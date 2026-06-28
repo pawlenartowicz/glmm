@@ -1,0 +1,83 @@
+name: CI
+
+# Single-crate mirror of the MCPower engine's `rust` job, plus the three gates a
+# standalone publishable crate needs: an MSRV floor check, a wasm compile (the
+# crate ships a cfg(wasm32) faer split), and a publish dry-run so `main` is always
+# in a releasable state.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+# Newer pushes supersede in-flight runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── fmt + clippy + the full #[test] suite, on stable ──────────────────────
+  lint-test:
+    name: lint + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # The dhat bounded-allocation gates assert exact alloc counts; faer/rayon
+      # multi-thread jitter perturbs them, so pin the pool to one thread.
+      RAYON_NUM_THREADS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        # The crate's workspace lints set clippy::all = deny, so a plain clippy
+        # run is the correctness gate — no extra `-- -D warnings` needed.
+        run: cargo clippy --all-targets
+      - name: test
+        run: cargo test
+      - name: test (mcpower feature)
+        # The unstable scratch-explicit surface is off by default; it must still
+        # compile and pass so the hot-path consumer never breaks silently.
+        run: cargo test --features mcpower
+
+  # ── MSRV floor: the bobyqa dep pins rust-version = 1.85 ───────────────────
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  # ── wasm: keep the cfg(wasm32) faer config honest ─────────────────────────
+  wasm:
+    name: wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --target wasm32-unknown-unknown
+
+  # ── package: gate the publishable state on every push ─────────────────────
+  package:
+    name: publish dry-run
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run

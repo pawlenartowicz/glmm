@@ -1,0 +1,73 @@
+[package]
+name = "glmm"
+version = "0.0.1"          # USER OWNS this — standalone library, not version.workspace
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = true             # alpha published to crates.io as `glmm` (mcpower-coupled, pre-1.0)
+description = "Standalone f64 GLMM fit kernels (OLS, GLM, LMM, GLMM) in pure Rust on faer — the parity-pinned numerics from the MCPower engine."
+keywords = ["statistics", "glmm", "regression", "mixed-models", "mle"]
+categories = ["science", "mathematics"]
+# repository = "https://github.com/pawlenartowicz/<repo>"   # USER: set once the GLMM repo is created
+
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+[features]
+# Unstable scratch-explicit hot-path surface for MCPower. OFF by default so the
+# semver-covered public API is just `fit` + `ModelSpec`. (spec §5)
+mcpower = []
+
+[dependencies]
+# Mirror engine-core's pins exactly — parity-stable numerics depend on them.
+bobyqa = "0.1"
+pulp = "=0.22.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+faer = "0.24"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
+
+[dev-dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+dhat       = "0.3"
+
+# ───────────────────────── standalone workspace root ─────────────────────────
+# glmm was carved out of the mcpower workspace (Stage 2). It is now its own
+# single-crate workspace so the `.workspace = true` inheritances above resolve
+# here, and the clippy/unsafe lint gate carried over from mcpower stays in one
+# place. Values copied verbatim from the mcpower workspace at carve time.
+[workspace]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"      # floor set by the bobyqa dep (edition 2024, MSRV 1.85)
+license = "GPL-3.0-or-later"
+
+[workspace.lints.rust]
+# glmm is pure-Rust and uses no `unsafe`; this baseline matches the mcpower
+# engine crates (which harden further to forbid in lib.rs — glmm does not).
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+# priority -1 lets item-level #[allow]/#[expect] override; deny makes clippy::all
+# a correctness gate that fails a plain `cargo clippy` — the parity-numeric guard
+# this crate shipped with inside mcpower.
+all = { level = "deny", priority = -1 }
+
+# Match the mcpower release profile so glmm's OWN release/bench builds keep the
+# codegen (lto + single codegen-unit) that the bobyqa/pulp version-pin comments
+# tie the fitted-MLE low bits / goldens to. Ignored when glmm is consumed as a
+# dependency (the consumer's profile wins), so it does not affect the mcpower
+# build path — only standalone `cargo build --release` / benchmarks in this repo.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+debug = false
