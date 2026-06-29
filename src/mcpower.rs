@@ -1,6 +1,6 @@
 //! UNSTABLE scratch-explicit surface for MCPower's simulation hot path.
 //! Gated by the `mcpower` cargo feature (off by default). NO semver guarantees —
-//! may change in ANY release (carve spec §5).
+//! may change in ANY release.
 
 pub use crate::glm::{glm_irls_fit, sigmoid_stable, GlmFitView, GlmScratch, MAX_IRLS_ITERS};
 pub use crate::glmm::{build_z, fit_glmm, GlmmFit, GlmmWorkspace};

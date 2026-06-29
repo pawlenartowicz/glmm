@@ -1,13 +1,13 @@
 //! Test-only scaffolding shared across the fit-module `#[cfg(test)]` blocks.
 //!
-//! `TestWs` is a buffer-bag mirroring the subset of engine-core's `SimWorkspace`
-//! fields the moved tests borrow (identical field names) so each test's
-//! field-borrowing helper bodies (`suff_stats`, `glm_scratch`,
-//! `build_lme_scratch`, `shipped_workspace`) stay near-zero-diff. It carries no
+//! `TestWs` is a buffer-bag exposing the same field names as engine-core's
+//! `SimWorkspace` for the subset the fit-module tests borrow, so each test's
+//! field-borrowing helper body (`suff_stats`, `glm_scratch`,
+//! `build_lme_scratch`, `shipped_workspace`) ports with minimal change. It carries no
 //! design-gen / RNG / critval machinery — the tests only use it as pre-sized
 //! scratch. The alloc lines + the two reset methods are copied verbatim from
 //! `engine-core/src/workspace.rs` `SimWorkspace::new` / its resets; the cluster
-//! count is passed directly (the old `ClusterSpec` was only a vehicle to size it).
+//! count is passed directly.
 
 use crate::ols::PANEL_ROWS;
 use faer::Mat;
@@ -248,9 +248,8 @@ pub(crate) fn extra_level_of_row(spec: &crate::ModelSpec, g: usize, i: usize) ->
 }
 
 /// Build an `LmeScratch` from a `TestWs` whose `lme_*` suff-stats are already
-/// populated. Shared by `lme.rs` and `lmm.rs` tests (identical body before the
-/// carve). Body copied verbatim from the former `lme.rs` local helper, retyped
-/// to `&mut TestWs`.
+/// populated. Shared by `lme.rs` and `lmm.rs` tests; keep in sync with the
+/// `lme::LmeScratch` field list.
 pub(crate) fn build_lme_scratch<'w>(
     ws: &'w mut TestWs,
     n_rows: u32,

@@ -25,7 +25,7 @@ pub const PIRLS_MAX_ITERS: usize = 50;
 /// `|Δpen| < PIRLS_TOL_REL · (1 + |pen|)`. The penalized deviance is O(n), so
 /// the former 1e-8 absolute gate demanded ~1e-12 *relative* accuracy and spent
 /// 2–4 extra inner iterations per solve buying precision the outer BOBYQA
-/// never sees (group-C result-moving change).
+/// never sees.
 pub const PIRLS_TOL_REL: f64 = 1e-6;
 /// Wide finite β box for the joint BOBYQA. Bound to `glm::BETA_CAP` (the log-odds
 /// divergence guard, same magnitude) so the box and the cap can never drift apart.
@@ -51,10 +51,9 @@ pub struct GlmmFit {
     pub tau_squared_hat: f64,
     /// Joint Wald-χ² over `target_indices` (NaN when empty / non-converged).
     pub joint_t_sq: f64,
-    /// Set iff the per-fit FD-Hessian covariance fell back to the RX/Schur block
-    /// (non-PD joint Hessian / non-finite perturbed deviance). Always `false`
-    /// here — `fit_glmm` does not yet run the `hessian`-mode kernel; Task 6 wires
-    /// it to `fd_hessian_cov`'s `NonPdFellBackToRx` status.
+    /// Set iff the fit ran `WaldSe::Hessian` and `fd_hessian_cov` fell back to the
+    /// RX/Schur block (non-PD joint Hessian / non-finite perturbed deviance) — its
+    /// `NonPdFellBackToRx` status. Always `false` under `WaldSe::Rx`.
     pub hessian_fallback: bool,
 }
 
@@ -64,7 +63,7 @@ pub struct GlmmWorkspace {
     pub k: usize,                // total RE columns (groupings.k_total)
     pub p: usize,                // fixed-effect predictors
     pub n_theta: usize,
-    pub z: Mat<f64>,      // max_n × k dense RE design (built per (spec,N) in Task 4)
+    pub z: Mat<f64>,      // max_n × k dense RE design (built per (spec, N) by `build_z`)
     pub m: Mat<f64>,      // max_n × k = ZΛ (rebuilt per BOBYQA eval)
     pub solver: Bobyqa,   // sized n_theta + p
     pub params: Vec<f64>, // [θ | β]
@@ -80,7 +79,7 @@ pub struct GlmmWorkspace {
     pub z_buf: Vec<f64>, // n×(q_p−1) row-major f64 copy of x[:, slope_cols] — filled once per fit
     pub mu: Vec<f64>, // (Mu)ᵢ per iteration via GEMV; overwritten in place by the IRLS residual W·Mu + (y−p) before the RHS GEMV
     pub u: Vec<f64>,
-    pub u_seed: Vec<f64>, // within-fit û warm-start incumbent (Phase 3); RESET to 0 each fit_glmm — never carried across fits
+    pub u_seed: Vec<f64>, // within-fit û warm-start incumbent; RESET to 0 each fit_glmm — never carried across fits
     pub a: Mat<f64>,      // k × k  M'WM + I
     pub wm: Mat<f64>, // max_n × k = W∘M scratch for the dense-Gram GEMM (rebuilt per PIRLS iteration)
     pub a_rhs: Vec<f64>, // length k
@@ -231,7 +230,7 @@ impl GlmmWorkspace {
     }
 }
 
-// Kernel — written as borrow-split FREE fns so the Task-5 BOBYQA closure can call
+// Kernel — written as borrow-split FREE fns so the BOBYQA closure in fit_glmm can call
 // them on destructured workspace fields without re-borrowing the whole workspace.
 
 /// In-place lower Crout Cholesky of a `q×q` block stored row-major in `blk`
@@ -367,6 +366,10 @@ pub(crate) fn apply_lambda(
         }
     }
     let base_theta = q * (q + 1) / 2;
+    // The GLMM structured path carries intercept-only extras (q_g == 1), so each
+    // extra owns a single scalar θ at `base_theta + e` (== its `vech_start`).
+    // Slopes-on-extras (q_g > 1) are an LMM-only lift; not reachable here.
+    debug_assert!(!groupings.extra_slopes_any);
     // Each extra grouping owns a CONTIGUOUS column block at its ABSOLUTE
     // `extra_offsets[e]`, scaled by its own scalar θ. Span the block by the
     // grouping's OWN width — NOT the gap to the next declaration's offset:
@@ -377,14 +380,14 @@ pub(crate) fn apply_lambda(
     // child columns; a crossed grouping spans its stored level count.
     for (e, &off) in groupings.extra_offsets.iter().enumerate() {
         let theta_e = params[base_theta + e];
-        let width = if groupings.nested_theta == Some(base_theta + e) {
+        let width = if groupings.nested.map(|nf| nf.vech_start) == Some(base_theta + e) {
             s * groupings.nested_per_parent
         } else {
             groupings
                 .crossed
                 .iter()
-                .find(|&&(ti, _)| ti == base_theta + e)
-                .map(|&(_, cnt)| cnt)
+                .find(|cf| cf.vech_start == base_theta + e)
+                .map(|cf| cf.n_levels)
                 .expect("an extra grouping is either nested or crossed")
         };
         for col in off..off + width {
@@ -431,8 +434,10 @@ fn build_packed_m(
     let k_family = qc * s;
     let base_theta = q * (q + 1) / 2;
     let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
+    // Intercept-only extras on the GLMM structured path (see `apply_lambda`).
+    debug_assert!(!g.extra_slopes_any);
     crate::lmm::primary_lambda(&params[..g.n_theta()], q, lam);
-    let theta_nested = g.nested_theta.map(|ti| params[ti]).unwrap_or(0.0);
+    let theta_nested = g.nested.map(|nf| params[nf.vech_start]).unwrap_or(0.0);
     for i in 0..n {
         let f = cluster_ids[i] as usize;
         // Core primary block: same `Σ_{r≥c} z_r·lam[r·q+c]` reduction `apply_lambda`
@@ -454,13 +459,15 @@ fn build_packed_m(
         // Crossed: one nonzero per crossed grouping (its single active level), θ-pinned
         // groupings skipped.
         let mut cnt = 0usize;
-        for &(theta_idx, count) in &g.crossed {
-            let theta = params[theta_idx];
+        for cf in &g.crossed {
+            let theta = params[cf.vech_start];
             if theta == 0.0 {
                 continue;
             }
-            let off = g.extra_offsets[theta_idx - base_theta];
-            for col in off..off + count {
+            // q_g==1 here (see debug_assert above), so vech_start − base_theta is
+            // this factor's declaration index into extra_offsets.
+            let off = g.extra_offsets[cf.vech_start - base_theta];
+            for col in off..off + cf.n_levels {
                 let zv = z[(i, col)];
                 if zv != 0.0 {
                     cross_col[i * g_cap + cnt] = (col - k_family) as u32;
@@ -485,7 +492,7 @@ fn build_packed_m(
 /// Mu, A = M'(W∘M) + I, and the RHS all go through faer GEMM (`Par::Seq`) with
 /// `wm` as the W∘M scratch — GEMM accumulation order, deliberately NOT the old
 /// per-entry i-order dots (the serial FP-add chain was the dense path's latency
-/// floor; group-H result-moving change). `eta_fixed`/`mu` are caller-owned
+/// floor). `eta_fixed`/`mu` are caller-owned
 /// length-n scratch. `A` is left holding the FINAL-iterate A for the caller.
 /// Iterates from the caller-provided `u` (the warm-start seed); the caller owns
 /// resetting it per fit.
@@ -691,7 +698,7 @@ fn pirls_solve_blocked(
         for v in a_rhs[..k].iter_mut() {
             *v = 0.0;
         }
-        // Loop-split (Phase 4): the former interleaved transcendental+scatter sweep
+        // Loop-split: the former interleaved transcendental+scatter sweep
         // becomes η-pass → SIMD pass → scatter-pass so the transcendental runs
         // vectorized over a materialized η[] with no gather/scatter data deps.
         // --- pass 1: η-pass (scalar gather): form ηᵢ, accumulate Σ y·η ---
@@ -1802,7 +1809,6 @@ pub fn fit_glmm(
         return nan_fit(ws, target_indices, out.n_eval);
     }
 
-    // β̂ from γ̂.
     for j in 0..p {
         ws.betas[j] = ws.params[n_theta + j];
     }
@@ -2495,8 +2501,6 @@ mod tests {
             touched.iter().all(|&t| t),
             "every RE column must be populated — offset wiring"
         );
-        // The fit_glmm width-general assertions (β̂/τ̂ recovery on this same fixture)
-        // are added in Task 5, reusing `glmm_slope_crossed_dataset`.
     }
 
     /// `apply_lambda` must scale each extra grouping's columns by ITS OWN θ over
@@ -3032,7 +3036,7 @@ mod tests {
         );
     }
 
-    /// Deferred from Task 4.7: fit_glmm on the q_p=2 slope + crossed fixture.
+    /// fit_glmm on the q_p=2 slope + crossed fixture.
     #[test]
     fn fit_glmm_width_general_slope_and_crossed() {
         let (xf64, y, ids, crossed_ids, cluster) = glmm_slope_crossed_dataset();
@@ -3118,20 +3122,20 @@ mod tests {
         let stats = dhat::HeapStats::get();
         drop(profiler);
         // Measured 120 (this machine) — 6 blocks/fit on the no-extras intercept
-        // fixture, down from 7780. Phase 2 routes it through the BLOCKED PIRLS, so
+        // fixture, down from 7780. The blocked PIRLS routes it, so
         // the dense per-iteration k×1 rhs Mat and the per-eval dense `llt` internals
         // are gone; the per-block Crout factor/solve work on pre-allocated a_blocks
         // and stack-sized m_row scratch. What remains is the joint [θ|β] BOBYQA's
         // own per-eval scratch. Block COUNT is deterministic for a fixed code path
         // under `RAYON_NUM_THREADS=1` — a change to that floor flags a new allocation
         // or a shifted eval/iteration trajectory. If faer changes its Cholesky
-        // internals, update — do not relax. Phase 3's within-fit warm-start allocates
+        // internals, update — do not relax. The within-fit warm-start allocates
         // nothing itself (u_seed copy/reset hit pre-allocated buffers) but its
         // within-exit-band objective shift nudges the BOBYQA trajectory by a few evals:
-        // 120 → 124. Phase 4 (SIMD fit-path transcendentals) keeps the floor flat:
+        // 120 → 124. The SIMD fit-path transcendentals keep the floor flat:
         // the `pulp` dispatch is alloc-free and the loop-split uses only the
         // pre-allocated eta/prob/w scratch + stack-sized m_row, so the bound holds.
-        // Re-measured after the relative PIRLS exit (group C): still exactly 124
+        // Re-measured after the relative PIRLS exit: still exactly 124
         // on this fixture — fewer inner iterations, same eval-scratch count.
         const BOUND: u64 = 124;
         assert!(
@@ -3142,7 +3146,7 @@ mod tests {
         );
     }
 
-    /// Structured-path warm zero-alloc lock (Group G), the crossed/nested twin of
+    /// Structured-path warm zero-alloc lock, the crossed/nested twin of
     /// `fit_glmm_warm_path_bounded_alloc`. There was no such gate before — the dense
     /// crossed/nested path allocated inside faer's per-eval `llt`. The structured
     /// path replaces that with `glmm_block_chol`/`glmm_block_solve` on the

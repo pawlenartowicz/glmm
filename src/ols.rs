@@ -21,7 +21,7 @@ use crate::FLOAT_NEAR_ZERO;
 /// Rows per widened f64 panel in the suff-stats GEMM accumulate
 /// (`OlsSuffStats::add_rows` / `LmeSuffStats::add_rows`). Bounds the f64
 /// working set to PANEL_ROWS·P so the GEMM stays cache-resident instead of
-/// streaming a full n×p copy (group-B route (a) vs (b)).
+/// streaming a full n×p copy.
 /// Tuned 2026-06-12 over {128, 256, 512}, clock-locked, off-mode fits/s:
 /// ols_large_n 3686 / 3802 / 3831, ols_wide 20792 / 20746 / 20657 — flat
 /// within ~1–3% and opposite preferences, so 256 keeps the balanced middle.
@@ -95,8 +95,8 @@ impl<'w> OlsSuffStats<'w> {
     /// triangle of `xtx` (i ≥ j in `xtx[(i, j)]`); the Cholesky path reads
     /// `Side::Lower` only, so storing the upper triangle would be wasted work.
     ///
-    /// Panel-GEMM (group B): each ≤PANEL_ROWS slice of the block is widened
-    /// f32→f64 into `panel_x`/`panel_y` once, then X'X/X'y accumulate through
+    /// Panel-GEMM: each ≤PANEL_ROWS slice of the block is repacked densely
+    /// (column-major) into `panel_x`/`panel_y` once, then X'X/X'y accumulate through
     /// faer GEMM (`Accum::Add`, `Par::Seq` — per-fit parallelism is the outer
     /// rayon loop). GEMM accumulation order, deliberately NOT the old per-row
     /// rank-1 triangle: the serial FP-add chain was the latency floor
@@ -349,7 +349,6 @@ pub fn fit_suff_stats_t_sq<'a>(
         }
     }
 
-    // Cholesky factorization on the lower triangle.
     let chol = match xtx_work.rb().llt(faer::Side::Lower) {
         Ok(c) => c,
         Err(_) => {
@@ -478,7 +477,6 @@ pub fn ols_contrast_t_sq(fit: &OlsFitView<'_>, p_col: u32, n_col: u32, scratch: 
     }
 
     // Forward solve L · u = c where c = e_pc − e_nc.
-    // L is lower-triangular (fit.factor).
     let norm_sq = triangular_solve_norm_sq(
         fit.factor,
         |i| {
@@ -539,7 +537,7 @@ mod tests {
     // Suff-stats path tests
     // ---------------------------------------------------------------------
 
-    /// EST-07: `OlsSuffStats::add_rows` is batch-split invariant — adding the
+    /// `OlsSuffStats::add_rows` is batch-split invariant — adding the
     /// rows in two segments accumulates the identical X'X / X'y / y'y / Σy /
     /// n_rows as adding them in one full pass. No hand-computed reference: the
     /// invariant compares the kernel against itself under a different split.
@@ -594,7 +592,7 @@ mod tests {
         assert_eq!(ws_split.suff_n_rows, n);
     }
 
-    /// Regression net for the panel-GEMM rewrite (group B): `add_rows` must match
+    /// Regression net for the panel-GEMM rewrite: `add_rows` must match
     /// the pre-panel per-row rank-1 triangle (inlined verbatim below as the
     /// oracle). X'X / X'y reassociate under the GEMM — band 1e-12 relative,
     /// measured max 2.0e-15 (first post-rewrite run); yty / sum_y stay scalar in
@@ -794,7 +792,7 @@ mod tests {
     // ols_contrast_t_sq unit tests
     // -----------------------------------------------------------------------
 
-    /// EST-10: `ols_contrast_t_sq` is symmetric under swapping `p_col` and
+    /// `ols_contrast_t_sq` is symmetric under swapping `p_col` and
     /// `n_col` — the beta difference is negated but squared away, and ‖L⁻¹c‖²
     /// is identical for c and −c. A broken kernel that forgot to square the
     /// numerator (or used a one-sided statistic) would fail. The result must
@@ -895,7 +893,6 @@ mod tests {
         );
     }
 
-    /// Non-converged fit must return NaN.
     #[test]
     fn contrast_t_sq_returns_nan_on_non_converged() {
         let p = 2;
@@ -910,7 +907,7 @@ mod tests {
             factor: factor.as_ref(),
             sigma_sq: 1.0,
             df_resid: 10,
-            converged: false, // non-converged
+            converged: false,
             rss: f64::NAN,
             sst: f64::NAN,
         };
@@ -927,10 +924,12 @@ mod tests {
         let x = build_x(n, p, |i, j| match j {
             0 => 1.0,
             1 => (i as f64) * 0.1,
-            // Zero column → exactly-zero Cholesky pivot, robustly rank-deficient
-            // in f32. (An exact-duplicate column leaves a ~1e-7 roundoff pivot
-            // that f32 generation tips above eps_rank=1e-12 — the f32 LLT grey
-            // zone the f32-overhaul plan flagged; a zero column avoids it.)
+            // Zero column → exactly-zero X'X diagonal → zero Cholesky pivot,
+            // robustly rank-deficient (faer's LLT rejects it as non-PD, else
+            // chol_rank_deficient catches min|L_ii| < eps·max|L_ii|). An
+            // exact-duplicate column instead leaves a ~1e-7 roundoff pivot that
+            // can drift above eps_rank=1e-12 into the near-singular grey zone;
+            // a zero column avoids it.
             _ => 0.0,
         });
         let y: Vec<f64> = (0..n).map(|i| (i as f64) * 0.3).collect();

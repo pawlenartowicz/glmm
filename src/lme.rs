@@ -580,7 +580,6 @@ pub fn brent_minimize<F: FnMut(f64) -> f64>(
 
         // Update bracket.
         if fu <= fx {
-            // New point is better.
             if u_actual >= x {
                 bracket_lo = x;
             } else {
@@ -800,6 +799,8 @@ pub fn lme_fit<'a>(
     let mut brent_iters: u32 = 0;
 
     // ----- 2. Initial 3-point bracket on log(θ) -----
+    // (Numbering starts at 2: step 1, suff-stats accumulation, is the caller's
+    // responsibility — see the doc comment.)
     // Truth-centered when θ₀ is passed (see the doc comment), else the full
     // cold bracket [LOG_THETA_LOW, LOG_THETA_HIGH].
     let truth_bracket = theta_start.map(|theta0| {

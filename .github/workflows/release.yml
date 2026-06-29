@@ -1,0 +1,40 @@
+name: Publish
+
+# Publish to crates.io on a version tag, via crates.io Trusted Publishing (OIDC) —
+# no stored API token. The token is minted by crates-io-auth-action at run time
+# and auto-revoked when the job ends.
+#
+# PREREQUISITE: the crate must already exist on crates.io and have a Trusted
+# Publisher configured (crate Settings → Trusted Publishing) pointing at THIS
+# repo + workflow file (release.yml) + the `release` environment below. crates.io
+# has no pending-publisher flow, so 0.0.1 is published manually; this covers 0.0.2+.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Naming an environment lets you attach required-reviewer / branch protection
+    # to releases. It MUST match the environment set in the crates.io Trusted
+    # Publisher config (or remove it in both places).
+    environment: release
+    permissions:
+      # Required: lets the job request the OIDC identity token crates.io verifies.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Authenticate to crates.io (Trusted Publishing)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

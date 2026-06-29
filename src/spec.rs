@@ -1,6 +1,6 @@
 //! `glmm`'s owned model-spec input vocabulary. Minimal copy of the subset of
 //! MCPower's `engine_contract` cluster types that the fit kernels actually read
-//! (carve spec §4). MCPower converts its `ClusterSpec` into this via a
+//! MCPower converts its `ClusterSpec` into this via a
 //! conversion fn on its side — `glmm` never sees `engine_contract`.
 
 /// Predictor column index (mirrors `engine_contract::ColumnId`'s underlying type).
@@ -52,6 +52,39 @@ pub struct Grouping {
     pub slopes: Vec<SlopeTerm>,
 }
 
+impl Grouping {
+    /// The `q_g×q_g` RE *correlation* matrix `R_g` over `[intercept, slope_0, …]`
+    /// (`q_g = 1 + slopes.len()`). Identical recipe to the primary's
+    /// [`ModelSpec::re_correlation_matrix`]; `cluster_theta_truth` reads it to form
+    /// each extra factor's relative-covariance factor `Λ_g = chol(D_g)`.
+    pub fn re_correlation_matrix(&self) -> (usize, Vec<f64>) {
+        re_correlation_from_slopes(&self.slopes)
+    }
+}
+
+/// Build the `q×q` RE correlation matrix over `[intercept, slope_0, …]` from a
+/// slope list (`q = 1 + slopes.len()`), row-major: diagonal 1;
+/// `R[0][k+1]=R[k+1][0]=slopes[k].corr_with_intercept`;
+/// `R[i+1][k+1]=R[k+1][i+1]=slopes[k].corr_with[i]` for `i < k`. Shared by the
+/// primary factor ([`ModelSpec::re_correlation_matrix`]) and each extra
+/// [`Grouping::re_correlation_matrix`] — one source, no drift.
+fn re_correlation_from_slopes(slopes: &[SlopeTerm]) -> (usize, Vec<f64>) {
+    let q = 1 + slopes.len();
+    let mut r = vec![0.0; q * q];
+    for d in 0..q {
+        r[d * q + d] = 1.0;
+    }
+    for (k, s) in slopes.iter().enumerate() {
+        r[k + 1] = s.corr_with_intercept; // R[0][k+1]
+        r[(k + 1) * q] = s.corr_with_intercept; // R[k+1][0]
+        for (i, &cik) in s.corr_with.iter().enumerate() {
+            r[(i + 1) * q + (k + 1)] = cik;
+            r[(k + 1) * q + (i + 1)] = cik;
+        }
+    }
+    (q, r)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum GroupingRelation {
     Crossed { n_clusters: u32 },
@@ -91,22 +124,9 @@ impl ModelSpec {
     /// slopes[k].corr_with_intercept`; `R[i+1][k+1]=R[k+1][i+1]=slopes[k].corr_with[i]`
     /// for `i < k`. Multiply by `diag(τ)` on both sides for `D`. Verbatim mirror of
     /// `engine_contract::ClusterSpec::re_correlation_matrix` — `cluster_theta_truth`
-    /// reads it after the carve retypes its input to `&ModelSpec`.
+    /// reads it after the caller converts its `ClusterSpec` to `&ModelSpec`.
     pub fn re_correlation_matrix(&self) -> (usize, Vec<f64>) {
-        let q = 1 + self.slopes.len();
-        let mut r = vec![0.0; q * q];
-        for d in 0..q {
-            r[d * q + d] = 1.0;
-        }
-        for (k, s) in self.slopes.iter().enumerate() {
-            r[k + 1] = s.corr_with_intercept; // R[0][k+1]
-            r[(k + 1) * q] = s.corr_with_intercept; // R[k+1][0]
-            for (i, &cik) in s.corr_with.iter().enumerate() {
-                r[(i + 1) * q + (k + 1)] = cik;
-                r[(k + 1) * q + (i + 1)] = cik;
-            }
-        }
-        (q, r)
+        re_correlation_from_slopes(&self.slopes)
     }
 }
 

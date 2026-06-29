@@ -455,7 +455,7 @@ pub fn ln_fill(buf: &mut [f64]) {
     pulp::Arch::new().dispatch(LnInplaceOp::<{ FUSED_DEFAULT }> { buf });
 }
 
-// A&S 7.1.26 constants — mirror crate::distributions::erfc, change together.
+// A&S 7.1.26 constants — mirror engine_core::distributions::erfc, change together.
 const ERF_A1: f64 = 0.254829592;
 const ERF_A2: f64 = -0.284496736;
 const ERF_A3: f64 = 1.421413741;
@@ -536,9 +536,9 @@ pub fn phi_fill(buf: &mut [f64]) {
 mod tests {
     use super::*;
 
-    // Reference: system libm (std f64). The spike proved the primitives are ≤1
-    // ULP of an MPFR oracle; in-repo we re-assert SIMD == scalar-libm accuracy
-    // (exp/log1p ≤1 ULP, composed p ≤2 ULP) — the regression net for the coeffs.
+    // Reference: system libm (std f64). Accuracy was established offline against
+    // an MPFR oracle (primitives ≤1 ULP); in-repo we re-assert SIMD == scalar-libm
+    // accuracy (exp/log1p ≤1 ULP, composed p ≤2 ULP) — the regression net for the coeffs.
     fn ulp(a: f64, b: f64) -> i128 {
         let o = |x: f64| {
             let b = x.to_bits() as i64;

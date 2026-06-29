@@ -35,18 +35,18 @@ use faer::{Accum, MatMut, MatRef, Par};
 use crate::ols::nan_fill_ols_scratch;
 use crate::FLOAT_NEAR_ZERO;
 
-/// IRLS safety cap; v1 parity.
+/// IRLS safety cap.
 pub const MAX_IRLS_ITERS: u32 = 50;
-/// Adaptive convergence tolerance on `|Δdeviance|`; v1 parity.
+/// Adaptive convergence tolerance on `|Δdeviance|`.
 pub const DEVIANCE_TOL: f64 = 1e-8;
 /// Divergence guard: any |β_j| > BETA_CAP at iter ≥ 3 marks non-converged.
 pub const BETA_CAP: f64 = 30.0;
 /// Floor on per-row IRLS weight `W_i = p_i (1-p_i)` to avoid division by zero
-/// in the working response. v1 parity.
+/// in the working response.
 pub const WEIGHT_CLAMP: f64 = 1e-6;
 /// Saturation post-fit guard: rows with `p_i(1-p_i) < SATURATION_W` count as
 /// saturated. If the fraction exceeds `SATURATION_FRAC`, the fit is marked
-/// non-converged. v1 parity.
+/// non-converged.
 pub const SATURATION_W: f64 = 1e-5;
 pub const SATURATION_FRAC: f64 = 0.5;
 
@@ -105,8 +105,9 @@ pub struct GlmScratch<'w> {
 // Numerically stable helpers
 // ---------------------------------------------------------------------------
 
-/// Numerically stable sigmoid. Mirrors v1's data_generation.cpp::generate_y_binary
-/// branch. Production paths now compute `p` in the vectorized `simd_transcendental`
+/// Numerically stable sigmoid: branches on the sign of `eta` so `exp` never
+/// overflows and the ratio avoids cancellation. Production paths now compute `p`
+/// in the vectorized `simd_transcendental`
 /// kernels (fit: `pw_and_log1pexp_sum`; generation: `sigmoid_fill`, ≤2 ULP of this
 /// form); this stays as the libm reference for tests.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -259,7 +260,7 @@ pub fn glm_irls_fit<'a>(
     // check without the extra pass buying another factorization. The deviance
     // moved from a post-accept `bernoulli_deviance` call to the top-of-pass
     // fused kernel — same values one pass later, no standalone `log1pexp` sweep
-    // (group-C deviance fold; bit-identical, the fused Σ equals the lean one).
+    // (deviance fold; bit-identical, the fused Σ equals the lean one).
     for iter in 0..=MAX_IRLS_ITERS {
         // η = X · β is already in `irls_eta`: seeded to 0 (β = 0) or the
         // truth start before the loop, then refreshed by the accept step below
@@ -267,7 +268,7 @@ pub fn glm_irls_fit<'a>(
         // X·β (same β, same summation order).
 
         // p, W, and Σ log1pexp(η) in one fused vectorized pass; the working
-        // response z is a scalar follow-up (it carries the f32 y and a division,
+        // response z is a scalar follow-up (it carries y and a division,
         // no transcendental) that also folds in the Σ y·η deviance half.
         let lp_sum = crate::simd_transcendental::pw_and_log1pexp_sum(
             &irls_eta[..n],
@@ -306,8 +307,7 @@ pub fn glm_irls_fit<'a>(
         // through faer GEMM (`Par::Seq`; per-fit parallelism is the outer
         // rayon loop). GEMM accumulation order, deliberately NOT the old
         // per-entry row-order dots: the serial FP-add chain was the latency
-        // floor on wide p (measured 0.94× glm_wide) — group-H result-moving
-        // change.
+        // floor on wide p (measured 0.94× glm_wide).
         {
             let wx = &mut irls_wx[..n * p];
             for j in 0..p {
@@ -602,7 +602,7 @@ mod tests {
         );
     }
 
-    /// EST-16: GLM Wald z² is NaN on a non-converged fit (the variance is not
+    /// GLM Wald z² is NaN on a non-converged fit (the variance is not
     /// recoverable). Error path for the z² shape rule — a broken kernel that
     /// emitted a finite garbage z² when the fit failed would be caught.
     #[test]
@@ -673,7 +673,7 @@ mod tests {
         );
     }
     // -----------------------------------------------------------------
-    // C6 — GLM deviance_null golden value (external oracle: R glm()$null.deviance)
+    // GLM deviance_null golden value (external oracle: R glm()$null.deviance)
     // -----------------------------------------------------------------
 
     #[test]

@@ -1,14 +1,14 @@
 [package]
 name = "glmm"
-version = "0.0.1"          # USER OWNS this — standalone library, not version.workspace
+version = "0.0.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = true             # alpha published to crates.io as `glmm` (mcpower-coupled, pre-1.0)
+publish = true
 description = "Standalone f64 GLMM fit kernels (OLS, GLM, LMM, GLMM) in pure Rust on faer — the parity-pinned numerics from the MCPower engine."
 keywords = ["statistics", "glmm", "regression", "mixed-models", "mle"]
 categories = ["science", "mathematics"]
-# repository = "https://github.com/pawlenartowicz/<repo>"   # USER: set once the GLMM repo is created
+repository = "https://github.com/pawlenartowicz/glmm"
 
 [lib]
 crate-type = ["rlib"]

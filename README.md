@@ -1,5 +1,11 @@
 # glmm
 
+[![CI](https://github.com/pawlenartowicz/glmm/actions/workflows/ci.yml/badge.svg)](https://github.com/pawlenartowicz/glmm/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/glmm.svg)](https://crates.io/crates/glmm)
+[![docs.rs](https://img.shields.io/docsrs/glmm)](https://docs.rs/glmm)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)
+
 **Standalone f64 GLMM fit kernels — OLS → GLM → LMM → GLMM — in pure Rust on faer.**
 The parity-pinned numerics from the [MCPower](https://github.com/pawlenartowicz/) engine, usable on their own.
 

@@ -1,7 +1,7 @@
 //! Friendly stable `fit` entry point for the `glmm` crate.
 //!
 //! Owns all scratch; dispatches on `ModelSpec::estimator`; returns `Fit`.
-//! This is the additive stable public surface described in the carve spec §5 —
+//! This is the additive stable public surface —
 //! it never touches any kernel; only marshals data and scratch into kernel
 //! calls, then copies results out.
 //!
@@ -17,6 +17,7 @@
 
 use faer::Mat;
 
+use crate::consts::{MAX_EXTRA_Q, MAX_PRIMARY_Q};
 use crate::lmm::{fit_lmm, LmmWorkspace};
 use crate::ols::{OlsScratch, OlsSuffStats, PANEL_ROWS};
 use crate::{Estimator, GroupingRelation, ModelSpec, Sizing};
@@ -58,10 +59,45 @@ pub fn fit(x: &[f64], y: &[f64], n: usize, p: usize, model: &ModelSpec, opts: &F
         "x must have n*p elements in row-major layout"
     );
     assert_eq!(y.len(), n, "y must have n elements");
+    assert_model_shape(model, p);
     match model.estimator {
         Estimator::Ols => fit_ols(x, y, n, p, opts),
         Estimator::Mle => fit_mle(x, y, n, p, model, opts),
         Estimator::Glm => unimplemented!("Estimator::Glm is not yet wired in glmm::fit (both unclustered GLM and clustered GLMM are unimplemented); use the glmm::mcpower surface for now"),
+    }
+}
+
+/// Mirror of MCPower's contract invariants 19/21 for the standalone `fit` path:
+/// the kernel's stack scratch is sized off `MAX_PRIMARY_Q`/`MAX_EXTRA_Q`, so a
+/// `q` over the cap would overflow it, and every slope column must index into the
+/// `p`-wide design. A malformed spec is an engine invariant violation (see the
+/// `fit` panic convention), so this asserts rather than returning a `Fit`.
+fn assert_model_shape(model: &ModelSpec, p: usize) {
+    let q_p = 1 + model.slopes.len();
+    assert!(
+        q_p <= MAX_PRIMARY_Q,
+        "primary RE width q_p={q_p} exceeds MAX_PRIMARY_Q={MAX_PRIMARY_Q}"
+    );
+    for s in &model.slopes {
+        assert!(
+            (s.column as usize) < p,
+            "primary slope column {} out of range (p={p})",
+            s.column
+        );
+    }
+    for g in &model.extra_groupings {
+        let q_g = 1 + g.slopes.len();
+        assert!(
+            q_g <= MAX_EXTRA_Q,
+            "extra grouping RE width q_g={q_g} exceeds MAX_EXTRA_Q={MAX_EXTRA_Q}"
+        );
+        for s in &g.slopes {
+            assert!(
+                (s.column as usize) < p,
+                "extra-grouping slope column {} out of range (p={p})",
+                s.column
+            );
+        }
     }
 }
 
@@ -98,7 +134,6 @@ fn fit_ols(x: &[f64], y: &[f64], n: usize, p: usize, opts: &FitOptions) -> Fit {
         }
     }
 
-    // --- accumulate suff stats ---
     {
         let mut suff = OlsSuffStats {
             xtx: suff_xtx.as_mut(),
@@ -114,7 +149,6 @@ fn fit_ols(x: &[f64], y: &[f64], n: usize, p: usize, opts: &FitOptions) -> Fit {
         }
     }
 
-    // --- fit ---
     let view = {
         let scratch = OlsScratch {
             fit_betas: &mut fit_betas,
@@ -139,7 +173,7 @@ fn fit_ols(x: &[f64], y: &[f64], n: usize, p: usize, opts: &FitOptions) -> Fit {
 
     // --- map OlsFitView → Fit ---
     // view.betas is compact [0..p]; view.var_diag is compact [0..t] at target rank
-    // (OLS/GLM are target-compact; LME/LMM are predictor-indexed — see batch.rs header)
+    // (OLS/GLM are target-compact; LME/LMM are predictor-indexed)
     let beta = view.betas.to_vec();
     let converged = view.converged;
     let mut se = vec![f64::NAN; p];
@@ -206,9 +240,17 @@ fn block_levels(rel: &GroupingRelation) -> usize {
 fn fit_mle(x: &[f64], y: &[f64], n: usize, p: usize, model: &ModelSpec, opts: &FitOptions) -> Fit {
     // slope_cols: x column indices for the primary RE slopes (empty = intercept-only)
     let slope_cols: Vec<usize> = model.slopes.iter().map(|s| s.column as usize).collect();
+    // Extra-grouping slope x-columns, declaration order. On the standalone path the
+    // ModelSpec's slope columns ARE x-matrix indices (unlike MCPower, which resolves
+    // them separately), so they are read directly here.
+    let extra_slope_cols: Vec<Vec<usize>> = model
+        .extra_groupings
+        .iter()
+        .map(|g| g.slopes.iter().map(|s| s.column as usize).collect())
+        .collect();
 
     // Build workspace — allocates solver, suff-stats, fit scratch for this model shape
-    let mut ws = LmmWorkspace::for_cluster_spec(p, model, n, &slope_cols);
+    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, model, n, &slope_cols, &extra_slope_cols);
 
     // Build cluster and extra-grouping id vectors from the model layout
     let cluster_ids: Vec<u32> = (0..n)
@@ -227,14 +269,13 @@ fn fit_mle(x: &[f64], y: &[f64], n: usize, p: usize, model: &ModelSpec, opts: &F
         }
     }
 
-    // Accumulate sufficient statistics
     ws.suff.reset();
     if n > 0 && p > 0 {
         ws.suff
             .add_rows_multi(x_mat.as_ref().subrows(0, n), y, &cluster_ids, &extra_ids);
     }
 
-    // Fit — use truth-start from the workspace (the DGP-derived hint, P1).
+    // Fit — use truth-start from the workspace (the DGP-derived hint).
     // Copy theta_truth to a local buffer to avoid a borrow conflict with &mut ws.
     let theta_truth = ws.theta_truth.clone();
     let lmm_fit = fit_lmm(&mut ws, &opts.target_indices, Some(&theta_truth));
@@ -337,6 +378,48 @@ mod tests {
             y[i] = 0.5 + 0.4 * x1 - 0.2 * x2 + u_c[c] + 0.8 * lcg(&mut st);
         }
         (x, y, n, p)
+    }
+
+    use crate::{Grouping, GroupingRelation, SlopeTerm};
+
+    /// Mirror of MCPower's `extra_grouping_rejects_too_many_slopes` contract test:
+    /// the standalone `fit` path must reject `q_g = 5` (intercept + 4 slopes) over
+    /// the `MAX_EXTRA_Q = 4` cap before it can overflow the kernel's stack scratch.
+    #[test]
+    #[should_panic(expected = "exceeds MAX_EXTRA_Q")]
+    fn fit_rejects_extra_grouping_q_too_large() {
+        let st = |c: u32| SlopeTerm {
+            column: c,
+            variance: 0.1,
+            corr_with_intercept: 0.0,
+            corr_with: vec![],
+        };
+        let model = ModelSpec {
+            sizing: Sizing::FixedClusters { n_clusters: 4 },
+            tau_squared: 0.25,
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 4 },
+                tau_squared: 0.1,
+                slopes: vec![st(1), st(2), st(3), st(4)], // q_g = 5 > MAX_EXTRA_Q
+            }],
+            estimator: Estimator::Mle,
+            wald_se: WaldSe::Hessian,
+        };
+        let n = 16;
+        let p = 4;
+        let x = vec![0.0f64; n * p];
+        let y = vec![0.0f64; n];
+        let _ = fit(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &FitOptions {
+                target_indices: vec![1],
+            },
+        );
     }
 
     #[test]

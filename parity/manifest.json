@@ -1,0 +1,66 @@
+{
+  "schema": "glmm-parity-manifest/1",
+  "datasets": [
+    {
+      "name": "Dyestuff",
+      "rung": 1,
+      "source": "lme4",
+      "family": "gaussian",
+      "reml": true,
+      "factors": ["Batch"],
+      "r_formula":  "Yield ~ 1 + (1 | Batch)",
+      "jl_formula": "@formula(Yield ~ 1 + (1 | Batch))"
+    },
+    {
+      "name": "sleepstudy",
+      "rung": 2,
+      "source": "lme4",
+      "family": "gaussian",
+      "reml": true,
+      "factors": ["Subject"],
+      "r_formula":  "Reaction ~ 1 + Days + (1 + Days | Subject)",
+      "jl_formula": "@formula(Reaction ~ 1 + Days + (1 + Days | Subject))"
+    },
+    {
+      "name": "Penicillin",
+      "rung": 3,
+      "source": "lme4",
+      "family": "gaussian",
+      "reml": true,
+      "factors": ["plate", "sample"],
+      "r_formula":  "diameter ~ 1 + (1 | plate) + (1 | sample)",
+      "jl_formula": "@formula(diameter ~ 1 + (1 | plate) + (1 | sample))"
+    },
+    {
+      "name": "Pastes",
+      "rung": 4,
+      "source": "lme4",
+      "family": "gaussian",
+      "reml": true,
+      "factors": ["batch", "sample"],
+      "r_formula":  "strength ~ 1 + (1 | batch) + (1 | sample)",
+      "jl_formula": "@formula(strength ~ 1 + (1 | batch) + (1 | sample))"
+    },
+    {
+      "name": "cbpp",
+      "rung": 5,
+      "source": "lme4",
+      "family": "binomial",
+      "reml": null,
+      "factors": ["herd", "period"],
+      "weights": "size",
+      "r_formula":  "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)",
+      "jl_formula": "@formula(prop ~ 1 + period + (1 | herd))"
+    },
+    {
+      "name": "grouseticks",
+      "rung": 6,
+      "source": "lme4",
+      "family": "poisson",
+      "reml": null,
+      "factors": ["BROOD", "INDEX", "LOCATION", "YEAR"],
+      "r_formula":  "TICKS ~ 1 + YEAR + cHEIGHT + (1 | BROOD) + (1 | INDEX) + (1 | LOCATION)",
+      "jl_formula": "@formula(TICKS ~ 1 + YEAR + cHEIGHT + (1 | BROOD) + (1 | INDEX) + (1 | LOCATION))"
+    }
+  ]
+}

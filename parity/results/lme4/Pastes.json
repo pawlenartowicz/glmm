@@ -1,0 +1,40 @@
+{
+  "dataset": "Pastes",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 4,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)"],
+  "estimates": {
+    "beta": [60.053333333334],
+    "se": [0.676870046254119],
+    "loglik": -123.495372926743,
+    "varcomp": [
+      {
+        "group": "sample",
+        "terms": ["(Intercept)"],
+        "stddev": [2.90407781032194],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "batch",
+        "terms": ["(Intercept)"],
+        "stddev": [1.28736473502312],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "sigma": 0.823407522595863
+  },
+  "timing": {
+    "fit_seconds_min": 0.0141434669494629,
+    "n_runs": 10,
+    "warmup_discarded": 1
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "dataset": "Penicillin",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 3,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)"],
+  "estimates": {
+    "beta": [22.9722222222219],
+    "se": [0.808595361386344],
+    "loglik": -165.430294499802,
+    "varcomp": [
+      {
+        "group": "plate",
+        "terms": ["(Intercept)"],
+        "stddev": [0.846702510330875],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "sample",
+        "terms": ["(Intercept)"],
+        "stddev": [1.93161379222258],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "sigma": 0.549922682062881
+  },
+  "timing": {
+    "fit_seconds_min": 0.0150349140167236,
+    "n_runs": 10,
+    "warmup_discarded": 1
+  }
+}

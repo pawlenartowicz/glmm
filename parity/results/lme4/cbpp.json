@@ -1,0 +1,31 @@
+{
+  "dataset": "cbpp",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "binomial",
+  "reml": null,
+  "rung": 5,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "period2", "period3", "period4"],
+  "estimates": {
+    "beta": [-1.3983428644712, -0.991924974975699, -1.12821621594328, -1.57974541364914],
+    "se": [0.231213976143225, 0.303150526138057, 0.32283000769806, 0.42204890650355],
+    "loglik": -92.0265663895302,
+    "varcomp": [
+      {
+        "group": "herd",
+        "terms": ["(Intercept)"],
+        "stddev": [0.642069927729443],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  },
+  "timing": {
+    "fit_seconds_min": 0.0624220371246338,
+    "n_runs": 10,
+    "warmup_discarded": 1
+  }
+}

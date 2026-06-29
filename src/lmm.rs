@@ -40,7 +40,7 @@ pub const THETA_HI: f64 = 1e3;
 /// validity requirement.
 pub const RHO_BEGIN: f64 = 0.5;
 /// Final trust radius = θ̂ target accuracy. 1e-6 measured equivalent to 1e-8
-/// on every Gate-0 parity gate under the amended abs floors (stat 1e-4 /
+/// on every parity check under the amended abs floors (stat 1e-4 /
 /// β̂ 1e-5), at 15.1–15.7 vs 19.5–20.7 evals/fit — a ~25% eval cut for free.
 pub const RHO_END: f64 = 1e-6;
 /// Truth-start floor: a `Some(θ₀)` start is clamped to max(θ₀, this) so a
@@ -67,18 +67,44 @@ pub fn bobyqa_config(n_theta: usize) -> Config {
     }
 }
 
-/// Capacity ceilings — single-sourced in `crate::consts` (carve spec §6).
+/// Capacity ceilings — single-sourced in `crate::consts`.
 /// Also re-exported by MCPower's `engine-contract`, where `validate()`
-/// (invariants 20/21) enforces them so oversized specs are rejected before a fit
+/// enforces them so oversized specs are rejected before a fit
 /// is ever built. Re-exported `pub` so the sibling `glmm.rs` fit code reads them
 /// as `crate::lmm::MAX_*`. (`MAX_THETA`, which sizes `batch.rs`'s stack
 /// truth-start buffer, lives in `crate::consts` and is read directly from there
 /// by engine-core — not used inside `glmm`.)
-pub use crate::consts::{MAX_EXTRA_GROUPINGS, MAX_PRIMARY_Q};
+pub use crate::consts::{MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q, MAX_PRIMARY_Q};
 
 // ---------------------------------------------------------------------------
 // LmmGroupings — grouping-structure metadata shared by suff stats + deviance.
 // ---------------------------------------------------------------------------
+
+/// A crossed extra grouping factor's θ-layout descriptor. `vech_start` is the
+/// θ index where its `vech(Λ_g)` block begins (`q·(q+1)/2` entries, column-major
+/// lower-tri); `q = 1 + #slopes` is its RE width; `n_levels` is its crossed level
+/// count. For `q == 1` (intercept only) `vech_start` is the old scalar θ index and
+/// the block is a single variance — byte-identical to the pre-slope layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossedFactor {
+    pub vech_start: usize,
+    pub q: usize,
+    pub n_levels: usize,
+    /// Declaration index among the extra groupings — indexes `extra_offsets` /
+    /// `extra_q` / `extra_slope_cols`.
+    pub decl: usize,
+}
+
+/// A nested extra grouping factor's θ-layout descriptor (child RE columns sit in
+/// the family block). `vech_start`/`q` as in [`CrossedFactor`]; the level count is
+/// `n_primary · nested_per_parent`, derived from the primary, so it is not stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NestedFactor {
+    pub vech_start: usize,
+    pub q: usize,
+    /// Declaration index among the extra groupings.
+    pub decl: usize,
+}
 
 /// Grouping-structure metadata the suff stats and deviance share.
 ///
@@ -92,10 +118,10 @@ pub struct LmmGroupings {
     pub n_primary: usize,
     /// Children per parent; 0 = no nested extra (family width 1).
     pub nested_per_parent: usize,
-    /// θ component index of the nested extra, if any.
-    pub nested_theta: Option<usize>,
-    /// Crossed extras in declaration order: (θ component index, level count).
-    pub crossed: Vec<(usize, usize)>,
+    /// The nested extra's θ-layout descriptor, if any.
+    pub nested: Option<NestedFactor>,
+    /// Crossed extras in declaration order.
+    pub crossed: Vec<CrossedFactor>,
     /// RE-column offset of extra g (declaration order) — where its globalized
     /// level ids land in `s`/`counts`.
     pub extra_offsets: Vec<usize>,
@@ -115,23 +141,39 @@ pub struct LmmGroupings {
     /// workspace by `compute_diagonal_theta` (the vech-diagonal walk lives there,
     /// single-sourced) so the per-fit pin loop borrows instead of reallocating.
     pub diagonal_theta: Vec<usize>,
+    /// Solver-path gate: true iff any extra grouping carries a random slope
+    /// (`q_g > 1`). The scalar tail in `reml_deviance` stays byte-identical when
+    /// false; the blocked per-factor `Λ_g` tail (Phase 4) is taken when true.
+    pub extra_slopes_any: bool,
+    /// Per-extra-grouping RE width `q_g = 1 + #slopes`, DECLARATION order (parallel
+    /// to `extra_offsets`). Sizes each grouping's RE-column block (`level·q_g + d`)
+    /// and its `vech(Λ_g)`. All `1` for intercept-only extras (pre-slope shape).
+    pub extra_q: Vec<usize>,
+    /// Per-extra-grouping `[X y]` row indices of that grouping's slope covariates
+    /// (resolved x columns), DECLARATION order — the crossed/nested analogue of
+    /// `primary_slope_cols`. `extra_slope_cols[e]` has `extra_q[e] − 1` entries.
+    /// Empty (or empty inner) for intercept-only extras. Used by `add_rows_multi`
+    /// (covariate-weighted scatter) and the Phase 4 tail Gram recovery.
+    pub extra_slope_cols: Vec<Vec<usize>>,
 }
 
 /// The vech-diagonal θ-index walk, single source of truth for
-/// `LmmGroupings::diagonal_theta`. `primary_q` diagonal entries (column-major:
-/// the diagonal of column d sits at offset `Σ_{j<d}(primary_q−j)`) then one
-/// scalar per extra grouping at `primary_q(primary_q+1)/2 + e`.
-fn compute_diagonal_theta(primary_q: usize, n_extras: usize) -> Vec<usize> {
-    let q = primary_q;
-    let mut idx = Vec::with_capacity(q + n_extras);
-    let mut off = 0usize;
-    for d in 0..q {
-        idx.push(off);
-        off += q - d; // advance past column d's vech block (length q−d)
-    }
-    let base = q * (q + 1) / 2;
-    for e in 0..n_extras {
-        idx.push(base + e);
+/// `LmmGroupings::diagonal_theta`. Each factor (the primary, then every extra in
+/// declaration order) contributes its `q` diagonal entries (column-major: the
+/// diagonal of column d sits at offset `Σ_{j<d}(q−j)` within the factor's vech
+/// block), and the next factor's block starts `q(q+1)/2` θ-slots later. With
+/// every extra `q == 1` this is `[primary diagonals, base+0, base+1, …]` — the
+/// pre-slope layout.
+fn compute_diagonal_theta(primary_q: usize, extra_qs: &[usize]) -> Vec<usize> {
+    let mut idx = Vec::with_capacity(primary_q + extra_qs.len());
+    let mut start = 0usize;
+    for &q in std::iter::once(&primary_q).chain(extra_qs.iter()) {
+        let mut off = start;
+        for d in 0..q {
+            idx.push(off);
+            off += q - d; // advance past column d's vech block (length q−d)
+        }
+        start += q * (q + 1) / 2; // next factor's vech block
     }
     idx
 }
@@ -142,13 +184,16 @@ impl LmmGroupings {
         LmmGroupings {
             n_primary: max_clusters,
             nested_per_parent: 0,
-            nested_theta: None,
+            nested: None,
             crossed: vec![],
             extra_offsets: vec![],
             k_total: max_clusters,
             primary_q: 1,
             primary_slope_cols: vec![],
-            diagonal_theta: compute_diagonal_theta(1, 0), // [0]
+            diagonal_theta: compute_diagonal_theta(1, &[]), // [0]
+            extra_slopes_any: false,
+            extra_q: vec![],
+            extra_slope_cols: vec![],
         }
     }
 
@@ -160,6 +205,22 @@ impl LmmGroupings {
         cluster: &crate::ModelSpec,
         max_n: usize,
         slope_cols: &[usize],
+    ) -> Self {
+        // Intercept-only extras (or layout-only callers): no extra-slope x-cols.
+        Self::from_cluster_spec_ext(cluster, max_n, slope_cols, &[])
+    }
+
+    /// As [`from_cluster_spec`], plus the resolved `[X y]` column indices of each
+    /// extra grouping's slope covariates (`extra_slope_cols[e]`, declaration order;
+    /// pass `&[]` for intercept-only extras). The RE *widths* still come from the
+    /// `ModelSpec` (`1 + gs.slopes.len()`); these only supply the x-columns the
+    /// suff-stats weight by. `extra_slope_cols` shorter than the extra count, or
+    /// an empty inner vec, means that grouping is intercept-only.
+    pub fn from_cluster_spec_ext(
+        cluster: &crate::ModelSpec,
+        max_n: usize,
+        slope_cols: &[usize],
+        extra_slope_cols: &[Vec<usize>],
     ) -> Self {
         use crate::{GroupingRelation, Sizing};
         let n_primary = match &cluster.sizing {
@@ -183,48 +244,97 @@ impl LmmGroupings {
         let prim_width = q_p * n_primary;
         let n_extras = cluster.extra_groupings.len();
         debug_assert!(n_extras <= MAX_EXTRA_GROUPINGS);
+        // θ order is declaration order: each extra owns a vech(Λ_g) block of
+        // q_g(q_g+1)/2 slots starting at `vech_start`, packed after the primary
+        // vech. For all q_g == 1, `vech_start == base_theta + g` — the pre-slope
+        // scalar layout, bit-identical.
+        let base_theta = q_p * (q_p + 1) / 2;
+        let extra_qs: Vec<usize> = cluster
+            .extra_groupings
+            .iter()
+            .map(|gs| 1 + gs.slopes.len())
+            .collect();
+        let mut vech_starts = vec![0usize; n_extras];
+        let mut cursor = base_theta;
+        for (g, &q_g) in extra_qs.iter().enumerate() {
+            vech_starts[g] = cursor;
+            cursor += q_g * (q_g + 1) / 2;
+        }
         let mut nested_per_parent = 0usize;
-        let mut nested_theta = None;
+        let mut nested = None;
         let mut extra_offsets = vec![0usize; n_extras];
         for (g, gs) in cluster.extra_groupings.iter().enumerate() {
             if let GroupingRelation::NestedWithin { n_per_parent } = gs.relation {
                 nested_per_parent = (n_per_parent).max(1) as usize;
-                nested_theta = Some(q_p * (q_p + 1) / 2 + g); // scalar after the primary vech
+                nested = Some(NestedFactor {
+                    vech_start: vech_starts[g],
+                    q: extra_qs[g],
+                    decl: g,
+                });
                 extra_offsets[g] = prim_width; // nested children begin after the primary block
             }
         }
-        let mut off = prim_width + n_primary * nested_per_parent;
+        // Nested children are q_nested RE columns each (q_nested == 1 ⇒ the
+        // pre-slope single-indicator width).
+        let q_nested = nested.map(|nf| nf.q).unwrap_or(0);
+        let mut off = prim_width + n_primary * nested_per_parent * q_nested;
         let mut crossed = Vec::new();
         for (g, gs) in cluster.extra_groupings.iter().enumerate() {
             if let GroupingRelation::Crossed { n_clusters } = gs.relation {
                 let k = (n_clusters).max(1) as usize;
-                crossed.push((q_p * (q_p + 1) / 2 + g, k)); // scalar after the primary vech
+                let q_g = extra_qs[g];
+                crossed.push(CrossedFactor {
+                    vech_start: vech_starts[g],
+                    q: q_g,
+                    n_levels: k,
+                    decl: g,
+                });
                 extra_offsets[g] = off;
-                off += k;
+                off += k * q_g; // q_g RE columns per crossed level
             }
         }
+        let extra_slopes_any = extra_qs.iter().any(|&q| q > 1);
+        // Per-grouping slope x-cols, declaration order, padded to the extra count
+        // (intercept-only groupings get an empty inner vec). A provided inner vec
+        // must match `extra_qs[g] − 1` (one x-col per slope).
+        let extra_slope_cols: Vec<Vec<usize>> = (0..n_extras)
+            .map(|g| {
+                let v = extra_slope_cols.get(g).cloned().unwrap_or_default();
+                debug_assert!(v.is_empty() || v.len() == extra_qs[g] - 1);
+                v
+            })
+            .collect();
         LmmGroupings {
             n_primary,
             nested_per_parent,
-            nested_theta,
+            nested,
             crossed,
             extra_offsets,
             k_total: off,
             primary_q: q_p,
             primary_slope_cols: slope_cols.to_vec(),
-            diagonal_theta: compute_diagonal_theta(q_p, n_extras),
+            diagonal_theta: compute_diagonal_theta(q_p, &extra_qs),
+            extra_slopes_any,
+            extra_q: extra_qs,
+            extra_slope_cols,
         }
     }
 
-    /// Primary vech (`q_p(q_p+1)/2`) + one scalar per extra grouping.
-    /// q_p=1 ⇒ `1 + extra_offsets.len()` (the M2 shape).
+    /// Primary vech (`q_p(q_p+1)/2`) + a `vech(Λ_g)` block per extra grouping
+    /// (`q_g(q_g+1)/2` each). With every `q_g == 1` this is
+    /// `primary vech + #extras` — the pre-slope shape.
     pub fn n_theta(&self) -> usize {
-        self.primary_q * (self.primary_q + 1) / 2 + self.extra_offsets.len()
+        let prim = self.primary_q * (self.primary_q + 1) / 2;
+        let nested = self.nested.map(|nf| nf.q * (nf.q + 1) / 2).unwrap_or(0);
+        let crossed: usize = self.crossed.iter().map(|cf| cf.q * (cf.q + 1) / 2).sum();
+        prim + nested + crossed
     }
     /// Columns eliminated family-by-family: the `q_p` primary RE cols per level
-    /// plus nested children. (`k_crossed = k_total − k_family` is the dense tail.)
+    /// plus nested children (`q_nested` cols each). (`k_crossed = k_total −
+    /// k_family` is the dense tail.) `q_nested == 1` ⇒ the pre-slope width.
     pub fn k_family(&self) -> usize {
-        self.n_primary * (self.primary_q + self.nested_per_parent)
+        let q_nested = self.nested.map(|nf| nf.q).unwrap_or(0);
+        self.n_primary * self.primary_q + self.n_primary * self.nested_per_parent * q_nested
     }
     pub fn k_crossed(&self) -> usize {
         self.k_total - self.k_family()
@@ -258,8 +368,11 @@ impl LmmGroupings {
         let mut lower = vec![0.0; n];
         let upper = vec![THETA_HI; n];
         let diag = self.diagonal_theta();
-        let prim_vech = self.primary_q * (self.primary_q + 1) / 2;
-        for i in 0..prim_vech {
+        // Off-diagonal vech entries (primary AND every extra factor's Λ_g) get a
+        // blind start of 0 and a signed box; diagonals keep θ₀ = THETA0, box
+        // [0, HI]. q_g=1 extras are all-diagonal, so they are untouched — the
+        // pre-slope behaviour (the loop used to stop at the primary vech).
+        for i in 0..n {
             if !diag.contains(&i) {
                 theta[i] = 0.0; // off-diagonal blind start
                 lower[i] = -THETA_HI; // signed box
@@ -391,7 +504,11 @@ impl LmmSuffStats {
         for row in 0..x.nrows() {
             gid[0] = cluster_ids[row] as usize;
             for (e, ids) in extra_ids.iter().enumerate() {
-                gid[1 + e] = self.groupings.extra_offsets[e] + ids[row] as usize;
+                // Intercept RE column of this level's q_g-wide block. q_g==1 ⇒ the
+                // pre-slope `offset + id` (byte-identical); slope cols follow at
+                // `gid + 1 .. gid + q_g`.
+                gid[1 + e] =
+                    self.groupings.extra_offsets[e] + ids[row] as usize * self.groupings.extra_q[e];
             }
             debug_assert!(gid[..n_g].iter().all(|&a| a < self.counts.len()));
             for &a in &gid[..n_g] {
@@ -427,7 +544,7 @@ impl LmmSuffStats {
                     ccol[i] += self.w_buf[i] * wj;
                 }
             }
-            if self.groupings.k_crossed() > 0 {
+            if self.groupings.k_crossed() > 0 && !self.groupings.extra_slopes_any {
                 let slope = self.groupings.primary_q > 1;
                 let n_prim = self.groupings.n_primary;
                 for bi in 0..n_g {
@@ -459,6 +576,61 @@ impl LmmSuffStats {
                         }
                     }
                 }
+            } else if self.groupings.k_crossed() > 0 {
+                // Blocked crossed/nested-slopes path: fill `zx` with the FULL
+                // covariate-weighted co-occurrence zx[(a_col, b_local)] = Σ z_a·z_b
+                // over rows, for every (RE col a, crossed col b) on DISTINCT
+                // groupings. z is 1 for an intercept component, x_{slope} for a slope
+                // component. This subsumes the scalar path's counts + zx_slope; the
+                // blocked tail reads all cross-factor coupling from here, the per-
+                // level diagonal blocks from `s`/`counts`. zx_slope stays unused.
+                let g = &self.groupings;
+                let n_prim = g.n_primary;
+                for bi in 0..n_g {
+                    let b = gid[bi];
+                    if b < kf {
+                        continue; // only crossed columns own a `b_local`
+                    }
+                    let bl = b - kf;
+                    let q_b = if bi == 0 {
+                        g.primary_q
+                    } else {
+                        g.extra_q[bi - 1]
+                    };
+                    for db in 0..q_b {
+                        let z_b = if db == 0 {
+                            1.0
+                        } else if bi == 0 {
+                            self.w_buf[g.primary_slope_cols[db - 1]]
+                        } else {
+                            self.w_buf[g.extra_slope_cols[bi - 1][db - 1]]
+                        };
+                        let b_local = bl + db;
+                        for ai in 0..n_g {
+                            if ai == bi {
+                                continue;
+                            }
+                            let q_a = if ai == 0 {
+                                g.primary_q
+                            } else {
+                                g.extra_q[ai - 1]
+                            };
+                            for da in 0..q_a {
+                                let (a_col, z_a) = if da == 0 {
+                                    (gid[ai], 1.0)
+                                } else if ai == 0 {
+                                    (
+                                        da * n_prim + gid[0],
+                                        self.w_buf[g.primary_slope_cols[da - 1]],
+                                    )
+                                } else {
+                                    (gid[ai] + da, self.w_buf[g.extra_slope_cols[ai - 1][da - 1]])
+                                };
+                                self.zx[(a_col, b_local)] += z_a * z_b;
+                            }
+                        }
+                    }
+                }
             }
             // Primary slopes: each slope k's RE column at level gid[0] (offset
             // (k+1)·n_primary + gid[0]) accumulates z = x_{slope_k} weighted sums
@@ -482,6 +654,33 @@ impl LmmSuffStats {
                     }
                 }
             }
+            // Extra-grouping slopes: slope d of grouping e accumulates z = x_{slope_d}
+            // weighted [X y] into its RE column `gid[1+e] + 1 + d` (the q_g-wide level
+            // block is [intercept | slope_0 | …]). The intercept subcol gid[1+e] is
+            // already filled with z=1 by the `s` scatter above; counts is NOT
+            // incremented for slope subcols (the Gram reads `s`). Same covariate-
+            // weighted recipe as the primary; intercept-only extras scatter nothing.
+            if self.groupings.extra_slopes_any {
+                for e in 0..self.groupings.extra_slope_cols.len() {
+                    let gintercept = gid[1 + e];
+                    let n_d = self.groupings.extra_slope_cols[e].len();
+                    for d in 0..n_d {
+                        let sc = self.groupings.extra_slope_cols[e][d];
+                        let z = self.w_buf[sc];
+                        let scol = gintercept + 1 + d;
+                        let scol_mut = self
+                            .s
+                            .col_mut(scol)
+                            .try_as_col_major_mut()
+                            .unwrap()
+                            .as_slice_mut();
+                        #[allow(clippy::needless_range_loop)]
+                        for j in 0..self.m {
+                            scol_mut[j] += z * self.w_buf[j];
+                        }
+                    }
+                }
+            }
             if gid[0] + 1 > self.n_clusters {
                 self.n_clusters = gid[0] + 1;
             }
@@ -502,7 +701,7 @@ pub struct LmmFitScratch {
     /// (W_tot = n_primary·w): column f·w+r is family f's L_f⁻¹B_f row r,
     /// contiguous. Filled and solved per family, consumed by ONE triangular
     /// GEMM downdate after the family loop — the per-family tail re-traversals
-    /// are gone (the F/G post-mortem cure: traffic/chain shape, not indexing).
+    /// are gone.
     pub bt: Vec<f64>,
     /// (k_crossed+m)² tail [[H, B_x],[B_xᵀ, C]] over [crossed | X y],
     /// column-major lower triangle (entry (i,j) at j·t_dim+i); GEMM-downdated
@@ -543,6 +742,19 @@ pub struct LmmFitScratch {
     pub joint_k_inv: Mat<f64>,
     pub joint_sigma_t_chol: Mat<f64>,
     pub joint_rhs: Vec<f64>,
+    // --- crossed/nested-slopes blocked path (`reml_deviance_blocked`) ---
+    // All empty unless `extra_slopes_any`; sized once here so the blocked warm
+    // path stays zero-alloc. `k = k_total`, `dim = k + m`.
+    /// k×k materialized block-diagonal relative-covariance factor Λ (column-major
+    /// lower-tri), refreshed per θ-eval.
+    pub blocked_lam: Vec<f64>,
+    /// k×k raw RE design Gram ZᵀZ (column-major), refreshed per θ-eval.
+    pub blocked_g: Vec<f64>,
+    /// k×k scratch holding Λᵀ·ZᵀZ between the two Λ-applications.
+    pub blocked_tmp: Vec<f64>,
+    /// dim×dim penalized augmented matrix [[ΛᵀZᵀZΛ+I, ΛᵀZᵀ[Xy]],[·, [Xy]ᵀ[Xy]]]
+    /// (column-major lower-tri), faer-llt'd per θ-eval.
+    pub blocked_p: Vec<f64>,
 }
 
 impl LmmFitScratch {
@@ -554,7 +766,10 @@ impl LmmFitScratch {
         let m = p + 1;
         let w = g.primary_q + g.nested_per_parent; // q_p primary cols + nested children
         let t_dim = g.k_crossed() + m;
-        let q2 = if g.primary_q > 1 {
+        // prim_lam / prim_gram hold the q_p×q_p primary Λ/Gram on the slope path
+        // AND on the blocked crossed/nested-slopes path (which unpacks the primary
+        // Λ even when q_p == 1), so size them whenever either path can run.
+        let q2 = if g.primary_q > 1 || g.extra_slopes_any {
             g.primary_q * g.primary_q
         } else {
             0
@@ -562,6 +777,13 @@ impl LmmFitScratch {
         // Collapse scratch only on the intercept-primary path; slope w would
         // mis-size it and the path never collapses.
         let npairs = if g.primary_q == 1 { w * (w + 1) / 2 } else { 0 };
+        // Blocked crossed/nested-slopes scratch only when that path is taken.
+        let blocked_kk = if g.extra_slopes_any {
+            g.k_total * g.k_total
+        } else {
+            0
+        };
+        let blocked_dim = if g.extra_slopes_any { g.k_total + m } else { 0 };
         LmmFitScratch {
             fam_a: vec![0.0; w * w],
             bt: vec![0.0; g.n_primary * w * t_dim],
@@ -592,6 +814,10 @@ impl LmmFitScratch {
             joint_k_inv: Mat::zeros(p, p),
             joint_sigma_t_chol: Mat::zeros(p, p),
             joint_rhs: vec![0.0; p],
+            blocked_lam: vec![0.0; blocked_kk],
+            blocked_g: vec![0.0; blocked_kk],
+            blocked_tmp: vec![0.0; blocked_kk],
+            blocked_p: vec![0.0; blocked_dim * blocked_dim],
         }
     }
 }
@@ -625,16 +851,40 @@ pub fn cluster_theta_truth(cluster: &crate::ModelSpec) -> Vec<f64> {
     }
     let lam = crate::linalg::chol_lower(&d, q);
     let mut tt = Vec::with_capacity(q * (q + 1) / 2 + cluster.extra_groupings.len());
+    push_vech_chol(&mut tt, &lam, q);
+    // Each extra grouping contributes vech(chol(D_g)), D_g = diag(τ_g)·R_g·diag(τ_g)
+    // — the same recipe as the primary and as data-gen's per-factor RE draw. For
+    // q_g=1 this is √τ²_g floored, bit-identical to the prior scalar push.
+    for g in &cluster.extra_groupings {
+        let (qg, rg) = g.re_correlation_matrix();
+        let mut taug = vec![g.tau_squared.max(0.0).sqrt()];
+        for s in &g.slopes {
+            taug.push(s.variance.max(0.0).sqrt());
+        }
+        let mut dg = vec![0.0f64; qg * qg];
+        for i in 0..qg {
+            for j in 0..qg {
+                dg[i * qg + j] = taug[i] * rg[i * qg + j] * taug[j];
+            }
+        }
+        let lamg = crate::linalg::chol_lower(&dg, qg);
+        push_vech_chol(&mut tt, &lamg, qg);
+    }
+    tt
+}
+
+/// Append `vech(L)` (column-major lower-tri, the θ packing convention) of a
+/// `q×q` row-major lower-triangular Cholesky factor `lam`, flooring the diagonal
+/// entries at `THETA_TRUTH_FLOOR` (a degenerate variance must not start the
+/// optimiser exactly on the boundary). Shared by the primary and every extra
+/// factor in `cluster_theta_truth`.
+fn push_vech_chol(tt: &mut Vec<f64>, lam: &[f64], q: usize) {
     for c in 0..q {
         for rr in c..q {
             let v = lam[rr * q + c];
             tt.push(if rr == c { v.max(THETA_TRUTH_FLOOR) } else { v });
         }
     }
-    for g in &cluster.extra_groupings {
-        tt.push(g.tau_squared.max(0.0).sqrt().max(THETA_TRUTH_FLOOR));
-    }
-    tt
 }
 
 // ---------------------------------------------------------------------------
@@ -676,7 +926,22 @@ impl LmmWorkspace {
         max_n: usize,
         slope_cols: &[usize],
     ) -> Self {
-        let groupings = LmmGroupings::from_cluster_spec(cluster, max_n, slope_cols);
+        Self::for_cluster_spec_ext(p, cluster, max_n, slope_cols, &[])
+    }
+
+    /// As [`for_cluster_spec`], plus each extra grouping's resolved slope x-columns
+    /// (`extra_slope_cols`, declaration order; `&[]` for intercept-only extras) —
+    /// the crossed/nested-slopes entry. Both `glmm::fit` (standalone) and
+    /// `glmm::mcpower` bind through here.
+    pub fn for_cluster_spec_ext(
+        p: usize,
+        cluster: &crate::ModelSpec,
+        max_n: usize,
+        slope_cols: &[usize],
+        extra_slope_cols: &[Vec<usize>],
+    ) -> Self {
+        let groupings =
+            LmmGroupings::from_cluster_spec_ext(cluster, max_n, slope_cols, extra_slope_cols);
         let n_theta = groupings.n_theta();
         // θ truth-start via the shared helper — always-vech path (behaviour-
         // preserving: for q=1 chol([[τ²]]) = [[√τ²]], vech = [√τ²], bit-identical
@@ -697,8 +962,8 @@ impl LmmWorkspace {
                 .map(|&i| theta_truth[i])
                 .fold(f64::INFINITY, f64::min))
         .min(RHO_BEGIN);
-        // npt: ⌈1.5n⌉+1 from n_theta = 3 up, Powell's 2n+1 below (E2 npt sweep,
-        // 2026-06-12, clock-locked): the mid model wins on every measured dim ≥ 3
+        // npt: ⌈1.5n⌉+1 from n_theta = 3 up, Powell's 2n+1 below: the mid model
+        // wins on every measured dim ≥ 3
         // (n=3 lmm_slope 1.06x / crossed_nested 1.05x, n=6 multislope 1.10x —
         // mostly smaller kernel inner dims, evals/fit flat), while at n=2 the
         // range collapses to n+2, which loses (lmm_nested 0.88x, evals 21.8→26.6).
@@ -753,9 +1018,9 @@ impl LmmWorkspace {
 // ---------------------------------------------------------------------------
 
 /// Unpack the primary q×q lower-triangular Λ from the column-major vech θ prefix
-/// into `lam` (row-major, len q·q; upper triangle zeroed). `pub(crate)` — Task 9
-/// reuses it to reconstruct the RE covariance D = ΛΛ′ for the introspection
-/// surface. Caller owns `lam` so the deviance hot loop stays zero-alloc.
+/// into `lam` (row-major, len q·q; upper triangle zeroed). `pub(crate)` — the
+/// introspection surface reuses it to reconstruct the RE covariance D = ΛΛ′.
+/// Caller owns `lam` so the deviance hot loop stays zero-alloc.
 pub fn primary_lambda(theta: &[f64], q: usize, lam: &mut [f64]) {
     for v in lam[..q * q].iter_mut() {
         *v = 0.0;
@@ -896,6 +1161,268 @@ pub(crate) fn precompute_balanced_collapse(suff: &LmmSuffStats, fit: &mut LmmFit
 // reml_deviance — the blocked-Cholesky objective.
 // ---------------------------------------------------------------------------
 
+/// Crossed/nested random-slopes REML deviance — the gated `extra_slopes_any`
+/// path. Builds the full penalized augmented matrix
+/// `P = [[ΛᵀZᵀZΛ + I, ΛᵀZᵀ[Xy]], [·, [Xy]ᵀ[Xy]]]` over `[all RE cols | X y]`
+/// and takes ONE dense Cholesky. The crossed dimension is bounded (crossed forces
+/// a FixedClusters primary), so `k = k_total` is independent of N. The block-
+/// diagonal `Λ` carries each grouping's `q_g×q_g` relative-covariance factor; the
+/// raw RE Gram `ZᵀZ` is recovered from the suff stats (per-level diagonal blocks
+/// from `s`/`counts`, cross-factor blocks from the weighted `zx`). Same deviance
+/// normalization as [`reml_deviance`] (`log|L_ZZ|² + log|L_XX|² + (N−P)·log σ̂²`),
+/// so it reduces to the scalar value (to FP reassociation) when every `q_g == 1`.
+///
+/// Zero-alloc warm path: every buffer lives in `LmmFitScratch` (`blocked_*`),
+/// sized once when `extra_slopes_any`. Returns INFINITY on any Cholesky failure.
+fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> f64 {
+    let g = &suff.groupings;
+    let m = suff.m;
+    let p = m - 1;
+    let k = g.k_total;
+    let dim = k + m;
+    let n_prim = g.n_primary;
+    let q_p = g.primary_q;
+    let np = g.nested_per_parent;
+    let prim_width = q_p * n_prim;
+    let kf = g.k_family();
+
+    // --- Λ (k×k, column-major lower-tri): block-diagonal per grouping/level ---
+    fit.blocked_lam[..k * k].fill(0.0);
+    // Primary: Λ_p on each level f's SCATTERED component columns {d·n_prim + f}.
+    primary_lambda(theta, q_p, &mut fit.prim_lam);
+    for f in 0..n_prim {
+        for dc in 0..q_p {
+            for dr in dc..q_p {
+                let row = dr * n_prim + f;
+                let col = dc * n_prim + f;
+                fit.blocked_lam[col * k + row] = fit.prim_lam[dr * q_p + dc];
+            }
+        }
+    }
+    // Nested children: each child level's q_n×q_n Λ_n on its CONTIGUOUS block
+    // [ic .. ic+q_n] — mirrors the crossed block below; the only difference is the
+    // block stride (a child id is `f·np + c`, scattered after the primary block).
+    // q_n==1 ⇒ a single scalar θ_n on the diagonal, byte-identical to the prior
+    // intercept-only layout.
+    if let Some(nf) = g.nested {
+        let q_n = nf.q;
+        let mut lam_n = [0.0f64; MAX_EXTRA_Q * MAX_EXTRA_Q];
+        primary_lambda(&theta[nf.vech_start..], q_n, &mut lam_n);
+        for f in 0..n_prim {
+            for c in 0..np {
+                let ic = prim_width + (f * np + c) * q_n;
+                for dc in 0..q_n {
+                    for dr in dc..q_n {
+                        fit.blocked_lam[(ic + dc) * k + (ic + dr)] = lam_n[dr * q_n + dc];
+                    }
+                }
+            }
+        }
+    }
+    // Crossed: Λ_g on each level's CONTIGUOUS block [ic .. ic+q_g].
+    let mut lam_g = [0.0f64; MAX_EXTRA_Q * MAX_EXTRA_Q];
+    for cf in &g.crossed {
+        let q = cf.q;
+        primary_lambda(&theta[cf.vech_start..], q, &mut lam_g);
+        let off = g.extra_offsets[cf.decl];
+        for c in 0..cf.n_levels {
+            let ic = off + c * q;
+            for dc in 0..q {
+                for dr in dc..q {
+                    fit.blocked_lam[(ic + dc) * k + (ic + dr)] = lam_g[dr * q + dc];
+                }
+            }
+        }
+    }
+
+    // --- raw RE design Gram G = ZᵀZ (k×k, full symmetric, column-major) ---
+    // Step B: cross-factor coupling from the weighted `zx` (a = any RE col, b =
+    // crossed col). Same-factor entries are 0 in `zx`; overwritten by step C.
+    fit.blocked_g[..k * k].fill(0.0);
+    for b in kf..k {
+        let bl = b - kf;
+        for a in 0..k {
+            let v = suff.zx[(a, bl)];
+            fit.blocked_g[b * k + a] = v;
+            fit.blocked_g[a * k + b] = v;
+        }
+    }
+    // Step C: per-level diagonal blocks from `s`/`counts`.
+    // Primary family blocks G_f (component-major scatter).
+    for f in 0..n_prim {
+        primary_gram(suff, g, f, q_p, &mut fit.prim_gram);
+        for dr in 0..q_p {
+            for dc in 0..q_p {
+                fit.blocked_g[(dc * n_prim + f) * k + (dr * n_prim + f)] =
+                    fit.prim_gram[dr * q_p + dc];
+            }
+        }
+    }
+    // Nested children: per-child q_n×q_n diagonal Gram block + the primary↔child
+    // cross-Gram. The diagonal block is a level's covariate-weighted scatter from
+    // `s`/`counts`, identical in form to a crossed level's block (below). The cross
+    // block is the within-family coupling — a nested child shares its rows with its
+    // parent, so this q_p×q_n Σ_{child} z^{prim}·z^{child} is NOT in `zx` (which is
+    // crossed-only). Entry (prim da, child dc): z=1 for an intercept component,
+    // x_slope for a slope component; the four cases pick the matching `s`/`counts`
+    // scatter. q_n==1 collapses to the prior n_c diagonal + the dc==0 cross column.
+    if let Some(nf) = g.nested {
+        let q_n = nf.q;
+        let nscols = &g.extra_slope_cols[nf.decl];
+        for f in 0..n_prim {
+            for c in 0..np {
+                let ic = prim_width + (f * np + c) * q_n;
+                let n_c = f64::from(suff.counts[ic]);
+                for dr in 0..q_n {
+                    for dc in 0..q_n {
+                        let v = if dr == 0 && dc == 0 {
+                            n_c
+                        } else if dr == 0 {
+                            suff.s[(nscols[dc - 1], ic)] // Σ x_{dc-1}
+                        } else if dc == 0 {
+                            suff.s[(nscols[dr - 1], ic)] // Σ x_{dr-1}
+                        } else {
+                            suff.s[(nscols[dr - 1], ic + dc)] // Σ x_{dr-1} x_{dc-1}
+                        };
+                        fit.blocked_g[(ic + dc) * k + (ic + dr)] = v;
+                    }
+                }
+                for da in 0..q_p {
+                    let prow = da * n_prim + f;
+                    for dc in 0..q_n {
+                        let ccol = ic + dc;
+                        let v = if da == 0 && dc == 0 {
+                            n_c
+                        } else if dc == 0 {
+                            suff.s[(g.primary_slope_cols[da - 1], ic)] // Σ x^p_{da-1}
+                        } else if da == 0 {
+                            suff.s[(nscols[dc - 1], ic)] // Σ x^n_{dc-1}
+                        } else {
+                            suff.s[(g.primary_slope_cols[da - 1], ic + dc)] // Σ x^p_{da-1} x^n_{dc-1}
+                        };
+                        fit.blocked_g[ccol * k + prow] = v;
+                        fit.blocked_g[prow * k + ccol] = v;
+                    }
+                }
+            }
+        }
+    }
+    // Crossed diagonal blocks G_gc (intercept n_c, slope rows covariate-weighted).
+    for cf in &g.crossed {
+        let q = cf.q;
+        let off = g.extra_offsets[cf.decl];
+        let scols = &g.extra_slope_cols[cf.decl];
+        for c in 0..cf.n_levels {
+            let ic = off + c * q;
+            let n_c = f64::from(suff.counts[ic]);
+            for dr in 0..q {
+                for dc in 0..q {
+                    let v = if dr == 0 && dc == 0 {
+                        n_c
+                    } else if dr == 0 {
+                        suff.s[(scols[dc - 1], ic)] // Σ x_{dc-1}
+                    } else if dc == 0 {
+                        suff.s[(scols[dr - 1], ic)] // Σ x_{dr-1}
+                    } else {
+                        suff.s[(scols[dr - 1], ic + dc)] // Σ x_{dr-1} x_{dc-1}
+                    };
+                    fit.blocked_g[(ic + dc) * k + (ic + dr)] = v;
+                }
+            }
+        }
+    }
+
+    // --- penalized augmented matrix P (dim×dim, column-major lower-tri) ---
+    // P_zz = Λᵀ G Λ + I via two block-diagonal-aware contractions (tmp = ΛᵀG).
+    fit.blocked_tmp[..k * k].fill(0.0);
+    for bp in 0..k {
+        for a in 0..k {
+            let mut acc = 0.0;
+            for ap in 0..k {
+                let l = fit.blocked_lam[a * k + ap]; // Λ[ap][a]
+                if l != 0.0 {
+                    acc += l * fit.blocked_g[bp * k + ap]; // G[ap][bp]
+                }
+            }
+            fit.blocked_tmp[bp * k + a] = acc;
+        }
+    }
+    for b in 0..k {
+        for a in b..k {
+            let mut acc = 0.0;
+            for bp in 0..k {
+                let l = fit.blocked_lam[b * k + bp]; // Λ[bp][b]
+                if l != 0.0 {
+                    acc += fit.blocked_tmp[bp * k + a] * l;
+                }
+            }
+            if a == b {
+                acc += 1.0; // + I
+            }
+            fit.blocked_p[b * dim + a] = acc;
+        }
+    }
+    // P_zx = Λᵀ Zᵀ[Xy]: row (k+j), col a = Σ_{a'} Λ[a'][a]·s[(j, a')]. (Zᵀ[Xy] = s.)
+    for a in 0..k {
+        for j in 0..m {
+            let mut acc = 0.0;
+            for ap in 0..k {
+                let l = fit.blocked_lam[a * k + ap];
+                if l != 0.0 {
+                    acc += l * suff.s[(j, ap)];
+                }
+            }
+            fit.blocked_p[a * dim + (k + j)] = acc;
+        }
+    }
+    // [Xy]ᵀ[Xy] block = suff.c (lower-tri).
+    for j in 0..m {
+        for i in j..m {
+            fit.blocked_p[(k + j) * dim + (k + i)] = suff.c[(i, j)];
+        }
+    }
+
+    // --- one dense Cholesky; read the deviance off the factor ---
+    let pref = faer::MatRef::from_column_major_slice(&fit.blocked_p[..dim * dim], dim, dim);
+    let chol = match pref.llt(faer::Side::Lower) {
+        Ok(c) => c,
+        Err(_) => return f64::INFINITY,
+    };
+    let l = chol.L();
+    let mut log_lzz_half = 0.0_f64;
+    for i in 0..k {
+        let lii = l[(i, i)];
+        if !(lii.is_finite() && lii > 0.0) {
+            return f64::INFINITY;
+        }
+        log_lzz_half += lii.ln();
+    }
+    let mut log_lxx_sq = 0.0_f64;
+    for j in 0..p {
+        let ljj = l[(k + j, k + j)];
+        if !(ljj.is_finite() && ljj > 0.0) {
+            return f64::INFINITY;
+        }
+        log_lxx_sq += ljj.ln();
+    }
+    log_lxx_sq *= 2.0;
+    // Trailing m×m → fit.factor (recovery reads only this, M1 semantics).
+    for j in 0..m {
+        for i in 0..m {
+            fit.factor[(i, j)] = if i >= j { l[(k + i, k + j)] } else { 0.0 };
+        }
+    }
+    let lyy = fit.factor[(p, p)];
+    let r_sq = lyy * lyy;
+    let df = (suff.n_rows - p) as f64;
+    let sigma_sq = r_sq / df;
+    if !(sigma_sq.is_finite() && sigma_sq > 0.0) {
+        return f64::INFINITY;
+    }
+    fit.sigma_sq = sigma_sq;
+    2.0 * log_lzz_half + log_lxx_sq + df * sigma_sq.ln()
+}
+
 /// REML profiled deviance at θ via the family-blocked augmented Cholesky.
 ///
 /// Ω_θ over [primary | nested children | crossed | X y]. The leading block is
@@ -905,7 +1432,7 @@ pub(crate) fn precompute_balanced_collapse(suff: &LmmSuffStats, fit: &mut LmmFit
 /// [crossed | X y] tail — cost linear in cluster count. The per-family tail
 /// downdates are stacked into ONE triangular GEMM after the family loop
 /// (Tail −= Bt·Bt′ over the solved couplings in `bt`; result-moving vs the
-/// old sequential per-family subtraction — the F/G chain-latency cure).
+/// old sequential per-family subtraction).
 /// Crossed factors couple everything (the dense Z_a′Z_b coupling, sanctioned
 /// dense within the stated regime), so they stay in the tail with [X y]: one
 /// dense (k_crossed+m) faer llt per evaluation. With no extras this is M1's
@@ -949,13 +1476,18 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
     if suff.n_rows <= p || p == 0 {
         return f64::INFINITY;
     }
+    // Crossed/nested random slopes route to the dense blocked path; the scalar
+    // tail below stays byte-identical for every current (q_g==1) contract.
+    if g.extra_slopes_any {
+        return reml_deviance_blocked(theta, suff, fit);
+    }
     let kf = g.k_family();
     let kx = g.k_crossed();
     let t_dim = kx + m;
     let np = g.nested_per_parent;
     let w = g.primary_q + np; // width-general family width: q_p primary cols + nested children
     let th_p = theta[0];
-    let th_n = g.nested_theta.map(|t| theta[t]).unwrap_or(0.0);
+    let th_n = g.nested.map(|nf| theta[nf.vech_start]).unwrap_or(0.0);
 
     // Width-general primary factor (q_p ≥ 2 ⇒ slope path; q_p == 1 ⇒ M2 scalar,
     // kept byte-identical). The slope path may now carry a crossed/nested tail
@@ -966,12 +1498,15 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
         primary_lambda(theta, g.primary_q, &mut fit.prim_lam);
     }
 
-    // λ per local crossed column.
+    // λ per local crossed column. This scalar tail handles intercept-only extras
+    // (q_g == 1, `vech_start` is the scalar θ index); slopes-on-extras (q_g > 1)
+    // route to the blocked path before reaching here (Phase 4 gate).
+    debug_assert!(!g.extra_slopes_any);
     {
         let mut b = 0usize;
-        for &(ti, k) in &g.crossed {
-            for _ in 0..k {
-                fit.lam_x[b] = theta[ti];
+        for cf in &g.crossed {
+            for _ in 0..cf.n_levels {
+                fit.lam_x[b] = theta[cf.vech_start];
                 b += 1;
             }
         }
@@ -1289,9 +1824,8 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
         // triangular GEMM through faer's blocked multi-accumulator FMA kernels
         // (Par::Seq — per-fit parallelism is the outer rayon loop). RESULT-MOVING:
         // GEMM accumulation order replaces the per-family sequential subtraction;
-        // sanctioned (rides the golden re-freeze campaign), verified against the
-        // brute-force oracle + Gate-0 parity bands which are orders wider than the
-        // reorder's last-ulp footprint.
+        // sanctioned, verified against the brute-force oracle + parity bands which
+        // are orders wider than the reorder's last-ulp footprint.
         let w_tot = g.n_primary * w;
         {
             let bt = faer::MatRef::from_column_major_slice(&fit.bt[..t_dim * w_tot], t_dim, w_tot);
@@ -1667,7 +2201,7 @@ mod tests {
 
     /// All scratch is overwritten per call — re-evaluating a θ after an
     /// intervening different-θ call reproduces bit-identical deviance and σ̂²
-    /// (mirrors lme.rs's EST-20 stale-state test).
+    /// (mirrors lme.rs's stale-state test).
     #[test]
     fn reml_deviance_overwrites_state() {
         let (x, y, ids) = hand_dataset();
@@ -2454,6 +2988,64 @@ mod tests {
         );
     }
 
+    /// Crossed-slopes twin of the bounded-alloc gate: the blocked path's only
+    /// per-eval heap traffic is the faer `llt` internals (everything else lives in
+    /// `LmmFitScratch.blocked_*`, sized once). Same acceptance class as the other
+    /// general fits; faer-version/machine specific — if faer changes its Cholesky
+    /// internals, update the bound, do not relax.
+    #[test]
+    #[ignore]
+    fn lmm_fit_crossed_slope_warm_path_bounded_alloc() {
+        const N_CALLS: usize = 100;
+        // Measured ~46100 (this machine, faer 0.x): ~460 blocks/fit = the dim≈31
+        // tail `llt` internals × the ~50–90 BOBYQA evals of a 6-θ fit. ALL faer-
+        // internal — `reml_deviance_blocked` itself is zero-alloc (every buffer is
+        // in `blocked_*` scratch; only a stack `lam_g`). faer-version/machine
+        // specific; if faer changes its Cholesky internals, update — do not relax.
+        const BOUND: u64 = 55000;
+
+        let (x, y, pid, eid) = crossed_slope_golden_dataset();
+        let sl = |v| SlopeTerm {
+            column: 1,
+            variance: v,
+            corr_with_intercept: 0.0,
+            corr_with: vec![],
+        };
+        let cluster = ModelSpec {
+            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            tau_squared: 0.15,
+            slopes: vec![sl(0.12)],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 6 },
+                tau_squared: 0.18,
+                slopes: vec![sl(0.04)],
+            }],
+            estimator: Estimator::Mle,
+            wald_se: WaldSe::Hessian,
+        };
+        let mut ws = LmmWorkspace::for_cluster_spec_ext(2, &cluster, x.nrows(), &[1], &[vec![1]]);
+        let truth = ws.theta_truth.clone();
+        ws.suff.reset();
+        ws.suff.add_rows_multi(x.as_ref(), &y, &pid, &[eid.clone()]);
+        let _ = fit_lmm(&mut ws, &[1], Some(&truth));
+
+        let profiler = dhat::Profiler::builder().testing().build();
+        for _ in 0..N_CALLS {
+            ws.suff.reset();
+            ws.suff.add_rows_multi(x.as_ref(), &y, &pid, &[eid.clone()]);
+            let _ = fit_lmm(&mut ws, &[1], Some(&truth));
+        }
+        let stats = dhat::HeapStats::get();
+        drop(profiler);
+        assert!(
+            stats.total_blocks <= BOUND,
+            "crossed-slope fit_lmm allocated {} blocks across {} warm-path calls (BOUND = {})",
+            stats.total_blocks,
+            N_CALLS,
+            BOUND
+        );
+    }
+
     /// Truth-start lands in the same minimum as blind on multi-grouping
     /// surfaces (the P1 multimodality probe at M2's n_theta).
     #[test]
@@ -2924,6 +3516,199 @@ mod tests {
         LmmGroupings::from_cluster_spec(&cluster, 80, &[1])
     }
 
+    // --- Phase 1: θ-layout generalization (scalar → vech ranges) ---
+
+    /// One intercept-only primary + one crossed grouping of RE width `q_g`
+    /// (intercept + `q_g−1` slopes), expressed through the slope machinery — the
+    /// Phase 1 θ-layout fixture. Slope columns are placeholders (layout reads only
+    /// `slopes.len()`).
+    fn groupings_primary1_crossed_qg(q_g: usize) -> LmmGroupings {
+        let slopes: Vec<SlopeTerm> = (0..q_g - 1)
+            .map(|k| SlopeTerm {
+                column: (k + 1) as u32,
+                variance: 0.1,
+                corr_with_intercept: 0.0,
+                corr_with: vec![0.0; k],
+            })
+            .collect();
+        let cluster = ModelSpec {
+            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            tau_squared: 0.25,
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 5 },
+                tau_squared: 0.16,
+                slopes,
+            }],
+            estimator: Estimator::Mle,
+            wald_se: WaldSe::Hessian,
+        };
+        LmmGroupings::from_cluster_spec(&cluster, 80, &[])
+    }
+
+    #[test]
+    fn extra_qg1_theta_layout_matches_scalar() {
+        // Intercept-only crossed factor through the slope machinery = the old
+        // scalar layout: one primary scalar + one extra scalar.
+        let g = groupings_primary1_crossed_qg(1);
+        assert_eq!(g.n_theta(), 1 + 1);
+        assert_eq!(g.crossed[0].vech_start, 1);
+        assert_eq!(g.crossed[0].q, 1);
+        assert!(!g.extra_slopes_any);
+    }
+
+    #[test]
+    fn extra_qg2_theta_packs_vech3() {
+        let g = groupings_primary1_crossed_qg(2);
+        assert_eq!(g.crossed[0].q, 2);
+        assert_eq!(g.n_theta(), 1 + 3); // primary scalar + vech(2×2)=3
+        assert!(g.extra_slopes_any);
+        // The extra block's two diagonal θ indices are vech_start (=1) and
+        // vech_start + 2 (=3) under the column-major lower-tri convention.
+        let diag = &g.diagonal_theta;
+        assert!(diag.contains(&1) && diag.contains(&3));
+        // Off-diagonal λ₁₀ at index 2 is NOT a diagonal (signed box).
+        assert!(!diag.contains(&2));
+    }
+
+    #[test]
+    fn cluster_theta_truth_packs_extra_vech() {
+        // Crossed grouping with one slope ⇒ vech(chol(D_g)) is 3 entries; total θ
+        // length matches n_theta (primary scalar + extra vech3).
+        let cluster = ModelSpec {
+            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            tau_squared: 0.25,
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 5 },
+                tau_squared: 0.16,
+                slopes: vec![SlopeTerm {
+                    column: 1,
+                    variance: 0.10,
+                    corr_with_intercept: 0.3,
+                    corr_with: vec![],
+                }],
+            }],
+            estimator: Estimator::Mle,
+            wald_se: WaldSe::Hessian,
+        };
+        let g = LmmGroupings::from_cluster_spec(&cluster, 80, &[]);
+        let tt = cluster_theta_truth(&cluster);
+        assert_eq!(tt.len(), g.n_theta());
+        assert_eq!(tt.len(), 4);
+        // Extra block at [1,2,3]: diagonals √0.16 and chol-derived, off-diagonal at [2].
+        assert!((tt[1] - 0.16f64.sqrt()).abs() < 1e-12); // λ₀₀ = √τ²_g
+    }
+
+    /// Reduction-to-scalar parity: an intercept-only extra expressed through the
+    /// (now vech-capable) machinery yields the SAME θ-truth as before — a single
+    /// √τ²_g scalar after the primary.
+    #[test]
+    fn cluster_theta_truth_qg1_extra_matches_scalar() {
+        let cluster = ModelSpec {
+            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            tau_squared: 0.25,
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 5 },
+                tau_squared: 0.16,
+                slopes: vec![],
+            }],
+            estimator: Estimator::Mle,
+            wald_se: WaldSe::Hessian,
+        };
+        let tt = cluster_theta_truth(&cluster);
+        assert_eq!(tt.len(), 2);
+        assert!((tt[0] - 0.25f64.sqrt()).abs() < 1e-12);
+        assert!((tt[1] - 0.16f64.sqrt()).abs() < 1e-12);
+    }
+
+    // --- Phase 3: extra-slope sufficient statistics ---
+
+    /// Brute-force the `s` columns for a crossed factor carrying a slope: the
+    /// intercept subcol is Σ_{rows∈level} [X y]; the slope subcol is Σ x_slope·[X y].
+    #[test]
+    fn extra_crossed_slope_s_columns_match_bruteforce() {
+        let n = 6usize;
+        let p = 3; // [1, x1, x2]
+        let xd = [
+            (0.5, -0.2),
+            (-0.3, 0.7),
+            (0.9, 0.1),
+            (-0.6, -0.4),
+            (0.2, 0.8),
+            (0.4, -0.5),
+        ];
+        let cluster_ids = [0u32, 1, 0, 1, 0, 1];
+        let crossed_ids = [0u32, 1, 2, 0, 1, 2];
+        let y = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut x = Mat::<f64>::zeros(n, p);
+        for i in 0..n {
+            x[(i, 0)] = 1.0;
+            x[(i, 1)] = xd[i].0;
+            x[(i, 2)] = xd[i].1;
+        }
+        let cluster = ModelSpec {
+            sizing: Sizing::FixedClusters { n_clusters: 2 },
+            tau_squared: 0.2,
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 3 },
+                tau_squared: 0.1,
+                slopes: vec![SlopeTerm {
+                    column: 1,
+                    variance: 0.1,
+                    corr_with_intercept: 0.0,
+                    corr_with: vec![],
+                }],
+            }],
+            estimator: Estimator::Mle,
+            wald_se: WaldSe::Hessian,
+        };
+        // crossed slope on x_full col 1.
+        let g = LmmGroupings::from_cluster_spec_ext(&cluster, n, &[], &[vec![1]]);
+        // crossed block: q_g=2, offset = prim_width = 2 (n_primary=2, q_p=1).
+        assert_eq!(g.extra_offsets[0], 2);
+        assert_eq!(g.extra_q[0], 2);
+        let mut suff = LmmSuffStats::with_groupings(p, g);
+        suff.add_rows_multi(x.as_ref(), &y, &cluster_ids, &[crossed_ids.to_vec()]);
+        let m = p + 1;
+        for c in 0..3usize {
+            let icol = 2 + c * 2;
+            let scol = icol + 1;
+            let mut s_int = vec![0.0; m];
+            let mut s_slope = vec![0.0; m];
+            for i in 0..n {
+                if crossed_ids[i] as usize == c {
+                    let w = [x[(i, 0)], x[(i, 1)], x[(i, 2)], y[i]];
+                    let x1 = x[(i, 1)];
+                    for j in 0..m {
+                        s_int[j] += w[j];
+                        s_slope[j] += x1 * w[j];
+                    }
+                }
+            }
+            for j in 0..m {
+                assert!(
+                    (suff.s[(j, icol)] - s_int[j]).abs() < 1e-12,
+                    "intercept col level {c} row {j}: got {} want {}",
+                    suff.s[(j, icol)],
+                    s_int[j]
+                );
+                assert!(
+                    (suff.s[(j, scol)] - s_slope[j]).abs() < 1e-12,
+                    "slope col level {c} row {j}: got {} want {}",
+                    suff.s[(j, scol)],
+                    s_slope[j]
+                );
+            }
+            // counts only on the intercept subcol.
+            let n_c = crossed_ids.iter().filter(|&&l| l as usize == c).count() as u32;
+            assert_eq!(suff.counts[icol], n_c);
+            assert_eq!(suff.counts[scol], 0);
+        }
+    }
+
     /// REML deviance on the explicit n×n V for the composed model: the 2×2
     /// primary slope block (D_p = ΛΛ′ over [1, x1]) PLUS the extra-grouping
     /// intercept block (θ_e² when the extra ids match). The f32 data is widened
@@ -2937,8 +3722,7 @@ mod tests {
         pid: &[u32],
         eid: &[u32],
     ) -> f64 {
-        use faer::linalg::solvers::Solve;
-        let (n, p) = (x.nrows(), x.ncols());
+        let n = x.nrows();
         let (a, b, c) = (theta[0], theta[1], theta[2]);
         // D_p = ΛΛ′, Λ = [[a,0],[b,c]] (column-major vech).
         let (d00, d01, d11) = (a * a, a * b, b * b + c * c);
@@ -2958,7 +3742,15 @@ mod tests {
                 }
             }
         }
-        // REML profile (identical to the other oracles): ldv + ldk + df·ln s².
+        reml_profile_from_v(&v, x, y)
+    }
+
+    /// REML profiled deviance from an explicit n×n marginal V (in residual-σ²
+    /// units): `log|V| + log|XᵀV⁻¹X| + (N−P)·log σ̂²`. The shared V→deviance back
+    /// end for every brute-force oracle (composed, crossed-slope, …).
+    fn reml_profile_from_v(v: &Mat<f64>, x: &Mat<f64>, y: &[f64]) -> f64 {
+        use faer::linalg::solvers::Solve;
+        let (n, p) = (x.nrows(), x.ncols());
         let vc = v.as_ref().llt(faer::Side::Lower).unwrap();
         let mut ldv = 0.0;
         for i in 0..n {
@@ -3012,6 +3804,40 @@ mod tests {
         ldv + ldk + df * s2.ln()
     }
 
+    /// Brute-force REML deviance for a CROSSED-SLOPE model
+    /// `y ~ x1 + (1+x1 | primary) + (1+x1 | crossed)`: V = I + Z_p D_p Z_pᵀ +
+    /// Z_e D_e Z_eᵀ, each D a 2×2 from its vech θ over [1, x1]. θ =
+    /// [primary vech (3) ; crossed vech (3)].
+    fn brute_force_crossed_slope_deviance(
+        theta: &[f64],
+        x: &Mat<f64>,
+        y: &[f64],
+        pid: &[u32],
+        eid: &[u32],
+    ) -> f64 {
+        let n = x.nrows();
+        let (ap, bp, cp) = (theta[0], theta[1], theta[2]);
+        let (dp00, dp01, dp11) = (ap * ap, ap * bp, bp * bp + cp * cp);
+        let (ae, be, ce) = (theta[3], theta[4], theta[5]);
+        let (de00, de01, de11) = (ae * ae, ae * be, be * be + ce * ce);
+        let mut v = Mat::<f64>::zeros(n, n);
+        for i in 0..n {
+            v[(i, i)] += 1.0;
+        }
+        for i in 0..n {
+            for j in 0..n {
+                let (zi, zj) = (x[(i, 1)], x[(j, 1)]);
+                if pid[i] == pid[j] {
+                    v[(i, j)] += dp00 + dp01 * (zi + zj) + dp11 * zi * zj;
+                }
+                if eid[i] == eid[j] {
+                    v[(i, j)] += de00 + de01 * (zi + zj) + de11 * zi * zj;
+                }
+            }
+        }
+        reml_profile_from_v(&v, x, y)
+    }
+
     /// Slope + crossed: the composed deviance matches the brute-force oracle to
     /// 1e-8 — the Task 6 composition gate. zx_slope carries the slope↔crossed
     /// coupling; the primary 2×2 block and the item intercept block are coupled
@@ -3036,6 +3862,484 @@ mod tests {
                 "θ={th:?}: {dev} vs {oracle}"
             );
         }
+    }
+
+    /// CROSSED SLOPES (the headline lme4-parity case): `y ~ x1 + (1+x1 | primary)
+    /// + (1+x1 | item)` — both grouping factors carry a random slope on x1, so the
+    /// gated blocked path runs. Deviance must match the explicit-V oracle to 1e-7
+    /// across θ, including the primary-slope↔crossed-slope coupling (the x1²
+    /// weighted co-occurrence) the blocked `zx` fill captures.
+    #[test]
+    fn crossed_slope_deviance_matches_brute_force() {
+        let cluster = ModelSpec {
+            sizing: Sizing::FixedClusters { n_clusters: 5 },
+            tau_squared: 0.25,
+            slopes: vec![SlopeTerm {
+                column: 1,
+                variance: 0.10,
+                corr_with_intercept: 0.2,
+                corr_with: vec![],
+            }],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 4 },
+                tau_squared: 0.16,
+                slopes: vec![SlopeTerm {
+                    column: 1,
+                    variance: 0.09,
+                    corr_with_intercept: 0.1,
+                    corr_with: vec![],
+                }],
+            }],
+            estimator: Estimator::Mle,
+            wald_se: WaldSe::Hessian,
+        };
+        let n = 60; // atom = 5·4 = 20 ⇒ 3 balanced blocks
+        let mut st = 91u64;
+        let u0p: Vec<f64> = (0..5).map(|_| 0.5 * lcg(&mut st)).collect();
+        let u1p: Vec<f64> = (0..5).map(|_| 0.3 * lcg(&mut st)).collect();
+        let u0e: Vec<f64> = (0..4).map(|_| 0.4 * lcg(&mut st)).collect();
+        let u1e: Vec<f64> = (0..4).map(|_| 0.3 * lcg(&mut st)).collect();
+        let mut x = Mat::<f64>::zeros(n, 2);
+        let mut y = vec![0.0f64; n];
+        let mut pid = vec![0u32; n];
+        let mut eid = vec![0u32; n];
+        for i in 0..n {
+            let par = cluster.sizing.cluster_of_row(i);
+            let item = extra_level_of_row(&cluster, 0, i) as usize;
+            pid[i] = par as u32;
+            eid[i] = item as u32;
+            let x1 = lcg(&mut st);
+            x[(i, 0)] = 1.0;
+            x[(i, 1)] = x1;
+            y[i] = 0.5
+                + 0.4 * x1
+                + u0p[par]
+                + u1p[par] * x1
+                + u0e[item]
+                + u1e[item] * x1
+                + 0.8 * lcg(&mut st);
+        }
+        let g = LmmGroupings::from_cluster_spec_ext(&cluster, n, &[1], &[vec![1]]);
+        assert!(g.extra_slopes_any, "must route to the blocked path");
+        let mut suff = LmmSuffStats::with_groupings(2, g);
+        suff.add_rows_multi(x.as_ref(), &y, &pid, &[eid.clone()]);
+        let gref = LmmGroupings::from_cluster_spec_ext(&cluster, n, &[1], &[vec![1]]);
+        let mut fit = LmmFitScratch::with_groupings(2, &gref);
+        // θ = [primary vech (λ₀₀,λ₁₀,λ₁₁) ; crossed vech (λ₀₀,λ₁₀,λ₁₁)].
+        for th in [
+            vec![1.0, 0.0, 1.0, 1.0, 0.0, 1.0],
+            vec![0.7, 0.2, 0.5, 0.6, 0.1, 0.4],
+            vec![1.3, -0.3, 0.6, 0.9, -0.2, 0.5],
+        ] {
+            let dev = reml_deviance(&th, &suff, &mut fit);
+            let oracle = brute_force_crossed_slope_deviance(&th, &x, &y, &pid, &eid);
+            assert!(dev.is_finite(), "θ={th:?}");
+            assert!(
+                (dev - oracle).abs() <= 1e-7 * oracle.abs().max(1.0),
+                "θ={th:?}: {dev} vs {oracle}"
+            );
+        }
+    }
+
+    /// NESTED SLOPES (the M1.5 defect): `y ~ x1 + (1+x1 | grp) + (1+x1 | class)`,
+    /// class nested in grp — both grouping factors carry a random slope on x1, so
+    /// the gated blocked path runs with a nested factor of q_n = 2. Before the M1.5
+    /// fix the blocked path assembled the nested children intercept-only (scalar
+    /// θ_n), diverging to NaN. The marginal V is grouping-agnostic (Σ_g Z_g D_g Z_gᵀ
+    /// over rows sharing a level id), so the crossed-slope oracle is reused with the
+    /// GLOBAL nested child id as the extra level. Matches the explicit-V oracle to
+    /// 1e-7 across θ.
+    #[test]
+    fn nested_slope_deviance_matches_brute_force() {
+        let n_per_parent = 3u32;
+        let cluster = ModelSpec {
+            sizing: Sizing::FixedClusters { n_clusters: 5 },
+            tau_squared: 0.25,
+            slopes: vec![SlopeTerm {
+                column: 1,
+                variance: 0.10,
+                corr_with_intercept: 0.2,
+                corr_with: vec![],
+            }],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::NestedWithin { n_per_parent },
+                tau_squared: 0.16,
+                slopes: vec![SlopeTerm {
+                    column: 1,
+                    variance: 0.09,
+                    corr_with_intercept: 0.1,
+                    corr_with: vec![],
+                }],
+            }],
+            estimator: Estimator::Mle,
+            wald_se: WaldSe::Hessian,
+        };
+        let n = 60; // atom = primary 5 · nested 3 = 15 ⇒ 4 balanced blocks
+        let n_child = 5 * n_per_parent as usize;
+        let mut st = 137u64;
+        let u0p: Vec<f64> = (0..5).map(|_| 0.5 * lcg(&mut st)).collect();
+        let u1p: Vec<f64> = (0..5).map(|_| 0.3 * lcg(&mut st)).collect();
+        let u0e: Vec<f64> = (0..n_child).map(|_| 0.4 * lcg(&mut st)).collect();
+        let u1e: Vec<f64> = (0..n_child).map(|_| 0.3 * lcg(&mut st)).collect();
+        let mut x = Mat::<f64>::zeros(n, 2);
+        let mut y = vec![0.0f64; n];
+        let mut pid = vec![0u32; n];
+        let mut eid = vec![0u32; n];
+        for i in 0..n {
+            let par = cluster.sizing.cluster_of_row(i);
+            let child = extra_level_of_row(&cluster, 0, i); // GLOBAL child id
+            pid[i] = par as u32;
+            eid[i] = child as u32;
+            let x1 = lcg(&mut st);
+            x[(i, 0)] = 1.0;
+            x[(i, 1)] = x1;
+            y[i] = 0.5
+                + 0.4 * x1
+                + u0p[par]
+                + u1p[par] * x1
+                + u0e[child]
+                + u1e[child] * x1
+                + 0.8 * lcg(&mut st);
+        }
+        let g = LmmGroupings::from_cluster_spec_ext(&cluster, n, &[1], &[vec![1]]);
+        assert!(g.extra_slopes_any, "must route to the blocked path");
+        assert!(g.nested.is_some(), "must carry a nested factor");
+        let mut suff = LmmSuffStats::with_groupings(2, g);
+        suff.add_rows_multi(x.as_ref(), &y, &pid, &[eid.clone()]);
+        let gref = LmmGroupings::from_cluster_spec_ext(&cluster, n, &[1], &[vec![1]]);
+        let mut fit = LmmFitScratch::with_groupings(2, &gref);
+        // θ = [primary vech (λ₀₀,λ₁₀,λ₁₁) ; nested vech (λ₀₀,λ₁₀,λ₁₁)].
+        for th in [
+            vec![1.0, 0.0, 1.0, 1.0, 0.0, 1.0],
+            vec![0.7, 0.2, 0.5, 0.6, 0.1, 0.4],
+            vec![1.3, -0.3, 0.6, 0.9, -0.2, 0.5],
+        ] {
+            let dev = reml_deviance(&th, &suff, &mut fit);
+            let oracle = brute_force_crossed_slope_deviance(&th, &x, &y, &pid, &eid);
+            assert!(dev.is_finite(), "θ={th:?}");
+            assert!(
+                (dev - oracle).abs() <= 1e-7 * oracle.abs().max(1.0),
+                "θ={th:?}: {dev} vs {oracle}"
+            );
+        }
+    }
+
+    /// End-to-end NESTED-SLOPE fit: the original M1.5 symptom was BOBYQA diverging
+    /// to NaN (`converged = false`) on every seed because the blocked objective was
+    /// mis-assembled. With the correct objective the full θ-search must converge to
+    /// a finite interior fit. Asserts `converged`, no numerical failure
+    /// (`boundary_hit != 2`), finite θ̂/σ̂², and β̂ recovered near the planted
+    /// [0.5, 0.4].
+    #[test]
+    fn nested_slope_fit_converges() {
+        let n_per_parent = 3u32;
+        let sl = |v, r| SlopeTerm {
+            column: 1,
+            variance: v,
+            corr_with_intercept: r,
+            corr_with: vec![],
+        };
+        let cluster = ModelSpec {
+            sizing: Sizing::FixedClusters { n_clusters: 5 },
+            tau_squared: 0.25,
+            slopes: vec![sl(0.10, 0.2)],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::NestedWithin { n_per_parent },
+                tau_squared: 0.16,
+                slopes: vec![sl(0.09, 0.1)],
+            }],
+            estimator: Estimator::Mle,
+            wald_se: WaldSe::Hessian,
+        };
+        let n = 120; // atom = 5·3 = 15 ⇒ 8 balanced blocks
+        let n_child = 5 * n_per_parent as usize;
+        let mut st = 137u64;
+        let u0p: Vec<f64> = (0..5).map(|_| 0.5 * lcg(&mut st)).collect();
+        let u1p: Vec<f64> = (0..5).map(|_| 0.3 * lcg(&mut st)).collect();
+        let u0e: Vec<f64> = (0..n_child).map(|_| 0.4 * lcg(&mut st)).collect();
+        let u1e: Vec<f64> = (0..n_child).map(|_| 0.3 * lcg(&mut st)).collect();
+        let mut x = Mat::<f64>::zeros(n, 2);
+        let mut y = vec![0.0f64; n];
+        let mut pid = vec![0u32; n];
+        let mut eid = vec![0u32; n];
+        for i in 0..n {
+            let par = cluster.sizing.cluster_of_row(i);
+            let child = extra_level_of_row(&cluster, 0, i);
+            pid[i] = par as u32;
+            eid[i] = child as u32;
+            let x1 = lcg(&mut st);
+            x[(i, 0)] = 1.0;
+            x[(i, 1)] = x1;
+            y[i] = 0.5
+                + 0.4 * x1
+                + u0p[par]
+                + u1p[par] * x1
+                + u0e[child]
+                + u1e[child] * x1
+                + 0.8 * lcg(&mut st);
+        }
+        let mut ws = LmmWorkspace::for_cluster_spec_ext(2, &cluster, n, &[1], &[vec![1]]);
+        ws.suff.reset();
+        ws.suff.add_rows_multi(x.as_ref(), &y, &pid, &[eid.clone()]);
+        let theta_truth = ws.theta_truth.clone();
+        let fit = fit_lmm(&mut ws, &[1], Some(&theta_truth));
+        assert!(fit.converged, "nested-slope fit must converge");
+        assert_ne!(fit.boundary_hit, 2, "must not be a numerical (NaN) failure");
+        assert!(fit.sigma_sq.is_finite() && fit.sigma_sq > 0.0, "σ̂² {}", fit.sigma_sq);
+        assert!(ws.theta.iter().all(|t| t.is_finite()), "θ̂ {:?}", ws.theta);
+        assert!((0.2..0.8).contains(&ws.fit.betas[0]), "intercept {}", ws.fit.betas[0]);
+        assert!((0.1..0.7).contains(&ws.fit.betas[1]), "slope {}", ws.fit.betas[1]);
+    }
+
+    /// General brute-force REML deviance: V = I + Σ_g Z_g D_g Z_gᵀ where each
+    /// factor `(ids, vech)` contributes a 2×2 D over [1, x1] (an intercept-only
+    /// factor passes `[θ, 0, 0]`). Used for the multi-crossed-factor oracle.
+    fn brute_force_slopes_deviance(x: &Mat<f64>, y: &[f64], factors: &[(&[u32], [f64; 3])]) -> f64 {
+        let n = x.nrows();
+        let mut v = Mat::<f64>::zeros(n, n);
+        for i in 0..n {
+            v[(i, i)] += 1.0;
+        }
+        for &(ids, vech) in factors {
+            let (a, b, c) = (vech[0], vech[1], vech[2]);
+            let (d00, d01, d11) = (a * a, a * b, b * b + c * c);
+            for i in 0..n {
+                for j in 0..n {
+                    if ids[i] == ids[j] {
+                        let (zi, zj) = (x[(i, 1)], x[(j, 1)]);
+                        v[(i, j)] += d00 + d01 * (zi + zj) + d11 * zi * zj;
+                    }
+                }
+            }
+        }
+        reml_profile_from_v(&v, x, y)
+    }
+
+    /// TWO crossed factors with slopes: `y ~ x1 + (1 | primary) + (1+x1 | c1)
+    /// + (1+x1 | c2)`. Exercises the crossed↔crossed slope coupling (c1's slope
+    /// column against c2's, the x1² weighted co-occurrence between two distinct
+    /// crossed factors) — the part neither the composed nor single-crossed test
+    /// reaches. Matches the explicit-V oracle to 1e-7.
+    #[test]
+    fn two_crossed_slopes_deviance_matches_brute_force() {
+        let cluster = ModelSpec {
+            sizing: Sizing::FixedClusters { n_clusters: 3 },
+            tau_squared: 0.20,
+            slopes: vec![], // primary intercept-only
+            extra_groupings: vec![
+                Grouping {
+                    relation: GroupingRelation::Crossed { n_clusters: 3 },
+                    tau_squared: 0.16,
+                    slopes: vec![SlopeTerm {
+                        column: 1,
+                        variance: 0.10,
+                        corr_with_intercept: 0.1,
+                        corr_with: vec![],
+                    }],
+                },
+                Grouping {
+                    relation: GroupingRelation::Crossed { n_clusters: 3 },
+                    tau_squared: 0.12,
+                    slopes: vec![SlopeTerm {
+                        column: 1,
+                        variance: 0.08,
+                        corr_with_intercept: -0.2,
+                        corr_with: vec![],
+                    }],
+                },
+            ],
+            estimator: Estimator::Mle,
+            wald_se: WaldSe::Hessian,
+        };
+        let n = 54; // atom = 3·3·3 = 27 ⇒ 2 blocks
+        let mut st = 73u64;
+        let up: Vec<f64> = (0..3).map(|_| 0.45 * lcg(&mut st)).collect();
+        let u0a: Vec<f64> = (0..3).map(|_| 0.4 * lcg(&mut st)).collect();
+        let u1a: Vec<f64> = (0..3).map(|_| 0.3 * lcg(&mut st)).collect();
+        let u0b: Vec<f64> = (0..3).map(|_| 0.35 * lcg(&mut st)).collect();
+        let u1b: Vec<f64> = (0..3).map(|_| 0.28 * lcg(&mut st)).collect();
+        let mut x = Mat::<f64>::zeros(n, 2);
+        let mut y = vec![0.0f64; n];
+        let mut pid = vec![0u32; n];
+        let mut c1 = vec![0u32; n];
+        let mut c2 = vec![0u32; n];
+        for i in 0..n {
+            let par = cluster.sizing.cluster_of_row(i);
+            let a = extra_level_of_row(&cluster, 0, i) as usize;
+            let b = extra_level_of_row(&cluster, 1, i) as usize;
+            pid[i] = par as u32;
+            c1[i] = a as u32;
+            c2[i] = b as u32;
+            let x1 = lcg(&mut st);
+            x[(i, 0)] = 1.0;
+            x[(i, 1)] = x1;
+            y[i] = 0.5
+                + 0.4 * x1
+                + up[par]
+                + u0a[a]
+                + u1a[a] * x1
+                + u0b[b]
+                + u1b[b] * x1
+                + 0.8 * lcg(&mut st);
+        }
+        let g = LmmGroupings::from_cluster_spec_ext(&cluster, n, &[], &[vec![1], vec![1]]);
+        assert!(g.extra_slopes_any);
+        let mut suff = LmmSuffStats::with_groupings(2, g);
+        suff.add_rows_multi(x.as_ref(), &y, &pid, &[c1.clone(), c2.clone()]);
+        let gref = LmmGroupings::from_cluster_spec_ext(&cluster, n, &[], &[vec![1], vec![1]]);
+        let mut fit = LmmFitScratch::with_groupings(2, &gref);
+        // θ = [primary scalar ; c1 vech (3) ; c2 vech (3)].
+        for th in [
+            vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0],
+            vec![0.6, 0.7, 0.2, 0.4, 0.6, -0.1, 0.35],
+            vec![0.8, 1.2, -0.3, 0.5, 0.9, 0.25, 0.45],
+        ] {
+            let dev = reml_deviance(&th, &suff, &mut fit);
+            let oracle = brute_force_slopes_deviance(
+                &x,
+                &y,
+                &[
+                    (&pid, [th[0], 0.0, 0.0]),
+                    (&c1, [th[1], th[2], th[3]]),
+                    (&c2, [th[4], th[5], th[6]]),
+                ],
+            );
+            assert!(dev.is_finite(), "θ={th:?}");
+            assert!(
+                (dev - oracle).abs() <= 1e-7 * oracle.abs().max(1.0),
+                "θ={th:?}: {dev} vs {oracle}"
+            );
+        }
+    }
+
+    /// Deterministic crossed-slope dataset for the lme4 golden (Phase 4): 8 primary
+    /// clusters × 6 crossed levels × 2 reps (n=96),
+    /// `y = 1.0 + 0.8·x1 + u0p + u1p·x1 + u0e + u1e·x1 + ε`. The Rust generator is
+    /// the source of truth; `dump_crossed_slope_golden_csv` writes it for the R
+    /// `lme4::lmer` reference whose fit is frozen in `GOLDEN_LME4_*`.
+    fn crossed_slope_golden_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<u32>) {
+        let (n_prim, n_cross, n) = (8usize, 6usize, 96usize);
+        let mut st = 20260629u64;
+        let u0p: Vec<f64> = (0..n_prim).map(|_| 0.7 * lcg(&mut st)).collect();
+        let u1p: Vec<f64> = (0..n_prim).map(|_| 0.5 * lcg(&mut st)).collect();
+        let u0e: Vec<f64> = (0..n_cross).map(|_| 0.6 * lcg(&mut st)).collect();
+        let u1e: Vec<f64> = (0..n_cross).map(|_| 0.4 * lcg(&mut st)).collect();
+        let mut x = Mat::<f64>::zeros(n, 2);
+        let mut y = vec![0.0f64; n];
+        let mut pid = vec![0u32; n];
+        let mut eid = vec![0u32; n];
+        for i in 0..n {
+            let pp = i % n_prim; // FixedClusters primary: i % n_clusters
+            let ee = (i / n_prim) % n_cross; // crossed: (i / n_prim) % n_cross
+            pid[i] = pp as u32;
+            eid[i] = ee as u32;
+            let x1 = lcg(&mut st);
+            x[(i, 0)] = 1.0;
+            x[(i, 1)] = x1;
+            y[i] = 1.0
+                + 0.8 * x1
+                + u0p[pp]
+                + u1p[pp] * x1
+                + u0e[ee]
+                + u1e[ee] * x1
+                + 0.5 * lcg(&mut st);
+        }
+        (x, y, pid, eid)
+    }
+
+    /// Run once (`cargo test -p ... dump_crossed_slope_golden_csv -- --ignored`)
+    /// to regenerate the CSV the R reference reads. Not a normal test.
+    #[test]
+    #[ignore]
+    fn dump_crossed_slope_golden_csv() {
+        let (x, y, pid, eid) = crossed_slope_golden_dataset();
+        let mut s = String::from("x1,y,pid,eid\n");
+        for i in 0..y.len() {
+            s.push_str(&format!("{},{},{},{}\n", x[(i, 1)], y[i], pid[i], eid[i]));
+        }
+        std::fs::write("/tmp/crossed_slope_golden.csv", s).unwrap();
+    }
+
+    /// L3 golden: `glmm`'s crossed-slope fit must reproduce `lme4::lmer`'s REML fit
+    /// of `y ~ x1 + (1+x1|pid) + (1+x1|eid)` on the committed dataset — fixed
+    /// effects, residual σ², and both 2×2 RE covariances. Frozen from
+    /// `/tmp/golden_fit.R` (lme4 1.1, bobyqa). Recovered D_g = σ̂²·Λ_gΛ_gᵀ from θ̂.
+    #[test]
+    fn crossed_slope_fit_matches_lme4_golden() {
+        // lme4 golden (REML, bobyqa).
+        const G_BETA0: f64 = 1.0582083262;
+        const G_BETA1: f64 = 0.6334043248;
+        const G_SIGMA2: f64 = 0.0921249591;
+        const G_PID_V0: f64 = 0.1406815355; // var(intercept)
+        const G_PID_V1: f64 = 0.1237856496; // var(x1)
+        const G_PID_COV: f64 = 0.0127473486;
+        const G_EID_V0: f64 = 0.1828301299;
+        const G_EID_V1: f64 = 0.0396985129;
+        const G_EID_COV: f64 = -0.0456611171;
+
+        let (x, y, pid, eid) = crossed_slope_golden_dataset();
+        let n = y.len();
+        let sl = |v| SlopeTerm {
+            column: 1,
+            variance: v,
+            corr_with_intercept: 0.0,
+            corr_with: vec![],
+        };
+        let cluster = ModelSpec {
+            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            tau_squared: 0.15,
+            slopes: vec![sl(0.12)],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 6 },
+                tau_squared: 0.18,
+                slopes: vec![sl(0.04)],
+            }],
+            estimator: Estimator::Mle,
+            wald_se: WaldSe::Hessian,
+        };
+        let mut ws = LmmWorkspace::for_cluster_spec_ext(2, &cluster, n, &[1], &[vec![1]]);
+        ws.suff.reset();
+        ws.suff.add_rows_multi(x.as_ref(), &y, &pid, &[eid.clone()]);
+        let theta_truth = ws.theta_truth.clone();
+        let fit = fit_lmm(&mut ws, &[1], Some(&theta_truth));
+        assert!(fit.converged, "golden fit must converge");
+        let s2 = fit.sigma_sq;
+
+        // Fixed effects + residual variance.
+        assert!(
+            (ws.fit.betas[0] - G_BETA0).abs() < 1e-4,
+            "β0 {} vs {G_BETA0}",
+            ws.fit.betas[0]
+        );
+        assert!(
+            (ws.fit.betas[1] - G_BETA1).abs() < 1e-4,
+            "β1 {} vs {G_BETA1}",
+            ws.fit.betas[1]
+        );
+        assert!(
+            (s2 - G_SIGMA2).abs() <= 1e-3 * G_SIGMA2,
+            "σ² {s2} vs {G_SIGMA2}"
+        );
+
+        // D_g = σ̂²·Λ_gΛ_gᵀ from θ̂ (primary vech θ[0..3], crossed vech θ[3..6]).
+        let dblock = |t: &[f64]| {
+            let (a, b, c) = (t[0], t[1], t[2]);
+            (s2 * a * a, s2 * (b * b + c * c), s2 * a * b) // (v0, v1, cov)
+        };
+        let (pv0, pv1, pcov) = dblock(&ws.theta[0..3]);
+        let (ev0, ev1, ecov) = dblock(&ws.theta[3..6]);
+        let close = |got: f64, want: f64, name: &str| {
+            assert!(
+                (got - want).abs() <= 2e-3 * want.abs().max(1e-3),
+                "{name}: {got} vs {want}"
+            );
+        };
+        close(pv0, G_PID_V0, "pid var0");
+        close(pv1, G_PID_V1, "pid var1");
+        close(pcov, G_PID_COV, "pid cov");
+        close(ev0, G_EID_V0, "eid var0");
+        close(ev1, G_EID_V1, "eid var1");
+        close(ecov, G_EID_COV, "eid cov");
     }
 
     /// Slope + NESTED: `(1 + x1 | g) + (1 | g:sub)` — the composed deviance with

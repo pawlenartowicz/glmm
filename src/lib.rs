@@ -1,6 +1,6 @@
 //! `glmm` — standalone f64 GLMM fit kernels (OLS → GLM → LMM → GLMM).
 //!
-//! Two public surfaces (see the carve design spec §5):
+//! Two public surfaces:
 //! - [`fit`] + [`ModelSpec`]: the stable, semver-covered friendly API.
 //! - `mcpower` (cargo feature, off by default): the unstable scratch-explicit
 //!   hot-path surface MCPower's simulation layer binds to. NO semver guarantees.
@@ -27,7 +27,7 @@ pub use fit::{fit, Fit, FitOptions};
 pub use spec::*;
 
 /// Tiny float guard — magnitudes below this are treated as zero (rank /
-/// division-by-zero sentinel). Mirrors v1's FLOAT_NEAR_ZERO; comparing
+/// division-by-zero sentinel). Matches the FLOAT_NEAR_ZERO constant in engine-core; comparing
 /// `β̂²/var_diag` against thresholds with NaN propagates as "fail" downstream.
 /// Duplicated in engine-core (still used there by data_gen/posthoc) — a 1-line
 /// numeric sentinel is fewer moving parts than a cross-crate `pub` edge.
