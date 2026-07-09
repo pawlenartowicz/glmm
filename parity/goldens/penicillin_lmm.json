@@ -1,0 +1,23 @@
+{
+  "name": "penicillin_lmm",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "kind": "lmm",
+  "data": "Penicillin",
+  "family": "gaussian",
+  "reml": true,
+  "r_formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)"],
+  "estimates": {
+    "beta": [22.9722222222],
+    "se": [0.808595361386],
+    "loglik": -165.4302945,
+    "varcomp": [
+      { "group": "plate", "terms": ["(Intercept)"], "stddev": [0.846702], "corr": [[1]] },
+      { "group": "sample", "terms": ["(Intercept)"], "stddev": [1.931614], "corr": [[1]] }
+    ],
+    "sigma": 0.549922682063
+  }
+}

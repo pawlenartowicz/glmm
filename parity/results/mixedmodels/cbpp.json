@@ -1,0 +1,32 @@
+{
+  "dataset": "cbpp",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "binomial",
+  "reml": null,
+  "rung": 5,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "period: 2", "period: 3", "period: 4"],
+  "estimates": {
+    "beta": [-1.3985270600238817, -0.9923352550031116, -1.1286742262456453, -1.5803146439543805],
+    "se_rx": [0.22789089828433887, 0.30538550186489033, 0.32604922687217425, 0.42879474024277503],
+    "loglik": -92.02628186502456,
+    "varcomp": [
+      {
+        "group": "herd",
+        "terms": ["(Intercept)"],
+        "stddev": [0.6422618636965784],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  },
+  "timing": {
+    "fit_seconds_median_rx": 0.004812359,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

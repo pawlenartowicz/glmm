@@ -1,0 +1,44 @@
+{
+  "dataset": "sim_slope_extra",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 7,
+  "converged": true,
+  "singular": false,
+  "tolPwrss": {},
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [1.1339401022421, 0.501211027151105],
+    "se": [0.285285305169402, 0.171066727312553],
+    "loglik": -491.375309670534,
+    "varcomp": [
+      {
+        "group": "g1",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [1.14177415304009, 0.627278650305794],
+        "corr": [
+          [1, 0.205692073678433],
+          [0.205692073678433, 1]
+        ]
+      },
+      {
+        "group": "g2",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [0.63831794275263, 0.415096529834656],
+        "corr": [
+          [1, 0.640608564840322],
+          [0.640608564840322, 1]
+        ]
+      }
+    ],
+    "sigma": 0.708647553431039
+  },
+  "timing": {
+    "fit_seconds_median": 0.0497126579284668,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

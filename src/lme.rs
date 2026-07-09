@@ -31,14 +31,12 @@ const BRENT_REL_TOL: f64 = 1e-4;
 /// domain and trigger high-τ rebracket retries on cases the main loop
 /// handles within [0, 1000].
 const LOG_THETA_LOW: f64 = -9.210_340_371_976_184; // ln(1e-4)
-                                                   // clippy::approx_constant fires because -ln(10) ≈ LN_10; this is intentional
-                                                   // (ln(1e-1) = -ln(10)), not a use of the std constant.
 #[expect(
     clippy::approx_constant,
     reason = "literal is ln(1e-1) = -ln(10), not a use of the std LN_10 constant"
 )]
 const LOG_THETA_MID: f64 = -2.302_585_092_994_046; // ln(1e-1)
-const LOG_THETA_HIGH: f64 = 6.907_755_278_982_137; // ln(1e3) — matches v1's λ²≤1e6 reach
+const LOG_THETA_HIGH: f64 = 6.907_755_278_982_137; // ln(1e3) — θ ≤ 1e3 ⇒ λ² = θ² ≤ 1e6
 /// Boundary-detection slack (log-units). If Brent settles within this distance
 /// of an endpoint we treat it as a boundary hit.
 const BOUNDARY_LOG_SLACK: f64 = 0.1;
@@ -278,16 +276,9 @@ impl<'w> LmeSuffStats<'w> {
 // profiled_deviance
 // ---------------------------------------------------------------------------
 
-// REML form of the profiled deviance. The original implementation parametrised
-// by lam_sq = θ²; the inner loop
-// is algebraically identical to our θ-form below (1 + θ²·n_c == 1 + lam_sq·n_c,
-// and θ²·v_c⁻¹ == lam_sq · M_j⁻¹). v1's REML branch returns:
-//     log|L_theta| + 2·Σ log L_jj + (N − P) · log(r_sq)
-// where `r_sq = ytViy − β̂'·XtViy` (NOT divided by (N − P)). We instead
-// return `(N − P) · log(σ̂²) = (N − P) · log(r_sq / (N − P))`. The two
-// differ only by the additive constant `(N − P) · log(N − P)` — the test
-// gates on deviance *differences* (which cancel that constant) plus β̂ and σ̂²
-// directly (which are formulation-independent).
+// REML form of the profiled deviance, parametrised by θ. Relative to a
+// λ² = θ² parametrisation the inner loop is algebraically identical
+// (1 + θ²·n_c == 1 + λ²·n_c, and θ²·v_c⁻¹ == λ²·M_j⁻¹).
 //
 // Per-θ overwrite invariant: `scratch.v_diag_inv`, `scratch.xtvix`,
 // `scratch.xtviy`, `scratch.xtvix_factor`, `scratch.betas` are all fully
@@ -295,6 +286,14 @@ impl<'w> LmeSuffStats<'w> {
 /// Evaluate the REML profiled deviance at θ. Writes intermediate state into
 /// `scratch.xtvix`, `scratch.xtviy`, `scratch.xtvix_factor`, `scratch.v_diag_inv`
 /// per the per-θ overwrite invariant.
+///
+/// Deviance convention: the standard REML formula is
+/// `log|L_theta| + 2·Σ log L_jj + (N − P) · log(r_sq)`, where
+/// `r_sq = ytViy − β̂'·XtViy` (NOT divided by (N − P)). This function instead
+/// returns `(N − P) · log(σ̂²) = (N − P) · log(r_sq / (N − P))`. The two differ
+/// only by the additive constant `(N − P) · log(N − P)` — deviance
+/// *differences* cancel that constant, as do β̂ and σ̂² themselves (both
+/// formulation-independent).
 ///
 /// Side effects: on success, `scratch.xtvix_factor` holds the Cholesky L of
 /// `X' V(θ)⁻¹ X` and `scratch.betas` holds β̂(θ). `scratch.v_diag_inv[c]`
@@ -2295,7 +2294,7 @@ mod tests {
     /// `fit_suff_stats_warm_path_bounded_alloc`). Marked `#[ignore]` because
     /// `dhat::Profiler` measures process-wide allocations and concurrent tests
     /// contaminate the count. Run explicitly:
-    ///   `cargo test -p engine-core lme_fit_warm_path_bounded_alloc -- --ignored --test-threads=1`
+    ///   `cargo test -p glmm lme_fit_warm_path_bounded_alloc -- --ignored --test-threads=1`
     ///
     /// `BOUND` locks the measured warm-path block count. Each `profiled_deviance`
     /// call (the Brent loop runs several per fit) does one faer `Cholesky`; the

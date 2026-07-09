@@ -1,0 +1,43 @@
+{
+  "dataset": "sim_slope_extra",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 7,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [1.1339400344356505, 0.5012109275999685],
+    "se": [0.28528771626919625, 0.1710659423078121],
+    "loglik": -491.375309669744,
+    "varcomp": [
+      {
+        "group": "g1",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [1.1417821285252028, 0.6272763828580695],
+        "corr": [
+          [1, 0.2056836663623491],
+          [0.2056836663623491, 1]
+        ]
+      },
+      {
+        "group": "g2",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [0.6383256990713932, 0.4150937108332218],
+        "corr": [
+          [1, 0.6406113571907086],
+          [0.6406113571907086, 1]
+        ]
+      }
+    ],
+    "sigma": 0.7086471213331813
+  },
+  "timing": {
+    "fit_seconds_median": 0.005524816,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

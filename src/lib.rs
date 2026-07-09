@@ -1,40 +1,47 @@
 //! `glmm` — standalone f64 GLMM fit kernels (OLS → GLM → LMM → GLMM).
 //!
 //! Two public surfaces:
-//! - [`fit`] + [`ModelSpec`]: the stable, semver-covered friendly API.
-//! - `mcpower` (cargo feature, off by default): the unstable scratch-explicit
-//!   hot-path surface MCPower's simulation layer binds to. NO semver guarantees.
+//! - [`fit_cold`]/[`fit_warm`] + [`ModelSpec`] + [`GroupIds`]: the stable,
+//!   semver-covered friendly API.
+//! - `loop_advanced` (cargo feature, off by default): the unstable scratch-explicit
+//!   hot-path surface (loop tier) that warm-start consumers like MCPower bind to,
+//!   exposing the kernels and [`StartValues`]. NO semver guarantees.
 
 // The scratch-explicit kernels (glm/glmm/lme + most of lmm) exist to serve the
-// `mcpower` feature; the stable `fit` wires only a subset (OLS + LMM). With the
-// feature OFF they are intentionally unreachable, not stale — so suppress
-// dead_code only in that build. The `mcpower` build uses all of it, so genuinely
-// dead code is still caught there (it's the superset).
-#![cfg_attr(not(feature = "mcpower"), allow(dead_code))]
+// `loop_advanced` feature; the stable `fit` wires only a subset (OLS + LMM). With
+// the feature OFF they are intentionally unreachable, not stale — so suppress
+// dead_code only in that build. The `loop_advanced` build uses all of it, so
+// genuinely dead code is still caught there (it's the superset).
+#![cfg_attr(not(feature = "loop_advanced"), allow(dead_code))]
 
 pub mod consts;
 pub mod linalg;
 pub mod simd_transcendental;
 
+mod family;
 mod fit;
 mod glm;
 mod glmm;
+mod ids;
 mod lme;
 mod lmm;
 mod ols;
+mod sparse;
 mod spec;
-pub use fit::{fit, Fit, FitOptions};
+mod start;
+pub use fit::{fit_cold, fit_warm, Fit, FitOptions};
+pub use ids::GroupIds;
 pub use spec::*;
 
 /// Tiny float guard — magnitudes below this are treated as zero (rank /
-/// division-by-zero sentinel). Matches the FLOAT_NEAR_ZERO constant in engine-core; comparing
-/// `β̂²/var_diag` against thresholds with NaN propagates as "fail" downstream.
-/// Duplicated in engine-core (still used there by data_gen/posthoc) — a 1-line
-/// numeric sentinel is fewer moving parts than a cross-crate `pub` edge.
+/// division-by-zero sentinel): comparing `β̂²/var_diag` against thresholds with
+/// NaN propagates as "fail" downstream.
 pub(crate) const FLOAT_NEAR_ZERO: f64 = 1e-30;
 
-#[cfg(feature = "mcpower")]
-pub mod mcpower;
+#[cfg(feature = "loop_advanced")]
+pub mod loop_advanced;
+
+pub use start::StartValues;
 
 #[cfg(test)]
 mod test_support;

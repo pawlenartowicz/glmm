@@ -1,0 +1,88 @@
+{
+  "dataset": "sim_sparse_poisson",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "poisson",
+  "reml": null,
+  "rung": 9,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.16523712721965586, 0.4972444600170972],
+    "se_rx": [0.39585224902680566, 0.031257093758737114],
+    "loglik": -700.7214741825513,
+    "varcomp": [
+      {
+        "group": "g1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.5821342670432665],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.3096956576809584],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c2",
+        "terms": ["(Intercept)"],
+        "stddev": [0.4541340618873667],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c3",
+        "terms": ["(Intercept)"],
+        "stddev": [0.3938030552287018],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c4",
+        "terms": ["(Intercept)"],
+        "stddev": [0.3176279321918476],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c5",
+        "terms": ["(Intercept)"],
+        "stddev": [0.30431751352613906],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c6",
+        "terms": ["(Intercept)"],
+        "stddev": [0.3825440746899913],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c7",
+        "terms": ["(Intercept)"],
+        "stddev": [0.45736488769422595],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  },
+  "timing": {
+    "fit_seconds_median_rx": 0.314804971,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

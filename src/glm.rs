@@ -1,28 +1,28 @@
-//! Adaptive IRLS logistic regression kernel; outputs z² = β̂²/Var(β̂) for hot-loop comparison against precomputed squared critical values from `critvals.rs` — no CDF calls, no SE sqrt.
+//! Adaptive IRLS logistic regression kernel; outputs z² = β̂²/Var(β̂) for hot-loop comparison against a precomputed squared-critical-value table supplied by the caller — no CDF calls, no SE sqrt.
 //!
 //! Hot-loop invariant: no z-CDF calls, no SE sqrt, no per-coefficient
 //! square roots. Inference outputs `z_sq_j = β̂_j² / Var(β̂_j)` against the
-//! precomputed `z_crit_sq` table built in `critvals.rs`.
+//! caller-supplied precomputed `z_crit_sq` table.
 //!
 //! All per-fit buffers live in `SimWorkspace` (the `irls_*` fields, see workspace.rs).
 //! The kernel takes a `GlmScratch<'w>` built inline at the call site (NLL split-borrow)
 //! and returns a borrowed `GlmFitView<'a>`. No owned result struct.
 //!
-//! Algorithm — guards and tolerances are v1 parity:
+//! Algorithm — guards and tolerances:
 //!   - Adaptive convergence: `|Δdeviance| < DEVIANCE_TOL = 1e-8`
 //!   - Safety cap: `MAX_IRLS_ITERS = 50`
 //!   - BETA_CAP divergence guard: `iter ≥ 3 ∧ ‖β‖_∞ > 30 → non-converged`
 //!   - All-0 / all-1 short circuit
 //!   - Post-fit saturation guard (50% of weights < 1e-5 ⇒ non-converged)
-//!   - No step-halving: β_new is accepted directly (v1 parity; step-halving
-//!     drifts power ~3.5% at N=50 — see the accept step in the IRLS loop)
+//!   - No step-halving: β_new is accepted directly (step-halving drifts
+//!     power ~3.5% at N=50 — see the accept step in the IRLS loop)
 //!
-//! The start point deviates from v1 deliberately: the shipped hot loop passes
-//! `beta_start = Some(spec.effect_sizes)` (Y is synthetic, so the true β on
-//! the logit scale is known — the spec-derived truth-start seam, mirroring
-//! `lmm::fit_lmm`'s `theta_start`). `None` keeps v1's β = 0 cold start
-//! bit-identically. Either way the accept rule and the |Δdev| < 1e-8 fixpoint
-//! are unchanged — only the path to it shortens.
+//! Two `beta_start` modes: `None` seeds β = 0, a fixed reproducible cold
+//! start; `Some(spec.effect_sizes)` — what the shipped hot loop passes — seeds
+//! the spec-derived truth-start (Y is synthetic, so the true β on the logit
+//! scale is known; mirrors `lmm::fit_lmm`'s `theta_start`). Either way the
+//! accept rule and the |Δdev| < 1e-8 fixpoint are unchanged — only the path
+//! to it shortens.
 //!
 //! Working-response IRLS form and the canonical-link weights follow McCullagh &
 //! Nelder (1989), *Generalized Linear Models*, 2nd ed., Chapman & Hall — as MN89.
@@ -33,6 +33,7 @@ use faer::reborrow::{IntoConst, Reborrow, ReborrowMut};
 use faer::{Accum, MatMut, MatRef, Par};
 
 use crate::ols::nan_fill_ols_scratch;
+use crate::spec::{BinomialLink, Family};
 use crate::FLOAT_NEAR_ZERO;
 
 /// IRLS safety cap.
@@ -126,18 +127,32 @@ pub fn sigmoid_stable(eta: f64) -> f64 {
 // IRLS kernel
 // ---------------------------------------------------------------------------
 
-/// Fit a logistic regression via adaptive IRLS. All buffers live in `scratch`;
-/// the returned view borrows from the same storage.
+/// Fit a GLM via adaptive IRLS. All buffers live in `scratch`; the returned view
+/// borrows from the same storage.
+///
+/// `family` selects the IRLS math. `Family::Binomial { link: Logit }` runs the
+/// **verbatim** canonical fused-SIMD path (byte-identity, the MCPower hot loop);
+/// every other family routes the scalar general Fisher-scoring branch through
+/// [`crate::family`]. Gamma/NB dispersion is handled by the caller (`fit.rs`),
+/// not here — this kernel folds `φ=1`. `nb_theta` is the NB shape θ̂ the caller's
+/// outer-θ loop fixes for this fit (only the NB family reads it via
+/// `family::variance`/`dev_resid`; pass `f64::NAN` for every other family).
 ///
 /// - `x`: `n × p` design (column-major faer).
-/// - `y`: length `n`, values in {0.0, 1.0} (produced by `data_gen::generate_sim_data`).
+/// - `y`: length `n`; {0.0, 1.0} for binomial, counts for Poisson/NB, positive for Gamma.
 /// - `target_indices`: per-coefficient indices to compute `z²` for.
 /// - `beta_start`: `None` → β = 0 cold start (bit-identical pre-warm-start
 ///   path); `Some(β₀)` (length `p`) → spec-derived truth start — seeds β and
 ///   computes η = X·β₀ once. A per-scenario constant, so determinism and
 ///   chunk merging are unaffected.
 /// - `scratch`: borrowed mutable slots from `SimWorkspace.irls_*`.
+///
+/// `deviance_null` matches R's `glm(family=binomial)$null.deviance` (see
+/// `glm_deviance_null_golden_value`); no external oracle validates the full
+/// β̂/deviance path yet.
 pub fn glm_irls_fit<'a>(
+    family: Family,
+    nb_theta: f64,
     x: MatRef<'_, f64>,
     y: &[f64],
     target_indices: &[u32],
@@ -170,8 +185,9 @@ pub fn glm_irls_fit<'a>(
     debug_assert!(t <= irls_var_diag.len());
     debug_assert!(n <= irls_eta.len());
 
-    // NaN-fill on early-return / non-converged paths so callers see the
-    // v1-contract NaN signal. Successful paths overwrite every populated slot.
+    // NaN-fill on early-return / non-converged paths so callers can detect
+    // non-convergence from NaN outputs alone. Successful paths overwrite
+    // every populated slot.
     nan_fill_ols_scratch(irls_betas, irls_var_diag, irls_t_sq, p, t);
 
     // Short-circuit: n ≤ p, or no predictors.
@@ -188,13 +204,16 @@ pub fn glm_irls_fit<'a>(
         };
     }
 
-    // All-0 / all-1 short circuit. Without this the working response divides
-    // by zero on iter 1 (W collapses, p collapses).
+    // All-0 / all-1 short circuit — Bernoulli-only: without it the binomial
+    // working response divides by zero on iter 1 (W collapses, p collapses).
+    // Poisson/Gamma/NB have no such degeneracy (y_sum ≥ n is ordinary for
+    // counts), so the guard is gated behind the binomial family; their n≤p
+    // guard above still holds.
     let mut y_sum = 0.0;
     for &yi in &y[..n] {
         y_sum += yi;
     }
-    if y_sum <= 0.0 || y_sum >= n as f64 {
+    if matches!(family, Family::Binomial { .. }) && (y_sum <= 0.0 || y_sum >= n as f64) {
         return GlmFitView {
             betas: &irls_betas[..p],
             var_diag: &irls_var_diag[..t],
@@ -212,7 +231,22 @@ pub fn glm_irls_fit<'a>(
     // clobber it. The all-0 / all-1 branch above guarantees `y_bar ∉ {0, 1}`
     // here, so no `ln(0)` risk.
     let y_bar = y_sum / n as f64;
-    let deviance_null = -2.0 * (y_sum * y_bar.ln() + (n as f64 - y_sum) * (1.0 - y_bar).ln());
+    // Intercept-only MLE is μ̂=ȳ for any (family, link), so the null deviance is
+    // Σ dᵢ(y, ȳ). Logit keeps the closed-form Bernoulli expression verbatim
+    // (byte-identity); other families fold it generically.
+    let deviance_null = match family {
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        } => -2.0 * (y_sum * y_bar.ln() + (n as f64 - y_sum) * (1.0 - y_bar).ln()),
+        other => {
+            let mu0 = crate::family::clamp_mu(other, y_bar);
+            let mut d = 0.0;
+            for &yi in &y[..n] {
+                d += crate::family::dev_resid(other, nb_theta, yi, mu0);
+            }
+            d
+        }
+    };
 
     // Seed β and η here; the IRLS loop carries η forward from each
     // iteration's post-accept recompute (the β-accept step) instead of
@@ -232,10 +266,26 @@ pub fn glm_irls_fit<'a>(
                 }
             }
         }
-        // Cold start: β ← 0, so η = X·β = 0.
+        // Cold start: β ← 0, so η = X·β = 0 — bit-identical for logit (μ=0.5) and
+        // fine for Poisson/Gamma-log (μ=1). The Gamma **inverse** link cannot
+        // start there (η=0 ⇒ μ=1/0): seed η = 1/y per row (R's `mustart=y`,
+        // `etastart=1/y`) so the first IRLS step has a valid μ>0. β stays 0; the
+        // first solve overwrites it, so X·β consistency resumes from iter 1.
         None => {
             irls_betas[..p].fill(0.0);
-            irls_eta[..n].fill(0.0);
+            if matches!(
+                family,
+                Family::Gamma {
+                    link: crate::spec::GammaLink::Inverse,
+                    ..
+                }
+            ) {
+                for i in 0..n {
+                    irls_eta[i] = 1.0 / crate::family::clamp_mu(family, y[i]);
+                }
+            } else {
+                irls_eta[..n].fill(0.0);
+            }
         }
     }
 
@@ -267,28 +317,52 @@ pub fn glm_irls_fit<'a>(
         // after each β update. Reusing it here is bit-identical to recomputing
         // X·β (same β, same summation order).
 
-        // p, W, and Σ log1pexp(η) in one fused vectorized pass; the working
-        // response z is a scalar follow-up (it carries y and a division,
-        // no transcendental) that also folds in the Σ y·η deviance half.
-        let lp_sum = crate::simd_transcendental::pw_and_log1pexp_sum(
-            &irls_eta[..n],
-            &mut irls_p[..n],
-            &mut irls_w[..n],
-        );
-        let mut yeta = 0.0;
-        for i in 0..n {
-            let yi = y[i];
-            yeta += yi * irls_eta[i];
-            irls_z[i] = irls_eta[i] + (yi - irls_p[i]) / irls_w[i];
-        }
+        // p, W, z, and the deviance for this β. Family-branched: logit keeps the
+        // VERBATIM fused-SIMD path (p, W, Σ log1pexp(η) in one vectorized pass,
+        // then the scalar z follow-up that folds in the Σ y·η deviance half) for
+        // byte-identity; new families take the scalar general Fisher-scoring
+        // branch through `family.rs` (φ folded as 1). Both leave irls_p / irls_w
+        // / irls_z filled identically in shape for the WLS solve below.
+        let deviance = match family {
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            } => {
+                let lp_sum = crate::simd_transcendental::pw_and_log1pexp_sum(
+                    &irls_eta[..n],
+                    &mut irls_p[..n],
+                    &mut irls_w[..n],
+                );
+                let mut yeta = 0.0;
+                for i in 0..n {
+                    let yi = y[i];
+                    yeta += yi * irls_eta[i];
+                    irls_z[i] = irls_eta[i] + (yi - irls_p[i]) / irls_w[i];
+                }
+                2.0 * (lp_sum - yeta)
+            }
+            other => {
+                // Per row: clamp η; (μ, W_raw, working_resid) from family.rs;
+                // floor W at WEIGHT_CLAMP; z = η + r; accumulate Σ dᵢ (the
+                // residual deviance — the |Δ| convergence metric, dispersion-free).
+                let mut dev = 0.0;
+                for i in 0..n {
+                    let e = crate::family::clamp_eta(other, irls_eta[i]);
+                    let (mu, w_raw, r) =
+                        crate::family::irls_weight_and_resid(other, nb_theta, y[i], e);
+                    irls_p[i] = mu;
+                    irls_w[i] = w_raw.max(WEIGHT_CLAMP);
+                    irls_z[i] = e + r;
+                    dev += crate::family::dev_resid(other, nb_theta, y[i], mu);
+                }
+                dev
+            }
+        };
 
-        // Adaptive early exit on |Δdeviance|, where deviance is the
-        // Bernoulli −2·log-lik `2·(Σ log1pexp(η) − Σ y·η)` at the CURRENT β —
-        // the one the previous pass's solve accepted. Pass 0 sees the seed β,
-        // whose deviance v1 never measured: skip check and tracker so the first
-        // real comparison stays β₂-vs-β₁, exactly v1's sequence.
+        // Adaptive early exit on |Δdeviance| at the CURRENT β — the one the
+        // previous pass's solve accepted. Pass 0 sees the seed β, which has no
+        // prior deviance to compare against: skip the check and the tracker so
+        // the first real comparison is β₂-vs-β₁.
         if iter > 0 {
-            let deviance = 2.0 * (lp_sum - yeta);
             deviance_final = deviance;
             if (deviance - deviance_prev).abs() < DEVIANCE_TOL {
                 converged = true;
@@ -397,8 +471,7 @@ pub fn glm_irls_fit<'a>(
         }
 
         // BETA_CAP divergence guard at iter ≥ 3. Fires before the next
-        // pass's convergence check — a capped β never reports converged,
-        // matching v1's check order.
+        // pass's convergence check — a capped β never reports converged.
         if iter >= 3 {
             let mut max_abs: f64 = 0.0;
             for &b in &irls_betas[..p] {
@@ -435,11 +508,11 @@ pub fn glm_irls_fit<'a>(
         }
     }
 
-    // If not converged: NaN the inference outputs but leave betas as fitted
-    // (matches v1 which returns whatever β the loop left + NaN inference).
+    // If not converged: NaN the inference outputs but leave betas at whatever
+    // value the loop last computed.
     if !converged {
         // Partial re-NaN: inference outputs only — `betas` are deliberately
-        // left at the loop's last fitted value (v1 parity), so the 3-array
+        // left at the loop's last fitted value, so the 3-array
         // `nan_fill_ols_scratch` must NOT be used here.
         irls_var_diag[..t].fill(f64::NAN);
         irls_t_sq[..t].fill(f64::NAN);
@@ -557,7 +630,17 @@ mod tests {
         let y = vec![0.0f64; n];
         let mut ws = TestWs::new(n, p, 0);
         let targets: Vec<u32> = vec![0, 1];
-        let fit = glm_irls_fit(x.as_ref(), &y, &targets, None, glm_scratch(&mut ws));
+        let fit = glm_irls_fit(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &targets,
+            None,
+            glm_scratch(&mut ws),
+        );
         assert!(!fit.converged);
         assert_eq!(fit.n_iter, 0);
     }
@@ -574,7 +657,17 @@ mod tests {
         let y = vec![1.0f64; n];
         let mut ws = TestWs::new(n, p, 0);
         let targets: Vec<u32> = vec![0, 1];
-        let fit = glm_irls_fit(x.as_ref(), &y, &targets, None, glm_scratch(&mut ws));
+        let fit = glm_irls_fit(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &targets,
+            None,
+            glm_scratch(&mut ws),
+        );
         assert!(!fit.converged);
         assert_eq!(fit.n_iter, 0);
     }
@@ -595,7 +688,17 @@ mod tests {
         let y: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
         let mut ws = TestWs::new(n, p, 0);
         let targets: Vec<u32> = vec![1, 2];
-        let fit = glm_irls_fit(x.as_ref(), &y, &targets, None, glm_scratch(&mut ws));
+        let fit = glm_irls_fit(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &targets,
+            None,
+            glm_scratch(&mut ws),
+        );
         assert!(
             !fit.converged,
             "rank-deficient design must report non-converged"
@@ -618,7 +721,17 @@ mod tests {
         let y = vec![0.0f64; n];
         let mut ws = TestWs::new(n, p, 0);
         let targets: Vec<u32> = vec![0, 1];
-        let fit = glm_irls_fit(x.as_ref(), &y, &targets, None, glm_scratch(&mut ws));
+        let fit = glm_irls_fit(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &targets,
+            None,
+            glm_scratch(&mut ws),
+        );
         assert!(!fit.converged);
         for &t in fit.t_sq.iter() {
             assert!(t.is_nan(), "z² must be NaN on non-converged fit, got {t}");
@@ -638,7 +751,17 @@ mod tests {
         let y = vec![0.0f64; n];
         let mut ws = TestWs::new(n, p, 0);
         let targets: Vec<u32> = vec![0, 1];
-        let fit = glm_irls_fit(x.as_ref(), &y, &targets, None, glm_scratch(&mut ws));
+        let fit = glm_irls_fit(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &targets,
+            None,
+            glm_scratch(&mut ws),
+        );
         assert!(!fit.converged);
         assert!(
             fit.deviance.is_nan(),
@@ -666,7 +789,17 @@ mod tests {
         }
         let mut ws = TestWs::new(n, p, 0);
         let targets: Vec<u32> = vec![1];
-        let fit = glm_irls_fit(x.as_ref(), &y, &targets, None, glm_scratch(&mut ws));
+        let fit = glm_irls_fit(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &targets,
+            None,
+            glm_scratch(&mut ws),
+        );
         assert!(
             !fit.converged,
             "fully separated data must report non-converged"
@@ -703,7 +836,17 @@ mod tests {
 
         let mut ws = TestWs::new(n, p, 0);
         let targets: Vec<u32> = vec![1];
-        let fit = glm_irls_fit(x.as_ref(), &y, &targets, None, glm_scratch(&mut ws));
+        let fit = glm_irls_fit(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &targets,
+            None,
+            glm_scratch(&mut ws),
+        );
         assert!(fit.converged, "must converge: non-separated y pattern");
 
         // External oracle: R glm(y ~ x, family=binomial)$null.deviance with y_sum=40/n=100

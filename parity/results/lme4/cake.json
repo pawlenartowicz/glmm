@@ -1,0 +1,34 @@
+{
+  "dataset": "cake",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 13,
+  "converged": true,
+  "singular": false,
+  "tolPwrss": {},
+  "coef_names": ["(Intercept)", "recipeB", "recipeC", "temp", "recipeB:temp", "recipeC:temp"],
+  "estimates": {
+    "beta": [2.37936507936229, -3.64920634920315, -1.94126984126736, 0.153714285714299, 0.0108571428571276, 0.00209523809522647],
+    "se": [5.90280171326432, 8.34782223889682, 8.34782223889681, 0.028207480277113, 0.0398914011682612, 0.0398914011682612],
+    "loglik": -851.633740037747,
+    "varcomp": [
+      {
+        "group": "recipe:replicate",
+        "terms": ["(Intercept)"],
+        "stddev": [6.46280386816139],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "sigma": 4.5701341357848
+  },
+  "timing": {
+    "fit_seconds_median": 0.0146224498748779,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

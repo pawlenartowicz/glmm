@@ -1,0 +1,41 @@
+{
+  "dataset": "sim_three_level",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 15,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.5388439811413399, 0.8221798501703264],
+    "se": [0.33727330060767063, 0.035094417854894505],
+    "loglik": -448.9705413760589,
+    "varcomp": [
+      {
+        "group": "g1 & g2",
+        "terms": ["(Intercept)"],
+        "stddev": [0.66879358817463],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "g1",
+        "terms": ["(Intercept)"],
+        "stddev": [1.0077211063540719],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "sigma": 0.6357536116072972
+  },
+  "timing": {
+    "fit_seconds_median": 0.000572445,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

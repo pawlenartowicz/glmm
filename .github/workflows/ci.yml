@@ -9,6 +9,8 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main]
+  # Let release.yml reuse these exact gates before publishing (single source of truth).
+  workflow_call:
 
 # Newer pushes supersede in-flight runs on the same ref.
 concurrency:
@@ -81,3 +83,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo publish --dry-run
+
+  # ── python: build the glmm wheel, install it, test + lint (spec §7) ───────
+  python:
+    name: python (glmm wheel)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel (abi3, Linux x86_64)
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          command: build
+          args: --release --out dist
+      - name: Install the built wheel (non-editable, catches packaging mistakes)
+        run: pip install --find-links python/dist glmm
+      - name: Install test + lint deps
+        run: pip install pytest ruff
+      - name: pytest against the installed wheel, run outside the source tree
+        run: |
+          cd "$RUNNER_TEMP"
+          python -m pytest "$GITHUB_WORKSPACE/python/tests" -v
+      - name: ruff check
+        run: ruff check python/
+      - name: ruff format --check
+        run: ruff format --check python/

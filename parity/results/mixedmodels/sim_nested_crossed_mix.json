@@ -1,0 +1,49 @@
+{
+  "dataset": "sim_nested_crossed_mix",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 21,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.967062359104183, 0.6225792611285834],
+    "se": [0.6174428924914919, 0.030983570994653153],
+    "loglik": -262.24062029427887,
+    "varcomp": [
+      {
+        "group": "g1 & g2",
+        "terms": ["(Intercept)"],
+        "stddev": [0.7000785479112426],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "g1",
+        "terms": ["(Intercept)"],
+        "stddev": [1.2825095900062229],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.9624890661822755],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "sigma": 0.4833125126982968
+  },
+  "timing": {
+    "fit_seconds_median": 0.000998438,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

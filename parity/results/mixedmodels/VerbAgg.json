@@ -1,0 +1,40 @@
+{
+  "dataset": "VerbAgg",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "binomial",
+  "reml": null,
+  "rung": 12,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "Anger", "Gender: M", "btype: scold", "btype: shout", "situ: self", "mode: want"],
+  "estimates": {
+    "beta": [-0.15363127297551488, 0.05741814548119729, 0.32076877178780944, -1.0597590472756862, -2.103765604505892, -1.0542894533318778, 0.7070813299746226],
+    "se_rx": [0.38522473005302427, 0.016753066582042273, 0.191210418328067, 0.18415220876063326, 0.18651097897996746, 0.15118907588333413, 0.15100201078118003],
+    "loglik": -4067.9164280757027,
+    "varcomp": [
+      {
+        "group": "id",
+        "terms": ["(Intercept)"],
+        "stddev": [1.3392372198861089],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "item",
+        "terms": ["(Intercept)"],
+        "stddev": [0.34225680347916965],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  },
+  "timing": {
+    "fit_seconds_median_rx": 4.379262082,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

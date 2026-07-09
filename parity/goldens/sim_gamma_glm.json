@@ -1,0 +1,20 @@
+{
+  "name": "sim_gamma_glm",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "kind": "glm",
+  "data": "sim_gamma",
+  "family": "gamma",
+  "link": "log",
+  "nagq": 1,
+  "r_formula": "y ~ 1 + x + grp",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x", "grpb"],
+  "estimates": {
+    "beta": [0.449945830683142, 0.565796931228723, 0.526238083012209],
+    "se": [0.0818215272793177, 0.0596141419705928, 0.119864153173617],
+    "loglik": -490.80909764798,
+    "dispersion": 1.0286627876062
+  }
+}

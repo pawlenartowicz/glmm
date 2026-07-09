@@ -1,0 +1,45 @@
+{
+  "dataset": "sim_binomial_slope_crossed",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "binomial",
+  "reml": null,
+  "rung": 18,
+  "converged": true,
+  "singular": false,
+  "tolPwrss": 1e-13,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.0828981295841742, 0.634303950623442],
+    "se_hessian": [0.219944110429003, 0.216886499145537],
+    "se_rx": [0.219875070785551, 0.216771154628166],
+    "loglik": -597.511826433981,
+    "varcomp": [
+      {
+        "group": "g1",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [0.594579799259361, 0.547358446110361],
+        "corr": [
+          [1, -0.10282274905156],
+          [-0.10282274905156, 1]
+        ]
+      },
+      {
+        "group": "g2",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [0.526191511922771, 0.547153890271485],
+        "corr": [
+          [1, 0.778302035075306],
+          [0.778302035075306, 1]
+        ]
+      }
+    ]
+  },
+  "timing": {
+    "fit_seconds_median_rx": 0.283133268356323,
+    "fit_seconds_median_hessian": 0.282382249832153,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

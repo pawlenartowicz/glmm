@@ -1,0 +1,41 @@
+{
+  "dataset": "Penicillin",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 3,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)"],
+  "estimates": {
+    "beta": [22.972222222225263],
+    "se": [0.8085732363158709],
+    "loglik": -165.43029449550886,
+    "varcomp": [
+      {
+        "group": "plate",
+        "terms": ["(Intercept)"],
+        "stddev": [0.8467043108367798],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "sample",
+        "terms": ["(Intercept)"],
+        "stddev": [1.9315580185458343],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "sigma": 0.5499231454269622
+  },
+  "timing": {
+    "fit_seconds_median": 0.000517964,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

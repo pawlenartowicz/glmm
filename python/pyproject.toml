@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "glmm"
+# Lockstep with the crate: must equal GLMM/Cargo.toml [package] version.
+version = "0.0.3"
+description = "Linear-regression family OLS / GLM / LMM / GLMM — Python port of the glmm crate"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.maturin]
+manifest-path = "../glmm-python/Cargo.toml"
+module-name = "glmm._native"
+python-source = "."
+features = ["pyo3/extension-module"]
+include = [{ path = "faststats/**/*.py", format = "wheel" }]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

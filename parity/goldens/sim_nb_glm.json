@@ -1,0 +1,20 @@
+{
+  "name": "sim_nb_glm",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "kind": "glm",
+  "data": "sim_nb",
+  "family": "negbin",
+  "link": "log",
+  "nagq": 1,
+  "r_formula": "y ~ 1 + x + grp",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x", "grpb"],
+  "estimates": {
+    "beta": [0.144166077871857, 0.619826870647895, 0.633686899496841],
+    "se": [0.120690561977139, 0.0756442004078213, 0.155714256322938],
+    "loglik": -497.32514268659,
+    "theta": 1.01052181546876
+  }
+}

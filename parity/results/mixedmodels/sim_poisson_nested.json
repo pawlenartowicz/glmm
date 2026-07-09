@@ -1,0 +1,40 @@
+{
+  "dataset": "sim_poisson_nested",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "poisson",
+  "reml": null,
+  "rung": 19,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.5100716045727104, 0.3514513076419107],
+    "se_rx": [0.1711597017778497, 0.036713795926442874],
+    "loglik": -686.5994654912006,
+    "varcomp": [
+      {
+        "group": "g1 & g2",
+        "terms": ["(Intercept)"],
+        "stddev": [0.2421773746805014],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "g1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.5111103882197868],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  },
+  "timing": {
+    "fit_seconds_median_rx": 0.017609578,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

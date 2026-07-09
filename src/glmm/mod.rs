@@ -1,0 +1,834 @@
+//! Clustered-logistic GLMM kernel: glmer-faithful nAGQ=1. Optimized in two
+//! stages, mirroring lme4's structure (Bates, Mächler, Bolker, Walker, *JSS*
+//! 67(1), 2015, §3): stage 1 runs BOBYQA over θ alone (`n_theta` dims), and at
+//! each candidate θ the penalized-IRLS inner loop profiles β out by solving for
+//! the conditional modes ũ **and** β jointly per iteration (a small dense p×p
+//! β-Schur border on the RE solve) — the PQL-optimal β for that θ; stage 2 is a
+//! short joint [θ | β] BOBYQA polish on the true Laplace objective, warm-started
+//! from stage 1. Stage 1 is only an accelerant: stage 2 guarantees the reported
+//! (θ̂, β̂) is the Laplace optimum, not the PQL one. The objective is the Laplace
+//! deviance d(y,ũ) + ‖ũ‖² + log|L|²; PIRLS gains step-halving to keep the
+//! higher-dimensional joint (u, β) step stable. Setting `GlmmWorkspace.two_stage
+//! = false` reverts to the single joint [θ | β] solve (β held fixed within each
+//! PIRLS solve) as an A/B escape hatch. RE design Z and Λ_θ are dense
+//! (spec-sanctioned within the regime; the block/sparse backend is not built).
+//! All scratch lives in `GlmmWorkspace`, allocated once per
+//! (spec, max_n) shape — the warm path is zero-alloc (Bobyqa::new once).
+//!
+//! No σ² scale: binomial dispersion is fixed at 1, so D̂ = Λ̂Λ̂′ directly.
+//!
+//! BOBYQA is Powell, M.J.D. (2009), *The BOBYQA algorithm for bound constrained
+//! optimization without derivatives*, Cambridge report DAMTP 2009/NA06.
+
+use crate::WaldSe;
+use bobyqa::Status;
+use faer::{Mat, MatRef};
+
+use crate::lmm::{PIN_THETA, THETA0, THETA_TRUTH_FLOOR};
+
+use se::{blocked_schur_fill, dense_schur_fill, structured_schur_fill};
+use workspace::fill_z_f64;
+
+/// PIRLS inner-loop caps — the same as glm.rs's IRLS (PIRLS *is* that IRLS plus
+/// the +I ridge).
+pub const PIRLS_MAX_ITERS: usize = 50;
+/// Backtracking cap for PIRLS step-halving, mirroring lme4 `pwrssUpdate`'s
+/// 10-halving discipline: when a full Fisher step raises the penalized deviance
+/// above the last accepted value, the u-step is halved and re-evaluated up to
+/// this many times before the solve is declared failed. Exhausting it surfaces as
+/// the module's `(NaN, NaN, NaN, false)` failure — the same terminal state a raw
+/// overshoot reaches today, but reached deliberately. Shared by all three PIRLS
+/// variants (dense / blocked / structured).
+pub const PIRLS_MAX_HALVINGS: usize = 10;
+/// Adaptive PIRLS exit on |Δ penalized-deviance|, relative to the objective
+/// scale (lme4's pwrss discipline): converged when
+/// `|Δpen| < PIRLS_TOL_REL · (1 + |pen|)`. The penalized deviance is O(n), so
+/// this relative gate is an ABSOLUTE tolerance of `PIRLS_TOL_REL · n` in the
+/// deviance scale — fine for the small/medium parity rungs (n ≲ 1500) but not
+/// for VerbAgg (n=7584, the largest individual-Bernoulli binomial rung): at
+/// the former 1e-6 the absolute slack was ~8e-3 in deviance, one Newton step
+/// short of the quadratic-convergence cliff canonical links otherwise reach
+/// "for free" (see `PIRLS_TOL_REL_NONCANON`'s doc comment) — BOBYQA's stage-2
+/// objective then carried that ~1 iteration of leftover curvature noise into
+/// β̂, landing 4e-3 relative off both lme4 and MixedModels.jl (which agree
+/// with each other to 8e-5) instead of the ~1e-4 every other binomial/poisson
+/// rung achieves. This is a cliff, not a gradient: 1e-7 and 1e-8 still miss
+/// VerbAgg's 1e-3 gate at ~4–5e-3 (the Newton step hasn't yet landed inside
+/// the quadratic basin), 3e-9 clears it at 5e-4; 1e-9 keeps a ~5× margin.
+/// Tightening costs the 2–4 extra inner iterations the now-superseded former
+/// comment warned about, but only until each canonical-link solve reaches its
+/// own quadratic floor — negligible on every rung's fit time (verified via
+/// `parity/compare.R` full-suite pass, no rung regressed).
+pub const PIRLS_TOL_REL: f64 = 1e-9;
+/// Tighter PIRLS exit for NON-canonical links (probit, Gamma-log/inverse,
+/// NB-log). Canonical links (logit, Poisson-log) are Newton ⇒ quadratic
+/// convergence, so PIRLS overshoots `PIRLS_TOL_REL` to ~machine precision on its
+/// own and their deviance is already smooth enough for both the outer BOBYQA β
+/// and the FD-Hessian SE. Non-canonical links are Fisher-scoring ⇒ only LINEAR
+/// convergence, so the deviance is smooth only to the exit tolerance; at the
+/// canonical 1e-6 that ~1e-4 floor leaves β ~3e-3 off and the FD second
+/// differences (÷ step²) amplify the noise into a 7–41%-wrong `se_hessian`.
+/// Tightening removes that, but the accuracy PLATEAUS: a cbpp-probit tolerance
+/// sweep (see `fit::tests::fit_glmm_probit_cbpp_matches_lme4`) shows β pinned at
+/// ~5e-5 (40× inside its 2e-3 golden limit) flat across 1e-8…1e-10, with a sharp
+/// cliff only at 1e-6→1e-7. 1e-8 sits one decade above the cliff: same β margin
+/// as 1e-10 (tighter buys no β safety, only iterations), `se_hessian` 34× inside
+/// limit, ~1.5× inner iters vs canonical — paid only on non-canonical fits, and
+/// only when SEs go through the FD-Hessian (`se_rx` skips it entirely).
+pub const PIRLS_TOL_REL_NONCANON: f64 = 1e-8;
+/// PIRLS exit tolerance under the FD-Hessian SE evals ONLY (`fd_hessian_cov` /
+/// `sparse_fd_hessian_cov`), overriding `pirls_tol` for every link. The FD
+/// second differences divide the deviance by step² (~1e-4), so PIRLS exit noise
+/// at the canonical 1e-6 surfaces as a dataset-dependent ~0.3% step wobble in
+/// `se_hessian` (cbpp, h=1e-2 vs 1e-3 — the shipped step landed on the accurate
+/// side by measurement, not construction). At 1e-8 the cbpp Hessian is
+/// step-invariant to ~5–6 sig figs across h ∈ {1e-2, 1e-3, 1e-4} and sits on
+/// the tight-tol (1e-12) limit — accurate by construction. Deeper buys nothing:
+/// the diagnosis sweep was already flat from 1e-10 to 1e-13. The fit path never
+/// pays this — BOBYQA objective evals keep `pirls_tol`; the cost lands only on
+/// the ~m² SE evals that already dominate `WaldSe::Hessian` timing (the same
+/// ~1.5×-inner-iteration precedent as `PIRLS_TOL_REL_NONCANON`, whose value
+/// this matches).
+pub const PIRLS_TOL_REL_FD: f64 = 1e-8;
+/// PIRLS exit tolerance for `family`: the standard value for canonical (Newton,
+/// quadratic) links, the tight value for non-canonical (Fisher-scoring, linear)
+/// links. The canonical set MIRRORS `family::irls_weight_and_resid`'s `canonical`
+/// branch (logit, Poisson-log) — change both together.
+pub(crate) fn pirls_tol(family: crate::spec::Family) -> f64 {
+    use crate::spec::{BinomialLink, Family};
+    if matches!(
+        family,
+        Family::Binomial {
+            link: BinomialLink::Logit
+        } | Family::Poisson { .. }
+    ) {
+        PIRLS_TOL_REL
+    } else {
+        PIRLS_TOL_REL_NONCANON
+    }
+}
+/// Wide finite β box for the joint BOBYQA. Bound to `glm::BETA_CAP` (the log-odds
+/// divergence guard, same magnitude) so the box and the cap can never drift apart.
+pub const BETA_BOX: f64 = crate::glm::BETA_CAP;
+/// Relative FD step for `fd_hessian_cov`'s joint-deviance Hessian:
+/// `h_k = FD_STEP_REL·max(1, |γ̂_k|)`. The Hessian is step-invariant over h ∈
+/// [1e-4, 1e-1] on the committed fixture (the deviance is smooth/deterministic
+/// enough that 1/h² noise amplification is negligible), so 1e-2 is a comfortable
+/// mid-band choice — see `fd_hessian_cov`'s doc comment for the full diagnostic.
+pub const FD_STEP_REL: f64 = 1e-2;
+
+/// Per-fit GLMM result (mirrors `LmmFit`; no σ² — dispersion is fixed at 1).
+pub struct GlmmFit {
+    /// `true` iff stage-2 BOBYQA converged AND the pinned-γ̂ re-eval deviance is
+    /// finite; `false` NaN-fills every inference field (see `nan_fit`).
+    pub converged: bool,
+    /// 0 = interior, 1 = ≥1 diagonal θ pinned (converged), 2 = optimizer/Schur
+    /// failure (non-converged).
+    pub boundary_hit: u8,
+    /// Bit k set iff diagonal variance component k pinned (order
+    /// [intercept, slope_0, …, extra_1, …]). Mirrors `LmmFit.pinned_components`
+    /// (u64 mask — see there for the over-envelope component-count rationale).
+    pub pinned_components: u64,
+    /// Total BOBYQA evaluations across both stages (stage 1 + stage 2; 0 + stage 2
+    /// on the single-stage path).
+    pub n_eval: usize,
+    /// Estimated random-intercept variance D̂[0][0] (NaN on non-converged).
+    pub tau_squared_hat: f64,
+    /// Joint Wald-χ² over `target_indices` (NaN when empty / non-converged).
+    pub joint_t_sq: f64,
+    /// Set iff the fit ran `WaldSe::Hessian` and `fd_hessian_cov` fell back to the
+    /// RX/Schur block (non-PD joint Hessian / non-finite perturbed deviance) — its
+    /// `NonPdFellBackToRx` status. Always `false` under `WaldSe::Rx`.
+    pub hessian_fallback: bool,
+    /// Minimized marginal Laplace deviance at the pinned γ̂ (`d(y,ũ)+‖ũ‖²+log|A|`,
+    /// or the AGQ deviance when `nagq>1`). `f64::INFINITY` on non-convergence. The
+    /// NB GLMM outer-θ loop needs this as the kernel of its marginal-θ objective
+    /// (`logL_marginal = −½·deviance + nb_saturated_loglik(y,θ)`); other callers
+    /// ignore it.
+    pub deviance: f64,
+}
+
+mod agq;
+mod deviance;
+mod pirls;
+mod se;
+mod workspace;
+
+#[cfg(test)]
+pub(crate) use deviance::glmm_laplace_deviance;
+pub use se::fd_hessian_cov;
+pub(crate) use workspace::StructuredSchur;
+pub use workspace::{build_z, GlmmWorkspace};
+#[cfg(test)]
+pub(crate) use workspace::{glmm_block_chol, glmm_block_solve};
+
+use deviance::laplace_deviance;
+
+#[cfg(test)]
+mod tests;
+
+/// Outcome of the FD-Hessian fixed-effect covariance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdHessianStatus {
+    /// The joint-deviance Hessian was PD and every perturbed eval finite; the
+    /// returned covariance is `2·(H_dev⁻¹)_ββ` (lme4 `vcov(use.hessian = TRUE)`).
+    Ok,
+    /// The joint Hessian was non-PD (or a perturbed deviance was non-finite — the
+    /// few-cluster failure mode); the returned covariance is the RX/Schur block.
+    NonPdFellBackToRx,
+}
+
+/// Fit the clustered-logistic GLMM. `ws.z` must already be built (build_z) for
+/// this (X, ids, N). `beta_start` = spec.effect_sizes. Writes β̂/Var/z² into
+/// ws.{betas,var_diag,t_sq}; returns the GlmmFit summary.
+///
+/// Convention: `wald_se` selects the fixed-effect covariance — `WaldSe::Rx`
+/// inverts the expected-information Schur complement directly (assumes β–θ
+/// orthogonality; anticonservative for the GLMM); `WaldSe::Hessian` (glmer
+/// `use.hessian = TRUE`) sources it from the FD-Hessian of the joint Laplace
+/// deviance instead, the lme4-matching default. The optimizer runs a two-stage
+/// β-profiling search when `ws.two_stage` (default `true`): stage 1 profiles β
+/// out of a θ-only BOBYQA on the PQL objective purely as a warm-start
+/// accelerant; stage 2's joint [θ | β] BOBYQA polish alone gates convergence,
+/// so the reported (θ̂, β̂) is always the Laplace optimum, not the PQL one.
+///
+/// Matches `lme4::glmer` (binomial cbpp fixture; see
+/// `fit::tests::fit_glmm_cbpp_matches_lme4`).
+///
+/// Errors: no `Result` — non-convergence (BOBYQA failure, a non-PD Schur, or the
+/// degenerate-fit guard tripping on an all-infeasible BOBYQA simplex) is
+/// reported through `GlmmFit`: `converged = false`, `boundary_hit = 2`, and
+/// every β̂/SE/deviance field NaN or `f64::INFINITY` (see `nan_fit`).
+#[allow(clippy::too_many_arguments)]
+pub fn fit_glmm(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    target_indices: &[u32],
+    theta_start: Option<&[f64]>,
+    beta_start: &[f64],
+    n: usize,
+    wald_se: WaldSe,
+) -> GlmmFit {
+    let (k, p, n_theta) = (ws.k, ws.p, ws.n_theta);
+
+    // γ₀ = [θ₀ | β₀].
+    match theta_start {
+        Some(ts) => {
+            for (t, &v) in ws.params[..n_theta].iter_mut().zip(ts) {
+                *t = v.max(THETA_TRUTH_FLOOR);
+            }
+        }
+        None => {
+            for t in ws.params[..n_theta].iter_mut() {
+                *t = THETA0;
+            }
+        }
+    }
+    for (j, &b) in beta_start.iter().enumerate().take(p) {
+        ws.params[n_theta + j] = b.clamp(-BETA_BOX, BETA_BOX);
+    }
+
+    // Within-fit warm-start resets per fit — the incumbent is NEVER carried across
+    // fits (that is the rejected cross-sim warm-start; it would break the
+    // plan_chunks/run_chunk merge and same-seed reproducibility).
+    for v in ws.u_seed[..k].iter_mut() {
+        *v = 0.0;
+    }
+
+    // Joint BOBYQA over [θ | β]. Borrow-split mirrors `glmm_laplace_deviance`:
+    // `solver` held by `minimize`; the closure calls the shared `laplace_deviance`
+    // on the disjoint scratch fields (groupings read; m/lam/eta/prob/w/u/a/a_rhs
+    // written). The closure's `gamma` is BOBYQA's candidate point, not the bound
+    // `params` (which `minimize` owns as its `x`).
+    let family = ws.family;
+    let nb_theta = ws.nb_theta;
+    let nagq = ws.nagq;
+    // Always false in production; test-only escape hatch for the both-paths
+    // cross-check (`ws.force_dense_schur`), threaded through both the BOBYQA
+    // objective and the pinned-γ̂ re-eval below so a fit-level comparison (not just
+    // a single deviance eval) exercises the dense factor/solve end to end.
+    let force_dense_schur = ws.force_dense_schur;
+    // Two-stage A/B flag (the β-profiling two-stage optimizer design). Read before
+    // the destructure moves `ws`'s fields out by mutable reference; `bool` is Copy
+    // so this is a plain read.
+    let two_stage = ws.two_stage;
+    let GlmmWorkspace {
+        solver,
+        solver_stage1,
+        params,
+        params_stage1,
+        beta_rhs,
+        lower,
+        upper,
+        groupings,
+        agq_scratch,
+        z,
+        m,
+        eta,
+        prob,
+        w,
+        u,
+        u_prev,
+        u_seed,
+        eta_fixed,
+        mu,
+        wm,
+        a,
+        a_chol,
+        a_llt_mem,
+        a_rhs,
+        a_blocks,
+        core_blocks,
+        coupling,
+        schur_blk,
+        lam,
+        z_buf,
+        m_buf,
+        m_core_buf,
+        cross_val,
+        cross_col,
+        n_cross,
+        coup_cols,
+        coup_ptr,
+        structured_schur,
+        xtwx,
+        xtwm,
+        ainv_mtwx,
+        schur,
+        schur_llt_mem,
+        beta_prof,
+        beta_seed,
+        beta_prev,
+        p: pf,
+        ..
+    } = ws;
+    // x is fixed for this fit: widen the slope columns to f64 once, so every
+    // BOBYQA eval's per-solve M fill runs MatRef-free. Blocked path ONLY: the
+    // dense (crossed/nested) branch never reads z_buf, and under a test_formula
+    // reduced fit `x` is the REDUCED design while `primary_slope_cols` index the
+    // FULL one — an unconditional fill could index past x's columns there.
+    if groupings.extra_offsets.is_empty() {
+        fill_z_f64(groupings, x, z_buf, n);
+    }
+
+    // STAGE 1 (two-stage β-profiling optimizer design) — θ-only BOBYQA on the PQL
+    // objective, β profiled inside PIRLS. An accelerant that warm-starts stage 2; it
+    // never gates convergence. Skipped bit-identically when `two_stage == false`
+    // (the A/B tests pin this for the single-stage reference) and when `nagq > 1` —
+    // Profile deviance is undefined on the AGQ early-return path
+    // (`debug_assert!(!profile_beta || nagq == 1)`), and AGQ fits must bypass stage 1
+    // unchanged.
+    let mut n_eval_stage1 = 0usize;
+    if two_stage && nagq == 1 {
+        params_stage1.copy_from_slice(&params[..n_theta]); // θ₀ as today
+        beta_prof[..p].copy_from_slice(&params[n_theta..n_theta + p]); // β₀ (GLM warm start)
+        beta_seed[..p].copy_from_slice(&beta_prof[..p]);
+        let mut best1 = f64::INFINITY;
+        let out1 = solver_stage1.minimize(
+            |theta| {
+                // Re-seed BOTH latent states from the INCUMBENT (best point so far),
+                // not the last-evaluated: BOBYQA's final call is not its best.
+                // û is point-determined given θ, and β is likewise point-determined
+                // (the PQL β̂(θ)); the incumbent seed only shifts the stopping iterate
+                // within tol — the same argument that justifies the u_seed warm start.
+                u[..k].copy_from_slice(&u_seed[..k]);
+                beta_prof[..p].copy_from_slice(&beta_seed[..p]);
+                // Profile mode SWAPS the β buffers vs the Fixed stage-2 call below:
+                // `beta = beta_prof` (in/out profiled β), `beta_step_rhs = beta_rhs`
+                // (the δβ border scratch). See deviance.rs's buffer-role comment.
+                let obj = laplace_deviance(
+                    family,
+                    nb_theta,
+                    nagq,
+                    groupings,
+                    theta,
+                    beta_prof,
+                    z.as_ref(),
+                    m,
+                    lam,
+                    z_buf,
+                    m_buf,
+                    x,
+                    y,
+                    cluster_ids,
+                    eta,
+                    prob,
+                    w,
+                    u,
+                    u_prev,
+                    eta_fixed,
+                    mu,
+                    wm,
+                    a,
+                    a_chol,
+                    a_llt_mem,
+                    a_rhs,
+                    a_blocks,
+                    core_blocks,
+                    coupling,
+                    schur_blk,
+                    m_core_buf,
+                    cross_val,
+                    cross_col,
+                    n_cross,
+                    coup_cols,
+                    coup_ptr,
+                    structured_schur.as_mut(),
+                    force_dense_schur,
+                    agq_scratch,
+                    xtwx,
+                    xtwm,
+                    ainv_mtwx,
+                    // Stage 1 writes ws.schur via the Profile S_β border; the post-fit
+                    // SE path runs AFTER stage 2 and its dense/blocked/structured
+                    // schur_fill rebuilds ws.schur from scratch, so this transient use
+                    // is safe (no read survives into inference).
+                    schur,
+                    schur_llt_mem,
+                    beta_rhs,
+                    beta_prev,
+                    true,
+                    // Never the FD tight tol here — stage-1 objective evals stay at
+                    // `pirls_tol` (the field is None outside `fd_hessian_cov`).
+                    None,
+                    *pf,
+                    n,
+                );
+                if obj < best1 {
+                    best1 = obj;
+                    // INCUMBENT-gated snapshot — snapshot only on strict
+                    // improvement, NOT every eval.
+                    u_seed[..k].copy_from_slice(&u[..k]);
+                    beta_seed[..p].copy_from_slice(&beta_prof[..p]);
+                }
+                obj
+            },
+            params_stage1,
+            &lower[..n_theta],
+            &upper[..n_theta],
+        );
+        // Non-convergence does NOT fail the fit — stage 1 is an accelerant. Proceed to
+        // stage 2 from wherever the incumbent landed (worst case = today's cold start).
+        n_eval_stage1 = out1.n_eval;
+        // Warm-start stage 2: θ̂₁ (BOBYQA leaves the incumbent in `params_stage1`) and
+        // β̂₁ (the incumbent snapshot, NOT `beta_prof`'s last-evaluated value).
+        params[..n_theta].copy_from_slice(params_stage1);
+        // β̂₁ is not re-clamped to ±BETA_BOX here: the bobyqa crate itself projects
+        // an out-of-box start onto the bounds (PRIMA moderatex-style preproc), so
+        // stage 2's solver init already lands in-box without a redundant clamp.
+        params[n_theta..].copy_from_slice(&beta_seed[..p]);
+    }
+
+    let mut best_obj = f64::INFINITY;
+    let out = solver.minimize(
+        |gamma| {
+            // Within-fit û warm-start: seed PIRLS from the incumbent (best point so
+            // far), not from 0. The conditional mode is point-determined, so the seed
+            // only shifts the stopping iterate within the PIRLS exit band.
+            u[..k].copy_from_slice(&u_seed[..k]);
+            let obj = laplace_deviance(
+                family,
+                nb_theta,
+                nagq,
+                groupings,
+                gamma,
+                beta_rhs,
+                z.as_ref(),
+                m,
+                lam,
+                z_buf,
+                m_buf,
+                x,
+                y,
+                cluster_ids,
+                eta,
+                prob,
+                w,
+                u,
+                u_prev,
+                eta_fixed,
+                mu,
+                wm,
+                a,
+                a_chol,
+                a_llt_mem,
+                a_rhs,
+                a_blocks,
+                core_blocks,
+                coupling,
+                schur_blk,
+                m_core_buf,
+                cross_val,
+                cross_col,
+                n_cross,
+                coup_cols,
+                coup_ptr,
+                structured_schur.as_mut(),
+                force_dense_schur,
+                agq_scratch,
+                xtwx,
+                xtwm,
+                ainv_mtwx,
+                schur,
+                schur_llt_mem,
+                // Stage-2 BOBYQA objective is β-FIXED; the Profile
+                // border scratch is inert. `beta_prof` is the spare distinct buffer
+                // (`beta_rhs` is `beta` above). The stage-1 objective above flips this
+                // to Profile, behind `ws.two_stage`.
+                beta_prof,
+                beta_prev,
+                false,
+                // Never the FD tight tol here — BOBYQA objective evals stay at
+                // `pirls_tol` (the field is None outside `fd_hessian_cov`).
+                None,
+                *pf,
+                n,
+            );
+            if obj < best_obj {
+                best_obj = obj;
+                u_seed[..k].copy_from_slice(&u[..k]);
+            }
+            obj
+        },
+        params,
+        lower,
+        upper,
+    );
+
+    debug_assert!(out.status != Status::InvalidArgs);
+    let ok = matches!(out.status, Status::Converged);
+    // Reported eval count is stage 1 + stage 2 (0 + stage 2 on the single-stage path,
+    // so byte-identical to today). Only stage 2's status feeds `converged`.
+    let n_eval = n_eval_stage1 + out.n_eval;
+
+    // Per-component diagonal pin (β never pins). `diag` borrows ws.groupings; the
+    // loop mutates the disjoint field ws.params, so no clone is needed.
+    let diag = ws.groupings.diagonal_theta();
+    let mut pinned_components = 0u64;
+    let mut pinned = false;
+    if ok {
+        for (kk, &ti) in diag.iter().enumerate() {
+            if ws.params[ti] <= PIN_THETA {
+                ws.params[ti] = 0.0;
+                pinned = true;
+                pinned_components |= 1u64 << kk;
+            }
+        }
+    }
+
+    // Re-evaluate at the (possibly pinned) γ̂ to refresh M, ũ, W̃. ws.params already
+    // holds the pinned γ̂, so call the kernel on it directly — no params copy. The
+    // refreshed deviance is the reported marginal deviance (the NB outer-θ loop's
+    // objective kernel); INFINITY until the re-eval runs.
+    let mut final_deviance = f64::INFINITY;
+    if ok {
+        // Warm-start the pinned re-eval from the incumbent (its modes are the
+        // inference iterate); u_seed holds the BOBYQA incumbent after minimize.
+        ws.u[..k].copy_from_slice(&ws.u_seed[..k]);
+        let GlmmWorkspace {
+            groupings,
+            params,
+            beta_rhs,
+            p,
+            z,
+            m,
+            lam,
+            z_buf,
+            m_buf,
+            eta,
+            prob,
+            w,
+            u,
+            u_prev,
+            eta_fixed,
+            mu,
+            wm,
+            a,
+            a_chol,
+            a_llt_mem,
+            a_rhs,
+            a_blocks,
+            core_blocks,
+            coupling,
+            schur_blk,
+            m_core_buf,
+            cross_val,
+            cross_col,
+            n_cross,
+            coup_cols,
+            coup_ptr,
+            structured_schur,
+            xtwx,
+            xtwm,
+            ainv_mtwx,
+            schur,
+            schur_llt_mem,
+            beta_prof,
+            beta_prev,
+            ..
+        } = ws;
+        // z_buf still holds this fit's slope copy — x is unchanged since fill_z_f64.
+        // On the structured path this re-eval re-packs m_core_buf/cross_* at γ̂, which
+        // `structured_schur_fill` then reads (the dense `m` it formerly read is no
+        // longer maintained here).
+        final_deviance = laplace_deviance(
+            family,
+            nb_theta,
+            nagq,
+            groupings,
+            &params[..],
+            beta_rhs,
+            z.as_ref(),
+            m,
+            lam,
+            z_buf,
+            m_buf,
+            x,
+            y,
+            cluster_ids,
+            eta,
+            prob,
+            w,
+            u,
+            u_prev,
+            eta_fixed,
+            mu,
+            wm,
+            a,
+            a_chol,
+            a_llt_mem,
+            a_rhs,
+            a_blocks,
+            core_blocks,
+            coupling,
+            schur_blk,
+            m_core_buf,
+            cross_val,
+            cross_col,
+            n_cross,
+            coup_cols,
+            coup_ptr,
+            structured_schur.as_mut(),
+            force_dense_schur,
+            agq_scratch,
+            xtwx,
+            xtwm,
+            ainv_mtwx,
+            schur,
+            schur_llt_mem,
+            // Pinned-γ̂ re-eval is β-FIXED (reports the fitted β); Profile border
+            // scratch inert. `beta_prof` is the spare distinct buffer.
+            beta_prof,
+            beta_prev,
+            false,
+            // Never the FD tight tol here — the pinned re-eval stays at `pirls_tol`
+            // (the field is None outside `fd_hessian_cov`).
+            None,
+            *p,
+            n,
+        );
+    }
+
+    // Degenerate-fit guard. BOBYQA can report `Converged` on a fit that never left
+    // an infinite-deviance start: PRIMA's `moderatef` maps a `+inf` objective to the
+    // finite ceiling FUNCMAX (1e30), so if the whole initial simplex is infeasible
+    // the fval array is uniformly huge (a flat surface) and the trust region shrinks
+    // to `rho_end` without ever finding a finite point — a `SMALL_TR_RADIUS` exit
+    // that maps to `Status::Converged`. The marginal deviance recomputed at γ̂ above
+    // is the honest witness: if it is non-finite the optimizer sat on the start and
+    // this is not a converged fit. Step-halving in the PIRLS variants
+    // (`pirls_solve*`) now recovers the grouseticks 3-crossed β=0 cold start that
+    // used to overshoot into a ~1e30 weight regime and bail — so this guard no
+    // longer fires on that case. It remains the backstop for the genuinely
+    // unrecoverable path: when halving is EXHAUSTED (`PIRLS_MAX_HALVINGS` reached)
+    // PIRLS returns `(NaN, …)` and the deviance is non-finite, and BOBYQA can still
+    // report `Converged` off an all-infeasible simplex (PRIMA maps `+inf` to the
+    // FUNCMAX ceiling). Do NOT remove it.
+    let ok = ok && final_deviance.is_finite();
+
+    if !ok {
+        return nan_fit(ws, target_indices, n_eval);
+    }
+
+    for j in 0..p {
+        ws.betas[j] = ws.params[n_theta + j];
+    }
+
+    // Var(β̂): `Rx` inverts the β-information (Schur) directly — fast, but the
+    // expected-information Schur complement assumes β–θ orthogonality (exact for
+    // the Gaussian LMM, anticonservative for the GLMM where IRLS weights couple
+    // β,θ). `Hessian` (default) sources Var(β̂) from the FD-Hessian of the joint
+    // Laplace deviance (glmer `use.hessian = TRUE`), the lme4 "correct" denom.
+    let mut hessian_fallback = false;
+    // Reset the θ-block SE each fit (the workspace is reused across fits). Only the
+    // Hessian arm's `fd_hessian_cov` refills it; the Rx arm leaves it NaN.
+    for v in ws.theta_se[..n_theta].iter_mut() {
+        *v = f64::NAN;
+    }
+    let joint_t_sq = match wald_se {
+        WaldSe::Rx => {
+            // Schur fill. No-extras reuses the per-block factors the blocked PIRLS
+            // left in ws.a_blocks; structured-eligible extras reuse the core+Schur
+            // factors the structured PIRLS left in ws.{core_blocks, schur_blk,
+            // coupling}; the dense fallback factors ws.a.
+            let inf_ok = if ws.groupings.extra_offsets.is_empty() {
+                blocked_schur_fill(ws, x, cluster_ids, n)
+            } else if ws.groupings.structured_extras_eligible() {
+                structured_schur_fill(ws, x, cluster_ids, n)
+            } else {
+                dense_schur_fill(ws, x, n)
+            };
+            if !inf_ok {
+                return nan_fit(ws, target_indices, n_eval);
+            }
+            // Gamma carries lme4's σ̂² on the RX vcov (`vcov(use.hessian=FALSE)` =
+            // σ̂²·Schur⁻¹); fixed-scale families σ̂²≡1. Computed off the converged
+            // μ̂/û the pinned-γ̂ re-eval left. The Hessian arm is NOT scaled — the
+            // dispersion enters its objective via `gamma_aic`, and its unscaled SE
+            // is the oracle-settled match to `vcov(use.hessian=TRUE)`.
+            let sigma_sq =
+                crate::family::glmm_sigma_sq(family, &y[..n], &ws.prob[..n], &ws.u[..ws.k]);
+            // Var(β̂)_jj from chol(Schur) forward-solve (mirrors fit_lmm's recovery).
+            let sc = match ws.schur.as_ref().llt(faer::Side::Lower) {
+                Ok(c) => c,
+                Err(_) => return nan_fit(ws, target_indices, n_eval),
+            };
+            let lschur = sc.L();
+            for &tj in target_indices {
+                let tj = tj as usize;
+                // Forward-solve into reusable scratch; fwd_solve[i] is written before
+                // it is read as fwd_solve[kk] (kk < i), so no per-target zero-fill is
+                // needed.
+                for i in 0..p {
+                    let mut acc = if i == tj { 1.0 } else { 0.0 };
+                    for kk in 0..i {
+                        acc -= lschur[(i, kk)] * ws.fwd_solve[kk];
+                    }
+                    ws.fwd_solve[i] = acc / lschur[(i, i)];
+                }
+                let vd: f64 = ws.fwd_solve[..p].iter().map(|v| v * v).sum::<f64>() * sigma_sq;
+                ws.var_diag[tj] = vd;
+                ws.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
+                    ws.betas[tj] * ws.betas[tj] / vd
+                } else {
+                    f64::NAN
+                };
+            }
+            // Joint Wald-χ² via the lme helper (Schur is the β-information; σ̂²
+            // divides W as in the LMM caller — 1 except Gamma).
+            if target_indices.is_empty() {
+                f64::NAN
+            } else {
+                crate::lme::joint_wald_chi_sq(
+                    ws.schur.as_ref(),
+                    &ws.betas,
+                    sigma_sq,
+                    target_indices,
+                    ws.joint_k_inv.as_mut(),
+                    ws.joint_sigma_t_chol.as_mut(),
+                    &mut ws.joint_rhs,
+                )
+            }
+        }
+        WaldSe::Hessian => {
+            // FD-Hessian covariance into a LOCAL p×p Mat — NOT a ws field: the kernel
+            // takes `&mut ws`, so `&mut ws.<field>` for out_cov would alias it. The
+            // allocation is acceptable on this default path (the zero-alloc gate
+            // pins the Rx warm path). The kernel re-evals PIRLS itself and its
+            // RX fallback runs schur_fill internally, so skip the schur_fill above.
+            let mut cov = Mat::<f64>::zeros(p, p);
+            let status = fd_hessian_cov(ws, x, y, cluster_ids, p, n, &mut cov);
+            // Double-failure sentinel: the kernel NaN-fills `cov` when BOTH the joint
+            // Hessian and the RX fallback fail. Treat as a failed fit.
+            if !cov[(0, 0)].is_finite() {
+                return nan_fit(ws, target_indices, n_eval);
+            }
+            hessian_fallback = matches!(status, FdHessianStatus::NonPdFellBackToRx);
+            // Marginal var/t² straight off the covariance diagonal.
+            for &tj in target_indices {
+                let tj = tj as usize;
+                let vd = cov[(tj, tj)];
+                ws.var_diag[tj] = vd;
+                ws.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
+                    ws.betas[tj] * ws.betas[tj] / vd
+                } else {
+                    f64::NAN
+                };
+            }
+            // Joint Wald-χ²: `joint_wald_chi_sq` expects the β-INFORMATION (it inverts
+            // and sub-blocks internally), so pass info = cov⁻¹. Write cov⁻¹ into the
+            // now-free ws.schur (schur_fill was skipped on this arm) and reuse the
+            // helper verbatim — same faer LLT-inverse idiom as `rx_cov_into`.
+            if target_indices.is_empty() {
+                f64::NAN
+            } else {
+                use faer::linalg::solvers::Solve;
+                match cov.as_ref().llt(faer::Side::Lower) {
+                    Ok(chol) => {
+                        let mut inv = Mat::<f64>::identity(p, p);
+                        chol.solve_in_place(inv.as_mut());
+                        for a in 0..p {
+                            for b in 0..p {
+                                ws.schur[(a, b)] = inv[(a, b)];
+                            }
+                        }
+                        crate::lme::joint_wald_chi_sq(
+                            ws.schur.as_ref(),
+                            &ws.betas,
+                            1.0,
+                            target_indices,
+                            ws.joint_k_inv.as_mut(),
+                            ws.joint_sigma_t_chol.as_mut(),
+                            &mut ws.joint_rhs,
+                        )
+                    }
+                    Err(_) => f64::NAN,
+                }
+            }
+        }
+    };
+
+    // τ̂² = D̂[0][0] = (Λ̂Λ̂')[0][0]. No σ² (binomial). For lower-tri Λ_p stored
+    // row-major (lam[r*q + c]), row 0 has only the (0,0) entry nonzero, so
+    // D̂[0][0] = Σ_c Λ[0,c]² = Λ[0,0]² — the random-INTERCEPT variance.
+    crate::lmm::primary_lambda(&ws.params[..n_theta], ws.groupings.primary_q, &mut ws.lam);
+    let q = ws.groupings.primary_q;
+    let mut d00 = 0.0;
+    for r in 0..q {
+        d00 += ws.lam[r] * ws.lam[r];
+    }
+    GlmmFit {
+        converged: true,
+        boundary_hit: u8::from(pinned),
+        pinned_components,
+        n_eval,
+        tau_squared_hat: d00,
+        joint_t_sq,
+        hessian_fallback,
+        deviance: final_deviance,
+    }
+}
+
+/// NaN-fill the inference outputs on a non-converged / Schur-failure fit, mirror
+/// `fit_lmm`'s NaN-fill branch (boundary_hit = 2 = optimizer/Schur failure).
+fn nan_fit(ws: &mut GlmmWorkspace, targets: &[u32], n_eval: usize) -> GlmmFit {
+    for v in ws.betas.iter_mut() {
+        *v = f64::NAN;
+    }
+    for &t in targets {
+        ws.var_diag[t as usize] = f64::NAN;
+        ws.t_sq[t as usize] = f64::NAN;
+    }
+    GlmmFit {
+        converged: false,
+        boundary_hit: 2,
+        pinned_components: 0,
+        n_eval,
+        tau_squared_hat: f64::NAN,
+        joint_t_sq: f64::NAN,
+        hessian_fallback: false,
+        deviance: f64::INFINITY,
+    }
+}

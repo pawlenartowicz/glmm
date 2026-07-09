@@ -204,8 +204,9 @@ fn triangular_solve_norm_sq(
 }
 
 /// NaN-fill the three scratch output slices (`betas[..p]`, `var_diag[..t]`,
-/// `t_sq[..t]`) on the rank-deficient / early-return paths so callers see the
-/// v1-contract NaN signal. Successful paths overwrite every populated slot.
+/// `t_sq[..t]`) on the rank-deficient / early-return paths so callers can
+/// detect non-convergence from NaN outputs alone. Successful paths overwrite
+/// every populated slot.
 /// Shared by the OLS fit and the GLM IRLS preamble.
 #[inline]
 pub(crate) fn nan_fill_ols_scratch(
@@ -273,6 +274,56 @@ pub(crate) fn chol_rank_deficient(factor: MatRef<'_, f64>, p: usize, eps: f64) -
     max_diag <= 0.0 || min_diag < eps * max_diag
 }
 
+/// Relative pivot floor for rank-deficiency detection. A column is
+/// aliased when its Cholesky Schur pivot drops below `ALIAS_EPS · G_dd` (its OWN
+/// Gram diagonal) — i.e. its residual norm, after projecting onto the retained
+/// earlier columns, falls below `sqrt(ALIAS_EPS)` of its own original norm.
+/// Per-column ⇒ scale-invariant (a small-magnitude independent column is not
+/// wrongly dropped just because another column is large). `1e-14 = (1e-7)²`
+/// mirrors lme4/R's `dqrdc2`, which drops at `1e-7` relative to the column norm;
+/// the pivot is a squared quantity, so the eps is squared. (Distinct from OLS's
+/// `1e-12` guard, which is on the L-diagonal = √pivot scale — a different basis.)
+pub(crate) const ALIAS_EPS: f64 = 1e-14;
+
+/// Order-preserving rank reveal: which columns of `X` are linearly dependent on
+/// EARLIER columns, from the lower triangle of the Gram `G = XᵀX` (`p×p`).
+/// Left-to-right (natural order, NO pivoting-by-norm) so the dropped set matches
+/// lme4/R's `dqrdc2`: the later column of a collinear group is aliased, the
+/// earlier retained. A column's Schur pivot (`G_dd − Σ_{j<d, retained} L_dj²`)
+/// below `eps · G_dd` — its OWN Gram diagonal, so the test is scale-invariant and
+/// matches dqrdc2's per-column-norm tolerance — marks it aliased; its `L` column
+/// stays zero, so it contributes nothing to later pivots. Returns a length-`p`
+/// mask (`true` = aliased/drop). `p` tiny ⇒ the `O(p³)` factor is negligible.
+pub(crate) fn aliased_columns(gram: MatRef<'_, f64>, p: usize, eps: f64) -> Vec<bool> {
+    let mut l = vec![0.0f64; p * p]; // row-major lower-tri factor of the retained block
+    let mut aliased = vec![false; p];
+    for d in 0..p {
+        let g_dd = gram[(d, d)];
+        let mut piv = g_dd;
+        for j in 0..d {
+            if !aliased[j] {
+                piv -= l[d * p + j] * l[d * p + j];
+            }
+        }
+        if piv <= eps * g_dd {
+            aliased[d] = true; // L column d left zero → invisible to later pivots
+            continue;
+        }
+        let ljj = piv.sqrt();
+        l[d * p + d] = ljj;
+        for i in (d + 1)..p {
+            let mut s = gram[(i, d)]; // lower triangle: i ≥ d
+            for j in 0..d {
+                if !aliased[j] {
+                    s -= l[i * p + j] * l[d * p + j];
+                }
+            }
+            l[i * p + d] = s / ljj;
+        }
+    }
+    aliased
+}
+
 /// The production OLS fit: Cholesky on accumulated sufficient statistics.
 /// Starts from `(X'X, X'y, y'y, n_rows)` instead of a raw `(X, y)` pair —
 /// this is the cross-N reuse path: each successive call sees a strictly larger
@@ -326,8 +377,9 @@ pub fn fit_suff_stats_t_sq<'a>(
     debug_assert!(t <= fit_var_diag.len());
     debug_assert!(p <= fit_rhs.nrows(), "fit_rhs must hold at least p rows");
 
-    // NaN-fill on the rank-deficient / early-return paths so callers see the
-    // v1-contract NaN signal. Successful paths overwrite every populated slot.
+    // NaN-fill on the rank-deficient / early-return paths so callers can
+    // detect non-convergence from NaN outputs alone. Successful paths
+    // overwrite every populated slot.
     nan_fill_ols_scratch(fit_betas, fit_var_diag, fit_t_sq, p, t);
 
     if n <= p || p == 0 {
@@ -531,6 +583,63 @@ mod tests {
             }
         }
         m
+    }
+
+    // ---------------------------------------------------------------------
+    // aliased_columns rank-reveal tests
+    // ---------------------------------------------------------------------
+
+    /// Build the lower-tri Gram G = XᵀX (row-major X, n×p) into a faer Mat.
+    fn gram_of(x: &[f64], n: usize, p: usize) -> faer::Mat<f64> {
+        let mut g = faer::Mat::<f64>::zeros(p, p);
+        for i in 0..n {
+            for a in 0..p {
+                let xa = x[i * p + a];
+                for b in 0..=a {
+                    g[(a, b)] += xa * x[i * p + b];
+                }
+            }
+        }
+        g
+    }
+
+    /// col2 = col0 + col1 exactly → column 2 is aliased (dropped), 0 and 1 kept.
+    #[test]
+    fn aliased_columns_flags_dependent_last() {
+        let n = 4;
+        let p = 3;
+        // rows: [1, days, 1+days]
+        let x = vec![
+            1.0, 0.0, 1.0, //
+            1.0, 1.0, 2.0, //
+            1.0, 2.0, 3.0, //
+            1.0, 3.0, 4.0, //
+        ];
+        let g = gram_of(&x, n, p);
+        let a = super::aliased_columns(g.as_ref(), p, super::ALIAS_EPS);
+        assert_eq!(a, vec![false, false, true]);
+    }
+
+    /// Full-rank design → no column aliased.
+    #[test]
+    fn aliased_columns_full_rank_none() {
+        let n = 4;
+        let p = 2;
+        let x = vec![1.0, 0.0, 1.0, 1.0, 1.0, 2.0, 1.0, 3.0];
+        let g = gram_of(&x, n, p);
+        let a = super::aliased_columns(g.as_ref(), p, super::ALIAS_EPS);
+        assert_eq!(a, vec![false, false]);
+    }
+
+    /// Exact duplicate (col1 == col0) → the LATER column (1) is dropped.
+    #[test]
+    fn aliased_columns_drops_later_duplicate() {
+        let n = 3;
+        let p = 2;
+        let x = vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
+        let g = gram_of(&x, n, p);
+        let a = super::aliased_columns(g.as_ref(), p, super::ALIAS_EPS);
+        assert_eq!(a, vec![false, true]);
     }
 
     // ---------------------------------------------------------------------
@@ -745,7 +854,7 @@ mod tests {
     }
 
     /// `n ≤ p` early-return on the production path: non-converged view with
-    /// all-NaN outputs (v1 NaN contract), including `rss`/`sst`.
+    /// all-NaN outputs (the crate's non-convergence signal), including `rss`/`sst`.
     #[test]
     fn suff_stats_non_converged_when_n_le_p() {
         let p = 4;

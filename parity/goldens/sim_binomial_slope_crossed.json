@@ -1,0 +1,41 @@
+{
+  "name": "sim_binomial_slope_crossed",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "kind": "glmm",
+  "data": "sim_binomial_slope_crossed",
+  "family": "binomial",
+  "link": "logit",
+  "nagq": 1,
+  "tolPwrss": 1e-13,
+  "r_formula": "cbind(incidence, size - incidence) ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.0828981295841742, 0.634303950623442],
+    "se_hessian": [0.219944110429003, 0.216886499145537],
+    "se_rx": [0.219875070785551, 0.216771154628166],
+    "loglik": -597.511826433981,
+    "varcomp": [
+      {
+        "group": "g1",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [0.594579799259361, 0.547358446110361],
+        "corr": [
+          [1, -0.10282274905156],
+          [-0.10282274905156, 1]
+        ]
+      },
+      {
+        "group": "g2",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [0.526191511922771, 0.547153890271485],
+        "corr": [
+          [1, 0.778302035075306],
+          [0.778302035075306, 1]
+        ]
+      }
+    ]
+  }
+}

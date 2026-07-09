@@ -7,6 +7,7 @@
   "rung": 3,
   "converged": true,
   "singular": false,
+  "tolPwrss": {},
   "coef_names": ["(Intercept)"],
   "estimates": {
     "beta": [22.9722222222219],
@@ -33,8 +34,9 @@
     "sigma": 0.549922682062881
   },
   "timing": {
-    "fit_seconds_min": 0.0150349140167236,
+    "fit_seconds_median": 0.017087459564209,
     "n_runs": 10,
-    "warmup_discarded": 1
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
   }
 }

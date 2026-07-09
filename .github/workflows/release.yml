@@ -16,8 +16,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Run the full CI suite (fmt + clippy + test + msrv + wasm + publish dry-run)
+  # against the tagged commit. publish is gated on this — a tag that fails any
+  # gate never reaches crates.io.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
   publish:
     name: cargo publish
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Naming an environment lets you attach required-reviewer / branch protection

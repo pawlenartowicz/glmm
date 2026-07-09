@@ -1,0 +1,88 @@
+{
+  "dataset": "sim_sparse_binomial",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "binomial",
+  "reml": null,
+  "rung": 8,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.5301669812940422, 0.4339430595432192],
+    "se_rx": [0.4717137666170023, 0.05418541181534298],
+    "loglik": -466.02443030506595,
+    "varcomp": [
+      {
+        "group": "g1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.9212236586573219],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.5674112225659228],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c2",
+        "terms": ["(Intercept)"],
+        "stddev": [0.46967925091705953],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c3",
+        "terms": ["(Intercept)"],
+        "stddev": [0.2468215470370685],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c4",
+        "terms": ["(Intercept)"],
+        "stddev": [0.4044954455088612],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c5",
+        "terms": ["(Intercept)"],
+        "stddev": [0.4279333896034543],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c6",
+        "terms": ["(Intercept)"],
+        "stddev": [0.42210510274008245],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c7",
+        "terms": ["(Intercept)"],
+        "stddev": [0.2534852275698928],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  },
+  "timing": {
+    "fit_seconds_median_rx": 0.199272139,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "cbpp_agq_k7",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "kind": "glmm",
+  "data": "cbpp",
+  "family": "binomial",
+  "link": "logit",
+  "nagq": 7,
+  "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "period2", "period3", "period4"],
+  "estimates": {
+    "beta": [-1.39923514006289, -0.991393555379478, -1.12782137776524, -1.57947295789128],
+    "se_hessian": [0.233511989327252, 0.306766850686303, 0.326768337249063, 0.427594578846843],
+    "se_rx": [0.228946020380031, 0.305441218189644, 0.326098309106134, 0.428854551251444],
+    "loglik": -50.0050005536298,
+    "varcomp": [
+      {
+        "group": "herd",
+        "terms": ["(Intercept)"],
+        "stddev": [0.647518692435348],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "dataset": "sim_crossed_at_cap",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "poisson",
+  "reml": null,
+  "rung": 17,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.5136095154098681, 0.5404553697739387],
+    "se_rx": [0.3842285191425534, 0.031185542201704677],
+    "loglik": -760.2328916136315,
+    "varcomp": [
+      {
+        "group": "g1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.5999630872826339],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.3392698935569014],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c2",
+        "terms": ["(Intercept)"],
+        "stddev": [0.48997696618877534],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c3",
+        "terms": ["(Intercept)"],
+        "stddev": [0.4816849131380372],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c4",
+        "terms": ["(Intercept)"],
+        "stddev": [0.3288488399481508],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c5",
+        "terms": ["(Intercept)"],
+        "stddev": [0.34559898123690236],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c6",
+        "terms": ["(Intercept)"],
+        "stddev": [0.33262166581909586],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  },
+  "timing": {
+    "fit_seconds_median_rx": 0.234763331,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

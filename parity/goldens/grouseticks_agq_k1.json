@@ -1,0 +1,30 @@
+{
+  "name": "grouseticks_agq_k1",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "kind": "glmm",
+  "data": "grouseticks",
+  "family": "poisson",
+  "link": "log",
+  "nagq": 1,
+  "r_formula": "TICKS ~ 1 + YEAR + cHEIGHT + (1 | INDEX)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "YEAR96", "YEAR97", "cHEIGHT"],
+  "estimates": {
+    "beta": [0.439973156570138, 1.10082823355748, -0.988047711092655, -0.0236982108735122],
+    "se_hessian": [0.140882438904129, 0.168795499457234, 0.197654140578256, 0.00211151961591648],
+    "se_rx": [0.135256358652126, 0.167159521281353, 0.200107710225792, 0.00212152366009025],
+    "loglik": -957.399741174491,
+    "varcomp": [
+      {
+        "group": "INDEX",
+        "terms": ["(Intercept)"],
+        "stddev": [1.1293694390126],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  }
+}

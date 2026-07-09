@@ -104,14 +104,10 @@ const EXP_ARG_FLOOR: f64 = -700.0;
 // rarely there, where libm would be approaching f64::MAX/inf anyway.
 const EXP_ARG_CEIL: f64 = 700.0;
 
-// fma policy: guaranteed-fused mul_add on native; plain mul/add on wasm32.
-// wasm simd128 has no FMA instruction, so `mul_add_f64s` / `f64::mul_add` lower
-// to the exact soft-float compiler-builtins libcall there — measured 9–41× on
-// the GLM/GLMM wasm rows (~89 pts of the glmm_intercept profile). Dropping the
-// fuse on wasm breaks native↔wasm byte-equality by design; the wasm bench gate
-// is tier-2 |Δk| from this change on. `FUSED` is a const generic (not a bare
-// cfg!) so the native test suite can instantiate and ULP-guard the wasm
-// arithmetic; production entries pick `FUSED_DEFAULT` for the compile target.
+// fma policy: see the module header ("fma policy"). `FUSED` is a const generic
+// rather than a bare `cfg!` check so the native test suite can instantiate and
+// ULP-guard the wasm (unfused) arithmetic on native hardware; production
+// entries pick `FUSED_DEFAULT` for the compile target.
 pub(crate) const FUSED_DEFAULT: bool = cfg!(not(target_arch = "wasm32"));
 
 #[inline(always)]
@@ -455,7 +451,8 @@ pub fn ln_fill(buf: &mut [f64]) {
     pulp::Arch::new().dispatch(LnInplaceOp::<{ FUSED_DEFAULT }> { buf });
 }
 
-// A&S 7.1.26 constants — mirror engine_core::distributions::erfc, change together.
+// A&S 7.1.26 constants — shared by the SIMD Φ kernel below and its scalar
+// mirror `scalar_phi`; change together.
 const ERF_A1: f64 = 0.254829592;
 const ERF_A2: f64 = -0.284496736;
 const ERF_A3: f64 = 1.421413741;
@@ -509,12 +506,11 @@ impl<const FUSED: bool> pulp::WithSimd for PhiInplaceOp<'_, FUSED> {
 }
 
 /// Scalar mirror of the SIMD Φ head above; bit-identical op-for-op (same A&S
-/// 7.1.26 constants, same owned exp_nonpos). Mirrors
-/// engine_core::distributions::{phi,erfc} across the crate boundary —
-/// change together. Kept self-contained here so phi_fill's tail needs no
-/// back-edge into engine-core (that would violate glmm's no-MCPower-crate rule).
+/// 7.1.26 constants, same owned exp_nonpos) — change together. Kept
+/// self-contained here (not shared through a common dependency) so
+/// `phi_fill`'s tail loop stays a plain function call with no extra crate edge.
 #[inline]
-fn scalar_phi(z: f64) -> f64 {
+pub(crate) fn scalar_phi(z: f64) -> f64 {
     let x = -z * std::f64::consts::FRAC_1_SQRT_2;
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let ax = x.abs();
@@ -522,6 +518,159 @@ fn scalar_phi(z: f64) -> f64 {
     let poly = (((((ERF_A5 * t + ERF_A4) * t) + ERF_A3) * t + ERF_A2) * t + ERF_A1) * t;
     let y = 1.0 - poly * exp_nonpos(-ax * ax);
     0.5 * (1.0 - sign * y)
+}
+
+/// High-precision Φ(z) = ½·erfc(−z/√2), accurate to ~1e-15 (full double).
+/// Used **only** by the probit link in `family.rs`. Deliberately separate from
+/// `scalar_phi`/`phi_fill`: that data-gen path is bit-pinned to
+/// the A&S-7.1.26 form (~7.5e-8) and must not change, but the probit
+/// FD-Hessian SE differentiates Φ twice and amplifies its error, so the fit
+/// needs a Φ good to machine precision. `erfc` is W. J. Cody's rational
+/// Chebyshev approximation (CALERF, Netlib SPECFUN), the same algorithm libm
+/// uses; coefficients verbatim from the reference.
+#[inline]
+pub(crate) fn phi_hp(z: f64) -> f64 {
+    0.5 * erfc_cody(-z * std::f64::consts::FRAC_1_SQRT_2)
+}
+
+/// `erfc(x)` to ~1e-15 — W. J. Cody, *Rational Chebyshev approximation for the
+/// error function* (Math. Comp. 1969), CALERF jint=1. Three regions in |x|:
+/// rational `erf` for |x|≤0.46875, two `erfc` rationals for the tails, with the
+/// `exp(−⌊16y⌋²/16)·exp(−δ)` split that preserves precision in the exponential.
+#[allow(clippy::excessive_precision)]
+fn erfc_cody(x: f64) -> f64 {
+    const A: [f64; 5] = [
+        3.16112374387056560e00,
+        1.13864154151050156e02,
+        3.77485237685302021e02,
+        3.20937758913846947e03,
+        1.85777706184603153e-1,
+    ];
+    const B: [f64; 4] = [
+        2.36012909523441209e01,
+        2.44024637934444173e02,
+        1.28261652607737228e03,
+        2.84423683343917062e03,
+    ];
+    const C: [f64; 9] = [
+        5.64188496988670089e-1,
+        8.88314979438837594e00,
+        6.61191906371416295e01,
+        2.98635138197400131e02,
+        8.81952221241769090e02,
+        1.71204761263407058e03,
+        2.05107837782607147e03,
+        1.23033935479799725e03,
+        2.15311535474403846e-8,
+    ];
+    const D: [f64; 8] = [
+        1.57449261107098347e01,
+        1.17693950891312499e02,
+        5.37181101862009858e02,
+        1.62138957456669019e03,
+        3.29079923573345963e03,
+        4.36261909014324716e03,
+        3.43936767414372164e03,
+        1.23033935480374942e03,
+    ];
+    const P: [f64; 6] = [
+        3.05326634961232344e-1,
+        3.60344899949804439e-1,
+        1.25781726111229246e-1,
+        1.60837851487422766e-2,
+        6.58749161529837803e-4,
+        1.63153871373020978e-2,
+    ];
+    const Q: [f64; 5] = [
+        2.56852019228982242e00,
+        1.87295284992346047e00,
+        5.27905102951428412e-1,
+        6.05183413124413191e-2,
+        2.33520497626869185e-3,
+    ];
+    const SQRPI: f64 = 5.6418958354775628695e-1;
+    const THRESH: f64 = 0.46875;
+    const SIXTEN: f64 = 16.0;
+    const XSMALL: f64 = 1.11e-16;
+    const XBIG: f64 = 26.543;
+
+    let y = x.abs();
+    if y <= THRESH {
+        // erf region; erfc = 1 − erf, and erf carries x's sign (odd).
+        let ysq = if y > XSMALL { y * y } else { 0.0 };
+        let mut xnum = A[4] * ysq;
+        let mut xden = ysq;
+        for i in 0..3 {
+            xnum = (xnum + A[i]) * ysq;
+            xden = (xden + B[i]) * ysq;
+        }
+        return 1.0 - x * (xnum + A[3]) / (xden + B[3]);
+    }
+    let mut result = if y <= 4.0 {
+        let mut xnum = C[8] * y;
+        let mut xden = y;
+        for i in 0..7 {
+            xnum = (xnum + C[i]) * y;
+            xden = (xden + D[i]) * y;
+        }
+        (xnum + C[7]) / (xden + D[7])
+    } else if y >= XBIG {
+        0.0
+    } else {
+        let ysq = 1.0 / (y * y);
+        let mut xnum = P[5] * ysq;
+        let mut xden = ysq;
+        for i in 0..4 {
+            xnum = (xnum + P[i]) * ysq;
+            xden = (xden + Q[i]) * ysq;
+        }
+        (SQRPI - ysq * (xnum + P[4]) / (xden + Q[4])) / y
+    };
+    if y < XBIG {
+        // Reintroduce the exp(−y²) factor with the ⌊16y⌋/16 split for precision.
+        let ysq = (y * SIXTEN).trunc() / SIXTEN;
+        let del = (y - ysq) * (y + ysq);
+        result *= (-ysq * ysq).exp() * (-del).exp();
+    }
+    // erfc(−|x|) = 2 − erfc(|x|).
+    if x < 0.0 {
+        2.0 - result
+    } else {
+        result
+    }
+}
+
+/// `ln Γ(x)` for `x > 0`, accurate to ~1e-15 (full double). Lanczos
+/// approximation, `g = 7`, 9-coefficient series (Lanczos 1964; coefficients the
+/// widely-used Godfrey/Boost set) — relative error < 2e-16 on `x ∈ (0, ∞)`.
+/// Used by the Gamma-GLMM Laplace objective (`family::gamma_aic`, lme4's
+/// `Gamma()$aic`): the dispersion enters the deviance only through `lnΓ(1/φ)`, so
+/// matching `glmer` needs `lnΓ` to machine precision. No `digamma`/`trigamma` —
+/// lme4 profiles the dispersion as `D/Σw` rather than solving the ML score.
+#[allow(clippy::excessive_precision)]
+pub(crate) fn ln_gamma(x: f64) -> f64 {
+    // Lanczos g=7 coefficients (c[0] is the series constant a₀).
+    const C: [f64; 9] = [
+        0.999_999_999_999_809_93,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_13,
+        -176.615_029_162_140_59,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_571_6e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    const G: f64 = 7.0;
+    const LN_SQRT_2PI: f64 = 0.918_938_533_204_672_74; // ½·ln(2π)
+                                                       // Reflection is unnecessary here (callers pass x>0), so use the direct series.
+    let x = x - 1.0;
+    let mut a = C[0];
+    let t = x + G + 0.5;
+    for (i, &c) in C.iter().enumerate().skip(1) {
+        a += c / (x + i as f64);
+    }
+    LN_SQRT_2PI + (x + 0.5) * t.ln() - t + a.ln()
 }
 
 /// In-place `buf[i] = Φ(buf[i])` — SIMD mirror of `distributions::phi`
@@ -731,6 +880,58 @@ mod tests {
                 scalar_phi(z[i]).to_bits(),
                 "phi_fill diverged from scalar phi at z={}",
                 z[i]
+            );
+        }
+    }
+
+    #[test]
+    fn phi_hp_full_double_precision() {
+        // Reference Φ values (R `pnorm`, 16 figs). The probit FD-Hessian SE needs
+        // Φ to ~machine precision — scalar_phi's ~7.5e-8 is far too coarse here.
+        let cases = [
+            (-6.0, 9.865_876_450_376_968e-10),
+            (-3.0, 1.349_898_031_630_095e-3),
+            (-1.959_963_984_540_054, 0.025),
+            (-1.0, 0.158_655_253_931_457_05),
+            (0.0, 0.5),
+            (0.5, 0.691_462_461_274_013_1),
+            (1.0, 0.841_344_746_068_542_9),
+            (1.959_963_984_540_054, 0.975),
+            (3.0, 0.998_650_101_968_369_9),
+            (6.0, 0.999_999_999_013_412_3),
+        ];
+        for (z, want) in cases {
+            let got = phi_hp(z);
+            assert!(
+                (got - want).abs() <= 1e-14 * want.abs().max(1e-12),
+                "phi_hp({z}) = {got}, want {want}"
+            );
+        }
+        // Tail symmetry Φ(−z) = 1 − Φ(z) to full precision.
+        for &z in &[0.3, 1.7, 4.2, 8.0] {
+            assert!((phi_hp(-z) - (1.0 - phi_hp(z))).abs() <= 1e-15);
+        }
+    }
+
+    #[test]
+    fn ln_gamma_full_double_precision() {
+        // Reference lnΓ values (R `lgamma`, 16 figs), spanning the range the Gamma
+        // dispersion 1/φ visits (small, ~1, integer factorials, large).
+        let cases = [
+            (0.5, 0.572_364_942_924_700_1), // ln(√π)
+            (1.0, 0.0),
+            (1.5, -0.120_782_237_635_245_22),
+            (1.9, -0.038_984_275_923_082_73),
+            (2.0, 0.0),
+            (5.0, 3.178_053_830_347_945_6), // ln(4!) = ln 24
+            (10.0, 12.801_827_480_081_469), // ln(9!)
+            (100.0, 359.134_205_369_575_4),
+        ];
+        for (x, want) in cases {
+            let got = ln_gamma(x);
+            assert!(
+                (got - want).abs() <= 1e-13 * want.abs().max(1.0),
+                "ln_gamma({x}) = {got}, want {want}"
             );
         }
     }

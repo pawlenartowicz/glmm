@@ -1,0 +1,41 @@
+{
+  "dataset": "Oats",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 11,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "Variety: Marvellous", "Variety: Victory", "nitro"],
+  "estimates": {
+    "beta": [82.39999999999957, 5.291666666666758, -6.874999999999913, 73.66666666666686],
+    "se": [8.058571400945947, 7.078904942708428, 7.078904942708428, 6.781479805493855],
+    "loglik": -289.4458934785149,
+    "varcomp": [
+      {
+        "group": "Block & Variety",
+        "terms": ["(Intercept)"],
+        "stddev": [10.437579415104667],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "Block",
+        "terms": ["(Intercept)"],
+        "stddev": [14.645032593712742],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "sigma": 12.866953255077734
+  },
+  "timing": {
+    "fit_seconds_median": 0.000415057,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

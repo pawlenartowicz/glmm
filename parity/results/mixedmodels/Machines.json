@@ -1,0 +1,35 @@
+{
+  "dataset": "Machines",
+  "engine": "mixedmodels",
+  "engine_version": "5.7.0",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 10,
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "Machine: B", "Machine: C"],
+  "estimates": {
+    "beta": [52.355555555555725, 7.966666666667124, 13.916666666666888],
+    "se": [1.680718191258567, 2.4208564658233103, 1.5400705994604142],
+    "loglik": -104.15560916302698,
+    "varcomp": [
+      {
+        "group": "Worker",
+        "terms": ["(Intercept)", "Machine: B", "Machine: C"],
+        "stddev": [4.079297807340543, 5.87765716161883, 3.68978078600239],
+        "corr": [
+          [1, 0.484012039456738, -0.3649835038331264],
+          [0.484012039456738, 1, 0.29662345543211976],
+          [-0.3649835038331264, 0.29662345543211976, 1]
+        ]
+      }
+    ],
+    "sigma": 0.9615787480868915
+  },
+  "timing": {
+    "fit_seconds_median": 0.002572652,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "dataset": "VerbAgg",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "binomial",
+  "reml": null,
+  "rung": 12,
+  "converged": true,
+  "singular": false,
+  "tolPwrss": 1e-13,
+  "coef_names": ["(Intercept)", "Anger", "GenderM", "btypescold", "btypeshout", "situself", "modewant"],
+  "estimates": {
+    "beta": [-0.153642978267108, 0.057419438973635, 0.320882241025115, -1.0597741630472, -2.10378875017943, -1.05432854937354, 0.707078752031444],
+    "se_hessian": [0.386726894043521, 0.0168343385775611, 0.191864409835059, 0.184806846796194, 0.187771455355338, 0.151838121030856, 0.151554595062181],
+    "se_rx": [0.38522304922459, 0.0167528809347019, 0.191208298769333, 0.184156755476849, 0.186515479689468, 0.151192777744349, 0.15100571511298],
+    "loglik": -4067.9164280242,
+    "varcomp": [
+      {
+        "group": "id",
+        "terms": ["(Intercept)"],
+        "stddev": [1.33922028456217],
+        "corr": [
+          [1]
+        ],
+        "stddev_se": [0.068446247660894]
+      },
+      {
+        "group": "item",
+        "terms": ["(Intercept)"],
+        "stddev": [0.34226659618671],
+        "corr": [
+          [1]
+        ],
+        "stddev_se": [0.0593776302511887]
+      }
+    ]
+  },
+  "timing": {
+    "fit_seconds_median_rx": 8.25070667266846,
+    "fit_seconds_median_hessian": 8.23539233207703,
+    "n_runs": 10,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

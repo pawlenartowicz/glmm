@@ -1,13 +1,12 @@
 //! Test-only scaffolding shared across the fit-module `#[cfg(test)]` blocks.
 //!
-//! `TestWs` is a buffer-bag exposing the same field names as engine-core's
-//! `SimWorkspace` for the subset the fit-module tests borrow, so each test's
+//! `TestWs` is a buffer-bag mirroring the field names/reset semantics of the
+//! kernel's own workspace, for the subset the fit-module tests borrow, so each test's
 //! field-borrowing helper body (`suff_stats`, `glm_scratch`,
 //! `build_lme_scratch`, `shipped_workspace`) ports with minimal change. It carries no
 //! design-gen / RNG / critval machinery — the tests only use it as pre-sized
-//! scratch. The alloc lines + the two reset methods are copied verbatim from
-//! `engine-core/src/workspace.rs` `SimWorkspace::new` / its resets; the cluster
-//! count is passed directly.
+//! scratch. The alloc lines + the two reset methods mirror the kernel workspace's
+//! `new` / its resets; the cluster count is passed directly.
 
 use crate::ols::PANEL_ROWS;
 use faer::Mat;
@@ -190,14 +189,14 @@ impl TestWs {
 }
 
 /// Intercept-only `ModelSpec` — mirrors `engine_contract::ClusterSpec::intercept_only`.
-pub(crate) fn intercept_only_spec(sizing: crate::Sizing, tau: f64) -> crate::ModelSpec {
+pub(crate) fn intercept_only_spec(sizing: crate::Sizing, _tau: f64) -> crate::ModelSpec {
     crate::ModelSpec {
-        sizing,
-        tau_squared: tau,
-        slopes: vec![],
-        extra_groupings: vec![],
-        estimator: crate::Estimator::Mle,
-        wald_se: crate::WaldSe::Hessian,
+        family: crate::Family::Gaussian,
+        re: Some(crate::ReStructure {
+            sizing,
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
     }
 }
 
@@ -215,20 +214,25 @@ pub(crate) fn block_levels(rel: &crate::GroupingRelation) -> usize {
 /// Grid atom for the full grouping structure. Verbatim mirror of
 /// `engine_contract::ClusterSpec::atom` (test-only DGP layout).
 pub(crate) fn model_atom(spec: &crate::ModelSpec) -> usize {
-    spec.extra_groupings
+    let re = spec.re.as_ref().expect("model_atom requires re: Some");
+    re.extra_groupings
         .iter()
-        .fold(spec.sizing.atom(), |a, g| a * block_levels(&g.relation))
+        .fold(re.sizing.atom(), |a, g| a * block_levels(&g.relation))
 }
 
 /// Level of extra grouping `g` that row `i` belongs to. Verbatim mirror of
 /// `engine_contract::ClusterSpec::extra_level_of_row` (test-only DGP layout).
 pub(crate) fn extra_level_of_row(spec: &crate::ModelSpec, g: usize, i: usize) -> usize {
-    let rel = &spec.extra_groupings[g].relation;
-    match &spec.sizing {
+    let re = spec
+        .re
+        .as_ref()
+        .expect("extra_level_of_row requires re: Some");
+    let rel = &re.extra_groupings[g].relation;
+    match &re.sizing {
         crate::Sizing::FixedClusters { n_clusters } => {
             let s = (*n_clusters).max(1) as usize;
             let mut stride = s;
-            for h in &spec.extra_groupings[..g] {
+            for h in &re.extra_groupings[..g] {
                 stride *= block_levels(&h.relation);
             }
             let within = (i / stride) % block_levels(rel);
