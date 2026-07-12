@@ -24,8 +24,13 @@ res$variant <- paste(res$balance, res$regime, sep = "/")
 res$wall_ratio <- ifelse(res$glmm_status == "ok" & res$mm_status == "ok",
                          res$wall_glmm / res$wall_mm, NA_real_)
 
-fmt_t <- function(s) ifelse(s < 0.9995, sprintf("%.1f&thinsp;ms", s * 1000),
-                            sprintf("%.2f&thinsp;s", s))
+# 4 significant figures, not fixed decimals: hot MM fits and glmm fits are
+# often both ~1 ms but differ in the 3rd-4th digit; %.1f ms collapsed them to
+# an indistinguishable "1.0 ms vs 1.0 ms". format="g" keeps the precision that
+# actually separates the two runs (drops trailing zeros, no sci notation here).
+fmt_t <- function(s) ifelse(s < 0.9995,
+                            sprintf("%s&thinsp;ms", formatC(s * 1000, digits = 4, format = "g")),
+                            sprintf("%s&thinsp;s", formatC(s, digits = 4, format = "g")))
 fmt_r <- function(r) ifelse(r < 0.095, sprintf("&times;%.3f", r),
                             sprintf("&times;%.2f", r))
 
@@ -35,6 +40,23 @@ cell_color <- function(r) {
   lr <- max(-2, min(2, log2(r)))
   hue <- if (lr <= 0) 60 - lr * 30 else 60 - lr * 15
   sprintf("hsl(%.0f,75%%,85%%)", hue)
+}
+
+# Deviance winner on a mismatch cell. The mark itself is blame-blind: betas
+# differ, but it can't say which engine is right. Sign of (dev_glmm - dev_mm)
+# past a ~1-logL inference-relevant band settles it -- LRT chi-sq_1 .05 crit is
+# 3.84, AIC selection flips at delta 2, so a gap under ~1 logL is a flat-
+# direction beta disagreement, not a convergence gap. dev_* are the aligned
+# -2logL from analyze_grid.R (lower = better fit); &#8595; = that engine reached
+# the lower deviance, &asymp; = flat tie.
+DEV_BAND <- 1.0
+dev_verdict <- function(row) {
+  d <- row$dev_glmm - row$dev_mm
+  if (!is.finite(d)) return(list(tag = "", tip = ""))
+  who <- if (d < -DEV_BAND) "glmm&#8595;" else if (d > DEV_BAND) "MM&#8595;" else "&asymp;"
+  list(tag = sprintf(' <span class="verdict">%s</span>', who),
+       tip = sprintf('\ndev glmm %.6g vs MM %.6g (&Delta; %+.3g)',
+                     row$dev_glmm, row$dev_mm, d))
 }
 
 cell_html <- function(row) {
@@ -48,11 +70,12 @@ cell_html <- function(row) {
     return(sprintf('<td class="mm-fail" title="%s">glmm %s &middot; %dev<br>MM.jl: %s</td>',
                    row$case_id, fmt_t(row$wall_glmm), row$n_eval_glmm, row$mm_status))
   mism <- if (row$status == "mismatch") ' mismatch' else ''
-  warn <- if (row$status == "mismatch") ' &#9888;' else ''
+  v <- if (row$status == "mismatch") dev_verdict(row) else list(tag = "", tip = "")
+  warn <- if (row$status == "mismatch") paste0(' &#9888;', v$tag) else ''
   sprintf(paste0(
-    '<td class="ok%s" style="background:%s" title="%s\nwall ratio %s / eval ratio %s">',
+    '<td class="ok%s" style="background:%s" title="%s%s\nwall ratio %s / eval ratio %s">',
     '<b>%s</b>%s <span class="ev">%d&thinsp;ev</span><br>%s <span class="ev">%d&thinsp;ev</span></td>'),
-    mism, cell_color(row$wall_ratio), row$case_id,
+    mism, cell_color(row$wall_ratio), row$case_id, v$tip,
     fmt_r(row$wall_ratio), fmt_r(row$eval_ratio),
     fmt_t(row$wall_glmm), warn, row$n_eval_glmm,
     fmt_t(row$wall_mm), row$n_eval_mm)
@@ -66,6 +89,7 @@ html <- c(sprintf(paste0(
   'td,th{border:1px solid #bbb;padding:3px 8px;text-align:left;white-space:nowrap}',
   'th{background:#f0f0f0} td b{font-weight:600}',
   '.ev{color:#666;font-size:11px}',
+  '.verdict{color:#c00;font-size:11px;font-weight:600}',
   '.glmm-fail{background:hsl(0,75%%,80%%)} .mm-fail{background:hsl(215,75%%,85%%)}',
   '.both-fail{background:#ddd;color:#666}',
   '.mismatch{outline:2px dashed #c00;outline-offset:-2px}',
@@ -87,12 +111,27 @@ html <- c(sprintf(paste0(
   '<span style="background:hsl(0,75%%,80%%)">glmm failed</span>',
   '<span style="background:hsl(215,75%%,85%%)">only glmm converged</span>',
   '<span style="background:#ddd">both failed</span>',
-  '<span style="outline:2px dashed #c00">&#9888; &beta; mismatch</span></p>',
+  '<span style="outline:2px dashed #c00">&#9888; &beta; mismatch (&#8595; = engine at lower deviance; &asymp; = flat tie)</span></p>',
   '<p><b>Overall</b> (%d jointly-ok of %d cells): wall ratio median %.3f / p90 %.2f; ',
   'eval ratio median %.3f / p90 %.2f.</p>'),
   sum(!is.na(res$wall_ratio)), nrow(res),
   median(res$wall_ratio, na.rm = TRUE), quantile(res$wall_ratio, .9, na.rm = TRUE),
   median(res$eval_ratio, na.rm = TRUE), quantile(res$eval_ratio, .9, na.rm = TRUE)))
+
+# Deviance cross-check summary: on jointly-ok cells the sign of (dev_glmm -
+# dev_mm) is a mild but consistent fingerprint (glmm grinds a hair deeper);
+# magnitudes are inference-invisible here, so this is a one-line record, not a
+# gate. The per-cell winner glyph on mismatch cells is where it actually adjudicates.
+okd <- res[res$status == "ok" & is.finite(res$dev_glmm) & is.finite(res$dev_mm), ]
+html <- c(html, sprintf(paste0(
+  '<p class="note"><b>Deviance cross-check</b> (aligned &minus;2&thinsp;logL, lower = better fit): ',
+  'across %d jointly-ok cells the engines agree to &le;%.1e (worst absolute gap); ',
+  'glmm sits at the lower deviance on %d, MixedModels on %d &mdash; inference-invisible, ',
+  'but a consistent direction. On &beta;-mismatch cells the &#8595; glyph flags which engine ',
+  'reached the lower deviance past a %.0f&thinsp;logL band (&asymp; = flat tie).</p>'),
+  nrow(okd), max(abs(okd$dev_glmm - okd$dev_mm)),
+  sum(okd$dev_glmm < okd$dev_mm - 1e-6), sum(okd$dev_mm < okd$dev_glmm - 1e-6),
+  DEV_BAND))
 
 structures <- unique(res$structure[order(res$n_theta, res$structure)])
 for (grp in split(structures, ceiling(seq_along(structures) / 4))) {
