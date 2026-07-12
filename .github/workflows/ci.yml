@@ -44,10 +44,15 @@ jobs:
         run: cargo clippy --all-targets
       - name: test
         run: cargo test
-      - name: test (mcpower feature)
+      - name: test (loop_advanced feature)
         # The unstable scratch-explicit surface is off by default; it must still
         # compile and pass so the hot-path consumer never breaks silently.
-        run: cargo test --features mcpower
+        run: cargo test --features loop_advanced
+      - name: test (parallel feature)
+        # rayon in-fit parallelism (AGQ cluster loop) is off by default; it must
+        # still compile and pass, including the bit-identity test that pins it to
+        # the serial path's exact output.
+        run: cargo test --features parallel
 
   # ── MSRV floor: the bobyqa dep pins rust-version = 1.85 ───────────────────
   msrv:
@@ -72,6 +77,10 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --target wasm32-unknown-unknown
+      - name: check (parallel feature, must be inert on wasm)
+        # rayon is target-dep-excluded on wasm32, so the feature must compile to
+        # a no-op here, never pull rayon in or break the build.
+        run: cargo check --target wasm32-unknown-unknown --features parallel
 
   # ── package: gate the publishable state on every push ─────────────────────
   package:

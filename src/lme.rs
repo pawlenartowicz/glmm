@@ -2294,7 +2294,8 @@ mod tests {
     /// `fit_suff_stats_warm_path_bounded_alloc`). Marked `#[ignore]` because
     /// `dhat::Profiler` measures process-wide allocations and concurrent tests
     /// contaminate the count. Run explicitly:
-    ///   `cargo test -p glmm lme_fit_warm_path_bounded_alloc -- --ignored --test-threads=1`
+    ///   `cargo test -p glmm --features alloc-tests lme_fit_warm_path_bounded_alloc -- --ignored --test-threads=1`
+    /// (`alloc-tests` installs the dhat global allocator the profiler requires.)
     ///
     /// `BOUND` locks the measured warm-path block count. Each `profiled_deviance`
     /// call (the Brent loop runs several per fit) does one faer `Cholesky`; the
@@ -2306,6 +2307,7 @@ mod tests {
     /// faer-internal block count — pinned across start-point changes. If a
     /// future faer version changes its Cholesky internals, update the bound —
     /// do not relax it.
+    #[cfg(feature = "alloc-tests")]
     #[test]
     #[ignore]
     fn lme_fit_warm_path_bounded_alloc() {

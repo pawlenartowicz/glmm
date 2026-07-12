@@ -75,7 +75,7 @@ fn assert_beta(got: &[f64], want: &[f64], rtol: f64, atol: f64, ctx: &str) {
 
 #[test]
 fn sleepstudy_random_slope() {
-    let data = rows(include_str!("../../parity/data/sleepstudy.csv"));
+    let data = rows(include_str!("../../parity/data_empirical/sleepstudy.csv"));
     let table = Table {
         columns: vec![
             ("Reaction".into(), numeric(&data, 0)),
@@ -139,7 +139,7 @@ fn scalar_lmm(csv: &str, golden: &str, formula: &str, table: Table, ctx: &str) {
 
 #[test]
 fn penicillin_crossed() {
-    let data = rows(include_str!("../../parity/data/Penicillin.csv"));
+    let data = rows(include_str!("../../parity/data_empirical/Penicillin.csv"));
     let table = Table {
         columns: vec![
             ("diameter".into(), numeric(&data, 0)),
@@ -159,7 +159,7 @@ fn penicillin_crossed() {
 
 #[test]
 fn pastes_nested() {
-    let data = rows(include_str!("../../parity/data/Pastes.csv"));
+    let data = rows(include_str!("../../parity/data_empirical/Pastes.csv"));
     let table = Table {
         columns: vec![
             ("strength".into(), numeric(&data, 0)),
@@ -186,7 +186,7 @@ fn pastes_nested() {
 /// the relation (T3 fired) and the same lme4 golden as the explicit form.
 #[test]
 fn pastes_flat_nested() {
-    let data = rows(include_str!("../../parity/data/Pastes.csv"));
+    let data = rows(include_str!("../../parity/data_empirical/Pastes.csv"));
     let table = Table {
         columns: vec![
             ("strength".into(), numeric(&data, 0)),
@@ -228,7 +228,7 @@ fn pastes_flat_nested() {
 /// nested — a false positive would corrupt the padded family-block Cholesky.
 #[test]
 fn penicillin_stays_crossed() {
-    let data = rows(include_str!("../../parity/data/Penicillin.csv"));
+    let data = rows(include_str!("../../parity/data_empirical/Penicillin.csv"));
     let table = Table {
         columns: vec![
             ("diameter".into(), numeric(&data, 0)),
@@ -237,7 +237,12 @@ fn penicillin_stays_crossed() {
         ],
         n: data.len(),
     };
-    let lo = lower("diameter ~ (1|plate) + (1|sample)", &table, Family::Gaussian).unwrap();
+    let lo = lower(
+        "diameter ~ (1|plate) + (1|sample)",
+        &table,
+        Family::Gaussian,
+    )
+    .unwrap();
     let extra = &lo.model.re.as_ref().unwrap().extra_groupings[0];
     assert!(
         matches!(extra.relation, glmm::GroupingRelation::Crossed { .. }),
@@ -252,7 +257,7 @@ fn penicillin_stays_crossed() {
 fn cbpp_binomial() {
     // Aggregated binomial → Bernoulli 0/1 rows (the kernel is Bernoulli; §8 makes
     // this the caller's prep). Each aggregated row contributes `size` rows.
-    let data = rows(include_str!("../../parity/data/cbpp.csv"));
+    let data = rows(include_str!("../../parity/data_empirical/cbpp.csv"));
     let (mut y, mut herd, mut period) = (Vec::new(), Vec::new(), Vec::new());
     for r in &data {
         let (herd_l, incidence, size, period_l) = (
@@ -308,7 +313,7 @@ fn cbpp_binomial() {
 
 #[test]
 fn grouseticks_poisson() {
-    let data = rows(include_str!("../../parity/data/grouseticks.csv"));
+    let data = rows(include_str!("../../parity/data_empirical/grouseticks.csv"));
     // cols: INDEX,TICKS,BROOD,HEIGHT,YEAR,LOCATION,cHEIGHT
     let table = Table {
         columns: vec![

@@ -12,11 +12,45 @@ Fits fixed-effect and mixed (random-intercept/random-slope) models for
 Gaussian, Binomial (logit/probit), Poisson, Gamma, and Negative-Binomial
 outcomes, validated against R/lme4 and Julia/MixedModels.jl goldens.
 
-**New to the crate? Start with [`TUTORIAL-RUST.md`](TUTORIAL-RUST.md)** — a
+**New to the crate? Start with [`TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md)** — a
 single-page, three-layer walkthrough (cold fit → warm fit → advanced loop)
 plus a short section on parsing an R-style formula string instead of building
-inputs by hand. (A Python port is planned; its tutorial will live alongside
-this one as `TUTORIAL-PYTHON.md`.)
+inputs by hand. A Python package is also available — see
+[`TUTORIAL-PYTHON.md`](documentation/TUTORIAL-PYTHON.md).
+
+## One crate, one `fit`
+
+A single entry point covers the whole linear-regression family. `fit` reads
+`ModelSpec` and routes on family × random effects × weights:
+
+```mermaid
+flowchart LR
+    F["fit(x, y, ModelSpec)"] --> RE{"re?"}
+    RE -- "None" --> FAM1{"family?"}
+    FAM1 -- "Gaussian" --> OLS["OLS - WLS with weights"]
+    FAM1 -- "other" --> GLM["GLM - IRLS"]
+    RE -- "Some" --> FAM2{"family?"}
+    FAM2 -- "Gaussian" --> LMM["LMM - profiled REML"]
+    FAM2 -- "other" --> GLMM["GLMM - PIRLS, Laplace/AGQ"]
+```
+
+This is the pitch view. Every branch point, solver path, and tuning knob is
+traced to code in the full algorithm map:
+[`documentation/algorithms.md`](documentation/algorithms.md), with the LMM
+and GLMM legs detailed in
+[`documentation/algorithms-lmm.md`](documentation/algorithms-lmm.md) and
+[`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md).
+
+## Documentation
+
+| File | Purpose |
+|---|---|
+| [`documentation/TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md) | Three-layer Rust walkthrough: cold fit → warm fit → advanced loop, plus the formula frontend |
+| [`documentation/TUTORIAL-PYTHON.md`](documentation/TUTORIAL-PYTHON.md) | The Python package (`glmm`) walkthrough |
+| [`documentation/supported_families.md`](documentation/supported_families.md) | Family × link support matrix, canonical-link notes, dispersion conventions |
+| [`documentation/algorithms.md`](documentation/algorithms.md) | Algorithm map entry point: full dispatch graph, knob index, OLS/GLM paths |
+| [`documentation/algorithms-lmm.md`](documentation/algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML, closed-form shortcut, BOBYQA, boundary handling |
+| [`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md) | GLMM: PIRLS, Laplace vs AGQ, dense vs sparse Z, NB outer loop, warm starts |
 
 ## Alpha (0.0.x)
 
@@ -33,12 +67,21 @@ The stable surface is [`fit_cold`]/[`fit_warm`] + `ModelSpec` + `GroupIds`.
 A mixed non-Gaussian model that falls outside the dense solver's envelope
 (too many extra groupings, or an extra grouping too wide) is not yet
 implemented and panics rather than silently misrouting — see
-[`TUTORIAL-RUST.md`](TUTORIAL-RUST.md) for the exact envelope.
+[`TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md) for the exact envelope.
 
 The `loop_advanced` cargo feature (off by default) exposes an unstable
 scratch-explicit hot-path surface for warm-start callers like MCPower's
 simulation loop — **no semver guarantees; do not depend on it outside a
 pinned revision.**
+
+The `parallel` cargo feature (off by default, **experimental**) enables
+in-fit parallelism — the AGQ cluster loop and the FD-Hessian SE grid — via
+rayon, and is additionally gated at runtime by `FitOptions::parallel_inner`
+(also off by default): both the feature *and* the flag must be on for any
+thread to spawn. Parallel results are bit-identical to serial ones, but the
+kernels are new and their performance envelope isn't characterized yet —
+treat as opt-in only. A no-op on wasm32 (compile-time excluded, rayon never
+pulled in).
 
 ## Quick example
 
@@ -61,7 +104,7 @@ let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts);
 assert!(fit.converged);
 ```
 
-See [`TUTORIAL-RUST.md`](TUTORIAL-RUST.md) for the full walkthrough: warm
+See [`TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md) for the full walkthrough: warm
 starts, the advanced hot-loop surface, and building `x`/`ModelSpec`/`GroupIds`
 from a formula string instead of by hand.
 

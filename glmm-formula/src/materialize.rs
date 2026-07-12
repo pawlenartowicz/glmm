@@ -305,7 +305,12 @@ fn nested_padded_ids(parent_ids: &[u32], labels: &[String]) -> Vec<u32> {
         .max(1);
     let local_index: Vec<HashMap<&str, u32>> = children_per_parent
         .iter()
-        .map(|set| set.iter().enumerate().map(|(i, &l)| (l, i as u32)).collect())
+        .map(|set| {
+            set.iter()
+                .enumerate()
+                .map(|(i, &l)| (l, i as u32))
+                .collect()
+        })
         .collect();
     parent_ids
         .iter()
@@ -313,6 +318,17 @@ fn nested_padded_ids(parent_ids: &[u32], labels: &[String]) -> Vec<u32> {
         .map(|(&p, c)| p * n_per_parent as u32 + local_index[p as usize][c.as_str()])
         .collect()
 }
+
+/// Max padding-inflation factor for flat-nesting detection: detect nested only
+/// while `n_parents · max_children ≤ NESTING_INFLATION_BOUND ·
+/// n_distinct_child_levels`. The guard protects the padded rectangle from
+/// inflating the dense RE block — not balance per se: near-balanced nesting
+/// (children-per-parent ∈ {1,2,3}, inflation ~1.6×) pads a few empty slots and
+/// stays far cheaper than routing its tens of thousands of levels crossed
+/// (dense tail is cubic in crossed levels), while an observation-level factor
+/// like grouseticks' INDEX (each row its own level, inflation ≫ 2) still fails
+/// closed to `Crossed` (measured there: nested 44 s vs crossed 0.16 s).
+const NESTING_INFLATION_BOUND: usize = 2;
 
 /// Detect nesting of a flat extra grouping (the lme4 idiom
 /// `(1|parent)+(1|child)`, no explicit `parent:child` syntax) from the observed
@@ -322,15 +338,11 @@ fn nested_padded_ids(parent_ids: &[u32], labels: &[String]) -> Vec<u32> {
 /// 1. **Genuine nesting** — every distinct `child_labels` value must fall under a
 ///    single `primary_ids` (parent). A label spanning two parents is genuinely
 ///    crossed; routing it nested would corrupt the padded family-block Cholesky.
-/// 2. **Balance** — every parent must have the same distinct-child count, so the
-///    padded-per-parent layout adds NO empty slots (padded dim == level count).
-///    Unbalanced flat nesting — an observation-level factor like grouseticks'
-///    `INDEX` (each row its own level, wildly uneven per parent) — genuinely
-///    nests but its padded dim (`n_parents · max_children`) far exceeds the level
-///    count, inflating the DENSE RE block and running orders of magnitude slower
-///    than the crossed path (measured: grouseticks 0.16s→44s). Crossed is
-///    correct for it anyway. Explicit `parent:child` syntax still pads unbalanced
-///    nesting — there the user asked for nested layout outright.
+/// 2. **Bounded padding inflation** — the padded rectangle
+///    `n_parents · max_children` must not exceed [`NESTING_INFLATION_BOUND`] ×
+///    the distinct child-level count (see the constant's rationale). Explicit
+///    `parent:child` syntax still pads unbounded — there the user asked for the
+///    nested layout outright.
 fn detect_flat_nesting(primary_ids: &[u32], child_labels: &[String]) -> Option<Vec<u32>> {
     let n_parents = primary_ids
         .iter()
@@ -348,8 +360,8 @@ fn detect_flat_nesting(primary_ids: &[u32], child_labels: &[String]) -> Option<V
         }
     }
     let w = children_per_parent.iter().copied().max().unwrap_or(0);
-    if children_per_parent.iter().any(|&c| c != w) {
-        return None; // unbalanced → padding would inflate the dense block
+    if n_parents * w > NESTING_INFLATION_BOUND * parent_of.len() {
+        return None; // padded rectangle would inflate the dense RE block
     }
     Some(nested_padded_ids(primary_ids, child_labels))
 }
@@ -369,7 +381,10 @@ fn grouping_ids(re: &RandomEffect, data: &Table) -> Result<Vec<u32>, Error> {
             // applied to `parent` — guarantees this matches the primary's own ids
             // exactly when `parent` names the primary grouping.
             let (_, parent_ids) = factor_levels(grouping_labels(parent, data)?);
-            Ok(nested_padded_ids(&parent_ids, grouping_labels(child, data)?))
+            Ok(nested_padded_ids(
+                &parent_ids,
+                grouping_labels(child, data)?,
+            ))
         }
         RandomEffect::Intercept {
             group,
@@ -479,6 +494,13 @@ fn lower_random_effects(
     let mut extra_groupings = Vec::new();
     let mut extra_ids = Vec::new();
     let mut re_groups = vec![re_group_info(re0, factor_main_cols)];
+    // The kernel holds ONE nested slot (`LmmGroupings.nested: Option<_>`), so at
+    // most one extra may carry `NestedWithin`. Flat-nesting detection therefore
+    // only fires while no nested extra exists yet — later flat candidates fail
+    // closed to `Crossed` (statistically the same model, see the route-invariance
+    // lever). Explicit `parent:child` syntax is not gated here; a second explicit
+    // nested extra trips the engine's `assert_model_shape` instead.
+    let mut have_nested = false;
     for re in &ast.random_effects[1..] {
         let slopes = slope_cols(re, numeric_main_col, factor_main_cols)?;
         // Explicit `parent:child` syntax → nested. A flat scalar-intercept
@@ -493,7 +515,10 @@ fn lower_random_effects(
                 GroupingRelation::NestedWithin { n_per_parent: 1 },
                 grouping_ids(re, data)?,
             ),
-            RandomEffect::Intercept { group, parent: None } if !group.contains(':') => {
+            RandomEffect::Intercept {
+                group,
+                parent: None,
+            } if !group.contains(':') && !have_nested => {
                 match detect_flat_nesting(&primary_ids, grouping_labels(group, data)?) {
                     Some(padded) => (GroupingRelation::NestedWithin { n_per_parent: 1 }, padded),
                     None => (
@@ -507,6 +532,7 @@ fn lower_random_effects(
                 grouping_ids(re, data)?,
             ),
         };
+        have_nested |= matches!(relation, GroupingRelation::NestedWithin { .. });
         extra_groupings.push(Grouping { relation, slopes });
         extra_ids.push(ids);
         re_groups.push(re_group_info(re, factor_main_cols));
@@ -594,7 +620,10 @@ mod tests {
     fn detect_flat_nesting_balanced_is_nested() {
         let primary = vec![0, 0, 1, 1];
         let child = strs(&["a", "b", "c", "d"]);
-        assert_eq!(detect_flat_nesting(&primary, &child), Some(vec![0, 1, 2, 3]));
+        assert_eq!(
+            detect_flat_nesting(&primary, &child),
+            Some(vec![0, 1, 2, 3])
+        );
     }
 
     /// Genuinely crossed with matching cardinality — a child label reused across
@@ -607,14 +636,79 @@ mod tests {
         assert_eq!(detect_flat_nesting(&primary, &child), None);
     }
 
-    /// Genuine nesting but UNBALANCED — parent 0 has 2 children, parent 1 has 1
-    /// (the shape of an observation-level factor like grouseticks' `INDEX`,
-    /// uneven per parent). Padding to `W=2` would inflate the dense RE block, so
-    /// T3 stays `Crossed` (`None`) even though every child nests cleanly.
+    /// Genuine nesting, NEAR-balanced — parents 0/1/2 with 3/2/3 distinct
+    /// children (the grid generator's `sample(1:3)` shape: children-per-parent
+    /// ∈ {1,2,3}). Padded rectangle `3·3 = 9` vs `8` levels — inflation 1.125
+    /// ≤ NESTING_INFLATION_BOUND, so detection returns the padded layout
+    /// (parent 1's slot `[3+2, 6)` stays unassigned padding).
     #[test]
-    fn detect_flat_nesting_unbalanced_stays_crossed() {
-        let primary = vec![0, 0, 1];
-        let child = strs(&["a", "b", "c"]);
+    fn detect_flat_nesting_near_balanced_is_nested() {
+        let primary = vec![0, 0, 0, 1, 1, 2, 2, 2];
+        let child = strs(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        assert_eq!(
+            detect_flat_nesting(&primary, &child),
+            Some(vec![0, 1, 2, 3, 4, 6, 7, 8])
+        );
+    }
+
+    /// Genuine nesting but WILDLY uneven (the shape of an observation-level
+    /// factor like grouseticks' `INDEX`): one parent holds most of the children
+    /// — 5/1/1 — so the padded rectangle `n_parents · max_children = 3·5 = 15`
+    /// exceeds `NESTING_INFLATION_BOUND · 7 levels = 14`. Detection fails
+    /// closed to `Crossed` (`None`) even though every child nests cleanly.
+    #[test]
+    fn detect_flat_nesting_high_inflation_stays_crossed() {
+        let primary = vec![0, 0, 0, 0, 0, 1, 2];
+        let child = strs(&["a", "b", "c", "d", "e", "f", "g"]);
         assert_eq!(detect_flat_nesting(&primary, &child), None);
+    }
+
+    /// Two flat extras that BOTH nest cleanly in the primary: the kernel holds
+    /// one nested slot, so only the first detects `NestedWithin`; the second
+    /// fails closed to `Crossed` (same statistical model either way).
+    #[test]
+    fn second_flat_nesting_candidate_stays_crossed() {
+        let table = Table {
+            columns: vec![
+                (
+                    "y".into(),
+                    Column::Numeric(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+                ),
+                (
+                    "g1".into(),
+                    Column::Factor {
+                        labels: strs(&["A", "A", "A", "A", "B", "B", "B", "B"]),
+                    },
+                ),
+                (
+                    "g2".into(),
+                    Column::Factor {
+                        labels: strs(&["a1", "a1", "a2", "a2", "b1", "b1", "b2", "b2"]),
+                    },
+                ),
+                (
+                    "g3".into(),
+                    Column::Factor {
+                        labels: strs(&["c1", "c1", "c2", "c2", "d1", "d1", "d2", "d2"]),
+                    },
+                ),
+            ],
+            n: 8,
+        };
+        let lo = crate::lower("y ~ (1|g1) + (1|g2) + (1|g3)", &table, Family::Gaussian).unwrap();
+        let relations: Vec<_> = lo
+            .model
+            .re
+            .as_ref()
+            .unwrap()
+            .extra_groupings
+            .iter()
+            .map(|g| g.relation.clone())
+            .collect();
+        assert!(matches!(
+            relations[0],
+            GroupingRelation::NestedWithin { .. }
+        ));
+        assert!(matches!(relations[1], GroupingRelation::Crossed { .. }));
     }
 }

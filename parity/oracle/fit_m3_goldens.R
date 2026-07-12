@@ -5,8 +5,9 @@
 # (hardcoded constants in src/*.rs tests) are validated against. On any glmm
 # disagreement, glmm is presumed wrong -- never relax a tolerance or edit a reference.
 #
-# Deliberately SEPARATE from oracle/fit.R + the results/<engine>/ tree: compare.R
-# discovers references by globbing results/lme4/*.json, so dropping new-family fits
+# Deliberately SEPARATE from oracle/fit.R + the results/<engine>_{empirical,simulated}/
+# tree: compare.R discovers references by globbing results/lme4_{empirical,simulated}/*.json,
+# so dropping new-family fits
 # there would pull them into the curated cross-engine sweep and expand the 6-rung
 # oracle -- which design 6 forbids ("the curated 6-rung oracle is NOT expanded").
 # Writing to goldens/ keeps that sweep byte-for-byte untouched. lme4/MASS only; the
@@ -46,8 +47,14 @@ varcomp_of <- function(m) {
   })
 }
 
+# m3_goldens specs carry a bare `data` name (no `source` field like the curated
+# manifest.datasets rungs), so the empirical/simulated split is read off the
+# `sim_` prefix convention directly (mirrors Step 2's split-by-filename).
+data_dir_of_name <- function(name)
+  file.path(parity_dir, if (startsWith(name, "sim_")) "data_simulated" else "data_empirical")
+
 read_dataset <- function(spec) {
-  df <- read.csv(file.path(parity_dir, "data", paste0(spec$data, ".csv")),
+  df <- read.csv(file.path(data_dir_of_name(spec$data), paste0(spec$data, ".csv")),
                  stringsAsFactors = FALSE)
   for (f in unlist(spec$factors)) df[[f]] <- factor(df[[f]])
   df

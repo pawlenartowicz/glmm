@@ -1,0 +1,47 @@
+
+== status map ==
+
+engine-fail    mismatch          ok     timeout 
+          2          11         491           6 
+
+== glmm/MM eval-ratio quantiles ==
+        axis    group   n    median      p90
+ n_theta_bin      1-2 107 0.9729730 1.340000
+ n_theta_bin      3-5 147 1.0661157 1.485620
+ n_theta_bin     6-11 125 1.2181070 1.782728
+ n_theta_bin    12-20  40 1.5574700 2.100103
+ n_theta_bin    21-40  56 1.8379486 3.875385
+      family binomial  72 1.0649727 1.458263
+      family gaussian 370 1.1974031 2.008287
+      family  poisson  33 1.0135135 1.412836
+   structure   cross4  38 1.0398781 1.376239
+   structure   cross6  34 1.1686115 1.486857
+   structure   cross8  19 0.8543689 1.296179
+   structure     int1  31 1.0512821 1.333333
+   structure    int2x  38 0.9796372 1.460833
+   structure    nest2  38 0.9422863 1.303103
+   structure   nest2s  21 1.0303030 1.438356
+   structure    nest3   8 0.9368506 1.173109
+   structure  nestmix  16 1.0762679 1.315015
+   structure      q2s  41 1.0454545 1.457627
+   structure   q2sq2s  23 1.2368421 2.149482
+   structure    q2sx2  23 1.4244604 1.756464
+   structure      q3s  13 1.3529412 1.849931
+   structure    q3sx2  23 1.4910180 1.958285
+   structure       q4  13 1.4945652 1.913746
+   structure    q4sx2  18 1.4926984 1.998058
+   structure     q5q2  22 1.6213569 2.360412
+   structure       q6  22 1.8180070 2.223248
+   structure   q6q2x3   5 1.8310440 3.339820
+   structure       q8  20 1.9054787 3.998848
+   structure    q8q2x   9 2.2102351 3.884230
+      regime     base 315 1.1984733 2.000351
+      regime highcorr  29 0.9946524 1.318799
+      regime    lowmu   5 1.0156250 1.446800
+      regime   lowsnr  49 1.0019305 1.411730
+      regime nearzero  65 1.2127660 1.984771
+      regime     rare  12 1.1777444 1.445227
+
+lme4 to-do: 61 cells (11 mismatch + 50 audit) -> /home/plenartowicz/Projekty/FastStats-Project/GLMM/parity/results/grid/analysis/lme4_todo.txt
+
+NOTE: wall/per-eval columns are meaningful ONLY for clock-locked passes (check results/grid/run_meta_*.json no_turbo==1).

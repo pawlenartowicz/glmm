@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
-# Human-readable TIMING summary of the parity results -- pure REPORTING, the
-# pass/fail gate lives in compare.R; the accuracy views live in
-# summarize_accuracy.R (shares the read/format helpers below -- change together).
+# TIMING summary of the parity results -- pure REPORTING, the pass/fail gate lives 
+# in compare.R; the accuracy views live in summarize_accuracy.R (shares the read/format 
+# helpers below -- change together).
 #
 # Per dataset x engine, the median PER-FIT time (rx / hessian split), plus the
 # glmm speedup factor vs each oracle.
@@ -10,18 +10,29 @@
 
 suppressMessages(library(jsonlite))
 
-parity_dir <- normalizePath(dirname(sub(
-  "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))))
+# PARITY_SUITE_DIR: suite-directory override (mirrors fit.R) -- results/ resolves
+# under it; unset = this script's own parity/ dir.
+suite <- Sys.getenv("PARITY_SUITE_DIR")
+parity_dir <- if (nzchar(suite)) normalizePath(suite) else
+  normalizePath(dirname(sub(
+    "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))))
 
 read_engine <- function(dir_name) {
-  dir <- file.path(parity_dir, "results", dir_name)
-  if (!dir.exists(dir)) return(NULL)
-  files <- list.files(dir, pattern = "\\.json$", full.names = TRUE)
+  files <- unlist(lapply(c("empirical", "simulated"), function(s)
+    list.files(file.path(parity_dir, "results", paste0(dir_name, "_", s)),
+               pattern = "\\.json$", full.names = TRUE)))
+  if (length(files) == 0) return(NULL)
   res <- lapply(files, fromJSON, simplifyVector = TRUE,
                 simplifyDataFrame = FALSE, simplifyMatrix = TRUE)
   if (!length(res)) return(NULL)
   setNames(res, vapply(res, `[[`, "", "dataset"))
 }
+
+# The design's "visually separated" rule: rungs print in two passes, empirical
+# first, then simulated -- the set is which lme4_empirical carries.
+empirical_names <- vapply(
+  list.files(file.path(parity_dir, "results", "lme4_empirical"), pattern = "\\.json$"),
+  function(f) sub("\\.json$", "", f), "")
 
 # Per-method PER-FIT time. The JSON stores the median per SAMPLE, and a sample is
 # `fits_per_sample` fits (batched rungs time 10 fits to beat R's timer floor) --
@@ -74,21 +85,25 @@ for (e in timing_engines) header <- paste0(header, sprintf(" %9s", ENGINE_LABEL[
 if ("glmm" %in% present) for (e in SPEEDUP_VS) header <- paste0(header, sprintf(" %9s", paste0("vs_", ENGINE_LABEL[[e]])))
 cat(header, "\n")
 cat(strrep("-", nchar(header)), "\n")
-for (name in order_names) {
-  a <- ref[[name]]
-  tms <- setNames(lapply(timing_engines, function(e) {
-    b <- data[[e]][[name]]
-    if (is.null(b)) c(rx = NA_real_, hess = NA_real_) else time_of(b)
-  }), timing_engines)
-  rx_row <- lead_row(name, a$rung, "rx")
-  for (tm in tms) rx_row <- paste0(rx_row, sprintf(" %9s", fmt_t(tm["rx"])))
-  if ("glmm" %in% present) for (e in SPEEDUP_VS) rx_row <- paste0(rx_row, sprintf(" %9s", fmt_x(tms[[e]]["rx"], tms[["glmm"]]["rx"])))
-  cat(rx_row, "\n")
-  if (any(!is.na(vapply(tms, `[[`, 0, "hess")))) {
-    h_row <- lead_row("", "", "h")
-    for (tm in tms) h_row <- paste0(h_row, sprintf(" %9s", fmt_t(tm["hess"])))
-    if ("glmm" %in% present) for (e in SPEEDUP_VS) h_row <- paste0(h_row, sprintf(" %9s", fmt_x(tms[[e]]["hess"], tms[["glmm"]]["hess"])))
-    cat(h_row, "\n")
+for (group in c("empirical", "simulated")) {
+  cat(sprintf("== %s ==\n", group))
+  names_in_group <- if (group == "empirical") empirical_names else setdiff(order_names, empirical_names)
+  for (name in intersect(order_names, names_in_group)) {
+    a <- ref[[name]]
+    tms <- setNames(lapply(timing_engines, function(e) {
+      b <- data[[e]][[name]]
+      if (is.null(b)) c(rx = NA_real_, hess = NA_real_) else time_of(b)
+    }), timing_engines)
+    rx_row <- lead_row(name, a$rung, "rx")
+    for (tm in tms) rx_row <- paste0(rx_row, sprintf(" %9s", fmt_t(tm["rx"])))
+    if ("glmm" %in% present) for (e in SPEEDUP_VS) rx_row <- paste0(rx_row, sprintf(" %9s", fmt_x(tms[[e]]["rx"], tms[["glmm"]]["rx"])))
+    cat(rx_row, "\n")
+    if (any(!is.na(vapply(tms, `[[`, 0, "hess")))) {
+      h_row <- lead_row("", "", "h")
+      for (tm in tms) h_row <- paste0(h_row, sprintf(" %9s", fmt_t(tm["hess"])))
+      if ("glmm" %in% present) for (e in SPEEDUP_VS) h_row <- paste0(h_row, sprintf(" %9s", fmt_x(tms[[e]]["hess"], tms[["glmm"]]["hess"])))
+      cat(h_row, "\n")
+    }
   }
 }
 cat("\nrx/h = time to fit + produce that SE (Hessian is the cost);",

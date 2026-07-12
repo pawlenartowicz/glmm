@@ -3,6 +3,7 @@
 //! default). NO semver guarantees — may change in ANY release. The warm-start
 //! primitive [`crate::StartValues`] is re-exported `pub` only behind this feature.
 
+pub use crate::fit::{lmm_objective_at, lmm_sweep_fit, LmmSweepOutcome};
 pub use crate::glm::{glm_irls_fit, sigmoid_stable, GlmFitView, GlmScratch, MAX_IRLS_ITERS};
 pub use crate::glmm::{build_z, fit_glmm, GlmmFit, GlmmWorkspace};
 pub use crate::lme::{lme_fit, LmeFitView, LmeScratch, LmeSuffStats};
@@ -73,7 +74,7 @@ mod tests {
 
         let mut ws_cold = LmmWorkspace::for_cluster_spec(p, &model, n, &[]);
         ws_cold.suff.reset();
-        ws_cold.suff.add_rows_multi(x.as_ref(), &y, &pid, &[]);
+        ws_cold.suff.add_rows_multi(x.as_ref(), &y, &pid, &[], None);
         let cold = fit_lmm(&mut ws_cold, &[1, 2], None);
 
         // n_theta == 1 here (one intercept variance component); warm-start it well off
@@ -84,7 +85,7 @@ mod tests {
         };
         let mut ws_warm = LmmWorkspace::for_cluster_spec(p, &model, n, &[]);
         ws_warm.suff.reset();
-        ws_warm.suff.add_rows_multi(x.as_ref(), &y, &pid, &[]);
+        ws_warm.suff.add_rows_multi(x.as_ref(), &y, &pid, &[], None);
         let warm = fit_lmm(&mut ws_warm, &[1, 2], Some(&warm_start.theta));
 
         assert!(

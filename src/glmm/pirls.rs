@@ -89,6 +89,8 @@ pub(crate) fn pirls_solve(
     m: MatRef<f64>,
     x: MatRef<f64>,
     y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
     beta: &mut [f64],
     mut beta_step: BetaStep,
     eta: &mut [f64],
@@ -152,7 +154,7 @@ pub(crate) fn pirls_solve(
         dev = match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
-            } => {
+            } if !weighted => {
                 let mut yeta = 0.0;
                 for i in 0..n {
                     let e = eta_fixed[i] + mu[i];
@@ -175,8 +177,9 @@ pub(crate) fn pirls_solve(
                     prob[i] = mui;
                     let dmu = crate::family::mu_eta(other, e);
                     let v = crate::family::variance(other, nb_theta, mui);
-                    w[i] = (dmu * dmu / v).max(crate::glm::WEIGHT_CLAMP);
-                    d += crate::family::dev_resid(other, nb_theta, y[i], mui);
+                    let pw = prior_w[i];
+                    w[i] = (pw * dmu * dmu / v).max(crate::glm::WEIGHT_CLAMP);
+                    d += pw * crate::family::dev_resid(other, nb_theta, y[i], mui);
                 }
                 d
             }
@@ -255,11 +258,11 @@ pub(crate) fn pirls_solve(
         }
         // IRLS RHS M′(W·Mu + W·r): fold the effective residual into mu in place
         // (mu is dead until next iteration's refill), then one GEMV. Logit's
-        // W·r = (y−p); the general branch is W·r = (dμ/dη)·(y−μ)/V.
+        // W·r = (y−p); the general branch is W·r = wᵢ·(dμ/dη)·(y−μ)/V.
         match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
-            } => {
+            } if !weighted => {
                 for i in 0..n {
                     mu[i] = w[i] * mu[i] + (y[i] - prob[i]);
                 }
@@ -268,7 +271,7 @@ pub(crate) fn pirls_solve(
                 for i in 0..n {
                     let dmu = crate::family::mu_eta(other, eta[i]);
                     let v = crate::family::variance(other, nb_theta, prob[i]);
-                    mu[i] = w[i] * mu[i] + dmu * (y[i] - prob[i]) / v;
+                    mu[i] = w[i] * mu[i] + prior_w[i] * dmu * (y[i] - prob[i]) / v;
                 }
             }
         }
@@ -287,7 +290,7 @@ pub(crate) fn pirls_solve(
                     link: BinomialLink::Logit,
                 } => {
                     for i in 0..n {
-                        let rho = y[i] - prob[i];
+                        let rho = prior_w[i] * (y[i] - prob[i]);
                         for j in 0..p {
                             beta_rhs[j] += x[(i, j)] * rho;
                         }
@@ -297,7 +300,7 @@ pub(crate) fn pirls_solve(
                     for i in 0..n {
                         let dmu = crate::family::mu_eta(other, eta[i]);
                         let v = crate::family::variance(other, nb_theta, prob[i]);
-                        let rho = dmu * (y[i] - prob[i]) / v;
+                        let rho = prior_w[i] * dmu * (y[i] - prob[i]) / v;
                         for j in 0..p {
                             beta_rhs[j] += x[(i, j)] * rho;
                         }
@@ -448,6 +451,7 @@ pub(crate) fn pirls_solve(
             // must track the moved u (‖u_joint‖²), so recompute it.
             refresh_eta_fixed(x, beta, eta_fixed, n, p);
             pen = 0.0;
+            #[allow(clippy::needless_range_loop)]
             for c in 0..k {
                 pen += u[c] * u[c];
             }
@@ -512,6 +516,8 @@ pub(crate) fn pirls_solve_blocked(
     cluster_ids: &[u32],
     x: MatRef<f64>,
     y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
     beta: &mut [f64],
     mut beta_step: BetaStep,
     lam: &[f64],
@@ -592,7 +598,7 @@ pub(crate) fn pirls_solve_blocked(
         dev = match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
-            } => {
+            } if !weighted => {
                 let lp_sum = crate::simd_transcendental::pw_and_log1pexp_sum(
                     &eta[..n],
                     &mut prob[..n],
@@ -609,8 +615,9 @@ pub(crate) fn pirls_solve_blocked(
                     prob[i] = mui;
                     let dmu = crate::family::mu_eta(other, e);
                     let v = crate::family::variance(other, nb_theta, mui);
-                    w[i] = (dmu * dmu / v).max(crate::glm::WEIGHT_CLAMP);
-                    d += crate::family::dev_resid(other, nb_theta, y[i], mui);
+                    let pw = prior_w[i];
+                    w[i] = (pw * dmu * dmu / v).max(crate::glm::WEIGHT_CLAMP);
+                    d += pw * crate::family::dev_resid(other, nb_theta, y[i], mui);
                 }
                 d
             }
@@ -672,16 +679,17 @@ pub(crate) fn pirls_solve_blocked(
             let ubase = f * q;
             let ablk = f * q * q;
             let wi = w[i];
-            let resid = match family {
-                Family::Binomial {
-                    link: BinomialLink::Logit,
-                } => y[i] - prob[i],
-                other => {
-                    let dmu = crate::family::mu_eta(other, eta[i]);
-                    let v = crate::family::variance(other, nb_theta, prob[i]);
-                    dmu * (y[i] - prob[i]) / v
-                }
-            };
+            let resid = prior_w[i]
+                * match family {
+                    Family::Binomial {
+                        link: BinomialLink::Logit,
+                    } => y[i] - prob[i],
+                    other => {
+                        let dmu = crate::family::mu_eta(other, eta[i]);
+                        let v = crate::family::variance(other, nb_theta, prob[i]);
+                        dmu * (y[i] - prob[i]) / v
+                    }
+                };
             for r in 0..q {
                 a_rhs[ubase + r] += m_row[r] * resid;
                 let wr = wi * m_row[r];
@@ -703,7 +711,7 @@ pub(crate) fn pirls_solve_blocked(
                     link: BinomialLink::Logit,
                 } => {
                     for i in 0..n {
-                        let rho = y[i] - prob[i];
+                        let rho = prior_w[i] * (y[i] - prob[i]);
                         for j in 0..p {
                             beta_rhs[j] += x[(i, j)] * rho;
                         }
@@ -713,7 +721,7 @@ pub(crate) fn pirls_solve_blocked(
                     for i in 0..n {
                         let dmu = crate::family::mu_eta(other, eta[i]);
                         let v = crate::family::variance(other, nb_theta, prob[i]);
-                        let rho = dmu * (y[i] - prob[i]) / v;
+                        let rho = prior_w[i] * dmu * (y[i] - prob[i]) / v;
                         for j in 0..p {
                             beta_rhs[j] += x[(i, j)] * rho;
                         }
@@ -874,6 +882,7 @@ pub(crate) fn pirls_solve_blocked(
             // moved u (‖u_joint‖²), so recompute it.
             refresh_eta_fixed(x, beta, eta_fixed, n, p);
             pen = 0.0;
+            #[allow(clippy::needless_range_loop)]
             for c in 0..k {
                 pen += u[c] * u[c];
             }
@@ -1112,6 +1121,72 @@ pub(crate) fn structured_ainv_solve(
     }
 }
 
+/// Per-cluster crossed-column pattern (CSR over f): the union of cluster f's
+/// rows' cross_col entries — exactly the nonzero-column support of C_f.
+/// Counting-sort CSR: counts → prefix → fill (coup_ptr doubles as the write
+/// cursors) → shift cursors back → per-cluster sort + dedup-compact (a
+/// cluster's rows repeat the same crossed level; a duplicate in the list
+/// would double-subtract in the Schur build). e = 0 (nested only) degenerates
+/// to an all-empty CSR — n_cross is all zero.
+///
+/// The pattern is a function of the design AND the θ-pinning mask
+/// (`build_packed_m` drops θ=0 crossed groupings from `cross_col`/`n_cross`),
+/// so it is fit-invariant only while the pinning mask is: the caller
+/// (deviance.rs structured branch) caches it keyed on that mask and rebuilds
+/// on transitions — not per eval, not blindly per fit.
+pub(crate) fn build_coupling_csr(
+    cluster_ids: &[u32],
+    cross_col: &[u32],
+    n_cross: &[u8],
+    s: usize,
+    n: usize,
+    coup_cols: &mut [u32],
+    coup_ptr: &mut [u32],
+) {
+    let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
+    for v in coup_ptr[..s + 1].iter_mut() {
+        *v = 0;
+    }
+    for i in 0..n {
+        coup_ptr[cluster_ids[i] as usize + 1] += n_cross[i] as u32;
+    }
+    for f in 0..s {
+        coup_ptr[f + 1] += coup_ptr[f];
+    }
+    for i in 0..n {
+        let f = cluster_ids[i] as usize;
+        let cbase = i * g_cap;
+        for z in 0..n_cross[i] as usize {
+            coup_cols[coup_ptr[f] as usize] = cross_col[cbase + z];
+            coup_ptr[f] += 1;
+        }
+    }
+    for f in (1..=s).rev() {
+        coup_ptr[f] = coup_ptr[f - 1];
+    }
+    coup_ptr[0] = 0;
+    {
+        let mut write = 0usize;
+        let mut start = 0usize;
+        for f in 0..s {
+            let end = coup_ptr[f + 1] as usize;
+            coup_cols[start..end].sort_unstable();
+            coup_ptr[f] = write as u32;
+            let mut prev = u32::MAX; // crossed indices are < e ≪ u32::MAX
+            for idx in start..end {
+                let v = coup_cols[idx];
+                if v != prev {
+                    coup_cols[write] = v;
+                    write += 1;
+                    prev = v;
+                }
+            }
+            start = end;
+        }
+        coup_ptr[s] = write as u32;
+    }
+}
+
 /// Structured PIRLS for the intercept-only crossed/nested regime
 /// (`groupings.structured_extras_eligible()`): `A = M'WM + I` is
 /// `[[D, C], [C', E]]` where `D` is block-diagonal over the primary clusters
@@ -1176,6 +1251,8 @@ pub(crate) fn pirls_solve_blocked_extras(
     n_cross: &[u8],
     x: MatRef<f64>,
     y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
     beta: &mut [f64],
     mut beta_step: BetaStep,
     eta: &mut [f64],
@@ -1188,8 +1265,8 @@ pub(crate) fn pirls_solve_blocked_extras(
     core_blocks: &mut [f64],
     coupling: &mut [f64],
     schur_blk: &mut [f64],
-    coup_cols: &mut [u32],
-    coup_ptr: &mut [u32],
+    coup_cols: &[u32],
+    coup_ptr: &[u32],
     mut structured_schur: Option<&mut StructuredSchur>,
     force_dense: bool,
     a_rhs: &mut [f64],
@@ -1223,56 +1300,6 @@ pub(crate) fn pirls_solve_blocked_extras(
             ef += x[(i, j)] * beta[j];
         }
         eta_fixed[i] = ef;
-    }
-    // Per-cluster crossed-column pattern (CSR over f): the union of cluster f's
-    // rows' cross_col entries — exactly the nonzero-column support of C_f. Fixed
-    // within this solve (build_packed_m already dropped θ-pinned groupings), so
-    // build it once and let every iteration's `structured_factor` walk it instead
-    // of all `e` columns. Counting-sort CSR: counts → prefix → fill (coup_ptr
-    // doubles as the write cursors) → shift cursors back → per-cluster sort +
-    // dedup-compact (a cluster's rows repeat the same crossed level; a duplicate
-    // in the list would double-subtract in the Schur build). e = 0 (nested only)
-    // degenerates to an all-empty CSR — n_cross is all zero.
-    for v in coup_ptr[..s + 1].iter_mut() {
-        *v = 0;
-    }
-    for i in 0..n {
-        coup_ptr[cluster_ids[i] as usize + 1] += n_cross[i] as u32;
-    }
-    for f in 0..s {
-        coup_ptr[f + 1] += coup_ptr[f];
-    }
-    for i in 0..n {
-        let f = cluster_ids[i] as usize;
-        let cbase = i * g_cap;
-        for z in 0..n_cross[i] as usize {
-            coup_cols[coup_ptr[f] as usize] = cross_col[cbase + z];
-            coup_ptr[f] += 1;
-        }
-    }
-    for f in (1..=s).rev() {
-        coup_ptr[f] = coup_ptr[f - 1];
-    }
-    coup_ptr[0] = 0;
-    {
-        let mut write = 0usize;
-        let mut start = 0usize;
-        for f in 0..s {
-            let end = coup_ptr[f + 1] as usize;
-            coup_cols[start..end].sort_unstable();
-            coup_ptr[f] = write as u32;
-            let mut prev = u32::MAX; // crossed indices are < e ≪ u32::MAX
-            for idx in start..end {
-                let v = coup_cols[idx];
-                if v != prev {
-                    coup_cols[write] = v;
-                    write += 1;
-                    prev = v;
-                }
-            }
-            start = end;
-        }
-        coup_ptr[s] = write as u32;
     }
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
     let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
@@ -1310,7 +1337,7 @@ pub(crate) fn pirls_solve_blocked_extras(
         dev = match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
-            } => {
+            } if !weighted => {
                 let lp_sum = crate::simd_transcendental::pw_and_log1pexp_sum(
                     &eta[..n],
                     &mut prob[..n],
@@ -1327,8 +1354,9 @@ pub(crate) fn pirls_solve_blocked_extras(
                     prob[i] = mui;
                     let dmu = crate::family::mu_eta(other, e);
                     let v = crate::family::variance(other, nb_theta, mui);
-                    w[i] = (dmu * dmu / v).max(crate::glm::WEIGHT_CLAMP);
-                    d += crate::family::dev_resid(other, nb_theta, y[i], mui);
+                    let pw = prior_w[i];
+                    w[i] = (pw * dmu * dmu / v).max(crate::glm::WEIGHT_CLAMP);
+                    d += pw * crate::family::dev_resid(other, nb_theta, y[i], mui);
                 }
                 d
             }
@@ -1382,7 +1410,7 @@ pub(crate) fn pirls_solve_blocked_extras(
         match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
-            } => {
+            } if !weighted => {
                 for i in 0..n {
                     mu[i] = w[i] * mu[i] + (y[i] - prob[i]);
                 }
@@ -1391,7 +1419,7 @@ pub(crate) fn pirls_solve_blocked_extras(
                 for i in 0..n {
                     let dmu = crate::family::mu_eta(other, eta[i]);
                     let v = crate::family::variance(other, nb_theta, prob[i]);
-                    mu[i] = w[i] * mu[i] + dmu * (y[i] - prob[i]) / v;
+                    mu[i] = w[i] * mu[i] + prior_w[i] * dmu * (y[i] - prob[i]) / v;
                 }
             }
         }
@@ -1474,7 +1502,7 @@ pub(crate) fn pirls_solve_blocked_extras(
                     link: BinomialLink::Logit,
                 } => {
                     for i in 0..n {
-                        let rho = y[i] - prob[i];
+                        let rho = prior_w[i] * (y[i] - prob[i]);
                         for j in 0..p {
                             beta_rhs[j] += x[(i, j)] * rho;
                         }
@@ -1484,7 +1512,7 @@ pub(crate) fn pirls_solve_blocked_extras(
                     for i in 0..n {
                         let dmu = crate::family::mu_eta(other, eta[i]);
                         let v = crate::family::variance(other, nb_theta, prob[i]);
-                        let rho = dmu * (y[i] - prob[i]) / v;
+                        let rho = prior_w[i] * dmu * (y[i] - prob[i]) / v;
                         for j in 0..p {
                             beta_rhs[j] += x[(i, j)] * rho;
                         }
@@ -1684,6 +1712,7 @@ pub(crate) fn pirls_solve_blocked_extras(
             // moved u (‖u_joint‖²), so recompute it.
             refresh_eta_fixed(x, beta, eta_fixed, n, p);
             pen = 0.0;
+            #[allow(clippy::needless_range_loop)]
             for c in 0..k {
                 pen += u[c] * u[c];
             }

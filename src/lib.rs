@@ -6,6 +6,11 @@
 //! - `loop_advanced` (cargo feature, off by default): the unstable scratch-explicit
 //!   hot-path surface (loop tier) that warm-start consumers like MCPower bind to,
 //!   exposing the kernels and [`StartValues`]. NO semver guarantees.
+//!
+//! `parallel` (cargo feature, off by default, **experimental**): enables in-fit
+//! parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool; a
+//! no-op on wasm32; gated at runtime by `FitOptions::parallel_inner` (also off
+//! by default — both the feature and the knob are explicit opt-ins).
 
 // The scratch-explicit kernels (glm/glmm/lme + most of lmm) exist to serve the
 // `loop_advanced` feature; the stable `fit` wires only a subset (OLS + LMM). With
@@ -47,7 +52,9 @@ pub use start::StartValues;
 mod test_support;
 
 // dhat alloc-profiling for the `#[ignore]` warm-path bounded-alloc tests.
-// cfg(test) only — the externalizable library never ships a custom allocator.
-#[cfg(test)]
+// Gated behind the `alloc-tests` feature (not plain cfg(test)): dhat's
+// allocator takes a global lock on every allocation, which serializes the
+// otherwise-parallel test suite. The library never ships a custom allocator.
+#[cfg(all(test, feature = "alloc-tests"))]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;

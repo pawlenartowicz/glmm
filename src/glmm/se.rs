@@ -32,6 +32,50 @@ fn fd_eval(
     laplace_deviance_at(ws, x, y, cluster_ids, n)
 }
 
+/// Central second difference of coordinate `k` at step `s`: `(f(+s) − 2·f0 +
+/// f(−s))/s²`. Returns the raw value — non-finite if either directional eval
+/// diverges — so the caller decides fallback (serial: on the first bad cell;
+/// parallel grid: after the whole grid). Extracted from the former `second_diff!`
+/// macro so a per-thread worker workspace can call it.
+#[allow(clippy::too_many_arguments)]
+fn second_diff(
+    ws: &mut GlmmWorkspace,
+    k: usize,
+    s: f64,
+    f0: f64,
+    x: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    n: usize,
+) -> f64 {
+    let fp = fd_eval(ws, &[k], &[s], x, y, cluster_ids, n);
+    let fm = fd_eval(ws, &[k], &[-s], x, y, cluster_ids, n);
+    (fp - 2.0 * f0 + fm) / (s * s)
+}
+
+/// Symmetric 4-point mixed partial of `(i, j)` at steps `(si, sj)`:
+/// `(f(+si,+sj) − f(+si,−sj) − f(−si,+sj) + f(−si,−sj))/(4·si·sj)`. Returns the raw
+/// value (non-finite if any of the four evals diverges); fallback is the caller's,
+/// as for `second_diff`.
+#[allow(clippy::too_many_arguments)]
+fn mixed_diff(
+    ws: &mut GlmmWorkspace,
+    i: usize,
+    j: usize,
+    si: f64,
+    sj: f64,
+    x: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    n: usize,
+) -> f64 {
+    let fpp = fd_eval(ws, &[i, j], &[si, sj], x, y, cluster_ids, n);
+    let fpm = fd_eval(ws, &[i, j], &[si, -sj], x, y, cluster_ids, n);
+    let fmp = fd_eval(ws, &[i, j], &[-si, sj], x, y, cluster_ids, n);
+    let fmm = fd_eval(ws, &[i, j], &[-si, -sj], x, y, cluster_ids, n);
+    (fpp - fpm - fmp + fmm) / (4.0 * si * sj)
+}
+
 /// Fill `out_cov` (p×p) with the RX/Schur fixed-effect covariance `inv(ws.schur)`
 /// — `ws.schur` is the β-INFORMATION matrix, so the inverse is the covariance
 /// directly (NO factor of 2; that factor only applies to the deviance Hessian,
@@ -160,8 +204,13 @@ pub fn fd_hessian_cov(
             // production Rx arm (fixed-scale families: ×1). The fd_eval above
             // restored the converged μ̂/û at γ̂.
             if ok {
-                let sigma_sq =
-                    crate::family::glmm_sigma_sq(ws.family, &y[..n], &ws.prob[..n], &ws.u[..ws.k]);
+                let sigma_sq = crate::family::glmm_sigma_sq(
+                    ws.family,
+                    &y[..n],
+                    &ws.prob[..n],
+                    &ws.u[..ws.k],
+                    ws.weighted.then(|| &ws.prior_w[..n]),
+                );
                 if sigma_sq != 1.0 {
                     for a in 0..p {
                         for b in 0..p {
@@ -207,47 +256,75 @@ pub fn fd_hessian_cov(
     ws.u_seed[..kk].copy_from_slice(&ws.u[..kk]);
     ws.warm_seed_active = true;
 
-    // Second difference of coord k at step s, central: (f(+s)−2f0+f(−s))/s².
-    macro_rules! second_diff {
-        ($k:expr, $s:expr) => {{
-            let s = $s;
-            let fp = fd_eval(ws, &[$k], &[s], x, y, cluster_ids, n);
-            let fm = fd_eval(ws, &[$k], &[-s], x, y, cluster_ids, n);
-            if !(fp.is_finite() && fm.is_finite()) {
-                fallback!();
-            }
-            (fp - 2.0 * f0 + fm) / (s * s)
-        }};
-    }
-    // Symmetric 4-point mixed partial of (i,j) at steps (si, sj):
-    // (f(+si,+sj) − f(+si,−sj) − f(−si,+sj) + f(−si,−sj)) / (4·si·sj).
-    macro_rules! mixed_diff {
-        ($i:expr, $j:expr, $si:expr, $sj:expr) => {{
-            let (si, sj) = ($si, $sj);
-            let fpp = fd_eval(ws, &[$i, $j], &[si, sj], x, y, cluster_ids, n);
-            let fpm = fd_eval(ws, &[$i, $j], &[si, -sj], x, y, cluster_ids, n);
-            let fmp = fd_eval(ws, &[$i, $j], &[-si, sj], x, y, cluster_ids, n);
-            let fmm = fd_eval(ws, &[$i, $j], &[-si, -sj], x, y, cluster_ids, n);
-            if !(fpp.is_finite() && fpm.is_finite() && fmp.is_finite() && fmm.is_finite()) {
-                fallback!();
-            }
-            (fpp - fpm - fmp + fmm) / (4.0 * si * sj)
-        }};
-    }
-
     // Build the symmetric m×m Hessian into ws.hess_scratch (upper, then mirror).
-    for i in 0..m {
-        let hi = ws.fd_steps[i];
-        // Diagonal: single-step central second difference (no Richardson — the
-        // fixture is step-invariant to ~7 sig figs across h ∈ [1e-4, 1e-1], see
-        // the doc comment above `fd_hessian_cov`).
-        let hii = second_diff!(i, hi);
-        ws.hess_scratch[(i, i)] = hii;
-        for j in (i + 1)..m {
-            let hj = ws.fd_steps[j];
-            let hij = mixed_diff!(i, j, hi, hj);
-            ws.hess_scratch[(i, j)] = hij;
-            ws.hess_scratch[(j, i)] = hij;
+    // Each grid cell is a pure function of the frozen FD seed (fd_saved, fd_steps,
+    // u_seed) — see `fd_hessian_cov`'s doc comment — so per-thread worker
+    // workspaces compute bit-identical values in any order. Diagonal cells use a
+    // single-step central second difference (no Richardson — the fixture is
+    // step-invariant to ~7 sig figs across h ∈ [1e-4, 1e-1], see the doc comment).
+    let use_par = cfg!(all(feature = "parallel", not(target_arch = "wasm32"))) && ws.parallel_inner;
+    if use_par {
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+        {
+            use super::workspace::fd_worker_ws;
+            use rayon::prelude::*;
+            let cells: Vec<(usize, usize)> =
+                (0..m).flat_map(|i| (i..m).map(move |j| (i, j))).collect();
+            let ws_ro: &GlmmWorkspace = ws; // shared read-only view for map_init
+            let results: Vec<(usize, usize, f64)> = cells
+                .par_iter()
+                .map_init(
+                    || fd_worker_ws(ws_ro, n),
+                    |wws, &(i, j)| {
+                        let h = if i == j {
+                            second_diff(wws, i, ws_ro.fd_steps[i], f0, x, y, cluster_ids, n)
+                        } else {
+                            mixed_diff(
+                                wws,
+                                i,
+                                j,
+                                ws_ro.fd_steps[i],
+                                ws_ro.fd_steps[j],
+                                x,
+                                y,
+                                cluster_ids,
+                                n,
+                            )
+                        };
+                        (i, j, h)
+                    },
+                )
+                .collect();
+            // The serial arm fallback!()s on the FIRST non-finite eval; here the
+            // whole grid ran first, then we check — same destination (RX fallback),
+            // extra work only on the already-failing path. `results` is collected
+            // before this point, ending map_init's immutable borrow of `ws` so the
+            // fallback (which needs `&mut ws`) is legal.
+            if results.iter().any(|&(_, _, h)| !h.is_finite()) {
+                fallback!();
+            }
+            for (i, j, h) in results {
+                ws.hess_scratch[(i, j)] = h;
+                ws.hess_scratch[(j, i)] = h;
+            }
+        }
+    } else {
+        for i in 0..m {
+            let hi = ws.fd_steps[i];
+            let hii = second_diff(ws, i, hi, f0, x, y, cluster_ids, n);
+            if !hii.is_finite() {
+                fallback!();
+            }
+            ws.hess_scratch[(i, i)] = hii;
+            for j in (i + 1)..m {
+                let hj = ws.fd_steps[j];
+                let hij = mixed_diff(ws, i, j, hi, hj, x, y, cluster_ids, n);
+                if !hij.is_finite() {
+                    fallback!();
+                }
+                ws.hess_scratch[(i, j)] = hij;
+                ws.hess_scratch[(j, i)] = hij;
+            }
         }
     }
 
@@ -271,6 +348,14 @@ pub fn fd_hessian_cov(
     for k in 0..n_theta {
         ws.theta_se[k] = (2.0 * inv[(k, k)]).max(0.0).sqrt();
     }
+
+    // Restore the converged PIRLS state at γ̂ (W̃/û/μ̂/factors): the stencil leaves
+    // the LAST perturbed eval's state in ws, and the dense caller reads ws.prob/
+    // ws.u AFTER this returns (Gamma's σ̂² for tau2/varcorr, the Pearson φ̂,
+    // mu_hat) — off the perturbed state Gamma's σ̂² was ~2e-3 high (rung-23
+    // stddev gate). Same central re-eval the RX fallback uses; the empty
+    // perturbation evaluates exactly at γ̂ (fd_saved).
+    let _ = fd_eval(ws, &[], &[], x, y, cluster_ids, n);
 
     ws.params[..m].copy_from_slice(&ws.fd_saved[..m]);
     ws.warm_seed_active = false; // never leak the FD seed into a later fit / BOBYQA

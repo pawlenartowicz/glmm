@@ -1096,7 +1096,9 @@ mod tests {
     ///
     /// `#[ignore]` because `dhat::Profiler` measures process-wide allocations
     /// and must run single-threaded:
-    ///   `cargo test -p glmm fit_suff_stats_warm_path_bounded_alloc -- --ignored --test-threads=1`
+    ///   `cargo test -p glmm --features alloc-tests fit_suff_stats_warm_path_bounded_alloc -- --ignored --test-threads=1`
+    /// (`alloc-tests` installs the dhat global allocator the profiler requires.)
+    #[cfg(feature = "alloc-tests")]
     #[test]
     #[ignore]
     fn fit_suff_stats_warm_path_bounded_alloc() {

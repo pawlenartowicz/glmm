@@ -1,7 +1,7 @@
 //! glmm side of the cross-language parity harness — fits the parity datasets with
-//! the local `glmm` crate and writes `results/glmm/<ds>.json` in the common
-//! schema (parity/README.md), to be checked against the frozen lme4 / MixedModels
-//! references by `compare.R`. Committed alongside the other engines' results.
+//! the local `glmm` crate and writes `results/glmm_{empirical,simulated}/<ds>.json`
+//! in the common schema (parity/README.md), to be checked against the frozen lme4 /
+//! MixedModels references by `compare.R`. Committed alongside the other engines' results.
 //!
 //! The design matrix, `ModelSpec` and per-row `GroupIds` are built by the `d3`
 //! formula frontend (`glmm_formula::lower`, a dev-dependency here) from an R-style
@@ -23,12 +23,28 @@
 
 use std::time::Instant;
 
-use glmm::{fit_cold, BinomialLink, Family, Fit, FitOptions, PoissonLink, WaldSe};
-use glmm_formula::{lower, Column, Lowered, ReGroupInfo, Table};
+use glmm::{
+    fit_cold, BinomialLink, Family, Fit, FitOptions, GammaLink, NegBinomialLink, PoissonLink,
+    WaldSe,
+};
+use glmm_formula::ReGroupInfo;
 use serde_json::{json, Value};
+
+#[path = "harness_common.rs"]
+mod harness_common;
+use harness_common::*;
 
 const DIR: &str = env!("CARGO_MANIFEST_DIR");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Suite directory (manifest + data + results root). `PARITY_SUITE_DIR`
+/// overrides at RUN time (a sub-suite's run.sh, e.g. `parity/weights/`, sets
+/// it); unset = the main `parity/` dir, byte-identical to the pre-override
+/// behavior. Read per call site rather than cached: the compile-time
+/// `CARGO_MANIFEST_DIR` anchor stays the fallback.
+fn suite_dir() -> String {
+    std::env::var("PARITY_SUITE_DIR").unwrap_or_else(|_| format!("{DIR}/parity"))
+}
 // Timing loop: first (cold) pass discarded, MEDIAN of the rest reported. Median, not
 // min, is the user's chosen estimator for this harness. NOT a locked-machine
 // benchmark — the timing field is indicative only until the box is stabilized/locked
@@ -39,9 +55,13 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const N_RUNS: usize = 10;
 
 fn main() {
-    std::fs::create_dir_all(format!("{DIR}/parity/results/glmm")).expect("mk glmm");
+    let suite = suite_dir();
+    std::fs::create_dir_all(format!("{suite}/results/glmm_empirical"))
+        .expect("mk glmm_empirical");
+    std::fs::create_dir_all(format!("{suite}/results/glmm_simulated"))
+        .expect("mk glmm_simulated");
     let manifest: Value = serde_json::from_str(
-        &std::fs::read_to_string(format!("{DIR}/parity/manifest.json")).expect("read manifest"),
+        &std::fs::read_to_string(format!("{suite}/manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
     // PARITY_ONLY=<name>[,<name>...]: fit only the named datasets (mirrors
@@ -71,20 +91,45 @@ fn fit_one(spec: &Value) {
         .as_array()
         .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
         .unwrap_or_default();
+    let source = if spec["source"].as_str() == Some("sim") {
+        "simulated"
+    } else {
+        "empirical"
+    };
 
-    let (header, rows) = read_csv(ds);
+    let suite = suite_dir();
+    // `data` field: CSV to read when it differs from the rung name (mirrors
+    // fit.R/fit.jl) — a re-linked rung (cbpp_probit) reuses the committed
+    // dataset byte-for-byte instead of duplicating it.
+    let data_name = spec["data"].as_str().unwrap_or(ds);
+    let (header, rows) = read_csv_path(&format!("{suite}/data_{source}/{data_name}.csv"));
 
     // jl_formula, not r_formula: guaranteed cbind-free for every rung (design doc),
     // so it is already a safe generic lowering source. Strip the literal
-    // "@formula(...)" wrapper to get a plain formula string.
-    let jl = spec["jl_formula"]
-        .as_str()
-        .expect("manifest entry missing jl_formula");
-    let formula_str = jl
-        .strip_prefix("@formula(")
-        .and_then(|s| s.strip_suffix(')'))
-        .unwrap_or_else(|| panic!("jl_formula not in @formula(...) shape: {jl}"))
-        .to_string();
+    // "@formula(...)" wrapper to get a plain formula string. Rungs WITHOUT a
+    // jl_formula (weights suite fixed-only / R-only rungs -- the field's absence
+    // is fit.jl's skip signal) fall back to r_formula; an aggregated-binomial
+    // r_formula's `cbind(...)` response is rewritten to the `prop` column
+    // lower_dataset_generic synthesizes (the same lowering fit.jl's manifest
+    // entries spell out by hand).
+    let formula_str = match spec["jl_formula"].as_str() {
+        Some(jl) => jl
+            .strip_prefix("@formula(")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("jl_formula not in @formula(...) shape: {jl}"))
+            .to_string(),
+        None => {
+            let r = spec["r_formula"]
+                .as_str()
+                .expect("manifest entry missing both jl_formula and r_formula");
+            match r.split_once('~') {
+                Some((resp, rhs)) if resp.trim_start().starts_with("cbind(") => {
+                    format!("prop ~{rhs}")
+                }
+                _ => r.to_string(),
+            }
+        }
+    };
     // Julia's own crossed-interaction grouping operator is `&` (e.g. cake's
     // `(1 | recipe & replicate)`); this crate's `glmm_formula` parser uses `:`
     // for the same grouping (`(1|A:B)`). `&` occurs nowhere else in the manifest
@@ -96,25 +141,57 @@ fn fit_one(spec: &Value) {
     // manifest writes it as the fixed side's leading term, `"<dep> ~ 1 + ..."`.
     let formula_str = formula_str.replacen(" ~ 1 + ", " ~ ", 1);
 
+    // `link` field: non-canonical link override (cbpp_probit). Absent = the
+    // family's canonical link, the pre-existing behavior for every other rung.
+    let link_str = spec["link"].as_str();
     let family = match family_str {
         "gaussian" => Family::Gaussian,
         "binomial" => Family::Binomial {
-            link: BinomialLink::Logit,
+            link: match link_str {
+                None | Some("logit") => BinomialLink::Logit,
+                Some("probit") => BinomialLink::Probit,
+                Some(other) => panic!("unsupported binomial link: {other}"),
+            },
         },
         "poisson" => Family::Poisson {
             link: PoissonLink::Log,
         },
+        "gamma" => Family::Gamma {
+            link: match link_str {
+                None | Some("log") => GammaLink::Log,
+                Some("inverse") => GammaLink::Inverse,
+                Some(other) => panic!("unsupported gamma link: {other}"),
+            },
+        },
+        "negbin" => Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
         other => panic!("unsupported family: {other}"),
     };
 
-    let mut lo = lower_dataset(spec, &header, &rows, &factors, &formula_str, family);
+    let mut lo = lower_dataset_generic(spec, &header, &rows, &factors, &formula_str, family);
+    // `weights_col`: plain per-row prior weights read off the named CSV column
+    // (every weights-suite rung except the aggregated-binomial ones, which use
+    // the `weights` field lower_dataset_generic already routes -- the two are
+    // mutually exclusive per rung by design).
+    if let Some(wc) = spec["weights_col"].as_str() {
+        assert!(
+            spec["weights"].is_null(),
+            "{ds}: weights_col and weights are mutually exclusive"
+        );
+        let w_idx = header
+            .iter()
+            .position(|h| h == wc)
+            .unwrap_or_else(|| panic!("{ds}: weights_col {wc:?} not in CSV header"));
+        lo.opts.weights = Some(rows.iter().map(|r| r[w_idx].parse().unwrap()).collect());
+    }
     let timing_batch = spec["timing_batch"].as_u64().unwrap_or(1) as usize;
 
     // Reference grouping order (compare.R aligns varcomp positionally, not by
     // name) — read off the already-frozen lme4 result rather than re-deriving
     // lme4's own convention.
     let reference: Value = serde_json::from_str(
-        &std::fs::read_to_string(format!("{DIR}/parity/results/lme4/{ds}.json"))
+        &std::fs::read_to_string(format!("{suite}/results/lme4_{source}/{ds}.json"))
             .expect("read lme4 reference"),
     )
     .expect("parse lme4 reference");
@@ -130,7 +207,40 @@ fn fit_one(spec: &Value) {
         })
         .collect();
 
-    let (converged, estimates, timing) = if gaussian {
+    // Unit-weights identity gate (weights suite U1): the `weighted` fast-path
+    // split must be invisible at w ≡ 1 -- fit once with the (all-ones) weights
+    // and once with `weights: None`, and require β/SE/θ-stddev to agree to
+    // 1e-12 relative BEFORE the result JSON is written. Failure is loud at fit
+    // time, not a tolerance row in compare.R.
+    if spec["gate"].as_str() == Some("unit_identity") {
+        let o_u = FitOptions {
+            target_indices: lo.opts.target_indices.clone(),
+            weights: None,
+            ..FitOptions::default()
+        };
+        let fw = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+        let fu = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &o_u);
+        let check = |what: &str, a: &[f64], b: &[f64]| {
+            assert_eq!(a.len(), b.len(), "{ds}: unit-identity {what} length");
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                let rel = (x - y).abs() / x.abs().max(y.abs()).max(1e-12);
+                assert!(
+                    rel < 1e-12,
+                    "{ds}: unit-identity gate FAILED on {what}[{i}]: w≡1 gives {x}, \
+                     weights:None gives {y} (rel {rel:.3e} ≥ 1e-12)"
+                );
+            }
+        };
+        check("beta", &fw.beta, &fu.beta);
+        check("se", &fw.se, &fu.se);
+        for i in 0..lo.re_groups.len() {
+            check("stddev", &fw.stddev_corr(i).0, &fu.stddev_corr(i).0);
+        }
+        println!("glmm  {ds:<12}  unit-identity gate ok (w≡1 == weights:None to 1e-12)");
+    }
+
+    let fixed_only = lo.re_groups.is_empty();
+    let (converged, estimates, timing, n_eval, deviance) = if gaussian {
         let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
         let t = json!({
             "fit_seconds_median": median_secs(timing_batch, || {
@@ -143,7 +253,24 @@ fn fit_one(spec: &Value) {
             "se": nums(&f.se),
             "varcomp": varcomp(&f, &lo.re_groups, &ref_order, false),
         });
-        (f.converged, est, t)
+        (f.converged, est, t, f.n_eval, f.deviance)
+    } else if fixed_only {
+        // Fixed-only GLM (weights suite): no θ, so the Rx-vs-Hessian method
+        // split is moot — one fit, one SE, emitted as `se_rx` to line up with
+        // the single SE fit.R's `glm`/`glm.nb` writes for these rungs.
+        let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+        let t = json!({
+            "fit_seconds_median": median_secs(timing_batch, || {
+                let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+            }),
+            "n_runs": N_RUNS, "warmup_discarded": 1, "fits_per_sample": timing_batch,
+        });
+        let est = json!({
+            "beta": nums(&f.beta),
+            "se_rx": nums(&f.se),
+            "varcomp": varcomp(&f, &lo.re_groups, &ref_order, false),
+        });
+        (f.converged, est, t, f.n_eval, f.deviance)
     } else {
         // GLMM SE has two genuinely different variants (Laplace) — emit both so
         // compare.R checks like to like: se_hessian (keeps θ–β coupling, glmm
@@ -174,7 +301,13 @@ fn fit_one(spec: &Value) {
             // stddev_se from the Hessian fit's θ block (fh = WaldSe::Hessian).
             "varcomp": varcomp(&fh, &lo.re_groups, &ref_order, true),
         });
-        (fh.converged && fr.converged, est, t)
+        (
+            fh.converged && fr.converged,
+            est,
+            t,
+            fh.n_eval + fr.n_eval,
+            fh.deviance,
+        )
     };
 
     let res = json!({
@@ -183,145 +316,14 @@ fn fit_one(spec: &Value) {
         "reml": if gaussian { json!(spec["reml"].as_bool().unwrap_or(false)) } else { Value::Null },
         "rung": rung,
         "converged": converged, "singular": false,
+        "optimizer": "bobyqa",
+        "n_eval": n_eval,
+        "deviance": num(deviance),
         "coef_names": std::mem::take(&mut lo.col_names),
         "estimates": estimates,
         "timing": timing,
     });
-    write_result(ds, res);
-}
-
-/// Build the lowered fit inputs for one dataset. Handles the one genuinely
-/// data-shape-dependent branch in the corpus: an aggregated-binomial rung
-/// (manifest `weights`) synthesizes `prop = incidence/weights_col` (mirrors
-/// fit.jl:44-46) so jl_formula's `prop ~ ...` response resolves, then either:
-/// - passes `Some(weights)` into `FitOptions::weights` when the RE structure
-///   routes to the sparse binomial GLMM path (the only path that honors prior
-///   weights — `src/fit.rs`'s own boundary assert), one row per aggregate
-///   observation (sim_sparse_binomial: 7 crossed extras ⇒ sparse); or
-/// - falls back to the historical per-trial Bernoulli expansion when it does not
-///   (cbpp: single grouping ⇒ dense NoZ, where weights are not honored) — same
-///   argmin as the aggregated-weights objective, so the numbers agree.
-/// Solver choice is read off the lowered RE shape (grouping/term counts vs the
-/// engine's own envelope caps), not the dataset name, so a future weighted rung
-/// routes itself correctly either way.
-fn lower_dataset(
-    spec: &Value,
-    header: &[String],
-    rows: &[Vec<String>],
-    factors: &[String],
-    formula_str: &str,
-    family: Family,
-) -> Lowered {
-    let Some(w_name) = spec["weights"].as_str() else {
-        let table = build_table(header, rows, factors);
-        return lower(formula_str, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
-    };
-
-    let w_idx = header
-        .iter()
-        .position(|h| h == w_name)
-        .expect("weights column in header");
-    let inc_idx = header
-        .iter()
-        .position(|h| h == "incidence")
-        .expect("incidence column in header");
-    let sizes: Vec<f64> = rows.iter().map(|r| r[w_idx].parse().unwrap()).collect();
-    let incid: Vec<f64> = rows.iter().map(|r| r[inc_idx].parse().unwrap()).collect();
-    let prop: Vec<f64> = incid.iter().zip(&sizes).map(|(i, s)| i / s).collect();
-
-    let mut table = build_table(header, rows, factors);
-    table.columns.push(("prop".into(), Column::Numeric(prop)));
-    let lo_agg = lower(formula_str, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
-
-    // Mirrors src/fit.rs's classify_design for the binomial (non-Gaussian) case,
-    // computed from the lowered RE shape alone: over-envelope OR any
-    // slope-carrying extra grouping (q_g ≥ 2) routes Sparse — change together.
-    let extras = lo_agg.re_groups.len().saturating_sub(1);
-    let q_p = lo_agg.re_groups.first().map_or(0, |g| g.terms.len());
-    let over_extra = lo_agg.re_groups[1..]
-        .iter()
-        .any(|g| g.terms.len() > glmm::consts::MAX_EXTRA_Q);
-    let slope_extras = lo_agg.re_groups[1..].iter().any(|g| g.terms.len() > 1);
-    let sparse = extras > glmm::consts::MAX_EXTRA_GROUPINGS
-        || q_p > glmm::consts::MAX_PRIMARY_Q
-        || over_extra
-        || slope_extras;
-
-    if sparse {
-        let mut lo = lo_agg;
-        lo.opts.weights = Some(sizes);
-        lo
-    } else {
-        let erows = expand_bernoulli(rows, inc_idx, w_idx);
-        let mut etable = build_table(header, &erows, factors);
-        let prop_vals = match &etable
-            .columns
-            .iter()
-            .find(|(n, _)| n == "incidence")
-            .unwrap()
-            .1
-        {
-            Column::Numeric(v) => v.clone(),
-            Column::Factor { .. } => unreachable!("incidence is numeric"),
-        };
-        etable
-            .columns
-            .push(("prop".into(), Column::Numeric(prop_vals)));
-        lower(formula_str, &etable, family).unwrap_or_else(|e| panic!("lower: {e}"))
-    }
-}
-
-/// Expand aggregated (incidence, size) rows into `size` per-trial Bernoulli rows
-/// (the kernel is Bernoulli on the dense path). Every other column is duplicated
-/// as-is; `incidence` becomes the 0/1 trial outcome.
-fn expand_bernoulli(rows: &[Vec<String>], inc_idx: usize, size_idx: usize) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    for r in rows {
-        let incidence: u32 = r[inc_idx].parse().unwrap();
-        let size: u32 = r[size_idx].parse().unwrap();
-        for k in 0..size {
-            let mut nr = r.clone();
-            nr[inc_idx] = if k < incidence {
-                "1".into()
-            } else {
-                "0".into()
-            };
-            out.push(nr);
-        }
-    }
-    out
-}
-
-/// A `Table` built by column NAME: manifest `factors` become `Column::Factor`,
-/// everything else `Column::Numeric` — except a column that fails to parse as
-/// `f64` anywhere (e.g. Pastes' `cask`, a categorical helper column the parity
-/// corpus carries but no jl_formula references) falls back to `Column::Factor`
-/// rather than panicking, since it may be present in the CSV without being
-/// referenced by the formula at all.
-fn build_table(header: &[String], rows: &[Vec<String>], factors: &[String]) -> Table {
-    let n = rows.len();
-    let columns = header
-        .iter()
-        .enumerate()
-        .map(|(j, name)| {
-            let is_factor = factors.iter().any(|f| f == name)
-                || rows.iter().any(|r| r[j].parse::<f64>().is_err());
-            let col = if is_factor {
-                Column::Factor {
-                    labels: rows.iter().map(|r| r[j].clone()).collect(),
-                }
-            } else {
-                Column::Numeric(rows.iter().map(|r| r[j].parse().unwrap()).collect())
-            };
-            // Mirrors fit.jl's read_dataset: R-origin CSV headers can carry dots
-            // (Arabidopsis's `total.fruits`) that jl_formula sanitizes to
-            // underscores because Julia's @formula reader can't parse a dot as
-            // part of an identifier. Rename here so the Table's column names
-            // match jl_formula's (already-underscored) reference.
-            (name.replace('.', "_"), col)
-        })
-        .collect();
-    Table { columns, n }
+    write_result(ds, source, res);
 }
 
 /// Variance components in the common schema, one entry per grouping factor, from
@@ -385,31 +387,8 @@ fn group_names_match(a: &str, b: &str) -> bool {
 }
 
 // ── shared helpers ────────────────────────────────────────────────────────────
-
-fn read_csv(ds: &str) -> (Vec<String>, Vec<Vec<String>>) {
-    let raw = std::fs::read_to_string(format!("{DIR}/parity/data/{ds}.csv")).expect("read csv");
-    let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
-    let header = lines.next().unwrap().split(',').map(unquote).collect();
-    let rows = lines.map(|l| l.split(',').map(unquote).collect()).collect();
-    (header, rows)
-}
-fn unquote(s: &str) -> String {
-    s.trim().trim_matches('"').to_string()
-}
-
-/// NaN/Inf → JSON null (serde_json cannot serialize non-finite floats, and a
-/// non-converged fit leaves NaN-filled estimates) so an unconverged run still
-/// writes valid JSON the comparators read as "missing", not a crash.
-fn num(x: f64) -> Value {
-    if x.is_finite() {
-        json!(x)
-    } else {
-        Value::Null
-    }
-}
-fn nums(xs: &[f64]) -> Value {
-    Value::Array(xs.iter().map(|&x| num(x)).collect())
-}
+// read_csv_path/unquote/build_table/num/nums/lower_dataset_generic
+// live in harness_common.rs (shared with grid_fit.rs) — change together.
 
 /// Median seconds over N_RUNS samples, warm-up (first) discarded. Each sample times
 /// `batch` fits so sub-resolution fits stay above the timer floor (mirrors the manifest
@@ -438,8 +417,8 @@ fn median(xs: &[f64]) -> f64 {
     }
 }
 
-fn write_result(ds: &str, res: Value) {
-    let out = format!("{DIR}/parity/results/glmm/{ds}.json");
+fn write_result(ds: &str, source: &str, res: Value) {
+    let out = format!("{}/results/glmm_{source}/{ds}.json", suite_dir());
     std::fs::write(
         &out,
         format!("{}\n", serde_json::to_string_pretty(&res).unwrap()),

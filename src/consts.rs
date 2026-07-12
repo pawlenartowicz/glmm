@@ -31,6 +31,19 @@ pub const MAX_EXTRA_Q: usize = 4;
 pub const MAX_THETA: usize = MAX_PRIMARY_Q * (MAX_PRIMARY_Q + 1) / 2
     + MAX_EXTRA_GROUPINGS * (MAX_EXTRA_Q * (MAX_EXTRA_Q + 1) / 2);
 
+/// Max total level count over `Crossed` extra groupings on the dense NoZ path:
+/// designs with `Σ n_clusters` over crossed extras above this route to the
+/// sparse-Z path (`fit::classify_design`). Unlike the `MAX_*` scratch ceilings
+/// this is a PERFORMANCE boundary — the dense tail of `reml_deviance` (and the
+/// dense GLMM path's Schur complement over extras) is cubic in the total
+/// crossed column count, so many-level crossed factors make each deviance eval
+/// take minutes (measured 2026-07-09: 22,714 crossed levels ≈ 10¹³ flops and
+/// ~6 GB scratch per eval). 500 is a placeholder: grouseticks' 403-level
+/// crossed factor ran fine dense (0.16 s), and the cubic term at 500 is ~4×10⁷
+/// flops/eval — negligible. Refine with a dense-vs-sparse crossover sweep
+/// extending the 2026-07-02 sweep's level axis past 30.
+pub const MAX_CROSSED_LEVELS: usize = 500;
+
 /// Max adaptive Gauss–Hermite node count for `nAGQ>1`. Odd nodes
 /// only; the GH table below covers orders `1,3,…,MAX_NAGQ`.
 pub const MAX_NAGQ: u8 = 25;

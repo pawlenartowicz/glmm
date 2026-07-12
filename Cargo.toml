@@ -21,6 +21,21 @@ crate-type = ["rlib"]
 name = "parity_fit"
 path = "parity/oracle/fit.rs"
 
+# The glmm side of the optimizer-grid campaign (manifest_grid.json, 510 cells):
+# one JSONL record per cell, appended to $GRID_OUT. Shares harness_common.rs
+# with parity_fit above.
+[[example]]
+name = "grid_fit"
+path = "parity/oracle/grid_fit.rs"
+
+# Mismatch-adjudication driver (oracle spec 2026-07-11): evaluates/minimizes
+# the LMM profiled-REML objective at caller-chosen θ/schedules through the
+# dev-only loop_advanced seam. Shares harness_common.rs with the two above.
+[[example]]
+name = "theta_eval"
+path = "parity/oracle/theta_eval.rs"
+required-features = ["loop_advanced"]
+
 [lints]
 workspace = true
 
@@ -29,6 +44,19 @@ workspace = true
 # kernels + `StartValues` warm-start). Capability-named, multi-consumer. OFF by
 # default so the semver-covered public API is just `fit` + `ModelSpec`. (spec §5)
 loop_advanced = []
+# Installs dhat as the test binary's #[global_allocator] for the `#[ignore]`
+# bounded-alloc tests. OFF by default: dhat locks a global mutex on every
+# allocation, which serializes the whole parallel test suite when it's always
+# installed. Run those tests with
+# `cargo test --features alloc-tests <name> -- --ignored --test-threads=1`.
+alloc-tests = []
+# In-fit parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool.
+# OFF by default: a batch/MCPower caller running its own outer rayon loop over
+# many fits should pay nothing for this, not even rayon's per-split overhead.
+# Compile-excluded on wasm32 (`dep:rayon` only pulled in on non-wasm targets
+# below) — a no-op there, not a broken build. Gated at runtime by
+# `FitOptions::parallel_inner` even when the feature is compiled in.
+parallel = ["dep:rayon"]
 
 [dependencies]
 # Mirror engine-core's pins exactly — parity-stable numerics depend on them.
@@ -37,6 +65,7 @@ pulp = "=0.22.2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 faer = "0.24"
+rayon = { version = "1", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 faer = { version = "0.24", default-features = false, features = ["std", "sparse-linalg"] }
@@ -93,3 +122,16 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 debug = false
+
+# Optimize test builds: the suite is dominated by faer/BOBYQA/PIRLS numerics
+# that run 30-60x slower unoptimized (the sparse NB GLMM test alone is ~24 s
+# optimized, tens of minutes at opt-level 0). Debug assertions stay on. The
+# release-profile parity pins above are untouched — goldens are tolerance
+# checks, not bit-exact, under test profiles.
+[profile.test]
+opt-level = 3
+
+# Dependencies of test builds compile under profile.dev, not profile.test, so
+# faer/bobyqa need their own override to be optimized in `cargo test`.
+[profile.dev.package."*"]
+opt-level = 3

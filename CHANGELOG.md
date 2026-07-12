@@ -7,19 +7,45 @@ until the first tag.
 
 ## [Unreleased]
 
-### Prior weights (sparse binomial GLMM)
+### LMM cold start
+
+#### Changed
+
+- **LMM cold starts now use the unit-diagonal blind seed** (diagonal θ at 1,
+  off-diagonal vech entries at 0 — the lme4/MixedModels convention), on both
+  the dense (`fit_lmm`) and sparse (`fit_mle_sparse`) Gaussian paths. The
+  former start set *every* component to 1; on wide-slope designs (q ≥ 4 with
+  correlated slopes) that start funneled BOBYQA into a second-best local
+  optimum on 8 of 9 adjudicated grid cells (deviance gaps +0.23 to +57.4 vs
+  the best-known optima, now frozen as goldens under `parity/goldens/optima/`).
+  With the new seed the fitted optimum matches or beats MixedModels on all 9.
+  Intercept-only and uncorrelated-slope models have no off-diagonal
+  components and are bit-identical. Full-grid effect vs MixedModels on the
+  gaussian slope stratum: worse-than-MM cells drop 8 → 2 — the two
+  remaining are *new* coin-flips where the old start happened to hold the
+  best-known basin (`lmm_q6_g300p5_bal_base` +0.008,
+  `lmm_q8_g3000p5_bal_lowsnr` +2.03; goldens frozen for both). It also fixes
+  the dense-vs-sparse basin disagreement behind the `noz_sparse_grid_agrees`
+  cell-20 failure. Eval counts on affected wide-slope fits move both ways
+  (grid-wide gaussian-slope total −10%). The sparse non-Gaussian GLMM joint
+  seed already used this shape; the Gaussian paths now match it.
+
+### Prior weights
 
 #### Added
 
 - **`FitOptions::weights`** — per-row prior (case) weights, lme4's `weights=`.
-  Currently honored only on the sparse binomial GLMM path; every other dispatch
-  rejects them at the fit boundary rather than silently fit unweighted. An
-  aggregated binomial (y = success proportion, weight = trial count) now fits
-  directly — lme4's `cbind(s, m−s)` objective, which shares its argmin (and so
-  β/SE/varcomp) with the expanded-Bernoulli fit — letting the
+  An aggregated binomial (y = success proportion, weight = trial count) now
+  fits directly — lme4's `cbind(s, m−s)` objective, which shares its argmin
+  (and so β/SE/varcomp) with the expanded-Bernoulli fit — letting the
   `sim_sparse_binomial` parity rung fit its 240 aggregated rows instead of the
   3,059-row Bernoulli expansion. Parity holds at unchanged tolerances; the
   per-solve O(n·width²) cost collapses accordingly.
+
+#### Changed
+
+- `FitOptions.weights` now supported on all paths (was: sparse binomial GLMM
+  only); nAGQ>1 with weights rejected.
 
 ### Two-stage GLMM optimizer
 

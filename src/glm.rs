@@ -17,7 +17,10 @@
 //!   - No step-halving: β_new is accepted directly (step-halving drifts
 //!     power ~3.5% at N=50 — see the accept step in the IRLS loop)
 //!
-//! Two `beta_start` modes: `None` seeds β = 0, a fixed reproducible cold
+//! Two `beta_start` modes: `None` seeds β = 0 with a family-specific η seed
+//! (η = 0 for logit; R's `initialize` μ-start for Gamma-inverse; the null-model
+//! μ₀ = ȳ + 0.1 for the log-link count families — see the cold-start arm), a
+//! fixed reproducible cold
 //! start; `Some(spec.effect_sizes)` — what the shipped hot loop passes — seeds
 //! the spec-derived truth-start (Y is synthetic, so the true β on the logit
 //! scale is known; mirrors `lmm::fit_lmm`'s `theta_start`). Either way the
@@ -145,11 +148,22 @@ pub fn sigmoid_stable(eta: f64) -> f64 {
 ///   path); `Some(β₀)` (length `p`) → spec-derived truth start — seeds β and
 ///   computes η = X·β₀ once. A per-scenario constant, so determinism and
 ///   chunk merging are unaffected.
+/// - `prior_w`: per-row prior (case) weight `wᵢ`, McCullagh & Nelder's prior-
+///   weight sense (MN89 §2.2.2) — `None` = unit weight. Multiplies the IRLS
+///   working weight (`irls_w[i] = (wᵢ·W_raw).max(WEIGHT_CLAMP)`) and the
+///   per-row deviance contribution; the working response `z = η + r` is
+///   untouched (prior weights don't scale the working residual). The fused
+///   SIMD `Logit` fast path cannot take per-row weights, so `Some(_)` routes
+///   `Family::Binomial { link: Logit }` through the general scalar arm instead
+///   (unweighted logit still takes the fast path, byte-identical). Matches R
+///   `glm(weights=)` (`fit_glm_gamma_weighted_matches_r`,
+///   `fit_glm_binomial_weighted_aggregated_matches_r`).
 /// - `scratch`: borrowed mutable slots from `SimWorkspace.irls_*`.
 ///
 /// `deviance_null` matches R's `glm(family=binomial)$null.deviance` (see
 /// `glm_deviance_null_golden_value`); no external oracle validates the full
 /// β̂/deviance path yet.
+#[allow(clippy::too_many_arguments)] // marshals (family, nb_theta, x, y, target_indices, beta_start, prior_w, scratch)
 pub fn glm_irls_fit<'a>(
     family: Family,
     nb_theta: f64,
@@ -157,6 +171,7 @@ pub fn glm_irls_fit<'a>(
     y: &[f64],
     target_indices: &[u32],
     beta_start: Option<&[f64]>,
+    prior_w: Option<&[f64]>,
     scratch: GlmScratch<'a>,
 ) -> GlmFitView<'a> {
     let n = x.nrows();
@@ -230,19 +245,38 @@ pub fn glm_irls_fit<'a>(
     // LRT. Stored in a local so the per-iteration deviance tracker doesn't
     // clobber it. The all-0 / all-1 branch above guarantees `y_bar ∉ {0, 1}`
     // here, so no `ln(0)` risk.
-    let y_bar = y_sum / n as f64;
-    // Intercept-only MLE is μ̂=ȳ for any (family, link), so the null deviance is
-    // Σ dᵢ(y, ȳ). Logit keeps the closed-form Bernoulli expression verbatim
-    // (byte-identity); other families fold it generically.
+    // Intercept-only MLE is μ̂₀=ȳ for any (family, link) with unit weights; under
+    // prior weights it is the WEIGHTED mean μ̂₀ = Σwᵢyᵢ/Σwᵢ (R's
+    // glm(weights=)$null.deviance), so the null deviance is Σ wᵢdᵢ(y, μ̂₀).
+    // Logit keeps the closed-form Bernoulli expression verbatim (byte-identity)
+    // only when unweighted — a weighted fit routes through the same general
+    // fold the per-iteration deviance uses (see the `prior_w` guard below), so
+    // `deviance_null` stays on the same weighting convention as `deviance`.
+    // (The all-0/all-1 short circuit above keys off raw y, which is equivalent
+    // under positive weights: the weighted mean is 0/1 exactly when ȳ is.)
+    let y_bar = match prior_w {
+        Some(w) => {
+            let (mut wy_sum, mut w_sum) = (0.0, 0.0);
+            for (i, &yi) in y[..n].iter().enumerate() {
+                wy_sum += w[i] * yi;
+                w_sum += w[i];
+            }
+            wy_sum / w_sum
+        }
+        None => y_sum / n as f64,
+    };
     let deviance_null = match family {
         Family::Binomial {
             link: BinomialLink::Logit,
-        } => -2.0 * (y_sum * y_bar.ln() + (n as f64 - y_sum) * (1.0 - y_bar).ln()),
+        } if prior_w.is_none() => {
+            -2.0 * (y_sum * y_bar.ln() + (n as f64 - y_sum) * (1.0 - y_bar).ln())
+        }
         other => {
             let mu0 = crate::family::clamp_mu(other, y_bar);
             let mut d = 0.0;
-            for &yi in &y[..n] {
-                d += crate::family::dev_resid(other, nb_theta, yi, mu0);
+            for (i, &yi) in y[..n].iter().enumerate() {
+                let pw = prior_w.map_or(1.0, |w| w[i]);
+                d += pw * crate::family::dev_resid(other, nb_theta, yi, mu0);
             }
             d
         }
@@ -266,25 +300,39 @@ pub fn glm_irls_fit<'a>(
                 }
             }
         }
-        // Cold start: β ← 0, so η = X·β = 0 — bit-identical for logit (μ=0.5) and
-        // fine for Poisson/Gamma-log (μ=1). The Gamma **inverse** link cannot
-        // start there (η=0 ⇒ μ=1/0): seed η = 1/y per row (R's `mustart=y`,
-        // `etastart=1/y`) so the first IRLS step has a valid μ>0. β stays 0; the
-        // first solve overwrites it, so X·β consistency resumes from iter 1.
+        // Cold start: β ← 0 with a family-specific η seed. Logit keeps η = 0
+        // (μ=0.5, bit-identical to the pre-warm-start behavior). The Gamma
+        // **inverse** link cannot start at η=0 (μ=1/0): seed η = 1/y per row
+        // (R's `mustart=y`, `etastart=1/y`). Log-link count families
+        // (Poisson/NB) seed the null model, μ₀ = ȳ + 0.1 ⇒ η = ln(ȳ+0.1) on
+        // every row: from η = 0 (μ=1) on data with ȳ ≳ ~25–30 the first WLS
+        // step overshoots and IRLS runs away (β → ~9e304) — there is
+        // deliberately no step-halving to catch it (see the rejection note at
+        // the accept step). NOT R's per-row μ₀ = y + 0.1 `initialize`: on
+        // zero-heavy small-θ NB data the per-row seed's first step fits the
+        // log-count mean (intercept ≈ ln 0.1), the second explodes past
+        // BETA_CAP, and recovery crawls at ~1 unit/iter past the iteration
+        // budget — R's own glm.fit fails identically there (glm.nb only
+        // survives by warm-starting each alternation from a Poisson fit); the
+        // constant ȳ seed converges on both regimes. β stays 0 in all seeded
+        // cases; the first solve overwrites it, so X·β consistency resumes
+        // from iter 1.
         None => {
             irls_betas[..p].fill(0.0);
-            if matches!(
-                family,
+            match family {
                 Family::Gamma {
                     link: crate::spec::GammaLink::Inverse,
                     ..
+                } => {
+                    for i in 0..n {
+                        irls_eta[i] = 1.0 / crate::family::clamp_mu(family, y[i]);
+                    }
                 }
-            ) {
-                for i in 0..n {
-                    irls_eta[i] = 1.0 / crate::family::clamp_mu(family, y[i]);
+                Family::Poisson { .. } | Family::NegativeBinomial { .. } => {
+                    let ybar = y[..n].iter().sum::<f64>() / n.max(1) as f64;
+                    irls_eta[..n].fill((ybar + 0.1).ln());
                 }
-            } else {
-                irls_eta[..n].fill(0.0);
+                _ => irls_eta[..n].fill(0.0),
             }
         }
     }
@@ -326,7 +374,7 @@ pub fn glm_irls_fit<'a>(
         let deviance = match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
-            } => {
+            } if prior_w.is_none() => {
                 let lp_sum = crate::simd_transcendental::pw_and_log1pexp_sum(
                     &irls_eta[..n],
                     &mut irls_p[..n],
@@ -342,17 +390,22 @@ pub fn glm_irls_fit<'a>(
             }
             other => {
                 // Per row: clamp η; (μ, W_raw, working_resid) from family.rs;
-                // floor W at WEIGHT_CLAMP; z = η + r; accumulate Σ dᵢ (the
-                // residual deviance — the |Δ| convergence metric, dispersion-free).
+                // fold in the prior weight wᵢ (None ⇒ 1.0) on both the working
+                // weight and the deviance term, then floor W at WEIGHT_CLAMP;
+                // z = η + r is untouched — prior weights don't scale the working
+                // residual (MN89 §2.2.2). Accumulate Σ wᵢdᵢ (the |Δ| convergence
+                // metric, dispersion-free). This arm also carries the weighted
+                // Logit fallthrough (fused SIMD kernel has no per-row weight).
                 let mut dev = 0.0;
                 for i in 0..n {
                     let e = crate::family::clamp_eta(other, irls_eta[i]);
                     let (mu, w_raw, r) =
                         crate::family::irls_weight_and_resid(other, nb_theta, y[i], e);
+                    let pw = prior_w.map_or(1.0, |w| w[i]);
                     irls_p[i] = mu;
-                    irls_w[i] = w_raw.max(WEIGHT_CLAMP);
+                    irls_w[i] = (pw * w_raw).max(WEIGHT_CLAMP);
                     irls_z[i] = e + r;
-                    dev += crate::family::dev_resid(other, nb_theta, y[i], mu);
+                    dev += pw * crate::family::dev_resid(other, nb_theta, y[i], mu);
                 }
                 dev
             }
@@ -499,9 +552,20 @@ pub fn glm_irls_fit<'a>(
         // η — no recompute needed. The clamp floor (WEIGHT_CLAMP = 1e-6) sits
         // below SATURATION_W (1e-5), so `w < SATURATION_W` is equivalent to the
         // raw `p(1-p) < SATURATION_W` test the scalar guard used.
-        let saturated = irls_w[..n]
-            .iter()
-            .filter(|&&w_i| w_i < SATURATION_W)
+        //
+        // Weighted case: irls_w carries wᵢ·W_raw, so the threshold scales with
+        // wᵢ too — otherwise a legitimately small prior weight would masquerade
+        // as saturation. The guard tests the FAMILY weight μ(1−μ) (or its
+        // generalization), not the case weight, so it compares against
+        // SATURATION_W·wᵢ rather than a fixed floor. Sub-unit-weight edge:
+        // for wᵢ < WEIGHT_CLAMP/SATURATION_W = 0.1 the clamp floor (1e-6)
+        // exceeds the scaled threshold SATURATION_W·wᵢ, so a truly saturated
+        // row escapes the guard — accepted edge; case weights are typically ≥ 1.
+        let saturated = (0..n)
+            .filter(|&i| {
+                let pw = prior_w.map_or(1.0, |w| w[i]);
+                irls_w[i] < SATURATION_W * pw
+            })
             .count();
         if (saturated as f64) / (n as f64) > SATURATION_FRAC {
             converged = false;
@@ -639,6 +703,7 @@ mod tests {
             &y,
             &targets,
             None,
+            None,
             glm_scratch(&mut ws),
         );
         assert!(!fit.converged);
@@ -665,6 +730,7 @@ mod tests {
             x.as_ref(),
             &y,
             &targets,
+            None,
             None,
             glm_scratch(&mut ws),
         );
@@ -696,6 +762,7 @@ mod tests {
             x.as_ref(),
             &y,
             &targets,
+            None,
             None,
             glm_scratch(&mut ws),
         );
@@ -730,6 +797,7 @@ mod tests {
             &y,
             &targets,
             None,
+            None,
             glm_scratch(&mut ws),
         );
         assert!(!fit.converged);
@@ -759,6 +827,7 @@ mod tests {
             x.as_ref(),
             &y,
             &targets,
+            None,
             None,
             glm_scratch(&mut ws),
         );
@@ -797,6 +866,7 @@ mod tests {
             x.as_ref(),
             &y,
             &targets,
+            None,
             None,
             glm_scratch(&mut ws),
         );
@@ -845,6 +915,7 @@ mod tests {
             &y,
             &targets,
             None,
+            None,
             glm_scratch(&mut ws),
         );
         assert!(fit.converged, "must converge: non-separated y pattern");
@@ -857,6 +928,72 @@ mod tests {
             abs_err < 0.001,
             "deviance_null = {}, expected {expected}, err = {abs_err}",
             fit.deviance_null
+        );
+    }
+
+    /// Weighted Gamma(log) null/residual deviance vs R glm(weights=).
+    /// Convention: null mean is the WEIGHTED mean μ̂₀ = Σwᵢyᵢ/Σwᵢ and both
+    /// deviances accumulate Σwᵢdᵢ. Same fixture as fit.rs's
+    /// `fit_glm_gamma_weighted_matches_r` (β/SE/φ gated there).
+    #[test]
+    fn glm_weighted_deviance_null_golden_value() {
+        // R 4.5.3 oracle (set.seed(42), n = 40):
+        //   x1 <- round(rnorm(n), 4); w <- sample(1:4, n, replace = TRUE)
+        //   eta <- 0.4 + 0.8 * x1
+        //   yg <- round(rgamma(n, shape = 2, scale = exp(eta) / 2), 6)
+        //   fg <- glm(yg ~ x1, family = Gamma("log"), weights = w)
+        //   print(fg$null.deviance, digits = 15); print(fg$deviance, digits = 15)
+        let x1: [f64; 40] = [
+            1.371, -0.5647, 0.3631, 0.6329, 0.4043, -0.1061, 1.5115, -0.0947, 2.0184, -0.0627,
+            1.3049, 2.2866, -1.3889, -0.2788, -0.1333, 0.636, -0.2843, -2.6565, -2.4405, 1.3201,
+            -0.3066, -1.7813, -0.1719, 1.2147, 1.8952, -0.4305, -0.2573, -1.7632, 0.4601, -0.64,
+            0.4555, 0.7048, 1.0351, -0.6089, 0.505, -1.717, -0.7845, -0.8509, -2.4142, 0.0361,
+        ];
+        let w: [f64; 40] = [
+            4.0, 1.0, 2.0, 1.0, 1.0, 4.0, 4.0, 1.0, 3.0, 3.0, 1.0, 4.0, 1.0, 4.0, 4.0, 2.0, 1.0,
+            4.0, 2.0, 2.0, 2.0, 4.0, 1.0, 2.0, 1.0, 2.0, 4.0, 3.0, 4.0, 1.0, 4.0, 1.0, 4.0, 3.0,
+            2.0, 2.0, 3.0, 1.0, 1.0, 2.0,
+        ];
+        let y: [f64; 40] = [
+            2.421196, 0.850101, 1.188318, 0.917668, 1.895064, 2.717167, 4.391082, 0.266883,
+            1.853922, 1.838375, 5.959549, 19.008523, 0.121882, 1.544704, 1.422566, 0.758422,
+            1.264496, 0.147806, 0.06751, 2.907132, 0.3538, 0.223494, 0.297625, 5.273375, 12.534684,
+            0.514577, 1.473477, 0.485665, 0.962023, 1.043896, 1.771311, 1.926229, 7.592099,
+            1.298714, 0.675125, 0.201756, 1.814679, 1.104297, 0.434436, 0.470596,
+        ];
+        const REF_DEV_NULL: f64 = 140.09428224081;
+        const REF_DEV: f64 = 39.1211374203115;
+        let n = 40;
+        let p = 2;
+        let mut x = Mat::<f64>::zeros(n, p);
+        for i in 0..n {
+            x[(i, 0)] = 1.0;
+            x[(i, 1)] = x1[i];
+        }
+        let mut ws = TestWs::new(n, p, 0);
+        let targets: Vec<u32> = vec![0, 1];
+        let fit = glm_irls_fit(
+            crate::Family::Gamma {
+                link: crate::GammaLink::Log,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &targets,
+            None,
+            Some(&w),
+            glm_scratch(&mut ws),
+        );
+        assert!(fit.converged, "weighted gamma GLM must converge");
+        assert!(
+            (fit.deviance_null - REF_DEV_NULL).abs() / REF_DEV_NULL < 1e-8,
+            "deviance_null = {} vs R {REF_DEV_NULL}",
+            fit.deviance_null
+        );
+        assert!(
+            (fit.deviance - REF_DEV).abs() / REF_DEV < 1e-6,
+            "deviance = {} vs R {REF_DEV}",
+            fit.deviance
         );
     }
 }

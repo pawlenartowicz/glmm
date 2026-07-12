@@ -168,46 +168,60 @@ pub(crate) fn dev_resid(family: Family, nb_theta: f64, y: f64, mu: f64) -> f64 {
 
 /// lme4's `Gamma()$aic` — the Gamma family's contribution to the Laplace deviance,
 /// substituted for the bare deviance `D` in the Gamma-GLMM objective. The
-/// dispersion is **profiled** inside this term as `disp = D/Σwₖ` (here `Σwₖ = n`,
-/// unit prior weights), not carried as a free parameter, so
+/// dispersion is **profiled** inside this term as `disp = D/Σwₖ` (`Σwₖ = n` when
+/// `prior_w` is `None` — unit prior weights), not carried as a free parameter, so
 /// ```text
-///   aic = −2·Σᵢ log dgamma(yᵢ; shape = 1/disp, scale = μᵢ·disp) + 2
+///   aic = −2·Σᵢ wᵢ·log dgamma(yᵢ; shape = 1/disp, scale = μᵢ·disp) + 2
 ///   log dgamma(y; a, s) = (a−1)·ln y − y/s − a·ln s − lnΓ(a)
 /// ```
-/// This is the **only** place the dispersion enters glmer's Gamma fit (its PIRLS
-/// weights and the `‖u‖²` penalty are unit-scale — no `1/φ` weighting, no φ-ridge;
-/// confirmed against lme4 `src/glmFamily.cpp`). Swapping `D → aic` in the objective
-/// is what makes the kernel's β̂/τ̂ and FD-Hessian SE pick up the dispersion
-/// coupling. Needs `lnΓ` (one call, on the scalar shape `1/disp`) — no digamma,
-/// since the dispersion is profiled rather than ML-solved. Validated against the
-/// `fit::tests::fit_glmm_gamma_sim_matches_lme4` golden.
-pub(crate) fn gamma_aic(y: &[f64], mu: &[f64], dev: f64, n: usize) -> f64 {
-    let disp = dev / n as f64;
+/// matching R's weighted `Gamma()$aic`: `disp = dev/Σwᵢ`, each log-density term
+/// scaled by its row's `wᵢ`. This is the **only** place the dispersion enters
+/// glmer's Gamma fit (its PIRLS weights and the `‖u‖²` penalty are unit-scale —
+/// no `1/φ` weighting, no φ-ridge; confirmed against lme4 `src/glmFamily.cpp`).
+/// Swapping `D → aic` in the objective is what makes the kernel's β̂/τ̂ and
+/// FD-Hessian SE pick up the dispersion coupling. Needs `lnΓ` (one call, on the
+/// scalar shape `1/disp`) — no digamma, since the dispersion is profiled rather
+/// than ML-solved. Validated against the `fit::tests::fit_glmm_gamma_sim_matches_lme4`
+/// golden (unweighted) and `fit_glmm_gamma_weighted_matches_lme4` (weighted).
+pub(crate) fn gamma_aic(y: &[f64], mu: &[f64], dev: f64, n: usize, prior_w: Option<&[f64]>) -> f64 {
+    let sum_w = prior_w.map_or(n as f64, |w| w[..n].iter().sum());
+    let disp = dev / sum_w;
     let a = 1.0 / disp; // shape = 1/disp
     let ln_gamma_a = crate::simd_transcendental::ln_gamma(a);
     let mut s = 0.0;
-    for (&yi, &mui) in y.iter().zip(mu).take(n) {
+    for (i, (&yi, &mui)) in y.iter().zip(mu).take(n).enumerate() {
         let scale = mui * disp; // sᵢ = μᵢ·disp
-        s += (a - 1.0) * yi.ln() - yi / scale - a * scale.ln() - ln_gamma_a;
+        s += prior_w.map_or(1.0, |w| w[i])
+            * ((a - 1.0) * yi.ln() - yi / scale - a * scale.ln() - ln_gamma_a);
     }
     -2.0 * s + 2.0
 }
 
 /// lme4's `sigma(merMod)²` for a GLMM with a free scale: `σ̂² = pwrss/n =
-/// (Σᵢ rᵢ² + ‖û‖²)/n` with Pearson residuals `rᵢ = (yᵢ−μᵢ)/√V(μᵢ)` (for Gamma,
-/// `V(μ)=μ²` ⇒ `rᵢ=(yᵢ−μᵢ)/μᵢ`). Fixed-scale families (binomial/Poisson/NB —
-/// their overdispersion lives in θ, not σ²) return 1. This is the factor lme4's
+/// (Σᵢ wᵢ·rᵢ² + ‖û‖²)/n` with Pearson residuals `rᵢ = (yᵢ−μᵢ)/√V(μᵢ)` (for Gamma,
+/// `V(μ)=μ²` ⇒ `rᵢ=(yᵢ−μᵢ)/μᵢ`) and `wᵢ` the row's prior weight (`prior_w = None`
+/// ⇒ unit weights). Fixed-scale families (binomial/Poisson/NB — their
+/// overdispersion lives in θ, not σ²) return 1. This is the factor lme4's
 /// `vcov(use.hessian = FALSE)` puts on the RX/Schur vcov and the one its VarCorr
 /// stddevs carry — distinct from the Pearson/(n−p) `dispersion` moment reported
 /// separately. `mu`/`u` are the CONVERGED conditional means/modes (post pinned-γ̂
 /// re-eval); Gamma Rx-SE gating: `fit::tests::fit_glmm_gamma_sim_matches_lme4`.
-pub(crate) fn glmm_sigma_sq(family: Family, y: &[f64], mu: &[f64], u: &[f64]) -> f64 {
+/// The denominator stays the RAW `y.len()` (not `Σwᵢ`) under weighting — verified
+/// against the `fit_glmm_gamma_weighted_matches_lme4` golden, which matches lme4's
+/// `pwrss/n` with `n` the raw row count even when `weights=` is supplied.
+pub(crate) fn glmm_sigma_sq(
+    family: Family,
+    y: &[f64],
+    mu: &[f64],
+    u: &[f64],
+    prior_w: Option<&[f64]>,
+) -> f64 {
     match family {
         Family::Gamma { .. } => {
             let mut wrss = 0.0;
-            for (&yi, &mui) in y.iter().zip(mu) {
+            for (i, (&yi, &mui)) in y.iter().zip(mu).enumerate() {
                 let r = (yi - mui) / mui;
-                wrss += r * r;
+                wrss += prior_w.map_or(1.0, |w| w[i]) * r * r;
             }
             let usq: f64 = u.iter().map(|&v| v * v).sum();
             (wrss + usq) / y.len() as f64

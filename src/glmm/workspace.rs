@@ -28,6 +28,20 @@ pub struct GlmmWorkspace {
     pub nagq: u8,
     /// 4·n_primary AGQ per-cluster scratch (center loglik | node u_cj | per-node loglik | running log-sum); unused on the Laplace path
     pub agq_scratch: Vec<f64>,
+    /// FitOptions::parallel_inner, copied per fit by the fit.rs adapter (the
+    /// nb_theta pattern). Runtime gate for the parallel kernels in `parallel`
+    /// builds: when false — or in any serial build — the per-fit
+    /// ClusterRowIndex is never built, agq_deviance runs the original
+    /// node-outer loop, and the FD-Hessian grids stay serial; a batch caller
+    /// pays nothing.
+    pub parallel_inner: bool,
+    /// Per-cluster row CSR for the cluster-outer AGQ loop — rayon's
+    /// work-splitting substrate. Built once per fit in fit_glmm (cluster_ids
+    /// is fit-fixed) iff the `parallel` feature is compiled in AND
+    /// `nagq > 1 && parallel_inner`; None otherwise. Serial builds are always
+    /// node-outer: cluster-outer serially regresses many-tiny-cluster shapes
+    /// (see the build site in fit_glmm).
+    pub cluster_rows: Option<super::agq::ClusterRowIndex>,
     /// total RE columns (groupings.k_total)
     pub k: usize,
     /// fixed-effect predictors
@@ -69,6 +83,16 @@ pub struct GlmmWorkspace {
     pub z_buf: Vec<f64>,
     /// (Mu)ᵢ per iteration via GEMV; overwritten in place by the IRLS residual W·Mu + (y−p) before the RHS GEMV
     pub mu: Vec<f64>,
+    /// Per-row prior weights `wᵢ` (`FitOptions::weights`; all-1 when absent —
+    /// zero behavioral change). Semantics mirror the sparse twin
+    /// (`SparseGlmmWorkspace::prior_w`): `wᵢ·W̃ᵢ` on the working weight,
+    /// `wᵢ·devᵢ` on the deviance, `wᵢ·ρᵢ` on the score; everything downstream
+    /// (A/RHS scatter, β border, Schur, FD Hessian) reads `w`/ρ and inherits it.
+    pub(crate) prior_w: Vec<f64>,
+    /// True iff `prior_w` was filled from `FitOptions::weights`. Gates the
+    /// fused-SIMD logit fast path in `pirls.rs` (the fused kernel cannot take
+    /// per-row weights; weighted logit runs the general scalar branch).
+    pub(crate) weighted: bool,
     pub u: Vec<f64>,
     /// previous accepted PIRLS iterate, step-halving backtrack buffer (len k.max(1))
     pub u_prev: Vec<f64>,
@@ -120,13 +144,19 @@ pub struct GlmmWorkspace {
     /// max_n; #crossed nonzeros for row i (≤ G ≤ MAX_EXTRA_GROUPINGS < 256)
     pub n_cross: Vec<u8>,
     // Per-cluster CSR of C_f's nonzero crossed columns (cluster f's slice is
-    // coup_cols[coup_ptr[f]..coup_ptr[f+1]], sorted + deduped). Rebuilt once per
-    // structured PIRLS solve from cross_col/n_cross; structured_factor's Schur
-    // build walks it instead of all e columns.
+    // coup_cols[coup_ptr[f]..coup_ptr[f+1]], sorted + deduped). Rebuilt on
+    // pinning-mask transitions (see `coup_mask`) from cross_col/n_cross;
+    // structured_factor's Schur build walks it instead of all e columns.
     /// ≤ max_n · G_cap entries before dedup
     pub coup_cols: Vec<u32>,
     /// n_primary + 1 offsets
     pub coup_ptr: Vec<u32>,
+    /// θ-pinning mask (bit g = crossed grouping g has θ == 0.0) the current
+    /// coup_cols/coup_ptr CSR was built for; `None` ⇒ not built this fit. The
+    /// CSR pattern depends on the design AND this mask (build_packed_m drops
+    /// pinned groupings), so the structured deviance rebuilds only on mask
+    /// transitions. Reset to None at each fit_glmm start (mirrors u_seed).
+    pub coup_mask: Option<u32>,
     /// Cached sparse factor of the crossed Schur `S`. `Some` only on the
     /// structured crossed path with `e > 0`; built per fit by `StructuredSchur::new`
     /// after `build_z`. `None` ⇒ the dense/blocked/e=0 paths, which never touch it.
@@ -213,6 +243,22 @@ impl GlmmWorkspace {
         nagq: u8,
     ) -> Self {
         let groupings = LmmGroupings::from_cluster_spec(cluster, max_n, slope_cols);
+        Self::from_groupings(groupings, cluster.family, p, max_n, nagq)
+    }
+
+    /// Build the workspace from an already-constructed `LmmGroupings` (+ family).
+    /// The extracted tail of `for_cluster_spec` — everything past the groupings
+    /// build depends only on `(groupings, family, p, max_n, nagq)`, never on the
+    /// `ModelSpec` or `slope_cols` themselves. Split out so a per-thread FD-Hessian
+    /// worker can reconstruct a fresh, identically-sized workspace from a live one's
+    /// cloned groupings without re-threading the spec (`fd_worker_ws`).
+    pub(crate) fn from_groupings(
+        groupings: LmmGroupings,
+        family: crate::Family,
+        p: usize,
+        max_n: usize,
+        nagq: u8,
+    ) -> Self {
         let k = groupings.k_total;
         let n_theta = groupings.n_theta();
         let q = groupings.primary_q;
@@ -243,36 +289,44 @@ impl GlmmWorkspace {
         // solver) share the exact same computed θ-portion rho_begin — a pure
         // extraction, not a new derivation.
         let rho_begin = (0.1 * min_diag).min(RHO_BEGIN);
-        let config = Config {
+        // MIRRORS the joint config in `sparse::fit_glmm_sparse` — both feed
+        // through the shared `apply_campaign_overrides` tail.
+        let mut config = Config {
             rho_begin,
             rho_end: GLMM_RHO_END,
             ..Config::new(n_theta + p)
         };
+        crate::lmm::apply_campaign_overrides(&mut config, n_theta + p);
         // Stage-1 θ-only BOBYQA config: same rho_begin/rho_end schedule as the
         // joint solver above, but `npt` mirrors `sparse_lmm_seed`'s mid-model
         // rule (lmm.rs), NOT the joint solver's — the two are sized for
         // different-dimension searches and this crate's precedent for a
-        // θ-only search is `sparse_lmm_seed`.
+        // θ-only search is `sparse_lmm_seed`. MIRRORS `config1` in
+        // `fit_glmm_sparse` (sparse.rs) — change together. Both feed through
+        // the shared `apply_campaign_overrides` tail.
         let npt_stage1 = if n_theta >= 3 {
             (3 * n_theta).div_ceil(2) + 1
         } else {
             2 * n_theta + 1
         };
-        let config_stage1 = Config {
+        let mut config_stage1 = Config {
             rho_begin,
             rho_end: GLMM_RHO_END,
             npt: npt_stage1,
             ..Config::new(n_theta)
         };
+        crate::lmm::apply_campaign_overrides(&mut config_stage1, n_theta);
         // θ-only incumbent buffer, seeded from the θ-prefix of the joint start.
         let params_stage1 = params[..n_theta].to_vec();
 
         GlmmWorkspace {
             groupings,
-            family: cluster.family,
+            family,
             nb_theta: f64::NAN,
             nagq,
             agq_scratch: vec![0.0; (4 * n_primary).max(1)],
+            parallel_inner: false,
+            cluster_rows: None,
             k,
             p,
             n_theta,
@@ -337,6 +391,8 @@ impl GlmmWorkspace {
             m_buf: vec![0.0; max_n * q],
             z_buf: vec![0.0; max_n * (q - 1)],
             mu: vec![0.0; max_n],
+            prior_w: vec![1.0; max_n],
+            weighted: false,
             u: vec![0.0; k.max(1)],
             u_prev: vec![0.0; k.max(1)],
             u_seed: vec![0.0; k.max(1)],
@@ -363,6 +419,7 @@ impl GlmmWorkspace {
             n_cross: vec![0u8; max_n.max(1)],
             coup_cols: vec![0u32; (max_n * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
             coup_ptr: vec![0u32; n_primary + 1],
+            coup_mask: None,
             structured_schur: None,
             force_dense_schur: false,
             xtwx: Mat::zeros(p, p),
@@ -393,6 +450,52 @@ impl GlmmWorkspace {
             pirls_tol_override: None,
         }
     }
+}
+
+/// Fresh workspace for one FD-Hessian worker thread: an independently-sized clone
+/// of `src` carrying everything an FD deviance eval reads or mutates, so a rayon
+/// grid thread never aliases the live workspace. Bit-identity rests on `fd_eval`
+/// restoring `params` from `fd_saved` and seeding û from the frozen `u_seed` every
+/// eval — each grid cell is a pure function of `(fd_saved, fd_steps, u_seed,
+/// design)`, identical whichever workspace computes it.
+///
+/// Construction reuses `from_groupings` (fresh scratch, correctly sized) on a
+/// CLONE of `src`'s groupings, then copies the load-bearing state the fresh
+/// constructor zeroes: the built design (`z`, `z_buf`), the structured crossed
+/// factor (rebuilt as its own per-thread scratch — see `StructuredSchur::
+/// clone_scratch`), and the FD seed state `fd_hessian_cov` set before the grid.
+/// A missed field is a silent aliasing bug; the knob-on-vs-off bit-identity test
+/// in `glmm/tests.rs` is the enforcement.
+///
+/// `coup_mask` is deliberately left `None` (the fresh constructor's value): the
+/// worker rebuilds its own coupling CSR on the first structured eval, matching the
+/// serial path's per-fit rebuild. `nb_theta`/`force_dense_schur` are copied because
+/// the deviance reads them; `cluster_rows` stays `None` — on the AGQ path the
+/// node-outer fallback it triggers is bit-identical to the cluster-outer loop.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
+    let mut w =
+        GlmmWorkspace::from_groupings(src.groupings.clone(), src.family, src.p, n, src.nagq);
+    // Built design (build_z / fill_z_f64 output — constant across the FD grid).
+    // src may be sized for max_n >= n (reusable-workspace surface); only the first
+    // n rows are live, and fill_z_f64 fills row-major, so a prefix slice is correct.
+    w.z = src.z.clone();
+    let len = w.z_buf.len();
+    w.z_buf.copy_from_slice(&src.z_buf[..len]);
+    w.prior_w[..n].copy_from_slice(&src.prior_w[..n]);
+    w.weighted = src.weighted;
+    // Crossed-Schur factor: fresh per-thread scratch over the same symbolic pattern.
+    w.structured_schur = src.structured_schur.as_ref().map(|ss| ss.clone_scratch());
+    w.nb_theta = src.nb_theta;
+    w.force_dense_schur = src.force_dense_schur;
+    // FD seed state (fd_hessian_cov sets these before the grid).
+    w.params.copy_from_slice(&src.params);
+    w.fd_saved.copy_from_slice(&src.fd_saved);
+    w.fd_steps.copy_from_slice(&src.fd_steps);
+    w.u_seed.copy_from_slice(&src.u_seed);
+    w.warm_seed_active = src.warm_seed_active;
+    w.pirls_tol_override = src.pirls_tol_override;
+    w
 }
 
 // Kernel — written as borrow-split FREE fns so the BOBYQA closure in fit_glmm can call
@@ -541,6 +644,41 @@ impl StructuredSchur {
             solve_mem,
             e,
         })
+    }
+
+    /// Per-thread clone for an FD-Hessian worker: shares nothing mutable with
+    /// `self`. The symbolic pattern (`axx`) is copied and RE-factorized here rather
+    /// than cloned — `SymbolicCholesky` is not `Clone`, but `factorize_symbolic_
+    /// cholesky` on the same pattern with the same (deterministic AMD) ordering
+    /// reproduces it bit-for-bit, so the per-eval numeric refactor lands on the
+    /// identical elimination tree as `self`'s. `l_values`/scratch are fresh (their
+    /// contents are overwritten every refactor). Mirrors `new`'s tail exactly.
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    pub(crate) fn clone_scratch(&self) -> StructuredSchur {
+        let axx = self.axx.clone();
+        let symbolic = factorize_symbolic_cholesky(
+            axx.symbolic(),
+            Side::Lower,
+            Default::default(), // AMD fill-reducing ordering (deterministic)
+            CholeskySymbolicParams {
+                supernodal_flop_ratio_threshold: SupernodalThreshold::FORCE_SIMPLICIAL,
+                ..Default::default()
+            },
+        )
+        .expect("Schur symbolic factorization");
+        let l_values = vec![0.0f64; symbolic.len_val()];
+        let fac_mem = MemBuffer::new(
+            symbolic.factorize_numeric_llt_scratch::<f64>(Par::Seq, Spec::default()),
+        );
+        let solve_mem = MemBuffer::new(symbolic.solve_in_place_scratch::<f64>(1, Par::Seq));
+        StructuredSchur {
+            symbolic,
+            axx,
+            l_values,
+            fac_mem,
+            solve_mem,
+            e: self.e,
+        }
     }
 }
 

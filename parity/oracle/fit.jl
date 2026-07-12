@@ -1,5 +1,5 @@
 #!/usr/bin/env julia
-# MixedModels.jl reference fits over the parity datasets -> results/mixedmodels/<dataset>.json.
+# MixedModels.jl reference fits over the parity datasets -> results/mixedmodels_{empirical,simulated}/<dataset>.json.
 #
 # THE ORACLE IS SACRED. These JSONs are a frozen reference, the second of the two
 # engines glmm is later held to. Never edit a result to make a downstream engine
@@ -10,18 +10,28 @@
 
 using MixedModels, CSV, DataFrames, JSON3, Statistics, LinearAlgebra
 
-const PARITY = normpath(joinpath(@__DIR__, ".."))
+# PARITY_SUITE_DIR: suite-directory override (mirrors fit.R) -- manifest, data
+# and results resolve under it; unset = this script's own parity/ dir.
+const PARITY = let s = get(ENV, "PARITY_SUITE_DIR", "")
+    isempty(s) ? normpath(joinpath(@__DIR__, "..")) : normpath(s)
+end
 # Timing loop; first pass (JIT warm-up) discarded, median of rest reported. 10 runs
 # (was 100): multi-second GLMM rungs made 100 repeats cost ~half an hour here; each
 # result JSON records its own n_runs, so old 100-run files stay self-describing.
 const N_RUNS = 10
 
 manifest = JSON3.read(read(joinpath(PARITY, "manifest.json"), String))
-out_dir = joinpath(PARITY, "results", "mixedmodels")
-mkpath(out_dir)
+data_dir_of(spec) = joinpath(PARITY, String(spec.source) == "sim" ? "data_simulated" : "data_empirical")
+out_dir_of(spec)  = joinpath(PARITY, "results",
+                             string("mixedmodels_", String(spec.source) == "sim" ? "simulated" : "empirical"))
+mkpath(joinpath(PARITY, "results", "mixedmodels_empirical"))
+mkpath(joinpath(PARITY, "results", "mixedmodels_simulated"))
 
 function read_dataset(spec)
-    df = CSV.read(joinpath(PARITY, "data", string(spec.name, ".csv")), DataFrame)
+    # `data` field: CSV to read when it differs from the rung name (mirrors fit.R) --
+    # a re-linked rung (cbpp_probit) reuses the committed dataset byte-for-byte.
+    src_name = haskey(spec, :data) ? spec.data : spec.name
+    df = CSV.read(joinpath(data_dir_of(spec), string(src_name, ".csv")), DataFrame)
     # Mirror fit.R: coerce grouping + categorical fixed-effect columns to String so
     # MixedModels treats them as categorical with DummyCoding; sorted-level base =
     # first level matches R's treatment-contrast base (asserted in compare.R).
@@ -45,9 +55,20 @@ end
 function fit_thunk(spec, df)
     f = eval(Meta.parse(String(spec.jl_formula)))
     fam = String(spec.family)
+    # Prior weights (weights suite `weights_col` rungs): MixedModels' wts=
+    # kwarg, the counterpart of lme4's weights=. Distinct from the
+    # aggregated-binomial `weights` field handled in the binomial branch.
+    wcol = haskey(spec, :weights_col) ? Float64.(df[!, Symbol(spec.weights_col)]) : nothing
     if fam == "gaussian"
-        () -> fit(MixedModel, f, df; REML = spec.reml === true, progress = false)
+        wcol === nothing ?
+            (() -> fit(MixedModel, f, df; REML = spec.reml === true, progress = false)) :
+            (() -> fit(MixedModel, f, df; REML = spec.reml === true, wts = wcol, progress = false))
     elseif fam == "binomial"
+        # `link` field: non-canonical link override (cbpp_probit, mirrors fit.R).
+        # Absent = the canonical logit, the pre-existing behavior.
+        lnk = haskey(spec, :link) ? String(spec.link) : "logit"
+        L = lnk == "logit" ? LogitLink() :
+            lnk == "probit" ? ProbitLink() : error("unsupported binomial link: $lnk")
         # Aggregated binomial (cbind(successes, failures) ~ ...): synthesize the
         # proportion response from the manifest's weight column, as before. Plain
         # per-row binary binomial (VerbAgg: y in {0,1}, no `weights` field) has no
@@ -55,12 +76,18 @@ function fit_thunk(spec, df)
         if haskey(spec, :weights)
             w = Float64.(df[!, Symbol(spec.weights)])
             df.prop = Float64.(df.incidence) ./ w
-            () -> fit(MixedModel, f, df, Binomial(); wts = w, progress = false)
+            () -> fit(MixedModel, f, df, Binomial(), L; wts = w, progress = false)
         else
-            () -> fit(MixedModel, f, df, Binomial(); progress = false)
+            () -> fit(MixedModel, f, df, Binomial(), L; progress = false)
         end
     elseif fam == "poisson"
-        () -> fit(MixedModel, f, df, Poisson(); progress = false)
+        wcol === nothing ?
+            (() -> fit(MixedModel, f, df, Poisson(); progress = false)) :
+            (() -> fit(MixedModel, f, df, Poisson(); wts = wcol, progress = false))
+    elseif fam == "gamma"
+        # Explicit LogLink: the manifest's gamma rungs pin link "log" (Gamma's
+        # canonical inverse link is unstable on these designs, mirroring fit.R).
+        () -> fit(MixedModel, f, df, Gamma(), LogLink(); progress = false)
     else
         error("unsupported family: $fam")
     end
@@ -204,11 +231,13 @@ function fit_one(spec)
            rung = spec.rung,
            converged = m.optsum.returnvalue in OK_RETURN,
            singular = issingular(m),
+           optimizer = string(m.optsum.optimizer),
+           n_eval = m.optsum.feval,
            coef_names = collect(coefnames(m)),   # contrast-coding assertion vs lme4
            estimates = est,
            timing = time_one(spec, make_fit))
 
-    open(joinpath(out_dir, string(spec.name, ".json")), "w") do io
+    open(joinpath(out_dir_of(spec), string(spec.name, ".json")), "w") do io
         emit_jsonlite(io, res, 0)
         println(io)                              # trailing newline, matching R's write()
     end
@@ -229,10 +258,17 @@ specs = isempty(only_ds) ? collect(manifest.datasets) :
 # sim_binomial_slope_crossed (rung 18): the pinned MixedModels (v5.7.0) cannot
 # CONSTRUCT this shape — PosDefException at construction, before PIRLS runs; a
 # package limitation confirmed independent of the data (see parity/README.md,
-# "2-way gate"). results/mixedmodels/<name>.json is intentionally absent and
-# compare.R reports the rung as n/a for this engine.
+# "2-way gate"). results/mixedmodels_{empirical,simulated}/<name>.json is
+# intentionally absent and compare.R reports the rung as n/a for this engine.
 const JL_CANNOT_FIT = ("sim_binomial_slope_crossed",)
 for spec in specs
+    # No jl_formula = "not a Julia rung" (weights suite fixed-only and R-only
+    # rungs omit the field): MixedModels does not fit fixed-only models and
+    # GLM.jl is not a project dependency, so these rungs are lme4-only.
+    if !haskey(spec, :jl_formula)
+        println("mixedmodels  $(rpad(spec.name,12))  SKIPPED -- no jl_formula (R-only rung)")
+        continue
+    end
     if String(spec.name) in JL_CANNOT_FIT
         println("mixedmodels  $(rpad(spec.name,12))  SKIPPED -- MixedModels cannot construct this shape (see comment above)")
         continue

@@ -1,0 +1,2507 @@
+<meta charset="utf-8"><title>GLMM grid report</title><style>body{font-family:system-ui,sans-serif;margin:1.5em;font-size:14px}table{border-collapse:collapse;margin:0 0 2em}td,th{border:1px solid #bbb;padding:3px 8px;text-align:left;white-space:nowrap}th{background:#f0f0f0} td b{font-weight:600}.ev{color:#666;font-size:11px}.glmm-fail{background:hsl(0,75%,80%)} .mm-fail{background:hsl(215,75%,85%)}.both-fail{background:#ddd;color:#666}.mismatch{outline:2px dashed #c00;outline-offset:-2px}.grp{border-left:3px solid #888}.legend span{padding:2px 8px;margin-right:6px;border:1px solid #bbb}h2{margin:1.2em 0 .3em} .note{color:#555;max-width:70em}</style><h1>Optimizer-grid Study A &mdash; glmm vs MixedModels.jl (run 2026-07-11)</h1><p class="note">Cell: top line glmm, bottom line MixedModels &mdash; per-fit wall time and optimizer eval count. Color = wall-time ratio glmm/MM (hover for exact wall + eval ratios). Timing is the aim; eval ratio is the optimizer-side diagnostic. </p><p class="note"><b>Environment:</b> Intel Core Ultra 7 265H (Arrow Lake-H), 32&thinsp;GB RAM; both engines pinned to P-core 1 (<code>taskset -c 1</code>); clock locked for the whole run: governor <code>performance</code>, turbo off (<code>no_turbo=1</code>), P-cores fixed at the 2.2&thinsp;GHz base. Timings are only ever produced on this locked configuration &mdash; unlocked passes are excluded by protocol. Julia 1.12.6 / MixedModels.jl per the pinned parity env.</p><p class="legend"><span style="background:hsl(120,75%,85%)">glmm &ge;2&times; faster</span><span style="background:hsl(60,75%,85%)">even</span><span style="background:hsl(30,75%,85%)">glmm &ge;2&times; slower</span><span style="background:hsl(0,75%,80%)">glmm failed</span><span style="background:hsl(215,75%,85%)">only glmm converged</span><span style="background:#ddd">both failed</span><span style="outline:2px dashed #c00">&#9888; &beta; mismatch</span></p><p><b>Overall</b> (477 jointly-ok of 510 cells): wall ratio median 0.839 / p90 2.98; eval ratio median 1.094 / p90 1.58.</p>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="3" class="grp">int1 <small>(n_theta 1)</small></th>
+<th colspan="3" class="grp">int2x <small>(n_theta 2)</small></th>
+<th colspan="3" class="grp">nest2 <small>(n_theta 2)</small></th>
+<th colspan="1" class="grp">nest3 <small>(n_theta 3)</small></th>
+</tr>
+<tr>
+<th class="grp">binomial</th>
+<th>gaussian</th>
+<th>poisson</th>
+<th class="grp">binomial</th>
+<th>gaussian</th>
+<th>poisson</th>
+<th class="grp">binomial</th>
+<th>gaussian</th>
+<th>poisson</th>
+<th class="grp">gaussian</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int1_g300p5_bal_base
+wall ratio &times;13.36 / eval ratio &times;1.31"><b>1.7&thinsp;ms</b> <span class="ev">17&thinsp;ev</span><br>0.1&thinsp;ms <span class="ev">13&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(56,75%,85%)" title="lmm_int2x_g300p5_bal_base
+wall ratio &times;1.19 / eval ratio &times;0.93"><b>0.8&thinsp;ms</b> <span class="ev">27&thinsp;ev</span><br>0.6&thinsp;ms <span class="ev">29&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(47,75%,85%)" title="lmm_nest2_g300p5_bal_base
+wall ratio &times;1.85 / eval ratio &times;0.93"><b>0.8&thinsp;ms</b> <span class="ev">28&thinsp;ev</span><br>0.4&thinsp;ms <span class="ev">30&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(87,75%,85%)" title="lmm_nest3_g300p5_bal_base
+wall ratio &times;0.53 / eval ratio &times;0.88"><b>39.4&thinsp;ms</b> <span class="ev">36&thinsp;ev</span><br>74.3&thinsp;ms <span class="ev">41&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p5 bal/lowsnr</th>
+<td></td>
+<td class="ok" style="background:hsl(34,75%,85%)" title="lmm_int1_g300p5_bal_lowsnr
+wall ratio &times;3.29 / eval ratio &times;1.07"><b>0.3&thinsp;ms</b> <span class="ev">16&thinsp;ev</span><br>0.1&thinsp;ms <span class="ev">15&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 bal/nearzero</th>
+<td></td>
+<td class="ok" style="background:hsl(33,75%,85%)" title="lmm_int1_g300p5_bal_nearzero
+wall ratio &times;3.41 / eval ratio &times;0.89"><b>0.3&thinsp;ms</b> <span class="ev">16&thinsp;ev</span><br>0.1&thinsp;ms <span class="ev">18&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 single/base</th>
+<td></td>
+<td class="ok" style="background:hsl(35,75%,85%)" title="lmm_int1_g300p5_single_base
+wall ratio &times;3.12 / eval ratio &times;1.00"><b>0.4&thinsp;ms</b> <span class="ev">16&thinsp;ev</span><br>0.1&thinsp;ms <span class="ev">16&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 skew/base</th>
+<td></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int1_g300p5_skew_base
+wall ratio &times;42.71 / eval ratio &times;0.83"><b>4.2&thinsp;ms</b> <span class="ev">15&thinsp;ev</span><br>0.1&thinsp;ms <span class="ev">18&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/base</th>
+<td class="ok" style="background:hsl(86,75%,85%)" title="binb_int1_g300p20_bal_base
+wall ratio &times;0.55 / eval ratio &times;1.27"><b>1.8&thinsp;ms</b> <span class="ev">38&thinsp;ev</span><br>3.2&thinsp;ms <span class="ev">30&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int1_g300p20_bal_base
+wall ratio &times;4.18 / eval ratio &times;1.33"><b>0.3&thinsp;ms</b> <span class="ev">20&thinsp;ev</span><br>0.1&thinsp;ms <span class="ev">15&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(79,75%,85%)" title="pois_int1_g300p20_bal_base
+wall ratio &times;0.65 / eval ratio &times;1.17"><b>4.2&thinsp;ms</b> <span class="ev">49&thinsp;ev</span><br>6.5&thinsp;ms <span class="ev">42&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(89,75%,85%)" title="binb_int2x_g300p20_bal_base
+wall ratio &times;0.51 / eval ratio &times;1.10"><b>4.1&thinsp;ms</b> <span class="ev">53&thinsp;ev</span><br>8.1&thinsp;ms <span class="ev">48&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(46,75%,85%)" title="lmm_int2x_g300p20_bal_base
+wall ratio &times;1.87 / eval ratio &times;1.09"><b>0.5&thinsp;ms</b> <span class="ev">36&thinsp;ev</span><br>0.3&thinsp;ms <span class="ev">33&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(84,75%,85%)" title="pois_int2x_g300p20_bal_base
+wall ratio &times;0.58 / eval ratio &times;1.22"><b>10.4&thinsp;ms</b> <span class="ev">88&thinsp;ev</span><br>17.9&thinsp;ms <span class="ev">72&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(93,75%,85%)" title="binb_nest2_g300p20_bal_base
+wall ratio &times;0.46 / eval ratio &times;0.76"><b>4.0&thinsp;ms</b> <span class="ev">48&thinsp;ev</span><br>8.6&thinsp;ms <span class="ev">63&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(45,75%,85%)" title="lmm_nest2_g300p20_bal_base
+wall ratio &times;1.98 / eval ratio &times;1.06"><b>0.5&thinsp;ms</b> <span class="ev">33&thinsp;ev</span><br>0.3&thinsp;ms <span class="ev">31&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(70,75%,85%)" title="pois_nest2_g300p20_bal_base
+wall ratio &times;0.79 / eval ratio &times;1.23"><b>10.5&thinsp;ms</b> <span class="ev">79&thinsp;ev</span><br>13.3&thinsp;ms <span class="ev">64&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(50,75%,85%)" title="lmm_nest3_g300p20_bal_base
+wall ratio &times;1.61 / eval ratio &times;1.00"><b>8.1&thinsp;ms</b> <span class="ev">48&thinsp;ev</span><br>5.1&thinsp;ms <span class="ev">48&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p20 bal/lowmu</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="ok" style="background:hsl(80,75%,85%)" title="pois_int2x_g300p20_bal_lowmu
+wall ratio &times;0.63 / eval ratio &times;1.02"><b>8.6&thinsp;ms</b> <span class="ev">65&thinsp;ev</span><br>13.7&thinsp;ms <span class="ev">64&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="ok" style="background:hsl(80,75%,85%)" title="pois_nest2_g300p20_bal_lowmu
+wall ratio &times;0.63 / eval ratio &times;0.83"><b>8.8&thinsp;ms</b> <span class="ev">62&thinsp;ev</span><br>14.1&thinsp;ms <span class="ev">75&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/lowsnr</th>
+<td></td>
+<td class="ok" style="background:hsl(31,75%,85%)" title="lmm_int1_g300p20_bal_lowsnr
+wall ratio &times;3.82 / eval ratio &times;1.05"><b>0.3&thinsp;ms</b> <span class="ev">21&thinsp;ev</span><br>0.1&thinsp;ms <span class="ev">20&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(49,75%,85%)" title="lmm_int2x_g300p20_bal_lowsnr
+wall ratio &times;1.68 / eval ratio &times;0.97"><b>0.5&thinsp;ms</b> <span class="ev">35&thinsp;ev</span><br>0.3&thinsp;ms <span class="ev">36&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/nearzero</th>
+<td class="ok" style="background:hsl(111,75%,85%)" title="binb_int1_g300p20_bal_nearzero
+wall ratio &times;0.30 / eval ratio &times;0.90"><b>1.2&thinsp;ms</b> <span class="ev">35&thinsp;ev</span><br>4.0&thinsp;ms <span class="ev">39&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int1_g300p20_bal_nearzero
+wall ratio &times;4.92 / eval ratio &times;1.33"><b>0.3&thinsp;ms</b> <span class="ev">16&thinsp;ev</span><br>0.1&thinsp;ms <span class="ev">12&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(95,75%,85%)" title="binb_int2x_g300p20_bal_nearzero
+wall ratio &times;0.44 / eval ratio &times;1.00"><b>3.7&thinsp;ms</b> <span class="ev">49&thinsp;ev</span><br>8.4&thinsp;ms <span class="ev">49&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(48,75%,85%)" title="lmm_int2x_g300p20_bal_nearzero
+wall ratio &times;1.78 / eval ratio &times;0.94"><b>0.5&thinsp;ms</b> <span class="ev">31&thinsp;ev</span><br>0.3&thinsp;ms <span class="ev">33&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(90,75%,85%)" title="pois_int2x_g300p20_bal_nearzero
+wall ratio &times;0.50 / eval ratio &times;0.80"><b>7.6&thinsp;ms</b> <span class="ev">55&thinsp;ev</span><br>15.2&thinsp;ms <span class="ev">69&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(75,75%,85%)" title="bina_nest2_g300p20_bal_nearzero
+wall ratio &times;0.71 / eval ratio &times;0.86"><b>9.3&thinsp;ms</b> <span class="ev">55&thinsp;ev</span><br>13.1&thinsp;ms <span class="ev">64&thinsp;ev</span></td>
+<td></td>
+<td class="ok" style="background:hsl(76,75%,85%)" title="pois_nest2_g300p20_bal_nearzero
+wall ratio &times;0.68 / eval ratio &times;0.95"><b>9.0&thinsp;ms</b> <span class="ev">62&thinsp;ev</span><br>13.1&thinsp;ms <span class="ev">65&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/rare</th>
+<td class="ok" style="background:hsl(120,75%,85%)" title="binb_int1_g300p20_bal_rare
+wall ratio &times;0.24 / eval ratio &times;1.33"><b>2.0&thinsp;ms</b> <span class="ev">73&thinsp;ev</span><br>8.3&thinsp;ms <span class="ev">55&thinsp;ev</span></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(86,75%,85%)" title="binb_int2x_g300p20_bal_rare
+wall ratio &times;0.55 / eval ratio &times;1.46"><b>4.7&thinsp;ms</b> <span class="ev">70&thinsp;ev</span><br>8.6&thinsp;ms <span class="ev">48&thinsp;ev</span></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(73,75%,85%)" title="bina_nest2_g300p20_bal_rare
+wall ratio &times;0.75 / eval ratio &times;1.15"><b>9.5&thinsp;ms</b> <span class="ev">61&thinsp;ev</span><br>12.7&thinsp;ms <span class="ev">53&thinsp;ev</span></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 single/base</th>
+<td></td>
+<td class="ok" style="background:hsl(33,75%,85%)" title="lmm_int1_g300p20_single_base
+wall ratio &times;3.50 / eval ratio &times;1.12"><b>0.4&thinsp;ms</b> <span class="ev">18&thinsp;ev</span><br>0.1&thinsp;ms <span class="ev">16&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(52,75%,85%)" title="lmm_int2x_g300p20_single_base
+wall ratio &times;1.46 / eval ratio &times;0.96"><b>1.0&thinsp;ms</b> <span class="ev">27&thinsp;ev</span><br>0.7&thinsp;ms <span class="ev">28&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 skew/base</th>
+<td class="ok" style="background:hsl(111,75%,85%)" title="binb_int1_g300p20_skew_base
+wall ratio &times;0.31 / eval ratio &times;0.95"><b>1.3&thinsp;ms</b> <span class="ev">39&thinsp;ev</span><br>4.2&thinsp;ms <span class="ev">41&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(34,75%,85%)" title="lmm_int1_g300p20_skew_base
+wall ratio &times;3.29 / eval ratio &times;0.71"><b>0.3&thinsp;ms</b> <span class="ev">17&thinsp;ev</span><br>0.1&thinsp;ms <span class="ev">24&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(102,75%,85%)" title="binb_int2x_g300p20_skew_base
+wall ratio &times;0.38 / eval ratio &times;0.86"><b>3.5&thinsp;ms</b> <span class="ev">49&thinsp;ev</span><br>9.3&thinsp;ms <span class="ev">57&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(47,75%,85%)" title="lmm_int2x_g300p20_skew_base
+wall ratio &times;1.80 / eval ratio &times;0.97"><b>0.5&thinsp;ms</b> <span class="ev">36&thinsp;ev</span><br>0.3&thinsp;ms <span class="ev">37&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(93,75%,85%)" title="pois_int2x_g300p20_skew_base
+wall ratio &times;0.47 / eval ratio &times;0.77"><b>7.5&thinsp;ms</b> <span class="ev">55&thinsp;ev</span><br>16.1&thinsp;ms <span class="ev">71&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(74,75%,85%)" title="bina_nest2_g300p20_skew_base
+wall ratio &times;0.73 / eval ratio &times;0.95"><b>10.5&thinsp;ms</b> <span class="ev">70&thinsp;ev</span><br>14.4&thinsp;ms <span class="ev">74&thinsp;ev</span></td>
+<td></td>
+<td class="ok" style="background:hsl(74,75%,85%)" title="pois_nest2_g300p20_skew_base
+wall ratio &times;0.72 / eval ratio &times;1.38"><b>11.6&thinsp;ms</b> <span class="ev">91&thinsp;ev</span><br>16.1&thinsp;ms <span class="ev">66&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int1_g3000p5_bal_base
+wall ratio &times;6.39 / eval ratio &times;0.95"><b>2.5&thinsp;ms</b> <span class="ev">18&thinsp;ev</span><br>0.4&thinsp;ms <span class="ev">19&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(67,75%,85%)" title="lmm_int2x_g3000p5_bal_base
+wall ratio &times;0.85 / eval ratio &times;1.06"><b>3.6&thinsp;ms</b> <span class="ev">35&thinsp;ev</span><br>4.3&thinsp;ms <span class="ev">33&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(44,75%,85%)" title="lmm_nest2_g3000p5_bal_base
+wall ratio &times;2.12 / eval ratio &times;0.75"><b>6.2&thinsp;ms</b> <span class="ev">27&thinsp;ev</span><br>2.9&thinsp;ms <span class="ev">36&thinsp;ev</span></td>
+<td></td>
+<td class="grp mm-fail" title="lmm_nest3_g3000p5_bal_base">glmm 40.3&thinsp;ms &middot; 41ev<br>MM.jl: timeout</td>
+</tr>
+<tr><th>g3000p5 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(75,75%,85%)" title="lmm_int2x_g3000p5_bal_lowsnr
+wall ratio &times;0.71 / eval ratio &times;0.82"><b>3.6&thinsp;ms</b> <span class="ev">33&thinsp;ev</span><br>5.1&thinsp;ms <span class="ev">40&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 bal/nearzero</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(64,75%,85%)" title="lmm_int2x_g3000p5_bal_nearzero
+wall ratio &times;0.90 / eval ratio &times;1.50"><b>3.8&thinsp;ms</b> <span class="ev">48&thinsp;ev</span><br>4.2&thinsp;ms <span class="ev">32&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 single/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(35,75%,85%)" title="lmm_int2x_g3000p5_single_base
+wall ratio &times;3.13 / eval ratio &times;0.77"><b>10.4&thinsp;ms</b> <span class="ev">33&thinsp;ev</span><br>3.3&thinsp;ms <span class="ev">43&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 skew/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(50,75%,85%)" title="lmm_int2x_g3000p5_skew_base
+wall ratio &times;1.57 / eval ratio &times;0.86"><b>6.6&thinsp;ms</b> <span class="ev">36&thinsp;ev</span><br>4.2&thinsp;ms <span class="ev">42&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="ok" style="background:hsl(99,75%,85%)" title="binb_int1_g3000p20_bal_base
+wall ratio &times;0.41 / eval ratio &times;0.89"><b>12.0&thinsp;ms</b> <span class="ev">33&thinsp;ev</span><br>29.5&thinsp;ms <span class="ev">37&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int1_g3000p20_bal_base
+wall ratio &times;11.91 / eval ratio &times;0.76"><b>2.3&thinsp;ms</b> <span class="ev">19&thinsp;ev</span><br>0.2&thinsp;ms <span class="ev">25&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(89,75%,85%)" title="pois_int1_g3000p20_bal_base
+wall ratio &times;0.51 / eval ratio &times;0.63"><b>36.6&thinsp;ms</b> <span class="ev">36&thinsp;ev</span><br>71.6&thinsp;ms <span class="ev">57&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(60,75%,85%)" title="binb_int2x_g3000p20_bal_base
+wall ratio &times;1.00 / eval ratio &times;1.02"><b>59.4&thinsp;ms</b> <span class="ev">53&thinsp;ev</span><br>59.4&thinsp;ms <span class="ev">52&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(37,75%,85%)" title="lmm_int2x_g3000p20_bal_base
+wall ratio &times;2.86 / eval ratio &times;1.24"><b>3.7&thinsp;ms</b> <span class="ev">41&thinsp;ev</span><br>1.3&thinsp;ms <span class="ev">33&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(79,75%,85%)" title="pois_int2x_g3000p20_bal_base
+wall ratio &times;0.65 / eval ratio &times;0.64"><b>116.2&thinsp;ms</b> <span class="ev">65&thinsp;ev</span><br>178.6&thinsp;ms <span class="ev">101&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(51,75%,85%)" title="binb_nest2_g3000p20_bal_base
+wall ratio &times;1.49 / eval ratio &times;0.94"><b>83.8&thinsp;ms</b> <span class="ev">48&thinsp;ev</span><br>56.2&thinsp;ms <span class="ev">51&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_nest2_g3000p20_bal_base
+wall ratio &times;5.11 / eval ratio &times;1.31"><b>4.2&thinsp;ms</b> <span class="ev">38&thinsp;ev</span><br>0.8&thinsp;ms <span class="ev">29&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(60,75%,85%)" title="pois_nest2_g3000p20_bal_base
+wall ratio &times;1.00 / eval ratio &times;0.85"><b>129.2&thinsp;ms</b> <span class="ev">55&thinsp;ev</span><br>129.4&thinsp;ms <span class="ev">65&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(120,75%,85%)" title="lmm_nest3_g3000p20_bal_base
+wall ratio &times;0.011 / eval ratio &times;1.39"><b>24.6&thinsp;ms</b> <span class="ev">53&thinsp;ev</span><br>2.22&thinsp;s <span class="ev">38&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p20 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(51,75%,85%)" title="lmm_int2x_g3000p20_bal_lowsnr
+wall ratio &times;1.54 / eval ratio &times;0.48"><b>3.7&thinsp;ms</b> <span class="ev">30&thinsp;ev</span><br>2.4&thinsp;ms <span class="ev">63&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(37,75%,85%)" title="lmm_nest2_g3000p20_bal_lowsnr
+wall ratio &times;2.90 / eval ratio &times;0.61"><b>3.8&thinsp;ms</b> <span class="ev">28&thinsp;ev</span><br>1.3&thinsp;ms <span class="ev">46&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/nearzero</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(41,75%,85%)" title="lmm_int2x_g3000p20_bal_nearzero
+wall ratio &times;2.42 / eval ratio &times;1.10"><b>3.7&thinsp;ms</b> <span class="ev">44&thinsp;ev</span><br>1.5&thinsp;ms <span class="ev">40&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(50,75%,85%)" title="binb_nest2_g3000p20_bal_nearzero
+wall ratio &times;1.56 / eval ratio &times;0.94"><b>77.7&thinsp;ms</b> <span class="ev">50&thinsp;ev</span><br>49.8&thinsp;ms <span class="ev">53&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_nest2_g3000p20_bal_nearzero
+wall ratio &times;3.96 / eval ratio &times;0.84"><b>4.0&thinsp;ms</b> <span class="ev">31&thinsp;ev</span><br>1.0&thinsp;ms <span class="ev">37&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/rare</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(55,75%,85%)" title="binb_nest2_g3000p20_bal_rare
+wall ratio &times;1.26 / eval ratio &times;1.04"><b>88.8&thinsp;ms</b> <span class="ev">58&thinsp;ev</span><br>70.5&thinsp;ms <span class="ev">56&thinsp;ev</span></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 single/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(50,75%,85%)" title="lmm_int2x_g3000p20_single_base
+wall ratio &times;1.61 / eval ratio &times;1.07"><b>7.6&thinsp;ms</b> <span class="ev">31&thinsp;ev</span><br>4.7&thinsp;ms <span class="ev">29&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(35,75%,85%)" title="lmm_nest2_g3000p20_single_base
+wall ratio &times;3.11 / eval ratio &times;1.00"><b>6.7&thinsp;ms</b> <span class="ev">26&thinsp;ev</span><br>2.2&thinsp;ms <span class="ev">26&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 skew/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(32,75%,85%)" title="lmm_int2x_g3000p20_skew_base
+wall ratio &times;3.68 / eval ratio &times;1.13"><b>4.5&thinsp;ms</b> <span class="ev">35&thinsp;ev</span><br>1.2&thinsp;ms <span class="ev">31&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(54,75%,85%)" title="binb_nest2_g3000p20_skew_base
+wall ratio &times;1.30 / eval ratio &times;0.80"><b>83.7&thinsp;ms</b> <span class="ev">48&thinsp;ev</span><br>64.2&thinsp;ms <span class="ev">60&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_nest2_g3000p20_skew_base
+wall ratio &times;5.04 / eval ratio &times;1.00"><b>3.9&thinsp;ms</b> <span class="ev">32&thinsp;ev</span><br>0.8&thinsp;ms <span class="ev">32&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/base</th>
+<td class="ok" style="background:hsl(104,75%,85%)" title="binb_int1_g3000p100_bal_base
+wall ratio &times;0.37 / eval ratio &times;1.06"><b>12.5&thinsp;ms</b> <span class="ev">50&thinsp;ev</span><br>34.2&thinsp;ms <span class="ev">47&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int1_g3000p100_bal_base
+wall ratio &times;24.44 / eval ratio &times;1.50"><b>2.1&thinsp;ms</b> <span class="ev">18&thinsp;ev</span><br>0.1&thinsp;ms <span class="ev">12&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(67,75%,85%)" title="pois_int1_g3000p100_bal_base
+wall ratio &times;0.85 / eval ratio &times;0.95"><b>42.3&thinsp;ms</b> <span class="ev">52&thinsp;ev</span><br>49.5&thinsp;ms <span class="ev">55&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(84,75%,85%)" title="binb_int2x_g3000p100_bal_base
+wall ratio &times;0.57 / eval ratio &times;0.97"><b>38.7&thinsp;ms</b> <span class="ev">59&thinsp;ev</span><br>67.5&thinsp;ms <span class="ev">61&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int2x_g3000p100_bal_base
+wall ratio &times;7.46 / eval ratio &times;1.35"><b>3.2&thinsp;ms</b> <span class="ev">54&thinsp;ev</span><br>0.4&thinsp;ms <span class="ev">40&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(69,75%,85%)" title="pois_int2x_g3000p100_bal_base
+wall ratio &times;0.81 / eval ratio &times;1.01"><b>89.6&thinsp;ms</b> <span class="ev">75&thinsp;ev</span><br>110.7&thinsp;ms <span class="ev">74&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(80,75%,85%)" title="binb_nest2_g3000p100_bal_base
+wall ratio &times;0.63 / eval ratio &times;0.81"><b>37.3&thinsp;ms</b> <span class="ev">48&thinsp;ev</span><br>58.9&thinsp;ms <span class="ev">59&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_nest2_g3000p100_bal_base
+wall ratio &times;9.98 / eval ratio &times;1.30"><b>3.1&thinsp;ms</b> <span class="ev">39&thinsp;ev</span><br>0.3&thinsp;ms <span class="ev">30&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(58,75%,85%)" title="pois_nest2_g3000p100_bal_base
+wall ratio &times;1.08 / eval ratio &times;1.48"><b>125.4&thinsp;ms</b> <span class="ev">108&thinsp;ev</span><br>115.9&thinsp;ms <span class="ev">73&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(55,75%,85%)" title="lmm_nest3_g3000p100_bal_base
+wall ratio &times;1.28 / eval ratio &times;0.81"><b>47.5&thinsp;ms</b> <span class="ev">50&thinsp;ev</span><br>37.2&thinsp;ms <span class="ev">62&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p100 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_nest2_g3000p100_bal_lowsnr
+wall ratio &times;7.87 / eval ratio &times;0.84"><b>3.0&thinsp;ms</b> <span class="ev">32&thinsp;ev</span><br>0.4&thinsp;ms <span class="ev">38&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/nearzero</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_nest2_g3000p100_bal_nearzero
+wall ratio &times;8.77 / eval ratio &times;0.85"><b>3.0&thinsp;ms</b> <span class="ev">29&thinsp;ev</span><br>0.3&thinsp;ms <span class="ev">34&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 single/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(32,75%,85%)" title="lmm_nest2_g3000p100_single_base
+wall ratio &times;3.63 / eval ratio &times;1.17"><b>6.8&thinsp;ms</b> <span class="ev">34&thinsp;ev</span><br>1.9&thinsp;ms <span class="ev">29&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 skew/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_nest2_g3000p100_skew_base
+wall ratio &times;9.53 / eval ratio &times;1.13"><b>3.1&thinsp;ms</b> <span class="ev">35&thinsp;ev</span><br>0.3&thinsp;ms <span class="ev">31&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int1_g30000p5_bal_base
+wall ratio &times;11.94 / eval ratio &times;1.38"><b>26.7&thinsp;ms</b> <span class="ev">18&thinsp;ev</span><br>2.2&thinsp;ms <span class="ev">13&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(73,75%,85%)" title="lmm_int2x_g30000p5_bal_base
+wall ratio &times;0.74 / eval ratio &times;1.49"><b>34.8&thinsp;ms</b> <span class="ev">55&thinsp;ev</span><br>47.3&thinsp;ms <span class="ev">37&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(39,75%,85%)" title="lmm_nest2_g30000p5_bal_base
+wall ratio &times;2.68 / eval ratio &times;0.86"><b>59.2&thinsp;ms</b> <span class="ev">25&thinsp;ev</span><br>22.1&thinsp;ms <span class="ev">29&thinsp;ev</span></td>
+<td></td>
+<td class="grp mm-fail" title="lmm_nest3_g30000p5_bal_base">glmm 441.3&thinsp;ms &middot; 44ev<br>MM.jl: timeout</td>
+</tr>
+<tr><th>g30000p5 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(42,75%,85%)" title="lmm_nest2_g30000p5_bal_lowsnr
+wall ratio &times;2.31 / eval ratio &times;0.93"><b>70.8&thinsp;ms</b> <span class="ev">38&thinsp;ev</span><br>30.7&thinsp;ms <span class="ev">41&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/nearzero</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(39,75%,85%)" title="lmm_nest2_g30000p5_bal_nearzero
+wall ratio &times;2.69 / eval ratio &times;1.12"><b>69.7&thinsp;ms</b> <span class="ev">36&thinsp;ev</span><br>25.9&thinsp;ms <span class="ev">32&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 single/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(41,75%,85%)" title="lmm_nest2_g30000p5_single_base
+wall ratio &times;2.42 / eval ratio &times;0.90"><b>91.2&thinsp;ms</b> <span class="ev">27&thinsp;ev</span><br>37.7&thinsp;ms <span class="ev">30&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 skew/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_nest2_g30000p5_skew_base
+wall ratio &times;3.92 / eval ratio &times;0.88"><b>59.2&thinsp;ms</b> <span class="ev">30&thinsp;ev</span><br>15.1&thinsp;ms <span class="ev">34&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int1_g30000p20_bal_base
+wall ratio &times;26.84 / eval ratio &times;1.12"><b>21.6&thinsp;ms</b> <span class="ev">19&thinsp;ev</span><br>0.8&thinsp;ms <span class="ev">17&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(35,75%,85%)" title="lmm_int2x_g30000p20_bal_base
+wall ratio &times;3.23 / eval ratio &times;1.97"><b>33.1&thinsp;ms</b> <span class="ev">63&thinsp;ev</span><br>10.3&thinsp;ms <span class="ev">32&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_nest2_g30000p20_bal_base
+wall ratio &times;5.17 / eval ratio &times;0.97"><b>40.2&thinsp;ms</b> <span class="ev">35&thinsp;ev</span><br>7.8&thinsp;ms <span class="ev">36&thinsp;ev</span></td>
+<td></td>
+<td class="grp mm-fail" title="lmm_nest3_g30000p20_bal_base">glmm 232.7&thinsp;ms &middot; 48ev<br>MM.jl: timeout</td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int1_g30000p100_bal_base
+wall ratio &times;86.91 / eval ratio &times;1.00"><b>22.0&thinsp;ms</b> <span class="ev">18&thinsp;ev</span><br>0.3&thinsp;ms <span class="ev">18&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_int2x_g30000p100_bal_base
+wall ratio &times;16.14 / eval ratio &times;1.47"><b>33.3&thinsp;ms</b> <span class="ev">44&thinsp;ev</span><br>2.1&thinsp;ms <span class="ev">30&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_nest2_g30000p100_bal_base
+wall ratio &times;21.75 / eval ratio &times;1.14"><b>32.1&thinsp;ms</b> <span class="ev">33&thinsp;ev</span><br>1.5&thinsp;ms <span class="ev">29&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(120,75%,85%)" title="lmm_nest3_g30000p100_bal_base
+wall ratio &times;0.003 / eval ratio &times;0.95"><b>90.6&thinsp;ms</b> <span class="ev">52&thinsp;ev</span><br>26.80&thinsp;s <span class="ev">55&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(120,75%,85%)" title="lmm_nest3_g30000p100_bal_lowsnr
+wall ratio &times;0.003 / eval ratio &times;0.95"><b>91.0&thinsp;ms</b> <span class="ev">53&thinsp;ev</span><br>27.28&thinsp;s <span class="ev">56&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(120,75%,85%)" title="lmm_nest3_g30000p100_bal_nearzero
+wall ratio &times;0.003 / eval ratio &times;1.09"><b>103.4&thinsp;ms</b> <span class="ev">70&thinsp;ev</span><br>31.44&thinsp;s <span class="ev">64&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp mm-fail" title="lmm_nest3_g30000p100_single_base">glmm 609.8&thinsp;ms &middot; 43ev<br>MM.jl: timeout</td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(120,75%,85%)" title="lmm_nest3_g30000p100_skew_base
+wall ratio &times;0.003 / eval ratio &times;0.84"><b>86.8&thinsp;ms</b> <span class="ev">52&thinsp;ev</span><br>28.96&thinsp;s <span class="ev">62&thinsp;ev</span></td>
+</tr>
+</table>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="1" class="grp">nestmix <small>(n_theta 3)</small></th>
+<th colspan="3" class="grp">q2s <small>(n_theta 3)</small></th>
+<th colspan="3" class="grp">cross4 <small>(n_theta 4)</small></th>
+<th colspan="3" class="grp">nest2s <small>(n_theta 4)</small></th>
+</tr>
+<tr>
+<th class="grp">gaussian</th>
+<th class="grp">binomial</th>
+<th>gaussian</th>
+<th>poisson</th>
+<th class="grp">binomial</th>
+<th>gaussian</th>
+<th>poisson</th>
+<th class="grp">binomial</th>
+<th>gaussian</th>
+<th>poisson</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td class="ok" style="background:hsl(78,75%,85%)" title="lmm_nestmix_g300p5_bal_base
+wall ratio &times;0.65 / eval ratio &times;0.76"><b>2.4&thinsp;ms</b> <span class="ev">35&thinsp;ev</span><br>3.7&thinsp;ms <span class="ev">46&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(89,75%,85%)" title="lmm_q2s_g300p5_bal_base
+wall ratio &times;0.51 / eval ratio &times;1.02"><b>0.8&thinsp;ms</b> <span class="ev">46&thinsp;ev</span><br>1.6&thinsp;ms <span class="ev">45&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_cross4_g300p5_bal_base
+wall ratio &times;4.13 / eval ratio &times;1.41"><b>18.4&thinsp;ms</b> <span class="ev">65&thinsp;ev</span><br>4.5&thinsp;ms <span class="ev">46&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(91,75%,85%)" title="lmm_nest2s_g300p5_bal_base
+wall ratio &times;0.49 / eval ratio &times;1.15"><b>1.8&thinsp;ms</b> <span class="ev">61&thinsp;ev</span><br>3.6&thinsp;ms <span class="ev">53&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g300p5 bal/lowsnr</th>
+<td class="ok" style="background:hsl(69,75%,85%)" title="lmm_nestmix_g300p5_bal_lowsnr
+wall ratio &times;0.80 / eval ratio &times;1.10"><b>3.2&thinsp;ms</b> <span class="ev">54&thinsp;ev</span><br>4.0&thinsp;ms <span class="ev">49&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p5 bal/nearzero</th>
+<td class="ok" style="background:hsl(71,75%,85%)" title="lmm_nestmix_g300p5_bal_nearzero
+wall ratio &times;0.78 / eval ratio &times;1.02"><b>2.8&thinsp;ms</b> <span class="ev">45&thinsp;ev</span><br>3.6&thinsp;ms <span class="ev">44&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p5 single/base</th>
+<td class="ok" style="background:hsl(120,75%,85%)" title="lmm_nestmix_g300p5_single_base
+wall ratio &times;0.22 / eval ratio &times;1.39"><b>5.7&thinsp;ms</b> <span class="ev">53&thinsp;ev</span><br>26.6&thinsp;ms <span class="ev">38&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p5 skew/base</th>
+<td class="ok" style="background:hsl(53,75%,85%)" title="lmm_nestmix_g300p5_skew_base
+wall ratio &times;1.39 / eval ratio &times;1.07"><b>1.7&thinsp;ms</b> <span class="ev">44&thinsp;ev</span><br>1.2&thinsp;ms <span class="ev">41&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p20 bal/base</th>
+<td class="ok" style="background:hsl(46,75%,85%)" title="lmm_nestmix_g300p20_bal_base
+wall ratio &times;1.88 / eval ratio &times;2.29"><b>1.1&thinsp;ms</b> <span class="ev">87&thinsp;ev</span><br>0.6&thinsp;ms <span class="ev">38&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(93,75%,85%)" title="binb_q2s_g300p20_bal_base
+wall ratio &times;0.47 / eval ratio &times;1.46"><b>4.9&thinsp;ms</b> <span class="ev">86&thinsp;ev</span><br>10.4&thinsp;ms <span class="ev">59&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(68,75%,85%)" title="lmm_q2s_g300p20_bal_base
+wall ratio &times;0.82 / eval ratio &times;0.94"><b>0.5&thinsp;ms</b> <span class="ev">45&thinsp;ev</span><br>0.6&thinsp;ms <span class="ev">48&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(86,75%,85%)" title="pois_q2s_g300p20_bal_base
+wall ratio &times;0.55 / eval ratio &times;1.16"><b>11.2&thinsp;ms</b> <span class="ev">96&thinsp;ev</span><br>20.3&thinsp;ms <span class="ev">83&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(79,75%,85%)" title="binb_cross4_g300p20_bal_base
+wall ratio &times;0.64 / eval ratio &times;1.06"><b>17.0&thinsp;ms</b> <span class="ev">92&thinsp;ev</span><br>26.6&thinsp;ms <span class="ev">87&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(88,75%,85%)" title="lmm_cross4_g300p20_bal_base
+wall ratio &times;0.52 / eval ratio &times;0.68"><b>1.0&thinsp;ms</b> <span class="ev">61&thinsp;ev</span><br>1.8&thinsp;ms <span class="ev">90&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(84,75%,85%)" title="pois_cross4_g300p20_bal_base
+wall ratio &times;0.58 / eval ratio &times;0.88"><b>35.7&thinsp;ms</b> <span class="ev">127&thinsp;ev</span><br>61.6&thinsp;ms <span class="ev">144&thinsp;ev</span></td>
+<td class="grp mm-fail" title="binb_nest2s_g300p20_bal_base">glmm 12.8&thinsp;ms &middot; 95ev<br>MM.jl: engine-fail</td>
+<td class="ok" style="background:hsl(78,75%,85%)" title="lmm_nest2s_g300p20_bal_base
+wall ratio &times;0.66 / eval ratio &times;1.33"><b>1.1&thinsp;ms</b> <span class="ev">88&thinsp;ev</span><br>1.6&thinsp;ms <span class="ev">66&thinsp;ev</span></td>
+<td class="mm-fail" title="pois_nest2s_g300p20_bal_base">glmm 23.6&thinsp;ms &middot; 115ev<br>MM.jl: engine-fail</td>
+</tr>
+<tr><th>g300p20 bal/lowmu</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="ok" style="background:hsl(76,75%,85%)" title="pois_q2s_g300p20_bal_lowmu
+wall ratio &times;0.69 / eval ratio &times;1.46"><b>11.5&thinsp;ms</b> <span class="ev">101&thinsp;ev</span><br>16.8&thinsp;ms <span class="ev">69&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p20 bal/lowsnr</th>
+<td class="ok" style="background:hsl(59,75%,85%)" title="lmm_nestmix_g300p20_bal_lowsnr
+wall ratio &times;1.03 / eval ratio &times;0.96"><b>0.9&thinsp;ms</b> <span class="ev">55&thinsp;ev</span><br>0.8&thinsp;ms <span class="ev">57&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(82,75%,85%)" title="lmm_cross4_g300p20_bal_lowsnr
+wall ratio &times;0.60 / eval ratio &times;0.84"><b>0.9&thinsp;ms</b> <span class="ev">61&thinsp;ev</span><br>1.5&thinsp;ms <span class="ev">73&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p20 bal/nearzero</th>
+<td class="ok" style="background:hsl(58,75%,85%)" title="lmm_nestmix_g300p20_bal_nearzero
+wall ratio &times;1.07 / eval ratio &times;0.85"><b>0.8&thinsp;ms</b> <span class="ev">39&thinsp;ev</span><br>0.7&thinsp;ms <span class="ev">46&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="ok" style="background:hsl(88,75%,85%)" title="pois_q2s_g300p20_bal_nearzero
+wall ratio &times;0.53 / eval ratio &times;1.08"><b>12.1&thinsp;ms</b> <span class="ev">115&thinsp;ev</span><br>23.0&thinsp;ms <span class="ev">106&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(84,75%,85%)" title="lmm_cross4_g300p20_bal_nearzero
+wall ratio &times;0.57 / eval ratio &times;1.01"><b>1.2&thinsp;ms</b> <span class="ev">104&thinsp;ev</span><br>2.1&thinsp;ms <span class="ev">103&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p20 single/base</th>
+<td class="ok" style="background:hsl(67,75%,85%)" title="lmm_nestmix_g300p20_single_base
+wall ratio &times;0.85 / eval ratio &times;1.00"><b>3.2&thinsp;ms</b> <span class="ev">43&thinsp;ev</span><br>3.7&thinsp;ms <span class="ev">43&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(43,75%,85%)" title="lmm_cross4_g300p20_single_base
+wall ratio &times;2.19 / eval ratio &times;0.75"><b>15.2&thinsp;ms</b> <span class="ev">47&thinsp;ev</span><br>6.9&thinsp;ms <span class="ev">63&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p20 skew/base</th>
+<td class="ok" style="background:hsl(56,75%,85%)" title="lmm_nestmix_g300p20_skew_base
+wall ratio &times;1.19 / eval ratio &times;1.19"><b>0.9&thinsp;ms</b> <span class="ev">62&thinsp;ev</span><br>0.8&thinsp;ms <span class="ev">52&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="ok" style="background:hsl(93,75%,85%)" title="pois_q2s_g300p20_skew_base
+wall ratio &times;0.46 / eval ratio &times;1.15"><b>12.1&thinsp;ms</b> <span class="ev">101&thinsp;ev</span><br>26.1&thinsp;ms <span class="ev">88&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(83,75%,85%)" title="lmm_cross4_g300p20_skew_base
+wall ratio &times;0.59 / eval ratio &times;0.88"><b>1.2&thinsp;ms</b> <span class="ev">85&thinsp;ev</span><br>2.0&thinsp;ms <span class="ev">97&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td class="ok" style="background:hsl(120,75%,85%)" title="lmm_nestmix_g3000p5_bal_base
+wall ratio &times;0.19 / eval ratio &times;1.06"><b>26.5&thinsp;ms</b> <span class="ev">52&thinsp;ev</span><br>142.3&thinsp;ms <span class="ev">49&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(87,75%,85%)" title="lmm_q2s_g3000p5_bal_base
+wall ratio &times;0.53 / eval ratio &times;1.44"><b>5.5&thinsp;ms</b> <span class="ev">49&thinsp;ev</span><br>10.4&thinsp;ms <span class="ev">34&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(103,75%,85%)" title="lmm_cross4_g3000p5_bal_base
+wall ratio &times;0.37 / eval ratio &times;1.04"><b>16.3&thinsp;ms</b> <span class="ev">77&thinsp;ev</span><br>44.1&thinsp;ms <span class="ev">74&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(100,75%,85%)" title="lmm_nest2s_g3000p5_bal_base
+wall ratio &times;0.40 / eval ratio &times;1.05"><b>13.6&thinsp;ms</b> <span class="ev">60&thinsp;ev</span><br>34.3&thinsp;ms <span class="ev">57&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(101,75%,85%)" title="lmm_cross4_g3000p5_bal_lowsnr
+wall ratio &times;0.39 / eval ratio &times;0.67"><b>22.3&thinsp;ms</b> <span class="ev">64&thinsp;ev</span><br>57.0&thinsp;ms <span class="ev">96&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(84,75%,85%)" title="lmm_cross4_g3000p5_bal_nearzero
+wall ratio &times;0.58 / eval ratio &times;1.02"><b>30.8&thinsp;ms</b> <span class="ev">91&thinsp;ev</span><br>53.0&thinsp;ms <span class="ev">89&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(94,75%,85%)" title="lmm_cross4_g3000p5_single_base
+wall ratio &times;0.46 / eval ratio &times;1.32"><b>98.0&thinsp;ms</b> <span class="ev">90&thinsp;ev</span><br>214.9&thinsp;ms <span class="ev">68&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(48,75%,85%)" title="lmm_cross4_g3000p5_skew_base
+wall ratio &times;1.71 / eval ratio &times;1.33"><b>67.2&thinsp;ms</b> <span class="ev">112&thinsp;ev</span><br>39.3&thinsp;ms <span class="ev">84&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="ok" style="background:hsl(52,75%,85%)" title="lmm_nestmix_g3000p20_bal_base
+wall ratio &times;1.47 / eval ratio &times;1.17"><b>11.2&thinsp;ms</b> <span class="ev">61&thinsp;ev</span><br>7.6&thinsp;ms <span class="ev">52&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(90,75%,85%)" title="binb_q2s_g3000p20_bal_base
+wall ratio &times;0.50 / eval ratio &times;1.09"><b>54.2&thinsp;ms</b> <span class="ev">81&thinsp;ev</span><br>108.8&thinsp;ms <span class="ev">74&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(84,75%,85%)" title="lmm_q2s_g3000p20_bal_base
+wall ratio &times;0.58 / eval ratio &times;0.64"><b>3.2&thinsp;ms</b> <span class="ev">45&thinsp;ev</span><br>5.5&thinsp;ms <span class="ev">70&thinsp;ev</span></td>
+<td class="ok mismatch" style="background:hsl(120,75%,85%)" title="pois_q2s_g3000p20_bal_base
+wall ratio &times;0.14 / eval ratio &times;0.29"><b>121.5&thinsp;ms</b> &#9888; <span class="ev">96&thinsp;ev</span><br>854.5&thinsp;ms <span class="ev">326&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(41,75%,85%)" title="binb_cross4_g3000p20_bal_base
+wall ratio &times;2.40 / eval ratio &times;1.04"><b>567.8&thinsp;ms</b> <span class="ev">106&thinsp;ev</span><br>237.1&thinsp;ms <span class="ev">102&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(47,75%,85%)" title="lmm_cross4_g3000p20_bal_base
+wall ratio &times;1.84 / eval ratio &times;0.99"><b>30.7&thinsp;ms</b> <span class="ev">92&thinsp;ev</span><br>16.7&thinsp;ms <span class="ev">93&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(55,75%,85%)" title="pois_cross4_g3000p20_bal_base
+wall ratio &times;1.27 / eval ratio &times;0.94"><b>809.8&thinsp;ms</b> <span class="ev">147&thinsp;ev</span><br>639.6&thinsp;ms <span class="ev">157&thinsp;ev</span></td>
+<td class="grp mm-fail" title="binb_nest2s_g3000p20_bal_base">glmm 241.2&thinsp;ms &middot; 158ev<br>MM.jl: engine-fail</td>
+<td class="ok" style="background:hsl(89,75%,85%)" title="lmm_nest2s_g3000p20_bal_base
+wall ratio &times;0.51 / eval ratio &times;0.90"><b>6.0&thinsp;ms</b> <span class="ev">63&thinsp;ev</span><br>11.7&thinsp;ms <span class="ev">70&thinsp;ev</span></td>
+<td class="mm-fail" title="pois_nest2s_g3000p20_bal_base">glmm 307.3&thinsp;ms &middot; 121ev<br>MM.jl: engine-fail</td>
+</tr>
+<tr><th>g3000p20 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(98,75%,85%)" title="lmm_nest2s_g3000p20_bal_highcorr
+wall ratio &times;0.42 / eval ratio &times;0.82"><b>6.6&thinsp;ms</b> <span class="ev">78&thinsp;ev</span><br>15.8&thinsp;ms <span class="ev">95&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p20 bal/lowmu</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="ok" style="background:hsl(52,75%,85%)" title="pois_cross4_g3000p20_bal_lowmu
+wall ratio &times;1.45 / eval ratio &times;0.90"><b>736.7&thinsp;ms</b> <span class="ev">129&thinsp;ev</span><br>508.8&thinsp;ms <span class="ev">144&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="mm-fail" title="pois_nest2s_g3000p20_bal_lowmu">glmm 276.5&thinsp;ms &middot; 107ev<br>MM.jl: engine-fail</td>
+</tr>
+<tr><th>g3000p20 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(41,75%,85%)" title="lmm_cross4_g3000p20_bal_lowsnr
+wall ratio &times;2.41 / eval ratio &times;1.32"><b>33.8&thinsp;ms</b> <span class="ev">103&thinsp;ev</span><br>14.0&thinsp;ms <span class="ev">78&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(88,75%,85%)" title="lmm_nest2s_g3000p20_bal_lowsnr
+wall ratio &times;0.53 / eval ratio &times;0.86"><b>5.5&thinsp;ms</b> <span class="ev">54&thinsp;ev</span><br>10.5&thinsp;ms <span class="ev">63&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p20 bal/nearzero</th>
+<td></td>
+<td class="grp ok" style="background:hsl(92,75%,85%)" title="binb_q2s_g3000p20_bal_nearzero
+wall ratio &times;0.47 / eval ratio &times;1.13"><b>41.1&thinsp;ms</b> <span class="ev">78&thinsp;ev</span><br>86.9&thinsp;ms <span class="ev">69&thinsp;ev</span></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(38,75%,85%)" title="binb_cross4_g3000p20_bal_nearzero
+wall ratio &times;2.79 / eval ratio &times;1.29"><b>608.8&thinsp;ms</b> <span class="ev">121&thinsp;ev</span><br>218.3&thinsp;ms <span class="ev">94&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(54,75%,85%)" title="lmm_cross4_g3000p20_bal_nearzero
+wall ratio &times;1.30 / eval ratio &times;0.72"><b>22.7&thinsp;ms</b> <span class="ev">69&thinsp;ev</span><br>17.4&thinsp;ms <span class="ev">96&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(58,75%,85%)" title="pois_cross4_g3000p20_bal_nearzero
+wall ratio &times;1.12 / eval ratio &times;0.80"><b>964.9&thinsp;ms</b> <span class="ev">195&thinsp;ev</span><br>861.6&thinsp;ms <span class="ev">244&thinsp;ev</span></td>
+<td class="grp mm-fail" title="bina_nest2s_g3000p20_bal_nearzero">glmm 343.8&thinsp;ms &middot; 124ev<br>MM.jl: engine-fail</td>
+<td class="ok" style="background:hsl(77,75%,85%)" title="lmm_nest2s_g3000p20_bal_nearzero
+wall ratio &times;0.67 / eval ratio &times;1.40"><b>7.0&thinsp;ms</b> <span class="ev">88&thinsp;ev</span><br>10.5&thinsp;ms <span class="ev">63&thinsp;ev</span></td>
+<td class="mm-fail" title="pois_nest2s_g3000p20_bal_nearzero">glmm 320.2&thinsp;ms &middot; 141ev<br>MM.jl: engine-fail</td>
+</tr>
+<tr><th>g3000p20 bal/rare</th>
+<td></td>
+<td class="grp ok" style="background:hsl(99,75%,85%)" title="binb_q2s_g3000p20_bal_rare
+wall ratio &times;0.41 / eval ratio &times;1.02"><b>46.8&thinsp;ms</b> <span class="ev">112&thinsp;ev</span><br>114.5&thinsp;ms <span class="ev">110&thinsp;ev</span></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(45,75%,85%)" title="binb_cross4_g3000p20_bal_rare
+wall ratio &times;2.00 / eval ratio &times;1.20"><b>554.2&thinsp;ms</b> <span class="ev">106&thinsp;ev</span><br>277.1&thinsp;ms <span class="ev">88&thinsp;ev</span></td>
+<td></td>
+<td></td>
+<td class="grp mm-fail" title="bina_nest2s_g3000p20_bal_rare">glmm 288.5&thinsp;ms &middot; 115ev<br>MM.jl: engine-fail</td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p20 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(49,75%,85%)" title="lmm_cross4_g3000p20_single_base
+wall ratio &times;1.64 / eval ratio &times;1.58"><b>120.3&thinsp;ms</b> <span class="ev">156&thinsp;ev</span><br>73.3&thinsp;ms <span class="ev">99&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(120,75%,85%)" title="lmm_nest2s_g3000p20_single_base
+wall ratio &times;0.006 / eval ratio &times;0.93"><b>15.4&thinsp;ms</b> <span class="ev">56&thinsp;ev</span><br>2.40&thinsp;s <span class="ev">60&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p20 skew/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(102,75%,85%)" title="binb_q2s_g3000p20_skew_base
+wall ratio &times;0.38 / eval ratio &times;1.13"><b>46.1&thinsp;ms</b> <span class="ev">86&thinsp;ev</span><br>122.0&thinsp;ms <span class="ev">76&thinsp;ev</span></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(42,75%,85%)" title="binb_cross4_g3000p20_skew_base
+wall ratio &times;2.29 / eval ratio &times;1.13"><b>505.4&thinsp;ms</b> <span class="ev">107&thinsp;ev</span><br>220.6&thinsp;ms <span class="ev">95&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(45,75%,85%)" title="lmm_cross4_g3000p20_skew_base
+wall ratio &times;2.01 / eval ratio &times;0.86"><b>32.8&thinsp;ms</b> <span class="ev">78&thinsp;ev</span><br>16.3&thinsp;ms <span class="ev">91&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(49,75%,85%)" title="pois_cross4_g3000p20_skew_base
+wall ratio &times;1.66 / eval ratio &times;1.55"><b>889.9&thinsp;ms</b> <span class="ev">186&thinsp;ev</span><br>535.3&thinsp;ms <span class="ev">120&thinsp;ev</span></td>
+<td class="grp mm-fail" title="bina_nest2s_g3000p20_skew_base">glmm 340.0&thinsp;ms &middot; 118ev<br>MM.jl: engine-fail</td>
+<td class="ok" style="background:hsl(90,75%,85%)" title="lmm_nest2s_g3000p20_skew_base
+wall ratio &times;0.50 / eval ratio &times;0.87"><b>6.6&thinsp;ms</b> <span class="ev">74&thinsp;ev</span><br>13.1&thinsp;ms <span class="ev">85&thinsp;ev</span></td>
+<td class="mm-fail" title="pois_nest2s_g3000p20_skew_base">glmm 291.2&thinsp;ms &middot; 117ev<br>MM.jl: engine-fail</td>
+</tr>
+<tr><th>g3000p100 bal/base</th>
+<td class="ok" style="background:hsl(36,75%,85%)" title="lmm_nestmix_g3000p100_bal_base
+wall ratio &times;3.00 / eval ratio &times;1.08"><b>4.9&thinsp;ms</b> <span class="ev">68&thinsp;ev</span><br>1.6&thinsp;ms <span class="ev">63&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(87,75%,85%)" title="binb_q2s_g3000p100_bal_base
+wall ratio &times;0.54 / eval ratio &times;1.28"><b>42.1&thinsp;ms</b> <span class="ev">95&thinsp;ev</span><br>78.7&thinsp;ms <span class="ev">74&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(48,75%,85%)" title="lmm_q2s_g3000p100_bal_base
+wall ratio &times;1.73 / eval ratio &times;0.85"><b>2.5&thinsp;ms</b> <span class="ev">62&thinsp;ev</span><br>1.4&thinsp;ms <span class="ev">73&thinsp;ev</span></td>
+<td class="ok mismatch" style="background:hsl(119,75%,85%)" title="pois_q2s_g3000p100_bal_base
+wall ratio &times;0.26 / eval ratio &times;0.40"><b>104.6&thinsp;ms</b> &#9888; <span class="ev">89&thinsp;ev</span><br>406.9&thinsp;ms <span class="ev">223&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(48,75%,85%)" title="binb_cross4_g3000p100_bal_base
+wall ratio &times;1.72 / eval ratio &times;1.36"><b>228.1&thinsp;ms</b> <span class="ev">117&thinsp;ev</span><br>132.5&thinsp;ms <span class="ev">86&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(43,75%,85%)" title="lmm_cross4_g3000p100_bal_base
+wall ratio &times;2.21 / eval ratio &times;0.90"><b>6.1&thinsp;ms</b> <span class="ev">70&thinsp;ev</span><br>2.7&thinsp;ms <span class="ev">78&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(82,75%,85%)" title="pois_cross4_g3000p100_bal_base
+wall ratio &times;0.60 / eval ratio &times;0.55"><b>364.4&thinsp;ms</b> <span class="ev">140&thinsp;ev</span><br>602.6&thinsp;ms <span class="ev">255&thinsp;ev</span></td>
+<td class="grp mm-fail" title="binb_nest2s_g3000p100_bal_base">glmm 121.0&thinsp;ms &middot; 110ev<br>MM.jl: engine-fail</td>
+<td class="ok" style="background:hsl(68,75%,85%)" title="lmm_nest2s_g3000p100_bal_base
+wall ratio &times;0.83 / eval ratio &times;0.76"><b>3.9&thinsp;ms</b> <span class="ev">90&thinsp;ev</span><br>4.7&thinsp;ms <span class="ev">119&thinsp;ev</span></td>
+<td class="mm-fail" title="pois_nest2s_g3000p100_bal_base">glmm 377.5&thinsp;ms &middot; 241ev<br>MM.jl: engine-fail</td>
+</tr>
+<tr><th>g3000p100 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(61,75%,85%)" title="lmm_nest2s_g3000p100_bal_highcorr
+wall ratio &times;0.99 / eval ratio &times;0.95"><b>4.0&thinsp;ms</b> <span class="ev">97&thinsp;ev</span><br>4.0&thinsp;ms <span class="ev">102&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p100 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(66,75%,85%)" title="lmm_nest2s_g3000p100_bal_lowsnr
+wall ratio &times;0.88 / eval ratio &times;0.87"><b>3.9&thinsp;ms</b> <span class="ev">98&thinsp;ev</span><br>4.5&thinsp;ms <span class="ev">113&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p100 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp mm-fail" title="binb_nest2s_g3000p100_bal_nearzero">glmm 120.5&thinsp;ms &middot; 120ev<br>MM.jl: engine-fail</td>
+<td class="ok" style="background:hsl(62,75%,85%)" title="lmm_nest2s_g3000p100_bal_nearzero
+wall ratio &times;0.96 / eval ratio &times;1.04"><b>4.3&thinsp;ms</b> <span class="ev">119&thinsp;ev</span><br>4.5&thinsp;ms <span class="ev">114&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p100 bal/rare</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp mm-fail" title="binb_nest2s_g3000p100_bal_rare">glmm 213.2&thinsp;ms &middot; 236ev<br>MM.jl: engine-fail</td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p100 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(120,75%,85%)" title="lmm_nest2s_g3000p100_single_base
+wall ratio &times;0.010 / eval ratio &times;0.80"><b>13.2&thinsp;ms</b> <span class="ev">56&thinsp;ev</span><br>1.36&thinsp;s <span class="ev">70&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p100 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp mm-fail" title="binb_nest2s_g3000p100_skew_base">glmm 118.2&thinsp;ms &middot; 107ev<br>MM.jl: engine-fail</td>
+<td class="ok" style="background:hsl(57,75%,85%)" title="lmm_nest2s_g3000p100_skew_base
+wall ratio &times;1.14 / eval ratio &times;0.93"><b>3.7&thinsp;ms</b> <span class="ev">77&thinsp;ev</span><br>3.3&thinsp;ms <span class="ev">83&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td class="ok" style="background:hsl(120,75%,85%)" title="lmm_nestmix_g30000p5_bal_base
+wall ratio &times;0.021 / eval ratio &times;0.92"><b>316.6&thinsp;ms</b> <span class="ev">61&thinsp;ev</span><br>15.42&thinsp;s <span class="ev">66&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(94,75%,85%)" title="lmm_q2s_g30000p5_bal_base
+wall ratio &times;0.45 / eval ratio &times;1.24"><b>51.4&thinsp;ms</b> <span class="ev">47&thinsp;ev</span><br>113.7&thinsp;ms <span class="ev">38&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(120,75%,85%)" title="lmm_cross4_g30000p5_bal_base
+wall ratio &times;0.17 / eval ratio &times;2.10"><b>149.0&thinsp;ms</b> <span class="ev">298&thinsp;ev</span><br>878.9&thinsp;ms <span class="ev">142&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(97,75%,85%)" title="lmm_nest2s_g30000p5_bal_base
+wall ratio &times;0.43 / eval ratio &times;1.16"><b>140.7&thinsp;ms</b> <span class="ev">64&thinsp;ev</span><br>327.6&thinsp;ms <span class="ev">55&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p5 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(106,75%,85%)" title="lmm_q2s_g30000p5_bal_highcorr
+wall ratio &times;0.34 / eval ratio &times;0.94"><b>52.9&thinsp;ms</b> <span class="ev">49&thinsp;ev</span><br>154.7&thinsp;ms <span class="ev">52&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(111,75%,85%)" title="lmm_nest2s_g30000p5_bal_highcorr
+wall ratio &times;0.30 / eval ratio &times;0.81"><b>136.0&thinsp;ms</b> <span class="ev">61&thinsp;ev</span><br>446.7&thinsp;ms <span class="ev">75&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(107,75%,85%)" title="lmm_q2s_g30000p5_bal_lowsnr
+wall ratio &times;0.34 / eval ratio &times;0.85"><b>48.8&thinsp;ms</b> <span class="ev">41&thinsp;ev</span><br>143.9&thinsp;ms <span class="ev">48&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(91,75%,85%)" title="lmm_nest2s_g30000p5_bal_lowsnr
+wall ratio &times;0.48 / eval ratio &times;1.43"><b>162.3&thinsp;ms</b> <span class="ev">77&thinsp;ev</span><br>335.7&thinsp;ms <span class="ev">54&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(117,75%,85%)" title="lmm_q2s_g30000p5_bal_nearzero
+wall ratio &times;0.27 / eval ratio &times;0.69"><b>50.3&thinsp;ms</b> <span class="ev">44&thinsp;ev</span><br>189.1&thinsp;ms <span class="ev">64&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(105,75%,85%)" title="lmm_nest2s_g30000p5_bal_nearzero
+wall ratio &times;0.35 / eval ratio &times;0.99"><b>154.0&thinsp;ms</b> <span class="ev">72&thinsp;ev</span><br>436.3&thinsp;ms <span class="ev">73&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(112,75%,85%)" title="lmm_q2s_g30000p5_single_base
+wall ratio &times;0.30 / eval ratio &times;1.00"><b>79.0&thinsp;ms</b> <span class="ev">44&thinsp;ev</span><br>263.1&thinsp;ms <span class="ev">44&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="mm-fail" title="lmm_nest2s_g30000p5_single_base">glmm 250.8&thinsp;ms &middot; 64ev<br>MM.jl: timeout</td>
+<td></td>
+</tr>
+<tr><th>g30000p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(100,75%,85%)" title="lmm_q2s_g30000p5_skew_base
+wall ratio &times;0.40 / eval ratio &times;0.86"><b>50.7&thinsp;ms</b> <span class="ev">48&thinsp;ev</span><br>128.3&thinsp;ms <span class="ev">56&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="mm-fail" title="lmm_nest2s_g30000p5_skew_base">glmm 109.7&thinsp;ms &middot; 57ev<br>MM.jl: timeout</td>
+<td></td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td class="ok" style="background:hsl(53,75%,85%)" title="lmm_nestmix_g30000p20_bal_base
+wall ratio &times;1.38 / eval ratio &times;1.24"><b>132.5&thinsp;ms</b> <span class="ev">84&thinsp;ev</span><br>96.2&thinsp;ms <span class="ev">68&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(60,75%,85%)" title="lmm_q2s_g30000p20_bal_base
+wall ratio &times;1.01 / eval ratio &times;1.39"><b>31.3&thinsp;ms</b> <span class="ev">57&thinsp;ev</span><br>31.0&thinsp;ms <span class="ev">41&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(101,75%,85%)" title="lmm_cross4_g30000p20_bal_base
+wall ratio &times;0.38 / eval ratio &times;0.83"><b>91.7&thinsp;ms</b> <span class="ev">137&thinsp;ev</span><br>238.5&thinsp;ms <span class="ev">165&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(87,75%,85%)" title="lmm_nest2s_g30000p20_bal_base
+wall ratio &times;0.54 / eval ratio &times;1.00"><b>62.2&thinsp;ms</b> <span class="ev">72&thinsp;ev</span><br>115.4&thinsp;ms <span class="ev">72&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p20 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(82,75%,85%)" title="lmm_q2s_g30000p20_bal_highcorr
+wall ratio &times;0.60 / eval ratio &times;0.74"><b>30.5&thinsp;ms</b> <span class="ev">50&thinsp;ev</span><br>50.7&thinsp;ms <span class="ev">68&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p20 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(77,75%,85%)" title="lmm_q2s_g30000p20_bal_lowsnr
+wall ratio &times;0.68 / eval ratio &times;0.80"><b>29.8&thinsp;ms</b> <span class="ev">47&thinsp;ev</span><br>44.0&thinsp;ms <span class="ev">59&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p20 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(93,75%,85%)" title="lmm_q2s_g30000p20_bal_nearzero
+wall ratio &times;0.46 / eval ratio &times;0.66"><b>31.3&thinsp;ms</b> <span class="ev">59&thinsp;ev</span><br>67.4&thinsp;ms <span class="ev">90&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p20 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(111,75%,85%)" title="lmm_q2s_g30000p20_single_base
+wall ratio &times;0.31 / eval ratio &times;0.85"><b>53.2&thinsp;ms</b> <span class="ev">39&thinsp;ev</span><br>171.9&thinsp;ms <span class="ev">46&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p20 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(64,75%,85%)" title="lmm_q2s_g30000p20_skew_base
+wall ratio &times;0.91 / eval ratio &times;1.15"><b>32.4&thinsp;ms</b> <span class="ev">55&thinsp;ev</span><br>35.8&thinsp;ms <span class="ev">48&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td class="ok" style="background:hsl(37,75%,85%)" title="lmm_nestmix_g30000p100_bal_base
+wall ratio &times;2.94 / eval ratio &times;1.21"><b>62.2&thinsp;ms</b> <span class="ev">92&thinsp;ev</span><br>21.2&thinsp;ms <span class="ev">76&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(41,75%,85%)" title="lmm_q2s_g30000p100_bal_base
+wall ratio &times;2.35 / eval ratio &times;0.89"><b>25.3&thinsp;ms</b> <span class="ev">62&thinsp;ev</span><br>10.7&thinsp;ms <span class="ev">70&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(42,75%,85%)" title="lmm_cross4_g30000p100_bal_base
+wall ratio &times;2.29 / eval ratio &times;1.24"><b>106.3&thinsp;ms</b> <span class="ev">185&thinsp;ev</span><br>46.5&thinsp;ms <span class="ev">149&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(56,75%,85%)" title="lmm_nest2s_g30000p100_bal_base
+wall ratio &times;1.18 / eval ratio &times;0.82"><b>37.1&thinsp;ms</b> <span class="ev">79&thinsp;ev</span><br>31.4&thinsp;ms <span class="ev">96&thinsp;ev</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(42,75%,85%)" title="lmm_q2s_g30000p100_bal_highcorr
+wall ratio &times;2.33 / eval ratio &times;0.93"><b>25.5&thinsp;ms</b> <span class="ev">66&thinsp;ev</span><br>10.9&thinsp;ms <span class="ev">71&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(40,75%,85%)" title="lmm_q2s_g30000p100_bal_lowsnr
+wall ratio &times;2.57 / eval ratio &times;1.00"><b>25.3&thinsp;ms</b> <span class="ev">64&thinsp;ev</span><br>9.9&thinsp;ms <span class="ev">64&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(36,75%,85%)" title="lmm_q2s_g30000p100_bal_nearzero
+wall ratio &times;3.04 / eval ratio &times;1.39"><b>26.0&thinsp;ms</b> <span class="ev">78&thinsp;ev</span><br>8.6&thinsp;ms <span class="ev">56&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(102,75%,85%)" title="lmm_q2s_g30000p100_single_base
+wall ratio &times;0.38 / eval ratio &times;1.00"><b>51.6&thinsp;ms</b> <span class="ev">43&thinsp;ev</span><br>135.0&thinsp;ms <span class="ev">43&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(46,75%,85%)" title="lmm_q2s_g30000p100_skew_base
+wall ratio &times;1.90 / eval ratio &times;0.67"><b>23.8&thinsp;ms</b> <span class="ev">55&thinsp;ev</span><br>12.5&thinsp;ms <span class="ev">82&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+</tr>
+</table>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="1" class="grp">q2sx2 <small>(n_theta 5)</small></th>
+<th colspan="3" class="grp">cross6 <small>(n_theta 6)</small></th>
+<th colspan="1" class="grp">q2sq2s <small>(n_theta 6)</small></th>
+<th colspan="1" class="grp">q3s <small>(n_theta 6)</small></th>
+</tr>
+<tr>
+<th class="grp">gaussian</th>
+<th class="grp">binomial</th>
+<th>gaussian</th>
+<th>poisson</th>
+<th class="grp">gaussian</th>
+<th class="grp">gaussian</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td class="ok" style="background:hsl(76,75%,85%)" title="lmm_q2sx2_g300p5_bal_base
+wall ratio &times;0.69 / eval ratio &times;1.11"><b>7.5&thinsp;ms</b> <span class="ev">81&thinsp;ev</span><br>10.8&thinsp;ms <span class="ev">73&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(31,75%,85%)" title="lmm_cross6_g300p5_bal_base
+wall ratio &times;3.83 / eval ratio &times;1.16"><b>70.9&thinsp;ms</b> <span class="ev">85&thinsp;ev</span><br>18.5&thinsp;ms <span class="ev">73&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(83,75%,85%)" title="lmm_q2sq2s_g300p5_bal_base
+wall ratio &times;0.59 / eval ratio &times;1.41"><b>7.5&thinsp;ms</b> <span class="ev">121&thinsp;ev</span><br>12.7&thinsp;ms <span class="ev">86&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(92,75%,85%)" title="lmm_q3s_g300p5_bal_base
+wall ratio &times;0.48 / eval ratio &times;1.09"><b>1.8&thinsp;ms</b> <span class="ev">88&thinsp;ev</span><br>3.7&thinsp;ms <span class="ev">81&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(73,75%,85%)" title="lmm_cross6_g300p5_bal_lowsnr
+wall ratio &times;0.74 / eval ratio &times;1.12"><b>15.3&thinsp;ms</b> <span class="ev">91&thinsp;ev</span><br>20.8&thinsp;ms <span class="ev">81&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(76,75%,85%)" title="lmm_cross6_g300p5_bal_nearzero
+wall ratio &times;0.70 / eval ratio &times;1.08"><b>15.5&thinsp;ms</b> <span class="ev">94&thinsp;ev</span><br>22.2&thinsp;ms <span class="ev">87&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(108,75%,85%)" title="lmm_cross6_g300p5_single_base
+wall ratio &times;0.33 / eval ratio &times;1.17"><b>28.9&thinsp;ms</b> <span class="ev">95&thinsp;ev</span><br>87.5&thinsp;ms <span class="ev">81&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(60,75%,85%)" title="lmm_cross6_g300p5_skew_base
+wall ratio &times;1.00 / eval ratio &times;1.15"><b>12.6&thinsp;ms</b> <span class="ev">85&thinsp;ev</span><br>12.5&thinsp;ms <span class="ev">74&thinsp;ev</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/base</th>
+<td class="ok" style="background:hsl(92,75%,85%)" title="lmm_q2sx2_g300p20_bal_base
+wall ratio &times;0.47 / eval ratio &times;0.97"><b>1.5&thinsp;ms</b> <span class="ev">100&thinsp;ev</span><br>3.1&thinsp;ms <span class="ev">103&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(64,75%,85%)" title="binb_cross6_g300p20_bal_base
+wall ratio &times;0.90 / eval ratio &times;1.20"><b>59.0&thinsp;ms</b> <span class="ev">157&thinsp;ev</span><br>65.3&thinsp;ms <span class="ev">131&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(101,75%,85%)" title="lmm_cross6_g300p20_bal_base
+wall ratio &times;0.39 / eval ratio &times;0.85"><b>2.0&thinsp;ms</b> <span class="ev">104&thinsp;ev</span><br>5.1&thinsp;ms <span class="ev">123&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(83,75%,85%)" title="pois_cross6_g300p20_bal_base
+wall ratio &times;0.58 / eval ratio &times;1.04"><b>113.3&thinsp;ms</b> <span class="ev">244&thinsp;ev</span><br>194.7&thinsp;ms <span class="ev">235&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(81,75%,85%)" title="lmm_q2sq2s_g300p20_bal_base
+wall ratio &times;0.62 / eval ratio &times;1.15"><b>2.6&thinsp;ms</b> <span class="ev">178&thinsp;ev</span><br>4.1&thinsp;ms <span class="ev">155&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(79,75%,85%)" title="lmm_q3s_g300p20_bal_base
+wall ratio &times;0.64 / eval ratio &times;1.12"><b>1.3&thinsp;ms</b> <span class="ev">140&thinsp;ev</span><br>2.0&thinsp;ms <span class="ev">125&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p20 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(92,75%,85%)" title="lmm_q2sq2s_g300p20_bal_highcorr
+wall ratio &times;0.48 / eval ratio &times;0.87"><b>2.3&thinsp;ms</b> <span class="ev">155&thinsp;ev</span><br>4.7&thinsp;ms <span class="ev">179&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(91,75%,85%)" title="lmm_cross6_g300p20_bal_lowsnr
+wall ratio &times;0.49 / eval ratio &times;1.12"><b>2.1&thinsp;ms</b> <span class="ev">114&thinsp;ev</span><br>4.2&thinsp;ms <span class="ev">102&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(83,75%,85%)" title="lmm_q2sq2s_g300p20_bal_lowsnr
+wall ratio &times;0.59 / eval ratio &times;0.98"><b>1.7&thinsp;ms</b> <span class="ev">106&thinsp;ev</span><br>2.8&thinsp;ms <span class="ev">108&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(90,75%,85%)" title="lmm_cross6_g300p20_bal_nearzero
+wall ratio &times;0.50 / eval ratio &times;1.33"><b>2.7&thinsp;ms</b> <span class="ev">173&thinsp;ev</span><br>5.5&thinsp;ms <span class="ev">130&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(76,75%,85%)" title="lmm_q2sq2s_g300p20_bal_nearzero
+wall ratio &times;0.68 / eval ratio &times;1.27"><b>2.6&thinsp;ms</b> <span class="ev">179&thinsp;ev</span><br>3.8&thinsp;ms <span class="ev">141&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(63,75%,85%)" title="lmm_cross6_g300p20_single_base
+wall ratio &times;0.93 / eval ratio &times;1.20"><b>21.9&thinsp;ms</b> <span class="ev">98&thinsp;ev</span><br>23.5&thinsp;ms <span class="ev">82&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(95,75%,85%)" title="lmm_q2sq2s_g300p20_single_base
+wall ratio &times;0.45 / eval ratio &times;1.15"><b>6.7&thinsp;ms</b> <span class="ev">98&thinsp;ev</span><br>14.9&thinsp;ms <span class="ev">85&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(82,75%,85%)" title="lmm_cross6_g300p20_skew_base
+wall ratio &times;0.60 / eval ratio &times;1.40"><b>3.1&thinsp;ms</b> <span class="ev">175&thinsp;ev</span><br>5.2&thinsp;ms <span class="ev">125&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(63,75%,85%)" title="lmm_q2sq2s_g300p20_skew_base
+wall ratio &times;0.92 / eval ratio &times;1.84"><b>2.4&thinsp;ms</b> <span class="ev">182&thinsp;ev</span><br>2.6&thinsp;ms <span class="ev">99&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td class="ok" style="background:hsl(74,75%,85%)" title="lmm_q2sx2_g3000p5_bal_base
+wall ratio &times;0.72 / eval ratio &times;1.25"><b>84.0&thinsp;ms</b> <span class="ev">114&thinsp;ev</span><br>116.5&thinsp;ms <span class="ev">91&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(100,75%,85%)" title="lmm_cross6_g3000p5_bal_base
+wall ratio &times;0.40 / eval ratio &times;1.08"><b>95.6&thinsp;ms</b> <span class="ev">184&thinsp;ev</span><br>240.9&thinsp;ms <span class="ev">171&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(92,75%,85%)" title="lmm_q2sq2s_g3000p5_bal_base
+wall ratio &times;0.48 / eval ratio &times;1.42"><b>67.2&thinsp;ms</b> <span class="ev">167&thinsp;ev</span><br>139.9&thinsp;ms <span class="ev">118&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(88,75%,85%)" title="lmm_q3s_g3000p5_bal_base
+wall ratio &times;0.52 / eval ratio &times;1.51"><b>14.1&thinsp;ms</b> <span class="ev">103&thinsp;ev</span><br>27.0&thinsp;ms <span class="ev">68&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p5 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(113,75%,85%)" title="lmm_q2sq2s_g3000p5_bal_highcorr
+wall ratio &times;0.29 / eval ratio &times;0.86"><b>57.6&thinsp;ms</b> <span class="ev">143&thinsp;ev</span><br>195.6&thinsp;ms <span class="ev">166&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(104,75%,85%)" title="lmm_q2sq2s_g3000p5_bal_lowsnr
+wall ratio &times;0.36 / eval ratio &times;1.05"><b>49.1&thinsp;ms</b> <span class="ev">120&thinsp;ev</span><br>135.5&thinsp;ms <span class="ev">114&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(93,75%,85%)" title="lmm_q2sq2s_g3000p5_bal_nearzero
+wall ratio &times;0.47 / eval ratio &times;1.44"><b>131.3&thinsp;ms</b> <span class="ev">344&thinsp;ev</span><br>280.9&thinsp;ms <span class="ev">239&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(62,75%,85%)" title="lmm_q2sq2s_g3000p5_single_base
+wall ratio &times;0.96 / eval ratio &times;1.48"><b>139.0&thinsp;ms</b> <span class="ev">200&thinsp;ev</span><br>144.3&thinsp;ms <span class="ev">135&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(94,75%,85%)" title="lmm_q2sq2s_g3000p5_skew_base
+wall ratio &times;0.46 / eval ratio &times;1.27"><b>67.3&thinsp;ms</b> <span class="ev">201&thinsp;ev</span><br>147.0&thinsp;ms <span class="ev">158&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="ok" style="background:hsl(72,75%,85%)" title="lmm_q2sx2_g3000p20_bal_base
+wall ratio &times;0.75 / eval ratio &times;1.17"><b>28.6&thinsp;ms</b> <span class="ev">134&thinsp;ev</span><br>38.0&thinsp;ms <span class="ev">115&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(30,75%,85%)" title="binb_cross6_g3000p20_bal_base
+wall ratio &times;5.10 / eval ratio &times;1.50"><b>2.32&thinsp;s</b> <span class="ev">151&thinsp;ev</span><br>455.0&thinsp;ms <span class="ev">101&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(119,75%,85%)" title="lmm_cross6_g3000p20_bal_base
+wall ratio &times;0.25 / eval ratio &times;0.87"><b>118.9&thinsp;ms</b> <span class="ev">135&thinsp;ev</span><br>469.1&thinsp;ms <span class="ev">156&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(47,75%,85%)" title="pois_cross6_g3000p20_bal_base
+wall ratio &times;1.84 / eval ratio &times;1.09"><b>3.45&thinsp;s</b> <span class="ev">252&thinsp;ev</span><br>1.87&thinsp;s <span class="ev">231&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(75,75%,85%)" title="lmm_q2sq2s_g3000p20_bal_base
+wall ratio &times;0.71 / eval ratio &times;1.30"><b>34.2&thinsp;ms</b> <span class="ev">200&thinsp;ev</span><br>48.5&thinsp;ms <span class="ev">154&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(75,75%,85%)" title="lmm_q3s_g3000p20_bal_base
+wall ratio &times;0.71 / eval ratio &times;1.49"><b>7.5&thinsp;ms</b> <span class="ev">152&thinsp;ev</span><br>10.6&thinsp;ms <span class="ev">102&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p20 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(86,75%,85%)" title="lmm_q2sq2s_g3000p20_bal_highcorr
+wall ratio &times;0.55 / eval ratio &times;1.02"><b>32.6&thinsp;ms</b> <span class="ev">190&thinsp;ev</span><br>59.0&thinsp;ms <span class="ev">187&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/lowmu</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="ok" style="background:hsl(41,75%,85%)" title="pois_cross6_g3000p20_bal_lowmu
+wall ratio &times;2.40 / eval ratio &times;1.42"><b>3.45&thinsp;s</b> <span class="ev">253&thinsp;ev</span><br>1.44&thinsp;s <span class="ev">178&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(86,75%,85%)" title="lmm_q2sq2s_g3000p20_bal_lowsnr
+wall ratio &times;0.54 / eval ratio &times;0.93"><b>21.8&thinsp;ms</b> <span class="ev">118&thinsp;ev</span><br>40.1&thinsp;ms <span class="ev">127&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="ok" style="background:hsl(52,75%,85%)" title="pois_cross6_g3000p20_bal_nearzero
+wall ratio &times;1.44 / eval ratio &times;0.80"><b>3.59&thinsp;s</b> <span class="ev">287&thinsp;ev</span><br>2.49&thinsp;s <span class="ev">360&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(71,75%,85%)" title="lmm_q2sq2s_g3000p20_bal_nearzero
+wall ratio &times;0.77 / eval ratio &times;1.47"><b>39.5&thinsp;ms</b> <span class="ev">239&thinsp;ev</span><br>51.3&thinsp;ms <span class="ev">163&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp ok" style="background:hsl(107,75%,85%)" title="lmm_q2sq2s_g3000p20_single_base
+wall ratio &times;0.34 / eval ratio &times;1.02"><b>69.6&thinsp;ms</b> <span class="ev">144&thinsp;ev</span><br>207.2&thinsp;ms <span class="ev">141&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="ok" style="background:hsl(50,75%,85%)" title="pois_cross6_g3000p20_skew_base
+wall ratio &times;1.57 / eval ratio &times;1.09"><b>3.04&thinsp;s</b> <span class="ev">260&thinsp;ev</span><br>1.94&thinsp;s <span class="ev">239&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(101,75%,85%)" title="lmm_q2sq2s_g3000p20_skew_base
+wall ratio &times;0.39 / eval ratio &times;0.80"><b>23.1&thinsp;ms</b> <span class="ev">152&thinsp;ev</span><br>59.6&thinsp;ms <span class="ev">190&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/base</th>
+<td class="ok" style="background:hsl(61,75%,85%)" title="lmm_q2sx2_g3000p100_bal_base
+wall ratio &times;0.97 / eval ratio &times;0.86"><b>6.6&thinsp;ms</b> <span class="ev">102&thinsp;ev</span><br>6.8&thinsp;ms <span class="ev">118&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(42,75%,85%)" title="binb_cross6_g3000p100_bal_base
+wall ratio &times;2.26 / eval ratio &times;1.47"><b>765.3&thinsp;ms</b> <span class="ev">182&thinsp;ev</span><br>339.4&thinsp;ms <span class="ev">124&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(48,75%,85%)" title="lmm_cross6_g3000p100_bal_base
+wall ratio &times;1.77 / eval ratio &times;0.65"><b>27.8&thinsp;ms</b> <span class="ev">128&thinsp;ev</span><br>15.7&thinsp;ms <span class="ev">196&thinsp;ev</span></td>
+<td class="ok" style="background:hsl(58,75%,85%)" title="pois_cross6_g3000p100_bal_base
+wall ratio &times;1.09 / eval ratio &times;1.15"><b>1.14&thinsp;s</b> <span class="ev">259&thinsp;ev</span><br>1.05&thinsp;s <span class="ev">226&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(77,75%,85%)" title="lmm_q2sq2s_g3000p100_bal_base
+wall ratio &times;0.67 / eval ratio &times;0.82"><b>10.1&thinsp;ms</b> <span class="ev">227&thinsp;ev</span><br>15.0&thinsp;ms <span class="ev">276&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(72,75%,85%)" title="lmm_q3s_g3000p100_bal_base
+wall ratio &times;0.77 / eval ratio &times;0.73"><b>4.2&thinsp;ms</b> <span class="ev">153&thinsp;ev</span><br>5.5&thinsp;ms <span class="ev">210&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p100 bal/nearzero</th>
+<td></td>
+<td class="grp ok" style="background:hsl(43,75%,85%)" title="binb_cross6_g3000p100_bal_nearzero
+wall ratio &times;2.16 / eval ratio &times;1.21"><b>724.7&thinsp;ms</b> <span class="ev">171&thinsp;ev</span><br>335.4&thinsp;ms <span class="ev">141&thinsp;ev</span></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/rare</th>
+<td></td>
+<td class="grp ok" style="background:hsl(47,75%,85%)" title="binb_cross6_g3000p100_bal_rare
+wall ratio &times;1.79 / eval ratio &times;1.32"><b>684.7&thinsp;ms</b> <span class="ev">157&thinsp;ev</span><br>381.8&thinsp;ms <span class="ev">119&thinsp;ev</span></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 skew/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(47,75%,85%)" title="binb_cross6_g3000p100_skew_base
+wall ratio &times;1.79 / eval ratio &times;1.24"><b>706.2&thinsp;ms</b> <span class="ev">179&thinsp;ev</span><br>394.3&thinsp;ms <span class="ev">144&thinsp;ev</span></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td class="ok" style="background:hsl(87,75%,85%)" title="lmm_q2sx2_g30000p5_bal_base
+wall ratio &times;0.53 / eval ratio &times;0.99"><b>1.12&thinsp;s</b> <span class="ev">156&thinsp;ev</span><br>2.10&thinsp;s <span class="ev">157&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(120,75%,85%)" title="lmm_cross6_g30000p5_bal_base
+wall ratio &times;0.030 / eval ratio &times;1.09"><b>157.3&thinsp;ms</b> <span class="ev">399&thinsp;ev</span><br>5.19&thinsp;s <span class="ev">367&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(89,75%,85%)" title="lmm_q2sq2s_g30000p5_bal_base
+wall ratio &times;0.51 / eval ratio &times;1.54"><b>1.45&thinsp;s</b> <span class="ev">361&thinsp;ev</span><br>2.84&thinsp;s <span class="ev">234&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(90,75%,85%)" title="lmm_q3s_g30000p5_bal_base
+wall ratio &times;0.50 / eval ratio &times;1.52"><b>141.2&thinsp;ms</b> <span class="ev">108&thinsp;ev</span><br>280.9&thinsp;ms <span class="ev">71&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p5 bal/highcorr</th>
+<td class="ok" style="background:hsl(87,75%,85%)" title="lmm_q2sx2_g30000p5_bal_highcorr
+wall ratio &times;0.54 / eval ratio &times;1.01"><b>1.31&thinsp;s</b> <span class="ev">184&thinsp;ev</span><br>2.43&thinsp;s <span class="ev">182&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/lowsnr</th>
+<td class="ok" style="background:hsl(72,75%,85%)" title="lmm_q2sx2_g30000p5_bal_lowsnr
+wall ratio &times;0.75 / eval ratio &times;1.44"><b>1.83&thinsp;s</b> <span class="ev">262&thinsp;ev</span><br>2.43&thinsp;s <span class="ev">182&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/nearzero</th>
+<td class="ok" style="background:hsl(74,75%,85%)" title="lmm_q2sx2_g30000p5_bal_nearzero
+wall ratio &times;0.72 / eval ratio &times;1.38"><b>1.85&thinsp;s</b> <span class="ev">264&thinsp;ev</span><br>2.57&thinsp;s <span class="ev">192&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 single/base</th>
+<td class="ok" style="background:hsl(51,75%,85%)" title="lmm_q2sx2_g30000p5_single_base
+wall ratio &times;1.51 / eval ratio &times;1.37"><b>2.85&thinsp;s</b> <span class="ev">190&thinsp;ev</span><br>1.89&thinsp;s <span class="ev">139&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 skew/base</th>
+<td class="ok" style="background:hsl(71,75%,85%)" title="lmm_q2sx2_g30000p5_skew_base
+wall ratio &times;0.77 / eval ratio &times;1.41"><b>1.19&thinsp;s</b> <span class="ev">212&thinsp;ev</span><br>1.54&thinsp;s <span class="ev">150&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td class="ok" style="background:hsl(64,75%,85%)" title="lmm_q2sx2_g30000p20_bal_base
+wall ratio &times;0.91 / eval ratio &times;1.57"><b>521.7&thinsp;ms</b> <span class="ev">283&thinsp;ev</span><br>573.3&thinsp;ms <span class="ev">180&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(93,75%,85%)" title="lmm_cross6_g30000p20_bal_base
+wall ratio &times;0.46 / eval ratio &times;1.54"><b>393.7&thinsp;ms</b> <span class="ev">383&thinsp;ev</span><br>851.4&thinsp;ms <span class="ev">248&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(71,75%,85%)" title="lmm_q2sq2s_g30000p20_bal_base
+wall ratio &times;0.78 / eval ratio &times;1.66"><b>587.5&thinsp;ms</b> <span class="ev">423&thinsp;ev</span><br>749.3&thinsp;ms <span class="ev">255&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(76,75%,85%)" title="lmm_q3s_g30000p20_bal_base
+wall ratio &times;0.69 / eval ratio &times;1.37"><b>62.9&thinsp;ms</b> <span class="ev">129&thinsp;ev</span><br>91.8&thinsp;ms <span class="ev">94&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p20 bal/highcorr</th>
+<td class="ok" style="background:hsl(75,75%,85%)" title="lmm_q2sx2_g30000p20_bal_highcorr
+wall ratio &times;0.70 / eval ratio &times;1.20"><b>474.5&thinsp;ms</b> <span class="ev">255&thinsp;ev</span><br>676.6&thinsp;ms <span class="ev">213&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/lowsnr</th>
+<td class="ok" style="background:hsl(81,75%,85%)" title="lmm_q2sx2_g30000p20_bal_lowsnr
+wall ratio &times;0.61 / eval ratio &times;1.01"><b>371.9&thinsp;ms</b> <span class="ev">194&thinsp;ev</span><br>610.4&thinsp;ms <span class="ev">192&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/nearzero</th>
+<td class="ok" style="background:hsl(60,75%,85%)" title="lmm_q2sx2_g30000p20_bal_nearzero
+wall ratio &times;1.01 / eval ratio &times;1.79"><b>707.3&thinsp;ms</b> <span class="ev">396&thinsp;ev</span><br>702.8&thinsp;ms <span class="ev">221&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 single/base</th>
+<td class="ok" style="background:hsl(66,75%,85%)" title="lmm_q2sx2_g30000p20_single_base
+wall ratio &times;0.86 / eval ratio &times;1.63"><b>2.17&thinsp;s</b> <span class="ev">244&thinsp;ev</span><br>2.52&thinsp;s <span class="ev">150&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 skew/base</th>
+<td class="ok" style="background:hsl(69,75%,85%)" title="lmm_q2sx2_g30000p20_skew_base
+wall ratio &times;0.80 / eval ratio &times;1.35"><b>425.4&thinsp;ms</b> <span class="ev">226&thinsp;ev</span><br>529.5&thinsp;ms <span class="ev">167&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td class="ok" style="background:hsl(64,75%,85%)" title="lmm_q2sx2_g30000p100_bal_base
+wall ratio &times;0.92 / eval ratio &times;1.01"><b>109.8&thinsp;ms</b> <span class="ev">187&thinsp;ev</span><br>119.9&thinsp;ms <span class="ev">186&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="ok" style="background:hsl(56,75%,85%)" title="lmm_cross6_g30000p100_bal_base
+wall ratio &times;1.20 / eval ratio &times;0.80"><b>265.9&thinsp;ms</b> <span class="ev">233&thinsp;ev</span><br>221.6&thinsp;ms <span class="ev">293&thinsp;ev</span></td>
+<td></td>
+<td class="grp ok" style="background:hsl(69,75%,85%)" title="lmm_q2sq2s_g30000p100_bal_base
+wall ratio &times;0.81 / eval ratio &times;0.99"><b>170.0&thinsp;ms</b> <span class="ev">342&thinsp;ev</span><br>208.8&thinsp;ms <span class="ev">346&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(58,75%,85%)" title="lmm_q3s_g30000p100_bal_base
+wall ratio &times;1.09 / eval ratio &times;0.98"><b>39.0&thinsp;ms</b> <span class="ev">175&thinsp;ev</span><br>35.9&thinsp;ms <span class="ev">179&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 bal/highcorr</th>
+<td class="ok" style="background:hsl(75,75%,85%)" title="lmm_q2sx2_g30000p100_bal_highcorr
+wall ratio &times;0.71 / eval ratio &times;0.83"><b>121.5&thinsp;ms</b> <span class="ev">220&thinsp;ev</span><br>171.0&thinsp;ms <span class="ev">266&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(60,75%,85%)" title="lmm_q3s_g30000p100_bal_highcorr
+wall ratio &times;1.02 / eval ratio &times;0.87"><b>38.8&thinsp;ms</b> <span class="ev">166&thinsp;ev</span><br>38.2&thinsp;ms <span class="ev">190&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td class="ok" style="background:hsl(57,75%,85%)" title="lmm_q2sx2_g30000p100_bal_lowsnr
+wall ratio &times;1.12 / eval ratio &times;1.13"><b>96.5&thinsp;ms</b> <span class="ev">150&thinsp;ev</span><br>85.9&thinsp;ms <span class="ev">133&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(58,75%,85%)" title="lmm_q3s_g30000p100_bal_lowsnr
+wall ratio &times;1.11 / eval ratio &times;0.78"><b>35.5&thinsp;ms</b> <span class="ev">124&thinsp;ev</span><br>31.8&thinsp;ms <span class="ev">159&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td class="ok" style="background:hsl(54,75%,85%)" title="lmm_q2sx2_g30000p100_bal_nearzero
+wall ratio &times;1.34 / eval ratio &times;1.96"><b>205.5&thinsp;ms</b> <span class="ev">469&thinsp;ev</span><br>153.7&thinsp;ms <span class="ev">239&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(69,75%,85%)" title="lmm_q3s_g30000p100_bal_nearzero
+wall ratio &times;0.82 / eval ratio &times;1.17"><b>49.8&thinsp;ms</b> <span class="ev">354&thinsp;ev</span><br>60.7&thinsp;ms <span class="ev">303&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td class="ok" style="background:hsl(92,75%,85%)" title="lmm_q2sx2_g30000p100_single_base
+wall ratio &times;0.48 / eval ratio &times;0.88"><b>1.29&thinsp;s</b> <span class="ev">171&thinsp;ev</span><br>2.72&thinsp;s <span class="ev">194&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(107,75%,85%)" title="lmm_q3s_g30000p100_single_base
+wall ratio &times;0.34 / eval ratio &times;0.98"><b>123.6&thinsp;ms</b> <span class="ev">86&thinsp;ev</span><br>362.2&thinsp;ms <span class="ev">88&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td class="ok" style="background:hsl(64,75%,85%)" title="lmm_q2sx2_g30000p100_skew_base
+wall ratio &times;0.91 / eval ratio &times;1.04"><b>112.5&thinsp;ms</b> <span class="ev">199&thinsp;ev</span><br>123.6&thinsp;ms <span class="ev">192&thinsp;ev</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(64,75%,85%)" title="lmm_q3s_g30000p100_skew_base
+wall ratio &times;0.91 / eval ratio &times;0.80"><b>37.1&thinsp;ms</b> <span class="ev">161&thinsp;ev</span><br>40.5&thinsp;ms <span class="ev">202&thinsp;ev</span></td>
+</tr>
+</table>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="1" class="grp">cross8 <small>(n_theta 8)</small></th>
+<th colspan="1" class="grp">q3sx2 <small>(n_theta 8)</small></th>
+<th colspan="1" class="grp">q4 <small>(n_theta 10)</small></th>
+<th colspan="1" class="grp">q4sx2 <small>(n_theta 12)</small></th>
+</tr>
+<tr>
+<th class="grp">gaussian</th>
+<th class="grp">gaussian</th>
+<th class="grp">gaussian</th>
+<th class="grp">gaussian</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_cross8_g300p5_bal_base
+wall ratio &times;5.13 / eval ratio &times;1.44"><b>330.4&thinsp;ms</b> <span class="ev">180&thinsp;ev</span><br>64.4&thinsp;ms <span class="ev">125&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(60,75%,85%)" title="lmm_q3sx2_g300p5_bal_base
+wall ratio &times;1.01 / eval ratio &times;1.63"><b>21.3&thinsp;ms</b> <span class="ev">170&thinsp;ev</span><br>21.2&thinsp;ms <span class="ev">104&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(77,75%,85%)" title="lmm_q4_g300p5_bal_base
+wall ratio &times;0.68 / eval ratio &times;1.34"><b>4.7&thinsp;ms</b> <span class="ev">170&thinsp;ev</span><br>6.9&thinsp;ms <span class="ev">127&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(63,75%,85%)" title="lmm_q4sx2_g300p5_bal_base
+wall ratio &times;0.94 / eval ratio &times;1.38"><b>36.5&thinsp;ms</b> <span class="ev">210&thinsp;ev</span><br>39.0&thinsp;ms <span class="ev">152&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p5 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(63,75%,85%)" title="lmm_q4sx2_g300p5_bal_highcorr
+wall ratio &times;0.93 / eval ratio &times;1.44"><b>76.8&thinsp;ms</b> <span class="ev">458&thinsp;ev</span><br>82.3&thinsp;ms <span class="ev">319&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(71,75%,85%)" title="lmm_q4sx2_g300p5_bal_lowsnr
+wall ratio &times;0.78 / eval ratio &times;1.18"><b>34.1&thinsp;ms</b> <span class="ev">201&thinsp;ev</span><br>43.9&thinsp;ms <span class="ev">171&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(57,75%,85%)" title="lmm_q4sx2_g300p5_bal_nearzero
+wall ratio &times;1.12 / eval ratio &times;1.72"><b>51.3&thinsp;ms</b> <span class="ev">304&thinsp;ev</span><br>45.6&thinsp;ms <span class="ev">177&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(49,75%,85%)" title="lmm_q4sx2_g300p5_single_base
+wall ratio &times;1.68 / eval ratio &times;1.15"><b>65.5&thinsp;ms</b> <span class="ev">207&thinsp;ev</span><br>39.0&thinsp;ms <span class="ev">180&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(67,75%,85%)" title="lmm_q4sx2_g300p5_skew_base
+wall ratio &times;0.84 / eval ratio &times;1.36"><b>27.9&thinsp;ms</b> <span class="ev">267&thinsp;ev</span><br>33.2&thinsp;ms <span class="ev">196&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p20 bal/base</th>
+<td class="ok" style="background:hsl(88,75%,85%)" title="lmm_cross8_g300p20_bal_base
+wall ratio &times;0.53 / eval ratio &times;0.83"><b>7.9&thinsp;ms</b> <span class="ev">172&thinsp;ev</span><br>15.0&thinsp;ms <span class="ev">206&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(87,75%,85%)" title="lmm_q3sx2_g300p20_bal_base
+wall ratio &times;0.54 / eval ratio &times;1.06"><b>2.5&thinsp;ms</b> <span class="ev">134&thinsp;ev</span><br>4.6&thinsp;ms <span class="ev">126&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(74,75%,85%)" title="lmm_q4_g300p20_bal_base
+wall ratio &times;0.72 / eval ratio &times;1.11"><b>3.6&thinsp;ms</b> <span class="ev">273&thinsp;ev</span><br>5.0&thinsp;ms <span class="ev">247&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(83,75%,85%)" title="lmm_q4sx2_g300p20_bal_base
+wall ratio &times;0.59 / eval ratio &times;1.09"><b>6.1&thinsp;ms</b> <span class="ev">260&thinsp;ev</span><br>10.3&thinsp;ms <span class="ev">238&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p20 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(74,75%,85%)" title="lmm_q4sx2_g300p20_bal_highcorr
+wall ratio &times;0.72 / eval ratio &times;1.38"><b>10.1&thinsp;ms</b> <span class="ev">448&thinsp;ev</span><br>14.1&thinsp;ms <span class="ev">325&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p20 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(81,75%,85%)" title="lmm_q4sx2_g300p20_bal_lowsnr
+wall ratio &times;0.61 / eval ratio &times;1.14"><b>6.2&thinsp;ms</b> <span class="ev">266&thinsp;ev</span><br>10.1&thinsp;ms <span class="ev">234&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p20 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(69,75%,85%)" title="lmm_q4sx2_g300p20_bal_nearzero
+wall ratio &times;0.80 / eval ratio &times;1.55"><b>16.9&thinsp;ms</b> <span class="ev">735&thinsp;ev</span><br>21.1&thinsp;ms <span class="ev">475&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p20 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(70,75%,85%)" title="lmm_q4sx2_g300p20_single_base
+wall ratio &times;0.79 / eval ratio &times;1.20"><b>45.3&thinsp;ms</b> <span class="ev">220&thinsp;ev</span><br>57.0&thinsp;ms <span class="ev">184&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p20 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(80,75%,85%)" title="lmm_q4sx2_g300p20_skew_base
+wall ratio &times;0.63 / eval ratio &times;1.22"><b>11.7&thinsp;ms</b> <span class="ev">517&thinsp;ev</span><br>18.7&thinsp;ms <span class="ev">423&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td class="ok" style="background:hsl(55,75%,85%)" title="lmm_cross8_g3000p5_bal_base
+wall ratio &times;1.25 / eval ratio &times;0.99"><b>774.2&thinsp;ms</b> <span class="ev">236&thinsp;ev</span><br>619.5&thinsp;ms <span class="ev">238&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(70,75%,85%)" title="lmm_q3sx2_g3000p5_bal_base
+wall ratio &times;0.79 / eval ratio &times;1.31"><b>199.3&thinsp;ms</b> <span class="ev">179&thinsp;ev</span><br>251.7&thinsp;ms <span class="ev">137&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(82,75%,85%)" title="lmm_q4_g3000p5_bal_base
+wall ratio &times;0.60 / eval ratio &times;1.38"><b>30.0&thinsp;ms</b> <span class="ev">149&thinsp;ev</span><br>49.9&thinsp;ms <span class="ev">108&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(71,75%,85%)" title="lmm_q4sx2_g3000p5_bal_base
+wall ratio &times;0.77 / eval ratio &times;1.16"><b>401.1&thinsp;ms</b> <span class="ev">260&thinsp;ev</span><br>521.8&thinsp;ms <span class="ev">225&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_cross8_g3000p20_bal_base
+wall ratio &times;4.83 / eval ratio &times;1.01"><b>790.0&thinsp;ms</b> <span class="ev">189&thinsp;ev</span><br>163.4&thinsp;ms <span class="ev">188&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(58,75%,85%)" title="lmm_q3sx2_g3000p20_bal_base
+wall ratio &times;1.09 / eval ratio &times;1.68"><b>94.5&thinsp;ms</b> <span class="ev">304&thinsp;ev</span><br>86.4&thinsp;ms <span class="ev">181&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(86,75%,85%)" title="lmm_q4_g3000p20_bal_base
+wall ratio &times;0.54 / eval ratio &times;1.00"><b>15.0&thinsp;ms</b> <span class="ev">227&thinsp;ev</span><br>27.7&thinsp;ms <span class="ev">226&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(71,75%,85%)" title="lmm_q4sx2_g3000p20_bal_base
+wall ratio &times;0.77 / eval ratio &times;1.12"><b>144.7&thinsp;ms</b> <span class="ev">354&thinsp;ev</span><br>188.0&thinsp;ms <span class="ev">315&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p20 bal/lowsnr</th>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_cross8_g3000p20_bal_lowsnr
+wall ratio &times;4.12 / eval ratio &times;0.85"><b>884.4&thinsp;ms</b> <span class="ev">211&thinsp;ev</span><br>214.6&thinsp;ms <span class="ev">247&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/nearzero</th>
+<td class="ok" style="background:hsl(35,75%,85%)" title="lmm_cross8_g3000p20_bal_nearzero
+wall ratio &times;3.20 / eval ratio &times;0.67"><b>883.8&thinsp;ms</b> <span class="ev">213&thinsp;ev</span><br>276.4&thinsp;ms <span class="ev">319&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 single/base</th>
+<td class="ok" style="background:hsl(61,75%,85%)" title="lmm_cross8_g3000p20_single_base
+wall ratio &times;0.98 / eval ratio &times;0.84"><b>636.8&thinsp;ms</b> <span class="ev">171&thinsp;ev</span><br>653.1&thinsp;ms <span class="ev">203&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 skew/base</th>
+<td class="ok" style="background:hsl(36,75%,85%)" title="lmm_cross8_g3000p20_skew_base
+wall ratio &times;2.97 / eval ratio &times;0.69"><b>663.3&thinsp;ms</b> <span class="ev">177&thinsp;ev</span><br>223.3&thinsp;ms <span class="ev">256&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/base</th>
+<td class="ok" style="background:hsl(42,75%,85%)" title="lmm_cross8_g3000p100_bal_base
+wall ratio &times;2.27 / eval ratio &times;0.84"><b>92.0&thinsp;ms</b> <span class="ev">223&thinsp;ev</span><br>40.6&thinsp;ms <span class="ev">267&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(81,75%,85%)" title="lmm_q3sx2_g3000p100_bal_base
+wall ratio &times;0.62 / eval ratio &times;0.78"><b>11.7&thinsp;ms</b> <span class="ev">200&thinsp;ev</span><br>18.9&thinsp;ms <span class="ev">255&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(93,75%,85%)" title="lmm_q4_g3000p100_bal_base
+wall ratio &times;0.47 / eval ratio &times;0.54"><b>7.9&thinsp;ms</b> <span class="ev">278&thinsp;ev</span><br>16.9&thinsp;ms <span class="ev">518&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(87,75%,85%)" title="lmm_q4sx2_g3000p100_bal_base
+wall ratio &times;0.53 / eval ratio &times;0.76"><b>22.2&thinsp;ms</b> <span class="ev">340&thinsp;ev</span><br>41.5&thinsp;ms <span class="ev">447&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p100 bal/lowsnr</th>
+<td class="ok" style="background:hsl(37,75%,85%)" title="lmm_cross8_g3000p100_bal_lowsnr
+wall ratio &times;2.84 / eval ratio &times;0.93"><b>93.5&thinsp;ms</b> <span class="ev">200&thinsp;ev</span><br>32.9&thinsp;ms <span class="ev">216&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/nearzero</th>
+<td class="ok" style="background:hsl(42,75%,85%)" title="lmm_cross8_g3000p100_bal_nearzero
+wall ratio &times;2.26 / eval ratio &times;0.76"><b>111.2&thinsp;ms</b> <span class="ev">247&thinsp;ev</span><br>49.2&thinsp;ms <span class="ev">324&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 single/base</th>
+<td class="ok" style="background:hsl(63,75%,85%)" title="lmm_cross8_g3000p100_single_base
+wall ratio &times;0.93 / eval ratio &times;0.66"><b>683.5&thinsp;ms</b> <span class="ev">178&thinsp;ev</span><br>738.6&thinsp;ms <span class="ev">271&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 skew/base</th>
+<td class="ok" style="background:hsl(57,75%,85%)" title="lmm_cross8_g3000p100_skew_base
+wall ratio &times;1.17 / eval ratio &times;0.39"><b>60.1&thinsp;ms</b> <span class="ev">132&thinsp;ev</span><br>51.1&thinsp;ms <span class="ev">337&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td class="ok" style="background:hsl(60,75%,85%)" title="lmm_cross8_g30000p5_bal_base
+wall ratio &times;0.99 / eval ratio &times;1.66"><b>9.49&thinsp;s</b> <span class="ev">626&thinsp;ev</span><br>9.57&thinsp;s <span class="ev">378&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(67,75%,85%)" title="lmm_q3sx2_g30000p5_bal_base
+wall ratio &times;0.85 / eval ratio &times;1.43"><b>3.98&thinsp;s</b> <span class="ev">344&thinsp;ev</span><br>4.67&thinsp;s <span class="ev">241&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(88,75%,85%)" title="lmm_q4_g30000p5_bal_base
+wall ratio &times;0.53 / eval ratio &times;1.24"><b>295.3&thinsp;ms</b> <span class="ev">151&thinsp;ev</span><br>559.7&thinsp;ms <span class="ev">122&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(58,75%,85%)" title="lmm_q4sx2_g30000p5_bal_base
+wall ratio &times;1.12 / eval ratio &times;1.56"><b>7.53&thinsp;s</b> <span class="ev">427&thinsp;ev</span><br>6.71&thinsp;s <span class="ev">273&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p5 bal/highcorr</th>
+<td></td>
+<td class="grp ok" style="background:hsl(68,75%,85%)" title="lmm_q3sx2_g30000p5_bal_highcorr
+wall ratio &times;0.84 / eval ratio &times;1.41"><b>5.31&thinsp;s</b> <span class="ev">462&thinsp;ev</span><br>6.33&thinsp;s <span class="ev">327&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/lowsnr</th>
+<td class="ok" style="background:hsl(90,75%,85%)" title="lmm_cross8_g30000p5_bal_lowsnr
+wall ratio &times;0.50 / eval ratio &times;0.84"><b>8.39&thinsp;s</b> <span class="ev">558&thinsp;ev</span><br>16.75&thinsp;s <span class="ev">661&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(103,75%,85%)" title="lmm_q3sx2_g30000p5_bal_lowsnr
+wall ratio &times;0.37 / eval ratio &times;0.61"><b>2.50&thinsp;s</b> <span class="ev">215&thinsp;ev</span><br>6.81&thinsp;s <span class="ev">352&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/nearzero</th>
+<td class="ok" style="background:hsl(111,75%,85%)" title="lmm_cross8_g30000p5_bal_nearzero
+wall ratio &times;0.31 / eval ratio &times;0.48"><b>3.25&thinsp;s</b> <span class="ev">198&thinsp;ev</span><br>10.44&thinsp;s <span class="ev">412&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(80,75%,85%)" title="lmm_q3sx2_g30000p5_bal_nearzero
+wall ratio &times;0.63 / eval ratio &times;1.06"><b>3.67&thinsp;s</b> <span class="ev">318&thinsp;ev</span><br>5.80&thinsp;s <span class="ev">299&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 single/base</th>
+<td class="mm-fail" title="lmm_cross8_g30000p5_single_base">glmm 8.79&thinsp;s &middot; 575ev<br>MM.jl: timeout</td>
+<td class="grp ok" style="background:hsl(49,75%,85%)" title="lmm_q3sx2_g30000p5_single_base
+wall ratio &times;1.70 / eval ratio &times;1.17"><b>5.37&thinsp;s</b> <span class="ev">221&thinsp;ev</span><br>3.16&thinsp;s <span class="ev">189&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 skew/base</th>
+<td class="ok" style="background:hsl(56,75%,85%)" title="lmm_cross8_g30000p5_skew_base
+wall ratio &times;1.23 / eval ratio &times;1.04"><b>11.68&thinsp;s</b> <span class="ev">506&thinsp;ev</span><br>9.53&thinsp;s <span class="ev">486&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(65,75%,85%)" title="lmm_q3sx2_g30000p5_skew_base
+wall ratio &times;0.88 / eval ratio &times;1.51"><b>3.16&thinsp;s</b> <span class="ev">361&thinsp;ev</span><br>3.57&thinsp;s <span class="ev">239&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_cross8_g30000p20_bal_base
+wall ratio &times;4.20 / eval ratio &times;1.11"><b>12.70&thinsp;s</b> <span class="ev">531&thinsp;ev</span><br>3.02&thinsp;s <span class="ev">477&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(76,75%,85%)" title="lmm_q3sx2_g30000p20_bal_base
+wall ratio &times;0.68 / eval ratio &times;1.11"><b>1.09&thinsp;s</b> <span class="ev">377&thinsp;ev</span><br>1.59&thinsp;s <span class="ev">339&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(74,75%,85%)" title="lmm_q4_g30000p20_bal_base
+wall ratio &times;0.72 / eval ratio &times;1.41"><b>144.0&thinsp;ms</b> <span class="ev">247&thinsp;ev</span><br>200.1&thinsp;ms <span class="ev">175&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(62,75%,85%)" title="lmm_q4sx2_g30000p20_bal_base
+wall ratio &times;0.95 / eval ratio &times;1.46"><b>2.53&thinsp;s</b> <span class="ev">651&thinsp;ev</span><br>2.68&thinsp;s <span class="ev">445&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p20 bal/highcorr</th>
+<td></td>
+<td class="grp ok" style="background:hsl(61,75%,85%)" title="lmm_q3sx2_g30000p20_bal_highcorr
+wall ratio &times;0.98 / eval ratio &times;1.65"><b>1.54&thinsp;s</b> <span class="ev">549&thinsp;ev</span><br>1.56&thinsp;s <span class="ev">333&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/lowsnr</th>
+<td></td>
+<td class="grp ok" style="background:hsl(56,75%,85%)" title="lmm_q3sx2_g30000p20_bal_lowsnr
+wall ratio &times;1.20 / eval ratio &times;1.99"><b>1.53&thinsp;s</b> <span class="ev">539&thinsp;ev</span><br>1.27&thinsp;s <span class="ev">271&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/nearzero</th>
+<td></td>
+<td class="grp ok" style="background:hsl(70,75%,85%)" title="lmm_q3sx2_g30000p20_bal_nearzero
+wall ratio &times;0.80 / eval ratio &times;1.33"><b>1.54&thinsp;s</b> <span class="ev">546&thinsp;ev</span><br>1.92&thinsp;s <span class="ev">409&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 single/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(59,75%,85%)" title="lmm_q3sx2_g30000p20_single_base
+wall ratio &times;1.06 / eval ratio &times;1.78"><b>5.47&thinsp;s</b> <span class="ev">378&thinsp;ev</span><br>5.15&thinsp;s <span class="ev">212&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 skew/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(73,75%,85%)" title="lmm_q3sx2_g30000p20_skew_base
+wall ratio &times;0.74 / eval ratio &times;1.21"><b>1.15&thinsp;s</b> <span class="ev">403&thinsp;ev</span><br>1.56&thinsp;s <span class="ev">334&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td class="ok" style="background:hsl(30,75%,85%)" title="lmm_cross8_g30000p100_bal_base
+wall ratio &times;7.21 / eval ratio &times;0.57"><b>4.64&thinsp;s</b> <span class="ev">258&thinsp;ev</span><br>643.6&thinsp;ms <span class="ev">452&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(84,75%,85%)" title="lmm_q3sx2_g30000p100_bal_base
+wall ratio &times;0.57 / eval ratio &times;0.78"><b>266.1&thinsp;ms</b> <span class="ev">393&thinsp;ev</span><br>464.9&thinsp;ms <span class="ev">504&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(70,75%,85%)" title="lmm_q4_g30000p100_bal_base
+wall ratio &times;0.79 / eval ratio &times;0.90"><b>68.8&thinsp;ms</b> <span class="ev">332&thinsp;ev</span><br>86.9&thinsp;ms <span class="ev">368&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(77,75%,85%)" title="lmm_q4sx2_g30000p100_bal_base
+wall ratio &times;0.68 / eval ratio &times;0.89"><b>386.5&thinsp;ms</b> <span class="ev">433&thinsp;ev</span><br>567.3&thinsp;ms <span class="ev">484&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 bal/highcorr</th>
+<td></td>
+<td class="grp ok" style="background:hsl(78,75%,85%)" title="lmm_q3sx2_g30000p100_bal_highcorr
+wall ratio &times;0.65 / eval ratio &times;0.89"><b>271.2&thinsp;ms</b> <span class="ev">399&thinsp;ev</span><br>415.3&thinsp;ms <span class="ev">449&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(77,75%,85%)" title="lmm_q4_g30000p100_bal_highcorr
+wall ratio &times;0.68 / eval ratio &times;0.76"><b>65.7&thinsp;ms</b> <span class="ev">311&thinsp;ev</span><br>97.2&thinsp;ms <span class="ev">411&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td></td>
+<td class="grp ok" style="background:hsl(57,75%,85%)" title="lmm_q3sx2_g30000p100_bal_lowsnr
+wall ratio &times;1.15 / eval ratio &times;1.59"><b>290.6&thinsp;ms</b> <span class="ev">432&thinsp;ev</span><br>252.6&thinsp;ms <span class="ev">271&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(62,75%,85%)" title="lmm_q4_g30000p100_bal_lowsnr
+wall ratio &times;0.96 / eval ratio &times;0.93"><b>60.0&thinsp;ms</b> <span class="ev">247&thinsp;ev</span><br>62.6&thinsp;ms <span class="ev">266&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td></td>
+<td class="grp ok" style="background:hsl(59,75%,85%)" title="lmm_q3sx2_g30000p100_bal_nearzero
+wall ratio &times;1.05 / eval ratio &times;1.64"><b>685.3&thinsp;ms</b> <span class="ev">1161&thinsp;ev</span><br>652.7&thinsp;ms <span class="ev">708&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(69,75%,85%)" title="lmm_q4_g30000p100_bal_nearzero
+wall ratio &times;0.82 / eval ratio &times;1.47"><b>127.4&thinsp;ms</b> <span class="ev">962&thinsp;ev</span><br>155.8&thinsp;ms <span class="ev">655&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(84,75%,85%)" title="lmm_q3sx2_g30000p100_single_base
+wall ratio &times;0.57 / eval ratio &times;0.96"><b>3.30&thinsp;s</b> <span class="ev">271&thinsp;ev</span><br>5.73&thinsp;s <span class="ev">282&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(98,75%,85%)" title="lmm_q4_g30000p100_single_base
+wall ratio &times;0.42 / eval ratio &times;0.99"><b>330.0&thinsp;ms</b> <span class="ev">163&thinsp;ev</span><br>794.4&thinsp;ms <span class="ev">164&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(47,75%,85%)" title="lmm_q3sx2_g30000p100_skew_base
+wall ratio &times;1.83 / eval ratio &times;2.46"><b>238.7&thinsp;ms</b> <span class="ev">344&thinsp;ev</span><br>130.1&thinsp;ms <span class="ev">140&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(65,75%,85%)" title="lmm_q4_g30000p100_skew_base
+wall ratio &times;0.89 / eval ratio &times;1.01"><b>65.8&thinsp;ms</b> <span class="ev">317&thinsp;ev</span><br>73.6&thinsp;ms <span class="ev">313&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+</table>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="1" class="grp">q5q2 <small>(n_theta 18)</small></th>
+<th colspan="1" class="grp">q6 <small>(n_theta 21)</small></th>
+<th colspan="1" class="grp">q6q2x3 <small>(n_theta 27)</small></th>
+<th colspan="1" class="grp">q8 <small>(n_theta 36)</small></th>
+</tr>
+<tr>
+<th class="grp">gaussian</th>
+<th class="grp">gaussian</th>
+<th class="grp">gaussian</th>
+<th class="grp">gaussian</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td class="ok" style="background:hsl(69,75%,85%)" title="lmm_q5q2_g300p5_bal_base
+wall ratio &times;0.81 / eval ratio &times;1.61"><b>53.6&thinsp;ms</b> <span class="ev">334&thinsp;ev</span><br>66.3&thinsp;ms <span class="ev">207&thinsp;ev</span></td>
+<td class="grp ok mismatch" style="background:hsl(39,75%,85%)" title="lmm_q6_g300p5_bal_base
+wall ratio &times;2.67 / eval ratio &times;3.92"><b>115.9&thinsp;ms</b> &#9888; <span class="ev">1859&thinsp;ev</span><br>43.4&thinsp;ms <span class="ev">474&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(59,75%,85%)" title="lmm_q6q2x3_g300p5_bal_base
+wall ratio &times;1.05 / eval ratio &times;1.42"><b>1.88&thinsp;s</b> <span class="ev">2076&thinsp;ev</span><br>1.80&thinsp;s <span class="ev">1458&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(42,75%,85%)" title="lmm_q8_g300p5_bal_base
+wall ratio &times;2.25 / eval ratio &times;2.39"><b>792.6&thinsp;ms</b> <span class="ev">5922&thinsp;ev</span><br>352.1&thinsp;ms <span class="ev">2474&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p5 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok mismatch" style="background:hsl(30,75%,85%)" title="lmm_q8_g300p5_bal_highcorr
+wall ratio &times;5.10 / eval ratio &times;5.12"><b>762.5&thinsp;ms</b> &#9888; <span class="ev">5649&thinsp;ev</span><br>149.5&thinsp;ms <span class="ev">1104&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(43,75%,85%)" title="lmm_q8_g300p5_bal_lowsnr
+wall ratio &times;2.14 / eval ratio &times;2.16"><b>508.8&thinsp;ms</b> <span class="ev">3750&thinsp;ev</span><br>237.3&thinsp;ms <span class="ev">1733&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(46,75%,85%)" title="lmm_q8_g300p5_bal_nearzero
+wall ratio &times;1.92 / eval ratio &times;1.98"><b>241.0&thinsp;ms</b> <span class="ev">1804&thinsp;ev</span><br>125.8&thinsp;ms <span class="ev">912&thinsp;ev</span></td>
+</tr>
+<tr><th>g300p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp glmm-fail" title="lmm_q8_g300p5_single_base">glmm: engine-fail<br>MM.jl 1.70&thinsp;s</td>
+</tr>
+<tr><th>g300p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(50,75%,85%)" title="lmm_q8_g300p5_skew_base
+wall ratio &times;1.57 / eval ratio &times;1.61"><b>235.0&thinsp;ms</b> <span class="ev">2047&thinsp;ev</span><br>149.5&thinsp;ms <span class="ev">1273&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td class="ok" style="background:hsl(85,75%,85%)" title="lmm_q5q2_g3000p5_bal_base
+wall ratio &times;0.56 / eval ratio &times;1.30"><b>504.5&thinsp;ms</b> <span class="ev">402&thinsp;ev</span><br>900.7&thinsp;ms <span class="ev">309&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(66,75%,85%)" title="lmm_q6_g3000p5_bal_base
+wall ratio &times;0.88 / eval ratio &times;1.50"><b>143.0&thinsp;ms</b> <span class="ev">343&thinsp;ev</span><br>163.0&thinsp;ms <span class="ev">228&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(110,75%,85%)" title="lmm_q6q2x3_g3000p5_bal_base
+wall ratio &times;0.31 / eval ratio &times;1.20"><b>1.89&thinsp;s</b> <span class="ev">640&thinsp;ev</span><br>6.03&thinsp;s <span class="ev">532&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(47,75%,85%)" title="lmm_q8_g3000p5_bal_base
+wall ratio &times;1.79 / eval ratio &times;2.02"><b>581.1&thinsp;ms</b> <span class="ev">762&thinsp;ev</span><br>325.1&thinsp;ms <span class="ev">378&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p5 bal/highcorr</th>
+<td class="ok" style="background:hsl(76,75%,85%)" title="lmm_q5q2_g3000p5_bal_highcorr
+wall ratio &times;0.70 / eval ratio &times;1.62"><b>1.04&thinsp;s</b> <span class="ev">832&thinsp;ev</span><br>1.49&thinsp;s <span class="ev">512&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(59,75%,85%)" title="lmm_q8_g3000p5_bal_highcorr
+wall ratio &times;1.07 / eval ratio &times;1.21"><b>690.6&thinsp;ms</b> <span class="ev">913&thinsp;ev</span><br>648.3&thinsp;ms <span class="ev">754&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p5 bal/lowsnr</th>
+<td class="ok" style="background:hsl(81,75%,85%)" title="lmm_q5q2_g3000p5_bal_lowsnr
+wall ratio &times;0.62 / eval ratio &times;1.43"><b>930.4&thinsp;ms</b> <span class="ev">743&thinsp;ev</span><br>1.51&thinsp;s <span class="ev">518&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok mismatch" style="background:hsl(50,75%,85%)" title="lmm_q8_g3000p5_bal_lowsnr
+wall ratio &times;1.57 / eval ratio &times;1.75"><b>1.34&thinsp;s</b> &#9888; <span class="ev">1732&thinsp;ev</span><br>851.8&thinsp;ms <span class="ev">987&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p5 bal/nearzero</th>
+<td class="ok" style="background:hsl(87,75%,85%)" title="lmm_q5q2_g3000p5_bal_nearzero
+wall ratio &times;0.54 / eval ratio &times;1.26"><b>690.6&thinsp;ms</b> <span class="ev">552&thinsp;ev</span><br>1.28&thinsp;s <span class="ev">439&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(57,75%,85%)" title="lmm_q8_g3000p5_bal_nearzero
+wall ratio &times;1.15 / eval ratio &times;1.31"><b>571.0&thinsp;ms</b> <span class="ev">755&thinsp;ev</span><br>497.9&thinsp;ms <span class="ev">578&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p5 single/base</th>
+<td class="ok" style="background:hsl(50,75%,85%)" title="lmm_q5q2_g3000p5_single_base
+wall ratio &times;1.59 / eval ratio &times;1.27"><b>853.3&thinsp;ms</b> <span class="ev">355&thinsp;ev</span><br>535.3&thinsp;ms <span class="ev">280&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(54,75%,85%)" title="lmm_q8_g3000p5_single_base
+wall ratio &times;1.32 / eval ratio &times;1.54"><b>1.15&thinsp;s</b> <span class="ev">800&thinsp;ev</span><br>873.5&thinsp;ms <span class="ev">518&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p5 skew/base</th>
+<td class="ok" style="background:hsl(95,75%,85%)" title="lmm_q5q2_g3000p5_skew_base
+wall ratio &times;0.45 / eval ratio &times;0.99"><b>418.1&thinsp;ms</b> <span class="ev">432&thinsp;ev</span><br>930.7&thinsp;ms <span class="ev">436&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(54,75%,85%)" title="lmm_q8_g3000p5_skew_base
+wall ratio &times;1.29 / eval ratio &times;1.46"><b>602.1&thinsp;ms</b> <span class="ev">980&thinsp;ev</span><br>466.2&thinsp;ms <span class="ev">673&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="ok" style="background:hsl(77,75%,85%)" title="lmm_q5q2_g3000p20_bal_base
+wall ratio &times;0.67 / eval ratio &times;1.14"><b>248.5&thinsp;ms</b> <span class="ev">564&thinsp;ev</span><br>371.6&thinsp;ms <span class="ev">496&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(71,75%,85%)" title="lmm_q6_g3000p20_bal_base
+wall ratio &times;0.78 / eval ratio &times;1.21"><b>58.2&thinsp;ms</b> <span class="ev">463&thinsp;ev</span><br>74.7&thinsp;ms <span class="ev">383&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(65,75%,85%)" title="lmm_q6q2x3_g3000p20_bal_base
+wall ratio &times;0.89 / eval ratio &times;0.97"><b>1.84&thinsp;s</b> <span class="ev">708&thinsp;ev</span><br>2.07&thinsp;s <span class="ev">728&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(52,75%,85%)" title="lmm_q8_g3000p20_bal_base
+wall ratio &times;1.47 / eval ratio &times;1.54"><b>212.8&thinsp;ms</b> <span class="ev">889&thinsp;ev</span><br>144.7&thinsp;ms <span class="ev">577&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p20 bal/highcorr</th>
+<td class="ok" style="background:hsl(83,75%,85%)" title="lmm_q5q2_g3000p20_bal_highcorr
+wall ratio &times;0.58 / eval ratio &times;0.99"><b>303.6&thinsp;ms</b> <span class="ev">689&thinsp;ev</span><br>520.3&thinsp;ms <span class="ev">695&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(47,75%,85%)" title="lmm_q8_g3000p20_bal_highcorr
+wall ratio &times;1.85 / eval ratio &times;1.96"><b>403.7&thinsp;ms</b> <span class="ev">1694&thinsp;ev</span><br>218.3&thinsp;ms <span class="ev">864&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p20 bal/lowsnr</th>
+<td class="ok" style="background:hsl(61,75%,85%)" title="lmm_q5q2_g3000p20_bal_lowsnr
+wall ratio &times;0.98 / eval ratio &times;1.66"><b>245.7&thinsp;ms</b> <span class="ev">559&thinsp;ev</span><br>250.6&thinsp;ms <span class="ev">337&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(57,75%,85%)" title="lmm_q8_g3000p20_bal_lowsnr
+wall ratio &times;1.16 / eval ratio &times;1.21"><b>231.2&thinsp;ms</b> <span class="ev">960&thinsp;ev</span><br>199.6&thinsp;ms <span class="ev">795&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p20 bal/nearzero</th>
+<td class="ok" style="background:hsl(64,75%,85%)" title="lmm_q5q2_g3000p20_bal_nearzero
+wall ratio &times;0.91 / eval ratio &times;1.56"><b>563.3&thinsp;ms</b> <span class="ev">1300&thinsp;ev</span><br>619.8&thinsp;ms <span class="ev">831&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(56,75%,85%)" title="lmm_q8_g3000p20_bal_nearzero
+wall ratio &times;1.22 / eval ratio &times;1.29"><b>336.5&thinsp;ms</b> <span class="ev">1397&thinsp;ev</span><br>276.6&thinsp;ms <span class="ev">1084&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p20 single/base</th>
+<td class="ok" style="background:hsl(89,75%,85%)" title="lmm_q5q2_g3000p20_single_base
+wall ratio &times;0.52 / eval ratio &times;1.20"><b>549.5&thinsp;ms</b> <span class="ev">348&thinsp;ev</span><br>1.06&thinsp;s <span class="ev">291&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(54,75%,85%)" title="lmm_q8_g3000p20_single_base
+wall ratio &times;1.33 / eval ratio &times;1.53"><b>639.5&thinsp;ms</b> <span class="ev">690&thinsp;ev</span><br>480.4&thinsp;ms <span class="ev">452&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p20 skew/base</th>
+<td class="ok" style="background:hsl(67,75%,85%)" title="lmm_q5q2_g3000p20_skew_base
+wall ratio &times;0.85 / eval ratio &times;1.62"><b>314.8&thinsp;ms</b> <span class="ev">820&thinsp;ev</span><br>371.4&thinsp;ms <span class="ev">507&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp ok" style="background:hsl(75,75%,85%)" title="lmm_q8_g3000p20_skew_base
+wall ratio &times;0.71 / eval ratio &times;0.76"><b>206.6&thinsp;ms</b> <span class="ev">860&thinsp;ev</span><br>291.1&thinsp;ms <span class="ev">1137&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p100 bal/base</th>
+<td class="ok" style="background:hsl(52,75%,85%)" title="lmm_q5q2_g3000p100_bal_base
+wall ratio &times;1.47 / eval ratio &times;1.78"><b>54.6&thinsp;ms</b> <span class="ev">594&thinsp;ev</span><br>37.3&thinsp;ms <span class="ev">333&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(71,75%,85%)" title="lmm_q6_g3000p100_bal_base
+wall ratio &times;0.77 / eval ratio &times;0.91"><b>29.4&thinsp;ms</b> <span class="ev">606&thinsp;ev</span><br>38.1&thinsp;ms <span class="ev">668&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(43,75%,85%)" title="lmm_q6q2x3_g3000p100_bal_base
+wall ratio &times;2.21 / eval ratio &times;2.17"><b>356.4&thinsp;ms</b> <span class="ev">984&thinsp;ev</span><br>161.4&thinsp;ms <span class="ev">453&thinsp;ev</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/highcorr</th>
+<td class="ok" style="background:hsl(76,75%,85%)" title="lmm_q5q2_g3000p100_bal_highcorr
+wall ratio &times;0.69 / eval ratio &times;0.85"><b>67.3&thinsp;ms</b> <span class="ev">731&thinsp;ev</span><br>97.2&thinsp;ms <span class="ev">862&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/lowsnr</th>
+<td class="ok" style="background:hsl(75,75%,85%)" title="lmm_q5q2_g3000p100_bal_lowsnr
+wall ratio &times;0.70 / eval ratio &times;0.83"><b>44.2&thinsp;ms</b> <span class="ev">469&thinsp;ev</span><br>62.9&thinsp;ms <span class="ev">567&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/nearzero</th>
+<td class="ok" style="background:hsl(56,75%,85%)" title="lmm_q5q2_g3000p100_bal_nearzero
+wall ratio &times;1.20 / eval ratio &times;1.61"><b>273.8&thinsp;ms</b> <span class="ev">3144&thinsp;ev</span><br>228.4&thinsp;ms <span class="ev">1958&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 single/base</th>
+<td class="ok" style="background:hsl(94,75%,85%)" title="lmm_q5q2_g3000p100_single_base
+wall ratio &times;0.45 / eval ratio &times;1.08"><b>641.1&thinsp;ms</b> <span class="ev">504&thinsp;ev</span><br>1.42&thinsp;s <span class="ev">466&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 skew/base</th>
+<td class="ok" style="background:hsl(91,75%,85%)" title="lmm_q5q2_g3000p100_skew_base
+wall ratio &times;0.49 / eval ratio &times;0.59"><b>39.9&thinsp;ms</b> <span class="ev">430&thinsp;ev</span><br>81.7&thinsp;ms <span class="ev">729&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td class="ok" style="background:hsl(71,75%,85%)" title="lmm_q5q2_g30000p5_bal_base
+wall ratio &times;0.78 / eval ratio &times;1.76"><b>10.93&thinsp;s</b> <span class="ev">813&thinsp;ev</span><br>13.98&thinsp;s <span class="ev">463&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(66,75%,85%)" title="lmm_q6_g30000p5_bal_base
+wall ratio &times;0.88 / eval ratio &times;1.62"><b>1.49&thinsp;s</b> <span class="ev">379&thinsp;ev</span><br>1.69&thinsp;s <span class="ev">234&thinsp;ev</span></td>
+<td class="grp mm-fail" title="lmm_q6q2x3_g30000p5_bal_base">glmm 27.47&thinsp;s &middot; 1230ev<br>MM.jl: timeout</td>
+<td class="grp ok" style="background:hsl(51,75%,85%)" title="lmm_q8_g30000p5_bal_base
+wall ratio &times;1.50 / eval ratio &times;1.84"><b>5.15&thinsp;s</b> <span class="ev">730&thinsp;ev</span><br>3.43&thinsp;s <span class="ev">396&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p5 bal/highcorr</th>
+<td></td>
+<td class="grp ok" style="background:hsl(81,75%,85%)" title="lmm_q6_g30000p5_bal_highcorr
+wall ratio &times;0.62 / eval ratio &times;1.15"><b>1.91&thinsp;s</b> <span class="ev">492&thinsp;ev</span><br>3.10&thinsp;s <span class="ev">428&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/lowsnr</th>
+<td></td>
+<td class="grp ok" style="background:hsl(58,75%,85%)" title="lmm_q6_g30000p5_bal_lowsnr
+wall ratio &times;1.11 / eval ratio &times;2.10"><b>2.46&thinsp;s</b> <span class="ev">637&thinsp;ev</span><br>2.22&thinsp;s <span class="ev">304&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/nearzero</th>
+<td></td>
+<td class="grp ok" style="background:hsl(68,75%,85%)" title="lmm_q6_g30000p5_bal_nearzero
+wall ratio &times;0.82 / eval ratio &times;1.53"><b>1.89&thinsp;s</b> <span class="ev">487&thinsp;ev</span><br>2.30&thinsp;s <span class="ev">319&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 single/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(78,75%,85%)" title="lmm_q6_g30000p5_single_base
+wall ratio &times;0.66 / eval ratio &times;1.26"><b>2.73&thinsp;s</b> <span class="ev">354&thinsp;ev</span><br>4.14&thinsp;s <span class="ev">282&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 skew/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(73,75%,85%)" title="lmm_q6_g30000p5_skew_base
+wall ratio &times;0.74 / eval ratio &times;1.37"><b>1.39&thinsp;s</b> <span class="ev">455&thinsp;ev</span><br>1.87&thinsp;s <span class="ev">332&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td class="ok" style="background:hsl(79,75%,85%)" title="lmm_q5q2_g30000p20_bal_base
+wall ratio &times;0.65 / eval ratio &times;1.14"><b>3.58&thinsp;s</b> <span class="ev">846&thinsp;ev</span><br>5.53&thinsp;s <span class="ev">742&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(66,75%,85%)" title="lmm_q6_g30000p20_bal_base
+wall ratio &times;0.87 / eval ratio &times;1.45"><b>527.7&thinsp;ms</b> <span class="ev">499&thinsp;ev</span><br>605.3&thinsp;ms <span class="ev">345&thinsp;ev</span></td>
+<td class="grp glmm-fail" title="lmm_q6q2x3_g30000p20_bal_base">glmm: timeout<br>MM.jl 46.98&thinsp;s</td>
+<td class="grp ok" style="background:hsl(53,75%,85%)" title="lmm_q8_g30000p20_bal_base
+wall ratio &times;1.38 / eval ratio &times;1.54"><b>1.48&thinsp;s</b> <span class="ev">784&thinsp;ev</span><br>1.07&thinsp;s <span class="ev">510&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p20 bal/highcorr</th>
+<td></td>
+<td class="grp ok" style="background:hsl(75,75%,85%)" title="lmm_q6_g30000p20_bal_highcorr
+wall ratio &times;0.71 / eval ratio &times;1.21"><b>666.9&thinsp;ms</b> <span class="ev">645&thinsp;ev</span><br>933.8&thinsp;ms <span class="ev">532&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/lowsnr</th>
+<td></td>
+<td class="grp ok" style="background:hsl(84,75%,85%)" title="lmm_q6_g30000p20_bal_lowsnr
+wall ratio &times;0.58 / eval ratio &times;0.91"><b>346.6&thinsp;ms</b> <span class="ev">310&thinsp;ev</span><br>598.2&thinsp;ms <span class="ev">341&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/nearzero</th>
+<td></td>
+<td class="grp ok" style="background:hsl(75,75%,85%)" title="lmm_q6_g30000p20_bal_nearzero
+wall ratio &times;0.71 / eval ratio &times;1.23"><b>1.13&thinsp;s</b> <span class="ev">1132&thinsp;ev</span><br>1.61&thinsp;s <span class="ev">920&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 single/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(71,75%,85%)" title="lmm_q6_g30000p20_single_base
+wall ratio &times;0.77 / eval ratio &times;1.45"><b>1.78&thinsp;s</b> <span class="ev">366&thinsp;ev</span><br>2.32&thinsp;s <span class="ev">253&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 skew/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(89,75%,85%)" title="lmm_q6_g30000p20_skew_base
+wall ratio &times;0.51 / eval ratio &times;0.85"><b>500.3&thinsp;ms</b> <span class="ev">473&thinsp;ev</span><br>975.3&thinsp;ms <span class="ev">556&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td class="ok" style="background:hsl(87,75%,85%)" title="lmm_q5q2_g30000p100_bal_base
+wall ratio &times;0.53 / eval ratio &times;0.67"><b>631.1&thinsp;ms</b> <span class="ev">547&thinsp;ev</span><br>1.19&thinsp;s <span class="ev">820&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(66,75%,85%)" title="lmm_q6_g30000p100_bal_base
+wall ratio &times;0.87 / eval ratio &times;1.24"><b>265.2&thinsp;ms</b> <span class="ev">1022&thinsp;ev</span><br>303.1&thinsp;ms <span class="ev">822&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(30,75%,85%)" title="lmm_q6q2x3_g30000p100_bal_base
+wall ratio &times;4.06 / eval ratio &times;2.05"><b>13.58&thinsp;s</b> <span class="ev">1204&thinsp;ev</span><br>3.35&thinsp;s <span class="ev">588&thinsp;ev</span></td>
+<td class="grp ok" style="background:hsl(83,75%,85%)" title="lmm_q8_g30000p100_bal_base
+wall ratio &times;0.59 / eval ratio &times;0.58"><b>510.4&thinsp;ms</b> <span class="ev">1099&thinsp;ev</span><br>862.4&thinsp;ms <span class="ev">1884&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 bal/highcorr</th>
+<td></td>
+<td class="grp ok" style="background:hsl(74,75%,85%)" title="lmm_q6_g30000p100_bal_highcorr
+wall ratio &times;0.73 / eval ratio &times;0.97"><b>205.5&thinsp;ms</b> <span class="ev">741&thinsp;ev</span><br>282.9&thinsp;ms <span class="ev">766&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td></td>
+<td class="grp ok" style="background:hsl(59,75%,85%)" title="lmm_q6_g30000p100_bal_lowsnr
+wall ratio &times;1.03 / eval ratio &times;1.32"><b>184.6&thinsp;ms</b> <span class="ev">642&thinsp;ev</span><br>178.5&thinsp;ms <span class="ev">485&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td></td>
+<td class="grp ok" style="background:hsl(65,75%,85%)" title="lmm_q6_g30000p100_bal_nearzero
+wall ratio &times;0.89 / eval ratio &times;1.44"><b>661.9&thinsp;ms</b> <span class="ev">2876&thinsp;ev</span><br>745.9&thinsp;ms <span class="ev">2001&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(70,75%,85%)" title="lmm_q6_g30000p100_single_base
+wall ratio &times;0.80 / eval ratio &times;1.52"><b>2.20&thinsp;s</b> <span class="ev">541&thinsp;ev</span><br>2.74&thinsp;s <span class="ev">357&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td></td>
+<td class="grp ok" style="background:hsl(89,75%,85%)" title="lmm_q6_g30000p100_skew_base
+wall ratio &times;0.51 / eval ratio &times;0.62"><b>161.9&thinsp;ms</b> <span class="ev">535&thinsp;ev</span><br>316.7&thinsp;ms <span class="ev">856&thinsp;ev</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+</table>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="1" class="grp">q8q2x <small>(n_theta 40)</small></th>
+</tr>
+<tr>
+<th class="grp">gaussian</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td class="glmm-fail" title="lmm_q8q2x_g300p5_bal_base">glmm: engine-fail<br>MM.jl 12.22&thinsp;s</td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td class="ok" style="background:hsl(52,75%,85%)" title="lmm_q8q2x_g3000p5_bal_base
+wall ratio &times;1.43 / eval ratio &times;1.96"><b>6.36&thinsp;s</b> <span class="ev">1353&thinsp;ev</span><br>4.46&thinsp;s <span class="ev">692&thinsp;ev</span></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="ok" style="background:hsl(49,75%,85%)" title="lmm_q8q2x_g3000p20_bal_base
+wall ratio &times;1.67 / eval ratio &times;1.64"><b>2.54&thinsp;s</b> <span class="ev">1569&thinsp;ev</span><br>1.52&thinsp;s <span class="ev">955&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td class="both-fail" title="lmm_q8q2x_g30000p5_bal_base">glmm: timeout<br>MM.jl: timeout</td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td class="ok" style="background:hsl(57,75%,85%)" title="lmm_q8q2x_g30000p20_bal_base
+wall ratio &times;1.16 / eval ratio &times;1.36"><b>34.89&thinsp;s</b> <span class="ev">2536&thinsp;ev</span><br>30.14&thinsp;s <span class="ev">1869&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p20 bal/highcorr</th>
+<td class="both-fail" title="lmm_q8q2x_g30000p20_bal_highcorr">glmm: timeout<br>MM.jl: timeout</td>
+</tr>
+<tr><th>g30000p20 bal/lowsnr</th>
+<td class="ok" style="background:hsl(58,75%,85%)" title="lmm_q8q2x_g30000p20_bal_lowsnr
+wall ratio &times;1.11 / eval ratio &times;1.30"><b>25.96&thinsp;s</b> <span class="ev">1886&thinsp;ev</span><br>23.45&thinsp;s <span class="ev">1450&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p20 bal/nearzero</th>
+<td class="ok" style="background:hsl(45,75%,85%)" title="lmm_q8q2x_g30000p20_bal_nearzero
+wall ratio &times;1.96 / eval ratio &times;2.32"><b>68.61&thinsp;s</b> <span class="ev">5017&thinsp;ev</span><br>34.92&thinsp;s <span class="ev">2161&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p20 single/base</th>
+<td class="both-fail" title="lmm_q8q2x_g30000p20_single_base">glmm: timeout<br>MM.jl: timeout</td>
+</tr>
+<tr><th>g30000p20 skew/base</th>
+<td class="ok" style="background:hsl(85,75%,85%)" title="lmm_q8q2x_g30000p20_skew_base
+wall ratio &times;0.56 / eval ratio &times;0.73"><b>15.85&thinsp;s</b> <span class="ev">1291&thinsp;ev</span><br>28.37&thinsp;s <span class="ev">1766&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td class="ok" style="background:hsl(54,75%,85%)" title="lmm_q8q2x_g30000p100_bal_base
+wall ratio &times;1.29 / eval ratio &times;1.17"><b>8.90&thinsp;s</b> <span class="ev">2533&thinsp;ev</span><br>6.90&thinsp;s <span class="ev">2169&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 bal/highcorr</th>
+<td class="ok" style="background:hsl(47,75%,85%)" title="lmm_q8q2x_g30000p100_bal_highcorr
+wall ratio &times;1.84 / eval ratio &times;1.64"><b>14.22&thinsp;s</b> <span class="ev">3999&thinsp;ev</span><br>7.74&thinsp;s <span class="ev">2433&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td class="ok" style="background:hsl(31,75%,85%)" title="lmm_q8q2x_g30000p100_bal_lowsnr
+wall ratio &times;3.84 / eval ratio &times;3.45"><b>20.16&thinsp;s</b> <span class="ev">5695&thinsp;ev</span><br>5.25&thinsp;s <span class="ev">1652&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td class="ok" style="background:hsl(42,75%,85%)" title="lmm_q8q2x_g30000p100_bal_nearzero
+wall ratio &times;2.26 / eval ratio &times;2.03"><b>28.71&thinsp;s</b> <span class="ev">8080&thinsp;ev</span><br>12.68&thinsp;s <span class="ev">3980&thinsp;ev</span></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td class="both-fail" title="lmm_q8q2x_g30000p100_single_base">glmm: timeout<br>MM.jl: timeout</td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td class="ok" style="background:hsl(45,75%,85%)" title="lmm_q8q2x_g30000p100_skew_base
+wall ratio &times;2.03 / eval ratio &times;2.04"><b>5.03&thinsp;s</b> <span class="ev">1593&thinsp;ev</span><br>2.48&thinsp;s <span class="ev">781&thinsp;ev</span></td>
+</tr>
+</table>

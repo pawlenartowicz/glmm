@@ -1,6 +1,7 @@
 #!/usr/bin/env Rscript
-# Export each lme4-origin parity dataset to data/<name>.csv — run ONCE; the CSVs
-# are committed and are the neutral input EVERY engine reads (R, Julia, later Rust).
+# Export each lme4-origin parity dataset to data_empirical/<name>.csv (sim rungs
+# below go to data_simulated/) — run ONCE; the CSVs are committed and are the
+# neutral input EVERY engine reads (R, Julia, later Rust).
 # Exporting from one canonical source (lme4 in R) is what guarantees byte-identical
 # input across engines and sidesteps row-order / factor-coding / NA differences
 # between the ecosystems' built-in copies. Ordinary parity runs never call this.
@@ -16,8 +17,11 @@ parity_dir <- normalizePath(file.path(dirname(sub(
   "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))), ".."))
 
 manifest <- fromJSON(file.path(parity_dir, "manifest.json"), simplifyDataFrame = FALSE)
-data_dir <- file.path(parity_dir, "data")
-dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+data_dir_of <- function(spec)
+  file.path(parity_dir,
+            if (identical(spec$source, "sim")) "data_simulated" else "data_empirical")
+dir.create(file.path(parity_dir, "data_empirical"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(parity_dir, "data_simulated"), showWarnings = FALSE, recursive = TRUE)
 
 for (spec in manifest$datasets) {
   if (!identical(spec$source, "lme4") && !identical(spec$source, "nlme")) next  # sim rungs generated below
@@ -45,7 +49,7 @@ for (spec in manifest$datasets) {
     df$rack     <- factor(df$rack)
   }
 
-  out <- file.path(data_dir, paste0(spec$name, ".csv"))
+  out <- file.path(data_dir_of(spec), paste0(spec$name, ".csv"))
   write.csv(df, out, row.names = FALSE)
   cat(sprintf("wrote %-12s  %3d rows x %d cols\n", spec$name, nrow(df), ncol(df)))
 }
@@ -70,14 +74,14 @@ g    <- make_clustered()
 mu_g <- exp(g$eta)                                   # Gamma log-link mean
 y_g  <- rgamma(length(mu_g), shape = 2, scale = mu_g / 2)   # E[y]=mu, shape=2
 write.csv(data.frame(cluster = g$cl, x = g$x, grp = g$grp, y = y_g),
-          file.path(data_dir, "sim_gamma.csv"), row.names = FALSE)
+          file.path(parity_dir, "data_simulated", "sim_gamma.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_gamma", length(y_g), 4L))
 
 nb    <- make_clustered()
 mu_nb <- exp(nb$eta)
 y_nb  <- MASS::rnegbin(length(mu_nb), mu = mu_nb, theta = 1.5)
 write.csv(data.frame(cluster = nb$cl, x = nb$x, grp = nb$grp, y = y_nb),
-          file.path(data_dir, "sim_nb.csv"), row.names = FALSE)
+          file.path(parity_dir, "data_simulated", "sim_nb.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_nb", length(y_nb), 4L))
 
 # --- Simulated crossed random-slope dataset for the #3 VarCorr synthetic -------
@@ -96,7 +100,7 @@ make_slope <- function(n1 = 20, n2 = 8, per = 6) {
   data.frame(y = y, x = x, g1 = g1, g2 = g2)
 }
 d_slope <- make_slope()
-write.csv(d_slope, file.path(data_dir, "sim_slope.csv"), row.names = FALSE)
+write.csv(d_slope, file.path(parity_dir, "data_simulated", "sim_slope.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_slope", nrow(d_slope), 4L))
 
 # --- Simulated near-collinear fixed design for the #4 rank-deficiency golden ----
@@ -116,7 +120,7 @@ make_collinear <- function(n = 80) {
   data.frame(y = y, x1 = x1, x2 = x2, x3 = x3)
 }
 d_col <- make_collinear()
-write.csv(d_col, file.path(data_dir, "sim_collinear.csv"), row.names = FALSE)
+write.csv(d_col, file.path(parity_dir, "data_simulated", "sim_collinear.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_collinear", nrow(d_col), 4L))
 
 # --- Simulated wide-crossed LMM (7 extra intercept factors, over-cap) --------
@@ -150,7 +154,7 @@ make_wide_crossed <- function(n = 420, n_g1 = 12, n_c = 8) {
              c4 = c4, c5 = c5, c6 = c6, c7 = c7)
 }
 d_wc <- make_wide_crossed()
-write.csv(d_wc, file.path(data_dir, "sim_wide_crossed.csv"), row.names = FALSE)
+write.csv(d_wc, file.path(parity_dir, "data_simulated", "sim_wide_crossed.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_wide_crossed", nrow(d_wc), ncol(d_wc)))
 
 # --- Simulated over-WIDTH random-slope LMM (q_g = 5, over-cap by WIDTH) -------
@@ -181,7 +185,7 @@ make_wide_slopes <- function(n = 1200, n_gp = 20, n_ge = 40) {
   data.frame(y = y, x1 = x1, x2 = x2, x3 = x3, x4 = x4, gp = gp, ge = ge)
 }
 d_ws <- make_wide_slopes()
-write.csv(d_ws, file.path(data_dir, "sim_wide_slopes.csv"), row.names = FALSE)
+write.csv(d_ws, file.path(parity_dir, "data_simulated", "sim_wide_slopes.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_wide_slopes", nrow(d_ws), ncol(d_ws)))
 
 # --- Simulated crossed slope-EXTRA LMM (rung 7: in-envelope sparse-routed class) --
@@ -209,7 +213,7 @@ make_slope_extra <- function(n1 = 24, n2 = 16, per = 15) {
   data.frame(y = y, x = x, g1 = g1, g2 = g2)
 }
 d_se <- make_slope_extra()
-write.csv(d_se, file.path(data_dir, "sim_slope_extra.csv"), row.names = FALSE)
+write.csv(d_se, file.path(parity_dir, "data_simulated", "sim_slope_extra.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_slope_extra", nrow(d_se), ncol(d_se)))
 
 # --- Step-2 sparse non-Gaussian parity datasets (rungs 8-9 + two goldens) -----
@@ -241,7 +245,7 @@ make_sparse_binomial <- function(n = 240, n_g1 = 12, n_c = 8) {
   d
 }
 d_sb <- make_sparse_binomial()
-write.csv(d_sb, file.path(data_dir, "sim_sparse_binomial.csv"), row.names = FALSE)
+write.csv(d_sb, file.path(parity_dir, "data_simulated", "sim_sparse_binomial.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_sparse_binomial", nrow(d_sb), ncol(d_sb)))
 
 # Rung 9: sim_sparse_poisson — over-count, Bernoulli-free count response.
@@ -259,7 +263,7 @@ make_sparse_poisson <- function(n = 420, n_g1 = 12, n_c = 8) {
   d
 }
 d_sp <- make_sparse_poisson()
-write.csv(d_sp, file.path(data_dir, "sim_sparse_poisson.csv"), row.names = FALSE)
+write.csv(d_sp, file.path(parity_dir, "data_simulated", "sim_sparse_poisson.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_sparse_poisson", nrow(d_sp), ncol(d_sp)))
 
 # Golden: sim_sparse_gamma — over-WIDTH (q_g = 5 slope-block extra), gamma/log.
@@ -285,7 +289,7 @@ make_sparse_gamma <- function(n = 1200, n_gp = 20, n_ge = 40) {
   data.frame(y = y, x1 = x1, x2 = x2, x3 = x3, x4 = x4, gp = gp, ge = ge)
 }
 d_sg <- make_sparse_gamma()
-write.csv(d_sg, file.path(data_dir, "sim_sparse_gamma.csv"), row.names = FALSE)
+write.csv(d_sg, file.path(parity_dir, "data_simulated", "sim_sparse_gamma.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_sparse_gamma", nrow(d_sg), ncol(d_sg)))
 
 # Golden: sim_sparse_nb — over-count, negative-binomial counts (theta = 1.5,
@@ -304,7 +308,7 @@ make_sparse_nb <- function(n = 420, n_g1 = 12, n_c = 8) {
   d
 }
 d_sn <- make_sparse_nb()
-write.csv(d_sn, file.path(data_dir, "sim_sparse_nb.csv"), row.names = FALSE)
+write.csv(d_sn, file.path(parity_dir, "data_simulated", "sim_sparse_nb.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_sparse_nb", nrow(d_sn), ncol(d_sn)))
 
 # --- Rung 15: sim_three_level -- pure 3-level nesting depth (g1/g2), gaussian ----
@@ -325,7 +329,7 @@ make_three_level <- function(n_g1 = 10, n_g2 = 4, per = 10) {
   data.frame(y = y, x = x, g1 = g1, g2 = g2)
 }
 d_tl <- make_three_level()
-write.csv(d_tl, file.path(data_dir, "sim_three_level.csv"), row.names = FALSE)
+write.csv(d_tl, file.path(parity_dir, "data_simulated", "sim_three_level.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_three_level", nrow(d_tl), ncol(d_tl)))
 
 # --- Rung 16: sim_max_q_slope -- single grouping at EXACTLY MAX_PRIMARY_Q=8 ------
@@ -352,7 +356,7 @@ make_max_q_slope <- function(n_g1 = 60, per = 25) {
              g1 = g1)
 }
 d_mq <- make_max_q_slope()
-write.csv(d_mq, file.path(data_dir, "sim_max_q_slope.csv"), row.names = FALSE)
+write.csv(d_mq, file.path(parity_dir, "data_simulated", "sim_max_q_slope.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_max_q_slope", nrow(d_mq), ncol(d_mq)))
 
 # --- Rung 17: sim_crossed_at_cap -- EXACTLY 6 crossed extras = MAX_EXTRA_GROUPINGS,
@@ -372,7 +376,7 @@ make_crossed_at_cap <- function(n = 420, n_g1 = 12, n_c = 8) {
   d
 }
 d_cc <- make_crossed_at_cap()
-write.csv(d_cc, file.path(data_dir, "sim_crossed_at_cap.csv"), row.names = FALSE)
+write.csv(d_cc, file.path(parity_dir, "data_simulated", "sim_crossed_at_cap.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_crossed_at_cap", nrow(d_cc), ncol(d_cc)))
 
 # --- Rung 18: sim_binomial_slope_crossed -- 2 crossed groupings, EACH with a
@@ -394,7 +398,7 @@ make_binomial_slope_crossed <- function(n = 300, n_g1 = 15, n_g2 = 12) {
   data.frame(incidence = incidence, size = size, x = x, g1 = g1, g2 = g2)
 }
 d_bsc <- make_binomial_slope_crossed()
-write.csv(d_bsc, file.path(data_dir, "sim_binomial_slope_crossed.csv"), row.names = FALSE)
+write.csv(d_bsc, file.path(parity_dir, "data_simulated", "sim_binomial_slope_crossed.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_binomial_slope_crossed", nrow(d_bsc), ncol(d_bsc)))
 
 # --- Rung 19: sim_poisson_nested -- 3-level nesting depth in the Poisson/Laplace
@@ -415,7 +419,7 @@ make_poisson_nested <- function(n_g1 = 10, n_g2 = 4, per = 10) {
   data.frame(y = y, x = x, g1 = g1, g2 = g2)
 }
 d_pn <- make_poisson_nested()
-write.csv(d_pn, file.path(data_dir, "sim_poisson_nested.csv"), row.names = FALSE)
+write.csv(d_pn, file.path(parity_dir, "data_simulated", "sim_poisson_nested.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_poisson_nested", nrow(d_pn), ncol(d_pn)))
 
 # --- Rung 20: sim_unbalanced_nested -- 3-level nesting with heavily unbalanced
@@ -435,7 +439,7 @@ make_unbalanced_nested <- function(n_g1 = 10, n_g2 = 3) {
   data.frame(y = y, x = x, g1 = g1, g2 = g2)
 }
 d_un <- make_unbalanced_nested()
-write.csv(d_un, file.path(data_dir, "sim_unbalanced_nested.csv"), row.names = FALSE)
+write.csv(d_un, file.path(parity_dir, "data_simulated", "sim_unbalanced_nested.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_unbalanced_nested", nrow(d_un), ncol(d_un)))
 
 # --- Rung 21: sim_nested_crossed_mix -- one nested factor (g1/g2) AND one
@@ -456,5 +460,99 @@ make_nested_crossed_mix <- function(n_g1 = 8, n_g2 = 3, per = 12, n_c1 = 6) {
   data.frame(y = y, x = x, g1 = g1, g2 = g2, c1 = c1)
 }
 d_ncm <- make_nested_crossed_mix()
-write.csv(d_ncm, file.path(data_dir, "sim_nested_crossed_mix.csv"), row.names = FALSE)
+write.csv(d_ncm, file.path(parity_dir, "data_simulated", "sim_nested_crossed_mix.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_nested_crossed_mix", nrow(d_ncm), ncol(d_ncm)))
+
+# --- NB theta-bracket-edge GLM datasets (coverage-gaps G2) --------------------
+# Two sim_nb siblings whose glm.nb theta-hat sits near an end of glmm's theta
+# search bracket [1e-3, 1e4] (fit.rs NB_THETA_LO/HI). Parameters were chosen by
+# a pre-freeze glm.nb sweep: at these (theta, n, b0) MASS::glm.nb converges with
+# ZERO warnings (no theta.ml iteration/alternation limit), so the reference is
+# trustworthy -- more extreme settings put theta.ml itself at its limits.
+# Low edge: theta_true = 0.005 -> theta-hat ~4.1e-3 (heavy overdispersion).
+set.seed(20260717)
+make_nb_edge <- function(n, b0, theta) {
+  x   <- rnorm(n)
+  grp <- factor(sample(c("a", "b"), n, replace = TRUE))
+  mu  <- exp(b0 + 0.6 * x + 0.4 * (grp == "b"))
+  data.frame(x = x, grp = grp, y = MASS::rnegbin(n, mu = mu, theta = theta))
+}
+d_nl <- make_nb_edge(n = 400, b0 = 1.0, theta = 0.005)
+write.csv(d_nl, file.path(parity_dir, "data_simulated", "sim_nb_lowtheta.csv"), row.names = FALSE)
+cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_nb_lowtheta", nrow(d_nl), ncol(d_nl)))
+
+# High edge: near-Poisson, theta_true = 800 -> theta-hat ~5.3e2 (the profile
+# is nearly flat up there, so theta-hat scatters across cells; information
+# about theta comes from count size x n, hence n = 4000). Two constraints cap
+# how close to NB_THETA_HI the frozen reference can sit: (a) the zero-warning
+# check was done on the CSV ROUND-TRIP, not the in-memory data -- write.csv's
+# 15-sig-digit format perturbs the flat profile enough to flip marginal cells
+# into glm.nb's alternation/iteration limits, and cells with theta-hat > ~1e3
+# all warned; (b) glmm's IRLS mu=1 cold start diverges for log-link counts
+# with ybar over ~25 (b0 >= ~2.8 here), so larger-count cells (which carry
+# more theta information) cannot be gated in-crate at all.
+set.seed(20260724)
+d_nh <- make_nb_edge(n = 4000, b0 = 2.0, theta = 800)
+write.csv(d_nh, file.path(parity_dir, "data_simulated", "sim_nb_hightheta.csv"), row.names = FALSE)
+cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_nb_hightheta", nrow(d_nh), ncol(d_nh)))
+
+# --- NB unbalanced-nested GLMM golden dataset (coverage-gaps G2) --------------
+# sim_nb's GLMM sibling on an UNBALANCED NESTED design (per-g1 sizes 8..120 on
+# an exp ladder, the sim_unbalanced_nested precedent; g2 labels reused across
+# parents so (1|g1/g2) disambiguates). theta = 1.5, the sim_nb convention.
+# glmer.nb on this seed: 0 conv messages, non-singular (pre-freeze check).
+set.seed(20260719)
+make_nb_nested <- function(n_g1 = 12, n_g2 = 3, lo = 8, hi = 120) {
+  sizes <- round(exp(seq(log(lo), log(hi), length.out = n_g1)))
+  g1  <- factor(rep(seq_len(n_g1), times = sizes))
+  n   <- length(g1)
+  g2  <- factor(unlist(lapply(sizes, function(s) sample(seq_len(n_g2), s, replace = TRUE))))
+  x   <- rnorm(n)
+  ig  <- interaction(g1, g2, drop = TRUE)
+  u1  <- rnorm(n_g1, sd = 0.6)[g1]
+  u2  <- rnorm(nlevels(ig), sd = 0.4)[as.integer(ig)]
+  eta <- 0.8 + 0.5 * x + u1 + u2
+  data.frame(y = MASS::rnegbin(n, mu = exp(eta), theta = 1.5),
+             x = x, g1 = g1, g2 = g2)
+}
+d_nn <- make_nb_nested()
+write.csv(d_nn, file.path(parity_dir, "data_simulated", "sim_nb_nested.csv"), row.names = FALSE)
+cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_nb_nested", nrow(d_nn), ncol(d_nn)))
+
+# --- Collinear fixed column on a MIXED design (coverage-gaps G5) --------------
+# sim_collinear's LMM sibling: x3 = x1 + x2 + jitter sd 1e-13 (same rationale --
+# see the sim_collinear note on drop tolerances) plus a scalar random intercept
+# over 12 clusters. lmer's rankMatrix check drops the LAST dependent column
+# (x3), fits the reduced model non-singular, and fixef simply omits the dropped
+# name -- the golden records lme4's choice via coef_names.
+set.seed(20260720)
+make_collinear_lmm <- function(n_g = 12, per = 15) {
+  n  <- n_g * per
+  g  <- factor(rep(seq_len(n_g), each = per))
+  x1 <- rnorm(n)
+  x2 <- rnorm(n)
+  x3 <- x1 + x2 + rnorm(n, sd = 1e-13)
+  u  <- rnorm(n_g, sd = 0.9)[g]
+  y  <- 1.0 + 0.7 * x1 - 0.4 * x2 + u + rnorm(n, sd = 0.5)
+  data.frame(y = y, x1 = x1, x2 = x2, x3 = x3, g = g)
+}
+d_cl <- make_collinear_lmm()
+write.csv(d_cl, file.path(parity_dir, "data_simulated", "sim_collinear_lmm.csv"), row.names = FALSE)
+cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_collinear_lmm", nrow(d_cl), ncol(d_cl)))
+
+# --- High-mean Poisson GLM dataset (bug-fixes B3) ------------------------------
+# Regression dataset for the IRLS log-link cold start: from the old mu = 1 seed
+# (eta = 0) any count data with ybar over ~25-30 made the first WLS step
+# overshoot and IRLS run away (beta -> ~9e304); R converges via its
+# mustart = y + 0.1 initialize, which glmm now mirrors. ybar ~ 90 here puts the
+# data far past the old divergence threshold while keeping glm() warning-free.
+set.seed(20260725)
+make_poisson_highmean <- function(n = 300, b0 = 4.3) {
+  x   <- rnorm(n)
+  grp <- factor(sample(c("a", "b"), n, replace = TRUE))
+  mu  <- exp(b0 + 0.3 * x + 0.2 * (grp == "b"))
+  data.frame(x = x, grp = grp, y = rpois(n, mu))
+}
+d_ph <- make_poisson_highmean()
+write.csv(d_ph, file.path(parity_dir, "data_simulated", "sim_poisson_highmean.csv"), row.names = FALSE)
+cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_poisson_highmean", nrow(d_ph), ncol(d_ph)))

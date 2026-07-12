@@ -1,7 +1,9 @@
 use faer::dyn_stack::MemBuffer;
 use faer::{Mat, MatRef};
 
-use super::pirls::{pirls_solve, pirls_solve_blocked, pirls_solve_blocked_extras, BetaStep};
+use super::pirls::{
+    build_coupling_csr, pirls_solve, pirls_solve_blocked, pirls_solve_blocked_extras, BetaStep,
+};
 #[cfg(test)]
 use super::workspace::fill_z_f64;
 use super::workspace::{apply_lambda, build_packed_m, GlmmWorkspace, StructuredSchur};
@@ -35,6 +37,8 @@ pub(crate) fn laplace_deviance(
     m_buf: &mut [f64],
     x: MatRef<f64>,
     y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
     cluster_ids: &[u32],
     eta: &mut [f64],
     prob: &mut [f64],
@@ -63,6 +67,7 @@ pub(crate) fn laplace_deviance(
     n_cross: &mut [u8],
     coup_cols: &mut [u32],
     coup_ptr: &mut [u32],
+    coup_mask: &mut Option<u32>,
     structured_schur: Option<&mut StructuredSchur>,
     force_dense_schur: bool,
     agq_scratch: &mut [f64],
@@ -94,6 +99,9 @@ pub(crate) fn laplace_deviance(
     pirls_tol_override: Option<f64>,
     p: usize,
     n: usize,
+    // Cluster-outer AGQ substrate (`agq::ClusterRowIndex`), forwarded verbatim to
+    // `agq_deviance`'s early return below; `None` on every non-AGQ path (unread).
+    cluster_rows: Option<&super::agq::ClusterRowIndex>,
 ) -> f64 {
     let n_theta = groupings.n_theta();
     // Fixed-mode β: a value-exact copy of `params[n_theta..n_theta+p]` into the
@@ -133,6 +141,7 @@ pub(crate) fn laplace_deviance(
             m_buf,
             x,
             y,
+            prior_w,
             cluster_ids,
             eta,
             prob,
@@ -146,6 +155,7 @@ pub(crate) fn laplace_deviance(
             nagq,
             pirls_tol_override,
             n,
+            cluster_rows,
         );
     }
     let k = groupings.k_total;
@@ -174,6 +184,8 @@ pub(crate) fn laplace_deviance(
             cluster_ids,
             x,
             y,
+            prior_w,
+            weighted,
             beta,
             beta_step,
             lam,
@@ -208,6 +220,27 @@ pub(crate) fn laplace_deviance(
             n_cross,
             n,
         );
+        // CSR cache: pattern = f(design, pinning mask). Rebuild only when the set
+        // of θ-pinned crossed groupings changes (see build_coupling_csr's contract).
+        debug_assert!(groupings.crossed.len() <= 32);
+        let mut pin_mask: u32 = 0;
+        for (gi, cf) in groupings.crossed.iter().enumerate() {
+            if params[cf.vech_start] == 0.0 {
+                pin_mask |= 1 << gi;
+            }
+        }
+        if *coup_mask != Some(pin_mask) {
+            build_coupling_csr(
+                cluster_ids,
+                cross_col,
+                n_cross,
+                groupings.n_primary,
+                n,
+                coup_cols,
+                coup_ptr,
+            );
+            *coup_mask = Some(pin_mask);
+        }
         pirls_solve_blocked_extras(
             family,
             nb_theta,
@@ -219,6 +252,8 @@ pub(crate) fn laplace_deviance(
             n_cross,
             x,
             y,
+            prior_w,
+            weighted,
             beta,
             beta_step,
             eta,
@@ -250,6 +285,8 @@ pub(crate) fn laplace_deviance(
             m.as_ref(),
             x,
             y,
+            prior_w,
+            weighted,
             beta,
             beta_step,
             eta,
@@ -277,7 +314,7 @@ pub(crate) fn laplace_deviance(
     // making it a nonlinear function of `D` — the sole route by which the dispersion
     // shifts glmer's β̂/τ̂ (see `family::gamma_aic`). `prob` holds μ̂ at the mode.
     let data_term = if matches!(family, Family::Gamma { .. }) {
-        crate::family::gamma_aic(y, prob, dev, n)
+        crate::family::gamma_aic(y, prob, dev, n, Some(prior_w))
     } else {
         dev
     };
@@ -318,6 +355,7 @@ pub(crate) fn laplace_deviance_at(
     let nagq = ws.nagq;
     let force_dense_schur = ws.force_dense_schur;
     let pirls_tol_override = ws.pirls_tol_override;
+    let weighted = ws.weighted;
     let GlmmWorkspace {
         groupings,
         params: prm,
@@ -328,6 +366,7 @@ pub(crate) fn laplace_deviance_at(
         lam,
         z_buf,
         m_buf,
+        prior_w,
         eta,
         prob,
         w,
@@ -350,8 +389,10 @@ pub(crate) fn laplace_deviance_at(
         n_cross,
         coup_cols,
         coup_ptr,
+        coup_mask,
         structured_schur,
         agq_scratch,
+        cluster_rows,
         xtwx,
         xtwm,
         ainv_mtwx,
@@ -375,6 +416,8 @@ pub(crate) fn laplace_deviance_at(
         m_buf,
         x,
         y,
+        &prior_w[..n],
+        weighted,
         cluster_ids,
         eta,
         prob,
@@ -398,6 +441,7 @@ pub(crate) fn laplace_deviance_at(
         n_cross,
         coup_cols,
         coup_ptr,
+        coup_mask,
         structured_schur.as_mut(),
         force_dense_schur,
         agq_scratch,
@@ -416,6 +460,7 @@ pub(crate) fn laplace_deviance_at(
         pirls_tol_override,
         *p,
         n,
+        cluster_rows.as_ref(),
     )
 }
 
@@ -470,6 +515,7 @@ pub(crate) fn glmm_laplace_deviance_profile(
     let nagq = ws.nagq;
     let force_dense_schur = ws.force_dense_schur;
     let pirls_tol_override = ws.pirls_tol_override;
+    let weighted = ws.weighted;
     let GlmmWorkspace {
         groupings,
         params: prm,
@@ -480,6 +526,7 @@ pub(crate) fn glmm_laplace_deviance_profile(
         lam,
         z_buf,
         m_buf,
+        prior_w,
         eta,
         prob,
         w,
@@ -502,8 +549,10 @@ pub(crate) fn glmm_laplace_deviance_profile(
         n_cross,
         coup_cols,
         coup_ptr,
+        coup_mask,
         structured_schur,
         agq_scratch,
+        cluster_rows,
         xtwx,
         xtwm,
         ainv_mtwx,
@@ -527,6 +576,8 @@ pub(crate) fn glmm_laplace_deviance_profile(
         m_buf,
         x,
         y,
+        &prior_w[..n],
+        weighted,
         cluster_ids,
         eta,
         prob,
@@ -550,6 +601,7 @@ pub(crate) fn glmm_laplace_deviance_profile(
         n_cross,
         coup_cols,
         coup_ptr,
+        coup_mask,
         structured_schur.as_mut(),
         force_dense_schur,
         agq_scratch,
@@ -564,5 +616,6 @@ pub(crate) fn glmm_laplace_deviance_profile(
         pirls_tol_override,
         *p,
         n,
+        cluster_rows.as_ref(),
     )
 }

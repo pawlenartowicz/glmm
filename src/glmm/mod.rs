@@ -60,8 +60,9 @@ pub const PIRLS_MAX_HALVINGS: usize = 10;
 /// own quadratic floor — negligible on every rung's fit time (verified via
 /// `parity/compare.R` full-suite pass, no rung regressed).
 pub const PIRLS_TOL_REL: f64 = 1e-9;
-/// Tighter PIRLS exit for NON-canonical links (probit, Gamma-log/inverse,
-/// NB-log). Canonical links (logit, Poisson-log) are Newton ⇒ quadratic
+/// PIRLS exit for NON-canonical links (probit, Gamma-log/inverse, NB-log) — a
+/// decade looser than `PIRLS_TOL_REL`, but tightened far below the former 1e-6
+/// default. Canonical links (logit, Poisson-log) are Newton ⇒ quadratic
 /// convergence, so PIRLS overshoots `PIRLS_TOL_REL` to ~machine precision on its
 /// own and their deviance is already smooth enough for both the outer BOBYQA β
 /// and the FD-Hessian SE. Non-canonical links are Fisher-scoring ⇒ only LINEAR
@@ -112,9 +113,13 @@ pub(crate) fn pirls_tol(family: crate::spec::Family) -> f64 {
 pub const BETA_BOX: f64 = crate::glm::BETA_CAP;
 /// Relative FD step for `fd_hessian_cov`'s joint-deviance Hessian:
 /// `h_k = FD_STEP_REL·max(1, |γ̂_k|)`. The Hessian is step-invariant over h ∈
-/// [1e-4, 1e-1] on the committed fixture (the deviance is smooth/deterministic
-/// enough that 1/h² noise amplification is negligible), so 1e-2 is a comfortable
-/// mid-band choice — see `fd_hessian_cov`'s doc comment for the full diagnostic.
+/// [1e-4, 1e-1] on the committed fixture — but NOT on every curated rung:
+/// h = 1e-3 blows the parity se_hess gates on the noise side (sim_gamma 1e-2,
+/// cbpp_probit 2e-3 vs the 1e-3 band) while 1e-2 holds them at ~1e-4, so 1e-2
+/// is pinned by the curated sweep, not just the fixture. The sparse path needs
+/// the opposite trade and carries its own `sparse::SPARSE_FD_STEP_REL` (1e-3,
+/// truncation-limited on the 21-dim sparse Gamma golden) — calibrated
+/// separately, do not fold the two constants together.
 pub const FD_STEP_REL: f64 = 1e-2;
 
 /// Per-fit GLMM result (mirrors `LmmFit`; no σ² — dispersion is fixed at 1).
@@ -236,6 +241,28 @@ pub fn fit_glmm(
     for v in ws.u_seed[..k].iter_mut() {
         *v = 0.0;
     }
+    ws.coup_mask = None; // CSR validity is per (fit, pinning mask): ids/z may differ across fits
+                         // Cluster-outer AGQ substrate: built once per fit (cluster_ids is fit-fixed),
+                         // ONLY in `parallel` builds — it exists as rayon's work-splitting substrate.
+                         // Serial builds always run the original node-outer loop: even with the
+                         // reweight hoist in agq_deviance, cluster-outer's residual per-cluster
+                         // overhead (loop restart + CSR gather) regresses many-tiny-cluster shapes
+                         // (observation-level REs: +12–16% measured on grouseticks (1|INDEX), 403
+                         // clusters × 1 row) while its serial cache win on large clusters is small
+                         // (−4% on cbpp), so the non-parallel hot path (batch loops) stays
+                         // byte-for-byte unchanged. The grid campaign's parallel pass owns the
+                         // decision of whether a rows-per-cluster dispatch can unlock the win.
+    ws.cluster_rows = if cfg!(all(feature = "parallel", not(target_arch = "wasm32")))
+        && ws.nagq > 1
+        && ws.parallel_inner
+    {
+        Some(agq::ClusterRowIndex::build(
+            cluster_ids,
+            ws.groupings.n_primary,
+        ))
+    } else {
+        None
+    };
 
     // Joint BOBYQA over [θ | β]. Borrow-split mirrors `glmm_laplace_deviance`:
     // `solver` held by `minimize`; the closure calls the shared `laplace_deviance`
@@ -254,6 +281,7 @@ pub fn fit_glmm(
     // the destructure moves `ws`'s fields out by mutable reference; `bool` is Copy
     // so this is a plain read.
     let two_stage = ws.two_stage;
+    let weighted = ws.weighted;
     let GlmmWorkspace {
         solver,
         solver_stage1,
@@ -264,8 +292,10 @@ pub fn fit_glmm(
         upper,
         groupings,
         agq_scratch,
+        cluster_rows,
         z,
         m,
+        prior_w,
         eta,
         prob,
         w,
@@ -292,6 +322,7 @@ pub fn fit_glmm(
         n_cross,
         coup_cols,
         coup_ptr,
+        coup_mask,
         structured_schur,
         xtwx,
         xtwm,
@@ -352,6 +383,8 @@ pub fn fit_glmm(
                     m_buf,
                     x,
                     y,
+                    &prior_w[..n],
+                    weighted,
                     cluster_ids,
                     eta,
                     prob,
@@ -375,6 +408,7 @@ pub fn fit_glmm(
                     n_cross,
                     coup_cols,
                     coup_ptr,
+                    coup_mask,
                     structured_schur.as_mut(),
                     force_dense_schur,
                     agq_scratch,
@@ -395,6 +429,7 @@ pub fn fit_glmm(
                     None,
                     *pf,
                     n,
+                    cluster_rows.as_ref(),
                 );
                 if obj < best1 {
                     best1 = obj;
@@ -442,6 +477,8 @@ pub fn fit_glmm(
                 m_buf,
                 x,
                 y,
+                &prior_w[..n],
+                weighted,
                 cluster_ids,
                 eta,
                 prob,
@@ -465,6 +502,7 @@ pub fn fit_glmm(
                 n_cross,
                 coup_cols,
                 coup_ptr,
+                coup_mask,
                 structured_schur.as_mut(),
                 force_dense_schur,
                 agq_scratch,
@@ -485,6 +523,7 @@ pub fn fit_glmm(
                 None,
                 *pf,
                 n,
+                cluster_rows.as_ref(),
             );
             if obj < best_obj {
                 best_obj = obj;
@@ -537,6 +576,7 @@ pub fn fit_glmm(
             lam,
             z_buf,
             m_buf,
+            prior_w,
             eta,
             prob,
             w,
@@ -559,6 +599,7 @@ pub fn fit_glmm(
             n_cross,
             coup_cols,
             coup_ptr,
+            coup_mask,
             structured_schur,
             xtwx,
             xtwm,
@@ -587,6 +628,8 @@ pub fn fit_glmm(
             m_buf,
             x,
             y,
+            &prior_w[..n],
+            weighted,
             cluster_ids,
             eta,
             prob,
@@ -610,6 +653,7 @@ pub fn fit_glmm(
             n_cross,
             coup_cols,
             coup_ptr,
+            coup_mask,
             structured_schur.as_mut(),
             force_dense_schur,
             agq_scratch,
@@ -628,6 +672,7 @@ pub fn fit_glmm(
             None,
             *p,
             n,
+            cluster_rows.as_ref(),
         );
     }
 
@@ -688,8 +733,13 @@ pub fn fit_glmm(
             // μ̂/û the pinned-γ̂ re-eval left. The Hessian arm is NOT scaled — the
             // dispersion enters its objective via `gamma_aic`, and its unscaled SE
             // is the oracle-settled match to `vcov(use.hessian=TRUE)`.
-            let sigma_sq =
-                crate::family::glmm_sigma_sq(family, &y[..n], &ws.prob[..n], &ws.u[..ws.k]);
+            let sigma_sq = crate::family::glmm_sigma_sq(
+                family,
+                &y[..n],
+                &ws.prob[..n],
+                &ws.u[..ws.k],
+                ws.weighted.then(|| &ws.prior_w[..n]),
+            );
             // Var(β̂)_jj from chol(Schur) forward-solve (mirrors fit_lmm's recovery).
             let sc = match ws.schur.as_ref().llt(faer::Side::Lower) {
                 Ok(c) => c,

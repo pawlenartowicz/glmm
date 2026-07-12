@@ -286,6 +286,62 @@ fn agq_k1_reduces_to_laplace() {
     );
 }
 
+/// Cluster-outer AGQ must be BIT-identical to the node-outer loop: same
+/// operands, same per-accumulator summation order (ClusterRowIndex's
+/// ascending-row guarantee). Exact equality — approximate closeness here
+/// would hide a reordering that invalidates the no-golden-revalidation
+/// safety argument.
+#[test]
+fn agq_cluster_outer_bit_identical_to_node_outer() {
+    let (xf64, y, ids) = glmm_intercept_dataset();
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    for nagq in [3u8, 7, 11] {
+        let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
+        build_z(&mut ws_a, xf64.as_ref(), &ids, &[], 80);
+        ws_a.params[0] = 0.5; // θ (Λ scalar) ≠ 1 — exercises the λ-scale, mirrors agq_k1_reduces_to_laplace
+        ws_a.params[1] = 0.2;
+        ws_a.params[2] = 0.8;
+        let params = ws_a.params.clone();
+        ws_a.cluster_rows = Some(ClusterRowIndex::build(&ids, ws_a.groupings.n_primary));
+
+        let mut ws_b = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
+        build_z(&mut ws_b, xf64.as_ref(), &ids, &[], 80);
+        ws_b.cluster_rows = None;
+
+        let da = glmm_agq_deviance(&params, &mut ws_a, xf64.as_ref(), &y, &ids, 80, nagq);
+        let db = glmm_agq_deviance(&params, &mut ws_b, xf64.as_ref(), &y, &ids, 80, nagq);
+        assert_eq!(da.to_bits(), db.to_bits(), "nagq={nagq}");
+    }
+}
+
+/// Parallel cluster loop must equal the serial cluster-outer loop bitwise —
+/// disjoint sum-slot writes make the result schedule-independent.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[test]
+fn agq_parallel_bit_identical_to_serial() {
+    let (xf64, y, ids) = glmm_intercept_dataset();
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    for nagq in [3u8, 7, 11] {
+        let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
+        build_z(&mut ws_a, xf64.as_ref(), &ids, &[], 80);
+        ws_a.params[0] = 0.5; // θ (Λ scalar) ≠ 1 — exercises the λ-scale, mirrors agq_k1_reduces_to_laplace
+        ws_a.params[1] = 0.2;
+        ws_a.params[2] = 0.8;
+        let params = ws_a.params.clone();
+        // Some(idx) here runs the rayon arm under --features parallel (this test is
+        // itself feature-gated), so `da` below is the parallel result.
+        ws_a.cluster_rows = Some(ClusterRowIndex::build(&ids, ws_a.groupings.n_primary));
+
+        let mut ws_b = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
+        build_z(&mut ws_b, xf64.as_ref(), &ids, &[], 80);
+        ws_b.cluster_rows = None; // knob-off path: always the original serial node-outer loop
+
+        let da = glmm_agq_deviance(&params, &mut ws_a, xf64.as_ref(), &y, &ids, 80, nagq);
+        let db = glmm_agq_deviance(&params, &mut ws_b, xf64.as_ref(), &y, &ids, 80, nagq);
+        assert_eq!(da.to_bits(), db.to_bits(), "nagq={nagq}");
+    }
+}
+
 #[test]
 fn laplace_deviance_collapses_to_glm_at_theta_zero() {
     let (xf64, y, ids) = glmm_intercept_dataset();
@@ -601,6 +657,121 @@ fn fd_hessian_cov_matches_glmer_use_hessian_true() {
     }
 }
 
+/// Run `fd_hessian_cov` twice on the same converged workspace — serial
+/// (`parallel_inner = false`) then parallel (`= true`) — and assert every returned
+/// covariance entry, θ-block SE, and `FdHessianStatus` is BITWISE equal. `.to_bits()`
+/// comparison so a NaN (RX-fallback θ SE) matches a NaN. A mismatch means a
+/// per-thread worker workspace (`fd_worker_ws`) missed a field the deviance reads.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn assert_fd_hessian_serial_eq_parallel(
+    ws: &mut GlmmWorkspace,
+    x: faer::MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    p: usize,
+    n: usize,
+) {
+    let mut cov_s = Mat::<f64>::zeros(p, p);
+    ws.parallel_inner = false;
+    let st_s = fd_hessian_cov(ws, x, y, ids, p, n, &mut cov_s);
+    let tse_s = ws.theta_se.clone();
+
+    let mut cov_p = Mat::<f64>::zeros(p, p);
+    ws.parallel_inner = true;
+    let st_p = fd_hessian_cov(ws, x, y, ids, p, n, &mut cov_p);
+    let tse_p = ws.theta_se.clone();
+
+    assert_eq!(st_s, st_p, "FdHessianStatus differs serial vs parallel");
+    for i in 0..p {
+        for j in 0..p {
+            assert_eq!(
+                cov_s[(i, j)].to_bits(),
+                cov_p[(i, j)].to_bits(),
+                "cov[{i}][{j}] not bit-identical: serial {} parallel {}",
+                cov_s[(i, j)],
+                cov_p[(i, j)]
+            );
+        }
+    }
+    assert_eq!(tse_s.len(), tse_p.len());
+    for (k, (&a, &b)) in tse_s.iter().zip(tse_p.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "theta_se[{k}] not bit-identical: {a} vs {b}"
+        );
+    }
+}
+
+/// The parallel FD-Hessian grid must reproduce the serial one BITWISE on both the
+/// no-extras blocked path and the structured crossed path. Every grid cell is a
+/// pure function of the frozen (fd_saved, fd_steps, u_seed) seed, so per-thread
+/// workspaces change nothing — a mismatch is an `fd_worker_ws` field-liveness bug,
+/// not floating-point noise.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[test]
+fn fd_hessian_parallel_bit_identical_to_serial() {
+    // Case A: no-extras (1|grp) fixture — the blocked FD path.
+    {
+        let fx = load_hessian_fixture();
+        let n = fx.n;
+        let p = fx.beta.len();
+        let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
+        let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters }, 0.25);
+        let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
+        let mut xf64 = Mat::<f64>::zeros(n, p);
+        for i in 0..n {
+            for j in 0..p {
+                xf64[(i, j)] = fx.x[i][j];
+            }
+        }
+        let y = fx.y.clone();
+        let ids = fx.cluster_ids.clone();
+        build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
+        let fit = fit_glmm(
+            &mut ws,
+            xf64.as_ref(),
+            &y,
+            &ids,
+            &[1u32],
+            None,
+            &vec![0.0; p],
+            n,
+            WaldSe::Rx,
+        );
+        assert!(fit.converged, "no-extras fixture must converge");
+        assert_fd_hessian_serial_eq_parallel(&mut ws, xf64.as_ref(), &y, &ids, p, n);
+    }
+    // Case B: structured crossed (grouseticks INDEX primary + BROOD, LOCATION) —
+    // exercises the per-thread StructuredSchur rebuild in `fd_worker_ws`.
+    {
+        let (model, ids, x, y, n, p) = grouseticks_3crossed_fixture();
+        let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+        assert!(
+            ws.groupings.structured_extras_eligible(),
+            "grouseticks 3-crossed must route through the structured extras path"
+        );
+        build_z(&mut ws, x.as_ref(), &ids.primary, &ids.extra, n);
+        ws.structured_schur = StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n);
+        let fit = fit_glmm(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids.primary,
+            &[0u32, 1, 2, 3],
+            None,
+            &vec![0.0; p],
+            n,
+            WaldSe::Rx,
+        );
+        assert!(
+            fit.converged,
+            "grouseticks structured fixture must converge"
+        );
+        assert_fd_hessian_serial_eq_parallel(&mut ws, x.as_ref(), &y, &ids.primary, p, n);
+    }
+}
+
 /// `fit_glmm(.., WaldSe::Hessian)` sources the per-fit marginal SE from
 /// `fd_hessian_cov` (glmer `use.hessian = TRUE`) instead of the Schur
 /// forward-solve: on the committed fixture the x1 Hessian SE EXCEEDS the Rx
@@ -853,6 +1024,7 @@ fn fit_glmm_collapses_to_plain_irls_when_tau_negligible() {
             &y,
             &[1],
             None,
+            None,
             s,
         );
         (f.betas.to_vec(), f.t_sq.to_vec(), f.converged)
@@ -945,7 +1117,9 @@ fn fit_glmm_width_general_slope_and_crossed() {
 /// process-wide allocations and concurrent tests contaminate the count. faer's
 /// rayon parallelism also jitters the count run-to-run on a multi-core box, so
 /// pin it to one thread for a deterministic measurement:
-/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm fit_glmm_warm_path_bounded_alloc -- --ignored --test-threads=1`
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests fit_glmm_warm_path_bounded_alloc -- --ignored --test-threads=1`
+/// (`alloc-tests` installs the dhat global allocator the profiler requires.)
+#[cfg(feature = "alloc-tests")]
 #[test]
 #[ignore]
 fn fit_glmm_warm_path_bounded_alloc() {
@@ -1013,7 +1187,8 @@ fn fit_glmm_warm_path_bounded_alloc() {
 /// scratch, so the only per-eval blocks left are the joint [θ|β] BOBYQA's own
 /// scratch (M is built into the pre-allocated `ws.m`). `#[ignore]` + one-thread
 /// for the same reasons as the no-extras gate. Run:
-/// `RAYON_NUM_THREADS=1 cargo test -p glmm fit_glmm_structured_warm_path_bounded_alloc -- --ignored --test-threads=1`
+/// `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests fit_glmm_structured_warm_path_bounded_alloc -- --ignored --test-threads=1`
+#[cfg(feature = "alloc-tests")]
 #[test]
 #[ignore]
 fn fit_glmm_structured_warm_path_bounded_alloc() {
@@ -1238,6 +1413,7 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         z,
         m,
         lam,
+        prior_w,
         eta,
         prob,
         w,
@@ -1263,6 +1439,8 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         m.as_ref(),
         xf64.as_ref(),
         &y,
+        &prior_w[..n],
+        false,
         &mut params[nt..],
         BetaStep::Fixed,
         eta,
@@ -1291,6 +1469,7 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         lam,
         z_buf,
         m_buf,
+        prior_w,
         eta,
         prob,
         w,
@@ -1310,6 +1489,8 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         &ids,
         xf64.as_ref(),
         &y,
+        &prior_w[..n],
+        false,
         &mut beta,
         BetaStep::Fixed,
         lam,
@@ -1396,6 +1577,7 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         z,
         m,
         lam,
+        prior_w,
         eta,
         prob,
         w,
@@ -1421,6 +1603,8 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         m.as_ref(),
         xf64.as_ref(),
         &y,
+        &prior_w[..n],
+        false,
         &mut params[nt..],
         BetaStep::Fixed,
         eta,
@@ -1449,6 +1633,7 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         lam,
         z_buf,
         m_buf,
+        prior_w,
         eta,
         prob,
         w,
@@ -1468,6 +1653,8 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         &ids,
         xf64.as_ref(),
         &y,
+        &prior_w[..n],
+        false,
         &mut beta,
         BetaStep::Fixed,
         lam,
@@ -2028,6 +2215,7 @@ fn structured_extras_matches_dense() {
             z,
             m,
             lam,
+            prior_w,
             eta,
             prob,
             w,
@@ -2053,6 +2241,8 @@ fn structured_extras_matches_dense() {
             m.as_ref(),
             xf64.as_ref(),
             &y,
+            &prior_w[..n],
+            false,
             &mut params[nt..],
             BetaStep::Fixed,
             eta,
@@ -2108,6 +2298,7 @@ fn structured_extras_matches_dense() {
                 cross_val,
                 cross_col,
                 n_cross,
+                prior_w,
                 eta,
                 prob,
                 w,
@@ -2123,6 +2314,15 @@ fn structured_extras_matches_dense() {
                 a_rhs,
                 ..
             } = &mut ws2;
+            build_coupling_csr(
+                &ids,
+                cross_col,
+                n_cross,
+                groupings.n_primary,
+                n,
+                coup_cols,
+                coup_ptr,
+            );
             pirls_solve_blocked_extras(
                 crate::Family::Binomial {
                     link: crate::BinomialLink::Logit,
@@ -2136,6 +2336,8 @@ fn structured_extras_matches_dense() {
                 n_cross,
                 xf64.as_ref(),
                 &y,
+                &prior_w[..n],
+                false,
                 &mut beta,
                 BetaStep::Fixed,
                 eta,
@@ -2192,7 +2394,7 @@ fn structured_extras_matches_dense() {
     }
 }
 
-/// Parses `parity/data/grouseticks.csv` into the 3-crossed `TICKS ~ YEAR +
+/// Parses `parity/data_empirical/grouseticks.csv` into the 3-crossed `TICKS ~ YEAR +
 /// cHEIGHT + (1|INDEX) + (1|BROOD) + (1|LOCATION)` design (observation-level
 /// INDEX primary + crossed BROOD, LOCATION). Returns the **sized** `ModelSpec`
 /// (crossed widths resolved from the actual level counts via
@@ -2232,7 +2434,7 @@ pub(crate) fn grouseticks_3crossed_fixture(
             .collect()
     }
 
-    let csv = include_str!("../../parity/data/grouseticks.csv");
+    let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
     // cols: INDEX,TICKS,BROOD,HEIGHT,YEAR,LOCATION,cHEIGHT
     let p = 4;
     let mut rows = Vec::<[f64; 4]>::new();
@@ -2335,6 +2537,7 @@ fn structured_cold_start_overshoot_is_finite() {
 /// `(n_eval_single, n_eval_two)` for the baseline-doc print (the eval-count win is
 /// a separate, measured concern; it is NOT gated here). Both workspaces are built
 /// fresh from the same spec/data; only `two_stage` differs.
+#[allow(clippy::too_many_arguments)]
 fn assert_two_stage_matches_single(
     label: &str,
     spec: &ModelSpec,
@@ -2731,6 +2934,7 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
         z,
         m,
         lam,
+        prior_w,
         eta,
         prob,
         w,
@@ -2763,6 +2967,8 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
         m.as_ref(),
         xf64.as_ref(),
         &y,
+        &prior_w[..n],
+        false,
         &mut beta,
         BetaStep::Profile {
             xtwx,
@@ -2808,6 +3014,7 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
             xr[j] += xf64[(i, j)] * rho;
         }
     }
+    #[allow(clippy::needless_range_loop)]
     for j in 0..p {
         assert!(
             xr[j].abs() < 1e-6 * n as f64,
@@ -2858,6 +3065,7 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         lam,
         z_buf,
         m_buf,
+        prior_w,
         eta,
         prob,
         w,
@@ -2884,6 +3092,8 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         &ids,
         xf64.as_ref(),
         &y,
+        &prior_w[..n],
+        false,
         &mut beta,
         BetaStep::Profile {
             xtwx,
@@ -2929,6 +3139,7 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
             xr[j] += xf64[(i, j)] * rho;
         }
     }
+    #[allow(clippy::needless_range_loop)]
     for j in 0..p {
         assert!(
             xr[j].abs() < 1e-6 * n as f64,
@@ -2995,6 +3206,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             cross_val,
             cross_col,
             n_cross,
+            prior_w,
             eta,
             prob,
             w,
@@ -3017,6 +3229,15 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             beta_prev,
             ..
         } = &mut ws;
+        build_coupling_csr(
+            &ids.primary,
+            cross_col,
+            n_cross,
+            groupings.n_primary,
+            n,
+            coup_cols,
+            coup_ptr,
+        );
         pirls_solve_blocked_extras(
             Family::Poisson {
                 link: crate::PoissonLink::Log,
@@ -3030,6 +3251,8 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             n_cross,
             x.as_ref(),
             &y,
+            &prior_w[..n],
+            false,
             &mut beta,
             BetaStep::Profile {
                 xtwx,
@@ -3103,6 +3326,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             xr[j] += x[(i, j)] * rho;
         }
     }
+    #[allow(clippy::needless_range_loop)]
     for j in 0..p {
         assert!(
             xr[j].abs() < 1e-6 * n as f64,
@@ -3145,6 +3369,7 @@ fn structured_profile_beta_matches_dense_profile() {
     let dense = {
         let GlmmWorkspace {
             m,
+            prior_w,
             eta,
             prob,
             w,
@@ -3176,6 +3401,8 @@ fn structured_profile_beta_matches_dense_profile() {
             m.as_ref(),
             xf64.as_ref(),
             &y,
+            &prior_w[..n],
+            false,
             &mut beta_dense,
             BetaStep::Profile {
                 xtwx,
@@ -3241,6 +3468,7 @@ fn structured_profile_beta_matches_dense_profile() {
             cross_val,
             cross_col,
             n_cross,
+            prior_w,
             eta,
             prob,
             w,
@@ -3263,6 +3491,15 @@ fn structured_profile_beta_matches_dense_profile() {
             beta_prev,
             ..
         } = &mut wss;
+        build_coupling_csr(
+            &ids,
+            cross_col,
+            n_cross,
+            groupings.n_primary,
+            n,
+            coup_cols,
+            coup_ptr,
+        );
         pirls_solve_blocked_extras(
             Family::Binomial {
                 link: BinomialLink::Logit,
@@ -3276,6 +3513,8 @@ fn structured_profile_beta_matches_dense_profile() {
             n_cross,
             xf64.as_ref(),
             &y,
+            &prior_w[..n],
+            false,
             &mut beta_str,
             BetaStep::Profile {
                 xtwx,
@@ -3316,6 +3555,43 @@ fn structured_profile_beta_matches_dense_profile() {
             beta_str[j]
         );
     }
+}
+
+/// The coupling CSR is cached per (fit, θ-pinning mask). A BOBYQA eval can
+/// pin a crossed θ to exactly 0 (its lower bound), which drops that grouping
+/// from build_packed_m's cross_col/n_cross and changes the CSR pattern — a
+/// stale cache here would silently corrupt the Schur build. Drive the
+/// workspace through unpinned → pinned → unpinned evals and assert each
+/// deviance is bit-identical to a fresh-workspace eval at the same point.
+#[test]
+fn coupling_csr_rebuilds_on_theta_pinning_transition() {
+    let (model, ids, x, y, n, p) = grouseticks_3crossed_fixture();
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+    let nt = ws.n_theta;
+    // Unpinned point: every θ > 0, β = 0.
+    let mut unpinned = vec![0.5; nt + p];
+    for b in unpinned[nt..].iter_mut() {
+        *b = 0.0;
+    }
+    // Pinned point: last crossed θ exactly 0 (BOBYQA bound), rest unchanged.
+    let mut pinned = unpinned.clone();
+    let last_crossed = ws.groupings.crossed.last().unwrap().vech_start;
+    pinned[last_crossed] = 0.0;
+
+    let fresh = |params: &[f64]| {
+        let mut w2 = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+        glmm_laplace_deviance(params, &mut w2, x.as_ref(), &y, &ids.primary, n)
+    };
+    let d1 = glmm_laplace_deviance(&unpinned, &mut ws, x.as_ref(), &y, &ids.primary, n);
+    let d2 = glmm_laplace_deviance(&pinned, &mut ws, x.as_ref(), &y, &ids.primary, n);
+    let d3 = glmm_laplace_deviance(&unpinned, &mut ws, x.as_ref(), &y, &ids.primary, n);
+    assert_eq!(
+        d1,
+        fresh(&unpinned),
+        "unpinned eval must match fresh workspace"
+    );
+    assert_eq!(d2, fresh(&pinned), "pinned eval read a stale CSR");
+    assert_eq!(d3, d1, "un-pinning must restore the original pattern");
 }
 
 /// No-extras twin of `dense_path_overshoot_fixture`: primary-only grouping
@@ -3538,6 +3814,7 @@ fn stage2_objective_is_bit_identical_to_single_stage_objective() {
     let mut points: Vec<Vec<f64>> = Vec::new();
     {
         let mut blind = vec![0.0_f64; nt + p];
+        #[allow(clippy::needless_range_loop)]
         for t in 0..nt {
             blind[t] = 1.0; // THETA0
         }
@@ -3556,6 +3833,7 @@ fn stage2_objective_is_bit_identical_to_single_stage_objective() {
     }
     {
         let mut q = converged.clone();
+        #[allow(clippy::needless_range_loop)]
         for t in 0..nt {
             q[t] *= 0.5;
         }
@@ -3599,6 +3877,7 @@ fn stage2_objective_is_bit_identical_to_single_stage_objective() {
 /// NaN (`nan_fit`), the terminal state an exhausted-halving PIRLS reaches.
 /// A finite-but-wrong two-stage fit (converged, disagreeing with single-stage) is
 /// precisely the failure this gate exists to catch.
+#[allow(clippy::too_many_arguments)]
 fn assert_two_stage_adversarial(
     label: &str,
     spec: &ModelSpec,

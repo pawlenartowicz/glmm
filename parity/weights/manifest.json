@@ -1,0 +1,178 @@
+{
+  "schema": "glmm-parity-manifest/1",
+  "//": "WEIGHTS parity suite (docs/GLMM/2026-07-10-weights-parity-harness-design.md). Read by the SHARED oracle/fit.{R,jl,rs} + compare.R under PARITY_SUITE_DIR (set by ./run.sh). Conventions on top of the main manifest: `weights_col` names a plain per-row prior-weight CSV column (mutually exclusive with the aggregated-binomial `weights` field); rungs WITHOUT a jl_formula are lme4-only (fixed-only models MixedModels cannot fit, or R-only pathologicals) and fit.jl skips them; `gate` marks the two fit-time special gates (dropped_rows in fit.R, unit_identity in fit.rs).",
+  "datasets": [
+    {
+      "name": "wls_basic",
+      "rung": 1,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x1 + x2"
+    },
+    {
+      "name": "glm_binomial_agg",
+      "rung": 2,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [],
+      "weights": "size",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x"
+    },
+    {
+      "name": "glm_poisson",
+      "rung": 3,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": ["grp"],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
+      "name": "glm_gamma",
+      "rung": 4,
+      "source": "sim",
+      "family": "gamma",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": ["grp"],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
+      "name": "glm_nb",
+      "rung": 5,
+      "source": "sim",
+      "family": "negbin",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": ["grp"],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
+      "name": "lmm_intercept",
+      "rung": 6,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "timing_batch": 10,
+      "factors": ["g"],
+      "weights_col": "w",
+      "r_formula":  "y ~ 1 + x + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g))"
+    },
+    {
+      "name": "lmm_slope",
+      "rung": 7,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "timing_batch": 10,
+      "factors": ["g"],
+      "weights_col": "w",
+      "r_formula":  "y ~ 1 + x + (1 + x | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g))"
+    },
+    {
+      "name": "lmm_crossed",
+      "rung": 8,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "timing_batch": 10,
+      "factors": ["g1", "g2"],
+      "weights_col": "w",
+      "//": "R-only (no jl_formula) by MEASUREMENT, not design: the pinned MixedModels (v5.7.0) wts= is broken for any fit combining a slope block with a second crossed grouping -- on this data it collapses to sigma~3e-5 with beta~[34, 1.2] (initial-objective-evaluation failure, then a degenerate 'optimum'; reproduced under both LN_NEWUOA and LN_BOBYQA, and with a reduced (1+x|g1)+(1|g2) shape). Weighted single-grouping slopes (lmm_slope) and weighted crossed intercepts fit fine. lme4 and glmm agree to 2e-7 here, so the rung stays 2-way gated, same convention as the main harness's sim_binomial_slope_crossed.",
+      "r_formula":  "y ~ 1 + x + (1 + x | g1) + (1 + x | g2)"
+    },
+    {
+      "name": "glmm_poisson",
+      "rung": 9,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "factors": ["g"],
+      "weights_col": "w",
+      "r_formula":  "y ~ 1 + x + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g))"
+    },
+    {
+      "name": "glmm_binomial",
+      "rung": 10,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "factors": ["g1", "c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+      "weights": "size",
+      "r_formula":  "cbind(incidence, size - incidence) ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+      "jl_formula": "@formula(prop ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7))"
+    },
+    {
+      "name": "path_extreme_range",
+      "rung": 11,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x"
+    },
+    {
+      "name": "path_near_zero",
+      "rung": 12,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [],
+      "weights_col": "w",
+      "gate": "dropped_rows",
+      "r_formula": "y ~ 1 + x"
+    },
+    {
+      "name": "path_huge_int",
+      "rung": 13,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "timing_batch": 10,
+      "factors": ["g"],
+      "weights_col": "w",
+      "r_formula":  "y ~ 1 + x + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g))"
+    },
+    {
+      "name": "path_dominant",
+      "rung": 14,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x"
+    },
+    {
+      "name": "all_ones",
+      "rung": 15,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "timing_batch": 10,
+      "factors": ["g"],
+      "weights_col": "w",
+      "gate": "unit_identity",
+      "r_formula":  "y ~ 1 + x + (1 + x | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g))"
+    }
+  ]
+}
