@@ -7,11 +7,12 @@ fourth is a short note on warm starts. The Python surface is deliberately tiny:
 links, knobs) is a string or scalar argument, not a type.
 
 > **Status:** this release ships the full API surface — signatures, argument
-> validation, `Fit`, `summary()` — but the formula parse and the kernel call
-> land with the PyO3 binding. Until then a valid `fit(...)` call validates its
-> arguments and raises `NotImplementedError`. This page documents the surface
-> as it will behave once wired; everything about *calling* it correctly is
-> already enforced today.
+> validation, `Fit`, `summary()` — wired end to end through the PyO3 binding:
+> a valid `fit(...)` call parses the formula, fits, and returns a real `Fit`.
+> Four narrow combinations are GLMM 0.1.1 gaps and raise a clean
+> `NotImplementedError` instead: `family="inversegaussian"`, `link="cloglog"`,
+> quasi-likelihood `dispersion=` on binomial/poisson, and a `theta=` float
+> seed (see §2).
 
 The package is not on PyPI yet. Install from the repo:
 
@@ -86,12 +87,14 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
   φ ≡ 1. `"estimate"`: force the Pearson estimate — on binomial/poisson this
   *is* quasi-binomial/quasi-Poisson, GLM only. A float: hold φ fixed (still
   scales SE). Fix-vs-estimate, not a warm start.
-- `theta` — negative-binomial shape. `None` cold-starts the θ search from a
-  method-of-moments seed; a float seeds it. Estimation always runs.
+- `theta` — negative-binomial shape. `None` (default, the only value the
+  kernel currently accepts) cold-starts the θ search; a float raises
+  `NotImplementedError` — there is no kernel hook yet to seed it. Estimation
+  always runs.
 - `nagq` — adaptive Gauss–Hermite node count; `1` = Laplace (default). Must
-  be odd and ≤ 25. `>1` is honored only on a single scalar-intercept
-  binomial/Poisson GLMM; every other shape ignores it and uses Laplace
-  (matching lme4 / MixedModels.jl).
+  be odd and ≤ 25. `>1` applies to binomial/Poisson models with a single
+  grouping factor and ≤ 3 random effects per group (intercept + slopes,
+  temporary cap); any other shape warns and falls back to Laplace.
 - `wald_se` — fixed-effect Wald-SE denominator: `"hessian"` (default) or
   `"rx"`.
 - `targets` — list of predictor names whose SE is computed; `None` ⇒ all.

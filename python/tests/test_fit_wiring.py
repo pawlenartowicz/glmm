@@ -56,6 +56,31 @@ def test_targets_subset_leaves_other_se_nan():
     assert not np.isnan(result.se[1])  # x targeted
 
 
+def test_agq_vector_q2_smoke():
+    # q=2 (random intercept + slope) binomial with small clusters, where the
+    # Laplace bias AGQ corrects is visible — proves nagq>1 actually routed to
+    # the vector-AGQ kernel instead of silently refitting Laplace.
+    rng = np.random.default_rng(42)
+    n_groups, per = 75, 4
+    n = n_groups * per
+    g = np.repeat(np.arange(n_groups), per)
+    x = rng.normal(size=n)
+    b0 = rng.normal(scale=1.2, size=n_groups)
+    b1 = rng.normal(scale=0.8, size=n_groups)
+    eta = 0.3 + 0.8 * x + b0[g] + b1[g] * x
+    y = rng.binomial(1, 1.0 / (1.0 + np.exp(-eta))).astype(float)
+    data = {"y": y.tolist(), "x": x.tolist(), "g": [f"g{i}" for i in g.tolist()]}
+
+    laplace = glmm.fit(data, "y ~ x + (1 + x | g)", "binomial")  # nagq=1 default
+    agq = glmm.fit(data, "y ~ x + (1 + x | g)", "binomial", nagq=7, wald_se="hessian")
+    assert agq.converged
+    assert np.all(np.isfinite(agq.se))
+    # Gate routed: quadrature moves the answer off the Laplace fit (empirically
+    # ~3e-2 in beta and ~0.3 in varcorr on this dataset — far above tolerance).
+    assert np.max(np.abs(agq.beta - laplace.beta)) > 1e-6
+    assert np.max(np.abs(np.array(agq.varcorr[0]) - np.array(laplace.varcorr[0]))) > 1e-4
+
+
 def test_warm_start_reaches_same_answer_as_cold():
     y = 1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)
     cold = glmm.fit(_data(y.tolist()), "y ~ x + (1 | g)")

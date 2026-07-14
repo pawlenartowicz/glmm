@@ -1829,8 +1829,9 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
                     fit.fam_a[(1 + c) * w + (1 + c)] = 1.0 + th_n * th_n * n_c;
                 }
             }
-            // In-place Crout Cholesky over the row-major w×w block, w ≤ 1+n_per —
-            // hand-rolled (zero-alloc; INFINITY on a non-positive pivot, the
+            // In-place Crout Cholesky over the row-major w×w block, w ≤ 1+n_per,
+            // via the shared kernel in `crate::linalg::block_chol` (zero-alloc;
+            // false on a non-positive pivot, mapped to +INFINITY here — the
             // module's failure surface). Chains are ≤ w links — not chain-sick.
             // Pivots are multiplied into a per-family product (≤ w ≈ 9 terms,
             // each ≥ 1 since A_f's diagonal is 1.0 + θ²·n) and logged once
@@ -1841,26 +1842,12 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
             // over ~480 terms can overflow f64 to +Infinity where the
             // per-family scoping (bounded product, reset each family) stays
             // finite.
+            if !crate::linalg::block_chol(&mut fit.fam_a[..w * w], w) {
+                return f64::INFINITY;
+            }
             let mut fam_prod = 1.0_f64;
             for j in 0..w {
-                let mut d = fit.fam_a[j * w + j];
-                for k in 0..j {
-                    let v = fit.fam_a[j * w + k];
-                    d -= v * v;
-                }
-                if !(d.is_finite() && d > 0.0) {
-                    return f64::INFINITY;
-                }
-                let l = d.sqrt();
-                fit.fam_a[j * w + j] = l;
-                fam_prod *= l;
-                for i in (j + 1)..w {
-                    let mut v = fit.fam_a[i * w + j];
-                    for k in 0..j {
-                        v -= fit.fam_a[i * w + k] * fit.fam_a[j * w + k];
-                    }
-                    fit.fam_a[i * w + j] = v / l;
-                }
+                fam_prod *= fit.fam_a[j * w + j];
             }
             log_lzz_half += fam_prod.ln();
             // B_f (rows = Bt columns f·w..f·w+w, each contiguous): cols [crossed | X y].
@@ -2053,27 +2040,37 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
 /// One general-path fit summary. θ̂ (post-pin) stays in `ws.theta`; β̂/Var/t²
 /// land in `ws.fit`'s target slots — no per-fit allocation.
 pub struct LmmFit {
-    /// Residual variance estimate σ̂² at θ̂. NaN on non-converged fits.
+    /// Residual variance estimate σ̂² at θ̂. NaN only when there is no
+    /// endpoint to report at all (`ModelDegenerate` / rank-deficient) —
+    /// finite on a `MaxFunReached` cap-out too (Option A,
+    /// `docs/GLMM/implemented/2026-07-11-maxeval-plateau-policy-spec.md`).
     pub sigma_sq: f64,
     /// Whether the optimizer reached an interior minimum or a pinned
-    /// boundary (both count); false only on optimizer/numerical failure.
+    /// boundary (both count); false on a `MaxFunReached` cap-out (the
+    /// endpoint is still reported, honestly, as non-converged) and on
+    /// optimizer/numerical failure.
     pub converged: bool,
     /// Shipped `lme.rs` coding: 0 = interior min, 1 = pinned at a variance
-    /// boundary (counted converged), 2 = optimizer/numerical failure
-    /// (NaN-filled, non-converged).
+    /// boundary (counted converged), 2 = no accepted optimum — either a
+    /// `MaxFunReached` cap-out (finite endpoint still reported below) or an
+    /// optimizer/numerical failure (NaN-filled).
     pub boundary_hit: u8,
     /// Objective evaluations consumed (diagnostics only).
     pub n_eval: usize,
     /// Joint Wald-χ² over the target set (the shared `lme.rs` helper). Under
-    /// H₀: β_T = 0, asymptotically χ²(k). NaN on non-converged / degenerate
-    /// fits or an empty target set.
+    /// H₀: β_T = 0, asymptotically χ²(k). NaN on optimizer/numerical failure
+    /// or an empty target set; finite on a `MaxFunReached` endpoint.
     pub joint_t_sq: f64,
     /// Bit k set iff diagonal variance component k (in `diagonal_theta()`
-    /// order) pinned at 0. 0 on non-converged fits. u64 mask: over-envelope
-    /// sparse designs can exceed the 32-component NoZ ceiling (up to 64).
+    /// order) pinned at 0. 0 unless `converged` — a `MaxFunReached` endpoint
+    /// is reported as a point, not an accepted boundary, so it never sets
+    /// this mask even though its near-zero diagonals are still numerically
+    /// pinned for FP stability. u64 mask: over-envelope sparse designs can
+    /// exceed the 32-component NoZ ceiling (up to 64).
     pub pinned_components: u64,
-    /// Minimized profiled REML deviance at the accepted θ̂ (the `reml_deviance`
-    /// value after the pin re-eval). NaN on optimizer/numerical failure.
+    /// Minimized profiled REML deviance at the accepted (or capped) θ̂ (the
+    /// `reml_deviance` value after the pin re-eval). NaN only on
+    /// optimizer/numerical failure — finite on a `MaxFunReached` endpoint.
     pub deviance: f64,
 }
 
@@ -2171,36 +2168,46 @@ fn fit_lmm_impl(
         solver.minimize(|xs| reml_deviance(xs, suff, fit), theta, lower, upper)
     };
 
-    // Status mapping: Converged ⇒ candidate fit; MaxFunReached /
-    // ModelDegenerate ⇒ optimizer failure ⇒ NaN-fill, non-converged (the
-    // generalized boundary_hit == 2). TargetReached unreachable (f_target
-    // stays -inf); InvalidArgs would be an engine bug — the workspace fixes
-    // shapes and bounds.
+    // Status mapping (Option A,
+    // docs/GLMM/implemented/2026-07-11-maxeval-plateau-policy-spec.md):
+    // Converged ⇒ candidate fit. MaxFunReached ⇒ still runs the same
+    // pin + rank-guard + recovery below (an honest finite endpoint), but
+    // `converged` stays false and `boundary_hit` stays 2 rather than
+    // migrating into the accepted-boundary (1) code. ModelDegenerate has no
+    // endpoint worth reporting ⇒ NaN-fill (boundary_hit == 2). TargetReached
+    // unreachable (f_target stays -inf); InvalidArgs would be an engine bug —
+    // the workspace fixes shapes and bounds.
     debug_assert!(out.status != Status::InvalidArgs);
-    let ok = matches!(out.status, Status::Converged);
+    let converged = matches!(out.status, Status::Converged);
+    let has_endpoint = matches!(out.status, Status::Converged | Status::MaxFunReached);
 
     // Per-component deterministic pin: every DIAGONAL variance component ≤
-    // PIN_THETA collapses to exactly 0 — FP-stable across platforms, counted
-    // converged. Off-diagonal vech entries (signed slope covariances) are never
-    // pinned: a corr → ±1 boundary presents as the *diagonal* λ_{dd} → 0 under
-    // the Cholesky parameterization, so pinning the diagonal is the whole
-    // policy. `pinned_components` records the bit per `diagonal_theta()` index.
+    // PIN_THETA collapses to exactly 0 — FP-stable across platforms. Applied
+    // to any reported endpoint (converged or capped), but `pinned`/
+    // `pinned_components` (⇒ boundary_hit == 1, "accepted boundary") only
+    // latch when the fit actually converged — a capped endpoint is reported
+    // as a point, not accepted onto the boundary. Off-diagonal vech entries
+    // (signed slope covariances) are never pinned: a corr → ±1 boundary
+    // presents as the *diagonal* λ_{dd} → 0 under the Cholesky
+    // parameterization, so pinning the diagonal is the whole policy.
     let diag = suff.groupings.diagonal_theta();
     let mut pinned = false;
     let mut pinned_components = 0u64;
-    if ok {
+    if has_endpoint {
         for (k, &ti) in diag.iter().enumerate() {
             if theta[ti] <= PIN_THETA {
                 theta[ti] = 0.0;
-                pinned = true;
-                pinned_components |= 1u64 << k;
+                if converged {
+                    pinned = true;
+                    pinned_components |= 1u64 << k;
+                }
             }
         }
     }
 
-    // Pin eval at θ̂ — refreshes factor/σ̂² at the accepted point (the shipped
-    // path's "pin Cholesky at θ̂" step).
-    let dev = if ok {
+    // Pin eval at θ̂ — refreshes factor/σ̂² at the accepted-or-capped point
+    // (the shipped path's "pin Cholesky at θ̂" step).
+    let dev = if has_endpoint {
         reml_deviance(theta, suff, fit)
     } else {
         f64::INFINITY
@@ -2209,7 +2216,7 @@ fn fit_lmm_impl(
     // Rank guard on the p×p block — mirrors lme.rs's EPS_RANK min/max-diag
     // test on the pinning factor.
     let degenerate = !dev.is_finite() || chol_rank_deficient(fit.factor.as_ref(), p, EPS_RANK);
-    if !ok || degenerate {
+    if !has_endpoint || degenerate {
         for v in fit.betas.iter_mut() {
             *v = f64::NAN;
         }
@@ -2293,8 +2300,8 @@ fn fit_lmm_impl(
 
     LmmFit {
         sigma_sq,
-        converged: true,
-        boundary_hit: u8::from(pinned),
+        converged,
+        boundary_hit: if converged { u8::from(pinned) } else { 2 },
         n_eval: out.n_eval,
         joint_t_sq,
         pinned_components,
@@ -2440,6 +2447,104 @@ mod tests {
         let sig_b = fit.sigma_sq;
         assert_eq!(dev_a, dev_b, "deviance(θ=1) must be reproducible");
         assert_eq!(sig_a, sig_b, "σ̂²(θ=1) must be reproducible");
+    }
+
+    /// Task 0.2 correctness prerequisite for workspace reuse: `suff.reset()`
+    /// followed by a refill on a DIFFERENT dataset (same shape, different `y`)
+    /// must reproduce a freshly-constructed workspace's fit bit-for-bit. Same
+    /// buffers + same code path ⇒ identical float reassociation, so the
+    /// assertion is exact `==`, not a tolerance band. If this fails, `reset()`
+    /// (src/lmm.rs) leaves some `LmmSuffStats` field stale across datasets.
+    #[test]
+    fn reused_workspace_refill_matches_fresh() {
+        let (x, y_a, ids) = hand_dataset();
+        // B: same shape/ids as A, deterministically different y (constant shift
+        // + a fixed rescale) — not randomized, so the comparison stays exact.
+        let y_b: Vec<f64> = y_a.iter().map(|&v| 1.7 - 0.3 * v).collect();
+        let targets: Vec<u32> = vec![1, 2];
+
+        // Fresh workspace, fit B directly.
+        let mut ws_fresh = LmmWorkspace::new(3, 6);
+        ws_fresh.suff.reset();
+        ws_fresh.suff.add_rows(x.as_ref(), &y_b, &ids);
+        let fit_fresh = fit_lmm(&mut ws_fresh, &targets, None);
+
+        // Reused workspace: fit A first, reset, refill with B, fit again.
+        let mut ws_reused = LmmWorkspace::new(3, 6);
+        ws_reused.suff.reset();
+        ws_reused.suff.add_rows(x.as_ref(), &y_a, &ids);
+        let _ = fit_lmm(&mut ws_reused, &targets, None);
+        ws_reused.suff.reset();
+        ws_reused.suff.add_rows(x.as_ref(), &y_b, &ids);
+        let fit_reused = fit_lmm(&mut ws_reused, &targets, None);
+
+        assert_eq!(
+            fit_fresh.deviance, fit_reused.deviance,
+            "deviance must be bit-identical after reset+refill on new data"
+        );
+        assert_eq!(
+            ws_fresh.fit.betas, ws_reused.fit.betas,
+            "betas must be bit-identical after reset+refill on new data"
+        );
+        assert_eq!(
+            ws_fresh.fit.var_diag, ws_reused.fit.var_diag,
+            "var_diag must be bit-identical after reset+refill on new data"
+        );
+    }
+
+    /// Option A (docs/GLMM/implemented/2026-07-11-maxeval-plateau-policy-spec.md):
+    /// a `MaxFunReached` cap-out must still report the honest finite endpoint
+    /// (β̂/σ̂²/SE/deviance), with `converged = false` and `boundary_hit == 2`
+    /// (not the accepted-boundary 1). Forces the cap by swapping in a solver
+    /// whose `max_fun` is the legal minimum (`npt + 1`) — one eval past the
+    /// initial model build, nowhere near this dataset's optimum — bypassing
+    /// `LMM_MAX_FUN_FORMULA` entirely so the test carries no process-env race.
+    #[test]
+    fn maxfun_cap_reports_honest_endpoint() {
+        let (x, y, ids) = hand_dataset();
+        let targets: Vec<u32> = vec![1, 2];
+
+        let mut ws = LmmWorkspace::new(3, 6);
+        ws.suff.add_rows(x.as_ref(), &y, &ids);
+        let n_theta = ws.theta.len();
+        let npt = 2 * n_theta + 1; // n_theta == 1 here: PRIMA's minimum npt
+        let config = Config {
+            npt,
+            max_fun: npt + 1,
+            ..Config::new(n_theta)
+        };
+        ws.solver = Bobyqa::new(n_theta, config).expect("legal minimal config");
+
+        let fit = fit_lmm(&mut ws, &targets, None);
+
+        assert!(!fit.converged, "capped fit must not report converged");
+        assert_eq!(
+            fit.boundary_hit, 2,
+            "capped fit must not migrate into the accepted-boundary code"
+        );
+        assert_eq!(
+            fit.pinned_components, 0,
+            "a capped endpoint is a point, not an accepted boundary"
+        );
+        assert!(
+            fit.deviance.is_finite(),
+            "Option A: capped endpoint must report a finite deviance"
+        );
+        assert!(
+            fit.sigma_sq.is_finite(),
+            "Option A: capped endpoint must report a finite sigma_sq"
+        );
+        assert!(
+            fit.joint_t_sq.is_finite(),
+            "Option A: capped endpoint must report a finite joint_t_sq"
+        );
+        for &tj in &targets {
+            assert!(
+                ws.fit.betas[tj as usize].is_finite(),
+                "Option A: capped endpoint must not NaN-fill beta"
+            );
+        }
+        assert!(fit.n_eval <= npt + 1, "n_eval must reflect the forced cap");
     }
 
     /// End-to-end q=1 parity on the hand dataset: the general machine vs the
@@ -2639,7 +2744,7 @@ mod tests {
         with_nested: bool,
         n_blocks: usize,
     ) -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<Vec<u32>>, ModelSpec) {
-        let mut cluster = intercept_only_spec(Sizing::FixedClusters { n_clusters: 6 }, 0.25);
+        let mut cluster = intercept_only_spec(Sizing::FixedClusters { n_clusters: 6 });
         cluster.re.as_mut().unwrap().extra_groupings.push(Grouping {
             relation: GroupingRelation::Crossed { n_clusters: 4 },
             slopes: vec![],
@@ -2690,7 +2795,7 @@ mod tests {
     #[test]
     fn groupings_vech_layout() {
         let sizing = Sizing::FixedClusters { n_clusters: 4 };
-        let base = intercept_only_spec(sizing.clone(), 0.25);
+        let base = intercept_only_spec(sizing.clone());
 
         // q_p = 1 (intercept-only): shape must be unchanged.
         let g1 = LmmGroupings::from_cluster_spec(&base, 40, &[]);
@@ -2920,7 +3025,7 @@ mod tests {
     /// and parents that grow with N.
     #[test]
     fn nested_regime_b_deviance_matches_brute_force() {
-        let mut cluster = intercept_only_spec(Sizing::FixedSize { cluster_size: 8 }, 0.25);
+        let mut cluster = intercept_only_spec(Sizing::FixedSize { cluster_size: 8 });
         cluster.re.as_mut().unwrap().extra_groupings.push(Grouping {
             relation: GroupingRelation::NestedWithin { n_per_parent: 2 },
             slopes: vec![],
@@ -2970,7 +3075,7 @@ mod tests {
     #[test]
     fn balanced_collapse_applicability() {
         // Balanced: the regime-B nested dataset (atom-multiple by construction).
-        let mut cluster = intercept_only_spec(Sizing::FixedSize { cluster_size: 8 }, 0.25);
+        let mut cluster = intercept_only_spec(Sizing::FixedSize { cluster_size: 8 });
         cluster.re.as_mut().unwrap().extra_groupings.push(Grouping {
             relation: GroupingRelation::NestedWithin { n_per_parent: 2 },
             slopes: vec![],
@@ -3090,7 +3195,7 @@ mod tests {
     /// Two crossed factors — the dense cross-factor coupling block.
     #[test]
     fn two_crossed_factors_deviance_matches_brute_force() {
-        let mut cluster = intercept_only_spec(Sizing::FixedClusters { n_clusters: 3 }, 0.25);
+        let mut cluster = intercept_only_spec(Sizing::FixedClusters { n_clusters: 3 });
         for k in [4u32, 2u32] {
             cluster.re.as_mut().unwrap().extra_groupings.push(Grouping {
                 relation: GroupingRelation::Crossed { n_clusters: k },
@@ -3153,12 +3258,9 @@ mod tests {
     fn zero_crossed_variance_pins_only_that_component() {
         let s_cl = 4usize;
         let i_cl = 3usize;
-        let mut cluster = intercept_only_spec(
-            Sizing::FixedClusters {
-                n_clusters: s_cl as u32,
-            },
-            0.25,
-        );
+        let mut cluster = intercept_only_spec(Sizing::FixedClusters {
+            n_clusters: s_cl as u32,
+        });
         cluster.re.as_mut().unwrap().extra_groupings.push(Grouping {
             relation: GroupingRelation::Crossed {
                 n_clusters: i_cl as u32,

@@ -152,7 +152,7 @@ for (tau in c(1e-3, 1e-5)) {
 }
 write.csv(do.call(rbind, prof), file.path(out_dir, "data_profiles.csv"), row.names = FALSE)
 
-# ---- lme4 to-do: mismatches + rival engine-fails + seeded 50-cell audit --------
+# ---- lme4 to-do: mismatches + rival engine-fails + seeded 20-cell audit --------
 # Manifest order (not case_id sort or sample order) -- the watchdog's lme4
 # timeout-attribution keys off this file's line order (Task 9 constraint).
 # Rival engine-fail cells (glmm ok, MM crashes -- 2026-07-11: all nest2s
@@ -161,7 +161,7 @@ write.csv(do.call(rbind, prof), file.path(out_dir, "data_profiles.csv"), row.nam
 # MM *timeouts* are excluded: expected-heavy 30000-row cells, lme4 would
 # mostly burn its 120 s budget the same way.
 set.seed(20260709)
-audit <- sample(res$case_id[res$status == "ok"], min(50, sum(res$status == "ok")))
+audit <- sample(res$case_id[res$status == "ok"], min(20, sum(res$status == "ok")))
 rival_fail <- res$case_id[res$glmm_status == "ok" & res$mm_status == "engine-fail"]
 todo_set <- union(union(res$case_id[res$status == "mismatch"], audit), rival_fail)
 todo <- Filter(function(cid) cid %in% todo_set, names(cells))

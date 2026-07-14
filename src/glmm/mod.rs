@@ -93,16 +93,9 @@ pub const PIRLS_TOL_REL_NONCANON: f64 = 1e-8;
 pub const PIRLS_TOL_REL_FD: f64 = 1e-8;
 /// PIRLS exit tolerance for `family`: the standard value for canonical (Newton,
 /// quadratic) links, the tight value for non-canonical (Fisher-scoring, linear)
-/// links. The canonical set MIRRORS `family::irls_weight_and_resid`'s `canonical`
-/// branch (logit, Poisson-log) — change both together.
+/// links (canonical links overshoot to machine precision, non-canonical don't).
 pub(crate) fn pirls_tol(family: crate::spec::Family) -> f64 {
-    use crate::spec::{BinomialLink, Family};
-    if matches!(
-        family,
-        Family::Binomial {
-            link: BinomialLink::Logit
-        } | Family::Poisson { .. }
-    ) {
+    if crate::family::is_canonical(family) {
         PIRLS_TOL_REL
     } else {
         PIRLS_TOL_REL_NONCANON
@@ -117,9 +110,10 @@ pub const BETA_BOX: f64 = crate::glm::BETA_CAP;
 /// h = 1e-3 blows the parity se_hess gates on the noise side (sim_gamma 1e-2,
 /// cbpp_probit 2e-3 vs the 1e-3 band) while 1e-2 holds them at ~1e-4, so 1e-2
 /// is pinned by the curated sweep, not just the fixture. The sparse path needs
-/// the opposite trade and carries its own `sparse::SPARSE_FD_STEP_REL` (1e-3,
-/// truncation-limited on the 21-dim sparse Gamma golden) — calibrated
-/// separately, do not fold the two constants together.
+/// the opposite trade and carries its own `sparse::SPARSE_FD_STEP_REL` (1e-4,
+/// landing on the weighted sparse Gamma golden's FD-step plateau — 1e-3 biases
+/// se(β₀) high there) — calibrated separately, do not fold the two constants
+/// together.
 pub const FD_STEP_REL: f64 = 1e-2;
 
 /// Per-fit GLMM result (mirrors `LmmFit`; no σ² — dispersion is fixed at 1).
@@ -162,6 +156,7 @@ mod workspace;
 #[cfg(test)]
 pub(crate) use deviance::glmm_laplace_deviance;
 pub use se::fd_hessian_cov;
+pub(crate) use se::{fd_mixed_diff, fd_second_diff};
 pub(crate) use workspace::StructuredSchur;
 pub use workspace::{build_z, GlmmWorkspace};
 #[cfg(test)]
@@ -305,6 +300,7 @@ pub fn fit_glmm(
         eta_fixed,
         mu,
         wm,
+        wx,
         a,
         a_chol,
         a_llt_mem,
@@ -350,7 +346,9 @@ pub fn fit_glmm(
     // (the A/B tests pin this for the single-stage reference) and when `nagq > 1` —
     // Profile deviance is undefined on the AGQ early-return path
     // (`debug_assert!(!profile_beta || nagq == 1)`), and AGQ fits must bypass stage 1
-    // unchanged.
+    // unchanged. A Laplace-pass warm start for AGQ was measured on the 33 diligent
+    // AGQ cells (2026-07-14) and reverted: total eval count was a wash (−0.3%), below
+    // the ship gate's materiality bar — see docs/GLMM/implemented/.
     let mut n_eval_stage1 = 0usize;
     if two_stage && nagq == 1 {
         params_stage1.copy_from_slice(&params[..n_theta]); // θ₀ as today
@@ -394,6 +392,7 @@ pub fn fit_glmm(
                     eta_fixed,
                     mu,
                     wm,
+                    wx,
                     a,
                     a_chol,
                     a_llt_mem,
@@ -488,6 +487,7 @@ pub fn fit_glmm(
                 eta_fixed,
                 mu,
                 wm,
+                wx,
                 a,
                 a_chol,
                 a_llt_mem,
@@ -585,6 +585,7 @@ pub fn fit_glmm(
             eta_fixed,
             mu,
             wm,
+            wx,
             a,
             a_chol,
             a_llt_mem,
@@ -639,6 +640,7 @@ pub fn fit_glmm(
             eta_fixed,
             mu,
             wm,
+            wx,
             a,
             a_chol,
             a_llt_mem,

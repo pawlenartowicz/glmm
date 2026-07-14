@@ -1,0 +1,49 @@
+#!/usr/bin/env Rscript
+# Adjudication cross-check for the two large-beta q2s AGQ mismatches in the
+# diligent grid (analyze_diligent.R's ADJUDICATED list -- change together).
+# Third-engine evidence: glmer-Laplace on the same data. At p20/p100 obs per
+# cluster Laplace ~ AGQ, so whichever engine glmer lands on is at the right
+# optimum. Result (run 2026-07-14): glmer reproduces glmm's beta AND theta to
+# 4 decimals on both cells; GLMMadaptive under-converged (on the p100 cell its
+# own record carries se=null -- non-PD Hessian at its "optimum").
+#   Rscript adjudicate_diligent.R      (takes ~2 min; refits both cells)
+suppressMessages({ library(lme4); library(jsonlite) })
+
+parity_dir <- normalizePath(dirname(sub(
+  "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))))
+CELLS <- c("pois_q2s_g3000p20_bal_base", "pois_q2s_g3000p100_bal_base")
+
+# recorded diligent rows for side-by-side print
+read_row <- function(path, cid) {
+  for (ln in readLines(path)) {
+    r <- tryCatch(fromJSON(ln), error = function(e) NULL)
+    if (!is.null(r) && identical(r$case_id, cid)) return(r)
+  }
+  NULL
+}
+
+for (cid in CELLS) {
+  df <- read.csv(file.path(parity_dir, "data_simulated", "grid",
+                           paste0(cid, ".csv")))
+  df$g1 <- factor(df$g1)
+  m <- glmer(y ~ 1 + x1 + (1 + x1 | g1), data = df, family = poisson(),
+             control = glmerControl(tolPwrss = 1e-13))
+  vc <- VarCorr(m)$g1
+  cat(sprintf("== %s ==\n", cid))
+  cat(sprintf("  glmer-Laplace: beta=%s stddev=%s corr=%.4f\n",
+              paste(round(unname(fixef(m)), 4), collapse = ","),
+              paste(round(attr(vc, "stddev"), 4), collapse = ","),
+              attr(vc, "correlation")[1, 2]))
+  for (eng in c("glmm", "lme4")) {
+    r <- read_row(file.path(parity_dir, "results", "diligent",
+                            paste0(eng, ".jsonl")), cid)
+    if (is.null(r)) { cat(sprintf("  %s: no recorded row\n", eng)); next }
+    # fromJSON simplifies varcomp to a data.frame with a list-column stddev
+    sd <- if (is.data.frame(r$varcomp)) r$varcomp$stddev[[1]] else r$varcomp[[1]]$stddev
+    cat(sprintf("  %-13s: beta=%s stddev=%s (status %s)\n",
+                paste0(r$engine, " k=7"),
+                paste(round(r$beta, 4), collapse = ","),
+                paste(round(unlist(sd), 4), collapse = ","),
+                r$status))
+  }
+}

@@ -48,6 +48,40 @@ fn main() {
     }
 }
 
+/// θ̂ in the common cross-engine schema, one entry per grouping factor, from
+/// `Fit::stddev_corr` (arbitrary q) — same shape as `oracle/fit.rs::varcomp`
+/// (minus the reference-order reindex: the diligent run's R side joins by
+/// group name, not position) and R's `varcomp_of`/`fit_m3_goldens.R`'s
+/// GLMMadaptive branch, so all three engines' diligent output is directly
+/// joinable on `{group, terms}`. `include_se` gates `stddev_se` to the mixed
+/// non-Gaussian Hessian path (`Fit::stddev_se` is populated only there, and
+/// only for scalar (q=1) groupings — see its doc comment); LMM callers pass
+/// `false`.
+fn varcomp(f: &glmm::Fit, re_groups: &[glmm_formula::ReGroupInfo], include_se: bool) -> Value {
+    let mut theta_offset = 0usize;
+    Value::Array(
+        re_groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let (stddev, corr) = f.stddev_corr(i);
+                let q = g.terms.len();
+                let mut entry = json!({
+                    "group": g.name,
+                    "terms": g.terms,
+                    "stddev": nums(&stddev),
+                    "corr": Value::Array(corr.iter().map(|row| nums(row)).collect()),
+                });
+                if include_se && q == 1 {
+                    entry["stddev_se"] = nums(&[f.stddev_se[theta_offset]]);
+                }
+                theta_offset += q * (q + 1) / 2;
+                entry
+            })
+            .collect(),
+    )
+}
+
 fn done_case_ids(path: &str) -> std::collections::HashSet<String> {
     let Ok(s) = std::fs::read_to_string(path) else {
         return Default::default();
@@ -108,6 +142,20 @@ fn config_tag(lo: &glmm_formula::Lowered, gaussian: bool, user_tag: &str) -> Str
     }
 }
 
+/// Fit one cell, timed (`wall_seconds`). `lower_seconds` (CSV→matrix
+/// marshalling, `lower_grid_cell`) stays OUTSIDE the timed region — it is the
+/// Rust-side analogue of MM's harness already holding a `DataFrame` before
+/// `fit_cell` starts.
+///
+/// Timing protocol: one discarded warm-up fit, then two timed fits, reporting
+/// the min-wall rep. The warm-up absorbs one-time per-process lazy init —
+/// faer's first triangular matmul costs ~4–9 ms and used to land inside the
+/// timed solve of whichever cell first took the unbalanced dense-LMM path
+/// (the 40× `lmm_int1_g300p5_skew_base` outlier in every pre-fix pass). The
+/// min is honest: fits are deterministic (identical eval sequence —
+/// `rep_mismatch` flags any drift) and timing noise on a locked machine is
+/// one-sided. Mirrors grid_fit.jl's warm-up discard; run_grid.sh's glmm
+/// TIMEOUT budgets 3 fits per cell — change together.
 fn fit_cell(cell: &Value, user_tag: &str) -> Value {
     let case_id = cell["case_id"].as_str().unwrap().to_string();
     let seed = cell["seed"].as_i64().unwrap_or(0);
@@ -115,18 +163,60 @@ fn fit_cell(cell: &Value, user_tag: &str) -> Value {
         "case_id": case_id, "seed": seed, "engine": "glmm",
         "optimizer": "bobyqa",
     });
-    let t0 = Instant::now();
     // Lower first (own catch_unwind: a lowering panic is engine-fail with no
     // site to report), so config_tag can read the lowered relations/ids.
-    let lowered =
+    let t_lower = Instant::now();
+    let mut lowered =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lower_grid_cell(cell, DIR)));
-    let result: Option<glmm::Fit> = match &lowered {
+    let lower_seconds = t_lower.elapsed().as_secs_f64();
+    // Diligent manifests stamp `nagq` on the 33 AGQ-eligible cells (spec Part 6);
+    // absent on every other cell (shipped/eval-efficiency manifests included),
+    // where this is a no-op leaving `FitOptions::nagq`'s default (1 = Laplace).
+    if let Ok((lo, ..)) = &mut lowered {
+        if let Some(k) = cell["nagq"].as_u64() {
+            lo.opts.nagq = k as u8;
+        }
+    }
+    let (result, wall_seconds): (Option<glmm::Fit>, f64) = match &lowered {
         Ok((lo, gaussian, _)) => {
             rec["config_tag"] = json!(config_tag(lo, *gaussian, user_tag));
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts)
-            }))
-            .ok()
+            let one_fit = || -> (Option<glmm::Fit>, f64) {
+                let t_fit = Instant::now();
+                let f = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts)
+                }))
+                .ok();
+                let wall = t_fit.elapsed().as_secs_f64();
+                (f, wall)
+            };
+            let warm = one_fit();
+            if warm.0.is_none() {
+                // Warm-up panicked — record it as-is; re-fitting the same
+                // cell would panic again.
+                warm
+            } else {
+                let (a, b) = (one_fit(), one_fit());
+                rec["n_reps"] = json!(2);
+                if let (Some(fa), Some(fb)) = (&a.0, &b.0) {
+                    // Determinism QA — identical work per rep is what makes
+                    // min-of-2 honest; flag drift rather than silently
+                    // taking the min over disagreeing fits.
+                    if fa.deviance.to_bits() != fb.deviance.to_bits() || fa.n_eval != fb.n_eval {
+                        rec["rep_mismatch"] = json!(true);
+                    }
+                }
+                match (a.0.is_some(), b.0.is_some()) {
+                    (true, false) => a,
+                    (false, true) => b,
+                    _ => {
+                        if a.1 <= b.1 {
+                            a
+                        } else {
+                            b
+                        }
+                    }
+                }
+            }
         }
         Err(_) => {
             rec["config_tag"] = json!(if user_tag.is_empty() {
@@ -134,10 +224,9 @@ fn fit_cell(cell: &Value, user_tag: &str) -> Value {
             } else {
                 format!("lower-fail:{user_tag}")
             });
-            None
+            (None, 0.0)
         }
     };
-    let wall = t0.elapsed().as_secs_f64();
     match result {
         Some(f) => {
             let max_fun = lowered.as_ref().map(|(_, _, m)| *m).unwrap_or(0);
@@ -148,6 +237,17 @@ fn fit_cell(cell: &Value, user_tag: &str) -> Value {
             rec["deviance"] = num(f.deviance);
             rec["beta"] = nums(&f.beta);
             rec["se"] = nums(&f.se);
+            // theta hat (diligent-run recording, spec Part 6): reduced to
+            // stddev+corr per grouping via `Fit::stddev_corr`, mirroring
+            // `oracle/fit.rs::varcomp`/R's `varcomp_of` schema so the three
+            // runners join on the same field. Empty for fixed-only fits (no
+            // `re_groups`). `include_se` mirrors fit.rs: only the mixed
+            // non-Gaussian path has a populated `stddev_se` (scalar groupings).
+            rec["varcomp"] = lowered
+                .as_ref()
+                .ok()
+                .map(|(lo, gaussian, _)| varcomp(&f, &lo.re_groups, !gaussian))
+                .unwrap_or_else(|| json!([]));
             rec["status"] = json!(if maxeval {
                 "maxeval"
             } else if f.converged {
@@ -163,9 +263,11 @@ fn fit_cell(cell: &Value, user_tag: &str) -> Value {
             rec["deviance"] = Value::Null;
             rec["beta"] = json!([]);
             rec["se"] = json!([]);
+            rec["varcomp"] = json!([]);
             rec["status"] = json!("engine-fail");
         }
     }
-    rec["wall_seconds"] = json!(wall);
+    rec["lower_seconds"] = num(lower_seconds);
+    rec["wall_seconds"] = num(wall_seconds);
     rec
 }

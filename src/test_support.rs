@@ -189,7 +189,7 @@ impl TestWs {
 }
 
 /// Intercept-only `ModelSpec` — mirrors `engine_contract::ClusterSpec::intercept_only`.
-pub(crate) fn intercept_only_spec(sizing: crate::Sizing, _tau: f64) -> crate::ModelSpec {
+pub(crate) fn intercept_only_spec(sizing: crate::Sizing) -> crate::ModelSpec {
     crate::ModelSpec {
         family: crate::Family::Gaussian,
         re: Some(crate::ReStructure {
@@ -200,15 +200,13 @@ pub(crate) fn intercept_only_spec(sizing: crate::Sizing, _tau: f64) -> crate::Mo
     }
 }
 
-/// Levels one grouping contributes to an atom block. Verbatim mirror of
-/// `engine_contract::GroupingRelation::block_levels` — used only by the
-/// test-only DGP layout helpers below (glmm's `ModelSpec` deliberately omits
-/// the sim-layer layout methods; the lmm test datasets need them).
+/// Levels one grouping contributes to an atom block. Delegates to
+/// `ids::block_levels` (the two were a verbatim duplicate) — kept as a
+/// separate binding here since the DGP layout helpers below (`model_atom`,
+/// `extra_level_of_row`) are `ModelSpec`-shaped while `ids`'s is
+/// `ReStructure`-shaped.
 pub(crate) fn block_levels(rel: &crate::GroupingRelation) -> usize {
-    match rel {
-        crate::GroupingRelation::Crossed { n_clusters } => (*n_clusters).max(1) as usize,
-        crate::GroupingRelation::NestedWithin { n_per_parent } => (*n_per_parent).max(1) as usize,
-    }
+    crate::ids::block_levels(rel)
 }
 
 /// Grid atom for the full grouping structure. Verbatim mirror of
@@ -220,35 +218,15 @@ pub(crate) fn model_atom(spec: &crate::ModelSpec) -> usize {
         .fold(re.sizing.atom(), |a, g| a * block_levels(&g.relation))
 }
 
-/// Level of extra grouping `g` that row `i` belongs to. Verbatim mirror of
-/// `engine_contract::ClusterSpec::extra_level_of_row` (test-only DGP layout).
+/// Level of extra grouping `g` that row `i` belongs to. `ModelSpec`-shaped
+/// wrapper that unwraps `re` and delegates to `ids::extra_level_of_row` (the
+/// `ReStructure`-shaped original) — the two bodies were a verbatim duplicate.
 pub(crate) fn extra_level_of_row(spec: &crate::ModelSpec, g: usize, i: usize) -> usize {
     let re = spec
         .re
         .as_ref()
         .expect("extra_level_of_row requires re: Some");
-    let rel = &re.extra_groupings[g].relation;
-    match &re.sizing {
-        crate::Sizing::FixedClusters { n_clusters } => {
-            let s = (*n_clusters).max(1) as usize;
-            let mut stride = s;
-            for h in &re.extra_groupings[..g] {
-                stride *= block_levels(&h.relation);
-            }
-            let within = (i / stride) % block_levels(rel);
-            match rel {
-                crate::GroupingRelation::Crossed { .. } => within,
-                crate::GroupingRelation::NestedWithin { n_per_parent } => {
-                    (i % s) * (*n_per_parent).max(1) as usize + within
-                }
-            }
-        }
-        crate::Sizing::FixedSize { cluster_size } => {
-            let cs = (*cluster_size).max(1) as usize;
-            let np = block_levels(rel);
-            (i / cs) * np + (i % cs) % np
-        }
-    }
+    crate::ids::extra_level_of_row(re, g, i) as usize
 }
 
 /// Build an `LmeScratch` from a `TestWs` whose `lme_*` suff-stats are already

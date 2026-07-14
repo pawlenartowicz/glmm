@@ -230,6 +230,40 @@ pub(crate) fn glmm_sigma_sq(
     }
 }
 
+/// Pearson-moment dispersion `φ̂ = Σᵢ wᵢrᵢ²/(n−p)`, `rᵢ = (yᵢ−μᵢ)/√V(μᵢ)`, raw
+/// `n−p` degrees of freedom (not `Σwᵢ−p`) — matches R's `summary.glm`'s
+/// (weighted) Pearson dispersion. `prior_w = None` ⇒ unit weights.
+pub(crate) fn pearson_dispersion(
+    y: &[f64],
+    mu: &[f64],
+    family: Family,
+    nb_theta: f64,
+    n: usize,
+    p: usize,
+    prior_w: Option<&[f64]>,
+) -> f64 {
+    let mut s = 0.0;
+    for i in 0..n {
+        let r = (y[i] - mu[i]) / variance(family, nb_theta, mu[i]).sqrt();
+        let pw = prior_w.map_or(1.0, |w| w[i]);
+        s += pw * r * r;
+    }
+    s / (n - p) as f64
+}
+
+/// Canonical-link test: logit (binomial) and log (Poisson) are the links whose
+/// IRLS weight collapses to the simplified Newton form (`irls_weight_and_resid`)
+/// and whose PIRLS exit overshoots to machine precision at the standard
+/// tolerance (`glmm::pirls_tol`) — both keyed off this same set.
+pub(crate) fn is_canonical(family: Family) -> bool {
+    matches!(
+        family,
+        Family::Binomial {
+            link: BinomialLink::Logit
+        } | Family::Poisson { .. }
+    )
+}
+
 /// IRLS triple `(μ, W, working_residual)` at the current η. For **canonical**
 /// links (logit, Poisson-log) the simplified form `W=V(μ)`, `r=(y−μ)/V(μ)`; for
 /// **non-canonical** links (probit, Gamma-log/inverse, NB-log) the general
@@ -244,16 +278,7 @@ pub(crate) fn irls_weight_and_resid(
 ) -> (f64, f64, f64) {
     let mu = link_inv(family, eta);
     let v = variance(family, nb_theta, mu);
-    // Canonical (Newton) links keep the simplified weight here; the SAME set
-    // gates `glmm::pirls_tol`'s convergence tolerance (they overshoot to machine
-    // precision, non-canonical don't) — change both together.
-    let canonical = matches!(
-        family,
-        Family::Binomial {
-            link: BinomialLink::Logit
-        } | Family::Poisson { .. }
-    );
-    if canonical {
+    if is_canonical(family) {
         // dμ/dη = V(μ) here, so the general form collapses to this shortcut.
         (mu, v, (y - mu) / v)
     } else {

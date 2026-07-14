@@ -1,0 +1,3426 @@
+<meta charset="utf-8"><title>GLMM diligent grid</title><style>
+body{font-family:system-ui,sans-serif;margin:1.5em;font-size:14px;color:#111}
+table{border-collapse:collapse;margin:0 0 2em}
+td,th{border:1px solid #bbb;padding:3px 7px;text-align:left;white-space:nowrap}
+th{background:#f0f0f0} .c{font-size:12px} .c b{font-weight:600}
+.g{color:#555;font-size:11px} .k{color:#04a;font-weight:700;font-size:10px}
+.agq{outline:2px solid #06c;outline-offset:-2px}
+.grp{border-left:3px solid #888}
+.legend span{padding:2px 8px;margin-right:6px;border:1px solid #bbb}
+h1{font-size:20px} h2{margin:1.2em 0 .3em} .note{color:#444;max-width:74em}
+.claim{background:#f7f7f7;border-left:4px solid #06c;padding:.5em 1em;margin:.4em 0;max-width:74em}
+</style>
+<h1>GLMM diligent grid &mdash; estimates / var-components / Hessian SEs vs lme4 + GLMMadaptive</h1>
+<p class="note">510-cell accuracy sweep (full-AGQ vector-RE spec, Part 6). glmm result rows: 510/510; oracle rows: 510/510. Each cell = worst gated parity gap (hover for beta / stddev / corr / se / deviance). AGQ cells (nagq=7) carry a <span class="k">k7</span> badge and blue outline. Walls recorded but NOT a deliverable (machine not clock-locked).</p>
+<p class="legend">
+<span style="background:hsl(120,60%,90%)">ok</span>
+<span style="background:hsl(0,75%,82%)">&#9888; mismatch</span>
+<span style="background:hsl(0,75%,78%)">glmm fail</span>
+<span style="background:hsl(30,80%,85%)">glmm timeout (budget)</span>
+<span style="background:hsl(215,70%,85%)">oracle error (identifiability)</span>
+<span style="background:hsl(190,55%,88%)">oracle singular (ungated)</span>
+<span style="outline:2px solid #06c">AGQ cell</span></p>
+<p class="note"><b>Status:</b> ok 432 &middot; mismatch 21 &middot; glmm-fail 0 &middot; glmm-timeout 13 &middot; oracle-error 0 &middot; oracle-singular 40 &middot; oracle-timeout 3 &middot; both-fail 1. <b>glmm-timeout</b> = 30&thinsp;s watchdog budget exceeded (giant-LMM slow tail) &mdash; compute-budget boundary, not an accuracy verdict. <b>oracle-error</b> = lme4 identifiability refusal (obs &le; REs per group on p5 high-q cells) &mdash; glmm fits, no oracle answer exists. <b>oracle-singular</b> = lme4 boundary (singular) fit with estimates &mdash; gaps recorded, not gated (flat directions). <b>oracle-timeout</b> = oracle exceeded its 120&thinsp;s budget.</p>
+<h2>The three claims (spec Part 6 &ldquo;what the run proves&rdquo;)</h2>
+<div class="claim"><b>1. Grid-wide Laplace (477 cells):</b> 405/477 match lme4-Laplace answers (beta, &theta;, Hessian SE) within band &mdash; 16 mismatches, and every one is at the SAME optimum (aligned deviance agrees to &le;4e-08): 8 are near-zero/zero-boundary &theta; components where the relative stddev band is meaningless, 8 are Hessian-SE-only exceedances on multi-grouping GLMM cells (&beta;/&theta;/deviance match; se gap up to 1.4e-2 vs the 1e-3 band). Zero wrong-answer cells. Non-comparable remainder, all named in failures.txt: 13 glmm compute-budget timeouts, 0 lme4 identifiability refusals (no oracle answer), 40 lme4 singular fits (ungated), 2 oracle timeouts, 1 both-fail (both engines refuse the same p5 q8 cell).</div>
+<div class="claim"><b>2. int1 scalar AGQ (15 cells, 15 joinable):</b> 15/15 &equiv; lme4 glmer(nAGQ=7) across the size&times;balance&times;regime sweep &mdash; 0 parity-fail. Includes the 6 aggregated-binomial <code>bina_int1_*</code> cells, now fit via AGQ&times;prior-weights (gate lifted 2026-07-14).</div>
+<div class="claim"><b>3. q2s vector AGQ (headline; 18 cells, 17 joinable):</b> 12/17 joinable cells match GLMMadaptive at matched nodes (k=7); 5 mismatch, each attributed in failures.txt &mdash; 2 large-&beta; cells adjudicated oracle-side via <code>adjudicate_diligent.R</code> (glmer-Laplace on the same data reproduces glmm&rsquo;s &beta; and &theta; to 4 decimals; GLMMadaptive under-converged, one with a non-PD Hessian), and 3 nearzero cells via the near-zero-&theta; boundary argument (&beta;/SE agree; only the &sim;0.01&ndash;0.1-scale slope stddev, a degenerate component with corr pinned at &plusmn;1, exceeds the relative band). 1 cell has no reference (GLMMadaptive exceeded its 120&thinsp;s budget). The 6 aggregated-binomial <code>bina_q2s_*</code> cells are now fit via AGQ&times;prior-weights (gate lifted 2026-07-14).</div>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="4" class="grp">int1 <small>(n&theta; 1)</small></th>
+<th colspan="4" class="grp">int2x <small>(n&theta; 2)</small></th>
+<th colspan="4" class="grp">nest2 <small>(n&theta; 2)</small></th>
+<th colspan="1" class="grp">nest3 <small>(n&theta; 3)</small></th>
+</tr>
+<tr>
+<th class="grp">bina</th>
+<th>binb</th>
+<th>lmm</th>
+<th>pois</th>
+<th class="grp">bina</th>
+<th>binb</th>
+<th>lmm</th>
+<th>pois</th>
+<th class="grp">bina</th>
+<th>binb</th>
+<th>lmm</th>
+<th>pois</th>
+<th class="grp">lmm</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g300p5_bal_base
+cat laplace oracle lme4
+beta 4.18e-11 stddev 3.19e-09 corr &ndash; se 2.90e-09 dev 5.03e-16"><b>ok</b><br><span class=g>3.19e-09</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g300p5_bal_base
+cat laplace oracle lme4
+beta 4.78e-10 stddev 1.14e-07 corr &ndash; se 5.46e-08 dev 1.68e-15"><b>ok</b><br><span class=g>1.14e-07</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g300p5_bal_base
+cat laplace oracle lme4
+beta 2.31e-08 stddev 3.83e-07 corr &ndash; se 2.30e-07 dev 2.04e-14"><b>ok</b><br><span class=g>3.83e-07</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_nest3_g300p5_bal_base
+cat laplace oracle lme4
+beta 1.97e-08 stddev 2.47e-07 corr &ndash; se 4.95e-08 dev 4.14e-15"><b>ok</b><br><span class=g>2.47e-07</span></td>
+</tr>
+<tr><th>g300p5 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g300p5_bal_lowsnr
+cat laplace oracle lme4
+beta 9.90e-09 stddev 6.90e-08 corr &ndash; se 1.98e-08 dev 1.49e-16"><b>ok</b><br><span class=g>6.90e-08</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 bal/nearzero</th>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_int1_g300p5_bal_nearzero
+cat laplace oracle lme4
+beta 6.67e-16 stddev 0.00e+00 corr &ndash; se 1.72e-15 dev 8.08e-16"><b>oracle-singular</b><br><span class=g>1.72e-15 ungated</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 single/base</th>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g300p5_single_base
+cat laplace oracle lme4
+beta 1.07e-10 stddev 1.99e-09 corr &ndash; se 1.61e-09 dev 0.00e+00"><b>ok</b><br><span class=g>1.99e-09</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 skew/base</th>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g300p5_skew_base
+cat laplace oracle lme4
+beta 1.11e-09 stddev 1.45e-08 corr &ndash; se 1.16e-08 dev 8.14e-16"><b>ok</b><br><span class=g>1.45e-08</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/base</th>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="bina_int1_g300p20_bal_base
+cat agq_int1 oracle lme4
+beta 3.07e-05 stddev 5.00e-06 corr &ndash; se 4.81e-06 dev 2.04e+00"><b>ok</b> <span class="k">k7</span><br><span class=g>3.07e-05</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="binb_int1_g300p20_bal_base
+cat agq_int1 oracle lme4
+beta 1.06e-05 stddev 1.09e-05 corr &ndash; se 3.51e-06 dev 7.57e-12"><b>ok</b> <span class="k">k7</span><br><span class=g>1.09e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g300p20_bal_base
+cat laplace oracle lme4
+beta 2.73e-11 stddev 1.90e-08 corr &ndash; se 1.87e-08 dev 1.14e-15"><b>ok</b><br><span class=g>1.90e-08</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="pois_int1_g300p20_bal_base
+cat agq_int1 oracle lme4
+beta 7.96e-07 stddev 3.20e-06 corr &ndash; se 5.33e-06 dev 1.82e+00"><b>ok</b> <span class="k">k7</span><br><span class=g>5.33e-06</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_int2x_g300p20_bal_base
+cat laplace oracle lme4
+beta 1.46e-05 stddev 2.50e-06 corr &ndash; se 3.01e-06 dev 2.68e-12"><b>ok</b><br><span class=g>1.46e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_int2x_g300p20_bal_base
+cat laplace oracle lme4
+beta 1.15e-06 stddev 1.40e-05 corr &ndash; se 9.24e-06 dev 9.78e-12"><b>ok</b><br><span class=g>1.40e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g300p20_bal_base
+cat laplace oracle lme4
+beta 1.11e-08 stddev 2.88e-06 corr &ndash; se 1.33e-06 dev 1.56e-13"><b>ok</b><br><span class=g>2.88e-06</span></td>
+<td class="c " style="background:hsl(0,75%,82%)" title="pois_int2x_g300p20_bal_base
+cat laplace oracle lme4
+beta 3.19e-05 stddev 8.77e-06 corr &ndash; se 5.11e-03 dev 2.04e-09"><b>&#9888; mismatch</b><br><span class=g>5.11e-03</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_nest2_g300p20_bal_base
+cat laplace oracle lme4
+beta 1.05e-05 stddev 5.71e-06 corr &ndash; se 3.98e-06 dev 1.25e-12"><b>ok</b><br><span class=g>1.05e-05</span></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="binb_nest2_g300p20_bal_base
+cat laplace oracle lme4
+beta 9.67e-06 stddev 1.00e+00 corr &ndash; se 2.07e-02 dev 1.65e-11"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g300p20_bal_base
+cat laplace oracle lme4
+beta 3.40e-09 stddev 3.11e-07 corr &ndash; se 9.43e-08 dev 8.00e-15"><b>ok</b><br><span class=g>3.11e-07</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_nest2_g300p20_bal_base
+cat laplace oracle lme4
+beta 2.38e-05 stddev 6.94e-06 corr &ndash; se 2.77e-06 dev 3.17e-12"><b>ok</b><br><span class=g>2.38e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_nest3_g300p20_bal_base
+cat laplace oracle lme4
+beta 1.78e-07 stddev 6.76e-06 corr &ndash; se 4.51e-06 dev 2.26e-12"><b>ok</b><br><span class=g>6.76e-06</span></td>
+</tr>
+<tr><th>g300p20 bal/lowmu</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_int2x_g300p20_bal_lowmu
+cat laplace oracle lme4
+beta 1.12e-05 stddev 6.89e-06 corr &ndash; se 1.29e-05 dev 3.30e-12"><b>ok</b><br><span class=g>1.29e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_nest2_g300p20_bal_lowmu
+cat laplace oracle lme4
+beta 9.85e-06 stddev 4.10e-05 corr &ndash; se 2.53e-05 dev 1.36e-10"><b>ok</b><br><span class=g>4.10e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g300p20_bal_lowsnr
+cat laplace oracle lme4
+beta 3.41e-11 stddev 1.02e-09 corr &ndash; se 7.10e-10 dev 2.21e-15"><b>ok</b><br><span class=g>1.02e-09</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g300p20_bal_lowsnr
+cat laplace oracle lme4
+beta 8.13e-09 stddev 1.35e-07 corr &ndash; se 1.76e-08 dev 1.21e-15"><b>ok</b><br><span class=g>1.35e-07</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/nearzero</th>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="bina_int1_g300p20_bal_nearzero
+cat agq_int1 oracle lme4
+beta 1.50e-05 stddev 1.20e-05 corr &ndash; se 8.91e-06 dev 2.20e+00"><b>ok</b> <span class="k">k7</span><br><span class=g>1.50e-05</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="binb_int1_g300p20_bal_nearzero
+cat agq_int1 oracle lme4
+beta 3.76e-06 stddev 9.62e-06 corr &ndash; se 4.99e-06 dev 2.18e-12"><b>ok</b> <span class="k">k7</span><br><span class=g>9.62e-06</span></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_int1_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.33e-15 stddev 0.00e+00 corr &ndash; se 1.97e-15 dev 4.24e-16"><b>oracle-singular</b><br><span class=g>1.97e-15 ungated</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(0,75%,82%)" title="bina_int2x_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 8.58e-07 stddev 3.15e-05 corr &ndash; se 1.37e-02 dev 2.62e-12"><b>&#9888; mismatch</b><br><span class=g>1.37e-02</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_int2x_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 5.53e-06 stddev 1.09e-05 corr &ndash; se 7.60e-06 dev 7.78e-12"><b>ok</b><br><span class=g>1.09e-05</span></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_int2x_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.15e-11 stddev 1.23e-08 corr &ndash; se 1.21e-08 dev 1.90e-15"><b>oracle-singular</b><br><span class=g>1.23e-08 ungated</span></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="pois_int2x_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 6.83e-06 stddev 3.21e-06 corr &ndash; se 4.32e-04 dev 1.73e-10"><b>oracle-singular</b><br><span class=g>4.32e-04 ungated</span></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="bina_nest2_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 4.67e-05 stddev 9.13e-06 corr &ndash; se 7.30e-03 dev 6.84e-12"><b>oracle-singular</b><br><span class=g>7.30e-03 ungated</span></td>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="pois_nest2_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 2.65e-06 stddev 1.00e+00 corr &ndash; se 1.20e-02 dev 1.53e-11"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/rare</th>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="bina_int1_g300p20_bal_rare
+cat agq_int1 oracle lme4
+beta 5.83e-07 stddev 9.93e-06 corr &ndash; se 2.24e-05 dev 7.15e-01"><b>ok</b> <span class="k">k7</span><br><span class=g>2.24e-05</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="binb_int1_g300p20_bal_rare
+cat agq_int1 oracle lme4
+beta 1.15e-06 stddev 3.07e-06 corr &ndash; se 6.06e-04 dev 2.43e-12"><b>ok</b> <span class="k">k7</span><br><span class=g>6.06e-04</span></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="bina_int2x_g300p20_bal_rare
+cat laplace oracle lme4
+beta 4.89e-06 stddev 8.29e-06 corr &ndash; se 2.22e-02 dev 3.80e-11"><b>oracle-singular</b><br><span class=g>2.22e-02 ungated</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_int2x_g300p20_bal_rare
+cat laplace oracle lme4
+beta 4.53e-06 stddev 9.67e-06 corr &ndash; se 4.48e-04 dev 9.67e-12"><b>ok</b><br><span class=g>4.48e-04</span></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_nest2_g300p20_bal_rare
+cat laplace oracle lme4
+beta 1.40e-06 stddev 7.33e-06 corr &ndash; se 1.12e-05 dev 2.43e-09"><b>ok</b><br><span class=g>1.12e-05</span></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 single/base</th>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g300p20_single_base
+cat laplace oracle lme4
+beta 4.97e-10 stddev 1.24e-08 corr &ndash; se 1.06e-08 dev 9.44e-16"><b>ok</b><br><span class=g>1.24e-08</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g300p20_single_base
+cat laplace oracle lme4
+beta 4.75e-08 stddev 1.05e-06 corr &ndash; se 7.66e-07 dev 2.43e-13"><b>ok</b><br><span class=g>1.05e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 skew/base</th>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="bina_int1_g300p20_skew_base
+cat agq_int1 oracle lme4
+beta 6.77e-05 stddev 6.14e-07 corr &ndash; se 7.25e-07 dev 1.74e+00"><b>ok</b> <span class="k">k7</span><br><span class=g>6.77e-05</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="binb_int1_g300p20_skew_base
+cat agq_int1 oracle lme4
+beta 5.39e-04 stddev 8.58e-07 corr &ndash; se 2.45e-04 dev 2.73e-12"><b>ok</b> <span class="k">k7</span><br><span class=g>5.39e-04</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g300p20_skew_base
+cat laplace oracle lme4
+beta 4.13e-10 stddev 1.78e-08 corr &ndash; se 1.65e-08 dev 2.00e-15"><b>ok</b><br><span class=g>1.78e-08</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_int2x_g300p20_skew_base
+cat laplace oracle lme4
+beta 1.90e-04 stddev 1.64e-05 corr &ndash; se 1.57e-05 dev 3.91e-12"><b>ok</b><br><span class=g>1.90e-04</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_int2x_g300p20_skew_base
+cat laplace oracle lme4
+beta 2.54e-05 stddev 4.42e-06 corr &ndash; se 1.34e-05 dev 7.93e-13"><b>ok</b><br><span class=g>2.54e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g300p20_skew_base
+cat laplace oracle lme4
+beta 2.20e-07 stddev 3.80e-07 corr &ndash; se 8.33e-08 dev 2.11e-15"><b>ok</b><br><span class=g>3.80e-07</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_int2x_g300p20_skew_base
+cat laplace oracle lme4
+beta 6.16e-06 stddev 5.64e-06 corr &ndash; se 7.11e-06 dev 2.56e-12"><b>ok</b><br><span class=g>7.11e-06</span></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="bina_nest2_g300p20_skew_base
+cat laplace oracle lme4
+beta 2.86e-05 stddev 6.42e-06 corr &ndash; se 6.86e-03 dev 3.08e-12"><b>oracle-singular</b><br><span class=g>6.86e-03 ungated</span></td>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_nest2_g300p20_skew_base
+cat laplace oracle lme4
+beta 2.82e-06 stddev 4.55e-06 corr &ndash; se 1.03e-05 dev 2.21e-11"><b>ok</b><br><span class=g>1.03e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g3000p5_bal_base
+cat laplace oracle lme4
+beta 7.19e-11 stddev 1.20e-08 corr &ndash; se 1.10e-08 dev 2.29e-15"><b>ok</b><br><span class=g>1.20e-08</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g3000p5_bal_base
+cat laplace oracle lme4
+beta 3.25e-09 stddev 4.28e-06 corr &ndash; se 3.79e-06 dev 1.89e-13"><b>ok</b><br><span class=g>4.28e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g3000p5_bal_base
+cat laplace oracle lme4
+beta 7.35e-11 stddev 1.62e-08 corr &ndash; se 1.03e-08 dev 3.83e-15"><b>ok</b><br><span class=g>1.62e-08</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_nest3_g3000p5_bal_base
+cat laplace oracle lme4
+beta 8.13e-08 stddev 9.84e-06 corr &ndash; se 5.03e-06 dev 9.39e-12"><b>ok</b><br><span class=g>9.84e-06</span></td>
+</tr>
+<tr><th>g3000p5 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g3000p5_bal_lowsnr
+cat laplace oracle lme4
+beta 1.54e-06 stddev 3.11e-05 corr &ndash; se 2.68e-05 dev 5.53e-12"><b>ok</b><br><span class=g>3.11e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 bal/nearzero</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g3000p5_bal_nearzero
+cat laplace oracle lme4
+beta 1.11e-09 stddev 2.61e-05 corr &ndash; se 1.12e-06 dev 1.00e-14"><b>ok</b><br><span class=g>2.61e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 single/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g3000p5_single_base
+cat laplace oracle lme4
+beta 7.51e-10 stddev 3.42e-06 corr &ndash; se 3.27e-06 dev 7.49e-14"><b>ok</b><br><span class=g>3.42e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 skew/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g3000p5_skew_base
+cat laplace oracle lme4
+beta 5.75e-10 stddev 2.58e-06 corr &ndash; se 2.23e-06 dev 8.07e-14"><b>ok</b><br><span class=g>2.58e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="bina_int1_g3000p20_bal_base
+cat agq_int1 oracle lme4
+beta 1.44e-05 stddev 1.14e-06 corr &ndash; se 8.97e-07 dev 2.00e+00"><b>ok</b> <span class="k">k7</span><br><span class=g>1.44e-05</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="binb_int1_g3000p20_bal_base
+cat agq_int1 oracle lme4
+beta 1.28e-05 stddev 2.61e-07 corr &ndash; se 1.89e-06 dev 5.59e-13"><b>ok</b> <span class="k">k7</span><br><span class=g>1.28e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g3000p20_bal_base
+cat laplace oracle lme4
+beta 2.49e-12 stddev 1.04e-09 corr &ndash; se 1.02e-09 dev 8.98e-16"><b>ok</b><br><span class=g>1.04e-09</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="pois_int1_g3000p20_bal_base
+cat agq_int1 oracle lme4
+beta 4.24e-06 stddev 1.89e-06 corr &ndash; se 5.42e-06 dev 1.76e+00"><b>ok</b> <span class="k">k7</span><br><span class=g>5.42e-06</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_int2x_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.35e-05 stddev 4.24e-06 corr &ndash; se 1.10e-06 dev 2.82e-13"><b>ok</b><br><span class=g>1.35e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_int2x_g3000p20_bal_base
+cat laplace oracle lme4
+beta 8.79e-06 stddev 8.09e-06 corr &ndash; se 1.90e-06 dev 5.05e-12"><b>ok</b><br><span class=g>8.79e-06</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g3000p20_bal_base
+cat laplace oracle lme4
+beta 4.55e-11 stddev 8.14e-07 corr &ndash; se 6.76e-07 dev 2.05e-15"><b>ok</b><br><span class=g>8.14e-07</span></td>
+<td class="c " style="background:hsl(0,75%,82%)" title="pois_int2x_g3000p20_bal_base
+cat laplace oracle lme4
+beta 3.39e-05 stddev 7.22e-06 corr &ndash; se 4.86e-03 dev 1.10e-09"><b>&#9888; mismatch</b><br><span class=g>4.86e-03</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_nest2_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.53e-05 stddev 2.14e-06 corr &ndash; se 1.86e-06 dev 5.86e-13"><b>ok</b><br><span class=g>1.53e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_nest2_g3000p20_bal_base
+cat laplace oracle lme4
+beta 9.23e-06 stddev 9.51e-06 corr &ndash; se 5.09e-06 dev 5.45e-12"><b>ok</b><br><span class=g>9.51e-06</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g3000p20_bal_base
+cat laplace oracle lme4
+beta 4.44e-09 stddev 6.45e-07 corr &ndash; se 5.59e-07 dev 1.30e-14"><b>ok</b><br><span class=g>6.45e-07</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_nest2_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.43e-05 stddev 1.21e-05 corr &ndash; se 1.51e-06 dev 7.65e-12"><b>ok</b><br><span class=g>1.43e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_nest3_g3000p20_bal_base
+cat laplace oracle lme4
+beta 4.12e-09 stddev 6.22e-07 corr &ndash; se 2.16e-07 dev 6.39e-14"><b>ok</b><br><span class=g>6.22e-07</span></td>
+</tr>
+<tr><th>g3000p20 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g3000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 7.37e-09 stddev 9.41e-07 corr &ndash; se 7.74e-07 dev 2.25e-15"><b>ok</b><br><span class=g>9.41e-07</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g3000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 2.53e-06 stddev 1.04e-04 corr &ndash; se 4.86e-05 dev 7.27e-11"><b>ok</b><br><span class=g>1.04e-04</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/nearzero</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.61e-09 stddev 1.52e-06 corr &ndash; se 1.51e-06 dev 2.14e-14"><b>ok</b><br><span class=g>1.52e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="binb_nest2_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 5.82e-06 stddev 2.79e-06 corr &ndash; se 2.67e-02 dev 3.40e-12"><b>oracle-singular</b><br><span class=g>2.67e-02 ungated</span></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_nest2_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.59e-10 stddev 2.99e-08 corr &ndash; se 2.68e-08 dev 5.47e-16"><b>oracle-singular</b><br><span class=g>2.99e-08 ungated</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/rare</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_nest2_g3000p20_bal_rare
+cat laplace oracle lme4
+beta 5.50e-07 stddev 3.73e-06 corr &ndash; se 3.37e-04 dev 1.91e-10"><b>ok</b><br><span class=g>3.37e-04</span></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 single/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g3000p20_single_base
+cat laplace oracle lme4
+beta 1.06e-08 stddev 1.20e-05 corr &ndash; se 1.14e-05 dev 1.61e-12"><b>ok</b><br><span class=g>1.20e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g3000p20_single_base
+cat laplace oracle lme4
+beta 3.47e-09 stddev 2.88e-07 corr &ndash; se 1.83e-07 dev 5.23e-15"><b>ok</b><br><span class=g>2.88e-07</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 skew/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g3000p20_skew_base
+cat laplace oracle lme4
+beta 8.88e-09 stddev 1.35e-06 corr &ndash; se 1.23e-06 dev 6.43e-14"><b>ok</b><br><span class=g>1.35e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_nest2_g3000p20_skew_base
+cat laplace oracle lme4
+beta 4.60e-06 stddev 7.21e-06 corr &ndash; se 5.95e-06 dev 8.28e-12"><b>ok</b><br><span class=g>7.21e-06</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g3000p20_skew_base
+cat laplace oracle lme4
+beta 3.35e-09 stddev 1.12e-06 corr &ndash; se 4.96e-07 dev 6.28e-14"><b>ok</b><br><span class=g>1.12e-06</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/base</th>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="bina_int1_g3000p100_bal_base
+cat agq_int1 oracle lme4
+beta 4.27e-05 stddev 4.48e-07 corr &ndash; se 6.10e-07 dev 2.23e+00"><b>ok</b> <span class="k">k7</span><br><span class=g>4.27e-05</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="binb_int1_g3000p100_bal_base
+cat agq_int1 oracle lme4
+beta 8.37e-06 stddev 7.21e-06 corr &ndash; se 5.78e-06 dev 9.75e-13"><b>ok</b> <span class="k">k7</span><br><span class=g>8.37e-06</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g3000p100_bal_base
+cat laplace oracle lme4
+beta 8.89e-12 stddev 1.91e-07 corr &ndash; se 1.90e-07 dev 3.23e-16"><b>ok</b><br><span class=g>1.91e-07</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="pois_int1_g3000p100_bal_base
+cat agq_int1 oracle lme4
+beta 1.51e-05 stddev 3.16e-06 corr &ndash; se 2.47e-06 dev 1.77e+00"><b>ok</b> <span class="k">k7</span><br><span class=g>1.51e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_int2x_g3000p100_bal_base
+cat laplace oracle lme4
+beta 1.20e-06 stddev 8.78e-06 corr &ndash; se 9.34e-05 dev 8.61e-11"><b>ok</b><br><span class=g>9.34e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_int2x_g3000p100_bal_base
+cat laplace oracle lme4
+beta 1.04e-05 stddev 1.02e-05 corr &ndash; se 9.39e-06 dev 1.70e-12"><b>ok</b><br><span class=g>1.04e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g3000p100_bal_base
+cat laplace oracle lme4
+beta 1.40e-10 stddev 4.84e-07 corr &ndash; se 2.75e-07 dev 9.45e-16"><b>ok</b><br><span class=g>4.84e-07</span></td>
+<td class="c " style="background:hsl(0,75%,82%)" title="pois_int2x_g3000p100_bal_base
+cat laplace oracle lme4
+beta 2.10e-05 stddev 1.06e-05 corr &ndash; se 1.49e-03 dev 6.01e-12"><b>&#9888; mismatch</b><br><span class=g>1.49e-03</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_nest2_g3000p100_bal_base
+cat laplace oracle lme4
+beta 5.69e-05 stddev 1.71e-05 corr &ndash; se 1.63e-06 dev 1.06e-12"><b>ok</b><br><span class=g>5.69e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_nest2_g3000p100_bal_base
+cat laplace oracle lme4
+beta 2.17e-05 stddev 1.43e-05 corr &ndash; se 8.78e-06 dev 1.92e-12"><b>ok</b><br><span class=g>2.17e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g3000p100_bal_base
+cat laplace oracle lme4
+beta 9.58e-10 stddev 1.14e-06 corr &ndash; se 1.06e-06 dev 2.20e-14"><b>ok</b><br><span class=g>1.14e-06</span></td>
+<td class="c " style="background:hsl(0,75%,82%)" title="pois_nest2_g3000p100_bal_base
+cat laplace oracle lme4
+beta 1.23e-05 stddev 6.43e-06 corr &ndash; se 2.55e-03 dev 1.39e-10"><b>&#9888; mismatch</b><br><span class=g>2.55e-03</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_nest3_g3000p100_bal_base
+cat laplace oracle lme4
+beta 1.48e-07 stddev 1.13e-05 corr &ndash; se 1.01e-05 dev 7.98e-12"><b>ok</b><br><span class=g>1.13e-05</span></td>
+</tr>
+<tr><th>g3000p100 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g3000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 5.21e-09 stddev 6.03e-07 corr &ndash; se 4.06e-07 dev 2.36e-16"><b>ok</b><br><span class=g>6.03e-07</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/nearzero</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g3000p100_bal_nearzero
+cat laplace oracle lme4
+beta 1.88e-10 stddev 9.56e-07 corr &ndash; se 1.36e-07 dev 5.65e-15"><b>ok</b><br><span class=g>9.56e-07</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 single/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g3000p100_single_base
+cat laplace oracle lme4
+beta 1.13e-08 stddev 1.56e-07 corr &ndash; se 5.43e-08 dev 9.05e-15"><b>ok</b><br><span class=g>1.56e-07</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 skew/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g3000p100_skew_base
+cat laplace oracle lme4
+beta 8.01e-10 stddev 1.04e-07 corr &ndash; se 8.14e-09 dev 9.78e-15"><b>ok</b><br><span class=g>1.04e-07</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g30000p5_bal_base
+cat laplace oracle lme4
+beta 2.66e-12 stddev 3.95e-09 corr &ndash; se 3.63e-09 dev 2.72e-14"><b>ok</b><br><span class=g>3.95e-09</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g30000p5_bal_base
+cat laplace oracle lme4
+beta 8.78e-10 stddev 5.05e-05 corr &ndash; se 5.00e-05 dev 2.07e-12"><b>ok</b><br><span class=g>5.05e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g30000p5_bal_base
+cat laplace oracle lme4
+beta 4.48e-11 stddev 3.53e-08 corr &ndash; se 2.16e-08 dev 6.59e-14"><b>ok</b><br><span class=g>3.53e-08</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_nest3_g30000p5_bal_base
+cat laplace oracle lme4
+beta 1.56e-09 stddev 7.01e-07 corr &ndash; se 4.03e-07 dev 1.40e-13"><b>ok</b><br><span class=g>7.01e-07</span></td>
+</tr>
+<tr><th>g30000p5 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g30000p5_bal_lowsnr
+cat laplace oracle lme4
+beta 3.48e-08 stddev 8.20e-05 corr &ndash; se 3.43e-06 dev 4.39e-12"><b>ok</b><br><span class=g>8.20e-05</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/nearzero</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_nest2_g30000p5_bal_nearzero
+cat laplace oracle lme4
+beta 1.42e-09 stddev 5.26e-07 corr &ndash; se 3.14e-07 dev 6.48e-14"><b>oracle-singular</b><br><span class=g>5.26e-07 ungated</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 single/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g30000p5_single_base
+cat laplace oracle lme4
+beta 1.20e-08 stddev 1.50e-06 corr &ndash; se 3.86e-07 dev 2.51e-13"><b>ok</b><br><span class=g>1.50e-06</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 skew/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g30000p5_skew_base
+cat laplace oracle lme4
+beta 7.50e-08 stddev 3.86e-06 corr &ndash; se 2.69e-06 dev 1.04e-12"><b>ok</b><br><span class=g>3.86e-06</span></td>
+<td></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g30000p20_bal_base
+cat laplace oracle lme4
+beta 2.93e-11 stddev 8.89e-08 corr &ndash; se 8.72e-08 dev 1.54e-14"><b>ok</b><br><span class=g>8.89e-08</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g30000p20_bal_base
+cat laplace oracle lme4
+beta 1.21e-10 stddev 3.39e-06 corr &ndash; se 3.25e-06 dev 8.88e-15"><b>ok</b><br><span class=g>3.39e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g30000p20_bal_base
+cat laplace oracle lme4
+beta 2.90e-11 stddev 4.67e-07 corr &ndash; se 4.02e-07 dev 2.47e-14"><b>ok</b><br><span class=g>4.67e-07</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_nest3_g30000p20_bal_base
+cat laplace oracle lme4
+beta 2.84e-09 stddev 9.83e-07 corr &ndash; se 8.44e-07 dev 3.67e-14"><b>ok</b><br><span class=g>9.83e-07</span></td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int1_g30000p100_bal_base
+cat laplace oracle lme4
+beta 6.64e-13 stddev 7.10e-09 corr &ndash; se 7.07e-09 dev 2.01e-14"><b>ok</b><br><span class=g>7.10e-09</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_int2x_g30000p100_bal_base
+cat laplace oracle lme4
+beta 1.22e-11 stddev 6.02e-07 corr &ndash; se 5.31e-07 dev 4.07e-14"><b>ok</b><br><span class=g>6.02e-07</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g30000p100_bal_base
+cat laplace oracle lme4
+beta 3.80e-10 stddev 1.40e-06 corr &ndash; se 4.91e-07 dev 5.54e-14"><b>ok</b><br><span class=g>1.40e-06</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_nest3_g30000p100_bal_base
+cat laplace oracle lme4
+beta 1.13e-08 stddev 1.44e-05 corr &ndash; se 1.35e-05 dev 4.45e-12"><b>ok</b><br><span class=g>1.44e-05</span></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_nest3_g30000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 1.99e-08 stddev 4.08e-06 corr &ndash; se 1.41e-06 dev 3.63e-14"><b>ok</b><br><span class=g>4.08e-06</span></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_nest3_g30000p100_bal_nearzero
+cat laplace oracle lme4
+beta 1.02e-09 stddev 1.00e+00 corr &ndash; se 3.28e-08 dev 6.05e-14"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_nest3_g30000p100_single_base
+cat laplace oracle lme4
+beta 5.15e-09 stddev 1.88e-06 corr &ndash; se 9.23e-07 dev 3.10e-13"><b>ok</b><br><span class=g>1.88e-06</span></td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_nest3_g30000p100_skew_base
+cat laplace oracle lme4
+beta 2.63e-08 stddev 6.07e-06 corr &ndash; se 2.22e-07 dev 9.03e-13"><b>ok</b><br><span class=g>6.07e-06</span></td>
+</tr>
+</table>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="1" class="grp">nestmix <small>(n&theta; 3)</small></th>
+<th colspan="4" class="grp">q2s <small>(n&theta; 3)</small></th>
+<th colspan="4" class="grp">cross4 <small>(n&theta; 4)</small></th>
+<th colspan="4" class="grp">nest2s <small>(n&theta; 4)</small></th>
+</tr>
+<tr>
+<th class="grp">lmm</th>
+<th class="grp">bina</th>
+<th>binb</th>
+<th>lmm</th>
+<th>pois</th>
+<th class="grp">bina</th>
+<th>binb</th>
+<th>lmm</th>
+<th>pois</th>
+<th class="grp">bina</th>
+<th>binb</th>
+<th>lmm</th>
+<th>pois</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g300p5_bal_base
+cat laplace oracle lme4
+beta 2.29e-08 stddev 5.27e-07 corr &ndash; se 3.07e-07 dev 1.51e-14"><b>ok</b><br><span class=g>5.27e-07</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g300p5_bal_base
+cat laplace oracle lme4
+beta 6.08e-08 stddev 2.18e-06 corr 1.55e-06 se 1.81e-06 dev 7.72e-13"><b>ok</b><br><span class=g>2.18e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g300p5_bal_base
+cat laplace oracle lme4
+beta 1.25e-07 stddev 4.95e-06 corr &ndash; se 3.56e-07 dev 3.30e-12"><b>ok</b><br><span class=g>4.95e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g300p5_bal_base
+cat laplace oracle lme4
+beta 1.29e-07 stddev 4.71e-06 corr 1.34e-05 se 3.72e-06 dev 1.12e-11"><b>ok</b><br><span class=g>1.34e-05</span></td>
+<td></td>
+</tr>
+<tr><th>g300p5 bal/lowsnr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g300p5_bal_lowsnr
+cat laplace oracle lme4
+beta 2.10e-06 stddev 1.28e-05 corr &ndash; se 1.43e-07 dev 6.89e-13"><b>ok</b><br><span class=g>1.28e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p5 bal/nearzero</th>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_nestmix_g300p5_bal_nearzero
+cat laplace oracle lme4
+beta 6.73e-08 stddev 2.00e-06 corr &ndash; se 1.71e-06 dev 2.90e-13"><b>oracle-singular</b><br><span class=g>2.00e-06 ungated</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p5 single/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g300p5_single_base
+cat laplace oracle lme4
+beta 6.39e-07 stddev 6.32e-06 corr &ndash; se 2.64e-06 dev 2.95e-12"><b>ok</b><br><span class=g>6.32e-06</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p5 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g300p5_skew_base
+cat laplace oracle lme4
+beta 4.51e-08 stddev 1.57e-06 corr &ndash; se 5.11e-07 dev 2.44e-13"><b>ok</b><br><span class=g>1.57e-06</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g300p20_bal_base
+cat laplace oracle lme4
+beta 5.50e-08 stddev 3.76e-05 corr &ndash; se 1.39e-05 dev 2.34e-11"><b>ok</b><br><span class=g>3.76e-05</span></td>
+<td class="grp c agq" style="background:hsl(120,60%,90%)" title="bina_q2s_g300p20_bal_base
+cat agq_q2s oracle GLMMadaptive
+beta 3.22e-04 stddev 7.09e-06 corr 2.60e-06 se 1.69e-04 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>3.22e-04</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="binb_q2s_g300p20_bal_base
+cat agq_q2s oracle GLMMadaptive
+beta 1.19e-05 stddev 1.33e-05 corr 2.12e-05 se 1.15e-04 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>1.15e-04</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g300p20_bal_base
+cat laplace oracle lme4
+beta 1.24e-07 stddev 5.29e-05 corr 3.34e-05 se 5.12e-05 dev 1.17e-10"><b>ok</b><br><span class=g>5.29e-05</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="pois_q2s_g300p20_bal_base
+cat agq_q2s oracle GLMMadaptive
+beta 1.14e-05 stddev 3.63e-05 corr 5.55e-05 se 3.92e-04 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>3.92e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross4_g300p20_bal_base
+cat laplace oracle lme4
+beta 2.20e-05 stddev 1.23e-05 corr &ndash; se 7.22e-06 dev 4.72e-12"><b>ok</b><br><span class=g>2.20e-05</span></td>
+<td class="c " style="background:hsl(0,75%,82%)" title="binb_cross4_g300p20_bal_base
+cat laplace oracle lme4
+beta 3.89e-05 stddev 1.00e+00 corr &ndash; se 2.55e-05 dev 3.01e-09"><b>&#9888; mismatch</b><br><span class=g>1.00e+00</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g300p20_bal_base
+cat laplace oracle lme4
+beta 2.64e-06 stddev 1.43e-05 corr &ndash; se 5.33e-06 dev 1.29e-11"><b>ok</b><br><span class=g>1.43e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_cross4_g300p20_bal_base
+cat laplace oracle lme4
+beta 9.71e-06 stddev 2.06e-05 corr &ndash; se 3.70e-06 dev 7.30e-12"><b>ok</b><br><span class=g>2.06e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_nest2s_g300p20_bal_base
+cat laplace oracle lme4
+beta 3.43e-05 stddev 7.93e-06 corr 6.34e-06 se 6.41e-06 dev 4.09e-12"><b>ok</b><br><span class=g>3.43e-05</span></td>
+<td class="c " style="background:hsl(0,75%,82%)" title="binb_nest2s_g300p20_bal_base
+cat laplace oracle lme4
+beta 1.51e-03 stddev 1.00e+00 corr 8.92e-05 se 4.00e-05 dev 1.01e-08"><b>&#9888; mismatch</b><br><span class=g>1.00e+00</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g300p20_bal_base
+cat laplace oracle lme4
+beta 9.39e-08 stddev 7.12e-06 corr 4.66e-06 se 5.91e-06 dev 2.92e-12"><b>ok</b><br><span class=g>7.12e-06</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_nest2s_g300p20_bal_base
+cat laplace oracle lme4
+beta 8.58e-06 stddev 6.89e-06 corr 5.87e-06 se 3.84e-06 dev 3.06e-12"><b>ok</b><br><span class=g>8.58e-06</span></td>
+</tr>
+<tr><th>g300p20 bal/lowmu</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="pois_q2s_g300p20_bal_lowmu
+cat agq_q2s oracle GLMMadaptive
+beta 1.06e-05 stddev 3.37e-05 corr 2.96e-05 se 2.29e-04 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>2.29e-04</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p20 bal/lowsnr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g300p20_bal_lowsnr
+cat laplace oracle lme4
+beta 5.47e-06 stddev 7.79e-05 corr &ndash; se 8.61e-06 dev 4.37e-12"><b>ok</b><br><span class=g>7.79e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g300p20_bal_lowsnr
+cat laplace oracle lme4
+beta 5.20e-06 stddev 8.97e-06 corr &ndash; se 2.09e-06 dev 3.01e-13"><b>ok</b><br><span class=g>8.97e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p20 bal/nearzero</th>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_nestmix_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.02e-08 stddev 3.17e-05 corr &ndash; se 2.88e-05 dev 1.82e-11"><b>oracle-singular</b><br><span class=g>3.17e-05 ungated</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="c agq" style="background:hsl(0,75%,82%)" title="pois_q2s_g300p20_bal_nearzero
+cat agq_q2s oracle GLMMadaptive
+beta 1.57e-04 stddev 1.57e-01 corr 1.48e-01 se 2.67e-03 dev &ndash;"><b>&#9888; mismatch</b> <span class="k">k7</span><br><span class=g>1.57e-01</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 5.02e-08 stddev 4.68e-06 corr &ndash; se 1.83e-06 dev 4.83e-13"><b>ok</b><br><span class=g>4.68e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p20 single/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g300p20_single_base
+cat laplace oracle lme4
+beta 3.88e-07 stddev 1.15e-05 corr &ndash; se 5.06e-06 dev 9.36e-12"><b>ok</b><br><span class=g>1.15e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g300p20_single_base
+cat laplace oracle lme4
+beta 9.89e-08 stddev 7.62e-06 corr &ndash; se 1.75e-06 dev 5.36e-12"><b>ok</b><br><span class=g>7.62e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g300p20 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g300p20_skew_base
+cat laplace oracle lme4
+beta 1.93e-07 stddev 3.89e-06 corr &ndash; se 1.80e-06 dev 3.32e-13"><b>ok</b><br><span class=g>3.89e-06</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="pois_q2s_g300p20_skew_base
+cat agq_q2s oracle GLMMadaptive
+beta 2.05e-05 stddev 8.08e-05 corr 6.16e-05 se 2.09e-04 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>2.09e-04</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g300p20_skew_base
+cat laplace oracle lme4
+beta 7.41e-07 stddev 3.01e-05 corr &ndash; se 9.87e-07 dev 4.42e-11"><b>ok</b><br><span class=g>3.01e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g3000p5_bal_base
+cat laplace oracle lme4
+beta 3.37e-09 stddev 4.75e-07 corr &ndash; se 2.66e-07 dev 2.14e-14"><b>ok</b><br><span class=g>4.75e-07</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g3000p5_bal_base
+cat laplace oracle lme4
+beta 4.41e-08 stddev 2.97e-06 corr 1.60e-07 se 2.64e-06 dev 1.63e-12"><b>ok</b><br><span class=g>2.97e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g3000p5_bal_base
+cat laplace oracle lme4
+beta 4.89e-08 stddev 6.87e-05 corr &ndash; se 1.70e-05 dev 1.45e-10"><b>ok</b><br><span class=g>6.87e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p5_bal_base
+cat laplace oracle lme4
+beta 1.17e-07 stddev 7.50e-06 corr 6.95e-08 se 4.00e-06 dev 7.97e-12"><b>ok</b><br><span class=g>7.50e-06</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g3000p5_bal_lowsnr
+cat laplace oracle lme4
+beta 5.94e-08 stddev 6.31e-06 corr &ndash; se 8.11e-07 dev 1.47e-13"><b>ok</b><br><span class=g>6.31e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(0,75%,82%)" title="lmm_cross4_g3000p5_bal_nearzero
+cat laplace oracle lme4
+beta 4.24e-07 stddev 2.02e-03 corr &ndash; se 3.50e-06 dev 4.27e-10"><b>&#9888; mismatch</b><br><span class=g>2.02e-03</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g3000p5_single_base
+cat laplace oracle lme4
+beta 2.20e-07 stddev 8.34e-05 corr &ndash; se 8.08e-06 dev 2.08e-10"><b>ok</b><br><span class=g>8.34e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g3000p5_skew_base
+cat laplace oracle lme4
+beta 1.77e-08 stddev 1.75e-05 corr &ndash; se 6.85e-06 dev 6.27e-12"><b>ok</b><br><span class=g>1.75e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.81e-09 stddev 2.09e-06 corr &ndash; se 1.04e-06 dev 4.00e-13"><b>ok</b><br><span class=g>2.09e-06</span></td>
+<td class="grp c agq" style="background:hsl(120,60%,90%)" title="bina_q2s_g3000p20_bal_base
+cat agq_q2s oracle GLMMadaptive
+beta 6.89e-05 stddev 4.99e-06 corr 5.63e-07 se 1.75e-04 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>1.75e-04</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="binb_q2s_g3000p20_bal_base
+cat agq_q2s oracle GLMMadaptive
+beta 7.18e-05 stddev 5.83e-05 corr 2.78e-05 se 2.55e-04 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>2.55e-04</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g3000p20_bal_base
+cat laplace oracle lme4
+beta 3.18e-09 stddev 2.70e-06 corr 3.21e-07 se 2.65e-06 dev 3.63e-13"><b>ok</b><br><span class=g>2.70e-06</span></td>
+<td class="c agq" style="background:hsl(0,75%,82%)" title="pois_q2s_g3000p20_bal_base
+cat agq_q2s oracle GLMMadaptive
+beta 9.96e-02 stddev 6.91e-03 corr 1.79e-04 se 1.69e-02 dev &ndash;"><b>&#9888; mismatch</b> <span class="k">k7</span><br><span class=g>9.96e-02</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross4_g3000p20_bal_base
+cat laplace oracle lme4
+beta 4.23e-05 stddev 1.47e-05 corr &ndash; se 1.26e-05 dev 2.39e-12"><b>ok</b><br><span class=g>4.23e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_cross4_g3000p20_bal_base
+cat laplace oracle lme4
+beta 2.05e-05 stddev 1.45e-05 corr &ndash; se 2.38e-06 dev 3.77e-11"><b>ok</b><br><span class=g>2.05e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.22e-08 stddev 1.14e-05 corr &ndash; se 4.26e-06 dev 3.74e-12"><b>ok</b><br><span class=g>1.14e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_cross4_g3000p20_bal_base
+cat laplace oracle lme4
+beta 2.00e-05 stddev 1.37e-05 corr &ndash; se 4.33e-06 dev 1.20e-12"><b>ok</b><br><span class=g>2.00e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_nest2s_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.19e-05 stddev 8.07e-06 corr 8.72e-06 se 7.23e-06 dev 4.30e-12"><b>ok</b><br><span class=g>1.19e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_nest2s_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.57e-06 stddev 6.15e-06 corr 5.32e-07 se 4.18e-06 dev 3.75e-10"><b>ok</b><br><span class=g>6.15e-06</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p20_bal_base
+cat laplace oracle lme4
+beta 2.37e-08 stddev 9.25e-06 corr 2.68e-06 se 6.83e-06 dev 2.58e-12"><b>ok</b><br><span class=g>9.25e-06</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_nest2s_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.18e-05 stddev 9.55e-07 corr 3.41e-06 se 1.87e-06 dev 4.11e-12"><b>ok</b><br><span class=g>1.18e-05</span></td>
+</tr>
+<tr><th>g3000p20 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p20_bal_highcorr
+cat laplace oracle lme4
+beta 7.43e-08 stddev 2.80e-05 corr 1.36e-05 se 2.72e-05 dev 4.37e-11"><b>ok</b><br><span class=g>2.80e-05</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p20 bal/lowmu</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_cross4_g3000p20_bal_lowmu
+cat laplace oracle lme4
+beta 4.37e-06 stddev 4.25e-06 corr &ndash; se 1.26e-05 dev 1.26e-12"><b>ok</b><br><span class=g>1.26e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_nest2s_g3000p20_bal_lowmu
+cat laplace oracle lme4
+beta 1.15e-06 stddev 1.93e-06 corr 1.16e-07 se 1.25e-05 dev 3.43e-10"><b>ok</b><br><span class=g>1.25e-05</span></td>
+</tr>
+<tr><th>g3000p20 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g3000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 1.27e-07 stddev 7.22e-06 corr &ndash; se 1.32e-06 dev 1.64e-13"><b>ok</b><br><span class=g>7.22e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 3.48e-07 stddev 7.84e-06 corr 1.98e-06 se 4.95e-06 dev 5.07e-13"><b>ok</b><br><span class=g>7.84e-06</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p20 bal/nearzero</th>
+<td></td>
+<td class="grp c agq" style="background:hsl(0,75%,82%)" title="bina_q2s_g3000p20_bal_nearzero
+cat agq_q2s oracle GLMMadaptive
+beta 2.71e-05 stddev 2.01e-02 corr 1.31e-03 se 8.86e-04 dev &ndash;"><b>&#9888; mismatch</b> <span class="k">k7</span><br><span class=g>2.01e-02</span></td>
+<td class="c agq" style="background:hsl(0,75%,82%)" title="binb_q2s_g3000p20_bal_nearzero
+cat agq_q2s oracle GLMMadaptive
+beta 6.87e-04 stddev 8.78e-03 corr 5.09e-04 se 4.62e-04 dev &ndash;"><b>&#9888; mismatch</b> <span class="k">k7</span><br><span class=g>8.78e-03</span></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross4_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.31e-05 stddev 5.90e-05 corr &ndash; se 4.26e-06 dev 5.34e-12"><b>ok</b><br><span class=g>5.90e-05</span></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="binb_cross4_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 3.13e-05 stddev 1.00e+00 corr &ndash; se 1.63e-02 dev 1.09e-10"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_cross4_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 6.20e-09 stddev 2.09e-05 corr &ndash; se 2.86e-06 dev 5.74e-12"><b>oracle-singular</b><br><span class=g>2.09e-05 ungated</span></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="pois_cross4_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.32e-06 stddev 1.00e+00 corr &ndash; se 1.28e-04 dev 2.28e-12"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="bina_nest2s_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 2.45e-06 stddev 5.88e-06 corr 0.00e+00 se 6.38e-03 dev 7.49e-13"><b>oracle-singular</b><br><span class=g>6.38e-03 ungated</span></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 6.03e-07 stddev 6.07e-04 corr 8.97e-05 se 3.57e-05 dev 7.29e-11"><b>ok</b><br><span class=g>6.07e-04</span></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="pois_nest2s_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 4.31e-06 stddev 5.60e-04 corr 0.00e+00 se 9.87e-02 dev 1.15e-12"><b>oracle-singular</b><br><span class=g>9.87e-02 ungated</span></td>
+</tr>
+<tr><th>g3000p20 bal/rare</th>
+<td></td>
+<td class="grp c agq" style="background:hsl(120,60%,90%)" title="bina_q2s_g3000p20_bal_rare
+cat agq_q2s oracle GLMMadaptive
+beta 1.28e-05 stddev 2.12e-05 corr 5.15e-05 se 7.54e-05 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>7.54e-05</span></td>
+<td class="c agq" style="background:hsl(215,70%,90%)" title="binb_q2s_g3000p20_bal_rare
+cat agq_q2s oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>oracle-timeout</b> <span class="k">k7</span><br><span class=g>g:ok o:timeout</span></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross4_g3000p20_bal_rare
+cat laplace oracle lme4
+beta 9.57e-06 stddev 1.58e-05 corr &ndash; se 6.30e-06 dev 3.07e-11"><b>ok</b><br><span class=g>1.58e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_cross4_g3000p20_bal_rare
+cat laplace oracle lme4
+beta 7.86e-06 stddev 8.56e-06 corr &ndash; se 4.77e-05 dev 1.02e-11"><b>ok</b><br><span class=g>4.77e-05</span></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_nest2s_g3000p20_bal_rare
+cat laplace oracle lme4
+beta 1.28e-05 stddev 1.95e-05 corr 3.33e-05 se 8.88e-06 dev 4.43e-09"><b>ok</b><br><span class=g>3.33e-05</span></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p20 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g3000p20_single_base
+cat laplace oracle lme4
+beta 8.23e-08 stddev 5.43e-05 corr &ndash; se 2.12e-05 dev 3.73e-11"><b>ok</b><br><span class=g>5.43e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p20_single_base
+cat laplace oracle lme4
+beta 3.92e-07 stddev 9.79e-06 corr 4.13e-06 se 6.11e-06 dev 1.10e-11"><b>ok</b><br><span class=g>9.79e-06</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p20 skew/base</th>
+<td></td>
+<td class="grp c agq" style="background:hsl(120,60%,90%)" title="bina_q2s_g3000p20_skew_base
+cat agq_q2s oracle GLMMadaptive
+beta 1.25e-04 stddev 2.15e-05 corr 1.55e-06 se 1.81e-04 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>1.81e-04</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="binb_q2s_g3000p20_skew_base
+cat agq_q2s oracle GLMMadaptive
+beta 9.32e-06 stddev 2.15e-05 corr 1.65e-05 se 1.41e-04 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>1.41e-04</span></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross4_g3000p20_skew_base
+cat laplace oracle lme4
+beta 6.67e-05 stddev 5.39e-06 corr &ndash; se 2.68e-06 dev 6.01e-13"><b>ok</b><br><span class=g>6.67e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_cross4_g3000p20_skew_base
+cat laplace oracle lme4
+beta 1.35e-04 stddev 1.15e-05 corr &ndash; se 9.14e-06 dev 6.18e-12"><b>ok</b><br><span class=g>1.35e-04</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g3000p20_skew_base
+cat laplace oracle lme4
+beta 1.07e-08 stddev 2.00e-05 corr &ndash; se 8.47e-06 dev 4.77e-12"><b>ok</b><br><span class=g>2.00e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_cross4_g3000p20_skew_base
+cat laplace oracle lme4
+beta 5.29e-05 stddev 6.47e-06 corr &ndash; se 1.44e-05 dev 9.25e-13"><b>ok</b><br><span class=g>5.29e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_nest2s_g3000p20_skew_base
+cat laplace oracle lme4
+beta 1.11e-05 stddev 4.71e-06 corr 3.18e-06 se 1.10e-05 dev 6.32e-12"><b>ok</b><br><span class=g>1.11e-05</span></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p20_skew_base
+cat laplace oracle lme4
+beta 1.20e-06 stddev 1.45e-05 corr 8.13e-06 se 1.23e-05 dev 1.34e-11"><b>ok</b><br><span class=g>1.45e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_nest2s_g3000p20_skew_base
+cat laplace oracle lme4
+beta 5.55e-06 stddev 4.12e-06 corr 1.62e-06 se 2.15e-06 dev 1.10e-10"><b>ok</b><br><span class=g>5.55e-06</span></td>
+</tr>
+<tr><th>g3000p100 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g3000p100_bal_base
+cat laplace oracle lme4
+beta 3.35e-08 stddev 6.74e-05 corr &ndash; se 2.48e-05 dev 7.82e-11"><b>ok</b><br><span class=g>6.74e-05</span></td>
+<td class="grp c agq" style="background:hsl(120,60%,90%)" title="bina_q2s_g3000p100_bal_base
+cat agq_q2s oracle GLMMadaptive
+beta 2.59e-06 stddev 7.62e-07 corr 1.71e-06 se 4.86e-05 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>4.86e-05</span></td>
+<td class="c agq" style="background:hsl(120,60%,90%)" title="binb_q2s_g3000p100_bal_base
+cat agq_q2s oracle GLMMadaptive
+beta 6.66e-05 stddev 2.33e-05 corr 3.18e-07 se 4.48e-04 dev &ndash;"><b>ok</b> <span class="k">k7</span><br><span class=g>4.48e-04</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g3000p100_bal_base
+cat laplace oracle lme4
+beta 7.74e-10 stddev 1.49e-06 corr 6.83e-07 se 1.48e-06 dev 4.23e-14"><b>ok</b><br><span class=g>1.49e-06</span></td>
+<td class="c agq" style="background:hsl(0,75%,82%)" title="pois_q2s_g3000p100_bal_base
+cat agq_q2s oracle GLMMadaptive
+beta 5.72e-01 stddev 4.01e-01 corr 3.02e-01 se &ndash; dev &ndash;"><b>&#9888; mismatch</b> <span class="k">k7</span><br><span class=g>5.72e-01</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross4_g3000p100_bal_base
+cat laplace oracle lme4
+beta 7.93e-05 stddev 8.63e-06 corr &ndash; se 2.24e-05 dev 6.33e-13"><b>ok</b><br><span class=g>7.93e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_cross4_g3000p100_bal_base
+cat laplace oracle lme4
+beta 6.05e-06 stddev 1.37e-05 corr &ndash; se 1.04e-05 dev 3.52e-12"><b>ok</b><br><span class=g>1.37e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g3000p100_bal_base
+cat laplace oracle lme4
+beta 2.37e-08 stddev 1.17e-04 corr &ndash; se 2.97e-05 dev 1.36e-10"><b>ok</b><br><span class=g>1.17e-04</span></td>
+<td class="c " style="background:hsl(0,75%,82%)" title="pois_cross4_g3000p100_bal_base
+cat laplace oracle lme4
+beta 2.01e-04 stddev 2.01e-05 corr &ndash; se 3.18e-03 dev 1.29e-10"><b>&#9888; mismatch</b><br><span class=g>3.18e-03</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_nest2s_g3000p100_bal_base
+cat laplace oracle lme4
+beta 1.25e-05 stddev 1.12e-05 corr 1.03e-05 se 9.78e-05 dev 5.76e-11"><b>ok</b><br><span class=g>9.78e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_nest2s_g3000p100_bal_base
+cat laplace oracle lme4
+beta 3.95e-06 stddev 3.87e-06 corr 5.66e-06 se 1.77e-05 dev 2.13e-12"><b>ok</b><br><span class=g>1.77e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p100_bal_base
+cat laplace oracle lme4
+beta 3.28e-08 stddev 6.03e-05 corr 1.28e-05 se 4.33e-05 dev 5.50e-11"><b>ok</b><br><span class=g>6.03e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_nest2s_g3000p100_bal_base
+cat laplace oracle lme4
+beta 2.26e-05 stddev 1.22e-05 corr 7.52e-06 se 2.25e-04 dev 3.62e-10"><b>ok</b><br><span class=g>2.25e-04</span></td>
+</tr>
+<tr><th>g3000p100 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p100_bal_highcorr
+cat laplace oracle lme4
+beta 2.09e-08 stddev 3.83e-05 corr 2.22e-06 se 3.58e-05 dev 6.08e-11"><b>ok</b><br><span class=g>3.83e-05</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p100 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 7.49e-07 stddev 1.27e-06 corr 2.48e-05 se 1.17e-06 dev 7.79e-13"><b>ok</b><br><span class=g>2.48e-05</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p100 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="binb_nest2s_g3000p100_bal_nearzero
+cat laplace oracle lme4
+beta 2.74e-06 stddev 5.16e-06 corr 0.00e+00 se 1.80e-02 dev 1.30e-12"><b>oracle-singular</b><br><span class=g>1.80e-02 ungated</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p100_bal_nearzero
+cat laplace oracle lme4
+beta 6.35e-08 stddev 1.10e-04 corr 8.77e-05 se 8.02e-05 dev 7.23e-11"><b>ok</b><br><span class=g>1.10e-04</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p100 bal/rare</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="binb_nest2s_g3000p100_bal_rare
+cat laplace oracle lme4
+beta 2.75e-06 stddev 9.95e-06 corr 0.00e+00 se 1.66e-01 dev 2.69e-13"><b>oracle-singular</b><br><span class=g>1.66e-01 ungated</span></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g3000p100 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p100_single_base
+cat laplace oracle lme4
+beta 1.50e-07 stddev 4.41e-06 corr 5.39e-07 se 8.99e-07 dev 7.60e-13"><b>ok</b><br><span class=g>4.41e-06</span></td>
+<td></td>
+</tr>
+<tr><th>g3000p100 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_nest2s_g3000p100_skew_base
+cat laplace oracle lme4
+beta 1.87e-05 stddev 1.16e-05 corr 9.71e-06 se 9.21e-06 dev 2.02e-11"><b>ok</b><br><span class=g>1.87e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g3000p100_skew_base
+cat laplace oracle lme4
+beta 4.26e-08 stddev 1.85e-05 corr 1.51e-05 se 1.22e-05 dev 2.28e-12"><b>ok</b><br><span class=g>1.85e-05</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g30000p5_bal_base
+cat laplace oracle lme4
+beta 1.11e-09 stddev 4.76e-06 corr &ndash; se 4.68e-06 dev 7.51e-14"><b>ok</b><br><span class=g>4.76e-06</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p5_bal_base
+cat laplace oracle lme4
+beta 6.13e-09 stddev 2.48e-06 corr 1.46e-06 se 2.23e-06 dev 1.08e-12"><b>ok</b><br><span class=g>2.48e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g30000p5_bal_base
+cat laplace oracle lme4
+beta 9.36e-09 stddev 2.47e-05 corr &ndash; se 1.41e-05 dev 3.07e-12"><b>ok</b><br><span class=g>2.47e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g30000p5_bal_base
+cat laplace oracle lme4
+beta 2.29e-08 stddev 5.16e-06 corr 4.87e-08 se 2.41e-06 dev 3.70e-12"><b>ok</b><br><span class=g>5.16e-06</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p5 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p5_bal_highcorr
+cat laplace oracle lme4
+beta 2.43e-08 stddev 4.25e-06 corr 9.65e-07 se 3.57e-06 dev 6.13e-12"><b>ok</b><br><span class=g>4.25e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g30000p5_bal_highcorr
+cat laplace oracle lme4
+beta 6.80e-08 stddev 1.08e-05 corr 3.14e-06 se 7.85e-06 dev 1.19e-11"><b>ok</b><br><span class=g>1.08e-05</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p5_bal_lowsnr
+cat laplace oracle lme4
+beta 7.03e-08 stddev 1.91e-05 corr 1.53e-05 se 5.15e-06 dev 5.39e-12"><b>ok</b><br><span class=g>1.91e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g30000p5_bal_lowsnr
+cat laplace oracle lme4
+beta 4.68e-07 stddev 4.79e-05 corr 3.14e-05 se 1.15e-05 dev 1.68e-11"><b>ok</b><br><span class=g>4.79e-05</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p5_bal_nearzero
+cat laplace oracle lme4
+beta 3.15e-08 stddev 5.89e-05 corr 7.87e-07 se 3.01e-06 dev 1.29e-12"><b>ok</b><br><span class=g>5.89e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g30000p5_bal_nearzero
+cat laplace oracle lme4
+beta 6.22e-08 stddev 2.22e-04 corr 9.63e-06 se 4.12e-06 dev 2.32e-12"><b>ok</b><br><span class=g>2.22e-04</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p5_single_base
+cat laplace oracle lme4
+beta 2.21e-09 stddev 6.98e-07 corr 2.56e-07 se 5.10e-07 dev 1.11e-13"><b>ok</b><br><span class=g>6.98e-07</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g30000p5_single_base
+cat laplace oracle lme4
+beta 1.83e-08 stddev 4.17e-06 corr 1.38e-06 se 1.06e-06 dev 1.07e-12"><b>ok</b><br><span class=g>4.17e-06</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p5_skew_base
+cat laplace oracle lme4
+beta 4.90e-09 stddev 1.53e-06 corr 1.19e-06 se 1.18e-06 dev 1.90e-13"><b>ok</b><br><span class=g>1.53e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g30000p5_skew_base
+cat laplace oracle lme4
+beta 7.46e-08 stddev 3.39e-06 corr 7.81e-07 se 2.51e-06 dev 8.52e-13"><b>ok</b><br><span class=g>3.39e-06</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g30000p20_bal_base
+cat laplace oracle lme4
+beta 1.97e-09 stddev 7.68e-05 corr &ndash; se 7.42e-05 dev 5.30e-12"><b>ok</b><br><span class=g>7.68e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p20_bal_base
+cat laplace oracle lme4
+beta 5.41e-10 stddev 3.72e-06 corr 4.38e-06 se 3.62e-06 dev 9.84e-13"><b>ok</b><br><span class=g>4.38e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g30000p20_bal_base
+cat laplace oracle lme4
+beta 1.13e-09 stddev 1.82e-04 corr &ndash; se 8.40e-05 dev 3.36e-11"><b>ok</b><br><span class=g>1.82e-04</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g30000p20_bal_base
+cat laplace oracle lme4
+beta 3.45e-08 stddev 1.77e-05 corr 1.21e-05 se 1.31e-05 dev 1.27e-11"><b>ok</b><br><span class=g>1.77e-05</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p20 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p20_bal_highcorr
+cat laplace oracle lme4
+beta 9.88e-10 stddev 1.03e-06 corr 1.01e-07 se 1.01e-06 dev 6.23e-14"><b>ok</b><br><span class=g>1.03e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p20 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 3.86e-07 stddev 3.41e-06 corr 2.13e-05 se 2.09e-06 dev 2.00e-12"><b>ok</b><br><span class=g>2.13e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p20 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_q2s_g30000p20_bal_nearzero
+cat laplace oracle lme4
+beta 2.38e-09 stddev 1.68e-04 corr 2.22e-16 se 9.60e-08 dev 5.30e-14"><b>oracle-singular</b><br><span class=g>1.68e-04 ungated</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p20 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p20_single_base
+cat laplace oracle lme4
+beta 8.95e-09 stddev 6.77e-07 corr 1.24e-06 se 5.30e-07 dev 1.54e-13"><b>ok</b><br><span class=g>1.24e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p20 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p20_skew_base
+cat laplace oracle lme4
+beta 8.06e-09 stddev 2.65e-07 corr 5.45e-07 se 2.29e-07 dev 1.39e-14"><b>ok</b><br><span class=g>5.45e-07</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nestmix_g30000p100_bal_base
+cat laplace oracle lme4
+beta 4.28e-11 stddev 6.81e-07 corr &ndash; se 4.69e-07 dev 7.65e-15"><b>ok</b><br><span class=g>6.81e-07</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p100_bal_base
+cat laplace oracle lme4
+beta 5.76e-09 stddev 1.85e-05 corr 5.49e-05 se 1.84e-05 dev 2.39e-11"><b>ok</b><br><span class=g>5.49e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g30000p100_bal_base
+cat laplace oracle lme4
+beta 2.62e-10 stddev 1.72e-05 corr &ndash; se 9.85e-07 dev 6.48e-13"><b>ok</b><br><span class=g>1.72e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g30000p100_bal_base
+cat laplace oracle lme4
+beta 7.26e-09 stddev 6.66e-05 corr 5.74e-05 se 6.63e-05 dev 9.27e-11"><b>ok</b><br><span class=g>6.66e-05</span></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p100_bal_highcorr
+cat laplace oracle lme4
+beta 3.35e-10 stddev 7.65e-06 corr 1.97e-06 se 7.62e-06 dev 6.36e-13"><b>ok</b><br><span class=g>7.65e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 1.06e-08 stddev 4.09e-06 corr 4.32e-06 se 3.68e-06 dev 1.08e-13"><b>ok</b><br><span class=g>4.32e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p100_bal_nearzero
+cat laplace oracle lme4
+beta 1.18e-07 stddev 5.43e-04 corr 1.62e-04 se 5.60e-05 dev 8.74e-11"><b>ok</b><br><span class=g>5.43e-04</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p100_single_base
+cat laplace oracle lme4
+beta 1.74e-08 stddev 2.17e-06 corr 1.46e-06 se 1.51e-06 dev 8.91e-13"><b>ok</b><br><span class=g>2.17e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2s_g30000p100_skew_base
+cat laplace oracle lme4
+beta 3.19e-09 stddev 6.96e-07 corr 1.70e-06 se 6.83e-07 dev 3.02e-14"><b>ok</b><br><span class=g>1.70e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+</table>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="1" class="grp">q2sx2 <small>(n&theta; 5)</small></th>
+<th colspan="4" class="grp">cross6 <small>(n&theta; 6)</small></th>
+<th colspan="1" class="grp">q2sq2s <small>(n&theta; 6)</small></th>
+<th colspan="1" class="grp">q3s <small>(n&theta; 6)</small></th>
+</tr>
+<tr>
+<th class="grp">lmm</th>
+<th class="grp">bina</th>
+<th>binb</th>
+<th>lmm</th>
+<th>pois</th>
+<th class="grp">lmm</th>
+<th class="grp">lmm</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g300p5_bal_base
+cat laplace oracle lme4
+beta 1.38e-07 stddev 1.21e-06 corr 2.07e-06 se 7.68e-07 dev 6.79e-13"><b>ok</b><br><span class=g>2.07e-06</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g300p5_bal_base
+cat laplace oracle lme4
+beta 4.80e-07 stddev 1.44e-05 corr &ndash; se 1.72e-06 dev 1.19e-11"><b>ok</b><br><span class=g>1.44e-05</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g300p5_bal_base
+cat laplace oracle lme4
+beta 6.71e-08 stddev 7.63e-06 corr 2.32e-06 se 4.26e-06 dev 5.32e-12"><b>ok</b><br><span class=g>7.63e-06</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g300p5_bal_base
+cat laplace oracle lme4
+beta 1.83e-06 stddev 1.46e-05 corr 2.63e-05 se 1.27e-05 dev 6.78e-11"><b>ok</b><br><span class=g>2.63e-05</span></td>
+</tr>
+<tr><th>g300p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_cross6_g300p5_bal_lowsnr
+cat laplace oracle lme4
+beta 6.27e-06 stddev 3.26e-05 corr &ndash; se 3.37e-06 dev 5.01e-12"><b>oracle-singular</b><br><span class=g>3.26e-05 ungated</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_cross6_g300p5_bal_nearzero
+cat laplace oracle lme4
+beta 5.08e-06 stddev 1.17e-05 corr &ndash; se 1.13e-06 dev 1.90e-11"><b>oracle-singular</b><br><span class=g>1.17e-05 ungated</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g300p5_single_base
+cat laplace oracle lme4
+beta 2.25e-06 stddev 3.71e-06 corr &ndash; se 1.20e-06 dev 1.51e-12"><b>ok</b><br><span class=g>3.71e-06</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g300p5_skew_base
+cat laplace oracle lme4
+beta 3.94e-06 stddev 2.43e-05 corr &ndash; se 4.94e-06 dev 3.49e-11"><b>ok</b><br><span class=g>2.43e-05</span></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g300p20_bal_base
+cat laplace oracle lme4
+beta 4.07e-07 stddev 3.05e-05 corr 3.28e-05 se 2.96e-05 dev 7.35e-11"><b>ok</b><br><span class=g>3.28e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross6_g300p20_bal_base
+cat laplace oracle lme4
+beta 1.84e-05 stddev 1.84e-05 corr &ndash; se 9.77e-06 dev 5.88e-12"><b>ok</b><br><span class=g>1.84e-05</span></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="binb_cross6_g300p20_bal_base
+cat laplace oracle lme4
+beta 3.42e-06 stddev 1.00e+00 corr &ndash; se 2.84e-02 dev 2.33e-11"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g300p20_bal_base
+cat laplace oracle lme4
+beta 2.02e-08 stddev 1.17e-05 corr &ndash; se 6.04e-06 dev 3.52e-12"><b>ok</b><br><span class=g>1.17e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_cross6_g300p20_bal_base
+cat laplace oracle lme4
+beta 8.38e-06 stddev 8.82e-06 corr &ndash; se 7.53e-06 dev 1.07e-12"><b>ok</b><br><span class=g>8.82e-06</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g300p20_bal_base
+cat laplace oracle lme4
+beta 3.53e-07 stddev 3.09e-05 corr 4.23e-05 se 2.63e-05 dev 1.13e-10"><b>ok</b><br><span class=g>4.23e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g300p20_bal_base
+cat laplace oracle lme4
+beta 2.22e-07 stddev 1.32e-05 corr 1.25e-05 se 1.29e-05 dev 1.54e-11"><b>ok</b><br><span class=g>1.32e-05</span></td>
+</tr>
+<tr><th>g300p20 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g300p20_bal_highcorr
+cat laplace oracle lme4
+beta 2.38e-06 stddev 7.50e-05 corr 3.14e-05 se 2.18e-05 dev 6.11e-10"><b>ok</b><br><span class=g>7.50e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g300p20_bal_lowsnr
+cat laplace oracle lme4
+beta 2.57e-05 stddev 2.76e-04 corr &ndash; se 2.97e-06 dev 3.76e-11"><b>ok</b><br><span class=g>2.76e-04</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g300p20_bal_lowsnr
+cat laplace oracle lme4
+beta 1.03e-06 stddev 3.18e-05 corr 1.49e-05 se 1.98e-05 dev 1.38e-11"><b>ok</b><br><span class=g>3.18e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_cross6_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.53e-07 stddev 1.00e+00 corr &ndash; se 1.88e-05 dev 5.79e-10"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_q2sq2s_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 4.82e-07 stddev 8.80e-05 corr 2.58e-06 se 8.11e-05 dev 3.83e-10"><b>oracle-singular</b><br><span class=g>8.80e-05 ungated</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g300p20_single_base
+cat laplace oracle lme4
+beta 4.70e-06 stddev 2.45e-05 corr &ndash; se 4.03e-06 dev 4.63e-11"><b>ok</b><br><span class=g>2.45e-05</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g300p20_single_base
+cat laplace oracle lme4
+beta 8.31e-06 stddev 2.90e-05 corr 9.79e-06 se 1.68e-06 dev 1.24e-10"><b>ok</b><br><span class=g>2.90e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g300p20 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g300p20_skew_base
+cat laplace oracle lme4
+beta 5.31e-07 stddev 8.16e-05 corr &ndash; se 4.27e-05 dev 2.84e-10"><b>ok</b><br><span class=g>8.16e-05</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g300p20_skew_base
+cat laplace oracle lme4
+beta 6.28e-08 stddev 4.46e-06 corr 6.85e-06 se 8.39e-07 dev 2.76e-12"><b>ok</b><br><span class=g>6.85e-06</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g3000p5_bal_base
+cat laplace oracle lme4
+beta 1.64e-07 stddev 2.66e-05 corr 5.80e-06 se 1.27e-05 dev 1.08e-11"><b>ok</b><br><span class=g>2.66e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g3000p5_bal_base
+cat laplace oracle lme4
+beta 4.32e-08 stddev 6.43e-05 corr &ndash; se 4.10e-06 dev 6.27e-11"><b>ok</b><br><span class=g>6.43e-05</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p5_bal_base
+cat laplace oracle lme4
+beta 6.35e-08 stddev 1.48e-05 corr 2.58e-05 se 1.36e-05 dev 9.44e-12"><b>ok</b><br><span class=g>2.58e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g3000p5_bal_base
+cat laplace oracle lme4
+beta 7.29e-08 stddev 2.56e-06 corr 6.02e-06 se 2.19e-06 dev 4.45e-12"><b>ok</b><br><span class=g>6.02e-06</span></td>
+</tr>
+<tr><th>g3000p5 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p5_bal_highcorr
+cat laplace oracle lme4
+beta 4.08e-08 stddev 2.34e-05 corr 5.14e-06 se 2.00e-05 dev 9.10e-12"><b>ok</b><br><span class=g>2.34e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p5_bal_lowsnr
+cat laplace oracle lme4
+beta 8.55e-07 stddev 8.27e-05 corr 6.65e-05 se 6.07e-05 dev 3.54e-11"><b>ok</b><br><span class=g>8.27e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(0,75%,82%)" title="lmm_q2sq2s_g3000p5_bal_nearzero
+cat laplace oracle lme4
+beta 3.90e-07 stddev 1.13e-03 corr 2.16e-04 se 6.04e-05 dev 2.65e-10"><b>&#9888; mismatch</b><br><span class=g>1.13e-03</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p5_single_base
+cat laplace oracle lme4
+beta 7.16e-07 stddev 5.36e-05 corr 2.56e-05 se 5.17e-05 dev 6.24e-11"><b>ok</b><br><span class=g>5.36e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p5_skew_base
+cat laplace oracle lme4
+beta 3.49e-07 stddev 2.39e-05 corr 2.25e-05 se 2.26e-05 dev 7.84e-12"><b>ok</b><br><span class=g>2.39e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g3000p20_bal_base
+cat laplace oracle lme4
+beta 5.56e-08 stddev 2.90e-05 corr 1.93e-05 se 2.26e-05 dev 8.67e-11"><b>ok</b><br><span class=g>2.90e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross6_g3000p20_bal_base
+cat laplace oracle lme4
+beta 6.19e-05 stddev 8.44e-06 corr &ndash; se 3.43e-05 dev 1.33e-12"><b>ok</b><br><span class=g>6.19e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_cross6_g3000p20_bal_base
+cat laplace oracle lme4
+beta 2.85e-04 stddev 1.95e-05 corr &ndash; se 3.82e-06 dev 7.90e-11"><b>ok</b><br><span class=g>2.85e-04</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g3000p20_bal_base
+cat laplace oracle lme4
+beta 2.60e-08 stddev 2.91e-05 corr &ndash; se 1.18e-05 dev 2.07e-11"><b>ok</b><br><span class=g>2.91e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_cross6_g3000p20_bal_base
+cat laplace oracle lme4
+beta 9.46e-06 stddev 6.53e-06 corr &ndash; se 2.92e-05 dev 2.62e-13"><b>ok</b><br><span class=g>2.92e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p20_bal_base
+cat laplace oracle lme4
+beta 7.69e-08 stddev 4.35e-05 corr 5.27e-05 se 3.21e-05 dev 1.10e-10"><b>ok</b><br><span class=g>5.27e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g3000p20_bal_base
+cat laplace oracle lme4
+beta 2.15e-08 stddev 2.12e-06 corr 1.03e-05 se 2.05e-06 dev 4.75e-12"><b>ok</b><br><span class=g>1.03e-05</span></td>
+</tr>
+<tr><th>g3000p20 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p20_bal_highcorr
+cat laplace oracle lme4
+beta 3.43e-08 stddev 3.09e-05 corr 9.82e-07 se 1.89e-05 dev 3.01e-11"><b>ok</b><br><span class=g>3.09e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/lowmu</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_cross6_g3000p20_bal_lowmu
+cat laplace oracle lme4
+beta 1.57e-05 stddev 1.41e-05 corr &ndash; se 9.23e-06 dev 3.24e-12"><b>ok</b><br><span class=g>1.57e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 5.70e-07 stddev 9.09e-05 corr 4.58e-05 se 5.75e-05 dev 1.29e-10"><b>ok</b><br><span class=g>9.09e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="pois_cross6_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.02e-05 stddev 8.49e-06 corr &ndash; se 4.71e-04 dev 1.44e-09"><b>oracle-singular</b><br><span class=g>4.71e-04 ungated</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.56e-07 stddev 1.59e-04 corr 3.81e-05 se 1.01e-04 dev 1.87e-10"><b>ok</b><br><span class=g>1.59e-04</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p20_single_base
+cat laplace oracle lme4
+beta 1.29e-07 stddev 7.66e-06 corr 8.40e-06 se 7.04e-06 dev 5.34e-12"><b>ok</b><br><span class=g>8.40e-06</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="pois_cross6_g3000p20_skew_base
+cat laplace oracle lme4
+beta 5.03e-05 stddev 1.26e-05 corr &ndash; se 1.47e-05 dev 5.37e-12"><b>ok</b><br><span class=g>5.03e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p20_skew_base
+cat laplace oracle lme4
+beta 1.86e-08 stddev 1.15e-05 corr 1.90e-05 se 8.92e-06 dev 3.21e-12"><b>ok</b><br><span class=g>1.90e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g3000p100_bal_base
+cat laplace oracle lme4
+beta 1.63e-08 stddev 5.56e-05 corr 7.34e-06 se 4.69e-06 dev 2.11e-11"><b>ok</b><br><span class=g>5.56e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross6_g3000p100_bal_base
+cat laplace oracle lme4
+beta 1.01e-04 stddev 1.63e-05 corr &ndash; se 3.45e-05 dev 2.38e-12"><b>ok</b><br><span class=g>1.01e-04</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_cross6_g3000p100_bal_base
+cat laplace oracle lme4
+beta 1.02e-04 stddev 3.61e-05 corr &ndash; se 4.54e-05 dev 5.45e-11"><b>ok</b><br><span class=g>1.02e-04</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g3000p100_bal_base
+cat laplace oracle lme4
+beta 2.35e-09 stddev 2.23e-05 corr &ndash; se 1.90e-06 dev 4.47e-12"><b>ok</b><br><span class=g>2.23e-05</span></td>
+<td class="c " style="background:hsl(0,75%,82%)" title="pois_cross6_g3000p100_bal_base
+cat laplace oracle lme4
+beta 4.40e-05 stddev 6.48e-06 corr &ndash; se 3.73e-03 dev 6.90e-10"><b>&#9888; mismatch</b><br><span class=g>3.73e-03</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g3000p100_bal_base
+cat laplace oracle lme4
+beta 9.44e-09 stddev 2.75e-05 corr 2.80e-05 se 2.08e-05 dev 1.24e-11"><b>ok</b><br><span class=g>2.80e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g3000p100_bal_base
+cat laplace oracle lme4
+beta 2.54e-09 stddev 4.87e-06 corr 1.03e-05 se 4.84e-06 dev 8.93e-13"><b>ok</b><br><span class=g>1.03e-05</span></td>
+</tr>
+<tr><th>g3000p100 bal/nearzero</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross6_g3000p100_bal_nearzero
+cat laplace oracle lme4
+beta 9.34e-06 stddev 2.64e-05 corr &ndash; se 1.84e-05 dev 2.65e-12"><b>ok</b><br><span class=g>2.64e-05</span></td>
+<td class="c " style="background:hsl(190,55%,88%)" title="binb_cross6_g3000p100_bal_nearzero
+cat laplace oracle lme4
+beta 1.71e-05 stddev 1.00e+00 corr &ndash; se 1.22e-02 dev 1.30e-11"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/rare</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross6_g3000p100_bal_rare
+cat laplace oracle lme4
+beta 1.80e-06 stddev 8.20e-06 corr &ndash; se 2.68e-05 dev 2.01e-12"><b>ok</b><br><span class=g>2.68e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_cross6_g3000p100_bal_rare
+cat laplace oracle lme4
+beta 3.42e-06 stddev 1.43e-05 corr &ndash; se 5.25e-05 dev 8.80e-09"><b>ok</b><br><span class=g>5.25e-05</span></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 skew/base</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross6_g3000p100_skew_base
+cat laplace oracle lme4
+beta 6.06e-05 stddev 1.80e-05 corr &ndash; se 2.98e-05 dev 5.53e-12"><b>ok</b><br><span class=g>6.06e-05</span></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_cross6_g3000p100_skew_base
+cat laplace oracle lme4
+beta 2.57e-05 stddev 1.57e-05 corr &ndash; se 9.09e-06 dev 1.40e-11"><b>ok</b><br><span class=g>2.57e-05</span></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p5_bal_base
+cat laplace oracle lme4
+beta 7.61e-09 stddev 1.30e-04 corr 2.44e-06 se 2.27e-05 dev 2.52e-11"><b>ok</b><br><span class=g>1.30e-04</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g30000p5_bal_base
+cat laplace oracle lme4
+beta 1.16e-09 stddev 3.90e-05 corr &ndash; se 6.61e-06 dev 2.86e-12"><b>ok</b><br><span class=g>3.90e-05</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g30000p5_bal_base
+cat laplace oracle lme4
+beta 5.07e-08 stddev 2.75e-04 corr 1.53e-04 se 2.72e-04 dev 8.43e-11"><b>ok</b><br><span class=g>2.75e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g30000p5_bal_base
+cat laplace oracle lme4
+beta 7.81e-09 stddev 3.91e-06 corr 4.59e-06 se 3.36e-06 dev 3.92e-12"><b>ok</b><br><span class=g>4.59e-06</span></td>
+</tr>
+<tr><th>g30000p5 bal/highcorr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p5_bal_highcorr
+cat laplace oracle lme4
+beta 5.56e-08 stddev 5.23e-05 corr 5.30e-07 se 1.65e-05 dev 3.34e-12"><b>ok</b><br><span class=g>5.23e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/lowsnr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p5_bal_lowsnr
+cat laplace oracle lme4
+beta 1.15e-06 stddev 1.11e-04 corr 3.97e-06 se 2.06e-05 dev 9.35e-12"><b>ok</b><br><span class=g>1.11e-04</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/nearzero</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p5_bal_nearzero
+cat laplace oracle lme4
+beta 1.12e-08 stddev 1.06e-04 corr 6.60e-05 se 3.70e-05 dev 4.75e-12"><b>ok</b><br><span class=g>1.06e-04</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 single/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p5_single_base
+cat laplace oracle lme4
+beta 9.10e-08 stddev 2.06e-04 corr 6.40e-06 se 7.53e-05 dev 3.05e-11"><b>ok</b><br><span class=g>2.06e-04</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p5_skew_base
+cat laplace oracle lme4
+beta 2.32e-08 stddev 9.82e-06 corr 1.34e-06 se 7.21e-06 dev 2.92e-13"><b>ok</b><br><span class=g>9.82e-06</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p20_bal_base
+cat laplace oracle lme4
+beta 3.54e-09 stddev 3.40e-05 corr 7.92e-07 se 2.29e-05 dev 2.74e-12"><b>ok</b><br><span class=g>3.40e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g30000p20_bal_base
+cat laplace oracle lme4
+beta 2.06e-09 stddev 8.79e-05 corr &ndash; se 5.87e-06 dev 1.59e-11"><b>ok</b><br><span class=g>8.79e-05</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g30000p20_bal_base
+cat laplace oracle lme4
+beta 2.14e-09 stddev 5.93e-05 corr 3.09e-05 se 5.74e-05 dev 5.19e-12"><b>ok</b><br><span class=g>5.93e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g30000p20_bal_base
+cat laplace oracle lme4
+beta 3.98e-09 stddev 9.78e-06 corr 3.44e-06 se 9.57e-06 dev 5.87e-12"><b>ok</b><br><span class=g>9.78e-06</span></td>
+</tr>
+<tr><th>g30000p20 bal/highcorr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p20_bal_highcorr
+cat laplace oracle lme4
+beta 3.07e-09 stddev 4.47e-05 corr 1.99e-07 se 2.57e-05 dev 2.23e-12"><b>ok</b><br><span class=g>4.47e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/lowsnr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 2.07e-07 stddev 8.46e-05 corr 3.91e-06 se 3.34e-05 dev 2.81e-12"><b>ok</b><br><span class=g>8.46e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/nearzero</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p20_bal_nearzero
+cat laplace oracle lme4
+beta 7.67e-09 stddev 4.45e-04 corr 1.22e-04 se 1.26e-05 dev 1.60e-11"><b>ok</b><br><span class=g>4.45e-04</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 single/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p20_single_base
+cat laplace oracle lme4
+beta 1.18e-08 stddev 8.75e-05 corr 2.16e-06 se 1.81e-05 dev 7.61e-12"><b>ok</b><br><span class=g>8.75e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p20_skew_base
+cat laplace oracle lme4
+beta 4.88e-09 stddev 3.14e-06 corr 7.97e-07 se 1.54e-06 dev 1.28e-13"><b>ok</b><br><span class=g>3.14e-06</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p100_bal_base
+cat laplace oracle lme4
+beta 2.57e-10 stddev 1.13e-05 corr 2.22e-06 se 3.31e-06 dev 2.69e-13"><b>ok</b><br><span class=g>1.13e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g30000p100_bal_base
+cat laplace oracle lme4
+beta 9.52e-11 stddev 2.21e-05 corr &ndash; se 8.40e-06 dev 1.94e-12"><b>ok</b><br><span class=g>2.21e-05</span></td>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q2sq2s_g30000p100_bal_base
+cat laplace oracle lme4
+beta 7.90e-10 stddev 9.16e-06 corr 1.58e-05 se 8.14e-06 dev 8.74e-13"><b>ok</b><br><span class=g>1.58e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g30000p100_bal_base
+cat laplace oracle lme4
+beta 9.30e-09 stddev 2.62e-05 corr 3.22e-05 se 2.61e-05 dev 2.89e-11"><b>ok</b><br><span class=g>3.22e-05</span></td>
+</tr>
+<tr><th>g30000p100 bal/highcorr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p100_bal_highcorr
+cat laplace oracle lme4
+beta 5.05e-10 stddev 4.48e-05 corr 5.74e-07 se 2.53e-05 dev 2.75e-12"><b>ok</b><br><span class=g>4.48e-05</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g30000p100_bal_highcorr
+cat laplace oracle lme4
+beta 3.27e-09 stddev 3.67e-06 corr 3.85e-06 se 3.66e-06 dev 3.74e-12"><b>ok</b><br><span class=g>3.85e-06</span></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 3.63e-07 stddev 1.84e-04 corr 4.52e-05 se 1.25e-04 dev 2.79e-11"><b>ok</b><br><span class=g>1.84e-04</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g30000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 6.04e-07 stddev 2.67e-05 corr 9.80e-06 se 2.45e-05 dev 3.14e-12"><b>ok</b><br><span class=g>2.67e-05</span></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p100_bal_nearzero
+cat laplace oracle lme4
+beta 3.38e-08 stddev 4.31e-04 corr 2.85e-04 se 2.54e-04 dev 2.68e-10"><b>ok</b><br><span class=g>4.31e-04</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g30000p100_bal_nearzero
+cat laplace oracle lme4
+beta 2.54e-07 stddev 4.77e-04 corr 4.37e-04 se 2.05e-04 dev 1.15e-09"><b>ok</b><br><span class=g>4.77e-04</span></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p100_single_base
+cat laplace oracle lme4
+beta 4.51e-08 stddev 1.35e-04 corr 9.87e-06 se 2.47e-05 dev 2.40e-11"><b>ok</b><br><span class=g>1.35e-04</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g30000p100_single_base
+cat laplace oracle lme4
+beta 4.93e-08 stddev 3.67e-06 corr 5.40e-06 se 2.54e-06 dev 2.74e-12"><b>ok</b><br><span class=g>5.40e-06</span></td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q2sx2_g30000p100_skew_base
+cat laplace oracle lme4
+beta 2.03e-09 stddev 6.39e-06 corr 1.24e-06 se 2.53e-06 dev 1.02e-13"><b>ok</b><br><span class=g>6.39e-06</span></td>
+<td class="grp"></td>
+<td></td>
+<td></td>
+<td></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3s_g30000p100_skew_base
+cat laplace oracle lme4
+beta 3.82e-09 stddev 5.48e-06 corr 3.87e-06 se 5.36e-06 dev 3.81e-13"><b>ok</b><br><span class=g>5.48e-06</span></td>
+</tr>
+</table>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="1" class="grp">cross8 <small>(n&theta; 8)</small></th>
+<th colspan="1" class="grp">q3sx2 <small>(n&theta; 8)</small></th>
+<th colspan="1" class="grp">q4 <small>(n&theta; 10)</small></th>
+<th colspan="1" class="grp">q4sx2 <small>(n&theta; 12)</small></th>
+</tr>
+<tr>
+<th class="grp">lmm</th>
+<th class="grp">lmm</th>
+<th class="grp">lmm</th>
+<th class="grp">lmm</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g300p5_bal_base
+cat laplace oracle lme4
+beta 1.27e-05 stddev 3.41e-05 corr &ndash; se 1.05e-06 dev 4.96e-11"><b>ok</b><br><span class=g>3.41e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g300p5_bal_base
+cat laplace oracle lme4
+beta 2.32e-07 stddev 3.67e-06 corr 5.32e-06 se 1.85e-06 dev 3.14e-12"><b>ok</b><br><span class=g>5.32e-06</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g300p5_bal_base
+cat laplace oracle lme4
+beta 3.58e-05 stddev 6.60e-05 corr 5.66e-05 se 4.65e-05 dev 6.64e-10"><b>ok</b><br><span class=g>6.60e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g300p5_bal_base
+cat laplace oracle lme4
+beta 1.12e-05 stddev 7.51e-05 corr 6.37e-05 se 4.49e-05 dev 1.23e-09"><b>ok</b><br><span class=g>7.51e-05</span></td>
+</tr>
+<tr><th>g300p5 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_q4sx2_g300p5_bal_highcorr
+cat laplace oracle lme4
+beta 2.13e-06 stddev 2.16e-05 corr 3.07e-06 se 7.84e-06 dev 6.50e-11"><b>oracle-singular</b><br><span class=g>2.16e-05 ungated</span></td>
+</tr>
+<tr><th>g300p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_q4sx2_g300p5_bal_lowsnr
+cat laplace oracle lme4
+beta 2.77e-05 stddev 1.71e-04 corr 1.24e-04 se 4.49e-06 dev 7.83e-11"><b>oracle-singular</b><br><span class=g>1.71e-04 ungated</span></td>
+</tr>
+<tr><th>g300p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_q4sx2_g300p5_bal_nearzero
+cat laplace oracle lme4
+beta 1.52e-05 stddev 5.21e-05 corr 1.12e-04 se 1.88e-05 dev 4.93e-10"><b>oracle-singular</b><br><span class=g>1.12e-04 ungated</span></td>
+</tr>
+<tr><th>g300p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g300p5_single_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g300p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g300p5_skew_base
+cat laplace oracle lme4
+beta 8.20e-06 stddev 5.39e-05 corr 4.77e-05 se 1.52e-05 dev 2.39e-10"><b>ok</b><br><span class=g>5.39e-05</span></td>
+</tr>
+<tr><th>g300p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g300p20_bal_base
+cat laplace oracle lme4
+beta 2.35e-07 stddev 4.03e-05 corr &ndash; se 1.47e-06 dev 5.62e-11"><b>ok</b><br><span class=g>4.03e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g300p20_bal_base
+cat laplace oracle lme4
+beta 1.71e-07 stddev 4.34e-05 corr 2.94e-05 se 2.25e-05 dev 9.44e-11"><b>ok</b><br><span class=g>4.34e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g300p20_bal_base
+cat laplace oracle lme4
+beta 1.84e-06 stddev 1.95e-05 corr 3.28e-05 se 1.91e-05 dev 1.63e-10"><b>ok</b><br><span class=g>3.28e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g300p20_bal_base
+cat laplace oracle lme4
+beta 1.38e-05 stddev 5.74e-05 corr 8.41e-05 se 5.56e-05 dev 3.72e-10"><b>ok</b><br><span class=g>8.41e-05</span></td>
+</tr>
+<tr><th>g300p20 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g300p20_bal_highcorr
+cat laplace oracle lme4
+beta 6.56e-06 stddev 1.33e-04 corr 3.37e-05 se 8.22e-05 dev 2.23e-09"><b>ok</b><br><span class=g>1.33e-04</span></td>
+</tr>
+<tr><th>g300p20 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_q4sx2_g300p20_bal_lowsnr
+cat laplace oracle lme4
+beta 4.30e-01 stddev 1.00e+00 corr &ndash; se 9.83e-02 dev 4.80e-03"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+</tr>
+<tr><th>g300p20 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_q4sx2_g300p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.46e-05 stddev 7.34e-04 corr 5.46e-04 se 3.83e-04 dev 3.27e-08"><b>oracle-singular</b><br><span class=g>7.34e-04 ungated</span></td>
+</tr>
+<tr><th>g300p20 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g300p20_single_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g300p20 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_q4sx2_g300p20_skew_base
+cat laplace oracle lme4
+beta 1.45e-05 stddev 4.32e-05 corr 2.45e-05 se 3.78e-05 dev 1.53e-10"><b>oracle-singular</b><br><span class=g>4.32e-05 ungated</span></td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g3000p5_bal_base
+cat laplace oracle lme4
+beta 3.57e-07 stddev 1.08e-04 corr &ndash; se 1.07e-05 dev 3.46e-10"><b>ok</b><br><span class=g>1.08e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g3000p5_bal_base
+cat laplace oracle lme4
+beta 8.71e-08 stddev 5.35e-05 corr 1.37e-05 se 3.85e-05 dev 6.60e-11"><b>ok</b><br><span class=g>5.35e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g3000p5_bal_base
+cat laplace oracle lme4
+beta 1.82e-07 stddev 2.16e-06 corr 3.18e-06 se 1.37e-06 dev 2.27e-12"><b>ok</b><br><span class=g>3.18e-06</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g3000p5_bal_base
+cat laplace oracle lme4
+beta 3.87e-07 stddev 2.34e-05 corr 9.24e-06 se 8.19e-06 dev 1.04e-11"><b>ok</b><br><span class=g>2.34e-05</span></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.01e-07 stddev 6.23e-05 corr &ndash; se 8.23e-06 dev 6.46e-11"><b>ok</b><br><span class=g>6.23e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.24e-06 stddev 2.61e-05 corr 1.33e-05 se 2.01e-05 dev 3.04e-11"><b>ok</b><br><span class=g>2.61e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g3000p20_bal_base
+cat laplace oracle lme4
+beta 2.39e-07 stddev 1.92e-05 corr 5.23e-05 se 1.87e-05 dev 1.51e-10"><b>ok</b><br><span class=g>5.23e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g3000p20_bal_base
+cat laplace oracle lme4
+beta 3.33e-07 stddev 2.53e-05 corr 3.56e-05 se 2.43e-05 dev 1.07e-10"><b>ok</b><br><span class=g>3.56e-05</span></td>
+</tr>
+<tr><th>g3000p20 bal/lowsnr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g3000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 5.59e-06 stddev 1.05e-04 corr &ndash; se 2.87e-05 dev 7.79e-11"><b>ok</b><br><span class=g>1.05e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 bal/nearzero</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 8.25e-08 stddev 3.05e-04 corr &ndash; se 1.00e-05 dev 2.26e-10"><b>ok</b><br><span class=g>3.05e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 single/base</th>
+<td class="c " style="background:hsl(0,75%,82%)" title="lmm_cross8_g3000p20_single_base
+cat laplace oracle lme4
+beta 1.22e-05 stddev 1.65e-03 corr &ndash; se 1.31e-04 dev 4.11e-08"><b>&#9888; mismatch</b><br><span class=g>1.65e-03</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p20 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g3000p20_skew_base
+cat laplace oracle lme4
+beta 8.69e-07 stddev 5.63e-04 corr &ndash; se 1.01e-04 dev 5.67e-09"><b>ok</b><br><span class=g>5.63e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g3000p100_bal_base
+cat laplace oracle lme4
+beta 1.09e-06 stddev 3.08e-04 corr &ndash; se 3.41e-05 dev 6.05e-10"><b>ok</b><br><span class=g>3.08e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g3000p100_bal_base
+cat laplace oracle lme4
+beta 8.90e-08 stddev 9.20e-05 corr 6.90e-05 se 4.38e-05 dev 7.93e-11"><b>ok</b><br><span class=g>9.20e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g3000p100_bal_base
+cat laplace oracle lme4
+beta 2.74e-08 stddev 5.63e-05 corr 5.52e-05 se 5.60e-05 dev 7.59e-11"><b>ok</b><br><span class=g>5.63e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g3000p100_bal_base
+cat laplace oracle lme4
+beta 3.24e-07 stddev 2.00e-04 corr 1.00e-04 se 1.18e-04 dev 8.07e-10"><b>ok</b><br><span class=g>2.00e-04</span></td>
+</tr>
+<tr><th>g3000p100 bal/lowsnr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g3000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 2.67e-06 stddev 4.89e-05 corr &ndash; se 1.79e-06 dev 1.52e-11"><b>ok</b><br><span class=g>4.89e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/nearzero</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g3000p100_bal_nearzero
+cat laplace oracle lme4
+beta 3.43e-08 stddev 2.46e-04 corr &ndash; se 1.60e-05 dev 5.44e-10"><b>ok</b><br><span class=g>2.46e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 single/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g3000p100_single_base
+cat laplace oracle lme4
+beta 3.09e-08 stddev 2.08e-05 corr &ndash; se 4.22e-06 dev 6.68e-12"><b>ok</b><br><span class=g>2.08e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g3000p100_skew_base
+cat laplace oracle lme4
+beta 8.83e-08 stddev 2.61e-04 corr &ndash; se 8.46e-05 dev 6.50e-10"><b>ok</b><br><span class=g>2.61e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td class="c " style="background:hsl(30,80%,85%)" title="lmm_cross8_g30000p5_bal_base
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:ok</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p5_bal_base
+cat laplace oracle lme4
+beta 4.10e-08 stddev 5.66e-05 corr 2.99e-06 se 4.92e-05 dev 7.26e-12"><b>ok</b><br><span class=g>5.66e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g30000p5_bal_base
+cat laplace oracle lme4
+beta 2.21e-07 stddev 1.07e-05 corr 8.20e-06 se 7.40e-06 dev 2.17e-11"><b>ok</b><br><span class=g>1.07e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g30000p5_bal_base
+cat laplace oracle lme4
+beta 1.69e-07 stddev 1.53e-05 corr 4.74e-06 se 1.01e-05 dev 2.90e-12"><b>ok</b><br><span class=g>1.53e-05</span></td>
+</tr>
+<tr><th>g30000p5 bal/highcorr</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p5_bal_highcorr
+cat laplace oracle lme4
+beta 9.36e-08 stddev 2.81e-05 corr 2.70e-06 se 6.66e-06 dev 1.51e-11"><b>ok</b><br><span class=g>2.81e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/lowsnr</th>
+<td class="c " style="background:hsl(30,80%,85%)" title="lmm_cross8_g30000p5_bal_lowsnr
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:ok</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p5_bal_lowsnr
+cat laplace oracle lme4
+beta 1.97e-06 stddev 1.30e-04 corr 1.08e-05 se 1.03e-04 dev 2.50e-11"><b>ok</b><br><span class=g>1.30e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/nearzero</th>
+<td class="c " style="background:hsl(0,75%,82%)" title="lmm_cross8_g30000p5_bal_nearzero
+cat laplace oracle lme4
+beta 5.14e-07 stddev 1.15e-03 corr &ndash; se 1.68e-05 dev 7.06e-10"><b>&#9888; mismatch</b><br><span class=g>1.15e-03</span></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_q3sx2_g30000p5_bal_nearzero
+cat laplace oracle lme4
+beta 7.68e-08 stddev 1.19e-03 corr 3.39e-04 se 4.44e-05 dev 1.91e-10"><b>oracle-singular</b><br><span class=g>1.19e-03 ungated</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 single/base</th>
+<td class="c " style="background:hsl(30,80%,85%)" title="lmm_cross8_g30000p5_single_base
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:ok</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p5_single_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g30000p5_skew_base
+cat laplace oracle lme4
+beta 4.78e-08 stddev 3.00e-04 corr &ndash; se 6.93e-05 dev 1.28e-10"><b>ok</b><br><span class=g>3.00e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p5_skew_base
+cat laplace oracle lme4
+beta 8.01e-08 stddev 8.18e-05 corr 1.42e-05 se 2.25e-05 dev 1.41e-11"><b>ok</b><br><span class=g>8.18e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g30000p20_bal_base
+cat laplace oracle lme4
+beta 2.13e-09 stddev 1.03e-04 corr &ndash; se 8.37e-06 dev 1.99e-11"><b>ok</b><br><span class=g>1.03e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p20_bal_base
+cat laplace oracle lme4
+beta 9.41e-09 stddev 5.73e-05 corr 5.69e-06 se 2.11e-05 dev 1.38e-11"><b>ok</b><br><span class=g>5.73e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g30000p20_bal_base
+cat laplace oracle lme4
+beta 2.70e-08 stddev 1.55e-05 corr 3.18e-05 se 1.52e-05 dev 4.34e-11"><b>ok</b><br><span class=g>3.18e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g30000p20_bal_base
+cat laplace oracle lme4
+beta 1.53e-08 stddev 5.46e-05 corr 8.16e-06 se 2.42e-05 dev 8.97e-12"><b>ok</b><br><span class=g>5.46e-05</span></td>
+</tr>
+<tr><th>g30000p20 bal/highcorr</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p20_bal_highcorr
+cat laplace oracle lme4
+beta 2.56e-08 stddev 5.88e-05 corr 3.63e-06 se 2.11e-05 dev 1.40e-11"><b>ok</b><br><span class=g>5.88e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/lowsnr</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 7.85e-07 stddev 8.37e-05 corr 3.05e-05 se 6.53e-05 dev 9.60e-12"><b>ok</b><br><span class=g>8.37e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/nearzero</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p20_bal_nearzero
+cat laplace oracle lme4
+beta 3.47e-07 stddev 1.65e-04 corr 7.80e-05 se 3.98e-05 dev 4.69e-11"><b>ok</b><br><span class=g>1.65e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 single/base</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p20_single_base
+cat laplace oracle lme4
+beta 3.51e-08 stddev 7.40e-05 corr 1.74e-06 se 2.60e-05 dev 4.99e-12"><b>ok</b><br><span class=g>7.40e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 skew/base</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p20_skew_base
+cat laplace oracle lme4
+beta 2.05e-07 stddev 7.20e-05 corr 8.58e-06 se 1.02e-05 dev 1.77e-11"><b>ok</b><br><span class=g>7.20e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross8_g30000p100_bal_base
+cat laplace oracle lme4
+beta 1.96e-09 stddev 7.37e-05 corr &ndash; se 2.02e-05 dev 9.72e-12"><b>ok</b><br><span class=g>7.37e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p100_bal_base
+cat laplace oracle lme4
+beta 1.33e-09 stddev 1.32e-05 corr 6.14e-06 se 6.75e-06 dev 1.47e-12"><b>ok</b><br><span class=g>1.32e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g30000p100_bal_base
+cat laplace oracle lme4
+beta 4.05e-09 stddev 2.07e-05 corr 1.38e-05 se 2.06e-05 dev 6.24e-12"><b>ok</b><br><span class=g>2.07e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4sx2_g30000p100_bal_base
+cat laplace oracle lme4
+beta 7.95e-09 stddev 2.72e-05 corr 3.83e-05 se 1.10e-05 dev 1.24e-11"><b>ok</b><br><span class=g>3.83e-05</span></td>
+</tr>
+<tr><th>g30000p100 bal/highcorr</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p100_bal_highcorr
+cat laplace oracle lme4
+beta 8.56e-09 stddev 9.75e-05 corr 8.62e-06 se 8.02e-05 dev 2.53e-11"><b>ok</b><br><span class=g>9.75e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g30000p100_bal_highcorr
+cat laplace oracle lme4
+beta 5.43e-08 stddev 2.92e-06 corr 8.92e-06 se 2.91e-06 dev 5.87e-11"><b>ok</b><br><span class=g>8.92e-06</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 3.59e-06 stddev 8.18e-04 corr 1.52e-04 se 1.46e-04 dev 5.06e-10"><b>ok</b><br><span class=g>8.18e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g30000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 2.46e-06 stddev 1.03e-04 corr 7.00e-05 se 9.07e-05 dev 7.10e-11"><b>ok</b><br><span class=g>1.03e-04</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_q3sx2_g30000p100_bal_nearzero
+cat laplace oracle lme4
+beta 1.92e-08 stddev 1.79e-04 corr 1.03e-04 se 6.67e-05 dev 4.30e-10"><b>oracle-singular</b><br><span class=g>1.79e-04 ungated</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g30000p100_bal_nearzero
+cat laplace oracle lme4
+beta 1.91e-07 stddev 6.09e-04 corr 4.84e-04 se 6.07e-04 dev 6.81e-09"><b>ok</b><br><span class=g>6.09e-04</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p100_single_base
+cat laplace oracle lme4
+beta 1.03e-07 stddev 2.64e-05 corr 3.44e-06 se 8.74e-06 dev 1.92e-12"><b>ok</b><br><span class=g>2.64e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g30000p100_single_base
+cat laplace oracle lme4
+beta 1.25e-06 stddev 2.24e-05 corr 1.50e-05 se 1.13e-05 dev 4.46e-11"><b>ok</b><br><span class=g>2.24e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q3sx2_g30000p100_skew_base
+cat laplace oracle lme4
+beta 9.21e-09 stddev 2.47e-05 corr 9.74e-06 se 9.53e-06 dev 1.42e-12"><b>ok</b><br><span class=g>2.47e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q4_g30000p100_skew_base
+cat laplace oracle lme4
+beta 1.36e-07 stddev 2.40e-05 corr 3.45e-05 se 2.35e-05 dev 2.66e-11"><b>ok</b><br><span class=g>3.45e-05</span></td>
+<td class="grp"></td>
+</tr>
+</table>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="1" class="grp">q5q2 <small>(n&theta; 18)</small></th>
+<th colspan="1" class="grp">q6 <small>(n&theta; 21)</small></th>
+<th colspan="1" class="grp">q6q2x3 <small>(n&theta; 27)</small></th>
+<th colspan="1" class="grp">q8 <small>(n&theta; 36)</small></th>
+</tr>
+<tr>
+<th class="grp">lmm</th>
+<th class="grp">lmm</th>
+<th class="grp">lmm</th>
+<th class="grp">lmm</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g300p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g300p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6q2x3_g300p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g300p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g300p5 bal/highcorr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g300p5_bal_highcorr
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g300p5 bal/lowsnr</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g300p5_bal_lowsnr
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g300p5 bal/nearzero</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g300p5_bal_nearzero
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g300p5 single/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:#ddd" title="lmm_q8_g300p5_single_base
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>both-fail</b><br><span class=g>g:engine-fail o:engine-fail</span></td>
+</tr>
+<tr><th>g300p5 skew/base</th>
+<td></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g300p5_skew_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g3000p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6q2x3_g3000p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g3000p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g3000p5 bal/highcorr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p5_bal_highcorr
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g3000p5_bal_highcorr
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g3000p5 bal/lowsnr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p5_bal_lowsnr
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(0,75%,82%)" title="lmm_q8_g3000p5_bal_lowsnr
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>&#9888; mismatch</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g3000p5 bal/nearzero</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p5_bal_nearzero
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g3000p5_bal_nearzero
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g3000p5 single/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p5_single_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g3000p5_single_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g3000p5 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p5_skew_base
+cat laplace oracle lme4
+beta 1.98e-06 stddev 4.00e-05 corr 1.09e-04 se 3.41e-05 dev 7.24e-11"><b>ok</b><br><span class=g>1.09e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g3000p5_skew_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p20_bal_base
+cat laplace oracle lme4
+beta 5.64e-07 stddev 3.90e-05 corr 4.02e-05 se 3.10e-05 dev 1.00e-10"><b>ok</b><br><span class=g>4.02e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g3000p20_bal_base
+cat laplace oracle lme4
+beta 2.24e-07 stddev 1.20e-05 corr 2.20e-05 se 1.13e-05 dev 3.25e-11"><b>ok</b><br><span class=g>2.20e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6q2x3_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.69e-06 stddev 1.67e-04 corr 1.46e-04 se 1.05e-04 dev 5.20e-10"><b>ok</b><br><span class=g>1.67e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.95e-06 stddev 7.53e-05 corr 9.63e-05 se 7.33e-05 dev 7.36e-10"><b>ok</b><br><span class=g>9.63e-05</span></td>
+</tr>
+<tr><th>g3000p20 bal/highcorr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p20_bal_highcorr
+cat laplace oracle lme4
+beta 4.36e-07 stddev 1.29e-05 corr 2.64e-06 se 1.21e-05 dev 2.00e-11"><b>ok</b><br><span class=g>1.29e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g3000p20_bal_highcorr
+cat laplace oracle lme4
+beta 5.77e-06 stddev 5.93e-05 corr 1.89e-05 se 5.41e-05 dev 6.69e-10"><b>ok</b><br><span class=g>5.93e-05</span></td>
+</tr>
+<tr><th>g3000p20 bal/lowsnr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 1.25e-04 stddev 1.50e-04 corr 3.15e-04 se 9.20e-05 dev 1.05e-09"><b>ok</b><br><span class=g>3.15e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_q8_g3000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 2.38e-04 stddev 6.11e-04 corr 4.30e-04 se 1.82e-04 dev 4.44e-09"><b>oracle-singular</b><br><span class=g>6.11e-04 ungated</span></td>
+</tr>
+<tr><th>g3000p20 bal/nearzero</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.82e-06 stddev 3.80e-04 corr 4.28e-04 se 2.86e-04 dev 3.86e-09"><b>ok</b><br><span class=g>4.28e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g3000p20_bal_nearzero
+cat laplace oracle lme4
+beta 1.66e-06 stddev 1.86e-04 corr 1.26e-04 se 8.14e-05 dev 1.79e-09"><b>ok</b><br><span class=g>1.86e-04</span></td>
+</tr>
+<tr><th>g3000p20 single/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p20_single_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g3000p20_single_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g3000p20 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p20_skew_base
+cat laplace oracle lme4
+beta 6.83e-06 stddev 4.04e-05 corr 5.94e-05 se 3.17e-05 dev 2.02e-10"><b>ok</b><br><span class=g>5.94e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g3000p20_skew_base
+cat laplace oracle lme4
+beta 1.35e-05 stddev 6.81e-05 corr 7.69e-05 se 5.35e-05 dev 3.21e-10"><b>ok</b><br><span class=g>7.69e-05</span></td>
+</tr>
+<tr><th>g3000p100 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p100_bal_base
+cat laplace oracle lme4
+beta 4.55e-07 stddev 2.68e-04 corr 5.12e-04 se 2.62e-04 dev 2.97e-09"><b>ok</b><br><span class=g>5.12e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g3000p100_bal_base
+cat laplace oracle lme4
+beta 1.63e-07 stddev 4.92e-05 corr 9.59e-05 se 4.89e-05 dev 1.58e-10"><b>ok</b><br><span class=g>9.59e-05</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6q2x3_g3000p100_bal_base
+cat laplace oracle lme4
+beta 2.30e-07 stddev 9.31e-05 corr 9.70e-05 se 3.44e-05 dev 3.59e-10"><b>ok</b><br><span class=g>9.70e-05</span></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/highcorr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p100_bal_highcorr
+cat laplace oracle lme4
+beta 1.35e-07 stddev 3.59e-05 corr 7.77e-06 se 3.55e-05 dev 3.96e-11"><b>ok</b><br><span class=g>3.59e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/lowsnr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 1.97e-05 stddev 1.92e-04 corr 1.81e-04 se 1.24e-04 dev 3.32e-10"><b>ok</b><br><span class=g>1.92e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 bal/nearzero</th>
+<td class="c " style="background:hsl(190,55%,88%)" title="lmm_q5q2_g3000p100_bal_nearzero
+cat laplace oracle lme4
+beta 5.85e-06 stddev 9.71e-04 corr 2.20e-03 se 7.82e-04 dev 4.55e-08"><b>oracle-singular</b><br><span class=g>2.20e-03 ungated</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 single/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p100_single_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g3000p100 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g3000p100_skew_base
+cat laplace oracle lme4
+beta 1.20e-06 stddev 5.73e-05 corr 3.66e-05 se 3.46e-05 dev 5.04e-11"><b>ok</b><br><span class=g>5.73e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g30000p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp c " style="background:hsl(30,80%,85%)" title="lmm_q6q2x3_g30000p5_bal_base
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:engine-fail</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g30000p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g30000p5 bal/highcorr</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p5_bal_highcorr
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/lowsnr</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p5_bal_lowsnr
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 bal/nearzero</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p5_bal_nearzero
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 single/base</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p5_single_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p5 skew/base</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p5_skew_base
+cat laplace oracle lme4
+beta 1.72e-06 stddev 9.27e-06 corr 3.19e-05 se 9.15e-06 dev 6.17e-11"><b>ok</b><br><span class=g>3.19e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td class="c " style="background:hsl(30,80%,85%)" title="lmm_q5q2_g30000p20_bal_base
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:ok</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p20_bal_base
+cat laplace oracle lme4
+beta 3.02e-07 stddev 9.26e-05 corr 1.12e-04 se 8.87e-05 dev 1.09e-09"><b>ok</b><br><span class=g>1.12e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6q2x3_g30000p20_bal_base
+cat laplace oracle lme4
+beta 6.40e-08 stddev 3.39e-04 corr 3.24e-04 se 3.33e-04 dev 1.60e-10"><b>ok</b><br><span class=g>3.39e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g30000p20_bal_base
+cat laplace oracle lme4
+beta 1.46e-06 stddev 1.37e-04 corr 1.09e-04 se 1.30e-04 dev 1.56e-09"><b>ok</b><br><span class=g>1.37e-04</span></td>
+</tr>
+<tr><th>g30000p20 bal/highcorr</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p20_bal_highcorr
+cat laplace oracle lme4
+beta 1.80e-07 stddev 2.71e-05 corr 7.48e-06 se 2.65e-05 dev 9.69e-11"><b>ok</b><br><span class=g>2.71e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/lowsnr</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 1.91e-05 stddev 1.13e-04 corr 2.91e-04 se 6.78e-05 dev 6.86e-10"><b>ok</b><br><span class=g>2.91e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 bal/nearzero</th>
+<td></td>
+<td class="grp c " style="background:hsl(0,75%,82%)" title="lmm_q6_g30000p20_bal_nearzero
+cat laplace oracle lme4
+beta 4.44e-07 stddev 2.65e-03 corr 1.36e-03 se 1.11e-04 dev 2.40e-09"><b>&#9888; mismatch</b><br><span class=g>2.65e-03</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 single/base</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p20_single_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p20 skew/base</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p20_skew_base
+cat laplace oracle lme4
+beta 4.93e-06 stddev 3.24e-05 corr 5.51e-05 se 2.73e-05 dev 1.61e-10"><b>ok</b><br><span class=g>5.51e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q5q2_g30000p100_bal_base
+cat laplace oracle lme4
+beta 1.69e-08 stddev 4.77e-05 corr 1.09e-04 se 3.54e-05 dev 4.69e-11"><b>ok</b><br><span class=g>1.09e-04</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p100_bal_base
+cat laplace oracle lme4
+beta 1.53e-08 stddev 3.33e-05 corr 3.88e-05 se 3.32e-05 dev 6.31e-11"><b>ok</b><br><span class=g>3.88e-05</span></td>
+<td class="grp c " style="background:hsl(30,80%,85%)" title="lmm_q6q2x3_g30000p100_bal_base
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:ok</span></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q8_g30000p100_bal_base
+cat laplace oracle lme4
+beta 1.89e-07 stddev 1.54e-04 corr 9.73e-05 se 1.53e-04 dev 4.62e-10"><b>ok</b><br><span class=g>1.54e-04</span></td>
+</tr>
+<tr><th>g30000p100 bal/highcorr</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p100_bal_highcorr
+cat laplace oracle lme4
+beta 1.43e-07 stddev 2.64e-05 corr 1.45e-05 se 2.62e-05 dev 1.65e-10"><b>ok</b><br><span class=g>2.64e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 2.89e-05 stddev 3.57e-04 corr 3.99e-04 se 3.13e-04 dev 1.29e-09"><b>ok</b><br><span class=g>3.99e-04</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p100_bal_nearzero
+cat laplace oracle lme4
+beta 4.92e-07 stddev 6.83e-04 corr 1.33e-03 se 6.80e-04 dev 2.38e-08"><b>ok</b><br><span class=g>1.33e-03</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p100_single_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td></td>
+<td class="grp c " style="background:hsl(120,60%,90%)" title="lmm_q6_g30000p100_skew_base
+cat laplace oracle lme4
+beta 3.20e-07 stddev 1.89e-05 corr 7.13e-05 se 1.85e-05 dev 6.88e-11"><b>ok</b><br><span class=g>7.13e-05</span></td>
+<td class="grp"></td>
+<td class="grp"></td>
+</tr>
+</table>
+<table>
+<tr><th rowspan="2">cell</th>
+<th colspan="1" class="grp">q8q2x <small>(n&theta; 40)</small></th>
+</tr>
+<tr>
+<th class="grp">lmm</th>
+</tr>
+<tr><th>g300p5 bal/base</th>
+<td class="c " style="background:hsl(30,80%,85%)" title="lmm_q8q2x_g300p5_bal_base
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:engine-fail</span></td>
+</tr>
+<tr><th>g3000p5 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q8q2x_g3000p5_bal_base
+cat laplace oracle MixedModels
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>ok</b><br><span class=g>&ndash;</span></td>
+</tr>
+<tr><th>g3000p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q8q2x_g3000p20_bal_base
+cat laplace oracle lme4
+beta 1.28e-06 stddev 5.03e-05 corr 3.82e-05 se 2.79e-05 dev 1.24e-10"><b>ok</b><br><span class=g>5.03e-05</span></td>
+</tr>
+<tr><th>g30000p5 bal/base</th>
+<td class="c " style="background:hsl(30,80%,85%)" title="lmm_q8q2x_g30000p5_bal_base
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:engine-fail</span></td>
+</tr>
+<tr><th>g30000p20 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q8q2x_g30000p20_bal_base
+cat laplace oracle lme4
+beta 8.80e-08 stddev 1.83e-04 corr 1.73e-04 se 1.42e-04 dev 1.15e-10"><b>ok</b><br><span class=g>1.83e-04</span></td>
+</tr>
+<tr><th>g30000p20 bal/highcorr</th>
+<td class="c " style="background:hsl(30,80%,85%)" title="lmm_q8q2x_g30000p20_bal_highcorr
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:ok</span></td>
+</tr>
+<tr><th>g30000p20 bal/lowsnr</th>
+<td class="c " style="background:hsl(0,75%,82%)" title="lmm_q8q2x_g30000p20_bal_lowsnr
+cat laplace oracle lme4
+beta 3.16e-05 stddev 1.38e-03 corr 8.83e-04 se 1.34e-03 dev 1.17e-09"><b>&#9888; mismatch</b><br><span class=g>1.38e-03</span></td>
+</tr>
+<tr><th>g30000p20 bal/nearzero</th>
+<td class="c " style="background:hsl(215,70%,90%)" title="lmm_q8q2x_g30000p20_bal_nearzero
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>oracle-timeout</b><br><span class=g>g:ok o:timeout</span></td>
+</tr>
+<tr><th>g30000p20 single/base</th>
+<td class="c " style="background:hsl(30,80%,85%)" title="lmm_q8q2x_g30000p20_single_base
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:engine-fail</span></td>
+</tr>
+<tr><th>g30000p20 skew/base</th>
+<td class="c " style="background:hsl(30,80%,85%)" title="lmm_q8q2x_g30000p20_skew_base
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:ok</span></td>
+</tr>
+<tr><th>g30000p100 bal/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q8q2x_g30000p100_bal_base
+cat laplace oracle lme4
+beta 1.23e-07 stddev 5.94e-04 corr 2.59e-04 se 3.40e-04 dev 6.01e-10"><b>ok</b><br><span class=g>5.94e-04</span></td>
+</tr>
+<tr><th>g30000p100 bal/highcorr</th>
+<td class="c " style="background:hsl(30,80%,85%)" title="lmm_q8q2x_g30000p100_bal_highcorr
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:ok</span></td>
+</tr>
+<tr><th>g30000p100 bal/lowsnr</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q8q2x_g30000p100_bal_lowsnr
+cat laplace oracle lme4
+beta 8.14e-05 stddev 3.40e-04 corr 1.33e-04 se 1.00e-04 dev 2.47e-10"><b>ok</b><br><span class=g>3.40e-04</span></td>
+</tr>
+<tr><th>g30000p100 bal/nearzero</th>
+<td class="c " style="background:hsl(215,70%,90%)" title="lmm_q8q2x_g30000p100_bal_nearzero
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>oracle-timeout</b><br><span class=g>g:ok o:timeout</span></td>
+</tr>
+<tr><th>g30000p100 single/base</th>
+<td class="c " style="background:hsl(30,80%,85%)" title="lmm_q8q2x_g30000p100_single_base
+cat laplace oracle lme4
+beta &ndash; stddev &ndash; corr &ndash; se &ndash; dev &ndash;"><b>glmm-timeout</b><br><span class=g>g:timeout o:engine-fail</span></td>
+</tr>
+<tr><th>g30000p100 skew/base</th>
+<td class="c " style="background:hsl(120,60%,90%)" title="lmm_q8q2x_g30000p100_skew_base
+cat laplace oracle lme4
+beta 2.19e-06 stddev 4.72e-04 corr 1.38e-04 se 4.20e-04 dev 7.69e-10"><b>ok</b><br><span class=g>4.72e-04</span></td>
+</tr>
+</table>

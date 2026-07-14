@@ -67,15 +67,15 @@ Points worth knowing at this layer:
   the kernels are new and their performance envelope isn't characterized yet,
   so treat this as opt-in experimentation only. Leave it off if you run your
   own parallel loop over many fits (the outer loop should own the cores).
-- **The envelope.** The dense ("NoZ") solver has hard capacity limits:
+- **The envelope.** The dense ("NoZ") solver has capacity limits:
   `re.slopes.len() + 1 <= 8` (primary width), up to 6 extra groupings, and
   `slopes.len() + 1 <= 4` per extra grouping (`glmm::consts::{MAX_PRIMARY_Q,
   MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q}`). Within that envelope, a **Gaussian**
   extra grouping that carries a random slope is routed internally to a sparse
-  solver instead (still just works — no API change). Outside the envelope, or
-  a *non-Gaussian* mixed model that needs the sparse path, `fit_cold` panics
-  with `unimplemented!` rather than silently misfitting — check your spec
-  against the caps up front if you're building models programmatically.
+  solver instead (still just works — no API change). Outside the envelope, a
+  mixed model with any extra grouping carrying a random slope, or a design
+  with too many crossed levels, is likewise routed to the sparse solver
+  automatically — every family fits either way, with no reachable panic.
 
 ## 2. Warm fit — reusing a previous solution
 
@@ -130,7 +130,7 @@ let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &model, n, &slope_cols, &extr
 
 for resample in resamples {
     ws.suff.reset();
-    ws.suff.add_rows_multi(resample.x.as_ref(), &resample.y, &resample.cluster_ids, &resample.extra_ids);
+    ws.suff.add_rows_multi(resample.x.as_ref(), &resample.y, &resample.cluster_ids, &resample.extra_ids, None);
     let result = fit_lmm(&mut ws, &target_indices, theta_start.as_deref());
     // ws.fit.betas / ws.theta hold this iteration's estimate; no fresh
     // allocation happened — ws is reused next iteration.

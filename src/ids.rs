@@ -46,11 +46,12 @@ impl GroupIds {
 }
 
 /// Local level id for extra grouping `g` at row `i`, from the positional sizing.
-/// Verbatim from the former `fit::extra_level_of_row` (mirrors
-/// `test_support::extra_level_of_row`, which is `#[cfg(test)]`-gated). Test-gated
-/// alongside its only caller, [`GroupIds::from_sizing`].
+/// Verbatim from the former `fit::extra_level_of_row`; this is the canonical
+/// copy — `test_support::extra_level_of_row` is a thin `&ModelSpec`-unwrapping
+/// wrapper that delegates here. Test-gated alongside its only caller,
+/// [`GroupIds::from_sizing`].
 #[cfg(test)]
-fn extra_level_of_row(re: &ReStructure, g: usize, i: usize) -> u32 {
+pub(crate) fn extra_level_of_row(re: &ReStructure, g: usize, i: usize) -> u32 {
     let rel = &re.extra_groupings[g].relation;
     let level = match &re.sizing {
         Sizing::FixedClusters { n_clusters } => {
@@ -77,7 +78,7 @@ fn extra_level_of_row(re: &ReStructure, g: usize, i: usize) -> u32 {
 }
 
 #[cfg(test)]
-fn block_levels(rel: &GroupingRelation) -> usize {
+pub(crate) fn block_levels(rel: &GroupingRelation) -> usize {
     match rel {
         GroupingRelation::Crossed { n_clusters } => (*n_clusters).max(1) as usize,
         GroupingRelation::NestedWithin { n_per_parent } => (*n_per_parent).max(1) as usize,

@@ -24,9 +24,15 @@ pub struct GlmmWorkspace {
     /// Defaulted to `f64::NAN` at construction; the `fit::fit_glmm` adapter sets it
     /// per fit (NB passes the current θ iterate, every other family leaves it NaN).
     pub nb_theta: f64,
-    /// adaptive GH node count; 1 = Laplace. >1 only fires on the scalar-intercept binomial/Poisson AGQ path (`agq::agq_deviance`); ignored otherwise.
+    /// adaptive GH node count; 1 = Laplace. >1 only fires on the single-grouping-factor
+    /// binomial/Poisson AGQ paths — scalar intercept (`agq::agq_deviance`) or vector RE
+    /// with `q_p ∈ 2..=3` (`agq::agq_deviance_vec`); ignored otherwise.
     pub nagq: u8,
-    /// 4·n_primary AGQ per-cluster scratch (center loglik | node u_cj | per-node loglik | running log-sum); unused on the Laplace path
+    /// AGQ per-cluster scratch; unused on the Laplace path. Shape-dependent:
+    /// scalar (`q_p==1`) is `4·n_primary` (center loglik | node u_cj | per-node
+    /// loglik | running log-sum); vector (`q_p∈2..=3`) is `2·n_primary + k^q·(q+1)`
+    /// (center loglik | running log-sum | product-grid node table). See the
+    /// sizing at construction.
     pub agq_scratch: Vec<f64>,
     /// FitOptions::parallel_inner, copied per fit by the fit.rs adapter (the
     /// nb_theta pattern). Runtime gate for the parallel kernels in `parallel`
@@ -113,6 +119,9 @@ pub struct GlmmWorkspace {
     pub a_llt_mem: MemBuffer,
     /// max_n × k = W∘M scratch for the dense-Gram GEMM (rebuilt per PIRLS iteration)
     pub wm: Mat<f64>,
+    /// max_n × p = W∘X scratch for the X'WX GEMM (rebuilt per PIRLS iteration,
+    /// all three pirls variants and the three se.rs schur-fill twins)
+    pub wx: Mat<f64>,
     /// length k
     pub a_rhs: Vec<f64>,
     /// s · q_p² packed per-cluster q_p×q_p blocks (no-extras path; Σ wᵢmᵢmᵢ'+I then Crout L)
@@ -289,7 +298,7 @@ impl GlmmWorkspace {
         // solver) share the exact same computed θ-portion rho_begin — a pure
         // extraction, not a new derivation.
         let rho_begin = (0.1 * min_diag).min(RHO_BEGIN);
-        // MIRRORS the joint config in `sparse::fit_glmm_sparse` — both feed
+        // MIRRORS the joint config in `sparse::glmm::fit_glmm_sparse` — both feed
         // through the shared `apply_campaign_overrides` tail.
         let mut config = Config {
             rho_begin,
@@ -324,7 +333,19 @@ impl GlmmWorkspace {
             family,
             nb_theta: f64::NAN,
             nagq,
-            agq_scratch: vec![0.0; (4 * n_primary).max(1)],
+            // Scalar AGQ (`q_p==1`, `agq::agq_deviance`) uses `4·s` slots
+            // (ctr|ucj|acc|sum). The vector kernel (`q_p∈2..=3`,
+            // `agq::agq_deviance_vec`) instead needs `2·s` (ctr|sum) plus a
+            // per-eval product-grid node table of `k^q·(q+1)` f64 (the q z-vector
+            // components + the summed Liu–Pierce reweight per node), `k=nagq`
+            // fixed per workspace. `nagq=1` shapes never reach the vector kernel,
+            // so their `k^q=1` table is a harmless `q+1` slots.
+            agq_scratch: if q >= 2 {
+                let kq = (nagq as usize).pow(q as u32);
+                vec![0.0; (2 * n_primary + kq * (q + 1)).max(1)]
+            } else {
+                vec![0.0; (4 * n_primary).max(1)]
+            },
             parallel_inner: false,
             cluster_rows: None,
             k,
@@ -404,6 +425,7 @@ impl GlmmWorkspace {
                 Spec::default(),
             )),
             wm: Mat::zeros(max_n, k.max(1)),
+            wx: Mat::zeros(max_n, p),
             a_rhs: vec![0.0; k.max(1)],
             a_blocks: vec![0.0; (q * q * n_primary).max(1)],
             core_blocks: vec![0.0; (q_core * q_core * n_primary).max(1)],
@@ -504,27 +526,9 @@ pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
 /// In-place lower Crout Cholesky of a `q×q` block stored row-major in `blk`
 /// (lower triangle read; on return the lower triangle holds L). Returns false on
 /// a non-positive pivot — the module's failure surface. q ≤ MAX_PRIMARY_Q (8).
-/// Mirrors the inline Crout in `lmm::reml_deviance`'s family loop — change together.
+/// Thin wrapper over the shared kernel in `crate::linalg::block_chol`.
 pub(crate) fn glmm_block_chol(blk: &mut [f64], q: usize) -> bool {
-    for j in 0..q {
-        let mut d = blk[j * q + j];
-        for k in 0..j {
-            d -= blk[j * q + k] * blk[j * q + k];
-        }
-        if !(d.is_finite() && d > 0.0) {
-            return false;
-        }
-        let l = d.sqrt();
-        blk[j * q + j] = l;
-        for i in (j + 1)..q {
-            let mut v = blk[i * q + j];
-            for k in 0..j {
-                v -= blk[i * q + k] * blk[j * q + k];
-            }
-            blk[i * q + j] = v / l;
-        }
-    }
-    true
+    crate::linalg::block_chol(blk, q)
 }
 
 /// Solve `L Lᵀ x = b` in place (`b` overwritten with `x`) for the `q×q` lower
@@ -547,6 +551,43 @@ pub(crate) fn glmm_block_solve(l: &[f64], q: usize, b: &mut [f64]) {
     }
 }
 
+/// Panel variant of `glmm_block_solve`: solve `L Lᵀ X = B` in place for a
+/// row-major `q×nc` RHS panel (`panel[r·nc..(r+1)·nc]` = row r) against the same
+/// row-major factor. Identical substitution with the column loop hoisted inside:
+/// each factor entry is read once per row op and the inner loop runs over the
+/// contiguous row slice (vectorizable axpy) instead of re-walking the factor
+/// once per RHS column.
+pub(crate) fn glmm_block_solve_panel(l: &[f64], q: usize, panel: &mut [f64], nc: usize) {
+    for r in 0..q {
+        let (done, rest) = panel.split_at_mut(r * nc);
+        let row_r = &mut rest[..nc];
+        for c in 0..r {
+            let lrc = l[r * q + c];
+            for (x, &y) in row_r.iter_mut().zip(&done[c * nc..(c + 1) * nc]) {
+                *x -= lrc * y;
+            }
+        }
+        let d = l[r * q + r];
+        for x in row_r.iter_mut() {
+            *x /= d;
+        }
+    }
+    for r in (0..q).rev() {
+        let (head, rest) = panel.split_at_mut((r + 1) * nc);
+        let row_r = &mut head[r * nc..];
+        for c in (r + 1)..q {
+            let lcr = l[c * q + r];
+            for (x, &y) in row_r.iter_mut().zip(&rest[(c - r - 1) * nc..(c - r) * nc]) {
+                *x -= lcr * y;
+            }
+        }
+        let d = l[r * q + r];
+        for x in row_r.iter_mut() {
+            *x /= d;
+        }
+    }
+}
+
 /// Cached sparse factor of the `e`-wide crossed Schur complement `S`.
 /// `S`'s sparsity pattern is fixed by the crossed incidence (θ-independent), so the
 /// symbolic factor is built ONCE per fit here and numeric-refactored every PIRLS
@@ -554,7 +595,8 @@ pub(crate) fn glmm_block_solve(l: &[f64], q: usize, b: &mut [f64]) {
 /// (`sparse.rs`), one factor narrower — only the crossed tail, not the whole system.
 /// `None` for nested-only shapes (`e = 0`, no Schur).
 pub(crate) struct StructuredSchur {
-    /// Symbolic Cholesky of `S`'s pattern (FORCE_SIMPLICIAL, AMD). Reused every refactor.
+    /// Symbolic Cholesky of `S`'s pattern (AMD; simplicial or supernodal by
+    /// faer's AUTO heuristic — `logdet_llt` handles both). Reused every refactor.
     pub(crate) symbolic: SymbolicCholesky<usize>,
     /// `S`'s value container in the fixed CSC pattern (lower tri + full diagonal).
     /// Values overwritten per PIRLS iteration by a gather from the dense `schur_blk`;
@@ -567,6 +609,22 @@ pub(crate) struct StructuredSchur {
     /// Solve scratch, sized once from `solve_in_place_scratch(1, …)` — the Schur
     /// back-solve (PIRLS and each SE column) is always a single RHS column.
     pub(crate) solve_mem: MemBuffer,
+    /// Downdate panels for `structured_factor`'s per-cluster `S −= C_f'A_f⁻¹C_f`
+    /// (the LMM sparse-tail kernels A–D port): `c_panel` the gathered nonzero
+    /// coupling columns (row-major `qc×e_f`), `y_panel` its `A_f⁻¹`-solved copy,
+    /// `dd_temp` the `C_f'·Y` product (col-major `e_f×e_f`, lower). Sized once
+    /// to `max_f e_f` off the FULL θ-independent incidence (`cols_of` in `new` —
+    /// a superset of every θ-masked `coup_cols` CSR the fit visits), overwritten
+    /// per cluster. Used only at `qc > 1`: at `qc == 1` `structured_factor`
+    /// routes to the scalar walk and `new` sizes these to 0 (change together).
+    /// The panel is NOT a win at qc=1 — the downdate is rank-1, so the staging
+    /// (gather + `dd_temp` + a second scatter pass) doubles memory traffic for
+    /// identical arithmetic and measured a +4–7% per-eval loss on the cross6
+    /// GLMM cells (2026-07-14 drift investigation). It stays for qc>1, the only
+    /// case that has real qc×e_f batched work to amortize the staging.
+    pub(crate) c_panel: Vec<f64>,
+    pub(crate) y_panel: Vec<f64>,
+    pub(crate) dd_temp: Vec<f64>,
     /// Crossed width `e = g.k_crossed()`.
     pub(crate) e: usize,
 }
@@ -626,7 +684,9 @@ impl StructuredSchur {
             Side::Lower,
             Default::default(), // AMD fill-reducing ordering
             CholeskySymbolicParams {
-                supernodal_flop_ratio_threshold: SupernodalThreshold::FORCE_SIMPLICIAL,
+                // AUTO: simplicial or supernodal per pattern; `logdet_llt`
+                // handles both arms. Mirrors `clone_scratch` — change together.
+                supernodal_flop_ratio_threshold: SupernodalThreshold::AUTO,
                 ..Default::default()
             },
         )
@@ -636,12 +696,24 @@ impl StructuredSchur {
             symbolic.factorize_numeric_llt_scratch::<f64>(Par::Seq, Spec::default()),
         );
         let solve_mem = MemBuffer::new(symbolic.solve_in_place_scratch::<f64>(1, Par::Seq));
+        let qc = g.primary_q + g.nested_per_parent;
+        let max_ef = cols_of.iter().map(|v| v.len()).max().unwrap_or(0);
+        // At qc == 1 `structured_factor` routes the downdate to its scalar arm
+        // (the panel staging is a +4–7% per-eval loss there; 2026-07-14 drift
+        // investigation), so the panel buffers are never touched — size them to 0.
+        // Mirrors the `qc != 1` filter in `structured_factor` — change together:
+        // widening the route without resizing slices zero-length buffers and
+        // panics. `clone_scratch` follows automatically (it mirrors these lengths).
+        let panel_ef = if qc == 1 { 0 } else { max_ef };
         Some(StructuredSchur {
             symbolic,
             axx,
             l_values,
             fac_mem,
             solve_mem,
+            c_panel: vec![0.0f64; qc * panel_ef],
+            y_panel: vec![0.0f64; qc * panel_ef],
+            dd_temp: vec![0.0f64; panel_ef * panel_ef],
             e,
         })
     }
@@ -661,7 +733,9 @@ impl StructuredSchur {
             Side::Lower,
             Default::default(), // AMD fill-reducing ordering (deterministic)
             CholeskySymbolicParams {
-                supernodal_flop_ratio_threshold: SupernodalThreshold::FORCE_SIMPLICIAL,
+                // Mirrors `new` — change together (same pattern + same params
+                // ⇒ same supernodal/simplicial decision on every worker).
+                supernodal_flop_ratio_threshold: SupernodalThreshold::AUTO,
                 ..Default::default()
             },
         )
@@ -677,6 +751,9 @@ impl StructuredSchur {
             l_values,
             fac_mem,
             solve_mem,
+            c_panel: vec![0.0f64; self.c_panel.len()],
+            y_panel: vec![0.0f64; self.y_panel.len()],
+            dd_temp: vec![0.0f64; self.dd_temp.len()],
             e: self.e,
         }
     }

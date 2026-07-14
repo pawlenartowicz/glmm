@@ -3,11 +3,14 @@
 //! default). NO semver guarantees — may change in ANY release. The warm-start
 //! primitive [`crate::StartValues`] is re-exported `pub` only behind this feature.
 
-pub use crate::fit::{lmm_objective_at, lmm_sweep_fit, LmmSweepOutcome};
+pub use crate::fit::{
+    build_lmm_seam_ws, build_lmm_workspace, lmm_objective_at, lmm_sweep_fit, lmm_sweep_fit_on,
+    refit_lmm, LmmSeamWs, LmmSweepOutcome,
+};
 pub use crate::glm::{glm_irls_fit, sigmoid_stable, GlmFitView, GlmScratch, MAX_IRLS_ITERS};
 pub use crate::glmm::{build_z, fit_glmm, GlmmFit, GlmmWorkspace};
 pub use crate::lme::{lme_fit, LmeFitView, LmeScratch, LmeSuffStats};
-pub use crate::lmm::{fit_lmm, primary_lambda, LmmFit, LmmSuffStats, LmmWorkspace};
+pub use crate::lmm::{fit_lmm, primary_lambda, LmmFit, LmmGroupings, LmmSuffStats, LmmWorkspace};
 pub use crate::ols::{
     fit_suff_stats_t_sq, ols_contrast_t_sq, OlsFitView, OlsScratch, OlsSuffStats, PANEL_ROWS,
 };

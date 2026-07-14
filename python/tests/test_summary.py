@@ -16,6 +16,7 @@ def make_fit(**kw):
         aliased=np.array([False, False]),
         dispersion=1.0,
         converged=True,
+        singular=False,
         names=["(Intercept)", "x"],
     )
     base.update(kw)

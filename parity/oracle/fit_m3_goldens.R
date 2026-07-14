@@ -10,13 +10,17 @@
 # so dropping new-family fits
 # there would pull them into the curated cross-engine sweep and expand the 6-rung
 # oracle -- which design 6 forbids ("the curated 6-rung oracle is NOT expanded").
-# Writing to goldens/ keeps that sweep byte-for-byte untouched. lme4/MASS only; the
-# in-crate GLMM SE is gated against lme4 alone (gap 1.1), so no Julia/Rust cross-check.
+# Writing to goldens/ keeps that sweep byte-for-byte untouched. lme4/MASS for the
+# scalar rungs (the in-crate GLMM SE is gated against lme4 alone, gap 1.1; no
+# Julia/Rust cross-check); GLMMadaptive for the vector-RE AGQ rungs (oracle field
+# below -- glmer refuses nAGQ>1 for vector REs, full-AGQ spec locked decision 6).
 # Run once to freeze (NOT part of run.sh): Rscript parity/oracle/fit_m3_goldens.R
 
 suppressMessages({
   library(lme4)
-  library(MASS)      # glm.nb
+  library(MASS)         # glm.nb
+  library(GLMMadaptive) # vector-RE AGQ oracle (specs with oracle="GLMMadaptive";
+                        # glmer refuses nAGQ>1 for vector REs). See parity/README.md.
   library(jsonlite)
 })
 
@@ -60,8 +64,65 @@ read_dataset <- function(spec) {
   df
 }
 
+# GLMMadaptive reference fit (vector-RE AGQ rungs, spec oracle="GLMMadaptive"):
+# mixed_model(fixed, random, nAGQ=k) -- k quadrature points PER RE DIMENSION
+# (product grid, k^q nodes/cluster), the same convention as glmm's nagq. The
+# manifest spells the fixed/random split out (`ma_fixed`/`ma_random`) rather
+# than parsing it off r_formula; r_formula stays as the equivalent glmer form.
+# Frozen quantities: beta, Hessian SEs (vcov(parm="fixed-effects") -- observed
+# information of the AGQ log-likelihood, the like-for-like partner of glmm's
+# WaldSe::Hessian beta block), and varcomp from m$D (stddev + correlation) in
+# the shared golden schema. NO deviance/logLik: GLMMadaptive's logLik carries
+# different additive constants than glmer's devfun convention, so the deviance
+# scale is owned by the in-crate k-convergence invariants (spec Part 4 layer 1),
+# not this oracle.
+fit_one_glmmadaptive <- function(spec, df) {
+  nagq <- as.integer(spec$nagq)
+  # Tightened controls, recorded per JSON (the fit.R tolPwrss=1e-13 precedent):
+  # mixed_model's DEFAULTS under-converge on the low-information rungs -- on
+  # sim_binomial_slope1 (k=7) the default EM/qN stop leaves logLik 4e-3 below
+  # the true optimum and beta ~3e-3/6e-3 off (measured at freeze, 2026-07-13);
+  # glmm sits at the better optimum. update_GH_every=1 re-adapts the quadrature
+  # grid every iteration -- the like-for-like convention (glmm re-adapts at
+  # every deviance eval). Verified stable: a further tightening step moves
+  # logLik < 1e-4 on every rung.
+  ctrl <- list(iter_EM = 300, iter_qN_outer = 60,
+               tol1 = 1e-8, tol2 = 1e-10, tol3 = 1e-12, update_GH_every = 1)
+  m <- mixed_model(fixed = as.formula(spec$ma_fixed),
+                   random = as.formula(spec$ma_random),
+                   data = df, family = fam_obj(spec$family, spec$link),
+                   nAGQ = nagq, control = ctrl)
+  se <- sqrt(diag(vcov(m, parm = "fixed-effects")))
+  est <- list(
+    beta = I(unname(fixef(m))),
+    se_hessian = I(unname(se)),
+    varcomp = list(list(
+      group  = sub("^.*\\|\\s*", "", spec$ma_random),
+      terms  = I(colnames(m$D)),
+      stddev = I(unname(sqrt(diag(m$D)))),
+      corr   = unname(cov2cor(m$D))))
+  )
+  res <- list(
+    name = spec$name, engine = "GLMMadaptive",
+    engine_version = as.character(packageVersion("GLMMadaptive")),
+    kind = spec$kind, data = spec$data,
+    family = spec$family, link = spec$link,
+    nagq = nagq,
+    control = ctrl,   # self-describing, like fit.R's tolPwrss field
+    r_formula = spec$r_formula,
+    converged = isTRUE(m$converged), singular = FALSE,
+    coef_names = I(names(fixef(m))),
+    estimates = est
+  )
+  out <- file.path(out_dir, paste0(spec$name, ".json"))
+  write(toJSON(res, auto_unbox = TRUE, pretty = TRUE, digits = NA, na = "null"), out)
+  cat(sprintf("m3  %-20s  %-4s  %-9s nAGQ=%-2d converged=%s (GLMMadaptive)\n",
+              spec$name, spec$kind, spec$family, nagq, res$converged))
+}
+
 fit_one <- function(spec) {
   df <- read_dataset(spec)
+  if (identical(spec$oracle, "GLMMadaptive")) return(fit_one_glmmadaptive(spec, df))
   fm <- as.formula(spec$r_formula)
   nagq <- if (is.null(spec$nagq)) 1L else as.integer(spec$nagq)
 

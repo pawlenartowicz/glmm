@@ -34,8 +34,8 @@ The recurring symbols on this page, defined once here before first use:
 
 ## Dispatch within the GLMM path
 
-**Code:** `classify_design` and the `(family, Some(re))` arm of `fit_dispatch`
-in `src/fit.rs`; envelope caps in `src/consts.rs` (`MAX_PRIMARY_Q`,
+**Code:** `classify_design` and the `(family, Some(re))` arm of the dispatch
+match in `fit_warm` (`src/fit.rs`); envelope caps in `src/consts.rs` (`MAX_PRIMARY_Q`,
 `MAX_EXTRA_GROUPINGS`, `MAX_EXTRA_Q`, `MAX_CROSSED_LEVELS`).
 
 `classify_design` returns `Solver::NoZ` (the dense clustered kernel) or
@@ -301,7 +301,8 @@ the `loop_advanced` MCPower hot-loop surface.
 **Code:** the `WaldSe` arms in `glmm::fit_glmm` and `fd_hessian_cov` /
 `rx_cov_into` in `src/glmm/se.rs`; the sparse twins `sparse_fd_hessian_cov` and
 the sparse Rx Schur in `src/sparse.rs`; `FD_STEP_REL = 1e-2` and
-`PIRLS_TOL_REL_FD = 1e-8` in `src/glmm/mod.rs`.
+`PIRLS_TOL_REL_FD = 1e-8` in `src/glmm/mod.rs`; `SPARSE_FD_STEP_REL = 1e-4` in
+`src/sparse.rs`.
 
 Two genuinely different Wald covariances are offered, selected by `WaldSe`:
 
@@ -330,7 +331,11 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
 
 Both are computed on the deviance/log-odds scale (the fit's linear-predictor
 scale). The sparse driver emits the same two arms: `sparse_fd_hessian_cov`
-mirrors the dense FD scheme exactly, with the identical Rx fallback. The Hessian
+mirrors the dense FD scheme (single-step central differences, same
+`h_k = step·max(1, |γ̂_k|)` rule, identical Rx fallback) but carries its own
+sparse-calibrated step `SPARSE_FD_STEP_REL = 1e-4` — deliberately not the dense
+`1e-2`; the two paths sit on opposite sides of the truncation-vs-noise trade
+and the constants must not be folded together. The Hessian
 arm is the dominant time cost (≈ O(m²) deviance re-solves); on cbpp the Hessian
 fit is ~1.9× its Rx fit.
 
@@ -351,10 +356,12 @@ The GLMM paths are held to the frozen `parity/` oracle (`parity/README.md`) —
 two independent reference engines (R `lme4`, Julia `MixedModels.jl`) agreeing
 within tolerance is the truth condition; on any disagreement glmm is presumed
 wrong. Estimation is pinned to Laplace (`nAGQ=1`) across the sweep so all three
-engines compare like-to-like. Of the 21 roadmap rungs, **nine are landed** on
-the glmm side (rungs 1–9); the GLMM ones among them are cbpp,
-grouseticks, `sim_sparse_binomial` and `sim_sparse_poisson`. Directly relevant
-rungs and goldens:
+engines compare like-to-like. Of the 24 roadmap rungs, **23 are landed** on
+the glmm side (rungs 1–23; rung 24, the sparse Gamma, is backed out); the GLMM
+ones among them include cbpp, grouseticks, VerbAgg, Arabidopsis, cbpp_probit,
+`sim_crossed_at_cap`, `sim_poisson_nested`, `sim_binomial_slope_crossed`,
+`sim_gamma`, and the over-count pair `sim_sparse_binomial` /
+`sim_sparse_poisson`. Directly relevant rungs and goldens:
 
 | Path | Rung / golden | Reference | Status |
 |---|---|---|---|
@@ -362,9 +369,9 @@ rungs and goldens:
 | Poisson GLMM, dense | grouseticks (rung 6) | lme4 + MixedModels.jl | landed |
 | Sparse over-count binomial | `sim_sparse_binomial` (rung 8) | lme4 + MixedModels.jl | landed |
 | Sparse over-count Poisson | `sim_sparse_poisson` (rung 9) | lme4 + MixedModels.jl | landed |
-| Binomial, individual 0/1 | VerbAgg (rung 12) | lme4 + MixedModels.jl | roadmap (used to tune `PIRLS_TOL_REL`) |
-| Poisson, real nested | Arabidopsis (rung 14) | lme4 + MixedModels.jl | roadmap |
-| Sparse binomial, slope-crossed | `sim_binomial_slope_crossed` (rung 18) | lme4 (+ glmm golden) | roadmap rung; in-crate golden gated |
+| Binomial, individual 0/1 | VerbAgg (rung 12) | lme4 + MixedModels.jl | landed (used to tune `PIRLS_TOL_REL`) |
+| Poisson, real nested | Arabidopsis (rung 14) | lme4 + MixedModels.jl | landed |
+| Sparse binomial, slope-crossed | `sim_binomial_slope_crossed` (rung 18) | lme4 (+ glmm golden) | landed (2-way gate); in-crate golden gated |
 | Probit GLMM (non-canonical) | `goldens/cbpp_probit_glmm.json` (`fit_glmm_probit_cbpp_matches_lme4`) | lme4 | in-crate golden |
 | Gamma GLMM, dense | `goldens/sim_gamma_glmm.json` (`fit_glmm_gamma_sim_matches_lme4`) | lme4 | in-crate golden |
 | NB GLMM, dense | `goldens/sim_nb_glmm.json` (`fit_glmm_nb_sim_matches_lme4`) | lme4 | in-crate golden |

@@ -60,7 +60,9 @@ of the crate's build (example / bench / small bin, decided then).
 ## Datasets — the roadmap rungs
 
 Rungs 1–22 are landed and green (see "Landed" below); 23–24 are specced but
-backed out pending glmm-side fixes (see the gamma note below the table).
+backed out pending glmm-side fixes (see the gamma note below the table; 23 has
+since re-landed). Rungs 25–27 (vector-RE AGQ Laplace anchors) are landed and
+green.
 
 | Rung | Dataset             | Family                                        | Source |
 |------|---------------------|-----------------------------------------------|--------|
@@ -88,6 +90,9 @@ backed out pending glmm-side fixes (see the gamma note below the table).
 | 22   | cbpp_probit          | binomial GLMM, probit link (cbpp data)        | lme4   |
 | 23   | sim_gamma            | gamma GLMM, log link (dense) — backed out     | sim    |
 | 24   | sim_sparse_gamma     | gamma GLMM, log link (q=5, sparse) — backed out | sim  |
+| 25   | sim_binomial_slope1  | binomial GLMM (Bernoulli, single q=2 grouping) | sim   |
+| 26   | sim_poisson_slope1   | Poisson GLMM (sparse counts, single q=2 grouping) | sim |
+| 27   | sim_binomial_slope2  | binomial GLMM (Bernoulli, single q=3 grouping) | sim   |
 
 Rung 18 (`sim_binomial_slope_crossed`) is fit on the Rust side by the
 **sparse GLMM driver** (`fit_glmm_sparse`): `classify_design` routes any
@@ -166,6 +171,24 @@ intentionally absent.
 The NB sibling stays in the goldens track permanently: MixedModels has no
 glmer.nb equivalent.
 
+Rungs 25–27 (`sim_binomial_slope1`, `sim_poisson_slope1`, `sim_binomial_slope2`)
+are the **vector-RE AGQ datasets** (full-AGQ spec Part 5): a single grouping
+factor with a correlated intercept+slope RE (q=2, q=3), sized so the Laplace
+bias is visible (small clusters / sparse information). Each dataset carries
+**two tiers**: the curated rung here is the ordinary **Laplace anchor (nAGQ=1)**
+— a full 3-way gate against the machine-tight glmer/MixedModels Laplace oracle,
+validating the mode/curvature substrate — while the **AGQ tier (nAGQ ∈ {7, 11})**
+lives in the goldens track (`goldens/sim_*_slope*_agq_k{7,11}.json`, the
+`cbpp_agq_k7/k11` pattern) against **GLMMadaptive** (`mixed_model(nAGQ = k)`),
+because `glmer` refuses `nAGQ > 1` for vector REs. Those goldens freeze β̂, θ̂
+(stddev + correlation) and Hessian SEs — **not** deviance (GLMMadaptive's
+logLik constants differ from glmer's devfun convention; the deviance scale is
+owned by the in-crate k-convergence invariants). They are gated in-crate
+(`src/fit/glmm_tests.rs`) at the empirically calibrated `agq_*` bands in
+`tol.R`, and were frozen with **tightened `mixed_model` controls** — the
+GLMMadaptive defaults under-converge on the low-information rungs, the same
+artifact class as lme4's default `tolPwrss` (see `oracle/fit_m3_goldens.R`).
+
 Each dataset is exported **once** from its canonical source (lme4) to neutral CSV;
 Julia and Rust read that CSV, **not** their own ecosystem's built-in copy — this is
 what guarantees byte-identical input and sidesteps row-order / factor-coding / NA
@@ -190,7 +213,15 @@ InstEval and salamander are **deferred** — added when their rungs need them.
 ./run.sh --oracles cbpp     # combine: refit all three engines, but only for `cbpp`
 ```
 
-**R** needs `lme4` + `jsonlite`. **Julia** runs in this dir's pinned env; set it up
+**R** needs `lme4` + `jsonlite` — plus **`GLMMadaptive`** to regenerate the
+vector-RE AGQ goldens (`oracle/fit_m3_goldens.R` only; ordinary `run.sh` runs,
+including `--oracles`, never load it):
+
+```sh
+Rscript -e 'install.packages(c("lme4", "jsonlite", "GLMMadaptive"), repos = "https://cloud.r-project.org")'
+```
+
+**Julia** runs in this dir's pinned env; set it up
 once (this writes `Project.toml` + `Manifest.toml` — commit them for a reproducibly
 regenerable oracle):
 

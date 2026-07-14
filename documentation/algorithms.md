@@ -99,7 +99,7 @@ Pastes, sim_slope_extra on the Gaussian side; cbpp, grouseticks,
 
 Every tuning surface, one line each, pointing at the page that owns it. Public
 `FitOptions` knobs are documented at their use site; internal constants are
-tuned on the crate's parity corpus (the 21-rung roadmap, of which 9 are landed —
+tuned on the crate's parity corpus (the 24-rung roadmap, of which 23 are landed —
 see the LMM/GLMM validation sections) and are not user-facing.
 
 ### Public `FitOptions` fields (`src/fit.rs`, `struct FitOptions`)

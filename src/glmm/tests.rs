@@ -14,8 +14,8 @@ use faer::linalg::solvers::Solve;
 /// GLMM kernel has always used here. (Pre-M3 the kernel ignored `spec.family`;
 /// M3 made `ws.family` load-bearing, so these legacy binomial tests must set it
 /// rather than inherit `intercept_only_spec`'s Gaussian default.)
-fn logit_intercept_spec(sizing: Sizing, tau: f64) -> ModelSpec {
-    let mut s = intercept_only_spec(sizing, tau);
+fn logit_intercept_spec(sizing: Sizing) -> ModelSpec {
+    let mut s = intercept_only_spec(sizing);
     s.family = Family::Binomial {
         link: BinomialLink::Logit,
     };
@@ -228,7 +228,7 @@ fn laplace_deviance_matches_brute_force_intercept() {
     let (xf64, y, ids) = glmm_intercept_dataset();
     let beta = [0.2_f64, 0.8];
     let want = brute_force_intercept_laplace(0.5, &beta, &xf64, &y, &ids, 8);
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.5;
@@ -249,7 +249,7 @@ fn beta_fixed_mode_is_pure_plumbing() {
     // calls (which Profile mode must also keep in later tasks) on top of the
     // full oracle suite's bit-identity witness.
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.5;
@@ -271,7 +271,7 @@ fn agq_k1_reduces_to_laplace() {
     // AGQ guard fires only for nagq>1. Run at a non-unit τ² (= 0.5²) so a missing
     // λ-scale in the integrand would surface (the k=1 reduction is τ-dependent).
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.5; // θ (Λ scalar) ≠ 1 — exercises the λ-scale
@@ -286,6 +286,97 @@ fn agq_k1_reduces_to_laplace() {
     );
 }
 
+/// White-box, no external oracle: the aggregated-binomial AGQ objective and its
+/// per-trial expanded twin, evaluated at a SHARED (β, θ), differ by exactly the
+/// data-only saturated constant `2·Σᵢ wᵢ[yᵢ ln yᵢ + (1−yᵢ) ln(1−yᵢ)]` (yᵢ the
+/// aggregated proportion, wᵢ the trial count). The RE prior, GH nodes/weights,
+/// and log-sum-exp are identical between the encodings, and the constant is
+/// u-independent, so it cancels in every `ℓ_c(u_cj) − ℓ_c(ũ_c)` and survives only
+/// in the `−2·ℓ_c(ũ_c)` center term. This is the decisive check that `prior_w` is
+/// folded into the per-row dev_resid sums exactly as the aggregated≡expanded
+/// identity demands. Two independent PIRLS runs converge the shared mode, so the
+/// residual is bounded by PIRLS tol, not machine ε (hence 1e-8, not bit-equal).
+/// Held at nAGQ ∈ {1, 7}.
+#[test]
+fn agq_weighted_aggregated_equals_expanded_plus_saturated_const() {
+    // 6 clusters, round-robin ids (FixedClusters layout). Each aggregated row is
+    // intercept + covariate x1, m trials, s successes strictly in (0, m) so the
+    // saturated constant is nonzero.
+    let nc = 6usize;
+    let mut st = 42u64;
+    let mut xa = Vec::<f64>::new(); // aggregated [1, x1] row-major
+    let mut ya = Vec::<f64>::new(); // aggregated proportions
+    let mut wa = Vec::<f64>::new(); // trial counts (weights)
+    let mut ids_a = Vec::<u32>::new();
+    let mut xe = Vec::<f64>::new(); // expanded [1, x1] row-major
+    let mut ye = Vec::<f64>::new(); // expanded 0/1
+    let mut ids_e = Vec::<u32>::new();
+    for i in 0..18usize {
+        let c = (i % nc) as u32;
+        let x1 = lcg(&mut st);
+        let m = 4 + (i % 5); // 4..8 trials
+        let succ = 1 + i % (m - 1); // 1..m-1 successes (strictly inside)
+        xa.extend_from_slice(&[1.0, x1]);
+        ya.push(succ as f64 / m as f64);
+        wa.push(m as f64);
+        ids_a.push(c);
+        for k in 0..m {
+            xe.extend_from_slice(&[1.0, x1]);
+            ye.push(if k < succ { 1.0 } else { 0.0 });
+            ids_e.push(c);
+        }
+    }
+    let (n_a, n_e) = (ya.len(), ye.len());
+    let mut xa_mat = Mat::<f64>::zeros(n_a, 2);
+    for r in 0..n_a {
+        xa_mat[(r, 0)] = xa[r * 2];
+        xa_mat[(r, 1)] = xa[r * 2 + 1];
+    }
+    let mut xe_mat = Mat::<f64>::zeros(n_e, 2);
+    for r in 0..n_e {
+        xe_mat[(r, 0)] = xe[r * 2];
+        xe_mat[(r, 1)] = xe[r * 2 + 1];
+    }
+    // 2·Σ wᵢ[yᵢ ln yᵢ + (1−yᵢ) ln(1−yᵢ)] — the analytic offset (parameter-free).
+    let sat: f64 = (0..n_a)
+        .map(|i| {
+            let y = ya[i];
+            2.0 * wa[i] * (y * y.ln() + (1.0 - y) * (1.0 - y).ln())
+        })
+        .sum();
+    assert!(sat < -1e-6, "saturated const must be nonzero (got {sat})");
+
+    let cluster = logit_intercept_spec(Sizing::FixedClusters {
+        n_clusters: nc as u32,
+    });
+    for nagq in [1u8, 7] {
+        let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, n_a, &[], nagq);
+        build_z(&mut ws_a, xa_mat.as_ref(), &ids_a, &[], n_a);
+        ws_a.weighted = true;
+        ws_a.prior_w[..n_a].copy_from_slice(&wa);
+        ws_a.params[0] = 0.5; // θ (Λ scalar)
+        ws_a.params[1] = 0.2; // β0
+        ws_a.params[2] = 0.8; // β1
+        let pa = ws_a.params.clone();
+        let da = glmm_agq_deviance(&pa, &mut ws_a, xa_mat.as_ref(), &ya, &ids_a, n_a, nagq);
+
+        let mut ws_e = GlmmWorkspace::for_cluster_spec(2, &cluster, n_e, &[], nagq);
+        build_z(&mut ws_e, xe_mat.as_ref(), &ids_e, &[], n_e);
+        ws_e.params[0] = 0.5;
+        ws_e.params[1] = 0.2;
+        ws_e.params[2] = 0.8;
+        let pe = ws_e.params.clone();
+        let de = glmm_agq_deviance(&pe, &mut ws_e, xe_mat.as_ref(), &ye, &ids_e, n_e, nagq);
+
+        let got = da - de;
+        assert!(
+            (got - sat).abs() <= 1e-8 * (1.0 + sat.abs()),
+            "nagq={nagq}: dev_agg−dev_exp = {got}, saturated const = {sat} (Δ {})",
+            (got - sat).abs()
+        );
+    }
+}
+
 /// Cluster-outer AGQ must be BIT-identical to the node-outer loop: same
 /// operands, same per-accumulator summation order (ClusterRowIndex's
 /// ascending-row guarantee). Exact equality — approximate closeness here
@@ -294,7 +385,7 @@ fn agq_k1_reduces_to_laplace() {
 #[test]
 fn agq_cluster_outer_bit_identical_to_node_outer() {
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     for nagq in [3u8, 7, 11] {
         let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
         build_z(&mut ws_a, xf64.as_ref(), &ids, &[], 80);
@@ -320,7 +411,7 @@ fn agq_cluster_outer_bit_identical_to_node_outer() {
 #[test]
 fn agq_parallel_bit_identical_to_serial() {
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     for nagq in [3u8, 7, 11] {
         let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
         build_z(&mut ws_a, xf64.as_ref(), &ids, &[], 80);
@@ -342,11 +433,189 @@ fn agq_parallel_bit_identical_to_serial() {
     }
 }
 
+// --- Vector AGQ (agq_deviance_vec) white-box invariants (spec Part 4 layer 1) --
+
+/// q=2 vector-RE spec: intercept + slope on design col 1, single grouping
+/// factor, no extras — the shape the widened gate routes to `agq_deviance_vec`.
+fn slope1_spec() -> ModelSpec {
+    ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    }
+}
+
+/// q=3 vector-RE spec: intercept + slopes on design cols 1,2 (pins the q≤3 cap).
+fn slope2_spec() -> ModelSpec {
+    ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            slopes: vec![1, 2],
+            extra_groupings: vec![],
+        }),
+    }
+}
+
+/// No-extras q_p=3 (intercept + 2 slopes) clustered-binary dataset — the vector
+/// AGQ q=3 fixture. p=3, 8 clusters, correlated intercept+2 slopes.
+fn glmm_slope2_noextra_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>) {
+    let (n, nc) = (120usize, 8usize);
+    let mut st = 29u64;
+    let u0: Vec<f64> = (0..nc).map(|_| 0.6 * lcg(&mut st)).collect();
+    let u1: Vec<f64> = (0..nc).map(|_| 0.4 * lcg(&mut st)).collect();
+    let u2: Vec<f64> = (0..nc).map(|_| 0.3 * lcg(&mut st)).collect();
+    let mut x = Mat::<f64>::zeros(n, 3);
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        let c = i % nc;
+        ids[i] = c as u32;
+        let x1 = lcg(&mut st);
+        let x2 = lcg(&mut st);
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = x1;
+        x[(i, 2)] = x2;
+        let eta = 0.2 + 0.8 * x1 - 0.5 * x2 + u0[c] + u1[c] * x1 + u2[c] * x2;
+        let p = 1.0 / (1.0 + (-eta).exp());
+        y[i] = if lcg(&mut st) + 0.5 < p { 1.0 } else { 0.0 };
+    }
+    (x, y, ids)
+}
+
+/// Vector AGQ k=1 ≡ Laplace at q=2 (rel<1e-12): the single z=0 node collapses the
+/// multivariate Liu–Pierce bracket to `q·ln√π`, leaving `−2ℓ_c(ũ_c)+log|A_c|` —
+/// the Laplace term exactly. Mirrors `agq_k1_reduces_to_laplace` one dimension up;
+/// run at a non-identity Λ_p (correlated intercept/slope) so a missing `Λ_p·u_cj`
+/// or `L_c⁻ᵀ` transform in the integrand would surface.
+#[test]
+fn agq_vec_k1_reduces_to_laplace_q2() {
+    let (xf64, y, ids) = glmm_slope_noextra_dataset();
+    let n = y.len();
+    let cluster = slope1_spec();
+    let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
+    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
+    ws.params[0] = 0.5; // vech(Λ_p): [σ_int, cov, σ_slope] ≠ I
+    ws.params[1] = 0.1;
+    ws.params[2] = 0.4;
+    ws.params[3] = 0.2; // β
+    ws.params[4] = 0.8;
+    let p = ws.params.clone();
+    let lap = glmm_laplace_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, n);
+    let agq1 = glmm_agq_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, n, 1);
+    assert!(
+        (agq1 - lap).abs() <= 1e-12 * lap.abs().max(1.0),
+        "agq_vec(k=1) q2 {agq1} vs laplace {lap}"
+    );
+}
+
+/// Vector AGQ k=1 ≡ Laplace at q=3 (rel<1e-12) — the same reduction on the cap
+/// surface (full 3×3 Λ_p, q²=9 transform), proving dimensional generality.
+#[test]
+fn agq_vec_k1_reduces_to_laplace_q3() {
+    let (xf64, y, ids) = glmm_slope2_noextra_dataset();
+    let n = y.len();
+    let cluster = slope2_spec();
+    let mut ws = GlmmWorkspace::for_cluster_spec(3, &cluster, n, &[1, 2], 1);
+    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
+    // vech(Λ_p) column-major lower-tri of a 3×3, non-identity.
+    let theta = [0.6, 0.1, 0.05, 0.4, 0.08, 0.3];
+    ws.params[..6].copy_from_slice(&theta);
+    ws.params[6] = 0.2; // β
+    ws.params[7] = 0.8;
+    ws.params[8] = -0.5;
+    let p = ws.params.clone();
+    let lap = glmm_laplace_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, n);
+    let agq1 = glmm_agq_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, n, 1);
+    assert!(
+        (agq1 - lap).abs() <= 1e-12 * lap.abs().max(1.0),
+        "agq_vec(k=1) q3 {agq1} vs laplace {lap}"
+    );
+}
+
+/// Vector AGQ parallel cluster loop ≡ serial bitwise (q=2): disjoint `sum[c]`
+/// writes make the cluster-outer result schedule-independent, and the `None`
+/// (serial) arm builds the same row-index ordering as the prebuilt `Some` arm.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[test]
+fn agq_vec_parallel_bit_identical_to_serial_q2() {
+    let (xf64, y, ids) = glmm_slope_noextra_dataset();
+    let n = y.len();
+    let cluster = slope1_spec();
+    for nagq in [3u8, 7, 9] {
+        let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], nagq);
+        build_z(&mut ws_a, xf64.as_ref(), &ids, &[], n);
+        ws_a.params[0] = 0.5;
+        ws_a.params[1] = 0.1;
+        ws_a.params[2] = 0.4;
+        ws_a.params[3] = 0.2;
+        ws_a.params[4] = 0.8;
+        let params = ws_a.params.clone();
+        // Some(idx) ⇒ rayon arm under --features parallel (this test is itself
+        // feature-gated), so `da` is the parallel result.
+        ws_a.cluster_rows = Some(ClusterRowIndex::build(&ids, ws_a.groupings.n_primary));
+
+        let mut ws_b = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], nagq);
+        build_z(&mut ws_b, xf64.as_ref(), &ids, &[], n);
+        ws_b.cluster_rows = None; // serial cluster-outer arm (builds a transient index)
+
+        let da = glmm_agq_deviance(&params, &mut ws_a, xf64.as_ref(), &y, &ids, n, nagq);
+        let db = glmm_agq_deviance(&params, &mut ws_b, xf64.as_ref(), &y, &ids, n, nagq);
+        assert_eq!(da.to_bits(), db.to_bits(), "nagq={nagq}");
+    }
+}
+
+/// Vector AGQ k-convergence self-consistency (q=2): the product Gauss–Hermite
+/// grid converges, so a fixed dataset's deviance at k=9/15/21 agrees to
+/// tightening tolerances — high-k is its own deviance-scale reference (no oracle).
+#[test]
+fn agq_vec_k_convergence_self_consistent_q2() {
+    let (xf64, y, ids) = glmm_slope_noextra_dataset();
+    let n = y.len();
+    let cluster = slope1_spec();
+    let theta_beta = [0.5_f64, 0.1, 0.4, 0.2, 0.8];
+    let dev_at = |nagq: u8| {
+        let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], nagq);
+        build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
+        ws.params[..5].copy_from_slice(&theta_beta);
+        let p = ws.params.clone();
+        glmm_agq_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, n, nagq)
+    };
+    let d9 = dev_at(9);
+    let d15 = dev_at(15);
+    let d21 = dev_at(21);
+    let scale = d21.abs().max(1.0);
+    let gap_9_21 = (d9 - d21).abs();
+    let gap_15_21 = (d15 - d21).abs();
+    // Already at k=9 the value is close; k=15 is essentially converged against k=21; and the gap
+    // must not grow with refinement (slack for the noise floor when all three
+    // sit within a few ULP of the converged value).
+    assert!(
+        gap_9_21 < 1e-4 * scale,
+        "k=9 vs k=21 gap {gap_9_21} too large"
+    );
+    assert!(
+        gap_15_21 < 1e-7 * scale,
+        "k=15 vs k=21 gap {gap_15_21} not converged"
+    );
+    assert!(
+        gap_15_21 <= gap_9_21 + 1e-12 * scale,
+        "gap not tightening: |d15-d21|={gap_15_21} > |d9-d21|={gap_9_21}"
+    );
+}
+
 #[test]
 fn laplace_deviance_collapses_to_glm_at_theta_zero() {
     let (xf64, y, ids) = glmm_intercept_dataset();
     let beta = [0.2_f64, 0.8];
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.0;
@@ -479,7 +748,7 @@ fn apply_lambda_handles_nonmonotonic_extra_offsets() {
 #[test]
 fn fit_glmm_recovers_direction_and_finite_inference() {
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     let targets = [1u32];
@@ -556,7 +825,7 @@ fn fd_hessian_cov_matches_glmer_use_hessian_true() {
     let n = fx.n;
     let p = fx.beta.len();
     let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters });
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
     let mut xf64 = Mat::<f64>::zeros(n, p);
     for i in 0..n {
@@ -717,7 +986,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
         let n = fx.n;
         let p = fx.beta.len();
         let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
-        let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters }, 0.25);
+        let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters });
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
         let mut xf64 = Mat::<f64>::zeros(n, p);
         for i in 0..n {
@@ -784,7 +1053,7 @@ fn hessian_mode_t_sq_uses_fd_hessian_cov() {
     let n = fx.n;
     let p = fx.beta.len();
     let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters });
     let mut xf64 = Mat::<f64>::zeros(n, p);
     for i in 0..n {
         for j in 0..p {
@@ -892,12 +1161,9 @@ fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
         y[i] = if lcg(&mut st) + 0.5 < pr { 1.0 } else { 0.0 };
     }
     let p = 2usize;
-    let cluster = logit_intercept_spec(
-        Sizing::FixedClusters {
-            n_clusters: nc as u32,
-        },
-        0.25,
-    );
+    let cluster = logit_intercept_spec(Sizing::FixedClusters {
+        n_clusters: nc as u32,
+    });
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
     build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
 
@@ -1031,12 +1297,9 @@ fn fit_glmm_collapses_to_plain_irls_when_tau_negligible() {
     };
     assert!(irls.2, "plain IRLS must converge");
 
-    let cluster = logit_intercept_spec(
-        Sizing::FixedClusters {
-            n_clusters: nc as u32,
-        },
-        0.1,
-    );
+    let cluster = logit_intercept_spec(Sizing::FixedClusters {
+        n_clusters: nc as u32,
+    });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
     build_z(&mut ws, x.as_ref(), &ids, &[], n);
     let fit = fit_glmm(
@@ -1124,7 +1387,7 @@ fn fit_glmm_width_general_slope_and_crossed() {
 #[ignore]
 fn fit_glmm_warm_path_bounded_alloc() {
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     let _ = fit_glmm(
@@ -1335,7 +1598,7 @@ fn blocked_laplace_matches_brute_force_intercept() {
     let (xf64, y, ids) = glmm_intercept_dataset();
     let beta = [0.2_f64, 0.8];
     let want = brute_force_intercept_laplace(0.5, &beta, &xf64, &y, &ids, 8);
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     assert!(
         ws.groupings.extra_offsets.is_empty(),
@@ -1362,7 +1625,7 @@ fn blocked_laplace_matches_brute_force_intercept_contiguous() {
     let (xf64, y, ids) = glmm_intercept_dataset_layout(true);
     let beta = [0.2_f64, 0.8];
     let want = brute_force_intercept_laplace(0.5, &beta, &xf64, &y, &ids, 8);
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     assert!(
         ws.groupings.extra_offsets.is_empty(),
@@ -1422,6 +1685,7 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         eta_fixed,
         mu,
         wm,
+        wx,
         a,
         a_chol,
         a_llt_mem,
@@ -1451,6 +1715,7 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         eta_fixed,
         mu,
         wm,
+        wx,
         a,
         a_chol,
         a_rhs,
@@ -1480,6 +1745,7 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         a_rhs,
         ..
     } = &mut ws2;
+    let mut wx_scratch = faer::Mat::<f64>::zeros(n, beta.len());
     let blocked = pirls_solve_blocked(
         crate::Family::Binomial {
             link: crate::BinomialLink::Logit,
@@ -1504,6 +1770,7 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         eta_fixed,
         a_blocks,
         a_rhs,
+        &mut wx_scratch,
         None,
         n,
     );
@@ -1586,6 +1853,7 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         eta_fixed,
         mu,
         wm,
+        wx,
         a,
         a_chol,
         a_llt_mem,
@@ -1615,6 +1883,7 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         eta_fixed,
         mu,
         wm,
+        wx,
         a,
         a_chol,
         a_rhs,
@@ -1644,6 +1913,7 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         a_rhs,
         ..
     } = &mut ws2;
+    let mut wx_scratch = faer::Mat::<f64>::zeros(n, beta.len());
     let blocked = pirls_solve_blocked(
         crate::Family::Binomial {
             link: crate::BinomialLink::Logit,
@@ -1668,6 +1938,7 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         eta_fixed,
         a_blocks,
         a_rhs,
+        &mut wx_scratch,
         None,
         n,
     );
@@ -1833,7 +2104,7 @@ fn blocked_inference_matches_dense_slope_noextra() {
 #[test]
 fn warm_start_is_per_fit_deterministic() {
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mk = || {
         let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
         build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
@@ -1891,7 +2162,7 @@ fn warm_start_is_per_fit_deterministic() {
 #[test]
 fn warm_start_objective_is_seed_independent() {
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.5;
@@ -2224,6 +2495,7 @@ fn structured_extras_matches_dense() {
             eta_fixed,
             mu,
             wm,
+            wx,
             a,
             a_chol,
             a_llt_mem,
@@ -2253,6 +2525,7 @@ fn structured_extras_matches_dense() {
             eta_fixed,
             mu,
             wm,
+            wx,
             a,
             a_chol,
             a_rhs,
@@ -2323,6 +2596,7 @@ fn structured_extras_matches_dense() {
                 coup_cols,
                 coup_ptr,
             );
+            let mut wx_scratch = faer::Mat::<f64>::zeros(n, p);
             pirls_solve_blocked_extras(
                 crate::Family::Binomial {
                     link: crate::BinomialLink::Logit,
@@ -2355,6 +2629,7 @@ fn structured_extras_matches_dense() {
                 None,
                 false,
                 a_rhs,
+                &mut wx_scratch,
                 None,
                 n,
             )
@@ -2389,6 +2664,165 @@ fn structured_extras_matches_dense() {
                 "{label} u[{c}]: dense {} structured {}",
                 ws.u[c],
                 ws2.u[c]
+            );
+        }
+    }
+}
+
+/// Two legs, distinct roles (2026-07-14 qc=1-downdate-route spec).
+/// `structured_factor`'s per-cluster `S −= C_f'A_f⁻¹C_f` runs panel-wise when
+/// `StructuredSchur` is cached AND `qc > 1`, and column-at-a-time scalar
+/// otherwise (the `ss = None` arm, and — since the qc=1 route change — the
+/// production path whenever `qc == 1`). `force_dense = true` on BOTH runs pins
+/// the factor to the same dense Crout, so any disagreement is the downdate alone.
+///
+/// - `crossed_nested` (np=2 ⇒ qc=3): the real panel-vs-scalar oracle. `use_panel`
+///   actually exercises the panel path; bands mirror
+///   `structured_extras_matches_dense` (dev/pen/logdet 1e-9, u 1e-7) to absorb the
+///   panel's downdate reassociation.
+/// - `crossed` (np=0 ⇒ qc=1): a routing smoke check. Both runs take the scalar
+///   arm (qc==1 routes there regardless of `ss`), so they run identical code and
+///   agree bit-exact — the band tightens to `== 0.0`.
+#[test]
+fn structured_panel_downdate_matches_scalar() {
+    for (np, ncr, label) in [(0usize, 6usize, "crossed"), (2, 6, "crossed_nested")] {
+        // qc == 1 (np == 0) ⇒ both runs are the same scalar arm ⇒ bit-exact.
+        let tol = if np == 0 { 0.0 } else { 1e-9 };
+        let u_tol = if np == 0 { 0.0 } else { 1e-7 };
+        let (xf64, y, ids, extra_ids, cluster) = glmm_extras_q1_dataset(np, ncr);
+        let n = y.len();
+        let mut theta = vec![0.5_f64];
+        if np > 0 {
+            theta.push(0.4);
+        }
+        theta.push(0.45);
+        let beta0 = [0.2_f64, 0.8];
+
+        let run = |use_panel: bool| {
+            let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
+            build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
+            let (p, nt) = (ws.p, ws.n_theta);
+            let mut prm = vec![0.0; nt + p];
+            prm[..nt].copy_from_slice(&theta);
+            prm[nt..].copy_from_slice(&beta0);
+            let mut ss = if use_panel {
+                Some(
+                    StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n)
+                        .expect("ncr > 0 ⇒ e > 0 ⇒ Some"),
+                )
+            } else {
+                None
+            };
+            let mut beta = beta0;
+            let GlmmWorkspace {
+                groupings,
+                z,
+                lam,
+                m_core_buf,
+                cross_val,
+                cross_col,
+                n_cross,
+                prior_w,
+                eta,
+                prob,
+                w,
+                u,
+                u_prev,
+                eta_fixed,
+                mu,
+                core_blocks,
+                coupling,
+                schur_blk,
+                coup_cols,
+                coup_ptr,
+                a_rhs,
+                ..
+            } = &mut ws;
+            build_packed_m(
+                groupings,
+                &prm[..],
+                z.as_ref(),
+                lam,
+                &ids,
+                m_core_buf,
+                cross_val,
+                cross_col,
+                n_cross,
+                n,
+            );
+            build_coupling_csr(
+                &ids,
+                cross_col,
+                n_cross,
+                groupings.n_primary,
+                n,
+                coup_cols,
+                coup_ptr,
+            );
+            let mut wx_scratch = faer::Mat::<f64>::zeros(n, 2);
+            let out = pirls_solve_blocked_extras(
+                crate::Family::Binomial {
+                    link: crate::BinomialLink::Logit,
+                },
+                f64::NAN,
+                groupings,
+                &ids,
+                m_core_buf,
+                cross_val,
+                cross_col,
+                n_cross,
+                xf64.as_ref(),
+                &y,
+                &prior_w[..n],
+                false,
+                &mut beta,
+                BetaStep::Fixed,
+                eta,
+                prob,
+                w,
+                u,
+                u_prev,
+                eta_fixed,
+                mu,
+                core_blocks,
+                coupling,
+                schur_blk,
+                coup_cols,
+                coup_ptr,
+                ss.as_mut(),
+                true, // force_dense: same factor arm both runs — isolate the downdate
+                a_rhs,
+                &mut wx_scratch,
+                None,
+                n,
+            );
+            (out, u.clone())
+        };
+        let (scalar, u_scalar) = run(false);
+        let (panel, u_panel) = run(true);
+        assert_eq!(scalar.3, panel.3, "{label}: convergence flag");
+        assert!(
+            (scalar.0 - panel.0).abs() <= tol,
+            "{label} dev: scalar {} panel {}",
+            scalar.0,
+            panel.0
+        );
+        assert!(
+            (scalar.1 - panel.1).abs() <= tol,
+            "{label} pen: scalar {} panel {}",
+            scalar.1,
+            panel.1
+        );
+        assert!(
+            (scalar.2 - panel.2).abs() <= tol,
+            "{label} logdet: scalar {} panel {}",
+            scalar.2,
+            panel.2
+        );
+        for (c, (a, b)) in u_scalar.iter().zip(u_panel.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= u_tol,
+                "{label} u[{c}]: scalar {a} panel {b}"
             );
         }
     }
@@ -2670,7 +3104,7 @@ fn two_stage_matches_single_stage_corpus_sweep() {
             ("logit", BinomialLink::Logit),
             ("probit", BinomialLink::Probit),
         ] {
-            let mut spec = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+            let mut spec = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
             spec.family = Family::Binomial { link };
             let (a, b) = assert_two_stage_matches_single(
                 &format!("intercept_{label}"),
@@ -2943,6 +3377,7 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
         eta_fixed,
         mu,
         wm,
+        wx,
         a,
         a_chol,
         a_llt_mem,
@@ -2987,6 +3422,7 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
         eta_fixed,
         mu,
         wm,
+        wx,
         a,
         a_chol,
         a_rhs,
@@ -3081,6 +3517,7 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         schur_llt_mem,
         beta_rhs,
         beta_prev,
+        wx,
         ..
     } = &mut ws;
     let out = pirls_solve_blocked(
@@ -3115,6 +3552,7 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         eta_fixed,
         a_blocks,
         a_rhs,
+        wx,
         None,
         n,
     );
@@ -3227,6 +3665,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             schur_llt_mem,
             beta_rhs,
             beta_prev,
+            wx,
             ..
         } = &mut ws;
         build_coupling_csr(
@@ -3278,6 +3717,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             None,
             false,
             a_rhs,
+            wx,
             None,
             n,
         )
@@ -3378,6 +3818,7 @@ fn structured_profile_beta_matches_dense_profile() {
             eta_fixed,
             mu,
             wm,
+            wx,
             a,
             a_chol,
             a_llt_mem,
@@ -3421,6 +3862,7 @@ fn structured_profile_beta_matches_dense_profile() {
             eta_fixed,
             mu,
             wm,
+            wx,
             a,
             a_chol,
             a_rhs,
@@ -3489,6 +3931,7 @@ fn structured_profile_beta_matches_dense_profile() {
             schur_llt_mem,
             beta_rhs,
             beta_prev,
+            wx,
             ..
         } = &mut wss;
         build_coupling_csr(
@@ -3540,6 +3983,7 @@ fn structured_profile_beta_matches_dense_profile() {
             None,
             false,
             a_rhs,
+            wx,
             None,
             n,
         )
@@ -3982,7 +4426,7 @@ fn assert_two_stage_adversarial(
 #[test]
 fn two_stage_adversarial_bad_theta_start() {
     let (x, y, ids) = glmm_intercept_dataset();
-    let spec = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 }, 0.25);
+    let spec = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     assert_two_stage_adversarial(
         "bad_theta",
         &spec,
@@ -4019,12 +4463,9 @@ fn two_stage_adversarial_near_collinear_x() {
         let pr = 1.0 / (1.0 + (-eta).exp());
         y[i] = if lcg(&mut st) + 0.5 < pr { 1.0 } else { 0.0 };
     }
-    let spec = logit_intercept_spec(
-        Sizing::FixedClusters {
-            n_clusters: nc as u32,
-        },
-        0.25,
-    );
+    let spec = logit_intercept_spec(Sizing::FixedClusters {
+        n_clusters: nc as u32,
+    });
     assert_two_stage_adversarial(
         "near_collinear",
         &spec,
@@ -4060,12 +4501,9 @@ fn two_stage_adversarial_tiny_clusters() {
         let pr = 1.0 / (1.0 + (-eta).exp());
         y[i] = if lcg(&mut st) + 0.5 < pr { 1.0 } else { 0.0 };
     }
-    let spec = logit_intercept_spec(
-        Sizing::FixedClusters {
-            n_clusters: nc as u32,
-        },
-        0.25,
-    );
+    let spec = logit_intercept_spec(Sizing::FixedClusters {
+        n_clusters: nc as u32,
+    });
     assert_two_stage_adversarial(
         "tiny_clusters",
         &spec,

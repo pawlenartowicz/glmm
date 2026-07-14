@@ -48,6 +48,7 @@ pub(crate) fn laplace_deviance(
     eta_fixed: &mut [f64],
     mu: &mut [f64],
     wm: &mut Mat<f64>,
+    wx: &mut Mat<f64>,
     a: &mut Mat<f64>,
     // Copy-then-factor target for `a`'s Cholesky (ws.a_chol) — dense-fallback
     // branch only (`pirls_solve`); inert on the blocked/structured branches.
@@ -122,15 +123,23 @@ pub(crate) fn laplace_deviance(
     // bypasses PIRLS entirely, so Profile there is undefined; the two-stage
     // optimizer's stage-1 gating routes around it (`two_stage && nagq == 1`).
     debug_assert!(!profile_beta || nagq == 1);
-    // AGQ (nagq>1) only on the single scalar-intercept binomial/Poisson shape —
-    // a product of 1-D cluster integrals; every other shape (and nagq==1) uses the
+    // AGQ (nagq>1) only on a single grouping factor (no extras), q_p ≤ 3,
+    // binomial/Poisson — the shapes where the marginal likelihood factorizes into
+    // independent per-cluster q-D integrals (a k^q product quadrature). Route by
+    // q_p: scalar (q_p==1) → agq_deviance (verbatim, frozen goldens), vector
+    // (q_p∈2..=3) → agq_deviance_vec. Every other shape (and nagq==1) uses the
     // Laplace path below unchanged (nagq==1 IS Laplace, so it is bit-identical).
     if nagq > 1
         && groupings.extra_offsets.is_empty()
-        && groupings.primary_q == 1
+        && (1..=3).contains(&groupings.primary_q)
         && matches!(family, Family::Binomial { .. } | Family::Poisson { .. })
     {
-        return super::agq::agq_deviance(
+        let kernel = if groupings.primary_q == 1 {
+            super::agq::agq_deviance
+        } else {
+            super::agq::agq_deviance_vec
+        };
+        return kernel(
             family,
             nb_theta,
             groupings,
@@ -142,6 +151,7 @@ pub(crate) fn laplace_deviance(
             x,
             y,
             prior_w,
+            weighted,
             cluster_ids,
             eta,
             prob,
@@ -151,6 +161,7 @@ pub(crate) fn laplace_deviance(
             eta_fixed,
             a_blocks,
             a_rhs,
+            wx,
             agq_scratch,
             nagq,
             pirls_tol_override,
@@ -199,6 +210,7 @@ pub(crate) fn laplace_deviance(
             eta_fixed,
             a_blocks,
             a_rhs,
+            wx,
             pirls_tol_override,
             n,
         )
@@ -271,6 +283,7 @@ pub(crate) fn laplace_deviance(
             structured_schur,
             force_dense_schur,
             a_rhs,
+            wx,
             pirls_tol_override,
             n,
         )
@@ -297,6 +310,7 @@ pub(crate) fn laplace_deviance(
             eta_fixed,
             mu,
             wm,
+            wx,
             a,
             a_chol,
             a_rhs,
@@ -350,6 +364,27 @@ pub(crate) fn laplace_deviance_at(
             *v = 0.0;
         }
     }
+    // Fixed mode: β = ws.beta_rhs (transient scratch, never ws.betas — see
+    // laplace_deviance's doc). `beta_step_rhs` just needs a distinct spare
+    // buffer (inert under Fixed) — ws.beta_prof is it.
+    laplace_deviance_ws(ws, x, y, cluster_ids, n, false)
+}
+
+/// Shared borrow-split body of `laplace_deviance_at` and (test-only)
+/// `glmm_laplace_deviance_profile`: destructures the workspace into the
+/// disjoint borrows `laplace_deviance` needs and calls it. `profile_beta`
+/// selects both `laplace_deviance`'s β mode AND which workspace buffer plays
+/// β vs. the spare `beta_step_rhs` (Fixed: β = `beta_rhs`, spare = `beta_prof`;
+/// Profile: β = `beta_prof`, spare = `beta_rhs` — the two must never alias).
+/// Callers own all u/β seeding — this helper seeds nothing.
+fn laplace_deviance_ws(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    n: usize,
+    profile_beta: bool,
+) -> f64 {
     let family = ws.family;
     let nb_theta = ws.nb_theta;
     let nagq = ws.nagq;
@@ -375,6 +410,7 @@ pub(crate) fn laplace_deviance_at(
         eta_fixed,
         mu,
         wm,
+        wx,
         a,
         a_chol,
         a_llt_mem,
@@ -402,13 +438,18 @@ pub(crate) fn laplace_deviance_at(
         beta_prev,
         ..
     } = ws;
+    let (beta, beta_step_rhs): (&mut [f64], &mut [f64]) = if profile_beta {
+        (beta_prof, beta_rhs)
+    } else {
+        (beta_rhs, beta_prof)
+    };
     laplace_deviance(
         family,
         nb_theta,
         nagq,
         groupings,
         &prm[..],
-        beta_rhs,
+        beta,
         z.as_ref(),
         m,
         lam,
@@ -427,6 +468,7 @@ pub(crate) fn laplace_deviance_at(
         eta_fixed,
         mu,
         wm,
+        wx,
         a,
         a_chol,
         a_llt_mem,
@@ -450,13 +492,9 @@ pub(crate) fn laplace_deviance_at(
         ainv_mtwx,
         schur,
         schur_llt_mem,
-        // FD path is β-FIXED: the FD-Hessian must differentiate a
-        // function of the caller's β, so β cannot move under it. `beta_step_rhs`
-        // just needs a distinct spare buffer (inert in Fixed) — `beta_prof` is it,
-        // since `beta_rhs` is already `beta` above.
-        beta_prof,
+        beta_step_rhs,
         beta_prev,
-        false,
+        profile_beta,
         pirls_tol_override,
         *p,
         n,
@@ -510,112 +548,5 @@ pub(crate) fn glmm_laplace_deviance_profile(
     for v in ws.beta_prof.iter_mut() {
         *v = 0.0;
     }
-    let family = ws.family;
-    let nb_theta = ws.nb_theta;
-    let nagq = ws.nagq;
-    let force_dense_schur = ws.force_dense_schur;
-    let pirls_tol_override = ws.pirls_tol_override;
-    let weighted = ws.weighted;
-    let GlmmWorkspace {
-        groupings,
-        params: prm,
-        beta_rhs,
-        p,
-        z,
-        m,
-        lam,
-        z_buf,
-        m_buf,
-        prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        wm,
-        a,
-        a_chol,
-        a_llt_mem,
-        a_rhs,
-        a_blocks,
-        core_blocks,
-        coupling,
-        schur_blk,
-        m_core_buf,
-        cross_val,
-        cross_col,
-        n_cross,
-        coup_cols,
-        coup_ptr,
-        coup_mask,
-        structured_schur,
-        agq_scratch,
-        cluster_rows,
-        xtwx,
-        xtwm,
-        ainv_mtwx,
-        schur,
-        schur_llt_mem,
-        beta_prof,
-        beta_prev,
-        ..
-    } = ws;
-    laplace_deviance(
-        family,
-        nb_theta,
-        nagq,
-        groupings,
-        &prm[..],
-        beta_prof,
-        z.as_ref(),
-        m,
-        lam,
-        z_buf,
-        m_buf,
-        x,
-        y,
-        &prior_w[..n],
-        weighted,
-        cluster_ids,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        wm,
-        a,
-        a_chol,
-        a_llt_mem,
-        a_rhs,
-        a_blocks,
-        core_blocks,
-        coupling,
-        schur_blk,
-        m_core_buf,
-        cross_val,
-        cross_col,
-        n_cross,
-        coup_cols,
-        coup_ptr,
-        coup_mask,
-        structured_schur.as_mut(),
-        force_dense_schur,
-        agq_scratch,
-        xtwx,
-        xtwm,
-        ainv_mtwx,
-        schur,
-        schur_llt_mem,
-        beta_rhs,
-        beta_prev,
-        true,
-        pirls_tol_override,
-        *p,
-        n,
-        cluster_rows.as_ref(),
-    )
+    laplace_deviance_ws(ws, x, y, cluster_ids, n, true)
 }

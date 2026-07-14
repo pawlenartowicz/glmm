@@ -70,6 +70,7 @@ class Fit:
     aliased: np.ndarray  # (p,) bool — rank-deficient columns dropped (lme4's NA coefficients)
     dispersion: float  # phi (gamma / inverse-gaussian) / theta (negbin) / 1.0 otherwise
     converged: bool
+    singular: bool  # boundary (singular) fit — >=1 variance component pinned at 0; mirrors lme4's isSingular
     names: list  # coefficient names, aligned with beta
 
     def stddev_corr(self, group_idx):
@@ -135,7 +136,9 @@ class Fit:
                 theta_off += q * (q + 1) // 2
 
         lines.append("")
-        lines.append(f"dispersion: {self.dispersion:.6g}   converged: {self.converged}")
+        lines.append(
+            f"dispersion: {self.dispersion:.6g}   converged: {self.converged}   singular: {self.singular}"
+        )
         text = "\n".join(lines)
         print(text)
         return text
@@ -160,6 +163,10 @@ def fit(
     data: dict[str, array-like]; DataFrame / Arrow Table also accepted (duck-typed).
     formula: R-style string, e.g. "y ~ x + z + (1 + x | g)".
     family: gaussian | binomial | poisson | gamma | negativebinomial | inversegaussian.
+    nagq: adaptive Gauss-Hermite quadrature nodes per random-effect dimension
+        (odd, 1..=25; default 1 = Laplace). k>1 applies to binomial/Poisson
+        models with a single grouping factor and q <= 3 random effects per
+        group (temporary cap); any other shape warns and falls back to Laplace.
     See the API spec for the remaining knobs.
     """
     if family not in _FAMILIES:
@@ -272,19 +279,32 @@ def fit(
             [float(v) for v in warm_start.get("theta", [])],
         )
 
-    beta, se, tau2, varcorr, stddev_se, aliased, disp, converged, names = _native.fit(
-        formula,
-        numeric_columns,
-        factor_columns,
-        family,
-        link,
-        wald_se,
-        nagq,
-        dispersion,
-        [float(w) for w in weights] if weights is not None else None,
-        list(targets) if targets is not None else None,
-        warm_start_pair,
+    beta, se, tau2, varcorr, stddev_se, aliased, disp, converged, singular, names, agq_warning = (
+        _native.fit(
+            formula,
+            numeric_columns,
+            factor_columns,
+            family,
+            link,
+            wald_se,
+            nagq,
+            dispersion,
+            [float(w) for w in weights] if weights is not None else None,
+            list(targets) if targets is not None else None,
+            warm_start_pair,
+        )
     )
+    # nagq's shape eligibility (single grouping factor, binomial/Poisson,
+    # q <= 3) is only decidable after the Rust-side formula lowering, so the
+    # §3.5 warn-and-strip for it lives in glmm-python/src/orchestrate.rs; the
+    # message comes back here to be raised as the same UserWarning the
+    # dispersion/theta strips above use.
+    if agq_warning is not None:
+        warnings.warn(agq_warning, stacklevel=2)
+    # lme4 parity (boundary-fits follow-up spec Part B step 4): glmm computes
+    # this flag already (Fit::singular) but never surfaced it as a warning.
+    if singular:
+        warnings.warn("boundary (singular) fit: see help('isSingular')", stacklevel=2)
     # Wrap PyO3's plain-list tuple fields back into the array types Fit's
     # dataclass documents (no numpy Rust dep — the native call returns plain lists).
     return Fit(
@@ -296,5 +316,6 @@ def fit(
         np.asarray(aliased, dtype=bool),
         disp,
         converged,
+        singular,
         names,
     )

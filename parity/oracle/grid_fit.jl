@@ -3,7 +3,7 @@
 # Resume-safe (skips case_ids already in GRID_OUT); eval cap set per cell from
 # the manifest's pre-registered max_fun via optsum.maxfeval. Run inside the
 # pinned env: julia --project=GLMM/parity GLMM/parity/oracle/grid_fit.jl
-using MixedModels, CSV, DataFrames, JSON3
+using MixedModels, CSV, DataFrames, JSON3, LinearAlgebra
 
 const PARITY = normpath(joinpath(@__DIR__, ".."))
 manifest_path = get(ENV, "GRID_MANIFEST", joinpath(PARITY, "manifest_grid.json"))
@@ -20,6 +20,23 @@ isfile(out_path) && for l in eachline(out_path)
 end
 
 const OK_RETURN = Set([:FTOL_REACHED, :XTOL_REACHED, :SUCCESS, :STOPVAL_REACHED])
+
+# Per-reterm Σ = σ² λλᵀ (λ = relative covariance Cholesky factor, m.σ = residual
+# sd), then stddev = sqrt(diag Σ), corr = D⁻¹ΣD⁻¹ — same schema as grid_fit.R's
+# varcomp_of (mirrors lme4's VarCorr: group/terms/stddev/corr) so
+# analyze_diligent.R's stddevs_of/corrs_of read this field unmodified. GLM
+# reterms carry no residual scale (σ folds into the family dispersion, held at
+# 1 upstream of λ) — only called on gaussian LMM cells (boundary-37 spec, Part
+# A), so unconditionally uses m.σ.
+function varcomp_of(m)
+    map(m.reterms) do t
+        sigma = m.σ^2 * t.λ * t.λ'
+        d = sqrt.(diag(sigma))
+        corr = sigma ./ (d * d')
+        (group = string(MixedModels.fname(t)), terms = t.cnames,
+         stddev = collect(d), corr = [collect(r) for r in eachrow(corr)])
+    end
+end
 
 function fit_cell(cell)
     df = CSV.read(joinpath(PARITY, "data_simulated", "grid", string(cell.case_id, ".csv")), DataFrame)
@@ -58,7 +75,10 @@ function fit_cell(cell)
     # compile_seconds is recorded as PROOF the timed fit was hot — analysis
     # hard-stops on nonzero — never as a subtraction/correction.
     dofit!(build())
-    m = build()
+    # wall_seconds = model build + θ-solve, so it stays comparable to glmm's
+    # wall (which folds its own O(N) suff-stats build into the fit). The two are
+    # no longer reported apart — the build/solve split diagnostic was retired.
+    build_seconds = @elapsed (m = build())
     t = @timed dofit!(m)
     conv = m.optsum.returnvalue in OK_RETURN
     status = m.optsum.returnvalue == :MAXEVAL_REACHED ? "maxeval" :
@@ -73,7 +93,9 @@ function fit_cell(cell)
      theta = collect(m.θ),
      re_groups = [string(MixedModels.fname(t)) for t in m.reterms],
      re_qs = [size(t.λ, 1) for t in m.reterms],
-     status = status, wall_seconds = t.time, compile_seconds = t.compile_time)
+     varcomp = fam == "gaussian" ? varcomp_of(m) : NamedTuple[],
+     status = status,
+     wall_seconds = build_seconds + t.time, compile_seconds = t.compile_time)
 end
 
 open(out_path, "a") do io
@@ -91,6 +113,7 @@ open(out_path, "a") do io
                          singular = false, deviance = nothing,
                          beta = Float64[], se = Float64[],
                          theta = Float64[], re_groups = String[], re_qs = Int[],
+                         varcomp = NamedTuple[],
                          status = "engine-fail", wall_seconds = 0.0))
         end
         println(io, JSON3.write(rec))

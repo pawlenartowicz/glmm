@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use glmm::{fit_warm, StartValues, WaldSe};
+use glmm::{fit_warm, Family, StartValues, WaldSe};
 use glmm_formula::{lower, Column, Table};
 
 use crate::convert::family_from_str;
@@ -21,23 +21,36 @@ pub struct FitResult {
     pub aliased: Vec<bool>,
     pub dispersion: f64,
     pub converged: bool,
+    /// `true` iff the fit converged onto a variance-component boundary
+    /// (mirrors `glmm::Fit::singular` / lme4's `isSingular`) — boundary-fits
+    /// follow-up spec Part B step 4 (docs/GLMM/plans/2026-07-14-boundary-
+    /// fits-followup-spec.md): the flag was already computed but never
+    /// surfaced through this wrapper.
+    pub singular: bool,
     pub names: Vec<String>,
+    /// §3.5 warn-and-strip message for an ineligible-shape `nagq>1` (the fit
+    /// proceeded with Laplace); surfaced by `glmm.fit` as a `UserWarning`.
+    pub agq_warning: Option<String>,
 }
 
+/// `FitResult` flattened for the PyO3 return — field order matches the
+/// unpacking in `glmm/__init__.py::fit`.
+pub type FitTuple = (
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<Vec<f64>>,
+    Vec<f64>,
+    Vec<bool>,
+    f64,
+    bool,
+    bool,
+    Vec<String>,
+    Option<String>,
+);
+
 impl FitResult {
-    pub fn into_tuple(
-        self,
-    ) -> (
-        Vec<f64>,
-        Vec<f64>,
-        Vec<f64>,
-        Vec<Vec<f64>>,
-        Vec<f64>,
-        Vec<bool>,
-        f64,
-        bool,
-        Vec<String>,
-    ) {
+    pub fn into_tuple(self) -> FitTuple {
         (
             self.beta,
             self.se,
@@ -47,7 +60,9 @@ impl FitResult {
             self.aliased,
             self.dispersion,
             self.converged,
+            self.singular,
             self.names,
+            self.agq_warning,
         )
     }
 }
@@ -114,6 +129,35 @@ pub fn run_fit(
         "rx" => WaldSe::Rx,
         other => return Err(format!("unsupported wald_se {other:?}")),
     };
+    // nagq>1 on an ineligible shape is valid-but-inapplicable — warn-and-strip
+    // (the Python layer's §3.5 policy: nothing inapplicable may reach the
+    // kernel, whose shape check is an `assert!`, and a Rust panic across the
+    // FFI is not an acceptable user error). The shape is only knowable here,
+    // after `lower()`, so this is the strip site; `glmm.fit` emits the message
+    // as a `UserWarning`. Eligibility mirrors
+    // `src/fit/common.rs::assert_model_shape` — change together: nagq>1 needs
+    // a mixed binomial/Poisson model with a single grouping factor and
+    // q_p = 1 + #slopes ≤ 3 (the temporary cost/oracle cap).
+    let mut nagq = nagq;
+    let mut agq_warning: Option<String> = None;
+    if nagq > 1 {
+        let agq_family = matches!(fam, Family::Binomial { .. } | Family::Poisson { .. });
+        let eligible = match lowered.model.re.as_ref() {
+            Some(re) => {
+                let q_p = 1 + re.slopes.len(); // intercept + slopes, as in assert_model_shape
+                agq_family && re.extra_groupings.is_empty() && q_p <= 3
+            }
+            None => false,
+        };
+        if !eligible {
+            agq_warning = Some(format!(
+                "nagq={nagq} (adaptive quadrature) applies only to binomial/Poisson \
+                 mixed models with a single grouping factor and at most 3 random \
+                 effects per group; fitting with Laplace (nagq=1)"
+            ));
+            nagq = 1;
+        }
+    }
     lowered.opts.nagq = nagq;
     lowered.opts.dispersion = dispersion;
     lowered.opts.weights = weights;
@@ -155,7 +199,9 @@ pub fn run_fit(
         aliased: fit.aliased,
         dispersion: fit.dispersion,
         converged: fit.converged,
+        singular: fit.singular,
         names: lowered.col_names,
+        agq_warning,
     })
 }
 
@@ -215,26 +261,35 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_weights_shape_becomes_a_clean_error_not_a_process_abort() {
-        let (numeric, factor) = toy_ols();
-        let err = run_fit(
-            "y ~ x",
+    fn ineligible_nagq_is_stripped_with_a_warning_not_an_error() {
+        // Gaussian LMM with nagq=3: ineligible family — must strip to Laplace
+        // and report the §3.5 warning, never surface the kernel's shape panic.
+        let (numeric, mut factor) = toy_ols();
+        factor.insert(
+            "g".to_string(),
+            ["a", "b", "c", "d", "e"]
+                .iter()
+                .cycle()
+                .take(10)
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let result = run_fit(
+            "y ~ x + (1 | g)",
             numeric,
             factor,
             "gaussian",
             "identity",
             "hessian",
-            1,
+            3,
             None,
-            Some(vec![1.0; 10]),
+            None,
             None,
             None,
         )
-        .unwrap_err();
-        // The kernel's boundary fault is an `assert!` (a real panic); this test
-        // proves catch_unwind converts it into a normal Err instead of aborting
-        // the test process.
-        assert!(err.contains("weights"), "{err}");
+        .expect("ineligible nagq must be stripped, not an error");
+        let msg = result.agq_warning.as_deref().expect("warning expected");
+        assert!(msg.contains("nagq=3"), "{msg}");
     }
 
     #[test]

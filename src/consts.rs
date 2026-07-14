@@ -45,7 +45,11 @@ pub const MAX_THETA: usize = MAX_PRIMARY_Q * (MAX_PRIMARY_Q + 1) / 2
 pub const MAX_CROSSED_LEVELS: usize = 500;
 
 /// Max adaptive Gauss–Hermite node count for `nAGQ>1`. Odd nodes
-/// only; the GH table below covers orders `1,3,…,MAX_NAGQ`.
+/// only; the GH table below covers orders `1,3,…,MAX_NAGQ`. Uniform across the
+/// scalar and vector (`agq::agq_deviance_vec`, q_p≤3) AGQ paths: the vector path
+/// uses a `k^q` **product** grid, so k=25 at q=3 is 15,625 nodes/cluster/eval —
+/// legal but self-punishing; the k^q cost is the user's to pay (the q_p≤3 cap in
+/// `assert_model_shape` bounds the exponent).
 pub const MAX_NAGQ: u8 = 25;
 
 // --- Gauss–Hermite quadrature table (physicists', weight e^{-x²}) ------------

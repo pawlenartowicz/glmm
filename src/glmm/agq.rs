@@ -3,7 +3,9 @@
 //! product of independent 1-D cluster integrals, so AGQ is a per-cluster k-node
 //! sum with no curse of dimensionality. Replaces the Laplace `+log|A|` curvature
 //! term with a Liu–Pierce (1994) adaptive GH sum centered at each cluster's PIRLS
-//! mode/curvature.
+//! mode/curvature. The sibling kernel [`agq_deviance_vec`] extends this one
+//! dimension up — a **vector** RE (`q_p ∈ 2..=3`) on a single grouping factor,
+//! integrated over a `k^q` product grid; the scalar kernel stays untouched.
 //!
 //! `nAGQ=1` is the Laplace term exactly (the k=1 node sits at the mode with GH
 //! weight √π), so the production path routes `nagq==1` to `laplace_deviance`
@@ -83,7 +85,7 @@ impl ClusterRowIndex {
 /// integrand must match — a b-scale prior `−½u²/τ²` or dropping `λ` breaks the
 /// k=1≡Laplace reduction for `τ²≠1`):
 /// ```text
-///   ℓ_c(u)     = Σ_{i∈c} −½·dev_resid(family, y_i, g⁻¹(η_fix,i + λ·u)) − ½u²
+///   ℓ_c(u)     = Σ_{i∈c} −½·w_i·dev_resid(family, y_i, g⁻¹(η_fix,i + λ·u)) − ½u²
 ///   −2 log L_c = −2·ℓ_c(ũ_c) − 2·log σ_c
 ///              − 2·log[ (1/√π)·Σ_j w_j·exp(z_j² + ℓ_c(u_cj) − ℓ_c(ũ_c)) ]
 /// ```
@@ -104,6 +106,7 @@ pub(crate) fn agq_deviance(
     x: MatRef<f64>,
     y: &[f64],
     prior_w: &[f64],
+    weighted: bool,
     cluster_ids: &[u32],
     eta: &mut [f64],
     prob: &mut [f64],
@@ -113,6 +116,10 @@ pub(crate) fn agq_deviance(
     eta_fixed: &mut [f64],
     a_blocks: &mut [f64],
     a_rhs: &mut [f64],
+    // AGQ is always `BetaStep::Fixed`, so `pirls_solve_blocked`'s Profile-only
+    // C = X'WX GEMM never runs here — this is just uniform plumbing across the
+    // three PIRLS variants.
+    wx: &mut faer::Mat<f64>,
     agq_scratch: &mut [f64],
     nagq: u8,
     pirls_tol_override: Option<f64>,
@@ -127,10 +134,11 @@ pub(crate) fn agq_deviance(
     // caller's Fixed-mode buffer = params[n_theta..]; leaves prob = g⁻¹ at the mode,
     // a_blocks[c] = √A_c). AGQ is always β-fixed, so pass `BetaStep::Fixed` explicitly.
     crate::lmm::primary_lambda(&params[..n_theta], groupings.primary_q, lam);
-    // AGQ (nagq>1) is gated closed for weighted fits (see the boundary-gate
-    // capability map in `fit.rs`) — `weighted` is unconditionally `false` here;
-    // `prior_w` still threads through so the callee's signature is uniform
-    // across the three PIRLS variants.
+    // `weighted` threads through to PIRLS so the converged mode ũ_c and curvature
+    // A_c fold in the prior weights: on the logit-binomial fast path (a `!weighted`
+    // match arm in pirls.rs) an unweighted flag would skip `prior_w` entirely and
+    // give an unweighted mode/scale, wrong for aggregated-binomial cells. Poisson/
+    // probit fold `prior_w` regardless, but the flag must still be correct.
     let (_dev, _pen, _logdet, conv) = pirls_solve_blocked(
         family,
         nb_theta,
@@ -139,7 +147,7 @@ pub(crate) fn agq_deviance(
         x,
         y,
         prior_w,
-        false,
+        weighted,
         beta,
         BetaStep::Fixed,
         lam,
@@ -153,6 +161,7 @@ pub(crate) fn agq_deviance(
         eta_fixed,
         a_blocks,
         a_rhs,
+        wx,
         pirls_tol_override,
         n,
     );
@@ -179,7 +188,9 @@ pub(crate) fn agq_deviance(
     }
     for i in 0..n {
         let c = cluster_ids[i] as usize;
-        ctr[c] -= 0.5 * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
+        // w_i·dev_resid: prior_w[i] is exactly 1.0 on the unweighted path (workspace
+        // init), and x·1.0 is bit-exact, so unweighted stays byte-identical.
+        ctr[c] -= 0.5 * prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
     }
 
     // GH sum over nodes. σ_c = 1/√A_c = 1/a_blocks[c] (the 1×1 Cholesky factor).
@@ -192,17 +203,6 @@ pub(crate) fn agq_deviance(
     let u_ro: &[f64] = u;
     let a_blocks_ro: &[f64] = a_blocks;
     let ctr_ro: &[f64] = ctr;
-    // ln(w_j·e^{z_j²}) per node — the Liu–Pierce reweight, a function of the GH
-    // table only. Filled once (k ≤ MAX_NAGQ, stack buffer — no alloc on the hot
-    // path) so the cluster-outer arm reads it instead of recomputing per
-    // (cluster, node): that recomputation cost s·k ln() calls per eval and was
-    // the dominant cluster-outer overhead on many-tiny-cluster shapes. Same
-    // operands, deterministic — bit-identical to the inline form.
-    let mut ln_wj_buf = [0.0f64; crate::consts::MAX_NAGQ as usize];
-    for (j, (&zj, &wj)) in nodes.iter().zip(wts).enumerate() {
-        ln_wj_buf[j] = wj.ln() + zj * zj;
-    }
-    let ln_wj_ro: &[f64] = &ln_wj_buf[..k];
     match cluster_rows {
         // Cluster-outer: per cluster, same node order and (via the CSR's
         // ascending-row guarantee) same per-accumulator operand order as the
@@ -210,6 +210,19 @@ pub(crate) fn agq_deviance(
         // glmer(nAGQ=k) goldens re-validate nothing. Rows stay cache-hot per
         // cluster instead of k full n-sweeps.
         Some(idx) => {
+            // ln(w_j·e^{z_j²}) per node — the Liu–Pierce reweight, a function of
+            // the GH table only. Filled once (k ≤ MAX_NAGQ, stack buffer — no
+            // alloc on the hot path) so this arm reads it instead of
+            // recomputing per (cluster, node): that recomputation cost s·k
+            // ln() calls per eval and was the dominant cluster-outer overhead
+            // on many-tiny-cluster shapes. Same operands, deterministic —
+            // bit-identical to the inline form (only reader — the node-outer
+            // `None` arm below recomputes `ln_wj` per node instead).
+            let mut ln_wj_buf = [0.0f64; crate::consts::MAX_NAGQ as usize];
+            for (j, (&zj, &wj)) in nodes.iter().zip(wts).enumerate() {
+                ln_wj_buf[j] = wj.ln() + zj * zj;
+            }
+            let ln_wj_ro: &[f64] = &ln_wj_buf[..k];
             // Per-cluster closure: reads shared slices, writes only its own sum slot —
             // deterministic under any thread schedule, so parallel == serial bitwise.
             let per_cluster = |c: usize, sum_c: &mut f64| {
@@ -223,7 +236,8 @@ pub(crate) fn agq_deviance(
                     for &i in rows {
                         let i = i as usize;
                         let mu = crate::family::link_inv(family, eta_fixed_ro[i] + lambda * u_cj);
-                        acc_c -= 0.5 * crate::family::dev_resid(family, nb_theta, y[i], mu);
+                        acc_c -=
+                            0.5 * prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], mu);
                     }
                     acc_sum += (ln_wj + acc_c - ctr_ro[c]).exp();
                 }
@@ -254,7 +268,8 @@ pub(crate) fn agq_deviance(
                 for i in 0..n {
                     let c = cluster_ids[i] as usize;
                     let mu = crate::family::link_inv(family, eta_fixed[i] + lambda * ucj[c]);
-                    acc[c] -= 0.5 * crate::family::dev_resid(family, nb_theta, y[i], mu);
+                    acc[c] -=
+                        0.5 * prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], mu);
                 }
                 for c in 0..s {
                     sum[c] += (ln_wj + acc[c] - ctr[c]).exp();
@@ -272,10 +287,269 @@ pub(crate) fn agq_deviance(
     dev
 }
 
-/// Test-only: drive `agq_deviance` from a `&[f64]` params (mirrors
-/// `deviance::glmm_laplace_deviance`). Forces the AGQ path at the given `nagq`
-/// regardless of the production gate, so the k=1≡Laplace reduction can be
-/// asserted directly against `glmm_laplace_deviance`.
+/// Multivariate AGQ deviance for the **vector**-RE (`q_p ∈ 2..=3`, single
+/// grouping factor, no extras) binomial/Poisson GLMM at `(θ,β)=params` — the
+/// dimension-up sibling of [`agq_deviance`], reached via the widened
+/// `deviance.rs` gate for `q_p ≥ 2`. Converges each cluster's `q_p`-vector
+/// conditional mode `ũ_c` and curvature `A_c` with the same blocked PIRLS the
+/// Laplace path uses, then integrates the conditional likelihood over a `k=nagq`
+/// **product** Gauss–Hermite grid (`k^q` nodes/cluster), combined by
+/// log-sum-exp.
+///
+/// Returns the AGQ deviance `−2·Σ_c log L_c` with the saturated and `2π`
+/// constants dropped (the deviance convention), so it equals `laplace_deviance`
+/// at `k=1`. Non-convergence ⇒ `f64::INFINITY`.
+///
+/// **Convention.** Multivariate Liu–Pierce (1994) adaptive GHQ, standardized
+/// u-scale (prior `u_c ~ N(0, I_q)`, `η = Xβ + Z_c·Λ_p·u_c` with `Λ_p` the
+/// lower-triangular `primary_lambda` factor), **product** grid only (`k^q`
+/// nodes; Smolyak deferred), **odd** `k` (a node at the mode ⇒ the k=1≡Laplace
+/// reduction). Binomial/Poisson only (NB/Gamma deferred). Adaptive transform per
+/// cluster: `u_cj = ũ_c + √2·L_cᵀ⁻¹·z_j`, `L_c` = the `q×q` Cholesky factor of
+/// `A_c` (`glmm_block_chol`'s per-block output, reused as-is). Per node the
+/// generalizations from the scalar path are all direct — `η_i` per row is
+/// `eta_fixed[i] + z_i·(Λ_p·u_cj)`; the Liu–Pierce reweight is the log-space sum
+/// `Σ_d (ln w_{j_d} + z_{j_d}²)`; the normalization is `q·ln√π`; the scale term
+/// is `−Σ_r ln L_c[r,r] = −½ log|A_c|`.
+/// ```text
+///   ℓ_c(u)     = Σ_{i∈c} −½·w_i·dev_resid(family, y_i, g⁻¹(η_i(u))) − ½‖u‖²
+///   −2 log L_c = −2·ℓ_c(ũ_c) − 2·(−Σ_r ln L_c[r,r])
+///              − 2·log[ (1/√π)^q · Σ_j exp( ln_wj + ℓ_c(u_cj) − ℓ_c(ũ_c) ) ]
+/// ```
+/// At `k=1` the single node is `z=0, ln_wj=q·ln√π`, so the bracket is
+/// `log((1/√π)^q·√π^q)=0` and what remains is `−2ℓ_c(ũ_c)+log|A_c|` — the Laplace
+/// term. The k=1≡Laplace reduction is asserted `rel<1e-12` for q=2 and q=3 in
+/// `glmm::tests`; serial≡parallel and k-convergence self-consistency likewise.
+///
+/// **Oracle.** Validated against **GLMMadaptive** (`mixed_model(nAGQ=k)`) — lme4
+/// `glmer` refuses `nAGQ>1` for vector REs, so it covers only the scalar rungs.
+/// See `docs/GLMM/plans/2026-07-12-full-agq-vector-re-spec.md` Part 4.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agq_deviance_vec(
+    family: Family,
+    nb_theta: f64,
+    groupings: &LmmGroupings,
+    params: &[f64],
+    beta: &mut [f64],
+    lam: &mut [f64],
+    z_buf: &[f64],
+    m_buf: &mut [f64],
+    x: MatRef<f64>,
+    y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
+    cluster_ids: &[u32],
+    eta: &mut [f64],
+    prob: &mut [f64],
+    w: &mut [f64],
+    u: &mut [f64],
+    u_prev: &mut [f64],
+    eta_fixed: &mut [f64],
+    a_blocks: &mut [f64],
+    a_rhs: &mut [f64],
+    wx: &mut faer::Mat<f64>,
+    agq_scratch: &mut [f64],
+    nagq: u8,
+    pirls_tol_override: Option<f64>,
+    n: usize,
+    cluster_rows: Option<&ClusterRowIndex>,
+) -> f64 {
+    let n_theta = groupings.n_theta();
+    let s = groupings.n_primary;
+    let q = groupings.primary_q; // 2 or 3 (gate-enforced)
+                                 // Converge ũ_c / A_c via the same blocked PIRLS the Laplace path uses; leaves
+                                 // prob = g⁻¹ at the mode, a_blocks[c] = the q×q Cholesky factor L_c of A_c.
+                                 // AGQ is always β-fixed; `weighted` folds prior weights into the mode/curvature
+                                 // (see agq_deviance for why the flag must be correct on the logit fast path).
+    crate::lmm::primary_lambda(&params[..n_theta], q, lam);
+    let (_dev, _pen, _logdet, conv) = pirls_solve_blocked(
+        family,
+        nb_theta,
+        groupings,
+        cluster_ids,
+        x,
+        y,
+        prior_w,
+        weighted,
+        beta,
+        BetaStep::Fixed,
+        lam,
+        z_buf,
+        m_buf,
+        eta,
+        prob,
+        w,
+        u,
+        u_prev,
+        eta_fixed,
+        a_blocks,
+        a_rhs,
+        wx,
+        pirls_tol_override,
+        n,
+    );
+    if !conv {
+        return f64::INFINITY;
+    }
+    let k = nagq as usize;
+    let blk = crate::consts::GH_OFFSETS[(k - 1) / 2];
+    let nodes = &crate::consts::GH_NODES[blk..blk + k];
+    let wts = &crate::consts::GH_WEIGHTS[blk..blk + k];
+    let ln_sqrt_pi = 0.5 * std::f64::consts::PI.ln();
+    let kq = k.pow(q as u32);
+
+    // Scratch: ctr_c = ℓ_c(ũ_c) (s) | running Σ_j (s) | product-grid node table
+    // (k^q·(q+1): the q z-vector components + the summed Liu–Pierce reweight per
+    // node). Per-cluster temporaries (u_cj, v_cj) are [f64;3] stack arrays.
+    let (ctr, rest) = agq_scratch.split_at_mut(s);
+    let (sum, node_tbl) = rest.split_at_mut(s);
+    let node_tbl = &mut node_tbl[..kq * (q + 1)];
+
+    // Hoist the k^q node table once per eval (parameter-independent within an
+    // eval), shared read-only across clusters — generalizes the scalar ln_wj_buf
+    // hoist. Multi-index t = (j_0,…,j_{q-1}) base k; store the z-vector then
+    // ln_wj = Σ_d (ln w_{j_d} + z_{j_d}²) (the product rule is a log-space sum).
+    for t in 0..kq {
+        let base = t * (q + 1);
+        let mut rem = t;
+        let mut ln_wj = 0.0;
+        for d in 0..q {
+            let jd = rem % k;
+            rem /= k;
+            let zj = nodes[jd];
+            node_tbl[base + d] = zj;
+            ln_wj += wts[jd].ln() + zj * zj;
+        }
+        node_tbl[base + q] = ln_wj;
+    }
+
+    // ctr_c = ℓ_c(ũ_c): RE prior −½‖ũ_c‖², then Σ_{i∈c} −½·dev_resid at the mode
+    // (prob[i] already holds g⁻¹ at the converged η).
+    for c in 0..s {
+        let ubase = c * q;
+        let mut acc = 0.0;
+        for r in 0..q {
+            acc -= 0.5 * u[ubase + r] * u[ubase + r];
+        }
+        ctr[c] = acc;
+        sum[c] = 0.0;
+    }
+    for i in 0..n {
+        let c = cluster_ids[i] as usize;
+        // w_i·dev_resid; prior_w[i]==1.0 exactly on the unweighted path ⇒ byte-identical.
+        ctr[c] -= 0.5 * prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
+    }
+
+    // Shared read-only reborrows for the parallel closure (rayon needs Sync
+    // captures; `&mut [f64]` isn't Sync). The per-cluster body only reads these.
+    let lam_ro: &[f64] = lam;
+    let eta_fixed_ro: &[f64] = eta_fixed;
+    let u_ro: &[f64] = u;
+    let a_blocks_ro: &[f64] = a_blocks;
+    let ctr_ro: &[f64] = ctr;
+    let node_tbl_ro: &[f64] = node_tbl;
+    // Per-cluster integral: reads shared slices, writes only its own `sum` slot —
+    // deterministic under any thread schedule ⇒ parallel == serial bitwise.
+    let per_cluster = |idx: &ClusterRowIndex, c: usize, sum_c: &mut f64| {
+        let rows = idx.cluster_rows(c);
+        let lblk = &a_blocks_ro[c * q * q..c * q * q + q * q]; // L_c (row-major lower)
+        let ubase = c * q;
+        let mut acc_sum = 0.0;
+        for t in 0..kq {
+            let nbase = t * (q + 1);
+            let znode = &node_tbl_ro[nbase..nbase + q];
+            let ln_wj = node_tbl_ro[nbase + q];
+            // u_cj = ũ_c + √2·L_cᵀ⁻¹·z_j: back-solve L_cᵀ·w = z (upper-tri), then
+            // shift/scale. L_cᵀ[r][cc] = L_c[cc][r] = lblk[cc·q + r].
+            let mut u_cj = [0.0f64; 3];
+            for r in (0..q).rev() {
+                let mut v = znode[r];
+                for cc in (r + 1)..q {
+                    v -= lblk[cc * q + r] * u_cj[cc];
+                }
+                u_cj[r] = v / lblk[r * q + r];
+            }
+            for r in 0..q {
+                u_cj[r] = u_ro[ubase + r] + std::f64::consts::SQRT_2 * u_cj[r];
+            }
+            // v_cj = Λ_p·u_cj (Λ_p lower-tri row-major = lam): v[r] = Σ_{cc≤r} lam[r·q+cc]·u_cj[cc].
+            let mut v_cj = [0.0f64; 3];
+            for r in 0..q {
+                let mut vv = 0.0;
+                for cc in 0..=r {
+                    vv += lam_ro[r * q + cc] * u_cj[cc];
+                }
+                v_cj[r] = vv;
+            }
+            // ℓ_c(u_cj): RE prior −½‖u_cj‖², then the per-row deviance at η_i =
+            // eta_fixed[i] + z_i·v_cj (z_i = [1, z_buf row]).
+            let mut acc_c = 0.0;
+            for &uc in &u_cj[..q] {
+                acc_c -= 0.5 * uc * uc;
+            }
+            for &i in rows {
+                let i = i as usize;
+                let mut eta_i = eta_fixed_ro[i] + v_cj[0]; // z_i0 = 1
+                for d in 0..q - 1 {
+                    eta_i += z_buf[i * (q - 1) + d] * v_cj[d + 1];
+                }
+                let mu = crate::family::link_inv(family, eta_i);
+                acc_c -= 0.5 * prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], mu);
+            }
+            acc_sum += (ln_wj + acc_c - ctr_ro[c]).exp();
+        }
+        *sum_c = acc_sum;
+    };
+    match cluster_rows {
+        // Prebuilt CSR (parallel_inner): rayon-parallel under the feature, serial
+        // otherwise. Cluster-outer either way.
+        Some(idx) => {
+            #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+            {
+                use rayon::prelude::*;
+                sum[..s]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(c, sc)| per_cluster(idx, c, sc));
+            }
+            #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+            for (c, sc) in sum[..s].iter_mut().enumerate() {
+                per_cluster(idx, c, sc);
+            }
+        }
+        // Serial fallback (no prebuilt CSR — FD-Hessian workers, serial builds).
+        // The vector kernel is cluster-outer only (no node-outer variant: at
+        // 49–729 nodes/cluster it is the sole sensible shape), so build a
+        // transient index here — O(n), negligible against the k^q·n node sweeps.
+        // Same `build` ⇒ same ascending-row ordering as the `Some` arm, so the
+        // result is bit-identical.
+        None => {
+            let idx = ClusterRowIndex::build(cluster_ids, s);
+            for (c, sc) in sum[..s].iter_mut().enumerate() {
+                per_cluster(&idx, c, sc);
+            }
+        }
+    }
+
+    // −2·Σ_c [ ℓ_c(ũ_c) − Σ_r ln L_c[r,r] + log((1/√π)^q·Σ_j …) ].
+    let mut dev = 0.0;
+    let q_ln_sqrt_pi = q as f64 * ln_sqrt_pi;
+    for c in 0..s {
+        let lblk = &a_blocks[c * q * q..c * q * q + q * q];
+        let mut log_scale = 0.0; // −Σ_r ln L_c[r,r] = −½ log|A_c|
+        for r in 0..q {
+            log_scale -= lblk[r * q + r].ln();
+        }
+        dev += -2.0 * (ctr[c] + log_scale + sum[c].ln() - q_ln_sqrt_pi);
+    }
+    dev
+}
+
+/// Test-only: drive `agq_deviance`/`agq_deviance_vec` from a `&[f64]` params
+/// (mirrors `deviance::glmm_laplace_deviance`). Routes by `q_p` exactly as the
+/// production gate does (`q_p==1`→scalar, `q_p∈2..=3`→vector). Forces the AGQ
+/// path at the given `nagq` regardless of the production gate, so the
+/// k=1≡Laplace reduction can be asserted directly against `glmm_laplace_deviance`.
 #[cfg(test)]
 pub(crate) fn glmm_agq_deviance(
     params: &[f64],
@@ -293,6 +567,7 @@ pub(crate) fn glmm_agq_deviance(
     }
     let family = ws.family;
     let nb_theta = ws.nb_theta;
+    let weighted = ws.weighted;
     let super::workspace::GlmmWorkspace {
         groupings,
         params: prm,
@@ -310,6 +585,7 @@ pub(crate) fn glmm_agq_deviance(
         eta_fixed,
         a_blocks,
         a_rhs,
+        wx,
         agq_scratch,
         cluster_rows,
         ..
@@ -319,7 +595,12 @@ pub(crate) fn glmm_agq_deviance(
     // is the fit's reported output).
     let nt = groupings.n_theta();
     beta_rhs[..*p].copy_from_slice(&prm[nt..nt + *p]);
-    agq_deviance(
+    let kernel = if groupings.primary_q == 1 {
+        agq_deviance
+    } else {
+        agq_deviance_vec
+    };
+    kernel(
         family,
         nb_theta,
         groupings,
@@ -331,6 +612,7 @@ pub(crate) fn glmm_agq_deviance(
         x,
         y,
         &prior_w[..n],
+        weighted,
         cluster_ids,
         eta,
         prob,
@@ -340,6 +622,7 @@ pub(crate) fn glmm_agq_deviance(
         eta_fixed,
         a_blocks,
         a_rhs,
+        wx,
         agq_scratch,
         nagq,
         None,

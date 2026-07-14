@@ -59,15 +59,17 @@ The stable surface is [`fit_cold`]/[`fit_warm`] + `ModelSpec` + `GroupIds`.
 | Model                      | Fixed-only (`re: None`) | Mixed (`re: Some`)                                          |
 |-----------------------------|--------------------------|---------------------------------------------------------------|
 | Gaussian                    | OLS                      | LMM — dense, or sparse-Z when an extra grouping carries a random slope |
-| Binomial (logit/probit)     | GLM                      | GLMM — dense only                                              |
-| Poisson (log)                | GLM                      | GLMM — dense only                                              |
-| Gamma (log/inverse)          | GLM                      | GLMM — dense only                                              |
-| Negative-Binomial (log)      | GLM                      | GLMM — dense only                                              |
+| Binomial (logit/probit)     | GLM                      | GLMM — dense, or sparse-Z over-envelope                          |
+| Poisson (log)                | GLM                      | GLMM — dense, or sparse-Z over-envelope                          |
+| Gamma (log/inverse)          | GLM                      | GLMM — dense, or sparse-Z over-envelope                          |
+| Negative-Binomial (log)      | GLM                      | GLMM — dense, or sparse-Z over-envelope                          |
 
-A mixed non-Gaussian model that falls outside the dense solver's envelope
-(too many extra groupings, or an extra grouping too wide) is not yet
-implemented and panics rather than silently misrouting — see
-[`TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md) for the exact envelope.
+Every wired family fits through both routes — there is no reachable panic for
+falling outside the dense solver's envelope (too many extra groupings, or an
+extra grouping too wide); classification just routes to the sparse-Z solver
+instead. See [`TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md) and
+[`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md) for the
+dense/sparse routing envelope.
 
 The `loop_advanced` cargo feature (off by default) exposes an unstable
 scratch-explicit hot-path surface for warm-start callers like MCPower's

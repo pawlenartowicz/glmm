@@ -67,9 +67,9 @@ flowchart TD
     C -->|"otherwise"| GP["general family elimination"]
 ```
 
-**Code**: `classify_design`, `fit_mle`, `fit_mle_sparse` (`src/fit.rs`);
+**Code**: `classify_design`, `fit_mle` (`src/fit.rs`);
 `fit_lmm`, `reml_deviance`, `reml_deviance_blocked`, `precompute_balanced_collapse`
-(`src/lmm.rs`); `sparse_reml_deviance` (`src/sparse.rs`); caps in `src/consts.rs`.
+(`src/lmm.rs`); `fit_mle_sparse`, `sparse_reml_deviance` (`src/sparse.rs`); caps in `src/consts.rs`.
 **Convention**: the NoZ/Sparse split is a scratch-capacity boundary, not a model
 limit — lme4 and MixedModels.jl fit any of these designs with one solver; `glmm`
 picks the faster kernel per shape and both give the same REML fit.
@@ -220,7 +220,7 @@ diagnostics from that same dense path.
 default `nloptwrap`/`bobyqa` optimiser for `lmer`. **Validation**: sleepstudy
 (`n_θ = 3`, correlated slope), Penicillin (crossed), Pastes (nested) drive the
 general elimination; sim_slope_extra drives the sparse variant. The tuning
-constants were swept against the 21-rung parity corpus (of which the 9 landed
+constants were swept against the 24-rung parity corpus (of which the 23 landed
 rungs are green).
 
 ## Boundary handling (PIN_THETA)
@@ -273,7 +273,7 @@ The parity harness (`parity/`) fits the same model on the same CSV with lme4,
 MixedModels.jl, and `glmm`, and gates β and varcomp std-devs at relative ~1e-3,
 the LMM `se` at ~1e-3, and the REML loglik at absolute ~1e-6. The committed data
 plus the reference JSONs are the frozen oracle: on any disagreement `glmm` is
-presumed wrong. Of the 21 roadmap rungs, the landed Gaussian LMM rungs are:
+presumed wrong. Of the 24 roadmap rungs, the core Gaussian LMM rungs are:
 
 | Rung | Dataset | Structure | Path exercised |
 |---|---|---|---|
@@ -285,9 +285,9 @@ presumed wrong. Of the 21 roadmap rungs, the landed Gaussian LMM rungs are:
 
 Further Gaussian rungs in the corpus (Machines `q = 3`, Oats real nesting, cake
 interaction grouping, sim_three_level, sim_max_q_slope at the `q = 8`
-`MAX_PRIMARY_Q` boundary, sim_unbalanced_nested, sim_nested_crossed_mix) are
-designed but **not yet fit** — they exercise the same kernels and are listed here
-only so their absence from the validated set is explicit.
+`MAX_PRIMARY_Q` boundary, sim_unbalanced_nested, sim_nested_crossed_mix) have
+since **landed and are green** — they exercise the same kernels through the same
+gates.
 
 ## References
 

@@ -28,17 +28,7 @@ fn fit(
     weights: Option<Vec<f64>>,
     targets: Option<Vec<String>>,
     warm_start: Option<(Vec<f64>, Vec<f64>)>,
-) -> PyResult<(
-    Vec<f64>,
-    Vec<f64>,
-    Vec<f64>,
-    Vec<Vec<f64>>,
-    Vec<f64>,
-    Vec<bool>,
-    f64,
-    bool,
-    Vec<String>,
-)> {
+) -> PyResult<orchestrate::FitTuple> {
     orchestrate::run_fit(
         formula,
         numeric_columns,

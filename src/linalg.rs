@@ -1,26 +1,29 @@
 //! Linear-algebra primitives shared by the sim and fit layers.
 
-/// Lower Cholesky factor of a symmetric PSD `q×q` matrix (row-major in/out).
-/// validate() guarantees PSD, so a zero pivot is treated as exact 0 (its
-/// below-diagonal column entries become 0).
-pub fn chol_lower(a: &[f64], q: usize) -> Vec<f64> {
-    let mut l = vec![0.0f64; q * q];
+/// In-place lower Crout Cholesky of a `q×q` block stored row-major in `blk`
+/// (lower triangle read; on return the lower triangle holds L). Returns false on
+/// a non-positive pivot — the module's failure surface. Shared by the GLMM
+/// block solver (`glmm::workspace::glmm_block_chol` call sites) and the LMM
+/// per-family factor in `lmm::reml_deviance`.
+#[inline]
+pub(crate) fn block_chol(blk: &mut [f64], q: usize) -> bool {
     for j in 0..q {
-        let mut diag = a[j * q + j];
+        let mut d = blk[j * q + j];
         for k in 0..j {
-            diag -= l[j * q + k] * l[j * q + k];
+            d -= blk[j * q + k] * blk[j * q + k];
         }
-        let ljj = diag.max(0.0).sqrt();
-        l[j * q + j] = ljj;
+        if !(d.is_finite() && d > 0.0) {
+            return false;
+        }
+        let l = d.sqrt();
+        blk[j * q + j] = l;
         for i in (j + 1)..q {
-            if ljj > 0.0 {
-                let mut s = a[i * q + j];
-                for k in 0..j {
-                    s -= l[i * q + k] * l[j * q + k];
-                }
-                l[i * q + j] = s / ljj;
+            let mut v = blk[i * q + j];
+            for k in 0..j {
+                v -= blk[i * q + k] * blk[j * q + k];
             }
+            blk[i * q + j] = v / l;
         }
     }
-    l
+    true
 }

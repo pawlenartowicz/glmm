@@ -237,6 +237,36 @@
       "reml": null,
       "factors": ["cluster", "grp"],
       "r_formula": "y ~ 1 + x + grp + (1 | cluster)"
+    },
+    {
+      "name": "sim_binomial_slope1",
+      "rung": 25,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "factors": ["g"],
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g))"
+    },
+    {
+      "name": "sim_poisson_slope1",
+      "rung": 26,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "factors": ["g"],
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g))"
+    },
+    {
+      "name": "sim_binomial_slope2",
+      "rung": 27,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "factors": ["g"],
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + (1 + x1 + x2 | g))"
     }
   ],
 
@@ -273,6 +303,19 @@
       "factors": ["INDEX", "YEAR"],  "r_formula": "TICKS ~ 1 + YEAR + cHEIGHT + (1 | INDEX)" },
     { "name": "grouseticks_agq_k11","kind": "glmm", "data": "grouseticks", "family": "poisson",  "link": "log",   "nagq": 11,
       "factors": ["INDEX", "YEAR"],  "r_formula": "TICKS ~ 1 + YEAR + cHEIGHT + (1 | INDEX)" },
+
+    { "name": "sim_binomial_slope1_agq_k7",  "kind": "glmm", "data": "sim_binomial_slope1", "family": "binomial", "link": "logit", "nagq": 7,  "oracle": "GLMMadaptive",
+      "factors": ["g"], "r_formula": "y ~ 1 + x + (1 + x | g)", "ma_fixed": "y ~ x", "ma_random": "~ x | g" },
+    { "name": "sim_binomial_slope1_agq_k11", "kind": "glmm", "data": "sim_binomial_slope1", "family": "binomial", "link": "logit", "nagq": 11, "oracle": "GLMMadaptive",
+      "factors": ["g"], "r_formula": "y ~ 1 + x + (1 + x | g)", "ma_fixed": "y ~ x", "ma_random": "~ x | g" },
+    { "name": "sim_poisson_slope1_agq_k7",   "kind": "glmm", "data": "sim_poisson_slope1",  "family": "poisson",  "link": "log",   "nagq": 7,  "oracle": "GLMMadaptive",
+      "factors": ["g"], "r_formula": "y ~ 1 + x + (1 + x | g)", "ma_fixed": "y ~ x", "ma_random": "~ x | g" },
+    { "name": "sim_poisson_slope1_agq_k11",  "kind": "glmm", "data": "sim_poisson_slope1",  "family": "poisson",  "link": "log",   "nagq": 11, "oracle": "GLMMadaptive",
+      "factors": ["g"], "r_formula": "y ~ 1 + x + (1 + x | g)", "ma_fixed": "y ~ x", "ma_random": "~ x | g" },
+    { "name": "sim_binomial_slope2_agq_k7",  "kind": "glmm", "data": "sim_binomial_slope2", "family": "binomial", "link": "logit", "nagq": 7,  "oracle": "GLMMadaptive",
+      "factors": ["g"], "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)", "ma_fixed": "y ~ x1 + x2", "ma_random": "~ x1 + x2 | g" },
+    { "name": "sim_binomial_slope2_agq_k11", "kind": "glmm", "data": "sim_binomial_slope2", "family": "binomial", "link": "logit", "nagq": 11, "oracle": "GLMMadaptive",
+      "factors": ["g"], "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)", "ma_fixed": "y ~ x1 + x2", "ma_random": "~ x1 + x2 | g" },
 
     { "name": "sim_slope_lmm",      "kind": "lmm",  "data": "sim_slope",   "family": "gaussian", "reml": true,
       "factors": ["g1", "g2"],       "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 | g2)" },

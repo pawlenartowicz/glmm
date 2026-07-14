@@ -1,0 +1,37 @@
+{
+  "name": "sim_poisson_slope1_agq_k11",
+  "engine": "GLMMadaptive",
+  "engine_version": "0.9.7",
+  "kind": "glmm",
+  "data": "sim_poisson_slope1",
+  "family": "poisson",
+  "link": "log",
+  "nagq": 11,
+  "control": {
+    "iter_EM": 300,
+    "iter_qN_outer": 60,
+    "tol1": 1e-08,
+    "tol2": 1e-10,
+    "tol3": 1e-12,
+    "update_GH_every": 1
+  },
+  "r_formula": "y ~ 1 + x + (1 + x | g)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [-1.35341529695698, 0.493130694641524],
+    "se_hessian": [0.218232117673111, 0.18535120407789],
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [1.01074118285088, 0.336232840163804],
+        "corr": [
+          [1, 0.037125016934612],
+          [0.037125016934612, 1]
+        ]
+      }
+    ]
+  }
+}

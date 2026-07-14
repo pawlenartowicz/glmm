@@ -1,0 +1,95 @@
+# Diligent-grid named failure list (spec Part 6). Manifest order.
+# 22 parity failures of 510 cells.
+lmm_cross4_g3000p5_bal_nearzero            mismatch        laplace  lme4         beta=4.2e-07 stddev=2.0e-03 corr=NA se=3.5e-06 dev=4.3e-10 (glmm:ok oracle:ok)
+lmm_q2sq2s_g3000p5_bal_nearzero            mismatch        laplace  lme4         beta=3.9e-07 stddev=1.1e-03 corr=2.2e-04 se=6.0e-05 dev=2.6e-10 (glmm:ok oracle:ok)
+lmm_cross8_g3000p20_single_base            mismatch        laplace  lme4         beta=1.2e-05 stddev=1.7e-03 corr=NA se=1.3e-04 dev=4.1e-08 (glmm:ok oracle:engine-fail)
+lmm_cross8_g30000p5_bal_nearzero           mismatch        laplace  lme4         beta=5.1e-07 stddev=1.2e-03 corr=NA se=1.7e-05 dev=7.1e-10 (glmm:ok oracle:ok)
+lmm_q6_g30000p20_bal_nearzero              mismatch        laplace  lme4         beta=4.4e-07 stddev=2.7e-03 corr=1.4e-03 se=1.1e-04 dev=2.4e-09 (glmm:ok oracle:ok)
+lmm_q8_g300p5_single_base                  both-fail       laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:engine-fail oracle:engine-fail)
+lmm_q8_g3000p5_bal_lowsnr                  mismatch        laplace  MixedModels  beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:ok oracle:engine-fail)  <-- REAL DISAGREEMENT vs MixedModels.jl (verify_boundary37.R): REML criterion gap +2.03 -- glmm converged to a worse optimum, not a boundary/flat-direction artifact
+lmm_q8q2x_g30000p20_bal_lowsnr             mismatch        laplace  lme4         beta=3.2e-05 stddev=1.4e-03 corr=8.8e-04 se=1.3e-03 dev=1.2e-09 (glmm:ok oracle:ok)
+bina_int2x_g300p20_bal_nearzero            mismatch        laplace  lme4         beta=8.6e-07 stddev=3.2e-05 corr=NA se=1.4e-02 dev=2.6e-12 (glmm:ok oracle:ok)
+pois_int2x_g300p20_bal_base                mismatch        laplace  lme4         beta=3.2e-05 stddev=8.8e-06 corr=NA se=5.1e-03 dev=2.0e-09 (glmm:ok oracle:ok)
+pois_int2x_g3000p20_bal_base               mismatch        laplace  lme4         beta=3.4e-05 stddev=7.2e-06 corr=NA se=4.9e-03 dev=1.1e-09 (glmm:ok oracle:ok)
+pois_int2x_g3000p100_bal_base              mismatch        laplace  lme4         beta=2.1e-05 stddev=1.1e-05 corr=NA se=1.5e-03 dev=6.0e-12 (glmm:ok oracle:ok)
+pois_nest2_g3000p100_bal_base              mismatch        laplace  lme4         beta=1.2e-05 stddev=6.4e-06 corr=NA se=2.5e-03 dev=1.4e-10 (glmm:ok oracle:ok)
+pois_q2s_g300p20_bal_nearzero              mismatch        agq_q2s  GLMMadaptive beta=1.6e-04 stddev=1.6e-01 corr=1.5e-01 se=2.7e-03 dev=NA (glmm:ok oracle:ok)  <-- BOUNDARY near-zero theta: beta/SE agree; only the ~0.008-scale degenerate slope stddev and its corr (pinned at -1 vs -0.85) exceed the bands
+binb_q2s_g3000p20_bal_nearzero             mismatch        agq_q2s  GLMMadaptive beta=6.9e-04 stddev=8.8e-03 corr=5.1e-04 se=4.6e-04 dev=NA (glmm:ok oracle:ok)  <-- BOUNDARY near-zero theta: beta/SE agree; only the ~0.1-scale degenerate slope stddev (corr pinned at +1, within band) exceeds the relative band
+bina_q2s_g3000p20_bal_nearzero             mismatch        agq_q2s  GLMMadaptive beta=2.7e-05 stddev=2.0e-02 corr=1.3e-03 se=8.9e-04 dev=NA (glmm:ok oracle:ok)  <-- BOUNDARY near-zero theta: beta (2.7e-5) / SE (8.9e-4) / corr (1.3e-3, within band) agree; only the ~0.02-scale degenerate slope stddev exceeds the relative band
+pois_q2s_g3000p20_bal_base                 mismatch        agq_q2s  GLMMadaptive beta=1.0e-01 stddev=6.9e-03 corr=1.8e-04 se=1.7e-02 dev=NA (glmm:ok oracle:ok)  <-- ADJUDICATED oracle-side (adjudicate_diligent.R): glmer-Laplace == glmm to 4 dp; GLMMadaptive under-converged
+pois_q2s_g3000p100_bal_base                mismatch        agq_q2s  GLMMadaptive beta=5.7e-01 stddev=4.0e-01 corr=3.0e-01 se=NA dev=NA (glmm:ok oracle:ok)  <-- ADJUDICATED oracle-side (adjudicate_diligent.R): glmer-Laplace == glmm to 4 dp; GLMMadaptive non-PD Hessian (se=null)
+binb_cross4_g300p20_bal_base               mismatch        laplace  lme4         beta=3.9e-05 stddev=1.0e+00 corr=NA se=2.5e-05 dev=3.0e-09 (glmm:ok oracle:ok)
+pois_cross4_g3000p100_bal_base             mismatch        laplace  lme4         beta=2.0e-04 stddev=2.0e-05 corr=NA se=3.2e-03 dev=1.3e-10 (glmm:ok oracle:ok)
+binb_nest2s_g300p20_bal_base               mismatch        laplace  lme4         beta=1.5e-03 stddev=1.0e+00 corr=8.9e-05 se=4.0e-05 dev=1.0e-08 (glmm:ok oracle:engine-fail)
+pois_cross6_g3000p100_bal_base             mismatch        laplace  lme4         beta=4.4e-05 stddev=6.5e-06 corr=NA se=3.7e-03 dev=6.9e-10 (glmm:ok oracle:ok)
+
+# GLMM COMPUTE-BUDGET BOUNDARY (13 cells, NOT accuracy verdicts): watchdog
+# 30 s per-fit budget exceeded -- the known giant-LMM slow tail (cross8/q5q2/
+# q6q2x3/q8q2x, mostly g30000). No answer produced within budget.
+lmm_cross8_g30000p5_bal_base               glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:ok)
+lmm_cross8_g30000p5_single_base            glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:ok)
+lmm_cross8_g30000p5_bal_lowsnr             glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:ok)
+lmm_q5q2_g30000p20_bal_base                glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:ok)
+lmm_q6q2x3_g30000p5_bal_base               glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:engine-fail)
+lmm_q6q2x3_g30000p100_bal_base             glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:ok)
+lmm_q8q2x_g300p5_bal_base                  glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:engine-fail)
+lmm_q8q2x_g30000p5_bal_base                glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:engine-fail)
+lmm_q8q2x_g30000p20_skew_base              glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:ok)
+lmm_q8q2x_g30000p20_single_base            glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:engine-fail)
+lmm_q8q2x_g30000p20_bal_highcorr           glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:ok)
+lmm_q8q2x_g30000p100_single_base           glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:engine-fail)
+lmm_q8q2x_g30000p100_bal_highcorr          glmm-timeout    laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:timeout oracle:ok)
+
+# ORACLE COVERAGE LIMIT (0 cells): lme4 identifiability refusal ('number of
+# observations <= number of random effects') on p5 high-q LMM cells -- glmm
+# fits these; there is simply no oracle answer to compare against.
+
+# ORACLE SINGULAR FITS (40 cells, informational): lme4 converged to a boundary
+# (singular) fit with estimates. Gaps vs glmm recorded in status_map.csv but
+# NOT gated -- singular optima have flat directions.
+lmm_int1_g300p5_bal_nearzero               oracle-singular laplace  lme4         beta=6.7e-16 stddev=0.0e+00 corr=NA se=1.7e-15 dev=8.1e-16 (glmm:ok oracle:engine-fail)
+lmm_int1_g300p20_bal_nearzero              oracle-singular laplace  lme4         beta=1.3e-15 stddev=0.0e+00 corr=NA se=2.0e-15 dev=4.2e-16 (glmm:ok oracle:engine-fail)
+lmm_int2x_g300p20_bal_nearzero             oracle-singular laplace  lme4         beta=1.1e-11 stddev=1.2e-08 corr=NA se=1.2e-08 dev=1.9e-15 (glmm:ok oracle:engine-fail)
+lmm_nest2_g3000p20_bal_nearzero            oracle-singular laplace  lme4         beta=1.6e-10 stddev=3.0e-08 corr=NA se=2.7e-08 dev=5.5e-16 (glmm:ok oracle:engine-fail)
+lmm_nest2_g30000p5_bal_nearzero            oracle-singular laplace  lme4         beta=1.4e-09 stddev=5.3e-07 corr=NA se=3.1e-07 dev=6.5e-14 (glmm:ok oracle:engine-fail)
+lmm_q2s_g30000p20_bal_nearzero             oracle-singular laplace  lme4         beta=2.4e-09 stddev=1.7e-04 corr=2.2e-16 se=9.6e-08 dev=5.3e-14 (glmm:ok oracle:engine-fail)
+lmm_nest3_g30000p100_bal_nearzero          oracle-singular laplace  lme4         beta=1.0e-09 stddev=1.0e+00 corr=NA se=3.3e-08 dev=6.1e-14 (glmm:ok oracle:engine-fail)
+lmm_nestmix_g300p5_bal_nearzero            oracle-singular laplace  lme4         beta=6.7e-08 stddev=2.0e-06 corr=NA se=1.7e-06 dev=2.9e-13 (glmm:ok oracle:engine-fail)
+lmm_nestmix_g300p20_bal_nearzero           oracle-singular laplace  lme4         beta=1.0e-08 stddev=3.2e-05 corr=NA se=2.9e-05 dev=1.8e-11 (glmm:ok oracle:engine-fail)
+lmm_cross4_g3000p20_bal_nearzero           oracle-singular laplace  lme4         beta=6.2e-09 stddev=2.1e-05 corr=NA se=2.9e-06 dev=5.7e-12 (glmm:ok oracle:engine-fail)
+lmm_cross6_g300p5_bal_nearzero             oracle-singular laplace  lme4         beta=5.1e-06 stddev=1.2e-05 corr=NA se=1.1e-06 dev=1.9e-11 (glmm:ok oracle:engine-fail)
+lmm_cross6_g300p5_bal_lowsnr               oracle-singular laplace  lme4         beta=6.3e-06 stddev=3.3e-05 corr=NA se=3.4e-06 dev=5.0e-12 (glmm:ok oracle:engine-fail)
+lmm_cross6_g300p20_bal_nearzero            oracle-singular laplace  lme4         beta=1.5e-07 stddev=1.0e+00 corr=NA se=1.9e-05 dev=5.8e-10 (glmm:ok oracle:engine-fail)
+lmm_q2sq2s_g300p20_bal_nearzero            oracle-singular laplace  lme4         beta=4.8e-07 stddev=8.8e-05 corr=2.6e-06 se=8.1e-05 dev=3.8e-10 (glmm:ok oracle:engine-fail)
+lmm_q3sx2_g30000p5_bal_nearzero            oracle-singular laplace  lme4         beta=7.7e-08 stddev=1.2e-03 corr=3.4e-04 se=4.4e-05 dev=1.9e-10 (glmm:ok oracle:engine-fail)
+lmm_q3sx2_g30000p100_bal_nearzero          oracle-singular laplace  lme4         beta=1.9e-08 stddev=1.8e-04 corr=1.0e-04 se=6.7e-05 dev=4.3e-10 (glmm:ok oracle:engine-fail)
+lmm_q4sx2_g300p5_bal_nearzero              oracle-singular laplace  lme4         beta=1.5e-05 stddev=5.2e-05 corr=1.1e-04 se=1.9e-05 dev=4.9e-10 (glmm:ok oracle:engine-fail)
+lmm_q4sx2_g300p5_bal_highcorr              oracle-singular laplace  lme4         beta=2.1e-06 stddev=2.2e-05 corr=3.1e-06 se=7.8e-06 dev=6.5e-11 (glmm:ok oracle:engine-fail)
+lmm_q4sx2_g300p5_bal_lowsnr                oracle-singular laplace  lme4         beta=2.8e-05 stddev=1.7e-04 corr=1.2e-04 se=4.5e-06 dev=7.8e-11 (glmm:ok oracle:engine-fail)
+lmm_q4sx2_g300p20_skew_base                oracle-singular laplace  lme4         beta=1.5e-05 stddev=4.3e-05 corr=2.5e-05 se=3.8e-05 dev=1.5e-10 (glmm:ok oracle:engine-fail)
+lmm_q4sx2_g300p20_bal_nearzero             oracle-singular laplace  lme4         beta=1.5e-05 stddev=7.3e-04 corr=5.5e-04 se=3.8e-04 dev=3.3e-08 (glmm:ok oracle:engine-fail)
+lmm_q4sx2_g300p20_bal_lowsnr               oracle-singular laplace  lme4         beta=4.3e-01 stddev=1.0e+00 corr=NA se=9.8e-02 dev=4.8e-03 (glmm:ok oracle:engine-fail)
+lmm_q5q2_g3000p100_bal_nearzero            oracle-singular laplace  lme4         beta=5.8e-06 stddev=9.7e-04 corr=2.2e-03 se=7.8e-04 dev=4.5e-08 (glmm:ok oracle:engine-fail)
+lmm_q8_g3000p20_bal_lowsnr                 oracle-singular laplace  lme4         beta=2.4e-04 stddev=6.1e-04 corr=4.3e-04 se=1.8e-04 dev=4.4e-09 (glmm:ok oracle:engine-fail)
+bina_int2x_g300p20_bal_rare                oracle-singular laplace  lme4         beta=4.9e-06 stddev=8.3e-06 corr=NA se=2.2e-02 dev=3.8e-11 (glmm:ok oracle:engine-fail)
+pois_int2x_g300p20_bal_nearzero            oracle-singular laplace  lme4         beta=6.8e-06 stddev=3.2e-06 corr=NA se=4.3e-04 dev=1.7e-10 (glmm:ok oracle:engine-fail)
+binb_nest2_g300p20_bal_base                oracle-singular laplace  lme4         beta=9.7e-06 stddev=1.0e+00 corr=NA se=2.1e-02 dev=1.6e-11 (glmm:ok oracle:engine-fail)
+bina_nest2_g300p20_skew_base               oracle-singular laplace  lme4         beta=2.9e-05 stddev=6.4e-06 corr=NA se=6.9e-03 dev=3.1e-12 (glmm:ok oracle:engine-fail)
+bina_nest2_g300p20_bal_nearzero            oracle-singular laplace  lme4         beta=4.7e-05 stddev=9.1e-06 corr=NA se=7.3e-03 dev=6.8e-12 (glmm:ok oracle:engine-fail)
+pois_nest2_g300p20_bal_nearzero            oracle-singular laplace  lme4         beta=2.6e-06 stddev=1.0e+00 corr=NA se=1.2e-02 dev=1.5e-11 (glmm:ok oracle:engine-fail)
+binb_nest2_g3000p20_bal_nearzero           oracle-singular laplace  lme4         beta=5.8e-06 stddev=2.8e-06 corr=NA se=2.7e-02 dev=3.4e-12 (glmm:ok oracle:engine-fail)
+binb_cross4_g3000p20_bal_nearzero          oracle-singular laplace  lme4         beta=3.1e-05 stddev=1.0e+00 corr=NA se=1.6e-02 dev=1.1e-10 (glmm:ok oracle:engine-fail)
+pois_cross4_g3000p20_bal_nearzero          oracle-singular laplace  lme4         beta=1.3e-06 stddev=1.0e+00 corr=NA se=1.3e-04 dev=2.3e-12 (glmm:ok oracle:engine-fail)
+bina_nest2s_g3000p20_bal_nearzero          oracle-singular laplace  lme4         beta=2.4e-06 stddev=5.9e-06 corr=0.0e+00 se=6.4e-03 dev=7.5e-13 (glmm:ok oracle:engine-fail)
+pois_nest2s_g3000p20_bal_nearzero          oracle-singular laplace  lme4         beta=4.3e-06 stddev=5.6e-04 corr=0.0e+00 se=9.9e-02 dev=1.2e-12 (glmm:ok oracle:engine-fail)
+binb_nest2s_g3000p100_bal_rare             oracle-singular laplace  lme4         beta=2.7e-06 stddev=9.9e-06 corr=0.0e+00 se=1.7e-01 dev=2.7e-13 (glmm:ok oracle:engine-fail)
+binb_nest2s_g3000p100_bal_nearzero         oracle-singular laplace  lme4         beta=2.7e-06 stddev=5.2e-06 corr=0.0e+00 se=1.8e-02 dev=1.3e-12 (glmm:ok oracle:engine-fail)
+binb_cross6_g300p20_bal_base               oracle-singular laplace  lme4         beta=3.4e-06 stddev=1.0e+00 corr=NA se=2.8e-02 dev=2.3e-11 (glmm:ok oracle:engine-fail)
+pois_cross6_g3000p20_bal_nearzero          oracle-singular laplace  lme4         beta=1.0e-05 stddev=8.5e-06 corr=NA se=4.7e-04 dev=1.4e-09 (glmm:ok oracle:engine-fail)
+binb_cross6_g3000p100_bal_nearzero         oracle-singular laplace  lme4         beta=1.7e-05 stddev=1.0e+00 corr=NA se=1.2e-02 dev=1.3e-11 (glmm:ok oracle:engine-fail)
+
+# ORACLE TIMEOUTS (3 cells): oracle exceeded the 120 s watchdog budget --
+# oracle-side compute limit, no reference answer.
+lmm_q8q2x_g30000p20_bal_nearzero           oracle-timeout  laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:ok oracle:timeout)
+lmm_q8q2x_g30000p100_bal_nearzero          oracle-timeout  laplace  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:ok oracle:timeout)
+binb_q2s_g3000p20_bal_rare                 oracle-timeout  agq_q2s  lme4         beta=NA stddev=NA corr=NA se=NA dev=NA (glmm:ok oracle:timeout)

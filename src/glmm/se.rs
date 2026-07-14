@@ -33,10 +33,43 @@ fn fd_eval(
 }
 
 /// Central second difference of coordinate `k` at step `s`: `(f(+s) − 2·f0 +
-/// f(−s))/s²`. Returns the raw value — non-finite if either directional eval
-/// diverges — so the caller decides fallback (serial: on the first bad cell;
-/// parallel grid: after the whole grid). Extracted from the former `second_diff!`
-/// macro so a per-thread worker workspace can call it.
+/// f(−s))/s²`, where `eval(coords, deltas)` evaluates the deviance at the base
+/// point perturbed by `Σ deltaₖ·e_{coordₖ}`. Returns the raw value — non-finite
+/// if either directional eval diverges — so the caller decides fallback. The
+/// step is a PARAMETER: the dense (`FD_STEP_REL`) and sparse (`SPARSE_FD_STEP_REL`)
+/// paths pass their own deliberately-divergent constants; this helper never sees one.
+pub(crate) fn fd_second_diff(
+    eval: &mut impl FnMut(&[usize], &[f64]) -> f64,
+    k: usize,
+    s: f64,
+    f0: f64,
+) -> f64 {
+    let fp = eval(&[k], &[s]);
+    let fm = eval(&[k], &[-s]);
+    (fp - 2.0 * f0 + fm) / (s * s)
+}
+
+/// Symmetric 4-point mixed partial of `(i, j)` at steps `(si, sj)`:
+/// `(f(+si,+sj) − f(+si,−sj) − f(−si,+sj) + f(−si,−sj))/(4·si·sj)`. Returns the raw
+/// value (non-finite if any of the four evals diverges); fallback is the caller's,
+/// as for `fd_second_diff`. Same eval-closure / step-as-parameter contract.
+pub(crate) fn fd_mixed_diff(
+    eval: &mut impl FnMut(&[usize], &[f64]) -> f64,
+    i: usize,
+    j: usize,
+    si: f64,
+    sj: f64,
+) -> f64 {
+    let fpp = eval(&[i, j], &[si, sj]);
+    let fpm = eval(&[i, j], &[si, -sj]);
+    let fmp = eval(&[i, j], &[-si, sj]);
+    let fmm = eval(&[i, j], &[-si, -sj]);
+    (fpp - fpm - fmp + fmm) / (4.0 * si * sj)
+}
+
+/// Dense-path adapter: builds the `fd_eval` closure over `ws`/design and applies
+/// the shared `fd_second_diff` stencil. Keeps the per-thread worker workspace and
+/// β-fixed deviance wiring local to this side.
 #[allow(clippy::too_many_arguments)]
 fn second_diff(
     ws: &mut GlmmWorkspace,
@@ -48,15 +81,12 @@ fn second_diff(
     cluster_ids: &[u32],
     n: usize,
 ) -> f64 {
-    let fp = fd_eval(ws, &[k], &[s], x, y, cluster_ids, n);
-    let fm = fd_eval(ws, &[k], &[-s], x, y, cluster_ids, n);
-    (fp - 2.0 * f0 + fm) / (s * s)
+    let mut eval =
+        |coords: &[usize], deltas: &[f64]| fd_eval(ws, coords, deltas, x, y, cluster_ids, n);
+    fd_second_diff(&mut eval, k, s, f0)
 }
 
-/// Symmetric 4-point mixed partial of `(i, j)` at steps `(si, sj)`:
-/// `(f(+si,+sj) − f(+si,−sj) − f(−si,+sj) + f(−si,−sj))/(4·si·sj)`. Returns the raw
-/// value (non-finite if any of the four evals diverges); fallback is the caller's,
-/// as for `second_diff`.
+/// Dense-path adapter for the 4-point mixed partial; see `second_diff`.
 #[allow(clippy::too_many_arguments)]
 fn mixed_diff(
     ws: &mut GlmmWorkspace,
@@ -69,11 +99,9 @@ fn mixed_diff(
     cluster_ids: &[u32],
     n: usize,
 ) -> f64 {
-    let fpp = fd_eval(ws, &[i, j], &[si, sj], x, y, cluster_ids, n);
-    let fpm = fd_eval(ws, &[i, j], &[si, -sj], x, y, cluster_ids, n);
-    let fmp = fd_eval(ws, &[i, j], &[-si, sj], x, y, cluster_ids, n);
-    let fmm = fd_eval(ws, &[i, j], &[-si, -sj], x, y, cluster_ids, n);
-    (fpp - fpm - fmp + fmm) / (4.0 * si * sj)
+    let mut eval =
+        |coords: &[usize], deltas: &[f64]| fd_eval(ws, coords, deltas, x, y, cluster_ids, n);
+    fd_mixed_diff(&mut eval, i, j, si, sj)
 }
 
 /// Fill `out_cov` (p×p) with the RX/Schur fixed-effect covariance `inv(ws.schur)`
@@ -363,6 +391,29 @@ pub fn fd_hessian_cov(
     FdHessianStatus::Ok
 }
 
+/// C = X'W̃X (p×p), full matrix, via the W∘X GEMM scratch `ws.wx` (rebuilt fresh
+/// from `ws.w` each call). Shared by `dense_schur_fill`/`blocked_schur_fill`/
+/// `structured_schur_fill`: all three read the identical `ws.w`/`x` pair for this
+/// block (they differ only in how they build `X'W̃M`), so one GEMM fill serves
+/// all three rather than three copies of the same scalar triple loop. Mirrors the
+/// `pirls.rs` `BetaStep::Profile` xtwx GEMM this construction is shared with.
+fn xtwx_fill(ws: &mut GlmmWorkspace, x: MatRef<f64>, n: usize) {
+    let p = ws.p;
+    for c in 0..p {
+        for i in 0..n {
+            ws.wx[(i, c)] = ws.w[i] * x[(i, c)];
+        }
+    }
+    faer::linalg::matmul::matmul(
+        ws.xtwx.as_mut(),
+        faer::Accum::Replace,
+        x.subrows(0, n).transpose(),
+        ws.wx.as_ref().subrows(0, n),
+        1.0,
+        faer::Par::Seq,
+    );
+}
+
 /// Dense Schur fill (crossed/nested path): X'W̃X, X'W̃M, A⁻¹M'W̃X via the `k×k`
 /// `ws.a` LLT, and `ws.schur = X'W̃X − X'W̃M·A⁻¹M'W̃X`. Reads `ws.{a, m, w, x via
 /// arg}`. Returns false on a non-PD `ws.a`. Unchanged from the pre-Phase-2 inline
@@ -376,16 +427,7 @@ pub fn fd_hessian_cov(
 pub(crate) fn dense_schur_fill(ws: &mut GlmmWorkspace, x: MatRef<f64>, n: usize) -> bool {
     use faer::linalg::solvers::Solve;
     let (k, p) = (ws.k, ws.p);
-    for r in 0..p {
-        for c in 0..=r {
-            let mut s = 0.0;
-            for i in 0..n {
-                s += x[(i, r)] * ws.w[i] * x[(i, c)];
-            }
-            ws.xtwx[(r, c)] = s;
-            ws.xtwx[(c, r)] = s;
-        }
-    }
+    xtwx_fill(ws, x, n);
     for r in 0..p {
         for c in 0..k {
             let mut s = 0.0;
@@ -432,17 +474,7 @@ pub(crate) fn blocked_schur_fill(
 ) -> bool {
     let (p, q, s) = (ws.p, ws.groupings.primary_q, ws.groupings.n_primary);
     let k = q * s;
-    // X'W̃X (p×p).
-    for r in 0..p {
-        for c in 0..=r {
-            let mut sm = 0.0;
-            for i in 0..n {
-                sm += x[(i, r)] * ws.w[i] * x[(i, c)];
-            }
-            ws.xtwx[(r, c)] = sm;
-            ws.xtwx[(c, r)] = sm;
-        }
-    }
+    xtwx_fill(ws, x, n);
     // X'W̃M, blocked: zero then scatter the q_p coupling columns per row.
     for r in 0..p {
         for c in 0..k {
@@ -538,17 +570,7 @@ pub(crate) fn structured_schur_fill(
             prim_width + f * np + (local - q)
         }
     };
-    // X'W̃X (p×p).
-    for r in 0..p {
-        for c in 0..=r {
-            let mut sm = 0.0;
-            for i in 0..n {
-                sm += x[(i, r)] * ws.w[i] * x[(i, c)];
-            }
-            ws.xtwx[(r, c)] = sm;
-            ws.xtwx[(c, r)] = sm;
-        }
-    }
+    xtwx_fill(ws, x, n);
     // X'W̃M: zero then scatter each row's core + crossed columns. Reads the PACKED
     // M nonzeros (`m_core_buf` core slice + `cross_*`/`n_cross` crossed entries) the
     // converged re-eval's `build_packed_m` left behind — the dense `ws.m` is no

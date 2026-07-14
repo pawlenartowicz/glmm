@@ -1,0 +1,38 @@
+{
+  "name": "sim_binomial_slope2_agq_k7",
+  "engine": "GLMMadaptive",
+  "engine_version": "0.9.7",
+  "kind": "glmm",
+  "data": "sim_binomial_slope2",
+  "family": "binomial",
+  "link": "logit",
+  "nagq": 7,
+  "control": {
+    "iter_EM": 300,
+    "iter_qN_outer": 60,
+    "tol1": 1e-08,
+    "tol2": 1e-10,
+    "tol3": 1e-12,
+    "update_GH_every": 1
+  },
+  "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x1", "x2"],
+  "estimates": {
+    "beta": [0.373075122811724, 0.538115508156578, -0.365494193314524],
+    "se_hessian": [0.131104470232051, 0.104634038656309, 0.105565160856298],
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)", "x1", "x2"],
+        "stddev": [1.06395645115595, 0.621740709383644, 0.64210307117174],
+        "corr": [
+          [1, 0.219163044280095, 0.13220959895703],
+          [0.219163044280095, 1, -0.0310847425852427],
+          [0.13220959895703, -0.0310847425852427, 1]
+        ]
+      }
+    ]
+  }
+}

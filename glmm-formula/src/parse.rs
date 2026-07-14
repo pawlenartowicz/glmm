@@ -123,6 +123,36 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
     })
 }
 
+/// Repeatedly matches `regex` against `work`, hands each match's captures to
+/// `make` to produce zero or more `(seen-key, effect)` pairs, dedup-inserts
+/// each key into `seen` (erroring on a repeat grouping factor), pushes the
+/// effects, and strips the first match out of `work` — until `regex` no
+/// longer matches. This is the skeleton shared by all five RE-extraction
+/// stages in [`extract_random_effects`]; everything stage-specific (how many
+/// effects one match yields, `EmptySlopeTerm`/fallback logic) lives in `make`.
+fn extract_stage(
+    work: &mut String,
+    seen: &mut std::collections::BTreeSet<String>,
+    effects: &mut Vec<RandomEffect>,
+    regex: &Regex,
+    mut make: impl FnMut(&regex::Captures) -> Result<Vec<(String, RandomEffect)>, ParseError>,
+) -> Result<(), ParseError> {
+    loop {
+        let snapshot = work.clone();
+        let Some(m) = regex.captures(&snapshot) else {
+            break;
+        };
+        for (name, effect) in make(&m)? {
+            if !seen.insert(name.clone()) {
+                return Err(ParseError::DuplicateGroupingVar { name });
+            }
+            effects.push(effect);
+        }
+        *work = regex.replacen(&snapshot, 1, "").into_owned();
+    }
+    Ok(())
+}
+
 fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), ParseError> {
     use std::collections::BTreeSet;
 
@@ -135,39 +165,32 @@ fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), Pars
         return Err(ParseError::RandomInterceptSuppressionUnsupported);
     }
 
-    // 1. Nested intercept: (1|A/B) → push pair, replace with empty.
-    let re_nested = &*RE_NESTED;
-    loop {
-        let snapshot = work.clone();
-        let Some(m) = re_nested.captures(&snapshot) else {
-            break;
-        };
+    // 1. Nested intercept: (1|A/B) → two entries, parent then joined-with-parent.
+    extract_stage(&mut work, &mut seen, &mut effects, &RE_NESTED, |m| {
         let parent_name = m.get(1).unwrap().as_str().to_string();
         let child_name = m.get(2).unwrap().as_str().to_string();
         let joined = format!("{parent_name}:{child_name}");
-        for name in [&parent_name, &joined] {
-            if !seen.insert(name.clone()) {
-                return Err(ParseError::DuplicateGroupingVar { name: name.clone() });
-            }
-        }
-        effects.push(RandomEffect::Intercept {
-            group: parent_name.clone(),
-            parent: None,
-        });
-        effects.push(RandomEffect::Intercept {
-            group: joined,
-            parent: Some(parent_name),
-        });
-        work = re_nested.replacen(&snapshot, 1, "").into_owned();
-    }
+        Ok(vec![
+            (
+                parent_name.clone(),
+                RandomEffect::Intercept {
+                    group: parent_name.clone(),
+                    parent: None,
+                },
+            ),
+            (
+                joined.clone(),
+                RandomEffect::Intercept {
+                    group: joined,
+                    parent: Some(parent_name),
+                },
+            ),
+        ])
+    })?;
 
-    // 2. Random slope: (1+x+y|g)
-    let re_slope = &*RE_SLOPE;
-    loop {
-        let snapshot = work.clone();
-        let Some(m) = re_slope.captures(&snapshot) else {
-            break;
-        };
+    // 2. Random slope: (1+x+y|g) — falls back to a plain Intercept if every
+    // token was "1" (no non-"1" slope vars survive the filter).
+    extract_stage(&mut work, &mut seen, &mut effects, &RE_SLOPE, |m| {
         let var_list_raw = m.get(1).unwrap().as_str();
         let group = m.get(2).unwrap().as_str().to_string();
         let raw_tokens: Vec<&str> = var_list_raw
@@ -183,29 +206,25 @@ fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), Pars
             .filter(|s| **s != "1")
             .map(|s| String::from(*s))
             .collect();
-        if !seen.insert(group.clone()) {
-            return Err(ParseError::DuplicateGroupingVar {
-                name: group.clone(),
-            });
-        }
-        if vars.is_empty() {
-            effects.push(RandomEffect::Intercept {
-                group,
+        let effect = if vars.is_empty() {
+            RandomEffect::Intercept {
+                group: group.clone(),
                 parent: None,
-            });
+            }
         } else {
-            effects.push(RandomEffect::Slope { group, vars });
-        }
-        work = re_slope.replacen(&snapshot, 1, "").into_owned();
-    }
+            RandomEffect::Slope {
+                group: group.clone(),
+                vars,
+            }
+        };
+        Ok(vec![(group, effect)])
+    })?;
 
     // 2.5. Implicit-intercept slope: (x|g), (x+z|g) — equivalent to (1+x|g).
-    let re_islope = &*RE_ISLOPE;
-    loop {
-        let snapshot = work.clone();
-        let Some(m) = re_islope.captures(&snapshot) else {
-            break;
-        };
+    // Unlike stage 2, always yields a Slope (never falls back to Intercept):
+    // an empty `vars` here means the term was `(1|g)`, which RE_ISLOPE's
+    // `[_A-Za-z]`-starting group excludes from matching in the first place.
+    extract_stage(&mut work, &mut seen, &mut effects, &RE_ISLOPE, |m| {
         let var_list_raw = m.get(1).unwrap().as_str();
         let group = m.get(2).unwrap().as_str().to_string();
         let vars: Vec<String> = var_list_raw
@@ -214,54 +233,36 @@ fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), Pars
             .filter(|s| !s.is_empty() && *s != "1")
             .map(String::from)
             .collect();
-        if !seen.insert(group.clone()) {
-            return Err(ParseError::DuplicateGroupingVar {
-                name: group.clone(),
-            });
-        }
-        effects.push(RandomEffect::Slope { group, vars });
-        work = re_islope.replacen(&snapshot, 1, "").into_owned();
-    }
+        Ok(vec![(group.clone(), RandomEffect::Slope { group, vars })])
+    })?;
 
     // 2.7. Crossed interaction grouping: (1|A:B) — a random intercept keyed by
     // the combination of two existing factor columns (NOT nesting: parent stays
     // None, unlike step 1's `(1|A/B)` inner term).
-    let re_interaction = &*RE_INTERACTION;
-    loop {
-        let snapshot = work.clone();
-        let Some(m) = re_interaction.captures(&snapshot) else {
-            break;
-        };
+    extract_stage(&mut work, &mut seen, &mut effects, &RE_INTERACTION, |m| {
         let lhs = m.get(1).unwrap().as_str().to_string();
         let rhs = m.get(2).unwrap().as_str().to_string();
         let joined = format!("{lhs}:{rhs}");
-        if !seen.insert(joined.clone()) {
-            return Err(ParseError::DuplicateGroupingVar { name: joined });
-        }
-        effects.push(RandomEffect::Intercept {
-            group: joined,
-            parent: None,
-        });
-        work = re_interaction.replacen(&snapshot, 1, "").into_owned();
-    }
+        Ok(vec![(
+            joined.clone(),
+            RandomEffect::Intercept {
+                group: joined,
+                parent: None,
+            },
+        )])
+    })?;
 
     // 3. Random intercept: (1|g)
-    let re_int = &*RE_INT;
-    loop {
-        let snapshot = work.clone();
-        let Some(m) = re_int.captures(&snapshot) else {
-            break;
-        };
+    extract_stage(&mut work, &mut seen, &mut effects, &RE_INT, |m| {
         let name = m.get(1).unwrap().as_str().to_string();
-        if !seen.insert(name.clone()) {
-            return Err(ParseError::DuplicateGroupingVar { name });
-        }
-        effects.push(RandomEffect::Intercept {
-            group: name,
-            parent: None,
-        });
-        work = re_int.replacen(&snapshot, 1, "").into_owned();
-    }
+        Ok(vec![(
+            name.clone(),
+            RandomEffect::Intercept {
+                group: name,
+                parent: None,
+            },
+        )])
+    })?;
 
     // Clean stray "+" — collapse "++", trim leading/trailing "+".
     let cleaned = clean_residual_plusses(&work);

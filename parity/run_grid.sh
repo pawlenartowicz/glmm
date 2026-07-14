@@ -10,8 +10,10 @@
 # the state (no_turbo) into run_meta so unlocked timings can be excluded later.
 #
 #   ./run_grid.sh glmm|mixedmodels|lme4 <pass-tag> [timeout-seconds]
-# Timeouts default per design: glmm/mixedmodels 10 s, lme4 120 s; B passes
-# override with the third arg (60).
+# Timeouts: the per-fit design budget is 10 s (lme4 120 s); each engine's
+# default scales it by its fits-per-cell (glmm 3x: warm-up + 2 timed fits,
+# min-of-2; MM 2x: warm-up + timed fit). B passes override with the third
+# arg — scale explicit budgets the same way.
 set -euo pipefail
 PARITY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE="${1:?engine}"; TAG="${2:?pass tag}"; TIMEOUT="${3:-}"
@@ -22,9 +24,12 @@ export GRID_OUT="$OUT" GRID_MANIFEST="$MANIFEST" GRID_CONFIG_TAG="${GRID_CONFIG_
 
 case "$ENGINE" in
   glmm)        CMD=(cargo run --quiet --release --manifest-path "$PARITY/../Cargo.toml" --example grid_fit)
-               TIMEOUT="${TIMEOUT:-10}" ;;
+               # 3x the per-fit budget: grid_fit.rs runs warm-up + 2 timed
+               # fits per cell (min-of-2 reported) — change with fit_cell's
+               # timing protocol
+               TIMEOUT="${TIMEOUT:-30}" ;;
   mixedmodels) CMD=(julia --project="$PARITY" "$PARITY/oracle/grid_fit.jl")
-               # 2x glmm's default: grid_fit.jl double-fits each cell (JIT
+               # 2x the per-fit budget: grid_fit.jl double-fits each cell (JIT
                # warm-up + timed fit) — callers passing an explicit budget
                # must double it the same way (run_study_a.sh does)
                TIMEOUT="${TIMEOUT:-20}" ;;
@@ -52,11 +57,15 @@ printf '{"engine":"%s","tag":"%s","timeout_s":%s,"no_turbo":"%s","started":"%s"}
   > "$PARITY/results/grid/run_meta_${ENGINE}_${TAG}.json"
 [ "$NO_TURBO" = "1" ] || echo "WARNING: clock NOT locked (no_turbo=$NO_TURBO) — timings from this pass must be excluded from timing aggregates" >&2
 
-# cell universe (lme4 runs only its GRID_TODO subset)
+# cell universe (lme4 runs only its GRID_TODO subset; other engines respect
+# GRID_ONLY the same way grid_fit.jl/.rs do — otherwise the watchdog treats
+# every cell GRID_ONLY excluded as still "missing" and relaunches forever)
 if [ "$ENGINE" = "lme4" ]; then
   : "${GRID_TODO:?lme4 pass needs GRID_TODO (from analyze_grid.R)}"
   export GRID_TODO
   mapfile -t ALL < "$GRID_TODO"
+elif [ -n "${GRID_ONLY:-}" ]; then
+  mapfile -t ALL < <(tr ',' '\n' <<< "$GRID_ONLY")
 else
   mapfile -t ALL < <(jq -r '.cells[].case_id' "$MANIFEST")
 fi

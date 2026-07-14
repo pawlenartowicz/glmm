@@ -56,10 +56,8 @@ const N_RUNS: usize = 10;
 
 fn main() {
     let suite = suite_dir();
-    std::fs::create_dir_all(format!("{suite}/results/glmm_empirical"))
-        .expect("mk glmm_empirical");
-    std::fs::create_dir_all(format!("{suite}/results/glmm_simulated"))
-        .expect("mk glmm_simulated");
+    std::fs::create_dir_all(format!("{suite}/results/glmm_empirical")).expect("mk glmm_empirical");
+    std::fs::create_dir_all(format!("{suite}/results/glmm_simulated")).expect("mk glmm_simulated");
     let manifest: Value = serde_json::from_str(
         &std::fs::read_to_string(format!("{suite}/manifest.json")).expect("read manifest"),
     )

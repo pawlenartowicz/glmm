@@ -67,5 +67,6 @@ def test_fit_fields():
         "aliased",
         "dispersion",
         "converged",
+        "singular",
         "names",
     ]

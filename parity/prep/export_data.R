@@ -556,3 +556,72 @@ make_poisson_highmean <- function(n = 300, b0 = 4.3) {
 d_ph <- make_poisson_highmean()
 write.csv(d_ph, file.path(parity_dir, "data_simulated", "sim_poisson_highmean.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_poisson_highmean", nrow(d_ph), ncol(d_ph)))
+
+# --- Rungs 25-27: vector-RE AGQ datasets (full-AGQ spec Part 5) ---------------
+# Single grouping factor with a vector random effect (q=2 intercept+slope, q=3
+# intercept+2 slopes) -- the exact shape the vector AGQ kernel (agq_deviance_vec)
+# admits. Sized so AGQ matters: small clusters / sparse information, where the
+# Laplace approximation is visibly biased. Confirmed at freeze (glmer Laplace vs
+# GLMMadaptive nAGQ=11): RE-sd shifts 5%/36% (binomial q=2), 2%/9% (poisson
+# q=2), 5%/13%/14% (binomial q=3); both oracles converge cleanly, non-singular.
+# Two tiers per dataset: Laplace-anchor rung in manifest.datasets (vs glmer,
+# machine-tight) + AGQ k=7/11 goldens in m3_goldens (vs GLMMadaptive).
+
+# Rung 25: sim_binomial_slope1 -- Bernoulli rows (NOT aggregated: per-row trials
+# of 1 are the low-information regime that maximizes Laplace bias), q=2.
+set.seed(20260726)
+make_binomial_slope1 <- function(n_g = 60, per = 8) {
+  n <- n_g * per
+  g <- factor(rep(seq_len(n_g), each = per))
+  x <- rnorm(n)
+  S <- diag(c(1.0, 0.6)) %*% matrix(c(1, 0.3, 0.3, 1), 2) %*% diag(c(1.0, 0.6))
+  b <- MASS::mvrnorm(n_g, mu = c(0, 0), Sigma = S)
+  eta <- 0.3 + 0.6 * x + b[g, 1] + b[g, 2] * x
+  data.frame(y = rbinom(n, 1, plogis(eta)), x = x, g = g)
+}
+d_bs1 <- make_binomial_slope1()
+write.csv(d_bs1, file.path(parity_dir, "data_simulated", "sim_binomial_slope1.csv"), row.names = FALSE)
+cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_binomial_slope1", nrow(d_bs1), ncol(d_bs1)))
+
+# Rung 26: sim_poisson_slope1 -- sparse counts (b0 = -1.2 puts the marginal mean
+# ~0.5/row; Poisson-Laplace bias vanishes at high counts, so low counts are the
+# regime worth testing), q=2.
+set.seed(20260730)
+make_poisson_slope1 <- function(n_g = 60, per = 4) {
+  n <- n_g * per
+  g <- factor(rep(seq_len(n_g), each = per))
+  x <- rnorm(n)
+  S <- diag(c(1.0, 0.6)) %*% matrix(c(1, -0.2, -0.2, 1), 2) %*% diag(c(1.0, 0.6))
+  b <- MASS::mvrnorm(n_g, mu = c(0, 0), Sigma = S)
+  eta <- -1.2 + 0.4 * x + b[g, 1] + b[g, 2] * x
+  data.frame(y = rpois(n, exp(eta)), x = x, g = g)
+}
+d_ps1 <- make_poisson_slope1()
+write.csv(d_ps1, file.path(parity_dir, "data_simulated", "sim_poisson_slope1.csv"), row.names = FALSE)
+cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_poisson_slope1", nrow(d_ps1), ncol(d_ps1)))
+
+# Rung 27: sim_binomial_slope2 -- Bernoulli, q=3 (intercept + 2 slopes): pins the
+# temporary q_p<=3 cap surface and the kernel's dimensional generality. Larger
+# n_g/per than q=2: 6 varcomp parameters need the extra information for a clean
+# non-singular optimum on BOTH oracles (smaller draws left glmer with a
+# degenerate Hessian at freeze).
+set.seed(20260728)
+make_binomial_slope2 <- function(n_g = 100, per = 12) {
+  n <- n_g * per
+  g <- factor(rep(seq_len(n_g), each = per))
+  x1 <- rnorm(n); x2 <- rnorm(n)
+  sds <- c(1.0, 0.7, 0.6)
+  R <- matrix(c(1, 0.3, 0.1, 0.3, 1, 0.2, 0.1, 0.2, 1), 3)
+  S <- diag(sds) %*% R %*% diag(sds)
+  b <- MASS::mvrnorm(n_g, mu = c(0, 0, 0), Sigma = S)
+  # b0 = 0.5 (not ~0): at a near-zero realized intercept the beta[0] direction is
+  # shallow enough that glmer's optimizer stops ~1e-4 absolute short of the
+  # MM/glmm optimum, and the tiny |beta0| denominator inflates that to a spurious
+  # >1e-3 RELATIVE beta gap at the compare.R gate. A clearly nonzero intercept
+  # keeps the relative comparison honest.
+  eta <- 0.5 + 0.5 * x1 - 0.4 * x2 + b[g, 1] + b[g, 2] * x1 + b[g, 3] * x2
+  data.frame(y = rbinom(n, 1, plogis(eta)), x1 = x1, x2 = x2, g = g)
+}
+d_bs2 <- make_binomial_slope2()
+write.csv(d_bs2, file.path(parity_dir, "data_simulated", "sim_binomial_slope2.csv"), row.names = FALSE)
+cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_binomial_slope2", nrow(d_bs2), ncol(d_bs2)))

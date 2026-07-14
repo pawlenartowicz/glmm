@@ -73,6 +73,52 @@ def test_nagq_max_odd_fits():
     assert result.converged
 
 
+# Ineligible-shape nagq>1 is valid-but-inapplicable (spec §3.5): warn and strip
+# to nagq=1, never surface the kernel's shape panic as a ValueError. Eligibility
+# mirrors src/fit/common.rs::assert_model_shape — single grouping factor,
+# binomial/Poisson, q ≤ 3.
+
+
+def test_nagq_on_gaussian_mixed_warns_and_strips_to_laplace():
+    with pytest.warns(UserWarning, match="nagq"):
+        result = glmm.fit(FIT_DATA, "y_gauss ~ x + (1 | g)", "gaussian", nagq=3)
+    assert result.converged
+    # The stripped fit IS the Laplace fit — same answer as an explicit nagq=1 call.
+    base = glmm.fit(FIT_DATA, "y_gauss ~ x + (1 | g)", "gaussian")
+    assert _np.allclose(result.beta, base.beta)
+
+
+def test_nagq_on_crossed_re_warns_and_strips():
+    data = {**FIT_DATA, "h": [f"h{i % 5}" for i in range(_N)]}
+    with pytest.warns(UserWarning, match="nagq"):
+        result = glmm.fit(data, "y_bin ~ x + (1 | g) + (1 | h)", "binomial", nagq=3)
+    assert result.converged
+
+
+def test_nagq_over_q_cap_warns_and_strips():
+    # q_p = 4 (intercept + 3 slopes) exceeds the temporary q ≤ 3 AGQ cap.
+    data = {
+        **FIT_DATA,
+        "x1": _rng.normal(size=_N).tolist(),
+        "x2": _rng.normal(size=_N).tolist(),
+        "x3": _rng.normal(size=_N).tolist(),
+    }
+    with pytest.warns(UserWarning, match="nagq"):
+        result = glmm.fit(
+            data,
+            "y_bin ~ x + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g)",
+            "binomial",
+            nagq=3,
+        )
+    assert result.converged
+
+
+def test_nagq_on_fixed_only_warns_and_strips():
+    with pytest.warns(UserWarning, match="nagq"):
+        result = glmm.fit(FIT_DATA, "y_bin ~ x", "binomial", nagq=3)
+    assert result.converged
+
+
 def test_dispersion_on_gaussian_warns_and_strips_then_fits():
     with pytest.warns(UserWarning, match="dispersion"):
         result = glmm.fit(FIT_DATA, "y_gauss ~ x", "gaussian", dispersion="estimate")

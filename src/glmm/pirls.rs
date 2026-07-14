@@ -4,7 +4,9 @@ use faer::linalg::cholesky::llt::solve::solve_in_place;
 use faer::sparse::linalg::cholesky::LltRef;
 use faer::{Conj, Mat, MatMut, MatRef, Par, Side, Spec};
 
-use super::workspace::{glmm_block_chol, glmm_block_solve, StructuredSchur};
+use super::workspace::{
+    glmm_block_chol, glmm_block_solve, glmm_block_solve_panel, StructuredSchur,
+};
 use super::{PIRLS_MAX_HALVINGS, PIRLS_MAX_ITERS};
 use crate::sparse::logdet_llt;
 use crate::spec::{BinomialLink, Family};
@@ -101,6 +103,10 @@ pub(crate) fn pirls_solve(
     eta_fixed: &mut [f64],
     mu: &mut [f64],
     wm: &mut Mat<f64>,
+    // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
+    // (mirrors `wm` above for M; rebuilt fresh from this iteration's `w` each
+    // Profile step, so no stale-value hazard across PIRLS iterations).
+    wx: &mut Mat<f64>,
     // `a` must survive this call holding the raw symmetric M'WM+I — `dense_schur_fill`
     // (se.rs) re-factors it after a converged Fixed-mode solve (the `blocked_schur_fill`
     // twin's contract, mirrored here). The Cholesky factor+solve therefore runs on the
@@ -376,17 +382,24 @@ pub(crate) fn pirls_solve(
                 1.0,
                 Par::Seq,
             );
-            // C = X'WX (p×p), lower triangle then mirror — dense_schur_fill's xtwx block.
-            for r in 0..p {
-                for c in 0..=r {
-                    let mut s = 0.0;
-                    for i in 0..n {
-                        s += x[(i, r)] * w[i] * x[(i, c)];
-                    }
-                    xtwx[(r, c)] = s;
-                    xtwx[(c, r)] = s;
+            // C = X'WX (p×p) via the W∘X GEMM scratch `wx` — mirrors the X'WM GEMM
+            // above (dense_schur_fill's per-entry xtwx block, same product here).
+            // GEMM fills the full p×p (not just the lower triangle the old scalar
+            // loop mirrored); every downstream read below is over the full matrix
+            // (`schur[(r,c)] = xtwx[(r,c)] - …` for `c in 0..p`), so this is exact.
+            for c in 0..p {
+                for i in 0..n {
+                    wx[(i, c)] = w[i] * x[(i, c)];
                 }
             }
+            matmul(
+                xtwx.as_mut(),
+                Accum::Replace,
+                x.subrows(0, n).transpose(),
+                wx.as_ref().subrows(0, n),
+                1.0,
+                Par::Seq,
+            );
             // T = A⁻¹B = A⁻¹(M'WX): transpose-gather B' into ainv_mtwx, solve with
             // this iteration's factor (dense_schur_fill:283-288).
             for r in 0..k {
@@ -531,6 +544,10 @@ pub(crate) fn pirls_solve_blocked(
     eta_fixed: &mut [f64],
     a_blocks: &mut [f64],
     a_rhs: &mut [f64],
+    // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
+    // (mirrors `pirls_solve`'s `wx`; this variant has no dense M so there is no
+    // `wm` twin here — B' = X'WM is filled by cluster-scatter instead).
+    wx: &mut Mat<f64>,
     pirls_tol_override: Option<f64>,
     n: usize,
 ) -> (f64, f64, f64, bool) {
@@ -785,17 +802,24 @@ pub(crate) fn pirls_solve_blocked(
             ..
         } = &mut beta_step
         {
-            // C = X'WX (p×p), lower triangle then mirror — blocked_schur_fill's xtwx.
-            for r in 0..p {
-                for c in 0..=r {
-                    let mut sm = 0.0;
-                    for i in 0..n {
-                        sm += x[(i, r)] * w[i] * x[(i, c)];
-                    }
-                    xtwx[(r, c)] = sm;
-                    xtwx[(c, r)] = sm;
+            // C = X'WX (p×p) via the W∘X GEMM scratch `wx` — blocked_schur_fill's
+            // xtwx block, same product. GEMM fills the full p×p (the old scalar
+            // loop only filled+mirrored the lower triangle); every downstream read
+            // below is over the full matrix (`schur[(r,c)]` for `c in 0..p`), so
+            // this is exact.
+            for c in 0..p {
+                for i in 0..n {
+                    wx[(i, c)] = w[i] * x[(i, c)];
                 }
             }
+            faer::linalg::matmul::matmul(
+                xtwx.as_mut(),
+                faer::Accum::Replace,
+                x.subrows(0, n).transpose(),
+                wx.as_ref().subrows(0, n),
+                1.0,
+                Par::Seq,
+            );
             // B' = X'WM (p×k), blocked: zero, then scatter the q_p coupling columns
             // per row into cluster f's column band. Uses the live `m_buf[i·q+c] = mᵢ`.
             for r in 0..p {
@@ -912,12 +936,20 @@ pub(crate) fn pirls_solve_blocked(
 /// `coup_cols`/`coup_ptr` is the per-cluster CSR of C_f's nonzero crossed columns
 /// (built once per solve by `pirls_solve_blocked_extras`): the Schur build walks
 /// only those columns instead of all `e` — every skipped column of `C_f` is
-/// exactly 0.0 (no row of cluster `f` touches that crossed level), so its dense
-/// contribution was an exact-zero subtraction and skipping it is bit-identical.
-/// Each `S[a][b]` still receives at most one contribution per cluster in the same
-/// `f` order, so per-entry accumulation order is unchanged. On an observation-
-/// level primary (s ≈ n, grouseticks) this collapses the build from `s·e²/2` to
-/// the ~G² true nonzeros per cluster.
+/// exactly 0.0 (no row of cluster `f` touches that crossed level), so skipping it
+/// drops only exact-zero contributions. On an observation-level primary (s ≈ n,
+/// grouseticks) this collapses the build from `s·e²/2` to the ~G² true nonzeros
+/// per cluster. The downdate itself runs panel-wise per cluster (one batched
+/// `A_f⁻¹` solve + one triangular `C_f'·Y` matmul through `ss`'s scratch — the
+/// LMM sparse-tail kernels A–D port): each `S[a][b]` still receives exactly one
+/// subtraction per touching cluster in the same `f` order; only the dot's
+/// internal association moved into the matmul — a result-moving reassociation of
+/// the sanctioned class (see `SparseTail`'s doc). The panel path serves
+/// `qc > 1` (vector primary and/or nested REs). At `qc == 1` the downdate is
+/// rank-1 and the scalar column-at-a-time walk is the **production route**
+/// (routed via the `qc != 1` filter below; the panel staging is a +4–7%
+/// per-eval loss there — 2026-07-14 drift investigation); the same walk is also
+/// the `ss = None` arm, which is the panel path's equality oracle at `qc > 1`.
 #[allow(clippy::too_many_arguments)]
 fn structured_factor(
     g: &crate::lmm::LmmGroupings,
@@ -926,10 +958,9 @@ fn structured_factor(
     schur_blk: &mut [f64],
     coup_cols: &[u32],
     coup_ptr: &[u32],
-    ss: Option<&mut StructuredSchur>,
+    mut ss: Option<&mut StructuredSchur>,
     force_dense: bool,
 ) -> Option<f64> {
-    use crate::lmm::MAX_PRIMARY_Q;
     let qc = g.primary_q + g.nested_per_parent;
     let s = g.n_primary;
     let e = g.k_crossed();
@@ -942,30 +973,86 @@ fn structured_factor(
         for r in 0..qc {
             logdet += core_blocks[cb + r * qc + r].ln();
         }
-        // S −= C_f' A_f⁻¹ C_f (lower triangle), one NONZERO crossed column at a
-        // time (cluster f's coup_cols slice; see the fn doc for why this is
-        // bit-identical to the dense 0..e walk).
+        // S −= C_f' A_f⁻¹ C_f (lower triangle) over cluster f's NONZERO crossed
+        // columns: gather them into a compact row-major qc×e_f panel, batch-solve
+        // it, one triangular matmul, then subtract dd's lower triangle through
+        // the same `cols` map (cols ascending ⇒ local lower = global lower).
         let coup = f * qc * e;
         let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
-        let mut ycol = [0.0_f64; MAX_PRIMARY_Q];
-        for &b in cols {
-            let b = b as usize;
-            for local in 0..qc {
-                ycol[local] = coupling[coup + local * e + b];
-            }
-            glmm_block_solve(&core_blocks[cb..cb + qc * qc], qc, &mut ycol[..qc]);
-            // y = A_f⁻¹ C_f[:,b]; S[a][b] −= Σ_local C_f[local][a]·y[local],
-            // lower triangle only (a ≥ b).
-            for &a in cols {
-                let a = a as usize;
-                if a < b {
-                    continue;
-                }
-                let mut acc = 0.0;
+        let e_f = cols.len();
+        if e_f == 0 {
+            continue;
+        }
+        let Some(StructuredSchur {
+            c_panel,
+            y_panel,
+            dd_temp,
+            ..
+        }) = ss.as_deref_mut().filter(|_| qc != 1)
+        else {
+            // Production route for qc == 1 (and the ss = None oracle) — see the
+            // fn doc. At qc == 1 the downdate is rank-1: the panel path stages the
+            // identical FLOPs (gather → dd_temp → second scatter pass) at ~double
+            // the memory traffic, a measured +4–7% per-eval loss on the qc=1
+            // cross6 GLMM cells (binb 1.758→1.870 s; 2026-07-14 drift
+            // investigation). This scalar walk accumulates each rank-1 dot
+            // straight into schur_blk — already minimal. `qc == 1` is the only
+            // measured boundary; no qc>1 GLMM structured cell exists in the grid.
+            // Sizing of the panel buffers mirrors this condition in
+            // `StructuredSchur::new` — change together.
+            let mut ycol = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
+            for &b in cols {
+                let b = b as usize;
                 for local in 0..qc {
-                    acc += coupling[coup + local * e + a] * ycol[local];
+                    ycol[local] = coupling[coup + local * e + b];
                 }
-                schur_blk[a * e + b] -= acc;
+                glmm_block_solve(&core_blocks[cb..cb + qc * qc], qc, &mut ycol[..qc]);
+                // y = A_f⁻¹ C_f[:,b]; S[a][b] −= Σ_local C_f[local][a]·y[local],
+                // lower triangle only (a ≥ b).
+                for &a in cols {
+                    let a = a as usize;
+                    if a < b {
+                        continue;
+                    }
+                    let mut acc = 0.0;
+                    for local in 0..qc {
+                        acc += coupling[coup + local * e + a] * ycol[local];
+                    }
+                    schur_blk[a * e + b] -= acc;
+                }
+            }
+            continue;
+        };
+        let cpan = &mut c_panel[..qc * e_f];
+        for local in 0..qc {
+            let crow = &coupling[coup + local * e..];
+            for (dst, &b) in cpan[local * e_f..(local + 1) * e_f].iter_mut().zip(cols) {
+                *dst = crow[b as usize];
+            }
+        }
+        let ypan = &mut y_panel[..qc * e_f];
+        ypan.copy_from_slice(cpan);
+        glmm_block_solve_panel(&core_blocks[cb..cb + qc * qc], qc, ypan, e_f);
+        // dd = C_f'·Y (e_f×e_f lower, col-major). A row-major qc×e_f buffer
+        // viewed col-major e_f×qc IS its transpose — no copy for either side.
+        let dd = &mut dd_temp[..e_f * e_f];
+        let ct = MatRef::from_column_major_slice(cpan, e_f, qc);
+        let yv = MatRef::from_column_major_slice(ypan, e_f, qc).transpose();
+        faer::linalg::matmul::triangular::matmul(
+            MatMut::from_column_major_slice_mut(dd, e_f, e_f),
+            faer::linalg::matmul::triangular::BlockStructure::TriangularLower,
+            faer::Accum::Replace,
+            ct,
+            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+            yv,
+            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+            1.0,
+            Par::Seq,
+        );
+        for (bj, &b) in cols.iter().enumerate() {
+            let b = b as usize;
+            for (&a, &d) in cols[bj..].iter().zip(&dd[bj * e_f + bj..(bj + 1) * e_f]) {
+                schur_blk[a as usize * e + b] -= d;
             }
         }
     }
@@ -1270,6 +1357,9 @@ pub(crate) fn pirls_solve_blocked_extras(
     mut structured_schur: Option<&mut StructuredSchur>,
     force_dense: bool,
     a_rhs: &mut [f64],
+    // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
+    // (mirrors `pirls_solve`'s `wx`).
+    wx: &mut Mat<f64>,
     pirls_tol_override: Option<f64>,
     n: usize,
 ) -> (f64, f64, f64, bool) {
@@ -1591,17 +1681,24 @@ pub(crate) fn pirls_solve_blocked_extras(
             ..
         } = &mut beta_step
         {
-            // C = X'WX (p×p), lower triangle then mirror — structured_schur_fill's X'W̃X.
-            for r in 0..p {
-                for c in 0..=r {
-                    let mut sm = 0.0;
-                    for i in 0..n {
-                        sm += x[(i, r)] * w[i] * x[(i, c)];
-                    }
-                    xtwx[(r, c)] = sm;
-                    xtwx[(c, r)] = sm;
+            // C = X'WX (p×p) via the W∘X GEMM scratch `wx` — structured_schur_fill's
+            // X'W̃X block, same product. GEMM fills the full p×p (the old scalar
+            // loop only filled+mirrored the lower triangle); every downstream read
+            // below is over the full matrix (`schur[(r,c)]` for `c in 0..p`), so
+            // this is exact.
+            for c in 0..p {
+                for i in 0..n {
+                    wx[(i, c)] = w[i] * x[(i, c)];
                 }
             }
+            faer::linalg::matmul::matmul(
+                xtwx.as_mut(),
+                faer::Accum::Replace,
+                x.subrows(0, n).transpose(),
+                wx.as_ref().subrows(0, n),
+                1.0,
+                Par::Seq,
+            );
             // B' = X'WM (p×k): zero, then scatter each row's core + crossed columns
             // from the packed `m_core_buf`/`cross_*` nonzeros (structured_schur_fill:436-456).
             for r in 0..p {
