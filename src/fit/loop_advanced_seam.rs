@@ -61,12 +61,12 @@ pub enum LmmSeamWs {
     /// scratch buffers `reml_deviance` factors into, already armed for the
     /// balanced-collapse fast path if the design qualifies.
     Dense {
-        suff: LmmSuffStats,
-        fit: LmmFitScratch,
+        suff: Box<LmmSuffStats>,
+        fit: Box<LmmFitScratch>,
     },
     /// Sparse (`Solver::Sparse`) route: one symbolic-factor workspace.
     Sparse {
-        ws: crate::sparse::SparseLmmWorkspace,
+        ws: Box<crate::sparse::SparseLmmWorkspace>,
     },
 }
 
@@ -108,7 +108,13 @@ pub fn build_lmm_seam_ws(
             let LmmWorkspace { suff, mut fit, .. } = ws;
             crate::lmm::precompute_balanced_collapse(&suff, &mut fit);
             let g = suff.groupings.clone();
-            (LmmSeamWs::Dense { suff, fit }, g)
+            (
+                LmmSeamWs::Dense {
+                    suff: Box::new(suff),
+                    fit: Box::new(fit),
+                },
+                g,
+            )
         }
         Solver::Sparse => {
             let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(
@@ -128,7 +134,7 @@ pub fn build_lmm_seam_ws(
                 p,
                 None,
             );
-            (LmmSeamWs::Sparse { ws }, g)
+            (LmmSeamWs::Sparse { ws: Box::new(ws) }, g)
         }
     }
 }
