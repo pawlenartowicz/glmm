@@ -13,7 +13,10 @@ python/glmm/_native*.pyd
 # the committed seed + prep script, not the bytes) and per-engine result JSONs
 # (regenerated every run). Committed inputs: data_empirical/*.csv (lme4/nlme). Durable
 # summaries live in parity/reports/ and parity/weights/ (not under results/).
-/parity/data_simulated/
+# The flat *.csv fixtures under data_simulated/ are small and committed (cargo
+# test's include_str! depends on them, incl. in CI); only the 429MB grid/
+# campaign dataset is gitignored.
+/parity/data_simulated/grid/
 /parity/weights/data_simulated/
 /parity/results/
 /parity/weights/results/
