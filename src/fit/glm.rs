@@ -8,7 +8,7 @@ use faer::Mat;
 use crate::glm::{glm_irls_fit, GlmScratch};
 use crate::{Family, NegBinomialLink};
 
-use super::common::{fill_se_compact, to_col_major};
+use super::common::{fill_se_compact, nan_vcov, to_col_major, vcov_from_chol};
 use super::{Fit, FitOptions};
 
 /// Placeholder for the M3 families/links not yet wired through `fit` (Tasks 3–7
@@ -19,6 +19,7 @@ fn fit_unsupported_family(p: usize) -> Fit {
     Fit {
         beta: vec![f64::NAN; p],
         se: vec![f64::NAN; p],
+        vcov: nan_vcov(p),
         tau2: vec![],
         dispersion: f64::NAN,
         converged: false,
@@ -158,6 +159,15 @@ fn fit_glm_prebuilt(
     let converged = view.converged;
     let mut se = vec![f64::NAN; p];
     fill_se_compact(view.var_diag, &opts.target_indices, &mut se);
+    // Unscaled (X'WX)⁻¹, read off `view` here because `view` mutably borrows
+    // `buf` and Gamma's φ estimate below reads `buf.irls_p`. φ multiplies it
+    // afterwards, exactly as √φ scales `se`. `view.l` is stale-or-zero unless
+    // `converged` (its documented contract).
+    let mut vcov = if converged {
+        vcov_from_chol(view.l, p, &opts.target_indices, 1.0)
+    } else {
+        nan_vcov(p)
+    };
 
     // Dispersion. Binomial/Poisson hold φ≡1 (the kernel's `(XᵀWX)⁻¹` is the full
     // covariance). Gamma recovers φ post-fit — the mean model β is φ-independent,
@@ -190,9 +200,18 @@ fn fit_glm_prebuilt(
         _ => 1.0,
     };
 
+    // Var(β̂) = φ·(X'WX)⁻¹ — the same φ the SE loop applied as √φ. A no-op for
+    // the φ≡1 families, where `dispersion` is 1.0.
+    for row in vcov.iter_mut() {
+        for v in row.iter_mut() {
+            *v *= dispersion;
+        }
+    }
+
     Fit {
         beta,
         se,
+        vcov,
         tau2: vec![],
         dispersion,
         converged,

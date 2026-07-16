@@ -1,0 +1,21 @@
+[package]
+name = "glmm-r"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "extendr binding for the glmm crate — the #[extendr] surface re-exported by GLMM/r/src/rust into the fastglmm R package."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+extendr-api = "0.9"
+# version alongside path so `cargo package -p glmm-r` (run by r/tools/
+# cran-tarball.sh to build the self-contained R source tarball) can normalize
+# this manifest; dev builds still use the workspace HEAD via the path.
+glmm = { path = "..", version = "0.1.0" }
+
+[lints]
+workspace = true

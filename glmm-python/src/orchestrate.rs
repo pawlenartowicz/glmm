@@ -1,4 +1,4 @@
-//! Orchestrates one fit: formula + data -> `glmm-formula::lower` -> option
+//! Orchestrates one fit: formula + data -> `glmm::formula::lower` -> option
 //! overrides -> `glmm::fit_warm`, wrapped in `catch_unwind` so the kernel's
 //! `assert!`-based boundary faults become a normal `Err`, never a process
 //! abort across the FFI. No `pyo3` types here — plain-Rust, unit-testable.
@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use glmm::formula::{lower, Column, Table};
 use glmm::{fit_warm, Family, StartValues, WaldSe};
-use glmm_formula::{lower, Column, Table};
 
 use crate::convert::family_from_str;
 
@@ -15,70 +15,46 @@ use crate::convert::family_from_str;
 pub struct FitResult {
     pub beta: Vec<f64>,
     pub se: Vec<f64>,
+    /// Full p×p fixed-effect covariance (`glmm::Fit::vcov`) — the off-diagonals
+    /// `se` alone cannot carry, which any hand-built Wald contrast needs.
+    pub vcov: Vec<Vec<f64>>,
     pub tau2: Vec<f64>,
     pub varcorr: Vec<Vec<f64>>,
     pub stddev_se: Vec<f64>,
     pub aliased: Vec<bool>,
     pub dispersion: f64,
     pub converged: bool,
+    /// Optimizer evaluation count (`glmm::Fit::n_eval`).
+    pub n_eval: usize,
+    /// Minimized optimizer criterion (`glmm::Fit::deviance`) — carries that
+    /// field's not-comparable-across-models caveat; see `glmm/__init__.py`.
+    pub deviance: f64,
     /// `true` iff the fit converged onto a variance-component boundary
-    /// (mirrors `glmm::Fit::singular` / lme4's `isSingular`) — boundary-fits
-    /// follow-up spec Part B step 4 (docs/GLMM/plans/2026-07-14-boundary-
-    /// fits-followup-spec.md): the flag was already computed but never
-    /// surfaced through this wrapper.
+    /// (mirrors `glmm::Fit::singular` / lme4's `isSingular`) — the flag was
+    /// already computed but never surfaced through this wrapper until now.
     pub singular: bool,
     pub names: Vec<String>,
+    /// Per-grouping `(name, term_names)` from `glmm::formula::Lowered::re_groups`,
+    /// in `varcorr` block order (primary, then each extra in declaration order)
+    /// — `ReGroupInfo` flattened for the tuple. Without it `summary()` has no
+    /// grouping name to print and falls back to `group 0`.
+    pub re_groups: Vec<(String, Vec<String>)>,
     /// §3.5 warn-and-strip message for an ineligible-shape `nagq>1` (the fit
     /// proceeded with Laplace); surfaced by `glmm.fit` as a `UserWarning`.
     pub agq_warning: Option<String>,
-}
-
-/// `FitResult` flattened for the PyO3 return — field order matches the
-/// unpacking in `glmm/__init__.py::fit`.
-pub type FitTuple = (
-    Vec<f64>,
-    Vec<f64>,
-    Vec<f64>,
-    Vec<Vec<f64>>,
-    Vec<f64>,
-    Vec<bool>,
-    f64,
-    bool,
-    bool,
-    Vec<String>,
-    Option<String>,
-);
-
-impl FitResult {
-    pub fn into_tuple(self) -> FitTuple {
-        (
-            self.beta,
-            self.se,
-            self.tau2,
-            self.varcorr,
-            self.stddev_se,
-            self.aliased,
-            self.dispersion,
-            self.converged,
-            self.singular,
-            self.names,
-            self.agq_warning,
-        )
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_fit(
     formula: &str,
     numeric_columns: HashMap<String, Vec<f64>>,
-    factor_columns: HashMap<String, Vec<String>>,
+    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
     family: &str,
     link: &str,
     wald_se: &str,
     nagq: u8,
     dispersion: Option<f64>,
     weights: Option<Vec<f64>>,
-    targets: Option<Vec<String>>,
     warm_start: Option<(Vec<f64>, Vec<f64>)>,
 ) -> Result<FitResult, String> {
     let fam = family_from_str(family, link)?;
@@ -89,9 +65,20 @@ pub fn run_fit(
         lengths.push((name.clone(), values.len()));
         columns.push((name, Column::Numeric(values)));
     }
-    for (name, labels) in factor_columns {
-        lengths.push((name.clone(), labels.len()));
-        columns.push((name, Column::Factor { labels }));
+    // Factors arrive pre-coded: `glmm.fit` supplies the level order (a pandas
+    // Categorical's `categories`, or the sorted distinct labels of a plain
+    // string column), so the caller's reference level survives to here rather
+    // than being re-derived by a sort. An out-of-range code would index past
+    // `levels` inside `materialize`, so it is rejected at the boundary.
+    for (name, (levels, codes)) in factor_columns {
+        if let Some(&bad) = codes.iter().find(|&&c| c as usize >= levels.len()) {
+            return Err(format!(
+                "factor column {name:?}: code {bad} is out of range for {} levels",
+                levels.len()
+            ));
+        }
+        lengths.push((name.clone(), codes.len()));
+        columns.push((name, Column::Factor { levels, codes }));
     }
     // Require every column to agree on row count rather than taking the max:
     // a ragged column would otherwise be silently zero-padded by `lower()`'s
@@ -161,18 +148,6 @@ pub fn run_fit(
     lowered.opts.nagq = nagq;
     lowered.opts.dispersion = dispersion;
     lowered.opts.weights = weights;
-    if let Some(names) = &targets {
-        let mut idx = Vec::with_capacity(names.len());
-        for name in names {
-            let pos = lowered
-                .col_names
-                .iter()
-                .position(|c| c == name)
-                .ok_or_else(|| format!("unknown target column {name:?}"))?;
-            idx.push(pos as u32);
-        }
-        lowered.opts.target_indices = idx;
-    }
 
     let start = warm_start.map(|(beta, theta)| StartValues { beta, theta });
 
@@ -190,17 +165,37 @@ pub fn run_fit(
     }))
     .map_err(panic_message)?;
 
+    // `varcorr` and `re_groups` are both emitted in RE declaration order
+    // (primary, then each extra), so index i of one names index i of the other.
+    // Assert rather than trust it: a silent misalignment relabels a variance
+    // component in `summary()`, which reads as a wrong answer, not a cosmetic
+    // slip. Non-mixed fits leave both empty, so the check holds there too.
+    let re_groups: Vec<(String, Vec<String>)> = lowered
+        .re_groups
+        .into_iter()
+        .map(|g| (g.name, g.terms))
+        .collect();
+    assert_eq!(
+        re_groups.len(),
+        fit.varcorr.len(),
+        "re_groups and varcorr must agree in length and order"
+    );
+
     Ok(FitResult {
         beta: fit.beta,
         se: fit.se,
+        vcov: fit.vcov,
         tau2: fit.tau2,
         varcorr: fit.varcorr,
         stddev_se: fit.stddev_se,
         aliased: fit.aliased,
         dispersion: fit.dispersion,
         converged: fit.converged,
+        n_eval: fit.n_eval,
+        deviance: fit.deviance,
         singular: fit.singular,
         names: lowered.col_names,
+        re_groups,
         agq_warning,
     })
 }
@@ -220,7 +215,24 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn toy_ols() -> (HashMap<String, Vec<f64>>, HashMap<String, Vec<String>>) {
+    /// A factor column in the `(levels, codes)` form `run_fit` takes, with the
+    /// lexicographic level order a plain string column gets from `glmm.fit`.
+    fn factor_col(labels: &[&str]) -> (Vec<String>, Vec<u32>) {
+        let mut levels: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
+        levels.sort();
+        levels.dedup();
+        let codes = labels
+            .iter()
+            .map(|l| levels.iter().position(|v| v == l).unwrap() as u32)
+            .collect();
+        (levels, codes)
+    }
+
+    #[allow(clippy::type_complexity)] // test fixture: the numeric+factor column maps run_fit takes
+    fn toy_ols() -> (
+        HashMap<String, Vec<f64>>,
+        HashMap<String, (Vec<String>, Vec<u32>)>,
+    ) {
         let y = vec![1.0, 2.0, 2.9, 4.1, 5.0, 6.2, 6.8, 8.1, 9.0, 10.2];
         let x = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
         let mut numeric = HashMap::new();
@@ -233,7 +245,7 @@ mod tests {
     fn gaussian_ols_end_to_end() {
         let (numeric, factor) = toy_ols();
         let result = run_fit(
-            "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
+            "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None,
         )
         .expect("fit should succeed");
         assert_eq!(
@@ -254,7 +266,7 @@ mod tests {
     fn unknown_column_is_a_clean_error() {
         let (numeric, factor) = toy_ols();
         let err = run_fit(
-            "y ~ z", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
+            "y ~ z", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None,
         )
         .unwrap_err();
         assert!(err.contains("z"), "{err}");
@@ -265,15 +277,13 @@ mod tests {
         // Gaussian LMM with nagq=3: ineligible family — must strip to Laplace
         // and report the §3.5 warning, never surface the kernel's shape panic.
         let (numeric, mut factor) = toy_ols();
-        factor.insert(
-            "g".to_string(),
-            ["a", "b", "c", "d", "e"]
-                .iter()
-                .cycle()
-                .take(10)
-                .map(|s| s.to_string())
-                .collect(),
-        );
+        let g: Vec<&str> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .copied()
+            .cycle()
+            .take(10)
+            .collect();
+        factor.insert("g".to_string(), factor_col(&g));
         let result = run_fit(
             "y ~ x + (1 | g)",
             numeric,
@@ -285,7 +295,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .expect("ineligible nagq must be stripped, not an error");
         let msg = result.agq_warning.as_deref().expect("warning expected");
@@ -293,33 +302,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_target_is_a_clean_error() {
-        let (numeric, factor) = toy_ols();
-        let err = run_fit(
-            "y ~ x",
-            numeric,
-            factor,
-            "gaussian",
-            "identity",
-            "hessian",
-            1,
-            None,
-            None,
-            Some(vec!["nope".to_string()]),
-            None,
-        )
-        .unwrap_err();
-        assert!(err.contains("nope"), "{err}");
-    }
-
-    #[test]
     fn malformed_formula_panic_becomes_a_clean_error_not_a_process_abort() {
         let (numeric, factor) = toy_ols();
         let err = run_fit(
-            "y ~ :", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
+            "y ~ :", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None,
         )
         .unwrap_err();
-        // lower()'s panic (an unguarded index in glmm-formula's interaction-term
+        // lower()'s panic (an unguarded index in the formula frontend's interaction-term
         // handling) must become a clean Err via catch_unwind, not abort the process.
         assert!(!err.is_empty());
     }
@@ -340,7 +329,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .unwrap_err();
         assert!(err.contains("x"), "{err}");
@@ -352,7 +340,7 @@ mod tests {
         let (mut numeric, factor) = toy_ols();
         numeric.insert("junk".to_string(), vec![0.0; 1000]); // not referenced by the formula
         let err = run_fit(
-            "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
+            "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None,
         )
         .unwrap_err();
         assert!(err.contains("junk"), "{err}");

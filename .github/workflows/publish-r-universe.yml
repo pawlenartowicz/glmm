@@ -1,0 +1,61 @@
+name: Publish (r-universe)
+
+# Publishes fastglmm to r-universe. r-universe builds straight from a git ref
+# via `R CMD build`, which strips out-of-package path deps (r/ depends on
+# ../glmm-r, which depends on ../ — the glmm kernel), so it cannot build the
+# repo tree directly. Instead this workflow runs cran-tarball.sh --vendor to
+# stage the self-contained, offline-vendored package and force-pushes that
+# staged tree as the *root* of an orphan `r-universe` branch. r-universe's
+# registry (a separate repo the user controls) points at that branch; it
+# notices the ref change and rebuilds. main never holds the vendored tree —
+# the branch is a generated artifact (docs/GLMM/plans/2026-07-16-r-repo-publishing-spec.md).
+on:
+  push:
+    tags: ["r-*"]
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  version-check:
+    name: Verify tag matches r/DESCRIPTION
+    runs-on: ubuntu-latest
+    needs: [verify]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches DESCRIPTION version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/r-}"
+          VERSION=$(grep -m1 '^Version: ' r/DESCRIPTION | cut -d' ' -f2)
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "::error::r/DESCRIPTION has Version: $VERSION, tag is r-$TAG"
+            exit 1
+          fi
+          echo "r/DESCRIPTION matches tag r-$TAG."
+
+  publish-r-universe:
+    name: Stage + push r-universe branch
+    needs: [version-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # force-push the generated r-universe branch with GITHUB_TOKEN
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: r-lib/actions/setup-r@v2
+      - name: Stage self-contained, vendored package
+        run: r/tools/cran-tarball.sh --vendor
+      - name: Force-push staged tree as the r-universe branch root
+        working-directory: target/cran-stage/fastglmm
+        run: |
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "r-universe: fastglmm ${GITHUB_REF#refs/tags/r-}"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:r-universe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

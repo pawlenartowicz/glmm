@@ -52,15 +52,46 @@ pub struct Fit {
     /// Standard errors: `se[j] = sqrt(Var(β̂_j))` for target predictors,
     /// NaN for non-targets. Length p.
     pub se: Vec<f64>,
+    /// Fixed-effect covariance `Cov(β̂)` — a full symmetric **p×p** matrix
+    /// (`vcov[i][j]`), NOT vech-packed: unlike `varcorr`, which packs one
+    /// variable-sized block per grouping, this is a single square block and
+    /// every consumer (R's `vcov()`/`confint`, `multcomp::glht`, any hand-built
+    /// Wald contrast) indexes it directly. `se` is its diagonal:
+    /// `se[j] == vcov[j][j].sqrt()` wherever both are finite.
+    ///
+    /// Finite exactly where `se` is — the off-diagonal `vcov[i][j]` is finite
+    /// iff `se[i]` and `se[j]` both are. So a [`FitOptions::target_indices`]
+    /// subset leaves everything outside the target block NaN (there is no
+    /// covariance to report for a coefficient whose variance was never
+    /// computed), and a non-converged fit is all-NaN.
+    ///
+    /// Sources, by path: OLS/GLM/LMM invert the same Cholesky factor `se`'s
+    /// forward solve already walks; GLMM `WaldSe::Hessian` takes the β block of
+    /// the joint (θ,β) FD-Hessian covariance, and `WaldSe::Rx` the p×p Schur
+    /// inverse — both already formed in full and previously discarded down to a
+    /// diagonal. Unlike `stddev_se`, this is populated on the Hessian's RX
+    /// fallback too (that fallback inverts a full p×p covariance; only a
+    /// double failure, where the Hessian AND the fallback both fail, NaN-fills
+    /// — as a non-converged fit).
+    pub vcov: Vec<Vec<f64>>,
     /// Per-element Cholesky-scaled values `theta[k]^2 * sigma_sq`. These equal
     /// the random-effect variance components only for diagonal/scalar RE
     /// components (q=1 / scalar-extra — the currently reachable case); slope
     /// (q≥2) models are not yet validated through this field. Empty for OLS.
     pub tau2: Vec<f64>,
     /// Estimated dispersion: `φ` for Gamma (Pearson moment estimator), the
-    /// estimated shape `θ` for negative-binomial, and `1.0` for
-    /// Gaussian/binomial/Poisson (where dispersion is fixed, not estimated).
+    /// estimated shape `θ` for negative-binomial, the residual variance `σ̂²`
+    /// for Gaussian — `RSS/(n−p)` for OLS (raw-row df, matching R
+    /// `summary.lm`'s `sigma²`; the same `sigma_sq` that scales `se`/`vcov`)
+    /// and the REML `pwrss/(n−p)` for LMM (matching lme4 `sigma()²`; oracle:
+    /// `parity/goldens/sleepstudy_lmm.json` `sigma`, asserted in
+    /// `fit_sleepstudy_slope_varcorr_matches_lme4`) — and `1.0` for
+    /// binomial/Poisson (where dispersion is fixed, not estimated). NaN on a
+    /// Gaussian fit with no honest endpoint (non-converged OLS, degenerate
+    /// LMM).
     pub dispersion: f64,
+    /// Whether the optimizer reached its convergence criterion. `false` means
+    /// `se`/`vcov`/`dispersion` above are the NaN-fill described on each field.
     pub converged: bool,
     /// RE (co)variance per grouping: one **vech-packed
     /// lower-triangular** covariance block `D̂ = σ̂²·Λ̂Λ̂'` per grouping, in
@@ -113,8 +144,9 @@ pub struct Fit {
     /// saturated constant. NaN for OLS/GLM and on optimizer/numerical
     /// failure (GLMM non-convergence surfaces as +∞ internally; mapped to
     /// NaN here). An LMM fit that hits `MaxFunReached` still reports the
-    /// finite endpoint deviance here with `converged == false` (Option A,
-    /// `docs/GLMM/implemented/2026-07-11-maxeval-plateau-policy-spec.md`).
+    /// finite endpoint deviance here with `converged == false` — the plateau
+    /// policy: a `MaxFunReached` cap-out reports its finite endpoint with
+    /// `converged == false` rather than NaN-filling.
     pub deviance: f64,
     /// `true` iff the fit converged onto the θ boundary (≥ 1 diagonal variance
     /// component pinned at 0 — `boundary_hit == 1` internally, OR a converged
@@ -132,8 +164,7 @@ pub struct Fit {
 /// singular even when the optimizer's own stopping point (governed by
 /// `PIN_THETA`, an absolute 1e-4 threshold on the internal θ scale — left
 /// untouched, this is a reporting-only check) landed just short of an exact
-/// pin. Measured on `pois_cross4_g3000p20_bal_nearzero` (docs/GLMM/plans/
-/// 2026-07-14-boundary-fits-followup-spec.md, Part B): glmm converges to
+/// pin. Measured on `pois_cross4_g3000p20_bal_nearzero`: glmm converges to
 /// stddev 2.5e-4 against a ~0.44-scale sibling component (ratio ~5.7e-4)
 /// while lme4's own optimizer pins the same component to exactly 0 and flags
 /// `isSingular`; 1e-3 catches this and any tighter true pin with margin.
@@ -626,7 +657,7 @@ pub(crate) fn classify_design_pub(model: &ModelSpec, nagq: u8) -> Solver {
 // feature's `crate::loop_advanced` re-exports the dev seam from here.
 // ---------------------------------------------------------------------------
 
-pub(crate) use common::assemble_varcorr;
+pub(crate) use common::{assemble_varcorr, nan_vcov, vcov_from_chol};
 #[cfg(test)]
 pub(crate) use common::{assert_model_shape_pub, spec_sized_from_ids_pub};
 pub(crate) use glm::{golden_max_ln_theta, nb_profile_loglik};

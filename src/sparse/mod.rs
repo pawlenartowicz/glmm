@@ -115,11 +115,10 @@ pub(crate) fn fit_mle_sparse(
         &upper,
     );
     debug_assert!(out.status != Status::InvalidArgs);
-    // Option A (docs/GLMM/implemented/2026-07-11-maxeval-plateau-policy-spec.md),
-    // mirrored from `fit_lmm` (`lmm.rs`): a `MaxFunReached` cap-out runs the
-    // same pin + rank-guard + recovery as `Converged` — an honest finite
-    // endpoint — but `converged` stays false. `ModelDegenerate` has no
-    // endpoint worth reporting and NaN-fills below.
+    // The plateau policy, mirrored from `fit_lmm` (`lmm.rs`): a `MaxFunReached`
+    // cap-out reports its finite endpoint with `converged == false` rather than
+    // NaN-filling — it runs the same pin + rank-guard + recovery as `Converged`.
+    // `ModelDegenerate` has no endpoint worth reporting and NaN-fills below.
     let converged_status = matches!(out.status, Status::Converged);
     let has_endpoint = matches!(out.status, Status::Converged | Status::MaxFunReached);
 
@@ -157,8 +156,9 @@ pub(crate) fn fit_mle_sparse(
         return crate::Fit {
             beta: vec![f64::NAN; p],
             se: vec![f64::NAN; p],
+            vcov: crate::fit::nan_vcov(p),
             tau2: theta.iter().map(|_| f64::NAN).collect(),
-            dispersion: 1.0,
+            dispersion: f64::NAN,
             converged: false,
             varcorr: vec![],
             stddev_se: vec![],
@@ -214,6 +214,10 @@ pub(crate) fn fit_mle_sparse(
         }
     }
 
+    // Var(β̂) = σ̂²·(L_XX L_XX')⁻¹ over the same target block, off the same
+    // factor the per-target solve above walks — `se` is its diagonal.
+    let vcov = crate::fit::vcov_from_chol(l.as_ref(), p, &opts.target_indices, sigma_sq);
+
     // tau2[k] = θ̂[k]²·σ̂²; varcorr = vech(σ̂²·Λ̂Λ̂') per grouping — the path-independent
     // assembly shared with `fit_mle` (`fit.rs`).
     let tau2: Vec<f64> = theta.iter().map(|&t| t * t * sigma_sq).collect();
@@ -230,8 +234,9 @@ pub(crate) fn fit_mle_sparse(
     let mut fit = crate::Fit {
         beta,
         se,
+        vcov,
         tau2,
-        dispersion: 1.0,
+        dispersion: sigma_sq,
         converged,
         varcorr,
         stddev_se: vec![],

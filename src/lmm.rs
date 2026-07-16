@@ -512,6 +512,7 @@ impl LmmGroupings {
         let q_nested = self.nested.map(|nf| nf.q).unwrap_or(0);
         self.n_primary * self.primary_q + self.n_primary * self.nested_per_parent * q_nested
     }
+    /// Width of the dense crossed-family tail: `k_total - k_family()`.
     pub fn k_crossed(&self) -> usize {
         self.k_total - self.k_family()
     }
@@ -613,10 +614,14 @@ pub struct LmmSuffStats {
 }
 
 impl LmmSuffStats {
+    /// Accumulator for a single-intercept grouping at `max_clusters` clusters
+    /// (`k_total = max_clusters`, no crossed/nested columns).
     pub fn new(p: usize, max_clusters: usize) -> Self {
         Self::with_groupings(p, LmmGroupings::single(max_clusters))
     }
 
+    /// Accumulator sized for an arbitrary `LmmGroupings` layout, including
+    /// nested and crossed RE columns.
     pub fn with_groupings(p: usize, groupings: LmmGroupings) -> Self {
         let m = p + 1;
         let k = groupings.k_total;
@@ -1032,8 +1037,12 @@ impl LmmFitScratch {
 // LmmWorkspace — everything a fit needs, allocated once per problem shape.
 // ---------------------------------------------------------------------------
 
+/// Per-problem-shape scratch: sufficient stats, deviance/PIRLS buffers, and
+/// θ-solver state, allocated once and reused across fits of the same shape.
 pub struct LmmWorkspace {
+    /// Accumulated per-RE-column sufficient statistics for the current data.
     pub suff: LmmSuffStats,
+    /// Deviance/PIRLS scratch buffers sized to the same problem shape.
     pub fit: LmmFitScratch,
     /// BOBYQA solver state — `Bobyqa::new` is the crate's only allocation
     /// site; `minimize` is zero-alloc on the warm path.
@@ -1042,6 +1051,8 @@ pub struct LmmWorkspace {
     pub theta: Vec<f64>,
     /// Per-component box bounds. Diagonal entries: [0, THETA_HI].
     pub lower: Vec<f64>,
+    /// Upper box bound, always THETA_HI regardless of diagonal/off-diagonal
+    /// (see `lower` for the entry that carries the diagonal/off-diagonal split).
     pub upper: Vec<f64>,
 }
 
@@ -2042,8 +2053,9 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
 pub struct LmmFit {
     /// Residual variance estimate σ̂² at θ̂. NaN only when there is no
     /// endpoint to report at all (`ModelDegenerate` / rank-deficient) —
-    /// finite on a `MaxFunReached` cap-out too (Option A,
-    /// `docs/GLMM/implemented/2026-07-11-maxeval-plateau-policy-spec.md`).
+    /// finite on a `MaxFunReached` cap-out too (the plateau policy: a
+    /// `MaxFunReached` cap-out reports its finite endpoint with
+    /// `converged == false` rather than NaN-filling).
     pub sigma_sq: f64,
     /// Whether the optimizer reached an interior minimum or a pinned
     /// boundary (both count); false on a `MaxFunReached` cap-out (the
@@ -2168,8 +2180,8 @@ fn fit_lmm_impl(
         solver.minimize(|xs| reml_deviance(xs, suff, fit), theta, lower, upper)
     };
 
-    // Status mapping (Option A,
-    // docs/GLMM/implemented/2026-07-11-maxeval-plateau-policy-spec.md):
+    // Status mapping (the plateau policy): a `MaxFunReached` cap-out reports
+    // its finite endpoint with `converged == false` rather than NaN-filling.
     // Converged ⇒ candidate fit. MaxFunReached ⇒ still runs the same
     // pin + rank-guard + recovery below (an honest finite endpoint), but
     // `converged` stays false and `boundary_hit` stays 2 rather than
@@ -2492,8 +2504,8 @@ mod tests {
         );
     }
 
-    /// Option A (docs/GLMM/implemented/2026-07-11-maxeval-plateau-policy-spec.md):
-    /// a `MaxFunReached` cap-out must still report the honest finite endpoint
+    /// Exercises the plateau policy: a `MaxFunReached` cap-out must still
+    /// report the honest finite endpoint
     /// (β̂/σ̂²/SE/deviance), with `converged = false` and `boundary_hit == 2`
     /// (not the accepted-boundary 1). Forces the cap by swapping in a solver
     /// whose `max_fun` is the legal minimum (`npt + 1`) — one eval past the
@@ -2528,23 +2540,56 @@ mod tests {
         );
         assert!(
             fit.deviance.is_finite(),
-            "Option A: capped endpoint must report a finite deviance"
+            "plateau policy: capped endpoint must report a finite deviance"
         );
         assert!(
             fit.sigma_sq.is_finite(),
-            "Option A: capped endpoint must report a finite sigma_sq"
+            "plateau policy: capped endpoint must report a finite sigma_sq"
         );
         assert!(
             fit.joint_t_sq.is_finite(),
-            "Option A: capped endpoint must report a finite joint_t_sq"
+            "plateau policy: capped endpoint must report a finite joint_t_sq"
         );
         for &tj in &targets {
             assert!(
                 ws.fit.betas[tj as usize].is_finite(),
-                "Option A: capped endpoint must not NaN-fill beta"
+                "plateau policy: capped endpoint must not NaN-fill beta"
             );
         }
         assert!(fit.n_eval <= npt + 1, "n_eval must reflect the forced cap");
+
+        // Pinned values are the deterministic truncated-BOBYQA endpoint (hand_dataset,
+        // max_fun = npt+1) — a regression lock, not an external oracle: any solver-path
+        // change that moves the honest cap-out endpoint should fail this test.
+        let rel = |got: f64, want: f64| (got - want).abs() / want.abs().max(1e-12);
+        assert!(
+            rel(fit.deviance, -62.08988134487164) < 1e-6,
+            "deviance = {}",
+            fit.deviance
+        );
+        assert!(
+            rel(fit.sigma_sq, 0.16043347869402982) < 1e-6,
+            "sigma_sq = {}",
+            fit.sigma_sq
+        );
+        assert!(
+            rel(fit.joint_t_sq, 14.568949550460516) < 1e-6,
+            "joint_t_sq = {}",
+            fit.joint_t_sq
+        );
+        let want_betas = [
+            0.4691004480864937,
+            0.26391548909385104,
+            -0.33307894295165125,
+        ];
+        for (j, &wb) in want_betas.iter().enumerate() {
+            assert!(
+                rel(ws.fit.betas[j], wb) < 1e-6,
+                "betas[{j}] = {}, want {}",
+                ws.fit.betas[j],
+                wb
+            );
+        }
     }
 
     /// End-to-end q=1 parity on the hand dataset: the general machine vs the
@@ -3313,6 +3358,14 @@ mod tests {
         assert!(fit.converged);
         assert!((ws.fit.betas[1] - 0.4).abs() < 0.15);
         assert!((ws.fit.betas[2] + 0.2).abs() < 0.15);
+        // Deterministic regression lock (lcg-seeded multi_dataset) alongside the
+        // planted-value recovers-check above, which documents intent.
+        assert!(
+            (ws.fit.betas[1] - 0.40829926961384383).abs() / 0.40829926961384383_f64.abs() < 1e-6
+        );
+        assert!(
+            (ws.fit.betas[2] - -0.2916210839321183).abs() / 0.2916210839321183_f64.abs() < 1e-6
+        );
         assert!(ws.fit.t_sq[1].is_finite() && ws.fit.t_sq[2].is_finite());
         assert!(fit.joint_t_sq.is_finite() && fit.joint_t_sq > 0.0);
         assert_eq!(ws.theta.len(), 3);
@@ -3675,6 +3728,13 @@ mod tests {
             "slope {}",
             ws.fit.betas[1]
         );
+        // Deterministic regression lock alongside the bands above.
+        assert!(
+            (ws.fit.betas[0] - 0.46265883331118085).abs() / 0.46265883331118085_f64.abs() < 1e-6
+        );
+        assert!(
+            (ws.fit.betas[1] - 0.20152611939449563).abs() / 0.20152611939449563_f64.abs() < 1e-6
+        );
         assert_eq!(fit.pinned_components & !0b11, 0); // only 2 components exist
     }
 
@@ -3707,6 +3767,12 @@ mod tests {
         assert!(
             ws.fit.betas[1] > ws.fit.betas[2],
             "x1 slope must exceed x2 slope"
+        );
+        // Deterministic regression lock alongside the bands above.
+        assert!((ws.fit.betas[0] - 0.5129839426148501).abs() / 0.5129839426148501_f64.abs() < 1e-6);
+        assert!((ws.fit.betas[1] - 0.6442611282130077).abs() / 0.6442611282130077_f64.abs() < 1e-6);
+        assert!(
+            (ws.fit.betas[2] - 0.28355377896623535).abs() / 0.28355377896623535_f64.abs() < 1e-6
         );
         assert_eq!(fit.pinned_components & !0b111, 0); // only 3 components exist
     }
@@ -4352,6 +4418,9 @@ mod tests {
             "slope {}",
             ws.fit.betas[1]
         );
+        // Deterministic regression lock (seed 137) alongside the wide recovers-check above.
+        assert!((ws.fit.betas[0] - 0.6209080774915476).abs() / 0.6209080774915476_f64.abs() < 1e-6);
+        assert!((ws.fit.betas[1] - 0.257915422474595).abs() / 0.257915422474595_f64.abs() < 1e-6);
     }
 
     /// General brute-force REML deviance: V = I + Σ_g Z_g D_g Z_gᵀ where each

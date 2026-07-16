@@ -1,14 +1,14 @@
 """GLMM Python port — formula + data -> fit.
 
 `glmm.fit` parses `formula` against `data`'s columns through the Rust
-`glmm-formula` parser, fits via the `glmm` kernel (through the `glmm._native`
+`glmm::formula` module, fits via the `glmm` kernel (through the `glmm._native`
 PyO3 extension), and returns a `Fit`. Four combinations from the API spec's
 family/link table are GLMM 0.1.1 ("approved design, not yet implemented in the
 kernel" — docs/GLMM/0.1.1/2026-07-04-glmm-0.1.1-families-links-spec.md) and
 raise a clean `NotImplementedError`: `family="inversegaussian"`,
 `link="cloglog"`, quasi-likelihood `dispersion=` on binomial/poisson, and
-`theta=<float>` (no kernel hook exists yet to seed the negative-binomial search
-— only the default `theta=None` cold-start is supported).
+`init_theta=<float>` (no kernel hook exists yet to seed the negative-binomial
+search — only the default `init_theta=None` cold-start is supported).
 
 Public surface is exactly two names: `fit` and `Fit`.
 """
@@ -44,15 +44,62 @@ _MAX_NAGQ = 25  # mirrors GLMM/src/consts.rs::MAX_NAGQ — change together
 
 
 def _columns(data):
-    """Extract {name: list-of-values} from dict / pandas / polars / pyarrow
-    (spec §3.1) without a hard dependency on any dataframe library."""
+    """Extract {name: column} from dict / pandas / polars / pyarrow (spec §3.1)
+    without a hard dependency on any dataframe library.
+
+    Columns are returned UNFLATTENED so `fit` can still see a categorical dtype:
+    `list(col)` drops it, and with it the level order the caller declared (see
+    `_levels_and_codes`)."""
     if isinstance(data, dict):
-        return {k: list(v) for k, v in data.items()}
+        return dict(data)
     if hasattr(data, "column_names"):  # pyarrow Table
-        return {c: data.column(c).to_pylist() for c in data.column_names}
+        return {c: data.column(c) for c in data.column_names}
     if hasattr(data, "columns"):  # pandas / polars DataFrame
-        return {c: list(data[c]) for c in data.columns}
+        return {c: data[c] for c in data.columns}
     raise TypeError(f"data must be a dict, DataFrame, or pyarrow Table; got {type(data).__name__}")
+
+
+def _levels_and_codes(col):
+    """A factor column as (levels, per-row codes), or None if `col` is not
+    categorical.
+
+    A declared level order is the whole point: level 0 is the treatment-contrast
+    base, so `pd.Categorical(x, categories=["low","med","high"])` must fit
+    against `"low"`, not against whichever label happens to sort first. Rust's
+    `Column::Factor` takes the order from us rather than re-deriving it.
+
+    Duck-typed on `.categories`/`.codes` — no hard pandas dependency, matching
+    `_columns`' `hasattr(data, "column_names")` style. Covers pandas
+    `Categorical`/`Series[category]` (via `.cat`) and pyarrow `DictionaryArray`.
+    A plain string column has no declared order and is handled by the caller."""
+    cat = getattr(col, "cat", col)  # pandas Series[category] -> .cat accessor
+    if hasattr(cat, "categories") and hasattr(cat, "codes"):
+        levels = [str(v) for v in cat.categories]
+        codes = [int(c) for c in cat.codes]
+        # pandas marks a missing value as code -1; there is no level to fit it
+        # against, and silently dropping the row would change the model.
+        if any(c < 0 for c in codes):
+            raise ValueError("categorical column has missing values (code -1); drop or fill them")
+        return levels, codes
+    if hasattr(col, "dictionary") and hasattr(col, "indices"):  # pyarrow DictionaryArray
+        levels = [str(v) for v in col.dictionary.to_pylist()]
+        codes = col.indices.to_pylist()
+        if any(c is None for c in codes):
+            raise ValueError("categorical column has missing values; drop or fill them")
+        return levels, [int(c) for c in codes]
+    return None
+
+
+def _sorted_levels_and_codes(labels):
+    """A plain string column as (levels, codes), levels lexicographic.
+
+    Mirrors Rust's `Column::factor_from_labels` — the R `factor()` default, and
+    all that can be inferred when the caller declared no order. Doing the sort
+    here rather than in the parser is what makes it a default the caller can
+    override, instead of one imposed on every factor."""
+    levels = sorted(set(labels))
+    index = {lvl: i for i, lvl in enumerate(levels)}
+    return levels, [index[v] for v in labels]
 
 
 @dataclass
@@ -61,17 +108,26 @@ class Fit:
     names from the formula. Returned by `fit`, not constructed by callers."""
 
     beta: np.ndarray  # (p,) fixed-effect estimates
-    se: np.ndarray  # (p,) standard errors; NaN for non-targets
+    se: np.ndarray  # (p,) standard errors; NaN where unavailable
+    vcov: np.ndarray  # (p, p) full Cov(beta-hat); se is sqrt of its diagonal
     tau2: np.ndarray  # legacy per-element RE variances (q=1 only) — prefer varcorr
     varcorr: list  # per grouping: vech-packed (column-major lower-tri) RE covariance
     stddev_se: (
         np.ndarray
     )  # SE of each RE stddev, theta layout (not beta-aligned); NaN where unavailable
     aliased: np.ndarray  # (p,) bool — rank-deficient columns dropped (lme4's NA coefficients)
-    dispersion: float  # phi (gamma / inverse-gaussian) / theta (negbin) / 1.0 otherwise
+    dispersion: float  # phi (gamma / inverse-gaussian) / theta (negbin) / residual sigma^2 (gaussian) / 1.0 (binomial, poisson)
     converged: bool
     singular: bool  # boundary (singular) fit — >=1 variance component pinned at 0; mirrors lme4's isSingular
     names: list  # coefficient names, aligned with beta
+    re_groups: list  # per grouping, in varcorr order: (name, [term names])
+    n_eval: int  # optimizer objective evaluations (0 on the closed-form/IRLS paths)
+    # Minimized optimizer criterion. NOT comparable across models and NOT an AIC
+    # input — it carries the Rust `Fit::deviance` caveat: for an LMM it is lme4's
+    # REMLcrit minus a data-independent constant; for a GLMM it is the marginal
+    # Laplace deviance, which differs from -2*logLik by a data-only saturated
+    # constant. NaN for OLS/GLM and on numerical failure.
+    deviance: float
 
     def stddev_corr(self, group_idx):
         """Split grouping `group_idx`'s vech-packed covariance into
@@ -127,12 +183,20 @@ class Fit:
             for g in range(len(self.varcorr)):
                 sd, corr = self.stddev_corr(g)
                 q = len(sd)
-                lines.append(f"  group {g}:")
+                # re_groups is emitted in varcorr order (asserted in the Rust
+                # shim), so index g names block g.
+                group_name, terms = self.re_groups[g]
+                lines.append(f"  {group_name}:")
+                term_w = max((len(t) for t in terms), default=0)
                 for i in range(q):
                     di = theta_off + (i * q - (i * i - i) // 2)
                     sd_se = self.stddev_se[di] if di < len(self.stddev_se) else math.nan
                     corr_cells = " ".join(f"{corr[i][j]:>8.3f}" for j in range(i + 1))
-                    lines.append(f"    sd {sd[i]:>10.4g}  se {sd_se:>10.4g}  corr {corr_cells}")
+                    term = terms[i] if i < len(terms) else ""
+                    lines.append(
+                        f"    {term:<{term_w}}  sd {sd[i]:>10.4g}  se {sd_se:>10.4g}"
+                        f"  corr {corr_cells}"
+                    )
                 theta_off += q * (q + 1) // 2
 
         lines.append("")
@@ -151,11 +215,10 @@ def fit(
     *,
     link=None,
     dispersion=None,
-    theta=None,
+    init_theta=None,
     weights=None,
     wald_se="hessian",
     nagq=1,
-    targets=None,
     warm_start=None,
 ):
     """Fit `formula` against `data`'s columns and return a `Fit`.
@@ -167,6 +230,19 @@ def fit(
         (odd, 1..=25; default 1 = Laplace). k>1 applies to binomial/Poisson
         models with a single grouping factor and q <= 3 random effects per
         group (temporary cap); any other shape warns and falls back to Laplace.
+    init_theta: negative-binomial shape seed, named for `MASS::glm.nb(init.theta=)`
+        — the same knob, and the name the R port exposes. Distinct from
+        `warm_start["theta"]`, which is the random-effect Cholesky vector
+        (lme4's `start=list(theta=)`); they are unrelated parameters and both
+        may be passed in one call.
+    warm_start: {"beta": …, "theta": …} optimizer start. See `init_theta` above
+        for why "theta" here is NOT the negative-binomial shape.
+
+    A categorical column's level order is honored: level 0 is the
+    treatment-contrast base, so `pd.Categorical(x, categories=[…])` fits against
+    the first category you list. A plain string column has no declared order and
+    is sorted lexicographically (R's `factor()` default).
+
     See the API spec for the remaining knobs.
     """
     if family not in _FAMILIES:
@@ -223,12 +299,12 @@ def fit(
                 stacklevel=2,
             )
             dispersion = None
-    if theta is not None and family != "negativebinomial":
+    if init_theta is not None and family != "negativebinomial":
         warnings.warn(
-            "theta= applies only to family 'negativebinomial'; ignored",
+            "init_theta= applies only to family 'negativebinomial'; ignored",
             stacklevel=2,
         )
-        theta = None
+        init_theta = None
     if warm_start is not None:
         if not isinstance(warm_start, dict):
             raise TypeError(
@@ -258,17 +334,27 @@ def fit(
             f"quasi-likelihood dispersion on family {family!r} requires GLMM "
             "0.1.1; not yet implemented in the kernel"
         )
-    if theta is not None:
+    if init_theta is not None:
         raise NotImplementedError(
-            "theta= (negative-binomial shape seed) has no kernel hook yet; "
-            "only theta=None (cold-start search) is supported"
+            "init_theta= (negative-binomial shape seed) has no kernel hook yet; "
+            "only init_theta=None (cold-start search) is supported"
         )
 
+    # Classify each column numeric vs factor, and hand factors across as
+    # (levels, codes) so the caller's reference level survives into Rust.
+    # A declared categorical is checked FIRST: dtype beats value-sniffing, or a
+    # categorical of non-strings (pd.Categorical([1, 2, 3])) would land in the
+    # numeric branch and be fit as a continuous predictor.
     numeric_columns = {}
     factor_columns = {}
-    for name, values in _columns(data).items():
+    for name, col in _columns(data).items():
+        declared = _levels_and_codes(col)
+        if declared is not None:
+            factor_columns[name] = declared
+            continue
+        values = list(col)
         if values and isinstance(values[0], str):
-            factor_columns[name] = [str(v) for v in values]
+            factor_columns[name] = _sorted_levels_and_codes([str(v) for v in values])
         else:
             numeric_columns[name] = [float(v) for v in values]
 
@@ -279,43 +365,44 @@ def fit(
             [float(v) for v in warm_start.get("theta", [])],
         )
 
-    beta, se, tau2, varcorr, stddev_se, aliased, disp, converged, singular, names, agq_warning = (
-        _native.fit(
-            formula,
-            numeric_columns,
-            factor_columns,
-            family,
-            link,
-            wald_se,
-            nagq,
-            dispersion,
-            [float(w) for w in weights] if weights is not None else None,
-            list(targets) if targets is not None else None,
-            warm_start_pair,
-        )
+    r = _native.fit(
+        formula,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        wald_se,
+        nagq,
+        dispersion,
+        [float(w) for w in weights] if weights is not None else None,
+        warm_start_pair,
     )
     # nagq's shape eligibility (single grouping factor, binomial/Poisson,
     # q <= 3) is only decidable after the Rust-side formula lowering, so the
     # §3.5 warn-and-strip for it lives in glmm-python/src/orchestrate.rs; the
     # message comes back here to be raised as the same UserWarning the
     # dispersion/theta strips above use.
-    if agq_warning is not None:
-        warnings.warn(agq_warning, stacklevel=2)
+    if r["agq_warning"] is not None:
+        warnings.warn(r["agq_warning"], stacklevel=2)
     # lme4 parity (boundary-fits follow-up spec Part B step 4): glmm computes
     # this flag already (Fit::singular) but never surfaced it as a warning.
-    if singular:
+    if r["singular"]:
         warnings.warn("boundary (singular) fit: see help('isSingular')", stacklevel=2)
-    # Wrap PyO3's plain-list tuple fields back into the array types Fit's
-    # dataclass documents (no numpy Rust dep — the native call returns plain lists).
+    # Wrap the native dict's plain lists back into the array types Fit's
+    # dataclass documents (no numpy Rust dep — the native call returns lists).
     return Fit(
-        np.asarray(beta, dtype=float),
-        np.asarray(se, dtype=float),
-        np.asarray(tau2, dtype=float),
-        varcorr,
-        np.asarray(stddev_se, dtype=float),
-        np.asarray(aliased, dtype=bool),
-        disp,
-        converged,
-        singular,
-        names,
+        beta=np.asarray(r["beta"], dtype=float),
+        se=np.asarray(r["se"], dtype=float),
+        vcov=np.asarray(r["vcov"], dtype=float),
+        tau2=np.asarray(r["tau2"], dtype=float),
+        varcorr=r["varcorr"],
+        stddev_se=np.asarray(r["stddev_se"], dtype=float),
+        aliased=np.asarray(r["aliased"], dtype=bool),
+        dispersion=r["dispersion"],
+        converged=r["converged"],
+        singular=r["singular"],
+        names=r["names"],
+        re_groups=r["re_groups"],
+        n_eval=r["n_eval"],
+        deviance=r["deviance"],
     )

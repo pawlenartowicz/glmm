@@ -6,6 +6,9 @@
 //! - `loop_advanced` (cargo feature, off by default): the unstable scratch-explicit
 //!   hot-path surface (loop tier) that warm-start consumers like MCPower bind to,
 //!   exposing the kernels and [`StartValues`]. NO semver guarantees.
+//! - [`formula`] (cargo feature, on by default): the R-style formula frontend —
+//!   `formula::lower("y ~ x + (1|g)", &table, family)` builds the kernel's inputs
+//!   from a formula string and a data table instead of by hand.
 //!
 //! `parallel` (cargo feature, off by default, **experimental**): enables in-fit
 //! parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool; a
@@ -18,10 +21,19 @@
 // dead_code only in that build. The `loop_advanced` build uses all of it, so
 // genuinely dead code is still caught there (it's the superset).
 #![cfg_attr(not(feature = "loop_advanced"), allow(dead_code))]
+// Every public statistical item must state its convention and cite its oracle.
+#![warn(missing_docs)]
 
 pub mod consts;
 pub mod linalg;
 pub mod simd_transcendental;
+
+// R-style formula frontend (`formula` feature, on by default). Off for the
+// formula-free hot path, which then links no `regex`. Module docs live in
+// src/formula/mod.rs — keep them there: a `///` fragment here would resolve the
+// module's intra-doc links in the crate root's scope, breaking them.
+#[cfg(feature = "formula")]
+pub mod formula;
 
 mod family;
 mod fit;

@@ -4,7 +4,7 @@
 //! MixedModels references by `compare.R`. Committed alongside the other engines' results.
 //!
 //! The design matrix, `ModelSpec` and per-row `GroupIds` are built by the `d3`
-//! formula frontend (`glmm_formula::lower`, a dev-dependency here) from an R-style
+//! formula frontend (`glmm::formula::lower`, the `formula` feature) from an R-style
 //! formula string + a columnar `Table`, not hand-assembled — the same path SDOC /
 //! MCPower will drive. This doubles as the frontend's end-to-end oracle: the
 //! numbers it feeds `fit_cold` must reproduce the frozen references.
@@ -18,16 +18,16 @@
 //! data-driven lookup at run time, not a re-derivation of lme4's own convention.
 //!
 //! Run via `run.sh` (ENGINES has "rust") or
-//! `cargo run --release --example parity_fit`. Paths are anchored at
-//! `CARGO_MANIFEST_DIR` so the cwd does not matter.
+//! `cargo run --release -p parity --example parity_fit`. Paths are anchored at
+//! `CARGO_MANIFEST_DIR` (the `parity/` crate dir) so the cwd does not matter.
 
 use std::time::Instant;
 
+use glmm::formula::{lower, ReGroupInfo};
 use glmm::{
     fit_cold, BinomialLink, Family, Fit, FitOptions, GammaLink, NegBinomialLink, PoissonLink,
     WaldSe,
 };
-use glmm_formula::ReGroupInfo;
 use serde_json::{json, Value};
 
 #[path = "harness_common.rs"]
@@ -41,17 +41,24 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// overrides at RUN time (a sub-suite's run.sh, e.g. `parity/weights/`, sets
 /// it); unset = the main `parity/` dir, byte-identical to the pre-override
 /// behavior. Read per call site rather than cached: the compile-time
-/// `CARGO_MANIFEST_DIR` anchor stays the fallback.
+/// `CARGO_MANIFEST_DIR` anchor (the `parity/` crate dir) stays the fallback.
 fn suite_dir() -> String {
-    std::env::var("PARITY_SUITE_DIR").unwrap_or_else(|_| format!("{DIR}/parity"))
+    std::env::var("PARITY_SUITE_DIR").unwrap_or_else(|_| DIR.to_string())
 }
 // Timing loop: first (cold) pass discarded, MEDIAN of the rest reported. Median, not
 // min, is the user's chosen estimator for this harness. NOT a locked-machine
 // benchmark — the timing field is indicative only until the box is stabilized/locked
-// (see README "Timing"); the user owns CPU-clock locking, this harness only records.
+// (see README "Timing").
 // 10 runs (was 100): the corpus now holds multi-second GLMM fits where 100 repeats
 // cost an hour per engine for no extra precision; each JSON records its own n_runs,
 // so files timed under the old convention stay self-describing.
+//
+// TWO timings per fit, both recorded: `fit_seconds_median*` times `fit_cold` ALONE
+// (lowering hoisted out) — the solver-isolation number the per-eval / solve-gap
+// analyses need; `fit_seconds_median*_full` times `lower + fit_cold`, the
+// construction-inclusive span lme4 / MixedModels / the Python port all measure, so
+// the cross-engine speedups and the port's `py_gap` compare same-to-same
+// (summarize_timing.R reads the `_full` fields for glmm).
 const N_RUNS: usize = 10;
 
 fn main() {
@@ -129,7 +136,7 @@ fn fit_one(spec: &Value) {
         }
     };
     // Julia's own crossed-interaction grouping operator is `&` (e.g. cake's
-    // `(1 | recipe & replicate)`); this crate's `glmm_formula` parser uses `:`
+    // `(1 | recipe & replicate)`); the formula frontend's parser uses `:`
     // for the same grouping (`(1|A:B)`). `&` occurs nowhere else in the manifest
     // (checked: only cake's RE term), so a global replace is safe and generic.
     let formula_str = formula_str.replace(" & ", ":");
@@ -167,7 +174,12 @@ fn fit_one(spec: &Value) {
         other => panic!("unsupported family: {other}"),
     };
 
-    let mut lo = lower_dataset_generic(spec, &header, &rows, &factors, &formula_str, family);
+    // `table` is kept (not just `lo`) so the construction-inclusive timing below
+    // can re-run `lower(&table)` in a loop — the Rust analogue of what lme4 /
+    // MixedModels / the Python port time (formula+data → model → fit), so all
+    // four engines compare same-to-same. See the `_full` timing fields.
+    let (mut lo, table) =
+        lower_dataset_generic(spec, &header, &rows, &factors, &formula_str, family);
     // `weights_col`: plain per-row prior weights read off the named CSV column
     // (every weights-suite rung except the aggregated-binomial ones, which use
     // the `weights` field lower_dataset_generic already routes -- the two are
@@ -237,13 +249,32 @@ fn fit_one(spec: &Value) {
         println!("glmm  {ds:<12}  unit-identity gate ok (w≡1 == weights:None to 1e-12)");
     }
 
+    // Construction-inclusive timing: median of `lower(&table) + fit_cold`, the
+    // span lme4 (`lmer(formula, df)`), MixedModels (`fit(MixedModel, f, df)`) and
+    // the Python port (`glmm.fit(data, formula)`) all measure — model matrices
+    // are rebuilt from the formula on every call there, so timing `fit_cold`
+    // alone (the `_median` fields, retained for the solver-isolation analyses)
+    // is the ONLY engine that excludes it. `table` is pre-built (the typed-column
+    // DataFrame analogue), so this excludes CSV string-parsing, matching the
+    // reference engines' pre-typed `df`. `opts` is captured, not re-derived from
+    // the fresh lowering: target_indices are column positions the identical table
+    // reproduces, and weights are per-row — both stay valid across re-lowers.
+    let time_full = |opts: &FitOptions| -> f64 {
+        median_secs(timing_batch, || {
+            let l = lower(&formula_str, &table, family)
+                .unwrap_or_else(|e| panic!("re-lower {ds}: {e}"));
+            let _ = fit_cold(&l.x, &l.y, l.n, l.p, &l.model, &l.ids, opts);
+        })
+    };
+
     let fixed_only = lo.re_groups.is_empty();
-    let (converged, estimates, timing, n_eval, deviance) = if gaussian {
+    let (converged, singular, estimates, timing, n_eval, deviance) = if gaussian {
         let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
         let t = json!({
             "fit_seconds_median": median_secs(timing_batch, || {
                 let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
             }),
+            "fit_seconds_median_full": time_full(&lo.opts),
             "n_runs": N_RUNS, "warmup_discarded": 1, "fits_per_sample": timing_batch,
         });
         let est = json!({
@@ -251,7 +282,7 @@ fn fit_one(spec: &Value) {
             "se": nums(&f.se),
             "varcomp": varcomp(&f, &lo.re_groups, &ref_order, false),
         });
-        (f.converged, est, t, f.n_eval, f.deviance)
+        (f.converged, f.singular, est, t, f.n_eval, f.deviance)
     } else if fixed_only {
         // Fixed-only GLM (weights suite): no θ, so the Rx-vs-Hessian method
         // split is moot — one fit, one SE, emitted as `se_rx` to line up with
@@ -261,6 +292,7 @@ fn fit_one(spec: &Value) {
             "fit_seconds_median": median_secs(timing_batch, || {
                 let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
             }),
+            "fit_seconds_median_full": time_full(&lo.opts),
             "n_runs": N_RUNS, "warmup_discarded": 1, "fits_per_sample": timing_batch,
         });
         let est = json!({
@@ -268,7 +300,7 @@ fn fit_one(spec: &Value) {
             "se_rx": nums(&f.se),
             "varcomp": varcomp(&f, &lo.re_groups, &ref_order, false),
         });
-        (f.converged, est, t, f.n_eval, f.deviance)
+        (f.converged, f.singular, est, t, f.n_eval, f.deviance)
     } else {
         // GLMM SE has two genuinely different variants (Laplace) — emit both so
         // compare.R checks like to like: se_hessian (keeps θ–β coupling, glmm
@@ -290,6 +322,8 @@ fn fit_one(spec: &Value) {
             "fit_seconds_median_hessian": median_secs(timing_batch, || {
                 let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
             }),
+            "fit_seconds_median_rx_full": time_full(&o_r),
+            "fit_seconds_median_hessian_full": time_full(&lo.opts),
             "n_runs": N_RUNS, "warmup_discarded": 1, "fits_per_sample": timing_batch,
         });
         let est = json!({
@@ -301,6 +335,10 @@ fn fit_one(spec: &Value) {
         });
         (
             fh.converged && fr.converged,
+            // singular from the Hessian fit (fh) — same PIRLS fit as fr, so the
+            // boundary decision is identical; fh is the one whose θ block the
+            // estimates come from.
+            fh.singular,
             est,
             t,
             fh.n_eval + fr.n_eval,
@@ -313,7 +351,7 @@ fn fit_one(spec: &Value) {
         "family": family_str,
         "reml": if gaussian { json!(spec["reml"].as_bool().unwrap_or(false)) } else { Value::Null },
         "rung": rung,
-        "converged": converged, "singular": false,
+        "converged": converged, "singular": singular,
         "optimizer": "bobyqa",
         "n_eval": n_eval,
         "deviance": num(deviance),
@@ -368,10 +406,10 @@ fn varcomp(f: &Fit, re_groups: &[ReGroupInfo], ref_order: &[String], include_se:
     )
 }
 
-/// Compares a `glmm_formula` grouping name against the lme4 reference's grouping
+/// Compares a formula-frontend grouping name against the lme4 reference's grouping
 /// name, order-invariant on `:`-joined components: lme4 names a nested inner
 /// group `child:parent` (e.g. `"Variety:Block"` for `(1|Block/Variety)`) while
-/// `glmm_formula` names the same grouping `parent:child` (`"Block:Variety"`) — a
+/// the formula frontend names the same grouping `parent:child` (`"Block:Variety"`) — a
 /// pure display-convention difference, not a different grouping. Comparing the
 /// `:`-split component sets (rather than the joined string) matches either order,
 /// and is a no-op for non-composite names (single-component groupings compare

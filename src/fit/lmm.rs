@@ -6,7 +6,9 @@
 use crate::lmm::{fit_lmm, LmmWorkspace};
 use crate::{ModelSpec, StartValues};
 
-use super::common::{assemble_varcorr, fill_se_by_predictor, to_col_major};
+use super::common::{
+    assemble_varcorr, fill_se_by_predictor, nan_vcov, to_col_major, vcov_from_chol,
+};
 use super::{Fit, FitOptions};
 
 // ---------------------------------------------------------------------------
@@ -70,9 +72,9 @@ pub(super) fn fit_lmm_into(
     // tau2[k] = theta[k]^2 * sigma_sq — the k-th variance component in original scale.
     // ws.theta holds the fitted Cholesky parameters; diagonal entries satisfy
     // theta[k] = sqrt(tau_k / sigma_sq), so theta[k]^2 * sigma_sq = tau_k.
-    // Gated on the finite endpoint (`deviance`), not `converged` — Option A
-    // (docs/GLMM/implemented/2026-07-11-maxeval-plateau-policy-spec.md) reports
-    // an honest θ̂ on a `MaxFunReached` cap-out too, just with converged=false.
+    // Gated on the finite endpoint (`deviance`), not `converged` — the plateau
+    // policy: a `MaxFunReached` cap-out reports an honest θ̂ (its finite
+    // endpoint) with `converged == false` rather than NaN-filling.
     let has_endpoint = lmm_fit.deviance.is_finite();
     let tau2: Vec<f64> = if has_endpoint {
         ws.theta.iter().map(|&t| t * t * sigma_sq).collect()
@@ -88,11 +90,25 @@ pub(super) fn fit_lmm_into(
         vec![]
     };
 
+    // Var(β̂) = σ̂²·(X'V⁻¹X)⁻¹ from the top-left p×p block of the augmented
+    // factor — the same `L_XX` and the same σ̂² the `var_diag` forward solve
+    // above uses, so `vcov`'s diagonal is `var_diag`. Gated on the finite
+    // endpoint like `tau2`/`varcorr`: the degenerate return NaN-fills
+    // `var_diag` and `sigma_sq` together, so `se` and `vcov` go NaN together.
+    let vcov = if has_endpoint {
+        vcov_from_chol(ws.fit.factor.as_ref(), p, target_indices, sigma_sq)
+    } else {
+        nan_vcov(p)
+    };
+
     let mut fit = Fit {
         beta,
         se,
+        vcov,
         tau2,
-        dispersion: 1.0,
+        // REML σ̂² (NaN-filled by the kernel alongside var_diag on the
+        // degenerate path, so this stays honest without an endpoint gate).
+        dispersion: sigma_sq,
         converged: lmm_fit.converged,
         varcorr,
         stddev_se: vec![], // LMM has no Hessian SE machinery

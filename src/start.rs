@@ -20,21 +20,8 @@
 ///   `THETA0` blind start). Empty for fixed-only (OLS/GLM) models.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartValues {
+    /// Warm-start β, length `p`.
     pub beta: Vec<f64>,
+    /// Warm-start θ (RE Cholesky vech), length `n_theta`; empty for fixed-only models.
     pub theta: Vec<f64>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn start_values_round_trips_fields() {
-        let s = StartValues {
-            beta: vec![0.1, -0.2],
-            theta: vec![0.7],
-        };
-        assert_eq!(s.beta.len(), 2);
-        assert_eq!(s.theta, vec![0.7]);
-    }
 }

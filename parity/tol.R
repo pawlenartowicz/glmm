@@ -21,6 +21,16 @@ TOL <- list(
                             #   single-step-FD vs numDeriv-Richardson method floor on the theta
                             #   block, noisier than the beta block, hence the wider band.
 
+  # glmm (Rust) vs the glmm Python port -- a ROUND-OFF band, not an agreement band.
+  # The port drives the same kernel through PyO3 (fit_warm(start=NULL) IS fit_cold),
+  # with the same lowering and a deterministic optimizer, so every gated quantity is
+  # bit-identical and only the JSON round-trip could perturb it (it does not: Rust
+  # and Python both emit shortest-round-trip f64, jsonlite parses back exact). Any
+  # nonzero value here means the port fed the kernel something different -- a wiring
+  # bug -- so this is the one band that is diagnostic at 0 and is NEVER widened.
+  # Measured worst across the 26-rung corpus at freeze (2026-07-16): exactly 0.
+  port_rel        = 1e-12,
+
   # Vector-RE AGQ rungs vs GLMMadaptive (goldens/sim_*_slope*_agq_k*.json; the
   # in-crate gates in src/fit/glmm_tests.rs use these numbers -- change
   # together). Calibrated empirically at freeze (2026-07-13) against goldens

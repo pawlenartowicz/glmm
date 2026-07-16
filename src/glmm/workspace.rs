@@ -47,19 +47,24 @@ pub struct GlmmWorkspace {
     /// `nagq > 1 && parallel_inner`; None otherwise. Serial builds are always
     /// node-outer: cluster-outer serially regresses many-tiny-cluster shapes
     /// (see the build site in fit_glmm).
-    pub cluster_rows: Option<super::agq::ClusterRowIndex>,
+    pub(crate) cluster_rows: Option<super::agq::ClusterRowIndex>,
     /// total RE columns (groupings.k_total)
     pub k: usize,
     /// fixed-effect predictors
     pub p: usize,
+    /// count of variance-component (θ) parameters (groupings.n_theta())
     pub n_theta: usize,
     /// max_n × k dense RE design (built per (spec, N) by `build_z`)
     pub z: Mat<f64>,
     /// max_n × k = ZΛ (rebuilt per BOBYQA eval)
     pub m: Mat<f64>,
+    /// Joint (θ,β) BOBYQA solver, dimension `n_theta + p`.
     pub solver: Bobyqa,   // sized n_theta + p
+    /// Joint solver's live iterate: `[θ (n_theta) | β (p)]`.
     pub params: Vec<f64>, // [θ | β]
+    /// Joint solver box lower bounds, length `n_theta + p`.
     pub lower: Vec<f64>,
+    /// Joint solver box upper bounds, length `n_theta + p`.
     pub upper: Vec<f64>,
     /// θ-only BOBYQA solver for the two-stage optimizer's stage 1: sized
     /// `n_theta`, configured with the same `rho_begin`/`GLMM_RHO_END` schedule
@@ -78,8 +83,11 @@ pub struct GlmmWorkspace {
     /// optimum within oracle tolerances.
     pub two_stage: bool,
     // PIRLS scratch (sized max_n / k):
+    /// PIRLS linear predictor η, length max_n.
     pub eta: Vec<f64>,
+    /// PIRLS fitted mean μ, length max_n.
     pub prob: Vec<f64>,
+    /// PIRLS working weights W, length max_n.
     pub w: Vec<f64>,
     /// Σ_j x·β, hoisted out of the PIRLS iteration (β fixed within a solve)
     pub eta_fixed: Vec<f64>,
@@ -99,6 +107,7 @@ pub struct GlmmWorkspace {
     /// fused-SIMD logit fast path in `pirls.rs` (the fused kernel cannot take
     /// per-row weights; weighted logit runs the general scalar branch).
     pub(crate) weighted: bool,
+    /// Current RE-mode iterate û, length k.
     pub u: Vec<f64>,
     /// previous accepted PIRLS iterate, step-halving backtrack buffer (len k.max(1))
     pub u_prev: Vec<f64>,
@@ -169,7 +178,7 @@ pub struct GlmmWorkspace {
     /// Cached sparse factor of the crossed Schur `S`. `Some` only on the
     /// structured crossed path with `e > 0`; built per fit by `StructuredSchur::new`
     /// after `build_z`. `None` ⇒ the dense/blocked/e=0 paths, which never touch it.
-    pub structured_schur: Option<StructuredSchur>,
+    pub(crate) structured_schur: Option<StructuredSchur>,
     /// Test-only: force the dense `glmm_block_chol` Schur factor instead of the
     /// cached sparse one, so the both-paths cross-check runs both at one θ. Always
     /// `false` in production (the sparse factor is the only path).
@@ -200,6 +209,17 @@ pub struct GlmmWorkspace {
     pub beta_seed: Vec<f64>,
     /// length p
     pub var_diag: Vec<f64>,
+    /// p×p Cov(β̂) — `var_diag` is its diagonal, and both are filled together at
+    /// the same target indices (NaN elsewhere). Workspace-owned, not returned on
+    /// `GlmmFit`, so filling it costs no per-fit allocation and the `Rx` warm
+    /// path keeps its zero-alloc gate. Sourced from the full matrix each SE arm
+    /// already forms: `Rx` from the Schur forward-solve columns, `Hessian` from
+    /// `fd_hessian_cov`'s β block. Mapped to `Fit::vcov` by `fit/glmm.rs`.
+    pub vcov: Mat<f64>,
+    /// p×p scratch holding column `j` of `L⁻¹` at each target `j` — the `Rx`
+    /// arm's per-target forward solves, kept so their pairwise dots can fill
+    /// `vcov`'s off-diagonals instead of only `‖·‖²` on its diagonal.
+    pub vcov_cols: Mat<f64>,
     /// length p
     pub t_sq: Vec<f64>,
     // SE of each θ coordinate = sqrt of the θ-block diagonal of the joint (θ,β)
@@ -214,8 +234,11 @@ pub struct GlmmWorkspace {
     /// length p; Var(β̂)_jj forward-solve scratch (per-target)
     pub fwd_solve: Vec<f64>,
     // joint Wald scratch (reuse lme::joint_wald_chi_sq):
+    /// Inverse of the joint Wald K matrix, p×p (see `lme::joint_wald_chi_sq`).
     pub joint_k_inv: Mat<f64>,
+    /// Cholesky factor of the joint Wald Σ_t, p×p.
     pub joint_sigma_t_chol: Mat<f64>,
+    /// Joint Wald right-hand side, length p.
     pub joint_rhs: Vec<f64>,
     // FD-Hessian SE scratch (`fd_hessian_cov`), allocated once so the per-fit
     // hessian path reuses them. `m = n_theta + p = params.len()`.
@@ -459,6 +482,8 @@ impl GlmmWorkspace {
             beta_prof: vec![0.0; p],
             beta_seed: vec![0.0; p],
             var_diag: vec![0.0; p],
+            vcov: Mat::zeros(p, p),
+            vcov_cols: Mat::zeros(p, p),
             t_sq: vec![0.0; p],
             theta_se: vec![f64::NAN; n_theta],
             fwd_solve: vec![0.0; p],
@@ -625,8 +650,6 @@ pub(crate) struct StructuredSchur {
     pub(crate) c_panel: Vec<f64>,
     pub(crate) y_panel: Vec<f64>,
     pub(crate) dd_temp: Vec<f64>,
-    /// Crossed width `e = g.k_crossed()`.
-    pub(crate) e: usize,
 }
 
 impl StructuredSchur {
@@ -714,7 +737,6 @@ impl StructuredSchur {
             c_panel: vec![0.0f64; qc * panel_ef],
             y_panel: vec![0.0f64; qc * panel_ef],
             dd_temp: vec![0.0f64; panel_ef * panel_ef],
-            e,
         })
     }
 
@@ -754,7 +776,6 @@ impl StructuredSchur {
             c_panel: vec![0.0f64; self.c_panel.len()],
             y_panel: vec![0.0f64; self.y_panel.len()],
             dd_temp: vec![0.0f64; self.dd_temp.len()],
-            e: self.e,
         }
     }
 }
@@ -976,11 +997,11 @@ mod tests {
         let cluster_ids = ids.primary;
         let extra_ids = ids.extra;
         let ss = StructuredSchur::new(&g, &cluster_ids, &extra_ids, n).expect("e = 181 > 0 ⇒ Some");
-        assert_eq!(ss.e, g.k_crossed());
-        assert_eq!(ss.e, 181);
+        assert_eq!(ss.axx.ncols(), g.k_crossed());
+        assert_eq!(ss.axx.ncols(), 181);
         // Symbolic factor allocated a non-empty L; diagonal is fully present.
         assert!(
-            ss.symbolic.len_val() >= ss.e,
+            ss.symbolic.len_val() >= ss.axx.ncols(),
             "at least the e diagonal entries"
         );
         assert_eq!(ss.l_values.len(), ss.symbolic.len_val());

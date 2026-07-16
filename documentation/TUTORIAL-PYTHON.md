@@ -11,8 +11,8 @@ links, knobs) is a string or scalar argument, not a type.
 > a valid `fit(...)` call parses the formula, fits, and returns a real `Fit`.
 > Four narrow combinations are GLMM 0.1.1 gaps and raise a clean
 > `NotImplementedError` instead: `family="inversegaussian"`, `link="cloglog"`,
-> quasi-likelihood `dispersion=` on binomial/poisson, and a `theta=` float
-> seed (see §2).
+> quasi-likelihood `dispersion=` on binomial/poisson, and an `init_theta=`
+> float seed (see §2).
 
 The package is not on PyPI yet. Install from the repo:
 
@@ -21,7 +21,8 @@ pip install ./python            # from the repo root; add -e for development
 ```
 
 (For the Rust crate this package ports, see [`TUTORIAL-RUST.md`](TUTORIAL-RUST.md)
-— same models, hand-built inputs instead of a formula.)
+— same models, hand-built inputs instead of a formula — and for the R port,
+[`TUTORIAL-R.md`](TUTORIAL-R.md).)
 
 ## 1. One call — formula in, `Fit` out
 
@@ -59,7 +60,10 @@ Points worth knowing at this layer:
 - The formula follows R conventions: `*` desugars to main effects +
   interaction, `A/B` to nesting, `(1 + x | g)` is a correlated random
   intercept + slope, and additional `(… | g2)` terms add crossed/nested
-  grouping factors. Treatment contrasts (R's default) code the factors.
+  grouping factors. Treatment contrasts (R's default) code the factors, based
+  on the column's **first level** — a `pandas.Categorical` uses the first
+  category you declare; a plain string column declares no order and is sorted
+  lexicographically, as R's `factor()` does.
 - Misspell a keyword and you get a `TypeError` at the call site — the
   signature is explicit keywords, no options bag, so typos can't become
   silent no-ops.
@@ -87,19 +91,19 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
   φ ≡ 1. `"estimate"`: force the Pearson estimate — on binomial/poisson this
   *is* quasi-binomial/quasi-Poisson, GLM only. A float: hold φ fixed (still
   scales SE). Fix-vs-estimate, not a warm start.
-- `theta` — negative-binomial shape. `None` (default, the only value the
-  kernel currently accepts) cold-starts the θ search; a float raises
-  `NotImplementedError` — there is no kernel hook yet to seed it. Estimation
-  always runs.
 - `nagq` — adaptive Gauss–Hermite node count; `1` = Laplace (default). Must
   be odd and ≤ 25. `>1` applies to binomial/Poisson models with a single
   grouping factor and ≤ 3 random effects per group (intercept + slopes,
   temporary cap); any other shape warns and falls back to Laplace.
 - `wald_se` — fixed-effect Wald-SE denominator: `"hessian"` (default) or
   `"rx"`.
-- `targets` — list of predictor names whose SE is computed; `None` ⇒ all.
-  SE computation has a cost, so on wide models ask only for the columns you
-  need — non-targets get `NaN` SE.
+- `init_theta` — negative-binomial shape seed, named for
+  `MASS::glm.nb(init.theta=)`. `None` (default, the only value the kernel
+  currently accepts) cold-starts the θ search; a float raises
+  `NotImplementedError` — there is no kernel hook yet to seed it. Estimation
+  always runs. Distinct from `warm_start["theta"]`, the random-effect Cholesky
+  start (§4): unrelated knobs that happen to share a Greek letter, which is why
+  this one is not just called `theta`. Both may be passed in one call.
 - `weights` — per-row prior (case) weights, lme4's `weights=`. For an
   aggregated binomial, `y` is the success *proportion* and `weights` the
   trial count (lme4's `cbind(s, m−s)`).
@@ -107,7 +111,7 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
 **Error vs. warning.** An *invalid* value — unknown family, a link the family
 doesn't offer, even `nagq` (`ValueError`), a non-dict `warm_start`
 (`TypeError`) — raises. A *valid but inapplicable* option — `dispersion=` on
-gaussian, `theta=` off negative-binomial, quasi-dispersion on a mixed
+gaussian, `init_theta=` off negative-binomial, quasi-dispersion on a mixed
 binomial/poisson formula — warns (`UserWarning`) and is stripped, so it never
 reaches the kernel: loud enough to catch the mistake, lenient enough for
 exploration. One combination is a hard error rather than a warning:
@@ -121,21 +125,38 @@ them). It is returned by `fit`, never constructed by callers.
 | field | what it holds |
 |---|---|
 | `beta` | `(p,)` fixed-effect estimates |
-| `se` | `(p,)` standard errors; `NaN` for non-targets |
+| `se` | `(p,)` standard errors; `NaN` where unavailable |
+| `vcov` | `(p, p)` full Cov(β̂) — `se` is the sqrt of its diagonal; use it for contrasts/confidence intervals, where the off-diagonals matter |
 | `names` | coefficient names, aligned with `beta` |
 | `aliased` | `(p,)` bool — rank-deficient columns dropped (lme4's `NA` coefficients) |
 | `varcorr` | per grouping: vech-packed lower-triangular RE covariance D̂ |
 | `tau2` | legacy per-element RE variances (q=1 only) — prefer `varcorr` |
 | `stddev_se` | SE of each RE stddev, θ layout (not beta-aligned); `NaN` where unavailable |
 | `dispersion` | φ (gamma / inverse-gaussian) / θ (negbin) / 1.0 otherwise |
+| `re_groups` | per grouping, in `varcorr` order: `(name, [term names])` — what `summary()` labels the RE block with |
+| `n_eval` | optimizer objective evaluations (0 on the closed-form/IRLS paths) |
+| `deviance` | minimized optimizer criterion — **not** comparable across models, and not an AIC input (see below) |
 | `converged` | numerical failure signals here (not an exception) — check before trusting `beta`/`se` |
+
+**`deviance` is not a model-comparison statistic.** It is the criterion the
+optimizer minimized, on that fit's own scale: for an LMM it is lme4's
+`REMLcrit` minus a data-independent constant; for a GLMM it is the marginal
+Laplace deviance, which differs from −2·logLik by a data-only saturated
+constant. Those constants do not cancel between two different models, so
+differencing `deviance` across fits — or feeding it to an AIC — is a mistake.
+It is `NaN` for OLS/GLM and on numerical failure.
+
+**`vcov` and `se` carry different information.** `se` is only the diagonal, so
+it cannot answer anything about two coefficients jointly. A contrast like
+β₁ − β₂ needs `Var(β₁) + Var(β₂) − 2·Cov(β₁, β₂)`, and that covariance lives
+only in `vcov`. Both are `NaN` in the same places.
 
 `summary()` builds the coefficient table — **name, estimate, std. error, z,
 p** — prints it, and returns it as a string. Aliased columns show `NaN`
 estimates, as lme4 prints `NA`. A footer carries `dispersion` and
-`converged`, and when `varcorr` is non-empty an RE block shows per-grouping
-stddev / correlation (lme4's `VarCorr` layout) with `stddev_se` alongside
-where populated. The z/p columns are derived in Python from `beta`/`se` as a
+`converged`, and when `varcorr` is non-empty an RE block shows each grouping
+by name with its per-term stddev / correlation (lme4's `VarCorr` layout) and
+`stddev_se` alongside where populated — the names come from `re_groups`. The z/p columns are derived in Python from `beta`/`se` as a
 Wald test (`z = beta/se`, `p = 2·(1 − Φ(|z|))`); Wald-z (not t) matches the
 GLM/GLMM convention and the absence of a residual-df field on the kernel
 output.
@@ -163,7 +184,7 @@ The dict takes exactly two keys, mirroring the Rust `StartValues`: `"beta"`
 (length p) and `"theta"` (Cholesky-scaled RE start; empty for fixed-only
 models, where a warm start is a no-op anyway). Unknown keys warn and are
 dropped. The gamma φ is a post-fit estimate, and the negative-binomial θ seed
-is the `theta=` kwarg (§2). `warm_start` is always explicit, caller-owned —
+is the `init_theta=` kwarg (§2). `warm_start` is always explicit, caller-owned —
 a previous fit's state is never threaded forward automatically.
 
 **Batch processing** (many fits with same formula behind one call — bootstrap,

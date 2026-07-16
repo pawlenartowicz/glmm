@@ -6,7 +6,8 @@ shorter, self-contained note on skipping the hand-built inputs via a formula
 string.
 
 (This page covers the Rust crate only — for the Python port, see
-[`TUTORIAL-PYTHON.md`](TUTORIAL-PYTHON.md).)
+[`TUTORIAL-PYTHON.md`](TUTORIAL-PYTHON.md); for the R port,
+[`TUTORIAL-R.md`](TUTORIAL-R.md).)
 
 All inputs use **row-major** `f64` for the design matrix: `x[i * p + j]` is
 row `i`, column `j`.
@@ -148,18 +149,18 @@ the OLS/GLM/GLMM/LME kernels and scratch types the same way — `fit_cold`/
 
 Building `x`/`ModelSpec`/`GroupIds` by hand (as above) is fine for a fixed,
 known model shape. If you'd rather describe the model as an R-style formula
-string and a data table, the companion `glmm-formula` crate does the
-lowering:
+string and a data table, the `glmm::formula` module (the `formula` feature, on
+by default) does the lowering:
 
 ```rust
+use glmm::formula::{lower, Column, Table};
 use glmm::{fit_cold, Family};
-use glmm_formula::{lower, Column, Table};
 
 let table = Table {
     columns: vec![
         ("y".into(), Column::Numeric(y_values)),
         ("x1".into(), Column::Numeric(x1_values)),
-        ("group".into(), Column::Factor { labels: group_labels }),
+        ("group".into(), Column::factor_from_labels(&group_labels)),
     ],
     n,
 };
@@ -174,3 +175,7 @@ contrasts (R's default), and returns everything `fit_cold` needs — including
 `lo.col_names`, the coefficient name for each design column. Use `parse`/
 `materialize` separately if you need to parse once and materialize against
 several data tables (the parse step is data-free).
+
+If you only need the kernel — the parse-once/fit-many hot path — take
+`glmm = { version = "0.1", default-features = false }`; the formula module
+disappears and the crate links no `regex`.

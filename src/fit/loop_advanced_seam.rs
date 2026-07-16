@@ -61,11 +61,14 @@ pub enum LmmSeamWs {
     /// scratch buffers `reml_deviance` factors into, already armed for the
     /// balanced-collapse fast path if the design qualifies.
     Dense {
+        /// Accumulated per-cluster sufficient statistics for the design.
         suff: Box<LmmSuffStats>,
+        /// Cholesky/collapse scratch buffers `reml_deviance` factors into.
         fit: Box<LmmFitScratch>,
     },
     /// Sparse (`Solver::Sparse`) route: one symbolic-factor workspace.
     Sparse {
+        /// Symbolic-factor workspace for the sparse REML objective.
         ws: Box<crate::sparse::SparseLmmWorkspace>,
     },
 }
@@ -195,9 +198,13 @@ pub fn lmm_objective_at(
 /// eval count and raw convergence bit (no pinning, no β recovery).
 #[cfg(feature = "loop_advanced")]
 pub struct LmmSweepOutcome {
+    /// Profiled REML deviance at `theta`.
     pub deviance: f64,
+    /// θ at the accepted point, in the same vech layout as [`lmm_objective_at`].
     pub theta: Vec<f64>,
+    /// Number of objective evaluations the solver used.
     pub n_eval: usize,
+    /// Whether the solver reported convergence (vs. hitting `max_fun`/other stop).
     pub converged: bool,
 }
 

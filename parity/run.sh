@@ -8,12 +8,15 @@
 # PARITY_MANIFEST_HINT overrides -- see weights/run.sh for the exact values. Any
 # suite-specific text belongs behind one of those vars, not hardcoded here.
 #
-#   ./run.sh                 fit glmm (Rust) only + compare against the EXISTING
-#                             results/lme4_*/mixedmodels_* JSONs on disk (fast default;
-#                             R/lme4 and Julia/MixedModels are NOT refit -- those results
-#                             don't change run to run, so paying their cost every time is
-#                             wasted). Never touches data_{empirical,simulated}/.
-#   ./run.sh --oracles       refit ALL THREE engines (R, Julia, Rust) + compare -- use when
+#   ./run.sh                 fit glmm (Rust) AND the glmm Python port + compare against
+#                             the EXISTING results/lme4_*/mixedmodels_* JSONs on disk
+#                             (fast default; R/lme4 and Julia/MixedModels are NOT refit --
+#                             those results don't change run to run, so paying their cost
+#                             every time is wasted). Never touches data_{empirical,simulated}/.
+#                             The port fits the same kernel through PyO3: compare.R gates it
+#                             against the Rust row (near-exact), and summarize_timing.R's
+#                             py_gap column is the end-to-end cost of calling from Python.
+#   ./run.sh --oracles       refit ALL FOUR engines (R, Julia, Rust, Python) + compare -- use when
 #                             regenerating the oracle itself (new dataset, new machine,
 #                             tolerance work).
 #   ./run.sh --prep          regenerate the committed data_{empirical,simulated}/*.csv
@@ -67,8 +70,8 @@ if [[ $# -gt 0 ]]; then
   export PARITY_ONLY
 fi
 
-ENGINES=(rust)
-[[ "$ORACLES" == 1 ]] && ENGINES=(R jl rust)
+ENGINES=(rust py glmm_r)
+[[ "$ORACLES" == 1 ]] && ENGINES=(lme4 jl rust py glmm_r)
 
 # Pin the timed fits to one P-core (cores 0-5 are the 5.3 GHz P-cores on this box;
 # same core every run) so a locked-machine run isn't perturbed by the scheduler
@@ -85,7 +88,7 @@ fi
 
 for e in "${ENGINES[@]}"; do
   case "$e" in
-    R)
+    lme4)
       echo ">> lme4 (R)"
       $PIN Rscript "$PARITY/oracle/fit.R" ;;
     jl)
@@ -101,7 +104,33 @@ for e in "${ENGINES[@]}"; do
         echo "   skipped: cargo not found" >&2
       else
         $PIN cargo run --quiet --release --manifest-path "$PARITY/../Cargo.toml" \
-          --example parity_fit
+          -p parity --example parity_fit
+      fi ;;
+    py)
+      echo ">> glmm python port -> results/glmm_python_*/"
+      # The repo's own venv first (python/venv, where `maturin develop --release`
+      # installs the wheel editable), else whatever python3 has glmm importable.
+      # The wheel MUST be a --release build: a debug kernel would report the port's
+      # "overhead" as a codegen artifact an order of magnitude too large.
+      # dirname "$PARITY" (already absolute), not "$PARITY/..": a literal ".." in
+      # sys.executable makes the venv's site.py warn about an unexpected sys.prefix.
+      PY="$(dirname "$PARITY")/python/venv/bin/python"
+      [[ -x "$PY" ]] || PY="$(command -v python3 || true)"
+      if [[ -z "$PY" ]] || ! "$PY" -c 'import glmm' 2>/dev/null; then
+        echo "   skipped: no python with the glmm wheel installed (see $PARITY_README_HINT)" >&2
+      else
+        $PIN "$PY" "$PARITY/oracle/fit.py"
+      fi ;;
+    glmm_r)
+      echo ">> glmm R port -> results/glmm_r_*/"
+      # Same kernel as the Rust/Python engines, reached through the fastglmm R
+      # package (extendr wrapper). No venv step -- the package is installed in the
+      # R library. Skip cleanly if it is not, so a machine without it still runs
+      # the rest.
+      if ! Rscript -e 'if (!requireNamespace("fastglmm", quietly=TRUE)) quit(status=1)' 2>/dev/null; then
+        echo "   skipped: fastglmm R package not installed (see $PARITY_README_HINT)" >&2
+      else
+        $PIN Rscript "$PARITY/oracle/fit_port.R"
       fi ;;
     *)
       echo "unknown engine: $e" >&2; exit 2 ;;

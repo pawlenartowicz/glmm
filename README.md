@@ -52,9 +52,9 @@ and GLMM legs detailed in
 | [`documentation/algorithms-lmm.md`](documentation/algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML, closed-form shortcut, BOBYQA, boundary handling |
 | [`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md) | GLMM: PIRLS, Laplace vs AGQ, dense vs sparse Z, NB outer loop, warm starts |
 
-## Alpha (0.0.x)
+## Scope and stability (0.1.x)
 
-The stable surface is [`fit_cold`]/[`fit_warm`] + `ModelSpec` + `GroupIds`.
+The semver-covered surface is `fit_cold`/`fit_warm` + `ModelSpec` + `GroupIds`.
 
 | Model                      | Fixed-only (`re: None`) | Mixed (`re: Some`)                                          |
 |-----------------------------|--------------------------|---------------------------------------------------------------|
@@ -100,6 +100,7 @@ let model = ModelSpec {
     }),
 };
 let ids = GroupIds { primary: vec![0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5], extra: vec![] };
+// target_indices = which coefficients get a standard error; here, both.
 let opts = FitOptions { target_indices: vec![0, 1], ..Default::default() };
 
 let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts);
@@ -108,7 +109,8 @@ assert!(fit.converged);
 
 See [`TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md) for the full walkthrough: warm
 starts, the advanced hot-loop surface, and building `x`/`ModelSpec`/`GroupIds`
-from a formula string instead of by hand.
+from a formula string with `glmm::formula` (the `formula` feature, on by default)
+instead of by hand.
 
 ## Design
 

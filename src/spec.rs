@@ -8,8 +8,16 @@ pub type ColumnId = u32;
 /// Cluster sizing regime: a fixed cluster count, or a fixed per-cluster size.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Sizing {
-    FixedClusters { n_clusters: u32 },
-    FixedSize { cluster_size: u32 },
+    /// Fixed number of clusters; per-cluster size grows with total N.
+    FixedClusters {
+        /// Cluster count, held constant as N scales.
+        n_clusters: u32,
+    },
+    /// Fixed per-cluster size; cluster count grows with total N.
+    FixedSize {
+        /// Rows per cluster, held constant as N scales.
+        cluster_size: u32,
+    },
 }
 
 impl Sizing {
@@ -20,12 +28,18 @@ impl Sizing {
             Sizing::FixedSize { cluster_size } => (*cluster_size).max(1) as usize,
         }
     }
+    /// Number of clusters when total row count is `n`: the fixed `n_clusters`
+    /// itself under `FixedClusters`, or `n / cluster_size` (floor) under
+    /// `FixedSize`.
     pub fn n_clusters_at(&self, n: usize) -> usize {
         match self {
             Sizing::FixedClusters { n_clusters } => (*n_clusters).max(1) as usize,
             Sizing::FixedSize { cluster_size } => n / (*cluster_size).max(1) as usize,
         }
     }
+    /// Cluster index owning row `i` (0-based row index into `x`/`y`). Under
+    /// `FixedClusters`, rows are dealt round-robin (`i % n_clusters`); under
+    /// `FixedSize`, rows are contiguous per cluster (`i / cluster_size`).
     pub fn cluster_of_row(&self, i: usize) -> usize {
         match self {
             Sizing::FixedClusters { n_clusters } => i % (*n_clusters).max(1) as usize,
@@ -40,14 +54,30 @@ impl Sizing {
 /// magnitudes and warm starts are not carried here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Grouping {
+    /// How this grouping's clusters relate to the primary grouping's rows.
     pub relation: GroupingRelation,
+    /// Random-slope design columns for this grouping (0-based indices into `x`);
+    /// empty means random-intercept only.
     pub slopes: Vec<ColumnId>,
 }
 
+/// How an extra grouping's clusters map onto rows, relative to the primary
+/// grouping.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GroupingRelation {
-    Crossed { n_clusters: u32 },
-    NestedWithin { n_per_parent: u32 },
+    /// Independent (crossed) with the primary grouping: `n_clusters` clusters,
+    /// each potentially touching any primary cluster (e.g. items crossed with
+    /// subjects).
+    Crossed {
+        /// Cluster count for this crossed factor.
+        n_clusters: u32,
+    },
+    /// Nested within the primary grouping: each primary cluster contains
+    /// `n_per_parent` clusters of this factor, uniquely owned by that parent.
+    NestedWithin {
+        /// Number of this factor's clusters per parent (primary) cluster.
+        n_per_parent: u32,
+    },
 }
 
 /// Outcome distribution + link. Selects the fit kernel together with
@@ -142,8 +172,12 @@ pub enum NegBinomialLink {
 /// GLMM fixed-effect Wald-SE denominator.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WaldSe {
+    /// FD-Hessian of the joint (θ, β) Laplace deviance — the lme4
+    /// `use.hessian = TRUE`-matching default.
     #[default]
     Hessian,
+    /// Direct inverse of the expected-information Schur complement (assumes
+    /// β–θ orthogonality); anticonservative for the GLMM.
     Rx,
 }
 
@@ -153,8 +187,12 @@ pub enum WaldSe {
 /// unrepresentable. Holds exactly the RE fields the LMM/GLMM kernels read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReStructure {
+    /// Primary grouping's cluster-count regime.
     pub sizing: Sizing,
+    /// Random-slope design columns for the primary grouping (0-based indices
+    /// into `x`); empty means random-intercept only.
     pub slopes: Vec<ColumnId>,
+    /// Additional crossed/nested grouping factors beyond the primary grouping.
     pub extra_groupings: Vec<Grouping>,
 }
 
@@ -170,7 +208,10 @@ pub struct ReStructure {
 /// a warm fit unchanged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelSpec {
+    /// Outcome distribution + link, selecting the fit kernel.
     pub family: Family,
+    /// Random-effect structure; `None` for a fixed-only model (OLS/GLM),
+    /// `Some` for mixed (LMM/GLMM).
     pub re: Option<ReStructure>,
 }
 
@@ -193,8 +234,6 @@ mod tests {
             re: Some(re),
         };
         let re = spec.re.as_ref().unwrap();
-        // primary RE width q_p = 1 (intercept) + #slopes
-        assert_eq!(1 + re.slopes.len(), 2);
         assert_eq!(re.sizing.atom(), 30);
     }
 

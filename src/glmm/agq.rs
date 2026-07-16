@@ -323,7 +323,6 @@ pub(crate) fn agq_deviance(
 ///
 /// **Oracle.** Validated against **GLMMadaptive** (`mixed_model(nAGQ=k)`) — lme4
 /// `glmer` refuses `nAGQ>1` for vector REs, so it covers only the scalar rungs.
-/// See `docs/GLMM/plans/2026-07-12-full-agq-vector-re-spec.md` Part 4.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn agq_deviance_vec(
     family: Family,

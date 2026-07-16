@@ -348,7 +348,8 @@ pub fn fit_glmm(
     // (`debug_assert!(!profile_beta || nagq == 1)`), and AGQ fits must bypass stage 1
     // unchanged. A Laplace-pass warm start for AGQ was measured on the 33 diligent
     // AGQ cells (2026-07-14) and reverted: total eval count was a wash (−0.3%), below
-    // the ship gate's materiality bar — see docs/GLMM/implemented/.
+    // the ship gate's materiality bar (the minimum eval-count improvement required
+    // to keep a change).
     let mut n_eval_stage1 = 0usize;
     if two_stage && nagq == 1 {
         params_stage1.copy_from_slice(&params[..n_theta]); // θ₀ as today
@@ -748,6 +749,7 @@ pub fn fit_glmm(
                 Err(_) => return nan_fit(ws, target_indices, n_eval),
             };
             let lschur = sc.L();
+            nan_fill_vcov(ws, p);
             for &tj in target_indices {
                 let tj = tj as usize;
                 // Forward-solve into reusable scratch; fwd_solve[i] is written before
@@ -767,6 +769,26 @@ pub fn fit_glmm(
                 } else {
                     f64::NAN
                 };
+                // Keep this target's column of L⁻¹: Schur⁻¹ = L⁻ᵀL⁻¹, so the
+                // pairwise dots below are `vcov`'s off-diagonals — the same
+                // arithmetic `vd` takes the norm of, not thrown away.
+                for i in 0..p {
+                    ws.vcov_cols[(i, tj)] = ws.fwd_solve[i];
+                }
+            }
+            for &ta in target_indices {
+                for &tb in target_indices {
+                    let (a, b) = (ta as usize, tb as usize);
+                    if b > a {
+                        continue; // symmetric — fill both from the lower pair
+                    }
+                    let mut acc = 0.0;
+                    for i in 0..p {
+                        acc += ws.vcov_cols[(i, a)] * ws.vcov_cols[(i, b)];
+                    }
+                    ws.vcov[(a, b)] = acc * sigma_sq;
+                    ws.vcov[(b, a)] = acc * sigma_sq;
+                }
             }
             // Joint Wald-χ² via the lme helper (Schur is the β-information; σ̂²
             // divides W as in the LMM caller — 1 except Gamma).
@@ -808,6 +830,28 @@ pub fn fit_glmm(
                 } else {
                     f64::NAN
                 };
+            }
+            // `cov` IS Cov(β̂) in full — keep the target block rather than only
+            // the diagonal just read. The RX fallback (`NonPdFellBackToRx`) fills
+            // `cov` through `rx_cov_into`, which forms a complete p×p inverse
+            // too, so it carries a real vcov and is NOT NaN-filled here.
+            //
+            // Mirror the lower triangle instead of copying both cells: `cov`
+            // comes from a solve against an identity, which leaves (a,b) and
+            // (b,a) differing in the last bits. The matrix is symmetric
+            // mathematically, and every other path builds it symmetric by
+            // construction, so pick one value per pair rather than hand a
+            // consumer an almost-symmetric vcov.
+            nan_fill_vcov(ws, p);
+            for &ta in target_indices {
+                for &tb in target_indices {
+                    let (a, b) = (ta as usize, tb as usize);
+                    if b > a {
+                        continue;
+                    }
+                    ws.vcov[(a, b)] = cov[(a, b)];
+                    ws.vcov[(b, a)] = cov[(a, b)];
+                }
             }
             // Joint Wald-χ²: `joint_wald_chi_sq` expects the β-INFORMATION (it inverts
             // and sub-blocks internally), so pass info = cov⁻¹. Write cov⁻¹ into the
@@ -863,12 +907,25 @@ pub fn fit_glmm(
     }
 }
 
+/// NaN-fill `ws.vcov` — the workspace is reused across fits, so every SE arm
+/// clears it before writing its target block; entries outside that block stay
+/// NaN, keeping `vcov` finite exactly where `var_diag` is.
+fn nan_fill_vcov(ws: &mut GlmmWorkspace, p: usize) {
+    for a in 0..p {
+        for b in 0..p {
+            ws.vcov[(a, b)] = f64::NAN;
+        }
+    }
+}
+
 /// NaN-fill the inference outputs on a non-converged / Schur-failure fit, mirror
 /// `fit_lmm`'s NaN-fill branch (boundary_hit = 2 = optimizer/Schur failure).
 fn nan_fit(ws: &mut GlmmWorkspace, targets: &[u32], n_eval: usize) -> GlmmFit {
     for v in ws.betas.iter_mut() {
         *v = f64::NAN;
     }
+    let p = ws.betas.len();
+    nan_fill_vcov(ws, p);
     for &t in targets {
         ws.var_diag[t as usize] = f64::NAN;
         ws.t_sq[t as usize] = f64::NAN;

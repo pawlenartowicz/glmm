@@ -1,0 +1,51 @@
+[package]
+name = "parity"
+# Lockstep with the crate: must equal GLMM/Cargo.toml [package] version.
+# fit.rs stamps CARGO_PKG_VERSION into each result JSON's engine_version, and
+# after the move that macro reads THIS manifest, not glmm's.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Dev/CI-only cross-language oracle harness — never distributed. Being a nested
+# package is also what keeps everything under parity/ out of `cargo package
+# -p glmm`: Cargo never descends into a subdirectory with its own Cargo.toml.
+publish = false
+
+# No lib/bin — this package exists only to own the three oracle example targets
+# below (examples satisfy Cargo's at-least-one-target requirement).
+
+# `formula` — the drivers lower R-style formulas; `loop_advanced` — theta_eval
+# drives the dev-only seam. Enabled here on the dep rather than per-example
+# `required-features` so all three examples always build (and stay under the
+# workspace clippy deny gate) in `cargo clippy --workspace --all-targets`.
+[dependencies]
+glmm = { path = "..", features = ["formula", "loop_advanced"] }
+
+[dev-dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
+
+# The glmm side of the cross-language parity harness. Kept at oracle/fit.rs
+# (where the design and run.sh name it) rather than the default examples/ dir;
+# run by run.sh's "rust" engine entry (`cargo run -p parity --example parity_fit`).
+[[example]]
+name = "parity_fit"
+path = "oracle/fit.rs"
+
+# The glmm side of the optimizer-grid campaign (manifest_grid.json, 510 cells):
+# one JSONL record per cell, appended to $GRID_OUT. Shares harness_common.rs
+# with parity_fit above.
+[[example]]
+name = "grid_fit"
+path = "oracle/grid_fit.rs"
+
+# Mismatch-adjudication driver (oracle spec 2026-07-11): evaluates/minimizes
+# the LMM profiled-REML objective at caller-chosen θ/schedules through the
+# dev-only loop_advanced seam. Shares harness_common.rs with the two above.
+[[example]]
+name = "theta_eval"
+path = "oracle/theta_eval.rs"

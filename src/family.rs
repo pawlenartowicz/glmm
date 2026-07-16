@@ -341,7 +341,8 @@ mod tests {
         // d_i = 2[ y log(y/μ) − (y−μ) ]; at y=μ → 0
         assert!(dev_resid(f, f64::NAN, 4.0, 4.0).abs() < 1e-10);
         assert!(dev_resid(f, f64::NAN, 4.0, 2.0) > 0.0);
-        assert!(dev_resid(f, f64::NAN, 0.0, 1.0).abs() > 0.0); // y=0 finite (0·ln0→0)
+        // y=0, μ=1: t=0 (0·ln0→0 limit), so d = 2[0 − (0−1)] = 2.0 exactly.
+        assert!((dev_resid(f, f64::NAN, 0.0, 1.0) - 2.0).abs() < 1e-10);
     }
 
     #[test]

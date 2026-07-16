@@ -49,13 +49,6 @@ def test_negativebinomial_glm_cold_start():
     assert result.dispersion > 0  # theta estimate
 
 
-def test_targets_subset_leaves_other_se_nan():
-    y = 1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)
-    result = glmm.fit(_data(y.tolist()), "y ~ x", targets=["x"])
-    assert np.isnan(result.se[0])  # (Intercept) not targeted
-    assert not np.isnan(result.se[1])  # x targeted
-
-
 def test_agq_vector_q2_smoke():
     # q=2 (random intercept + slope) binomial with small clusters, where the
     # Laplace bias AGQ corrects is visible — proves nagq>1 actually routed to

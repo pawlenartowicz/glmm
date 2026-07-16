@@ -4,8 +4,8 @@
 //! rather than a library module — both examples are dev-only, so this stays a
 //! plain shared source file rather than adding a crate for two consumers.
 
+use glmm::formula::{lower, Column, Lowered, Table};
 use glmm::Family;
-use glmm_formula::{lower, Column, Lowered, Table};
 use serde_json::{json, Value};
 
 /// Read a parity CSV at an explicit path (unquoted header + rows, `,`-split).
@@ -39,9 +39,12 @@ pub fn build_table(header: &[String], rows: &[Vec<String>], factors: &[String]) 
             let is_factor = factors.iter().any(|f| f == name)
                 || rows.iter().any(|r| r[j].parse::<f64>().is_err());
             let col = if is_factor {
-                Column::Factor {
-                    labels: rows.iter().map(|r| r[j].clone()).collect(),
-                }
+                // A CSV column carries no declared level order, so the
+                // lexicographic default is the whole of what the oracle can
+                // know — and it is what R's own `factor()` did on the reference
+                // side when the golden was frozen.
+                let labels: Vec<String> = rows.iter().map(|r| r[j].clone()).collect();
+                Column::factor_from_labels(&labels)
             } else {
                 Column::Numeric(rows.iter().map(|r| r[j].parse().unwrap()).collect())
             };
@@ -72,14 +75,14 @@ pub fn nums(xs: &[f64]) -> Value {
 
 /// Load a grid cell's CSV → lower. Returns the lowered inputs, whether the
 /// family is Gaussian, and the cell's pre-registered eval cap. `manifest_dir`
-/// is the crate root (`CARGO_MANIFEST_DIR`); data lives under
-/// `parity/data_simulated/grid/`. Used by the grid drivers (`grid_fit`,
+/// is the `parity/` crate dir (`CARGO_MANIFEST_DIR`); data lives under
+/// `data_simulated/grid/`. Used by the grid drivers (`grid_fit`,
 /// `theta_eval`) — allow(dead_code) because `parity_fit` includes this file
 /// without calling it.
 #[allow(dead_code)]
 pub fn lower_grid_cell(cell: &Value, manifest_dir: &str) -> (Lowered, bool, usize) {
     let case_id = cell["case_id"].as_str().unwrap();
-    let path = format!("{manifest_dir}/parity/data_simulated/grid/{case_id}.csv");
+    let path = format!("{manifest_dir}/data_simulated/grid/{case_id}.csv");
     let (header, rows) = read_csv_path(&path);
     let factors: Vec<String> = cell["factors"]
         .as_array()
@@ -103,8 +106,9 @@ pub fn lower_grid_cell(cell: &Value, manifest_dir: &str) -> (Lowered, bool, usiz
         },
         other => panic!("family {other}"),
     };
-    // aggregated binomial reuses the tier-0 lowering (weights/prop/expansion)
-    let lo = lower_dataset_generic(cell, &header, &rows, &factors, &formula, family);
+    // aggregated binomial reuses the tier-0 lowering (weights/prop/expansion);
+    // the grid driver does not time lowering, so the Table is dropped here.
+    let (lo, _table) = lower_dataset_generic(cell, &header, &rows, &factors, &formula, family);
     let max_fun = cell["max_fun"].as_u64().unwrap_or(0) as usize;
     (lo, matches!(family, Family::Gaussian), max_fun)
 }
@@ -118,6 +122,13 @@ pub fn lower_grid_cell(cell: &Value, manifest_dir: &str) -> (Lowered, bool, usiz
 /// weights (`src/fit.rs`'s boundary assert only rejects nAGQ>1 with weights),
 /// so there is no more dense-vs-sparse split or per-trial Bernoulli expansion
 /// to keep the two argmins in agreement.
+///
+/// Returns the built `Table` alongside the `Lowered`, so a caller that wants to
+/// TIME the lowering (fit.rs's construction-inclusive timing, matching how lme4 /
+/// MixedModels / the Python port measure `formula+data -> model -> fit`) can
+/// re-run `lower(formula, &table, family)` in a loop without re-parsing the CSV.
+/// The Table is the typed-columns analogue of an lme4/Julia DataFrame — built
+/// once, then lowered repeatedly.
 pub fn lower_dataset_generic(
     spec: &Value,
     header: &[String],
@@ -125,10 +136,11 @@ pub fn lower_dataset_generic(
     factors: &[String],
     formula_str: &str,
     family: Family,
-) -> Lowered {
+) -> (Lowered, Table) {
     let Some(w_name) = spec["weights"].as_str() else {
         let table = build_table(header, rows, factors);
-        return lower(formula_str, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
+        let lo = lower(formula_str, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
+        return (lo, table);
     };
 
     let w_idx = header
@@ -147,5 +159,5 @@ pub fn lower_dataset_generic(
     table.columns.push(("prop".into(), Column::Numeric(prop)));
     let mut lo = lower(formula_str, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
     lo.opts.weights = Some(sizes);
-    lo
+    (lo, table)
 }

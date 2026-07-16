@@ -6,7 +6,7 @@ use faer::Mat;
 
 use crate::ols::{OlsScratch, OlsSuffStats, PANEL_ROWS};
 
-use super::common::fill_se_compact;
+use super::common::{fill_se_compact, nan_vcov, vcov_from_chol};
 use super::{Fit, FitOptions};
 
 // ---------------------------------------------------------------------------
@@ -104,12 +104,21 @@ pub(super) fn fit_ols(x: &[f64], y: &[f64], n: usize, p: usize, opts: &FitOption
     let converged = view.converged;
     let mut se = vec![f64::NAN; p];
     fill_se_compact(view.var_diag, &opts.target_indices, &mut se);
+    // `view.factor` is stale-or-zero unless `converged` (its documented
+    // contract) — a non-converged fit reports an all-NaN vcov, as `se` does.
+    let vcov = if converged {
+        vcov_from_chol(view.factor, p, &opts.target_indices, view.sigma_sq)
+    } else {
+        nan_vcov(p)
+    };
 
     Fit {
         beta,
         se,
+        vcov,
         tau2: vec![],
-        dispersion: 1.0,
+        // σ̂² = RSS/(n−p); NaN when not converged (nonconverged_view's fill).
+        dispersion: view.sigma_sq,
         converged,
         varcorr: vec![],
         stddev_se: vec![],

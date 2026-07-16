@@ -245,9 +245,19 @@ pub(super) fn fit_rank_deficient(
         beta[orig] = fr.beta[r];
         se[orig] = fr.se[r];
     }
+    // Same scatter in two dimensions: an aliased column has no coefficient, so
+    // it has no covariance with anything — its whole row and column stay NaN,
+    // exactly as its `se` slot does.
+    let mut vcov = nan_vcov(p);
+    for (ri, &oi) in kept.iter().enumerate() {
+        for (rj, &oj) in kept.iter().enumerate() {
+            vcov[oi][oj] = fr.vcov[ri][rj];
+        }
+    }
     Fit {
         beta,
         se,
+        vcov,
         tau2: fr.tau2,
         dispersion: fr.dispersion,
         converged: fr.converged,
@@ -280,8 +290,8 @@ pub(super) fn assert_group_ids(re: &ReStructure, ids: &GroupIds, n: usize) {
     }
 }
 
-/// Mirror of MCPower's contract invariants 19/21 for the standalone `fit` path:
-/// the kernel's stack scratch is sized off `MAX_PRIMARY_Q`/`MAX_EXTRA_Q`, so a
+/// Engine invariant checks for the standalone `fit` path: the kernel's stack
+/// scratch is sized off `MAX_PRIMARY_Q`/`MAX_EXTRA_Q`, so a
 /// `q` over the cap would overflow it, and every slope column must index into the
 /// `p`-wide design. A malformed spec is an engine invariant violation (see the
 /// `fit` panic convention), so this asserts rather than returning a `Fit`.
@@ -316,7 +326,8 @@ pub(super) fn assert_model_shape(model: &ModelSpec, p: usize, nagq: u8) {
         // q_p = 1 + #primary slopes. The q_p ≥ 4 refusal is a TEMPORARY cost /
         // oracle-coverage boundary (the k^q product grid and the dimension-generic
         // loop have no q limit), not a code limit — lifting it later is deleting
-        // this one check. See the AGQ spec's locked decision #2.
+        // this one check. Locked decision: cap AGQ to q_p≤3 until oracle coverage
+        // extends past it, rather than let uncapped q_p through untested.
         let q_p = 1 + re.slopes.len();
         assert!(
             q_p <= 3,
@@ -410,4 +421,62 @@ pub(super) fn fill_se_by_predictor(var_diag: &[f64], target_indices: &[u32], se:
             se[ti as usize] = vd.sqrt();
         }
     }
+}
+
+/// An all-NaN `p×p` [`Fit::vcov`] — the shape every path starts from, and the
+/// whole of what a non-converged fit reports (mirroring how `se` NaN-fills).
+pub(crate) fn nan_vcov(p: usize) -> Vec<Vec<f64>> {
+    vec![vec![f64::NAN; p]; p]
+}
+
+/// Full `p×p` [`Fit::vcov`] from `l`, the lower-triangular Cholesky factor of a
+/// precision matrix (`X'X` for OLS, `X'WX` for GLM, `X'V⁻¹X` for LMM), scaled by
+/// `scale`: `vcov = scale · (L L')⁻¹`.
+///
+/// No new numerics — this is the SE forward solve, kept instead of discarded.
+/// `(L L')⁻¹ = L⁻ᵀ L⁻¹`, so `vcov[i][j] = scale · (uᵢ · uⱼ)` where `uⱼ = L⁻¹eⱼ`
+/// is exactly the vector each `se` target already forward-solves for
+/// (`var_diag_j = scale·‖uⱼ‖²` is this matrix's diagonal — see
+/// `ols::fit_suff_stats_t_sq`). Solving each target's column once and forming
+/// the Gram costs the `p` solves `se` already pays plus the dot products.
+///
+/// Only `targets` rows/columns are solved: outside that block there is no `u`
+/// to dot and the result stays NaN, so `vcov` is finite exactly where `se` is
+/// (the `targets`-subset carve-out). `l` must be
+/// the converged factor — every caller gates on `converged` first, the same
+/// staleness contract [`crate::ols::OlsFitView::factor`] documents.
+pub(crate) fn vcov_from_chol(
+    l: faer::MatRef<'_, f64>,
+    p: usize,
+    target_indices: &[u32],
+    scale: f64,
+) -> Vec<Vec<f64>> {
+    let mut vcov = nan_vcov(p);
+    // Column j of L⁻¹, for each target j: forward-solve L·u = e_j, reading
+    // L[(i,k)] directly (already lower-triangular, no transposed access).
+    let mut cols: Vec<(usize, Vec<f64>)> = Vec::with_capacity(target_indices.len());
+    for &tj in target_indices {
+        let tj = tj as usize;
+        if tj >= p {
+            continue;
+        }
+        let mut u = vec![0.0f64; p];
+        for i in 0..p {
+            let mut acc = if i == tj { 1.0 } else { 0.0 };
+            for k in 0..i {
+                acc -= l[(i, k)] * u[k];
+            }
+            let l_ii = l[(i, i)];
+            u[i] = if l_ii == 0.0 { f64::NAN } else { acc / l_ii };
+        }
+        cols.push((tj, u));
+    }
+    for (a, (i, ui)) in cols.iter().enumerate() {
+        for (j, uj) in cols[a..].iter() {
+            let v = scale * ui.iter().zip(uj).map(|(x, y)| x * y).sum::<f64>();
+            vcov[*i][*j] = v;
+            vcov[*j][*i] = v;
+        }
+    }
+    vcov
 }

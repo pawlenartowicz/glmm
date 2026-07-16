@@ -407,6 +407,7 @@ fn fit_glm_probit_matches_r() {
         },
     );
     assert!(f.converged, "probit GLM must converge");
+    assert!((f.dispersion - 1.0).abs() < 1e-12, "probit φ≡1");
     for j in 0..p {
         let b_rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
         assert!(

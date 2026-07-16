@@ -1,11 +1,83 @@
 # Changelog
 
 All notable changes to the `glmm` crate are recorded here. Format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this crate predates its
-first release (no published version yet), so entries accumulate under *Unreleased*
-until the first tag.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
+shares these entries; Python-specific notes are called out where they differ.
 
 ## [Unreleased]
+
+## [0.1.0] — 2026-07-16
+
+First release of the Python package (`glmm` on PyPI), and the first crate
+release since `0.0.2`. The breaking changes below are real breaks against the
+published `0.0.2` — `ModelSpec` is now structure-only and the `mcpower` feature
+is renamed `loop_advanced`. `0.0.3` was never published, so it is not a
+migration source.
+
+All four estimators are wired into the stable `fit` dispatch: OLS; GLM
+(Gaussian, binomial logit/probit, Poisson, Gamma, negative binomial); LMM
+(closed-form single-intercept + BOBYQA general); GLMM (dense and sparse-Z, all
+families including NB), with AGQ (nAGQ > 1) for single scalar random effects.
+Validated against R/lme4 and Julia/MixedModels.jl across a 23-rung dataset
+parity manifest plus a 15-rung prior-weights harness.
+
+### Fixed
+
+- **A factor's level order is no longer silently discarded.** `glmm::formula`
+  sorted every factor's levels lexicographically, so the treatment-contrast base
+  was whichever label sorted first, regardless of what the caller asked for. A
+  deliberately ordered categorical — `pd.Categorical(x, categories=["low",
+  "med", "high"])` — was refactored to base `"high"`, returning a different
+  coefficient for a different question with nothing in the output to reveal it.
+  `Column::Factor` now takes `{ levels, codes }`, so the caller states the order
+  and level 0 is the base. Python passes a `Categorical`'s
+  `categories`/`codes` through; a plain string column has no declared order and
+  is sorted by `Column::factor_from_labels` — the same lexicographic default as
+  R's `factor()`, now a default rather than an imposition.
+- Python: a categorical of non-strings (`pd.Categorical([1, 2, 3])`) was
+  classified numeric and fit as one continuous slope instead of expanding to
+  dummies. Column classification now checks the dtype before sniffing values.
+- Python: `summary()` printed `group 0` instead of the grouping's name, and its
+  per-term rows carried no labels — `Lowered::re_groups` was never carried
+  across the PyO3 shim. It now is, and `summary()` prints e.g. `Subject:` with
+  `(Intercept)`/`Days` rows.
+
+### Added
+
+- `glmm::formula` — the R-style formula frontend is now part of the crate,
+  behind the `formula` feature (on by default). `lower("y ~ x + (1|g)", &table,
+  family)` builds the kernel's inputs from a formula string and a data table.
+  Previously an unpublished companion crate, so it was unreachable for anyone
+  installing from crates.io.
+- `default-features = false` gives the formula-free kernel, which links no
+  `regex` — the configuration for parse-once/fit-many hot paths.
+- **`Fit::vcov`** — the full `p×p` fixed-effect covariance `Cov(β̂)`, on every
+  path. `Fit::se` is its diagonal and cannot answer anything about two
+  coefficients jointly, so a contrast, a confidence interval, or anything of
+  `vcov()`/`confint`/`glht`/`emmeans`'s shape needed off-diagonals that were
+  being computed and thrown away (GLMM) or never formed (OLS/GLM/LMM). It is
+  finite exactly where `se` is. Also on the Python `Fit`, as a `(p, p)` array.
+- Python `Fit` gained `n_eval` (optimizer evaluation count), `deviance` (the
+  minimized criterion — **not** comparable across models, see the docs), and
+  `re_groups`. All three were already on the Rust `Fit`; none crossed the shim.
+
+### Changed
+
+- **Python: `theta=` is renamed `init_theta=`.** One call had two unrelated
+  parameters named `theta`: the negative-binomial shape seed and, inside
+  `warm_start={"theta": …}`, the random-effect Cholesky vector. The seed takes
+  the name R already uses for it (`MASS::glm.nb(init.theta=)`);
+  `warm_start["theta"]` is unchanged, matching lme4's `start=list(theta=)`.
+- **Python: `targets=` is removed.** It exposed `FitOptions::target_indices`, a
+  performance knob for MCPower's hot path that leaves non-target SEs `NaN`. That
+  hot path drives the Rust surface directly, where the option is unchanged; no
+  Python caller wants `summary()` printing `NA` for standard errors it could
+  have computed.
+- Python: the native call returns a dict keyed by field name rather than a
+  positional tuple. Internal, but it is why `re_groups`/`n_eval`/`deviance`
+  could go missing unnoticed.
 
 ### LMM cold start
 

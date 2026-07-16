@@ -1864,8 +1864,8 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
 /// on an AGQ fit must be a strict no-op. Runs the Poisson grouseticks AGQ fixture
 /// (nAGQ=7) through `crate::glmm::fit_glmm` both ways and asserts β̂, θ̂, τ̂², and
 /// n_eval are BIT-identical — the bypass is clean. (A Laplace-pass warm start for
-/// AGQ was measured on the diligent AGQ cells (2026-07-14) and reverted as a wash —
-/// see docs/GLMM/implemented/; the bypass this canary pins is the shipped state.)
+/// AGQ was measured on the diligent AGQ cells (2026-07-14) and reverted as a wash;
+/// the bypass this canary pins is the shipped state.)
 #[test]
 fn two_stage_agq_bypass_is_bit_identical() {
     let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
@@ -2312,4 +2312,83 @@ fn fit_glmm_binomial_slope2_vector_agq_matches_glmmadaptive() {
             },
         );
     }
+}
+
+/// Boundary singular flag on a GLMM: a scalar random-intercept
+/// binomial-logit fit with NO cluster signal (`y` drawn from a
+/// fixed-effects-only logit; the grouping factor is present but no cluster
+/// deviation is added to `eta`) must pin θ̂ ≈ 0 and set `Fit::singular`,
+/// mirroring the LMM boundary case
+/// (`fit_lmm_weighted_boundary_matches_wls`'s `mixed.singular` assert) but
+/// for the GLMM path, which sets `singular` from `boundary_hit` OR
+/// `has_negligible_component` (`fit/glmm.rs`'s `SINGULAR_REL_TOL` check) —
+/// neither of which any existing GLMM test exercises. 40 clusters × 10 reps
+/// (n=400): fewer clusters/reps left tau2[0] at a small positive REML
+/// estimate instead of pinning at the boundary (finite-sample cluster-mean
+/// noise still readable as signal) — verified empirically, not a guess.
+#[test]
+fn fit_glmm_binomial_no_cluster_signal_is_singular() {
+    let n_clusters = 40u32;
+    let reps = 10usize;
+    let n = n_clusters as usize * reps;
+    let p = 2;
+    let mut xm = Mat::<f64>::zeros(n, p);
+    let mut y = vec![0.0f64; n];
+    let mut cl = vec![0u32; n];
+    let mut st = 11u64;
+    let mut i = 0;
+    for c in 0..n_clusters {
+        for _ in 0..reps {
+            let cov = crate::sparse::test_lcg(&mut st);
+            // Fixed-effects-only logit — no per-cluster deviation added, so
+            // the true random-intercept variance is exactly zero.
+            let eta = 0.3 + 0.5 * cov;
+            let prob = 1.0 / (1.0 + (-eta).exp());
+            let draw = (crate::sparse::test_lcg(&mut st) + 1.0) / 2.0;
+            xm[(i, 0)] = 1.0;
+            xm[(i, 1)] = cov;
+            cl[i] = c;
+            y[i] = if draw < prob { 1.0 } else { 0.0 };
+            i += 1;
+        }
+    }
+    let mut x = vec![0.0f64; n * p];
+    for row in 0..n {
+        for col in 0..p {
+            x[row * p + col] = xm[(row, col)];
+        }
+    }
+    let ids = GroupIds {
+        primary: cl,
+        extra: vec![],
+    };
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged, "no-signal GLMM must still converge");
+    assert!(f.singular, "must flag the θ≈0 boundary as singular");
+    assert!(
+        f.tau2[0] < 1e-4,
+        "tau2[0] must pin near zero, got {}",
+        f.tau2[0]
+    );
 }

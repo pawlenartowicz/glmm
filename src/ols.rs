@@ -33,11 +33,17 @@ pub const PANEL_ROWS: usize = 256;
 /// borrow the whole workspace and conflict with the shared `x_full`/`y_full`
 /// reads in the same loop iteration).
 pub struct OlsScratch<'w> {
+    /// Output buffer for `β̂ = (X'X)⁻¹X'y`, length ≥ `p`, x-matrix column order.
     pub fit_betas: &'w mut [f64],
+    /// Output buffer for `σ̂² · (X'X)⁻¹_jj` per requested target, length ≥ `t`.
     pub fit_var_diag: &'w mut [f64],
+    /// Output buffer for `t_sq_j = β̂_j² / var_diag_j` per requested target, length ≥ `t`.
     pub fit_t_sq: &'w mut [f64],
+    /// Forward-solve scratch for `L u = e_j`, length ≥ `p`; reused per target.
     pub fit_u_scratch: &'w mut [f64],
+    /// `P × P` buffer that receives the lower-triangular Cholesky factor `L` of `X'X`.
     pub fit_factor: MatMut<'w, f64>,
+    /// `P × 1` buffer used as the rhs for the `L L' β = X'y` solve, then overwritten with `β̂`.
     pub fit_rhs: MatMut<'w, f64>,
 }
 
@@ -45,6 +51,7 @@ pub struct OlsScratch<'w> {
 /// Lifetime ties back to the workspace that owns
 /// the storage.
 pub struct OlsFitView<'a> {
+    /// `β̂ = (X'X)⁻¹X'y`, length `p`, x-matrix column order.
     pub betas: &'a [f64],
     /// Length `t` — only the first `n_targets` entries are populated.
     pub var_diag: &'a [f64],
@@ -58,8 +65,11 @@ pub struct OlsFitView<'a> {
     /// data from a previous fit. Posthoc gates on `converged` so this is safe
     /// in practice; new consumers must do the same.
     pub factor: MatRef<'a, f64>,
+    /// Residual variance `σ̂² = RSS / df_resid`. `NaN` on every non-converged / rank-deficient return.
     pub sigma_sq: f64,
+    /// Residual degrees of freedom, `n − p`.
     pub df_resid: u32,
+    /// `false` on the `n <= p || p == 0` early-return path; all other fields are then unreliable.
     pub converged: bool,
     /// `‖y − X β̂‖²`. `NaN` on every non-converged / rank-deficient return.
     pub rss: f64,

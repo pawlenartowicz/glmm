@@ -28,6 +28,12 @@ fn fit_ols_recovers_slope() {
     );
     assert!(f.converged);
     assert!((f.beta[1] - 2.0).abs() < 1e-6);
+    // OLS reports deviance: NaN, singular: false unconditionally (fit/ols.rs).
+    assert!(f.deviance.is_nan());
+    assert!(!f.singular);
+    assert!(f.tau2.is_empty());
+    // y = 2*i is an exact fit (no noise) → RSS/(n-p) ≈ 0, not the GLM φ≡1 convention.
+    assert!(f.dispersion >= 0.0 && f.dispersion < 1e-9);
 }
 
 /// WLS through the stable surface, gated against R `lm(weights=)`.
@@ -51,6 +57,9 @@ fn fit_ols_weighted_matches_r_lm() {
     }
     const REF_BETA: [f64; 2] = [0.371528122456273, 1.996237765292144];
     const REF_SE: [f64; 2] = [0.0289002251717619, 0.0195893362923423];
+    // vcov(f)[1,2] from the same R run — the only external pin of a vcov
+    // off-diagonal at the fit surface (se checks only see the diagonal).
+    const REF_VCOV_01: f64 = -0.0002002132676736411;
     let model = ModelSpec {
         family: Family::Gaussian,
         re: None,
@@ -65,6 +74,13 @@ fn fit_ols_weighted_matches_r_lm() {
     for j in 0..2 {
         assert!((f.beta[j] - REF_BETA[j]).abs() < 1e-9, "beta[{j}]");
         assert!((f.se[j] - REF_SE[j]).abs() < 1e-9, "se[{j}]");
+    }
+    for (i, j) in [(0, 1), (1, 0)] {
+        assert!(
+            (f.vcov[i][j] - REF_VCOV_01).abs() < 1e-12,
+            "vcov[{i}][{j}] = {}, R = {REF_VCOV_01}",
+            f.vcov[i][j]
+        );
     }
 }
 

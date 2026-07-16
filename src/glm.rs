@@ -72,7 +72,9 @@ pub struct GlmFitView<'a> {
     /// Valid only when `converged == true` (stale-or-zero otherwise — same
     /// staleness contract as `OlsFitView::factor`).
     pub l: MatRef<'a, f64>,
+    /// Number of IRLS iterations completed (0 on the short-circuit / non-converged paths).
     pub n_iter: u32,
+    /// Whether the deviance fixpoint `|Δdeviance| < DEVIANCE_TOL` was reached before `MAX_IRLS_ITERS`.
     pub converged: bool,
     /// Final-iteration Bernoulli deviance −2·Σ[y log p̂ + (1−y) log(1−p̂)].
     /// `NaN` on every non-converged / short-circuit return.
@@ -89,17 +91,29 @@ pub struct GlmFitView<'a> {
 /// `ws.glm_scratch()` — that re-introduces the whole-struct exclusive borrow
 /// problem (NLL cannot split borrow a method receiver from its fields).
 pub struct GlmScratch<'w> {
+    /// Linear predictor η = Xβ, length `n`, one entry per row.
     pub irls_eta: &'w mut [f64],
+    /// Fitted mean μ (= p under logit link), length `n`, one entry per row.
     pub irls_p: &'w mut [f64],
+    /// IRLS working weight per row, length `n`, clamped to `WEIGHT_CLAMP`.
     pub irls_w: &'w mut [f64],
+    /// IRLS working response per row, length `n`.
     pub irls_z: &'w mut [f64],
+    /// Current-iteration coefficient vector β, length `p`, in x-matrix column order.
     pub irls_betas: &'w mut [f64],
+    /// Next-iteration coefficient vector produced by the WLS solve, length `p`.
     pub irls_betas_new: &'w mut [f64],
+    /// Output slot for `((X'WX)⁻¹)_jj` per target, length `t` (one per requested target index).
     pub irls_var_diag: &'w mut [f64],
+    /// Output slot for Wald z² per target, length `t`.
     pub irls_t_sq: &'w mut [f64],
+    /// Forward-substitution scratch `u` for `L·u = e_j`, length `p`; reused per target when computing `var_diag`.
     pub irls_u_scratch: &'w mut [f64],
+    /// Weighted normal-equations matrix X'WX, `p × p`.
     pub irls_xtwx: MatMut<'w, f64>,
+    /// Weighted right-hand side X'Wz, length `p`; overwritten with the WLS solution in place.
     pub irls_xtwz: &'w mut [f64],
+    /// Lower-triangular Cholesky factor L of X'WX, `p × p`.
     pub irls_l: MatMut<'w, f64>,
     /// Per-iteration W∘X scratch (column-major, stride n); needs `len ≥ n·p`.
     pub irls_wx: &'w mut [f64],

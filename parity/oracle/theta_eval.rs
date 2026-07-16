@@ -15,10 +15,10 @@
 //! `{k, f, theta}` trajectory log — and an optional `"label"` echoed back.
 use std::io::Write;
 
+use glmm::formula::Lowered;
 use glmm::loop_advanced::{
     build_lmm_seam_ws, lmm_objective_at, lmm_sweep_fit_on, LmmGroupings, LmmSeamWs,
 };
-use glmm_formula::Lowered;
 use serde_json::{json, Value};
 
 #[path = "harness_common.rs"]
@@ -30,7 +30,7 @@ const DIR: &str = env!("CARGO_MANIFEST_DIR");
 fn main() {
     let in_path = std::env::var("THETA_EVAL_IN").expect("THETA_EVAL_IN request file");
     let manifest_path = std::env::var("GRID_MANIFEST")
-        .unwrap_or_else(|_| format!("{DIR}/parity/manifest_grid.json"));
+        .unwrap_or_else(|_| format!("{DIR}/manifest_grid.json"));
     let manifest: Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("read grid manifest"))
             .expect("parse grid manifest");

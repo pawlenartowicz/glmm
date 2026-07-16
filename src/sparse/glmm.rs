@@ -894,6 +894,7 @@ fn sparse_glmm_nan_fit(p: usize, n_theta: usize) -> crate::Fit {
     crate::Fit {
         beta: vec![f64::NAN; p],
         se: vec![f64::NAN; p],
+        vcov: crate::fit::nan_vcov(p),
         tau2: vec![f64::NAN; n_theta],
         dispersion: f64::NAN,
         converged: false,
@@ -1132,26 +1133,20 @@ pub(crate) fn fit_glmm_sparse(
     // the FD-Hessian perturbs the workspace, so its Rx FALLBACK re-evals at γ̂
     // first to restore that state.
     let mut se = vec![f64::NAN; p];
+    let mut vcov = crate::fit::nan_vcov(p);
     let mut stddev_se = vec![f64::NAN; n_theta];
-    let cov_from_schur = |schur: Mat<f64>, se: &mut [f64]| -> bool {
-        // Var(β̂)_jj = σ̂²·‖L⁻¹e_j‖² per target from chol(S_β) (mirror the dense Rx
-        // arm, including Gamma's σ̂² on the RX vcov — lme4 `vcov(use.hessian=FALSE)`).
+    let cov_from_schur = |schur: Mat<f64>, se: &mut [f64], vcov: &mut Vec<Vec<f64>>| -> bool {
+        // σ̂²·(S_β)⁻¹ from chol(S_β) (mirror the dense Rx arm, including Gamma's
+        // σ̂² on the RX vcov — lme4 `vcov(use.hessian=FALSE)`). SE is its
+        // diagonal, so the shared helper's forward solve serves both.
         let sc = match schur.as_ref().llt(faer::Side::Lower) {
             Ok(c) => c,
             Err(_) => return false,
         };
-        let lschur = sc.L();
-        let mut fwd = vec![0.0f64; p];
+        *vcov = crate::fit::vcov_from_chol(sc.L(), p, &opts.target_indices, sigma_sq);
         for &tj in &opts.target_indices {
             let tj = tj as usize;
-            for i in 0..p {
-                let mut acc = if i == tj { 1.0 } else { 0.0 };
-                for kk in 0..i {
-                    acc -= lschur[(i, kk)] * fwd[kk];
-                }
-                fwd[i] = acc / lschur[(i, i)];
-            }
-            let vd: f64 = fwd[..p].iter().map(|v| v * v).sum::<f64>() * sigma_sq;
+            let vd = vcov[tj][tj];
             if vd.is_finite() && vd >= 0.0 {
                 se[tj] = vd.sqrt();
             }
@@ -1164,7 +1159,7 @@ pub(crate) fn fit_glmm_sparse(
                 Some(s) => s,
                 None => return (sparse_glmm_nan_fit(p, n_theta), f64::INFINITY),
             };
-            if !cov_from_schur(schur, &mut se) {
+            if !cov_from_schur(schur, &mut se, &mut vcov) {
                 return (sparse_glmm_nan_fit(p, n_theta), f64::INFINITY);
             }
         }
@@ -1191,6 +1186,21 @@ pub(crate) fn fit_glmm_sparse(
                             se[tj] = vd.sqrt();
                         }
                     }
+                    // `cov` is Cov(β̂) in full — keep the target block, not only
+                    // the diagonal just read. Mirrors the dense Hessian arm,
+                    // including taking one value per pair: `cov` is a solve
+                    // against an identity, so (a,b)/(b,a) differ in the last
+                    // bits and a verbatim copy would not be exactly symmetric.
+                    for &ta in &opts.target_indices {
+                        for &tb in &opts.target_indices {
+                            let (a, b) = (ta as usize, tb as usize);
+                            if b > a {
+                                continue;
+                            }
+                            vcov[a][b] = cov[(a, b)];
+                            vcov[b][a] = cov[(a, b)];
+                        }
+                    }
                     stddev_se.copy_from_slice(&tse);
                 }
                 None => {
@@ -1208,11 +1218,12 @@ pub(crate) fn fit_glmm_sparse(
                         Some(s) => s,
                         None => return (sparse_glmm_nan_fit(p, n_theta), f64::INFINITY),
                     };
-                    if !cov_from_schur(schur, &mut se) {
+                    if !cov_from_schur(schur, &mut se, &mut vcov) {
                         return (sparse_glmm_nan_fit(p, n_theta), f64::INFINITY);
                     }
                     // No joint Hessian ⇒ no θ-block SE (stays NaN), as the dense
-                    // fallback reports.
+                    // fallback reports. `vcov` IS filled here — the Schur inverse
+                    // is a full p×p, same as the dense fallback's `rx_cov_into`.
                 }
             }
             ws.pirls_tol_override = None; // never leak the FD tight tol past the SE step
@@ -1222,6 +1233,7 @@ pub(crate) fn fit_glmm_sparse(
     let mut fit = crate::Fit {
         beta,
         se,
+        vcov,
         tau2,
         dispersion,
         converged: true,

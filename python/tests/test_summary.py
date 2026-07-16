@@ -10,6 +10,7 @@ def make_fit(**kw):
     base = dict(
         beta=np.array([2.0, -0.5]),
         se=np.array([1.0, 0.25]),
+        vcov=np.array([[1.0, 0.0], [0.0, 0.0625]]),
         tau2=np.array([]),
         varcorr=[],
         stddev_se=np.array([]),
@@ -18,6 +19,9 @@ def make_fit(**kw):
         converged=True,
         singular=False,
         names=["(Intercept)", "x"],
+        re_groups=[],
+        n_eval=0,
+        deviance=math.nan,
     )
     base.update(kw)
     return glmm.Fit(**base)
@@ -71,11 +75,17 @@ def test_summary_re_block():
     f = make_fit(
         varcorr=[np.array([4.0, 1.0, 1.25])],
         stddev_se=np.array([float("nan")] * 3),
+        re_groups=[("Subject", ["(Intercept)", "Days"])],
     )
     text = f.summary()
     assert "Random effects" in text
     assert "1.118" in text
     assert "0.447" in text
+    # The grouping and its terms are named, not "group 0" with bare sd/se rows.
+    assert "Subject:" in text
+    assert "group 0" not in text
+    assert "(Intercept)" in text
+    assert "Days" in text
 
 
 def test_summary_no_re_block_when_empty():

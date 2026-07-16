@@ -19,11 +19,10 @@ def test_fit_signature_matches_spec():
         "family",
         "link",
         "dispersion",
-        "theta",
+        "init_theta",
         "weights",
         "wald_se",
         "nagq",
-        "targets",
         "warm_start",
     ]
     p = sig.parameters
@@ -32,11 +31,10 @@ def test_fit_signature_matches_spec():
     for name in [
         "link",
         "dispersion",
-        "theta",
+        "init_theta",
         "weights",
         "wald_se",
         "nagq",
-        "targets",
         "warm_start",
     ]:
         assert p[name].kind is inspect.Parameter.KEYWORD_ONLY, name
@@ -61,6 +59,7 @@ def test_fit_fields():
     assert list(glmm.Fit.__dataclass_fields__) == [
         "beta",
         "se",
+        "vcov",
         "tau2",
         "varcorr",
         "stddev_se",
@@ -69,4 +68,7 @@ def test_fit_fields():
         "converged",
         "singular",
         "names",
+        "re_groups",
+        "n_eval",
+        "deviance",
     ]

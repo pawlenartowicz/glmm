@@ -663,6 +663,35 @@ fn build_z_width_general_populates_all_columns() {
         touched.iter().all(|&t| t),
         "every RE column must be populated — offset wiring"
     );
+
+    // "some nonzero" can't catch an offset swap between two same-width
+    // groupings (e.g. crossed level 1 landing in level 2's slot) — pin the
+    // EXACT nonzero row set per column instead. Layout from `build_z`:
+    // primary is per-level (`base = lvl*q`, col `2*lvl` = intercept, col
+    // `2*lvl+1` = slope), n_prim=8 levels at q=2; the crossed block starts
+    // at the absolute offset `n_prim*q=16`, one column per of its 4 levels.
+    // `glmm_slope_crossed_dataset` sets `ids[i] = i % 8`, `crossed[i] = i % 4`.
+    let n_prim = 8usize;
+    let n_crossed = 4usize;
+    for lvl in 0..n_prim {
+        let expect_rows: Vec<usize> = (0..n).filter(|&i| i % n_prim == lvl).collect();
+        for (kind, col) in [("intercept", 2 * lvl), ("slope", 2 * lvl + 1)] {
+            let got_rows: Vec<usize> = (0..n).filter(|&i| ws.z[(i, col)] != 0.0).collect();
+            assert_eq!(
+                got_rows, expect_rows,
+                "primary col {col} (level {lvl}, {kind}) nonzero rows"
+            );
+        }
+    }
+    for cc in 0..n_crossed {
+        let col = n_prim * 2 + cc;
+        let expect_rows: Vec<usize> = (0..n).filter(|&i| i % n_crossed == cc).collect();
+        let got_rows: Vec<usize> = (0..n).filter(|&i| ws.z[(i, col)] != 0.0).collect();
+        assert_eq!(
+            got_rows, expect_rows,
+            "crossed col {col} (level {cc}) nonzero rows"
+        );
+    }
 }
 
 /// `apply_lambda` must scale each extra grouping's columns by ITS OWN θ over
@@ -2962,6 +2991,11 @@ fn structured_cold_start_overshoot_is_finite() {
             dev.is_finite(),
             "structured cold-start deviance must be finite (step-halving recovers the overshoot), got {dev}"
         );
+    // Sanity ceiling, not a precision bound: the guarded bug returned
+    // INFINITY, so `is_finite` alone would also pass a recovery that landed
+    // somewhere absurd. A run of this fixture converges to dev≈997; 2000 is
+    // a generous 2× headroom against that, still well below "absurd".
+    assert!(dev < 2000.0, "recovered deviance {dev} implausibly large");
 }
 
 /// Runs one GLMM shape through `fit_glmm` both ways — single-stage
@@ -3330,6 +3364,10 @@ fn pirls_dense_step_halving_recovers_from_overshoot() {
         dev.is_finite(),
         "step-halving must rescue the cold-start overshoot, got {dev}"
     );
+    // Sanity ceiling against a finite-but-absurd recovery (the guarded bug
+    // returned INFINITY). A run of this fixture converges to dev≈1269; 2600
+    // is a generous 2× headroom above that.
+    assert!(dev < 2600.0, "recovered deviance {dev} implausibly large");
 }
 
 /// PQL stationarity of the Profile-mode dense β step: after a converged
@@ -4097,6 +4135,10 @@ fn pirls_blocked_step_halving_recovers_from_overshoot() {
         dev.is_finite(),
         "step-halving must rescue the cold-start overshoot, got {dev}"
     );
+    // Sanity ceiling against a finite-but-absurd recovery (the guarded bug
+    // returned INFINITY). A run of this fixture converges to dev≈1837; 3700
+    // is a generous 2× headroom above that.
+    assert!(dev < 3700.0, "recovered deviance {dev} implausibly large");
 }
 
 /// Profile evaluation via the `laplace_deviance` production entry point

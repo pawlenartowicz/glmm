@@ -280,6 +280,47 @@ fn sparse_over_32_components_no_overflow() {
     assert!(f.converged, "33-component sparse fit converged");
     assert!(f.beta[0].is_finite(), "β finite");
     assert!(f.se[0].is_finite(), "se finite");
+
+    // Grouping-permutation invariance: reverse the 32 extra id-vectors AND
+    // their matching Groupings together (same index in both, so id-vector g
+    // still pairs with its own level-count) and refit. The fitted model is
+    // the same 33-way variance partition regardless of declaration order, so
+    // β0/se0/deviance must agree — but not bitwise, since BOBYQA's θ-space
+    // walk (and the sparse factor's fill-in pattern) differs at a different
+    // extra-grouping order.
+    let re = model.re.as_ref().unwrap();
+    let model_rev = ModelSpec {
+        family: model.family,
+        re: Some(ReStructure {
+            sizing: re.sizing.clone(),
+            slopes: re.slopes.clone(),
+            extra_groupings: re.extra_groupings.iter().rev().cloned().collect(),
+        }),
+    };
+    let ids_rev = crate::GroupIds {
+        primary: ids.primary.clone(),
+        extra: ids.extra.iter().rev().cloned().collect(),
+    };
+    let f_rev = crate::fit_cold(&xflat, &y, n, p, &model_rev, &ids_rev, &opts);
+    assert!(f_rev.converged, "reversed-grouping-order fit converged");
+    assert!(
+        (f_rev.beta[0] - f.beta[0]).abs() < 1e-6 * f.beta[0].abs().max(1.0),
+        "reversed β0 {} vs original {}",
+        f_rev.beta[0],
+        f.beta[0]
+    );
+    assert!(
+        (f_rev.se[0] - f.se[0]).abs() < 1e-6 * f.se[0].abs().max(1.0),
+        "reversed se0 {} vs original {}",
+        f_rev.se[0],
+        f.se[0]
+    );
+    assert!(
+        (f_rev.deviance - f.deviance).abs() < 1e-6 * f.deviance.abs().max(1.0),
+        "reversed deviance {} vs original {}",
+        f_rev.deviance,
+        f.deviance
+    );
 }
 
 /// Spike: prove the faer 0.24 sparse-LLT call sequence + logdet-off-the-CSC
@@ -1220,6 +1261,14 @@ fn fit_wide_crossed_sparse_matches_lme4() {
             "varcomp[{k}] stddev glmm={got_sd:.6} lme4={ref_sd:.6}",
         );
     }
+    // Gaussian dispersion = REML σ̂² on the sparse path too; σ̂ against the
+    // same frozen lme4 sigma() the warm-start test's θ̂ reconstruction uses.
+    const REF_SIGMA: f64 = 0.619378289188346;
+    assert!(
+        (f.dispersion.sqrt() - REF_SIGMA).abs() / REF_SIGMA < 3e-2,
+        "σ̂ {} vs {REF_SIGMA}",
+        f.dispersion.sqrt()
+    );
 }
 
 /// Warm-start A/B on the sparse-routed wide-crossed LMM: a warm fit from
@@ -2886,9 +2935,24 @@ fn sparse_glmm_deviance_matches_dense() {
             },
             107,
         ),
+        (
+            Family::NegativeBinomial {
+                link: crate::NegBinomialLink::Log,
+            },
+            109,
+        ),
     ] {
         let (xflat, y, n, p, model, ids) = build_glmm_case(family, seed);
         let x = Mat::<f64>::from_fn(n, p, |i, j| xflat[i * p + j]);
+
+        // This is a fixed-(θ,β) deviance cross-check, not a fit, so NB's θ
+        // (normally profiled by an outer search) is just a probe constant
+        // fed identically to both sides.
+        let nb_theta = if matches!(family, Family::NegativeBinomial { .. }) {
+            5.0
+        } else {
+            f64::NAN
+        };
 
         // Dense workspace, mirroring the fit.rs adapter's construction.
         let mut dws = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
@@ -2898,6 +2962,7 @@ fn sparse_glmm_deviance_matches_dense() {
         } else {
             None
         };
+        dws.nb_theta = nb_theta;
 
         let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[]);
         let mut sws = super::SparseGlmmWorkspace::new(&g, &ids.primary, &ids.extra, n, p);
@@ -2918,7 +2983,7 @@ fn sparse_glmm_deviance_matches_dense() {
             );
             let sparse = super::sparse_glmm_deviance(
                 family,
-                f64::NAN,
+                nb_theta,
                 &params,
                 &mut sws,
                 x.as_ref(),
@@ -3468,16 +3533,20 @@ fn sparse_weighted_binomial_fit_matches_expanded() {
     }
 }
 
-/// Over-envelope non-Gaussian smoke: genuinely over-cap designs with real
-/// signal CONVERGE through the routed `fit_cold` path (an upgrade over the
-/// prior anti-panic floor, which merely returned
-/// non-converged NaN). Over-count binomial/Poisson (7 crossed extras) and
-/// over-width gamma (one q_g = 5 slope-block extra) — the two shapes the
-/// parity rungs use. External truth is the parity datasets; this is
-/// the in-crate convergence gate.
+/// Over-envelope non-Gaussian smoke, binomial half: a genuinely over-cap
+/// design (7 crossed extras, `y ~ 1 + x + (1|g1) + (1|c1) + … + (1|c7)`) with
+/// real signal CONVERGES through the routed `fit_cold` path (an upgrade over
+/// the prior anti-panic floor, which merely returned non-converged NaN).
+/// External truth is the parity `sim_sparse_binomial` rung; this is the
+/// in-crate convergence gate, tightened by a deviance self-consistency
+/// check: every RE here is scalar (q_p = 1, all extras scalar) and the
+/// family has σ² ≡ 1, so `θ_i = √tau2[i]` exactly reconstructs the
+/// converged Cholesky factor — feeding `[θ.., β..]` back through
+/// `sparse_glmm_deviance` at the SAME (θ, β) must reproduce `f.deviance`
+/// (mirrors `sparse_glmm_deviance_matches_dense`'s workspace-build pattern).
 #[test]
-fn sparse_glmm_over_envelope_converges() {
-    // Over-count: y ~ 1 + x + (1|g1) + (1|c1) + … + (1|c7).
+fn sparse_glmm_over_envelope_converges_binomial() {
+    use faer::Mat;
     let n = 210;
     let p = 2;
     let mut st = 301u64;
@@ -3508,8 +3577,10 @@ fn sparse_glmm_over_envelope_converges() {
         }
         eta[i] = e;
     }
-    let mk_model = |family: Family| ModelSpec {
-        family,
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: crate::BinomialLink::Logit,
+        },
         re: Some(ReStructure {
             sizing: Sizing::FixedClusters {
                 n_clusters: n_primary as u32,
@@ -3534,7 +3605,6 @@ fn sparse_glmm_over_envelope_converges() {
         target_indices: vec![0, 1],
         ..crate::FitOptions::default()
     };
-    // Binomial.
     let yb: Vec<f64> = eta
         .iter()
         .map(|&e| {
@@ -3547,9 +3617,6 @@ fn sparse_glmm_over_envelope_converges() {
             }
         })
         .collect();
-    let model = mk_model(Family::Binomial {
-        link: crate::BinomialLink::Logit,
-    });
     assert!(matches!(
         crate::fit::classify_design_pub(&model, 1),
         crate::fit::Solver::Sparse
@@ -3557,7 +3624,95 @@ fn sparse_glmm_over_envelope_converges() {
     let f = crate::fit_cold(&x, &yb, n, p, &model, &ids, &opts);
     assert!(f.converged, "over-count binomial converges");
     assert!(f.beta.iter().all(|b| b.is_finite()) && f.se.iter().all(|s| s.is_finite()));
-    // Poisson.
+
+    let n_theta = f.tau2.len();
+    let mut params = Vec::with_capacity(n_theta + p);
+    params.extend(f.tau2.iter().map(|t| t.sqrt()));
+    params.extend(f.beta.iter().copied());
+    let x_mat = Mat::<f64>::from_fn(n, p, |i, j| x[i * p + j]);
+    let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[]);
+    let mut sws = super::SparseGlmmWorkspace::new(&g, &ids.primary, &ids.extra, n, p);
+    let recomputed = super::sparse_glmm_deviance(
+        model.family,
+        f64::NAN,
+        &params,
+        &mut sws,
+        x_mat.as_ref(),
+        &yb,
+        n,
+        false,
+    );
+    assert!(
+        (recomputed - f.deviance).abs() < 1e-8 * (1.0 + f.deviance.abs()),
+        "deviance self-consistency: recomputed {recomputed} vs fit {}",
+        f.deviance
+    );
+}
+
+/// Over-envelope non-Gaussian smoke, Poisson half — same over-cap shape and
+/// deviance self-consistency check as the binomial twin above, on the
+/// parity `sim_sparse_poisson` rung's design instead.
+#[test]
+fn sparse_glmm_over_envelope_converges_poisson() {
+    use faer::Mat;
+    let n = 210;
+    let p = 2;
+    let mut st = 401u64;
+    let n_primary = 6usize;
+    let u_c: Vec<f64> = (0..n_primary)
+        .map(|_| 0.5 * super::test_lcg(&mut st))
+        .collect();
+    let extra_levels = [3usize, 4, 3, 5, 3, 4, 3];
+    let v_e: Vec<Vec<f64>> = extra_levels
+        .iter()
+        .map(|&l| (0..l).map(|_| 0.3 * super::test_lcg(&mut st)).collect())
+        .collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut eta = vec![0.0f64; n];
+    let pid: Vec<u32> = (0..n).map(|i| (i % n_primary) as u32).collect();
+    let extra: Vec<Vec<u32>> = extra_levels
+        .iter()
+        .enumerate()
+        .map(|(g, &l)| (0..n).map(|i| ((i / (g + 1)) % l) as u32).collect())
+        .collect();
+    for i in 0..n {
+        let cov = super::test_lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = cov;
+        let mut e = 0.3 + 0.5 * cov + u_c[pid[i] as usize];
+        for (g, ids_g) in extra.iter().enumerate() {
+            e += v_e[g][ids_g[i] as usize];
+        }
+        eta[i] = e;
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_primary as u32,
+            },
+            slopes: vec![],
+            extra_groupings: extra_levels
+                .iter()
+                .map(|&l| Grouping {
+                    relation: GroupingRelation::Crossed {
+                        n_clusters: l as u32,
+                    },
+                    slopes: vec![],
+                })
+                .collect(),
+        }),
+    };
+    let ids = crate::GroupIds {
+        primary: pid,
+        extra,
+    };
+    let opts = crate::FitOptions {
+        target_indices: vec![0, 1],
+        ..crate::FitOptions::default()
+    };
     let yp: Vec<f64> = eta
         .iter()
         .map(|&e| {
@@ -3565,16 +3720,53 @@ fn sparse_glmm_over_envelope_converges() {
             (e.exp() * jit).round().max(0.0)
         })
         .collect();
-    let model = mk_model(Family::Poisson {
-        link: crate::PoissonLink::Log,
-    });
+    assert!(matches!(
+        crate::fit::classify_design_pub(&model, 1),
+        crate::fit::Solver::Sparse
+    ));
     let f = crate::fit_cold(&x, &yp, n, p, &model, &ids, &opts);
     assert!(f.converged, "over-count poisson converges");
     assert!(f.beta.iter().all(|b| b.is_finite()) && f.se.iter().all(|s| s.is_finite()));
 
+    let n_theta = f.tau2.len();
+    let mut params = Vec::with_capacity(n_theta + p);
+    params.extend(f.tau2.iter().map(|t| t.sqrt()));
+    params.extend(f.beta.iter().copied());
+    let x_mat = Mat::<f64>::from_fn(n, p, |i, j| x[i * p + j]);
+    let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[]);
+    let mut sws = super::SparseGlmmWorkspace::new(&g, &ids.primary, &ids.extra, n, p);
+    let recomputed = super::sparse_glmm_deviance(
+        model.family,
+        f64::NAN,
+        &params,
+        &mut sws,
+        x_mat.as_ref(),
+        &yp,
+        n,
+        false,
+    );
+    assert!(
+        (recomputed - f.deviance).abs() < 1e-8 * (1.0 + f.deviance.abs()),
+        "deviance self-consistency: recomputed {recomputed} vs fit {}",
+        f.deviance
+    );
+}
+
+/// Over-envelope non-Gaussian smoke, gamma half: one over-width slope-block
+/// extra (`(1 + x1..x4 | ge)`, `q_g = 5 > MAX_EXTRA_Q`) CONVERGES with a
+/// finite, real-signal fit. Unlike the binomial/Poisson twins above, no
+/// deviance self-consistency check here: with a q=5 covariance block AND a
+/// free Gamma dispersion, `f.tau2` alone can't reconstruct the converged Λ
+/// (off-diagonal vech entries and the dispersion aren't recoverable from
+/// `tau2`'s per-diagonal values), so external parity rungs (`sim_gamma_glmm`
+/// shape) are what validate this case's numbers; this stays a convergence
+/// gate.
+#[test]
+fn sparse_glmm_over_envelope_converges_gamma() {
     // Over-width: y ~ 1 + x1..x4 + (1|gp) + (1 + x1..x4 | ge), gamma/log.
     let n = 240;
     let p = 5;
+    let mut st = 507u64;
     let n_gp = 8usize;
     let n_ge = 6usize;
     let q_g = 5usize;
@@ -4189,6 +4381,10 @@ fn fit_sparse_lmm_weighted_matches_lme4() {
         (sd_slope - REF_SD_G2_SLOPE).abs() / REF_SD_G2_SLOPE < 1e-3,
         "g2 slope sd {sd_slope} vs {REF_SD_G2_SLOPE}"
     );
+    // corr = vc[1]/(sd_int·sd_slope) is a ratio of the off-diagonal vech
+    // component to two stddevs on this weighted, small-n (n=400, 15 g2
+    // levels) fit — it's the noisiest of the three θ coordinates, hence the
+    // 0.05 band next to the 1e-5-scale β checks above.
     assert!(
         (corr - REF_CORR_G2).abs() < 0.05,
         "g2 corr {corr} vs {REF_CORR_G2}"
@@ -4211,6 +4407,41 @@ fn fit_sparse_lmm_weighted_matches_lme4() {
         "deviance {} vs lme4-derived {expected}",
         f.deviance
     );
+
+    // Natural design has 15 g2 levels (< TAIL_SPARSE_MIN) ⇒ this golden takes
+    // the dense tail. Force the sparse (AMD-ordered) tail on the SAME fit to
+    // exercise that route against a real weighted golden instead of only
+    // synthetic shapes. NOT bit-identical: AMD reorders the elimination, a
+    // sanctioned reassociation of the same Cholesky (src/sparse/mod.rs
+    // `SparseTail` doc), so the two converged optima agree only to
+    // reassociation-error size — matching the existing dense/sparse-tail
+    // equality precedent in this file (`sparse_tail_clique_pattern_and_
+    // deviance_match_dense`, ~line 752: 1e-6 abs on β/se). A run showed
+    // ~1e-9 drift on β0 here; 1e-6 keeps headroom without being loose.
+    let f_forced = with_forced_sparse_tail(|| crate::fit_cold(&x, &y, n, p, &model, &ids, &opts));
+    assert!(f_forced.converged, "forced-sparse-tail refit must converge");
+    for j in 0..p {
+        assert!(
+            (f_forced.beta[j] - f.beta[j]).abs() < 1e-6,
+            "forced-sparse-tail beta[{j}] {} vs unforced {}",
+            f_forced.beta[j],
+            f.beta[j]
+        );
+        assert!(
+            (f_forced.se[j] - f.se[j]).abs() < 1e-6,
+            "forced-sparse-tail se[{j}] {} vs unforced {}",
+            f_forced.se[j],
+            f.se[j]
+        );
+    }
+    for k in 0..f.tau2.len() {
+        assert!(
+            (f_forced.tau2[k] - f.tau2[k]).abs() < 1e-6,
+            "forced-sparse-tail tau2[{k}] {} vs unforced {}",
+            f_forced.tau2[k],
+            f.tau2[k]
+        );
+    }
 }
 
 /// Task 6: constant weights (w ≡ 2) on a sparse-classified design (extra

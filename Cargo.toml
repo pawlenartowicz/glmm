@@ -1,6 +1,6 @@
 [package]
 name = "glmm"
-version = "0.0.3"
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,33 +13,18 @@ repository = "https://github.com/pawlenartowicz/glmm"
 [lib]
 crate-type = ["rlib"]
 
-# The glmm side of the cross-language parity harness. Kept at parity/oracle/fit.rs
-# (where the design and run.sh name it) rather than the default examples/ dir; an
-# ordinary part of the crate build, run by run.sh's "rust" engine entry. Uses the
-# serde_json dev-dependency (examples see dev-deps).
-[[example]]
-name = "parity_fit"
-path = "parity/oracle/fit.rs"
-
-# The glmm side of the optimizer-grid campaign (manifest_grid.json, 510 cells):
-# one JSONL record per cell, appended to $GRID_OUT. Shares harness_common.rs
-# with parity_fit above.
-[[example]]
-name = "grid_fit"
-path = "parity/oracle/grid_fit.rs"
-
-# Mismatch-adjudication driver (oracle spec 2026-07-11): evaluates/minimizes
-# the LMM profiled-REML objective at caller-chosen θ/schedules through the
-# dev-only loop_advanced seam. Shares harness_common.rs with the two above.
-[[example]]
-name = "theta_eval"
-path = "parity/oracle/theta_eval.rs"
-required-features = ["loop_advanced"]
-
 [lints]
 workspace = true
 
 [features]
+# The R-style formula frontend (`glmm::formula`). ON by default so `cargo add glmm`
+# gets the API the Rust tutorial documents. `regex` — the only dep it adds — is
+# pulled in solely by this feature, so `default-features = false` gives the
+# formula-free kernel the parse-once/fit-many hot path wants, linking no regex.
+# CI asserts that (ci.yml "kernel links no regex"). Unlike `loop_advanced`, this
+# IS part of the semver-covered surface.
+default = ["formula"]
+formula = ["dep:regex"]
 # Unstable scratch-explicit hot-path surface (the loop tier: scratch-explicit
 # kernels + `StartValues` warm-start). Capability-named, multi-consumer. OFF by
 # default so the semver-covered public API is just `fit` + `ModelSpec`. (spec §5)
@@ -62,6 +47,9 @@ parallel = ["dep:rayon"]
 # Mirror engine-core's pins exactly — parity-stable numerics depend on them.
 bobyqa = "0.1"
 pulp = "=0.22.2"
+# Formula-parser only (`src/formula/parse.rs`); optional so the default-off kernel
+# never links it. Its MSRV (1.65) clears this crate's 1.85 floor.
+regex = { version = "1", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 faer = "0.24"
@@ -74,12 +62,6 @@ faer = { version = "0.24", default-features = false, features = ["std", "sparse-
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 dhat       = "0.3"
-# The formula frontend, used only by the parity example (`parity/oracle/fit.rs`)
-# to build design/spec/ids from a formula string instead of by hand. A
-# dev-dependency, so this glmm→glmm-formula→glmm edge is a permitted dev-only
-# cycle (Cargo allows cycles through dev-deps) and never enters the published
-# lib's dependency graph — the parse-once/fit-many hot path still links no `regex`.
-glmm-formula = { path = "glmm-formula" }
 
 # ───────────────────────── standalone workspace root ─────────────────────────
 # glmm was carved out of the mcpower workspace (Stage 2). It is now its own
@@ -88,13 +70,16 @@ glmm-formula = { path = "glmm-formula" }
 # place. Values copied verbatim from the mcpower workspace at carve time.
 [workspace]
 resolver = "2"
-# The `glmm` root package is the kernel (formula-free, parse-once/fit-many hot
-# path). `glmm-formula` (d3) is the R-style formula frontend that lowers a
-# formula + data table into the numeric inputs `fit_cold` consumes; it depends on
-# `glmm`, never the reverse, so the kernel never links `regex`/the parser.
-# `glmm-python` (Python wiring) depends on both and is the only crate that links
-# `pyo3`; `publish = false` — it is a PyO3/maturin extension, never `cargo publish`ed.
-members = ["glmm-formula", "glmm-python"]
+# The `glmm` root package is the kernel plus — behind the default-on `formula`
+# feature — the R-style formula frontend that lowers a formula + data table into
+# the numeric inputs `fit_cold` consumes. `glmm-python` (Python wiring) is the only
+# crate that links `pyo3`; `publish = false` — it is a PyO3/maturin extension,
+# never `cargo publish`ed. `glmm-r` is its R-side twin (extendr wiring), re-exported
+# by `r/src/rust` (which stays OUT of this workspace — R drives that staticlib
+# build with its own resolver, mirroring mcpower's ports/r layout). `parity` is
+# the publish = false crate owning the oracle-harness examples; nesting it keeps
+# parity/ out of the packaged glmm crate.
+members = ["glmm-python", "glmm-r", "parity"]
 
 [workspace.package]
 edition = "2021"

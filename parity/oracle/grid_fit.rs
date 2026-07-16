@@ -17,9 +17,9 @@ const DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 fn main() {
     let manifest_path = std::env::var("GRID_MANIFEST")
-        .unwrap_or_else(|_| format!("{DIR}/parity/manifest_grid.json"));
+        .unwrap_or_else(|_| format!("{DIR}/manifest_grid.json"));
     let out_path = std::env::var("GRID_OUT")
-        .unwrap_or_else(|_| format!("{DIR}/parity/results/grid/glmm_shipped.jsonl"));
+        .unwrap_or_else(|_| format!("{DIR}/results/grid/glmm_shipped.jsonl"));
     let tag = std::env::var("GRID_CONFIG_TAG").unwrap_or_default();
     let only = std::env::var("GRID_ONLY").unwrap_or_default();
     std::fs::create_dir_all(std::path::Path::new(&out_path).parent().unwrap()).unwrap();
@@ -57,7 +57,7 @@ fn main() {
 /// non-Gaussian Hessian path (`Fit::stddev_se` is populated only there, and
 /// only for scalar (q=1) groupings — see its doc comment); LMM callers pass
 /// `false`.
-fn varcomp(f: &glmm::Fit, re_groups: &[glmm_formula::ReGroupInfo], include_se: bool) -> Value {
+fn varcomp(f: &glmm::Fit, re_groups: &[glmm::formula::ReGroupInfo], include_se: bool) -> Value {
     let mut theta_offset = 0usize;
     Value::Array(
         re_groups
@@ -100,7 +100,7 @@ fn done_case_ids(path: &str) -> std::collections::HashSet<String> {
 /// src/fit.rs's classify_design: over-envelope, any slope-carrying extra
 /// grouping, or Σ crossed levels past MAX_CROSSED_LEVELS routes Sparse
 /// (mirrors classify_design — change together).
-fn config_tag(lo: &glmm_formula::Lowered, gaussian: bool, user_tag: &str) -> String {
+fn config_tag(lo: &glmm::formula::Lowered, gaussian: bool, user_tag: &str) -> String {
     let sparse = match lo.model.re.as_ref() {
         None => false,
         Some(re) => {

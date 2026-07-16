@@ -158,17 +158,32 @@ def test_dispersion_bool_raises():
         glmm.fit(DATA, "y ~ x", "gamma", dispersion=True)
 
 
-def test_theta_off_negbin_warns_then_fits():
-    with pytest.warns(UserWarning, match="theta"):
-        result = glmm.fit(FIT_DATA, "y_gamma ~ x", "gamma", theta=1.5)
+def test_init_theta_off_negbin_warns_then_fits():
+    with pytest.warns(UserWarning, match="init_theta"):
+        result = glmm.fit(FIT_DATA, "y_gamma ~ x", "gamma", init_theta=1.5)
     assert result.converged
 
 
-def test_theta_on_negbin_is_a_kernel_gap():
-    # theta=<float> has no kernel hook (no public theta_seed on fit_warm);
-    # only the default theta=None cold-start search is supported.
-    with pytest.raises(NotImplementedError, match="theta"):
-        glmm.fit(FIT_DATA, "y_pois ~ x", "negativebinomial", theta=1.5)
+def test_init_theta_on_negbin_is_a_kernel_gap():
+    # init_theta=<float> has no kernel hook (no public theta_seed on fit_warm);
+    # only the default init_theta=None cold-start search is supported.
+    with pytest.raises(NotImplementedError, match="init_theta"):
+        glmm.fit(FIT_DATA, "y_pois ~ x", "negativebinomial", init_theta=1.5)
+
+
+def test_init_theta_and_warm_start_theta_are_independent(recwarn):
+    # The §3 collision: `init_theta` (negative-binomial shape) and
+    # `warm_start["theta"]` (RE Cholesky vector) are unrelated knobs that may
+    # legally appear in one call. `init_theta` on a Gaussian is inapplicable and
+    # strips with a warning; the warm start still takes effect.
+    result = glmm.fit(
+        FIT_DATA,
+        "y_gauss ~ x + (1 | g)",
+        warm_start={"beta": [0.0, 0.0], "theta": [1.0]},
+        init_theta=2.0,
+    )
+    assert result.converged
+    assert any("init_theta" in str(w.message) for w in recwarn)
 
 
 def test_warm_start_unknown_key_warns_then_fits():

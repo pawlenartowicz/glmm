@@ -8,7 +8,9 @@ use crate::{
 };
 use faer::Mat;
 
-use super::common_tests::{dense_str, lcg, lmm_hand_dataset};
+#[cfg(feature = "loop_advanced")]
+use super::common_tests::lmm_hand_dataset;
+use super::common_tests::{dense_str, lcg};
 
 #[derive(serde::Deserialize)]
 struct RdLmmEst {
@@ -230,37 +232,6 @@ fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
     }
 }
 
-#[test]
-fn fit_lmm_smoke() {
-    let (x, y, n, p) = lmm_hand_dataset();
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 6 },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let f = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &model,
-        &GroupIds::from_sizing(model.re.as_ref().unwrap(), n),
-        &FitOptions {
-            target_indices: vec![1, 2],
-            ..FitOptions::default()
-        },
-    );
-    assert!(f.converged, "LMM should converge on clean clustered data");
-    assert!(
-        f.tau2[0].is_finite() && f.tau2[0] >= 0.0,
-        "tau2[0] must be a finite non-negative variance, got {}",
-        f.tau2[0]
-    );
-}
-
 /// Gap #3: sleepstudy `Reaction ~ 1 + Days + (1 + Days | Subject)` — a q=2
 /// random-slope LMM through `fit_cold`, gated against the frozen lme4 VarCorr
 /// (`parity/goldens/sleepstudy_lmm.json`, REML). Checks the full 2×2 RE
@@ -275,6 +246,7 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
     const REF_SD0: f64 = 24.7406579949841; // (Intercept) sd
     const REF_SD1: f64 = 5.92213765889808; // Days sd
     const REF_CORR: f64 = 0.0655512382381282;
+    const REF_SIGMA: f64 = 25.5917957216753; // residual sd, lme4 sigma()
 
     let csv = include_str!("../../parity/data_empirical/sleepstudy.csv");
     let mut y = Vec::<f64>::new();
@@ -340,6 +312,12 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
         (f.se[1] - REF_SE1).abs() / REF_SE1 < 2e-2,
         "se1 {} vs {REF_SE1}",
         f.se[1]
+    );
+    // Gaussian dispersion = REML σ̂²; σ̂ against the frozen lme4 sigma().
+    assert!(
+        (f.dispersion.sqrt() - REF_SIGMA).abs() / REF_SIGMA < 1e-3,
+        "σ̂ {} vs {REF_SIGMA}",
+        f.dispersion.sqrt()
     );
 
     // Reference D (col-major vech lower-tri): [D00, D10, D11].
@@ -1281,6 +1259,92 @@ fn lmm_sweep_fit_on_matches_lmm_sweep_fit_sparse() {
 
     assert_sweep_outcomes_bit_equal(&on_a, &standalone_a, "sparse theta_a");
     assert_sweep_outcomes_bit_equal(&on_b, &standalone_b, "sparse theta_b");
+}
+
+/// [`lmm_objective_at`] self-consistency: evaluating it at the θ̂ an
+/// `lmm_sweep_fit` run converged to must reproduce that run's own
+/// `deviance` — both paths build the same `LmmSeamWs` and call the same
+/// `reml_deviance`/`sparse_reml_deviance` closure, so only bit-level FP
+/// order can separate them. Dense (`Solver::NoZ`) shape, same design as
+/// [`lmm_sweep_fit_on_matches_lmm_sweep_fit_dense`].
+#[cfg(feature = "loop_advanced")]
+#[test]
+fn lmm_objective_at_matches_lmm_sweep_fit_deviance_dense() {
+    let (x, y, n, p) = lmm_hand_dataset();
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 6 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds::from_sizing(model.re.as_ref().unwrap(), n);
+    assert!(matches!(classify_design(&model, 1), Solver::NoZ));
+
+    let outcome = lmm_sweep_fit(&x, &y, n, p, &model, &ids, None, 1e-6, None, None);
+    assert!(outcome.converged, "dense sweep fit must converge");
+
+    let obj = lmm_objective_at(&x, &y, n, p, &model, &ids, &outcome.theta);
+    let rel = (obj - outcome.deviance).abs() / outcome.deviance.abs();
+    assert!(
+        rel < 1e-10,
+        "dense: lmm_objective_at {obj} vs sweep deviance {} (rel {rel})",
+        outcome.deviance
+    );
+}
+
+/// Same proof as [`lmm_objective_at_matches_lmm_sweep_fit_deviance_dense`],
+/// sparse (`Solver::Sparse`) shape: the crossed-slope 32-row design from
+/// [`lmm_sweep_fit_on_matches_lmm_sweep_fit_sparse`] that forces
+/// `classify_design` off the dense route.
+#[cfg(feature = "loop_advanced")]
+#[test]
+fn lmm_objective_at_matches_lmm_sweep_fit_deviance_sparse() {
+    let n = 32usize;
+    let p = 3usize;
+    let mut st = 7u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut primary = vec![0u32; n];
+    let mut extra = vec![0u32; n];
+    for i in 0..n {
+        let x1 = lcg(&mut st);
+        let x2 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        x[i * p + 2] = x2;
+        primary[i] = (i % 4) as u32;
+        extra[i] = ((i / 4) % 4) as u32;
+        y[i] = 0.5 + 0.4 * x1 - 0.2 * x2 + 0.3 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 4 },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 4 },
+                slopes: vec![1],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary,
+        extra: vec![extra],
+    };
+    assert!(matches!(classify_design(&model, 1), Solver::Sparse));
+
+    let outcome = lmm_sweep_fit(&x, &y, n, p, &model, &ids, None, 1e-6, None, None);
+    assert!(outcome.converged, "sparse sweep fit must converge");
+
+    let obj = lmm_objective_at(&x, &y, n, p, &model, &ids, &outcome.theta);
+    let rel = (obj - outcome.deviance).abs() / outcome.deviance.abs();
+    assert!(
+        rel < 1e-10,
+        "sparse: lmm_objective_at {obj} vs sweep deviance {} (rel {rel})",
+        outcome.deviance
+    );
 }
 
 /// Task 3's correctness proof: two [`refit_lmm`] calls with DIFFERENT `y`

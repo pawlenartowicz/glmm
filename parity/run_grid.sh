@@ -23,7 +23,7 @@ mkdir -p "$(dirname "$OUT")"
 export GRID_OUT="$OUT" GRID_MANIFEST="$MANIFEST" GRID_CONFIG_TAG="${GRID_CONFIG_TAG:-$TAG}"
 
 case "$ENGINE" in
-  glmm)        CMD=(cargo run --quiet --release --manifest-path "$PARITY/../Cargo.toml" --example grid_fit)
+  glmm)        CMD=(cargo run --quiet --release --manifest-path "$PARITY/../Cargo.toml" -p parity --example grid_fit)
                # 3x the per-fit budget: grid_fit.rs runs warm-up + 2 timed
                # fits per cell (min-of-2 reported) — change with fit_cell's
                # timing protocol
@@ -48,7 +48,7 @@ GRACE="${GRID_STARTUP_GRACE:-$((TIMEOUT + 180))}"
 # glmm: compile OUTSIDE the watchdog — a first build takes minutes with no
 # output writes, which would read as a per-fit timeout and kill the compiler.
 [ "$ENGINE" = "glmm" ] && cargo build --quiet --release \
-  --manifest-path "$PARITY/../Cargo.toml" --example grid_fit
+  --manifest-path "$PARITY/../Cargo.toml" -p parity --example grid_fit
 
 # clock state into run meta (recorded, never set — user's bench-l/bench-u)
 NO_TURBO=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo "?")

@@ -9,7 +9,7 @@
 # Nesting is realized with globally-unique inner labels + plain intercept terms
 # ((1|g1)+(1|g2), g2 labels unique within g1) rather than the `/` operator --
 # semantically identical, and it sidesteps engine-specific nesting syntax
-# (glmm_formula has no `/`; the tier-0 corpus uses the same unique-label trick).
+# (the formula frontend has no `/`; the tier-0 corpus uses the same unique-label trick).
 suppressMessages({ library(jsonlite); library(MASS) })
 
 parity_dir <- normalizePath(file.path(dirname(sub(

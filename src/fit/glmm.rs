@@ -12,7 +12,7 @@ use crate::glm::{glm_irls_fit, GlmScratch};
 use crate::glmm::{build_z, GlmmWorkspace, StructuredSchur};
 use crate::{Family, ModelSpec, NegBinomialLink, StartValues};
 
-use super::common::{assemble_varcorr, fill_se_by_predictor, to_col_major};
+use super::common::{assemble_varcorr, fill_se_by_predictor, nan_vcov, to_col_major};
 use super::glm::{golden_max_ln_theta, nb_profile_loglik};
 use super::{Fit, FitOptions};
 
@@ -151,6 +151,7 @@ fn fit_glmm_build(
             Fit {
                 beta: vec![f64::NAN; p],
                 se: vec![f64::NAN; p],
+                vcov: nan_vcov(p),
                 tau2: vec![f64::NAN; ws.n_theta],
                 dispersion: f64::NAN,
                 converged: false,
@@ -347,10 +348,18 @@ fn fit_glmm_prebuilt(
         vec![f64::NAN; n_theta]
     };
 
+    // `ws.vcov` is filled at the same target indices as `ws.var_diag` by
+    // whichever SE arm ran, and NaN elsewhere — so `Fit::vcov` is finite exactly
+    // where `Fit::se` is, on both `Hessian` and `Rx`.
+    let vcov: Vec<Vec<f64>> = (0..p)
+        .map(|i| (0..p).map(|j| ws.vcov[(i, j)]).collect())
+        .collect();
+
     let mu_hat = ws.prob[..n].to_vec();
     let mut fit = Fit {
         beta,
         se,
+        vcov,
         tau2,
         dispersion,
         converged: glmm_fit.converged,

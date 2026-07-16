@@ -30,41 +30,6 @@ pub(super) fn sim_clustered(csv: &str) -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) 
     (x, y, ids, nc)
 }
 
-/// Weights × AGQ boundary is OPEN: prior weights flow through the AGQ path
-/// (PIRLS folds them into the conditional mode/curvature; the per-row `dev_resid`
-/// sums in `glmm/agq.rs` carry `wᵢ`), so a weighted scalar-intercept binomial
-/// GLMM at `nAGQ=3` fits instead of panicking. The tight aggregated≡expanded and
-/// oracle checks live in `glmm_tests.rs`; this only pins that the dispatch
-/// boundary no longer rejects `weights.is_some() && nagq > 1`.
-#[test]
-fn weights_accepted_with_agq() {
-    let n = 8;
-    let x = vec![1.0f64; n];
-    let y: Vec<f64> = (0..n).map(|i| f64::from(u32::from(i % 3 == 0))).collect();
-    let model = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 2 },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds {
-        primary: vec![0, 0, 0, 0, 1, 1, 1, 1],
-        extra: vec![],
-    };
-    let opts = FitOptions {
-        weights: Some(vec![2.0; n]),
-        nagq: 3,
-        ..FitOptions::default()
-    };
-    let f = fit_cold(&x, &y, n, 1, &model, &ids, &opts);
-    assert!(f.converged, "weighted nAGQ=3 fit must converge");
-    assert!(f.beta[0].is_finite(), "weighted nAGQ=3 β must be finite");
-}
-
 /// Shape asserts (length + positivity) landed in Task 1 and never moved —
 /// this pins the wrong-length case still faults on an otherwise-open path
 /// (fixed-only OLS), independent of the family/RE capability map above.
@@ -298,6 +263,7 @@ fn fit_with_varcorr(vech: Vec<f64>) -> Fit {
     Fit {
         beta: vec![],
         se: vec![],
+        vcov: vec![],
         tau2: vec![],
         dispersion: 1.0,
         converged: true,
@@ -430,7 +396,7 @@ fn spec_sized_from_ids_derives_counts() {
 /// UNBALANCED nesting: 3 parents with 1, 2, and 3 distinct children
 /// respectively, primary ids ascending with the widest parent last
 /// (`0 → {0}`, `1 → {3,4}`, `2 → {6,7,8}` — the contiguous-per-parent-block
-/// layout `glmm-formula`'s `grouping_ids` now emits, padded to width 3).
+/// layout the formula frontend's `grouping_ids` now emits, padded to width 3).
 #[test]
 fn spec_sized_from_ids_nested_unbalanced_uses_true_max_per_parent() {
     let re = ReStructure {
@@ -1027,4 +993,211 @@ fn fixed_only_fit_runs_zero_bobyqa_evals() {
             "{family:?} fixed-only fit must enter BOBYQA zero times"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// `Fit::vcov` — gating tests for the `targets`-subset carve-out.
+// ---------------------------------------------------------------------------
+
+/// `vcov` must be a symmetric p×p whose diagonal IS `se²`, on every estimator
+/// path — the spec's plan gate 2: no path may report a finite `se[j]` next to a
+/// NaN `vcov[j][j]`. Covers OLS / GLM / LMM / GLMM (both `WaldSe` arms), since
+/// each sources `vcov` from a different matrix.
+fn assert_vcov_agrees_with_se(fit: &Fit, p: usize, ctx: &str) {
+    assert_eq!(fit.vcov.len(), p, "{ctx}: vcov is not p rows");
+    for row in &fit.vcov {
+        assert_eq!(row.len(), p, "{ctx}: vcov is not p×p");
+    }
+    for j in 0..p {
+        if fit.se[j].is_finite() {
+            assert!(
+                fit.vcov[j][j].is_finite(),
+                "{ctx}: finite se[{j}] alongside NaN vcov[{j}][{j}]"
+            );
+            // se = sqrt(diag) — same quantity, so this is tight, not a tolerance.
+            let want = fit.se[j] * fit.se[j];
+            assert!(
+                (fit.vcov[j][j] - want).abs() <= 1e-9 * want.abs().max(1e-12),
+                "{ctx}: vcov[{j}][{j}] = {} vs se[{j}]² = {want}",
+                fit.vcov[j][j]
+            );
+        }
+    }
+    for i in 0..p {
+        for j in 0..p {
+            if fit.vcov[i][j].is_finite() || fit.vcov[j][i].is_finite() {
+                assert_eq!(fit.vcov[i][j], fit.vcov[j][i], "{ctx}: vcov not symmetric");
+            }
+        }
+    }
+}
+
+#[test]
+fn vcov_diagonal_is_se_squared_on_every_path() {
+    let (x, y, n, p) = lmm_hand_dataset();
+    let all: Vec<u32> = (0..p as u32).collect();
+    let opts = FitOptions {
+        target_indices: all.clone(),
+        ..FitOptions::default()
+    };
+
+    // OLS — Gaussian, no RE.
+    let ols = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &ModelSpec {
+            family: Family::Gaussian,
+            re: None,
+        },
+        &GroupIds::default(),
+        &opts,
+    );
+    assert!(ols.converged);
+    assert_vcov_agrees_with_se(&ols, p, "ols");
+
+    // LMM — Gaussian, 6 clusters.
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % 6) as u32).collect(),
+        extra: vec![],
+    };
+    let lmm_model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 6 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let lmm = fit_cold(&x, &y, n, p, &lmm_model, &ids, &opts);
+    assert!(lmm.converged);
+    assert_vcov_agrees_with_se(&lmm, p, "lmm");
+
+    // GLM / GLMM — Bernoulli response off the same design.
+    let yb: Vec<f64> = y.iter().map(|&v| f64::from(v > 0.5)).collect();
+    let binom = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let glm = fit_cold(
+        &x,
+        &yb,
+        n,
+        p,
+        &ModelSpec {
+            family: binom,
+            re: None,
+        },
+        &GroupIds::default(),
+        &opts,
+    );
+    assert!(glm.converged);
+    assert_vcov_agrees_with_se(&glm, p, "glm");
+
+    // GLMM on both SE arms — each sources vcov from a different matrix
+    // (FD-Hessian β block vs Schur inverse).
+    for wald_se in [WaldSe::Hessian, WaldSe::Rx] {
+        let glmm = fit_cold(
+            &x,
+            &yb,
+            n,
+            p,
+            &ModelSpec {
+                family: binom,
+                re: Some(ReStructure {
+                    sizing: Sizing::FixedClusters { n_clusters: 6 },
+                    slopes: vec![],
+                    extra_groupings: vec![],
+                }),
+            },
+            &ids,
+            &FitOptions {
+                target_indices: all.clone(),
+                wald_se,
+                ..FitOptions::default()
+            },
+        );
+        assert!(glmm.converged, "glmm {wald_se:?} did not converge");
+        assert_vcov_agrees_with_se(&glmm, p, &format!("glmm {wald_se:?}"));
+    }
+}
+
+/// The sanctioned `targets=` carve-out (gate 2's one exception): under a target
+/// subset, `vcov` is finite exactly on the target block and NaN outside it —
+/// never a finite `se` next to a NaN variance, and never a fabricated
+/// covariance for a coefficient whose variance was never computed.
+#[test]
+fn vcov_is_nan_outside_the_target_block() {
+    let (x, y, n, p) = lmm_hand_dataset();
+    let fit = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &ModelSpec {
+            family: Family::Gaussian,
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![2], // only the last predictor
+            ..FitOptions::default()
+        },
+    );
+    assert!(fit.converged);
+    assert!(fit.se[2].is_finite() && fit.vcov[2][2].is_finite());
+    assert!(fit.se[0].is_nan() && fit.se[1].is_nan());
+    for j in [0usize, 1] {
+        for i in 0..p {
+            assert!(
+                fit.vcov[i][j].is_nan() && fit.vcov[j][i].is_nan(),
+                "vcov must be NaN outside the target block at ({i},{j})"
+            );
+        }
+    }
+    assert_vcov_agrees_with_se(&fit, p, "targets subset");
+}
+
+/// An aliased (rank-deficient) column has no coefficient, so it has no
+/// covariance either: its whole `vcov` row/column is NaN, exactly as its `se`
+/// slot is, while the surviving block stays finite and self-consistent.
+#[test]
+fn vcov_rows_are_nan_for_aliased_columns() {
+    let (x, y, n, _) = lmm_hand_dataset();
+    // Widen the design with a duplicate of column 1 → aliased on it.
+    let p = 4;
+    let mut xa = vec![0.0f64; n * p];
+    for i in 0..n {
+        xa[i * p] = x[i * 3];
+        xa[i * p + 1] = x[i * 3 + 1];
+        xa[i * p + 2] = x[i * 3 + 2];
+        xa[i * p + 3] = x[i * 3 + 1]; // exact copy of column 1
+    }
+    let fit = fit_cold(
+        &xa,
+        &y,
+        n,
+        p,
+        &ModelSpec {
+            family: Family::Gaussian,
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: (0..p as u32).collect(),
+            ..FitOptions::default()
+        },
+    );
+    assert!(fit.aliased[3], "duplicate column must be detected aliased");
+    for i in 0..p {
+        assert!(
+            fit.vcov[i][3].is_nan(),
+            "aliased column keeps a NaN vcov col"
+        );
+        assert!(
+            fit.vcov[3][i].is_nan(),
+            "aliased column keeps a NaN vcov row"
+        );
+    }
+    assert_vcov_agrees_with_se(&fit, p, "aliased");
 }

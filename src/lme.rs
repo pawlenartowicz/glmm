@@ -136,10 +136,15 @@ pub struct LmeScratch<'w> {
     /// individual `&'w mut f64` reborrows of workspace's `lme_brent_*` slots.
     /// (`d`/`e` are stack locals in `lme_fit`, not workspace slots — see there.)
     pub brent_log_a: &'w mut f64,
+    /// Bracket best/interior point, log(θ).
     pub brent_log_b: &'w mut f64,
+    /// Bracket upper endpoint, log(θ).
     pub brent_log_c: &'w mut f64,
+    /// REML profiled deviance at `brent_log_a`.
     pub brent_fa: &'w mut f64,
+    /// REML profiled deviance at `brent_log_b`.
     pub brent_fb: &'w mut f64,
+    /// REML profiled deviance at `brent_log_c`.
     pub brent_fc: &'w mut f64,
     /// p × p scratch; top-left k×k holds the Cholesky of Σ_T. Overwritten per
     /// call. See joint Wald-χ² block in `lme_fit`.
@@ -156,10 +161,15 @@ pub struct LmeScratch<'w> {
 /// Borrowed view into the outputs of `lme_fit`. Lifetime ties back
 /// to the workspace that owns the storage.
 pub struct LmeFitView<'a> {
+    /// Fixed-effect estimates β̂(θ̂), length `p`.
     pub betas: &'a [f64],
+    /// Per-target Var(β̂_j) at θ̂, length `p`.
     pub var_diag: &'a [f64],
+    /// Per-target β̂_j² / Var(β̂_j) at θ̂, length `p`.
     pub t_sq: &'a [f64],
+    /// `P × P` Cholesky factor of X'V(θ̂)⁻¹X.
     pub factor: MatRef<'a, f64>,
+    /// Residual variance σ̂²(θ̂) (variance scale, not SD).
     pub sigma_sq: f64,
     /// Estimated random-intercept variance τ̂² = θ̂²·σ̂² (θ̂ is the fitted
     /// relative SD λ̂ = τ/σ). `NaN` on the failure paths, alongside `sigma_sq`.
@@ -167,6 +177,8 @@ pub struct LmeFitView<'a> {
     /// from the raw `theta`; this scalar path exposes it directly since `θ̂`
     /// (`pin_theta`) is local to `lme_fit`.
     pub tau_sq_hat: f64,
+    /// `true` if Brent's method terminated within `MAX_BRENT_ITERS`
+    /// (trivially `true` when `boundary_hit == 1` skips Brent entirely).
     pub converged: bool,
     /// 0 = interior min, 1 = τ̂ ≈ 0 (OLS fallback used), 2 = high-τ bracket failure.
     pub boundary_hit: u8,
@@ -2257,6 +2269,32 @@ mod tests {
             .collect();
         let cluster_ids: Vec<u32> = (0..N).map(|i| (i % K) as u32).collect();
 
+        // OLS reference β̂ via normal equations on the same data: at τ=0 the
+        // GLS solution collapses to OLS exactly, so this pins the fit's β̂
+        // without depending on any external oracle (mirrors the P=3 block
+        // in lme_fit_detects_tau_zero_boundary, adapted to this test's P=2 design).
+        let mut xtx_ols = Mat::<f64>::zeros(P, P);
+        let mut xty_ols = [0.0_f64; P];
+        for i in 0..N {
+            for jj in 0..P {
+                xty_ols[jj] += x[(i, jj)] * y[i];
+                for ii in jj..P {
+                    xtx_ols[(ii, jj)] += x[(i, ii)] * x[(i, jj)];
+                }
+            }
+        }
+        let chol = xtx_ols
+            .as_ref()
+            .llt(faer::Side::Lower)
+            .expect("OLS Cholesky failed");
+        let mut rhs = Mat::<f64>::zeros(P, 1);
+        for jj in 0..P {
+            rhs[(jj, 0)] = xty_ols[jj];
+        }
+        use faer::linalg::solvers::Solve;
+        chol.solve_in_place(rhs.as_mut());
+        let ols_beta = [rhs[(0, 0)], rhs[(1, 0)]];
+
         let mut ws = TestWs::new(N, P, K);
         ws.reset_lme_suff_stats();
         {
@@ -2277,17 +2315,28 @@ mod tests {
 
         let fit_converged: bool;
         let fit_boundary: u8;
+        let fit_betas: [f64; P];
         {
             let scratch = build_lme_scratch(&mut ws, N as u32, K as u32);
             let fit = lme_fit(x.as_ref(), &y, &cluster_ids, &targets, None, scratch);
             fit_converged = fit.converged;
             fit_boundary = fit.boundary_hit;
+            fit_betas = [fit.betas[0], fit.betas[1]];
         }
         assert!(fit_converged, "bracket-repair path failed to converge");
-        assert!(
-            fit_boundary == 0 || fit_boundary == 1,
-            "expected boundary_hit ∈ {{0, 1}}, got {fit_boundary}"
+        assert_eq!(
+            fit_boundary, 1,
+            "expected τ̂≈0 boundary_hit=1, got {fit_boundary}"
         );
+        for j in 0..P {
+            let delta = (fit_betas[j] - ols_beta[j]).abs();
+            assert!(
+                delta < 1e-6,
+                "β̂[{j}] = {}, OLS = {}, delta = {delta}",
+                fit_betas[j],
+                ols_beta[j]
+            );
+        }
     }
 
     /// Bounded-allocation warm-path test (mirrors `ols.rs`'s
@@ -2706,11 +2755,14 @@ mod tests {
     // C4 — lme_fit σ² / β̂ golden values (external oracle: R/lme4 REML)
     // -----------------------------------------------------------------
     //
-    // R run on the committed 60-row fixture (cluster = i % 6, i=0..59):
+    // R run on the committed 60-row fixture (cluster = i / 10, blocks of 10 —
+    // NOT i % 6: the round-robin grouping has zero between-cluster signal and
+    // collapses to the τ̂=0 boundary, which this test must avoid):
     //   df <- data.frame(y=y60, x1=x1, x2=x2, cluster=factor(rep(0:5, each=10)))
     //   fit <- lmer(y ~ x1 + x2 + (1|cluster), REML=TRUE, data=df)
     //   sigma(fit)^2  →  0.9643488
     //   fixef(fit)    →  intercept=0.1665798, x1=0.7513689, x2=0.2555365
+    //   VarCorr τ²    →  0.0828566   (interior optimum, isSingular = FALSE)
     #[test]
     fn lme_fit_golden_sigma_sq_and_betas() {
         use faer::Mat;
@@ -2913,7 +2965,7 @@ mod tests {
             x[(i, 2)] = x2[i];
         }
         let y: Vec<f64> = y_data.to_vec();
-        let cluster_ids: Vec<u32> = (0..N).map(|i| (i % K) as u32).collect();
+        let cluster_ids: Vec<u32> = (0..N).map(|i| (i / 10) as u32).collect();
         let target_indices: Vec<u32> = vec![1, 2];
 
         let mut ws = TestWs::new(N, P, K);
@@ -2941,35 +2993,38 @@ mod tests {
             "must converge on the canonical 60-row fixture"
         );
 
-        if fit.boundary_hit == 0 {
-            // Interior minimum: compare to R/lme4 REML values (0.1% relative tolerance).
-            // R: sigma(fit)^2  = 0.9643488  (lmer REML on this fixture)
-            // R: fixef(fit)[2] = 0.7513689  (x1 coefficient, index 1)
-            let r_sigma_sq = 0.9643488_f64;
-            let r_beta_x1 = 0.7513689_f64;
+        // Interior optimum is the point of this fixture — a boundary landing
+        // means the goldens below would be silently vacuous, so it must fail.
+        // (The τ̂=0 boundary path is covered by lme_fit_detects_tau_zero_boundary.)
+        assert_eq!(
+            fit.boundary_hit, 0,
+            "expected interior optimum on the blocked fixture, got boundary_hit={}",
+            fit.boundary_hit
+        );
 
-            let rel_sigma = (fit.sigma_sq - r_sigma_sq).abs() / r_sigma_sq;
-            assert!(
-                rel_sigma < 1e-3,
-                "σ² = {}, R/lme4 = {r_sigma_sq}, rel = {rel_sigma}",
-                fit.sigma_sq
-            );
-            let rel_beta = (fit.betas[1] - r_beta_x1).abs() / r_beta_x1.abs().max(1e-9);
-            assert!(
-                rel_beta < 1e-3,
-                "β̂[x1] = {}, R/lme4 = {r_beta_x1}, rel = {rel_beta}",
-                fit.betas[1]
-            );
-        } else {
-            // OLS fallback (boundary_hit=1): σ² should still be finite and positive.
-            // The OLS-fallback branch is further guarded by lme_fit_detects_tau_zero_boundary.
-            assert_eq!(fit.boundary_hit, 1, "unexpected boundary_hit value");
-            assert!(
-                fit.sigma_sq.is_finite() && fit.sigma_sq > 0.0,
-                "OLS-fallback σ² must be finite positive, got {}",
-                fit.sigma_sq
-            );
-        }
+        // Compare to R/lme4 REML values (0.1% relative tolerance).
+        let r_sigma_sq = 0.9643488_f64;
+        let r_beta_x1 = 0.7513689_f64;
+        let r_tau_sq = 0.0828566_f64;
+
+        let rel_sigma = (fit.sigma_sq - r_sigma_sq).abs() / r_sigma_sq;
+        assert!(
+            rel_sigma < 1e-3,
+            "σ² = {}, R/lme4 = {r_sigma_sq}, rel = {rel_sigma}",
+            fit.sigma_sq
+        );
+        let rel_beta = (fit.betas[1] - r_beta_x1).abs() / r_beta_x1.abs().max(1e-9);
+        assert!(
+            rel_beta < 1e-3,
+            "β̂[x1] = {}, R/lme4 = {r_beta_x1}, rel = {rel_beta}",
+            fit.betas[1]
+        );
+        let rel_tau = (fit.tau_sq_hat - r_tau_sq).abs() / r_tau_sq;
+        assert!(
+            rel_tau < 1e-3,
+            "τ² = {}, R/lme4 = {r_tau_sq}, rel = {rel_tau}",
+            fit.tau_sq_hat
+        );
     }
 
     // -----------------------------------------------------------------

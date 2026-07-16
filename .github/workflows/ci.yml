@@ -53,6 +53,21 @@ jobs:
         # still compile and pass, including the bit-identity test that pins it to
         # the serial path's exact output.
         run: cargo test --features parallel
+      - name: test (no default features — formula-free kernel)
+        # The parse-once/fit-many hot path builds with default-features = false.
+        # The formula tests are #![cfg(feature = "formula")] and skip themselves.
+        run: cargo test --no-default-features
+      - name: guard — the default-off kernel links no regex
+        # `formula` is on by default (semver-covered surface), so the kernel's
+        # regex-free property is no longer structural — this assertion IS the
+        # guarantee. See GLMM.md's dependency-direction decision.
+        run: |
+          if cargo tree -e normal -p glmm --no-default-features | grep -q regex; then
+            echo "::error::default-off kernel pulls in regex — the formula feature is leaking"
+            cargo tree -e normal -p glmm --no-default-features | grep -B5 regex
+            exit 1
+          fi
+          echo "Kernel is regex-free with default features off."
 
   # ── MSRV floor: the bobyqa dep pins rust-version = 1.85 ───────────────────
   msrv:
