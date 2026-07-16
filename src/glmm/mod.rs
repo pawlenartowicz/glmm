@@ -195,6 +195,12 @@ pub enum FdHessianStatus {
 /// Matches `lme4::glmer` (binomial cbpp fixture; see
 /// `fit::tests::fit_glmm_cbpp_matches_lme4`).
 ///
+/// Read-back: on `converged == true`, `ws.params[..n_theta + p]` holds the
+/// pinned optimum `[θ̂ | β̂]` — the stable convention documented on
+/// `GlmmWorkspace::params`; callers may feed it back as
+/// `theta_start`/`beta_start` for a subsequent fit of related data (both pass
+/// through the same `THETA_TRUTH_FLOOR`/`BETA_BOX` clamps as any other start).
+///
 /// Errors: no `Result` — non-convergence (BOBYQA failure, a non-PD Schur, or the
 /// degenerate-fit guard tripping on an all-infeasible BOBYQA simplex) is
 /// reported through `GlmmFit`: `converged = false`, `boundary_hit = 2`, and

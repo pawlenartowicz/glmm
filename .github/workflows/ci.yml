@@ -21,15 +21,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── fmt + clippy + the full #[test] suite, on stable ──────────────────────
-  lint-test:
-    name: lint + test
+  # ── fmt + clippy + the regex-free-kernel guard, on stable ─────────────────
+  # Split out from the #[test] suite so the four feature-variant test runs can
+  # go wide in a matrix (below) instead of recompiling serially behind clippy.
+  lint:
+    name: lint
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      # The dhat bounded-allocation gates assert exact alloc counts; faer/rayon
-      # multi-thread jitter perturbs them, so pin the pool to one thread.
-      RAYON_NUM_THREADS: 1
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,21 +40,6 @@ jobs:
         # The crate's workspace lints set clippy::all = deny, so a plain clippy
         # run is the correctness gate — no extra `-- -D warnings` needed.
         run: cargo clippy --all-targets
-      - name: test
-        run: cargo test
-      - name: test (loop_advanced feature)
-        # The unstable scratch-explicit surface is off by default; it must still
-        # compile and pass so the hot-path consumer never breaks silently.
-        run: cargo test --features loop_advanced
-      - name: test (parallel feature)
-        # rayon in-fit parallelism (AGQ cluster loop) is off by default; it must
-        # still compile and pass, including the bit-identity test that pins it to
-        # the serial path's exact output.
-        run: cargo test --features parallel
-      - name: test (no default features — formula-free kernel)
-        # The parse-once/fit-many hot path builds with default-features = false.
-        # The formula tests are #![cfg(feature = "formula")] and skip themselves.
-        run: cargo test --no-default-features
       - name: guard — the default-off kernel links no regex
         # `formula` is on by default (semver-covered surface), so the kernel's
         # regex-free property is no longer structural — this assertion IS the
@@ -68,6 +51,43 @@ jobs:
             exit 1
           fi
           echo "Kernel is regex-free with default features off."
+
+  # ── the full #[test] suite across all four feature configs, in parallel ───
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # The dhat bounded-allocation gates assert exact alloc counts; faer/rayon
+      # multi-thread jitter perturbs them, so pin the pool to one thread.
+      RAYON_NUM_THREADS: 1
+    strategy:
+      # A failing feature config must not cancel the others — we want every
+      # leg's result on one push, not just the first to break.
+      fail-fast: false
+      matrix:
+        # Each entry is one recompile-and-test on its own runner:
+        #   default        — the semver-covered surface.
+        #   loop_advanced  — unstable scratch-explicit surface, off by default;
+        #                    must still compile+pass so the hot-path consumer
+        #                    never breaks silently.
+        #   parallel       — rayon in-fit parallelism (AGQ cluster loop), off by
+        #                    default; includes the bit-identity test pinning it
+        #                    to the serial path's exact output.
+        #   no-default     — the parse-once/fit-many formula-free kernel; the
+        #                    formula tests are #![cfg(feature = "formula")] and
+        #                    skip themselves.
+        include:
+          - { name: default, flags: "" }
+          - { name: loop_advanced, flags: "--features loop_advanced" }
+          - { name: parallel, flags: "--features parallel" }
+          - { name: no-default, flags: "--no-default-features" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test (${{ matrix.name }})
+        run: cargo test ${{ matrix.flags }}
 
   # ── MSRV floor: the bobyqa dep pins rust-version = 1.85 ───────────────────
   msrv:

@@ -36,7 +36,15 @@ manifest-path = "../glmm-python/Cargo.toml"
 module-name = "glmm._native"
 python-source = "."
 features = ["pyo3/extension-module"]
-include = [{ path = "faststats/**/*.py", format = "wheel" }]
+# maturin ships only the primary `glmm` package; the faststats alias reaches the
+# wheel only through this include. It MUST be the plain-string form (both sdist and
+# wheel), never `{ format = "wheel" }`: the release builds the wheel *from the sdist*
+# (build_sdist job), and maturin re-roots python-source to the sdist root while
+# leaving working-tree dirs under `python/`. Wheel-only scoping omits faststats from
+# the sdist, so the sdist→wheel build can't find it and `import faststats.glmm`
+# fails. The string form also archives faststats at the sdist root, where this same
+# glob matches on the rebuild. Change together with test_packaging.py.
+include = ["faststats/**/*.py"]
 
 [tool.ruff]
 line-length = 100

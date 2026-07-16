@@ -60,7 +60,14 @@ pub struct GlmmWorkspace {
     pub m: Mat<f64>,
     /// Joint (θ,β) BOBYQA solver, dimension `n_theta + p`.
     pub solver: Bobyqa, // sized n_theta + p
-    /// Joint solver's live iterate: `[θ (n_theta) | β (p)]`.
+    /// Joint solver's live iterate: `[θ (n_theta) | β (p)]`. STABLE READ-BACK
+    /// CONVENTION: after `fit_glmm` returns with `converged == true`, this
+    /// holds the pinned optimum — `params[..n_theta]` is θ̂ (boundary
+    /// components zeroed) and `params[n_theta..n_theta + p]` is β̂ (stage 2 is
+    /// a joint [θ | β] solve, and `betas` is copied from this suffix) — so a
+    /// caller may read it back as the warm start for a subsequent fit of
+    /// related data. On a non-converged fit the content is an arbitrary
+    /// iterate — do not read it.
     pub params: Vec<f64>, // [θ | β]
     /// Joint solver box lower bounds, length `n_theta + p`.
     pub lower: Vec<f64>,

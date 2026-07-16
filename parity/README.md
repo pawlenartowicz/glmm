@@ -63,10 +63,9 @@ of the crate's build (example / bench / small bin, decided then).
 
 ## Datasets — the roadmap rungs
 
-Rungs 1–22 are landed and green (see "Landed" below); 23–24 are specced but
-backed out pending glmm-side fixes (see the gamma note below the table; 23 has
-since re-landed). Rungs 25–27 (vector-RE AGQ Laplace anchors) are landed and
-green.
+Rungs 1–23 and 25–27 are landed and green (see "Landed" below). Only rung 24 is
+backed out pending a glmm-side fix (see the gamma note below the table). Rungs
+25–27 are the vector-RE AGQ Laplace anchors.
 
 | Rung | Dataset             | Family                                        | Source |
 |------|---------------------|-----------------------------------------------|--------|
@@ -436,8 +435,9 @@ stable `fit_cold` surface, emits the same schema (both `se_hessian` and `se_rx` 
 `WaldSe::{Hessian, Rx}`) to `results/glmm_{empirical,simulated}/`, and joins the comparison against
 the frozen references.
 
-**Landed (glmm):** rungs 1–22 — the full 1–21 roadmap plus 22 cbpp_probit
-(non-canonical link) — green against both references, except rung 18 which is
-the documented 2-way lme4+glmm gate (MixedModels cannot construct that shape).
-Rungs 23–24 (gamma) are backed out pending glmm-side fixes (see the gamma note
-under "Datasets").
+**Landed (glmm):** rungs 1–23 and 25–27 — the full 1–21 roadmap, 22 cbpp_probit
+(non-canonical link), 23 sim_gamma (dense, re-landed after the B1 fix), and the
+25–27 vector-RE AGQ Laplace anchors — green against both references, except rung
+18 which is the documented 2-way lme4+glmm gate (MixedModels cannot construct
+that shape). Only rung 24 (sim_sparse_gamma) stays backed out pending a
+glmm-side fix (see the gamma note under "Datasets").
