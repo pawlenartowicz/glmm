@@ -59,7 +59,7 @@ pub struct GlmmWorkspace {
     /// max_n × k = ZΛ (rebuilt per BOBYQA eval)
     pub m: Mat<f64>,
     /// Joint (θ,β) BOBYQA solver, dimension `n_theta + p`.
-    pub solver: Bobyqa,   // sized n_theta + p
+    pub solver: Bobyqa, // sized n_theta + p
     /// Joint solver's live iterate: `[θ (n_theta) | β (p)]`.
     pub params: Vec<f64>, // [θ | β]
     /// Joint solver box lower bounds, length `n_theta + p`.

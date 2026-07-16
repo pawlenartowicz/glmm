@@ -16,8 +16,8 @@ use harness_common::*;
 const DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 fn main() {
-    let manifest_path = std::env::var("GRID_MANIFEST")
-        .unwrap_or_else(|_| format!("{DIR}/manifest_grid.json"));
+    let manifest_path =
+        std::env::var("GRID_MANIFEST").unwrap_or_else(|_| format!("{DIR}/manifest_grid.json"));
     let out_path = std::env::var("GRID_OUT")
         .unwrap_or_else(|_| format!("{DIR}/results/grid/glmm_shipped.jsonl"));
     let tag = std::env::var("GRID_CONFIG_TAG").unwrap_or_default();

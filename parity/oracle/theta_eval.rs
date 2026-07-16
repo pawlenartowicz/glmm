@@ -29,8 +29,8 @@ const DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 fn main() {
     let in_path = std::env::var("THETA_EVAL_IN").expect("THETA_EVAL_IN request file");
-    let manifest_path = std::env::var("GRID_MANIFEST")
-        .unwrap_or_else(|_| format!("{DIR}/manifest_grid.json"));
+    let manifest_path =
+        std::env::var("GRID_MANIFEST").unwrap_or_else(|_| format!("{DIR}/manifest_grid.json"));
     let manifest: Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("read grid manifest"))
             .expect("parse grid manifest");
