@@ -49,7 +49,7 @@ results/<engine>_{empirical,simulated}/   ten dirs (lme4/mixedmodels/glmm/glmm_p
 reports/           durable summaries, COMMITTED: reports/grid/{status_map,eval_ratio,data_profiles}.csv,
                    final_analysis.txt, lme4_todo.txt, report.html (written by analyze_grid.R + grid_report.R)
 compare.R          cross-engine agreement GATE (lme4 vs MixedModels vs glmm) + the port gates (glmm vs glmm_python, glmm vs glmm_r)
-summarize_timing.R    human-readable timing view (no gate): per-fit medians + speedup vs lme4/mmjl + port overhead (py_gap)
+summarize_timing.R    human-readable timing view (no gate): per-fit medians + speedup vs lme4/mmjl + port overhead (py_gap, r_gap)
 summarize_accuracy.R  human-readable accuracy views (no gate): diffs vs lme4 + SE-by-method (5-way)
 run.sh             default: fits glmm (Rust) + the Python port + the R port + compare.R vs
                    existing oracle results; --oracles refits lme4 + Julia too; --prep implies
@@ -349,8 +349,15 @@ for shape, so a divergence in either port's data-prep or formula-rewrite logic s
 as a diff between near-identical functions rather than an independently-derived bug.
 Results land in `results/glmm_r_{empirical,simulated}/` in the same schema as every other
 engine; `compare.R`'s "glmm (Rust) vs glmm_r (port)" section is its gate. `run.sh` runs
-it by default (skipped with a message if the package is not installed); it is not yet
-charted in `summarize_timing.R` (that script's engine list is hardcoded).
+it by default (skipped with a message if the package is not installed), and
+`summarize_timing.R` charts it in the `r` column with an `r_gap` tax column, exactly as
+`glmm_python` gets `py`/`py_gap`. Note `r_gap` runs several times larger than `py_gap` on
+the sub-millisecond rungs (Dyestuff, Oats, the intercept-only/3-level sims): that is a real
+fixed per-call cost of the extendr/R marshaling path (a few hundred µs), not a timer
+artifact — it just dominates the ratio when the fit itself is ~50 µs. It washes out on every
+rung whose fit clears ~1 ms, where `r_gap` sits at ~1.0x alongside `py_gap`. (`median_secs`
+times with `Sys.time()`, ~2 µs resolution; the earlier `proc.time()` floored at 1 ms and
+*hid* this real overhead behind a bogus 0.001 s quantum — see its comment.)
 
 Two R-specific details are load-bearing. **Factor levels are forced to byte order**
 (`sort(method="radix")`, = C locale = Rust's `str` ordering), not R's default `factor()`

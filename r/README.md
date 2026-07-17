@@ -14,7 +14,7 @@ different answer.
 
 ## Installation
 
-From r-universe (once the first `r-*` tag has built):
+From r-universe:
 
 ```r
 install.packages("fastglmm", repos = c("https://pawlenartowicz.r-universe.dev", getOption("repos")))

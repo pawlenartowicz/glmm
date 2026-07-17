@@ -182,14 +182,19 @@ do_fit <- function(data, formula, family, wald_se) {
 
 median_secs <- function(batch, call) {
   # Median seconds over N_RUNS samples, warm-up (first) discarded. Each sample times
-  # `batch` fits so sub-resolution fits stay above the timer floor (the manifest
-  # `timing_batch` every engine reads); summarize_timing.R divides by fits_per_sample.
-  # Mirrors fit.py::median_secs (proc.time as the perf_counter analogue).
+  # `batch` fits (the manifest `timing_batch` every engine reads); summarize_timing.R
+  # divides by fits_per_sample. Mirrors fit.py::median_secs.
+  #
+  # Timer is Sys.time(), NOT proc.time(): proc.time()'s elapsed field ticks at 1 ms on
+  # Linux, so every sub-ms fit (the small intercept-only/3-level rungs) floored to
+  # exactly 0.001 s and reported a bogus 5-14x port "tax". Sys.time() resolves to ~2 us
+  # here (measured), which is the true high-resolution-wall-clock analogue of Python's
+  # perf_counter -- proc.time was the wrong analogue for it.
   samples <- numeric(N_RUNS)
   for (i in seq_len(N_RUNS)) {
-    t0 <- proc.time()[["elapsed"]]
+    t0 <- as.numeric(Sys.time())
     for (j in seq_len(batch)) call()
-    samples[i] <- proc.time()[["elapsed"]] - t0
+    samples[i] <- as.numeric(Sys.time()) - t0
   }
   stats::median(samples[-1])
 }

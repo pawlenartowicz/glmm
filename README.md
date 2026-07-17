@@ -15,8 +15,8 @@ outcomes, validated against R/lme4 and Julia/MixedModels.jl goldens.
 **New to the crate? Start with [`TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md)** — a
 single-page, three-layer walkthrough (cold fit → warm fit → advanced loop)
 plus a short section on parsing an R-style formula string instead of building
-inputs by hand. A Python package is also available — see
-[`TUTORIAL-PYTHON.md`](documentation/TUTORIAL-PYTHON.md).
+inputs by hand. Python and R packages are also available — see
+[Python and R](#python-and-r) below.
 
 ## One crate, one `fit`
 
@@ -47,6 +47,7 @@ and GLMM legs detailed in
 |---|---|
 | [`documentation/TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md) | Three-layer Rust walkthrough: cold fit → warm fit → advanced loop, plus the formula frontend |
 | [`documentation/TUTORIAL-PYTHON.md`](documentation/TUTORIAL-PYTHON.md) | The Python package (`glmm`) walkthrough |
+| [`documentation/TUTORIAL-R.md`](documentation/TUTORIAL-R.md) | The R package (`fastglmm`) walkthrough |
 | [`documentation/supported_families.md`](documentation/supported_families.md) | Family × link support matrix, canonical-link notes, dispersion conventions |
 | [`documentation/algorithms.md`](documentation/algorithms.md) | Algorithm map entry point: full dispatch graph, knob index, OLS/GLM paths |
 | [`documentation/algorithms-lmm.md`](documentation/algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML, closed-form shortcut, BOBYQA, boundary handling |
@@ -111,6 +112,46 @@ See [`TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md) for the full walkthroug
 starts, the advanced hot-loop surface, and building `x`/`ModelSpec`/`GroupIds`
 from a formula string with `glmm::formula` (the `formula` feature, on by default)
 instead of by hand.
+
+## Python and R
+
+The same kernel ships as a Python package and an R package. Both take a data
+table and an R-style formula — no design matrices by hand.
+
+**Python** (`glmm` on PyPI; Python 3.10+, NumPy is the only dependency):
+
+```bash
+pip install glmm
+```
+
+```python
+import glmm
+
+fit = glmm.fit(data, "y ~ x1 + (1 | group)")   # data: dict / pandas / polars
+fit.summary()
+```
+
+The public surface is two names, `glmm.fit` and `glmm.Fit`. See the
+[Python README](python/README.md) and
+[`TUTORIAL-PYTHON.md`](documentation/TUTORIAL-PYTHON.md).
+
+**R** (`fastglmm`, via r-universe):
+
+```r
+install.packages("fastglmm", repos = c("https://pawlenartowicz.r-universe.dev", getOption("repos")))
+```
+
+```r
+library(fastglmm)
+
+fit <- fastglmm(y ~ x1 + (1 | group), data)
+summary(fit)   # plus fixef, vcov, VarCorr, confint, isSingular
+```
+
+Deliberately scoped to fast fitting — anything the engine cannot compute
+honestly (`ranef`, `predict`, `logLik`) errors with the reason instead of
+guessing. See the [R README](r/README.md) and
+[`TUTORIAL-R.md`](documentation/TUTORIAL-R.md).
 
 ## Design
 

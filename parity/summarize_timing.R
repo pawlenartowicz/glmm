@@ -73,8 +73,9 @@ short_name <- function(n) {
 }
 
 ENGINE_DIRS <- c(lme4 = "lme4", mixedmodels = "mixedmodels", glmm = "glmm",
-                 glmm_python = "glmm_python")
-ENGINE_LABEL <- c(lme4 = "lme4", mixedmodels = "mmjl", glmm = "glmm", glmm_python = "py")
+                 glmm_python = "glmm_python", glmm_r = "glmm_r")
+ENGINE_LABEL <- c(lme4 = "lme4", mixedmodels = "mmjl", glmm = "glmm",
+                  glmm_python = "py", glmm_r = "r")
 data <- Filter(Negate(is.null), lapply(ENGINE_DIRS, read_engine))
 data <- lapply(data, function(lst) setNames(lst, short_name(names(lst))))
 present <- names(data)
@@ -82,18 +83,22 @@ ref <- data[["lme4"]]
 if (is.null(ref)) stop("no lme4 reference present -- run oracle/fit.R first")
 order_names <- names(ref)[order(vapply(ref, `[[`, 0L, "rung"))]
 
-TIMING_COLS <- c("glmm", "glmm_python", "lme4", "mixedmodels")
+TIMING_COLS <- c("glmm", "glmm_python", "glmm_r", "lme4", "mixedmodels")
 timing_engines <- Filter(function(e) e %in% present, TIMING_COLS)
 
 # glmm speedup vs lme4/mmjl: how many times faster glmm is (other_time / glmm_time).
 fmt_x <- function(other, mine) {
   if (is.na(other) || is.na(mine) || mine == 0) "-" else sprintf("%.1fx", other / mine)
 }
-# py_gap reads in the same direction as vs_lme4/vs_mmjl (other/glmm), but the port is
-# the same kernel, so it is the port tax (conversion + FFI), not a speedup.
-SPEEDUP_VS <- Filter(function(e) e %in% present, c("lme4", "mixedmodels", "glmm_python"))
-# The port column is a tax, not a speedup, so it is headed py_gap rather than vs_py.
-speedup_label <- function(e) if (e == "glmm_python") "py_gap" else paste0("vs_", ENGINE_LABEL[[e]])
+# py_gap/r_gap read in the same direction as vs_lme4/vs_mmjl (other/glmm), but each
+# port is the same kernel, so it is the port tax (conversion + FFI), not a speedup.
+SPEEDUP_VS <- Filter(function(e) e %in% present,
+                     c("lme4", "mixedmodels", "glmm_python", "glmm_r"))
+# A port column is a tax, not a speedup, so it is headed <lang>_gap rather than vs_<lang>.
+PORT_ENGINES <- c("glmm_python", "glmm_r")
+speedup_label <- function(e) {
+  if (e %in% PORT_ENGINES) paste0(ENGINE_LABEL[[e]], "_gap") else paste0("vs_", ENGINE_LABEL[[e]])
+}
 
 cat("== timing (median seconds per fit) ==\n")
 name_w <- max(nchar(order_names)) + 1L
@@ -128,4 +133,6 @@ cat("\nrx/h = time to fit + produce that SE (Hessian is the cost);",
     "gaussian/legacy single time shown under rx (no h row).\n",
     "vs_lme4/vs_mmjl = glmm speedup factor (other engine's time / glmm's time).\n",
     "py_gap = Python port time / glmm time (same kernel; the port tax of dict scan,\n",
-    "  float() conversion, and the FFI copy). See oracle/fit.py.\n")
+    "  float() conversion, and the FFI copy). See oracle/fit.py.\n",
+    "r_gap = R port time / glmm time (same kernel through the fastglmm extendr\n",
+    "  wrapper; the port tax of the R<->Rust copy). See oracle/fit_port.R.\n")
