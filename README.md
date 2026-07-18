@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/pawlenartowicz/glmm/actions/workflows/ci.yml/badge.svg)](https://github.com/pawlenartowicz/glmm/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/glmm.svg)](https://crates.io/crates/glmm)
+[![PyPI](https://img.shields.io/pypi/v/glmm.svg)](https://pypi.org/project/glmm/)
+[![r-universe](https://pawlenartowicz.r-universe.dev/badges/fastglmm)](https://pawlenartowicz.r-universe.dev/fastglmm)
 [![docs.rs](https://img.shields.io/docsrs/glmm)](https://docs.rs/glmm)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 ![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)

@@ -72,7 +72,8 @@ migration source.
 All four estimators are wired into the stable `fit` dispatch: OLS; GLM
 (Gaussian, binomial logit/probit, Poisson, Gamma, negative binomial); LMM
 (closed-form single-intercept + BOBYQA general); GLMM (dense and sparse-Z, all
-families including NB), with AGQ (nAGQ > 1) for single scalar random effects.
+families including NB), with AGQ (nAGQ > 1) for up to 3 random effects per
+group (single grouping factor, binomial/Poisson).
 Validated against R/lme4 and Julia/MixedModels.jl across a 23-rung dataset
 parity manifest plus a 15-rung prior-weights harness.
 
