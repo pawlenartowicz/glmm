@@ -70,6 +70,180 @@ pub(crate) fn assemble_varcorr(
     }
     out
 }
+/// [`Fit::loglik`] for the Gaussian LMM paths: the REML criterion
+/// `−½(deviance + (n−p)(1 + ln 2π))` — the stripped constant restored (see
+/// `Fit::deviance`'s LMM contract), then onto the `logLik()` scale. Call AFTER
+/// any weighted `−Σlog wᵢ` deviance correction (the correction is part of
+/// lme4's REMLcrit, so it belongs inside the criterion). NaN in ⇒ NaN out.
+pub(crate) fn lmm_loglik(deviance: f64, n: usize, p: usize) -> f64 {
+    // The NaN gate also protects the `n − p` residual df from underflowing on
+    // the degenerate n ≤ p short-circuit (which always reports a NaN deviance).
+    if !deviance.is_finite() || n <= p {
+        return f64::NAN;
+    }
+    -0.5 * (deviance + (n - p) as f64 * (1.0 + (2.0 * std::f64::consts::PI).ln()))
+}
+
+/// [`Fit::loglik`] for the GLMM paths (dense and sparse, Laplace and AGQ):
+/// restore the data-only saturated constant the marginal deviance drops.
+/// Binomial/Poisson/NB: `−½·deviance + saturated_loglik` (the deviance's data
+/// term is the weighted `dev_resid` sum). Gamma: `−½·deviance` with NO
+/// correction — lme4's `logLik(glmer fit)` is literally `−devfun/2`, and the
+/// `+2` its `Gamma()$aic` data term carries stays inside (so glmer's Gamma
+/// logLik sits 1 below `Σwᵢ·log f`; R's `logLik.glm` subtracts that 2 back
+/// out, glmer does not — pinned against the sim_gamma parity loglik). NaN in
+/// ⇒ NaN out (the non-converged contract).
+pub(crate) fn glmm_loglik(
+    family: Family,
+    nb_theta: f64,
+    deviance: f64,
+    y: &[f64],
+    prior_w: Option<&[f64]>,
+) -> f64 {
+    if !deviance.is_finite() {
+        return f64::NAN;
+    }
+    match family {
+        Family::Gamma { .. } => -0.5 * deviance,
+        _ => -0.5 * deviance + crate::family::saturated_loglik(family, nb_theta, y, prior_w),
+    }
+}
+
+/// [`Fit::df`] for a converged fit: retained fixed effects + RE θ parameters +
+/// 1 if the family estimates a dispersion/scale. `dispersion_fixed` is
+/// `FitOptions::dispersion.is_some()` (Gamma's hold-φ-fixed directive; every
+/// other family ignores it).
+pub(crate) fn model_df(
+    family: Family,
+    p_retained: usize,
+    n_theta: usize,
+    dispersion_fixed: bool,
+) -> usize {
+    let scale = match family {
+        Family::Gaussian | Family::NegativeBinomial { .. } => 1,
+        Family::Gamma { .. } => usize::from(!dispersion_fixed),
+        Family::Binomial { .. } | Family::Poisson { .. } => 0,
+    };
+    p_retained + n_theta + scale
+}
+
+/// Extra grouping `e`'s θ vech offset — nested and crossed factors store it on
+/// their own descriptors, keyed by declaration index.
+fn extra_vech_start(g: &crate::lmm::LmmGroupings, e: usize) -> usize {
+    if let Some(nf) = g.nested {
+        if nf.decl == e {
+            return nf.vech_start;
+        }
+    }
+    g.crossed
+        .iter()
+        .find(|cf| cf.decl == e)
+        .map(|cf| cf.vech_start)
+        .expect("an extra grouping is either nested or crossed")
+}
+
+/// [`Fit::ranef_levels`]: level count per grouping, declaration order (primary,
+/// then each extra). A nested grouping spans the padded
+/// `n_primary·nested_per_parent` child grid (see `Fit::ranef`'s layout doc).
+pub(crate) fn ranef_level_counts(g: &crate::lmm::LmmGroupings) -> Vec<usize> {
+    let mut counts = Vec::with_capacity(1 + g.extra_q.len());
+    counts.push(g.n_primary);
+    for e in 0..g.extra_q.len() {
+        let is_nested = g.nested.map(|nf| nf.decl) == Some(e);
+        counts.push(if is_nested {
+            g.n_primary * g.nested_per_parent
+        } else {
+            g.crossed
+                .iter()
+                .find(|cf| cf.decl == e)
+                .map(|cf| cf.n_levels)
+                .expect("an extra grouping is either nested or crossed")
+        });
+    }
+    counts
+}
+
+/// [`Fit::ranef`] from the DENSE GLMM workspace's spherical modes `u`
+/// (`glmm::build_z` layout: primary block level-major `lvl·q_p + c`, then each
+/// extra's scalar indicator columns at its absolute `extra_offsets[e]` — this
+/// path carries intercept-only extras exclusively, see `apply_lambda`).
+/// `b = Λ̂û` per block: the primary level's `q_p`-vector through the lower-tri
+/// `Λ_p`, each extra level through its scalar θ. Output is `Fit::ranef`'s
+/// public layout (per grouping, level-major) — for this path the primary block
+/// is already level-major, so it maps through 1:1.
+pub(crate) fn assemble_ranef_dense(
+    theta: &[f64],
+    g: &crate::lmm::LmmGroupings,
+    u: &[f64],
+) -> Vec<f64> {
+    let q = g.primary_q;
+    let mut lam = vec![0.0f64; q * q];
+    crate::lmm::primary_lambda(theta, q, &mut lam);
+    let mut out = Vec::with_capacity(g.k_total);
+    for lvl in 0..g.n_primary {
+        let base = lvl * q;
+        for r in 0..q {
+            let mut b = 0.0;
+            for c in 0..=r {
+                b += lam[r * q + c] * u[base + c];
+            }
+            out.push(b);
+        }
+    }
+    debug_assert!(!g.extra_slopes_any, "dense GLMM extras are intercept-only");
+    let counts = ranef_level_counts(g);
+    for (e, &off) in g.extra_offsets.iter().enumerate() {
+        let theta_e = theta[extra_vech_start(g, e)];
+        for l in 0..counts[e + 1] {
+            out.push(theta_e * u[off + l]);
+        }
+    }
+    out
+}
+
+/// [`Fit::ranef`] from the SPARSE workspace's spherical modes `u`
+/// (`sparse::for_each_z_entry` layout: primary block component-major
+/// `d·n_primary + f`, each extra level-major `extra_offsets[e] + l·q_g + c`
+/// with a full `q_g×q_g` `Λ_g` block). Output is `Fit::ranef`'s public layout
+/// (per grouping, level-major) — the primary block is transposed into it here.
+pub(crate) fn assemble_ranef_sparse(
+    theta: &[f64],
+    g: &crate::lmm::LmmGroupings,
+    u: &[f64],
+) -> Vec<f64> {
+    let q = g.primary_q;
+    let s = g.n_primary;
+    let mut lam = vec![0.0f64; q * q];
+    crate::lmm::primary_lambda(theta, q, &mut lam);
+    let mut out = Vec::with_capacity(g.k_total);
+    for f in 0..s {
+        for r in 0..q {
+            let mut b = 0.0;
+            for c in 0..=r {
+                b += lam[r * q + c] * u[c * s + f];
+            }
+            out.push(b);
+        }
+    }
+    let counts = ranef_level_counts(g);
+    for (e, &off) in g.extra_offsets.iter().enumerate() {
+        let q_g = g.extra_q[e];
+        let mut lam_g = vec![0.0f64; q_g * q_g];
+        crate::lmm::primary_lambda(&theta[extra_vech_start(g, e)..], q_g, &mut lam_g);
+        for l in 0..counts[e + 1] {
+            let base = off + l * q_g;
+            for r in 0..q_g {
+                let mut b = 0.0;
+                for c in 0..=r {
+                    b += lam_g[r * q_g + c] * u[base + c];
+                }
+                out.push(b);
+            }
+        }
+    }
+    out
+}
+
 /// A `ModelSpec` copy whose RE **counts** are derived from the supplied `GroupIds`
 /// (`n_primary = max(primary)+1`; per crossed grouping `n_clusters =
 /// max(extra[g])+1`; per nested grouping `n_per_parent = ⌈children/n_primary⌉`,
@@ -267,6 +441,17 @@ pub(super) fn fit_rank_deficient(
         n_eval: fr.n_eval,
         deviance: fr.deviance,
         singular: fr.singular,
+        // Scalars/per-row/RE-shaped fields pass through: loglik and df come
+        // from the REDUCED fit (aliased columns carry no parameter — lme4's
+        // NA-coefficient df), fitted is per-row (the reduced model's means are
+        // the model's means), ranef is RE-shaped (unchanged by fixed-column
+        // drops).
+        loglik: fr.loglik,
+        df: fr.df,
+        reml: fr.reml,
+        fitted: fr.fitted,
+        ranef: fr.ranef,
+        ranef_levels: fr.ranef_levels,
     }
 }
 /// Engine-invariant shape check for the data-shaped ids (mirrors `fit_grouped`'s

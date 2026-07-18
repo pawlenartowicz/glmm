@@ -29,6 +29,12 @@ fn fit_unsupported_family(p: usize) -> Fit {
         n_eval: 0,
         deviance: f64::NAN,
         singular: false,
+        loglik: f64::NAN,
+        df: 0,
+        reml: false,
+        fitted: vec![],
+        ranef: vec![],
+        ranef_levels: vec![],
     }
 }
 // ---------------------------------------------------------------------------
@@ -149,6 +155,7 @@ fn fit_glm_prebuilt(
             &opts.target_indices,
             None,
             opts.weights.as_deref(),
+            opts.offset.as_deref(),
             buf.as_scratch(),
         )
     };
@@ -157,6 +164,10 @@ fn fit_glm_prebuilt(
     // view.betas is full [0..p]; view.var_diag is target-compact [0..t] (like OLS).
     let beta = view.betas.to_vec();
     let converged = view.converged;
+    // Weighted Σwᵢdᵢ at the accepted iterate (NaN unless converged) — captured
+    // as a scalar here because the loglik below reads `buf.irls_p`, which the
+    // borrow behind `view` still holds.
+    let irls_deviance = view.deviance;
     let mut se = vec![f64::NAN; p];
     fill_se_compact(view.var_diag, &opts.target_indices, &mut se);
     // Unscaled (X'WX)⁻¹, read off `view` here because `view` mutably borrows
@@ -208,6 +219,30 @@ fn fit_glm_prebuilt(
         }
     }
 
+    // Fitted means μ̂ (the kernel's converged IRLS means) and the family
+    // log-likelihood on R's `logLik.glm`/`MASS::glm.nb` scale.
+    // Binomial/Poisson/NB: the IRLS deviance is the weighted `dev_resid` sum,
+    // so restoring the saturated constant gives the exact log-likelihood.
+    // Gamma: R's `Gamma()$aic` convention — dispersion profiled as dev/Σwᵢ
+    // inside `gamma_aic` (NOT the Pearson `dispersion` above, matching R, which
+    // also mixes the two conventions between `logLik` and `summary`).
+    let (fitted, loglik) = if converged {
+        let mu = buf.irls_p[..n].to_vec();
+        let ll = match family {
+            Family::Gamma { .. } => {
+                -0.5 * (crate::family::gamma_aic(y, &mu, irls_deviance, n, opts.weights.as_deref())
+                    - 2.0)
+            }
+            _ => {
+                -0.5 * irls_deviance
+                    + crate::family::saturated_loglik(family, nb_theta, y, opts.weights.as_deref())
+            }
+        };
+        (mu, ll)
+    } else {
+        (vec![], f64::NAN)
+    };
+
     Fit {
         beta,
         se,
@@ -221,6 +256,16 @@ fn fit_glm_prebuilt(
         n_eval: 0,
         deviance: f64::NAN,
         singular: false,
+        loglik,
+        df: if converged {
+            super::common::model_df(family, p, 0, opts.dispersion.is_some())
+        } else {
+            0
+        },
+        reml: false,
+        fitted,
+        ranef: vec![],
+        ranef_levels: vec![],
     }
 }
 // ---------------------------------------------------------------------------
@@ -367,9 +412,12 @@ pub(super) fn fit_glm_nb_capped(
         if !fit_result.converged {
             break;
         }
-        // μ̂ = exp(Xβ̂) for the θ optimisation.
+        // μ̂ = exp(o + Xβ̂) for the θ optimisation.
         for (i, mi) in mu.iter_mut().enumerate() {
-            let eta: f64 = (0..p).map(|j| x[i * p + j] * fit_result.beta[j]).sum();
+            let mut eta: f64 = (0..p).map(|j| x[i * p + j] * fit_result.beta[j]).sum();
+            if let Some(o) = &opts.offset {
+                eta += o[i];
+            }
             *mi = crate::family::link_inv(family, eta);
         }
         let new_theta = optimize_nb_theta(y, &mu, opts.weights.as_deref());

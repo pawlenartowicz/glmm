@@ -103,6 +103,9 @@ pub(crate) fn laplace_deviance(
     // Cluster-outer AGQ substrate (`agq::ClusterRowIndex`), forwarded verbatim to
     // `agq_deviance`'s early return below; `None` on every non-AGQ path (unread).
     cluster_rows: Option<&super::agq::ClusterRowIndex>,
+    // Per-row linear-predictor offset (`FitOptions::offset`), forwarded to every
+    // PIRLS/AGQ variant's `eta_fixed` fill. `None` ⇒ no offset.
+    offset: Option<&[f64]>,
 ) -> f64 {
     let n_theta = groupings.n_theta();
     // Fixed-mode β: a value-exact copy of `params[n_theta..n_theta+p]` into the
@@ -167,6 +170,7 @@ pub(crate) fn laplace_deviance(
             pirls_tol_override,
             n,
             cluster_rows,
+            offset,
         );
     }
     let k = groupings.k_total;
@@ -211,6 +215,7 @@ pub(crate) fn laplace_deviance(
             a_blocks,
             a_rhs,
             wx,
+            offset,
             pirls_tol_override,
             n,
         )
@@ -284,6 +289,7 @@ pub(crate) fn laplace_deviance(
             force_dense_schur,
             a_rhs,
             wx,
+            offset,
             pirls_tol_override,
             n,
         )
@@ -315,6 +321,7 @@ pub(crate) fn laplace_deviance(
             a_chol,
             a_rhs,
             a_llt_mem,
+            offset,
             pirls_tol_override,
             n,
         )
@@ -391,6 +398,7 @@ fn laplace_deviance_ws(
     let force_dense_schur = ws.force_dense_schur;
     let pirls_tol_override = ws.pirls_tol_override;
     let weighted = ws.weighted;
+    let offset = ws.offset.as_deref();
     let GlmmWorkspace {
         groupings,
         params: prm,
@@ -499,6 +507,7 @@ fn laplace_deviance_ws(
         *p,
         n,
         cluster_rows.as_ref(),
+        offset,
     )
 }
 

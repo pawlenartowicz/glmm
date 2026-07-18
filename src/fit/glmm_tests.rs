@@ -347,6 +347,133 @@ fn fit_glmm_cbpp_aggregated_matches_lme4() {
         sd_rel < 3e-3,
         "herd SD = {herd_sd} vs lme4 {REF_HERD_SD} (rel {sd_rel})"
     );
+    // lme4 logLik on the same cbind(incidence, size−incidence) fit
+    // (parity/results/lme4_empirical/cbpp.json .estimates.loglik) — the
+    // aggregated-binomial saturated constant (incl. ln C(mᵢ,sᵢ)) restored
+    // under prior weights, the engine-spec §7.6 gate.
+    const REF_LOGLIK: f64 = -92.0262818745091;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs lme4 {REF_LOGLIK}",
+        f.loglik
+    );
+    assert!(!f.reml);
+    assert_eq!(f.df, 5); // 4 β + herd-intercept θ; binomial has no dispersion
+                         // fitted/ranef consistency: b̂ = θ̂û on the natural scale must reproduce μ̂
+                         // through the logit link — pins the dense-path ranef layout AND scale.
+    assert_eq!(f.ranef_levels, vec![15]);
+    assert_eq!(f.ranef.len(), 15);
+    assert_eq!(f.fitted.len(), n);
+    for i in 0..n {
+        let eta: f64 = (0..p).map(|j| x[i * p + j] * f.beta[j]).sum::<f64>()
+            + f.ranef[cluster_ids[i] as usize];
+        let mu = 1.0 / (1.0 + (-eta).exp());
+        assert!(
+            (f.fitted[i] - mu).abs() < 1e-8,
+            "fitted[{i}] = {} vs Xβ̂+Zb̂ → {mu}",
+            f.fitted[i]
+        );
+    }
+}
+
+/// `FitOptions::offset` on the aggregated cbpp binomial GLMM: a constant
+/// per-row offset `o` shifts `η = o + Xβ + Zb`, so at the same argmin the
+/// fitted intercept must absorb it (`β̂₀(offset) ≈ β̂₀(no offset) − o`) while
+/// every other coefficient and the RE variance are unchanged — two
+/// independent BOBYQA runs of the same-argmin-up-to-a-shift objectives, so
+/// the tolerance is optimizer-scatter-sized (5e-4), not the tight oracle
+/// gate above. A zero offset must reproduce the no-offset fit bit-for-bit:
+/// `refresh_eta_fixed`'s `if let Some(o)` gate still runs (unlike `None`),
+/// so this is the one case that actually exercises the offset-add arithmetic
+/// while proving it is a no-op at `o=0`.
+#[test]
+fn fit_glmm_offset_constant_shifts_intercept() {
+    let (x, y, w, cluster_ids, n) = cbpp_design_aggregated();
+    let p = 4;
+    let model = cbpp_model();
+    let ids = GroupIds {
+        primary: cluster_ids.clone(),
+        extra: vec![],
+    };
+    let base_opts = FitOptions {
+        target_indices: vec![0, 1, 2, 3],
+        weights: Some(w.clone()),
+        ..FitOptions::default()
+    };
+
+    let f0 = fit_cold(&x, &y, n, p, &model, &ids, &base_opts);
+    assert!(f0.converged, "no-offset aggregated cbpp GLMM must converge");
+
+    const OFFSET_VAL: f64 = 0.7;
+    let f_off = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            offset: Some(vec![OFFSET_VAL; n]),
+            ..base_opts.clone()
+        },
+    );
+    assert!(f_off.converged, "offset aggregated cbpp GLMM must converge");
+
+    assert!(
+        (f_off.beta[0] - (f0.beta[0] - OFFSET_VAL)).abs() < 5e-4,
+        "intercept: offset fit {} vs no-offset {} shifted by -{OFFSET_VAL}",
+        f_off.beta[0],
+        f0.beta[0]
+    );
+    for j in 1..p {
+        assert!(
+            (f_off.beta[j] - f0.beta[j]).abs() < 5e-4,
+            "β[{j}]: offset fit {} vs no-offset {}",
+            f_off.beta[j],
+            f0.beta[j]
+        );
+    }
+    let herd_sd_diff = (f_off.tau2[0].sqrt() - f0.tau2[0].sqrt()).abs();
+    assert!(
+        herd_sd_diff < 5e-4,
+        "herd SD: offset fit {} vs no-offset {}",
+        f_off.tau2[0].sqrt(),
+        f0.tau2[0].sqrt()
+    );
+
+    // Logit consistency: fitted[i] must equal plogis(offset + Xβ̂ + b̂) at the
+    // offset fit's own (β̂, b̂) — mirrors the fitted/ranef check on the
+    // no-offset oracle test above.
+    assert_eq!(f_off.fitted.len(), n);
+    for i in 0..n {
+        let eta: f64 = OFFSET_VAL
+            + (0..p).map(|j| x[i * p + j] * f_off.beta[j]).sum::<f64>()
+            + f_off.ranef[cluster_ids[i] as usize];
+        let mu = 1.0 / (1.0 + (-eta).exp());
+        assert!(
+            (f_off.fitted[i] - mu).abs() < 1e-8,
+            "fitted[{i}] = {} vs offset+Xβ̂+b̂ → {mu}",
+            f_off.fitted[i]
+        );
+    }
+
+    // An all-zeros offset must be bit-identical to no offset: the
+    // `if let Some(o)` gate in `refresh_eta_fixed` runs and adds 0.0 to every
+    // eta_fixed entry, which must not perturb the converged optimum at all.
+    let f_zero = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            offset: Some(vec![0.0; n]),
+            ..base_opts
+        },
+    );
+    assert_eq!(f_zero.deviance, f0.deviance, "zero-offset deviance");
+    assert_eq!(f_zero.beta, f0.beta, "zero-offset beta");
 }
 
 /// Prior-weight fit-level equivalence on the DENSE (NoZ) path: `fit_cold`
@@ -745,6 +872,128 @@ fn fit_glmm_poisson_grouseticks_matches_lme4() {
         "INDEX sd = {} vs lme4 {REF_INDEX_SD}",
         f.tau2[0].sqrt()
     );
+    // lme4 logLik (grouseticks_agq_k1.json .estimates.loglik) — the Poisson
+    // saturated constant Σ(yᵢln yᵢ − yᵢ − ln yᵢ!) restored.
+    const REF_LOGLIK: f64 = -957.399741174491;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs lme4 {REF_LOGLIK}",
+        f.loglik
+    );
+    assert_eq!(f.df, 5); // 4 β + INDEX θ; Poisson has no dispersion
+                         // fitted/ranef consistency through the log link (403 size-1 clusters).
+    assert_eq!(f.ranef_levels, vec![n_clusters]);
+    assert_eq!(f.fitted.len(), n);
+    for i in 0..n {
+        let eta: f64 = (0..p).map(|j| x[i * p + j] * f.beta[j]).sum::<f64>()
+            + f.ranef[cluster_ids[i] as usize];
+        assert!(
+            (f.fitted[i] - eta.exp()).abs() < 1e-6 * eta.exp().max(1.0),
+            "fitted[{i}] = {} vs exp(Xβ̂+Zb̂) = {}",
+            f.fitted[i],
+            eta.exp()
+        );
+    }
+}
+
+/// Poisson GLMM with a per-row offset vs R `glmer(offset=)`: grouseticks
+/// `TICKS ~ YEAR + cHEIGHT + (1|INDEX)` with `o_i = 0.1·((i−1) mod 7)`
+/// (0-based CSV row order in Rust). Oracle (R 4.5.3, lme4 1.1-38,
+/// `glmerControl(tolPwrss = 1e-13)`):
+///   fg <- glmer(TICKS ~ YEAR + cHEIGHT + (1|INDEX), poisson, data = gt, offset = og)
+///   print(fixef(fg), digits = 15); print(logLik(fg), digits = 15)
+///   print(as.data.frame(VarCorr(fg))$sdcor[1], digits = 15)
+#[test]
+fn fit_glmm_poisson_offset_matches_lme4() {
+    const REF_BETA: [f64; 4] = [
+        0.128483161410054,
+        1.10179195638099,
+        -0.982969256355447,
+        -0.023819614546972,
+    ];
+    const REF_LOGLIK: f64 = -960.701615612628;
+    const REF_INDEX_SD: f64 = 1.14913810893358;
+    let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
+    let p = 4;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut raw = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        raw.push(f[0].parse().unwrap()); // INDEX
+        let year: u32 = f[4].parse().unwrap();
+        x.extend_from_slice(&[
+            1.0,
+            f64::from(u32::from(year == 96)),
+            f64::from(u32::from(year == 97)),
+            f[6].parse().unwrap(), // cHEIGHT
+        ]);
+        y.push(f[1].parse().unwrap()); // TICKS
+    }
+    let (cluster_ids, n_clusters) = dense_ids(&raw);
+    let n = y.len();
+    let o: Vec<f64> = (0..n).map(|i| 0.1 * (i % 7) as f64).collect();
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            offset: Some(o.clone()),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged, "offset poisson GLMM must converge");
+    for (j, (&b, &r)) in f.beta.iter().zip(&REF_BETA).enumerate() {
+        // Intercept is near zero under this offset — absolute band there.
+        let ok = if r.abs() > 0.1 {
+            (b - r).abs() / r.abs() < 2e-3
+        } else {
+            (b - r).abs() < 2e-3
+        };
+        assert!(ok, "β[{j}] = {b} vs lme4 {r}");
+    }
+    let sd_rel = (f.tau2[0].sqrt() - REF_INDEX_SD).abs() / REF_INDEX_SD;
+    assert!(
+        sd_rel < 3e-3,
+        "INDEX sd = {} vs lme4 {REF_INDEX_SD}",
+        f.tau2[0].sqrt()
+    );
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs lme4 {REF_LOGLIK}",
+        f.loglik
+    );
+    // fitted folds the offset: μ̂ = exp(o + Xβ̂ + b̂[cluster]).
+    for i in 0..n {
+        let eta: f64 = o[i]
+            + (0..p).map(|j| x[i * p + j] * f.beta[j]).sum::<f64>()
+            + f.ranef[cluster_ids[i] as usize];
+        assert!(
+            (f.fitted[i] - eta.exp()).abs() < 1e-6 * eta.exp().max(1.0),
+            "fitted[{i}] = {} vs exp(o+Xβ̂+Zb̂) = {}",
+            f.fitted[i],
+            eta.exp()
+        );
+    }
 }
 
 /// Parses `parity/data_empirical/grouseticks.csv` into the 3-crossed `TICKS ~ YEAR +
@@ -907,7 +1156,15 @@ fn sparse_schur_deviance_equals_dense_grouseticks() {
     // (the GLM warm start, matching what `fit_glmm` would open PIRLS at).
     let params: Vec<f64> = {
         let mut prm = ws.params.clone();
-        let beta = glm_warm_start_beta(model.family, f64::NAN, xm.as_ref().subrows(0, n), &y, n, p);
+        let beta = glm_warm_start_beta(
+            model.family,
+            f64::NAN,
+            xm.as_ref().subrows(0, n),
+            &y,
+            n,
+            p,
+            None,
+        );
         prm[ws.n_theta..ws.n_theta + p].copy_from_slice(&beta);
         prm
     };
@@ -962,8 +1219,15 @@ fn sparse_schur_se_equals_dense_grouseticks() {
             xm[(i, j)] = x[i * p + j];
         }
     }
-    let beta_start =
-        glm_warm_start_beta(model.family, f64::NAN, xm.as_ref().subrows(0, n), &y, n, p);
+    let beta_start = glm_warm_start_beta(
+        model.family,
+        f64::NAN,
+        xm.as_ref().subrows(0, n),
+        &y,
+        n,
+        p,
+        None,
+    );
 
     let run = |force_dense: bool| -> (Vec<f64>, bool) {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
@@ -1076,8 +1340,15 @@ fn sparse_schur_small_e_matches_dense() {
     };
     let model = spec_sized_from_ids_pub(&model, &ids);
     let slope_cols: Vec<usize> = vec![];
-    let beta_start =
-        glm_warm_start_beta(model.family, f64::NAN, xm.as_ref().subrows(0, n), &y, n, p);
+    let beta_start = glm_warm_start_beta(
+        model.family,
+        f64::NAN,
+        xm.as_ref().subrows(0, n),
+        &y,
+        n,
+        p,
+        None,
+    );
 
     let run = |force_dense: bool| -> (Vec<f64>, Vec<f64>, bool) {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
@@ -1665,6 +1936,16 @@ fn fit_glmm_gamma_sim_matches_lme4() {
         (sd[0] - f.tau2[0].sqrt()).abs() < 1e-12,
         "stddev_corr and tau2 must report the same σ̂-scaled sd"
     );
+    // lme4 logLik (parity/results/lme4_simulated/sim_gamma.json) — pins the
+    // Gamma rule loglik = −½·deviance verbatim: lme4's glmer logLik is
+    // −devfun/2 with gamma_aic's +2 left inside (1 below Σ log f).
+    const REF_LOGLIK: f64 = -445.173519506374;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 5e-3,
+        "loglik {} vs lme4 {REF_LOGLIK}",
+        f.loglik
+    );
+    assert_eq!(f.df, 5); // 3 β + cluster θ + φ
 
     // Rx arm on the same design vs the golden's σ̂²-scaled `se_rx`.
     let f_rx = fit_cold(
@@ -1755,6 +2036,16 @@ fn fit_glmm_nb_sim_matches_lme4() {
         "cluster sd = {} vs lme4 {REF_CLUSTER_SD}",
         f.tau2[0].sqrt()
     );
+    // lme4 logLik (parity/goldens/sim_nb_glmm.json) — the θ-dependent NB
+    // saturated constant (incl. −ln yᵢ!) restored at θ̂. Wider band than the
+    // φ≡1 families: the constant itself moves with θ̂ (5e-2 rel above).
+    const REF_LOGLIK: f64 = -481.455529976646;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-2,
+        "loglik {} vs lme4 {REF_LOGLIK}",
+        f.loglik
+    );
+    assert_eq!(f.df, 5); // 3 β + cluster θ_RE + NB θ
 }
 
 /// NB GLMM on an UNBALANCED NESTED design: `y ~ 1 + x + (1|g1/g2)` on
@@ -1913,8 +2204,15 @@ fn two_stage_agq_bypass_is_bit_identical() {
             xm[(i, j)] = x[i * p + j];
         }
     }
-    let beta_start =
-        glm_warm_start_beta(sized.family, f64::NAN, xm.as_ref().subrows(0, n), &y, n, p);
+    let beta_start = glm_warm_start_beta(
+        sized.family,
+        f64::NAN,
+        xm.as_ref().subrows(0, n),
+        &y,
+        n,
+        p,
+        None,
+    );
 
     let run = |two_stage: bool| -> (Vec<f64>, Vec<f64>, f64, usize) {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &sized, n, &[], nagq);
@@ -1993,8 +2291,15 @@ fn assert_two_stage_matches_single_local(
             xm[(i, j)] = x[i * p + j];
         }
     }
-    let beta_start =
-        glm_warm_start_beta(sized.family, f64::NAN, xm.as_ref().subrows(0, n), y, n, p);
+    let beta_start = glm_warm_start_beta(
+        sized.family,
+        f64::NAN,
+        xm.as_ref().subrows(0, n),
+        y,
+        n,
+        p,
+        None,
+    );
     let targets: Vec<u32> = (0..p as u32).collect();
 
     let run = |two_stage: bool| -> (Vec<f64>, Vec<f64>, f64, usize) {

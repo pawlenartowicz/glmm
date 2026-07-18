@@ -103,8 +103,9 @@ for (engine in others) {
     # n/a, not a comparison (rel_max over zero-length vectors would warn -Inf).
     d_sd   <- if (is.null(stddevs(a)) && is.null(stddevs(b))) NA_real_
               else rel_max(stddevs(a), stddevs(b))
-    # loglik: glmm's Fit exposes none yet -- n/a (ungated) when the engine omits it,
-    # rather than erroring on `value - NULL`. Gated only where the engine reports it.
+    # loglik: glmm's Fit now exposes it (loglik/df/reml, all engines), gated at
+    # the same LMM/GLMM bands as every other engine here. n/a (ungated) only when
+    # an engine genuinely omits it, rather than erroring on `value - NULL`.
     d_ll   <- if (is.null(b$estimates$loglik)) NA_real_
               else abs(a$estimates$loglik - b$estimates$loglik)
     coef_ok <- identical(norm_coef(a$coef_names), norm_coef(b$coef_names))
@@ -182,9 +183,9 @@ port <- read_engine("glmm_python")
 rust <- read_engine("glmm")
 if (length(port) > 0 && length(rust) > 0) {
   cat("\n=== glmm (Rust)  vs  glmm_python (port) ===\n")
-  cat(sprintf("%-12s %-5s  %-10s %-10s %-10s %-10s %-10s %-10s  %s\n",
+  cat(sprintf("%-12s %-5s  %-10s %-10s %-10s %-10s %-10s %-10s %-10s  %s\n",
               "dataset", "rung", "beta", "se_rx", "se_hess", "stddev", "sd_se",
-              "deviance", "coef"))
+              "deviance", "loglik", "coef"))
   for (name in names(rust)) {
     a <- rust[[name]]; b <- port[[name]]
     if (is.null(b)) next
@@ -214,14 +215,22 @@ if (length(port) > 0 && length(rust) > 0) {
     no_dev <- is.null(a$deviance) || is.null(b$deviance)
     d_dev <- if (no_dev) NA_real_ else rel_max(a$deviance, b$deviance)
     m_dev <- gate(d_dev, no_dev)
+    # loglik: both sides are the SAME kernel (fit_warm(start=NULL) IS fit_cold),
+    # so it round-off-gates like beta/se/deviance -- not the looser cross-engine
+    # loglik_abs_* bands above, which exist only because lme4/MixedModels are a
+    # genuinely different implementation.
+    no_ll <- is.null(a$estimates$loglik) || is.null(b$estimates$loglik)
+    d_ll <- if (no_ll) NA_real_ else rel_max(a$estimates$loglik, b$estimates$loglik)
+    m_ll <- gate(d_ll, no_ll)
     coef_ok <- identical(a$coef_names, b$coef_names)
 
-    marks <- c(m_beta, m_se_rx, m_se_h, m_sd, m_sd_se, m_dev)
+    marks <- c(m_beta, m_se_rx, m_se_h, m_sd, m_sd_se, m_dev, m_ll)
     failed <- any(marks %in% c("FAIL", "FAIL(len)")) || !coef_ok
     any_fail <- any_fail || failed
-    cat(sprintf("%-12s %-5d  %s %s %s %s %s %s  %s\n", name, a$rung,
+    cat(sprintf("%-12s %-5d  %s %s %s %s %s %s %s  %s\n", name, a$rung,
                 cell(d_beta, marks[1]), cell(d_se_rx, marks[2]), cell(d_se_h, marks[3]),
                 cell(d_sd, marks[4]), cell(d_sd_se, marks[5]), cell(d_dev, marks[6]),
+                cell(d_ll, marks[7]),
                 if (coef_ok) "ok" else "MISMATCH"))
   }
 }

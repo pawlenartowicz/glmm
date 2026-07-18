@@ -137,6 +137,7 @@ them). It is returned by `fit`, never constructed by callers.
 | `n_eval` | optimizer objective evaluations (0 on the closed-form/IRLS paths) |
 | `deviance` | minimized optimizer criterion — **not** comparable across models, and not an AIC input (see below) |
 | `converged` | numerical failure signals here (not an exception) — check before trusting `beta`/`se` |
+| `singular` | boundary (singular) fit — `>=1` RE variance component pinned at 0; mirrors lme4's `isSingular` |
 
 **`deviance` is not a model-comparison statistic.** It is the criterion the
 optimizer minimized, on that fit's own scale: for an LMM it is lme4's
@@ -153,8 +154,8 @@ only in `vcov`. Both are `NaN` in the same places.
 
 `summary()` builds the coefficient table — **name, estimate, std. error, z,
 p** — prints it, and returns it as a string. Aliased columns show `NaN`
-estimates, as lme4 prints `NA`. A footer carries `dispersion` and
-`converged`, and when `varcorr` is non-empty an RE block shows each grouping
+estimates, as lme4 prints `NA`. A footer carries `dispersion`,
+`converged` and `singular`, and when `varcorr` is non-empty an RE block shows each grouping
 by name with its per-term stddev / correlation (lme4's `VarCorr` layout) and
 `stddev_se` alongside where populated — the names come from `re_groups`. The z/p columns are derived in Python from `beta`/`se` as a
 Wald test (`z = beta/se`, `p = 2·(1 − Φ(|z|))`); Wald-z (not t) matches the

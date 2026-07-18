@@ -1,6 +1,6 @@
 [package]
 name = "glmm-r"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,7 +15,7 @@ extendr-api = "0.9"
 # version alongside path so `cargo package -p glmm-r` (run by r/tools/
 # cran-tarball.sh to build the self-contained R source tarball) can normalize
 # this manifest; dev builds still use the workspace HEAD via the path.
-glmm = { path = "..", version = "0.1.0" }
+glmm = { path = "..", version = "0.1.1" }
 
 [lints]
 workspace = true

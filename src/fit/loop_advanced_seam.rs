@@ -410,10 +410,20 @@ pub fn refit_lmm(
     opts: &FitOptions,
     start: Option<&StartValues>,
 ) -> Fit {
+    // Identity-link offset as the exact y-shift before accumulation — mirrors
+    // fit_mle; change together.
+    let y_shifted: Vec<f64>;
+    let y_eff: &[f64] = match &opts.offset {
+        Some(o) => {
+            y_shifted = y.iter().zip(o).map(|(&yi, &oi)| yi - oi).collect();
+            &y_shifted
+        }
+        None => y,
+    };
     accumulate_lmm_rows(
         ws,
         x,
-        y,
+        y_eff,
         n,
         p,
         &ids.primary,
@@ -426,6 +436,9 @@ pub fn refit_lmm(
     // Change together with fit_mle.
     if let Some(w) = &opts.weights {
         fit.deviance -= w.iter().map(|v| v.ln()).sum::<f64>();
+        // Corrected deviance ⇒ recompute the criterion-scale loglik (mirrors
+        // fit_mle — change together).
+        fit.loglik = super::common::lmm_loglik(fit.deviance, n, p);
     }
     fit
 }

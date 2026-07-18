@@ -175,6 +175,20 @@ def build_fit_data(spec, header, rows, factors):
     return data, None
 
 
+def offset_of(spec, header, rows):
+    """Per-row known additive linear-predictor offset (R's `offset=`) -- a
+    named CSV column, the plain-lookup counterpart of `weights_col` above
+    (no synthesis, unlike the aggregated-binomial `weights` field). Mirrors
+    fit.rs's offset handling."""
+    oc = spec.get("offset")
+    if oc is None:
+        return None
+    if oc not in header:
+        raise ValueError(f"offset {oc!r} not in CSV header")
+    j = header.index(oc)
+    return [float(r[j]) for r in rows]
+
+
 def num(x):
     """NaN/Inf -> JSON null (mirrors harness_common.rs::num): a non-converged fit
     leaves NaN-filled estimates, and json.dumps(allow_nan=False) would raise rather
@@ -260,6 +274,7 @@ def fit_one(spec):
     data_name = spec.get("data", ds)
     header, rows = read_csv_path(f"{SUITE}/data_{source}/{data_name}.csv")
     data, weights = build_fit_data(spec, header, rows, factors)
+    offset = offset_of(spec, header, rows)
     formula = formula_of(spec)
     family = _FAMILY.get(family_str)
     if family is None:
@@ -267,7 +282,7 @@ def fit_one(spec):
     link = spec.get("link")
     timing_batch = spec.get("timing_batch", 1)
 
-    kw = {"link": link, "weights": weights}
+    kw = {"link": link, "weights": weights, "offset": offset}
 
     # Reference grouping order (compare.R aligns varcomp positionally, not by name) —
     # read off the already-frozen lme4 result rather than re-deriving lme4's convention.
@@ -294,6 +309,8 @@ def fit_one(spec):
         estimates = {
             "beta": nums(fh_fit.beta),
             ("se" if gaussian else "se_rx"): nums(fh_fit.se),
+            "loglik": num(fh_fit.loglik),
+            "df": fh_fit.df,
             "varcomp": varcomp(fh_fit, ref_order, False),
         }
         converged, n_eval, deviance = fh_fit.converged, fh_fit.n_eval, fh_fit.deviance
@@ -319,6 +336,8 @@ def fit_one(spec):
             "beta": nums(fh_fit.beta),
             "se_hessian": nums(fh_fit.se),
             "se_rx": nums(fr_fit.se),
+            "loglik": num(fh_fit.loglik),
+            "df": fh_fit.df,
             # stddev_se from the Hessian fit's theta block.
             "varcomp": varcomp(fh_fit, ref_order, True),
         }

@@ -125,6 +125,11 @@ pub(crate) fn agq_deviance(
     pirls_tol_override: Option<f64>,
     n: usize,
     cluster_rows: Option<&ClusterRowIndex>,
+    // Per-row linear-predictor offset (`FitOptions::offset`), forwarded to the
+    // inner `pirls_solve_blocked` call; the node loop below reads it back off
+    // the `eta_fixed` that fill leaves, so nothing else here changes. `None` ⇒
+    // no offset.
+    offset: Option<&[f64]>,
 ) -> f64 {
     // β length p is `beta.len()` (the Fixed-mode buffer the caller filled) — the
     // blocked PIRLS derives p from it, so no separate `p` param is threaded here.
@@ -162,6 +167,7 @@ pub(crate) fn agq_deviance(
         a_blocks,
         a_rhs,
         wx,
+        offset,
         pirls_tol_override,
         n,
     );
@@ -352,6 +358,10 @@ pub(crate) fn agq_deviance_vec(
     pirls_tol_override: Option<f64>,
     n: usize,
     cluster_rows: Option<&ClusterRowIndex>,
+    // Per-row linear-predictor offset (`FitOptions::offset`), forwarded to the
+    // inner `pirls_solve_blocked` call — the node loop below reads it back off
+    // the `eta_fixed` that fill leaves. `None` ⇒ no offset.
+    offset: Option<&[f64]>,
 ) -> f64 {
     let n_theta = groupings.n_theta();
     let s = groupings.n_primary;
@@ -384,6 +394,7 @@ pub(crate) fn agq_deviance_vec(
         a_blocks,
         a_rhs,
         wx,
+        offset,
         pirls_tol_override,
         n,
     );
@@ -567,6 +578,7 @@ pub(crate) fn glmm_agq_deviance(
     let family = ws.family;
     let nb_theta = ws.nb_theta;
     let weighted = ws.weighted;
+    let offset = ws.offset.as_deref();
     let super::workspace::GlmmWorkspace {
         groupings,
         params: prm,
@@ -627,5 +639,6 @@ pub(crate) fn glmm_agq_deviance(
         None,
         n,
         cluster_rows.as_ref(),
+        offset,
     )
 }

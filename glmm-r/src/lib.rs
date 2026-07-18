@@ -154,7 +154,17 @@ fn fastglmm_fit(
         names = r.names,
         re_group_names = re_group_names,
         re_group_terms = re_group_terms,
-        agq_warning = agq_warning
+        agq_warning = agq_warning,
+        loglik = r.loglik,
+        df = r.df as f64,
+        reml = r.reml,
+        fitted = r.fitted,
+        ranef = r.ranef,
+        ranef_levels = r
+            .ranef_levels
+            .iter()
+            .map(|&v| v as f64)
+            .collect::<Vec<f64>>()
     ))
 }
 

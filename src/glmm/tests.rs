@@ -1320,6 +1320,7 @@ fn fit_glmm_collapses_to_plain_irls_when_tau_negligible() {
             &[1],
             None,
             None,
+            None,
             s,
         );
         (f.betas.to_vec(), f.t_sq.to_vec(), f.converged)
@@ -1749,6 +1750,7 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         a_chol,
         a_rhs,
         a_llt_mem,
+        None, // offset
         None,
         n,
     );
@@ -1800,6 +1802,7 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         a_blocks,
         a_rhs,
         &mut wx_scratch,
+        None, // offset
         None,
         n,
     );
@@ -1917,6 +1920,7 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         a_chol,
         a_rhs,
         a_llt_mem,
+        None, // offset
         None,
         n,
     );
@@ -1968,6 +1972,7 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         a_blocks,
         a_rhs,
         &mut wx_scratch,
+        None, // offset
         None,
         n,
     );
@@ -2559,6 +2564,7 @@ fn structured_extras_matches_dense() {
             a_chol,
             a_rhs,
             a_llt_mem,
+            None, // offset
             None,
             n,
         );
@@ -2659,6 +2665,7 @@ fn structured_extras_matches_dense() {
                 false,
                 a_rhs,
                 &mut wx_scratch,
+                None, // offset
                 None,
                 n,
             )
@@ -2822,6 +2829,7 @@ fn structured_panel_downdate_matches_scalar() {
                 true, // force_dense: same factor arm both runs — isolate the downdate
                 a_rhs,
                 &mut wx_scratch,
+                None, // offset
                 None,
                 n,
             );
@@ -3465,6 +3473,7 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
         a_chol,
         a_rhs,
         a_llt_mem,
+        None, // offset
         None,
         n,
     );
@@ -3591,6 +3600,7 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         a_blocks,
         a_rhs,
         wx,
+        None, // offset
         None,
         n,
     );
@@ -3756,6 +3766,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             false,
             a_rhs,
             wx,
+            None, // offset
             None,
             n,
         )
@@ -3905,6 +3916,7 @@ fn structured_profile_beta_matches_dense_profile() {
             a_chol,
             a_rhs,
             a_llt_mem,
+            None, // offset
             None,
             n,
         )
@@ -4022,6 +4034,7 @@ fn structured_profile_beta_matches_dense_profile() {
             false,
             a_rhs,
             wx,
+            None, // offset
             None,
             n,
         )

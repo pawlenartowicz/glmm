@@ -195,6 +195,15 @@ fn fit_one(spec: &Value) {
             .unwrap_or_else(|| panic!("{ds}: weights_col {wc:?} not in CSV header"));
         lo.opts.weights = Some(rows.iter().map(|r| r[w_idx].parse().unwrap()).collect());
     }
+    // `offset` field: per-row known additive term on the linear-predictor scale
+    // (R's `offset=`) -- a named CSV column, mirroring `weights_col` above.
+    if let Some(oc) = spec["offset"].as_str() {
+        let o_idx = header
+            .iter()
+            .position(|h| h == oc)
+            .unwrap_or_else(|| panic!("{ds}: offset {oc:?} not in CSV header"));
+        lo.opts.offset = Some(rows.iter().map(|r| r[o_idx].parse().unwrap()).collect());
+    }
     let timing_batch = spec["timing_batch"].as_u64().unwrap_or(1) as usize;
 
     // Reference grouping order (compare.R aligns varcomp positionally, not by
@@ -280,6 +289,8 @@ fn fit_one(spec: &Value) {
         let est = json!({
             "beta": nums(&f.beta),
             "se": nums(&f.se),
+            "loglik": num(f.loglik),
+            "df": f.df,
             "varcomp": varcomp(&f, &lo.re_groups, &ref_order, false),
         });
         (f.converged, f.singular, est, t, f.n_eval, f.deviance)
@@ -298,6 +309,8 @@ fn fit_one(spec: &Value) {
         let est = json!({
             "beta": nums(&f.beta),
             "se_rx": nums(&f.se),
+            "loglik": num(f.loglik),
+            "df": f.df,
             "varcomp": varcomp(&f, &lo.re_groups, &ref_order, false),
         });
         (f.converged, f.singular, est, t, f.n_eval, f.deviance)
@@ -309,6 +322,7 @@ fn fit_one(spec: &Value) {
             target_indices: lo.opts.target_indices.clone(),
             wald_se: WaldSe::Rx,
             weights: lo.opts.weights.clone(),
+            offset: lo.opts.offset.clone(),
             ..FitOptions::default()
         };
         let fh = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
@@ -330,6 +344,8 @@ fn fit_one(spec: &Value) {
             "beta": nums(&fh.beta),
             "se_hessian": nums(&fh.se),
             "se_rx": nums(&fr.se),
+            "loglik": num(fh.loglik),
+            "df": fh.df,
             // stddev_se from the Hessian fit's θ block (fh = WaldSe::Hessian).
             "varcomp": varcomp(&fh, &lo.re_groups, &ref_order, true),
         });

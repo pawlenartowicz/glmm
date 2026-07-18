@@ -46,6 +46,19 @@ pub struct FitResult {
     /// Warn-and-strip message for an ineligible-shape `nagq>1` (the fit
     /// proceeded with Laplace); surfaced by `fastglmm()` as an R `warning()`.
     pub agq_warning: Option<String>,
+    /// Log-likelihood at the fitted parameters (`glmm::Fit::loglik`).
+    pub loglik: f64,
+    /// Parameters counted for AIC/BIC (`glmm::Fit::df`).
+    pub df: usize,
+    /// `true` iff `loglik` is a REML criterion, not an ML log-likelihood
+    /// (`glmm::Fit::reml`).
+    pub reml: bool,
+    /// Fitted means per row (`glmm::Fit::fitted`).
+    pub fitted: Vec<f64>,
+    /// Random-effect conditional modes (`glmm::Fit::ranef`).
+    pub ranef: Vec<f64>,
+    /// Level count per grouping, for slicing `ranef` (`glmm::Fit::ranef_levels`).
+    pub ranef_levels: Vec<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -202,6 +215,12 @@ pub fn run_fit(
         names: lowered.col_names,
         re_groups,
         agq_warning,
+        loglik: fit.loglik,
+        df: fit.df,
+        reml: fit.reml,
+        fitted: fit.fitted,
+        ranef: fit.ranef,
+        ranef_levels: fit.ranef_levels,
     })
 }
 

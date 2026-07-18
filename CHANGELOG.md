@@ -8,6 +8,59 @@ shares these entries; Python-specific notes are called out where they differ.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-07-18
+
+Additive release: an offset term and post-fit reporting fields (log-likelihood,
+AIC/BIC df, fitted means, conditional modes). Nothing on the stable surface
+changed shape, so every 0.1.0 fit keeps its result up to optimizer tolerance;
+the oracle goldens hold at their existing tolerances.
+
+### Added
+
+- **`FitOptions::offset`** — a per-row additive term on the linear-predictor
+  scale, `η = offset + Xβ (+ Zb)`, matching R's `glm(offset=)` / `glmer(offset=)`.
+  A fixed known contribution, not a parameter (β must not absorb it); the
+  canonical use is a Poisson exposure, `offset = log(exposure)`. Supported on
+  every path — OLS, GLM, LMM, GLMM (dense and sparse) — with identity-link
+  paths applying it as an exact `y − o` shift and `Fit::fitted` still reporting
+  means on the original `y` scale. Also on the Python `fit(offset=)`. A new
+  `sim_poisson_offset` parity rung (28) pins it against `glmer(offset=)`. The R
+  port (`fastglmm`) still rejects `offset=` / `offset()` by design.
+- **`Fit::loglik`, `Fit::df`, `Fit::reml`** — the log-likelihood at the fitted
+  parameters, `deviance` with its dropped data-only constants restored onto
+  lme4's `logLik()` scale, the AIC/BIC parameter count, and a flag marking the
+  LMM REML criterion. Together they give `AIC = 2·df − 2·loglik` and
+  `BIC = df·ln(n) − 2·loglik` on every path. `loglik` matches `lme4::logLik`
+  including the aggregated-binomial `cbind(s, m−s)` form under `weights=`; on
+  the Gaussian LMM paths it is the REML criterion `−REMLcrit/2`, comparable only
+  between models with identical fixed effects — `reml` is set there, mirroring
+  lme4's REML-fit `anova` warning. `df` counts retained fixed effects (lme4's
+  NA-coefficient handling for aliased columns) + RE θ parameters + 1 where the
+  family estimates a dispersion/scale.
+- **`Fit::fitted`** — fitted means `μ̂` per row through the inverse link (lme4
+  `fitted()`). Empty on non-converged fits and on the Gaussian LMM paths, which
+  fit via sufficient statistics and never materialize per-row means.
+- **`Fit::ranef`, `Fit::ranef_levels`** — random-effect conditional modes `b̂`
+  (BLUPs), one block per grouping in `varcorr`/`re_groups` order, level-major,
+  with `ranef_levels` giving each grouping's level count for slicing. Empty on
+  the same paths as `fitted`.
+- All six new fields cross the Python and R shims onto their fit results
+  (`Fit.loglik`/`df`/`reml`/`fitted`/`ranef`/`ranef_levels` in Python).
+- Seven user-facing guides under `documentation/`: `installation.md`,
+  `formula.md`, `conventions.md`, `coming-from-lme4.md`, `glmm-design.md`,
+  `validation.md`, `troubleshooting.md`. The Python and R READMEs now link them
+  instead of inlining the formula and factor-coding rules.
+
+### Changed
+
+- **The boundary (singular) fit warning now names the degenerate components.**
+  lme4's exact text (`boundary (singular) fit: see help('isSingular')`) is
+  extended with `sd(term | group) = 0` per collapsed variance and
+  `corr(a, b | group) = ±1` per degenerate correlation. Exact comparisons are
+  safe because the kernel pins boundary components to exact 0 / ±1; the bare
+  lme4 text is kept when only the relative-tolerance singular check fired. The
+  Python and R ports emit the same extended message.
+
 ## [0.1.0] — 2026-07-16
 
 First release of the Python package (`glmm` on PyPI), and the first crate

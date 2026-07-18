@@ -67,17 +67,19 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
 The formula follows R conventions: `*` desugars to main effects + interaction,
 `A/B` to nesting, `(1 + x | g)` is a correlated random intercept + slope, and
 additional `(… | g2)` terms add crossed or nested grouping factors. Treatment
-contrasts (R's default) code the factors: the base is the column's **first
-level**, so a `pandas.Categorical` is fit against the first category you
-declare, and a plain string column — which declares no order — is sorted
-lexicographically, as R's `factor()` does.
+contrasts (R's default) code the factors against the column's first level; the
+full syntax, rejected constructs and workarounds, and factor-coding rules are
+in
+[`formula.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/formula.md).
 
 ### Not yet implemented
 
 Four combinations have an approved design but no kernel support, and raise a
 clean `NotImplementedError`: `family="inversegaussian"`, `link="cloglog"`,
 quasi-likelihood `dispersion=` on binomial/poisson, and a float `init_theta=`
-seed (only the default `init_theta=None` cold start is supported).
+seed (only the default `init_theta=None` cold start is supported). See
+[`troubleshooting.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/troubleshooting.md)
+for fixes to common errors.
 
 ## Documentation
 

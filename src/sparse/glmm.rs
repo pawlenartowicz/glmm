@@ -123,6 +123,9 @@ pub(crate) struct SparseGlmmWorkspace {
     /// the `WaldSe::Hessian` FD evals (and the RX-fallback central re-eval);
     /// `None` on the fit path, which therefore stays bit-identical.
     pirls_tol_override: Option<f64>,
+    /// Per-row linear-predictor offset (`FitOptions::offset`), added into
+    /// `eta_fixed` by `refresh_eta_fixed`. `None` ⇒ no offset, byte-identical.
+    pub(super) offset: Option<Vec<f64>>,
 }
 
 impl SparseGlmmWorkspace {
@@ -205,6 +208,7 @@ impl SparseGlmmWorkspace {
             k,
             p,
             pirls_tol_override: None,
+            offset: None,
         }
     }
 
@@ -253,6 +257,7 @@ impl SparseGlmmWorkspace {
             k,
             p,
             pirls_tol_override,
+            offset,
         } = self;
         SparseGlmmWorkspace {
             g: g.clone(),
@@ -293,6 +298,7 @@ impl SparseGlmmWorkspace {
             k: *k,
             p: *p,
             pirls_tol_override: *pirls_tol_override,
+            offset: offset.clone(),
         }
     }
 
@@ -338,8 +344,8 @@ impl SparseGlmmWorkspace {
         }
     }
 
-    /// Refill `eta_fixed[i] = Σ_j x[i,j]·β[j]` from `self.beta` — the sparse
-    /// twin of `pirls::refresh_eta_fixed`. Called at PIRLS entry and, in
+    /// Refill `eta_fixed[i] = offset[i] + Σ_j x[i,j]·β[j]` from `self.beta` — the
+    /// sparse twin of `pirls::refresh_eta_fixed`. Called at PIRLS entry and, in
     /// Profile mode, after every β update (δβ step and each β halving).
     fn refresh_eta_fixed(&mut self, x: MatRef<f64>, n: usize) {
         for i in 0..n {
@@ -348,6 +354,11 @@ impl SparseGlmmWorkspace {
                 e += x[(i, j)] * b;
             }
             self.eta_fixed[i] = e;
+        }
+        if let Some(o) = &self.offset {
+            for (e, &ov) in self.eta_fixed[..n].iter_mut().zip(o) {
+                *e += ov;
+            }
         }
     }
 
@@ -904,6 +915,12 @@ fn sparse_glmm_nan_fit(p: usize, n_theta: usize) -> crate::Fit {
         n_eval: 0,
         deviance: f64::NAN,
         singular: false,
+        loglik: f64::NAN,
+        df: 0,
+        reml: false,
+        fitted: vec![],
+        ranef: vec![],
+        ranef_levels: vec![],
     }
 }
 
@@ -960,6 +977,7 @@ pub(crate) fn fit_glmm_sparse(
     if let Some(w) = &opts.weights {
         ws.prior_w[..n].copy_from_slice(w);
     }
+    ws.offset = opts.offset.clone();
 
     // Joint [θ | β] parameter vector, seeds, and boxes. The θ cold start is the
     // structure-aware blind seed from `blind_theta_and_bounds` — diagonal vech
@@ -984,7 +1002,9 @@ pub(crate) fn fit_glmm_sparse(
     }
     let beta_start = match start {
         Some(s) => s.beta.clone(),
-        None => crate::fit::glm_warm_start_beta(family, nb_theta, xm, y, n, p),
+        None => {
+            crate::fit::glm_warm_start_beta(family, nb_theta, xm, y, n, p, opts.offset.as_deref())
+        }
     };
     for (slot, &b) in params[n_theta..].iter_mut().zip(&beta_start) {
         *slot = b.clamp(-crate::glmm::BETA_BOX, crate::glmm::BETA_BOX);
@@ -1128,6 +1148,18 @@ pub(crate) fn fit_glmm_sparse(
     // σ̂²-scaled like tau2 above (lme4 VarCorr; σ̂² ≡ 1 for φ≡1 families —
     // mirrors `fit::fit_glmm`'s varcorr, change together).
     let varcorr = crate::fit::assemble_varcorr(&params[..n_theta], &g, sigma_sq);
+    // μ̂/û/loglik captured HERE, off the same converged state as tau2 above —
+    // the FD-Hessian arm below perturbs ws.prob/ws.u and only its fallback
+    // restores them (mirrors `fit::fit_glmm`'s read discipline).
+    let fitted = ws.prob[..n].to_vec();
+    let ranef = crate::fit::assemble_ranef_sparse(&params[..n_theta], &g, &ws.u[..ws.k]);
+    let loglik = crate::fit::glmm_loglik(
+        family,
+        nb_theta,
+        final_deviance,
+        &y[..n],
+        Some(&ws.prior_w[..n]),
+    );
 
     // SE per WaldSe arm. The Rx Schur reads the converged W̃/A the re-eval left;
     // the FD-Hessian perturbs the workspace, so its Rx FALLBACK re-evals at γ̂
@@ -1243,6 +1275,12 @@ pub(crate) fn fit_glmm_sparse(
         n_eval,
         deviance: final_deviance,
         singular: pinned,
+        loglik,
+        df: crate::fit::model_df(family, p, n_theta, opts.dispersion.is_some()),
+        reml: false,
+        fitted,
+        ranef,
+        ranef_levels: crate::fit::ranef_level_counts(&g),
     };
     fit.singular = fit.singular || fit.has_negligible_component();
     (fit, final_deviance)

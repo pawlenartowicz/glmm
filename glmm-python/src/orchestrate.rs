@@ -42,6 +42,19 @@ pub struct FitResult {
     /// §3.5 warn-and-strip message for an ineligible-shape `nagq>1` (the fit
     /// proceeded with Laplace); surfaced by `glmm.fit` as a `UserWarning`.
     pub agq_warning: Option<String>,
+    /// Log-likelihood at the fitted parameters (`glmm::Fit::loglik`).
+    pub loglik: f64,
+    /// Parameters counted for AIC/BIC (`glmm::Fit::df`).
+    pub df: usize,
+    /// `true` iff `loglik` is a REML criterion, not an ML log-likelihood
+    /// (`glmm::Fit::reml`).
+    pub reml: bool,
+    /// Fitted means per row (`glmm::Fit::fitted`).
+    pub fitted: Vec<f64>,
+    /// Random-effect conditional modes (`glmm::Fit::ranef`).
+    pub ranef: Vec<f64>,
+    /// Level count per grouping, for slicing `ranef` (`glmm::Fit::ranef_levels`).
+    pub ranef_levels: Vec<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -55,6 +68,7 @@ pub fn run_fit(
     nagq: u8,
     dispersion: Option<f64>,
     weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
     warm_start: Option<(Vec<f64>, Vec<f64>)>,
 ) -> Result<FitResult, String> {
     let fam = family_from_str(family, link)?;
@@ -148,6 +162,7 @@ pub fn run_fit(
     lowered.opts.nagq = nagq;
     lowered.opts.dispersion = dispersion;
     lowered.opts.weights = weights;
+    lowered.opts.offset = offset;
 
     let start = warm_start.map(|(beta, theta)| StartValues { beta, theta });
 
@@ -197,6 +212,12 @@ pub fn run_fit(
         names: lowered.col_names,
         re_groups,
         agq_warning,
+        loglik: fit.loglik,
+        df: fit.df,
+        reml: fit.reml,
+        fitted: fit.fitted,
+        ranef: fit.ranef,
+        ranef_levels: fit.ranef_levels,
     })
 }
 
@@ -245,7 +266,7 @@ mod tests {
     fn gaussian_ols_end_to_end() {
         let (numeric, factor) = toy_ols();
         let result = run_fit(
-            "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None,
+            "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
         )
         .expect("fit should succeed");
         assert_eq!(
@@ -266,7 +287,7 @@ mod tests {
     fn unknown_column_is_a_clean_error() {
         let (numeric, factor) = toy_ols();
         let err = run_fit(
-            "y ~ z", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None,
+            "y ~ z", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
         )
         .unwrap_err();
         assert!(err.contains("z"), "{err}");
@@ -295,6 +316,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("ineligible nagq must be stripped, not an error");
         let msg = result.agq_warning.as_deref().expect("warning expected");
@@ -305,7 +327,7 @@ mod tests {
     fn malformed_formula_panic_becomes_a_clean_error_not_a_process_abort() {
         let (numeric, factor) = toy_ols();
         let err = run_fit(
-            "y ~ :", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None,
+            "y ~ :", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
         )
         .unwrap_err();
         // lower()'s panic (an unguarded index in the formula frontend's interaction-term
@@ -329,6 +351,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("x"), "{err}");
@@ -340,7 +363,7 @@ mod tests {
         let (mut numeric, factor) = toy_ols();
         numeric.insert("junk".to_string(), vec![0.0; 1000]); // not referenced by the formula
         let err = run_fit(
-            "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None,
+            "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
         )
         .unwrap_err();
         assert!(err.contains("junk"), "{err}");

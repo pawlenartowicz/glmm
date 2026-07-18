@@ -11,7 +11,7 @@ name: Publish (r-universe)
 # the branch is a generated artifact (docs/GLMM/plans/2026-07-16-r-repo-publishing-spec.md).
 on:
   push:
-    tags: ["r-*"]
+    tags: ["v*"]
 
 jobs:
   verify:
@@ -26,13 +26,13 @@ jobs:
       - name: Check tag matches DESCRIPTION version
         shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/r-}"
+          TAG="${GITHUB_REF#refs/tags/v}"
           VERSION=$(grep -m1 '^Version: ' r/DESCRIPTION | cut -d' ' -f2)
           if [ "$VERSION" != "$TAG" ]; then
-            echo "::error::r/DESCRIPTION has Version: $VERSION, tag is r-$TAG"
+            echo "::error::r/DESCRIPTION has Version: $VERSION, tag is v$TAG"
             exit 1
           fi
-          echo "r/DESCRIPTION matches tag r-$TAG."
+          echo "r/DESCRIPTION matches tag v$TAG."
 
   publish-r-universe:
     name: Stage + push r-universe branch
@@ -55,7 +55,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -q -m "r-universe: fastglmm ${GITHUB_REF#refs/tags/r-}"
+          git commit -q -m "r-universe: fastglmm ${GITHUB_REF#refs/tags/v}"
           git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:r-universe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

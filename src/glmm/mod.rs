@@ -283,6 +283,7 @@ pub fn fit_glmm(
     // so this is a plain read.
     let two_stage = ws.two_stage;
     let weighted = ws.weighted;
+    let offset = ws.offset.as_deref();
     let GlmmWorkspace {
         solver,
         solver_stage1,
@@ -436,6 +437,7 @@ pub fn fit_glmm(
                     *pf,
                     n,
                     cluster_rows.as_ref(),
+                    offset,
                 );
                 if obj < best1 {
                     best1 = obj;
@@ -531,6 +533,7 @@ pub fn fit_glmm(
                 *pf,
                 n,
                 cluster_rows.as_ref(),
+                offset,
             );
             if obj < best_obj {
                 best_obj = obj;
@@ -682,6 +685,7 @@ pub fn fit_glmm(
             *p,
             n,
             cluster_rows.as_ref(),
+            offset,
         );
     }
 

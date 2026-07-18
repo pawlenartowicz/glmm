@@ -128,6 +128,30 @@ class Fit:
     # Laplace deviance, which differs from -2*logLik by a data-only saturated
     # constant. NaN for OLS/GLM and on numerical failure.
     deviance: float
+    # Log-likelihood at the fitted parameters, on the logLik() scale (R/lme4).
+    # For an LMM this is the REML criterion (see `reml` below); for OLS/GLM/GLMM
+    # it is the ordinary log-likelihood. NaN wherever `deviance`'s failure modes
+    # apply.
+    loglik: float
+    # Parameters counted for AIC/BIC: retained fixed effects + RE parameters +
+    # 1 if the family estimates a dispersion/scale. 0 on degenerate NaN-fill
+    # paths.
+    df: int
+    # True iff `loglik` is a REML criterion rather than an ML log-likelihood
+    # (the Gaussian LMM paths). Model comparisons (AIC/LRT) across fits with
+    # different fixed effects are invalid when this is set.
+    reml: bool
+    # Fitted means mu-hat per row (n,). Empty on non-converged fits and on the
+    # Gaussian LMM paths (fit via sufficient statistics, no per-row means).
+    fitted: np.ndarray
+    # Random-effect conditional modes b-hat, one block per grouping in
+    # varcorr/re_groups order, each block level-major (level l's q values at
+    # [l*q .. (l+1)*q]). Empty on non-converged fits and on the Gaussian LMM
+    # paths; see `ranef_levels` for slicing per grouping.
+    ranef: np.ndarray
+    # Level count per grouping, for slicing `ranef`: ranef.size == sum(levels *
+    # q_per_group). Empty exactly when `ranef` is.
+    ranef_levels: np.ndarray
 
     def stddev_corr(self, group_idx):
         """Split grouping `group_idx`'s vech-packed covariance into
@@ -208,6 +232,29 @@ class Fit:
         return text
 
 
+def _singular_detail(res):
+    """Names of the exactly-degenerate RE components, for the singular warning:
+    "sd(term | group) = 0" per collapsed variance, "corr(a, b | group) = +/-1"
+    per degenerate correlation. Exact comparisons are safe because the kernel
+    pins boundary components to exact 0 / ±1 (algorithms-lmm.md "Boundary
+    handling"); empty when only the relative-tolerance singular check fired,
+    which keeps the bare lme4 text."""
+    parts = []
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for g, (group, terms) in enumerate(res.re_groups):
+            stddev, corr = res.stddev_corr(g)
+            for i in range(len(stddev)):
+                if stddev[i] == 0:
+                    parts.append(f"sd({terms[i]} | {group}) = 0")
+            for c in range(len(stddev)):
+                for r in range(c + 1, len(stddev)):
+                    if stddev[c] > 0 and stddev[r] > 0 and abs(corr[r, c]) == 1:
+                        parts.append(
+                            f"corr({terms[c]}, {terms[r]} | {group}) = {int(corr[r, c]):+d}"
+                        )
+    return parts
+
+
 def fit(
     data,
     formula,
@@ -217,6 +264,7 @@ def fit(
     dispersion=None,
     init_theta=None,
     weights=None,
+    offset=None,
     wald_se="hessian",
     nagq=1,
     warm_start=None,
@@ -235,6 +283,10 @@ def fit(
         `warm_start["theta"]`, which is the random-effect Cholesky vector
         (lme4's `start=list(theta=)`); they are unrelated parameters and both
         may be passed in one call.
+    offset: per-row additive offset on the linear-predictor scale, length n
+        (R's `offset=`): eta = offset + X*beta (+ Z*b). A fixed known
+        contribution, not a parameter — the canonical use is a Poisson
+        exposure, offset = log(exposure). None = no offset.
     warm_start: {"beta": …, "theta": …} optimizer start. See `init_theta` above
         for why "theta" here is NOT the negative-binomial shape.
 
@@ -375,6 +427,7 @@ def fit(
         nagq,
         dispersion,
         [float(w) for w in weights] if weights is not None else None,
+        [float(v) for v in offset] if offset is not None else None,
         warm_start_pair,
     )
     # nagq's shape eligibility (single grouping factor, binomial/Poisson,
@@ -384,13 +437,9 @@ def fit(
     # dispersion/theta strips above use.
     if r["agq_warning"] is not None:
         warnings.warn(r["agq_warning"], stacklevel=2)
-    # lme4 parity (boundary-fits follow-up spec Part B step 4): glmm computes
-    # this flag already (Fit::singular) but never surfaced it as a warning.
-    if r["singular"]:
-        warnings.warn("boundary (singular) fit: see help('isSingular')", stacklevel=2)
     # Wrap the native dict's plain lists back into the array types Fit's
     # dataclass documents (no numpy Rust dep — the native call returns lists).
-    return Fit(
+    res = Fit(
         beta=np.asarray(r["beta"], dtype=float),
         se=np.asarray(r["se"], dtype=float),
         vcov=np.asarray(r["vcov"], dtype=float),
@@ -405,4 +454,19 @@ def fit(
         re_groups=r["re_groups"],
         n_eval=r["n_eval"],
         deviance=r["deviance"],
+        loglik=r["loglik"],
+        df=r["df"],
+        reml=r["reml"],
+        fitted=np.asarray(r["fitted"], dtype=float),
+        ranef=np.asarray(r["ranef"], dtype=float),
+        ranef_levels=np.asarray(r["ranef_levels"], dtype=int),
     )
+    # lme4 parity (boundary-fits follow-up spec Part B step 4): lme4's exact
+    # text, extended with the degenerate components. The R port emits the same
+    # message (fastglmm.R) — change together.
+    if res.singular:
+        warnings.warn(
+            "; ".join(["boundary (singular) fit: see help('isSingular')", *_singular_detail(res)]),
+            stacklevel=2,
+        )
+    return res

@@ -28,6 +28,26 @@ def test_binomial_glmm():
     assert result.converged
 
 
+def test_singular_fit_warning_names_component():
+    # No group effect in tiny clusters: the RE variance pins to 0 and the
+    # warning names the pinned component (mirrors the R port's test).
+    rng = np.random.default_rng(1)
+    x = rng.normal(size=120)
+    p = 1.0 / (1.0 + np.exp(-(0.2 + 0.8 * x)))
+    data = {
+        "x": x.tolist(),
+        "g": [f"g{i}" for i in np.repeat(np.arange(30), 4).tolist()],
+        "y": rng.binomial(1, p).astype(float).tolist(),
+    }
+    with pytest.warns(
+        UserWarning,
+        match=r"boundary \(singular\) fit: see help\('isSingular'\); "
+        r"sd\(\(Intercept\) \| g\) = 0",
+    ):
+        result = glmm.fit(data, "y ~ x + (1 | g)", "binomial")
+    assert result.singular
+
+
 def test_poisson_glm():
     y = _rng.poisson(np.exp(0.5 + 0.3 * _X)).astype(float)
     result = glmm.fit(_data(y.tolist()), "y ~ x", "poisson")
@@ -72,6 +92,46 @@ def test_agq_vector_q2_smoke():
     # ~3e-2 in beta and ~0.3 in varcorr on this dataset — far above tolerance).
     assert np.max(np.abs(agq.beta - laplace.beta)) > 1e-6
     assert np.max(np.abs(np.array(agq.varcorr[0]) - np.array(laplace.varcorr[0]))) > 1e-4
+
+
+def test_gaussian_fixed_only_exposes_loglik_df_reml_fitted():
+    y = 1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)
+    result = glmm.fit(_data(y.tolist()), "y ~ x")
+    assert result.converged
+    assert np.isfinite(result.loglik)
+    assert result.df == len(result.beta) + 1  # p fixed effects + sigma^2
+    assert result.reml is False
+    assert len(result.fitted) == _N
+
+
+def test_mixed_binomial_exposes_ranef_consistent_with_levels():
+    p = 1.0 / (1.0 + np.exp(-(0.2 + 0.8 * _X)))
+    y = _rng.binomial(1, p).astype(float)
+    result = glmm.fit(_data(y.tolist()), "y ~ x + (1 | g)", "binomial")
+    assert result.converged
+    assert len(result.ranef_levels) == len(result.varcorr)
+    q = 1  # scalar random intercept -> q=1 per level
+    assert len(result.ranef) == sum(int(lv) * q for lv in result.ranef_levels)
+
+
+def test_mixed_poisson_exposes_ranef_consistent_with_levels():
+    y = _rng.poisson(np.exp(0.5 + 0.3 * _X)).astype(float)
+    result = glmm.fit(_data(y.tolist()), "y ~ x + (1 | g)", "poisson")
+    assert result.converged
+    assert len(result.ranef_levels) == len(result.varcorr)
+    q = 1
+    assert len(result.ranef) == sum(int(lv) * q for lv in result.ranef_levels)
+
+
+def test_offset_shifts_poisson_intercept_by_minus_constant():
+    y = _rng.poisson(np.exp(0.5 + 0.3 * _X)).astype(float)
+    data = _data(y.tolist())
+    base = glmm.fit(data, "y ~ x", "poisson")
+    c = 1.7
+    shifted = glmm.fit(data, "y ~ x", "poisson", offset=[c] * _N)
+    assert base.converged and shifted.converged
+    assert abs(shifted.beta[0] - (base.beta[0] - c)) < 1e-3
+    assert np.max(np.abs(shifted.beta[1:] - base.beta[1:])) < 1e-3
 
 
 def test_warm_start_reaches_same_answer_as_cold():

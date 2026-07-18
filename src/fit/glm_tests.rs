@@ -61,6 +61,16 @@ fn fit_glm_gamma_weighted_matches_r() {
         assert!((f.se[j] - REF_SE[j]).abs() < 1e-6, "se[{j}]");
     }
     assert!((f.dispersion - REF_DISPERSION).abs() / REF_DISPERSION < 1e-6);
+    // logLik(fg)/df from the same R run — R's Gamma()$aic convention, whose
+    // dispersion is profiled as dev/Σwᵢ (NOT the Pearson φ̂ above).
+    const REF_LOGLIK: f64 = -118.213036736182;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-6,
+        "loglik {} vs R {REF_LOGLIK}",
+        f.loglik
+    );
+    assert_eq!(f.df, 3); // β0, β1, φ
+    assert_eq!(f.fitted.len(), 40);
 }
 
 /// Weighted binomial-logit GLM on aggregated (proportion, trial-count)
@@ -151,6 +161,16 @@ fn fit_glm_binomial_weighted_aggregated_matches_r() {
         assert!((f.beta[j] - REF_BETA[j]).abs() < 1e-6, "beta[{j}]");
         assert!((f.se[j] - REF_SE[j]).abs() < 1e-6, "se[{j}]");
     }
+    // logLik(fb)/df from the same R run — includes the ln C(mᵢ,sᵢ) binomial
+    // coefficients (dbinom on the aggregated counts), the exact quantity the
+    // saturated-constant restoration must reproduce under weights.
+    const REF_LOGLIK: f64 = -46.8334270981151;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-6,
+        "loglik {} vs R {REF_LOGLIK}",
+        f.loglik
+    );
+    assert_eq!(f.df, 2); // β only; binomial has no free dispersion
 }
 
 #[test]
@@ -280,6 +300,86 @@ fn fit_glm_poisson_matches_r() {
             "se[{j}] = {} vs R {} (rel {se_rel})",
             f.se[j],
             REF_SE[j]
+        );
+    }
+    // R logLik on the same fit: glm(TICKS ~ factor(YEAR) + cHEIGHT, poisson)
+    // on parity/data_empirical/grouseticks.csv → logLik −2187.40552083455,
+    // df 4 (φ≡1: no dispersion parameter).
+    const REF_LOGLIK: f64 = -2187.40552083455;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs R {REF_LOGLIK}",
+        f.loglik
+    );
+    assert_eq!(f.df, 4);
+}
+
+/// Poisson GLM with a per-row offset (the canonical exposure use case), vs R
+/// `glm(offset=)` on grouseticks: `TICKS ~ factor(YEAR) + cHEIGHT` with
+/// `o_i = 0.1·((i−1) mod 7)` (0-based CSV row order in Rust). Oracle (R 4.5.3):
+///   fp <- glm(TICKS ~ YEAR + cHEIGHT, family = poisson, data = gt, offset = og)
+///   print(coef(fp), digits = 15); print(logLik(fp), digits = 15)
+#[test]
+fn fit_glm_poisson_offset_matches_r() {
+    const REF_BETA: [f64; 4] = [
+        1.3026444328289024,
+        0.4002824077793738,
+        -1.6756905837047817,
+        -0.0213150417946447,
+    ];
+    const REF_LOGLIK: f64 = -2233.81176722254;
+    let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
+    let p = 4;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        let year: u32 = f[4].parse().unwrap();
+        x.extend_from_slice(&[
+            1.0,
+            f64::from(u32::from(year == 96)),
+            f64::from(u32::from(year == 97)),
+            f[6].parse().unwrap(), // cHEIGHT
+        ]);
+        y.push(f[1].parse().unwrap()); // TICKS
+    }
+    let n = y.len();
+    let o: Vec<f64> = (0..n).map(|i| 0.1 * (i % 7) as f64).collect();
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: None,
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            offset: Some(o.clone()),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged, "poisson GLM with offset must converge");
+    for (j, (&b, &r)) in f.beta.iter().zip(&REF_BETA).enumerate() {
+        let b_rel = (b - r).abs() / r.abs();
+        assert!(b_rel < 1e-3, "β[{j}] = {b} vs R {r} (rel {b_rel})");
+    }
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs R {REF_LOGLIK}",
+        f.loglik
+    );
+    // fitted = exp(o + Xβ̂): the offset is part of the mean, not of β.
+    for i in 0..n.min(20) {
+        let eta: f64 = o[i] + (0..p).map(|j| x[i * p + j] * f.beta[j]).sum::<f64>();
+        assert!(
+            (f.fitted[i] - eta.exp()).abs() < 1e-8 * eta.exp().max(1.0),
+            "fitted[{i}]"
         );
     }
 }
@@ -702,6 +802,92 @@ fn fit_glm_nb_weighted_matches_mass() {
         th_rel < 1e-4,
         "θ̂ = {} vs MASS {REF_THETA} (rel {th_rel})",
         f.dispersion
+    );
+    // logLik(f)/df from the same R run (`logLik.glm` on the glm.nb fit) — the
+    // full NB density including the −lnΓ(yᵢ+1) count terms, weighted.
+    const REF_LOGLIK: f64 = -220.733217667106;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 5e-4,
+        "loglik {} vs MASS {REF_LOGLIK}",
+        f.loglik
+    );
+    assert_eq!(f.df, 3); // β0, β1, θ
+}
+
+/// NB GLM with a per-row offset has no R oracle (`MASS::glm.nb` takes no
+/// `offset=`), so this pins the offset threaded through the NB outer loop by
+/// its structural invariant instead: a CONSTANT offset `c` on the log link
+/// shifts only the intercept, by `−c`, leaving the slopes and the estimated
+/// dispersion θ̂ untouched (μ̂ = exp(c + β₀ + …) = exp((β₀−c) + …)). The Rust
+/// twin of Python's `test_offset_shifts_poisson_intercept_by_minus_constant`.
+#[test]
+fn fit_glm_nb_constant_offset_shifts_intercept() {
+    let csv = include_str!("../../parity/data_simulated/sim_nb.csv");
+    let p = 3;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        let xv: f64 = f[1].parse().unwrap();
+        let grp_b = f64::from(u32::from(f[2] == "b"));
+        let yv: f64 = f[3].parse().unwrap();
+        x.extend_from_slice(&[1.0, xv, grp_b]);
+        y.push(yv);
+    }
+    let n = y.len();
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: None,
+    };
+    let base = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    let c = 1.3;
+    let shifted = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            offset: Some(vec![c; n]),
+            ..FitOptions::default()
+        },
+    );
+    assert!(base.converged && shifted.converged, "NB fits must converge");
+    assert!(
+        (shifted.beta[0] - (base.beta[0] - c)).abs() < 2e-3,
+        "intercept {} vs base {} − {c}",
+        shifted.beta[0],
+        base.beta[0]
+    );
+    for j in 1..p {
+        assert!(
+            (shifted.beta[j] - base.beta[j]).abs() < 2e-3,
+            "β[{j}] shifted {} vs base {}",
+            shifted.beta[j],
+            base.beta[j]
+        );
+    }
+    // θ̂ is offset-invariant: the shape depends on the (unchanged) fitted means.
+    assert!(
+        (shifted.dispersion - base.dispersion).abs() / base.dispersion < 1e-2,
+        "θ̂ shifted {} vs base {}",
+        shifted.dispersion,
+        base.dispersion
     );
 }
 

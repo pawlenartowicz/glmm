@@ -269,6 +269,10 @@ pub struct GlmmWorkspace {
     /// 1e-6 exit noise. `None` everywhere else: the fit/BOBYQA path never pays the
     /// extra inner iterations and stays bit-identical.
     pub pirls_tol_override: Option<f64>,
+    /// Per-row linear-predictor offset (`FitOptions::offset`), read by every
+    /// `eta_fixed` refresh (`pirls::refresh_eta_fixed` and its two blocked-path
+    /// inline twins). `None` ⇒ no offset, byte-identical to the pre-offset code.
+    pub(crate) offset: Option<Vec<f64>>,
 }
 
 impl GlmmWorkspace {
@@ -502,6 +506,7 @@ impl GlmmWorkspace {
             fd_steps: vec![0.0; n_theta + p],
             warm_seed_active: false,
             pirls_tol_override: None,
+            offset: None,
         }
     }
 }
@@ -549,6 +554,7 @@ pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
     w.u_seed.copy_from_slice(&src.u_seed);
     w.warm_seed_active = src.warm_seed_active;
     w.pirls_tol_override = src.pirls_tol_override;
+    w.offset = src.offset.clone();
     w
 }
 

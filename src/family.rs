@@ -197,6 +197,71 @@ pub(crate) fn gamma_aic(y: &[f64], mu: &[f64], dev: f64, n: usize, prior_w: Opti
     -2.0 * s + 2.0
 }
 
+/// Saturated log-likelihood `Σᵢ log f(yᵢ; μ=yᵢ)` — the data-only constant the
+/// deviance convention drops: `−2·logLik = Σᵢ wᵢ·dᵢ − 2·saturated_loglik`, so
+/// `logLik = −½·deviance + saturated_loglik` wherever the reported deviance is
+/// the (weighted) `dev_resid` sum. Per family:
+///
+/// - **Binomial** — the aggregated form: row `i` is `mᵢ = wᵢ` trials with
+///   `sᵢ = wᵢ·yᵢ` successes (unit weights ⇒ Bernoulli, where every term is 0),
+///   so the saturated density at `μ=y` is `ln C(mᵢ,sᵢ) + sᵢ·ln yᵢ +
+///   (mᵢ−sᵢ)·ln(1−yᵢ)` with the binomial coefficient via `lnΓ` (continuous in
+///   `wᵢ`; R's `dbinom` rounds — identical on the integer trial counts the
+///   aggregated convention carries).
+/// - **Poisson** — `wᵢ·(yᵢ·ln yᵢ − yᵢ − lnΓ(yᵢ+1))` (0 at `yᵢ=0`).
+/// - **NegativeBinomial** — `nb_profile_loglik(y, y, θ, w) − Σᵢ wᵢ·lnΓ(yᵢ+1)`
+///   (the θ-dependent saturated normalizer plus the count term that profile
+///   deliberately omits).
+/// - **Gaussian** — 0 (its `dev_resid` is the bare RSS; the Gaussian paths
+///   build their log-likelihood directly and never call this).
+/// - **Gamma** — NaN on purpose: the Gamma objective substitutes `gamma_aic`
+///   (already `−2·Σwᵢ·log f + 2`), so its logLik is `−½(deviance − 2)` with no
+///   saturated term; a caller reaching this arm is a bug, surfaced as NaN.
+pub(crate) fn saturated_loglik(
+    family: Family,
+    nb_theta: f64,
+    y: &[f64],
+    prior_w: Option<&[f64]>,
+) -> f64 {
+    let lgamma = crate::simd_transcendental::ln_gamma;
+    match family {
+        Family::Gaussian => 0.0,
+        Family::Gamma { .. } => f64::NAN,
+        Family::Binomial { .. } => {
+            let mut s = 0.0;
+            for (i, &yi) in y.iter().enumerate() {
+                let m = prior_w.map_or(1.0, |w| w[i]);
+                let succ = m * yi;
+                s += lgamma(m + 1.0) - lgamma(succ + 1.0) - lgamma(m - succ + 1.0);
+                if yi > 0.0 {
+                    s += succ * yi.ln();
+                }
+                if yi < 1.0 {
+                    s += (m - succ) * (1.0 - yi).ln();
+                }
+            }
+            s
+        }
+        Family::Poisson { .. } => {
+            let mut s = 0.0;
+            for (i, &yi) in y.iter().enumerate() {
+                let t = if yi > 0.0 { yi * yi.ln() } else { 0.0 };
+                s += prior_w.map_or(1.0, |w| w[i]) * (t - yi - lgamma(yi + 1.0));
+            }
+            s
+        }
+        Family::NegativeBinomial { .. } => {
+            let profile = crate::fit::nb_profile_loglik(y, y, nb_theta, prior_w);
+            let counts: f64 = y
+                .iter()
+                .enumerate()
+                .map(|(i, &yi)| prior_w.map_or(1.0, |w| w[i]) * lgamma(yi + 1.0))
+                .sum();
+            profile - counts
+        }
+    }
+}
+
 /// lme4's `sigma(merMod)²` for a GLMM with a free scale: `σ̂² = pwrss/n =
 /// (Σᵢ wᵢ·rᵢ² + ‖û‖²)/n` with Pearson residuals `rᵢ = (yᵢ−μᵢ)/√V(μᵢ)` (for Gamma,
 /// `V(μ)=μ²` ⇒ `rᵢ=(yᵢ−μᵢ)/μᵢ`) and `wᵢ` the row's prior weight (`prior_w = None`
@@ -353,6 +418,74 @@ mod tests {
         // V(μ) = μ + μ²/θ, with θ̂ threaded explicitly.
         let mu = 3.0;
         assert!((variance(f, 2.0, mu) - (mu + mu * mu / 2.0)).abs() < 1e-12);
+    }
+
+    /// The identity `Fit.loglik` relies on: `−½·Σwᵢdᵢ + saturated_loglik`
+    /// must equal the exact `Σwᵢ·log f(yᵢ; μᵢ)` at ANY μ (not just the fitted
+    /// one), per family — checked against directly-written log-densities.
+    #[test]
+    fn saturated_loglik_restores_exact_densities() {
+        let lg = crate::simd_transcendental::ln_gamma;
+        let y = [0.0, 1.0, 3.0, 7.0];
+        let mu = [0.5, 1.2, 2.5, 6.0];
+        let w = [1.0, 2.0, 1.0, 3.0];
+
+        let fp = Family::Poisson {
+            link: PoissonLink::Log,
+        };
+        let dev: f64 = (0..4)
+            .map(|i| w[i] * dev_resid(fp, f64::NAN, y[i], mu[i]))
+            .sum();
+        let direct: f64 = (0..4)
+            .map(|i| w[i] * (y[i] * mu[i].ln() - mu[i] - lg(y[i] + 1.0)))
+            .sum();
+        let restored = -0.5 * dev + saturated_loglik(fp, f64::NAN, &y, Some(&w));
+        assert!(
+            (restored - direct).abs() < 1e-10,
+            "poisson {restored} vs {direct}"
+        );
+
+        let th = 1.7;
+        let fnb = Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        };
+        let dev: f64 = (0..4).map(|i| w[i] * dev_resid(fnb, th, y[i], mu[i])).sum();
+        let direct: f64 = (0..4)
+            .map(|i| {
+                w[i] * (lg(y[i] + th) - lg(th) - lg(y[i] + 1.0)
+                    + th * (th / (th + mu[i])).ln()
+                    + y[i] * (mu[i] / (th + mu[i])).ln())
+            })
+            .sum();
+        let restored = -0.5 * dev + saturated_loglik(fnb, th, &y, Some(&w));
+        assert!(
+            (restored - direct).abs() < 1e-10,
+            "nb {restored} vs {direct}"
+        );
+
+        // Aggregated binomial: y is a success PROPORTION, w the trial count m.
+        let fb = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        let yb = [0.0, 0.5, 2.0 / 3.0, 1.0];
+        let m = [2.0, 4.0, 3.0, 5.0];
+        let mub = [0.3, 0.55, 0.6, 0.8];
+        let dev: f64 = (0..4)
+            .map(|i| m[i] * dev_resid(fb, f64::NAN, yb[i], mub[i]))
+            .sum();
+        let direct: f64 = (0..4)
+            .map(|i| {
+                let s = m[i] * yb[i];
+                lg(m[i] + 1.0) - lg(s + 1.0) - lg(m[i] - s + 1.0)
+                    + s * mub[i].ln()
+                    + (m[i] - s) * (1.0 - mub[i]).ln()
+            })
+            .sum();
+        let restored = -0.5 * dev + saturated_loglik(fb, f64::NAN, &yb, Some(&m));
+        assert!(
+            (restored - direct).abs() < 1e-10,
+            "binomial {restored} vs {direct}"
+        );
     }
 
     #[test]

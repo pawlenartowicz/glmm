@@ -52,6 +52,12 @@ and GLMM legs detailed in
 | [`documentation/algorithms.md`](documentation/algorithms.md) | Algorithm map entry point: full dispatch graph, knob index, OLS/GLM paths |
 | [`documentation/algorithms-lmm.md`](documentation/algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML, closed-form shortcut, BOBYQA, boundary handling |
 | [`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md) | GLMM: PIRLS, Laplace vs AGQ, dense vs sparse Z, NB outer loop, warm starts |
+| [`documentation/installation.md`](documentation/installation.md) | Installing the Rust crate, Python package, and R package |
+| [`documentation/formula.md`](documentation/formula.md) | What the formula parser accepts and rejects, with workarounds |
+| [`documentation/conventions.md`](documentation/conventions.md) | Estimation, standard-error, dispersion, and variance-component conventions, and the flags on a fit result |
+| [`documentation/validation.md`](documentation/validation.md) | How glmm is validated against lme4 and MixedModels.jl, what's covered, and known tolerances/exemptions |
+| [`documentation/coming-from-lme4.md`](documentation/coming-from-lme4.md) | Call mapping from lme4 (and statsmodels), what's deliberately missing, and behavioral differences to watch |
+| [`documentation/troubleshooting.md`](documentation/troubleshooting.md) | Fixes for singular fits, non-convergence, NotImplementedError, and rejected formulas |
 
 ## Scope and stability (0.1.x)
 

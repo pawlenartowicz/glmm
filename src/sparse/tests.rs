@@ -3728,6 +3728,30 @@ fn sparse_glmm_over_envelope_converges_poisson() {
     assert!(f.converged, "over-count poisson converges");
     assert!(f.beta.iter().all(|b| b.is_finite()) && f.se.iter().all(|s| s.is_finite()));
 
+    // fitted/ranef consistency through the log link — pins the sparse-path
+    // ranef layout (primary block, then the 7 scalar crossed extras in
+    // declaration order) and the Λ scale: η̂ = Xβ̂ + Zb̂ must reproduce μ̂.
+    let mut expected_levels = vec![n_primary];
+    expected_levels.extend(extra_levels.iter());
+    assert_eq!(f.ranef_levels, expected_levels);
+    assert_eq!(f.ranef.len(), expected_levels.iter().sum::<usize>());
+    assert_eq!(f.fitted.len(), n);
+    for i in 0..n {
+        let mut eta: f64 = (0..p).map(|j| x[i * p + j] * f.beta[j]).sum();
+        eta += f.ranef[ids.primary[i] as usize];
+        let mut off = n_primary;
+        for (g, ids_g) in ids.extra.iter().enumerate() {
+            eta += f.ranef[off + ids_g[i] as usize];
+            off += extra_levels[g];
+        }
+        let mu = eta.exp();
+        assert!(
+            (f.fitted[i] - mu).abs() < 1e-6 * mu.max(1.0),
+            "fitted[{i}] = {} vs exp(Xβ̂+Zb̂) = {mu}",
+            f.fitted[i]
+        );
+    }
+
     let n_theta = f.tau2.len();
     let mut params = Vec::with_capacity(n_theta + p);
     params.extend(f.tau2.iter().map(|t| t.sqrt()));
@@ -3823,6 +3847,28 @@ fn sparse_glmm_over_envelope_converges_gamma() {
     let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert!(f.converged, "over-width gamma converges");
     assert!(f.beta.iter().all(|b| b.is_finite()) && f.se.iter().all(|s| s.is_finite()));
+
+    // fitted/ranef consistency through the log link — the q_g=5 slope-block
+    // extra pins the sparse ranef Λ_g block application and the level-major
+    // [intercept, slope₁..slope₄] within-level order.
+    assert_eq!(f.ranef_levels, vec![n_gp, n_ge]);
+    assert_eq!(f.ranef.len(), n_gp + n_ge * q_g);
+    assert_eq!(f.fitted.len(), n);
+    for i in 0..n {
+        let mut eta: f64 = (0..p).map(|j| x[i * p + j] * f.beta[j]).sum();
+        eta += f.ranef[ids.primary[i] as usize];
+        let base = n_gp + ids.extra[0][i] as usize * q_g;
+        eta += f.ranef[base]; // extra intercept
+        for (c, &col) in [1usize, 2, 3, 4].iter().enumerate() {
+            eta += f.ranef[base + 1 + c] * x[i * p + col];
+        }
+        let mu = eta.exp();
+        assert!(
+            (f.fitted[i] - mu).abs() < 1e-6 * mu.max(1.0),
+            "fitted[{i}] = {} vs exp(Xβ̂+Zb̂) = {mu}",
+            f.fitted[i]
+        );
+    }
 }
 
 /// Task 6: weighted sparse Gaussian LMM. `parity/manifest.json` has no
@@ -4407,6 +4453,16 @@ fn fit_sparse_lmm_weighted_matches_lme4() {
         "deviance {} vs lme4-derived {expected}",
         f.deviance
     );
+    // loglik = −REMLcrit/2 (weighted REML criterion on the logLik scale,
+    // mirrors the dense weighted golden's loglik gate).
+    assert!(
+        (f.loglik - (-REF_REMLCRIT / 2.0)).abs() < 1e-3,
+        "loglik {} vs lme4 {}",
+        f.loglik,
+        -REF_REMLCRIT / 2.0
+    );
+    assert!(f.reml);
+    assert_eq!(f.df, 3 + 4 + 1); // 3 β + (g1 scalar + g2 q=2 vech) θ + σ²
 
     // Natural design has 15 g2 levels (< TAIL_SPARSE_MIN) ⇒ this golden takes
     // the dense tail. Force the sparse (AMD-ordered) tail on the SAME fit to

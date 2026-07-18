@@ -177,7 +177,7 @@ pub fn sigmoid_stable(eta: f64) -> f64 {
 /// `deviance_null` matches R's `glm(family=binomial)$null.deviance` (see
 /// `glm_deviance_null_golden_value`); no external oracle validates the full
 /// β̂/deviance path yet.
-#[allow(clippy::too_many_arguments)] // marshals (family, nb_theta, x, y, target_indices, beta_start, prior_w, scratch)
+#[allow(clippy::too_many_arguments)] // marshals (family, nb_theta, x, y, target_indices, beta_start, prior_w, offset, scratch)
 pub fn glm_irls_fit<'a>(
     family: Family,
     nb_theta: f64,
@@ -186,6 +186,11 @@ pub fn glm_irls_fit<'a>(
     target_indices: &[u32],
     beta_start: Option<&[f64]>,
     prior_w: Option<&[f64]>,
+    // Per-row additive linear-predictor offset `oᵢ` (R `glm(offset=)`): the
+    // carried η is `o + Xβ` throughout, and the WLS solve regresses `z − o` on
+    // X (β must not absorb the offset). `None` leaves every loop structurally
+    // unchanged — byte-identity for offset-free fits.
+    offset: Option<&[f64]>,
     scratch: GlmScratch<'a>,
 ) -> GlmFitView<'a> {
     let n = x.nrows();
@@ -313,6 +318,12 @@ pub fn glm_irls_fit<'a>(
                     irls_eta[i] += x[(i, j)] * b_j;
                 }
             }
+            // η = o + Xβ₀ — mirrors the accept-step recompute below; change together.
+            if let Some(o) = offset {
+                for i in 0..n {
+                    irls_eta[i] += o[i];
+                }
+            }
         }
         // Cold start: β ← 0 with a family-specific η seed. Logit keeps η = 0
         // (μ=0.5, bit-identical to the pre-warm-start behavior). The Gamma
@@ -400,6 +411,13 @@ pub fn glm_irls_fit<'a>(
                     yeta += yi * irls_eta[i];
                     irls_z[i] = irls_eta[i] + (yi - irls_p[i]) / irls_w[i];
                 }
+                // z − o: the WLS below solves β from X alone, so the offset's
+                // fixed contribution must leave the working response.
+                if let Some(o) = offset {
+                    for i in 0..n {
+                        irls_z[i] -= o[i];
+                    }
+                }
                 2.0 * (lp_sum - yeta)
             }
             other => {
@@ -420,6 +438,12 @@ pub fn glm_irls_fit<'a>(
                     irls_w[i] = (pw * w_raw).max(WEIGHT_CLAMP);
                     irls_z[i] = e + r;
                     dev += pw * crate::family::dev_resid(other, nb_theta, y[i], mu);
+                }
+                // z − o (see the logit arm) — the offset is not β's to fit.
+                if let Some(o) = offset {
+                    for i in 0..n {
+                        irls_z[i] -= o[i];
+                    }
                 }
                 dev
             }
@@ -534,6 +558,14 @@ pub fn glm_irls_fit<'a>(
             let b_j = irls_betas[j];
             for i in 0..n {
                 irls_eta[i] += x[(i, j)] * b_j;
+            }
+        }
+        // η = o + Xβ — mirrors the truth-start seed; change together. (Cold
+        // seeds deliberately omit o, like R's η₀ = link(mustart): the seed is
+        // a start, not a fixpoint constraint; consistency begins at iter 1.)
+        if let Some(o) = offset {
+            for i in 0..n {
+                irls_eta[i] += o[i];
             }
         }
 
@@ -718,6 +750,7 @@ mod tests {
             &targets,
             None,
             None,
+            None,
             glm_scratch(&mut ws),
         );
         assert!(!fit.converged);
@@ -744,6 +777,7 @@ mod tests {
             x.as_ref(),
             &y,
             &targets,
+            None,
             None,
             None,
             glm_scratch(&mut ws),
@@ -776,6 +810,7 @@ mod tests {
             x.as_ref(),
             &y,
             &targets,
+            None,
             None,
             None,
             glm_scratch(&mut ws),
@@ -812,6 +847,7 @@ mod tests {
             &targets,
             None,
             None,
+            None,
             glm_scratch(&mut ws),
         );
         assert!(!fit.converged);
@@ -841,6 +877,7 @@ mod tests {
             x.as_ref(),
             &y,
             &targets,
+            None,
             None,
             None,
             glm_scratch(&mut ws),
@@ -880,6 +917,7 @@ mod tests {
             x.as_ref(),
             &y,
             &targets,
+            None,
             None,
             None,
             glm_scratch(&mut ws),
@@ -928,6 +966,7 @@ mod tests {
             x.as_ref(),
             &y,
             &targets,
+            None,
             None,
             None,
             glm_scratch(&mut ws),
@@ -996,6 +1035,7 @@ mod tests {
             &targets,
             None,
             Some(&w),
+            None,
             glm_scratch(&mut ws),
         );
         assert!(fit.converged, "weighted gamma GLM must converge");

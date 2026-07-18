@@ -3,7 +3,7 @@ name = "parity"
 # Lockstep with the crate: must equal GLMM/Cargo.toml [package] version.
 # fit.rs stamps CARGO_PKG_VERSION into each result JSON's engine_version, and
 # after the move that macro reads THIS manifest, not glmm's.
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

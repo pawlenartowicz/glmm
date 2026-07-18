@@ -412,6 +412,88 @@ fn fit_exposes_n_eval_deviance_singular() {
         "deviance {} vs lme4-derived {expected}",
         f.deviance
     );
+    // Fit.loglik must invert that stripped constant back to lme4's logLik —
+    // the REML criterion on the logLik scale (reml flags it as such).
+    assert!(
+        (f.loglik - lme4_loglik).abs() < 1e-6,
+        "loglik {} vs lme4 {lme4_loglik}",
+        f.loglik
+    );
+    assert!(f.reml, "Gaussian LMM loglik is the REML criterion");
+    assert_eq!(f.df, 6); // 2 β + 3 θ (q=2 vech) + σ²
+}
+
+/// Dense LMM with a per-row offset — the identity-link `y − o` shift — vs R
+/// `lmer(offset=)`: sleepstudy random-slope with `o_i = 5·((i−1) mod 4)`
+/// (0-based CSV row order in Rust). Oracle (R 4.5.3, lme4 1.1-38):
+///   fl <- lmer(Reaction ~ Days + (Days | Subject), data = ss, offset = ol)
+///   print(fixef(fl), digits = 15); print(REMLcrit(fl), digits = 15)
+///   print(logLik(fl), digits = 15)
+#[test]
+fn fit_lmm_offset_matches_lme4() {
+    const REF_BETA: [f64; 2] = [244.5869230303025, 10.3157708080802];
+    const REF_REMLCRIT: f64 = 1756.8758930064;
+    const REF_LOGLIK: f64 = -878.437946503201;
+    let csv = include_str!("../../parity/data_empirical/sleepstudy.csv");
+    let mut y = Vec::<f64>::new();
+    let mut days = Vec::<f64>::new();
+    let mut subj_raw = Vec::<String>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap()); // Reaction
+        days.push(f[1].parse().unwrap()); // Days
+        subj_raw.push(f[2].to_string()); // Subject
+    }
+    let n = y.len();
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = days[i];
+    }
+    let (subject, _n_subj) = dense_str(&subj_raw);
+    let o: Vec<f64> = (0..n).map(|i| 5.0 * (i % 4) as f64).collect();
+
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — data path derives it
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: subject,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1],
+            offset: Some(o),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged, "offset LMM must converge");
+    for (j, (&b, &r)) in f.beta.iter().zip(&REF_BETA).enumerate() {
+        assert!((b - r).abs() / r.abs() < 1e-3, "β[{j}] = {b} vs lme4 {r}");
+    }
+    let df = (n - p) as f64;
+    let expected = REF_REMLCRIT - df * (1.0 + (2.0 * std::f64::consts::PI).ln());
+    assert!(
+        (f.deviance - expected).abs() < 1e-6,
+        "deviance {} vs lme4-derived {expected}",
+        f.deviance
+    );
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-6,
+        "loglik {} vs lme4 {REF_LOGLIK}",
+        f.loglik
+    );
 }
 
 /// Task 5: weighted dense LMM REML — sleepstudy random-slope fit with
@@ -542,6 +624,15 @@ fn fit_lmm_weighted_matches_lme4() {
         "deviance {} vs lme4-derived {expected}",
         f.deviance
     );
+    // loglik = −REMLcrit/2 under weights — pins that the −Σlog wᵢ correction
+    // lands INSIDE the criterion the loglik reports (lme4's weighted logLik).
+    assert!(
+        (f.loglik - (-REF_REMLCRIT / 2.0)).abs() < 1e-6,
+        "weighted loglik {} vs lme4 {}",
+        f.loglik,
+        -REF_REMLCRIT / 2.0
+    );
+    assert!(f.reml);
 
     // σ̂ isn't exposed on `Fit` for q≥2 RE (tau2 only reproduces the (0,0)
     // diagonal, not the raw residual variance) — reconstruct via the same

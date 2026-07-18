@@ -25,6 +25,7 @@ dir.create(file.path(parity_dir, "data_simulated"), showWarnings = FALSE, recurs
 
 for (spec in manifest$datasets) {
   if (!identical(spec$source, "lme4") && !identical(spec$source, "nlme")) next  # sim rungs generated below
+  if (!is.null(spec$data)) next  # re-linked rung (cbpp_probit): reuses another rung's CSV, nothing to export
   data(list = spec$name, package = spec$source)
   df <- as.data.frame(get(spec$name))  # strips nlme's groupedData/formula/units attrs
 
@@ -625,3 +626,35 @@ make_binomial_slope2 <- function(n_g = 100, per = 12) {
 d_bs2 <- make_binomial_slope2()
 write.csv(d_bs2, file.path(parity_dir, "data_simulated", "sim_binomial_slope2.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_binomial_slope2", nrow(d_bs2), ncol(d_bs2)))
+
+# --- Rung 28: sim_poisson_offset -- Poisson GLMM with a known non-trivial
+# exposure offset (spec section 2, the offset= oracle rung). log_exposure is a
+# per-row LOG exposure (not a fixed effect column): glm(offset=)/glmer(offset=)
+# add it to the linear predictor with an implicit coefficient of 1, the classic
+# rate-model use ("y is a count over a varying exposure"). Own isolated seed
+# block appended at the end -- does not disturb any earlier dataset's draws.
+# per = 80 (not the sketch's 20): at per = 20 the slope's se_hessian gap vs
+# lme4 sits at 2-2.5e-3 REGARDLESS of seed (checked 7 seeds) -- confirmed by a
+# zero-offset control (same design, log_exposure forced to 0) that collapses
+# the gap to ~1e-5, so the wide, non-trivial offset column genuinely raises
+# the single-step-FD-vs-numDeriv noise floor here (the same method-floor
+# effect documented for TOL$stddev_se_rel), not a data-generation fluke. Also
+# not fixable by picking a lucky seed at per=20 -- the gap is seed-independent
+# to within a factor of 2. per=80 (n=2400) pushes the same gap down to
+# 6-8e-4 (checked 4 seeds), comfortably under se_hessian_rel=1e-3 with margin,
+# without touching the tolerance itself (RULE 0).
+set.seed(20260801)
+make_poisson_offset <- function(n_clust = 30, per = 80) {
+  n   <- n_clust * per
+  cl  <- rep(seq_len(n_clust), each = per)
+  x   <- rnorm(n)
+  exposure <- runif(n, 0.5, 5)
+  log_exposure <- log(exposure)
+  b_cluster <- rnorm(n_clust, sd = 0.5)[cl]
+  eta <- 0.3 + 0.5 * x + b_cluster + log_exposure
+  y   <- rpois(n, exp(eta))
+  data.frame(cluster = cl, x = x, log_exposure = log_exposure, y = y)
+}
+d_po <- make_poisson_offset()
+write.csv(d_po, file.path(parity_dir, "data_simulated", "sim_poisson_offset.csv"), row.names = FALSE)
+cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_poisson_offset", nrow(d_po), ncol(d_po)))

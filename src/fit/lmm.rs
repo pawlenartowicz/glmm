@@ -101,6 +101,8 @@ pub(super) fn fit_lmm_into(
         nan_vcov(p)
     };
 
+    let n_rows = ws.suff.n_rows;
+    let n_theta = ws.theta.len();
     let mut fit = Fit {
         beta,
         se,
@@ -116,6 +118,17 @@ pub(super) fn fit_lmm_into(
         n_eval: lmm_fit.n_eval,
         deviance: lmm_fit.deviance,
         singular: lmm_fit.boundary_hit == 1,
+        // REML criterion on the logLik scale. Weights-agnostic like `deviance`:
+        // callers that support `weights=` recompute this after their −Σlog wᵢ
+        // deviance correction (`fit_mle` / `refit_lmm` — change together).
+        loglik: super::common::lmm_loglik(lmm_fit.deviance, n_rows, p),
+        df: if has_endpoint { p + n_theta + 1 } else { 0 },
+        reml: true,
+        // No per-row means exist on this path (pure sufficient-statistics fit);
+        // LMM fitted/ranef land together with the conditional-mode recovery.
+        fitted: vec![],
+        ranef: vec![],
+        ranef_levels: vec![],
     };
     fit.singular = fit.singular || fit.has_negligible_component();
     fit
@@ -152,10 +165,21 @@ pub(super) fn fit_mle(
 
     // Build workspace — allocates solver, suff-stats, fit scratch for this model shape
     let mut ws = LmmWorkspace::for_cluster_spec_ext(p, model, n, &slope_cols, &extra_slope_cols);
+    // Identity-link offset is an exact y-shift before accumulation (the suff
+    // stats are the only place raw y enters) — mirrors `fit_ols` / the sparse
+    // `fit_mle_sparse`; change together.
+    let y_shifted: Vec<f64>;
+    let y_eff: &[f64] = match &opts.offset {
+        Some(o) => {
+            y_shifted = y.iter().zip(o).map(|(&yi, &oi)| yi - oi).collect();
+            &y_shifted
+        }
+        None => y,
+    };
     accumulate_lmm_rows(
         &mut ws,
         x,
-        y,
+        y_eff,
         n,
         p,
         cluster_ids,
@@ -173,6 +197,9 @@ pub(super) fn fit_mle(
     // weights slice, which the workspace doesn't retain past accumulation.
     if let Some(w) = &opts.weights {
         fit.deviance -= w.iter().map(|v| v.ln()).sum::<f64>();
+        // The correction is part of lme4's REMLcrit, so the criterion-scale
+        // loglik must be recomputed from the corrected deviance.
+        fit.loglik = super::common::lmm_loglik(fit.deviance, n, p);
     }
     fit
 }

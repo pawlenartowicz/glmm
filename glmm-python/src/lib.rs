@@ -36,6 +36,12 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     d.set_item("names", r.names)?;
     d.set_item("re_groups", r.re_groups)?;
     d.set_item("agq_warning", r.agq_warning)?;
+    d.set_item("loglik", r.loglik)?;
+    d.set_item("df", r.df)?;
+    d.set_item("reml", r.reml)?;
+    d.set_item("fitted", r.fitted)?;
+    d.set_item("ranef", r.ranef)?;
+    d.set_item("ranef_levels", r.ranef_levels)?;
     Ok(d)
 }
 
@@ -43,7 +49,7 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
 #[pyfunction]
 #[pyo3(signature = (
     formula, numeric_columns, factor_columns, family, link, wald_se, nagq,
-    dispersion, weights, warm_start,
+    dispersion, weights, offset, warm_start,
 ))]
 fn fit<'py>(
     py: Python<'py>,
@@ -59,6 +65,7 @@ fn fit<'py>(
     nagq: u8,
     dispersion: Option<f64>,
     weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
     warm_start: Option<(Vec<f64>, Vec<f64>)>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = orchestrate::run_fit(
@@ -71,6 +78,7 @@ fn fit<'py>(
         nagq,
         dispersion,
         weights,
+        offset,
         warm_start,
     )
     .map_err(PyValueError::new_err)?;

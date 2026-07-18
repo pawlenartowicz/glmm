@@ -296,8 +296,13 @@ fastglmm <- function(formula, data, family = gaussian(),
 
   if (!is.null(r$agq_warning)) warning(r$agq_warning, call. = FALSE)
   if (r$singular) {
-    # lme4's exact text (cross-port agreement, spec section 5).
-    warning("boundary (singular) fit: see help('isSingular')", call. = FALSE)
+    # lme4's exact text (cross-port agreement, spec section 5), extended with
+    # the degenerate components. The Python port emits the same message
+    # (glmm/__init__.py) - change together.
+    warning(paste(c("boundary (singular) fit: see help('isSingular')",
+                    .singular_detail(r$varcorr, r$re_group_names,
+                                     r$re_group_terms)),
+                  collapse = "; "), call. = FALSE)
   }
 
   p <- length(r$beta)
@@ -335,6 +340,38 @@ fastglmm <- function(formula, data, family = gaussian(),
     # (with the warning surfaced above), so record what actually ran.
     nAGQ = if (is.null(r$agq_warning)) nAGQ else 1L
   ), class = "fastglmm")
+}
+
+# Names of the exactly-degenerate RE components, for the singular warning:
+# "sd(term | group) = 0" per collapsed variance, "corr(a, b | group) = +/-1"
+# per degenerate correlation. Exact comparisons are safe because the kernel
+# pins boundary components to exact 0 / +/-1 (algorithms-lmm.md "Boundary
+# handling"); character(0) when only the relative-tolerance singular check
+# fired, which keeps the bare lme4 text.
+.singular_detail <- function(varcorr, group_names, group_terms) {
+  parts <- character()
+  for (g in seq_along(varcorr)) {
+    sc <- .stddev_corr(varcorr[[g]])
+    terms <- group_terms[[g]]
+    grp <- group_names[[g]]
+    for (i in which(sc$stddev == 0)) {
+      parts <- c(parts, sprintf("sd(%s | %s) = 0", terms[[i]], grp))
+    }
+    q <- length(sc$stddev)
+    if (q > 1L) {
+      for (cc in 1:(q - 1L)) {
+        for (rr in (cc + 1L):q) {
+          if (sc$stddev[cc] > 0 && sc$stddev[rr] > 0 &&
+              abs(sc$correlation[rr, cc]) == 1) {
+            parts <- c(parts, sprintf("corr(%s, %s | %s) = %+d", terms[[cc]],
+                                      terms[[rr]], grp,
+                                      as.integer(sc$correlation[rr, cc])))
+          }
+        }
+      }
+    }
+  }
+  parts
 }
 
 # `...` exists only to intercept known lme4 arguments with designed errors

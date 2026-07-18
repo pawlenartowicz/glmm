@@ -265,8 +265,9 @@ The single `se` above is a **gaussian (LMM) rung** — its SE is profiled, one m
 **`se_hessian`** (keeps the θ–β coupling) and **`se_rx`** (conditional on θ̂, drops it);
 MixedModels computes only `se_rx`, so its GLMM files carry that field alone. This is what
 lets `compare.R` measure like method against like (see Tolerances). glmm emits both (via
-`WaldSe::{Hessian, Rx}`) but **no `loglik`** — its `Fit` does not expose one yet, so that
-column is shown `n/a` for glmm and left ungated until it does.
+`WaldSe::{Hessian, Rx}`) and now also `loglik`/`df` (`Fit::loglik`/`Fit::df`), gated at the
+same `loglik_abs_lmm`/`loglik_abs_glmm` bands as lme4/MixedModels, and at `TOL$port_rel`
+against the Python port (the R port omits it — `fastglmm` does not surface `loglik` yet).
 
 Both fit scripts normalize the careful bits to one representation: **`varcomp`** to
 the absolute σ scale (lme4 reports variances, MixedModels σ-relative θ); **`loglik`**

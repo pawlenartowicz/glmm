@@ -30,7 +30,7 @@ and `rustc >= 1.85` on the `PATH`):
 install.packages(".", repos = NULL, type = "source")
 ```
 
-or, once the first `r-*` tag has built, from r-universe:
+or from r-universe:
 
 ```r
 install.packages("fastglmm",

@@ -353,7 +353,18 @@ main <- function() {
     names <- strsplit(only, ",", fixed = TRUE)[[1]]
     function(ds) ds %in% names
   }
-  for (spec in manifest$datasets) if (want(spec$name)) fit_one(spec)
+  for (spec in manifest$datasets) {
+    if (!want(spec$name)) next
+    # fastglmm() rejects offset= outright (R/fastglmm.R: "the kernel has no
+    # offset field" -- not yet wired into the R package), mirroring how
+    # fit.jl skips a rung it structurally cannot fit. Print a skip note
+    # rather than erroring the whole port run.
+    if (!is.null(spec[["offset"]])) {
+      cat(sprintf("glmm_r   %-12s  SKIPPED -- fastglmm has no offset= support\n", spec$name))
+      next
+    }
+    fit_one(spec)
+  }
 }
 
 main()

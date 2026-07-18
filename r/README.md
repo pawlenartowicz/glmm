@@ -4,7 +4,7 @@ R bindings for the [`glmm`](https://github.com/pawlenartowicz/glmm) Rust
 kernel: OLS, GLM (binomial, Poisson, Gamma, negative binomial), REML linear
 mixed models, and binomial/Poisson GLMMs with Laplace or adaptive
 Gauss-Hermite quadrature. lme4-style formulas, estimates validated against
-lme4 and MixedModels.jl.
+lme4 and MixedModels.jl (see [`validation.md`](../documentation/validation.md)).
 
 Deliberately scoped to **fast fitting**: fixed effects, Wald standard errors,
 and variance components on the SD/correlation scale. Anything the engine
@@ -57,10 +57,12 @@ The formula is parsed by the same Rust parser the Python port uses: bare
 column names, `+`, `:`, `*`, `A/B` nesting, and `(1 + x | g)` random effects
 with a full correlation structure. Not accepted (each is a clear error with a
 workaround): `log(x)`/`I()`/`poly()` (compute the column first),
-`cbind(s, f)` (pass the proportion as response and trials as `weights=`),
-`- 1`/`0 +`, `(x || g)`, `offset()`, `.`, and `contrasts=` (relevel the
-factor instead). R's `Gamma()` object means `link = "inverse"` (R semantics
-win); the string `"gamma"` means the glmm default `link = "log"`.
+`cbind(s, f)` (pass the proportion as response and trials as `weights=`), and
+`- 1`/`0 +` (not available; the model always carries an intercept) — full
+list and workarounds in
+[`formula.md`](../documentation/formula.md). R's `Gamma()` object means
+`link = "inverse"` (R semantics win); the string `"gamma"` means the glmm
+default `link = "log"`.
 
 ## Development
 

@@ -51,13 +51,23 @@ pub(super) fn fit_ols(x: &[f64], y: &[f64], n: usize, p: usize, opts: &FitOption
             x_mat[(i, j)] = s * x[i * p + j];
         }
     }
+    // Identity-link offset is an exact y-shift: fit on y − o, report means as
+    // o + Xβ̂ below. Applied BEFORE the √wᵢ scaling so weighting composes.
+    let y_shifted: Vec<f64>;
+    let y_base: &[f64] = match &opts.offset {
+        Some(o) => {
+            y_shifted = y.iter().zip(o).map(|(&yi, &oi)| yi - oi).collect();
+            &y_shifted
+        }
+        None => y,
+    };
     let y_scaled: Vec<f64>;
     let y_eff: &[f64] = match &sqrt_w {
         Some(sw) => {
-            y_scaled = y.iter().zip(sw).map(|(&yi, &s)| yi * s).collect();
+            y_scaled = y_base.iter().zip(sw).map(|(&yi, &s)| yi * s).collect();
             &y_scaled
         }
-        None => y,
+        None => y_base,
     };
 
     {
@@ -112,6 +122,34 @@ pub(super) fn fit_ols(x: &[f64], y: &[f64], n: usize, p: usize, opts: &FitOption
         nan_vcov(p)
     };
 
+    // Fitted means Xβ̂ (raw rows — the √wᵢ scaling above is a solver device,
+    // not part of the mean) and the ML Gaussian log-likelihood off the weighted
+    // RSS, R `logLik.lm`: ½(Σlog wᵢ − n(ln 2π + 1 − ln n + ln Σwᵢrᵢ²)).
+    let (fitted, loglik) = if converged && n > 0 {
+        let fitted: Vec<f64> = (0..n)
+            .map(|i| {
+                let o = opts.offset.as_ref().map_or(0.0, |o| o[i]);
+                o + (0..p).map(|j| x[i * p + j] * beta[j]).sum::<f64>()
+            })
+            .collect();
+        let rss: f64 = (0..n)
+            .map(|i| {
+                let r = y[i] - fitted[i];
+                opts.weights.as_ref().map_or(1.0, |w| w[i]) * r * r
+            })
+            .sum();
+        let sum_log_w = opts
+            .weights
+            .as_ref()
+            .map_or(0.0, |w| w.iter().map(|v| v.ln()).sum());
+        let nf = n as f64;
+        let ll =
+            0.5 * (sum_log_w - nf * ((2.0 * std::f64::consts::PI).ln() + 1.0 - nf.ln() + rss.ln()));
+        (fitted, ll)
+    } else {
+        (vec![], f64::NAN)
+    };
+
     Fit {
         beta,
         se,
@@ -126,5 +164,12 @@ pub(super) fn fit_ols(x: &[f64], y: &[f64], n: usize, p: usize, opts: &FitOption
         n_eval: 0,
         deviance: f64::NAN,
         singular: false,
+        loglik,
+        // p fixed effects + σ² (R logLik.lm's df).
+        df: if converged { p + 1 } else { 0 },
+        reml: false,
+        fitted,
+        ranef: vec![],
+        ranef_levels: vec![],
     }
 }

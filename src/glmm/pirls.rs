@@ -32,17 +32,31 @@ pub(crate) enum BetaStep<'a> {
     },
 }
 
-/// Refill `eta_fixed[i] = Σ_j x[i,j]·β[j]` (the fixed-effect linear predictor).
-/// Called once at entry of `pirls_solve` and, in `BetaStep::Profile`, after every
-/// β update (the accepted δβ step and each β halving) — the trial evaluation at
-/// the top of the loop reads `eta_fixed`, so it must track the current β.
-fn refresh_eta_fixed(x: MatRef<f64>, beta: &[f64], eta_fixed: &mut [f64], n: usize, p: usize) {
+/// Refill `eta_fixed[i] = offset[i] + Σ_j x[i,j]·β[j]` (the fixed-effect linear
+/// predictor). Called once at entry of `pirls_solve` and, in `BetaStep::Profile`,
+/// after every β update (the accepted δβ step and each β halving) — the trial
+/// evaluation at the top of the loop reads `eta_fixed`, so it must track the
+/// current β. `offset` is `FitOptions::offset` (`None` ⇒ this function is
+/// byte-identical to the pre-offset version).
+fn refresh_eta_fixed(
+    x: MatRef<f64>,
+    beta: &[f64],
+    eta_fixed: &mut [f64],
+    n: usize,
+    p: usize,
+    offset: Option<&[f64]>,
+) {
     for i in 0..n {
         let mut e = 0.0;
         for j in 0..p {
             e += x[(i, j)] * beta[j];
         }
         eta_fixed[i] = e;
+    }
+    if let Some(o) = offset {
+        for i in 0..n {
+            eta_fixed[i] += o[i];
+        }
     }
 }
 
@@ -122,6 +136,9 @@ pub(crate) fn pirls_solve(
     // `.llt(Side::Lower)` per-PIRLS-iteration heap allocation on this hot RE-block
     // solve.
     a_llt_mem: &mut MemBuffer,
+    // Per-row linear-predictor offset (`FitOptions::offset`), added into
+    // `eta_fixed` by every `refresh_eta_fixed` call. `None` ⇒ no offset.
+    offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,
     n: usize,
 ) -> (f64, f64, f64, bool) {
@@ -133,7 +150,7 @@ pub(crate) fn pirls_solve(
     // η_fixed,ᵢ = Σ_j x[i,j]·β[j]. In Fixed mode β is invariant across iterations
     // so this once-at-entry fill stands for the whole solve; in Profile mode the
     // δβ step re-fills it after every β update (below), hence the shared helper.
-    refresh_eta_fixed(x, beta, eta_fixed, n, p);
+    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
     let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
@@ -225,7 +242,7 @@ pub(crate) fn pirls_solve(
                     for j in 0..p {
                         beta[j] = 0.5 * (beta[j] + beta_prev[j]);
                     }
-                    refresh_eta_fixed(x, beta, eta_fixed, n, p);
+                    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
                 }
                 continue;
             }
@@ -462,7 +479,7 @@ pub(crate) fn pirls_solve(
             }
             // η_fixed depends on β; refresh it for the next trial evaluation. `pen`
             // must track the moved u (‖u_joint‖²), so recompute it.
-            refresh_eta_fixed(x, beta, eta_fixed, n, p);
+            refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
             pen = 0.0;
             #[allow(clippy::needless_range_loop)]
             for c in 0..k {
@@ -548,6 +565,9 @@ pub(crate) fn pirls_solve_blocked(
     // (mirrors `pirls_solve`'s `wx`; this variant has no dense M so there is no
     // `wm` twin here — B' = X'WM is filled by cluster-scatter instead).
     wx: &mut Mat<f64>,
+    // Per-row linear-predictor offset (`FitOptions::offset`), added into
+    // `eta_fixed` below and by every `refresh_eta_fixed` call. `None` ⇒ no offset.
+    offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,
     n: usize,
 ) -> (f64, f64, f64, bool) {
@@ -562,6 +582,11 @@ pub(crate) fn pirls_solve_blocked(
             e += x[(i, j)] * beta[j];
         }
         eta_fixed[i] = e;
+    }
+    if let Some(o) = offset {
+        for i in 0..n {
+            eta_fixed[i] += o[i];
+        }
     }
     // M = ZΛ_p (mᵢ = Λ_p'·zᵢ, zᵢ = [1, x[i, slope_cols]] pre-widened into z_buf
     // per fit) is invariant within one solve — Λ and x are fixed; the iteration
@@ -666,7 +691,7 @@ pub(crate) fn pirls_solve_blocked(
                     for j in 0..p {
                         beta[j] = 0.5 * (beta[j] + beta_prev[j]);
                     }
-                    refresh_eta_fixed(x, beta, eta_fixed, n, p);
+                    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
                 }
                 continue;
             }
@@ -904,7 +929,7 @@ pub(crate) fn pirls_solve_blocked(
             }
             // η_fixed depends on β; refresh for the next trial. `pen` must track the
             // moved u (‖u_joint‖²), so recompute it.
-            refresh_eta_fixed(x, beta, eta_fixed, n, p);
+            refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
             pen = 0.0;
             #[allow(clippy::needless_range_loop)]
             for c in 0..k {
@@ -1360,6 +1385,9 @@ pub(crate) fn pirls_solve_blocked_extras(
     // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
     // (mirrors `pirls_solve`'s `wx`).
     wx: &mut Mat<f64>,
+    // Per-row linear-predictor offset (`FitOptions::offset`), added into
+    // `eta_fixed` below and by every `refresh_eta_fixed` call. `None` ⇒ no offset.
+    offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,
     n: usize,
 ) -> (f64, f64, f64, bool) {
@@ -1390,6 +1418,11 @@ pub(crate) fn pirls_solve_blocked_extras(
             ef += x[(i, j)] * beta[j];
         }
         eta_fixed[i] = ef;
+    }
+    if let Some(o) = offset {
+        for i in 0..n {
+            eta_fixed[i] += o[i];
+        }
     }
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
     let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
@@ -1479,7 +1512,7 @@ pub(crate) fn pirls_solve_blocked_extras(
                     for j in 0..p {
                         beta[j] = 0.5 * (beta[j] + beta_prev[j]);
                     }
-                    refresh_eta_fixed(x, beta, eta_fixed, n, p);
+                    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
                 }
                 continue;
             }
@@ -1807,7 +1840,7 @@ pub(crate) fn pirls_solve_blocked_extras(
             }
             // η_fixed depends on β; refresh for the next trial. `pen` must track the
             // moved u (‖u_joint‖²), so recompute it.
-            refresh_eta_fixed(x, beta, eta_fixed, n, p);
+            refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
             pen = 0.0;
             #[allow(clippy::needless_range_loop)]
             for c in 0..k {

@@ -157,6 +157,63 @@ pub struct Fit {
     /// not accepted onto the boundary, so it never sets this flag even when
     /// its diagonals are near zero.
     pub singular: bool,
+    /// The actual log-likelihood at the fitted parameters — `deviance` with its
+    /// dropped data-only constants restored, on the `logLik()` scale (R/lme4):
+    ///
+    /// - **OLS/GLM** — the standard closed forms (R `logLik.lm`/`logLik.glm`,
+    ///   `MASS::glm.nb`), including under prior weights.
+    /// - **LMM** — the **REML criterion** `−REMLcrit/2` (this path is
+    ///   REML-only): `−½(deviance + (n−p)·(1 + ln 2π))`. REML criteria are
+    ///   comparable only between models with IDENTICAL fixed effects — an
+    ///   AIC/LRT across different fixed parts is meaningless; check [`Fit::reml`]
+    ///   before comparing. Matches `lme4::logLik` on a `REML=TRUE` fit.
+    /// - **GLMM** — the marginal Laplace/AGQ log-likelihood:
+    ///   `−½·deviance + saturated_loglik` (binomial/Poisson/NB, see
+    ///   `family::saturated_loglik`), `−½·deviance` for Gamma (lme4's
+    ///   `logLik(glmer)` is `−devfun/2` verbatim, `gamma_aic`'s `+2`
+    ///   included — see `fit::common::glmm_loglik`). Matches `lme4::logLik`
+    ///   on the same fit, including the aggregated-binomial `cbind(s, m−s)`
+    ///   form under `weights=`.
+    ///
+    /// NaN wherever `deviance`'s failure modes apply (non-converged/degenerate
+    /// fits); finite on an LMM `MaxFunReached` endpoint, like `deviance`.
+    /// `AIC = 2·df − 2·loglik`, `BIC = df·ln(n) − 2·loglik` with [`Fit::df`].
+    pub loglik: f64,
+    /// Parameters counted for AIC/BIC: retained fixed effects (`p` minus
+    /// aliased columns, matching lme4's NA-coefficient handling) + `n_theta`
+    /// RE parameters + 1 if the family estimates a dispersion/scale (Gaussian
+    /// σ², Gamma φ unless held fixed via [`FitOptions::dispersion`], NB θ).
+    /// 0 on degenerate NaN-fill paths.
+    pub df: usize,
+    /// `true` iff `loglik` is a REML criterion (the Gaussian LMM paths — REML
+    /// is this engine's locked LMM objective) rather than an ML log-likelihood.
+    /// Model comparisons (AIC/LRT) across fits with different fixed effects are
+    /// invalid when this is set — mirror of lme4's REML-fit `anova` warning.
+    pub reml: bool,
+    /// Fitted means μ̂ per row (length `n`): the conditional means through the
+    /// inverse link — `g⁻¹(Xβ̂ + Zb̂)` for mixed fits (lme4 `fitted()`),
+    /// `g⁻¹(Xβ̂)` for fixed-only. Empty on non-converged fits and on the
+    /// Gaussian LMM paths (dense and sparse), which fit via sufficient
+    /// statistics and never materialize per-row means — an LMM `fitted` needs
+    /// the conditional modes first and lands with them.
+    pub fitted: Vec<f64>,
+    /// Random-effect conditional modes `b̂ = Λ̂û` on the natural (link) scale —
+    /// lme4's `ranef()` values. One block per grouping in declaration order
+    /// (primary, then each extra — same order as `varcorr`), each block
+    /// level-major: level `l`'s `q` values (intercept, then slopes in
+    /// declaration order) at `[l·q .. (l+1)·q]`. `η̂ = Xβ̂ + Zb̂` reproduces the
+    /// linear predictor behind `fitted`. Level counts per grouping are in
+    /// [`Fit::ranef_levels`]; `q` per grouping is recoverable from `varcorr`
+    /// (vech length). For a nested grouping the block spans
+    /// `n_parents·n_per_parent` slots (child id = parent·n_per_parent +
+    /// within), padded with zero modes for parents with fewer observed
+    /// children. Empty on non-converged fits and on the Gaussian LMM paths
+    /// (see [`Fit::fitted`]).
+    pub ranef: Vec<f64>,
+    /// Level count per grouping for slicing [`Fit::ranef`], declaration order
+    /// (primary, then each extra). `ranef.len() = Σ_g levels[g]·q_g`. Empty
+    /// exactly when `ranef` is.
+    pub ranef_levels: Vec<usize>,
 }
 
 /// Relative tolerance for [`Fit::has_negligible_component`]: a converged
@@ -318,6 +375,17 @@ pub struct FitOptions {
     ///   `fit_sparse_lmm_weighted_matches_lme4` (lme4 `lmer`, sparse) and
     ///   `sparse_lmm_constant_weights_invariant`.
     pub weights: Option<Vec<f64>>,
+    /// Per-row additive offset `oᵢ` on the linear-predictor scale — R's
+    /// `offset=`: `η = o + Xβ (+ Zb)`, every family, every solver path. A fixed
+    /// known contribution, NOT a parameter: it adds no column to `X` and never
+    /// appears in `beta`/`se`/`vcov`/`df`. The canonical use is a Poisson
+    /// exposure, `offset = ln(exposure)`. `None` = no offset (byte-identical to
+    /// the pre-offset paths). Gaussian identity-link paths (OLS/LMM) implement
+    /// it as the exact `y − o` shift before the sufficient-statistics
+    /// accumulation; `Fit::fitted` still reports means on the original `y`
+    /// scale (μ̂ = o + Xβ̂ + Zb̂ through the link). Oracle: `glm(offset=)` /
+    /// `glmer(offset=)`.
+    pub offset: Option<Vec<f64>>,
     /// **Experimental.** Opt into the parallel inner-fit kernels (cluster-outer
     /// AGQ, per-`(i,j)` FD-Hessian grid) — live ONLY when built with the
     /// `parallel` Cargo feature on a non-`wasm32` target. The exclusion is
@@ -356,6 +424,7 @@ impl Default for FitOptions {
             nagq: 1,
             dispersion: None,
             weights: None,
+            offset: None,
             parallel_inner: false,
         }
     }
@@ -477,6 +546,14 @@ pub fn fit_warm(
         assert!(
             w.iter().all(|&v| v.is_finite() && v > 0.0),
             "FitOptions.weights must be finite and > 0"
+        );
+    }
+    // Offset: shape/finiteness check at the boundary, like weights above.
+    if let Some(o) = &opts.offset {
+        assert_eq!(o.len(), n, "FitOptions.offset must have n elements");
+        assert!(
+            o.iter().all(|&v| v.is_finite()),
+            "FitOptions.offset must be finite"
         );
     }
     // Rank-deficiency salvage: drop fixed-effect columns aliased on
@@ -657,7 +734,10 @@ pub(crate) fn classify_design_pub(model: &ModelSpec, nagq: u8) -> Solver {
 // feature's `crate::loop_advanced` re-exports the dev seam from here.
 // ---------------------------------------------------------------------------
 
-pub(crate) use common::{assemble_varcorr, nan_vcov, vcov_from_chol};
+pub(crate) use common::{
+    assemble_ranef_sparse, assemble_varcorr, glmm_loglik, lmm_loglik, model_df, nan_vcov,
+    ranef_level_counts, vcov_from_chol,
+};
 #[cfg(test)]
 pub(crate) use common::{assert_model_shape_pub, spec_sized_from_ids_pub};
 pub(crate) use glm::{golden_max_ln_theta, nb_profile_loglik};

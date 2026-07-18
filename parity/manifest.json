@@ -267,6 +267,17 @@
       "factors": ["g"],
       "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)",
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + (1 + x1 + x2 | g))"
+    },
+    {
+      "name": "sim_poisson_offset",
+      "rung": 28,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "factors": ["cluster"],
+      "offset": "log_exposure",
+      "r_formula": "y ~ 1 + x + (1 | cluster)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | cluster))"
     }
   ],
 

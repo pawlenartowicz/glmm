@@ -22,6 +22,12 @@ def make_fit(**kw):
         re_groups=[],
         n_eval=0,
         deviance=math.nan,
+        loglik=math.nan,
+        df=0,
+        reml=False,
+        fitted=np.array([]),
+        ranef=np.array([]),
+        ranef_levels=np.array([]),
     )
     base.update(kw)
     return glmm.Fit(**base)

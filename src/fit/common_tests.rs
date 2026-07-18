@@ -273,6 +273,12 @@ fn fit_with_varcorr(vech: Vec<f64>) -> Fit {
         n_eval: 0,
         deviance: f64::NAN,
         singular: false,
+        loglik: f64::NAN,
+        df: 0,
+        reml: false,
+        fitted: vec![],
+        ranef: vec![],
+        ranef_levels: vec![],
     }
 }
 

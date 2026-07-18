@@ -56,6 +56,7 @@ pub(crate) fn glm_warm_start_beta(
     y: &[f64],
     n: usize,
     p: usize,
+    offset: Option<&[f64]>,
 ) -> Vec<f64> {
     let (n1, p1) = (n.max(1), p.max(1));
     let mut irls_eta = vec![0.0f64; n1];
@@ -81,6 +82,7 @@ pub(crate) fn glm_warm_start_beta(
         &[],
         None,
         None,
+        offset,
         GlmScratch {
             irls_eta: &mut irls_eta,
             irls_p: &mut irls_p,
@@ -141,6 +143,7 @@ fn fit_glmm_build(
         ws.prior_w[..n].copy_from_slice(w);
         ws.weighted = true;
     }
+    ws.offset = opts.offset.clone();
 
     // --- convert row-major f64 input to column-major f64 faer matrix ---
     let x_mat = to_col_major(x, n, p);
@@ -161,6 +164,12 @@ fn fit_glmm_build(
                 n_eval: 0,
                 deviance: f64::NAN,
                 singular: false,
+                loglik: f64::NAN,
+                df: 0,
+                reml: false,
+                fitted: vec![],
+                ranef: vec![],
+                ranef_levels: vec![],
             },
             vec![],
             f64::INFINITY,
@@ -252,7 +261,15 @@ fn fit_glmm_prebuilt(
     // at the kernel's THETA0 blind start.
     let beta_start = match start {
         Some(s) => s.beta.clone(),
-        None => glm_warm_start_beta(model.family, nb_theta, x_mat, y, n, p),
+        None => glm_warm_start_beta(
+            model.family,
+            nb_theta,
+            x_mat,
+            y,
+            n,
+            p,
+            opts.offset.as_deref(),
+        ),
     };
     let glmm_fit = crate::glmm::fit_glmm(
         ws,
@@ -356,6 +373,33 @@ fn fit_glmm_prebuilt(
         .collect();
 
     let mu_hat = ws.prob[..n].to_vec();
+    // Diagnostics off the converged workspace state: μ̂ (the same conditional
+    // means the tuple returns), b̂ = Λ̂û from the spherical modes, and the
+    // marginal log-likelihood with the saturated constant restored.
+    let (fitted, ranef, ranef_levels) = if glmm_fit.converged {
+        (
+            mu_hat.clone(),
+            super::common::assemble_ranef_dense(
+                &ws.params[..n_theta],
+                &ws.groupings,
+                &ws.u[..ws.k],
+            ),
+            super::common::ranef_level_counts(&ws.groupings),
+        )
+    } else {
+        (vec![], vec![], vec![])
+    };
+    let loglik = super::common::glmm_loglik(
+        model.family,
+        nb_theta,
+        if glmm_fit.deviance.is_finite() {
+            glmm_fit.deviance
+        } else {
+            f64::NAN
+        },
+        &y[..n],
+        ws.weighted.then(|| &ws.prior_w[..n]),
+    );
     let mut fit = Fit {
         beta,
         se,
@@ -373,6 +417,16 @@ fn fit_glmm_prebuilt(
             f64::NAN
         },
         singular: glmm_fit.boundary_hit == 1,
+        loglik,
+        df: if glmm_fit.converged {
+            super::common::model_df(model.family, p, n_theta, opts.dispersion.is_some())
+        } else {
+            0
+        },
+        reml: false,
+        fitted,
+        ranef,
+        ranef_levels,
     };
     fit.singular = fit.singular || fit.has_negligible_component();
     (fit, mu_hat, glmm_fit.deviance)

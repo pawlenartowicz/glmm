@@ -59,6 +59,11 @@ function fit_thunk(spec, df)
     # kwarg, the counterpart of lme4's weights=. Distinct from the
     # aggregated-binomial `weights` field handled in the binomial branch.
     wcol = haskey(spec, :weights_col) ? Float64.(df[!, Symbol(spec.weights_col)]) : nothing
+    # Known per-row additive linear-predictor offset (manifest `offset` key,
+    # e.g. a log-exposure column) -- MixedModels' `offset=` kwarg on the
+    # GeneralizedLinearMixedModel constructor (confirmed supported since
+    # v3.4.1; GLMM only, not LMM). Mirrors wcol's plain named-column lookup.
+    ocol = haskey(spec, :offset) ? Float64.(df[!, Symbol(spec.offset)]) : nothing
     if fam == "gaussian"
         wcol === nothing ?
             (() -> fit(MixedModel, f, df; REML = spec.reml === true, progress = false)) :
@@ -81,9 +86,15 @@ function fit_thunk(spec, df)
             () -> fit(MixedModel, f, df, Binomial(), L; progress = false)
         end
     elseif fam == "poisson"
-        wcol === nothing ?
-            (() -> fit(MixedModel, f, df, Poisson(); progress = false)) :
-            (() -> fit(MixedModel, f, df, Poisson(); wts = wcol, progress = false))
+        if wcol === nothing && ocol === nothing
+            () -> fit(MixedModel, f, df, Poisson(); progress = false)
+        elseif ocol === nothing
+            () -> fit(MixedModel, f, df, Poisson(); wts = wcol, progress = false)
+        elseif wcol === nothing
+            () -> fit(MixedModel, f, df, Poisson(); offset = ocol, progress = false)
+        else
+            () -> fit(MixedModel, f, df, Poisson(); wts = wcol, offset = ocol, progress = false)
+        end
     elseif fam == "gamma"
         # Explicit LogLink: the manifest's gamma rungs pin link "log" (Gamma's
         # canonical inverse link is unstable on these designs, mirroring fit.R).

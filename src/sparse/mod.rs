@@ -83,8 +83,26 @@ pub(crate) fn fit_mle_sparse(
         .weights
         .as_ref()
         .map(|w| w.iter().map(|v| v.sqrt()).collect());
-    let mut ws =
-        SparseLmmWorkspace::new(&g, xm, cluster_ids, extra_ids, y, n, p, sqrt_w.as_deref());
+    // Identity-link offset as the exact y-shift before Gram accumulation —
+    // mirrors `fit_mle` (dense); change together.
+    let y_shifted: Vec<f64>;
+    let y_eff: &[f64] = match &opts.offset {
+        Some(o) => {
+            y_shifted = y.iter().zip(o).map(|(&yi, &oi)| yi - oi).collect();
+            &y_shifted
+        }
+        None => y,
+    };
+    let mut ws = SparseLmmWorkspace::new(
+        &g,
+        xm,
+        cluster_ids,
+        extra_ids,
+        y_eff,
+        n,
+        p,
+        sqrt_w.as_deref(),
+    );
 
     // θ seed + per-component boxes + solver — topology-only, byte-identical to the
     // NoZ path (the superset property depends on this).
@@ -166,6 +184,12 @@ pub(crate) fn fit_mle_sparse(
             n_eval: out.n_eval,
             deviance: f64::NAN,
             singular: false,
+            loglik: f64::NAN,
+            df: 0,
+            reml: true,
+            fitted: vec![],
+            ranef: vec![],
+            ranef_levels: vec![],
         };
     }
 
@@ -244,6 +268,15 @@ pub(crate) fn fit_mle_sparse(
         n_eval: out.n_eval,
         deviance: dev,
         singular: pinned,
+        // REML criterion off the weight-corrected deviance (mirrors `fit_mle`'s
+        // loglik; same suff-stats caveat — no per-row fitted/ranef on this path
+        // until the LMM conditional-mode recovery lands).
+        loglik: crate::fit::lmm_loglik(dev, n, p),
+        df: p + theta.len() + 1,
+        reml: true,
+        fitted: vec![],
+        ranef: vec![],
+        ranef_levels: vec![],
     };
     fit.singular = fit.singular || fit.has_negligible_component();
     fit

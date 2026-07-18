@@ -61,21 +61,31 @@ is_mixed <- function(spec) grepl("|", spec$r_formula, fixed = TRUE)
 # through the cbind() response, not a weights= argument.
 weights_of <- function(spec, df)
   if (is.null(spec$weights_col)) NULL else df[[spec$weights_col]]
+# Known per-row additive linear-predictor offset (the manifest `offset` key,
+# e.g. a log-exposure column) -- NULL = no offset, R's own default for every
+# rung without the key. Mirrors weights_of's plain named-column lookup.
+offset_of <- function(spec, df)
+  if (is.null(spec$offset)) NULL else df[[spec$offset]]
 
 fit_call <- function(spec, df) {
   fm <- as.formula(spec$r_formula)
   w <- weights_of(spec, df)
+  o <- offset_of(spec, df)
   if (!is_mixed(spec)) {
     return(switch(spec$family,
-      gaussian = function() lm(fm, data = df, weights = w),
-      binomial = function() glm(fm, family = binomial(), data = df, weights = w),
-      poisson  = function() glm(fm, family = poisson(), data = df, weights = w),
-      gamma    = function() glm(fm, family = Gamma(link = "log"), data = df, weights = w),
+      gaussian = function() lm(fm, data = df, weights = w, offset = o),
+      binomial = function() glm(fm, family = binomial(), data = df, weights = w, offset = o),
+      poisson  = function() glm(fm, family = poisson(), data = df, weights = w, offset = o),
+      gamma    = function() glm(fm, family = Gamma(link = "log"), data = df, weights = w, offset = o),
+      # glm.nb() has no offset= parameter (MASS forwards ... to glm.control,
+      # which errors on it, even NULL) -- an offset would need an offset()
+      # term inside the formula instead. No manifest rung is both negbin and
+      # offset-bearing, so this stays unsupported rather than guessed at.
       negbin   = function() MASS::glm.nb(fm, data = df, weights = w),
       stop("unsupported fixed-only family: ", spec$family)))
   }
   if (spec$family == "gaussian") {
-    function() lmer(fm, data = df, REML = isTRUE(spec$reml), weights = w)
+    function() lmer(fm, data = df, REML = isTRUE(spec$reml), weights = w, offset = o)
   } else {
     # `link` field: non-canonical link override (cbpp_probit). Absent = the
     # family's canonical link, the pre-existing behavior for every other rung.
@@ -104,7 +114,7 @@ fit_call <- function(spec, df) {
     # 1e-12 where 1e-12 is itself clean (1e-16 aborts in step-halving; stay above
     # lme4's numeric floor). This is a documented solver-precision setting, not a
     # spec change -- the model (formula/family/link/nAGQ) is untouched.
-    function() glmer(fm, data = df, family = fam, weights = w, nAGQ = 1,
+    function() glmer(fm, data = df, family = fam, weights = w, offset = o, nAGQ = 1,
                      control = glmerControl(tolPwrss = 1e-13))
   }
 }

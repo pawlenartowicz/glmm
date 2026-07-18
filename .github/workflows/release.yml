@@ -27,14 +27,14 @@ jobs:
   verify:
     uses: ./.github/workflows/ci.yml
 
-  # The three versions are lockstep-coupled but otherwise enforced only by a
+  # The four versions are lockstep-coupled but otherwise enforced only by a
   # comment in pyproject.toml. This makes drift a release-time failure.
   version-check:
-    name: Verify tag matches all three versions
+    name: Verify tag matches all four versions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check 3-way version lockstep
+      - name: Check 4-way version lockstep
         shell: bash
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
@@ -47,11 +47,13 @@ jobs:
           CRATE=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           PYCRATE=$(grep -m1 '^version = ' glmm-python/Cargo.toml | cut -d'"' -f2)
           PYPROJ=$(grep -m1 '^version = ' python/pyproject.toml | cut -d'"' -f2)
+          RDESC=$(grep -m1 '^Version: ' r/DESCRIPTION | cut -d' ' -f2)
           check "$CRATE" Cargo.toml
           check "$PYCRATE" glmm-python/Cargo.toml
           check "$PYPROJ" python/pyproject.toml
+          check "$RDESC" r/DESCRIPTION
           [ "$fail" = 0 ] || exit 1
-          echo "All three at $TAG."
+          echo "All four at $TAG."
 
   build_wheels:
     name: Build & test wheel (${{ matrix.target }} on ${{ matrix.os }})

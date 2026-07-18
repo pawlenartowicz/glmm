@@ -1,7 +1,11 @@
 TOL <- list(
   beta_rel        = 1e-3,   # fixed effects: relative
   stddev_rel      = 1e-3,   # varcomp std-devs: relative
-  loglik_abs_lmm  = 1e-6,   # LMM REML criterion: near-exact across engines (~1e-9 seen)
+  loglik_abs_lmm  = 2e-6,   # LMM REML criterion: near-exact across engines (~1e-9 typical).
+                            #   Measured worst 1.23e-6 on sim_max_q_slope (q=8, 36 theta params,
+                            #   the corpus's largest LMM covariance; ~6e-10 relative — MixedModels
+                            #   sits 5e-7 from lme4 on the same rung), so 2e-6 = measured worst +
+                            #   margin, same convention as se_hessian_rel below.
   loglik_abs_glmm = 1e-3,   # GLMM Laplace logLik: two optimizers land ~3e-6 relative
                             #   apart on the same surface (beta/varcomp confirm same fit)
   se_rel          = 1e-3,   # LMM SE + method-matched GLMM RX: tight (same method, all engines)

@@ -109,11 +109,12 @@ test_that("print and summary run and carry the honest header", {
   expect_true(any(grepl("groups: g, 60", sout)))
 })
 
-test_that("boundary fits warn with lme4's exact text and flag isSingular", {
+test_that("boundary fits warn with lme4's text plus the pinned component", {
   # tau0 = 0 data: the RE variance pins to the boundary.
   d <- benchmark_data(seed = 107, family = "binomial", tau0 = 1e-8)
   expect_warning(fit <- fastglmm(y ~ t + (1 | g), d, family = binomial()),
-                 "boundary \\(singular\\) fit: see help\\('isSingular'\\)")
+                 paste0("boundary \\(singular\\) fit: see help\\('isSingular'\\); ",
+                        "sd\\(\\(Intercept\\) \\| g\\) = 0"))
   expect_true(isSingular(fit))
 })
 
