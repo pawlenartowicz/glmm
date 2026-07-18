@@ -25,6 +25,9 @@ want_vendor=0
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)   # GLMM repo root
 out=$(pwd)
+# glmm's version — pins the `cargo package` output name and the glmm-r dep
+# below. Read from the manifest so a version bump needs no edit here.
+ver=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo/Cargo.toml" | head -1)
 stage="$repo/target/cran-stage"
 pkg="$stage/fastglmm"
 
@@ -39,7 +42,7 @@ mkdir -p "$local_dir"
 # glmm: `cargo package` resolves the workspace-inherited manifest fields and
 # prunes to the published file set — exactly the crates.io artifact.
 (cd "$repo" && cargo package -p glmm --no-verify --allow-dirty >/dev/null)
-tar -xzf "$repo/target/package/glmm-0.1.0.crate" -C "$local_dir"
+tar -xzf "$repo/target/package/glmm-$ver.crate" -C "$local_dir"
 mv "$local_dir"/glmm-* "$local_dir/glmm"
 # The crate currently packages the whole repo tree; drop what the staticlib
 # build cannot need and what R CMD check flags (hidden files, the R port
@@ -47,7 +50,7 @@ mv "$local_dir"/glmm-* "$local_dir/glmm"
 rm -rf "$local_dir/glmm/r" "$local_dir/glmm/.github" \
        "$local_dir/glmm/.cargo_vcs_info.json"
 
-# glmm-r: unpackageable while glmm 0.1.0 is unpublished (cargo package
+# glmm-r: unpackageable while this glmm version is unpublished (cargo package
 # verifies version deps against the registry), so copy + de-workspace its
 # manifest by hand. Anchored edits — mirrors glmm-r/Cargo.toml, change
 # together.
@@ -57,13 +60,13 @@ sed -i \
   -e 's/^edition\.workspace = true$/edition = "2021"/' \
   -e 's/^rust-version\.workspace = true$/rust-version = "1.85"/' \
   -e 's/^license\.workspace = true$/license = "GPL-3.0-or-later"/' \
-  -e 's/^glmm = .*$/glmm = { version = "0.1.0" }/' \
+  -e "s/^glmm = .*\$/glmm = { version = \"$ver\" }/" \
   -e '/^\[lints\]$/,/^workspace = true$/d' \
   "$local_dir/glmm-r/Cargo.toml"
 
 # Repoint the staticlib crate at the local copies; the [patch] makes the
-# version dep resolve to local/glmm even though 0.1.0 may not be on
-# crates.io.
+# version dep resolve to local/glmm even though that version may not be
+# on crates.io.
 sed -i 's|glmm-r      = { path = "../../../glmm-r" }|glmm-r      = { path = "local/glmm-r" }|' \
   "$pkg/src/rust/Cargo.toml"
 cat >> "$pkg/src/rust/Cargo.toml" <<'EOF'
