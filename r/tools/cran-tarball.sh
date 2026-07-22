@@ -46,7 +46,7 @@ tar -xzf "$repo/target/package/glmm-$ver.crate" -C "$local_dir"
 mv "$local_dir"/glmm-* "$local_dir/glmm"
 # The crate currently packages the whole repo tree; drop what the staticlib
 # build cannot need and what R CMD check flags (hidden files, the R port
-# itself). parity/ stays: the manifest's [[example]] targets point into it.
+# itself). validation/ stays: the manifest's [[example]] targets point into it.
 rm -rf "$local_dir/glmm/r" "$local_dir/glmm/.github" \
        "$local_dir/glmm/.cargo_vcs_info.json"
 

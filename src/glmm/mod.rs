@@ -1,19 +1,32 @@
-//! Clustered-logistic GLMM kernel: glmer-faithful nAGQ=1. Optimized in two
-//! stages, mirroring lme4's structure (Bates, Mächler, Bolker, Walker, *JSS*
-//! 67(1), 2015, §3): stage 1 runs BOBYQA over θ alone (`n_theta` dims), and at
-//! each candidate θ the penalized-IRLS inner loop profiles β out by solving for
-//! the conditional modes ũ **and** β jointly per iteration (a small dense p×p
-//! β-Schur border on the RE solve) — the PQL-optimal β for that θ; stage 2 is a
-//! short joint [θ | β] BOBYQA polish on the true Laplace objective, warm-started
-//! from stage 1. Stage 1 is only an accelerant: stage 2 guarantees the reported
-//! (θ̂, β̂) is the Laplace optimum, not the PQL one. The objective is the Laplace
-//! deviance d(y,ũ) + ‖ũ‖² + log|L|²; PIRLS gains step-halving to keep the
-//! higher-dimensional joint (u, β) step stable. Setting `GlmmWorkspace.two_stage
-//! = false` reverts to the single joint [θ | β] solve (β held fixed within each
-//! PIRLS solve) as an A/B escape hatch. RE design Z and Λ_θ are dense
-//! (spec-sanctioned within the regime; the block/sparse backend is not built).
-//! All scratch lives in `GlmmWorkspace`, allocated once per
-//! (spec, max_n) shape — the warm path is zero-alloc (Bobyqa::new once).
+//! GLMM kernel: PIRLS + Laplace/AGQ, glmer-faithful nAGQ=1. Covers
+//! Binomial/Poisson/Gamma/negative-binomial with random effects; NB's extra
+//! dispersion θ̂ is set by an outer marginal-θ search in `fit::glmm`
+//! (`glmer.nb`-style) that calls into this module at a fixed θ. Optimized in
+//! two stages, mirroring lme4's structure (Bates, Mächler, Bolker, Walker,
+//! *JSS* 67(1), 2015, §3): stage 1 runs BOBYQA over θ alone (`n_theta` dims),
+//! and at each candidate θ the penalized-IRLS inner loop profiles β out by
+//! solving for the conditional modes ũ **and** β jointly per iteration (a
+//! small dense p×p β-Schur border on the RE solve) — the PQL-optimal β for
+//! that θ; stage 2 is a short joint [θ | β] BOBYQA polish on the true Laplace
+//! objective, warm-started from stage 1. Stage 1 is only an accelerant: stage
+//! 2 guarantees the reported (θ̂, β̂) is the Laplace optimum, not the PQL one.
+//! The objective is the Laplace deviance d(y,ũ) + ‖ũ‖² + log|L|²; PIRLS gains
+//! step-halving to keep the higher-dimensional joint (u, β) step stable.
+//! Setting `GlmmWorkspace.two_stage = false` reverts to the single joint
+//! [θ | β] solve (β held fixed within each PIRLS solve) as an A/B escape
+//! hatch.
+//!
+//! This module holds three dense PIRLS backends, picked per RE design shape:
+//! `pirls_solve` (single grouping, no extra slopes), `pirls_solve_blocked`
+//! (crossed/nested groupings, block-diagonal Λ_θ), and
+//! `pirls_solve_blocked_extras` (blocked plus extra random-slope columns) —
+//! see `se::blocked_schur_fill`/`se::structured_schur_fill` for their Schur
+//! complement fills. All three keep Z and Λ_θ dense, which is exact and fast
+//! within the spec-sanctioned regime (bounded groups × levels). Designs that
+//! fall outside that regime route to the separate sparse-matrix driver in
+//! `crate::sparse::glmm` (`fit_glmm_sparse`) instead. All scratch for the
+//! dense backends lives in `GlmmWorkspace`, allocated once per (spec, max_n)
+//! shape — the warm path is zero-alloc (Bobyqa::new once).
 //!
 //! No σ² scale: binomial dispersion is fixed at 1, so D̂ = Λ̂Λ̂′ directly.
 //!
@@ -44,9 +57,9 @@ pub const PIRLS_MAX_HALVINGS: usize = 10;
 /// scale (lme4's pwrss discipline): converged when
 /// `|Δpen| < PIRLS_TOL_REL · (1 + |pen|)`. The penalized deviance is O(n), so
 /// this relative gate is an ABSOLUTE tolerance of `PIRLS_TOL_REL · n` in the
-/// deviance scale — fine for the small/medium parity rungs (n ≲ 1500) but not
+/// deviance scale — fine for the small/medium validation rungs (n ≲ 1500) but not
 /// for VerbAgg (n=7584, the largest individual-Bernoulli binomial rung): at
-/// the former 1e-6 the absolute slack was ~8e-3 in deviance, one Newton step
+/// a looser 1e-6 tolerance the absolute slack would be ~8e-3 in deviance, one Newton step
 /// short of the quadratic-convergence cliff canonical links otherwise reach
 /// "for free" (see `PIRLS_TOL_REL_NONCANON`'s doc comment) — BOBYQA's stage-2
 /// objective then carried that ~1 iteration of leftover curvature noise into
@@ -55,14 +68,14 @@ pub const PIRLS_MAX_HALVINGS: usize = 10;
 /// rung achieves. This is a cliff, not a gradient: 1e-7 and 1e-8 still miss
 /// VerbAgg's 1e-3 gate at ~4–5e-3 (the Newton step hasn't yet landed inside
 /// the quadratic basin), 3e-9 clears it at 5e-4; 1e-9 keeps a ~5× margin.
-/// Tightening costs the 2–4 extra inner iterations the now-superseded former
-/// comment warned about, but only until each canonical-link solve reaches its
-/// own quadratic floor — negligible on every rung's fit time (verified via
-/// `parity/compare.R` full-suite pass, no rung regressed).
+/// The 1e-9 setting costs 2–4 extra inner iterations over a looser tolerance,
+/// but only until each canonical-link solve reaches its own quadratic floor —
+/// negligible on every rung's fit time (verified via `validation/compare.R`
+/// full-suite pass, no rung regressed).
 pub const PIRLS_TOL_REL: f64 = 1e-9;
 /// PIRLS exit for NON-canonical links (probit, Gamma-log/inverse, NB-log) — a
-/// decade looser than `PIRLS_TOL_REL`, but tightened far below the former 1e-6
-/// default. Canonical links (logit, Poisson-log) are Newton ⇒ quadratic
+/// decade looser than `PIRLS_TOL_REL`, tight enough to stay well clear of the
+/// 1e-6 accuracy cliff described below. Canonical links (logit, Poisson-log) are Newton ⇒ quadratic
 /// convergence, so PIRLS overshoots `PIRLS_TOL_REL` to ~machine precision on its
 /// own and their deviance is already smooth enough for both the outer BOBYQA β
 /// and the FD-Hessian SE. Non-canonical links are Fisher-scoring ⇒ only LINEAR
@@ -107,7 +120,7 @@ pub const BETA_BOX: f64 = crate::glm::BETA_CAP;
 /// Relative FD step for `fd_hessian_cov`'s joint-deviance Hessian:
 /// `h_k = FD_STEP_REL·max(1, |γ̂_k|)`. The Hessian is step-invariant over h ∈
 /// [1e-4, 1e-1] on the committed fixture — but NOT on every curated rung:
-/// h = 1e-3 blows the parity se_hess gates on the noise side (sim_gamma 1e-2,
+/// h = 1e-3 blows the validation se_hess gates on the noise side (sim_gamma 1e-2,
 /// cbpp_probit 2e-3 vs the 1e-3 band) while 1e-2 holds them at ~1e-4, so 1e-2
 /// is pinned by the curated sweep, not just the fixture. The sparse path needs
 /// the opposite trade and carries its own `sparse::SPARSE_FD_STEP_REL` (1e-4,
@@ -217,6 +230,18 @@ pub fn fit_glmm(
     n: usize,
     wald_se: WaldSe,
 ) -> GlmmFit {
+    // Backstop for a hand-built dense workspace: the dense GLMM path builds
+    // intercept-only extras (`build_z` emits no extra slope columns; `apply_lambda`
+    // / `build_packed_m` carry the per-eval debug_asserts). `classify_design`
+    // routes any extra-slope shape to Sparse, so this is unreachable through
+    // `fit_on`/`fit_warm` — it catches a caller that constructs `GlmmWorkspace`
+    // directly. Mirrors the same debug_assert in `apply_lambda` and
+    // `build_packed_m` (`glmm/workspace.rs`) and `assemble_ranef_dense`
+    // (`fit/common.rs`) — change together.
+    assert!(
+        !ws.groupings.extra_slopes_any,
+        "dense GLMM entry: extra_slopes_any — slope-on-extra must route Sparse"
+    );
     let (k, p, n_theta) = (ws.k, ws.p, ws.n_theta);
 
     // γ₀ = [θ₀ | β₀].
@@ -236,9 +261,11 @@ pub fn fit_glmm(
         ws.params[n_theta + j] = b.clamp(-BETA_BOX, BETA_BOX);
     }
 
-    // Within-fit warm-start resets per fit — the incumbent is NEVER carried across
-    // fits (that is the rejected cross-sim warm-start; it would break the
-    // plan_chunks/run_chunk merge and same-seed reproducibility).
+    // Within-fit warm-start resets per fit — the incumbent u_seed is NEVER carried
+    // across fits. Carrying it would make a fit's result depend on which fits ran
+    // before it in the workspace, breaking both the guarantee that a given (spec,
+    // data, seed) fits the same way regardless of call order and the reset-state
+    // assumption `fit_cold` makes about a fresh `GlmmWorkspace`.
     for v in ws.u_seed[..k].iter_mut() {
         *v = 0.0;
     }
@@ -354,9 +381,8 @@ pub fn fit_glmm(
     // Profile deviance is undefined on the AGQ early-return path
     // (`debug_assert!(!profile_beta || nagq == 1)`), and AGQ fits must bypass stage 1
     // unchanged. A Laplace-pass warm start for AGQ was measured on the 33 diligent
-    // AGQ cells (2026-07-14) and reverted: total eval count was a wash (−0.3%), below
-    // the ship gate's materiality bar (the minimum eval-count improvement required
-    // to keep a change).
+    // AGQ cells (2026-07-14) and reverted: total eval count was a wash (−0.3%),
+    // not worth the added code path for that little a gain.
     let mut n_eval_stage1 = 0usize;
     if two_stage && nagq == 1 {
         params_stage1.copy_from_slice(&params[..n_theta]); // θ₀ as today

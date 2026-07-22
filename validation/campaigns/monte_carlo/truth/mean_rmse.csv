@@ -1,0 +1,15 @@
+# Frozen oracle: Li & Signorelli (2026), "A Comparison of R Packages for
+# Estimating GLMMs", arXiv 2606.15933v1, Table 5 (mean RMSE), page 13.
+# Grand average across the 24 simulation cells of the per-cell RMSE
+# sqrt(mean((theta_hat - theta_true)^2)), per package, over the "good"-converged
+# replications. "-" (invalid) rendered NA (see mean_abs_bias.csv header).
+# True params: b0=.1 b1=.3 b2=-.2 b3=.1 tau0=.8 tau1=.4 rho01=.2
+package,beta0,beta1,beta2,beta3,tau0,tau1,rho01
+lme4_LA,0.265,0.366,0.425,0.660,0.510,1.531,0.689
+lme4_AGQ,0.246,0.332,0.393,0.534,0.192,NA,NA
+GLMMadaptive,0.254,0.360,0.404,0.563,0.272,0.609,0.608
+glmmTMB,0.340,0.552,0.542,0.847,0.771,2.107,0.590
+MASS,0.248,0.341,0.382,0.536,0.269,0.690,0.684
+hglm,0.239,0.307,0.356,0.490,0.334,0.254,NA
+brms,0.258,0.352,0.417,0.569,0.233,NA,NA
+rstanarm,0.248,0.349,0.395,0.552,0.236,0.502,0.350

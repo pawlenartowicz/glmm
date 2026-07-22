@@ -1,0 +1,39 @@
+{
+  "name": "pastes_lmm",
+  "engine": "lme4::lmer",
+  "engine_version": "1.1.38",
+  "kind": "lmm",
+  "data": "Pastes",
+  "family": "gaussian",
+  "link": {},
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "strength ~ 1 + (1 | batch/cask)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)"],
+  "estimates": {
+    "beta": [60.0533333333354],
+    "se": [0.676870215074031],
+    "loglik": -123.495372926744,
+    "varcomp": [
+      {
+        "group": "cask:batch",
+        "terms": ["(Intercept)"],
+        "stddev": [2.9040774664762],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "batch",
+        "terms": ["(Intercept)"],
+        "stddev": [1.2873658811052],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "sigma": 0.823407523446778
+  }
+}

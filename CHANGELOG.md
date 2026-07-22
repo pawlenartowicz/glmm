@@ -8,6 +8,73 @@ shares these entries; Python-specific notes are called out where they differ.
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-07-22
+
+A fix release with an internal restructure. Two changes move an answer, both
+narrow: the Gamma inverse-link PIRLS boundary fix (a cell that reported false
+convergence now lands on lme4's optimum) and the formula random-effect ordering
+fix (a formula that writes a plain-intercept term before a slope term now takes
+the written order as its primary grouping). Everything else — the whole log-link
+and binomial corpus, single-RE and slope-first formulas — refits bit-identically,
+and the oracle goldens hold at their existing tolerances.
+
+### Changed
+
+- Restructured the validation suite: `parity/` is now `validation/` (package
+  `validation`, example `validation_fit`, test file `tests/validation_oracle.rs`);
+  the prior-weights suite merged in as manifest rungs 29–43 (`tier: "weights"`);
+  the finished grid/diligent/accuracy studies archived under
+  `validation/campaigns/{speed-grid,estimate-grid,monte_carlo}/`. No gate,
+  tolerance, golden, or dataset changed.
+
+- **The formula frontend now lowers random effects in formula order.** The
+  parser used to emit random effects in its internal extraction order (slope
+  terms before plain intercept terms), so in a formula like
+  `y ~ x + (1|g) + (1+x|h)` the slope grouping `h` became the primary grouping
+  even though `g` was written first. Random effects now follow the order they
+  are written, with one exception: a nested `(1|A/B)` pair still sorts first,
+  because the kernel interprets nesting relative to the primary grouping. For
+  formulas that write a plain-intercept term before a slope term this changes
+  the primary grouping, and with it: which solver the model routes to (a slope
+  on an extra grouping is a sparse-routing trigger), the packing order of the
+  θ variance components, and the order of `ReGroupInfo` blocks. Single-RE
+  models, all-intercept models, slope-first models, and anything with a nested
+  term lower exactly as before. This fix re-landed parity rung 24
+  (`sim_sparse_gamma`) at unchanged tolerances: the misordering had routed it
+  to the dense kernel, whose optimizer stops ~2e-3 deviance short on that
+  shape, while the formula-order orientation routes sparse and lands 2e-4
+  from lme4's optimum.
+
+### Fixed
+
+- **Gamma inverse-link PIRLS could converge on the η > 0 domain boundary.**
+  `clamp_eta` projects a trial iterate with η ≤ 0 (where μ = 1/η is undefined)
+  onto η = 1e-10, and the projected row's working weight μ² ≈ 1e20 then
+  dominates the WLS solve, so PIRLS kept returning the boundary and reported
+  convergence there. Routed through the sparse solver, the `sim_gamma`
+  inverse-link cell returned `converged = true` at an optimum ~937 deviance
+  units above lme4's; the same mechanism put a ~98-unit discontinuity in the θ
+  surface BOBYQA minimizes on the dense path, which had been reaching the right
+  optimum only because its warm-start chain stayed feasible. All four PIRLS
+  drivers now treat a domain-infeasible trial iterate as a failed step and
+  halve toward the last accepted feasible iterate (R `glm.fit`'s
+  `valideta`-style step-halving); a first trial with no accepted predecessor
+  backtracks toward the u = 0 seed, and an infeasible η_fixed itself surfaces
+  as an honest non-converged NaN. Every family/link whose η domain is all of ℝ
+  — the whole log-link and binomial corpus — refits bit-identically
+  before/after the change; the repaired sparse cell is pinned against the dense
+  fit and the frozen lme4 golden (`sim_gamma_inv_glmm`).
+
+- **`Sizing::n_clusters_at` under-counted clusters off-grid.** Under
+  `Sizing::FixedSize` it divided `n / cluster_size` rounding down, while its
+  neighbour `Sizing::cluster_of_row` sends row `i` to cluster `i / cluster_size`.
+  With `n = 18, cluster_size = 4` row 17 lands in cluster 4, so five clusters
+  exist and the function reported four — the trailing partial cluster is real
+  and its id must be in range. It now rounds up, matching the workspace
+  allocator, which had been carrying its own private copy of the corrected
+  formula. Off-grid `n` only; on an atom multiple the two agree, so no shipped
+  path changes answer.
+
 ## [0.1.1] — 2026-07-18
 
 Additive release: an offset term and post-fit reporting fields (log-likelihood,

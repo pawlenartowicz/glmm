@@ -1,5 +1,10 @@
 //! Sparse-Z non-Gaussian GLMM half of `sparse::` — see `super` (`sparse/mod.rs`)
 //! for the Gaussian LMM half this composes with.
+//!
+//! On designs outside the dense-solver envelope, this module returns a
+//! NaN-filled `Fit { converged: false, ... }` instead of panicking — tested by
+//! `fit_over_envelope_non_gaussian_never_panics`. The dense/sparse routing
+//! decision is made by `fit::classify_design` (see `fit/mod.rs:609`).
 
 use crate::lmm::LmmGroupings;
 use bobyqa::Status;
@@ -395,6 +400,17 @@ impl SparseGlmmWorkspace {
         let tol = self
             .pirls_tol_override
             .unwrap_or_else(|| crate::glmm::pirls_tol(family));
+        // Backtrack seeds for the FIRST trial iterate (which has no accepted
+        // predecessor): u_prev = 0 so an infeasible first trial halves toward
+        // η = eta_fixed (the canonical cold seed), beta_prev = the caller's β.
+        // Dead for the overshoot trigger — it cannot fire before an accept —
+        // so only the domain-infeasibility trigger ever reads these seeds
+        // (mirrors `pirls_solve`).
+        self.u_prev[..k].fill(0.0);
+        if profile {
+            let (head, _) = self.beta.split_at(p);
+            self.beta_prev[..p].copy_from_slice(head);
+        }
         let mut pen_accepted = f64::INFINITY;
         let mut mixed_prev = f64::INFINITY;
         let mut halvings = 0usize;
@@ -404,7 +420,10 @@ impl SparseGlmmWorkspace {
         let mut logdet = 0.0;
         for _ in 0..crate::glmm::PIRLS_MAX_ITERS {
             // Trial evaluation at the current u: (Mu)ᵢ, then η/μ/W/deviance.
+            // `infeasible` flags any raw η outside the link's open domain
+            // (Gamma-inverse only — mirrors `pirls_solve`).
             dev = 0.0;
+            let mut infeasible = false;
             #[allow(clippy::needless_range_loop)]
             for i in 0..n {
                 let base = i * width;
@@ -413,7 +432,9 @@ impl SparseGlmmWorkspace {
                     acc += self.m_vals[t] * self.u[self.m_cols[t] as usize];
                 }
                 self.mu[i] = acc;
-                let e = crate::family::clamp_eta(family, self.eta_fixed[i] + acc);
+                let raw = self.eta_fixed[i] + acc;
+                infeasible |= crate::family::eta_infeasible(family, raw);
+                let e = crate::family::clamp_eta(family, raw);
                 self.eta[i] = e;
                 // Canonical-link shortcut (Poisson-log) lives inside this call — see
                 // `irls_weight_and_resid`'s doc comment.
@@ -423,12 +444,14 @@ impl SparseGlmmWorkspace {
                 dev += self.prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], mui);
             }
             // Band-tolerant retrospective step-halving (mirror `pirls_solve` —
-            // see its in-loop comment for why the band must not converge). In
-            // Profile mode the trial point is the JOINT (u, β) step, so β halves
-            // toward `beta_prev` in lockstep with u.
+            // see its in-loop comment for why the band must not converge, and
+            // for why a domain-infeasible trial halves regardless of the band
+            // and only from an accepted feasible iterate). In Profile mode the
+            // trial point is the JOINT (u, β) step, so β halves toward
+            // `beta_prev` in lockstep with u.
             let pen_u: f64 = self.u[..k].iter().map(|v| v * v).sum();
             let penalized = dev + pen_u;
-            if penalized - pen_accepted > tol * (1.0 + penalized.abs()) {
+            if infeasible || penalized - pen_accepted > tol * (1.0 + penalized.abs()) {
                 if halvings < crate::glmm::PIRLS_MAX_HALVINGS {
                     halvings += 1;
                     for c in 0..k {
@@ -942,7 +965,9 @@ fn sparse_glmm_nan_fit(p: usize, n_theta: usize) -> crate::Fit {
 /// mirror `fit::fit_glmm`'s mapping (Gamma's pwrss/n τ² scale and Pearson
 /// dispersion included). Returns the mapped `Fit` plus the minimized marginal
 /// Laplace deviance (the NB marginal-θ objective kernel); non-NB callers take
-/// `.0`.
+/// `.0`. On failure (non-convergence, rank-deficiency, or numeric failure),
+/// returns a NaN-filled `Fit { converged: false, ... }` constructed by
+/// `sparse_glmm_nan_fit`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_glmm_sparse(
     x: &[f64],

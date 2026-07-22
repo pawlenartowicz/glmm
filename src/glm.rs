@@ -1,8 +1,7 @@
-//! Adaptive IRLS logistic regression kernel; outputs z² = β̂²/Var(β̂) for hot-loop comparison against a precomputed squared-critical-value table supplied by the caller — no CDF calls, no SE sqrt.
-//!
-//! Hot-loop invariant: no z-CDF calls, no SE sqrt, no per-coefficient
-//! square roots. Inference outputs `z_sq_j = β̂_j² / Var(β̂_j)` against the
-//! caller-supplied precomputed `z_crit_sq` table.
+//! Adaptive IRLS logistic regression kernel; outputs `z_sq_j = β̂_j² / Var(β̂_j)`
+//! for hot-loop comparison against a caller-supplied precomputed squared-
+//! critical-value table — no z-CDF calls, no SE sqrt, no per-coefficient
+//! square roots anywhere in the loop.
 //!
 //! All per-fit buffers live in `SimWorkspace` (the `irls_*` fields, see workspace.rs).
 //! The kernel takes a `GlmScratch<'w>` built inline at the call site (NLL split-borrow)
@@ -14,8 +13,7 @@
 //!   - BETA_CAP divergence guard: `iter ≥ 3 ∧ ‖β‖_∞ > 30 → non-converged`
 //!   - All-0 / all-1 short circuit
 //!   - Post-fit saturation guard (50% of weights < 1e-5 ⇒ non-converged)
-//!   - No step-halving: β_new is accepted directly (step-halving drifts
-//!     power ~3.5% at N=50 — see the accept step in the IRLS loop)
+//!   - No step-halving: β_new is accepted directly
 //!
 //! Two `beta_start` modes: `None` seeds β = 0 with a family-specific η seed
 //! (η = 0 for logit; R's `initialize` μ-start for Gamma-inverse; the null-model
@@ -35,7 +33,7 @@ use faer::linalg::matmul::{matmul, triangular};
 use faer::reborrow::{IntoConst, Reborrow, ReborrowMut};
 use faer::{Accum, MatMut, MatRef, Par};
 
-use crate::ols::nan_fill_ols_scratch;
+use crate::ols::{nan_fill_ols_scratch, triangular_solve_norm_sq};
 use crate::spec::{BinomialLink, Family};
 use crate::FLOAT_NEAR_ZERO;
 
@@ -52,6 +50,8 @@ pub const WEIGHT_CLAMP: f64 = 1e-6;
 /// saturated. If the fraction exceeds `SATURATION_FRAC`, the fit is marked
 /// non-converged.
 pub const SATURATION_W: f64 = 1e-5;
+/// Saturation post-fit guard: fraction of rows with `W_i < SATURATION_W`
+/// above which the fit is marked non-converged.
 pub const SATURATION_FRAC: f64 = 0.5;
 
 /// Borrowed view into the workspace `irls_*` scratch produced by `glm_irls_fit`.
@@ -83,6 +83,11 @@ pub struct GlmFitView<'a> {
     /// `NaN` whenever `Σy ∈ {0, n}` (the short-circuit path) or any other
     /// non-converged path.
     pub deviance_null: f64,
+    /// Fitted means μ̂ = link⁻¹(η̂), length `n`. Valid only when `converged`
+    /// (stale/uninitialised otherwise — same staleness contract as `l`). Carried
+    /// on the view so `glm_view_to_fit` can assemble `fitted`/`loglik`/Gamma
+    /// dispersion without a second borrow of the IRLS scratch the view holds.
+    pub mu: &'a [f64],
 }
 
 /// Caller-owned scratch borrowed from `SimWorkspace` field-by-field. Built
@@ -174,9 +179,21 @@ pub fn sigmoid_stable(eta: f64) -> f64 {
 ///   `fit_glm_binomial_weighted_aggregated_matches_r`).
 /// - `scratch`: borrowed mutable slots from `SimWorkspace.irls_*`.
 ///
+/// IRLS weight: `W = diag(μ(1−μ))` under canonical logit (`Family::Binomial
+/// { link: Logit }`); every other family/link uses the general Fisher-scoring
+/// weight `W_i = 1 / (Var(μ_i) · g'(μ_i)²)` from [`crate::family`].
+///
 /// `deviance_null` matches R's `glm(family=binomial)$null.deviance` (see
-/// `glm_deviance_null_golden_value`); no external oracle validates the full
-/// β̂/deviance path yet.
+/// `glm_deviance_null_golden_value`). The full β̂/deviance path is pinned
+/// against R for the weighted branch (`glm_weighted_deviance_null_golden_value`
+/// here; `fit_glm_gamma_weighted_matches_r`,
+/// `fit_glm_binomial_weighted_aggregated_matches_r` in `fit/glm_tests.rs`),
+/// which is what unweighted-binomial aggregated-proportion data (R's
+/// `cbind(successes, failures) ~ ...`, e.g. the `cbpp_logit_glm` validation golden)
+/// also routes through. The one path still without a full β̂ oracle is the
+/// unweighted canonical-logit fast path (`Family::Binomial { link: Logit }`,
+/// `prior_w: None`) — its only external check is the null-deviance golden
+/// above, which depends solely on ȳ, not the fitted β.
 #[allow(clippy::too_many_arguments)] // marshals (family, nb_theta, x, y, target_indices, beta_start, prior_w, offset, scratch)
 pub fn glm_irls_fit<'a>(
     family: Family,
@@ -235,6 +252,7 @@ pub fn glm_irls_fit<'a>(
             converged: false,
             deviance: f64::NAN,
             deviance_null: f64::NAN,
+            mu: &irls_p[..n],
         };
     }
 
@@ -257,6 +275,7 @@ pub fn glm_irls_fit<'a>(
             converged: false,
             deviance: f64::NAN,
             deviance_null: f64::NAN,
+            mu: &irls_p[..n],
         };
     }
 
@@ -332,8 +351,8 @@ pub fn glm_irls_fit<'a>(
         // (Poisson/NB) seed the null model, μ₀ = ȳ + 0.1 ⇒ η = ln(ȳ+0.1) on
         // every row: from η = 0 (μ=1) on data with ȳ ≳ ~25–30 the first WLS
         // step overshoots and IRLS runs away (β → ~9e304) — there is
-        // deliberately no step-halving to catch it (see the rejection note at
-        // the accept step). NOT R's per-row μ₀ = y + 0.1 `initialize`: on
+        // deliberately no step-halving to catch it (see the accept step).
+        // NOT R's per-row μ₀ = y + 0.1 `initialize`: on
         // zero-heavy small-θ NB data the per-row seed's first step fits the
         // log-count mean (intercept ≈ ln 0.1), the second explodes past
         // BETA_CAP, and recovery crawls at ~1 unit/iter past the iteration
@@ -375,15 +394,16 @@ pub fn glm_irls_fit<'a>(
     let mut n_iter: u32 = 0;
 
     // IRLS: each pass is a weighted least squares solve
-    // β_new = (X'WX)⁻¹ X'Wz on the working response z = η + (y − μ)/W with
-    // weights W = diag(μ(1−μ)), μ = σ(η). Iterated to the |Δdeviance| fixpoint
-    // it is the maximum-likelihood β. MN89 §4.
+    // β_new = (X'WX)⁻¹ X'Wz on the working response z = η + (y − μ)/W, μ = σ(η).
+    // W = diag(μ(1−μ)) under canonical logit; the general Fisher-scoring
+    // weight (see the `///` doc above) applies otherwise. Iterated to the
+    // |Δdeviance| fixpoint it is the maximum-likelihood β. MN89 §4.
     // `0..=`: pass k's top checks convergence of the deviance that pass k−1's
     // solve produced (off the carried η), so the final solve still gets its
     // check without the extra pass buying another factorization. The deviance
-    // moved from a post-accept `bernoulli_deviance` call to the top-of-pass
-    // fused kernel — same values one pass later, no standalone `log1pexp` sweep
-    // (deviance fold; bit-identical, the fused Σ equals the lean one).
+    // check reads the top-of-pass fused kernel's output directly — no separate
+    // `log1pexp` sweep — so `deviance_final` is always one pass behind the β
+    // that produced it, by construction, not by an accident of ordering.
     for iter in 0..=MAX_IRLS_ITERS {
         // η = X · β is already in `irls_eta`: seeded to 0 (β = 0) or the
         // truth start before the loop, then refreshed by the accept step below
@@ -470,9 +490,9 @@ pub fn glm_irls_fit<'a>(
         // WX = W∘X into irls_wx (column-major, mirrors x), then
         // X′WX (lower triangle — Cholesky reads Side::Lower only) and X′Wz
         // through faer GEMM (`Par::Seq`; per-fit parallelism is the outer
-        // rayon loop). GEMM accumulation order, deliberately NOT the old
-        // per-entry row-order dots: the serial FP-add chain was the latency
-        // floor on wide p (measured 0.94× glm_wide).
+        // rayon loop). GEMM's blocked accumulation keeps the FP-add chain off
+        // the critical path on wide p, unlike a per-entry row-order dot
+        // product, which serializes one add per row.
         {
             let wx = &mut irls_wx[..n * p];
             for j in 0..p {
@@ -544,8 +564,7 @@ pub fn glm_irls_fit<'a>(
 
         // Accept β_new unconditionally and compute new deviance.
         //
-        // β_new is accepted unconditionally — no step-halving: it causes
-        // systematic power drift at small N (measured ~3.5% at N=50). The
+        // β_new is accepted unconditionally — no step-halving. The
         // DEVIANCE_TOL early-exit and MAX_IRLS_ITERS cap are sufficient
         // divergence guards.
         irls_betas[..p].copy_from_slice(&irls_betas_new[..p]);
@@ -618,8 +637,6 @@ pub fn glm_irls_fit<'a>(
         }
     }
 
-    // If not converged: NaN the inference outputs but leave betas at whatever
-    // value the loop last computed.
     if !converged {
         // Partial re-NaN: inference outputs only — `betas` are deliberately
         // left at the loop's last fitted value, so the 3-array
@@ -635,6 +652,7 @@ pub fn glm_irls_fit<'a>(
             converged: false,
             deviance: f64::NAN,
             deviance_null: f64::NAN,
+            mu: &irls_p[..n],
         };
     }
 
@@ -651,32 +669,21 @@ pub fn glm_irls_fit<'a>(
         }
     }
 
-    // Per-target Var(β̂_j) = ((X'WX)⁻¹)_jj via forward solve on L:
-    //   L · u = e_{tj} → var_diag = ‖u‖²
-    // (No σ̂² scaling — under Bernoulli the score covariance is (X'WX)⁻¹.)
+    // Per-target Var(β̂_j) = ((X'WX)⁻¹)_jj — see `ols::triangular_solve_norm_sq`
+    // for the forward-solve identity (no σ̂² scaling here: under Bernoulli the
+    // score covariance is (X'WX)⁻¹ directly).
     for (out_idx, &tj) in target_indices.iter().enumerate() {
         let tj = tj as usize;
         if tj >= p {
             continue;
         }
-        irls_u_scratch[..p].fill(0.0);
-        for i in 0..p {
-            let b_i = if i == tj { 1.0 } else { 0.0 };
-            let mut acc = b_i;
-            for k in 0..i {
-                acc -= irls_l[(i, k)] * irls_u_scratch[k];
-            }
-            let l_ii = irls_l[(i, i)];
-            irls_u_scratch[i] = if l_ii.abs() < FLOAT_NEAR_ZERO {
-                f64::NAN
-            } else {
-                acc / l_ii
-            };
-        }
-        let mut norm_sq = 0.0;
-        for &v in &irls_u_scratch[..p] {
-            norm_sq += v * v;
-        }
+        let norm_sq = triangular_solve_norm_sq(
+            irls_l.rb(),
+            |i| if i == tj { 1.0 } else { 0.0 },
+            irls_u_scratch,
+            p,
+            false, // lower-triangular L: row access factor[(i, k)]
+        );
         irls_var_diag[out_idx] = norm_sq;
         if norm_sq > FLOAT_NEAR_ZERO && norm_sq.is_finite() {
             let beta_j = irls_betas[tj];
@@ -695,6 +702,7 @@ pub fn glm_irls_fit<'a>(
         converged: true,
         deviance: deviance_final,
         deviance_null,
+        mu: &irls_p[..n],
     }
 }
 

@@ -54,7 +54,7 @@ test_that("the Gamma() link trap: object honored, string means log", {
   expect_equal(sigma(fit_str)^2, summary(ref)$dispersion, tolerance = 1e-5)
 })
 
-test_that("sigma is fixed at 1 for binomial/poisson (lme4 parity)", {
+test_that("sigma is fixed at 1 for binomial/poisson (lme4 agreement)", {
   d <- benchmark_data(seed = 104, family = "binomial")
   fit <- fastglmm(y ~ t + (1 | g), d, family = binomial())
   expect_identical(sigma(fit), 1)

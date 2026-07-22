@@ -256,11 +256,11 @@ pub struct GlmmWorkspace {
     /// length m; per-coordinate FD step h_k
     pub fd_steps: Vec<f64>,
     /// When true, `laplace_deviance_at` seeds PIRLS from `u_seed` (the fitted mode
-    /// û(γ̂)) instead of û = 0. Set ONLY by `fd_hessian_cov`, and only for its
-    /// perturbed evals: a FIXED shared seed (every eval from the same constant
-    /// u_seed) keeps each f(γ) a function of γ alone, so FD order-independence
-    /// holds — a *chained* seed would not. Reset on every `fd_hessian_cov` exit so
-    /// non-FD callers keep their cold, order-free û = 0 start.
+    /// û(γ̂)) instead of û = 0. Set ONLY by `fd_hessian_cov`, for **every** one of
+    /// its evals including the central f0, and reset on every `fd_hessian_cov` exit
+    /// so non-FD callers keep their cold, order-free û = 0 start. Same fixed-seed
+    /// FD-derivative invariant as `fd_hessian_cov` in se.rs — see there for the
+    /// derivation and for why f0 is inside the warm set too.
     pub warm_seed_active: bool,
     /// PIRLS exit-tol override read by `laplace_deviance_at` and forwarded to every
     /// PIRLS variant. `Some(PIRLS_TOL_REL_FD)` ONLY while `fd_hessian_cov` runs (set
@@ -302,6 +302,17 @@ impl GlmmWorkspace {
         max_n: usize,
         nagq: u8,
     ) -> Self {
+        // The dense GLMM kernel builds intercept-only extra groupings exclusively
+        // (`build_z` emits no slope columns for extras), so a slope-carrying extra
+        // would fit a REDUCED model and report it as a normal success. Callers must
+        // route such a design to the sparse solver — `classify_design`'s
+        // `slope_extras` clause does. Checked here, once per workspace build, rather
+        // than in `apply_lambda`/`build_packed_m`, whose per-eval `debug_assert`s
+        // stay debug-only because they sit in the hot loop.
+        assert!(
+            !groupings.extra_slopes_any,
+            "dense GLMM kernel cannot fit a slope-carrying extra grouping — route it to the sparse solver"
+        );
         let k = groupings.k_total;
         let n_theta = groupings.n_theta();
         let q = groupings.primary_q;
@@ -405,12 +416,13 @@ impl GlmmWorkspace {
             //
             // Threshold below is from a locked-machine (`bench-l`, `taskset -c 1`)
             // timing sweep of every rung that reaches this constructor (non-Gaussian
-            // dense NoZ; `parity/` datasets with a sparse/LMM path are unaffected by
-            // this field and were confirmed identical across both sweep arms) — NOT
-            // just the plan's named reach set, which turned out to include one false
-            // positive. Protocol: per arm (forced skip vs forced keep), two independent
-            // `parity_fit` invocations, each itself the median of 9 timed samples
-            // after a discarded warmup (see parity/oracle/fit.rs); invocations agreed
+            // dense NoZ; `validation/` datasets with a sparse/LMM path are unaffected by
+            // this field and were confirmed identical across both sweep arms) — the
+            // full corpus, not a hand-picked dataset list: an earlier hand-picked list
+            // missed one loser (Arabidopsis, see below). Protocol: per arm (forced skip
+            // vs forced keep), two independent
+            // `validation_fit` invocations, each itself the median of 9 timed samples
+            // after a discarded warmup (see validation/engines/glmm.rs); invocations agreed
             // within ~2% everywhere, and the table shows the keep-arm/skip-arm medians
             // (Poisson rows re-measured after the dense-PIRLS weight-loop revert that
             // restored the pre-helper per-row math; the logit rows — cbpp, VerbAgg —

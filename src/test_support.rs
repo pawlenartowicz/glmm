@@ -11,6 +11,33 @@
 use crate::ols::PANEL_ROWS;
 use faer::Mat;
 
+/// Near-identity slice comparison shared by the fit-core equivalence tests
+/// (`fit_on`-on-reused-ws vs `fit_cold`, view-mapper vs direct). Tolerance is
+/// `1e-12 + 1e-9·|want|` — tight enough to catch every failure these gates
+/// exist for (stale buffers, `n_max` over-reads, option-reset misses shift
+/// results materially, not by an ULP) without demanding bit-identity across a
+/// refactor. Scalars compare as one-element slices: `assert_near(&[a], &[b], _)`.
+pub(crate) fn assert_near(got: &[f64], want: &[f64], ctx: &str) {
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{ctx}: len {} vs {}",
+        got.len(),
+        want.len()
+    );
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        // Both NaN is near-identical (a non-target SE / non-converged slot is
+        // NaN in both fresh and reused); one NaN alone is a real mismatch.
+        if g.is_nan() && w.is_nan() {
+            continue;
+        }
+        assert!(
+            (g - w).abs() <= 1e-12 + 1e-9 * w.abs(),
+            "{ctx}[{i}]: {g} vs {w}"
+        );
+    }
+}
+
 pub(crate) struct TestWs {
     // OLS suff-stats
     pub suff_xtx: Mat<f64>,

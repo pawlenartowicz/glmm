@@ -1,0 +1,40 @@
+{
+  "name": "sim_nb_nested_glmm",
+  "engine": "lme4::glmer.nb",
+  "engine_version": "1.1.38",
+  "kind": "glmm",
+  "data": "sim_nb_nested",
+  "family": "negbin",
+  "link": "log",
+  "nagq": 1,
+  "tolPwrss": 1e-13,
+  "r_formula": "y ~ 1 + x + (1 | g1/g2)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.585008012882136, 0.507366183617519],
+    "se_hessian": [0.204821238995223, 0.0539930224466891],
+    "se_rx": [0.203586388145329, 0.0543396976225674],
+    "loglik": -976.826817031685,
+    "varcomp": [
+      {
+        "group": "g2:g1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.355203416126476],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "g1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.629023491671728],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "theta": 1.43013162783783
+  }
+}

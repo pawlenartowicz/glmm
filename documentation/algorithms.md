@@ -19,30 +19,37 @@ the other engines and the reasoning behind them.
 Every real fit enters through `fit_warm` (`fit_cold` is exactly
 `fit_warm(.., None, ..)`). It shape-checks the inputs (`assert_model_shape`,
 followed by the finiteness/shape asserts on `weights`, `offset`, and any
-`StartValues`), runs the rank-deficiency salvage, then matches on
-`(family, re)`; the mixed arm routes through `classify_design` to a dense
-(`NoZ`) or sparse (`Sparse`) solver, and within each solver the family selects
-the kernel. This is the whole as-built decision tree — one graph, no
+`StartValues`), runs the rank-deficiency salvage, sizes the spec from the group
+ids, then hands off to the unified fit core in `src/fit/core.rs`:
+`build_workspace` matches on `(family, re)` — the mixed arm routing through
+`classify_design` to a dense (`NoZ`) or sparse (`Sparse`) solver, and within
+each solver the family selecting the kernel — and `fit_on` solves on the
+workspace it allocated. This is the whole as-built decision tree — one graph, no
 unreachable arms.
+
+The core is the *only* dispatch body. `fit_warm` allocates a throwaway
+workspace per call and always assembles the full `Fit`; a `loop_advanced`
+caller builds once per shape and reads the lean `FitView` per draw. Both walk
+the identical tree, so routing cannot drift between the two tiers.
 
 ```mermaid
 flowchart TD
   E["fit_cold / fit_warm"] --> SH["assert_model_shape"]
   SH --> RD{"detect_aliased: any aliased column?"}
   RD -->|yes| RDF["fit_rank_deficient: drop columns, re-enter reduced"]
-  RD -->|no| M{"match family, re"}
+  RD -->|no| BW["build_workspace: match family, re"]
 
-  M -->|"Gaussian, None"| OLS["fit_ols (incl. WLS by weights)"]
-  M -->|"Binomial/Poisson/Gamma, None"| GLM["fit_glm (IRLS)"]
-  M -->|"NegativeBinomial, None"| GLMNB["fit_glm_nb (outer theta loop)"]
-  M -->|"any family, Some(re)"| CD{"classify_design"}
+  BW -->|"Gaussian, None"| OLS["fit_ols_prebuilt (incl. WLS by weights)"]
+  BW -->|"Binomial/Poisson/Gamma, None"| GLM["fit_glm_prebuilt (IRLS)"]
+  BW -->|"NegativeBinomial, None"| GLMNB["fit_glm_nb (outer theta loop)"]
+  BW -->|"any family, Some(re)"| CD{"classify_design"}
 
   CD -->|"in envelope"| NZ{"family (NoZ)"}
   CD -->|"over envelope / slope on extra / crossed levels > 500"| SP{"family (Sparse)"}
 
-  NZ -->|Gaussian| MLE["fit_mle"]
+  NZ -->|Gaussian| MLE["lmm_run_on"]
   NZ -->|NegativeBinomial| GNB["fit_glmm_nb"]
-  NZ -->|"Binomial/Poisson/Gamma"| GMM["fit_glmm"]
+  NZ -->|"Binomial/Poisson/Gamma"| GMM["run_glmm_on"]
 
   SP -->|Gaussian| MLES["fit_mle_sparse"]
   SP -->|NegativeBinomial| GNBS["fit_glmm_nb_sparse"]
@@ -109,15 +116,16 @@ Penicillin, Pastes, sim_slope_extra on the Gaussian side; cbpp, grouseticks,
 ## Legend
 
 - **Node** = a named function the dispatch actually calls; the terminal leaves
-  (`fit_ols`, `fit_glm`, `fit_glm_nb`, `fit_mle`, `fit_glmm`, `fit_glmm_nb`, and
-  the three `*_sparse` twins) are the solvers. **Diamond** = a real branch in the
-  code (`match`, `classify_design`, a guard). **Edge label** = the condition
-  under which that branch is taken.
+  (`fit_ols_prebuilt`, `fit_glm_prebuilt`, `fit_glm_nb`, `lmm_run_on`,
+  `run_glmm_on`, `fit_glmm_nb`, and the three `*_sparse` twins) are the solvers.
+  **Diamond** = a real branch in the code (`match`, `classify_design`, a guard).
+  **Edge label** = the condition under which that branch is taken.
 - **Code citations** across all three pages use the form `src/path/file.rs` plus
   the item name (fn/struct/const) — never line numbers, so a citation survives
   edits to the file. When an item name is unique in the crate the file alone
-  locates it. (The `fit` and `sparse` modules are directories: dispatch lives in
-  `src/fit/mod.rs` and `src/fit/common.rs`, the per-path entry points in
+  locates it. (The `fit` and `sparse` modules are directories: the entry and its
+  preprocessing live in `src/fit/mod.rs` and `src/fit/common.rs`, the dispatch
+  itself in `src/fit/core.rs`, the per-path entry points in
   `src/fit/{ols,glm,lmm,glmm}.rs`, their tests in the sibling `*_tests.rs`
   files, and the sparse solver in `src/sparse/`.)
 - The map grows with the crate: future optimizer tiers and additional families
@@ -127,7 +135,7 @@ Penicillin, Pastes, sim_slope_extra on the Gaussian side; cbpp, grouseticks,
 
 Every tuning surface, one line each, pointing at the page that owns it. Public
 `FitOptions` knobs are documented at their use site; internal constants are
-tuned on the crate's parity corpus (27 manifest datasets, rungs 1–23 and 25–28;
+tuned on the crate's validation corpus (27 manifest datasets, rungs 1–23 and 25–28;
 rung 24, the sparse Gamma, is backed out — see the LMM/GLMM validation sections)
 and are not user-facing.
 
@@ -170,16 +178,17 @@ same bracket through a global golden-section search
 
 ## Ordinary least squares (OLS)
 
-**Code:** `fit_ols` (`src/fit/ols.rs`); `OlsSuffStats::add_rows`,
+**Code:** `fit_ols_prebuilt` + `ols_view_to_fit` (`src/fit/ols.rs`);
+`OlsSuffStats::add_rows`,
 `fit_suff_stats_t_sq`, `PANEL_ROWS` (`src/ols.rs`). **Convention:** the textbook
 Gaussian OLS normal equations, with R `lm()`'s residual-df and dispersion
 conventions. **Validation:** `fit_ols_recovers_slope`, and for the weighted path
 `fit_ols_weighted_matches_r_lm` / `fit_ols_constant_weights_invariant`
 (`src/fit/ols_tests.rs`). OLS is the fixed-only Gaussian leaf and is not a
-dedicated mixed-model parity rung; it is exercised implicitly as the `q_p = 1`
+dedicated mixed-model validation rung; it is exercised implicitly as the `q_p = 1`
 degenerate of the LMM kernels.
 
-`fit_ols` accumulates the sufficient statistics `XᵀX` (lower triangle), `Xᵀy`,
+`fit_ols_prebuilt` accumulates the sufficient statistics `XᵀX` (lower triangle), `Xᵀy`,
 and `yᵀy` in a single panel-blocked pass (`OlsSuffStats::add_rows`, repacking
 `PANEL_ROWS = 256`-row panels so the GEMM stays cache-resident), then solves the
 normal equations by a Cholesky of `XᵀX`: `L z = Xᵀy`, `Lᵀ β̂ = z`
@@ -208,7 +217,8 @@ scaling; they are deliberately never mapped into `Fit`.
 
 ## Generalised linear models (GLM)
 
-**Code:** `fit_glm` and (for negative binomial) `fit_glm_nb` (`src/fit/glm.rs`);
+**Code:** `fit_glm_prebuilt` + `glm_view_to_fit` and (for negative binomial)
+`fit_glm_nb` (`src/fit/glm.rs`);
 the IRLS kernel `glm_irls_fit` with its constants `MAX_IRLS_ITERS = 50`,
 `DEVIANCE_TOL = 1e-8`, `WEIGHT_CLAMP = 1e-6`, `BETA_CAP = 30`,
 `SATURATION_W = 1e-5`, `SATURATION_FRAC = 0.5` (`src/glm.rs`); the SIMD
@@ -221,10 +231,10 @@ deviance and dispersion, and `MASS::glm.nb` for the NB θ profile.
 `glm_weighted_deviance_null_golden_value` (`src/glm.rs`), and for NB
 `fit_glm_nb_matches_mass` / `fit_glm_nb_weighted_matches_mass`
 (`src/fit/glm_tests.rs`). GLM is a fixed-only leaf with no external three-way
-parity rung of its own; the cbpp/grouseticks rungs exercise the same family
+validation rung of its own; the cbpp/grouseticks rungs exercise the same family
 math through the GLMM cold-start GLM fit.
 
-`fit_glm` runs adaptive IRLS cold-started at β = 0, converging on
+`fit_glm_prebuilt` runs adaptive IRLS cold-started at β = 0, converging on
 `|Δ deviance| < DEVIANCE_TOL` with a `MAX_IRLS_ITERS` safety cap. The η seed at
 that β = 0 start is **family-specific** — a plain η = 0 start is wrong for two
 of the regimes:
@@ -280,10 +290,8 @@ loop, all in `glm_irls_fit`:
 - A **Cholesky failure** on `XᵀWX` (non-PD) → non-converged.
 
 There is deliberately **no step-halving** on this path: the trial β is accepted
-unconditionally each iteration. Step-halving was tried and measured — it
-drifted simulated power by ~3.5% at N = 50 against R's un-halved `glm()`, so
-matching R's convergence trajectory took priority. (The mixed
-PIRLS loop *does* step-halve, because there it mirrors lme4 — see
+unconditionally each iteration, matching R's un-halved IRLS trajectory. (The
+mixed PIRLS loop *does* step-halve, because there it mirrors lme4 — see
 [`algorithms-glmm.md`](algorithms-glmm.md#pirls-inner-loop).)
 
 **Dispersion.** Binomial and Poisson hold `φ ≡ 1`, so `(XᵀWX)⁻¹` is the full
@@ -336,7 +344,7 @@ analysis) need to swap family and RE structure without changing API.
 
 Two consequences: `glmm`'s GLM is the same IRLS kernel the GLMM cold start
 runs (`glm_warm_start_beta`), so the fixed-only path is exercised by every
-mixed parity rung; and `glmm` pins its GLM/OLS behaviour (deviance,
+mixed validation rung; and `glmm` pins its GLM/OLS behaviour (deviance,
 dispersion, `etastart`, weighted df) to R's `glm()`/`lm()`, since those are
 the fixed-only conventions users compare against.
 
@@ -352,7 +360,7 @@ change.
 ## References
 
 - McCullagh, P. & Nelder, J. A. (1989). *Generalized Linear Models* (2nd ed.).
-  Chapman & Hall. — the IRLS/Fisher-scoring formulation `fit_glm` implements.
+  Chapman & Hall. — the IRLS/Fisher-scoring formulation `glm_irls_fit` implements.
 - Venables, W. N. & Ripley, B. D. (2002). *Modern Applied Statistics with S*
   (4th ed.). Springer. — `MASS::glm.nb` / `theta.ml`, the NB outer-loop
   convention `fit_glm_nb` matches.

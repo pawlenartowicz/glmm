@@ -108,10 +108,10 @@ impl<'w> OlsSuffStats<'w> {
     /// Panel-GEMM: each ≤PANEL_ROWS slice of the block is repacked densely
     /// (column-major) into `panel_x`/`panel_y` once, then X'X/X'y accumulate through
     /// faer GEMM (`Accum::Add`, `Par::Seq` — per-fit parallelism is the outer
-    /// rayon loop). GEMM accumulation order, deliberately NOT the old per-row
-    /// rank-1 triangle: the serial FP-add chain was the latency floor
-    /// (mirrors glm.rs's X'WX conversion). `yty`/`sum_y` stay scalar in row
-    /// order — bit-identical to the pre-panel loop.
+    /// rayon loop). GEMM's blocked accumulation keeps the FP-add chain off the
+    /// critical path, unlike a per-row rank-1 triangle update, which serializes
+    /// one add per row (mirrors glm.rs's X'WX conversion). `yty`/`sum_y` stay
+    /// scalar in row order — bit-identical to the pre-panel loop.
     ///
     /// Caller's responsibility: `x_block.nrows() == y_block.len()` and the
     /// column count matches the workspace's predictor count.
@@ -179,9 +179,11 @@ impl<'w> OlsSuffStats<'w> {
 ///
 /// This de-duplicates the forward-substitution + norm-squared accumulation
 /// shared by `fit_suff_stats_t_sq` and `ols_contrast_t_sq` (both Cholesky
-/// path, lower).
+/// path, lower) and by `glm::glm_irls_fit`'s per-target `Var(β̂_j)` step,
+/// which reuses it directly: `Var(β̂_j) = ((X'WX)⁻¹)_jj = ‖L⁻¹ e_j‖²`, the
+/// same identity as `fit_suff_stats_t_sq`'s `(X'X)⁻¹_jj` case above.
 #[inline]
-fn triangular_solve_norm_sq(
+pub(crate) fn triangular_solve_norm_sq(
     factor: MatRef<'_, f64>,
     b: impl Fn(usize) -> f64,
     scratch: &mut [f64],

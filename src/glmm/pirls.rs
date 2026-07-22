@@ -151,6 +151,17 @@ pub(crate) fn pirls_solve(
     // so this once-at-entry fill stands for the whole solve; in Profile mode the
     // δβ step re-fills it after every β update (below), hence the shared helper.
     refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+    // Backtrack seeds for the FIRST trial iterate (which has no accepted
+    // predecessor): u_prev = 0 so an infeasible first trial halves toward
+    // η = eta_fixed (the canonical cold seed), beta_prev = the caller's β.
+    // Dead for the overshoot trigger — it cannot fire before an accept (a rise
+    // above an infinite `pen_accepted` never tests true) — so only the
+    // domain-infeasibility trigger below ever reads these seeds, and the
+    // iterate path is untouched wherever it never fires.
+    u_prev[..k].fill(0.0);
+    if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
+        beta_prev[..p].copy_from_slice(&beta[..p]);
+    }
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
     let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
@@ -174,6 +185,10 @@ pub(crate) fn pirls_solve(
         // η = η_fixed + Mu; family-branched deviance + p/W. Logit keeps the
         // verbatim fused-SIMD path (byte-identity); other families take the
         // scalar general Fisher-scoring branch through family.rs.
+        // `infeasible` = any row's RAW η outside the link's open domain
+        // (`family::eta_infeasible` — Gamma-inverse only; constant-false, hence
+        // dead, for every all-ℝ link including the logit arm above it).
+        let mut infeasible = false;
         dev = match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
@@ -194,7 +209,9 @@ pub(crate) fn pirls_solve(
             other => {
                 let mut d = 0.0;
                 for i in 0..n {
-                    let e = crate::family::clamp_eta(other, eta_fixed[i] + mu[i]);
+                    let raw = eta_fixed[i] + mu[i];
+                    infeasible |= crate::family::eta_infeasible(other, raw);
+                    let e = crate::family::clamp_eta(other, raw);
                     eta[i] = e;
                     let mui = crate::family::link_inv(other, e);
                     prob[i] = mui;
@@ -226,7 +243,16 @@ pub(crate) fn pirls_solve(
         // 3.9e-5 inside the 1.07e-4 band while the mixed sequence was still 7.2e-3
         // apart), returning an iterate ~4e-7 coarse in the objective and breaking
         // the AGQ(k=1) ≡ Laplace 1e-12 gate and the non-canonical FD-Hessian SEs.
-        if penalized - pen_accepted > tol * (1.0 + penalized.abs()) {
+        //
+        // A domain-infeasible trial iterate (`infeasible`, Gamma-inverse only) is
+        // a step failure REGARDLESS of the band: accepting it would let the
+        // `clamp_eta` boundary projection define the converged answer (see
+        // `family::eta_infeasible`). It halves toward the last accepted feasible
+        // iterate — or, on the very first trial, toward the u = 0 / caller-β
+        // seeds installed at entry. An infeasible η_fixed itself is beyond
+        // halving's reach (u = 0 already gives η = η_fixed): halvings exhaust
+        // into the honest (NaN, …, false).
+        if infeasible || penalized - pen_accepted > tol * (1.0 + penalized.abs()) {
             if halvings < PIRLS_MAX_HALVINGS {
                 // Last full step overshot: halve δu = u − u_prev and re-enter the
                 // top (the recompute above is the trial evaluation of the halved
@@ -518,19 +544,10 @@ pub(crate) fn pirls_solve(
 /// block ⇒ `(NaN, NaN, NaN, false)`. Iterates from the caller-provided `u` (the
 /// warm-start seed); the caller owns resetting it per fit.
 ///
-/// **Step-halving (lme4 `pwrssUpdate`, retrospective form — mirrors
-/// `pirls_solve`):** each iteration evaluates the trial `u` first; only if the
-/// same-point penalized deviance `dev + ‖u‖²` rose above the last accepted value
-/// BY MORE than the tol band does it halve `δu = u − u_prev` and re-evaluate, up
-/// to `PIRLS_MAX_HALVINGS` times (then `(NaN, NaN, NaN, false)`); a within-band
-/// rise is accepted (FP noise, never burns a halving). `u_prev` is the
-/// caller-owned length-`k` backtrack buffer; in `Profile` mode the joint (u,β)
-/// step is backtracked in lockstep, halving β toward `beta_prev` alongside u.
-/// Convergence is today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` rule checked
-/// AFTER the step — bit-identical iterate path and returns to the pre-halving
-/// loop when no halving fires; `a_blocks`/`log|A|` on return are from the final
-/// step's assembly — exactly the factors that produced the returned u,
-/// preserving the `blocked_schur_fill` contract above.
+/// Step-halving: see `pirls_solve`'s doc — identical mechanism, `a_blocks` here
+/// plays the role of `pirls_solve`'s `A`, so `a_blocks`/`log|A|` on return are
+/// from the final step's assembly, preserving the `blocked_schur_fill` contract
+/// above.
 ///
 /// **β mode (`beta_step`):** `Fixed` holds β at the caller's input (β read-only,
 /// FD-Hessian / stage-2 contract). `Profile` adds a joint δβ Schur-border step
@@ -611,6 +628,12 @@ pub(crate) fn pirls_solve_blocked(
             m_buf[i * q + c] = acc;
         }
     }
+    // First-trial backtrack seeds (u_prev = 0, beta_prev = caller's β) — only
+    // the domain-infeasibility trigger can read them; see `pirls_solve`.
+    u_prev[..k].fill(0.0);
+    if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
+        beta_prev[..p].copy_from_slice(&beta[..p]);
+    }
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
     let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
@@ -636,7 +659,10 @@ pub(crate) fn pirls_solve_blocked(
             yeta += y[i] * e;
         }
         // --- pass 2: η[] → prob[]/w[] + deviance. Logit: verbatim fused SIMD.
-        // Other families: scalar general branch (clamps η in place). ---
+        // Other families: scalar general branch (clamps η in place;
+        // `infeasible` flags any raw η outside the link's open domain —
+        // Gamma-inverse only, mirrors `pirls_solve`). ---
+        let mut infeasible = false;
         dev = match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
@@ -651,7 +677,9 @@ pub(crate) fn pirls_solve_blocked(
             other => {
                 let mut d = 0.0;
                 for i in 0..n {
-                    let e = crate::family::clamp_eta(other, eta[i]);
+                    let raw = eta[i];
+                    infeasible |= crate::family::eta_infeasible(other, raw);
+                    let e = crate::family::clamp_eta(other, raw);
                     eta[i] = e;
                     let mui = crate::family::link_inv(other, e);
                     prob[i] = mui;
@@ -673,8 +701,10 @@ pub(crate) fn pirls_solve_blocked(
         let penalized = dev + pen_u;
         // BAND-TOLERANT overshoot test, mirrors `pirls_solve` (see its comments
         // for why a within-band rise is accepted rather than converged-on or
-        // halved): only a rise EXCEEDING the tol band backtracks.
-        if penalized - pen_accepted > tol * (1.0 + penalized.abs()) {
+        // halved): only a rise EXCEEDING the tol band backtracks. A
+        // domain-infeasible trial halves regardless of the band (see
+        // `pirls_solve`'s comment).
+        if infeasible || penalized - pen_accepted > tol * (1.0 + penalized.abs()) {
             if halvings < PIRLS_MAX_HALVINGS {
                 // Last full step overshot: halve δu = u − u_prev and re-enter the
                 // top (the recompute above is the trial evaluation of the halved
@@ -1325,22 +1355,13 @@ pub(crate) fn build_coupling_csr(
 /// seed); the caller owns resetting it per fit. `a_rhs` (length ≥ k_total) is the
 /// RHS scratch, packed `[g_core in (f,local) order | g_e]`.
 ///
-/// **Step-halving (lme4 `pwrssUpdate`, retrospective form — mirrors
-/// `pirls_solve` / `pirls_solve_blocked`):** each iteration evaluates the trial
-/// `u` first; only if the same-point penalized deviance `dev + ‖u‖²` rose above
-/// the last accepted value BY MORE than the tol band does it halve `δu = u −
-/// u_prev` and re-evaluate, up to `PIRLS_MAX_HALVINGS` times (then
-/// `(NaN, NaN, NaN, false)`); a within-band rise is accepted (FP noise near the
-/// optimum, never burns a halving). `u_prev` is the caller-owned length-`k_total`
-/// backtrack buffer (β is FIXED here, so only `u_prev` is needed). A halved retry
-/// re-enters the top and re-runs the full structured factor + Schur
-/// (`structured_factor` / `structured_ainv_solve`) on the backtracked `u` — a
-/// numeric refactor per iteration is already the design. Convergence is today's
-/// mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` rule checked AFTER the step — bit-identical iterate
-/// path and returns to the pre-halving loop when no halving fires; `core_blocks` /
-/// `schur_blk` / `coupling` and `log|A|` on return are from the final step's
-/// assembly — exactly the factors that produced the returned u, preserving the
-/// `structured_schur_fill` contract above (it reads those buffers).
+/// Step-halving: see `pirls_solve`'s doc — identical mechanism, scoped here to
+/// `u_prev` only (β is FIXED in this variant). A halved retry re-enters the top
+/// and re-runs the full structured factor + Schur (`structured_factor` /
+/// `structured_ainv_solve`) on the backtracked `u`; `core_blocks` / `schur_blk` /
+/// `coupling` and `log|A|` on return are from the final step's assembly,
+/// preserving the `structured_schur_fill` contract above (it reads those
+/// buffers).
 ///
 /// **β mode (`beta_step`):** `Fixed` holds β at the caller's input (β read-only,
 /// FD-Hessian / stage-2 contract). `Profile` adds a joint δβ Schur-border step
@@ -1424,6 +1445,12 @@ pub(crate) fn pirls_solve_blocked_extras(
             eta_fixed[i] += o[i];
         }
     }
+    // First-trial backtrack seeds (u_prev = 0, beta_prev = caller's β) — only
+    // the domain-infeasibility trigger can read them; see `pirls_solve`.
+    u_prev[..k].fill(0.0);
+    if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
+        beta_prev[..p].copy_from_slice(&beta[..p]);
+    }
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
     let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
@@ -1456,7 +1483,10 @@ pub(crate) fn pirls_solve_blocked_extras(
             yeta += y[i] * eta[i];
         }
         // --- pass 2: η[] → prob[]/w[] + deviance. Logit: verbatim fused SIMD.
-        // Other families: scalar general branch (clamps η in place). ---
+        // Other families: scalar general branch (clamps η in place;
+        // `infeasible` flags any raw η outside the link's open domain —
+        // Gamma-inverse only, mirrors `pirls_solve`). ---
+        let mut infeasible = false;
         dev = match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
@@ -1471,7 +1501,9 @@ pub(crate) fn pirls_solve_blocked_extras(
             other => {
                 let mut d = 0.0;
                 for i in 0..n {
-                    let e = crate::family::clamp_eta(other, eta[i]);
+                    let raw = eta[i];
+                    infeasible |= crate::family::eta_infeasible(other, raw);
+                    let e = crate::family::clamp_eta(other, raw);
                     eta[i] = e;
                     let mui = crate::family::link_inv(other, e);
                     prob[i] = mui;
@@ -1494,8 +1526,9 @@ pub(crate) fn pirls_solve_blocked_extras(
         let penalized = dev + pen_u;
         // BAND-TOLERANT overshoot test, mirrors `pirls_solve` (see its comments for
         // why a within-band rise is accepted rather than converged-on or halved):
-        // only a rise EXCEEDING the tol band backtracks.
-        if penalized - pen_accepted > tol * (1.0 + penalized.abs()) {
+        // only a rise EXCEEDING the tol band backtracks. A domain-infeasible trial
+        // halves regardless of the band (see `pirls_solve`'s comment).
+        if infeasible || penalized - pen_accepted > tol * (1.0 + penalized.abs()) {
             if halvings < PIRLS_MAX_HALVINGS {
                 // Last full step overshot: halve δu = u − u_prev and re-enter the top
                 // (the recompute above is the trial evaluation of the halved step; a

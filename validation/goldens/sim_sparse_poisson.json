@@ -1,0 +1,87 @@
+{
+  "name": "sim_sparse_poisson",
+  "engine": "lme4::glmer",
+  "engine_version": "1.1.38",
+  "kind": "glmm",
+  "data": "sim_sparse_poisson",
+  "family": "poisson",
+  "link": "log",
+  "nagq": 1,
+  "tolPwrss": 1e-13,
+  "r_formula": "y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.165227123933105, 0.497245710445165],
+    "se_hessian": [0.396168347789517, 0.0313749143320371],
+    "se_rx": [0.395852568936618, 0.0312571068669314],
+    "loglik": -700.721474115799,
+    "varcomp": [
+      {
+        "group": "g1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.582136014453751],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.309685905401286],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c2",
+        "terms": ["(Intercept)"],
+        "stddev": [0.454157288852828],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c3",
+        "terms": ["(Intercept)"],
+        "stddev": [0.393801182136475],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c4",
+        "terms": ["(Intercept)"],
+        "stddev": [0.317628882874025],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c5",
+        "terms": ["(Intercept)"],
+        "stddev": [0.304317583148592],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c6",
+        "terms": ["(Intercept)"],
+        "stddev": [0.382565254364751],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c7",
+        "terms": ["(Intercept)"],
+        "stddev": [0.45733232351609],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  }
+}

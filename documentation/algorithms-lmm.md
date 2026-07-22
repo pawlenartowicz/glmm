@@ -12,7 +12,7 @@ An LMM here is a Gaussian response with one or more grouping factors, each
 carrying an intercept and optionally random slopes. Estimation is **REML only**
 (there is no ML switch on this path — `src/fit/lmm.rs` hardcodes
 `reml: true`): every objective below is the profiled REML deviance, so the
-parity rungs are all fit `reml = true`. The fixed effects β and the residual
+validation rungs are all fit `reml = true`. The fixed effects β and the residual
 scale σ² are profiled out analytically; the optimiser sees only the relative
 covariance parameter θ.
 
@@ -49,9 +49,9 @@ Three real routing decisions sit between `fit_cold`/`fit_warm` and a returned
    caps in `src/consts.rs`), **or** any extra grouping carries a random slope,
    **or** the total `Crossed` level count exceeds `MAX_CROSSED_LEVELS` (500).
    Otherwise `NoZ`.
-2. **Kernel** — `NoZ` Gaussian goes to `fit_mle` (`src/fit/lmm.rs`) →
-   `fit_lmm` (`src/lmm.rs`); `Sparse` Gaussian goes to `fit_mle_sparse`
-   (`src/sparse/mod.rs`). Both minimise the same profiled-REML objective over
+2. **Kernel** — `NoZ` Gaussian goes to `accumulate_lmm_rows` + `lmm_run_on`
+   (`src/fit/lmm.rs`) → `fit_lmm` (`src/lmm.rs`); `Sparse` Gaussian goes to
+   `fit_mle_sparse` (`src/sparse/mod.rs`). Both minimise the same profiled-REML objective over
    the same θ seed/bounds; the sparse path is a superset that reproduces the
    dense fit to machine precision on any in-envelope design (see
    [the sparse section](#the-sparse-kernel-two-level-schur-block-cholesky)
@@ -66,7 +66,7 @@ Three real routing decisions sit between `fit_cold`/`fit_warm` and a returned
 flowchart TD
     A["Gaussian, re: Some"] --> B{"classify_design"}
     B -->|"over envelope / slope on extra / >500 crossed levels"| S["Solver::Sparse: fit_mle_sparse"]
-    B -->|"in envelope"| N["Solver::NoZ: fit_mle -> fit_lmm"]
+    B -->|"in envelope"| N["Solver::NoZ: lmm_run_on -> fit_lmm"]
     N --> C{"reml_deviance sub-path"}
     C -->|"slope on extra grouping"| BL["reml_deviance_blocked"]
     C -->|"intercept-only primary, balanced"| CO["balanced collapse shortcut"]
@@ -82,7 +82,8 @@ extras), forms the raw RE Gram `G = ZᵀZ`, and takes **one dense Cholesky** of
 `P = ΛᵀGΛ + I` augmented with `[X y]` — `O(k_total³)` per evaluation, paid
 only when an extra grouping carries a random slope.
 
-**Code**: `classify_design` (`src/fit/mod.rs`); `fit_mle` (`src/fit/lmm.rs`);
+**Code**: `classify_design` (`src/fit/mod.rs`); `build_workspace`/`fit_on`
+(`src/fit/core.rs`); `accumulate_lmm_rows`, `lmm_run_on` (`src/fit/lmm.rs`);
 `fit_lmm`, `reml_deviance`, `reml_deviance_blocked`,
 `precompute_balanced_collapse` (`src/lmm.rs`); `fit_mle_sparse`,
 `sparse_reml_deviance` (`src/sparse/mod.rs`); caps in `src/consts.rs`.
@@ -149,19 +150,20 @@ accumulator (`LmmSuffStats::add_rows_multi`, `src/lmm.rs`) folds `√wᵢ` into
 every accumulated quantity exactly once per side, so every Gram product carries
 `wᵢ` — but the level counts and df stay raw-row (`n − p`). The weighted
 Gaussian deviance needs one further θ-independent term, `−Σ log wᵢ`; because it
-does not move the optimum, `fit_mle` (`src/fit/lmm.rs`) applies it to the
-deviance (and recomputes the loglik) *after* optimization rather than paying it
-per evaluation.
+does not move the optimum, `lmm_view_to_fit` (`src/fit/lmm.rs`) applies it to
+the deviance (and recomputes the loglik) *after* optimization rather than paying
+it per evaluation. It sits in the `Fit` assembly, the one site every caller
+reaches, so no caller applies it a second time.
 
 **Offset.** A `FitOptions::offset` is an exact response shift under the
-identity link: `fit_mle` accumulates `y − o` and nothing downstream needs to
-know (same convention as the OLS path).
+identity link: the core's `LmmDense` arm accumulates `y − o` and nothing
+downstream needs to know (same convention as the OLS path).
 
 The objective returns `f64::INFINITY` on any Cholesky failure or non-positive σ̂²
 — that value is the deviance failure surface BOBYQA is driven over.
 
 **Code**: `reml_deviance`, `reml_deviance_blocked`, `LmmSuffStats::add_rows_multi`
-(`src/lmm.rs`); `fit_mle` (`src/fit/lmm.rs`); `sparse_reml_deviance`
+(`src/lmm.rs`); `accumulate_lmm_rows` (`src/fit/lmm.rs`); `sparse_reml_deviance`
 (`src/sparse/mod.rs`); `profiled_deviance` (`src/lme.rs`).
 **Convention**: lme4's profiled REML `devfun` — β and σ² profiled out, optimiser
 on θ. **Validation**: the loglik gate is near-exact for LMM rungs (absolute
@@ -207,11 +209,11 @@ means failure/cap-out — see the boundary section). Its rank guard is a local
 `EPS_RANK = 1e-8` (numerically identical to the `lmm.rs` copy) applied to the
 pinning Cholesky after Brent converges.
 
-This kernel is **not on the `fit_cold`/`fit_warm` path** — `mod lme` is
-private, re-exported only through the unstable `loop_advanced` cargo feature,
-which the MCPower hot loop consumes. The public surface routes every
-single-intercept Gaussian LMM through `fit_lmm`'s collapse shortcut instead;
-the two agree up to re-association.
+This kernel is on **no** fitting path — `mod lme` is private, re-exported only
+through the unstable `loop_advanced` cargo feature for a caller that wants to
+drive it directly. Every tier, stable and loop, routes the single-intercept
+Gaussian LMM through `fit_lmm`'s collapse shortcut instead; the two agree up to
+re-association.
 
 **Code**: `precompute_balanced_collapse`, the `collapse` branch of `reml_deviance`
 (`src/lmm.rs`); `lme_fit`, `profiled_deviance`, `brent_minimize`, constants
@@ -244,7 +246,7 @@ route) is:
 trust-radius shrinkage, not travel distance. It is then capped at `0.5` so the
 start `θ₀ = 1` stays clear of the `0` lower bound — PRIMA nudges any start that
 lands within `rho_begin` of a bound. `RHO_END = 1e-6` was measured equivalent to
-`1e-8` on every parity check under the crate's absolute floors, at ~25% fewer
+`1e-8` on every validation check under the crate's absolute floors, at ~25% fewer
 evals. (The neighbouring constant `GLMM_RHO_END` in the same file is the GLMM
 outer loop's own, separately-swept schedule — it never applies here.)
 
@@ -273,7 +275,7 @@ diagnostics from that same dense path.
 default `nloptwrap`/`bobyqa` optimiser for `lmer`. **Validation**: sleepstudy
 (`n_θ = 3`, correlated slope), Penicillin (crossed), Pastes (nested) drive the
 general elimination; sim_slope_extra drives the sparse variant. The tuning
-constants were swept against the parity corpus (27 manifest datasets, rungs
+constants were swept against the validation corpus (27 manifest datasets, rungs
 1–23 and 25–28, all green; rung 24 backed out).
 
 ## Boundary handling (PIN_THETA)
@@ -374,7 +376,7 @@ MixedModels.jl.
 
 ## Validation
 
-The parity harness (`parity/`) fits the same model on the same CSV with lme4,
+The validation suite (`validation/`) fits the same model on the same CSV with lme4,
 MixedModels.jl, and `glmm`, and gates β and varcomp std-devs at relative ~1e-3,
 the LMM `se` at ~1e-3, and the REML loglik at absolute ~1e-6. The committed data
 plus the reference JSONs are the frozen oracle: on any disagreement `glmm` is

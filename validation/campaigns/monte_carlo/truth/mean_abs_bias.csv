@@ -1,0 +1,16 @@
+# Frozen oracle: Li & Signorelli (2026), "A Comparison of R Packages for
+# Estimating GLMMs", arXiv 2606.15933v1, Table 4 (mean absolute bias), page 13.
+# Grand average across the 24 simulation cells of |mean(theta_hat) - theta_true|,
+# per package, over the "good"-converged replications. "-" (invalid) rendered NA:
+# lme4_AGQ has no multidim RE (no tau1/rho01); hglm has no RE correlation (no rho01);
+# brms was run on RI-only cells (no tau1/rho01). True params: b0=.1 b1=.3 b2=-.2 b3=.1 tau0=.8 tau1=.4 rho01=.2
+# Competitor columns are never recomputed by us; only glmm's column is added downstream.
+package,beta0,beta1,beta2,beta3,tau0,tau1,rho01
+lme4_LA,0.011,0.031,0.024,0.039,0.086,0.295,0.083
+lme4_AGQ,0.007,0.011,0.015,0.020,0.036,NA,NA
+GLMMadaptive,0.006,0.017,0.013,0.016,0.071,0.380,0.241
+glmmTMB,0.014,0.067,0.017,0.039,0.174,0.615,0.280
+MASS,0.038,0.020,0.013,0.017,0.099,0.418,0.303
+hglm,0.062,0.030,0.016,0.014,0.289,0.175,NA
+brms,0.015,0.016,0.024,0.029,0.080,NA,NA
+rstanarm,0.010,0.021,0.013,0.018,0.082,0.404,0.232

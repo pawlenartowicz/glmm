@@ -171,9 +171,10 @@ const SUCCESS: &[SuccessCase] = &[
         "y ~ x + z + (1|g) + (1+x+z|h)",
         "y",
         &["x", "z"],
-        // Parser-extraction order: slopes (step 2) before plain intercepts (step 3),
-        // NOT formula order — so slope(x,z)|h precedes intercept|g here.
-        &["slope(x,z)|h", "intercept|g"],
+        // Formula order: the intercept term is written first, so it lowers
+        // first (and becomes the primary grouping) even though the parser's
+        // slope stage runs before its intercept stage.
+        &["intercept|g", "slope(x,z)|h"],
     ),
     (
         "022_implicit_intercept_slope",
@@ -394,6 +395,56 @@ fn redundant_explicit_one_in_implicit_form_is_dropped() {
             group: "g".into(),
             vars: vec!["x".into()]
         }]
+    );
+}
+
+#[test]
+fn nested_term_sorts_first_even_when_written_last() {
+    // `NestedWithin` is interpreted relative to the primary grouping, so a
+    // nested pair must supply the primary — it outranks formula order.
+    let f = parse("y ~ x + (1|c1) + (1|g1/g2)").unwrap();
+    assert_eq!(
+        f.random_effects,
+        vec![
+            RandomEffect::Intercept {
+                group: "g1".into(),
+                parent: None,
+            },
+            RandomEffect::Intercept {
+                group: "g1:g2".into(),
+                parent: Some("g1".into()),
+            },
+            RandomEffect::Intercept {
+                group: "c1".into(),
+                parent: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn seam_match_from_embedded_re_term_still_parses() {
+    // Degenerate input: an RE term embedded in another. The nested stage
+    // removes `(1|a/b)` and the slope stage then matches across the seam
+    // (`(1+x+|g)`), whose text does not occur in the original RHS — the
+    // position lookup must fall back (sort to the end), not panic.
+    let f = parse("y ~ (1+x+(1|a/b)|g)").unwrap();
+    assert_eq!(
+        f.random_effects,
+        vec![
+            RandomEffect::Intercept {
+                group: "a".into(),
+                parent: None,
+            },
+            RandomEffect::Intercept {
+                group: "a:b".into(),
+                parent: Some("a".into()),
+            },
+            RandomEffect::Slope {
+                group: "g".into(),
+                vars: vec!["x".into()],
+            },
+        ]
     );
 }
 

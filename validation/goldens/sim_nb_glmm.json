@@ -1,0 +1,32 @@
+{
+  "name": "sim_nb_glmm",
+  "engine": "lme4::glmer.nb",
+  "engine_version": "1.1.38",
+  "kind": "glmm",
+  "data": "sim_nb",
+  "family": "negbin",
+  "link": "log",
+  "nagq": 1,
+  "tolPwrss": 1e-13,
+  "r_formula": "y ~ 1 + x + grp + (1 | cluster)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x", "grpb"],
+  "estimates": {
+    "beta": [-0.0207666865912213, 0.593956396029443, 0.599437426457325],
+    "se_hessian": [0.16316687420593, 0.0721280781804034, 0.141480932960649],
+    "se_rx": [0.16231380449049, 0.0687415162050713, 0.143708768712412],
+    "loglik": -481.455432449267,
+    "varcomp": [
+      {
+        "group": "cluster",
+        "terms": ["(Intercept)"],
+        "stddev": [0.574213729137204],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "theta": 1.78363190531981
+  }
+}

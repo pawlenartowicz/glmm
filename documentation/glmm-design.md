@@ -10,7 +10,7 @@ detail: [`algorithms.md`](algorithms.md),
 All engines minimise the same objective — the profiled deviance over the
 relative-Cholesky θ, derivative-free. `glmm` changes how each evaluation is
 computed and what happens at the edges, not what is estimated: point estimates
-agree with lme4/MixedModels.jl to the parity gates (~1e-3 relative on β and
+agree with lme4/MixedModels.jl to the validation gates (~1e-3 relative on β and
 variance components) on every supported design.
 
 ## The differences
@@ -77,7 +77,7 @@ schedule scaled to the start point, a stopping radius relaxed from `1e-8` to
 `1e-6`, and for GLMMs a two-stage search (θ-only with β profiled inside PIRLS,
 then a joint `[θ|β]` polish that alone decides convergence).
 
-**Why it is faster.** Every choice was swept against the parity corpus and
+**Why it is faster.** Every choice was swept against the validation corpus and
 kept only where it cut evaluations without moving any gated result: the `npt`
 mid-size won on every dimension ≥ 3, the relaxed stopping radius saved ~25% of
 evaluations at measured-equivalent accuracy, and stage 1 is a pure warm-start
@@ -92,7 +92,7 @@ and the deviance fold in one vectorised pass over crate-own minimax `exp`/
 
 **Why it is faster.** IRLS/PIRLS time is dominated by link-function
 transcendentals. Fusing them removes redundant `exp` calls and keeps the loop
-in SIMD registers; the ≤ 2 ULP bound keeps the result within the parity gates.
+in SIMD registers; the ≤ 2 ULP bound keeps the result within the validation gates.
 
 ## 6. Standard errors from a tightly re-converged Hessian
 
@@ -146,7 +146,7 @@ reach.
 
 ## What keeps the speed honest
 
-Every difference above is held to the frozen parity oracle: identical models
+Every difference above is held to the frozen validation oracle: identical models
 fit in R/lme4 and Julia/MixedModels.jl — two independent implementations — on
 27 committed datasets from single-intercept LMMs to crossed/nested/sparse
 GLMMs. On any disagreement `glmm` is presumed wrong; references are never

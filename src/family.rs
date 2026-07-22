@@ -50,6 +50,27 @@ pub(crate) fn clamp_eta(family: Family, eta: f64) -> f64 {
     }
 }
 
+/// True iff η lies outside the link's OPEN domain — only the Gamma inverse
+/// link has one (μ = 1/η needs η > 0); every other family/link's η domain is
+/// all of ℝ, where [`clamp_eta`]'s bounds are overflow guards, not domain
+/// edges, so this is constant-false there. PIRLS treats a trial iterate that
+/// violates this as a failed step and halves toward the last accepted feasible
+/// iterate (R `glm.fit`'s `valideta` step-halving), because letting
+/// [`clamp_eta`]'s boundary projection stand would let the solve converge ON
+/// the boundary: at η = MU_FLOOR the working weight is μ² ≈ 1e20, the pinned
+/// row dominates the WLS solve, and PIRLS reports a spuriously converged
+/// boundary answer (measured on the Gamma-inverse `sim_gamma` cell: a ~98-unit
+/// deviance cliff in the θ surface, one clamped row carrying all of it).
+pub(crate) fn eta_infeasible(family: Family, eta: f64) -> bool {
+    matches!(
+        family,
+        Family::Gamma {
+            link: GammaLink::Inverse,
+            ..
+        }
+    ) && eta <= 0.0
+}
+
 /// Clamp μ to each family's valid domain: `≥ MU_FLOOR` for Poisson/Gamma/NB
 /// (positive mean), `(PROB_EPS, 1−PROB_EPS)` for binomial. Gaussian passes through.
 pub(crate) fn clamp_mu(family: Family, mu: f64) -> f64 {

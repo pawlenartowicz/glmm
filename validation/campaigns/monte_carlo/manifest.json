@@ -1,0 +1,63 @@
+{
+  "study": "GLMM accuracy benchmark, mirror of Li & Signorelli (2026)",
+  "paper": "arXiv:2606.15933v1, A Comparison of R Packages for Estimating GLMMs",
+  "external_repo": "github.com/xanalee/glmmPackCompare",
+  "external_commit": "48b8eb2da674a149f80ba3ca3b2bd9bc174869ee",
+  "generator": "external/scripts/00_SetHyperparameters.R + 01_GenerateData.R (set.seed(126))",
+  "response_used": "y_full",
+  "S": 1000,
+  "lme4_subset_reps": 200,
+  "nagq_agq": 11,
+  "fit_engine": "fastglmm (r/ port of the glmm Rust kernel)",
+  "true_params": {"beta0": 0.1, "beta1": 0.3, "beta2": -0.2, "beta3": 0.1, "tau0": 0.8, "tau1": 0.4, "rho01": 0.2},
+  "dgp": {
+    "eta": "b0 + b1*t + b2*d + b3*(t*d) + u0 + u1*t",
+    "d_i": "Bernoulli(0.4), per subject",
+    "time_grid": "sort of a size-m_i sample without replacement from {0,1/(M-1),...,1}",
+    "cluster_sizes": "m_i ~ DiscreteUniform(1, M)",
+    "RI_only": {"tau0": 0.8},
+    "RI_slope": {"tau0": 0.8, "tau1": 0.4, "rho01": 0.2, "cov_byrow": true}
+  },
+  "formulas": {
+    "rdi": "y_full ~ time + group + time:group + (1 | id)",
+    "rdis": "y_full ~ time + group + time:group + (1 + time | id)"
+  },
+  "arms": {
+    "glmm_LA": {"nAGQ": 1, "cells": "all 24"},
+    "glmm_AGQ": {"nAGQ": 11, "cells": "12 RI-only (rdi) cells"},
+    "lme4_LA": {"nAGQ": 1, "cells": "all 24", "reps": 200, "role": "validation gate + timing denominator"},
+    "lme4_AGQ": {"nAGQ": 11, "cells": "12 RI-only cells", "reps": 200, "role": "validation gate"}
+  },
+  "metric": {
+    "bias": "grand mean over cells of |mean_reps(theta_hat) - theta_true|",
+    "rmse": "grand mean over cells of sqrt(mean_reps((theta_hat - theta_true)^2))",
+    "reps_counted": "good-converged only (mirrors their real-convergence filter)",
+    "cell_sets": "betas & tau0 over all cells the arm covers; tau1 & rho01 over slope cells only (na.rm)"
+  },
+  "cells": [
+    {"id": "n50_M3_Bernoulli_rdi",   "n": 50,  "M": 3, "family": "Bernoulli", "slope": false},
+    {"id": "n50_M9_Bernoulli_rdi",   "n": 50,  "M": 9, "family": "Bernoulli", "slope": false},
+    {"id": "n50_M3_Poisson_rdi",     "n": 50,  "M": 3, "family": "Poisson",   "slope": false},
+    {"id": "n50_M9_Poisson_rdi",     "n": 50,  "M": 9, "family": "Poisson",   "slope": false},
+    {"id": "n100_M3_Bernoulli_rdi",  "n": 100, "M": 3, "family": "Bernoulli", "slope": false},
+    {"id": "n100_M9_Bernoulli_rdi",  "n": 100, "M": 9, "family": "Bernoulli", "slope": false},
+    {"id": "n100_M3_Poisson_rdi",    "n": 100, "M": 3, "family": "Poisson",   "slope": false},
+    {"id": "n100_M9_Poisson_rdi",    "n": 100, "M": 9, "family": "Poisson",   "slope": false},
+    {"id": "n200_M3_Bernoulli_rdi",  "n": 200, "M": 3, "family": "Bernoulli", "slope": false},
+    {"id": "n200_M9_Bernoulli_rdi",  "n": 200, "M": 9, "family": "Bernoulli", "slope": false},
+    {"id": "n200_M3_Poisson_rdi",    "n": 200, "M": 3, "family": "Poisson",   "slope": false},
+    {"id": "n200_M9_Poisson_rdi",    "n": 200, "M": 9, "family": "Poisson",   "slope": false},
+    {"id": "n50_M3_Bernoulli_rdis",  "n": 50,  "M": 3, "family": "Bernoulli", "slope": true},
+    {"id": "n50_M9_Bernoulli_rdis",  "n": 50,  "M": 9, "family": "Bernoulli", "slope": true},
+    {"id": "n50_M3_Poisson_rdis",    "n": 50,  "M": 3, "family": "Poisson",   "slope": true},
+    {"id": "n50_M9_Poisson_rdis",    "n": 50,  "M": 9, "family": "Poisson",   "slope": true},
+    {"id": "n100_M3_Bernoulli_rdis", "n": 100, "M": 3, "family": "Bernoulli", "slope": true},
+    {"id": "n100_M9_Bernoulli_rdis", "n": 100, "M": 9, "family": "Bernoulli", "slope": true},
+    {"id": "n100_M3_Poisson_rdis",   "n": 100, "M": 3, "family": "Poisson",   "slope": true},
+    {"id": "n100_M9_Poisson_rdis",   "n": 100, "M": 9, "family": "Poisson",   "slope": true},
+    {"id": "n200_M3_Bernoulli_rdis", "n": 200, "M": 3, "family": "Bernoulli", "slope": true},
+    {"id": "n200_M9_Bernoulli_rdis", "n": 200, "M": 9, "family": "Bernoulli", "slope": true},
+    {"id": "n200_M3_Poisson_rdis",   "n": 200, "M": 3, "family": "Poisson",   "slope": true},
+    {"id": "n200_M9_Poisson_rdis",   "n": 200, "M": 9, "family": "Poisson",   "slope": true}
+  ]
+}

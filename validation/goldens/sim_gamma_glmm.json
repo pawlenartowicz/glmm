@@ -1,0 +1,33 @@
+{
+  "name": "sim_gamma_glmm",
+  "engine": "lme4::glmer",
+  "engine_version": "1.1.38",
+  "kind": "glmm",
+  "data": "sim_gamma",
+  "family": "gamma",
+  "link": "log",
+  "nagq": 1,
+  "tolPwrss": 1e-13,
+  "r_formula": "y ~ 1 + x + grp + (1 | cluster)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x", "grpb"],
+  "estimates": {
+    "beta": [0.308865929298002, 0.577787588536638, 0.455502211064488],
+    "se_hessian": [0.139118158213407, 0.0428018925517171, 0.0883108454540967],
+    "se_rx": [0.116942135617231, 0.0453778125377997, 0.0929173943803303],
+    "loglik": -445.173519506374,
+    "varcomp": [
+      {
+        "group": "cluster",
+        "terms": ["(Intercept)"],
+        "stddev": [0.485218221666796],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "dispersion": 0.526574217524446,
+    "sigma": 0.756696599409696
+  }
+}

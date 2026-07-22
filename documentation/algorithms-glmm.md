@@ -10,7 +10,7 @@ The page ends with a [comparison](#how-the-other-engines-fit-a-glmm) against
 lme4, MixedModels.jl, and GLMMadaptive.
 
 Each section names its code, the lme4/`glmer` (or `MixedModels.jl`) semantics it
-follows, and the parity rungs that pin it. Estimation is `glmer`-faithful
+follows, and the validation rungs that pin it. Estimation is `glmer`-faithful
 `nAGQ=1` Laplace by default; AGQ (`nAGQ>1`) is an opt-in on a single grouping
 factor with up to 3 random effects per group, binomial/Poisson.
 
@@ -252,8 +252,8 @@ each cluster's PIRLS mode/curvature. **Validation:** in-crate goldens
 `fit_glmm_binomial_agq_matches_lme4` and `fit_glmm_poisson_agq_matches_lme4`
 (against `goldens/cbpp_agq_k{1,7,11}.json` and
 `goldens/grouseticks_agq_k{1,7,11}.json`); the vector-RE shapes are anchored at
-Laplace by parity rungs 25–27 (`sim_binomial_slope1`, `sim_poisson_slope1`,
-`sim_binomial_slope2`). AGQ itself is **not** part of the 3-way `parity/`
+Laplace by validation rungs 25–27 (`sim_binomial_slope1`, `sim_poisson_slope1`,
+`sim_binomial_slope2`). AGQ itself is **not** part of the 3-way `validation/`
 sweep — that corpus is pinned to Laplace (`nAGQ=1`) so it can compare
 like-to-like across lme4, MixedModels.jl and glmm; AGQ lives in the goldens
 track alone, since it is fundamentally an lme4-vs-glmm comparison.
@@ -322,8 +322,10 @@ sparse NB path by `goldens/sim_sparse_nb.json`.
 
 **Code:** `GlmmWorkspace::for_cluster_spec` / `from_groupings` in
 `src/glmm/workspace.rs`; within-fit seeding in `glmm::fit_glmm`
-(`src/glmm/mod.rs`); `glm_warm_start_beta` (`src/fit/glmm.rs`); the
-`loop_advanced` reuse surface (see [`TUTORIAL-RUST.md`](TUTORIAL-RUST.md) §3).
+(`src/glmm/mod.rs`); `glm_warm_start_beta` (`src/fit/glmm.rs`). A
+`loop_advanced` caller reaches this reuse through `build_workspace`/`fit_on`
+(see [`TUTORIAL-RUST.md`](TUTORIAL-RUST.md) §3), which owns the `GlmmWorkspace`
+rather than handing it over.
 
 All GLMM solver scratch lives in one `GlmmWorkspace`, allocated **once per
 (spec, max_n) shape** — its buffers depend only on `(groupings, family, p,
@@ -346,10 +348,20 @@ warm-starts both, unlike the LMM kernel which seeds θ only). A cold start seeds
 own scratch) before the RE structure is even considered, which is
 lme4/`glmer`'s own initialization — and θ from the blind `THETA0`. Within a
 fit, `u_seed` holds the conditional-mode warm start incumbent, but it is
-**reset to 0 at the start of every `fit_glmm`** and never carried across fits —
-the conditional mode is point-determined given (θ, β), so the seed only shifts
-the stopping iterate within the PIRLS exit band, and a cross-fit carry is
-deliberately rejected (it would break same-seed reproducibility).
+**reset to 0 at the start of every `fit_glmm`** and never carried across fits — a
+cross-fit carry is deliberately rejected (it would break same-seed
+reproducibility).
+
+The seed is usually immaterial: where the conditional mode is unique given
+(θ, β) it only shifts the stopping iterate within the PIRLS exit band. That is
+not guaranteed, though, and the exception is load-bearing for the standard
+errors. On a Gamma fit with the **inverse** link the mode problem has more than
+one basin, and a cold solve at the converged γ̂ can land in a different basin than
+the fit itself reached — measured on `sim_gamma`, deviance 1034.57 against the
+fit's 936.77 at the same γ̂. `fd_hessian_cov` therefore seeds every one of its
+finite-difference evaluations, the central one included, from the mode the fit
+converged to rather than re-deriving it cold; differentiating around the wrong
+basin produced an indefinite Hessian and cost the fit its SEs entirely.
 
 **Validation:** the warm/cold equivalence is a MLE property (start-independent
 optimum), exercised implicitly by every rung; the zero-alloc reuse discipline is
@@ -396,7 +408,7 @@ fits via `isSingular` (θ diagonal `< 1e-4`), but reports the raw converged
 θ rather than pinning; the two engines flag near-identical boundary sets on
 identical data (see the engine comparison below). **Validation:** the LMM τ̂≈0
 tests in `src/lmm.rs` pin the shared pin loop; the accuracy study
-(`accuracy/`) exercises the GLMM boundary at scale.
+(`validation/campaigns/monte_carlo/`) exercises the GLMM boundary at scale.
 
 ## Standard errors
 
@@ -445,7 +457,7 @@ fit is ~1.9× its Rx fit.
 (numDeriv Hessian of the Laplace deviance); `WaldSe::Rx` ≡
 `vcov(use.hessian = FALSE)` and the MixedModels.jl vcov. **Validation:** the
 committed fixture `tests/fixtures/glmm_hessian_vcov.json` (n=96 /
-12-cluster `y ~ x1 + (1|grp)`) pins the FD scheme; in the `parity/` sweep the two
+12-cluster `y ~ x1 + (1|grp)`) pins the FD scheme; in the `validation/` sweep the two
 methods are gated separately — `se_rx` against all three engines
 (cbpp, grouseticks; glmm sits on the MixedModels value, ~6e-7 on cbpp) and
 `se_hessian` against lme4 alone (`n/a` for MixedModels, which has no Hessian
@@ -470,7 +482,7 @@ its own.
 
 ## Validation
 
-The GLMM paths are held to the frozen `parity/` oracle (`parity/README.md`) —
+The GLMM paths are held to the frozen `validation/` oracle (`validation/README.md`) —
 two independent reference engines (R `lme4`, Julia `MixedModels.jl`) agreeing
 within tolerance is the truth condition; on any disagreement glmm is presumed
 wrong. Estimation is pinned to Laplace (`nAGQ=1`) across the sweep so all three
@@ -535,7 +547,7 @@ In practice:
   log-Cholesky can only asymptote toward it, so its optimizer stops at an
   interior point and rarely reports a singular fit even when the MLE is
   singular. Measured rep-by-rep on identical data in the accuracy study
-  (`accuracy/`), `glmm` and lme4 flag near-identical boundary sets (AGQ:
+  (`validation/campaigns/monte_carlo/`), `glmm` and lme4 flag near-identical boundary sets (AGQ:
   identical; Laplace: 297 of 301 shared over 1069 matched fits), while
   GLMMadaptive reports 8 boundary fits where `glmm` reports 346 — and an
   engine-independent Gauss–Hermite referee of the exact marginal likelihood

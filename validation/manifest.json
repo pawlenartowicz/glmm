@@ -1,0 +1,1116 @@
+{
+  "schema": "glmm-parity-manifest/1",
+  "datasets": [
+    {
+      "name": "Dyestuff",
+      "rung": 1,
+      "source": "lme4",
+      "family": "gaussian",
+      "reml": true,
+      "timing_batch": 10,
+      "factors": [
+        "Batch"
+      ],
+      "r_formula": "Yield ~ 1 + (1 | Batch)",
+      "jl_formula": "@formula(Yield ~ 1 + (1 | Batch))"
+    },
+    {
+      "name": "sleepstudy",
+      "rung": 2,
+      "source": "lme4",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "Subject"
+      ],
+      "r_formula": "Reaction ~ 1 + Days + (1 + Days | Subject)",
+      "jl_formula": "@formula(Reaction ~ 1 + Days + (1 + Days | Subject))"
+    },
+    {
+      "name": "Penicillin",
+      "rung": 3,
+      "source": "lme4",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "plate",
+        "sample"
+      ],
+      "r_formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+      "jl_formula": "@formula(diameter ~ 1 + (1 | plate) + (1 | sample))"
+    },
+    {
+      "name": "Pastes",
+      "rung": 4,
+      "source": "lme4",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "batch",
+        "sample"
+      ],
+      "r_formula": "strength ~ 1 + (1 | batch) + (1 | sample)",
+      "jl_formula": "@formula(strength ~ 1 + (1 | batch) + (1 | sample))"
+    },
+    {
+      "name": "cbpp",
+      "rung": 5,
+      "source": "lme4",
+      "family": "binomial",
+      "reml": null,
+      "factors": [
+        "herd",
+        "period"
+      ],
+      "weights": "size",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)",
+      "jl_formula": "@formula(prop ~ 1 + period + (1 | herd))"
+    },
+    {
+      "name": "grouseticks",
+      "rung": 6,
+      "source": "lme4",
+      "family": "poisson",
+      "reml": null,
+      "factors": [
+        "BROOD",
+        "INDEX",
+        "LOCATION",
+        "YEAR"
+      ],
+      "r_formula": "TICKS ~ 1 + YEAR + cHEIGHT + (1 | BROOD) + (1 | INDEX) + (1 | LOCATION)",
+      "jl_formula": "@formula(TICKS ~ 1 + YEAR + cHEIGHT + (1 | BROOD) + (1 | INDEX) + (1 | LOCATION))"
+    },
+    {
+      "name": "sim_slope_extra",
+      "rung": 7,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g1) + (1 + x | g2))"
+    },
+    {
+      "name": "sim_sparse_binomial",
+      "rung": 8,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "factors": [
+        "g1",
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+        "c6",
+        "c7"
+      ],
+      "weights": "size",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+      "jl_formula": "@formula(prop ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7))"
+    },
+    {
+      "name": "sim_sparse_poisson",
+      "rung": 9,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "factors": [
+        "g1",
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+        "c6",
+        "c7"
+      ],
+      "r_formula": "y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+      "jl_formula": "@formula(y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7))"
+    },
+    {
+      "name": "Machines",
+      "rung": 10,
+      "source": "nlme",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "Worker",
+        "Machine"
+      ],
+      "r_formula": "score ~ 1 + Machine + (1 + Machine | Worker)",
+      "jl_formula": "@formula(score ~ 1 + Machine + (1 + Machine | Worker))"
+    },
+    {
+      "name": "Oats",
+      "rung": 11,
+      "source": "nlme",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "Block",
+        "Variety"
+      ],
+      "r_formula": "yield ~ 1 + Variety + nitro + (1 | Block/Variety)",
+      "jl_formula": "@formula(yield ~ 1 + Variety + nitro + (1 | Block/Variety))"
+    },
+    {
+      "name": "VerbAgg",
+      "rung": 12,
+      "source": "lme4",
+      "family": "binomial",
+      "reml": null,
+      "factors": [
+        "Gender",
+        "btype",
+        "situ",
+        "mode",
+        "id",
+        "item"
+      ],
+      "r_formula": "y ~ 1 + Anger + Gender + btype + situ + mode + (1|id) + (1|item)",
+      "jl_formula": "@formula(y ~ 1 + Anger + Gender + btype + situ + mode + (1|id) + (1|item))"
+    },
+    {
+      "name": "cake",
+      "rung": 13,
+      "source": "lme4",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "recipe",
+        "replicate"
+      ],
+      "r_formula": "angle ~ 1 + recipe*temp + (1 | recipe:replicate)",
+      "jl_formula": "@formula(angle ~ 1 + recipe*temp + (1 | recipe & replicate))"
+    },
+    {
+      "name": "Arabidopsis",
+      "rung": 14,
+      "source": "lme4",
+      "family": "poisson",
+      "reml": null,
+      "factors": [
+        "nutrient",
+        "rack",
+        "amd",
+        "status",
+        "popu",
+        "gen"
+      ],
+      "r_formula": "total.fruits ~ 1 + nutrient + amd + rack + status + (1 | popu/gen)",
+      "jl_formula": "@formula(total_fruits ~ 1 + nutrient + amd + rack + status + (1 | popu/gen))"
+    },
+    {
+      "name": "sim_three_level",
+      "rung": 15,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "r_formula": "y ~ 1 + x + (1 | g1/g2)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g1/g2))"
+    },
+    {
+      "name": "sim_max_q_slope",
+      "rung": 16,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "g1"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1))"
+    },
+    {
+      "name": "sim_crossed_at_cap",
+      "rung": 17,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "factors": [
+        "g1",
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+        "c6"
+      ],
+      "r_formula": "y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6)",
+      "jl_formula": "@formula(y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6))"
+    },
+    {
+      "name": "sim_binomial_slope_crossed",
+      "rung": 18,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "weights": "size",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
+      "jl_formula": "@formula(prop ~ 1 + x + (1 + x | g1) + (1 + x | g2))"
+    },
+    {
+      "name": "sim_poisson_nested",
+      "rung": 19,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "r_formula": "y ~ 1 + x + (1 | g1/g2)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g1/g2))"
+    },
+    {
+      "name": "sim_unbalanced_nested",
+      "rung": 20,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "r_formula": "y ~ 1 + x + (1 | g1/g2)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g1/g2))"
+    },
+    {
+      "name": "sim_nested_crossed_mix",
+      "rung": 21,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "g1",
+        "g2",
+        "c1"
+      ],
+      "r_formula": "y ~ 1 + x + (1 | g1/g2) + (1 | c1)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g1/g2) + (1 | c1))"
+    },
+    {
+      "name": "cbpp_probit",
+      "rung": 22,
+      "source": "lme4",
+      "family": "binomial",
+      "link": "probit",
+      "reml": null,
+      "factors": [
+        "herd",
+        "period"
+      ],
+      "weights": "size",
+      "data": "cbpp",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)",
+      "jl_formula": "@formula(prop ~ 1 + period + (1 | herd))"
+    },
+    {
+      "name": "sim_gamma",
+      "rung": 23,
+      "source": "sim",
+      "family": "gamma",
+      "link": "log",
+      "reml": null,
+      "factors": [
+        "cluster",
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp + (1 | cluster)"
+    },
+    {
+      "name": "sim_sparse_gamma",
+      "rung": 24,
+      "source": "sim",
+      "family": "gamma",
+      "link": "log",
+      "reml": null,
+      "factors": [
+        "gp",
+        "ge"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + (1 | gp) + (1 + x1 + x2 + x3 + x4 | ge)"
+    },
+    {
+      "name": "sim_binomial_slope1",
+      "rung": 25,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g))"
+    },
+    {
+      "name": "sim_poisson_slope1",
+      "rung": 26,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g))"
+    },
+    {
+      "name": "sim_binomial_slope2",
+      "rung": 27,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + (1 + x1 + x2 | g))"
+    },
+    {
+      "name": "sim_poisson_offset",
+      "rung": 28,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "factors": [
+        "cluster"
+      ],
+      "offset": "log_exposure",
+      "r_formula": "y ~ 1 + x + (1 | cluster)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | cluster))"
+    },
+    {
+      "name": "wls_basic",
+      "rung": 29,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x1 + x2",
+      "tier": "weights"
+    },
+    {
+      "name": "glm_binomial_agg",
+      "rung": 30,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [],
+      "weights": "size",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x",
+      "tier": "weights"
+    },
+    {
+      "name": "glm_poisson",
+      "rung": 31,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [
+        "grp"
+      ],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x + grp",
+      "tier": "weights"
+    },
+    {
+      "name": "glm_gamma",
+      "rung": 32,
+      "source": "sim",
+      "family": "gamma",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [
+        "grp"
+      ],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x + grp",
+      "tier": "weights"
+    },
+    {
+      "name": "glm_nb",
+      "rung": 33,
+      "source": "sim",
+      "family": "negbin",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [
+        "grp"
+      ],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x + grp",
+      "tier": "weights"
+    },
+    {
+      "name": "lmm_intercept",
+      "rung": 34,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "timing_batch": 10,
+      "factors": [
+        "g"
+      ],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g))",
+      "tier": "weights"
+    },
+    {
+      "name": "lmm_slope",
+      "rung": 35,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "timing_batch": 10,
+      "factors": [
+        "g"
+      ],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g))",
+      "tier": "weights"
+    },
+    {
+      "name": "lmm_crossed",
+      "rung": 36,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "timing_batch": 10,
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "weights_col": "w",
+      "//": "R-only (no jl_formula) by MEASUREMENT, not design: the pinned MixedModels (v5.7.0) wts= is broken for any fit combining a slope block with a second crossed grouping -- on this data it collapses to sigma~3e-5 with beta~[34, 1.2] (initial-objective-evaluation failure, then a degenerate 'optimum'; reproduced under both LN_NEWUOA and LN_BOBYQA, and with a reduced (1+x|g1)+(1|g2) shape). Weighted single-grouping slopes (lmm_slope) and weighted crossed intercepts fit fine. lme4 and glmm agree to 2e-7 here, so the rung stays 2-way gated, same convention as the main harness's sim_binomial_slope_crossed.",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
+      "tier": "weights"
+    },
+    {
+      "name": "glmm_poisson",
+      "rung": 37,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "factors": [
+        "g"
+      ],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g))",
+      "tier": "weights"
+    },
+    {
+      "name": "glmm_binomial",
+      "rung": 38,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "factors": [
+        "g1",
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+        "c6",
+        "c7"
+      ],
+      "weights": "size",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+      "jl_formula": "@formula(prop ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7))",
+      "tier": "weights"
+    },
+    {
+      "name": "path_extreme_range",
+      "rung": 39,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x",
+      "tier": "weights"
+    },
+    {
+      "name": "path_near_zero",
+      "rung": 40,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [],
+      "weights_col": "w",
+      "gate": "dropped_rows",
+      "r_formula": "y ~ 1 + x",
+      "tier": "weights"
+    },
+    {
+      "name": "path_huge_int",
+      "rung": 41,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "timing_batch": 10,
+      "factors": [
+        "g"
+      ],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g))",
+      "tier": "weights"
+    },
+    {
+      "name": "path_dominant",
+      "rung": 42,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": null,
+      "timing_batch": 10,
+      "factors": [],
+      "weights_col": "w",
+      "r_formula": "y ~ 1 + x",
+      "tier": "weights"
+    },
+    {
+      "name": "all_ones",
+      "rung": 43,
+      "source": "sim",
+      "family": "gaussian",
+      "reml": true,
+      "timing_batch": 10,
+      "factors": [
+        "g"
+      ],
+      "weights_col": "w",
+      "gate": "unit_identity",
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g))",
+      "tier": "weights"
+    }
+  ],
+  "//gamma_rungs": "Rung 23 (sim_gamma, dense) RE-LANDED after the B1 varcorr sigma-hat^2 fix (2026-07-11 bug-fixes spec). Rung 24 (sim_sparse_gamma) RE-LANDED 2026-07-21: the backed-out failure was DIAGNOSED AND FIXED by the frontend RE-ordering change -- the parser used to extract slope REs before intercept REs, so the harness lowered (1|gp)+(1+x1..x4|ge) with ge as PRIMARY (q_p=5) and routed the DENSE kernel, whose joint optimizer lands ~2e-3 deviance above the tolPwrss=1e-13 lme4 optimum (beta[0] 1.9e-2 off). The frontend now lowers random effects in FORMULA ORDER (nested terms still sort first -- NestedWithin is relative to the primary), so gp is primary, the model routes SPARSE, and it lands 2e-4 above lme4 -- matching the in-crate golden that hand-builds the same orientation. Tolerances were NOT relaxed. STILL OPEN (recorded, not a rung gap): the dense joint optimizer's ~2e-3 shortfall on a q_p=5 primary with an extra grouping is real and reachable by writing the slope term first; the ordering fix stops ROUTING rung 24 there, it does not improve that path (dense stage-1/2 schedule work is a separate item). These are rung-18-style 2-WAY gates (no jl_formula): MixedModels' Gamma GLMM is a documented different estimator, its JSONs stay intentionally absent. See validation/README.md. GAMMA-INVERSE WITH RANDOM EFFECTS, SPARSE: attempted 2026-07-21 as spec sim_sparse_gamma_inv over the sim_sparse_gamma data and ABANDONED -- no oracle is obtainable there. That data is simulated under a LOG link and spans y 0.0045..265, so an inverse-link model is misspecified for it: eta goes negative, mu = 1/eta with it, and the Gamma likelihood is undefined. lme4 dies with 'PIRLS loop resulted in NaN value', and so does a plain fixed-only stats::glm on the same formula -- the failure is the data, not the mixed solver. Oracling this cell needs a dataset simulated under the inverse link, which is a new simulated fixture and a separate decision. The DENSE Gamma-inverse mixed cell is covered: sim_gamma_inv_glmm fits cleanly on sim_gamma.",
+  "//m3_goldens": "M3 family/link/AGQ reference fits for the IN-CRATE frozen goldens (NOT curated rungs). Generated by engines/goldens_agq.R into validation/goldens/<name>.json -- a SEPARATE dir so compare.R's results/<engine>/*.json glob (the curated cross-engine sweep) is untouched, per design 6 'the curated 6-rung oracle is NOT expanded'. lme4/MASS only; no Julia/Rust cross-check. Every golden in goldens/ must have an entry here and therefore a generator -- sleepstudy_lmm, penicillin_lmm and pastes_lmm sat in goldens/ unregistered and unregenerable until 2026-07-21; they are the SAME datasets as rungs 2/3/4 but distinct model specs (pastes_lmm is the nested (1|batch/cask) form, rung 4 is the flat idiom), which is why they are separate goldens rather than rung results. Their files previously predated this script and carried its predecessor's schema (reml instead of nagq, 12-sig-fig rounding, and pastes_lmm's varcomp blocks in the opposite order to the cask:batch-first order lme4 emits today). Regenerating them reproduced every estimate (penicillin stddev to 6e-7, the rounding; pastes to 1e-7 once the two blocks are matched by name), so the regenerated form was ADOPTED 2026-07-21 and all three are now byte-reproducible from this script. Adopting it required first converting every multi-block varcomp read in the crate to key by group NAME rather than index: glmm emits declaration order, lme4's VarCorr emits descending level count, and pastes_lmm is the fixture where the two disagree.",
+  "m3_goldens": [
+    {
+      "name": "grouseticks_glm",
+      "kind": "glm",
+      "data": "grouseticks",
+      "family": "poisson",
+      "link": "log",
+      "factors": [
+        "YEAR"
+      ],
+      "r_formula": "TICKS ~ 1 + YEAR + cHEIGHT"
+    },
+    {
+      "name": "cbpp_logit_glm",
+      "kind": "glm",
+      "data": "cbpp",
+      "family": "binomial",
+      "link": "logit",
+      "factors": [
+        "period"
+      ],
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + period"
+    },
+    {
+      "name": "cbpp_probit_glm",
+      "kind": "glm",
+      "data": "cbpp",
+      "family": "binomial",
+      "link": "probit",
+      "factors": [
+        "period"
+      ],
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + period"
+    },
+    {
+      "name": "cbpp_probit_glmm",
+      "kind": "glmm",
+      "data": "cbpp",
+      "family": "binomial",
+      "link": "probit",
+      "tolPwrss": 1e-13,
+      "factors": [
+        "herd",
+        "period"
+      ],
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)"
+    },
+    {
+      "name": "sim_gamma_glm",
+      "kind": "glm",
+      "data": "sim_gamma",
+      "family": "gamma",
+      "link": "log",
+      "factors": [
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
+      "name": "sim_gamma_inv_glm",
+      "kind": "glm",
+      "data": "sim_gamma",
+      "family": "gamma",
+      "link": "inverse",
+      "factors": [
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
+      "name": "sim_gamma_glmm",
+      "kind": "glmm",
+      "data": "sim_gamma",
+      "family": "gamma",
+      "link": "log",
+      "tolPwrss": 1e-13,
+      "factors": [
+        "cluster",
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp + (1 | cluster)"
+    },
+    {
+      "name": "sim_gamma_inv_glmm",
+      "kind": "glmm",
+      "data": "sim_gamma",
+      "family": "gamma",
+      "link": "inverse",
+      "tolPwrss": 1e-13,
+      "factors": [
+        "cluster",
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp + (1 | cluster)"
+    },
+    {
+      "name": "sim_nb_glm",
+      "kind": "glm",
+      "data": "sim_nb",
+      "family": "negbin",
+      "link": "log",
+      "factors": [
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
+      "name": "sim_nb_glmm",
+      "kind": "glmm",
+      "data": "sim_nb",
+      "family": "negbin",
+      "link": "log",
+      "tolPwrss": 1e-13,
+      "factors": [
+        "cluster",
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp + (1 | cluster)"
+    },
+    {
+      "name": "cbpp_agq_k1",
+      "kind": "glmm",
+      "data": "cbpp",
+      "family": "binomial",
+      "link": "logit",
+      "nagq": 1,
+      "tolPwrss": 1e-13,
+      "factors": [
+        "herd",
+        "period"
+      ],
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)"
+    },
+    {
+      "name": "cbpp_agq_k7",
+      "kind": "glmm",
+      "data": "cbpp",
+      "family": "binomial",
+      "link": "logit",
+      "nagq": 7,
+      "tolPwrss": 1e-13,
+      "factors": [
+        "herd",
+        "period"
+      ],
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)"
+    },
+    {
+      "name": "cbpp_agq_k11",
+      "kind": "glmm",
+      "data": "cbpp",
+      "family": "binomial",
+      "link": "logit",
+      "nagq": 11,
+      "tolPwrss": 1e-13,
+      "factors": [
+        "herd",
+        "period"
+      ],
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)"
+    },
+    {
+      "name": "grouseticks_agq_k1",
+      "kind": "glmm",
+      "data": "grouseticks",
+      "family": "poisson",
+      "link": "log",
+      "nagq": 1,
+      "tolPwrss": 1e-13,
+      "factors": [
+        "INDEX",
+        "YEAR"
+      ],
+      "r_formula": "TICKS ~ 1 + YEAR + cHEIGHT + (1 | INDEX)"
+    },
+    {
+      "name": "grouseticks_agq_k7",
+      "kind": "glmm",
+      "data": "grouseticks",
+      "family": "poisson",
+      "link": "log",
+      "nagq": 7,
+      "tolPwrss": 1e-13,
+      "factors": [
+        "INDEX",
+        "YEAR"
+      ],
+      "r_formula": "TICKS ~ 1 + YEAR + cHEIGHT + (1 | INDEX)"
+    },
+    {
+      "name": "grouseticks_agq_k11",
+      "kind": "glmm",
+      "data": "grouseticks",
+      "family": "poisson",
+      "link": "log",
+      "nagq": 11,
+      "tolPwrss": 1e-13,
+      "factors": [
+        "INDEX",
+        "YEAR"
+      ],
+      "r_formula": "TICKS ~ 1 + YEAR + cHEIGHT + (1 | INDEX)"
+    },
+    {
+      "name": "sim_binomial_slope1_agq_k7",
+      "kind": "glmm",
+      "data": "sim_binomial_slope1",
+      "family": "binomial",
+      "link": "logit",
+      "nagq": 7,
+      "oracle": "GLMMadaptive",
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "ma_fixed": "y ~ x",
+      "ma_random": "~ x | g"
+    },
+    {
+      "name": "sim_binomial_slope1_agq_k11",
+      "kind": "glmm",
+      "data": "sim_binomial_slope1",
+      "family": "binomial",
+      "link": "logit",
+      "nagq": 11,
+      "oracle": "GLMMadaptive",
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "ma_fixed": "y ~ x",
+      "ma_random": "~ x | g"
+    },
+    {
+      "name": "sim_poisson_slope1_agq_k7",
+      "kind": "glmm",
+      "data": "sim_poisson_slope1",
+      "family": "poisson",
+      "link": "log",
+      "nagq": 7,
+      "oracle": "GLMMadaptive",
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "ma_fixed": "y ~ x",
+      "ma_random": "~ x | g"
+    },
+    {
+      "name": "sim_poisson_slope1_agq_k11",
+      "kind": "glmm",
+      "data": "sim_poisson_slope1",
+      "family": "poisson",
+      "link": "log",
+      "nagq": 11,
+      "oracle": "GLMMadaptive",
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "ma_fixed": "y ~ x",
+      "ma_random": "~ x | g"
+    },
+    {
+      "name": "sim_binomial_slope2_agq_k7",
+      "kind": "glmm",
+      "data": "sim_binomial_slope2",
+      "family": "binomial",
+      "link": "logit",
+      "nagq": 7,
+      "oracle": "GLMMadaptive",
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)",
+      "ma_fixed": "y ~ x1 + x2",
+      "ma_random": "~ x1 + x2 | g"
+    },
+    {
+      "name": "sim_binomial_slope2_agq_k11",
+      "kind": "glmm",
+      "data": "sim_binomial_slope2",
+      "family": "binomial",
+      "link": "logit",
+      "nagq": 11,
+      "oracle": "GLMMadaptive",
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)",
+      "ma_fixed": "y ~ x1 + x2",
+      "ma_random": "~ x1 + x2 | g"
+    },
+    {
+      "name": "sim_slope_lmm",
+      "kind": "lmm",
+      "data": "sim_slope",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 | g2)"
+    },
+    {
+      "name": "sim_collinear_glm",
+      "kind": "glm",
+      "data": "sim_collinear",
+      "family": "gaussian",
+      "link": "identity",
+      "r_formula": "y ~ 1 + x1 + x2 + x3"
+    },
+    {
+      "name": "sim_wide_crossed_lmm",
+      "kind": "lmm",
+      "data": "sim_wide_crossed",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "g1",
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+        "c6",
+        "c7"
+      ],
+      "r_formula": "y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)"
+    },
+    {
+      "name": "sim_wide_slopes_lmm",
+      "kind": "lmm",
+      "data": "sim_wide_slopes",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "gp",
+        "ge"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge)"
+    },
+    {
+      "name": "sim_sparse_gamma",
+      "kind": "glmm",
+      "data": "sim_sparse_gamma",
+      "family": "gamma",
+      "link": "log",
+      "tolPwrss": 1e-13,
+      "factors": [
+        "gp",
+        "ge"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge)"
+    },
+    {
+      "name": "sim_sparse_poisson",
+      "kind": "glmm",
+      "data": "sim_sparse_poisson",
+      "family": "poisson",
+      "link": "log",
+      "tolPwrss": 1e-13,
+      "factors": [
+        "g1",
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+        "c6",
+        "c7"
+      ],
+      "r_formula": "y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)"
+    },
+    {
+      "name": "sim_sparse_nb",
+      "kind": "glmm",
+      "data": "sim_sparse_nb",
+      "family": "negbin",
+      "link": "log",
+      "tolPwrss": 1e-13,
+      "factors": [
+        "g1",
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+        "c6",
+        "c7"
+      ],
+      "r_formula": "y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)"
+    },
+    {
+      "name": "sim_binomial_slope_crossed",
+      "kind": "glmm",
+      "data": "sim_binomial_slope_crossed",
+      "family": "binomial",
+      "link": "logit",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "tolPwrss": 1e-13,
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x + (1 + x | g1) + (1 + x | g2)"
+    },
+    {
+      "name": "sim_nb_lowtheta_glm",
+      "kind": "glm",
+      "data": "sim_nb_lowtheta",
+      "family": "negbin",
+      "link": "log",
+      "factors": [
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
+      "name": "sim_nb_hightheta_glm",
+      "kind": "glm",
+      "data": "sim_nb_hightheta",
+      "family": "negbin",
+      "link": "log",
+      "factors": [
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
+      "name": "sim_nb_nested_glmm",
+      "kind": "glmm",
+      "data": "sim_nb_nested",
+      "family": "negbin",
+      "link": "log",
+      "tolPwrss": 1e-13,
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "r_formula": "y ~ 1 + x + (1 | g1/g2)"
+    },
+    {
+      "name": "sim_collinear_lmm",
+      "kind": "lmm",
+      "data": "sim_collinear_lmm",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 | g)"
+    },
+    {
+      "name": "sim_poisson_highmean_glm",
+      "kind": "glm",
+      "data": "sim_poisson_highmean",
+      "family": "poisson",
+      "link": "log",
+      "factors": [
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
+      "name": "sleepstudy_lmm",
+      "kind": "lmm",
+      "data": "sleepstudy",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "Subject"
+      ],
+      "r_formula": "Reaction ~ 1 + Days + (1 + Days | Subject)"
+    },
+    {
+      "name": "penicillin_lmm",
+      "kind": "lmm",
+      "data": "Penicillin",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "plate",
+        "sample"
+      ],
+      "r_formula": "diameter ~ 1 + (1 | plate) + (1 | sample)"
+    },
+    {
+      "name": "pastes_lmm",
+      "kind": "lmm",
+      "data": "Pastes",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "batch",
+        "cask"
+      ],
+      "r_formula": "strength ~ 1 + (1 | batch/cask)"
+    }
+  ],
+  "//weights_tier": "WEIGHTS validation suite (docs/GLMM/2026-07-10-weights-parity-harness-design.md), fit by the same engines/compare as every other rung. Conventions on top of the main manifest: `weights_col` names a plain per-row prior-weight CSV column (mutually exclusive with the aggregated-binomial `weights` field); rungs WITHOUT a jl_formula are lme4-only (fixed-only models MixedModels cannot fit, or R-only pathologicals) and fit.jl skips them; `gate` marks the two fit-time special gates (dropped_rows in fit.R, unit_identity in fit.rs)."
+}

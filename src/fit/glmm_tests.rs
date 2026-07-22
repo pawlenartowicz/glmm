@@ -3,13 +3,52 @@
 
 use super::*;
 use crate::glmm::{build_z, glmm_laplace_deviance, GlmmWorkspace, StructuredSchur};
+use crate::test_support::assert_near;
 use crate::{
     BinomialLink, Family, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing,
     StartValues, WaldSe,
 };
 use faer::Mat;
 
-use super::common_tests::{dense_ids, dense_str, sim_clustered};
+use super::common_tests::{assert_pinned, dense_ids, dense_str, sim_clustered, PIN_REL_ITER};
+
+/// `fit_glmm` (now `run_glmm_on` + `glmm_view_to_fit`) must reproduce the `Fit`
+/// that the full `fit_cold` dispatch produces for a clustered binomial GLMM —
+/// pins the view/assembly split as behavior-preserving. The mu_hat/deviance
+/// tuple that the NB marginal-θ loop reads must also stay populated.
+#[test]
+fn glmm_view_maps_to_same_fit_as_fit_cold() {
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let p = 4;
+    let model = cbpp_model();
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2, 3],
+        ..FitOptions::default()
+    };
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let (via, mu, dev) = super::glmm::fit_glmm(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids.primary,
+        &ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+    );
+    assert!(cold.converged && via.converged);
+    assert_near(&cold.beta, &via.beta, "beta");
+    assert_near(&cold.se, &via.se, "se");
+    assert_near(&[cold.deviance], &[via.deviance], "deviance");
+    assert_eq!(mu.len(), n);
+    assert!(dev.is_finite());
+}
 
 /// Warm-start A/B on the realistic cbpp binomial GLMM (dense joint-BOBYQA
 /// path, scalar herd intercept): warm from the cold fit's own solution
@@ -84,7 +123,7 @@ fn fit_warm_glmm_cbpp_matches_cold_optimum() {
 /// `(x [n·4 row-major], y, herd cluster_ids, n)`. Shared by the cbpp oracle
 /// test and `fit_grouped_honors_opts_wald_se`.
 fn cbpp_design() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
-    let csv = include_str!("../../parity/data_empirical/cbpp.csv");
+    let csv = include_str!("../../validation/data/empirical/cbpp.csv");
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
     let mut cluster_ids = Vec::<u32>::new();
@@ -174,34 +213,44 @@ fn fit_grouped_honors_opts_wald_se() {
     );
 }
 
+// Frozen lme4 1.1-38 cbpp reference (validation/results/lme4_empirical/cbpp.json,
+// which records tolPwrss = 1e-13). ONE definition, shared by the expanded and
+// aggregated gates below: they assert the same fit through two entry points, and
+// keeping two copies is exactly how both drifted onto lme4's DEFAULT-tolPwrss
+// (1e-7) numbers while still citing this file — SE read 0.231213976143225
+// against the file's 0.232473254781808. That gap is lme4's lagged-ldL2 artifact
+// (glmer builds log|A| from working weights one PIRLS iteration behind the mode
+// — see src/glmm/se.rs), and carrying it forced a 3e-2 SE band that hid a real
+// ~1.3% disagreement. Corrected 2026-07-21; glmm now agrees to 6.0e-6.
+const CBPP_REF_BETA: [f64; 4] = [
+    -1.39853204368263,
+    -0.992315880328946,
+    -1.12866414695346,
+    -1.58031559790095,
+];
+const CBPP_REF_SE: [f64; 4] = [
+    0.232473254781808,
+    0.306641326429934,
+    0.326637242566145,
+    0.427437244644503,
+];
+/// √τ̂²(herd intercept).
+const CBPP_REF_HERD_SD: f64 = 0.642269888687578;
+const CBPP_REF_LOGLIK: f64 = -92.0262818745091;
+
 /// cbpp binomial GLMM through the stable `fit_cold` surface with explicit
 /// `GroupIds` (single grouping), gated against the frozen R `lme4::glmer` oracle
-/// (`parity/results/lme4_empirical/cbpp.json`). cbpp is
+/// (`validation/results/lme4_empirical/cbpp.json`). cbpp is
 /// `cbind(incidence, size−incidence) ~ period + (1 | herd)`; the kernel is
 /// Bernoulli-logit, so each `(incidence, size)` row is expanded to `size` 0/1
 /// rows sharing its design row and herd — value-identical MLE to the aggregated
 /// binomial fit. Herds are unbalanced, so the positional `Sizing` layout cannot
 /// express them: this is the data-shaped-ids path's reason to exist.
 /// SE is compared to **lme4 only** (its Hessian denom keeps the θ–β coupling;
-/// MixedModels.jl drops it ~3% — parity §6). The oracle is sacred: on
-/// disagreement glmm is presumed wrong (parity §1).
+/// MixedModels.jl drops it ~3% — RULE 6). The oracle is sacred: on
+/// disagreement glmm is presumed wrong (RULE 0).
 #[test]
 fn fit_glmm_cbpp_matches_lme4() {
-    // Frozen lme4 1.1-38 reference (parity/results/lme4_empirical/cbpp.json).
-    const REF_BETA: [f64; 4] = [
-        -1.3983428644712,
-        -0.991924974975699,
-        -1.12821621594328,
-        -1.57974541364914,
-    ];
-    const REF_SE: [f64; 4] = [
-        0.231213976143225,
-        0.303150526138057,
-        0.32283000769806,
-        0.42204890650355,
-    ];
-    const REF_HERD_SD: f64 = 0.642069927729443; // √τ̂²(herd intercept)
-
     let (x, y, cluster_ids, n) = cbpp_design();
     let p = 4; // [intercept, period2, period3, period4]
     let model = cbpp_model();
@@ -222,35 +271,36 @@ fn fit_glmm_cbpp_matches_lme4() {
     );
 
     assert!(f.converged, "cbpp GLMM must converge");
-    // Tolerances reflect the measured glmm↔lme4 agreement with margin for
-    // optimizer float non-determinism: β abs Δ ≤ 5.7e-4 (rel ~4e-4 — both
-    // Laplace/nAGQ=1), herd SD rel 3.0e-4, SE rel ≤ 1.3% (glmm FD-Hessian vs
-    // lme4's numerical-differentiation Hessian). The oracle is sacred — these
-    // bound glmm to lme4, never the reverse (parity §1).
+    // Bands are validation/tol.R's cross-engine numbers (beta_rel, se_hessian_rel,
+    // stddev_rel = 1e-3) — change together with that file. This is a glmm↔lme4
+    // claim, so tol.R's calibration is the one that applies. Measured agreement
+    // against the artifact-free reference is far inside them: SE worst 6.0e-6.
+    // The SE band was 3e-2 only because the constants above were the
+    // default-tolPwrss ones; with the citation corrected, that band no longer
+    // has a reason to exist. The oracle is sacred — these bound glmm to lme4,
+    // never the reverse (RULE 0).
     for j in 0..p {
+        let b_rel = (f.beta[j] - CBPP_REF_BETA[j]).abs() / CBPP_REF_BETA[j].abs();
         assert!(
-            (f.beta[j] - REF_BETA[j]).abs() < 2e-3,
-            "β[{j}] = {} vs lme4 {} (Δ {})",
+            b_rel < 1e-3,
+            "β[{j}] = {} vs lme4 {} (rel {b_rel})",
             f.beta[j],
-            REF_BETA[j],
-            (f.beta[j] - REF_BETA[j]).abs()
+            CBPP_REF_BETA[j]
         );
-        // SE vs lme4 only (Hessian denom): relative tolerance covers the
-        // FD-Hessian vs lme4 numerical-differentiation difference.
-        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        let se_rel = (f.se[j] - CBPP_REF_SE[j]).abs() / CBPP_REF_SE[j];
         assert!(
-            se_rel < 3e-2,
+            se_rel < 1e-3,
             "se[{j}] = {} vs lme4 {} (rel {se_rel})",
             f.se[j],
-            REF_SE[j]
+            CBPP_REF_SE[j]
         );
     }
     // Herd random-intercept SD = √τ̂²; tau2[0] = θ̂² = τ̂² (σ² = 1 binomial).
     let herd_sd = f.tau2[0].sqrt();
-    let sd_rel = (herd_sd - REF_HERD_SD).abs() / REF_HERD_SD;
+    let sd_rel = (herd_sd - CBPP_REF_HERD_SD).abs() / CBPP_REF_HERD_SD;
     assert!(
-        sd_rel < 3e-3,
-        "herd SD = {herd_sd} vs lme4 {REF_HERD_SD} (rel {sd_rel})"
+        sd_rel < 1e-3,
+        "herd SD = {herd_sd} vs lme4 {CBPP_REF_HERD_SD} (rel {sd_rel})"
     );
 }
 
@@ -258,7 +308,7 @@ fn fit_glmm_cbpp_matches_lme4() {
 /// `cbpp_design`'s parsing verbatim; only the Bernoulli expansion loop is
 /// replaced by one row per CSV record.
 fn cbpp_design_aggregated() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<u32>, usize) {
-    let csv = include_str!("../../parity/data_empirical/cbpp.csv");
+    let csv = include_str!("../../validation/data/empirical/cbpp.csv");
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
     let mut w = Vec::<f64>::new();
@@ -286,25 +336,12 @@ fn cbpp_design_aggregated() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<u32>, usize) {
 /// Aggregated cbpp through the DENSE (NoZ) path with prior weights must
 /// reproduce the same frozen lme4 oracle as the expanded fit — lme4 itself
 /// fits cbind(incidence, size−incidence), i.e. the aggregated objective.
-/// Matches lme4 1.1-38 (parity/results/lme4_empirical/cbpp.json freeze).
+/// Matches lme4 1.1-38 (validation/results/lme4_empirical/cbpp.json freeze).
 #[test]
 fn fit_glmm_cbpp_aggregated_matches_lme4() {
-    // Same frozen constants and tolerances as fit_glmm_cbpp_matches_lme4
-    // (2e-3 abs β, 3e-2 rel SE, 3e-3 rel herd SD).
-    const REF_BETA: [f64; 4] = [
-        -1.3983428644712,
-        -0.991924974975699,
-        -1.12821621594328,
-        -1.57974541364914,
-    ];
-    const REF_SE: [f64; 4] = [
-        0.231213976143225,
-        0.303150526138057,
-        0.32283000769806,
-        0.42204890650355,
-    ];
-    const REF_HERD_SD: f64 = 0.642069927729443; // √τ̂²(herd intercept)
-
+    // Same frozen reference and bands as fit_glmm_cbpp_matches_lme4 — it asserts
+    // the same lme4 fit through the expanded entry point, so both read the one
+    // CBPP_REF_* definition above rather than each keeping a copy.
     let (x, y, w, cluster_ids, n) = cbpp_design_aggregated();
     let p = 4; // [intercept, period2, period3, period4]
     let model = cbpp_model();
@@ -326,35 +363,34 @@ fn fit_glmm_cbpp_aggregated_matches_lme4() {
     );
     assert!(f.converged, "aggregated cbpp GLMM must converge");
     for j in 0..p {
+        let b_rel = (f.beta[j] - CBPP_REF_BETA[j]).abs() / CBPP_REF_BETA[j].abs();
         assert!(
-            (f.beta[j] - REF_BETA[j]).abs() < 2e-3,
-            "β[{j}] = {} vs lme4 {} (Δ {})",
+            b_rel < 1e-3,
+            "β[{j}] = {} vs lme4 {} (rel {b_rel})",
             f.beta[j],
-            REF_BETA[j],
-            (f.beta[j] - REF_BETA[j]).abs()
+            CBPP_REF_BETA[j]
         );
-        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        let se_rel = (f.se[j] - CBPP_REF_SE[j]).abs() / CBPP_REF_SE[j];
         assert!(
-            se_rel < 3e-2,
+            se_rel < 1e-3,
             "se[{j}] = {} vs lme4 {} (rel {se_rel})",
             f.se[j],
-            REF_SE[j]
+            CBPP_REF_SE[j]
         );
     }
     let herd_sd = f.tau2[0].sqrt();
-    let sd_rel = (herd_sd - REF_HERD_SD).abs() / REF_HERD_SD;
+    let sd_rel = (herd_sd - CBPP_REF_HERD_SD).abs() / CBPP_REF_HERD_SD;
     assert!(
-        sd_rel < 3e-3,
-        "herd SD = {herd_sd} vs lme4 {REF_HERD_SD} (rel {sd_rel})"
+        sd_rel < 1e-3,
+        "herd SD = {herd_sd} vs lme4 {CBPP_REF_HERD_SD} (rel {sd_rel})"
     );
     // lme4 logLik on the same cbind(incidence, size−incidence) fit
-    // (parity/results/lme4_empirical/cbpp.json .estimates.loglik) — the
+    // (validation/results/lme4_empirical/cbpp.json .estimates.loglik) — the
     // aggregated-binomial saturated constant (incl. ln C(mᵢ,sᵢ)) restored
     // under prior weights, the engine-spec §7.6 gate.
-    const REF_LOGLIK: f64 = -92.0262818745091;
     assert!(
-        (f.loglik - REF_LOGLIK).abs() < 1e-3,
-        "loglik {} vs lme4 {REF_LOGLIK}",
+        (f.loglik - CBPP_REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs lme4 {CBPP_REF_LOGLIK}",
         f.loglik
     );
     assert!(!f.reml);
@@ -791,9 +827,9 @@ fn fit_glmm_gamma_weighted_matches_lme4() {
 
 /// Poisson GLMM `TICKS ~ 1 + YEAR + cHEIGHT + (1|INDEX)` on grouseticks
 /// (observation-level INDEX = 403 size-1 clusters), gated against frozen
-/// `lme4::glmer(family=poisson, nAGQ=1)` (`parity/goldens/grouseticks_agq_k1.json`).
+/// `lme4::glmer(family=poisson, nAGQ=1)` (`validation/goldens/grouseticks_agq_k1.json`).
 /// Exercises the blocked PIRLS path for a non-binomial family. lme4-only SE
-/// (parity §6). The oracle is sacred.
+/// (RULE 6). The oracle is sacred.
 #[test]
 fn fit_glmm_poisson_grouseticks_matches_lme4() {
     const REF_BETA: [f64; 4] = [
@@ -809,7 +845,7 @@ fn fit_glmm_poisson_grouseticks_matches_lme4() {
         0.00211151961592,
     ];
     const REF_INDEX_SD: f64 = 1.129369439;
-    let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
     let p = 4;
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -913,7 +949,7 @@ fn fit_glmm_poisson_offset_matches_lme4() {
     ];
     const REF_LOGLIK: f64 = -960.701615612628;
     const REF_INDEX_SD: f64 = 1.14913810893358;
-    let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
     let p = 4;
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -996,13 +1032,13 @@ fn fit_glmm_poisson_offset_matches_lme4() {
     }
 }
 
-/// Parses `parity/data_empirical/grouseticks.csv` into the 3-crossed `TICKS ~ YEAR +
+/// Parses `validation/data/empirical/grouseticks.csv` into the 3-crossed `TICKS ~ YEAR +
 /// cHEIGHT + (1|INDEX) + (1|BROOD) + (1|LOCATION)` design (observation-level
 /// INDEX + crossed BROOD, LOCATION). Shared by the lme4 fit gate below and the
 /// both-paths sparse-vs-dense Schur cross-checks (`sparse_schur_*`), which need
 /// direct `GlmmWorkspace`/`StructuredSchur` access that `fit_cold` doesn't expose.
 fn grouseticks_3crossed_inputs() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
-    let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
     // cols: INDEX,TICKS,BROOD,HEIGHT,YEAR,LOCATION,cHEIGHT
     let p = 4;
     let mut x = Vec::<f64>::new();
@@ -1060,7 +1096,7 @@ fn grouseticks_3crossed_inputs() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec
 /// Poisson GLMM, **three crossed groupings**: grouseticks
 /// `TICKS ~ YEAR + cHEIGHT + (1|INDEX) + (1|BROOD) + (1|LOCATION)` (observation-
 /// level INDEX + crossed BROOD, LOCATION), gated against the frozen
-/// `lme4::glmer(family=poisson)` reference (`parity/results/lme4_empirical/grouseticks.json`).
+/// `lme4::glmer(family=poisson)` reference (`validation/results/lme4_empirical/grouseticks.json`).
 /// Exercises the structured crossed-extras PIRLS/Schur path (`pirls_solve_blocked_
 /// extras` / `structured_factor`) that the single-grouping test above does not.
 /// This is the regression guard for the degenerate-fit bug: from a β=0 cold start
@@ -1071,7 +1107,7 @@ fn grouseticks_3crossed_inputs() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec
 /// The oracle is sacred.
 #[test]
 fn fit_glmm_poisson_grouseticks_3crossed_matches_lme4() {
-    // Frozen lme4 reference (parity/results/lme4_empirical/grouseticks.json).
+    // Frozen lme4 reference (validation/results/lme4_empirical/grouseticks.json).
     const REF_BETA: [f64; 4] = [
         0.372776372908808,
         1.18041688638813,
@@ -1099,20 +1135,19 @@ fn fit_glmm_poisson_grouseticks_3crossed_matches_lme4() {
         f.converged,
         "3-crossed poisson GLMM must converge (not the degenerate start fit)"
     );
-    // β[0..2] are O(1); rel-compare. β[3] (cHEIGHT) is ~-0.024; abs-compare.
-    for (j, &rb) in REF_BETA.iter().enumerate().take(3) {
+    // Bands are `validation/tol.R`'s cross-engine ones (beta_rel/stddev_rel 1e-3),
+    // since every constant here is lme4's — mirrors tol.R, change together.
+    // Measured worst against this reference: β 6.9e-5, RE stddev 2.2e-5. The
+    // 3e-2/5e-2 these replaced predate the tol.R calibration and could not fail.
+    // β[3] (cHEIGHT, ~-0.024) took an absolute band while the others took a
+    // relative one; at 2.3e-6 relative it does not need the exception.
+    for (j, &rb) in REF_BETA.iter().enumerate() {
         assert!(
-            (f.beta[j] - rb).abs() / rb.abs() < 3e-2,
+            (f.beta[j] - rb).abs() / rb.abs() < 1e-3,
             "β[{j}] = {} vs lme4 {rb}",
             f.beta[j]
         );
     }
-    assert!(
-        (f.beta[3] - REF_BETA[3]).abs() < 3e-3,
-        "β[3] = {} vs lme4 {}",
-        f.beta[3],
-        REF_BETA[3]
-    );
     // tau2 layout [primary(INDEX) | BROOD | LOCATION].
     for (k, refsd) in [REF_INDEX_SD, REF_BROOD_SD, REF_LOCATION_SD]
         .into_iter()
@@ -1120,7 +1155,7 @@ fn fit_glmm_poisson_grouseticks_3crossed_matches_lme4() {
     {
         let sd = f.tau2[k].sqrt();
         assert!(
-            (sd - refsd).abs() / refsd < 5e-2,
+            (sd - refsd).abs() / refsd < 1e-3,
             "grouping {k} sd = {sd} vs lme4 {refsd}"
         );
     }
@@ -1409,7 +1444,7 @@ fn sparse_schur_small_e_matches_dense() {
 
 /// Adaptive GH quadrature, binomial GLMM: cbpp `cbind(incidence, size−incidence)
 /// ~ period + (1|herd)` (expanded 0/1) at nAGQ ∈ {1,7,11}, gated against frozen
-/// `glmer(nAGQ=k)` (`parity/goldens/cbpp_agq_k{1,7,11}.json`). nAGQ=1 is Laplace
+/// `glmer(nAGQ=k)` (`validation/goldens/cbpp_agq_k{1,7,11}.json`). nAGQ=1 is Laplace
 /// (≡ `fit_glmm_cbpp_matches_lme4`); k>1 shifts β/varcomp off it as the Laplace
 /// bias is integrated out (herd sd 0.642→0.648). β + varcomp only — the AGQ
 /// goldens don't freeze SE (AGQ changes the integral, not the SE convention).
@@ -1449,7 +1484,7 @@ fn fit_glmm_binomial_agq_matches_lme4() {
             0.647517861083539,
         ),
     ];
-    let csv = include_str!("../../parity/data_empirical/cbpp.csv");
+    let csv = include_str!("../../validation/data/empirical/cbpp.csv");
     let p = 4;
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -1520,7 +1555,7 @@ fn fit_glmm_binomial_agq_matches_lme4() {
 /// weighted AGQ path must reproduce the SAME frozen `glmer(nAGQ=k)` goldens as the
 /// expanded fixture above — the goldens were produced from aggregated cbpp on the
 /// R side, so they are reusable as-is; only the Rust encoding changes. This is the
-/// weighted-AGQ parity rung: it exercises `prior_w` flowing through the AGQ
+/// weighted-AGQ validation rung: it exercises `prior_w` flowing through the AGQ
 /// kernel's PIRLS mode and per-row dev_resid sums end-to-end at nAGQ ∈ {1,7,11}.
 /// The oracle is sacred.
 #[test]
@@ -1672,7 +1707,7 @@ fn fit_glmm_binomial_agq_parallel_inner_knob_is_bit_identical() {
 
 /// Adaptive GH quadrature, Poisson GLMM: grouseticks single-grouping `TICKS ~
 /// YEAR + cHEIGHT + (1|INDEX)` at nAGQ ∈ {1,7,11}, gated against frozen
-/// `glmer(family=poisson, nAGQ=k)` (`parity/goldens/grouseticks_agq_k{1,7,11}.json`).
+/// `glmer(family=poisson, nAGQ=k)` (`validation/goldens/grouseticks_agq_k{1,7,11}.json`).
 /// nAGQ=1 ≡ `fit_glmm_poisson_grouseticks_matches_lme4`; k>1 shifts the fit as the
 /// Laplace bias is integrated out. β + varcomp only. The oracle is sacred.
 #[test]
@@ -1709,7 +1744,7 @@ fn fit_glmm_poisson_agq_matches_lme4() {
             1.13407867482264,
         ),
     ];
-    let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
     let p = 4;
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -1775,7 +1810,7 @@ fn fit_glmm_poisson_agq_matches_lme4() {
 
 /// Probit binomial GLMM `cbind(incidence, size−incidence) ~ period + (1|herd)`
 /// on cbpp (expanded 0/1), gated against frozen `glmer(binomial("probit"))`
-/// (`parity/goldens/cbpp_probit_glmm.json`). lme4-only SE. The oracle is sacred.
+/// (`validation/goldens/cbpp_probit_glmm.json`). lme4-only SE. The oracle is sacred.
 // FD-Hessian SE (use.hessian=TRUE) for this non-canonical link needs a
 // smooth deviance: probit is Fisher-scoring (linear convergence), so PIRLS at
 // the canonical 1e-6 tolerance left the deviance noisy to ~1e-4 and the FD
@@ -1798,7 +1833,7 @@ fn fit_glmm_probit_cbpp_matches_lme4() {
         0.204681153481,
     ];
     const REF_HERD_SD: f64 = 0.3379893465;
-    let csv = include_str!("../../parity/data_empirical/cbpp.csv");
+    let csv = include_str!("../../validation/data/empirical/cbpp.csv");
     let p = 4;
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -1860,8 +1895,108 @@ fn fit_glmm_probit_cbpp_matches_lme4() {
     }
 }
 
+/// Gamma INVERSE-link GLMM `y ~ 1 + x + grp + (1|cluster)` on sim_gamma, gated
+/// against frozen `glmer(family=Gamma("inverse"))`
+/// (`validation/goldens/sim_gamma_inv_glmm.json`, `tolPwrss = 1e-13`). Same data and
+/// formula as the log-link test below — only the link differs, which is what
+/// makes it a controlled pair.
+///
+/// Regression guard for the FD-Hessian seeding bug: `fd_hessian_cov` used to
+/// re-derive the random-effect mode û(γ̂) by a COLD PIRLS solve rather than
+/// reusing the one the fit had just converged to. Where the mode problem has more
+/// than one basin the cold solve lands in a different one, and the inverse link is
+/// where that shows: the fit reaches deviance 936.7683 and the cold re-eval at the
+/// same γ̂ returned 1034.5678. The finite differences then straddled the two
+/// branches, the joint Hessian came out indefinite, the RX fallback's Schur was
+/// indefinite at the same wrong mode, and the whole fit was reported failed for
+/// want of a standard error — `converged` was `false` and every estimate NaN.
+///
+/// So `converged` is the assertion that would have caught it, and `loglik` is the
+/// one that keeps catching it: landing on the wrong branch moves the
+/// log-likelihood by ~49, which no band here tolerates. Bands are `validation/tol.R`'s
+/// cross-engine ones throughout — every constant below is lme4's.
+#[test]
+fn fit_glmm_gamma_inverse_link_matches_lme4() {
+    const REF_BETA: [f64; 3] = [0.75205795080653, -0.187572954875194, -0.140275024148733];
+    const REF_SE: [f64; 3] = [0.0757958253868104, 0.0174915990199966, 0.0340264529562919];
+    const REF_CLUSTER_SD: f64 = 0.243083546786158;
+    const REF_DISP: f64 = 0.578838313863376;
+    const REF_LOGLIK: f64 = -468.38415378098;
+
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Inverse,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    // Default `WaldSe::Hessian` deliberately — the Rx arm never touches
+    // `fd_hessian_cov` and stayed green all through the bug.
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+
+    assert!(
+        f.converged,
+        "gamma-inverse GLMM must converge (the FD-Hessian must anchor on the fit's own mode)"
+    );
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
+            "β[{j}] = {} vs lme4 {}",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        assert!(
+            (f.se[j] - REF_SE[j]).abs() / REF_SE[j] < 1e-3,
+            "se_hessian[{j}] = {} vs lme4 {}",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+    let (sd, _corr) = f.stddev_corr(0);
+    assert!(
+        (sd[0] - REF_CLUSTER_SD).abs() / REF_CLUSTER_SD < 1e-3,
+        "cluster sd = {} vs lme4 {REF_CLUSTER_SD}",
+        sd[0]
+    );
+    assert!(
+        (f.dispersion - REF_DISP).abs() / REF_DISP < 1e-3,
+        "φ̂ = {} vs lme4 {REF_DISP}",
+        f.dispersion
+    );
+    // The branch check: the discarded mode sat ~98 deviance units above this one,
+    // so a wrong-basin fit misses here by ~49 even if it manages to report SEs.
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs lme4 {REF_LOGLIK}",
+        f.loglik
+    );
+}
+
 /// Gamma log-link GLMM `y ~ 1 + x + grp + (1|cluster)` on sim_gamma, gated
-/// against frozen `glmer(family=Gamma("log"))` (`parity/goldens/sim_gamma_glmm.json`).
+/// against frozen `glmer(family=Gamma("log"))` (`validation/goldens/sim_gamma_glmm.json`).
 /// φ̂ is the post-fit Pearson moment on conditional-mode residuals (matches the
 /// oracle's hand-computed `Σpearson²/(n−p)`). lme4-only SE. The oracle is sacred.
 //
@@ -1880,8 +2015,9 @@ fn fit_glmm_gamma_sim_matches_lme4() {
     const REF_SE_RX: [f64; 3] = [0.116924273630386, 0.0453773644154408, 0.0929163554683392];
     const REF_CLUSTER_SD: f64 = 0.4851167757;
     const REF_DISP: f64 = 0.5265553674;
-    let (x, y, cluster_ids, n_clusters) =
-        sim_clustered(include_str!("../../parity/data_simulated/sim_gamma.csv"));
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
     let (n, p) = (y.len(), 3);
     let model = ModelSpec {
         family: Family::Gamma {
@@ -1936,7 +2072,7 @@ fn fit_glmm_gamma_sim_matches_lme4() {
         (sd[0] - f.tau2[0].sqrt()).abs() < 1e-12,
         "stddev_corr and tau2 must report the same σ̂-scaled sd"
     );
-    // lme4 logLik (parity/results/lme4_simulated/sim_gamma.json) — pins the
+    // lme4 logLik (validation/results/lme4_simulated/sim_gamma.json) — pins the
     // Gamma rule loglik = −½·deviance verbatim: lme4's glmer logLik is
     // −devfun/2 with gamma_aic's +2 left inside (1 below Σ log f).
     const REF_LOGLIK: f64 = -445.173519506374;
@@ -1978,7 +2114,7 @@ fn fit_glmm_gamma_sim_matches_lme4() {
 }
 
 /// NB GLMM `y ~ 1 + x + grp + (1|cluster)` on sim_nb via the outer-θ loop,
-/// gated against frozen `lme4::glmer.nb` (`parity/goldens/sim_nb_glmm.json`).
+/// gated against frozen `lme4::glmer.nb` (`validation/goldens/sim_nb_glmm.json`).
 /// `dispersion = θ̂`. lme4-only SE. The oracle is sacred.
 #[test]
 fn fit_glmm_nb_sim_matches_lme4() {
@@ -1987,7 +2123,7 @@ fn fit_glmm_nb_sim_matches_lme4() {
     const REF_CLUSTER_SD: f64 = 0.5742029807;
     const REF_THETA: f64 = 1.783620004;
     let (x, y, cluster_ids, n_clusters) =
-        sim_clustered(include_str!("../../parity/data_simulated/sim_nb.csv"));
+        sim_clustered(include_str!("../../validation/data/simulated/sim_nb.csv"));
     let (n, p) = (y.len(), 3);
     let model = ModelSpec {
         family: Family::NegativeBinomial {
@@ -2036,7 +2172,7 @@ fn fit_glmm_nb_sim_matches_lme4() {
         "cluster sd = {} vs lme4 {REF_CLUSTER_SD}",
         f.tau2[0].sqrt()
     );
-    // lme4 logLik (parity/goldens/sim_nb_glmm.json) — the θ-dependent NB
+    // lme4 logLik (validation/goldens/sim_nb_glmm.json) — the θ-dependent NB
     // saturated constant (incl. −ln yᵢ!) restored at θ̂. Wider band than the
     // φ≡1 families: the constant itself moves with θ̂ (5e-2 rel above).
     const REF_LOGLIK: f64 = -481.455529976646;
@@ -2050,7 +2186,7 @@ fn fit_glmm_nb_sim_matches_lme4() {
 
 /// NB GLMM on an UNBALANCED NESTED design: `y ~ 1 + x + (1|g1/g2)` on
 /// sim_nb_nested (per-g1 sizes 8..120 on an exp ladder), gated against
-/// frozen `lme4::glmer.nb` (`parity/goldens/sim_nb_nested_glmm.json`).
+/// frozen `lme4::glmer.nb` (`validation/goldens/sim_nb_nested_glmm.json`).
 /// The nested extra rides the Pastes convention: `GroupIds.extra` carries
 /// the globally-unique g1:g2 level, `NestedWithin` is the topology tag,
 /// placeholder counts prove sizing comes from the ids. `dispersion = θ̂`;
@@ -2065,7 +2201,7 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
     const REF_NEST_SD: f64 = 0.355202234990849;
     const REF_THETA: f64 = 1.43012979314052;
     // sim_nb_nested.csv: y,x,g1,g2 (g2 labels reused across g1 parents).
-    let csv = include_str!("../../parity/data_simulated/sim_nb_nested.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_nb_nested.csv");
     let mut y = Vec::<f64>::new();
     let mut xcol = Vec::<f64>::new();
     let mut g1_raw = Vec::<String>::new();
@@ -2159,7 +2295,7 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
 /// the bypass this canary pins is the shipped state.)
 #[test]
 fn two_stage_agq_bypass_is_bit_identical() {
-    let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
     let p = 4;
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -2397,8 +2533,9 @@ fn two_stage_matches_single_stage_cbpp_probit_and_gamma() {
     }
     // Gamma log-link mixed model (blocked, non-canonical + dispersion PIRLS path).
     {
-        let (x, y, cluster_ids, n_clusters) =
-            sim_clustered(include_str!("../../parity/data_simulated/sim_gamma.csv"));
+        let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+            "../../validation/data/simulated/sim_gamma.csv"
+        ));
         let n = y.len();
         let model = ModelSpec {
             family: Family::Gamma {
@@ -2422,51 +2559,38 @@ fn two_stage_matches_single_stage_cbpp_probit_and_gamma() {
 
 // ── Vector-RE AGQ goldens (GLMMadaptive oracle) ─────────────────────────────
 
-/// Serde shape for the GLMMadaptive vector-AGQ goldens
-/// (`oracle/fit_m3_goldens.R`'s GLMMadaptive branch schema); serde ignores
-/// unread fields.
-#[derive(serde::Deserialize)]
-struct MaVcBlock {
-    stddev: Vec<f64>,
-    corr: Vec<Vec<f64>>,
-}
-#[derive(serde::Deserialize)]
-struct MaEst {
-    beta: Vec<f64>,
-    se_hessian: Vec<f64>,
-    varcomp: Vec<MaVcBlock>,
-}
-#[derive(serde::Deserialize)]
-struct MaGolden {
-    nagq: u8,
-    estimates: MaEst,
-}
-
-/// One vector-AGQ golden check: parse a `y,<covariates...>,g` CSV, fit with
-/// `nagq` from the golden (primary grouping factor, random slopes on every
-/// covariate → q_p = 1 + n_x, routed through `agq_deviance_vec`), and gate
-/// β̂ / Hessian SE / RE stddev / RE correlation against the frozen
-/// GLMMadaptive reference. NO deviance gate — GLMMadaptive's logLik carries
-/// different additive constants than glmm's devfun convention; the deviance
-/// scale is owned by the in-crate k-convergence invariants (glmm/tests.rs).
+/// One vector-AGQ pin: parse a `y,<covariates...>,g` CSV, fit at `nagq`
+/// (primary grouping factor, random slopes on every covariate → q_p = 1 + n_x,
+/// routed through `agq_deviance_vec`), and check β̂ / Hessian SE / RE stddev /
+/// RE correlation against values recorded from glmm.
 ///
-/// Tolerance bands are calibrated empirically at freeze (parity/tol.R,
-/// `agq_*` entries — change together): GLMMadaptive's adaptive-quadrature
-/// details differ (per-step re-adaptation, RE-covariance parameterization),
-/// so matched-k agreement is tight but not machine-precision. k=11 agrees to
-/// ≤ 7.1e-4 everywhere; the wide SE band covers one k=7 case on the sparsest
-/// rung where the ORACLE's own quadrature truncation dominates (GLMMadaptive's
-/// k=7 se[0] sits 1.2e-2 from its own k=25 limit; glmm's k=7 is within 1.1e-3
-/// of that limit) — see tol.R's agq_* rationale.
-fn check_vector_agq_golden(name: &str, csv: &str, golden_json: &str, n_x: usize, family: Family) {
-    // Mirror parity/tol.R agq_* — change together.
-    const AGQ_BETA_REL: f64 = 3e-3;
-    const AGQ_STDDEV_REL: f64 = 4e-3;
-    const AGQ_CORR_ABS: f64 = 4e-3;
-    const AGQ_SE_HESSIAN_REL: f64 = 2e-2;
-    let gold: MaGolden = serde_json::from_str(golden_json).expect("golden JSON parses");
-    let nagq = gold.nagq;
-
+/// `corr_lower` is the strict lower triangle in row order — (1,0) for q=2;
+/// (1,0), (2,0), (2,1) for q=3. The diagonal is 1 by construction and the
+/// upper triangle mirrors, so pinning them would assert nothing.
+///
+/// Cross-engine validation of every one of these fits lives in the
+/// `sim_{binomial,poisson}_slope{1,2}_agq_k{7,11}` cells, against frozen
+/// `GLMMadaptive::mixed_model(nAGQ=k)`. Those cells run at the wider `agq_*`
+/// bands from `validation/tol.R`, because GLMMadaptive's quadrature details differ
+/// from ours (per-step re-adaptation, a different RE-covariance
+/// parameterization) — matched-k agreement is tight but not machine-precision.
+/// That is a fact about the two engines and has no bearing on how tightly glmm
+/// reproduces its own answer, which is what this pins.
+///
+/// No deviance pin: the deviance scale is owned by the in-crate k-convergence
+/// invariants in `glmm/tests.rs`.
+#[allow(clippy::too_many_arguments)]
+fn check_vector_agq_pin(
+    name: &str,
+    csv: &str,
+    nagq: u8,
+    n_x: usize,
+    family: Family,
+    ref_beta: &[f64],
+    ref_se: &[f64],
+    ref_stddev: &[f64],
+    corr_lower: &[f64],
+) {
     let mut y = Vec::<f64>::new();
     let mut xc: Vec<Vec<f64>> = vec![vec![]; n_x];
     let mut g_raw = Vec::<u32>::new();
@@ -2505,118 +2629,137 @@ fn check_vector_agq_golden(name: &str, csv: &str, golden_json: &str, n_x: usize,
     let opts = FitOptions {
         target_indices: (0..p as u32).collect(),
         nagq,
-        ..FitOptions::default() // WaldSe::Hessian — the golden's se_hessian partner
+        ..FitOptions::default() // WaldSe::Hessian — the se_hessian partner
     };
     let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert!(f.converged, "{name} k={nagq} must converge");
 
-    let est = &gold.estimates;
-    for j in 0..p {
-        let (b, rb) = (f.beta[j], est.beta[j]);
-        let rel = (b - rb).abs() / rb.abs().max(1e-12);
-        assert!(
-            rel < AGQ_BETA_REL,
-            "{name} k={nagq} β[{j}] = {b} vs GLMMadaptive {rb} (rel {rel:.2e})"
-        );
-        let (s, rs) = (f.se[j], est.se_hessian[j]);
-        let rel = (s - rs).abs() / rs.abs().max(1e-12);
-        assert!(
-            rel < AGQ_SE_HESSIAN_REL,
-            "{name} k={nagq} se[{j}] = {s} vs GLMMadaptive {rs} (rel {rel:.2e})"
-        );
-    }
+    let what = format!("{name} k={nagq}");
+    assert_pinned(&f.beta, ref_beta, PIN_REL_ITER, &format!("{what} beta"));
+    assert_pinned(&f.se, ref_se, PIN_REL_ITER, &format!("{what} se"));
     let (stddev, corr) = f.stddev_corr(0);
-    let q = stddev.len();
-    assert_eq!(q, est.varcomp[0].stddev.len(), "{name} q mismatch");
-    for t in 0..q {
-        let (s, rs) = (stddev[t], est.varcomp[0].stddev[t]);
-        let rel = (s - rs).abs() / rs.abs().max(1e-12);
-        assert!(
-            rel < AGQ_STDDEV_REL,
-            "{name} k={nagq} stddev[{t}] = {s} vs GLMMadaptive {rs} (rel {rel:.2e})"
-        );
-        for (u, (&c, &rc)) in corr[t].iter().zip(&est.varcomp[0].corr[t]).enumerate() {
-            if u >= t {
-                break; // strict lower triangle: diag ≡ 1, upper mirrors lower
-            }
-            let abs = (c - rc).abs();
-            assert!(
-                abs < AGQ_CORR_ABS,
-                "{name} k={nagq} corr[{t}][{u}] = {c} vs GLMMadaptive {rc} (abs {abs:.2e})"
-            );
-        }
-    }
+    assert_pinned(&stddev, ref_stddev, PIN_REL_ITER, &format!("{what} stddev"));
+    let lower: Vec<f64> = (0..stddev.len())
+        .flat_map(|t| (0..t).map(move |u| (t, u)))
+        .map(|(t, u)| corr[t][u])
+        .collect();
+    assert_pinned(&lower, corr_lower, PIN_REL_ITER, &format!("{what} corr"));
 }
 
-/// Vector AGQ (q=2), binomial: `y ~ x + (1 + x | g)` on sim_binomial_slope1
-/// at nAGQ ∈ {7, 11}, gated against frozen `GLMMadaptive::mixed_model(nAGQ=k)`
-/// (`parity/goldens/sim_binomial_slope1_agq_k{7,11}.json`). The oracle is
-/// sacred.
+/// Vector AGQ (q=2), binomial: `y ~ x + (1 + x | g)` on sim_binomial_slope1 at
+/// nAGQ ∈ {7, 11}. Validated cross-engine by the
+/// `sim_binomial_slope1_agq_k{7,11}` cells against GLMMadaptive.
 #[test]
-fn fit_glmm_binomial_slope1_vector_agq_matches_glmmadaptive() {
-    let csv = include_str!("../../parity/data_simulated/sim_binomial_slope1.csv");
-    for json in [
-        include_str!("../../parity/goldens/sim_binomial_slope1_agq_k7.json"),
-        include_str!("../../parity/goldens/sim_binomial_slope1_agq_k11.json"),
-    ] {
-        check_vector_agq_golden(
-            "sim_binomial_slope1",
-            csv,
-            json,
-            1,
-            Family::Binomial {
-                link: BinomialLink::Logit,
-            },
-        );
-    }
+fn fit_glmm_binomial_slope1_vector_agq_is_pinned() {
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_slope1.csv");
+    let family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    check_vector_agq_pin(
+        "sim_binomial_slope1",
+        csv,
+        7,
+        1,
+        family,
+        &[0.42897645003558754, 0.43458315523970653],
+        &[0.1562674670018699, 0.1310475868542789],
+        &[0.8758219936062426, 0.3726397459266911],
+        &[0.5283132632086392],
+    );
+    check_vector_agq_pin(
+        "sim_binomial_slope1",
+        csv,
+        11,
+        1,
+        family,
+        &[0.42897959050352286, 0.43458759206119546],
+        &[0.15627012841005886, 0.13105001203556532],
+        &[0.8758453743269463, 0.3726611962891021],
+        &[0.5283433982271978],
+    );
 }
 
-/// Vector AGQ (q=2), Poisson: `y ~ x + (1 + x | g)` on sim_poisson_slope1
-/// at nAGQ ∈ {7, 11}, gated against frozen `GLMMadaptive::mixed_model(nAGQ=k)`
-/// (`parity/goldens/sim_poisson_slope1_agq_k{7,11}.json`). The oracle is
-/// sacred.
+/// Vector AGQ (q=2), Poisson: `y ~ x + (1 + x | g)` on sim_poisson_slope1 at
+/// nAGQ ∈ {7, 11}. Validated cross-engine by the
+/// `sim_poisson_slope1_agq_k{7,11}` cells against GLMMadaptive.
 #[test]
-fn fit_glmm_poisson_slope1_vector_agq_matches_glmmadaptive() {
-    let csv = include_str!("../../parity/data_simulated/sim_poisson_slope1.csv");
-    for json in [
-        include_str!("../../parity/goldens/sim_poisson_slope1_agq_k7.json"),
-        include_str!("../../parity/goldens/sim_poisson_slope1_agq_k11.json"),
-    ] {
-        check_vector_agq_golden(
-            "sim_poisson_slope1",
-            csv,
-            json,
-            1,
-            Family::Poisson {
-                link: crate::PoissonLink::Log,
-            },
-        );
-    }
+fn fit_glmm_poisson_slope1_vector_agq_is_pinned() {
+    let csv = include_str!("../../validation/data/simulated/sim_poisson_slope1.csv");
+    let family = Family::Poisson {
+        link: crate::PoissonLink::Log,
+    };
+    check_vector_agq_pin(
+        "sim_poisson_slope1",
+        csv,
+        7,
+        1,
+        family,
+        &[-1.3538764484761825, 0.49328234955414413],
+        &[0.21833946383750474, 0.18544416147664192],
+        &[1.0117923068022499, 0.33570973669422155],
+        &[0.03689193891989874],
+    );
+    check_vector_agq_pin(
+        "sim_poisson_slope1",
+        csv,
+        11,
+        1,
+        family,
+        &[-1.353312567495963, 0.493094585284533],
+        &[0.21807780917884897, 0.18530325400802838],
+        &[1.0106390790816442, 0.33617266187700573],
+        &[0.037212955698941674],
+    );
 }
 
 /// Vector AGQ (q=3), binomial: `y ~ x1 + x2 + (1 + x1 + x2 | g)` on
-/// sim_binomial_slope2 at nAGQ ∈ {7, 11} — pins the q_p ≤ 3 cap surface and
-/// the kernel's dimensional generality. Gated against frozen
-/// `GLMMadaptive::mixed_model(nAGQ=k)`
-/// (`parity/goldens/sim_binomial_slope2_agq_k{7,11}.json`). The oracle is
-/// sacred.
+/// sim_binomial_slope2 at nAGQ ∈ {7, 11} — the q_p ≤ 3 cap surface and the
+/// kernel's dimensional generality. Validated cross-engine by the
+/// `sim_binomial_slope2_agq_k{7,11}` cells against GLMMadaptive.
 #[test]
-fn fit_glmm_binomial_slope2_vector_agq_matches_glmmadaptive() {
-    let csv = include_str!("../../parity/data_simulated/sim_binomial_slope2.csv");
-    for json in [
-        include_str!("../../parity/goldens/sim_binomial_slope2_agq_k7.json"),
-        include_str!("../../parity/goldens/sim_binomial_slope2_agq_k11.json"),
-    ] {
-        check_vector_agq_golden(
-            "sim_binomial_slope2",
-            csv,
-            json,
-            2,
-            Family::Binomial {
-                link: BinomialLink::Logit,
-            },
-        );
-    }
+fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_slope2.csv");
+    let family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    check_vector_agq_pin(
+        "sim_binomial_slope2",
+        csv,
+        7,
+        2,
+        family,
+        &[0.3730517271148301, 0.538098978038483, -0.3654854470965549],
+        &[
+            0.13111390541787663,
+            0.10465308883561775,
+            0.10556860651205546,
+        ],
+        &[1.0640265640371298, 0.6217295819798455, 0.6420938363939653],
+        &[
+            0.21906654236295983,
+            0.13220156109374376,
+            -0.030986539519051545,
+        ],
+    );
+    check_vector_agq_pin(
+        "sim_binomial_slope2",
+        csv,
+        11,
+        2,
+        family,
+        &[0.3730629587832013, 0.5381087834502509, -0.3654883076141031],
+        &[
+            0.13112095270455848,
+            0.10465667876714824,
+            0.10557212730472322,
+        ],
+        &[1.0640974804776098, 0.6217673168423941, 0.6421365960857665],
+        &[
+            0.21910550941911974,
+            0.13222240391317389,
+            -0.03101919706448947,
+        ],
+    );
 }
 
 /// Boundary singular flag on a GLMM: a scalar random-intercept
@@ -2696,4 +2839,72 @@ fn fit_glmm_binomial_no_cluster_signal_is_singular() {
         "tau2[0] must pin near zero, got {}",
         f.tau2[0]
     );
+}
+
+/// The loop tier must fit the SAME model `fit_cold` does when an extra grouping
+/// carries a random slope. The dense GLMM kernel builds intercept-only extras, so
+/// reaching it with such a design fits a reduced model and reports it as a normal
+/// success; `build_workspace`'s `classify_design` call is what keeps the loop tier
+/// off it. Nothing else pins the loop-tier entry itself — the classifier test
+/// (`classify_routes_slope_extras_to_sparse_all_families`) pins only the routing
+/// decision, not that the built workspace acts on it.
+#[test]
+fn loop_tier_honours_extra_grouping_slope() {
+    let (n_g1, n_g2, per) = (8usize, 6usize, 10usize);
+    let n = n_g1 * per;
+    let mut st = 7u64;
+    let (mut x, mut y) = (vec![0.0f64; n * 2], vec![0.0f64; n]);
+    let (mut g1, mut g2) = (vec![0u32; n], vec![0u32; n]);
+    for i in 0..n {
+        g1[i] = (i % n_g1) as u32;
+        g2[i] = (i % n_g2) as u32;
+        let x1 = crate::sparse::test_lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        // Extra-grouping slope variance ≈ 0.9 in the fitted model — big enough that
+        // dropping the slope would move β̂ well past any optimizer tolerance.
+        let eta = 0.5 + 0.4 * x1 + 0.25 * (g1[i] as f64 - 4.0) + 0.6 * x1 * (g2[i] as f64 - 3.0);
+        y[i] = eta.exp().round();
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 1 },
+                slopes: vec![1],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: g1,
+        extra: vec![g2],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+
+    let cold = fit_cold(&x, &y, n, 2, &model, &ids, &opts);
+    assert!(cold.converged, "reference fit must converge");
+    // tau2 layout: primary intercept, then the extra grouping's 2×2 vech block.
+    assert!(
+        cold.tau2.len() == 4 && cold.tau2[2] > 0.1,
+        "the draw must actually carry an extra-grouping slope variance: tau2 {:?}",
+        cold.tau2
+    );
+
+    let sized = super::common::spec_sized_from_ids(&model, &ids);
+    let mut ws = super::core::build_workspace(&sized, n, 2, &opts);
+    let view = super::core::fit_on(&mut ws, &x, &y, &ids, None, &opts);
+    for j in 0..2 {
+        assert_eq!(
+            view.betas()[j],
+            cold.beta[j],
+            "loop tier must reach fit_cold's β exactly: β[{j}]"
+        );
+    }
 }

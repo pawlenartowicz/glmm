@@ -173,7 +173,7 @@ guessing. See the [R README](r/README.md) and
 ## Origin
 
 `glmm` was carved out of [MCPower](https://github.com/pawlenartowicz/)'s
-simulation engine — the numerics here are the same parity-pinned kernels that
+simulation engine — the numerics here are the same validation-pinned kernels that
 power MCPower's Monte Carlo fits, split out so they're usable standalone. The
 `loop_advanced` feature above exists specifically to serve MCPower's
 warm-start hot loop as a consumer of this crate.

@@ -5,7 +5,7 @@
 # (x / y / cluster_ids are the fixture's identity and never change), refits, and
 # rewrites the derived fields: theta, beta, vcov_hessian, vcov_rx.
 #
-# tolPwrss = 1e-13, matching parity/oracle/fit.R (change together): at glmer's
+# tolPwrss = 1e-13, matching validation/engines/lme4.R (change together): at glmer's
 # default 1e-7 the ldL2 term uses working weights one PIRLS iteration behind the
 # mode, putting a ~1% spurious theta/theta-beta curvature into
 # vcov(use.hessian=TRUE) -- the artifact the fixture carried until 2026-07-04

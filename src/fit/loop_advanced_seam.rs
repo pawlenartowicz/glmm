@@ -5,9 +5,10 @@
 //! helpers (`common::spec_sized_from_ids`/`assert_group_ids`,
 //! `lmm::{accumulate_lmm_rows, fit_lmm_into}`):
 //!
-//! - the **adjudication seam** (mismatch-oracle spec 2026-07-11): exposes the
-//!   exact profiled-REML closure `fit` minimizes, evaluated at a caller-fixed
-//!   θ or minimized under a caller-configured BOBYQA schedule;
+//! - the **adjudication seam**: lets a caller check its own θ-search or refit
+//!   logic against the exact profiled-REML closure `fit` minimizes, by
+//!   exposing that closure evaluated at a caller-fixed θ or minimized under a
+//!   caller-configured BOBYQA schedule;
 //! - **caller-owned LMM workspace reuse**: lets a caller (MCPower's hot loop)
 //!   allocate the per-shape LMM workspace once and refit many same-shape
 //!   datasets against it.
@@ -17,17 +18,25 @@
 #[cfg(feature = "loop_advanced")]
 use crate::lmm::{LmmFitScratch, LmmSuffStats, LmmWorkspace};
 #[cfg(feature = "loop_advanced")]
-use crate::{Family, GroupIds, ModelSpec, StartValues};
+use crate::{Family, GroupIds, ModelSpec};
+// Only the test-gated `build_lmm_workspace`/`refit_lmm` pair below still uses these.
+#[cfg(all(test, feature = "loop_advanced"))]
+use crate::StartValues;
 
 #[cfg(feature = "loop_advanced")]
 use super::common::{assert_group_ids, spec_sized_from_ids};
 #[cfg(feature = "loop_advanced")]
-use super::lmm::{accumulate_lmm_rows, fit_lmm_into};
+use super::lmm::accumulate_lmm_rows;
+#[cfg(all(test, feature = "loop_advanced"))]
+use super::lmm::fit_lmm_into;
 #[cfg(feature = "loop_advanced")]
-use super::{classify_design, Fit, FitOptions, Solver};
+use super::{classify_design, Solver};
+#[cfg(all(test, feature = "loop_advanced"))]
+use super::{Fit, FitOptions};
 
 // ---------------------------------------------------------------------------
-// Dev-only adjudication seam (loop_advanced) — mismatch-oracle spec 2026-07-11.
+// Dev-only adjudication seam (loop_advanced) — lets a caller adjudicate its
+// own θ-search against the reference objective.
 // NOT semver-covered. Gaussian LMM only: exposes the exact profiled-REML
 // closure `fit` minimizes, (a) evaluated at a caller-fixed θ and (b) minimized
 // under a caller-configured schedule. The shipped path is untouched.
@@ -241,8 +250,10 @@ fn lmm_sweep_search(
             t.to_vec()
         }
         // Mirror `fit_lmm`'s cold arm exactly (replay fidelity depends on
-        // this): the blind seed — diagonals THETA0, off-diagonals 0 —
-        // adopted by the shipped LMM paths in the 2026-07-11 basin fix.
+        // this): the blind seed — diagonals THETA0, off-diagonals 0. An
+        // all-THETA0 seed (diagonals AND off-diagonals) mis-scales Λ on wide
+        // vech blocks and BOBYQA stalls in that basin instead of reaching the
+        // optimum, so the shipped LMM paths seed off-diagonals at 0 instead.
         None => blind,
     };
     let min_diag = g
@@ -365,7 +376,9 @@ pub fn lmm_sweep_fit(
 ///
 /// If `model.re` is `None` (fixed-only design) — mirrors `fit_mle`'s own
 /// mixed-model requirement.
-#[cfg(feature = "loop_advanced")]
+// Not on the public loop surface — `build_workspace`/`fit_on` is; kept only for
+// the `refit_lmm_matches_fresh_fit_cold` equivalence test.
+#[cfg(all(test, feature = "loop_advanced"))]
 pub fn build_lmm_workspace(p: usize, model: &ModelSpec, n: usize) -> LmmWorkspace {
     let re = model
         .re
@@ -393,12 +406,9 @@ pub fn build_lmm_workspace(p: usize, model: &ModelSpec, n: usize) -> LmmWorkspac
 /// `Fit`'s O(p) result `Vec`s still allocate (as at every fit entry point in
 /// this module) — only the workspace's own buffers (suff-stats, fit scratch,
 /// solver state) are reused.
-///
-/// COUPLING — mirrors `fit_mle`'s post-solve `-Σlog wᵢ` weighted-deviance
-/// correction verbatim: `fit_lmm_into` is weights-agnostic (see its doc), so
-/// every caller of it that supports weights must apply this. Change together
-/// with `fit_mle`.
-#[cfg(feature = "loop_advanced")]
+// Not on the public loop surface — `build_workspace`/`fit_on` is; kept only for
+// the equivalence test.
+#[cfg(all(test, feature = "loop_advanced"))]
 #[allow(clippy::too_many_arguments)] // marshals the kernel's (ws, x, y, n, p, ids, opts, start) surface
 pub fn refit_lmm(
     ws: &mut LmmWorkspace,
@@ -430,15 +440,5 @@ pub fn refit_lmm(
         &ids.extra,
         opts.weights.as_deref(),
     );
-    let mut fit = fit_lmm_into(ws, &opts.target_indices, start);
-    // COUPLING — mirrors fit_mle's post-solve weighted-deviance correction; fit_lmm_into
-    // is weights-agnostic, so every caller of it that supports weights must apply this.
-    // Change together with fit_mle.
-    if let Some(w) = &opts.weights {
-        fit.deviance -= w.iter().map(|v| v.ln()).sum::<f64>();
-        // Corrected deviance ⇒ recompute the criterion-scale loglik (mirrors
-        // fit_mle — change together).
-        fit.loglik = super::common::lmm_loglik(fit.deviance, n, p);
-    }
-    fit
+    fit_lmm_into(ws, n, p, opts, start)
 }

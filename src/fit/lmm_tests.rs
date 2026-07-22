@@ -10,37 +10,100 @@ use faer::Mat;
 
 #[cfg(feature = "loop_advanced")]
 use super::common_tests::lmm_hand_dataset;
-use super::common_tests::{dense_str, lcg};
+use super::common_tests::{assert_pinned, dense_str, lcg, PIN_REL_ITER};
+// The dev seam is not on the `loop_advanced` public surface, so this equivalence
+// test reaches it directly from its module.
+#[cfg(feature = "loop_advanced")]
+use super::loop_advanced_seam::{build_lmm_workspace, refit_lmm};
 
-#[derive(serde::Deserialize)]
-struct RdLmmEst {
-    beta: Vec<f64>,
-    varcomp: Vec<VcBlock>,
-}
+use super::lmm::{lmm_run_on, lmm_view_to_fit};
+use crate::test_support::assert_near;
 
-#[derive(serde::Deserialize)]
-struct RdLmmGolden {
-    coef_names: Vec<String>,
-    estimates: RdLmmEst,
-}
-
-/// Coverage-gaps G5: aliased fixed column on a MIXED design.
-/// `y ~ 1 + x1 + x2 + x3 + (1|g)` on sim_collinear_lmm (x3 ≈ x1 + x2) vs
-/// frozen lme4 (`parity/goldens/sim_collinear_lmm.json`): lmer's rankMatrix
-/// check drops the aliased column and `fixef` simply omits its name, so the
-/// golden's `coef_names` records WHICH column lme4 dropped (x3, the last
-/// dependent one — the same later-column convention `detect_aliased` uses,
-/// so the drop indices are asserted equal, not merely each self-consistent).
-/// glmm instead keeps full width with `NaN` in the dropped slot(s); the
-/// surviving β and the varcomp must match the reduced lme4 fit. The oracle
-/// is sacred.
+/// `lmm_run_on` + `lmm_view_to_fit` on a hand-accumulated workspace must
+/// reproduce the `Fit` that `fit_cold` produces for the same single-random-
+/// intercept Gaussian LMM — pins the view/mapper split as behavior-preserving.
 #[test]
-fn fit_lmm_rank_deficient_matches_lme4_drop() {
-    let raw = include_str!("../../parity/goldens/sim_collinear_lmm.json");
-    let gold: RdLmmGolden = serde_json::from_str(raw).expect("golden JSON parses");
+fn lmm_run_on_view_maps_to_same_fit_as_fit_cold() {
+    let n_clusters = 6usize;
+    let per = 8usize;
+    let n = n_clusters * per;
+    let p = 2usize;
+    let mut st = 13u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    for i in 0..n {
+        ids_v[i] = (i % n_clusters) as u32;
+        let x1 = lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        let re = 0.3 * ((ids_v[i] as f64) - (n_clusters as f64) / 2.0);
+        y[i] = 0.5 + 0.4 * x1 + re + 0.2 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+
+    let sized = spec_sized_from_ids(&model, &ids);
+    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[], &[]);
+    let mut x_mat = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        for j in 0..p {
+            x_mat[(i, j)] = x[i * p + j];
+        }
+    }
+    ws.suff.reset();
+    ws.suff
+        .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], None);
+    let via = {
+        let v = lmm_run_on(&mut ws, &opts.target_indices, None);
+        lmm_view_to_fit(&v, n, p, &opts)
+    };
+    assert_near(&cold.beta, &via.beta, "beta");
+    assert_near(&cold.tau2, &via.tau2, "tau2");
+    assert_near(&[cold.dispersion], &[via.dispersion], "dispersion");
+    assert_near(&cold.se, &via.se, "se");
+}
+
+/// Aliased fixed column on a MIXED design: `y ~ 1 + x1 + x2 + x3 + (1|g)` on
+/// sim_collinear_lmm (x3 ≈ x1 + x2). glmm keeps full width with `NaN` in the
+/// dropped slot and flags it in `aliased`; the rest of the fit is the reduced
+/// model, varcomp included — the salvage must not perturb θ.
+///
+/// Values recorded from glmm. They are validated by `sim_collinear_lmm`, whose
+/// cross-engine cell checks the same fit against lme4 and asserts the two
+/// engines drop the SAME column — lmer's rankMatrix check omits the name from
+/// `fixef` entirely, so that comparison has to align by name and belongs there.
+#[test]
+fn fit_lmm_rank_deficient_drops_the_aliased_column() {
+    // Surviving coefficients of the reduced fit; index 3 is the dropped x3.
+    const REF_BETA: [f64; 3] = [0.8576729942296913, 0.6993983638391031, -0.4068182431411529];
+    const REF_SE: [f64; 3] = [
+        0.24654045945855108,
+        0.041312856909260794,
+        0.042805742152106876,
+    ];
+    // tau2 and dispersion are the variance scales, not stddev/sigma.
+    const REF_G_TAU2: f64 = 0.7113844334703112;
+    const REF_SIGMA2: f64 = 0.26968316460592023;
 
     // sim_collinear_lmm.csv: y,x1,x2,x3,g
-    let csv = include_str!("../../parity/data_simulated/sim_collinear_lmm.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_collinear_lmm.csv");
     let mut y = Vec::<f64>::new();
     let mut cols: Vec<[f64; 3]> = Vec::new();
     let mut g_raw = Vec::<String>::new();
@@ -89,36 +152,18 @@ fn fit_lmm_rank_deficient_matches_lme4_drop() {
     );
 
     assert!(f.converged, "reduced LMM must converge");
-    // lme4 dropped exactly x3: its surviving coef_names lack it. glmm's
-    // aliased mask must mark the SAME column (index 3) and only it.
-    assert!(
-        !gold.coef_names.iter().any(|c| c == "x3") && gold.coef_names.len() == 3,
-        "golden must record lme4 dropping x3, got {:?}",
-        gold.coef_names
-    );
     assert_eq!(
         f.aliased,
         vec![false, false, false, true],
-        "glmm must drop the same column lme4 does (x3)"
+        "x3 is the dependent column and the only one dropped"
     );
     assert!(f.beta[3].is_nan(), "aliased β = NaN");
     assert!(f.se[3].is_nan(), "aliased se = NaN");
-    // Surviving slots [0..3) line up 1:1 with the golden's 3 reduced coefs.
-    for (j, rb) in gold.estimates.beta.iter().enumerate() {
-        assert!(
-            (f.beta[j] - rb).abs() / rb.abs() < 1e-3,
-            "β{j} {} vs lme4 {rb}",
-            f.beta[j]
-        );
-    }
+    assert_pinned(&f.beta[..3], &REF_BETA, PIN_REL_ITER, "beta");
+    assert_pinned(&f.se[..3], &REF_SE, PIN_REL_ITER, "se");
     // Varcomp of the reduced fit passes through the salvage unchanged.
-    let ref_g_sd = gold.estimates.varcomp[0].stddev[0];
-    let g_rel = (f.tau2[0].sqrt() - ref_g_sd).abs() / ref_g_sd;
-    assert!(
-        g_rel < 1e-2,
-        "g sd = {} vs lme4 {ref_g_sd}",
-        f.tau2[0].sqrt()
-    );
+    assert_pinned(&f.tau2, &[REF_G_TAU2], PIN_REL_ITER, "tau2");
+    assert_pinned(&[f.dispersion], &[REF_SIGMA2], PIN_REL_ITER, "sigma2");
 }
 
 /// Warm-start A/B on the realistic sleepstudy random-slope LMM
@@ -131,7 +176,7 @@ fn fit_lmm_rank_deficient_matches_lme4_drop() {
 #[test]
 fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
     // Parsing mirrors `fit_sleepstudy_slope_varcorr_matches_lme4`.
-    let csv = include_str!("../../parity/data_empirical/sleepstudy.csv");
+    let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
     let mut y = Vec::<f64>::new();
     let mut days = Vec::<f64>::new();
     let mut subj_raw = Vec::<String>::new();
@@ -169,7 +214,7 @@ fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
     assert!(cold.converged, "cold sleepstudy fit must converge");
 
     // lme4 θ̂ = vech Cholesky of D̂/σ̂², from the frozen golden's
-    // stddev/corr/sigma (`parity/goldens/sleepstudy_lmm.json`) — `Fit`
+    // stddev/corr/sigma (`validation/goldens/sleepstudy_lmm.json`) — `Fit`
     // does not expose θ̂, and Gaussian tau2/varcorr are both σ²-scaled so
     // θ cannot be recovered from the cold fit alone:
     // θ00 = sd0/σ, θ10 = corr·sd1/σ, θ11 = (sd1/σ)·√(1−corr²).
@@ -234,7 +279,7 @@ fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
 
 /// Gap #3: sleepstudy `Reaction ~ 1 + Days + (1 + Days | Subject)` — a q=2
 /// random-slope LMM through `fit_cold`, gated against the frozen lme4 VarCorr
-/// (`parity/goldens/sleepstudy_lmm.json`, REML). Checks the full 2×2 RE
+/// (`validation/goldens/sleepstudy_lmm.json`, REML). Checks the full 2×2 RE
 /// covariance (variances AND the off-diagonal covariance) via `Fit::varcorr`,
 /// which `tau2` cannot represent at q≥2. The oracle is sacred.
 #[test]
@@ -248,7 +293,7 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
     const REF_CORR: f64 = 0.0655512382381282;
     const REF_SIGMA: f64 = 25.5917957216753; // residual sd, lme4 sigma()
 
-    let csv = include_str!("../../parity/data_empirical/sleepstudy.csv");
+    let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
     let mut y = Vec::<f64>::new();
     let mut days = Vec::<f64>::new();
     let mut subj_raw = Vec::<String>::new();
@@ -337,11 +382,19 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
         "sd1 {} vs {REF_SD1}",
         vc[2].sqrt()
     );
-    // Covariance is small (corr≈0.066) → check on an absolute scale.
-    assert!((vc[0] - d00).abs() / d00 < 2e-2, "D00 {} vs {d00}", vc[0]);
-    assert!((vc[2] - d11).abs() / d11 < 2e-2, "D11 {} vs {d11}", vc[2]);
+    assert!((vc[0] - d00).abs() / d00 < 1e-3, "D00 {} vs {d00}", vc[0]);
+    assert!((vc[2] - d11).abs() / d11 < 1e-3, "D11 {} vs {d11}", vc[2]);
+    // The off-diagonal covariance is the least-constrained θ coordinate under
+    // BOBYQA's rho_end floor — θ10 is small relative to θ00/θ11, so it lands
+    // with less relative precision than either variance. Measured against this
+    // reference: D10 1.8e-5 relative, against 4.7e-7 on the Days stddev, so the
+    // effect is real but worth about a factor of 40 — not the factor of 1e5 the
+    // previous absolute-scale band (0.20·sd0·sd1) encoded. 1e-3 relative is the
+    // cross-engine varcomp band this file's other glmm↔lme4 claims use.
+    // The weighted analog (`fit_lmm_weighted_matches_lme4`) hits the same floor
+    // on the same coordinate and states the band the same way — change together.
     assert!(
-        (vc[1] - d10).abs() < 0.20 * REF_SD0 * REF_SD1,
+        (vc[1] - d10).abs() / d10.abs() < 1e-3,
         "D10 {} vs {d10}",
         vc[1]
     );
@@ -354,7 +407,7 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
 /// carries; loglik = −REMLcrit/2 is what results/lme4_empirical stores).
 #[test]
 fn fit_exposes_n_eval_deviance_singular() {
-    let csv = include_str!("../../parity/data_empirical/sleepstudy.csv");
+    let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
     let mut y = Vec::<f64>::new();
     let mut days = Vec::<f64>::new();
     let mut subj_raw = Vec::<String>::new();
@@ -404,7 +457,7 @@ fn fit_exposes_n_eval_deviance_singular() {
     let n = 180.0_f64;
     let p = 2.0_f64; // intercept + Days
     let df = n - p;
-    let lme4_loglik = -871.814135979976; // parity/results/lme4_empirical/sleepstudy.json .estimates.loglik
+    let lme4_loglik = -871.814135979976; // validation/results/lme4_empirical/sleepstudy.json .estimates.loglik
     let remlcrit = -2.0 * lme4_loglik;
     let expected = remlcrit - df * (1.0 + (2.0 * std::f64::consts::PI).ln());
     assert!(
@@ -434,7 +487,7 @@ fn fit_lmm_offset_matches_lme4() {
     const REF_BETA: [f64; 2] = [244.5869230303025, 10.3157708080802];
     const REF_REMLCRIT: f64 = 1756.8758930064;
     const REF_LOGLIK: f64 = -878.437946503201;
-    let csv = include_str!("../../parity/data_empirical/sleepstudy.csv");
+    let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
     let mut y = Vec::<f64>::new();
     let mut days = Vec::<f64>::new();
     let mut subj_raw = Vec::<String>::new();
@@ -501,12 +554,12 @@ fn fit_lmm_offset_matches_lme4() {
 /// gated against a frozen lme4 golden. Pins β, SE, the 2×2 RE covariance
 /// (SDs + correlation), σ̂, and the `−Σlog wᵢ` deviance-constant convention:
 /// weighted REMLcrit strips the same `df·(1+ln 2π)` constant as the
-/// unweighted case (`lme.rs:2978`) PLUS the weighted Gaussian log-density's
+/// unweighted case (see `lme::profiled_deviance`) PLUS the weighted Gaussian log-density's
 /// `+½Σlog wᵢ` per row (`−Σlog wᵢ` on the −2ℓ deviance scale). Generated
 /// with (R 4.5.3, lme4 1.1-38):
 /// ```r
 /// library(lme4)
-/// d <- read.csv("parity/data_empirical/sleepstudy.csv")
+/// d <- read.csv("validation/data/empirical/sleepstudy.csv")
 /// w <- 1 + (seq_len(nrow(d)) - 1) %% 3
 /// f <- lmer(Reaction ~ Days + (Days | Subject), data = d, weights = w, REML = TRUE)
 /// print(summary(f)$coefficients, digits = 15)
@@ -525,7 +578,7 @@ fn fit_lmm_weighted_matches_lme4() {
     const REF_SIGMA: f64 = 38.62892535113247;
     const REF_REMLCRIT: f64 = 1778.29146275691;
 
-    let csv = include_str!("../../parity/data_empirical/sleepstudy.csv");
+    let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
     let mut y = Vec::<f64>::new();
     let mut days = Vec::<f64>::new();
     let mut subj_raw = Vec::<String>::new();
@@ -607,12 +660,14 @@ fn fit_lmm_weighted_matches_lme4() {
         (sd1 - REF_SD1).abs() / REF_SD1 < 1e-4,
         "sd1 {sd1} vs {REF_SD1}"
     );
-    // The off-diagonal covariance/correlation is the least-constrained θ
-    // coordinate under BOBYQA's rho_end floor (θ10 is small relative to
-    // θ00/θ11, so its relative precision is looser) — the unweighted
-    // analog (`fit_sleepstudy_slope_varcorr_matches_lme4`) hits the exact
-    // same floor and uses the same absolute-on-D10-scale band.
-    assert!((corr - REF_CORR).abs() < 0.05, "corr {corr} vs {REF_CORR}");
+    // The off-diagonal correlation is the least-constrained θ coordinate under
+    // BOBYQA's rho_end floor (θ10 is small relative to θ00/θ11, so its relative
+    // precision is looser) — the unweighted analog
+    // (`fit_sleepstudy_slope_varcorr_matches_lme4`) hits the same floor on the
+    // same coordinate and states its band the same way; change together.
+    // Absolute rather than relative because a correlation near zero has no
+    // meaningful relative scale. Measured gap against this reference: 3.0e-5.
+    assert!((corr - REF_CORR).abs() < 4e-3, "corr {corr} vs {REF_CORR}");
 
     // Fit.deviance vs REMLcrit(f) − (n−p)·(1+ln 2π) — pins the −Σlog wᵢ
     // constant `fit_mle` folds into the reported deviance (see the arm
@@ -759,7 +814,7 @@ fn fit_lmm_constant_weights_invariant() {
 /// `fit_lmm_constant_weights_invariant`.
 #[test]
 fn fit_lmm_crossed_constant_weights_invariant() {
-    let csv = include_str!("../../parity/data_simulated/sim_slope.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_slope.csv");
     let mut y = Vec::<f64>::new();
     let mut xcol = Vec::<f64>::new();
     let mut g1_raw = Vec::<String>::new();
@@ -943,36 +998,27 @@ fn fit_lmm_weighted_boundary_matches_wls() {
     }
 }
 
-// serde ignores unread JSON fields (e.g. `group`) by default; only the fields
-// the assertions consume are declared, to keep the dead_code lint clean.
-#[derive(serde::Deserialize)]
-struct VcBlock {
-    stddev: Vec<f64>,
-    corr: Vec<Vec<f64>>,
-}
-
-#[derive(serde::Deserialize)]
-struct VcEst {
-    beta: Vec<f64>,
-    varcomp: Vec<VcBlock>,
-}
-
-#[derive(serde::Deserialize)]
-struct VcGolden {
-    estimates: VcEst,
-}
-
-/// Gap #3 synthetic: crossed random-slope `y ~ 1 + x + (1 + x | g1) + (1 | g2)`
-/// vs the R-generated lme4 golden (`parity/goldens/sim_slope_lmm.json`). Exercises
-/// a q=2 `varcorr` block on the PRIMARY plus a scalar block on a crossed EXTRA
-/// grouping — the multi-grouping generalization the single-grouping composition omits.
-/// The oracle is sacred.
+/// Crossed random-slope `y ~ 1 + x + (1 + x | g1) + (1 | g2)`: a q=2 `varcorr`
+/// block on the PRIMARY plus a scalar block on a crossed EXTRA grouping — the
+/// multi-grouping generalization the single-grouping composition omits. A
+/// permuted or mis-sized varcorr layout moves these numbers.
+///
+/// Values recorded from glmm. They are validated by `sim_slope_lmm`, whose
+/// cross-engine cell checks the same fit against lme4.
 #[test]
-fn fit_sim_slope_varcorr_matches_lme4() {
-    let raw = include_str!("../../parity/goldens/sim_slope_lmm.json");
-    let gold: VcGolden = serde_json::from_str(raw).expect("golden JSON parses");
+fn fit_sim_slope_varcorr_is_pinned() {
+    const REF_BETA: [f64; 2] = [1.038027232001732, 0.8009679266277173];
+    const REF_SE: [f64; 2] = [0.33893198769052935, 0.17067326607075656];
+    // varcorr[0] = g1, packed lower triangle [v00, c01, v11]; varcorr[1] = g2.
+    const REF_VC_G1: [f64; 3] = [
+        0.8994006042465587,
+        -0.11776425179243186,
+        0.39740694659663073,
+    ];
+    const REF_VC_G2: f64 = 0.5081866440363081;
+    const REF_SIGMA2: f64 = 0.5717627834266172;
 
-    let csv = include_str!("../../parity/data_simulated/sim_slope.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_slope.csv");
     let mut y = Vec::<f64>::new();
     let mut xcol = Vec::<f64>::new();
     let mut g1_raw = Vec::<String>::new();
@@ -1023,45 +1069,17 @@ fn fit_sim_slope_varcorr_matches_lme4() {
     );
 
     assert!(f.converged);
-    for j in 0..p {
-        let r = gold.estimates.beta[j];
-        assert!(
-            (f.beta[j] - r).abs() / r.abs().max(1e-6) < 5e-3,
-            "β{j} {} vs {r}",
-            f.beta[j]
-        );
-    }
-    // varcorr[0] = g1 (q=2), varcorr[1] = g2 (scalar). Reconstruct D from stddev+corr.
-    assert_eq!(f.varcorr.len(), 2);
-    let g1b = &gold.estimates.varcomp[0];
-    let (sd0, sd1, c01) = (g1b.stddev[0], g1b.stddev[1], g1b.corr[0][1]);
-    let vc0 = &f.varcorr[0];
-    assert!(
-        (vc0[0].sqrt() - sd0).abs() / sd0 < 2e-2,
-        "g1 sd0 {} vs {sd0}",
-        vc0[0].sqrt()
-    );
-    assert!(
-        (vc0[2].sqrt() - sd1).abs() / sd1 < 2e-2,
-        "g1 sd1 {} vs {sd1}",
-        vc0[2].sqrt()
-    );
-    assert!(
-        (vc0[1] - c01 * sd0 * sd1).abs() < 0.30 * sd0 * sd1,
-        "g1 cov {}",
-        vc0[1]
-    );
-    let g2sd = gold.estimates.varcomp[1].stddev[0];
-    assert!(
-        (f.varcorr[1][0].sqrt() - g2sd).abs() / g2sd < 3e-2,
-        "g2 sd {} vs {g2sd}",
-        f.varcorr[1][0].sqrt()
-    );
+    assert_pinned(&f.beta, &REF_BETA, PIN_REL_ITER, "beta");
+    assert_pinned(&f.se, &REF_SE, PIN_REL_ITER, "se");
+    assert_eq!(f.varcorr.len(), 2, "one block per grouping, g1 then g2");
+    assert_pinned(&f.varcorr[0], &REF_VC_G1, PIN_REL_ITER, "g1 varcorr");
+    assert_pinned(&f.varcorr[1], &[REF_VC_G2], PIN_REL_ITER, "g2 varcorr");
+    assert_pinned(&[f.dispersion], &[REF_SIGMA2], PIN_REL_ITER, "sigma2");
 }
 
 /// Gap #1 crossed: Penicillin `diameter ~ 1 + (1|plate) + (1|sample)` through the
 /// data-shaped `fit_cold` with `GroupIds { primary: plate, extra: vec![sample] }`,
-/// gated against the frozen lme4 golden (`parity/goldens/penicillin_lmm.json`,
+/// gated against the frozen lme4 golden (`validation/goldens/penicillin_lmm.json`,
 /// REML). Two crossed intercept-only groupings, fixed effect = intercept only
 /// (p=1). Placeholder spec counts prove the data path derives level counts from
 /// the ids. The oracle is sacred.
@@ -1072,7 +1090,7 @@ fn fit_penicillin_crossed_matches_lme4() {
     const REF_PLATE_SD: f64 = 0.846702;
     const REF_SAMPLE_SD: f64 = 1.931614;
 
-    let csv = include_str!("../../parity/data_empirical/Penicillin.csv");
+    let csv = include_str!("../../validation/data/empirical/Penicillin.csv");
     let mut y = Vec::<f64>::new();
     let mut plate_raw = Vec::<String>::new();
     let mut sample_raw = Vec::<String>::new();
@@ -1144,7 +1162,7 @@ fn fit_penicillin_crossed_matches_lme4() {
 /// Gap #1 nested: Pastes `strength ~ 1 + (1|batch/cask)` through the data-shaped
 /// `fit_cold` with `GroupIds { primary: batch, extra: vec![cask] }`, where `cask`
 /// is the globally-unique batch:cask level (dense 0..29). Gated against the frozen
-/// lme4 golden (`parity/goldens/pastes_lmm.json`, REML). Exercises the
+/// lme4 golden (`validation/goldens/pastes_lmm.json`, REML). Exercises the
 /// `NestedWithin` topology tag on the data path; placeholder counts prove level
 /// counts come from the ids. The oracle is sacred.
 #[test]
@@ -1154,7 +1172,7 @@ fn fit_pastes_nested_matches_lme4() {
     const REF_BATCH_SD: f64 = 1.287366;
     const REF_CASK_SD: f64 = 2.904077;
 
-    let csv = include_str!("../../parity/data_empirical/Pastes.csv");
+    let csv = include_str!("../../validation/data/empirical/Pastes.csv");
     // cols: strength,batch,cask,sample  (sample = "batch:cask" global label)
     let mut y = Vec::<f64>::new();
     let mut batch_raw = Vec::<String>::new();

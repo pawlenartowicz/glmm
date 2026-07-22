@@ -26,9 +26,10 @@
 //! unstable dev-only surface re-exported through `crate::loop_advanced`.
 
 use crate::consts::{MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q, MAX_PRIMARY_Q};
-use crate::{BinomialLink, Family, GroupIds, GroupingRelation, ModelSpec, StartValues, WaldSe};
+use crate::{GroupIds, GroupingRelation, ModelSpec, StartValues, WaldSe};
 
 mod common;
+mod core;
 mod glm;
 mod glmm;
 mod lmm;
@@ -39,10 +40,6 @@ use common::{
     assert_group_ids, assert_model_shape, detect_aliased, fit_rank_deficient, spec_sized_from_ids,
     theta_width,
 };
-use glm::{fit_glm, fit_glm_nb};
-use glmm::{fit_glmm, fit_glmm_nb};
-use lmm::fit_mle;
-use ols::fit_ols;
 
 /// Result of `fit`. Fixed-effect estimates cover all p predictors; SE and
 /// tau2 have the ranges below. Non-target SE slots are NaN.
@@ -84,7 +81,7 @@ pub struct Fit {
     /// for Gaussian — `RSS/(n−p)` for OLS (raw-row df, matching R
     /// `summary.lm`'s `sigma²`; the same `sigma_sq` that scales `se`/`vcov`)
     /// and the REML `pwrss/(n−p)` for LMM (matching lme4 `sigma()²`; oracle:
-    /// `parity/goldens/sleepstudy_lmm.json` `sigma`, asserted in
+    /// `validation/goldens/sleepstudy_lmm.json` `sigma`, asserted in
     /// `fit_sleepstudy_slope_varcorr_matches_lme4`) — and `1.0` for
     /// binomial/Poisson (where dispersion is fixed, not estimated). NaN on a
     /// Gaussian fit with no honest endpoint (non-converged OLS, degenerate
@@ -102,8 +99,8 @@ pub struct Fit {
     /// accessors agree. Vech order is column-major
     /// lower-triangular (matching the θ vech convention): for a `q×q` block,
     /// `(0,0),(1,0),…,(q-1,0),(1,1),…,(q-1,q-1)`. Validated against lme4
-    /// `VarCorr` (`parity/goldens/sleepstudy_lmm.json`; Gamma scale:
-    /// `parity/goldens/sim_gamma_glmm.json`). Empty for OLS/GLM
+    /// `VarCorr` (`validation/goldens/sleepstudy_lmm.json`; Gamma scale:
+    /// `validation/goldens/sim_gamma_glmm.json`). Empty for OLS/GLM
     /// (no random effects). This is the q≥2-valid replacement for `tau2`'s
     /// per-component variances; `tau2` is retained for back-compat.
     pub varcorr: Vec<Vec<f64>>,
@@ -121,7 +118,7 @@ pub struct Fit {
     /// the σ̂² factor. Deliberately NOT multiplied by σ̂: the joint Hessian does
     /// not carry cov(σ̂, θ̂), so a σ̂-rescaled SE would be a delta-method value
     /// that matches no oracle. For the φ≡1 families the two scales coincide and
-    /// there is no split. (The parity harness skips `sd_se` gating for
+    /// there is no split. (The validation suite skips `sd_se` gating for
     /// dispersion families accordingly.)
     pub stddev_se: Vec<f64>,
     /// Rank-deficiency mask, length `p`: `true` for a fixed-effect
@@ -567,95 +564,22 @@ pub fn fit_warm(
             return fit_rank_deficient(x, y, n, p, model, ids, start, opts, &aliased);
         }
     }
-    match (&model.family, model.re.as_ref()) {
-        // Fixed-only (OLS/GLM/NB-GLM): `ids` and `start` are unused — a warm start
-        // is a no-op for fixed-only fits. No GroupIds shape check.
-        (Family::Gaussian, None) => fit_ols(x, y, n, p, opts),
-        (
-            Family::Poisson { .. }
-            | Family::Gamma { .. }
-            | Family::Binomial {
-                link: BinomialLink::Probit | BinomialLink::Logit,
-            },
-            None,
-        ) => fit_glm(model.family, f64::NAN, x, y, n, p, opts),
-        (Family::NegativeBinomial { .. }, None) => fit_glm_nb(x, y, n, p, None, opts),
-        // Mixed (LMM/GLMM): validate the ids, size the spec from them, dispatch.
-        (family, Some(re)) => {
+    // Dispatch over the unified fit core: classify + allocate the per-shape
+    // workspace, solve on it, map the lean view to the full `Fit`. Fixed-only is
+    // structure-only; mixed derives level counts from the ids. The ids are
+    // validated HERE, ahead of the core's own re-check, so a bad `GroupIds`
+    // faults against the caller's model with the entry's error message rather
+    // than the core's shape-pin panic.
+    let sized = match model.re.as_ref() {
+        None => model.clone(),
+        Some(re) => {
             assert_group_ids(re, ids, n);
-            let sized = spec_sized_from_ids(model, ids);
-            // Classify the SIZED spec: the level-count clause needs real
-            // `n_clusters`, and the frontend passes placeholders (`sized ==
-            // model` for callers who already pass real counts).
-            match classify_design(&sized, opts.nagq) {
-                Solver::NoZ => match family {
-                    Family::Gaussian => {
-                        fit_mle(x, y, n, p, &sized, &ids.primary, &ids.extra, start, opts)
-                    }
-                    Family::NegativeBinomial { .. } => {
-                        fit_glmm_nb(x, y, n, p, &sized, &ids.primary, &ids.extra, start, opts)
-                    }
-                    Family::Binomial { .. } | Family::Poisson { .. } | Family::Gamma { .. } => {
-                        fit_glmm(
-                            x,
-                            y,
-                            n,
-                            p,
-                            &sized,
-                            &ids.primary,
-                            &ids.extra,
-                            f64::NAN,
-                            start,
-                            opts,
-                        )
-                        .0
-                    }
-                },
-                // Over-envelope designs: the Gaussian sparse-Z REML
-                // path, the sparse NB marginal-θ wrapper, and the sparse non-Gaussian
-                // PIRLS driver — every wired family fits, no reachable panic.
-                Solver::Sparse => match family {
-                    Family::Gaussian => crate::sparse::fit_mle_sparse(
-                        x,
-                        y,
-                        n,
-                        p,
-                        &sized,
-                        &ids.primary,
-                        &ids.extra,
-                        start,
-                        opts,
-                    ),
-                    Family::NegativeBinomial { .. } => crate::sparse::fit_glmm_nb_sparse(
-                        x,
-                        y,
-                        n,
-                        p,
-                        &sized,
-                        &ids.primary,
-                        &ids.extra,
-                        start,
-                        opts,
-                    ),
-                    Family::Binomial { .. } | Family::Poisson { .. } | Family::Gamma { .. } => {
-                        crate::sparse::fit_glmm_sparse(
-                            x,
-                            y,
-                            n,
-                            p,
-                            &sized,
-                            &ids.primary,
-                            &ids.extra,
-                            f64::NAN,
-                            start,
-                            opts,
-                        )
-                        .0
-                    }
-                },
-            }
+            spec_sized_from_ids(model, ids)
         }
-    }
+    };
+    let mut ws = core::build_workspace(&sized, n, p, opts);
+    let view = core::fit_on(&mut ws, x, y, ids, start, opts);
+    view.into_fit(x, y, n, p, model, opts)
 }
 /// Which LMM/GLMM solver a design routes to. `NoZ` is the dense
 /// no-Z fast path with bounded stack scratch (the `MAX_*` envelope), kept
@@ -693,10 +617,10 @@ pub(crate) fn classify_design(model: &ModelSpec, _nagq: u8) -> Solver {
             .extra_groupings
             .iter()
             .any(|g| 1 + g.slopes.len() > MAX_EXTRA_Q);
-    // Extra-grouping random slopes always route Sparse. Gaussian: measured
-    // (d2 Phase-1 crossover sweep, 2026-07-02, locked machine — Sparse wins
-    // 4–13× across q_g ∈ {2,3,4}, n_extra ∈ {2,4,6}; intercept-only extras
-    // stay NoZ, 2–1500× the other way). Non-Gaussian: the dense NoZ GLMM
+    // Extra-grouping random slopes always route Sparse. Gaussian: measured on a
+    // locked-clock benchmark run — Sparse wins 4–13× across q_g ∈ {2,3,4},
+    // n_extra ∈ {2,4,6}; intercept-only extras stay NoZ, 2–1500× the other
+    // way. Non-Gaussian: the dense NoZ GLMM
     // kernel builds intercept-only extras exclusively (`glmm::build_z` emits
     // no slope columns for extras; `apply_lambda`/`build_packed_m` carry
     // debug_asserts), so Sparse — whose PIRLS applies full q_g×q_g Λ-blocks
@@ -734,24 +658,31 @@ pub(crate) fn classify_design_pub(model: &ModelSpec, nagq: u8) -> Solver {
 // feature's `crate::loop_advanced` re-exports the dev seam from here.
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+pub(crate) use common::assert_model_shape_pub;
+#[cfg(any(test, feature = "loop_advanced"))]
+pub use common::spec_sized_from_ids_pub;
 pub(crate) use common::{
     assemble_ranef_sparse, assemble_varcorr, glmm_loglik, lmm_loglik, model_df, nan_vcov,
     ranef_level_counts, vcov_from_chol,
 };
-#[cfg(test)]
-pub(crate) use common::{assert_model_shape_pub, spec_sized_from_ids_pub};
 pub(crate) use glm::{golden_max_ln_theta, nb_profile_loglik};
 pub(crate) use glmm::glm_warm_start_beta;
 #[cfg(test)]
 pub(crate) use lmm::fit_mle_noz_pub;
+// Unified fit-core surface for the loop tier.
+#[cfg(feature = "loop_advanced")]
+pub use core::{build_workspace, fit_on, FitView, FitWorkspace};
 #[cfg(feature = "loop_advanced")]
 pub use loop_advanced_seam::{
-    build_lmm_seam_ws, build_lmm_workspace, lmm_objective_at, lmm_sweep_fit, lmm_sweep_fit_on,
-    refit_lmm, LmmSeamWs, LmmSweepOutcome,
+    build_lmm_seam_ws, lmm_objective_at, lmm_sweep_fit, lmm_sweep_fit_on, LmmSeamWs,
+    LmmSweepOutcome,
 };
 
+// `pub(crate)` only so `src/sparse/tests.rs` can reach the shared Tier 1 pin
+// bands; the module is `cfg(test)` either way.
 #[cfg(test)]
-mod common_tests;
+pub(crate) mod common_tests;
 #[cfg(test)]
 mod glm_tests;
 #[cfg(test)]

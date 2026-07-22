@@ -1,0 +1,88 @@
+{
+  "name": "sim_sparse_nb",
+  "engine": "lme4::glmer.nb",
+  "engine_version": "1.1.38",
+  "kind": "glmm",
+  "data": "sim_sparse_nb",
+  "family": "negbin",
+  "link": "log",
+  "nagq": 1,
+  "tolPwrss": 1e-13,
+  "r_formula": "y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.508973335305305, 0.47617747616338],
+    "se_hessian": [0.370500007764979, 0.0623615754650949],
+    "se_rx": [0.369726927892902, 0.0610141749906039],
+    "loglik": -820.94108349418,
+    "varcomp": [
+      {
+        "group": "g1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.618024381330367],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.284810042975813],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c2",
+        "terms": ["(Intercept)"],
+        "stddev": [0.302721286424016],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c3",
+        "terms": ["(Intercept)"],
+        "stddev": [0.465909143152014],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c4",
+        "terms": ["(Intercept)"],
+        "stddev": [0.399510526735986],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c5",
+        "terms": ["(Intercept)"],
+        "stddev": [0.174143226709312],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c6",
+        "terms": ["(Intercept)"],
+        "stddev": [0.382558062655764],
+        "corr": [
+          [1]
+        ]
+      },
+      {
+        "group": "c7",
+        "terms": ["(Intercept)"],
+        "stddev": [0.283525863406369],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "theta": 1.39610186766246
+  }
+}

@@ -14,6 +14,7 @@ use faer::linalg::solvers::Solve;
 // AsMatMut: gives as_mat_mut() → MatMut<'_, T>; as_mut() gives &mut Mat, wrong type.
 use faer::mat::AsMatMut;
 
+use crate::fit::common_tests::{assert_pinned, PIN_REL_ITER};
 use crate::{Family, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing};
 
 /// One extra grouping's per-row level ids, packed as the `extra_ids` shape
@@ -1076,7 +1077,7 @@ fn build_case(
     }
 }
 
-/// Parses `parity/data_simulated/sim_wide_crossed.csv` into the over-cap
+/// Parses `validation/data/simulated/sim_wide_crossed.csv` into the over-cap
 /// `y ~ 1 + x + (1|g1) + (1|c1)+...+(1|c7)` design — 7 crossed intercept
 /// extras exceed `MAX_EXTRA_GROUPINGS=6`, so `fit_cold` routes to the
 /// sparse-Z path. Shared by the lme4 golden gate and the warm-start A/B
@@ -1089,7 +1090,7 @@ fn wide_crossed_design() -> (
     crate::ModelSpec,
     crate::GroupIds,
 ) {
-    let csv = include_str!("../../parity/data_simulated/sim_wide_crossed.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_wide_crossed.csv");
     let mut y = Vec::<f64>::new();
     let mut xcol = Vec::<f64>::new();
     let mut g1_raw = Vec::<String>::new();
@@ -1195,32 +1196,33 @@ fn wide_crossed_design() -> (
     (x, y, n, p, model, ids)
 }
 
-/// OVER-CAP lme4 REML golden on the `wide_crossed_design` above. Gated
-/// against the frozen lme4 1.1.38 REML golden
-/// (`parity/goldens/sim_wide_crossed_lmm.json`). The oracle is sacred.
-/// Tolerances: β/SE 2e-2 relative, varcomp stddev 3e-2 relative (phase-1 band).
+/// OVER-CAP sparse LMM on the `wide_crossed_design` above: 7 crossed extras
+/// exceed `MAX_EXTRA_GROUPINGS`, so the design routes to the sparse solver.
+/// The eight scalar variance components are pinned in glmm's own order
+/// (primary first, extras in declaration order) — a permuted Z layout moves
+/// them, which is what this rung is for.
+///
+/// Values recorded from glmm. They are validated by `sim_wide_crossed_lmm`,
+/// whose cross-engine cell checks the same fit against lme4 and pairs the
+/// variance components by group NAME (lme4's `VarCorr` order is descending
+/// level count and matches ours only by luck).
 #[test]
-fn fit_wide_crossed_sparse_matches_lme4() {
-    // Serde structs mirror the fit.rs VcBlock/VcEst/VcGolden pattern; `se`
-    // added here for the SE gate (LMM golden has `estimates.se` directly).
-    // serde ignores unread JSON fields (e.g. `group`, `corr`) by default.
-    #[derive(serde::Deserialize)]
-    struct VcBlock {
-        stddev: Vec<f64>,
-    }
-    #[derive(serde::Deserialize)]
-    struct VcEst {
-        beta: Vec<f64>,
-        se: Vec<f64>,
-        varcomp: Vec<VcBlock>,
-    }
-    #[derive(serde::Deserialize)]
-    struct VcGolden {
-        estimates: VcEst,
-    }
-
-    let raw = include_str!("../../parity/goldens/sim_wide_crossed_lmm.json");
-    let gold: VcGolden = serde_json::from_str(raw).expect("golden JSON parses");
+fn fit_wide_crossed_sparse_is_pinned() {
+    const REF_BETA: [f64; 2] = [1.7525795303530547, 0.808767308253792];
+    const REF_SE: [f64; 2] = [0.6809497161215503, 0.03212803911232081];
+    // Eight q=1 blocks, glmm order [g1 | c1..c7]. Variances, not stddevs.
+    const REF_VAR: [f64; 8] = [
+        0.9096743051917926,
+        1.0157902991959213,
+        0.3140283552167859,
+        0.39010531978955515,
+        0.3554082353151701,
+        0.45603559620535206,
+        0.37148878217578546,
+        0.19148041401408306,
+    ];
+    // Gaussian dispersion = REML σ̂².
+    const REF_SIGMA2: f64 = 0.3836290814464871;
 
     let (x, y, n, p, model, ids) = wide_crossed_design();
     // 7 extras > MAX_EXTRA_GROUPINGS=6 → over-envelope-by-count ⇒ Sparse.
@@ -1235,40 +1237,12 @@ fn fit_wide_crossed_sparse_matches_lme4() {
     let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
 
     assert!(f.converged, "sparse wide-crossed fit must converge");
-    // β/SE: 2e-2 relative (phase-1 band). Intercept (j=0) and slope (j=1).
-    for j in 0..p {
-        let rb = gold.estimates.beta[j];
-        let rs = gold.estimates.se[j];
-        assert!(
-            (f.beta[j] - rb).abs() / rb.abs().max(1e-6) < 2e-2,
-            "β[{j}] glmm={} lme4={rb}",
-            f.beta[j],
-        );
-        assert!(
-            (f.se[j] - rs).abs() / rs.abs().max(1e-6) < 2e-2,
-            "se[{j}] glmm={} lme4={rs}",
-            f.se[j],
-        );
-    }
-    // Varcomp stddev: 3e-2 relative (phase-1 band). 8 scalar blocks (q=1):
-    // varcorr[0]=g1, [1]=c1, ..., [7]=c7 — primary first, extras in formula order.
+    assert_pinned(&f.beta, &REF_BETA, PIN_REL_ITER, "beta");
+    assert_pinned(&f.se, &REF_SE, PIN_REL_ITER, "se");
     assert_eq!(f.varcorr.len(), 8, "8 scalar varcomp blocks (g1 + c1..c7)");
-    for k in 0..8 {
-        let ref_sd = gold.estimates.varcomp[k].stddev[0];
-        let got_sd = f.varcorr[k][0].sqrt();
-        assert!(
-            (got_sd - ref_sd).abs() / ref_sd.max(1e-6) < 3e-2,
-            "varcomp[{k}] stddev glmm={got_sd:.6} lme4={ref_sd:.6}",
-        );
-    }
-    // Gaussian dispersion = REML σ̂² on the sparse path too; σ̂ against the
-    // same frozen lme4 sigma() the warm-start test's θ̂ reconstruction uses.
-    const REF_SIGMA: f64 = 0.619378289188346;
-    assert!(
-        (f.dispersion.sqrt() - REF_SIGMA).abs() / REF_SIGMA < 3e-2,
-        "σ̂ {} vs {REF_SIGMA}",
-        f.dispersion.sqrt()
-    );
+    let vars: Vec<f64> = f.varcorr.iter().map(|b| b[0]).collect();
+    assert_pinned(&vars, &REF_VAR, PIN_REL_ITER, "varcorr");
+    assert_pinned(&[f.dispersion], &[REF_SIGMA2], PIN_REL_ITER, "sigma2");
 }
 
 /// Warm-start A/B on the sparse-routed wide-crossed LMM: a warm fit from
@@ -1674,6 +1648,13 @@ fn noz_sparse_grid_agrees() {
     let mut skipped = 0usize;
     let mut checked = 0usize;
     for (idx, c) in cells.iter().enumerate() {
+        // `loop_advanced` here is a COST gate, not a capability one: nothing in
+        // these cells needs the unstable hot-path surface, they are just slow
+        // enough (~8 heavy cells) that the default suite skips them. The
+        // feature is borrowed because a third feature for one call site is
+        // machinery for a single use. Without this note the next reader infers
+        // the sweep requires the unstable API, and the CI `loop_advanced` leg
+        // pays for the heavy cells with nothing saying why.
         if is_heavy_cell(c) && !cfg!(feature = "loop_advanced") {
             skipped += 1;
             continue;
@@ -1993,34 +1974,52 @@ fn noz_sparse_crossover_heavy_timed() {
 /// `ge` carries q_g = 5 (intercept + 4 slopes) > `MAX_EXTRA_Q = 4`, so the design is
 /// over-envelope by a single grouping's WIDTH — the one over-cap axis with NO dense
 /// (NoZ) twin, since NoZ physically cannot run q_g>4. The sparse-vs-NoZ cross-check
-/// (`sparse_vs_noz_cross_check_table`) therefore never reaches q_g>1, so this golden
-/// is the *sole* oracle for the extras LEVEL-MAJOR multi-slope Z column layout at
-/// width 5: a wrong layout corrupts the whole fit, so matching lme4 on β + SE +
-/// per-term varcomp (the true SDs are distinct, so a column permutation shifts the
-/// diagonal variances and fails) validates the layout end-to-end. The oracle is
-/// sacred — tolerances are the phase-1 band (β/SE 2e-2, varcomp stddev 3e-2 rel).
+/// (`sparse_vs_noz_cross_check_table`) therefore never reaches q_g>1, so this rung is
+/// the *sole* check on the extras LEVEL-MAJOR multi-slope Z column layout at width 5.
+/// A wrong layout corrupts the whole fit, so the full 15-element vech of the `ge`
+/// block is pinned rather than just its diagonal: a column permutation moves the
+/// off-diagonals even where it happens to leave the variances alone.
+///
+/// Values recorded from glmm. They are validated by `sim_wide_slopes_lmm`, whose
+/// cross-engine cell checks the same fit against lme4.
 #[test]
-fn fit_wide_slopes_sparse_matches_lme4() {
-    #[derive(serde::Deserialize)]
-    struct VcBlock {
-        group: String,
-        stddev: Vec<f64>,
-    }
-    #[derive(serde::Deserialize)]
-    struct VcEst {
-        beta: Vec<f64>,
-        se: Vec<f64>,
-        varcomp: Vec<VcBlock>,
-    }
-    #[derive(serde::Deserialize)]
-    struct VcGolden {
-        estimates: VcEst,
-    }
+fn fit_wide_slopes_sparse_is_pinned() {
+    const REF_BETA: [f64; 5] = [
+        1.705945745131128,
+        0.6799307210839243,
+        -0.5337786719626961,
+        0.3961595523369236,
+        -0.23725708236374737,
+    ];
+    const REF_SE: [f64; 5] = [
+        0.26358014130208135,
+        0.1354457259552539,
+        0.11236944514245578,
+        0.06849214893069645,
+        0.047239345204624014,
+    ];
+    // gp: scalar block. ge: q=5, column-major lower-triangle vech of D̂.
+    const REF_VC_GP: f64 = 0.8317180213434034;
+    const REF_VC_GE: [f64; 15] = [
+        1.0998857218331997,
+        -0.025678656387641927,
+        0.22421999913175872,
+        0.09681455610755789,
+        0.08265957169332074,
+        0.7159782689170134,
+        0.2979600435789402,
+        0.02504464200849968,
+        0.007685081403510894,
+        0.48821896083002864,
+        0.07347532656451775,
+        0.04159258231076535,
+        0.17210515687373046,
+        0.008381212912406297,
+        0.07263571892974993,
+    ];
+    const REF_SIGMA2: f64 = 0.3764413475288632;
 
-    let raw = include_str!("../../parity/goldens/sim_wide_slopes_lmm.json");
-    let gold: VcGolden = serde_json::from_str(raw).expect("golden JSON parses");
-
-    let csv = include_str!("../../parity/data_simulated/sim_wide_slopes.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_wide_slopes.csv");
     // Columns: y, x1, x2, x3, x4, gp, ge (indices 0..7).
     let mut y = Vec::<f64>::new();
     let mut xc: [Vec<f64>; 4] = [vec![], vec![], vec![], vec![]];
@@ -2093,76 +2092,38 @@ fn fit_wide_slopes_sparse_matches_lme4() {
     let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
 
     assert!(f.converged, "sparse over-width fit must converge");
-    // β/SE: 2e-2 relative. Golden coef order (Intercept,x1,x2,x3,x4) == x col order.
-    for j in 0..p {
-        let rb = gold.estimates.beta[j];
-        let rs = gold.estimates.se[j];
-        assert!(
-            (f.beta[j] - rb).abs() / rb.abs().max(1e-6) < 2e-2,
-            "β[{j}] glmm={} lme4={rb}",
-            f.beta[j],
-        );
-        assert!(
-            (f.se[j] - rs).abs() / rs.abs().max(1e-6) < 2e-2,
-            "se[{j}] glmm={} lme4={rs}",
-            f.se[j],
-        );
-    }
-
-    // Varcomp: glmm order is declaration order [gp(primary,q=1), ge(extra,q=5)];
-    // lme4's VarCorr order is descending level count [ge(40), gp(20)] — so map by
-    // group NAME, not index. glmm.varcorr[k] is the column-major lower-tri vech of
-    // D̂=σ̂²Λ̂Λ̂'; per-term variances sit at the diagonal offsets below.
+    assert_pinned(&f.beta, &REF_BETA, PIN_REL_ITER, "beta");
+    assert_pinned(&f.se, &REF_SE, PIN_REL_ITER, "se");
+    // glmm's varcorr order is declaration order [gp(primary,q=1), ge(extra,q=5)],
+    // each block the column-major lower-triangle vech of D̂ = σ̂²Λ̂Λ̂'.
     assert_eq!(f.varcorr.len(), 2, "two varcomp blocks (gp + ge)");
-    let gold_of = |name: &str| {
-        gold.estimates
-            .varcomp
-            .iter()
-            .find(|b| b.group == name)
-            .expect("golden block")
-    };
-    // gp: scalar q=1 block.
-    let gp_sd = f.varcorr[0][0].sqrt();
-    let gp_ref = gold_of("gp").stddev[0];
-    assert!(
-        (gp_sd - gp_ref).abs() / gp_ref.max(1e-6) < 3e-2,
-        "gp stddev glmm={gp_sd:.6} lme4={gp_ref:.6}",
-    );
-    // ge: q=5 block. Diagonal of D in column-major lower-tri vech (q=5) is at
-    // offsets 0,5,9,12,14 for terms (Intercept,x1,x2,x3,x4) — glmm's Λ term order
-    // (intercept then slopes [1,2,3,4]) matches the golden's `terms` order.
-    const GE_DIAG: [usize; 5] = [0, 5, 9, 12, 14];
-    let ge_ref = gold_of("ge");
-    for (t, &off) in GE_DIAG.iter().enumerate() {
-        let got = f.varcorr[1][off].sqrt();
-        let rf = ge_ref.stddev[t];
-        assert!(
-            (got - rf).abs() / rf.max(1e-6) < 3e-2,
-            "ge stddev[{t}] glmm={got:.6} lme4={rf:.6}",
-        );
-    }
+    assert_pinned(&f.varcorr[0], &[REF_VC_GP], PIN_REL_ITER, "gp varcorr");
+    assert_pinned(&f.varcorr[1], &REF_VC_GE, PIN_REL_ITER, "ge varcorr");
+    assert_pinned(&[f.dispersion], &[REF_SIGMA2], PIN_REL_ITER, "sigma2");
 }
 
 // ── Sparse non-Gaussian goldens (gamma over-width, NB over-count) ─
 
-/// Shared serde shape for the two sparse GLMM goldens (fit_m3_goldens.R's
-/// glmm schema). serde ignores unread fields (loglik, corr, …).
+/// Shared serde shape for the two sparse gamma goldens (goldens_agq.R's
+/// glmm schema). serde ignores unread fields (loglik, corr, …). Gated with
+/// the tests that read it — those are the only two cross-engine checks left
+/// in this file, everything else here is pinned against glmm's own values.
+#[cfg(feature = "oracle-tests")]
 #[derive(serde::Deserialize)]
 struct SgVcBlock {
     group: String,
     stddev: Vec<f64>,
 }
+#[cfg(feature = "oracle-tests")]
 #[derive(serde::Deserialize)]
 struct SgEst {
     beta: Vec<f64>,
     se_hessian: Vec<f64>,
     se_rx: Vec<f64>,
     varcomp: Vec<SgVcBlock>,
-    #[serde(default)]
     dispersion: Option<f64>,
-    #[serde(default)]
-    theta: Option<f64>,
 }
+#[cfg(feature = "oracle-tests")]
 #[derive(serde::Deserialize)]
 struct SgGolden {
     estimates: SgEst,
@@ -2188,7 +2149,7 @@ fn dense_ids(raw: &[String]) -> Vec<u32> {
 /// OVER-WIDTH gamma GLMM golden: `y ~ 1 + x1..x4 + (1|gp) + (1 + x1..x4 | ge)`,
 /// gamma/log — `ge` carries q_g = 5 > MAX_EXTRA_Q, so the design routes to the
 /// sparse non-Gaussian PIRLS (`fit_glmm_sparse`); no dense twin exists.
-/// Gated against frozen `glmer(Gamma("log"))` (`parity/goldens/sim_sparse_gamma.json`).
+/// Gated against frozen `glmer(Gamma("log"))` (`validation/goldens/sim_sparse_gamma.json`).
 /// The oracle is sacred.
 ///
 /// Both SE arms are lme4-gated: **Hessian** (glmm's default) against
@@ -2196,22 +2157,25 @@ fn dense_ids(raw: &[String]) -> Vec<u32> {
 /// settled), and **Rx** against `se_rx` — glmm's Gamma Rx carries lme4's
 /// σ̂² = pwrss/n like `vcov(use.hessian=FALSE)` (`family::glmm_sigma_sq`;
 /// unscaled, the two differ by exactly σ̂ on this dataset).
+/// Tier 2 (cross-engine): compiled only under `oracle-tests`. It used to skip
+/// at runtime under default features and still report PASS, which is strictly
+/// worse than `#[ignore]` — a golden that asserted nothing while being counted
+/// as covered. A compile-time gate makes its absence visible in the test count.
+/// Also ~8 min release (n=1200, 21-dim joint BOBYQA + FD-Hessian SE), so the
+/// off-by-default tier is where the cost belongs anyway.
+///
+/// Not subsumed by the corpus-driven Tier 2 cell of the same name: that one
+/// goes through the formula frontend, which orders the slope RE first and so
+/// routes the DENSE kernel (`manifest.json` `//gamma_rungs`). This builds the
+/// `ModelSpec` by hand to pin the SPARSE orientation. Different claim, both
+/// worth having.
+#[cfg(feature = "oracle-tests")]
 #[test]
 fn fit_sparse_gamma_glmm_matches_lme4() {
-    // Heavy (~8 min release: n=1200, 21-dim joint BOBYQA + FD-Hessian SE) —
-    // gated like the heavy crossover cells; the default suite keeps the NB
-    // golden (43 s) + the over-envelope gamma convergence smoke.
-    if !cfg!(feature = "loop_advanced") {
-        eprintln!(
-            "fit_sparse_gamma_glmm_matches_lme4: heavy golden skipped — \
-             run with --features loop_advanced"
-        );
-        return;
-    }
-    let raw = include_str!("../../parity/goldens/sim_sparse_gamma.json");
+    let raw = include_str!("../../validation/goldens/sim_sparse_gamma.json");
     let gold: SgGolden = serde_json::from_str(raw).expect("golden JSON parses");
 
-    let csv = include_str!("../../parity/data_simulated/sim_sparse_gamma.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_sparse_gamma.csv");
     // Columns: y, x1..x4, gp, ge (indices 0..6).
     let mut y = Vec::<f64>::new();
     let mut xc: [Vec<f64>; 4] = [vec![], vec![], vec![], vec![]];
@@ -2346,18 +2310,33 @@ fn fit_sparse_gamma_glmm_matches_lme4() {
 
 /// OVER-COUNT NB GLMM golden: `y ~ 1 + x + (1|g1) + (1|c1) + … + (1|c7)`,
 /// negbin/log — 7 crossed extras > MAX_EXTRA_GROUPINGS route to the sparse NB
-/// marginal-θ wrapper (`fit_glmm_nb_sparse`). Gated against frozen
-/// `lme4::glmer.nb` (`parity/goldens/sim_sparse_nb.json`). The oracle is
-/// sacred. (glmer.nb printed interim-fit convergence warnings while
-/// generating the reference — from its internal θ-candidate refits — but the
-/// FINAL model carries no convergence messages and its estimates sit near the
-/// simulation truth, so the golden stands.) Rx SE, as the gamma golden.
+/// marginal-θ wrapper (`fit_glmm_nb_sparse`). Rx SE, as the gamma rung.
+///
+/// Values recorded from glmm. They are validated by `sim_sparse_nb`, whose
+/// cross-engine cell checks the same fit against `lme4::glmer.nb`. (glmer.nb
+/// printed interim-fit convergence warnings while generating that reference —
+/// from its internal θ-candidate refits — but the FINAL model carries no
+/// convergence messages and its estimates sit near the simulation truth, so
+/// the golden stands.)
 #[test]
-fn fit_sparse_nb_glmm_matches_lme4() {
-    let raw = include_str!("../../parity/goldens/sim_sparse_nb.json");
-    let gold: SgGolden = serde_json::from_str(raw).expect("golden JSON parses");
+fn fit_sparse_nb_glmm_is_pinned() {
+    const REF_BETA: [f64; 2] = [0.5088886079829762, 0.47617441464483673];
+    const REF_SE: [f64; 2] = [0.36966175981400595, 0.06101272391660244];
+    // Eight q=1 blocks, glmm order [g1 | c1..c7]. Variances, not stddevs.
+    const REF_VAR: [f64; 8] = [
+        0.382027397260772,
+        0.08109606375178166,
+        0.09154782243229326,
+        0.2169364949898817,
+        0.1595385360755232,
+        0.030291705546718815,
+        0.14628184272094907,
+        0.08037534285434245,
+    ];
+    // NB θ̂ rides in `dispersion`, from the marginal golden-section search.
+    const REF_THETA: f64 = 1.3961559360588565;
 
-    let csv = include_str!("../../parity/data_simulated/sim_sparse_nb.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_sparse_nb.csv");
     // Columns: y, x, g1, c1..c7 (indices 0..9).
     let mut y = Vec::<f64>::new();
     let mut xcol = Vec::<f64>::new();
@@ -2407,41 +2386,12 @@ fn fit_sparse_nb_glmm_matches_lme4() {
     };
     let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert!(f.converged, "sparse NB GLMM must converge");
-
-    // θ̂ (NB dispersion): 5e-2 relative — the sim_nb_glmm golden's band (two
-    // independent marginal-θ golden-section searches over re-fit surfaces).
-    let rt = gold.estimates.theta.expect("NB golden carries theta");
-    assert!(
-        (f.dispersion - rt).abs() / rt < 5e-2,
-        "θ̂ glmm={} lme4={rt}",
-        f.dispersion
-    );
-    for j in 0..p {
-        let rb = gold.estimates.beta[j];
-        let rs = gold.estimates.se_rx[j];
-        assert!(
-            (f.beta[j] - rb).abs() / rb.abs().max(1e-6) < 2e-2,
-            "β[{j}] glmm={} lme4={rb}",
-            f.beta[j]
-        );
-        assert!(
-            (f.se[j] - rs).abs() / rs.abs().max(1e-6) < 2e-2,
-            "se[{j}] glmm={} lme4={rs}",
-            f.se[j]
-        );
-    }
-    // 8 scalar varcomp blocks, glmm order [g1 | c1..c7] == lme4's VarCorr
-    // order (g1 has the most levels; ties keep formula order — the
-    // sim_wide_crossed precedent).
+    assert_pinned(&f.beta, &REF_BETA, PIN_REL_ITER, "beta");
+    assert_pinned(&f.se, &REF_SE, PIN_REL_ITER, "se");
     assert_eq!(f.varcorr.len(), 8, "8 scalar varcomp blocks");
-    for k in 0..8 {
-        let ref_sd = gold.estimates.varcomp[k].stddev[0];
-        let got_sd = f.varcorr[k][0].sqrt();
-        assert!(
-            (got_sd - ref_sd).abs() / ref_sd.max(1e-6) < 3e-2,
-            "varcomp[{k}] stddev glmm={got_sd:.6} lme4={ref_sd:.6}"
-        );
-    }
+    let vars: Vec<f64> = f.varcorr.iter().map(|b| b[0]).collect();
+    assert_pinned(&vars, &REF_VAR, PIN_REL_ITER, "varcorr");
+    assert_pinned(&[f.dispersion], &[REF_THETA], PIN_REL_ITER, "theta");
 }
 
 /// Weighted twin of `fit_sparse_gamma_glmm_matches_lme4` (Task 7): same
@@ -2458,8 +2408,9 @@ fn fit_sparse_nb_glmm_matches_lme4() {
 /// well-conditioned (SE lands back at the unweighted golden's scale) while
 /// still exercising the same weighted code path. Closes the sparse Gamma
 /// weighting gap — profiled dispersion (`gamma_aic`) and the post-fit
-/// Pearson φ̂ both take `ws.prior_w`. Gated behind `loop_advanced` like its
-/// unweighted sibling (same 21-dim joint BOBYQA + FD-Hessian SE cost).
+/// Pearson φ̂ both take `ws.prior_w`. Tier 2, gated behind `oracle-tests` like
+/// its unweighted sibling — same cross-engine claim, and the same 21-dim joint
+/// BOBYQA plus FD-Hessian SE cost.
 /// Generated with (R 4.5.3, lme4 1.1-38):
 /// ```r
 ///   d$w <- 1 + 0.2 * (((seq_len(nrow(d)) - 1) %% 3) - 1)
@@ -2475,15 +2426,9 @@ fn fit_sparse_nb_glmm_matches_lme4() {
 /// still lands within 0.1%, confirming the curvature (hence the
 /// weighting) is correct and this is optimizer-path scatter on a
 /// poorly-determined direction, not a weighting bug.
+#[cfg(feature = "oracle-tests")]
 #[test]
 fn fit_sparse_gamma_glmm_weighted_matches_lme4() {
-    if !cfg!(feature = "loop_advanced") {
-        eprintln!(
-            "fit_sparse_gamma_glmm_weighted_matches_lme4: heavy golden skipped — \
-             run with --features loop_advanced"
-        );
-        return;
-    }
     const REF_BETA: [f64; 5] = [
         0.233369872688657,
         0.511759152360149,
@@ -2504,7 +2449,7 @@ fn fit_sparse_gamma_glmm_weighted_matches_lme4() {
     // the Pearson form matches `glmm`'s `Fit::dispersion` field.
     const REF_DISPERSION: f64 = 0.411217227312831;
 
-    let csv = include_str!("../../parity/data_simulated/sim_sparse_gamma.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_sparse_gamma.csv");
     // Columns: y, x1..x4, gp, ge (indices 0..6).
     let mut y = Vec::<f64>::new();
     let mut xc: [Vec<f64>; 4] = [vec![], vec![], vec![], vec![]];
@@ -2648,17 +2593,23 @@ fn sparse_weighted_nb_matches_replicated() {
 /// (1 + x | g2), prior weights = size — the first non-Gaussian design with
 /// a slope-carrying extra grouping. IN-envelope (q_g = 2 ≤ MAX_EXTRA_Q):
 /// reaches Sparse purely through classify_design's slope-extras clause.
-/// Gated against frozen glmer (parity/goldens/sim_binomial_slope_crossed.json,
-/// tolPwrss = 1e-13). The oracle is sacred.
+///
+/// Values recorded from glmm. They are validated by
+/// `sim_binomial_slope_crossed`, whose cross-engine cell checks the same fit
+/// against frozen glmer at tolPwrss = 1e-13.
 #[test]
-fn fit_sparse_binomial_slope_crossed_matches_lme4() {
-    let raw = include_str!("../../parity/goldens/sim_binomial_slope_crossed.json");
-    let gold: SgGolden = serde_json::from_str(raw).expect("golden JSON parses");
+fn fit_sparse_binomial_slope_crossed_is_pinned() {
+    const REF_BETA: [f64; 2] = [0.08290096060631727, 0.6343172639914979];
+    const REF_SE: [f64; 2] = [0.2199779193352823, 0.21697243593898305];
+    // Two q=2 blocks [g1, g2], each the column-major lower-triangle vech of D̂
+    // on the link scale (binomial: no σ̂ scaling).
+    const REF_VC_G1: [f64; 3] = [0.3535134591196692, -0.03346456385338107, 0.299602458176971];
+    const REF_VC_G2: [f64; 3] = [0.27688146870530117, 0.22408711356841296, 0.2993874546311821];
 
-    let csv = include_str!("../../parity/data_simulated/sim_binomial_slope_crossed.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_slope_crossed.csv");
     // Columns: incidence, size, x, g1, g2 (indices 0..4). Aggregated
     // binomial: y = incidence/size (proportion), prior weights = size —
-    // mirrors parity/oracle/fit.rs's weighted rung-18 lowering.
+    // mirrors validation/engines/glmm.rs's weighted rung-18 lowering.
     let mut y = Vec::<f64>::new();
     let mut size_col = Vec::<f64>::new();
     let mut xcol = Vec::<f64>::new();
@@ -2711,47 +2662,11 @@ fn fit_sparse_binomial_slope_crossed_matches_lme4() {
         f.converged,
         "sparse binomial slope-crossed GLMM must converge"
     );
-
-    // β at 2e-2 relative, se_hessian at the FD-Hessian floor 3e-2 — the
-    // sparse-golden bands (gamma/NB precedent).
-    for j in 0..p {
-        let rb = gold.estimates.beta[j];
-        let rs = gold.estimates.se_hessian[j];
-        assert!(
-            (f.beta[j] - rb).abs() / rb.abs().max(1e-6) < 2e-2,
-            "β[{j}] glmm={} lme4={rb}",
-            f.beta[j]
-        );
-        assert!(
-            (f.se[j] - rs).abs() / rs.abs().max(1e-6) < 3e-2,
-            "se[{j}] glmm={} lme4={rs}",
-            f.se[j]
-        );
-    }
-    // Varcomp by group NAME (glmm order is declaration order [g1, g2] but
-    // never assume the golden's): two q=2 blocks; varcorr[k] is the
-    // column-major lower-tri vech of D̂ on the link scale (binomial: no σ̂
-    // scaling), diag at offsets 0, 2 for terms (Intercept, x).
+    assert_pinned(&f.beta, &REF_BETA, PIN_REL_ITER, "beta");
+    assert_pinned(&f.se, &REF_SE, PIN_REL_ITER, "se");
     assert_eq!(f.varcorr.len(), 2, "two q=2 varcomp blocks (g1 + g2)");
-    let gold_of = |name: &str| {
-        gold.estimates
-            .varcomp
-            .iter()
-            .find(|b| b.group == name)
-            .expect("golden block")
-    };
-    const DIAG_Q2: [usize; 2] = [0, 2];
-    for (k, name) in ["g1", "g2"].iter().enumerate() {
-        let ref_block = gold_of(name);
-        for (t, &off) in DIAG_Q2.iter().enumerate() {
-            let got = f.varcorr[k][off].sqrt();
-            let rf = ref_block.stddev[t];
-            assert!(
-                (got - rf).abs() / rf.max(1e-6) < 3e-2,
-                "{name} stddev[{t}] glmm={got:.6} lme4={rf:.6}"
-            );
-        }
-    }
+    assert_pinned(&f.varcorr[0], &REF_VC_G1, PIN_REL_ITER, "g1 varcorr");
+    assert_pinned(&f.varcorr[1], &REF_VC_G2, PIN_REL_ITER, "g2 varcorr");
 }
 
 // ── Sparse non-Gaussian GLMM cross-checks ────────────────────
@@ -2936,6 +2851,12 @@ fn sparse_glmm_deviance_matches_dense() {
             107,
         ),
         (
+            Family::Gamma {
+                link: crate::GammaLink::Inverse,
+            },
+            113,
+        ),
+        (
             Family::NegativeBinomial {
                 link: crate::NegBinomialLink::Log,
             },
@@ -2967,12 +2888,30 @@ fn sparse_glmm_deviance_matches_dense() {
         let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[]);
         let mut sws = super::SparseGlmmWorkspace::new(&g, &ids.primary, &ids.extra, n, p);
 
-        // (θ, β) probe points: [θ_primary, θ_extra, β0, β1].
-        for params in [
-            [0.5f64, 0.7, 0.3, 0.5],
-            [1.0, 0.2, -0.2, 0.8],
-            [0.15, 1.1, 0.6, -0.4],
-        ] {
+        // (θ, β) probe points: [θ_primary, θ_extra, β0, β1]. The inverse link
+        // gets its own β probes with β₀ well inside the η > 0 domain (μ = 1/η):
+        // the shared probes' β₀ leave η_fixed ≤ 0 rows, where PIRLS now
+        // correctly refuses a boundary answer (`family::eta_infeasible`) and
+        // both paths return ∞ — true agreement, but a vacuous probe.
+        let probes: [[f64; 4]; 3] = if matches!(
+            family,
+            Family::Gamma {
+                link: crate::GammaLink::Inverse,
+            }
+        ) {
+            [
+                [0.5, 0.7, 1.5, 0.3],
+                [1.0, 0.2, 1.3, 0.2],
+                [0.15, 1.1, 1.8, -0.3],
+            ]
+        } else {
+            [
+                [0.5, 0.7, 0.3, 0.5],
+                [1.0, 0.2, -0.2, 0.8],
+                [0.15, 1.1, 0.6, -0.4],
+            ]
+        };
+        for params in probes {
             let dense = crate::glmm::glmm_laplace_deviance(
                 &params,
                 &mut dws,
@@ -3104,6 +3043,100 @@ fn sparse_glmm_fit_matches_dense_in_envelope() {
                 dense.dispersion
             );
         }
+    }
+}
+
+/// Regression test for the Gamma-inverse boundary-convergence defect: forced
+/// through the sparse solver, `y ~ 1 + x + grp + (1|cluster)` on `sim_gamma`
+/// with the INVERSE link used to report `converged = true` under `WaldSe::Rx`
+/// at an optimum ~937 deviance units above the dense one (β₀ off by 11%), and
+/// `deviance = inf` under `WaldSe::Hessian` — PIRLS accepted iterates that
+/// `clamp_eta` had projected onto the η > 0 domain boundary, and the projected
+/// row's μ² ≈ 1e20 working weight kept the WLS solve pinned there (see
+/// `family::eta_infeasible` for the fix: infeasible trial ⇒ step-halve). The
+/// log-link twin of this model was green throughout, which is what pins the
+/// defect to the link rather than the sparse forcing.
+///
+/// Asserts the sparse fit against the dense `fit_cold` on identical inputs
+/// (the envelope-test bounds — two independent BOBYQA minimizations) and
+/// against frozen `glmer(family=Gamma("inverse"))`
+/// (`validation/goldens/sim_gamma_inv_glmm.json`), both `WaldSe` arms. The loglik
+/// pin is the branch check: the spurious boundary optimum misses it by ~469.
+#[test]
+fn sparse_glmm_gamma_inverse_fit_matches_dense_and_lme4() {
+    const REF_BETA: [f64; 3] = [0.75205795080653, -0.187572954875194, -0.140275024148733];
+    const REF_LOGLIK: f64 = -468.38415378098;
+    let (x, y, cluster_ids, n_clusters) = crate::fit::common_tests::sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Inverse,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = crate::GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    for wald_se in [crate::WaldSe::Hessian, crate::WaldSe::Rx] {
+        let opts = crate::FitOptions {
+            target_indices: vec![0, 1, 2],
+            wald_se,
+            ..crate::FitOptions::default()
+        };
+        let dense = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        let sized = crate::fit::spec_sized_from_ids_pub(&model, &ids);
+        let (sp, _dev) = super::fit_glmm_sparse(
+            &x,
+            &y,
+            n,
+            p,
+            &sized,
+            &ids.primary,
+            &ids.extra,
+            f64::NAN,
+            None,
+            &opts,
+        );
+        let tag = format!("gamma-inverse/{wald_se:?}");
+        assert!(
+            dense.converged && sp.converged,
+            "{tag}: both paths must converge"
+        );
+        #[allow(clippy::needless_range_loop)] // j indexes three parallel slices
+        for j in 0..p {
+            assert!(
+                (sp.beta[j] - dense.beta[j]).abs() < 2e-3 * (1.0 + dense.beta[j].abs()),
+                "{tag} β[{j}]: sparse={} dense={}",
+                sp.beta[j],
+                dense.beta[j]
+            );
+            assert!(
+                (sp.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 2e-3,
+                "{tag} β[{j}]: sparse={} lme4={}",
+                sp.beta[j],
+                REF_BETA[j]
+            );
+            assert!(
+                (sp.se[j] - dense.se[j]).abs() < 2e-2 * (1.0 + dense.se[j].abs()),
+                "{tag} se[{j}]: sparse={} dense={}",
+                sp.se[j],
+                dense.se[j]
+            );
+        }
+        assert!(
+            (sp.loglik - REF_LOGLIK).abs() < 1e-2,
+            "{tag} loglik {} vs lme4 {REF_LOGLIK}",
+            sp.loglik
+        );
     }
 }
 
@@ -3537,7 +3570,7 @@ fn sparse_weighted_binomial_fit_matches_expanded() {
 /// design (7 crossed extras, `y ~ 1 + x + (1|g1) + (1|c1) + … + (1|c7)`) with
 /// real signal CONVERGES through the routed `fit_cold` path (an upgrade over
 /// the prior anti-panic floor, which merely returned non-converged NaN).
-/// External truth is the parity `sim_sparse_binomial` rung; this is the
+/// External truth is the validation `sim_sparse_binomial` rung; this is the
 /// in-crate convergence gate, tightened by a deviance self-consistency
 /// check: every RE here is scalar (q_p = 1, all extras scalar) and the
 /// family has σ² ≡ 1, so `θ_i = √tau2[i]` exactly reconstructs the
@@ -3651,7 +3684,7 @@ fn sparse_glmm_over_envelope_converges_binomial() {
 
 /// Over-envelope non-Gaussian smoke, Poisson half — same over-cap shape and
 /// deviance self-consistency check as the binomial twin above, on the
-/// parity `sim_sparse_poisson` rung's design instead.
+/// validation `sim_sparse_poisson` rung's design instead.
 #[test]
 fn sparse_glmm_over_envelope_converges_poisson() {
     use faer::Mat;
@@ -3782,7 +3815,7 @@ fn sparse_glmm_over_envelope_converges_poisson() {
 /// deviance self-consistency check here: with a q=5 covariance block AND a
 /// free Gamma dispersion, `f.tau2` alone can't reconstruct the converged Λ
 /// (off-diagonal vech entries and the dispersion aren't recoverable from
-/// `tau2`'s per-diagonal values), so external parity rungs (`sim_gamma_glmm`
+/// `tau2`'s per-diagonal values), so external validation rungs (`sim_gamma_glmm`
 /// shape) are what validate this case's numbers; this stays a convergence
 /// gate.
 #[test]
@@ -3871,11 +3904,11 @@ fn sparse_glmm_over_envelope_converges_gamma() {
     }
 }
 
-/// Task 6: weighted sparse Gaussian LMM. `parity/manifest.json` has no
+/// Task 6: weighted sparse Gaussian LMM. `validation/manifest.json` has no
 /// sparse-Gaussian rung (only sparse binomial/poisson/gamma/nb), so this
 /// fixture is generated directly in R rather than pulled from a committed
-/// parity dataset, and pinned against a frozen lme4 golden (not routed
-/// through the parity oracle harness). Design: primary `(1|g1)` (20
+/// validation dataset, and pinned against a frozen lme4 golden (not routed
+/// through the validation harness). Design: primary `(1|g1)` (20
 /// levels) crossed with an extra grouping that carries a random SLOPE
 /// `(1+x2|g2)` (15 levels) — `classify_design`'s `slope_extras` clause
 /// routes any slope-carrying extra grouping Sparse regardless of size,

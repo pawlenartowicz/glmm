@@ -3,11 +3,19 @@
 //! a dense tail Cholesky with [X y]) + BOBYQA θ-search over one diagonal θ
 //! component per grouping. A degenerate single-intercept `ClusterSpec`
 //! collapses to the per-cluster shrink-downdate arithmetic (up to FP
-//! reassociation), so the q=1 parity corpus re-proves on this machine.
+//! reassociation), so the q=1 validation corpus re-proves on this machine.
 //!
-//! Engine-resident: non-degenerate (extra-grouping) Mle specs dispatch here;
-//! every shipped (degenerate single-intercept) `ClusterSpec` keeps routing to
-//! the scalar Brent path in `lme.rs`.
+//! Engine-resident: ALL Gaussian mixed (LMM) specs dispatch here through the
+//! unified fit core — the single-random-intercept shape is an `LmmDense`/BOBYQA
+//! case like any other, from every tier (stable and loop). The scalar-Brent
+//! `lme_fit` in `lme.rs` is NOT reachable from `fit_on`. Its measured 3× win on
+//! that shape was an allocation artifact — it reused preallocated scratch while
+//! the old dispatch rebuilt a workspace per call, and handing BOBYQA the true θ
+//! changed BOBYQA's runtime by under 6%, so the θ search was never the cost.
+//! The reusable `FitWorkspace` captures that win for every shape. Brent is also
+//! strictly worse at high cluster counts (its `O(n_clusters·P)` per-evaluation
+//! downdate has no counterpart in `reml_deviance`'s balanced-collapse path), and
+//! the two agree on β̂ to ~1e-9, so there was no accuracy axis to trade either.
 //!
 //! Hot-loop invariants (mirror `lme.rs`):
 //!  * Bounded allocations on the warm path (twin test in `lmm::tests`): all
@@ -41,7 +49,7 @@ pub const THETA_HI: f64 = 1e3;
 /// validity requirement.
 pub const RHO_BEGIN: f64 = 0.5;
 /// Final trust radius = θ̂ target accuracy. 1e-6 measured equivalent to 1e-8
-/// on every parity check under the amended abs floors (stat 1e-4 /
+/// on every validation check under the amended abs floors (stat 1e-4 /
 /// β̂ 1e-5), at 15.1–15.7 vs 19.5–20.7 evals/fit — a ~25% eval cut for free.
 pub const RHO_END: f64 = 1e-6;
 /// GLMM-path final trust radius (θ AND β jointly, not θ-only like `RHO_END`).
@@ -74,7 +82,9 @@ pub const EPS_RANK: f64 = 1e-8;
 
 /// BOBYQA config for an n_theta-dimensional θ-search. `Config::new` supplies
 /// the PRIMA defaults (npt = 2n+1, max_fun = 500·n) — at n = 1 exactly
-/// npt = 3 / max_fun = 500.
+/// npt = 3 / max_fun = 500. Test-only (reached only via the test-gated
+/// [`LmmWorkspace::with_groupings`]); the live path inlines its own config.
+#[cfg(test)]
 pub fn bobyqa_config(n_theta: usize) -> Config {
     let mut config = Config {
         rho_begin: RHO_BEGIN,
@@ -85,17 +95,18 @@ pub fn bobyqa_config(n_theta: usize) -> Config {
     config
 }
 
-/// Dev-only optimizer-campaign hooks (npt hook: design doc P0.2, approved
-/// 2026-07-09; the max_fun variant shares the seam).
+/// Dev-only env hooks for sweeping BOBYQA's npt/max_fun without recompiling
+/// (npt and max_fun share this seam).
 /// `LMM_NPT_FORMULA=<mult>n<add>` overrides npt at EVERY BOBYQA config site:
 /// dense LMM (`for_cluster_spec_ext`), the blind seed (`bobyqa_config`), the
 /// sparse θ seed (`sparse_lmm_seed`), the sparse GLMM stage-1 + joint configs
 /// (`sparse.rs`), and the GLMM joint + stage-1 solvers (`glmm/workspace.rs`)
 /// — each evaluated against that solver's own dimension (joint: n_theta + p).
 /// `LMM_MAX_FUN_FORMULA` does the same for max_fun (unclamped). Formula-shaped
-/// values only: a flat constant violates `n+2 ≤ npt ≤ (n+1)(n+2)/2` at small n
-/// (mystery-doc trap), so flat inputs parse to None and the shipped value stays.
-/// Read once per process (OnceLock) — campaign passes set them per run.
+/// values only: a flat constant would violate `n+2 ≤ npt ≤ (n+1)(n+2)/2` at
+/// small n once n changes between call sites, so flat inputs parse to None
+/// and the shipped value stays instead of silently producing an illegal npt.
+/// Read once per process (OnceLock) — sweeps set them per run via env var.
 pub(crate) fn eval_formula(formula: &str, n: usize) -> Option<usize> {
     let (mult, add) = formula.split_once('n')?;
     let mult: f64 = mult.parse().ok()?;
@@ -137,15 +148,15 @@ fn two_stage_enabled() -> bool {
     *V.get_or_init(|| std::env::var("LMM_TWO_STAGE").is_ok_and(|v| v == "1"))
 }
 
-/// B3 experimental two-stage warm restart (campaign design doc). Stage 1:
+/// Experimental two-stage warm restart, gated behind `LMM_TWO_STAGE=1`. Stage 1:
 /// cheapest legal model (npt = n+2), loose rho_end 1e-3 — reach the basin.
 /// Stage 2: fresh solver (BOBYQA cannot grow npt mid-run — the inverse-KKT
 /// update assumes a constant set size), npt = 2n+1, shipped RHO_END, rho_begin
 /// shrunk to the local scale (0.1·min diagonal θ₁, clamped to
 /// [10·RHO_END, RHO_BEGIN]). Returns a merged Outcome: stage-2 status/point,
-/// summed n_eval. LMM_STAGE_PROBE=1 prints per-stage evals + the θ₁→θ̂ distance
-/// (B3's 3-stage-extension decision data). Dev seam only — allocates two
-/// solvers per fit, which the shipped path never does.
+/// summed n_eval. LMM_STAGE_PROBE=1 prints per-stage evals + the θ₁→θ̂ distance,
+/// for judging whether a third stage would pay for itself. Dev seam only —
+/// allocates two solvers per fit, which the shipped path never does.
 fn two_stage_minimize(
     suff: &LmmSuffStats,
     fit: &mut LmmFitScratch,
@@ -389,18 +400,16 @@ impl LmmGroupings {
         slope_cols: &[usize],
         extra_slope_cols: &[Vec<usize>],
     ) -> Self {
-        use crate::{GroupingRelation, Sizing};
+        use crate::GroupingRelation;
         // RE-path constructor: only built for mixed models, so `re` is present.
         let re = cluster
             .re
             .as_ref()
             .expect("LmmGroupings::from_cluster_spec_ext requires re: Some (mixed model)");
-        let n_primary = match &re.sizing {
-            Sizing::FixedClusters { n_clusters } => (*n_clusters).max(1) as usize,
-            // div_ceil keeps a partial trailing parent's ids in range
-            // (production N is an atom multiple; tests may not be).
-            Sizing::FixedSize { cluster_size } => max_n.div_ceil((*cluster_size).max(1) as usize),
-        };
+        // Sole cluster-count formula in the crate: it rounds up under `FixedSize`,
+        // which keeps a partial trailing parent's ids in range (production N is an
+        // atom multiple; tests may not be).
+        let n_primary = re.sizing.n_clusters_at(max_n);
         let q_p = 1 + slope_cols.len();
         // Width-general layout: the primary block is `q_p · n_primary` wide
         // ([intercept 0..S | slope_0 S..2S | … | slope_{q-2}]), and the
@@ -441,6 +450,7 @@ impl LmmGroupings {
         let mut extra_offsets = vec![0usize; n_extras];
         for (g, gs) in re.extra_groupings.iter().enumerate() {
             if let GroupingRelation::NestedWithin { n_per_parent } = gs.relation {
+                // `.max(1)` clamp mirrored by `fit::core`'s capacity pin — change together.
                 nested_per_parent = (n_per_parent).max(1) as usize;
                 nested = Some(NestedFactor {
                     vech_start: vech_starts[g],
@@ -453,10 +463,13 @@ impl LmmGroupings {
         // Nested children are q_nested RE columns each (q_nested == 1 ⇒ the
         // pre-slope single-indicator width).
         let q_nested = nested.map(|nf| nf.q).unwrap_or(0);
+        // Nested block width mirrored by `fit::core`'s capacity pin — change together.
         let mut off = prim_width + n_primary * nested_per_parent * q_nested;
         let mut crossed = Vec::new();
         for (g, gs) in re.extra_groupings.iter().enumerate() {
             if let GroupingRelation::Crossed { n_clusters } = gs.relation {
+                // Crossed level count + `.max(1)` mirrored by `fit::core`'s capacity
+                // pin — change together.
                 let k = (n_clusters).max(1) as usize;
                 let q_g = extra_qs[g];
                 crossed.push(CrossedFactor {
@@ -675,8 +688,8 @@ impl LmmSuffStats {
     /// 0..I, nested parent·n_per+within), declaration order; this routine maps
     /// them onto the elimination-order column offsets. `weights[i]` (prior/case
     /// weight, unstable `loop_advanced` surface) is `wᵢ`; `None` is unit weight.
-    /// Per-row rule (see the module-level weighted-REML note): every row is
-    /// conceptually √wᵢ-scaled before hitting the unit-weight accumulator math,
+    /// Per-row rule for folding prior weights into the unit-weight suff-stats
+    /// accumulator: every row is conceptually √wᵢ-scaled before hitting the math,
     /// so `wi.sqrt()` (`zw`) multiplies `w_buf` once (propagating one `zw` into
     /// every `[X y]` and slope-`z` read) and every bare intercept-`z=1.0` site
     /// takes one more explicit `zw` (or `wi` where both intercept sides already
@@ -1058,14 +1071,20 @@ pub struct LmmWorkspace {
 
 impl LmmWorkspace {
     /// Allocates a workspace for a single-intercept grouping at `max_clusters`.
+    /// Test-only since the retirement of the raw `LmmWorkspace` loop surface —
+    /// the live core path builds through [`Self::for_cluster_spec_ext`].
+    #[cfg(test)]
     pub fn new(p: usize, max_clusters: usize) -> Self {
         Self::with_groupings(p, LmmGroupings::single(max_clusters))
     }
 
     /// Workspace for a validated non-degenerate ClusterSpec at max_n. Carries
-    /// the spec-derived truth start and a scaled BOBYQA schedule (P1).
+    /// the spec-derived truth start and a scaled BOBYQA schedule.
     /// `slope_cols` are the x_full column indices for the primary slopes
     /// (`spec.cluster_slope_design_cols` as usize); pass `&[]` for callers without slopes.
+    /// Test-only convenience over [`Self::for_cluster_spec_ext`] (the live path)
+    /// since the raw `LmmWorkspace` loop surface was retired.
+    #[cfg(test)]
     pub fn for_cluster_spec(
         p: usize,
         cluster: &crate::ModelSpec,
@@ -1092,7 +1111,7 @@ impl LmmWorkspace {
         // MIRRORED by `sparse_lmm_seed` (the sparse-Z path's topology-only solver
         // seed) — change the schedule (rho_begin / npt / bounds) together (both
         // feed through the shared `apply_campaign_overrides` tail).
-        // Scaled schedule (P1): rho_begin = 0.1·min θ₀ — the eval count is
+        // Scaled schedule: rho_begin = 0.1·min θ₀ — the eval count is
         // dominated by rho shrinkage, not travel distance. The start is now the cold
         // blind θ₀ (ModelSpec is structure-only), so every diagonal entry is
         // THETA0 and the fold collapses to it. Fold over DIAGONAL entries only — a
@@ -1137,7 +1156,9 @@ impl LmmWorkspace {
     }
 
     /// Allocates the suff-stats accumulator, fit scratch, and BOBYQA solver
-    /// state for the given grouping shape, once per problem shape.
+    /// state for the given grouping shape, once per problem shape. Test-only
+    /// (reached only via [`Self::new`]) since the raw loop surface was retired.
+    #[cfg(test)]
     pub fn with_groupings(p: usize, groupings: LmmGroupings) -> Self {
         let n_theta = groupings.n_theta();
         let fit = LmmFitScratch::with_groupings(p, &groupings);
@@ -1974,7 +1995,7 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
         // triangular GEMM through faer's blocked multi-accumulator FMA kernels
         // (Par::Seq — per-fit parallelism is the outer rayon loop). RESULT-MOVING:
         // GEMM accumulation order replaces the per-family sequential subtraction;
-        // sanctioned, verified against the brute-force oracle + parity bands which
+        // sanctioned, verified against the brute-force oracle + validation bands which
         // are orders wider than the reorder's last-ulp footprint.
         let w_tot = g.n_primary * w;
         {
@@ -2107,7 +2128,7 @@ pub fn fit_lmm(
     fit_lmm_impl(ws, target_indices, theta_start, two_stage_enabled())
 }
 
-/// Test-visible wrapper: runs [`fit_lmm`]'s body with the B3 two-stage warm
+/// Test-visible wrapper: runs [`fit_lmm`]'s body with the two-stage warm
 /// restart forced on, bypassing the `LMM_TWO_STAGE` env read — the unit test
 /// asserting stage parity never touches the process environment (env
 /// mutation races the parallel test runner).
@@ -2162,10 +2183,10 @@ fn fit_lmm_impl(
             // all-THETA0 start put off-diagonal vech entries at 1.0 — off the
             // lme4/MixedModels unit-diagonal convention — and on the wide-slope
             // grid stratum that start funnels BOBYQA into a second-best optimum
-            // (8/9 cells; adjudicated 2026-07-11, root-cause report in the
-            // umbrella docs; goldens at parity/goldens/optima/). Mirrors the
-            // sparse GLMM joint seed, which fixed the same trap earlier
-            // (`fit_glmm_sparse`'s θ cold start, sparse.rs).
+            // in 8/9 cells (regression goldens at validation/goldens/optima/ pin
+            // the correct optimum). Mirrors the sparse GLMM joint seed, which
+            // fixed the same trap earlier (`fit_glmm_sparse`'s θ cold start,
+            // sparse.rs).
             for t in theta.iter_mut() {
                 *t = 0.0;
             }
@@ -2331,9 +2352,9 @@ mod tests {
     use crate::{Family, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing};
 
     /// Grammar: `<mult>n<add>`, e.g. `2n1` = 2·n+1, `1.5n1` = ⌈1.5·n⌉+1, `1n2` =
-    /// n+2. Result clamped to BOBYQA's legal `[n+2, (n+1)(n+2)/2]` — the mystery
-    /// doc's documented trap: flat constants (and small-n underflow) violate the
-    /// bounds, so the hook clamps rather than panic deep in `Bobyqa::new`.
+    /// n+2. Result clamped to BOBYQA's legal `[n+2, (n+1)(n+2)/2]`: flat constants
+    /// (and small-n underflow) violate the bounds, so the hook clamps rather than
+    /// panic deep in `Bobyqa::new`.
     #[test]
     fn npt_formula_parses_and_clamps() {
         assert_eq!(npt_from_formula("2n1", 36), Some(73));
@@ -2461,8 +2482,8 @@ mod tests {
         assert_eq!(sig_a, sig_b, "σ̂²(θ=1) must be reproducible");
     }
 
-    /// Task 0.2 correctness prerequisite for workspace reuse: `suff.reset()`
-    /// followed by a refill on a DIFFERENT dataset (same shape, different `y`)
+    /// Correctness prerequisite for workspace reuse across simulation draws:
+    /// `suff.reset()` followed by a refill on a DIFFERENT dataset (same shape, different `y`)
     /// must reproduce a freshly-constructed workspace's fit bit-for-bit. Same
     /// buffers + same code path ⇒ identical float reassociation, so the
     /// assertion is exact `==`, not a tolerance band. If this fails, `reset()`
@@ -2641,7 +2662,8 @@ mod tests {
     /// residuals alternate ±0.8 within each cluster with equal counts, so every
     /// cluster's residual sum is exactly 0 and the REML deviance is minimized at
     /// θ = 0. The fit must pin (boundary_hit == 1), write θ̂ = exactly 0.0, and
-    /// count as converged — the Q7 deterministic-pin policy.
+    /// count as converged: zero variance is a legitimate boundary optimum, not
+    /// a failure to fit.
     #[test]
     fn zero_between_cluster_variance_pins_at_exactly_zero() {
         let n = 48usize;
@@ -2697,7 +2719,7 @@ mod tests {
         assert!(ws.fit.t_sq[1].is_nan() && ws.fit.t_sq[2].is_nan());
     }
 
-    /// θ-start seam (P1): a truth-started fit reaches the same answer as the
+    /// A truth-started fit (`theta_start: Some`) reaches the same answer as the
     /// blind fit on the same bytes — and Some(0.0) exercises the
     /// THETA_TRUTH_FLOOR clamp rather than starting on the 0 boundary.
     /// Bands are the amended floors: two BOBYQA runs from different
@@ -2739,10 +2761,11 @@ mod tests {
     /// ~2 per deviance evaluation (15.1–15.7 evals/fit at rho_end 1e-6, the
     /// measured mean), the same acceptance the shipped path's 26
     /// blocks/call carry; if a future faer version changes its Cholesky
-    /// internals, update the bound — do not relax it. The owned-kernel
-    /// alternative (P3) was spiked and rejected — wasm `f64::ln` ULP forks,
-    /// not the factorization, broke bit-equality — so the faer bound is the
-    /// locked steady state.
+    /// internals, update the bound — do not relax it. A hand-rolled
+    /// owned-kernel replacement for faer's `llt` was tried and rejected: its
+    /// wasm `f64::ln` took a different ULP path than the native build (the
+    /// factorization itself was fine), which broke cross-platform
+    /// bit-equality. The faer bound stays the locked steady state.
     #[cfg(feature = "alloc-tests")]
     #[test]
     #[ignore]
@@ -3064,6 +3087,25 @@ mod tests {
             let b = reml_deviance(&th, &suff, &mut fit_b);
             assert_eq!(a.to_bits(), b.to_bits(), "θ={th:?}");
         }
+    }
+
+    /// Off-grid N under `FixedSize`: row 17 of 18 sits in cluster 4, so five
+    /// primary levels exist and the nested block must cover all five parents.
+    #[test]
+    fn fixed_size_off_grid_n_keeps_the_partial_trailing_cluster() {
+        let mut cluster = intercept_only_spec(Sizing::FixedSize { cluster_size: 4 });
+        cluster.re.as_mut().unwrap().extra_groupings.push(Grouping {
+            relation: GroupingRelation::NestedWithin { n_per_parent: 2 },
+            slopes: vec![],
+        });
+        let n = 18;
+        let sizing = &cluster.re.as_ref().unwrap().sizing;
+        assert_eq!(sizing.cluster_of_row(n - 1), 4);
+        assert_eq!(sizing.n_clusters_at(n), 5);
+        let g = LmmGroupings::from_cluster_spec(&cluster, n, &[]);
+        assert_eq!(g.n_primary, 5);
+        assert_eq!(g.n_primary * g.nested_per_parent, 10);
+        assert_eq!(g.k_total, 15);
     }
 
     /// Nested-only in Regime B — the path with NO crossed tail (zx is 0×0)
@@ -3669,7 +3711,7 @@ mod tests {
             vec![2.0, -0.5, 0.7],
             vec![1e-3, 1e-3, 1e-3],
             // θ at THETA_HI (BOBYQA's box upper bound): the per-family Crout
-            // pivot product (T4) must stay finite here — a product accumulated
+            // pivot product must stay finite here — a product accumulated
             // across all families instead of reset per family would overflow.
             vec![THETA_HI, 0.0, THETA_HI],
         ] {
@@ -3777,9 +3819,9 @@ mod tests {
         assert_eq!(fit.pinned_components & !0b111, 0); // only 3 components exist
     }
 
-    /// B3 (grid-campaign design doc): two-stage warm restart must reach the same
+    /// The experimental two-stage warm restart must reach the same
     /// optimum as single-stage on a well-behaved rung — stage 1 (npt = n+2,
-    /// rho_end 1e-3, measured correctness-safe on the parity corpus) finds the
+    /// rho_end 1e-3, measured correctness-safe on the validation corpus) finds the
     /// basin, stage 2 (npt = 2n+1, shipped rho_end) refines from stage 1's point.
     /// Uses the multislope fixture (n_theta = 6) so the shipped mid-npt formula
     /// (`n_theta >= 3`) is the one exercised by the single-stage comparator.
@@ -4210,7 +4252,7 @@ mod tests {
         }
     }
 
-    /// CROSSED SLOPES (the headline lme4-parity case): `y ~ x1 + (1+x1 | primary)
+    /// CROSSED SLOPES (the headline lme4-agreement case): `y ~ x1 + (1+x1 | primary)
     /// + (1+x1 | item)` — both grouping factors carry a random slope on x1, so the
     /// gated blocked path runs. Deviance must match the explicit-V oracle to 1e-7
     /// across θ, including the primary-slope↔crossed-slope coupling (the x1²

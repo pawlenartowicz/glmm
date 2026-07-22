@@ -10,6 +10,48 @@ use crate::{
 };
 use faer::linalg::solvers::Solve;
 
+/// The dense GLMM kernel entry rejects a hand-built workspace whose extra
+/// grouping carries a random slope (`extra_slopes_any`). In normal use
+/// `classify_design` routes any extra-slope shape to Sparse, so the guard is the
+/// backstop for a caller that constructs the dense `GlmmWorkspace` directly — in
+/// release this path used to silently drop the slope. The panic now comes from
+/// `from_groupings` (release too), not from the per-eval `debug_assert`s, so it
+/// fires at `for_cluster_spec` above rather than inside `fit_glmm`.
+#[test]
+#[should_panic(expected = "route it to the sparse solver")]
+fn dense_glmm_entry_rejects_extra_slopes() {
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 2 },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 2 },
+                slopes: vec![1],
+            }],
+        }),
+    };
+    let n = 8;
+    let p = 2;
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+    let x = faer::Mat::<f64>::zeros(n, p);
+    let y = vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+    let cluster_ids = vec![0u32, 0, 1, 1, 0, 0, 1, 1];
+    let _ = fit_glmm(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &cluster_ids,
+        &[],
+        None,
+        &[0.0; 2],
+        n,
+        WaldSe::Hessian,
+    );
+}
+
 /// Intercept-only spec carrying the **binomial-logit** family — the family the
 /// GLMM kernel has always used here. (Pre-M3 the kernel ignored `spec.family`;
 /// M3 made `ws.family` load-bearing, so these legacy binomial tests must set it
@@ -2865,7 +2907,7 @@ fn structured_panel_downdate_matches_scalar() {
     }
 }
 
-/// Parses `parity/data_empirical/grouseticks.csv` into the 3-crossed `TICKS ~ YEAR +
+/// Parses `validation/data/empirical/grouseticks.csv` into the 3-crossed `TICKS ~ YEAR +
 /// cHEIGHT + (1|INDEX) + (1|BROOD) + (1|LOCATION)` design (observation-level
 /// INDEX primary + crossed BROOD, LOCATION). Returns the **sized** `ModelSpec`
 /// (crossed widths resolved from the actual level counts via
@@ -2905,7 +2947,7 @@ pub(crate) fn grouseticks_3crossed_fixture(
             .collect()
     }
 
-    let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
     // cols: INDEX,TICKS,BROOD,HEIGHT,YEAR,LOCATION,cHEIGHT
     let p = 4;
     let mut rows = Vec::<[f64; 4]>::new();

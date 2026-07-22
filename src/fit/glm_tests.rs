@@ -1,10 +1,62 @@
 //! GLM estimator tests (fixed-effects binomial/Poisson/Gamma/negative-binomial,
 //! `re: None`).
 
+use super::glm::{fit_glm, fit_glm_prebuilt, glm_view_to_fit, GlmScratchBuf};
 use super::*;
+use crate::test_support::assert_near;
 use crate::{BinomialLink, Family, GroupIds, ModelSpec};
 
 use super::common_tests::{lcg, sim_clustered};
+
+/// A small non-separable binomial(logit) dataset (n=30, p=2) for the view-mapper
+/// equivalence gate. Deterministic, no RNG.
+fn glm_logit_hand_dataset() -> (Vec<f64>, Vec<f64>, usize, usize) {
+    let n = 30;
+    let p = 2;
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    for i in 0..n {
+        let xi = (i as f64) / 10.0 - 1.5;
+        x.extend_from_slice(&[1.0, xi]);
+        y.push(if (i * 3 + 1) % 5 < 3 { 1.0 } else { 0.0 });
+    }
+    (x, y, n, p)
+}
+
+/// `fit_glm_prebuilt` + `glm_view_to_fit` must reproduce the `Fit` that the
+/// throwaway `fit_glm` path produces — pins the view/assembly split as
+/// behavior-preserving for a non-Gaussian family.
+#[test]
+fn fit_glm_prebuilt_view_maps_to_same_fit() {
+    let (x, y, n, p) = glm_logit_hand_dataset();
+    let opts = FitOptions {
+        target_indices: vec![1],
+        ..FitOptions::default()
+    };
+    let family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+
+    let direct = fit_glm(family, f64::NAN, &x, &y, n, p, &opts);
+
+    let mut buf = GlmScratchBuf::new(n, p, opts.target_indices.len());
+    let x_mat = super::common::to_col_major(&x, n, p);
+    let via_view = {
+        let v = fit_glm_prebuilt(
+            family,
+            f64::NAN,
+            x_mat.as_ref().subrows(0, n),
+            &y,
+            &opts,
+            &mut buf,
+        );
+        glm_view_to_fit(&v, &y, family, f64::NAN, n, p, &opts)
+    };
+    assert!(direct.converged && via_view.converged);
+    assert_near(&direct.beta, &via_view.beta, "beta");
+    assert_near(&direct.se, &via_view.se, "se");
+    assert_near(&[direct.loglik], &[via_view.loglik], "loglik");
+}
 
 /// Weighted Gamma(log) GLM vs R glm(weights=). Convention: prior weight
 /// multiplies the IRLS working weight and deviance; Pearson dispersion
@@ -228,10 +280,10 @@ fn fit_glm_smoke() {
 }
 
 /// Poisson GLM through stable `fit` (re: None), gated against the frozen R
-/// `glm(family=poisson)` oracle (`parity/goldens/grouseticks_glm.json`):
+/// `glm(family=poisson)` oracle (`validation/goldens/grouseticks_glm.json`):
 /// `TICKS ~ 1 + YEAR + cHEIGHT` on grouseticks, canonical log link. Dispersion
 /// is fixed `φ≡1`, so SE = √((XᵀWX)⁻¹). Routes the Poisson canonical-shortcut
-/// branch of `family.rs`. The oracle is sacred (parity §1).
+/// branch of `family.rs`. The oracle is sacred (RULE 0).
 #[test]
 fn fit_glm_poisson_matches_r() {
     const REF_BETA: [f64; 4] = [
@@ -247,7 +299,7 @@ fn fit_glm_poisson_matches_r() {
         0.000710396896273056,
     ];
     // grouseticks.csv cols: INDEX,TICKS,BROOD,HEIGHT,YEAR,LOCATION,cHEIGHT.
-    let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
     let p = 4; // [intercept, YEAR96, YEAR97, cHEIGHT]; YEAR base level 95.
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -303,7 +355,7 @@ fn fit_glm_poisson_matches_r() {
         );
     }
     // R logLik on the same fit: glm(TICKS ~ factor(YEAR) + cHEIGHT, poisson)
-    // on parity/data_empirical/grouseticks.csv → logLik −2187.40552083455,
+    // on validation/data/empirical/grouseticks.csv → logLik −2187.40552083455,
     // df 4 (φ≡1: no dispersion parameter).
     const REF_LOGLIK: f64 = -2187.40552083455;
     assert!(
@@ -328,7 +380,7 @@ fn fit_glm_poisson_offset_matches_r() {
         -0.0213150417946447,
     ];
     const REF_LOGLIK: f64 = -2233.81176722254;
-    let csv = include_str!("../../parity/data_empirical/grouseticks.csv");
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
     let p = 4;
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -386,18 +438,18 @@ fn fit_glm_poisson_offset_matches_r() {
 
 /// High-mean Poisson GLM through stable `fit` (re: None), gated against the
 /// frozen R `glm(family=poisson)` oracle
-/// (`parity/goldens/sim_poisson_highmean_glm.json`): `y ~ 1 + x + grp` on
+/// (`validation/goldens/sim_poisson_highmean_glm.json`): `y ~ 1 + x + grp` on
 /// sim_poisson_highmean (ȳ ≈ 85). Regression gate for the IRLS log-link cold
 /// start: from the old μ = 1 seed (η = 0) any count data with ȳ ≳ ~25–30 made
 /// the first WLS step overshoot and IRLS run away (β → ~9e304,
 /// `converged = false`); the μ₀ = y + 0.1 seed (R's family `initialize`)
-/// converges here. The oracle is sacred (parity §1).
+/// converges here. The oracle is sacred (RULE 0).
 #[test]
 fn fit_glm_poisson_highmean_matches_r() {
     const REF_BETA: [f64; 3] = [4.27614930354405, 0.299823553158498, 0.220101964251659];
     const REF_SE: [f64; 3] = [0.00955233157557028, 0.00587180175968696, 0.0125653819843501];
     // sim_poisson_highmean.csv cols: x,grp,y — grp ∈ {a,b}, base level a.
-    let csv = include_str!("../../parity/data_simulated/sim_poisson_highmean.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_poisson_highmean.csv");
     let p = 3; // [intercept, x, grpb]
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -449,10 +501,10 @@ fn fit_glm_poisson_highmean_matches_r() {
 }
 
 /// Probit binomial GLM through stable `fit` (re: None), gated against frozen
-/// R `glm(binomial("probit"))` (`parity/goldens/cbpp_probit_glm.json`): cbpp
+/// R `glm(binomial("probit"))` (`validation/goldens/cbpp_probit_glm.json`): cbpp
 /// `cbind(incidence, size−incidence) ~ period`, expanded to 0/1 rows (same
 /// MLE + Fisher information as the aggregated fit). Probit is non-canonical →
-/// the general Fisher-scoring branch; `φ≡1`. The oracle is sacred (parity §1).
+/// the general Fisher-scoring branch; `φ≡1`. The oracle is sacred (RULE 0).
 #[test]
 fn fit_glm_probit_matches_r() {
     const REF_BETA: [f64; 4] = [
@@ -467,7 +519,7 @@ fn fit_glm_probit_matches_r() {
         0.158774972086234,
         0.194512024389745,
     ];
-    let csv = include_str!("../../parity/data_empirical/cbpp.csv");
+    let csv = include_str!("../../validation/data/empirical/cbpp.csv");
     let p = 4; // [intercept, period2, period3, period4]
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -530,7 +582,7 @@ fn fit_glm_probit_matches_r() {
 /// (cluster,x,grp,y); X = [intercept, x, grp=="b"]. Shared by the Gamma
 /// goldens.
 fn sim_gamma_xy() -> (Vec<f64>, Vec<f64>, usize) {
-    let csv = include_str!("../../parity/data_simulated/sim_gamma.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_gamma.csv");
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
     for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
@@ -546,9 +598,9 @@ fn sim_gamma_xy() -> (Vec<f64>, Vec<f64>, usize) {
 }
 
 /// Gamma log-link GLM, gated against frozen R `glm(family=Gamma("log"))`
-/// (`parity/goldens/sim_gamma_glm.json`). φ is the post-fit Pearson moment
+/// (`validation/goldens/sim_gamma_glm.json`). φ is the post-fit Pearson moment
 /// estimator (`dispersion: None`); SE is √φ-scaled, matching R's
-/// `summary()$dispersion`. The oracle is sacred (parity §1).
+/// `summary()$dispersion`. The oracle is sacred (RULE 0).
 #[test]
 fn fit_glm_gamma_log_matches_r() {
     const REF_BETA: [f64; 3] = [0.449945830683142, 0.565796931228723, 0.526238083012209];
@@ -590,7 +642,7 @@ fn fit_glm_gamma_log_matches_r() {
 }
 
 /// Gamma inverse-link GLM, gated against frozen R `glm(family=Gamma("inverse"))`
-/// (`parity/goldens/sim_gamma_inv_glm.json`). Inverse is non-canonical (η=1/μ is
+/// (`validation/goldens/sim_gamma_inv_glm.json`). Inverse is non-canonical (η=1/μ is
 /// −θ): the general branch + the 1/y cold-start seed. The oracle is sacred.
 #[test]
 fn fit_glm_gamma_inverse_matches_r() {
@@ -670,16 +722,16 @@ fn fit_glm_gamma_fixed_dispersion_scales_se() {
 }
 
 /// Negative-binomial GLM via the alternating outer-θ loop, gated against
-/// frozen R `MASS::glm.nb` (`parity/goldens/sim_nb_glm.json`):
+/// frozen R `MASS::glm.nb` (`validation/goldens/sim_nb_glm.json`):
 /// `y ~ 1 + x + grp` on sim_nb. `dispersion = θ̂` (the estimated shape); β SE
-/// conditions on θ̂. The oracle is sacred (parity §1).
+/// conditions on θ̂. The oracle is sacred (RULE 0).
 #[test]
 fn fit_glm_nb_matches_mass() {
     const REF_BETA: [f64; 3] = [0.144166077871857, 0.619826870647895, 0.633686899496841];
     const REF_SE: [f64; 3] = [0.120690561977139, 0.0756442004078213, 0.155714256322938];
     const REF_THETA: f64 = 1.01052181546876;
     // sim_nb.csv: cluster,x,grp,y (y integer counts).
-    let csv = include_str!("../../parity/data_simulated/sim_nb.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_nb.csv");
     let p = 3;
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -822,7 +874,7 @@ fn fit_glm_nb_weighted_matches_mass() {
 /// twin of Python's `test_offset_shifts_poisson_intercept_by_minus_constant`.
 #[test]
 fn fit_glm_nb_constant_offset_shifts_intercept() {
-    let csv = include_str!("../../parity/data_simulated/sim_nb.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_nb.csv");
     let p = 3;
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -948,7 +1000,7 @@ fn nb_edge_fit(csv: &str, ref_beta: &[f64; 3], ref_se: &[f64; 3]) -> Fit {
 
 /// θ-bracket LOW edge: heavily overdispersed NB GLM (θ̂ ≈ 4.1e-3, half an
 /// order above `NB_THETA_LO` = 1e-3), gated against frozen `MASS::glm.nb`
-/// (`parity/goldens/sim_nb_lowtheta_glm.json`; glm.nb converged with zero
+/// (`validation/goldens/sim_nb_lowtheta_glm.json`; glm.nb converged with zero
 /// warnings on the committed CSV — the reference is trustworthy this close
 /// to the edge, not past it). Pins that the golden-section θ search stays
 /// interior and matches MASS near its lower bracket end. The oracle is
@@ -959,7 +1011,7 @@ fn fit_glm_nb_theta_low_edge_matches_mass() {
     const REF_SE: [f64; 3] = [1.12744374740952, 0.781254798362756, 1.57118324159906];
     const REF_THETA: f64 = 0.00409762150621296;
     let f = nb_edge_fit(
-        include_str!("../../parity/data_simulated/sim_nb_lowtheta.csv"),
+        include_str!("../../validation/data/simulated/sim_nb_lowtheta.csv"),
         &REF_BETA,
         &REF_SE,
     );
@@ -979,7 +1031,7 @@ fn fit_glm_nb_theta_low_edge_matches_mass() {
 
 /// θ-bracket HIGH edge: near-Poisson NB GLM (θ̂ ≈ 5.3e2, pushed toward
 /// `NB_THETA_HI` = 1e4), gated against frozen `MASS::glm.nb`
-/// (`parity/goldens/sim_nb_hightheta_glm.json`; zero glm.nb warnings on the
+/// (`validation/goldens/sim_nb_hightheta_glm.json`; zero glm.nb warnings on the
 /// committed CSV — cells with θ̂ nearer the edge all put `theta.ml` at its
 /// iteration/alternation limits, and count size is separately capped by the
 /// IRLS cold-start divergence; both constraints are documented at the
@@ -997,7 +1049,7 @@ fn fit_glm_nb_theta_high_edge_matches_mass() {
     ];
     const REF_THETA: f64 = 534.632483746729;
     let f = nb_edge_fit(
-        include_str!("../../parity/data_simulated/sim_nb_hightheta.csv"),
+        include_str!("../../validation/data/simulated/sim_nb_hightheta.csv"),
         &REF_BETA,
         &REF_SE,
     );
@@ -1025,7 +1077,8 @@ fn fit_glm_nb_theta_high_edge_matches_mass() {
 #[test]
 fn fit_glm_nb_outer_cap_semantics() {
     // Fixed-only fit; sim_clustered's cluster ids are unused here.
-    let (x, y, _ids, _nc) = sim_clustered(include_str!("../../parity/data_simulated/sim_nb.csv"));
+    let (x, y, _ids, _nc) =
+        sim_clustered(include_str!("../../validation/data/simulated/sim_nb.csv"));
     let (n, p) = (y.len(), 3);
     let opts = FitOptions {
         target_indices: vec![0, 1, 2],

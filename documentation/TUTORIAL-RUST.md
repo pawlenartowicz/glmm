@@ -113,11 +113,13 @@ Notes at this layer:
 ## 3. Advanced — the `loop_advanced` hot-loop surface
 
 For the tightest inner loop (thousands of near-identical fits — e.g. a Monte
-Carlo power simulation), even `fit_warm`'s per-call allocation and
-row-major→column-major conversion is overhead you may want to own yourself.
-The `loop_advanced` cargo feature exposes the scratch-explicit kernels
-directly: you allocate the workspace/scratch buffers **once**, then call the
-kernel in a loop, reusing the buffers every iteration.
+Carlo power simulation), even `fit_warm`'s per-call allocation is overhead you
+may want to own yourself. The `loop_advanced` cargo feature lets you split the
+fit in two: `build_workspace` classifies the design and allocates the solver's
+per-shape buffers **once**, then `fit_on` solves each draw on that workspace.
+(Not everything is hoisted: the offset vectors are copied per call, and the
+sparse and negative-binomial routes still allocate their own buffers per draw —
+they get the shared routing, not the reuse win.)
 
 ```toml
 [dependencies]
@@ -125,25 +127,49 @@ glmm = { version = "...", features = ["loop_advanced"] }
 ```
 
 ```rust
-use glmm::loop_advanced::{fit_lmm, LmmWorkspace};
+use glmm::loop_advanced::{build_workspace, fit_on};
 
-let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &model, n, &slope_cols, &extra_slope_cols);
+// The spec you pass to `build_workspace` must carry the REAL random-effect
+// level counts, not the placeholders `fit_cold` accepts — the stable entry
+// derives them from the ids for you, the loop tier does not.
+let mut ws = build_workspace(&sized_model, n_max, p, &opts);
 
 for resample in resamples {
-    ws.suff.reset();
-    ws.suff.add_rows_multi(resample.x.as_ref(), &resample.y, &resample.cluster_ids, &resample.extra_ids, None);
-    let result = fit_lmm(&mut ws, &target_indices, theta_start.as_deref());
-    // ws.fit.betas / ws.theta hold this iteration's estimate; no fresh
-    // allocation happened — ws is reused next iteration.
+    let view = fit_on(&mut ws, &resample.x, &resample.y, &resample.ids, start.as_ref(), &opts);
+    // Hot-loop reads, straight off the workspace slots — no `Fit` allocated:
+    let significant = view.t_sq()[0] > crit && view.converged();
+    // Or pay for the full result when you actually need it:
+    // let fit = view.into_fit(&resample.x, &resample.y, n, p, &model, &opts);
 }
 ```
+
+`fit_on` panics rather than misroutes: the design shape (rows, predictors, RE
+level counts) and the options frozen at build (`nagq`, whether weights and
+offsets are present, `parallel_inner`) must match the workspace every call. Row
+counts may vary below the `n_max` you built at.
+
+What it does **not** do is validate your data. `fit_warm` checks start-value
+lengths, weight and offset lengths and finiteness, and it drops rank-deficient
+fixed-effect columns and refits. `fit_on` does none of that — it trusts the
+caller. A short `StartValues.theta` leaves the trailing entries at the *previous*
+fit's θ̂, so the same call can answer differently depending on how old the
+workspace is. A weights vector longer than `n` is accepted and skews the LMM
+deviance and log-likelihood; non-finite weights or offsets turn the fit into
+NaN, and the GLMM route panics on a length mismatch instead. Check these once
+outside your loop.
 
 This is the **unstable** surface — no semver guarantees, and it changes in any
 release. It exists to serve one class of caller (warm-start simulation loops
 like MCPower's); reach for it only once you've measured that `fit_warm`'s
-per-call cost actually matters for your loop. `loop_advanced` also re-exports
-the OLS/GLM/GLMM/LME kernels and scratch types the same way — `fit_cold`/
-`fit_warm` are a thin, allocating wrapper around exactly these.
+per-call cost actually matters for your loop. `fit_cold`/`fit_warm` route
+through this same `build_workspace`/`fit_on` core — they allocate a throwaway
+workspace per call and always assemble the full `Fit`. That shared core is the
+point: the solver cannot drift between the stable entry and the loop tier. The
+answers still can, on one input — an aliased fixed-effect design. `fit_warm`
+drops the aliased columns and returns a reduced fit; `fit_on` runs the full
+design and returns NaN with `converged: false`.
+`loop_advanced` also re-exports the individual OLS/GLM/GLMM/LME kernels and
+their scratch types, a level below this.
 
 ## 4. Parsing a formula instead of building inputs by hand
 

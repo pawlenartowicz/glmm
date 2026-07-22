@@ -11,8 +11,65 @@ use crate::{
     ReStructure, Sizing, StartValues,
 };
 
+/// Band for pins on the closed-form paths — OLS and GLM/IRLS.
+///
+/// These are Rust-vs-Rust pins, NOT cross-engine agreement bands: they say the
+/// number has not moved, and nothing about lme4. Cross-engine bands live in
+/// `validation/tol.R` and are asserted by the `oracle-tests` tier.
+pub(crate) const PIN_REL_OLS: f64 = 1e-9;
+
+/// Band for pins on the iterative paths — LMM/GLMM, where BOBYQA stops inside
+/// its own convergence tolerance rather than on a fixed point, so a shifted
+/// last bit in the objective moves the reported optimum further than it does on
+/// the closed-form paths.
+///
+/// Measured, not chosen: every pin in the crate reproduces BIT-EXACTLY across
+/// debug and release and all four feature configs (default, `loop_advanced`,
+/// `parallel`, `--no-default-features`) on one machine — worst relative spread
+/// 0.0, not merely small. The band is therefore margin against a different CPU,
+/// where `src/simd_transcendental.rs` dispatches on feature detection and can
+/// shift that last bit. That second machine is the CI runner and has NOT been
+/// measured yet; until it is, both bands are provisional. Bit-exact pins would
+/// be the tighter claim and are wrong for exactly that reason: they would go
+/// red on a runner drawing a different microarchitecture, for no bug.
+///
+/// The second measurement is the `pin-bands` workflow, triggered by hand. It
+/// rewrites both constants to 0.0 so every pin reports its own deviation, and
+/// records the CPU each leg drew. When it has run, replace the paragraph above
+/// with what it measured and drop the word provisional.
+pub(crate) const PIN_REL_ITER: f64 = 1e-7;
+
+/// Assert a fitted vector against its pinned values, elementwise relative.
+/// `what` names the quantity so a failure says which one moved. Length is
+/// asserted too: a pin that silently covers fewer elements than the fit
+/// produces is the same nothing-asserted failure the pins exist to prevent.
+///
+/// The failure names the WORST element, not the first one over the band. That
+/// matters for the band-measurement run, which sets `band` to 0.0 so every pin
+/// reports its deviation: stopping at the first element would report whichever
+/// came first in index order rather than the spread the band has to cover.
+pub(crate) fn assert_pinned(got: &[f64], want: &[f64], band: f64, what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let mut worst = (f64::NEG_INFINITY, 0usize);
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let rel = (g - w).abs() / w.abs();
+        if rel > worst.0 {
+            worst = (rel, i);
+        }
+    }
+    let (rel, i) = worst;
+    assert!(
+        rel < band,
+        "{what}[{i}] = {} vs pinned {} (rel {rel:.2e}, worst of {})",
+        got[i],
+        want[i],
+        got.len()
+    );
+}
+
 /// Parse a `cluster,x,grp,y` sim CSV → (X=[1,x,grp_b], y, dense cluster ids, n_clusters).
-pub(super) fn sim_clustered(csv: &str) -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
+/// `pub(crate)` so `src/sparse/tests.rs` can load the same fixtures.
+pub(crate) fn sim_clustered(csv: &str) -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
     let mut raw = Vec::<u32>::new();
@@ -122,26 +179,22 @@ fn fit_rank_deficient_drops_and_matches_reduced() {
     );
 }
 
-#[derive(serde::Deserialize)]
-struct ColEst {
-    beta: Vec<Option<f64>>,
-}
-
-#[derive(serde::Deserialize)]
-struct ColGolden {
-    estimates: ColEst,
-}
-
-/// Gap #4 oracle: near-collinear `y ~ 1 + x1 + x2 + x3` (x3 ≈ x1+x2) vs R's
-/// column-drop-and-fit (`parity/goldens/sim_collinear_glm.json`). glmm must
-/// drop the SAME column R marks `NA`, mark it in `Fit::aliased`, and match the
-/// retained β. The oracle is sacred.
+/// Rank-deficiency salvage on a fixed-only design: near-collinear
+/// `y ~ 1 + x1 + x2 + x3` (x3 ≈ x1+x2) must drop x3, mark it in `Fit::aliased`,
+/// and fit the reduced model.
+///
+/// Values recorded from glmm. They are validated by `sim_collinear_glm`, whose
+/// cross-engine cell checks the same fit against R's `stats::glm` — including
+/// that R drops the SAME column (R keeps the name and writes `NA`; glmm keeps
+/// the column and writes NaN). That agreement claim lives there, not here, so
+/// this test can pin at a band the closed-form OLS path actually holds.
 #[test]
-fn fit_sim_collinear_matches_lme4_drop() {
-    let raw = include_str!("../../parity/goldens/sim_collinear_glm.json");
-    let gold: ColGolden = serde_json::from_str(raw).expect("golden JSON parses");
+fn fit_sim_collinear_drops_the_aliased_column() {
+    // Surviving coefficients of the reduced fit; index 3 is the dropped x3.
+    const REF_BETA: [f64; 3] = [0.9521742640860978, 0.7192032159906663, -0.43352501721286113];
+    const REF_SE: [f64; 3] = [0.05307754868563462, 0.0526001540491167, 0.05132117947475763];
 
-    let csv = include_str!("../../parity/data_simulated/sim_collinear.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_collinear.csv");
     let mut y = Vec::<f64>::new();
     let mut cols: Vec<[f64; 3]> = Vec::new();
     for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
@@ -180,22 +233,15 @@ fn fit_sim_collinear_matches_lme4_drop() {
     );
 
     assert!(f.converged, "reduced fit converges");
-    // R's aliased column = the beta slot that is null.
-    let r_aliased: Vec<bool> = gold.estimates.beta.iter().map(|b| b.is_none()).collect();
     assert_eq!(
-        f.aliased, r_aliased,
-        "glmm must drop the same column R does"
+        f.aliased,
+        vec![false, false, false, true],
+        "x3 is the dependent column and the only one dropped"
     );
-    for (j, rb) in gold.estimates.beta.iter().enumerate() {
-        match rb {
-            Some(v) => assert!(
-                (f.beta[j] - v).abs() / v.abs().max(1e-6) < 1e-3,
-                "β{j} {} vs {v}",
-                f.beta[j]
-            ),
-            None => assert!(f.beta[j].is_nan(), "β{j} must be NaN (aliased)"),
-        }
-    }
+    assert!(f.beta[3].is_nan(), "aliased β = NaN");
+    assert!(f.se[3].is_nan(), "aliased se = NaN");
+    assert_pinned(&f.beta[..3], &REF_BETA, PIN_REL_OLS, "beta");
+    assert_pinned(&f.se[..3], &REF_SE, PIN_REL_OLS, "se");
 }
 
 /// Deterministic pseudo-data (NR LCG), uniform in (−1, 1). Mirrors the

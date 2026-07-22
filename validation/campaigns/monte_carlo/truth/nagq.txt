@@ -1,0 +1,6 @@
+# nAGQ order for the AGQ arm, read from the paper's own code:
+# glmmPackCompare/helpers/estimation_tool.R:189
+#   est_lme4_AGQ = pryr::partial(est_lme4, nAGQ = 11)
+# The PDF never prints the order; their code fixes it at 11, and that code
+# produced Tables 4/5. Our glmm-AGQ and lme4-AGQ arms therefore use nAGQ = 11.
+11

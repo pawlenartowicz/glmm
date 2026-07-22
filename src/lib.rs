@@ -48,6 +48,10 @@ mod spec;
 mod start;
 pub use fit::{fit_cold, fit_warm, Fit, FitOptions};
 pub use ids::GroupIds;
+/// The blind θ start. Re-exported because a caller that must supply
+/// [`StartValues`] (β and θ are bundled) cannot reach the `None`-θ blind path,
+/// and so has to reproduce that start explicitly.
+pub use lmm::THETA0;
 pub use spec::*;
 
 /// Tiny float guard — magnitudes below this are treated as zero (rank /

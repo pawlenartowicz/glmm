@@ -1,0 +1,21 @@
+{
+  "name": "sim_nb_lowtheta_glm",
+  "engine": "MASS::glm.nb",
+  "engine_version": "7.3.65",
+  "kind": "glm",
+  "data": "sim_nb_lowtheta",
+  "family": "negbin",
+  "link": "log",
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "y ~ 1 + x + grp",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x", "grpb"],
+  "estimates": {
+    "beta": [0.392948589321679, -1.19642377752834, 0.820910978622294],
+    "se": [1.12744374740952, 0.781254798362756, 1.57118324159906],
+    "loglik": -100.539633262498,
+    "theta": 0.00409762150621296
+  }
+}

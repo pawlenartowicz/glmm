@@ -52,8 +52,8 @@ pub(super) fn varcorr_block(theta_block: &[f64], q: usize, scale: f64) -> Vec<f6
 /// Assemble `Fit::varcorr`: one vech-packed `D̂ = scale·Λ̂Λ̂'` block
 /// per grouping, declaration order (primary, then each extra). `scale` is σ̂²
 /// (LMM) or 1.0 (GLMM link scale). Path-independent — a function of θ̂ only.
-/// The primary-then-extras vech walk mirrors `LmmGroupings::from_cluster_spec_ext`'s
-/// `vech_start` layout (`lmm.rs:252-267`) — change together.
+/// The primary-then-extras vech walk mirrors the `vech_start` layout assigned
+/// in `LmmGroupings::from_cluster_spec_ext` (`src/lmm.rs`) — change together.
 /// `pub(crate)` so the sparse-Z path (`sparse::fit_mle_sparse`) recovers varcorr
 /// from θ̂ through the same path-independent assembly as the NoZ `fit_mle`.
 pub(crate) fn assemble_varcorr(
@@ -91,7 +91,7 @@ pub(crate) fn lmm_loglik(deviance: f64, n: usize, p: usize) -> f64 {
 /// correction — lme4's `logLik(glmer fit)` is literally `−devfun/2`, and the
 /// `+2` its `Gamma()$aic` data term carries stays inside (so glmer's Gamma
 /// logLik sits 1 below `Σwᵢ·log f`; R's `logLik.glm` subtracts that 2 back
-/// out, glmer does not — pinned against the sim_gamma parity loglik). NaN in
+/// out, glmer does not — pinned against the sim_gamma validation loglik). NaN in
 /// ⇒ NaN out (the non-converged contract).
 pub(crate) fn glmm_loglik(
     family: Family,
@@ -523,8 +523,8 @@ pub(super) fn assert_model_shape(model: &ModelSpec, p: usize, nagq: u8) {
     let Some(re) = model.re.as_ref() else {
         return;
     };
-    // d1 #2: the RE-envelope caps (extra-grouping count, q_p, q_g) that used to
-    // panic here are now `classify_design`'s routing boundary — over-envelope
+    // The RE-envelope caps (extra-grouping count, q_p, q_g) that used to panic
+    // here are now `classify_design`'s routing boundary — over-envelope
     // designs route to the sparse path instead of aborting. Only the column-
     // bounds validity asserts remain below (they hold regardless of solver).
     for &col in &re.slopes {
@@ -562,11 +562,13 @@ pub(crate) fn assert_model_shape_pub(model: &ModelSpec, p: usize, nagq: u8) {
     assert_model_shape(model, p, nagq);
 }
 
-/// Test-only re-export of [`spec_sized_from_ids`] so the sparse-Z path's
-/// equivalence test (`sparse::tests`) can size a spec from ids exactly as the
-/// stable `fit_warm` entry does, then force the sparse path directly.
-#[cfg(test)]
-pub(crate) fn spec_sized_from_ids_pub(model: &ModelSpec, ids: &GroupIds) -> ModelSpec {
+/// Crate-internal re-export of [`spec_sized_from_ids`]: the sparse-Z path's
+/// equivalence test (`sparse::tests`) sizes a spec from ids exactly as the stable
+/// `fit_warm` entry does, and the `loop_advanced` surface hands it to loop-tier
+/// consumers (MCPower) so they normalize RE level counts the same validated way
+/// before [`build_workspace`] rather than reimplementing the count derivation.
+#[cfg(any(test, feature = "loop_advanced"))]
+pub fn spec_sized_from_ids_pub(model: &ModelSpec, ids: &GroupIds) -> ModelSpec {
     spec_sized_from_ids(model, ids)
 }
 /// Converts row-major `x` (n·p, unweighted) into a column-major faer matrix.

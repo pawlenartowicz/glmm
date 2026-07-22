@@ -10,6 +10,11 @@
 //! Split into this LMM half (`mod.rs`) and the GLMM half (`glmm.rs`); test
 //! code lives in `tests.rs`. `mod.rs` re-exports the GLMM half's externally
 //! consumed items so `crate::sparse::X` paths are unaffected by the split.
+//!
+//! On designs outside the dense-solver envelope, these modules return a
+//! NaN-filled `Fit { converged: false, ... }` instead of panicking — tested by
+//! `fit_over_envelope_non_gaussian_never_panics`. The dense/sparse routing
+//! decision is made by `fit::classify_design` (see `fit/mod.rs:609`).
 //
 // `SymbolicCholesky` at module level serves `logdet_llt`, shared by the GLMM
 // sparse-Schur PIRLS path (`glmm/pirls.rs`) and the LMM sparse-tail branch
@@ -47,6 +52,8 @@ use glmm::{sparse_glmm_deviance, SparseGlmmWorkspace};
 /// the NoZ path), and the recovery reads the augmented Schur factor `L`
 /// (`sparse_schur_factor`) exactly as `fit_lmm` reads its `fit.factor`. `aliased`
 /// is all-false (rank-deficiency is salvaged upstream in `fit_warm` before routing).
+/// On failure (non-convergence, rank-deficiency, or numeric failure), returns a
+/// NaN-filled `Fit { converged: false, ... }` constructed inline (lines 173-194).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_mle_sparse(
     x: &[f64],
@@ -1287,7 +1294,7 @@ pub(crate) fn sparse_reml_deviance(theta: &[f64], ws: &mut SparseLmmWorkspace) -
 /// the same Cholesky as the generic sparse factorization it replaced up to the
 /// elimination order (structure-driven here vs AMD) and GEMM accumulation
 /// order — a sanctioned reassociation (same argument as `lmm.rs:1796-1802`),
-/// gated by the both-paths deviance-equality tests and the parity harness.
+/// gated by the both-paths deviance-equality tests and the validation suite.
 ///
 /// Returns `log|L_ZZ|²`; `None` on any non-PD pivot (family Crout, tail LLT —
 /// `LltRegularization::default()` is a verified no-op, delta = 0 — or Schur

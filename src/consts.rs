@@ -1,28 +1,29 @@
 //! Scratch-bounding capacity constants. `glmm` owns these; they
 //! size the solver's stack buffers, so they are HARD ceilings. These ceilings
 //! live here in `consts` as the single source, no drift.
+//!
+//! The `MAX_*` constants below define the NoZ-scratch envelope (the dense
+//! no-Z-matrix path in `fit::classify_design`), not a model ceiling. Designs
+//! over-envelope route to the sparse-Z path instead.
 
-/// Max primary RE width `q_p = 1 + #slopes` (≤ 7 random slopes). This
-/// is the NoZ-scratch envelope, not a model ceiling — over-envelope designs
-/// route to the sparse-Z path (`fit::classify_design`).
+/// Max primary RE width `q_p = 1 + #slopes` (≤ 7 random slopes).
+/// See the module header for the NoZ-scratch envelope distinction.
 pub const MAX_PRIMARY_Q: usize = 8;
 
 /// Max extra grouping factors. Mirrors the solver's per-row level-id buffer
 /// width `1 + MAX_EXTRA_GROUPINGS`. 6 keeps the NoZ envelope's total variance
 /// components `MAX_PRIMARY_Q + MAX_EXTRA_GROUPINGS·MAX_EXTRA_Q = 8 + 6·4 = 32`
-/// well within the `pinned_components` bitmask. This is the
-/// NoZ-scratch envelope, not a model ceiling — over-envelope designs route to
-/// the sparse-Z path (`fit::classify_design`). The mask is now `u64`, so the
+/// well within the `pinned_components` bitmask. The mask is now `u64`, so the
 /// sparse path safely pins up to 64 components; raising MAX_* past 64 total
 /// components would require replacing the bitmask with a bitset.
+/// See the module header for the NoZ-scratch envelope distinction.
 pub const MAX_EXTRA_GROUPINGS: usize = 6;
 
 /// Max random-effect dimension per EXTRA grouping factor: `q_g = 1 + #slopes`
 /// (intercept + up to 3 random slopes). Bounds the per-factor `vech(Λ_g)` θ block
 /// and every stack buffer sized off `MAX_THETA`. 4 covers the realistic ceiling
-/// (a crossed factor with intercept + 3 slopes); raise only with a benchmark. This
-/// is the NoZ-scratch envelope, not a model ceiling — over-envelope
-/// designs route to the sparse-Z path (`fit::classify_design`).
+/// (a crossed factor with intercept + 3 slopes); raise only with a benchmark.
+/// See the module header for the NoZ-scratch envelope distinction.
 pub const MAX_EXTRA_Q: usize = 4;
 
 /// Max θ length: full primary `vech(Λ_p)` plus a `vech(Λ_g)` block per extra

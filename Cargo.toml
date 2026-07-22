@@ -1,11 +1,11 @@
 [package]
 name = "glmm"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = true
-description = "Standalone f64 GLMM fit kernels (OLS, GLM, LMM, GLMM) in pure Rust on faer — the parity-pinned numerics from the MCPower engine."
+description = "Standalone f64 GLMM fit kernels (OLS, GLM, LMM, GLMM) in pure Rust on faer — the validation-pinned numerics from the MCPower engine."
 keywords = ["statistics", "glmm", "regression", "mixed-models", "mle"]
 categories = ["science", "mathematics"]
 repository = "https://github.com/pawlenartowicz/glmm"
@@ -35,6 +35,15 @@ loop_advanced = []
 # installed. Run those tests with
 # `cargo test --features alloc-tests <name> -- --ignored --test-threads=1`.
 alloc-tests = []
+# Tier 2, the cross-engine tier: asserts the crate against the frozen lme4 /
+# MixedModels / GLMMadaptive goldens in `validation/goldens/` at `validation/tol.R`'s
+# agreement bands. OFF by default because it is slow — it refits all 35 goldens
+# — and because CI runs the validated-answer tier instead (RULE 6). Reads frozen
+# JSON, so it needs neither R nor Julia. Named for the claim, not the cost, and
+# NOT `--oracles`, which is `run.sh`'s flag for refitting the references
+# themselves — a different act. Preferred over `#[ignore]` so the tier is
+# greppable and its absence from a run is visible rather than silent.
+oracle-tests = []
 # In-fit parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool.
 # OFF by default: a batch/MCPower caller running its own outer rayon loop over
 # many fits should pay nothing for this, not even rayon's per-split overhead.
@@ -44,7 +53,7 @@ alloc-tests = []
 parallel = ["dep:rayon"]
 
 [dependencies]
-# Mirror engine-core's pins exactly — parity-stable numerics depend on them.
+# Mirror engine-core's pins exactly — validation-stable numerics depend on them.
 bobyqa = "0.1"
 pulp = "=0.22.2"
 # Formula-parser only (`src/formula/parse.rs`); optional so the default-off kernel
@@ -76,10 +85,10 @@ resolver = "2"
 # crate that links `pyo3`; `publish = false` — it is a PyO3/maturin extension,
 # never `cargo publish`ed. `glmm-r` is its R-side twin (extendr wiring), re-exported
 # by `r/src/rust` (which stays OUT of this workspace — R drives that staticlib
-# build with its own resolver, mirroring mcpower's ports/r layout). `parity` is
+# build with its own resolver, mirroring mcpower's ports/r layout). `validation` is
 # the publish = false crate owning the oracle-harness examples; nesting it keeps
-# parity/ out of the packaged glmm crate.
-members = ["glmm-python", "glmm-r", "parity"]
+# validation/ out of the packaged glmm crate.
+members = ["glmm-python", "glmm-r", "validation"]
 
 [workspace.package]
 edition = "2021"
@@ -93,7 +102,7 @@ unsafe_code = "warn"
 
 [workspace.lints.clippy]
 # priority -1 lets item-level #[allow]/#[expect] override; deny makes clippy::all
-# a correctness gate that fails a plain `cargo clippy` — the parity-numeric guard
+# a correctness gate that fails a plain `cargo clippy` — the validation-numeric guard
 # this crate shipped with inside mcpower.
 all = { level = "deny", priority = -1 }
 
@@ -111,7 +120,7 @@ debug = false
 # Optimize test builds: the suite is dominated by faer/BOBYQA/PIRLS numerics
 # that run 30-60x slower unoptimized (the sparse NB GLMM test alone is ~24 s
 # optimized, tens of minutes at opt-level 0). Debug assertions stay on. The
-# release-profile parity pins above are untouched — goldens are tolerance
+# release-profile validation pins above are untouched — goldens are tolerance
 # checks, not bit-exact, under test profiles.
 [profile.test]
 opt-level = 3

@@ -42,10 +42,11 @@ pub struct ParsedFormula {
     /// Effect terms in formula order. Main effects appear as `Term::Main`;
     /// interactions (from `:` or the `*` expansion) as `Term::Interaction`.
     pub terms: Vec<Term>,
-    /// Random effects in parser-extraction order (nested → explicit slopes →
-    /// implicit slopes → crossed interaction groupings → plain intercepts — NOT
-    /// formula order); empty when the formula declares none. The first entry's
-    /// grouping is the primary grouping.
+    /// Random effects in formula order, with one exception: a nested `(1|A/B)`
+    /// pair always sorts first (parent immediately before child), because the
+    /// kernel interprets `NestedWithin` relative to the primary grouping.
+    /// Empty when the formula declares none. The first entry's grouping is the
+    /// primary grouping.
     pub random_effects: Vec<RandomEffect>,
 }
 
@@ -89,6 +90,20 @@ pub enum RandomEffect {
 }
 
 /// Parse a formula string into its data-free AST.
+///
+/// # Errors
+/// Returns a [`ParseError`] for malformed formulas:
+/// - [`ParseError::EmptyFormula`] if the formula is empty or has no RHS.
+/// - [`ParseError::Syntax`] if a token is not a valid identifier (e.g. contains
+///   parentheses or other invalid characters).
+/// - [`ParseError::TermRemovalUnsupported`] if the formula contains a `-` term
+///   removal (e.g. `y ~ x - z`).
+/// - [`ParseError::DuplicateGroupingVar`] if the same grouping factor appears
+///   in multiple random-effect terms.
+/// - [`ParseError::EmptySlopeTerm`] if a random-slope term has no slope
+///   variables (e.g. `(1+ |g)` with nothing between `+` and `|`).
+/// - [`ParseError::RandomInterceptSuppressionUnsupported`] if a random-effect
+///   term suppresses the intercept (e.g. `(0+x|g)` or `(-1+x|g)`).
 pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
     let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
     if cleaned.is_empty() {
@@ -132,14 +147,29 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
 /// Repeatedly matches `regex` against `work`, hands each match's captures to
 /// `make` to produce zero or more `(seen-key, effect)` pairs, dedup-inserts
 /// each key into `seen` (erroring on a repeat grouping factor), pushes the
-/// effects, and strips the first match out of `work` — until `regex` no
-/// longer matches. This is the skeleton shared by all five RE-extraction
-/// stages in [`extract_random_effects`]; everything stage-specific (how many
-/// effects one match yields, `EmptySlopeTerm`/fallback logic) lives in `make`.
+/// effects keyed `(rank, source position)`, and strips the first match out of
+/// `work` — until `regex` no longer matches. This is the skeleton shared by
+/// all five RE-extraction stages in [`extract_random_effects`]; everything
+/// stage-specific (how many effects one match yields,
+/// `EmptySlopeTerm`/fallback logic) lives in `make`.
+///
+/// The position is the match text's byte offset in the original `rhs`, so a
+/// final stable sort can restore formula order after the stages run. For
+/// well-formed input the match text is a verbatim substring of `rhs`, and its
+/// first occurrence is the right one: duplicate grouping factors are rejected
+/// (`DuplicateGroupingVar`), so every match text contains a distinct group
+/// name and occurs exactly once. The `unwrap_or` is not decoration: degenerate
+/// input can embed one RE term inside another (e.g. `(1+x+(1|a/b)|g)`), and an
+/// earlier stage's removal then leaves a seam a later stage matches across —
+/// the seam match's text is absent from `rhs` and `find` returns `None`. Such
+/// input parses without error today and must not start panicking; `usize::MAX`
+/// parks any seam match at the end, in stage order via the stable sort.
 fn extract_stage(
+    rhs: &str,
+    rank: u8,
     work: &mut String,
     seen: &mut std::collections::BTreeSet<String>,
-    effects: &mut Vec<RandomEffect>,
+    effects: &mut Vec<((u8, usize), RandomEffect)>,
     regex: &Regex,
     mut make: impl FnMut(&regex::Captures) -> Result<Vec<(String, RandomEffect)>, ParseError>,
 ) -> Result<(), ParseError> {
@@ -148,11 +178,12 @@ fn extract_stage(
         let Some(m) = regex.captures(&snapshot) else {
             break;
         };
+        let pos = rhs.find(m.get(0).unwrap().as_str()).unwrap_or(usize::MAX);
         for (name, effect) in make(&m)? {
             if !seen.insert(name.clone()) {
                 return Err(ParseError::DuplicateGroupingVar { name });
             }
-            effects.push(effect);
+            effects.push(((rank, pos), effect));
         }
         *work = regex.replacen(&snapshot, 1, "").into_owned();
     }
@@ -163,7 +194,7 @@ fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), Pars
     use std::collections::BTreeSet;
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut effects: Vec<RandomEffect> = Vec::new();
+    let mut effects: Vec<((u8, usize), RandomEffect)> = Vec::new();
     let mut work = rhs.to_string();
 
     // 0. Reject intercept suppression: (0+…|g), (-1+…|g), (0|g), (-1|g).
@@ -171,32 +202,49 @@ fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), Pars
         return Err(ParseError::RandomInterceptSuppressionUnsupported);
     }
 
+    // Stage order below is load-bearing for MATCHING only (suppression before
+    // intercept, interaction before plain intercept, …); the final sort keyed
+    // `(rank, source position)` restores formula order. Rank 0 keeps a nested
+    // pair first regardless of where it was written: `NestedWithin` is
+    // interpreted relative to the PRIMARY grouping (`materialize.rs`), so a
+    // nested term must supply the primary — pure formula order would lower
+    // `y ~ (1|c1) + (1|g1/g2)` with `c1` primary and hand the kernel a nested
+    // extra whose parent is not the primary. Every other stage gets rank 1.
+
     // 1. Nested intercept: (1|A/B) → two entries, parent then joined-with-parent.
-    extract_stage(&mut work, &mut seen, &mut effects, &RE_NESTED, |m| {
-        let parent_name = m.get(1).unwrap().as_str().to_string();
-        let child_name = m.get(2).unwrap().as_str().to_string();
-        let joined = format!("{parent_name}:{child_name}");
-        Ok(vec![
-            (
-                parent_name.clone(),
-                RandomEffect::Intercept {
-                    group: parent_name.clone(),
-                    parent: None,
-                },
-            ),
-            (
-                joined.clone(),
-                RandomEffect::Intercept {
-                    group: joined,
-                    parent: Some(parent_name),
-                },
-            ),
-        ])
-    })?;
+    extract_stage(
+        rhs,
+        0,
+        &mut work,
+        &mut seen,
+        &mut effects,
+        &RE_NESTED,
+        |m| {
+            let parent_name = m.get(1).unwrap().as_str().to_string();
+            let child_name = m.get(2).unwrap().as_str().to_string();
+            let joined = format!("{parent_name}:{child_name}");
+            Ok(vec![
+                (
+                    parent_name.clone(),
+                    RandomEffect::Intercept {
+                        group: parent_name.clone(),
+                        parent: None,
+                    },
+                ),
+                (
+                    joined.clone(),
+                    RandomEffect::Intercept {
+                        group: joined,
+                        parent: Some(parent_name),
+                    },
+                ),
+            ])
+        },
+    )?;
 
     // 2. Random slope: (1+x+y|g) — falls back to a plain Intercept if every
     // token was "1" (no non-"1" slope vars survive the filter).
-    extract_stage(&mut work, &mut seen, &mut effects, &RE_SLOPE, |m| {
+    extract_stage(rhs, 1, &mut work, &mut seen, &mut effects, &RE_SLOPE, |m| {
         let var_list_raw = m.get(1).unwrap().as_str();
         let group = m.get(2).unwrap().as_str().to_string();
         let raw_tokens: Vec<&str> = var_list_raw
@@ -230,36 +278,52 @@ fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), Pars
     // Unlike stage 2, always yields a Slope (never falls back to Intercept):
     // an empty `vars` here means the term was `(1|g)`, which RE_ISLOPE's
     // `[_A-Za-z]`-starting group excludes from matching in the first place.
-    extract_stage(&mut work, &mut seen, &mut effects, &RE_ISLOPE, |m| {
-        let var_list_raw = m.get(1).unwrap().as_str();
-        let group = m.get(2).unwrap().as_str().to_string();
-        let vars: Vec<String> = var_list_raw
-            .split('+')
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "1")
-            .map(String::from)
-            .collect();
-        Ok(vec![(group.clone(), RandomEffect::Slope { group, vars })])
-    })?;
+    extract_stage(
+        rhs,
+        1,
+        &mut work,
+        &mut seen,
+        &mut effects,
+        &RE_ISLOPE,
+        |m| {
+            let var_list_raw = m.get(1).unwrap().as_str();
+            let group = m.get(2).unwrap().as_str().to_string();
+            let vars: Vec<String> = var_list_raw
+                .split('+')
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "1")
+                .map(String::from)
+                .collect();
+            Ok(vec![(group.clone(), RandomEffect::Slope { group, vars })])
+        },
+    )?;
 
     // 2.7. Crossed interaction grouping: (1|A:B) — a random intercept keyed by
     // the combination of two existing factor columns (NOT nesting: parent stays
     // None, unlike step 1's `(1|A/B)` inner term).
-    extract_stage(&mut work, &mut seen, &mut effects, &RE_INTERACTION, |m| {
-        let lhs = m.get(1).unwrap().as_str().to_string();
-        let rhs = m.get(2).unwrap().as_str().to_string();
-        let joined = format!("{lhs}:{rhs}");
-        Ok(vec![(
-            joined.clone(),
-            RandomEffect::Intercept {
-                group: joined,
-                parent: None,
-            },
-        )])
-    })?;
+    extract_stage(
+        rhs,
+        1,
+        &mut work,
+        &mut seen,
+        &mut effects,
+        &RE_INTERACTION,
+        |m| {
+            let lhs = m.get(1).unwrap().as_str().to_string();
+            let rhs = m.get(2).unwrap().as_str().to_string();
+            let joined = format!("{lhs}:{rhs}");
+            Ok(vec![(
+                joined.clone(),
+                RandomEffect::Intercept {
+                    group: joined,
+                    parent: None,
+                },
+            )])
+        },
+    )?;
 
     // 3. Random intercept: (1|g)
-    extract_stage(&mut work, &mut seen, &mut effects, &RE_INT, |m| {
+    extract_stage(rhs, 1, &mut work, &mut seen, &mut effects, &RE_INT, |m| {
         let name = m.get(1).unwrap().as_str().to_string();
         Ok(vec![(
             name.clone(),
@@ -269,6 +333,11 @@ fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), Pars
             },
         )])
     })?;
+
+    // Restore formula order (stable: a nested pair's parent stays immediately
+    // before its child — both carry one match's position).
+    effects.sort_by_key(|(key, _)| *key);
+    let effects = effects.into_iter().map(|(_, e)| e).collect();
 
     // Clean stray "+" — collapse "++", trim leading/trailing "+".
     let cleaned = clean_residual_plusses(&work);

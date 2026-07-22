@@ -1,7 +1,55 @@
 //! OLS estimator tests (`Family::Gaussian`, `re: None`).
 
+use super::ols::{fit_ols, fit_ols_prebuilt, ols_view_to_fit, OlsWorkspace};
 use super::*;
+use crate::test_support::assert_near;
 use crate::{Family, GroupIds, ModelSpec};
+
+/// A small fixed OLS dataset (n=20, p=3: intercept + two predictors) used by the
+/// workspace-reuse gate. Deterministic, no RNG.
+fn ols_hand_dataset() -> (Vec<f64>, Vec<f64>, usize, usize) {
+    let n = 20;
+    let p = 3;
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = i as f64;
+        let b = ((i * 7) % 11) as f64 - 5.0;
+        x.extend_from_slice(&[1.0, a, b]);
+        y.push(0.5 + 1.3 * a - 0.7 * b + ((i % 3) as f64 - 1.0));
+    }
+    (x, y, n, p)
+}
+
+/// A reused `OlsWorkspace` must give a near-identical `Fit` to a throwaway one,
+/// and a second fit on the SAME ws must match the first — guards stale-buffer
+/// leakage the goldens (which only fit throwaway workspaces) cannot see.
+#[test]
+fn fit_ols_prebuilt_reused_ws_near_identical_to_fresh() {
+    let (x, y, n, p) = ols_hand_dataset();
+    let opts = FitOptions {
+        target_indices: vec![1, 2],
+        ..FitOptions::default()
+    };
+
+    let fresh = fit_ols(&x, &y, n, p, &opts);
+
+    let mut ws = OlsWorkspace::new(n, p, opts.target_indices.len());
+    let x_mat = super::common::to_col_major(&x, n, p);
+    let reused = {
+        let v = fit_ols_prebuilt(&mut ws, x_mat.as_ref().subrows(0, n), &y, n, p, &opts);
+        ols_view_to_fit(&v, &x, &y, n, p, &opts)
+    };
+    let reused2 = {
+        let v = fit_ols_prebuilt(&mut ws, x_mat.as_ref().subrows(0, n), &y, n, p, &opts);
+        ols_view_to_fit(&v, &x, &y, n, p, &opts)
+    };
+
+    assert_near(&fresh.beta, &reused.beta, "beta reused vs fresh");
+    assert_near(&fresh.se, &reused.se, "se reused vs fresh");
+    assert_near(&[fresh.dispersion], &[reused.dispersion], "dispersion");
+    assert_near(&reused.beta, &reused2.beta, "beta second reuse");
+}
 
 #[test]
 fn fit_ols_recovers_slope() {

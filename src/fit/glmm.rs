@@ -9,7 +9,7 @@
 use faer::Mat;
 
 use crate::glm::{glm_irls_fit, GlmScratch};
-use crate::glmm::{build_z, GlmmWorkspace, StructuredSchur};
+use crate::glmm::{build_z, GlmmFit, GlmmWorkspace, StructuredSchur};
 use crate::{Family, ModelSpec, NegBinomialLink, StartValues};
 
 use super::common::{assemble_varcorr, fill_se_by_predictor, nan_vcov, to_col_major};
@@ -196,6 +196,11 @@ fn fit_glmm_build(
     Ok((ws, x_mat))
 }
 
+/// Test-only baseline (fixed-θ dense GLMM as a single call). The stable path
+/// dispatches through the unified core ([`super::core::fit_on`]) over
+/// `run_glmm_on`/`glmm_view_to_fit`; the NB marginal-θ loop uses
+/// `fit_glmm_build`/`fit_glmm_prebuilt` directly.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // marshals the kernel's (x, y, n, p, spec, ids…) surface
 pub(super) fn fit_glmm(
     x: &[f64],
@@ -227,19 +232,85 @@ pub(super) fn fit_glmm(
     )
 }
 
+/// Borrowed result of [`run_glmm_on`]: the [`GlmmFit`] summary, the θ̂ it was fit
+/// at, and a shared borrow of the whole solved [`GlmmWorkspace`] (the assembly
+/// reads a dozen of its result slots — β̂, Var, μ̂, û, θ̂, θ_se, vcov, groupings —
+/// so borrowing the workspace whole is simpler than enumerating each). Lifetime
+/// ties back to the workspace that owns the storage.
+pub(crate) struct GlmmResultView<'a> {
+    fit: GlmmFit,
+    nb_theta: f64,
+    ws: &'a GlmmWorkspace,
+}
+
+// Loop-tier read accessors (via the `FitView`/`loop_advanced` surface); the
+// stable path reads the workspace slots through `glmm_view_to_fit` instead.
+#[allow(dead_code)]
+impl GlmmResultView<'_> {
+    /// Per-target Wald statistic, predictor-indexed length p — only the
+    /// `target_indices` slots are written; a non-target slot reads 0.0 on a
+    /// fresh workspace or a previous fit's value on a reused one.
+    pub(crate) fn t_sq(&self) -> &[f64] {
+        &self.ws.t_sq
+    }
+    /// Fixed-effect estimates β̂, predictor-indexed.
+    pub(crate) fn betas(&self) -> &[f64] {
+        &self.ws.betas
+    }
+    /// Per-predictor Var(β̂_j), predictor-indexed length p — only the
+    /// `target_indices` slots are written; a non-target slot reads 0.0 on a
+    /// fresh workspace or a previous fit's value on a reused one.
+    pub(crate) fn var_diag(&self) -> &[f64] {
+        &self.ws.var_diag
+    }
+    /// Whether the joint [θ|β] optimizer converged.
+    pub(crate) fn converged(&self) -> bool {
+        self.fit.converged
+    }
+    /// Joint Wald-χ² over the target set (the omnibus significance read).
+    pub(crate) fn joint_t_sq(&self) -> f64 {
+        self.fit.joint_t_sq
+    }
+    /// 0 interior, 1 a θ component pinned to the floor, 2 no optimum found.
+    pub(crate) fn boundary_hit(&self) -> u8 {
+        self.fit.boundary_hit
+    }
+    /// Bitmask of θ components pinned to the boundary (diagonal_theta order).
+    pub(crate) fn pinned_components(&self) -> u64 {
+        self.fit.pinned_components
+    }
+    /// Objective evaluations the joint solve spent.
+    pub(crate) fn n_eval(&self) -> usize {
+        self.fit.n_eval
+    }
+    /// Random-intercept variance D̂[0][0] (the GLMM dispersion read).
+    pub(crate) fn dispersion(&self) -> f64 {
+        self.fit.tau_squared_hat
+    }
+    /// Fitted θ̂ vech — the leading `n_theta` params of the joint [θ̂ | β̂] block.
+    pub(crate) fn theta(&self) -> &[f64] {
+        &self.ws.params[..self.ws.n_theta]
+    }
+}
+
 /// θ-dependent solve half of [`fit_glmm`]: sets the NB dispersion on the
-/// prebuilt workspace, cold- or warm-seeds β, runs the GLMM kernel, and maps
-/// `GlmmFit` + workspace → `Fit`. The kernel resets all per-fit warm-start state
-/// (`params`, `u_seed`, `coup_mask`, `cluster_rows`, `theta_se`) at its top —
-/// the workspace is designed for cross-fit reuse (see `glmm::fit_glmm`) — so
-/// calling this repeatedly on one prebuilt `ws` (the NB marginal-θ search) is
-/// bit-identical to a fresh construction per θ. `Z`, the symbolic factor, and
+/// prebuilt workspace, cold- or warm-seeds β, runs the GLMM kernel, and returns
+/// the borrowed [`GlmmResultView`]. The kernel resets all per-fit warm-start
+/// state (`params`, `u_seed`, `coup_mask`, `cluster_rows`) at its top and
+/// `theta_se` further down, after the degenerate-fit guard — an early
+/// `nan_fit` bail there (`glmm/mod.rs`) skips the `theta_se` reset and leaves
+/// the previous fit's values in the workspace; harmless since `stddev_se` is
+/// itself gated on `converged`. The workspace is designed for cross-fit reuse
+/// (see `glmm::fit_glmm`), so calling this repeatedly on one prebuilt `ws` (the
+/// NB marginal-θ search) is bit-identical to a fresh construction per θ except
+/// for that one stale-on-bail slot. `Z`, the symbolic factor, and
 /// `x_mat` are θ-invariant reads; the numeric factorization the kernel writes
-/// into `structured_schur` is recomputed every eval.
+/// into `structured_schur` is recomputed every eval. [`glmm_view_to_fit`] maps
+/// the returned view to `Fit`.
 #[allow(clippy::too_many_arguments)]
-fn fit_glmm_prebuilt(
-    ws: &mut GlmmWorkspace,
-    x_mat: faer::MatRef<f64>,
+pub(crate) fn run_glmm_on<'a>(
+    ws: &'a mut GlmmWorkspace,
+    x_mat: faer::MatRef<'_, f64>,
     y: &[f64],
     n: usize,
     p: usize,
@@ -248,11 +319,10 @@ fn fit_glmm_prebuilt(
     nb_theta: f64,
     start: Option<&StartValues>,
     opts: &FitOptions,
-) -> (Fit, Vec<f64>, f64) {
+) -> GlmmResultView<'a> {
     // NB θ̂ is threaded explicitly (the spec is θ-free); the PIRLS/AGQ variance and
     // deviance read it off the workspace. NaN for every non-NB family (unread).
     ws.nb_theta = nb_theta;
-    let n_theta = ws.n_theta;
 
     // Warm start threads β + θ into the GLMM kernel. A caller-supplied `start` (the
     // MCPower hot loop) uses its β verbatim; a cold start seeds β from the no-RE GLM
@@ -282,6 +352,31 @@ fn fit_glmm_prebuilt(
         n,
         opts.wald_se,
     );
+    GlmmResultView {
+        fit: glmm_fit,
+        nb_theta,
+        ws,
+    }
+}
+
+/// Maps a [`GlmmResultView`] to the full stable `Fit`, the converged conditional
+/// means `μ̂` (length `n`), and the minimized marginal Laplace deviance (the NB
+/// marginal-θ loop needs the raw deviance; other callers take `.0`). Needs raw
+/// `y` (σ̂²/dispersion/loglik read it) and `model` (family selection); θ̂ comes
+/// from the view.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn glmm_view_to_fit(
+    view: &GlmmResultView<'_>,
+    y: &[f64],
+    n: usize,
+    p: usize,
+    model: &ModelSpec,
+    opts: &FitOptions,
+) -> (Fit, Vec<f64>, f64) {
+    let ws = view.ws;
+    let glmm_fit = &view.fit;
+    let nb_theta = view.nb_theta;
+    let n_theta = ws.n_theta;
 
     // Map GlmmFit + workspace state → Fit.
     // ws.betas: length p, all fixed effects; ws.var_diag: predictor-indexed.
@@ -348,7 +443,7 @@ fn fit_glmm_prebuilt(
     // accessors report the one variance component on one scale (lme4 VarCorr;
     // σ̂² ≡ 1 for binomial/Poisson/NB, so this only bites dispersion families
     // like Gamma). Oracle: `fit_glmm_gamma_sim_matches_lme4` /
-    // `parity/goldens/sim_gamma_glmm.json` varcomp stddevs.
+    // `validation/goldens/sim_gamma_glmm.json` varcomp stddevs.
     let varcorr = if glmm_fit.converged {
         assemble_varcorr(&ws.params[..n_theta], &ws.groupings, sigma_sq)
     } else {
@@ -430,6 +525,39 @@ fn fit_glmm_prebuilt(
     };
     fit.singular = fit.singular || fit.has_negligible_component();
     (fit, mu_hat, glmm_fit.deviance)
+}
+
+/// θ-dependent solve + `Fit` assembly on a prebuilt workspace. Composes
+/// [`run_glmm_on`] + [`glmm_view_to_fit`] — the same split the unified fit core
+/// drives (`fit_on` calls `run_glmm_on`; `FitView::into_fit` calls
+/// `glmm_view_to_fit`). Returns `(Fit, μ̂, deviance)`; the NB marginal-θ loop
+/// takes the deviance, other callers `.0`.
+#[allow(clippy::too_many_arguments)]
+fn fit_glmm_prebuilt(
+    ws: &mut GlmmWorkspace,
+    x_mat: faer::MatRef<f64>,
+    y: &[f64],
+    n: usize,
+    p: usize,
+    model: &ModelSpec,
+    cluster_ids: &[u32],
+    nb_theta: f64,
+    start: Option<&StartValues>,
+    opts: &FitOptions,
+) -> (Fit, Vec<f64>, f64) {
+    let view = run_glmm_on(
+        ws,
+        x_mat,
+        y,
+        n,
+        p,
+        model,
+        cluster_ids,
+        nb_theta,
+        start,
+        opts,
+    );
+    glmm_view_to_fit(&view, y, n, p, model, opts)
 }
 
 /// Negative-binomial GLMM via the **marginal-θ** profile (`lme4::glmer.nb`):

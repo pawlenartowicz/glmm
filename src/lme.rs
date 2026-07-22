@@ -1,6 +1,6 @@
 //! LME profiled-deviance solver — Brent's method on log(θ).
 //!
-//! Hot-loop invariants (mirror `ols.rs` post-fix1+fix2):
+//! Hot-loop invariants (mirror `ols.rs`'s bounded-alloc and squared-statistic rules):
 //!  * Bounded allocations on the warm path — no explicit per-fit allocs; the
 //!    locked block count is dominated by faer's Cholesky internals
 //!    (bounded-alloc test in `lme::tests`).
@@ -202,7 +202,7 @@ impl<'w> LmeSuffStats<'w> {
     /// Accumulate a block of rows into the running sufficient statistics;
     /// `cluster_ids_block` routes each row to its cluster accumulator.
     ///
-    /// Panel-GEMM (group B): X'X/X'y accumulate through faer GEMM over a
+    /// Panel-GEMM: X'X/X'y accumulate through faer GEMM over a
     /// widened f64 panel, exactly as `OlsSuffStats::add_rows` (see its doc
     /// comment for the route rationale). The cluster accumulators (sum_xc,
     /// sum_yc, cluster_sizes, yty, n_clusters_seen) stay scalar passes in
@@ -292,9 +292,7 @@ impl<'w> LmeSuffStats<'w> {
 // λ² = θ² parametrisation the inner loop is algebraically identical
 // (1 + θ²·n_c == 1 + λ²·n_c, and θ²·v_c⁻¹ == λ²·M_j⁻¹).
 //
-// Per-θ overwrite invariant: `scratch.v_diag_inv`, `scratch.xtvix`,
-// `scratch.xtviy`, `scratch.xtvix_factor`, `scratch.betas` are all fully
-// overwritten on every call — no per-iteration reset needed by the caller.
+// Per-θ overwrite invariant: see the module header for the full scratch-field list.
 /// Evaluate the REML profiled deviance at θ. Writes intermediate state into
 /// `scratch.xtvix`, `scratch.xtviy`, `scratch.xtvix_factor`, `scratch.v_diag_inv`
 /// per the per-θ overwrite invariant.
@@ -1179,9 +1177,9 @@ mod tests {
         }
     }
 
-    /// Regression net for the panel-GEMM rewrite (group B), LME twin of
+    /// Regression net for the panel-GEMM accumulation path, LME twin of
     /// ols::add_rows_panel_matches_scalar_reference. X'X / X'y reassociate —
-    /// 1e-12 relative band, measured max 9.1e-16 (first post-rewrite run);
+    /// 1e-12 relative band, measured max 9.1e-16;
     /// every cluster accumulator (sum_xc, sum_yc, cluster_sizes, yty,
     /// n_clusters_seen) stays scalar in row order and must be bit-identical.
     #[test]
@@ -1269,7 +1267,7 @@ mod tests {
         assert_eq!(ws.lme_n_clusters_seen, ref_seen);
     }
 
-    /// EST-20: `profiled_deviance` overwrites all scratch state on every call
+    /// `profiled_deviance` overwrites all scratch state on every call
     /// — evaluating the same θ twice (with an intervening different-θ call)
     /// reproduces identical β̂ and identical deviance, i.e. there is no
     /// stale-state accumulation across θ evaluations. A broken kernel that
@@ -1342,8 +1340,7 @@ mod tests {
         );
     }
 
-    /// Replaces the two synthetic-function value-match Brent tests. Brent must
-    /// converge to an *interior* minimum without expanding the bracket: the
+    /// Brent must converge to an *interior* minimum without expanding the bracket: the
     /// returned xmin lies inside (a0, c0), fmin is ≤ the value at both initial
     /// endpoints, and the iteration terminates below the cap. No xmin value is
     /// pinned — only the bracketing/optimality invariant.
@@ -1492,7 +1489,7 @@ mod tests {
     // lme_fit end-to-end tests
     // ---------------------------------------------------------------------
 
-    /// EST-24/25: on the canonical clustered reference dataset, `lme_fit`
+    /// On the canonical clustered reference dataset, `lme_fit`
     /// converges with a *valid* boundary flag (∈ {0, 1} — interior or τ̂≈0
     /// OLS-equivalent, never the hard-failure 2), returns finite β̂ and t²,
     /// and per-target variances are non-negative (`var_diag = σ̂²·‖L⁻¹eⱼ‖² ≥ 0`).
@@ -1757,7 +1754,7 @@ mod tests {
                 fit_t_sq[j].is_finite() && fit_t_sq[j] > 0.0,
                 "t²[{j}] must be finite and strictly positive on a converged fit"
             );
-            // EST-25: per-target variance σ̂²·‖L⁻¹eⱼ‖² is non-negative.
+            // Per-target variance σ̂²·‖L⁻¹eⱼ‖² is non-negative.
             assert!(
                 fit_var_diag[j] >= 0.0,
                 "var_diag[{j}] = {} must be non-negative",
@@ -2009,7 +2006,7 @@ mod tests {
 
     /// Deterministic clustered fixture with a REAL random-intercept effect
     /// (per-cluster offsets, sd ≈ 0.66, vs residual noise 0.3·U(−1,1)) so the
-    /// REML minimum is interior — used by the W2 truth-start tests below.
+    /// REML minimum is interior — used by the truth-start tests below.
     /// Returns `(x, y, cluster_ids)`; n=60, p=3, k=6.
     fn make_clustered_fixture_interior_theta() -> (faer::Mat<f64>, Vec<f64>, Vec<u32>) {
         use faer::Mat;
@@ -2039,9 +2036,9 @@ mod tests {
         (x, y, cluster_ids)
     }
 
-    /// W2 truth-start: a warm (truth-centered) bracket and the cold bracket on
+    /// Truth-start: a warm (truth-centered) bracket and the cold bracket on
     /// the same suff-stats converge to the same interior REML minimum — z =
-    /// √t² within 1e-4 abs and β̂ within 1e-5 abs (the campaign parity
+    /// √t² within 1e-4 abs and β̂ within 1e-5 abs (the campaign validation
     /// floors), same boundary flag — while spending fewer deviance evals. A
     /// warm bracket that shifted the minimum (instead of just narrowing the
     /// search) or that failed to save evals would fail here.
@@ -2119,7 +2116,7 @@ mod tests {
         );
     }
 
-    /// W2 truth-start at τ² = 0: ln θ₀ = −∞ clamps the bracket onto the left
+    /// Truth-start at τ² = 0: ln θ₀ = −∞ clamps the bracket onto the left
     /// edge, and a no-cluster-effect dataset must still classify as the τ̂≈0
     /// boundary (boundary_hit = 1) with β̂ identical to the cold path — both
     /// paths pin the recovery Cholesky at exactly LOG_THETA_LOW, so the
@@ -2752,7 +2749,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C4 — lme_fit σ² / β̂ golden values (external oracle: R/lme4 REML)
+    // lme_fit σ² / β̂ golden values (external oracle: R/lme4 REML)
     // -----------------------------------------------------------------
     //
     // R run on the committed 60-row fixture (cluster = i / 10, blocks of 10 —
@@ -3028,7 +3025,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C12 — profiled_deviance at θ=1 vs an external lme4 oracle (+ curvature)
+    // profiled_deviance at θ=1 vs an external lme4 oracle (+ curvature)
     // -----------------------------------------------------------------
     //
     // External oracle (no reference to the engine's own prior output). lme4's
@@ -3040,8 +3037,9 @@ mod tests {
     // `log|V| + 2·Σ log L_jj + (N−P)·log(σ̂²)`. Hence
     //     engine_expected(θ) = devfun(θ) − (N−P)·(1 + log2π).
     // For this 6-row fixture lme4 gives devfun(1.0) = 9.410566478412274
-    // (reproduce with scripts/lme_devfun_theta1.R), so the engine value at θ=1
-    // is ≈ −1.9409417872 — and lme4 confirms the curvature ordering too
+    // (from `lmer(y ~ x1 + (1|cluster), REML=TRUE)` evaluated at θ=1 via
+    // `mkLmerDevfun`, not optimised), so the engine value at θ=1 is
+    // ≈ −1.9409417872 — and lme4 confirms the curvature ordering too
     // (devfun(1e-4) − const ≈ −3.0766 < −1.9409).
     //
     // The test guards two properties:
@@ -3100,7 +3098,7 @@ mod tests {
 
         // 1. Absolute-value guard against the external lme4 oracle.
         //    devfun(1.0) is lme4's REML deviance at θ=1 (see the block comment
-        //    above the fn and scripts/lme_devfun_theta1.R); subtract the
+        //    above the fn for how it was obtained); subtract the
         //    (N−P)·(1 + log2π) constant the engine omits. Actual lme4↔engine
         //    agreement is ~1e-13; the 1e-4 band leaves headroom for platform
         //    float drift while still catching any O(1) formula error.

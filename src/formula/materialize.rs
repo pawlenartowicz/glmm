@@ -4,11 +4,10 @@
 //! [`GroupIds`], and a defaulted [`FitOptions`].
 //!
 //! Conventions (validated against R `model.matrix` / `lme4`):
-//! - **Treatment contrasts**, base = first level — i.e. the caller's
-//!   [`Column::Factor`] level order picks the reference level.
-//!   [`Column::factor_from_labels`] supplies the lexicographic order R's
-//!   `factor()` defaults to when the caller has none. Dummy names are
-//!   `paste0(var, level)`.
+//! - **Treatment contrasts**, base = first level — the caller's [`Column::Factor`]
+//!   level order picks the reference level. [`Column::factor_from_labels`] supplies
+//!   the lexicographic order R's `factor()` defaults to when the caller has none.
+//!   Dummy names follow `paste0(var, level)`, e.g. `period2`.
 //! - **Interaction columns** are the elementwise product of their components'
 //!   expanded columns, with the earliest component's contrasts varying fastest
 //!   (R's `model.matrix` order); names are the component names joined by `:`.
@@ -98,7 +97,7 @@ pub struct Lowered {
     /// Design width (emitted column count).
     pub p: usize,
     /// Coefficient name per design column, in column order (`"(Intercept)"` first).
-    /// The R-parity handle the end-to-end/contrast oracles assert against.
+    /// The R-matching handle the end-to-end/contrast oracles assert against.
     pub col_names: Vec<String>,
     /// Structure-only model spec (counts are placeholders; the kernel re-derives
     /// real level counts from `ids`).
@@ -127,12 +126,36 @@ pub struct Lowered {
 /// [`Error::ResponseNotNumeric`], [`Error::WrongColumnKind`],
 /// [`Error::SlopeVarNotInDesign`]) when `data` doesn't match what the formula
 /// requires.
+///
+/// # Examples
+/// ```
+/// use glmm::formula::{lower, Column, Table};
+/// use glmm::Family;
+///
+/// let data = Table {
+///     columns: vec![
+///         ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0])),
+///         ("x".into(), Column::Numeric(vec![0.5, 1.0, 1.5])),
+///     ],
+///     n: 3,
+/// };
+/// let result = lower("y ~ x", &data, Family::Gaussian);
+/// assert!(result.is_ok());
+/// let lo = result.unwrap();
+/// assert_eq!(lo.n, 3);
+/// assert_eq!(lo.p, 2); // intercept + x
+/// ```
 pub fn lower(formula: &str, data: &Table, family: Family) -> Result<Lowered, Error> {
     let ast = parse(formula)?;
     materialize(&ast, data, family)
 }
 
 /// The data-dependent half alone (caller already holds a [`ParsedFormula`]).
+///
+/// # Errors
+/// Returns the same data-dependent error variants as [`lower`]: [`Error::UnknownColumn`],
+/// [`Error::ResponseNotNumeric`], [`Error::WrongColumnKind`], and
+/// [`Error::SlopeVarNotInDesign`].
 pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<Lowered, Error> {
     let n = data.n;
 
@@ -239,7 +262,7 @@ fn sorted_levels_and_codes(labels: &[String]) -> (Vec<String>, Vec<u32>) {
 }
 
 /// Treatment-coded dummy columns for a factor (base = level 0, `levels-1`
-/// columns). Each is named `paste0(var, level)` — e.g. `period2`.
+/// columns). Names follow the module-header treatment-contrasts convention.
 fn factor_dummies(var: &str, levels: &[String], codes: &[u32]) -> Vec<(String, Vec<f64>)> {
     levels
         .iter()
@@ -265,9 +288,9 @@ fn expand_var(name: &str, data: &Table) -> Result<Vec<(String, Vec<f64>)>, Error
     }
 }
 
-/// Interaction columns: the elementwise product across the vars' expanded column
-/// sets, earliest var varying fastest (R `model.matrix` order). Names join the
-/// component names with `:`.
+/// Interaction columns formed from the module-header conventions: elementwise
+/// product across the vars' expanded sets, earliest var varying fastest, names
+/// joined by `:`.
 fn interaction_columns(vars: &[String], data: &Table) -> Result<Vec<(String, Vec<f64>)>, Error> {
     let mut acc = expand_var(&vars[0], data)?;
     for var in &vars[1..] {
@@ -460,9 +483,11 @@ fn grouping_ids(re: &RandomEffect, data: &Table) -> Result<Vec<u32>, Error> {
 /// slope var (not in `numeric_main_col`) expands to ALL of its dummy
 /// `ColumnId`s, in `factor_dummies` order — so the returned vec can be longer
 /// than `vars`. A slope var absent from both maps (never a fixed-effect main
-/// term) is `SlopeVarNotInDesign` — this crate does not compute on-demand
-/// dummies for a slope-only factor (see design doc point 4: unreached by the
-/// current parity corpus, where every factor slope var is also a fixed main).
+/// term) is `SlopeVarNotInDesign` — the crate does not support slope-only
+/// factors (factors appearing only in random slopes, not fixed main effects),
+/// as that would require on-demand dummy computation outside the main-effects
+/// pass. This is unreached by the current validation corpus where every factor
+/// slope variable is also a fixed main term.
 fn slope_cols(
     re: &RandomEffect,
     numeric_main_col: &HashMap<String, ColumnId>,

@@ -171,9 +171,9 @@ pub(crate) fn rx_cov_into(
 /// (slightly MORE converged — harmless).
 ///
 /// Match vs lme4 `vcov(use.hessian=TRUE)`: ~3.4e-7 worst per-entry gap on the
-/// committed fixture and ≤2e-5 rel `se_hessian` on every parity rung — but ONLY
+/// committed fixture and ≤2e-5 rel `se_hessian` on every validation rung — but ONLY
 /// against an lme4 run at tightened `tolPwrss` (the fixture and the frozen
-/// parity references are generated at 1e-13; each records it). At lme4's
+/// validation references are generated at 1e-13; each records it). At lme4's
 /// DEFAULT `tolPwrss = 1e-7` a ~1% gap opens, and it is LME4'S, not ours
 /// (measured 2026-07-04):
 /// glmer assembles the `log|A|` (ldL2) term of its Laplace deviance from
@@ -221,6 +221,22 @@ pub fn fd_hessian_cov(
         fill_z_f64(groupings, x, z_buf, n);
     }
 
+    // Put û(γ̂) back the way it was found. `u_seed` holds the entry mode (see the
+    // seeding block below), and every eval here overwrites `ws.u` with its own
+    // perturbed mode, so without this the workspace exits carrying an FD leftover
+    // where the fit's mode used to be — and since the seed is now READ from
+    // `ws.u`, a second `fd_hessian_cov` on the same workspace would anchor on that
+    // leftover and return a different (still valid, but different) covariance.
+    // `fd_hessian_parallel_bit_identical_to_serial` calls it exactly twice and is
+    // what holds this line. Same contract as the `ws.params`/`fd_saved` restore it
+    // sits next to: leave the workspace as you found it.
+    macro_rules! restore_fd_mode {
+        () => {{
+            let kk = ws.k.max(1);
+            ws.u[..kk].copy_from_slice(&ws.u_seed[..kk]);
+        }};
+    }
+
     // Restore γ̂ and take the RX/Schur fallback: re-eval the central deviance to
     // repopulate W̃/Λ̂/block factors at γ̂, then invert the β information.
     macro_rules! fallback {
@@ -263,26 +279,49 @@ pub fn fd_hessian_cov(
                 ws.theta_se[k] = f64::NAN;
             }
             ws.params[..m].copy_from_slice(&ws.fd_saved[..m]);
+            restore_fd_mode!();
             ws.warm_seed_active = false; // never leak the FD seed into a later fit / BOBYQA
             ws.pirls_tol_override = None; // nor the FD tight tol
             return FdHessianStatus::NonPdFellBackToRx;
         }};
     }
 
+    // Anchor the whole FD grid on the fit's OWN converged mode û(γ̂), which the
+    // pinned-γ̂ re-eval in `fit_glmm_ws` just left in `ws.u`. Every eval below — f0
+    // included — warm-starts from this one fixed seed (`ws.u_seed`, set once here,
+    // read by every `laplace_deviance_at` call via `warm_seed_active`), never from
+    // the previous eval's own mode. That makes each f(γ) a function of γ alone: the
+    // second differences that build the Hessian only stay valid if every f± sees
+    // the same seed, because a *chained* seed (eval k warm-started from eval k−1's
+    // mode) would make f(γ) depend on evaluation order and corrupt them. f0 shares
+    // the seed for the same reason and so reproduces the deviance the optimizer
+    // actually reached.
+    //
+    // This used to run f0 cold (u = 0) and take ITS mode as the seed, on the
+    // assumption that a cold solve at γ̂ re-finds û(γ̂). That assumption holds
+    // wherever the PIRLS mode problem has one basin, and fails where it has more
+    // than one: on a Gamma fit with the INVERSE link the cold solve lands in a
+    // different basin than the fit did, and the whole Hessian is then built around
+    // a point that is not the fit's optimum. Measured on `sim_gamma`
+    // (`y ~ 1 + x + grp + (1 | cluster)`, Gamma-inverse): the fit reaches deviance
+    // 936.7683 and a cold f0 at the same γ̂ returns 1034.5678, ~98 above it. The
+    // deviance seen along each coordinate then jumps between the two branches, so
+    // the second differences measure the branch gap rather than curvature — every
+    // diagonal entry came out around −9.8e5, the joint Hessian was indefinite, and
+    // the RX fallback formed its Schur at the same wrong mode and was indefinite
+    // too. The fit was reported as failed for want of a standard error.
+    //
+    // Seeding from û(γ̂) makes f0 equal the fit's deviance exactly there, and moves
+    // the log-link sibling's f0 from 1.2e-6 to 1.0e-7 off its own `Fit::deviance` —
+    // this is the self-consistency the FD needed on every link, not a Gamma patch.
+    let kk = ws.k.max(1);
+    ws.u_seed[..kk].copy_from_slice(&ws.u[..kk]);
+    ws.warm_seed_active = true;
+
     let f0 = fd_eval(ws, &[], &[], x, y, cluster_ids, n);
     if !f0.is_finite() {
         fallback!();
     }
-
-    // f0 ran cold (warm_seed_active still false), so ws.u now holds the fitted
-    // mode û(γ̂). Snapshot it as the fixed shared FD seed and switch every
-    // subsequent perturbed eval to warm-start from it (§2/§5: identical seed for
-    // all f± keeps the second differences order-independent; the diagonal mixes a
-    // cold f0 with warm f±, but u_seed IS f0's own converged mode so a warm f0
-    // would return the same deviance to tol — no systematic offset to amplify).
-    let kk = ws.k.max(1);
-    ws.u_seed[..kk].copy_from_slice(&ws.u[..kk]);
-    ws.warm_seed_active = true;
 
     // Build the symmetric m×m Hessian into ws.hess_scratch (upper, then mirror).
     // Each grid cell is a pure function of the frozen FD seed (fd_saved, fd_steps,
@@ -386,6 +425,12 @@ pub fn fd_hessian_cov(
     let _ = fd_eval(ws, &[], &[], x, y, cluster_ids, n);
 
     ws.params[..m].copy_from_slice(&ws.fd_saved[..m]);
+    // That re-eval lands on û(γ̂) again but at the FD tight tol, so it is a hair
+    // MORE converged than the mode this call was handed. Take the handed one back
+    // verbatim, so a second call on the same workspace seeds from the same vector
+    // and returns the same bits. The ~1e-12 it leaves between `ws.u` and the
+    // `ws.prob`/W̃ the re-eval just wrote is far below anything read off them.
+    restore_fd_mode!();
     ws.warm_seed_active = false; // never leak the FD seed into a later fit / BOBYQA
     ws.pirls_tol_override = None; // nor the FD tight tol
     FdHessianStatus::Ok

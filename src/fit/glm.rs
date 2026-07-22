@@ -5,16 +5,17 @@
 
 use faer::Mat;
 
-use crate::glm::{glm_irls_fit, GlmScratch};
+use crate::glm::{glm_irls_fit, GlmFitView, GlmScratch};
 use crate::{Family, NegBinomialLink};
 
 use super::common::{fill_se_compact, nan_vcov, to_col_major, vcov_from_chol};
 use super::{Fit, FitOptions};
 
-/// Placeholder for the M3 families/links not yet wired through `fit` (Tasks 3–7
-/// replace these arms with real kernels). Returns the standard non-converged NaN
-/// signal — truthful "not yet fittable", never reached by a test until its
-/// family's kernel lands.
+/// Builds the standard non-converged NaN `Fit` used to seed
+/// [`fit_glm_nb_capped`]'s θ↔β alternation before the first inner IRLS fit
+/// runs. If `max_outer` were ever `0` this is what the loop would return
+/// unmodified; in practice `max_outer >= 1` always, so the first iteration
+/// overwrites it before it's read.
 fn fit_unsupported_family(p: usize) -> Fit {
     Fit {
         beta: vec![f64::NAN; p],
@@ -45,8 +46,11 @@ fn fit_unsupported_family(p: usize) -> Fit {
 /// documents. Hoistable across repeated fixed-θ GLM fits (the NB outer-θ
 /// alternation in [`fit_glm_nb_capped`]): [`glm_irls_fit`] re-seeds or NaN-fills
 /// every populated slot at entry, so a reused buffer is bit-identical to a fresh
-/// allocation.
-struct GlmScratchBuf {
+/// allocation — except `mu` (`irls_p`) on the two pre-loop early returns (n ≤ p
+/// short-circuit, Binomial all-0/all-1 short-circuit), where `irls_p` is left
+/// untouched and `mu` carries the previous fit's means instead of zeros;
+/// harmless since `mu`'s own contract gates it on `converged`.
+pub(crate) struct GlmScratchBuf {
     irls_eta: Vec<f64>,
     irls_p: Vec<f64>,
     irls_w: Vec<f64>,
@@ -63,7 +67,7 @@ struct GlmScratchBuf {
 }
 
 impl GlmScratchBuf {
-    fn new(n: usize, p: usize, t: usize) -> Self {
+    pub(crate) fn new(n: usize, p: usize, t: usize) -> Self {
         let (n1, p1, t1) = (n.max(1), p.max(1), t.max(1));
         GlmScratchBuf {
             irls_eta: vec![0.0f64; n1],
@@ -107,6 +111,9 @@ impl GlmScratchBuf {
 /// runs the `family`-selected IRLS kernel cold-started at β=0, and maps the view
 /// to `Fit`. No random effects ⇒ `tau2` empty. Binomial/Poisson keep
 /// `dispersion = 1.0`; Gamma/NB recover their dispersion in their own arms.
+/// Test-only baseline since the stable path dispatches through the unified core
+/// ([`super::core::fit_on`]) over `fit_glm_prebuilt`/`glm_view_to_fit`.
+#[cfg(test)]
 pub(super) fn fit_glm(
     family: Family,
     nb_theta: f64,
@@ -118,62 +125,69 @@ pub(super) fn fit_glm(
 ) -> Fit {
     let mut buf = GlmScratchBuf::new(n, p, opts.target_indices.len());
     let x_mat = to_col_major(x, n, p);
-    fit_glm_prebuilt(
+    let view = fit_glm_prebuilt(
         family,
         nb_theta,
         x_mat.as_ref().subrows(0, n),
         y,
-        n,
-        p,
         opts,
         &mut buf,
-    )
+    );
+    glm_view_to_fit(&view, y, family, nb_theta, n, p, opts)
 }
 
 /// [`fit_glm`]'s solve half over a prebuilt column-major `x_mat` and reusable
-/// IRLS scratch. Hoisted so the NB outer-θ loop ([`fit_glm_nb_capped`]) converts
-/// `x` and allocates the scratch ONCE, re-running IRLS per fixed-θ fit instead
-/// of rebuilding both every alternation.
-#[allow(clippy::too_many_arguments)]
-fn fit_glm_prebuilt(
+/// IRLS scratch, returning the borrowed [`GlmFitView`]. Hoisted so the NB
+/// outer-θ loop ([`fit_glm_nb_capped`]) converts `x` and allocates the scratch
+/// ONCE, re-running IRLS per fixed-θ fit; the unified fit core drives it per
+/// draw. [`glm_view_to_fit`] maps the returned view to the full `Fit`.
+pub(crate) fn fit_glm_prebuilt<'a>(
     family: Family,
     nb_theta: f64,
-    x_mat: faer::MatRef<f64>,
+    x_mat: faer::MatRef<'_, f64>,
     y: &[f64],
+    opts: &FitOptions,
+    buf: &'a mut GlmScratchBuf,
+) -> GlmFitView<'a> {
+    // None = β=0 cold start (no spec-derived truth on the standalone path).
+    glm_irls_fit(
+        family,
+        nb_theta,
+        x_mat,
+        y,
+        &opts.target_indices,
+        None,
+        opts.weights.as_deref(),
+        opts.offset.as_deref(),
+        buf.as_scratch(),
+    )
+}
+
+/// Maps a [`GlmFitView`] to the full stable `Fit`: SE from `var_diag`, vcov from
+/// the cached Cholesky factor, Gamma dispersion + √φ SE scaling, fitted means μ̂,
+/// and the family log-likelihood. Needs raw `y` (Gamma dispersion + saturated
+/// loglik read it) and `nb_theta` (the NB shape θ̂; only NB/Gamma read it, pass
+/// `f64::NAN` otherwise).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn glm_view_to_fit(
+    view: &GlmFitView<'_>,
+    y: &[f64],
+    family: Family,
+    nb_theta: f64,
     n: usize,
     p: usize,
     opts: &FitOptions,
-    buf: &mut GlmScratchBuf,
 ) -> Fit {
-    let view = {
-        // None = β=0 cold start (no spec-derived truth on the standalone path).
-        glm_irls_fit(
-            family,
-            nb_theta,
-            x_mat,
-            y,
-            &opts.target_indices,
-            None,
-            opts.weights.as_deref(),
-            opts.offset.as_deref(),
-            buf.as_scratch(),
-        )
-    };
-
     // --- map GlmFitView → Fit ---
     // view.betas is full [0..p]; view.var_diag is target-compact [0..t] (like OLS).
     let beta = view.betas.to_vec();
     let converged = view.converged;
-    // Weighted Σwᵢdᵢ at the accepted iterate (NaN unless converged) — captured
-    // as a scalar here because the loglik below reads `buf.irls_p`, which the
-    // borrow behind `view` still holds.
+    // Weighted Σwᵢdᵢ at the accepted iterate (NaN unless converged).
     let irls_deviance = view.deviance;
     let mut se = vec![f64::NAN; p];
     fill_se_compact(view.var_diag, &opts.target_indices, &mut se);
-    // Unscaled (X'WX)⁻¹, read off `view` here because `view` mutably borrows
-    // `buf` and Gamma's φ estimate below reads `buf.irls_p`. φ multiplies it
-    // afterwards, exactly as √φ scales `se`. `view.l` is stale-or-zero unless
-    // `converged` (its documented contract).
+    // Unscaled (X'WX)⁻¹; Gamma's φ multiplies it afterwards, exactly as √φ scales
+    // `se`. `view.l` is stale-or-zero unless `converged` (its documented contract).
     let mut vcov = if converged {
         vcov_from_chol(view.l, p, &opts.target_indices, 1.0)
     } else {
@@ -192,7 +206,7 @@ fn fit_glm_prebuilt(
                 Some(v) => v,
                 None => crate::family::pearson_dispersion(
                     y,
-                    &buf.irls_p[..n],
+                    view.mu,
                     family,
                     nb_theta,
                     n,
@@ -227,7 +241,7 @@ fn fit_glm_prebuilt(
     // inside `gamma_aic` (NOT the Pearson `dispersion` above, matching R, which
     // also mixes the two conventions between `logLik` and `summary`).
     let (fitted, loglik) = if converged {
-        let mu = buf.irls_p[..n].to_vec();
+        let mu = view.mu.to_vec();
         let ll = match family {
             Family::Gamma { .. } => {
                 -0.5 * (crate::family::gamma_aic(y, &mu, irls_deviance, n, opts.weights.as_deref())
@@ -276,8 +290,10 @@ fn fit_glm_prebuilt(
 /// alternations between the β fit (fixed θ) and the 1-D θ optimisation.
 pub(super) const NB_MAX_OUTER: usize = 25;
 const NB_THETA_TOL: f64 = 1e-6;
-/// θ search bracket (on ln θ): `θ ∈ [1e-3, 1e4]`. Below → ≈Poisson (huge θ);
-/// above is implausible overdispersion for the parity datasets.
+/// θ search bracket (on ln θ): `θ ∈ [1e-3, 1e4]`. NB variance is `μ + μ²/θ`,
+/// so large θ (near `1e4`) drives `μ²/θ` toward zero — near-Poisson, low
+/// overdispersion; small θ (near `1e-3`) is the highly overdispersed end,
+/// implausibly so beyond this bound for the validation datasets.
 pub(super) const NB_THETA_LO: f64 = 1e-3;
 pub(super) const NB_THETA_HI: f64 = 1e4;
 
@@ -285,7 +301,7 @@ pub(super) const NB_THETA_HI: f64 = 1e4;
 /// `Σ[ lnΓ(yᵢ+θ) − lnΓ(θ) + θ·ln(θ/(θ+μ̂ᵢ)) + yᵢ·ln(μ̂ᵢ/(θ+μ̂ᵢ)) ]`. Counts are
 /// integers, so `lnΓ(y+θ)−lnΓ(θ) = Σ_{k=0}^{y−1} ln(θ+k)` exactly — no lgamma,
 /// and identical to `MASS::theta.ml`'s objective. (`Σ_{k}` is `O(Σy)`; fine at
-/// parity scale.)
+/// validation scale.)
 ///
 /// The `μᵢ==0` guard makes this finite when evaluated at the **saturated** mean
 /// `μ=y` (so `nb_profile_loglik(y, y, θ)` = the NB saturated log-likelihood, the
@@ -408,7 +424,8 @@ pub(super) fn fit_glm_nb_capped(
     let mut fit_result = fit_unsupported_family(p);
     for _ in 0..max_outer {
         // θ is fixed for this β fit and threaded explicitly (the spec is θ-free).
-        fit_result = fit_glm_prebuilt(family, theta, x_ref, y, n, p, opts, &mut buf);
+        let view = fit_glm_prebuilt(family, theta, x_ref, y, opts, &mut buf);
+        fit_result = glm_view_to_fit(&view, y, family, theta, n, p, opts);
         if !fit_result.converged {
             break;
         }
@@ -425,7 +442,8 @@ pub(super) fn fit_glm_nb_capped(
         theta = new_theta;
         if converged {
             // Final β/SE at the converged θ for consistency.
-            fit_result = fit_glm_prebuilt(family, theta, x_ref, y, n, p, opts, &mut buf);
+            let view = fit_glm_prebuilt(family, theta, x_ref, y, opts, &mut buf);
+            fit_result = glm_view_to_fit(&view, y, family, theta, n, p, opts);
             break;
         }
     }

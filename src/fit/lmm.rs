@@ -3,7 +3,10 @@
 //! kernel lives in `src/lmm.rs`; this module only builds the workspace,
 //! accumulates sufficient statistics, and maps `LmmFit` back to `Fit`.
 
-use crate::lmm::{fit_lmm, LmmWorkspace};
+use crate::lmm::{fit_lmm, LmmFit, LmmGroupings, LmmWorkspace};
+// Used only by the test-only `fit_mle`/`fit_lmm_into` baselines. The stable core
+// reaches the LMM path via `accumulate_lmm_rows`/`lmm_run_on`, which take neither.
+#[cfg(test)]
 use crate::{ModelSpec, StartValues};
 
 use super::common::{
@@ -46,46 +49,131 @@ pub(super) fn accumulate_lmm_rows(
     }
 }
 
-/// θ-solve + `Fit` assembly from a pre-built, already-accumulated workspace.
-/// Caller contract: `ws.suff` holds the accumulated rows (`accumulate_lmm_rows`,
-/// reset + add_rows_multi per dataset) — mirrors `fit_lmm`'s own contract.
-pub(super) fn fit_lmm_into(
-    ws: &mut LmmWorkspace,
-    target_indices: &[u32],
-    start: Option<&StartValues>,
-) -> Fit {
-    // Warm start threads `theta` only — the LMM β is solved exactly given θ, so a
-    // β start is irrelevant (matches StartValues carrying no LMM β use). `None`
-    // (cold) uses the kernel's THETA0 blind start.
-    let lmm_fit = fit_lmm(ws, target_indices, start.map(|s| s.theta.as_slice()));
+/// Borrowed result of [`lmm_run_on`]: the [`LmmFit`] summary plus the workspace
+/// result slots the `Fit` assembly reads (β̂, per-predictor Var/z², the augmented
+/// factor, θ̂, groupings, row count). Lifetime ties back to the [`LmmWorkspace`]
+/// that owns the storage.
+pub(crate) struct LmmResultView<'a> {
+    fit: LmmFit,
+    betas: &'a [f64],
+    var_diag: &'a [f64],
+    // Read only by the loop-tier `t_sq` accessor below (dead in a default build).
+    #[allow(dead_code)]
+    t_sq: &'a [f64],
+    factor: faer::MatRef<'a, f64>,
+    theta: &'a [f64],
+    groupings: &'a LmmGroupings,
+    n_rows: usize,
+}
 
-    // Map LmmFit + workspace state → Fit
-    // ws.fit.betas: length p, all fixed effects
-    // ws.fit.var_diag: length p, predictor-indexed (LME/LMM are predictor-indexed, unlike OLS)
-    let beta = ws.fit.betas.clone();
-    let p = beta.len();
+// Loop-tier read accessors (via the `FitView`/`loop_advanced` surface); the
+// stable path reads these slots through `lmm_view_to_fit` instead.
+#[allow(dead_code)]
+impl LmmResultView<'_> {
+    /// Per-target Wald z², predictor-indexed length p — only the
+    /// `target_indices` slots are written; a non-target slot reads 0.0 on a
+    /// fresh workspace or a previous fit's value on a reused one.
+    pub(crate) fn t_sq(&self) -> &[f64] {
+        self.t_sq
+    }
+    /// Fixed-effect estimates β̂, predictor-indexed.
+    pub(crate) fn betas(&self) -> &[f64] {
+        self.betas
+    }
+    /// Per-predictor Var(β̂_j), predictor-indexed length p — only the
+    /// `target_indices` slots are written; a non-target slot reads 0.0 on a
+    /// fresh workspace or a previous fit's value on a reused one.
+    pub(crate) fn var_diag(&self) -> &[f64] {
+        self.var_diag
+    }
+    /// Whether θ̂ reached an interior/pinned optimum.
+    pub(crate) fn converged(&self) -> bool {
+        self.fit.converged
+    }
+    /// Joint Wald-χ² over the target set (the omnibus significance read).
+    pub(crate) fn joint_t_sq(&self) -> f64 {
+        self.fit.joint_t_sq
+    }
+    /// 0 interior, 1 a θ component pinned to the floor, 2 no optimum found.
+    pub(crate) fn boundary_hit(&self) -> u8 {
+        self.fit.boundary_hit
+    }
+    /// Bitmask of θ components pinned to the boundary (diagonal_theta order).
+    pub(crate) fn pinned_components(&self) -> u64 {
+        self.fit.pinned_components
+    }
+    /// Objective evaluations the θ-solve spent.
+    pub(crate) fn n_eval(&self) -> usize {
+        self.fit.n_eval
+    }
+    /// Residual variance σ̂² (the LMM dispersion).
+    pub(crate) fn dispersion(&self) -> f64 {
+        self.fit.sigma_sq
+    }
+    /// Fitted θ̂ vech (primary block then extras, column-major lower-triangular).
+    pub(crate) fn theta(&self) -> &[f64] {
+        self.theta
+    }
+}
+
+/// Runs the θ-solve on a pre-accumulated workspace and returns a borrowed view
+/// of the results. Caller contract: `ws.suff` holds the accumulated rows
+/// ([`accumulate_lmm_rows`]). Warm start threads `theta` only — the LMM β is
+/// solved exactly given θ, so a β start is irrelevant; `None` (cold) uses the
+/// kernel's THETA0 blind start.
+pub(crate) fn lmm_run_on<'a>(
+    ws: &'a mut LmmWorkspace,
+    target_indices: &[u32],
+    theta_start: Option<&[f64]>,
+) -> LmmResultView<'a> {
+    let fit = fit_lmm(ws, target_indices, theta_start);
+    LmmResultView {
+        fit,
+        betas: &ws.fit.betas,
+        var_diag: &ws.fit.var_diag,
+        t_sq: &ws.fit.t_sq,
+        factor: ws.fit.factor.as_ref(),
+        theta: &ws.theta,
+        groupings: &ws.suff.groupings,
+        n_rows: ws.suff.n_rows,
+    }
+}
+
+/// Maps an [`LmmResultView`] to the full stable `Fit`: SE from `var_diag`, tau2
+/// from θ̂, varcorr, vcov from the augmented factor, the REML criterion loglik,
+/// and — when `opts.weights` is set — the −Σlog wᵢ weighted-deviance correction.
+pub(crate) fn lmm_view_to_fit(
+    view: &LmmResultView<'_>,
+    n: usize,
+    p: usize,
+    opts: &FitOptions,
+) -> Fit {
+    let lmm_fit = &view.fit;
+    // view.betas: length p, all fixed effects.
+    // view.var_diag: length p, predictor-indexed (LME/LMM are predictor-indexed, unlike OLS).
+    let beta = view.betas.to_vec();
     let sigma_sq = lmm_fit.sigma_sq;
 
     let mut se = vec![f64::NAN; p];
-    fill_se_by_predictor(&ws.fit.var_diag, target_indices, &mut se);
+    fill_se_by_predictor(view.var_diag, &opts.target_indices, &mut se);
 
     // tau2[k] = theta[k]^2 * sigma_sq — the k-th variance component in original scale.
-    // ws.theta holds the fitted Cholesky parameters; diagonal entries satisfy
+    // θ̂ holds the fitted Cholesky parameters; diagonal entries satisfy
     // theta[k] = sqrt(tau_k / sigma_sq), so theta[k]^2 * sigma_sq = tau_k.
     // Gated on the finite endpoint (`deviance`), not `converged` — the plateau
     // policy: a `MaxFunReached` cap-out reports an honest θ̂ (its finite
     // endpoint) with `converged == false` rather than NaN-filling.
     let has_endpoint = lmm_fit.deviance.is_finite();
     let tau2: Vec<f64> = if has_endpoint {
-        ws.theta.iter().map(|&t| t * t * sigma_sq).collect()
+        view.theta.iter().map(|&t| t * t * sigma_sq).collect()
     } else {
-        ws.theta.iter().map(|_| f64::NAN).collect()
+        view.theta.iter().map(|_| f64::NAN).collect()
     };
 
     // varcorr[g] = vech(σ̂²·Λ̂_gΛ̂_g') per grouping — the q≥2-valid
     // covariance; equals tau2's diagonal only at the (0,0) primary entry.
     let varcorr = if has_endpoint {
-        assemble_varcorr(&ws.theta, &ws.suff.groupings, sigma_sq)
+        assemble_varcorr(view.theta, view.groupings, sigma_sq)
     } else {
         vec![]
     };
@@ -96,13 +184,17 @@ pub(super) fn fit_lmm_into(
     // endpoint like `tau2`/`varcorr`: the degenerate return NaN-fills
     // `var_diag` and `sigma_sq` together, so `se` and `vcov` go NaN together.
     let vcov = if has_endpoint {
-        vcov_from_chol(ws.fit.factor.as_ref(), p, target_indices, sigma_sq)
+        vcov_from_chol(view.factor, p, &opts.target_indices, sigma_sq)
     } else {
         nan_vcov(p)
     };
 
-    let n_rows = ws.suff.n_rows;
-    let n_theta = ws.theta.len();
+    // Equal to `n` on every real path; diverges only in the degenerate
+    // n > 0 && p == 0 case, where `accumulate_lmm_rows` skips `add_rows_multi`
+    // (and so never increments `n_rows`) while `n` still reflects the caller's
+    // row count.
+    let n_rows = view.n_rows;
+    let n_theta = view.theta.len();
     let mut fit = Fit {
         beta,
         se,
@@ -118,9 +210,9 @@ pub(super) fn fit_lmm_into(
         n_eval: lmm_fit.n_eval,
         deviance: lmm_fit.deviance,
         singular: lmm_fit.boundary_hit == 1,
-        // REML criterion on the logLik scale. Weights-agnostic like `deviance`:
-        // callers that support `weights=` recompute this after their −Σlog wᵢ
-        // deviance correction (`fit_mle` / `refit_lmm` — change together).
+        // REML criterion on the logLik scale, from the base (unweighted) deviance;
+        // the weighted correction below rewrites both together (using `n`, not
+        // `n_rows` — see note above `n_rows`).
         loglik: super::common::lmm_loglik(lmm_fit.deviance, n_rows, p),
         df: if has_endpoint { p + n_theta + 1 } else { 0 },
         reml: true,
@@ -131,11 +223,45 @@ pub(super) fn fit_lmm_into(
         ranef_levels: vec![],
     };
     fit.singular = fit.singular || fit.has_negligible_component();
+
+    // Weighted Gaussian log-density carries +½Σlog wᵢ per row; on the −2ℓ scale
+    // the REML deviance gains −Σlog wᵢ (θ-independent — added post-optimization,
+    // argmin unchanged), and the criterion-scale loglik is recomputed from the
+    // corrected deviance. Matches lme4's weighted REMLcrit up to the additive
+    // constant the engine strips from its deviance convention (documented on
+    // `lme::profiled_deviance`). This is the single site every caller reaches, so
+    // no caller applies the correction itself.
+    if let Some(w) = &opts.weights {
+        fit.deviance -= w.iter().map(|v| v.ln()).sum::<f64>();
+        fit.loglik = super::common::lmm_loglik(fit.deviance, n, p);
+    }
     fit
+}
+
+/// θ-solve + `Fit` assembly from a pre-built, already-accumulated workspace.
+/// Composes [`lmm_run_on`] + [`lmm_view_to_fit`]. Caller contract: `ws.suff`
+/// holds the accumulated rows (`accumulate_lmm_rows`, reset + add_rows_multi per
+/// dataset). The weighted-deviance correction is inside `lmm_view_to_fit`, so
+/// callers must NOT re-apply it. Only the test-gated `fit_mle` and `refit_lmm`
+/// baselines compose through this; the core calls `lmm_run_on`/`lmm_view_to_fit`
+/// directly.
+#[cfg(test)]
+pub(super) fn fit_lmm_into(
+    ws: &mut LmmWorkspace,
+    n: usize,
+    p: usize,
+    opts: &FitOptions,
+    start: Option<&StartValues>,
+) -> Fit {
+    let view = lmm_run_on(ws, &opts.target_indices, start.map(|s| s.theta.as_slice()));
+    lmm_view_to_fit(&view, n, p, opts)
 }
 /// LMM dispatch adapter. `cluster_ids`/`extra_ids` are the per-row level ids from
 /// the entry's [`GroupIds`]; `model` is the sizing-corrected spec (counts derived
 /// from those ids). Slope x-columns come from `model.re`. Mirrors `fit_glmm`.
+/// Test-only baseline since the stable path dispatches through the unified core
+/// ([`super::core::fit_on`]) over `accumulate_lmm_rows`/`lmm_run_on`.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // marshals the kernel's (x, y, n, p, spec, ids…) surface
 pub(super) fn fit_mle(
     x: &[f64],
@@ -187,21 +313,7 @@ pub(super) fn fit_mle(
         opts.weights.as_deref(),
     );
 
-    let mut fit = fit_lmm_into(&mut ws, &opts.target_indices, start);
-
-    // Weighted Gaussian log-density carries +½Σlog wᵢ per row; on the −2ℓ
-    // scale the REML/ML deviance gains −Σlog wᵢ (θ-independent — added
-    // post-optimization, argmin unchanged). Matches lme4's weighted REMLcrit
-    // up to the engine's documented stripped constant (see lme.rs:2978).
-    // Applied here rather than inside `fit_lmm_into` — it needs the caller's raw
-    // weights slice, which the workspace doesn't retain past accumulation.
-    if let Some(w) = &opts.weights {
-        fit.deviance -= w.iter().map(|v| v.ln()).sum::<f64>();
-        // The correction is part of lme4's REMLcrit, so the criterion-scale
-        // loglik must be recomputed from the corrected deviance.
-        fit.loglik = super::common::lmm_loglik(fit.deviance, n, p);
-    }
-    fit
+    fit_lmm_into(&mut ws, n, p, opts, start)
 }
 /// Test-only forced-NoZ entry (mirror of forcing `fit_mle_sparse` directly):
 /// the NoZ↔Sparse cross-checks and timed sweeps must reach the dense kernel

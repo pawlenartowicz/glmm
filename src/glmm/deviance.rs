@@ -19,7 +19,9 @@ use crate::spec::Family;
 /// dispersion as `D/n` (`family::gamma_aic`), the sole route by which dispersion
 /// shifts glmer's β̂/τ̂. Non-convergence / Cholesky failure ⇒ `f64::INFINITY` (the
 /// module's failure surface, mirrors `lmm::reml_deviance`). `pirls_solve` returns
-/// `log|A|` off its converged factor, so there is no re-factor here.
+/// `log|L|` off its converged factor (L the Cholesky factor of A, so `log|A| =
+/// 2 log|L|`) — the caller below doubles it to get `log|A|`, so there is no
+/// re-factor here.
 /// The blocked branch requires `z_buf` pre-filled for this fit's `x`
 /// (`fill_z_f64`); the dense branch ignores `z_buf`/`m_buf`.
 #[allow(clippy::too_many_arguments)]
@@ -348,10 +350,8 @@ pub(crate) fn laplace_deviance(
 /// disjoint borrows `laplace_deviance` needs (z read; m/lam/a/etc. written) and
 /// calls it. Seeds the PIRLS conditional modes from û = 0 each call — UNLESS
 /// `ws.warm_seed_active`, in which case it seeds from the fixed shared `ws.u_seed`
-/// (the fitted mode û(γ̂), set by `fd_hessian_cov`). Either way the seed is a
-/// constant independent of evaluation order, so each `f(γ)` depends only on γ and
-/// the FD second differences stay valid — only a *chained* seed (eval k from eval
-/// k−1's mode) would make `f(γ)` order-dependent and corrupt them.
+/// (the fitted mode û(γ̂), set by `fd_hessian_cov`). Same fixed-seed FD-derivative
+/// invariant as `fd_hessian_cov` in se.rs — see there for the derivation.
 ///
 /// Caller must have filled `ws.z_buf` for this fit's `x` (blocked path) — `x` is
 /// constant across all FD perturbations, so fill it ONCE before the FD loop, not

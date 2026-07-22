@@ -461,7 +461,7 @@ def fit(
         ranef=np.asarray(r["ranef"], dtype=float),
         ranef_levels=np.asarray(r["ranef_levels"], dtype=int),
     )
-    # lme4 parity (boundary-fits follow-up spec Part B step 4): lme4's exact
+    # lme4 agreement (boundary-fits follow-up spec Part B step 4): lme4's exact
     # text, extended with the degenerate components. The R port emits the same
     # message (fastglmm.R) — change together.
     if res.singular:

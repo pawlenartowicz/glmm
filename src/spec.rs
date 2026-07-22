@@ -29,12 +29,14 @@ impl Sizing {
         }
     }
     /// Number of clusters when total row count is `n`: the fixed `n_clusters`
-    /// itself under `FixedClusters`, or `n / cluster_size` (floor) under
-    /// `FixedSize`.
+    /// itself under `FixedClusters`, or `n / cluster_size` rounded UP under
+    /// `FixedSize`. Rounding up is what makes this agree with
+    /// [`Sizing::cluster_of_row`]: off-grid `n` leaves a partial trailing cluster
+    /// whose rows still carry a real id, and that id must be in range.
     pub fn n_clusters_at(&self, n: usize) -> usize {
         match self {
             Sizing::FixedClusters { n_clusters } => (*n_clusters).max(1) as usize,
-            Sizing::FixedSize { cluster_size } => n / (*cluster_size).max(1) as usize,
+            Sizing::FixedSize { cluster_size } => n.div_ceil((*cluster_size).max(1) as usize),
         }
     }
     /// Cluster index owning row `i` (0-based row index into `x`/`y`). Under
@@ -99,7 +101,7 @@ pub enum Family {
     },
     /// Poisson count response → log-link GLM/GLMM. Variance `V(μ)=μ`, dispersion
     /// `φ≡1`. Deviance residual `dᵢ=2[yᵢ·ln(yᵢ/μᵢ)−(yᵢ−μᵢ)]`. Validated against R
-    /// `glm(family=poisson)` / `lme4::glmer(family=poisson)` (parity goldens
+    /// `glm(family=poisson)` / `lme4::glmer(family=poisson)` (validation goldens
     /// `grouseticks_glm`, `grouseticks`).
     Poisson {
         /// Link function — log only (canonical).
@@ -108,7 +110,7 @@ pub enum Family {
     /// Gamma response (`y>0`) → GLM/GLMM. Variance `V(μ)=μ²`. Dispersion `φ` is
     /// estimated post-fit as the Pearson moment estimator `φ̂=Σ rᵢ²/(n−p)`
     /// (`rᵢ=(yᵢ−μ̂ᵢ)/μ̂ᵢ`) and scales the SE by `√φ̂`. Validated against R
-    /// `glm(family=Gamma(link))` / `lme4::glmer(family=Gamma)` (parity goldens
+    /// `glm(family=Gamma(link))` / `lme4::glmer(family=Gamma)` (validation goldens
     /// `sim_gamma_*`).
     Gamma {
         /// Link function — [`GammaLink::Log`] (safe default) or `Inverse`. The
@@ -123,7 +125,7 @@ pub enum Family {
     /// [`ModelSpec`]): the MLE is start-independent, so a spec-supplied warm-start
     /// could only seed the optimizer without changing the converged θ̂. The fit
     /// threads θ̂ explicitly through the numeric stack instead. Validated against R
-    /// `MASS::glm.nb` / `lme4::glmer.nb` (parity goldens `sim_nb_*`).
+    /// `MASS::glm.nb` / `lme4::glmer.nb` (validation goldens `sim_nb_*`).
     NegativeBinomial {
         /// Link function — log only (`log(μ/(μ+θ))` canonical link not offered).
         link: NegBinomialLink,

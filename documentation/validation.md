@@ -26,8 +26,8 @@ range of random-effect shapes (intercept-only, correlated slopes, nested
 and crossed grouping, canonical and non-canonical links, dense and sparse
 routing). The exact dataset list and per-dataset model
 spec is the single source of truth in
-[`../parity/manifest.json`](../parity/manifest.json); a separate suite for
-prior (case) weights lives under [`../parity/weights/`](../parity/weights/).
+[`../validation/manifest.json`](../validation/manifest.json); prior (case)
+weights get their own manifest rungs (`tier: "weights"`, rungs 29-43).
 The Python and R packages are not compared against lme4/MixedModels.jl
 directly — they wrap the same Rust kernel, so they are gated against the
 Rust engine's own results at a round-off tolerance, confirming the wrapper
@@ -57,10 +57,10 @@ picking whichever reference happens to sit closer to `glmm`.
 
 ## Running it yourself
 
-From `parity/`, `./run.sh` fits `glmm` (Rust) and its Python and R ports
+From `validation/`, `./run.sh` fits `glmm` (Rust) and its Python and R ports
 and compares them against the existing reference results on disk — R and
 Julia are not refit, so this is the fast path for iterating on `glmm`
 itself. `./run.sh --oracles` refits all engines, including the R and Julia
 references, for when the oracle itself needs regenerating. See
-[`../parity/README.md`](../parity/README.md) for the full directory layout,
+[`../validation/README.md`](../validation/README.md) for the full directory layout,
 result schema, and running instructions.

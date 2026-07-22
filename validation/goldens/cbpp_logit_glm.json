@@ -1,0 +1,20 @@
+{
+  "name": "cbpp_logit_glm",
+  "engine": "stats::glm",
+  "engine_version": "R-4.5.3",
+  "kind": "glm",
+  "data": "cbpp",
+  "family": "binomial",
+  "link": "logit",
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "cbind(incidence, size - incidence) ~ 1 + period",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "period2", "period3", "period4"],
+  "estimates": {
+    "beta": [-1.26902348936715, -1.17076272514038, -1.30140533385642, -1.78227863534165],
+    "se": [0.144919762428695, 0.291467787718859, 0.312881171641315, 0.413056442968483],
+    "loglik": -99.0291994893634
+  }
+}

@@ -1,0 +1,106 @@
+name: pin-bands
+
+# Measures the Tier 1 pin bands on a second CPU.
+#
+# `PIN_REL_OLS` and `PIN_REL_ITER` (src/fit/common_tests.rs) are currently pure
+# margin: every pin in the crate reproduces BIT-EXACTLY across debug/release and
+# all four feature configs on the development machine, so the bands cover nothing
+# that was ever observed. They exist because `src/simd_transcendental.rs`
+# dispatches on CPU feature detection, and a runner with a different
+# microarchitecture can shift the last bit. This job is the second machine.
+#
+# NOT a gate. It is expected to "fail" every test it runs — that is the
+# mechanism. It rewrites both bands to 0.0 so no pin can pass, and every pin then
+# prints its own relative deviation, which is the number being collected.
+# `assert_pinned` reports the WORST element of each pin, not the first, so the
+# printed value is the spread and not an artifact of index order.
+#
+# Read the result like this:
+#   every reported rel is 0.00e0  -> CI is bit-exact too; both constants can
+#                                    tighten a long way. Record the CPU below.
+#   some rel is nonzero          -> that spread, plus margin, is the band, and
+#                                    the `lscpu` output goes in the constant's
+#                                    comment. `ubuntu-latest` is a heterogeneous
+#                                    pool, so an unattributed measurement cannot
+#                                    be re-checked later — which is why every leg
+#                                    prints its CPU.
+#
+# A pin that moves ONLY under `parallel` is not a band problem. RULE 1 requires
+# parallel results to stay bit-identical to serial, so that is a RULE 1 bug and
+# is fixed there, never absorbed into the tolerance.
+#
+# Manual trigger only: it burns eight runners and produces no pass/fail signal.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  measure:
+    name: measure (${{ matrix.features.name }}, ${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Match the CI test job: the dhat alloc gates assert exact counts and
+      # rayon jitter perturbs them.
+      RAYON_NUM_THREADS: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [debug, release]
+        features:
+          - { name: default, flags: "" }
+          - { name: loop_advanced, flags: "--features loop_advanced" }
+          - { name: parallel, flags: "--features parallel" }
+          - { name: no-default, flags: "--no-default-features" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: record the CPU this leg drew
+        # The measurement is meaningless without it: a spread attributed to no
+        # microarchitecture cannot be reproduced or challenged.
+        run: |
+          echo "::group::lscpu"
+          lscpu
+          echo "::endgroup::"
+          echo "model: $(lscpu | sed -n 's/^Model name: *//p')"
+          echo "flags: $(lscpu | sed -n 's/^Flags: *//p' | tr ' ' '\n' \
+            | grep -E '^(avx|avx2|avx512|fma|sse4|f16c|bmi)' | sort | tr '\n' ' ')"
+
+      - name: force both pin bands to zero
+        # Source rewrite rather than an env knob: the bands are `const`, and
+        # making them runtime-configurable would put measurement machinery in
+        # production test code for a job that runs by hand a few times a year.
+        # The edit is asserted rather than assumed — a silent no-op here would
+        # produce a green run that measured nothing.
+        run: |
+          sed -i 's/^pub(crate) const PIN_REL_OLS: f64 = .*/pub(crate) const PIN_REL_OLS: f64 = 0.0;/' src/fit/common_tests.rs
+          sed -i 's/^pub(crate) const PIN_REL_ITER: f64 = .*/pub(crate) const PIN_REL_ITER: f64 = 0.0;/' src/fit/common_tests.rs
+          grep -q 'PIN_REL_OLS: f64 = 0.0;' src/fit/common_tests.rs || { echo "::error::PIN_REL_OLS rewrite missed"; exit 1; }
+          grep -q 'PIN_REL_ITER: f64 = 0.0;' src/fit/common_tests.rs || { echo "::error::PIN_REL_ITER rewrite missed"; exit 1; }
+          grep -n 'PIN_REL_' src/fit/common_tests.rs
+
+      - name: run the pinned tests and collect every deviation
+        # `|| true`: the failures ARE the output. The summary below is what to
+        # read; the raw log holds the per-pin lines.
+        run: |
+          set -o pipefail
+          RUSTFLAGS="" cargo test ${{ matrix.features.flags }} \
+            ${{ matrix.profile == 'release' && '--release' || '' }} \
+            -- --test-threads=1 2>&1 | tee pins.log || true
+          echo "## ${{ matrix.features.name }} / ${{ matrix.profile }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "cpu: $(lscpu | sed -n 's/^Model name: *//p')" >> "$GITHUB_STEP_SUMMARY"
+          grep -oE '\(rel [0-9.]+e[-+]?[0-9]+, worst of [0-9]+\)' pins.log \
+            | sort -u >> "$GITHUB_STEP_SUMMARY" || echo "no pin deviations reported" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "---- distinct deviations on this leg ----"
+          grep -oE 'rel [0-9.]+e[-+]?[0-9]+' pins.log | sort -u || echo "none"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pins-${{ matrix.features.name }}-${{ matrix.profile }}
+          path: pins.log
