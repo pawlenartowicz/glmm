@@ -8,7 +8,7 @@ DATA = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
 
 
 def test_module_surface():
-    assert glmm.__all__ == ["fit", "Fit"]
+    assert glmm.__all__ == ["Fit", "fit"]
 
 
 def test_fit_signature_matches_spec():

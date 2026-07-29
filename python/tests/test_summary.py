@@ -7,28 +7,28 @@ import glmm
 
 
 def make_fit(**kw):
-    base = dict(
-        beta=np.array([2.0, -0.5]),
-        se=np.array([1.0, 0.25]),
-        vcov=np.array([[1.0, 0.0], [0.0, 0.0625]]),
-        tau2=np.array([]),
-        varcorr=[],
-        stddev_se=np.array([]),
-        aliased=np.array([False, False]),
-        dispersion=1.0,
-        converged=True,
-        singular=False,
-        names=["(Intercept)", "x"],
-        re_groups=[],
-        n_eval=0,
-        deviance=math.nan,
-        loglik=math.nan,
-        df=0,
-        reml=False,
-        fitted=np.array([]),
-        ranef=np.array([]),
-        ranef_levels=np.array([]),
-    )
+    base = {
+        "beta": np.array([2.0, -0.5]),
+        "se": np.array([1.0, 0.25]),
+        "vcov": np.array([[1.0, 0.0], [0.0, 0.0625]]),
+        "tau2": np.array([]),
+        "varcorr": [],
+        "stddev_se": np.array([]),
+        "aliased": np.array([False, False]),
+        "dispersion": 1.0,
+        "converged": True,
+        "singular": False,
+        "names": ["(Intercept)", "x"],
+        "re_groups": [],
+        "n_eval": 0,
+        "deviance": math.nan,
+        "loglik": math.nan,
+        "df": 0,
+        "reml": False,
+        "fitted": np.array([]),
+        "ranef": np.array([]),
+        "ranef_levels": np.array([]),
+    }
     base.update(kw)
     return glmm.Fit(**base)
 

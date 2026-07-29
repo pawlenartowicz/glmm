@@ -5,7 +5,6 @@ def test_faststats_alias_ships():
     # build_sdist job) — that path is what breaks if the include is wheel-scoped. See
     # the include comment in pyproject.toml. ModuleNotFoundError means it stopped matching.
     import faststats.glmm
-
     import glmm
 
     assert faststats.glmm is glmm

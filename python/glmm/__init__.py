@@ -21,7 +21,7 @@ import numpy as np
 
 from glmm import _native
 
-__all__ = ["fit", "Fit"]
+__all__ = ["Fit", "fit"]
 
 
 # Family table — mirrors the API spec §3.2 and GLMM/src/family.rs.

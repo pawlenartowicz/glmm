@@ -149,7 +149,9 @@ jobs:
       - name: Install the built wheel (non-editable, catches packaging mistakes)
         run: pip install --find-links python/dist glmm
       - name: Install test + lint deps
-        run: pip install pytest ruff
+        # ruff pinned so a new release's rule/formatter changes can't break CI
+        # mid-release (0.16.0 did exactly that); bump deliberately.
+        run: pip install pytest ruff==0.16.0
       - name: pytest against the installed wheel, run outside the source tree
         run: |
           cd "$RUNNER_TEMP"
