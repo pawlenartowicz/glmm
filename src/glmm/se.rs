@@ -10,6 +10,7 @@ use super::{FdHessianStatus, FD_STEP_REL};
 /// field borrows are legal). `coords`/`deltas` are ≤ 2 long (a diagonal or a
 /// mixed partial). Leaves `ws.params` perturbed — callers restore from
 /// `ws.fd_saved` between the directional evals via this same write.
+#[allow(clippy::too_many_arguments)]
 fn fd_eval(
     ws: &mut GlmmWorkspace,
     coords: &[usize],
@@ -17,6 +18,7 @@ fn fd_eval(
     x: MatRef<f64>,
     y: &[f64],
     cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
     n: usize,
 ) -> f64 {
     let m = ws.fd_saved.len();
@@ -29,7 +31,7 @@ fn fd_eval(
     // caller's β, so β must NOT move under these directional evals — a Profile step
     // here would make each `f(γ)` depend on the profiled β̂(γ) and corrupt the
     // second differences.
-    laplace_deviance_at(ws, x, y, cluster_ids, n)
+    laplace_deviance_at(ws, x, y, cluster_ids, extra_ids, n)
 }
 
 /// Central second difference of coordinate `k` at step `s`: `(f(+s) − 2·f0 +
@@ -79,10 +81,12 @@ fn second_diff(
     x: MatRef<f64>,
     y: &[f64],
     cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
     n: usize,
 ) -> f64 {
-    let mut eval =
-        |coords: &[usize], deltas: &[f64]| fd_eval(ws, coords, deltas, x, y, cluster_ids, n);
+    let mut eval = |coords: &[usize], deltas: &[f64]| {
+        fd_eval(ws, coords, deltas, x, y, cluster_ids, extra_ids, n)
+    };
     fd_second_diff(&mut eval, k, s, f0)
 }
 
@@ -97,10 +101,12 @@ fn mixed_diff(
     x: MatRef<f64>,
     y: &[f64],
     cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
     n: usize,
 ) -> f64 {
-    let mut eval =
-        |coords: &[usize], deltas: &[f64]| fd_eval(ws, coords, deltas, x, y, cluster_ids, n);
+    let mut eval = |coords: &[usize], deltas: &[f64]| {
+        fd_eval(ws, coords, deltas, x, y, cluster_ids, extra_ids, n)
+    };
     fd_mixed_diff(&mut eval, i, j, si, sj)
 }
 
@@ -191,11 +197,13 @@ pub(crate) fn rx_cov_into(
 /// `m = ws.params.len() = n_theta + p`; the β block is rows/cols `n_theta..m`.
 /// Precondition: `ws` is at a CONVERGED fit and `ws.z_buf`-eligible scratch is
 /// valid for (x, ids, n) (the deviance evals re-solve PIRLS).
+#[allow(clippy::too_many_arguments)]
 pub fn fd_hessian_cov(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
     y: &[f64],
     cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
     p: usize,
     n: usize,
     out_cov: &mut Mat<f64>,
@@ -209,12 +217,15 @@ pub fn fd_hessian_cov(
     // Reset on every exit alongside `warm_seed_active`.
     ws.pirls_tol_override = Some(super::PIRLS_TOL_REL_FD);
 
-    // Snapshot γ̂ and the per-coordinate FD step; fill z_buf once (blocked path).
+    // Snapshot γ̂ and the per-coordinate FD step; fill z_buf once (blocked AND
+    // structured paths — `build_packed_m`'s primary-core reduction reads it the
+    // same way `pirls_solve_blocked`'s does; the dense-fallback path skips it,
+    // matching `fit_glmm`'s hoist).
     ws.fd_saved[..m].copy_from_slice(&ws.params[..m]);
     for k in 0..m {
         ws.fd_steps[k] = FD_STEP_REL * ws.fd_saved[k].abs().max(1.0);
     }
-    if ws.groupings.extra_offsets.is_empty() {
+    if ws.groupings.extra_offsets.is_empty() || ws.groupings.structured_extras_eligible() {
         let GlmmWorkspace {
             groupings, z_buf, ..
         } = &mut *ws;
@@ -241,7 +252,7 @@ pub fn fd_hessian_cov(
     // repopulate W̃/Λ̂/block factors at γ̂, then invert the β information.
     macro_rules! fallback {
         () => {{
-            let _ = fd_eval(ws, &[], &[], x, y, cluster_ids, n);
+            let _ = fd_eval(ws, &[], &[], x, y, cluster_ids, extra_ids, n);
             let ok = rx_cov_into(ws, x, cluster_ids, p, n, out_cov);
             debug_assert!(ok, "RX fallback Schur must be PD at a converged fit");
             // The fallback reports an RX vcov, so it carries Gamma's σ̂² like the
@@ -318,7 +329,7 @@ pub fn fd_hessian_cov(
     ws.u_seed[..kk].copy_from_slice(&ws.u[..kk]);
     ws.warm_seed_active = true;
 
-    let f0 = fd_eval(ws, &[], &[], x, y, cluster_ids, n);
+    let f0 = fd_eval(ws, &[], &[], x, y, cluster_ids, extra_ids, n);
     if !f0.is_finite() {
         fallback!();
     }
@@ -344,7 +355,17 @@ pub fn fd_hessian_cov(
                     || fd_worker_ws(ws_ro, n),
                     |wws, &(i, j)| {
                         let h = if i == j {
-                            second_diff(wws, i, ws_ro.fd_steps[i], f0, x, y, cluster_ids, n)
+                            second_diff(
+                                wws,
+                                i,
+                                ws_ro.fd_steps[i],
+                                f0,
+                                x,
+                                y,
+                                cluster_ids,
+                                extra_ids,
+                                n,
+                            )
                         } else {
                             mixed_diff(
                                 wws,
@@ -355,6 +376,7 @@ pub fn fd_hessian_cov(
                                 x,
                                 y,
                                 cluster_ids,
+                                extra_ids,
                                 n,
                             )
                         };
@@ -378,14 +400,14 @@ pub fn fd_hessian_cov(
     } else {
         for i in 0..m {
             let hi = ws.fd_steps[i];
-            let hii = second_diff(ws, i, hi, f0, x, y, cluster_ids, n);
+            let hii = second_diff(ws, i, hi, f0, x, y, cluster_ids, extra_ids, n);
             if !hii.is_finite() {
                 fallback!();
             }
             ws.hess_scratch[(i, i)] = hii;
             for j in (i + 1)..m {
                 let hj = ws.fd_steps[j];
-                let hij = mixed_diff(ws, i, j, hi, hj, x, y, cluster_ids, n);
+                let hij = mixed_diff(ws, i, j, hi, hj, x, y, cluster_ids, extra_ids, n);
                 if !hij.is_finite() {
                     fallback!();
                 }
@@ -422,7 +444,7 @@ pub fn fd_hessian_cov(
     // mu_hat) — off the perturbed state Gamma's σ̂² was ~2e-3 high (rung-23
     // stddev gate). Same central re-eval the RX fallback uses; the empty
     // perturbation evaluates exactly at γ̂ (fd_saved).
-    let _ = fd_eval(ws, &[], &[], x, y, cluster_ids, n);
+    let _ = fd_eval(ws, &[], &[], x, y, cluster_ids, extra_ids, n);
 
     ws.params[..m].copy_from_slice(&ws.fd_saved[..m]);
     // That re-eval lands on û(γ̂) again but at the FD tight tol, so it is a hair

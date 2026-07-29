@@ -33,12 +33,18 @@ pub(crate) struct OlsWorkspace {
     panel_x: Vec<f64>,
     panel_y: Vec<f64>,
     // √wᵢ-scaled design / offset-shifted-and-scaled response, n_max-sized.
+    // `scaled_x` is read only on the weighted branch (`:91-99` below); gated
+    // 0×0 when the build is unweighted (`has_weights` is frozen at build, so
+    // the workspace knows at construction whether the buffer can ever be
+    // read). 0×0 rather than `.max(1)`, deliberately: a read on a route that
+    // is supposed to have none must panic on the bounds check, not silently
+    // return a zero.
     scaled_x: Mat<f64>,
     scaled_y: Vec<f64>,
 }
 
 impl OlsWorkspace {
-    pub(crate) fn new(n_max: usize, p: usize, t: usize) -> Self {
+    pub(crate) fn new(n_max: usize, p: usize, t: usize, has_weights: bool) -> Self {
         let n1 = n_max.max(1);
         let p1 = p.max(1); // guard zero-column degenerate call
         let t1 = t.max(1);
@@ -55,7 +61,11 @@ impl OlsWorkspace {
             // panel buffers: PANEL_ROWS * p1 is always sufficient (see PANEL_ROWS).
             panel_x: vec![0.0f64; PANEL_ROWS * p1],
             panel_y: vec![0.0f64; PANEL_ROWS],
-            scaled_x: Mat::<f64>::zeros(n1, p1),
+            scaled_x: if has_weights {
+                Mat::<f64>::zeros(n1, p1)
+            } else {
+                Mat::<f64>::zeros(0, 0)
+            },
             scaled_y: vec![0.0f64; n1],
         }
     }
@@ -157,7 +167,7 @@ pub(crate) fn fit_ols_prebuilt<'a>(
 /// `fit_ols_prebuilt`/`ols_view_to_fit`.
 #[cfg(test)]
 pub(super) fn fit_ols(x: &[f64], y: &[f64], n: usize, p: usize, opts: &FitOptions) -> Fit {
-    let mut ws = OlsWorkspace::new(n, p, opts.target_indices.len());
+    let mut ws = OlsWorkspace::new(n, p, opts.target_indices.len(), opts.weights.is_some());
     let x_mat = super::common::to_col_major(x, n, p);
     let view = fit_ols_prebuilt(&mut ws, x_mat.as_ref().subrows(0, n), y, n, p, opts);
     ols_view_to_fit(&view, x, y, n, p, opts)

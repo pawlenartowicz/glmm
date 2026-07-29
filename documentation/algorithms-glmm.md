@@ -329,11 +329,15 @@ rather than handing it over.
 
 All GLMM solver scratch lives in one `GlmmWorkspace`, allocated **once per
 (spec, max_n) shape** — its buffers depend only on `(groupings, family, p,
-max_n, nAGQ)`, never on the data values. Every buffer is sized to `max_n` rows
-and `k` RE columns (with `n_theta` and `p` fixed by the spec), so a single
-workspace is reused across every BOBYQA evaluation and PIRLS iteration of one
-fit with no reallocation; the warm path is zero-alloc (BOBYQA is constructed
-once). The shape-compatibility rule is a **contract, not a runtime check**: the
+max_n, nAGQ)`, never on the data values. Buffers are sized to `max_n` rows
+and `k` RE columns (with `n_theta` and `p` fixed by the spec), with one
+route-dependent exception: the dense random-effects matrices (`z`, `m`, `wm`
+and their `k × k` products `a`, `a_chol`) exist only on the dense fallback
+route — the blocked and structured routes never read them and get 0×0 stubs,
+so the workspace's footprint stays cluster-sized rather than data-sized on
+the common shapes. A single workspace is reused across every BOBYQA
+evaluation and PIRLS iteration of one fit with no reallocation; the warm path
+is zero-alloc (BOBYQA is constructed once). The shape-compatibility rule is a **contract, not a runtime check**: the
 buffers are fixed at construction, and nothing in the crate detects a mismatch
 — a `loop_advanced` caller must construct a fresh workspace whenever the row
 count would exceed `max_n`, `p` changes, or the RE topology changes (any shift
@@ -574,6 +578,10 @@ In practice:
   Mixed-Effects Models Using lme4. *Journal of Statistical Software*, 67(1),
   1–48. — the PIRLS/Laplace `devfun`, the θ-then-joint two-stage structure
   (§3), and the `pwrssUpdate` step-halving discipline.
+- Li, X. & Signorelli, M. (2026). A Comparison of R Packages for Estimating
+  Generalized Linear Mixed Models. *arXiv:2606.15933v1*. — the accuracy
+  study `validation/campaigns/monte_carlo/` mirrors: the DGP, cell grid, and
+  the published bias/RMSE baselines it validates `glmm` against.
 - Liu, Q. & Pierce, D. A. (1994). A note on Gauss–Hermite quadrature.
   *Biometrika*, 81(3), 624–629. — the adaptive-GH centering/reweighting
   `agq_deviance` implements.

@@ -54,9 +54,16 @@ pub struct GlmmWorkspace {
     pub p: usize,
     /// count of variance-component (θ) parameters (groupings.n_theta())
     pub n_theta: usize,
-    /// max_n × k dense RE design (built per (spec, N) by `build_z`)
+    /// max_n × k dense RE design (built per (spec, N) by `build_z`). Allocated
+    /// only on the dense fallback route (extras present and the core oversized,
+    /// `!structured_extras_eligible()`) — 0×0 on the blocked AND structured
+    /// routes: the structured route packs its nonzeros straight from the ids
+    /// (`build_packed_m`) and never materializes the dense design.
     pub z: Mat<f64>,
-    /// max_n × k = ZΛ (rebuilt per BOBYQA eval)
+    /// max_n × k = ZΛ (rebuilt per BOBYQA eval). Allocated only on the dense
+    /// fallback route (extras present and the core oversized,
+    /// `!structured_extras_eligible()`) — 0×0 on the blocked and structured
+    /// routes, which never read it (`deviance.rs:194`).
     pub m: Mat<f64>,
     /// Joint (θ,β) BOBYQA solver, dimension `n_theta + p`.
     pub solver: Bobyqa, // sized n_theta + p
@@ -122,18 +129,26 @@ pub struct GlmmWorkspace {
     pub u_seed: Vec<f64>,
     /// k × k  M'WM + I. `dense_schur_fill` (se.rs) re-factors THIS field after a
     /// converged Fixed-mode PIRLS solve, so `pirls_solve` must leave it holding
-    /// the raw symmetric A — never the in-place Cholesky factor.
+    /// the raw symmetric A — never the in-place Cholesky factor. Allocated
+    /// only on the dense fallback route — 0×0 on the blocked and structured
+    /// routes, which never read it (`deviance.rs:194`).
     pub a: Mat<f64>,
     /// Copy-then-factor target for `a`'s Cholesky (k×k): `pirls_solve` copies
     /// `a`'s lower triangle in here (mirroring `.llt(Side::Lower)`'s internal
     /// copy) and runs `cholesky_in_place` on THIS buffer, leaving `a` itself
-    /// untouched for `dense_schur_fill` to re-read.
+    /// untouched for `dense_schur_fill` to re-read. Allocated only on the
+    /// dense fallback route — 0×0 on the blocked and structured routes, which
+    /// never read it (`deviance.rs:194`).
     pub a_chol: Mat<f64>,
     /// Scratch for `a_chol`'s in-place `cholesky_in_place` (k×k, θ-independent
     /// size) — avoids the per-PIRLS-iteration `.llt(Side::Lower)` allocation on
-    /// the dense `pirls_solve` hot path.
+    /// the dense `pirls_solve` hot path. Allocated only on the dense fallback
+    /// route — 0×0 on the blocked and structured routes, which never read it
+    /// (`deviance.rs:194`).
     pub a_llt_mem: MemBuffer,
-    /// max_n × k = W∘M scratch for the dense-Gram GEMM (rebuilt per PIRLS iteration)
+    /// max_n × k = W∘M scratch for the dense-Gram GEMM (rebuilt per PIRLS
+    /// iteration). Allocated only on the dense fallback route — 0×0 on the
+    /// blocked and structured routes, which never read it (`deviance.rs:194`).
     pub wm: Mat<f64>,
     /// max_n × p = W∘X scratch for the X'WX GEMM (rebuilt per PIRLS iteration,
     /// all three pirls variants and the three se.rs schur-fill twins)
@@ -323,6 +338,13 @@ impl GlmmWorkspace {
         let q_core = q + groupings.nested_per_parent;
         let e_crossed = groupings.k_crossed();
 
+        // Which of `laplace_deviance`'s three routes this shape takes is fixed by `groupings`
+        // alone (deviance.rs:194) — decided here so the n×k buffers exist only on the route
+        // that reads them. Sized 0×0 (not `.max(1)`) on the routes that don't: a missed read
+        // must panic on the bounds check, not silently return a zero.
+        let has_extras = !groupings.extra_offsets.is_empty();
+        let needs_dense = has_extras && !groupings.structured_extras_eligible();
+
         // Bounds: θ part from blind_theta_and_bounds; β part = [−BETA_BOX, BETA_BOX].
         let (theta0, mut lower, mut upper) = groupings.blind_theta_and_bounds();
         let mut params = theta0;
@@ -396,8 +418,16 @@ impl GlmmWorkspace {
             k,
             p,
             n_theta,
-            z: Mat::zeros(max_n, k.max(1)),
-            m: Mat::zeros(max_n, k.max(1)),
+            z: if needs_dense {
+                Mat::zeros(max_n, k.max(1))
+            } else {
+                Mat::zeros(0, 0)
+            },
+            m: if needs_dense {
+                Mat::zeros(max_n, k.max(1))
+            } else {
+                Mat::zeros(0, 0)
+            },
             solver: Bobyqa::new(n_theta + p, config)
                 .expect("BOBYQA config constants are valid by construction"),
             params,
@@ -463,14 +493,26 @@ impl GlmmWorkspace {
             u: vec![0.0; k.max(1)],
             u_prev: vec![0.0; k.max(1)],
             u_seed: vec![0.0; k.max(1)],
-            a: Mat::zeros(k.max(1), k.max(1)),
-            a_chol: Mat::zeros(k.max(1), k.max(1)),
+            a: if needs_dense {
+                Mat::zeros(k.max(1), k.max(1))
+            } else {
+                Mat::zeros(0, 0)
+            },
+            a_chol: if needs_dense {
+                Mat::zeros(k.max(1), k.max(1))
+            } else {
+                Mat::zeros(0, 0)
+            },
             a_llt_mem: MemBuffer::new(cholesky_in_place_scratch::<f64>(
-                k.max(1),
+                if needs_dense { k.max(1) } else { 1 },
                 Par::Seq,
                 Spec::default(),
             )),
-            wm: Mat::zeros(max_n, k.max(1)),
+            wm: if needs_dense {
+                Mat::zeros(max_n, k.max(1))
+            } else {
+                Mat::zeros(0, 0)
+            },
             wx: Mat::zeros(max_n, p),
             a_rhs: vec![0.0; k.max(1)],
             a_blocks: vec![0.0; (q * q * n_primary).max(1)],
@@ -520,6 +562,30 @@ impl GlmmWorkspace {
             pirls_tol_override: None,
             offset: None,
         }
+    }
+
+    /// Test-only: materialize the six dense buffers (`z`, `m`, `wm`, `a`, `a_chol`,
+    /// `a_llt_mem`) at full size regardless of the route `from_groupings` picked.
+    /// Some tests deliberately drive the dense kernel (`apply_lambda`/`pirls_solve`)
+    /// directly against a workspace built for a blocked or structured shape, to
+    /// assert the fast path agrees with the dense one — that assertion needs the
+    /// dense buffers to exist even though production never allocates them off the
+    /// dense route. `max_n` is read back from `eta` (always allocated at full size,
+    /// on every route).
+    #[cfg(test)]
+    pub(crate) fn ensure_dense_buffers(&mut self) {
+        let max_n = self.eta.len();
+        let k = self.k.max(1);
+        self.z = Mat::zeros(max_n, k);
+        self.m = Mat::zeros(max_n, k);
+        self.wm = Mat::zeros(max_n, k);
+        self.a = Mat::zeros(k, k);
+        self.a_chol = Mat::zeros(k, k);
+        self.a_llt_mem = MemBuffer::new(cholesky_in_place_scratch::<f64>(
+            k,
+            Par::Seq,
+            Spec::default(),
+        ));
     }
 }
 
@@ -814,8 +880,10 @@ impl StructuredSchur {
 /// indicator columns at its ABSOLUTE `extra_offsets[e]` (already includes the
 /// primary block width — do not add it again). `slope_cols` index `x`.
 ///
-/// Builds the GLMM design-`Z` (`ws.z`) for the dense-extras path; the
-/// block-diagonal / structured fits reconstruct `mᵢ` per row instead.
+/// Builds the GLMM design-`Z` (`ws.z`) for the dense-fallback path only; the
+/// block-diagonal (no-extras) and structured fits both reconstruct `mᵢ` per
+/// row from the ids instead and never read `ws.z` (0×0 there, so this returns
+/// immediately).
 pub fn build_z(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
@@ -823,6 +891,12 @@ pub fn build_z(
     extra_ids: &[Vec<u32>],
     n: usize,
 ) {
+    // Sized 0×0 by `from_groupings` on the no-extras blocked route (nothing ever
+    // reads it there) — the constructor is the single place that decides this,
+    // so a route change there is all this early return needs to track.
+    if ws.z.ncols() == 0 {
+        return;
+    }
     let g = &ws.groupings;
     let q = g.primary_q;
     for c in 0..ws.k {
@@ -930,21 +1004,29 @@ pub(crate) fn apply_lambda(
 /// which it replaces on this path (`apply_lambda` writes the full dense `n×k`
 /// every eval; this writes only the `q_core` core + ≤`G` crossed nonzeros each
 /// row reads). `m_core_buf[i·q_core+local]` = the `Λ`-scaled core value
-/// `M[(i, core_col(f,local))]` for row `i`'s primary cluster `f = cluster_ids[i]`
-/// (primary `local<q`: `Σ_{r≥local} z_r·lam[r·q+local]`, mirroring `apply_lambda`'s
-/// core write and the blocked-path fill; nested `local≥q`: the nested indicator
-/// scaled by its θ). For each crossed grouping with `θ≠0`, the row's single active
-/// level contributes one nonzero: `cross_val = z·θ`, `cross_col = b` (the crossed
+/// `M[(i, core_col(f,local))]` for row `i`'s primary cluster (primary `local<q`:
+/// `Σ_{r≥local} z_r·lam[r·q+local]`, mirroring `apply_lambda`'s core write and
+/// the blocked-path fill; nested `local≥q`: the nested indicator scaled by its
+/// θ). For each crossed grouping with `θ≠0`, the row's single active level
+/// contributes one nonzero: `cross_val = z·θ`, `cross_col = b` (the crossed
 /// block-local index, `0..e`), with `n_cross[i]` the count (`≤ G`). A θ-pinned
-/// (θ=0) grouping is skipped, mirroring `apply_lambda`'s `z·θ=0` ⇒ no nonzero. The
-/// crossed-column scan over `z` is O(n·e) but runs ONCE per eval; the per-PIRLS-
-/// iteration passes then read O(n·G). Reads `z` (the dense design `build_z` left),
-/// `lam` (filled here via `primary_lambda`), `params`, and `cluster_ids`.
+/// (θ=0) grouping is skipped, mirroring `apply_lambda`'s `z·θ=0` ⇒ no nonzero.
+/// Packs M's nonzeros from the grouping ids and `z_buf`; the dense `z` is
+/// never materialized on this route (it is 0×0 there — see
+/// `GlmmWorkspace::z`'s doc). Every value it used to read
+/// back out of `z` is reconstructed straight from what `build_z` would have
+/// written there: the primary core from `z_buf` (the pre-widened slope buffer
+/// `fill_z_f64` fills, same source `build_z` widens from `x`), the nested
+/// indicator and the crossed level from `extra_ids` (the same slice `build_z`
+/// takes) directly — no scan needed for either. Reads `z_buf`, `extra_ids`,
+/// `cluster_ids` (only for the nested global→local id conversion — see below),
+/// `lam` (filled here via `primary_lambda`), and `params`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_packed_m(
     g: &LmmGroupings,
     params: &[f64],
-    z: MatRef<f64>,
+    z_buf: &[f64],
+    extra_ids: &[Vec<u32>],
     lam: &mut [f64],
     cluster_ids: &[u32],
     m_core_buf: &mut [f64],
@@ -954,11 +1036,9 @@ pub(crate) fn build_packed_m(
     n: usize,
 ) {
     let q = g.primary_q;
-    let s = g.n_primary;
     let np = g.nested_per_parent;
     let qc = q + np;
-    let prim_width = q * s;
-    let k_family = qc * s;
+    let k_family = qc * g.n_primary;
     let base_theta = q * (q + 1) / 2;
     let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
     // Intercept-only extras on the GLMM structured path (see `apply_lambda`;
@@ -966,26 +1046,69 @@ pub(crate) fn build_packed_m(
     debug_assert!(!g.extra_slopes_any);
     crate::lmm::primary_lambda(&params[..g.n_theta()], q, lam);
     let theta_nested = g.nested.map(|nf| params[nf.vech_start]).unwrap_or(0.0);
+    // Declaration index into `extra_offsets`/`extra_ids` for the nested factor;
+    // `None` when there is no nested grouping (`np == 0`, the loop below never
+    // reads it then).
+    let nested_decl = g.nested.map(|nf| nf.vech_start - base_theta);
     for i in 0..n {
         let f = cluster_ids[i] as usize;
-        // Core primary block: same `Σ_{r≥c} z_r·lam[r·q+c]` reduction `apply_lambda`
-        // writes at M[(i, f·q+c)], packed to the local layout the passes read.
+        // Core primary block: the identical `Σ_{r≥c} z_r·lam[r·q+c]` reduction
+        // that `pirls.rs`'s per-solve M fill runs (pirls.rs:617-630, whose own
+        // comment records it as bit-identical to the z-sourced form) — z_r is
+        // 1.0 at r==0 (the intercept `build_z` always writes) or the
+        // pre-widened slope value `z_buf[i·(q−1)+(r−1)]` otherwise (the same
+        // `x` column `build_z` would have widened into the row's `z` block).
         for c in 0..q {
             let mut acc = 0.0;
             for r in c..q {
-                acc += z[(i, f * q + r)] * lam[r * q + c];
+                let zr = if r == 0 {
+                    1.0
+                } else {
+                    z_buf[i * (q - 1) + (r - 1)]
+                };
+                acc += zr * lam[r * q + c];
             }
             m_core_buf[i * qc + c] = acc;
         }
-        // Core nested children of parent f: the indicator scaled by θ_nested (one of
-        // the np slots is 1, the rest 0 — kept as written zeros so the passes sum a
-        // contiguous q_core slice).
-        for j in 0..np {
-            let col = prim_width + f * np + j;
-            m_core_buf[i * qc + q + j] = z[(i, col)] * theta_nested;
+        // Core nested children of parent f: `extra_ids` stores the nested id
+        // GLOBAL (dense over all parents — see `GroupIds`'s doc), while the
+        // packed core slots are LOCAL to this row's own parent block, so the
+        // global id needs `f`'s own `f·np` prefix subtracted back off before
+        // it can be compared against the local `j`. `build_z` wrote a 1.0
+        // indicator at the row's own (global) nested id and 0.0 at every other
+        // slot, so the packed value is θ_nested at that one local `j` and
+        // `0.0 · theta_nested` everywhere else — kept as the multiply, not a
+        // bare `0.0` literal, so a transient negative θ (an FD-Hessian
+        // perturbation step, or an off-optimum BOBYQA trial — θ is only
+        // guaranteed ≥ 0 at the pinned post-fit point, not at every eval)
+        // still lands on the same `-0.0` the z-sourced form would have.
+        if np > 0 {
+            let global_id = extra_ids[nested_decl.expect("np > 0 ⇒ g.nested is Some")][i] as usize;
+            // Before the ids-based rewrite, a malformed id panicked on the z
+            // bounds check in every build profile; these two asserts keep at
+            // least the debug-profile tripwire now that `z` is never read here.
+            debug_assert!(
+                global_id >= f * np,
+                "row {i}: nested global id {global_id} underflows parent {f}'s block (f*np={})",
+                f * np
+            );
+            let local_id = global_id - f * np;
+            debug_assert!(
+                local_id < np,
+                "row {i}: nested local id {local_id} out of range (np={np})"
+            );
+            for j in 0..np {
+                m_core_buf[i * qc + q + j] = if j == local_id {
+                    theta_nested
+                } else {
+                    0.0 * theta_nested
+                };
+            }
         }
         // Crossed: one nonzero per crossed grouping (its single active level), θ-pinned
-        // groupings skipped.
+        // groupings skipped. `build_z` wrote that level's one 1.0 at column
+        // `off + extra_ids[e][i]`, so the former linear scan for the first
+        // nonzero collapses to a direct index — no scan, no `z` read.
         let mut cnt = 0usize;
         for cf in &g.crossed {
             let theta = params[cf.vech_start];
@@ -993,17 +1116,22 @@ pub(crate) fn build_packed_m(
                 continue;
             }
             // q_g==1 here (see debug_assert above), so vech_start − base_theta is
-            // this factor's declaration index into extra_offsets.
-            let off = g.extra_offsets[cf.vech_start - base_theta];
-            for col in off..off + cf.n_levels {
-                let zv = z[(i, col)];
-                if zv != 0.0 {
-                    cross_col[i * g_cap + cnt] = (col - k_family) as u32;
-                    cross_val[i * g_cap + cnt] = zv * theta;
-                    cnt += 1;
-                    break;
-                }
-            }
+            // this factor's declaration index into extra_offsets/extra_ids.
+            let e = cf.vech_start - base_theta;
+            // Same tripwire as the nested branch above: before the ids-based
+            // rewrite a malformed id panicked on the z bounds check in every
+            // build profile; this keeps at least the debug-profile check.
+            debug_assert!(
+                (extra_ids[e][i] as usize) < cf.n_levels,
+                "row {i}: crossed id {} out of range (n_levels={})",
+                extra_ids[e][i],
+                cf.n_levels
+            );
+            let off = g.extra_offsets[e];
+            let col = off + extra_ids[e][i] as usize;
+            cross_col[i * g_cap + cnt] = (col - k_family) as u32;
+            cross_val[i * g_cap + cnt] = theta; // z·θ where z ≡ 1.0 exactly
+            cnt += 1;
         }
         n_cross[i] = cnt as u8;
     }

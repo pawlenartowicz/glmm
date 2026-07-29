@@ -9,24 +9,31 @@ use crate::lmm::{fit_lmm, LmmFit, LmmGroupings, LmmWorkspace};
 #[cfg(test)]
 use crate::{ModelSpec, StartValues};
 
-use super::common::{
-    assemble_varcorr, fill_se_by_predictor, nan_vcov, to_col_major, vcov_from_chol,
-};
+use super::common::{assemble_varcorr, fill_se_by_predictor, nan_vcov, vcov_from_chol};
+// Used only by the test-only `fit_mle` baseline, which builds its own throwaway
+// `Mat` — the stable core reaches the LMM path via `accumulate_lmm_rows`, which
+// takes a caller-filled `x_mat` directly.
+#[cfg(test)]
+use super::common::to_col_major;
 use super::{Fit, FitOptions};
 
 // ---------------------------------------------------------------------------
 // LMM dispatch (Estimator::Mle)
 // ---------------------------------------------------------------------------
 
-/// Converts row-major `x` into the workspace's column-major buffer and
-/// accumulates the θ-independent sufficient statistics (reset + add_rows_multi).
-/// Single-sourced across `fit_mle` and `with_lmm_objective`'s dense arm — both
-/// were byte-identical copies of this block, differing only in `weights` and
-/// whether the guard was written out at the call site.
-#[allow(clippy::too_many_arguments)] // marshals the kernel's (x, y, n, p, ids…) surface
+/// Accumulates the θ-independent sufficient statistics (reset + add_rows_multi)
+/// from an already-column-major `x_mat`. Single-sourced across `fit_mle` and
+/// `with_lmm_objective`'s dense arm — both were byte-identical copies of this
+/// block, differing only in `weights` and whether the guard was written out at
+/// the call site. Takes `x_mat` rather than row-major `x` so the `fit_on` hot
+/// path can fill a build-once `n_max`-sized buffer and pass a `subrows(0, n)`
+/// view in, instead of allocating a fresh `Mat` every call; the three other
+/// callers (`fit_mle`, `build_lmm_seam_ws`, `refit_lmm`) each build their own
+/// throwaway `Mat` via `to_col_major` at the call site.
+#[allow(clippy::too_many_arguments)] // marshals the kernel's (x_mat, y, n, p, ids…) surface
 pub(super) fn accumulate_lmm_rows(
     ws: &mut LmmWorkspace,
-    x: &[f64],
+    x_mat: faer::MatRef<'_, f64>,
     y: &[f64],
     n: usize,
     p: usize,
@@ -34,18 +41,10 @@ pub(super) fn accumulate_lmm_rows(
     extra_ids: &[Vec<u32>],
     weights: Option<&[f64]>,
 ) {
-    // --- convert row-major f64 input to column-major f64 faer matrix ---
-    let x_mat = to_col_major(x, n, p);
-
     ws.suff.reset();
     if n > 0 && p > 0 {
-        ws.suff.add_rows_multi(
-            x_mat.as_ref().subrows(0, n),
-            y,
-            cluster_ids,
-            extra_ids,
-            weights,
-        );
+        ws.suff
+            .add_rows_multi(x_mat, y, cluster_ids, extra_ids, weights);
     }
 }
 
@@ -302,9 +301,10 @@ pub(super) fn fit_mle(
         }
         None => y,
     };
+    let x_mat = to_col_major(x, n, p);
     accumulate_lmm_rows(
         &mut ws,
-        x,
+        x_mat.as_ref().subrows(0, n),
         y_eff,
         n,
         p,

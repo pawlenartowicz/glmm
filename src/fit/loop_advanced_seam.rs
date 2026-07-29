@@ -116,7 +116,17 @@ pub fn build_lmm_seam_ws(
         Solver::NoZ => {
             let mut ws =
                 LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &slope_cols, &extra_slope_cols);
-            accumulate_lmm_rows(&mut ws, x, y, n, p, &ids.primary, &ids.extra, None);
+            let x_mat = super::common::to_col_major(x, n, p);
+            accumulate_lmm_rows(
+                &mut ws,
+                x_mat.as_ref().subrows(0, n),
+                y,
+                n,
+                p,
+                &ids.primary,
+                &ids.extra,
+                None,
+            );
             let LmmWorkspace { suff, mut fit, .. } = ws;
             crate::lmm::precompute_balanced_collapse(&suff, &mut fit);
             let g = suff.groupings.clone();
@@ -430,9 +440,10 @@ pub fn refit_lmm(
         }
         None => y,
     };
+    let x_mat = super::common::to_col_major(x, n, p);
     accumulate_lmm_rows(
         ws,
-        x,
+        x_mat.as_ref().subrows(0, n),
         y_eff,
         n,
         p,

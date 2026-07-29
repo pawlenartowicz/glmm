@@ -8,6 +8,53 @@ shares these entries; Python-specific notes are called out where they differ.
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-07-29
+
+An allocation release. Nothing moves an answer and nothing on the public
+surface changes shape: the full validation manifest refits bit-identically
+before and after every change. Two changes — the dense GLMM workspace stops
+allocating large matrices its common routes never read, and the
+`loop_advanced` build-once/fit-many tier stops allocating per draw — plus the
+memory harness that measured them.
+
+### Changed
+
+- **The dense GLMM `Z` matrices are allocated only on the route that reads
+  them.** The dense GLMM workspace allocated three `n × k_total` matrices
+  (`Z`, `M`, `WM`) unconditionally, but the two common solve routes never
+  read `Z`: the blocked route reconstructs per-cluster blocks on the fly,
+  and the structured route needed it only inside `build_packed_m`, which now
+  builds its packed products directly from the column structure. The
+  workspace now sizes those buffers to 0×0 unless the model routes to the
+  dense fallback (the one route that genuinely reads all of them, unchanged).
+  Measured peak RSS on large models, Rust binary: a 50,000-row random-intercept
+  fit with 800 levels drops 952 → 27 MB, an observation-level-RE fit
+  (10,000 rows, 10,000 levels) 3827 → 12 MB, four correlated slopes plus a
+  crossed grouping 2765 → 51 MB; on the validation manifest the multi-grouping
+  rungs shrink the same way (VerbAgg 54 → 16 MB) and everything else is flat.
+  Net of each runtime's baseline, the kernel's fit cost on the blocked shape
+  is now below lme4's.
+
+- **The `fit_on` loop tier no longer allocates per draw** (`loop_advanced`
+  feature). The `Ols`, `Glm` and dense-LMM arms each built a fresh
+  column-major `n × p` copy of `x` on every call; they now fill a buffer
+  preallocated once in `build_workspace`, the same pattern the dense-GLMM arm
+  already used. The LMM offset path likewise reuses a preallocated `y − o`
+  buffer, and unweighted OLS workspaces reclaim the `scaled_x` matrix they
+  never touch. Per-draw heap traffic on those arms is gone. Measured on a
+  locked clock (pinned P-core, min over repeats, both versions producing
+  bit-identical estimates): 2–3 % per draw on OLS, ≤1 % on dense LMM, flat
+  on GLM (IRLS iteration cost dwarfs one allocation), at n = 1000–10000.
+  An allocation-hygiene change, not a speedup headline.
+
+### Added
+
+- `validation/memory/` — a peak-RSS measurement harness over the 43 manifest
+  rungs plus 13 large synthetic models, with cross-engine baselines (Rust
+  binary, Python and R ports, lme4, MixedModels.jl) and a summariser
+  (`validation/summarize_memory.R`). Measurement tooling only; no gate, no
+  golden.
+
 ## [0.1.2] — 2026-07-22
 
 A fix release with an internal restructure. Two changes move an answer, both

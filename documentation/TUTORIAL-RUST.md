@@ -117,7 +117,7 @@ Carlo power simulation), even `fit_warm`'s per-call allocation is overhead you
 may want to own yourself. The `loop_advanced` cargo feature lets you split the
 fit in two: `build_workspace` classifies the design and allocates the solver's
 per-shape buffers **once**, then `fit_on` solves each draw on that workspace.
-(Not everything is hoisted: the offset vectors are copied per call, and the
+(Not everything is hoisted: the GLMM offset vector is copied per call, and the
 sparse and negative-binomial routes still allocate their own buffers per draw —
 they get the shared routing, not the reuse win.)
 

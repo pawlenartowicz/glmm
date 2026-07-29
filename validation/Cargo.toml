@@ -3,7 +3,7 @@ name = "validation"
 # Lockstep with the crate: must equal GLMM/Cargo.toml [package] version.
 # glmm.rs stamps CARGO_PKG_VERSION into each result JSON's engine_version, and
 # after the move that macro reads THIS manifest, not glmm's.
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,12 +12,12 @@ license.workspace = true
 # -p glmm`: Cargo never descends into a subdirectory with its own Cargo.toml.
 publish = false
 
-# No lib/bin — this package exists only to own the three oracle example targets
+# No lib/bin — this package exists only to own the four oracle example targets
 # below (examples satisfy Cargo's at-least-one-target requirement).
 
 # `formula` — the drivers lower R-style formulas; `loop_advanced` — theta_eval
 # drives the dev-only seam. Enabled here on the dep rather than per-example
-# `required-features` so all three examples always build (and stay under the
+# `required-features` so all four examples always build (and stay under the
 # workspace clippy deny gate) in `cargo clippy --workspace --all-targets`.
 [dependencies]
 glmm = { path = "..", features = ["formula", "loop_advanced"] }
@@ -49,3 +49,11 @@ path = "campaigns/speed-grid/fit.rs"
 [[example]]
 name = "theta_eval"
 path = "campaigns/speed-grid/theta_eval.rs"
+
+# Fits one memory-measurement model (validation/memory/models.json + gen_models.py)
+# from a CSV path + formula string, for the memory harness (memory/memory.sh) to
+# wrap in `/usr/bin/time -f '%M'`. Shares common.rs with the three examples above.
+# NOT a validation rung -- see memory/models.json's header.
+[[example]]
+name = "memory_fit"
+path = "memory/memory_fit.rs"

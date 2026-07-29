@@ -1,0 +1,188 @@
+{
+  "schema": "glmm-memory-large-models/1",
+  "_purpose": "Thirteen synthetic memory-measurement models. These are NOT validation rungs: they carry no oracle JSON, no compare.R tolerance gate, and are never fit for accuracy -- only measured for peak RSS. The 43 curated manifest rungs are too small (cbpp is 56 rows / 15 herds) to show the n*k_total memory term this set exists to expose.",
+  "_axis": "The predicted allocation is 3*8*n*k_total bytes (three n-by-k_total f64 matrices in the dense GLMM workspace, src/glmm/workspace.rs): k_total is the TOTAL random-effect column count (levels*q per grouping, summed over groupings), not n alone -- 200000 rows in 5 groups is small; 10000 rows in 10000 groups is huge. before_bytes_predicted is that term for reference; it is not measured against anything, only printed alongside the observed peak_rss_kb.",
+  "_data": "Data is generated at run time by gen_models.py from a fixed seed (rng seeded on the model id) -- mirrors validation/../toy28/ram_scaling.py's precedent -- and written to a git-ignored path (results/memory/data/, already covered by validation/.gitignore's blanket /validation/results/ entry). Nothing here is committed.",
+  "_family": "binomial (logit) is the default family for every row unless a row says otherwise -- the allocation this set measures is family-independent, so family is not swept.",
+  "models": [
+    {
+      "id": 1,
+      "purpose": "blocked -- the sweep's top rung, fixed",
+      "n": 50000,
+      "family": "binomial",
+      "nagq": 1,
+      "predictors": ["x"],
+      "formula": "y ~ x + (1|g)",
+      "groups": [{"name": "g", "kind": "crossed", "levels": 800, "slopes": []}],
+      "k_total_predicted": 800,
+      "before_bytes_predicted": 960000000
+    },
+    {
+      "id": 2,
+      "purpose": "blocked -- large n, small k: the term is not n",
+      "n": 200000,
+      "family": "binomial",
+      "nagq": 1,
+      "predictors": ["x"],
+      "formula": "y ~ x + (1|g)",
+      "groups": [{"name": "g", "kind": "crossed", "levels": 20, "slopes": []}],
+      "k_total_predicted": 20,
+      "before_bytes_predicted": 96000000
+    },
+    {
+      "id": 3,
+      "purpose": "blocked -- same k reached via q, not levels",
+      "n": 50000,
+      "family": "binomial",
+      "nagq": 1,
+      "predictors": ["x"],
+      "formula": "y ~ x + (1+x|g)",
+      "groups": [{"name": "g", "kind": "crossed", "levels": 400, "slopes": ["x"]}],
+      "k_total_predicted": 800,
+      "before_bytes_predicted": 960000000
+    },
+    {
+      "id": 4,
+      "purpose": "blocked -- observation-level RE, near-unusable today",
+      "n": 10000,
+      "family": "binomial",
+      "nagq": 1,
+      "predictors": ["x"],
+      "formula": "y ~ x + (1|obs)",
+      "groups": [{"name": "obs", "kind": "crossed", "levels": 10000, "slopes": [], "one_row_per_level": true}],
+      "k_total_predicted": 10000,
+      "before_bytes_predicted": 2400000000
+    },
+    {
+      "id": 5,
+      "purpose": "AGQ -- allocates all three, reads none",
+      "n": 20000,
+      "family": "binomial",
+      "nagq": 7,
+      "predictors": ["x"],
+      "formula": "y ~ x + (1|g)",
+      "groups": [{"name": "g", "kind": "crossed", "levels": 500, "slopes": []}],
+      "k_total_predicted": 500,
+      "before_bytes_predicted": 240000000
+    },
+    {
+      "id": 6,
+      "purpose": "structured -- moves under both the buffer-sizing and M-packing changes",
+      "n": 50000,
+      "family": "binomial",
+      "nagq": 1,
+      "predictors": ["x"],
+      "formula": "y ~ x + (1|subj) + (1|item)",
+      "groups": [
+        {"name": "subj", "kind": "crossed", "levels": 500, "slopes": []},
+        {"name": "item", "kind": "crossed", "levels": 400, "slopes": []}
+      ],
+      "k_total_predicted": 900,
+      "before_bytes_predicted": 1080000000
+    },
+    {
+      "id": 7,
+      "purpose": "structured, via nesting rather than crossing",
+      "n": 50000,
+      "family": "binomial",
+      "nagq": 1,
+      "predictors": ["x"],
+      "formula": "y ~ x + (1|parent/child)",
+      "groups": [
+        {"name": "parent", "kind": "nested_parent", "levels": 100, "slopes": []},
+        {"name": "child", "kind": "nested_child", "parent": "parent", "per_parent": 5, "slopes": []}
+      ],
+      "k_total_predicted": 600,
+      "before_bytes_predicted": 720000000,
+      "note": "k_total_predicted/before_bytes_predicted here are predicted, unverified -- not confirmed against a measured run."
+    },
+    {
+      "id": 8,
+      "purpose": "structured -- stresses the per-row crossed-level packing in build_packed_m",
+      "n": 30000,
+      "family": "binomial",
+      "nagq": 1,
+      "predictors": ["x"],
+      "formula": "y ~ x + (1|g1) + (1|g2) + (1|g3)",
+      "groups": [
+        {"name": "g1", "kind": "crossed", "levels": 600, "slopes": []},
+        {"name": "g2", "kind": "crossed", "levels": 250, "slopes": []},
+        {"name": "g3", "kind": "crossed", "levels": 250, "slopes": []}
+      ],
+      "k_total_predicted": 1100,
+      "before_bytes_predicted": 792000000,
+      "note": "g1 (first RE term -> primary grouping under formula-order lowering) carries 600 of the 1100 total: MAX_CROSSED_LEVELS (src/consts.rs, 500) is checked only over the EXTRA groupings' summed crossed levels, not the primary -- g2+g3 = 500 stays at the dense NoZ boundary (500 is not > 500), while a primary-heavy split would have silently tripped Solver::Sparse and missed the dense per-row level scan this row exists to stress."
+    },
+    {
+      "id": 9,
+      "purpose": "structured, widest RE in the set (headline row)",
+      "n": 50000,
+      "family": "binomial",
+      "nagq": 1,
+      "predictors": ["x1", "x2", "x3"],
+      "formula": "y ~ x1 + x2 + x3 + (1+x1+x2+x3|g) + (1|item)",
+      "groups": [
+        {"name": "g", "kind": "crossed", "levels": 500, "slopes": ["x1", "x2", "x3"]},
+        {"name": "item", "kind": "crossed", "levels": 300, "slopes": []}
+      ],
+      "k_total_predicted": 2300,
+      "before_bytes_predicted": 2760000000,
+      "note": "q_p held at exactly 4 (intercept + x1/x2/x3), never 5 -- a q_p=5 shape hits a known, unrelated ~2e-3 optimizer shortfall recorded elsewhere; irrelevant to a memory measurement, but avoid that shape here."
+    },
+    {
+      "id": 10,
+      "purpose": "control: dense fallback, must not move",
+      "n": 20000,
+      "family": "binomial",
+      "nagq": 1,
+      "predictors": ["x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8"],
+      "formula": "y ~ x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + (1+x1+x2+x3+x4+x5+x6+x7+x8|g) + (1|item)",
+      "groups": [
+        {"name": "g", "kind": "crossed", "levels": 50, "slopes": ["x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8"]},
+        {"name": "item", "kind": "crossed", "levels": 100, "slopes": []}
+      ],
+      "k_total_predicted": null,
+      "before_bytes_predicted": null,
+      "note": "q_p = 9 (intercept + 8 slopes) exceeds MAX_PRIMARY_Q = 8 (src/consts.rs), so classify_design (src/fit/mod.rs) routes this to Solver::Sparse regardless of k_total -- the dense n*k_total allocation this set otherwise measures must NOT appear here. before/k_total are left null: the whole point of this row is that the predicted dense term does not apply."
+    },
+    {
+      "id": 11,
+      "purpose": "control: LMM allocates no n x k",
+      "n": 100000,
+      "family": "gaussian",
+      "nagq": 1,
+      "predictors": ["x"],
+      "formula": "y ~ x + (1|g)",
+      "groups": [{"name": "g", "kind": "crossed", "levels": 1000, "slopes": []}],
+      "k_total_predicted": 1000,
+      "before_bytes_predicted": 0,
+      "note": "Gaussian with random effects routes to the LMM path (profiled REML, theta-Cholesky), which never builds the dense n x k_total z/m workspace the GLMM PIRLS path does -- the predicted term is 0 by construction, not because k_total is small."
+    },
+    {
+      "id": 12,
+      "purpose": "control for the GLMM buffer sizing; also exercises the Glm arm of fit_on",
+      "n": 200000,
+      "family": "binomial",
+      "nagq": 1,
+      "predictors": ["x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9"],
+      "formula": "y ~ x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + x9",
+      "groups": [],
+      "k_total_predicted": 0,
+      "before_bytes_predicted": 0,
+      "note": "No random effects at all (p = 10 fixed columns incl. intercept) -- routes to plain IRLS, not the mixed-model workspace. Flat by construction; this row and row 13 exist as controls for the GLMM buffer sizing this set otherwise measures, and this harness doubles as a check on the Glm/Ols arms of fit_on's build-once alloc reduction."
+    },
+    {
+      "id": 13,
+      "purpose": "control for the GLMM buffer sizing; also exercises the Ols arm of fit_on",
+      "n": 200000,
+      "family": "gaussian",
+      "nagq": 1,
+      "predictors": ["x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9"],
+      "formula": "y ~ x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + x9",
+      "groups": [],
+      "k_total_predicted": 0,
+      "before_bytes_predicted": 0,
+      "note": "No random effects, Gaussian -- plain OLS via normal equations. Flat by construction; see row 12's note."
+    }
+  ]
+}

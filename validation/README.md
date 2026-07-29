@@ -31,6 +31,13 @@ table). Cross-reference disagreements are catalogued in the workspace's
     summarize_timing.R / summarize_accuracy.R / summarize_parallel.R
                       human-readable views (no gate): timing + speedups,
                       accuracy diffs, parallel-feature speedup
+    summarize_memory.R
+                      human-readable view (no gate) of the memory/ legs
+    memory/           peak-RSS harness (no gate): memory.sh measures every
+                      engine's peak resident memory over the 43 manifest rungs
+                      plus 13 large synthetic models (models.json, regenerable
+                      by gen_models.py); one fit script per engine; results
+                      land in results/memory/ (gitignored)
     prep/             regenerate data/ from fixed seeds (export_data.R rungs 1-28,
                       gen_weights_data.R rungs 29-43)
     engines/          one fit harness per engine, named for its engine:
@@ -55,6 +62,7 @@ table). Cross-reference disagreements are catalogued in the workspace's
 | `cargo test --features oracle-tests` (Tier 2) | `results/` + `data/` on disk | no — local only (needs a prior `./run.sh --oracles`) |
 | `./run.sh` (this suite) | everything | no — local only (needs R, Julia, the wheel, fastglmm) |
 | campaigns | own manifests/results | no — finished studies, rerun by hand |
+| `memory/memory.sh` | `data/`, `memory/models.json` | no — local only, measurement not gate |
 
 ## Datasets — the rungs
 

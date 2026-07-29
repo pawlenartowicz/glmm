@@ -34,7 +34,7 @@ fn fit_ols_prebuilt_reused_ws_near_identical_to_fresh() {
 
     let fresh = fit_ols(&x, &y, n, p, &opts);
 
-    let mut ws = OlsWorkspace::new(n, p, opts.target_indices.len());
+    let mut ws = OlsWorkspace::new(n, p, opts.target_indices.len(), opts.weights.is_some());
     let x_mat = super::common::to_col_major(&x, n, p);
     let reused = {
         let v = fit_ols_prebuilt(&mut ws, x_mat.as_ref().subrows(0, n), &y, n, p, &opts);

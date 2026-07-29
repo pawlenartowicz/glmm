@@ -18,7 +18,7 @@ use crate::glmm::{build_z, GlmmWorkspace, StructuredSchur};
 use crate::lmm::LmmWorkspace;
 use crate::{BinomialLink, Family, GroupIds, GroupingRelation, ModelSpec, StartValues};
 
-use super::common::{assert_group_ids, assert_model_shape, to_col_major};
+use super::common::{assert_group_ids, assert_model_shape, fill_col_major};
 use super::glm::GlmScratchBuf;
 use super::lmm::LmmResultView;
 use super::ols::OlsWorkspace;
@@ -144,7 +144,10 @@ impl FitView<'_> {
     }
 
     /// Objective evaluations the solve spent. OLS is closed-form (0); the
-    /// `Prebuilt` arm forwards the kernel's `Fit.n_eval`.
+    /// `Prebuilt` arm forwards the kernel's `Fit.n_eval`. GLM reports 0 by
+    /// choice, not by omission — it has no objective to evaluate, and its
+    /// `GlmFitView::n_iter` counts IRLS steps, which is a different quantity
+    /// from the θ-search evaluation count every other arm reports here.
     pub fn n_eval(&self) -> usize {
         match &self.kind {
             FitViewKind::Ols(_) | FitViewKind::Glm(_) => 0,
@@ -260,9 +263,30 @@ pub struct FitWorkspace {
 // memory win.
 #[allow(clippy::large_enum_variant)]
 enum FitKind {
-    Ols(OlsWorkspace),
-    Glm(GlmScratchBuf),
-    LmmDense(LmmWorkspace),
+    // `x_mat` is a sibling of the workspace, not a field of it: both
+    // `fit_ols_prebuilt`/`fit_glm_prebuilt` take `&mut Ols/GlmScratchBuf` and
+    // return a view borrowing from it, so a `MatRef` sourced from a field of
+    // that same workspace would be a second mutable borrow for the whole call
+    // — a hard error, not a lifetime puzzle. Sibling fields give `fit_on`
+    // disjoint borrows instead, exactly as `GlmmDense` already does below.
+    Ols {
+        ws: OlsWorkspace,
+        x_mat: Mat<f64>,
+    },
+    Glm {
+        buf: GlmScratchBuf,
+        x_mat: Mat<f64>,
+    },
+    LmmDense {
+        ws: LmmWorkspace,
+        x_mat: Mat<f64>,
+        // Offset-shifted y, filled only when `opts.offset` is set (per-call,
+        // not frozen at build — unlike `x_mat` this buffer sits unused and
+        // untouched on every offset-less call). Sibling of `ws` for the same
+        // borrow reason as `x_mat`: `accumulate_lmm_rows` takes `ws` mutably,
+        // so a slice of `ws` cannot also be its `y` argument.
+        y_shifted: Vec<f64>,
+    },
     GlmmDense {
         ws: GlmmWorkspace,
         x_mat: Mat<f64>,
@@ -287,13 +311,13 @@ enum PrebuiltRoute {
 #[cfg(test)]
 impl FitWorkspace {
     pub(crate) fn is_ols(&self) -> bool {
-        matches!(self.kind, FitKind::Ols(_))
+        matches!(self.kind, FitKind::Ols { .. })
     }
     pub(crate) fn is_glm(&self) -> bool {
-        matches!(self.kind, FitKind::Glm(_))
+        matches!(self.kind, FitKind::Glm { .. })
     }
     pub(crate) fn is_lmm_dense(&self) -> bool {
-        matches!(self.kind, FitKind::LmmDense(_))
+        matches!(self.kind, FitKind::LmmDense { .. })
     }
     pub(crate) fn is_glmm_dense(&self) -> bool {
         matches!(self.kind, FitKind::GlmmDense { .. })
@@ -321,7 +345,10 @@ pub fn build_workspace(
     assert_model_shape(sized, p, opts.nagq);
     let t = opts.target_indices.len();
     let kind = match (&sized.family, sized.re.as_ref()) {
-        (Family::Gaussian, None) => FitKind::Ols(OlsWorkspace::new(n_max, p, t)),
+        (Family::Gaussian, None) => FitKind::Ols {
+            ws: OlsWorkspace::new(n_max, p, t, opts.weights.is_some()),
+            x_mat: Mat::<f64>::zeros(n_max.max(1), p.max(1)),
+        },
         (Family::NegativeBinomial { .. }, None) => FitKind::Prebuilt(PrebuiltRoute::GlmNb),
         // Spelled out rather than `(_, None)` so adding a family (or a binomial
         // link) is a compile error here instead of silently routing to IRLS.
@@ -332,7 +359,10 @@ pub fn build_workspace(
                 link: BinomialLink::Probit | BinomialLink::Logit,
             },
             None,
-        ) => FitKind::Glm(GlmScratchBuf::new(n_max, p, t)),
+        ) => FitKind::Glm {
+            buf: GlmScratchBuf::new(n_max, p, t),
+            x_mat: Mat::<f64>::zeros(n_max.max(1), p.max(1)),
+        },
         (family, Some(re)) => match classify_design(sized, opts.nagq) {
             Solver::NoZ => match family {
                 Family::Gaussian => {
@@ -342,13 +372,17 @@ pub fn build_workspace(
                         .iter()
                         .map(|g| g.slopes.iter().map(|&c| c as usize).collect())
                         .collect();
-                    FitKind::LmmDense(LmmWorkspace::for_cluster_spec_ext(
-                        p,
-                        sized,
-                        n_max,
-                        &slope_cols,
-                        &extra_slope_cols,
-                    ))
+                    FitKind::LmmDense {
+                        ws: LmmWorkspace::for_cluster_spec_ext(
+                            p,
+                            sized,
+                            n_max,
+                            &slope_cols,
+                            &extra_slope_cols,
+                        ),
+                        x_mat: Mat::<f64>::zeros(n_max.max(1), p.max(1)),
+                        y_shifted: vec![0.0f64; n_max.max(1)],
+                    }
                 }
                 Family::NegativeBinomial { .. } => FitKind::Prebuilt(PrebuiltRoute::GlmmNbDense),
                 _ => {
@@ -515,16 +549,16 @@ pub fn fit_on<'a>(
     }
 
     match &mut ws.kind {
-        FitKind::Ols(ols_ws) => {
-            let x_mat = to_col_major(x, n, p);
+        FitKind::Ols { ws: ols_ws, x_mat } => {
+            fill_col_major(x_mat, x, n, p);
             let v =
                 super::ols::fit_ols_prebuilt(ols_ws, x_mat.as_ref().subrows(0, n), y, n, p, opts);
             FitView {
                 kind: FitViewKind::Ols(v),
             }
         }
-        FitKind::Glm(buf) => {
-            let x_mat = to_col_major(x, n, p);
+        FitKind::Glm { buf, x_mat } => {
+            fill_col_major(x_mat, x, n, p);
             let v = super::glm::fit_glm_prebuilt(
                 ws.sized.family,
                 f64::NAN,
@@ -537,20 +571,32 @@ pub fn fit_on<'a>(
                 kind: FitViewKind::Glm(v),
             }
         }
-        FitKind::LmmDense(lmm_ws) => {
+        FitKind::LmmDense {
+            ws: lmm_ws,
+            x_mat,
+            y_shifted,
+        } => {
+            fill_col_major(x_mat, x, n, p);
             // Identity-link offset as the exact y-shift before accumulation
             // (mirrors `fit_mle`); weights fold into the Gram accumulators.
-            let y_shifted: Vec<f64>;
+            // The identical collect lives at `fit/lmm.rs`, `loop_advanced_seam.rs`,
+            // and `sparse/mod.rs`, each carrying a "change together"
+            // comment — what those comments pin is the numerics (offset as an
+            // exact y-shift applied before accumulation), which is unchanged
+            // here; this site only stops allocating, filling the build-once
+            // `y_shifted` buffer with a plain loop instead of a fresh `collect()`.
             let y_eff: &[f64] = match &opts.offset {
                 Some(o) => {
-                    y_shifted = y.iter().zip(o).map(|(&yi, &oi)| yi - oi).collect();
-                    &y_shifted
+                    for i in 0..n {
+                        y_shifted[i] = y[i] - o[i];
+                    }
+                    &y_shifted[..n]
                 }
                 None => y,
             };
             super::lmm::accumulate_lmm_rows(
                 lmm_ws,
-                x,
+                x_mat.as_ref().subrows(0, n),
                 y_eff,
                 n,
                 p,
@@ -568,13 +614,7 @@ pub fn fit_on<'a>(
             }
         }
         FitKind::GlmmDense { ws: glmm_ws, x_mat } => {
-            // Overwrite rows [0, n) of the n_max-sized col-major buffer; rows
-            // past n keep the previous draw's values and are never read.
-            for i in 0..n {
-                for j in 0..p {
-                    x_mat[(i, j)] = x[i * p + j];
-                }
-            }
+            fill_col_major(x_mat, x, n, p);
             // Reset call-varying option state (mirrors `fit_glmm_build`'s one-time
             // set, made per-call so a reused ws is correct for the new draw).
             glmm_ws.parallel_inner = opts.parallel_inner;
@@ -607,6 +647,7 @@ pub fn fit_on<'a>(
                 p,
                 &ws.sized,
                 &ids.primary,
+                &ids.extra,
                 f64::NAN,
                 start,
                 opts,

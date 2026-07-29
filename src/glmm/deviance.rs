@@ -22,8 +22,10 @@ use crate::spec::Family;
 /// `log|L|` off its converged factor (L the Cholesky factor of A, so `log|A| =
 /// 2 log|L|`) — the caller below doubles it to get `log|A|`, so there is no
 /// re-factor here.
-/// The blocked branch requires `z_buf` pre-filled for this fit's `x`
-/// (`fill_z_f64`); the dense branch ignores `z_buf`/`m_buf`.
+/// The blocked AND structured branches require `z_buf` pre-filled for this
+/// fit's `x` (`fill_z_f64`) — `build_packed_m`'s primary-core reduction reads
+/// it the same way `pirls_solve_blocked`'s does; the dense branch ignores
+/// `z_buf`/`m_buf` (it reads `x` through `z`/`apply_lambda` instead).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn laplace_deviance(
     family: Family,
@@ -42,6 +44,11 @@ pub(crate) fn laplace_deviance(
     prior_w: &[f64],
     weighted: bool,
     cluster_ids: &[u32],
+    // Per-row extra-grouping level ids, the same slice `build_z` takes — read
+    // only on the structured route (`build_packed_m`'s nested-indicator and
+    // crossed-level reconstruction); unread on the blocked and dense-fallback
+    // routes.
+    extra_ids: &[Vec<u32>],
     eta: &mut [f64],
     prob: &mut [f64],
     w: &mut [f64],
@@ -230,7 +237,8 @@ pub(crate) fn laplace_deviance(
         build_packed_m(
             groupings,
             params,
-            z,
+            z_buf,
+            extra_ids,
             lam,
             cluster_ids,
             m_core_buf,
@@ -361,6 +369,7 @@ pub(crate) fn laplace_deviance_at(
     x: MatRef<f64>,
     y: &[f64],
     cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
     n: usize,
 ) -> f64 {
     let kk = ws.k.max(1);
@@ -374,7 +383,7 @@ pub(crate) fn laplace_deviance_at(
     // Fixed mode: β = ws.beta_rhs (transient scratch, never ws.betas — see
     // laplace_deviance's doc). `beta_step_rhs` just needs a distinct spare
     // buffer (inert under Fixed) — ws.beta_prof is it.
-    laplace_deviance_ws(ws, x, y, cluster_ids, n, false)
+    laplace_deviance_ws(ws, x, y, cluster_ids, extra_ids, n, false)
 }
 
 /// Shared borrow-split body of `laplace_deviance_at` and (test-only)
@@ -389,6 +398,7 @@ fn laplace_deviance_ws(
     x: MatRef<f64>,
     y: &[f64],
     cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
     n: usize,
     profile_beta: bool,
 ) -> f64 {
@@ -468,6 +478,7 @@ fn laplace_deviance_ws(
         &prior_w[..n],
         weighted,
         cluster_ids,
+        extra_ids,
         eta,
         prob,
         w,
@@ -524,11 +535,12 @@ pub(crate) fn glmm_laplace_deviance(
     x: MatRef<f64>,
     y: &[f64],
     cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
     n: usize,
 ) -> f64 {
     ws.params[..params.len()].copy_from_slice(params);
     fill_z_f64(&ws.groupings, x, &mut ws.z_buf, n);
-    laplace_deviance_at(ws, x, y, cluster_ids, n)
+    laplace_deviance_at(ws, x, y, cluster_ids, extra_ids, n)
 }
 
 /// Test-only Profile twin of `glmm_laplace_deviance`: drives `laplace_deviance`
@@ -546,6 +558,7 @@ pub(crate) fn glmm_laplace_deviance_profile(
     x: MatRef<f64>,
     y: &[f64],
     cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
     n: usize,
 ) -> f64 {
     ws.params[..params.len()].copy_from_slice(params);
@@ -557,5 +570,5 @@ pub(crate) fn glmm_laplace_deviance_profile(
     for v in ws.beta_prof.iter_mut() {
         *v = 0.0;
     }
-    laplace_deviance_ws(ws, x, y, cluster_ids, n, true)
+    laplace_deviance_ws(ws, x, y, cluster_ids, extra_ids, n, true)
 }

@@ -2918,6 +2918,7 @@ fn sparse_glmm_deviance_matches_dense() {
                 x.as_ref(),
                 &y,
                 &ids.primary,
+                &ids.extra,
                 n,
             );
             let sparse = super::sparse_glmm_deviance(

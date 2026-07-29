@@ -61,7 +61,11 @@ pub fn build_table(header: &[String], rows: &[Vec<String>], factors: &[String]) 
 
 /// NaN/Inf → JSON null (serde_json cannot serialize non-finite floats, and a
 /// non-converged fit leaves NaN-filled estimates) so an unconverged run still
-/// writes valid JSON the comparators read as "missing", not a crash.
+/// writes valid JSON the comparators read as "missing", not a crash. Used by
+/// every driver that emits comparison JSON — allow(dead_code) because
+/// `memory_fit` includes this file without calling either (it prints one
+/// status line, never a result record).
+#[allow(dead_code)]
 pub fn num(x: f64) -> Value {
     if x.is_finite() {
         json!(x)
@@ -69,6 +73,7 @@ pub fn num(x: f64) -> Value {
         Value::Null
     }
 }
+#[allow(dead_code)]
 pub fn nums(xs: &[f64]) -> Value {
     Value::Array(xs.iter().map(|&x| num(x)).collect())
 }

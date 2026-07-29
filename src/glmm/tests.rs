@@ -45,6 +45,7 @@ fn dense_glmm_entry_rejects_extra_slopes() {
         &y,
         &cluster_ids,
         &[],
+        &[],
         None,
         &[0.0; 2],
         n,
@@ -276,7 +277,15 @@ fn laplace_deviance_matches_brute_force_intercept() {
     ws.params[0] = 0.5;
     ws.params[1] = beta[0];
     ws.params[2] = beta[1];
-    let got = glmm_laplace_deviance(&ws.params.clone(), &mut ws, xf64.as_ref(), &y, &ids, 80);
+    let got = glmm_laplace_deviance(
+        &ws.params.clone(),
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &[],
+        80,
+    );
     assert!(
         (got - want).abs() < 1e-6,
         "laplace dev: got {got}, want {want}"
@@ -298,8 +307,8 @@ fn beta_fixed_mode_is_pure_plumbing() {
     ws.params[1] = 0.2;
     ws.params[2] = 0.8;
     let params = ws.params.clone();
-    let d1 = glmm_laplace_deviance(&params, &mut ws, xf64.as_ref(), &y, &ids, 80);
-    let d2 = glmm_laplace_deviance(&params, &mut ws, xf64.as_ref(), &y, &ids, 80);
+    let d1 = glmm_laplace_deviance(&params, &mut ws, xf64.as_ref(), &y, &ids, &[], 80);
+    let d2 = glmm_laplace_deviance(&params, &mut ws, xf64.as_ref(), &y, &ids, &[], 80);
     assert_eq!(d1.to_bits(), d2.to_bits());
 }
 
@@ -320,7 +329,7 @@ fn agq_k1_reduces_to_laplace() {
     ws.params[1] = 0.2;
     ws.params[2] = 0.8;
     let p = ws.params.clone();
-    let lap = glmm_laplace_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, 80);
+    let lap = glmm_laplace_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, &[], 80);
     let agq1 = glmm_agq_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, 80, 1);
     assert!(
         (agq1 - lap).abs() <= 1e-12 * lap.abs().max(1.0),
@@ -550,7 +559,7 @@ fn agq_vec_k1_reduces_to_laplace_q2() {
     ws.params[3] = 0.2; // β
     ws.params[4] = 0.8;
     let p = ws.params.clone();
-    let lap = glmm_laplace_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, n);
+    let lap = glmm_laplace_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, &[], n);
     let agq1 = glmm_agq_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, n, 1);
     assert!(
         (agq1 - lap).abs() <= 1e-12 * lap.abs().max(1.0),
@@ -574,7 +583,7 @@ fn agq_vec_k1_reduces_to_laplace_q3() {
     ws.params[7] = 0.8;
     ws.params[8] = -0.5;
     let p = ws.params.clone();
-    let lap = glmm_laplace_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, n);
+    let lap = glmm_laplace_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, &[], n);
     let agq1 = glmm_agq_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, n, 1);
     assert!(
         (agq1 - lap).abs() <= 1e-12 * lap.abs().max(1.0),
@@ -663,7 +672,15 @@ fn laplace_deviance_collapses_to_glm_at_theta_zero() {
     ws.params[0] = 0.0;
     ws.params[1] = beta[0];
     ws.params[2] = beta[1];
-    let got = glmm_laplace_deviance(&ws.params.clone(), &mut ws, xf64.as_ref(), &y, &ids, 80);
+    let got = glmm_laplace_deviance(
+        &ws.params.clone(),
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &[],
+        80,
+    );
     let mut d = 0.0;
     for i in 0..80 {
         let eta = beta[0] + beta[1] * xf64[(i, 1)];
@@ -685,6 +702,12 @@ fn build_z_width_general_populates_all_columns() {
     let (xf64, _y, ids, crossed_ids, cluster) = glmm_slope_crossed_dataset();
     let n = ids.len();
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
+    // This model (q_p=2 slope + one intercept-only crossed extra) is
+    // structured-eligible, so `ws.z` is 0×0 by construction (`build_z` fills
+    // it only on the dense-fallback route). This test drives
+    // `build_z` directly to check its column layout, not through the
+    // structured deviance path, so force the dense buffers into existence.
+    ws.ensure_dense_buffers();
     build_z(
         &mut ws,
         xf64.as_ref(),
@@ -829,6 +852,7 @@ fn fit_glmm_recovers_direction_and_finite_inference() {
         xf64.as_ref(),
         &y,
         &ids,
+        &[],
         &targets,
         Some(&[0.5]),
         &beta_truth,
@@ -918,7 +942,7 @@ fn fd_hessian_cov_matches_glmer_use_hessian_true() {
     for j in 0..p {
         ws.params[1 + j] = fx.beta[j];
     }
-    let _ = laplace_deviance_at(&mut ws, xf64.as_ref(), &y, &ids, n);
+    let _ = laplace_deviance_at(&mut ws, xf64.as_ref(), &y, &ids, &[], n);
     let mut rx = Mat::<f64>::zeros(p, p);
     assert!(rx_cov_into(&mut ws, xf64.as_ref(), &ids, p, n, &mut rx));
     for i in 0..p {
@@ -938,6 +962,7 @@ fn fd_hessian_cov_matches_glmer_use_hessian_true() {
         xf64.as_ref(),
         &y,
         &ids,
+        &[],
         &[1u32],
         None,
         &vec![0.0; p],
@@ -969,7 +994,7 @@ fn fd_hessian_cov_matches_glmer_use_hessian_true() {
     let our_theta = ws.params[0];
 
     let mut cov = Mat::<f64>::zeros(p, p);
-    let status = fd_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, p, n, &mut cov);
+    let status = fd_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov);
     assert_eq!(status, FdHessianStatus::Ok);
     // ws.params restored to OUR converged snapshot on return.
     assert!((ws.params[0] - our_theta).abs() < 1e-15);
@@ -1008,17 +1033,18 @@ fn assert_fd_hessian_serial_eq_parallel(
     x: faer::MatRef<f64>,
     y: &[f64],
     ids: &[u32],
+    extra_ids: &[Vec<u32>],
     p: usize,
     n: usize,
 ) {
     let mut cov_s = Mat::<f64>::zeros(p, p);
     ws.parallel_inner = false;
-    let st_s = fd_hessian_cov(ws, x, y, ids, p, n, &mut cov_s);
+    let st_s = fd_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_s);
     let tse_s = ws.theta_se.clone();
 
     let mut cov_p = Mat::<f64>::zeros(p, p);
     ws.parallel_inner = true;
-    let st_p = fd_hessian_cov(ws, x, y, ids, p, n, &mut cov_p);
+    let st_p = fd_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_p);
     let tse_p = ws.theta_se.clone();
 
     assert_eq!(st_s, st_p, "FdHessianStatus differs serial vs parallel");
@@ -1073,6 +1099,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             xf64.as_ref(),
             &y,
             &ids,
+            &[],
             &[1u32],
             None,
             &vec![0.0; p],
@@ -1080,7 +1107,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             WaldSe::Rx,
         );
         assert!(fit.converged, "no-extras fixture must converge");
-        assert_fd_hessian_serial_eq_parallel(&mut ws, xf64.as_ref(), &y, &ids, p, n);
+        assert_fd_hessian_serial_eq_parallel(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n);
     }
     // Case B: structured crossed (grouseticks INDEX primary + BROOD, LOCATION) —
     // exercises the per-thread StructuredSchur rebuild in `fd_worker_ws`.
@@ -1098,6 +1125,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             x.as_ref(),
             &y,
             &ids.primary,
+            &ids.extra,
             &[0u32, 1, 2, 3],
             None,
             &vec![0.0; p],
@@ -1108,7 +1136,15 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             fit.converged,
             "grouseticks structured fixture must converge"
         );
-        assert_fd_hessian_serial_eq_parallel(&mut ws, x.as_ref(), &y, &ids.primary, p, n);
+        assert_fd_hessian_serial_eq_parallel(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids.primary,
+            &ids.extra,
+            p,
+            n,
+        );
     }
 }
 
@@ -1142,6 +1178,7 @@ fn hessian_mode_t_sq_uses_fd_hessian_cov() {
         xf64.as_ref(),
         &y,
         &ids,
+        &[],
         &[1u32],
         None,
         &vec![0.0; p],
@@ -1158,6 +1195,7 @@ fn hessian_mode_t_sq_uses_fd_hessian_cov() {
         xf64.as_ref(),
         &y,
         &ids,
+        &[],
         &[1u32],
         None,
         &vec![0.0; p],
@@ -1244,6 +1282,7 @@ fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
         xf64.as_ref(),
         &y,
         &ids,
+        &[],
         &[1u32],
         None,
         &[0.0, 0.8],
@@ -1266,7 +1305,7 @@ fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
     ws.params[0] *= 5.0;
 
     let mut cov = Mat::<f64>::zeros(p, p);
-    let status = fd_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, p, n, &mut cov);
+    let status = fd_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov);
     assert_eq!(
         status,
         FdHessianStatus::NonPdFellBackToRx,
@@ -1379,6 +1418,7 @@ fn fit_glmm_collapses_to_plain_irls_when_tau_negligible() {
         x.as_ref(),
         &y,
         &ids,
+        &[],
         &[1],
         Some(&[0.05]),
         &[0.1, 0.7],
@@ -1420,6 +1460,7 @@ fn fit_glmm_width_general_slope_and_crossed() {
         xf64.as_ref(),
         &y,
         &ids,
+        std::slice::from_ref(&crossed_ids),
         &[1],
         None,
         &[0.2, 0.8],
@@ -1467,6 +1508,7 @@ fn fit_glmm_warm_path_bounded_alloc() {
         xf64.as_ref(),
         &y,
         &ids,
+        &[],
         &[1],
         Some(&[0.5]),
         &[0.2, 0.8],
@@ -1480,6 +1522,7 @@ fn fit_glmm_warm_path_bounded_alloc() {
             xf64.as_ref(),
             &y,
             &ids,
+            &[],
             &[1],
             Some(&[0.5]),
             &[0.2, 0.8],
@@ -1540,6 +1583,7 @@ fn fit_glmm_structured_warm_path_bounded_alloc() {
         xf64.as_ref(),
         &y,
         &ids,
+        &extra_ids,
         &[1],
         Some(&theta),
         &[0.2, 0.8],
@@ -1553,6 +1597,7 @@ fn fit_glmm_structured_warm_path_bounded_alloc() {
             xf64.as_ref(),
             &y,
             &ids,
+            &extra_ids,
             &[1],
             Some(&theta),
             &[0.2, 0.8],
@@ -1680,7 +1725,15 @@ fn blocked_laplace_matches_brute_force_intercept() {
     ws.params[0] = 0.5;
     ws.params[1] = beta[0];
     ws.params[2] = beta[1];
-    let got = glmm_laplace_deviance(&ws.params.clone(), &mut ws, xf64.as_ref(), &y, &ids, 80);
+    let got = glmm_laplace_deviance(
+        &ws.params.clone(),
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &[],
+        80,
+    );
     assert!(
         (got - want).abs() < 1e-6,
         "blocked laplace: got {got}, want {want}"
@@ -1707,7 +1760,15 @@ fn blocked_laplace_matches_brute_force_intercept_contiguous() {
     ws.params[0] = 0.5;
     ws.params[1] = beta[0];
     ws.params[2] = beta[1];
-    let got = glmm_laplace_deviance(&ws.params.clone(), &mut ws, xf64.as_ref(), &y, &ids, 80);
+    let got = glmm_laplace_deviance(
+        &ws.params.clone(),
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &[],
+        80,
+    );
     assert!(
         (got - want).abs() < 1e-6,
         "blocked laplace (contiguous): got {got}, want {want}"
@@ -1734,6 +1795,9 @@ fn blocked_pirls_matches_dense_slope_noextra() {
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
     assert!(ws.groupings.extra_offsets.is_empty());
+    // Drives the dense kernel (apply_lambda/pirls_solve) directly against a
+    // workspace the constructor sized for the blocked route (0×0 z/m/wm/a/a_chol).
+    ws.ensure_dense_buffers();
     build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     let theta = [0.5_f64, 0.1, 0.4]; // vech(Λ_p): [σ_int, cov, σ_slope]
     let mut beta = [0.2_f64, 0.8];
@@ -1904,6 +1968,9 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
     assert!(ws.groupings.extra_offsets.is_empty());
+    // Drives the dense kernel (apply_lambda/pirls_solve) directly against a
+    // workspace the constructor sized for the blocked route (0×0 z/m/wm/a/a_chol).
+    ws.ensure_dense_buffers();
     build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     let theta = [0.5_f64, 0.1, 0.4]; // vech(Λ_p): [σ_int, cov, σ_slope]
     let mut beta = [0.2_f64, 0.8];
@@ -2070,12 +2137,16 @@ fn blocked_inference_matches_dense_slope_noextra() {
         }),
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
+    // The dense recomputation below reads ws.z/ws.m directly against a workspace
+    // the constructor sized for the blocked route (0×0 z/m/wm/a/a_chol).
+    ws.ensure_dense_buffers();
     build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
         &y,
         &ids,
+        &[],
         &[1],
         Some(&[0.5, 0.1, 0.4]),
         &[0.2, 0.8],
@@ -2193,6 +2264,7 @@ fn warm_start_is_per_fit_deterministic() {
         xf64.as_ref(),
         &y,
         &ids,
+        &[],
         &[1],
         Some(&[0.5]),
         &[0.2, 0.8],
@@ -2208,6 +2280,7 @@ fn warm_start_is_per_fit_deterministic() {
         xf64.as_ref(),
         &y,
         &ids,
+        &[],
         &[1],
         Some(&[0.5]),
         &[0.2, 0.8],
@@ -2219,6 +2292,7 @@ fn warm_start_is_per_fit_deterministic() {
         xf64.as_ref(),
         &y,
         &ids,
+        &[],
         &[1],
         Some(&[0.5]),
         &[0.2, 0.8],
@@ -2247,11 +2321,27 @@ fn warm_start_objective_is_seed_independent() {
     for v in ws.u.iter_mut() {
         *v = 0.0;
     }
-    let cold = glmm_laplace_deviance(&ws.params.clone(), &mut ws, xf64.as_ref(), &y, &ids, 80);
+    let cold = glmm_laplace_deviance(
+        &ws.params.clone(),
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &[],
+        80,
+    );
     for (c, v) in ws.u.iter_mut().enumerate() {
         *v = 0.05 * (c as f64 - 4.0);
     }
-    let warm = glmm_laplace_deviance(&ws.params.clone(), &mut ws, xf64.as_ref(), &y, &ids, 80);
+    let warm = glmm_laplace_deviance(
+        &ws.params.clone(),
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &[],
+        80,
+    );
     assert!(
         (cold - warm).abs() < 1e-6,
         "objective seed-dependent: cold {cold} warm {warm}"
@@ -2505,7 +2595,15 @@ fn structured_extras_laplace_matches_brute_force() {
         }
         ws.params[nt] = beta[0];
         ws.params[nt + 1] = beta[1];
-        let got = glmm_laplace_deviance(&ws.params.clone(), &mut ws, xf64.as_ref(), &y, &ids, n);
+        let got = glmm_laplace_deviance(
+            &ws.params.clone(),
+            &mut ws,
+            xf64.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            n,
+        );
         let nested = if np > 0 { extra_refs[0] } else { &[][..] };
         let crossed = if ncr > 0 {
             extra_refs[extra_refs.len() - 1]
@@ -2552,6 +2650,9 @@ fn structured_extras_matches_dense() {
             ws.groupings.structured_extras_eligible(),
             "{label}: fixture must be structured-eligible"
         );
+        // Drives the dense kernel (apply_lambda/pirls_solve) directly against a
+        // workspace the constructor sized for the structured route (0×0 m/wm/a/a_chol).
+        ws.ensure_dense_buffers();
         build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
         let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
         let mut params = vec![0.0; nt + p];
@@ -2618,7 +2719,7 @@ fn structured_extras_matches_dense() {
             let GlmmWorkspace {
                 groupings,
                 params: prm,
-                z,
+                z_buf,
                 lam,
                 m_core_buf,
                 cross_val,
@@ -2631,7 +2732,8 @@ fn structured_extras_matches_dense() {
             build_packed_m(
                 groupings,
                 &prm[..],
-                z.as_ref(),
+                z_buf,
+                &extra_ids,
                 lam,
                 &ids,
                 m_core_buf,
@@ -2745,6 +2847,226 @@ fn structured_extras_matches_dense() {
             );
         }
     }
+
+    // q_p=2 case: every shape above is q_p=1 (intercept-only primary), so none
+    // of them exercises build_packed_m's z_buf-sourced primary-core read (read
+    // 1 of the dense-Z phase-2 rewrite) at q>1 -- an unfilled or mis-widened
+    // z_buf would silently zero the slope column and still pass every
+    // assertion above. Reuses `glmm_slope_crossed_dataset` (q_p=2 slope + one
+    // crossed extra), the same fixture `fit_glmm_width_general_slope_and_crossed`
+    // drives end-to-end; same dense-vs-structured comparison, same bands.
+    {
+        let label = "slope_q2_crossed";
+        let (xf64, y, ids, crossed_ids, cluster) = glmm_slope_crossed_dataset();
+        let extra_ids = vec![crossed_ids];
+        let n = y.len();
+        // θ = [vech(Λ_p): σ_int, cov, σ_slope | θ_crossed]; β = [intercept, slope]
+        // (mirrors `agq_vec_k1_reduces_to_laplace_q2`'s q=2 vech convention).
+        let theta = vec![0.5_f64, 0.1, 0.4, 0.45];
+        let mut beta = [0.2_f64, 0.8];
+
+        // Dense reference: apply_lambda → pirls_solve.
+        let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
+        assert!(
+            ws.groupings.structured_extras_eligible(),
+            "{label}: fixture must be structured-eligible"
+        );
+        ws.ensure_dense_buffers();
+        build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
+        let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
+        let mut params = vec![0.0; nt + p];
+        params[..nt].copy_from_slice(&theta);
+        params[nt..].copy_from_slice(&beta);
+        let GlmmWorkspace {
+            groupings,
+            z,
+            m,
+            lam,
+            prior_w,
+            eta,
+            prob,
+            w,
+            u,
+            u_prev,
+            eta_fixed,
+            mu,
+            wm,
+            wx,
+            a,
+            a_chol,
+            a_llt_mem,
+            a_rhs,
+            ..
+        } = &mut ws;
+        apply_lambda(groupings, &params, z.as_ref(), m, lam, n);
+        let dense = pirls_solve(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            k,
+            p,
+            m.as_ref(),
+            xf64.as_ref(),
+            &y,
+            &prior_w[..n],
+            false,
+            &mut params[nt..],
+            BetaStep::Fixed,
+            eta,
+            prob,
+            w,
+            u,
+            u_prev,
+            eta_fixed,
+            mu,
+            wm,
+            wx,
+            a,
+            a_chol,
+            a_rhs,
+            a_llt_mem,
+            None, // offset
+            None,
+            n,
+        );
+
+        // Structured: build_packed_m → pirls_solve_blocked_extras, fresh scratch.
+        // build_packed_m's primary-core read (read 1) sources the slope value from
+        // z_buf, not the dense z build_z fills above -- production hoists this fill
+        // once per fit (`fit_glmm`/`fd_hessian_cov`, see the widened gate in mod.rs/
+        // se.rs); this raw kernel-level test must do the same thing by hand.
+        let mut ws2 = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
+        build_z(&mut ws2, xf64.as_ref(), &ids, &extra_ids, n);
+        fill_z_f64(&ws2.groupings, xf64.as_ref(), &mut ws2.z_buf, n);
+        {
+            let GlmmWorkspace {
+                groupings,
+                params: prm,
+                z_buf,
+                lam,
+                m_core_buf,
+                cross_val,
+                cross_col,
+                n_cross,
+                ..
+            } = &mut ws2;
+            prm[..nt].copy_from_slice(&theta);
+            prm[nt..nt + p].copy_from_slice(&beta);
+            build_packed_m(
+                groupings,
+                &prm[..],
+                z_buf,
+                &extra_ids,
+                lam,
+                &ids,
+                m_core_buf,
+                cross_val,
+                cross_col,
+                n_cross,
+                n,
+            );
+        }
+        let structured = {
+            let GlmmWorkspace {
+                groupings,
+                m_core_buf,
+                cross_val,
+                cross_col,
+                n_cross,
+                prior_w,
+                eta,
+                prob,
+                w,
+                u,
+                u_prev,
+                eta_fixed,
+                mu,
+                core_blocks,
+                coupling,
+                schur_blk,
+                coup_cols,
+                coup_ptr,
+                a_rhs,
+                ..
+            } = &mut ws2;
+            build_coupling_csr(
+                &ids,
+                cross_col,
+                n_cross,
+                groupings.n_primary,
+                n,
+                coup_cols,
+                coup_ptr,
+            );
+            let mut wx_scratch = faer::Mat::<f64>::zeros(n, p);
+            pirls_solve_blocked_extras(
+                crate::Family::Binomial {
+                    link: crate::BinomialLink::Logit,
+                },
+                f64::NAN,
+                groupings,
+                &ids,
+                m_core_buf,
+                cross_val,
+                cross_col,
+                n_cross,
+                xf64.as_ref(),
+                &y,
+                &prior_w[..n],
+                false,
+                &mut beta,
+                BetaStep::Fixed,
+                eta,
+                prob,
+                w,
+                u,
+                u_prev,
+                eta_fixed,
+                mu,
+                core_blocks,
+                coupling,
+                schur_blk,
+                coup_cols,
+                coup_ptr,
+                None,
+                false,
+                a_rhs,
+                &mut wx_scratch,
+                None, // offset
+                None,
+                n,
+            )
+        };
+
+        assert_eq!(dense.3, structured.3, "{label}: convergence flag");
+        assert!(
+            (dense.0 - structured.0).abs() < 1e-9,
+            "{label} dev: dense {} structured {}",
+            dense.0,
+            structured.0
+        );
+        assert!(
+            (dense.1 - structured.1).abs() < 1e-9,
+            "{label} pen: dense {} structured {}",
+            dense.1,
+            structured.1
+        );
+        assert!(
+            (dense.2 - structured.2).abs() < 1e-9,
+            "{label} logdet: dense {} structured {}",
+            dense.2,
+            structured.2
+        );
+        for c in 0..k {
+            assert!(
+                (ws.u[c] - ws2.u[c]).abs() < 1e-7,
+                "{label} u[{c}]: dense {} structured {}",
+                ws.u[c],
+                ws2.u[c]
+            );
+        }
+    }
 }
 
 /// Two legs, distinct roles (2026-07-14 qc=1-downdate-route spec).
@@ -2794,7 +3116,7 @@ fn structured_panel_downdate_matches_scalar() {
             let mut beta = beta0;
             let GlmmWorkspace {
                 groupings,
-                z,
+                z_buf,
                 lam,
                 m_core_buf,
                 cross_val,
@@ -2819,7 +3141,8 @@ fn structured_panel_downdate_matches_scalar() {
             build_packed_m(
                 groupings,
                 &prm[..],
-                z.as_ref(),
+                z_buf,
+                &extra_ids,
                 lam,
                 &ids,
                 m_core_buf,
@@ -3036,7 +3359,15 @@ fn structured_cold_start_overshoot_is_finite() {
     for j in 0..p {
         ws.params[nt + j] = 0.0;
     }
-    let dev = glmm_laplace_deviance(&ws.params.clone(), &mut ws, x.as_ref(), &y, &ids.primary, n);
+    let dev = glmm_laplace_deviance(
+        &ws.params.clone(),
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids.primary,
+        &ids.extra,
+        n,
+    );
     assert!(
             dev.is_finite(),
             "structured cold-start deviance must be finite (step-halving recovers the overshoot), got {dev}"
@@ -3077,6 +3408,7 @@ fn assert_two_stage_matches_single(
         x,
         y,
         primary,
+        extra,
         &targets,
         None,
         &beta_start,
@@ -3093,6 +3425,7 @@ fn assert_two_stage_matches_single(
         x,
         y,
         primary,
+        extra,
         &targets,
         None,
         &beta_start,
@@ -3244,12 +3577,17 @@ fn structured_inference_matches_dense() {
             ws.groupings.structured_extras_eligible(),
             "{label}: eligible"
         );
+        // The dense recomputation below reads ws.m directly against a workspace
+        // the constructor sized for the structured route (0×0 z/m/wm/a/a_chol on
+        // this route — `ensure_dense_buffers` forces them full-size).
+        ws.ensure_dense_buffers();
         build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
         let fit = fit_glmm(
             &mut ws,
             xf64.as_ref(),
             &y,
             &ids,
+            &extra_ids,
             &[1],
             None,
             &[0.2, 0.8],
@@ -3409,7 +3747,10 @@ fn pirls_dense_step_halving_recovers_from_overshoot() {
     let params: Vec<f64> = (0..n_params)
         .map(|i| if i < ws.n_theta { 1.0 } else { 0.0 })
         .collect();
-    let dev = glmm_laplace_deviance(&params, &mut ws, x.as_ref(), &y, &ids, n);
+    // Dense fallback route (asserted above): `extra_ids` is unread here
+    // (`build_packed_m` never runs), so an empty slice is safe even though the
+    // fixture's actual crossed ids aren't threaded back out of it.
+    let dev = glmm_laplace_deviance(&params, &mut ws, x.as_ref(), &y, &ids, &[], n);
     assert!(
         dev.is_finite(),
         "step-halving must rescue the cold-start overshoot, got {dev}"
@@ -3443,6 +3784,9 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
         }),
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
+    // Drives the dense kernel (apply_lambda/pirls_solve) directly against a
+    // workspace the constructor sized for the blocked route (0×0 z/m/wm/a/a_chol).
+    ws.ensure_dense_buffers();
     build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
     // Blind θ (vech Λ_p), β seed = 0. β is a buffer DISTINCT from ws.beta_rhs
@@ -3706,7 +4050,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
         let GlmmWorkspace {
             groupings,
             params,
-            z,
+            z_buf,
             lam,
             m_core_buf,
             cross_val,
@@ -3717,7 +4061,8 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
         build_packed_m(
             groupings,
             params,
-            z.as_ref(),
+            z_buf,
+            &ids.extra,
             lam,
             &ids.primary,
             m_core_buf,
@@ -3882,6 +4227,9 @@ fn structured_profile_beta_matches_dense_profile() {
 
     // Dense reference: apply_lambda → pirls_solve in Profile mode, β seed 0.
     let mut wsd = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
+    // Drives the dense kernel directly against a workspace the constructor sized
+    // for the structured route (0×0 m/wm/a/a_chol).
+    wsd.ensure_dense_buffers();
     build_z(&mut wsd, xf64.as_ref(), &ids, &extra_ids, n);
     let (k, p, nt) = (wsd.k, wsd.p, wsd.n_theta);
     let mut params = vec![0.0; nt + p];
@@ -3973,7 +4321,7 @@ fn structured_profile_beta_matches_dense_profile() {
         let GlmmWorkspace {
             groupings,
             params: prm,
-            z,
+            z_buf,
             lam,
             m_core_buf,
             cross_val,
@@ -3985,7 +4333,8 @@ fn structured_profile_beta_matches_dense_profile() {
         build_packed_m(
             groupings,
             &prm[..],
-            z.as_ref(),
+            z_buf,
+            &extra_ids,
             lam,
             &ids,
             m_core_buf,
@@ -4117,11 +4466,35 @@ fn coupling_csr_rebuilds_on_theta_pinning_transition() {
 
     let fresh = |params: &[f64]| {
         let mut w2 = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
-        glmm_laplace_deviance(params, &mut w2, x.as_ref(), &y, &ids.primary, n)
+        glmm_laplace_deviance(params, &mut w2, x.as_ref(), &y, &ids.primary, &ids.extra, n)
     };
-    let d1 = glmm_laplace_deviance(&unpinned, &mut ws, x.as_ref(), &y, &ids.primary, n);
-    let d2 = glmm_laplace_deviance(&pinned, &mut ws, x.as_ref(), &y, &ids.primary, n);
-    let d3 = glmm_laplace_deviance(&unpinned, &mut ws, x.as_ref(), &y, &ids.primary, n);
+    let d1 = glmm_laplace_deviance(
+        &unpinned,
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids.primary,
+        &ids.extra,
+        n,
+    );
+    let d2 = glmm_laplace_deviance(
+        &pinned,
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids.primary,
+        &ids.extra,
+        n,
+    );
+    let d3 = glmm_laplace_deviance(
+        &unpinned,
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids.primary,
+        &ids.extra,
+        n,
+    );
     assert_eq!(
         d1,
         fresh(&unpinned),
@@ -4185,7 +4558,7 @@ fn pirls_blocked_step_halving_recovers_from_overshoot() {
     let params: Vec<f64> = (0..n_params)
         .map(|i| if i < ws.n_theta { 1.0 } else { 0.0 })
         .collect();
-    let dev = glmm_laplace_deviance(&params, &mut ws, x.as_ref(), &y, &ids, n);
+    let dev = glmm_laplace_deviance(&params, &mut ws, x.as_ref(), &y, &ids, &[], n);
     assert!(
         dev.is_finite(),
         "step-halving must rescue the cold-start overshoot, got {dev}"
@@ -4231,7 +4604,7 @@ fn laplace_deviance_profile_evaluates_and_is_deterministic() {
     let mut params = vec![0.0; nt + p];
     params[..nt].copy_from_slice(&theta);
 
-    let d1 = glmm_laplace_deviance_profile(&params, &mut ws, xf64.as_ref(), &y, &ids, n);
+    let d1 = glmm_laplace_deviance_profile(&params, &mut ws, xf64.as_ref(), &y, &ids, &[], n);
     let beta1 = ws.beta_prof.clone();
     assert!(d1.is_finite(), "Profile deviance must be finite, got {d1}");
     assert!(
@@ -4239,7 +4612,7 @@ fn laplace_deviance_profile_evaluates_and_is_deterministic() {
         "beta_prof must move off its 0 seed (β profiled, not held): {beta1:?}"
     );
 
-    let d2 = glmm_laplace_deviance_profile(&params, &mut ws, xf64.as_ref(), &y, &ids, n);
+    let d2 = glmm_laplace_deviance_profile(&params, &mut ws, xf64.as_ref(), &y, &ids, &[], n);
     let beta2 = ws.beta_prof.clone();
     assert_eq!(
         d1.to_bits(),
@@ -4337,6 +4710,7 @@ fn stage2_objective_is_bit_identical_to_single_stage_objective() {
             x.as_ref(),
             &y,
             &ids.primary,
+            &ids.extra,
             &[0, 1, 2, 3],
             None,
             &beta0,
@@ -4394,7 +4768,7 @@ fn stage2_objective_is_bit_identical_to_single_stage_objective() {
         for v in ws.u_seed[..k].iter_mut() {
             *v = 0.05;
         }
-        glmm_laplace_deviance(pt, &mut ws, x.as_ref(), &y, &ids.primary, n)
+        glmm_laplace_deviance(pt, &mut ws, x.as_ref(), &y, &ids.primary, &ids.extra, n)
     };
 
     for (i, pt) in points.iter().enumerate() {
@@ -4441,6 +4815,7 @@ fn assert_two_stage_adversarial(
         x,
         y,
         primary,
+        extra,
         &targets,
         theta_start,
         &beta_start,
@@ -4456,6 +4831,7 @@ fn assert_two_stage_adversarial(
         x,
         y,
         primary,
+        extra,
         &targets,
         theta_start,
         &beta_start,

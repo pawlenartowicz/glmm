@@ -1211,6 +1211,7 @@ fn sparse_schur_deviance_equals_dense_grouseticks() {
         xm.as_ref().subrows(0, n),
         &y,
         &ids.primary,
+        &ids.extra,
         n,
     );
     ws.force_dense_schur = false;
@@ -1220,6 +1221,7 @@ fn sparse_schur_deviance_equals_dense_grouseticks() {
         xm.as_ref().subrows(0, n),
         &y,
         &ids.primary,
+        &ids.extra,
         n,
     );
 
@@ -1284,6 +1286,7 @@ fn sparse_schur_se_equals_dense_grouseticks() {
             xm.as_ref().subrows(0, n),
             &y,
             &ids.primary,
+            &ids.extra,
             &[0, 1, 2, 3],
             None,
             &beta_start,
@@ -1405,6 +1408,7 @@ fn sparse_schur_small_e_matches_dense() {
             xm.as_ref().subrows(0, n),
             &y,
             &ids.primary,
+            &ids.extra,
             &[0, 1],
             None,
             &beta_start,
@@ -2359,6 +2363,7 @@ fn two_stage_agq_bypass_is_bit_identical() {
             xm.as_ref().subrows(0, n),
             &y,
             &cluster_ids,
+            &[],
             &[0, 1, 2, 3],
             None,
             &beta_start,
@@ -2459,6 +2464,7 @@ fn assert_two_stage_matches_single_local(
             xm.as_ref().subrows(0, n),
             y,
             &ids.primary,
+            &ids.extra,
             &targets,
             None,
             &beta_start,

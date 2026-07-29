@@ -1,5 +1,11 @@
 [deps]
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+# Was only a transitive dep of MixedModels (already pinned in Manifest.toml) --
+# promoted to direct so fit_mixedmodels.jl can `using GLM` for the memory oracle
+# backfill's two fixed-effects-only rows (models.json rows 12/13, no RE term:
+# glm()/lm() instead of MixedModels' fit()). UUID copied from the existing
+# Manifest.toml entry, not fetched fresh.
+GLM = "38e38edf-8417-5370-95a0-9cbb8c7f171a"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 MixedModels = "ff71e718-51f3-5ec2-a782-8ffcbfa3c316"

@@ -191,7 +191,8 @@ pub enum FdHessianStatus {
     NonPdFellBackToRx,
 }
 
-/// Fit the clustered-logistic GLMM. `ws.z` must already be built (build_z) for
+/// Fit the clustered-logistic GLMM. `build_z` must already have run (a no-op on
+/// the no-extras blocked route, where `ws.z` is 0×0 and nothing reads it) for
 /// this (X, ids, N). `beta_start` = spec.effect_sizes. Writes β̂/Var/z² into
 /// ws.{betas,var_diag,t_sq}; returns the GlmmFit summary.
 ///
@@ -224,6 +225,7 @@ pub fn fit_glmm(
     x: MatRef<f64>,
     y: &[f64],
     cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
     target_indices: &[u32],
     theta_start: Option<&[f64]>,
     beta_start: &[f64],
@@ -365,12 +367,13 @@ pub fn fit_glmm(
         p: pf,
         ..
     } = ws;
-    // x is fixed for this fit: widen the slope columns to f64 once, so every
-    // BOBYQA eval's per-solve M fill runs MatRef-free. Blocked path ONLY: the
-    // dense (crossed/nested) branch never reads z_buf, and under a test_formula
-    // reduced fit `x` is the REDUCED design while `primary_slope_cols` index the
-    // FULL one — an unconditional fill could index past x's columns there.
-    if groupings.extra_offsets.is_empty() {
+    // x is fixed for this fit: widen the slope columns to f64 once (blocked AND
+    // structured paths — `build_packed_m`'s primary-core reduction reads it the
+    // same way `pirls_solve_blocked`'s does), so every BOBYQA eval's per-solve M
+    // fill runs MatRef-free. The dense-fallback path skips it: it never reads
+    // z_buf (it reads `x` through `z`/`apply_lambda` instead). `se.rs`'s
+    // `fd_hessian_cov` mirrors this same hoist for its own FD deviance evals.
+    if groupings.extra_offsets.is_empty() || groupings.structured_extras_eligible() {
         fill_z_f64(groupings, x, z_buf, n);
     }
 
@@ -418,6 +421,7 @@ pub fn fit_glmm(
                     &prior_w[..n],
                     weighted,
                     cluster_ids,
+                    extra_ids,
                     eta,
                     prob,
                     w,
@@ -514,6 +518,7 @@ pub fn fit_glmm(
                 &prior_w[..n],
                 weighted,
                 cluster_ids,
+                extra_ids,
                 eta,
                 prob,
                 w,
@@ -668,6 +673,7 @@ pub fn fit_glmm(
             &prior_w[..n],
             weighted,
             cluster_ids,
+            extra_ids,
             eta,
             prob,
             w,
@@ -849,7 +855,7 @@ pub fn fit_glmm(
             // pins the Rx warm path). The kernel re-evals PIRLS itself and its
             // RX fallback runs schur_fill internally, so skip the schur_fill above.
             let mut cov = Mat::<f64>::zeros(p, p);
-            let status = fd_hessian_cov(ws, x, y, cluster_ids, p, n, &mut cov);
+            let status = fd_hessian_cov(ws, x, y, cluster_ids, extra_ids, p, n, &mut cov);
             // Double-failure sentinel: the kernel NaN-fills `cov` when BOTH the joint
             // Hessian and the RX fallback fail. Treat as a failed fit.
             if !cov[(0, 0)].is_finite() {

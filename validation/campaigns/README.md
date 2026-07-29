@@ -44,7 +44,10 @@ above, then `Rscript analyze.R`.
 
 **Question:** with data *generated from known parameters*, how close does each
 engine (glmm, lme4, GLMMadaptive) land to the truth — RMSE, not cross-engine
-agreement?
+agreement? Mirrors Li & Signorelli (2026), *A Comparison of R Packages for
+Estimating GLMMs*, arXiv:2606.15933v1 — same DGP, cell grid, and published
+bias/RMSE baselines (`manifest.json`'s `paper`/`study` fields, `external_repo`
+github.com/xanalee/glmmPackCompare).
 **Verdict** (`reports/final_analysis.txt`, `reports/glmm_vs_engines_rmse.png`):
 see the frozen summaries; convergence is scored by **each engine's own native
 flag** (lme4's untouched), boundary fits reported as their own column split by

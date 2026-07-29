@@ -571,16 +571,29 @@ pub(crate) fn assert_model_shape_pub(model: &ModelSpec, p: usize, nagq: u8) {
 pub fn spec_sized_from_ids_pub(model: &ModelSpec, ids: &GroupIds) -> ModelSpec {
     spec_sized_from_ids(model, ids)
 }
-/// Converts row-major `x` (n·p, unweighted) into a column-major faer matrix.
-/// Shared by every unweighted site; `fit_ols`'s √wᵢ-scaled loop is a distinct
-/// variant and is not routed through this helper.
-pub(super) fn to_col_major(x: &[f64], n: usize, p: usize) -> Mat<f64> {
-    let mut x_mat = Mat::<f64>::zeros(n.max(1), p.max(1));
+/// Fills `dst[0..n, 0..p]` from row-major `x` (n·p, unweighted). Factored out
+/// of `to_col_major` so the `fit_on` hot-path arms (`Ols`/`Glm`/`LmmDense`) can
+/// fill an `n_max`-sized buffer allocated once at `build_workspace`, instead of
+/// allocating a fresh `n×p` `Mat` every call — the same buffer-reuse pattern
+/// `FitKind::GlmmDense`'s `x_mat` already uses. `dst` must be at least `n×p`;
+/// rows/columns past `n`/`p` are left untouched.
+pub(super) fn fill_col_major(dst: &mut Mat<f64>, x: &[f64], n: usize, p: usize) {
     for i in 0..n {
         for j in 0..p {
-            x_mat[(i, j)] = x[i * p + j];
+            dst[(i, j)] = x[i * p + j];
         }
     }
+}
+
+/// Converts row-major `x` (n·p, unweighted) into a column-major faer matrix.
+/// Shared by every unweighted site; `fit_ols`'s √wᵢ-scaled loop is a distinct
+/// variant and is not routed through this helper. Thin wrapper over
+/// [`fill_col_major`] for the call sites that build a throwaway `Mat` once per
+/// call regardless (test-only paths, `fit_glm`, `fit_glm_nb`, `fit_glmm_build`)
+/// — not on the `fit_on` hot path, so the allocation here is not worth removing.
+pub(super) fn to_col_major(x: &[f64], n: usize, p: usize) -> Mat<f64> {
+    let mut x_mat = Mat::<f64>::zeros(n.max(1), p.max(1));
+    fill_col_major(&mut x_mat, x, n, p);
     x_mat
 }
 
