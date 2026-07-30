@@ -110,8 +110,6 @@ test_that("engine-blocked accessors error with the reason", {
   expect_error(fitted(fit), "engine-blocked")
   expect_error(residuals(fit), "engine-blocked")
   expect_error(coef(fit), "fixef")
-  expect_error(logLik(fit), "engine-blocked|not comparable")
-  expect_error(AIC(fit), "engine-blocked|not comparable")
   expect_error(terms(fit), "formula\\(\\) returns")
   expect_error(confint(fit, method = "profile"), "no profiling machinery")
 })

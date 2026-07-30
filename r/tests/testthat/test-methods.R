@@ -109,6 +109,20 @@ test_that("print and summary run and carry the honest header", {
   expect_true(any(grepl("groups: g, 60", sout)))
 })
 
+test_that("logLik carries df/nobs/REML and feeds AIC/BIC", {
+  d <- benchmark_data(seed = 108, family = "binomial")
+  fit <- fastglmm(y ~ t + (1 | g), d, family = binomial())
+  ll <- logLik(fit)
+  expect_s3_class(ll, "logLik")
+  expect_true(is.finite(as.numeric(ll)))
+  # p fixed effects + one RE variance; binomial estimates no dispersion.
+  expect_equal(attr(ll, "df"), 3L)
+  expect_equal(attr(ll, "nobs"), nrow(d))
+  expect_false(attr(ll, "REML"))
+  expect_equal(AIC(fit), -2 * as.numeric(ll) + 2 * attr(ll, "df"))
+  expect_equal(BIC(fit), -2 * as.numeric(ll) + log(nrow(d)) * attr(ll, "df"))
+})
+
 test_that("boundary fits warn with lme4's text plus the pinned component", {
   # tau0 = 0 data: the RE variance pins to the boundary.
   d <- benchmark_data(seed = 107, family = "binomial", tau0 = 1e-8)

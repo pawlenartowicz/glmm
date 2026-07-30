@@ -72,6 +72,27 @@ test_that("poisson random slope (tau0, tau1, rho01) matches glmer", {
   expect_matches_glmer(fit, ref)
 })
 
+test_that("logLik and AIC match lme4, and the LMM value is lmer's REML criterion", {
+  d <- benchmark_data(seed = 206, family = "binomial", tau0 = 0.8)
+  f <- y ~ t + d + (1 | g)
+  fit <- fastglmm(f, d, family = binomial())
+  ref <- glmer_quietly(f, d, family = binomial())
+  expect_equal(as.numeric(logLik(fit)), as.numeric(logLik(ref)), tolerance = 1e-5)
+  expect_equal(attr(logLik(fit), "df"), attr(logLik(ref), "df"))
+  expect_equal(AIC(fit), AIC(ref), tolerance = 1e-4)
+  expect_false(attr(logLik(fit), "REML"))
+
+  # The LMM path is REML-only, so its logLik is lmer's REML criterion, not an ML
+  # value — comparable only across models with identical fixed effects.
+  set.seed(207)
+  dl <- data.frame(g = factor(rep(1:40, each = 8)), t = stats::rnorm(320))
+  dl$y <- 1 + 0.5 * dl$t + stats::rnorm(40)[as.integer(dl$g)] + stats::rnorm(320)
+  fl <- fastglmm(y ~ t + (1 | g), dl)
+  rl <- suppressWarnings(suppressMessages(lme4::lmer(y ~ t + (1 | g), dl)))
+  expect_equal(as.numeric(logLik(fl)), as.numeric(logLik(rl)), tolerance = 1e-6)
+  expect_true(attr(logLik(fl), "REML"))
+})
+
 test_that("the harness's remaining requirements hold: timeable, flagged", {
   # Their design needs a system.time()-able fit and a convergence flag
   # (spec 'Who this is for') — assert both survive the API.

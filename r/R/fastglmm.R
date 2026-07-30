@@ -326,6 +326,11 @@ fastglmm <- function(formula, data, family = gaussian(),
     singular = r$singular,
     n_eval = r$n_eval,
     deviance = r$deviance,
+    # logLik()/AIC()/BIC() inputs. `reml` marks the LMM paths, whose `loglik`
+    # is a REML criterion rather than an ML one - see logLik.fastglmm().
+    loglik = r$loglik,
+    df = as.integer(r$df),
+    reml = r$reml,
     re_group_names = r$re_group_names,
     re_group_terms = r$re_group_terms,
     call = match.call(),

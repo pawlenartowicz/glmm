@@ -83,9 +83,10 @@ print.fastglmm <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
 #'
 #' The coefficient table carries Wald z statistics and normal-based p-values
 #' for all families (the kernel surfaces no residual df, so there is no t).
-#' There is deliberately **no** `AIC BIC logLik deviance` header line: the
-#' engine does not surface a comparable log-likelihood yet, and printing a
-#' fake one would be worse than omitting it.
+#' There is deliberately **no** `AIC BIC logLik deviance` header line. On the
+#' LMM paths `logLik()` is a REML criterion (see [logLik.fastglmm]), so a
+#' printed AIC invites exactly the across-models comparison it is not valid for.
+#' Call `logLik()`/`AIC()` explicitly instead.
 #'
 #' @param object a [fastglmm] fit.
 #' @param ... unused.
@@ -373,14 +374,30 @@ coef.fastglmm <- function(object, ...) {
        "expects from the same call. Use fixef().", call. = FALSE)
 }
 
+#' Log-likelihood of a fastglmm fit
+#'
+#' On `stats::logLik`'s scale, so `AIC()` and `BIC()` work directly. This is
+#' `glmm::Fit::loglik`, not `$deviance` - the latter is the optimizer criterion
+#' and differs from `-2*logLik` by model-dependent constants.
+#'
+#' For an LMM the value is the **REML criterion**, matching `lme4::logLik` on a
+#' REML fit, and the returned object carries `REML = TRUE`. REML criteria are
+#' comparable only between models with identical fixed effects; an AIC across
+#' LMMs with different fixed effects is invalid. The LMM path is REML-only by
+#' design, so there is no ML value to return instead.
+#'
+#' @param object a [fastglmm] fit.
+#' @param ... unused.
+#' @return A `"logLik"` object with `df`, `nobs` and `REML` attributes. `NaN`
+#'   wherever the fit failed, matching `$loglik`.
 #' @export
 logLik.fastglmm <- function(object, ...) {
-  stop("logLik() (and with it AIC/BIC) is engine-blocked: the kernel's ",
-       "optimizer criterion differs from -2*logLik by model-dependent ",
-       "constants and is not comparable across models (see ",
-       "glmm::Fit::deviance); the engine spec ",
-       "2026-07-15-engine-loglik-diagnostics is what fills this in",
-       call. = FALSE)
+  val <- object$loglik
+  attr(val, "df") <- object$df
+  attr(val, "nobs") <- object$nobs
+  attr(val, "REML") <- object$reml
+  class(val) <- "logLik"
+  val
 }
 
 #' @export

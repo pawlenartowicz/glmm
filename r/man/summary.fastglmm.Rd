@@ -18,7 +18,8 @@ matrix (\code{Estimate}, \verb{Std. Error}, \verb{z value}, \verb{Pr(>|z|)}).
 \description{
 The coefficient table carries Wald z statistics and normal-based p-values
 for all families (the kernel surfaces no residual df, so there is no t).
-There is deliberately \strong{no} \verb{AIC BIC logLik deviance} header line: the
-engine does not surface a comparable log-likelihood yet, and printing a
-fake one would be worse than omitting it.
+There is deliberately \strong{no} \verb{AIC BIC logLik deviance} header line. On the
+LMM paths \code{logLik()} is a REML criterion (see \link{logLik.fastglmm}), so a
+printed AIC invites exactly the across-models comparison it is not valid for.
+Call \code{logLik()}/\code{AIC()} explicitly instead.
 }

@@ -8,6 +8,23 @@ shares these entries; Python-specific notes are called out where they differ.
 
 ## [Unreleased]
 
+### Added
+
+- **`logLik()`, `AIC()` and `BIC()` work in the R package.** `fastglmm` blocked
+  `logLik()` with an error pointing at the engine spec that would lift it. That
+  spec landed in 0.1.1: the kernel has carried `Fit::loglik`, `Fit::df` and
+  `Fit::reml` since then, and the Python port has exposed them, but the R fit
+  object dropped the three fields on the way out and the block was never
+  removed. The fields are now carried and `logLik()` returns a `"logLik"`
+  object with `df`, `nobs` and `REML` attributes.
+
+  On an LMM the value is the REML criterion, matching `lme4::logLik` on a REML
+  fit and flagged by `REML = TRUE` — comparable only across models with
+  identical fixed effects, since the LMM path is REML-only by design. `summary()`
+  still prints no `AIC BIC logLik deviance` header line, for that reason.
+
+  Nothing in the kernel changed; this is R-side plumbing only.
+
 ## [0.1.3] — 2026-07-29
 
 An allocation release. Nothing moves an answer and nothing on the public
