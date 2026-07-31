@@ -1,29 +1,43 @@
 name: pin-bands
 
-# Measures the Tier 1 pin bands on a second CPU.
+# Measures the Tier 1 pin bands on a third CPU.
 #
-# `PIN_REL_OLS` and `PIN_REL_ITER` (src/fit/common_tests.rs) are currently pure
-# margin: every pin in the crate reproduces BIT-EXACTLY across debug/release and
-# all four feature configs on the development machine, so the bands cover nothing
-# that was ever observed. They exist because `src/simd_transcendental.rs`
-# dispatches on CPU feature detection, and a runner with a different
-# microarchitecture can shift the last bit. This job is the second machine.
+# Every pin in the crate reproduces BIT-EXACTLY on the anchor machine across
+# debug/release and all four feature configs (`assert_pinned` in
+# src/fit/common_tests.rs names the anchor and holds the full account). The bands
+# are margin for a different microarchitecture, where `src/simd_transcendental.rs`
+# dispatches on CPU feature detection and the compiler contracts multiply-adds
+# elsewhere in the kernel's long reductions. A second machine
+# (aarch64-apple-darwin) has since been measured by hand and is what currently
+# sizes them; this job is the third, and the only one that covers CI's own pool.
 #
-# NOT a gate. It is expected to "fail" every test it runs — that is the
-# mechanism. It rewrites both bands to 0.0 so no pin can pass, and every pin then
-# prints its own relative deviation, which is the number being collected.
-# `assert_pinned` reports the WORST element of each pin, not the first, so the
-# printed value is the spread and not an artifact of index order.
+# NOT a gate. It is expected to "fail" some of the tests it runs — that is the
+# mechanism. It rewrites every band so no pin can pass bar a bit-exact one, and
+# each pin then prints its own relative deviation, which is the number being
+# collected. `assert_pinned` reports the WORST element of each pin, not the
+# first, so the printed value is the spread and not an artifact of index order.
+#
+# THE BANDS ARE REWRITTEN TO 1e-300, NOT 0.0. At 0.0 even a bit-exact pin fails,
+# so each test aborts on its FIRST quantity — a run then reports every test's
+# `beta` and nothing about its `se`, `stddev` or `corr`, which is how a nonzero
+# drift can hide behind an exact one. At 1e-300 a bit-exact quantity passes and
+# the failure lands on the first quantity that actually moved. Neither value
+# reports every quantity in one pass; 1e-300 reports the one that matters.
 #
 # Read the result like this:
-#   every reported rel is 0.00e0  -> CI is bit-exact too; both constants can
-#                                    tighten a long way. Record the CPU below.
-#   some rel is nonzero          -> that spread, plus margin, is the band, and
-#                                    the `lscpu` output goes in the constant's
-#                                    comment. `ubuntu-latest` is a heterogeneous
-#                                    pool, so an unattributed measurement cannot
-#                                    be re-checked later — which is why every leg
-#                                    prints its CPU.
+#   no test fails               -> this CPU is bit-exact too. Record it below;
+#                                  the bands cover it with room to spare.
+#   some rel is nonzero         -> that spread, plus margin, is the band, and
+#                                  the `lscpu` output goes in the anchor note in
+#                                  `assert_pinned`. `ubuntu-latest` is a
+#                                  heterogeneous pool, so an unattributed
+#                                  measurement cannot be re-checked later —
+#                                  which is why every leg prints its CPU.
+#
+# Pins asserted against a frozen R/Julia reference are NOT in scope and will fail
+# here for their own reasons — `fit_glmm_binomial_bigsd_agq_matches_lme4` sits
+# 4.0e-6 from its lme4 golden on any machine. That is cross-engine disagreement,
+# not CPU drift; do not fold it into a band.
 #
 # A pin that moves ONLY under `parallel` is not a band problem. RULE 1 requires
 # parallel results to stay bit-identical to serial, so that is a RULE 1 bug and
@@ -70,18 +84,33 @@ jobs:
           echo "flags: $(lscpu | sed -n 's/^Flags: *//p' | tr ' ' '\n' \
             | grep -E '^(avx|avx2|avx512|fma|sse4|f16c|bmi)' | sort | tr '\n' ' ')"
 
-      - name: force both pin bands to zero
+      - name: force every pin band down to 1e-300
         # Source rewrite rather than an env knob: the bands are `const`, and
         # making them runtime-configurable would put measurement machinery in
         # production test code for a job that runs by hand a few times a year.
         # The edit is asserted rather than assumed — a silent no-op here would
         # produce a green run that measured nothing.
+        #
+        # THE PER-TEST `const BAND` SWEEP IS LOAD-BEARING, not belt-and-braces.
+        # Seven pins moved off PIN_REL_ITER onto their own in-function `BAND` in
+        # 0.1.4, and they are exactly the pins with a measured cross-arch drift —
+        # rewriting only the two PIN_REL_* constants would leave every one of
+        # them running at its shipped band and silently measure nothing. Mirrors
+        # the band list in `assert_pinned`'s anchor note: add a `const BAND` in a
+        # new test file and it must be added here too.
         run: |
-          sed -i 's/^pub(crate) const PIN_REL_OLS: f64 = .*/pub(crate) const PIN_REL_OLS: f64 = 0.0;/' src/fit/common_tests.rs
-          sed -i 's/^pub(crate) const PIN_REL_ITER: f64 = .*/pub(crate) const PIN_REL_ITER: f64 = 0.0;/' src/fit/common_tests.rs
-          grep -q 'PIN_REL_OLS: f64 = 0.0;' src/fit/common_tests.rs || { echo "::error::PIN_REL_OLS rewrite missed"; exit 1; }
-          grep -q 'PIN_REL_ITER: f64 = 0.0;' src/fit/common_tests.rs || { echo "::error::PIN_REL_ITER rewrite missed"; exit 1; }
+          sed -i 's/^pub(crate) const PIN_REL_OLS: f64 = .*/pub(crate) const PIN_REL_OLS: f64 = 1e-300;/' src/fit/common_tests.rs
+          sed -i 's/^pub(crate) const PIN_REL_ITER: f64 = .*/pub(crate) const PIN_REL_ITER: f64 = 1e-300;/' src/fit/common_tests.rs
+          sed -i 's/^\( *\)const BAND: f64 = .*;$/\1const BAND: f64 = 1e-300;/' src/fit/glmm_tests.rs src/sparse/tests.rs
+          grep -q 'PIN_REL_OLS: f64 = 1e-300;' src/fit/common_tests.rs || { echo "::error::PIN_REL_OLS rewrite missed"; exit 1; }
+          grep -q 'PIN_REL_ITER: f64 = 1e-300;' src/fit/common_tests.rs || { echo "::error::PIN_REL_ITER rewrite missed"; exit 1; }
+          # Every remaining `const BAND` must now be 1e-300; one that is not means
+          # the pattern drifted and that pin is measuring nothing.
+          if grep -rn 'const BAND: f64' src/ | grep -v '1e-300'; then
+            echo "::error::a const BAND survived the rewrite (listed above)"; exit 1
+          fi
           grep -n 'PIN_REL_' src/fit/common_tests.rs
+          grep -rn 'const BAND: f64' src/
 
       - name: run the pinned tests and collect every deviation
         # `|| true`: the failures ARE the output. The summary below is what to
