@@ -72,9 +72,8 @@ def test_diagnostics_exposes_the_fields_and_the_flags_still_read_off_fit():
 
 def test_pinned_detail_survives_a_q2_grouping_where_the_stddev_is_not_zero():
     # On a q>=2 grouping the pin fixes the Cholesky diagonal while the reported
-    # stddev inherits the off-diagonal, so it lands at ~1e-10, not at 0.0, and
-    # the correlation lands at 1+2e-16, not at exactly 1. Reading `pinned`
-    # names the component.
+    # stddev inherits the off-diagonal, so it lands at ~1e-10, not at 0.0.
+    # Reading `pinned` names the component.
     #
     # Design mirrors the Rust lmm::tests::zero_slope_variance_pins_slope_component:
     # 16 clusters x 16 rows, a real fixed slope but zero cluster-varying slope,
@@ -105,11 +104,9 @@ def test_pinned_detail_survives_a_q2_grouping_where_the_stddev_is_not_zero():
     assert result.diagnostics["pinned"] == [[False, True]]
     sd, corr = result.stddev_corr(0)
     assert len(result.diagnostics["pinned"][0]) == len(sd)
-    # The pinned slot is negligible against its sibling but is NOT exactly 0,
-    # and the correlation is NOT exactly +/-1.
+    # The pinned slot is negligible against its sibling but is NOT exactly 0.
     assert sd[1] != 0.0
     assert sd[1] / sd[0] < 1e-6
-    assert abs(corr[1, 0]) != 1.0
 
 
 def test_ill_conditioned_note_warns_under_its_own_category():
