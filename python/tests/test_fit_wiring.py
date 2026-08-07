@@ -102,7 +102,7 @@ def test_pinned_detail_survives_a_q2_grouping_where_the_stddev_is_not_zero():
     assert result.diagnostics["boundary"] == "at_boundary"
     # The slope component is the pinned one, aligned with the varcorr block.
     assert result.diagnostics["pinned"] == [[False, True]]
-    sd, corr = result.stddev_corr(0)
+    sd, _corr = result.stddev_corr(0)
     assert len(result.diagnostics["pinned"][0]) == len(sd)
     # The pinned slot is negligible against its sibling but is NOT exactly 0.
     assert sd[1] != 0.0
