@@ -10,6 +10,10 @@
 //!   `formula::lower("y ~ x + (1|g)", &table, family)` builds the kernel's inputs
 //!   from a formula string and a data table instead of by hand.
 //!
+//! - `orchestrate` (cargo feature, off by default): the string-typed fit
+//!   orchestration the FFI ports (`glmm-python`, `glmm-r`) share — like
+//!   `loop_advanced`, NO semver guarantees.
+//!
 //! `parallel` (cargo feature, off by default, **experimental**): enables in-fit
 //! parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool; a
 //! no-op on wasm32; gated at runtime by `FitOptions::parallel_inner` (also off
@@ -46,7 +50,7 @@ mod ols;
 mod sparse;
 mod spec;
 mod start;
-pub use fit::{fit_cold, fit_warm, Fit, FitOptions};
+pub use fit::{fit_cold, fit_warm, Boundary, Diagnostics, Fit, FitOptions, Note};
 pub use ids::GroupIds;
 /// The blind θ start. Re-exported because a caller that must supply
 /// [`StartValues`] (β and θ are bundled) cannot reach the `None`-θ blind path,
@@ -61,6 +65,12 @@ pub(crate) const FLOAT_NEAR_ZERO: f64 = 1e-30;
 
 #[cfg(feature = "loop_advanced")]
 pub mod loop_advanced;
+
+// String-typed fit orchestration shared by the FFI ports (`orchestrate`
+// feature, off by default). Like `loop_advanced`: real surface, no semver
+// promise — its shape follows the ports' needs.
+#[cfg(feature = "orchestrate")]
+pub mod orchestrate;
 
 pub use start::StartValues;
 

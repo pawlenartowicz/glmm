@@ -50,10 +50,25 @@ NumericVector strtod_parse(CharacterVector s) {
 # (DESCRIPTION Version), so this is glmm.rs's CARGO_PKG_VERSION by construction.
 VERSION <- as.character(packageVersion("fastglmm"))
 
-# Timing loop: first (cold) pass discarded, MEDIAN of the rest reported -- the same
-# convention and count as glmm.rs/glmm_python.py's N_RUNS (change together), so the engines'
-# medians are comparable without renormalizing.
-N_RUNS <- 10L
+# Timing is OPT-IN and its sample count lives in run.sh, not here, so the engines'
+# medians are comparable without renormalizing and no mirrored constant has to be
+# kept in step across the five.
+#
+# THE contract, mirrored in glmm.rs / lme4.R / mixedmodels.jl / glmm_python.py
+# `timing_runs` -- change together: VALIDATION_TIMINGS unset / "" / "0" means do not
+# time (`timing` is written null); otherwise it IS the sample count, an integer >= 2,
+# first (cold) pass discarded, MEDIAN of the rest. run.sh validates the value; this
+# errors rather than silently skipping timing when run by hand with a malformed one.
+timing_runs <- function() {
+  v <- trimws(Sys.getenv("VALIDATION_TIMINGS"))
+  if (v == "" || v == "0") return(NULL)
+  n <- suppressWarnings(as.integer(v))
+  if (is.na(n) || n < 2)
+    stop("VALIDATION_TIMINGS must be 0 or an integer >= 2 (got '", v,
+         "'); N=2 keeps 1 sample after the warm-up discard")
+  n
+}
+N_RUNS <- timing_runs()  # NULL on an untimed run
 
 # Suite directory (manifest + data + results root). Mirrors glmm_python.py's SUITE.
 HERE <- normalizePath(dirname(sub("--file=", "",
@@ -143,6 +158,16 @@ build_fit_data <- function(spec, header, rows, factors) {
   data <- build_data(header, rows, factors)
   column <- function(name) strtod_parse(vapply(rows, function(r) r[[match(name, header)]], ""))
 
+  # Manifest `offset`: a plain named-column lookup, no synthesis -- the counterpart of
+  # glmm_python.py::offset_of. Copied to the FIXED name `validation_off` rather than
+  # referenced under its manifest name, so do_fit() can name it as a literal symbol for
+  # fastglmm's eval-in-data (the same reason `validation_wts` exists).
+  oc <- spec[["offset"]]
+  if (!is.null(oc)) {
+    if (!(oc %in% header)) stop("offset ", oc, " not in CSV header")
+    data[["validation_off"]] <- column(oc)
+  }
+
   # `[[` (exact), not `$`: R's `$` partial-matches, so `spec$weights` would return the
   # `weights_col` value on a weights-suite rung (weights absent) and trip the assert.
   w_name <- spec[["weights"]]
@@ -180,14 +205,23 @@ build_family <- function(spec) {
 }
 
 do_fit <- function(data, formula, family, wald_se) {
-  # One fastglmm() call. weights ride as a data column (`validation_wts`) referenced by
-  # name so fastglmm's eval-in-data resolves them deterministically inside the timing
-  # closures, never via parent.frame(). suppressWarnings: the expected singular-boundary
-  # / nAGQ-fallback notices are captured on the fit object (singular, converged), not
-  # needed on stderr for a batch run.
+  # One fastglmm() call. weights and offset ride as data columns (`validation_wts`,
+  # `validation_off`) referenced by name so fastglmm's eval-in-data resolves them
+  # deterministically inside the timing closures, never via parent.frame() -- which is
+  # why the four arms are spelled out rather than assembled with do.call(). No manifest
+  # rung carries both today; the arm exists so one would not silently drop its offset.
+  # suppressWarnings: the expected singular-boundary / nAGQ-fallback notices are captured
+  # on the fit object (singular, converged), not needed on stderr for a batch run.
+  has_w <- "validation_wts" %in% names(data)
+  has_o <- "validation_off" %in% names(data)
   suppressWarnings(
-    if ("validation_wts" %in% names(data))
+    if (has_w && has_o)
+      fastglmm(formula, data, family, weights = validation_wts,
+               offset = validation_off, wald.se = wald_se)
+    else if (has_w)
       fastglmm(formula, data, family, weights = validation_wts, wald.se = wald_se)
+    else if (has_o)
+      fastglmm(formula, data, family, offset = validation_off, wald.se = wald_se)
     else
       fastglmm(formula, data, family, wald.se = wald_se)
   )
@@ -292,7 +326,9 @@ fit_one <- function(spec) {
     # One SE, no method choice: a gaussian rung has a single profiled `se`, a fixed-only
     # GLM (weights suite) has no theta. Emitted in the slot glmm_python.py uses for each -- `se`
     # for gaussian, `se_rx` for fixed-only -- so compare.R's se_rx_of() lines them up.
-    timing <- list(
+    # NA, not NULL, on an untimed run: jsonlite writes an empty object for a NULL
+    # list element and `null` for NA under na = "null".
+    timing <- if (is.null(N_RUNS)) NA else list(
       fit_seconds_median = median_secs(timing_batch,
         function() do_fit(data, formula, family, "hessian")),
       n_runs = N_RUNS, warmup_discarded = 1L, fits_per_sample = timing_batch)
@@ -306,7 +342,7 @@ fit_one <- function(spec) {
     fr_fit <- do_fit(data, formula, family, "rx")
     # Split timing by SE method -- the FD-Hessian is the main time consumer, Rx is one
     # closed-form Schur solve. Same PIRLS fit underlies both.
-    timing <- list(
+    timing <- if (is.null(N_RUNS)) NA else list(
       fit_seconds_median_rx = median_secs(timing_batch,
         function() do_fit(data, formula, family, "rx")),
       fit_seconds_median_hessian = median_secs(timing_batch,
@@ -346,9 +382,13 @@ write_result <- function(ds, source, res) {
   # digits = NA: full-precision doubles. The port gate (TOL$port_rel = 1e-12) compares
   # glmm_r against the Rust glmm row; jsonlite's default 4-digit rounding would fail it.
   writeLines(toJSON(res, auto_unbox = TRUE, pretty = TRUE, digits = NA, na = "null"), out)
-  t <- res$timing$fit_seconds_median %||% res$timing$fit_seconds_median_rx
-  cat(sprintf("glmm_r   %-12s  rung %s  converged=%s  fit_median=%.4fs\n",
-              ds, res$rung, res$converged, t))
+  # `$` on the NA an untimed run leaves behind would error ("invalid for atomic
+  # vectors"), so test for the list first; the console line then omits the time.
+  t <- if (is.list(res$timing)) res$timing$fit_seconds_median %||% res$timing$fit_seconds_median_rx
+       else NULL
+  cat(sprintf("glmm_r   %-12s  rung %s  converged=%s%s\n",
+              ds, res$rung, res$converged,
+              if (is.null(t)) "" else sprintf("  fit_median=%.4fs", t)))
 }
 
 main <- function() {
@@ -368,14 +408,6 @@ main <- function() {
   }
   for (spec in manifest$datasets) {
     if (!want(spec$name)) next
-    # fastglmm() rejects offset= outright (R/fastglmm.R: "the kernel has no
-    # offset field" -- not yet wired into the R package), mirroring how
-    # mixedmodels.jl skips a rung it structurally cannot fit. Print a skip note
-    # rather than erroring the whole port run.
-    if (!is.null(spec[["offset"]])) {
-      cat(sprintf("glmm_r   %-12s  SKIPPED -- fastglmm has no offset= support\n", spec$name))
-      next
-    }
     fit_one(spec)
   }
 }

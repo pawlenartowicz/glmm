@@ -7,10 +7,10 @@ Gauss-Hermite quadrature. lme4-style formulas, estimates validated against
 lme4 and MixedModels.jl (see [`validation.md`](../documentation/validation.md)).
 
 Deliberately scoped to **fast fitting**: fixed effects, Wald standard errors,
-and variance components on the SD/correlation scale. Anything the engine
-cannot compute honestly today (`ranef`, `predict`, `fitted`, `residuals`,
-`logLik`/`AIC`, profiling) is an error naming the reason — never a silently
-different answer.
+variance components on the SD/correlation scale, conditional modes, fitted
+values, and log-likelihood. Anything the engine cannot compute honestly today
+(`predict`, `residuals`, `coef`, profiling) is an error naming the reason —
+never a silently different answer.
 
 ## Installation
 
@@ -31,7 +31,7 @@ install.packages(".", repos = NULL, type = "source")
 
 A full four-section walkthrough — formula in / fit out, families and knobs,
 reading the result, warm starts — is in
-[`TUTORIAL-R.md`](../documentation/TUTORIAL-R.md).
+[`tutorial-r.md`](../documentation/tutorial-r.md).
 
 ```r
 library(fastglmm)

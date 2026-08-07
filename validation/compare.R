@@ -7,7 +7,9 @@
 # Tolerances are PER-QUANTITY (gap doc 5, 1.1) -- one global threshold can't serve
 # point estimates that agree to ~1e-4 and SEs that legitimately differ by percent.
 # Starting points, tuned against the first reference run; recorded here, never
-# relaxed to make an engine pass (oracle is sacred).
+# relaxed to make an engine pass (oracle is sacred). `se_hessian` is additionally
+# PER-RUNG-CAPABLE via tol.R's TOL_PER_RUNG/tol_for -- see the se_hessian gate
+# below for why only that one quantity has the lookup.
 #
 # Each engine's results live split across two dirs, `<engine>_empirical/` and
 # `<engine>_simulated/` (validation/README.md) -- read_engine() merges both.
@@ -119,7 +121,14 @@ for (engine in others) {
       m_se_rx <- mark(d_se_rx, TOL$se_rel)
       if (!is.null(b$estimates$se_hessian)) {
         d_se_h <- rel_max(a$estimates$se_hessian, b$estimates$se_hessian)
-        m_se_h <- mark(d_se_h, TOL$se_hessian_rel)
+        # The ONE per-rung band in the harness (tol.R's TOL_PER_RUNG): every other
+        # gate here reads its flat TOL entry directly. se_hessian is singled out
+        # because it is the only quantity where the corpus-wide band (1e-3) is
+        # orders looser than the agreement the crate documents (<= 2e-5), so a rung
+        # added to guard that agreement needs its own number. `tol_for` falls back
+        # to TOL$se_hessian_rel for any rung without an override; see tol.R's
+        # TOL_PER_RUNG for which rungs override it and the measured numbers.
+        m_se_h <- mark(d_se_h, tol_for(name, "se_hessian_rel"))
       } else { d_se_h <- NA_real_; m_se_h <- "n/a" }
     }
 
@@ -192,31 +201,31 @@ if (length(port) > 0 && length(rust) > 0) {
     # of being laundered into an n/a pass by a blanket is.na() check.
     gate <- function(d, absent = FALSE) if (absent) "n/a" else mark(d, TOL$port_rel)
 
-    d_beta <- rel_max(a$estimates$beta, b$estimates$beta)
+    d_beta <- port_rel_max(a$estimates$beta, b$estimates$beta)
     m_beta <- gate(d_beta)
-    d_se_rx <- rel_max(se_rx_of(a), se_rx_of(b))
+    d_se_rx <- port_rel_max(se_rx_of(a), se_rx_of(b))
     m_se_rx <- gate(d_se_rx)
     no_h <- is.null(a$estimates$se_hessian) || is.null(b$estimates$se_hessian)
-    d_se_h <- if (no_h) NA_real_ else rel_max(a$estimates$se_hessian, b$estimates$se_hessian)
+    d_se_h <- if (no_h) NA_real_ else port_rel_max(a$estimates$se_hessian, b$estimates$se_hessian)
     m_se_h <- gate(d_se_h, no_h)
     no_sd <- is.null(stddevs(a)) && is.null(stddevs(b))
-    d_sd <- if (no_sd) NA_real_ else rel_max(stddevs(a), stddevs(b))
+    d_sd <- if (no_sd) NA_real_ else port_rel_max(stddevs(a), stddevs(b))
     m_sd <- gate(d_sd, no_sd)
     sd_se_a <- stddev_ses(a); sd_se_b <- stddev_ses(b)
     no_sd_se <- is.null(sd_se_a) || is.null(sd_se_b)
-    d_sd_se <- if (no_sd_se) NA_real_ else rel_max(sd_se_a, sd_se_b)
+    d_sd_se <- if (no_sd_se) NA_real_ else port_rel_max(sd_se_a, sd_se_b)
     m_sd_se <- gate(d_sd_se, no_sd_se)
     # deviance is top-level (not under estimates) and identically defined on both
     # sides -- the same Rust field, so it gates like any other number here.
     no_dev <- is.null(a$deviance) || is.null(b$deviance)
-    d_dev <- if (no_dev) NA_real_ else rel_max(a$deviance, b$deviance)
+    d_dev <- if (no_dev) NA_real_ else port_rel_max(a$deviance, b$deviance)
     m_dev <- gate(d_dev, no_dev)
     # loglik: both sides are the SAME kernel (fit_warm(start=NULL) IS fit_cold),
     # so it round-off-gates like beta/se/deviance -- not the looser cross-engine
     # loglik_abs_* bands above, which exist only because lme4/MixedModels are a
     # genuinely different implementation.
     no_ll <- is.null(a$estimates$loglik) || is.null(b$estimates$loglik)
-    d_ll <- if (no_ll) NA_real_ else rel_max(a$estimates$loglik, b$estimates$loglik)
+    d_ll <- if (no_ll) NA_real_ else port_rel_max(a$estimates$loglik, b$estimates$loglik)
     m_ll <- gate(d_ll, no_ll)
     coef_ok <- identical(a$coef_names, b$coef_names)
 
@@ -262,22 +271,22 @@ if (length(port_r) > 0 && length(rust) > 0) {
 
     gate <- function(d, absent = FALSE) if (absent) "n/a" else mark(d, TOL$port_rel)
 
-    d_beta <- rel_max(a$estimates$beta, b$estimates$beta)
+    d_beta <- port_rel_max(a$estimates$beta, b$estimates$beta)
     m_beta <- gate(d_beta)
-    d_se_rx <- rel_max(se_rx_of(a), se_rx_of(b))
+    d_se_rx <- port_rel_max(se_rx_of(a), se_rx_of(b))
     m_se_rx <- gate(d_se_rx)
     no_h <- is.null(a$estimates$se_hessian) || is.null(b$estimates$se_hessian)
-    d_se_h <- if (no_h) NA_real_ else rel_max(a$estimates$se_hessian, b$estimates$se_hessian)
+    d_se_h <- if (no_h) NA_real_ else port_rel_max(a$estimates$se_hessian, b$estimates$se_hessian)
     m_se_h <- gate(d_se_h, no_h)
     no_sd <- is.null(stddevs(a)) && is.null(stddevs(b))
-    d_sd <- if (no_sd) NA_real_ else rel_max(stddevs(a), stddevs(b))
+    d_sd <- if (no_sd) NA_real_ else port_rel_max(stddevs(a), stddevs(b))
     m_sd <- gate(d_sd, no_sd)
     sd_se_a <- stddev_ses(a); sd_se_b <- stddev_ses(b)
     no_sd_se <- is.null(sd_se_a) || is.null(sd_se_b)
-    d_sd_se <- if (no_sd_se) NA_real_ else rel_max(sd_se_a, sd_se_b)
+    d_sd_se <- if (no_sd_se) NA_real_ else port_rel_max(sd_se_a, sd_se_b)
     m_sd_se <- gate(d_sd_se, no_sd_se)
     no_dev <- is.null(a$deviance) || is.null(b$deviance)
-    d_dev <- if (no_dev) NA_real_ else rel_max(a$deviance, b$deviance)
+    d_dev <- if (no_dev) NA_real_ else port_rel_max(a$deviance, b$deviance)
     m_dev <- gate(d_dev, no_dev)
     coef_ok <- identical(a$coef_names, b$coef_names)
 

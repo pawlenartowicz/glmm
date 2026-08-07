@@ -47,14 +47,15 @@
       "reml": true,
       "factors": [
         "batch",
-        "sample"
+        "cask"
       ],
-      "r_formula": "strength ~ 1 + (1 | batch) + (1 | sample)",
-      "jl_formula": "@formula(strength ~ 1 + (1 | batch) + (1 | sample))"
+      "r_formula": "strength ~ 1 + (1 | batch/cask)",
+      "jl_formula": "@formula(strength ~ 1 + (1 | batch) + (1 | batch & cask))"
     },
     {
       "name": "cbpp",
       "rung": 5,
+      "agq": 7,
       "source": "lme4",
       "family": "binomial",
       "reml": null,
@@ -306,6 +307,7 @@
     {
       "name": "cbpp_probit",
       "rung": 22,
+      "agq": 7,
       "source": "lme4",
       "family": "binomial",
       "link": "probit",
@@ -348,6 +350,7 @@
     {
       "name": "sim_binomial_slope1",
       "rung": 25,
+      "agq": 7,
       "source": "sim",
       "family": "binomial",
       "reml": null,
@@ -360,6 +363,7 @@
     {
       "name": "sim_poisson_slope1",
       "rung": 26,
+      "agq": 7,
       "source": "sim",
       "family": "poisson",
       "reml": null,
@@ -372,6 +376,7 @@
     {
       "name": "sim_binomial_slope2",
       "rung": 27,
+      "agq": 7,
       "source": "sim",
       "family": "binomial",
       "reml": null,
@@ -384,6 +389,7 @@
     {
       "name": "sim_poisson_offset",
       "rung": 28,
+      "agq": 7,
       "source": "sim",
       "family": "poisson",
       "reml": null,
@@ -509,6 +515,7 @@
     {
       "name": "glmm_poisson",
       "rung": 37,
+      "agq": 7,
       "source": "sim",
       "family": "poisson",
       "reml": null,
@@ -608,9 +615,49 @@
       "r_formula": "y ~ 1 + x + (1 + x | g)",
       "jl_formula": "@formula(y ~ 1 + x + (1 + x | g))",
       "tier": "weights"
+    },
+    {
+      "name": "sim_binomial_bigsd",
+      "rung": 44,
+      "agq": 7,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x + z + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x + z + (1 | g))"
+    },
+    {
+      "name": "sim_poisson_bigsd",
+      "rung": 45,
+      "agq": 7,
+      "source": "sim",
+      "family": "poisson",
+      "reml": null,
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x + z + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x + z + (1 | g))"
+    },
+    {
+      "name": "sim_sparse_binomial_bigsd",
+      "rung": 46,
+      "source": "sim",
+      "family": "binomial",
+      "reml": null,
+      "factors": [
+        "g1", "c1", "c2", "c3", "c4", "c5", "c6", "c7"
+      ],
+      "r_formula": "y ~ 1 + x + z + (1 | g1) + (1 | c1) + (1 | c2) + (1 | c3) + (1 | c4) + (1 | c5) + (1 | c6) + (1 | c7)",
+      "//": "2-WAY GATE (glmm vs lme4), no jl_formula, by decision rather than by MixedModels limitation: this rung's job is the sparse arm's se_hessian at large theta-hat, and lme4 is the comparator that quantity is calibrated against. MixedModels.jl also throws PosDefException on rung 45, the dense large-theta rung, so a Julia leg in the same theta-hat band would most likely just crash. Same convention as rungs 23/24 and 36: absent jl_formula means engines/mixedmodels.jl skips the rung. Seven crossed intercept-only extras is what routes this to the sparse solver (over MAX_EXTRA_GROUPINGS); every RE block is scalar on purpose, because engines/lme4.R emits stddev_se only for all-scalar binomial/poisson fits and stddev_se is half of what this rung gates. Bernoulli, not Poisson: a Poisson design in this regime pushes counts into the tens of thousands, where the deviance-sum rounding noise dominates the FD Hessian's step independent of any solver tuning (see prep/gen_large_theta_data.R block R4 for the measurement); a Bernoulli response bounds the working weight and removes that noise floor. Sparse-large-theta-hat Poisson coverage is deliberately not attempted for this reason, not a gap left open."
     }
   ],
-  "//gamma_rungs": "Rung 23 (sim_gamma, dense) RE-LANDED after the B1 varcorr sigma-hat^2 fix (2026-07-11 bug-fixes spec). Rung 24 (sim_sparse_gamma) RE-LANDED 2026-07-21: the backed-out failure was DIAGNOSED AND FIXED by the frontend RE-ordering change -- the parser used to extract slope REs before intercept REs, so the harness lowered (1|gp)+(1+x1..x4|ge) with ge as PRIMARY (q_p=5) and routed the DENSE kernel, whose joint optimizer lands ~2e-3 deviance above the tolPwrss=1e-13 lme4 optimum (beta[0] 1.9e-2 off). The frontend now lowers random effects in FORMULA ORDER (nested terms still sort first -- NestedWithin is relative to the primary), so gp is primary, the model routes SPARSE, and it lands 2e-4 above lme4 -- matching the in-crate golden that hand-builds the same orientation. Tolerances were NOT relaxed. STILL OPEN (recorded, not a rung gap): the dense joint optimizer's ~2e-3 shortfall on a q_p=5 primary with an extra grouping is real and reachable by writing the slope term first; the ordering fix stops ROUTING rung 24 there, it does not improve that path (dense stage-1/2 schedule work is a separate item). These are rung-18-style 2-WAY gates (no jl_formula): MixedModels' Gamma GLMM is a documented different estimator, its JSONs stay intentionally absent. See validation/README.md. GAMMA-INVERSE WITH RANDOM EFFECTS, SPARSE: attempted 2026-07-21 as spec sim_sparse_gamma_inv over the sim_sparse_gamma data and ABANDONED -- no oracle is obtainable there. That data is simulated under a LOG link and spans y 0.0045..265, so an inverse-link model is misspecified for it: eta goes negative, mu = 1/eta with it, and the Gamma likelihood is undefined. lme4 dies with 'PIRLS loop resulted in NaN value', and so does a plain fixed-only stats::glm on the same formula -- the failure is the data, not the mixed solver. Oracling this cell needs a dataset simulated under the inverse link, which is a new simulated fixture and a separate decision. The DENSE Gamma-inverse mixed cell is covered: sim_gamma_inv_glmm fits cleanly on sim_gamma.",
+  "//large_theta_rungs": "Rungs 44-46 + the two sim_binomial_bigsd_agq_k* goldens: the large-theta-hat regime. Rung 44 sim_binomial_bigsd is Bernoulli, scalar (1|g), 300 groups x 6 obs, fitted theta-hat 4.5106 -- 3.4x the corpus's previous GLMM maximum (1.339, VerbAgg); rung 45 sim_poisson_bigsd is the count-family counterpart at 2.9716. Both are Laplace (nAGQ=1) curated rungs on the EXISTING tiers, not a new tier and not an expansion of the curated 6-rung cross-engine oracle (design 6). Rung 46 sim_sparse_binomial_bigsd is the SPARSE arm of the same regime -- one primary grouping g1 (300 groups x 12) plus seven crossed intercept-only extras c1-c7, fitted theta-hat(g1) 3.9076 -- added because rungs 44-45 are both dense-routed scalar (1|g), so the sparse solver's large-theta-hat behavior was untested rather than merely uncalibrated (A4 A2.0a batch); it is a 2-way gate (glmm vs lme4 only, see its own '//' comment above for why). Their data comes from prep/gen_large_theta_data.R, the third of the five prep scripts (export_data.R rungs 1-28, gen_weights_data.R 29-43, gen_illcond_data.R, gen_scale_data.R). THE THIRD DATASET OF THAT SPEC, sim_binomial_zerosd (theta = 0 exactly), IS DELIBERATELY NOT A RUNG: lme4's vcov(m, use.hessian = TRUE) HARD-ERRORS on a boundary fit ('Hessian is unavailable' -- m@optinfo$derivs is NULL), which is exactly what engines/lme4.R:269 and :146 call, so adding it as a curated rung would abort the whole oracle run. What it exists to gate is a FLAG divergence, not a number -- lme4 warns 'boundary (singular) fit' (so engines/lme4.R records converged = FALSE) while glmm pins the component and reports converged = true with singular = true, and BOTH land on a bit-exact 0.0 stddev, so compare.R's numeric gates would see nothing. It is gated in-crate instead, by glmm_zerosd_boundary_reports_converged_and_singular in src/fit/glmm_tests.rs, which needs no oracle JSON. Verified 2026-07-30 that rel_max(0.0, 0.0) = 0 on this dataset, i.e. the two engines do not straddle rel_max's 1e-12 denominator floor.",
+  "//gamma_rungs": "Rung 23 (sim_gamma, dense) RE-LANDED after the B1 varcorr sigma-hat^2 fix. Rung 24 (sim_sparse_gamma) RE-LANDED 2026-07-21: the backed-out failure was DIAGNOSED AND FIXED by the frontend RE-ordering change -- the parser used to extract slope REs before intercept REs, so the harness lowered (1|gp)+(1+x1..x4|ge) with ge as PRIMARY (q_p=5) and routed the DENSE kernel, whose joint optimizer lands ~2e-3 deviance above the tolPwrss=1e-13 lme4 optimum (beta[0] 1.9e-2 off). The frontend now lowers random effects in FORMULA ORDER (nested terms still sort first -- NestedWithin is relative to the primary), so gp is primary, the model routes SPARSE, and it lands 2e-4 above lme4 -- matching the in-crate golden that hand-builds the same orientation. Tolerances were NOT relaxed. STILL OPEN (recorded, not a rung gap): the dense joint optimizer's ~2e-3 shortfall on a q_p=5 primary with an extra grouping is real and reachable by writing the slope term first; the ordering fix stops ROUTING rung 24 there, it does not improve that path (dense stage-1/2 schedule work is a separate item). These are rung-18-style 2-WAY gates (no jl_formula): MixedModels' Gamma GLMM is a documented different estimator, its JSONs stay intentionally absent. See validation/README.md. GAMMA-INVERSE WITH RANDOM EFFECTS, SPARSE: attempted 2026-07-21 as spec sim_sparse_gamma_inv over the sim_sparse_gamma data and ABANDONED -- no oracle is obtainable there. That data is simulated under a LOG link and spans y 0.0045..265, so an inverse-link model is misspecified for it: eta goes negative, mu = 1/eta with it, and the Gamma likelihood is undefined. lme4 dies with 'PIRLS loop resulted in NaN value', and so does a plain fixed-only stats::glm on the same formula -- the failure is the data, not the mixed solver. Oracling this cell needs a dataset simulated under the inverse link, which is a new simulated fixture and a separate decision. The DENSE Gamma-inverse mixed cell is covered: sim_gamma_inv_glmm fits cleanly on sim_gamma.",
+  "//agq_field": "`agq: <k>` marks the datasets AGQ can be run on, for the OPT-IN timing pass only (VALIDATION_AGQ, read by engines/lme4.R and engines/glmm.rs). It is inert on a normal run: the curated cross-engine sweep stays pinned at nAGQ=1 (engines/lme4.R's fit_call) and the AGQ pass writes to results/{lme4,glmm}_agq_*, which compare.R's results/lme4_{empirical,simulated}/*.json glob never sees -- design 6, 'the curated 6-rung oracle is NOT expanded'. Eligibility is glmm's AGQ gate (src/glmm/deviance.rs): binomial/Poisson, ONE grouping factor, q <= 3. Arabidopsis and sim_poisson_nested are excluded for having two groupings. The three vector-RE entries (sim_binomial_slope1/sim_poisson_slope1 q=2, sim_binomial_slope2 q=3) are glmm-only -- glmer refuses nAGQ>1 for vector REs, so lme4.R skips them and their rows carry no lme4 time.",
   "//m3_goldens": "M3 family/link/AGQ reference fits for the IN-CRATE frozen goldens (NOT curated rungs). Generated by engines/goldens_agq.R into validation/goldens/<name>.json -- a SEPARATE dir so compare.R's results/<engine>/*.json glob (the curated cross-engine sweep) is untouched, per design 6 'the curated 6-rung oracle is NOT expanded'. lme4/MASS only; no Julia/Rust cross-check. Every golden in goldens/ must have an entry here and therefore a generator -- sleepstudy_lmm, penicillin_lmm and pastes_lmm sat in goldens/ unregistered and unregenerable until 2026-07-21; they are the SAME datasets as rungs 2/3/4 but distinct model specs (pastes_lmm is the nested (1|batch/cask) form, rung 4 is the flat idiom), which is why they are separate goldens rather than rung results. Their files previously predated this script and carried its predecessor's schema (reml instead of nagq, 12-sig-fig rounding, and pastes_lmm's varcomp blocks in the opposite order to the cask:batch-first order lme4 emits today). Regenerating them reproduced every estimate (penicillin stddev to 6e-7, the rounding; pastes to 1e-7 once the two blocks are matched by name), so the regenerated form was ADOPTED 2026-07-21 and all three are now byte-reproducible from this script. Adopting it required first converting every multi-block varcomp read in the crate to key by group NAME rather than index: glmm emits declaration order, lme4's VarCorr emits descending level count, and pastes_lmm is the fixture where the two disagree.",
   "m3_goldens": [
     {
@@ -1066,6 +1113,17 @@
       "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 | g)"
     },
     {
+      "name": "sim_dynrange_lmm",
+      "kind": "lmm",
+      "data": "sim_dynrange_lmm",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + u + w + (1 | g)"
+    },
+    {
       "name": "sim_poisson_highmean_glm",
       "kind": "glm",
       "data": "sim_poisson_highmean",
@@ -1110,7 +1168,38 @@
         "cask"
       ],
       "r_formula": "strength ~ 1 + (1 | batch/cask)"
-    }
+    },
+    {
+      "name": "sim_binomial_bigsd_agq_k7",
+      "kind": "glmm",
+      "data": "sim_binomial_bigsd",
+      "family": "binomial",
+      "link": "logit",
+      "nagq": 7,
+      "tolPwrss": 1e-13,
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x + z + (1 | g)"
+    },
+    {
+      "name": "sim_binomial_bigsd_agq_k11",
+      "kind": "glmm",
+      "data": "sim_binomial_bigsd",
+      "family": "binomial",
+      "link": "logit",
+      "nagq": 11,
+      "tolPwrss": 1e-13,
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x + z + (1 | g)"
+    },
+    {"name": "sim_scale_logit_glm", "kind": "glm", "data": "sim_scale_logit", "family": "binomial", "link": "logit", "r_formula": "y ~ 1 + x"},
+    {"name": "sim_scale_logit_small_glm", "kind": "glm", "data": "sim_scale_logit", "family": "binomial", "link": "logit", "r_formula": "y ~ 1 + x_small"},
+    {"name": "sim_scale_logit_big_glm", "kind": "glm", "data": "sim_scale_logit", "family": "binomial", "link": "logit", "r_formula": "y ~ 1 + x_big"},
+    {"name": "sim_scale_sep_glm", "kind": "glm", "data": "sim_scale_sep", "family": "binomial", "link": "logit", "r_formula": "y ~ 1 + x"},
+    {"name": "sim_scale_gamma_inv_glm", "kind": "glm", "data": "sim_scale_gamma_inv", "family": "gamma", "link": "inverse", "r_formula": "y ~ 1 + x"}
   ],
-  "//weights_tier": "WEIGHTS validation suite (docs/GLMM/2026-07-10-weights-parity-harness-design.md), fit by the same engines/compare as every other rung. Conventions on top of the main manifest: `weights_col` names a plain per-row prior-weight CSV column (mutually exclusive with the aggregated-binomial `weights` field); rungs WITHOUT a jl_formula are lme4-only (fixed-only models MixedModels cannot fit, or R-only pathologicals) and fit.jl skips them; `gate` marks the two fit-time special gates (dropped_rows in fit.R, unit_identity in fit.rs)."
+  "//weights_tier": "WEIGHTS validation suite, fit by the same engines/compare as every other rung. Conventions on top of the main manifest: `weights_col` names a plain per-row prior-weight CSV column (mutually exclusive with the aggregated-binomial `weights` field); rungs WITHOUT a jl_formula are lme4-only (fixed-only models MixedModels cannot fit, or R-only pathologicals) and fit.jl skips them; `gate` marks the two fit-time special gates (dropped_rows in fit.R, unit_identity in fit.rs)."
 }

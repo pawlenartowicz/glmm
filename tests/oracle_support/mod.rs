@@ -42,7 +42,7 @@ pub mod tol {
     pub const AGQ_STDDEV_REL: f64 = 4e-3;
     /// ABSOLUTE — correlations near zero break a relative band. Reused for the
     /// non-AGQ LMM correlation blocks too: `tol.R` has no separate non-AGQ
-    /// correlation constant, `analyze_diligent.R` already reuses this one, and
+    /// correlation constant, the estimate-grid `analyze.R` already reuses this one, and
     /// only three goldens carry a real off-diagonal — too thin a base to
     /// calibrate a second constant on.
     pub const AGQ_CORR_ABS: f64 = 4e-3;
@@ -106,9 +106,8 @@ fn one() -> u8 {
 pub struct Est {
     /// `None` at a coefficient the reference DROPPED as aliased — R writes `NA`,
     /// which `jsonlite` emits as `null`. glmm instead reports NaN and flags
-    /// `aliased[j]`, a deliberate divergence (`glmm-vs-lme4-mixedmodels.md`,
-    /// "changes the answer"), so these slots are asserted as divergences rather
-    /// than parsed away.
+    /// `aliased[j]`, a deliberate divergence, so these slots are asserted as
+    /// divergences rather than parsed away.
     pub beta: Vec<Option<f64>>,
     /// LMM / plain-GLM standard errors.
     #[serde(default)]
@@ -159,11 +158,22 @@ impl Est {
 
 // ── Comparison helpers ───────────────────────────────────────────────────────
 
+/// Coordinates both engines put at zero, below which a relative difference has
+/// no answer to give: glmm pins to a hard 0.0 while an oracle stops on its own
+/// residue, and `|x-y| / max(|x|,|y|)` reads exactly 1.0 however small that
+/// residue gets. Mirrors `TOL$near_zero_abs` in `validation/tol.R`, which
+/// carries the measurement it was sized from — change together.
+const NEAR_ZERO_ABS: f64 = 1e-3;
+
 /// Relative difference against the larger magnitude, matching `tol.R::rel_max`
-/// (`|x-y| / max(|x|,|y|,1e-12)`) so a Rust failure and an R failure mean the
-/// same thing on the same pair.
+/// (`|x-y| / max(|x|,|y|,1e-12)`, exempting coordinates under `NEAR_ZERO_ABS`)
+/// so a Rust failure and an R failure mean the same thing on the same pair.
 fn rel(got: f64, want: f64) -> f64 {
-    (got - want).abs() / got.abs().max(want.abs()).max(1e-12)
+    let scale = got.abs().max(want.abs()).max(1e-12);
+    if scale <= NEAR_ZERO_ABS {
+        return 0.0;
+    }
+    (got - want).abs() / scale
 }
 
 pub fn assert_rel(got: f64, want: f64, band: f64, ctx: &str) {
@@ -186,9 +196,8 @@ pub fn assert_abs(got: f64, want: f64, band: f64, ctx: &str) {
 /// rank-deficiency divergence wherever the reference dropped a column.
 ///
 /// lme4 and `stats::glm` silently drop an aliased column and report `NA`; glmm
-/// keeps the slot, reports NaN and sets `aliased[j]`
-/// (`glmm-vs-lme4-mixedmodels.md`, "changes the answer"). Asserting both
-/// directions means the divergence has to still be there — if a reference ever
+/// keeps the slot, reports NaN and sets `aliased[j]` — a deliberate divergence.
+/// Asserting both directions means the divergence has to still be there — if a reference ever
 /// starts reporting the coefficient, or glmm stops flagging it, this fails
 /// instead of silently passing.
 pub fn assert_coefs(

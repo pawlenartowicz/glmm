@@ -115,6 +115,11 @@ pub(crate) fn laplace_deviance(
     // Per-row linear-predictor offset (`FitOptions::offset`), forwarded to every
     // PIRLS/AGQ variant's `eta_fixed` fill. `None` ⇒ no offset.
     offset: Option<&[f64]>,
+    // Observation-only: incremented below when a fit-path PIRLS solve (the
+    // Laplace branch only — AGQ's own per-cluster PIRLS, above, is not
+    // instrumented) runs the full iteration cap without converging. Never read
+    // by anything on the numeric path; see `Note::PirlsExhausted`.
+    pirls_exhausted: &mut u32,
 ) -> f64 {
     let n_theta = groupings.n_theta();
     // Fixed-mode β: a value-exact copy of `params[n_theta..n_theta+p]` into the
@@ -336,6 +341,17 @@ pub(crate) fn laplace_deviance(
             n,
         )
     };
+    // `!conv` with a FINITE `dev` is exactly the natural iteration-cap
+    // exhaustion: the three PIRLS variants return `(NaN, NaN, NaN, false)` from
+    // every OTHER failure path (halving exhausted, non-PD Cholesky), so a
+    // finite `dev` alongside `!conv` can only mean the `for` loop ran out its
+    // `PIRLS_MAX_ITERS` iterations still inside a rising/falling accepted
+    // sequence. Gated on `pirls_tol_override.is_none()` — the FD-Hessian SE
+    // evals run their own tight tolerance and must not count (mirrors the
+    // fit-path-vs-FD-eval discriminator `sparse_glmm_deviance` already uses).
+    if !conv && dev.is_finite() && pirls_tol_override.is_none() {
+        *pirls_exhausted += 1;
+    }
     if !conv || !dev.is_finite() {
         return f64::INFINITY;
     }
@@ -454,6 +470,7 @@ fn laplace_deviance_ws(
         schur_llt_mem,
         beta_prof,
         beta_prev,
+        pirls_exhausted,
         ..
     } = ws;
     let (beta, beta_step_rhs): (&mut [f64], &mut [f64]) = if profile_beta {
@@ -519,6 +536,7 @@ fn laplace_deviance_ws(
         n,
         cluster_rows.as_ref(),
         offset,
+        pirls_exhausted,
     )
 }
 

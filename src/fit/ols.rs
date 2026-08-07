@@ -6,8 +6,23 @@ use faer::Mat;
 
 use crate::ols::{OlsFitView, OlsScratch, OlsSuffStats, PANEL_ROWS};
 
-use super::common::{fill_se_compact, nan_vcov, vcov_from_chol};
+use super::common::{fill_se_compact, nan_vcov, vcov_from_chol, FitDiagnostics};
 use super::{Fit, FitOptions};
+
+impl OlsFitView<'_> {
+    /// This route's [`FitDiagnostics`]. No θ, so no boundary or pin state; the
+    /// recorded pivot is measured on the **weighted** Gram, which is the whole
+    /// reason it is worth reporting — the pre-dispatch alias gate tests the raw
+    /// `x` and a design full-rank unweighted can be near-singular once weighted.
+    pub(crate) fn diagnostics(&self) -> FitDiagnostics {
+        FitDiagnostics {
+            pivot: self.pivot,
+            pivot_col: self.pivot_col,
+            ill_conditioned: self.pivot < crate::ols::PIVOT_MIN,
+            ..FitDiagnostics::fixed_only(self.converged)
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // OLS dispatch
@@ -154,7 +169,6 @@ pub(crate) fn fit_ols_prebuilt<'a>(
         suff_sum_y,
         suff_n_rows,
         &opts.target_indices,
-        1e-12,
         ws.suff_xtx_work.as_mut(),
         scratch,
     )
@@ -187,7 +201,8 @@ pub(crate) fn ols_view_to_fit(
     // view.betas is compact [0..p]; view.var_diag is compact [0..t] at target rank
     // (OLS/GLM are target-compact; LME/LMM are predictor-indexed)
     let beta = view.betas.to_vec();
-    let converged = view.converged;
+    let diag = view.diagnostics();
+    let converged = diag.converged;
     let mut se = vec![f64::NAN; p];
     fill_se_compact(view.var_diag, &opts.target_indices, &mut se);
     // `view.factor` is stale-or-zero unless `converged` (its documented
@@ -233,13 +248,18 @@ pub(crate) fn ols_view_to_fit(
         tau2: vec![],
         // σ̂² = RSS/(n−p); NaN when not converged (nonconverged_view's fill).
         dispersion: view.sigma_sq,
-        converged,
+        // `singular` comes out of `boundary_hit == 1`, and this route has no θ
+        // to pin: the carrier documents `boundary_hit` as meaningless here and
+        // fixes it at 0, so `singular` is constant false on OLS. That is the
+        // right report — "no variance component collapsed" is trivially true
+        // where there are none — but it means nothing on this route can ever
+        // make it true, and a test comparing against it is comparing constants.
+        // Mirrors `glm.rs` — change together.
+        diagnostics: super::common::materialize_diagnostics(&diag, p, &[]),
         varcorr: vec![],
         stddev_se: vec![],
-        aliased: vec![false; p],
         n_eval: 0,
         deviance: f64::NAN,
-        singular: false,
         loglik,
         // p fixed effects + σ² (R logLik.lm's df).
         df: if converged { p + 1 } else { 0 },

@@ -3,7 +3,7 @@
 //! validation rung: no oracle JSON, no golden comparison -- this binary exists
 //! only so memory.sh can wrap it in `/usr/bin/time -f '%M'` and read peak RSS
 //! for an arbitrary generated CSV + formula, the same way it wraps the
-//! manifest-driven `validation_fit` example for the 43 curated rungs.
+//! manifest-driven `validation_fit` example for the curated manifest rungs.
 //!
 //! Usage:
 //!   memory_fit <csv> <formula> <family> [link] [factors_csv] [nagq]
@@ -79,5 +79,5 @@ fn main() {
     // invoking this binary to cap the optimizer's eval budget; it changes
     // nothing about the workspace allocation being measured.
     let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    println!("n={} p={} converged={}", lo.n, lo.p, fit.converged);
+    println!("n={} p={} converged={}", lo.n, lo.p, fit.converged());
 }

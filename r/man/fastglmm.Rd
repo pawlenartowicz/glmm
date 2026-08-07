@@ -11,6 +11,7 @@ fastglmm(
   weights = NULL,
   subset = NULL,
   na.action = getOption("na.action"),
+  offset = NULL,
   nAGQ = 1L,
   start = NULL,
   wald.se = c("hessian", "rx"),
@@ -45,6 +46,15 @@ as the response and the trial count here (the same model as
 resolved before the kernel sees the data; an action that leaves them in
 place (\code{na.pass}) is an error.}
 
+\item{offset}{optional per-row known additive term on the
+linear-predictor scale, \code{glm}'s \verb{offset=}: \verb{eta = offset + X b (+ Z u)},
+with no coefficient estimated for it. The usual use is a Poisson rate
+model with a known exposure, \code{offset = log(exposure)}. Evaluated in
+\code{data}, so an expression works; \verb{subset=} and \code{na.action} drop its
+entries with the rows. Positioned after \code{na.action} as in \link[stats:glm]{stats::glm}.
+The \code{offset()} \strong{formula term} remains unsupported - the shared parser
+has no such term.}
+
 \item{nAGQ}{adaptive Gauss-Hermite node count: an odd integer in
 \verb{1..=25} (\code{1} = Laplace, the default). More permissive than lme4 in range
 but see the fallback note in Details.}
@@ -66,13 +76,15 @@ search, so any non-\code{NULL} value is an error (the default cold start is
 what runs).}
 
 \item{...}{intercepted, never silently swallowed: known lme4 arguments
-(\code{REML}, \code{control}, \code{verbose}, \code{contrasts}, \code{offset}) raise errors saying
-why they cannot be honored; unknown names error as unused arguments.}
+(\code{REML}, \code{control}, \code{verbose}, \code{contrasts}) raise errors saying why they
+cannot be honored; unknown names error as unused arguments.}
 }
 \value{
 An object of class \code{"fastglmm"}: fixed effects (\link{fixef}), Wald
 covariance (\code{vcov()}), variance components on the SD/correlation scale
-(\link{VarCorr}), \code{converged} and \code{singular} flags (\link{isSingular}), plus
+(\link{VarCorr}), \code{converged} and \code{singular} flags (\link{isSingular}), a
+\code{diagnostics} list (the solver's own report: \code{boundary}, \code{pinned},
+\code{notes}, plus the three flags above), plus
 \code{print()}, \link[=summary.fastglmm]{summary()}, \link[=confint.fastglmm]{confint()}
 (Wald), \code{nobs()}, \link[=formula.fastglmm]{formula()} (returns the formula
 \strong{string}), \code{family()}, and \code{model.frame()}. Engine-blocked accessors
@@ -113,9 +125,18 @@ effects per group. Any other shape \strong{warns and falls back to Laplace}
 get is a Laplace fit, and the warning is the only notice. This mirrors the
 Python port so the two ports agree.
 
+\strong{Diagnostic warnings carry a condition class.} Each solver note is raised
+as a warning of class \code{"fastglmm_diagnostic"} with a per-kind subclass
+(\code{"fastglmm_ill_conditioned"}, \code{"fastglmm_pirls_exhausted"}; a note from a
+newer kernel than this package arrives as \code{"fastglmm_unknown_note"}), so
+\code{withCallingHandlers()} and \code{suppressWarnings(classes = )} can select them
+without matching message text.
+
 Anything the engine cannot do is an error naming the reason - never a
 silently different model. That includes \code{REML = FALSE} (the LMM path is
-REML-only \strong{by design}), \code{offset()}, \verb{control=}/\verb{verbose=},
+REML-only \strong{by design}), the \code{offset()} \strong{formula term} (the \verb{offset=}
+argument is supported - only the parser has no such term),
+\verb{control=}/\verb{verbose=},
 \code{family = inverse.gaussian()} and \code{link = "cloglog"} (approved for GLMM
 0.1.1, not yet in the kernel), and quasi-likelihood \verb{dispersion=} on
 binomial/poisson.

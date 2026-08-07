@@ -17,7 +17,7 @@ link default (§2).
 > **Status:** this release ships the full API surface — `fastglmm()`, argument
 > validation, every working accessor — wired end to end through the extendr
 > binding: a valid call parses the formula, fits, and returns a real
-> `"fastglmm"` object. Four narrow combinations are GLMM 0.1.1 gaps and raise a
+> `"fastglmm"` object. Four narrow combinations are open gaps and raise a
 > clean error naming the reason instead of fitting: `family = inverse.gaussian()`,
 > `binomial("cloglog")`, quasi-likelihood `dispersion=` on binomial/poisson, and
 > an `init.theta=` shape seed (see §2).
@@ -38,8 +38,8 @@ install.packages("fastglmm",
 ```
 
 (Same models from other surfaces: the Python port —
-[`TUTORIAL-PYTHON.md`](TUTORIAL-PYTHON.md) — and the Rust crate this package
-binds — [`TUTORIAL-RUST.md`](TUTORIAL-RUST.md), hand-built inputs instead of a
+[`tutorial-python.md`](tutorial-python.md) — and the Rust crate this package
+binds — [`tutorial-rust.md`](tutorial-rust.md), hand-built inputs instead of a
 formula.)
 
 ## 1. One call — formula in, fit out
@@ -55,6 +55,7 @@ library(fastglmm)
 data <- data.frame(
   y     = c(1.02, 1.05, 1.11, 1.13, 1.21, 1.24, 1.30, 1.33, 1.42, 1.44, 1.51, 1.53),
   x1    = c(0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1),
+  s     = c(0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1),
   group = factor(rep(letters[1:6], each = 2))
 )
 
@@ -130,6 +131,14 @@ The knobs:
   aggregated binomial, pass the success **proportion** as the response and the
   trial count here — the same model as `cbind(successes, failures)`, whose syntax
   the parser does not accept. Weights must be strictly positive.
+- `offset` — per-row known additive term on the linear-predictor scale,
+  `glm`'s `offset=`: `η = offset + Xβ (+ Zb)`, with no coefficient estimated
+  for it and no column added to the design. The canonical use is a Poisson
+  rate model against a known exposure, `offset = log(exposure)`. Honored for
+  every family and every solver path; `NULL` (default) means no offset.
+  Evaluated in `data`, so an expression works; the formula's `offset()` term
+  is still rejected (see [`formula.md`](formula.md)) — pass the vector here
+  instead.
 - `start` — warm start; see §4.
 - `init.theta` — negative-binomial shape seed, named for
   `MASS::glm.nb(init.theta=)`, and **distinct** from `start$theta` (the
@@ -144,9 +153,9 @@ kernel: loud enough to catch the mistake, lenient enough for exploration.
 
 Three things error *naming the reason* rather than fitting a silently different
 model. Known lme4 arguments passed through `...` (`REML = FALSE`, `control=`,
-`verbose=`, `contrasts=`, `offset=`) each explain why they can't be honored
+`verbose=`, `contrasts=`) each explain why they can't be honored
 (`REML = FALSE`, for instance, because the LMM path is REML-only by design). The
-GLMM 0.1.1 gaps (`inverse.gaussian`, `cloglog`, quasi-likelihood dispersion on
+open gaps (`inverse.gaussian`, `cloglog`, quasi-likelihood dispersion on
 binomial/Poisson) error until the kernel implements them. And `init.theta=` with
 an actual value errors — there is no kernel hook to seed the shape search yet, so
 only the default cold start runs (off negative-binomial the same argument is the
@@ -167,22 +176,37 @@ shaped like lme4's. These **work**:
 | `isSingular(fit)` | boundary-fit flag — lme4's condition, computed by the kernel. |
 | `sigma(fit)` | residual SD for gaussian/Gamma fits; `1` for binomial/Poisson/negative-binomial (fixed scale, as in lme4). |
 | `nobs`, `formula`, `family`, `model.frame`, `print` | the usual; `formula()` returns the formula **string** as given (the parser is Rust-side, so there is no R `terms` object to hand back). |
+| `ranef(fit)` | conditional modes (BLUPs), one data frame per grouping, lme4-shaped. Conditional variances (`condVar`) are not computed. |
+| `fitted(fit)` | conditional means per row, including the random-effect contribution and any offset. |
+| `logLik(fit)` | log-likelihood on `stats::logLik`'s scale, so `AIC()`/`BIC()` work; on the LMM paths this is the REML criterion (`REML = TRUE` attribute). |
+| `fit$diagnostics` | list with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; the top-level `fit$converged`/`fit$singular`/`fit$aliased` are unchanged and mirror the same values. |
+
+**Diagnostic conditions.** `fit` raises a warning for each note the kernel
+records — today only ill-conditioning, of class `"fastglmm_ill_conditioned"`;
+a note kind newer than this package recognizes arrives as
+`"fastglmm_unknown_note"`. Both inherit `"fastglmm_diagnostic"`, so one
+handler catches the whole channel. A design that is merely ill-conditioned
+(near-collinear but still distinguishable) is fitted and returns real
+numbers; the warning is how you find out its standard errors are honest but
+large. Select on the class rather than matching message text:
+
+```r
+withCallingHandlers(
+  fit <- fastglmm(y ~ x1 + x2 + (1 | group), data),
+  fastglmm_diagnostic = function(w) invokeRestart("muffleWarning")
+)
+
+# or, to just silence the channel:
+suppressWarnings(fastglmm(y ~ x1 + x2 + (1 | group), data), classes = "fastglmm_diagnostic")
+```
 
 These **error, naming the reason** — the package's defining choice, that anything
 the kernel cannot compute honestly is a documented error, never a silently
-different answer:
-
-```r
-ranef(fit)
-#> Error: ranef() is engine-blocked: glmm::Fit does not surface the
-#>   conditional modes / linear predictor yet ...
-```
-
-`ranef`, `predict`, `fitted`, `residuals`, `coef`, `logLik` (and with it
-`AIC`/`BIC`), and `terms` all error. `coef()` is instructive: lme4's `coef()`
-means fixed + random effects per group, which needs `ranef()` (engine-blocked) —
-returning fixed effects only would silently differ from what the same call gives
-an lme4 user, so it errors and points you at `fixef()`.
+different answer: `predict`, `residuals`, `coef`, and `terms`. `coef()` is
+instructive: lme4's `coef()` means fixed + random effects per group, and
+returning fixed effects only would silently differ from what the same call
+gives an lme4 user, so it errors and points you at `fixef()` and `ranef()`
+instead.
 
 **`vcov` and `se` carry different information.** The `Std. Error` column is just
 the square root of `diag(vcov(fit))`, so it cannot answer anything about two

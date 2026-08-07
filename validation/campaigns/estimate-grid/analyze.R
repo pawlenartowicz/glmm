@@ -50,7 +50,7 @@ cells <- setNames(manifest$cells, vapply(manifest$cells, `[[`, "", "case_id"))
 # df*(1+log 2pi) offset (validated in-crate, Task 2); add it back. GLMM: glmm is
 # on the UNIT-DEVIANCE scale (D = 2(logL_sat - logL), saturated constants
 # dropped -- pinned vs MixedModels' objective(), analyze_grid.R), while
-# grid_fit.R records glmer's -2*logLik, which KEEPS them: aligned = D - 2 logL_sat.
+# speed-grid/fit.R records glmer's -2*logLik, which KEEPS them: aligned = D - 2 logL_sat.
 # logL_sat: binary binomial 0 (identity), poisson sum dpois(y,y,log),
 # aggregated binomial sum dbinom(k,n,k/n,log). Pinned on this run: unaligned,
 # pois/bina cells sat at a constant ~0.6 relative offset while binb cells agreed
@@ -104,7 +104,7 @@ for (cid in names(cells)) {
   # not an accuracy verdict -- named separately (run 2026-07-14: 13 cells, the
   # giant-LMM slow tail, cross8/q5q2/q6q2x3/q8q2x at g30000 plus one g300 q8q2x).
   g_timeout <- !is.null(g) && identical(g$status, "timeout")
-  # Oracle "engine-fail" triage (run 2026-07-14): grid_fit.R marks ANY lme4
+  # Oracle "engine-fail" triage (run 2026-07-14): speed-grid/fit.R marks ANY lme4
   # convergence message as engine-fail, but two distinct things hide under it.
   #   * beta EMPTY  -- a real R error: every one is lme4's identifiability
   #     refusal ("number of observations <= number of random effects") on
@@ -113,7 +113,7 @@ for (cid in names(cells)) {
   #   * beta PRESENT -- lmer/glmer converged with a warning and returned
   #     estimates -- historically all lumped as "oracle-singular", but the
   #     warning isn't always lme4's singular-fit warning (boundary-fits
-  #     follow-up spec, Part B: analyze_diligent.R:157 scored this off the
+  #     follow-up spec, Part B: this file's predecessor scored this off the
   #     status proxy alone, never reading lme4's actual `singular` field).
   o_estimates <- !is.null(o) && !o_ok && length(o$beta) > 0 &&
                 !identical(o$status, "timeout")
@@ -121,7 +121,8 @@ for (cid in names(cells)) {
   # GLMMadaptive q2s cell on this run -- oracle-side compute limit, no answer.
   o_timeout <- !is.null(o) && identical(o$status, "timeout")
   # Real singular flags (Fit::singular / lme4 isSingular, both exported --
-  # grid_fit.rs:239, grid_fit.R:varcomp_of's caller). oracle-singular is now
+  # speed-grid/fit.rs's `rec["singular"]`, speed-grid/fit.R's `isSingular(m)`).
+  # oracle-singular is now
   # gated on THIS, not the status proxy: a convergence-warning cell whose
   # real flag says non-singular joins and gates like any other cell instead
   # of being silently parked ungated.
@@ -232,8 +233,8 @@ ids_of <- function(statuses) Filter(function(cid)
 #     stddev (degenerate component, corr pinned at +-1) exceeds the relative
 #     band, which is meaningless at that scale.
 ADJUDICATED <- c(
-  pois_q2s_g3000p20_bal_base  = "ADJUDICATED oracle-side (adjudicate_diligent.R): glmer-Laplace == glmm to 4 dp; GLMMadaptive under-converged",
-  pois_q2s_g3000p100_bal_base = "ADJUDICATED oracle-side (adjudicate_diligent.R): glmer-Laplace == glmm to 4 dp; GLMMadaptive non-PD Hessian (se=null)",
+  pois_q2s_g3000p20_bal_base  = "ADJUDICATED oracle-side (adjudicate.R): glmer-Laplace == glmm to 4 dp; GLMMadaptive under-converged",
+  pois_q2s_g3000p100_bal_base = "ADJUDICATED oracle-side (adjudicate.R): glmer-Laplace == glmm to 4 dp; GLMMadaptive non-PD Hessian (se=null)",
   pois_q2s_g300p20_bal_nearzero  = "BOUNDARY near-zero theta: beta/SE agree; only the ~0.008-scale degenerate slope stddev and its corr (pinned at -1 vs -0.85) exceed the bands",
   binb_q2s_g3000p20_bal_nearzero = "BOUNDARY near-zero theta: beta/SE agree; only the ~0.1-scale degenerate slope stddev (corr pinned at +1, within band) exceeds the relative band",
   bina_q2s_g3000p20_bal_nearzero = "BOUNDARY near-zero theta: beta (2.7e-5) / SE (8.9e-4) / corr (1.3e-3, within band) agree; only the ~0.02-scale degenerate slope stddev exceeds the relative band",
@@ -242,7 +243,37 @@ ADJUDICATED <- c(
   # against MixedModels.jl -- REML criterion gap +2.03, glmm at a measurably
   # worse optimum than MM on this cell (not a flat-direction/representation
   # difference like the other 36).
-  lmm_q8_g3000p5_bal_lowsnr = "REAL DISAGREEMENT vs MixedModels.jl (verify_boundary37.R): REML criterion gap +2.03 -- glmm converged to a worse optimum, not a boundary/flat-direction artifact")
+  lmm_q8_g3000p5_bal_lowsnr = "REAL DISAGREEMENT vs MixedModels.jl (verify_boundary37.R): REML criterion gap +2.03 -- glmm converged to a worse optimum, not a boundary/flat-direction artifact",
+  # ── mismatch-diagnosis pass (classify_mismatch.R -> reports/mismatch_classes.csv;
+  # verify_boundary37.R in VERIFY_OBJECTIVE mode -> reports/objective_verdicts.csv)
+  #
+  # Two pieces of evidence closed the cells below, and neither is a comparison
+  # of the two engines' numbers -- which is the point, because on a
+  # disagreement that comparison cannot say who is right.
+  #
+  #   1. THE OBJECTIVE AT BOTH ANSWERS. lme4's own REML criterion evaluated at
+  #      glmm's answer and at lme4's. Lower wins; the engine that produced the
+  #      criterion gets no home advantage from it. On every gaussian cell here
+  #      glmm scores at or below lme4, so none of them is glmm landing wrong.
+  #      Each verdict was checked by running lme4's own answer through the
+  #      identical path first: it reproduces lme4's recorded deviance to <=4e-5,
+  #      so the theta reconstruction the scoring depends on is sound.
+  #   2. WHAT LME4 SAID. fit.R now records m@optinfo$conv$lme4$messages
+  #      verbatim. Two cells turn out to carry lme4's own max|grad| convergence
+  #      FAILURE rather than its singular-fit note -- lme4 reporting that it did
+  #      not converge, on cells previously read as glmm disagreeing with it.
+  #
+  # The remaining 38 oracle-singular cells all carry the singular-fit note and
+  # nothing else, and 25 of them break no band at all.
+  lmm_q4sx2_g300p20_bal_lowsnr = "GLMM CONFIRMED, oracle stopped short (verify_boundary37.R objective mode): lme4's own REML criterion is 1529.835 at glmm's answer vs 1537.213 at lme4's -- glmm 7.38 LOWER; lme4 restarted from glmm's theta stays at 1529.835. lme4's g1 intercept SD pinned to 0 is the worse optimum, not the reference",
+  binb_nest2s_g300p20_bal_base = "ORACLE UNDER-CONVERGED (fit.R messages): lme4 reports max|grad| = 0.00269 against its own 0.002 tol -- it did not converge. Deviance agrees to 1.0e-8 rel; the one breaching coefficient is the 0.0320 intercept, 4.8e-5 apart in absolute terms against its own SE of 0.223",
+  lmm_cross8_g3000p20_single_base = "ORACLE UNDER-CONVERGED (fit.R messages): lme4 reports max|grad| = 0.0179 against its own 0.002 tol. Objective mode agrees -- glmm scores 3.3e-4 lower on lme4's own REML criterion",
+  lmm_cross4_g3000p5_bal_nearzero  = "SAME OPTIMUM (objective mode): glmm 2.5e-06 below lme4 on lme4's own REML criterion (4e-10 relative) -- a flat direction, not a different fit",
+  lmm_cross8_g30000p5_bal_nearzero = "SAME OPTIMUM (objective mode): glmm 3.9e-05 below lme4 on lme4's own REML criterion (7e-10 relative)",
+  lmm_q2sq2s_g3000p5_bal_nearzero  = "SAME OPTIMUM (objective mode): glmm and lme4 within 1.9e-06 on lme4's own REML criterion, inside TOL$loglik_abs_lmm",
+  lmm_q6_g30000p20_bal_nearzero    = "SAME OPTIMUM (objective mode): glmm 1.5e-04 below lme4 on lme4's own REML criterion (2e-09 relative)",
+  lmm_q8q2x_g30000p20_bal_lowsnr   = "SAME OPTIMUM (objective mode): glmm 1.8e-04 below lme4 on lme4's own REML criterion (1e-09 relative)",
+  lmm_q3sx2_g30000p5_bal_nearzero  = "SAME OPTIMUM (objective mode): glmm 1.6e-05 below lme4 on lme4's own REML criterion; the breaching stddev coordinate is g1:x2 at magnitude 1.9e-03, the two engines 2.3e-06 apart in absolute terms")
 line_of <- function(cid) {
   r <- res[res$case_id == cid, ]
   note <- if (cid %in% names(ADJUDICATED)) paste0("  <-- ", ADJUDICATED[[cid]]) else ""
@@ -292,15 +323,37 @@ claim <- function(subset) {
        fail = sum(subset$status %in% fail_status))
 }
 c1 <- claim(res[res$category == "laplace", ])
-# Laplace-mismatch decomposition (this run: every one is at the SAME optimum --
-# aligned deviance agrees to <= 3e-9 -- so none is a wrong answer):
-#   * stddev-band exceedance = a near-zero/zero-boundary theta component where
-#     the relative band is meaningless (e.g. glmm 0.0 vs lme4 2e-4 -> rel 1.0);
-#   * otherwise the only exceeded gate is the Hessian SE (multi-grouping GLMM
-#     cells, se gap 1.5e-3..1.4e-2 vs the 1e-3 band; beta/theta/deviance match).
+# Laplace-mismatch decomposition. `c1$fail` also counts glmm-fail and both-fail
+# cells, which have no glmm answer to compare and so cannot join any of the
+# buckets below -- they are reported as their own terms so the parts sum.
+#
+# The buckets are named for the GATE that broke, not for a diagnosis. What each
+# cell means is settled per cell in ADJUDICATED above, from lme4's own REML
+# criterion evaluated at both answers and from lme4's recorded messages; the
+# counts of those two verdicts are carried alongside rather than folded in.
+# Precedence beta > stddev > se mirrors classify_mismatch.R's class rule --
+# change together.
 lap_mis <- res[res$category == "laplace" & res$status == "mismatch", ]
-n_near0  <- sum(!is.na(lap_mis$d_stddev) & lap_mis$d_stddev > lap_mis$tol_stddev)
-n_seonly <- nrow(lap_mis) - n_near0
+n_gfail_lap <- sum(res$category == "laplace" & res$status == "glmm-fail")
+n_bfail_lap <- sum(res$category == "laplace" & res$status == "both-fail")
+broke <- function(d, tol) !is.na(d) & d > tol
+# The b37 reclassification block above rewrites status and oracle_engine for the
+# one "real disagreement (MixedModels)" verdict but leaves its delta columns at
+# the NA the refused lme4 join gave them, so it cannot be classified by band.
+# That status/engine pair is set for no other reason, so count it directly.
+lap_real <- lap_mis[lap_mis$oracle_engine == "MixedModels", ]
+lap_band <- lap_mis[lap_mis$oracle_engine != "MixedModels", ]
+beta_hit <- broke(lap_band$d_beta, lap_band$tol_beta)
+sd_hit   <- broke(lap_band$d_stddev, lap_band$tol_stddev) & !beta_hit
+se_hit   <- !beta_hit & !sd_hit
+n_beta   <- sum(beta_hit) + nrow(lap_real)
+n_sdonly <- sum(sd_hit)
+n_seonly <- sum(se_hit)
+# The residual bucket is only honest if every cell in it really did break the SE
+# band and nothing else; a corr-only breach would otherwise be mislabelled.
+stopifnot(all(broke(lap_band$d_se, lap_band$tol_se)[se_hit]))
+n_undercvg <- sum(startsWith(ADJUDICATED[names(ADJUDICATED) %in% lap_mis$case_id],
+                             "ORACLE UNDER-CONVERGED"))
 max_dev_mis <- suppressWarnings(max(lap_mis$d_dev_rel, na.rm = TRUE))
 int1 <- res[res$category == "agq_int1", ]
 c2 <- claim(int1)   # all int1 AGQ cells joinable (bina_ gate lifted 2026-07-14)
@@ -319,16 +372,24 @@ cat("\n== diligent-grid status ==\n"); print(table(res$status))
 cat(sprintf("\ncoverage: glmm %d/510, oracle %d/510 result rows\n",
             length(glmm), length(oracle)))
 cat("\n== the three named claims (spec Part 6) ==\n")
-cat(sprintf(paste0("  1. Laplace vs lme4      : %d/%d cells match (%d validation-fail, ALL same-optimum: ",
-            "%d near-zero-theta + %d se-only, worst dev gap %.0e; ",
-            "%d glmm-timeout, %d oracle-error, %d oracle-singular, %d oracle-timeout)\n"),
-            c1$ok, c1$n, c1$fail, n_near0, n_seonly, max_dev_mis,
+cat(sprintf(paste0("  1. Laplace vs lme4      : %d/%d cells match (%d validation-fail = ",
+            "%d mismatch + %d glmm-fail + %d both-fail)\n",
+            "       mismatches by broken gate: %d se-only + %d stddev-only + %d beta-level, ",
+            "worst dev gap %.0e\n",
+            "       adjudicated: %d are lme4's own max|grad| non-convergence, ",
+            "%d a real disagreement vs MixedModels.jl (see failures.txt)\n",
+            "       non-comparable: %d glmm-timeout, %d oracle-error, %d oracle-singular, ",
+            "%d oracle-timeout\n"),
+            c1$ok, c1$n, c1$fail,
+            nrow(lap_mis), n_gfail_lap, n_bfail_lap,
+            n_seonly, n_sdonly, n_beta, max_dev_mis,
+            n_undercvg, nrow(lap_real),
             length(timeout_ids), length(oerr_ids), length(osing_ids),
             n_otime_lap))
 cat(sprintf("  2. int1 scalar AGQ k=7  : %d/%d joinable match lme4 (%d validation-fail)\n",
             c2$ok, c2$n, c2$fail))
 cat(sprintf(paste0("  3. q2s vector AGQ k=7   : %d/%d joinable match GLMMadaptive (%d mismatch: ",
-            "%d large-beta adjudicated oracle-side via adjudicate_diligent.R, ",
+            "%d large-beta adjudicated oracle-side via adjudicate.R, ",
             "%d nearzero via the near-zero-theta boundary argument; ",
             "%d oracle-timeout)\n"),
             c3$ok, c3$joinable, c3$fail, n_adj_oracle, n_adj_near0,
@@ -429,21 +490,25 @@ html <- c(
           tbl[["both-fail"]]),
   '<h2>The three claims (spec Part 6 &ldquo;what the run proves&rdquo;)</h2>',
   sprintf(paste0('<div class="claim"><b>1. Grid-wide Laplace (477 cells):</b> %d/%d match lme4-Laplace answers ',
-    '(beta, &theta;, Hessian SE) within band &mdash; %d mismatches, and every one is at the SAME optimum ',
-    '(aligned deviance agrees to &le;%.0e): %d are near-zero/zero-boundary &theta; components where the relative ',
-    'stddev band is meaningless, %d are Hessian-SE-only exceedances on multi-grouping GLMM cells ',
-    '(&beta;/&theta;/deviance match; se gap up to 1.4e-2 vs the 1e-3 band). Zero wrong-answer cells. ',
+    '(beta, &theta;, Hessian SE) within band &mdash; %d mismatches, by the gate they break: ',
+    '%d Hessian-SE-only on multi-grouping GLMM cells (&beta;/&theta;/deviance match; se gap up to 1.4e-2 ',
+    'vs the 1e-3 band), %d stddev-band-only on small variance components, %d at &beta; level. ',
+    'Aligned deviance agrees to &le;%.0e across the mismatches. Adjudicated per cell in failures.txt: ',
+    '%d carry lme4&rsquo;s own max|grad| non-convergence, %d is a real disagreement against ',
+    'MixedModels.jl; on the rest lme4&rsquo;s own REML criterion scores glmm at or below lme4, ',
+    'so they are the same optimum. ',
     'Non-comparable remainder, all named in failures.txt: %d glmm compute-budget timeouts, ',
     '%d lme4 identifiability refusals (no oracle answer), %d lme4 singular fits (ungated), ',
     '%d oracle timeouts, %d both-fail (both engines refuse the same p5 q8 cell).</div>'),
-          c1$ok, c1$n, nrow(lap_mis), max_dev_mis, n_near0, n_seonly,
+          c1$ok, c1$n, nrow(lap_mis), n_seonly, n_sdonly, n_beta, max_dev_mis,
+          n_undercvg, nrow(lap_real),
           length(timeout_ids), length(oerr_ids), length(osing_ids),
-          n_otime_lap, sum(res$status == "both-fail")),
+          n_otime_lap, n_bfail_lap),
   sprintf('<div class="claim"><b>2. int1 scalar AGQ (15 cells, %d joinable):</b> %d/%d &equiv; lme4 glmer(nAGQ=7) across the size&times;balance&times;regime sweep &mdash; %d validation-fail. Includes the 6 aggregated-binomial <code>bina_int1_*</code> cells, now fit via AGQ&times;prior-weights (gate lifted 2026-07-14).</div>',
           c2$joinable, c2$ok, c2$joinable, c2$fail),
   sprintf(paste0('<div class="claim"><b>3. q2s vector AGQ (headline; 18 cells, %d joinable):</b> %d/%d joinable cells ',
     'match GLMMadaptive at matched nodes (k=7); %d mismatch, each attributed in failures.txt &mdash; %d large-&beta; cells ',
-    'adjudicated oracle-side via <code>adjudicate_diligent.R</code> (glmer-Laplace on the same data reproduces glmm&rsquo;s ',
+    'adjudicated oracle-side via <code>adjudicate.R</code> (glmer-Laplace on the same data reproduces glmm&rsquo;s ',
     '&beta; and &theta; to 4 decimals; GLMMadaptive under-converged, one with a non-PD Hessian), and %d nearzero cells via ',
     'the near-zero-&theta; boundary argument (&beta;/SE agree; only the &sim;0.01&ndash;0.1-scale slope stddev, a degenerate ',
     'component with corr pinned at &plusmn;1, exceeds the relative band). ',

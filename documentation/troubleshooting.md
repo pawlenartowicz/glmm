@@ -11,6 +11,23 @@ estimate, just one where the data can't support the random-effect structure
 you asked for. Simplify the RE structure — drop a random slope, drop a
 grouping factor — and refit.
 
+## Warning: ill-conditioned / entangled columns
+
+Two or more fixed-effect columns are near-collinear but not exactly
+redundant — the design is computable and the fit is real. The estimates are
+honest and the standard errors are large, because the data genuinely cannot
+separate the entangled columns. This is not a failure: `converged` stays
+`true`, and no column is dropped (contrast an *aliased* column, which is
+exactly redundant and is dropped, with `beta`/`se` reported as `NaN`).
+
+The warning names one column — the one the pivot search happened to reach —
+but its entangled partners are **not** named; the search finds the
+worst-conditioned column, not the full set it is confounded with. To fix it:
+rescale predictors onto comparable magnitudes, or drop or combine the
+predictors that are actually measuring the same thing. See
+[`conventions.md#flags-on-the-result`](conventions.md#flags-on-the-result) for
+where this sits in the `diagnostics` channel.
+
 ## converged is false
 
 `converged` reports whether the optimizer reached its convergence criterion.
@@ -28,9 +45,9 @@ reports honestly if it didn't converge.
 
 ## NotImplementedError: family/link/knob
 
-Four combinations have an approved design (targeted for 0.1.1) but no kernel
-support yet, and raise a clean `NotImplementedError` rather than silently
-falling back to something close:
+Four combinations have an approved design but no kernel support yet, and
+raise a clean `NotImplementedError` rather than silently falling back to
+something close:
 
 - `family="inversegaussian"`
 - `link="cloglog"`
@@ -67,10 +84,12 @@ reinterpretation. See
 [`formula.md#not-accepted-and-the-workaround`](formula.md#not-accepted-and-the-workaround)
 for the full list and the workaround for each.
 
-## ranef()/predict()/logLik() error
+## predict()/residuals()/coef() error
 
-These aren't missing by oversight — the R and Python ports error, naming the
-reason, on anything the kernel can't compute honestly rather than returning
-a fixed-effects-only or otherwise silently different answer. See
+These aren't missing by oversight — the ports error, naming the reason, on
+anything the kernel can't compute honestly rather than returning a
+fixed-effects-only or otherwise silently different answer. `ranef()`,
+`fitted()` and `logLik()`/`AIC()`/`BIC()` used to be on this list and now
+work. See
 [`coming-from-lme4.md#what-is-deliberately-missing`](coming-from-lme4.md#what-is-deliberately-missing)
 for what's blocked and why.

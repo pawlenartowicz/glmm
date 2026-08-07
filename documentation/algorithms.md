@@ -30,7 +30,11 @@ unreachable arms.
 The core is the *only* dispatch body. `fit_warm` allocates a throwaway
 workspace per call and always assembles the full `Fit`; a `loop_advanced`
 caller builds once per shape and reads the lean `FitView` per draw. Both walk
-the identical tree, so routing cannot drift between the two tiers.
+the identical tree, so routing cannot drift between the two tiers. The
+`orchestrate` feature (`src/orchestrate.rs`, off by default, no semver
+guarantee) is a third caller and not a fourth tier: it lowers a formula and a
+data table, calls `fit_warm`, and flattens the result for the Python and R
+packages, so it enters the tree at the same door `fit_warm` does.
 
 ```mermaid
 flowchart TD
@@ -161,7 +165,7 @@ and are not user-facing.
 | `PIN_THETA` | `1e-4` — diagonal variance component pinned to `0` | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm.rs`) |
 | `SINGULAR_REL_TOL` | `1e-3` — post-hoc relative check: any RE stddev `≤ 1e-3 ×` the largest ⇒ `singular` | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/fit/mod.rs`) |
 | `two_stage` warm-start gate | disabled when `n_θ ≤ 2 && p ≤ 4`, else enabled | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-two-stage-optimizer) (`src/glmm/workspace.rs`) |
-| `BETA_CAP` | `30` — GLM divergence guard: any `|β_j| > 30` at IRLS iter ≥ 3 → non-converged | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
+| `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: any `|η_i| > 30` at IRLS iter ≥ 3 → non-converged; skipped under the Gamma inverse link | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `SATURATION_W` / `SATURATION_FRAC` | `1e-5` / `0.5` — post-fit separation guard: > half the (weighted) rows saturated → non-converged | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `MAX_PRIMARY_Q` | `8` — primary width cap (over → Sparse) | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
 | `MAX_EXTRA_Q` | `4` — per-extra-grouping width cap | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
@@ -196,11 +200,14 @@ normal equations by a Cholesky of `XᵀX`: `L z = Xᵀy`, `Lᵀ β̂ = z`
 `RSS = yᵀy − β̂ᵀXᵀy` — no residual sweep. The dispersion is
 `σ̂² = RSS/(n − p)` with **raw-row** residual df `n − p`, and the SE of a target
 column is `√(σ̂²·‖L⁻¹e_j‖²)` from one forward solve against the Cholesky factor
-(the diagonal of `σ̂²(XᵀX)⁻¹`). A Cholesky failure or near-singular factor (the
-rank guard `chol_rank_deficient` at `eps_rank = 1e-12`) returns a non-converged,
-`NaN`-filled fit. `Fit::dispersion` carries `σ̂²` on this path (`NaN` on any
-non-converged return); `Fit::deviance` is **always** `NaN` on the OLS path —
-it is never populated, converged or not.
+(the diagonal of `σ̂²(XᵀX)⁻¹`). Only a genuine Cholesky failure (non-PD factor)
+returns a non-converged, `NaN`-filled fit; a near-singular but PD factor is
+fitted, and its scale-invariant pivot ratio (`min_pivot_ratio`) is measured
+and, below `PIVOT_MIN = 1e-12`, recorded as an `IllConditioned` note on
+`Fit::diagnostics` rather than refused. `fit_suff_stats_t_sq` no longer takes
+an `eps_rank` parameter. `Fit::dispersion` carries `σ̂²` on this path (`NaN` on
+any non-converged return); `Fit::deviance` is **always** `NaN` on the OLS
+path — it is never populated, converged or not.
 
 **Offset.** A `FitOptions::offset` is applied as an exact response pre-shift:
 the accumulator sees `y − o`, applied *before* any weight scaling so the two
@@ -220,7 +227,7 @@ scaling; they are deliberately never mapped into `Fit`.
 **Code:** `fit_glm_prebuilt` + `glm_view_to_fit` and (for negative binomial)
 `fit_glm_nb` (`src/fit/glm.rs`);
 the IRLS kernel `glm_irls_fit` with its constants `MAX_IRLS_ITERS = 50`,
-`DEVIANCE_TOL = 1e-8`, `WEIGHT_CLAMP = 1e-6`, `BETA_CAP = 30`,
+`DEVIANCE_TOL = 1e-8`, `WEIGHT_CLAMP = 1e-6`, `ETA_DIVERGENCE_CAP = 30`,
 `SATURATION_W = 1e-5`, `SATURATION_FRAC = 0.5` (`src/glm.rs`); the SIMD
 transcendental fast paths in `src/simd_transcendental.rs`; per-family link,
 variance and deviance in `src/family.rs`. **Convention:** McCullagh & Nelder
@@ -246,7 +253,8 @@ of the regimes:
   cannot produce an infinite or negative seed.
 - **Log-link count families (Poisson, NB):** each row seeds the null model,
   `η = ln(ȳ + 0.1)`. A plain η = 0 start (μ = 1) overshoots so badly on
-  high-mean counts (`ȳ ≳ 25–30`) that IRLS diverges past the `BETA_CAP` guard.
+  high-mean counts (`ȳ ≳ 25–30`) that IRLS diverges past the
+  `ETA_DIVERGENCE_CAP` guard.
 
 The `family` argument selects the arithmetic in two branches:
 
@@ -275,10 +283,17 @@ the shifted working response `z − o`, so β never absorbs the offset.
 **Guards beyond the deviance fixpoint.** Four additional exits protect the
 loop, all in `glm_irls_fit`:
 
-- A **divergence guard**: any `|β_j| > BETA_CAP (30)` at iteration ≥ 3 marks
-  the fit non-converged immediately (on the linear-predictor scale, |η| = 30
-  is already probability ≈ 1 − 1e-13; a coefficient out there is separation,
-  not signal).
+- A **divergence guard**: any `|η_i| > ETA_DIVERGENCE_CAP (30)` at iteration ≥ 3
+  marks the fit non-converged immediately. The bound is on the linear predictor,
+  where |η| = 30 is already probability ≈ 1 − 1e-13 — out there is separation,
+  not signal. Bounding η rather than β is what makes the decision independent of
+  the caller's units: rescaling a predictor column divides its coefficient by
+  the same factor and leaves η, the fitted values and the deviance untouched, so
+  a bound on `|β_j|` would accept or reject the same model depending on whether
+  a height column is in metres or kilometres. The guard is skipped for
+  `Family::Gamma { link: Inverse }`, where η = 1/μ and a small-mean fit carries a
+  large |η| honestly; that arm exits through `clamp_eta`'s ±700, the non-finite
+  guard, or `MAX_IRLS_ITERS` instead.
 - A **degenerate-response short-circuit**: an all-0 or all-1 (weighted)
   Bernoulli response returns early rather than dividing by zero in the working
   response.

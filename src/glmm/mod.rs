@@ -52,7 +52,16 @@ pub const PIRLS_MAX_ITERS: usize = 50;
 /// the module's `(NaN, NaN, NaN, false)` failure — the same terminal state a raw
 /// overshoot reaches today, but reached deliberately. Shared by all three PIRLS
 /// variants (dense / blocked / structured).
-pub const PIRLS_MAX_HALVINGS: usize = 10;
+///
+/// 16, above lme4's 10: the sparse GLMM's FD-Hessian central deviance eval
+/// cold-seeds `û = 0` on every evaluation (see `sparse::glmm`'s step-size
+/// constant doc comment), and on a large-θ̂, many-crossed-grouping, large-count
+/// design that cold seed needs more halvings to walk back to the mode than a
+/// warm-started fit does. Measured floor on the sparse large-θ̂ rung is 11
+/// halvings; 16 was chosen for margin above that floor, not tuned to the exact
+/// minimum. Dense PIRLS and the blocked/structured sparse solve steps don't hit
+/// this regime and converge well inside the cap.
+pub const PIRLS_MAX_HALVINGS: usize = 16;
 /// Adaptive PIRLS exit on |Δ penalized-deviance|, relative to the objective
 /// scale (lme4's pwrss discipline): converged when
 /// `|Δpen| < PIRLS_TOL_REL · (1 + |pen|)`. The penalized deviance is O(n), so
@@ -114,20 +123,52 @@ pub(crate) fn pirls_tol(family: crate::spec::Family) -> f64 {
         PIRLS_TOL_REL_NONCANON
     }
 }
-/// Wide finite β box for the joint BOBYQA. Bound to `glm::BETA_CAP` (the log-odds
-/// divergence guard, same magnitude) so the box and the cap can never drift apart.
-pub const BETA_BOX: f64 = crate::glm::BETA_CAP;
-/// Relative FD step for `fd_hessian_cov`'s joint-deviance Hessian:
-/// `h_k = FD_STEP_REL·max(1, |γ̂_k|)`. The Hessian is step-invariant over h ∈
+/// Wide finite β box for the joint BOBYQA — the bounds handed to the optimizer
+/// for the β block, and the clamp applied to a warm-start β.
+///
+/// Deliberately NOT tied to the GLM route's divergence cap any more. That cap
+/// bounds the linear predictor and refuses a fit; this is a box that keeps a
+/// derivative-free optimizer inside a finite region. They are different objects
+/// that happen to share the magnitude 30, and aliasing them made a change to one
+/// silently a change to the other. Like any absolute bound on β this box is
+/// itself unit-dependent; that is a known, separate question.
+pub const BETA_BOX: f64 = 30.0;
+/// Base FD step for `fd_hessian_cov`'s joint-deviance Hessian. It is applied
+/// ASYMMETRICALLY across the joint (θ, β) vector: `h_θ = FD_STEP_BASE` absolute on
+/// the θ block, `h_β = FD_STEP_BASE·max(1, |β̂_k|)` relative on the β block.
+/// β enters through η = Xβ and wants relative stepping; θ does not — scaling h_θ
+/// with the random-effect SD widens the window exactly where the deviance profile
+/// in θ flattens, so the central second difference's O(h²) truncation error grows
+/// as θ̂². Measured on the corpus 2026-07-30: dropping the θ scaling divides the
+/// distance to the h→0 limit by θ̂² to within 6% on all seven scalar-RE rungs whose
+/// θ̂ exceeds 1, at nAGQ = 1 and 7 and 11 alike (θ̂ 1.13 → 5.16, a 20× range in
+/// θ̂²), on both `se_hessian` and the θ-block SEs. The step
+/// construction, and the toenail evidence behind it, is at `se.rs`'s
+/// `ws.fd_steps` loop.
+///
+/// The BASE VALUE 1e-2 is unchanged by that fix and stays pinned by the curated
+/// sweep, not just by the fixture: the Hessian is step-invariant over h ∈
 /// [1e-4, 1e-1] on the committed fixture — but NOT on every curated rung:
 /// h = 1e-3 blows the validation se_hess gates on the noise side (sim_gamma 1e-2,
-/// cbpp_probit 2e-3 vs the 1e-3 band) while 1e-2 holds them at ~1e-4, so 1e-2
-/// is pinned by the curated sweep, not just the fixture. The sparse path needs
-/// the opposite trade and carries its own `sparse::SPARSE_FD_STEP_REL` (1e-4,
-/// landing on the weighted sparse Gamma golden's FD-step plateau — 1e-3 biases
-/// se(β₀) high there) — calibrated separately, do not fold the two constants
-/// together.
-pub const FD_STEP_REL: f64 = 1e-2;
+/// cbpp_probit 2e-3 vs the 1e-3 band) while 1e-2 holds them at ~1e-4. Both of
+/// those rungs have θ̂ < 1, so `max(1, |θ̂|)` was already exactly 1 there and the
+/// asymmetry above does not disturb the sweep that pinned this number — h_θ on
+/// them is bit-for-bit what it was. Independently, the measured noise knee in θ is
+/// at h_θ ≈ 2.5e-4, so 1e-2 keeps a 40× margin on the truncation side.
+/// The sparse path needs the opposite trade and carries its own
+/// `sparse::SPARSE_FD_STEP_REL` (1e-4, landing on the weighted sparse Gamma
+/// golden's FD-step plateau — 1e-3 biases se(β₀) high there) — calibrated
+/// separately, do not fold the two constants together. The θ-step fix does NOT
+/// transfer to it: that constant is calibrated on the noise side, so removing the
+/// θ scaling there would push h_θ further into noise, not out of it.
+///
+/// **The `_BASE` / `_REL` split in the two names is deliberate.** This one is
+/// `_BASE` because the asymmetry above makes "relative" false of the θ block;
+/// `SPARSE_FD_STEP_REL` keeps its suffix because it really is applied relatively
+/// on every coordinate, θ included. If the sparse step ever takes the same
+/// asymmetry, rename it in the same change, or the suffix starts lying there
+/// instead.
+pub const FD_STEP_BASE: f64 = 1e-2;
 
 /// Per-fit GLMM result (mirrors `LmmFit`; no σ² — dispersion is fixed at 1).
 pub struct GlmmFit {
@@ -249,13 +290,28 @@ pub fn fit_glmm(
     // γ₀ = [θ₀ | β₀].
     match theta_start {
         Some(ts) => {
+            // Floor is diagonal-only: diagonals are boxed [0, THETA_HI] so 0 is
+            // their edge; off-diagonals are boxed [-THETA_HI, THETA_HI] where 0 is
+            // mid-range, so flooring them would silently rewrite a negative
+            // correlation start. lme4 passes `start$theta` through verbatim.
             for (t, &v) in ws.params[..n_theta].iter_mut().zip(ts) {
-                *t = v.max(THETA_TRUTH_FLOOR);
+                *t = v;
+            }
+            for &i in ws.groupings.diagonal_theta() {
+                ws.params[i] = ws.params[i].max(THETA_TRUTH_FLOOR);
             }
         }
         None => {
+            // Blind start: diagonals THETA0, off-diagonals 0 — the structure-only
+            // blind θ₀ `GlmmWorkspace::new` builds (workspace.rs). The former
+            // all-THETA0 start implied RE correlation +0.707 for every pair, and
+            // on negative-correlation data that converges into the τ=0 boundary
+            // basin (mirror the 2026-07-11 sparse basin fix, `sparse/glmm.rs`).
             for t in ws.params[..n_theta].iter_mut() {
-                *t = THETA0;
+                *t = 0.0;
+            }
+            for &i in ws.groupings.diagonal_theta() {
+                ws.params[i] = THETA0;
             }
         }
     }
@@ -271,6 +327,11 @@ pub fn fit_glmm(
     for v in ws.u_seed[..k].iter_mut() {
         *v = 0.0;
     }
+    // Observation-only PIRLS-exhaustion counters — reset per fit like u_seed
+    // above, so a `loop_advanced` reuse of this workspace never carries a prior
+    // draw's count into the next (see `Note::PirlsExhausted`).
+    ws.pirls_exhausted = 0;
+    ws.final_pirls_exhausted = false;
     ws.coup_mask = None; // CSR validity is per (fit, pinning mask): ids/z may differ across fits
                          // Cluster-outer AGQ substrate: built once per fit (cluster_ids is fit-fixed),
                          // ONLY in `parallel` builds — it exists as rayon's work-splitting substrate.
@@ -365,6 +426,7 @@ pub fn fit_glmm(
         beta_seed,
         beta_prev,
         p: pf,
+        pirls_exhausted,
         ..
     } = ws;
     // x is fixed for this fit: widen the slope columns to f64 once (blocked AND
@@ -468,6 +530,7 @@ pub fn fit_glmm(
                     n,
                     cluster_rows.as_ref(),
                     offset,
+                    pirls_exhausted,
                 );
                 if obj < best1 {
                     best1 = obj;
@@ -565,6 +628,7 @@ pub fn fit_glmm(
                 n,
                 cluster_rows.as_ref(),
                 offset,
+                pirls_exhausted,
             );
             if obj < best_obj {
                 best_obj = obj;
@@ -593,7 +657,9 @@ pub fn fit_glmm(
             if ws.params[ti] <= PIN_THETA {
                 ws.params[ti] = 0.0;
                 pinned = true;
-                pinned_components |= 1u64 << kk;
+                if kk < u64::BITS as usize {
+                    pinned_components |= 1u64 << kk;
+                }
             }
         }
     }
@@ -603,6 +669,11 @@ pub fn fit_glmm(
     // refreshed deviance is the reported marginal deviance (the NB outer-θ loop's
     // objective kernel); INFINITY until the re-eval runs.
     let mut final_deviance = f64::INFINITY;
+    // Separate from `ws.pirls_exhausted`: exactly one PIRLS solve happens below,
+    // so this is 0 or 1, folded into the reported bool after the block (the
+    // final re-eval is the case where a truncated solve would feed the
+    // returned estimates directly — see `Note::PirlsExhausted`).
+    let mut final_exhausted_count = 0u32;
     if ok {
         // Warm-start the pinned re-eval from the incumbent (its modes are the
         // inference iterate); u_seed holds the BOBYQA incumbent after minimize.
@@ -718,8 +789,10 @@ pub fn fit_glmm(
             n,
             cluster_rows.as_ref(),
             offset,
+            &mut final_exhausted_count,
         );
     }
+    ws.final_pirls_exhausted = final_exhausted_count > 0;
 
     // Degenerate-fit guard. BOBYQA can report `Converged` on a fit that never left
     // an infinite-deviance start: PRIMA's `moderatef` maps a `+inf` objective to the

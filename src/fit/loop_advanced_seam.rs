@@ -230,8 +230,8 @@ pub struct LmmSweepOutcome {
 /// The θ-search body shared by [`lmm_sweep_fit`] (via [`lmm_sweep_fit_on`]) and
 /// `with_lmm_objective`'s one-shot sibling: minimizes `obj` under a caller-
 /// configured BOBYQA schedule. `theta0` is used VERBATIM (`None` → the shipped
-/// blind start) — unlike `fit`'s warm start, which clamps every component to
-/// `THETA_TRUTH_FLOOR` and so cannot express a negative off-diagonal start.
+/// blind start) — unlike `fit`'s warm start, which floors only diagonal
+/// components to `THETA_TRUTH_FLOOR` and passes off-diagonals through verbatim.
 /// npt and rho_begin are derived exactly as the shipped sites derive them (mid
 /// npt ⌈1.5n⌉+1 from n ≥ 3, rho_begin = min(0.1·min diag θ₀, RHO_BEGIN) floored
 /// at 10·rho_end), so `(theta0 = None, rho_end = RHO_END, max_fun = None)`
@@ -279,12 +279,10 @@ fn lmm_sweep_search(
     } else {
         2 * n_theta + 1
     };
-    let mut config = Config {
-        rho_begin,
-        rho_end,
-        npt,
-        ..Config::new(n_theta)
-    };
+    let mut config = Config::new(n_theta);
+    config.rho_begin = rho_begin;
+    config.rho_end = rho_end;
+    config.npt = npt;
     crate::lmm::apply_campaign_overrides(&mut config, n_theta);
     if let Some(mf) = max_fun {
         config.max_fun = mf;
@@ -451,5 +449,5 @@ pub fn refit_lmm(
         &ids.extra,
         opts.weights.as_deref(),
     );
-    fit_lmm_into(ws, n, p, opts, start)
+    fit_lmm_into(ws, x, ids, n, p, opts, start)
 }

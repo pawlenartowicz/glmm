@@ -17,7 +17,7 @@
 #     present, oracles backfilled across all 13 large models). Pass a leg name
 #     to render an earlier one (e.g. after-phase1).
 #
-# One view: CROSS-ENGINE, LARGE MODELS ONLY (the 43 manifest rungs are dropped --
+# One view: CROSS-ENGINE, LARGE MODELS ONLY (the manifest rungs are dropped --
 # their peak RSS is dominated by runtime start-up, which is exactly what this view
 # is built to exclude, so they'd only show noise). Per dataset x engine, values
 # are (peak_rss - engine's load-only baseline) in MB, i.e. fit cost with each

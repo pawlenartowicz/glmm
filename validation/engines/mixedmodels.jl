@@ -11,10 +11,28 @@
 using MixedModels, CSV, DataFrames, JSON3, Statistics, LinearAlgebra
 
 const SUITE_DIR = normpath(joinpath(@__DIR__, ".."))
-# Timing loop; first pass (JIT warm-up) discarded, median of rest reported. 10 runs
-# (was 100): multi-second GLMM rungs made 100 repeats cost ~half an hour here; each
-# result JSON records its own n_runs, so old 100-run files stay self-describing.
-const N_RUNS = 10
+# Timing is OPT-IN and its sample count lives in run.sh, not here.
+#
+# THE contract, mirrored in glmm.rs / lme4.R / glmm_python.py / glmm_r.R
+# `timing_runs` -- five languages that cannot share code, so change together:
+# VALIDATION_TIMINGS unset / "" / "0" means do not time (`timing` is written null,
+# which fmt_scalar already emits for `nothing`); otherwise it IS the sample count, an
+# integer >= 2, first pass (JIT warm-up) discarded, median of the rest. run.sh
+# validates the value; this errors rather than silently skipping timing when the
+# engine is run by hand with a malformed one.
+#
+# Each result JSON still records its own n_runs, so files timed under any count --
+# including the old hardcoded 10 and its 100-run predecessor -- stay self-describing.
+function timing_runs()
+    v = strip(get(ENV, "VALIDATION_TIMINGS", ""))
+    (isempty(v) || v == "0") && return nothing
+    n = tryparse(Int, v)
+    (n === nothing || n < 2) && error(
+        "VALIDATION_TIMINGS must be 0 or an integer >= 2 (got \"$v\"); " *
+        "N=2 keeps 1 sample after the warm-up discard")
+    n
+end
+const N_RUNS = timing_runs()  # nothing on an untimed run
 
 manifest = JSON3.read(read(joinpath(SUITE_DIR, "manifest.json"), String))
 data_dir_of(spec) = joinpath(SUITE_DIR, "data", String(spec.source) == "sim" ? "simulated" : "empirical")
@@ -119,6 +137,7 @@ end
 # `fit_seconds_median_rx` to line up with the glmm/lme4 Rx/Hessian split. Gaussian
 # rungs keep the single `fit_seconds_median`.
 function time_one(spec, make_fit)
+    N_RUNS === nothing && return nothing   # untimed run: no loops at all
     t = time_fit(make_fit; batch = get(spec, :timing_batch, 1))
     String(spec.family) == "gaussian" && return t
     (fit_seconds_median_rx = t.fit_seconds_median, n_runs = t.n_runs,
@@ -248,11 +267,12 @@ function fit_one(spec)
         emit_jsonlite(io, res, 0)
         println(io)                              # trailing newline, matching R's write()
     end
-    t_disp = String(spec.family) == "gaussian" ? res.timing.fit_seconds_median :
-             res.timing.fit_seconds_median_rx
+    t_disp = res.timing === nothing ? nothing :
+             String(spec.family) == "gaussian" ? res.timing.fit_seconds_median :
+                                                 res.timing.fit_seconds_median_rx
     println("mixedmodels  $(rpad(spec.name,12))  rung $(spec.rung)  ",
-            "converged=$(res.converged) singular=$(res.singular)  ",
-            "fit_median=$(round(t_disp, sigdigits=4))s")
+            "converged=$(res.converged) singular=$(res.singular)",
+            t_disp === nothing ? "" : "  fit_median=$(round(t_disp, sigdigits=4))s")
 end
 
 # VALIDATION_ONLY=<name>[,<name>...]: fit only the named datasets (mirrors lme4.R) —
@@ -267,7 +287,14 @@ specs = isempty(only_ds) ? collect(manifest.datasets) :
 # package limitation confirmed independent of the data (see validation/README.md,
 # "2-way gate"). results/mixedmodels_{empirical,simulated}/<name>.json is
 # intentionally absent and compare.R reports the rung as n/a for this engine.
-const JL_CANNOT_FIT = ("sim_binomial_slope_crossed",)
+# sim_poisson_bigsd (rung 45): same engine, same exception, later in the fit — the
+# model constructs, then PIRLS throws PosDefException (deviance! -> reweight! ->
+# updateL! -> cholUnblocked!) on the large-theta-hat Poisson design. Confirmed
+# 2026-08-07 on MixedModels v5.7.0; rung 46's `//` comment in manifest.json cites
+# the same crash. Skipping it here is what keeps a whole-corpus `run.sh --oracles`
+# alive: run.sh is `set -e` and runs the Julia engine before the Rust one, so an
+# unskipped crash here kills the run before the Rust leg and compare.R.
+const JL_CANNOT_FIT = ("sim_binomial_slope_crossed", "sim_poisson_bigsd")
 for spec in specs
     # No jl_formula = "not a Julia rung" (weights suite fixed-only and R-only
     # rungs omit the field): MixedModels does not fit fixed-only models and
@@ -277,7 +304,7 @@ for spec in specs
         continue
     end
     if String(spec.name) in JL_CANNOT_FIT
-        println("mixedmodels  $(rpad(spec.name,12))  SKIPPED -- MixedModels cannot construct this shape (see comment above)")
+        println("mixedmodels  $(rpad(spec.name,12))  SKIPPED -- MixedModels cannot fit this rung (see comment above)")
         continue
     end
     fit_one(spec)

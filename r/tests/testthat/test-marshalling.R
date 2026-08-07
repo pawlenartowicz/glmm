@@ -69,6 +69,32 @@ test_that("weights are honored; zero/short/negative weights are clean errors", {
   expect_error(fastglmm(y ~ x, d, weights = c(0, rep(1, 9))), "positive")
 })
 
+test_that("offset= is honored as an expression and stays aligned under subset=", {
+  set.seed(21)
+  d <- data.frame(x = rnorm(40), exposure = runif(40, 1, 10))
+  d$y <- rpois(40, d$exposure * exp(0.3 + 0.5 * d$x))
+
+  fit <- fastglmm(y ~ x, d, family = poisson(), offset = log(exposure))
+  ref <- glm(y ~ x, poisson(), d, offset = log(exposure))
+  expect_equal(unname(fixef(fit)), unname(coef(ref)), tolerance = 1e-8)
+
+  # The alignment hazard: an offset read off `data` after the row filtering
+  # would pair each kept row with the wrong exposure. That fit still converges
+  # and still looks reasonable, so only a comparison against the same rows
+  # filtered up front catches it.
+  keep <- d$x > 0
+  sub_fit <- fastglmm(y ~ x, d, family = poisson(), offset = log(exposure),
+                      subset = x > 0)
+  pre_fit <- fastglmm(y ~ x, d[keep, ], family = poisson(),
+                      offset = log(exposure))
+  expect_equal(nobs(sub_fit), sum(keep))
+  expect_equal(unname(fixef(sub_fit)), unname(fixef(pre_fit)),
+               tolerance = 1e-10)
+
+  expect_error(fastglmm(y ~ x, d, family = poisson(), offset = rep(0, 3)),
+               "one entry")
+})
+
 test_that("missing and unsupported columns are clean errors", {
   expect_error(fastglmm(y ~ z, ols_data()), "not found in data.*z")
   d <- ols_data()

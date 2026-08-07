@@ -1,7 +1,7 @@
 # glmm — algorithmic design rationale
 
 *The main algorithmic differences between `glmm` and the reference engines
-(lme4, MixedModels.jl), and why each one makes it faster or more robust.
+(lme4, MixedModels.jl), and why each one makes it faster.
 Written for readers who already know how mixed models are fit. Code-level
 detail: [`algorithms.md`](algorithms.md),
 [`algorithms-lmm.md`](algorithms-lmm.md),
@@ -47,9 +47,9 @@ extra groupings), a core-plus-Schur factorisation (intercept-only
 crossed/nested extras), and a sparse-Z solver for everything over the dense
 envelope. lme4 and MixedModels.jl run one general solver for all shapes.
 
-**Why it is faster and more robust.** The common simulation shapes get a
+**Why it is faster.** The common simulation shapes get a
 kernel specialised to their structure instead of paying general-solver
-overhead. Robustness comes from the router's contract: a design outside the
+overhead. The router's contract also means a design outside the
 dense envelope is *redirected* to the sparse solver, never rejected — there is
 no reachable `unimplemented!` in the dispatch. The dense/sparse split cannot
 introduce disagreement: at the same θ both kernels factor the same SPD system,
@@ -117,14 +117,19 @@ warning or an exception:
 
 - Rank-deficient X: aliased columns detected in R's `dqrdc2` order, dropped,
   the reduced model fit, `NaN` returned exactly where lme4 puts `NA`.
+- Ill-conditioned but not redundant X: fitted as-is — real β̂/SE, no column
+  dropped — with an `IllConditioned` note on `Diagnostics::notes` naming the
+  worst-conditioned column. Large standard errors carry the honest signal that
+  the columns are barely separable; this is distinct from the rank-deficient
+  case above, which is exact aliasing.
 - Variance component at zero: pinned to exactly `0.0` (every diagonal
   component ≤ 1e-4), fit still counted converged, reported through
-  `singular`/`pinned_components` flags.
+  `Diagnostics::singular`/`Diagnostics::pinned`.
 - Optimizer cap-out on a flat plateau: the best finite point is returned with
   `converged: false`, not a NaN fill.
 - Genuine numerical failure: NaN-filled, non-converged — never a crash.
 
-**Why it is more robust.** A simulation loop cannot stop to read console
+**Why it matters.** A simulation loop cannot stop to read console
 warnings. Machine-readable flags with exact-zero pins (floating-point stable
 across platforms) let a caller classify every fit programmatically, and the
 boundary between "converged at an edge" and "failed" is explicit instead of
@@ -138,7 +143,7 @@ task writes one pre-assigned slot; reductions run in fixed order). The kernel
 compiles unmodified to `wasm32` (CI-gated), and the Python and R packages are
 thin wrappers over the same compiled code.
 
-**Why it is more robust.** Same inputs, same bits — on any platform, any
+**Why it matters.** Same inputs, same bits — on any platform, any
 thread count, any wrapper. That is what makes results reproducible across a
 simulation grid, lets the parallel feature share the serial test goldens, and
 puts the engine in browsers and embedded runtimes that R and Julia cannot

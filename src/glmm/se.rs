@@ -3,7 +3,7 @@ use faer::{Mat, MatRef};
 use super::deviance::laplace_deviance_at;
 use super::pirls::structured_ainv_solve;
 use super::workspace::{fill_z_f64, glmm_block_solve, GlmmWorkspace};
-use super::{FdHessianStatus, FD_STEP_REL};
+use super::{FdHessianStatus, FD_STEP_BASE};
 
 /// Evaluate the joint Laplace deviance at `fd_saved + Σ deltaₖ·e_{coordₖ}`,
 /// reusing `ws.fd_saved` (distinct field from `ws.params`, so the disjoint
@@ -38,7 +38,7 @@ fn fd_eval(
 /// f(−s))/s²`, where `eval(coords, deltas)` evaluates the deviance at the base
 /// point perturbed by `Σ deltaₖ·e_{coordₖ}`. Returns the raw value — non-finite
 /// if either directional eval diverges — so the caller decides fallback. The
-/// step is a PARAMETER: the dense (`FD_STEP_REL`) and sparse (`SPARSE_FD_STEP_REL`)
+/// step is a PARAMETER: the dense (`FD_STEP_BASE`) and sparse (`SPARSE_FD_STEP_REL`)
 /// paths pass their own deliberately-divergent constants; this helper never sees one.
 pub(crate) fn fd_second_diff(
     eval: &mut impl FnMut(&[usize], &[f64]) -> f64,
@@ -161,7 +161,9 @@ pub(crate) fn rx_cov_into(
 ///
 /// FD scheme (tuned against `tests/fixtures/glmm_hessian_vcov.json`, the n=96 /
 /// 12-cluster `y ~ x1 + (1|grp)` glmer fit): single-step central second
-/// differences at `h_k = FD_STEP_REL·max(1, |γ̂_k|)`. No Richardson extrapolation
+/// differences at `h_θ = FD_STEP_BASE` (ABSOLUTE on the θ block) and
+/// `h_β = FD_STEP_BASE·max(1, |β̂_k|)` — see the step-construction comment in the
+/// body for why θ does not take the relative form. No Richardson extrapolation
 /// (dropped 2026-07-04 — the deviance is step-invariant to ~7 sig figs across
 /// h ∈ [1e-4, 1e-1] on this fixture, so a second-order correction bought no
 /// measurable accuracy). Every eval here runs PIRLS at the tight `PIRLS_TOL_REL_FD` (via
@@ -177,7 +179,16 @@ pub(crate) fn rx_cov_into(
 /// (slightly MORE converged — harmless).
 ///
 /// Match vs lme4 `vcov(use.hessian=TRUE)`: ~3.4e-7 worst per-entry gap on the
-/// committed fixture and ≤2e-5 rel `se_hessian` on every validation rung — but ONLY
+/// committed fixture and ≤2e-5 rel `se_hessian` on every validation rung,
+/// including the two large-θ̂ rungs (`sim_binomial_bigsd` θ̂ = 4.51, 7.4e-6;
+/// `sim_poisson_bigsd` θ̂ = 2.97, 1.4e-5). That 2e-5
+/// is **reference-limited, not glmm-limited**: we sit within 3.1e-6 of
+/// our own h→0 stencil limit on every rung, while lme4's
+/// `vcov(use.hessian=TRUE)` is itself `lme4:::deriv12` at an ABSOLUTE δ = 1e-4
+/// — measured on these references 2026-07-30, that carries 5–9e-6 of its own FD
+/// error, δ = 1e-4 sitting past lme4's own noise knee in β, and two runs of its
+/// stencil differing by 4.5e-7…1.8e-6. So most of the residual gap is theirs;
+/// tightening this number would pin one lme4 cannot reproduce — but ONLY
 /// against an lme4 run at tightened `tolPwrss` (the fixture and the frozen
 /// validation references are generated at 1e-13; each records it). At lme4's
 /// DEFAULT `tolPwrss = 1e-7` a ~1% gap opens, and it is LME4'S, not ours
@@ -222,8 +233,16 @@ pub fn fd_hessian_cov(
     // same way `pirls_solve_blocked`'s does; the dense-fallback path skips it,
     // matching `fit_glmm`'s hoist).
     ws.fd_saved[..m].copy_from_slice(&ws.params[..m]);
+    // Step construction per `FD_STEP_BASE` (θ absolute, β relative). On toenail
+    // (θ̂ = 4.708), a θ-relative step of h_θ = 0.047 puts se(β₀) 4.9e-4 above the
+    // converged value; at h_θ = 1e-2 it is 2.2e-5, against a noise floor near
+    // h = 2.5e-3.
     for k in 0..m {
-        ws.fd_steps[k] = FD_STEP_REL * ws.fd_saved[k].abs().max(1.0);
+        ws.fd_steps[k] = if k < n_theta {
+            FD_STEP_BASE
+        } else {
+            FD_STEP_BASE * ws.fd_saved[k].abs().max(1.0)
+        };
     }
     if ws.groupings.extra_offsets.is_empty() || ws.groupings.structured_extras_eligible() {
         let GlmmWorkspace {

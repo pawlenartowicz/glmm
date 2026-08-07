@@ -9,7 +9,7 @@
 // which do not classify the design for you.
 pub use crate::fit::{
     build_lmm_seam_ws, build_workspace, fit_on, lmm_objective_at, lmm_sweep_fit, lmm_sweep_fit_on,
-    FitView, FitWorkspace, LmmSeamWs, LmmSweepOutcome,
+    FitDiagnostics, FitView, FitWorkspace, LmmSeamWs, LmmSweepOutcome,
 };
 // The RE-level-count normalizer `build_workspace` expects its `sized` spec to have
 // gone through — exposed so loop-tier consumers size specs the validated way

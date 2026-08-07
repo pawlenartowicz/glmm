@@ -10,7 +10,8 @@
 //! Algorithm — guards and tolerances:
 //!   - Adaptive convergence: `|Δdeviance| < DEVIANCE_TOL = 1e-8`
 //!   - Safety cap: `MAX_IRLS_ITERS = 50`
-//!   - BETA_CAP divergence guard: `iter ≥ 3 ∧ ‖β‖_∞ > 30 → non-converged`
+//!   - ETA_DIVERGENCE_CAP divergence guard: `iter ≥ 3 ∧ ‖η‖_∞ > 30 →
+//!     non-converged` (skipped under the Gamma inverse link)
 //!   - All-0 / all-1 short circuit
 //!   - Post-fit saturation guard (50% of weights < 1e-5 ⇒ non-converged)
 //!   - No step-halving: β_new is accepted directly
@@ -41,8 +42,16 @@ use crate::FLOAT_NEAR_ZERO;
 pub const MAX_IRLS_ITERS: u32 = 50;
 /// Adaptive convergence tolerance on `|Δdeviance|`.
 pub const DEVIANCE_TOL: f64 = 1e-8;
-/// Divergence guard: any |β_j| > BETA_CAP at iter ≥ 3 marks non-converged.
-pub const BETA_CAP: f64 = 30.0;
+/// Divergence guard: any |η_i| > ETA_DIVERGENCE_CAP at iter ≥ 3 marks
+/// non-converged. The bound is on the LINEAR PREDICTOR, not on β: η = Xβ is
+/// unchanged when a predictor column is rescaled (the compensating change in β̂
+/// is exact), so the accept/reject decision does not depend on the caller's
+/// choice of units — height in metres and height in kilometres give the same
+/// verdict. 30 is the number the physical argument actually supports: on the
+/// logit scale |η| = 30 is already p ≈ 1 − 1e-13, which is separation, not
+/// signal. Skipped under the Gamma inverse link, where η = 1/μ makes a large
+/// |η| an honest small-mean fit (see the guard site).
+pub const ETA_DIVERGENCE_CAP: f64 = 30.0;
 /// Floor on per-row IRLS weight `W_i = p_i (1-p_i)` to avoid division by zero
 /// in the working response.
 pub const WEIGHT_CLAMP: f64 = 1e-6;
@@ -88,6 +97,23 @@ pub struct GlmFitView<'a> {
     /// on the view so `glm_view_to_fit` can assemble `fitted`/`loglik`/Gamma
     /// dispersion without a second borrow of the IRLS scratch the view holds.
     pub mu: &'a [f64],
+    /// Scale-invariant per-column pivot ratio of the CONVERGED `X'WX`
+    /// (`crate::ols::min_pivot_ratio`), with `pivot_col` the column that attains
+    /// it. **Detection only** — nothing in this route reads it to accept or
+    /// reject a design, and nothing may start to: the IRLS weights come out of
+    /// the fit itself, so an ill-conditioned-but-computable design already fits
+    /// here and turning that into a refusal needs its own calibration against
+    /// `glm.fit`. The value exists so a diagnostics channel can tell the caller
+    /// their coefficients are barely identified, which is the one thing nothing
+    /// upstream can see: a design full-rank in raw `x` can be singular under the
+    /// converged weights, and the pre-dispatch alias gate cannot predict them
+    /// even in principle.
+    ///
+    /// `NaN` / `0` on every non-converged and short-circuit return — there is no
+    /// converged `X'WX` to measure.
+    pub pivot: f64,
+    /// Column attaining `pivot`. Meaningless when `pivot` is NaN.
+    pub pivot_col: u32,
 }
 
 /// Caller-owned scratch borrowed from `SimWorkspace` field-by-field. Built
@@ -253,6 +279,8 @@ pub fn glm_irls_fit<'a>(
             deviance: f64::NAN,
             deviance_null: f64::NAN,
             mu: &irls_p[..n],
+            pivot: f64::NAN,
+            pivot_col: 0,
         };
     }
 
@@ -276,6 +304,8 @@ pub fn glm_irls_fit<'a>(
             deviance: f64::NAN,
             deviance_null: f64::NAN,
             mu: &irls_p[..n],
+            pivot: f64::NAN,
+            pivot_col: 0,
         };
     }
 
@@ -355,7 +385,7 @@ pub fn glm_irls_fit<'a>(
         // NOT R's per-row μ₀ = y + 0.1 `initialize`: on
         // zero-heavy small-θ NB data the per-row seed's first step fits the
         // log-count mean (intercept ≈ ln 0.1), the second explodes past
-        // BETA_CAP, and recovery crawls at ~1 unit/iter past the iteration
+        // the divergence cap, and recovery crawls at ~1 unit/iter past the iteration
         // budget — R's own glm.fit fails identically there (glm.nb only
         // survives by warm-starting each alternation from a Poisson fit); the
         // constant ȳ seed converges on both regimes. β stays 0 in all seeded
@@ -404,6 +434,19 @@ pub fn glm_irls_fit<'a>(
     // check reads the top-of-pass fused kernel's output directly — no separate
     // `log1pexp` sweep — so `deviance_final` is always one pass behind the β
     // that produced it, by construction, not by an accident of ordering.
+    //
+    // The divergence guard bounds |η|, which under the Gamma inverse link is
+    // 1/μ — a legitimate small-mean fit sits far above the threshold there. That
+    // family/link pair falls through to the other exits instead: clamp_eta's
+    // ±700 (src/family.rs), the non-finite guard on β_new, and MAX_IRLS_ITERS.
+    // Loop-invariant, so it is evaluated once.
+    let eta_guard_active = !matches!(
+        family,
+        Family::Gamma {
+            link: crate::spec::GammaLink::Inverse
+        }
+    );
+
     for iter in 0..=MAX_IRLS_ITERS {
         // η = X · β is already in `irls_eta`: seeded to 0 (β = 0) or the
         // truth start before the loop, then refreshed by the accept step below
@@ -588,17 +631,20 @@ pub fn glm_irls_fit<'a>(
             }
         }
 
-        // BETA_CAP divergence guard at iter ≥ 3. Fires before the next
-        // pass's convergence check — a capped β never reports converged.
-        if iter >= 3 {
+        // Divergence guard at iter ≥ 3, on the linear predictor just recomputed
+        // above. Fires before the next pass's convergence check — a capped fit
+        // never reports converged. The sweep is over n rather than p; that is a
+        // longer pass than the old |β| one, and negligible beside the GEMM that
+        // builds X'WX each iteration.
+        if eta_guard_active && iter >= 3 {
             let mut max_abs: f64 = 0.0;
-            for &b in &irls_betas[..p] {
-                let ab = b.abs();
-                if ab > max_abs {
-                    max_abs = ab;
+            for &e in &irls_eta[..n] {
+                let ae = e.abs();
+                if ae > max_abs {
+                    max_abs = ae;
                 }
             }
-            if max_abs > BETA_CAP {
+            if max_abs > ETA_DIVERGENCE_CAP {
                 break;
             }
         }
@@ -653,6 +699,8 @@ pub fn glm_irls_fit<'a>(
             deviance: f64::NAN,
             deviance_null: f64::NAN,
             mu: &irls_p[..n],
+            pivot: f64::NAN,
+            pivot_col: 0,
         };
     }
 
@@ -693,6 +741,12 @@ pub fn glm_irls_fit<'a>(
         }
     }
 
+    // Ill-conditioning DETECTION on the converged X'WX, read off the L just
+    // materialised. Purely observational: no branch below depends on it. The
+    // matrix is the one the coefficients and their SEs actually came from, which
+    // is why it is measured here and not on the raw design.
+    let (pivot, pivot_col) = crate::ols::min_pivot_ratio(irls_l.rb(), p);
+
     GlmFitView {
         betas: &irls_betas[..p],
         var_diag: &irls_var_diag[..t],
@@ -703,6 +757,8 @@ pub fn glm_irls_fit<'a>(
         deviance: deviance_final,
         deviance_null,
         mu: &irls_p[..n],
+        pivot,
+        pivot_col: pivot_col as u32,
     }
 }
 
@@ -904,7 +960,7 @@ mod tests {
     #[test]
     fn glm_separation_marks_non_converged() {
         // Build a fully-separated dataset: y = (x > 0). Logistic regression
-        // diverges (β → ∞); BETA_CAP or saturation guard should fire.
+        // diverges (β → ∞, so η → ∞); the divergence cap or the saturation guard should fire.
         let n = 200;
         let p = 2;
         let mut x = Mat::<f64>::zeros(n, p);
@@ -935,6 +991,220 @@ mod tests {
             "fully separated data must report non-converged"
         );
     }
+
+    /// Well-conditioned logistic design whose slope column is multiplied by
+    /// `scale`. The response is generated from the UNSCALED column, so the three
+    /// scalings are literally the same model in three unit systems. The LCG is
+    /// local to this builder — the fit path itself stays RNG-free (RULE 3).
+    fn scaled_logit_design(n: usize, scale: f64) -> (Mat<f64>, Vec<f64>) {
+        let mut x = Mat::<f64>::zeros(n, 2);
+        let mut y = vec![0.0f64; n];
+        let mut s: u64 = 12345;
+        for i in 0..n {
+            let xu = ((i as f64) / (n as f64) - 0.5) * 4.0;
+            x[(i, 0)] = 1.0;
+            x[(i, 1)] = xu * scale;
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = (s >> 11) as f64 / ((1u64 << 53) as f64);
+            let p = 1.0 / (1.0 + (0.3 - 2.0 * xu).exp());
+            y[i] = f64::from(u8::from(u < p));
+        }
+        (x, y)
+    }
+
+    /// Same idea for a Poisson log-link design: μ = exp(0.5 + 0.8·x), counts
+    /// spread deterministically around it.
+    fn scaled_poisson_design(n: usize, scale: f64) -> (Mat<f64>, Vec<f64>) {
+        let mut x = Mat::<f64>::zeros(n, 2);
+        let mut y = vec![0.0f64; n];
+        for i in 0..n {
+            let xu = ((i as f64) / (n as f64) - 0.5) * 4.0;
+            x[(i, 0)] = 1.0;
+            x[(i, 1)] = xu * scale;
+            let mu = (0.5 + 0.8 * xu).exp();
+            let jitter = 0.7 + 0.2 * ((i % 4) as f64);
+            y[i] = (mu * jitter).round();
+        }
+        (x, y)
+    }
+
+    /// η = Xβ does not move when a predictor column is rescaled — the
+    /// compensating change in β̂ is exact — so a guard that bounds η gives the
+    /// same accept/reject decision in every unit system. Under the old
+    /// `|β_j| > 30` cap the x/1000 fit was rejected with NaN variances while the
+    /// identical x and x·1000 fits were accepted.
+    #[test]
+    fn glm_logit_guard_is_scale_invariant() {
+        let n = 200;
+        let p = 2;
+        let targets: Vec<u32> = vec![0, 1];
+        let fit_at = |scale: f64| {
+            let (x, y) = scaled_logit_design(n, scale);
+            let mut ws = TestWs::new(n, p, 0);
+            let f = glm_irls_fit(
+                crate::Family::Binomial {
+                    link: crate::BinomialLink::Logit,
+                },
+                f64::NAN,
+                x.as_ref(),
+                &y,
+                &targets,
+                None,
+                None,
+                None,
+                glm_scratch(&mut ws),
+            );
+            (
+                f.converged,
+                f.betas.to_vec(),
+                f.deviance,
+                f.var_diag.to_vec(),
+            )
+        };
+
+        let (c1, b1, d1, v1) = fit_at(1.0);
+        let (c2, b2, d2, v2) = fit_at(1e-3);
+        let (c3, b3, d3, v3) = fit_at(1e3);
+
+        assert!(
+            c1 && c2 && c3,
+            "the same model in three unit systems must give the same convergence \
+             verdict: x={c1} x/1000={c2} x*1000={c3}"
+        );
+
+        // Tolerance floor is ~1e-12 relative, not 0: `xu * 1e-3` and `xu * 1e3`
+        // are rounded doubles, so the three designs are not literally the same
+        // numbers even though they are the same model.
+        for (b, d, s) in [(&b2, d2, 1e-3f64), (&b3, d3, 1e3f64)] {
+            assert!(
+                (b[0] - b1[0]).abs() <= 1e-9 * b1[0].abs().max(1.0),
+                "intercept must not depend on the slope column's units: {} vs {}",
+                b[0],
+                b1[0]
+            );
+            let rescaled = b[1] * s;
+            assert!(
+                (rescaled - b1[1]).abs() <= 1e-9 * b1[1].abs().max(1.0),
+                "slope must scale exactly with the unit change: {rescaled} vs {}",
+                b1[1]
+            );
+            assert!(
+                (d - d1).abs() <= 1e-9 * d1.abs(),
+                "deviance must not depend on units: {d} vs {d1}"
+            );
+        }
+        for v in [&v1, &v2, &v3] {
+            assert!(
+                v.iter().all(|q| q.is_finite()),
+                "variances must be finite in every unit system: {v:?}"
+            );
+        }
+    }
+
+    /// The Poisson log link repeats the logistic invariance property. Under the
+    /// old `|β_j| > 30` cap, `y ~ x/1000` returned `converged: false` with
+    /// β̂ = (0.4915, 803.09) and NaN standard errors.
+    #[test]
+    fn glm_poisson_guard_is_scale_invariant() {
+        let n = 200;
+        let p = 2;
+        let targets: Vec<u32> = vec![0, 1];
+        let fit_at = |scale: f64| {
+            let (x, y) = scaled_poisson_design(n, scale);
+            let mut ws = TestWs::new(n, p, 0);
+            let f = glm_irls_fit(
+                crate::Family::Poisson {
+                    link: crate::PoissonLink::Log,
+                },
+                f64::NAN,
+                x.as_ref(),
+                &y,
+                &targets,
+                None,
+                None,
+                None,
+                glm_scratch(&mut ws),
+            );
+            (
+                f.converged,
+                f.betas.to_vec(),
+                f.deviance,
+                f.var_diag.to_vec(),
+            )
+        };
+
+        let (c1, b1, d1, v1) = fit_at(1.0);
+        let (c2, b2, d2, v2) = fit_at(1e-3);
+
+        assert!(c1 && c2, "poisson: x={c1} x/1000={c2}");
+        assert!(
+            (b2[0] - b1[0]).abs() <= 1e-9 * b1[0].abs().max(1.0),
+            "poisson intercept: {} vs {}",
+            b2[0],
+            b1[0]
+        );
+        let rescaled = b2[1] * 1e-3;
+        assert!(
+            (rescaled - b1[1]).abs() <= 1e-9 * b1[1].abs().max(1.0),
+            "poisson slope must scale exactly: {rescaled} vs {}",
+            b1[1]
+        );
+        assert!(
+            (d2 - d1).abs() <= 1e-9 * d1.abs(),
+            "poisson deviance: {d2} vs {d1}"
+        );
+        assert!(v1.iter().chain(v2.iter()).all(|q| q.is_finite()));
+    }
+
+    /// Under the Gamma inverse link η = 1/μ, so a legitimate small-mean fit sits
+    /// far above the divergence threshold on the η scale — μ = 0.01 gives
+    /// η = 100. The guard is skipped for that family/link pair; this fit pins
+    /// that it is, and that the fit is still accepted.
+    #[test]
+    fn glm_gamma_inverse_large_eta_still_converges() {
+        let n = 200;
+        let p = 2;
+        let mut x = Mat::<f64>::zeros(n, p);
+        let mut y = vec![0.0f64; n];
+        for i in 0..n {
+            let xu = (i as f64) / (n as f64) - 0.5;
+            x[(i, 0)] = 1.0;
+            x[(i, 1)] = xu;
+            // η = 100 − 20·x exactly, i.e. μ ≈ 0.01: honest, and more than three
+            // times the divergence threshold.
+            let eta = 100.0 - 20.0 * xu;
+            let jitter = 1.0 + 0.05 * (((i % 7) as f64) - 3.0) / 3.0;
+            y[i] = jitter / eta;
+        }
+        let mut ws = TestWs::new(n, p, 0);
+        let targets: Vec<u32> = vec![0, 1];
+        let fit = glm_irls_fit(
+            crate::Family::Gamma {
+                link: crate::GammaLink::Inverse,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &targets,
+            None,
+            None,
+            None,
+            glm_scratch(&mut ws),
+        );
+        assert!(
+            fit.converged,
+            "a small-mean Gamma inverse-link fit carries |η| ≈ 100 honestly and \
+             must not be rejected as divergence"
+        );
+        assert!(
+            (fit.betas[0] - 100.0).abs() < 5.0,
+            "intercept on the 1/μ scale should land near 100, got {}",
+            fit.betas[0]
+        );
+    }
+
     // -----------------------------------------------------------------
     // GLM deviance_null golden value (external oracle: R glm()$null.deviance)
     // -----------------------------------------------------------------

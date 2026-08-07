@@ -8,8 +8,24 @@ use faer::Mat;
 use crate::glm::{glm_irls_fit, GlmFitView, GlmScratch};
 use crate::{Family, NegBinomialLink};
 
-use super::common::{fill_se_compact, nan_vcov, to_col_major, vcov_from_chol};
-use super::{Fit, FitOptions};
+use super::common::{fill_se_compact, nan_vcov, to_col_major, vcov_from_chol, FitDiagnostics};
+use super::{Diagnostics, Fit, FitOptions};
+
+impl GlmFitView<'_> {
+    /// This route's [`FitDiagnostics`]. No θ, so no boundary or pin state. The
+    /// pivot is measured on the CONVERGED `X'WX`, and it shares OLS's floor
+    /// because the two were calibrated together — the IRLS weights are what
+    /// makes it worth reporting: they come out of the fit itself, so nothing
+    /// upstream can predict the conditioning of the matrix actually solved.
+    pub(crate) fn diagnostics(&self) -> FitDiagnostics {
+        FitDiagnostics {
+            pivot: self.pivot,
+            pivot_col: self.pivot_col,
+            ill_conditioned: self.pivot < crate::ols::PIVOT_MIN,
+            ..FitDiagnostics::fixed_only(self.converged)
+        }
+    }
+}
 
 /// Builds the standard non-converged NaN `Fit` used to seed
 /// [`fit_glm_nb_capped`]'s θ↔β alternation before the first inner IRLS fit
@@ -23,13 +39,11 @@ fn fit_unsupported_family(p: usize) -> Fit {
         vcov: nan_vcov(p),
         tau2: vec![],
         dispersion: f64::NAN,
-        converged: false,
+        diagnostics: Diagnostics::from_flags(false, false, p),
         varcorr: vec![],
         stddev_se: vec![],
-        aliased: vec![false; p],
         n_eval: 0,
         deviance: f64::NAN,
-        singular: false,
         loglik: f64::NAN,
         df: 0,
         reml: false,
@@ -181,7 +195,8 @@ pub(crate) fn glm_view_to_fit(
     // --- map GlmFitView → Fit ---
     // view.betas is full [0..p]; view.var_diag is target-compact [0..t] (like OLS).
     let beta = view.betas.to_vec();
-    let converged = view.converged;
+    let diag = view.diagnostics();
+    let converged = diag.converged;
     // Weighted Σwᵢdᵢ at the accepted iterate (NaN unless converged).
     let irls_deviance = view.deviance;
     let mut se = vec![f64::NAN; p];
@@ -263,13 +278,13 @@ pub(crate) fn glm_view_to_fit(
         vcov,
         tau2: vec![],
         dispersion,
-        converged,
+        // `singular` is constant false here for the same reason it is on OLS —
+        // no θ, so `boundary_hit` stays 0. See `ols.rs`'s note at this field.
+        diagnostics: super::common::materialize_diagnostics(&diag, p, &[]),
         varcorr: vec![],
         stddev_se: vec![],
-        aliased: vec![false; p],
         n_eval: 0,
         deviance: f64::NAN,
-        singular: false,
         loglik,
         df: if converged {
             super::common::model_df(family, p, 0, opts.dispersion.is_some())
@@ -334,6 +349,25 @@ pub(crate) fn nb_profile_loglik(y: &[f64], mu: &[f64], theta: f64, weights: Opti
 /// Returns `θ̂ = exp(argmax)`. Shared by the GLM conditional θ profile
 /// ([`optimize_nb_theta`]) and the GLMM marginal-θ objective in [`fit_glmm_nb`];
 /// `g` is the log-likelihood to maximise as a function of `ln θ`.
+///
+/// Stopping width `1e-4` on `ln θ` (2026-08-06, was `1e-8`): for the GLMM route,
+/// `g` is a full inner GLMM refit at fixed θ, and that refit's own inner
+/// two-stage BOBYQA is converged only to `GLMM_RHO_END = 3e-6` (`src/lmm.rs`) —
+/// no evaluation of `g` resolves θ differences finer than that on its own. Below
+/// that radius the inner refit exhibits a knife-edge: two nearby θ values can
+/// land the refit in different local optima of its own objective, with the same
+/// `g(ln θ)` shape otherwise unchanged, so a search still iterating there is not
+/// resolving curvature — it is picking a side of that knife-edge by whatever
+/// rounding happens to be present in the inputs. Measured on the dense NB GLMM
+/// fixture: the old `1e-8` width let a 1-ULP input perturbation flip the
+/// reported β by ~9.5e-5 relative through exactly this mechanism (branch flip at
+/// golden-section iteration 40 of 45, interval width 4.35e-8, ~69x tighter than
+/// the noise floor); at `1e-4` the same perturbation pair converges to a
+/// bit-identical β. `1e-4` was chosen as the loosest of {1e-8, 1e-7, 1e-6, 1e-5,
+/// 1e-4, 1e-3} that both removes the flip and keeps every cross-engine NB golden
+/// (`cargo test --features oracle-tests -- goldens_agree_with_the_references`)
+/// inside `validation/tol.R`'s bands (`1e-3` also held; `1e-4` is one decade
+/// tighter for margin).
 pub(crate) fn golden_max_ln_theta(mut g: impl FnMut(f64) -> f64) -> f64 {
     const INV_PHI: f64 = 0.618_033_988_749_894_9; // 1/golden ratio
     let (mut a, mut b) = (NB_THETA_LO.ln(), NB_THETA_HI.ln());
@@ -354,7 +388,7 @@ pub(crate) fn golden_max_ln_theta(mut g: impl FnMut(f64) -> f64) -> f64 {
             d = a + (b - a) * INV_PHI;
             fd = g(d);
         }
-        if (b - a).abs() < 1e-8 {
+        if (b - a).abs() < 1e-4 {
             break;
         }
     }
@@ -426,7 +460,7 @@ pub(super) fn fit_glm_nb_capped(
         // θ is fixed for this β fit and threaded explicitly (the spec is θ-free).
         let view = fit_glm_prebuilt(family, theta, x_ref, y, opts, &mut buf);
         fit_result = glm_view_to_fit(&view, y, family, theta, n, p, opts);
-        if !fit_result.converged {
+        if !fit_result.converged() {
             break;
         }
         // μ̂ = exp(o + Xβ̂) for the θ optimisation.

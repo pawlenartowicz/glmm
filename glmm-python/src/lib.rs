@@ -1,15 +1,14 @@
-//! PyO3 binding: builds the `glmm._native` extension module. Almost all logic
-//! lives in `convert.rs`/`orchestrate.rs`, which never touch a `pyo3` type and
-//! run under plain `cargo test` — this file is only the FFI shim.
-
-mod convert;
-mod orchestrate;
+//! PyO3 binding: builds the `glmm._native` extension module. All logic lives
+//! in `glmm::orchestrate` (the crate's shared port-orchestration module,
+//! behind its `orchestrate` feature) — this file is only the FFI shim.
 
 use std::collections::HashMap;
 
+use glmm::orchestrate;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 
 /// `FitResult` → a `dict` keyed by field name, unpacked in `glmm/__init__.py::fit`.
 ///
@@ -42,6 +41,36 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     d.set_item("fitted", r.fitted)?;
     d.set_item("ranef", r.ranef)?;
     d.set_item("ranef_levels", r.ranef_levels)?;
+    // Labelled blocks as their own dicts, same reason the notes below are: the
+    // Python layer reshapes each into `(n_levels, n_terms)` and never has to
+    // know a positional order.
+    let blocks = PyList::empty(py);
+    for (group, terms, levels, values) in r.ranef_blocks {
+        let bd = PyDict::new(py);
+        bd.set_item("group", group)?;
+        bd.set_item("terms", terms)?;
+        bd.set_item("levels", levels)?;
+        bd.set_item("values", values)?;
+        blocks.append(bd)?;
+    }
+    d.set_item("ranef_blocks", blocks)?;
+    d.set_item("boundary", r.boundary)?;
+    d.set_item("pinned", r.pinned)?;
+    // Each note as its own dict, keyed the same way the outer one is: the
+    // `kind` string is what `glmm/__init__.py` maps to a warning category, so
+    // an unrecognized kind stays readable instead of decoding to a position.
+    let notes = PyList::empty(py);
+    for n in r.notes {
+        let nd = PyDict::new(py);
+        nd.set_item("kind", n.kind)?;
+        nd.set_item("columns", n.columns)?;
+        nd.set_item("pivot", n.pivot)?;
+        nd.set_item("evals", n.evals)?;
+        nd.set_item("final_eval", n.final_eval)?;
+        nd.set_item("detail", n.detail)?;
+        notes.append(nd)?;
+    }
+    d.set_item("notes", notes)?;
     Ok(d)
 }
 

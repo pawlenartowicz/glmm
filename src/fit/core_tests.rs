@@ -312,10 +312,247 @@ fn fitview_accessors_match_fit_for_ols() {
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     let mut ws = build_workspace(&model, n, p, &opts);
     let v = fit_on(&mut ws, &x, &y, &ids, None, &opts);
-    assert_eq!(v.converged(), cold.converged);
+    assert_eq!(v.converged(), cold.converged());
     // OLS t_sq is target-compact.
     assert_eq!(v.t_sq().len(), opts.target_indices.len());
     assert_eq!(v.betas().len(), p);
+}
+
+/// The one diagnostics carrier agrees with what `into_fit` materializes into
+/// `Fit`, on all three shapes that reach it differently: OLS (a detection route
+/// with no θ), dense LMM (θ boundary state AND a recorded pivot), and the
+/// sparse `Prebuilt` arm (whose carrier is read back off an assembled `Fit`).
+/// Every case here is well-conditioned, so `ill_conditioned` must be false and
+/// the OLS/LMM pivots must sit far above their floors — this is the negative
+/// control for the flag, and it is the case the alloc gate below profiles.
+#[test]
+fn fitview_diagnostics_agree_with_materialized_fit() {
+    let (x, y, n, p, model, ids, opts) = ols_case();
+    let mut ws = build_workspace(&model, n, p, &opts);
+    let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert_eq!(d.converged, cold.converged());
+    // OLS has no θ, so both sides of the carrier↔`Fit` agreement are pinned at
+    // their absent-state values rather than agreeing about anything: assert the
+    // values, not the equality. `boundary_hit == 1` is what `singular` reads,
+    // and neither can ever become true on this route (see `ols.rs`'s note at
+    // the `diagnostics` field). The LMM case below is where they carry state.
+    assert_eq!(d.boundary_hit, 0, "OLS has no θ to pin");
+    assert!(!cold.singular(), "OLS reports no variance component");
+    assert!(!d.ill_conditioned);
+    assert!(d.pivot > crate::ols::PIVOT_MIN, "pivot {}", d.pivot);
+
+    let (x, y, n, p, model, ids, opts) = lmm_intercept_case();
+    let sized = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, n, p, &opts);
+    let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert_eq!(d.converged, cold.converged());
+    assert!(!d.ill_conditioned);
+    assert!(d.pivot > crate::lmm::PIVOT_MIN, "pivot {}", d.pivot);
+    // `Fit::singular` is the carrier's boundary bit ORed with the
+    // negligible-component check, so the carrier can only be the weaker of the
+    // two — never `true` where the fit says `false`.
+    assert!(d.boundary_hit != 1 || cold.singular());
+
+    let (x, y, n, p, model, ids, opts) = crossed_extra_case(vec![1]);
+    let sized = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, n, p, &opts);
+    assert!(ws.is_prebuilt());
+    let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert_eq!(d.converged, cold.converged());
+    assert_eq!(d.boundary_hit == 1, cold.singular());
+    // The sparse route refuses below its own floor and records no pivot, so it
+    // never flags — spec decision, not an oversight.
+    assert!(!d.ill_conditioned && d.pivot.is_nan());
+}
+
+/// The positive control the negative one above cannot give: a dense-LMM draw
+/// that comes back FLAGGED. Column 2 is column 1 scaled by 0.1 and nudged by a
+/// relative `D` of alternating sign — a NEAR-duplicate, not an exact one,
+/// because an exact duplicate drives this route's θ-search to a non-finite
+/// deviance and it returns `boundary_hit == 2` with no factor left to measure.
+/// The near-duplicate converges normally and still records a pivot far under
+/// `lmm::PIVOT_MIN`, which is the state this flag exists to report.
+///
+/// It has to go through `fit_on`, not `fit_cold`: the stable entries run the
+/// pre-dispatch alias gate, which finds this pair redundant in the raw Gram and
+/// drops column 2 before any solver sees it — asserted at the end, because that
+/// contrast IS the loop tier's problem. A warm-loop caller bypasses the gate,
+/// gets `converged: true` with a finite β̂ and an enormous SE, and has nothing
+/// to count unless this flag fires.
+#[test]
+fn fitview_diagnostics_flag_a_rank_deficient_lmm_draw() {
+    // Picked against the recorded pivot rather than guessed: 1e-6 puts it at
+    // 9.7e-13, barely inside the band; 1e-7 puts it at 9.0e-15, with room.
+    const D: f64 = 1e-7;
+    let (n, n_clusters, p) = (48usize, 6usize, 3usize);
+    let mut st = 11u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    for i in 0..n {
+        ids_v[i] = (i % n_clusters) as u32;
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        x[i * p + 2] = 0.1 * x1 * (1.0 + D * if i % 2 == 0 { 1.0 } else { -1.0 });
+        y[i] = 0.5 + 0.4 * x1 + 0.8 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![1, 2],
+        ..FitOptions::default()
+    };
+
+    let sized = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, n, p, &opts);
+    assert!(ws.is_lmm_dense());
+    let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
+    assert!(d.converged, "the near-duplicate design is still computable");
+    assert!(
+        d.ill_conditioned,
+        "a near-duplicate column must raise the flag, pivot was {}",
+        d.pivot
+    );
+    assert!(d.pivot < crate::lmm::PIVOT_MIN, "pivot {}", d.pivot);
+    assert_eq!(
+        d.pivot_col, 2,
+        "the LATER column of the duplicated pair is the one named"
+    );
+
+    // Through the stable entry the alias gate drops column 2 first, so the same
+    // design never reaches the flag — it reaches `aliased` instead. That split
+    // is exactly why the loop tier needs a read of its own.
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert_eq!(cold.aliased(), vec![false, false, true]);
+}
+
+/// The OLS twin of the LMM positive control, and the reason there are two: the
+/// two routes compare against two SEPARATE constants that both happen to read
+/// 1e-12 today, so a swapped comparison is invisible by value. Firing each arm
+/// against its own design is what keeps both wirings under test if either
+/// constant is ever recalibrated.
+///
+/// The design is full-rank raw and near-singular once weighted — the alias gate
+/// tests the raw `x` and passes it, so unlike the LMM case above this one
+/// reaches the flag through `fit_cold` too. The pivot is measured on the
+/// weighted Gram, which is the whole point of recording it.
+#[test]
+fn fitview_diagnostics_flag_a_weighted_collinear_ols_fit() {
+    let (n, p, split) = (60usize, 3usize, 40usize);
+    // 1e-11 puts the weighted pivot around 2e-13 — inside the flagging band and
+    // still positive-definite enough for faer's llt to accept it. A smaller
+    // weight makes X'WX numerically indefinite and the route refuses instead.
+    const WSMALL: f64 = 1e-11;
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    let mut w = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = ((i * 13) % 17) as f64 - 8.0;
+        // What separates the two predictor columns lives ENTIRELY on the
+        // negligibly-weighted rows.
+        let delta = if i < split { 0.0 } else { 1.0 };
+        x.extend_from_slice(&[1.0, a, a + delta]);
+        y.push(0.5 + 1.3 * a + 0.477 * (a + delta) + ((i % 3) as f64 - 1.0));
+        w.push(if i < split { 1.0 } else { WSMALL });
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        weights: Some(w),
+        ..FitOptions::default()
+    };
+    let ids = GroupIds::default();
+
+    let mut ws = build_workspace(&model, n, p, &opts);
+    assert!(ws.is_ols());
+    let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
+    assert!(d.converged, "the fit is computable and must be returned");
+    assert!(
+        d.ill_conditioned,
+        "the weighted collinearity must raise the flag, pivot was {}",
+        d.pivot
+    );
+    assert!(d.pivot < crate::ols::PIVOT_MIN, "pivot {}", d.pivot);
+    assert_eq!(d.pivot_col, 2);
+    // Nothing is redundant in the RAW design, so the alias gate drops nothing
+    // and the stable entry lands on the same flagged fit.
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(cold.converged() && cold.aliased() == vec![false; p]);
+}
+
+/// The carrier must cost the warm loop NOTHING. Not a bound like the kernel
+/// gates elsewhere — an exact zero: `FitDiagnostics` is `Copy` scalars only, so
+/// reading it per draw may not touch the heap on ANY route. The `Prebuilt` arm
+/// is the one that could regress here, since its carrier is read off a `Fit`
+/// that owns several `Vec`s; if a future field starts cloning one of them, this
+/// is what catches it.
+///
+/// Run: `cargo test -p glmm --features alloc-tests fitview_diagnostics_zero_alloc
+/// -- --ignored` (`alloc-tests` installs the dhat allocator; `alloc_test_guard`
+/// serializes it against the other `#[ignore]` tests).
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn fitview_diagnostics_zero_alloc() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: usize = 1000;
+
+    let (xo, yo, no, po, mo, ido, oo) = ols_case();
+    let mut ws_ols = build_workspace(&mo, no, po, &oo);
+    let (xl, yl, nl, pl, ml, idl, ol) = lmm_intercept_case();
+    let sized_l = spec_sized_from_ids_pub(&ml, &idl);
+    let mut ws_lmm = build_workspace(&sized_l, nl, pl, &ol);
+    let (xs, ys, ns, ps, ms, ids_s, os) = crossed_extra_case(vec![1]);
+    let sized_s = spec_sized_from_ids_pub(&ms, &ids_s);
+    let mut ws_sparse = build_workspace(&sized_s, ns, ps, &os);
+
+    // Fit each arm ONCE outside the profiler — the fits themselves allocate
+    // (faer internals, and the sparse kernel assembles a whole `Fit`); what is
+    // being measured is only the carrier read off the resulting view.
+    let v_ols = fit_on(&mut ws_ols, &xo, &yo, &ido, None, &oo);
+    let v_lmm = fit_on(&mut ws_lmm, &xl, &yl, &idl, None, &ol);
+    let v_sparse = fit_on(&mut ws_sparse, &xs, &ys, &ids_s, None, &os);
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    // `diagnostics()` is pure and its input (`v_*`) does not change across
+    // iterations, so black-boxing only the RESULT stops the compiler from
+    // discarding the call as dead code but not from proving the whole loop
+    // body loop-invariant and hoisting it above the loop, which would leave
+    // this measuring one real call plus 999 no-op reads of the cached value
+    // instead of N_CALLS calls. Black-boxing the reference too — an opaque
+    // input each iteration — blocks that hoist, so the assertion below is
+    // actually over N_CALLS × 3 real `diagnostics()` calls.
+    for _ in 0..N_CALLS {
+        std::hint::black_box(std::hint::black_box(&v_ols).diagnostics());
+        std::hint::black_box(std::hint::black_box(&v_lmm).diagnostics());
+        std::hint::black_box(std::hint::black_box(&v_sparse).diagnostics());
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    assert_eq!(
+        stats.total_blocks, 0,
+        "FitView::diagnostics allocated {} blocks across {} reads per arm",
+        stats.total_blocks, N_CALLS
+    );
 }
 
 // --- build_workspace routing ---
@@ -373,8 +610,8 @@ fn fit_on_ols_reused_ws_near_identical_to_fit_cold() {
     let (x, y, n, p, model, ids, opts) = ols_case();
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     let mut ws = build_workspace(&model, n, p, &opts);
-    let f1 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, n, p, &model, &opts);
-    let f2 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, n, p, &model, &opts);
+    let f1 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
+    let f2 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     assert_near(&cold.beta, &f1.beta, "beta vs fit_cold");
     assert_near(&cold.se, &f1.se, "se vs fit_cold");
     assert_near(&f1.beta, &f2.beta, "beta first vs second reuse");
@@ -386,7 +623,7 @@ fn fit_on_reused_ws_near_identical_to_fit_cold_lmm() {
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     let sized = spec_sized_from_ids_pub(&model, &ids);
     let mut ws = build_workspace(&sized, n, p, &opts);
-    let f1 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, n, p, &model, &opts);
+    let f1 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     assert_near(&cold.beta, &f1.beta, "beta vs fit_cold");
     assert_near(&cold.tau2, &f1.tau2, "tau2 vs fit_cold");
     assert_near(
@@ -403,7 +640,8 @@ fn fit_on_reused_ws_near_identical_to_fit_cold_lmm() {
         .map(|(i, &v)| v + 0.3 * ((i % 7) as f64 - 3.0))
         .collect();
     let cold2 = fit_cold(&x, &y2, n, p, &model, &ids, &opts);
-    let f2 = fit_on(&mut ws, &x, &y2, &ids, None, &opts).into_fit(&x, &y2, n, p, &model, &opts);
+    let f2 =
+        fit_on(&mut ws, &x, &y2, &ids, None, &opts).into_fit(&x, &y2, &ids, n, p, &model, &opts);
     assert_near(&cold2.beta, &f2.beta, "draw-2 beta vs fit_cold");
     assert_near(&cold2.tau2, &f2.tau2, "draw-2 tau2 vs fit_cold");
     // The perturbation must actually move the fit, or the reuse gate above proves
@@ -418,11 +656,11 @@ fn fit_on_reused_ws_near_identical_to_fit_cold_lmm() {
 fn fit_on_glmm_dense_matches_fit_cold() {
     let (x, y, n, p, model, ids, opts) = glmm_binomial_intercept_case();
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert!(cold.converged);
+    assert!(cold.converged());
     let sized = spec_sized_from_ids_pub(&model, &ids);
     let mut ws = build_workspace(&sized, n, p, &opts);
     assert!(ws.is_glmm_dense());
-    let f1 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, n, p, &model, &opts);
+    let f1 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     assert_near(&cold.beta, &f1.beta, "beta vs fit_cold");
     assert_near(&cold.se, &f1.se, "se vs fit_cold");
 
@@ -434,8 +672,9 @@ fn fit_on_glmm_dense_matches_fit_cold() {
         .map(|(i, &v)| if i % 5 == 0 { 1.0 - v } else { v })
         .collect();
     let cold2 = fit_cold(&x, &y2, n, p, &model, &ids, &opts);
-    assert!(cold2.converged);
-    let f2 = fit_on(&mut ws, &x, &y2, &ids, None, &opts).into_fit(&x, &y2, n, p, &model, &opts);
+    assert!(cold2.converged());
+    let f2 =
+        fit_on(&mut ws, &x, &y2, &ids, None, &opts).into_fit(&x, &y2, &ids, n, p, &model, &opts);
     assert_near(&cold2.beta, &f2.beta, "draw-2 beta vs fit_cold");
     assert_near(&cold2.se, &f2.se, "draw-2 se vs fit_cold");
 }
@@ -522,7 +761,8 @@ fn fit_on_sparse_matches_fit_cold() {
     let sized = spec_sized_from_ids_pub(&model, &ids);
     let mut ws = build_workspace(&sized, n, p, &opts);
     assert!(ws.is_prebuilt()); // sparse Level 1 routes through the Prebuilt arm
-    let via = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, n, p, &model, &opts);
+    let via =
+        fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     // Near-identity (both call the same sparse kernel); guards the routing + wrap.
     assert_near(&cold.beta, &via.beta, "sparse Level 1 beta vs fit_cold");
     assert_near(&cold.se, &via.se, "sparse Level 1 se vs fit_cold");
@@ -632,7 +872,8 @@ fn fit_on_varying_n_below_n_max_matches_fit_cold() {
         let y = &full_y[..n];
         let ids = GroupIds::default();
         let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via = fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, n, p, &model, &opts);
+        let via =
+            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
         assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
         assert_near(&cold.se, &via.se, &format!("n={n} se"));
     }
@@ -654,12 +895,12 @@ fn fit_on_weighted_reuse_matches_fit_cold() {
 
     let cold_w = fit_cold(&x, &y, n, p, &model, &ids, &opts_w);
     let via_w =
-        fit_on(&mut ws, &x, &y, &ids, None, &opts_w).into_fit(&x, &y, n, p, &model, &opts_w);
+        fit_on(&mut ws, &x, &y, &ids, None, &opts_w).into_fit(&x, &y, &ids, n, p, &model, &opts_w);
     assert_near(&cold_w.beta, &via_w.beta, "weighted beta");
 
     let cold_u = fit_cold(&x, &y, n, p, &model, &ids, &opts_unit);
-    let via_u =
-        fit_on(&mut ws, &x, &y, &ids, None, &opts_unit).into_fit(&x, &y, n, p, &model, &opts_unit);
+    let via_u = fit_on(&mut ws, &x, &y, &ids, None, &opts_unit)
+        .into_fit(&x, &y, &ids, n, p, &model, &opts_unit);
     assert_near(&cold_u.beta, &via_u.beta, "unit-weight-after-weighted beta");
     assert_near(&cold_u.se, &via_u.se, "unit-weight-after-weighted se");
 }
@@ -684,7 +925,8 @@ fn fit_on_ols_smaller_then_larger_matches_fit_cold() {
         let y = &full_y[..n];
         let ids = GroupIds::default();
         let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via = fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, n, p, &model, &opts);
+        let via =
+            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
         assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
         assert_near(&cold.se, &via.se, &format!("n={n} se"));
     }
@@ -699,7 +941,8 @@ fn fit_on_ols_larger_then_smaller_matches_fit_cold() {
         let y = &full_y[..n];
         let ids = GroupIds::default();
         let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via = fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, n, p, &model, &opts);
+        let via =
+            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
         assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
         assert_near(&cold.se, &via.se, &format!("n={n} se"));
     }
@@ -715,7 +958,8 @@ fn fit_on_glm_smaller_then_larger_matches_fit_cold() {
         let y = &full_y[..n];
         let ids = GroupIds::default();
         let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via = fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, n, p, &model, &opts);
+        let via =
+            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
         assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
         assert_near(&cold.se, &via.se, &format!("n={n} se"));
     }
@@ -730,7 +974,8 @@ fn fit_on_glm_larger_then_smaller_matches_fit_cold() {
         let y = &full_y[..n];
         let ids = GroupIds::default();
         let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via = fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, n, p, &model, &opts);
+        let via =
+            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
         assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
         assert_near(&cold.se, &via.se, &format!("n={n} se"));
     }
@@ -753,7 +998,8 @@ fn fit_on_lmm_dense_smaller_then_larger_matches_fit_cold() {
             extra: vec![],
         };
         let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via = fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, n, p, &model, &opts);
+        let via =
+            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
         assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
         assert_near(&cold.tau2, &via.tau2, &format!("n={n} tau2"));
     }
@@ -772,7 +1018,8 @@ fn fit_on_lmm_dense_larger_then_smaller_matches_fit_cold() {
             extra: vec![],
         };
         let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via = fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, n, p, &model, &opts);
+        let via =
+            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
         assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
         assert_near(&cold.tau2, &via.tau2, &format!("n={n} tau2"));
     }
@@ -797,15 +1044,16 @@ fn fit_on_ols_scaled_x_gate_matches_has_weights() {
     // Unweighted build: has_weights=false ⇒ scaled_x is 0×0, must never be read.
     let cold_u = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     let mut ws_u = build_workspace(&model, n, p, &opts);
-    let via_u = fit_on(&mut ws_u, &x, &y, &ids, None, &opts).into_fit(&x, &y, n, p, &model, &opts);
+    let via_u =
+        fit_on(&mut ws_u, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     assert_near(&cold_u.beta, &via_u.beta, "unweighted beta");
     assert_near(&cold_u.se, &via_u.se, "unweighted se");
 
     // Weighted build: has_weights=true ⇒ scaled_x is n_max×p, read every call.
     let cold_w = fit_cold(&x, &y, n, p, &model, &ids, &opts_w);
     let mut ws_w = build_workspace(&model, n, p, &opts_w);
-    let via_w =
-        fit_on(&mut ws_w, &x, &y, &ids, None, &opts_w).into_fit(&x, &y, n, p, &model, &opts_w);
+    let via_w = fit_on(&mut ws_w, &x, &y, &ids, None, &opts_w)
+        .into_fit(&x, &y, &ids, n, p, &model, &opts_w);
     assert_near(&cold_w.beta, &via_w.beta, "weighted beta");
     assert_near(&cold_w.se, &via_w.se, "weighted se");
 }
@@ -839,7 +1087,8 @@ fn fit_on_lmm_dense_offset_round_trip_varying_n() {
             ..opts.clone()
         };
         let cold = fit_cold(x, y, n, p, &model, &ids, &opts_n);
-        let via = fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, n, p, &model, &opts_n);
+        let via =
+            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts_n);
         assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
         assert_near(&cold.tau2, &via.tau2, &format!("n={n} tau2"));
     }

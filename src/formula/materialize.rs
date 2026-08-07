@@ -38,8 +38,11 @@ pub enum Column {
         /// by `codes`: an unused level yields an all-zero dummy column and thus
         /// an aliased (NA) coefficient, matching R's `model.matrix` on a factor
         /// with an unused level. An unused level of a *grouping* factor is an
-        /// empty cluster, which contributes nothing to the likelihood but does
-        /// cost RE width — callers who care should drop it (R's `droplevels`).
+        /// empty cluster, which contributes nothing to the likelihood. It costs
+        /// RE width only when an observed level follows it: block width is
+        /// `max(code) + 1` (`level_count` in `fit/common.rs`), so a level
+        /// declared after the last observed one occupies no slot at all.
+        /// Callers who care should drop unused levels (R's `droplevels`).
         levels: Vec<String>,
         /// Per-row index into `levels` (length `n`).
         codes: Vec<u32>,
@@ -78,12 +81,21 @@ impl Table {
 }
 
 /// One grouping factor's random-effect term names, in the order the kernel's
-/// `varcorr`/`tau2` blocks use them — `"(Intercept)"` first, then any slopes.
+/// `varcorr`/`tau2` blocks use them — `"(Intercept)"` first, then any slopes —
+/// plus the label of every slot of its RE block.
 pub struct ReGroupInfo {
     /// Grouping factor name (`"Subject"`, or `"A:B"` for a nested inner factor).
     pub name: String,
     /// RE term names for this grouping, e.g. `["(Intercept)", "Days"]`.
     pub terms: Vec<String>,
+    /// Level label per slot of this grouping's RE block, in kernel block order,
+    /// `None` for a padded nested slot that belongs to no level. Emitted by the
+    /// same layer that CHOOSES the layout ([`grouping_ids`]), because that
+    /// choice is data-dependent: a flat `(1|A) + (1|B)` routes nested or crossed
+    /// depending on how balanced the data is (see [`detect_flat_nesting`]), so a
+    /// consumer that inferred the layout would be wrong on a dataset nobody
+    /// tested. [`label_ranef`] is the only reader.
+    pub slot_labels: Vec<Option<String>>,
 }
 
 /// The lowered fit inputs — a one-shot front door to `crate::fit_cold`.
@@ -104,10 +116,16 @@ pub struct Lowered {
     pub model: ModelSpec,
     /// Per-row level ids for every grouping.
     pub ids: GroupIds,
-    /// Per-grouping name + RE term names, in `varcorr`/`tau2` block order
-    /// (primary first, then extras in declaration order). Empty when the
-    /// formula declares no random effects.
+    /// Per-grouping name + RE term names + slot labels, in `varcorr`/`tau2`
+    /// block order (primary first, then extras in declaration order). Empty when
+    /// the formula declares no random effects.
     pub re_groups: Vec<ReGroupInfo>,
+    /// Observations the LOWERING made about the data, which no solver can make
+    /// because no solver sees the labels — currently only
+    /// [`crate::Note::UnusedGroupingLevels`]. Empty on a clean lowering. Carried
+    /// here rather than on `Fit` because it is decided before any fit runs; the
+    /// ports fold it into the same warning channel as `Fit`'s own notes.
+    pub notes: Vec<crate::Note>,
     /// `target_indices = 0..p`; other knobs defaulted. Caller may override.
     pub opts: FitOptions,
 }
@@ -220,7 +238,7 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
     }
 
     // 3. Random effects → ReStructure + GroupIds (declaration order; first = primary).
-    let (model, ids, re_groups) =
+    let (model, ids, re_groups, notes) =
         lower_random_effects(ast, data, family, n, &numeric_main_col, &factor_main_cols)?;
 
     let opts = FitOptions {
@@ -237,6 +255,7 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
         model,
         ids,
         re_groups,
+        notes,
         opts,
     })
 }
@@ -346,7 +365,14 @@ fn grouping_row_labels(name: &str, data: &Table) -> Result<Vec<String>, Error> {
 /// any row (padding). Assumes each child label occurs under a SINGLE parent —
 /// the caller must have verified nesting (explicit `parent:child` syntax, or
 /// [`detect_flat_nesting`] for the flat idiom).
-fn nested_padded_ids(parent_ids: &[u32], labels: &[String]) -> Vec<u32> {
+///
+/// Returns the ids alongside one label per slot of the padded rectangle
+/// (`n_parents · W`, slot `p·W + k`): the child label at every assigned slot and
+/// `None` at every padded one. The caller joins the parent's own label in when
+/// the formula named a parent (`(1|A/B)`); the flat idiom keeps the child label
+/// bare, because `re_group_info` names that block for the child alone and the
+/// route it takes is data-dependent.
+fn nested_padded_ids(parent_ids: &[u32], labels: &[String]) -> (Vec<u32>, Vec<Option<String>>) {
     let n_parents = parent_ids
         .iter()
         .copied()
@@ -376,11 +402,18 @@ fn nested_padded_ids(parent_ids: &[u32], labels: &[String]) -> Vec<u32> {
                 .collect()
         })
         .collect();
-    parent_ids
+    let mut slot_labels: Vec<Option<String>> = vec![None; n_parents * n_per_parent];
+    for (p, set) in children_per_parent.iter().enumerate() {
+        for (k, &child) in set.iter().enumerate() {
+            slot_labels[p * n_per_parent + k] = Some(child.to_string());
+        }
+    }
+    let ids = parent_ids
         .iter()
         .zip(labels)
         .map(|(&p, c)| p * n_per_parent as u32 + local_index[p as usize][c.as_str()])
-        .collect()
+        .collect();
+    (ids, slot_labels)
 }
 
 /// Max padding-inflation factor for flat-nesting detection: detect nested only
@@ -407,7 +440,10 @@ const NESTING_INFLATION_BOUND: usize = 2;
 ///    the distinct child-level count (see the constant's rationale). Explicit
 ///    `parent:child` syntax still pads unbounded — there the user asked for the
 ///    nested layout outright.
-fn detect_flat_nesting(primary_ids: &[u32], child_labels: &[String]) -> Option<Vec<u32>> {
+fn detect_flat_nesting(
+    primary_ids: &[u32],
+    child_labels: &[String],
+) -> Option<(Vec<u32>, Vec<Option<String>>)> {
     let n_parents = primary_ids
         .iter()
         .copied()
@@ -430,10 +466,33 @@ fn detect_flat_nesting(primary_ids: &[u32], child_labels: &[String]) -> Option<V
     Some(nested_padded_ids(primary_ids, child_labels))
 }
 
-/// Dense per-row ids for one grouping. A nested inner factor `A:B` (explicit
-/// parent `A`) routes through [`nested_padded_ids`]; a crossed interaction and a
-/// plain grouping use a flat global lexicographic code.
-fn grouping_ids(re: &RandomEffect, data: &Table) -> Result<Vec<u32>, Error> {
+/// One grouping's lowered level layout. `slot_labels` is [`ReGroupInfo`]'s
+/// field; `unused` names the declared levels that own a slot but no row (see
+/// [`crate::Note::UnusedGroupingLevels`]) and is empty for every arm but the
+/// plain one, where alone it can happen.
+struct GroupingLayout {
+    ids: Vec<u32>,
+    slot_labels: Vec<Option<String>>,
+    unused: Vec<String>,
+}
+
+impl GroupingLayout {
+    /// A layout whose every slot is an observed level, in the order `labels`
+    /// gives them — the crossed-interaction and (unused-free) plain cases.
+    fn all_observed(ids: Vec<u32>, labels: Vec<String>) -> Self {
+        GroupingLayout {
+            ids,
+            slot_labels: labels.into_iter().map(Some).collect(),
+            unused: Vec::new(),
+        }
+    }
+}
+
+/// Dense per-row ids for one grouping, plus the label of every slot of its RE
+/// block. A nested inner factor `A:B` (explicit parent `A`) routes through
+/// [`nested_padded_ids`]; a crossed interaction and a plain grouping use a flat
+/// global lexicographic code.
+fn grouping_ids(re: &RandomEffect, data: &Table) -> Result<GroupingLayout, Error> {
     match re {
         RandomEffect::Intercept {
             group,
@@ -444,11 +503,33 @@ fn grouping_ids(re: &RandomEffect, data: &Table) -> Result<Vec<u32>, Error> {
             // Parent ids: identical computation to the plain-grouping arm below
             // applied to `parent` — guarantees this matches the primary's own ids
             // exactly when `parent` names the primary grouping.
-            let (_, parent_ids) = grouping_factor(parent, data)?;
-            Ok(nested_padded_ids(
-                parent_ids,
-                &grouping_row_labels(child, data)?,
-            ))
+            let (parent_levels, parent_ids) = grouping_factor(parent, data)?;
+            let (ids, child_labels) =
+                nested_padded_ids(parent_ids, &grouping_row_labels(child, data)?);
+            // Explicit `parent:child` syntax: the user named the parent, so the
+            // level is spelled with it. PARENT-FIRST — lme4 spells the same level
+            // child-first (`b1:a1`); both label the same thing, and this order
+            // matches the one the formula and the grouping's own name already use.
+            // `nested_padded_ids` lays out `max(parent_ids)+1` blocks, which is
+            // ≤ the parent's declared level count when trailing levels go
+            // unobserved — recover its own block width, not the declared one.
+            let n_parents = parent_ids
+                .iter()
+                .copied()
+                .max()
+                .map(|m| m as usize + 1)
+                .unwrap_or(1);
+            let w = (child_labels.len() / n_parents).max(1);
+            let slot_labels = child_labels
+                .into_iter()
+                .enumerate()
+                .map(|(slot, c)| c.map(|c| format!("{}:{c}", parent_levels[slot / w])))
+                .collect();
+            Ok(GroupingLayout {
+                ids,
+                slot_labels,
+                unused: Vec::new(),
+            })
         }
         RandomEffect::Intercept {
             group,
@@ -470,10 +551,35 @@ fn grouping_ids(re: &RandomEffect, data: &Table) -> Result<Vec<u32>, Error> {
             let a = grouping_row_labels(lhs, data)?;
             let b = grouping_row_labels(rhs, data)?;
             let joined: Vec<String> = a.iter().zip(&b).map(|(x, y)| format!("{x}:{y}")).collect();
-            Ok(sorted_levels_and_codes(&joined).1)
+            let (levels, codes) = sorted_levels_and_codes(&joined);
+            Ok(GroupingLayout::all_observed(codes, levels))
         }
         RandomEffect::Intercept { group, .. } | RandomEffect::Slope { group, .. } => {
-            Ok(grouping_factor(group, data)?.1.to_vec())
+            let (levels, codes) = grouping_factor(group, data)?;
+            // The codes ARE the ids, so slot `l` is level `l` — but the block is
+            // only `max(code)+1` wide (`fit::common::spec_sized_from_ids`), not
+            // `levels.len()`: both ports marshal `levels()` wholesale after row
+            // filtering, so a level declared after the last observed one has no
+            // slot to label. A level with a slot but no row DOES cost RE width
+            // and gets a labelled (fully shrunk) row plus a note.
+            let width = codes
+                .iter()
+                .copied()
+                .max()
+                .map(|m| m as usize + 1)
+                .unwrap_or(0);
+            let mut observed = vec![false; width];
+            for &c in codes {
+                observed[c as usize] = true;
+            }
+            Ok(GroupingLayout {
+                ids: codes.to_vec(),
+                slot_labels: levels[..width].iter().cloned().map(Some).collect(),
+                unused: (0..width)
+                    .filter(|&l| !observed[l])
+                    .map(|l| levels[l].clone())
+                    .collect(),
+            })
         }
     }
 }
@@ -515,14 +621,18 @@ fn slope_cols(
 /// slope term names (mirrors `varcorr`/`tau2` block term order). A factor
 /// slope var expands to its dummy names (`format!("{var}{lvl}")`, same naming
 /// `factor_dummies` uses on the fixed-effect side), not the bare var name.
+/// `slot_labels` comes from [`grouping_ids`], which is the only place the chosen
+/// layout and the level labels are both in scope.
 fn re_group_info(
     re: &RandomEffect,
     factor_main_cols: &HashMap<String, Vec<(String, ColumnId)>>,
+    slot_labels: Vec<Option<String>>,
 ) -> ReGroupInfo {
     match re {
         RandomEffect::Intercept { group, .. } => ReGroupInfo {
             name: group.clone(),
             terms: vec!["(Intercept)".to_string()],
+            slot_labels,
         },
         RandomEffect::Slope { group, vars } => {
             let mut terms = vec!["(Intercept)".to_string()];
@@ -536,9 +646,19 @@ fn re_group_info(
             ReGroupInfo {
                 name: group.clone(),
                 terms,
+                slot_labels,
             }
         }
     }
+}
+
+/// The lowering's [`crate::Note::UnusedGroupingLevels`] for one grouping, or
+/// `None` when every slot of its block owns a row.
+fn unused_levels_note(name: &str, unused: Vec<String>) -> Option<crate::Note> {
+    (!unused.is_empty()).then(|| crate::Note::UnusedGroupingLevels {
+        grouping: name.to_string(),
+        levels: unused,
+    })
 }
 
 fn lower_random_effects(
@@ -548,23 +668,33 @@ fn lower_random_effects(
     n: usize,
     numeric_main_col: &HashMap<String, ColumnId>,
     factor_main_cols: &HashMap<String, Vec<(String, ColumnId)>>,
-) -> Result<(ModelSpec, GroupIds, Vec<ReGroupInfo>), Error> {
+) -> Result<(ModelSpec, GroupIds, Vec<ReGroupInfo>, Vec<crate::Note>), Error> {
     if ast.random_effects.is_empty() {
         return Ok((
             ModelSpec { family, re: None },
             GroupIds::default(),
+            Vec::new(),
             Vec::new(),
         ));
     }
 
     let re0 = &ast.random_effects[0];
     let primary_slopes = slope_cols(re0, numeric_main_col, factor_main_cols)?;
-    let primary_ids = grouping_ids(re0, data)?;
+    let primary_layout = grouping_ids(re0, data)?;
+    let primary_ids = primary_layout.ids;
     debug_assert_eq!(primary_ids.len(), n);
 
     let mut extra_groupings = Vec::new();
     let mut extra_ids = Vec::new();
-    let mut re_groups = vec![re_group_info(re0, factor_main_cols)];
+    let mut notes: Vec<crate::Note> =
+        unused_levels_note(&re_group_name(re0), primary_layout.unused)
+            .into_iter()
+            .collect();
+    let mut re_groups = vec![re_group_info(
+        re0,
+        factor_main_cols,
+        primary_layout.slot_labels,
+    )];
     // The kernel holds ONE nested slot (`LmmGroupings.nested: Option<_>`), so at
     // most one extra may carry `NestedWithin`. Flat-nesting detection therefore
     // only fires while no nested extra exists yet — later flat candidates fail
@@ -579,7 +709,7 @@ fn lower_random_effects(
         // `(1|batch)+(1|sample)`, T3); detect that from the id structure and fail
         // closed to Crossed on any parent conflict. Both relation counts are
         // placeholders — the kernel re-derives real level counts from the ids.
-        let (relation, ids) = match re {
+        let (relation, layout) = match re {
             RandomEffect::Intercept {
                 parent: Some(_), ..
             } => (
@@ -591,7 +721,19 @@ fn lower_random_effects(
                 parent: None,
             } if !group.contains(':') && !have_nested => {
                 match detect_flat_nesting(&primary_ids, &grouping_row_labels(group, data)?) {
-                    Some(padded) => (GroupingRelation::NestedWithin { n_per_parent: 1 }, padded),
+                    // The flat idiom writes no parent, and `re_group_info` names
+                    // this block for the child alone, so the labels stay bare
+                    // child labels: joining the parent in here would make the
+                    // SPELLING move with the dataset, since the same formula
+                    // routes nested or crossed depending on balance.
+                    Some((padded, slot_labels)) => (
+                        GroupingRelation::NestedWithin { n_per_parent: 1 },
+                        GroupingLayout {
+                            ids: padded,
+                            slot_labels,
+                            unused: Vec::new(),
+                        },
+                    ),
                     None => (
                         GroupingRelation::Crossed { n_clusters: 1 },
                         grouping_ids(re, data)?,
@@ -605,8 +747,9 @@ fn lower_random_effects(
         };
         have_nested |= matches!(relation, GroupingRelation::NestedWithin { .. });
         extra_groupings.push(Grouping { relation, slopes });
-        extra_ids.push(ids);
-        re_groups.push(re_group_info(re, factor_main_cols));
+        extra_ids.push(layout.ids);
+        notes.extend(unused_levels_note(&re_group_name(re), layout.unused));
+        re_groups.push(re_group_info(re, factor_main_cols, layout.slot_labels));
     }
 
     // No envelope cap here: the MAX_* caps are the engine's NoZ↔Sparse ROUTING
@@ -630,7 +773,108 @@ fn lower_random_effects(
         },
         ids,
         re_groups,
+        notes,
     ))
+}
+
+/// One grouping's random-effect conditional modes, labelled — the shape every
+/// consumer renders, and the ONLY place the kernel's RE block layout is
+/// interpreted. Rows are levels, columns are terms; padded nested slots are
+/// dropped, so `levels.len()` is the row count and `values.len() = levels.len()
+/// · terms.len()`.
+pub struct RanefBlock {
+    /// Grouping factor name — [`ReGroupInfo::name`].
+    pub group: String,
+    /// Column names, `"(Intercept)"` first — [`ReGroupInfo::terms`].
+    pub terms: Vec<String>,
+    /// Row labels, one per retained level, in kernel block order.
+    pub levels: Vec<String>,
+    /// Row-major `levels.len() × terms.len()` conditional modes.
+    pub values: Vec<f64>,
+}
+
+/// Label a fit's random-effect conditional modes: [`crate::Fit::ranef`]'s flat
+/// blocks zipped against the lowering's slot labels, padded slots dropped, one
+/// [`RanefBlock`] per grouping in declaration order.
+///
+/// This is the whole of the RE block-layout knowledge, written once. Every
+/// consumer — the Python and R packages, a Rust caller — goes through here
+/// rather than re-deriving the slicing, because the layout is a data-dependent
+/// SPEED decision (see [`detect_flat_nesting`]) that no consumer can infer from
+/// the formula.
+///
+/// A fit with no conditional modes (fixed-only, or non-converged, where
+/// `Fit::ranef` is empty) yields an empty vec — not an error.
+///
+/// # Errors
+/// [`Error::RanefShapeMismatch`] when `re_groups` does not describe this fit:
+/// a different grouping count, a slot-label count that disagrees with
+/// [`crate::Fit::ranef_levels`], or a total that disagrees with `ranef.len()`.
+/// Partial results are never returned — a mislabelled mode reads as a wrong
+/// answer, not a cosmetic slip.
+pub fn label_ranef(fit: &crate::Fit, re_groups: &[ReGroupInfo]) -> Result<Vec<RanefBlock>, Error> {
+    if fit.ranef.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mismatch = |what: &str| Error::RanefShapeMismatch(what.to_string());
+    if fit.ranef_levels.len() != re_groups.len() {
+        return Err(mismatch(&format!(
+            "fit has {} grouping(s), the formula lowered {}",
+            fit.ranef_levels.len(),
+            re_groups.len()
+        )));
+    }
+    let total: usize = fit
+        .ranef_levels
+        .iter()
+        .zip(re_groups)
+        .map(|(&l, g)| l * g.terms.len())
+        .sum();
+    if total != fit.ranef.len() {
+        return Err(mismatch(&format!(
+            "ranef holds {} value(s), the lowered blocks span {total}",
+            fit.ranef.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(re_groups.len());
+    let mut base = 0usize;
+    for (g, info) in re_groups.iter().enumerate() {
+        let n_levels = fit.ranef_levels[g];
+        let q = info.terms.len();
+        if info.slot_labels.len() != n_levels {
+            return Err(mismatch(&format!(
+                "grouping {:?} has {} slot label(s) for {n_levels} level(s)",
+                info.name,
+                info.slot_labels.len()
+            )));
+        }
+        let mut levels = Vec::new();
+        let mut values = Vec::new();
+        for (l, label) in info.slot_labels.iter().enumerate() {
+            // A padded nested slot is not a level: no row is assigned to it and
+            // its mode is zero by construction, so it is dropped rather than
+            // reported (lme4 has no counterpart to it either).
+            let Some(label) = label else { continue };
+            levels.push(label.clone());
+            values.extend_from_slice(&fit.ranef[base + l * q..base + (l + 1) * q]);
+        }
+        out.push(RanefBlock {
+            group: info.name.clone(),
+            terms: info.terms.clone(),
+            levels,
+            values,
+        });
+        base += n_levels * q;
+    }
+    Ok(out)
+}
+
+/// The grouping factor a random effect is written against — the name
+/// `re_group_info` publishes, and the one a lowering note points at.
+fn re_group_name(re: &RandomEffect) -> String {
+    match re {
+        RandomEffect::Intercept { group, .. } | RandomEffect::Slope { group, .. } => group.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -664,8 +908,24 @@ mod tests {
             group: "g1:g2".to_string(),
             parent: Some("g1".to_string()),
         };
-        let ids = grouping_ids(&re, &table).unwrap();
-        assert_eq!(ids, vec![0, 3, 4, 6, 7, 8]);
+        let layout = grouping_ids(&re, &table).unwrap();
+        assert_eq!(layout.ids, vec![0, 3, 4, 6, 7, 8]);
+        // The same hand-computed rectangle, read as labels: parent-first joins at
+        // every assigned slot, `None` at the two padded ones.
+        assert_eq!(
+            layout.slot_labels,
+            vec![
+                Some("A:c1".into()),
+                None,
+                None,
+                Some("B:c1".into()),
+                Some("B:c2".into()),
+                None,
+                Some("C:c1".into()),
+                Some("C:c2".into()),
+                Some("C:c3".into()),
+            ]
+        );
     }
 
     fn strs(v: &[&str]) -> Vec<String> {
@@ -681,9 +941,18 @@ mod tests {
     fn detect_flat_nesting_balanced_is_nested() {
         let primary = vec![0, 0, 1, 1];
         let child = strs(&["a", "b", "c", "d"]);
+        let (ids, labels) = detect_flat_nesting(&primary, &child).expect("nesting detected");
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+        // Bare child labels, not `parent:child` — see the flat arm in
+        // `lower_random_effects` for why this route must not join the parent in.
         assert_eq!(
-            detect_flat_nesting(&primary, &child),
-            Some(vec![0, 1, 2, 3])
+            labels,
+            vec![
+                Some("a".into()),
+                Some("b".into()),
+                Some("c".into()),
+                Some("d".into())
+            ]
         );
     }
 
@@ -706,10 +975,10 @@ mod tests {
     fn detect_flat_nesting_near_balanced_is_nested() {
         let primary = vec![0, 0, 0, 1, 1, 2, 2, 2];
         let child = strs(&["a", "b", "c", "d", "e", "f", "g", "h"]);
-        assert_eq!(
-            detect_flat_nesting(&primary, &child),
-            Some(vec![0, 1, 2, 3, 4, 6, 7, 8])
-        );
+        let (ids, labels) = detect_flat_nesting(&primary, &child).expect("nesting detected");
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 6, 7, 8]);
+        assert_eq!(labels[5], None, "parent 1's third slot is padding");
+        assert_eq!(labels[4], Some("e".into()));
     }
 
     /// Genuine nesting but WILDLY uneven (the shape of an observation-level

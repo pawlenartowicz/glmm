@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Peak-RSS collection over the manifest (43 rungs) and the large synthetic
+# Peak-RSS collection over the manifest rungs and the large synthetic
 # models (models.json) -- one leg at a time. NOT a validation gate: nothing
 # here is compared against an oracle, and no clock lock is required (peak RSS
 # does not depend on CPU frequency, unlike run.sh's timed legs) -- that is the

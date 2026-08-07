@@ -18,12 +18,11 @@ condition `glmm` is held to.
 Where the two references disagree with each other beyond tolerance, that is a
 recorded **flag to investigate**, never a silent "pick the closer one"
 (known exemptions: the GLMM SE-method split and the 2-way rungs listed in the
-table). Cross-reference disagreements are catalogued in the workspace's
-`docs/parity_gaps.md`.
+table).
 
 ## Layout
 
-    manifest.json     single source of truth: all 43 rungs, both formula dialects,
+    manifest.json     single source of truth: all 46 rungs, both formula dialects,
                       per-rung options (data, link, weights_col, tier)
     run.sh            the runner -- see Running below
     compare.R         the cross-engine agreement GATE + the two port gates
@@ -34,12 +33,14 @@ table). Cross-reference disagreements are catalogued in the workspace's
     summarize_memory.R
                       human-readable view (no gate) of the memory/ legs
     memory/           peak-RSS harness (no gate): memory.sh measures every
-                      engine's peak resident memory over the 43 manifest rungs
+                      engine's peak resident memory over the manifest rungs
                       plus 13 large synthetic models (models.json, regenerable
                       by gen_models.py); one fit script per engine; results
                       land in results/memory/ (gitignored)
-    prep/             regenerate data/ from fixed seeds (export_data.R rungs 1-28,
-                      gen_weights_data.R rungs 29-43)
+    prep/             regenerate data/ from fixed seeds: export_data.R (rungs 1-28),
+                      gen_weights_data.R (rungs 29-43), gen_large_theta_data.R
+                      (rungs 44-46 + the non-rung sim_binomial_zerosd fixture),
+                      gen_illcond_data.R, gen_scale_data.R
     engines/          one fit harness per engine, named for its engine:
                       lme4.R, mixedmodels.jl, glmm.rs (example validation_fit),
                       glmm_python.py, glmm_r.R, common.rs, goldens_agq.R
@@ -68,7 +69,9 @@ table). Cross-reference disagreements are catalogued in the workspace's
 
 Rungs 1–28 are the model-shape ladder (empirical + fixed-seed simulated);
 rungs 29–43 are the prior-weights tier (`tier: "weights"` in the manifest —
-same engines, same gates, plus per-rung weight pathologies).
+same engines, same gates, plus per-rung weight pathologies); rungs 44–45 are the
+large-θ̂ tier (no `tier` field — ordinary model-shape rungs on the existing tiers,
+added late so no existing rung had to be renumbered).
 
 | Rung | Dataset | Family | What it exercises |
 |------|---------|--------|--------------------|
@@ -115,8 +118,30 @@ same engines, same gates, plus per-rung weight pathologies).
 | 41 | path_huge_int | gaussian (weighted, intercept RE) | huge-integer weight values |
 | 42 | path_dominant | gaussian (weighted) | one dominant weight overwhelming the rest |
 | 43 | all_ones | gaussian (weighted, slope RE) | weights of 1 must equal the unweighted fit bit-for-bit (`unit_identity` gate) |
+| 44 | sim_binomial_bigsd | binomial GLMM (Bernoulli, scalar RE) | large θ̂ (4.51 fitted, 3.4× the corpus's previous GLMM max) — Laplace/FD-Hessian in the hard low-information cell |
+| 45 | sim_poisson_bigsd | Poisson GLMM (scalar RE) | large θ̂ (2.97 fitted) — the count-family counterpart of rung 44 |
+| 46 | sim_sparse_binomial_bigsd | binomial GLMM (Bernoulli, 1 primary + 7 crossed scalar RE) | the SPARSE arm of the large-θ̂ regime — large θ̂ (3.91 fitted on `g1`) crossed with 7 crossed intercept-only extras, which is what routes it past `MAX_EXTRA_GROUPINGS` to the sparse solver. **2-way (glmm ↔ lme4) by decision, not by MixedModels limitation** — see the rung's `//` comment in `manifest.json`. Bernoulli rather than Poisson: a Poisson design in this regime pushes counts into the tens of thousands, where deviance-sum rounding noise dominates the FD Hessian's step independent of solver tuning; sparse-large-θ̂-Poisson coverage is deliberately not attempted for that reason. |
 
-Status: all 43 rungs green against both references, except the documented 2-way
+Status: rungs 44–45 got their **lme4** references on 2026-07-30
+(`VALIDATION_ONLY=sim_binomial_bigsd,sim_poisson_bigsd Rscript engines/lme4.R`); rung 46 got
+its **lme4** reference on 2026-08-06
+(`VALIDATION_ONLY=sim_sparse_binomial_bigsd Rscript engines/lme4.R`) and is 2-way
+by decision.
+Like every other rung's, those JSONs live in the gitignored `results/` tree, so a
+fresh checkout still has to run `run.sh --oracles` before `compare.R` — which
+iterates the lme4 result JSONs on disk — lists them. **Rung 44 got its MixedModels
+leg on 2026-08-05 and is 3-way; rung 45 has none and is 2-way** (glmm ↔ lme4)
+rather than the 3-way of a normal GLMM rung. Rung 45's missing leg is a package
+limitation, like rung 18's and unlike the manifest decisions at 23/24: it keeps its
+`jl_formula`, but MixedModels v5.7.0 throws `PosDefException` inside PIRLS on it, so
+it sits in `JL_CANNOT_FIT` in `engines/mixedmodels.jl` — without that entry the
+Julia engine exits non-zero and `set -e` takes the whole `--oracles` run with it.
+Note `se_hessian` is a 2-way
+quantity on every rung regardless — MixedModels does not compute it, so what the
+missing leg costs here is the β / stddev / loglik cross-check. The green status
+below is about rungs 1–43: 44–45 have not yet been through a `compare.R` sweep.
+
+Status: all 43 referenced rungs green against both references, except the documented 2-way
 gates (18, 23, 24 — MixedModels cannot construct or fits a different estimator;
 see manifest comments) and rung 36 (weights tier, R-only for a related
 MixedModels `wts=` limitation: broken on a slope block combined with a second
@@ -131,12 +156,36 @@ asserted via `coef_names`.
 
 ## Running
 
-    ./run.sh                    fit glmm (Rust) + Python port + R port, compare vs the
-                                EXISTING lme4/MixedModels results on disk (fast default)
-    ./run.sh --oracles          refit ALL engines incl. R + Julia (oracle regeneration)
+    ./run.sh                    fit glmm (Rust) only, untimed, compare vs the EXISTING
+                                lme4/MixedModels results on disk — the default gate
+    ./run.sh --ports            ALSO fit the Python and R ports
+    ./run.sh --oracles          ALSO refit R + Julia (oracle regeneration)
+    ./run.sh --timings[=N]      ALSO time the fits (N samples, default 4; warm-up dropped,
+                                median of the rest). `=N` must be attached, not spaced.
     ./run.sh --prep             regenerate data/ first; implies --oracles
     ./run.sh --rust-tier2       also run the crate's oracle-tests tier first
     ./run.sh cbpp sleepstudy    restrict any of the above to named datasets
+
+Two independent axes — **which engines fit**, and **whether fits are timed** — and
+the flags compose. The whole corpus, Rust, untimed, is ~35 s.
+
+Timing is opt-in because `compare.R` reads no timing field at all: the numbers serve
+only `summarize_timing.R` / `summarize_parallel.R`, which `run.sh` does not call.
+All five engines implement one contract, mirrored because five languages cannot share
+code: `VALIDATION_TIMINGS` unset or `0` means do not time; otherwise it **is** the
+sample count (integer ≥ 2, first discarded, median of the rest). The count lives in
+`run.sh` alone — no engine carries an `N_RUNS` constant any more — so `--timings=8`
+reaches all five, and each result JSON still records its own `n_runs`, keeping files
+timed under older counts (10, and its 100-run predecessor) self-describing. Without
+`--timings` the engines write `"timing": null`, so a default run **drops any timings
+already recorded in `results/`** — re-measure with `--timings` when you need them. Each timed engine also gets a `results/run_meta_<engine>.json` (machine, git
+rev, `no_turbo`, core pin), which `summarize_timing.R` prints and uses to refuse to
+put two machines' seconds in one comparison — seconds never transfer across boxes,
+and the ratios only weakly. Real speed work belongs in `campaigns/speed-grid/`.
+
+The ports reach the same kernel through a different binding and must match the Rust
+engine to round-off, so `--ports` is what you run when a port, the lowering, or the
+data changed — it cannot diverge on a kernel-only change.
 
 Setup (one-time):
 
@@ -209,8 +258,8 @@ and `sigma` absent on GLMM rungs).
 the identical Rust kernel (PyO3 / extendr). compare.R therefore gates them
 against the **Rust row** at `TOL$port_rel` (a round-off band, measured 0 on
 every gated quantity) — a miss means the port fed the kernel different input
-(swapped column, mis-sorted factor levels, dropped weights), exactly the bug
-class the ports' own test suites cannot see.
+(swapped column, mis-sorted factor levels, dropped weights or offset), exactly
+the bug class the ports' own test suites cannot see.
 
 `compare.R` also carries a `KNOWN_R_PARSE` mechanism (currently
 `sim_max_q_slope` and `sim_binomial_slope2`) that relabels a port-gate FAIL to
@@ -232,6 +281,13 @@ lme4/MixedModels, and the port-call overhead columns (`py_gap`, `r_gap`).
 
 Per-quantity bands live in `tol.R`, one place, each with the measurement that
 set it and its history. Never relaxed to make an engine pass.
+
+One quantity, `se_hessian_rel`, is additionally per-rung capable via `tol.R`'s
+`TOL_PER_RUNG` — the corpus-wide 1e-3 is orders looser than the ≤2e-5 agreement
+the crate documents, so a rung that exists to guard that agreement needs its own
+number. `tol.R`'s `TOL_PER_RUNG` table owns the current overrides and their
+measured sizing. Overrides may only tighten; `validate_tol_per_rung()` rejects
+a widening one, an unknown rung name and an unknown quantity name at load.
 
 ## Estimator pinning
 

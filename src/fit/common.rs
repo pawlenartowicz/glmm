@@ -11,7 +11,181 @@ use crate::{
     Family, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing, StartValues,
 };
 
-use super::{Fit, FitOptions};
+use super::{Boundary, Diagnostics, Fit, FitOptions, Note};
+
+/// Every diagnostic a fitting arm produces, in one carrier. Each of the five
+/// routes fills it once (`OlsFitView::diagnostics` and its four siblings), the
+/// loop tier reads it off [`super::core::FitView::diagnostics`], and the stable
+/// path materializes it into `Fit` inside the `*_view_to_fit` mappers. One
+/// carrier, so a new diagnostic costs no new accessor set.
+///
+/// **Plain `Copy` data, no `Vec`.** The warm loop calls this per draw and 0.1.3
+/// spent a whole batch removing allocations from that path, so the carrier holds
+/// nothing that allocates. The public reshape — `Boundary` for `boundary_hit`,
+/// varcorr-aligned flags for `pinned_components`, a note carrying
+/// `(pivot_col, pivot)` — is a translation of these fields and nothing more.
+///
+/// **What is deliberately NOT here.**
+/// - `aliased`: no fitting arm decides it. Dropping a redundant column is the
+///   pre-dispatch alias gate's job (`detect_aliased` in `fit_warm`, scattered
+///   back by [`fit_rank_deficient`]), which sits ABOVE the view — every arm's
+///   own mask is unconditionally all-false, so a field here would always be
+///   empty and would suggest a per-route decision that does not exist.
+/// - `singular`: it is `boundary_hit == 1` on every route, ORed at
+///   materialization with [`Fit::has_negligible_component`] — which reads the
+///   assembled `varcorr` and so cannot be decided at view level.
+#[derive(Clone, Copy)]
+pub struct FitDiagnostics {
+    /// Whether the fit reached its convergence criterion.
+    pub converged: bool,
+    /// θ boundary: 0 interior, 1 a component pinned to the floor, 2 no optimum.
+    /// **Placeholder on the sparse and NB (`Prebuilt`) routes** — they report no
+    /// boundary state, so this is back-derived from their `Fit::singular` and
+    /// cannot distinguish 2 from 0. **Meaningless on OLS/GLM** (no θ): always 0.
+    pub boundary_hit: u8,
+    /// Bitmask of θ components pinned to the boundary, `diagonal_theta` order.
+    /// **Meaningless on OLS/GLM** (no θ): always 0. **Placeholder on the
+    /// `Prebuilt` routes** — reported as 0, which is indistinguishable from
+    /// "nothing was pinned". Those routes assemble a `Fit` themselves and the
+    /// sparse ones fill `Diagnostics::pinned` on it directly, so the stable
+    /// surface is complete; only this loop-tier carrier, which is read back off
+    /// the assembled `Fit` and holds no `Vec`, cannot carry the mask.
+    pub pinned_components: u64,
+    /// Scale-invariant per-column pivot ratio of the route's own Gram
+    /// ([`crate::ols::min_pivot_ratio`]), and the column attaining it. NaN on
+    /// every route and every return that formed no factor to measure — the
+    /// dense-GLMM, sparse and NB routes record none at all.
+    pub pivot: f64,
+    /// Column attaining `pivot`. Meaningless when `pivot` is NaN.
+    pub pivot_col: u32,
+    /// `pivot` fell below the recording route's own detection floor: the design
+    /// is computable but its coefficients are barely identified. Each route
+    /// compares against its own constant (`ols::PIVOT_MIN` for OLS and GLM,
+    /// `lmm::PIVOT_MIN` for dense LMM) because the routes were calibrated
+    /// separately. NaN pivots compare false, so a route that records none never
+    /// flags. The sparse route is NOT a detector — it refuses below its own
+    /// floor and reports that as `converged: false`, so it flags nothing here.
+    pub ill_conditioned: bool,
+    /// GLMM-only: count of fit-path PIRLS solves (BOBYQA objective evals, not
+    /// FD-Hessian SE evals) that ran the full `PIRLS_MAX_ITERS` cap without
+    /// converging. 0 on every non-GLMM route and on a GLMM fit with no such
+    /// eval — see [`crate::Note::PirlsExhausted`].
+    pub pirls_exhausted: u32,
+    /// GLMM-only: whether the FINAL re-evaluation at the converged gamma-hat
+    /// itself exhausted the PIRLS cap — the case where the reported estimates
+    /// rest on a truncated solve rather than a rejected trial point. `false`
+    /// on every non-GLMM route.
+    pub final_pirls_exhausted: bool,
+}
+
+impl FitDiagnostics {
+    /// The no-θ, no-detection carrier: `converged` and nothing else. OLS and GLM
+    /// build on this (GLM adds its pivot), and it is what every "this route has
+    /// no such state" placeholder above reduces to.
+    pub(crate) fn fixed_only(converged: bool) -> Self {
+        FitDiagnostics {
+            converged,
+            boundary_hit: 0,
+            pinned_components: 0,
+            pivot: f64::NAN,
+            pivot_col: 0,
+            ill_conditioned: false,
+            pirls_exhausted: 0,
+            final_pirls_exhausted: false,
+        }
+    }
+}
+
+/// Translate a route's carrier into the public [`Diagnostics`]. Cold path only
+/// (the loop tier reads the carrier directly), so the two `Vec`s below are
+/// affordable — but both stay empty on a clean fit, which keeps a `Fit`
+/// materialized from a clean draw cheap.
+///
+/// `varcorr` is the block layout the caller has already assembled — see
+/// [`pinned_flags`] for why it is the only thing that can place the bits.
+pub(super) fn materialize_diagnostics(
+    d: &FitDiagnostics,
+    p: usize,
+    varcorr: &[Vec<f64>],
+) -> Diagnostics {
+    let pinned = pinned_flags(d.pinned_components, varcorr);
+    let mut notes = vec![];
+    if d.ill_conditioned {
+        notes.push(Note::IllConditioned {
+            columns: vec![d.pivot_col],
+            pivot: d.pivot,
+        });
+    }
+    if d.pirls_exhausted > 0 || d.final_pirls_exhausted {
+        notes.push(Note::PirlsExhausted {
+            evals: d.pirls_exhausted,
+            final_eval: d.final_pirls_exhausted,
+        });
+    }
+    Diagnostics {
+        converged: d.converged,
+        // `boundary_hit == 1` is the optimizer's own pin decision; the two
+        // mixed mappers OR the post-hoc negligible-component check on top of
+        // this, which is why `singular` is not simply `boundary == AtBoundary`.
+        singular: d.boundary_hit == 1,
+        // No fitting arm decides this (see the carrier's doc); the alias gate
+        // above dispatch overwrites it in `fit_rank_deficient`.
+        aliased: vec![false; p],
+        // Exhaustive over the carrier's documented 0/1/2 — deliberately NOT a
+        // `_ => NoOptimum` catch-all. A fourth code would then be reported as
+        // "the optimizer found no optimum", which is a specific claim about the
+        // fit, not a fallback; widening `boundary_hit` must come here and say
+        // what the new code means.
+        boundary: match d.boundary_hit {
+            0 => Boundary::Interior,
+            1 => Boundary::AtBoundary,
+            2 => Boundary::NoOptimum,
+            other => unreachable!("FitDiagnostics::boundary_hit is 0/1/2, got {other}"),
+        },
+        pinned,
+        notes,
+    }
+}
+
+/// Reshape a `diagonal_theta`-ordered pin bitmask into [`Diagnostics::pinned`]'s
+/// varcorr-aligned flags. Single source for that placement, shared by the four
+/// view mappers (through [`materialize_diagnostics`]) and by the two sparse
+/// routes, which assemble a `Fit` directly.
+///
+/// `varcorr` is the ONLY thing that maps bit order onto `pinned[g][i]`: the
+/// bitmask is keyed to `diagonal_theta` order, which walks the primary factor's
+/// `q_p` vech diagonals and then each extra grouping's, in declaration order —
+/// the same factors, in the same order, that `varcorr` carries one block each
+/// for. `q_g` comes from the block's vech length via [`super::vech_q`], the
+/// same inversion [`Fit::stddev_corr`] uses, so `pinned[g][i]` and
+/// `stddev_corr(g).0[i]` cannot drift apart.
+///
+/// Mask 0 ⇒ no grid: on every success path this function is fed the fitting
+/// route's real pin mask (via [`materialize_diagnostics`] for the four dense
+/// view mappers, or directly by the two sparse routes, which overwrite
+/// `Diagnostics::from_flags`'s empty placeholder with this call's result), so
+/// mask 0 here means the fit genuinely pinned nothing — never a route
+/// declining to say. The short-circuit itself is a memory choice, not a
+/// meaning: a warm loop over draws that never pin allocates no grid of
+/// `false` per draw for saying so.
+pub(crate) fn pinned_flags(mask: u64, varcorr: &[Vec<f64>]) -> Vec<Vec<bool>> {
+    if mask == 0 {
+        return vec![];
+    }
+    let mut k = 0usize;
+    varcorr
+        .iter()
+        .map(|vech| {
+            (0..super::vech_q(vech.len()))
+                .map(|_| {
+                    let bit = k < u64::BITS as usize && (mask >> k) & 1 == 1;
+                    k += 1;
+                    bit
+                })
+                .collect()
+        })
+        .collect()
+}
 
 /// RE θ length for a mixed model, from topology ALONE (independent of level
 /// counts): primary vech `q_p(q_p+1)/2` plus a `vech(Λ_g)` block `q_g(q_g+1)/2`
@@ -28,6 +202,14 @@ pub(super) fn theta_width(re: Option<&ReStructure>) -> usize {
         w += q_g * (q_g + 1) / 2;
     }
     w
+}
+
+/// The θ warm start a `StartValues` actually carries, as the kernels take it.
+/// An EMPTY `theta` is a per-component cold start (`StartValues`) and must reach
+/// them as `None` — the blind-`THETA0` path — not as an empty slice, which the
+/// zip-based seeders would silently read as "leave θ at zero".
+pub(super) fn warm_theta(start: Option<&StartValues>) -> Option<&[f64]> {
+    start.map(|s| s.theta.as_slice()).filter(|t| !t.is_empty())
 }
 
 /// vech(column-major lower-tri) of `D̂ = scale·Λ̂Λ̂'` for one `q×q` grouping.
@@ -206,6 +388,11 @@ pub(crate) fn assemble_ranef_dense(
 /// `d·n_primary + f`, each extra level-major `extra_offsets[e] + l·q_g + c`
 /// with a full `q_g×q_g` `Λ_g` block). Output is `Fit::ranef`'s public layout
 /// (per grouping, level-major) — the primary block is transposed into it here.
+///
+/// Also serves the DENSE LMM recovery (`lmm::recover_ranef`): the dense kernel's
+/// RE-column elimination order is the same layout, so the two share this rather
+/// than each carrying their own walk. What is sparse-specific is the caller, not
+/// the layout.
 pub(crate) fn assemble_ranef_sparse(
     theta: &[f64],
     g: &crate::lmm::LmmGroupings,
@@ -242,6 +429,68 @@ pub(crate) fn assemble_ranef_sparse(
         }
     }
     out
+}
+
+/// [`Fit::fitted`] for the Gaussian LMM paths: `μ̂ = o + Xβ̂ + Zb̂` per row,
+/// scattered straight through the ids. **Z is never materialized** — each row
+/// reads its own level's block out of `ranef` and weights it by that row's own
+/// covariates, which is what keeps the no-Z property the whole LMM design rests
+/// on true.
+///
+/// `ranef` is [`Fit::ranef`]'s public layout (per grouping, level-major), so this
+/// runs after [`assemble_ranef_sparse`]. The identity link makes μ̂ = η̂, and the
+/// offset is added back here because the LMM applies it as an exact `y − o` shift
+/// BEFORE accumulation and never sees it again — the same caveat `fit_ols`
+/// documents, and the same fix.
+#[allow(clippy::too_many_arguments)] // marshals (x, n, p, beta, ranef, groupings, ids…)
+pub(crate) fn lmm_fitted(
+    x: &[f64],
+    n: usize,
+    p: usize,
+    beta: &[f64],
+    ranef: &[f64],
+    g: &crate::lmm::LmmGroupings,
+    primary_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    offset: Option<&[f64]>,
+) -> Vec<f64> {
+    let counts = ranef_level_counts(g);
+    // Start of each grouping's block in `ranef`, declaration order.
+    let mut block_start = Vec::with_capacity(counts.len());
+    let mut acc = 0usize;
+    let q_of = |e: usize| {
+        if e == 0 {
+            g.primary_q
+        } else {
+            g.extra_q[e - 1]
+        }
+    };
+    for (e, &levels) in counts.iter().enumerate() {
+        block_start.push(acc);
+        acc += levels * q_of(e);
+    }
+    (0..n)
+        .map(|i| {
+            let row = &x[i * p..(i + 1) * p];
+            let mut eta = offset.map_or(0.0, |o| o[i]);
+            for (j, &b) in beta.iter().enumerate() {
+                eta += row[j] * b;
+            }
+            let mut add_block = |e: usize, level: usize, slope_cols: &[usize]| {
+                let q = q_of(e);
+                let base = block_start[e] + level * q;
+                eta += ranef[base]; // intercept component, z = 1
+                for (d, &sc) in slope_cols.iter().enumerate() {
+                    eta += ranef[base + 1 + d] * row[sc];
+                }
+            };
+            add_block(0, primary_ids[i] as usize, &g.primary_slope_cols);
+            for (e, level_ids) in extra_ids.iter().enumerate() {
+                add_block(e + 1, level_ids[i] as usize, &g.extra_slope_cols[e]);
+            }
+            eta
+        })
+        .collect()
 }
 
 /// A `ModelSpec` copy whose RE **counts** are derived from the supplied `GroupIds`
@@ -325,48 +574,116 @@ pub(super) fn detect_aliased(x: &[f64], n: usize, p: usize) -> Vec<bool> {
 
 /// Remap a spec's RE slope x-column indices through the kept-columns map
 /// (`to_reduced[orig]` = reduced index, or `usize::MAX` if that column was
-/// dropped). An aliased column that is ALSO an RE slope is a rank-deficient
-/// random slope — out of scope for #4; fault honestly rather than silently
-/// mis-index.
-fn remap_spec_slopes(model: &ModelSpec, to_reduced: &[usize]) -> ModelSpec {
+/// dropped).
+///
+/// `None` means a dropped column is ALSO used as an RE slope — a rank-deficient
+/// random slope, which the crate does not fit: the reduced design has no column
+/// for that slope to point at, so there is no valid reduced spec to build.
+/// Dropping the random slope alongside the fixed column would be a different
+/// model and needs its own reporting and its own oracle; it is deliberately not
+/// done here. Signalling `None` lets the caller return a non-converged `Fit`
+/// instead of panicking — a library panic would take the caller's process
+/// down, giving an R/Python user an abort instead of an inspectable fit, and
+/// costing a loop caller its whole run over one degenerate draw.
+fn remap_spec_slopes(model: &ModelSpec, to_reduced: &[usize]) -> Option<ModelSpec> {
     let Some(re) = model.re.as_ref() else {
-        return model.clone();
+        return Some(model.clone());
     };
-    let remap = |cols: &[u32]| -> Vec<u32> {
+    // `collect::<Option<Vec<_>>>` short-circuits on the first dropped column, so
+    // one `None` anywhere in any slope list fails the whole remap.
+    let remap = |cols: &[u32]| -> Option<Vec<u32>> {
         cols.iter()
             .map(|&c| {
                 let r = to_reduced[c as usize];
-                assert!(
-                    r != usize::MAX,
-                    "rank-deficient random-slope column {c}: an aliased fixed column is used as an RE slope (unsupported)"
-                );
-                r as u32
+                (r != usize::MAX).then_some(r as u32)
             })
             .collect()
     };
     let extra_groupings = re
         .extra_groupings
         .iter()
-        .map(|g| Grouping {
-            relation: g.relation.clone(),
-            slopes: remap(&g.slopes),
+        .map(|g| {
+            Some(Grouping {
+                relation: g.relation.clone(),
+                slopes: remap(&g.slopes)?,
+            })
         })
-        .collect();
-    ModelSpec {
+        .collect::<Option<Vec<_>>>()?;
+    Some(ModelSpec {
         family: model.family,
         re: Some(ReStructure {
             sizing: re.sizing.clone(),
-            slopes: remap(&re.slopes),
+            slopes: remap(&re.slopes)?,
             extra_groupings,
         }),
+    })
+}
+
+/// The "unfittable model" return: an aliased fixed column is also used as an RE
+/// slope, so no reduced spec exists (see [`remap_spec_slopes`]). Carries the
+/// crate's standard numerical-failure convention — NaN β/se/vcov/dispersion,
+/// `converged: false`, no varcorr, `df: 0` — the same shape `fit_mle_sparse`
+/// returns on its own failures, so a caller that already handles
+/// `converged == false` needs no new branch. `n_eval: 0` is honest: no optimizer
+/// ran.
+///
+/// `aliased` is reported as-is rather than blanked. `converged == false` with
+/// every β NaN already says "unfittable"; the mask says which columns caused it,
+/// which is the only diagnostic the caller can act on, and it is the same field
+/// `fit_rank_deficient` fills on the successful path.
+fn unfittable_random_slope_fit(p: usize, model: &ModelSpec, aliased: &[bool]) -> Fit {
+    Fit {
+        beta: vec![f64::NAN; p],
+        se: vec![f64::NAN; p],
+        vcov: nan_vcov(p),
+        tau2: vec![f64::NAN; theta_width(model.re.as_ref())],
+        dispersion: f64::NAN,
+        diagnostics: Diagnostics {
+            aliased: aliased.to_vec(),
+            ..Diagnostics::from_flags(false, false, p)
+        },
+        varcorr: vec![],
+        stddev_se: vec![],
+        n_eval: 0,
+        deviance: f64::NAN,
+        loglik: f64::NAN,
+        df: 0,
+        // Only the Gaussian mixed (LMM) routes report a REML criterion; every
+        // GLMM route reports `reml: false`. Reached with `re: Some` only, so the
+        // family alone decides.
+        reml: matches!(model.family, Family::Gaussian),
+        fitted: vec![],
+        ranef: vec![],
+        ranef_levels: vec![],
     }
 }
 
 /// Fit the reduced (aliased-columns-dropped) model and scatter β/se back to full
 /// width: retained slots take the reduced fit, aliased slots are NaN,
 /// `converged` follows the reduced fit, `tau2`/`varcorr`/`dispersion` pass through
-/// (the RE structure is unchanged; only fixed-column indices are remapped). The
-/// reduced design is full-rank, so the recursive `fit_warm` never re-enters here.
+/// (the RE structure is unchanged; only fixed-column indices are remapped).
+///
+/// `Fit::aliased` is the UNION of this level's `aliased` and the reduced fit's own
+/// mask, not just this level's — see the OR in the scatter loop. That keeps the
+/// field's contract (`NaN` in β/se ⇔ the column was dropped) true across a nested
+/// salvage, which the recursion below makes reachable.
+///
+/// Returns an all-NaN, non-converged `Fit` without refitting when a dropped
+/// column is also an RE slope (see [`remap_spec_slopes`]) — that model is
+/// unfittable, not merely rank-deficient.
+///
+/// **Recursion.** This re-enters `fit_warm`, so termination is a real
+/// obligation. It rests on `kept.len() < p`: every entry hands the recursive
+/// call a strictly narrower design, bounding the chain at `p` deep. The only
+/// caller is the alias gate (`detect_aliased` on X'X at `ALIAS_EPS`), which
+/// holds for a stronger reason too — the reduced design is full-rank in X'X, so
+/// the gate never fires a second time and the chain is one deep in practice.
+/// The `debug_assert` below pins the general requirement anyway, because a
+/// second caller passing a mask from a different matrix would not inherit that
+/// argument.
+///
+/// `kept.len() == 0` (every column aliased — reachable on an all-zero column) is
+/// not a termination hazard: `fit_warm` skips the gate at `p == 0`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_rank_deficient(
     x: &[f64],
@@ -381,10 +698,21 @@ pub(super) fn fit_rank_deficient(
 ) -> Fit {
     let kept: Vec<usize> = (0..p).filter(|&j| !aliased[j]).collect();
     let pk = kept.len();
+    debug_assert!(
+        pk < p,
+        "fit_rank_deficient: `aliased` must drop at least one column, or the \
+         recursive fit_warm re-enters on identical input"
+    );
     let mut to_reduced = vec![usize::MAX; p];
     for (r, &orig) in kept.iter().enumerate() {
         to_reduced[orig] = r;
     }
+    // Remap before building the reduced design: a dropped column used as an RE
+    // slope makes the model unfittable, and there is no point paying for the
+    // O(n·pk) copy to discover that.
+    let Some(model_r) = remap_spec_slopes(model, &to_reduced) else {
+        return unfittable_random_slope_fit(p, model, aliased);
+    };
     // Reduced design (drop aliased columns), row-major.
     let mut xr = vec![0.0f64; n * pk];
     for i in 0..n {
@@ -392,10 +720,15 @@ pub(super) fn fit_rank_deficient(
             xr[i * pk + r] = x[i * p + orig];
         }
     }
-    let model_r = remap_spec_slopes(model, &to_reduced);
-    // StartValues.beta is p-wide → reduce it; theta is RE-only, unchanged.
+    // StartValues.beta is p-wide → reduce it; theta is RE-only, unchanged. An
+    // empty β is the cold-start marker, not a p-wide vector — it stays empty
+    // rather than being indexed.
     let start_r = start.map(|s| StartValues {
-        beta: kept.iter().map(|&o| s.beta[o]).collect(),
+        beta: if s.beta.is_empty() {
+            Vec::new()
+        } else {
+            kept.iter().map(|&o| s.beta[o]).collect()
+        },
         theta: s.theta.clone(),
     });
     // Targets: drop aliased targets, reindex survivors into the reduced design.
@@ -413,11 +746,39 @@ pub(super) fn fit_rank_deficient(
     };
     let fr = super::fit_warm(&xr, y, n, pk, &model_r, ids, start_r.as_ref(), &opts_r);
     // Scatter reduced β/se to full width; aliased slots stay NaN.
+    //
+    // `aliased_out` starts as THIS level's mask and takes the reduced fit's mask
+    // on top, in the same loop that scatters β. The OR keeps the field's
+    // contract — NaN in β/se ⇔ the column was dropped — true no matter how deep
+    // the chain runs: if the recursive `fit_warm` salvages again, `fr.aliased[r]`
+    // is true for a column this level KEPT and `fr.beta[r]` is the NaN that goes
+    // with it, and reporting only this level's mask would scatter that NaN into
+    // a slot flagged `aliased == false`. The alias gate cannot fire twice today
+    // (see the recursion note above), so this is insurance rather than a live
+    // path, but it is the cheap kind and the contract is worth pinning.
+    let mut aliased_out = aliased.to_vec();
     let mut beta = vec![f64::NAN; p];
     let mut se = vec![f64::NAN; p];
     for (r, &orig) in kept.iter().enumerate() {
         beta[orig] = fr.beta[r];
         se[orig] = fr.se[r];
+        aliased_out[orig] |= fr.diagnostics.aliased[r];
+    }
+    // Every other diagnostic passes through from the reduced fit, but its note
+    // column indices are REDUCED-design indices — translate them back through
+    // `kept` so a caller can index them into the `x` it passed in.
+    let mut diagnostics = fr.diagnostics;
+    diagnostics.aliased = aliased_out;
+    for note in &mut diagnostics.notes {
+        match note {
+            Note::IllConditioned { columns, .. } => {
+                for c in columns.iter_mut() {
+                    *c = kept[*c as usize] as u32;
+                }
+            }
+            // Carry no design-column indices — nothing to translate.
+            Note::PirlsExhausted { .. } | Note::UnusedGroupingLevels { .. } => {}
+        }
     }
     // Same scatter in two dimensions: an aliased column has no coefficient, so
     // it has no covariance with anything — its whole row and column stay NaN,
@@ -434,13 +795,11 @@ pub(super) fn fit_rank_deficient(
         vcov,
         tau2: fr.tau2,
         dispersion: fr.dispersion,
-        converged: fr.converged,
+        diagnostics,
         varcorr: fr.varcorr,
         stddev_se: fr.stddev_se,
-        aliased: aliased.to_vec(),
         n_eval: fr.n_eval,
         deviance: fr.deviance,
-        singular: fr.singular,
         // Scalars/per-row/RE-shaped fields pass through: loglik and df come
         // from the REDUCED fit (aliased columns carry no parameter — lme4's
         // NA-coefficient df), fitted is per-row (the reduced model's means are
@@ -523,10 +882,10 @@ pub(super) fn assert_model_shape(model: &ModelSpec, p: usize, nagq: u8) {
     let Some(re) = model.re.as_ref() else {
         return;
     };
-    // The RE-envelope caps (extra-grouping count, q_p, q_g) that used to panic
-    // here are now `classify_design`'s routing boundary — over-envelope
-    // designs route to the sparse path instead of aborting. Only the column-
-    // bounds validity asserts remain below (they hold regardless of solver).
+    // The RE-envelope caps (extra-grouping count, q_p, q_g) are
+    // `classify_design`'s routing boundary — over-envelope designs route to
+    // the sparse path instead of aborting here. Only the column-bounds
+    // validity asserts remain below (they hold regardless of solver).
     for &col in &re.slopes {
         assert!(
             (col as usize) < p,

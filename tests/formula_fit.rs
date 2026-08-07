@@ -132,7 +132,7 @@ fn assert_vec_close(got: &[f64], want: &[f64], ctx: &str) {
 /// design, the ids, or nowhere. Asserting the whole `Fit` rather than β alone is
 /// what makes "nowhere" checkable.
 fn assert_same_fit(got: &Fit, want: &Fit, ctx: &str) {
-    assert_eq!(got.converged, want.converged, "{ctx}: converged");
+    assert_eq!(got.converged(), want.converged(), "{ctx}: converged");
     assert_vec_close(&got.beta, &want.beta, &format!("{ctx}: beta"));
     assert_vec_close(&got.se, &want.se, &format!("{ctx}: se"));
     assert_vec_close(&got.tau2, &want.tau2, &format!("{ctx}: tau2"));
@@ -203,8 +203,14 @@ fn assert_frontend_matches_hand_built(
         &hand.ids,
         &opts_for(hand.p),
     );
-    assert!(via_formula.converged, "{ctx}: formula fit did not converge");
-    assert!(by_hand.converged, "{ctx}: hand-built fit did not converge");
+    assert!(
+        via_formula.converged(),
+        "{ctx}: formula fit did not converge"
+    );
+    assert!(
+        by_hand.converged(),
+        "{ctx}: hand-built fit did not converge"
+    );
     assert_same_fit(&via_formula, &by_hand, ctx);
 }
 
@@ -424,7 +430,7 @@ fn pastes_flat_nested_equals_the_explicit_nesting() {
         &lo_exp.opts,
     );
     assert!(
-        f_flat.converged && f_exp.converged,
+        f_flat.converged() && f_exp.converged(),
         "pastes did not converge"
     );
     assert_same_fit(&f_flat, &f_exp, "pastes flat vs explicit");
@@ -823,7 +829,7 @@ fn re_groups_align_with_varcorr_blocks() {
     )
     .unwrap();
     let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    assert!(f.converged);
+    assert!(f.converged());
 
     // The shim's invariant: one name per varcorr block, same order.
     assert_eq!(
@@ -855,7 +861,7 @@ fn re_groups_align_with_varcorr_blocks() {
     );
 }
 
-/// §6 of the Python-port spec: a factor's level order is the caller's, and level
+/// A factor's level order is the caller's, and level
 /// 0 is the treatment-contrast base. Before this, `factor_levels` sorted every
 /// factor through a `BTreeSet`, so `["low","med","high"]` silently based against
 /// `"high"` — same fit quality, different β, a different question answered, and
@@ -902,7 +908,7 @@ fn declared_factor_level_order_picks_the_reference_level() {
     let f2 = fit_cold(
         &lo2.x, &lo2.y, lo2.n, lo2.p, &lo2.model, &lo2.ids, &lo2.opts,
     );
-    assert!(f1.converged && f2.converged);
+    assert!(f1.converged() && f2.converged());
     // Intercept = mean of the base level: "low" ≈ 1.05 vs "high" ≈ 3.05.
     assert!(
         close(f1.beta[0], 1.05, 1e-6, 1e-6),

@@ -1,6 +1,6 @@
 [package]
 name = "glmm"
-version = "0.1.3"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -29,11 +29,20 @@ formula = ["dep:regex"]
 # kernels + `StartValues` warm-start). Capability-named, multi-consumer. OFF by
 # default so the semver-covered public API is just `fit` + `ModelSpec`. (spec §5)
 loop_advanced = []
+# String-typed fit orchestration shared by the FFI ports (`glmm-python`,
+# `glmm-r`): one definition of the family/link string vocabulary and the
+# result flattening both ports publish, instead of two mirrored copies. OFF by
+# default and — like `loop_advanced` — NOT part of the semver-covered surface:
+# its shape follows the ports' needs. Needs `formula`, which `run_fit` lowers
+# through.
+orchestrate = ["formula"]
 # Installs dhat as the test binary's #[global_allocator] for the `#[ignore]`
 # bounded-alloc tests. OFF by default: dhat locks a global mutex on every
 # allocation, which serializes the whole parallel test suite when it's always
-# installed. Run those tests with
-# `cargo test --features alloc-tests <name> -- --ignored --test-threads=1`.
+# installed. The `#[ignore]` lib tests serialize themselves via
+# `test_support::alloc_test_guard` (dhat counts process-wide), so run with
+# `cargo test --features alloc-tests <name> -- --ignored` — no
+# `--test-threads=1` needed.
 alloc-tests = []
 # Tier 2, the cross-engine tier: asserts the crate against the frozen lme4 /
 # MixedModels / GLMMadaptive goldens in `validation/goldens/` at `validation/tol.R`'s
@@ -54,7 +63,7 @@ parallel = ["dep:rayon"]
 
 [dependencies]
 # Mirror engine-core's pins exactly — validation-stable numerics depend on them.
-bobyqa = "0.1"
+bobyqa = "0.2"
 pulp = "=0.22.2"
 # Formula-parser only (`src/formula/parse.rs`); optional so the default-off kernel
 # never links it. Its MSRV (1.65) clears this crate's 1.85 floor.

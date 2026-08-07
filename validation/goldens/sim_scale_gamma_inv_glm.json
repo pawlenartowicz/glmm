@@ -1,0 +1,21 @@
+{
+  "name": "sim_scale_gamma_inv_glm",
+  "engine": "stats::glm",
+  "engine_version": "R-4.5.3",
+  "kind": "glm",
+  "data": "sim_scale_gamma_inv",
+  "family": "gamma",
+  "link": "inverse",
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "y ~ 1 + x",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [99.8813244077148, -19.7574641575102],
+    "se": [0.204076575867777, 0.711212166103063],
+    "loglik": 1346.89182597649,
+    "dispersion": 0.000826844089170714
+  }
+}

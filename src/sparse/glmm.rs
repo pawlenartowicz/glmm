@@ -131,6 +131,16 @@ pub(crate) struct SparseGlmmWorkspace {
     /// Per-row linear-predictor offset (`FitOptions::offset`), added into
     /// `eta_fixed` by `refresh_eta_fixed`. `None` ⇒ no offset, byte-identical.
     pub(super) offset: Option<Vec<f64>>,
+    /// Count of fit-path (`pirls_tol_override.is_none()`) `pirls` solves that
+    /// ran the full `PIRLS_MAX_ITERS` cap without converging — observation-only,
+    /// read back by `FitDiagnostics`/`Note::PirlsExhausted`, never by any
+    /// numeric path. `SparseGlmmWorkspace::new` is built fresh per fit (no
+    /// `loop_advanced` reuse on this path), so the zero default is this
+    /// counter's per-fit reset.
+    pub(super) pirls_exhausted: u32,
+    /// Whether the FINAL re-evaluation at the pinned γ̂ itself exhausted the
+    /// PIRLS cap.
+    pub(super) final_pirls_exhausted: bool,
 }
 
 impl SparseGlmmWorkspace {
@@ -214,6 +224,8 @@ impl SparseGlmmWorkspace {
             p,
             pirls_tol_override: None,
             offset: None,
+            pirls_exhausted: 0,
+            final_pirls_exhausted: false,
         }
     }
 
@@ -263,6 +275,8 @@ impl SparseGlmmWorkspace {
             p,
             pirls_tol_override,
             offset,
+            pirls_exhausted: _,
+            final_pirls_exhausted: _,
         } = self;
         SparseGlmmWorkspace {
             g: g.clone(),
@@ -304,6 +318,10 @@ impl SparseGlmmWorkspace {
             p: *p,
             pirls_tol_override: *pirls_tol_override,
             offset: offset.clone(),
+            // FD-Hessian workers only ever run with `pirls_tol_override ==
+            // Some`, which never increments these — fresh per-worker state.
+            pirls_exhausted: 0,
+            final_pirls_exhausted: false,
         }
     }
 
@@ -706,6 +724,16 @@ pub(super) fn sparse_glmm_deviance(
         }
     }
     let (dev, pen, logdet, conv) = ws.pirls(family, nb_theta, x, y, n, profile_beta);
+    // `!conv` with a FINITE `dev` is exactly the natural iteration-cap
+    // exhaustion (mirrors `glmm::laplace_deviance`'s identical discriminator):
+    // `pirls`'s other failure paths (halving exhausted, non-PD Cholesky) always
+    // return the `(NaN, NaN, NaN, false)` triple, so a finite `dev` here can only
+    // mean the loop ran out its `PIRLS_MAX_ITERS` iterations. Gated on
+    // `pirls_tol_override.is_none()` so FD-Hessian SE evals never count — the
+    // same fit-path-vs-FD-eval discriminator this function already uses above.
+    if !conv && dev.is_finite() && ws.pirls_tol_override.is_none() {
+        ws.pirls_exhausted += 1;
+    }
     if !conv || !dev.is_finite() {
         return f64::INFINITY;
     }
@@ -773,7 +801,7 @@ fn sparse_glmm_schur(ws: &mut SparseGlmmWorkspace, x: MatRef<f64>, n: usize) -> 
 }
 
 /// Relative FD step for the SPARSE joint-deviance Hessian — deliberately NOT
-/// the dense `glmm::FD_STEP_REL` (1e-2): the two paths sit on opposite sides
+/// the dense `glmm::FD_STEP_BASE` (1e-2): the two paths sit on opposite sides
 /// of the truncation-vs-noise trade. On the weighted sparse Gamma golden
 /// (`sim_sparse_gamma`, weight-perturbed cell), the flat intercept direction's
 /// FD-step plateau (true curvature, found by scanning h) sits at
@@ -786,10 +814,17 @@ fn sparse_glmm_schur(ws: &mut SparseGlmmWorkspace, x: MatRef<f64>, n: usize) -> 
 /// se_hess gates (sim_gamma 1e-2, cbpp_probit 2e-3 vs the 1e-3 band) while
 /// h = 1e-2 holds them at ~1e-4 — so the dense constant stays 1e-2 and this
 /// one must not be folded back into it.
+///
+/// Unlike the dense path's `glmm::FD_STEP_BASE`, θ coordinates here stay
+/// RELATIVE rather than taking an absolute step: this constant is calibrated
+/// on the NOISE side, so dropping the `max(1, |θ̂|)` scaling would shrink h_θ
+/// from ~4.7e-4 toward 1e-4 on a large-SD model and push it further into
+/// noise, not out of it. The sparse arm needs its own step calibration in the
+/// large-θ̂ regime, measured separately.
 const SPARSE_FD_STEP_REL: f64 = 1e-4;
 
 /// FD-Hessian joint (θ,β) covariance on the sparse path — mirrors
-/// `glmm::fd_hessian_cov`'s scheme exactly (single-step central differences, no
+/// `glmm::fd_hessian_cov`'s scheme (single-step central differences, no
 /// Richardson extrapolation, step `h_k = SPARSE_FD_STEP_REL·max(1, |γ̂_k|)`
 /// (sparse-calibrated, see the constant above),
 /// `cov = 2·(H_dev⁻¹)_ββ`, θ SE from the θ diagonal) minus the warm-seed
@@ -931,13 +966,11 @@ fn sparse_glmm_nan_fit(p: usize, n_theta: usize) -> crate::Fit {
         vcov: crate::fit::nan_vcov(p),
         tau2: vec![f64::NAN; n_theta],
         dispersion: f64::NAN,
-        converged: false,
+        diagnostics: crate::Diagnostics::from_flags(false, false, p),
         varcorr: vec![],
         stddev_se: vec![],
-        aliased: vec![false; p],
         n_eval: 0,
         deviance: f64::NAN,
-        singular: false,
         loglik: f64::NAN,
         df: 0,
         reml: false,
@@ -1012,24 +1045,28 @@ pub(crate) fn fit_glmm_sparse(
     // (D diagonals up to q·THETA0²) and the joint BOBYQA stalls in that basin —
     // measured on sim_sparse_gamma, where the all-THETA0 start converged ~240
     // deviance units above the lme4 optimum with θ̂ ≈ θ₀. A warm start is floored
-    // at THETA_TRUTH_FLOOR on every coordinate (mirror `glmm::fit_glmm`). The β
-    // portion mirrors `fit::fit_glmm`: caller start verbatim, else the no-RE GLM
-    // warm start; clamped into the ±BETA_BOX box.
+    // at THETA_TRUTH_FLOOR on its diagonal coordinates only (mirror
+    // `glmm::fit_glmm`); off-diagonals pass through verbatim so a negative
+    // correlation start survives. The β portion mirrors `fit::fit_glmm`: caller
+    // start verbatim, else the no-RE GLM warm start; clamped into the ±BETA_BOX box.
+    // Either field may arrive EMPTY — a per-component cold start (`StartValues`) —
+    // and then takes the same branch as `start = None`.
     let (theta0, mut lower, mut upper) = g.blind_theta_and_bounds();
     let mut params = vec![0.0f64; n_theta + p];
     match start {
-        Some(s) => {
+        Some(s) if !s.theta.is_empty() => {
             for (t, &v) in params[..n_theta].iter_mut().zip(&s.theta) {
-                *t = v.max(crate::lmm::THETA_TRUTH_FLOOR);
+                *t = v;
+            }
+            for &i in g.diagonal_theta() {
+                params[i] = params[i].max(crate::lmm::THETA_TRUTH_FLOOR);
             }
         }
-        None => params[..n_theta].copy_from_slice(&theta0),
+        _ => params[..n_theta].copy_from_slice(&theta0),
     }
     let beta_start = match start {
-        Some(s) => s.beta.clone(),
-        None => {
-            crate::fit::glm_warm_start_beta(family, nb_theta, xm, y, n, p, opts.offset.as_deref())
-        }
+        Some(s) if !s.beta.is_empty() => s.beta.clone(),
+        _ => crate::fit::glm_warm_start_beta(family, nb_theta, xm, y, n, p, opts.offset.as_deref()),
     };
     for (slot, &b) in params[n_theta..].iter_mut().zip(&beta_start) {
         *slot = b.clamp(-crate::glmm::BETA_BOX, crate::glmm::BETA_BOX);
@@ -1061,12 +1098,10 @@ pub(crate) fn fit_glmm_sparse(
         };
         // MIRRORS `config_stage1` in `GlmmWorkspace::from_groupings` — both
         // feed through the shared `apply_campaign_overrides` tail.
-        let mut config1 = bobyqa::Config {
-            rho_begin,
-            rho_end: crate::lmm::GLMM_RHO_END,
-            npt: npt1,
-            ..bobyqa::Config::new(n_theta)
-        };
+        let mut config1 = bobyqa::Config::new(n_theta);
+        config1.rho_begin = rho_begin;
+        config1.rho_end = crate::lmm::GLMM_RHO_END;
+        config1.npt = npt1;
         crate::lmm::apply_campaign_overrides(&mut config1, n_theta);
         let mut solver1 = bobyqa::Bobyqa::new(n_theta, config1)
             .expect("BOBYQA config constants are valid by construction");
@@ -1100,11 +1135,9 @@ pub(crate) fn fit_glmm_sparse(
     // feeds `converged`. MIRRORS the joint config in
     // `GlmmWorkspace::from_groupings` — both feed through the shared
     // `apply_campaign_overrides` tail.
-    let mut config = bobyqa::Config {
-        rho_begin,
-        rho_end: crate::lmm::GLMM_RHO_END,
-        ..bobyqa::Config::new(n_theta + p)
-    };
+    let mut config = bobyqa::Config::new(n_theta + p);
+    config.rho_begin = rho_begin;
+    config.rho_end = crate::lmm::GLMM_RHO_END;
     crate::lmm::apply_campaign_overrides(&mut config, n_theta + p);
     let mut solver = bobyqa::Bobyqa::new(n_theta + p, config)
         .expect("BOBYQA config constants are valid by construction");
@@ -1117,13 +1150,21 @@ pub(crate) fn fit_glmm_sparse(
     debug_assert!(out.status != Status::InvalidArgs);
     let mut ok = matches!(out.status, Status::Converged);
 
-    // Diagonal-θ pin (mirror `glmm::fit_glmm`; β never pins).
+    // Diagonal-θ pin (mirror `glmm::fit_glmm`; β never pins). The mask's bit
+    // index is the position in `diagonal_theta()` order — the order
+    // `fit::common::pinned_flags` reshapes against the varcorr blocks. Shift
+    // guarded like the sparse LMM route's: past 64 components `pinned` still
+    // latches and the extras go unnamed.
     let mut pinned = false;
+    let mut pinned_components = 0u64;
     if ok {
-        for &ti in g.diagonal_theta() {
+        for (kk, &ti) in g.diagonal_theta().iter().enumerate() {
             if params[ti] <= crate::lmm::PIN_THETA {
                 params[ti] = 0.0;
                 pinned = true;
+                if kk < u64::BITS as usize {
+                    pinned_components |= 1u64 << kk;
+                }
             }
         }
     }
@@ -1132,7 +1173,14 @@ pub(crate) fn fit_glmm_sparse(
     // finite deviance is the degenerate-fit witness (dense kernel's guard).
     let mut final_deviance = f64::INFINITY;
     if ok {
+        // Snapshot/restore around the final call: `sparse_glmm_deviance`
+        // increments the same `ws.pirls_exhausted` for every fit-path eval, but
+        // this eval is the truncated-final-solve case, reported separately as
+        // `final_pirls_exhausted` — it must not also inflate the search count.
+        let before = ws.pirls_exhausted;
         final_deviance = sparse_glmm_deviance(family, nb_theta, &params, &mut ws, xm, y, n, false);
+        ws.final_pirls_exhausted = ws.pirls_exhausted > before;
+        ws.pirls_exhausted = before;
         ok = final_deviance.is_finite();
     }
     if !ok {
@@ -1287,19 +1335,35 @@ pub(crate) fn fit_glmm_sparse(
         }
     }
 
+    // Same as the sparse LMM route — see the comment at its `pinned_grid`.
+    let pinned_grid = crate::fit::pinned_flags(pinned_components, &varcorr);
+
     let mut fit = crate::Fit {
         beta,
         se,
         vcov,
         tau2,
         dispersion,
-        converged: true,
+        // Same story as the sparse LMM route: no pivot, so ill-conditioning
+        // stays unreported and `boundary` is back-derived; `pinned` is real,
+        // off the pin loop above. `notes` DOES carry a PIRLS-exhaustion
+        // observation when one fired — the only note this route can emit.
+        diagnostics: crate::Diagnostics {
+            pinned: pinned_grid,
+            notes: if ws.pirls_exhausted > 0 || ws.final_pirls_exhausted {
+                vec![crate::Note::PirlsExhausted {
+                    evals: ws.pirls_exhausted,
+                    final_eval: ws.final_pirls_exhausted,
+                }]
+            } else {
+                vec![]
+            },
+            ..crate::Diagnostics::from_flags(true, pinned, p)
+        },
         varcorr,
         stddev_se,
-        aliased: vec![false; p],
         n_eval,
         deviance: final_deviance,
-        singular: pinned,
         loglik,
         df: crate::fit::model_df(family, p, n_theta, opts.dispersion.is_some()),
         reml: false,
@@ -1307,7 +1371,7 @@ pub(crate) fn fit_glmm_sparse(
         ranef,
         ranef_levels: crate::fit::ranef_level_counts(&g),
     };
-    fit.singular = fit.singular || fit.has_negligible_component();
+    fit.diagnostics.singular = fit.diagnostics.singular || fit.has_negligible_component();
     (fit, final_deviance)
 }
 

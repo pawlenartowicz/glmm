@@ -14,10 +14,15 @@ def make_fit(**kw):
         "tau2": np.array([]),
         "varcorr": [],
         "stddev_se": np.array([]),
-        "aliased": np.array([False, False]),
+        "diagnostics": {
+            "converged": True,
+            "singular": False,
+            "aliased": np.array([False, False]),
+            "boundary": "interior",
+            "pinned": [],
+            "notes": [],
+        },
         "dispersion": 1.0,
-        "converged": True,
-        "singular": False,
         "names": ["(Intercept)", "x"],
         "re_groups": [],
         "n_eval": 0,
@@ -28,7 +33,14 @@ def make_fit(**kw):
         "fitted": np.array([]),
         "ranef": np.array([]),
         "ranef_levels": np.array([]),
+        "ranef_blocks": [],
     }
+    # converged / singular / aliased are diagnostics entries, not Fit fields —
+    # accept them as flat kwargs anyway so the tests below read the way the
+    # attributes do.
+    for name in ("converged", "singular", "aliased"):
+        if name in kw:
+            base["diagnostics"][name] = kw.pop(name)
     base.update(kw)
     return glmm.Fit(**base)
 

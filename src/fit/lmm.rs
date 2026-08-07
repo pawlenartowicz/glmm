@@ -9,12 +9,14 @@ use crate::lmm::{fit_lmm, LmmFit, LmmGroupings, LmmWorkspace};
 #[cfg(test)]
 use crate::{ModelSpec, StartValues};
 
-use super::common::{assemble_varcorr, fill_se_by_predictor, nan_vcov, vcov_from_chol};
+use super::common::{
+    assemble_varcorr, fill_se_by_predictor, nan_vcov, vcov_from_chol, FitDiagnostics,
+};
 // Used only by the test-only `fit_mle` baseline, which builds its own throwaway
 // `Mat` — the stable core reaches the LMM path via `accumulate_lmm_rows`, which
 // takes a caller-filled `x_mat` directly.
 #[cfg(test)]
-use super::common::to_col_major;
+use super::common::{to_col_major, warm_theta};
 use super::{Fit, FitOptions};
 
 // ---------------------------------------------------------------------------
@@ -63,6 +65,9 @@ pub(crate) struct LmmResultView<'a> {
     theta: &'a [f64],
     groupings: &'a LmmGroupings,
     n_rows: usize,
+    /// Spherical conditional modes û at θ̂, or empty when the recovery did not
+    /// run or did not succeed (see `LmmFitScratch::ranef_ok`).
+    ranef_u: &'a [f64],
 }
 
 // Loop-tier read accessors (via the `FitView`/`loop_advanced` surface); the
@@ -85,21 +90,28 @@ impl LmmResultView<'_> {
     pub(crate) fn var_diag(&self) -> &[f64] {
         self.var_diag
     }
-    /// Whether θ̂ reached an interior/pinned optimum.
-    pub(crate) fn converged(&self) -> bool {
-        self.fit.converged
+    /// This route's [`FitDiagnostics`] — every field is real here: the dense LMM
+    /// is the one route that reports θ boundary state, per-component pins, AND a
+    /// recorded pivot. The pivot floor is this route's own ([`crate::lmm::PIVOT_MIN`]),
+    /// which sits at the same 1e-12 as OLS/GLM but was calibrated separately and
+    /// stays a separate constant for that reason.
+    pub(crate) fn diagnostics(&self) -> FitDiagnostics {
+        FitDiagnostics {
+            converged: self.fit.converged,
+            boundary_hit: self.fit.boundary_hit,
+            pinned_components: self.fit.pinned_components,
+            pivot: self.fit.pivot,
+            pivot_col: self.fit.pivot_col,
+            ill_conditioned: self.fit.pivot < crate::lmm::PIVOT_MIN,
+            // No PIRLS on the Gaussian LMM path (profiled REML, no IRLS inner
+            // loop) — always 0/false.
+            pirls_exhausted: 0,
+            final_pirls_exhausted: false,
+        }
     }
     /// Joint Wald-χ² over the target set (the omnibus significance read).
     pub(crate) fn joint_t_sq(&self) -> f64 {
         self.fit.joint_t_sq
-    }
-    /// 0 interior, 1 a θ component pinned to the floor, 2 no optimum found.
-    pub(crate) fn boundary_hit(&self) -> u8 {
-        self.fit.boundary_hit
-    }
-    /// Bitmask of θ components pinned to the boundary (diagonal_theta order).
-    pub(crate) fn pinned_components(&self) -> u64 {
-        self.fit.pinned_components
     }
     /// Objective evaluations the θ-solve spent.
     pub(crate) fn n_eval(&self) -> usize {
@@ -127,6 +139,11 @@ pub(crate) fn lmm_run_on<'a>(
 ) -> LmmResultView<'a> {
     let fit = fit_lmm(ws, target_indices, theta_start);
     LmmResultView {
+        ranef_u: if ws.fit.ranef_ok {
+            &ws.fit.ranef_u[..ws.suff.groupings.k_total]
+        } else {
+            &[]
+        },
         fit,
         betas: &ws.fit.betas,
         var_diag: &ws.fit.var_diag,
@@ -140,14 +157,21 @@ pub(crate) fn lmm_run_on<'a>(
 
 /// Maps an [`LmmResultView`] to the full stable `Fit`: SE from `var_diag`, tau2
 /// from θ̂, varcorr, vcov from the augmented factor, the REML criterion loglik,
-/// and — when `opts.weights` is set — the −Σlog wᵢ weighted-deviance correction.
+/// the conditional modes + per-row means, and — when `opts.weights` is set — the
+/// −Σlog wᵢ weighted-deviance correction.
+///
+/// `x`/`ids` are here for `fitted` alone (`Xβ̂ + Zb̂` needs the design rows and
+/// the per-row levels), the same way `ols_view_to_fit` already takes `x`/`y`.
 pub(crate) fn lmm_view_to_fit(
     view: &LmmResultView<'_>,
+    x: &[f64],
+    ids: &crate::GroupIds,
     n: usize,
     p: usize,
     opts: &FitOptions,
 ) -> Fit {
     let lmm_fit = &view.fit;
+    let diag = view.diagnostics();
     // view.betas: length p, all fixed effects.
     // view.var_diag: length p, predictor-indexed (LME/LMM are predictor-indexed, unlike OLS).
     let beta = view.betas.to_vec();
@@ -194,6 +218,30 @@ pub(crate) fn lmm_view_to_fit(
     // row count.
     let n_rows = view.n_rows;
     let n_theta = view.theta.len();
+
+    // Conditional modes and the per-row means they unlock. Gated on `converged`,
+    // not on the finite endpoint the variance components use: a conditional mode
+    // at a non-converged θ̂ is not a BLUP of anything (the same rule the GLMM
+    // paths already apply). `ranef_u` is empty when the recovery did not run.
+    let (fitted, ranef, ranef_levels) = if lmm_fit.converged && !view.ranef_u.is_empty() {
+        let ranef = super::common::assemble_ranef_sparse(view.theta, view.groupings, view.ranef_u);
+        let fitted = super::common::lmm_fitted(
+            x,
+            n,
+            p,
+            view.betas,
+            &ranef,
+            view.groupings,
+            &ids.primary,
+            &ids.extra,
+            opts.offset.as_deref(),
+        );
+        let levels = super::common::ranef_level_counts(view.groupings);
+        (fitted, ranef, levels)
+    } else {
+        (vec![], vec![], vec![])
+    };
+
     let mut fit = Fit {
         beta,
         se,
@@ -202,26 +250,22 @@ pub(crate) fn lmm_view_to_fit(
         // REML σ̂² (NaN-filled by the kernel alongside var_diag on the
         // degenerate path, so this stays honest without an endpoint gate).
         dispersion: sigma_sq,
-        converged: lmm_fit.converged,
+        diagnostics: super::common::materialize_diagnostics(&diag, p, &varcorr),
         varcorr,
         stddev_se: vec![], // LMM has no Hessian SE machinery
-        aliased: vec![false; p],
         n_eval: lmm_fit.n_eval,
         deviance: lmm_fit.deviance,
-        singular: lmm_fit.boundary_hit == 1,
         // REML criterion on the logLik scale, from the base (unweighted) deviance;
         // the weighted correction below rewrites both together (using `n`, not
         // `n_rows` — see note above `n_rows`).
         loglik: super::common::lmm_loglik(lmm_fit.deviance, n_rows, p),
         df: if has_endpoint { p + n_theta + 1 } else { 0 },
         reml: true,
-        // No per-row means exist on this path (pure sufficient-statistics fit);
-        // LMM fitted/ranef land together with the conditional-mode recovery.
-        fitted: vec![],
-        ranef: vec![],
-        ranef_levels: vec![],
+        fitted,
+        ranef,
+        ranef_levels,
     };
-    fit.singular = fit.singular || fit.has_negligible_component();
+    fit.diagnostics.singular = fit.diagnostics.singular || fit.has_negligible_component();
 
     // Weighted Gaussian log-density carries +½Σlog wᵢ per row; on the −2ℓ scale
     // the REML deviance gains −Σlog wᵢ (θ-independent — added post-optimization,
@@ -247,13 +291,15 @@ pub(crate) fn lmm_view_to_fit(
 #[cfg(test)]
 pub(super) fn fit_lmm_into(
     ws: &mut LmmWorkspace,
+    x: &[f64],
+    ids: &crate::GroupIds,
     n: usize,
     p: usize,
     opts: &FitOptions,
     start: Option<&StartValues>,
 ) -> Fit {
-    let view = lmm_run_on(ws, &opts.target_indices, start.map(|s| s.theta.as_slice()));
-    lmm_view_to_fit(&view, n, p, opts)
+    let view = lmm_run_on(ws, &opts.target_indices, warm_theta(start));
+    lmm_view_to_fit(&view, x, ids, n, p, opts)
 }
 /// LMM dispatch adapter. `cluster_ids`/`extra_ids` are the per-row level ids from
 /// the entry's [`GroupIds`]; `model` is the sizing-corrected spec (counts derived
@@ -313,7 +359,11 @@ pub(super) fn fit_mle(
         opts.weights.as_deref(),
     );
 
-    fit_lmm_into(&mut ws, n, p, opts, start)
+    let ids = crate::GroupIds {
+        primary: cluster_ids.to_vec(),
+        extra: extra_ids.to_vec(),
+    };
+    fit_lmm_into(&mut ws, x, &ids, n, p, opts, start)
 }
 /// Test-only forced-NoZ entry (mirror of forcing `fit_mle_sparse` directly):
 /// the NoZ↔Sparse cross-checks and timed sweeps must reach the dense kernel

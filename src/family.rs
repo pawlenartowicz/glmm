@@ -172,16 +172,19 @@ pub(crate) fn dev_resid(family: Family, nb_theta: f64, y: f64, mu: f64) -> f64 {
             };
             2.0 * (a + b)
         }
-        // 2[ y ln(y/μ) − (y−μ) ], y·ln(y/μ)→0 at y=0.
+        // 2[ y ln(y/μ) − (y−μ) ], y·ln(y/μ)→0 at y=0. Written y·(ln y − ln μ), not
+        // y·ln(y/μ): for subnormal y and μ ≥ 2 the quotient y/μ underflows to exactly
+        // 0.0 before the log, punching a −inf hole in the objective.
         Family::Poisson { .. } => {
-            let t = if y > 0.0 { y * (y / mu).ln() } else { 0.0 };
+            let t = if y > 0.0 { y * (y.ln() - mu.ln()) } else { 0.0 };
             2.0 * (t - (y - mu))
         }
         // 2[ −ln(y/μ) + (y−μ)/μ ]; same form for log and inverse links.
         Family::Gamma { .. } => 2.0 * (-(y / mu).ln() + (y - mu) / mu),
         // 2[ y ln(y/μ) − (y+θ) ln((y+θ)/(μ+θ)) ], y·ln(y/μ)→0 at y=0; θ = nb_theta.
+        // Same subtraction form as Poisson — see the subnormal-underflow note above.
         Family::NegativeBinomial { .. } => {
-            let t = if y > 0.0 { y * (y / mu).ln() } else { 0.0 };
+            let t = if y > 0.0 { y * (y.ln() - mu.ln()) } else { 0.0 };
             2.0 * (t - (y + nb_theta) * ((y + nb_theta) / (mu + nb_theta)).ln())
         }
     }

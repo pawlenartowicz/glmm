@@ -1,0 +1,31 @@
+{
+  "name": "sim_binomial_bigsd_agq_k11",
+  "engine": "lme4::glmer",
+  "engine_version": "1.1.38",
+  "kind": "glmm",
+  "data": "sim_binomial_bigsd",
+  "family": "binomial",
+  "link": "logit",
+  "nagq": 11,
+  "tolPwrss": 1e-13,
+  "r_formula": "y ~ 1 + x + z + (1 | g)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x", "z"],
+  "estimates": {
+    "beta": [0.824994474498218, 0.913561093491045, -0.622307953920597],
+    "se_hessian": [0.354539726379712, 0.113789698253031, 0.196816594693318],
+    "se_rx": [0.338133244405115, 0.107644809789162, 0.191280950752237],
+    "loglik": -710.421596717909,
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)"],
+        "stddev": [5.15796068325673],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  }
+}

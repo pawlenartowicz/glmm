@@ -288,7 +288,7 @@ and the component's bit is recorded in `pinned_components`. Off-diagonal
 covariances are never pinned — a correlation running to `±1` shows up as the
 *diagonal* `λ_dd → 0` under the Cholesky parameterization, so pinning the
 diagonal is the complete policy. `PIN_THETA = 1e-4` aligns the class boundary with
-the scalar Brent kernel's τ̂≈0 detection. The `Fit.singular` flag is set when any
+the scalar Brent kernel's τ̂≈0 detection. The `Fit::diagnostics.singular` flag is set when any
 component was pinned (`boundary_hit == 1`) **or** by the post-hoc
 `has_negligible_component()` check at `Fit` assembly (`src/fit/mod.rs`,
 `SINGULAR_REL_TOL = 1e-3`): any RE standard deviation `≤ 1e-3 ×` the largest —
@@ -305,13 +305,15 @@ Distinct from a pin, the failure/cap-out outcomes (`boundary_hit == 2`) split
 into two cases — the **plateau policy**, pinned by
 `maxfun_cap_reports_honest_endpoint` (`src/lmm.rs`):
 
-- A `MaxFunReached` cap-out whose endpoint passes the `EPS_RANK = 1e-8` rank
-  guard runs the full β̂/σ̂²/SE recovery and returns **real finite numbers**
-  with `converged: false` — the best point found is reported rather than
-  discarded. (When BOBYQA hits `max_fun` on a flat deviance plateau, that
-  point is usually close to the optimum.)
-- `ModelDegenerate` (no accepted endpoint), or an endpoint whose `p×p` factor
-  fails the rank guard, yields the NaN-filled, non-converged fit.
+- A `MaxFunReached` cap-out runs the full β̂/σ̂²/SE recovery and returns **real
+  finite numbers** with `converged: false` — the best point found is reported
+  rather than discarded, with no rank check on its factor. (When BOBYQA hits
+  `max_fun` on a flat deviance plateau, that point is usually close to the
+  optimum.)
+- `ModelDegenerate` (no accepted endpoint), or a non-finite deviance at the
+  endpoint, yields the NaN-filled, non-converged fit. There is no longer a
+  rank guard on the endpoint's factor: `fit_lmm` fits a near-singular but
+  finite endpoint instead of refusing it.
 
 The sparse path mirrors the same plateau policy. Note the code-point overlap
 with the scalar Brent kernel: in `fit_lmm`, `boundary_hit == 2` always means
@@ -320,7 +322,9 @@ Brent bracket (see the shortcut section) — the two kernels share the code's
 numeric values but not their exact semantics.
 
 **Code**: the pin loop and endpoint recovery in `fit_lmm_impl`, constants
-`PIN_THETA`/`THETA_TRUTH_FLOOR`/`EPS_RANK` (`src/lmm.rs`); the mirror pin and
+`PIN_THETA`/`THETA_TRUTH_FLOOR` (`src/lmm.rs`; `EPS_RANK` survives only as the
+constant the private Brent kernel in `src/lme.rs` reads — `fit_lmm_impl` no
+longer consults it); the mirror pin and
 plateau policy in `fit_mle_sparse` (`src/sparse/mod.rs`). **Convention**:
 lme4 reports such fits as `isSingular`; `glmm` pins to exactly `0` (FP-stable
 across platforms) and still returns the fit. **Validation**: Dyestuff sits near
@@ -351,6 +355,10 @@ same θ both kernels factor the same SPD system, and by
 Cholesky uniqueness the sparse factor equals the dense path's augmented factor
 — so the two fits agree to machine precision wherever both apply, and the
 sparse path can serve as the superset solver without a separate tolerance.
+The two routes still disagree on ill-conditioning policy, though: the dense
+path never refuses on conditioning grounds (see the plateau policy above),
+while the sparse path refuses below its own floor (`sparse::PIVOT_MIN`) and
+reports `converged: false` instead of fitting and flagging.
 
 **Code**: `fit_mle_sparse`, `sparse_reml_deviance`, `sparse_schur_factor`,
 `schur_phase_b`, `TAIL_SPARSE_MIN` (`src/sparse/mod.rs`). **Validation**:
@@ -407,10 +415,10 @@ targets non-Gaussian GLMMs and defers Gaussian LMMs to nlme/lme4.)
 | | lme4 (`lmer`) | MixedModels.jl | `glmm` |
 |---|---|---|---|
 | Criterion default | REML (ML switch) | **ML** (REML switch) | **REML, locked** — no switch |
-| Optimiser | BOBYQA via nloptwrap (default) | BOBYQA via NLopt | BOBYQA (PRIMA), tuned `npt`/ρ schedule; Brent for the `loop_advanced` scalar kernel |
+| Optimiser | BOBYQA via nloptwrap (default) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE) | BOBYQA (PRIMA), tuned `npt`/ρ schedule; Brent for the `loop_advanced` scalar kernel |
 | Linear algebra per eval | sparse Cholesky of `ΛᵀZᵀZΛ + I` (CHOLMOD), Z materialised | blocked/amalgamated Cholesky, Z materialised | dense path: **no Z at all** — sufficient statistics + family-block elimination, with a closed-form collapse for balanced single-intercept designs; sparse path: Schur-block Cholesky (AMD sparse tail) |
-| Singular fit | fits, `isSingular` warns | fits, flags | pins diagonal components ≤ `1e-4` to exact `0`, still `converged`, sets `singular`/`pinned_components` |
-| Optimiser cap-out | warns, returns last point | warns, returns last point | returns the best finite point, `converged: false`, `boundary_hit = 2` |
+| Singular fit | fits, `isSingular` warns | fits, flags | pins diagonal components ≤ `1e-4` to exact `0`, still `converged`, sets `Diagnostics::singular`/`Diagnostics::pinned` |
+| Optimiser cap-out | warns, returns last point | warns, returns last point | returns the best finite point, `converged: false`; dense path: `Diagnostics::boundary == Boundary::NoOptimum`; sparse path: `boundary` is back-derived from `singular`, so `NoOptimum` never appears there |
 | BLUPs / `ranef` | yes | yes | not computed (deliberate — see [`coming-from-lme4.md`](coming-from-lme4.md)) |
 
 The rows that matter in practice: the **criterion lock** (comparing `glmm` to
@@ -431,7 +439,8 @@ list of differences from the other engines, with justification, is in
   1–48. — the relative-Cholesky `Λ_θ` parameterization, the profiled REML
   objective, and the singular-fit conventions this page follows.
 - Bates, D. et al. *MixedModels.jl* (Julia package). — the second reference
-  engine; same profiled objective, ML default, BOBYQA.
+  engine; same profiled objective, ML default; NEWUOA over unconstrained θ
+  since v5.0.0 (BOBYQA retained for scalar RE).
 - Powell, M. J. D. (2009). *The BOBYQA algorithm for bound constrained
   optimization without derivatives*. Report DAMTP 2009/NA06, University of
   Cambridge. — the θ optimizer; the `npt` bounds cited in the schedule table

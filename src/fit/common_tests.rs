@@ -23,20 +23,10 @@ pub(crate) const PIN_REL_OLS: f64 = 1e-9;
 /// last bit in the objective moves the reported optimum further than it does on
 /// the closed-form paths.
 ///
-/// Measured, not chosen: every pin in the crate reproduces BIT-EXACTLY across
-/// debug and release and all four feature configs (default, `loop_advanced`,
-/// `parallel`, `--no-default-features`) on one machine — worst relative spread
-/// 0.0, not merely small. The band is therefore margin against a different CPU,
-/// where `src/simd_transcendental.rs` dispatches on feature detection and can
-/// shift that last bit. That second machine is the CI runner and has NOT been
-/// measured yet; until it is, both bands are provisional. Bit-exact pins would
-/// be the tighter claim and are wrong for exactly that reason: they would go
-/// red on a runner drawing a different microarchitecture, for no bug.
-///
-/// The second measurement is the `pin-bands` workflow, triggered by hand. It
-/// rewrites both constants to 0.0 so every pin reports its own deviation, and
-/// records the CPU each leg drew. When it has run, replace the paragraph above
-/// with what it measured and drop the word provisional.
+/// Measured, not chosen — see [`assert_pinned`] for which machine measured it
+/// and what the second machine cost. Bit-exact pins would be the tighter claim
+/// and are wrong for exactly that reason: they would go red on a host drawing a
+/// different microarchitecture, for no bug.
 pub(crate) const PIN_REL_ITER: f64 = 1e-7;
 
 /// Assert a fitted vector against its pinned values, elementwise relative.
@@ -45,9 +35,59 @@ pub(crate) const PIN_REL_ITER: f64 = 1e-7;
 /// produces is the same nothing-asserted failure the pins exist to prevent.
 ///
 /// The failure names the WORST element, not the first one over the band. That
-/// matters for the band-measurement run, which sets `band` to 0.0 so every pin
-/// reports its deviation: stopping at the first element would report whichever
-/// came first in index order rather than the spread the band has to cover.
+/// matters for the band-measurement run below: stopping at the first element
+/// would report whichever came first in index order rather than the spread the
+/// band has to cover.
+///
+/// # Which machine the pins are frozen on
+///
+/// This is the one place that says it; every pin site cites this function rather
+/// than re-explaining. If you are re-freezing a pin, read this first.
+///
+/// **The anchor is x86_64-unknown-linux-gnu**, Intel Core Ultra 7 265H (Arrow
+/// Lake-H, AVX2 + FMA, no AVX-512). Every Rust-vs-Rust pin in the crate — the
+/// `PIN_REL_OLS` / `PIN_REL_ITER` pins and the per-test `BAND` pins in
+/// `glmm_tests.rs` and `sparse/tests.rs` — reproduces there BIT-EXACTLY, worst
+/// relative spread 0.0, across all four feature configs (default,
+/// `loop_advanced`, `parallel`, `--no-default-features`) in both debug and
+/// release: eight legs, zero non-exact pins. Verified 2026-07-31 by rewriting
+/// every band to `1e-300` and re-running the suite, so a bit-exact pin passes
+/// and one off by a single ULP fails. `1e-300` and not `0.0`: at `0.0` even an
+/// exact pin fails, so each test aborts on its first quantity and a run reports
+/// every test's `beta` and nothing about its `se`. That is the `pin-bands`
+/// workflow's procedure, and it rewrites this band list — keep the two in step.
+///
+/// **The bands are margin for a different CPU, and that cost is now measured.**
+/// The second machine is aarch64-apple-darwin, where `simd_transcendental.rs`
+/// dispatches differently and the compiler contracts multiply-adds into FMA at
+/// other points in this kernel's long reductions. Drift off the anchor values,
+/// worst per test: 1.4e-7 (`fit_wide_crossed_sparse_is_pinned`), 1.5e-7
+/// (`fit_glmm_binomial_slope1_vector_agq_is_pinned`), 1.4e-6
+/// (`fit_wide_slopes_sparse_is_pinned`), 3.6e-6
+/// (`fit_glmm_binomial_slope2_vector_agq_is_pinned`), 7.7e-6
+/// (`fit_sparse_binomial_slope_crossed_is_pinned`), 7.1e-5
+/// (`fit_glmm_poisson_slope1_vector_agq_is_pinned`), 7.9e-4
+/// (`fit_sparse_nb_glmm_is_pinned`).
+///
+/// That four-order spread is not noise in the measurement — it tracks how much
+/// ITERATION sits downstream of the reduction that rounds differently. A single
+/// solve lands at ~1e-7; the NB fit's marginal golden-section θ search compounds
+/// the same last-bit difference into 7.9e-4. So a band is sized per test against
+/// its own measured drift, never corpus-wide.
+///
+/// **Re-freezing rule: re-pin on the anchor.** A value harvested on the second
+/// machine is as arithmetically valid as the anchor's, but mixing the two splits
+/// the corpus across two references and makes "bit-exact on the anchor" stop
+/// being checkable — which is the property that lets a real regression be told
+/// apart from a port. Four `se` vectors were re-anchored on 2026-07-31 for
+/// exactly that reason; each says so at its own site.
+///
+/// **Not covered by any of this: pins asserted against a frozen R/Julia
+/// reference** (`fit_glmm_binomial_bigsd_agq_matches_lme4`, and everything in
+/// `tests/validation_oracle.rs`). Those bands are cross-ENGINE agreement, sized
+/// by the reference's own reproducibility, and re-pinning them to any machine of
+/// ours would be re-pinning the oracle. They are never bit-exact and are not
+/// supposed to be.
 pub(crate) fn assert_pinned(got: &[f64], want: &[f64], band: f64, what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     let mut worst = (f64::NEG_INFINITY, 0usize);
@@ -138,9 +178,9 @@ fn fit_rank_deficient_drops_and_matches_reduced() {
         },
     );
 
-    assert!(f.converged, "reduced OLS must converge");
+    assert!(f.converged(), "reduced OLS must converge");
     assert_eq!(
-        f.aliased,
+        f.aliased(),
         vec![false, false, true],
         "later collinear column dropped"
     );
@@ -177,6 +217,109 @@ fn fit_rank_deficient_drops_and_matches_reduced() {
         f.beta[1],
         fr.beta[1]
     );
+}
+
+/// Gap B — an aliased fixed column that is ALSO an RE random slope must report a
+/// non-converged `Fit`, not panic.
+///
+/// `y ~ 1 + x1 + x2 + (0 + x2 | g)` with `x2 = 1 + x1` exactly, so `x2` is
+/// aliased at `ALIAS_EPS` and `fit_warm` routes into `fit_rank_deficient` — which
+/// then has to remap the RE slope index through the kept-columns map and finds
+/// the slope's column gone. Dropping the random slope alongside the fixed column
+/// would be a different model, so the model is genuinely unfittable; the question
+/// is only how that is reported. It used to `assert!`, which takes the caller's
+/// whole process down — an R/Python user got an abort instead of an inspectable
+/// fit, and a loop caller lost the entire run over one degenerate draw.
+///
+/// Deliberately written with `catch_unwind` rather than `#[should_panic]`: the
+/// assertion under test is that NO panic happens, so a regression must surface as
+/// a test FAILURE with the panic message attached, not as an abort that takes the
+/// rest of the suite's output with it. `AssertUnwindSafe` is sound here because
+/// nothing observed after the call is shared with the closure — the inputs are
+/// read-only and the `Fit` is moved out.
+#[test]
+fn rank_deficient_random_slope_returns_nonconverged_instead_of_panicking() {
+    let (n_clusters, per) = (8usize, 12usize);
+    let n = n_clusters * per;
+    let p = 3usize;
+    let mut st = 29u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        ids[i] = (i % n_clusters) as u32;
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        x[i * p + 2] = 1.0 + x1; // col2 = col0 + col1 exactly ⇒ aliased at 1e-14
+        y[i] = 0.5 + 0.4 * x1 + 0.3 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![2], // the aliased column, as a random slope
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        ..FitOptions::default()
+    };
+
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fit_cold(&x, &y, n, p, &model, &ids, &opts)
+    }));
+    let f = match caught {
+        Ok(f) => f,
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            panic!("fit_cold panicked on a rank-deficient random slope: {msg}");
+        }
+    };
+
+    assert!(
+        !f.converged(),
+        "an unfittable model must not report converged"
+    );
+    assert!(
+        f.beta.iter().all(|b| b.is_nan()) && f.se.iter().all(|s| s.is_nan()),
+        "β/se must be NaN-filled: beta {:?} se {:?}",
+        f.beta,
+        f.se
+    );
+    assert!(
+        f.vcov.iter().all(|row| row.iter().all(|v| v.is_nan())),
+        "vcov must be NaN-filled"
+    );
+    // The mask is the one diagnostic the caller can act on, so it is reported
+    // rather than blanked — the same field the successful salvage fills.
+    assert_eq!(
+        f.aliased(),
+        vec![false, false, true],
+        "the aliased column is still named"
+    );
+    // θ width for q_p = 2 (intercept + one slope) is vech = 3; NaN-filled, not
+    // dropped, because the RE structure was never reduced.
+    assert_eq!(f.tau2.len(), 3, "tau2 keeps the unreduced θ width");
+    assert!(f.tau2.iter().all(|t| t.is_nan()), "tau2 NaN-filled");
+    assert!(f.dispersion.is_nan() && f.deviance.is_nan() && f.loglik.is_nan());
+    assert_eq!(f.df, 0, "no parameters were estimated");
+    assert!(
+        !f.singular(),
+        "singular is a fitted-boundary flag, not a failure flag"
+    );
+    assert!(f.varcorr.is_empty() && f.fitted.is_empty() && f.ranef.is_empty());
 }
 
 /// Rank-deficiency salvage on a fixed-only design: near-collinear
@@ -232,9 +375,9 @@ fn fit_sim_collinear_drops_the_aliased_column() {
         },
     );
 
-    assert!(f.converged, "reduced fit converges");
+    assert!(f.converged(), "reduced fit converges");
     assert_eq!(
-        f.aliased,
+        f.aliased(),
         vec![false, false, false, true],
         "x3 is the dependent column and the only one dropped"
     );
@@ -312,13 +455,11 @@ fn fit_with_varcorr(vech: Vec<f64>) -> Fit {
         vcov: vec![],
         tau2: vec![],
         dispersion: 1.0,
-        converged: true,
+        diagnostics: crate::Diagnostics::from_flags(true, false, 0),
         varcorr: vec![vech],
         stddev_se: vec![],
-        aliased: vec![],
         n_eval: 0,
         deviance: f64::NAN,
-        singular: false,
         loglik: f64::NAN,
         df: 0,
         reml: false,
@@ -511,8 +652,7 @@ fn spec_sized_from_ids_nested_unbalanced_first_parent_widest() {
     );
 }
 
-/// Mirror of MCPower's `extra_grouping_rejects_too_many_slopes` contract test:
-/// a `q_g = 5` (intercept + 4 slopes) extra grouping is over the `MAX_EXTRA_Q = 4`
+/// A `q_g = 5` (intercept + 4 slopes) extra grouping is over the `MAX_EXTRA_Q = 4`
 /// NoZ-scratch envelope and routes to Sparse (d1 #2). The sparse numeric path
 /// makes this a *supported* design — it routes to Sparse and
 /// `fit_cold` runs the sparse solver (returning a degenerate non-converged `Fit`
@@ -548,7 +688,7 @@ fn fit_extra_grouping_q_too_large_routes_sparse() {
             ..FitOptions::default()
         },
     );
-    assert!(!fit.converged);
+    assert!(!fit.converged());
 }
 
 /// d1 #2: 7 crossed extras exceed `MAX_EXTRA_GROUPINGS = 6`, the NoZ-scratch
@@ -734,7 +874,7 @@ fn fit_cold_equals_fit_warm_none() {
     assert_eq!(bits(&cold.se), bits(&warm_none.se));
     assert_eq!(bits(&cold.tau2), bits(&warm_none.tau2));
     assert_eq!(cold.dispersion.to_bits(), warm_none.dispersion.to_bits());
-    assert_eq!(cold.converged, warm_none.converged);
+    assert_eq!(cold.converged(), warm_none.converged());
 }
 
 /// Warm-path start-independence: on an LMM the MLE is start-independent, so a
@@ -764,7 +904,51 @@ fn fit_warm_start_reaches_cold_beta() {
         theta: vec![5.0],
     };
     let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
-    assert!(cold.converged && warm.converged, "both fits must converge");
+    assert!(
+        cold.converged() && warm.converged(),
+        "both fits must converge"
+    );
+    for j in [1usize, 2] {
+        let (a, b) = (cold.beta[j], warm.beta[j]);
+        let d = (a - b).abs();
+        assert!(
+            d <= 1e-7 || d <= 1e-6 * a.abs().max(b.abs()),
+            "LMM MLE must be start-independent: β[{j}] cold {a} vs warm {b}"
+        );
+    }
+}
+
+/// Same start-independence on the LMM, but from a θ-only start (`beta` empty —
+/// the per-component cold marker the ports need for lme4's
+/// `start = list(theta = …)`). The LMM ignores a β start anyway (β is solved
+/// exactly given θ), so this pins that an empty β is accepted rather than
+/// faulting the entry assert, and that θ still threads through.
+#[test]
+fn fit_warm_theta_only_start_reaches_cold_beta() {
+    let (x, y, n, p) = lmm_hand_dataset();
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 6 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds::from_sizing(model.re.as_ref().unwrap(), n);
+    let opts = FitOptions {
+        target_indices: vec![1, 2],
+        ..FitOptions::default()
+    };
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let start = StartValues {
+        beta: vec![],
+        theta: vec![5.0],
+    };
+    let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+    assert!(
+        cold.converged() && warm.converged(),
+        "both fits must converge"
+    );
     for j in [1usize, 2] {
         let (a, b) = (cold.beta[j], warm.beta[j]);
         let d = (a - b).abs();
@@ -971,7 +1155,7 @@ fn classify_fixed_only_is_noz() {
     ));
 }
 
-/// Tier-0 short-circuit (tiered-optimizer-architecture.md action 1): a fixed-only
+/// Tier-0 short-circuit: a fixed-only
 /// fit (no random effects, no θ to search) must run the direct GLM/OLS path and
 /// enter the BOBYQA search ZERO times. `fit_cold`'s `(family, None)` dispatch arms
 /// route straight to `fit_ols`/`fit_glm`/`fit_glm_nb`, each of which hard-sets
@@ -1106,7 +1290,7 @@ fn vcov_diagonal_is_se_squared_on_every_path() {
         &GroupIds::default(),
         &opts,
     );
-    assert!(ols.converged);
+    assert!(ols.converged());
     assert_vcov_agrees_with_se(&ols, p, "ols");
 
     // LMM — Gaussian, 6 clusters.
@@ -1123,7 +1307,7 @@ fn vcov_diagonal_is_se_squared_on_every_path() {
         }),
     };
     let lmm = fit_cold(&x, &y, n, p, &lmm_model, &ids, &opts);
-    assert!(lmm.converged);
+    assert!(lmm.converged());
     assert_vcov_agrees_with_se(&lmm, p, "lmm");
 
     // GLM / GLMM — Bernoulli response off the same design.
@@ -1143,7 +1327,7 @@ fn vcov_diagonal_is_se_squared_on_every_path() {
         &GroupIds::default(),
         &opts,
     );
-    assert!(glm.converged);
+    assert!(glm.converged());
     assert_vcov_agrees_with_se(&glm, p, "glm");
 
     // GLMM on both SE arms — each sources vcov from a different matrix
@@ -1169,7 +1353,7 @@ fn vcov_diagonal_is_se_squared_on_every_path() {
                 ..FitOptions::default()
             },
         );
-        assert!(glmm.converged, "glmm {wald_se:?} did not converge");
+        assert!(glmm.converged(), "glmm {wald_se:?} did not converge");
         assert_vcov_agrees_with_se(&glmm, p, &format!("glmm {wald_se:?}"));
     }
 }
@@ -1196,7 +1380,7 @@ fn vcov_is_nan_outside_the_target_block() {
             ..FitOptions::default()
         },
     );
-    assert!(fit.converged);
+    assert!(fit.converged());
     assert!(fit.se[2].is_finite() && fit.vcov[2][2].is_finite());
     assert!(fit.se[0].is_nan() && fit.se[1].is_nan());
     for j in [0usize, 1] {
@@ -1240,7 +1424,10 @@ fn vcov_rows_are_nan_for_aliased_columns() {
             ..FitOptions::default()
         },
     );
-    assert!(fit.aliased[3], "duplicate column must be detected aliased");
+    assert!(
+        fit.aliased()[3],
+        "duplicate column must be detected aliased"
+    );
     for i in 0..p {
         assert!(
             fit.vcov[i][3].is_nan(),
@@ -1252,4 +1439,289 @@ fn vcov_rows_are_nan_for_aliased_columns() {
         );
     }
     assert_vcov_agrees_with_se(&fit, p, "aliased");
+}
+
+// ---------------------------------------------------------------------------
+// The public `Diagnostics` surface (0.2.0): the three moved fields, the two
+// reshaped ones, and the notes channel.
+// ---------------------------------------------------------------------------
+
+/// A clean OLS design and a rank-deficient one, each read through BOTH paths —
+/// `fit.diagnostics.<field>` and the forwarding accessor. The point is not the
+/// values (other tests pin those) but that the two paths are the same storage:
+/// if a future change ever re-adds a top-level copy of one of these, one of the
+/// four `assert_eq!`s below stops holding.
+#[test]
+fn diagnostics_moved_fields_agree_through_both_paths() {
+    let (n, p) = (12usize, 3usize);
+    let mut st = 11u64;
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = lcg(&mut st);
+        let b = lcg(&mut st);
+        x.extend_from_slice(&[1.0, a, b]);
+        y.push(0.3 + 1.1 * a - 0.7 * b + 0.05 * ((i % 3) as f64 - 1.0));
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let opts = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        ..FitOptions::default()
+    };
+    let fit = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
+    assert_eq!(fit.diagnostics.converged, fit.converged());
+    assert_eq!(fit.diagnostics.singular, fit.singular());
+    assert_eq!(fit.diagnostics.aliased, fit.aliased());
+    assert!(fit.converged() && !fit.singular());
+    assert_eq!(fit.aliased(), vec![false; p]);
+
+    // Column 2 duplicated onto column 1 ⇒ the alias gate drops it. `aliased` is
+    // the one moved field the alias gate fills from ABOVE the fitting routes,
+    // so it needs its own true-valued case.
+    let mut xd = Vec::with_capacity(n * p);
+    for i in 0..n {
+        let a = x[i * p + 1];
+        xd.extend_from_slice(&[1.0, a, a]);
+    }
+    let dup = fit_cold(&xd, &y, n, p, &model, &GroupIds::default(), &opts);
+    assert_eq!(dup.diagnostics.aliased, dup.aliased());
+    assert_eq!(dup.aliased(), vec![false, false, true]);
+    assert!(dup.converged(), "the reduced model fits");
+}
+
+/// `Boundary` at both ends of the range the dense LMM route can report:
+/// the deterministic τ̂=0 pin fixture (`fit_lmm_weighted_boundary_matches_wls`'s
+/// design, same construction) lands `AtBoundary`, sleepstudy lands `Interior`.
+/// Also pins the one place `singular` and `boundary` are NOT interchangeable —
+/// `singular` additionally carries the post-hoc negligible-component check.
+#[test]
+fn diagnostics_boundary_reports_both_ends() {
+    let n = 48usize;
+    let n_clusters = 6usize;
+    let mut st = 7u64;
+    let mut x = vec![0.0f64; n * 2];
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        ids[i] = (i % n_clusters) as u32;
+        let x1 = lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        // ±0.8 cancels exactly per cluster ⇒ the between-cluster variance MLE
+        // is 0 and the optimizer pins it there.
+        let e = if (i / n_clusters) % 2 == 0 { 0.8 } else { -0.8 };
+        y[i] = 0.5 + 0.4 * x1 + e;
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let pinned = fit_cold(
+        &x,
+        &y,
+        n,
+        2,
+        &model,
+        &GroupIds {
+            primary: ids,
+            extra: vec![],
+        },
+        &opts,
+    );
+    assert!(pinned.converged(), "a boundary fit still converges");
+    assert_eq!(pinned.diagnostics.boundary, Boundary::AtBoundary);
+    assert!(pinned.singular());
+
+    let (xs, ys, ns, ps) = lmm_hand_dataset();
+    let ids_s: Vec<u32> = (0..ns).map(|i| (i % 6) as u32).collect();
+    let interior = fit_cold(
+        &xs,
+        &ys,
+        ns,
+        ps,
+        &ModelSpec {
+            family: Family::Gaussian,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters { n_clusters: 6 },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        },
+        &GroupIds {
+            primary: ids_s,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: (0..ps as u32).collect(),
+            ..FitOptions::default()
+        },
+    );
+    assert!(interior.converged());
+    assert_eq!(interior.diagnostics.boundary, Boundary::Interior);
+    assert!(interior.diagnostics.pinned.is_empty(), "nothing pinned");
+}
+
+/// `pinned[g][i]` must pair with `stddev_corr(g).0[i]` — the whole point of the
+/// alignment. Asserted on the one shape where a wrong
+/// mapping is VISIBLE — a q=2 primary block where the SLOPE component pins and
+/// the intercept stays interior, so swapping the two bits (or reading the vech
+/// off-diagonal as a component) flips the assertion.
+///
+/// The design is `lmm::tests::zero_slope_variance_pins_slope_component`'s,
+/// driven through `fit_cold` instead of the kernel: x1 is a within-cluster
+/// antithetic ±1 pattern carrying a real fixed slope but no cluster-varying
+/// one, and the ±0.8 period-4 residual is in quadrature against it, so every
+/// cluster has Σresid = 0 and Σx1·resid = 0 exactly. The planted u₀ keeps the
+/// intercept component off the boundary.
+#[test]
+fn diagnostics_pinned_aligns_with_varcorr_blocks() {
+    let (nc, per) = (16usize, 16usize);
+    let n = nc * per;
+    let mut st = 5u64;
+    let u0: Vec<f64> = (0..nc).map(|_| 0.6 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * 2];
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for (c, &uc) in u0.iter().enumerate() {
+        for k in 0..per {
+            let i = c * per + k;
+            ids[i] = c as u32;
+            let x1 = if k % 2 == 0 { 1.0 } else { -1.0 };
+            let e = if (k / 2) % 2 == 0 { 0.8 } else { -0.8 };
+            x[i * 2] = 1.0;
+            x[i * 2 + 1] = x1;
+            y[i] = 0.5 + 0.4 * x1 + uc + e;
+        }
+    }
+    let fit = fit_cold(
+        &x,
+        &y,
+        n,
+        2,
+        &ModelSpec {
+            family: Family::Gaussian,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: nc as u32,
+                },
+                slopes: vec![1],
+                extra_groupings: vec![],
+            }),
+        },
+        &GroupIds {
+            primary: ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(fit.converged());
+    assert_eq!(fit.diagnostics.pinned.len(), fit.varcorr.len());
+    let (sd, _) = fit.stddev_corr(0);
+    assert_eq!(fit.diagnostics.pinned[0].len(), sd.len());
+    assert_eq!(
+        fit.diagnostics.pinned[0],
+        vec![false, true],
+        "the SLOPE component is the pinned one; stddev {sd:?}"
+    );
+    // The pairing, stated as the invariant rather than as two literals: the
+    // pinned slot's stddev collapses and the unpinned one's does not.
+    //
+    // NOT exactly zero, and that is not slack in the assertion. The pin fixes
+    // the DIAGONAL θ (λ₁₁ = 0 exactly), while `stddev_corr(0).0[1]` is
+    // √D₁₁ = √(λ₁₀² + λ₁₁²) — so it inherits whatever the off-diagonal λ₁₀
+    // settled on, measured here at 4.4e-9 against a 0.6-scale intercept
+    // component. A q≥2 pinned component reads as negligible, not as 0.0.
+    assert!(
+        sd[1] / sd[0] < 1e-6,
+        "pinned component's stddev must collapse: {sd:?}"
+    );
+    assert!(sd[0] > 0.0, "interior component's stddev is positive");
+}
+
+/// `Note::IllConditioned` through the STABLE entry, positive and negative.
+/// Positive: `x = [1, a, a+δ]` where δ lives entirely on rows carrying weight
+/// 1e-11 — full-rank raw (so the alias gate passes it through untouched) and
+/// near-singular once weighted, which is the case nothing upstream of the fit
+/// can see. Negative: the same design at unit weights raises nothing.
+#[test]
+fn diagnostics_ill_conditioned_note_through_fit_cold() {
+    let (n, p, split) = (60usize, 3usize, 40usize);
+    const WSMALL: f64 = 1e-11;
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    let mut w = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = ((i * 13) % 17) as f64 - 8.0;
+        let delta = if i < split { 0.0 } else { 1.0 };
+        x.extend_from_slice(&[1.0, a, a + delta]);
+        y.push(0.5 + 1.3 * a + 0.477 * (a + delta) + ((i % 3) as f64 - 1.0));
+        w.push(if i < split { 1.0 } else { WSMALL });
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let targets: Vec<u32> = (0..p as u32).collect();
+    let flagged = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: targets.clone(),
+            weights: Some(w),
+            ..FitOptions::default()
+        },
+    );
+    assert!(flagged.converged(), "fit-and-flag: the design is returned");
+    assert_eq!(flagged.aliased(), vec![false; p], "nothing was dropped");
+    assert_eq!(flagged.diagnostics.notes.len(), 1);
+    let Note::IllConditioned { columns, pivot } = &flagged.diagnostics.notes[0] else {
+        panic!(
+            "expected IllConditioned, got {:?}",
+            flagged.diagnostics.notes[0]
+        );
+    };
+    assert_eq!(columns, &vec![2u32], "the later column of the pair");
+    assert!(
+        *pivot < crate::ols::PIVOT_MIN,
+        "the note carries the measured ratio, got {pivot}"
+    );
+
+    let clean = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: targets,
+            ..FitOptions::default()
+        },
+    );
+    assert!(clean.converged());
+    assert!(
+        clean.diagnostics.notes.is_empty(),
+        "unweighted, the same design is well-conditioned"
+    );
+    assert!(clean.diagnostics.pinned.is_empty(), "no RE, nothing to pin");
 }

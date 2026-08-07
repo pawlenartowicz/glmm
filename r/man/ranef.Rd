@@ -3,7 +3,7 @@
 \name{ranef}
 \alias{ranef}
 \alias{ranef.fastglmm}
-\title{Random-effect predictions (not available)}
+\title{Random-effect conditional modes}
 \usage{
 ranef(object, ...)
 
@@ -14,8 +14,24 @@ ranef(object, ...)
 
 \item{...}{unused.}
 }
+\value{
+A named \code{list} of \code{data.frame}s, empty for a fit with no random
+effects or one that did not converge.
+}
 \description{
-Errors: conditional modes are computed inside the kernel but not surfaced
-on \code{glmm::Fit} yet. The engine spec
-\code{2026-07-15-engine-loglik-diagnostics} is what lifts this.
+The conditional modes (BLUPs) \code{b-hat}, in \code{lme4::ranef}'s shape: a named list
+of data frames, one per grouping factor in the order the formula declares
+them, with one row per level and one column per random-effect term.
+}
+\details{
+The labels come from the kernel, not from this package: which internal layout
+a grouping factor lands in is a data-dependent speed decision, so only the
+layer that made it can say which level a number belongs to. Padded slots of a
+nested grouping carry no level and are not reported.
+
+Two differences from \code{lme4::ranef} worth knowing. Conditional variances are
+not computed, so \code{condVar} is not supported. And a grouping level that owns
+model width but no rows is reported with its mode shrunk to zero, where lme4
+has no such row at all; the fit warns about that case
+(\code{fastglmm_unused_grouping_levels}).
 }

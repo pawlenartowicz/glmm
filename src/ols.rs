@@ -76,6 +76,16 @@ pub struct OlsFitView<'a> {
     /// `Σ (yᵢ − ȳ)²`. `NaN` on every non-converged / rank-deficient return.
     /// Computed from the `sum_y` / `yty` running sums.
     pub sst: f64,
+    /// Scale-invariant per-column pivot ratio of the (possibly weighted) Gram
+    /// this fit came from ([`min_pivot_ratio`]), with `pivot_col` the column
+    /// attaining it. **Detection only** — nothing here reads it to accept or
+    /// reject a design, and nothing may start to; the reasoning is recorded at
+    /// the computation site. Below [`PIVOT_MIN`] the coefficients are barely
+    /// identified and the diagnostics channel says so. NaN on every
+    /// non-converged return, where no factor was formed.
+    pub pivot: f64,
+    /// Column attaining `pivot`. Meaningless when `pivot` is NaN.
+    pub pivot_col: u32,
 }
 
 /// Caller-owned scratch for the sufficient-statistics OLS path, parallel in
@@ -257,20 +267,25 @@ fn nonconverged_view<'a>(
         converged: false,
         rss: f64::NAN,
         sst: f64::NAN,
+        pivot: f64::NAN,
+        pivot_col: 0,
     }
 }
 
 /// Min/max diagonal-ratio rank-deficiency test on a Cholesky factor `L`
 /// (`p × p`, lower-triangular). Returns `true` when `L` is degenerate — either
-/// a non-positive max diagonal or `min|L_ii| < eps · max|L_ii|`. Catches the
-/// near-singular grey zone faer's `Llt` accepts numerically but whose inverse
-/// is essentially unbounded (e.g. collinear / duplicated columns).
+/// a non-positive max diagonal or `min|L_ii| < eps · max|L_ii|`.
 ///
-/// `eps` is passed by the caller, not fixed here, because the threshold is
-/// deliberately different across fits: OLS uses `1e-12` (caller-supplied
-/// `eps_rank`), while the mixed models use `1e-8` — looser, because their
-/// per-cluster outer-product downdates of `X'X` amplify near-singularity onto
-/// the diagonal of `L`. Keeping `eps` at the call site preserves that contrast.
+/// **Do not reuse this for new rank guards.** `min|L_ii| / max|L_ii|` is a ratio
+/// ACROSS columns, so it is not scale-invariant: it conflates near-collinearity
+/// with the design's column scaling, and on a design with no collinearity
+/// anywhere it falls by six decades as one column is rescaled while the fitted
+/// β̂ does not move by one part in 1e10. Measured 2026-07-31 on a 1-ULP
+/// perturbation sweep; the OLS, dense-LMM and sparse-LMM guards were moved off
+/// it onto [`min_pivot_ratio`], which is per-column and therefore scale-free.
+/// The one surviving caller is `lme.rs`'s `loop_advanced`-only sufficient-
+/// statistics route, which fits off pre-accumulated sums and was left
+/// unextended.
 pub(crate) fn chol_rank_deficient(factor: MatRef<'_, f64>, p: usize, eps: f64) -> bool {
     let mut max_diag: f64 = 0.0;
     let mut min_diag: f64 = f64::INFINITY;
@@ -336,6 +351,74 @@ pub(crate) fn aliased_columns(gram: MatRef<'_, f64>, p: usize, eps: f64) -> Vec<
     aliased
 }
 
+/// Ill-conditioning DETECTION floor for the OLS and GLM routes, on the
+/// **weighted** Gram `X'WX` (`x_eff = √w·x`, and the converged IRLS `X'WX` for
+/// GLM). Below it the coefficients are barely identified and the diagnostics
+/// channel says so; neither route refuses a design over it.
+///
+/// Calibrated 2026-07-31 against a 1-ULP perturbation sweep. On these two routes
+/// the worst relative movement of β̂ under a ±1-ULP re-rounding of `y` tracks
+/// `1e-15 / pivot` closely — at pivot 7.0e-14 the law predicts 1.4e-2 and 1.3e-2
+/// was measured — so `1e-12` is where β̂ has about three significant digits left.
+///
+/// The weighted-vs-raw distinction is load-bearing: [`aliased_columns`] tests
+/// the RAW `x`, and a design that is full-rank unweighted can be near-singular
+/// once weighted, so this measurement must not inherit that verdict. The sparse
+/// LMM route needs a looser value still and keeps its own constant.
+///
+/// No SOLVER path reads it: the kernels record the raw pivot and the comparison
+/// happens once per route, in `OlsFitView::diagnostics` / `GlmFitView::diagnostics`,
+/// which is what fills `FitDiagnostics::ill_conditioned`.
+pub(crate) const PIVOT_MIN: f64 = 1e-12;
+
+/// Scale-invariant rank statistic of a Cholesky factor `L` (`p × p` leading
+/// block, lower-triangular): the minimum over columns of the Schur pivot divided
+/// by that column's OWN Gram diagonal, plus the column that attains it.
+///
+/// This is the statistic [`aliased_columns`] already tests per column, read
+/// straight off the factor instead of re-derived from the Gram. For an
+/// unpivoted Cholesky in natural column order the two quantities are literally
+/// entries of `L`:
+///
+/// > pivot_d = L_dd²  and  G_dd = Σ_{k ≤ d} L_dk²
+///
+/// (the second is row `d` of `L·Lᵀ` on its diagonal), so the ratio needs no
+/// scratch matrix and no re-factorization — `O(p²)` and allocation-free, which
+/// is why the guards can run it on every fit where `aliased_columns`'s
+/// Gram form would allocate per fit.
+///
+/// Scale-invariant because each column is compared against its own norm:
+/// rescaling one column of `X` scales pivot and diagonal together and leaves the
+/// ratio fixed. That is the property `min|L_ii| / max|L_ii|` lacks; see
+/// [`chol_rank_deficient`].
+///
+/// A non-finite pivot or a non-positive reconstructed diagonal is arithmetic
+/// exhaustion rather than a ratio, and returns `(0.0, d)` — the hardest possible
+/// failure, attributed to the column that produced it. `p == 0` returns
+/// `(f64::INFINITY, 0)`; the callers all reject an empty design earlier.
+pub(crate) fn min_pivot_ratio(factor: MatRef<'_, f64>, p: usize) -> (f64, usize) {
+    let mut min_ratio = f64::INFINITY;
+    let mut min_col = 0usize;
+    for d in 0..p {
+        let mut g_dd = 0.0;
+        for k in 0..=d {
+            let l_dk = factor[(d, k)];
+            g_dd += l_dk * l_dk;
+        }
+        let l_dd = factor[(d, d)];
+        let pivot = l_dd * l_dd;
+        if !g_dd.is_finite() || g_dd <= 0.0 || !pivot.is_finite() {
+            return (0.0, d);
+        }
+        let ratio = pivot / g_dd;
+        if ratio < min_ratio {
+            min_ratio = ratio;
+            min_col = d;
+        }
+    }
+    (min_ratio, min_col)
+}
+
 /// The production OLS fit: Cholesky on accumulated sufficient statistics.
 /// Starts from `(X'X, X'y, y'y, n_rows)` instead of a raw `(X, y)` pair —
 /// this is the cross-N reuse path: each successive call sees a strictly larger
@@ -348,7 +431,6 @@ pub(crate) fn aliased_columns(gram: MatRef<'_, f64>, p: usize, eps: f64) -> Vec<
 /// - `yty`: scalar `y'y`.
 /// - `n_rows`: number of rows accumulated into `xtx`/`xty`/`yty`.
 /// - `target_indices`: per-coefficient indices into β̂ to test.
-/// - `eps_rank`: rank-deficiency threshold on `min|L_diag| / max|L_diag|`.
 /// - `xtx_work`: `P × P` scratch buffer — `xtx_lower` is copied here because
 ///   faer's Cholesky reads the input matrix.
 /// - `scratch`: caller-owned scratch from `SimWorkspace`.
@@ -363,7 +445,6 @@ pub fn fit_suff_stats_t_sq<'a>(
     sum_y: f64,
     n_rows: usize,
     target_indices: &[u32],
-    eps_rank: f64,
     mut xtx_work: MatMut<'_, f64>,
     scratch: OlsScratch<'a>,
 ) -> OlsFitView<'a> {
@@ -426,20 +507,26 @@ pub fn fit_suff_stats_t_sq<'a>(
         }
     };
 
-    // Materialize L (owned Mat; strict upper triangle zeroed) and run the
-    // rank-deficiency check on its diagonal via the min/max diagonal-ratio
-    // rule. (`Llt::new(...)` already rejects strictly non-PD inputs; this
-    // extra band catches the near-singular grey zone.)
+    // Materialize L (owned Mat; strict upper triangle zeroed) and MEASURE its
+    // conditioning. `Llt::new(...)` has already rejected strictly non-PD inputs;
+    // what remains is the near-singular grey zone it accepts, and this route
+    // does not refuse any of it.
+    //
+    // A `min|L_ii| / max|L_ii|` guard is wrong twice over: it never fires on
+    // the designs it would exist for (measured 4.8e-8 on a weighted-collinear
+    // design, four orders above a 1e-12 threshold), and refusing is the wrong
+    // response anyway. Measured 2026-07-31 on a 1-ULP
+    // perturbation sweep down past total loss of β̂: the standard errors stay
+    // stable to 1.3e-13 relative and never understate the actual error — at the
+    // bottom of the sweep the route reports β̂ = 7.11 for a true 0.5 with an SE
+    // of 6.1e5. The SE column already tells the caller the estimate is
+    // worthless, so refusing would destroy the coefficients for no gain.
+    //
+    // The Gram behind `l` is the WEIGHTED one, and that is the point: the
+    // pre-dispatch alias gate tests the raw `x` and cannot see a design that
+    // only goes singular under `W`.
     let l = chol.L();
-    if chol_rank_deficient(l, p, eps_rank) {
-        return nonconverged_view(
-            &fit_betas[..p],
-            &fit_var_diag[..t],
-            &fit_t_sq[..t],
-            fit_factor.into_const(),
-            (n - p) as u32,
-        );
-    }
+    let (pivot, pivot_col) = min_pivot_ratio(l, p);
 
     // Copy L into the caller-owned `fit_factor` so the returned view borrows
     // workspace storage rather than the locally-owned `l` Mat.
@@ -506,6 +593,8 @@ pub fn fit_suff_stats_t_sq<'a>(
         converged: true,
         rss,
         sst,
+        pivot,
+        pivot_col: pivot_col as u32,
     }
 }
 
@@ -821,7 +910,6 @@ mod tests {
             ws.suff_sum_y,
             ws.suff_n_rows,
             &targets,
-            1e-12,
             ws.suff_xtx_work.as_mut(),
             scratch,
         );
@@ -894,7 +982,6 @@ mod tests {
             ws.suff_sum_y,
             ws.suff_n_rows,
             &[1, 2, 3],
-            1e-12,
             ws.suff_xtx_work.as_mut(),
             scratch,
         );
@@ -942,6 +1029,8 @@ mod tests {
             converged: true,
             rss: 0.0,
             sst: 0.0,
+            pivot: 1.0,
+            pivot_col: 0,
         };
 
         let mut scratch = vec![0.0_f64; p];
@@ -994,7 +1083,6 @@ mod tests {
             ws.suff_sum_y,
             ws.suff_n_rows,
             &[0, 1],
-            1e-12,
             ws.suff_xtx_work.as_mut(),
             scratch,
         );
@@ -1031,6 +1119,8 @@ mod tests {
             converged: false,
             rss: f64::NAN,
             sst: f64::NAN,
+            pivot: f64::NAN,
+            pivot_col: 0,
         };
         let mut scratch = vec![0.0_f64; p];
         let got = ols_contrast_t_sq(&fit, 0, 1, &mut scratch);
@@ -1039,18 +1129,19 @@ mod tests {
 
     #[test]
     fn suff_stats_rank_deficiency_detected() {
-        // Two collinear columns — the suff-stats fit must classify this as non-converged.
+        // A structurally degenerate design — the suff-stats fit must classify
+        // this as non-converged.
         let n = 50;
         let p = 3;
         let x = build_x(n, p, |i, j| match j {
             0 => 1.0,
             1 => (i as f64) * 0.1,
-            // Zero column → exactly-zero X'X diagonal → zero Cholesky pivot,
-            // robustly rank-deficient (faer's LLT rejects it as non-PD, else
-            // chol_rank_deficient catches min|L_ii| < eps·max|L_ii|). An
-            // exact-duplicate column instead leaves a ~1e-7 roundoff pivot that
-            // can drift above eps_rank=1e-12 into the near-singular grey zone;
-            // a zero column avoids it.
+            // Zero column → exactly-zero X'X diagonal → zero Cholesky pivot, so
+            // faer's LLT rejects it as non-PD. That rejection is the only thing
+            // this route refuses on: near-singularity short of it is measured
+            // and reported, not refused. An exact-duplicate column instead
+            // leaves a ~1e-7 roundoff pivot that LLT accepts, and is FITTED
+            // with a huge SE — a different test.
             _ => 0.0,
         });
         let y: Vec<f64> = (0..n).map(|i| (i as f64) * 0.3).collect();
@@ -1082,7 +1173,6 @@ mod tests {
             sum_y_val,
             n_rows_val,
             &targets,
-            1e-12,
             ws_su.suff_xtx_work.as_mut(),
             scratch,
         );
@@ -1106,14 +1196,15 @@ mod tests {
     /// internals per fit, pinned so a faer upgrade that regresses the warm
     /// path fails loudly here instead of surfacing as a benchmark mystery.
     ///
-    /// `#[ignore]` because `dhat::Profiler` measures process-wide allocations
-    /// and must run single-threaded:
-    ///   `cargo test -p glmm --features alloc-tests fit_suff_stats_warm_path_bounded_alloc -- --ignored --test-threads=1`
+    /// `#[ignore]` because `dhat::Profiler` measures process-wide allocations;
+    /// `alloc_test_guard` serializes it against the other `#[ignore]` tests:
+    ///   `cargo test -p glmm --features alloc-tests fit_suff_stats_warm_path_bounded_alloc -- --ignored`
     /// (`alloc-tests` installs the dhat global allocator the profiler requires.)
     #[cfg(feature = "alloc-tests")]
     #[test]
     #[ignore]
     fn fit_suff_stats_warm_path_bounded_alloc() {
+        let _serial = crate::test_support::alloc_test_guard();
         // 2 blocks/fit measured on faer 0.24 (`llt` factor + `L()` internals);
         // no one-time block — the GEMM-backend lazy init lands in the warmup
         // call outside the profiler window.
@@ -1157,15 +1248,16 @@ mod tests {
                 ws.suff_sum_y,
                 ws.suff_n_rows,
                 &targets,
-                1e-12,
                 ws.suff_xtx_work.as_mut(),
                 scratch,
             );
             assert!(fit.converged);
         };
 
-        // Warm everything once outside the measured window.
+        // Warm everything once outside the measured window, then wait out the
+        // rayon worker startup that warmup kicks off on other threads.
         run_fit(&mut ws);
+        crate::test_support::settle_background_allocs();
 
         let profiler = dhat::Profiler::builder().testing().build();
         for _ in 0..N_CALLS {

@@ -19,7 +19,7 @@ use faer::linalg::matmul::{matmul, triangular};
 use faer::reborrow::{IntoConst, Reborrow, ReborrowMut};
 use faer::{Accum, MatMut, MatRef, Par};
 
-use crate::ols::{chol_rank_deficient, OlsScratch, PANEL_ROWS};
+use crate::ols::{chol_rank_deficient, PANEL_ROWS};
 use crate::FLOAT_NEAR_ZERO;
 
 /// Maximum Brent-loop iterations before declaring non-convergence.
@@ -76,17 +76,14 @@ pub struct LmeSuffStats<'w> {
 /// Per-simulation scratch for the LME Brent solver and inference.
 ///
 /// `LmeScratch` is built at the call site by reborrowing fields of
-/// `SimWorkspace`. The nested `ols_scratch` aliases the same workspace storage
-/// so the `boundary_hit = 1` OLS fallback can call `fit_suff_stats_t_sq`
-/// without a second accumulator.
+/// `SimWorkspace`, so every buffer below aliases workspace storage rather than
+/// owning it.
 ///
-/// Note on `xtx`/`xty`/`yty`: these are exposed as read-only borrows of the
-/// workspace's `lme_xtx`/`lme_xty`/`lme_yty` (the suff-stats accumulator
-/// targets). `OlsScratch` does not expose X'X / X'y / y'y directly (those
-/// live in `OlsSuffStats`, which is used at suff-stats build time only). The
-/// τ̂≈0 OLS fallback routes its inputs through `OlsSuffStats` over the same
-/// `lme_xtx`/`lme_xty`/`lme_yty` storage — so the duplication here is just
-/// a read-only view, not a second accumulator.
+/// There is no separate OLS fallback path: the τ̂≈0 case (`boundary_hit = 1`)
+/// skips Brent and pins θ at `LOG_THETA_LOW.exp()`, then runs the SAME
+/// `profiled_deviance` + β̂/Var recovery as an interior optimum (`lme_fit` step 6
+/// onward) — at that θ the LME arithmetic degenerates to OLS on its own. No
+/// `ols.rs` fit entry point is called from this file at any point.
 pub struct LmeScratch<'w> {
     /// `P × P` X'X accumulator (lower triangle) — read-only here, written by
     /// `LmeSuffStats::add_rows`. Borrowed from workspace's `lme_xtx`.
@@ -96,10 +93,6 @@ pub struct LmeScratch<'w> {
     pub xty: &'w [f64],
     /// Scalar y'y — read-only here, written by `LmeSuffStats::add_rows`.
     pub yty: f64,
-    /// X'X / X'y / y'y aliased through this nested `OlsScratch` for the
-    /// `boundary_hit = 1` (τ̂≈0) OLS fallback. Built from the same workspace
-    /// storage — no double accumulation.
-    pub ols_scratch: OlsScratch<'w>,
     /// `P × max_n_clusters` per-cluster sum of X (read-only after suff-stats build).
     pub sum_xc: MatRef<'w, f64>,
     /// Length-`max_n_clusters` per-cluster sum of y.
@@ -1046,15 +1039,20 @@ pub fn lme_fit<'a>(
     };
     let pin_dev = profiled_deviance(pin_theta, &mut scratch);
     n_evals += 1;
-    // Rank-deficiency check on the pinning Cholesky factor — mirrors
-    // `ols.rs::fit_suff_stats_t_sq`'s min/max diag ratio test. Catches the
-    // grey-zone case where faer's Cholesky succeeds numerically on a
-    // collinear X (e.g. duplicated columns) but the inverse is essentially
-    // unbounded. We use a slightly looser threshold than OLS's 1e-12 because
-    // the LME formulation downdates X'X with per-cluster outer products,
-    // which can amplify near-singularity onto the diagonal of L.
-    const EPS_RANK: f64 = 1e-8;
-    let rank_deficient = chol_rank_deficient(scratch.xtvix_factor.rb(), p, EPS_RANK);
+    // Rank-deficiency check on the pinning Cholesky factor, on `min|L_ii| /
+    // max|L_ii|`. Catches the grey-zone case where faer's Cholesky succeeds
+    // numerically on a collinear X (e.g. duplicated columns) but the inverse is
+    // essentially unbounded.
+    //
+    // This is the LAST route still on that statistic — see `ols::chol_rank_deficient`
+    // for why it is not scale-invariant and was moved off elsewhere. The route
+    // was left alone deliberately: it is `loop_advanced`-only, and it has no raw
+    // design to work with at all. `_x`/`_y` are unused and it fits off
+    // pre-accumulated sufficient statistics, so neither a column-drop salvage
+    // nor a per-column pivot on the ORIGINAL design is reachable from here
+    // without a re-architecture. Anyone extending it should move it onto the
+    // pivot ratio.
+    let rank_deficient = chol_rank_deficient(scratch.xtvix_factor.rb(), p, crate::lmm::EPS_RANK);
     if !pin_dev.is_finite() || rank_deficient {
         nan_fill_outputs(&mut scratch, p, target_indices);
         let factor = scratch.xtvix_factor.into_const();
@@ -2338,9 +2336,9 @@ mod tests {
 
     /// Bounded-allocation warm-path test (mirrors `ols.rs`'s
     /// `fit_suff_stats_warm_path_bounded_alloc`). Marked `#[ignore]` because
-    /// `dhat::Profiler` measures process-wide allocations and concurrent tests
-    /// contaminate the count. Run explicitly:
-    ///   `cargo test -p glmm --features alloc-tests lme_fit_warm_path_bounded_alloc -- --ignored --test-threads=1`
+    /// `dhat::Profiler` measures process-wide allocations; `alloc_test_guard`
+    /// serializes it against the other `#[ignore]` tests. Run explicitly:
+    ///   `cargo test -p glmm --features alloc-tests lme_fit_warm_path_bounded_alloc -- --ignored`
     /// (`alloc-tests` installs the dhat global allocator the profiler requires.)
     ///
     /// `BOUND` locks the measured warm-path block count. Each `profiled_deviance`
@@ -2357,6 +2355,7 @@ mod tests {
     #[test]
     #[ignore]
     fn lme_fit_warm_path_bounded_alloc() {
+        let _serial = crate::test_support::alloc_test_guard();
         use faer::Mat;
 
         const N: usize = 60;

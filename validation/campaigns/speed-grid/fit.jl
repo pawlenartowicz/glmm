@@ -5,6 +5,16 @@
 # pinned env: julia --project=GLMM/validation GLMM/validation/campaigns/speed-grid/fit.jl
 using MixedModels, CSV, DataFrames, JSON3, LinearAlgebra
 
+# Per-cell hard timeout, enforced from inside Julia: run.sh's watchdog only
+# notices a stuck cell via OUT's mtime and kills the whole process, losing
+# nothing already flushed but requiring an external kill -9. A task that runs
+# long inside dofit! (as opposed to hanging) still finishes eventually and
+# writes a normal record, so BUDGET here is a true per-cell cap, not a race
+# with the bash watchdog -- both exist because neither alone covers every
+# failure mode (bash: process wedged with no exception; this: fit spins past
+# budget but never throws).
+const CELL_BUDGET_S = parse(Float64, get(ENV, "GRID_CELL_BUDGET", "240"))
+
 manifest_path = get(ENV, "GRID_MANIFEST", joinpath(@__DIR__, "manifest.json"))
 out_path = get(ENV, "GRID_OUT", joinpath(@__DIR__, "results", "mixedmodels_shipped.jsonl"))
 tag = get(ENV, "GRID_CONFIG_TAG", "")
@@ -86,6 +96,12 @@ function fit_cell(cell)
     # column-major lower-triangle vech per reterm, MM's term order (descending
     # level count — NOT formula order); re_groups/re_qs make the mapping to
     # glmm's declaration-order layout explicit downstream.
+    wall = build_seconds + t.time
+    # Soft, post-hoc budget: MixedModels' single fit! call can't be
+    # preempted mid-optimization any more than glmm's BOBYQA can (same
+    # constraint as run.sh's top comment), so this can only reclassify a
+    # cell that already finished over budget -- it does not bound wall time.
+    status = wall > CELL_BUDGET_S ? "timeout" : status
     (optimizer = string(m.optsum.optimizer), n_eval = m.optsum.feval,
      converged = conv, singular = issingular(m), deviance = objective(m),
      beta = collect(coef(m)), se = collect(stderror(m)),
@@ -94,8 +110,26 @@ function fit_cell(cell)
      re_qs = [size(t.λ, 1) for t in m.reterms],
      varcomp = fam == "gaussian" ? varcomp_of(m) : NamedTuple[],
      status = status,
-     wall_seconds = build_seconds + t.time, compile_seconds = t.compile_time)
+     wall_seconds = wall, compile_seconds = t.compile_time)
 end
+
+# JSON has no NaN/Inf literal -- JSON3.write throws LoadError on one, which
+# (unlike an exception from fit_cell) isn't caught by the try/catch below
+# because it happens on the write, after fit_cell has already returned
+# successfully. A degenerate/near-boundary fit (e.g. a near-zero variance
+# component) can leave stderror() or objective() non-finite without fit_cell
+# ever throwing, so check explicitly rather than relying on the catch.
+has_nonfinite(x::Real) = !isfinite(x)
+has_nonfinite(x::AbstractArray) = any(has_nonfinite, x)
+has_nonfinite(x::NamedTuple) = any(has_nonfinite, values(x))
+has_nonfinite(x) = false
+
+fail_record(base) = merge(base, (optimizer = "", n_eval = 0, converged = false,
+                                  singular = false, deviance = nothing,
+                                  beta = Float64[], se = Float64[],
+                                  theta = Float64[], re_groups = String[], re_qs = Int[],
+                                  varcomp = NamedTuple[],
+                                  status = "engine-fail", wall_seconds = 0.0))
 
 open(out_path, "a") do io
     for cell in manifest.cells
@@ -105,15 +139,16 @@ open(out_path, "a") do io
         base = (case_id = cid, seed = cell.seed, engine = "mixedmodels",
                 config_tag = tag)
         rec = try
-            merge(base, fit_cell(cell))
+            fitted = fit_cell(cell)
+            if has_nonfinite(fitted)
+                @warn "non-finite fit result, recording as engine-fail" cid
+                fail_record(base)
+            else
+                merge(base, fitted)
+            end
         catch err
             @warn "engine-fail" cid err = sprint(showerror, err)
-            merge(base, (optimizer = "", n_eval = 0, converged = false,
-                         singular = false, deviance = nothing,
-                         beta = Float64[], se = Float64[],
-                         theta = Float64[], re_groups = String[], re_qs = Int[],
-                         varcomp = NamedTuple[],
-                         status = "engine-fail", wall_seconds = 0.0))
+            fail_record(base)
         end
         println(io, JSON3.write(rec))
         flush(io)   # line-per-fit flush: the watchdog watches mtime

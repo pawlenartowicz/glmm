@@ -2,6 +2,10 @@
 //! `loop_advanced`-gated LMM sweep/refit dev-seam tests.
 
 use super::*;
+// The loop-tier entries reached through the module rather than the re-export,
+// which is `loop_advanced`-gated: the pivot the region-2 tests below assert on
+// is recorded on every route, so these must run under default features too.
+use super::core::{build_workspace, fit_on};
 use crate::lmm::{fit_lmm, LmmWorkspace};
 use crate::{
     Family, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing, StartValues,
@@ -17,7 +21,7 @@ use super::common_tests::{assert_pinned, dense_str, lcg, PIN_REL_ITER};
 use super::loop_advanced_seam::{build_lmm_workspace, refit_lmm};
 
 use super::lmm::{lmm_run_on, lmm_view_to_fit};
-use crate::test_support::assert_near;
+use crate::test_support::{assert_near, intercept_only_spec};
 
 /// `lmm_run_on` + `lmm_view_to_fit` on a hand-accumulated workspace must
 /// reproduce the `Fit` that `fit_cold` produces for the same single-random-
@@ -72,7 +76,7 @@ fn lmm_run_on_view_maps_to_same_fit_as_fit_cold() {
         .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], None);
     let via = {
         let v = lmm_run_on(&mut ws, &opts.target_indices, None);
-        lmm_view_to_fit(&v, n, p, &opts)
+        lmm_view_to_fit(&v, &x, &ids, n, p, &opts)
     };
     assert_near(&cold.beta, &via.beta, "beta");
     assert_near(&cold.tau2, &via.tau2, "tau2");
@@ -151,9 +155,9 @@ fn fit_lmm_rank_deficient_drops_the_aliased_column() {
         },
     );
 
-    assert!(f.converged, "reduced LMM must converge");
+    assert!(f.converged(), "reduced LMM must converge");
     assert_eq!(
-        f.aliased,
+        f.aliased(),
         vec![false, false, false, true],
         "x3 is the dependent column and the only one dropped"
     );
@@ -164,6 +168,598 @@ fn fit_lmm_rank_deficient_drops_the_aliased_column() {
     // Varcomp of the reduced fit passes through the salvage unchanged.
     assert_pinned(&f.tau2, &[REF_G_TAU2], PIN_REL_ITER, "tau2");
     assert_pinned(&[f.dispersion], &[REF_SIGMA2], PIN_REL_ITER, "sigma2");
+}
+
+// ---------------------------------------------------------------------------
+// Ill-conditioned but computable — the designs that must be FITTED, not refused
+//
+// Both designs below clear the alias gate (`detect_aliased`, X'X,
+// `ALIAS_EPS = 1e-14`): nothing in them is redundant in f64, so there is no
+// column whose removal is the right answer. They are merely badly conditioned,
+// which means the fit is computable and unique and the honest expression of the
+// imprecision is a large standard error. Both used to be discarded — one
+// NaN-filled, the other had a column silently dropped — by a rank guard whose
+// statistic (`min|L_ii| / max|L_ii|` on X'V⁻¹X) measured column SCALE rather
+// than collinearity. That guard is gone: the dense-LMM route refuses no design
+// on conditioning grounds at all, and instead records the scale-invariant
+// per-column pivot ratio for the diagnostics channel to flag below
+// `lmm::PIVOT_MIN = 1e-12`. Neither design reaches even that.
+//
+// Designs generated from a 16-bit LCG (`s <- (75s + 74) mod 65537`, value
+// `s/65537 - 0.5`); every intermediate is below 2^53, so the stream is exact in
+// f64 and the R reference builder reproduces it bit for bit.
+// ---------------------------------------------------------------------------
+
+/// `s_{k+1} = (75·s_k + 74) mod 65537`, value `s/65537 − 0.5`. Local to the Gap A
+/// designs (the shared `lcg` helper is a different, 64-bit generator).
+fn gap_a_stream(k: usize) -> Vec<f64> {
+    let mut s = 1u64;
+    (0..k)
+        .map(|_| {
+            s = (75 * s + 74) % 65537;
+            s as f64 / 65537.0 - 0.5
+        })
+        .collect()
+}
+
+fn intercept_only_lmm() -> ModelSpec {
+    // Placeholder sizing — `spec_sized_from_ids` derives the real count.
+    intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 })
+}
+
+/// PURE DYNAMIC RANGE — no collinearity anywhere, and the fit must come out
+/// whole. `y ~ 1 + u + w + (1|g)`, J=25 × m=40. `u` is CLUSTER-LEVEL at scale
+/// 3e-7, `w` is WITHIN-CLUSTER mean-zero at scale 20. V⁻¹ divides the
+/// cluster-level block by `sqrt(1 + m·λ²)` (λ̂ ≈ 14.7 ⇒ 93×) and leaves the
+/// within-cluster block alone, so the min/max L-diagonal ratio of X'V⁻¹X lands
+/// at 1.6e-10 while X'X's own ratio (1.5e-8) is four orders clear of even the
+/// OLS guard.
+///
+/// This is the control that condemned the old statistic. Every per-column pivot
+/// ratio here is O(1) (1.0, 0.235, 1.0) — the columns are mutually
+/// distinguishable to full precision — yet the min/max L-diagonal ratio sits at
+/// 1.6e-10 purely because one column is 8 orders smaller than another. The old
+/// guard therefore threw the whole fit away over a choice of units: rescaling
+/// `u` alone moved its statistic by six decades while β̂ did not move by one part
+/// in 1e10 (measured 2026-07-31 across `c` = 1e-4 … 1e-10).
+///
+/// So the fit must converge with all three columns, and `u`'s coefficient must
+/// carry an enormous standard error — that SE is the correct report on a column
+/// whose entries are 3e-7, not a defect. The signal is well-conditioned even
+/// though the COLUMN is tiny (β_u enters `y` as 2 on `u/c`), so the estimate
+/// must also stay within a standard error of the truth `2/c`.
+///
+/// The assertions below are against the data-generating truth, which is what a
+/// default-tier test can check without a reference. The cross-engine check on
+/// the same fit is the `sim_dynrange_lmm` golden: this design is emitted
+/// bit-identically as `validation/data/simulated/sim_dynrange_lmm.csv` by
+/// `validation/prep/gen_illcond_data.R`, and `tests/validation_oracle.rs` bands
+/// its β, SE, σ̂, log-likelihood and variance components against lme4 on the FULL
+/// three-column design at `validation/tol.R`'s cross-engine tolerances. That
+/// golden exists because of this change: while the design NaN-filled there was
+/// nothing for a reference to agree with. The two engines land within 6e-11 on β
+/// and 1.1e-7 on the SEs — this design is ill-conditioned in the old statistic's
+/// eyes only, and both engines say so.
+#[test]
+fn lmm_pure_dynamic_range_design_fits_in_full() {
+    let (jn, m, c, s_scale, tau, sigma) = (25usize, 40usize, 3e-7f64, 20.0f64, 16.0f64, 1.0f64);
+    let (n, p) = (jn * m, 3usize);
+    let g = gap_a_stream(jn);
+    let h = gap_a_stream(n);
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for (j, &g_j) in g.iter().enumerate().take(jn) {
+        let u_j = c * ((j + 1) as f64 / jn as f64);
+        let b_j = tau * g_j;
+        for i in 0..m {
+            let r = j * m + i;
+            let w_i = s_scale * (i as f64 / m as f64 - (m as f64 - 1.0) / (2.0 * m as f64));
+            x[r * p] = 1.0;
+            x[r * p + 1] = u_j;
+            x[r * p + 2] = w_i;
+            // u enters the response at unit scale (β_u = 2 on u/c), so the
+            // signal is well-conditioned even though the COLUMN is tiny.
+            y[r] = 1.0 + 2.0 * (u_j / c) + 0.5 * w_i + b_j + sigma * h[r];
+            ids[r] = j as u32;
+        }
+    }
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, n, p, &intercept_only_lmm(), &ids, &opts);
+
+    assert!(
+        f.converged(),
+        "nothing is collinear here — the design is computable and must fit"
+    );
+    assert_eq!(
+        f.aliased(),
+        vec![false; p],
+        "nothing was dropped, so nothing may be flagged aliased"
+    );
+    assert!(
+        f.beta.iter().all(|b| b.is_finite()) && f.se.iter().all(|s| s.is_finite()),
+        "the full fit must be finite throughout, got β = {:?}, se = {:?}",
+        f.beta,
+        f.se
+    );
+    // The scale-driven imprecision lands where it belongs: on `u`'s SE, which is
+    // ~1e7 because the column's entries are ~3e-7. The two ordinary columns keep
+    // ordinary SEs, so the report is not "everything is uncertain".
+    assert!(
+        f.se[1] > 1e6,
+        "u's SE must carry the imprecision, got {}",
+        f.se[1]
+    );
+    assert!(
+        f.se[0] < 10.0 && f.se[2] < 1.0,
+        "the well-scaled columns keep ordinary SEs, got {:?}",
+        f.se
+    );
+    // β_u is estimable to within its own SE of the DGP truth 2/c — the fit is
+    // imprecise, not wrong.
+    assert!(
+        (f.beta[1] - 2.0 / c).abs() < f.se[1],
+        "β_u = {} must sit within one SE ({}) of the truth {}",
+        f.beta[1],
+        f.se[1],
+        2.0 / c
+    );
+    // `w` is the well-conditioned column; its coefficient is pinned tightly.
+    assert!(
+        (f.beta[2] - 0.5).abs() < 0.01,
+        "β_w = {} must recover the truth 0.5",
+        f.beta[2]
+    );
+    assert!(f.df > 0, "a converged fit reports its parameter count");
+
+    // The flag itself. This design is the control that condemned the old
+    // statistic, so the verdict under the NEW one must be "not flagged": no
+    // note on the stable surface, and a recorded pivot ratio nowhere near
+    // `PIVOT_MIN`. Without this the 0.235 quoted above could drift to anything
+    // and every other assertion here would still pass.
+    assert!(
+        f.diagnostics.notes.is_empty(),
+        "no column is entangled here, so no note may be raised: {:?}",
+        f.diagnostics.notes
+    );
+    let sized = spec_sized_from_ids_pub(&intercept_only_lmm(), &ids);
+    let mut ws = build_workspace(&sized, n, p, &opts);
+    let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
+    assert!(!d.ill_conditioned, "pivot {} must clear the floor", d.pivot);
+    // Band, not a pin: the doc comment above quotes 0.235 as the minimum
+    // per-column pivot ratio, and the point is that it is O(1) rather than the
+    // 1.6e-10 the old min/max statistic reported on the same fit.
+    assert!(
+        (0.2..0.3).contains(&d.pivot),
+        "min pivot ratio must stay at the quoted 0.235, got {}",
+        d.pivot
+    );
+}
+
+/// The entangled-pair design, shared by the two tests below.
+/// Returns `(x, y, ids, n, p)`.
+///
+/// `y ~ 1 + t + v + z [+ s] + (1|g)`, J=25 × m=40, every predictor within-cluster
+/// mean-zero:
+///   * `t` at scale `20·rho` (rho = 1e-5) — a mean-centred LCG pattern
+///   * `v = t·(1 + d·(−1)^i)` (d = 3e-6) — near-collinear with `t`, but four
+///     orders clear of `ALIAS_EPS`, so it is entangled with `t`, not redundant
+///     with it, and no gate drops it
+///   * `z` at scale 20 — the ramp; sets the max L-diagonal
+///   * `s = 1 + z` (only when `with_exact_alias`) — EXACTLY dependent on columns
+///     0 and 3, so `detect_aliased` catches it at `ALIAS_EPS` and the alias gate
+///     fires before the solver ever runs
+///
+/// With `with_exact_alias = true` the leading four columns are BIT-IDENTICAL to
+/// the `false` design, so the second test's post-drop fit is the same fit the
+/// first test performs — the two tests' numbers must agree exactly.
+fn build_gap_a_salvage_design(
+    with_exact_alias: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<u32>, usize, usize) {
+    let (jn, m, s_scale, tau, sigma) = (25usize, 40usize, 20.0f64, 16.0f64, 1.0f64);
+    let (d, rho) = (3e-6f64, 1e-5f64);
+    let n = jn * m;
+    let p = if with_exact_alias { 5 } else { 4 };
+    let s_small = s_scale * rho;
+    let g = gap_a_stream(jn);
+    // One stream, split: h[..n] shapes `t`, h[n..] is the residual noise. Reusing
+    // the same slice for both would make the noise collinear with `t` and drive
+    // σ̂² to zero.
+    let h = gap_a_stream(2 * n);
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for (j, &g_j) in g.iter().enumerate().take(jn) {
+        let b_j = tau * g_j;
+        let t_bar = h[j * m..j * m + m].iter().sum::<f64>() / m as f64;
+        for i in 0..m {
+            let r = j * m + i;
+            // z: the ramp. t: a DIFFERENT within-cluster mean-zero pattern, so t
+            // and z are not collinear with each other — only t and v are.
+            let z_i = s_scale * (i as f64 / m as f64 - (m as f64 - 1.0) / (2.0 * m as f64));
+            let t_i = s_small * (h[r] - t_bar);
+            let v_i = t_i * (1.0 + d * if i % 2 == 0 { 1.0 } else { -1.0 });
+            x[r * p] = 1.0;
+            x[r * p + 1] = t_i;
+            x[r * p + 2] = v_i;
+            x[r * p + 3] = z_i;
+            if with_exact_alias {
+                x[r * p + 4] = 1.0 + z_i;
+            }
+            y[r] = 1.0 + (1.0 / s_small) * t_i + 0.5 * z_i + b_j + sigma * h[n + r];
+            ids[r] = j as u32;
+        }
+    }
+    (x, y, ids, n, p)
+}
+
+/// ENTANGLED PAIR — distinguishable in f64, so the full model is what comes
+/// back. `y ~ 1 + t + v + z + (1|g)`, J=25 × m=40, all three predictors
+/// WITHIN-CLUSTER mean-zero:
+///   * `t` at scale `20·rho` (rho = 1e-5),
+///   * `v = t·(1 + d·(−1)^i)` (d = 3e-6) — near-collinear with `t`,
+///   * `z` at scale 20 — the large column that sets the max L-diagonal.
+///
+/// Three measured margins, all ≥ 100× (the flakiness floor from the sensitivity
+/// analysis: the alias pivot is a cancelled quantity, and this crate already
+/// carries pin failures from that class of FP drift):
+///   * alias gate must NOT trip — `v`'s X'X pivot ratio 8.98e-12 vs 1e-14: 898×
+///   * the design is not even flagged — `v`'s pivot ratio in X'V⁻¹X is 8.76e-12,
+///     8.76× above `lmm::PIVOT_MIN`
+///   * the old min/max L-diag statistic sat at 2.96e-11, 338× INSIDE the old
+///     `EPS_RANK`, and threw the fit away — the whole gap between the two
+///     verdicts on one design
+///
+/// `t` and `v` are not separately identified to any useful precision, and the
+/// fit says so: each gets a coefficient near ±3.8e7 with a standard error of the
+/// same size. That is the deliverable. It is also where lme4 already was — it
+/// fits all four columns of this design with the same ±3.8e7 blow-up — so the
+/// crate now agrees with the reference on the column set instead of returning a
+/// three-column model lme4 never proposed.
+///
+/// The pair sits in the within-cluster block deliberately. V⁻¹ downdates the
+/// cluster-level block with per-cluster outer products, and on a near-collinear
+/// CLUSTER-LEVEL pair that downdate cancels away the pivot entirely: the
+/// deviance re-eval at θ̂ returns infinity and the rank guard never runs, so such
+/// a design is not a witness for this branch at all. The within-cluster block is
+/// untouched by the downdate.
+///
+/// Reference values are lme4's on the FULL four-column design — the same design
+/// this test fits, column for column. That is what makes the entangled pair
+/// itself assertable: until this release the crate returned a three-column
+/// model lme4 never proposed, so there was nothing to compare the pair against
+/// and the test could only band the unentangled columns and the identified sum
+/// against lme4 on an explicitly-reduced design. Bands are `validation/tol.R`'s
+/// cross-engine ones, unchanged.
+///
+/// The provenance, since these constants are frozen in-crate rather than under
+/// `validation/goldens/`: the design is emitted as
+/// `validation/data/simulated/sim_entangled_pair_lmm.csv` by
+/// `validation/prep/gen_illcond_data.R`, whose generator arithmetic is
+/// bit-identical to [`build_gap_a_salvage_design`] above (verified over all 4000
+/// doubles) and whose CSV round-trips exactly at 17 significant digits. The
+/// reference is `lmer(y ~ 1 + t + v + z + (1|g), data, REML = TRUE)` under lme4
+/// 1.1.38 / R 4.5.3.
+///
+/// It is NOT registered in `validation/manifest.json` as a cross-engine golden,
+/// and the reason is worth stating rather than leaving to be rediscovered. Every
+/// quantity below agrees inside its band, but the REML criterion does not:
+/// glmm reports −239.09477 against lme4's −239.09437, a gap of 4.0e-4 where
+/// `tol.R`'s `loglik_abs_lmm` is an absolute 2e-6. That band was calibrated on
+/// well-conditioned designs.
+///
+/// The cause was measured rather than inferred, by re-evaluating this design's
+/// REML criterion in 60-digit arithmetic from its closed form for one balanced
+/// intercept RE — V_j = σ²I_m + τ²11', so V_j⁻¹ = (I − c·11')/σ² with
+/// c = τ²/(σ² + mτ²) and log|V_j| = (m−1)log σ² + log(σ² + mτ²) — and comparing
+/// term by term against the same evaluation carried out at reduced precision:
+///
+///   * the two θ̂ are not what separates the engines. The exact criterion at
+///     glmm's θ̂ and at lme4's differs by 5.1e-11; the objective really is flat
+///     here. (Two supporting controls agree: on the reduced design the two
+///     engines match the criterion to 1.0e-10, and lme4 returns the identical
+///     full-design value under a 1e-14-tightened optimizer, so neither side is
+///     merely under-converged.)
+///   * `log|X'V⁻¹X|` is where the digits go, and "loses digits" understates it:
+///     at float64 working precision this design's 4×4 X'V⁻¹X is numerically
+///     singular, and its log-determinant does not stabilise until roughly 25
+///     decimal digits. Neither engine can evaluate that term to the 2e-6 an
+///     absolute band assumes.
+///   * so both engines miss the criterion's exact value, −239.0944407: lme4 by
+///     +7.0e-5, glmm by −3.3e-4. glmm is the further of the two, by 4.7×. That
+///     is recorded as a finding, not argued away — but it is a shared
+///     consequence of the conditioning, not a difference of method.
+///
+/// Registering the rung therefore needs the band question settled first, which
+/// is a calibration decision, not a test edit.
+#[test]
+fn lmm_entangled_pair_fits_in_full_with_honest_ses() {
+    // lme4 1.1.38 on the FULL design [1, t, v, z], REML. Written in the shortest
+    // decimal form that round-trips to the same f64 as lme4's 17-digit output —
+    // the same doubles, not truncated ones; padding them back out is a clippy
+    // `excessive_precision` error and changes nothing. Measured agreement with
+    // glmm, worst per row: β 5.7e-4 (both entangled columns), SE 2.8e-4 (same
+    // two), stddev 1.4e-6, σ̂ 8.5e-8, β_t + β_v 4.8e-7. The two entangled cells
+    // are the tightest in the crate against a 1e-3 band — 1.8× margin — and that
+    // is the honest size of the disagreement, not a slack to be traded away:
+    // the pair is by construction the least-determined direction in the design,
+    // so it is where two independent implementations differ most.
+    const LME4_BETA: [f64; 4] = [
+        -0.7054541628205219,
+        -38288906.83665362,
+        38293871.58172187,
+        0.5016368546595636,
+    ];
+    const LME4_SE: [f64; 4] = [
+        0.8424257561779566,
+        52060999.05491157,
+        52060993.35174688,
+        0.0015371530739338938,
+    ];
+    const LME4_SD_G: f64 = 4.211895307851695;
+    const LME4_SIGMA: f64 = 0.2803066654730708;
+    // validation/tol.R: beta_rel, se_rel, stddev_rel.
+    const BETA_REL: f64 = 1e-3;
+    const SE_REL: f64 = 1e-3;
+    const STDDEV_REL: f64 = 1e-3;
+
+    let (x, y, ids, n, p) = build_gap_a_salvage_design(false);
+    let opts = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        ..FitOptions::default()
+    };
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let f = fit_cold(&x, &y, n, p, &intercept_only_lmm(), &ids, &opts);
+
+    assert!(
+        f.converged(),
+        "the design is ill-conditioned, not rank-deficient — it must fit"
+    );
+    assert_eq!(
+        f.aliased(),
+        vec![false; 4],
+        "nothing is redundant at ALIAS_EPS, so no column may be dropped"
+    );
+    assert!(
+        f.beta.iter().all(|b| b.is_finite()) && f.se.iter().all(|s| s.is_finite()),
+        "the full fit must be finite throughout, got β = {:?}, se = {:?}",
+        f.beta,
+        f.se
+    );
+    // The entangled pair reports its own imprecision: |β| ≈ 3.8e7 with an SE of
+    // the same order, i.e. neither coefficient is distinguishable from zero.
+    for j in [1usize, 2] {
+        assert!(
+            f.se[j] > 0.5 * f.beta[j].abs(),
+            "β[{j}] = {} must carry an SE of its own size, got {}",
+            f.beta[j],
+            f.se[j]
+        );
+    }
+    // EVERY column against lme4 on the same four-column design, the entangled
+    // pair included. This is the assertion the reduced-design reference could
+    // not make.
+    assert_pinned(&f.beta, &LME4_BETA, BETA_REL, "beta vs lme4 full design");
+    assert_pinned(&f.se, &LME4_SE, SE_REL, "se vs lme4 full design");
+    // The identified combination gets its own line because it is a far better
+    // determined quantity than either coefficient: v = t·(1 + d·(−1)^i), so
+    // β_t + β_v is what the data actually pins, and the two engines agree on it
+    // to 4.8e-7 while agreeing on its two summands only to 5.7e-4. Asserting it
+    // separately keeps that three-order gap under test — a regression that moved
+    // both coefficients together would slip past the per-column bands.
+    assert_pinned(
+        &[f.beta[1] + f.beta[2]],
+        &[LME4_BETA[1] + LME4_BETA[2]],
+        BETA_REL,
+        "β_t + β_v vs lme4 full design",
+    );
+    assert_eq!(f.tau2.len(), 1, "one variance component, got {:?}", f.tau2);
+    // Compare on the STDDEV scale, which is what tol.R's stddev_rel bands.
+    assert_pinned(
+        &[f.tau2[0].sqrt(), f.dispersion.sqrt()],
+        &[LME4_SD_G, LME4_SIGMA],
+        STDDEV_REL,
+        "stddevs vs lme4 full design",
+    );
+
+    // The flag itself. The doc comment above turns on this design sitting just
+    // ABOVE the detection floor — 8.76e-12 against `lmm::PIVOT_MIN` — and
+    // nothing else in this test would notice if that stopped being true.
+    assert!(
+        f.diagnostics.notes.is_empty(),
+        "the pair is distinguishable in f64, so no note may be raised: {:?}",
+        f.diagnostics.notes
+    );
+    let sized = spec_sized_from_ids_pub(&intercept_only_lmm(), &ids);
+    let mut ws = build_workspace(&sized, n, p, &opts);
+    let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
+    assert!(!d.ill_conditioned, "pivot {} must clear the floor", d.pivot);
+    // A 2× band, not a pin. This pivot is a cancelled quantity and the doc's
+    // own margins are stated at 100×, so banding it tighter would buy a flaky
+    // test; banding it at all keeps the quoted decade under test.
+    assert!(
+        (4.4e-12..1.8e-11).contains(&d.pivot),
+        "min pivot ratio must stay at the quoted 8.76e-12, got {}",
+        d.pivot
+    );
+
+    // 1-ULP stability: the guard's promise is that a fit it ACCEPTS still has
+    // significant digits left. Re-round every entry of `y` by one ULP and refit;
+    // the identified quantities must not move. Perturbing a SINGLE double is
+    // useless at n = 1000 — the Gram accumulation absorbs it exactly and reports
+    // a spurious zero — so every entry moves.
+    //
+    // Two alternating sign patterns, not the calibration's worst-of-16
+    // pseudorandom ones: alternating signs cancel heavily in the accumulation,
+    // so this is a weaker probe than the 2026-07-31 measurement and must not be
+    // read as reproducing its `betaRel`. It is a tripwire against a guard placed
+    // low enough to accept arithmetic noise, where the movement would be O(1).
+    for flip in [false, true] {
+        let y_eps: Vec<f64> = y
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                // ±1 ULP by direct bit step. Sign-magnitude layout: for v > 0 a
+                // larger bit pattern is a larger value, for v < 0 the reverse.
+                let up = (i % 2 == 0) != flip;
+                let bits = v.to_bits();
+                if v == 0.0 {
+                    v
+                } else if v.is_sign_positive() == up {
+                    f64::from_bits(bits + 1)
+                } else {
+                    f64::from_bits(bits - 1)
+                }
+            })
+            .collect();
+        let g = fit_cold(&x, &y_eps, n, p, &intercept_only_lmm(), &ids, &opts);
+        assert!(
+            g.converged(),
+            "flip={flip}: the perturbed fit must also converge"
+        );
+        // Measured worst across both patterns: 3.7e-12 on the unentangled
+        // columns, 7.5e-12 on β_t + β_v. The band is five orders above that, so
+        // it does not fail on cross-platform FP drift, and six orders below a
+        // fit that has lost its digits.
+        const ULP_REL: f64 = 1e-6;
+        for j in [0usize, 3] {
+            let rel = (g.beta[j] - f.beta[j]).abs() / f.beta[j].abs();
+            assert!(
+                rel < ULP_REL,
+                "flip={flip}: β[{j}] moved {rel} under a 1-ULP re-rounding of y"
+            );
+        }
+        let sum = f.beta[1] + f.beta[2];
+        let rel = ((g.beta[1] + g.beta[2]) - sum).abs() / sum.abs();
+        assert!(
+            rel < ULP_REL,
+            "flip={flip}: β_t + β_v moved {rel} under a 1-ULP re-rounding of y"
+        );
+    }
+}
+
+/// REDUNDANCY AND ENTANGLEMENT IN ONE DESIGN — the two must be told apart.
+///
+/// The design above plus `s = 1 + z`, exactly dependent on columns 0 and 3. `s`
+/// is genuinely redundant: there is no separate coefficient for it, so
+/// `detect_aliased` fires at `ALIAS_EPS` before the solver runs, the column is
+/// dropped, and `fit_warm` re-enters on a reduced design whose four columns are
+/// bit-identical to the single-level design. Those four are merely entangled,
+/// and the reduced fit keeps every one of them.
+///
+/// So this pins the discrimination the whole guard rework is about: exactly one
+/// column is dropped from a design that contains both an exact dependency and a
+/// near one, and `aliased` is `[f,f,f,f,t]` rather than flagging `v` too.
+///
+/// It also pins that the drop does not perturb the numbers: the inner fit IS the
+/// single-level test's fit, so β/se/τ/σ must land on the same lme4 reference
+/// values, and `tau2` must keep its width (no RE block is ever dropped).
+#[test]
+fn exact_alias_is_dropped_and_the_entangled_pair_is_kept() {
+    // Same lme4 1.1.38 FULL-design reference as
+    // `lmm_entangled_pair_fits_in_full_with_honest_ses` — the fit reached after
+    // `s` is dropped is that same four-column fit, so the same four references
+    // apply and the entangled pair is assertable here too. Provenance is
+    // recorded at that test.
+    const LME4_BETA: [f64; 4] = [
+        -0.7054541628205219,
+        -38288906.83665362,
+        38293871.58172187,
+        0.5016368546595636,
+    ];
+    const LME4_SE: [f64; 4] = [
+        0.8424257561779566,
+        52060999.05491157,
+        52060993.35174688,
+        0.0015371530739338938,
+    ];
+    const LME4_SD_G: f64 = 4.211895307851695;
+    const LME4_SIGMA: f64 = 0.2803066654730708;
+    const BETA_REL: f64 = 1e-3;
+    const SE_REL: f64 = 1e-3;
+    const STDDEV_REL: f64 = 1e-3;
+
+    let (x, y, ids, n, p) = build_gap_a_salvage_design(true);
+    assert_eq!(p, 5);
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &intercept_only_lmm(),
+        &GroupIds {
+            primary: ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: (0..p as u32).collect(),
+            ..FitOptions::default()
+        },
+    );
+
+    assert!(f.converged(), "the reduced fit must converge");
+    assert_eq!(
+        f.aliased(),
+        vec![false, false, false, false, true],
+        "only the EXACT dependency (s, index 4) is dropped; the near-collinear \
+         pair (t, v) is entangled, not redundant, and both columns stay"
+    );
+    // The contract `Fit::aliased` exists to carry, asserted directly rather than
+    // only through the mask: NaN in β/se iff flagged aliased, for every column.
+    for j in 0..p {
+        assert_eq!(
+            f.beta[j].is_nan(),
+            f.aliased()[j],
+            "β[{j}] = {} but aliased[{j}] = {}",
+            f.beta[j],
+            f.aliased()[j]
+        );
+        assert_eq!(
+            f.se[j].is_nan(),
+            f.aliased()[j],
+            "se[{j}] = {} but aliased[{j}] = {}",
+            f.se[j],
+            f.aliased()[j]
+        );
+    }
+    // Dropping `s` must not move the rest: the inner fit is the single-level
+    // test's fit, so the same lme4 reference applies, read the same way — every
+    // surviving column directly, plus the identified sum.
+    assert_pinned(
+        &f.beta[..4],
+        &LME4_BETA,
+        BETA_REL,
+        "reduced beta vs lme4 full design",
+    );
+    assert_pinned(
+        &f.se[..4],
+        &LME4_SE,
+        SE_REL,
+        "reduced se vs lme4 full design",
+    );
+    assert_pinned(
+        &[f.beta[1] + f.beta[2]],
+        &[LME4_BETA[1] + LME4_BETA[2]],
+        BETA_REL,
+        "β_t + β_v vs lme4 full design",
+    );
+    assert_eq!(f.tau2.len(), 1, "one variance component, got {:?}", f.tau2);
+    assert_pinned(
+        &[f.tau2[0].sqrt(), f.dispersion.sqrt()],
+        &[LME4_SD_G, LME4_SIGMA],
+        STDDEV_REL,
+        "nested stddevs vs lme4 full design",
+    );
 }
 
 /// Warm-start A/B on the realistic sleepstudy random-slope LMM
@@ -211,7 +807,7 @@ fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
         ..FitOptions::default()
     };
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert!(cold.converged, "cold sleepstudy fit must converge");
+    assert!(cold.converged(), "cold sleepstudy fit must converge");
 
     // lme4 θ̂ = vech Cholesky of D̂/σ̂², from the frozen golden's
     // stddev/corr/sigma (`validation/goldens/sleepstudy_lmm.json`) — `Fit`
@@ -247,7 +843,10 @@ fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
     ];
     for (label, start) in &starts {
         let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(start), &opts);
-        assert!(warm.converged, "{label}: warm must not degrade convergence");
+        assert!(
+            warm.converged(),
+            "{label}: warm must not degrade convergence"
+        );
         for j in 0..p {
             let rel = (warm.beta[j] - cold.beta[j]).abs() / cold.beta[j].abs();
             assert!(
@@ -337,7 +936,7 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
         },
     );
 
-    assert!(f.converged, "sleepstudy slope LMM must converge");
+    assert!(f.converged(), "sleepstudy slope LMM must converge");
     assert!(
         (f.beta[0] - REF_B0).abs() / REF_B0 < 1e-3,
         "β0 {} vs {REF_B0}",
@@ -453,7 +1052,7 @@ fn fit_exposes_n_eval_deviance_singular() {
 
     assert!(f.n_eval > 0, "BOBYQA ran, evals must be counted");
     assert!(f.deviance.is_finite());
-    assert!(!f.singular, "sleepstudy is an interior optimum");
+    assert!(!f.singular(), "sleepstudy is an interior optimum");
     let n = 180.0_f64;
     let p = 2.0_f64; // intercept + Days
     let df = n - p;
@@ -531,7 +1130,7 @@ fn fit_lmm_offset_matches_lme4() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "offset LMM must converge");
+    assert!(f.converged(), "offset LMM must converge");
     for (j, (&b, &r)) in f.beta.iter().zip(&REF_BETA).enumerate() {
         assert!((b - r).abs() / r.abs() < 1e-3, "β[{j}] = {b} vs lme4 {r}");
     }
@@ -624,7 +1223,7 @@ fn fit_lmm_weighted_matches_lme4() {
         },
     );
 
-    assert!(f.converged, "weighted sleepstudy slope LMM must converge");
+    assert!(f.converged(), "weighted sleepstudy slope LMM must converge");
     assert!(
         (f.beta[0] - REF_B0).abs() / REF_B0 < 1e-6,
         "β0 {} vs {REF_B0}",
@@ -773,7 +1372,7 @@ fn fit_lmm_constant_weights_invariant() {
             ..FitOptions::default()
         },
     );
-    assert!(unweighted.converged && weighted.converged);
+    assert!(unweighted.converged() && weighted.converged());
     // The θ̃=√c·θ substitution is exact algebra; the achieved match is
     // bounded by BOBYQA's rho_end floor (2 independently-converged fits,
     // not a shared trajectory), not by 1e-10 — 1e-6 relative is the tight
@@ -868,7 +1467,7 @@ fn fit_lmm_crossed_constant_weights_invariant() {
             ..base_opts
         },
     );
-    assert!(unweighted.converged && weighted.converged);
+    assert!(unweighted.converged() && weighted.converged());
     for j in 0..p {
         assert!(
             (unweighted.beta[j] - weighted.beta[j]).abs() / unweighted.beta[j].abs() < 1e-6,
@@ -960,8 +1559,8 @@ fn fit_lmm_weighted_boundary_matches_wls() {
             ..FitOptions::default()
         },
     );
-    assert!(mixed.converged, "boundary pin still counts as converged");
-    assert!(mixed.singular, "must pin at the τ=0 boundary");
+    assert!(mixed.converged(), "boundary pin still counts as converged");
+    assert!(mixed.singular(), "must pin at the τ=0 boundary");
 
     let fixed_only = ModelSpec {
         family: Family::Gaussian,
@@ -980,7 +1579,7 @@ fn fit_lmm_weighted_boundary_matches_wls() {
             ..FitOptions::default()
         },
     );
-    assert!(wls.converged);
+    assert!(wls.converged());
 
     for j in 0..2 {
         assert!(
@@ -1068,7 +1667,7 @@ fn fit_sim_slope_varcorr_is_pinned() {
         },
     );
 
-    assert!(f.converged);
+    assert!(f.converged());
     assert_pinned(&f.beta, &REF_BETA, PIN_REL_ITER, "beta");
     assert_pinned(&f.se, &REF_SE, PIN_REL_ITER, "se");
     assert_eq!(f.varcorr.len(), 2, "one block per grouping, g1 then g2");
@@ -1134,7 +1733,7 @@ fn fit_penicillin_crossed_matches_lme4() {
         },
     );
 
-    assert!(f.converged, "Penicillin crossed LMM must converge");
+    assert!(f.converged(), "Penicillin crossed LMM must converge");
     assert!(
         (f.beta[0] - REF_BETA).abs() / REF_BETA < 1e-4,
         "β0 = {} vs lme4 {REF_BETA}",
@@ -1217,7 +1816,7 @@ fn fit_pastes_nested_matches_lme4() {
         },
     );
 
-    assert!(f.converged, "Pastes nested LMM must converge");
+    assert!(f.converged(), "Pastes nested LMM must converge");
     assert!(
         (f.beta[0] - REF_BETA).abs() / REF_BETA < 1e-4,
         "β0 = {} vs lme4 {REF_BETA}",
@@ -1526,7 +2125,7 @@ fn refit_lmm_matches_fresh_fit_cold() {
     let cold_a = fit_cold(&xa, &ya, n, p, &model, &ids, &opts_a);
     let cold_b = fit_cold(&xb, &yb, n, p, &model, &ids, &opts_b);
     assert!(
-        cold_a.converged && cold_b.converged,
+        cold_a.converged() && cold_b.converged(),
         "oracle fits must converge"
     );
 
@@ -1535,7 +2134,7 @@ fn refit_lmm_matches_fresh_fit_cold() {
         ("A (unweighted)", &refit_a, &cold_a),
         ("B (weighted)", &refit_b, &cold_b),
     ] {
-        assert_eq!(refit.converged, cold.converged, "{label}: converged");
+        assert_eq!(refit.converged(), cold.converged(), "{label}: converged");
         assert_eq!(bits(&refit.beta), bits(&cold.beta), "{label}: beta");
         assert_eq!(bits(&refit.se), bits(&cold.se), "{label}: se");
         assert_eq!(bits(&refit.tau2), bits(&cold.tau2), "{label}: tau2");
@@ -1553,6 +2152,6 @@ fn refit_lmm_matches_fresh_fit_cold() {
             "{label}: deviance"
         );
         assert_eq!(refit.n_eval, cold.n_eval, "{label}: n_eval");
-        assert_eq!(refit.singular, cold.singular, "{label}: singular");
+        assert_eq!(refit.singular(), cold.singular(), "{label}: singular");
     }
 }

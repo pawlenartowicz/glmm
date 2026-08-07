@@ -89,7 +89,7 @@ the over-count sparse rungs `sim_sparse_binomial` / `sim_sparse_poisson`
 
 **Code:** `pirls_solve` (dense fallback), `pirls_solve_blocked` (no extras) and
 `pirls_solve_blocked_extras` (structured crossed/nested) in
-`src/glmm/pirls.rs`; caps `PIRLS_MAX_ITERS = 50`, `PIRLS_MAX_HALVINGS = 10` and
+`src/glmm/pirls.rs`; caps `PIRLS_MAX_ITERS = 50`, `PIRLS_MAX_HALVINGS = 16` and
 the tolerance selector `pirls_tol` in `src/glmm/mod.rs`.
 
 At a fixed θ the conditional modes ũ are found by penalized IRLS — Fisher
@@ -324,7 +324,7 @@ sparse NB path by `goldens/sim_sparse_nb.json`.
 `src/glmm/workspace.rs`; within-fit seeding in `glmm::fit_glmm`
 (`src/glmm/mod.rs`); `glm_warm_start_beta` (`src/fit/glmm.rs`). A
 `loop_advanced` caller reaches this reuse through `build_workspace`/`fit_on`
-(see [`TUTORIAL-RUST.md`](TUTORIAL-RUST.md) §3), which owns the `GlmmWorkspace`
+(see [`tutorial-rust.md`](tutorial-rust.md) §3), which owns the `GlmmWorkspace`
 rather than handing it over.
 
 All GLMM solver scratch lives in one `GlmmWorkspace`, allocated **once per
@@ -400,7 +400,7 @@ with the exact-boundary estimate — a pinned correlation is reported as exactly
 `±1`, not `0.9999…`. Off-diagonals are never pinned (the Cholesky geometry
 above makes the diagonal pin the complete policy).
 
-`Fit.singular` is `boundary_hit == 1` **or** the post-hoc
+`Fit::diagnostics.singular` is `boundary_hit == 1` **or** the post-hoc
 `has_negligible_component()` check at `Fit` assembly (`src/fit/glmm.rs`,
 identical in `src/fit/lmm.rs`): any RE standard deviation
 `≤ SINGULAR_REL_TOL (1e-3) ×` the largest RE standard deviation. The relative
@@ -418,7 +418,7 @@ tests in `src/lmm.rs` pin the shared pin loop; the accuracy study
 
 **Code:** the `WaldSe` arms in `glmm::fit_glmm` and `fd_hessian_cov` /
 `rx_cov_into` in `src/glmm/se.rs`; the sparse twins `sparse_fd_hessian_cov` and
-the sparse Rx Schur in `src/sparse/glmm.rs`; `FD_STEP_REL = 1e-2` and
+the sparse Rx Schur in `src/sparse/glmm.rs`; `FD_STEP_BASE = 1e-2` and
 `PIRLS_TOL_REL_FD = 1e-8` in `src/glmm/mod.rs`; `SPARSE_FD_STEP_REL = 1e-4` in
 `src/sparse/glmm.rs`.
 
@@ -429,9 +429,17 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   `H_dev` is the finite-difference Hessian of the joint `(θ, β)` Laplace
   deviance at the converged point. The factor of 2 arises because the deviance
   is −2·logL, so the observed information is `H_dev/2`. `fd_hessian_cov` uses
-  single-step central second differences at `h_k = FD_STEP_REL · max(1, |γ̂_k|)`,
-  with no Richardson extrapolation — the deviance is step-invariant over
-  `h ∈ [1e-4, 1e-1]`. Every FD deviance eval re-runs PIRLS at the tight
+  single-step central second differences, with the base step applied
+  asymmetrically across the joint vector: `h_θ = FD_STEP_BASE` **absolutely** on
+  the θ block, `h_β = FD_STEP_BASE · max(1, |β̂_k|)` relatively on the β block.
+  β enters through η = Xβ and wants relative stepping; θ does not — scaling h_θ
+  with the random-effect SD widens the differencing window exactly where the
+  deviance profile in θ flattens, and the O(h²) truncation error then grows as
+  θ̂² (measured: dropping the scaling divides the error by θ̂² to within 6% on
+  every rung with θ̂ > 1, at every nAGQ). Every rung with θ̂ ≤ 1 is unaffected,
+  `max(1, ·)` having been exactly 1 there. No Richardson extrapolation — the
+  deviance is step-invariant over `h ∈ [1e-4, 1e-1]`
+  on the committed fixture. Every FD deviance eval re-runs PIRLS at the tight
   `PIRLS_TOL_REL_FD = 1e-8` (not the fit tolerance), so the second differences
   are step-invariant by construction rather than by luck. If the joint Hessian
   is non-PD, or a perturbed deviance is non-finite (the few-cluster failure
@@ -449,11 +457,15 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
 
 Both are computed on the deviance/log-odds scale (the fit's linear-predictor
 scale). The sparse driver emits the same two arms: `sparse_fd_hessian_cov`
-mirrors the dense FD scheme (single-step central differences, same
-`h_k = step·max(1, |γ̂_k|)` rule, identical Rx fallback) but carries its own
-sparse-calibrated step `SPARSE_FD_STEP_REL = 1e-4` — deliberately not the dense
-`1e-2`; the two paths sit on opposite sides of the truncation-vs-noise trade
-and the constants must not be folded together. The Hessian
+mirrors the dense FD scheme (single-step central differences, identical Rx
+fallback) but carries its own sparse-calibrated step
+`SPARSE_FD_STEP_REL = 1e-4` — deliberately not the dense `1e-2`; the two paths
+sit on opposite sides of the truncation-vs-noise trade and the constants must
+not be folded together. It also keeps the relative
+`h_k = SPARSE_FD_STEP_REL · max(1, |γ̂_k|)` rule on **every** coordinate, θ
+included: the dense θ-step fix above does not transfer, because a step already
+calibrated on the noise side gets pushed further into noise by shrinking it.
+Large-θ̂ calibration of the sparse arm is open work. The Hessian
 arm is the dominant time cost (≈ O(m²) deviance re-solves); on cbpp the Hessian
 fit is ~1.9× its Rx fit.
 
@@ -531,10 +543,10 @@ GLMMadaptive is quadrature-first.
 | Default objective | Laplace (`nAGQ=1`) | Laplace | **adaptive GH quadrature** (default 11 points for ≤ 2 REs) | Laplace (`nAGQ=1`) |
 | AGQ shapes | single **scalar** RE only | single scalar RE only | vector REs, product grid (its core feature) | single grouping, `q_p ≤ 3` product grid, binomial/Poisson (opt-in `nagq`) |
 | Grouping structure | multiple, crossed/nested | multiple, crossed/nested | **single grouping factor only** | multiple, crossed/nested (dense/sparse routing) |
-| Outer optimisation | derivative-free, θ-then-joint two-stage (BOBYQA/Nelder-Mead) | derivative-free BOBYQA; `fast=true` θ-only or joint | hybrid: EM first, then quasi-Newton over all parameters | derivative-free two-stage BOBYQA: θ-only Profile warm start, then joint `[θ|β]` polish |
+| Outer optimisation | derivative-free, θ-then-joint two-stage (BOBYQA/Nelder-Mead) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE); `fast=true` θ-only or joint | hybrid: EM first, then quasi-Newton over all parameters | derivative-free two-stage BOBYQA: θ-only Profile warm start, then joint `[θ|β]` polish |
 | Fixed-effect vcov | Hessian (default) or RX | RX-style only | observed information (numeric), sandwich available | both arms: `Hessian` (default, ≡ `use.hessian=TRUE`) and `Rx` (≡ MixedModels) |
 | Families beyond binomial/Poisson | Gamma, NB (`glmer.nb`), … | limited | broad: NB, beta, Student-t, zero-inflated/hurdle, censored, user-defined density | Gamma, NB (marginal-θ golden-section) |
-| RE-covariance boundary (singular fits) | bounded linear-scale Cholesky, θ diagonals `≥ 0`: boundary reachable; flagged via `isSingular` (θ `< 1e-4`), raw θ reported | same bounded Cholesky, boundary reachable | **log-Cholesky** (`chol_transf`: Cholesky diagonal on the log scale), unconstrained — the boundary sits at `−∞` and is unreachable | bounded Cholesky as lme4, plus the exact-`0` pin (`PIN_THETA`) and `singular`/`boundary_hit`/`pinned_components` |
+| RE-covariance boundary (singular fits) | bounded linear-scale Cholesky, θ diagonals `≥ 0`: boundary reachable; flagged via `isSingular` (θ `< 1e-4`), raw θ reported | same bounded Cholesky, boundary reachable | **log-Cholesky** (`chol_transf`: Cholesky diagonal on the log scale), unconstrained — the boundary sits at `−∞` and is unreachable | bounded Cholesky as lme4, plus the exact-`0` pin (`PIN_THETA`) and `Diagnostics::singular`/`Diagnostics::boundary`/`Diagnostics::pinned` |
 
 In practice:
 

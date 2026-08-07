@@ -2,7 +2,7 @@
 """Python-port runner for the large synthetic memory-measurement models
 (models.json). NOT a validation rung -- see models.json's header. Fits an
 arbitrary generated CSV + formula through the installed `glmm` wheel (the same
-package engines/glmm_python.py drives for the 43 curated rungs), so memory.sh
+package engines/glmm_python.py drives for the curated manifest rungs), so memory.sh
 can wrap this in `/usr/bin/time -f '%M'` one process per (engine, model).
 
     python fit_python.py <csv> <formula> <family> <link> <factors_csv> <nagq>

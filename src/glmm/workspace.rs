@@ -288,6 +288,15 @@ pub struct GlmmWorkspace {
     /// `eta_fixed` refresh (`pirls::refresh_eta_fixed` and its two blocked-path
     /// inline twins). `None` ⇒ no offset, byte-identical to the pre-offset code.
     pub(crate) offset: Option<Vec<f64>>,
+    /// Count of fit-path (`pirls_tol_override.is_none()`) PIRLS solves that ran
+    /// the full `PIRLS_MAX_ITERS` cap without converging — observation-only,
+    /// bookkeeping read back by `FitDiagnostics`/`Note::PirlsExhausted`, never by
+    /// any numeric path. Reset to 0 at the top of every `fit_glmm` (mirrors
+    /// `u_seed`) so a `loop_advanced` reuse never carries a prior draw's count.
+    pub(crate) pirls_exhausted: u32,
+    /// Whether the FINAL re-evaluation at the pinned γ̂ itself exhausted the
+    /// PIRLS cap. Reset to `false` at the top of every `fit_glmm`.
+    pub(crate) final_pirls_exhausted: bool,
 }
 
 impl GlmmWorkspace {
@@ -367,11 +376,9 @@ impl GlmmWorkspace {
         let rho_begin = (0.1 * min_diag).min(RHO_BEGIN);
         // MIRRORS the joint config in `sparse::glmm::fit_glmm_sparse` — both feed
         // through the shared `apply_campaign_overrides` tail.
-        let mut config = Config {
-            rho_begin,
-            rho_end: GLMM_RHO_END,
-            ..Config::new(n_theta + p)
-        };
+        let mut config = Config::new(n_theta + p);
+        config.rho_begin = rho_begin;
+        config.rho_end = GLMM_RHO_END;
         crate::lmm::apply_campaign_overrides(&mut config, n_theta + p);
         // Stage-1 θ-only BOBYQA config: same rho_begin/rho_end schedule as the
         // joint solver above, but `npt` mirrors `sparse_lmm_seed`'s mid-model
@@ -385,12 +392,10 @@ impl GlmmWorkspace {
         } else {
             2 * n_theta + 1
         };
-        let mut config_stage1 = Config {
-            rho_begin,
-            rho_end: GLMM_RHO_END,
-            npt: npt_stage1,
-            ..Config::new(n_theta)
-        };
+        let mut config_stage1 = Config::new(n_theta);
+        config_stage1.rho_begin = rho_begin;
+        config_stage1.rho_end = GLMM_RHO_END;
+        config_stage1.npt = npt_stage1;
         crate::lmm::apply_campaign_overrides(&mut config_stage1, n_theta);
         // θ-only incumbent buffer, seeded from the θ-prefix of the joint start.
         let params_stage1 = params[..n_theta].to_vec();
@@ -561,6 +566,8 @@ impl GlmmWorkspace {
             warm_seed_active: false,
             pirls_tol_override: None,
             offset: None,
+            pirls_exhausted: 0,
+            final_pirls_exhausted: false,
         }
     }
 

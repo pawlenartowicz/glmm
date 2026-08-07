@@ -14,7 +14,7 @@ Fits fixed-effect and mixed (random-intercept/random-slope) models for
 Gaussian, Binomial (logit/probit), Poisson, Gamma, and Negative-Binomial
 outcomes, validated against R/lme4 and Julia/MixedModels.jl goldens.
 
-**New to the crate? Start with [`TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md)** — a
+**New to the crate? Start with [`tutorial-rust.md`](documentation/tutorial-rust.md)** — a
 single-page, three-layer walkthrough (cold fit → warm fit → advanced loop)
 plus a short section on parsing an R-style formula string instead of building
 inputs by hand. Python and R packages are also available — see
@@ -45,23 +45,30 @@ and GLMM legs detailed in
 
 ## Documentation
 
+The fuller map — entry point, tutorials, examples, migration guides, reference,
+and internals, all in one tiered table — lives in
+[`documentation/index.md`](documentation/index.md). The table below is this
+README's own copy of the essentials, not the whole set.
+
 | File | Purpose |
 |---|---|
-| [`documentation/TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md) | Three-layer Rust walkthrough: cold fit → warm fit → advanced loop, plus the formula frontend |
-| [`documentation/TUTORIAL-PYTHON.md`](documentation/TUTORIAL-PYTHON.md) | The Python package (`glmm`) walkthrough |
-| [`documentation/TUTORIAL-R.md`](documentation/TUTORIAL-R.md) | The R package (`fastglmm`) walkthrough |
+| [`documentation/tutorial-rust.md`](documentation/tutorial-rust.md) | Three-layer Rust walkthrough: cold fit → warm fit → advanced loop, plus the formula frontend |
+| [`documentation/tutorial-python.md`](documentation/tutorial-python.md) | The Python package (`glmm`) walkthrough |
+| [`documentation/tutorial-r.md`](documentation/tutorial-r.md) | The R package (`fastglmm`) walkthrough |
 | [`documentation/supported_families.md`](documentation/supported_families.md) | Family × link support matrix, canonical-link notes, dispersion conventions |
 | [`documentation/algorithms.md`](documentation/algorithms.md) | Algorithm map entry point: full dispatch graph, knob index, OLS/GLM paths |
 | [`documentation/algorithms-lmm.md`](documentation/algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML, closed-form shortcut, BOBYQA, boundary handling |
 | [`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md) | GLMM: PIRLS, Laplace vs AGQ, dense vs sparse Z, NB outer loop, warm starts |
+| [`documentation/glmm-design.md`](documentation/glmm-design.md) | Algorithmic design rationale: the differences from lme4/MixedModels.jl and why each one is faster |
 | [`documentation/installation.md`](documentation/installation.md) | Installing the Rust crate, Python package, and R package |
 | [`documentation/formula.md`](documentation/formula.md) | What the formula parser accepts and rejects, with workarounds |
 | [`documentation/conventions.md`](documentation/conventions.md) | Estimation, standard-error, dispersion, and variance-component conventions, and the flags on a fit result |
 | [`documentation/validation.md`](documentation/validation.md) | How glmm is validated against lme4 and MixedModels.jl, what's covered, and known tolerances/exemptions |
-| [`documentation/coming-from-lme4.md`](documentation/coming-from-lme4.md) | Call mapping from lme4 (and statsmodels), what's deliberately missing, and behavioral differences to watch |
+| [`documentation/coming-from-lme4.md`](documentation/coming-from-lme4.md) | Call mapping from lme4, what's deliberately missing, and behavioral differences to watch (covers both the R and Python surface) |
+| [`documentation/coming-from-statsmodels.md`](documentation/coming-from-statsmodels.md) | Migrating from `statsmodels` `MixedLM`/`GLM` to `glmm.fit` (Python only) |
 | [`documentation/troubleshooting.md`](documentation/troubleshooting.md) | Fixes for singular fits, non-convergence, NotImplementedError, and rejected formulas |
 
-## Scope and stability (0.1.x)
+## Scope and stability (0.2.x)
 
 The semver-covered surface is `fit_cold`/`fit_warm` + `ModelSpec` + `GroupIds`.
 
@@ -76,7 +83,7 @@ The semver-covered surface is `fit_cold`/`fit_warm` + `ModelSpec` + `GroupIds`.
 Every wired family fits through both routes — there is no reachable panic for
 falling outside the dense solver's envelope (too many extra groupings, or an
 extra grouping too wide); classification just routes to the sparse-Z solver
-instead. See [`TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md) and
+instead. See [`tutorial-rust.md`](documentation/tutorial-rust.md) and
 [`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md) for the
 dense/sparse routing envelope.
 
@@ -84,6 +91,12 @@ The `loop_advanced` cargo feature (off by default) exposes an unstable
 scratch-explicit hot-path surface for warm-start callers like MCPower's
 simulation loop — **no semver guarantees; do not depend on it outside a
 pinned revision.**
+
+The `orchestrate` cargo feature (off by default) exposes the string-typed fit
+orchestration the Python and R packages are built on — one definition of the
+family/link string vocabulary, the formula-and-data lowering, and the
+flattened result both ports publish. **No semver guarantees**, for the same
+reason as `loop_advanced`: its shape follows the ports' needs.
 
 The `parallel` cargo feature (off by default, **experimental**) enables
 in-fit parallelism — the AGQ cluster loop and the FD-Hessian SE grid — via
@@ -113,10 +126,10 @@ let ids = GroupIds { primary: vec![0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5], extra: v
 let opts = FitOptions { target_indices: vec![0, 1], ..Default::default() };
 
 let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-assert!(fit.converged);
+assert!(fit.converged());
 ```
 
-See [`TUTORIAL-RUST.md`](documentation/TUTORIAL-RUST.md) for the full walkthrough: warm
+See [`tutorial-rust.md`](documentation/tutorial-rust.md) for the full walkthrough: warm
 starts, the advanced hot-loop surface, and building `x`/`ModelSpec`/`GroupIds`
 from a formula string with `glmm::formula` (the `formula` feature, on by default)
 instead of by hand.
@@ -139,9 +152,10 @@ fit = glmm.fit(data, "y ~ x1 + (1 | group)")   # data: dict / pandas / polars
 fit.summary()
 ```
 
-The public surface is two names, `glmm.fit` and `glmm.Fit`. See the
+The public surface is six names: `glmm.fit`, `glmm.Fit`, and the four warning
+categories the diagnostics channel raises. See the
 [Python README](python/README.md) and
-[`TUTORIAL-PYTHON.md`](documentation/TUTORIAL-PYTHON.md).
+[`tutorial-python.md`](documentation/tutorial-python.md).
 
 **R** (`fastglmm`, via r-universe):
 
@@ -153,13 +167,13 @@ install.packages("fastglmm", repos = c("https://pawlenartowicz.r-universe.dev", 
 library(fastglmm)
 
 fit <- fastglmm(y ~ x1 + (1 | group), data)
-summary(fit)   # plus fixef, vcov, VarCorr, confint, isSingular
+summary(fit)   # plus fixef, ranef, fitted, vcov, VarCorr, confint, logLik, isSingular
 ```
 
 Deliberately scoped to fast fitting — anything the engine cannot compute
-honestly (`ranef`, `predict`, `logLik`) errors with the reason instead of
-guessing. See the [R README](r/README.md) and
-[`TUTORIAL-R.md`](documentation/TUTORIAL-R.md).
+honestly (`predict`, `residuals`) errors with the reason instead of guessing.
+See the [R README](r/README.md) and
+[`tutorial-r.md`](documentation/tutorial-r.md).
 
 ## Design
 

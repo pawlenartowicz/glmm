@@ -2,7 +2,7 @@
 # R-port (fastglmm) runner for the large synthetic memory-measurement models
 # (models.json). NOT a validation rung -- see models.json's header. Fits an
 # arbitrary generated CSV + formula through the installed fastglmm package
-# (the same extendr wrapper engines/glmm_r.R drives for the 43 curated rungs),
+# (the same extendr wrapper engines/glmm_r.R drives for the curated manifest rungs),
 # so memory.sh can wrap this in `/usr/bin/time -f '%M'` one process per
 # (engine, model).
 #

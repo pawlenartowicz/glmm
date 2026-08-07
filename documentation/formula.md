@@ -32,8 +32,9 @@ together: `(1 \| A:B)`.
 | `log(x)`, `I(x^2)`, `poly(x, 2)` | Clear parse error — the parser only accepts bare identifiers, not function calls | Compute the transformed column yourself and pass it as a plain column |
 | `cbind(s, f)` | Clear error — the response is looked up as a literal column name, so a call expression is never found in the data table | Pass the proportion as the response column and the trial count as `weights=` |
 | `- 1`, `0 +` | Clear error — the parser has no intercept-suppression or term-removal support on the fixed-effects side | Not available; the model always carries an intercept |
+| bare `1` (e.g. `y ~ 1 + x`) | Clear error — the parser only accepts bare identifiers as fixed-effect terms, and `1` is not one; the intercept is always carried implicitly, so there is no term for it to spell | Drop the explicit `1 +`; write `y ~ x` |
 | `(x || g)` | Clear error — the double-pipe form (uncorrelated random effects) matches none of the random-effect patterns and is rejected as invalid syntax | Not available; random slopes are always fit with a full correlation structure via `(1 + x | g)` |
-| `offset()` | Clear error — same as any other function-call syntax, rejected as an invalid identifier | Not available as formula syntax |
+| `offset()` | Clear error — same as any other function-call syntax, rejected as an invalid identifier | Not available as formula syntax; both the Python and R ports take it as an `offset=`/`offset` argument instead (see `tutorial-python.md`/`tutorial-r.md` §2) |
 | `.` | Clear error — `.` (all other columns) is not a valid identifier | Spell out the predictors explicitly |
 | `contrasts=` | Not an argument the R or Python wrapper accepts | Relevel the factor (`relevel()` in R; reorder before building a `pandas.Categorical`) so the level you want as base sorts first |
 

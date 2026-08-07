@@ -10,7 +10,7 @@ use crate::{
 };
 use faer::Mat;
 
-use super::common_tests::{assert_pinned, dense_ids, dense_str, sim_clustered, PIN_REL_ITER};
+use super::common_tests::{assert_pinned, dense_ids, dense_str, sim_clustered};
 
 /// `fit_glmm` (now `run_glmm_on` + `glmm_view_to_fit`) must reproduce the `Fit`
 /// that the full `fit_cold` dispatch produces for a clustered binomial GLMM —
@@ -42,7 +42,7 @@ fn glmm_view_maps_to_same_fit_as_fit_cold() {
         None,
         &opts,
     );
-    assert!(cold.converged && via.converged);
+    assert!(cold.converged() && via.converged());
     assert_near(&cold.beta, &via.beta, "beta");
     assert_near(&cold.se, &via.se, "se");
     assert_near(&[cold.deviance], &[via.deviance], "deviance");
@@ -71,7 +71,7 @@ fn fit_warm_glmm_cbpp_matches_cold_optimum() {
         ..FitOptions::default()
     };
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert!(cold.converged, "cold cbpp GLMM must converge");
+    assert!(cold.converged(), "cold cbpp GLMM must converge");
     let starts = [
         (
             "truth",
@@ -93,7 +93,10 @@ fn fit_warm_glmm_cbpp_matches_cold_optimum() {
     ];
     for (label, start) in &starts {
         let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(start), &opts);
-        assert!(warm.converged, "{label}: warm must not degrade convergence");
+        assert!(
+            warm.converged(),
+            "{label}: warm must not degrade convergence"
+        );
         for j in 0..p {
             let rel = (warm.beta[j] - cold.beta[j]).abs() / cold.beta[j].abs();
             assert!(
@@ -108,6 +111,81 @@ fn fit_warm_glmm_cbpp_matches_cold_optimum() {
                 "{label}: se[{j}] warm {} vs cold {} (rel {rel})",
                 warm.se[j],
                 cold.se[j]
+            );
+        }
+        let (w, c) = (warm.tau2[0].sqrt(), cold.tau2[0].sqrt());
+        let rel = (w - c).abs() / c;
+        assert!(
+            rel < 1e-3,
+            "{label}: herd SD warm {w} vs cold {c} (rel {rel})"
+        );
+    }
+}
+
+/// Per-component cold start on the cbpp binomial GLMM: an EMPTY `beta` or
+/// `theta` cold-starts that component alone. The ports need this — lme4's
+/// `start = list(theta = …)` supplies θ and nothing else, and neither the R nor
+/// the Python wrapper can synthesize the missing β (the cold seed is a no-RE GLM
+/// fit computed inside the kernel).
+///
+/// Both-empty is the strict arm: it must be BIT-identical to `fit_cold`, since
+/// it takes every cold branch. The one-sided arms only have to land on the cold
+/// optimum, like the warm arms above.
+#[test]
+fn fit_warm_glmm_partial_start_cold_starts_the_missing_component() {
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let p = 4;
+    let model = cbpp_model();
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2, 3],
+        ..FitOptions::default()
+    };
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(cold.converged(), "cold cbpp GLMM must converge");
+
+    let both_empty = StartValues {
+        beta: vec![],
+        theta: vec![],
+    };
+    let empty = fit_warm(&x, &y, n, p, &model, &ids, Some(&both_empty), &opts);
+    // Bitwise (not PartialEq): non-target SE slots are NaN and NaN != NaN.
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&cold.beta), bits(&empty.beta));
+    assert_eq!(bits(&cold.se), bits(&empty.se));
+    assert_eq!(bits(&cold.tau2), bits(&empty.tau2));
+
+    let starts = [
+        // θ only (lme4's `start = list(theta = …)`), θ̂ ≈ 0.64 perturbed to 3.
+        (
+            "theta-only",
+            StartValues {
+                beta: vec![],
+                theta: vec![3.0],
+            },
+        ),
+        // β only: halved β̂, θ falls back to the THETA0 blind start.
+        (
+            "beta-only",
+            StartValues {
+                beta: cold.beta.iter().map(|b| 0.5 * b).collect(),
+                theta: vec![],
+            },
+        ),
+    ];
+    for (label, start) in &starts {
+        let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(start), &opts);
+        assert!(warm.converged(), "{label}: must converge");
+        for j in 0..p {
+            let rel = (warm.beta[j] - cold.beta[j]).abs() / cold.beta[j].abs();
+            assert!(
+                rel < 1e-3,
+                "{label}: β[{j}] warm {} vs cold {} (rel {rel})",
+                warm.beta[j],
+                cold.beta[j]
             );
         }
         let (w, c) = (warm.tau2[0].sqrt(), cold.tau2[0].sqrt());
@@ -206,7 +284,7 @@ fn fit_grouped_honors_opts_wald_se() {
             ..FitOptions::default()
         },
     );
-    assert!(hess.converged && rx.converged);
+    assert!(hess.converged() && rx.converged());
     assert!(
         (hess.se[1] - rx.se[1]).abs() > 1e-6,
         "Rx vs Hessian SE must differ"
@@ -270,7 +348,12 @@ fn fit_glmm_cbpp_matches_lme4() {
         },
     );
 
-    assert!(f.converged, "cbpp GLMM must converge");
+    assert!(f.converged(), "cbpp GLMM must converge");
+    assert!(
+        f.diagnostics.notes.is_empty(),
+        "a well-behaved fit carries no PirlsExhausted note, got {:?}",
+        f.diagnostics.notes
+    );
     // Bands are validation/tol.R's cross-engine numbers (beta_rel, se_hessian_rel,
     // stddev_rel = 1e-3) — change together with that file. This is a glmm↔lme4
     // claim, so tol.R's calibration is the one that applies. Measured agreement
@@ -361,7 +444,7 @@ fn fit_glmm_cbpp_aggregated_matches_lme4() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "aggregated cbpp GLMM must converge");
+    assert!(f.converged(), "aggregated cbpp GLMM must converge");
     for j in 0..p {
         let b_rel = (f.beta[j] - CBPP_REF_BETA[j]).abs() / CBPP_REF_BETA[j].abs();
         assert!(
@@ -387,7 +470,7 @@ fn fit_glmm_cbpp_aggregated_matches_lme4() {
     // lme4 logLik on the same cbind(incidence, size−incidence) fit
     // (validation/results/lme4_empirical/cbpp.json .estimates.loglik) — the
     // aggregated-binomial saturated constant (incl. ln C(mᵢ,sᵢ)) restored
-    // under prior weights, the engine-spec §7.6 gate.
+    // under prior weights.
     assert!(
         (f.loglik - CBPP_REF_LOGLIK).abs() < 1e-3,
         "loglik {} vs lme4 {CBPP_REF_LOGLIK}",
@@ -438,7 +521,10 @@ fn fit_glmm_offset_constant_shifts_intercept() {
     };
 
     let f0 = fit_cold(&x, &y, n, p, &model, &ids, &base_opts);
-    assert!(f0.converged, "no-offset aggregated cbpp GLMM must converge");
+    assert!(
+        f0.converged(),
+        "no-offset aggregated cbpp GLMM must converge"
+    );
 
     const OFFSET_VAL: f64 = 0.7;
     let f_off = fit_cold(
@@ -453,7 +539,10 @@ fn fit_glmm_offset_constant_shifts_intercept() {
             ..base_opts.clone()
         },
     );
-    assert!(f_off.converged, "offset aggregated cbpp GLMM must converge");
+    assert!(
+        f_off.converged(),
+        "offset aggregated cbpp GLMM must converge"
+    );
 
     assert!(
         (f_off.beta[0] - (f0.beta[0] - OFFSET_VAL)).abs() < 5e-4,
@@ -560,7 +649,7 @@ fn fit_glmm_cbpp_aggregated_matches_expanded() {
         );
         let tag = format!("{wald_se:?}");
         assert!(
-            fe.converged && fa.converged,
+            fe.converged() && fa.converged(),
             "{tag}: both fits must converge"
         );
         for j in 0..p {
@@ -678,7 +767,7 @@ fn fit_glmm_poisson_weighted_matches_lme4() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "weighted Poisson GLMM must converge");
+    assert!(f.converged(), "weighted Poisson GLMM must converge");
     for j in 0..p {
         assert!(
             (f.beta[j] - REF_BETA[j]).abs() < 2e-3,
@@ -794,7 +883,7 @@ fn fit_glmm_gamma_weighted_matches_lme4() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "weighted Gamma GLMM must converge");
+    assert!(f.converged(), "weighted Gamma GLMM must converge");
     for j in 0..p {
         let b_rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
         assert!(
@@ -891,7 +980,7 @@ fn fit_glmm_poisson_grouseticks_matches_lme4() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "poisson GLMM must converge");
+    assert!(f.converged(), "poisson GLMM must converge");
     for j in 0..p {
         assert!(
             (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
@@ -997,7 +1086,7 @@ fn fit_glmm_poisson_offset_matches_lme4() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "offset poisson GLMM must converge");
+    assert!(f.converged(), "offset poisson GLMM must converge");
     for (j, (&b, &r)) in f.beta.iter().zip(&REF_BETA).enumerate() {
         // Intercept is near zero under this offset — absolute band there.
         let ok = if r.abs() > 0.1 {
@@ -1132,7 +1221,7 @@ fn fit_glmm_poisson_grouseticks_3crossed_matches_lme4() {
     );
 
     assert!(
-        f.converged,
+        f.converged(),
         "3-crossed poisson GLMM must converge (not the degenerate start fit)"
     );
     // Bands are `validation/tol.R`'s cross-engine ones (beta_rel/stddev_rel 1e-3),
@@ -1450,9 +1539,27 @@ fn sparse_schur_small_e_matches_dense() {
 /// ~ period + (1|herd)` (expanded 0/1) at nAGQ ∈ {1,7,11}, gated against frozen
 /// `glmer(nAGQ=k)` (`validation/goldens/cbpp_agq_k{1,7,11}.json`). nAGQ=1 is Laplace
 /// (≡ `fit_glmm_cbpp_matches_lme4`); k>1 shifts β/varcomp off it as the Laplace
-/// bias is integrated out (herd sd 0.642→0.648). β + varcomp only — the AGQ
-/// goldens don't freeze SE (AGQ changes the integral, not the SE convention).
-/// The oracle is sacred.
+/// bias is integrated out (herd sd 0.642→0.648). The oracle is sacred.
+///
+/// **β + varcomp only, deliberately.** The `cbpp_agq_k*` goldens *do* carry
+/// `se_hessian` (we agree with them to 6.0e-6 / 1.1e-5 / 1.4e-5 at k = 1/7/11),
+/// so this is a choice about what each test owns, not a gap in the reference:
+/// what k > 1 changes here is the integral, and β/varcomp are where that shows.
+/// The FD-Hessian SE machinery is gated at nAGQ = 1 by
+/// `fit_glmm_cbpp_matches_lme4` on this very fit, and at nAGQ = 7/11 by
+/// `fit_glmm_binomial_bigsd_agq_matches_lme4`.
+///
+/// AGQ does not leave the SE *convention* alone: `fd_hessian_cov` differentiates
+/// the deviance through `ws.nagq`, so at k > 1 it differences the AGQ deviance,
+/// not the Laplace one — the SE is a property of the quadrature order like
+/// everything else. What is true, measured
+/// 2026-07-30 across the 0.1.4 FD-θ-step fix, is the *step rule*'s behaviour: the
+/// θ-profile of the AGQ deviance obeys the same O(h²) truncation law as the
+/// Laplace one, with the same constant. Dropping the `max(1, |θ̂|)` scaling
+/// divides the error by θ̂² to within 6% at nAGQ = 1 and 7 and 11 alike, over
+/// θ̂ ∈ [1.13, 5.16]. That is why one step rule serves every k, and why cbpp
+/// (herd sd 0.647, below the `max(1, ·)` floor) is bit-identical across that fix
+/// at all three orders.
 #[test]
 fn fit_glmm_binomial_agq_matches_lme4() {
     // (nAGQ, β, herd sd) per frozen glmer(nAGQ=k).
@@ -1539,7 +1646,7 @@ fn fit_glmm_binomial_agq_matches_lme4() {
                 ..FitOptions::default()
             },
         );
-        assert!(f.converged, "binomial AGQ k={nagq} must converge");
+        assert!(f.converged(), "binomial AGQ k={nagq} must converge");
         for (j, (&b, &rb)) in f.beta.iter().zip(&refb).enumerate() {
             assert!(
                 (b - rb).abs() / rb.abs() < 1e-3,
@@ -1619,7 +1726,7 @@ fn fit_glmm_cbpp_aggregated_agq_matches_lme4() {
             },
         );
         assert!(
-            f.converged,
+            f.converged(),
             "aggregated binomial AGQ k={nagq} must converge"
         );
         for (j, (&b, &rb)) in f.beta.iter().zip(&refb).enumerate() {
@@ -1684,7 +1791,7 @@ fn fit_glmm_binomial_agq_parallel_inner_knob_is_bit_identical() {
                 ..FitOptions::default()
             },
         );
-        assert!(f_on.converged && f_off.converged, "nagq={nagq}");
+        assert!(f_on.converged() && f_off.converged(), "nagq={nagq}");
         for (j, (&b_on, &b_off)) in f_on.beta.iter().zip(&f_off.beta).enumerate() {
             assert_eq!(
                 b_on.to_bits(),
@@ -1796,7 +1903,7 @@ fn fit_glmm_poisson_agq_matches_lme4() {
                 ..FitOptions::default()
             },
         );
-        assert!(f.converged, "poisson AGQ k={nagq} must converge");
+        assert!(f.converged(), "poisson AGQ k={nagq} must converge");
         for (j, (&b, &rb)) in f.beta.iter().zip(&refb).enumerate() {
             assert!(
                 (b - rb).abs() / rb.abs() < 1e-3,
@@ -1886,7 +1993,7 @@ fn fit_glmm_probit_cbpp_matches_lme4() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "probit GLMM must converge");
+    assert!(f.converged(), "probit GLMM must converge");
     let sd_rel = (f.tau2[0].sqrt() - REF_HERD_SD).abs() / REF_HERD_SD;
     assert!(
         sd_rel < 3e-3,
@@ -1962,7 +2069,7 @@ fn fit_glmm_gamma_inverse_link_matches_lme4() {
     );
 
     assert!(
-        f.converged,
+        f.converged(),
         "gamma-inverse GLMM must converge (the FD-Hessian must anchor on the fit's own mode)"
     );
     for j in 0..p {
@@ -2050,7 +2157,7 @@ fn fit_glmm_gamma_sim_matches_lme4() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "gamma GLMM must converge");
+    assert!(f.converged(), "gamma GLMM must converge");
     let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
     assert!(disp_rel < 2e-2, "φ̂ = {} vs lme4 {REF_DISP}", f.dispersion);
     for j in 0..p {
@@ -2104,7 +2211,7 @@ fn fit_glmm_gamma_sim_matches_lme4() {
             ..FitOptions::default()
         },
     );
-    assert!(f_rx.converged, "gamma GLMM (Rx) must converge");
+    assert!(f_rx.converged(), "gamma GLMM (Rx) must converge");
     #[allow(clippy::needless_range_loop)]
     for j in 0..p {
         let se_rel = (f_rx.se[j] - REF_SE_RX[j]).abs() / REF_SE_RX[j];
@@ -2120,6 +2227,19 @@ fn fit_glmm_gamma_sim_matches_lme4() {
 /// NB GLMM `y ~ 1 + x + grp + (1|cluster)` on sim_nb via the outer-θ loop,
 /// gated against frozen `lme4::glmer.nb` (`validation/goldens/sim_nb_glmm.json`).
 /// `dispersion = θ̂`. lme4-only SE. The oracle is sacred.
+///
+/// **Additive Rust-vs-Rust pin (2026-08-06).** Gates `golden_max_ln_theta`
+/// (`src/fit/glm.rs`) and the NB marginal-θ path (`fit_glmm_nb`,
+/// `src/fit/glmm.rs`) directly — the lme4 bands above (5e-3 β, 5e-2 se/θ̂) are
+/// too loose to tell a regression from rounding: a knife-edge
+/// in the inner fixed-θ fit that a 1e-8-wide
+/// golden-section stopping width could land on either side of; loosening the
+/// width to 1e-4 (`glm.rs`'s own provenance comment) removed the two-branch
+/// behavior. `BAND = 1e-7` is 10-50× the measured worst-case drift on this
+/// fixture at the new width: 6.17e-9 relative under a 128-draw 1-ULP sweep on
+/// `sim_nb`'s inputs (K=64 on `x`, K=64 on `y`), 5.16e-11 under the committed
+/// `pulp` lane-width probe (scalar-forced vs normal dispatch) — both far
+/// inside the band, both probes agree on the order of magnitude.
 #[test]
 fn fit_glmm_nb_sim_matches_lme4() {
     const REF_BETA: [f64; 3] = [-0.0207782143496, 0.593950952004, 0.59944069353];
@@ -2156,7 +2276,7 @@ fn fit_glmm_nb_sim_matches_lme4() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "NB GLMM must converge");
+    assert!(f.converged(), "NB GLMM must converge");
     let th_rel = (f.dispersion - REF_THETA).abs() / REF_THETA;
     assert!(th_rel < 5e-2, "θ̂ = {} vs lme4 {REF_THETA}", f.dispersion);
     for j in 0..p {
@@ -2186,6 +2306,28 @@ fn fit_glmm_nb_sim_matches_lme4() {
         f.loglik
     );
     assert_eq!(f.df, 5); // 3 β + cluster θ_RE + NB θ
+
+    // Additive bit-exact pin (see doc comment above). Frozen at the same
+    // `golden_max_ln_theta` stopping width (1e-4) this fixture's fit above
+    // just ran at.
+    const BAND: f64 = 1e-7;
+    const REF_BETA_PIN: [f64; 3] = [-0.02075568116330833, 0.5939541494671592, 0.5994666840076409];
+    const REF_SE_PIN: [f64; 3] = [
+        0.16316851193776868,
+        0.07212836302375578,
+        0.14148159540123056,
+    ];
+    const REF_TAU2_PIN: [f64; 1] = [0.3297226921658576];
+    const REF_THETA_PIN: f64 = 1.783_599_975_969_345;
+    assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb pinned beta");
+    assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb pinned se");
+    assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb pinned tau2");
+    assert_pinned(
+        &[f.dispersion],
+        &[REF_THETA_PIN],
+        BAND,
+        "sim_nb pinned theta",
+    );
 }
 
 /// NB GLMM on an UNBALANCED NESTED design: `y ~ 1 + x + (1|g1/g2)` on
@@ -2197,6 +2339,14 @@ fn fit_glmm_nb_sim_matches_lme4() {
 /// lme4-only SE (Hessian, glmm's default). tau2 layout: [primary g1 |
 /// nested g2:g1] — the golden's varcomp lists g2:g1 first (lme4 orders by
 /// descending level count). The oracle is sacred.
+///
+/// **Additive Rust-vs-Rust pin (2026-08-06).** Same treatment and same
+/// reasoning as `fit_glmm_nb_sim_matches_lme4`'s pin — see its doc comment.
+/// This fixture is not redundant with that one: two variance blocks instead
+/// of one, and its own independently measured drift, never copied from
+/// `sim_nb`'s. `BAND = 1e-7` is 10-50× the measured worst case at the 1e-4
+/// stopping width: 7.84e-9 relative under the 128-draw 1-ULP sweep (K=64 on
+/// `x`, K=64 on `y`), 7.64e-10 under the lane-width probe.
 #[test]
 fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
     const REF_BETA: [f64; 2] = [0.584998228282064, 0.507364808670142];
@@ -2255,7 +2405,7 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "nested NB GLMM must converge");
+    assert!(f.converged(), "nested NB GLMM must converge");
     let th_rel = (f.dispersion - REF_THETA).abs() / REF_THETA;
     assert!(th_rel < 5e-2, "θ̂ = {} vs lme4 {REF_THETA}", f.dispersion);
     for j in 0..p {
@@ -2285,6 +2435,24 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
         nest_rel < 2e-2,
         "g2:g1 sd = {} vs lme4 {REF_NEST_SD}",
         f.tau2[1].sqrt()
+    );
+
+    // Additive bit-exact pin (see doc comment above). Frozen at the same
+    // `golden_max_ln_theta` stopping width (1e-4) this fixture's fit above
+    // just ran at.
+    const BAND: f64 = 1e-7;
+    const REF_BETA_PIN: [f64; 2] = [0.5849258898680778, 0.5073630231065611];
+    const REF_SE_PIN: [f64; 2] = [0.2048298934582241, 0.053993815699549405];
+    const REF_TAU2_PIN: [f64; 2] = [0.39569392783021273, 0.12615822089462564];
+    const REF_THETA_PIN: f64 = 1.430_063_029_750_896_3;
+    assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb_nested pinned beta");
+    assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb_nested pinned se");
+    assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb_nested pinned tau2");
+    assert_pinned(
+        &[f.dispersion],
+        &[REF_THETA_PIN],
+        BAND,
+        "sim_nb_nested pinned theta",
     );
 }
 
@@ -2524,6 +2692,10 @@ fn assert_two_stage_matches_single_local(
 #[test]
 #[ignore]
 fn two_stage_matches_single_stage_cbpp_probit_and_gamma() {
+    // Serialized under alloc-tests so its allocations can't land in a
+    // concurrent dhat profiler window on an `-- --ignored` run.
+    #[cfg(feature = "alloc-tests")]
+    let _serial = crate::test_support::alloc_test_guard();
     // cbpp probit binomial GLMM (blocked, non-canonical probit link).
     {
         let (x, y, cluster_ids, n) = cbpp_design();
@@ -2596,6 +2768,7 @@ fn check_vector_agq_pin(
     ref_se: &[f64],
     ref_stddev: &[f64],
     corr_lower: &[f64],
+    band: f64,
 ) {
     let mut y = Vec::<f64>::new();
     let mut xc: Vec<Vec<f64>> = vec![vec![]; n_x];
@@ -2638,25 +2811,40 @@ fn check_vector_agq_pin(
         ..FitOptions::default() // WaldSe::Hessian — the se_hessian partner
     };
     let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert!(f.converged, "{name} k={nagq} must converge");
+    assert!(f.converged(), "{name} k={nagq} must converge");
 
     let what = format!("{name} k={nagq}");
-    assert_pinned(&f.beta, ref_beta, PIN_REL_ITER, &format!("{what} beta"));
-    assert_pinned(&f.se, ref_se, PIN_REL_ITER, &format!("{what} se"));
+    assert_pinned(&f.beta, ref_beta, band, &format!("{what} beta"));
+    assert_pinned(&f.se, ref_se, band, &format!("{what} se"));
     let (stddev, corr) = f.stddev_corr(0);
-    assert_pinned(&stddev, ref_stddev, PIN_REL_ITER, &format!("{what} stddev"));
+    assert_pinned(&stddev, ref_stddev, band, &format!("{what} stddev"));
     let lower: Vec<f64> = (0..stddev.len())
         .flat_map(|t| (0..t).map(move |u| (t, u)))
         .map(|(t, u)| corr[t][u])
         .collect();
-    assert_pinned(&lower, corr_lower, PIN_REL_ITER, &format!("{what} corr"));
+    assert_pinned(&lower, corr_lower, band, &format!("{what} corr"));
 }
 
 /// Vector AGQ (q=2), binomial: `y ~ x + (1 + x | g)` on sim_binomial_slope1 at
 /// nAGQ ∈ {7, 11}. Validated cross-engine by the
 /// `sim_binomial_slope1_agq_k{7,11}` cells against GLMMadaptive.
+///
+/// Relative-tolerance, not bit-equal. These values reproduce BIT-EXACTLY on the
+/// anchor machine (see `assert_pinned`'s "which machine the pins are frozen on");
+/// BAND is margin for aarch64-apple-darwin, where the k=11 β drifts 1.51e-7
+/// (`beta[0]`) from architecture-dependent SIMD/FMA contraction on this kernel's
+/// long reductions. 5e-6 is ~33x that: loose enough to absorb cross-arch
+/// reassociation, tight enough that a real change in the fit still trips it.
+///
+/// **k=7 `ref_se` re-anchored 2026-07-31.** Both of its elements had been frozen
+/// off-anchor and missed by 3.6e-15 / 1.5e-13 — invisible under BAND, and old
+/// enough that the responsible toolchain or faer bump is not identifiable. Not a
+/// numerical finding at that size; re-pinned only so "bit-exact on the anchor"
+/// holds without exceptions and stays checkable. β, stddev and corr were already
+/// exact and are untouched, as is k=11.
 #[test]
 fn fit_glmm_binomial_slope1_vector_agq_is_pinned() {
+    const BAND: f64 = 5e-6;
     let csv = include_str!("../../validation/data/simulated/sim_binomial_slope1.csv");
     let family = Family::Binomial {
         link: BinomialLink::Logit,
@@ -2668,9 +2856,11 @@ fn fit_glmm_binomial_slope1_vector_agq_is_pinned() {
         1,
         family,
         &[0.42897645003558754, 0.43458315523970653],
-        &[0.1562674670018699, 0.1310475868542789],
+        // re-anchored 2026-07-31
+        &[0.15626746700186334, 0.13104758685425869],
         &[0.8758219936062426, 0.3726397459266911],
         &[0.5283132632086392],
+        BAND,
     );
     check_vector_agq_pin(
         "sim_binomial_slope1",
@@ -2682,14 +2872,42 @@ fn fit_glmm_binomial_slope1_vector_agq_is_pinned() {
         &[0.15627012841005886, 0.13105001203556532],
         &[0.8758453743269463, 0.3726611962891021],
         &[0.5283433982271978],
+        BAND,
     );
 }
 
 /// Vector AGQ (q=2), Poisson: `y ~ x + (1 + x | g)` on sim_poisson_slope1 at
 /// nAGQ ∈ {7, 11}. Validated cross-engine by the
 /// `sim_poisson_slope1_agq_k{7,11}` cells against GLMMadaptive.
+///
+/// Relative-tolerance, not bit-equal: these values were frozen on a
+/// different machine and reproduce here (aarch64-apple-darwin) only to rel
+/// ~2.05e-6 (k=7 `beta[1]`) and, the binding one, ~7.07e-5 (k=7 `corr[0]`) —
+/// not bit-exactly — architecture-dependent SIMD/FMA contraction on this
+/// kernel's long reductions, not a regression. 1e-3 is ~14x the worst
+/// observed drift: loose enough to absorb cross-arch reassociation, tight
+/// enough that a real change in the fit still trips it.
+///
+/// **`ref_se` re-pinned 2026-07-30 (0.1.4 FD-θ-step fix), then re-anchored
+/// 2026-07-31; β / stddev / corr are untouched throughout.** This fit's leading
+/// Cholesky diagonal is 1.0118, the only θ coordinate here above 1, so dropping
+/// the `max(1, |θ̂|)` scaling from the FD Hessian's θ step (`glmm::FD_STEP_BASE`,
+/// and the step-construction comment in `glmm/se.rs`) shrank exactly one of its
+/// steps, by 1.2%. Across that edit `se_hessian` moves 8.68e-7 (k=7) / 7.80e-7
+/// (k=11) relative — the SAME figure on both machines, which is the cleanest
+/// evidence available that the move is the fix and not the port — and **nothing
+/// else in the fit moves by a bit**. β, the RE stddevs and the correlations are
+/// bit-identical on both sides of the edit, which is why only `se` moved.
+///
+/// The 07-30 re-pin took its values from aarch64, splitting this test across two
+/// reference machines; 07-31 replaced them with the anchor's, which differ from
+/// the aarch64 ones by 5.2e-7 (k=7) / 7.4e-7 (k=11). Both are equally valid
+/// arithmetic and both sit far inside BAND — the point of preferring the anchor
+/// is corpus-wide, not local (`assert_pinned`, "re-freezing rule"). β/stddev/corr
+/// keep their original anchor constants and remain what sizes BAND.
 #[test]
 fn fit_glmm_poisson_slope1_vector_agq_is_pinned() {
+    const BAND: f64 = 1e-3;
     let csv = include_str!("../../validation/data/simulated/sim_poisson_slope1.csv");
     let family = Family::Poisson {
         link: crate::PoissonLink::Log,
@@ -2701,9 +2919,10 @@ fn fit_glmm_poisson_slope1_vector_agq_is_pinned() {
         1,
         family,
         &[-1.3538764484761825, 0.49328234955414413],
-        &[0.21833946383750474, 0.18544416147664192],
+        &[0.21833927439261516, 0.1854441204256203],
         &[1.0117923068022499, 0.33570973669422155],
         &[0.03689193891989874],
+        BAND,
     );
     check_vector_agq_pin(
         "sim_poisson_slope1",
@@ -2712,9 +2931,10 @@ fn fit_glmm_poisson_slope1_vector_agq_is_pinned() {
         1,
         family,
         &[-1.353312567495963, 0.493094585284533],
-        &[0.21807780917884897, 0.18530325400802838],
+        &[0.21807763915845102, 0.1853032173193218],
         &[1.0106390790816442, 0.33617266187700573],
         &[0.037212955698941674],
+        BAND,
     );
 }
 
@@ -2722,8 +2942,28 @@ fn fit_glmm_poisson_slope1_vector_agq_is_pinned() {
 /// sim_binomial_slope2 at nAGQ ∈ {7, 11} — the q_p ≤ 3 cap surface and the
 /// kernel's dimensional generality. Validated cross-engine by the
 /// `sim_binomial_slope2_agq_k{7,11}` cells against GLMMadaptive.
+///
+/// Relative-tolerance, not bit-equal. These values reproduce BIT-EXACTLY on the
+/// anchor machine (see `assert_pinned`'s "which machine the pins are frozen on");
+/// BAND is margin for aarch64-apple-darwin, where the k=7 β drifts 3.60e-6
+/// (`beta[2]`) from architecture-dependent SIMD/FMA contraction on this kernel's
+/// long reductions. 5e-5 is ~14x that: loose enough to absorb cross-arch
+/// reassociation, tight enough that a real change in the fit still trips it.
+///
+/// **`ref_se` re-pinned 2026-07-30 (0.1.4 FD-θ-step fix), then re-anchored
+/// 2026-07-31; β / stddev / corr are untouched throughout.** Same mechanism as
+/// the `sim_poisson_slope1` sibling above and documented there: only this fit's
+/// leading Cholesky diagonal (1.0640) is above 1, so exactly one FD θ step shrank,
+/// by 6.4%, and `se_hessian` moves 1.20e-7 relative at both k — again the same
+/// figure on both machines. Everything else in the fit is bit-identical across
+/// the edit. As on the sibling, the 07-30 re-pin took aarch64 values and 07-31
+/// replaced them with the anchor's (differing by 1.78e-6 at k=7, 9.7e-9 at k=11).
+/// The θ-step move is ~15x smaller than that cross-arch spread, so BAND is
+/// unchanged and still sized by `beta[2]`'s 3.60e-6 — both re-pins are
+/// bookkeeping, not a tolerance question.
 #[test]
 fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
+    const BAND: f64 = 5e-5;
     let csv = include_str!("../../validation/data/simulated/sim_binomial_slope2.csv");
     let family = Family::Binomial {
         link: BinomialLink::Logit,
@@ -2736,9 +2976,9 @@ fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
         family,
         &[0.3730517271148301, 0.538098978038483, -0.3654854470965549],
         &[
-            0.13111390541787663,
-            0.10465308883561775,
-            0.10556860651205546,
+            0.13111388966197157,
+            0.10465309428546639,
+            0.10556860947993794,
         ],
         &[1.0640265640371298, 0.6217295819798455, 0.6420938363939653],
         &[
@@ -2746,6 +2986,7 @@ fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
             0.13220156109374376,
             -0.030986539519051545,
         ],
+        BAND,
     );
     check_vector_agq_pin(
         "sim_binomial_slope2",
@@ -2755,9 +2996,9 @@ fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
         family,
         &[0.3730629587832013, 0.5381087834502509, -0.3654883076141031],
         &[
-            0.13112095270455848,
-            0.10465667876714824,
-            0.10557212730472322,
+            0.13112093692608306,
+            0.10465668422853727,
+            0.10557213027825517,
         ],
         &[1.0640974804776098, 0.6217673168423941, 0.6421365960857665],
         &[
@@ -2765,6 +3006,7 @@ fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
             0.13222240391317389,
             -0.03101919706448947,
         ],
+        BAND,
     );
 }
 
@@ -2838,12 +3080,259 @@ fn fit_glmm_binomial_no_cluster_signal_is_singular() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "no-signal GLMM must still converge");
-    assert!(f.singular, "must flag the θ≈0 boundary as singular");
+    assert!(f.converged(), "no-signal GLMM must still converge");
+    assert!(f.singular(), "must flag the θ≈0 boundary as singular");
     assert!(
         f.tau2[0] < 1e-4,
         "tau2[0] must pin near zero, got {}",
         f.tau2[0]
+    );
+}
+
+/// R1 of the large-θ̂ coverage spec, AGQ arm: binomial GLMM
+/// `y ~ 1 + x + z + (1 | g)` on `sim_binomial_bigsd` at nAGQ ∈ {7, 11}, gated
+/// against the frozen `glmer(nAGQ = k, tolPwrss = 1e-13)` goldens
+/// `validation/goldens/sim_binomial_bigsd_agq_k{7,11}.json`. lme4-only SE
+/// (MixedModels computes no `se_hessian`). The oracle is sacred.
+///
+/// **Why this rung exists.** It is the only in-crate gate that reaches the FD
+/// Hessian at a random-effect SD well above 1 — θ̂ = 4.85 (k=7) and 5.16 (k=11),
+/// against a corpus that otherwise tops out at 1.13. The θ step is
+/// `FD_STEP_BASE`, unscaled by θ̂, so these two fits difference the deviance
+/// over ±0.01 and carry only 1.9e-7 and 1.8e-7 relative truncation error off
+/// our own h→0 stencil limit even at this θ̂ range. Nothing else in the crate
+/// could see a step that scaled with θ̂: every other GLMM rung has θ̂ at or
+/// near 1.
+///
+/// **BAND = 2e-5, and it is reference-limited, not ours.** Measured post-fix
+/// through this test's own lowering on aarch64-apple-darwin 2026-07-30, worst
+/// coordinate of each quantity: `se_hessian` 7.18e-6 (k=7) / 8.35e-6 (k=11),
+/// β 2.13e-6 / 5.51e-6, RE stddev 2.35e-6 / 2.15e-6. `tol.R`'s convention is
+/// ceil-to-one-significant-figure of ~2× the measured worst, which the binding
+/// `se_hessian` figure (2 × 8.35e-6 = 1.67e-5) puts at 2e-5; β and stddev clear
+/// that with ≥3× to spare, so one band serves all three. The residual is **the
+/// golden's own**: lme4's `vcov(use.hessian = TRUE)` is `lme4:::deriv12` at an
+/// ABSOLUTE δ = 1e-4, which carries 8.34e-6 / 8.36e-6 relative error here — i.e.
+/// post-fix the whole remaining disagreement is accounted for by the reference,
+/// and tightening the band further would pin a number lme4 cannot itself
+/// reproduce (two runs of its own stencil differ by 4.5e-7…1.8e-6). Do not read
+/// the band as our accuracy.
+///
+/// **This band is not fail-before/pass-after evidence, and must not be read
+/// as it.** What it measures is against our own h→0 limit, not against lme4.
+/// The release's fail-before/pass-after rung is `sim_poisson_bigsd` in
+/// `validation/tol.R`'s `TOL_PER_RUNG`, not this test.
+///
+/// Sizing note: k = 7 → k = 11 still moves
+/// θ̂ by 6.3% on this dataset, so **k = 11 is not the AGQ limit here** and the two
+/// goldens are not expected to agree closely with each other — `se_hessian`
+/// differs between them by up to 6.2% on the intercept. That is the fit moving
+/// with the quadrature order, not disagreement, which is why each k is pinned
+/// against its own golden rather than against the other.
+#[test]
+fn fit_glmm_binomial_bigsd_agq_matches_lme4() {
+    // ceil₁(2 × 8.35e-6 = 1.67e-5); see the doc comment for why it is the reference's floor.
+    const BAND: f64 = 2e-5;
+    // (nAGQ, β, se_hessian, RE stddev) per the frozen golden.
+    let refs: [(u8, [f64; 3], [f64; 3], f64); 2] = [
+        (
+            7,
+            [0.786420873395614, 0.903437833126084, -0.616408180886449],
+            [0.333946011198284, 0.112745333379985, 0.195512460550797],
+            4.85249696634019,
+        ),
+        (
+            11,
+            [0.824994474498218, 0.913561093491045, -0.622307953920597],
+            [0.354539726379712, 0.113789698253031, 0.196816594693318],
+            5.15796068325673,
+        ),
+    ];
+    // Columns are y, x, z, g; `z` is numeric 0/1 and `g` (the grouping) is the
+    // only factor — the same lowering `validation/manifest.json` declares.
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_bigsd.csv");
+    let p = 3;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut g_raw = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        x.extend_from_slice(&[1.0, f[1].parse().unwrap(), f[2].parse().unwrap()]);
+        g_raw.push(f[3].parse().unwrap());
+    }
+    let n = y.len();
+    let (cluster_ids, n_clusters) = dense_ids(&g_raw);
+    assert_eq!((n, n_clusters), (1800, 300), "R1 fixture shape");
+    for (nagq, ref_beta, ref_se, ref_sd) in refs {
+        let model = ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: n_clusters as u32,
+                },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds {
+                primary: cluster_ids.clone(),
+                extra: vec![],
+            },
+            &FitOptions {
+                target_indices: vec![0, 1, 2],
+                nagq,
+                ..FitOptions::default() // WaldSe::Hessian — the whole point of the rung
+            },
+        );
+        assert!(f.converged(), "bigsd AGQ k={nagq} must converge");
+        assert!(!f.singular(), "bigsd AGQ k={nagq} is an interior fit");
+        let what = format!("sim_binomial_bigsd k={nagq}");
+        assert_pinned(&f.beta, &ref_beta, BAND, &format!("{what} beta"));
+        assert_pinned(&f.se, &ref_se, BAND, &format!("{what} se_hessian"));
+        let (stddev, _) = f.stddev_corr(0);
+        assert_pinned(&stddev, &[ref_sd], BAND, &format!("{what} stddev"));
+    }
+}
+
+/// R3 of the large-θ̂ coverage spec: the
+/// θ = 0 end of the same axis, on the **committed** `sim_binomial_zerosd`
+/// fixture rather than a synthetic draw.
+///
+/// This gates a *documented behavioural divergence*, not a number, and it is why
+/// R3 is deliberately NOT a curated `datasets` rung (`//large_theta_rungs` in
+/// `validation/manifest.json`). What diverges from lme4 is only the reporting:
+///
+/// - **glmm** pins the component and reports `converged = true` with
+///   `singular = true`.
+/// - **lme4** emits `boundary (singular) fit`, which lands in
+///   `m@optinfo$conv$lme4$messages` — so `engines/lme4.R:296`'s rule
+///   (`converged = length(messages) == 0`) records `converged = FALSE` for the
+///   very same fit. `isSingular()` is `TRUE` on both sides.
+///
+/// That difference-in-default had no test behind it.
+/// `compare.R` cannot supply one: it compares β, SEs, stddevs, loglik and
+/// coefficient names and reads no convergence flag at all — and both engines land
+/// on a **bit-exact 0.0** stddev, so every numeric gate it does run reports
+/// perfect agreement. Two further reasons the rung track is closed to R3, both
+/// measured 2026-07-30 rather than assumed: lme4's
+/// `vcov(m, use.hessian = TRUE)` — exactly what `engines/lme4.R:269` and `:146`
+/// call — **hard-errors** on this fit (`'use.hessian'=TRUE specified, but Hessian
+/// is unavailable`; `m@optinfo$derivs` is `NULL` on a boundary fit), so R3 as a
+/// rung would abort the whole oracle run; and at θ̂ = 0 the θ↔β coupling block
+/// vanishes, so `se_hessian` and `se_rx` collapse onto each other (9.4e-6 apart
+/// here, against 9.7e-2 on R1) — R3 gates nothing about the coupling term.
+///
+/// Hence: in-crate, no oracle JSON, asserting the flags and the exact zero.
+/// The exact zero is the assert that has to be `==`, not a band: `rel_max` floors
+/// its denominator at 1e-12 (`validation/tol.R`), so a *tiny nonzero* θ̂ against
+/// lme4's exact 0.0 would read as a relative difference of exactly 1.0. A
+/// seed sweep found Bernoulli-shaped cells that returned 1.5e-8 / 3.9e-8 **while
+/// still flagging singular** — which is why this fixture is the aggregated
+/// (`incidence`/`size`) shape and why "pinned" is checked as bit-equality.
+///
+/// Sibling of `fit_glmm_binomial_no_cluster_signal_is_singular` above, which makes
+/// the same claim on synthetic data with a `< 1e-4` band; this one is the committed
+/// fixture and the exact pin.
+#[test]
+fn glmm_zerosd_boundary_reports_converged_and_singular() {
+    // Aggregated binomial, lowered the way `validation/engines/common.rs`'s
+    // `lower_dataset_generic` does for a manifest `weights` rung: the response is
+    // `prop = incidence/size` and the trial counts enter as prior weights, one row
+    // per aggregate observation. X = [1, x, z] — `z` is numeric 0/1 in the CSV and
+    // the only declared factor is the grouping `g`.
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_zerosd.csv");
+    let p = 3;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut w = Vec::<f64>::new();
+    let mut cl = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        let incidence: f64 = f[0].parse().unwrap();
+        let size: f64 = f[1].parse().unwrap();
+        x.extend_from_slice(&[1.0, f[2].parse().unwrap(), f[3].parse().unwrap()]);
+        y.push(incidence / size);
+        w.push(size);
+        // Groups are labelled 1..=20 in the CSV; ids are 0-based and dense.
+        cl.push(f[4].parse::<u32>().unwrap() - 1);
+    }
+    let n = y.len();
+    let n_clusters = cl.iter().max().unwrap() + 1;
+    assert_eq!((n, n_clusters), (160, 20), "committed R3 fixture shape");
+
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cl,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            weights: Some(w),
+            ..FitOptions::default()
+        },
+    );
+
+    // The two flags the divergence is about, asserted together: reporting a pinned
+    // boundary as a *converged* fit is the whole claim, so `converged` alone or
+    // `singular` alone would each be satisfiable by the wrong behaviour.
+    assert!(
+        f.converged(),
+        "glmm must report the pinned θ=0 boundary as CONVERGED (lme4 records \
+         converged=FALSE on the same fit — documented divergence)"
+    );
+    assert!(
+        f.singular(),
+        "and must flag it singular, as lme4's isSingular does"
+    );
+
+    // Exact, not near: see the rel_max 1e-12-floor note above.
+    let (stddev, _) = f.stddev_corr(0);
+    assert_eq!(stddev.len(), 1, "one scalar grouping");
+    assert_eq!(
+        stddev[0].to_bits(),
+        0.0f64.to_bits(),
+        "RE stddev must be bit-exact 0.0, got {} (bits 0x{:016x})",
+        stddev[0],
+        stddev[0].to_bits()
+    );
+    assert_eq!(
+        f.tau2[0].to_bits(),
+        0.0f64.to_bits(),
+        "tau2[0] must be bit-exact 0.0, got {}",
+        f.tau2[0]
+    );
+    // A pinned boundary is still a reportable fit: the estimates must be finite,
+    // not the NaN-fill a numerical failure would leave behind.
+    assert!(
+        f.beta.iter().chain(&f.se).all(|v| v.is_finite()) && f.loglik.is_finite(),
+        "β/SE/loglik must be finite at the boundary: β {:?} se {:?} loglik {}",
+        f.beta,
+        f.se,
+        f.loglik
     );
 }
 
@@ -2895,7 +3384,7 @@ fn loop_tier_honours_extra_grouping_slope() {
     };
 
     let cold = fit_cold(&x, &y, n, 2, &model, &ids, &opts);
-    assert!(cold.converged, "reference fit must converge");
+    assert!(cold.converged(), "reference fit must converge");
     // tau2 layout: primary intercept, then the extra grouping's 2×2 vech block.
     assert!(
         cold.tau2.len() == 4 && cold.tau2[2] > 0.1,

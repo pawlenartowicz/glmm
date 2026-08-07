@@ -19,16 +19,58 @@ manifest <- fromJSON(file.path(suite_dir, "manifest.json"), simplifyDataFrame = 
 data_dir_of <- function(spec)
   file.path(suite_dir, "data",
             if (identical(spec$source, "sim")) "simulated" else "empirical")
-out_dir_of <- function(spec)
-  file.path(suite_dir, "results",
-            paste0("lme4_", if (identical(spec$source, "sim")) "simulated" else "empirical"))
+# `AGQ` (defined below, NULL on a normal run) redirects the whole pass into a
+# sibling tree; resolved at call time, so its later definition is fine.
+out_prefix <- function() if (is.null(AGQ)) "lme4_" else "lme4_agq_"
+out_dir_of <- function(spec) {
+  d <- file.path(suite_dir, "results",
+                 paste0(out_prefix(),
+                        if (identical(spec$source, "sim")) "simulated" else "empirical"))
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+  d
+}
 dir.create(file.path(suite_dir, "results", "lme4_empirical"), showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path(suite_dir, "results", "lme4_simulated"), showWarnings = FALSE, recursive = TRUE)
 
-# Timing loop; first pass discarded, median of the rest reported. 10 runs (was
-# 100): multi-second GLMM rungs made 100 repeats cost ~an hour per engine; each
-# result JSON records its own n_runs, so old 100-run files stay self-describing.
-N_RUNS <- 10
+# Timing is OPT-IN and its sample count lives in run.sh, not here.
+#
+# THE contract, mirrored in glmm.rs / mixedmodels.jl / glmm_python.py / glmm_r.R
+# `timing_runs` -- five languages that cannot share code, so change together:
+# VALIDATION_TIMINGS unset / "" / "0" means do not time (`timing` is written null);
+# otherwise it IS the sample count, an integer >= 2, first pass discarded, median of
+# the rest. run.sh validates the value; this errors rather than silently skipping
+# timing when the engine is run by hand with a malformed one.
+#
+# Each result JSON still records its own n_runs, so files timed under any count --
+# including the old hardcoded 10 and its 100-run predecessor -- stay self-describing.
+timing_runs <- function() {
+  v <- trimws(Sys.getenv("VALIDATION_TIMINGS"))
+  if (v == "" || v == "0") return(NULL)
+  n <- suppressWarnings(as.integer(v))
+  if (is.na(n) || n < 2)
+    stop("VALIDATION_TIMINGS must be 0 or an integer >= 2 (got '", v,
+         "'); N=2 keeps 1 sample after the warm-up discard")
+  n
+}
+N_RUNS <- timing_runs()  # NULL on an untimed run
+
+# AGQ timing pass, OPT-IN and orthogonal to everything above. VALIDATION_AGQ=<k>
+# refits the manifest's `agq`-marked datasets at nAGQ=k instead of the pinned
+# Laplace, into results/lme4_agq_* -- a separate tree because compare.R discovers
+# references by globbing results/lme4_{empirical,simulated}/*.json, so writing AGQ
+# fits there would silently expand the curated 6-rung oracle (design 6 forbids it).
+# Unset, every path below behaves exactly as before. Mirrors engines/glmm.rs's
+# VALIDATION_AGQ -- change together.
+agq_k <- function() {
+  v <- trimws(Sys.getenv("VALIDATION_AGQ"))
+  if (!nzchar(v) || identical(v, "0")) return(NULL)
+  n <- suppressWarnings(as.integer(v))
+  if (is.na(n) || n < 1 || n %% 2 == 0)
+    stop("VALIDATION_AGQ must be an ODD integer >= 1 (got '", v,
+         "'); the Gauss-Hermite table is built for orders 1, 3, 5, ...")
+  n
+}
+AGQ <- agq_k()  # NULL on a normal (Laplace) run
 
 read_dataset <- function(spec) {
   # `data` field: CSV to read when it differs from the rung name -- lets a
@@ -108,7 +150,10 @@ fit_call <- function(spec, df) {
     # 1e-12 where 1e-12 is itself clean (1e-16 aborts in step-halving; stay above
     # lme4's numeric floor). This is a documented solver-precision setting, not a
     # spec change -- the model (formula/family/link/nAGQ) is untouched.
-    function() glmer(fm, data = df, family = fam, weights = w, offset = o, nAGQ = 1,
+    # nAGQ is 1 on every normal run -- only the opt-in VALIDATION_AGQ timing pass
+    # (which writes to a separate results tree) raises it.
+    function() glmer(fm, data = df, family = fam, weights = w, offset = o,
+                     nAGQ = if (is.null(AGQ)) 1 else AGQ,
                      control = glmerControl(tolPwrss = 1e-13))
   }
 }
@@ -137,6 +182,9 @@ time_fit <- function(make_fit, batch = 1L) {
 # full fit+vcov for each (the glmer fit underlies both, so the gap is the SE-method
 # cost), mirroring glmm's per-method Rx/Hessian fit timings.
 time_one <- function(spec, make_fit) {
+  # Untimed run: no loops at all. NA rather than NULL because jsonlite writes an
+  # empty object for a NULL list element and `null` for NA under na = "null".
+  if (is.null(N_RUNS)) return(NA)
   batch <- if (is.null(spec$timing_batch)) 1L else as.integer(spec$timing_batch)
   # Fixed-only rungs: no Rx/Hessian method split (that is a glmer vcov choice),
   # a single fit timing regardless of family.
@@ -194,10 +242,14 @@ write_result <- function(spec, res) {
   out <- file.path(out_dir_of(spec), paste0(spec$name, ".json"))
   # digits = NA: full double precision -- this is an oracle, not a display.
   write(toJSON(res, auto_unbox = TRUE, pretty = TRUE, digits = NA, na = "null"), out)
-  t_disp <- if (!is.null(res$timing$fit_seconds_median)) res$timing$fit_seconds_median
+  # `$` on the NA an untimed run leaves behind would error ("invalid for atomic
+  # vectors"), so test for the list first; the console line then just omits the time.
+  t_disp <- if (!is.list(res$timing)) NULL
+            else if (!is.null(res$timing$fit_seconds_median)) res$timing$fit_seconds_median
             else res$timing$fit_seconds_median_hessian  # GLMM: show the heavier method
-  cat(sprintf("lme4  %-12s  rung %d  converged=%s singular=%s  fit_median=%.4gs\n",
-              spec$name, spec$rung, res$converged, res$singular, t_disp))
+  cat(sprintf("lme4  %-12s  rung %d  converged=%s singular=%s%s\n",
+              spec$name, spec$rung, res$converged, res$singular,
+              if (is.null(t_disp)) "" else sprintf("  fit_median=%.4gs", t_disp)))
 }
 
 # Fixed-only rungs (weights suite): lm / glm / MASS::glm.nb reference fits, same
@@ -314,5 +366,20 @@ specs <- manifest$datasets
 if (nzchar(only)) {
   keep <- strsplit(only, ",")[[1]]
   specs <- Filter(function(s) s$name %in% keep, specs)
+}
+# AGQ pass: only the `agq`-marked datasets, and of those only the ones glmer will
+# actually take. glmer refuses nAGQ>1 for a vector RE ("nAGQ > 1 is only available
+# for models with a single, scalar random-effects term"), so the q>=2 entries are
+# glmm-only and are reported skipped rather than left to error mid-run.
+if (!is.null(AGQ)) {
+  marked <- Filter(function(s) !is.null(s$agq), specs)
+  scalar <- vapply(marked, function(s) {
+    bars <- findbars(as.formula(s$r_formula))
+    length(bars) == 1 && identical(bars[[1]][[2]], 1)
+  }, TRUE)
+  for (s in marked[!scalar])
+    cat(sprintf("lme4  %-12s  SKIPPED at nAGQ=%d (vector RE; glmer is scalar-only)\n",
+                s$name, AGQ))
+  specs <- marked[scalar]
 }
 for (spec in specs) fit_one(spec)

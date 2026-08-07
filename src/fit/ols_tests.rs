@@ -74,11 +74,11 @@ fn fit_ols_recovers_slope() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged);
+    assert!(f.converged());
     assert!((f.beta[1] - 2.0).abs() < 1e-6);
     // OLS reports deviance: NaN, singular: false unconditionally (fit/ols.rs).
     assert!(f.deviance.is_nan());
-    assert!(!f.singular);
+    assert!(!f.singular());
     assert!(f.tau2.is_empty());
     // y = 2*i is an exact fit (no noise) → RSS/(n-p) ≈ 0, not the GLM φ≡1 convention.
     assert!(f.dispersion >= 0.0 && f.dispersion < 1e-9);
@@ -118,7 +118,7 @@ fn fit_ols_weighted_matches_r_lm() {
         ..FitOptions::default()
     };
     let f = fit_cold(&x, &y, n, 2, &model, &GroupIds::default(), &opts);
-    assert!(f.converged);
+    assert!(f.converged());
     for j in 0..2 {
         assert!((f.beta[j] - REF_BETA[j]).abs() < 1e-9, "beta[{j}]");
         assert!((f.se[j] - REF_SE[j]).abs() < 1e-9, "se[{j}]");
@@ -183,7 +183,7 @@ fn fit_ols_offset_matches_r_lm() {
         ..FitOptions::default()
     };
     let f = fit_cold(&x, &y, n, 2, &model, &GroupIds::default(), &opts);
-    assert!(f.converged);
+    assert!(f.converged());
     for (j, (&b, &r)) in f.beta.iter().zip(&REF_BETA).enumerate() {
         assert!((b - r).abs() < 1e-9, "beta[{j}] {b} vs R {r}");
     }
@@ -263,5 +263,107 @@ fn fit_ols_constant_weights_invariant() {
     for j in 0..2 {
         assert!((f0.beta[j] - f1.beta[j]).abs() < 1e-12);
         assert!((f0.se[j] - f1.se[j]).abs() < 1e-12);
+    }
+}
+
+/// Weighted-collinear OLS: full rank in the RAW design, near-singular once
+/// weighted. The fit comes back, the pivot records that it is barely identified,
+/// and the standard error says so out loud.
+///
+/// This class is invisible to every check upstream of the solve. The
+/// pre-dispatch alias gate (`detect_aliased`) tests the UNWEIGHTED `X'X`, where
+/// column 2 has a healthy pivot ratio — the two predictor columns differ by a
+/// full unit on the last third of the rows. But that third carries weight 1e-14,
+/// so in `X'WX` — the matrix β̂ and its SEs actually come from — the columns are
+/// very nearly the same column, and the pivot ratio falls below 1e-12.
+///
+/// The route used to guard this on `min|L_ii| / max|L_ii|`, which conflates
+/// collinearity with column scale and never fires here (measured 4.8e-8, four
+/// orders above its own 1e-12 threshold). It is not fixed by refusing on the
+/// right statistic either: the 2026-07-31 1-ULP sweep showed this route's
+/// standard errors stay stable to 1.3e-13 relative and never understate the
+/// error, all the way past total loss of β̂. So the deliverable is the
+/// combination asserted below — the estimates are returned, and the SE beside
+/// them is orders larger than the coefficient, which is what tells the caller
+/// the number is worthless.
+#[test]
+fn fit_ols_weighted_collinear_fits_with_an_honest_se() {
+    let n = 60;
+    let p = 3;
+    // Rows at or above `split` carry a negligible weight. 1e-11 is the value
+    // that puts the WEIGHTED pivot at 2.0e-13 — inside the flagging band, and
+    // still comfortably positive-definite so faer's Cholesky accepts it and the
+    // fit is actually produced. A smaller weight makes X'WX numerically
+    // indefinite and the route refuses on `llt` instead, which tests a
+    // different path.
+    let split = 40;
+    const WSMALL: f64 = 1e-11;
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    let mut w = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = ((i * 13) % 17) as f64 - 8.0;
+        // `delta` is what separates the two predictor columns, and it lives
+        // ENTIRELY on the negligibly-weighted rows.
+        let delta = if i < split { 0.0 } else { 1.0 };
+        x.extend_from_slice(&[1.0, a, a + delta]);
+        y.push(0.5 + 1.3 * a + 0.477 * (a + delta) + ((i % 3) as f64 - 1.0));
+        w.push(if i < split { 1.0 } else { WSMALL });
+    }
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        weights: Some(w),
+        ..FitOptions::default()
+    };
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let ids = GroupIds {
+        primary: vec![],
+        extra: vec![],
+    };
+
+    // The raw design really is full rank: the alias gate passes it through, so
+    // nothing before the solve can see the problem.
+    assert!(
+        !super::common::detect_aliased(&x, n, p).iter().any(|&a| a),
+        "the RAW design is full rank — this test is only meaningful if the \
+         alias gate lets it through"
+    );
+
+    // The recorded pivot is on the WEIGHTED Gram and must be in the flagging
+    // band; the raw Gram's own pivot is orders above it, which is the whole
+    // point of measuring the matrix the fit actually used.
+    let mut ws = OlsWorkspace::new(n, p, opts.target_indices.len(), true);
+    let x_mat = super::common::to_col_major(&x, n, p);
+    let view = fit_ols_prebuilt(&mut ws, x_mat.as_ref().subrows(0, n), &y, n, p, &opts);
+    assert!(
+        view.converged,
+        "the fit is computable and must be returned, not refused"
+    );
+    assert!(
+        view.pivot < crate::ols::PIVOT_MIN,
+        "the weighted pivot must land in the ill-conditioned band, got {}",
+        view.pivot
+    );
+
+    let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(f.converged(), "the fit is computable and must be returned");
+    assert_eq!(
+        f.aliased(),
+        vec![false; p],
+        "nothing is redundant in the raw design, so no column is dropped"
+    );
+    // The honest report: the two entangled coefficients carry standard errors
+    // orders larger than themselves. A caller reading `se` cannot mistake these
+    // for estimates.
+    for j in [1usize, 2] {
+        assert!(
+            f.se[j] > 100.0 * f.beta[j].abs(),
+            "β[{j}] = {} must carry an SE orders above it, got {}",
+            f.beta[j],
+            f.se[j]
+        );
     }
 }

@@ -1,13 +1,20 @@
 #!/usr/bin/env Rscript
-# Boundary-fits follow-up spec, Part A: verify the 37 oracle-error (lme4
-# identifiability-refusal) diligent cells against a third oracle,
-# MixedModels.jl. Joins glmm vs MM using the same stddevs_of/corrs_of/rel_max
-# machinery and lmm tolerance bands as analyze.R (docs/GLMM/plans/
-# 2026-07-14-boundary-fits-followup-spec.md). Deviance is not gated (MM's
-# objective constant differs from glmm's REML criterion — same rule
-# analyze.R applies to GLMMadaptive rows).
+# Verifies the 37 oracle-error (lme4 identifiability-refusal) diligent cells
+# against a third oracle, MixedModels.jl. Joins glmm vs MM using the same
+# stddevs_of/corrs_of/rel_max machinery and lmm tolerance bands as analyze.R.
+# Deviance is not gated (MM's objective constant differs from glmm's REML
+# criterion — same rule analyze.R applies to GLMMadaptive rows).
 #
 #   Rscript verify_boundary37.R [glmm.jsonl] [mixedmodels.jsonl]
+#
+# ── objective mode ────────────────────────────────────────────────────────
+# Set VERIFY_OBJECTIVE to a file of case_ids and the script ALSO runs the
+# whose-optimum-is-lower protocol on those cells, writing
+# reports/objective_verdicts.csv. That protocol answers a different question
+# from the join above -- not "do two engines' numbers agree" but "which of two
+# candidate answers scores better on one engine's own objective" -- and the
+# second question is the only one that decides a disagreement. See the
+# `-- objective mode --` block at the bottom.
 suppressMessages({ library(jsonlite) })
 
 suite_dir <- normalizePath(dirname(sub(
@@ -109,4 +116,146 @@ if (nrow(adj) > 0) {
     cat(sprintf("%-42s beta=%.1e stddev=%.1e corr=%.1e se=%.1e dev_gap=%+.4f  [%s]\n",
                 r$case_id, r$d_beta, r$d_stddev, r$d_corr, r$d_se, r$dev_gap, r$verdict))
   }
+}
+
+# ── objective mode ─────────────────────────────────────────────────────────
+# The join above compares two engines' ANSWERS. When they disagree that cannot
+# say which is right, because both are just numbers. This block asks the
+# question that can: it takes lme4's own REML criterion as the referee and
+# evaluates it at BOTH candidate answers. Whichever scores lower is the better
+# fit of the model lme4 itself is optimizing -- a verdict, not a resemblance.
+#
+# HOW A CANDIDATE IS SCORED WITHOUT ITS RESIDUAL SD. lmer(devFunOnly = TRUE) is
+# a function of theta, the covariance factor RELATIVE to the residual SD, and
+# neither engine records that SD -- only the absolute variance components. So a
+# candidate fixes theta's DIRECTION but not its scale: every recorded answer
+# names a ray {theta_shape / s : s > 0} through theta-space rather than a point.
+# The criterion is minimized along that ray. The minimum is a lower bound on the
+# candidate's own score, which is all a "which is lower" verdict needs, and it
+# costs one 1-D optimization instead of a refit.
+#
+# THE SELF-CHECK THAT MAKES THIS TRUSTWORTHY. lme4's OWN recorded answer runs
+# through the identical path. Its ray passes through its own optimum, so the
+# minimum along it must reproduce the deviance lme4 recorded. `lme4_roundtrip`
+# is that residual: if it is not ~0, the theta reconstruction is wrong and every
+# other number in the row is meaningless. Read it before reading the verdict.
+#
+# GAUSSIAN CELLS ONLY. glmer's devfun takes (theta, beta) jointly and its
+# profiling story is different; nothing here applies to it unchanged.
+objective_file <- Sys.getenv("VERIFY_OBJECTIVE", "")
+if (nzchar(objective_file)) {
+  suppressMessages(library(lme4))
+  lme4_path <- if (length(args) >= 3) args[3] else
+    file.path(suite_dir, "results", "lme4.jsonl")
+  lme4_rec <- read_jsonl(lme4_path)
+  obj_ids <- readLines(objective_file); obj_ids <- obj_ids[nzchar(obj_ids)]
+
+  # Lower-triangular Cholesky factor that tolerates a SEMI-definite Sigma.
+  # base::chol() errors on one, and a boundary fit -- the whole population this
+  # block exists for -- is exactly where a variance component sits at zero and
+  # Sigma loses rank. Cholesky-Banachiewicz with the pivot clamped at zero
+  # returns the factor lme4's own theta carries there.
+  chol_lower_psd <- function(S) {
+    n <- nrow(S); L <- matrix(0, n, n)
+    for (j in seq_len(n)) {
+      d <- S[j, j] - sum(L[j, seq_len(j - 1)]^2)
+      L[j, j] <- if (d > 0) sqrt(d) else 0
+      if (j < n) for (i in (j + 1):n) {
+        L[i, j] <- if (L[j, j] > 0)
+          (S[i, j] - sum(L[i, seq_len(j - 1)] * L[j, seq_len(j - 1)])) / L[j, j] else 0
+      }
+    }
+    L
+  }
+
+  # A record's varcomp -> theta shape, in the term order lme4 itself uses.
+  # `cnms` comes off the fitted model rather than the manifest formula because
+  # lme4 reorders random-effect terms internally (by number of levels); building
+  # theta in formula order would silently score a different model.
+  theta_shape_of <- function(rec, cnms) {
+    vc <- rec$varcomp
+    if (is.data.frame(vc)) vc <- lapply(seq_len(nrow(vc)), function(i) as.list(vc[i, ]))
+    unlist(lapply(names(cnms), function(gn) {
+      g <- Filter(function(e) identical(e$group, gn), vc)[[1]]
+      terms <- as.character(unlist(g$terms))
+      sd <- as.numeric(unlist(g$stddev))
+      cr <- g$corr; if (is.list(cr)) cr <- cr[[1]]
+      cr <- matrix(as.numeric(as.matrix(cr)), length(sd), length(sd))
+      # lme4 writes NA correlations against a zero-SD row; they multiply a zero
+      # variance either way, so zero is the only finite value that changes nothing.
+      cr[!is.finite(cr)] <- 0; diag(cr) <- 1
+      k <- match(cnms[[gn]], terms)
+      sd <- sd[k]; cr <- cr[k, k, drop = FALSE]
+      S <- diag(sd, nrow = length(sd)) %*% cr %*% diag(sd, nrow = length(sd))
+      L <- chol_lower_psd(S)
+      L[lower.tri(L, diag = TRUE)]   # column-major lower triangle == lme4's theta
+    }), use.names = FALSE)
+  }
+
+  rows <- list()
+  for (cid in obj_ids) {
+    cell <- cells[[cid]]
+    if (!identical(cell$family, "gaussian")) next
+    df <- read.csv(file.path(suite_dir, "..", "speed-grid", "data",
+                             paste0(cid, ".csv")))
+    for (f in unlist(cell$factors)) df[[f]] <- factor(df[[f]])
+    devfun <- lmer(as.formula(cell$r_formula), data = df, REML = isTRUE(cell$reml),
+                   devFunOnly = TRUE)
+    m_free <- lmer(as.formula(cell$r_formula), data = df, REML = isTRUE(cell$reml),
+                   control = lmerControl(optCtrl = list(maxeval = cell$max_fun)))
+    cnms <- getME(m_free, "cnms")
+
+    # Best score along a candidate's ray. The bracket spans four decades either
+    # side of 1; a residual SD outside that on a standardized simulation grid
+    # would be a broken fit, not a scale this needs to reach.
+    ray_min <- function(shape) {
+      f <- function(ls) devfun(shape / exp(ls))
+      o <- optimize(f, interval = c(-9, 9), tol = 1e-10)
+      c(obj = o$objective, s = exp(o$minimum))
+    }
+    g_ray <- ray_min(theta_shape_of(glmm[[cid]], cnms))
+    o_ray <- ray_min(theta_shape_of(lme4_rec[[cid]], cnms))
+
+    # lme4 restarted FROM glmm's answer. If lme4's own optimizer, handed glmm's
+    # point, walks back to lme4's recorded answer, lme4 prefers it; if it stays,
+    # lme4's recorded answer was a stopping point rather than its optimum.
+    seeded <- tryCatch({
+      m <- lmer(as.formula(cell$r_formula), data = df, REML = isTRUE(cell$reml),
+                start = list(theta = unname(g_ray["s"] ^ -1 *
+                                            theta_shape_of(glmm[[cid]], cnms))),
+                control = lmerControl(optCtrl = list(maxeval = cell$max_fun)))
+      as.numeric(-2 * logLik(m))
+    }, error = function(e) NA_real_)
+
+    tol_obj <- TOL$loglik_abs_lmm
+    verdict <- if (abs(g_ray["obj"] - o_ray["obj"]) <= tol_obj)
+                 "same optimum"
+               else if (g_ray["obj"] < o_ray["obj"])
+                 "glmm better on lme4's own criterion"
+               else "lme4 better (glmm at a worse optimum)"
+
+    rows[[length(rows) + 1L]] <- data.frame(
+      case_id = cid,
+      obj_at_glmm = unname(g_ray["obj"]), obj_at_lme4 = unname(o_ray["obj"]),
+      obj_gap = unname(g_ray["obj"] - o_ray["obj"]),
+      # The band is ABSOLUTE (TOL$loglik_abs_lmm), which is the right convention
+      # for a criterion but reads oddly on a 5000-scale one: a gap of 2e-6 there
+      # is a decision on the 10th significant figure. Reported so a "better"
+      # verdict can be seen for what it is.
+      obj_gap_rel = unname((g_ray["obj"] - o_ray["obj"]) / abs(o_ray["obj"])),
+      obj_seeded_from_glmm = seeded,
+      obj_lme4_free = as.numeric(-2 * logLik(m_free)),
+      lme4_roundtrip = unname(o_ray["obj"]) - as.numeric(lme4_rec[[cid]]$deviance),
+      verdict = verdict, stringsAsFactors = FALSE)
+  }
+  ores <- do.call(rbind, rows)
+  write.csv(ores, file.path(out_dir, "objective_verdicts.csv"), row.names = FALSE)
+  cat("\n== objective verdicts (lme4's REML criterion at both candidates) ==\n")
+  for (i in seq_len(nrow(ores))) {
+    r <- ores[i, ]
+    cat(sprintf("%-42s glmm %.5f  lme4 %.5f  gap %+.2e  seeded %.5f  [roundtrip %+.1e]  %s\n",
+                r$case_id, r$obj_at_glmm, r$obj_at_lme4, r$obj_gap,
+                r$obj_seeded_from_glmm, r$lme4_roundtrip, r$verdict))
+  }
+  cat(sprintf("\ntable: %s\n", file.path(out_dir, "objective_verdicts.csv")))
 }

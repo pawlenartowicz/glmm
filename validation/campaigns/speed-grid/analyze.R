@@ -109,6 +109,7 @@ for (cid in names(cells)) {
                         g$n_eval / m$n_eval, NA_real_),
     dev_glmm = dg, dev_mm = dm,
     wall_glmm = g$wall_seconds, wall_mm = m$wall_seconds,
+    wall_source = if (is.null(g$wall_source)) NA_character_ else g$wall_source,
     per_eval_glmm = g$wall_seconds / max(g$n_eval, 1),
     per_eval_mm = m$wall_seconds / max(m$n_eval, 1))
 }

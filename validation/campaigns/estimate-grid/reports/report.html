@@ -11,7 +11,7 @@ h1{font-size:20px} h2{margin:1.2em 0 .3em} .note{color:#444;max-width:74em}
 .claim{background:#f7f7f7;border-left:4px solid #06c;padding:.5em 1em;margin:.4em 0;max-width:74em}
 </style>
 <h1>GLMM diligent grid &mdash; estimates / var-components / Hessian SEs vs lme4 + GLMMadaptive</h1>
-<p class="note">510-cell accuracy sweep (full-AGQ vector-RE spec, Part 6). glmm result rows: 510/510; oracle rows: 510/510. Each cell = worst gated parity gap (hover for beta / stddev / corr / se / deviance). AGQ cells (nagq=7) carry a <span class="k">k7</span> badge and blue outline. Walls recorded but NOT a deliverable (machine not clock-locked).</p>
+<p class="note">510-cell accuracy sweep (full-AGQ vector-RE spec, Part 6). glmm result rows: 510/510; oracle rows: 510/510. Each cell = worst gated validation gap (hover for beta / stddev / corr / se / deviance). AGQ cells (nagq=7) carry a <span class="k">k7</span> badge and blue outline. Walls recorded but NOT a deliverable (machine not clock-locked).</p>
 <p class="legend">
 <span style="background:hsl(120,60%,90%)">ok</span>
 <span style="background:hsl(0,75%,82%)">&#9888; mismatch</span>
@@ -20,11 +20,11 @@ h1{font-size:20px} h2{margin:1.2em 0 .3em} .note{color:#444;max-width:74em}
 <span style="background:hsl(215,70%,85%)">oracle error (identifiability)</span>
 <span style="background:hsl(190,55%,88%)">oracle singular (ungated)</span>
 <span style="outline:2px solid #06c">AGQ cell</span></p>
-<p class="note"><b>Status:</b> ok 432 &middot; mismatch 21 &middot; glmm-fail 0 &middot; glmm-timeout 13 &middot; oracle-error 0 &middot; oracle-singular 40 &middot; oracle-timeout 3 &middot; both-fail 1. <b>glmm-timeout</b> = 30&thinsp;s watchdog budget exceeded (giant-LMM slow tail) &mdash; compute-budget boundary, not an accuracy verdict. <b>oracle-error</b> = lme4 identifiability refusal (obs &le; REs per group on p5 high-q cells) &mdash; glmm fits, no oracle answer exists. <b>oracle-singular</b> = lme4 boundary (singular) fit with estimates &mdash; gaps recorded, not gated (flat directions). <b>oracle-timeout</b> = oracle exceeded its 120&thinsp;s budget.</p>
+<p class="note"><b>Status:</b> ok 433 &middot; mismatch 20 &middot; glmm-fail 0 &middot; glmm-timeout 13 &middot; oracle-error 0 &middot; oracle-singular 40 &middot; oracle-timeout 3 &middot; both-fail 1. <b>glmm-timeout</b> = 30&thinsp;s watchdog budget exceeded (giant-LMM slow tail) &mdash; compute-budget boundary, not an accuracy verdict. <b>oracle-error</b> = lme4 identifiability refusal (obs &le; REs per group on p5 high-q cells) &mdash; glmm fits, no oracle answer exists. <b>oracle-singular</b> = lme4 boundary (singular) fit with estimates &mdash; gaps recorded, not gated (flat directions). <b>oracle-timeout</b> = oracle exceeded its 120&thinsp;s budget.</p>
 <h2>The three claims (spec Part 6 &ldquo;what the run proves&rdquo;)</h2>
-<div class="claim"><b>1. Grid-wide Laplace (477 cells):</b> 405/477 match lme4-Laplace answers (beta, &theta;, Hessian SE) within band &mdash; 16 mismatches, and every one is at the SAME optimum (aligned deviance agrees to &le;4e-08): 8 are near-zero/zero-boundary &theta; components where the relative stddev band is meaningless, 8 are Hessian-SE-only exceedances on multi-grouping GLMM cells (&beta;/&theta;/deviance match; se gap up to 1.4e-2 vs the 1e-3 band). Zero wrong-answer cells. Non-comparable remainder, all named in failures.txt: 13 glmm compute-budget timeouts, 0 lme4 identifiability refusals (no oracle answer), 40 lme4 singular fits (ungated), 2 oracle timeouts, 1 both-fail (both engines refuse the same p5 q8 cell).</div>
-<div class="claim"><b>2. int1 scalar AGQ (15 cells, 15 joinable):</b> 15/15 &equiv; lme4 glmer(nAGQ=7) across the size&times;balance&times;regime sweep &mdash; 0 parity-fail. Includes the 6 aggregated-binomial <code>bina_int1_*</code> cells, now fit via AGQ&times;prior-weights (gate lifted 2026-07-14).</div>
-<div class="claim"><b>3. q2s vector AGQ (headline; 18 cells, 17 joinable):</b> 12/17 joinable cells match GLMMadaptive at matched nodes (k=7); 5 mismatch, each attributed in failures.txt &mdash; 2 large-&beta; cells adjudicated oracle-side via <code>adjudicate_diligent.R</code> (glmer-Laplace on the same data reproduces glmm&rsquo;s &beta; and &theta; to 4 decimals; GLMMadaptive under-converged, one with a non-PD Hessian), and 3 nearzero cells via the near-zero-&theta; boundary argument (&beta;/SE agree; only the &sim;0.01&ndash;0.1-scale slope stddev, a degenerate component with corr pinned at &plusmn;1, exceeds the relative band). 1 cell has no reference (GLMMadaptive exceeded its 120&thinsp;s budget). The 6 aggregated-binomial <code>bina_q2s_*</code> cells are now fit via AGQ&times;prior-weights (gate lifted 2026-07-14).</div>
+<div class="claim"><b>1. Grid-wide Laplace (477 cells):</b> 406/477 match lme4-Laplace answers (beta, &theta;, Hessian SE) within band &mdash; 15 mismatches, by the gate they break: 7 Hessian-SE-only on multi-grouping GLMM cells (&beta;/&theta;/deviance match; se gap up to 1.4e-2 vs the 1e-3 band), 6 stddev-band-only on small variance components, 2 at &beta; level. Aligned deviance agrees to &le;4e-08 across the mismatches. Adjudicated per cell in failures.txt: 2 carry lme4&rsquo;s own max|grad| non-convergence, 1 is a real disagreement against MixedModels.jl; on the rest lme4&rsquo;s own REML criterion scores glmm at or below lme4, so they are the same optimum. Non-comparable remainder, all named in failures.txt: 13 glmm compute-budget timeouts, 0 lme4 identifiability refusals (no oracle answer), 40 lme4 singular fits (ungated), 2 oracle timeouts, 1 both-fail (both engines refuse the same p5 q8 cell).</div>
+<div class="claim"><b>2. int1 scalar AGQ (15 cells, 15 joinable):</b> 15/15 &equiv; lme4 glmer(nAGQ=7) across the size&times;balance&times;regime sweep &mdash; 0 validation-fail. Includes the 6 aggregated-binomial <code>bina_int1_*</code> cells, now fit via AGQ&times;prior-weights (gate lifted 2026-07-14).</div>
+<div class="claim"><b>3. q2s vector AGQ (headline; 18 cells, 17 joinable):</b> 12/17 joinable cells match GLMMadaptive at matched nodes (k=7); 5 mismatch, each attributed in failures.txt &mdash; 2 large-&beta; cells adjudicated oracle-side via <code>adjudicate.R</code> (glmer-Laplace on the same data reproduces glmm&rsquo;s &beta; and &theta; to 4 decimals; GLMMadaptive under-converged, one with a non-PD Hessian), and 3 nearzero cells via the near-zero-&theta; boundary argument (&beta;/SE agree; only the &sim;0.01&ndash;0.1-scale slope stddev, a degenerate component with corr pinned at &plusmn;1, exceeds the relative band). 1 cell has no reference (GLMMadaptive exceeded its 120&thinsp;s budget). The 6 aggregated-binomial <code>bina_q2s_*</code> cells are now fit via AGQ&times;prior-weights (gate lifted 2026-07-14).</div>
 <table>
 <tr><th rowspan="2">cell</th>
 <th colspan="4" class="grp">int1 <small>(n&theta; 1)</small></th>
@@ -168,7 +168,7 @@ cat laplace oracle lme4
 beta 1.05e-05 stddev 5.71e-06 corr &ndash; se 3.98e-06 dev 1.25e-12"><b>ok</b><br><span class=g>1.05e-05</span></td>
 <td class="c " style="background:hsl(190,55%,88%)" title="binb_nest2_g300p20_bal_base
 cat laplace oracle lme4
-beta 9.67e-06 stddev 1.00e+00 corr &ndash; se 2.07e-02 dev 1.65e-11"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+beta 9.67e-06 stddev 1.74e-05 corr &ndash; se 2.07e-02 dev 1.65e-11"><b>oracle-singular</b><br><span class=g>2.07e-02 ungated</span></td>
 <td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2_g300p20_bal_base
 cat laplace oracle lme4
 beta 3.40e-09 stddev 3.11e-07 corr &ndash; se 9.43e-08 dev 8.00e-15"><b>ok</b><br><span class=g>3.11e-07</span></td>
@@ -247,7 +247,7 @@ beta 4.67e-05 stddev 9.13e-06 corr &ndash; se 7.30e-03 dev 6.84e-12"><b>oracle-s
 <td></td>
 <td class="c " style="background:hsl(190,55%,88%)" title="pois_nest2_g300p20_bal_nearzero
 cat laplace oracle lme4
-beta 2.65e-06 stddev 1.00e+00 corr &ndash; se 1.20e-02 dev 1.53e-11"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+beta 2.65e-06 stddev 8.58e-06 corr &ndash; se 1.20e-02 dev 1.53e-11"><b>oracle-singular</b><br><span class=g>1.20e-02 ungated</span></td>
 <td class="grp"></td>
 </tr>
 <tr><th>g300p20 bal/rare</th>
@@ -834,7 +834,7 @@ beta 1.99e-08 stddev 4.08e-06 corr &ndash; se 1.41e-06 dev 3.63e-14"><b>ok</b><b
 <td></td>
 <td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_nest3_g30000p100_bal_nearzero
 cat laplace oracle lme4
-beta 1.02e-09 stddev 1.00e+00 corr &ndash; se 3.28e-08 dev 6.05e-14"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+beta 1.02e-09 stddev 5.92e-07 corr &ndash; se 3.28e-08 dev 6.05e-14"><b>oracle-singular</b><br><span class=g>5.92e-07 ungated</span></td>
 </tr>
 <tr><th>g30000p100 single/base</th>
 <td></td>
@@ -1003,9 +1003,9 @@ beta 1.14e-05 stddev 3.63e-05 corr 5.55e-05 se 3.92e-04 dev &ndash;"><b>ok</b> <
 <td class="grp c " style="background:hsl(120,60%,90%)" title="bina_cross4_g300p20_bal_base
 cat laplace oracle lme4
 beta 2.20e-05 stddev 1.23e-05 corr &ndash; se 7.22e-06 dev 4.72e-12"><b>ok</b><br><span class=g>2.20e-05</span></td>
-<td class="c " style="background:hsl(0,75%,82%)" title="binb_cross4_g300p20_bal_base
+<td class="c " style="background:hsl(120,60%,90%)" title="binb_cross4_g300p20_bal_base
 cat laplace oracle lme4
-beta 3.89e-05 stddev 1.00e+00 corr &ndash; se 2.55e-05 dev 3.01e-09"><b>&#9888; mismatch</b><br><span class=g>1.00e+00</span></td>
+beta 3.89e-05 stddev 5.78e-05 corr &ndash; se 2.55e-05 dev 3.01e-09"><b>ok</b><br><span class=g>5.78e-05</span></td>
 <td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross4_g300p20_bal_base
 cat laplace oracle lme4
 beta 2.64e-06 stddev 1.43e-05 corr &ndash; se 5.33e-06 dev 1.29e-11"><b>ok</b><br><span class=g>1.43e-05</span></td>
@@ -1017,7 +1017,7 @@ cat laplace oracle lme4
 beta 3.43e-05 stddev 7.93e-06 corr 6.34e-06 se 6.41e-06 dev 4.09e-12"><b>ok</b><br><span class=g>3.43e-05</span></td>
 <td class="c " style="background:hsl(0,75%,82%)" title="binb_nest2s_g300p20_bal_base
 cat laplace oracle lme4
-beta 1.51e-03 stddev 1.00e+00 corr 8.92e-05 se 4.00e-05 dev 1.01e-08"><b>&#9888; mismatch</b><br><span class=g>1.00e+00</span></td>
+beta 1.51e-03 stddev 5.60e-05 corr 8.92e-05 se 4.00e-05 dev 1.01e-08"><b>&#9888; mismatch</b><br><span class=g>1.51e-03</span></td>
 <td class="c " style="background:hsl(120,60%,90%)" title="lmm_nest2s_g300p20_bal_base
 cat laplace oracle lme4
 beta 9.39e-08 stddev 7.12e-06 corr 4.66e-06 se 5.91e-06 dev 2.92e-12"><b>ok</b><br><span class=g>7.12e-06</span></td>
@@ -1324,13 +1324,13 @@ cat laplace oracle lme4
 beta 1.31e-05 stddev 5.90e-05 corr &ndash; se 4.26e-06 dev 5.34e-12"><b>ok</b><br><span class=g>5.90e-05</span></td>
 <td class="c " style="background:hsl(190,55%,88%)" title="binb_cross4_g3000p20_bal_nearzero
 cat laplace oracle lme4
-beta 3.13e-05 stddev 1.00e+00 corr &ndash; se 1.63e-02 dev 1.09e-10"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+beta 3.13e-05 stddev 6.87e-05 corr &ndash; se 1.63e-02 dev 1.09e-10"><b>oracle-singular</b><br><span class=g>1.63e-02 ungated</span></td>
 <td class="c " style="background:hsl(190,55%,88%)" title="lmm_cross4_g3000p20_bal_nearzero
 cat laplace oracle lme4
 beta 6.20e-09 stddev 2.09e-05 corr &ndash; se 2.86e-06 dev 5.74e-12"><b>oracle-singular</b><br><span class=g>2.09e-05 ungated</span></td>
 <td class="c " style="background:hsl(190,55%,88%)" title="pois_cross4_g3000p20_bal_nearzero
 cat laplace oracle lme4
-beta 1.32e-06 stddev 1.00e+00 corr &ndash; se 1.28e-04 dev 2.28e-12"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+beta 1.32e-06 stddev 1.63e-05 corr &ndash; se 1.28e-04 dev 2.28e-12"><b>oracle-singular</b><br><span class=g>1.28e-04 ungated</span></td>
 <td class="grp c " style="background:hsl(190,55%,88%)" title="bina_nest2s_g3000p20_bal_nearzero
 cat laplace oracle lme4
 beta 2.45e-06 stddev 5.88e-06 corr 0.00e+00 se 6.38e-03 dev 7.49e-13"><b>oracle-singular</b><br><span class=g>6.38e-03 ungated</span></td>
@@ -1747,7 +1747,7 @@ beta 3.86e-07 stddev 3.41e-06 corr 2.13e-05 se 2.09e-06 dev 2.00e-12"><b>ok</b><
 <td></td>
 <td class="c " style="background:hsl(190,55%,88%)" title="lmm_q2s_g30000p20_bal_nearzero
 cat laplace oracle lme4
-beta 2.38e-09 stddev 1.68e-04 corr 2.22e-16 se 9.60e-08 dev 5.30e-14"><b>oracle-singular</b><br><span class=g>1.68e-04 ungated</span></td>
+beta 2.38e-09 stddev 9.78e-08 corr 2.22e-16 se 9.60e-08 dev 5.30e-14"><b>oracle-singular</b><br><span class=g>9.78e-08 ungated</span></td>
 <td></td>
 <td class="grp"></td>
 <td></td>
@@ -1987,7 +1987,7 @@ cat laplace oracle lme4
 beta 1.84e-05 stddev 1.84e-05 corr &ndash; se 9.77e-06 dev 5.88e-12"><b>ok</b><br><span class=g>1.84e-05</span></td>
 <td class="c " style="background:hsl(190,55%,88%)" title="binb_cross6_g300p20_bal_base
 cat laplace oracle lme4
-beta 3.42e-06 stddev 1.00e+00 corr &ndash; se 2.84e-02 dev 2.33e-11"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+beta 3.42e-06 stddev 1.26e-05 corr &ndash; se 2.84e-02 dev 2.33e-11"><b>oracle-singular</b><br><span class=g>2.84e-02 ungated</span></td>
 <td class="c " style="background:hsl(120,60%,90%)" title="lmm_cross6_g300p20_bal_base
 cat laplace oracle lme4
 beta 2.02e-08 stddev 1.17e-05 corr &ndash; se 6.04e-06 dev 3.52e-12"><b>ok</b><br><span class=g>1.17e-05</span></td>
@@ -2031,7 +2031,7 @@ beta 1.03e-06 stddev 3.18e-05 corr 1.49e-05 se 1.98e-05 dev 1.38e-11"><b>ok</b><
 <td></td>
 <td class="c " style="background:hsl(190,55%,88%)" title="lmm_cross6_g300p20_bal_nearzero
 cat laplace oracle lme4
-beta 1.53e-07 stddev 1.00e+00 corr &ndash; se 1.88e-05 dev 5.79e-10"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+beta 1.53e-07 stddev 9.54e-05 corr &ndash; se 1.88e-05 dev 5.79e-10"><b>oracle-singular</b><br><span class=g>9.54e-05 ungated</span></td>
 <td></td>
 <td class="grp c " style="background:hsl(190,55%,88%)" title="lmm_q2sq2s_g300p20_bal_nearzero
 cat laplace oracle lme4
@@ -2259,7 +2259,7 @@ cat laplace oracle lme4
 beta 9.34e-06 stddev 2.64e-05 corr &ndash; se 1.84e-05 dev 2.65e-12"><b>ok</b><br><span class=g>2.64e-05</span></td>
 <td class="c " style="background:hsl(190,55%,88%)" title="binb_cross6_g3000p100_bal_nearzero
 cat laplace oracle lme4
-beta 1.71e-05 stddev 1.00e+00 corr &ndash; se 1.22e-02 dev 1.30e-11"><b>oracle-singular</b><br><span class=g>1.00e+00 ungated</span></td>
+beta 1.71e-05 stddev 2.72e-05 corr &ndash; se 1.22e-02 dev 1.30e-11"><b>oracle-singular</b><br><span class=g>1.22e-02 ungated</span></td>
 <td></td>
 <td></td>
 <td class="grp"></td>

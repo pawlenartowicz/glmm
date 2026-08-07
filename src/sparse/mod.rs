@@ -39,6 +39,15 @@ mod glmm;
 mod tests;
 
 pub(crate) use glmm::{fit_glmm_nb_sparse, fit_glmm_sparse};
+
+/// Refuse floor for the sparse-LMM rank guard, on the scale-invariant
+/// per-column pivot ratio of the augmented Schur factor's fixed block
+/// ([`crate::ols::min_pivot_ratio`]). Calibrated 2026-07-31 against the same
+/// 1-ULP perturbation sweep as the dense route, and deliberately ~600× looser:
+/// this path obeys the same `betaRel ≈ 1e-15 / pivot` law with a ~500× worse
+/// constant and a hard noise floor at 5e-7, measured 2.7e-4 at pivot 9.7e-11.
+/// Sharing the dense `1e-12` here would accept fits whose β̂ has no digits left.
+const PIVOT_MIN: f64 = 6e-10;
 #[cfg(test)]
 use glmm::{sparse_glmm_deviance, SparseGlmmWorkspace};
 
@@ -116,12 +125,16 @@ pub(crate) fn fit_mle_sparse(
     let (mut solver, mut theta, lower, upper) = crate::lmm::sparse_lmm_seed(&g);
     // Cold start = blind seed (diagonals THETA0, off-diagonals 0 — mirror
     // `fit_lmm`'s cold arm, see the basin rationale there); a warm start
-    // clamps to the truth floor (mirror `fit_lmm` `lmm.rs:1888-1900`).
+    // clamps only its diagonal coordinates to the truth floor, off-diagonals
+    // verbatim (mirror `fit_lmm` `lmm.rs:1888-1900`).
     match start {
         Some(s) => {
             debug_assert_eq!(s.theta.len(), theta.len());
             for (t, &v) in theta.iter_mut().zip(&s.theta) {
-                *t = v.max(crate::lmm::THETA_TRUTH_FLOOR);
+                *t = v;
+            }
+            for &i in g.diagonal_theta() {
+                theta[i] = theta[i].max(crate::lmm::THETA_TRUTH_FLOOR);
             }
         }
         None => {
@@ -149,18 +162,26 @@ pub(crate) fn fit_mle_sparse(
 
     // Per-component deterministic pin: every DIAGONAL variance component ≤ PIN_THETA
     // collapses to exactly 0 so tau2/varcorr reflect the boundary (mirror `fit_lmm`
-    // `lmm.rs:1917-1927`). Applied to any reported endpoint, but `pinned` (⇒
+    // `lmm.rs:1917-1927`). Applied to any reported endpoint, but the mask (⇒
     // `singular`) only latches when the fit actually converged — a capped
-    // endpoint is reported as a point, not accepted onto the boundary. `Fit`
-    // carries no `pinned_components` mask (unlike the internal `LmmFit`), so
-    // `singular` only needs the any-pinned bit, not the mask.
+    // endpoint is reported as a point, not accepted onto the boundary. The bit
+    // index is the position in `diagonal_theta()` order, not the θ index: that
+    // is the order `fit::common::pinned_flags` reshapes against the varcorr
+    // blocks (mirror `fit_lmm` and `glmm::fit_glmm`, which build the same mask).
+    // This route is the one that takes the widest designs, so the shift is
+    // guarded — past 64 components `pinned` still latches and the extra
+    // components go unnamed, rather than the shift overflowing.
     let mut pinned = false;
+    let mut pinned_components = 0u64;
     if has_endpoint {
-        for &ti in g.diagonal_theta() {
+        for (kk, &ti) in g.diagonal_theta().iter().enumerate() {
             if theta[ti] <= crate::lmm::PIN_THETA {
                 theta[ti] = 0.0;
                 if converged_status {
                     pinned = true;
+                    if kk < u64::BITS as usize {
+                        pinned_components |= 1u64 << kk;
+                    }
                 }
             }
         }
@@ -170,7 +191,7 @@ pub(crate) fn fit_mle_sparse(
     // rank-guard the p×p fixed block (mirror `fit_lmm` `lmm.rs:1932-1940`).
     let factor_ok = has_endpoint && sparse_schur_factor(&theta, &mut ws).is_some();
     let degenerate = if factor_ok {
-        crate::ols::chol_rank_deficient(ws.factor.as_ref(), p, crate::lmm::EPS_RANK)
+        crate::ols::min_pivot_ratio(ws.factor.as_ref(), p).0 < PIVOT_MIN
     } else {
         true
     };
@@ -184,13 +205,11 @@ pub(crate) fn fit_mle_sparse(
             vcov: crate::fit::nan_vcov(p),
             tau2: theta.iter().map(|_| f64::NAN).collect(),
             dispersion: f64::NAN,
-            converged: false,
+            diagnostics: crate::Diagnostics::from_flags(false, false, p),
             varcorr: vec![],
             stddev_se: vec![],
-            aliased: vec![false; p],
             n_eval: out.n_eval,
             deviance: f64::NAN,
-            singular: false,
             loglik: f64::NAN,
             df: 0,
             reml: true,
@@ -202,7 +221,10 @@ pub(crate) fn fit_mle_sparse(
 
     // Accepted objective at θ̂ post-pin: no `dev` local survives from the BOBYQA
     // loop here (unlike `fit_lmm`'s `dev`), so re-evaluate at the pinned θ — a
-    // second Schur factor, but only once per fit (not the hot loop).
+    // second Schur factor, but only once per fit (not the hot loop). This is
+    // also the evaluation the conditional-mode recovery rides on: arming it here
+    // means the per-family factors it needs are kept for this call alone.
+    ws.arm_recovery();
     let dev = sparse_reml_deviance(&theta, &mut ws);
 
     let l = &ws.factor;
@@ -262,30 +284,61 @@ pub(crate) fn fit_mle_sparse(
         None => dev,
     };
 
+    // Which components pinned, in the layout the wrappers iterate. Built here
+    // rather than inside `from_flags` because that helper also serves the
+    // NaN-fill returns, which have no varcorr to place bits against.
+    let pinned_grid = crate::fit::pinned_flags(pinned_components, &varcorr);
+
+    // Conditional modes and the per-row means they unlock, off the factors the
+    // evaluation above kept. Gated on `converged` like the dense path: a mode at
+    // a non-converged θ̂ is not a BLUP of anything.
+    let (fitted, ranef, ranef_levels) = match converged.then(|| sparse_recover_u(&ws, &beta)) {
+        Some(Some(u)) => {
+            let ranef = crate::fit::assemble_ranef_sparse(&theta, &g, &u);
+            let fitted = crate::fit::lmm_fitted(
+                x,
+                n,
+                p,
+                &beta,
+                &ranef,
+                &g,
+                cluster_ids,
+                extra_ids,
+                opts.offset.as_deref(),
+            );
+            (fitted, ranef, crate::fit::ranef_level_counts(&g))
+        }
+        _ => (vec![], vec![], vec![]),
+    };
+
     let mut fit = crate::Fit {
         beta,
         se,
         vcov,
         tau2,
         dispersion: sigma_sq,
-        converged,
+        // This route records no pivot (it REFUSES below `PIVOT_MIN` rather than
+        // flagging), so `notes` stays empty and `boundary` is back-derived from
+        // `pinned` — see `Diagnostics::from_flags`. `pinned` itself IS real
+        // here: the pin loop above knows exactly which components collapsed.
+        diagnostics: crate::Diagnostics {
+            pinned: pinned_grid,
+            ..crate::Diagnostics::from_flags(converged, pinned, p)
+        },
         varcorr,
         stddev_se: vec![],
-        aliased: vec![false; p],
         n_eval: out.n_eval,
         deviance: dev,
-        singular: pinned,
         // REML criterion off the weight-corrected deviance (mirrors `fit_mle`'s
-        // loglik; same suff-stats caveat — no per-row fitted/ranef on this path
-        // until the LMM conditional-mode recovery lands).
+        // loglik).
         loglik: crate::fit::lmm_loglik(dev, n, p),
         df: p + theta.len() + 1,
         reml: true,
-        fitted: vec![],
-        ranef: vec![],
-        ranef_levels: vec![],
+        fitted,
+        ranef,
+        ranef_levels,
     };
-    fit.singular = fit.singular || fit.has_negligible_component();
+    fit.diagnostics.singular = fit.diagnostics.singular || fit.has_negligible_component();
     fit
 }
 
@@ -537,6 +590,31 @@ pub(crate) struct SparseLmmWorkspace {
     pub(crate) p: usize,
     /// Row count N — REML df is `N − p` (mirrors `reml_deviance` `lmm.rs:1813`).
     pub(crate) n: usize,
+    /// `Some` only for the one post-fit evaluation that feeds
+    /// [`sparse_recover_u`]; see [`SparseRecovery`].
+    pub(crate) rec: Option<SparseRecovery>,
+}
+
+/// Per-family factor state that [`sparse_schur_factor`] otherwise throws away,
+/// kept for ONE evaluation so [`sparse_recover_u`] can back-substitute the
+/// conditional modes. Off by default (`SparseLmmWorkspace::rec` is `None`), so
+/// the θ-search loop is untouched: the fit turns it on for the final evaluation
+/// at θ̂ and nowhere else.
+///
+/// Only two things are missing after an ordinary evaluation. `L_f` is
+/// overwritten family by family in the shared `fam_a` scratch, so all but the
+/// last are gone. `L21` survives on the DENSE-tail branch (the global `ws.l21`)
+/// but not on the sparse-tail one, which consumes each family's compact panel
+/// inside its own iteration — hence `panel`, which is a ragged copy of exactly
+/// those panels and stays empty on the dense branch.
+pub(crate) struct SparseRecovery {
+    /// `n_primary · w²` row-major Crout factors, family-major.
+    fam_l: Vec<f64>,
+    /// Sparse-tail branch only: each family's `e_f × w` col-major L21 panel,
+    /// concatenated; family `f` starts at `panel_off[f]` and is `e_f · w` long.
+    panel: Vec<f64>,
+    /// Length `n_primary + 1`, prefix sums over the panels above.
+    panel_off: Vec<usize>,
 }
 
 /// One (grouping, level) block of the block-diagonal Λ: local component `d`
@@ -924,7 +1002,36 @@ impl SparseLmmWorkspace {
             m,
             p,
             n,
+            rec: None,
         }
+    }
+
+    /// Arm [`SparseRecovery`] for the NEXT evaluation. Sized here, once, from
+    /// the shapes the workspace already fixes; the panels are ragged, so the
+    /// offsets are computed from each family's co-occurring crossed blocks the
+    /// same way `sparse_schur_factor` sums `e_f`.
+    fn arm_recovery(&mut self) {
+        let w = self.fam_w;
+        let n_prim = self.g.n_primary;
+        let sparse_tail = self.tail.is_some();
+        let mut panel_off = Vec::with_capacity(n_prim + 1);
+        let mut acc = 0usize;
+        for f in 0..n_prim {
+            panel_off.push(acc);
+            if sparse_tail {
+                let e_f: usize = self.a21_blk[self.a21_off[f]..self.a21_off[f + 1]]
+                    .iter()
+                    .map(|&bi| self.lam_blocks[bi as usize].q)
+                    .sum();
+                acc += e_f * w;
+            }
+        }
+        panel_off.push(acc);
+        self.rec = Some(SparseRecovery {
+            fam_l: vec![0.0f64; n_prim * w * w],
+            panel: vec![0.0f64; acc],
+            panel_off,
+        });
     }
 }
 
@@ -1359,6 +1466,7 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
         tail_llt_mem,
         factor_llt_mem,
         m,
+        rec,
         ..
     } = ws;
     let m = *m;
@@ -1537,6 +1645,11 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
                 fam_a[i * w + j] = v / l;
             }
         }
+        // The factor this iteration is about to overwrite for the next family —
+        // kept only when the post-fit recovery asked for it (see `SparseRecovery`).
+        if let Some(r) = rec.as_mut() {
+            r.fam_l[f * w * w..(f + 1) * w * w].copy_from_slice(&fam_a[..w * w]);
+        }
         // U1 family rows: B1_f = (Λ'Z'[X y])[family rows] — row r is
         // Σ_{a≥il} Λ[a,il]·ztxy_row(col_a) over its owning block (mirrors
         // `reml_deviance_blocked`'s P_zx = ΛᵀZᵀ[Xy], lmm.rs:1291-1303), read
@@ -1659,6 +1772,12 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
                 panel.fill(0.0);
                 fold_a21(panel, e_f, 0, true);
                 schur_phase_b(panel, e_f, w, fam_a);
+                // Consumed within this iteration, so the recovery copies it out
+                // here or never sees it (the dense branch keeps the global `l21`
+                // and needs no copy).
+                if let Some(r) = rec.as_mut() {
+                    r.panel[r.panel_off[f]..r.panel_off[f + 1]].copy_from_slice(panel);
+                }
                 // S22 −= L21_f·L21_fᵀ. The fused scalar syrk is now one
                 // triangular `panel·panelᵀ` into `dd_temp` (a RESULT-MOVING
                 // reassociation of the per-entry dots, sanctioned as the dense
@@ -1958,6 +2077,149 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
     )
     .ok()?;
     Some(2.0 * log_lzz_half)
+}
+
+/// Spherical conditional modes `û` at θ̂ on the sparse-Z LMM path, over the full
+/// RE-column set in `build_sparse_z` order — the layout
+/// `fit::common::assemble_ranef_sparse` reads.
+///
+/// Same identity the dense path recovers (`lmm::recover_ranef`), routed through
+/// the block factors this path actually keeps. With `c = (−β̂; 1)` so that
+/// `B·c = Λ′Z′(y − Xβ̂)`, the penalized normal equations `A u = B·c` split as
+///
+/// ```text
+/// û₂ = S₂₂⁻¹ (B̃₂·c),        û₁ = L₁₁⁻ᵀ (U₁·c − L₂₁ᵀ û₂)
+/// ```
+///
+/// and every factor on the right survives the final evaluation: `U₁` is
+/// `ws.u1`, `L₁₁`'s per-family blocks and (sparse-tail) `L₂₁`'s panels are what
+/// [`SparseRecovery`] held back, and `S₂₂⁻¹B̃₂` is `tail.x2` outright on the
+/// sparse-tail branch — where `û₂` is therefore a plain matrix–vector product,
+/// no solve at all. On the dense-tail branch `ws.u2` holds `U₂ = L₂₂⁻¹B̃₂`, so
+/// `û₂ = L₂₂⁻ᵀ(U₂·c)` is one back-substitution against the in-place `ws.s22`.
+///
+/// Caller contract: the last thing run on `ws` was an evaluation at θ̂ with
+/// `rec` armed. Returns `None` if it was not armed, or on a non-positive pivot.
+fn sparse_recover_u(ws: &SparseLmmWorkspace, beta: &[f64]) -> Option<Vec<f64>> {
+    let rec = ws.rec.as_ref()?;
+    let g = &ws.g;
+    let p = ws.p;
+    let w = ws.fam_w;
+    let kf = g.k_family();
+    let e = g.k_crossed();
+    let n_prim = g.n_primary;
+    let q_p = g.primary_q;
+    let np = g.nested_per_parent;
+    let q_n = g.nested.map(|nf| nf.q).unwrap_or(0);
+    // c = (−β̂; 1): contracting any `[X y]`-columned block against it turns it
+    // into that block's residual column.
+    let dot_c = |row: &dyn Fn(usize) -> f64| -> f64 {
+        let mut acc = row(p);
+        for (j, &b) in beta.iter().enumerate().take(p) {
+            acc -= row(j) * b;
+        }
+        acc
+    };
+
+    // --- crossed block ---
+    let mut u2 = vec![0.0f64; e];
+    if e > 0 {
+        match ws.tail.as_ref() {
+            Some(tail) => {
+                for (t, slot) in u2.iter_mut().enumerate() {
+                    *slot = dot_c(&|c| tail.x2[(t, c)]);
+                }
+            }
+            None => {
+                for (t, slot) in u2.iter_mut().enumerate() {
+                    *slot = dot_c(&|c| ws.u2[c * e + t]);
+                }
+                for t in (0..e).rev() {
+                    let mut acc = u2[t];
+                    for (i, &solved) in u2.iter().enumerate().skip(t + 1) {
+                        acc -= ws.s22[(i, t)] * solved;
+                    }
+                    let ltt = ws.s22[(t, t)];
+                    if !(ltt.is_finite() && ltt > 0.0) {
+                        return None;
+                    }
+                    u2[t] = acc / ltt;
+                }
+            }
+        }
+    }
+
+    // --- family blocks: L_fᵀ û₁_f = (U₁·c)_f − (L₂₁ᵀ û₂)_f ---
+    let mut u = vec![0.0f64; g.k_total];
+    for (t, &v) in u2.iter().enumerate() {
+        u[kf + t] = v;
+    }
+    let mut rhs = vec![0.0f64; w];
+    for f in 0..n_prim {
+        let fb = f * w;
+        for (r, slot) in rhs.iter_mut().enumerate() {
+            *slot = dot_c(&|c| ws.u1[c * kf + fb + r]);
+        }
+        if e > 0 {
+            match ws.tail.as_ref() {
+                // Panel rows are family-local: block `bi`'s `q` rows sit at the
+                // running `loc0`, and its crossed rows at `start − k_family`.
+                Some(_) => {
+                    let panel = &rec.panel[rec.panel_off[f]..rec.panel_off[f + 1]];
+                    let fam_blks = &ws.a21_blk[ws.a21_off[f]..ws.a21_off[f + 1]];
+                    let e_f = panel.len().checked_div(w).unwrap_or(0);
+                    let mut loc0 = 0usize;
+                    for &bi in fam_blks {
+                        let br = &ws.lam_blocks[bi as usize];
+                        let t0 = br.start - kf;
+                        for a in 0..br.q {
+                            let ut = u2[t0 + a];
+                            if ut != 0.0 {
+                                for (r, slot) in rhs.iter_mut().enumerate() {
+                                    *slot -= panel[r * e_f + loc0 + a] * ut;
+                                }
+                            }
+                        }
+                        loc0 += br.q;
+                    }
+                }
+                None => {
+                    for (r, slot) in rhs.iter_mut().enumerate() {
+                        let col = &ws.l21[(fb + r) * e..(fb + r + 1) * e];
+                        for (t, &ut) in u2.iter().enumerate() {
+                            *slot -= col[t] * ut;
+                        }
+                    }
+                }
+            }
+        }
+        let l = &rec.fam_l[fb * w..(fb + w) * w];
+        for r in (0..w).rev() {
+            let mut acc = rhs[r];
+            for (i, &solved) in rhs.iter().enumerate().skip(r + 1) {
+                acc -= l[i * w + r] * solved;
+            }
+            let lrr = l[r * w + r];
+            if !(lrr.is_finite() && lrr > 0.0) {
+                return None;
+            }
+            rhs[r] = acc / lrr;
+        }
+        // Family row r → RE column, the same map the U1 fill above walks:
+        // primary component r at `r·n_primary + f`, child `ch` component `il`
+        // at its own contiguous block start.
+        for (r, &v) in rhs.iter().enumerate() {
+            let re_col = if r < q_p {
+                r * n_prim + f
+            } else {
+                let rr = r - q_p;
+                let br = &ws.lam_blocks[n_prim + f * np + rr / q_n];
+                br.start + (rr % q_n) * br.stride
+            };
+            u[re_col] = v;
+        }
+    }
+    Some(u)
 }
 
 /// TEST ONLY: the deterministic LCG the LMM tests use for reproducible designs

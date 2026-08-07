@@ -6,8 +6,8 @@ shorter, self-contained note on skipping the hand-built inputs via a formula
 string.
 
 (This page covers the Rust crate only — for the Python port, see
-[`TUTORIAL-PYTHON.md`](TUTORIAL-PYTHON.md); for the R port,
-[`TUTORIAL-R.md`](TUTORIAL-R.md).)
+[`tutorial-python.md`](tutorial-python.md); for the R port,
+[`tutorial-r.md`](tutorial-r.md).)
 
 All inputs use **row-major** `f64` for the design matrix: `x[i * p + j]` is
 row `i`, column `j`.
@@ -42,7 +42,7 @@ let ids = GroupIds { primary: (0..n as u32).map(|i| i % 6).collect(), extra: vec
 let opts = FitOptions { target_indices: vec![0, 1], ..Default::default() }; // SE for both columns
 
 let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-assert!(fit.converged);
+assert!(fit.converged());
 println!("beta = {:?}, se = {:?}", fit.beta, fit.se);
 ```
 
@@ -58,8 +58,12 @@ Points worth knowing at this layer:
   its own `GroupIds::extra[g]` vector aligned 1:1, declaration order.
 - `FitOptions::target_indices` controls which columns get a standard error —
   SE computation has a cost, so only ask for the columns you need.
-- `Fit::converged == false` signals a numerical failure (not a panic); check it
-  before trusting `beta`/`se`.
+- `fit.converged() == false` signals a numerical failure (not a panic); check
+  it before trusting `beta`/`se`. It reads `fit.diagnostics.converged` —
+  everything the fit reports about *itself* (convergence, singularity, the
+  aliased-column mask, the θ boundary state, and any solver notes) lives on
+  `fit.diagnostics`, with `converged()`/`singular()`/`aliased()` kept as
+  forwarding accessors for the three most-read ones.
 - **Experimental: in-fit parallelism.** Building with the `parallel` cargo
   feature *and* setting `FitOptions { parallel_inner: true, .. }` runs the AGQ
   cluster loop and the FD-Hessian SE grid on rayon threads. Both default to
@@ -165,9 +169,21 @@ per-call cost actually matters for your loop. `fit_cold`/`fit_warm` route
 through this same `build_workspace`/`fit_on` core — they allocate a throwaway
 workspace per call and always assemble the full `Fit`. That shared core is the
 point: the solver cannot drift between the stable entry and the loop tier. The
-answers still can, on one input — an aliased fixed-effect design. `fit_warm`
-drops the aliased columns and returns a reduced fit; `fit_on` runs the full
-design and returns NaN with `converged: false`.
+answers still can, on one input — a rank-deficient fixed-effect design.
+`fit_warm` runs the alias gate first, drops the redundant column and returns a
+reduced fit. `fit_on` skips that gate on purpose — that is part of what you are
+buying — and hands the full design to the solver, so one of two things comes
+back: NaN with `converged: false`, or real numbers with an enormous standard
+error and `ill_conditioned` set. Which one is settled by the arithmetic on that
+draw, and you cannot predict it from the design or the route: the same route,
+given the same kind of duplicated column at two sample sizes, can land on
+opposite sides.
+
+That makes checking your job. Call `FitView::diagnostics()` on **every** draw and
+read `converged` and `ill_conditioned` before you use the numbers — a returned
+number is not evidence of a good fit, and `converged` alone misses every draw
+that fit through badly conditioned. `pivot_col` names the column to look at when
+the flag fires.
 `loop_advanced` also re-exports the individual OLS/GLM/GLMM/LME kernels and
 their scratch types, a level below this.
 

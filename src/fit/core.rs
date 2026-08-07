@@ -18,7 +18,9 @@ use crate::glmm::{build_z, GlmmWorkspace, StructuredSchur};
 use crate::lmm::LmmWorkspace;
 use crate::{BinomialLink, Family, GroupIds, GroupingRelation, ModelSpec, StartValues};
 
-use super::common::{assert_group_ids, assert_model_shape, fill_col_major};
+use super::common::{
+    assert_group_ids, assert_model_shape, fill_col_major, warm_theta, FitDiagnostics,
+};
 use super::glm::GlmScratchBuf;
 use super::lmm::LmmResultView;
 use super::ols::OlsWorkspace;
@@ -36,6 +38,13 @@ pub struct FitView<'a> {
     kind: FitViewKind<'a>,
 }
 
+// The `Prebuilt` arm is ~2× the next-largest variant because it owns a whole
+// assembled `Fit` — which is the arm's entire reason to exist, and got wider
+// again when `Fit`'s diagnostics moved behind `Diagnostics`. Clippy's fix is to
+// box it, and that is the wrong trade here: the enum lives for one call frame,
+// while `Box::new` would add a heap block PER DRAW on the loop tier, which is
+// the one cost this crate spent 0.1.3 removing.
+#[allow(clippy::large_enum_variant)]
 enum FitViewKind<'a> {
     Ols(crate::ols::OlsFitView<'a>),
     Glm(crate::glm::GlmFitView<'a>),
@@ -76,15 +85,55 @@ impl FitView<'_> {
         }
     }
 
-    /// Whether the fit reached its convergence criterion.
-    pub fn converged(&self) -> bool {
+    /// Every diagnostic this fit produced, in one carrier — the single channel
+    /// each route fills and everything downstream reads (see [`FitDiagnostics`]
+    /// for what each field means per route, and for the two placeholder fields).
+    /// Allocation-free, so a warm loop can read it per draw.
+    ///
+    /// This is the loop tier's ONLY window onto rank state, and reading it every
+    /// draw is the tier's price of admission. The warm-loop entry points skip
+    /// the pre-dispatch alias gate `fit_cold`/`fit_warm` run — the ONLY place a
+    /// column is ever dropped — deliberately, to buy the speed the tier exists
+    /// for. The design therefore reaches the solver as-is, and one of two things
+    /// comes back: refusal (NaN β̂, `converged: false`, no pivot recorded), or
+    /// acceptance (`converged: true`, a finite β̂, an enormous standard error,
+    /// `ill_conditioned` set).
+    ///
+    /// Which one is settled by the arithmetic on that draw. It is not
+    /// predictable from the design or from the route: one route, handed the same
+    /// kind of duplicated column at different sample sizes, has been measured
+    /// landing on opposite sides.
+    ///
+    /// So the obligation transfers to the caller. Read `converged` AND
+    /// `ill_conditioned` on every draw and decide what the draw is worth — a
+    /// returned number is not evidence of a good fit, and counting only
+    /// non-converged draws misses every draw that fit through badly conditioned.
+    pub fn diagnostics(&self) -> FitDiagnostics {
         match &self.kind {
-            FitViewKind::Ols(v) => v.converged,
-            FitViewKind::Glm(v) => v.converged,
-            FitViewKind::Lmm(v) => v.converged(),
-            FitViewKind::Glmm(v) => v.converged(),
-            FitViewKind::Prebuilt { fit, .. } => fit.converged,
+            FitViewKind::Ols(v) => v.diagnostics(),
+            FitViewKind::Glm(v) => v.diagnostics(),
+            FitViewKind::Lmm(v) => v.diagnostics(),
+            FitViewKind::Glmm(v) => v.diagnostics(),
+            // The kernel already assembled a `Fit`, so the carrier is read back
+            // off it. `boundary_hit` is back-derived from `singular`, which is
+            // lossy in the documented way: this route cannot report a cap-out
+            // (2), and the carrier holds no `Vec`, so the per-component detail
+            // stays on the assembled `Fit` (`Diagnostics::pinned`, filled by
+            // the sparse routes) and does not reach here. Its `singular` also
+            // carries the negligible-component check `into_fit` applies to the
+            // other arms afterwards, so it is at least as inclusive.
+            FitViewKind::Prebuilt { fit, .. } => FitDiagnostics {
+                boundary_hit: fit.singular() as u8,
+                ..FitDiagnostics::fixed_only(fit.converged())
+            },
         }
+    }
+
+    /// Whether the fit reached its convergence criterion. Forwards to
+    /// [`FitView::diagnostics`] — the most-read diagnostic keeps its one-hop
+    /// accessor rather than a five-arm match of its own.
+    pub fn converged(&self) -> bool {
+        self.diagnostics().converged
     }
 
     /// Fixed-effect estimates β̂ (length `p`).
@@ -118,28 +167,6 @@ impl FitView<'_> {
             FitViewKind::Lmm(v) => v.joint_t_sq(),
             FitViewKind::Glmm(v) => v.joint_t_sq(),
             FitViewKind::Prebuilt { .. } => f64::NAN,
-        }
-    }
-
-    /// θ boundary flag: 0 interior, 1 a component pinned to the floor, 2 no
-    /// optimum. The `Prebuilt` arm maps its `singular` flag onto `1`; OLS/GLM 0.
-    pub fn boundary_hit(&self) -> u8 {
-        match &self.kind {
-            FitViewKind::Ols(_) | FitViewKind::Glm(_) => 0,
-            FitViewKind::Lmm(v) => v.boundary_hit(),
-            FitViewKind::Glmm(v) => v.boundary_hit(),
-            FitViewKind::Prebuilt { fit, .. } => fit.singular as u8,
-        }
-    }
-
-    /// Bitmask of θ components pinned to the boundary (diagonal_theta order).
-    /// `Prebuilt`/OLS/GLM carry no per-component pin record — report 0.
-    pub fn pinned_components(&self) -> u64 {
-        match &self.kind {
-            FitViewKind::Ols(_) | FitViewKind::Glm(_) => 0,
-            FitViewKind::Lmm(v) => v.pinned_components(),
-            FitViewKind::Glmm(v) => v.pinned_components(),
-            FitViewKind::Prebuilt { .. } => 0,
         }
     }
 
@@ -183,10 +210,12 @@ impl FitView<'_> {
     /// Build the full stable `Fit` (vcov, loglik, varcorr, fitted, ranef). This
     /// is the allocating stable-API path; the hot loop reads the accessors above
     /// instead. `model` selects the family for the GLM/GLMM mappers.
+    #[allow(clippy::too_many_arguments)] // marshals (x, y, ids, n, p, model, opts)
     pub fn into_fit(
         self,
         x: &[f64],
         y: &[f64],
+        ids: &GroupIds,
         n: usize,
         p: usize,
         model: &ModelSpec,
@@ -197,7 +226,7 @@ impl FitView<'_> {
             FitViewKind::Glm(v) => {
                 super::glm::glm_view_to_fit(&v, y, model.family, f64::NAN, n, p, opts)
             }
-            FitViewKind::Lmm(v) => super::lmm::lmm_view_to_fit(&v, n, p, opts),
+            FitViewKind::Lmm(v) => super::lmm::lmm_view_to_fit(&v, x, ids, n, p, opts),
             FitViewKind::Glmm(v) => super::glmm::glmm_view_to_fit(&v, y, n, p, model, opts).0,
             FitViewKind::Prebuilt { fit, .. } => fit,
         }
@@ -469,8 +498,10 @@ pub fn build_workspace(
 ///   deviance and loglik come out wrong. Non-finite weights or offsets propagate
 ///   as NaN; the GLMM route panics on a length mismatch instead.
 /// - **Rank deficiency.** `fit_warm` drops aliased fixed-effect columns and refits
-///   (lme4 behaviour); `fit_on` does not, and returns NaN with
-///   `converged: false` on the same design.
+///   (lme4 behaviour); `fit_on` hands the design to the solver whole, and whether
+///   it comes back NaN-filled or fitted-and-flagged is settled by the arithmetic
+///   on that draw. Checking is the caller's job, per draw: read `converged` and
+///   `ill_conditioned` off [`FitView::diagnostics`].
 pub fn fit_on<'a>(
     ws: &'a mut FitWorkspace,
     x: &[f64],
@@ -604,11 +635,7 @@ pub fn fit_on<'a>(
                 &ids.extra,
                 opts.weights.as_deref(),
             );
-            let v = super::lmm::lmm_run_on(
-                lmm_ws,
-                &opts.target_indices,
-                start.map(|s| s.theta.as_slice()),
-            );
+            let v = super::lmm::lmm_run_on(lmm_ws, &opts.target_indices, warm_theta(start));
             FitView {
                 kind: FitViewKind::Lmm(v),
             }

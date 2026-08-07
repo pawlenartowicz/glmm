@@ -1,9 +1,9 @@
 //! Tier 2 — the cross-engine tier (RULE 6).
 //!
 //! Asserts the crate against the frozen lme4 / MASS / GLMMadaptive references at
-//! `validation/tol.R`'s agreement bands: 38 goldens in `validation/goldens/` plus the
+//! `validation/tol.R`'s agreement bands: 46 goldens in `validation/goldens/` plus the
 //! weights tier (rungs 29-43) in `validation/results/lme4_simulated/`. Reads frozen
-//! JSON, so it needs neither R nor Julia at runtime — but it refits all 53, so
+//! JSON, so it needs neither R nor Julia at runtime — but it refits all 61, so
 //! it is off by default:
 //!
 //! ```sh
@@ -13,7 +13,7 @@
 //! A failure here means glmm and the reference no longer agree by more than the
 //! calibration allowed. There are exactly three honest endings: a bug in glmm
 //! (fix it), a documented expected divergence (add the entry, under review), or
-//! a reference-vs-reference gap (`reference_disagreements.md`). Widening a band
+//! a reference-vs-reference gap. Widening a band
 //! to make red go green is none of them.
 //!
 //! This is NOT `validation/run.sh`, which refits R and Julia to check the frozen
@@ -50,10 +50,29 @@ fn factors_of(spec: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A manifest `m3_goldens` entry whose reference JSON has not been generated yet:
+/// `pending_reference` carries the reason as a non-empty string.
+///
+/// Registering a spec and freezing its reference are two separate acts, and the
+/// spec has to land FIRST — `engines/goldens_agq.R` reads the manifest to know
+/// what to fit, so there is no ordering in which the JSON can exist before the
+/// entry does. Without this flag that gap makes [`m3_corpus`] panic on a missing
+/// file and takes the whole 56-golden tier down with it, which is the opposite of
+/// what a not-yet-frozen addition should cost. Flagged entries are skipped here
+/// and reported by `pending_references_are_absent_and_reasoned`, which also stops
+/// the flag outliving the JSON's arrival: once the reference exists, the field
+/// must go, and removing it is what puts the golden under Tier 2.
+fn is_pending(spec: &Value) -> bool {
+    spec["pending_reference"]
+        .as_str()
+        .is_some_and(|r| !r.is_empty())
+}
+
 /// The `validation/goldens/` tree, with the manifest's factor list. The manifest is
 /// the registry — RULE 0: a golden that no script can regenerate is not an
 /// oracle, so anything in `validation/goldens/` must appear in `m3_goldens`, and
-/// `all_goldens_are_registered` holds that line.
+/// `all_goldens_are_registered` holds that line. Entries still awaiting their
+/// reference are excluded ([`is_pending`]).
 fn m3_corpus() -> Vec<(Golden, Vec<String>)> {
     let manifest: Value =
         serde_json::from_str(include_str!("../validation/manifest.json")).expect("manifest parses");
@@ -62,6 +81,7 @@ fn m3_corpus() -> Vec<(Golden, Vec<String>)> {
         .expect("manifest has m3_goldens");
     specs
         .iter()
+        .filter(|s| !is_pending(s))
         .map(|s| {
             let name = s["name"].as_str().expect("spec has a name");
             let path = format!(
@@ -80,10 +100,10 @@ fn m3_corpus() -> Vec<(Golden, Vec<String>)> {
 /// The weights tier (rungs 29-43 of `validation/manifest.json`), read where it
 /// was generated rather than copied into `validation/goldens/`.
 ///
-/// D3 asked for these to be "promoted into `m3_goldens`", meaning: asserted from
+/// These are promoted into `m3_goldens` coverage: asserted from
 /// `cargo test` instead of only by `compare.R` on a machine with R. Reading them
-/// in place achieves that without a second copy of 15 frozen JSONs — and §15.1
-/// is the case for not making one. The `goldens/` and `results/` trees held
+/// in place achieves that without a second copy of 15 frozen JSONs. The `goldens/`
+/// and `results/` trees held
 /// overlapping values that had silently drifted onto different `tolPwrss`
 /// settings, and the fix was to put them back on the same footing. A third
 /// overlapping tree would rebuild exactly that hazard.
@@ -275,6 +295,111 @@ fn all_goldens_are_registered() {
     );
 }
 
+/// The other half of [`is_pending`]: a `pending_reference` must be a real reason,
+/// and it must describe a golden that genuinely is not on disk yet.
+///
+/// The failure this exists to catch is the flag going stale. A spec whose
+/// reference HAS been generated but which still carries the field is silently
+/// excluded from every assertion in this file — a frozen oracle that costs an R
+/// run and gates nothing, the same defect `golden_fields_are_all_asserted` was
+/// built for one level down. So the arrival of the JSON turns this test red until
+/// the field is removed.
+#[test]
+fn pending_references_are_absent_and_reasoned() {
+    let manifest: Value =
+        serde_json::from_str(include_str!("../validation/manifest.json")).expect("manifest parses");
+    let pending = pending_specs(
+        manifest["m3_goldens"]
+            .as_array()
+            .expect("manifest has m3_goldens"),
+    );
+    // Printed, not asserted to be empty: entries here are a legitimate transient
+    // state (spec landed, freeze pending). Visible so a `cargo test` run says out
+    // loud which goldens the tier is NOT covering.
+    if !pending.is_empty() {
+        println!("m3_goldens awaiting a reference, excluded from Tier 2: {pending:?}");
+    }
+}
+
+/// Names of the flagged specs, asserting both halves of the flag's contract on
+/// the way past: the reason is non-empty, and the golden really is still absent.
+///
+/// Split out of the test above so the asserts can be driven by synthetic specs
+/// (`flag_semantics` below). With no flagged entry in the real manifest — the
+/// normal state — every line here is unreachable from the manifest alone, so the
+/// flag's semantics would otherwise be untested code.
+fn pending_specs(specs: &[Value]) -> Vec<String> {
+    let mut pending = Vec::new();
+    for s in specs {
+        let name = s["name"].as_str().expect("spec has a name");
+        let Some(reason) = s["pending_reference"].as_str() else {
+            continue;
+        };
+        assert!(
+            !reason.is_empty(),
+            "{name}: pending_reference is present but empty — an exclusion with no reason"
+        );
+        let path = format!(
+            "{}/validation/goldens/{name}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "{name}: pending_reference is set but {path} exists — drop the field, \
+             or the golden is frozen and gated by nothing"
+        );
+        pending.push(name.to_string());
+    }
+    pending
+}
+
+/// The flag's own semantics, on synthetic specs rather than the manifest — the
+/// manifest carries no flagged entry, and once the references of a release are
+/// frozen it never does, so a gate reading the real specs asserts nothing.
+mod flag_semantics {
+    use super::{is_pending, pending_specs};
+    use serde_json::{json, Value};
+
+    /// A spec named after a golden that IS on disk, so the stale-flag assert can
+    /// reach its failing branch. `sleepstudy_lmm` rather than an invented name:
+    /// an invented one could never collide, which is the case being tested.
+    fn frozen_golden_spec(reason: Value) -> Value {
+        json!({ "name": "sleepstudy_lmm", "pending_reference": reason })
+    }
+
+    #[test]
+    fn absent_empty_and_non_empty_reasons() {
+        assert!(!is_pending(&json!({ "name": "x" })));
+        assert!(!is_pending(
+            &json!({ "name": "x", "pending_reference": "" })
+        ));
+        assert!(is_pending(
+            &json!({ "name": "x", "pending_reference": "awaiting the R run" })
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "an exclusion with no reason")]
+    fn empty_reason_is_rejected() {
+        pending_specs(&[json!({ "name": "not_a_golden", "pending_reference": "" })]);
+    }
+
+    #[test]
+    #[should_panic(expected = "drop the field")]
+    fn flag_outliving_the_golden_is_rejected() {
+        pending_specs(&[frozen_golden_spec(json!("awaiting the R run"))]);
+    }
+
+    #[test]
+    fn an_unfrozen_flagged_spec_is_reported() {
+        let pending = pending_specs(&[
+            json!({ "name": "plain_spec" }),
+            json!({ "name": "not_a_golden", "pending_reference": "awaiting the R run" }),
+        ]);
+        assert_eq!(pending, vec!["not_a_golden".to_string()]);
+    }
+}
+
 /// The defect this tier was built to fix: a reader struct silently dropping a
 /// golden field, so the value is frozen, costs an R run, and is never checked.
 /// `Est` used to drop `sigma`, `se_rx`, `loglik`, `dispersion` and `theta`.
@@ -330,17 +455,29 @@ fn golden_fields_are_all_asserted() {
 /// Refit every golden from its own recorded `r_formula` and compare every field
 /// it carries, at `tol.R`'s bands.
 ///
-/// One test over the corpus rather than 35 hand-written ones: the goldens differ
+/// One test over the corpus rather than 56 hand-written ones: the goldens differ
 /// in data and model, not in what agreement means, and a per-golden test would
-/// be 35 copies of the same twelve asserts. A failure names the golden and the
+/// be 61 copies of the same twelve asserts. A failure names the golden and the
 /// field, so it localises the same way.
 #[test]
 fn goldens_agree_with_the_references() {
-    // 35 `m3_goldens` + 15 prior-weights rungs. Pinned because a loader that
+    // 46 `m3_goldens` + 15 prior-weights rungs. Pinned because a loader that
     // silently returns fewer — a renamed results directory, a manifest key that
     // moved — would leave this test green while asserting nothing, which is the
     // failure mode the whole tier is built against.
-    assert_eq!(corpus().len(), 53, "the cross-engine corpus changed size");
+    //
+    // 53 -> 55 on 2026-07-30: the two `sim_binomial_bigsd_agq_k{7,11}` references
+    // were frozen, so their specs lost `pending_reference` and rejoined
+    // `m3_corpus()`. 55 -> 56 on 2026-08-01: `sim_dynrange_lmm` joined, a design
+    // the crate used to NaN-fill on conditioning grounds and now fits — which is
+    // what made a reference possible at all. 56 -> 61 on 2026-08-06: the five
+    // `sim_scale_*_glm` goldens joined, pinning that the GLM divergence guard's
+    // switch from bounding |β| to bounding |η| gives the same accept/reject
+    // decision `stats::glm` does on the three-unit-system, separated, and
+    // Gamma-inverse-large-η design classes. The 46 is what
+    // `all_goldens_are_registered` proves against the goldens directory; the 15
+    // is asserted inside `corpus()` itself.
+    assert_eq!(corpus().len(), 61, "the cross-engine corpus changed size");
     let mut open = Vec::new();
     for (g, factors) in corpus() {
         if let Some(reason) = known_open(&g) {
@@ -352,14 +489,16 @@ fn goldens_agree_with_the_references() {
         let factor_refs: Vec<&str> = factors.iter().map(String::as_str).collect();
         let (f, cols, groups) = refit(&g, &factor_refs);
         let name = &g.name;
-        let align = align_coefs(&cols, &g.coef_names, &f.aliased, name);
+        let align = align_coefs(&cols, &g.coef_names, f.aliased(), name);
 
         assert_eq!(
-            f.converged, g.converged,
+            f.converged(),
+            g.converged,
             "{name}: convergence flag disagrees with the oracle"
         );
         assert_eq!(
-            f.singular, g.singular,
+            f.singular(),
+            g.singular,
             "{name}: singularity flag disagrees with the oracle"
         );
         if !g.converged {
@@ -377,7 +516,7 @@ fn goldens_agree_with_the_references() {
 
         assert_coefs(
             &f.beta,
-            &f.aliased,
+            f.aliased(),
             &align,
             &g.estimates.beta,
             beta_band,
@@ -390,7 +529,7 @@ fn goldens_agree_with_the_references() {
         if let Some(se) = &g.estimates.se {
             assert_coefs(
                 &f.se,
-                &f.aliased,
+                f.aliased(),
                 &align,
                 se,
                 se_band,
@@ -405,7 +544,7 @@ fn goldens_agree_with_the_references() {
             };
             assert_coefs(
                 &f.se,
-                &f.aliased,
+                f.aliased(),
                 &align,
                 se,
                 band,
@@ -420,7 +559,7 @@ fn goldens_agree_with_the_references() {
             let (fx, _, _) = refit_with(&g, &factor_refs, WaldSe::Rx);
             assert_coefs(
                 &fx.se,
-                &fx.aliased,
+                fx.aliased(),
                 &align,
                 se_rx,
                 tol::SE_REL,
@@ -456,20 +595,35 @@ fn goldens_agree_with_the_references() {
             );
         }
         if let Some(ll) = g.estimates.loglik {
-            if shape != Shape::VectorAgq && g.nagq > 1 {
+            // The scale break asserted below is the saturated log-likelihood, and
+            // that term is exactly 0 for a Bernoulli response — so Bernoulli rungs
+            // show no break at all and belong on the agreement branch. The harness
+            // writes aggregated binomial as `cbind(successes, failures)`, so a
+            // binomial golden whose formula lacks it is one row per trial.
+            let bernoulli = g.family == "binomial" && !g.r_formula.contains("cbind(");
+            if shape != Shape::VectorAgq && g.nagq > 1 && !bernoulli {
                 // EXPECTED DIVERGENCE — lme4's logLik() is not on the same scale
                 // at nAGQ>1 as at nAGQ=1, and glmm's is. Measured on cbpp at
                 // tolPwrss=1e-13, where the DEVIANCE barely moves (73.4715 at
                 // nAGQ=1, 73.3730 at 7, 73.3731 at 11 — the expected small AGQ
                 // improvement) while lme4's logLik jumps -92.0263 → -50.0050 →
-                // -50.0050. The constant it restores at nAGQ>1 is not the one it
-                // restores at nAGQ=1, and it is not the aggregated-binomial
-                // normalising term either (Σ ln C(nᵢ,sᵢ) = 185.48, the jump is
-                // 42.02). grouseticks shows the same break, -957.3996 → -492.3276.
-                // glmm reports -91.9834 at nAGQ=7 — consistent with its own
-                // Laplace value, which is the behaviour a user can compare across
-                // nAGQ. Asserted as a divergence so that lme4 fixing this fails
-                // here rather than passing silently.
+                // -50.0050. The constant is the saturated log-likelihood, which
+                // lme4 restores at nAGQ=1 and drops at nAGQ>1: on cbpp
+                // Σ[ln C(nᵢ,sᵢ) + sᵢ ln p̂ᵢ + (nᵢ−sᵢ) ln(1−p̂ᵢ)] = −41.98 against an
+                // observed jump of 42.02, the residual being the deviance's own
+                // nAGQ shift. It is NOT the normalising term on its own — that is
+                // Σ ln C(nᵢ,sᵢ) = 185.48. grouseticks shows the same break,
+                // -957.3996 → -492.3276. glmm reports -91.9834 at nAGQ=7 —
+                // consistent with its own Laplace value, which is the behaviour a
+                // user can compare across nAGQ. Asserted as a divergence so that
+                // lme4 fixing this fails here rather than passing silently.
+                //
+                // Bernoulli is exempt because nᵢ = 1 and sᵢ ∈ {0,1} zero every term
+                // of that sum, leaving no constant to drop: sim_binomial_bigsd
+                // agrees to 1.0e-9 at both k7 and k11. It is the corpus's only
+                // Bernoulli nAGQ>1 rung, added in 0.1.4 — the assertion predates it
+                // and generalised from cbpp and grouseticks, which are the whole
+                // rest of the lme4 nAGQ>1 set.
                 assert!(
                     (f.loglik - ll).abs() > 1.0,
                     "{name}: lme4's nAGQ>1 logLik scale break has disappeared \

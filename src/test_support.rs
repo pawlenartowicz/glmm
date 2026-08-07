@@ -38,6 +38,51 @@ pub(crate) fn assert_near(got: &[f64], want: &[f64], ctx: &str) {
     }
 }
 
+/// Serializes every `#[ignore]` lib test under `--features alloc-tests`.
+/// `dhat::Profiler` counts process-wide allocations and permits one live
+/// profiler at a time, so concurrent tests attribute each other's allocations
+/// (an OLS route with no optimizer once "regressed" this way). The
+/// bounded-alloc tests hold this for their whole body; the non-alloc
+/// `#[ignore]` tests take it too (feature-gated), since their allocations
+/// would otherwise land in a concurrent profiler window on an `-- --ignored`
+/// run. This makes `--test-threads=1` unnecessary. Poisoning is deliberately
+/// swallowed: one failing test must not cascade into the rest.
+#[cfg(feature = "alloc-tests")]
+pub(crate) fn alloc_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Blocks until no thread but ours is allocating, so a bounded-alloc test's
+/// profiler window measures only its own calls.
+///
+/// faer pulls in rayon, whose global pool spawns its workers lazily on first
+/// use and *asynchronously*: each worker's own startup allocations
+/// (crossbeam-epoch `Local::register`, crossbeam-deque `JobFifo`, the
+/// stack-overflow handler's `ThreadInfo`) land milliseconds after the fit that
+/// triggered the pool, on threads dhat counts all the same. On a 16-core box
+/// that is ~30 stray blocks drifting into whatever window is open — enough to
+/// blow a tight pin, and timing-dependent, so it looks like the kernel itself
+/// allocates non-deterministically. Call this after the warmup fit and before
+/// building the profiler.
+///
+/// Quiet is defined by measurement, not by a fixed sleep: sample short idle
+/// windows until one comes back at zero blocks. The cap keeps a genuinely
+/// noisy process from hanging the test — it then fails on the real bound.
+#[cfg(feature = "alloc-tests")]
+pub(crate) fn settle_background_allocs() {
+    for _ in 0..200 {
+        let probe = dhat::Profiler::builder().testing().build();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let blocks = dhat::HeapStats::get().total_blocks;
+        drop(probe);
+        if blocks == 0 {
+            return;
+        }
+    }
+}
+
 pub(crate) struct TestWs {
     // OLS suff-stats
     pub suff_xtx: Mat<f64>,
@@ -269,14 +314,6 @@ pub(crate) fn build_lme_scratch<'w>(
         xtx: ws.lme_xtx.as_ref(),
         xty: &ws.lme_xty,
         yty: ws.lme_yty,
-        ols_scratch: crate::ols::OlsScratch {
-            fit_betas: &mut ws.fit_betas,
-            fit_var_diag: &mut ws.fit_var_diag,
-            fit_t_sq: &mut ws.fit_t_sq,
-            fit_u_scratch: &mut ws.fit_u_scratch,
-            fit_factor: ws.fit_factor.as_mut(),
-            fit_rhs: ws.fit_rhs.as_mut(),
-        },
         sum_xc: ws.lme_sum_xc.as_mut().into_const(),
         sum_yc: &ws.lme_sum_yc,
         cluster_sizes: &ws.lme_cluster_sizes,

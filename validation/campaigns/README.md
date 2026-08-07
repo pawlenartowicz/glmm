@@ -15,7 +15,7 @@ family × size × balance?
 dimension (~0.97 at 1–2 θ params to ~1.8 at 21–40); 491/510 cells ok, the
 mismatches all adjudicated (see estimate-grid).
 **Machinery:** `manifest.json` (510 cells) + `prep.R` (fixed-seed data into
-`data/`) + `run.sh <engine> <tag>` (per-fit wall watchdog with kill-and-resume)
+`data/`) + `run.sh <engine> <tag>` (per-cell wall watchdog with kill-and-resume)
 + `fit.{rs,R,jl}` drivers + `analyze.R`/`report.R` → `reports/`.
 `theta_eval.rs` and `sweep_fit.jl` are the mismatch-adjudication drivers
 (multi-start sweeps re-scored on glmm's objective); their product is the

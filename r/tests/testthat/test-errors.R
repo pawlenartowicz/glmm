@@ -49,7 +49,7 @@ test_that("intercepted lme4 arguments raise designed errors", {
   expect_error(fastglmm(y ~ x, d, verbose = TRUE), "verbose")
   expect_error(fastglmm(y ~ x, d, contrasts = list(g = "contr.sum")),
                "relevel")
-  expect_error(fastglmm(y ~ x, d, offset = rep(1, 40)), "offset")
+  # offset= is a real argument; only the offset() formula term errors.
   expect_error(fastglmm(y ~ x + offset(x), d), "offset")
   expect_error(fastglmm(y ~ x, d, bogus = 1), "unused argument")
 })
@@ -102,13 +102,11 @@ test_that("ineligible-shape nAGQ > 1 warns and falls back to Laplace", {
   expect_true(fit$converged)
 })
 
-test_that("engine-blocked accessors error with the reason", {
+test_that("unimplemented accessors error with the reason", {
   d <- err_data()
   fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), d)) # boundary fit is fine here
-  expect_error(ranef(fit), "engine-blocked")
-  expect_error(predict(fit), "engine-blocked")
-  expect_error(fitted(fit), "engine-blocked")
-  expect_error(residuals(fit), "engine-blocked")
+  expect_error(predict(fit), "not available")
+  expect_error(residuals(fit), "type")
   expect_error(coef(fit), "fixef")
   expect_error(terms(fit), "formula\\(\\) returns")
   expect_error(confint(fit, method = "profile"), "no profiling machinery")

@@ -12,9 +12,11 @@ use crate::glm::{glm_irls_fit, GlmScratch};
 use crate::glmm::{build_z, GlmmFit, GlmmWorkspace, StructuredSchur};
 use crate::{Family, ModelSpec, NegBinomialLink, StartValues};
 
-use super::common::{assemble_varcorr, fill_se_by_predictor, nan_vcov, to_col_major};
+use super::common::{
+    assemble_varcorr, fill_se_by_predictor, nan_vcov, to_col_major, warm_theta, FitDiagnostics,
+};
 use super::glm::{golden_max_ln_theta, nb_profile_loglik};
-use super::{Fit, FitOptions};
+use super::{Diagnostics, Fit, FitOptions};
 
 // ---------------------------------------------------------------------------
 // GLMM dispatch (Binomial{Logit}, re: Some)
@@ -157,13 +159,11 @@ fn fit_glmm_build(
                 vcov: nan_vcov(p),
                 tau2: vec![f64::NAN; ws.n_theta],
                 dispersion: f64::NAN,
-                converged: false,
+                diagnostics: Diagnostics::from_flags(false, false, p),
                 varcorr: vec![],
                 stddev_se: vec![],
-                aliased: vec![false; p],
                 n_eval: 0,
                 deviance: f64::NAN,
-                singular: false,
                 loglik: f64::NAN,
                 df: 0,
                 reml: false,
@@ -264,21 +264,23 @@ impl GlmmResultView<'_> {
     pub(crate) fn var_diag(&self) -> &[f64] {
         &self.ws.var_diag
     }
-    /// Whether the joint [θ|β] optimizer converged.
-    pub(crate) fn converged(&self) -> bool {
-        self.fit.converged
+    /// This route's [`FitDiagnostics`]. θ boundary state and per-component pins
+    /// are real; the pivot fields are NOT — the dense GLMM records no pivot, so
+    /// they stay at the `fixed_only` NaN and this route never flags
+    /// ill-conditioning. Detection here would need its own calibration on the
+    /// PIRLS-weighted `X'WX`, which nobody has run.
+    pub(crate) fn diagnostics(&self) -> FitDiagnostics {
+        FitDiagnostics {
+            boundary_hit: self.fit.boundary_hit,
+            pinned_components: self.fit.pinned_components,
+            pirls_exhausted: self.ws.pirls_exhausted,
+            final_pirls_exhausted: self.ws.final_pirls_exhausted,
+            ..FitDiagnostics::fixed_only(self.fit.converged)
+        }
     }
     /// Joint Wald-χ² over the target set (the omnibus significance read).
     pub(crate) fn joint_t_sq(&self) -> f64 {
         self.fit.joint_t_sq
-    }
-    /// 0 interior, 1 a θ component pinned to the floor, 2 no optimum found.
-    pub(crate) fn boundary_hit(&self) -> u8 {
-        self.fit.boundary_hit
-    }
-    /// Bitmask of θ components pinned to the boundary (diagonal_theta order).
-    pub(crate) fn pinned_components(&self) -> u64 {
-        self.fit.pinned_components
     }
     /// Objective evaluations the joint solve spent.
     pub(crate) fn n_eval(&self) -> usize {
@@ -330,10 +332,11 @@ pub(crate) fn run_glmm_on<'a>(
     // MCPower hot loop) uses its β verbatim; a cold start seeds β from the no-RE GLM
     // fit (lme4/glmer initialization — see `glm_warm_start_beta`) instead of 0, so
     // the inner PIRLS opens near the mean and does not overshoot. θ still cold-starts
-    // at the kernel's THETA0 blind start.
+    // at the kernel's THETA0 blind start. An empty field is a per-component cold
+    // start (`StartValues`), so it takes the same branch as `start = None`.
     let beta_start = match start {
-        Some(s) => s.beta.clone(),
-        None => glm_warm_start_beta(
+        Some(s) if !s.beta.is_empty() => s.beta.clone(),
+        _ => glm_warm_start_beta(
             model.family,
             nb_theta,
             x_mat,
@@ -350,7 +353,7 @@ pub(crate) fn run_glmm_on<'a>(
         cluster_ids,
         extra_ids,
         &opts.target_indices,
-        start.map(|s| s.theta.as_slice()),
+        warm_theta(start),
         &beta_start,
         n,
         opts.wald_se,
@@ -378,6 +381,8 @@ pub(crate) fn glmm_view_to_fit(
 ) -> (Fit, Vec<f64>, f64) {
     let ws = view.ws;
     let glmm_fit = &view.fit;
+    let diag = view.diagnostics();
+    let converged = diag.converged;
     let nb_theta = view.nb_theta;
     let n_theta = ws.n_theta;
 
@@ -398,7 +403,7 @@ pub(crate) fn glmm_view_to_fit(
     // hoisted so tau2 and varcorr below carry the SAME scale — lme4's VarCorr
     // convention. Only meaningful on a converged fit (reads the converged
     // μ̂/û state).
-    let sigma_sq = if glmm_fit.converged {
+    let sigma_sq = if converged {
         crate::family::glmm_sigma_sq(
             model.family,
             &y[..n],
@@ -409,7 +414,7 @@ pub(crate) fn glmm_view_to_fit(
     } else {
         f64::NAN
     };
-    let tau2: Vec<f64> = if glmm_fit.converged {
+    let tau2: Vec<f64> = if converged {
         ws.params[..n_theta]
             .iter()
             .map(|&t| t * t * sigma_sq)
@@ -427,7 +432,7 @@ pub(crate) fn glmm_view_to_fit(
     // pwrss/n (`vcov(use.hessian=FALSE)`; `family::glmm_sigma_sq`, a DIFFERENT
     // quantity than this φ̂). NB θ̂ is set by the outer-θ wrapper, not here.
     let dispersion = match model.family {
-        Family::Gamma { .. } if glmm_fit.converged => match opts.dispersion {
+        Family::Gamma { .. } if converged => match opts.dispersion {
             Some(v) => v,
             None => crate::family::pearson_dispersion(
                 &y[..n],
@@ -447,7 +452,7 @@ pub(crate) fn glmm_view_to_fit(
     // σ̂² ≡ 1 for binomial/Poisson/NB, so this only bites dispersion families
     // like Gamma). Oracle: `fit_glmm_gamma_sim_matches_lme4` /
     // `validation/goldens/sim_gamma_glmm.json` varcomp stddevs.
-    let varcorr = if glmm_fit.converged {
+    let varcorr = if converged {
         assemble_varcorr(&ws.params[..n_theta], &ws.groupings, sigma_sq)
     } else {
         vec![]
@@ -457,7 +462,7 @@ pub(crate) fn glmm_view_to_fit(
     // NaN under Rx / RX fallback / non-converged — `ws.theta_se` is reset per fit
     // and refilled only by `fd_hessian_cov`). Cloned verbatim: for the reachable
     // scalar groupings θ = stddev, so the θ-scale SE is the stddev SE.
-    let stddev_se = if glmm_fit.converged {
+    let stddev_se = if converged {
         ws.theta_se[..n_theta].to_vec()
     } else {
         vec![f64::NAN; n_theta]
@@ -474,7 +479,7 @@ pub(crate) fn glmm_view_to_fit(
     // Diagnostics off the converged workspace state: μ̂ (the same conditional
     // means the tuple returns), b̂ = Λ̂û from the spherical modes, and the
     // marginal log-likelihood with the saturated constant restored.
-    let (fitted, ranef, ranef_levels) = if glmm_fit.converged {
+    let (fitted, ranef, ranef_levels) = if converged {
         (
             mu_hat.clone(),
             super::common::assemble_ranef_dense(
@@ -504,19 +509,17 @@ pub(crate) fn glmm_view_to_fit(
         vcov,
         tau2,
         dispersion,
-        converged: glmm_fit.converged,
+        diagnostics: super::common::materialize_diagnostics(&diag, p, &varcorr),
         varcorr,
         stddev_se,
-        aliased: vec![false; p],
         n_eval: glmm_fit.n_eval,
         deviance: if glmm_fit.deviance.is_finite() {
             glmm_fit.deviance
         } else {
             f64::NAN
         },
-        singular: glmm_fit.boundary_hit == 1,
         loglik,
-        df: if glmm_fit.converged {
+        df: if converged {
             super::common::model_df(model.family, p, n_theta, opts.dispersion.is_some())
         } else {
             0
@@ -526,7 +529,7 @@ pub(crate) fn glmm_view_to_fit(
         ranef,
         ranef_levels,
     };
-    fit.singular = fit.singular || fit.has_negligible_component();
+    fit.diagnostics.singular = fit.diagnostics.singular || fit.has_negligible_component();
     (fit, mu_hat, glmm_fit.deviance)
 }
 

@@ -31,7 +31,8 @@
 //! `2^k` is built with an FP magic-add + `u64` transmute/mask/mul rather than the
 //! textbook `(k+1023)<<52`: pulp 0.22's `Simd` trait exposes no integer
 //! shift/convert. Valid for `k ≥ -1023` (i.e. `x ⪆ -709`), always true on the
-//! fit path where `η` is bounded by `BETA_CAP`.
+//! fit path where `η` is bounded by `ETA_DIVERGENCE_CAP` — a bound on η
+//! directly, so this is exact rather than approximate.
 //!
 //! **fma policy.** wasm simd128 has no FMA instruction, so a guaranteed-fused
 //! `mul_add` lowers to the soft-float compiler-builtins libcall there (measured

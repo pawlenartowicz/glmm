@@ -60,9 +60,18 @@
 #' get is a Laplace fit, and the warning is the only notice. This mirrors the
 #' Python port so the two ports agree.
 #'
+#' **Diagnostic warnings carry a condition class.** Each solver note is raised
+#' as a warning of class `"fastglmm_diagnostic"` with a per-kind subclass
+#' (`"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`; a note from a
+#' newer kernel than this package arrives as `"fastglmm_unknown_note"`), so
+#' `withCallingHandlers()` and `suppressWarnings(classes = )` can select them
+#' without matching message text.
+#'
 #' Anything the engine cannot do is an error naming the reason - never a
 #' silently different model. That includes `REML = FALSE` (the LMM path is
-#' REML-only **by design**), `offset()`, `control=`/`verbose=`,
+#' REML-only **by design**), the `offset()` **formula term** (the `offset=`
+#' argument is supported - only the parser has no such term),
+#' `control=`/`verbose=`,
 #' `family = inverse.gaussian()` and `link = "cloglog"` (approved for GLMM
 #' 0.1.1, not yet in the kernel), and quasi-likelihood `dispersion=` on
 #' binomial/poisson.
@@ -86,6 +95,14 @@
 #'   `getOption("na.action")`, normally [stats::na.omit]). `NA`s must be
 #'   resolved before the kernel sees the data; an action that leaves them in
 #'   place (`na.pass`) is an error.
+#' @param offset optional per-row known additive term on the
+#'   linear-predictor scale, `glm`'s `offset=`: `eta = offset + X b (+ Z u)`,
+#'   with no coefficient estimated for it. The usual use is a Poisson rate
+#'   model with a known exposure, `offset = log(exposure)`. Evaluated in
+#'   `data`, so an expression works; `subset=` and `na.action` drop its
+#'   entries with the rows. Positioned after `na.action` as in [stats::glm].
+#'   The `offset()` **formula term** remains unsupported - the shared parser
+#'   has no such term.
 #' @param nAGQ adaptive Gauss-Hermite node count: an odd integer in
 #'   `1..=25` (`1` = Laplace, the default). More permissive than lme4 in range
 #'   but see the fallback note in Details.
@@ -102,12 +119,14 @@
 #'   search, so any non-`NULL` value is an error (the default cold start is
 #'   what runs).
 #' @param ... intercepted, never silently swallowed: known lme4 arguments
-#'   (`REML`, `control`, `verbose`, `contrasts`, `offset`) raise errors saying
-#'   why they cannot be honored; unknown names error as unused arguments.
+#'   (`REML`, `control`, `verbose`, `contrasts`) raise errors saying why they
+#'   cannot be honored; unknown names error as unused arguments.
 #'
 #' @return An object of class `"fastglmm"`: fixed effects ([fixef]), Wald
 #'   covariance (`vcov()`), variance components on the SD/correlation scale
-#'   ([VarCorr]), `converged` and `singular` flags ([isSingular]), plus
+#'   ([VarCorr]), `converged` and `singular` flags ([isSingular]), a
+#'   `diagnostics` list (the solver's own report: `boundary`, `pinned`,
+#'   `notes`, plus the three flags above), plus
 #'   `print()`, [summary()][summary.fastglmm], [confint()][confint.fastglmm]
 #'   (Wald), `nobs()`, [formula()][formula.fastglmm] (returns the formula
 #'   **string**), `family()`, and `model.frame()`. Engine-blocked accessors
@@ -130,6 +149,7 @@
 fastglmm <- function(formula, data, family = gaussian(),
                      weights = NULL, subset = NULL,
                      na.action = getOption("na.action"),
+                     offset = NULL,
                      nAGQ = 1L,
                      start = NULL,
                      wald.se = c("hessian", "rx"),
@@ -246,6 +266,20 @@ fastglmm <- function(formula, data, family = gaussian(),
     frame[["(weights)"]] <- as.double(w)
   }
 
+  # An offset is normally written as an expression over the data
+  # (offset = log(exposure)), so it is evaluated like weights= and parked in
+  # the frame: subset= and na.action must drop its entries in lockstep with
+  # the rows, and reading it off `data` after the filtering would misalign it
+  # against a subset fit with no error anywhere.
+  o <- eval(substitute(offset), data, parent.frame())
+  if (!is.null(o)) {
+    if (!is.numeric(o) || length(o) != nrow(data) || anyNA(o)) {
+      stop("offset must be a numeric vector with one entry per row of data",
+           call. = FALSE)
+    }
+    frame[["(offset)"]] <- as.double(o)
+  }
+
   s <- eval(substitute(subset), data, parent.frame())
   if (!is.null(s)) frame <- frame[s, , drop = FALSE]
 
@@ -263,6 +297,7 @@ fastglmm <- function(formula, data, family = gaussian(),
   }
   if (nrow(frame) == 0L) stop("no rows left to fit", call. = FALSE)
   w <- frame[["(weights)"]]
+  o <- frame[["(offset)"]]
 
   # --- marshalling: factors cross as (levels, 0-based codes) so the caller's
   # declared level order (the treatment base) survives into Rust's
@@ -290,6 +325,7 @@ fastglmm <- function(formula, data, family = gaussian(),
     fam$name, fam$link, wald.se, nAGQ,
     if (is.null(dispersion)) double() else as.double(dispersion),
     if (is.null(w)) double() else as.double(w),
+    if (is.null(o)) double() else as.double(o),
     as.double(start$beta %||% double()),
     as.double(start$theta %||% double())
   )
@@ -297,13 +333,14 @@ fastglmm <- function(formula, data, family = gaussian(),
   if (!is.null(r$agq_warning)) warning(r$agq_warning, call. = FALSE)
   if (r$singular) {
     # lme4's exact text (cross-port agreement, spec section 5), extended with
-    # the degenerate components. The Python port emits the same message
+    # the pinned components. The Python port emits the same message
     # (glmm/__init__.py) - change together.
     warning(paste(c("boundary (singular) fit: see help('isSingular')",
-                    .singular_detail(r$varcorr, r$re_group_names,
-                                     r$re_group_terms)),
+                    .pinned_detail(r$pinned, r$re_group_names,
+                                   r$re_group_terms)),
                   collapse = "; "), call. = FALSE)
   }
+  for (note in r$notes) .warn_note(note, r$names)
 
   p <- length(r$beta)
   beta <- stats::setNames(r$beta, r$names)
@@ -324,6 +361,39 @@ fastglmm <- function(formula, data, family = gaussian(),
     dispersion = r$dispersion,
     converged = r$converged,
     singular = r$singular,
+    # Everything the solver reports about the fit itself, mirroring the Rust
+    # `Diagnostics` (src/fit/mod.rs) and the Python port's `Fit$diagnostics` -
+    # change together. `converged`, `singular` and `aliased` stay at the top
+    # level as well; this element is additive.
+    #   boundary  "interior" / "at_boundary" / "no_optimum" / "unknown": where
+    #             the accepted theta sits. Only the dense LMM and dense GLMM
+    #             routes distinguish all three; elsewhere it is back-derived
+    #             from `singular`, so "no_optimum" is unreachable there and
+    #             "interior" means "not pinned", not "verified interior".
+    #   pinned    one logical vector per grouping, in varcorr order, one entry
+    #             per variance component: pinned[[g]][i] pairs with
+    #             .stddev_corr(varcorr[[g]])$stddev[i]. ON A CONVERGED FIT,
+    #             EMPTY MEANS NOTHING WAS PINNED - a model with no variance
+    #             components (OLS, GLM, fixed-effect-only negative binomial)
+    #             reports empty for the same reason: there was nothing to pin.
+    #             fastglmm() does not error on converged = FALSE; on that path
+    #             pinned is always the empty NaN-fill default regardless of
+    #             what the optimizer was doing when it gave up, so it carries
+    #             no information there.
+    #   notes     list of list(kind=, columns=, pivot=, evals=, final_eval=,
+    #             detail=); `columns` is
+    #             1-based into `names`. Each is raised as a classed warning by
+    #             the call above. An absent note means "not detected", never
+    #             "checked and clean": the dense GLMM route records no pivot
+    #             and the sparse route refuses rather than flagging.
+    diagnostics = list(
+      converged = r$converged,
+      singular = r$singular,
+      aliased = aliased,
+      boundary = r$boundary,
+      pinned = r$pinned,
+      notes = r$notes
+    ),
     n_eval = r$n_eval,
     deviance = r$deviance,
     # logLik()/AIC()/BIC() inputs. `reml` marks the LMM paths, whose `loglik`
@@ -333,6 +403,11 @@ fastglmm <- function(formula, data, family = gaussian(),
     reml = r$reml,
     re_group_names = r$re_group_names,
     re_group_terms = r$re_group_terms,
+    # Labelled conditional modes straight from the kernel - ranef() reshapes
+    # these into lme4's data.frame list. Nothing here slices the flat vector:
+    # only the kernel knows which RE block layout the data routed to.
+    ranef_blocks = r$ranef_blocks,
+    fitted = r$fitted,
     call = match.call(),
     formula = f_str,
     family = fam$object,
@@ -347,36 +422,109 @@ fastglmm <- function(formula, data, family = gaussian(),
   ), class = "fastglmm")
 }
 
-# Names of the exactly-degenerate RE components, for the singular warning:
-# "sd(term | group) = 0" per collapsed variance, "corr(a, b | group) = +/-1"
-# per degenerate correlation. Exact comparisons are safe because the kernel
-# pins boundary components to exact 0 / +/-1 (algorithms-lmm.md "Boundary
-# handling"); character(0) when only the relative-tolerance singular check
-# fired, which keeps the bare lme4 text.
-.singular_detail <- function(varcorr, group_names, group_terms) {
+# Names of the RE components the optimizer pinned at the boundary, for the
+# singular warning: "sd(term | group) pinned at the variance boundary" each.
+#
+# Read straight off the kernel's own record of what it pinned. Do NOT
+# reconstruct it from varcorr: on a grouping with q >= 2 the pin fixes the
+# DIAGONAL of the Cholesky factor while the reported stddev is
+# sqrt(lambda_offdiag^2 + lambda_diag^2), which lands at ~1e-9 rather than at 0,
+# so a scan for exactly-zero stddevs misses those pins entirely.
+#
+# That same fact is why the message says "pinned at the variance boundary" and
+# not "= 0", which is what it used to say. What is pinned is the Cholesky
+# diagonal; the stddev this fit reports for the component keeps whatever the
+# off-diagonal settled on, measured as high as 2.2e-3 against a 0.689 sibling on
+# a q >= 2 block - a number VarCorr() prints at default rounding. A warning must
+# not contradict a number the same fit prints.
+#
+# character(0) means nothing was pinned - including a model with no variance
+# components to pin. `singular` can still be TRUE with `pinned` empty (the
+# post-hoc negligible-stddev check is independent of the optimizer's own pin
+# decision), so the bare lme4 text stands regardless - empty `pinned` is never
+# evidence that the fit is not singular.
+# Mirrors python/glmm/__init__.py::_pinned_detail - change together.
+.pinned_detail <- function(pinned, group_names, group_terms) {
   parts <- character()
-  for (g in seq_along(varcorr)) {
-    sc <- .stddev_corr(varcorr[[g]])
+  for (g in seq_along(pinned)) {
     terms <- group_terms[[g]]
     grp <- group_names[[g]]
-    for (i in which(sc$stddev == 0)) {
-      parts <- c(parts, sprintf("sd(%s | %s) = 0", terms[[i]], grp))
-    }
-    q <- length(sc$stddev)
-    if (q > 1L) {
-      for (cc in 1:(q - 1L)) {
-        for (rr in (cc + 1L):q) {
-          if (sc$stddev[cc] > 0 && sc$stddev[rr] > 0 &&
-              abs(sc$correlation[rr, cc]) == 1) {
-            parts <- c(parts, sprintf("corr(%s, %s | %s) = %+d", terms[[cc]],
-                                      terms[[rr]], grp,
-                                      as.integer(sc$correlation[rr, cc])))
-          }
-        }
-      }
+    for (i in which(as.logical(pinned[[g]]))) {
+      term <- if (i <= length(terms)) terms[[i]] else sprintf("component %d", i)
+      parts <- c(parts, sprintf("sd(%s | %s) pinned at the variance boundary",
+                                term, grp))
     }
   }
   parts
+}
+
+# One kernel note as a classed R warning, so a caller can withCallingHandlers()
+# or suppress on the CLASS rather than matching message text. The `kind` string,
+# not the English text, is the stable identifier; an unrecognized kind comes
+# from a kernel newer than this wrapper (the Rust `Note` enum is
+# #[non_exhaustive]) and still warns, under the base class. The Python port maps
+# the same kinds to warning categories (glmm/__init__.py) - change together.
+#
+# Classes: "fastglmm_ill_conditioned", "fastglmm_pirls_exhausted",
+# "fastglmm_unused_grouping_levels", "fastglmm_unknown_note" - all inheriting
+# "fastglmm_diagnostic", so one handler catches the whole channel. Not every
+# note comes from the solver: "unused_grouping_levels" is raised by the formula
+# lowering, which is the only layer that sees both the declared levels and the
+# per-row codes.
+.warn_note <- function(note, coef_names) {
+  if (identical(note$kind, "ill_conditioned")) {
+    # `columns` arrives 1-based from the shim, so it indexes `coef_names`
+    # directly. Out of range falls back to the index rather than printing NA,
+    # mirroring the Python port's guard.
+    named <- paste(
+      vapply(note$columns, function(i) {
+        if (i >= 1L && i <= length(coef_names)) {
+          coef_names[[i]]
+        } else {
+          sprintf("column %d", i)
+        }
+      }, character(1)),
+      collapse = ", "
+    )
+    # "entangled with" rather than "the design does not identify <name>":
+    # entanglement is symmetric, and the kernel names the column attaining the
+    # SMALLEST scaled pivot, which is one member of the group and not a
+    # statement about the others. Wording it as a fact about that one column
+    # reads as if its partners were exonerated.
+    msg <- sprintf(paste0(
+      "%s is entangled with one or more other columns (scaled pivot %.3g): the ",
+      "fit is real and the estimates are honest, but the standard errors are ",
+      "large. Only the column the pivot search reached is named; its partners ",
+      "are equally implicated and are not identified here."), named, note$pivot)
+    cls <- c("fastglmm_ill_conditioned", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "unused_grouping_levels")) {
+    msg <- sprintf(paste0(
+      "grouping levels with no rows occupy random-effect columns (%s); their ",
+      "conditional modes are reported as exactly zero. Use droplevels() to ",
+      "remove both the rows and the wasted model width."), note$detail)
+    cls <- c("fastglmm_unused_grouping_levels", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "pirls_exhausted")) {
+    # `final_eval` is the case split: a rejected trial point is benign, the
+    # final re-evaluation at the converged fit feeds the reported estimates.
+    if (isTRUE(note$final_eval)) {
+      msg <- paste(
+        "the final PIRLS re-evaluation at the converged fit ran its full",
+        "iteration cap without converging: the reported estimates rest on",
+        "that truncated solve."
+      )
+    } else {
+      msg <- paste(
+        "a GLMM inner PIRLS solve ran its full iteration cap without converging.",
+        "This is observation-only and no fitted number is affected."
+      )
+    }
+    cls <- c("fastglmm_pirls_exhausted", "fastglmm_diagnostic")
+  } else {
+    msg <- sprintf(paste0("the kernel reported a solver note this version of ",
+                          "fastglmm does not recognize ('%s')"), note$kind)
+    cls <- c("fastglmm_unknown_note", "fastglmm_diagnostic")
+  }
+  warning(warningCondition(msg, class = cls, call = NULL))
 }
 
 # `...` exists only to intercept known lme4 arguments with designed errors
@@ -406,10 +554,6 @@ fastglmm <- function(formula, data, family = gaussian(),
                        "parser is treatment-coded with base = first level ",
                        "and offers no hook; relevel() the factor to change ",
                        "the base level", call. = FALSE),
-      offset = stop("offset= is not supported: the kernel has no offset ",
-                    "field and the formula parser no offset() term ",
-                    "(engine spec 2026-07-15-engine-loglik-diagnostics)",
-                    call. = FALSE),
       stop("unused argument", if (nzchar(nm)) paste0(" '", nm, "'") else "",
            " - fastglmm() intercepts rather than swallows unknown arguments",
            call. = FALSE)
@@ -435,8 +579,9 @@ fastglmm <- function(formula, data, family = gaussian(),
          "lme4's cbind() objective", call. = FALSE)
   }
   if (grepl("\\boffset\\s*\\(", f_str)) {
-    stop("offset() is not supported: the kernel has no offset field and the ",
-         "formula parser no offset() term", call. = FALSE)
+    stop("the offset() formula term is not supported: the shared parser has ",
+         "no such term - pass the vector as the offset= argument instead",
+         call. = FALSE)
   }
   if ("." %in% all.vars(formula)) {
     stop("'.' is not supported by the shared formula parser; ",

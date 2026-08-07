@@ -8,7 +8,18 @@ DATA = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
 
 
 def test_module_surface():
-    assert glmm.__all__ == ["Fit", "fit"]
+    # `fit`, `Fit`, and the four warning categories the diagnostics channel
+    # raises — a user has to be able to name them to filter on them.
+    assert glmm.__all__ == [
+        "DiagnosticWarning",
+        "Fit",
+        "IllConditionedWarning",
+        "PirlsExhaustedWarning",
+        "UnusedGroupingLevelsWarning",
+        "fit",
+    ]
+    assert issubclass(glmm.IllConditionedWarning, glmm.DiagnosticWarning)
+    assert issubclass(glmm.DiagnosticWarning, UserWarning)
 
 
 def test_fit_signature_matches_spec():
@@ -65,10 +76,10 @@ def test_fit_fields():
         "tau2",
         "varcorr",
         "stddev_se",
-        "aliased",
+        # converged / singular / aliased live in here and are re-exposed as
+        # properties, so they are deliberately absent from the field list.
+        "diagnostics",
         "dispersion",
-        "converged",
-        "singular",
         "names",
         "re_groups",
         "n_eval",
@@ -79,4 +90,5 @@ def test_fit_fields():
         "fitted",
         "ranef",
         "ranef_levels",
+        "ranef_blocks",
     ]

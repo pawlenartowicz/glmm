@@ -3,7 +3,7 @@ name = "validation"
 # Lockstep with the crate: must equal GLMM/Cargo.toml [package] version.
 # glmm.rs stamps CARGO_PKG_VERSION into each result JSON's engine_version, and
 # after the move that macro reads THIS manifest, not glmm's.
-version = "0.1.3"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -21,6 +21,13 @@ publish = false
 # workspace clippy deny gate) in `cargo clippy --workspace --all-targets`.
 [dependencies]
 glmm = { path = "..", features = ["formula", "loop_advanced"] }
+
+# Opt-in only, so the oracle/campaign examples keep building serial by default —
+# a normal `run.sh` pass must stay single-threaded. Required by the VALIDATION_AGQ
+# timing pass (engines/glmm.rs), which fits with `parallel_inner` on; without this
+# feature that flag is inert and the pass would quietly measure the serial kernel.
+[features]
+parallel = ["glmm/parallel"]
 
 [dev-dependencies]
 serde      = { version = "1", features = ["derive"] }
@@ -57,3 +64,9 @@ path = "campaigns/speed-grid/theta_eval.rs"
 [[example]]
 name = "memory_fit"
 path = "memory/memory_fit.rs"
+
+# Scratch AGQ parallel_inner probe (see its header). Temporary — delete this
+# entry and the file once the parallel-default question is answered.
+[[example]]
+name = "agq_par_probe"
+path = "campaigns/speed-grid/agq_par_probe.rs"

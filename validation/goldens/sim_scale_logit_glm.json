@@ -1,0 +1,20 @@
+{
+  "name": "sim_scale_logit_glm",
+  "engine": "stats::glm",
+  "engine_version": "R-4.5.3",
+  "kind": "glm",
+  "data": "sim_scale_logit",
+  "family": "binomial",
+  "link": "logit",
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "y ~ 1 + x",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [-0.311403810670574, 2.0819815005051],
+    "se": [0.209439712908431, 0.268038942174326],
+    "loglik": -74.4854926649013
+  }
+}

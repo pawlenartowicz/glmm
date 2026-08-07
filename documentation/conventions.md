@@ -29,6 +29,17 @@ marginal log-likelihood over `ln θ` by golden-section search around a full
 inner GLMM fit at each candidate. Either way, θ̂ is reported as the fit's
 `dispersion`.
 
+## Offset
+
+Every family and every solver path accepts a per-row known additive term on
+the linear-predictor scale — R's `offset=`: `η = offset + Xβ (+ Zb)`, with no
+coefficient estimated for it and no column added to the design. The
+canonical use is a rate model against a known exposure, `offset =
+log(exposure)`. `None`/`NULL` (the default) means no offset — byte-identical
+to the pre-offset fit paths. The formula syntax `offset()` is not accepted;
+pass the vector as the `offset=`/`offset` argument instead (see
+[`formula.md#not-accepted-and-the-workaround`](formula.md#not-accepted-and-the-workaround)).
+
 ## Standard errors
 
 All reported standard errors are **Wald** — the square root of a diagonal of
@@ -52,7 +63,7 @@ For GLMM, two genuinely different Wald covariances are offered, selected by
   anticonservative for a GLMM, where the IRLS weights couple β and θ.
 
 Coefficient tables report a Wald z-statistic and a two-sided `Pr(>|z|)`
-p-value (the R and Python ports; see `TUTORIAL-R.md` §3).
+p-value (the R and Python ports; see `tutorial-r.md` §3).
 
 SEs are computed only for the columns the caller asks for: in Rust,
 `FitOptions::target_indices` selects which predictor columns get an SE (every
@@ -77,7 +88,7 @@ between dimensions within the same grouping — not as raw variances. In R this
 is what `VarCorr(fit)` prints, one block per grouping factor, with a
 `Residual` row (`sigma()`) for a Gaussian mixed fit; the underlying attributes
 (`attr(vc$group, "stddev")`, `attr(vc$group, "correlation")`) are available to
-pull the numbers back out (see `TUTORIAL-R.md` §3).
+pull the numbers back out (see `tutorial-r.md` §3).
 
 ## Factor coding
 
@@ -100,6 +111,34 @@ condition lme4 flags: at least one diagonal random-effect variance component
 collapsed to (or landed negligibly close to) zero. It is computed by the
 kernel, not left to the caller to infer from the variance components
 themselves.
+
+**`diagnostics` is the channel these live on.** `converged`, `singular`
+and `aliased` are the three most-read fields and stay at the top level of the
+result (properties over `diagnostics` in Python; unchanged top-level fields in
+R), but they are three of six: the full report is `diagnostics.converged`,
+`.singular`, `.aliased`, `.boundary`, `.pinned`, `.notes`.
+
+- `boundary` says where the accepted θ sits — `Interior`, `AtBoundary` (≥ 1
+  variance component pinned at 0), or `NoOptimum` (the optimizer capped out at
+  a finite endpoint, reported as a point rather than accepted onto the
+  boundary). Only the dense LMM and dense GLMM routes distinguish all three;
+  elsewhere it is back-derived from `singular`.
+- `pinned` names which variance components were pinned, aligned with the
+  `varcorr` block layout so `pinned[g][i]` pairs with `stddev_corr(g)`'s `i`-th
+  stddev. Empty means "nothing to report" (no components at all, or none
+  pinned), not "checked and none pinned."
+- `notes` carries solver observations that have no dedicated flag. Today the
+  one kind is `IllConditioned`: two or more fixed-effect columns are entangled
+  — near-collinear but not exactly redundant. That design is now **fitted, not
+  refused**: the coefficients are real and the standard errors are honest
+  (large, because the data genuinely cannot separate the columns), where an
+  older version of this kernel returned `NaN` for the whole fit. Contrast
+  `aliased`, which is the genuinely-redundant case — an exactly aliased column
+  is still dropped and reported as `NaN`, matching R. `notes` is empty on a
+  clean fit, and an absent note means "not detected," never "checked and
+  clean": dense GLMM records no pivot at all, and the sparse LMM route refuses
+  an ill-conditioned design outright (`converged: false`) instead of fitting
+  and flagging it — the dense and sparse LMM routes disagree on this point.
 
 If a fit comes back with `converged == false` or `singular == true`, see
 [`troubleshooting.md`](troubleshooting.md) for what each flag implies and what

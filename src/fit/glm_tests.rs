@@ -52,7 +52,7 @@ fn fit_glm_prebuilt_view_maps_to_same_fit() {
         );
         glm_view_to_fit(&v, &y, family, f64::NAN, n, p, &opts)
     };
-    assert!(direct.converged && via_view.converged);
+    assert!(direct.converged() && via_view.converged());
     assert_near(&direct.beta, &via_view.beta, "beta");
     assert_near(&direct.se, &via_view.se, "se");
     assert_near(&[direct.loglik], &[via_view.loglik], "loglik");
@@ -107,7 +107,7 @@ fn fit_glm_gamma_weighted_matches_r() {
         ..FitOptions::default()
     };
     let f = fit_cold(&x, &yg, n, 2, &model, &GroupIds::default(), &opts);
-    assert!(f.converged);
+    assert!(f.converged());
     for j in 0..2 {
         assert!((f.beta[j] - REF_BETA[j]).abs() < 1e-6, "beta[{j}]");
         assert!((f.se[j] - REF_SE[j]).abs() < 1e-6, "se[{j}]");
@@ -208,7 +208,7 @@ fn fit_glm_binomial_weighted_aggregated_matches_r() {
         ..FitOptions::default()
     };
     let f = fit_cold(&x, &yp, n, 2, &model, &GroupIds::default(), &opts);
-    assert!(f.converged);
+    assert!(f.converged());
     for j in 0..2 {
         assert!((f.beta[j] - REF_BETA[j]).abs() < 1e-6, "beta[{j}]");
         assert!((f.se[j] - REF_SE[j]).abs() < 1e-6, "se[{j}]");
@@ -260,7 +260,7 @@ fn fit_glm_smoke() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "GLM should converge on clean logistic data");
+    assert!(f.converged(), "GLM should converge on clean logistic data");
     assert!(
         f.beta.iter().all(|b| b.is_finite()),
         "β̂ must be finite, got {:?}",
@@ -335,7 +335,7 @@ fn fit_glm_poisson_matches_r() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "poisson GLM must converge");
+    assert!(f.converged(), "poisson GLM must converge");
     assert!((f.dispersion - 1.0).abs() < 1e-12, "poisson φ≡1");
     assert!(f.tau2.is_empty(), "GLM has no variance components");
     for j in 0..p {
@@ -416,7 +416,7 @@ fn fit_glm_poisson_offset_matches_r() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "poisson GLM with offset must converge");
+    assert!(f.converged(), "poisson GLM with offset must converge");
     for (j, (&b, &r)) in f.beta.iter().zip(&REF_BETA).enumerate() {
         let b_rel = (b - r).abs() / r.abs();
         assert!(b_rel < 1e-3, "β[{j}] = {b} vs R {r} (rel {b_rel})");
@@ -480,7 +480,7 @@ fn fit_glm_poisson_highmean_matches_r() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "high-mean poisson GLM must converge");
+    assert!(f.converged(), "high-mean poisson GLM must converge");
     assert!((f.dispersion - 1.0).abs() < 1e-12, "poisson φ≡1");
     for j in 0..p {
         let b_rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
@@ -558,7 +558,7 @@ fn fit_glm_probit_matches_r() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "probit GLM must converge");
+    assert!(f.converged(), "probit GLM must converge");
     assert!((f.dispersion - 1.0).abs() < 1e-12, "probit φ≡1");
     for j in 0..p {
         let b_rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
@@ -626,7 +626,7 @@ fn fit_glm_gamma_log_matches_r() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "gamma-log GLM must converge");
+    assert!(f.converged(), "gamma-log GLM must converge");
     let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
     assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
     for j in 0..p {
@@ -669,7 +669,7 @@ fn fit_glm_gamma_inverse_matches_r() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "gamma-inverse GLM must converge");
+    assert!(f.converged(), "gamma-inverse GLM must converge");
     let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
     assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
     for j in 0..p {
@@ -706,7 +706,7 @@ fn fit_glm_gamma_fixed_dispersion_scales_se() {
     };
     let f1 = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts(1.0));
     let f2 = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts(2.0));
-    assert!(f1.converged && f2.converged);
+    assert!(f1.converged() && f2.converged());
     assert!((f2.dispersion - 2.0).abs() < 1e-12, "held φ must be 2.0");
     assert!((f1.dispersion - 1.0).abs() < 1e-12);
     for j in 0..p {
@@ -762,7 +762,7 @@ fn fit_glm_nb_matches_mass() {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "NB GLM must converge");
+    assert!(f.converged(), "NB GLM must converge");
     let th_rel = (f.dispersion - REF_THETA).abs() / REF_THETA;
     assert!(
         th_rel < 2e-2,
@@ -838,7 +838,7 @@ fn fit_glm_nb_weighted_matches_mass() {
         ..FitOptions::default()
     };
     let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
-    assert!(f.converged, "weighted NB GLM must converge");
+    assert!(f.converged(), "weighted NB GLM must converge");
     for j in 0..p {
         assert!(
             (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
@@ -919,7 +919,10 @@ fn fit_glm_nb_constant_offset_shifts_intercept() {
             ..FitOptions::default()
         },
     );
-    assert!(base.converged && shifted.converged, "NB fits must converge");
+    assert!(
+        base.converged() && shifted.converged(),
+        "NB fits must converge"
+    );
     assert!(
         (shifted.beta[0] - (base.beta[0] - c)).abs() < 2e-3,
         "intercept {} vs base {} − {c}",
@@ -984,7 +987,7 @@ fn nb_edge_fit(csv: &str, ref_beta: &[f64; 3], ref_se: &[f64; 3]) -> Fit {
             ..FitOptions::default()
         },
     );
-    assert!(f.converged, "NB edge GLM must converge");
+    assert!(f.converged(), "NB edge GLM must converge");
     for j in 0..3 {
         assert!(
             (f.beta[j] - ref_beta[j]).abs() / ref_beta[j].abs() < 1e-3,
@@ -1088,7 +1091,7 @@ fn fit_glm_nb_outer_cap_semantics() {
 
     let f0 = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, 0);
     assert!(
-        !f0.converged,
+        !f0.converged(),
         "cap 0: never-ran placeholder is converged=false"
     );
     assert!(f0.beta.iter().all(|b| b.is_nan()), "cap 0: β all NaN");
@@ -1098,10 +1101,10 @@ fn fit_glm_nb_outer_cap_semantics() {
     // Cap exhaustion is silent: the inner IRLS converged, so the flag is true
     // even though the θ alternation was cut off mid-flight.
     assert!(
-        f1.converged,
+        f1.converged(),
         "capped fit reports the INNER convergence flag"
     );
-    assert!(full.converged);
+    assert!(full.converged());
     // The single alternation moved θ off the seed (the profile step ran) …
     assert!(
         (f1.dispersion - super::glm::NB_THETA_LO).abs() / super::glm::NB_THETA_LO > 1.0,
@@ -1124,4 +1127,178 @@ fn fit_glm_nb_outer_cap_semantics() {
         "full θ̂ = {} vs MASS 1.0105",
         full.dispersion
     );
+}
+
+/// The same logistic model in three unit systems, gated against frozen R
+/// `glm(family=binomial)` (`validation/goldens/sim_scale_logit_glm.json`,
+/// `..._small_glm.json`, `..._big_glm.json`): `y ~ x`, `y ~ x/1000`,
+/// `y ~ x*1000` on sim_scale_logit. R fits all three identically — same
+/// deviance to 10 digits, same iteration count, coefficients and standard errors
+/// scaling exactly — because `glm.fit` has no coefficient cap. glmm used to
+/// reject the middle one: its divergence guard bounded |β|, so the accept/reject
+/// decision moved with the caller's choice of units. The guard bounds |η| now,
+/// which is invariant. The oracle is sacred (RULE 0).
+#[test]
+fn fit_glm_scale_variation_matches_r() {
+    // From validation/goldens/sim_scale_logit_glm.json (estimates.beta / .se).
+    const REF_BETA: [f64; 2] = [-0.311403810670574, 2.0819815005051];
+    const REF_SE: [f64; 2] = [0.209439712908431, 0.268038942174326];
+
+    // sim_scale_logit.csv cols: y,x,x_small,x_big
+    let csv = include_str!("../../validation/data/simulated/sim_scale_logit.csv");
+    let mut cols: [Vec<f64>; 4] = Default::default();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        for (k, f) in line.split(',').enumerate() {
+            cols[k].push(f.trim_matches('"').parse().unwrap());
+        }
+    }
+    let y = cols[0].clone();
+    let n = y.len();
+    let p = 2;
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: crate::BinomialLink::Logit,
+        },
+        re: None,
+    };
+
+    // col 1 = x (scale 1), col 2 = x/1000, col 3 = x*1000. The frozen reference
+    // for each is the same fit; only the slope's units differ.
+    for (col, scale) in [(1usize, 1.0f64), (2, 1e-3), (3, 1e3)] {
+        let mut x = Vec::<f64>::with_capacity(n * p);
+        for &xi in &cols[col] {
+            x.extend_from_slice(&[1.0, xi]);
+        }
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds::default(),
+            &FitOptions {
+                target_indices: vec![0, 1],
+                ..FitOptions::default()
+            },
+        );
+        assert!(
+            f.converged(),
+            "scale {scale}: must converge — R converges on all three"
+        );
+        let expect = [REF_BETA[0], REF_BETA[1] / scale];
+        let expect_se = [REF_SE[0], REF_SE[1] / scale];
+        for j in 0..p {
+            let b_rel = (f.beta[j] - expect[j]).abs() / expect[j].abs();
+            assert!(
+                b_rel < 1e-3,
+                "scale {scale} β[{j}] = {} vs R {} (rel {b_rel})",
+                f.beta[j],
+                expect[j]
+            );
+            let se_rel = (f.se[j] - expect_se[j]).abs() / expect_se[j];
+            assert!(
+                se_rel < 1e-3,
+                "scale {scale} se[{j}] = {} vs R {} (rel {se_rel})",
+                f.se[j],
+                expect_se[j]
+            );
+        }
+    }
+}
+
+/// Complete separation, gated against frozen R
+/// (`validation/goldens/sim_scale_sep_glm.json`): `y = 1[x > 0]`, where R
+/// reports `converged: FALSE` after exhausting `maxit`. glmm must also refuse.
+/// Only the FLAG is compared, not the coefficients: both engines stop at an
+/// arbitrary point on a path to infinity, and R's own stopping point depends on
+/// its iteration budget (25) which differs from glmm's (50). The oracle is
+/// sacred (RULE 0).
+#[test]
+fn fit_glm_separated_rejected_like_r() {
+    let csv = include_str!("../../validation/data/simulated/sim_scale_sep.csv");
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        x.extend_from_slice(&[1.0, f[1].parse().unwrap()]);
+    }
+    let n = y.len();
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        2,
+        &ModelSpec {
+            family: Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(
+        !f.converged(),
+        "completely separated data must be refused, as R's glm.fit refuses it"
+    );
+}
+
+/// Gamma inverse link with a small mean, gated against frozen R
+/// `glm(Gamma(link="inverse"))` (`validation/goldens/sim_scale_gamma_inv_glm.json`):
+/// `y ~ x` on sim_scale_gamma_inv, where μ ≈ 0.01 so η = 1/μ ≈ 100. A flat
+/// divergence cap of 30 on |η| would refuse this honest fit, which is why the
+/// GLM guard skips this family/link pair. The oracle is sacred (RULE 0).
+#[test]
+fn fit_glm_gamma_inverse_small_mean_matches_r() {
+    // From validation/goldens/sim_scale_gamma_inv_glm.json.
+    const REF_BETA: [f64; 2] = [99.8813244077148, -19.7574641575102];
+    const REF_SE: [f64; 2] = [0.204076575867777, 0.711212166103063];
+
+    let csv = include_str!("../../validation/data/simulated/sim_scale_gamma_inv.csv");
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        x.extend_from_slice(&[1.0, f[1].parse().unwrap()]);
+    }
+    let n = y.len();
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        2,
+        &ModelSpec {
+            family: Family::Gamma {
+                link: crate::GammaLink::Inverse,
+            },
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "small-mean Gamma inverse fit must converge");
+    for j in 0..2 {
+        let b_rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
+        assert!(
+            b_rel < 1e-3,
+            "β[{j}] = {} vs R {} (rel {b_rel})",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        assert!(
+            se_rel < 1e-3,
+            "se[{j}] = {} vs R {} (rel {se_rel})",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
 }

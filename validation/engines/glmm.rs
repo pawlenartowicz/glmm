@@ -55,12 +55,74 @@ fn suite_dir() -> String {
 // construction-inclusive span lme4 / MixedModels / the Python port all measure, so
 // the cross-engine speedups and the port's `py_gap` compare same-to-same
 // (summarize_timing.R reads the `_full` fields for glmm).
-const N_RUNS: usize = 10;
+// Timing is OPT-IN, and its sample count lives in run.sh rather than here, so the
+// five engines no longer carry mirrored N_RUNS constants to keep in step. compare.R
+// reads no timing field at all, so the default gate pays only the one fit per SE
+// method it already needed for the estimates, instead of N x (Rx, Hessian, and both
+// `_full` variants) — ~35 seconds over the corpus rather than ~10 minutes.
+
+/// Sample count for this run, or `None` when timing is off. Read once per dataset,
+/// never per loop.
+///
+/// THE contract, mirrored in lme4.R / mixedmodels.jl / glmm_python.py / glmm_r.R
+/// `timing_runs` — five languages that cannot share code, so change together:
+/// VALIDATION_TIMINGS unset / "" / "0" means do not time; otherwise it IS the sample
+/// count, an integer >= 2, first sample discarded, median of the rest. run.sh
+/// validates it, and this panics rather than silently not timing when the engine is
+/// run by hand with a malformed value.
+fn timing_runs() -> Option<usize> {
+    let raw = match std::env::var("VALIDATION_TIMINGS") {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let v = raw.trim();
+    if v.is_empty() || v == "0" {
+        return None;
+    }
+    match v.parse::<usize>() {
+        Ok(n) if n >= 2 => Some(n),
+        _ => panic!(
+            "VALIDATION_TIMINGS must be 0 or an integer >= 2 (got {v:?}); \
+             N=2 keeps 1 sample after the warm-up discard"
+        ),
+    }
+}
+
+/// AGQ timing pass, opt-in and orthogonal to `timing_runs`. `VALIDATION_AGQ=<k>`
+/// refits the manifest's `agq`-marked datasets at `nagq = k` with `parallel_inner`
+/// on — the shipped-config arm — into `results/glmm_agq_*`. The separate tree is
+/// load-bearing: compare.R globs `results/lme4_{empirical,simulated}/*.json` to
+/// discover references, and the curated 6-rung oracle is not expanded (design 6).
+/// Mirrors lme4.R's `agq_k` — change together.
+fn agq_nagq() -> Option<u8> {
+    let raw = std::env::var("VALIDATION_AGQ").ok()?;
+    let v = raw.trim();
+    if v.is_empty() || v == "0" {
+        return None;
+    }
+    match v.parse::<u8>() {
+        Ok(n) if n >= 1 && n % 2 == 1 => Some(n),
+        _ => panic!(
+            "VALIDATION_AGQ must be an ODD integer >= 1 (got {v:?}); \
+             the Gauss-Hermite table is built for orders 1, 3, 5, ..."
+        ),
+    }
+}
+
+/// `glmm_agq` on an AGQ pass, `glmm` otherwise — the results subdirectory stem.
+fn out_stem() -> &'static str {
+    if agq_nagq().is_some() {
+        "glmm_agq"
+    } else {
+        "glmm"
+    }
+}
 
 fn main() {
     let suite = suite_dir();
-    std::fs::create_dir_all(format!("{suite}/results/glmm_empirical")).expect("mk glmm_empirical");
-    std::fs::create_dir_all(format!("{suite}/results/glmm_simulated")).expect("mk glmm_simulated");
+    let stem = out_stem();
+    std::fs::create_dir_all(format!("{suite}/results/{stem}_empirical")).expect("mk empirical");
+    std::fs::create_dir_all(format!("{suite}/results/{stem}_simulated")).expect("mk simulated");
     let manifest: Value = serde_json::from_str(
         &std::fs::read_to_string(format!("{suite}/manifest.json")).expect("read manifest"),
     )
@@ -70,9 +132,12 @@ fn main() {
     // timing cost (grouseticks alone is ~200 multi-second fits).
     let only = std::env::var("VALIDATION_ONLY").unwrap_or_default();
     let want = |ds: &str| only.is_empty() || only.split(',').any(|s| s == ds);
+    // An AGQ pass covers only the `agq`-marked datasets — the shapes glmm's AGQ
+    // gate accepts (binomial/Poisson, one grouping factor, q <= 3).
+    let agq = agq_nagq().is_some();
     for spec in manifest["datasets"].as_array().expect("manifest.datasets") {
         let ds = spec["name"].as_str().expect("dataset entry missing name");
-        if want(ds) {
+        if want(ds) && (!agq || spec["agq"].is_number()) {
             fit_one(spec);
         }
     }
@@ -200,7 +265,18 @@ fn fit_one(spec: &Value) {
             .unwrap_or_else(|| panic!("{ds}: offset {oc:?} not in CSV header"));
         lo.opts.offset = Some(rows.iter().map(|r| r[o_idx].parse().unwrap()).collect());
     }
+    // AGQ pass: quadrature order from the env, and `parallel_inner` ON — the point
+    // of this pass is to time the configuration a user would actually get, and AGQ
+    // is where inner parallelism has something to chew on (k^q per-cluster sweeps).
+    // Note this makes the pass's times NOT a controlled serial-vs-parallel
+    // comparison against lme4's single-threaded fit. Mirrored into `o_r` below,
+    // which builds from FitOptions::default() — change together.
+    if let Some(k) = agq_nagq() {
+        lo.opts.nagq = k;
+        lo.opts.parallel_inner = true;
+    }
     let timing_batch = spec["timing_batch"].as_u64().unwrap_or(1) as usize;
+    let timings = timing_runs();
 
     // Reference grouping order (compare.R aligns varcomp positionally, not by
     // name) — read off the already-frozen lme4 result rather than re-deriving
@@ -264,8 +340,8 @@ fn fit_one(spec: &Value) {
     // reference engines' pre-typed `df`. `opts` is captured, not re-derived from
     // the fresh lowering: target_indices are column positions the identical table
     // reproduces, and weights are per-row — both stay valid across re-lowers.
-    let time_full = |opts: &FitOptions| -> f64 {
-        median_secs(timing_batch, || {
+    let time_full = |n_runs: usize, opts: &FitOptions| -> f64 {
+        median_secs(n_runs, timing_batch, || {
             let l = lower(&formula_str, &table, family)
                 .unwrap_or_else(|e| panic!("re-lower {ds}: {e}"));
             let _ = fit_cold(&l.x, &l.y, l.n, l.p, &l.model, &l.ids, opts);
@@ -275,13 +351,17 @@ fn fit_one(spec: &Value) {
     let fixed_only = lo.re_groups.is_empty();
     let (converged, singular, estimates, timing, n_eval, deviance) = if gaussian {
         let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-        let t = json!({
-            "fit_seconds_median": median_secs(timing_batch, || {
-                let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-            }),
-            "fit_seconds_median_full": time_full(&lo.opts),
-            "n_runs": N_RUNS, "warmup_discarded": 1, "fits_per_sample": timing_batch,
-        });
+        let t = if let Some(n_runs) = timings {
+            json!({
+                "fit_seconds_median": median_secs(n_runs, timing_batch, || {
+                    let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+                }),
+                "fit_seconds_median_full": time_full(n_runs, &lo.opts),
+                "n_runs": n_runs, "warmup_discarded": 1, "fits_per_sample": timing_batch,
+            })
+        } else {
+            Value::Null
+        };
         let est = json!({
             "beta": nums(&f.beta),
             "se": nums(&f.se),
@@ -289,19 +369,23 @@ fn fit_one(spec: &Value) {
             "df": f.df,
             "varcomp": varcomp(&f, &lo.re_groups, &ref_order, false),
         });
-        (f.converged, f.singular, est, t, f.n_eval, f.deviance)
+        (f.converged(), f.singular(), est, t, f.n_eval, f.deviance)
     } else if fixed_only {
         // Fixed-only GLM (weights suite): no θ, so the Rx-vs-Hessian method
         // split is moot — one fit, one SE, emitted as `se_rx` to line up with
         // the single SE lme4.R's `glm`/`glm.nb` writes for these rungs.
         let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-        let t = json!({
-            "fit_seconds_median": median_secs(timing_batch, || {
-                let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-            }),
-            "fit_seconds_median_full": time_full(&lo.opts),
-            "n_runs": N_RUNS, "warmup_discarded": 1, "fits_per_sample": timing_batch,
-        });
+        let t = if let Some(n_runs) = timings {
+            json!({
+                "fit_seconds_median": median_secs(n_runs, timing_batch, || {
+                    let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+                }),
+                "fit_seconds_median_full": time_full(n_runs, &lo.opts),
+                "n_runs": n_runs, "warmup_discarded": 1, "fits_per_sample": timing_batch,
+            })
+        } else {
+            Value::Null
+        };
         let est = json!({
             "beta": nums(&f.beta),
             "se_rx": nums(&f.se),
@@ -309,7 +393,7 @@ fn fit_one(spec: &Value) {
             "df": f.df,
             "varcomp": varcomp(&f, &lo.re_groups, &ref_order, false),
         });
-        (f.converged, f.singular, est, t, f.n_eval, f.deviance)
+        (f.converged(), f.singular(), est, t, f.n_eval, f.deviance)
     } else {
         // GLMM SE has two genuinely different variants (Laplace) — emit both so
         // compare.R checks like to like: se_hessian (keeps θ–β coupling, glmm
@@ -319,23 +403,32 @@ fn fit_one(spec: &Value) {
             wald_se: WaldSe::Rx,
             weights: lo.opts.weights.clone(),
             offset: lo.opts.offset.clone(),
+            // Carried over from `lo.opts`, NOT defaulted: both are 1/false on a
+            // normal run, but on an AGQ pass a defaulted `o_r` would silently time
+            // the Rx arm at Laplace while the Hessian arm ran quadrature.
+            nagq: lo.opts.nagq,
+            parallel_inner: lo.opts.parallel_inner,
             ..FitOptions::default()
         };
         let fh = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
         let fr = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &o_r);
         // Split timing by SE method — the FD-Hessian is the main time consumer,
         // Rx is one closed-form Schur solve. Same PIRLS fit underlies both.
-        let t = json!({
-            "fit_seconds_median_rx": median_secs(timing_batch, || {
-                let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &o_r);
-            }),
-            "fit_seconds_median_hessian": median_secs(timing_batch, || {
-                let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-            }),
-            "fit_seconds_median_rx_full": time_full(&o_r),
-            "fit_seconds_median_hessian_full": time_full(&lo.opts),
-            "n_runs": N_RUNS, "warmup_discarded": 1, "fits_per_sample": timing_batch,
-        });
+        let t = if let Some(n_runs) = timings {
+            json!({
+                "fit_seconds_median_rx": median_secs(n_runs, timing_batch, || {
+                    let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &o_r);
+                }),
+                "fit_seconds_median_hessian": median_secs(n_runs, timing_batch, || {
+                    let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+                }),
+                "fit_seconds_median_rx_full": time_full(n_runs, &o_r),
+                "fit_seconds_median_hessian_full": time_full(n_runs, &lo.opts),
+                "n_runs": n_runs, "warmup_discarded": 1, "fits_per_sample": timing_batch,
+            })
+        } else {
+            Value::Null
+        };
         let est = json!({
             "beta": nums(&fh.beta),
             "se_hessian": nums(&fh.se),
@@ -346,11 +439,11 @@ fn fit_one(spec: &Value) {
             "varcomp": varcomp(&fh, &lo.re_groups, &ref_order, true),
         });
         (
-            fh.converged && fr.converged,
+            fh.converged() && fr.converged(),
             // singular from the Hessian fit (fh) — same PIRLS fit as fr, so the
             // boundary decision is identical; fh is the one whose θ block the
             // estimates come from.
-            fh.singular,
+            fh.singular(),
             est,
             t,
             fh.n_eval + fr.n_eval,
@@ -438,14 +531,16 @@ fn group_names_match(a: &str, b: &str) -> bool {
 // read_csv_path/unquote/build_table/num/nums/lower_dataset_generic
 // live in common.rs (shared with grid_fit.rs) — change together.
 
-/// Median seconds over N_RUNS samples, warm-up (first) discarded. Each sample times
+/// Median seconds over `n_runs` samples, warm-up (first) discarded. `n_runs` comes
+/// from `timing_runs()`, i.e. from run.sh's `--timings[=N]`; callers must already
+/// have guarded on it, nothing here checks. Each sample times
 /// `batch` fits so sub-resolution fits stay above the timer floor (mirrors the manifest
 /// `timing_batch` the R/Julia oracles read) — the returned median is for `batch` fits;
 /// divide by `batch` for the per-fit estimate. GLMM rungs call this once per SE method
 /// (Rx vs Hessian) because the FD-Hessian is the dominant cost.
-fn median_secs(batch: usize, mut f: impl FnMut()) -> f64 {
-    let mut t = Vec::with_capacity(N_RUNS);
-    for _ in 0..N_RUNS {
+fn median_secs(n_runs: usize, batch: usize, mut f: impl FnMut()) -> f64 {
+    let mut t = Vec::with_capacity(n_runs);
+    for _ in 0..n_runs {
         let t0 = Instant::now();
         for _ in 0..batch {
             f();
@@ -466,7 +561,7 @@ fn median(xs: &[f64]) -> f64 {
 }
 
 fn write_result(ds: &str, source: &str, res: Value) {
-    let out = format!("{}/results/glmm_{source}/{ds}.json", suite_dir());
+    let out = format!("{}/results/{}_{source}/{ds}.json", suite_dir(), out_stem());
     std::fs::write(
         &out,
         format!("{}\n", serde_json::to_string_pretty(&res).unwrap()),
@@ -475,12 +570,17 @@ fn write_result(ds: &str, source: &str, res: Value) {
     let conv = res["converged"].as_bool().unwrap_or(false);
     // GLMM rungs store the split rx/hessian medians, not a single median — show
     // the Rx one on the console (mirrors mixedmodels.jl's t_disp fallback).
+    // None on an untimed run (`timing` is null) — the console line then omits the
+    // time rather than printing a NaN, matching the other four engines.
     let t = res["timing"]["fit_seconds_median"]
         .as_f64()
-        .or_else(|| res["timing"]["fit_seconds_median_rx"].as_f64())
-        .unwrap_or(f64::NAN);
+        .or_else(|| res["timing"]["fit_seconds_median_rx"].as_f64());
+    let t_disp = match t {
+        Some(t) => format!("  fit_median={t:.4}s"),
+        None => String::new(),
+    };
     println!(
-        "glmm  {ds:<12}  rung {}  converged={conv}  fit_median={t:.4}s",
+        "glmm  {ds:<12}  rung {}  converged={conv}{t_disp}",
         res["rung"]
     );
 }

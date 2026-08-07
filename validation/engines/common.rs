@@ -26,7 +26,7 @@ pub fn unquote(s: &str) -> String {
 
 /// A `Table` built by column NAME: manifest `factors` become `Column::Factor`,
 /// everything else `Column::Numeric` — except a column that fails to parse as
-/// `f64` anywhere (e.g. Pastes' `cask`, a categorical helper column the validation
+/// `f64` anywhere (e.g. Pastes' `sample`, a categorical helper column the validation
 /// corpus carries but no jl_formula references) falls back to `Column::Factor`
 /// rather than panicking, since it may be present in the CSV without being
 /// referenced by the formula at all.

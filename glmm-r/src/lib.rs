@@ -1,8 +1,8 @@
 //! extendr binding: the `#[extendr]` surface the `fastglmm` R package calls.
-//! Almost all logic lives in `convert.rs`/`orchestrate.rs`, which never touch
-//! an `extendr` type and run under plain `cargo test` — this file is only the
-//! FFI shim. Re-exported into the R package's staticlib by `r/src/rust`
-//! (`extendr_module! { mod fastglmm; use glmm_r; }`).
+//! All logic lives in `glmm::orchestrate` (the crate's shared
+//! port-orchestration module, behind its `orchestrate` feature) — this file is
+//! only the FFI shim. Re-exported into the R package's staticlib by
+//! `r/src/rust` (`extendr_module! { mod fastglmm; use glmm_r; }`).
 //!
 //! Mirror crate: `glmm-python` — the two ports bind the kernel at the same
 //! level. Absent optionals cross this boundary as empty
@@ -10,10 +10,9 @@
 //! argument validation, so every `Err` here is a boundary backstop, not a
 //! user-facing message.
 
-mod convert;
-mod orchestrate;
-
 use std::collections::HashMap;
+
+use glmm::orchestrate;
 
 use extendr_api::error::Result;
 use extendr_api::prelude::*;
@@ -98,6 +97,7 @@ fn fastglmm_fit(
     nagq: i32,
     dispersion: &[f64],
     weights: &[f64],
+    offset: &[f64],
     start_beta: &[f64],
     start_theta: &[f64],
 ) -> Result<List> {
@@ -108,6 +108,11 @@ fn fastglmm_fit(
         None
     } else {
         Some(weights.to_vec())
+    };
+    let offset = if offset.is_empty() {
+        None
+    } else {
+        Some(offset.to_vec())
     };
     let warm_start = if start_beta.is_empty() && start_theta.is_empty() {
         None
@@ -125,6 +130,7 @@ fn fastglmm_fit(
         nagq,
         dispersion,
         weights,
+        offset,
         warm_start,
     )
     .map_err(Error::Other)?;
@@ -137,6 +143,37 @@ fn fastglmm_fit(
         Some(msg) => r!(msg),
         None => r!(NULL),
     };
+    let pinned = List::from_values(r.pinned.iter().map(|flags| r!(flags.clone())));
+    // Column indices become 1-based HERE, once, so nothing on the R side of
+    // this boundary ever handles a 0-based index: `notes[[i]]$columns` indexes
+    // `names` directly. The Python port keeps them 0-based for the same reason
+    // - change together, and keep the two conventions each idiomatic.
+    let notes = List::from_values(r.notes.iter().map(|n| {
+        r!(list!(
+            kind = n.kind,
+            columns = n
+                .columns
+                .iter()
+                .map(|&c| c as i32 + 1)
+                .collect::<Vec<i32>>(),
+            pivot = n.pivot,
+            evals = n.evals as i32,
+            final_eval = n.final_eval,
+            detail = n.detail.clone()
+        ))
+    }));
+    // Labelled conditional modes, one entry per grouping. `ranef.fastglmm`
+    // reshapes each into lme4's named data.frame; nothing on the R side slices
+    // the flat `ranef` vector, because only the kernel knows the block layout.
+    let ranef_blocks =
+        List::from_values(r.ranef_blocks.iter().map(|(g, terms, levels, values)| {
+            r!(list!(
+                group = g.clone(),
+                terms = terms.clone(),
+                levels = levels.clone(),
+                values = values.clone()
+            ))
+        }));
 
     Ok(list!(
         beta = r.beta,
@@ -164,7 +201,11 @@ fn fastglmm_fit(
             .ranef_levels
             .iter()
             .map(|&v| v as f64)
-            .collect::<Vec<f64>>()
+            .collect::<Vec<f64>>(),
+        ranef_blocks = ranef_blocks,
+        boundary = r.boundary,
+        pinned = pinned,
+        notes = notes
     ))
 }
 

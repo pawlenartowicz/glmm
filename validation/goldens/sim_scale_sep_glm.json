@@ -1,0 +1,20 @@
+{
+  "name": "sim_scale_sep_glm",
+  "engine": "stats::glm",
+  "engine_version": "R-4.5.3",
+  "kind": "glm",
+  "data": "sim_scale_sep",
+  "family": "binomial",
+  "link": "logit",
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "y ~ 1 + x",
+  "converged": false,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [10.3122447759743, 1432.23560427971],
+    "se": [974.459568731949, 75218.2708102229],
+    "loglik": -5.90992613513919e-07
+  }
+}

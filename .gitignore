@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 python/build/
 python/.pytest_cache/
+.DS_Store
 python/glmm/_native*.so
 python/glmm/_native*.pyd
 
@@ -18,3 +19,5 @@ python/glmm/_native*.pyd
 /validation/campaigns/speed-grid/data/
 /validation/campaigns/speed-grid/results/
 /validation/campaigns/estimate-grid/results/
+# lane-width harness: per-run probe/test output, regenerated every run.
+/validation/lanewidth/results/

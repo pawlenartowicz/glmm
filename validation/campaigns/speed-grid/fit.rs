@@ -23,7 +23,24 @@ fn main() {
         .unwrap_or_else(|_| format!("{DIR}/campaigns/speed-grid/results/glmm_shipped.jsonl"));
     let tag = std::env::var("GRID_CONFIG_TAG").unwrap_or_default();
     let only = std::env::var("GRID_ONLY").unwrap_or_default();
+    // One cell per process (run.sh sets this for the glmm engine only — the
+    // two sites change together): a cell's wall time swung 2-10x on sub-100ms
+    // cells depending on the allocator/cache state left behind by whatever
+    // ran before it in the same process, and on where kill-relaunch
+    // boundaries fell between passes. A fresh process per cell gives every
+    // cell the same timing context.
+    let one_cell = !std::env::var("GRID_ONE_CELL")
+        .unwrap_or_default()
+        .is_empty();
     std::fs::create_dir_all(std::path::Path::new(&out_path).parent().unwrap()).unwrap();
+
+    // run.sh owns the budget and exports it per launch; the fallback lets
+    // this example still run standalone (change together with run.sh's
+    // GRID_CELL_BUDGET export).
+    let budget: f64 = std::env::var("GRID_CELL_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(240.0);
 
     let manifest: Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("read grid manifest"))
@@ -43,9 +60,12 @@ fn main() {
         if done.contains(case_id) {
             continue;
         }
-        let rec = fit_cell(cell, &tag);
+        let rec = fit_cell(cell, &tag, budget);
         writeln!(out, "{}", serde_json::to_string(&rec).unwrap()).unwrap();
         out.flush().unwrap(); // line-per-fit flush: the watchdog watches mtime
+        if one_cell {
+            return;
+        }
     }
 }
 
@@ -148,16 +168,27 @@ fn config_tag(lo: &glmm::formula::Lowered, gaussian: bool, user_tag: &str) -> St
 /// Rust-side analogue of MM's harness already holding a `DataFrame` before
 /// `fit_cell` starts.
 ///
-/// Timing protocol: one discarded warm-up fit, then two timed fits, reporting
-/// the min-wall rep. The warm-up absorbs one-time per-process lazy init —
-/// faer's first triangular matmul costs ~4–9 ms and used to land inside the
-/// timed solve of whichever cell first took the unbalanced dense-LMM path
-/// (the 40× `lmm_int1_g300p5_skew_base` outlier in every pre-fix pass). The
-/// min is honest: fits are deterministic (identical eval sequence —
-/// `rep_mismatch` flags any drift) and timing noise on a locked machine is
-/// one-sided. Mirrors fit.jl's warm-up discard; run.sh's glmm
-/// TIMEOUT budgets 3 fits per cell — change together.
-fn fit_cell(cell: &Value, user_tag: &str) -> Value {
+/// Timing protocol: one discarded warm-up fit, then up to two timed fits,
+/// reporting the min-wall rep when both run. The warm-up absorbs one-time
+/// per-process lazy init — faer's first triangular matmul costs ~4–9 ms and
+/// used to land inside the timed solve of whichever cell first took the
+/// unbalanced dense-LMM path (the 40× `lmm_int1_g300p5_skew_base` outlier in
+/// every pre-fix pass). The min is honest: fits are deterministic (identical
+/// eval sequence — `rep_mismatch` flags any drift) and timing noise on a
+/// locked machine is one-sided. Mirrors fit.jl's warm-up discard.
+///
+/// `budget` (seconds, shared across the cell's fits — not per-fit) caps how
+/// many fits are attempted: after each fit finishes, the next one starts only
+/// if `elapsed + duration_of_the_fit_just_finished <= budget`, predicting the
+/// next fit's duration from the one that just finished (fits within a cell
+/// are deterministic and near-identical in duration) rather than checking
+/// `elapsed < budget` — the plain form would start a fit at e.g. budget-1s
+/// and let it run for minutes before the shell watchdog kills the whole
+/// cell, discarding a perfectly good partial measurement. `wall_source`
+/// records which case applied (`min_of_2`, `single`, `warmup`) and `n_reps`
+/// (0, 1 or 2) the number of *timed* fits that contributed. run.sh owns the
+/// budget number and passes it via `GRID_CELL_BUDGET` — change together.
+fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
     let case_id = cell["case_id"].as_str().unwrap().to_string();
     let seed = cell["seed"].as_i64().unwrap_or(0);
     let mut rec = json!({
@@ -194,26 +225,44 @@ fn fit_cell(cell: &Value, user_tag: &str) -> Value {
             if warm.0.is_none() {
                 // Warm-up panicked — record it as-is; re-fitting the same
                 // cell would panic again.
+                rec["n_reps"] = json!(0);
+                rec["wall_source"] = json!("warmup");
+                warm
+            } else if warm.1 + warm.1 > budget {
+                // Predictive check: elapsed (= warm.1) + duration of the
+                // fit that just finished (= warm.1) would exceed budget.
+                rec["n_reps"] = json!(0);
+                rec["wall_source"] = json!("warmup");
                 warm
             } else {
-                let (a, b) = (one_fit(), one_fit());
-                rec["n_reps"] = json!(2);
-                if let (Some(fa), Some(fb)) = (&a.0, &b.0) {
-                    // Determinism QA — identical work per rep is what makes
-                    // min-of-2 honest; flag drift rather than silently
-                    // taking the min over disagreeing fits.
-                    if fa.deviance.to_bits() != fb.deviance.to_bits() || fa.n_eval != fb.n_eval {
-                        rec["rep_mismatch"] = json!(true);
+                let a = one_fit();
+                let elapsed = warm.1 + a.1;
+                if elapsed + a.1 > budget {
+                    rec["n_reps"] = json!(1);
+                    rec["wall_source"] = json!("single");
+                    a
+                } else {
+                    let b = one_fit();
+                    rec["n_reps"] = json!(2);
+                    rec["wall_source"] = json!("min_of_2");
+                    if let (Some(fa), Some(fb)) = (&a.0, &b.0) {
+                        // Determinism QA — identical work per rep is what makes
+                        // min-of-2 honest; flag drift rather than silently
+                        // taking the min over disagreeing fits.
+                        if fa.deviance.to_bits() != fb.deviance.to_bits() || fa.n_eval != fb.n_eval
+                        {
+                            rec["rep_mismatch"] = json!(true);
+                        }
                     }
-                }
-                match (a.0.is_some(), b.0.is_some()) {
-                    (true, false) => a,
-                    (false, true) => b,
-                    _ => {
-                        if a.1 <= b.1 {
-                            a
-                        } else {
-                            b
+                    match (a.0.is_some(), b.0.is_some()) {
+                        (true, false) => a,
+                        (false, true) => b,
+                        _ => {
+                            if a.1 <= b.1 {
+                                a
+                            } else {
+                                b
+                            }
                         }
                     }
                 }
@@ -231,10 +280,10 @@ fn fit_cell(cell: &Value, user_tag: &str) -> Value {
     match result {
         Some(f) => {
             let max_fun = lowered.as_ref().map(|(_, _, m)| *m).unwrap_or(0);
-            let maxeval = !f.converged && f.n_eval >= max_fun;
+            let maxeval = !f.converged() && f.n_eval >= max_fun;
             rec["n_eval"] = json!(f.n_eval);
-            rec["converged"] = json!(f.converged);
-            rec["singular"] = json!(f.singular);
+            rec["converged"] = json!(f.converged());
+            rec["singular"] = json!(f.singular());
             rec["deviance"] = num(f.deviance);
             rec["beta"] = nums(&f.beta);
             rec["se"] = nums(&f.se);
@@ -251,7 +300,7 @@ fn fit_cell(cell: &Value, user_tag: &str) -> Value {
                 .unwrap_or_else(|| json!([]));
             rec["status"] = json!(if maxeval {
                 "maxeval"
-            } else if f.converged {
+            } else if f.converged() {
                 "ok"
             } else {
                 "engine-fail"

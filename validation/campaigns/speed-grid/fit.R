@@ -121,13 +121,20 @@ for (cell in cells) {
       # and fit.jl's `get(cell, :reml, false) === true`.
       m <- lmer(as.formula(cell$r_formula), data = df, REML = isTRUE(cell$reml),
            control = lmerControl(optCtrl = list(maxeval = cell$max_fun)))
-      conv <- is.null(m@optinfo$conv$lme4$messages) ||
-              length(m@optinfo$conv$lme4$messages) == 0
+      msgs <- as.character(unlist(m@optinfo$conv$lme4$messages))
+      conv <- length(msgs) == 0
       feval <- as.integer(m@optinfo$feval)
       status <- if (feval >= cell$max_fun) "maxeval" else if (conv) "ok" else "engine-fail"
       c(base, list(
         optimizer = paste(unlist(m@optinfo$optimizer), collapse = "+"),
         n_eval = feval, converged = conv, singular = isSingular(m),
+        # `converged` collapses every lme4 message to one bit, but the messages
+        # are not one thing: the singular-fit note, a max-gradient warning and a
+        # Hessian warning all land in the same FALSE. Downstream triage of a
+        # non-converged cell cannot proceed without knowing which one fired, so
+        # the text is carried through verbatim. Mirrored in the glmer branch
+        # below -- change together.
+        messages = I(msgs),
         deviance = as.numeric(-2 * logLik(m)),
         beta = I(unname(fixef(m))),
         se = I(unname(sqrt(diag(as.matrix(vcov(m)))))),
@@ -145,13 +152,14 @@ for (cell in cells) {
             nAGQ = if (is_agq) as.integer(cell$nagq) else 1L,
             control = glmerControl(tolPwrss = 1e-13,
                                    optCtrl = list(maxfun = cell$max_fun)))
-      conv <- is.null(m@optinfo$conv$lme4$messages) ||
-              length(m@optinfo$conv$lme4$messages) == 0
+      msgs <- as.character(unlist(m@optinfo$conv$lme4$messages))
+      conv <- length(msgs) == 0
       feval <- as.integer(m@optinfo$feval)
       status <- if (feval >= cell$max_fun) "maxeval" else if (conv) "ok" else "engine-fail"
       c(base, list(
         optimizer = paste(unlist(m@optinfo$optimizer), collapse = "+"),
         n_eval = feval, converged = conv, singular = isSingular(m),
+        messages = I(msgs),   # mirrors the lmer branch above -- change together
         deviance = as.numeric(-2 * logLik(m)),
         beta = I(unname(fixef(m))),
         se = I(unname(sqrt(diag(as.matrix(vcov(m)))))),

@@ -1,0 +1,31 @@
+{
+  "name": "sim_dynrange_lmm",
+  "engine": "lme4::lmer",
+  "engine_version": "1.1.38",
+  "kind": "lmm",
+  "data": "sim_dynrange_lmm",
+  "family": "gaussian",
+  "link": {},
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "y ~ 1 + u + w + (1 | g)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "u", "w"],
+  "estimates": {
+    "beta": [-1.17366666568569, 9706846.67701253, 0.501109529266097],
+    "se": [1.77371475550411, 9942747.16930541, 0.00159828429821997],
+    "loglik": -286.564892791113,
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)"],
+        "stddev": [4.30164289417585],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "sigma": 0.291714251023172
+  }
+}

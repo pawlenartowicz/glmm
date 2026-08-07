@@ -1,0 +1,53 @@
+diff -ru a/src/aarch64.rs b/src/aarch64.rs
+--- a/src/aarch64.rs	2026-08-02 17:59:24
++++ b/src/aarch64.rs	2026-08-02 17:59:34
+@@ -3317,9 +3317,8 @@
+ 	/// Detects the best available instruction set.
+ 	#[inline]
+ 	pub fn new() -> Self {
+-		if let Some(simd) = Neon::try_new() {
+-			return Self::Neon(simd);
+-		}
++		// LANEWIDTH-HARNESS: dispatch forced to Scalar (lane 1) — see
++		// validation/lanewidth/pulp-0.22.2-scalar-force.patch in the glmm crate repo.
+ 		Self::Scalar
+ 	}
+ 
+diff -ru a/src/wasm.rs b/src/wasm.rs
+--- a/src/wasm.rs	2026-08-02 17:59:24
++++ b/src/wasm.rs	2026-08-02 17:59:50
+@@ -2438,12 +2438,8 @@
+ 	/// Detects the best available instruction set.
+ 	#[inline]
+ 	pub fn new() -> Self {
+-		if let Some(simd) = RelaxedSimd::try_new() {
+-			return Self::RelaxedSimd(simd);
+-		}
+-		if let Some(simd) = Simd128::try_new() {
+-			return Self::Simd128(simd);
+-		}
++		// LANEWIDTH-HARNESS: dispatch forced to Scalar (lane 1) — see
++		// validation/lanewidth/pulp-0.22.2-scalar-force.patch in the glmm crate repo.
+ 		Self::Scalar
+ 	}
+ 
+diff -ru a/src/x86.rs b/src/x86.rs
+--- a/src/x86.rs	2026-08-02 17:59:24
++++ b/src/x86.rs	2026-08-02 17:59:43
+@@ -311,14 +311,8 @@
+ 	/// Detects the best available instruction set.
+ 	#[inline]
+ 	pub fn new() -> Self {
+-		#[cfg(feature = "x86-v4")]
+-		if let Some(simd) = V4::try_new() {
+-			return Self::V4(simd);
+-		}
+-		#[cfg(feature = "x86-v3")]
+-		if let Some(simd) = V3::try_new() {
+-			return Self::V3(simd);
+-		}
++		// LANEWIDTH-HARNESS: dispatch forced to Scalar (lane 1) — see
++		// validation/lanewidth/pulp-0.22.2-scalar-force.patch in the glmm crate repo.
+ 		Self::Scalar
+ 	}
+ 

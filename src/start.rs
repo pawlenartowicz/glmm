@@ -14,14 +14,21 @@
 
 /// Raw optimizer warm-start state for one model fit.
 ///
-/// - `beta`: fixed-effect start, length `p` (cold = all-zero).
+/// - `beta`: fixed-effect start, length `p`.
 /// - `theta`: RE Cholesky parameters (the kernel's `θ`, column-major vech),
-///   length `n_theta` for the model's RE structure (cold = the kernel's flat
-///   `THETA0` blind start). Empty for fixed-only (OLS/GLM) models.
+///   length `n_theta` for the model's RE structure. Empty for fixed-only
+///   (OLS/GLM) models.
+///
+/// Either field may be left EMPTY to cold-start that component on its own, which
+/// is what a caller supplying only one of the two (lme4's `start = list(theta =
+/// …)` shape) needs: β then seeds from the no-RE GLM fit and θ from the blind
+/// `THETA0` shape, exactly as `start = None` would. The two cold seeds are
+/// computed inside the kernels, so a caller cannot reproduce them itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartValues {
-    /// Warm-start β, length `p`.
+    /// Warm-start β, length `p`; empty cold-starts β.
     pub beta: Vec<f64>,
-    /// Warm-start θ (RE Cholesky vech), length `n_theta`; empty for fixed-only models.
+    /// Warm-start θ (RE Cholesky vech), length `n_theta`; empty cold-starts θ
+    /// (and is the only valid value for fixed-only models).
     pub theta: Vec<f64>,
 }

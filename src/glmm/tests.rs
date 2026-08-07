@@ -1490,15 +1490,17 @@ fn fit_glmm_width_general_slope_and_crossed() {
 }
 
 /// Warm-path zero-alloc lock — `#[ignore]` because `dhat::Profiler` measures
-/// process-wide allocations and concurrent tests contaminate the count. faer's
-/// rayon parallelism also jitters the count run-to-run on a multi-core box, so
-/// pin it to one thread for a deterministic measurement:
-/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests fit_glmm_warm_path_bounded_alloc -- --ignored --test-threads=1`
+/// process-wide allocations; `alloc_test_guard` serializes it against the
+/// other `#[ignore]` tests. faer's rayon parallelism jitters the count
+/// run-to-run on a multi-core box, so pin it to one thread for a
+/// deterministic measurement:
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests fit_glmm_warm_path_bounded_alloc -- --ignored`
 /// (`alloc-tests` installs the dhat global allocator the profiler requires.)
 #[cfg(feature = "alloc-tests")]
 #[test]
 #[ignore]
 fn fit_glmm_warm_path_bounded_alloc() {
+    let _serial = crate::test_support::alloc_test_guard();
     let (xf64, y, ids) = glmm_intercept_dataset();
     let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
@@ -1565,11 +1567,12 @@ fn fit_glmm_warm_path_bounded_alloc() {
 /// scratch, so the only per-eval blocks left are the joint [θ|β] BOBYQA's own
 /// scratch (M is built into the pre-allocated `ws.m`). `#[ignore]` + one-thread
 /// for the same reasons as the no-extras gate. Run:
-/// `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests fit_glmm_structured_warm_path_bounded_alloc -- --ignored --test-threads=1`
+/// `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests fit_glmm_structured_warm_path_bounded_alloc -- --ignored`
 #[cfg(feature = "alloc-tests")]
 #[test]
 #[ignore]
 fn fit_glmm_structured_warm_path_bounded_alloc() {
+    let _serial = crate::test_support::alloc_test_guard();
     // crossed_nested q_p=1: 8 core blocks of 3×3 + a 6×6 Schur (the richest
     // structured shape; exercises both the block factor and the Schur).
     let (xf64, y, ids, extra_ids, cluster) = glmm_extras_q1_dataset(2, 6);
@@ -3499,6 +3502,10 @@ fn two_stage_matches_single_stage_on_grouseticks() {
 #[test]
 #[ignore]
 fn two_stage_matches_single_stage_corpus_sweep() {
+    // Serialized under alloc-tests so its allocations can't land in a
+    // concurrent dhat profiler window on an `-- --ignored` run.
+    #[cfg(feature = "alloc-tests")]
+    let _serial = crate::test_support::alloc_test_guard();
     // grouseticks 3-crossed Poisson (structured, non-canonical log link).
     {
         let (model, ids, x, y, n, p) = grouseticks_3crossed_fixture();

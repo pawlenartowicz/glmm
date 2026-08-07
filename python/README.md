@@ -1,6 +1,6 @@
 # glmm
 
-**Linear-regression family — OLS → GLM → LMM → GLMM — in pure Rust, with a two-name Python API.**
+**Linear-regression family — OLS → GLM → LMM → GLMM — in pure Rust, with a six-name Python API.**
 
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
@@ -40,8 +40,11 @@ assert fit.converged
 fit.summary()   # prints the coefficient table (and returns it as a string)
 ```
 
-The public surface is exactly two names: `glmm.fit` and `glmm.Fit`. Families,
-links, and knobs are string or scalar arguments, not types.
+The public surface is six names: `glmm.fit`, `glmm.Fit`, and the four warning
+categories the diagnostics channel raises — `glmm.DiagnosticWarning` (the
+base) plus `glmm.IllConditionedWarning`, `glmm.PirlsExhaustedWarning` and
+`glmm.UnusedGroupingLevelsWarning`. Families, links, and knobs are string or
+scalar arguments, not types.
 
 `data` is documented as a `dict[str, array-like]`, but anything
 column-addressable works — pandas / polars DataFrame, pyarrow Table — by
@@ -84,7 +87,7 @@ for fixes to common errors.
 ## Documentation
 
 Full walkthrough — every knob, the `Fit` object, and warm starts:
-[`TUTORIAL-PYTHON.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/TUTORIAL-PYTHON.md).
+[`tutorial-python.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/tutorial-python.md).
 
 The algorithm map (dispatch graph, solver paths, tuning knobs) is traced to
 code in

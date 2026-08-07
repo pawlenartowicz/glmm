@@ -82,6 +82,9 @@ pub enum Error {
     /// has no `ColumnId` in the design. A future version may allow
     /// random-slope variables with no corresponding fixed-effect term.
     SlopeVarNotInDesign(String),
+    /// [`super::label_ranef`] was handed a `Fit` and a `re_groups` that do not
+    /// describe the same model. The payload says which count disagreed.
+    RanefShapeMismatch(String),
 }
 
 impl fmt::Display for Error {
@@ -98,6 +101,10 @@ impl fmt::Display for Error {
             Error::SlopeVarNotInDesign(name) => write!(
                 f,
                 "random-slope variable '{name}' is not a numeric fixed term in the design"
+            ),
+            Error::RanefShapeMismatch(detail) => write!(
+                f,
+                "the fit and the lowered random effects do not describe the same model: {detail}"
             ),
         }
     }

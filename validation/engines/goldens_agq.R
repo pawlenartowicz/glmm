@@ -15,14 +15,33 @@
 # Julia/Rust cross-check); GLMMadaptive for the vector-RE AGQ rungs (oracle field
 # below -- glmer refuses nAGQ>1 for vector REs, full-AGQ spec locked decision 6).
 # Run once to freeze (NOT part of run.sh): Rscript validation/engines/goldens_agq.R
+#
+# A BARE RUN REFITS AND OVERWRITES EVERY GOLDEN. Use VALIDATION_ONLY (bottom of this
+# file) for anything short of a deliberate full re-freeze. That matters more now that
+# the manifest can carry a spec whose reference does NOT exist yet: `pending_reference`
+# (an OPTIONAL m3_goldens field -- no spec carries it while every reference is frozen,
+# which is the steady state) marks a golden that is registered so this script
+# can generate it, but is not frozen and is excluded from the in-crate Tier 2 corpus
+# (tests/validation_oracle.rs::is_pending). Generating one is
+#   VALIDATION_ONLY=<name> Rscript validation/engines/goldens_agq.R
+# and the `pending_reference` field is then dropped from the manifest entry in the
+# same change -- Tier 2 fails while the flag and the JSON coexist. This script itself
+# ignores the field: it is a registry annotation, not a fit setting, and it is not
+# copied into the reference JSON.
 
 suppressMessages({
   library(lme4)
   library(MASS)         # glm.nb
-  library(GLMMadaptive) # vector-RE AGQ oracle (specs with oracle="GLMMadaptive";
-                        # glmer refuses nAGQ>1 for vector REs). See validation/README.md.
   library(jsonlite)
 })
+# GLMMadaptive (vector-RE AGQ oracle: specs with oracle="GLMMadaptive"; glmer refuses
+# nAGQ>1 for vector REs -- see validation/README.md) is attached at FIRST USE, inside
+# fit_one_glmmadaptive, not here. It was a top-level library() call, which made the
+# whole script unloadable on a machine without the package -- including a
+# VALIDATION_ONLY run naming only glmer/glm/lmer specs, which never touch it. Those
+# are the majority (34 of 40 goldens) and are exactly what a single-golden
+# regeneration is. Attaching inside the function keeps `mixed_model`/`packageVersion`
+# resolving unqualified as before, so the vector-AGQ path is unchanged.
 
 suite_dir <- normalizePath(file.path(dirname(sub(
   "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))), ".."))
@@ -77,6 +96,8 @@ read_dataset <- function(spec) {
 # scale is owned by the in-crate k-convergence invariants (spec Part 4 layer 1),
 # not this oracle.
 fit_one_glmmadaptive <- function(spec, df) {
+  # Attached here rather than at the top of the file -- see the header note.
+  suppressMessages(library(GLMMadaptive))
   nagq <- as.integer(spec$nagq)
   # Tightened controls, recorded per JSON (the lme4.R tolPwrss=1e-13 precedent):
   # mixed_model's DEFAULTS under-converge on the low-information rungs -- on

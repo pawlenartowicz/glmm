@@ -31,8 +31,7 @@
 //! BOBYQA is Powell, M.J.D. (2009), *The BOBYQA algorithm for bound constrained
 //! optimization without derivatives*, Cambridge report DAMTP 2009/NA06.
 
-use crate::ols::chol_rank_deficient;
-use bobyqa::{Bobyqa, Config, Status};
+use bobyqa::{Bobyqa, Config, RestartConfig, Status};
 use faer::{Mat, MatRef};
 use std::sync::OnceLock;
 
@@ -53,19 +52,18 @@ pub const RHO_BEGIN: f64 = 0.5;
 /// β̂ 1e-5), at 15.1–15.7 vs 19.5–20.7 evals/fit — a ~25% eval cut for free.
 pub const RHO_END: f64 = 1e-6;
 /// GLMM-path final trust radius (θ AND β jointly, not θ-only like `RHO_END`).
-/// Re-swept {1e-6, 3e-6, 1e-5, 3e-5, 1e-4} against the full `cargo test
-/// --release` suite (2026-07-03, 181 tests — the calibrating set widened by
-/// the roadmap-step-2 sparse non-Gaussian solvers: both-paths cross-checks,
-/// over-envelope smokes, and the sim_sparse_nb golden): 1e-6 and 3e-6 pass
-/// 181/181; **1e-5 now fails** (`two_stage_matches_single_stage_on_grouseticks`
-/// — it passed the pre-step-2 159-test sweep, so the boundary moved in); 3e-5
-/// adds `fit_glmm_poisson_agq_matches_lme4` (β[0] off ~3e-3, past the crate's
-/// beta_rel=1e-3 oracle floor) and 1e-4 adds
-/// `fit_glmm_poisson_grouseticks_matches_lme4`. 3e-6 is retained: still fully
-/// green, but it is now the boundary-adjacent candidate (the old "one step
-/// back from 1e-5" margin is gone) — do NOT loosen past it. Original timing
-/// rationale (vs 1e-6): 0.265–0.269s vs 0.288s on `grouseticks` (n=403,
-/// 7 free params), a ~7–8% wall-time cut for free.
+/// Re-measured 2026-08-06 (full `cargo test --release` across all five
+/// feature configs plus a 20-rung validation sweep with tightening-only noise
+/// floors): 3e-6 fully green; 1e-5 fails 5 tests, the one oracle-band
+/// casualty being `fit_glmm_poisson_agq_matches_lme4` — grouseticks AGQ k=7
+/// β[0] at 1.9331e-3 vs its 1e-3 lme4 band (1.93×, and ~9× the rung's
+/// 1.03e-4 optimizer noise floor, so a real accuracy loss, not path wander);
+/// the other four are Rust-vs-Rust bit-exact pins. The 2026-07-03 sweep's
+/// 1e-5 casualty (`two_stage_matches_single_stage_on_grouseticks`) now
+/// passes at 1e-5; that sweep also saw 3e-5 and 1e-4 add further oracle
+/// failures. 3e-6 is the boundary-adjacent candidate — do NOT loosen past
+/// it. Original timing rationale (vs 1e-6): 0.265–0.269s vs 0.288s on
+/// `grouseticks` (n=403, 7 free params), a ~7–8% wall-time cut for free.
 pub const GLMM_RHO_END: f64 = 3e-6;
 /// Truth-start floor: a `Some(θ₀)` start is clamped to max(θ₀, this) so a
 /// zero/near-zero true θ never starts the search on the boundary itself.
@@ -77,8 +75,28 @@ pub const THETA_TRUTH_FLOOR: f64 = 0.01;
 /// with the shipped τ̂≈0 detection (`lme.rs` pins boundary_hit=1 fits at
 /// θ = 1e-4).
 pub const PIN_THETA: f64 = 1e-4;
-/// Rank guard on the p×p block of the factor — mirrors `lme.rs` EPS_RANK.
+/// Min/max L-diagonal floor for `lme.rs`'s rank guard. Retained only for that
+/// route (`loop_advanced`-only, fits off pre-accumulated sufficient statistics);
+/// the dense-LMM guard below moved to [`PIVOT_MIN`] because the min/max
+/// statistic is not scale-invariant — see [`crate::ols::chol_rank_deficient`].
 pub const EPS_RANK: f64 = 1e-8;
+/// Ill-conditioning DETECTION floor for the dense-LMM route, on the
+/// scale-invariant per-column pivot ratio of X'V⁻¹X at θ̂
+/// ([`crate::ols::min_pivot_ratio`]). Below it the fixed-effect coefficients are
+/// barely identified and the diagnostics channel says so — it is **not** a
+/// refuse threshold, and this route refuses no design on conditioning grounds
+/// (see the guard site for the two measured reasons).
+///
+/// Calibrated 2026-07-31 against a 1-ULP perturbation sweep of `y`. `1e-12` sits
+/// about two decades above where the statistic stops tracking conditioning on
+/// this route, which is the range where it still ranks designs. It is
+/// conservative: β̂'s measured movement here is 9.1e-8 at pivot 9.7e-13, far
+/// steadier than the `1e-15 / pivot` law the OLS and GLM routes obey.
+///
+/// No SOLVER path reads it: the kernel records the raw pivot and the comparison
+/// happens once, in `LmmResultView::diagnostics`, which is what fills
+/// `FitDiagnostics::ill_conditioned`.
+pub const PIVOT_MIN: f64 = 1e-12;
 
 /// BOBYQA config for an n_theta-dimensional θ-search. `Config::new` supplies
 /// the PRIMA defaults (npt = 2n+1, max_fun = 500·n) — at n = 1 exactly
@@ -86,11 +104,9 @@ pub const EPS_RANK: f64 = 1e-8;
 /// [`LmmWorkspace::with_groupings`]); the live path inlines its own config.
 #[cfg(test)]
 pub fn bobyqa_config(n_theta: usize) -> Config {
-    let mut config = Config {
-        rho_begin: RHO_BEGIN,
-        rho_end: RHO_END,
-        ..Config::new(n_theta)
-    };
+    let mut config = Config::new(n_theta);
+    config.rho_begin = RHO_BEGIN;
+    config.rho_end = RHO_END;
     apply_campaign_overrides(&mut config, n_theta);
     config
 }
@@ -133,7 +149,22 @@ pub(crate) fn max_fun_override(n: usize) -> Option<usize> {
     eval_formula(&env_formula("LMM_MAX_FUN_FORMULA", &V)?, n)
 }
 
-/// Shared tail for all BOBYQA config sites — campaign env hooks, no-op when unset.
+/// Shared tail for all BOBYQA config sites: the dev-only campaign env hooks
+/// (no-op when unset) and the shipped restart schedule (always on).
+///
+/// The restart re-solves from the incumbent θ with a discarded interpolation
+/// model once a cycle has spent an eighth of the evaluation budget that
+/// remained when it started. Only fits that cross that cap can move — with
+/// `cycle_budget_frac` non-zero, reaching `rho_end` no longer restarts on its
+/// own, so a solve converging inside its cap returns exactly what no-restart
+/// returns, evaluation count included. Note the trigger is the per-cycle cap,
+/// not `max_fun` exhaustion: a fit can restart with most of `max_fun` unspent.
+/// BOBYQA keeps the best point across cycles, so a restart never returns worse
+/// than stopping would have.
+///
+/// The four fields are written out even though they are `RestartConfig::new()`'s
+/// own defaults: the schedule is adopted by value, so a later bobyqa release
+/// changing its defaults cannot silently move this fit path.
 pub(crate) fn apply_campaign_overrides(config: &mut Config, n: usize) {
     if let Some(npt) = npt_override(n) {
         config.npt = npt;
@@ -141,6 +172,14 @@ pub(crate) fn apply_campaign_overrides(config: &mut Config, n: usize) {
     if let Some(mf) = max_fun_override(n) {
         config.max_fun = mf.max(config.npt + 1);
     }
+    let mut restart = RestartConfig::new();
+    restart.cycle_budget_frac = 0.125;
+    restart.max_restarts = 1;
+    restart.improve_rel_tol = 1e-6;
+    // Off: the eval cap dominates it in every measured case, and it cannot see
+    // a cycle that crawls without reducing rho.
+    restart.stall_reductions = 0;
+    config.restart = Some(restart);
 }
 
 fn two_stage_enabled() -> bool {
@@ -165,11 +204,12 @@ fn two_stage_minimize(
     upper: &[f64],
 ) -> bobyqa::Outcome {
     let n = theta.len();
-    let c1 = Config {
-        npt: n + 2,
-        rho_begin: RHO_BEGIN,
-        rho_end: 1e-3,
-        ..Config::new(n)
+    let c1 = {
+        let mut c = Config::new(n);
+        c.npt = n + 2;
+        c.rho_begin = RHO_BEGIN;
+        c.rho_end = 1e-3;
+        c
     };
     let mut s1 = Bobyqa::new(n, c1).expect("stage-1 config valid");
     let out1 = s1.minimize(|xs| reml_deviance(xs, suff, fit), theta, lower, upper);
@@ -182,11 +222,12 @@ fn two_stage_minimize(
         .map(|&i| theta[i])
         .fold(f64::INFINITY, f64::min);
     let rho_begin2 = (0.1 * min_diag).clamp(10.0 * RHO_END, RHO_BEGIN);
-    let c2 = Config {
-        npt: 2 * n + 1,
-        rho_begin: rho_begin2,
-        rho_end: RHO_END,
-        ..Config::new(n)
+    let c2 = {
+        let mut c = Config::new(n);
+        c.npt = 2 * n + 1;
+        c.rho_begin = rho_begin2;
+        c.rho_end = RHO_END;
+        c
     };
     let mut s2 = Bobyqa::new(n, c2).expect("stage-2 config valid");
     let out2 = s2.minimize(|xs| reml_deviance(xs, suff, fit), theta, lower, upper);
@@ -235,12 +276,10 @@ pub(crate) fn sparse_lmm_seed(groupings: &LmmGroupings) -> (Bobyqa, Vec<f64>, Ve
     } else {
         2 * n_theta + 1
     };
-    let mut config = Config {
-        rho_begin,
-        rho_end: RHO_END,
-        npt,
-        ..Config::new(n_theta)
-    };
+    let mut config = Config::new(n_theta);
+    config.rho_begin = rho_begin;
+    config.rho_end = RHO_END;
+    config.npt = npt;
     apply_campaign_overrides(&mut config, n_theta);
     let (theta, lower, upper) = groupings.blind_theta_and_bounds();
     let solver =
@@ -561,8 +600,7 @@ impl LmmGroupings {
         let diag = self.diagonal_theta();
         // Off-diagonal vech entries (primary AND every extra factor's Λ_g) get a
         // blind start of 0 and a signed box; diagonals keep θ₀ = THETA0, box
-        // [0, HI]. q_g=1 extras are all-diagonal, so they are untouched — the
-        // pre-slope behaviour (the loop used to stop at the primary vech).
+        // [0, HI]. q_g=1 extras are all-diagonal, so they are untouched.
         for i in 0..n {
             if !diag.contains(&i) {
                 theta[i] = 0.0; // off-diagonal blind start
@@ -959,6 +997,23 @@ pub struct LmmFitScratch {
     pub var_diag: Vec<f64>,
     pub t_sq: Vec<f64>,
     pub u: Vec<f64>,
+    /// Spherical conditional modes `û` at θ̂ over the full RE-column set
+    /// (elimination order, length `k_total`), written once per fit by
+    /// [`recover_ranef`]. Its OWN buffer, not `u`: `u`'s head is the
+    /// standard-error forward-solve scratch, which runs first and would be
+    /// overwritten.
+    pub ranef_u: Vec<f64>,
+    /// Whether `ranef_u` holds a usable recovery for the current fit. False
+    /// before any recovery has run, and after one whose re-factorization failed
+    /// (which can only happen at a θ̂ the deviance itself already factored, so it
+    /// is a numerical-edge guard, not an expected path).
+    pub ranef_ok: bool,
+    /// [`recover_ranef`]'s family-path solve buffers: crossed-tail û_x
+    /// (k_crossed) and the per-family back-substitution rhs (w). Scratch
+    /// fields so the recovery pass keeps the warm path allocation-free; every
+    /// entry is overwritten before it is read, so no per-fit reset is needed.
+    pub ranef_ux: Vec<f64>,
+    pub ranef_rhs: Vec<f64>,
     pub sigma_sq: f64,
     /// p×p X'V⁻¹X rebuild (L_XX·L_XXᵀ) + the shared joint-Wald scratch
     /// (mirrors the lme workspace triple the promoted helper expects).
@@ -1033,6 +1088,10 @@ impl LmmFitScratch {
             var_diag: vec![0.0; p],
             t_sq: vec![0.0; p],
             u: vec![0.0; p],
+            ranef_u: vec![0.0; g.k_total],
+            ranef_ok: false,
+            ranef_ux: vec![0.0; g.k_crossed()],
+            ranef_rhs: vec![0.0; w],
             sigma_sq: f64::NAN,
             joint_xtvix: Mat::zeros(p, p),
             joint_k_inv: Mat::zeros(p, p),
@@ -1135,12 +1194,10 @@ impl LmmWorkspace {
         } else {
             2 * n_theta + 1
         };
-        let mut config = Config {
-            rho_begin,
-            rho_end: RHO_END,
-            npt,
-            ..Config::new(n_theta)
-        };
+        let mut config = Config::new(n_theta);
+        config.rho_begin = rho_begin;
+        config.rho_end = RHO_END;
+        config.npt = npt;
         apply_campaign_overrides(&mut config, n_theta);
         let fit = LmmFitScratch::with_groupings(p, &groupings);
         let (theta, lower, upper) = groupings.blind_theta_and_bounds();
@@ -1247,6 +1304,212 @@ fn assemble_primary_a(fam_a: &mut [f64], stride: usize, lam: &[f64], gram: &[f64
                 s += m_r[e] * lam[e * q + c];
             }
             fam_a[r * stride + c] = if r == c { 1.0 + s } else { s };
+        }
+    }
+}
+
+/// Family `f`'s `w×w` block `A_f = I + Λ_f′G_fΛ_f` into the lower triangle of
+/// the row-major `fam_a` (`w = q_p + n_per`): the primary `q_p×q_p` block, then
+/// the nested children's diagonals and their coupling to the primary.
+///
+/// Lifted out of [`reml_deviance`]'s family loop so [`recover_ranef`] rebuilds
+/// the same `L_f` the deviance factored rather than restating the assembly —
+/// the deviance keeps only the LAST family's factor, and recovery needs all of
+/// them. Pure extraction: same operations in the same order, so the deviance is
+/// bit-identical to the pre-extraction path.
+#[allow(clippy::too_many_arguments)] // one call site each; the alternative is a struct of borrows
+fn assemble_fam_a(
+    fam_a: &mut [f64],
+    prim_gram: &mut [f64],
+    prim_lam: &[f64],
+    suff: &LmmSuffStats,
+    f: usize,
+    w: usize,
+    th_p: f64,
+    th_n: f64,
+    slope: bool,
+) {
+    let g = &suff.groupings;
+    let np = g.nested_per_parent;
+    if slope {
+        let q = g.primary_q;
+        primary_gram(suff, g, f, q, prim_gram);
+        assemble_primary_a(fam_a, w, prim_lam, prim_gram, q); // I + Λ′GΛ
+                                                              // Composed nested children (rows/cols q..q+np). Scalar child λ = θ_n;
+                                                              // child–child off-diagonals are 0 (children never
+                                                              // co-occur). The primary↔child off-diagonal A[(q+c, e)] folds the raw
+                                                              // cross-Gram (intercept = counts[child]; slope d = s[(slope_col_d,
+                                                              // child_re_col)]) through Λ_p, mirroring how the scalar path reads counts for the
+                                                              // intercept↔child term. n_primary = primary level count (slope RE
+                                                              // stride); np = children per parent (nested width) — kept distinct.
+        for c in 0..np {
+            // Nested child RE col = prim_width + f·np + c (prim_width = q_p·n_primary).
+            let gcol = g.n_primary * g.primary_q + f * np + c;
+            let n_c = suff.counts[gcol];
+            for c2 in 0..np {
+                fam_a[(q + c) * w + (q + c2)] = 0.0;
+            }
+            fam_a[(q + c) * w + (q + c)] = 1.0 + th_n * th_n * n_c;
+            // Primary↔child: A[(q+c, e)] = θ_n · Σ_{d≥e} Λ_p[d,e] · Graw_d,
+            // Graw_0 = n_c (intercept), Graw_d = Σ_{i∈child} x_{slope_{d-1}}.
+            for e in 0..q {
+                let mut acc = 0.0;
+                for d in e..q {
+                    let graw_d = if d == 0 {
+                        n_c
+                    } else {
+                        suff.s[(g.primary_slope_cols[d - 1], gcol)]
+                    };
+                    acc += prim_lam[d * q + e] * graw_d;
+                }
+                fam_a[(q + c) * w + e] = th_n * acc;
+            }
+        }
+    } else {
+        // parent–child counts = child row counts (a child's rows all lie
+        // inside its parent).
+        let n_f = suff.counts[f];
+        fam_a[0] = 1.0 + th_p * th_p * n_f;
+        for c in 0..np {
+            let gcol = g.n_primary + f * np + c;
+            let n_c = suff.counts[gcol];
+            for c2 in 0..np {
+                fam_a[(1 + c) * w + (1 + c2)] = 0.0;
+            }
+            fam_a[(1 + c) * w] = th_p * th_n * n_c;
+            fam_a[(1 + c) * w + (1 + c)] = 1.0 + th_n * th_n * n_c;
+        }
+    }
+}
+
+/// Family `f`'s coupling `B_f` to the `[crossed | X y]` tail, written as `w`
+/// contiguous `t_dim`-long columns (`bt_fam[r·t_dim + t]`) — the same slice
+/// [`reml_deviance`] writes at `fit.bt`'s columns `f·w .. f·w+w`. Extracted
+/// alongside [`assemble_fam_a`], for the same reason and with the same
+/// bit-identity claim.
+#[allow(clippy::too_many_arguments)] // as `assemble_fam_a`
+fn assemble_fam_b(
+    bt_fam: &mut [f64],
+    lam_x: &[f64],
+    prim_lam: &[f64],
+    suff: &LmmSuffStats,
+    f: usize,
+    t_dim: usize,
+    kx: usize,
+    slope: bool,
+    th_p: f64,
+    th_n: f64,
+) {
+    let g = &suff.groupings;
+    let m = suff.m;
+    let np = g.nested_per_parent;
+    if slope {
+        // Primary rows folded through Λ_p; nested-child rows scaled by θ_n
+        // (built at the shifted child offset). n_prim is the primary level
+        // count (slope RE stride: slope d-1's col at level f = d·n_prim+f);
+        // np is the nested width — kept distinct.
+        let q = g.primary_q;
+        let n_prim = g.n_primary;
+        // Primary rows ↔ crossed tail: intercept (d=0) reads zx[(f,b)];
+        // slope d reads zx_slope[(d·n_prim+f, b)]; both folded through Λ_p,
+        // scaled by the crossed λ_b. Column-b slices hoisted (unit-stride).
+        for b in 0..kx {
+            let lam_b = lam_x[b];
+            let zxb = suff.zx.col(b).try_as_col_major().unwrap().as_slice();
+            let zxsb = suff.zx_slope.col(b).try_as_col_major().unwrap().as_slice();
+            for r in 0..q {
+                let mut brb = 0.0;
+                for d in r..q {
+                    let zeta = if d == 0 { zxb[f] } else { zxsb[d * n_prim + f] };
+                    brb += prim_lam[d * q + r] * zeta;
+                }
+                bt_fam[r * t_dim + b] = lam_b * brb;
+            }
+        }
+        // Primary rows ↔ [X y] tail: Z_f′[Xy] row d at col j is s[(j, d·n_prim+f)]
+        // (intercept d=0 at col f), folded through Λ_p. Level-f s-columns
+        // hoisted once per family (unit-stride faer columns).
+        let mut s_cols: [&[f64]; MAX_PRIMARY_Q] = [&[]; MAX_PRIMARY_Q];
+        for (d, sc) in s_cols.iter_mut().enumerate().take(q) {
+            *sc = suff
+                .s
+                .col(d * n_prim + f)
+                .try_as_col_major()
+                .unwrap()
+                .as_slice();
+        }
+        for r in 0..q {
+            let bcol = &mut bt_fam[r * t_dim + kx..r * t_dim + kx + m];
+            for j in 0..m {
+                let mut brj = 0.0;
+                #[allow(clippy::needless_range_loop)]
+                for d in r..q {
+                    brj += prim_lam[d * q + r] * s_cols[d][j];
+                }
+                bcol[j] = brj;
+            }
+        }
+        // Nested-child rows (q..q+np) — built at the shifted child RE col.
+        for c in 0..np {
+            let gcol = n_prim * q + f * np + c; // prim_width + f·np + c
+            let off = (q + c) * t_dim;
+            for b in 0..kx {
+                bt_fam[off + b] = th_n * lam_x[b] * suff.zx[(gcol, b)];
+            }
+            let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
+            let bcol = &mut bt_fam[off + kx..off + kx + m];
+            for j in 0..m {
+                bcol[j] = th_n * scol[j];
+            }
+        }
+    } else {
+        let s_f = suff.s.col(f).try_as_col_major().unwrap().as_slice();
+        for b in 0..kx {
+            bt_fam[b] = th_p * lam_x[b] * suff.zx[(f, b)];
+        }
+        {
+            let bcol = &mut bt_fam[kx..kx + m];
+            for j in 0..m {
+                bcol[j] = th_p * s_f[j];
+            }
+        }
+        for c in 0..np {
+            let gcol = g.n_primary + f * np + c;
+            let off = (1 + c) * t_dim;
+            for b in 0..kx {
+                bt_fam[off + b] = th_n * lam_x[b] * suff.zx[(gcol, b)];
+            }
+            let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
+            let bcol = &mut bt_fam[off + kx..off + kx + m];
+            for j in 0..m {
+                bcol[j] = th_n * scol[j];
+            }
+        }
+    }
+}
+
+/// Forward-solve `L_f⁻¹B_f` in place on one family's `w` tail-coupling columns
+/// — axpy over contiguous `t_dim`-slices; per element the k-order subtractions
+/// and the final divide are unchanged from the old row-sweep (solved `k<r`
+/// values are final in both orders). Extracted alongside [`assemble_fam_b`].
+/// The divide is deliberately NOT hoisted into a reciprocal the way the sparse
+/// path's `schur_phase_b` does it — that is a ≤1-ulp change, and this path's
+/// values are pinned.
+fn fam_forward_solve(bt_fam: &mut [f64], t_dim: usize, w: usize, fam_a: &[f64]) {
+    for r in 0..w {
+        let (done, rest) = bt_fam.split_at_mut(r * t_dim);
+        let col_r = &mut rest[..t_dim];
+        for k in 0..r {
+            let l_rk = fam_a[r * w + k];
+            let col_k = &done[k * t_dim..(k + 1) * t_dim];
+            for t in 0..t_dim {
+                col_r[t] -= l_rk * col_k[t];
+            }
+        }
+        let l_rr = fam_a[r * w + r];
+        #[allow(clippy::needless_range_loop)]
+        for t in 0..t_dim {
+            col_r[t] /= l_rr;
         }
     }
 }
@@ -1811,56 +2074,18 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
             // intercept-only scalar path) nested-child diags + parent–child counts. The
             // slope branch additionally carries the composed nested children;
             // the scalar/q_p=1 `else` stays byte-identical (q_p=1 parity).
-            if slope {
-                let q = g.primary_q;
-                primary_gram(suff, g, f, q, &mut fit.prim_gram);
-                // Disjoint field borrows keep this zero-alloc and borrow-checked.
-                assemble_primary_a(&mut fit.fam_a, w, &fit.prim_lam, &fit.prim_gram, q); // I + Λ′GΛ
-                                                                                         // Composed nested children (rows/cols q..q+np). Scalar child λ = θ_n;
-                                                                                         // child–child off-diagonals are 0 (children never
-                                                                                         // co-occur). The primary↔child off-diagonal A[(q+c, e)] folds the raw
-                                                                                         // cross-Gram (intercept = counts[child]; slope d = s[(slope_col_d,
-                                                                                         // child_re_col)]) through Λ_p, mirroring how the scalar path reads counts for the
-                                                                                         // intercept↔child term. n_primary = primary level count (slope RE
-                                                                                         // stride); np = children per parent (nested width) — kept distinct.
-                for c in 0..np {
-                    // Nested child RE col = prim_width + f·np + c (prim_width = q_p·n_primary).
-                    let gcol = g.n_primary * g.primary_q + f * np + c;
-                    let n_c = suff.counts[gcol];
-                    for c2 in 0..np {
-                        fit.fam_a[(q + c) * w + (q + c2)] = 0.0;
-                    }
-                    fit.fam_a[(q + c) * w + (q + c)] = 1.0 + th_n * th_n * n_c;
-                    // Primary↔child: A[(q+c, e)] = θ_n · Σ_{d≥e} Λ_p[d,e] · Graw_d,
-                    // Graw_0 = n_c (intercept), Graw_d = Σ_{i∈child} x_{slope_{d-1}}.
-                    for e in 0..q {
-                        let mut acc = 0.0;
-                        for d in e..q {
-                            let graw_d = if d == 0 {
-                                n_c
-                            } else {
-                                suff.s[(g.primary_slope_cols[d - 1], gcol)]
-                            };
-                            acc += fit.prim_lam[d * q + e] * graw_d;
-                        }
-                        fit.fam_a[(q + c) * w + e] = th_n * acc;
-                    }
-                }
-            } else {
-                // parent–child counts = child row counts (a child's rows all lie
-                // inside its parent).
-                let n_f = suff.counts[f];
-                fit.fam_a[0] = 1.0 + th_p * th_p * n_f;
-                for c in 0..np {
-                    let gcol = g.n_primary + f * np + c;
-                    let n_c = suff.counts[gcol];
-                    for c2 in 0..np {
-                        fit.fam_a[(1 + c) * w + (1 + c2)] = 0.0;
-                    }
-                    fit.fam_a[(1 + c) * w] = th_p * th_n * n_c;
-                    fit.fam_a[(1 + c) * w + (1 + c)] = 1.0 + th_n * th_n * n_c;
-                }
-            }
+            // Disjoint field borrows keep this zero-alloc and borrow-checked.
+            assemble_fam_a(
+                &mut fit.fam_a,
+                &mut fit.prim_gram,
+                &fit.prim_lam,
+                suff,
+                f,
+                w,
+                th_p,
+                th_n,
+                slope,
+            );
             // In-place Crout Cholesky over the row-major w×w block, w ≤ 1+n_per,
             // via the shared kernel in `crate::linalg::block_chol` (zero-alloc;
             // false on a non-positive pivot, mapped to +INFINITY here — the
@@ -1882,112 +2107,23 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
                 fam_prod *= fit.fam_a[j * w + j];
             }
             log_lzz_half += fam_prod.ln();
-            // B_f (rows = Bt columns f·w..f·w+w, each contiguous): cols [crossed | X y].
+            // B_f (rows = Bt columns f·w..f·w+w, each contiguous): cols [crossed | X y],
+            // then the forward-solve L_f⁻¹B_f in place on that same slice.
             let fb = f * w;
-            if slope {
-                // Primary rows folded through Λ_p; nested-child rows scaled by θ_n
-                // (built at the shifted child offset). n_prim is the primary level
-                // count (slope RE stride: slope d-1's col at level f = d·n_prim+f);
-                // np is the nested width — kept distinct.
-                let q = g.primary_q;
-                let n_prim = g.n_primary;
-                // Primary rows ↔ crossed tail: intercept (d=0) reads zx[(f,b)];
-                // slope d reads zx_slope[(d·n_prim+f, b)]; both folded through Λ_p,
-                // scaled by the crossed λ_b. Column-b slices hoisted (unit-stride).
-                for b in 0..kx {
-                    let lam_b = fit.lam_x[b];
-                    let zxb = suff.zx.col(b).try_as_col_major().unwrap().as_slice();
-                    let zxsb = suff.zx_slope.col(b).try_as_col_major().unwrap().as_slice();
-                    for r in 0..q {
-                        let mut brb = 0.0;
-                        for d in r..q {
-                            let zeta = if d == 0 { zxb[f] } else { zxsb[d * n_prim + f] };
-                            brb += fit.prim_lam[d * q + r] * zeta;
-                        }
-                        fit.bt[(fb + r) * t_dim + b] = lam_b * brb;
-                    }
-                }
-                // Primary rows ↔ [X y] tail: Z_f′[Xy] row d at col j is s[(j, d·n_prim+f)]
-                // (intercept d=0 at col f), folded through Λ_p. Level-f s-columns
-                // hoisted once per family (unit-stride faer columns).
-                let mut s_cols: [&[f64]; MAX_PRIMARY_Q] = [&[]; MAX_PRIMARY_Q];
-                for (d, sc) in s_cols.iter_mut().enumerate().take(q) {
-                    *sc = suff
-                        .s
-                        .col(d * n_prim + f)
-                        .try_as_col_major()
-                        .unwrap()
-                        .as_slice();
-                }
-                for r in 0..q {
-                    let bcol = &mut fit.bt[(fb + r) * t_dim + kx..(fb + r) * t_dim + kx + m];
-                    for j in 0..m {
-                        let mut brj = 0.0;
-                        #[allow(clippy::needless_range_loop)]
-                        for d in r..q {
-                            brj += fit.prim_lam[d * q + r] * s_cols[d][j];
-                        }
-                        bcol[j] = brj;
-                    }
-                }
-                // Nested-child rows (q..q+np) — built at the shifted child RE col.
-                for c in 0..np {
-                    let gcol = n_prim * q + f * np + c; // prim_width + f·np + c
-                    let off = (fb + q + c) * t_dim;
-                    for b in 0..kx {
-                        fit.bt[off + b] = th_n * fit.lam_x[b] * suff.zx[(gcol, b)];
-                    }
-                    let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
-                    let bcol = &mut fit.bt[off + kx..off + kx + m];
-                    for j in 0..m {
-                        bcol[j] = th_n * scol[j];
-                    }
-                }
-            } else {
-                let s_f = suff.s.col(f).try_as_col_major().unwrap().as_slice();
-                let b0 = fb * t_dim;
-                for b in 0..kx {
-                    fit.bt[b0 + b] = th_p * fit.lam_x[b] * suff.zx[(f, b)];
-                }
-                {
-                    let bcol = &mut fit.bt[b0 + kx..b0 + kx + m];
-                    for j in 0..m {
-                        bcol[j] = th_p * s_f[j];
-                    }
-                }
-                for c in 0..np {
-                    let gcol = g.n_primary + f * np + c;
-                    let off = (fb + 1 + c) * t_dim;
-                    for b in 0..kx {
-                        fit.bt[off + b] = th_n * fit.lam_x[b] * suff.zx[(gcol, b)];
-                    }
-                    let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
-                    let bcol = &mut fit.bt[off + kx..off + kx + m];
-                    for j in 0..m {
-                        bcol[j] = th_n * scol[j];
-                    }
-                }
-            }
-            // Forward-solve L_f⁻¹ B_f in place on this family's Bt columns — axpy
-            // over contiguous t_dim-slices; per element the k-order subtractions
-            // and the final divide are unchanged from the old row-sweep (solved
-            // k<r values are final in both orders).
-            for r in 0..w {
-                let (done, rest) = fit.bt.split_at_mut((fb + r) * t_dim);
-                let col_r = &mut rest[..t_dim];
-                for k in 0..r {
-                    let l_rk = fit.fam_a[r * w + k];
-                    let col_k = &done[(fb + k) * t_dim..(fb + k + 1) * t_dim];
-                    for t in 0..t_dim {
-                        col_r[t] -= l_rk * col_k[t];
-                    }
-                }
-                let l_rr = fit.fam_a[r * w + r];
-                #[allow(clippy::needless_range_loop)]
-                for t in 0..t_dim {
-                    col_r[t] /= l_rr;
-                }
-            }
+            let bt_fam = &mut fit.bt[fb * t_dim..(fb + w) * t_dim];
+            assemble_fam_b(
+                bt_fam,
+                &fit.lam_x,
+                &fit.prim_lam,
+                suff,
+                f,
+                t_dim,
+                kx,
+                slope,
+                th_p,
+                th_n,
+            );
+            fam_forward_solve(bt_fam, t_dim, w, &fit.fam_a);
         }
 
         // --- one stacked downdate: Tail −= Σ_f B_f′B_f = Bt·Bt′ (lower) ---
@@ -2066,6 +2202,227 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
 }
 
 // ---------------------------------------------------------------------------
+// Conditional-mode recovery — once at θ̂, after β̂.
+// ---------------------------------------------------------------------------
+
+/// Recover the spherical conditional modes `û` at θ̂ into `fit.ranef_u`, setting
+/// `fit.ranef_ok`.
+///
+/// **Why this is a separate pass at all.** The profiled REML criterion is a
+/// determinant-and-quadratic-form identity computable straight off the factors,
+/// so no evaluation ever forms `u` — never forming it is what makes each
+/// evaluation cost O(clusters) instead of O(rows), and this does not touch that.
+/// The modes are recovered afterwards by back-substitution: with `[u; β]`
+/// solving the penalized least-squares system, eliminating β gives
+///
+/// ```text
+/// u = L_ZZ⁻ᵀ (U_y − U_X β̂),   U = L_ZZ⁻¹ Λ′Z′[X y]
+/// ```
+///
+/// and every input survives at convergence. What each evaluation DISCARDS is the
+/// per-family `L_f` and the tail factor, so this pass rebuilds them — one extra
+/// deviance evaluation's work against the 50–300 the θ-search already spent.
+///
+/// Caller contract: run AFTER the pin evaluation at θ̂ and after the β̂ backsolve
+/// and the standard-error block. `betas` must hold β̂; `fit.tail` (general path)
+/// or `fit.blocked_p` (crossed/nested-slopes path) must hold the state that
+/// evaluation left. Nothing on the fit path is read back afterwards, so this
+/// moves no reported estimate.
+pub(crate) fn recover_ranef(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch) {
+    fit.ranef_ok = false;
+    let k = suff.groupings.k_total;
+    if k == 0 || suff.n_rows == 0 {
+        return;
+    }
+    fit.ranef_u[..k].fill(0.0);
+    fit.ranef_ok = if suff.groupings.extra_slopes_any {
+        recover_ranef_blocked(theta, suff, fit)
+    } else {
+        recover_ranef_family(theta, suff, fit)
+    };
+}
+
+/// Recovery on the crossed/nested-slopes blocked path. `fit.blocked_p` still
+/// holds the UNFACTORED penalized augmented matrix at θ̂ (faer's `llt` builds a
+/// fresh factor rather than working in place), so one re-factorization hands
+/// back both halves at once: `L_ZZ` is its leading `k×k` block and `U` its
+/// `[X y]` rows, `U[a][j] = L[(k+j), a]`.
+fn recover_ranef_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> bool {
+    let _ = theta; // Λ is reconstructed by the caller; only the factor is read here
+    let g = &suff.groupings;
+    let m = suff.m;
+    let p = m - 1;
+    let k = g.k_total;
+    let dim = k + m;
+    let pref = faer::MatRef::from_column_major_slice(&fit.blocked_p[..dim * dim], dim, dim);
+    let Ok(chol) = pref.llt(faer::Side::Lower) else {
+        return false;
+    };
+    let l = chol.L();
+    // rhs = U_y − U_X β̂, then one upper-triangular back-substitution against
+    // L_ZZᵀ over the whole RE-column set.
+    let u = &mut fit.ranef_u;
+    for a in 0..k {
+        let mut acc = l[(k + p, a)];
+        for j in 0..p {
+            acc -= l[(k + j, a)] * fit.betas[j];
+        }
+        u[a] = acc;
+    }
+    for a in (0..k).rev() {
+        let mut acc = u[a];
+        for i in (a + 1)..k {
+            acc -= l[(i, a)] * u[i];
+        }
+        let laa = l[(a, a)];
+        if !(laa.is_finite() && laa > 0.0) {
+            return false;
+        }
+        u[a] = acc / laa;
+    }
+    true
+}
+
+/// Recovery on the family-blocked path (general dense AND balanced-collapse).
+///
+/// `L_ZZ` is `[[L_A, 0], [B_c, L_c]]` over `[families | crossed]`: block-diagonal
+/// per family, then the crossed tail. `fit.tail` holds the DOWNDATED tail
+/// `T − L21·L21ᵀ` that the evaluation factored, so re-factoring it recovers both
+/// `L_c` and the crossed rows of `U`. The families are rebuilt one at a time —
+/// the evaluation keeps only the last one's `L_f` — which is also why this arm
+/// serves the collapse path unchanged: collapse replaces the family LOOP with
+/// one representative `A(θ)` and a θ-independent Gram combine, but the per-family
+/// `A_f` it stands in for is exactly what [`assemble_fam_a`] rebuilds, and the
+/// tail it leaves behind is the same downdated tail.
+fn recover_ranef_family(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> bool {
+    let g = &suff.groupings;
+    let m = suff.m;
+    let p = m - 1;
+    let kf = g.k_family();
+    let kx = g.k_crossed();
+    let t_dim = kx + m;
+    let np = g.nested_per_parent;
+    let q_p = g.primary_q;
+    let w = q_p + np;
+    let n_prim = g.n_primary;
+    let th_p = theta[0];
+    let th_n = g.nested.map(|nf| theta[nf.vech_start]).unwrap_or(0.0);
+    let slope = q_p > 1;
+
+    // Refill the θ-derived scratch rather than trusting whichever arm ran last:
+    // the collapse arm never touches `prim_lam`, and both are cheap.
+    if slope {
+        primary_lambda(theta, q_p, &mut fit.prim_lam);
+    }
+    {
+        let mut b = 0usize;
+        for cf in &g.crossed {
+            for _ in 0..cf.n_levels {
+                fit.lam_x[b] = theta[cf.vech_start];
+                b += 1;
+            }
+        }
+    }
+
+    // --- crossed tail: û_x is final on its own, since L_ZZᵀ is block-UPPER and
+    // the crossed block is its last one. ---
+    let u_x = &mut fit.ranef_ux;
+    if kx > 0 {
+        let tail_ref =
+            faer::MatRef::from_column_major_slice(&fit.tail[..t_dim * t_dim], t_dim, t_dim);
+        let Ok(chol) = tail_ref.llt(faer::Side::Lower) else {
+            return false;
+        };
+        let l = chol.L();
+        for b in 0..kx {
+            let mut acc = l[(kx + p, b)];
+            for j in 0..p {
+                acc -= l[(kx + j, b)] * fit.betas[j];
+            }
+            u_x[b] = acc;
+        }
+        for b in (0..kx).rev() {
+            let mut acc = u_x[b];
+            for i in (b + 1)..kx {
+                acc -= l[(i, b)] * u_x[i];
+            }
+            let lbb = l[(b, b)];
+            if !(lbb.is_finite() && lbb > 0.0) {
+                return false;
+            }
+            u_x[b] = acc / lbb;
+        }
+        for (b, &v) in u_x.iter().enumerate() {
+            fit.ranef_u[kf + b] = v;
+        }
+    }
+
+    // --- families: L_Aᵀ û_fam = (U_y − U_X β̂) − B_cᵀ û_x, family by family. ---
+    let rhs = &mut fit.ranef_rhs;
+    for f in 0..n_prim {
+        assemble_fam_a(
+            &mut fit.fam_a,
+            &mut fit.prim_gram,
+            &fit.prim_lam,
+            suff,
+            f,
+            w,
+            th_p,
+            th_n,
+            slope,
+        );
+        if !crate::linalg::block_chol(&mut fit.fam_a[..w * w], w) {
+            return false;
+        }
+        // One family's columns of `bt` are scratch here — the fit is over and
+        // nothing reads the stacked couplings again. Family 0's slot serves
+        // every family, so this stays allocation-free at any cluster count.
+        let bt_fam = &mut fit.bt[..w * t_dim];
+        assemble_fam_b(
+            bt_fam,
+            &fit.lam_x,
+            &fit.prim_lam,
+            suff,
+            f,
+            t_dim,
+            kx,
+            slope,
+            th_p,
+            th_n,
+        );
+        fam_forward_solve(bt_fam, t_dim, w, &fit.fam_a);
+        for r in 0..w {
+            let col = &bt_fam[r * t_dim..(r + 1) * t_dim];
+            let mut acc = col[kx + p];
+            for j in 0..p {
+                acc -= col[kx + j] * fit.betas[j];
+            }
+            for (b, &ux) in u_x.iter().enumerate() {
+                acc -= col[b] * ux;
+            }
+            rhs[r] = acc;
+        }
+        for r in (0..w).rev() {
+            let mut acc = rhs[r];
+            for (i, &solved) in rhs.iter().enumerate().take(w).skip(r + 1) {
+                acc -= fit.fam_a[i * w + r] * solved;
+            }
+            rhs[r] = acc / fit.fam_a[r * w + r];
+        }
+        // Scatter into the RE-column layout `from_cluster_spec_ext` defines:
+        // primary component d at `d·n_primary + f`, nested child c at
+        // `prim_width + f·n_per + c` — change together.
+        for (r, &v) in rhs.iter().enumerate().take(q_p) {
+            fit.ranef_u[r * n_prim + f] = v;
+        }
+        for c in 0..np {
+            fit.ranef_u[q_p * n_prim + f * np + c] = rhs[q_p + c];
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // fit_lmm — BOBYQA θ-search + once-at-θ̂ recovery.
 // ---------------------------------------------------------------------------
 
@@ -2105,6 +2462,16 @@ pub struct LmmFit {
     /// `reml_deviance` value after the pin re-eval). NaN only on
     /// optimizer/numerical failure — finite on a `MaxFunReached` endpoint.
     pub deviance: f64,
+    /// Scale-invariant per-column pivot ratio of X'V⁻¹X at θ̂
+    /// ([`crate::ols::min_pivot_ratio`]), with `pivot_col` the column attaining
+    /// it. **Detection only** — no branch in this route reads it, and none may
+    /// start to; see the measurement recorded at the computation site. Below
+    /// [`PIVOT_MIN`] the coefficients are barely identified and the diagnostics
+    /// channel says so. NaN when the deviance re-eval left no trustworthy
+    /// factor to measure.
+    pub pivot: f64,
+    /// Column attaining `pivot`. Meaningless when `pivot` is NaN.
+    pub pivot_col: u32,
 }
 
 /// Fit by BOBYQA minimisation of the REML profiled deviance over the box-
@@ -2116,7 +2483,8 @@ pub struct LmmFit {
 /// `theta_start`: `None` → blind start (diagonals THETA0, off-diagonals 0,
 /// the default for arbitrary provided bytes); `Some(θ₀)` → per-component spec-derived truth
 /// start, `[primary, extras in declaration order]` (Y is always synthetic, so
-/// true θ_g = τ_g/σ is known), each component clamped to THETA_TRUTH_FLOOR. A
+/// true θ_g = τ_g/σ is known), with diagonal components clamped to
+/// THETA_TRUTH_FLOOR and off-diagonals passed through verbatim. A
 /// per-scenario constant — determinism and chunk merging are unaffected. The
 /// DGP-derived hint is a deliberate, recorded exception to the
 /// generation↔estimation split.
@@ -2164,7 +2532,8 @@ fn fit_lmm_impl(
 
     // Cold start per fit (no warm-start across sims — would re-import
     // cross-grid-point path dependence). A Some-start is clamped to the
-    // floor; under the fixed RHO_BEGIN, PRIMA's start-projection may still
+    // floor on its diagonal coordinates only (off-diagonals pass through
+    // verbatim); under the fixed RHO_BEGIN, PRIMA's start-projection may still
     // move a small start to rho_begin off the 0 bound — benign and
     // deterministic. The scaled schedule (rho_begin = 0.1·θ₀) that makes
     // small starts pay off is activation at workspace-construction time: rho
@@ -2174,7 +2543,10 @@ fn fit_lmm_impl(
         Some(ts) => {
             debug_assert_eq!(ts.len(), theta.len());
             for (t, &v) in theta.iter_mut().zip(ts) {
-                *t = v.max(THETA_TRUTH_FLOOR);
+                *t = v;
+            }
+            for &i in suff.groupings.diagonal_theta() {
+                theta[i] = theta[i].max(THETA_TRUTH_FLOOR);
             }
         }
         None => {
@@ -2232,7 +2604,9 @@ fn fit_lmm_impl(
                 theta[ti] = 0.0;
                 if converged {
                     pinned = true;
-                    pinned_components |= 1u64 << k;
+                    if k < u64::BITS as usize {
+                        pinned_components |= 1u64 << k;
+                    }
                 }
             }
         }
@@ -2246,10 +2620,31 @@ fn fit_lmm_impl(
         f64::INFINITY
     };
 
-    // Rank guard on the p×p block — mirrors lme.rs's EPS_RANK min/max-diag
-    // test on the pinning factor.
-    let degenerate = !dev.is_finite() || chol_rank_deficient(fit.factor.as_ref(), p, EPS_RANK);
-    if !has_endpoint || degenerate {
+    // Ill-conditioning DETECTION on the leading p×p block of the augmented
+    // factor, i.e. on X'V⁻¹X at θ̂. This route does not refuse at any pivot
+    // value, and nothing below may start to. Two measured reasons
+    // (2026-07-31, a 1-ULP perturbation sweep down past total loss of β̂):
+    //
+    //   * The standard errors stay truthful all the way down. They are stable
+    //     under the perturbation to ~1e-5 relative at rungs where β̂ moves by
+    //     100%, and they never understate the actual error — at the bottom they
+    //     over-cover by four orders. A caller reading the SE can always tell the
+    //     estimate is worthless, so refusing destroys information for no gain.
+    //   * On this route the pivot statistic itself floors out: below a certain
+    //     conditioning it stops tracking and wanders in [4.6e-16, 8.2e-15] while
+    //     β̂ keeps degrading. No refuse threshold is constructible from it.
+    //
+    // `dev.is_finite()` still gates the measurement: a ModelDegenerate exit, or
+    // a θ̂ whose deviance re-eval is non-finite, leaves no trustworthy factor.
+    // Those two remain the only NaN-fill conditions, and they are what they
+    // always were — no honest endpoint at all.
+    let (pivot, pivot_col) = if dev.is_finite() {
+        crate::ols::min_pivot_ratio(fit.factor.as_ref(), p)
+    } else {
+        (f64::NAN, 0)
+    };
+    if !has_endpoint || !dev.is_finite() {
+        fit.ranef_ok = false;
         for v in fit.betas.iter_mut() {
             *v = f64::NAN;
         }
@@ -2265,6 +2660,8 @@ fn fit_lmm_impl(
             joint_t_sq: f64::NAN,
             pinned_components: 0,
             deviance: f64::NAN,
+            pivot,
+            pivot_col: pivot_col as u32,
         };
     }
 
@@ -2331,6 +2728,11 @@ fn fit_lmm_impl(
         )
     };
 
+    // Conditional modes, last: it reads β̂ and reuses `fit.tail`/`fit.bt`/
+    // `fit.fam_a` as scratch, so it must come after every step that reads the
+    // factor state the θ̂ evaluation left.
+    recover_ranef(theta, suff, fit);
+
     LmmFit {
         sigma_sq,
         converged,
@@ -2339,6 +2741,8 @@ fn fit_lmm_impl(
         joint_t_sq,
         pinned_components,
         deviance: dev,
+        pivot,
+        pivot_col: pivot_col as u32,
     }
 }
 
@@ -2541,10 +2945,11 @@ mod tests {
         ws.suff.add_rows(x.as_ref(), &y, &ids);
         let n_theta = ws.theta.len();
         let npt = 2 * n_theta + 1; // n_theta == 1 here: PRIMA's minimum npt
-        let config = Config {
-            npt,
-            max_fun: npt + 1,
-            ..Config::new(n_theta)
+        let config = {
+            let mut c = Config::new(n_theta);
+            c.npt = npt;
+            c.max_fun = npt + 1;
+            c
         };
         ws.solver = Bobyqa::new(n_theta, config).expect("legal minimal config");
 
@@ -2691,11 +3096,20 @@ mod tests {
         assert!(ws.fit.betas[1].is_finite());
     }
 
-    /// Rank deficiency fails cleanly: x2 = 0.1·x1 (the scaled-duplicate fixture —
-    /// exact duplicates can slip through faer's llt grey zone) must produce a
-    /// non-converged, NaN-filled fit with boundary_hit == 2.
+    /// Rank deficiency is DETECTED, not refused, at kernel level: x2 = 0.1·x1
+    /// (the scaled-duplicate fixture — exact duplicates can slip through faer's
+    /// llt grey zone) returns a fit whose `pivot` records the exhaustion and
+    /// names the offending column.
+    ///
+    /// This kernel entry point is below the alias gate, which is what actually
+    /// handles a design like this: through `fit_cold`/`fit_warm` the duplicate
+    /// column is dropped before the solver runs and the caller gets a clean
+    /// `p−1` fit with `aliased[2]`, matching R. `fit_lmm` called directly does
+    /// not NaN-fill — it hands back the numbers together with the statistic
+    /// that condemns them, and the standard error it reports (~9e7 on a
+    /// coefficient of 11.5) is truthful.
     #[test]
-    fn rank_deficient_design_fails_cleanly() {
+    fn rank_deficient_design_is_flagged_not_refused() {
         let n = 48usize;
         let n_clusters = 6usize;
         let mut st = 11u64;
@@ -2713,10 +3127,24 @@ mod tests {
         let mut ws = LmmWorkspace::new(3, n_clusters);
         ws.suff.add_rows(x.as_ref(), &y, &ids);
         let fit = fit_lmm(&mut ws, &[1, 2], None);
-        assert!(!fit.converged);
-        assert_eq!(fit.boundary_hit, 2);
-        assert!(ws.fit.betas.iter().all(|b| b.is_nan()));
-        assert!(ws.fit.t_sq[1].is_nan() && ws.fit.t_sq[2].is_nan());
+        assert!(
+            fit.pivot < PIVOT_MIN,
+            "the duplicate column must be detected, got pivot {}",
+            fit.pivot
+        );
+        assert_eq!(
+            fit.pivot_col, 2,
+            "the LATER column of the duplicated pair is the one named"
+        );
+        // The SE is what makes the returned numbers safe: Var(β̂₂) ~ 8e15, so
+        // the coefficient is reported with an error eight orders larger than
+        // itself. That is the channel a caller reads, and it does not lie.
+        assert!(
+            ws.fit.var_diag[2].sqrt() > 1e6 * ws.fit.betas[2].abs(),
+            "β̂₂ = {} must carry an SE orders above it, got {}",
+            ws.fit.betas[2],
+            ws.fit.var_diag[2].sqrt()
+        );
     }
 
     /// A truth-started fit (`theta_start: Some`) reaches the same answer as the
@@ -2752,8 +3180,9 @@ mod tests {
 
     /// Bounded-allocation warm-path twin of lme.rs's
     /// `lme_fit_warm_path_bounded_alloc`. Marked #[ignore] because dhat measures
-    /// process-wide allocations and concurrent tests contaminate the count:
-    ///   cargo test -p glmm --features alloc-tests lmm_fit_warm_path_bounded_alloc -- --ignored --test-threads=1
+    /// process-wide allocations; `alloc_test_guard` serializes it against the
+    /// other `#[ignore]` tests:
+    ///   cargo test -p glmm --features alloc-tests lmm_fit_warm_path_bounded_alloc -- --ignored
     ///
     /// BOUND locks the measured warm-path block count. LmmWorkspace itself is
     /// allocation-free across fits (Bobyqa::new is the only solver allocation,
@@ -2770,8 +3199,9 @@ mod tests {
     #[test]
     #[ignore]
     fn lmm_fit_warm_path_bounded_alloc() {
+        let _serial = crate::test_support::alloc_test_guard();
         const N_CALLS: usize = 100;
-        const BOUND: u64 = 4800; // Measured 4600 (this machine) — ~46 blocks/fit of faer `llt` internals on the family-blocked q=1 path (one m×m tail llt per eval). `fit_lmm` no longer allocates per fit (the diagonal_theta index map is cached once on LmmGroupings), so this count is purely faer's Cholesky internals — faer-version/machine specific. q=1 deviance is byte-identical to the hand-rolled augmented-factor deviance (held by the lmm_parity corpus + golden_rng), so the eval trajectory is unchanged; the count differs from the prior 3804 only because faer's blocked llt allocates more per eval than the hand-rolled augmented factor. If faer changes its Cholesky internals, update — do not relax.
+        const BOUND: u64 = 4800; // Measured 4600 (this machine) — ~46 blocks/fit of faer `llt` internals on the family-blocked q=1 path (one m×m tail llt per eval). `fit_lmm` no longer allocates per fit (the diagonal_theta index map is cached once on LmmGroupings; the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields), so this count is purely faer's Cholesky internals — faer-version/machine specific. q=1 deviance is byte-identical to the hand-rolled augmented-factor deviance (held by the lmm_parity corpus + golden_rng), so the eval trajectory is unchanged; the count differs from the prior 3804 only because faer's blocked llt allocates more per eval than the hand-rolled augmented factor. If faer changes its Cholesky internals, update — do not relax.
 
         let (x, y, ids) = hand_dataset();
         let targets: Vec<u32> = vec![1, 2];
@@ -3422,8 +3852,9 @@ mod tests {
     #[test]
     #[ignore]
     fn lmm_fit_general_warm_path_bounded_alloc() {
+        let _serial = crate::test_support::alloc_test_guard();
         const N_CALLS: usize = 100;
-        const BOUND_GENERAL: u64 = 8400; // Measured 8000 (this machine) — ~80 blocks/fit truth-started (scaled rho + spec-derived start; the few-eval regime the production path runs). Per-eval faer `llt` internals only: the family loop is hand-rolled zero-alloc and the cached diagonal_theta map removed the per-fit Vec, so this count is faer-version/machine specific. If faer changes its Cholesky internals, update — do not relax.
+        const BOUND_GENERAL: u64 = 8400; // Measured 8000 (this machine) — ~80 blocks/fit truth-started (scaled rho + spec-derived start; the few-eval regime the production path runs). Per-eval faer `llt` internals only: the family loop is hand-rolled zero-alloc, the cached diagonal_theta map removed the per-fit Vec, and the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields, so this count is faer-version/machine specific. If faer changes its Cholesky internals, update — do not relax.
 
         let (x, y, pid, eids, cluster) = multi_dataset(true, 2);
         let targets: Vec<u32> = vec![1, 2];
@@ -3462,6 +3893,7 @@ mod tests {
     #[test]
     #[ignore]
     fn lmm_fit_crossed_slope_warm_path_bounded_alloc() {
+        let _serial = crate::test_support::alloc_test_guard();
         const N_CALLS: usize = 100;
         // Measured ~46100 (this machine, faer 0.x): ~460 blocks/fit = the dim≈31
         // tail `llt` internals × the ~50–90 BOBYQA evals of a 6-θ fit. ALL faer-
@@ -4615,6 +5047,10 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_crossed_slope_golden_csv() {
+        // Serialized under alloc-tests so its allocations can't land in a
+        // concurrent dhat profiler window on an `-- --ignored` run.
+        #[cfg(feature = "alloc-tests")]
+        let _serial = crate::test_support::alloc_test_guard();
         let (x, y, pid, eid) = crossed_slope_golden_dataset();
         let mut s = String::from("x1,y,pid,eid\n");
         for i in 0..y.len() {
@@ -4761,13 +5197,14 @@ mod tests {
     /// Bounded-allocation twin — the standalone slope workspace
     /// allocates only faer `llt` internals on the warm `fit_lmm` loop, the same
     /// acceptance class as the q=1 / general twins.
-    ///   cargo test -p glmm --features alloc-tests lmm_fit_slope_warm_path_bounded_alloc -- --ignored --test-threads=1
+    ///   cargo test -p glmm --features alloc-tests lmm_fit_slope_warm_path_bounded_alloc -- --ignored
     #[cfg(feature = "alloc-tests")]
     #[test]
     #[ignore]
     fn lmm_fit_slope_warm_path_bounded_alloc() {
+        let _serial = crate::test_support::alloc_test_guard();
         const N_CALLS: usize = 100;
-        const BOUND_SLOPE: u64 = 12000; // Measured 11400 (this machine) — ~114 blocks/fit of faer `llt` internals (one m×m tail llt per eval × ~54 evals on the blind 3-D q_p=2 surface; the family loop + primary Λ/Gram are zero-alloc scratch, and the cached diagonal_theta map removed the per-fit Vec). Higher total than q=1's 4600 only via the larger blind eval count, not a richer per-eval alloc — faer-version/machine specific. If faer's Cholesky internals change, update — do not relax.
+        const BOUND_SLOPE: u64 = 12000; // Measured 11400 (this machine) — ~114 blocks/fit of faer `llt` internals (one m×m tail llt per eval × ~54 evals on the blind 3-D q_p=2 surface; the family loop + primary Λ/Gram are zero-alloc scratch, the cached diagonal_theta map removed the per-fit Vec, and the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields). Higher total than q=1's 4600 only via the larger blind eval count, not a richer per-eval alloc — faer-version/machine specific. If faer's Cholesky internals change, update — do not relax.
 
         let (x, y, ids) = slope_dataset();
         let targets: Vec<u32> = vec![1];

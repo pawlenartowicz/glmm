@@ -52,10 +52,32 @@ import glmm
 # (python/pyproject.toml), so this is glmm.rs's CARGO_PKG_VERSION by construction.
 VERSION = version("glmm")
 
-# Timing loop: first (cold) pass discarded, MEDIAN of the rest reported — the same
-# convention and count as glmm.rs's N_RUNS (change together), so the two engines'
-# medians are comparable without renormalizing.
-N_RUNS = 10
+# Timing is OPT-IN and its sample count lives in run.sh, not here, so the engines'
+# medians are comparable without renormalizing and no mirrored constant has to be
+# kept in step across the five.
+#
+# THE contract, mirrored in glmm.rs / lme4.R / mixedmodels.jl / glmm_r.R
+# `timing_runs` — change together: VALIDATION_TIMINGS unset / "" / "0" means do not
+# time (`timing` is written null); otherwise it IS the sample count, an integer >= 2,
+# first (cold) pass discarded, MEDIAN of the rest. run.sh validates the value; this
+# raises rather than silently skipping timing when run by hand with a malformed one.
+def timing_runs():
+    v = os.environ.get("VALIDATION_TIMINGS", "").strip()
+    if v in ("", "0"):
+        return None
+    try:
+        n = int(v)
+    except ValueError:
+        n = -1
+    if n < 2:
+        raise SystemExit(
+            f"VALIDATION_TIMINGS must be 0 or an integer >= 2 (got {v!r}); "
+            "N=2 keeps 1 sample after the warm-up discard"
+        )
+    return n
+
+
+N_RUNS = timing_runs()  # None on an untimed run
 
 # Suite directory (manifest + data + results root). Mirrors glmm.rs's suite_dir().
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -100,7 +122,7 @@ def _is_float(s):
 def build_data(header, rows, factors):
     """Columns keyed by name, typed the way common.rs::build_table types
     them: manifest `factors` are categorical, as is any column that fails to parse
-    as f64 anywhere (Pastes' `cask` — carried in the CSV, referenced by no formula).
+    as f64 anywhere (Pastes' `sample` — carried in the CSV, referenced by no formula).
 
     A str column reaches `glmm.fit` as a factor with lexicographic levels, which is
     exactly `Column::factor_from_labels` (R's `factor()` default, and what the
@@ -296,7 +318,7 @@ def fit_one(spec):
         # fixed-only GLM (weights suite) has no theta, so the Rx-vs-Hessian split is
         # moot. Emitted in the slot glmm.rs uses for each — `se` for gaussian, `se_rx`
         # for fixed-only — so compare.R lines them up with the other engines.
-        timing = {
+        timing = None if N_RUNS is None else {
             "fit_seconds_median": median_secs(
                 timing_batch, lambda: glmm.fit(data, formula, family, wald_se="hessian", **kw)
             ),
@@ -319,7 +341,7 @@ def fit_one(spec):
         fr_fit = glmm.fit(data, formula, family, wald_se="rx", **kw)
         # Split timing by SE method — the FD-Hessian is the main time consumer, Rx is
         # one closed-form Schur solve. Same PIRLS fit underlies both.
-        timing = {
+        timing = None if N_RUNS is None else {
             "fit_seconds_median_rx": median_secs(
                 timing_batch, lambda: glmm.fit(data, formula, family, wald_se="rx", **kw)
             ),
@@ -370,9 +392,12 @@ def write_result(ds, source, res):
     with open(out, "w") as fh:
         json.dump(res, fh, indent=2, allow_nan=False)
         fh.write("\n")
-    t = res["timing"].get("fit_seconds_median", res["timing"].get("fit_seconds_median_rx"))
+    # `timing` is None on an untimed run — the console line then omits the time.
+    tm = res["timing"] or {}
+    t = tm.get("fit_seconds_median", tm.get("fit_seconds_median_rx"))
     print(
-        f"glmm_py  {ds:<12}  rung {res['rung']}  converged={res['converged']}  fit_median={t:.4f}s",
+        f"glmm_py  {ds:<12}  rung {res['rung']}  converged={res['converged']}"
+        + ("" if t is None else f"  fit_median={t:.4f}s"),
         flush=True,
     )
 

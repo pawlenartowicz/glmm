@@ -336,42 +336,86 @@ isSingular.fastglmm <- function(x, ...) x$singular
 # silently different answer. ----------------------------------------------
 
 .engine_blocked <- function(what) {
-  stop(what, " is engine-blocked: glmm::Fit does not surface the conditional ",
-       "modes / linear predictor yet (engine spec ",
-       "2026-07-15-engine-loglik-diagnostics). Fixed effects: fixef().",
+  stop(what, " is not available: it needs a design matrix built from rows the ",
+       "fit never saw, and the formula machinery is Rust-side. Fixed effects: ",
+       "fixef(). Conditional modes: ranef(). Fitted values: fitted().",
        call. = FALSE)
 }
 
-#' Random-effect predictions (not available)
+#' Random-effect conditional modes
 #'
-#' Errors: conditional modes are computed inside the kernel but not surfaced
-#' on `glmm::Fit` yet. The engine spec
-#' `2026-07-15-engine-loglik-diagnostics` is what lifts this.
+#' The conditional modes (BLUPs) `b-hat`, in `lme4::ranef`'s shape: a named list
+#' of data frames, one per grouping factor in the order the formula declares
+#' them, with one row per level and one column per random-effect term.
+#'
+#' The labels come from the kernel, not from this package: which internal layout
+#' a grouping factor lands in is a data-dependent speed decision, so only the
+#' layer that made it can say which level a number belongs to. Padded slots of a
+#' nested grouping carry no level and are not reported.
+#'
+#' Two differences from `lme4::ranef` worth knowing. Conditional variances are
+#' not computed, so `condVar` is not supported. And a grouping level that owns
+#' model width but no rows is reported with its mode shrunk to zero, where lme4
+#' has no such row at all; the fit warns about that case
+#' (`fastglmm_unused_grouping_levels`).
 #'
 #' @param object a [fastglmm] fit.
 #' @param ... unused.
+#' @return A named `list` of `data.frame`s, empty for a fit with no random
+#'   effects or one that did not converge.
 #' @export
 ranef <- function(object, ...) UseMethod("ranef")
 
 #' @rdname ranef
 #' @export
-ranef.fastglmm <- function(object, ...) .engine_blocked("ranef()")
+ranef.fastglmm <- function(object, ...) {
+  blocks <- object$ranef_blocks
+  out <- lapply(blocks, function(b) {
+    # `values` arrives row-major (level-major, terms within a level), which is
+    # byrow = TRUE for R's column-major matrix().
+    m <- matrix(as.double(b$values), nrow = length(b$levels),
+                ncol = length(b$terms), byrow = TRUE,
+                dimnames = list(b$levels, b$terms))
+    as.data.frame(m, stringsAsFactors = FALSE)
+  })
+  names(out) <- vapply(blocks, function(b) b$group, character(1))
+  out
+}
 
 #' @export
 predict.fastglmm <- function(object, ...) .engine_blocked("predict()")
 
+#' Fitted values
+#'
+#' The conditional means `mu-hat` per row of the model frame - `lme4::fitted`'s
+#' quantity, including the random-effect contribution and any offset, on the
+#' response scale.
+#'
+#' @param object a [fastglmm] fit.
+#' @param ... unused.
+#' @return A named numeric vector, named by the model frame's row names. Empty
+#'   for a fit that did not converge.
 #' @export
-fitted.fastglmm <- function(object, ...) .engine_blocked("fitted()")
+fitted.fastglmm <- function(object, ...) {
+  v <- as.double(object$fitted)
+  if (length(v) == nrow(object$frame)) names(v) <- rownames(object$frame)
+  v
+}
 
 #' @export
-residuals.fastglmm <- function(object, ...) .engine_blocked("residuals()")
+residuals.fastglmm <- function(object, ...) {
+  stop("residuals() is not implemented: lme4's `type` argument selects between ",
+       "deviance, pearson, working and response residuals, and guessing which ",
+       "one you meant would silently differ from what the same call gives in ",
+       "lme4. Compute them from fitted() and the response.", call. = FALSE)
+}
 
 #' @export
 coef.fastglmm <- function(object, ...) {
   stop("coef() is not implemented: lme4's coef() means fixed + random ",
-       "effects per group, which needs ranef() (engine-blocked); returning ",
-       "fixed effects only would silently differ from what an lme4 user ",
-       "expects from the same call. Use fixef().", call. = FALSE)
+       "effects per group, and returning fixed effects only would silently ",
+       "differ from what an lme4 user expects from the same call. Combine ",
+       "fixef() and ranef(), or use fixef() alone.", call. = FALSE)
 }
 
 #' Log-likelihood of a fastglmm fit

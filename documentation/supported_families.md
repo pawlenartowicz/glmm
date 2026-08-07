@@ -7,7 +7,7 @@ family dispatch.
 
 | Family | Links | Canonical | Fixed-only | Mixed | Validated against |
 |---|---|---|---|---|---|
-| `Gaussian` | identity (implicit) | yes | OLS | LMM (REML/MLE) | R `lm` / `lme4::lmer` |
+| `Gaussian` | identity (implicit) | yes | OLS | LMM (REML) | R `lm` / `lme4::lmer` |
 | `Binomial` | `Logit`, `Probit` | `Logit` | logistic/probit GLM | GLMM | R `glm(binomial)` / `lme4::glmer` |
 | `Poisson` | `Log` | yes | GLM | GLMM | R `glm(poisson)` / `lme4::glmer` (goldens `grouseticks_glm`, `grouseticks`) |
 | `Gamma` | `Log`, `Inverse` | neither¹ | GLM | GLMM | R `glm(Gamma(link))` / `lme4::glmer(Gamma)` (goldens `sim_gamma_*`) |
@@ -48,6 +48,9 @@ mixed models go through PIRLS with Laplace/AGQ
 - Dispersion is fixed at `φ ≡ 1` for Binomial, Poisson, and NB (NB
   overdispersion lives in `θ`, not `φ`).
 - **Prior (case) weights** (`FitOptions::weights`) are honored on every family
-  above, fixed-only and mixed alike, at `nagq == 1`; AGQ (`nagq > 1`) rejects
-  weights at the boundary. See `FitOptions::weights`'s rustdoc for the exact
-  per-path convention and oracle citations.
+  above, fixed-only and mixed alike, at any `nagq`, including AGQ (`nagq > 1`)
+  on the binomial/Poisson shapes it covers. See `FitOptions::weights`'s
+  rustdoc for the exact per-path convention and oracle citations.
+- **Offset** (`FitOptions::offset`) is honored on every family above,
+  fixed-only and mixed alike, at any `nagq`. See `FitOptions::offset`'s
+  rustdoc for the exact convention.

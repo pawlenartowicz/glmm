@@ -3,26 +3,28 @@
 One page, four sections. The first walks the single entry point — `glmm.fit` —
 end to end; the next two go deeper into the knobs and the returned `Fit`; the
 fourth is a short note on warm starts. The Python surface is deliberately tiny:
-**two public names**, `glmm.fit` and `glmm.Fit`. Everything else (families,
-links, knobs) is a string or scalar argument, not a type.
+**six public names**, `glmm.fit`, `glmm.Fit`, and the four warning categories
+the diagnostics channel raises — `glmm.DiagnosticWarning` (the base) plus
+`glmm.IllConditionedWarning`, `glmm.PirlsExhaustedWarning` and
+`glmm.UnusedGroupingLevelsWarning`. Everything else (families, links, knobs)
+is a string or scalar argument, not a type.
 
 > **Status:** this release ships the full API surface — signatures, argument
 > validation, `Fit`, `summary()` — wired end to end through the PyO3 binding:
 > a valid `fit(...)` call parses the formula, fits, and returns a real `Fit`.
-> Four narrow combinations are GLMM 0.1.1 gaps and raise a clean
-> `NotImplementedError` instead: `family="inversegaussian"`, `link="cloglog"`,
-> quasi-likelihood `dispersion=` on binomial/poisson, and an `init_theta=`
-> float seed (see §2).
+> Four narrow combinations are open gaps and raise a clean `NotImplementedError`
+> instead: `family="inversegaussian"`, `link="cloglog"`, quasi-likelihood
+> `dispersion=` on binomial/poisson, and an `init_theta=` float seed (see §2).
 
-The package is not on PyPI yet. Install from the repo:
+Install from PyPI:
 
 ```bash
-pip install ./python            # from the repo root; add -e for development
+pip install glmm
 ```
 
-(For the Rust crate this package ports, see [`TUTORIAL-RUST.md`](TUTORIAL-RUST.md)
+(For the Rust crate this package ports, see [`tutorial-rust.md`](tutorial-rust.md)
 — same models, hand-built inputs instead of a formula — and for the R port,
-[`TUTORIAL-R.md`](TUTORIAL-R.md).)
+[`tutorial-r.md`](tutorial-r.md).)
 
 ## 1. One call — formula in, `Fit` out
 
@@ -37,6 +39,7 @@ import glmm
 data = {
     "y":     [1.02, 1.05, 1.11, 1.13, 1.21, 1.24, 1.30, 1.33, 1.42, 1.44, 1.51, 1.53],
     "x1":    [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1],
+    "s":     [0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1],
     "group": ["a", "a", "b", "b", "c", "c", "d", "d", "e", "e", "f", "f"],
 }
 
@@ -76,19 +79,19 @@ string only where the kernel offers a choice:
 | `family` | default link | other links | distribution params |
 |---|---|---|---|
 | `gaussian` | identity | — | — |
-| `binomial` | `logit` | `probit`, `cloglog` | — |
+| `binomial` | `logit` | `probit`; `cloglog` not yet available (see status above) | — |
 | `poisson` | `log` | — | — |
 | `gamma` | `log` | `inverse` | `dispersion` |
 | `negativebinomial` | `log` | — | `theta` |
-| `inversegaussian` | `log` | `inverse_squared` | `dispersion` |
+| `inversegaussian` | not yet available (see status above) | — | — |
 
 ```python
 fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
 ```
 
-- `dispersion` — three states. `None` (default): gamma / inverse-gaussian
-  estimate φ̂ post-fit by Pearson and scale SE by √φ̂; other families hold
-  φ ≡ 1. `"estimate"`: force the Pearson estimate — on binomial/poisson this
+- `dispersion` — three states. `None` (default): gamma estimates φ̂ post-fit
+  by Pearson and scales SE by √φ̂; other families hold φ ≡ 1. `"estimate"`:
+  force the Pearson estimate — on binomial/poisson this
   *is* quasi-binomial/quasi-Poisson, GLM only. A float: hold φ fixed (still
   scales SE). Fix-vs-estimate, not a warm start.
 - `nagq` — adaptive Gauss–Hermite node count; `1` = Laplace (default). Must
@@ -107,6 +110,13 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
 - `weights` — per-row prior (case) weights, lme4's `weights=`. For an
   aggregated binomial, `y` is the success *proportion* and `weights` the
   trial count (lme4's `cbind(s, m−s)`).
+- `offset` — per-row known additive term on the linear-predictor scale, R's
+  `offset=`: `eta = offset + X*beta (+ Z*b)`, with no coefficient estimated
+  for it and no column added to the design. The canonical use is a Poisson
+  rate model against a known exposure, `offset = np.log(exposure)`. Honored
+  for every family and every solver path; `None` (default) means no offset.
+  The formula's `offset()` term is still rejected (see
+  [`formula.md`](formula.md)) — pass the array here instead.
 
 **Error vs. warning.** An *invalid* value — unknown family, a link the family
 doesn't offer, even `nagq` (`ValueError`), a non-dict `warm_start`
@@ -114,8 +124,7 @@ doesn't offer, even `nagq` (`ValueError`), a non-dict `warm_start`
 gaussian, `init_theta=` off negative-binomial, quasi-dispersion on a mixed
 binomial/poisson formula — warns (`UserWarning`) and is stripped, so it never
 reaches the kernel: loud enough to catch the mistake, lenient enough for
-exploration. One combination is a hard error rather than a warning:
-`inversegaussian` is GLM-only, so a mixed formula with it raises.
+exploration. `inversegaussian` is not yet implemented (see status above).
 
 ## 3. Reading the result — `Fit`
 
@@ -132,12 +141,35 @@ them). It is returned by `fit`, never constructed by callers.
 | `varcorr` | per grouping: vech-packed lower-triangular RE covariance D̂ |
 | `tau2` | legacy per-element RE variances (q=1 only) — prefer `varcorr` |
 | `stddev_se` | SE of each RE stddev, θ layout (not beta-aligned); `NaN` where unavailable |
-| `dispersion` | φ (gamma / inverse-gaussian) / θ (negbin) / 1.0 otherwise |
+| `dispersion` | φ (gamma) / θ (negbin) / 1.0 otherwise |
 | `re_groups` | per grouping, in `varcorr` order: `(name, [term names])` — what `summary()` labels the RE block with |
 | `n_eval` | optimizer objective evaluations (0 on the closed-form/IRLS paths) |
 | `deviance` | minimized optimizer criterion — **not** comparable across models, and not an AIC input (see below) |
+| `loglik` | log-likelihood on `logLik()`'s scale (R/lme4); the REML criterion for an LMM (see `reml`), the ordinary log-likelihood for OLS/GLM/GLMM; `NaN` wherever `deviance`'s failure modes apply |
+| `df` | parameters counted for AIC/BIC: retained fixed effects + RE parameters + 1 if the family estimates a dispersion/scale; `0` on degenerate NaN-fill paths |
+| `reml` | `True` iff `loglik` is a REML criterion rather than an ML log-likelihood (the Gaussian LMM paths) — AIC/LRT comparisons across fits with different fixed effects are invalid when this is set |
+| `fitted` | `(n,)` fitted means μ̂ per row; empty on non-converged fits |
+| `ranef` | random-effect conditional modes b̂, one block per grouping in `varcorr`/`re_groups` order, level-major; empty on non-converged fits — prefer `ranef_blocks` for the labelled form, and do not slice this array yourself |
+| `ranef_levels` | level count per grouping, for slicing `ranef`; empty exactly when `ranef` is |
+| `ranef_blocks` | the same conditional modes, labelled: a list of dicts per grouping (`group`, `terms`, `levels`, `values`); empty exactly when `ranef` is |
 | `converged` | numerical failure signals here (not an exception) — check before trusting `beta`/`se` |
 | `singular` | boundary (singular) fit — `>=1` RE variance component pinned at 0; mirrors lme4's `isSingular` |
+| `diagnostics` | dict with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; `converged`/`singular`/`aliased` above are `@property` forwarders over `diagnostics[...]`, kept at the top level for the most-read fields |
+
+**Diagnostic warnings.** `fit` raises a warning for each `note` the kernel
+records — today only ill-conditioning, as `IllConditionedWarning`, a subclass
+of the base category `DiagnosticWarning`. A design that is merely
+ill-conditioned (near-collinear but still distinguishable in f64) is fitted
+and returns real numbers; the warning is how you find out its standard
+errors are honest but large. Filter the whole channel, or just the one
+category:
+
+```python
+import warnings
+
+warnings.filterwarnings("ignore", category=glmm.DiagnosticWarning)      # all diagnostics
+warnings.filterwarnings("ignore", category=glmm.IllConditionedWarning)  # just this one
+```
 
 **`deviance` is not a model-comparison statistic.** It is the criterion the
 optimizer minimized, on that fit's own scale: for an LMM it is lme4's

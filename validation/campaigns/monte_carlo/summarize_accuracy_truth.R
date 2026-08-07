@@ -2,7 +2,8 @@
 # the paper's exact aggregation, and place glmm beside the frozen Table 4/5.
 # Prints a compact per-batch block to the console and writes the full artifacts.
 #
-# Per cell, over good-converged reps: cell mean estimate and cell RMSE per param.
+# Per cell, over same-rule converged reps (boundary included, see summarize_arm):
+# cell mean estimate and cell RMSE per param.
 # Grand average across cells: bias = mean_cells |cellmean-true|, rmse =
 # mean_cells sqrt(mean_reps (est-true)^2). tau1/rho01 exist only on slope cells,
 # so na.rm averages them over those cells only (matches 03_GatherResults.R).
@@ -26,26 +27,22 @@ summarize_arm <- function(dir, arm, cells = NULL) {
     d <- read.csv(f); d <- d[d$rep <= CAP, , drop = FALSE]
     cid <- sub(sprintf("__%s\\.csv$", arm), "", basename(f))
     slope <- grepl("rdis$", cid)
-    # singular: prefer the engine's own flag; derive identically if absent.
-    sing <- if ("singular" %in% names(d) && !all(is.na(d$singular))) d$singular %in% TRUE
-            else derive_singular(d, slope)
-    conv <- d$good %in% TRUE
     err <- d$err %in% TRUE
-    bound <- sing & !err   # boundary/singular MLE (!err: on slope cells derive_singular
-                           # flags every errored rep via rho01=NA; the guard excludes them)
-    # Convergence is reported by EACH engine's OWN flag, unchanged - lme4 stays lme4. glmm
-    # records a boundary optimum as converged (converged=TRUE + singular=TRUE); lme4 folds
-    # it into its "boundary (singular) fit" warning and reports not-good. Both conventions
-    # are shown verbatim. What makes the comparison honest is the boundary column: it counts
-    # ALL boundary fits (bound), split by where each engine files them - inside `converged`
-    # for glmm, inside `non-converged` for lme4. So the reader sees the boundary RATES are
-    # nearly identical (glmm ~3% vs lme4 ~3% on the RI cells) even though the conv% differs;
-    # the gap is a labeling convention, not a real convergence difference. And it is not a
-    # glmm weakness: on the slope cells glmm's rho=+-1 boundary fits beat GLMMadaptive's
-    # interior ones on 91% of disagreeing reps by marginal likelihood (neutral 2-D GH
-    # referee) and match lme4's own Laplace boundary rate exactly.
-    gm <- d[conv, , drop = FALSE]   # metric = each engine's `good` set (paper convention;
-                                    # glmm includes boundary, lme4 excludes) - keeps the gate
+    # ONE rule for every engine: singularity is derived from the estimates via
+    # derive_singular (native flags ignored - they only relabel the same fits:
+    # per-rep cross-check found glmm and lme4 on the same boundary set, 600/600
+    # RI reps and 465/469 slope reps), and a boundary optimum counts as
+    # converged for everyone - it is the constrained MLE, and glmm's boundary
+    # fits beat GLMMadaptive's interior ones on 91% of disagreeing slope reps
+    # by likelihood. The !err guard matters: on slope cells derive_singular
+    # flags every errored rep via rho01=NA.
+    # The frozen published rows keep the paper's own convention (lme4 boundary
+    # fits excluded via its warnings), so the gate |diff| now includes that
+    # convention gap on top of Monte Carlo error.
+    sing <- derive_singular(d, slope) & !err
+    conv <- (d$good %in% TRUE | sing) & !err
+    bound <- sing
+    gm <- d[conv, , drop = FALSE]   # metric set = same-rule converged (boundary included)
     row <- list(cell = cid, n_tot = nrow(d), n_good = sum(conv), n_metric = nrow(gm),
                 n_bnd_conv = sum(bound & conv), n_bnd_non = sum(bound & !conv),
                 n_err = sum(err), mean_secs = mean(d$secs, na.rm = TRUE))
@@ -118,17 +115,13 @@ prow <- function(lab, v) cat(sprintf("%-18s", lab), paste(fmt(v[P]), collapse=""
 
 cat("\n################  BATCH: reps 1..", CAP, "  ################\n", sep="")
 
-cat("\n--- FITS (conv=engine's OWN converged flag; boundary=singular MLE, shown where the engine files it; err=threw) ---\n")
-cat("    conv% is each engine's own convention, verbatim: glmm reports a boundary optimum as\n")
-cat("    converged (converged=TRUE + singular=TRUE), lme4 reports it as not-converged (its\n")
-cat("    'boundary (singular) fit' warning). The 'boundary' counts are ALL singular fits, split\n")
-cat("    by where each engine files them - inside conv for glmm, inside nonconv for lme4 - so\n")
-cat("    the boundary RATES are directly comparable (near-identical on the RI cells) even though\n")
-cat("    conv% differs: that gap is a labeling convention, not a real convergence difference. It\n")
-cat("    is no glmm weakness either - glmm's rho=+-1 boundary fits beat GLMMadaptive's interior\n")
-cat("    ones on 91% of disagreeing slope reps by likelihood, and match lme4's Laplace exactly.\n")
-cat("    Bias/RMSE use each engine's paper-convention good set (glmm includes boundary fits,\n")
-cat("    lme4 excludes them) - matching the frozen tables and keeping the lme4 gate green.\n")
+cat("\n--- FITS (same rule for every engine; err=threw) ---\n")
+cat("    conv and boundary use ONE shared rule for all engines: singular = derived from the\n")
+cat("    estimates (tau < 1e-3, |rho| > 0.99), and a boundary optimum counts as converged -\n")
+cat("    it is the constrained MLE (glmm and lme4 land on the same boundary set per-rep; the\n")
+cat("    old conv% gap was purely each engine's labeling). Bias/RMSE use this same set. The\n")
+cat("    frozen published rows keep the paper's own convention (lme4 excludes boundary fits),\n")
+cat("    so the gate |diff| includes that convention gap on top of Monte Carlo error.\n")
 for (nm in names(A)) {
   a <- A[[nm]]; if (is.null(a)) next
   nonconv <- a$n_tot - a$n_good - a$n_err

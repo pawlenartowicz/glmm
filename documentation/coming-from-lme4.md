@@ -1,4 +1,9 @@
-# Coming from lme4 (or statsmodels)
+# Coming from lme4
+
+Migrating from `statsmodels` instead? See
+[`coming-from-statsmodels.md`](coming-from-statsmodels.md) — that migration
+has its own shape (patsy formulas, a construct-then-fit API) and lives on its
+own page.
 
 ## Call mapping
 
@@ -11,17 +16,26 @@
 | `VarCorr(fit)` | `VarCorr(fit)` — SD/correlation-scale variance components, lme4-shaped, with a `Residual` row for a Gaussian mixed fit | `fit.varcorr` (vech-packed per grouping) plus `fit.stddev_corr(group_idx)`, which splits a grouping's block into a stddev vector and a correlation matrix |
 | `confint(fit)` | `confint(fit)` — Wald intervals off `vcov()`; `method = "profile"`/`"boot"` are not available and say so | Build from `fit.beta` and `fit.se` (or `fit.vcov` for joint contrasts) — no dedicated `confint` call |
 | `isSingular(fit)` | `isSingular(fit)` — boundary-fit flag, lme4's condition, computed by the kernel | `fit.singular` |
+| `ranef(fit)` | `ranef(fit)` — named list of data frames, one per grouping, rows named by level | `fit.ranef_blocks` — a list of `{group, terms, levels, values}`, `values` an `(n_levels, n_terms)` array (not a DataFrame; the package's only dependency is numpy) |
+| `fitted(fit)` | `fitted(fit)` — named numeric vector over the model frame's rows | `fit.fitted` — `(n,)` array |
 
 ## What is deliberately missing
 
 `fastglmm` is deliberately scoped to **fast fitting**: fixed effects, Wald
-standard errors, and variance components on the SD/correlation scale.
-Anything the engine cannot compute honestly today — `ranef`, `predict`,
-`fitted`, `residuals`, `logLik`/`AIC`, profiling — is an error naming the
-reason, never a silently different answer. `coef()` is the clearest case: it
-also errors, because lme4's `coef()` means fixed + random effects per group,
-which needs `ranef()` — engine-blocked — so it points you at `fixef()`
-instead of quietly dropping the random part.
+standard errors, variance components on the SD/correlation scale, and the
+conditional modes with the per-row means they imply. Anything the engine
+cannot compute honestly today — `predict`, `residuals`, profiling — is an
+error naming the reason, never a silently different answer. `predict()` needs
+a design matrix built from rows the fit never saw, and the formula machinery
+is Rust-side; `residuals()` would have to guess which of lme4's four `type=`
+residuals you meant, and guessing wrong is worse than erroring. `coef()`
+errors for the same reason it always did — lme4's `coef()` means fixed +
+random effects per group, and returning the fixed part alone would silently
+differ — but you can now build it yourself from `fixef()` and `ranef()`.
+
+Conditional variances are the one gap inside the `ranef` surface:
+`ranef(condVar = TRUE)` and lme4's `condsd` column have no counterpart, so the
+modes come with no uncertainty attached. Read them accordingly.
 
 This is the same discipline the kernel applies everywhere: it only surfaces
 what it can compute honestly. See
@@ -44,18 +58,270 @@ lme4/MixedModels.jl oracles.
 - Factors are always coded with treatment contrasts (base = the column's
   first level); `contrasts=` is not an accepted argument — relevel the
   factor instead. See [`formula.md`](formula.md#not-accepted-and-the-workaround).
+- **Composite grouping levels are ordered and spelled differently.** For an
+  explicit nesting `(1 | A/B)`, lme4 names the inner block `B:A` and labels its
+  rows child-first (`b1:a1`, `b1:a2`, …, first component varying fastest);
+  `glmm` names it `A:B` and labels the rows parent-first (`a1:b1`), grouped by
+  parent. The values are identical and every row is labelled — only the
+  printout's row order and label spelling differ. A crossed interaction
+  `(1 | A:B)` matches lme4 exactly, since both sort lexicographically on the
+  joined label.
+- **An unused grouping level gets a row where lme4 has none.** A factor level
+  declared between two observed ones costs random-effect width even with no
+  rows, so `ranef` reports it with its mode shrunk to zero and the fit warns
+  (`fastglmm_unused_grouping_levels` / `UnusedGroupingLevelsWarning`).
+  `droplevels()` removes both the row and the wasted width. A level declared
+  after the last observed one costs nothing and never appears.
 - REML is the only fit mode for LMMs (no ML switch), and all reported
   standard errors are Wald, not profile or bootstrap — see
   [`conventions.md`](conventions.md#flags-on-the-result) for how the
   `converged`/`singular` flags mark when those numbers should be trusted.
 
-## statsmodels
+## Three models, side by side
 
-The Python surface is exactly two names, `glmm.fit` and `glmm.Fit` — there is
-no model object to construct, unlike `statsmodels`' construct-then-fit API
-(`sm.MixedLM(...).fit()`). You hand `fit` a data table and a formula string,
-and it parses, builds the design matrix, fits, and returns a `Fit`. Mixed
-models beyond random intercepts — correlated random slopes, crossed and
-nested grouping factors, GLMMs with Laplace or adaptive quadrature — are
-first-class here, where `statsmodels.MixedLM` only covers Gaussian linear
-mixed models.
+The same three fits, in lme4, `fastglmm` (R), and `glmm.fit` (Python). These
+are recipes 1, 4 and 2 from the worked examples
+([`examples-python.md`](examples-python.md),
+[`examples-r.md`](examples-r.md)) — the `fastglmm`/`glmm.fit` code below is
+copied verbatim from those pages, already run against real data and checked
+against the frozen lme4 goldens there. The lme4 column is the formula that
+produced each rung's frozen golden (`validation/manifest.json`'s `r_formula`
+for that rung), fit the ordinary lme4 way, for direct comparison — see the
+linked recipe for the actual printed output and the oracle cross-check. Every
+lme4 formula below spells its intercept explicitly (`1 + …`), lme4's own
+convention; the `fastglmm`/`glmm.fit` column drops that leading `1 +`, since
+the shared parser has no bare-`1` fixed-effect term and errors on it
+(`expected identifier, got '1'`) — the intercept is never optional there,
+only ever implicit. See [`formula.md`](formula.md) for what the parser
+accepts.
+
+### Correlated random slope (`sleepstudy`)
+
+lme4:
+
+```r
+library(lme4)
+
+data(sleepstudy)
+
+fit <- lmer(Reaction ~ 1 + Days + (1 + Days | Subject), sleepstudy)
+
+summary(fit)
+```
+
+`fastglmm` (R):
+
+```r
+library(lme4)
+library(fastglmm)
+
+data(sleepstudy)
+
+fit <- fastglmm(Reaction ~ Days + (1 + Days | Subject), sleepstudy)
+
+summary(fit)
+```
+
+`glmm.fit` (Python):
+
+```python
+import csv
+from pathlib import Path
+
+import glmm
+
+DATA_PATH = Path(__file__).resolve().parents[3] / "validation" / "data" / "empirical" / "sleepstudy.csv"
+
+with open(DATA_PATH, newline="") as f:
+    rows = list(csv.DictReader(f))
+
+data = {
+    "Reaction": [float(r["Reaction"]) for r in rows],
+    "Days": [float(r["Days"]) for r in rows],
+    "Subject": [r["Subject"] for r in rows],
+}
+
+fit = glmm.fit(data, "Reaction ~ Days + (1 + Days | Subject)")
+
+assert fit.converged
+fit.summary()
+```
+
+Full recipe, with output and the goldens cross-check:
+[`examples-python.md#1-correlated-random-slope-sleepstudy`](examples-python.md#1-correlated-random-slope-sleepstudy) /
+[`examples-r.md#1-correlated-random-slope-sleepstudy`](examples-r.md#1-correlated-random-slope-sleepstudy).
+
+### Aggregated binomial via `weights=` (`cbpp`)
+
+lme4:
+
+```r
+library(lme4)
+
+data(cbpp)
+
+fit <- glmer(cbind(incidence, size - incidence) ~ 1 + period + (1 | herd),
+             cbpp, family = binomial)
+
+summary(fit)
+```
+
+`fastglmm` (R):
+
+```r
+library(lme4)
+library(fastglmm)
+
+data(cbpp)
+cbpp$prop <- cbpp$incidence / cbpp$size
+
+fit <- fastglmm(prop ~ period + (1 | herd), cbpp, family = binomial(), weights = size)
+
+summary(fit)
+```
+
+`glmm.fit` (Python):
+
+```python
+import csv
+from pathlib import Path
+
+import glmm
+
+DATA_PATH = Path(__file__).resolve().parents[3] / "validation" / "data" / "empirical" / "cbpp.csv"
+
+with open(DATA_PATH, newline="") as f:
+    rows = list(csv.DictReader(f))
+
+incidence = [float(r["incidence"]) for r in rows]
+size = [float(r["size"]) for r in rows]
+data = {
+    "prop": [i / s for i, s in zip(incidence, size)],
+    "period": [r["period"] for r in rows],
+    "herd": [r["herd"] for r in rows],
+}
+
+fit = glmm.fit(data, "prop ~ period + (1 | herd)", family="binomial", weights=size)
+
+assert fit.converged
+fit.summary()
+```
+
+Full recipe, with output and the goldens cross-check:
+[`examples-python.md#4-aggregated-binomial-via-weights-cbpp`](examples-python.md#4-aggregated-binomial-via-weights-cbpp) /
+[`examples-r.md#4-aggregated-binomial-via-weights-cbpp`](examples-r.md#4-aggregated-binomial-via-weights-cbpp).
+See [below](#the-cbind-migration-in-full) for the `cbind()` arithmetic spelled out.
+
+### Crossed grouping factors (`Penicillin`)
+
+lme4:
+
+```r
+library(lme4)
+
+data(Penicillin)
+
+fit <- lmer(diameter ~ 1 + (1 | plate) + (1 | sample), Penicillin)
+
+summary(fit)
+```
+
+`fastglmm` (R):
+
+```r
+library(lme4)
+library(fastglmm)
+
+data(Penicillin)
+
+# NOTE: no bare "1" fixed-effect term (the intercept is always implicit).
+fit <- fastglmm(diameter ~ (1 | plate) + (1 | sample), Penicillin)
+
+summary(fit)
+```
+
+`glmm.fit` (Python):
+
+```python
+import csv
+from pathlib import Path
+
+import glmm
+
+DATA_PATH = Path(__file__).resolve().parents[3] / "validation" / "data" / "empirical" / "Penicillin.csv"
+
+with open(DATA_PATH, newline="") as f:
+    rows = list(csv.DictReader(f))
+
+data = {
+    "diameter": [float(r["diameter"]) for r in rows],
+    "plate": [r["plate"] for r in rows],
+    "sample": [r["sample"] for r in rows],
+}
+
+# NOTE: no bare "1" fixed-effect term (the intercept is always implicit).
+fit = glmm.fit(data, "diameter ~ (1 | plate) + (1 | sample)")
+
+assert fit.converged
+fit.summary()
+```
+
+Full recipe, with output and the goldens cross-check:
+[`examples-python.md#2-crossed-grouping-factors-penicillin`](examples-python.md#2-crossed-grouping-factors-penicillin) /
+[`examples-r.md#2-crossed-grouping-factors-penicillin`](examples-r.md#2-crossed-grouping-factors-penicillin).
+
+## The `cbind()` migration in full
+
+This is the single most common lme4 line with no direct translation. lme4
+writes an aggregated binomial — one row per group of trials rather than one
+row per trial — as a two-column response built with `cbind()`:
+
+```r
+cbind(incidence, size - incidence) ~ period + (1 | herd)
+```
+
+`cbind()`'s first column is the success count, the second is the failure
+count, and lme4 derives the number of trials as their sum
+(`incidence + (size - incidence) = size`). The shared formula parser has no
+`cbind()` term — the response is always looked up as a single, literal
+column name (see [`formula.md`](formula.md#not-accepted-and-the-workaround))
+— so the same model is spelled as the success **proportion** as the response
+plus the trial count as `weights=`. That is exactly lme4's own objective
+underneath `cbind()`; only the arithmetic that produces it moves into your
+data-prep step:
+
+| | lme4 | glmm |
+|---|---|---|
+| Response | `cbind(incidence, size - incidence)` | `incidence / size` (a proportion in `[0, 1]`) |
+| Trial count | derived: `incidence + (size - incidence)` | `weights = size`, passed explicitly |
+| Formula | `cbind(incidence, size - incidence) ~ period + (1 \| herd)` | `prop ~ period + (1 \| herd)`, `family="binomial"`, `weights=size` |
+
+R, spelling out the arithmetic:
+
+```r
+data(cbpp)
+cbpp$prop <- cbpp$incidence / cbpp$size
+
+fit <- fastglmm(prop ~ period + (1 | herd), cbpp, family = binomial(), weights = size)
+```
+
+Python, spelling out the arithmetic:
+
+```python
+incidence = [float(r["incidence"]) for r in rows]
+size = [float(r["size"]) for r in rows]
+data = {
+    "prop": [i / s for i, s in zip(incidence, size)],
+    "period": [r["period"] for r in rows],
+    "herd": [r["herd"] for r in rows],
+}
+
+fit = glmm.fit(data, "prop ~ period + (1 | herd)", family="binomial", weights=size)
+```
+
+The trap: `weights=` is the **denominator** — the trial count (`size`), not
+the numerator (`incidence`). Passing `incidence` itself as `weights=` gets it
+backwards, weighting every row by how many *cases* it had, which is
+correlated with the very thing being modeled. This is recipe 4 in the worked
+examples; see it there for the fitted output and the oracle cross-check
+against `goldens/cbpp_agq_k1.json`.

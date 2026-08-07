@@ -10,7 +10,9 @@ raise a clean `NotImplementedError`: `family="inversegaussian"`,
 `init_theta=<float>` (no kernel hook exists yet to seed the negative-binomial
 search — only the default `init_theta=None` cold-start is supported).
 
-Public surface is exactly two names: `fit` and `Fit`.
+Public surface is `fit`, `Fit`, and the warning categories the diagnostics
+channel raises (`DiagnosticWarning`, `IllConditionedWarning`,
+`PirlsExhaustedWarning`, `UnusedGroupingLevelsWarning`).
 """
 
 import math
@@ -21,7 +23,61 @@ import numpy as np
 
 from glmm import _native
 
-__all__ = ["Fit", "fit"]
+__all__ = [
+    "DiagnosticWarning",
+    "Fit",
+    "IllConditionedWarning",
+    "PirlsExhaustedWarning",
+    "UnusedGroupingLevelsWarning",
+    "fit",
+]
+
+
+class DiagnosticWarning(UserWarning):
+    """Base category for the kernel's per-fit solver notes.
+
+    Every note warns under a subclass of this, so
+    `warnings.filterwarnings("ignore", category=glmm.DiagnosticWarning)`
+    silences the whole channel. A note kind this version of the wrapper does not
+    recognize — the Rust `Note` enum is `#[non_exhaustive]`, so a newer kernel
+    may raise one — warns under this base category rather than being dropped.
+    """
+
+
+class IllConditionedWarning(DiagnosticWarning):
+    """Two or more fixed-effect columns are entangled — near-collinear, but not
+    redundant.
+
+    The fit is real and the estimates are honest; the standard errors are large
+    because the data cannot separate the columns. Distinct from an *aliased*
+    column, which is exactly redundant and is dropped (`Fit.aliased`).
+    """
+
+
+class PirlsExhaustedWarning(DiagnosticWarning):
+    """A GLMM's inner PIRLS solve ran its full iteration cap without converging.
+
+    Two cases, and the message states which one occurred (the note's
+    `final_eval` field carries the distinction). On a BOBYQA trial point during
+    the search, that point was rejected and the search steered around it —
+    observation-only, no fitted number is affected. On the final re-evaluation
+    at the converged fit, the reported estimates rest on that truncated solve —
+    the more serious of the two cases.
+    """
+
+
+class UnusedGroupingLevelsWarning(DiagnosticWarning):
+    """A grouping factor declares levels that carry no row but still occupy
+    random-effect columns.
+
+    An empty cluster between two observed ones contributes nothing to the
+    likelihood and costs model width anyway, because the block is sized by the
+    largest observed code. `ranef` reports such a level with its mode fully
+    shrunk to zero; lme4 has no counterpart row at all. Dropping the level
+    (pandas `.cat.remove_unused_categories()`, R `droplevels`) removes both the
+    row and the wasted width. A level declared *after* the last observed one
+    costs nothing and never warns.
+    """
 
 
 # Family table — mirrors the API spec §3.2 and GLMM/src/family.rs.
@@ -104,8 +160,12 @@ def _sorted_levels_and_codes(labels):
 
 @dataclass
 class Fit:
-    """Fit result — mirrors the Rust `Fit` (GLMM/src/fit.rs), plus coefficient
-    names from the formula. Returned by `fit`, not constructed by callers."""
+    """Fit result — mirrors the Rust `Fit` (src/fit/mod.rs), plus coefficient
+    names from the formula. Returned by `fit`, not constructed by callers.
+
+    `converged`, `singular` and `aliased` are properties over `diagnostics`,
+    not dataclass fields: read them off the Fit as before, but reach for
+    `diagnostics` when reflecting over the dataclass (`asdict`, `fields`)."""
 
     beta: np.ndarray  # (p,) fixed-effect estimates
     se: np.ndarray  # (p,) standard errors; NaN where unavailable
@@ -115,10 +175,45 @@ class Fit:
     stddev_se: (
         np.ndarray
     )  # SE of each RE stddev, theta layout (not beta-aligned); NaN where unavailable
-    aliased: np.ndarray  # (p,) bool — rank-deficient columns dropped (lme4's NA coefficients)
+    # Everything the solver reports about the fit itself, mirroring the Rust
+    # `Diagnostics` (src/fit/mod.rs) as a plain dict:
+    #   converged  bool
+    #   singular   bool — boundary fit, >=1 variance component pinned at 0
+    #                     (lme4's isSingular)
+    #   aliased    (p,) bool — rank-deficient columns dropped (lme4's NA
+    #                     coefficients)
+    #   boundary   "interior" | "at_boundary" | "no_optimum" | "unknown" —
+    #                     where the accepted theta sits. Only the dense LMM and
+    #                     dense GLMM routes distinguish all three; elsewhere it
+    #                     is back-derived from `singular`, so "no_optimum" is
+    #                     unreachable there and "interior" means "not pinned",
+    #                     not "verified interior".
+    #   pinned     list per grouping (varcorr order) of per-component bools:
+    #                     pinned[g][i] pairs with stddev_corr(g)[0][i]. ON A
+    #                     CONVERGED FIT, EMPTY MEANS NOTHING WAS PINNED — a
+    #                     model with no variance components at all (OLS, GLM,
+    #                     fixed-effect-only negative binomial) also reports
+    #                     empty, for the same reason: there was nothing to pin.
+    #                     `fit()` does not raise on `converged: False`; on that
+    #                     path `pinned` is always the empty NaN-fill default
+    #                     regardless of what the optimizer was doing when it
+    #                     gave up, so it carries no information there.
+    #   notes      list of {"kind": str, "columns": [int], "pivot": float,
+    #                     "evals": int, "final_eval": bool, "detail": str} —
+    #                     observations with no dedicated field,
+    #                     each raised as a `DiagnosticWarning` subclass by `fit`.
+    #                     Mostly the solver's; the formula lowering contributes
+    #                     "unused_grouping_levels", whose names ride in `detail`.
+    #                     `columns` are 0-based indices into `names` (the R
+    #                     package reports the same thing 1-based, per R's own
+    #                     convention). An absent note means "not detected",
+    #                     never "checked and clean": the dense GLMM route
+    #                     records no pivot and the sparse route refuses rather
+    #                     than flagging.
+    # `converged`, `singular` and `aliased` also stay readable straight off the
+    # Fit (properties below) — one storage location, unchanged ergonomics.
+    diagnostics: dict
     dispersion: float  # phi (gamma / inverse-gaussian) / theta (negbin) / residual sigma^2 (gaussian) / 1.0 (binomial, poisson)
-    converged: bool
-    singular: bool  # boundary (singular) fit — >=1 variance component pinned at 0; mirrors lme4's isSingular
     names: list  # coefficient names, aligned with beta
     re_groups: list  # per grouping, in varcorr order: (name, [term names])
     n_eval: int  # optimizer objective evaluations (0 on the closed-form/IRLS paths)
@@ -141,22 +236,50 @@ class Fit:
     # (the Gaussian LMM paths). Model comparisons (AIC/LRT) across fits with
     # different fixed effects are invalid when this is set.
     reml: bool
-    # Fitted means mu-hat per row (n,). Empty on non-converged fits and on the
-    # Gaussian LMM paths (fit via sufficient statistics, no per-row means).
+    # Fitted means mu-hat per row (n,). Empty on non-converged fits.
     fitted: np.ndarray
     # Random-effect conditional modes b-hat, one block per grouping in
     # varcorr/re_groups order, each block level-major (level l's q values at
-    # [l*q .. (l+1)*q]). Empty on non-converged fits and on the Gaussian LMM
-    # paths; see `ranef_levels` for slicing per grouping.
+    # [l*q .. (l+1)*q]). Empty on non-converged fits; see `ranef_levels` for
+    # slicing per grouping. This is the raw numbers -- for the labelled form,
+    # read `ranef_blocks` instead and do NOT slice this yourself: which layout a
+    # grouping lands in is a data-dependent decision inside the kernel.
     ranef: np.ndarray
     # Level count per grouping, for slicing `ranef`: ranef.size == sum(levels *
     # q_per_group). Empty exactly when `ranef` is.
     ranef_levels: np.ndarray
+    # The same conditional modes, labelled: a list of dicts, one per grouping in
+    # re_groups order, each with
+    #   group   str        -- grouping factor name
+    #   terms   list[str]  -- column names, "(Intercept)" first
+    #   levels  list[str]  -- row labels, one per level
+    #   values  ndarray    -- (len(levels), len(terms))
+    # Padded slots of a nested grouping are already dropped, so `levels` is
+    # exactly the levels that exist. Not a DataFrame: the package's only
+    # dependency is numpy, and `fit()` accepts duck-typed data precisely so it
+    # does not require pandas. Empty exactly when `ranef` is.
+    ranef_blocks: list
+
+    @property
+    def converged(self):
+        """`diagnostics["converged"]` — the most-read field, kept at the top
+        level so moving the storage costs no caller an extra hop."""
+        return self.diagnostics["converged"]
+
+    @property
+    def singular(self):
+        """`diagnostics["singular"]`."""
+        return self.diagnostics["singular"]
+
+    @property
+    def aliased(self):
+        """`diagnostics["aliased"]`."""
+        return self.diagnostics["aliased"]
 
     def stddev_corr(self, group_idx):
         """Split grouping `group_idx`'s vech-packed covariance into
         (stddevs, correlation matrix) — mirrors Rust `Fit::stddev_corr`
-        (GLMM/src/fit.rs): column-major lower-triangular vech."""
+        (src/fit/mod.rs): column-major lower-triangular vech."""
         vech = np.asarray(self.varcorr[group_idx], dtype=float)
         m = len(vech)
         q = (math.isqrt(1 + 8 * m) - 1) // 2
@@ -232,27 +355,108 @@ class Fit:
         return text
 
 
-def _singular_detail(res):
-    """Names of the exactly-degenerate RE components, for the singular warning:
-    "sd(term | group) = 0" per collapsed variance, "corr(a, b | group) = +/-1"
-    per degenerate correlation. Exact comparisons are safe because the kernel
-    pins boundary components to exact 0 / ±1 (algorithms-lmm.md "Boundary
-    handling"); empty when only the relative-tolerance singular check fired,
-    which keeps the bare lme4 text."""
+def _pinned_detail(res):
+    """Names of the RE components the optimizer pinned at the boundary, for the
+    singular warning: "sd(term | group) pinned at the variance boundary" each.
+
+    Read straight off `diagnostics["pinned"]`, which is the kernel's own record
+    of what it pinned. Do NOT reconstruct it from `varcorr`: on a grouping with
+    q >= 2 the pin fixes the diagonal of the Cholesky factor, while the reported
+    stddev is sqrt(lambda_offdiag^2 + lambda_diag^2) and so lands at ~1e-9
+    rather than at 0 — a scan for exactly-zero stddevs misses those pins.
+
+    That same fact is why the message says "pinned at the variance boundary" and
+    not "= 0", which is what it used to say. What is pinned is the Cholesky
+    diagonal; the stddev this fit reports for the component keeps whatever the
+    off-diagonal settled on, and on a q >= 2 block that has been measured as
+    high as 2.2e-3 against a 0.689 sibling — a number that shows up in a printed
+    VarCorr at default rounding. A warning must not contradict a number the same
+    fit prints.
+
+    Empty means nothing was pinned — including a model with no variance
+    components to pin. `singular` can still be `True` with `pinned` empty (the
+    post-hoc negligible-stddev check is independent of the optimizer's own pin
+    decision), so the bare lme4 text stands regardless; the caller must not
+    read an empty `pinned` as "not singular"."""
+    pinned = res.diagnostics["pinned"]
+    if not pinned:
+        return []
     parts = []
-    with np.errstate(divide="ignore", invalid="ignore"):
-        for g, (group, terms) in enumerate(res.re_groups):
-            stddev, corr = res.stddev_corr(g)
-            for i in range(len(stddev)):
-                if stddev[i] == 0:
-                    parts.append(f"sd({terms[i]} | {group}) = 0")
-            for c in range(len(stddev)):
-                for r in range(c + 1, len(stddev)):
-                    if stddev[c] > 0 and stddev[r] > 0 and abs(corr[r, c]) == 1:
-                        parts.append(
-                            f"corr({terms[c]}, {terms[r]} | {group}) = {int(corr[r, c]):+d}"
-                        )
+    # strict: when the kernel reports pins at all it emits one flag block per
+    # varcorr block, so a length mismatch there is a bug to surface, not
+    # groupings to drop quietly. The empty case is handled above — it is the
+    # documented "nothing was pinned", not a mismatch.
+    for flags, (group, terms) in zip(pinned, res.re_groups, strict=True):
+        for i, is_pinned in enumerate(flags):
+            if is_pinned:
+                term = terms[i] if i < len(terms) else f"component {i}"
+                parts.append(f"sd({term} | {group}) pinned at the variance boundary")
     return parts
+
+
+def _note_warning(note, names):
+    """One kernel note as (message, warning category).
+
+    The `kind` string, not the English text, is the stable identifier — an
+    unrecognized kind comes from a kernel newer than this wrapper (the Rust
+    `Note` enum is `#[non_exhaustive]`) and still warns, under the base
+    category. The R port maps the same kinds to condition classes
+    (r/R/fastglmm.R) — change together."""
+    if note["kind"] == "ill_conditioned":
+        named = ", ".join(names[i] if i < len(names) else f"column {i}" for i in note["columns"])
+        # "entangled with" rather than "the design does not identify <name>":
+        # entanglement is symmetric, and the kernel names the column attaining
+        # the SMALLEST scaled pivot, which is one member of the group and not a
+        # statement about the others. Wording it as a fact about that one column
+        # reads as if its partners were exonerated.
+        return (
+            (
+                f"{named} is entangled with one or more other columns (scaled pivot "
+                f"{note['pivot']:.3g}): the fit is real and the estimates are honest, "
+                "but the standard errors are large. Only the column the pivot search "
+                "reached is named; its partners are equally implicated and are not "
+                "identified here."
+            ),
+            IllConditionedWarning,
+        )
+    if note["kind"] == "unused_grouping_levels":
+        return (
+            (
+                f"grouping levels with no rows occupy random-effect columns "
+                f"({note['detail']}); their conditional modes are reported as exactly "
+                "zero. Drop the unused levels to remove both the rows and the wasted "
+                "model width."
+            ),
+            UnusedGroupingLevelsWarning,
+        )
+    if note["kind"] == "pirls_exhausted":
+        # `final_eval` is the case split the docstring describes: a rejected
+        # trial point is benign, the final re-evaluation at the converged fit
+        # feeds the reported estimates.
+        if note["final_eval"]:
+            return (
+                (
+                    "the final PIRLS re-evaluation at the converged fit ran its "
+                    "full iteration cap without converging: the reported "
+                    "estimates rest on that truncated solve."
+                ),
+                PirlsExhaustedWarning,
+            )
+        return (
+            (
+                "a GLMM inner PIRLS solve ran its full iteration cap without "
+                "converging. This is observation-only and no fitted number is "
+                "affected."
+            ),
+            PirlsExhaustedWarning,
+        )
+    return (
+        (
+            "the kernel reported a solver note this version of glmm does not "
+            f"recognize ({note['kind']!r})"
+        ),
+        DiagnosticWarning,
+    )
 
 
 def fit(
@@ -432,7 +636,8 @@ def fit(
     )
     # nagq's shape eligibility (single grouping factor, binomial/Poisson,
     # q <= 3) is only decidable after the Rust-side formula lowering, so the
-    # §3.5 warn-and-strip for it lives in glmm-python/src/orchestrate.rs; the
+    # §3.5 warn-and-strip for it lives in the shared glmm::orchestrate module
+    # (GLMM/src/orchestrate.rs); the
     # message comes back here to be raised as the same UserWarning the
     # dispersion/theta strips above use.
     if r["agq_warning"] is not None:
@@ -446,10 +651,15 @@ def fit(
         tau2=np.asarray(r["tau2"], dtype=float),
         varcorr=r["varcorr"],
         stddev_se=np.asarray(r["stddev_se"], dtype=float),
-        aliased=np.asarray(r["aliased"], dtype=bool),
+        diagnostics={
+            "converged": r["converged"],
+            "singular": r["singular"],
+            "aliased": np.asarray(r["aliased"], dtype=bool),
+            "boundary": r["boundary"],
+            "pinned": r["pinned"],
+            "notes": r["notes"],
+        },
         dispersion=r["dispersion"],
-        converged=r["converged"],
-        singular=r["singular"],
         names=r["names"],
         re_groups=r["re_groups"],
         n_eval=r["n_eval"],
@@ -460,13 +670,30 @@ def fit(
         fitted=np.asarray(r["fitted"], dtype=float),
         ranef=np.asarray(r["ranef"], dtype=float),
         ranef_levels=np.asarray(r["ranef_levels"], dtype=int),
+        ranef_blocks=[
+            {
+                "group": b["group"],
+                "terms": b["terms"],
+                "levels": b["levels"],
+                "values": np.asarray(b["values"], dtype=float).reshape(
+                    len(b["levels"]), len(b["terms"])
+                ),
+            }
+            for b in r["ranef_blocks"]
+        ],
     )
     # lme4 agreement (boundary-fits follow-up spec Part B step 4): lme4's exact
     # text, extended with the degenerate components. The R port emits the same
     # message (fastglmm.R) — change together.
     if res.singular:
         warnings.warn(
-            "; ".join(["boundary (singular) fit: see help('isSingular')", *_singular_detail(res)]),
+            "; ".join(["boundary (singular) fit: see help('isSingular')", *_pinned_detail(res)]),
             stacklevel=2,
         )
+    # One warning per note, each under its own category so a caller can filter
+    # by kind. The R port raises the same set as classed conditions — change
+    # together.
+    for note in res.diagnostics["notes"]:
+        message, category = _note_warning(note, res.names)
+        warnings.warn(message, category=category, stacklevel=2)
     return res
