@@ -70,6 +70,28 @@ timing_runs <- function() {
 }
 N_RUNS <- timing_runs()  # NULL on an untimed run
 
+# AGQ timing pass, OPT-IN and orthogonal to everything above. VALIDATION_AGQ=<k>
+# refits the manifest's `agq`-marked datasets at nAGQ=k instead of the pinned Laplace,
+# into results/glmm_r_agq_* -- a separate tree because compare.R globs
+# results/glmm_r_{empirical,simulated}/*.json for the port gate, so writing AGQ fits
+# there would gate a different model against the Rust Laplace row. Mirrors
+# engines/glmm.rs's VALIDATION_AGQ / lme4.R's agq_k -- change together.
+#
+# Unlike the Rust pass this cannot turn `parallel_inner` on: the package builds glmm
+# with the "orchestrate" feature only (glmm-r/Cargo.toml), so the port's AGQ fit is
+# the serial kernel and there is no knob to change that from R.
+agq_k <- function() {
+  v <- trimws(Sys.getenv("VALIDATION_AGQ"))
+  if (v == "" || v == "0") return(NULL)
+  n <- suppressWarnings(as.integer(v))
+  if (is.na(n) || n < 1 || n %% 2 == 0)
+    stop("VALIDATION_AGQ must be an ODD integer >= 1 (got '", v,
+         "'); the Gauss-Hermite table is built for orders 1, 3, 5, ...")
+  n
+}
+AGQ <- agq_k()  # NULL on a normal (Laplace) run
+OUT_STEM <- if (is.null(AGQ)) "glmm_r" else "glmm_r_agq"
+
 # Suite directory (manifest + data + results root). Mirrors glmm_python.py's SUITE.
 HERE <- normalizePath(dirname(sub("--file=", "",
   grep("--file=", commandArgs(FALSE), value = TRUE))))
@@ -214,16 +236,18 @@ do_fit <- function(data, formula, family, wald_se) {
   # on the fit object (singular, converged), not needed on stderr for a batch run.
   has_w <- "validation_wts" %in% names(data)
   has_o <- "validation_off" %in% names(data)
+  # 1 on a normal run; the opt-in VALIDATION_AGQ pass is the only thing that moves it.
+  k <- AGQ %||% 1L
   suppressWarnings(
     if (has_w && has_o)
       fastglmm(formula, data, family, weights = validation_wts,
-               offset = validation_off, wald.se = wald_se)
+               offset = validation_off, wald.se = wald_se, nAGQ = k)
     else if (has_w)
-      fastglmm(formula, data, family, weights = validation_wts, wald.se = wald_se)
+      fastglmm(formula, data, family, weights = validation_wts, wald.se = wald_se, nAGQ = k)
     else if (has_o)
-      fastglmm(formula, data, family, offset = validation_off, wald.se = wald_se)
+      fastglmm(formula, data, family, offset = validation_off, wald.se = wald_se, nAGQ = k)
     else
-      fastglmm(formula, data, family, wald.se = wald_se)
+      fastglmm(formula, data, family, wald.se = wald_se, nAGQ = k)
   )
 }
 
@@ -311,16 +335,23 @@ fit_one <- function(spec) {
   family <- build_family(spec)
   timing_batch <- spec$timing_batch %||% 1L
 
-  # Reference grouping order (compare.R aligns varcomp positionally, not by name) --
-  # read off the already-frozen lme4 result rather than re-deriving lme4's convention.
-  reference <- fromJSON(file.path(SUITE, "results", paste0("lme4_", source),
-                                  paste0(ds, ".json")),
-                        simplifyVector = TRUE, simplifyDataFrame = FALSE,
-                        simplifyMatrix = TRUE)
-  ref_order <- vapply(reference$estimates$varcomp, function(e) e$group, "")
-
   fh_fit <- do_fit(data, formula, family, "hessian")
   fixed_only <- length(fh_fit$re_group_names) == 0L
+
+  # Reference grouping order (compare.R aligns varcomp positionally, not by name) --
+  # read off the already-frozen lme4 result rather than re-deriving lme4's convention.
+  # Mirrors the same block in engines/glmm.rs, which owns the explanation of the
+  # missing-file fallback -- change together. Read after the fit because the fallback
+  # needs the fit's group names; the Rust engine gets them pre-fit off the lowered
+  # spec, which the R API does not expose.
+  ref_path <- file.path(SUITE, "results", paste0("lme4_", source), paste0(ds, ".json"))
+  ref_order <- if (file.exists(ref_path)) {
+    reference <- fromJSON(ref_path, simplifyVector = TRUE, simplifyDataFrame = FALSE,
+                          simplifyMatrix = TRUE)
+    vapply(reference$estimates$varcomp, function(e) e$group, "")
+  } else {
+    fh_fit$re_group_names
+  }
 
   if (gaussian || fixed_only) {
     # One SE, no method choice: a gaussian rung has a single profiled `se`, a fixed-only
@@ -378,7 +409,7 @@ fit_one <- function(spec) {
 }
 
 write_result <- function(ds, source, res) {
-  out <- file.path(SUITE, "results", paste0("glmm_r_", source), paste0(ds, ".json"))
+  out <- file.path(SUITE, "results", paste0(OUT_STEM, "_", source), paste0(ds, ".json"))
   # digits = NA: full-precision doubles. The port gate (TOL$port_rel = 1e-12) compares
   # glmm_r against the Rust glmm row; jsonlite's default 4-digit rounding would fail it.
   writeLines(toJSON(res, auto_unbox = TRUE, pretty = TRUE, digits = NA, na = "null"), out)
@@ -393,7 +424,7 @@ write_result <- function(ds, source, res) {
 
 main <- function() {
   for (source in c("empirical", "simulated")) {
-    dir.create(file.path(SUITE, "results", paste0("glmm_r_", source)),
+    dir.create(file.path(SUITE, "results", paste0(OUT_STEM, "_", source)),
                showWarnings = FALSE, recursive = TRUE)
   }
   manifest <- fromJSON(file.path(SUITE, "manifest.json"),
@@ -406,8 +437,11 @@ main <- function() {
     names <- strsplit(only, ",", fixed = TRUE)[[1]]
     function(ds) ds %in% names
   }
+  # An AGQ pass covers only the `agq`-marked datasets -- the shapes glmm's AGQ gate
+  # accepts (binomial/Poisson, one grouping factor, q <= 3).
   for (spec in manifest$datasets) {
     if (!want(spec$name)) next
+    if (!is.null(AGQ) && is.null(spec$agq)) next
     fit_one(spec)
   }
 }

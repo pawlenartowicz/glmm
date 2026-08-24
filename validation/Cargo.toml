@@ -3,7 +3,7 @@ name = "validation"
 # Lockstep with the crate: must equal GLMM/Cargo.toml [package] version.
 # glmm.rs stamps CARGO_PKG_VERSION into each result JSON's engine_version, and
 # after the move that macro reads THIS manifest, not glmm's.
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -22,12 +22,10 @@ publish = false
 [dependencies]
 glmm = { path = "..", features = ["formula", "loop_advanced"] }
 
-# Opt-in only, so the oracle/campaign examples keep building serial by default —
-# a normal `run.sh` pass must stay single-threaded. Required by the VALIDATION_AGQ
-# timing pass (engines/glmm.rs), which fits with `parallel_inner` on; without this
-# feature that flag is inert and the pass would quietly measure the serial kernel.
-[features]
-parallel = ["glmm/parallel"]
+# No `parallel` passthrough: every engine target here fits serial, including the
+# VALIDATION_AGQ pass (engines/glmm.rs). The one example that wants inner
+# parallelism, campaigns/speed-grid/agq_par_probe.rs, asks for it on the dependency
+# directly (`--features glmm/parallel`, see its header).
 
 [dev-dependencies]
 serde      = { version = "1", features = ["derive"] }

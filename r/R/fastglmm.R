@@ -1,5 +1,4 @@
-# fastglmm() - the package's one entry point (R-port spec section 1, docs/GLMM/plans/
-# 2026-07-15-r-port-fast-fitter-spec.md). The R side does row filtering
+# fastglmm() - the package's one entry point. The R side does row filtering
 # (subset/na.action), family normalization, argument validation, and column
 # marshalling; the formula is parsed and lowered by the Rust side
 # (glmm::formula - one parser shared with the Python port, spec section 3), so this
@@ -62,10 +61,12 @@
 #'
 #' **Diagnostic warnings carry a condition class.** Each solver note is raised
 #' as a warning of class `"fastglmm_diagnostic"` with a per-kind subclass
-#' (`"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`; a note from a
-#' newer kernel than this package arrives as `"fastglmm_unknown_note"`), so
-#' `withCallingHandlers()` and `suppressWarnings(classes = )` can select them
-#' without matching message text.
+#' (`"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`,
+#' `"fastglmm_unused_grouping_levels"`, `"fastglmm_re_design_scale_spread"`,
+#' `"fastglmm_hessian_se_fallback"`; a note from a newer kernel than this
+#' package arrives as `"fastglmm_unknown_note"`), so `withCallingHandlers()`
+#' and `suppressWarnings(classes = )` can select them without matching message
+#' text.
 #'
 #' Anything the engine cannot do is an error naming the reason - never a
 #' silently different model. That includes `REML = FALSE` (the LMM path is
@@ -169,14 +170,14 @@ fastglmm <- function(formula, data, family = gaussian(),
   fam <- .normalize_family(family)
 
   # --- kernel-gap checks: GLMM 0.1.1 approved, not yet implemented (mirrors
-  # python/glmm/__init__.py's NotImplementedError block; docs/GLMM/0.1.1/). ---
+  # python/glmm/__init__.py's NotImplementedError block - change together). ---
   if (fam$name == "inversegaussian") {
     stop("family 'inverse.gaussian' requires GLMM 0.1.1; ",
-         "not yet implemented in the kernel (docs/GLMM/0.1.1/)", call. = FALSE)
+         "not yet implemented in the kernel", call. = FALSE)
   }
   if (fam$link == "cloglog") {
     stop("link 'cloglog' requires GLMM 0.1.1; ",
-         "not yet implemented in the kernel (docs/GLMM/0.1.1/)", call. = FALSE)
+         "not yet implemented in the kernel", call. = FALSE)
   }
 
   mixed <- grepl("|", f_str, fixed = TRUE)
@@ -207,8 +208,8 @@ fastglmm <- function(formula, data, family = gaussian(),
   }
   if (!is.null(dispersion) && fam$name %in% c("binomial", "poisson")) {
     stop("quasi-likelihood dispersion on family '", fam$name,
-         "' requires GLMM 0.1.1; not yet implemented in the kernel ",
-         "(docs/GLMM/0.1.1/)", call. = FALSE)
+         "' requires GLMM 0.1.1; not yet implemented in the kernel",
+         call. = FALSE)
   }
   if (!is.null(init.theta) && fam$name != "negativebinomial") {
     warning("init.theta= applies only to family 'negativebinomial'; ignored",
@@ -381,7 +382,7 @@ fastglmm <- function(formula, data, family = gaussian(),
     #             what the optimizer was doing when it gave up, so it carries
     #             no information there.
     #   notes     list of list(kind=, columns=, pivot=, evals=, final_eval=,
-    #             detail=); `columns` is
+    #             detail=, ratio=); `columns` is
     #             1-based into `names`. Each is raised as a classed warning by
     #             the call above. An absent note means "not detected", never
     #             "checked and clean": the dense GLMM route records no pivot
@@ -466,11 +467,12 @@ fastglmm <- function(formula, data, family = gaussian(),
 # the same kinds to warning categories (glmm/__init__.py) - change together.
 #
 # Classes: "fastglmm_ill_conditioned", "fastglmm_pirls_exhausted",
-# "fastglmm_unused_grouping_levels", "fastglmm_unknown_note" - all inheriting
+# "fastglmm_unused_grouping_levels", "fastglmm_re_design_scale_spread",
+# "fastglmm_hessian_se_fallback", "fastglmm_unknown_note" - all inheriting
 # "fastglmm_diagnostic", so one handler catches the whole channel. Not every
-# note comes from the solver: "unused_grouping_levels" is raised by the formula
-# lowering, which is the only layer that sees both the declared levels and the
-# per-row codes.
+# note comes from the solver: "unused_grouping_levels" and
+# "re_design_scale_spread" are raised by the formula lowering, which is the
+# only layer that sees both the declared levels/design and the per-row codes.
 .warn_note <- function(note, coef_names) {
   if (identical(note$kind, "ill_conditioned")) {
     # `columns` arrives 1-based from the shim, so it indexes `coef_names`
@@ -519,6 +521,22 @@ fastglmm <- function(formula, data, family = gaussian(),
       )
     }
     cls <- c("fastglmm_pirls_exhausted", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "re_design_scale_spread")) {
+    msg <- sprintf(paste0(
+      "random-effect design columns for grouping '%s' are on very different ",
+      "scales (max/min column RMS ratio %.3g). fastglmm scales the columns ",
+      "internally, so the fit is unaffected; rescaling the variable makes the ",
+      "reported random-effect standard deviation easier to read."),
+      note$detail, note$ratio)
+    cls <- c("fastglmm_re_design_scale_spread", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "hessian_se_fallback")) {
+    msg <- paste(
+      "the requested Hessian-based standard errors were not usable (the",
+      "finite-difference joint Hessian was not positive definite, or a",
+      "perturbed deviance evaluation was non-finite), so the RX",
+      "standard errors are reported instead and stddev_se is NaN."
+    )
+    cls <- c("fastglmm_hessian_se_fallback", "fastglmm_diagnostic")
   } else {
     msg <- sprintf(paste0("the kernel reported a solver note this version of ",
                           "fastglmm does not recognize ('%s')"), note$kind)
@@ -540,8 +558,7 @@ fastglmm <- function(formula, data, family = gaussian(),
         # REML = TRUE matches what the engine does, so only FALSE errors.
         if (isFALSE(dots$REML)) {
           stop("REML = FALSE is not supported: the glmm LMM path is REML-only ",
-               "by design, a permanent choice, not a gap ",
-               "(docs/GLMM/glmm-vs-lme4-mixedmodels.md)", call. = FALSE)
+               "by design, a permanent choice, not a gap", call. = FALSE)
         }
       },
       control = stop("control= is not supported: the optimizer (BOBYQA) ",

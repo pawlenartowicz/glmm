@@ -40,6 +40,11 @@ use common::{
     assert_group_ids, assert_model_shape, detect_aliased, fit_rank_deficient, spec_sized_from_ids,
     theta_width,
 };
+// The grouping reorder `spec_sized_from_ids` may apply. Always `pub` (it is a
+// `build_workspace` parameter and one of `spec_sized_from_ids_pub`'s returns)
+// but the `fit` module itself is private, so the stable crate surface is
+// unaffected; `crate::loop_advanced` is what actually publishes it.
+pub use common::Perm;
 
 /// Result of `fit`. Fixed-effect estimates cover all p predictors; SE and
 /// tau2 have the ranges below. Non-target SE slots are NaN.
@@ -368,6 +373,34 @@ pub enum Note {
         /// The declared level labels with a slot but no row.
         levels: Vec<String>,
     },
+    /// One grouping's random-effect design columns sit on very different
+    /// scales — the ratio of the largest to the smallest column RMS (the
+    /// implicit intercept counted at 1.0) exceeds the formula frontend's
+    /// `RE_SCALE_SPREAD_WARN` threshold (1e3). Fitting is unaffected (the
+    /// kernel scales internally), but the reported random-effect standard
+    /// deviations sit on the raw variable's scale, so a large spread makes
+    /// them hard to compare by eye. Mirrors lme4's
+    /// `lme4:::checkScaleX(tol = 1000)`.
+    ///
+    /// Raised by the formula frontend, not by a solver, for the same reason
+    /// [`Note::UnusedGroupingLevels`] is: the ratio is measured over the
+    /// lowered design, and a caller building `x`/`ModelSpec` by hand never
+    /// sees it. Reached through [`crate::formula::Lowered::notes`].
+    ReDesignScaleSpread {
+        /// The grouping factor, as the formula spells it.
+        grouping: String,
+        /// max column RMS / min column RMS over the grouping's random-effect
+        /// design columns (intercept included at 1.0).
+        ratio: f64,
+    },
+    /// `FitOptions::wald_se == WaldSe::Hessian` was requested, but the
+    /// finite-difference joint Hessian came back non-positive-definite (or a
+    /// perturbed deviance evaluation was non-finite), so the SE pass fell back
+    /// to the RX/Schur route instead. `Fit::se`/`vcov` are still filled (from
+    /// the fallback), but `Fit::stddev_se` is NaN — no θ-block SE comes out of
+    /// a Schur inverse. Never fires under `WaldSe::Rx`, which never attempts
+    /// the joint Hessian.
+    HessianSeFallback,
 }
 
 impl Diagnostics {
@@ -480,12 +513,29 @@ impl Fit {
     /// Read-only over the already-assembled `varcorr`; changes no returned
     /// estimate. `false` when `varcorr` is empty (non-mixed-model fit, or a
     /// non-converged fit that left it unassembled).
-    pub(crate) fn has_negligible_component(&self) -> bool {
+    ///
+    /// `re_scales` is [`common::re_scale_grid`] — the internal RE design-column
+    /// scale of each reported standard deviation. The comparison runs on the
+    /// INTERNAL standard deviations `sd·s` because the reported ones are not
+    /// commensurate with each other: an intercept's is in response units and a
+    /// slope's is in response per covariate unit, so their raw ratio moves when
+    /// the covariate is re-expressed and the verdict would follow it. On the
+    /// internal scale every component is "how much variation this term
+    /// contributes", and the check means what it says. All-`1.0` scales — every
+    /// intercept-only model — multiply exactly and leave this as it was.
+    pub(crate) fn has_negligible_component(&self, re_scales: &[Vec<f64>]) -> bool {
         if self.varcorr.is_empty() {
             return false;
         }
         let stddevs: Vec<Vec<f64>> = (0..self.varcorr.len())
-            .map(|g| self.stddev_corr(g).0)
+            .map(|g| {
+                let sd = self.stddev_corr(g).0;
+                let sc = re_scales.get(g);
+                sd.iter()
+                    .enumerate()
+                    .map(|(i, &v)| v * sc.and_then(|s| s.get(i)).copied().unwrap_or(1.0))
+                    .collect()
+            })
             .collect();
         let max_sd = stddevs.iter().flatten().cloned().fold(0.0_f64, f64::max);
         if max_sd <= 0.0 {
@@ -805,16 +855,24 @@ pub fn fit_warm(
     // validated HERE, ahead of the core's own re-check, so a bad `GroupIds`
     // faults against the caller's model with the entry's error message rather
     // than the core's shape-pin panic.
-    let sized = match model.re.as_ref() {
-        None => model.clone(),
+    // The sizing step may also reorder the groupings (`Perm`), so `sized`/`ids`/
+    // `perm` travel together from here on: the kernel is fed the reordered ids,
+    // and `into_fit` maps the grouping-indexed results back to the order
+    // `model` declares.
+    let (sized, ids, perm) = match model.re.as_ref() {
+        None => (
+            model.clone(),
+            std::borrow::Cow::Borrowed(ids),
+            Perm::IDENTITY,
+        ),
         Some(re) => {
             assert_group_ids(re, ids, n);
             spec_sized_from_ids(model, ids)
         }
     };
-    let mut ws = core::build_workspace(&sized, n, p, opts);
-    let view = core::fit_on(&mut ws, x, y, ids, start, opts);
-    view.into_fit(x, y, ids, n, p, model, opts)
+    let mut ws = core::build_workspace(&sized, perm, n, p, opts);
+    let view = core::fit_on(&mut ws, x, y, &ids, start, opts);
+    view.into_fit(x, y, &ids, n, p, model, opts)
 }
 /// Which LMM/GLMM solver a design routes to. `NoZ` is the dense
 /// no-Z fast path with bounded stack scratch (the `MAX_*` envelope), kept
@@ -899,7 +957,7 @@ pub(crate) use common::assert_model_shape_pub;
 pub use common::spec_sized_from_ids_pub;
 pub(crate) use common::{
     assemble_ranef_sparse, assemble_varcorr, glmm_loglik, lmm_fitted, lmm_loglik, model_df,
-    nan_vcov, pinned_flags, ranef_level_counts, vcov_from_chol,
+    nan_vcov, pinned_flags, ranef_level_counts, re_scale_grid, vcov_from_chol,
 };
 // The one diagnostics carrier. Always `pub` (it is `FitView::diagnostics`'s
 // return type), re-exported only for the loop tier — the stable path reads it

@@ -24,7 +24,7 @@ use crate::{Family, GroupIds, ModelSpec};
 use crate::StartValues;
 
 #[cfg(feature = "loop_advanced")]
-use super::common::{assert_group_ids, spec_sized_from_ids};
+use super::common::{assert_group_ids, spec_sized_from_ids, Perm};
 #[cfg(feature = "loop_advanced")]
 use super::lmm::accumulate_lmm_rows;
 #[cfg(all(test, feature = "loop_advanced"))]
@@ -74,12 +74,38 @@ pub enum LmmSeamWs {
         suff: Box<LmmSuffStats>,
         /// Cholesky/collapse scratch buffers `reml_deviance` factors into.
         fit: Box<LmmFitScratch>,
+        /// Grouping reorder the build applied — see [`LmmSeamWs::perm`].
+        perm: Perm,
     },
     /// Sparse (`Solver::Sparse`) route: one symbolic-factor workspace.
     Sparse {
         /// Symbolic-factor workspace for the sparse REML objective.
         ws: Box<crate::sparse::SparseLmmWorkspace>,
+        /// Grouping reorder the build applied — see [`LmmSeamWs::perm`].
+        perm: Perm,
     },
+}
+
+#[cfg(feature = "loop_advanced")]
+impl LmmSeamWs {
+    /// The grouping reorder [`build_lmm_seam_ws`] applied when it sized the
+    /// spec. Every θ vector crossing this seam — the `theta0` handed to
+    /// [`lmm_sweep_fit_on`], the `theta` on [`LmmSweepOutcome`], the argument to
+    /// [`lmm_objective_at`] — is in the objective's own SLOT order, deliberately
+    /// unmapped: the seam exists so a caller can adjudicate its θ-search against
+    /// the exact closure this crate minimizes, and permuting θ behind its back
+    /// would desynchronize the two vectors it is comparing. Map your own θ
+    /// through this instead.
+    ///
+    /// For the same reason those θ vectors are in the objective's own INTERNAL
+    /// RE column scale (`LmmGroupings::set_slope_scales`), not the design's units:
+    /// the closure is a function of internal θ, and `theta_row_scales` is the map
+    /// to and from a user-scale θ.
+    pub fn perm(&self) -> Perm {
+        match self {
+            LmmSeamWs::Dense { perm, .. } | LmmSeamWs::Sparse { perm, .. } => *perm,
+        }
+    }
 }
 
 /// Single O(N) build pass for the sweep seam: marshals the LMM inputs exactly
@@ -104,7 +130,10 @@ pub fn build_lmm_seam_ws(
         "dev objective seam covers Gaussian LMM only"
     );
     assert_group_ids(model.re.as_ref().unwrap(), ids, n);
-    let sized = spec_sized_from_ids(model, ids);
+    // `ids` is shadowed by the sizing step's own copy: the size rule may have
+    // reordered the groupings, and the accumulation below must see the order the
+    // sized spec describes. `perm` rides on the returned `LmmSeamWs`.
+    let (sized, ids, perm) = spec_sized_from_ids(model, ids);
     let re = sized.re.as_ref().unwrap();
     let slope_cols: Vec<usize> = re.slopes.iter().map(|&c| c as usize).collect();
     let extra_slope_cols: Vec<Vec<usize>> = re
@@ -134,18 +163,24 @@ pub fn build_lmm_seam_ws(
                 LmmSeamWs::Dense {
                     suff: Box::new(suff),
                     fit: Box::new(fit),
+                    perm,
                 },
                 g,
             )
         }
         Solver::Sparse => {
-            let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(
+            let mut g = crate::lmm::LmmGroupings::from_cluster_spec_ext(
                 &sized,
                 n,
                 &slope_cols,
                 &extra_slope_cols,
             );
             let xm = faer::MatRef::from_row_major_slice(x, n, p);
+            // The seam exists so a caller can drive the EXACT objective the crate
+            // minimizes, so its Z must carry the same internal RE column scales
+            // `fit_mle_sparse` installs — change together.
+            g.set_slope_scales(xm, None);
+            let g = g;
             let ws = crate::sparse::SparseLmmWorkspace::new(
                 &g,
                 xm,
@@ -156,7 +191,13 @@ pub fn build_lmm_seam_ws(
                 p,
                 None,
             );
-            (LmmSeamWs::Sparse { ws: Box::new(ws) }, g)
+            (
+                LmmSeamWs::Sparse {
+                    ws: Box::new(ws),
+                    perm,
+                },
+                g,
+            )
         }
     }
 }
@@ -178,11 +219,11 @@ fn with_lmm_objective<R>(
 ) -> R {
     let (mut ws, g) = build_lmm_seam_ws(x, y, n, p, model, ids);
     match &mut ws {
-        LmmSeamWs::Dense { suff, fit } => {
+        LmmSeamWs::Dense { suff, fit, .. } => {
             let mut obj = |theta: &[f64]| crate::lmm::reml_deviance(theta, suff, fit);
             f(&mut obj, &g)
         }
-        LmmSeamWs::Sparse { ws } => {
+        LmmSeamWs::Sparse { ws, .. } => {
             let mut obj = |theta: &[f64]| crate::sparse::sparse_reml_deviance(theta, ws);
             f(&mut obj, &g)
         }
@@ -327,11 +368,11 @@ pub fn lmm_sweep_fit_on(
     trace: Option<&mut LmmTrace<'_>>,
 ) -> LmmSweepOutcome {
     match ws {
-        LmmSeamWs::Dense { suff, fit } => {
+        LmmSeamWs::Dense { suff, fit, .. } => {
             let mut obj = |theta: &[f64]| crate::lmm::reml_deviance(theta, suff, fit);
             lmm_sweep_search(&mut obj, g, theta0, rho_end, max_fun, trace)
         }
-        LmmSeamWs::Sparse { ws } => {
+        LmmSeamWs::Sparse { ws, .. } => {
             let mut obj = |theta: &[f64]| crate::sparse::sparse_reml_deviance(theta, ws);
             lmm_sweep_search(&mut obj, g, theta0, rho_end, max_fun, trace)
         }

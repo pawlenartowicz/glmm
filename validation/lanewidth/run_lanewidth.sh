@@ -10,10 +10,10 @@
 # takes the scalar path instead. See README.md next to this script for the
 # full design rationale and how to interpret the diff between the two runs.
 #
-# HARD CONSTRAINT (RULE 4): the patch is applied ONLY inside a
+# HARD CONSTRAINT: the patch is applied ONLY inside a
 # scratch copy this script creates. It never touches the real tree's
-# Cargo.toml/Cargo.lock, and the real pulp pin (`=0.22.2` in
-# GLMM/Cargo.toml) is never edited. Running this script must leave the real
+# Cargo.toml/Cargo.lock, and the real pulp pin (`=0.22.2` in the crate's
+# Cargo.toml) is never edited. Running this script must leave the real
 # tree bit-for-bit as it found it.
 #
 #   ./run_lanewidth.sh                       default filter (NB/sparse fit tests)

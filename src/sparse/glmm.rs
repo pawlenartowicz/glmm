@@ -124,10 +124,10 @@ pub(crate) struct SparseGlmmWorkspace {
     k: usize,
     p: usize,
     /// PIRLS exit-tol override read by `pirls` — the sparse twin of the dense
-    /// `GlmmWorkspace::pirls_tol_override`. `Some(PIRLS_TOL_REL_FD)` only around
-    /// the `WaldSe::Hessian` FD evals (and the RX-fallback central re-eval);
-    /// `None` on the fit path, which therefore stays bit-identical.
-    pirls_tol_override: Option<f64>,
+    /// `GlmmWorkspace::pirls_tol_override`. `Some(pirls_tol_fd(family))` only
+    /// around the `WaldSe::Hessian` FD evals (and the RX-fallback central
+    /// re-eval); `None` on the fit path, which therefore stays bit-identical.
+    pub(super) pirls_tol_override: Option<f64>,
     /// Per-row linear-predictor offset (`FitOptions::offset`), added into
     /// `eta_fixed` by `refresh_eta_fixed`. `None` ⇒ no offset, byte-identical.
     pub(super) offset: Option<Vec<f64>>,
@@ -337,10 +337,14 @@ impl SparseGlmmWorkspace {
             for c in 0..q_p {
                 let mut acc = 0.0;
                 for r in c..q_p {
+                    // Z-side factor, indexed by the Λ ROW `r` (not the column `c`):
+                    // it takes the RE column's internal scale
+                    // (`LmmGroupings::set_slope_scales`), while `lam_small` is the
+                    // θ side and takes none. The intercept's scale is exactly 1.
                     let z = if r == 0 {
                         1.0
                     } else {
-                        x[(i, g.primary_slope_cols[r - 1])]
+                        x[(i, g.primary_slope_cols[r - 1])] / g.primary_slope_scales[r - 1]
                     };
                     acc += z * self.lam_small[r * q_p + c];
                 }
@@ -353,10 +357,11 @@ impl SparseGlmmWorkspace {
                 for c in 0..q_g {
                     let mut acc = 0.0;
                     for r in c..q_g {
+                        // Λ ROW index again — see the primary block above.
                         let z = if r == 0 {
                             1.0
                         } else {
-                            x[(i, g.extra_slope_cols[e][r - 1])]
+                            x[(i, g.extra_slope_cols[e][r - 1])] / g.extra_slope_scales[e][r - 1]
                         };
                         acc += z * self.lam_small[lo + r * q_g + c];
                     }
@@ -393,11 +398,12 @@ impl SparseGlmmWorkspace {
     /// with u. Same discipline verbatim: trial evaluation at the current u,
     /// band-tolerant retrospective step-halving (lme4 `pwrssUpdate`), the mixed
     /// `dev(uⱼ) + ‖uⱼ₊₁‖²` convergence rule, `log|A|` off the factor that
-    /// produced the returned u. Every family takes the general Fisher-scoring
-    /// branch through `family.rs` (no fused-SIMD logit shortcut here — for
-    /// canonical links the general weight/residual reduce to the same
-    /// quantities, and this path has no byte-identity gate to a prior
-    /// implementation). Returns `(dev, ‖ũ‖², log|A|, converged)`; a non-PD
+    /// produced the returned u. Every family takes the scalar per-row branch
+    /// through `family::irls_weight_and_resid` — no logit shortcut, and not the
+    /// batched `simd_transcendental::family_pass` the dense variants dispatch:
+    /// the row body here is interleaved with the packed-M gather that forms η,
+    /// so there is no materialized η column for a kernel to stream over.
+    /// Returns `(dev, ‖ũ‖², log|A|, converged)`; a non-PD
     /// A/S_β or exhausted halvings surface as `(NaN, NaN, NaN, false)`.
     /// Iterates from whatever `self.u` holds on entry — `pirls` itself never
     /// decides reset vs. warm-start; that call is `sparse_glmm_deviance`'s
@@ -821,7 +827,33 @@ fn sparse_glmm_schur(ws: &mut SparseGlmmWorkspace, x: MatRef<f64>, n: usize) -> 
 /// from ~4.7e-4 toward 1e-4 on a large-SD model and push it further into
 /// noise, not out of it. The sparse arm needs its own step calibration in the
 /// large-θ̂ regime, measured separately.
-const SPARSE_FD_STEP_REL: f64 = 1e-4;
+pub(super) const SPARSE_FD_STEP_REL: f64 = 1e-4;
+
+// Test-only capture of the converged internal-scale γ̂ = [θ̃ | β̂].
+//
+// The FD-margin measurement has to difference the deviance at exactly the point
+// the shipped stencil differences, and γ̂ leaves `fit_glmm_sparse` only as
+// `varcorr` — a `σ̂²·Λ̂Λ̂'` product whose Gamma σ̂² factor is not recoverable from
+// the returned `Fit` (`dispersion` reports the Pearson φ̂, a different
+// quantity), so on the one sparse × non-canonical rung in the corpus γ̂ cannot
+// be reconstructed from the outside. Thread-local, so parallel test threads
+// never observe each other's fits; written only when a caller has armed the
+// slot, so an ordinary test pays one `is_some` check.
+#[cfg(test)]
+thread_local! {
+    pub(super) static GAMMA_HAT_CAPTURE: std::cell::RefCell<Option<Vec<f64>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn capture_gamma_hat(params: &[f64]) {
+    GAMMA_HAT_CAPTURE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            *slot = Some(params.to_vec());
+        }
+    });
+}
 
 /// FD-Hessian joint (θ,β) covariance on the sparse path — mirrors
 /// `glmm::fd_hessian_cov`'s scheme (single-step central differences, no
@@ -833,11 +865,12 @@ const SPARSE_FD_STEP_REL: f64 = 1e-4;
 /// Returns `None` on a non-finite perturbed deviance or non-PD joint Hessian —
 /// the caller falls back to the Rx Schur (the `NonPdFellBackToRx` shape).
 /// Tolerance contract: the CALLER sets `ws.pirls_tol_override =
-/// Some(PIRLS_TOL_REL_FD)` around this call (and its fallback re-eval) and
+/// Some(pirls_tol_fd(family))` around this call (and its fallback re-eval) and
 /// resets it after — set/reset can't live here because the `?` early returns
-/// would skip the reset. Same rationale as the dense `fd_hessian_cov`: at the
-/// canonical fit tol the FD is not step-invariant; at the tight tol it is, by
-/// construction.
+/// would skip the reset. Same rationale as the dense `fd_hessian_cov`: at a loose
+/// exit tolerance the FD is not step-invariant, and the FD-pass tol is capped at
+/// `PIRLS_TOL_REL_FD` while never exceeding the family's own fit tolerance, so
+/// the stencil differences a deviance at least as converged as the fit's.
 /// One Hessian entry `(i, j)` of the sparse FD grid via the shared stencils:
 /// diagonal → `fd_second_diff`, off-diagonal → `fd_mixed_diff`. Returns `None`
 /// on any non-finite eval so both the serial (`?`) and rayon (grid-wide check)
@@ -1025,12 +1058,19 @@ pub(crate) fn fit_glmm_sparse(
         .iter()
         .map(|g| g.slopes.iter().map(|&c| c as usize).collect())
         .collect();
-    let g = LmmGroupings::from_cluster_spec_ext(model, n, &slope_cols, &extra_slope_cols);
+    let mut g = LmmGroupings::from_cluster_spec_ext(model, n, &slope_cols, &extra_slope_cols);
     let n_theta = g.n_theta();
     if n == 0 || p == 0 {
         return (sparse_glmm_nan_fit(p, n_theta), f64::INFINITY);
     }
     let xm = MatRef::from_row_major_slice(x, n, p);
+    // Before the workspace copies the groupings: `fill_m_vals` divides every slope
+    // value by its RE column's internal scale, so the scales must be current for
+    // THIS design first (mirrors `accumulate_lmm_rows` on the dense LMM route).
+    // Setting them here rather than on `ws.g` also covers the per-thread FD-Hessian
+    // workspace clones, which copy the groupings wholesale.
+    g.set_slope_scales(xm, opts.weights.as_deref());
+    let g = g;
     let mut ws = SparseGlmmWorkspace::new(&g, cluster_ids, extra_ids, n, p);
     if let Some(w) = &opts.weights {
         ws.prior_w[..n].copy_from_slice(w);
@@ -1055,8 +1095,11 @@ pub(crate) fn fit_glmm_sparse(
     let mut params = vec![0.0f64; n_theta + p];
     match start {
         Some(s) if !s.theta.is_empty() => {
-            for (t, &v) in params[..n_theta].iter_mut().zip(&s.theta) {
-                *t = v;
+            // Forward map into the solver's internal RE scale before the floor —
+            // mirror `fit_lmm`'s warm arm; change together.
+            let sc = g.theta_row_scales();
+            for ((t, &v), &f) in params[..n_theta].iter_mut().zip(&s.theta).zip(sc.iter()) {
+                *t = v * f;
             }
             for &i in g.diagonal_theta() {
                 params[i] = params[i].max(crate::lmm::THETA_TRUTH_FLOOR);
@@ -1187,6 +1230,9 @@ pub(crate) fn fit_glmm_sparse(
         return (sparse_glmm_nan_fit(p, n_theta), f64::INFINITY);
     }
 
+    #[cfg(test)]
+    capture_gamma_hat(&params);
+
     let beta: Vec<f64> = params[n_theta..].to_vec();
 
     // tau2 / dispersion / varcorr off the converged state, BEFORE the FD-Hessian
@@ -1199,9 +1245,13 @@ pub(crate) fn fit_glmm_sparse(
         &ws.u[..ws.k],
         Some(&ws.prior_w[..n]),
     );
+    // θ̂ is in the solver's internal RE units; the Λ-row scales divide it back into
+    // the design's own units before it is squared (mirror `glmm_view_to_fit`).
+    let theta_scales = g.theta_row_scales();
     let tau2: Vec<f64> = params[..n_theta]
         .iter()
-        .map(|&t| t * t * sigma_sq)
+        .zip(theta_scales.iter())
+        .map(|(&t, &s)| (t / s) * (t / s) * sigma_sq)
         .collect();
     let dispersion = match family {
         crate::Family::Gamma { .. } => match opts.dispersion {
@@ -1240,6 +1290,9 @@ pub(crate) fn fit_glmm_sparse(
     let mut se = vec![f64::NAN; p];
     let mut vcov = crate::fit::nan_vcov(p);
     let mut stddev_se = vec![f64::NAN; n_theta];
+    // Set true only in the FD-Hessian arm's `None` (non-PD/non-finite) case —
+    // the structural counterpart of the dense route's `NonPdFellBackToRx`.
+    let mut hessian_fallback = false;
     let cov_from_schur = |schur: Mat<f64>, se: &mut [f64], vcov: &mut Vec<Vec<f64>>| -> bool {
         // σ̂²·(S_β)⁻¹ from chol(S_β) (mirror the dense Rx arm, including Gamma's
         // σ̂² on the RX vcov — lme4 `vcov(use.hessian=FALSE)`). SE is its
@@ -1270,9 +1323,9 @@ pub(crate) fn fit_glmm_sparse(
         }
         crate::WaldSe::Hessian => {
             // FD evals (and the fallback's central re-eval below) converge PIRLS at
-            // the FD-only tight tol; reset right after the match so the returned-fit
+            // the FD-pass tol; reset right after the match so the returned-fit
             // workspace never leaks it (see sparse_fd_hessian_cov's contract).
-            ws.pirls_tol_override = Some(crate::glmm::PIRLS_TOL_REL_FD);
+            ws.pirls_tol_override = Some(crate::glmm::pirls_tol_fd(family));
             match sparse_fd_hessian_cov(
                 family,
                 nb_theta,
@@ -1306,9 +1359,20 @@ pub(crate) fn fit_glmm_sparse(
                             vcov[b][a] = cov[(a, b)];
                         }
                     }
-                    stddev_se.copy_from_slice(&tse);
+                    // FD SEs are on the internal θ̃ = s·θ; the map is a fixed
+                    // diagonal linear reparametrization, so the back-map is the
+                    // same plain division θ̂ takes and carries no delta-method term
+                    // (mirror `glmm_view_to_fit`).
+                    for ((slot, &v), &sc) in stddev_se
+                        .iter_mut()
+                        .zip(tse.iter())
+                        .zip(theta_scales.iter())
+                    {
+                        *slot = v / sc;
+                    }
                 }
                 None => {
+                    hessian_fallback = true;
                     // RX fallback (the dense `NonPdFellBackToRx` shape): restore the
                     // converged workspace state the FD loop perturbed, then Schur. The
                     // re-eval runs cold-seeded/tight-tol (see `sparse_glmm_deviance`'s
@@ -1331,7 +1395,7 @@ pub(crate) fn fit_glmm_sparse(
                     // is a full p×p, same as the dense fallback's `rx_cov_into`.
                 }
             }
-            ws.pirls_tol_override = None; // never leak the FD tight tol past the SE step
+            ws.pirls_tol_override = None; // never leak the FD-pass tol past the SE step
         }
     }
 
@@ -1347,16 +1411,22 @@ pub(crate) fn fit_glmm_sparse(
         // Same story as the sparse LMM route: no pivot, so ill-conditioning
         // stays unreported and `boundary` is back-derived; `pinned` is real,
         // off the pin loop above. `notes` DOES carry a PIRLS-exhaustion
-        // observation when one fired — the only note this route can emit.
+        // observation when one fired, and a Hessian-SE-fallback observation
+        // when the FD-Hessian arm above fell back to Schur.
         diagnostics: crate::Diagnostics {
             pinned: pinned_grid,
-            notes: if ws.pirls_exhausted > 0 || ws.final_pirls_exhausted {
-                vec![crate::Note::PirlsExhausted {
-                    evals: ws.pirls_exhausted,
-                    final_eval: ws.final_pirls_exhausted,
-                }]
-            } else {
-                vec![]
+            notes: {
+                let mut notes = vec![];
+                if ws.pirls_exhausted > 0 || ws.final_pirls_exhausted {
+                    notes.push(crate::Note::PirlsExhausted {
+                        evals: ws.pirls_exhausted,
+                        final_eval: ws.final_pirls_exhausted,
+                    });
+                }
+                if hessian_fallback {
+                    notes.push(crate::Note::HessianSeFallback);
+                }
+                notes
             },
             ..crate::Diagnostics::from_flags(true, pinned, p)
         },
@@ -1371,7 +1441,8 @@ pub(crate) fn fit_glmm_sparse(
         ranef,
         ranef_levels: crate::fit::ranef_level_counts(&g),
     };
-    fit.diagnostics.singular = fit.diagnostics.singular || fit.has_negligible_component();
+    fit.diagnostics.singular =
+        fit.diagnostics.singular || fit.has_negligible_component(&crate::fit::re_scale_grid(&g));
     (fit, final_deviance)
 }
 

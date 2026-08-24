@@ -68,7 +68,7 @@ README's own copy of the essentials, not the whole set.
 | [`documentation/coming-from-statsmodels.md`](documentation/coming-from-statsmodels.md) | Migrating from `statsmodels` `MixedLM`/`GLM` to `glmm.fit` (Python only) |
 | [`documentation/troubleshooting.md`](documentation/troubleshooting.md) | Fixes for singular fits, non-convergence, NotImplementedError, and rejected formulas |
 
-## Scope and stability (0.2.x)
+## Scope and stability (0.3.x)
 
 The semver-covered surface is `fit_cold`/`fit_warm` + `ModelSpec` + `GroupIds`.
 
@@ -152,7 +152,7 @@ fit = glmm.fit(data, "y ~ x1 + (1 | group)")   # data: dict / pandas / polars
 fit.summary()
 ```
 
-The public surface is six names: `glmm.fit`, `glmm.Fit`, and the four warning
+The public surface is eight names: `glmm.fit`, `glmm.Fit`, and the six warning
 categories the diagnostics channel raises. See the
 [Python README](python/README.md) and
 [`tutorial-python.md`](documentation/tutorial-python.md).

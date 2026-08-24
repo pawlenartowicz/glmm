@@ -16,8 +16,8 @@ use super::BETA_BOX;
 pub struct GlmmWorkspace {
     /// reused RE structure (estimator-agnostic)
     pub groupings: LmmGroupings,
-    /// Outcome family/link selecting the PIRLS IRLS math. `Binomial{Logit}` runs
-    /// the verbatim fused-SIMD path; other families take the general branch.
+    /// Outcome family/link selecting the PIRLS IRLS math — the arm
+    /// `simd_transcendental::family_pass` dispatches to each iteration.
     pub family: crate::Family,
     /// NB dispersion θ̂ fixed for this fit by the marginal-θ outer loop — read by
     /// the PIRLS/AGQ variance/deviance only when `family` is `NegativeBinomial`.
@@ -117,9 +117,9 @@ pub struct GlmmWorkspace {
     /// `wᵢ·devᵢ` on the deviance, `wᵢ·ρᵢ` on the score; everything downstream
     /// (A/RHS scatter, β border, Schur, FD Hessian) reads `w`/ρ and inherits it.
     pub(crate) prior_w: Vec<f64>,
-    /// True iff `prior_w` was filled from `FitOptions::weights`. Gates the
-    /// fused-SIMD logit fast path in `pirls.rs` (the fused kernel cannot take
-    /// per-row weights; weighted logit runs the general scalar branch).
+    /// True iff `prior_w` was filled from `FitOptions::weights`. Selects between
+    /// the two logit arms of `simd_transcendental::family_pass`: the fused
+    /// `Σ log1pexp` deviance identity holds only for unweighted Bernoulli rows.
     pub(crate) weighted: bool,
     /// Current RE-mode iterate û, length k.
     pub u: Vec<f64>,
@@ -278,10 +278,10 @@ pub struct GlmmWorkspace {
     /// derivation and for why f0 is inside the warm set too.
     pub warm_seed_active: bool,
     /// PIRLS exit-tol override read by `laplace_deviance_at` and forwarded to every
-    /// PIRLS variant. `Some(PIRLS_TOL_REL_FD)` ONLY while `fd_hessian_cov` runs (set
-    /// on entry, reset on every exit — the `warm_seed_active` discipline), so the FD
-    /// second differences see a deviance smooth to ~1e-8 instead of the canonical
-    /// 1e-6 exit noise. `None` everywhere else: the fit/BOBYQA path never pays the
+    /// PIRLS variant. `Some(pirls_tol_fd(family))` ONLY while `fd_hessian_cov` runs
+    /// (set on entry, reset on every exit — the `warm_seed_active` discipline), so
+    /// the FD second differences see a deviance converged at least as far as the
+    /// fit's own exit. `None` everywhere else: the fit/BOBYQA path never pays the
     /// extra inner iterations and stays bit-identical.
     pub pirls_tol_override: Option<f64>,
     /// Per-row linear-predictor offset (`FitOptions::offset`), read by every
@@ -918,7 +918,12 @@ pub fn build_z(
                                // Slope cols come from the workspace's own `primary_slope_cols` (set once at
                                // construction), mirroring `fill_z_f64` — not a per-call param. q_p−1 == #slopes.
         for d in 0..q - 1 {
-            ws.z[(i, base + 1 + d)] = x[(i, g.primary_slope_cols[d])];
+            // Read AS A RANDOM-EFFECT column, so it takes the internal scale
+            // (`LmmGroupings::set_slope_scales`); the same x column keeps its raw
+            // value everywhere the fixed-effect design reads it. Mirrored by
+            // `fill_z_f64` and by the Rx M row in `se::blocked_schur_fill` —
+            // change together.
+            ws.z[(i, base + 1 + d)] = x[(i, g.primary_slope_cols[d])] / g.primary_slope_scales[d];
         }
     }
     for (e, ids) in extra_ids.iter().enumerate() {
@@ -930,16 +935,18 @@ pub fn build_z(
     }
 }
 
-/// Per-fit f64 widening of the primary-slope columns: `z_buf[i·(q−1)+d] =
-/// x[i, slope_cols[d]]`. θ/β change per BOBYQA eval but `x` is fixed per fit,
-/// so this hoists every f32 MatRef load out of the per-solve M fill — the fill
-/// becomes a pure contiguous-f64 product. f32→f64 widening is value-exact, so
-/// bit-identity is preserved. No-op at q_p = 1 (no slope columns).
+/// Per-fit hoist of the primary-slope Z columns: `z_buf[i·(q−1)+d] =
+/// x[i, slope_cols[d]] / s_d`. θ/β change per BOBYQA eval but `x` and the scales
+/// are fixed per fit, so this lifts the MatRef load and the scale division out of
+/// the per-solve M fill — the fill becomes a pure contiguous-f64 product. `s_d`
+/// is the RE column's internal scale (`LmmGroupings::set_slope_scales`); mirrored
+/// by `build_z` and by the Rx M row in `se::blocked_schur_fill` — change
+/// together. No-op at q_p = 1 (no slope columns).
 pub(crate) fn fill_z_f64(g: &LmmGroupings, x: MatRef<f64>, z_buf: &mut [f64], n: usize) {
     let q = g.primary_q;
     for i in 0..n {
         for d in 0..q - 1 {
-            z_buf[i * (q - 1) + d] = x[(i, g.primary_slope_cols[d])];
+            z_buf[i * (q - 1) + d] = x[(i, g.primary_slope_cols[d])] / g.primary_slope_scales[d];
         }
     }
 }

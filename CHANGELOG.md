@@ -6,7 +6,74 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
-## [0.2.0] — unreleased
+## [0.3.0] — 2026-08-24
+
+The θ search no longer depends on the units a random-slope covariate happens to
+be measured in. Random-effect design columns are scaled internally before the
+optimizer sees them and mapped back to the caller's units afterwards, which
+fixes cold fits that used to settle on a worse local optimum than lme4 on a
+badly scaled design, and removes the false `singular` verdicts those designs
+produced. Two diagnostic notes arrive alongside it. Nothing breaks: the
+`#[non_exhaustive]` marking 0.2.0 paid for is what makes both new `Note`
+variants additive.
+
+### Changed
+
+- **Random-effect design columns are scaled internally, so the θ search no
+  longer depends on the units of a random-slope covariate.** Each random-slope
+  column now enters the random-effect design divided by its own weighted RMS,
+  with the matching rows of the relative Cholesky factor multiplied by the same
+  factor — an exact model identity, so the criterion surface is unchanged and
+  only the coordinate BOBYQA searches moves. Everything derived from θ̂ is mapped
+  back to the caller's units (`varcorr`, `tau2`, `ranef`, `fitted`, the GLMM
+  `stddev_se`), and a caller's warm-start θ is read in those units too. Always
+  on, no trigger.
+
+  What it fixes: on the `lme4/lme4-convergence` N400 subset, whose random-slope
+  covariate has sd 1582 against an intercept of 1, the cold fit used to land on a
+  different local optimum from lme4 — restricted logLik 238 units worse, the item
+  covariance block collapsed. It now reaches REML criterion 395213.55, which is
+  the well-scaled optimum (395184.08) plus the `4·ln(1582.449)` the REML
+  `log|X'V⁻¹X|` term picks up because the same column is a fixed effect; lme4's
+  own default fit on the unscaled data reaches 396013.25. A seeded crossed
+  random-slope sweep that used to lose up to 1054 criterion units at a 1e6 column
+  ratio now shows zero optimizer loss at every ratio through 1e6, and the GLMM
+  sweep reaches the same optimum through a 1e2 ratio with the FD-Hessian
+  standard-error route staying live where it used to fall back silently.
+
+  Two diagnostics move with it. `PIN_THETA` and the `SINGULAR_REL_TOL`
+  negligible-component check now test the internal (scaled) θ and standard
+  deviations, which is what makes their verdicts independent of a covariate's
+  units — the false `singular` those sweeps used to report is gone. This diverges
+  from lme4's user-scale `isSingular` on a badly scaled design.
+
+  Designs whose random-effect columns are all at scale exactly `1.0` — every
+  intercept-only model — are bit-identical to before. Every design carrying a real
+  scale factor moves within the floating-point reassociation band.
+
+### Added
+
+- **`Note::ReDesignScaleSpread { grouping, ratio }`** names a grouping whose
+  random-effect design columns sit on very different scales (mirrors lme4's
+  `checkScaleX`). Fitting is unaffected — that is what the internal scaling
+  above is for — but the reported stddev is easier to misread, so the note
+  says so. Raised by the formula frontend (`formula::Lowered::notes`), so a
+  caller building `x`/`ModelSpec` by hand never sees it.
+
+- **`Note::HessianSeFallback`** says `WaldSe::Hessian` was requested but the
+  finite-difference joint Hessian was not usable, so the standard-error pass
+  fell back to RX/Schur. Comes from the GLMM routes, dense and sparse, and only
+  under `WaldSe::Hessian` — the fallback used to be silent.
+
+- **Python: `glmm.ReDesignScaleWarning` and `glmm.HessianSeFallbackWarning`**,
+  one per new note variant, both subclasses of `glmm.DiagnosticWarning` and
+  filterable the same way. The public surface goes from six names to eight.
+
+- **R: `fastglmm_re_design_scale_spread` and `fastglmm_hessian_se_fallback`**,
+  two more classed conditions inheriting `fastglmm_diagnostic`. A port that did
+  not know these variants would have routed them to `fastglmm_unknown_note`.
+
+## [0.2.0] — 2026-08-07
 
 A correctness release that breaks one thing on purpose. Near-collinearity is a
 spectrum, and the crate treated most of it as failure: a design whose columns
@@ -75,9 +142,9 @@ and R callers see additions only.
   each named in advance and re-pinned with provenance; fits with
   `max(1, |θ̂|) = 1` are bit-identical. Against `glmer`
   `vcov(use.hessian = TRUE)` at `tolPwrss = 1e-13`: 3.9e-5 → 1.4e-5 (θ̂ = 2.97)
-  and 1.3e-5 → 7.4e-6 (θ̂ = 4.51). The residual gap is reference-limited —
-  glmm sits within 3.1e-6 of its own h→0 limit, while lme4's value is itself a
-  δ = 1e-4 finite difference carrying 5–9e-6.
+  and 1.3e-5 → 7.4e-6 (θ̂ = 4.51). glmm sits within 7.2e-6 of its own h→0
+  stencil limit on sim_poisson_bigsd and under 4e-7 on sim_binomial_bigsd;
+  lme4's value is itself a δ = 1e-4 finite difference carrying 5–9e-6.
 
 - **The singular-fit warning stops asserting things the numbers contradict.**
   Both ports said `sd(term | group) = 0`; they now say `pinned at the variance
@@ -299,11 +366,11 @@ and R callers see additions only.
 
 ### Removed
 
-- **`LmeScratch::ols_scratch`** (`loop_advanced`, RULE 1): provisioned for a
-  τ̂ ≈ 0 OLS fallback never implemented — the boundary case pins θ and runs the
-  same profiled-deviance path. Written and read by nobody.
+- **`LmeScratch::ols_scratch`** (`loop_advanced`, no semver guarantee):
+  provisioned for a τ̂ ≈ 0 OLS fallback never implemented — the boundary case
+  pins θ and runs the same profiled-deviance path. Written and read by nobody.
 
-### Changed — `loop_advanced` (no semver guarantee, RULE 1)
+### Changed — `loop_advanced` (no semver guarantee)
 
 Every changed item, named because MCPower consumes this tier.
 

@@ -74,6 +74,14 @@ pub const THETA_TRUTH_FLOOR: f64 = 0.01;
 /// pinned at exactly 0 and counted converged. 1e-4 aligns the class boundary
 /// with the shipped τ̂≈0 detection (`lme.rs` pins boundary_hit=1 fits at
 /// θ = 1e-4).
+///
+/// **Tested on the INTERNAL θ** — the scaled coordinate the solver minimizes over
+/// ([`LmmGroupings::set_slope_scales`]), not on θ in the design's own units.
+/// Internal θ is what the optimizer's own stopping geometry lives on, and it is
+/// the only version of the test that does not change its verdict when a
+/// random-slope column is re-expressed in different units. The cost is that a
+/// badly scaled design can be flagged differently from lme4's `isSingular`,
+/// which applies the same 1e-4 to user-scale θ.
 pub const PIN_THETA: f64 = 1e-4;
 /// Min/max L-diagonal floor for `lme.rs`'s rank guard. Retained only for that
 /// route (`loop_advanced`-only, fits off pre-accumulated sufficient statistics);
@@ -372,6 +380,50 @@ pub struct LmmGroupings {
     /// Empty (or empty inner) for intercept-only extras. Used by `add_rows_multi`
     /// (covariate-weighted scatter) and the blocked tail Gram recovery.
     pub extra_slope_cols: Vec<Vec<usize>>,
+    /// Internal scale `s_d` of each primary random-slope design column, parallel
+    /// to `primary_slope_cols`. Every site that reads that column as a
+    /// RANDOM-EFFECT covariate divides by it; the fixed-effect design keeps the
+    /// raw column. See [`LmmGroupings::set_slope_scales`] for the identity and
+    /// [`rms_column_scale`] for the statistic. All `1.0` until `set_slope_scales`
+    /// runs, and `1.0` divides exactly, so an unset grouping takes the unscaled
+    /// arithmetic bit-for-bit.
+    pub primary_slope_scales: Vec<f64>,
+    /// Per-extra-grouping twin of `primary_slope_scales`, parallel to
+    /// `extra_slope_cols` (declaration order).
+    pub extra_slope_scales: Vec<Vec<f64>>,
+}
+
+/// Weighted root-mean-square of design column `col`: `√(Σᵢ wᵢ xᵢ² / Σᵢ wᵢ)`.
+///
+/// This is the internal scale a random-effect design column is divided by. It is
+/// the weighted second moment about ZERO, not a centered sd, for one reason: it
+/// returns EXACTLY `1.0` on a constant-1 column under any weights, because
+/// `Σw/Σw` is `1.0` in IEEE-754 and `√1 = 1`. That exactness is what makes an
+/// implicit intercept subcolumn's factor exact and keeps an intercept-only
+/// design bit-identical to the unscaled path. A centered sd returns `0` there
+/// and would need a special case.
+///
+/// A degenerate column — zero total weight, zero weighted second moment, or a
+/// non-finite one — returns `1.0`: the scaling map has to stay invertible, and a
+/// column with no spread has no conditioning to fix.
+pub fn rms_column_scale(x: MatRef<'_, f64>, col: usize, weights: Option<&[f64]>) -> f64 {
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for i in 0..x.nrows() {
+        let w = weights.map_or(1.0, |w| w[i]);
+        let v = x[(i, col)];
+        num += w * v * v;
+        den += w;
+    }
+    if den <= 0.0 {
+        return 1.0;
+    }
+    let s = (num / den).sqrt();
+    if s.is_finite() && s > 0.0 {
+        s
+    } else {
+        1.0
+    }
 }
 
 /// The vech-diagonal θ-index walk, single source of truth for
@@ -411,6 +463,8 @@ impl LmmGroupings {
             extra_slopes_any: false,
             extra_q: vec![],
             extra_slope_cols: vec![],
+            primary_slope_scales: vec![],
+            extra_slope_scales: vec![],
         }
     }
 
@@ -544,8 +598,87 @@ impl LmmGroupings {
             diagonal_theta: compute_diagonal_theta(q_p, &extra_qs),
             extra_slopes_any,
             extra_q: extra_qs,
+            primary_slope_scales: vec![1.0; slope_cols.len()],
+            extra_slope_scales: extra_slope_cols
+                .iter()
+                .map(|v| vec![1.0; v.len()])
+                .collect(),
             extra_slope_cols,
         }
+    }
+
+    /// Recompute the internal RE design-column scales from this fit's design and
+    /// prior weights. Every route calls this once, after the grouping structure
+    /// is built and before anything reads a design column as a random-effect
+    /// covariate.
+    ///
+    /// The identity being installed: for a `q`-column RE block with per-column
+    /// scales `s₁…s_q`, replacing the block's design `Z` by `Z̃ = Z·diag(1/sᵢ)`
+    /// and its relative Cholesky factor `Λ` by `Λ̃[i][j] = sᵢ·Λ[i][j]` leaves
+    /// `Z̃Λ̃ = ZΛ` — the same model, the same likelihood, the same REML criterion.
+    /// Only the path BOBYQA takes through that criterion changes: θ̃ = s·θ puts
+    /// every component on a comparable scale, so the solver's single trust radius
+    /// can resolve them all (Bates et al. 2015 §3 for the `Λ_θ` parametrization
+    /// this rides on). The covariance block back-maps as
+    /// `D[i][j] = D̃[i][j]/(sᵢ·s_j)`, and a conditional mode as `b = b̃/sᵢ`;
+    /// neither direction puts a Jacobian into the criterion.
+    ///
+    /// The implicit intercept subcolumn is exactly `1.0` and is not stored, so an
+    /// intercept-only grouping is untouched by construction.
+    pub fn set_slope_scales(&mut self, x: MatRef<'_, f64>, weights: Option<&[f64]>) {
+        for d in 0..self.primary_slope_cols.len() {
+            self.primary_slope_scales[d] = rms_column_scale(x, self.primary_slope_cols[d], weights);
+        }
+        for e in 0..self.extra_slope_cols.len() {
+            for d in 0..self.extra_slope_cols[e].len() {
+                self.extra_slope_scales[e][d] =
+                    rms_column_scale(x, self.extra_slope_cols[e][d], weights);
+            }
+        }
+    }
+
+    /// Λ-row scale factor for row `r` of block `b` (`b == 0` the primary, `b == e+1`
+    /// extra grouping `e`). Row 0 is the intercept subcolumn — exactly `1.0`.
+    pub fn block_row_scale(&self, b: usize, r: usize) -> f64 {
+        if r == 0 {
+            return 1.0;
+        }
+        if b == 0 {
+            self.primary_slope_scales[r - 1]
+        } else {
+            self.extra_slope_scales[b - 1][r - 1]
+        }
+    }
+
+    /// Per-θ-index Λ-row scale, in θ order (primary vech, then each extra's vech in
+    /// declaration order — the layout `n_theta`/`vech_start` assign). The solver's
+    /// internal θ̃ relates to θ in the user's design units by `θ̃ = s·θ`
+    /// entry-wise, so this vector is the forward map for a user warm start and the
+    /// divisor for anything read back off θ̂ (see [`Self::set_slope_scales`]).
+    pub fn theta_row_scales(&self) -> Vec<f64> {
+        let mut out = Vec::with_capacity(self.n_theta());
+        for (b, &q) in std::iter::once(&self.primary_q)
+            .chain(self.extra_q.iter())
+            .enumerate()
+        {
+            // Column-major vech: column c contributes rows c..q.
+            for c in 0..q {
+                for r in c..q {
+                    out.push(self.block_row_scale(b, r));
+                }
+            }
+        }
+        out
+    }
+
+    /// True iff any random-effect design column carries a scale other than exactly
+    /// `1.0` — i.e. iff this fit's arithmetic differs from the unscaled path at all.
+    pub fn any_slope_scaled(&self) -> bool {
+        self.primary_slope_scales.iter().any(|&s| s != 1.0)
+            || self
+                .extra_slope_scales
+                .iter()
+                .any(|v| v.iter().any(|&s| s != 1.0))
     }
 
     /// Primary vech (`q_p(q_p+1)/2`) + a `vech(Λ_g)` block per extra grouping
@@ -828,8 +961,12 @@ impl LmmSuffStats {
                         // no slope, so they contribute nothing here.
                         if slope {
                             for (d, &sc) in self.groupings.primary_slope_cols.iter().enumerate() {
-                                let z = self.w_buf[sc]; // already carries one zw
-                                                        // scol mirrors from_cluster_spec's RE-column layout — change together.
+                                // Slope covariate read AS A RANDOM-EFFECT column, so it
+                                // takes the internal scale (`LmmGroupings::set_slope_scales`);
+                                // the same x column keeps its raw value in the `c`/`s`
+                                // fixed-effect scatters above. Already carries one zw.
+                                let z = self.w_buf[sc] / self.groupings.primary_slope_scales[d];
+                                // scol mirrors from_cluster_spec's RE-column layout — change together.
                                 let scol = (d + 1) * n_prim + gid[0];
                                 // b's side is the crossed intercept (z=1 → zw);
                                 // total zw·zw = wᵢ, matching Σ wᵢ·x_slope·1.
@@ -860,12 +997,16 @@ impl LmmSuffStats {
                         g.extra_q[bi - 1]
                     };
                     for db in 0..q_b {
+                        // Every slope read here is a Z entry, so it takes the
+                        // internal scale; the intercept's is exactly 1 by construction.
                         let z_b = if db == 0 {
                             zw // intercept z=1 → zw (one weight side)
                         } else if bi == 0 {
                             self.w_buf[g.primary_slope_cols[db - 1]]
+                                / g.primary_slope_scales[db - 1]
                         } else {
                             self.w_buf[g.extra_slope_cols[bi - 1][db - 1]]
+                                / g.extra_slope_scales[bi - 1][db - 1]
                         };
                         let b_local = bl + db;
                         for ai in 0..n_g {
@@ -883,10 +1024,15 @@ impl LmmSuffStats {
                                 } else if ai == 0 {
                                     (
                                         da * n_prim + gid[0],
-                                        self.w_buf[g.primary_slope_cols[da - 1]],
+                                        self.w_buf[g.primary_slope_cols[da - 1]]
+                                            / g.primary_slope_scales[da - 1],
                                     )
                                 } else {
-                                    (gid[ai] + da, self.w_buf[g.extra_slope_cols[ai - 1][da - 1]])
+                                    (
+                                        gid[ai] + da,
+                                        self.w_buf[g.extra_slope_cols[ai - 1][da - 1]]
+                                            / g.extra_slope_scales[ai - 1][da - 1],
+                                    )
                                 };
                                 self.zx[(a_col, b_local)] += z_a * z_b;
                             }
@@ -902,7 +1048,8 @@ impl LmmSuffStats {
             if self.groupings.primary_q > 1 {
                 let n_prim = self.groupings.n_primary;
                 for (k, &sc) in self.groupings.primary_slope_cols.iter().enumerate() {
-                    let z = self.w_buf[sc];
+                    // Z entry ⇒ internal scale (see the zx_slope fill above).
+                    let z = self.w_buf[sc] / self.groupings.primary_slope_scales[k];
                     let scol = (k + 1) * n_prim + gid[0];
                     let scol_mut = self
                         .s
@@ -928,7 +1075,8 @@ impl LmmSuffStats {
                     let n_d = self.groupings.extra_slope_cols[e].len();
                     for d in 0..n_d {
                         let sc = self.groupings.extra_slope_cols[e][d];
-                        let z = self.w_buf[sc];
+                        // Z entry ⇒ internal scale (see the zx_slope fill above).
+                        let z = self.w_buf[sc] / self.groupings.extra_slope_scales[e][d];
                         let scol = gintercept + 1 + d;
                         let scol_mut = self
                             .s
@@ -1268,12 +1416,17 @@ fn primary_gram(suff: &LmmSuffStats, g: &LmmGroupings, f: usize, q: usize, gram:
     }
     gram[0] = suff.counts[f]; // G[0][0]
     for a in 1..q {
-        let sa = suff.s[(g.primary_slope_cols[a - 1], f)]; // Σ x_{a-1} over f
+        // `s`'s COLUMN carries the RE column's own internal scale (divided in at
+        // accumulation), but its ROW is the raw `[X y]` entry — so a Gram between
+        // two RE columns picks up only one of the two divisions here and needs the
+        // row side applied explicitly. Intercept rows have scale 1 by construction.
+        let s_a = g.primary_slope_scales[a - 1];
+        let sa = suff.s[(g.primary_slope_cols[a - 1], f)] / s_a; // Σ z_{a-1} over f
         gram[a] = sa;
         gram[a * q] = sa;
         for b in 1..=a {
-            // Σ x_{a-1} x_{b-1} over f — slope_{a-1}'s subcol against slope_{b-1}'s level.
-            let v = suff.s[(g.primary_slope_cols[a - 1], b * n_prim + f)];
+            // Σ z_{a-1} z_{b-1} over f — slope_{a-1}'s subcol against slope_{b-1}'s level.
+            let v = suff.s[(g.primary_slope_cols[a - 1], b * n_prim + f)] / s_a;
             gram[a * q + b] = v;
             gram[b * q + a] = v;
         }
@@ -1355,10 +1508,13 @@ fn assemble_fam_a(
             for e in 0..q {
                 let mut acc = 0.0;
                 for d in e..q {
+                    // `s`-ROW read of a slope covariate ⇒ apply the internal scale
+                    // (the column here is the child's intercept, scale 1); see
+                    // `primary_gram` for why the row side is not already divided.
                     let graw_d = if d == 0 {
                         n_c
                     } else {
-                        suff.s[(g.primary_slope_cols[d - 1], gcol)]
+                        suff.s[(g.primary_slope_cols[d - 1], gcol)] / g.primary_slope_scales[d - 1]
                     };
                     acc += prim_lam[d * q + e] * graw_d;
                 }
@@ -1705,6 +1861,9 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
     if let Some(nf) = g.nested {
         let q_n = nf.q;
         let nscols = &g.extra_slope_cols[nf.decl];
+        // `s`-ROW reads of a slope covariate below take the internal scale of the
+        // row's own column; the `s`-COLUMN already carries its own (`primary_gram`).
+        let nssc = &g.extra_slope_scales[nf.decl];
         for f in 0..n_prim {
             for c in 0..np {
                 let ic = prim_width + (f * np + c) * q_n;
@@ -1714,11 +1873,11 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
                         let v = if dr == 0 && dc == 0 {
                             n_c
                         } else if dr == 0 {
-                            suff.s[(nscols[dc - 1], ic)] // Σ x_{dc-1}
+                            suff.s[(nscols[dc - 1], ic)] / nssc[dc - 1] // Σ z_{dc-1}
                         } else if dc == 0 {
-                            suff.s[(nscols[dr - 1], ic)] // Σ x_{dr-1}
+                            suff.s[(nscols[dr - 1], ic)] / nssc[dr - 1] // Σ z_{dr-1}
                         } else {
-                            suff.s[(nscols[dr - 1], ic + dc)] // Σ x_{dr-1} x_{dc-1}
+                            suff.s[(nscols[dr - 1], ic + dc)] / nssc[dr - 1] // Σ z_{dr-1} z_{dc-1}
                         };
                         fit.blocked_g[(ic + dc) * k + (ic + dr)] = v;
                     }
@@ -1730,11 +1889,13 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
                         let v = if da == 0 && dc == 0 {
                             n_c
                         } else if dc == 0 {
-                            suff.s[(g.primary_slope_cols[da - 1], ic)] // Σ x^p_{da-1}
+                            suff.s[(g.primary_slope_cols[da - 1], ic)]
+                                / g.primary_slope_scales[da - 1] // Σ z^p_{da-1}
                         } else if da == 0 {
-                            suff.s[(nscols[dc - 1], ic)] // Σ x^n_{dc-1}
+                            suff.s[(nscols[dc - 1], ic)] / nssc[dc - 1] // Σ z^n_{dc-1}
                         } else {
-                            suff.s[(g.primary_slope_cols[da - 1], ic + dc)] // Σ x^p_{da-1} x^n_{dc-1}
+                            suff.s[(g.primary_slope_cols[da - 1], ic + dc)]
+                                / g.primary_slope_scales[da - 1] // Σ z^p_{da-1} z^n_{dc-1}
                         };
                         fit.blocked_g[ccol * k + prow] = v;
                         fit.blocked_g[prow * k + ccol] = v;
@@ -1748,6 +1909,8 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
         let q = cf.q;
         let off = g.extra_offsets[cf.decl];
         let scols = &g.extra_slope_cols[cf.decl];
+        // `s`-ROW side of the internal scale, as in the nested block above.
+        let ssc = &g.extra_slope_scales[cf.decl];
         for c in 0..cf.n_levels {
             let ic = off + c * q;
             let n_c = suff.counts[ic];
@@ -1756,11 +1919,11 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
                     let v = if dr == 0 && dc == 0 {
                         n_c
                     } else if dr == 0 {
-                        suff.s[(scols[dc - 1], ic)] // Σ x_{dc-1}
+                        suff.s[(scols[dc - 1], ic)] / ssc[dc - 1] // Σ z_{dc-1}
                     } else if dc == 0 {
-                        suff.s[(scols[dr - 1], ic)] // Σ x_{dr-1}
+                        suff.s[(scols[dr - 1], ic)] / ssc[dr - 1] // Σ z_{dr-1}
                     } else {
-                        suff.s[(scols[dr - 1], ic + dc)] // Σ x_{dr-1} x_{dc-1}
+                        suff.s[(scols[dr - 1], ic + dc)] / ssc[dr - 1] // Σ z_{dr-1} z_{dc-1}
                     };
                     fit.blocked_g[(ic + dc) * k + (ic + dr)] = v;
                 }
@@ -2542,8 +2705,14 @@ fn fit_lmm_impl(
     match theta_start {
         Some(ts) => {
             debug_assert_eq!(ts.len(), theta.len());
-            for (t, &v) in theta.iter_mut().zip(ts) {
-                *t = v;
+            // A caller's θ is in the design's own units; the solver works on the
+            // internally scaled θ̃ = s·θ (`LmmGroupings::set_slope_scales`), so the
+            // warm start takes the forward map before anything else touches it.
+            // THETA_TRUTH_FLOOR then floors the INTERNAL diagonals — the same scale
+            // `PIN_THETA` tests, so the two absolute thresholds stay on one axis.
+            let s = suff.groupings.theta_row_scales();
+            for ((t, &v), &sc) in theta.iter_mut().zip(ts).zip(s.iter()) {
+                *t = v * sc;
             }
             for &i in suff.groupings.diagonal_theta() {
                 theta[i] = theta[i].max(THETA_TRUTH_FLOOR);

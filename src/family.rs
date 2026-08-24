@@ -6,11 +6,15 @@
 //! per-observation deviance — plus the assembled IRLS weight / working residual.
 //! `match`-dispatched, no `dyn`.
 //!
-//! The canonical-logit hot path is **not** routed through here: it stays in the
-//! fused-SIMD kernel (`pw_and_log1pexp_sum`) for byte-identity. `Binomial{Logit}`
-//! is implemented for completeness/tests only. The new families take the general
-//! Fisher-scoring branch, which therefore cannot perturb anything that works
-//! today.
+//! These are the **scalar statement** of the math, and the reference the
+//! vectorized arms of `simd_transcendental::family_pass` are written against;
+//! the fit path itself goes through that batched kernel rather than calling
+//! these per row. Where an arm's μ differs from the function here it is from the
+//! owned SIMD `exp` standing in for libm's: a couple of ULP on the log-link arms,
+//! and up to the 5 ULP `erfc_blend_accuracy_and_head_tail_identity` pins on the
+//! probit arm, whose blend composes two owned `exp`s through a product. The
+//! unweighted-Bernoulli-logit route is the exception: `family_pass` hands it
+//! straight to `pw_and_log1pexp_sum`, so it computes none of these quantities.
 //!
 //! Convention: weights/residuals are the working-response IRLS form of MN89
 //! (`z = η + (y−μ)·dη/dμ`, `W = (dμ/dη)²/(φ·V(μ))`), with `φ` folded as 1 here —
@@ -22,15 +26,15 @@ use crate::spec::{BinomialLink, Family, GammaLink};
 
 /// `exp(η)` stays finite up to η≈709; clamp short of it so log-link μ never
 /// overflows to `inf` mid-IRLS.
-const ETA_MAX: f64 = 700.0;
+pub(crate) const ETA_MAX: f64 = 700.0;
 /// Floor for log/inverse-link μ so `V(μ)` and the working residual never divide
 /// by zero (the IRLS weight floor `glm::WEIGHT_CLAMP` is the downstream guard).
-const MU_FLOOR: f64 = 1e-10;
+pub(crate) const MU_FLOOR: f64 = 1e-10;
 /// Binomial μ is kept in `(PROB_EPS, 1−PROB_EPS)` so probit deviance/weights stay
 /// finite at the saturated ends.
-const PROB_EPS: f64 = 1e-12;
+pub(crate) const PROB_EPS: f64 = 1e-12;
 /// `1/√(2π)` — the standard-normal pdf normalizer (probit `dμ/dη`).
-const FRAC_1_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
+pub(crate) const FRAC_1_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
 /// Clamp η to each link's safe domain: `±ETA_MAX` for log links (overflow guard)
 /// and `η>0` for the Gamma inverse link (`μ=1/η>0`). Identity links pass through.

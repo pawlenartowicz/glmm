@@ -63,7 +63,7 @@ fn lmm_run_on_view_maps_to_same_fit_as_fit_cold() {
 
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
 
-    let sized = spec_sized_from_ids(&model, &ids);
+    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
     let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[], &[]);
     let mut x_mat = Mat::<f64>::zeros(n, p);
     for i in 0..n {
@@ -329,8 +329,8 @@ fn lmm_pure_dynamic_range_design_fits_in_full() {
         "no column is entangled here, so no note may be raised: {:?}",
         f.diagnostics.notes
     );
-    let sized = spec_sized_from_ids_pub(&intercept_only_lmm(), &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&intercept_only_lmm(), &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
     assert!(!d.ill_conditioned, "pivot {} must clear the floor", d.pivot);
     // Band, not a pin: the doc comment above quotes 0.235 as the minimum
@@ -580,8 +580,8 @@ fn lmm_entangled_pair_fits_in_full_with_honest_ses() {
         "the pair is distinguishable in f64, so no note may be raised: {:?}",
         f.diagnostics.notes
     );
-    let sized = spec_sized_from_ids_pub(&intercept_only_lmm(), &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&intercept_only_lmm(), &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
     assert!(!d.ill_conditioned, "pivot {} must clear the floor", d.pivot);
     // A 2× band, not a pin. This pivot is a cancelled quantity and the doc's
@@ -1292,7 +1292,7 @@ fn fit_lmm_weighted_matches_lme4() {
     // diagonal, not the raw residual variance) — reconstruct via the same
     // suff-stats accumulator/kernel `fit_mle` calls, reading `sigma_sq`
     // straight off `LmmFit` (mirrors fit_mle's construction verbatim).
-    let sized = spec_sized_from_ids(&model, &ids);
+    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
     let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[1], &[]);
     let mut x_mat = Mat::<f64>::zeros(n, p);
     for i in 0..n {
@@ -1604,18 +1604,23 @@ fn fit_lmm_weighted_boundary_matches_wls() {
 ///
 /// Values recorded from glmm. They are validated by `sim_slope_lmm`, whose
 /// cross-engine cell checks the same fit against lme4.
+///
+/// Re-pinned 2026-08-23 with random-effect design column scaling: `x` has a
+/// column scale of 0.9688, so this fit carries a real scale factor and sits in
+/// the reassociation band the change allows (worst move here 1.3e-6 on the
+/// `g1` covariance, on a criterion that improved by 4.9e-8).
 #[test]
 fn fit_sim_slope_varcorr_is_pinned() {
-    const REF_BETA: [f64; 2] = [1.038027232001732, 0.8009679266277173];
-    const REF_SE: [f64; 2] = [0.33893198769052935, 0.17067326607075656];
+    const REF_BETA: [f64; 2] = [1.0380272349025235, 0.8009679281627348];
+    const REF_SE: [f64; 2] = [0.33893200546608876, 0.17067327664798077];
     // varcorr[0] = g1, packed lower triangle [v00, c01, v11]; varcorr[1] = g2.
     const REF_VC_G1: [f64; 3] = [
-        0.8994006042465587,
-        -0.11776425179243186,
-        0.39740694659663073,
+        0.8994006925131315,
+        -0.11776410058933363,
+        0.39740702504465475,
     ];
-    const REF_VC_G2: f64 = 0.5081866440363081;
-    const REF_SIGMA2: f64 = 0.5717627834266172;
+    const REF_VC_G2: f64 = 0.5081867068546223;
+    const REF_SIGMA2: f64 = 0.5717627431388194;
 
     let csv = include_str!("../../validation/data/simulated/sim_slope.csv");
     let mut y = Vec::<f64>::new();
@@ -1839,6 +1844,122 @@ fn fit_pastes_nested_matches_lme4() {
         (cask_sd - REF_CASK_SD).abs() / REF_CASK_SD < 5e-3,
         "cask sd = {cask_sd} vs lme4 {REF_CASK_SD}"
     );
+}
+
+/// Grouping order must not change the answer. Both declarations of the same
+/// two-factor scalar-crossed design — `(1|big) + (1|small)` and
+/// `(1|small) + (1|big)` — reach the kernel as the identical design, because
+/// the size rule makes the many-level factor the primary either way. So the
+/// fits are BIT-identical wherever the quantity is grouping-blind (deviance, β,
+/// SE, the optimizer's evaluation count), and every grouping-indexed field
+/// comes back in the order that caller declared, which is the reverse of the
+/// other's.
+///
+/// Bit equality is the assertion, not a tolerance: the two calls hand the
+/// accumulator the same rows in the same order, so anything short of identity
+/// would mean the reorder had leaked into the arithmetic.
+#[test]
+fn scalar_crossed_lmm_is_grouping_order_insensitive() {
+    const BIG: usize = 15;
+    const SMALL: usize = 4;
+    let n = 180usize;
+    let p = 2usize;
+    let mut st = 20_260_807u64;
+    let big_eff: Vec<f64> = (0..BIG).map(|_| 0.9 * lcg(&mut st)).collect();
+    let small_eff: Vec<f64> = (0..SMALL).map(|_| 0.3 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut big = vec![0u32; n];
+    let mut small = vec![0u32; n];
+    for i in 0..n {
+        big[i] = (i % BIG) as u32;
+        small[i] = ((i / BIG) % SMALL) as u32;
+        let cov = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = cov;
+        y[i] = 0.7
+            + 0.4 * cov
+            + big_eff[big[i] as usize]
+            + small_eff[small[i] as usize]
+            + 0.25 * lcg(&mut st);
+    }
+    // One extra crossed intercept-only grouping; counts are placeholders, as
+    // the formula frontend emits them.
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 1 },
+                slopes: vec![],
+            }],
+        }),
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let fit_of = |primary: &[u32], extra: &[u32]| {
+        let ids = GroupIds {
+            primary: primary.to_vec(),
+            extra: vec![extra.to_vec()],
+        };
+        fit_cold(&x, &y, n, p, &model, &ids, &opts)
+    };
+    // `a` declares the many-level factor first (already the chosen order),
+    // `b` declares it second (the rule swaps).
+    let a = fit_of(&big, &small);
+    let b = fit_of(&small, &big);
+    assert!(a.converged() && b.converged(), "both orders must converge");
+
+    assert_eq!(a.deviance.to_bits(), b.deviance.to_bits(), "deviance");
+    assert_eq!(a.n_eval, b.n_eval, "objective evaluations");
+    for j in 0..p {
+        assert_eq!(a.beta[j].to_bits(), b.beta[j].to_bits(), "beta[{j}]");
+        assert_eq!(a.se[j].to_bits(), b.se[j].to_bits(), "se[{j}]");
+    }
+
+    // Declared order: `a` reports [big, small], `b` reports [small, big].
+    assert_eq!(a.ranef_levels, vec![BIG, SMALL], "a declares big first");
+    assert_eq!(b.ranef_levels, vec![SMALL, BIG], "b declares small first");
+    assert_eq!(a.varcorr.len(), 2, "one block per grouping");
+    assert_eq!(b.varcorr.len(), 2, "one block per grouping");
+    for (g, h) in [(0usize, 1usize), (1, 0)] {
+        assert_eq!(
+            a.varcorr[g].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.varcorr[h].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "varcorr block for the same grouping (a[{g}] vs b[{h}])"
+        );
+        assert_eq!(
+            a.tau2[g].to_bits(),
+            b.tau2[h].to_bits(),
+            "tau2[{g}] vs tau2[{h}]"
+        );
+    }
+    assert_eq!(
+        a.diagnostics.pinned.len(),
+        b.diagnostics.pinned.len(),
+        "pinned block count"
+    );
+    for (g, h) in [(0usize, 1usize), (1, 0)] {
+        if let (Some(pa), Some(pb)) = (a.diagnostics.pinned.get(g), b.diagnostics.pinned.get(h)) {
+            assert_eq!(pa, pb, "pinned[{g}] vs pinned[{h}]");
+        }
+    }
+    // Conditional modes are per-grouping blocks of unequal width — the case the
+    // per-entry swap above cannot cover.
+    assert_eq!(a.ranef.len(), BIG + SMALL, "one mode per level");
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&a.ranef[..BIG]), bits(&b.ranef[SMALL..]), "big modes");
+    assert_eq!(
+        bits(&a.ranef[BIG..]),
+        bits(&b.ranef[..SMALL]),
+        "small modes"
+    );
+    for i in 0..n {
+        assert_eq!(a.fitted[i].to_bits(), b.fitted[i].to_bits(), "fitted[{i}]");
+    }
 }
 
 /// Bit-for-bit `LmmSweepOutcome` comparison — the arbiter for task 2's reuse
@@ -2154,4 +2275,345 @@ fn refit_lmm_matches_fresh_fit_cold() {
         assert_eq!(refit.n_eval, cold.n_eval, "{label}: n_eval");
         assert_eq!(refit.singular(), cold.singular(), "{label}: singular");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Internal random-effect column scaling (`LmmGroupings::set_slope_scales`) —
+// rescale tests
+//
+// GOVERNING IDEA, shared with `glmm_tests.rs`'s and `sparse/tests.rs`'s rescale
+// tests: multiply a random-slope design column by an exact power of two `C` and
+// refit. `rms_column_scale` is a weighted RMS of that one column, so a
+// power-of-two `C` moves it by EXACTLY `C` — an exact float multiply, no
+// rounding — which makes the INTERNAL problem BOBYQA searches (the
+// `Z~ = Z·diag(1/s)`, `Λ~ = diag(s)·Λ` reparameterization) bit-identical
+// between the two fits. Every quantity the crate reports back in the caller's
+// units therefore has to move by exactly the power of `C` that identity
+// predicts; a dropped back-map shows up unmistakably as a ratio of 1 instead of
+// `1/C` or `1/C²`.
+// ---------------------------------------------------------------------------
+
+/// Parses `validation/data/empirical/sleepstudy.csv` into the q=2 random-slope
+/// design `Reaction ~ 1 + Days + (1 + Days | Subject)` — shared by the rescale
+/// tests below, which need the raw `x`/`y`/`ids` to build a second design with
+/// column 1 (`Days`) multiplied by a power of two. Parsing mirrors
+/// `fit_sleepstudy_slope_varcorr_matches_lme4`.
+fn sleepstudy_slope_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
+    let mut y = Vec::<f64>::new();
+    let mut days = Vec::<f64>::new();
+    let mut subj_raw = Vec::<String>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap()); // Reaction
+        days.push(f[1].parse().unwrap()); // Days
+        subj_raw.push(f[2].to_string()); // Subject
+    }
+    let n = y.len();
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = days[i];
+    }
+    let (subject, _n_subj) = dense_str(&subj_raw);
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — data path derives it
+            slopes: vec![1],                                 // random slope on Days (col 1)
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: subject,
+        extra: vec![],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// Dense LMM rescale identity, `C = 1024.0`. Column 1 (`Days`) is BOTH the
+/// fixed-effect covariate and the primary random-slope covariate, so scaling it
+/// exercises the fixed-effect side (β/se/vcov) and the RE side (varcorr/tau2/
+/// ranef) with the same single multiply.
+///
+/// The predicted moves, worked from the module-header identity: writing
+/// `x̃ = C·x`, the reparameterization `β̃₁ = β₁/C` (so `β̃₁·x̃ = β₁·x`) makes
+/// `b̃ = diag(1, 1/C)·b` for the RE mode (intercept untouched, slope mode /C),
+/// hence `Λ̃ = diag(1, 1/C)·Λ` (row 1 — the slope row — /C, row 0 untouched) and
+/// `D̃ = σ̂²Λ̃Λ̃ᵀ`: `D̃₀₀` untouched, `D̃₁₀` /C (one row-1 factor), `D̃₁₁` /C² (two).
+/// `tau2[k] = θ[k]²·σ̂²`; θ's vech order is column-major so index 0 is row 0
+/// (untouched) and indices 1, 2 are both row 1 (Λ₁₀ and Λ₁₁), so both get the
+/// squared /C² factor. `Var(β̂)` mirrors the covariance block: `[0][0]`
+/// untouched, `[1][1]` /C², `[0][1]` /C. Fitted means and residual variance are
+/// unaffected — this is a reparameterization of the SAME model, not a rescale
+/// of it.
+///
+/// The REML deviance's only dependence on the fixed-effect column scale is the
+/// `log|X'V⁻¹X|` Jacobian: scaling one column of X by C is `X̃ = X·diag(1,C)`,
+/// so `X̃'V⁻¹X̃ = diag(1,C)·(X'V⁻¹X)·diag(1,C)` and
+/// `det(X̃'V⁻¹X̃) = C²·det(X'V⁻¹X)` — `log|X'V⁻¹X|` moves by `+2·ln(C)`, and since
+/// deviance is `-2·(profiled REML loglik) + log|X'V⁻¹X| + const`, `deviance`
+/// moves by the same `+2·ln(C)` and `loglik = -deviance/2 + const` by `-ln(C)`.
+///
+/// `BAND` is margin over the worst relative spread measured between the two
+/// independent BOBYQA fits' actual vs predicted ratios on 2026-08-23 (this
+/// crate's x86_64-unknown-linux-gnu Arrow Lake-H anchor, see `assert_pinned`'s
+/// doc comment for what that anchor means): 1.39e-6 on `ranef[16]`. That is
+/// three orders looser than `PIN_REL_ITER` (1e-7, this file's usual BOBYQA
+/// pin) because this test's "pin" is not one fit read twice but TWO
+/// INDEPENDENT optimizer runs landing on two different points in the same
+/// θ-space (θ and C·θ never coincide as floats), so the two runs' BOBYQA
+/// stopping tolerances compound instead of cancelling. `DEV_ABS` covers the
+/// measured deviance/loglik shift error (7.3e-12 on `deviance`), two orders of
+/// margin over that.
+#[test]
+fn lmm_rescaling_slope_column_moves_every_quantity_by_the_predicted_power_of_c() {
+    const C: f64 = 1024.0;
+    const BAND: f64 = 3e-6;
+    const DEV_ABS: f64 = 1e-10;
+
+    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+
+    let base = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(base.converged(), "base sleepstudy slope LMM must converge");
+
+    let mut x_c = x.clone();
+    for i in 0..n {
+        x_c[i * p + 1] *= C;
+    }
+    let scaled = fit_cold(&x_c, &y, n, p, &model, &ids, &opts);
+    assert!(scaled.converged(), "column-scaled fit must converge");
+
+    // The singular verdict is part of what must not move. `Fit::singular` is
+    // `boundary_hit == 1` OR the `SINGULAR_REL_TOL` relative check, and that check
+    // compares the INTERNAL standard deviations — on the reported ones the scaled
+    // fit's slope sd sits `C` below its intercept's (here 5.7/1024 against 24, a
+    // ratio of 2.3e-4) and a user-scale comparison would call this well-identified
+    // fit degenerate.
+    assert!(
+        !base.singular() && !scaled.singular(),
+        "neither fit is degenerate: base singular {} scaled singular {}",
+        base.singular(),
+        scaled.singular()
+    );
+
+    assert_pinned(&[scaled.beta[0]], &[base.beta[0]], BAND, "beta[0]");
+    assert_pinned(&[scaled.beta[1]], &[base.beta[1] / C], BAND, "beta[1]");
+    assert_pinned(&[scaled.se[0]], &[base.se[0]], BAND, "se[0]");
+    assert_pinned(&[scaled.se[1]], &[base.se[1] / C], BAND, "se[1]");
+    assert_pinned(&[scaled.vcov[0][0]], &[base.vcov[0][0]], BAND, "vcov[0][0]");
+    assert_pinned(
+        &[scaled.vcov[1][1]],
+        &[base.vcov[1][1] / (C * C)],
+        BAND,
+        "vcov[1][1]",
+    );
+    assert_pinned(
+        &[scaled.vcov[0][1]],
+        &[base.vcov[0][1] / C],
+        BAND,
+        "vcov[0][1]",
+    );
+    assert_pinned(
+        &[scaled.vcov[1][0]],
+        &[base.vcov[1][0] / C],
+        BAND,
+        "vcov[1][0]",
+    );
+
+    // varcorr vech [D00, D10, D11].
+    assert_eq!(scaled.varcorr.len(), 1, "one grouping block");
+    assert_pinned(
+        &scaled.varcorr[0],
+        &[
+            base.varcorr[0][0],
+            base.varcorr[0][1] / C,
+            base.varcorr[0][2] / (C * C),
+        ],
+        BAND,
+        "varcorr vech",
+    );
+
+    // tau2[0] = Lambda row 0 (intercept); tau2[1], tau2[2] = Lambda row 1 (slope).
+    assert_pinned(
+        &scaled.tau2,
+        &[base.tau2[0], base.tau2[1] / (C * C), base.tau2[2] / (C * C)],
+        BAND,
+        "tau2",
+    );
+
+    // ranef, per level [b0, b1].
+    assert_eq!(scaled.ranef.len(), base.ranef.len());
+    assert_eq!(scaled.ranef_levels, base.ranef_levels);
+    let n_levels = scaled.ranef_levels[0];
+    let mut want_ranef = Vec::with_capacity(scaled.ranef.len());
+    for l in 0..n_levels {
+        want_ranef.push(base.ranef[l * 2]);
+        want_ranef.push(base.ranef[l * 2 + 1] / C);
+    }
+    assert_pinned(&scaled.ranef, &want_ranef, BAND, "ranef");
+
+    // fitted — unchanged elementwise (same model, same conditional means).
+    assert_eq!(scaled.fitted.len(), base.fitted.len());
+    assert_pinned(&scaled.fitted, &base.fitted, BAND, "fitted");
+
+    // dispersion — unchanged (residual variance is invariant to a fixed/random
+    // reparameterization of one column).
+    assert_pinned(&[scaled.dispersion], &[base.dispersion], BAND, "dispersion");
+
+    // deviance / loglik — see the doc comment above for the log|X'V⁻¹X|
+    // derivation of the +2·ln(C) / -ln(C) shifts.
+    let dev_shift = scaled.deviance - base.deviance;
+    let expected_dev_shift = 2.0 * C.ln();
+    assert!(
+        (dev_shift - expected_dev_shift).abs() < DEV_ABS,
+        "deviance shift {dev_shift} vs predicted {expected_dev_shift}"
+    );
+    let loglik_shift = scaled.loglik - base.loglik;
+    let expected_loglik_shift = -C.ln();
+    assert!(
+        (loglik_shift - expected_loglik_shift).abs() < DEV_ABS,
+        "loglik shift {loglik_shift} vs predicted {expected_loglik_shift}"
+    );
+}
+
+/// Warm-start forward map, on the same sleepstudy slope design: warm-starting
+/// at a fit's own reported θ̂ (via [`FitView::theta`], which hands back θ in the
+/// CALLER's units) must be a FIXED POINT of the map `LmmGroupings::
+/// theta_row_scales` installs in `src/lmm.rs`'s `fit_lmm_impl`. `Days`' RMS
+/// scale is clearly off 1.0 (values run 0..9), so a dropped forward map moves
+/// this test's θ̂ rather than leaving it untouched by construction.
+///
+/// Reached through the loop tier (`build_workspace`/`fit_on`) rather than
+/// `fit_warm`, per the loop-tier warm-start contract this crate carries: the
+/// same workspace serves both the cold and the warm call.
+#[test]
+fn lmm_warm_start_theta_is_a_fixed_point_of_the_forward_map() {
+    const BAND: f64 = 1e-9;
+
+    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+
+    let cold_view = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts);
+    let cold_theta = cold_view.theta().to_vec();
+    let cold_n_eval = cold_view.n_eval();
+    let cold_fit = cold_view.into_fit(&x, &y, &sized_ids, n, p, &model, &opts);
+    assert!(
+        cold_fit.converged(),
+        "cold sleepstudy slope LMM must converge"
+    );
+
+    let start = StartValues {
+        beta: cold_fit.beta.clone(),
+        theta: cold_theta.clone(),
+    };
+    let warm_view = fit_on(&mut ws, &x, &y, &sized_ids, Some(&start), &opts);
+    let warm_theta = warm_view.theta().to_vec();
+    let warm_n_eval = warm_view.n_eval();
+    let warm_fit = warm_view.into_fit(&x, &y, &sized_ids, n, p, &model, &opts);
+    assert!(warm_fit.converged(), "warm-started fit must converge");
+
+    assert_pinned(&warm_theta, &cold_theta, BAND, "theta fixed point");
+    assert!(
+        (warm_fit.deviance - cold_fit.deviance).abs() < 1e-10,
+        "deviance moved under a fixed-point warm start: {} vs {}",
+        warm_fit.deviance,
+        cold_fit.deviance
+    );
+    // Teeth: a warm start planted exactly at θ̂ needs strictly fewer BOBYQA
+    // evals than the blind cold start (THETA0 diagonals, 0 off-diagonals) to
+    // reach the same point — this is what a dropped forward map (which would
+    // instead plant the RESCALED θ̂ read as if it were already in the design's
+    // own units) would blow past, since it starts the search somewhere BOBYQA
+    // still has to search its way out of.
+    assert!(
+        warm_n_eval < cold_n_eval,
+        "warm start at the true optimum must need fewer evals than the blind \
+         cold start: warm {warm_n_eval} vs cold {cold_n_eval}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `rms_column_scale` / `LmmGroupings::theta_row_scales` — map-primitive tests
+// ---------------------------------------------------------------------------
+
+/// `rms_column_scale` on a constant-1 column returns EXACTLY `1.0`, both
+/// unweighted and under non-unit weights — the exactness (not just closeness)
+/// that keeps an implicit-intercept RE subcolumn's factor exact and an
+/// intercept-only design bit-identical to the unscaled path (see the function's
+/// own doc comment for the `Σw/Σw == 1.0` argument).
+#[test]
+fn rms_column_scale_is_exactly_one_on_a_constant_column() {
+    use crate::lmm::rms_column_scale;
+    let n = 7;
+    let x = faer::Mat::<f64>::from_fn(n, 1, |_, _| 1.0);
+
+    assert_eq!(rms_column_scale(x.as_ref(), 0, None), 1.0);
+
+    let w: Vec<f64> = (0..n).map(|i| 0.3 + 1.7 * (i as f64)).collect();
+    assert_eq!(rms_column_scale(x.as_ref(), 0, Some(&w)), 1.0);
+}
+
+/// `LmmGroupings::theta_row_scales` on a hand-built grouping: a primary
+/// `q_p = 2` block (intercept + one slope, scale `s_p`) and one extra crossed
+/// `q_g = 2` block (intercept + one slope, scale `s_e`), scales set by hand on
+/// the struct fields (bypassing `set_slope_scales`, which needs a real design
+/// matrix). Column-major vech order per block is `[(0,0), (1,0), (1,1)]`; row 0
+/// of every block is the intercept subcolumn (scale exactly 1.0 by
+/// construction — never stored), row 1 is the slope (the hand-set scale). So
+/// the expected output is `[1.0, s_p, s_p, 1.0, s_e, s_e]`: primary block
+/// `[row0, row1, row1]` then the extra block the same shape.
+#[test]
+fn theta_row_scales_reads_off_the_hand_built_grouping() {
+    use crate::lmm::{CrossedFactor, LmmGroupings};
+
+    const S_P: f64 = 3.5;
+    const S_E: f64 = 0.25;
+
+    let mut g = LmmGroupings::from_cluster_spec_ext(
+        &ModelSpec {
+            family: Family::Gaussian,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters { n_clusters: 4 },
+                slopes: vec![1], // q_p = 2
+                extra_groupings: vec![Grouping {
+                    relation: GroupingRelation::Crossed { n_clusters: 3 },
+                    slopes: vec![2], // q_g = 2
+                }],
+            }),
+        },
+        4, // max_n placeholder — only the shape matters for this test
+        &[1],
+        &[vec![2]],
+    );
+    assert_eq!(g.primary_q, 2, "primary block must be q_p = 2");
+    assert_eq!(g.extra_q, vec![2], "extra block must be q_g = 2");
+    assert_eq!(
+        g.crossed,
+        vec![CrossedFactor {
+            vech_start: 3, // after the primary's 3-slot vech
+            q: 2,
+            n_levels: 3,
+            decl: 0,
+        }]
+    );
+
+    g.primary_slope_scales = vec![S_P];
+    g.extra_slope_scales = vec![vec![S_E]];
+
+    assert_eq!(
+        g.theta_row_scales(),
+        vec![1.0, S_P, S_P, 1.0, S_E, S_E],
+        "column-major vech: [primary (0,0),(1,0),(1,1)] then [extra (0,0),(1,0),(1,1)]"
+    );
 }

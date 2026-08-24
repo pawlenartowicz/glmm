@@ -166,29 +166,56 @@ pub(crate) fn rx_cov_into(
 /// body for why θ does not take the relative form. No Richardson extrapolation
 /// (dropped 2026-07-04 — the deviance is step-invariant to ~7 sig figs across
 /// h ∈ [1e-4, 1e-1] on this fixture, so a second-order correction bought no
-/// measurable accuracy). Every eval here runs PIRLS at the tight `PIRLS_TOL_REL_FD` (via
-/// `ws.pirls_tol_override`, set on entry / reset on every exit): at the
-/// canonical fit tol (1e-6) the FD was NOT step-invariant on cbpp (~0.3%
-/// wobble, h=1e-2 vs 1e-3 — the shipped step happened to land on the accurate
-/// side); at `PIRLS_TOL_REL_FD` it is step-invariant to ~5–6 sig figs across
-/// h ∈ [1e-4, 1e-2] and sits on the tight-tol (1e-12) limit, so the accuracy is
-/// by construction, not by luck. The fit path never sees the tight tol.
+/// measurable accuracy). Every eval here runs PIRLS at `pirls_tol_fd(family)` —
+/// the tighter of the `PIRLS_TOL_REL_FD` ceiling and the family's own fit
+/// tolerance — via `ws.pirls_tol_override`, set on entry and reset on every
+/// exit, so the stencil never differences a deviance looser than the one the
+/// optimizer converged on. At an exit tolerance of 1e-6 the FD was NOT
+/// step-invariant on cbpp (~0.3% wobble, h=1e-2 vs 1e-3 — the shipped step
+/// happened to land on the accurate side); at 1e-8 or tighter it is
+/// step-invariant to ~5–6 sig figs across h ∈ [1e-4, 1e-2] and sits on the
+/// tight-tol (1e-12) limit, so the accuracy is by construction, not by luck.
+/// The fit path never sees the override.
 /// One accepted divergence: on the RX fallback below, the central re-eval that
-/// repopulates the Schur factors also runs at the tight tol, so fallback RX
+/// repopulates the Schur factors also runs at the FD-pass tol, so fallback RX
 /// numbers differ from the plain `WaldSe::Rx` arm's at tolerance level
-/// (slightly MORE converged — harmless).
+/// (never LESS converged — harmless).
 ///
 /// Match vs lme4 `vcov(use.hessian=TRUE)`: ~3.4e-7 worst per-entry gap on the
-/// committed fixture and ≤2e-5 rel `se_hessian` on every validation rung,
+/// committed fixture; worst rel `se_hessian` ≤6e-4 across validation rungs
+/// (rung 28 `sim_poisson_offset`), all within `tol.R` bands,
 /// including the two large-θ̂ rungs (`sim_binomial_bigsd` θ̂ = 4.51, 7.4e-6;
-/// `sim_poisson_bigsd` θ̂ = 2.97, 1.4e-5). That 2e-5
-/// is **reference-limited, not glmm-limited**: we sit within 3.1e-6 of
-/// our own h→0 stencil limit on every rung, while lme4's
-/// `vcov(use.hessian=TRUE)` is itself `lme4:::deriv12` at an ABSOLUTE δ = 1e-4
-/// — measured on these references 2026-07-30, that carries 5–9e-6 of its own FD
-/// error, δ = 1e-4 sitting past lme4's own noise knee in β, and two runs of its
-/// stencil differing by 4.5e-7…1.8e-6. So most of the residual gap is theirs;
-/// tightening this number would pin one lme4 cannot reproduce — but ONLY
+/// `sim_poisson_bigsd` θ̂ = 2.97, 1.4e-5).
+///
+/// Both engines' numbers carry FD error of their own, and ours is the larger.
+/// Re-measured 2026-08-24 over the whole GLMM corpus by
+/// `fd_hessian_margin_corpus_measurement` (`src/sparse/fd_margin.rs`), which
+/// rebuilds the joint Hessian at δ, δ/2 and δ/4 and extrapolates the β SEs to
+/// h = 0 on the central difference's own O(δ²), S = (4·SE(δ/2) − SE(δ))/3.
+/// Where that sequence really is truncation-dominated — every dense canonical
+/// rung, gaps shrinking ~4× per halving and the two pairs' extrapolations
+/// agreeing to ≤3e-6 — the shipped step sits within 7.7e-5 of the limit
+/// (`sim_poisson_slope1`); the sparse large-θ̂ rung `sim_sparse_binomial_bigsd`
+/// is truncation-dominated as well, at 1.4e-4 with its two extrapolations 20%
+/// apart. Elsewhere there is NO h→0 limit to sit near: on the three
+/// non-canonical rungs (`cbpp_probit`, `sim_gamma`, `sim_probit_large`) and on
+/// the other four sparse canonical ones the SE gaps GROW 1.8–12× per halving,
+/// which is FD noise rather than truncation — f64 rounding of an O(10²–10³)
+/// deviance divided by δ², a floor no PIRLS tolerance reaches and only a larger
+/// δ avoids — and there the two extrapolated limits disagree by as much as the
+/// distance they are estimating. What holds corpus-wide is the weaker
+/// step-invariance statement: halving δ from the shipped step moves no β
+/// standard error by more than 1.4e-4 relative (`cbpp_probit`), and the shipped
+/// δ is on the good side of the knee, since halving again moves them more.
+/// So the figures above are measured agreement, not a bound on either engine's
+/// FD error: the tightest of them are SMALLER than our own step uncertainty, so
+/// none of them can be read as either side's accuracy.
+/// lme4's `vcov(use.hessian=TRUE)` is itself
+/// `lme4:::deriv12` at an ABSOLUTE δ = 1e-4; measured on these references
+/// 2026-07-30, that carries 5–9e-6 of its own FD error, δ = 1e-4 sitting past
+/// lme4's own noise knee in β, and two runs of its
+/// stencil differing by 4.5e-7…1.8e-6.
+/// Tightening this number would pin one lme4 cannot reproduce — but ONLY
 /// against an lme4 run at tightened `tolPwrss` (the fixture and the frozen
 /// validation references are generated at 1e-13; each records it). At lme4's
 /// DEFAULT `tolPwrss = 1e-7` a ~1% gap opens, and it is LME4'S, not ours
@@ -224,9 +251,9 @@ pub fn fd_hessian_cov(
     let n_theta = ws.n_theta;
 
     // Every deviance eval below (f0, the f± stencil, and the fallback's central
-    // re-eval) converges PIRLS at the FD-only tight tol — see the doc comment.
+    // re-eval) converges PIRLS at the FD-pass tol — see the doc comment.
     // Reset on every exit alongside `warm_seed_active`.
-    ws.pirls_tol_override = Some(super::PIRLS_TOL_REL_FD);
+    ws.pirls_tol_override = Some(super::pirls_tol_fd(ws.family));
 
     // Snapshot γ̂ and the per-coordinate FD step; fill z_buf once (blocked AND
     // structured paths — `build_packed_m`'s primary-core reduction reads it the
@@ -311,7 +338,7 @@ pub fn fd_hessian_cov(
             ws.params[..m].copy_from_slice(&ws.fd_saved[..m]);
             restore_fd_mode!();
             ws.warm_seed_active = false; // never leak the FD seed into a later fit / BOBYQA
-            ws.pirls_tol_override = None; // nor the FD tight tol
+            ws.pirls_tol_override = None; // nor the FD-pass tol
             return FdHessianStatus::NonPdFellBackToRx;
         }};
     }
@@ -466,14 +493,15 @@ pub fn fd_hessian_cov(
     let _ = fd_eval(ws, &[], &[], x, y, cluster_ids, extra_ids, n);
 
     ws.params[..m].copy_from_slice(&ws.fd_saved[..m]);
-    // That re-eval lands on û(γ̂) again but at the FD tight tol, so it is a hair
-    // MORE converged than the mode this call was handed. Take the handed one back
-    // verbatim, so a second call on the same workspace seeds from the same vector
-    // and returns the same bits. The ~1e-12 it leaves between `ws.u` and the
-    // `ws.prob`/W̃ the re-eval just wrote is far below anything read off them.
+    // That re-eval lands on û(γ̂) again but at the FD-pass tol, which is never
+    // looser than the fit's, so it is at least as converged as the mode this call
+    // was handed. Take the handed one back verbatim, so a second call on the same
+    // workspace seeds from the same vector and returns the same bits. The ≲1e-12
+    // it leaves between `ws.u` and the `ws.prob`/W̃ the re-eval just wrote is far
+    // below anything read off them.
     restore_fd_mode!();
     ws.warm_seed_active = false; // never leak the FD seed into a later fit / BOBYQA
-    ws.pirls_tol_override = None; // nor the FD tight tol
+    ws.pirls_tol_override = None; // nor the FD-pass tol
     FdHessianStatus::Ok
 }
 
@@ -574,10 +602,15 @@ pub(crate) fn blocked_schur_fill(
         for c in 0..q {
             let mut acc = 0.0;
             for rr in c..q {
+                // The one Z read on this path that does not come from `ws.z_buf`,
+                // so it applies the RE column's internal scale itself — mirrors
+                // `workspace::fill_z_f64` / `build_z`, change together. Indexed by
+                // the Λ ROW `rr`, not the column `c`.
                 let zr = if rr == 0 {
                     1.0
                 } else {
                     x[(i, ws.groupings.primary_slope_cols[rr - 1])]
+                        / ws.groupings.primary_slope_scales[rr - 1]
                 };
                 acc += zr * ws.lam[rr * q + c];
             }

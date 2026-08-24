@@ -325,6 +325,31 @@ test_that("pirls_exhausted message distinguishes the final re-evaluation", {
                "the reported estimates rest on that truncated solve")
 })
 
+test_that("re_design_scale_spread message names the grouping and ratio", {
+  # No fixture here drives the note through a real fit (the Rust-side
+  # end-to-end test covers that:
+  # fit::common_tests::re_design_scale_spread_note_fires_on_mismatched_slope_scale),
+  # so the message is asserted from a constructed note.
+  note <- list(kind = "re_design_scale_spread", columns = integer(0), pivot = NaN,
+               evals = 0L, final_eval = FALSE, detail = "g", ratio = 4200.0)
+  cond <- tryCatch(fastglmm:::.warn_note(note, character(0)),
+                   warning = identity)
+  expect_s3_class(cond, "fastglmm_re_design_scale_spread")
+  expect_match(conditionMessage(cond), "grouping 'g'")
+  expect_match(conditionMessage(cond), "4.2e\\+03")
+  expect_match(conditionMessage(cond), "scales the columns internally")
+})
+
+test_that("hessian_se_fallback message", {
+  note <- list(kind = "hessian_se_fallback", columns = integer(0), pivot = NaN,
+               evals = 0L, final_eval = FALSE, detail = "", ratio = NaN)
+  cond <- tryCatch(fastglmm:::.warn_note(note, character(0)),
+                   warning = identity)
+  expect_s3_class(cond, "fastglmm_hessian_se_fallback")
+  expect_match(conditionMessage(cond), "not positive definite")
+  expect_match(conditionMessage(cond), "stddev_se is NaN")
+})
+
 test_that("rank-deficient designs mirror lme4's NA coefficients", {
   d <- benchmark_data(seed = 108, family = "binomial")
   d$t2 <- d$t # aliased copy

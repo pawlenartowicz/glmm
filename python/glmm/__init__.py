@@ -2,9 +2,8 @@
 
 `glmm.fit` parses `formula` against `data`'s columns through the Rust
 `glmm::formula` module, fits via the `glmm` kernel (through the `glmm._native`
-PyO3 extension), and returns a `Fit`. Four combinations from the API spec's
-family/link table are GLMM 0.1.1 ("approved design, not yet implemented in the
-kernel" — docs/GLMM/0.1.1/2026-07-04-glmm-0.1.1-families-links-spec.md) and
+PyO3 extension), and returns a `Fit`. Four family/link combinations are GLMM
+0.1.1 — approved design, not yet implemented in the kernel — and
 raise a clean `NotImplementedError`: `family="inversegaussian"`,
 `link="cloglog"`, quasi-likelihood `dispersion=` on binomial/poisson, and
 `init_theta=<float>` (no kernel hook exists yet to seed the negative-binomial
@@ -12,7 +11,8 @@ search — only the default `init_theta=None` cold-start is supported).
 
 Public surface is `fit`, `Fit`, and the warning categories the diagnostics
 channel raises (`DiagnosticWarning`, `IllConditionedWarning`,
-`PirlsExhaustedWarning`, `UnusedGroupingLevelsWarning`).
+`PirlsExhaustedWarning`, `UnusedGroupingLevelsWarning`,
+`ReDesignScaleWarning`, `HessianSeFallbackWarning`).
 """
 
 import math
@@ -26,8 +26,10 @@ from glmm import _native
 __all__ = [
     "DiagnosticWarning",
     "Fit",
+    "HessianSeFallbackWarning",
     "IllConditionedWarning",
     "PirlsExhaustedWarning",
+    "ReDesignScaleWarning",
     "UnusedGroupingLevelsWarning",
     "fit",
 ]
@@ -80,7 +82,29 @@ class UnusedGroupingLevelsWarning(DiagnosticWarning):
     """
 
 
-# Family table — mirrors the API spec §3.2 and GLMM/src/family.rs.
+class ReDesignScaleWarning(DiagnosticWarning):
+    """A grouping's random-effect design columns sit on very different scales.
+
+    The fit is unaffected — `glmm` scales the columns internally before
+    solving — but the reported random-effect standard deviations stay on each
+    raw variable's own scale, so a large spread between them makes the numbers
+    hard to compare by eye. Rescale the offending variable(s) to bring the
+    reported stddevs onto comparable magnitudes.
+    """
+
+
+class HessianSeFallbackWarning(DiagnosticWarning):
+    """`wald_se="hessian"` was requested, but the finite-difference joint
+    Hessian was not usable (not positive definite, or a perturbed deviance
+    evaluation was non-finite).
+
+    The standard errors reported are the RX/Schur ones instead, and
+    `Fit.stddev_se` (the random-effect standard deviations' own standard
+    errors) comes back `NaN` — only the joint Hessian route fills it.
+    """
+
+
+# Family table — mirrors the kernel's own table in src/family.rs.
 _FAMILIES = {
     "gaussian": {"default_link": "identity", "links": {"identity"}},
     "binomial": {"default_link": "logit", "links": {"logit", "probit", "cloglog"}},
@@ -100,7 +124,7 @@ _MAX_NAGQ = 25  # mirrors GLMM/src/consts.rs::MAX_NAGQ — change together
 
 
 def _columns(data):
-    """Extract {name: column} from dict / pandas / polars / pyarrow (spec §3.1)
+    """Extract {name: column} from dict / pandas / polars / pyarrow
     without a hard dependency on any dataframe library.
 
     Columns are returned UNFLATTENED so `fit` can still see a categorical dtype:
@@ -199,11 +223,14 @@ class Fit:
     #                     regardless of what the optimizer was doing when it
     #                     gave up, so it carries no information there.
     #   notes      list of {"kind": str, "columns": [int], "pivot": float,
-    #                     "evals": int, "final_eval": bool, "detail": str} —
-    #                     observations with no dedicated field,
-    #                     each raised as a `DiagnosticWarning` subclass by `fit`.
-    #                     Mostly the solver's; the formula lowering contributes
-    #                     "unused_grouping_levels", whose names ride in `detail`.
+    #                     "evals": int, "final_eval": bool, "detail": str,
+    #                     "ratio": float} — observations with no dedicated
+    #                     field, each raised as a `DiagnosticWarning` subclass
+    #                     by `fit`. Mostly the solver's; the formula lowering
+    #                     contributes "unused_grouping_levels" (grouping and
+    #                     level names ride in `detail`) and
+    #                     "re_design_scale_spread" (grouping name in `detail`,
+    #                     the measured max/min column-RMS ratio in `ratio`).
     #                     `columns` are 0-based indices into `names` (the R
     #                     package reports the same thing 1-based, per R's own
     #                     convention). An absent note means "not detected",
@@ -450,6 +477,27 @@ def _note_warning(note, names):
             ),
             PirlsExhaustedWarning,
         )
+    if note["kind"] == "re_design_scale_spread":
+        return (
+            (
+                f"random-effect design columns for grouping {note['detail']!r} are on "
+                f"very different scales (max/min column RMS ratio {note['ratio']:.3g}). "
+                "glmm scales the columns internally, so the fit is unaffected; rescaling "
+                "the variable makes the reported random-effect standard deviation easier "
+                "to read."
+            ),
+            ReDesignScaleWarning,
+        )
+    if note["kind"] == "hessian_se_fallback":
+        return (
+            (
+                "the requested Hessian-based standard errors were not usable (the "
+                "finite-difference joint Hessian was not positive definite, or a "
+                "perturbed deviance evaluation was non-finite), so the RX "
+                "standard errors are reported instead and stddev_se is NaN."
+            ),
+            HessianSeFallbackWarning,
+        )
     return (
         (
             "the kernel reported a solver note this version of glmm does not "
@@ -533,7 +581,7 @@ def fit(
     ):
         raise ValueError(f"nagq must be an odd integer in 1..={_MAX_NAGQ}, got {nagq!r}")
 
-    # Valid-but-inapplicable options: warn and strip (spec §3.5). The kernel
+    # Valid-but-inapplicable options: warn and strip. The kernel
     # boundary-faults on inapplicable options and a Rust panic across the FFI
     # is not an acceptable user error, so nothing inapplicable may reach it.
     if dispersion is not None and family not in _DISPERSION_FAMILIES:
@@ -636,8 +684,8 @@ def fit(
     )
     # nagq's shape eligibility (single grouping factor, binomial/Poisson,
     # q <= 3) is only decidable after the Rust-side formula lowering, so the
-    # §3.5 warn-and-strip for it lives in the shared glmm::orchestrate module
-    # (GLMM/src/orchestrate.rs); the
+    # warn-and-strip for it lives in the shared glmm::orchestrate module
+    # (src/orchestrate.rs); the
     # message comes back here to be raised as the same UserWarning the
     # dispersion/theta strips above use.
     if r["agq_warning"] is not None:

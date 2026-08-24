@@ -121,8 +121,9 @@ pub struct Lowered {
     /// the formula declares no random effects.
     pub re_groups: Vec<ReGroupInfo>,
     /// Observations the LOWERING made about the data, which no solver can make
-    /// because no solver sees the labels — currently only
-    /// [`crate::Note::UnusedGroupingLevels`]. Empty on a clean lowering. Carried
+    /// because no solver sees the labels or the un-scaled design —
+    /// [`crate::Note::UnusedGroupingLevels`] and
+    /// [`crate::Note::ReDesignScaleSpread`]. Empty on a clean lowering. Carried
     /// here rather than on `Fit` because it is decided before any fit runs; the
     /// ports fold it into the same warning channel as `Fit`'s own notes.
     pub notes: Vec<crate::Note>,
@@ -238,8 +239,16 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
     }
 
     // 3. Random effects → ReStructure + GroupIds (declaration order; first = primary).
-    let (model, ids, re_groups, notes) =
-        lower_random_effects(ast, data, family, n, &numeric_main_col, &factor_main_cols)?;
+    let xm = faer::MatRef::from_row_major_slice(&x, n, p);
+    let (model, ids, re_groups, notes) = lower_random_effects(
+        ast,
+        data,
+        family,
+        n,
+        xm,
+        &numeric_main_col,
+        &factor_main_cols,
+    )?;
 
     let opts = FitOptions {
         target_indices: (0..p as u32).collect(),
@@ -661,11 +670,49 @@ fn unused_levels_note(name: &str, unused: Vec<String>) -> Option<crate::Note> {
     })
 }
 
+/// [`crate::Note::ReDesignScaleSpread`] fires above this max/min column-RMS
+/// ratio — the same 1000 lme4's `lme4:::checkScaleX(tol = 1000)` uses to warn
+/// "Some predictor variables are on very different scales: consider
+/// rescaling".
+const RE_SCALE_SPREAD_WARN: f64 = 1e3;
+
+/// [`crate::Note::ReDesignScaleSpread`] for one grouping: the max/min ratio of
+/// [`crate::lmm::rms_column_scale`] over its random-slope design columns, the
+/// implicit intercept counted as a constant-1 column (RMS exactly 1.0). `None`
+/// when the grouping has no slopes (nothing to compare the intercept against)
+/// or the ratio does not clear [`RE_SCALE_SPREAD_WARN`].
+///
+/// Unweighted (`weights: None`): `FitOptions::weights` is filled in by the
+/// ports AFTER `lower()` returns (see `orchestrate::run_fit`), so no per-row
+/// weight is in scope at lowering time.
+fn scale_spread_note(
+    name: &str,
+    x: faer::MatRef<'_, f64>,
+    slope_cols: &[ColumnId],
+) -> Option<crate::Note> {
+    if slope_cols.is_empty() {
+        return None;
+    }
+    let mut lo = 1.0f64;
+    let mut hi = 1.0f64;
+    for &c in slope_cols {
+        let s = crate::lmm::rms_column_scale(x, c as usize, None);
+        lo = lo.min(s);
+        hi = hi.max(s);
+    }
+    let ratio = hi / lo;
+    (ratio > RE_SCALE_SPREAD_WARN).then(|| crate::Note::ReDesignScaleSpread {
+        grouping: name.to_string(),
+        ratio,
+    })
+}
+
 fn lower_random_effects(
     ast: &ParsedFormula,
     data: &Table,
     family: Family,
     n: usize,
+    xm: faer::MatRef<'_, f64>,
     numeric_main_col: &HashMap<String, ColumnId>,
     factor_main_cols: &HashMap<String, Vec<(String, ColumnId)>>,
 ) -> Result<(ModelSpec, GroupIds, Vec<ReGroupInfo>, Vec<crate::Note>), Error> {
@@ -677,7 +724,6 @@ fn lower_random_effects(
             Vec::new(),
         ));
     }
-
     let re0 = &ast.random_effects[0];
     let primary_slopes = slope_cols(re0, numeric_main_col, factor_main_cols)?;
     let primary_layout = grouping_ids(re0, data)?;
@@ -689,6 +735,7 @@ fn lower_random_effects(
     let mut notes: Vec<crate::Note> =
         unused_levels_note(&re_group_name(re0), primary_layout.unused)
             .into_iter()
+            .chain(scale_spread_note(&re_group_name(re0), xm, &primary_slopes))
             .collect();
     let mut re_groups = vec![re_group_info(
         re0,
@@ -746,9 +793,10 @@ fn lower_random_effects(
             ),
         };
         have_nested |= matches!(relation, GroupingRelation::NestedWithin { .. });
+        notes.extend(unused_levels_note(&re_group_name(re), layout.unused));
+        notes.extend(scale_spread_note(&re_group_name(re), xm, &slopes));
         extra_groupings.push(Grouping { relation, slopes });
         extra_ids.push(layout.ids);
-        notes.extend(unused_levels_note(&re_group_name(re), layout.unused));
         re_groups.push(re_group_info(re, factor_main_cols, layout.slot_labels));
     }
 

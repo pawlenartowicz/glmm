@@ -127,10 +127,12 @@ Python port so the two ports agree.
 
 \strong{Diagnostic warnings carry a condition class.} Each solver note is raised
 as a warning of class \code{"fastglmm_diagnostic"} with a per-kind subclass
-(\code{"fastglmm_ill_conditioned"}, \code{"fastglmm_pirls_exhausted"}; a note from a
-newer kernel than this package arrives as \code{"fastglmm_unknown_note"}), so
-\code{withCallingHandlers()} and \code{suppressWarnings(classes = )} can select them
-without matching message text.
+(\code{"fastglmm_ill_conditioned"}, \code{"fastglmm_pirls_exhausted"},
+\code{"fastglmm_unused_grouping_levels"}, \code{"fastglmm_re_design_scale_spread"},
+\code{"fastglmm_hessian_se_fallback"}; a note from a newer kernel than this
+package arrives as \code{"fastglmm_unknown_note"}), so \code{withCallingHandlers()}
+and \code{suppressWarnings(classes = )} can select them without matching message
+text.
 
 Anything the engine cannot do is an error naming the reason - never a
 silently different model. That includes \code{REML = FALSE} (the LMM path is

@@ -1,6 +1,6 @@
 # glmm
 
-**Linear-regression family — OLS → GLM → LMM → GLMM — in pure Rust, with a six-name Python API.**
+**Linear-regression family — OLS → GLM → LMM → GLMM — in pure Rust, with an eight-name Python API.**
 
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
@@ -40,10 +40,11 @@ assert fit.converged
 fit.summary()   # prints the coefficient table (and returns it as a string)
 ```
 
-The public surface is six names: `glmm.fit`, `glmm.Fit`, and the four warning
+The public surface is eight names: `glmm.fit`, `glmm.Fit`, and the six warning
 categories the diagnostics channel raises — `glmm.DiagnosticWarning` (the
-base) plus `glmm.IllConditionedWarning`, `glmm.PirlsExhaustedWarning` and
-`glmm.UnusedGroupingLevelsWarning`. Families, links, and knobs are string or
+base) plus `glmm.IllConditionedWarning`, `glmm.PirlsExhaustedWarning`,
+`glmm.UnusedGroupingLevelsWarning`, `glmm.ReDesignScaleWarning` and
+`glmm.HessianSeFallbackWarning`. Families, links, and knobs are string or
 scalar arguments, not types.
 
 `data` is documented as a `dict[str, array-like]`, but anything

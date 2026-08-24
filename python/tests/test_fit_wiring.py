@@ -166,6 +166,44 @@ def test_pirls_exhausted_message_distinguishes_final_eval():
     assert "the reported estimates rest on that truncated solve" in serious_msg
 
 
+def test_re_design_scale_spread_message_names_grouping_and_ratio():
+    # No fixture below drives the note through a real fit here (the Rust-side
+    # end-to-end test covers that: fit::common_tests::
+    # re_design_scale_spread_note_fires_on_mismatched_slope_scale), so the
+    # message is asserted from a constructed note, mirroring the
+    # pirls_exhausted test above.
+    note = {
+        "kind": "re_design_scale_spread",
+        "columns": [],
+        "pivot": float("nan"),
+        "evals": 0,
+        "final_eval": False,
+        "detail": "g",
+        "ratio": 4200.0,
+    }
+    msg, cat = glmm._note_warning(note, [])
+    assert cat is glmm.ReDesignScaleWarning
+    assert "'g'" in msg
+    assert "4.2e+03" in msg
+    assert "scales the columns internally" in msg
+
+
+def test_hessian_se_fallback_message():
+    note = {
+        "kind": "hessian_se_fallback",
+        "columns": [],
+        "pivot": float("nan"),
+        "evals": 0,
+        "final_eval": False,
+        "detail": "",
+        "ratio": float("nan"),
+    }
+    msg, cat = glmm._note_warning(note, [])
+    assert cat is glmm.HessianSeFallbackWarning
+    assert "not positive definite" in msg
+    assert "stddev_se is NaN" in msg
+
+
 def test_poisson_glm():
     y = _rng.poisson(np.exp(0.5 + 0.3 * _X)).astype(float)
     result = glmm.fit(_data(y.tolist()), "y ~ x", "poisson")
@@ -319,3 +357,25 @@ def test_pinned_detail_is_reported_on_a_sparse_route_fit():
     for idx, flags in enumerate(result.diagnostics["pinned"]):
         sd, _ = result.stddev_corr(idx)
         assert len(flags) == len(sd)
+
+
+def test_degenerate_mixed_fit_returns_instead_of_panicking():
+    # n <= p leaves the LMM with no finite deviance endpoint, so the kernel takes
+    # its degenerate return: NaN beta/se/dispersion and — the crate's
+    # numerical-failure convention — no assembled varcorr. A mixed fit lowers one
+    # grouping regardless, so the two lengths disagree; that must reach the caller
+    # as a returned non-converged result, not a PanicException across the FFI.
+    data = {
+        "y": [1.0, 2.0, 3.0],
+        "x1": [0.1, 0.7, 0.3],
+        "x2": [0.5, 0.2, 0.9],
+        "g": ["a", "b", "a"],
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = glmm.fit(data, "y ~ x1 + x2 + (1 | g)")
+    assert not result.converged
+    assert result.varcorr == []
+    assert result.re_groups == [("g", ["(Intercept)"])]
+    # summary() walks varcorr/re_groups together — it must print, not raise.
+    assert "Random effects:" not in result.summary()

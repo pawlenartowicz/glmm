@@ -5,7 +5,7 @@
 //! `n_max` over-reads, or option-reset misses — this suite is that guard.
 
 use super::{build_workspace, fit_on};
-use crate::fit::spec_sized_from_ids_pub;
+use crate::fit::{spec_sized_from_ids_pub, Perm};
 use crate::test_support::assert_near;
 use crate::{
     fit_cold, BinomialLink, Family, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec,
@@ -310,7 +310,7 @@ fn nested_unbalanced_case() -> (
 fn fitview_accessors_match_fit_for_ols() {
     let (x, y, n, p, model, ids, opts) = ols_case();
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    let mut ws = build_workspace(&model, n, p, &opts);
+    let mut ws = build_workspace(&model, Perm::IDENTITY, n, p, &opts);
     let v = fit_on(&mut ws, &x, &y, &ids, None, &opts);
     assert_eq!(v.converged(), cold.converged());
     // OLS t_sq is target-compact.
@@ -328,7 +328,7 @@ fn fitview_accessors_match_fit_for_ols() {
 #[test]
 fn fitview_diagnostics_agree_with_materialized_fit() {
     let (x, y, n, p, model, ids, opts) = ols_case();
-    let mut ws = build_workspace(&model, n, p, &opts);
+    let mut ws = build_workspace(&model, Perm::IDENTITY, n, p, &opts);
     let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert_eq!(d.converged, cold.converged());
@@ -343,8 +343,8 @@ fn fitview_diagnostics_agree_with_materialized_fit() {
     assert!(d.pivot > crate::ols::PIVOT_MIN, "pivot {}", d.pivot);
 
     let (x, y, n, p, model, ids, opts) = lmm_intercept_case();
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert_eq!(d.converged, cold.converged());
@@ -356,8 +356,8 @@ fn fitview_diagnostics_agree_with_materialized_fit() {
     assert!(d.boundary_hit != 1 || cold.singular());
 
     let (x, y, n, p, model, ids, opts) = crossed_extra_case(vec![1]);
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     assert!(ws.is_prebuilt());
     let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
@@ -419,8 +419,8 @@ fn fitview_diagnostics_flag_a_rank_deficient_lmm_draw() {
         ..FitOptions::default()
     };
 
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     assert!(ws.is_lmm_dense());
     let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
     assert!(d.converged, "the near-duplicate design is still computable");
@@ -482,7 +482,7 @@ fn fitview_diagnostics_flag_a_weighted_collinear_ols_fit() {
     };
     let ids = GroupIds::default();
 
-    let mut ws = build_workspace(&model, n, p, &opts);
+    let mut ws = build_workspace(&model, Perm::IDENTITY, n, p, &opts);
     assert!(ws.is_ols());
     let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
     assert!(d.converged, "the fit is computable and must be returned");
@@ -517,13 +517,13 @@ fn fitview_diagnostics_zero_alloc() {
     const N_CALLS: usize = 1000;
 
     let (xo, yo, no, po, mo, ido, oo) = ols_case();
-    let mut ws_ols = build_workspace(&mo, no, po, &oo);
+    let mut ws_ols = build_workspace(&mo, Perm::IDENTITY, no, po, &oo);
     let (xl, yl, nl, pl, ml, idl, ol) = lmm_intercept_case();
-    let sized_l = spec_sized_from_ids_pub(&ml, &idl);
-    let mut ws_lmm = build_workspace(&sized_l, nl, pl, &ol);
+    let (sized_l, idl, perm) = spec_sized_from_ids_pub(&ml, &idl);
+    let mut ws_lmm = build_workspace(&sized_l, perm, nl, pl, &ol);
     let (xs, ys, ns, ps, ms, ids_s, os) = crossed_extra_case(vec![1]);
-    let sized_s = spec_sized_from_ids_pub(&ms, &ids_s);
-    let mut ws_sparse = build_workspace(&sized_s, ns, ps, &os);
+    let (sized_s, ids_s, perm) = spec_sized_from_ids_pub(&ms, &ids_s);
+    let mut ws_sparse = build_workspace(&sized_s, perm, ns, ps, &os);
 
     // Fit each arm ONCE outside the profiler — the fits themselves allocate
     // (faer internals, and the sparse kernel assembles a whole `Fit`); what is
@@ -564,12 +564,12 @@ fn build_workspace_routes_fixed_only_to_ols_and_mixed_to_lmm() {
         family: Family::Gaussian,
         re: None,
     };
-    let ws_fixed = build_workspace(&fixed, 100, 3, &opts);
+    let ws_fixed = build_workspace(&fixed, Perm::IDENTITY, 100, 3, &opts);
     assert!(ws_fixed.is_ols());
 
     let (_, _, n, p, mixed, ids, _) = lmm_intercept_case();
-    let sized = spec_sized_from_ids_pub(&mixed, &ids);
-    let ws_mix = build_workspace(&sized, n, p, &FitOptions::default());
+    let (sized, _ids, perm) = spec_sized_from_ids_pub(&mixed, &ids);
+    let ws_mix = build_workspace(&sized, perm, n, p, &FitOptions::default());
     assert!(ws_mix.is_lmm_dense());
 
     let glm = ModelSpec {
@@ -578,7 +578,7 @@ fn build_workspace_routes_fixed_only_to_ols_and_mixed_to_lmm() {
         },
         re: None,
     };
-    assert!(build_workspace(&glm, 50, 2, &opts).is_glm());
+    assert!(build_workspace(&glm, Perm::IDENTITY, 50, 2, &opts).is_glm());
 
     let nb = ModelSpec {
         family: Family::NegativeBinomial {
@@ -586,7 +586,7 @@ fn build_workspace_routes_fixed_only_to_ols_and_mixed_to_lmm() {
         },
         re: None,
     };
-    assert!(build_workspace(&nb, 50, 2, &opts).is_prebuilt());
+    assert!(build_workspace(&nb, Perm::IDENTITY, 50, 2, &opts).is_prebuilt());
 }
 
 // --- pin the absence of the scalar-Brent route ---
@@ -598,8 +598,8 @@ fn build_workspace_routes_fixed_only_to_ols_and_mixed_to_lmm() {
 #[test]
 fn single_intercept_gaussian_routes_to_bobyqa_not_brent() {
     let (_x, _y, n, p, model, ids, opts) = lmm_intercept_case();
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let ws = build_workspace(&sized, n, p, &opts);
+    let (sized, _ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let ws = build_workspace(&sized, perm, n, p, &opts);
     assert!(ws.is_lmm_dense());
 }
 
@@ -609,7 +609,7 @@ fn single_intercept_gaussian_routes_to_bobyqa_not_brent() {
 fn fit_on_ols_reused_ws_near_identical_to_fit_cold() {
     let (x, y, n, p, model, ids, opts) = ols_case();
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    let mut ws = build_workspace(&model, n, p, &opts);
+    let mut ws = build_workspace(&model, Perm::IDENTITY, n, p, &opts);
     let f1 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     let f2 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     assert_near(&cold.beta, &f1.beta, "beta vs fit_cold");
@@ -621,8 +621,8 @@ fn fit_on_ols_reused_ws_near_identical_to_fit_cold() {
 fn fit_on_reused_ws_near_identical_to_fit_cold_lmm() {
     let (x, y, n, p, model, ids, opts) = lmm_intercept_case();
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     let f1 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     assert_near(&cold.beta, &f1.beta, "beta vs fit_cold");
     assert_near(&cold.tau2, &f1.tau2, "tau2 vs fit_cold");
@@ -657,8 +657,8 @@ fn fit_on_glmm_dense_matches_fit_cold() {
     let (x, y, n, p, model, ids, opts) = glmm_binomial_intercept_case();
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert!(cold.converged());
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     assert!(ws.is_glmm_dense());
     let f1 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     assert_near(&cold.beta, &f1.beta, "beta vs fit_cold");
@@ -683,8 +683,8 @@ fn fit_on_glmm_dense_matches_fit_cold() {
 #[should_panic(expected = "shape")]
 fn fit_on_panics_on_level_count_mismatch() {
     let (x, y, n, p, model, ids, opts) = lmm_intercept_case();
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, _ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     // Collapse every row to a single cluster → fewer levels than the build shape.
     let fewer = GroupIds {
         primary: vec![0u32; n],
@@ -758,8 +758,8 @@ fn crossed_extra_case(
 fn fit_on_sparse_matches_fit_cold() {
     let (x, y, n, p, model, ids, opts) = crossed_extra_case(vec![1]);
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     assert!(ws.is_prebuilt()); // sparse Level 1 routes through the Prebuilt arm
     let via =
         fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
@@ -778,9 +778,9 @@ fn fit_on_sparse_matches_fit_cold() {
 #[should_panic(expected = "extra grouping")]
 fn fit_on_panics_on_extra_level_count_overflow() {
     let (x, y, n, p, model, ids, opts) = crossed_extra_case(vec![1]);
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
-    let mut more = ids.clone();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let mut more = ids.into_owned();
     // One row promoted past the built level count for that grouping.
     more.extra[0][0] = *more.extra[0].iter().max().unwrap() + 1;
     let _ = fit_on(&mut ws, &x, &y, &more, None, &opts);
@@ -794,10 +794,10 @@ fn fit_on_panics_on_extra_level_count_overflow() {
 #[should_panic(expected = "extra grouping")]
 fn fit_on_panics_on_dense_lmm_extra_level_count_overflow() {
     let (x, y, n, p, model, ids, opts) = crossed_extra_case(vec![]);
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     assert!(ws.is_lmm_dense());
-    let mut more = ids.clone();
+    let mut more = ids.into_owned();
     more.extra[0][0] = *more.extra[0].iter().max().unwrap() + 1;
     let _ = fit_on(&mut ws, &x, &y, &more, None, &opts);
 }
@@ -808,10 +808,10 @@ fn fit_on_panics_on_dense_lmm_extra_level_count_overflow() {
 #[should_panic(expected = "extra grouping")]
 fn fit_on_panics_on_dense_glmm_extra_level_count_overflow() {
     let (x, y, n, p, model, ids, opts) = crossed_extra_glmm_case();
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     assert!(ws.is_glmm_dense());
-    let mut more = ids.clone();
+    let mut more = ids.into_owned();
     more.extra[0][0] = *more.extra[0].iter().max().unwrap() + 1;
     let _ = fit_on(&mut ws, &x, &y, &more, None, &opts);
 }
@@ -823,8 +823,8 @@ fn fit_on_panics_on_dense_glmm_extra_level_count_overflow() {
 #[test]
 fn fit_on_accepts_nested_draw_below_capacity() {
     let (x, y, n, p, model, ids, opts) = nested_unbalanced_case();
-    let sized = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, n, p, &opts);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
     assert_eq!(ws.build_extra_capacity, vec![12]); // 4 parents × widest parent's 3
     let used = *ids.extra[0].iter().max().unwrap() as usize + 1;
     assert_eq!(used, 11); // max child id 10 (3·3 + 1)
@@ -837,12 +837,35 @@ fn fit_on_accepts_nested_draw_below_capacity() {
 #[should_panic(expected = "target count is frozen at build")]
 fn fit_on_panics_on_grown_target_count() {
     let (x, y, n, p, model, ids, opts) = ols_case();
-    let mut ws = build_workspace(&model, n, p, &opts);
+    let mut ws = build_workspace(&model, Perm::IDENTITY, n, p, &opts);
     let wider = FitOptions {
         target_indices: vec![0, 1, 2],
         ..opts
     };
     let _ = fit_on(&mut ws, &x, &y, &ids, None, &wider);
+}
+
+/// Weights presence is frozen at build, and that freeze is what keeps the dense
+/// GLMM workspace's `prior_w` honest across a reuse: the arm refills `prior_w`
+/// on every weighted call and never touches it otherwise, so a weighted →
+/// unweighted transition on one workspace would leave the previous call's
+/// weights in a buffer most consumers (the PIRLS working-weight and deviance
+/// folds, the pass-3 effective residual, `family::gamma_aic`) read without
+/// gating on `GlmmWorkspace::weighted`. The transition must fault here, before
+/// any of them runs.
+#[test]
+#[should_panic(expected = "weights presence is frozen at build")]
+fn fit_on_panics_when_a_weighted_glmm_workspace_is_reused_unweighted() {
+    let (x, y, n, p, model, ids, opts) = glmm_binomial_intercept_case();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let w: Vec<f64> = (0..n).map(|i| 1.0 + (i % 3) as f64).collect();
+    let opts_w = FitOptions {
+        weights: Some(w),
+        ..opts.clone()
+    };
+    let mut ws = build_workspace(&sized, perm, n, p, &opts_w);
+    let _ = fit_on(&mut ws, &x, &y, &ids, None, &opts_w);
+    let _ = fit_on(&mut ws, &x, &y, &ids, None, &opts);
 }
 
 /// A second `NestedWithin` extra aliases the first's RE-column block
@@ -856,7 +879,7 @@ fn build_workspace_rejects_two_nested_groupings() {
     let mut sized = model;
     let nested = sized.re.as_ref().unwrap().extra_groupings[0].clone();
     sized.re.as_mut().unwrap().extra_groupings.push(nested);
-    let _ = build_workspace(&sized, n, p, &opts);
+    let _ = build_workspace(&sized, Perm::IDENTITY, n, p, &opts);
 }
 
 // --- reuse-gate completeness (varying n, weighted reuse) ---
@@ -866,7 +889,7 @@ fn fit_on_varying_n_below_n_max_matches_fit_cold() {
     // Build the ws at n_max; refit at several n < n_max. Each must equal a fresh
     // fit_cold at that n (guards n_max-sized buffers being read past n).
     let (full_x, full_y, n_max, p, model, _ids, opts) = ols_case();
-    let mut ws = build_workspace(&model, n_max, p, &opts);
+    let mut ws = build_workspace(&model, Perm::IDENTITY, n_max, p, &opts);
     for &n in &[10usize, 21, n_max] {
         let x = &full_x[..n * p];
         let y = &full_y[..n];
@@ -891,7 +914,7 @@ fn fit_on_weighted_reuse_matches_fit_cold() {
         weights: Some(vec![1.0; n]),
         ..opts_w.clone()
     };
-    let mut ws = build_workspace(&model, n, p, &opts_w);
+    let mut ws = build_workspace(&model, Perm::IDENTITY, n, p, &opts_w);
 
     let cold_w = fit_cold(&x, &y, n, p, &model, &ids, &opts_w);
     let via_w =
@@ -919,7 +942,7 @@ fn fit_on_weighted_reuse_matches_fit_cold() {
 #[test]
 fn fit_on_ols_smaller_then_larger_matches_fit_cold() {
     let (full_x, full_y, n_max, p, model, _ids, opts) = ols_case();
-    let mut ws = build_workspace(&model, n_max, p, &opts);
+    let mut ws = build_workspace(&model, Perm::IDENTITY, n_max, p, &opts);
     for &n in &[12usize, n_max] {
         let x = &full_x[..n * p];
         let y = &full_y[..n];
@@ -935,7 +958,7 @@ fn fit_on_ols_smaller_then_larger_matches_fit_cold() {
 #[test]
 fn fit_on_ols_larger_then_smaller_matches_fit_cold() {
     let (full_x, full_y, n_max, p, model, _ids, opts) = ols_case();
-    let mut ws = build_workspace(&model, n_max, p, &opts);
+    let mut ws = build_workspace(&model, Perm::IDENTITY, n_max, p, &opts);
     for &n in &[n_max, 12usize] {
         let x = &full_x[..n * p];
         let y = &full_y[..n];
@@ -951,7 +974,7 @@ fn fit_on_ols_larger_then_smaller_matches_fit_cold() {
 #[test]
 fn fit_on_glm_smaller_then_larger_matches_fit_cold() {
     let (full_x, full_y, n_max, p, model, _ids, opts) = glm_case();
-    let mut ws = build_workspace(&model, n_max, p, &opts);
+    let mut ws = build_workspace(&model, Perm::IDENTITY, n_max, p, &opts);
     assert!(ws.is_glm());
     for &n in &[12usize, n_max] {
         let x = &full_x[..n * p];
@@ -968,7 +991,7 @@ fn fit_on_glm_smaller_then_larger_matches_fit_cold() {
 #[test]
 fn fit_on_glm_larger_then_smaller_matches_fit_cold() {
     let (full_x, full_y, n_max, p, model, _ids, opts) = glm_case();
-    let mut ws = build_workspace(&model, n_max, p, &opts);
+    let mut ws = build_workspace(&model, Perm::IDENTITY, n_max, p, &opts);
     for &n in &[n_max, 12usize] {
         let x = &full_x[..n * p];
         let y = &full_y[..n];
@@ -987,8 +1010,8 @@ fn fit_on_glm_larger_then_smaller_matches_fit_cold() {
 #[test]
 fn fit_on_lmm_dense_smaller_then_larger_matches_fit_cold() {
     let (full_x, full_y, n_max, p, model, ids_full, opts) = lmm_intercept_case();
-    let sized = spec_sized_from_ids_pub(&model, &ids_full);
-    let mut ws = build_workspace(&sized, n_max, p, &opts);
+    let (sized, ids_full, perm) = spec_sized_from_ids_pub(&model, &ids_full);
+    let mut ws = build_workspace(&sized, perm, n_max, p, &opts);
     assert!(ws.is_lmm_dense());
     for &n in &[24usize, n_max] {
         let x = &full_x[..n * p];
@@ -1008,8 +1031,8 @@ fn fit_on_lmm_dense_smaller_then_larger_matches_fit_cold() {
 #[test]
 fn fit_on_lmm_dense_larger_then_smaller_matches_fit_cold() {
     let (full_x, full_y, n_max, p, model, ids_full, opts) = lmm_intercept_case();
-    let sized = spec_sized_from_ids_pub(&model, &ids_full);
-    let mut ws = build_workspace(&sized, n_max, p, &opts);
+    let (sized, ids_full, perm) = spec_sized_from_ids_pub(&model, &ids_full);
+    let mut ws = build_workspace(&sized, perm, n_max, p, &opts);
     for &n in &[n_max, 24usize] {
         let x = &full_x[..n * p];
         let y = &full_y[..n];
@@ -1043,7 +1066,7 @@ fn fit_on_ols_scaled_x_gate_matches_has_weights() {
 
     // Unweighted build: has_weights=false ⇒ scaled_x is 0×0, must never be read.
     let cold_u = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    let mut ws_u = build_workspace(&model, n, p, &opts);
+    let mut ws_u = build_workspace(&model, Perm::IDENTITY, n, p, &opts);
     let via_u =
         fit_on(&mut ws_u, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     assert_near(&cold_u.beta, &via_u.beta, "unweighted beta");
@@ -1051,7 +1074,7 @@ fn fit_on_ols_scaled_x_gate_matches_has_weights() {
 
     // Weighted build: has_weights=true ⇒ scaled_x is n_max×p, read every call.
     let cold_w = fit_cold(&x, &y, n, p, &model, &ids, &opts_w);
-    let mut ws_w = build_workspace(&model, n, p, &opts_w);
+    let mut ws_w = build_workspace(&model, Perm::IDENTITY, n, p, &opts_w);
     let via_w = fit_on(&mut ws_w, &x, &y, &ids, None, &opts_w)
         .into_fit(&x, &y, &ids, n, p, &model, &opts_w);
     assert_near(&cold_w.beta, &via_w.beta, "weighted beta");
@@ -1073,8 +1096,8 @@ fn fit_on_lmm_dense_offset_round_trip_varying_n() {
     let (full_x, full_y, n_max, p, model, ids_full, mut opts) = lmm_intercept_case();
     let offset: Vec<f64> = (0..n_max).map(|i| 0.05 * ((i % 4) as f64 - 1.5)).collect();
     opts.offset = Some(offset.clone());
-    let sized = spec_sized_from_ids_pub(&model, &ids_full);
-    let mut ws = build_workspace(&sized, n_max, p, &opts);
+    let (sized, ids_full, perm) = spec_sized_from_ids_pub(&model, &ids_full);
+    let mut ws = build_workspace(&sized, perm, n_max, p, &opts);
     for &n in &[24usize, n_max, 24usize] {
         let x = &full_x[..n * p];
         let y = &full_y[..n];

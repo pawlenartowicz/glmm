@@ -159,7 +159,8 @@ fn fastglmm_fit(
             pivot = n.pivot,
             evals = n.evals as i32,
             final_eval = n.final_eval,
-            detail = n.detail.clone()
+            detail = n.detail.clone(),
+            ratio = n.ratio
         ))
     }));
     // Labelled conditional modes, one entry per grouping. `ranef.fastglmm`

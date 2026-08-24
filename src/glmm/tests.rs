@@ -1004,7 +1004,8 @@ fn fd_hessian_cov_matches_glmer_use_hessian_true() {
     // 1e-7 its ldL2 uses working weights one PIRLS iteration behind the mode
     // and vcov(use.hessian=TRUE) carried ~1.7e-3 of spurious θ/θβ curvature,
     // which this band used to absorb; see fd_hessian_cov's doc comment) and
-    // our FD runs PIRLS at the tight PIRLS_TOL_REL_FD, so what remains is the
+    // our FD runs PIRLS at `pirls_tol_fd` — never looser than the fit's own exit
+    // tolerance and capped at PIRLS_TOL_REL_FD — so what remains is the
     // two solvers' θ̂ offset plus FD truncation. tol = achieved band + ~30×
     // margin (cross-platform FP headroom); it pins the convention + the
     // load-bearing factor of 2. Mirrors hessian_mode_t_sq_uses_fd_hessian_cov's
@@ -1224,12 +1225,13 @@ fn hessian_mode_t_sq_uses_fd_hessian_cov() {
 ///
 /// Where non-PD genuinely lives: NOT at the θ→0 floor (the intercept-only
 /// Laplace deviance is EVEN in θ, so its θ-curvature there is structurally
-/// POSITIVE), and — since the FD evals run at the tight `PIRLS_TOL_REL_FD` —
-/// no longer at a converged high-variance fit either: an interior minimum has
-/// PSD curvature by definition, and the non-PD this fixture used to produce
-/// AT θ̂ was loose-tol FD noise on that near-flat θ direction (this very
-/// fixture flipped Ok when the tight tol landed — the noise the tol removes
-/// is exactly what made the LLT fail). The deviance is genuinely concave
+/// POSITIVE), and — since the FD evals run at `pirls_tol_fd`, never looser than
+/// the fit's own exit tolerance — no longer at a converged high-variance fit
+/// either: an interior minimum has PSD curvature by definition, and the non-PD
+/// this fixture used to produce AT θ̂ was loose-tol FD noise on that near-flat θ
+/// direction (this very fixture flipped Ok when the tightened FD tolerance
+/// landed — the noise it removes is exactly what made the LLT fail). The
+/// deviance is genuinely concave
 /// BEYOND the minimum along θ: at large θ the Laplace `log|A|` term grows
 /// like `2s·log θ` (concave) while the data deviance saturates and the
 /// penalty vanishes, so H_θθ < 0 there — tolerance-independent. The test
@@ -3334,8 +3336,8 @@ pub(crate) fn grouseticks_3crossed_fixture(
     };
     // Resize the placeholder crossed `n_clusters` from the actual level counts
     // (matches `fit_warm` before building `LmmGroupings`).
-    let sized = crate::fit::spec_sized_from_ids_pub(&model, &ids);
-    (sized, ids, x, y, n, p)
+    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
+    (sized, ids.into_owned(), x, y, n, p)
 }
 
 /// Structured cold-start overshoot gate (the documented grouseticks

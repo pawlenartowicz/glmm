@@ -70,11 +70,13 @@ short_name <- function(n) {
 
 ENGINE_DIRS <- c(lme4 = "lme4", mixedmodels = "mixedmodels", glmm = "glmm",
                  glmm_python = "glmm_python", glmm_r = "glmm_r")
-# AGQ pass (VALIDATION_AGQ, engines/lme4.R + engines/glmm.rs): a sibling results
-# tree, absent unless that opt-in pass has been run. Read separately from
-# ENGINE_DIRS because these are extra ROWS for datasets already in the table, not
-# extra engine columns -- and because compare.R must never see them (design 6).
-AGQ_DIRS <- c(lme4 = "lme4_agq", glmm = "glmm_agq")
+# AGQ pass (VALIDATION_AGQ, engines/lme4.R + glmm.rs + glmm_python.py + glmm_r.R):
+# a sibling results tree, absent unless that opt-in pass has been run. Read
+# separately from ENGINE_DIRS because these are extra ROWS for datasets already in
+# the table, not extra engine columns -- and because compare.R must never see them
+# (design 6).
+AGQ_DIRS <- c(lme4 = "lme4_agq", glmm = "glmm_agq",
+              glmm_python = "glmm_python_agq", glmm_r = "glmm_r_agq")
 agq <- Filter(Negate(is.null), lapply(AGQ_DIRS, read_engine))
 agq <- lapply(agq, function(lst) setNames(lst, short_name(names(lst))))
 # Quadrature order per dataset, for the row label -- the manifest's `agq` field is
@@ -119,13 +121,20 @@ speedup_label <- function(e) {
 # two boxes' rows from being silently read as one comparison.
 RUN_META_NAME <- c(glmm = "rust", glmm_python = "py", glmm_r = "glmm_r",
                    lme4 = "lme4", mixedmodels = "jl")
-read_run_meta <- function(e) {
-  p <- file.path(suite_dir, "results", paste0("run_meta_", RUN_META_NAME[[e]], ".json"))
+read_run_meta <- function(e, suffix = "") {
+  p <- file.path(suite_dir, "results",
+                 paste0("run_meta_", RUN_META_NAME[[e]], suffix, ".json"))
   if (!file.exists(p)) return(NULL)
   fromJSON(p, simplifyVector = TRUE)
 }
 metas <- Filter(Negate(is.null),
                 setNames(lapply(timing_engines, read_run_meta), timing_engines))
+# The aK rows come from a SEPARATE pass with its own run_meta (run.sh --agq=K), so
+# they get their own provenance lines -- printing them under the Laplace legs' meta
+# is what once hid an unpinned glmm AGQ leg sitting beside pinned port ones.
+agq_metas <- Filter(Negate(is.null),
+                    setNames(lapply(names(agq), read_run_meta, suffix = "_agq"),
+                             names(agq)))
 label_of <- function(es) paste(vapply(es, function(e) ENGINE_LABEL[[e]], ""), collapse = ", ")
 
 cat("== timing provenance ==\n")
@@ -152,6 +161,20 @@ if (!length(metas)) {
   if (length(loose))
     cat(sprintf("  WARNING: clock NOT locked for %s -- powersave noise, not measurements (run bench-l).\n",
                 label_of(loose)))
+}
+if (length(agq)) {
+  cat("  -- aK rows --\n")
+  for (e in names(agq)) {
+    m <- agq_metas[[e]]
+    if (is.null(m)) {
+      cat(sprintf("  %-6s no run_meta_*_agq.json -- fitted by hand, provenance UNKNOWN;\n%s",
+                  ENGINE_LABEL[[e]],
+                  "         do not read its aK cell against another engine's (run.sh --agq=K).\n"))
+    } else {
+      cat(sprintf("  %-6s %-30s no_turbo=%-2s pin=%-13s %s  %s\n", ENGINE_LABEL[[e]],
+                  m$machine, m$no_turbo, m$pin, substr(m$glmm_git_rev, 1, 8), m$started))
+    }
+  }
 }
 cat("\n")
 
@@ -204,7 +227,9 @@ cat("\nrx/h = time to fit + produce that SE (Hessian is the cost);",
     "  float() conversion, and the FFI copy). See engines/glmm_python.py.\n",
     "r_gap = R port time / glmm time (same kernel through the fastglmm extendr\n",
     "  wrapper; the port tax of the R<->Rust copy). See engines/glmm_r.R.\n",
-    "aK = the same fit at nAGQ=K instead of Laplace (opt-in VALIDATION_AGQ pass;\n",
-    "  absent unless it was run). NOT a controlled comparison: glmm fits these with\n",
-    "  parallel_inner ON -- shipped config vs shipped config, threads included.\n",
+    "aK = the same fit at nAGQ=K instead of Laplace (opt-in `run.sh --agq=K` pass;\n",
+    "  absent unless it was run). Every engine fits SERIAL here, glmm included --\n",
+    "  the only config all of them share, since neither port can turn inner\n",
+    "  parallelism on. So py_gap/r_gap read the same way as on the rx rows.\n",
+    "  Inner parallelism is measured in campaigns/speed-grid/agq_par_probe.rs.\n",
     "  A blank lme4 cell is glmer refusing nAGQ>1 on a vector RE, not a missing run.\n")

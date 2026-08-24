@@ -35,6 +35,13 @@ use faer::sparse::{SparseColMat, Triplet};
 use faer::{Conj, Mat, MatRef, Par, Side, Spec};
 
 mod glmm;
+// FD-Hessian noise-margin measurement (`#[ignore]`d, not a gate). Lives under
+// `sparse` rather than beside the dense FD code because it drives BOTH paths and
+// the sparse deviance evaluator (`glmm::sparse_glmm_deviance`) is private to
+// this module tree; the dense side's evaluator is `pub(crate)` and reachable
+// from anywhere.
+#[cfg(all(test, feature = "formula"))]
+mod fd_margin;
 #[cfg(test)]
 mod tests;
 
@@ -87,11 +94,16 @@ pub(crate) fn fit_mle_sparse(
         .iter()
         .map(|g| g.slopes.iter().map(|&c| c as usize).collect())
         .collect();
-    let g = LmmGroupings::from_cluster_spec_ext(model, n, &slope_cols, &extra_slope_cols);
+    let mut g = LmmGroupings::from_cluster_spec_ext(model, n, &slope_cols, &extra_slope_cols);
 
     // Row-major f64 `x` viewed column-agnostically as an n×p faer MatRef (Z/Gram
     // builders index it as `x[(i, j)]`).
     let xm = MatRef::from_row_major_slice(x, n, p);
+    // Before any Z entry is emitted: `for_each_z_entry` divides every slope value
+    // by its RE column's internal scale, so the scales must be current for THIS
+    // design first (mirrors `accumulate_lmm_rows` on the dense route).
+    g.set_slope_scales(xm, opts.weights.as_deref());
+    let g = g;
     // WLS-style √wᵢ pre-scaling, same convention as `fit_mle`'s dense path
     // (`add_rows_multi`'s `weights` arg): computed once here, threaded through
     // every z-emission and raw x/y read in `SparseLmmWorkspace::new`.
@@ -130,8 +142,11 @@ pub(crate) fn fit_mle_sparse(
     match start {
         Some(s) => {
             debug_assert_eq!(s.theta.len(), theta.len());
-            for (t, &v) in theta.iter_mut().zip(&s.theta) {
-                *t = v;
+            // Forward map into the solver's internal RE scale before the floor —
+            // mirror `fit_lmm`'s warm arm; change together.
+            let sc = g.theta_row_scales();
+            for ((t, &v), &f) in theta.iter_mut().zip(&s.theta).zip(sc.iter()) {
+                *t = v * f;
             }
             for &i in g.diagonal_theta() {
                 theta[i] = theta[i].max(crate::lmm::THETA_TRUTH_FLOOR);
@@ -273,7 +288,14 @@ pub(crate) fn fit_mle_sparse(
 
     // tau2[k] = θ̂[k]²·σ̂²; varcorr = vech(σ̂²·Λ̂Λ̂') per grouping — the path-independent
     // assembly shared with `fit_mle` (`fit.rs`).
-    let tau2: Vec<f64> = theta.iter().map(|&t| t * t * sigma_sq).collect();
+    // θ̂ is in the solver's internal RE units; the Λ-row scales divide it back into
+    // the design's own units before it is squared (mirror `lmm_view_to_fit`).
+    let theta_scales = g.theta_row_scales();
+    let tau2: Vec<f64> = theta
+        .iter()
+        .zip(theta_scales.iter())
+        .map(|(&t, &s)| (t / s) * (t / s) * sigma_sq)
+        .collect();
     let varcorr = crate::fit::assemble_varcorr(&theta, &g, sigma_sq);
 
     // Same −Σlog wᵢ deviance-constant convention as `fit_mle` (`fit.rs`,
@@ -338,7 +360,8 @@ pub(crate) fn fit_mle_sparse(
         ranef,
         ranef_levels,
     };
-    fit.diagnostics.singular = fit.diagnostics.singular || fit.has_negligible_component();
+    fit.diagnostics.singular =
+        fit.diagnostics.singular || fit.has_negligible_component(&crate::fit::re_scale_grid(&g));
     fit
 }
 
@@ -412,6 +435,29 @@ pub(crate) fn logdet_llt(symbolic: &SymbolicCholesky<usize>, l_values: &[f64]) -
 /// the O(e²·k_family) syrk downdate, not e³/3).
 pub(crate) const TAIL_SPARSE_MIN: usize = 128;
 
+/// Family-downdate dense-route trigger: take `FamDowndate::Dense` when one
+/// gather over the CSC pattern plus the per-eval `e²` zero costs less than
+/// `DD_DENSE_BETA ×` the scatter's per-eval entry count `Σ_f e_f(e_f+1)/2`.
+/// Both sides are θ-independent, so the comparison is made once at construction.
+///
+/// 0.5 — i.e. route dense once the scatter applies more than twice as many
+/// entries as the gather reads. Set by the 2026-08-24 locked-clock bracket over
+/// the seven sparse-tail cells available (six `cross8` grid cells plus InstEval
+/// in the ordered orientation), measuring per-eval cost on both routes with the
+/// route forced. Writing `R = Σ_f e_f(e_f+1)/2 / (nnz + e²)`, dense/scatter
+/// per-eval time came out 1.055 at R = 0.55, 1.045 at R = 0.92, 0.960 at
+/// R = 4.99, 0.825 at R = 12.2, 0.907 at R = 50.1, 0.753 at R = 93.7, 0.752 at
+/// R = 122.3. So the crossover lies in (0.92, 4.99) — no corpus shape lands
+/// inside that interval — and the threshold `R > 1/β = 2` is placed at its
+/// geometric middle, ~2.2× clear of the nearest measured loss and ~2.5× clear of
+/// the nearest measured win. Both misroutings near the boundary cost ≤5%.
+const DD_DENSE_BETA: f64 = 0.5;
+
+/// Hard cap on the dense accumulator: `e² · 8 B ≤ 256 MB` (e ≲ 5793). Above it
+/// the buffer is the wrong trade whatever the entry counts say, and the
+/// allocation itself is the objection.
+const DD_DENSE_MAX_BYTES: usize = 256 << 20;
+
 // Test-only override: force the sparse-tail branch for small-e fixtures so the
 // dense↔sparse equality tests exercise the sparse factor at their existing
 // tolerances. Thread-local (each #[test] runs on its own thread), read once in
@@ -420,6 +466,18 @@ pub(crate) const TAIL_SPARSE_MIN: usize = 128;
 thread_local! {
     pub(crate) static FORCE_SPARSE_TAIL: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+// Test-only override for the family-downdate route (`FamDowndate`), mirroring
+// `FORCE_SPARSE_TAIL` above: `Some(true)` forces the dense accumulator (still
+// subject to the memory cap), `Some(false)` the scatter, `None` leaves
+// `DD_DENSE_BETA` in charge. Exists so one fixture can be fit both ways and the
+// two answers compared; the production rule keeps no fallback of its own, so
+// neither arm is dead code kept as an oracle.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_DD_ROUTE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Sparse-tail state (branch `e > TAIL_SPARSE_MIN`): the fill-reducing (AMD)
@@ -460,23 +518,18 @@ pub(crate) struct SparseTail {
     /// sequentially by the assembly (mirrors the generation in `new` — change
     /// together).
     pub(crate) a22_slots: Vec<u32>,
-    /// Per family, CSC slot of every lower pair (a, b ≤ a) of its local crossed
-    /// scalar columns, in the downdate's replay order (column-major exclusive:
-    /// `b` outer, `a ≥ b` inner — stride-1 over the col-major `dd_temp`);
-    /// ragged via `fam_dd_off` (length n_primary+1). A dense
-    /// accumulate-then-gather alternative (stage every family's downdate in an
-    /// e×e buffer, subtract via one CSC gather per eval) measured 1.3–2.8×
-    /// SLOWER at every corpus shape on a locked clock: the staging writes are
-    /// the same count as the scatter's, and the e² zero + gather come on top.
-    /// The scatter stands.
-    pub(crate) fam_dd_slots: Vec<u32>,
-    pub(crate) fam_dd_off: Vec<usize>,
+    /// How each primary family's `S22 −= L21_f·L21_fᵀ` reaches `axx` — routed
+    /// once here off the θ-independent pattern, like every other decision in
+    /// this struct.
+    pub(crate) fam_dd: FamDowndate,
     /// Per-family compact L21 panel, col-major `e_f`-row columns
     /// (`panel[c·e_f + local]`), sized `fam_w · max_f e_f` once.
     pub(crate) panel: Vec<f64>,
     /// Scratch for the per-family S22 syrk downdate `panel·panelᵀ` (kernel B):
     /// col-major `e_f×e_f`, sized to `max_f e_f²` once, overwritten
-    /// (`Accum::Replace`) then scattered through `fam_dd_slots`.
+    /// (`Accum::Replace`) then applied through `fam_dd`. Empty on the arm that
+    /// needs no staging (`FamDowndate::Dense` at `fam_w == 1`, which folds the
+    /// rank-1 update straight into the accumulator).
     pub(crate) dd_temp: Vec<f64>,
     /// Scratch for the per-family B̃₂ downdate `panel·U1_sub` (kernel C):
     /// col-major `e_f×m`, sized to `max_f e_f · m` once, overwritten
@@ -486,6 +539,42 @@ pub(crate) struct SparseTail {
     /// (`LltRef` exposes no arm-agnostic forward-only solve; the deviance
     /// needs only `UᵀU = B̃₂ᵀS22⁻¹B̃₂`, which is permutation-invariant).
     pub(crate) x2: Mat<f64>,
+}
+
+/// How a primary family's `S22 −= L21_f·L21_fᵀ` reaches the CSC values.
+///
+/// Both arms apply the same `Σ_f e_f(e_f+1)/2` lower entries per eval; they
+/// differ in what one entry costs. `Scatter` pre-resolves every entry to its own
+/// CSC slot, so the per-eval index stream is as long as the value stream and a
+/// write can land anywhere in the `nnz(S22)`-wide, AMD-permuted `vals`. `Dense`
+/// carries one row index per family-local row instead — `Σ_f e_f` words — and
+/// accumulates into a dense lower `e×e` buffer whose active column is
+/// contiguous, paying one gather over the CSC pattern per eval for it.
+///
+/// An enum rather than two zero-sized field sets: the arms' state is disjoint
+/// and must never both be allocated — on the widest crossed cells `Scatter`'s
+/// slot list is hundreds of MB that `Dense` replaces with the `e×e` buffer — and
+/// the generation ↔ replay checklist then reads once per arm instead of covering
+/// two possible worlds.
+pub(crate) enum FamDowndate {
+    /// Per family, CSC slot of every lower pair (a, b ≤ a) of its local crossed
+    /// scalar columns, in the downdate's replay order (column-major exclusive:
+    /// `b` outer, `a ≥ b` inner — stride-1 over the col-major `dd_temp`);
+    /// ragged via `off` (length n_primary+1).
+    Scatter { slots: Vec<u32>, off: Vec<usize> },
+    /// `rows[off[f] + local]` is the global tail row of family `f`'s local
+    /// crossed row `local`. Strictly ascending within a family (`fam_crossed` is
+    /// sorted and crossed blocks are laid out level-ascending), so local lower
+    /// ⇒ global lower and no re-orientation is needed. Monotone but NOT
+    /// contiguous: a crossed factor gets one `LamBlock` per level, so at q = 1 —
+    /// every `(1|g)` design — each block is a single tail row. `acc` is the
+    /// lower-triangular column-major `e×e` accumulator, zeroed per eval with the
+    /// `A22 + I` assembly and gathered into `vals` after the family loop.
+    Dense {
+        rows: Vec<u32>,
+        off: Vec<usize>,
+        acc: Vec<f64>,
+    },
 }
 
 /// Per-fit workspace for the sparse-Z LMM path. Everything θ-independent —
@@ -1141,33 +1230,72 @@ fn build_sparse_tail(
             }
         }
     }
-    // Per-family downdate slots over the family's local crossed scalar columns
-    // (ascending, so local a ≥ b ⇒ global lower) — the kernel's replay order
-    // (COLUMN-major exclusive: `b` outer, `a ≥ b` inner, so the replay reads
-    // the col-major `dd_temp` stride-1); mirrors the panel scatter — change
-    // together. Within a family every (a, b) pair is a distinct CSC slot, so
-    // replay order only permutes which slot is hit when — the values are
-    // bit-identical either way.
-    let mut fam_dd_slots = Vec::new();
-    let mut fam_dd_off = Vec::with_capacity(fam_crossed.len() + 1);
-    fam_dd_off.push(0);
-    let mut cols: Vec<usize> = Vec::new();
+    // Family-downdate route (`FamDowndate`): both arms cost the same
+    // `Σ_f e_f(e_f+1)/2` entry applications per eval, so the comparison is over
+    // what the dense arm adds (one gather over the stored pattern — `nnz(S22)`,
+    // not `e(e+1)/2`, since the pattern is the co-occurrence union — plus the
+    // `e²` zero) against what it removes.
     let mut max_ef = 0usize;
+    let mut sum_pairs = 0.0f64;
     for list in fam_crossed {
-        cols.clear();
-        for &bi in list {
-            let b = &lam_blocks[bi as usize];
-            let t0 = b.start - kf;
-            cols.extend(t0..t0 + b.q);
-        }
-        max_ef = max_ef.max(cols.len());
-        for bl in 0..cols.len() {
-            for a in bl..cols.len() {
-                fam_dd_slots.push(slot_of((cols[a], cols[bl])));
-            }
-        }
-        fam_dd_off.push(fam_dd_slots.len());
+        let ef: usize = list.iter().map(|&bi| lam_blocks[bi as usize].q).sum();
+        max_ef = max_ef.max(ef);
+        sum_pairs += (ef as f64) * (ef as f64 + 1.0) * 0.5;
     }
+    let nnz = axx.symbolic().row_idx().len() as f64;
+    let cap_ok = e.saturating_mul(e).saturating_mul(8) <= DD_DENSE_MAX_BYTES;
+    let dense_route = cap_ok && nnz + (e as f64) * (e as f64) < DD_DENSE_BETA * sum_pairs;
+    #[cfg(test)]
+    let dense_route = match FORCE_DD_ROUTE.with(|c| c.get()) {
+        Some(want) => want && cap_ok,
+        None => dense_route,
+    };
+    let mut off = Vec::with_capacity(fam_crossed.len() + 1);
+    off.push(0);
+    let fam_dd = if dense_route {
+        // Local → global tail row per family-local crossed row, ascending
+        // within a family. This is the same walk the scatter's `cols` does
+        // below; keeping its result IS the dense arm's whole index state.
+        let mut rows: Vec<u32> = Vec::new();
+        for list in fam_crossed {
+            for &bi in list {
+                let b = &lam_blocks[bi as usize];
+                let t0 = b.start - kf;
+                rows.extend((t0..t0 + b.q).map(|t| t as u32));
+            }
+            off.push(rows.len());
+        }
+        FamDowndate::Dense {
+            rows,
+            off,
+            acc: vec![0.0f64; e * e],
+        }
+    } else {
+        // Per-family downdate slots over the family's local crossed scalar
+        // columns (ascending, so local a ≥ b ⇒ global lower) — the kernel's
+        // replay order (COLUMN-major exclusive: `b` outer, `a ≥ b` inner, so
+        // the replay reads the col-major `dd_temp` stride-1); mirrors the panel
+        // scatter — change together. Within a family every (a, b) pair is a
+        // distinct CSC slot, so replay order only permutes which slot is hit
+        // when — the values are bit-identical either way.
+        let mut slots = Vec::new();
+        let mut cols: Vec<usize> = Vec::new();
+        for list in fam_crossed {
+            cols.clear();
+            for &bi in list {
+                let b = &lam_blocks[bi as usize];
+                let t0 = b.start - kf;
+                cols.extend(t0..t0 + b.q);
+            }
+            for bl in 0..cols.len() {
+                for a in bl..cols.len() {
+                    slots.push(slot_of((cols[a], cols[bl])));
+                }
+            }
+            off.push(slots.len());
+        }
+        FamDowndate::Scatter { slots, off }
+    };
     let l_values = vec![0.0f64; symbolic.len_val()];
     let fac_mem =
         MemBuffer::new(symbolic.factorize_numeric_llt_scratch::<f64>(Par::Seq, Spec::default()));
@@ -1180,10 +1308,19 @@ fn build_sparse_tail(
         solve_mem,
         diag_slots,
         a22_slots,
-        fam_dd_slots,
-        fam_dd_off,
+        fam_dd,
         panel: vec![0.0f64; fam_w * max_ef],
-        dd_temp: vec![0.0f64; max_ef * max_ef],
+        // The dense arm at fam_w == 1 folds the rank-1 update straight into
+        // `acc` and never stages — mirrors the `w == 1` branch in
+        // `sparse_schur_factor`, change together.
+        dd_temp: vec![
+            0.0f64;
+            if dense_route && fam_w == 1 {
+                0
+            } else {
+                max_ef * max_ef
+            }
+        ],
         b2_temp: vec![0.0f64; max_ef * m],
         x2: Mat::zeros(e, m),
     }
@@ -1224,9 +1361,16 @@ fn for_each_z_entry(
     let sw = sqrt_w.map_or(1.0, |w| w[i]);
     let f = cluster_ids[i] as usize;
     // Slope-major primary layout — mirrors add_rows_multi's scatter (change together).
+    // Every slope value is read AS A RANDOM-EFFECT column and so takes the RE
+    // column's internal scale (`LmmGroupings::set_slope_scales`); the same x column
+    // keeps its raw value where the fixed-effect design reads it (`Z'X`, `[X y]'[X y]`).
+    // The intercept subcolumn's scale is exactly 1 by construction.
     emit(f, sw);
     for (k, &col) in g.primary_slope_cols.iter().enumerate() {
-        emit((k + 1) * g.n_primary + f, sw * x[(i, col)]);
+        emit(
+            (k + 1) * g.n_primary + f,
+            sw * (x[(i, col)] / g.primary_slope_scales[k]),
+        );
     }
     // Extra groupings: intercept at off, slope c at off+1+c.
     for (e, ids_e) in extra_ids.iter().enumerate() {
@@ -1234,7 +1378,7 @@ fn for_each_z_entry(
         let off = g.extra_offsets[e] + ids_e[i] as usize * q_g;
         emit(off, sw);
         for (c, &col) in g.extra_slope_cols[e].iter().enumerate() {
-            emit(off + 1 + c, sw * x[(i, col)]);
+            emit(off + 1 + c, sw * (x[(i, col)] / g.extra_slope_scales[e][c]));
         }
     }
 }
@@ -1517,8 +1661,15 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
                 axx,
                 a22_slots,
                 diag_slots,
+                fam_dd,
                 ..
             } = tail;
+            // Both per-eval accumulators reset together: `vals` takes A22 + I
+            // here, `acc` (dense route only) collects the family downdates and
+            // is gathered into `vals` after the family loop.
+            if let FamDowndate::Dense { acc, .. } = fam_dd {
+                acc.fill(0.0);
+            }
             let (_, vals) = axx.parts_mut();
             vals.fill(0.0);
             let mut cur = 0usize;
@@ -1754,8 +1905,7 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
             }
             Some(SparseTail {
                 axx,
-                fam_dd_slots,
-                fam_dd_off,
+                fam_dd,
                 panel,
                 dd_temp,
                 b2_temp,
@@ -1778,66 +1928,119 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
                 if let Some(r) = rec.as_mut() {
                     r.panel[r.panel_off[f]..r.panel_off[f + 1]].copy_from_slice(panel);
                 }
-                // S22 −= L21_f·L21_fᵀ. The fused scalar syrk is now one
-                // triangular `panel·panelᵀ` into `dd_temp` (a RESULT-MOVING
+                // S22 −= L21_f·L21_fᵀ, by whichever route `fam_dd` chose. Both
+                // arms compute the same lower `panel·panelᵀ` — a RESULT-MOVING
                 // reassociation of the per-entry dots, sanctioned as the dense
-                // arm's syrk at `1608–1610`; the small contraction width `w` —
-                // 1–2 for random-intercept crossed factors — means the win is
-                // on the `e_f` output dimension), then the scatter walk reads
-                // the accumulated lower entry from the temp. The column-major
-                // exclusive order (`b` outer, `a ≥ b` inner) mirrors the slot
-                // generation in `build_sparse_tail` — change together — and
-                // reads dd stride-1 (col b's lower entries are contiguous at
-                // `b·e_f + b..b·e_f + e_f`); the per-column `split_at` gives
-                // the zip exact lengths, killing the bounds checks.
-                let dd = &mut dd_temp[..e_f * e_f];
-                if w == 1 {
-                    // Every crossN cell that reaches this syrk has w==1 (fam_w is
-                    // a global scalar; all `(1|g)` random intercepts), where the
-                    // triangular matmul is a rank-1 lower outer product. A direct
-                    // hand loop runs at ~half faer's time — faer pays general
-                    // BLAS-3 setup for a single multiply per entry. Bit-identical
-                    // to the faer arm at w==1 (one product per lower entry, no
-                    // summation to reassociate), so parity numbers do not move.
-                    let p = &panel[..e_f];
-                    for b in 0..e_f {
-                        let pb = p[b];
-                        let col = &mut dd[b * e_f..b * e_f + e_f];
-                        for a in b..e_f {
-                            col[a] = p[a] * pb;
+                // tail's triangular `S22 −= L21·L21ᵀ` matmul below, just before
+                // its `Dense tail LLT`; the small contraction width `w` — 1–2
+                // for random-intercept crossed factors — means the win is on the
+                // `e_f` output dimension. They differ in where the entries land.
+                //
+                // At `w == 1` the triangular matmul is a rank-1 lower outer
+                // product, and a direct hand loop runs at ~half faer's time —
+                // faer pays general BLAS-3 setup for a single multiply per
+                // entry. Every crossN cell takes that path (`fam_w` is a global
+                // scalar; all `(1|g)` random intercepts). It is bit-identical to
+                // the faer arm at `w == 1` (one product per lower entry, no
+                // summation to reassociate), so parity numbers do not move; the
+                // `w ≥ 2` arm keeps the tuned BLAS-3 path for slope-carrying
+                // designs.
+                match fam_dd {
+                    // Scatter arm: stage into `dd_temp`, then replay through the
+                    // per-family slot list. The column-major exclusive order (`b`
+                    // outer, `a ≥ b` inner) mirrors the slot generation in
+                    // `build_sparse_tail` — change together — and reads dd
+                    // stride-1 (col b's lower entries are contiguous at
+                    // `b·e_f + b..b·e_f + e_f`); the per-column `split_at` gives
+                    // the zip exact lengths, killing the bounds checks.
+                    FamDowndate::Scatter { slots, off } => {
+                        let dd = &mut dd_temp[..e_f * e_f];
+                        if w == 1 {
+                            let p = &panel[..e_f];
+                            for b in 0..e_f {
+                                let pb = p[b];
+                                let col = &mut dd[b * e_f..b * e_f + e_f];
+                                for a in b..e_f {
+                                    col[a] = p[a] * pb;
+                                }
+                            }
+                        } else {
+                            let panel_ref =
+                                MatRef::from_column_major_slice(&panel[..e_f * w], e_f, w);
+                            faer::linalg::matmul::triangular::matmul(
+                                faer::MatMut::from_column_major_slice_mut(dd, e_f, e_f),
+                                faer::linalg::matmul::triangular::BlockStructure::TriangularLower,
+                                faer::Accum::Replace,
+                                panel_ref,
+                                faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+                                panel_ref.transpose(),
+                                faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+                                1.0,
+                                Par::Seq,
+                            );
+                        }
+                        let (_, vals) = axx.parts_mut();
+                        let mut rest = &slots[off[f]..off[f + 1]];
+                        for b in 0..e_f {
+                            let (col, tail_slots) = rest.split_at(e_f - b);
+                            rest = tail_slots;
+                            for (&s, &d) in col.iter().zip(&dd[b * e_f + b..b * e_f + e_f]) {
+                                vals[s as usize] -= d;
+                            }
+                        }
+                        debug_assert!(rest.is_empty(), "family downdate slot replay exhausted");
+                    }
+                    // Dense arm: `acc` column `rmap[b]` is contiguous and stays
+                    // resident for the whole column sweep, and the only index
+                    // stream is `rmap` — `e_f` words, against the scatter's
+                    // `e_f(e_f+1)/2`. At `w == 1` the rank-1 update goes straight
+                    // in, so `dd_temp` is neither written nor read (its buffer is
+                    // sized to zero in `build_sparse_tail` — change together).
+                    // `acc` collects `+Σ_f L21_f·L21_fᵀ`; the sign is applied
+                    // once by the gather after the family loop.
+                    FamDowndate::Dense { rows, off, acc } => {
+                        let rmap = &rows[off[f]..off[f + 1]];
+                        debug_assert_eq!(rmap.len(), e_f, "dense row map width");
+                        if w == 1 {
+                            let p = &panel[..e_f];
+                            for b in 0..e_f {
+                                let pb = p[b];
+                                let col = &mut acc[rmap[b] as usize * e..];
+                                for a in b..e_f {
+                                    col[rmap[a] as usize] += p[a] * pb;
+                                }
+                            }
+                        } else {
+                            let dd = &mut dd_temp[..e_f * e_f];
+                            let panel_ref =
+                                MatRef::from_column_major_slice(&panel[..e_f * w], e_f, w);
+                            faer::linalg::matmul::triangular::matmul(
+                                faer::MatMut::from_column_major_slice_mut(dd, e_f, e_f),
+                                faer::linalg::matmul::triangular::BlockStructure::TriangularLower,
+                                faer::Accum::Replace,
+                                panel_ref,
+                                faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+                                panel_ref.transpose(),
+                                faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+                                1.0,
+                                Par::Seq,
+                            );
+                            for b in 0..e_f {
+                                let col = &mut acc[rmap[b] as usize * e..];
+                                for (&r, &d) in
+                                    rmap[b..].iter().zip(&dd[b * e_f + b..b * e_f + e_f])
+                                {
+                                    col[r as usize] += d;
+                                }
+                            }
                         }
                     }
-                } else {
-                    // Existing faer triangular matmul, unchanged — bit-identical
-                    // for w ≥ 2. No crossN grid cell reaches this arm, but general
-                    // slope-carrying designs can, so keep the tuned BLAS-3 path.
-                    let panel_ref = MatRef::from_column_major_slice(&panel[..e_f * w], e_f, w);
-                    faer::linalg::matmul::triangular::matmul(
-                        faer::MatMut::from_column_major_slice_mut(dd, e_f, e_f),
-                        faer::linalg::matmul::triangular::BlockStructure::TriangularLower,
-                        faer::Accum::Replace,
-                        panel_ref,
-                        faer::linalg::matmul::triangular::BlockStructure::Rectangular,
-                        panel_ref.transpose(),
-                        faer::linalg::matmul::triangular::BlockStructure::Rectangular,
-                        1.0,
-                        Par::Seq,
-                    );
                 }
-                let (_, vals) = axx.parts_mut();
-                let mut rest = &fam_dd_slots[fam_dd_off[f]..fam_dd_off[f + 1]];
-                for b in 0..e_f {
-                    let (col, tail_slots) = rest.split_at(e_f - b);
-                    rest = tail_slots;
-                    for (&s, &d) in col.iter().zip(&dd[b * e_f + b..b * e_f + e_f]) {
-                        vals[s as usize] -= d;
-                    }
-                }
-                debug_assert!(rest.is_empty(), "family downdate slot replay exhausted");
                 // B̃₂ −= L21_f·U1_f (this family's rows of the B2 downdate). The
                 // per-block scalar gemm is now one `panel·U1_sub` into `b2_temp`
                 // (Accum::Replace; RESULT-MOVING reassociation, sanctioned as
-                // the dense arm's B2 matmul at `1676–1683`). U1_sub is rows
+                // the dense tail's `B̃₂ = B2 − L21·U1` matmul below its
+                // LLT). U1_sub is rows
                 // fb..fb+w of U1 taken as a strided `w×m` view (row-stride 1,
                 // col-stride kf, base `&u1[fb..]`) — no copy — so `u1` feeds the
                 // gemm vectorized; the family layout guarantees fb+w ≤ kf, which
@@ -1969,6 +2172,31 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
                 }
             }
             Some(tail) => {
+                // Dense downdate route: the family loop accumulated
+                // Σ_f L21_f·L21_fᵀ in `acc` instead of applying it per family,
+                // so subtract it here in one sequential pass over the stored
+                // pattern. This is the reassociation the route buys: the
+                // scatter applies `((s − c₁) − c₂) − c₃` family by family, this
+                // applies `s − (c₁ + c₂ + c₃)`. Only stored entries are read —
+                // `acc`'s strictly-upper half is never written and never
+                // gathered, and the pattern's lower-only storage keeps it that
+                // way.
+                if let SparseTail {
+                    axx,
+                    fam_dd: FamDowndate::Dense { acc, .. },
+                    ..
+                } = &mut *tail
+                {
+                    let (sym, vals) = axx.parts_mut();
+                    let col_ptr = sym.col_ptr();
+                    let row_idx = sym.row_idx();
+                    for j in 0..e {
+                        let base = j * e;
+                        for k in col_ptr[j]..col_ptr[j + 1] {
+                            vals[k] -= acc[base + row_idx[k]];
+                        }
+                    }
+                }
                 // Sparse tail: the CSC values already hold S22 = A22 + I −
                 // L21·L21ᵀ (assembly before the family loop, downdates inside
                 // it); numeric-refactor on the stored symbolic. A reordered
@@ -2020,7 +2248,8 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
     // S = C_xy − UᵀU (lower), Cholesky in place → the augmented factor L.
     // The UᵀU assembly is now two triangular syrk downdates — a RESULT-MOVING
     // reassociation of the per-entry U1ᵀU1 / U2ᵀU2 dots, sanctioned exactly as
-    // the dense-tail S22 syrk above (`s22` None-arm, `1608–1610`) — and
+    // the dense tail's triangular `S22 −= L21·L21ᵀ` matmul above (`s22`
+    // None-arm, just before its `Dense tail LLT`) — and
     // `cholesky_in_place` replaces the hand Crout with the same call the dense
     // tail uses for L22. Every write touches only the lower triangle, so the
     // once-zeroed upper stays zero and the recovery's lower-only reads see a

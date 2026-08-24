@@ -44,6 +44,13 @@ pub(super) fn accumulate_lmm_rows(
     weights: Option<&[f64]>,
 ) {
     ws.suff.reset();
+    // Before any row is accumulated: the RE design-column scales are per dataset, and
+    // every slope value the accumulator stores is already divided by them. The
+    // workspace is reused across draws with different `x`, so this is refreshed per
+    // call, not cached at construction — and outside the `n > 0 && p > 0` guard,
+    // because `SuffStats::reset` does not clear the scales and an empty draw would
+    // otherwise leave the previous draw's in place.
+    ws.suff.groupings.set_slope_scales(x_mat, weights);
     if n > 0 && p > 0 {
         ws.suff
             .add_rows_multi(x_mat, y, cluster_ids, extra_ids, weights);
@@ -107,6 +114,9 @@ impl LmmResultView<'_> {
             // loop) — always 0/false.
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
+            // No FD-Hessian SE pass on the Gaussian LMM path (no PIRLS to
+            // perturb) — always false.
+            hessian_fallback: false,
         }
     }
     /// Joint Wald-χ² over the target set (the omnibus significance read).
@@ -121,9 +131,15 @@ impl LmmResultView<'_> {
     pub(crate) fn dispersion(&self) -> f64 {
         self.fit.sigma_sq
     }
-    /// Fitted θ̂ vech (primary block then extras, column-major lower-triangular).
+    /// Fitted θ̂ vech (primary block then extras, column-major lower-triangular),
+    /// in the solver's INTERNAL RE column scale — `FitView::theta` divides it back
+    /// into the design's own units for the warm-start carry.
     pub(crate) fn theta(&self) -> &[f64] {
         self.theta
+    }
+    /// Grouping structure, for the internal RE column scales θ̂ carries.
+    pub(crate) fn groupings(&self) -> &LmmGroupings {
+        self.groupings
     }
 }
 
@@ -187,8 +203,16 @@ pub(crate) fn lmm_view_to_fit(
     // policy: a `MaxFunReached` cap-out reports an honest θ̂ (its finite
     // endpoint) with `converged == false` rather than NaN-filling.
     let has_endpoint = lmm_fit.deviance.is_finite();
+    // θ̂ is in the solver's internal RE units (`LmmGroupings::set_slope_scales`);
+    // `theta_row_scales` divides each entry back into the design's own units
+    // before it is squared, so `tau2` is a variance in the user's scale.
+    let theta_scales = view.groupings.theta_row_scales();
     let tau2: Vec<f64> = if has_endpoint {
-        view.theta.iter().map(|&t| t * t * sigma_sq).collect()
+        view.theta
+            .iter()
+            .zip(theta_scales.iter())
+            .map(|(&t, &s)| (t / s) * (t / s) * sigma_sq)
+            .collect()
     } else {
         view.theta.iter().map(|_| f64::NAN).collect()
     };
@@ -265,7 +289,8 @@ pub(crate) fn lmm_view_to_fit(
         ranef,
         ranef_levels,
     };
-    fit.diagnostics.singular = fit.diagnostics.singular || fit.has_negligible_component();
+    fit.diagnostics.singular = fit.diagnostics.singular
+        || fit.has_negligible_component(&super::common::re_scale_grid(view.groupings));
 
     // Weighted Gaussian log-density carries +½Σlog wᵢ per row; on the −2ℓ scale
     // the REML deviance gains −Σlog wᵢ (θ-independent — added post-optimization,

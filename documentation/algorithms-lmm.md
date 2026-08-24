@@ -126,6 +126,52 @@ the objective. **Validation**: the covariance recovery is checked by the varcomp
 std-dev gate (relative ~1e-3) on sleepstudy (a full `2×2` Λ with a correlation),
 Penicillin, and Pastes.
 
+## Random-effect design column scaling
+
+The θ search is made independent of the units of the random-effect columns.
+Before any sufficient statistic is accumulated, each random-slope design column
+gets a scale `s = √(Σ wᵢxᵢ² / Σ wᵢ)` — its weighted root-mean-square. Every site
+that reads that column as a random-effect covariate divides by `s`; the same
+column keeps its raw value everywhere the fixed-effect design reads it, and an
+implicit intercept subcolumn takes `s = 1` exactly.
+
+This is an exact model identity, not an approximation. Scaling a block's design
+`Z` by `diag(1/sᵢ)` and the matching rows of its relative Cholesky factor by
+`sᵢ` leaves `ZΛ` — and so the whole REML criterion — unchanged:
+
+```
+Z̃ = Z·diag(1/sᵢ)      Λ̃[i][j] = sᵢ·Λ[i][j]      Z̃Λ̃ = ZΛ
+```
+
+What changes is the coordinate BOBYQA searches: it minimises over `θ̃ = s·θ`, so
+a slope whose column is in the thousands and an intercept no longer sit decades
+apart in θ, and one global trust radius can resolve both. Without it a column of
+sd ~10³ against an intercept of 1 puts the two fitting θ components four decades
+apart, and the search freezes the intercept directions before the slope
+direction becomes resolvable at all.
+
+Everything derived from θ̂ is mapped back on the way out — `varcorr` as
+`D[i][j] = D̃[i][j]/(sᵢ·s_j)`, conditional modes as `b = b̃/sᵢ`, `tau2` and the
+GLMM `stddev_se` by the same row-wise division (the map is a fixed diagonal
+linear reparametrization, so the SE needs no delta-method term). A caller's
+warm-start θ is in the design's own units and is forward-mapped before the
+solve. `Fit` exposes no θ, so nothing else needs the map; the loop tier's
+`FitView::theta` divides it back for the warm-start carry.
+
+The scale is a property of the data, not of the model shape, so it is recomputed
+per dataset — on the dense path in `accumulate_lmm_rows`, on the sparse path
+before the workspace is built.
+
+**Code**: `rms_column_scale`, `LmmGroupings::set_slope_scales` /
+`theta_row_scales` / `block_row_scale` (`src/lmm.rs`); the Z-read sites in
+`LmmSuffStats::add_rows_multi` / `primary_gram` / `reml_deviance_blocked`
+(`src/lmm.rs`), `for_each_z_entry` (`src/sparse/mod.rs`), `build_z` /
+`fill_z_f64` (`src/glmm/workspace.rs`), `fill_m_vals` (`src/sparse/glmm.rs`);
+the back-maps in `varcorr_block` / `assemble_ranef_sparse` /
+`assemble_ranef_dense` (`src/fit/common.rs`). **Convention**: lme4 leaves the RE
+design alone and warns on badly scaled predictors instead (`checkScaleX`);
+`glmm` scales internally and reports the fit in the caller's units.
+
 ## Profiled REML objective
 
 Given θ, β̂ and σ̂² are their closed-form REML solutions, so the objective is a
@@ -288,11 +334,20 @@ and the component's bit is recorded in `pinned_components`. Off-diagonal
 covariances are never pinned — a correlation running to `±1` shows up as the
 *diagonal* `λ_dd → 0` under the Cholesky parameterization, so pinning the
 diagonal is the complete policy. `PIN_THETA = 1e-4` aligns the class boundary with
-the scalar Brent kernel's τ̂≈0 detection. The `Fit::diagnostics.singular` flag is set when any
+the scalar Brent kernel's τ̂≈0 detection. The test is on the **internal**
+(scaled) θ — see
+[Random-effect design column scaling](#random-effect-design-column-scaling) — so
+its verdict does not change when a random-slope covariate is re-expressed in
+different units. lme4 applies the same 1e-4 to θ in the caller's units, so on a
+badly scaled design the two can flag different terms. The `Fit::diagnostics.singular` flag is set when any
 component was pinned (`boundary_hit == 1`) **or** by the post-hoc
 `has_negligible_component()` check at `Fit` assembly (`src/fit/mod.rs`,
 `SINGULAR_REL_TOL = 1e-3`): any RE standard deviation `≤ 1e-3 ×` the largest —
 a relative check that catches scale-degenerate fits the absolute θ pin misses.
+It compares the **internal** standard deviations for the same reason the pin
+does: an intercept's standard deviation is in response units and a slope's is in
+response per covariate unit, so their raw ratio moves with the covariate's
+units, while the internal one does not.
 The sparse path applies the identical pin, and the GLMM path mirrors the whole
 policy after its stage-2 BOBYQA
 ([`algorithms-glmm.md` §Boundary handling](algorithms-glmm.md#boundary-handling-and-the-singular-flag)
@@ -387,8 +442,9 @@ MixedModels.jl.
 The validation suite (`validation/`) fits the same model on the same CSV with lme4,
 MixedModels.jl, and `glmm`, and gates β and varcomp std-devs at relative ~1e-3,
 the LMM `se` at ~1e-3, and the REML loglik at absolute ~1e-6. The committed data
-plus the reference JSONs are the frozen oracle: on any disagreement `glmm` is
-presumed wrong. The manifest currently carries 27 datasets (rungs 1–23 and
+plus the reference JSONs are frozen and never regenerated to absorb a
+disagreement; a disagreement beyond the band passes only once it is registered
+in `validation/divergences.json`. The manifest currently carries 27 datasets (rungs 1–23 and
 25–28; rung 24, the sparse Gamma, is backed out). The core Gaussian LMM rungs:
 
 | Rung | Dataset | Structure | Path exercised |

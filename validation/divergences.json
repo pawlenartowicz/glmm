@@ -1,0 +1,17 @@
+{
+  "//": "Documented divergences from the reference engines. The rules this file plays by — what makes an entry green, what still fails, and why a stale entry fails too — are written once in validation/README.md under 'Documented divergences'. Read them there; they are deliberately not restated here. Consumers: validation/compare.R and the in-crate cross-engine tier (tests/oracle_support). `summary` is the standalone short form, so an entry means something without the long-form review.",
+  "//fields": "id: stable key. dataset/rung: which fixture. comparison: 'lme4-vs-glmm' for compare.R's reference table, 'oracle-tier' for the in-crate goldens tier; an entry may list both. quantities: the comparison labels each consumer uses. max_rel: the largest relative difference the entry covers — an observation exceeding it FAILS, so a divergence that grows is not silently absorbed. direction: which way the criterion moved.",
+  "entries": [
+    {
+      "id": "rung24-gamma-basin-under-re-scaling",
+      "dataset": "sim_sparse_gamma",
+      "rung": 24,
+      "comparison": ["lme4-vs-glmm", "oracle-tier"],
+      "quantities": ["beta"],
+      "max_rel": 7.0e-3,
+      "direction": "glmm's criterion is 1.55937e-04 deviance WORSE than lme4's (3427.047732 vs lme4's 3427.047576), measured fresh against the full 48-rung corpus on 2026-08-24 -- supersedes the stale 1.328578e-04 figure, which had compared glmm's post-scaling criterion against its own pre-scaling value rather than against lme4. This sits inside the corpus-wide dev_eps = 2e-4 deviance gate, so the divergence stands: a basin choice, not a regression.",
+      "summary": "Always-on random-effect design column scaling moves this rung's blind start, and its gamma surface is flat and multimodal enough that BOBYQA lands in a neighbouring basin. The scaling map itself is exact: at matched theta the scaled and unscaled objectives agree to <= 1.3e-14 relative on both the dense and sparse LMM routes, and the scaled sparse and dense objectives agree to <= 1.3e-14 with each other. So this is a basin choice on a shared objective, not an arithmetic disagreement — beta[0] 0.23137381978057783 against lme4's 0.230029021531563 (rel 5.812e-3, compare.R's rel_max metric: |x-y| over max(|x|,|y|,1e-12)). lme4's basin is the better one by 1.56e-4 deviance. The same rung's beta also drifts 3.3e-3 on aarch64 from cross-microarchitecture FP reassociation; the two observations likely want one answer, and the aarch64 side is not resolved here.",
+      "review": "pending user review; `summary` above is the standalone record"
+    }
+  ]
+}

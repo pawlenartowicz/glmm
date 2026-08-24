@@ -79,6 +79,36 @@ def timing_runs():
 
 N_RUNS = timing_runs()  # None on an untimed run
 
+
+# AGQ timing pass, opt-in and orthogonal to timing_runs(). VALIDATION_AGQ=<k> refits
+# the manifest's `agq`-marked datasets at nagq=k instead of the pinned Laplace, into
+# results/glmm_python_agq_* -- a separate tree because compare.R globs
+# results/glmm_python_{empirical,simulated}/*.json for the port gate, so writing AGQ
+# fits there would gate a different model against the Rust Laplace row. Mirrors
+# glmm.rs's agq_nagq / lme4.R's agq_k -- change together.
+#
+# Unlike the Rust pass this cannot turn `parallel_inner` on: the wheel builds glmm
+# with the "orchestrate" feature only (glmm-python/Cargo.toml), so the port's AGQ
+# fit is the serial kernel and there is no knob to change that from Python.
+def agq_nagq():
+    v = os.environ.get("VALIDATION_AGQ", "").strip()
+    if v in ("", "0"):
+        return None
+    try:
+        n = int(v)
+    except ValueError:
+        n = -1
+    if n < 1 or n % 2 == 0:
+        raise SystemExit(
+            f"VALIDATION_AGQ must be an ODD integer >= 1 (got {v!r}); "
+            "the Gauss-Hermite table is built for orders 1, 3, 5, ..."
+        )
+    return n
+
+
+AGQ = agq_nagq()  # None on a normal (Laplace) run
+OUT_STEM = "glmm_python_agq" if AGQ is not None else "glmm_python"
+
 # Suite directory (manifest + data + results root). Mirrors glmm.rs's suite_dir().
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SUITE = os.path.dirname(_HERE)
@@ -303,15 +333,27 @@ def fit_one(spec):
     timing_batch = spec.get("timing_batch", 1)
 
     kw = {"link": link, "weights": weights, "offset": offset}
-
-    # Reference grouping order (compare.R aligns varcomp positionally, not by name) —
-    # read off the already-frozen lme4 result rather than re-deriving lme4's convention.
-    with open(f"{SUITE}/results/lme4_{source}/{ds}.json") as fh:
-        reference = json.load(fh)
-    ref_order = [e["group"] for e in reference["estimates"]["varcomp"]]
+    # nagq rides in kw so every fit AND every timing closure below uses it -- a
+    # defaulted arm would time Laplace while the other reported quadrature.
+    if AGQ is not None:
+        kw["nagq"] = AGQ
 
     fh_fit = glmm.fit(data, formula, family, wald_se="hessian", **kw)
     fixed_only = not fh_fit.re_groups
+
+    # Reference grouping order (compare.R aligns varcomp positionally, not by name) —
+    # read off the already-frozen lme4 result rather than re-deriving lme4's convention.
+    # Mirrors the same block in engines/glmm.rs, which owns the explanation of the
+    # missing-file fallback — change together. Read after the fit because the fallback
+    # needs the fit's group names; the Rust engine gets them pre-fit off the lowered
+    # spec, which the Python API does not expose.
+    ref_path = f"{SUITE}/results/lme4_{source}/{ds}.json"
+    if os.path.exists(ref_path):
+        with open(ref_path) as fh:
+            reference = json.load(fh)
+        ref_order = [e["group"] for e in reference["estimates"]["varcomp"]]
+    else:
+        ref_order = [name for name, _ in fh_fit.re_groups]
 
     if gaussian or fixed_only:
         # One SE, no method choice: a gaussian rung has a single profiled `se`, and a
@@ -388,7 +430,7 @@ def fit_one(spec):
 
 
 def write_result(ds, source, res):
-    out = f"{SUITE}/results/glmm_python_{source}/{ds}.json"
+    out = f"{SUITE}/results/{OUT_STEM}_{source}/{ds}.json"
     with open(out, "w") as fh:
         json.dump(res, fh, indent=2, allow_nan=False)
         fh.write("\n")
@@ -404,15 +446,17 @@ def write_result(ds, source, res):
 
 def main():
     for source in ("empirical", "simulated"):
-        os.makedirs(f"{SUITE}/results/glmm_python_{source}", exist_ok=True)
+        os.makedirs(f"{SUITE}/results/{OUT_STEM}_{source}", exist_ok=True)
     with open(f"{SUITE}/manifest.json") as fh:
         manifest = json.load(fh)
     # VALIDATION_ONLY=<name>[,<name>...]: fit only the named datasets (mirrors the other
     # engines) — reruns a single rung without repaying the full-corpus timing cost.
     only = os.environ.get("VALIDATION_ONLY", "")
     want = (lambda ds: True) if not only else (lambda ds: ds in only.split(","))
+    # An AGQ pass covers only the `agq`-marked datasets -- the shapes glmm's AGQ gate
+    # accepts (binomial/Poisson, one grouping factor, q <= 3).
     for spec in manifest["datasets"]:
-        if want(spec["name"]):
+        if want(spec["name"]) and (AGQ is None or spec.get("agq") is not None):
             fit_one(spec)
 
 

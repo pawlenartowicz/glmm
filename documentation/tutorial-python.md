@@ -3,10 +3,11 @@
 One page, four sections. The first walks the single entry point — `glmm.fit` —
 end to end; the next two go deeper into the knobs and the returned `Fit`; the
 fourth is a short note on warm starts. The Python surface is deliberately tiny:
-**six public names**, `glmm.fit`, `glmm.Fit`, and the four warning categories
+**eight public names**, `glmm.fit`, `glmm.Fit`, and the six warning categories
 the diagnostics channel raises — `glmm.DiagnosticWarning` (the base) plus
-`glmm.IllConditionedWarning`, `glmm.PirlsExhaustedWarning` and
-`glmm.UnusedGroupingLevelsWarning`. Everything else (families, links, knobs)
+`glmm.IllConditionedWarning`, `glmm.PirlsExhaustedWarning`,
+`glmm.UnusedGroupingLevelsWarning`, `glmm.ReDesignScaleWarning` and
+`glmm.HessianSeFallbackWarning`. Everything else (families, links, knobs)
 is a string or scalar argument, not a type.
 
 > **Status:** this release ships the full API surface — signatures, argument
@@ -157,12 +158,13 @@ them). It is returned by `fit`, never constructed by callers.
 | `diagnostics` | dict with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; `converged`/`singular`/`aliased` above are `@property` forwarders over `diagnostics[...]`, kept at the top level for the most-read fields |
 
 **Diagnostic warnings.** `fit` raises a warning for each `note` the kernel
-records — today only ill-conditioning, as `IllConditionedWarning`, a subclass
-of the base category `DiagnosticWarning`. A design that is merely
-ill-conditioned (near-collinear but still distinguishable in f64) is fitted
-and returns real numbers; the warning is how you find out its standard
-errors are honest but large. Filter the whole channel, or just the one
-category:
+records, one of `IllConditionedWarning`, `PirlsExhaustedWarning`,
+`UnusedGroupingLevelsWarning`, `ReDesignScaleWarning` or
+`HessianSeFallbackWarning`, every one a subclass of the base category
+`DiagnosticWarning`. A design that is merely ill-conditioned (near-collinear
+but still distinguishable in f64) is fitted and returns real numbers; the
+warning is how you find out its standard errors are honest but large. Filter
+the whole channel, or just one category:
 
 ```python
 import warnings

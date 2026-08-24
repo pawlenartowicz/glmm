@@ -89,11 +89,12 @@ fn timing_runs() -> Option<usize> {
 }
 
 /// AGQ timing pass, opt-in and orthogonal to `timing_runs`. `VALIDATION_AGQ=<k>`
-/// refits the manifest's `agq`-marked datasets at `nagq = k` with `parallel_inner`
-/// on — the shipped-config arm — into `results/glmm_agq_*`. The separate tree is
-/// load-bearing: compare.R globs `results/lme4_{empirical,simulated}/*.json` to
-/// discover references, and the curated 6-rung oracle is not expanded (design 6).
-/// Mirrors lme4.R's `agq_k` — change together.
+/// refits the manifest's `agq`-marked datasets at `nagq = k` into
+/// `results/glmm_agq_*`. The separate tree is load-bearing: compare.R globs
+/// `results/lme4_{empirical,simulated}/*.json` to discover references, and the
+/// curated 6-rung oracle is deliberately not expanded by an AGQ timing pass.
+/// Mirrors lme4.R's `agq_k` / glmm_python.py's `agq_nagq` / glmm_r.R's `agq_k` —
+/// change together.
 fn agq_nagq() -> Option<u8> {
     let raw = std::env::var("VALIDATION_AGQ").ok()?;
     let v = raw.trim();
@@ -265,38 +266,51 @@ fn fit_one(spec: &Value) {
             .unwrap_or_else(|| panic!("{ds}: offset {oc:?} not in CSV header"));
         lo.opts.offset = Some(rows.iter().map(|r| r[o_idx].parse().unwrap()).collect());
     }
-    // AGQ pass: quadrature order from the env, and `parallel_inner` ON — the point
-    // of this pass is to time the configuration a user would actually get, and AGQ
-    // is where inner parallelism has something to chew on (k^q per-cluster sweeps).
-    // Note this makes the pass's times NOT a controlled serial-vs-parallel
-    // comparison against lme4's single-threaded fit. Mirrored into `o_r` below,
-    // which builds from FitOptions::default() — change together.
+    // AGQ pass: quadrature order from the env, and `parallel_inner` left OFF. This
+    // pass once turned it on to time the shipped config, which made the aK row
+    // uninterpretable: run.sh pins timed fits to one core, so rayon had nothing to
+    // spread across and the flag cost 27-37% on the sub-4ms rungs, while the earlier
+    // UNPINNED results it was compared against had all P-cores (sim_binomial_slope2
+    // measured 0.212 s unpinned vs 1.569 s pinned, both parallel — a 7.4x swing on
+    // the pin alone, which read as the two ports being 5.6x slower than the same
+    // kernel). Serial is the only config all five engines can share, and neither
+    // port can turn inner parallelism on at all (both wrapper crates take glmm with
+    // "orchestrate" only). Inner parallelism is measured in
+    // campaigns/speed-grid/agq_par_probe.rs, which is built for it.
     if let Some(k) = agq_nagq() {
         lo.opts.nagq = k;
-        lo.opts.parallel_inner = true;
     }
     let timing_batch = spec["timing_batch"].as_u64().unwrap_or(1) as usize;
     let timings = timing_runs();
 
     // Reference grouping order (compare.R aligns varcomp positionally, not by
     // name) — read off the already-frozen lme4 result rather than re-deriving
-    // lme4's own convention.
-    let reference: Value = serde_json::from_str(
-        &std::fs::read_to_string(format!("{suite}/results/lme4_{source}/{ds}.json"))
-            .expect("read lme4 reference"),
-    )
-    .expect("parse lme4 reference");
-    let ref_order: Vec<String> = reference["estimates"]["varcomp"]
-        .as_array()
-        .expect("reference estimates.varcomp array")
-        .iter()
-        .map(|e| {
-            e["group"]
-                .as_str()
-                .expect("reference varcomp group name")
-                .to_string()
-        })
-        .collect();
+    // lme4's own convention. Some rungs (InstEval, rung 47) are TIMING ONLY and
+    // never get an lme4 reference generated (manifest.json's note on that entry) —
+    // compare.R discovers references by globbing `results/lme4_*/*.json`, so a
+    // rung with no file there is simply invisible to it, not a compare.R failure
+    // to route around. Falling back to the fit's own declaration order when the
+    // file is absent keeps such rungs fitting (and their varcomp populated) under
+    // a plain `./run.sh`, which never runs the `lme4`/`jl` engines that would
+    // produce the file.
+    let ref_order: Vec<String> =
+        match std::fs::read_to_string(format!("{suite}/results/lme4_{source}/{ds}.json")) {
+            Ok(raw) => {
+                let reference: Value = serde_json::from_str(&raw).expect("parse lme4 reference");
+                reference["estimates"]["varcomp"]
+                    .as_array()
+                    .expect("reference estimates.varcomp array")
+                    .iter()
+                    .map(|e| {
+                        e["group"]
+                            .as_str()
+                            .expect("reference varcomp group name")
+                            .to_string()
+                    })
+                    .collect()
+            }
+            Err(_) => lo.re_groups.iter().map(|g| g.name.clone()).collect(),
+        };
 
     // Unit-weights identity gate (weights suite U1): the `weighted` fast-path
     // split must be invisible at w ≡ 1 -- fit once with the (all-ones) weights
@@ -403,11 +417,10 @@ fn fit_one(spec: &Value) {
             wald_se: WaldSe::Rx,
             weights: lo.opts.weights.clone(),
             offset: lo.opts.offset.clone(),
-            // Carried over from `lo.opts`, NOT defaulted: both are 1/false on a
-            // normal run, but on an AGQ pass a defaulted `o_r` would silently time
-            // the Rx arm at Laplace while the Hessian arm ran quadrature.
+            // Carried over from `lo.opts`, NOT defaulted: it is 1 on a normal run,
+            // but on an AGQ pass a defaulted `o_r` would silently time the Rx arm at
+            // Laplace while the Hessian arm ran quadrature.
             nagq: lo.opts.nagq,
-            parallel_inner: lo.opts.parallel_inner,
             ..FitOptions::default()
         };
         let fh = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);

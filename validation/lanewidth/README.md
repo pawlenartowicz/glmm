@@ -35,8 +35,8 @@ quantities moved between a normal run and a scalar-forced run.
 ## What it does NOT do
 
 It does not change the shipped `pulp` pin. `pulp` is exact-pinned at
-`=0.22.2` in `GLMM/Cargo.toml` (RULE 4 — FP-affecting bumps move the
-validation goldens), and the vendoring patch here is **never** applied to
+`=0.22.2` in the crate's `Cargo.toml` — FP-affecting bumps move the
+validation goldens — and the vendoring patch here is **never** applied to
 that manifest. Every patched file lives inside a scratch copy the script
 creates (default: `mktemp -d`, outside this repo); the real tree's
 `Cargo.toml`/`Cargo.lock` are only ever read, never written.

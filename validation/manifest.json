@@ -653,6 +653,33 @@
       ],
       "r_formula": "y ~ 1 + x + z + (1 | g1) + (1 | c1) + (1 | c2) + (1 | c3) + (1 | c4) + (1 | c5) + (1 | c6) + (1 | c7)",
       "//": "2-WAY GATE (glmm vs lme4), no jl_formula, by decision rather than by MixedModels limitation: this rung's job is the sparse arm's se_hessian at large theta-hat, and lme4 is the comparator that quantity is calibrated against. MixedModels.jl also throws PosDefException on rung 45, the dense large-theta rung, so a Julia leg in the same theta-hat band would most likely just crash. Same convention as rungs 23/24 and 36: absent jl_formula means engines/mixedmodels.jl skips the rung. Seven crossed intercept-only extras is what routes this to the sparse solver (over MAX_EXTRA_GROUPINGS); every RE block is scalar on purpose, because engines/lme4.R emits stddev_se only for all-scalar binomial/poisson fits and stddev_se is half of what this rung gates. Bernoulli, not Poisson: a Poisson design in this regime pushes counts into the tens of thousands, where the deviance-sum rounding noise dominates the FD Hessian's step independent of any solver tuning (see prep/gen_large_theta_data.R block R4 for the measurement); a Bernoulli response bounds the working weight and removes that noise floor. Sparse-large-theta-hat Poisson coverage is deliberately not attempted for this reason, not a gap left open."
+    },
+    {
+      "name": "InstEval",
+      "rung": 47,
+      "source": "lme4",
+      "family": "gaussian",
+      "reml": true,
+      "factors": [
+        "s", "d", "studage", "lectage", "service", "dept"
+      ],
+      "r_formula": "y ~ service * dept + studage + lectage + (1 | d) + (1 | s)",
+      "jl_formula": "@formula(y ~ 1 + service * dept + studage + lectage + (1 | d) + (1 | s))",
+      "//": "TIMING ONLY, not a curated correctness rung: the standard lme4-paper InstEval model (73421 rows, crossed student/instructor intercepts, 2972/1128 levels) used here purely to time glmm's Cholesky/Schur path on a large crossed design, per Bates/Alday/Kokandakar arXiv:2505.11674's term-order fill-in benchmark. No oracle JSON is generated for it by a normal run; it only joins compare.R's comparison if --oracles is run against it explicitly."
+    },
+    {
+      "name": "sim_probit_large",
+      "rung": 48,
+      "source": "sim",
+      "family": "binomial",
+      "link": "probit",
+      "reml": null,
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + z + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + z + (1 | g))",
+      "//": "The corpus's LARGE probit rung. Bernoulli, scalar (1|g), 100 groups x 96 rows = 9600 rows, p = 5, fitted theta-hat ~0.66. cbpp_probit (rung 22) is the only other probit fit anywhere in the suite and is 56 rows at ~3 ms, where a vectorized family kernel is pure measurement noise -- so probit SPEED, and any accuracy drift that needs a long row loop to accumulate, were both invisible before this rung. 96 rows per cluster is deliberate: it puts every conditional mode in the well-determined regime where Laplace is accurate, so a gate miss here means a kernel defect rather than the approximation's own bias (rungs 44-46 own the hard-cell axis). The row count sits under lme4's check.conv.nobsmax = 10000 ceiling, above which glmer stops computing the optimizer Hessian and engines/lme4.R's vcov(use.hessian = TRUE) hard-errors -- that ceiling, not taste, is what caps the rung. Data from prep/gen_probit_large_data.R, which carries the full sizing and coefficient rationale."
     }
   ],
   "//large_theta_rungs": "Rungs 44-46 + the two sim_binomial_bigsd_agq_k* goldens: the large-theta-hat regime. Rung 44 sim_binomial_bigsd is Bernoulli, scalar (1|g), 300 groups x 6 obs, fitted theta-hat 4.5106 -- 3.4x the corpus's previous GLMM maximum (1.339, VerbAgg); rung 45 sim_poisson_bigsd is the count-family counterpart at 2.9716. Both are Laplace (nAGQ=1) curated rungs on the EXISTING tiers, not a new tier and not an expansion of the curated 6-rung cross-engine oracle (design 6). Rung 46 sim_sparse_binomial_bigsd is the SPARSE arm of the same regime -- one primary grouping g1 (300 groups x 12) plus seven crossed intercept-only extras c1-c7, fitted theta-hat(g1) 3.9076 -- added because rungs 44-45 are both dense-routed scalar (1|g), so the sparse solver's large-theta-hat behavior was untested rather than merely uncalibrated (A4 A2.0a batch); it is a 2-way gate (glmm vs lme4 only, see its own '//' comment above for why). Their data comes from prep/gen_large_theta_data.R, the third of the five prep scripts (export_data.R rungs 1-28, gen_weights_data.R 29-43, gen_illcond_data.R, gen_scale_data.R). THE THIRD DATASET OF THAT SPEC, sim_binomial_zerosd (theta = 0 exactly), IS DELIBERATELY NOT A RUNG: lme4's vcov(m, use.hessian = TRUE) HARD-ERRORS on a boundary fit ('Hessian is unavailable' -- m@optinfo$derivs is NULL), which is exactly what engines/lme4.R:269 and :146 call, so adding it as a curated rung would abort the whole oracle run. What it exists to gate is a FLAG divergence, not a number -- lme4 warns 'boundary (singular) fit' (so engines/lme4.R records converged = FALSE) while glmm pins the component and reports converged = true with singular = true, and BOTH land on a bit-exact 0.0 stddev, so compare.R's numeric gates would see nothing. It is gated in-crate instead, by glmm_zerosd_boundary_reports_converged_and_singular in src/fit/glmm_tests.rs, which needs no oracle JSON. Verified 2026-07-30 that rel_max(0.0, 0.0) = 0 on this dataset, i.e. the two engines do not straddle rel_max's 1e-12 denominator floor.",

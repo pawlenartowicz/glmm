@@ -24,6 +24,15 @@
 #   ./run.sh --oracles       ALSO refit R/lme4 and Julia/MixedModels. Needed when
 #                             results/ is empty (it is gitignored, so a fresh clone
 #                             has none), after --prep, or for a newly added rung.
+#   ./run.sh --agq=K         AGQ pass: refit the manifest's `agq`-marked datasets at
+#                             nAGQ=K instead of the pinned Laplace, into the SIBLING
+#                             results/<engine>_agq_* trees. Every engine fits SERIAL,
+#                             the only config all of them can share (neither port can
+#                             turn inner parallelism on). MixedModels has no AGQ, so
+#                             `jl` is dropped even under --oracles, and compare.R is
+#                             skipped: it globs the Laplace trees and would report the
+#                             previous run's gate, not this one. summarize_timing.R
+#                             prints these as the `aK` rows.
 #   ./run.sh --timings[=N]   ALSO time every fit that runs: N samples (default 4),
 #                             warm-up discarded, median of the rest. N lives HERE,
 #                             not in the engines -- they read VALIDATION_TIMINGS.
@@ -36,14 +45,15 @@
 #                             Records results/run_meta_<engine>.json (machine, git
 #                             rev, no_turbo, pin) so summarize_timing.R can refuse to
 #                             compare seconds fitted on two different boxes.
-#   ./run.sh --prep          regenerate data_{empirical,simulated}/*.csv first (all five
+#   ./run.sh --prep          regenerate data_{empirical,simulated}/*.csv first (all six
 #                             prep scripts: export_data.R for rungs 1-28,
 #                             gen_weights_data.R for the prior-weights tier,
 #                             gen_large_theta_data.R for the large-theta-hat rungs
 #                             + the non-rung sim_binomial_zerosd fixture,
 #                             gen_illcond_data.R for the two ill-conditioned LMM
 #                             designs, which are goldens rather than rungs, and
-#                             gen_scale_data.R for the scale-variation GLM goldens).
+#                             gen_scale_data.R for the scale-variation GLM goldens,
+#                             gen_probit_large_data.R for the large probit rung).
 #                             IMPLIES --oracles: changed data invalidates the old
 #                             R/Julia results.
 #   ./run.sh --rust-tier2    ALSO run the crate's own cross-engine tier
@@ -63,6 +73,11 @@ ORACLES=0
 PORTS=0
 TIMINGS=0
 TIER2=0
+# Quadrature order for the AGQ pass, empty on a normal (Laplace) run. Exported as
+# VALIDATION_AGQ, which every engine reads (glmm.rs / lme4.R / glmm_python.py /
+# glmm_r.R) -- the pass used to be hand-run only, which is how a leg fitted UNPINNED
+# ended up in one table beside pinned ones.
+AGQ=""
 # Sample count for --timings, warm-up included. 4 taken, first discarded, median of
 # 3 -- enough to see a 10x regression, cheap enough that nobody is tempted to make
 # the gate pay for it. This is THE definition: the engines carry no N_RUNS constant
@@ -77,6 +92,9 @@ while [[ $# -gt 0 ]]; do
     # `=N` form only. `--timings N` would be ambiguous with the trailing dataset
     # names (./run.sh --timings cbpp), so the count must be attached.
     --timings=*) TIMINGS=1; TIMING_RUNS="${1#*=}"; shift ;;
+    # `=K` form only, for the same reason --timings takes one: a bare `--agq K`
+    # would be ambiguous with the trailing dataset names.
+    --agq=*) AGQ="${1#*=}"; shift ;;
     --rust-tier2) TIER2=1; shift ;;
     --) shift; break ;;
     -*) echo "unknown flag: $1" >&2; exit 2 ;;
@@ -110,6 +128,18 @@ if [[ "$TIMINGS" == 1 ]]; then
   export VALIDATION_TIMINGS="$TIMING_RUNS"
 fi
 
+# The AGQ contract, mirrored in four engines: unset / "" / "0" means Laplace;
+# otherwise it IS the quadrature order, an ODD integer >= 1 (the Gauss-Hermite table
+# is built for orders 1, 3, 5, ...). Validated here so all four can trust it; each
+# engine still errors on a malformed one, for the case where it is run by hand.
+if [[ -n "$AGQ" && "$AGQ" != "0" ]]; then
+  [[ "$AGQ" =~ ^[0-9]+$ ]] && (( AGQ >= 1 )) && (( AGQ % 2 == 1 )) \
+    || { echo "--agq=K needs an ODD integer K >= 1 (got '$AGQ')" >&2; exit 2; }
+  export VALIDATION_AGQ="$AGQ"
+else
+  AGQ=""
+fi
+
 # Per-ENGINE run metadata for timed passes, mirroring campaigns/speed-grid/run.sh
 # (which is where the no_turbo discipline was worked out) and memory/memory.sh's
 # write_run_meta. Per engine, not per invocation: results/ legitimately holds legs
@@ -127,18 +157,33 @@ write_run_meta() {
   # Recorded, never set -- clock locking is the user's `bench-l`/`bench-u`.
   no_turbo="$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo '?')"
   mkdir -p "$ROOT/results"
-  printf '{"engine":"%s","machine":"%s","glmm_git_rev":"%s","n_runs":%s,"no_turbo":"%s","pin":"%s","started":"%s"}\n' \
-    "$engine" "$(uname -n) $(uname -s)/$(uname -m)" "$rev" "$TIMING_RUNS" "$no_turbo" "${PIN:-none}" "$(date -Is)" \
-    > "$ROOT/results/run_meta_${engine}.json"
+  printf '{"engine":"%s","machine":"%s","glmm_git_rev":"%s","n_runs":%s,"nagq":%s,"no_turbo":"%s","pin":"%s","started":"%s"}\n' \
+    "$engine" "$(uname -n) $(uname -s)/$(uname -m)" "$rev" "$TIMING_RUNS" "${AGQ:-1}" "$no_turbo" "${PIN:-none}" "$(date -Is)" \
+    > "$ROOT/results/run_meta_${engine}${META_SUFFIX}.json"
   [[ "$no_turbo" == "1" ]] || echo \
     "   WARNING: clock NOT locked (no_turbo=$no_turbo) -- timings from this $engine pass are powersave noise; run bench-l first" >&2
 }
+
+# An AGQ pass writes its own results tree, so its provenance file needs its own name
+# too -- one run_meta_<engine>.json covering both would claim the Laplace legs were
+# fitted whenever the AGQ ones were. Mirrors the engines' own `_agq` output stems.
+META_SUFFIX=""
+[[ -n "$AGQ" ]] && META_SUFFIX="_agq"
+# The engines' own results-dir stem on an AGQ pass, for the progress lines below.
+OUT_SUFFIX="$META_SUFFIX"
 
 # Oracles first: the Rust engine reads results/lme4_<suite>/<ds>.json for the
 # reference grouping order, so lme4 must have run at least once in this tree.
 ENGINES=(rust)
 [[ "$PORTS" == 1 ]] && ENGINES=("${ENGINES[@]}" py glmm_r)
 [[ "$ORACLES" == 1 ]] && ENGINES=(lme4 jl "${ENGINES[@]}")
+# MixedModels fits Laplace only -- there is no nAGQ knob to turn, so an AGQ pass
+# drops it rather than refitting the same Laplace numbers under an `agq` label.
+if [[ -n "$AGQ" ]]; then
+  KEEP=()
+  for e in "${ENGINES[@]}"; do [[ "$e" == jl ]] || KEEP=("${KEEP[@]}" "$e"); done
+  ENGINES=("${KEEP[@]}")
+fi
 
 # Pin TIMED fits to one P-core (cores 0-5 are the 5.3 GHz P-cores on this box; same
 # core every run) so a locked-machine run isn't perturbed by the scheduler hopping
@@ -164,6 +209,7 @@ if [[ "$PREP" == 1 ]]; then
   Rscript "$ROOT/prep/gen_large_theta_data.R"
   Rscript "$ROOT/prep/gen_illcond_data.R"
   Rscript "$ROOT/prep/gen_scale_data.R"
+  Rscript "$ROOT/prep/gen_probit_large_data.R"
 fi
 
 for e in "${ENGINES[@]}"; do
@@ -182,7 +228,7 @@ for e in "${ENGINES[@]}"; do
         $PIN julia --project="$ROOT" "$ROOT/engines/mixedmodels.jl"
       fi ;;
     rust)
-      echo ">> glmm (Rust) -> results/glmm_{empirical,simulated}/"
+      echo ">> glmm (Rust) -> results/glmm${OUT_SUFFIX}_{empirical,simulated}/"
       if ! command -v cargo >/dev/null; then
         echo "   skipped: cargo not found" >&2; RAN=0
       else
@@ -190,7 +236,7 @@ for e in "${ENGINES[@]}"; do
           -p validation --example validation_fit
       fi ;;
     py)
-      echo ">> glmm python port -> results/glmm_python_*/"
+      echo ">> glmm python port -> results/glmm_python${OUT_SUFFIX}_*/"
       # The repo's own venv first (python/venv, where `maturin develop --release`
       # installs the wheel editable), else whatever python3 has glmm importable.
       # The wheel MUST be a --release build: a debug kernel would report the port's
@@ -205,7 +251,7 @@ for e in "${ENGINES[@]}"; do
         $PIN "$PY" "$ROOT/engines/glmm_python.py"
       fi ;;
     glmm_r)
-      echo ">> glmm R port -> results/glmm_r_*/"
+      echo ">> glmm R port -> results/glmm_r${OUT_SUFFIX}_*/"
       # Same kernel as the Rust/Python engines, reached through the fastglmm R
       # package (extendr wrapper). No venv step -- the package is installed in the
       # R library. Skip cleanly if it is not, so a machine without it still runs
@@ -227,10 +273,17 @@ for e in "${ENGINES[@]}"; do
     if [[ "$TIMINGS" == 1 ]]; then
       write_run_meta "$e"
     else
-      rm -f "$ROOT/results/run_meta_${e}.json"
+      rm -f "$ROOT/results/run_meta_${e}${META_SUFFIX}.json"
     fi
   fi
 done
 
-echo ">> compare"
-Rscript "$ROOT/compare.R"
+# compare.R discovers references by globbing the LAPLACE trees, which an AGQ pass
+# never writes -- running it here would print the previous run's gate as if it were
+# this one's.
+if [[ -n "$AGQ" ]]; then
+  echo ">> compare skipped (AGQ pass -- see summarize_timing.R's aK rows)"
+else
+  echo ">> compare"
+  Rscript "$ROOT/compare.R"
+fi

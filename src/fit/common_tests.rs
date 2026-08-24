@@ -438,12 +438,12 @@ fn theta_width_counts_vech_blocks() {
 /// D=ΛΛ'=[[4,1],[1,1.25]], vech col-major = [4, 1, 1.25]; ×scale.
 #[test]
 fn varcorr_block_is_scaled_lambda_gram() {
-    let vech = super::common::varcorr_block(&[2.0, 0.5, 1.0], 2, 1.0);
+    let vech = super::common::varcorr_block(&[2.0, 0.5, 1.0], 2, 1.0, &[1.0, 1.0]);
     assert_eq!(vech.len(), 3);
     assert!((vech[0] - 4.0).abs() < 1e-12, "D00 {}", vech[0]);
     assert!((vech[1] - 1.0).abs() < 1e-12, "D10 {}", vech[1]);
     assert!((vech[2] - 1.25).abs() < 1e-12, "D11 {}", vech[2]);
-    let scaled = super::common::varcorr_block(&[2.0, 0.5, 1.0], 2, 3.0);
+    let scaled = super::common::varcorr_block(&[2.0, 0.5, 1.0], 2, 3.0, &[1.0, 1.0]);
     assert!((scaled[0] - 12.0).abs() < 1e-12);
     assert!((scaled[2] - 3.75).abs() < 1e-12);
 }
@@ -572,7 +572,7 @@ fn spec_sized_from_ids_derives_counts() {
         primary: vec![0, 1, 2, 0, 1, 2], // 3 primary levels
         extra: vec![vec![0, 0, 1, 1, 2, 2], vec![0, 1, 2, 3, 4, 5]], // crossed 3, nested 6 children
     };
-    let sized = super::spec_sized_from_ids(&model, &ids);
+    let (sized, _ids, _perm) = super::spec_sized_from_ids(&model, &ids);
     let sre = sized.re.unwrap();
     assert_eq!(sre.sizing, Sizing::FixedClusters { n_clusters: 3 });
     assert_eq!(
@@ -610,7 +610,7 @@ fn spec_sized_from_ids_nested_unbalanced_uses_true_max_per_parent() {
         primary: vec![0, 1, 1, 2, 2, 2],
         extra: vec![vec![0, 3, 4, 6, 7, 8]],
     };
-    let sized = super::spec_sized_from_ids(&model, &ids);
+    let (sized, _ids, _perm) = super::spec_sized_from_ids(&model, &ids);
     let sre = sized.re.unwrap();
     assert_eq!(sre.sizing, Sizing::FixedClusters { n_clusters: 3 });
     assert_eq!(
@@ -644,7 +644,7 @@ fn spec_sized_from_ids_nested_unbalanced_first_parent_widest() {
         primary: vec![0, 0, 0, 1, 1, 2],
         extra: vec![vec![0, 1, 2, 3, 4, 5]],
     };
-    let sized = super::spec_sized_from_ids(&model, &ids);
+    let (sized, _ids, _perm) = super::spec_sized_from_ids(&model, &ids);
     let sre = sized.re.unwrap();
     assert_eq!(
         sre.extra_groupings[0].relation,
@@ -1724,4 +1724,88 @@ fn diagnostics_ill_conditioned_note_through_fit_cold() {
         "unweighted, the same design is well-conditioned"
     );
     assert!(clean.diagnostics.pinned.is_empty(), "no RE, nothing to pin");
+}
+
+/// A grouping `g` with a random slope on `x`, `x` built at the requested RMS
+/// scale (constant across groups; the note only reads the column, not the
+/// fit). Mirrors `sparse::tests::sparse_binomial_bigsd_formula_routes_sparse`'s
+/// `formula::lower` setup — the smallest fixture that exercises the real
+/// lowering path rather than a hand-built `ModelSpec`.
+#[cfg(feature = "formula")]
+fn scale_spread_table(x_scale: f64) -> (crate::formula::Table, usize) {
+    use crate::formula::{Column, Table};
+
+    let n_groups = 5;
+    let per_group = 8;
+    let n = n_groups * per_group;
+    let mut y = Vec::with_capacity(n);
+    let mut x = Vec::with_capacity(n);
+    let mut g_labels = Vec::with_capacity(n);
+    for gi in 0..n_groups {
+        for j in 0..per_group {
+            let jitter = j as f64 - (per_group as f64 - 1.0) / 2.0;
+            let xv = x_scale + jitter;
+            x.push(xv);
+            y.push(1.0 + 0.1 * xv / x_scale + 0.05 * gi as f64);
+            g_labels.push(format!("g{gi}"));
+        }
+    }
+    let table = Table {
+        n,
+        columns: vec![
+            ("y".to_string(), Column::Numeric(y)),
+            ("x".to_string(), Column::Numeric(x)),
+            ("g".to_string(), Column::factor_from_labels(&g_labels)),
+        ],
+    };
+    (table, n)
+}
+
+#[cfg(feature = "formula")]
+#[test]
+fn re_design_scale_spread_note_fires_on_mismatched_slope_scale() {
+    let (table, _n) = scale_spread_table(1.0e4);
+    let lo = crate::formula::lower("y ~ x + (1 + x | g)", &table, Family::Gaussian).unwrap();
+
+    let spread: Vec<&Note> = lo
+        .notes
+        .iter()
+        .filter(|n| matches!(n, Note::ReDesignScaleSpread { .. }))
+        .collect();
+    assert_eq!(
+        spread.len(),
+        1,
+        "expected exactly one note, got {:?}",
+        lo.notes
+    );
+    match spread[0] {
+        Note::ReDesignScaleSpread { grouping, ratio } => {
+            assert_eq!(grouping, "g");
+            // RMS(x) ~ 1e4 against the implicit intercept's 1.0 — same decade.
+            assert!(
+                (1.0e3..1.0e5).contains(ratio),
+                "ratio {ratio} not in the expected decade"
+            );
+        }
+        other => panic!("expected ReDesignScaleSpread, got {other:?}"),
+    }
+
+    // The note is a lowering-time observation, independent of whether the
+    // solver converges — the pipeline still runs end to end through fit_cold.
+    let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+}
+
+#[cfg(feature = "formula")]
+#[test]
+fn re_design_scale_spread_note_absent_on_well_scaled_design() {
+    let (table, _n) = scale_spread_table(4.0);
+    let lo = crate::formula::lower("y ~ x + (1 + x | g)", &table, Family::Gaussian).unwrap();
+
+    assert!(
+        !lo.notes
+            .iter()
+            .any(|n| matches!(n, Note::ReDesignScaleSpread { .. })),
+        "well-scaled design should not warn, got {:?}",
+        lo.notes
+    );
 }

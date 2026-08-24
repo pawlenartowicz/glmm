@@ -99,9 +99,13 @@ pub struct NoteInfo {
     /// for every other variant.
     pub final_eval: bool,
     /// Free text a variant needs and the fields above cannot carry (the
-    /// grouping and level names of `UnusedGroupingLevels`). Empty otherwise;
-    /// the `kind`, not this string, stays the stable identifier.
+    /// grouping and level names of `UnusedGroupingLevels`, the grouping name
+    /// of `ReDesignScaleSpread`). Empty otherwise; the `kind`, not this
+    /// string, stays the stable identifier.
     pub detail: String,
+    /// `ReDesignScaleSpread` payload: the measured max/min column-RMS ratio
+    /// (that variant's `ratio`). `NaN` for every other variant.
+    pub ratio: f64,
 }
 
 /// One `crate::formula::RanefBlock` flattened for the ports:
@@ -129,6 +133,7 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals: 0,
                 final_eval: false,
                 detail: String::new(),
+                ratio: f64::NAN,
             },
             Note::PirlsExhausted { evals, final_eval } => NoteInfo {
                 kind: "pirls_exhausted",
@@ -137,6 +142,7 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals,
                 final_eval,
                 detail: String::new(),
+                ratio: f64::NAN,
             },
             Note::UnusedGroupingLevels { grouping, levels } => NoteInfo {
                 kind: "unused_grouping_levels",
@@ -145,6 +151,25 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals: 0,
                 final_eval: false,
                 detail: format!("{grouping}: {}", levels.join(", ")),
+                ratio: f64::NAN,
+            },
+            Note::ReDesignScaleSpread { grouping, ratio } => NoteInfo {
+                kind: "re_design_scale_spread",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: 0,
+                final_eval: false,
+                detail: grouping,
+                ratio,
+            },
+            Note::HessianSeFallback => NoteInfo {
+                kind: "hessian_se_fallback",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: 0,
+                final_eval: false,
+                detail: String::new(),
+                ratio: f64::NAN,
             },
         })
         .collect()
@@ -360,12 +385,11 @@ pub fn run_fit(
 
     // `varcorr` and `re_groups` are both emitted in RE declaration order
     // (primary, then each extra), so index i of one names index i of the other.
-    // Assert rather than trust it: a silent misalignment relabels a variance
+    // Check rather than trust it: a silent misalignment relabels a variance
     // component in a port's `summary()`, which reads as a wrong answer, not a
-    // cosmetic slip. Non-mixed fits leave both empty, so the check holds there
-    // too. Labelled BEFORE `re_groups` is flattened — `label_ranef` needs the
-    // slot labels, which the tuple form drops. A shape mismatch here is a
-    // kernel bug, not a user error, so it surfaces as an `Err` rather than
+    // cosmetic slip. Labelled BEFORE `re_groups` is flattened — `label_ranef`
+    // needs the slot labels, which the tuple form drops. A shape mismatch here
+    // is a kernel bug, not a user error, so it surfaces as an `Err` rather than
     // being swallowed.
     let ranef_blocks: Vec<RanefBlockTuple> = label_ranef(&fit, &lowered.re_groups)
         .map_err(|e| e.to_string())?
@@ -377,11 +401,24 @@ pub fn run_fit(
         .into_iter()
         .map(|g| (g.name, g.terms))
         .collect();
-    assert_eq!(
-        re_groups.len(),
-        fit.varcorr.len(),
-        "re_groups and varcorr must agree in length and order"
-    );
+    // An EMPTY `varcorr` is not a mismatch — it is the crate's numerical-failure
+    // convention, "the fit assembled no variance components". Every failure
+    // return uses it: the degenerate LMM endpoint (`fit/lmm.rs`, alongside its
+    // NaN-filled `tau2`/`vcov`), any non-converged dense GLMM (`fit/glmm.rs`),
+    // the unfittable-random-slope return and the sparse NaN return
+    // (`fit/common.rs`). `Fit::has_negligible_component` documents the same
+    // reading, and both ports already gate their random-effects block on
+    // `varcorr`'s length, so an empty one prints no RE section rather than
+    // mislabelling one. Only a NON-empty block list of the wrong length is the
+    // kernel bug this check is for. Non-mixed fits leave both empty.
+    if !fit.varcorr.is_empty() && fit.varcorr.len() != re_groups.len() {
+        return Err(format!(
+            "re_groups and varcorr must agree in length and order: \
+             {} grouping(s) lowered, {} varcorr block(s) returned",
+            re_groups.len(),
+            fit.varcorr.len()
+        ));
+    }
 
     // Taken out whole before the field-by-field move below: the forwarding
     // accessors borrow all of `fit`, which a partial move rules out.
@@ -525,6 +562,23 @@ mod tests {
         assert_eq!(notes[1].kind, "pirls_exhausted");
         assert_eq!(notes[1].evals, 0);
         assert!(notes[1].final_eval);
+    }
+
+    #[test]
+    fn re_design_scale_spread_and_hessian_fallback_payloads_survive_flattening() {
+        let notes = note_infos(vec![
+            Note::ReDesignScaleSpread {
+                grouping: "Subject".to_string(),
+                ratio: 4200.0,
+            },
+            Note::HessianSeFallback,
+        ]);
+        assert_eq!(notes[0].kind, "re_design_scale_spread");
+        assert_eq!(notes[0].detail, "Subject");
+        assert_eq!(notes[0].ratio, 4200.0);
+        assert_eq!(notes[1].kind, "hessian_se_fallback");
+        assert_eq!(notes[1].detail, "");
+        assert!(notes[1].ratio.is_nan());
     }
 
     /// A factor column in the `(levels, codes)` form `run_fit` takes, with the

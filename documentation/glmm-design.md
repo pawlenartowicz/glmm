@@ -154,8 +154,9 @@ reach.
 Every difference above is held to the frozen validation oracle: identical models
 fit in R/lme4 and Julia/MixedModels.jl — two independent implementations — on
 27 committed datasets from single-intercept LMMs to crossed/nested/sparse
-GLMMs. On any disagreement `glmm` is presumed wrong; references are never
-regenerated to relax a tolerance. Shapes only lme4 covers (Gamma/NB/probit
+GLMMs. References are never regenerated to relax a tolerance; a disagreement
+beyond the agreement band is investigated as a `glmm` bug first and passes only
+once it is written up and registered (`validation/divergences.json`). Shapes only lme4 covers (Gamma/NB/probit
 GLMMs, AGQ) are pinned by committed lme4 goldens.
 
 ## Limits

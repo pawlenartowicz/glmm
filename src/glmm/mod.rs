@@ -99,19 +99,29 @@ pub const PIRLS_TOL_REL: f64 = 1e-9;
 /// limit, ~1.5× inner iters vs canonical — paid only on non-canonical fits, and
 /// only when SEs go through the FD-Hessian (`se_rx` skips it entirely).
 pub const PIRLS_TOL_REL_NONCANON: f64 = 1e-8;
-/// PIRLS exit tolerance under the FD-Hessian SE evals ONLY (`fd_hessian_cov` /
-/// `sparse_fd_hessian_cov`), overriding `pirls_tol` for every link. The FD
-/// second differences divide the deviance by step² (~1e-4), so PIRLS exit noise
-/// at the canonical 1e-6 surfaces as a dataset-dependent ~0.3% step wobble in
-/// `se_hessian` (cbpp, h=1e-2 vs 1e-3 — the shipped step landed on the accurate
-/// side by measurement, not construction). At 1e-8 the cbpp Hessian is
-/// step-invariant to ~5–6 sig figs across h ∈ {1e-2, 1e-3, 1e-4} and sits on
-/// the tight-tol (1e-12) limit — accurate by construction. Deeper buys nothing:
-/// the diagnosis sweep was already flat from 1e-10 to 1e-13. The fit path never
-/// pays this — BOBYQA objective evals keep `pirls_tol`; the cost lands only on
-/// the ~m² SE evals that already dominate `WaldSe::Hessian` timing (the same
-/// ~1.5×-inner-iteration precedent as `PIRLS_TOL_REL_NONCANON`, whose value
-/// this matches).
+/// CEILING on the PIRLS exit tolerance under the FD-Hessian SE evals ONLY
+/// (`fd_hessian_cov` / `sparse_fd_hessian_cov`). Never applied on its own —
+/// `pirls_tol_fd` takes `min(this, pirls_tol(family))`, so the SE pass is always
+/// at least as converged as the fit that produced the point it differences.
+/// Applying it as a plain replacement would put canonical links (fitting at
+/// `PIRLS_TOL_REL` = 1e-9) on a LOOSER deviance under the stencil than the one
+/// the optimizer converged on — an inversion of what an FD-only tolerance is
+/// for, and the reason the `min` is not optional.
+///
+/// Sizing of the 1e-8: the FD second differences divide the deviance by step²
+/// (~1e-4), so PIRLS exit noise reaches `se_hessian` amplified 1e4×. At an exit
+/// tolerance of 1e-6 that shows up as a dataset-dependent ~0.3% step wobble
+/// (cbpp, h=1e-2 vs 1e-3 — the shipped step landed on the accurate side by
+/// measurement, not construction). At 1e-8 the cbpp Hessian is step-invariant to
+/// ~5–6 sig figs across h ∈ {1e-2, 1e-3, 1e-4} and sits on the
+/// tight-tolerance (1e-12) limit — accurate by construction. Deeper buys
+/// nothing: the diagnosis sweep was already flat from 1e-10 to 1e-13, which is
+/// why this is a ceiling and not a value that tracks `PIRLS_TOL_REL` downward.
+///
+/// The fit path never pays it — BOBYQA objective evals keep `pirls_tol`; the
+/// cost lands only on the ~m² SE evals that already dominate `WaldSe::Hessian`
+/// timing (the same ~1.5×-inner-iteration precedent as
+/// `PIRLS_TOL_REL_NONCANON`, whose value this matches).
 pub const PIRLS_TOL_REL_FD: f64 = 1e-8;
 /// PIRLS exit tolerance for `family`: the standard value for canonical (Newton,
 /// quadratic) links, the tight value for non-canonical (Fisher-scoring, linear)
@@ -122,6 +132,16 @@ pub(crate) fn pirls_tol(family: crate::spec::Family) -> f64 {
     } else {
         PIRLS_TOL_REL_NONCANON
     }
+}
+/// PIRLS exit tolerance for the FD-Hessian SE evals: the tighter of the FD
+/// ceiling and the family's own fit tolerance, so the stencil can only ever be
+/// more converged than the fit, never less. Canonical links take
+/// `PIRLS_TOL_REL` (1e-9); non-canonical links fit at 1e-8 and so take the
+/// ceiling. Both FD-Hessian arms write this into `pirls_tol_override` —
+/// `glmm::se::fd_hessian_cov` and `sparse::glmm`'s `WaldSe::Hessian` arm,
+/// change together.
+pub(crate) fn pirls_tol_fd(family: crate::spec::Family) -> f64 {
+    PIRLS_TOL_REL_FD.min(pirls_tol(family))
 }
 /// Wide finite β box for the joint BOBYQA — the bounds handed to the optimizer
 /// for the β block, and the clamp applied to a warm-start β.
@@ -294,8 +314,13 @@ pub fn fit_glmm(
             // their edge; off-diagonals are boxed [-THETA_HI, THETA_HI] where 0 is
             // mid-range, so flooring them would silently rewrite a negative
             // correlation start. lme4 passes `start$theta` through verbatim.
-            for (t, &v) in ws.params[..n_theta].iter_mut().zip(ts) {
-                *t = v;
+            // A caller's θ is in the design's own units; the solver works on the
+            // internally scaled θ̃ = s·θ (`LmmGroupings::set_slope_scales`), so the
+            // forward map runs before the floor — which then floors the INTERNAL
+            // diagonals, the same scale `PIN_THETA` tests.
+            let s = ws.groupings.theta_row_scales();
+            for ((t, &v), &sc) in ws.params[..n_theta].iter_mut().zip(ts).zip(s.iter()) {
+                *t = v * sc;
             }
             for &i in ws.groupings.diagonal_theta() {
                 ws.params[i] = ws.params[i].max(THETA_TRUTH_FLOOR);
@@ -523,7 +548,7 @@ pub fn fit_glmm(
                     beta_rhs,
                     beta_prev,
                     true,
-                    // Never the FD tight tol here — stage-1 objective evals stay at
+                    // Never the FD-pass tol here — stage-1 objective evals stay at
                     // `pirls_tol` (the field is None outside `fd_hessian_cov`).
                     None,
                     *pf,
@@ -621,7 +646,7 @@ pub fn fit_glmm(
                 beta_prof,
                 beta_prev,
                 false,
-                // Never the FD tight tol here — BOBYQA objective evals stay at
+                // Never the FD-pass tol here — BOBYQA objective evals stay at
                 // `pirls_tol` (the field is None outside `fd_hessian_cov`).
                 None,
                 *pf,
@@ -782,7 +807,7 @@ pub fn fit_glmm(
             beta_prof,
             beta_prev,
             false,
-            // Never the FD tight tol here — the pinned re-eval stays at `pirls_tol`
+            // Never the FD-pass tol here — the pinned re-eval stays at `pirls_tol`
             // (the field is None outside `fd_hessian_cov`).
             None,
             *p,

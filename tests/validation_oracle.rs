@@ -1,4 +1,4 @@
-//! Tier 2 — the cross-engine tier (RULE 6).
+//! Tier 2 — the cross-engine tier.
 //!
 //! Asserts the crate against the frozen lme4 / MASS / GLMMadaptive references at
 //! `validation/tol.R`'s agreement bands: 46 goldens in `validation/goldens/` plus the
@@ -25,9 +25,48 @@ mod oracle_support;
 
 use glmm::WaldSe;
 use oracle_support::{
-    align_coefs, assert_abs, assert_coefs, assert_rel, refit, refit_with, tol, Golden,
+    align_coefs, assert_abs, assert_coefs, assert_rel, load_golden, refit, refit_with, tol, Golden,
 };
 use serde_json::Value;
+
+#[test]
+fn aligned_dev_default_is_minus_two_loglik() {
+    let g = load_golden("pastes_lmm");
+    let ll = g.estimates.loglik.expect("gaussian golden has loglik");
+    assert_eq!(oracle_support::dev_align::aligned_dev(&g), Some(-2.0 * ll));
+}
+
+#[test]
+fn aligned_dev_none_when_golden_lacks_loglik() {
+    let g = load_golden("sim_binomial_slope1_agq_k7");
+    assert_eq!(oracle_support::dev_align::aligned_dev(&g), None);
+}
+
+/// The exactly-six GLMMadaptive vector-RE-AGQ goldens that carry no `loglik` —
+/// the deviance gate's only loud exclusions (`DEV-NA` in
+/// `goldens_agree_with_the_references`). Pinned by name so a golden losing its
+/// `loglik` (or one of these six regaining it) changes this test, not a corpus
+/// count that could silently drift.
+#[test]
+fn dev_align_none_matches_the_six_vector_agq_goldens() {
+    let expect_none = [
+        "sim_binomial_slope1_agq_k7",
+        "sim_binomial_slope1_agq_k11",
+        "sim_binomial_slope2_agq_k7",
+        "sim_binomial_slope2_agq_k11",
+        "sim_poisson_slope1_agq_k7",
+        "sim_poisson_slope1_agq_k11",
+    ];
+    for (g, _) in corpus() {
+        let is_none = oracle_support::dev_align::aligned_dev(&g).is_none();
+        assert_eq!(
+            is_none,
+            expect_none.contains(&g.name.as_str()),
+            "{}: aligned_dev None-ness disagrees with the pinned set of six",
+            g.name
+        );
+    }
+}
 
 /// The whole cross-engine corpus: the `m3_goldens` tree plus the prior-weights
 /// suite. Two frozen reference trees, one set of assertions.
@@ -69,7 +108,7 @@ fn is_pending(spec: &Value) -> bool {
 }
 
 /// The `validation/goldens/` tree, with the manifest's factor list. The manifest is
-/// the registry — RULE 0: a golden that no script can regenerate is not an
+/// the registry: a golden that no script can regenerate is not an
 /// oracle, so anything in `validation/goldens/` must appear in `m3_goldens`, and
 /// `all_goldens_are_registered` holds that line. Entries still awaiting their
 /// reference are excluded ([`is_pending`]).
@@ -259,7 +298,7 @@ fn known_open(_g: &Golden) -> Option<&'static str> {
 
 // ── Structural gates ─────────────────────────────────────────────────────────
 
-/// RULE 0: every golden has a manifest entry, and therefore a generator. Three
+/// Every golden has a manifest entry, and therefore a generator. Three
 /// goldens (sleepstudy, penicillin, pastes) sat unregistered and unregenerable
 /// until 2026-07-21; this is what stops a fourth appearing.
 #[test]
@@ -594,50 +633,35 @@ fn goldens_agree_with_the_references() {
                 &format!("{name}: dispersion"),
             );
         }
-        if let Some(ll) = g.estimates.loglik {
-            // The scale break asserted below is the saturated log-likelihood, and
-            // that term is exactly 0 for a Bernoulli response — so Bernoulli rungs
-            // show no break at all and belong on the agreement branch. The harness
-            // writes aggregated binomial as `cbind(successes, failures)`, so a
-            // binomial golden whose formula lacks it is one row per trial.
-            let bernoulli = g.family == "binomial" && !g.r_formula.contains("cbind(");
-            if shape != Shape::VectorAgq && g.nagq > 1 && !bernoulli {
-                // EXPECTED DIVERGENCE — lme4's logLik() is not on the same scale
-                // at nAGQ>1 as at nAGQ=1, and glmm's is. Measured on cbpp at
-                // tolPwrss=1e-13, where the DEVIANCE barely moves (73.4715 at
-                // nAGQ=1, 73.3730 at 7, 73.3731 at 11 — the expected small AGQ
-                // improvement) while lme4's logLik jumps -92.0263 → -50.0050 →
-                // -50.0050. The constant is the saturated log-likelihood, which
-                // lme4 restores at nAGQ=1 and drops at nAGQ>1: on cbpp
-                // Σ[ln C(nᵢ,sᵢ) + sᵢ ln p̂ᵢ + (nᵢ−sᵢ) ln(1−p̂ᵢ)] = −41.98 against an
-                // observed jump of 42.02, the residual being the deviance's own
-                // nAGQ shift. It is NOT the normalising term on its own — that is
-                // Σ ln C(nᵢ,sᵢ) = 185.48. grouseticks shows the same break,
-                // -957.3996 → -492.3276. glmm reports -91.9834 at nAGQ=7 —
-                // consistent with its own Laplace value, which is the behaviour a
-                // user can compare across nAGQ. Asserted as a divergence so that
-                // lme4 fixing this fails here rather than passing silently.
-                //
-                // Bernoulli is exempt because nᵢ = 1 and sᵢ ∈ {0,1} zero every term
-                // of that sum, leaving no constant to drop: sim_binomial_bigsd
-                // agrees to 1.0e-9 at both k7 and k11. It is the corpus's only
-                // Bernoulli nAGQ>1 rung, added in 0.1.4 — the assertion predates it
-                // and generalised from cbpp and grouseticks, which are the whole
-                // rest of the lme4 nAGQ>1 set.
+        // Deviance gate: dev = -2*loglik on each side. lme4's nAGQ>1
+        // logLik is on a different scale than nAGQ=1 — it drops the
+        // saturated-model logLik that nAGQ=1 restores (measured on cbpp: raw
+        // Δdev 84.04) — and `aligned_dev` adds that deficit back before the
+        // comparison, so what survives on both sides of the nAGQ break is a
+        // fraction of a unit rather than tens of units (cbpp_agq_k7: corrected
+        // dev 183.9667 vs the nAGQ=1 reference 184.0526, Δdev 0.086). That
+        // residual clears the gate because the gate is one-sided — glmm landing
+        // BELOW the reference is free, and DEV_BIG is the two-sided guard the
+        // 0.086 is measured against. It is 430x DEV_EPS, which only bounds how
+        // much WORSE than the reference glmm may be. A golden with no `loglik` at
+        // all (the six GLMMadaptive vector-RE-AGQ rungs, `Shape::VectorAgq`,
+        // which never report one) has no deviance to gate — printed loudly
+        // rather than silently skipped, and `dev_align_none_matches_the_six_
+        // vector_agq_goldens` below pins that this set of six can never grow
+        // quietly.
+        match oracle_support::dev_align::aligned_dev(&g) {
+            None => eprintln!("DEV-NA {name}: golden carries no loglik — parameter sanity only"),
+            Some(dev_ref) => {
+                let dev_g = -2.0 * f.loglik;
+                let d = dev_g - dev_ref;
                 assert!(
-                    (f.loglik - ll).abs() > 1.0,
-                    "{name}: lme4's nAGQ>1 logLik scale break has disappeared \
-                     (glmm={}, oracle={ll}) — re-check the divergence and gate \
-                     this at LOGLIK_ABS_GLMM instead",
-                    f.loglik
+                    d.abs() <= oracle_support::DEV_BIG,
+                    "{name}: |Δdev|={d:.3e} > DEV_BIG — suspected convention mismatch"
                 );
-            } else {
-                let band = if g.kind == "lmm" {
-                    tol::LOGLIK_ABS_LMM
-                } else {
-                    tol::LOGLIK_ABS_GLMM
-                };
-                assert_abs(f.loglik, ll, band, &format!("{name}: loglik"));
+                assert!(
+                    d <= oracle_support::DEV_EPS,
+                    "{name}: Δdev={d:.3e} > DEV_EPS — worse optimum than reference"
+                );
             }
         }
 
@@ -675,6 +699,55 @@ fn goldens_agree_with_the_references() {
         }
     }
     assert_open_set_unchanged(&open);
+    assert_documented_divergences_all_fired();
+}
+
+/// The registry's teeth. This tier reports a documented divergence instead of
+/// failing on it (`validation/divergences.json`), which only stays honest if an
+/// entry cannot outlive the divergence it describes: an entry whose dataset the
+/// corpus above actually refit and which never matched is a standing exemption
+/// for whatever drifts there next, so it fails here.
+///
+/// Printed, never silent. The print reaches the
+/// operator on any failure in this test and under `--nocapture`; the assertion
+/// below is what makes the match a checked fact rather than a quiet pass.
+fn assert_documented_divergences_all_fired() {
+    use oracle_support::divergence;
+    let reg = divergence::registry();
+    let fired = reg.fired();
+    // Keyed on the golden's `name`, not its `data`: `Registry::covers` parses the
+    // dataset out of the `"{name}: {quantity}"` assertion context, so an oracle-tier
+    // entry's `dataset` is a golden name. (`validation/compare.R` reads the same field
+    // as a manifest dataset name — an entry scoped to both tiers only works where the
+    // two coincide.)
+    let in_corpus: std::collections::BTreeSet<String> =
+        corpus().into_iter().map(|(g, _)| g.name).collect();
+
+    let mut expected = std::collections::BTreeSet::new();
+    for e in reg.scoped() {
+        if !in_corpus.contains(&e.dataset) {
+            continue; // this tier has no golden for it; compare.R owns that entry
+        }
+        expected.insert(e.id.clone());
+        if fired.contains(&e.id) {
+            eprintln!(
+                "documented divergence: {} rung {} [{}] <= {:.1e}\n  {}\n  direction: {}\n  see: {}",
+                e.dataset,
+                e.rung,
+                e.quantities.join(","),
+                e.max_rel,
+                e.summary,
+                e.direction,
+                e.review
+            );
+        }
+    }
+    assert_eq!(
+        fired, expected,
+        "documented-divergence registry is out of date: entries scoped to this \
+         tier that no longer fire must be deleted, and a divergence that starts \
+         firing must be written up first"
+    );
 }
 
 /// A count, not a list, so adding a `known_open` entry is a deliberate act that

@@ -1,6 +1,6 @@
 [package]
 name = "glmm"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -47,7 +47,7 @@ alloc-tests = []
 # Tier 2, the cross-engine tier: asserts the crate against the frozen lme4 /
 # MixedModels / GLMMadaptive goldens in `validation/goldens/` at `validation/tol.R`'s
 # agreement bands. OFF by default because it is slow — it refits all 35 goldens
-# — and because CI runs the validated-answer tier instead (RULE 6). Reads frozen
+# — and because CI runs the validated-answer tier instead. Reads frozen
 # JSON, so it needs neither R nor Julia. Named for the claim, not the cost, and
 # NOT `--oracles`, which is `run.sh`'s flag for refitting the references
 # themselves — a different act. Preferred over `#[ignore]` so the tier is
@@ -63,7 +63,7 @@ parallel = ["dep:rayon"]
 
 [dependencies]
 # Mirror engine-core's pins exactly — validation-stable numerics depend on them.
-bobyqa = "0.2"
+bobyqa = "0.3"
 pulp = "=0.22.2"
 # Formula-parser only (`src/formula/parse.rs`); optional so the default-off kernel
 # never links it. Its MSRV (1.65) clears this crate's 1.85 floor.

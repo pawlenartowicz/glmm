@@ -36,6 +36,7 @@ script_dir <- normalizePath(dirname(sub(
 suite_dir <- script_dir
 
 source(file.path(script_dir, "tol.R"))
+source(file.path(script_dir, "dev_align.R"))
 
 # lme4 labels categorical contrasts "period2"; MixedModels "period: 2", and
 # interactions "a & b" where lme4 writes "a:b". Same base, same levels, same order
@@ -69,6 +70,46 @@ mark <- function(diff, tol) {
   if (diff <= tol) "ok" else "FAIL"
 }
 
+# ── documented-divergence registry ───────────────────────────────────────────
+# The cross-engine comparison below is a REFERENCE CHECK, not a pass/fail gate.
+# The four outcomes (no entry / covered / past max_rel / stale) are tabulated
+# once in README.md under "Documented divergences" -- read them there rather than
+# from a copy here that can drift out of step with the table.
+#
+# The port gates below are NOT reference checks and do not consult this registry:
+# both ports call the same kernel, so their bands are round-off bands and a miss
+# is a wiring bug.
+DIV <- fromJSON(file.path(suite_dir, "divergences.json"),
+                simplifyVector = TRUE, simplifyDataFrame = FALSE)$entries
+div_fired <- character(0)
+div_seen <- character(0)   # datasets this run actually compared
+
+# The registry entry covering (dataset, quantity) in `scope`, or NULL.
+div_lookup <- function(dataset, quantity, scope) {
+  for (e in DIV) {
+    if (identical(e$dataset, dataset) && quantity %in% e$quantities &&
+        scope %in% e$comparison) {
+      return(e)
+    }
+  }
+  NULL
+}
+
+# Re-mark one over-band comparison against the registry. Returns the mark to
+# print; records the hit so the staleness check below can see it.
+div_mark <- function(m, diff, dataset, quantity, scope) {
+  if (!identical(m, "FAIL") || is.na(diff)) return(m)
+  e <- div_lookup(dataset, quantity, scope)
+  if (is.null(e)) return(m)
+  if (diff > e$max_rel) {
+    cat(sprintf("  !! %s/%s: %.3e exceeds documented divergence %s (max_rel %.1e)\n",
+                dataset, quantity, diff, e$id, e$max_rel))
+    return("FAIL")
+  }
+  div_fired <<- union(div_fired, e$id)
+  "DOC"
+}
+
 lme4 <- read_engine("lme4")
 if (length(lme4) == 0) stop("no lme4 results -- run engines/lme4.R first")
 others <- Filter(function(e) length(read_engine(e)) > 0,
@@ -83,14 +124,24 @@ if (length(others) == 0) {
 # One comparison cell: "<reldiff>/<mark>", or just the mark when there is no number
 # to show (n/a -- engine lacks that method; FAIL(len) -- length mismatch).
 cell <- function(d, m) sprintf("%-10s", if (is.na(d)) m else sprintf("%.0e/%s", d, m))
+# Informational-only cell (glmm-vs-MixedModels Δdev): no mark, just the raw
+# number or "n/a" -- this comparison never gates, so there is no verdict word
+# to print beside it.
+cell_info <- function(d) sprintf("%-10s", if (is.na(d)) "n/a" else sprintf("%.0e", d))
+
+# Deviance-gate summary accumulators: filled per-row in
+# the glmm loop below, printed as three blocks ahead of the final RESULT line.
+dev_win <- character(0)   # DEV-WIN rungs (Δdev <= 0), informational
+dev_na  <- character(0)   # DEV-NA rungs -- loud exclusion list, must reach the summary
+dev_conv <- character(0)  # FAIL(conv?) rungs, both deviances printed
 
 any_fail <- FALSE
 for (engine in others) {
   eng <- read_engine(engine)
   cat(sprintf("\n=== lme4  vs  %s ===\n", engine))
-  cat(sprintf("%-12s %-5s  %-10s %-10s %-10s %-10s %-10s %-10s %-10s  %s\n",
+  cat(sprintf("%-12s %-5s  %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s  %s\n",
               "dataset", "rung", "beta", "se_rx", "se_rx:mm", "se_hess",
-              "stddev", "sd_se", "loglik", "coef"))
+              "stddev", "sd_se", "dev", "dev:mm", "coef"))
   for (name in names(lme4)) {
     a <- lme4[[name]]; b <- eng[[name]]
     if (is.null(b)) next
@@ -101,11 +152,27 @@ for (engine in others) {
     # n/a, not a comparison (rel_max over zero-length vectors would warn -Inf).
     d_sd   <- if (is.null(stddevs(a)) && is.null(stddevs(b))) NA_real_
               else rel_max(stddevs(a), stddevs(b))
-    # loglik: glmm's Fit now exposes it (loglik/df/reml, all engines), gated at
-    # the same LMM/GLMM bands as every other engine here. n/a (ungated) only when
-    # an engine genuinely omits it, rather than erroring on `value - NULL`.
-    d_ll   <- if (is.null(b$estimates$loglik)) NA_real_
-              else abs(a$estimates$loglik - b$estimates$loglik)
+    # Deviance gate (dev = -2*loglik, dev_align.R's aligned convention). Hard
+    # gate vs lme4, glmm row only -- oracle contract: deviance gates hard vs
+    # lme4; parameters (beta/SE/stddev above) are registry-backed sanity checks.
+    # The lme4-vs-MixedModels row here is the two REFERENCES disagreeing with
+    # each other, so it gets no deviance mark at all -- lme4-vs-MMjl deviance
+    # disagreement is the references disagreeing with each other — logged
+    # separately, never resolved by picking the side closer to glmm.
+    if (engine == "glmm") {
+      dev_g <- aligned_dev(b$engine, b$estimates, b)
+      dev_r <- aligned_dev(a$engine, a$estimates, a)
+      if (is.na(dev_g) || is.na(dev_r)) {
+        d_dev <- NA_real_
+        m_dev <- sprintf("DEV-NA(%s)", attr(if (is.na(dev_r)) dev_r else dev_g, "why"))
+      } else {
+        d_dev <- dev_g - dev_r
+        m_dev <- if (abs(d_dev) > TOL$dev_big) "FAIL(conv?)"
+                 else if (d_dev > TOL$dev_eps) "FAIL(dev)"
+                 else if (d_dev < 0) "DEV-WIN"
+                 else "DEV-OK"
+      }
+    } else { d_dev <- NA_real_; m_dev <- "n/a" }
     coef_ok <- identical(norm_coef(a$coef_names), norm_coef(b$coef_names))
 
     # SE by method (gap 1.1). Gaussian: single profiled `se`, shown in the rx slot.
@@ -142,6 +209,14 @@ for (engine in others) {
       m_se_mm <- mark(d_se_mm, TOL$se_rel)
     } else { d_se_mm <- NA_real_; m_se_mm <- "n/a" }
 
+    # glmm-vs-MixedModels Δdev: informational only, computed the
+    # same way as the se_rx:mm cross-check above -- printed, never gated, never
+    # enters `failed`.
+    if (engine == "glmm" && !is.null(bmm)) {
+      dev_mm <- aligned_dev(bmm$engine, bmm$estimates, bmm)
+      d_dev_mm <- if (is.na(dev_mm)) NA_real_ else dev_g - dev_mm
+    } else { d_dev_mm <- NA_real_ }
+
     # stddev_se: GLMM RE-stddev SE, only where both engines report it (lme4 & glmm
     # Hessian). n/a for gaussian rungs and MixedModels (no Hessian variant).
     sd_se_a <- stddev_ses(a); sd_se_b <- stddev_ses(b)
@@ -153,17 +228,40 @@ for (engine in others) {
     m_beta <- mark(d_beta, TOL$beta_rel)
     m_sd   <- if (is.null(stddevs(a)) && is.null(stddevs(b))) "n/a"
               else mark(d_sd, TOL$stddev_rel)
-    m_ll   <- if (is.na(d_ll)) "n/a"
-              else mark(d_ll, if (gaussian) TOL$loglik_abs_lmm else TOL$loglik_abs_glmm)
 
-    failed <- any(c(m_beta, m_se_rx, m_se_mm, m_se_h, m_sd, m_sd_se, m_ll) %in%
-                  c("FAIL", "FAIL(len)")) || !coef_ok
+    # Reference check, not a gate: a documented divergence re-marks as DOC. Only
+    # the glmm row consults the registry — the lme4-vs-MixedModels row is the two
+    # references disagreeing with EACH OTHER, which `reference_disagreements` owns
+    # and which no glmm-side entry may excuse.
+    if (engine == "glmm") {
+      div_seen <<- union(div_seen, name)
+      scope <- "lme4-vs-glmm"
+      m_beta  <- div_mark(m_beta,  d_beta,  name, "beta",       scope)
+      m_se_rx <- div_mark(m_se_rx, d_se_rx, name, "se_rx",      scope)
+      m_se_mm <- div_mark(m_se_mm, d_se_mm, name, "se_rx:mm",   scope)
+      m_se_h  <- div_mark(m_se_h,  d_se_h,  name, "se_hessian", scope)
+      m_sd    <- div_mark(m_sd,    d_sd,    name, "stddev",     scope)
+      m_sd_se <- div_mark(m_sd_se, d_sd_se, name, "stddev_se",  scope)
+    }
+
+    # Deviance mark is a HARD gate (not registry-eligible): FAIL(dev)/FAIL(conv?)
+    # always fail, regardless of engine == "glmm" (the mixedmodels row's m_dev
+    # is always "n/a" and never matches). DEV-NA never fails but is collected
+    # below for the loud-exclusion summary.
+    failed <- any(c(m_beta, m_se_rx, m_se_mm, m_se_h, m_sd, m_sd_se) %in%
+                  c("FAIL", "FAIL(len)")) || !coef_ok ||
+              m_dev %in% c("FAIL(dev)", "FAIL(conv?)")
     any_fail <- any_fail || failed
-    cat(sprintf("%-12s %-5d  %s %s %s %s %s %s %s  %s\n",
+    if (engine == "glmm") {
+      if (m_dev == "DEV-WIN") dev_win <<- c(dev_win, sprintf("%s (rung %d): Δdev=%.6g", name, a$rung, d_dev))
+      if (startsWith(m_dev, "DEV-NA")) dev_na <<- c(dev_na, sprintf("%s (rung %d): %s", name, a$rung, m_dev))
+      if (m_dev == "FAIL(conv?)") dev_conv <<- c(dev_conv, sprintf("%s (rung %d): dev_glmm=%.6g dev_lme4=%.6g Δdev=%.6g", name, a$rung, dev_g, dev_r, d_dev))
+    }
+    cat(sprintf("%-12s %-5d  %s %s %s %s %s %s %s %s  %s\n",
                 name, a$rung,
                 cell(d_beta, m_beta), cell(d_se_rx, m_se_rx), cell(d_se_mm, m_se_mm),
                 cell(d_se_h, m_se_h), cell(d_sd, m_sd), cell(d_sd_se, m_sd_se),
-                cell(d_ll, m_ll),
+                cell(d_dev, m_dev), cell_info(d_dev_mm),
                 if (coef_ok) "ok" else "MISMATCH"))
   }
 }
@@ -305,6 +403,51 @@ if (length(port_r) > 0 && length(rust) > 0) {
   }
 }
 
+# ── documented divergences: report, and check the registry is not stale ──────
+# Printed unconditionally when anything fired, so a DOC cell above always has a
+# named reason next to it in the same output.
+if (length(div_fired) > 0) {
+  cat("\n=== documented divergences (reference check, not a gate) ===\n")
+  for (e in DIV) {
+    if (!(e$id %in% div_fired)) next
+    cat(sprintf("%-12s rung %-3d %-22s <= %.1e  %s\n",
+                e$dataset, e$rung, paste(e$quantities, collapse = ","),
+                e$max_rel, e$id))
+    cat(sprintf("  direction: %s\n", e$direction))
+    cat(sprintf("  review: %s\n", e$review))
+  }
+}
+# A registry entry whose dataset WAS compared and did not fire is stale: the
+# divergence it excuses is gone, and leaving it would turn the entry into a
+# standing exemption for whatever drifts there next. Scoped to datasets this run
+# actually reached, so a `./run.sh cbpp` subset run does not trip it.
+stale <- Filter(function(e) "lme4-vs-glmm" %in% e$comparison &&
+                            e$dataset %in% div_seen && !(e$id %in% div_fired), DIV)
+if (length(stale) > 0) {
+  cat("\n")
+  for (e in stale) {
+    cat(sprintf("STALE registry entry: %s (%s) no longer fires -- delete it\n",
+                e$id, e$dataset))
+  }
+  any_fail <- TRUE
+}
+
+# ── deviance gate summary ────────────────────────────────────────────────────
+# Three blocks, always printed (never conditional on any_fail): DEV-WIN is
+# informational so a passing run still shows it; DEV-NA is the loud exclusion
+# list -- a rung with no usable reference deviance must never disappear
+# silently, so this prints "none" rather than being skipped when empty;
+# FAIL(conv?) repeats both raw deviances so a convention mismatch is legible
+# without re-running.
+cat("\n=== DEV-WIN (Δdev <= 0 vs lme4; informational) ===\n")
+if (length(dev_win) > 0) for (line in dev_win) cat(sprintf("  %s\n", line)) else cat("  none\n")
+
+cat("\n=== DEV-NA (no usable reference deviance -- excluded loudly, not passed hollow) ===\n")
+if (length(dev_na) > 0) for (line in dev_na) cat(sprintf("  %s\n", line)) else cat("  none\n")
+
+cat("\n=== FAIL(conv?) (|Δdev| > dev_big -- convention mismatch, not a fit disagreement) ===\n")
+if (length(dev_conv) > 0) for (line in dev_conv) cat(sprintf("  %s\n", line)) else cat("  none\n")
+
 cat(sprintf("\n%s\n", if (any_fail) "RESULT: disagreements found -- investigate (flag, do not relax tolerance)"
-                       else "RESULT: all gated quantities agree within tolerance"))
+                       else "RESULT: all gated quantities agree, or diverge as documented"))
 quit(status = if (any_fail) 1 else 0)

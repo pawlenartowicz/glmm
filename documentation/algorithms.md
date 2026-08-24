@@ -162,8 +162,9 @@ and are not user-facing.
 | BOBYQA `npt` | `2·n_θ + 1` for `n_θ < 3`, else `(3·n_θ).div_ceil(2) + 1` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm.rs`) |
 | `rho_begin` schedule | `(0.1·min diag θ₀).min(RHO_BEGIN)`, `RHO_BEGIN = 0.5` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm.rs`) |
 | `rho_end` | `RHO_END = 1e-6` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm.rs`) |
-| `PIN_THETA` | `1e-4` — diagonal variance component pinned to `0` | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm.rs`) |
-| `SINGULAR_REL_TOL` | `1e-3` — post-hoc relative check: any RE stddev `≤ 1e-3 ×` the largest ⇒ `singular` | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/fit/mod.rs`) |
+| `PIN_THETA` | `1e-4` — diagonal variance component pinned to `0`, tested on the internal (scaled) θ | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm.rs`) |
+| `SINGULAR_REL_TOL` | `1e-3` — post-hoc relative check: any RE stddev `≤ 1e-3 ×` the largest ⇒ `singular`, on the internal (scaled) stddevs | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/fit/mod.rs`) |
+| RE design column scale | per random-slope column, `√(Σ wᵢxᵢ²/Σ wᵢ)`; intercept subcolumns exactly `1.0`; always on, no trigger | [`algorithms-lmm.md`](algorithms-lmm.md#random-effect-design-column-scaling) (`src/lmm.rs`) |
 | `two_stage` warm-start gate | disabled when `n_θ ≤ 2 && p ≤ 4`, else enabled | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-two-stage-optimizer) (`src/glmm/workspace.rs`) |
 | `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: any `|η_i| > 30` at IRLS iter ≥ 3 → non-converged; skipped under the Gamma inverse link | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `SATURATION_W` / `SATURATION_FRAC` | `1e-5` / `0.5` — post-fit separation guard: > half the (weighted) rows saturated → non-converged | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
@@ -256,25 +257,39 @@ of the regimes:
   high-mean counts (`ȳ ≳ 25–30`) that IRLS diverges past the
   `ETA_DIVERGENCE_CAP` guard.
 
-The `family` argument selects the arithmetic in two branches:
+The per-iteration row pass — clamps, inverse link, Fisher weight with its prior
+weight and `WEIGHT_CLAMP` floor, working response `z = η + r`, and the `Σ wᵢdᵢ`
+fold — is one batched call, `simd_transcendental::family_pass`, shared with the
+three GLMM PIRLS variants. It dispatches once on `family` to a vectorised arm
+rather than once per row:
 
-- **Canonical fused-SIMD path** — `Family::Binomial { link: Logit }` (unweighted)
-  runs a verbatim fused kernel (`pw_and_log1pexp_sum`,
-  `src/simd_transcendental.rs`) that computes the probability `p`, the working
-  weight `W`, and the `Σ log1pexp(η)` deviance fold in one vectorised pass,
-  sharing a single `exp(−|η|)` evaluation between the probability and the
-  deviance term. The transcendentals are the crate's own minimax polynomials
-  (Cody–Waite range reduction, degree-11 `exp`, degree-9 `log1p`; ≤ 2 ULP
-  against libm), with a SIMD body plus a bit-identical scalar tail. On native
-  targets the kernel fuses with hardware FMA; on `wasm32` it compiles to plain
-  mul/add, because wasm SIMD has no FMA and the soft-float libcall fallback
-  measured 9–41× slower. This is the MCPower hot path, kept byte-identical.
-- **General Fisher-scoring branch** — every other family (Poisson, Gamma, NB,
-  probit binomial, and *weighted* logit) routes the scalar arm, reading its link
-  inverse, variance, and deviance residual from `src/family.rs`. Prior weights
-  multiply the working weight (`(wᵢ·W_raw).max(WEIGHT_CLAMP)`) and the deviance
-  contribution; a weighted logit therefore leaves the fused path for the scalar
-  arm (the fused kernel has no per-row weight slot).
+- **Unweighted binomial logit** hands off to the fused kernel
+  `pw_and_log1pexp_sum`, which computes the probability `p`, the working weight
+  `W`, and the `Σ log1pexp(η)` deviance fold in one vectorised pass, sharing a
+  single `exp(−|η|)` evaluation between the probability and the deviance term.
+  This is the MCPower hot path and is byte-identical to the standalone fast path
+  it grew out of. Its deviance identity `2·(Σ log1pexp(η) − Σ y·η)` holds only
+  for unweighted Bernoulli rows, which is why prior weights route elsewhere.
+- **Probit** evaluates Φ through a branch-free SIMD `erfc` — Cody's CALERF with
+  all three `|x|` regions computed and blended by mask, since one lane vector
+  straddles the region seams — and `dμ/dη = φ(η)` through the same owned `exp`.
+- **Log links** (Poisson, Gamma-log, NB-log) compute `exp(η)` **once** and reuse
+  it for both μ and `dμ/dη`, where the scalar `link_inv`/`mu_eta` pair evaluated
+  it twice.
+- **Weighted logit** and **Gamma-inverse** have arms of the same shape; the
+  Gamma-inverse one carries the only live domain-infeasibility flag (`μ = 1/η`
+  needs `η > 0`), reduced lane-wise rather than OR'd per row.
+
+Every arm is a `pulp` SIMD body plus a bit-identical scalar tail for the
+sub-lane remainder, and reads its formulas from `src/family.rs`, which stays the
+scalar statement of the math. The transcendentals are the crate's own minimax
+polynomials (Cody–Waite range reduction, degree-11 `exp`, degree-9 `log1p`; ≤ 2
+ULP against libm). On native targets they fuse with hardware FMA; on `wasm32`
+they compile to plain mul/add, because wasm SIMD has no FMA and the soft-float
+libcall fallback measured 9–41× slower. The deviance itself stays on
+`family::dev_resid` outside the unweighted-logit arm: its `ln` arguments run
+over the whole positive line, outside the restricted domain of this module's
+owned `ln`.
 
 **Offset.** With `FitOptions::offset`, the linear predictor is `η = o + Xβ`
 throughout; each IRLS iteration solves the weighted normal equations against

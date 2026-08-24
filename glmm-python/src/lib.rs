@@ -68,6 +68,7 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
         nd.set_item("evals", n.evals)?;
         nd.set_item("final_eval", n.final_eval)?;
         nd.set_item("detail", n.detail)?;
+        nd.set_item("ratio", n.ratio)?;
         notes.append(nd)?;
     }
     d.set_item("notes", notes)?;

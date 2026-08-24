@@ -127,18 +127,41 @@ R), but they are three of six: the full report is `diagnostics.converged`,
   `varcorr` block layout so `pinned[g][i]` pairs with `stddev_corr(g)`'s `i`-th
   stddev. Empty means "nothing to report" (no components at all, or none
   pinned), not "checked and none pinned."
-- `notes` carries solver observations that have no dedicated flag. Today the
-  one kind is `IllConditioned`: two or more fixed-effect columns are entangled
-  — near-collinear but not exactly redundant. That design is now **fitted, not
-  refused**: the coefficients are real and the standard errors are honest
-  (large, because the data genuinely cannot separate the columns), where an
-  older version of this kernel returned `NaN` for the whole fit. Contrast
-  `aliased`, which is the genuinely-redundant case — an exactly aliased column
-  is still dropped and reported as `NaN`, matching R. `notes` is empty on a
-  clean fit, and an absent note means "not detected," never "checked and
-  clean": dense GLMM records no pivot at all, and the sparse LMM route refuses
-  an ill-conditioned design outright (`converged: false`) instead of fitting
-  and flagging it — the dense and sparse LMM routes disagree on this point.
+- `notes` carries solver observations that have no dedicated flag. Five kinds:
+  - `IllConditioned`: two or more fixed-effect columns are entangled —
+    near-collinear but not exactly redundant. That design is **fitted, not
+    refused**: the coefficients are real and the standard errors are honest
+    (large, because the data genuinely cannot separate the columns), where an
+    older version of this kernel returned `NaN` for the whole fit. Contrast
+    `aliased`, which is the genuinely-redundant case — an exactly aliased
+    column is still dropped and reported as `NaN`, matching R. Dense GLMM
+    records no pivot at all, and the sparse LMM route refuses an
+    ill-conditioned design outright (`converged: false`) instead of fitting
+    and flagging it — the dense and sparse LMM routes disagree on this point.
+  - `PirlsExhausted`: a GLMM's inner PIRLS solve ran its full iteration cap
+    without converging. Observation-only unless it hit the FINAL
+    re-evaluation at the converged fit, in which case the reported estimates
+    rest on that truncated solve.
+  - `UnusedGroupingLevels`: a grouping factor declares levels that own
+    random-effect columns but no row. Raised by the formula frontend, not a
+    solver — the only layer that sees both the declared levels and the
+    per-row codes.
+  - `ReDesignScaleSpread`: a grouping's random-effect design columns sit on
+    very different scales (mirrors lme4's `checkScaleX`). Fitting is
+    unaffected — the kernel scales internally — but the reported
+    random-effect standard deviations stay on the raw variable's own scale.
+    Also raised by the formula frontend, for the same reason
+    `UnusedGroupingLevels` is.
+  - `HessianSeFallback`: `wald_se`/`WaldSe::Hessian` was requested, but the
+    finite-difference joint Hessian was not usable (not positive definite, or
+    a perturbed deviance evaluation was non-finite), so the SE pass fell back
+    to the RX/Schur route. `se`/`vcov` are still filled from the fallback;
+    the random-effect stddev SEs (`stddev_se`) stay `NaN`.
+
+  `notes` is empty on a clean fit, and an absent note means "not detected,"
+  never "checked and clean": dense GLMM records no pivot at all, and the
+  sparse LMM route refuses an ill-conditioned design outright instead of
+  fitting and flagging it.
 
 If a fit comes back with `converged == false` or `singular == true`, see
 [`troubleshooting.md`](troubleshooting.md) for what each flag implies and what

@@ -176,6 +176,12 @@ fn fit_glmm_build(
         )));
     }
 
+    // Before Z is built: every slope column is stored in Z divided by its internal
+    // scale, so the scales have to be current for THIS design first. Per call, not
+    // cached on the workspace shape — the same workspace is reused across draws.
+    ws.groupings
+        .set_slope_scales(x_mat.as_ref().subrows(0, n), opts.weights.as_deref());
+
     // Build the dense RE design Z for this (X, ids) before the fit reads it.
     build_z(
         &mut ws,
@@ -275,6 +281,7 @@ impl GlmmResultView<'_> {
             pinned_components: self.fit.pinned_components,
             pirls_exhausted: self.ws.pirls_exhausted,
             final_pirls_exhausted: self.ws.final_pirls_exhausted,
+            hessian_fallback: self.fit.hessian_fallback,
             ..FitDiagnostics::fixed_only(self.fit.converged)
         }
     }
@@ -290,9 +297,14 @@ impl GlmmResultView<'_> {
     pub(crate) fn dispersion(&self) -> f64 {
         self.fit.tau_squared_hat
     }
-    /// Fitted θ̂ vech — the leading `n_theta` params of the joint [θ̂ | β̂] block.
+    /// Fitted θ̂ vech — the leading `n_theta` params of the joint [θ̂ | β̂] block,
+    /// in the solver's INTERNAL RE column scale (`FitView::theta` divides it back).
     pub(crate) fn theta(&self) -> &[f64] {
         &self.ws.params[..self.ws.n_theta]
+    }
+    /// Grouping structure, for the internal RE column scales θ̂ carries.
+    pub(crate) fn groupings(&self) -> &crate::lmm::LmmGroupings {
+        &self.ws.groupings
     }
 }
 
@@ -414,10 +426,15 @@ pub(crate) fn glmm_view_to_fit(
     } else {
         f64::NAN
     };
+    // θ̂ is in the solver's internal RE units (`LmmGroupings::set_slope_scales`);
+    // dividing by the Λ-row scales puts every θ-derived magnitude back into the
+    // design's own units before it is squared.
+    let theta_scales = ws.groupings.theta_row_scales();
     let tau2: Vec<f64> = if converged {
         ws.params[..n_theta]
             .iter()
-            .map(|&t| t * t * sigma_sq)
+            .zip(theta_scales.iter())
+            .map(|(&t, &s)| (t / s) * (t / s) * sigma_sq)
             .collect()
     } else {
         vec![f64::NAN; n_theta]
@@ -460,10 +477,19 @@ pub(crate) fn glmm_view_to_fit(
 
     // SE of the RE stddevs from the joint-Hessian θ block (`WaldSe::Hessian` only;
     // NaN under Rx / RX fallback / non-converged — `ws.theta_se` is reset per fit
-    // and refilled only by `fd_hessian_cov`). Cloned verbatim: for the reachable
-    // scalar groupings θ = stddev, so the θ-scale SE is the stddev SE.
+    // and refilled only by `fd_hessian_cov`). For the reachable scalar groupings
+    // θ = stddev, so the θ-scale SE is the stddev SE.
+    //
+    // The FD stencil perturbs the INTERNAL θ̃ = s·θ, so `theta_se` is an SE on θ̃.
+    // The map is a fixed diagonal linear reparametrization, so its Jacobian is the
+    // constant `s` — the back-map is the same plain division θ̂ itself takes, with
+    // no delta-method term.
     let stddev_se = if converged {
-        ws.theta_se[..n_theta].to_vec()
+        ws.theta_se[..n_theta]
+            .iter()
+            .zip(theta_scales.iter())
+            .map(|(&se, &s)| se / s)
+            .collect()
     } else {
         vec![f64::NAN; n_theta]
     };
@@ -529,7 +555,8 @@ pub(crate) fn glmm_view_to_fit(
         ranef,
         ranef_levels,
     };
-    fit.diagnostics.singular = fit.diagnostics.singular || fit.has_negligible_component();
+    fit.diagnostics.singular = fit.diagnostics.singular
+        || fit.has_negligible_component(&super::common::re_scale_grid(&ws.groupings));
     (fit, mu_hat, glmm_fit.deviance)
 }
 

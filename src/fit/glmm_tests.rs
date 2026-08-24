@@ -325,8 +325,8 @@ const CBPP_REF_LOGLIK: f64 = -92.0262818745091;
 /// binomial fit. Herds are unbalanced, so the positional `Sizing` layout cannot
 /// express them: this is the data-shaped-ids path's reason to exist.
 /// SE is compared to **lme4 only** (its Hessian denom keeps the θ–β coupling;
-/// MixedModels.jl drops it ~3% — RULE 6). The oracle is sacred: on
-/// disagreement glmm is presumed wrong (RULE 0).
+/// MixedModels.jl drops it ~3%). The oracle is sacred: on
+/// disagreement glmm is presumed wrong.
 #[test]
 fn fit_glmm_cbpp_matches_lme4() {
     let (x, y, cluster_ids, n) = cbpp_design();
@@ -361,7 +361,7 @@ fn fit_glmm_cbpp_matches_lme4() {
     // The SE band was 3e-2 only because the constants above were the
     // default-tolPwrss ones; with the citation corrected, that band no longer
     // has a reason to exist. The oracle is sacred — these bound glmm to lme4,
-    // never the reverse (RULE 0).
+    // never the reverse.
     for j in 0..p {
         let b_rel = (f.beta[j] - CBPP_REF_BETA[j]).abs() / CBPP_REF_BETA[j].abs();
         assert!(
@@ -917,8 +917,8 @@ fn fit_glmm_gamma_weighted_matches_lme4() {
 /// Poisson GLMM `TICKS ~ 1 + YEAR + cHEIGHT + (1|INDEX)` on grouseticks
 /// (observation-level INDEX = 403 size-1 clusters), gated against frozen
 /// `lme4::glmer(family=poisson, nAGQ=1)` (`validation/goldens/grouseticks_agq_k1.json`).
-/// Exercises the blocked PIRLS path for a non-binomial family. lme4-only SE
-/// (RULE 6). The oracle is sacred.
+/// Exercises the blocked PIRLS path for a non-binomial family. lme4-only SE.
+/// The oracle is sacred.
 #[test]
 fn fit_glmm_poisson_grouseticks_matches_lme4() {
     const REF_BETA: [f64; 4] = [
@@ -1258,7 +1258,7 @@ fn fit_glmm_poisson_grouseticks_3crossed_matches_lme4() {
 #[test]
 fn sparse_schur_deviance_equals_dense_grouseticks() {
     let (x, y, n, p, model, ids) = grouseticks_3crossed_inputs();
-    let model = spec_sized_from_ids_pub(&model, &ids);
+    let (model, ids, _perm) = spec_sized_from_ids_pub(&model, &ids);
     let slope_cols: Vec<usize> = vec![];
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
     // Column-major x + build_z + StructuredSchur, as fit_glmm does.
@@ -1337,7 +1337,7 @@ fn sparse_schur_deviance_equals_dense_grouseticks() {
 #[test]
 fn sparse_schur_se_equals_dense_grouseticks() {
     let (x, y, n, p, model, ids) = grouseticks_3crossed_inputs();
-    let model = spec_sized_from_ids_pub(&model, &ids);
+    let (model, ids, _perm) = spec_sized_from_ids_pub(&model, &ids);
     let slope_cols: Vec<usize> = vec![];
     let mut xm = Mat::<f64>::zeros(n, p);
     for i in 0..n {
@@ -1465,7 +1465,7 @@ fn sparse_schur_small_e_matches_dense() {
             }],
         }),
     };
-    let model = spec_sized_from_ids_pub(&model, &ids);
+    let (model, ids, _perm) = spec_sized_from_ids_pub(&model, &ids);
     let slope_cols: Vec<usize> = vec![];
     let beta_start = glm_warm_start_beta(
         model.family,
@@ -2499,7 +2499,7 @@ fn two_stage_agq_bypass_is_bit_identical() {
             extra_groupings: vec![],
         }),
     };
-    let sized = spec_sized_from_ids_pub(
+    let (sized, _ids, _perm) = spec_sized_from_ids_pub(
         &model,
         &GroupIds {
             primary: cluster_ids.clone(),
@@ -2593,7 +2593,7 @@ fn assert_two_stage_matches_single_local(
     n: usize,
     p: usize,
 ) -> (usize, usize) {
-    let sized = spec_sized_from_ids_pub(model, ids);
+    let (sized, ids, _perm) = spec_sized_from_ids_pub(model, ids);
     let mut xm = Mat::<f64>::zeros(n, p);
     for i in 0..n {
         for j in 0..p {
@@ -3385,15 +3385,23 @@ fn loop_tier_honours_extra_grouping_slope() {
 
     let cold = fit_cold(&x, &y, n, 2, &model, &ids, &opts);
     assert!(cold.converged(), "reference fit must converge");
-    // tau2 layout: primary intercept, then the extra grouping's 2×2 vech block.
+    // The guard is on the extra grouping's SLOPE VARIANCE, read off `varcorr` —
+    // `D[1][1]`, the last entry of that block's q=2 vech. The θ coordinates are
+    // the wrong place to read it: this draw's extra-grouping intercept variance
+    // is zero by construction (the generating η carries `x1·(g2−3)` and no `g2`
+    // main effect), and once `Λ[0][0] = 0` the Cholesky no longer identifies how
+    // the slope variance splits between `Λ[1][0]` and `Λ[1][1]` — only their sum
+    // of squares, which is exactly `D[1][1]`.
+    assert_eq!(cold.varcorr.len(), 2, "primary + one extra grouping");
+    let d_slope = *cold.varcorr[1].last().unwrap();
     assert!(
-        cold.tau2.len() == 4 && cold.tau2[2] > 0.1,
-        "the draw must actually carry an extra-grouping slope variance: tau2 {:?}",
-        cold.tau2
+        d_slope > 0.1,
+        "the draw must actually carry an extra-grouping slope variance: varcorr {:?}",
+        cold.varcorr
     );
 
-    let sized = super::common::spec_sized_from_ids(&model, &ids);
-    let mut ws = super::core::build_workspace(&sized, n, 2, &opts);
+    let (sized, ids, perm) = super::common::spec_sized_from_ids(&model, &ids);
+    let mut ws = super::core::build_workspace(&sized, perm, n, 2, &opts);
     let view = super::core::fit_on(&mut ws, &x, &y, &ids, None, &opts);
     for j in 0..2 {
         assert_eq!(
@@ -3402,4 +3410,187 @@ fn loop_tier_honours_extra_grouping_slope() {
             "loop tier must reach fit_cold's β exactly: β[{j}]"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Internal random-effect column scaling (`LmmGroupings::set_slope_scales`) —
+// dense GLMM rescale test
+//
+// GOVERNING IDEA, shared with `lmm_tests.rs`'s and `sparse/tests.rs`'s rescale
+// tests: multiply a random-slope design column by an exact power of two `C`
+// and refit. A dropped back-map shows up unmistakably as a ratio of 1 instead
+// of the predicted `1/C` or `1/C²` (see `lmm_tests.rs`'s rescale test for the
+// full `Z~ = Z·diag(1/s)`, `Λ~ = diag(s)·Λ` derivation, which applies
+// unchanged here).
+//
+// `C` is smaller here (4.0, not the LMM tests' 1024.0) and the band looser,
+// for a reason specific to the GLMM route: the LMM solver optimizes θ ALONE
+// (β is recovered in closed form at each θ), so scaling a column that is also
+// a fixed effect leaves the θ-search's internal problem bit-identical between
+// the two fits. The GLMM solver optimizes the JOINT vector `[θ | β]` with one
+// shared BOBYQA trust radius and a `BETA_BOX` of ±30 on the raw (unrescaled)
+// β coordinates. Column-scaling shifts β's position inside that fixed box
+// differently in the two fits (β̂ᵪ ≈ β̂/C sits closer to 0 than β̂ does), so the
+// two fits' internal trust-region paths genuinely differ — they are two
+// separate optimizations of equivalent objectives, not one bit-identical
+// search read twice. A small `C` keeps both fits' β inside the same box
+// region; a loose band absorbs the resulting path difference.
+// ---------------------------------------------------------------------------
+
+/// Parses `validation/data/simulated/sim_binomial_slope1.csv` into the q=2
+/// random-slope design `y ~ 1 + x + (1 + x | g)` — the same fixture
+/// `check_vector_agq_pin` uses for the AGQ pins above, reused here because it
+/// is already known to converge under a random primary slope. Column 1 (`x`)
+/// is both the fixed-effect covariate and the primary random-slope covariate.
+fn sim_binomial_slope1_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_slope1.csv");
+    let mut y = Vec::<f64>::new();
+    let mut xcol = Vec::<f64>::new();
+    let mut g_raw = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        xcol.push(f[1].parse().unwrap());
+        g_raw.push(f[2].parse().unwrap());
+    }
+    let n = y.len();
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = xcol[i];
+    }
+    let (primary, n_clusters) = dense_ids(&g_raw);
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary,
+        extra: vec![],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// Dense GLMM rescale identity, `C = 4.0`, `WaldSe::Hessian`. Same predicted
+/// moves as the LMM rescale test for `beta`/`se`/`varcorr`/`tau2` (see that
+/// test's doc comment for the derivation), EXCEPT:
+///
+/// - **No REML Jacobian.** The GLMM criterion is the marginal Laplace
+///   deviance, which carries no `log|X'V⁻¹X|` term (that term is a Gaussian-
+///   REML-only artifact of profiling β out of a linear-Gaussian likelihood).
+///   So unlike the LMM test, `deviance` here must be UNCHANGED — a genuine
+///   reparameterization, not a rescale, of the same marginal likelihood.
+/// - **`stddev_se` moves by the Lambda-row scales, not their squares.**
+///   `stddev_se` is the SE of θ itself (the θ-Hessian block of the joint
+///   covariance), not of `θ²`, so it carries exactly ONE power of the row
+///   scale — `[se0, se1/C, se2/C]` — unlike `tau2`, which is `θ²·σ̂²` and so
+///   carries the row scale SQUARED.
+///
+/// `BAND` is margin over the worst relative spread measured between the two
+/// independent joint-BOBYQA fits on 2026-08-23 (the anchor machine — see
+/// `assert_pinned`'s doc comment). Looser than the LMM test's band for the
+/// reason in this section's header comment: these are two genuinely different
+/// internal optimizations, not the same search read twice.
+#[test]
+fn glmm_rescaling_slope_column_moves_stddev_se_by_the_predicted_power_of_c() {
+    const C: f64 = 4.0;
+    const BAND: f64 = 3e-4;
+    const DEV_ABS: f64 = 1e-9;
+
+    let (x, y, n, p, model, ids) = sim_binomial_slope1_design();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        wald_se: WaldSe::Hessian,
+        ..FitOptions::default()
+    };
+
+    let base = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(base.converged(), "base binomial slope GLMM must converge");
+    assert!(
+        base.stddev_se.iter().all(|v| v.is_finite()),
+        "base stddev_se must be finite on a converged Hessian fit: {:?}",
+        base.stddev_se
+    );
+
+    let mut x_c = x.clone();
+    for i in 0..n {
+        x_c[i * p + 1] *= C;
+    }
+    let scaled = fit_cold(&x_c, &y, n, p, &model, &ids, &opts);
+    assert!(scaled.converged(), "column-scaled fit must converge");
+    assert!(
+        scaled.stddev_se.iter().all(|v| v.is_finite()),
+        "scaled stddev_se must be finite on a converged Hessian fit: {:?}",
+        scaled.stddev_se
+    );
+
+    assert_pinned(&[scaled.beta[0]], &[base.beta[0]], BAND, "beta[0]");
+    assert_pinned(&[scaled.beta[1]], &[base.beta[1] / C], BAND, "beta[1]");
+    assert_pinned(&[scaled.se[0]], &[base.se[0]], BAND, "se[0]");
+    assert_pinned(&[scaled.se[1]], &[base.se[1] / C], BAND, "se[1]");
+
+    // varcorr vech [D00, D10, D11].
+    assert_eq!(scaled.varcorr.len(), 1, "one grouping block");
+    assert_pinned(
+        &scaled.varcorr[0],
+        &[
+            base.varcorr[0][0],
+            base.varcorr[0][1] / C,
+            base.varcorr[0][2] / (C * C),
+        ],
+        BAND,
+        "varcorr vech",
+    );
+
+    // tau2[0] = Lambda row 0 (intercept); tau2[1], tau2[2] = Lambda row 1 (slope).
+    assert_pinned(
+        &scaled.tau2,
+        &[base.tau2[0], base.tau2[1] / (C * C), base.tau2[2] / (C * C)],
+        BAND,
+        "tau2",
+    );
+
+    // ranef, per level [b0, b1] — the assertion that caught `assemble_ranef_dense`
+    // reporting its slope modes on the internal scale (ratio 1 instead of 1/C).
+    assert_eq!(scaled.ranef.len(), base.ranef.len());
+    assert_eq!(scaled.ranef_levels, base.ranef_levels);
+    let n_levels = scaled.ranef_levels[0];
+    let mut want_ranef = Vec::with_capacity(scaled.ranef.len());
+    for l in 0..n_levels {
+        want_ranef.push(base.ranef[l * 2]);
+        want_ranef.push(base.ranef[l * 2 + 1] / C);
+    }
+    assert_pinned(&scaled.ranef, &want_ranef, BAND, "ranef");
+
+    // stddev_se — the item this test exists for: ONE power of the row scale
+    // (θ-scale SE), not squared like tau2. Length 3: [row0, row1, row1].
+    assert_eq!(scaled.stddev_se.len(), 3, "one grouping, q=2 vech");
+    assert_pinned(
+        &scaled.stddev_se,
+        &[
+            base.stddev_se[0],
+            base.stddev_se[1] / C,
+            base.stddev_se[2] / C,
+        ],
+        BAND,
+        "stddev_se",
+    );
+
+    // deviance — no REML Jacobian on the GLMM route, so this is a genuine
+    // reparameterization: the marginal criterion is invariant.
+    assert!(
+        (scaled.deviance - base.deviance).abs() < DEV_ABS,
+        "deviance moved under a column reparameterization: {} vs {}",
+        scaled.deviance,
+        base.deviance
+    );
 }

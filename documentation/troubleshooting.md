@@ -28,6 +28,33 @@ predictors that are actually measuring the same thing. See
 [`conventions.md#flags-on-the-result`](conventions.md#flags-on-the-result) for
 where this sits in the `diagnostics` channel.
 
+## Warning: random-effect design columns on very different scales
+
+A grouping's random-effect design columns span very different magnitudes —
+the ratio between the largest and smallest column RMS (the implicit
+intercept counted as 1.0) exceeds 1000, the same threshold lme4's
+`checkScaleX` warns on. Fitting itself is unaffected: the kernel scales the
+columns internally before solving. What the warning is telling you is that
+the reported random-effect standard deviation for that grouping sits on the
+raw variable's own scale, so a large spread between components makes them
+hard to compare by eye. Rescale the offending variable (e.g. divide a
+day-of-experiment slope by 100, or convert a raw count to thousands) so the
+reported stddevs land on comparable magnitudes.
+
+## Warning: Hessian-based standard errors fell back to RX
+
+`wald_se="hessian"` (Python) / `wald.se = "hessian"` (R) was requested, but
+the finite-difference joint Hessian this GLMM's SE pass builds was not
+usable — either it was not positive definite, or a perturbed deviance
+evaluation it needed was non-finite. The fit falls back to the RX/Schur
+standard errors instead: `se`/`vcov` are still filled (from the fallback),
+but `stddev_se` (the standard errors of the random-effect standard
+deviations) stays `NaN`, since only the joint-Hessian route can fill it. This
+never fires under `wald_se="rx"`, which never attempts the joint Hessian in
+the first place. If you need `stddev_se`, try simplifying the random-effect
+structure or switching to `wald_se="rx"` to avoid the failed attempt
+entirely.
+
 ## converged is false
 
 `converged` reports whether the optimizer reached its convergence criterion.

@@ -178,10 +178,12 @@ pub fn sigmoid_stable(eta: f64) -> f64 {
 /// Fit a GLM via adaptive IRLS. All buffers live in `scratch`; the returned view
 /// borrows from the same storage.
 ///
-/// `family` selects the IRLS math. `Family::Binomial { link: Logit }` runs the
-/// **verbatim** canonical fused-SIMD path (byte-identity, the MCPower hot loop);
-/// every other family routes the scalar general Fisher-scoring branch through
-/// [`crate::family`]. Gamma/NB dispersion is handled by the caller (`fit.rs`),
+/// `family` selects the IRLS math, all of it behind one batched call into
+/// `simd_transcendental::family_pass`. Unweighted `Family::Binomial { link:
+/// Logit }` reaches the fused kernel `pw_and_log1pexp_sum` there — the MCPower
+/// hot loop, byte-identical to before that kernel was shared; every other
+/// family/link runs a vectorized arm written against [`crate::family`]'s scalar
+/// formulas. Gamma/NB dispersion is handled by the caller (`fit.rs`),
 /// not here — this kernel folds `φ=1`. `nb_theta` is the NB shape θ̂ the caller's
 /// outer-θ loop fixes for this fit (only the NB family reads it via
 /// `family::variance`/`dev_resid`; pass `f64::NAN` for every other family).
@@ -198,9 +200,9 @@ pub fn sigmoid_stable(eta: f64) -> f64 {
 ///   working weight (`irls_w[i] = (wᵢ·W_raw).max(WEIGHT_CLAMP)`) and the
 ///   per-row deviance contribution; the working response `z = η + r` is
 ///   untouched (prior weights don't scale the working residual). The fused
-///   SIMD `Logit` fast path cannot take per-row weights, so `Some(_)` routes
-///   `Family::Binomial { link: Logit }` through the general scalar arm instead
-///   (unweighted logit still takes the fast path, byte-identical). Matches R
+///   `log1pexp` deviance identity holds only for unweighted Bernoulli rows, so
+///   `Some(_)` routes `Family::Binomial { link: Logit }` to the weighted arm
+///   instead (unweighted logit keeps the fused kernel). Matches R
 ///   `glm(weights=)` (`fit_glm_gamma_weighted_matches_r`,
 ///   `fit_glm_binomial_weighted_aggregated_matches_r`).
 /// - `scratch`: borrowed mutable slots from `SimWorkspace.irls_*`.
@@ -453,64 +455,39 @@ pub fn glm_irls_fit<'a>(
         // after each β update. Reusing it here is bit-identical to recomputing
         // X·β (same β, same summation order).
 
-        // p, W, z, and the deviance for this β. Family-branched: logit keeps the
-        // VERBATIM fused-SIMD path (p, W, Σ log1pexp(η) in one vectorized pass,
-        // then the scalar z follow-up that folds in the Σ y·η deviance half) for
-        // byte-identity; new families take the scalar general Fisher-scoring
-        // branch through `family.rs` (φ folded as 1). Both leave irls_p / irls_w
-        // / irls_z filled identically in shape for the WLS solve below.
-        let deviance = match family {
-            Family::Binomial {
-                link: BinomialLink::Logit,
-            } if prior_w.is_none() => {
-                let lp_sum = crate::simd_transcendental::pw_and_log1pexp_sum(
-                    &irls_eta[..n],
-                    &mut irls_p[..n],
-                    &mut irls_w[..n],
-                );
-                let mut yeta = 0.0;
-                for i in 0..n {
-                    let yi = y[i];
-                    yeta += yi * irls_eta[i];
-                    irls_z[i] = irls_eta[i] + (yi - irls_p[i]) / irls_w[i];
-                }
-                // z − o: the WLS below solves β from X alone, so the offset's
-                // fixed contribution must leave the working response.
-                if let Some(o) = offset {
-                    for i in 0..n {
-                        irls_z[i] -= o[i];
-                    }
-                }
-                2.0 * (lp_sum - yeta)
+        // p, W, z, and the deviance for this β — one batched call into the shared
+        // family kernel (`simd_transcendental::family_pass`), which owns the
+        // clamps, the inverse link, the Fisher weight with its prior-weight
+        // multiply and `WEIGHT_CLAMP` floor, the working response `z = η + r`
+        // (prior weights don't scale it — MN89 §2.2.2), and the `Σ wᵢdᵢ` fold.
+        // `Σ y·η` is only read by the unweighted-Bernoulli-logit deviance
+        // identity `2·(Σ log1pexp(η) − Σ y·η)`; it is accumulated here because
+        // that arm's kernel streams η without the response.
+        let mut yeta = 0.0;
+        for i in 0..n {
+            yeta += y[i] * irls_eta[i];
+        }
+        let (deviance, _infeasible) = crate::simd_transcendental::family_pass(
+            family,
+            nb_theta,
+            &mut irls_eta[..n],
+            &y[..n],
+            // Sliced to n so the kernel's SIMD head/tail split lines up with
+            // η's; an empty slice is its "unit weights" spelling.
+            prior_w.map_or(&[][..], |w| &w[..n]),
+            prior_w.is_some(),
+            yeta,
+            &mut irls_p[..n],
+            &mut irls_w[..n],
+            &mut irls_z[..n],
+        );
+        // z − o: the WLS below solves β from X alone, so the offset's fixed
+        // contribution must leave the working response.
+        if let Some(o) = offset {
+            for i in 0..n {
+                irls_z[i] -= o[i];
             }
-            other => {
-                // Per row: clamp η; (μ, W_raw, working_resid) from family.rs;
-                // fold in the prior weight wᵢ (None ⇒ 1.0) on both the working
-                // weight and the deviance term, then floor W at WEIGHT_CLAMP;
-                // z = η + r is untouched — prior weights don't scale the working
-                // residual (MN89 §2.2.2). Accumulate Σ wᵢdᵢ (the |Δ| convergence
-                // metric, dispersion-free). This arm also carries the weighted
-                // Logit fallthrough (fused SIMD kernel has no per-row weight).
-                let mut dev = 0.0;
-                for i in 0..n {
-                    let e = crate::family::clamp_eta(other, irls_eta[i]);
-                    let (mu, w_raw, r) =
-                        crate::family::irls_weight_and_resid(other, nb_theta, y[i], e);
-                    let pw = prior_w.map_or(1.0, |w| w[i]);
-                    irls_p[i] = mu;
-                    irls_w[i] = (pw * w_raw).max(WEIGHT_CLAMP);
-                    irls_z[i] = e + r;
-                    dev += pw * crate::family::dev_resid(other, nb_theta, y[i], mu);
-                }
-                // z − o (see the logit arm) — the offset is not β's to fit.
-                if let Some(o) = offset {
-                    for i in 0..n {
-                        irls_z[i] -= o[i];
-                    }
-                }
-                dev
-            }
-        };
+        }
 
         // Adaptive early exit on |Δdeviance| at the CURRENT β — the one the
         // previous pass's solve accepted. Pass 0 sees the seed β, which has no
@@ -995,7 +972,7 @@ mod tests {
     /// Well-conditioned logistic design whose slope column is multiplied by
     /// `scale`. The response is generated from the UNSCALED column, so the three
     /// scalings are literally the same model in three unit systems. The LCG is
-    /// local to this builder — the fit path itself stays RNG-free (RULE 3).
+    /// local to this builder — the fit path itself stays RNG-free.
     fn scaled_logit_design(n: usize, scale: f64) -> (Mat<f64>, Vec<f64>) {
         let mut x = Mat::<f64>::zeros(n, 2);
         let mut y = vec![0.0f64; n];

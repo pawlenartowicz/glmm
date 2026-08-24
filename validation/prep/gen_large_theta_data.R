@@ -6,8 +6,8 @@
 # export_data.R for rungs 1-28, gen_weights_data.R for 29-43, gen_illcond_data.R
 # and gen_scale_data.R).
 #
-# THE STAGED CSVs ARE AUTHORITATIVE AND FROZEN, like the reference JSONs
-# (RULE 0 shape): the CSV (not the seed) is the artifact. DO NOT re-run the
+# THE STAGED CSVs ARE AUTHORITATIVE AND FROZEN, like the reference JSONs:
+# the CSV (not the seed) is the artifact. DO NOT re-run the
 # R1-R3 blocks in place, including via `--prep`. Measured 2026-08-06 on this
 # box (R 4.5.3, glibc 2.42, x86_64): a re-run reproduces R4 byte-identically
 # but writes R1-R3 with ~1-ULP differences in scattered rnorm/rpois draws

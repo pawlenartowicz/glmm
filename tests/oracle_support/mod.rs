@@ -1,12 +1,17 @@
 //! Tier 2 support: golden schema, `validation/tol.R` mirror, and the generic driver
 //! that refits a golden from its own recorded `r_formula`.
 //!
-//! Tier 2 is the cross-engine tier — it asserts the crate against the frozen
+//! Tier 2 is the cross-engine tier — it checks the crate against the frozen
 //! lme4 / MASS / GLMMadaptive results in `validation/goldens/`. The bands here are
 //! AGREEMENT bands (measured worst gap plus margin), not correctness
-//! thresholds; a failure means two implementations drifted apart by more than
-//! the calibration allowed, which is a flag to investigate. Tier 1's tight pins
-//! live beside the code in `src/**/*_tests.rs`.
+//! thresholds; a difference beyond one means two implementations drifted apart by
+//! more than the calibration allowed, which is a flag to investigate. Tier 1's
+//! tight pins live beside the code in `src/**/*_tests.rs`.
+//!
+//! This is a REFERENCE CHECK, not a pass/fail gate: a difference past its band
+//! passes when `validation/divergences.json` documents it, and fails otherwise —
+//! see the [`divergence`] module for the registry and the rules that keep it from
+//! decaying into a blanket exemption.
 
 use glmm::formula::{lower, Column, Table};
 use glmm::{fit_cold, BinomialLink, Family, Fit, GammaLink, NegBinomialLink, PoissonLink, WaldSe};
@@ -23,8 +28,6 @@ use serde_json::Value;
 pub mod tol {
     pub const BETA_REL: f64 = 1e-3;
     pub const STDDEV_REL: f64 = 1e-3;
-    pub const LOGLIK_ABS_LMM: f64 = 2e-6;
-    pub const LOGLIK_ABS_GLMM: f64 = 1e-3;
     pub const SE_REL: f64 = 1e-3;
     /// The retired 3e-2 band is gone: it existed only while the frozen oracle
     /// carried lme4's lagged-`ldL2` `tolPwrss` artifact, which was fixed and the
@@ -156,6 +159,22 @@ impl Est {
     }
 }
 
+/// Read and parse a single golden by name, setting `source` the same way
+/// `m3_corpus`/`weights_corpus` do. For tests that need one named golden rather
+/// than the whole corpus (e.g. `dev_align`'s self-checks) — the multi-golden
+/// readers stay in `validation_oracle.rs` since they also carry manifest/factor
+/// logic this single-file read has no use for.
+pub fn load_golden(name: &str) -> Golden {
+    let path = format!(
+        "{}/validation/goldens/{name}.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let mut golden: Golden = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{name}: {e}"));
+    golden.source = path;
+    golden
+}
+
 // ── Comparison helpers ───────────────────────────────────────────────────────
 
 /// Coordinates both engines put at zero, below which a relative difference has
@@ -176,20 +195,286 @@ fn rel(got: f64, want: f64) -> f64 {
     (got - want).abs() / scale
 }
 
+/// The one place an over-band cross-engine comparison is adjudicated.
+///
+/// Implements the reference-check rule stated in the module header — not
+/// restated here, so the two cannot drift. What is specific to this function:
+/// a documented match is recorded so the corpus driver can print it and prove
+/// the registry is not stale, and everything else keeps its teeth — no entry, or
+/// a difference past the entry's own recorded `max_rel`, still panics here.
+///
+/// `ctx` is `"<dataset>: <quantity>"` (with an optional `[i]` index suffix),
+/// which is the key `divergences.json` is written against.
+fn adjudicate(observed: f64, band: f64, ctx: &str, detail: &dyn Fn() -> String) {
+    if observed <= band {
+        return;
+    }
+    match divergence::registry().covers(ctx, observed) {
+        divergence::Coverage::Documented => {}
+        divergence::Coverage::Exceeded { id, max_rel } => panic!(
+            "{}\n  documented divergence `{id}` covers only {max_rel:.1e} — this one grew",
+            detail()
+        ),
+        divergence::Coverage::NotDocumented => panic!("{}", detail()),
+    }
+}
+
 pub fn assert_rel(got: f64, want: f64, band: f64, ctx: &str) {
-    assert!(
-        rel(got, want) <= band,
-        "{ctx}: glmm={got} oracle={want} (rel {:.3e} > {band:.0e})",
-        rel(got, want)
-    );
+    let r = rel(got, want);
+    adjudicate(r, band, ctx, &|| {
+        format!("{ctx}: glmm={got} oracle={want} (rel {r:.3e} > {band:.0e})")
+    });
 }
 
 pub fn assert_abs(got: f64, want: f64, band: f64, ctx: &str) {
-    assert!(
-        (got - want).abs() <= band,
-        "{ctx}: glmm={got} oracle={want} (abs {:.3e} > {band:.0e})",
-        (got - want).abs()
-    );
+    let d = (got - want).abs();
+    adjudicate(d, band, ctx, &|| {
+        format!("{ctx}: glmm={got} oracle={want} (abs {d:.3e} > {band:.0e})")
+    });
+}
+
+// ── documented-divergence registry ───────────────────────────────────────────
+
+/// Reader for `validation/divergences.json`, the registry this tier and
+/// `validation/compare.R` share. The reference-check rule it serves is stated in
+/// the module header.
+///
+/// The registry is deliberately hostile to rot — [`Registry::fired`]
+/// records every match so the corpus driver can assert that each entry scoped to
+/// this tier actually fired, which is what stops a fixed divergence from leaving
+/// a standing exemption behind.
+pub mod divergence {
+    use serde::Deserialize;
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Deserialize)]
+    pub struct Entry {
+        pub id: String,
+        pub dataset: String,
+        pub rung: u32,
+        pub comparison: Vec<String>,
+        pub quantities: Vec<String>,
+        pub max_rel: f64,
+        pub direction: String,
+        pub summary: String,
+        pub review: String,
+    }
+
+    #[derive(Deserialize)]
+    struct File {
+        entries: Vec<Entry>,
+    }
+
+    pub enum Coverage {
+        /// An entry covers this comparison at this magnitude.
+        Documented,
+        /// An entry covers the comparison, but the difference outgrew it.
+        Exceeded { id: String, max_rel: f64 },
+        /// Nothing covers it — the caller must fail.
+        NotDocumented,
+    }
+
+    pub struct Registry {
+        entries: Vec<Entry>,
+        fired: Mutex<BTreeSet<String>>,
+    }
+
+    /// This tier's name in an entry's `comparison` list.
+    const SCOPE: &str = "oracle-tier";
+
+    impl Registry {
+        /// Adjudicate one over-band comparison. `ctx` is `"<dataset>: <quantity>"`,
+        /// optionally with an `[i]` coefficient-index suffix, as every assertion in
+        /// this module formats it.
+        pub fn covers(&self, ctx: &str, observed: f64) -> Coverage {
+            let Some((dataset, rest)) = ctx.split_once(": ") else {
+                return Coverage::NotDocumented;
+            };
+            // `"beta[0]"` and `"beta"` are the same quantity to the registry: an
+            // entry names the quantity, never which coordinate of it moved.
+            let quantity = rest.split('[').next().unwrap_or(rest).trim();
+            let Some(e) = self.entries.iter().find(|e| {
+                e.dataset == dataset
+                    && e.quantities.iter().any(|q| q == quantity)
+                    && e.comparison.iter().any(|c| c == SCOPE)
+            }) else {
+                return Coverage::NotDocumented;
+            };
+            if observed > e.max_rel {
+                return Coverage::Exceeded {
+                    id: e.id.clone(),
+                    max_rel: e.max_rel,
+                };
+            }
+            self.fired
+                .lock()
+                .expect("divergence registry mutex")
+                .insert(e.id.clone());
+            Coverage::Documented
+        }
+
+        /// Entry ids matched so far.
+        pub fn fired(&self) -> BTreeSet<String> {
+            self.fired
+                .lock()
+                .expect("divergence registry mutex")
+                .clone()
+        }
+
+        /// Entries scoped to this tier, in file order.
+        pub fn scoped(&self) -> impl Iterator<Item = &Entry> {
+            self.entries
+                .iter()
+                .filter(|e| e.comparison.iter().any(|c| c == SCOPE))
+        }
+    }
+
+    pub fn registry() -> &'static Registry {
+        static REG: OnceLock<Registry> = OnceLock::new();
+        REG.get_or_init(|| {
+            let path = format!("{}/validation/divergences.json", env!("CARGO_MANIFEST_DIR"));
+            let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let f: File = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{path}: {e}"));
+            Registry {
+                entries: f.entries,
+                fired: Mutex::new(BTreeSet::new()),
+            }
+        })
+    }
+}
+
+// ── deviance-convention alignment ───────────────────────────────────────────
+
+// mirrors validation/tol.R dev_eps / dev_big — change together.
+// Pinned 2026-08-24 from the corpus Δdev floor measurement.
+pub const DEV_EPS: f64 = 2e-4;
+pub const DEV_BIG: f64 = 0.5;
+
+// mirrors validation/dev_align.R — change together
+pub mod dev_align {
+    //! Per-family × per-method deviance convention alignment, mirroring
+    //! `validation/dev_align.R` on the Rust side (checklist comment at both
+    //! sites — change together). Shared convention: `dev = -2 * loglik` as each
+    //! engine reports it, corrected only for the one documented case below.
+
+    use super::{col_index, csv_for, parse_formula, split_line, Golden};
+
+    /// `ln Γ(x)` for `x > 0`. Same Lanczos g=7 series and coefficients as
+    /// `src/simd_transcendental.rs::ln_gamma`, duplicated here because that one
+    /// is `pub(crate)` and out of reach from this external test crate — this
+    /// harness needs one scalar call, not the SIMD kernel it backs.
+    #[allow(clippy::excessive_precision)]
+    fn ln_gamma(x: f64) -> f64 {
+        const C: [f64; 9] = [
+            0.999_999_999_999_809_93,
+            676.520_368_121_885_1,
+            -1_259.139_216_722_402_8,
+            771.323_428_777_653_13,
+            -176.615_029_162_140_59,
+            12.507_343_278_686_905,
+            -0.138_571_095_265_720_12,
+            9.984_369_578_019_571_6e-6,
+            1.505_632_735_149_311_6e-7,
+        ];
+        const G: f64 = 7.0;
+        const LN_SQRT_2PI: f64 = 0.918_938_533_204_672_74; // ½·ln(2π)
+        let x = x - 1.0;
+        let mut a = C[0];
+        let t = x + G + 0.5;
+        for (i, &c) in C.iter().enumerate().skip(1) {
+            a += c / (x + i as f64);
+        }
+        LN_SQRT_2PI + (x + 0.5) * t.ln() - t + a.ln()
+    }
+
+    /// `ln C(n, k)` via `lnΓ`, continuous in `n` the same way `dev_align.R`'s
+    /// `lchoose` is (R's `lchoose` is also `lnΓ`-based, not a factorial table).
+    fn lchoose(n: f64, k: f64) -> f64 {
+        ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0)
+    }
+
+    /// Golden `engine` strings are qualified R calls (`"lme4::glmer"`,
+    /// `"lme4::glmer.nb"`, `"lme4::lmer"`), not the bare `"lme4"` the interface
+    /// doc names — matched by prefix, same as `dev_align.R::is_lme4`, so the
+    /// nAGQ>1 correction actually fires rather than never matching in silence.
+    fn is_lme4(engine: &str) -> bool {
+        engine.starts_with("lme4")
+    }
+
+    /// Closed form of the saturated-model loglik (binomial/poisson), ported
+    /// (sign and form) via `dev_align.R::saturated_loglik_deficit` — the
+    /// verified closed-form saturated-model logLik correction for lme4
+    /// nAGQ>1, verified 2026-08-24. This is the value `aligned_dev` adds
+    /// directly to lme4's reported nAGQ>1 loglik. Sign verified against the
+    /// frozen `cbpp_agq_k1`/`cbpp_agq_k7` goldens (closes an 84-unit raw
+    /// deviance gap to <1 unit).
+    fn saturated_loglik_deficit(g: &Golden) -> f64 {
+        let spec = parse_formula(&g.r_formula);
+        let raw =
+            std::fs::read_to_string(csv_for(g)).unwrap_or_else(|e| panic!("{}: {e}", csv_for(g)));
+        let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
+        let header = split_line(lines.next().expect("CSV has a header"));
+        let rows: Vec<Vec<String>> = lines.map(split_line).collect();
+
+        match g.family.as_str() {
+            "binomial" => {
+                // Aggregated `cbind(s, n-s) ~ ...` carries n per row; the bare
+                // `y ~ ...` Bernoulli form is n=1 everywhere, which zeroes every
+                // term of the sum below (a Bernoulli fit is always saturated) —
+                // not a special case, just this formula evaluated at n=1.
+                let (yi, ni) = match &spec.aggregated {
+                    Some((succ, total)) => {
+                        (col_index(&header, succ), Some(col_index(&header, total)))
+                    }
+                    None => (col_index(&header, &spec.response), None),
+                };
+                let mut s = 0.0;
+                for r in &rows {
+                    let y: f64 = r[yi].parse().expect("successes parse");
+                    let n: f64 = match ni {
+                        Some(ti) => r[ti].parse().expect("total parse"),
+                        None => 1.0,
+                    };
+                    let p = y / n;
+                    s += lchoose(n, y);
+                    if y > 0.0 {
+                        s += y * p.ln();
+                    }
+                    if y < n {
+                        s += (n - y) * (1.0 - p).ln();
+                    }
+                }
+                s
+            }
+            "poisson" => {
+                let ri = col_index(&header, &spec.response);
+                let mut s = 0.0;
+                for r in &rows {
+                    let y: f64 = r[ri].parse().expect("response parse");
+                    let t = if y > 0.0 { y * y.ln() } else { 0.0 };
+                    s += t - y - ln_gamma(y + 1.0);
+                }
+                s
+            }
+            f => panic!("no verified saturated correction for family {f}"),
+        }
+    }
+
+    /// Deviance on the shared `-2*loglik` convention, aligned across engines.
+    /// Same three branches as `dev_align.R::aligned_dev`: default `-2*loglik`;
+    /// lme4 `nagq > 1` adds the saturated-model logLik deficit; no reference
+    /// loglik at all -> `None`, which the caller must exclude loudly,
+    /// never pass hollow.
+    pub fn aligned_dev(g: &Golden) -> Option<f64> {
+        let ll = g.estimates.loglik?;
+        let ll = if is_lme4(&g.engine) && g.nagq > 1 {
+            ll + saturated_loglik_deficit(g)
+        } else {
+            ll
+        };
+        Some(-2.0 * ll)
+    }
 }
 
 /// Compare a per-coefficient vector against the reference, asserting the

@@ -182,13 +182,15 @@ shaped like lme4's. These **work**:
 | `fit$diagnostics` | list with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; the top-level `fit$converged`/`fit$singular`/`fit$aliased` are unchanged and mirror the same values. |
 
 **Diagnostic conditions.** `fit` raises a warning for each note the kernel
-records — today only ill-conditioning, of class `"fastglmm_ill_conditioned"`;
-a note kind newer than this package recognizes arrives as
-`"fastglmm_unknown_note"`. Both inherit `"fastglmm_diagnostic"`, so one
-handler catches the whole channel. A design that is merely ill-conditioned
-(near-collinear but still distinguishable) is fitted and returns real
-numbers; the warning is how you find out its standard errors are honest but
-large. Select on the class rather than matching message text:
+records, one of `"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`,
+`"fastglmm_unused_grouping_levels"`, `"fastglmm_re_design_scale_spread"` or
+`"fastglmm_hessian_se_fallback"`; a note kind newer than this package
+recognizes arrives as `"fastglmm_unknown_note"`. All inherit
+`"fastglmm_diagnostic"`, so one handler catches the whole channel. A design
+that is merely ill-conditioned (near-collinear but still distinguishable) is
+fitted and returns real numbers; the warning is how you find out its standard
+errors are honest but large. Select on the class rather than matching message
+text:
 
 ```r
 withCallingHandlers(

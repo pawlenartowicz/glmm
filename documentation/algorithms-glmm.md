@@ -144,9 +144,10 @@ in lockstep, halving β toward `beta_prev` alongside `u`.
 **Prior weights.** With `FitOptions::weights`, PIRLS folds `wᵢ` into the
 working weight (`wᵢ·W̃ᵢ`), the deviance contribution (`wᵢ·devᵢ`), and the
 β-gradient score (`wᵢ·ρᵢ`), so the conditional mode and curvature are those of
-the weighted likelihood. One performance fork follows: the fused-SIMD logit
-kernel has no per-row weight slot, so a *weighted* binomial-logit fit takes the
-general scalar Fisher-scoring arm (`ws.weighted` gates the fast path). The
+the weighted likelihood. One fork follows inside the shared family kernel: the
+fused `2·(Σ log1pexp(η) − Σ y·η)` deviance identity holds only for unweighted
+Bernoulli rows, so a *weighted* binomial-logit fit takes the weighted-logit arm
+instead (`ws.weighted` gates it). The
 aggregated-binomial convention (y = success proportion, `wᵢ` = trial count —
 lme4's `cbind(s, m−s)`) rides this mechanism unchanged, on Laplace and AGQ
 alike.
@@ -406,6 +407,17 @@ identical in `src/fit/lmm.rs`): any RE standard deviation
 `≤ SINGULAR_REL_TOL (1e-3) ×` the largest RE standard deviation. The relative
 check catches scale-degenerate fits the absolute θ pin cannot see.
 
+Both tests read the **internal** (scaled) θ and standard deviations, which is
+what keeps their verdicts independent of the units a random-slope covariate is
+expressed in — the owning description is
+[`algorithms-lmm.md` §Random-effect design column scaling](algorithms-lmm.md#random-effect-design-column-scaling).
+The GLMM path scales its RE design the same way and by the same code: the
+per-column scales live on the shared grouping structure and are applied where Z
+is built (`build_z` / `fill_z_f64` in `src/glmm/workspace.rs`, `fill_m_vals` in
+`src/sparse/glmm.rs`, and the Rx M row in `src/glmm/se.rs`). Because the FD
+stencil perturbs the internal θ, `stddev_se` is divided by the same scales
+before it is reported.
+
 **Convention/reference:** lme4 searches the identical bounded linear-scale
 Cholesky (`glmer`'s θ lower bounds are `0` on diagonals) and flags the same
 fits via `isSingular` (θ diagonal `< 1e-4`), but reports the raw converged
@@ -439,9 +451,11 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   every rung with θ̂ > 1, at every nAGQ). Every rung with θ̂ ≤ 1 is unaffected,
   `max(1, ·)` having been exactly 1 there. No Richardson extrapolation — the
   deviance is step-invariant over `h ∈ [1e-4, 1e-1]`
-  on the committed fixture. Every FD deviance eval re-runs PIRLS at the tight
-  `PIRLS_TOL_REL_FD = 1e-8` (not the fit tolerance), so the second differences
-  are step-invariant by construction rather than by luck. If the joint Hessian
+  on the committed fixture. Every FD deviance eval re-runs PIRLS at
+  `min(PIRLS_TOL_REL_FD, pirls_tol(family))` — the FD ceiling capped by the
+  family's own fit tolerance, so the stencil is never looser than the fit that
+  produced the point it differences — and the second differences are
+  step-invariant by construction rather than by luck. If the joint Hessian
   is non-PD, or a perturbed deviance is non-finite (the few-cluster failure
   mode), it falls back to the Rx/Schur covariance and reports
   `FdHessianStatus::NonPdFellBackToRx`.

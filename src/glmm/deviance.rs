@@ -103,8 +103,8 @@ pub(crate) fn laplace_deviance(
     // site chooses.
     profile_beta: bool,
     // PIRLS exit-tol override, forwarded verbatim to whichever PIRLS variant (or
-    // `agq_deviance`) runs. `Some(PIRLS_TOL_REL_FD)` only under the FD-Hessian SE
-    // evals (`ws.pirls_tol_override`, set by `fd_hessian_cov`); `None` on the fit
+    // `agq_deviance`) runs. `Some(pirls_tol_fd(family))` only under the FD-Hessian
+    // SE evals (`ws.pirls_tol_override`, set by `fd_hessian_cov`); `None` on the fit
     // path, which therefore stays bit-identical.
     pirls_tol_override: Option<f64>,
     p: usize,

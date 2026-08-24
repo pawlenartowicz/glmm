@@ -5,6 +5,8 @@
 //! directly — it is `fit`'s own marshalling logic, factored out of `mod.rs`
 //! because every estimator's dispatch needs at least one of these.
 
+use std::borrow::Cow;
+
 use faer::Mat;
 
 use crate::{
@@ -76,6 +78,12 @@ pub struct FitDiagnostics {
     /// rest on a truncated solve rather than a rejected trial point. `false`
     /// on every non-GLMM route.
     pub final_pirls_exhausted: bool,
+    /// GLMM-only: `WaldSe::Hessian` was requested but the FD joint Hessian
+    /// came back non-PD (or a perturbed deviance evaluation was non-finite),
+    /// so the SE pass fell back to the RX/Schur route — see
+    /// [`crate::Note::HessianSeFallback`]. `false` on every non-GLMM route and
+    /// under `WaldSe::Rx`.
+    pub hessian_fallback: bool,
 }
 
 impl FitDiagnostics {
@@ -92,6 +100,7 @@ impl FitDiagnostics {
             ill_conditioned: false,
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
+            hessian_fallback: false,
         }
     }
 }
@@ -121,6 +130,9 @@ pub(super) fn materialize_diagnostics(
             evals: d.pirls_exhausted,
             final_eval: d.final_pirls_exhausted,
         });
+    }
+    if d.hessian_fallback {
+        notes.push(Note::HessianSeFallback);
     }
     Diagnostics {
         converged: d.converged,
@@ -215,9 +227,22 @@ pub(super) fn warm_theta(start: Option<&StartValues>) -> Option<&[f64]> {
 /// vech(column-major lower-tri) of `D̂ = scale·Λ̂Λ̂'` for one `q×q` grouping.
 /// `theta_block` is that grouping's column-major lower-tri `vech(Λ)` prefix
 /// (as `primary_lambda` reads it). `D[r][c] = Σ_{k≤min(r,c)} Λ[r][k]·Λ[c][k]`.
-pub(super) fn varcorr_block(theta_block: &[f64], q: usize, scale: f64) -> Vec<f64> {
+///
+/// `row_scales[r]` is row `r`'s internal RE design-column scale
+/// (`LmmGroupings::block_row_scale`). θ̂ arrives in the solver's internal units,
+/// where row `r` of Λ carries a factor `s_r`; dividing it out here is the whole
+/// back-map, and it is what makes the reported covariance
+/// `D[i][j] = D̃[i][j]/(sᵢ·s_j)` as the scaling identity requires. All-`1.0`
+/// scales divide exactly, so an unscaled design is untouched.
+pub(super) fn varcorr_block(
+    theta_block: &[f64],
+    q: usize,
+    scale: f64,
+    row_scales: &[f64],
+) -> Vec<f64> {
     let mut lam = vec![0.0f64; q * q];
-    crate::lmm::primary_lambda(theta_block, q, &mut lam); // Λ lower-tri, row-major
+    crate::lmm::primary_lambda(theta_block, q, &mut lam); // Λ̃ lower-tri, row-major
+    back_map_lambda(&mut lam, q, row_scales);
     let mut vech = Vec::with_capacity(q * (q + 1) / 2);
     for c in 0..q {
         for r in c..q {
@@ -245,9 +270,19 @@ pub(crate) fn assemble_varcorr(
 ) -> Vec<Vec<f64>> {
     let mut out = Vec::with_capacity(1 + groupings.extra_q.len());
     let mut cursor = 0usize;
-    for &q in std::iter::once(&groupings.primary_q).chain(groupings.extra_q.iter()) {
+    for (b, &q) in std::iter::once(&groupings.primary_q)
+        .chain(groupings.extra_q.iter())
+        .enumerate()
+    {
         let vech = q * (q + 1) / 2;
-        out.push(varcorr_block(&theta[cursor..cursor + vech], q, scale));
+        // θ̂ is in the solver's internal units; the row scales back-map it.
+        let row_scales = block_row_scales(groupings, b, q);
+        out.push(varcorr_block(
+            &theta[cursor..cursor + vech],
+            q,
+            scale,
+            &row_scales,
+        ));
         cursor += vech;
     }
     out
@@ -361,6 +396,11 @@ pub(crate) fn assemble_ranef_dense(
     let q = g.primary_q;
     let mut lam = vec![0.0f64; q * q];
     crate::lmm::primary_lambda(theta, q, &mut lam);
+    // Same back-map, and for the same reason, as `assemble_ranef_sparse` — the
+    // internal `b̃ = Λ̃û` carries the design column's scale on row r. Only the
+    // primary block needs it: this path's extras are intercept-only (asserted
+    // below), so their scale is exactly 1.
+    back_map_lambda(&mut lam, q, &block_row_scales(g, 0, q));
     let mut out = Vec::with_capacity(g.k_total);
     for lvl in 0..g.n_primary {
         let base = lvl * q;
@@ -393,6 +433,43 @@ pub(crate) fn assemble_ranef_dense(
 /// RE-column elimination order is the same layout, so the two share this rather
 /// than each carrying their own walk. What is sparse-specific is the caller, not
 /// the layout.
+/// Divide block `b`'s row-major lower-tri Λ̃ (as `primary_lambda` writes it) by
+/// its rows' internal RE design-column scales, turning the solver's internal
+/// factor into the user's: `Λ[r][c] = Λ̃[r][c]/s_r`. The one back-map every
+/// θ-derived block quantity funnels through. All-`1.0` scales divide exactly.
+fn back_map_lambda(lam: &mut [f64], q: usize, row_scales: &[f64]) {
+    for r in 1..q {
+        let s_r = row_scales[r];
+        if s_r == 1.0 {
+            continue;
+        }
+        for c in 0..=r {
+            lam[r * q + c] /= s_r;
+        }
+    }
+}
+
+/// Block `b`'s per-row internal RE design-column scales (`b == 0` primary,
+/// `b == e+1` extra grouping `e`), length `q` — the argument every back-map takes.
+fn block_row_scales(g: &crate::lmm::LmmGroupings, b: usize, q: usize) -> Vec<f64> {
+    (0..q).map(|r| g.block_row_scale(b, r)).collect()
+}
+
+/// The internal RE design-column scales laid out like [`Fit::varcorr`] — one
+/// row-aligned block per grouping, primary first. Multiplying a reported
+/// standard deviation by its entry puts it back on the internal scale, which is
+/// where the components of one fit are commensurate with each other:
+/// user-scale standard deviations for an intercept and for a slope are in
+/// different units (response, vs response per covariate unit), so their ratio
+/// moves with the covariate's units.
+pub(crate) fn re_scale_grid(g: &crate::lmm::LmmGroupings) -> Vec<Vec<f64>> {
+    std::iter::once(g.primary_q)
+        .chain(g.extra_q.iter().copied())
+        .enumerate()
+        .map(|(b, q)| block_row_scales(g, b, q))
+        .collect()
+}
+
 pub(crate) fn assemble_ranef_sparse(
     theta: &[f64],
     g: &crate::lmm::LmmGroupings,
@@ -402,6 +479,12 @@ pub(crate) fn assemble_ranef_sparse(
     let s = g.n_primary;
     let mut lam = vec![0.0f64; q * q];
     crate::lmm::primary_lambda(theta, q, &mut lam);
+    // `b̃ = Λ̃û` comes out in the solver's internal RE units, where row r carries
+    // the design column's scale s_r; the user's conditional mode is `b = b̃/s_r`.
+    // Back-mapping Λ here rather than the output does it once per row instead of
+    // once per level — and it must happen HERE, not later: `lmm_fitted` weights
+    // `ranef` by the RAW covariate, so it needs a user-scale `ranef`.
+    back_map_lambda(&mut lam, q, &block_row_scales(g, 0, q));
     let mut out = Vec::with_capacity(g.k_total);
     for f in 0..s {
         for r in 0..q {
@@ -417,6 +500,7 @@ pub(crate) fn assemble_ranef_sparse(
         let q_g = g.extra_q[e];
         let mut lam_g = vec![0.0f64; q_g * q_g];
         crate::lmm::primary_lambda(&theta[extra_vech_start(g, e)..], q_g, &mut lam_g);
+        back_map_lambda(&mut lam_g, q_g, &block_row_scales(g, e + 1, q_g));
         for l in 0..counts[e + 1] {
             let base = off + l * q_g;
             for r in 0..q_g {
@@ -493,6 +577,153 @@ pub(crate) fn lmm_fitted(
         .collect()
 }
 
+/// Which grouping the kernel holds in each slot, relative to the order the
+/// caller declared them in. Slot 0 is the primary grouping, slot `g+1` the g-th
+/// extra — the layout of both the `ModelSpec` and the `GroupIds` the kernels
+/// see, and of every grouping-indexed result they emit.
+///
+/// [`spec_sized_from_ids`] is the only producer. Its size rule exchanges the
+/// primary with exactly one extra, and only when every grouping is
+/// intercept-only, so each grouping then owns exactly one θ coordinate, one
+/// `varcorr` block, one `pinned` row and one `ranef` block. Undoing the reorder
+/// is therefore the same exchange applied a second time — a transposition is its
+/// own inverse — which is why this records the one swapped index rather than a
+/// full index map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Perm {
+    /// Extra grouping that traded places with the primary. `None` is the
+    /// identity: declaration order reached the kernel untouched.
+    swapped_extra: Option<usize>,
+}
+
+impl Perm {
+    /// Declaration order reached the kernel untouched.
+    pub const IDENTITY: Perm = Perm {
+        swapped_extra: None,
+    };
+
+    /// Whether the kernel's slot order IS the caller's declaration order.
+    pub fn is_identity(&self) -> bool {
+        self.swapped_extra.is_none()
+    }
+
+    /// Map a vector holding one entry per grouping between slot order and
+    /// declaration order — `v[0]` the primary's, `v[g+1]` the g-th extra's. The
+    /// same call converts either way (see the type doc). Covers every
+    /// per-grouping and per-θ-coordinate result, the two coinciding because the
+    /// rule only fires on intercept-only groupings.
+    ///
+    /// An EMPTY vector is a documented state for several of the fields this
+    /// runs over — nothing pinned, a non-converged fit carrying no `varcorr`,
+    /// an LMM's absent `stddev_se` — and stays empty. Any other length must
+    /// cover every grouping, so a short one indexes out of bounds here instead
+    /// of quietly reordering the wrong pair.
+    pub fn swap_slots<T>(&self, v: &mut [T]) {
+        if let Some(k) = self.swapped_extra {
+            if v.is_empty() {
+                return;
+            }
+            v.swap(0, k + 1);
+        }
+    }
+
+    /// Same map for a concatenation of variable-width per-grouping blocks —
+    /// [`Fit::ranef`], the one grouping-indexed output whose blocks are wider
+    /// than one entry. `widths` must be in the SAME order as `v` currently is;
+    /// map it with [`Perm::swap_slots`] afterwards, not before. Empty is a real
+    /// state here too (a non-converged fit recovers no conditional modes).
+    fn swap_blocks(&self, v: &mut Vec<f64>, widths: &[usize]) {
+        let Some(k) = self.swapped_extra else {
+            return;
+        };
+        if widths.is_empty() {
+            return;
+        }
+        let mut starts = Vec::with_capacity(widths.len());
+        let mut acc = 0usize;
+        for &w in widths {
+            starts.push(acc);
+            acc += w;
+        }
+        debug_assert_eq!(acc, v.len(), "block widths must cover the whole vector");
+        let mut order: Vec<usize> = (0..widths.len()).collect();
+        order.swap(0, k + 1);
+        let mut out = Vec::with_capacity(v.len());
+        for g in order {
+            out.extend_from_slice(&v[starts[g]..starts[g] + widths[g]]);
+        }
+        *v = out;
+    }
+}
+
+/// Report a fit's grouping-indexed results in the caller's declaration order.
+/// The kernels emit them in slot order, which [`spec_sized_from_ids`]'s size
+/// rule may have reordered; this is the single site that undoes it for the
+/// stable API, so no `Fit` consumer sees slot order. `beta`, `se`, `vcov`,
+/// `fitted`, `deviance` and `loglik` are grouping-order-independent and are not
+/// touched.
+pub(super) fn unpermute_fit(perm: Perm, fit: &mut Fit) {
+    if perm.is_identity() {
+        return;
+    }
+    // `ranef` before `ranef_levels`: the block widths must still describe the
+    // layout `ranef` is currently in.
+    perm.swap_blocks(&mut fit.ranef, &fit.ranef_levels);
+    perm.swap_slots(&mut fit.ranef_levels);
+    perm.swap_slots(&mut fit.tau2);
+    perm.swap_slots(&mut fit.stddev_se);
+    perm.swap_slots(&mut fit.varcorr);
+    perm.swap_slots(&mut fit.diagnostics.pinned);
+}
+
+/// The size rule: **when every grouping is intercept-only and `Crossed`, the
+/// grouping with the most levels becomes the primary; otherwise nothing moves.**
+///
+/// Why it pays. The primary is eliminated as block-diagonal families at cost
+/// linear in its level count, while every extra lands in one Schur tail whose
+/// width is the total crossed level count and whose factorization is cubic in
+/// that width. Which grouping the user happened to write first therefore sets
+/// the tail width. MixedModels.jl sorts its `ReMat`s by decreasing level count
+/// for exactly this reason; Bates, Alday & Kokandakar (2025), arXiv:2505.11674,
+/// measure the effect on InstEval with that sort defeated — ~4.5M vs 775K
+/// nonzeros in the Cholesky factor.
+///
+/// Why it is this narrow. Plain "most levels first" is wrong as soon as a
+/// `NestedWithin` grouping is present: hoisting a child out of its parent turns
+/// a nesting that rides inside the primary's block-diagonal elimination into two
+/// crossed factors sharing one tail, which can be several times WIDER. And it is
+/// wrong as soon as any grouping carries a random slope, because a wide primary
+/// routes the dense kernel whose joint optimizer is known to land above lme4's
+/// optimum on the sparse-Gamma shape. With every grouping scalar and crossed
+/// neither hazard exists — no nesting relation can be invalidated and no slope
+/// block can change hands — and "most levels first" and "smallest crossed tail"
+/// become the same argmax.
+///
+/// Ties keep the declared primary (and, among extras, the earliest), so a model
+/// already in the chosen order is handed to the kernel exactly as declared.
+fn size_rule_perm(re: &ReStructure, primary_levels: usize, extras: &[Grouping]) -> Perm {
+    let eligible = re.slopes.is_empty()
+        && extras
+            .iter()
+            .all(|g| g.slopes.is_empty() && matches!(g.relation, GroupingRelation::Crossed { .. }));
+    if !eligible {
+        return Perm::IDENTITY;
+    }
+    let mut best = primary_levels;
+    let mut swapped_extra = None;
+    for (k, g) in extras.iter().enumerate() {
+        let GroupingRelation::Crossed { n_clusters } = g.relation else {
+            // `eligible` already established every extra is Crossed.
+            continue;
+        };
+        if n_clusters as usize > best {
+            best = n_clusters as usize;
+            swapped_extra = Some(k);
+        }
+    }
+    Perm { swapped_extra }
+}
+
 /// A `ModelSpec` copy whose RE **counts** are derived from the supplied `GroupIds`
 /// (`n_primary = max(primary)+1`; per crossed grouping `n_clusters =
 /// max(extra[g])+1`; per nested grouping `n_per_parent = ⌈children/n_primary⌉`,
@@ -501,9 +732,20 @@ pub(crate) fn lmm_fitted(
 /// "derive every level count from the ids": the sizing-corrected copy
 /// feeds the existing workspace builders unchanged, so no builder/kernel signature
 /// changes. `re: None` is returned as-is (fixed-only carries no counts).
-pub(super) fn spec_sized_from_ids(model: &ModelSpec, ids: &GroupIds) -> ModelSpec {
+///
+/// It is also where [`size_rule_perm`]'s grouping reorder is applied, which is
+/// why the ids come back with the spec rather than being left to the caller:
+/// a sized spec and the ids that match it can only be obtained together, so no
+/// path can size a spec and then hand the kernel ids in a different order. The
+/// swap moves two `Vec` handles and two spec fields — nothing per-observation —
+/// but the ids must be cloned to be swapped, so the clone happens only on the
+/// models the rule actually reorders (`Cow::Borrowed` otherwise).
+pub(super) fn spec_sized_from_ids<'a>(
+    model: &ModelSpec,
+    ids: &'a GroupIds,
+) -> (ModelSpec, Cow<'a, GroupIds>, Perm) {
     let Some(re) = model.re.as_ref() else {
-        return model.clone();
+        return (model.clone(), Cow::Borrowed(ids), Perm::IDENTITY);
     };
     let level_count = |v: &[u32]| v.iter().copied().max().map(|m| m as usize + 1).unwrap_or(1);
     let n_primary = level_count(&ids.primary);
@@ -545,7 +787,8 @@ pub(super) fn spec_sized_from_ids(model: &ModelSpec, ids: &GroupIds) -> ModelSpe
             }
         })
         .collect();
-    ModelSpec {
+    let perm = size_rule_perm(re, n_primary, &extra_groupings);
+    let mut sized = ModelSpec {
         family: model.family,
         re: Some(ReStructure {
             sizing: Sizing::FixedClusters {
@@ -554,7 +797,33 @@ pub(super) fn spec_sized_from_ids(model: &ModelSpec, ids: &GroupIds) -> ModelSpe
             slopes: re.slopes.clone(),
             extra_groupings,
         }),
-    }
+    };
+    let Some(k) = perm.swapped_extra else {
+        return (sized, Cow::Borrowed(ids), perm);
+    };
+    let sized_re = sized.re.as_mut().expect("just built with re: Some");
+    let GroupingRelation::Crossed {
+        n_clusters: extra_levels,
+    } = sized_re.extra_groupings[k].relation
+    else {
+        unreachable!("the size rule only fires when every extra is Crossed");
+    };
+    sized_re.sizing = Sizing::FixedClusters {
+        n_clusters: extra_levels,
+    };
+    sized_re.extra_groupings[k].relation = GroupingRelation::Crossed {
+        n_clusters: n_primary as u32,
+    };
+    // Both are empty whenever the rule fires (it requires intercept-only
+    // groupings); swapped anyway so the spec half of the exchange is complete
+    // rather than complete-by-precondition.
+    std::mem::swap(
+        &mut sized_re.slopes,
+        &mut sized_re.extra_groupings[k].slopes,
+    );
+    let mut swapped_ids = ids.clone();
+    std::mem::swap(&mut swapped_ids.primary, &mut swapped_ids.extra[k]);
+    (sized, Cow::Owned(swapped_ids), perm)
 }
 /// Lower-tri Gram `G = XᵀX` (from row-major X) → `aliased_columns` mask. `p` is
 /// tiny, so the extra `O(N·p²)` reduction for the drop decision is negligible
@@ -777,7 +1046,10 @@ pub(super) fn fit_rank_deficient(
                 }
             }
             // Carry no design-column indices — nothing to translate.
-            Note::PirlsExhausted { .. } | Note::UnusedGroupingLevels { .. } => {}
+            Note::PirlsExhausted { .. }
+            | Note::UnusedGroupingLevels { .. }
+            | Note::ReDesignScaleSpread { .. }
+            | Note::HessianSeFallback => {}
         }
     }
     // Same scatter in two dimensions: an aliased column has no coefficient, so
@@ -926,8 +1198,14 @@ pub(crate) fn assert_model_shape_pub(model: &ModelSpec, p: usize, nagq: u8) {
 /// `fit_warm` entry does, and the `loop_advanced` surface hands it to loop-tier
 /// consumers (MCPower) so they normalize RE level counts the same validated way
 /// before [`build_workspace`] rather than reimplementing the count derivation.
+/// Feed all three returned values onward: the ids belong to the sized spec, and
+/// the [`Perm`] is what maps the kernel's grouping-indexed results (θ̂ above all)
+/// back to the order the caller declared.
 #[cfg(any(test, feature = "loop_advanced"))]
-pub fn spec_sized_from_ids_pub(model: &ModelSpec, ids: &GroupIds) -> ModelSpec {
+pub fn spec_sized_from_ids_pub<'a>(
+    model: &ModelSpec,
+    ids: &'a GroupIds,
+) -> (ModelSpec, Cow<'a, GroupIds>, Perm) {
     spec_sized_from_ids(model, ids)
 }
 /// Fills `dst[0..n, 0..p]` from row-major `x` (n·p, unweighted). Factored out

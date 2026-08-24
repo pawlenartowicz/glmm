@@ -8,13 +8,15 @@ DATA = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
 
 
 def test_module_surface():
-    # `fit`, `Fit`, and the four warning categories the diagnostics channel
+    # `fit`, `Fit`, and the six warning categories the diagnostics channel
     # raises — a user has to be able to name them to filter on them.
     assert glmm.__all__ == [
         "DiagnosticWarning",
         "Fit",
+        "HessianSeFallbackWarning",
         "IllConditionedWarning",
         "PirlsExhaustedWarning",
+        "ReDesignScaleWarning",
         "UnusedGroupingLevelsWarning",
         "fit",
     ]

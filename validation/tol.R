@@ -87,8 +87,26 @@ TOL <- list(
   agq_beta_rel       = 3e-3,  # worst 1.4e-3 (poisson k=7); binomial rungs <= 6.7e-5
   agq_stddev_rel     = 4e-3,  # worst 1.7e-3 (poisson k=7)
   agq_corr_abs       = 4e-3,  # ABSOLUTE (correlations near 0 break relative); worst 1.6e-3
-  agq_se_hessian_rel = 2e-2   # worst 1.3e-2 (poisson k=7 intercept, the MA k-truncation
+  agq_se_hessian_rel = 2e-2,  # worst 1.3e-2 (poisson k=7 intercept, the MA k-truncation
                               #   case above); next-worst 2.6e-3, k=11 worst 7.1e-4
+
+  # Deviance gate (dev = -2*loglik, dev_align.R's convention). Measured
+  # 2026-08-24 over the full 48-rung curated corpus by measure_dev_floor.R.
+  # ONE value, not split per
+  # family: corpus-wide max benign |Δdev| (beta/se/stddev all in-band vs lme4)
+  # is 1.6507e-05 on sim_sparse_binomial_bigsd (rung 46, the sparse large-θ̂
+  # rung that already carries its own tightened se_hessian_rel override
+  # below) -- every OTHER benign binomial rung sits at 9e-9..4.7e-6 (rung 27,
+  # sim_binomial_slope2, is the true second-highest), the same band as
+  # gaussian/poisson, so the apparent per-family gap is that one rung's own
+  # known-harder numerics, not a family-wide floor.
+  dev_eps = 2e-4,  # ceil-to-one-sig-fig(10 x 1.6507e-05), a ~10x margin
+  dev_big = 0.5    # unmoved: corpus-wide benign max (1.65e-5) and the largest
+                   #   documented-divergence Δdev (1.56e-4, sim_sparse_gamma's
+                   #   basin split) sit 4.5 and 3.5 orders of magnitude below it
+                   #   respectively; a convention-mismatch constant is itself
+                   #   tens of units (the nAGQ saturated-loglik deficit
+                   #   dev_align.R corrects), so 0.5 stays clear of both ends
 )
 
 # ── per-rung tolerance overrides ─────────────────────────────────────────────
@@ -142,7 +160,7 @@ TOL <- list(
 # pass after" holds for sim_poisson_bigsd only.
 #
 # NOT TIGHTER THAN THIS. Of sim_poisson_bigsd's 1.4439e-5 post-fix gap, only
-# 3.04e-6 is ours: post-fix glmm sits within 3.1e-6 of its own h->0 stencil limit
+# 7.17e-6 is ours: post-fix glmm sits within 7.2e-6 of its own h->0 stencil limit
 # on every moved rung, while lme4's vcov(use.hessian=TRUE) is `lme4:::deriv12` at
 # an ABSOLUTE delta = 1e-4 and carries 5e-6..9e-6 of its own FD error (two runs
 # of lme4's own stencil differ by 4.5e-7..1.8e-6). 3e-5 is a band around the

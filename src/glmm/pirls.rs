@@ -182,48 +182,29 @@ pub(crate) fn pirls_solve(
             1.0,
             Par::Seq,
         );
-        // η = η_fixed + Mu; family-branched deviance + p/W. Logit keeps the
-        // verbatim fused-SIMD path (byte-identity); other families take the
-        // scalar general Fisher-scoring branch through family.rs.
-        // `infeasible` = any row's RAW η outside the link's open domain
-        // (`family::eta_infeasible` — Gamma-inverse only; constant-false, hence
-        // dead, for every all-ℝ link including the logit arm above it).
-        let mut infeasible = false;
-        dev = match family {
-            Family::Binomial {
-                link: BinomialLink::Logit,
-            } if !weighted => {
-                let mut yeta = 0.0;
-                for i in 0..n {
-                    let e = eta_fixed[i] + mu[i];
-                    eta[i] = e;
-                    yeta += y[i] * e;
-                }
-                let lp_sum = crate::simd_transcendental::pw_and_log1pexp_sum(
-                    &eta[..n],
-                    &mut prob[..n],
-                    &mut w[..n],
-                );
-                2.0 * (lp_sum - yeta)
-            }
-            other => {
-                let mut d = 0.0;
-                for i in 0..n {
-                    let raw = eta_fixed[i] + mu[i];
-                    infeasible |= crate::family::eta_infeasible(other, raw);
-                    let e = crate::family::clamp_eta(other, raw);
-                    eta[i] = e;
-                    let mui = crate::family::link_inv(other, e);
-                    prob[i] = mui;
-                    let dmu = crate::family::mu_eta(other, e);
-                    let v = crate::family::variance(other, nb_theta, mui);
-                    let pw = prior_w[i];
-                    w[i] = (pw * dmu * dmu / v).max(crate::glm::WEIGHT_CLAMP);
-                    d += pw * crate::family::dev_resid(other, nb_theta, y[i], mui);
-                }
-                d
-            }
-        };
+        // η = η_fixed + Mu (raw), then one batched call into the shared family
+        // kernel for deviance + p/W. `infeasible` = any row's RAW η outside the
+        // link's open domain (`family::eta_infeasible` — Gamma-inverse only;
+        // constant-false, hence dead, for every all-ℝ link).
+        let mut yeta = 0.0;
+        for i in 0..n {
+            let e = eta_fixed[i] + mu[i];
+            eta[i] = e;
+            yeta += y[i] * e;
+        }
+        let (d, infeasible) = crate::simd_transcendental::family_pass(
+            family,
+            nb_theta,
+            &mut eta[..n],
+            &y[..n],
+            &prior_w[..n],
+            weighted,
+            yeta,
+            &mut prob[..n],
+            &mut w[..n],
+            &mut [],
+        );
+        dev = d;
         // Retrospective step-halving (lme4 `pwrssUpdate`): the convergence band is
         // tested BEFORE the overshoot test because near the optimum Fisher scoring
         // is not strictly monotone — a step can land ε above `pen_accepted` yet
@@ -658,40 +639,22 @@ pub(crate) fn pirls_solve_blocked(
             eta[i] = e;
             yeta += y[i] * e;
         }
-        // --- pass 2: η[] → prob[]/w[] + deviance. Logit: verbatim fused SIMD.
-        // Other families: scalar general branch (clamps η in place;
-        // `infeasible` flags any raw η outside the link's open domain —
-        // Gamma-inverse only, mirrors `pirls_solve`). ---
-        let mut infeasible = false;
-        dev = match family {
-            Family::Binomial {
-                link: BinomialLink::Logit,
-            } if !weighted => {
-                let lp_sum = crate::simd_transcendental::pw_and_log1pexp_sum(
-                    &eta[..n],
-                    &mut prob[..n],
-                    &mut w[..n],
-                );
-                2.0 * (lp_sum - yeta)
-            }
-            other => {
-                let mut d = 0.0;
-                for i in 0..n {
-                    let raw = eta[i];
-                    infeasible |= crate::family::eta_infeasible(other, raw);
-                    let e = crate::family::clamp_eta(other, raw);
-                    eta[i] = e;
-                    let mui = crate::family::link_inv(other, e);
-                    prob[i] = mui;
-                    let dmu = crate::family::mu_eta(other, e);
-                    let v = crate::family::variance(other, nb_theta, mui);
-                    let pw = prior_w[i];
-                    w[i] = (pw * dmu * dmu / v).max(crate::glm::WEIGHT_CLAMP);
-                    d += pw * crate::family::dev_resid(other, nb_theta, y[i], mui);
-                }
-                d
-            }
-        };
+        // --- pass 2: η[] → prob[]/w[] + deviance, through the shared family
+        // kernel (clamps η in place; `infeasible` flags any raw η outside the
+        // link's open domain — Gamma-inverse only, mirrors `pirls_solve`). ---
+        let (d, infeasible) = crate::simd_transcendental::family_pass(
+            family,
+            nb_theta,
+            &mut eta[..n],
+            &y[..n],
+            &prior_w[..n],
+            weighted,
+            yeta,
+            &mut prob[..n],
+            &mut w[..n],
+            &mut [],
+        );
+        dev = d;
         // Retrospective step-halving (lme4 `pwrssUpdate`, mirrors `pirls_solve`):
         // convergence band checked BEFORE the overshoot test (near the optimum
         // Fisher scoring is not strictly monotone — a step can land ε above
@@ -1482,40 +1445,22 @@ pub(crate) fn pirls_solve_blocked_extras(
             mu[i] = mui; // keep (Mu)ᵢ for the IRLS residual below
             yeta += y[i] * eta[i];
         }
-        // --- pass 2: η[] → prob[]/w[] + deviance. Logit: verbatim fused SIMD.
-        // Other families: scalar general branch (clamps η in place;
-        // `infeasible` flags any raw η outside the link's open domain —
-        // Gamma-inverse only, mirrors `pirls_solve`). ---
-        let mut infeasible = false;
-        dev = match family {
-            Family::Binomial {
-                link: BinomialLink::Logit,
-            } if !weighted => {
-                let lp_sum = crate::simd_transcendental::pw_and_log1pexp_sum(
-                    &eta[..n],
-                    &mut prob[..n],
-                    &mut w[..n],
-                );
-                2.0 * (lp_sum - yeta)
-            }
-            other => {
-                let mut d = 0.0;
-                for i in 0..n {
-                    let raw = eta[i];
-                    infeasible |= crate::family::eta_infeasible(other, raw);
-                    let e = crate::family::clamp_eta(other, raw);
-                    eta[i] = e;
-                    let mui = crate::family::link_inv(other, e);
-                    prob[i] = mui;
-                    let dmu = crate::family::mu_eta(other, e);
-                    let v = crate::family::variance(other, nb_theta, mui);
-                    let pw = prior_w[i];
-                    w[i] = (pw * dmu * dmu / v).max(crate::glm::WEIGHT_CLAMP);
-                    d += pw * crate::family::dev_resid(other, nb_theta, y[i], mui);
-                }
-                d
-            }
-        };
+        // --- pass 2: η[] → prob[]/w[] + deviance, through the shared family
+        // kernel (clamps η in place; `infeasible` flags any raw η outside the
+        // link's open domain — Gamma-inverse only, mirrors `pirls_solve`). ---
+        let (d, infeasible) = crate::simd_transcendental::family_pass(
+            family,
+            nb_theta,
+            &mut eta[..n],
+            &y[..n],
+            &prior_w[..n],
+            weighted,
+            yeta,
+            &mut prob[..n],
+            &mut w[..n],
+            &mut [],
+        );
+        dev = d;
         // Retrospective step-halving (lme4 `pwrssUpdate`, mirrors `pirls_solve` /
         // `pirls_solve_blocked`): convergence band checked BEFORE the overshoot test
         // (near the optimum Fisher scoring is not strictly monotone — a step can

@@ -283,7 +283,7 @@ fn fit_glm_smoke() {
 /// `glm(family=poisson)` oracle (`validation/goldens/grouseticks_glm.json`):
 /// `TICKS ~ 1 + YEAR + cHEIGHT` on grouseticks, canonical log link. Dispersion
 /// is fixed `φ≡1`, so SE = √((XᵀWX)⁻¹). Routes the Poisson canonical-shortcut
-/// branch of `family.rs`. The oracle is sacred (RULE 0).
+/// branch of `family.rs`. The oracle is sacred.
 #[test]
 fn fit_glm_poisson_matches_r() {
     const REF_BETA: [f64; 4] = [
@@ -443,7 +443,7 @@ fn fit_glm_poisson_offset_matches_r() {
 /// start: from the old μ = 1 seed (η = 0) any count data with ȳ ≳ ~25–30 made
 /// the first WLS step overshoot and IRLS run away (β → ~9e304,
 /// `converged = false`); the μ₀ = y + 0.1 seed (R's family `initialize`)
-/// converges here. The oracle is sacred (RULE 0).
+/// converges here. The oracle is sacred.
 #[test]
 fn fit_glm_poisson_highmean_matches_r() {
     const REF_BETA: [f64; 3] = [4.27614930354405, 0.299823553158498, 0.220101964251659];
@@ -504,7 +504,7 @@ fn fit_glm_poisson_highmean_matches_r() {
 /// R `glm(binomial("probit"))` (`validation/goldens/cbpp_probit_glm.json`): cbpp
 /// `cbind(incidence, size−incidence) ~ period`, expanded to 0/1 rows (same
 /// MLE + Fisher information as the aggregated fit). Probit is non-canonical →
-/// the general Fisher-scoring branch; `φ≡1`. The oracle is sacred (RULE 0).
+/// the general Fisher-scoring branch; `φ≡1`. The oracle is sacred.
 #[test]
 fn fit_glm_probit_matches_r() {
     const REF_BETA: [f64; 4] = [
@@ -600,7 +600,7 @@ fn sim_gamma_xy() -> (Vec<f64>, Vec<f64>, usize) {
 /// Gamma log-link GLM, gated against frozen R `glm(family=Gamma("log"))`
 /// (`validation/goldens/sim_gamma_glm.json`). φ is the post-fit Pearson moment
 /// estimator (`dispersion: None`); SE is √φ-scaled, matching R's
-/// `summary()$dispersion`. The oracle is sacred (RULE 0).
+/// `summary()$dispersion`. The oracle is sacred.
 #[test]
 fn fit_glm_gamma_log_matches_r() {
     const REF_BETA: [f64; 3] = [0.449945830683142, 0.565796931228723, 0.526238083012209];
@@ -724,7 +724,7 @@ fn fit_glm_gamma_fixed_dispersion_scales_se() {
 /// Negative-binomial GLM via the alternating outer-θ loop, gated against
 /// frozen R `MASS::glm.nb` (`validation/goldens/sim_nb_glm.json`):
 /// `y ~ 1 + x + grp` on sim_nb. `dispersion = θ̂` (the estimated shape); β SE
-/// conditions on θ̂. The oracle is sacred (RULE 0).
+/// conditions on θ̂. The oracle is sacred.
 #[test]
 fn fit_glm_nb_matches_mass() {
     const REF_BETA: [f64; 3] = [0.144166077871857, 0.619826870647895, 0.633686899496841];
@@ -1137,7 +1137,7 @@ fn fit_glm_nb_outer_cap_semantics() {
 /// scaling exactly — because `glm.fit` has no coefficient cap. glmm used to
 /// reject the middle one: its divergence guard bounded |β|, so the accept/reject
 /// decision moved with the caller's choice of units. The guard bounds |η| now,
-/// which is invariant. The oracle is sacred (RULE 0).
+/// which is invariant. The oracle is sacred.
 #[test]
 fn fit_glm_scale_variation_matches_r() {
     // From validation/goldens/sim_scale_logit_glm.json (estimates.beta / .se).
@@ -1212,7 +1212,7 @@ fn fit_glm_scale_variation_matches_r() {
 /// Only the FLAG is compared, not the coefficients: both engines stop at an
 /// arbitrary point on a path to infinity, and R's own stopping point depends on
 /// its iteration budget (25) which differs from glmm's (50). The oracle is
-/// sacred (RULE 0).
+/// sacred.
 #[test]
 fn fit_glm_separated_rejected_like_r() {
     let csv = include_str!("../../validation/data/simulated/sim_scale_sep.csv");
@@ -1251,7 +1251,7 @@ fn fit_glm_separated_rejected_like_r() {
 /// `glm(Gamma(link="inverse"))` (`validation/goldens/sim_scale_gamma_inv_glm.json`):
 /// `y ~ x` on sim_scale_gamma_inv, where μ ≈ 0.01 so η = 1/μ ≈ 100. A flat
 /// divergence cap of 30 on |η| would refuse this honest fit, which is why the
-/// GLM guard skips this family/link pair. The oracle is sacred (RULE 0).
+/// GLM guard skips this family/link pair. The oracle is sacred.
 #[test]
 fn fit_glm_gamma_inverse_small_mean_matches_r() {
     // From validation/goldens/sim_scale_gamma_inv_glm.json.

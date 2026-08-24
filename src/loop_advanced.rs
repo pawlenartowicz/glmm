@@ -13,8 +13,11 @@ pub use crate::fit::{
 };
 // The RE-level-count normalizer `build_workspace` expects its `sized` spec to have
 // gone through — exposed so loop-tier consumers size specs the validated way
-// instead of reimplementing the crossed/nested count derivation.
-pub use crate::fit::spec_sized_from_ids_pub;
+// instead of reimplementing the crossed/nested count derivation. It also decides
+// the grouping order the kernels see, which `Perm` records: the ids it returns
+// are what `fit_on` must be handed, and the `Perm` is what maps a caller's own θ
+// (into `StartValues`, out of `LmmSweepOutcome`) between the two orders.
+pub use crate::fit::{spec_sized_from_ids_pub, Perm};
 pub use crate::glm::{glm_irls_fit, sigmoid_stable, GlmFitView, GlmScratch, MAX_IRLS_ITERS};
 pub use crate::glmm::GlmmFit;
 pub use crate::lme::{lme_fit, LmeFitView, LmeScratch, LmeSuffStats};

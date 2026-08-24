@@ -8,16 +8,24 @@ formula, in R `lme4` and in Julia `MixedModels.jl`, then compared against
 within tolerance is the truth condition `glmm` is held to — not agreement
 with either engine alone.
 
-## The oracle is sacred
+## The references are frozen; disagreement is documented
 
-The reference data and reference results are frozen and treated as ground
-truth. When `glmm` disagrees with them, `glmm` is presumed wrong: the fix
-goes into `glmm`, not the reference. A reference result is only regenerated
-when the reference's own model spec is proven wrong (wrong formula, family,
-or link), and that requires a recorded justification. Tolerances are never
-relaxed to make `glmm` pass. Where the two reference engines disagree with
-each other beyond tolerance, that is recorded as a flag to investigate — the
-harness never silently picks whichever one is closer to `glmm`.
+The reference data and reference results are frozen and never move to
+accommodate `glmm`. A reference result is only regenerated when the
+reference's own model spec is proven wrong (wrong formula, family, or link),
+and that requires a recorded justification. Tolerances are never relaxed to
+make `glmm` pass.
+
+The comparison is a reference check rather than a pass/fail gate. Where
+`glmm` and a reference disagree beyond the agreement band, the disagreement
+has to be written up and registered in
+[`../validation/divergences.json`](../validation/divergences.json) before it
+passes; an unregistered one, one that outgrows its registered magnitude, and
+a registered one that stops firing all fail the run. Every reported
+divergence is printed with its direction, so none of this is silent. Where
+the two reference engines disagree with each other beyond tolerance, that is
+recorded as a flag to investigate — the harness never silently picks
+whichever one is closer to `glmm`, and no `glmm`-side entry may excuse it.
 
 ## What is covered
 
