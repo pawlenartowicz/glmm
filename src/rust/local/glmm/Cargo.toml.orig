@@ -1,0 +1,140 @@
+[package]
+name = "glmm"
+version = "0.3.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = true
+description = "Standalone f64 GLMM fit kernels (OLS, GLM, LMM, GLMM) in pure Rust on faer — the validation-pinned numerics from the MCPower engine."
+keywords = ["statistics", "glmm", "regression", "mixed-models", "mle"]
+categories = ["science", "mathematics"]
+repository = "https://github.com/pawlenartowicz/glmm"
+
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+[features]
+# The R-style formula frontend (`glmm::formula`). ON by default so `cargo add glmm`
+# gets the API the Rust tutorial documents. `regex` — the only dep it adds — is
+# pulled in solely by this feature, so `default-features = false` gives the
+# formula-free kernel the parse-once/fit-many hot path wants, linking no regex.
+# CI asserts that (ci.yml "kernel links no regex"). Unlike `loop_advanced`, this
+# IS part of the semver-covered surface.
+default = ["formula"]
+formula = ["dep:regex"]
+# Unstable scratch-explicit hot-path surface (the loop tier: scratch-explicit
+# kernels + `StartValues` warm-start). Capability-named, multi-consumer. OFF by
+# default so the semver-covered public API is just `fit` + `ModelSpec`. (spec §5)
+loop_advanced = []
+# String-typed fit orchestration shared by the FFI ports (`glmm-python`,
+# `glmm-r`): one definition of the family/link string vocabulary and the
+# result flattening both ports publish, instead of two mirrored copies. OFF by
+# default and — like `loop_advanced` — NOT part of the semver-covered surface:
+# its shape follows the ports' needs. Needs `formula`, which `run_fit` lowers
+# through.
+orchestrate = ["formula"]
+# Installs dhat as the test binary's #[global_allocator] for the `#[ignore]`
+# bounded-alloc tests. OFF by default: dhat locks a global mutex on every
+# allocation, which serializes the whole parallel test suite when it's always
+# installed. The `#[ignore]` lib tests serialize themselves via
+# `test_support::alloc_test_guard` (dhat counts process-wide), so run with
+# `cargo test --features alloc-tests <name> -- --ignored` — no
+# `--test-threads=1` needed.
+alloc-tests = []
+# Tier 2, the cross-engine tier: asserts the crate against the frozen lme4 /
+# MixedModels / GLMMadaptive goldens in `validation/goldens/` at `validation/tol.R`'s
+# agreement bands. OFF by default because it is slow — it refits all 35 goldens
+# — and because CI runs the validated-answer tier instead. Reads frozen
+# JSON, so it needs neither R nor Julia. Named for the claim, not the cost, and
+# NOT `--oracles`, which is `run.sh`'s flag for refitting the references
+# themselves — a different act. Preferred over `#[ignore]` so the tier is
+# greppable and its absence from a run is visible rather than silent.
+oracle-tests = []
+# In-fit parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool.
+# OFF by default: a batch/MCPower caller running its own outer rayon loop over
+# many fits should pay nothing for this, not even rayon's per-split overhead.
+# Compile-excluded on wasm32 (`dep:rayon` only pulled in on non-wasm targets
+# below) — a no-op there, not a broken build. Gated at runtime by
+# `FitOptions::parallel_inner` even when the feature is compiled in.
+parallel = ["dep:rayon"]
+
+[dependencies]
+# Mirror engine-core's pins exactly — validation-stable numerics depend on them.
+bobyqa = "0.3"
+pulp = "=0.22.2"
+# Formula-parser only (`src/formula/parse.rs`); optional so the default-off kernel
+# never links it. Its MSRV (1.65) clears this crate's 1.85 floor.
+regex = { version = "1", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+faer = "0.24"
+rayon = { version = "1", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+faer = { version = "0.24", default-features = false, features = ["std", "sparse-linalg"] }
+
+[dev-dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+dhat       = "0.3"
+
+# ───────────────────────── standalone workspace root ─────────────────────────
+# glmm was carved out of the mcpower workspace (Stage 2). It is now its own
+# single-crate workspace so the `.workspace = true` inheritances above resolve
+# here, and the clippy/unsafe lint gate carried over from mcpower stays in one
+# place. Values copied verbatim from the mcpower workspace at carve time.
+[workspace]
+resolver = "2"
+# The `glmm` root package is the kernel plus — behind the default-on `formula`
+# feature — the R-style formula frontend that lowers a formula + data table into
+# the numeric inputs `fit_cold` consumes. `glmm-python` (Python wiring) is the only
+# crate that links `pyo3`; `publish = false` — it is a PyO3/maturin extension,
+# never `cargo publish`ed. `glmm-r` is its R-side twin (extendr wiring), re-exported
+# by `r/src/rust` (which stays OUT of this workspace — R drives that staticlib
+# build with its own resolver, mirroring mcpower's ports/r layout). `validation` is
+# the publish = false crate owning the oracle-harness examples; nesting it keeps
+# validation/ out of the packaged glmm crate.
+members = ["glmm-python", "glmm-r", "validation"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"      # floor set by the bobyqa dep (edition 2024, MSRV 1.85)
+license = "GPL-3.0-or-later"
+
+[workspace.lints.rust]
+# glmm is pure-Rust and uses no `unsafe`; this baseline matches the mcpower
+# engine crates (which harden further to forbid in lib.rs — glmm does not).
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+# priority -1 lets item-level #[allow]/#[expect] override; deny makes clippy::all
+# a correctness gate that fails a plain `cargo clippy` — the validation-numeric guard
+# this crate shipped with inside mcpower.
+all = { level = "deny", priority = -1 }
+
+# Match the mcpower release profile so glmm's OWN release/bench builds keep the
+# codegen (lto + single codegen-unit) that the bobyqa/pulp version-pin comments
+# tie the fitted-MLE low bits / goldens to. Ignored when glmm is consumed as a
+# dependency (the consumer's profile wins), so it does not affect the mcpower
+# build path — only standalone `cargo build --release` / benchmarks in this repo.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+debug = false
+
+# Optimize test builds: the suite is dominated by faer/BOBYQA/PIRLS numerics
+# that run 30-60x slower unoptimized (the sparse NB GLMM test alone is ~24 s
+# optimized, tens of minutes at opt-level 0). Debug assertions stay on. The
+# release-profile validation pins above are untouched — goldens are tolerance
+# checks, not bit-exact, under test profiles.
+[profile.test]
+opt-level = 3
+
+# Dependencies of test builds compile under profile.dev, not profile.test, so
+# faer/bobyqa need their own override to be optimized in `cargo test`.
+[profile.dev.package."*"]
+opt-level = 3

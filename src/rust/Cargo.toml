@@ -1,0 +1,30 @@
+[package]
+name = 'fastglmm'
+publish = false
+version = '0.3.1'
+edition = '2021'
+rust-version = '1.85'
+
+[lib]
+crate-type = [ 'rlib', 'staticlib' ]
+name = 'fastglmm'
+
+[[bin]]
+name = 'document'
+path = 'document.rs'
+
+[dependencies]
+extendr-api = '0.9.0'
+glmm-r      = { path = "local/glmm-r" }
+
+[workspace]
+resolver = "2"
+# Standalone: do NOT join the glmm workspace (avoids resolver clashes with the
+# staticlib build R drives). Path dep into the workspace still resolves.
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[patch.crates-io]
+glmm = { path = "local/glmm" }

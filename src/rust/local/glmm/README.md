@@ -1,0 +1,208 @@
+# glmm
+
+[![CI](https://github.com/pawlenartowicz/glmm/actions/workflows/ci.yml/badge.svg)](https://github.com/pawlenartowicz/glmm/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/glmm.svg)](https://crates.io/crates/glmm)
+[![PyPI](https://img.shields.io/pypi/v/glmm.svg)](https://pypi.org/project/glmm/)
+[![r-universe](https://pawlenartowicz.r-universe.dev/badges/fastglmm)](https://pawlenartowicz.r-universe.dev/fastglmm)
+[![docs.rs](https://img.shields.io/docsrs/glmm)](https://docs.rs/glmm)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)
+
+**Standalone f64 GLM(M) fit kernels — OLS → GLM → LMM → GLMM — in pure Rust on faer.**
+
+Fits fixed-effect and mixed (random-intercept/random-slope) models for
+Gaussian, Binomial (logit/probit/cloglog), Poisson, Gamma, Negative-Binomial,
+and (fixed-effect GLM only) Inverse-Gaussian outcomes, validated against
+R/lme4 and Julia/MixedModels.jl goldens.
+
+**Beta.** Handles the usual mixed models, supports AGQ more widely than lme4,
+and is typically several times faster on them. Some lme4 features are still
+missing (see [`docs`](documentation/)). Version 1.0 will add a built-in test
+for whether a random effect matters — currently you need the separate RLRsim
+package, and it only works for normal (Gaussian) outcomes.
+
+**New to the crate? Start with [`tutorial-rust.md`](documentation/tutorial-rust.md)** — a
+single-page, three-layer walkthrough (cold fit → warm fit → advanced loop)
+plus a short section on parsing an R-style formula string instead of building
+inputs by hand. Python and R packages are also available — see
+[Python and R](#python-and-r) below.
+
+## One crate, one `fit`
+
+A single entry point covers the whole linear-regression family. `fit` reads
+`ModelSpec` and routes on family × random effects × weights:
+
+```mermaid
+flowchart LR
+    F["fit(x, y, ModelSpec)"] --> RE{"re?"}
+    RE -- "None" --> FAM1{"family?"}
+    FAM1 -- "Gaussian" --> OLS["OLS - WLS with weights"]
+    FAM1 -- "other" --> GLM["GLM - IRLS"]
+    RE -- "Some" --> FAM2{"family?"}
+    FAM2 -- "Gaussian" --> LMM["LMM - profiled REML"]
+    FAM2 -- "other" --> GLMM["GLMM - PIRLS, Laplace/AGQ"]
+```
+
+This is the pitch view. Every branch point, solver path, and tuning knob is
+traced to code in the full algorithm map:
+[`documentation/algorithms.md`](documentation/algorithms.md), with the LMM
+and GLMM legs detailed in
+[`documentation/algorithms-lmm.md`](documentation/algorithms-lmm.md) and
+[`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md).
+
+## Documentation
+
+The fuller map — entry point, tutorials, examples, migration guides, reference,
+and internals, all in one tiered table — lives in
+[`documentation/index.md`](documentation/index.md). The table below is this
+README's own copy of the essentials, not the whole set.
+
+| File | Purpose |
+|---|---|
+| [`documentation/tutorial-rust.md`](documentation/tutorial-rust.md) | Three-layer Rust walkthrough: cold fit → warm fit → advanced loop, plus the formula frontend |
+| [`documentation/tutorial-python.md`](documentation/tutorial-python.md) | The Python package (`glmm`) walkthrough |
+| [`documentation/tutorial-r.md`](documentation/tutorial-r.md) | The R package (`fastglmm`) walkthrough |
+| [`documentation/supported_families.md`](documentation/supported_families.md) | Family × link support matrix, canonical-link notes, dispersion conventions |
+| [`documentation/algorithms.md`](documentation/algorithms.md) | Algorithm map entry point: full dispatch graph, knob index, OLS/GLM paths |
+| [`documentation/algorithms-lmm.md`](documentation/algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML, closed-form shortcut, BOBYQA, boundary handling |
+| [`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md) | GLMM: PIRLS, Laplace vs AGQ, dense vs sparse Z, NB outer loop, warm starts |
+| [`documentation/glmm-design.md`](documentation/glmm-design.md) | Algorithmic design rationale: the differences from lme4/MixedModels.jl and why each one is faster |
+| [`documentation/installation.md`](documentation/installation.md) | Installing the Rust crate, Python package, and R package |
+| [`documentation/formula.md`](documentation/formula.md) | What the formula parser accepts and rejects, with workarounds |
+| [`documentation/conventions.md`](documentation/conventions.md) | Estimation, standard-error, dispersion, and variance-component conventions, and the flags on a fit result |
+| [`documentation/validation.md`](documentation/validation.md) | How glmm is validated against lme4 and MixedModels.jl, what's covered, and known tolerances/exemptions |
+| [`documentation/coming-from-lme4.md`](documentation/coming-from-lme4.md) | Call mapping from lme4, what's deliberately missing, and behavioral differences to watch (covers both the R and Python surface) |
+| [`documentation/coming-from-statsmodels.md`](documentation/coming-from-statsmodels.md) | Migrating from `statsmodels` `MixedLM`/`GLM` to `glmm.fit` (Python only) |
+| [`documentation/troubleshooting.md`](documentation/troubleshooting.md) | Fixes for singular fits, non-convergence, NotImplementedError, and rejected formulas |
+
+## Scope and stability (0.3.x)
+
+The semver-covered surface is `fit_cold`/`fit_warm` + `ModelSpec` + `GroupIds`.
+
+| Model                      | Fixed-only (`re: None`) | Mixed (`re: Some`)                                          |
+|-----------------------------|--------------------------|---------------------------------------------------------------|
+| Gaussian                    | OLS                      | LMM — dense, or sparse-Z when an extra grouping carries a random slope |
+| Binomial (logit/probit/cloglog) | GLM                  | GLMM — dense, or sparse-Z over-envelope                          |
+| Poisson (log)                | GLM                      | GLMM — dense, or sparse-Z over-envelope                          |
+| Gamma (log/inverse)          | GLM                      | GLMM — dense, or sparse-Z over-envelope                          |
+| Negative-Binomial (log)      | GLM                      | GLMM — dense, or sparse-Z over-envelope                          |
+| Inverse-Gaussian (log / 1/μ²) | GLM                     | not supported (faults)                                          |
+
+Every wired family, except Inverse-Gaussian (fixed-effects only), fits
+through both routes — there is no reachable panic for falling outside the
+dense solver's envelope (too many extra groupings, or an extra grouping too
+wide); classification just routes to the sparse-Z solver instead. See [`tutorial-rust.md`](documentation/tutorial-rust.md) and
+[`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md) for the
+dense/sparse routing envelope.
+
+The `loop_advanced` cargo feature (off by default) exposes an unstable
+scratch-explicit hot-path surface for warm-start callers like MCPower's
+simulation loop — **no semver guarantees; do not depend on it outside a
+pinned revision.**
+
+The `orchestrate` cargo feature (off by default) exposes the string-typed fit
+orchestration the Python and R packages are built on — one definition of the
+family/link string vocabulary, the formula-and-data lowering, and the
+flattened result both ports publish. **No semver guarantees**, for the same
+reason as `loop_advanced`: its shape follows the ports' needs.
+
+The `parallel` cargo feature (off by default, **experimental**) enables
+in-fit parallelism — the AGQ cluster loop and the FD-Hessian SE grid — via
+rayon, and is additionally gated at runtime by `FitOptions::parallel_inner`
+(also off by default): both the feature *and* the flag must be on for any
+thread to spawn. Parallel results are bit-identical to serial ones, but the
+kernels are new and their performance envelope isn't characterized yet —
+treat as opt-in only. A no-op on wasm32 (compile-time excluded, rayon never
+pulled in).
+
+## Quick example
+
+```rust
+use glmm::{fit_cold, Family, FitOptions, GroupIds, ModelSpec, ReStructure, Sizing};
+
+// y ~ x + (1 | group), Gaussian — a random-intercept LMM.
+let model = ModelSpec {
+    family: Family::Gaussian,
+    re: Some(ReStructure {
+        sizing: Sizing::FixedClusters { n_clusters: 6 },
+        slopes: vec![],
+        extra_groupings: vec![],
+    }),
+};
+let ids = GroupIds { primary: vec![0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5], extra: vec![] };
+// target_indices = which coefficients get a standard error; here, both.
+let opts = FitOptions { target_indices: vec![0, 1], ..Default::default() };
+
+let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+assert!(fit.converged());
+```
+
+See [`tutorial-rust.md`](documentation/tutorial-rust.md) for the full walkthrough: warm
+starts, the advanced hot-loop surface, and building `x`/`ModelSpec`/`GroupIds`
+from a formula string with `glmm::formula` (the `formula` feature, on by default)
+instead of by hand.
+
+## Python and R
+
+The same kernel ships as a Python package and an R package. Both take a data
+table and an R-style formula — no design matrices by hand.
+
+**Python** (`glmm` on PyPI; Python 3.10+, NumPy is the only dependency):
+
+```bash
+pip install glmm
+```
+
+```python
+import glmm
+
+fit = glmm.fit(data, "y ~ x1 + (1 | group)")   # data: dict / pandas / polars
+fit.summary()
+```
+
+The public surface is eight names: `glmm.fit`, `glmm.Fit`, and the six warning
+categories the diagnostics channel raises. See the
+[Python README](python/README.md) and
+[`tutorial-python.md`](documentation/tutorial-python.md).
+
+**R** (`fastglmm`, via r-universe):
+
+```r
+install.packages("fastglmm", repos = c("https://pawlenartowicz.r-universe.dev", getOption("repos")))
+```
+
+```r
+library(fastglmm)
+
+fit <- fastglmm(y ~ x1 + (1 | group), data)
+summary(fit)   # plus fixef, ranef, fitted, vcov, VarCorr, confint, logLik, isSingular
+```
+
+Deliberately scoped to fast fitting — anything the engine cannot compute
+honestly (`predict`, `residuals`) errors with the reason instead of guessing.
+See the [R README](r/README.md) and
+[`tutorial-r.md`](documentation/tutorial-r.md).
+
+## Design
+
+| Property       | Detail                                                              |
+|----------------|--------------------------------------------------------------------|
+| No `unsafe`    | zero `unsafe` (workspace baseline `unsafe_code = "warn"`)           |
+| Deterministic  | no RNG, no global state, no I/O in the fit path                     |
+| Linear algebra | [`faer`](https://crates.io/crates/faer) 0.24, pinned               |
+| MSRV           | Rust 1.85 (floor set by the `bobyqa` dep)                          |
+
+## Origin
+
+`glmm` was carved out of [MCPower](https://github.com/pawlenartowicz/)'s
+simulation engine — the numerics here are the same validation-pinned kernels that
+power MCPower's Monte Carlo fits, split out so they're usable standalone. The
+`loop_advanced` feature above exists specifically to serve MCPower's
+warm-start hot loop as a consumer of this crate.
+
+## License
+
+`GPL-3.0-or-later` (coupled to the GPL-3 MCPower flagship).
+
+---
+**Paweł Lenartowicz** — [Freestyler Scientist](https://freestylerscientist.pl) · [GitHub](https://github.com/pawlenartowicz/) · [ORCID](https://orcid.org/0000-0002-6906-7217)

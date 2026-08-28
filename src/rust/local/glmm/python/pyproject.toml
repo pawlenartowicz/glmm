@@ -1,0 +1,56 @@
+[build-system]
+# Floor is 1.9, not 1.7: `license = "GPL-3.0-or-later"` below is a PEP 639 SPDX
+# expression, which older maturin emits as an invalid `License:` field.
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "glmm"
+# Lockstep with the crate: must equal GLMM/Cargo.toml [package] version.
+version = "0.3.1"
+description = "Linear-regression family OLS / GLM / LMM / GLMM — Python port of the glmm crate"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+authors = [{ name = "Paweł Lenartowicz" }]
+keywords = ["statistics", "glmm", "regression", "mixed-models", "mle"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.urls]
+Homepage = "https://github.com/pawlenartowicz/glmm"
+Repository = "https://github.com/pawlenartowicz/glmm"
+Changelog = "https://github.com/pawlenartowicz/glmm/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.maturin]
+manifest-path = "../glmm-python/Cargo.toml"
+module-name = "glmm._native"
+python-source = "."
+features = ["pyo3/extension-module"]
+# maturin ships only the primary `glmm` package; the faststats alias reaches the
+# wheel only through this include. It MUST be the plain-string form (both sdist and
+# wheel), never `{ format = "wheel" }`: the release builds the wheel *from the sdist*
+# (build_sdist job), and maturin re-roots python-source to the sdist root while
+# leaving working-tree dirs under `python/`. Wheel-only scoping omits faststats from
+# the sdist, so the sdist→wheel build can't find it and `import faststats.glmm`
+# fails. The string form also archives faststats at the sdist root, where this same
+# glob matches on the rebuild. Change together with test_packaging.py.
+include = ["faststats/**/*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.format]
+# ruff ≥0.16 formats Python code blocks inside markdown; the README's aligned
+# dict literals are deliberate, so keep .md out of the formatter.
+exclude = ["*.md"]
