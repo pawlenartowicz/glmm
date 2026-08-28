@@ -3658,7 +3658,7 @@ fn build_glmm_case(
                 let jit = 1.0 + 0.4 * super::test_lcg(&mut st);
                 (eta.exp() * jit).round().max(0.0)
             }
-            Family::Gamma { .. } => {
+            Family::Gamma { .. } | Family::InverseGaussian { .. } => {
                 let jit = 1.0 + 0.3 * super::test_lcg(&mut st);
                 (eta.exp() * jit).max(0.05)
             }
@@ -5562,7 +5562,7 @@ fn sparse_lmm_constant_weights_invariant() {
         // the optimizer delivers in θ̂ rather than to machine precision. Same
         // argument as the dense twin `fit_lmm_constant_weights_invariant`
         // (`fit/lmm_tests.rs`) and `balanced_collapse_weighted_fit_invariant`
-        // (`lmm.rs`). A scratch-tree RHO_END sweep
+        // (`src/lmm/tests.rs`). A scratch-tree RHO_END sweep
         // over this fixture (five sweep points spanning four decades, three
         // equivalent constant weights w ∈ {2, 4, 8} per sweep point so the trend is
         // visible through the per-search scatter) has the gap tracking

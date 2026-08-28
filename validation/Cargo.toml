@@ -3,7 +3,7 @@ name = "validation"
 # Lockstep with the crate: must equal GLMM/Cargo.toml [package] version.
 # glmm.rs stamps CARGO_PKG_VERSION into each result JSON's engine_version, and
 # after the move that macro reads THIS manifest, not glmm's.
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -68,3 +68,12 @@ path = "memory/memory_fit.rs"
 [[example]]
 name = "agq_par_probe"
 path = "campaigns/speed-grid/agq_par_probe.rs"
+
+# Machine-local bit-identity baseline for refactors that must not change any
+# fitted number: fits all 48 manifest rungs and writes bit_identity/<config>.json
+# (rung, deviance, theta, beta, se_hessian, se_rx, n_eval, converged, singular).
+# Shares common.rs with the other examples above. See bit_identity/dump.rs's
+# header for the four config commands.
+[[example]]
+name = "bit_identity"
+path = "bit_identity/dump.rs"

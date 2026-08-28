@@ -6,6 +6,123 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [Unreleased]
+
+## [0.3.1] — 2026-08-27
+
+### Added
+
+- Formula terms `log(x)`, `sqrt(x)`, `exp(x)` and `I(x^k)` (`k` an integer
+  ≥ 2), each on a single bare column, in both the fixed-effect and offset
+  positions. The spelling is used verbatim as the design column name, and the
+  values are computed with the same libm calls R makes (`x^2` as `x*x`,
+  matching R's `R_POW` special case; every other power through `powf`), so
+  they agree with R's `model.matrix` to the contrasts oracle's tolerance. A
+  non-finite result (e.g. `log(x)` on a non-positive `x`) is now
+  `Error::TransformNotFinite`, naming the term and the first bad row, rather
+  than silently propagating into the fit. `poly()`, arithmetic inside a call
+  (`log(x+1)`), and a transform on a formula's LHS are still formula syntax
+  errors.
+- `cbind(successes, failures)` as a binomial response. Lowers onto the same
+  proportion-plus-prior-weights objective `weights=` already fits (lme4's own
+  `cbind()` convention), sharing its argmin with the expanded-Bernoulli form.
+  A non-binomial family is `Error::CbindNeedsBinomial`; a row whose trial
+  count `successes + failures` is not a positive finite number is
+  `Error::ZeroTrials`; a negative success or failure count is
+  `Error::NegativeCount`. `weights=` given together with a `cbind()` response,
+  or `offset=` given together with an `offset()` term, is now a clean error
+  naming both sources (`orchestrate::run_fit`) instead of one silently
+  overwriting the other.
+- `offset(...)` as a formula term — a bare column name or one of the
+  whitelisted transforms above, e.g. `offset(log(exposure))` — lowering onto
+  the existing `FitOptions::offset` field. At most one `offset()` term is
+  allowed per formula.
+- Fixed-intercept removal, `- 1` and `0 +`. `ParsedFormula::has_intercept` is
+  `false` when either is present; random-effect intercepts are unaffected.
+  Follows R's contrast promotion: in an intercept-free design the first
+  factor main effect in term order gets the full indicator set (all levels,
+  no base dropped) while later factors and every interaction keep treatment
+  contrasts, matching `model.matrix(y ~ x + f - 1)`. A formula with `- 1`/
+  `0 +` and no fixed-effect term (empty design) is now `Error::EmptyDesign`.
+  An intercept-free random-effect term (`(0+x|g)`, `(-1+x|g)`) is still a
+  formula syntax error, as is `(x || g)`, `poly()`, and the `.` formula
+  shorthand.
+- Python `Fit.summary_object()` returns an lme4-shaped `Summary` (in the new
+  `python/glmm/summary.py`) with `.text()`, `.html()`, `.latex()` and
+  `.typst()` renderers sharing one number formatter, so the same fit reports
+  the same numbers in every output. `Fit.summary()` is unchanged: it still
+  prints and returns the coefficient-table `str`, now built by calling
+  `summary_object().text()`. `Fit.residuals(type="response"|"pearson")` is
+  new; deviance and working residuals are not offered because they need
+  per-family formulas the package does not carry, and a picked default would
+  silently disagree with lme4's `residuals(type=)`. `Fit` also carries the
+  header inputs the summary needs: `formula`, `family`, `link` (resolved,
+  after the family default), `nagq` (as actually run, 1 after a
+  warn-and-strip), `nobs`, `y` (the response as the kernel fitted it — a
+  `cbind(s, f)` response comes back as `s/(s+f)`) and `weights` (the prior
+  weights the kernel fitted with, `None` when unweighted; for a `cbind()`
+  response these are the trial counts the lowering computed).
+- R `tidy()` and `glance()` (registered on `generics::tidy`/`generics::glance`,
+  a new `Imports: generics` — not `broom`, which drags 21 further recursive
+  dependencies for functions nothing here calls). `residuals.fastglmm()` is
+  no longer a hard error: `type = "response"` or `"pearson"` now returns the
+  residuals directly. `summary.fastglmm`/`print.summary.fastglmm` gained the
+  blocks lme4 prints and this port didn't: the data name, the REML criterion
+  (LMM) or the `AIC BIC logLik deviance df.resid` row (ML fit — `glance()`
+  returns both AIC and BIC regardless), scaled (Pearson) residual quantiles,
+  the correlation of fixed effects, and the Wald-z footnote. `VarCorr`'s
+  printer takes a `variance` argument adding a `Variance` column ahead of
+  `Std.Dev.`, on by default inside `summary.fastglmm` (lme4's
+  `print.summary.merMod` shape) and off in the bare `print.fastglmm` header
+  (lme4's `print.merMod` shape). `inversegaussian` is now in `sigma()`'s and
+  the summary dispersion label's family lists alongside `gamma`.
+- (Internal) `orchestrate::FitResult` gained `y`, `weights` and `nobs`, backing
+  the Python and R residuals/summary work above; both FFI shims flatten them
+  unchanged.
+- Binomial complementary log-log link (`BinomialLink::Cloglog`), fixed-effect
+  GLM and GLMM. Non-canonical: general Fisher-scoring branch, with an upper η
+  clamp at `ln(ETA_MAX)` the other two binomial links do not need. Validated
+  against R `binomial(link="cloglog")` and `lme4::glmer` (validation goldens
+  `sim_cloglog_glm`, `sim_cloglog_glmm`). Reachable from the Python port as
+  `link="cloglog"` and from `fastglmm` as `binomial(link = "cloglog")`.
+- Inverse-Gaussian family (`Family::InverseGaussian`), fixed-effect GLM only,
+  with the `1/μ²` and log links. `V(μ)=μ³`; dispersion is the post-fit Pearson
+  moment estimator scaling the SE by `√φ̂`, and the log-likelihood follows R's
+  `inverse.gaussian()$aic` convention with the dispersion profiled inside the
+  term. Mixed models are **not** supported and fault with a message naming the
+  deferral. Validated against R `glm(family=inverse.gaussian(link))`
+  (validation goldens `sim_igauss_glm`, `sim_igauss_inv_sq_glm`). Reachable as
+  `family="inversegaussian"` (Python) / `inverse.gaussian()` (R).
+
+### Changed
+
+- (Internal, no fitted number moves) The Brent scalar-kernel fitter
+  (`src/lme.rs`, 3127 lines) is retired: nothing in the stable `fit` dispatch
+  used it since the unified fit core, and it stayed only as a `loop_advanced`
+  re-export for MCPower, which is pinned to 0.3.0 until 1.0.0. Its
+  `joint_wald_chi_sq` helper moved to `src/lmm/mod.rs`, its only remaining
+  caller family; the two tests that pinned the scalar kernel's deviance
+  against the general path now assert against a recorded literal instead.
+  `src/lmm.rs` (5411 lines) split into `src/lmm/{mod.rs, kernel.rs, tests.rs}`
+  and `src/glmm/pirls.rs` (1840 lines) split into
+  `src/glmm/pirls/{mod.rs, dense.rs, blocked.rs, blocked_extras.rs}`, both
+  pure moves. A bit-identity dump (`validation/bit_identity/`, one JSON per
+  feature configuration) now fits every manifest rung plus a set of in-crate
+  fixtures and records deviance/theta/beta/SEs/eval counts at full `f64`
+  precision, to make a future refactor's byte-identity easy to check in one
+  diff.
+
+### Fixed
+
+- Pearson residuals and the summary's scaled residuals for a `cbind(s, f)`
+  response were computed at unit weights in both ports, dropping the
+  `√trials` factor. The weights the kernel fitted with now come back as
+  `Fit.weights` (Python) / `fit$weights` (R): the `cbind()` trial counts, or
+  the caller's `weights=`, `None`/`NULL` when unweighted.
+- `cbind()` with a negative success or failure count is now an error
+  (`Error::NegativeCount`) instead of lowering to a proportion outside
+  `[0, 1]` and fitting it.
+
 ## [0.3.0] — 2026-08-24
 
 The θ search no longer depends on the units a random-slope covariate happens to

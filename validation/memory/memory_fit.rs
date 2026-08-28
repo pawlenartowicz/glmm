@@ -74,7 +74,7 @@ fn main() {
     // converges (models.json's header) -- the wide-q rows (e.g. row 9) can
     // otherwise take intolerably long to fit for no change in the number this
     // harness reads. LMM_MAX_FUN_FORMULA is an existing dev-only env hook
-    // (src/lmm.rs, shared by every BOBYQA config site incl. the GLMM joint/
+    // (src/lmm/mod.rs, shared by every BOBYQA config site incl. the GLMM joint/
     // stage-1 solvers in src/glmm/workspace.rs) -- memory.sh may set it before
     // invoking this binary to cap the optimizer's eval budget; it changes
     // nothing about the workspace allocation being measured.

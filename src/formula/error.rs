@@ -85,6 +85,34 @@ pub enum Error {
     /// [`super::label_ranef`] was handed a `Fit` and a `re_groups` that do not
     /// describe the same model. The payload says which count disagreed.
     RanefShapeMismatch(String),
+    /// The formula removes the intercept and names no fixed-effect term, so the
+    /// design would have zero columns.
+    EmptyDesign,
+    /// A transform term evaluated to a non-finite value (e.g. `log(x)` on a
+    /// non-positive `x`). R would silently drop the row via `na.omit`; here it
+    /// is an error naming the row.
+    TransformNotFinite {
+        /// The term as spelled, e.g. `log(x)`.
+        term: String,
+        /// 0-based row of the first non-finite value.
+        row: usize,
+    },
+    /// A `cbind(successes, failures)` response with a non-binomial family.
+    CbindNeedsBinomial,
+    /// A `cbind()` row whose trial count `successes + failures` is not a
+    /// positive finite number — the kernel's prior weights must be `> 0`.
+    ZeroTrials {
+        /// 0-based row.
+        row: usize,
+    },
+    /// A `cbind()` row with a negative success or failure count. Only the sum
+    /// is checked by [`Error::ZeroTrials`]; a negative numerator would pass it
+    /// and lower to a proportion outside `[0, 1]`, which the binomial deviance
+    /// accepts without complaint (R's `glm` stops with "negative counts").
+    NegativeCount {
+        /// 0-based row.
+        row: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -105,6 +133,24 @@ impl fmt::Display for Error {
             Error::RanefShapeMismatch(detail) => write!(
                 f,
                 "the fit and the lowered random effects do not describe the same model: {detail}"
+            ),
+            Error::EmptyDesign => write!(
+                f,
+                "the fixed design has no columns: '- 1' / '0 +' with no fixed-effect term"
+            ),
+            Error::TransformNotFinite { term, row } => {
+                write!(f, "term '{term}' is not finite at row {row}")
+            }
+            Error::CbindNeedsBinomial => {
+                write!(f, "cbind(successes, failures) needs family = binomial")
+            }
+            Error::ZeroTrials { row } => write!(
+                f,
+                "cbind(): successes + failures must be positive and finite at every row; row {row} is not"
+            ),
+            Error::NegativeCount { row } => write!(
+                f,
+                "cbind(): successes and failures must be non-negative at every row; row {row} is not"
             ),
         }
     }

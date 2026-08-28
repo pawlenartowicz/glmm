@@ -19,7 +19,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use super::error::Error;
-use super::parse::{parse, ParsedFormula, RandomEffect};
+use super::parse::{parse, parse_transform, ParsedFormula, RandomEffect, Transform};
 use crate::{
     ColumnId, Family, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure,
     Sizing,
@@ -100,16 +100,17 @@ pub struct ReGroupInfo {
 
 /// The lowered fit inputs — a one-shot front door to `crate::fit_cold`.
 pub struct Lowered {
-    /// Row-major n×p design (intercept column first).
+    /// Row-major n×p design (intercept column first when the formula has one).
     pub x: Vec<f64>,
-    /// Response column, passed through as-is.
+    /// The response column, or `s/(s+f)` for a `cbind` response.
     pub y: Vec<f64>,
     /// Row count.
     pub n: usize,
     /// Design width (emitted column count).
     pub p: usize,
-    /// Coefficient name per design column, in column order (`"(Intercept)"` first).
-    /// The R-matching handle the end-to-end/contrast oracles assert against.
+    /// Coefficient name per design column, in column order (`"(Intercept)"`
+    /// first when the formula has one). The R-matching handle the
+    /// end-to-end/contrast oracles assert against.
     pub col_names: Vec<String>,
     /// Structure-only model spec (counts are placeholders; the kernel re-derives
     /// real level counts from `ids`).
@@ -127,7 +128,8 @@ pub struct Lowered {
     /// here rather than on `Fit` because it is decided before any fit runs; the
     /// ports fold it into the same warning channel as `Fit`'s own notes.
     pub notes: Vec<crate::Note>,
-    /// `target_indices = 0..p`; other knobs defaulted. Caller may override.
+    /// `target_indices = 0..p`; `offset` set from an `offset()` formula term
+    /// when present, else `None`; other knobs defaulted. Caller may override.
     pub opts: FitOptions,
 }
 
@@ -143,8 +145,10 @@ pub struct Lowered {
 /// Returns [`Error::Parse`] for a malformed formula (see [`super::ParseError`]), or
 /// one of the data-dependent variants ([`Error::UnknownColumn`],
 /// [`Error::ResponseNotNumeric`], [`Error::WrongColumnKind`],
-/// [`Error::SlopeVarNotInDesign`]) when `data` doesn't match what the formula
-/// requires.
+/// [`Error::SlopeVarNotInDesign`], [`Error::EmptyDesign`],
+/// [`Error::TransformNotFinite`], [`Error::CbindNeedsBinomial`],
+/// [`Error::ZeroTrials`], [`Error::NegativeCount`]) when `data` doesn't match
+/// what the formula requires.
 ///
 /// # Examples
 /// ```
@@ -173,23 +177,57 @@ pub fn lower(formula: &str, data: &Table, family: Family) -> Result<Lowered, Err
 ///
 /// # Errors
 /// Returns the same data-dependent error variants as [`lower`]: [`Error::UnknownColumn`],
-/// [`Error::ResponseNotNumeric`], [`Error::WrongColumnKind`], and
-/// [`Error::SlopeVarNotInDesign`].
+/// [`Error::ResponseNotNumeric`], [`Error::WrongColumnKind`],
+/// [`Error::SlopeVarNotInDesign`], [`Error::EmptyDesign`],
+/// [`Error::TransformNotFinite`], [`Error::CbindNeedsBinomial`],
+/// [`Error::ZeroTrials`], and [`Error::NegativeCount`].
 pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<Lowered, Error> {
     let n = data.n;
 
-    // 1. Response — single numeric column, passed through unchanged.
-    let y = match data.get(&ast.dependent) {
-        Some(Column::Numeric(v)) => v.clone(),
-        Some(Column::Factor { .. }) => {
-            return Err(Error::ResponseNotNumeric(ast.dependent.clone()))
+    // 1. Response. `cbind(s, f)` lowers to lme4's own objective: proportion
+    // as `y`, trial count as prior weights — the path the frozen cbpp golden
+    // already validates.
+    let mut weights = None;
+    let y = match &ast.cbind {
+        Some((s, f)) => {
+            if !matches!(family, Family::Binomial { .. }) {
+                return Err(Error::CbindNeedsBinomial);
+            }
+            let s = numeric_column(s, data)?;
+            let f = numeric_column(f, data)?;
+            if let Some(row) = s.iter().zip(&f).position(|(a, b)| *a < 0.0 || *b < 0.0) {
+                return Err(Error::NegativeCount { row });
+            }
+            let trials: Vec<f64> = s.iter().zip(&f).map(|(a, b)| a + b).collect();
+            if let Some(row) = trials.iter().position(|t| !(t.is_finite() && *t > 0.0)) {
+                return Err(Error::ZeroTrials { row });
+            }
+            let y = s.iter().zip(&trials).map(|(a, t)| a / t).collect();
+            weights = Some(trials);
+            y
         }
-        None => return Err(Error::UnknownColumn(ast.dependent.clone())),
+        None => match data.get(&ast.dependent) {
+            Some(Column::Numeric(v)) => v.clone(),
+            Some(Column::Factor { .. }) => {
+                return Err(Error::ResponseNotNumeric(ast.dependent.clone()))
+            }
+            None => return Err(Error::UnknownColumn(ast.dependent.clone())),
+        },
     };
 
-    // 2. Fixed design — intercept first, then each term's expanded columns.
-    let mut col_names: Vec<String> = vec!["(Intercept)".to_string()];
-    let mut cols: Vec<Vec<f64>> = vec![vec![1.0; n]];
+    // 2. Fixed design — intercept first (when the formula has one), then each
+    // term's expanded columns.
+    let mut col_names: Vec<String> = Vec::new();
+    let mut cols: Vec<Vec<f64>> = Vec::new();
+    if ast.has_intercept {
+        col_names.push("(Intercept)".to_string());
+        cols.push(vec![1.0; n]);
+    }
+    // R's contrast promotion: without an intercept the FIRST factor main
+    // effect (in term order, numeric terms before it do not count) is coded
+    // with all its levels; every later factor keeps treatment contrasts.
+    // Mirrors `model.matrix(y ~ x + f - 1)` → `x, fa, fb, fc`.
+    let mut promote_next_factor = !ast.has_intercept;
     // name → ColumnId for numeric main effects — the resolution map for
     // numeric random-slope variables.
     let mut numeric_main_col: HashMap<String, ColumnId> = HashMap::new();
@@ -203,23 +241,44 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
         use super::parse::Term;
         match term {
             Term::Main { name } => match data.get(name) {
-                Some(Column::Numeric(v)) => {
-                    numeric_main_col.insert(name.clone(), cols.len() as ColumnId);
-                    col_names.push(name.clone());
-                    cols.push(v.clone());
-                }
                 Some(Column::Factor { levels, codes }) => {
+                    let promoted = promote_next_factor;
                     let mut dummies = Vec::new();
-                    for (suffix, col) in factor_dummies(name, levels, codes) {
+                    for (suffix, col) in factor_dummies(name, levels, codes, promoted) {
                         dummies.push((suffix.clone(), cols.len() as ColumnId));
                         col_names.push(suffix);
                         cols.push(col);
                     }
-                    factor_main_cols.insert(name.clone(), dummies);
+                    promote_next_factor = false;
+                    // The promotion (`keep_base`) is a FIXED-DESIGN coding
+                    // convention only: R's contrast promotion recodes the
+                    // bare factor term to a full indicator set on the fixed
+                    // side, but a random slope on the same factor still
+                    // mirrors lme4's own `model.matrix(~f)` for the term —
+                    // intercept + treatment dummies — regardless of what the
+                    // fixed side did. So the RE-slope resolution map
+                    // (`factor_main_cols`) keeps only the non-base dummies
+                    // here (skip the promoted base level); the fixed design
+                    // above still emitted all of them.
+                    let re_dummies = if promoted {
+                        dummies[1..].to_vec()
+                    } else {
+                        dummies
+                    };
+                    factor_main_cols.insert(name.clone(), re_dummies);
                 }
-                None => return Err(Error::UnknownColumn(name.clone())),
+                _ => {
+                    let col = numeric_column(name, data)?;
+                    numeric_main_col.insert(name.clone(), cols.len() as ColumnId);
+                    col_names.push(name.clone());
+                    cols.push(col);
+                }
             },
             Term::Interaction { vars } => {
+                // Interaction columns keep treatment coding even in an
+                // intercept-free design — R never promotes an interaction's
+                // contrasts, only a bare factor main effect (checked by the
+                // `f*g - 1` oracle fixture).
                 for (name, col) in interaction_columns(vars, data)? {
                     col_names.push(name);
                     cols.push(col);
@@ -228,6 +287,9 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
         }
     }
 
+    if cols.is_empty() {
+        return Err(Error::EmptyDesign);
+    }
     let p = cols.len();
     // Flatten column-major buffers to the row-major layout fit_cold expects
     // (element (i,j) at x[i*p + j]).
@@ -250,8 +312,17 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
         &factor_main_cols,
     )?;
 
+    // `weights`/`offset` are set here ONLY when the formula itself carries
+    // them (`cbind()` response, `offset()` term). `orchestrate::run_fit` is
+    // the double-specification check site for both — change together.
+    let offset = match &ast.offset {
+        Some(expr) => Some(numeric_column(expr, data)?),
+        None => None,
+    };
     let opts = FitOptions {
         target_indices: (0..p as u32).collect(),
+        offset,
+        weights,
         ..FitOptions::default()
     };
 
@@ -290,12 +361,20 @@ fn sorted_levels_and_codes(labels: &[String]) -> (Vec<String>, Vec<u32>) {
 }
 
 /// Treatment-coded dummy columns for a factor (base = level 0, `levels-1`
-/// columns). Names follow the module-header treatment-contrasts convention.
-fn factor_dummies(var: &str, levels: &[String], codes: &[u32]) -> Vec<(String, Vec<f64>)> {
+/// columns), or with `keep_base` the full indicator set (`levels` columns,
+/// base included) — R's contrast promotion for the first factor main effect
+/// of an intercept-free design. Names follow the module-header
+/// treatment-contrasts convention.
+fn factor_dummies(
+    var: &str,
+    levels: &[String],
+    codes: &[u32],
+    keep_base: bool,
+) -> Vec<(String, Vec<f64>)> {
     levels
         .iter()
         .enumerate()
-        .skip(1) // drop the base level
+        .skip(if keep_base { 0 } else { 1 })
         .map(|(li, lvl)| {
             let col: Vec<f64> = codes
                 .iter()
@@ -306,13 +385,64 @@ fn factor_dummies(var: &str, levels: &[String], codes: &[u32]) -> Vec<(String, V
         .collect()
 }
 
-/// Expand one variable to its design columns: a numeric → one column named after
-/// the variable; a factor → its treatment dummies.
+/// A numeric design column by spelling: a bare column, or a whitelisted
+/// transform of one (`parse_transform`). A bare name that IS a column wins
+/// over a transform reading, so a caller who already computed `log(x)` into a
+/// column of that name gets it verbatim.
+///
+/// Evaluation mirrors R's arithmetic on the same libm so `tests/contrasts_oracle.rs`
+/// can compare within `|a-b| < 1e-12`: `log`/`sqrt`/`exp` are the libm calls R
+/// makes; `x^2` is `x*x` in R (`R_POW` special-cases 2) and every other integer
+/// power goes through libm `pow`, hence `powf`, not `powi`.
+fn numeric_column(name: &str, data: &Table) -> Result<Vec<f64>, Error> {
+    match data.get(name) {
+        Some(Column::Numeric(v)) => return Ok(v.clone()),
+        Some(Column::Factor { .. }) => {
+            return Err(Error::WrongColumnKind {
+                name: name.to_string(),
+                expected: "numeric",
+            })
+        }
+        None => {}
+    }
+    let Some((t, col)) = parse_transform(name) else {
+        return Err(Error::UnknownColumn(name.to_string()));
+    };
+    let v = match data.get(col) {
+        Some(Column::Numeric(v)) => v,
+        Some(Column::Factor { .. }) => {
+            return Err(Error::WrongColumnKind {
+                name: col.to_string(),
+                expected: "numeric",
+            })
+        }
+        None => return Err(Error::UnknownColumn(col.to_string())),
+    };
+    let out: Vec<f64> = v
+        .iter()
+        .map(|&x| match t {
+            Transform::Log => x.ln(),
+            Transform::Sqrt => x.sqrt(),
+            Transform::Exp => x.exp(),
+            Transform::Pow(2) => x * x,
+            Transform::Pow(k) => x.powf(f64::from(k)),
+        })
+        .collect();
+    if let Some(i) = out.iter().position(|x| !x.is_finite()) {
+        return Err(Error::TransformNotFinite {
+            term: name.to_string(),
+            row: i,
+        });
+    }
+    Ok(out)
+}
+
+/// Expand one variable to its design columns: a numeric (or transform) → one
+/// column named after the variable; a factor → its treatment dummies.
 fn expand_var(name: &str, data: &Table) -> Result<Vec<(String, Vec<f64>)>, Error> {
     match data.get(name) {
-        Some(Column::Numeric(v)) => Ok(vec![(name.to_string(), v.clone())]),
-        Some(Column::Factor { levels, codes }) => Ok(factor_dummies(name, levels, codes)),
-        None => Err(Error::UnknownColumn(name.to_string())),
+        Some(Column::Factor { levels, codes }) => Ok(factor_dummies(name, levels, codes, false)),
+        _ => Ok(vec![(name.to_string(), numeric_column(name, data)?)]),
     }
 }
 
@@ -365,7 +495,7 @@ fn grouping_row_labels(name: &str, data: &Table) -> Result<Vec<String>, Error> {
 /// BLOCKS in the same order the parent's own ids use — parent id `p`'s children
 /// occupy `[p·W, p·W + k_p)` where `k_p` is that parent's distinct child count
 /// and `W = max_p k_p` (the true max — every block gets the same width, since
-/// the kernel's `NestedWithin` sizing is a fixed-width rectangle: `src/lmm.rs`'s
+/// the kernel's `NestedWithin` sizing is a fixed-width rectangle: `src/lmm/kernel.rs`'s
 /// `add_rows_multi` computes a child's RE column as
 /// `extra_offsets[e] + id·extra_q[e]`, which only lands in the right parent's
 /// block under this padded-block layout — a fresh global lexicographic sort of

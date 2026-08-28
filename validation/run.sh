@@ -210,6 +210,7 @@ if [[ "$PREP" == 1 ]]; then
   Rscript "$ROOT/prep/gen_illcond_data.R"
   Rscript "$ROOT/prep/gen_scale_data.R"
   Rscript "$ROOT/prep/gen_probit_large_data.R"
+  Rscript "$ROOT/prep/gen_igauss_data.R"
 fi
 
 for e in "${ENGINES[@]}"; do

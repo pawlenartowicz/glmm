@@ -22,21 +22,22 @@ fastglmm(
 }
 \arguments{
 \item{formula}{an lme4-style model formula (or a string), e.g.
-\code{y ~ t + d + t:d + (1 + t | g)}. Bare column names only - see Details.}
+\code{y ~ t + d + t:d + (1 + t | g)}. See Details for what the shared parser
+accepts beyond bare column names.}
 
 \item{data}{a \code{data.frame} (or something coercible) holding every column
 the formula names.}
 
 \item{family}{a family object, family function, or string: one of
-\code{gaussian}, \code{binomial} (logit/probit), \code{poisson} (log), \code{Gamma}
-(log/inverse), \code{"negativebinomial"} (log; the shape \code{theta} is
-estimated). \code{inverse.gaussian} and \code{binomial("cloglog")} are approved for
-GLMM 0.1.1 and error until the kernel implements them.}
+\code{gaussian}, \code{binomial} (logit/probit/cloglog), \code{poisson} (log), \code{Gamma}
+(log/inverse), \code{inverse.gaussian} (log/\code{1/mu^2}), \code{"negativebinomial"}
+(log; the shape \code{theta} is estimated).}
 
 \item{weights}{optional per-row prior (case) weights - \code{lme4::glmer}'s
 \verb{weights=}. For an aggregated binomial, pass the success \strong{proportion}
-as the response and the trial count here (the same model as
-\code{cbind(successes, failures)}, whose syntax the parser does not accept).}
+as the response and the trial count here, or equivalently write
+\code{cbind(successes, failures)} as the formula's left-hand side; combining
+both is an error.}
 
 \item{subset}{optional row filter, evaluated in \code{data} like \code{lm}'s
 \verb{subset=}. Applied before fitting - row filtering, not parsing.}
@@ -52,8 +53,8 @@ with no coefficient estimated for it. The usual use is a Poisson rate
 model with a known exposure, \code{offset = log(exposure)}. Evaluated in
 \code{data}, so an expression works; \verb{subset=} and \code{na.action} drop its
 entries with the rows. Positioned after \code{na.action} as in \link[stats:glm]{stats::glm}.
-The \code{offset()} \strong{formula term} remains unsupported - the shared parser
-has no such term.}
+Equivalent to an \code{offset()} term in the formula; combining both is an
+error.}
 
 \item{nAGQ}{adaptive Gauss-Hermite node count: an odd integer in
 \verb{1..=25} (\code{1} = Laplace, the default). More permissive than lme4 in range
@@ -65,10 +66,10 @@ Distinct from \code{init.theta}, which is the negative-binomial shape.}
 
 \item{wald.se}{Wald standard-error mode: \code{"hessian"} (default) or \code{"rx"}.}
 
-\item{dispersion}{Gamma dispersion directive: \code{NULL} (estimate via Pearson,
-the default), \code{"estimate"} (same), or a number to hold it fixed.
-Non-\code{NULL} on binomial/poisson would mean quasi-likelihood - GLMM 0.1.1,
-errors today.}
+\item{dispersion}{Gamma/inverse-Gaussian dispersion directive: \code{NULL}
+(estimate via Pearson, the default), \code{"estimate"} (same), or a number to
+hold it fixed. Non-\code{NULL} on binomial/poisson would mean
+quasi-likelihood - GLMM 0.1.1, errors today.}
 
 \item{init.theta}{negative-binomial shape seed, named for
 \code{MASS::glm.nb(init.theta=)}. No kernel hook exists yet to seed the shape
@@ -99,13 +100,17 @@ the kernel itself does: OLS (\code{gaussian} without random effects), GLM
 Gauss-Hermite) - there is no \code{lmer}/\code{glmer} split.
 }
 \details{
-The formula is parsed by the same Rust parser the Python port uses, which
-accepts \strong{bare column names only}: no \code{I()}, \code{poly()}, \code{log(x)},
-\code{cbind()}, \code{offset()}, no \code{.}, and no term removal (\code{- 1} / \verb{0 +}). Compute
-transformed columns first and pass them by name. Fixed and random effects
-support \code{+}, \code{:}, \code{*}, \code{A/B} nesting, and \code{(1 + x | g)} random-effect terms
-with a \strong{full} correlation structure - \code{(x || g)} and intercept-free RE
-terms are not fittable by the kernel and raise an error. Contrasts are
+The formula is parsed by the same Rust parser the Python port uses. Besides
+bare column names, it accepts \code{log(x)}, \code{sqrt(x)}, \code{exp(x)}, and \code{I(x^k)}
+(\code{k >= 2}) of a single column; \code{cbind(successes, failures)} on the
+left-hand side with \code{family = binomial}; an \code{offset()} term; and term
+removal (\code{- 1} / \verb{0 +}). Not accepted: \code{poly()}, arithmetic inside a call,
+nested calls, and \code{.} - compute those columns first and pass them by name.
+\verb{weights=} together with a \code{cbind()} formula, and \verb{offset=} together with
+an \code{offset()} formula term, both error naming "use one". Fixed and random
+effects support \code{+}, \code{:}, \code{*}, \code{A/B} nesting, and \code{(1 + x | g)} random-effect
+terms with a \strong{full} correlation structure - \code{(x || g)} and intercept-free
+RE terms are not fittable by the kernel and raise an error. Contrasts are
 always treatment coding with the \strong{first factor level} as base; to change
 the base, \code{relevel()} the factor (a \code{contrasts} argument is deliberately
 absent). Character columns are converted to factors with lexicographic
@@ -136,12 +141,8 @@ text.
 
 Anything the engine cannot do is an error naming the reason - never a
 silently different model. That includes \code{REML = FALSE} (the LMM path is
-REML-only \strong{by design}), the \code{offset()} \strong{formula term} (the \verb{offset=}
-argument is supported - only the parser has no such term),
-\verb{control=}/\verb{verbose=},
-\code{family = inverse.gaussian()} and \code{link = "cloglog"} (approved for GLMM
-0.1.1, not yet in the kernel), and quasi-likelihood \verb{dispersion=} on
-binomial/poisson.
+REML-only \strong{by design}), \verb{control=}/\verb{verbose=}, and quasi-likelihood
+\verb{dispersion=} on binomial/poisson.
 }
 \examples{
 set.seed(1)

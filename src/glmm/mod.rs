@@ -318,7 +318,12 @@ pub fn fit_glmm(
             // internally scaled θ̃ = s·θ (`LmmGroupings::set_slope_scales`), so the
             // forward map runs before the floor — which then floors the INTERNAL
             // diagonals, the same scale `PIN_THETA` tests.
-            let s = ws.groupings.theta_row_scales();
+            // Stack-sized off the θ ceiling this dense route is bounded by
+            // (extras are intercept-only here — the `extra_slopes_any` assert
+            // above), so a warm loop pays no heap block for the forward map.
+            let mut s = [0.0_f64; crate::consts::MAX_THETA];
+            let s = &mut s[..n_theta];
+            ws.groupings.fill_theta_row_scales(s);
             for ((t, &v), &sc) in ws.params[..n_theta].iter_mut().zip(ts).zip(s.iter()) {
                 *t = v * sc;
             }
@@ -935,7 +940,7 @@ pub fn fit_glmm(
             if target_indices.is_empty() {
                 f64::NAN
             } else {
-                crate::lme::joint_wald_chi_sq(
+                crate::lmm::joint_wald_chi_sq(
                     ws.schur.as_ref(),
                     &ws.betas,
                     sigma_sq,
@@ -1010,7 +1015,7 @@ pub fn fit_glmm(
                                 ws.schur[(a, b)] = inv[(a, b)];
                             }
                         }
-                        crate::lme::joint_wald_chi_sq(
+                        crate::lmm::joint_wald_chi_sq(
                             ws.schur.as_ref(),
                             &ws.betas,
                             1.0,

@@ -12,14 +12,23 @@
 \item{...}{unused.}
 }
 \value{
-An object of class \code{"summary.fastglmm"} with a \code{coefficients}
-matrix (\code{Estimate}, \verb{Std. Error}, \verb{z value}, \verb{Pr(>|z|)}).
+An object of class \code{"summary.fastglmm"} with \code{coefficients}
+(\code{Estimate}, \verb{Std. Error}, \verb{z value}, \verb{Pr(>|z|)}), \code{criterion},
+\code{scaled_residuals} (\code{NULL} when the fit did not converge) and
+\code{corr_fixed} (\code{NULL} when there is one coefficient).
 }
 \description{
+lme4's blocks in lme4's order: method line, formula, data, the criterion
+(\verb{REML criterion at convergence} on an LMM, the \verb{AIC BIC logLik deviance df.resid} row on an ML fit), scaled residuals, random effects with
+variances, the observation/group counts, the Wald-z coefficient table,
+the correlation of fixed effects, and a footer. The Python port's
+\code{Fit.summary()} prints the same blocks - change together.
+}
+\details{
 The coefficient table carries Wald z statistics and normal-based p-values
-for all families (the kernel surfaces no residual df, so there is no t).
-There is deliberately \strong{no} \verb{AIC BIC logLik deviance} header line. On the
-LMM paths \code{logLik()} is a REML criterion (see \link{logLik.fastglmm}), so a
-printed AIC invites exactly the across-models comparison it is not valid for.
-Call \code{logLik()}/\code{AIC()} explicitly instead.
+for all families: the kernel surfaces no residual df, so there is no t and
+no Satterthwaite/Kenward-Roger. The REML criterion is printed on LMMs
+where lme4 prints it; the AIC row is printed only on ML fits, because a
+REML AIC invites exactly the across-models comparison it is not valid for.
+\code{glance()} returns AIC/BIC on request either way.
 }

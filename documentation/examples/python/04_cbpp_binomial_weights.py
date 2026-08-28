@@ -1,10 +1,13 @@
 """Recipe 4 — aggregated binomial via `weights=` (cbpp).
 
 lme4 writes an aggregated binomial as `cbind(incidence, size - incidence) ~
-...`; the shared formula parser has no `cbind()` term (bare column names
-only), so the equivalent model is the success *proportion* as the response
-plus the trial count as `weights=` — exactly lme4's own objective underneath
-`cbind()`, just spelled differently.
+...`. The shared formula parser also accepts `cbind()` directly with
+`family="binomial"`, but both arguments must be columns — compute the
+failures column first (`failures = size - incidence`; arithmetic inside
+`cbind()` itself is not accepted) and pass `cbind(incidence, failures) ~
+...`. This recipe instead spells the equivalent model as the success
+*proportion* as the response plus the trial count as `weights=` — exactly
+lme4's own objective underneath `cbind()`, just spelled differently.
 
 Data: validation/data/empirical/cbpp.csv (the lme4 `cbpp` dataset, frozen for
 the validation harness).

@@ -20,18 +20,53 @@ static RE_SUPPRESS: LazyLock<Regex> =
 static RE_NESTED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\(1\|([_A-Za-z][_A-Za-z0-9]*)/([_A-Za-z][_A-Za-z0-9]*)\)").unwrap()
 });
-static RE_SLOPE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\(1\+([^|]+?)\|([_A-Za-z][_A-Za-z0-9]*)\)").unwrap());
-static RE_ISLOPE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\(([_A-Za-z][^|]*?)\|([_A-Za-z][_A-Za-z0-9]*)\)").unwrap());
+// The slope-list class admits one paren level so `(1 + log(x) | g)` matches,
+// and refuses to cross a `)` so a fixed transform term followed by an RE term
+// (`log(x)+(1|g)`) cannot be swallowed as `(x)+(1|g)`.
+static RE_SLOPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\(1\+((?:[^|()]|\([^|()]*\))+?)\|([_A-Za-z][_A-Za-z0-9]*)\)").unwrap()
+});
+static RE_ISLOPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\(([_A-Za-z](?:[^|()]|\([^|()]*\))*?)\|([_A-Za-z][_A-Za-z0-9]*)\)").unwrap()
+});
 static RE_INT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\(1\|([_A-Za-z][_A-Za-z0-9]*)\)").unwrap());
 static RE_INTERACTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\(1\|([_A-Za-z][_A-Za-z0-9]*):([_A-Za-z][_A-Za-z0-9]*)\)").unwrap()
 });
 
+// `cbind(successes, failures)` LHS — a data-free syntax check only; the
+// two names are resolved against `data` in `materialize`.
+static CBIND_LHS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^cbind\(([_A-Za-z][_A-Za-z0-9]*),([_A-Za-z][_A-Za-z0-9]*)\)$").unwrap()
+});
+
+// `offset(...)` term, anchored to a term boundary (start of the RHS or right
+// after a `+`) so `foffset(e)` (a different identifier that merely ends in
+// "offset") and `x*offset(e)` / `a:offset(e)` (offset used inside a `*`/`:`
+// combination, which the grammar does not support) are rejected as syntax
+// errors instead of silently matching mid-token. One paren level admitted
+// inside the capture (mirrors `RE_SLOPE`'s class) so a whitelisted transform
+// spelling like `log(exposure)` matches; the extracted text is then
+// re-checked by `is_identifier` / `parse_transform` rather than trusted, so
+// `offset(a+b)` or `offset(poly(a,2))` still fail as syntax errors.
+static OFFSET_TERM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(^|\+)offset\(((?:[^()]|\([^()]*\))*)\)").unwrap());
+
+// Fixed-intercept removal. Whitespace is already stripped, so `x - 1`
+// arrives as `x-1`: the `-1` is matched at a term boundary (end of string
+// or before `+`) so `x-10` is untouched and still reaches
+// `find_term_removal`. `0` is a whole term (`0+x`, `x+0`). The `regex` crate
+// has no look-around, so the boundary is a normal capture group that gets
+// put back in the replacement rather than merely asserted.
+static NO_INTERCEPT_MINUS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-1(\+|$)").unwrap());
+static NO_INTERCEPT_ZERO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|\+)0(\+|$)").unwrap());
+
 /// The parsed formula AST. A frozen contract — its shape must stay stable
-/// since the parse test suite depends on it.
+/// since the parse test suite depends on it. The suite proves a superset of
+/// MCPower's grammar, not a mirror: fields like `has_intercept` widen the
+/// grammar past what MCPower's own parser accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedFormula {
     /// Dependent-variable name (`"y"`; `"explained_variable"` when the LHS is empty).
@@ -48,6 +83,17 @@ pub struct ParsedFormula {
     /// Empty when the formula declares none. The first entry's grouping is the
     /// primary grouping.
     pub random_effects: Vec<RandomEffect>,
+    /// `false` when the fixed design carries no intercept (`- 1` / `0 +`).
+    /// Random-effect intercepts are unaffected — they are always present.
+    pub has_intercept: bool,
+    /// The expression inside an `offset(...)` term — a bare column name or a
+    /// whitelisted transform spelling. Never a predictor and never a term:
+    /// an offset adds no design column.
+    pub offset: Option<String>,
+    /// `cbind(successes, failures)` on the LHS: the two column names. `dependent`
+    /// keeps the full spelling. Lowered by `materialize` onto the proportion +
+    /// trial-count form the kernel already fits.
+    pub cbind: Option<(String, String)>,
 }
 
 /// A fixed-effect term. `Interaction` holds its component variable names in order.
@@ -111,6 +157,28 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
     }
 
     let (mut dep, rhs) = split_at_separator(&cleaned);
+    // `cbind(s,f)` LHS check first: an empty LHS never matches it, so the
+    // `explained_variable` fallback below still applies. The canonical parse
+    // suite's LHS forms are `y ~`, `y =`, and none — never a non-identifier
+    // that already parses — so the third branch below is safe.
+    let cbind = if let Some(m) = CBIND_LHS.captures(&dep) {
+        Some((
+            m.get(1).unwrap().as_str().to_string(),
+            m.get(2).unwrap().as_str().to_string(),
+        ))
+    } else if dep.starts_with("cbind(") {
+        return Err(ParseError::Syntax {
+            pos: 0,
+            msg: format!("cbind() takes exactly two column names, got '{dep}'"),
+        });
+    } else if !dep.is_empty() && !is_identifier(&dep) {
+        return Err(ParseError::Syntax {
+            pos: 0,
+            msg: format!("expected a response column name, got '{dep}'"),
+        });
+    } else {
+        None
+    };
     if dep.is_empty() {
         // Empty LHS (e.g. `~X` or `=X`) — fall back to the same default name we
         // use when there is no separator at all.
@@ -123,6 +191,51 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
     // Extract random-effect terms first so the remaining RHS is a plain
     // fixed-effects string.
     let (random_effects, rhs_stripped) = extract_random_effects(&rhs)?;
+
+    // `offset()` extraction runs before the `- 1` stripping below so those
+    // regexes never see `offset(...)`'s contents, and after RE extraction so
+    // an RE term cannot contain `offset(` (the paren-aware slope classes
+    // stop short at a `)`, so `offset(x)+(1|g)` is never swallowed as an RE
+    // term either).
+    let mut offset = None;
+    let mut rhs_stripped = rhs_stripped;
+    let offsets: Vec<String> = OFFSET_TERM
+        .captures_iter(&rhs_stripped)
+        .map(|m| m.get(2).unwrap().as_str().to_string())
+        .collect();
+    if offsets.len() > 1 {
+        return Err(ParseError::Syntax {
+            pos: 0,
+            msg: "at most one offset() term is allowed".into(),
+        });
+    }
+    if let Some(expr) = offsets.into_iter().next() {
+        if !(is_identifier(&expr) || parse_transform(&expr).is_some()) {
+            return Err(ParseError::Syntax {
+                pos: 0,
+                msg: format!(
+                    "offset() takes a column name or a whitelisted transform of one, got '{expr}'"
+                ),
+            });
+        }
+        offset = Some(expr);
+        rhs_stripped = clean_residual_plusses(&OFFSET_TERM.replace(&rhs_stripped, "+"));
+    }
+
+    let mut has_intercept = true;
+    if NO_INTERCEPT_MINUS.is_match(&rhs_stripped) || NO_INTERCEPT_ZERO.is_match(&rhs_stripped) {
+        has_intercept = false;
+        // `$1` restores the trailing `+`/end-of-string the match consumed (no
+        // look-around available); `clean_residual_plusses` mops up the
+        // doubled `+` the zero-branch's literal `"+"` replacement can leave.
+        rhs_stripped = NO_INTERCEPT_MINUS
+            .replace_all(&rhs_stripped, "$1")
+            .into_owned();
+        rhs_stripped = NO_INTERCEPT_ZERO
+            .replace_all(&rhs_stripped, "+$1")
+            .into_owned();
+        rhs_stripped = clean_residual_plusses(&rhs_stripped);
+    }
 
     // Reject term removal: a '-' that isn't inside parens and isn't a digit sign.
     if find_term_removal(&rhs_stripped).is_some() {
@@ -141,6 +254,9 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
         predictors,
         terms,
         random_effects,
+        has_intercept,
+        offset,
+        cbind,
     })
 }
 
@@ -377,6 +493,10 @@ fn split_at_separator(s: &str) -> (String, String) {
     }
 }
 
+// The only legitimate `-` is the fixed-intercept removal (`- 1`), which the
+// caller strips via `NO_INTERCEPT_MINUS`/`NO_INTERCEPT_ZERO` before this runs
+// — so by the time `find_term_removal` sees a `-`, it is always unsupported,
+// including a leftover `-1` that wasn't at a term boundary (`x-10`, `x-1-z`).
 fn find_term_removal(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut depth = 0i32;
@@ -384,12 +504,7 @@ fn find_term_removal(s: &str) -> Option<usize> {
         match b {
             b'(' => depth += 1,
             b')' => depth -= 1,
-            b'-' if depth == 0 => {
-                let next = bytes.get(i + 1).copied().unwrap_or(b' ');
-                if !next.is_ascii_digit() {
-                    return Some(i);
-                }
-            }
+            b'-' if depth == 0 => return Some(i),
             _ => {}
         }
     }
@@ -448,7 +563,7 @@ fn parse_rhs(rhs: &str) -> Result<(Vec<String>, Vec<Term>), ParseError> {
 }
 
 fn parse_single_identifier(s: &str) -> Result<String, ParseError> {
-    if is_identifier(s) {
+    if is_identifier(s) || parse_transform(s).is_some() {
         Ok(s.to_string())
     } else {
         Err(ParseError::Syntax {
@@ -456,6 +571,43 @@ fn parse_single_identifier(s: &str) -> Result<String, ParseError> {
             msg: format!("expected identifier, got '{s}'"),
         })
     }
+}
+
+/// A whitelisted single-column transform. The whitelist is deliberately
+/// closed: R's `poly()` defaults to orthogonal polynomials, so emitting raw
+/// powers under its name would claim R's column name for a different column
+/// (`docs/parity_gaps.md` #6 in the wrapper repo); `I(x^k)` covers the same
+/// models with an honest name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Transform {
+    Log,
+    Sqrt,
+    Exp,
+    /// `I(x^k)`, `k ≥ 2`.
+    Pow(u32),
+}
+
+static TRANSFORM_CALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(log|sqrt|exp)\(([_A-Za-z][_A-Za-z0-9]*)\)$").unwrap());
+static TRANSFORM_POW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^I\(([_A-Za-z][_A-Za-z0-9]*)\^([2-9]|[1-9][0-9])\)$").unwrap());
+
+/// `log(x)` / `sqrt(x)` / `exp(x)` / `I(x^k)` with a single bare column name
+/// inside → the transform and that name. The spelling is used verbatim as the
+/// design column name, which equals what R's `model.matrix` deparses
+/// (whitespace was stripped by `parse`).
+pub(super) fn parse_transform(s: &str) -> Option<(Transform, &str)> {
+    if let Some(m) = TRANSFORM_CALL.captures(s) {
+        let t = match m.get(1).unwrap().as_str() {
+            "log" => Transform::Log,
+            "sqrt" => Transform::Sqrt,
+            _ => Transform::Exp,
+        };
+        return Some((t, m.get(2).unwrap().as_str()));
+    }
+    let m = TRANSFORM_POW.captures(s)?;
+    let k: u32 = m.get(2).unwrap().as_str().parse().ok()?;
+    Some((Transform::Pow(k), m.get(1).unwrap().as_str()))
 }
 
 fn parse_identifier_list(s: &str, seps: &[char]) -> Result<Vec<String>, ParseError> {

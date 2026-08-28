@@ -17,10 +17,9 @@ link default (§2).
 > **Status:** this release ships the full API surface — `fastglmm()`, argument
 > validation, every working accessor — wired end to end through the extendr
 > binding: a valid call parses the formula, fits, and returns a real
-> `"fastglmm"` object. Four narrow combinations are open gaps and raise a
-> clean error naming the reason instead of fitting: `family = inverse.gaussian()`,
-> `binomial("cloglog")`, quasi-likelihood `dispersion=` on binomial/poisson, and
-> an `init.theta=` shape seed (see §2).
+> `"fastglmm"` object. Two narrow combinations are open gaps and raise a
+> clean error naming the reason instead of fitting: quasi-likelihood
+> `dispersion=` on binomial/poisson, and an `init.theta=` shape seed (see §2).
 
 The package is not on CRAN yet. Install from a checkout (needs Rust — `cargo`
 and `rustc >= 1.85` on the `PATH`):
@@ -77,12 +76,13 @@ Points worth knowing at this layer:
 - The default `family = gaussian()` with no `(… | g)` term fits **OLS**; adding a
   random-effect term makes it an **LMM** (REML). The same split holds for every
   family: fixed-only ⇒ GLM, `(… | g)` present ⇒ GLMM.
-- The formula follows R conventions but takes **bare column names only**: `+`,
-  `:`, `*` (main effects + interaction), `A/B` nesting, and `(1 + x | g)` for a
+- The formula follows R conventions: `+`, `:`, `*` (main effects +
+  interaction), `A/B` nesting, `- 1`/`0 +` (drops the intercept),
+  `log()`/`sqrt()`/`exp()`/`I(x^k)` on one bare column, `offset()`,
+  `cbind(s, f) ~ …` (with `family = binomial()`), and `(1 + x | g)` for a
   correlated random intercept + slope, with extra `(… | g2)` terms adding
   crossed/nested groupings. Not accepted — each a clear error with the fix:
-  `I()`/`poly()`/`log(x)` (compute the column first), `cbind(s, f)` (pass the
-  proportion as response and trials as `weights=`), `offset()`, `.`, `- 1`/`0 +`,
+  `poly()` and other general function calls (compute the column first), `.`,
   and `(x || g)`.
 - Contrasts are always treatment coding based on the **first factor level**; to
   change the base, `relevel()` the factor (there is deliberately no `contrasts=`
@@ -101,11 +101,13 @@ choice:
 | `family` argument | fits | default link | other links | distribution param |
 |---|---|---|---|---|
 | `gaussian()` / `"gaussian"` | gaussian | identity | — | — |
-| `binomial()` / `"binomial"` | binomial | logit | probit | — |
+| `binomial()` / `"binomial"` | binomial | logit | probit, cloglog | — |
 | `poisson()` / `"poisson"` | poisson | log | — | — |
 | `Gamma()` **(object)** | gamma | **inverse** | log | dispersion |
 | `"gamma"` **(string)** | gamma | **log** | inverse | dispersion |
 | `"negativebinomial"` | negative binomial | log | — | theta (estimated) |
+| `inverse.gaussian()` **(object)** | inverse-Gaussian | **1/mu^2** | log | dispersion; **fixed-effect GLM only** |
+| `"inversegaussian"` **(string)** | inverse-Gaussian | **log** | 1/mu^2 | dispersion; **fixed-effect GLM only** |
 
 ```r
 fit <- fastglmm(s ~ x1 + (1 | group), data, family = binomial(link = "probit"), nAGQ = 7)
@@ -128,17 +130,18 @@ The knobs:
   default), `"estimate"` (same), or a single number to hold φ fixed.
 - `wald.se` — fixed-effect Wald-SE mode: `"hessian"` (default) or `"rx"`.
 - `weights` — per-row prior (case) weights, `lme4::glmer`'s `weights=`. For an
-  aggregated binomial, pass the success **proportion** as the response and the
-  trial count here — the same model as `cbind(successes, failures)`, whose syntax
-  the parser does not accept. Weights must be strictly positive.
+  aggregated binomial, either write `cbind(successes, failures) ~ …` directly
+  in the formula, or pass the success **proportion** as the response and the
+  trial count here — the same model, spelled by hand. Weights must be
+  strictly positive.
 - `offset` — per-row known additive term on the linear-predictor scale,
   `glm`'s `offset=`: `η = offset + Xβ (+ Zb)`, with no coefficient estimated
   for it and no column added to the design. The canonical use is a Poisson
   rate model against a known exposure, `offset = log(exposure)`. Honored for
   every family and every solver path; `NULL` (default) means no offset.
-  Evaluated in `data`, so an expression works; the formula's `offset()` term
-  is still rejected (see [`formula.md`](formula.md)) — pass the vector here
-  instead.
+  Evaluated in `data`, so an expression works. The formula also accepts an
+  `offset(expr)` term (see [`formula.md`](formula.md)); passing both this
+  argument and a formula `offset()` term is an error asking you to use one.
 - `start` — warm start; see §4.
 - `init.theta` — negative-binomial shape seed, named for
   `MASS::glm.nb(init.theta=)`, and **distinct** from `start$theta` (the
@@ -154,12 +157,14 @@ kernel: loud enough to catch the mistake, lenient enough for exploration.
 Three things error *naming the reason* rather than fitting a silently different
 model. Known lme4 arguments passed through `...` (`REML = FALSE`, `control=`,
 `verbose=`, `contrasts=`) each explain why they can't be honored
-(`REML = FALSE`, for instance, because the LMM path is REML-only by design). The
-open gaps (`inverse.gaussian`, `cloglog`, quasi-likelihood dispersion on
-binomial/Poisson) error until the kernel implements them. And `init.theta=` with
-an actual value errors — there is no kernel hook to seed the shape search yet, so
-only the default cold start runs (off negative-binomial the same argument is the
-harmless warn-and-strip case above).
+(`REML = FALSE`, for instance, because the LMM path is REML-only by design). A
+random-effect term on `family = inverse.gaussian()` errors — the kernel is
+GLM-only for that family — and the remaining open gap, quasi-likelihood
+dispersion on binomial/Poisson, errors until the kernel implements it. And
+`init.theta=` with an actual value errors — there is no kernel hook to seed
+the shape search yet, so only the default cold start runs (off
+negative-binomial the same argument is the harmless warn-and-strip case
+above).
 
 ## 3. Reading the result
 
@@ -174,7 +179,7 @@ shaped like lme4's. These **work**:
 | `VarCorr(fit)` | variance components on the **SD/correlation** scale, one covariance per grouping, lme4-shaped; a `Residual` row (= `sigma()`) is printed for a gaussian mixed fit. |
 | `confint(fit)` | Wald intervals off `vcov()`. `method = "profile"`/`"boot"` are not available and say so. |
 | `isSingular(fit)` | boundary-fit flag — lme4's condition, computed by the kernel. |
-| `sigma(fit)` | residual SD for gaussian/Gamma fits; `1` for binomial/Poisson/negative-binomial (fixed scale, as in lme4). |
+| `sigma(fit)` | residual SD for gaussian fits, `sqrt(phi)` for Gamma/inverse-Gaussian; `1` for binomial/Poisson/negative-binomial (fixed scale, as in lme4). |
 | `nobs`, `formula`, `family`, `model.frame`, `print` | the usual; `formula()` returns the formula **string** as given (the parser is Rust-side, so there is no R `terms` object to hand back). |
 | `ranef(fit)` | conditional modes (BLUPs), one data frame per grouping, lme4-shaped. Conditional variances (`condVar`) are not computed. |
 | `fitted(fit)` | conditional means per row, including the random-effect contribution and any offset. |

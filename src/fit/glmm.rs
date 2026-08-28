@@ -503,9 +503,10 @@ pub(crate) fn glmm_view_to_fit(
 
     let mu_hat = ws.prob[..n].to_vec();
     // Diagnostics off the converged workspace state: μ̂ (the same conditional
-    // means the tuple returns), b̂ = Λ̂û from the spherical modes, and the
-    // marginal log-likelihood with the saturated constant restored.
-    let (fitted, ranef, ranef_levels) = if converged {
+    // means the tuple returns) and b̂ = Λ̂û from the spherical modes. Level
+    // counts are design-only and reported regardless — see `fit/lmm.rs`.
+    let ranef_levels = super::common::ranef_level_counts(&ws.groupings);
+    let (fitted, ranef) = if converged {
         (
             mu_hat.clone(),
             super::common::assemble_ranef_dense(
@@ -513,10 +514,9 @@ pub(crate) fn glmm_view_to_fit(
                 &ws.groupings,
                 &ws.u[..ws.k],
             ),
-            super::common::ranef_level_counts(&ws.groupings),
         )
     } else {
-        (vec![], vec![], vec![])
+        (vec![], vec![])
     };
     let loglik = super::common::glmm_loglik(
         model.family,

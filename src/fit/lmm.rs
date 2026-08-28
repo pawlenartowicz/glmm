@@ -1,6 +1,6 @@
 //! LMM (`Family::Gaussian`, `re: Some`) dispatch — marshals `fit_warm`'s
 //! inputs into the dense LMM workspace and calls `fit_lmm`. The numerical
-//! kernel lives in `src/lmm.rs`; this module only builds the workspace,
+//! kernel lives in `src/lmm/mod.rs`; this module only builds the workspace,
 //! accumulates sufficient statistics, and maps `LmmFit` back to `Fit`.
 
 use crate::lmm::{fit_lmm, LmmFit, LmmGroupings, LmmWorkspace};
@@ -243,11 +243,13 @@ pub(crate) fn lmm_view_to_fit(
     let n_rows = view.n_rows;
     let n_theta = view.theta.len();
 
-    // Conditional modes and the per-row means they unlock. Gated on `converged`,
-    // not on the finite endpoint the variance components use: a conditional mode
+    // Level counts depend only on the design, so they are reported on every
+    // fit; a header line ("Number of obs: …, groups: …") prints on non-converged
+    // fits too. `fitted`/`ranef` stay gated on `converged`: a conditional mode
     // at a non-converged θ̂ is not a BLUP of anything (the same rule the GLMM
-    // paths already apply). `ranef_u` is empty when the recovery did not run.
-    let (fitted, ranef, ranef_levels) = if lmm_fit.converged && !view.ranef_u.is_empty() {
+    // paths apply). `ranef_u` is empty when the recovery did not run.
+    let ranef_levels = super::common::ranef_level_counts(view.groupings);
+    let (fitted, ranef) = if lmm_fit.converged && !view.ranef_u.is_empty() {
         let ranef = super::common::assemble_ranef_sparse(view.theta, view.groupings, view.ranef_u);
         let fitted = super::common::lmm_fitted(
             x,
@@ -260,10 +262,9 @@ pub(crate) fn lmm_view_to_fit(
             &ids.extra,
             opts.offset.as_deref(),
         );
-        let levels = super::common::ranef_level_counts(view.groupings);
-        (fitted, ranef, levels)
+        (fitted, ranef)
     } else {
-        (vec![], vec![], vec![])
+        (vec![], vec![])
     };
 
     let mut fit = Fit {
@@ -297,7 +298,7 @@ pub(crate) fn lmm_view_to_fit(
     // argmin unchanged), and the criterion-scale loglik is recomputed from the
     // corrected deviance. Matches lme4's weighted REMLcrit up to the additive
     // constant the engine strips from its deviance convention (documented on
-    // `lme::profiled_deviance`). This is the single site every caller reaches, so
+    // `lmm::reml_deviance`). This is the single site every caller reaches, so
     // no caller applies the correction itself.
     if let Some(w) = &opts.weights {
         fit.deviance -= w.iter().map(|v| v.ln()).sum::<f64>();

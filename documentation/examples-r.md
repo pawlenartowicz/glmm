@@ -254,10 +254,14 @@ happens to list them in.
 
 Each row of `cbpp` is a herd-period, not a single animal: `incidence` cases
 out of `size` at risk. lme4 writes this as
-`cbind(incidence, size - incidence) ~ ...`; the shared parser has no
-`cbind()` term (bare column names only), so the same model is the success
-*proportion* as the response plus the trial count as `weights=` — exactly
-lme4's objective underneath `cbind()`, spelled differently.
+`cbind(incidence, size - incidence) ~ ...`. The shared parser also accepts
+`cbind()` directly with `family = binomial`, but both arguments must be
+columns — compute the failures column first (`failures <- size - incidence`;
+arithmetic inside `cbind()` itself is not accepted) and pass
+`cbind(incidence, failures) ~ ...`. This recipe instead spells the same model
+as the success *proportion* as the response plus the trial count as
+`weights=` — exactly lme4's objective underneath `cbind()`, spelled
+differently.
 
 ```r
 library(lme4)

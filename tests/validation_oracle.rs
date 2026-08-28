@@ -1,9 +1,9 @@
 //! Tier 2 — the cross-engine tier.
 //!
 //! Asserts the crate against the frozen lme4 / MASS / GLMMadaptive references at
-//! `validation/tol.R`'s agreement bands: 46 goldens in `validation/goldens/` plus the
+//! `validation/tol.R`'s agreement bands: 50 goldens in `validation/goldens/` plus the
 //! weights tier (rungs 29-43) in `validation/results/lme4_simulated/`. Reads frozen
-//! JSON, so it needs neither R nor Julia at runtime — but it refits all 61, so
+//! JSON, so it needs neither R nor Julia at runtime — but it refits all 65, so
 //! it is off by default:
 //!
 //! ```sh
@@ -513,10 +513,16 @@ fn goldens_agree_with_the_references() {
     // `sim_scale_*_glm` goldens joined, pinning that the GLM divergence guard's
     // switch from bounding |β| to bounding |η| gives the same accept/reject
     // decision `stats::glm` does on the three-unit-system, separated, and
-    // Gamma-inverse-large-η design classes. The 46 is what
-    // `all_goldens_are_registered` proves against the goldens directory; the 15
-    // is asserted inside `corpus()` itself.
-    assert_eq!(corpus().len(), 61, "the cross-engine corpus changed size");
+    // Gamma-inverse-large-η design classes. 61 -> 62 on 2026-08-26:
+    // `sim_cloglog_glm` joined (the cloglog GLM arm). 62 -> 63 on 2026-08-26:
+    // `sim_cloglog_glmm` joined (the cloglog GLMM arm — no kernel change, PIRLS
+    // reaches the link through `family_pass`). 63 -> 65 on 2026-08-26:
+    // `sim_igauss_glm` and `sim_igauss_inv_sq_glm` joined (the two inverse-Gaussian
+    // GLM link cells, log and 1/μ², on the new `sim_igauss` fixture — GLM-only,
+    // no glmm cell, since the family faults at the model-shape gate with random
+    // effects). The 50 is what `all_goldens_are_registered` proves against the
+    // goldens directory; the 15 is asserted inside `corpus()` itself.
+    assert_eq!(corpus().len(), 65, "the cross-engine corpus changed size");
     let mut open = Vec::new();
     for (g, factors) in corpus() {
         if let Some(reason) = known_open(&g) {

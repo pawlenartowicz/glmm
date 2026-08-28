@@ -33,13 +33,17 @@
 #' (`gaussian` with random effects), and GLMM (Laplace or adaptive
 #' Gauss-Hermite) - there is no `lmer`/`glmer` split.
 #'
-#' The formula is parsed by the same Rust parser the Python port uses, which
-#' accepts **bare column names only**: no `I()`, `poly()`, `log(x)`,
-#' `cbind()`, `offset()`, no `.`, and no term removal (`- 1` / `0 +`). Compute
-#' transformed columns first and pass them by name. Fixed and random effects
-#' support `+`, `:`, `*`, `A/B` nesting, and `(1 + x | g)` random-effect terms
-#' with a **full** correlation structure - `(x || g)` and intercept-free RE
-#' terms are not fittable by the kernel and raise an error. Contrasts are
+#' The formula is parsed by the same Rust parser the Python port uses. Besides
+#' bare column names, it accepts `log(x)`, `sqrt(x)`, `exp(x)`, and `I(x^k)`
+#' (`k >= 2`) of a single column; `cbind(successes, failures)` on the
+#' left-hand side with `family = binomial`; an `offset()` term; and term
+#' removal (`- 1` / `0 +`). Not accepted: `poly()`, arithmetic inside a call,
+#' nested calls, and `.` - compute those columns first and pass them by name.
+#' `weights=` together with a `cbind()` formula, and `offset=` together with
+#' an `offset()` formula term, both error naming "use one". Fixed and random
+#' effects support `+`, `:`, `*`, `A/B` nesting, and `(1 + x | g)` random-effect
+#' terms with a **full** correlation structure - `(x || g)` and intercept-free
+#' RE terms are not fittable by the kernel and raise an error. Contrasts are
 #' always treatment coding with the **first factor level** as base; to change
 #' the base, `relevel()` the factor (a `contrasts` argument is deliberately
 #' absent). Character columns are converted to factors with lexicographic
@@ -70,26 +74,23 @@
 #'
 #' Anything the engine cannot do is an error naming the reason - never a
 #' silently different model. That includes `REML = FALSE` (the LMM path is
-#' REML-only **by design**), the `offset()` **formula term** (the `offset=`
-#' argument is supported - only the parser has no such term),
-#' `control=`/`verbose=`,
-#' `family = inverse.gaussian()` and `link = "cloglog"` (approved for GLMM
-#' 0.1.1, not yet in the kernel), and quasi-likelihood `dispersion=` on
-#' binomial/poisson.
+#' REML-only **by design**), `control=`/`verbose=`, and quasi-likelihood
+#' `dispersion=` on binomial/poisson.
 #'
 #' @param formula an lme4-style model formula (or a string), e.g.
-#'   `y ~ t + d + t:d + (1 + t | g)`. Bare column names only - see Details.
+#'   `y ~ t + d + t:d + (1 + t | g)`. See Details for what the shared parser
+#'   accepts beyond bare column names.
 #' @param data a `data.frame` (or something coercible) holding every column
 #'   the formula names.
 #' @param family a family object, family function, or string: one of
-#'   `gaussian`, `binomial` (logit/probit), `poisson` (log), `Gamma`
-#'   (log/inverse), `"negativebinomial"` (log; the shape `theta` is
-#'   estimated). `inverse.gaussian` and `binomial("cloglog")` are approved for
-#'   GLMM 0.1.1 and error until the kernel implements them.
+#'   `gaussian`, `binomial` (logit/probit/cloglog), `poisson` (log), `Gamma`
+#'   (log/inverse), `inverse.gaussian` (log/`1/mu^2`), `"negativebinomial"`
+#'   (log; the shape `theta` is estimated).
 #' @param weights optional per-row prior (case) weights - `lme4::glmer`'s
 #'   `weights=`. For an aggregated binomial, pass the success **proportion**
-#'   as the response and the trial count here (the same model as
-#'   `cbind(successes, failures)`, whose syntax the parser does not accept).
+#'   as the response and the trial count here, or equivalently write
+#'   `cbind(successes, failures)` as the formula's left-hand side; combining
+#'   both is an error.
 #' @param subset optional row filter, evaluated in `data` like `lm`'s
 #'   `subset=`. Applied before fitting - row filtering, not parsing.
 #' @param na.action how to handle `NA`s in the model columns (default
@@ -102,8 +103,8 @@
 #'   model with a known exposure, `offset = log(exposure)`. Evaluated in
 #'   `data`, so an expression works; `subset=` and `na.action` drop its
 #'   entries with the rows. Positioned after `na.action` as in [stats::glm].
-#'   The `offset()` **formula term** remains unsupported - the shared parser
-#'   has no such term.
+#'   Equivalent to an `offset()` term in the formula; combining both is an
+#'   error.
 #' @param nAGQ adaptive Gauss-Hermite node count: an odd integer in
 #'   `1..=25` (`1` = Laplace, the default). More permissive than lme4 in range
 #'   but see the fallback note in Details.
@@ -111,10 +112,10 @@
 #'   `list(beta =, theta =)` with `theta` the random-effect Cholesky vector.
 #'   Distinct from `init.theta`, which is the negative-binomial shape.
 #' @param wald.se Wald standard-error mode: `"hessian"` (default) or `"rx"`.
-#' @param dispersion Gamma dispersion directive: `NULL` (estimate via Pearson,
-#'   the default), `"estimate"` (same), or a number to hold it fixed.
-#'   Non-`NULL` on binomial/poisson would mean quasi-likelihood - GLMM 0.1.1,
-#'   errors today.
+#' @param dispersion Gamma/inverse-Gaussian dispersion directive: `NULL`
+#'   (estimate via Pearson, the default), `"estimate"` (same), or a number to
+#'   hold it fixed. Non-`NULL` on binomial/poisson would mean
+#'   quasi-likelihood - GLMM 0.1.1, errors today.
 #' @param init.theta negative-binomial shape seed, named for
 #'   `MASS::glm.nb(init.theta=)`. No kernel hook exists yet to seed the shape
 #'   search, so any non-`NULL` value is an error (the default cold start is
@@ -158,6 +159,9 @@ fastglmm <- function(formula, data, family = gaussian(),
                      init.theta = NULL,
                      ...) {
   .check_dots(...)
+  # Captured before `data` is touched: the header's `Data:` line, as lme4
+  # deparses it.
+  data_name <- paste(deparse(substitute(data), width.cutoff = 500L), collapse = " ")
   wald.se <- match.arg(wald.se)
 
   if (is.character(formula)) formula <- stats::as.formula(formula)
@@ -168,17 +172,6 @@ fastglmm <- function(formula, data, family = gaussian(),
   .check_formula(formula, f_str)
 
   fam <- .normalize_family(family)
-
-  # --- kernel-gap checks: GLMM 0.1.1 approved, not yet implemented (mirrors
-  # python/glmm/__init__.py's NotImplementedError block - change together). ---
-  if (fam$name == "inversegaussian") {
-    stop("family 'inverse.gaussian' requires GLMM 0.1.1; ",
-         "not yet implemented in the kernel", call. = FALSE)
-  }
-  if (fam$link == "cloglog") {
-    stop("link 'cloglog' requires GLMM 0.1.1; ",
-         "not yet implemented in the kernel", call. = FALSE)
-  }
 
   mixed <- grepl("|", f_str, fixed = TRUE)
 
@@ -202,11 +195,12 @@ fastglmm <- function(formula, data, family = gaussian(),
       dispersion <- NULL
     }
   }
-  if (identical(dispersion, "estimate") && fam$name == "gamma") {
-    # gamma's default (NULL) already computes the Pearson estimate.
+  if (identical(dispersion, "estimate") && fam$name %in% c("gamma", "inversegaussian")) {
+    # The phi families' default (NULL) already computes the Pearson estimate.
     dispersion <- NULL
   }
   if (!is.null(dispersion) && fam$name %in% c("binomial", "poisson")) {
+    # mirrors python/glmm/__init__.py's NotImplementedError block - change together.
     stop("quasi-likelihood dispersion on family '", fam$name,
          "' requires GLMM 0.1.1; not yet implemented in the kernel",
          call. = FALSE)
@@ -409,6 +403,14 @@ fastglmm <- function(formula, data, family = gaussian(),
     # only the kernel knows which RE block layout the data routed to.
     ranef_blocks = r$ranef_blocks,
     fitted = r$fitted,
+    # The response as the kernel fitted it (after lowering: a cbind() LHS is
+    # the proportion). residuals() reads this rather than re-resolving the
+    # response column from the formula, which cbind() makes ambiguous.
+    y = r$y,
+    # Prior weights the kernel fitted with (NULL when unweighted). From the
+    # kernel, not `weights=`: a cbind() LHS lowers to trial-count weights the
+    # caller never passed, and Pearson residuals need them.
+    weights = r$weights,
     call = match.call(),
     formula = f_str,
     family = fam$object,
@@ -417,6 +419,7 @@ fastglmm <- function(formula, data, family = gaussian(),
     family_name = fam$name,
     frame = frame,
     nobs = nrow(frame),
+    data_name = data_name,
     # Effective node count: the shim strips ineligible nAGQ>1 to Laplace
     # (with the warning surfaced above), so record what actually ran.
     nAGQ = if (is.null(r$agq_warning)) nAGQ else 1L
@@ -589,17 +592,6 @@ fastglmm <- function(formula, data, family = gaussian(),
          "always fits the full RE correlation structure (a kernel property, ",
          "not a parser gap - see src/spec.rs)", call. = FALSE)
   }
-  if (grepl("\\bcbind\\s*\\(", f_str)) {
-    stop("cbind(successes, failures) is not accepted by the shared formula ",
-         "parser, but the model is reachable: pass the success proportion ",
-         "as the response and the trial count as weights= - that is exactly ",
-         "lme4's cbind() objective", call. = FALSE)
-  }
-  if (grepl("\\boffset\\s*\\(", f_str)) {
-    stop("the offset() formula term is not supported: the shared parser has ",
-         "no such term - pass the vector as the offset= argument instead",
-         call. = FALSE)
-  }
   if ("." %in% all.vars(formula)) {
     stop("'.' is not supported by the shared formula parser; ",
          "list the columns explicitly", call. = FALSE)
@@ -612,15 +604,6 @@ fastglmm <- function(formula, data, family = gaussian(),
          "not supported: the RE correlation structure is always full and ",
          "includes the intercept (a kernel property - see src/spec.rs)",
          call. = FALSE)
-  }
-  # Any function call = a non-bare term (log(x), I(x^2), poly(x, 2), ...).
-  ops <- c("~", "+", "*", ":", "/", "|", "(", "-")
-  calls <- setdiff(all.names(formula), c(all.vars(formula), ops))
-  if (length(calls)) {
-    stop("function call(s) in formula are not supported (",
-         paste(unique(calls), collapse = ", "), "): the shared parser takes ",
-         "bare column names only - compute the column first (e.g. ",
-         "data$log_x <- log(data$x)) and pass it by name", call. = FALSE)
   }
   invisible()
 }
@@ -645,8 +628,8 @@ fastglmm <- function(formula, data, family = gaussian(),
       Gamma = "gamma",
       inverse.gaussian = "inversegaussian",
       stop("unsupported family '", rname, "'; expected one of gaussian, ",
-           "binomial, poisson, Gamma, \"negativebinomial\" ",
-           "(inverse.gaussian is GLMM 0.1.1)", call. = FALSE)
+           "binomial, poisson, Gamma, inverse.gaussian, \"negativebinomial\"",
+           call. = FALSE)
     )
     link <- switch(family$link,
       identity = "identity", logit = "logit", probit = "probit",

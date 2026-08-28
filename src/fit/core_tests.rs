@@ -1116,3 +1116,191 @@ fn fit_on_lmm_dense_offset_round_trip_varying_n() {
         assert_near(&cold.tau2, &via.tau2, &format!("n={n} tau2"));
     }
 }
+
+/// Dense random-slope LMM whose slope column is deliberately far off unit RMS,
+/// so `LmmGroupings::set_slope_scales` installs a scale != 1 and the θ̂ read-back
+/// in `FitView::new` has real work to do.
+fn lmm_slope_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let n_clusters = 6usize;
+    let per = 10usize;
+    let n = n_clusters * per;
+    let p = 2usize;
+    let mut st = 271u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    for i in 0..n {
+        let c = i % n_clusters;
+        ids_v[i] = c as u32;
+        // ×7 puts the column's RMS well away from 1 — the scale the read-back divides by.
+        let x1 = 7.0 * lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        let u = 0.3 * ((c as f64) - (n_clusters as f64) / 2.0);
+        let s = 0.05 * ((c as f64) - 2.0);
+        y[i] = 0.5 + 0.4 * x1 + u + s * x1 + 0.1 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// Intercept-only crossed design whose EXTRA factor outnumbers the primary, so
+/// `spec_sized_from_ids` swaps the two and the workspace carries a non-identity
+/// `Perm` — the state that makes a warm start arrive in the wrong slot order.
+fn reordered_crossed_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let g1 = 4usize; // primary
+    let g2 = 9usize; // extra — the larger one, which is what triggers the swap
+    let n = 72usize;
+    let p = 2usize;
+    let mut st = 4242u64;
+    let u1: Vec<f64> = (0..g1).map(|_| 0.5 * lcg(&mut st)).collect();
+    let u2: Vec<f64> = (0..g2).map(|_| 0.4 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut pid = vec![0u32; n];
+    let mut eid = vec![0u32; n];
+    for i in 0..n {
+        let (c1, c2) = (i % g1, i % g2);
+        pid[i] = c1 as u32;
+        eid[i] = c2 as u32;
+        let x1 = lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        y[i] = 0.5 + 0.7 * x1 + u1[c1] + u2[c2] + 0.2 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 1 },
+                slopes: vec![],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: pid,
+        extra: vec![eid],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// The two per-draw θ marshalling steps `fit_on` does outside the solver — the
+/// scaled-θ read-back in `FitView::new`, and permuting a warm start into slot
+/// order — must cost the warm loop nothing. Both arms are covered because they
+/// are mutually exclusive by construction: the grouping swap only fires on an
+/// all-intercept design, which is exactly the design that carries no RE column
+/// scale.
+///
+/// `fit_on` as a whole cannot be measured at zero — the dense LMM solver
+/// allocates faer `llt` internals per BOBYQA eval, the same acceptance class as
+/// `lmm.rs`'s bounded twins — so the gate is a pin on the TOTAL over a fixed
+/// call count. Re-materializing θ̂ or re-cloning a start costs 2 blocks per draw,
+/// so a regression overshoots by `2 * N_CALLS`, well outside the pin.
+///
+/// Run: `cargo test -p glmm --features alloc-tests fit_on_theta_marshalling_bounded_alloc
+/// -- --ignored` (`alloc-tests` installs the dhat allocator; `alloc_test_guard`
+/// serializes it against the other `#[ignore]` tests).
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn fit_on_theta_marshalling_bounded_alloc() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: usize = 100;
+    // Measured 10000 (this machine): ~50 blocks/draw of faer `llt` internals
+    // across the two arms, and nothing else — the pre-fix code measured 10500,
+    // the 5 marshalling blocks per iteration this test exists to keep at zero
+    // (scaled arm: scale vector + θ̂ copy; reordered arm: θ̂ copy + a two-`Vec`
+    // start clone). Pinned at the measurement with no slack. If faer's Cholesky
+    // internals change, re-measure and update — do not relax.
+    const BOUND: u64 = 10000;
+
+    let (xs, ys, ns, ps, ms, ids_s, os) = lmm_slope_case();
+    let (sized_s, ids_s, perm_s) = spec_sized_from_ids_pub(&ms, &ids_s);
+    assert!(perm_s.is_identity());
+    let mut ws_scaled = build_workspace(&sized_s, perm_s, ns, ps, &os);
+    assert!(ws_scaled.is_lmm_dense());
+
+    let (xr, yr, nr, pr, mr, ids_r, or) = reordered_crossed_case();
+    let (sized_r, ids_r, perm_r) = spec_sized_from_ids_pub(&mr, &ids_r);
+    assert!(
+        !perm_r.is_identity(),
+        "the warm-start permutation arm needs a reordering workspace"
+    );
+    let mut ws_reordered = build_workspace(&sized_r, perm_r, nr, pr, &or);
+    assert!(ws_reordered.is_lmm_dense());
+
+    // One fit per arm outside the profiler, both to warm the workspace's lazy
+    // buffers and to produce the warm start the profiled loop carries.
+    let start_s = {
+        let v = fit_on(&mut ws_scaled, &xs, &ys, &ids_s, None, &os);
+        assert!(
+            v.theta().iter().all(|t| t.is_finite()) && v.theta().len() == 3,
+            "the scaled arm must carry a q=2 θ"
+        );
+        crate::StartValues {
+            beta: v.betas().to_vec(),
+            theta: v.theta().to_vec(),
+        }
+    };
+    let start_r = {
+        let v = fit_on(&mut ws_reordered, &xr, &yr, &ids_r, None, &or);
+        crate::StartValues {
+            beta: v.betas().to_vec(),
+            theta: v.theta().to_vec(),
+        }
+    };
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    for _ in 0..N_CALLS {
+        let v = fit_on(&mut ws_scaled, &xs, &ys, &ids_s, Some(&start_s), &os);
+        std::hint::black_box(std::hint::black_box(&v).theta());
+        let v = fit_on(&mut ws_reordered, &xr, &yr, &ids_r, Some(&start_r), &or);
+        std::hint::black_box(std::hint::black_box(&v).theta());
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    assert!(
+        stats.total_blocks <= BOUND,
+        "fit_on allocated {} blocks across {} warm-path calls per arm (BOUND = {})",
+        stats.total_blocks,
+        N_CALLS,
+        BOUND
+    );
+}

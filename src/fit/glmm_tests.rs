@@ -2006,6 +2006,95 @@ fn fit_glmm_probit_cbpp_matches_lme4() {
     }
 }
 
+/// Cloglog binomial GLMM `y ~ 1 + x1 + x2 + x3 + z + (1 | g)` on the 9,600-row
+/// `sim_probit_large` fixture, gated against frozen
+/// `glmer(binomial("cloglog"), tolPwrss = 1e-13)`
+/// (`validation/goldens/sim_cloglog_glmm.json`). lme4-only SE. No kernel change
+/// was needed for this arm: `build_workspace`'s `(family, Some(re))` branch
+/// already catch-alls to the dense GLMM route and PIRLS reaches the link
+/// through `family_pass`. The oracle is sacred.
+#[test]
+fn fit_glmm_cloglog_matches_lme4() {
+    const REF_BETA: [f64; 5] = [
+        0.0719116500194013,
+        0.523012683780339,
+        -0.43319759691006,
+        0.259765436565002,
+        -0.631825419394664,
+    ];
+    const REF_SE: [f64; 5] = [
+        0.0771902212322184,
+        0.0174613948792221,
+        0.0169682053629786,
+        0.0163105409930296,
+        0.032588334380417,
+    ];
+    const REF_STDDEV: f64 = 0.738958645035249;
+    const REF_LOGLIK: f64 = -4924.21139386758;
+    let csv = include_str!("../../validation/data/simulated/sim_probit_large.csv");
+    let p = 5; // [intercept, x1, x2, x3, z]
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut raw_g = Vec::<String>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        x.extend_from_slice(&[
+            1.0,
+            f[1].parse().unwrap(),
+            f[2].parse().unwrap(),
+            f[3].parse().unwrap(),
+            f[4].parse().unwrap(),
+        ]);
+        raw_g.push(f[5].to_string());
+    }
+    let n = y.len();
+    let (cluster_ids, n_clusters) = dense_str(&raw_g);
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3, 4],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "cloglog GLMM must converge");
+    for ((&b, &rb), (&s, &rs)) in f.beta.iter().zip(&REF_BETA).zip(f.se.iter().zip(&REF_SE)) {
+        assert!((b - rb).abs() / rb.abs() < 2e-3, "β = {b} vs lme4 {rb}");
+        assert!((s - rs).abs() / rs < 3e-2, "se = {s} vs lme4 {rs}");
+    }
+    let (sd, _corr) = f.stddev_corr(0);
+    assert!(
+        (sd[0] - REF_STDDEV).abs() / REF_STDDEV < 3e-3,
+        "g sd = {} vs lme4 {REF_STDDEV}",
+        sd[0]
+    );
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs lme4 {REF_LOGLIK}",
+        f.loglik
+    );
+}
+
 /// Gamma INVERSE-link GLMM `y ~ 1 + x + grp + (1|cluster)` on sim_gamma, gated
 /// against frozen `glmer(family=Gamma("inverse"))`
 /// (`validation/goldens/sim_gamma_inv_glmm.json`, `tolPwrss = 1e-13`). Same data and

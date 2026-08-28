@@ -14,7 +14,10 @@
 //! decaying into a blanket exemption.
 
 use glmm::formula::{lower, Column, Table};
-use glmm::{fit_cold, BinomialLink, Family, Fit, GammaLink, NegBinomialLink, PoissonLink, WaldSe};
+use glmm::{
+    fit_cold, BinomialLink, Family, Fit, GammaLink, InverseGaussianLink, NegBinomialLink,
+    PoissonLink, WaldSe,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -776,7 +779,7 @@ fn family_of(g: &Golden) -> Family {
     // `Gamma()` default of inverse. Getting this wrong would fit a different
     // model than the one frozen, so it is spelled out rather than left to
     // `unwrap_or("identity")`.
-    let link = g.link.as_str().unwrap_or(match g.family.as_str() {
+    let link = g.link.as_str().unwrap_or_else(|| match g.family.as_str() {
         "gaussian" => "identity",
         "binomial" => "logit",
         "poisson" | "gamma" | "negbin" => "log",
@@ -790,6 +793,9 @@ fn family_of(g: &Golden) -> Family {
         ("binomial", "probit") => Family::Binomial {
             link: BinomialLink::Probit,
         },
+        ("binomial", "cloglog") => Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
         ("poisson", "log") => Family::Poisson {
             link: PoissonLink::Log,
         },
@@ -798,6 +804,12 @@ fn family_of(g: &Golden) -> Family {
         },
         ("gamma", "inverse") => Family::Gamma {
             link: GammaLink::Inverse,
+        },
+        ("inversegaussian", "log") => Family::InverseGaussian {
+            link: InverseGaussianLink::Log,
+        },
+        ("inversegaussian", "inverse_squared") => Family::InverseGaussian {
+            link: InverseGaussianLink::InverseSquared,
         },
         ("negbin", "log") => Family::NegativeBinomial {
             link: NegBinomialLink::Log,

@@ -1,9 +1,13 @@
 # Recipe 4 -- aggregated binomial via weights= (cbpp).
 #
 # lme4 writes an aggregated binomial as cbind(incidence, size - incidence) ~
-# ...; fastglmm's shared formula parser has no cbind() term, so pass the
-# success proportion as the response and the trial count as weights= --
-# exactly lme4's own objective underneath cbind(), just spelled differently.
+# .... fastglmm's shared formula parser also accepts cbind() directly with
+# family = binomial(), but both arguments must be columns -- compute the
+# failures column first (failures <- size - incidence; arithmetic inside
+# cbind() itself is not accepted) and pass cbind(incidence, failures) ~ ....
+# This recipe instead passes the success proportion as the response and the
+# trial count as weights= -- exactly lme4's own objective underneath cbind(),
+# just spelled differently.
 #
 # Data: lme4's own `cbpp` -- library(lme4); data(cbpp).
 #

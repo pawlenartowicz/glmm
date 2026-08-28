@@ -78,8 +78,10 @@ ports call the same kernel, so a miss there is a wiring bug, not a divergence.
 
 ## Layout
 
-    manifest.json     single source of truth: all 48 rungs, both formula dialects,
-                      per-rung options (data, link, weights_col, tier)
+    manifest.json     single source of truth: the 48 curated `datasets` rungs
+                      (the `m3_goldens` cells 49-52 are registered separately,
+                      see below), both formula dialects, per-rung options
+                      (data, link, weights_col, tier)
     run.sh            the runner -- see Running below
     compare.R         the cross-engine reference check + the two port GATES
     tol.R             every tolerance band, with its measurement history
@@ -99,7 +101,10 @@ ports call the same kernel, so a miss there is a wiring bug, not a divergence.
                       gen_weights_data.R (rungs 29-43), gen_large_theta_data.R
                       (rungs 44-46 + the non-rung sim_binomial_zerosd fixture),
                       gen_illcond_data.R, gen_scale_data.R,
-                      gen_probit_large_data.R (rung 48)
+                      gen_probit_large_data.R (rung 48), gen_igauss_data.R (rungs 51-52 --
+                      see the rung table's note: sim_igauss carries no manifest `rung`
+                      field of its own, unlike sim_probit_large, since it is not a
+                      `datasets` entry)
     engines/          one fit harness per engine, named for its engine:
                       lme4.R, mixedmodels.jl, glmm.rs (example validation_fit),
                       glmm_python.py, glmm_r.R, common.rs, goldens_agq.R
@@ -181,6 +186,24 @@ added late so no existing rung had to be renumbered).
 | 45 | sim_poisson_bigsd | Poisson GLMM (scalar RE) | large θ̂ (2.97 fitted) — the count-family counterpart of rung 44 |
 | 46 | sim_sparse_binomial_bigsd | binomial GLMM (Bernoulli, 1 primary + 7 crossed scalar RE) | the SPARSE arm of the large-θ̂ regime — large θ̂ (3.91 fitted on `g1`) crossed with 7 crossed intercept-only extras, which is what routes it past `MAX_EXTRA_GROUPINGS` to the sparse solver. **2-way (glmm ↔ lme4) by decision, not by MixedModels limitation** — see the rung's `//` comment in `manifest.json`. Bernoulli rather than Poisson: a Poisson design in this regime pushes counts into the tens of thousands, where deviance-sum rounding noise dominates the FD Hessian's step independent of solver tuning; sparse-large-θ̂-Poisson coverage is deliberately not attempted for that reason. |
 | 48 | sim_probit_large | binomial GLMM, probit link (Bernoulli, scalar RE) | the corpus's **large** probit rung — 100 groups × 96 rows = 9600 rows, p = 5, θ̂ ≈ 0.66. `cbpp_probit` (rung 22) is the only other probit fit in the suite and is 56 rows at ~3 ms, where a vectorized family kernel is pure measurement noise; this rung is what makes probit speed, and accuracy drift that needs a long row loop to show up, visible at all. The row count is capped by lme4, not by taste: above `glmerControl`'s `check.conv.nobsmax = 10000` glmer stops computing the optimizer Hessian and `engines/lme4.R`'s `vcov(use.hessian = TRUE)` hard-errors. Data from `prep/gen_probit_large_data.R`. |
+| 49 | sim_cloglog_glm | binomial GLM, cloglog link | non-canonical asymmetric link, GLM arm — reuses rung 48's data |
+| 50 | sim_cloglog_glmm | binomial GLMM, cloglog link (Bernoulli, scalar RE) | cloglog GLMM, dense scalar RE — the link's mixed arm |
+| 51 | sim_igauss_glm | inverse-Gaussian GLM, log link | V(μ)=μ³ family kernel, log link, on the new `sim_igauss` fixture |
+| 52 | sim_igauss_inv_sq_glm | inverse-Gaussian GLM, 1/μ² link | same data, non-canonical 1/μ² link — general Fisher-scoring branch |
+
+Rungs 49–52 are `m3_goldens` cells (`stats::glm` / `lme4::glmer` only, frozen by
+`engines/goldens_agq.R`), not curated 3-way rungs — they do not appear in
+`compare.R`'s sweep or the status paragraphs below. This table numbers rows
+sequentially for documentation, independent of any manifest `rung` field: rungs
+49–52 are `m3_goldens` cells with no `rung` field of their own (sim_cloglog_glm
+and sim_cloglog_glmm reuse rung 48's data; sim_igauss_glm and
+sim_igauss_inv_sq_glm's underlying `sim_igauss` data has no `rung` either, since
+it is not a `datasets` entry — see below). Rungs 51–52 are 2-way
+(glmm ↔ `stats::glm`) by construction, not by limitation: MixedModels.jl has no
+fixed-only inverse-Gaussian GLM path, and the family's mixed-model arm faults at
+`assert_model_shape` (not built), so `sim_igauss` carries no `jl_formula` and no
+GLMM cell — unlike cloglog, which reuses rung 48's data, `sim_igauss` is its own
+fixture (`prep/gen_igauss_data.R`).
 
 Status: rungs 44–45 got their **lme4** references on 2026-07-30
 (`VALIDATION_ONLY=sim_binomial_bigsd,sim_poisson_bigsd Rscript engines/lme4.R`); rung 46 got

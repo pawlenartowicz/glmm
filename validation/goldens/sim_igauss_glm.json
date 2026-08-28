@@ -1,0 +1,21 @@
+{
+  "name": "sim_igauss_glm",
+  "engine": "stats::glm",
+  "engine_version": "R-4.5.3",
+  "kind": "glm",
+  "data": "sim_igauss",
+  "family": "inversegaussian",
+  "link": "log",
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "y ~ 1 + x + grp",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x", "grpb"],
+  "estimates": {
+    "beta": [0.388918465368179, 0.0547374103199151, 0.0848741285568016],
+    "se": [0.020676393123407, 0.0149473668365438, 0.0298734973282543],
+    "loglik": -2382.12212270936,
+    "dispersion": 0.289727973895683
+  }
+}

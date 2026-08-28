@@ -67,7 +67,7 @@ print.fastglmm <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
     cat("Random effects:\n")
     print(VarCorr(x), digits = digits)
     sizes <- .group_sizes(x)
-    cat("Number of obs: ", x$nobs, ", groups: ",
+    cat("Number of obs: ", x$nobs, ", groups:  ",
         paste0(x$re_group_names, ", ", sizes, collapse = "; "), "\n", sep = "")
   } else {
     cat("Number of obs:", x$nobs, "\n")
@@ -81,29 +81,59 @@ print.fastglmm <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
 
 #' Summarize a fastglmm fit
 #'
+#' lme4's blocks in lme4's order: method line, formula, data, the criterion
+#' (`REML criterion at convergence` on an LMM, the `AIC BIC logLik deviance
+#' df.resid` row on an ML fit), scaled residuals, random effects with
+#' variances, the observation/group counts, the Wald-z coefficient table,
+#' the correlation of fixed effects, and a footer. The Python port's
+#' `Fit.summary()` prints the same blocks - change together.
+#'
 #' The coefficient table carries Wald z statistics and normal-based p-values
-#' for all families (the kernel surfaces no residual df, so there is no t).
-#' There is deliberately **no** `AIC BIC logLik deviance` header line. On the
-#' LMM paths `logLik()` is a REML criterion (see [logLik.fastglmm]), so a
-#' printed AIC invites exactly the across-models comparison it is not valid for.
-#' Call `logLik()`/`AIC()` explicitly instead.
+#' for all families: the kernel surfaces no residual df, so there is no t and
+#' no Satterthwaite/Kenward-Roger. The REML criterion is printed on LMMs
+#' where lme4 prints it; the AIC row is printed only on ML fits, because a
+#' REML AIC invites exactly the across-models comparison it is not valid for.
+#' `glance()` returns AIC/BIC on request either way.
 #'
 #' @param object a [fastglmm] fit.
 #' @param ... unused.
-#' @return An object of class `"summary.fastglmm"` with a `coefficients`
-#'   matrix (`Estimate`, `Std. Error`, `z value`, `Pr(>|z|)`).
+#' @return An object of class `"summary.fastglmm"` with `coefficients`
+#'   (`Estimate`, `Std. Error`, `z value`, `Pr(>|z|)`), `criterion`,
+#'   `scaled_residuals` (`NULL` when the fit did not converge) and
+#'   `corr_fixed` (`NULL` when there is one coefficient).
 #' @export
 summary.fastglmm <- function(object, ...) {
-  z <- object$beta / object$se
+  wald <- .wald(object)
   coefficients <- cbind(
     Estimate = object$beta,
     `Std. Error` = object$se,
-    `z value` = z,
-    `Pr(>|z|)` = 2 * stats::pnorm(-abs(z))
+    `z value` = wald$z,
+    `Pr(>|z|)` = wald$p
   )
+  ll <- object$loglik
+  criterion <- if (object$reml) {
+    c("REML criterion at convergence" = -2 * ll)
+  } else {
+    ic <- .ml_criteria(object)
+    c(AIC = ic$AIC,
+      BIC = ic$BIC,
+      logLik = ll,
+      deviance = ic$deviance,
+      df.resid = ic$df.residual)
+  }
+  scaled <- NULL
+  if (length(object$fitted) == object$nobs && object$nobs > 0L) {
+    r <- residuals(object, type = "pearson")
+    scaled <- stats::quantile(r, c(0, 0.25, 0.5, 0.75, 1), names = FALSE)
+    names(scaled) <- c("Min", "1Q", "Median", "3Q", "Max")
+  }
+  corr_fixed <- if (length(object$beta) >= 2L) stats::cov2cor(object$vcov) else NULL
   structure(list(
     object = object,
-    coefficients = coefficients
+    coefficients = coefficients,
+    criterion = criterion,
+    scaled_residuals = scaled,
+    corr_fixed = corr_fixed
   ), class = "summary.fastglmm")
 }
 
@@ -114,13 +144,26 @@ print.summary.fastglmm <- function(x,
   object <- x$object
   cat(.method_line(object), "\n")
   cat("Formula: ", object$formula, "\n", sep = "")
+  cat("   Data: ", object$data_name, "\n", sep = "")
   cat(" Family: ", object$family$family, " (", object$family$link, ")\n\n",
       sep = "")
+  if (length(x$criterion) == 1L) {
+    cat(names(x$criterion), ": ", format(x$criterion, digits = digits + 1L),
+        "\n\n", sep = "")
+  } else {
+    print(x$criterion, digits = digits + 1L)
+    cat("\n")
+  }
+  if (!is.null(x$scaled_residuals)) {
+    cat("Scaled residuals:\n")
+    print(x$scaled_residuals, digits = digits)
+    cat("\n")
+  }
   if (length(object$varcorr)) {
     cat("Random effects:\n")
-    print(VarCorr(object), digits = digits)
+    print(VarCorr(object), digits = digits, variance = TRUE)
     sizes <- .group_sizes(object)
-    cat("Number of obs: ", object$nobs, ", groups: ",
+    cat("Number of obs: ", object$nobs, ", groups:  ",
         paste0(object$re_group_names, ", ", sizes, collapse = "; "),
         "\n\n", sep = "")
   } else {
@@ -132,17 +175,29 @@ print.summary.fastglmm <- function(x,
     cat("(", sum(object$aliased),
         " coefficient(s) not defined because of singularities)\n", sep = "")
   }
-  if (object$family_name %in% c("gamma", "negativebinomial")) {
-    label <- if (object$family_name == "gamma") {
-      "Dispersion (phi, Pearson)"
-    } else {
+  if (!is.null(x$corr_fixed)) {
+    # Full names on both axes (lme4 abbreviates the columns) - the Python
+    # port prints the same; change together.
+    cat("\nCorrelation of Fixed Effects:\n")
+    p <- nrow(x$corr_fixed)
+    m <- format(round(x$corr_fixed, 3), nsmall = 3)
+    m[upper.tri(m, diag = TRUE)] <- ""
+    print(noquote(m[-1L, -p, drop = FALSE]), right = TRUE)
+  }
+  cat("\n")
+  if (object$family_name %in% c("gamma", "negativebinomial", "inversegaussian")) {
+    label <- if (object$family_name == "negativebinomial") {
       "Shape (theta)"
+    } else {
+      "Dispersion (phi, Pearson)"
     }
     cat(label, ": ", format(object$dispersion, digits = digits), "\n", sep = "")
   }
   cat("Optimizer evaluations: ", object$n_eval,
       ", converged: ", object$converged, "\n", sep = "")
   if (object$singular) cat("boundary (singular) fit: see help('isSingular')\n")
+  cat("z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or ",
+      "residual df is reported.\n", sep = "")
   invisible(x)
 }
 
@@ -206,40 +261,43 @@ VarCorr.fastglmm <- function(x, ...) {
                  else NA_real_)
 }
 
+#' @param digits number of significant digits to print.
+#' @param variance add a `Variance` column before `Std.Dev.` (lme4's
+#'   `print.summary.merMod` shape; the bare `print.fastglmm` header keeps
+#'   `Std.Dev.` only, as `lme4::print.merMod` does).
+#' @rdname VarCorr
 #' @export
 print.VarCorr.fastglmm <- function(x,
                                    digits = max(3L,
                                                 getOption("digits") - 3L),
+                                   variance = FALSE,
                                    ...) {
-  rows <- data.frame(Groups = character(), Name = character(),
-                     Std.Dev. = character(), Corr = character(),
-                     stringsAsFactors = FALSE)
+  cols <- c("Groups", "Name", if (variance) "Variance", "Std.Dev.", "Corr")
+  cells <- list()
   for (g in seq_along(x)) {
     sd <- attr(x[[g]], "stddev")
     corr <- attr(x[[g]], "correlation")
     for (i in seq_along(sd)) {
       corr_cells <- if (i > 1L) {
-        paste(format(corr[i, seq_len(i - 1L)], digits = 3), collapse = " ")
+        paste(format(round(corr[i, seq_len(i - 1L)], 2), nsmall = 2), collapse = " ")
       } else {
         ""
       }
-      rows <- rbind(rows, data.frame(
-        Groups = if (i == 1L) names(x)[g] else "",
-        Name = names(sd)[i],
-        Std.Dev. = format(sd[i], digits = digits),
-        Corr = corr_cells,
-        stringsAsFactors = FALSE
-      ))
+      row <- c(if (i == 1L) names(x)[g] else "", names(sd)[i])
+      if (variance) row <- c(row, format(sd[i]^2, digits = digits))
+      row <- c(row, format(sd[i], digits = digits), corr_cells)
+      cells[[length(cells) + 1L]] <- row
     }
   }
   sc <- attr(x, "sc")
   if (!is.null(sc) && is.finite(sc)) {
-    rows <- rbind(rows, data.frame(
-      Groups = "Residual", Name = "",
-      Std.Dev. = format(sc, digits = digits), Corr = "",
-      stringsAsFactors = FALSE
-    ))
+    row <- c("Residual", "")
+    if (variance) row <- c(row, format(sc^2, digits = digits))
+    row <- c(row, format(sc, digits = digits), "")
+    cells[[length(cells) + 1L]] <- row
   }
+  rows <- as.data.frame(do.call(rbind, cells), stringsAsFactors = FALSE)
+  names(rows) <- cols
   print(rows, row.names = FALSE, right = FALSE)
   invisible(x)
 }
@@ -249,15 +307,20 @@ print.VarCorr.fastglmm <- function(x,
 #' The residual standard deviation for **gaussian** fits (`sqrt` of the
 #' kernel's dispersion: `RSS/(n-p)` for a linear model, matching
 #' `summary.lm`'s sigma; the REML residual variance for a mixed model,
-#' matching `lme4::sigma`), `sqrt(phi)` for Gamma, and `1` for
-#' binomial/poisson/negative-binomial (the scale is fixed, as in lme4).
+#' matching `lme4::sigma`), `sqrt(phi)` for Gamma and inverse-Gaussian, and
+#' `1` for binomial/poisson/negative-binomial (the scale is fixed, as in
+#' lme4).
 #'
 #' @param object a [fastglmm] fit.
 #' @param ... unused.
 #' @export
 sigma.fastglmm <- function(object, ...) {
   fam <- object$family_name
-  if (fam %in% c("gaussian", "gamma")) sqrt(object$dispersion) else 1
+  if (fam %in% c("gaussian", "gamma", "inversegaussian")) {
+    sqrt(object$dispersion)
+  } else {
+    1
+  }
 }
 
 #' @export
@@ -402,12 +465,48 @@ fitted.fastglmm <- function(object, ...) {
   v
 }
 
+#' Residuals
+#'
+#' `type = "response"` is `y - fitted(object)`; `type = "pearson"` divides by
+#' `sqrt(phi * V(mu) / w)` with the family's variance function. Deviance and
+#' working residuals are not offered: they need per-family deviance formulas
+#' nothing else in the package carries, and a wrong default would silently
+#' differ from `lme4::residuals(type=)`.
+#'
+#' @param object a [fastglmm] fit.
+#' @param type `"response"` or `"pearson"`.
+#' @param ... unused.
 #' @export
-residuals.fastglmm <- function(object, ...) {
-  stop("residuals() is not implemented: lme4's `type` argument selects between ",
-       "deviance, pearson, working and response residuals, and guessing which ",
-       "one you meant would silently differ from what the same call gives in ",
-       "lme4. Compute them from fitted() and the response.", call. = FALSE)
+residuals.fastglmm <- function(object, type = c("response", "pearson"), ...) {
+  type <- match.arg(type)
+  mu <- as.double(object$fitted)
+  if (!length(mu)) {
+    stop("residuals are unavailable: the fit did not converge, so fitted() is empty",
+         call. = FALSE)
+  }
+  r <- as.double(object$y) - mu
+  if (type == "pearson") r <- r / sqrt(.pearson_scale(object, mu))
+  names(r) <- rownames(object$frame)
+  r
+}
+
+# phi * V(mu) / w for Pearson residuals. Mirrors the kernel's family table
+# (src/family.rs) and the Python port's `summary._VARIANCE` - change together.
+.pearson_scale <- function(object, mu) {
+  fam <- object$family_name
+  theta <- object$dispersion
+  v <- switch(fam,
+    gaussian = rep(1, length(mu)),
+    binomial = mu * (1 - mu),
+    poisson = mu,
+    gamma = mu^2,
+    negativebinomial = mu + mu^2 / theta,
+    inversegaussian = mu^3
+  )
+  phi <- if (fam %in% c("gaussian", "gamma", "inversegaussian")) object$dispersion else 1
+  w <- object$weights
+  if (is.null(w)) w <- rep(1, length(mu))
+  phi * v / w
 }
 
 #' @export
@@ -442,6 +541,87 @@ logLik.fastglmm <- function(object, ...) {
   attr(val, "REML") <- object$reml
   class(val) <- "logLik"
   val
+}
+
+# -- broom-shaped accessors. Registered on `generics::tidy`/`generics::glance`
+# (not a package-local generic like fixef/VarCorr above): modelsummary,
+# texreg, gt and kableExtra call `broom::tidy(fit)`, which IS generics::tidy
+# re-exported, so a local generic would never be found. `generics` is the
+# import, never `broom` (21 non-base recursive dependencies; nothing here
+# calls a broom function). ------------------------------------------------
+
+#' @importFrom generics tidy
+#' @export
+generics::tidy
+
+#' @importFrom generics glance
+#' @export
+generics::glance
+
+#' Tidy the fixed effects
+#'
+#' One row per fixed effect: `term`, `estimate`, `std.error`, `statistic`
+#' (Wald z) and `p.value` (normal). Aliased coefficients are `NA` rows.
+#'
+#' @param x a [fastglmm] fit.
+#' @param ... unused.
+#' @return A `data.frame`.
+#' @export
+tidy.fastglmm <- function(x, ...) {
+  wald <- .wald(x)
+  data.frame(
+    term = names(x$beta),
+    estimate = unname(x$beta),
+    std.error = unname(x$se),
+    statistic = unname(wald$z),
+    p.value = unname(wald$p),
+    stringsAsFactors = FALSE
+  )
+}
+
+#' One-row model summary
+#'
+#' `nobs`, `logLik`, `AIC`, `BIC`, `deviance` (`-2 * logLik`, the value the
+#' summary's criterion row prints - not `$deviance`, the optimizer criterion),
+#' `df.residual` (`nobs - df`) and `REML`. AIC/BIC are returned on REML fits
+#' too: computing a number somebody asked for is not printing one they did
+#' not, and the `REML` column says what it is. A REML AIC is comparable only
+#' across models with identical fixed effects.
+#'
+#' @param x a [fastglmm] fit.
+#' @param ... unused.
+#' @return A one-row `data.frame`.
+#' @export
+glance.fastglmm <- function(x, ...) {
+  ic <- .ml_criteria(x)
+  data.frame(
+    nobs = x$nobs,
+    logLik = x$loglik,
+    AIC = ic$AIC,
+    BIC = ic$BIC,
+    deviance = ic$deviance,
+    df.residual = ic$df.residual,
+    REML = x$reml
+  )
+}
+
+# Wald z and normal p per fixed effect - summary() and tidy() both print
+# these; one site so they cannot drift apart.
+.wald <- function(object) {
+  z <- object$beta / object$se
+  list(z = z, p = 2 * stats::pnorm(-abs(z)))
+}
+
+# AIC / BIC / deviance (-2 logLik) / residual df - summary()'s criterion row
+# and glance() both report these; one site so they cannot drift apart.
+.ml_criteria <- function(object) {
+  ll <- object$loglik
+  list(
+    AIC = -2 * ll + 2 * object$df,
+    BIC = -2 * ll + log(object$nobs) * object$df,
+    deviance = -2 * ll,
+    df.residual = object$nobs - object$df
+  )
 }
 
 #' @export

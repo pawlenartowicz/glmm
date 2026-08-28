@@ -54,6 +54,21 @@ test_that("the Gamma() link trap: object honored, string means log", {
   expect_equal(sigma(fit_str)^2, summary(ref)$dispersion, tolerance = 1e-5)
 })
 
+test_that("sigma for inverse-Gaussian is sqrt(phi), phi the Pearson dispersion", {
+  set.seed(2)
+  n <- 400
+  x <- rnorm(n)
+  mu <- exp(0.3 + 0.2 * x)
+  lam <- 3
+  v <- rnorm(n)^2
+  x1 <- mu + mu^2 * v / (2 * lam) -
+    (mu / (2 * lam)) * sqrt(4 * mu * lam * v + mu^2 * v^2)
+  y <- ifelse(runif(n) <= mu / (mu + x1), x1, mu^2 / x1)
+  d <- data.frame(y = y, x = x)
+  f <- fastglmm(y ~ x, data = d, family = inverse.gaussian())
+  expect_equal(sigma(f), sqrt(f$dispersion))
+})
+
 test_that("sigma is fixed at 1 for binomial/poisson (lme4 agreement)", {
   d <- benchmark_data(seed = 104, family = "binomial")
   fit <- fastglmm(y ~ t + (1 | g), d, family = binomial())
@@ -97,16 +112,64 @@ test_that("accessors: nobs, formula string, family, model.frame, isSingular", {
   expect_type(isSingular(fit), "logical")
 })
 
-test_that("print and summary run and carry the honest header", {
+test_that("summary prints lme4's blocks in lme4's order", {
   d <- benchmark_data(seed = 106, family = "binomial")
   fit <- fastglmm(y ~ t + (1 | g), d, family = binomial())
   out <- capture.output(print(fit))
   expect_true(any(grepl("Laplace", out)))
-  sout <- capture.output(print(summary(fit)))
-  # No faked AIC/logLik header line (spec §2).
-  expect_false(any(grepl("AIC", sout)))
-  expect_true(any(grepl("Random effects", sout)))
-  expect_true(any(grepl("groups: g, 60", sout)))
+  expect_true(any(grepl("groups:  g, 60", out, fixed = TRUE)))
+  sout <- paste(capture.output(print(summary(fit))), collapse = "\n")
+  order <- c(
+    "Generalized linear mixed model", "Formula: y ~ t + (1 | g)", "   Data: d",
+    "AIC", "BIC", "logLik", "deviance", "df.resid",
+    "Scaled residuals:", "Min", "1Q", "Median", "3Q", "Max",
+    "Random effects:", "Variance", "Std.Dev.",
+    "Number of obs: 600, groups:  g, 60",
+    "Fixed effects:", "Pr(>|z|)",
+    "Correlation of Fixed Effects:",
+    "Optimizer evaluations:", "Wald z"
+  )
+  pos <- vapply(order, function(s) regexpr(s, sout, fixed = TRUE)[1], 0)
+  expect_true(all(pos > 0), info = paste(names(pos)[pos <= 0], collapse = ", "))
+  expect_equal(pos, sort(pos))
+  # No REML line on an ML fit.
+  expect_false(grepl("REML criterion", sout, fixed = TRUE))
+})
+
+test_that("summary on a gaussian LMM prints the REML criterion, not AIC", {
+  d <- benchmark_data(seed = 107, family = "poisson")
+  d$yg <- d$y + rnorm(nrow(d))
+  fit <- fastglmm(yg ~ t + (1 | g), d)
+  s <- summary(fit)
+  expect_named(s$criterion, "REML criterion at convergence")
+  expect_equal(unname(s$criterion), -2 * as.numeric(logLik(fit)))
+  sout <- paste(capture.output(print(s)), collapse = "\n")
+  expect_true(grepl("REML criterion at convergence:", sout, fixed = TRUE))
+  expect_false(grepl("AIC", sout, fixed = TRUE))
+  expect_true(grepl("Residual", sout, fixed = TRUE))
+  # Scaled residuals are (y - mu) / sigma, quantiles type 7.
+  r <- (fit$y - fitted(fit)) / sigma(fit)
+  expect_equal(unname(s$scaled_residuals), unname(quantile(r, c(0, .25, .5, .75, 1))))
+})
+
+test_that("summary carries the correlation of fixed effects off vcov", {
+  d <- benchmark_data(seed = 109, family = "binomial")
+  fit <- fastglmm(y ~ t + d + (1 | g), d, family = binomial())
+  s <- summary(fit)
+  expect_equal(s$corr_fixed, cov2cor(vcov(fit)))
+})
+
+test_that("VarCorr correlations print at 2 dp", {
+  d <- benchmark_data(seed = 101, family = "binomial",
+                      tau0 = 0.8, tau1 = 0.5, rho = 0.3)
+  fit <- fastglmm(y ~ t + d + t:d + (1 + t | g), d, family = binomial())
+  out <- capture.output(print(VarCorr(fit)))
+  # The Corr cell is the last token of the slope row; Std.Dev. keeps its
+  # own `digits`, so only that cell is held to two decimals.
+  slope <- grep("^\\s+t\\s", out, value = TRUE)
+  expect_length(slope, 1L)
+  corr <- sub(".*\\s", "", trimws(slope))
+  expect_match(corr, "^-?[0-9]\\.[0-9]{2}$")
 })
 
 test_that("logLik carries df/nobs/REML and feeds AIC/BIC", {
@@ -357,6 +420,62 @@ test_that("rank-deficient designs mirror lme4's NA coefficients", {
   expect_true(fit$aliased[["t2"]])
   expect_true(is.na(fixef(fit)[["t2"]]))
   expect_true(fit$converged)
+})
+
+test_that("the fit keeps the lowered response and the data name", {
+  d <- benchmark_data(seed = 110, family = "binomial")
+  fit <- fastglmm(y ~ t + (1 | g), d, family = binomial())
+  expect_equal(unname(fit$y), as.double(d$y))
+  expect_equal(fit$data_name, "d")
+  # cbind(): y is the proportion the kernel fitted, not either column.
+  d$s <- d$y
+  d$f <- 1L - d$y + 1L
+  fit2 <- fastglmm(cbind(s, f) ~ t + (1 | g), d, family = binomial())
+  expect_equal(unname(fit2$y), d$s / (d$s + d$f))
+})
+
+test_that("residuals: response and pearson, nothing else", {
+  d <- benchmark_data(seed = 111, family = "poisson")
+  fit <- fastglmm(y ~ t + (1 | g), d, family = poisson())
+  r <- residuals(fit)
+  expect_equal(unname(r), unname(fit$y - fitted(fit)))
+  rp <- residuals(fit, type = "pearson")
+  expect_equal(unname(rp), unname((fit$y - fitted(fit)) / sqrt(fitted(fit))))
+  expect_error(residuals(fit, type = "deviance"), "response.*pearson")
+})
+
+test_that("tidy() and glance() dispatch through generics/broom", {
+  d <- benchmark_data(seed = 112, family = "binomial")
+  fit <- fastglmm(y ~ t + d + (1 | g), d, family = binomial())
+  td <- tidy(fit)
+  expect_s3_class(td, "data.frame")
+  expect_named(td, c("term", "estimate", "std.error", "statistic", "p.value"))
+  expect_equal(td$term, names(fixef(fit)))
+  expect_equal(td$estimate, unname(fixef(fit)))
+  expect_equal(td$statistic, unname(fixef(fit) / fit$se))
+  expect_equal(td$p.value, unname(summary(fit)$coefficients[, "Pr(>|z|)"]))
+  gl <- glance(fit)
+  expect_equal(nrow(gl), 1L)
+  expect_named(gl, c("nobs", "logLik", "AIC", "BIC", "deviance", "df.residual", "REML"))
+  expect_equal(gl$AIC, AIC(fit))
+  expect_equal(gl$BIC, BIC(fit))
+  expect_equal(gl$df.residual, nobs(fit) - fit$df)
+  expect_false(gl$REML)
+  # The whole point of registering on generics: downstream packages call
+  # broom::tidy(), which is generics::tidy re-exported.
+  skip_if_not_installed("broom")
+  expect_equal(broom::tidy(fit), td)
+  expect_equal(broom::glance(fit), gl)
+})
+
+test_that("glance() returns AIC/BIC on a REML fit and says so", {
+  d <- benchmark_data(seed = 113, family = "poisson")
+  d$yg <- d$y + rnorm(nrow(d))
+  fit <- fastglmm(yg ~ t + (1 | g), d)
+  gl <- glance(fit)
+  expect_true(gl$REML)
+  expect_equal(gl$AIC, -2 * fit$loglik + 2 * fit$df)
+  expect_equal(gl$deviance, -2 * fit$loglik)
 })
 
 test_that("warm start (lme4's start=) is accepted and unknown parts warn", {

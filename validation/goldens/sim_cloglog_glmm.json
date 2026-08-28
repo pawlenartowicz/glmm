@@ -1,0 +1,31 @@
+{
+  "name": "sim_cloglog_glmm",
+  "engine": "lme4::glmer",
+  "engine_version": "1.1.38",
+  "kind": "glmm",
+  "data": "sim_probit_large",
+  "family": "binomial",
+  "link": "cloglog",
+  "nagq": 1,
+  "tolPwrss": 1e-13,
+  "r_formula": "y ~ 1 + x1 + x2 + x3 + z + (1 | g)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x1", "x2", "x3", "z"],
+  "estimates": {
+    "beta": [0.0719116500194013, 0.523012683780339, -0.43319759691006, 0.259765436565002, -0.631825419394664],
+    "se_hessian": [0.0771902212322184, 0.0174613948792221, 0.0169682053629786, 0.0163105409930296, 0.032588334380417],
+    "se_rx": [0.0771448869327087, 0.0175507156514414, 0.0170047356123142, 0.0162665289253028, 0.0323395617956234],
+    "loglik": -4924.21139386758,
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)"],
+        "stddev": [0.738958645035249],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  }
+}

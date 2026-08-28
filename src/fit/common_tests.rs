@@ -388,7 +388,7 @@ fn fit_sim_collinear_drops_the_aliased_column() {
 }
 
 /// Deterministic pseudo-data (NR LCG), uniform in (−1, 1). Mirrors the
-/// LCG in lmm.rs tests so the smoke dataset behaves the same way.
+/// LCG in `src/lmm/tests.rs` so the smoke dataset behaves the same way.
 pub(super) fn lcg(state: &mut u64) -> f64 {
     *state = state
         .wrapping_mul(6364136223846793005)
@@ -396,7 +396,7 @@ pub(super) fn lcg(state: &mut u64) -> f64 {
     (((*state >> 11) as f64) / ((1u64 << 53) as f64)) * 2.0 - 1.0
 }
 
-/// n=48, p=3, 6 clusters — same shape as lmm.rs's `hand_dataset`, adapted
+/// n=48, p=3, 6 clusters — same shape as `src/lmm/tests.rs`'s `hand_dataset`, adapted
 /// to the row-major f64 layout the friendly API expects.
 pub(super) fn lmm_hand_dataset() -> (Vec<f64>, Vec<f64>, usize, usize) {
     let n = 48usize;
@@ -1162,7 +1162,7 @@ fn classify_fixed_only_is_noz() {
 /// `n_eval: 0`; this pins that invariant end-to-end (through the whole cold path,
 /// not just `classify_design`) across every wired fixed-only family, so a future
 /// change that accidentally sent a no-Z model through the optimizer would trip it.
-/// NB's outer θ↔β alternation is a scalar Brent search, not BOBYQA — it also
+/// NB's outer θ↔β alternation is a golden-section search, not BOBYQA — it also
 /// leaves `n_eval` at the inner IRLS 0.
 #[test]
 fn fixed_only_fit_runs_zero_bobyqa_evals() {

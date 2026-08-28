@@ -64,17 +64,23 @@ flowchart TD
 ```
 
 (Gaussian `re: Some` is the LMM path — `fit_mle` / `fit_mle_sparse` — covered in
-[`algorithms-lmm.md`](algorithms-lmm.md), not here.) Every wired family fits on
-both solver arms: there is **no reachable `unimplemented!`** in the GLMM
-dispatch. The only hard rejections are the shape asserts at the stable boundary
-(`assert_model_shape`, `src/fit/common.rs`): `nAGQ` must be odd in `1..=25`,
-and `nAGQ>1` is allowed only on a single grouping factor (no extras), `q_p ≤ 3`
-random effects per group, binomial/Poisson GLMM. The same assert also checks
-the engine invariants that hold at `nAGQ = 1`: every primary/extra slope column
-must index within `p`, and at most one `NestedWithin` extra grouping is
-accepted. Prior weights are **not** a rejection anywhere on this path —
-`FitOptions::weights` is honored on every GLMM shape, AGQ included (see the
-weights paragraph in the PIRLS section).
+[`algorithms-lmm.md`](algorithms-lmm.md), not here.) Every family that reaches
+this match fits on both solver arms: there is **no reachable `unimplemented!`**
+once dispatch is inside the GLMM path. The hard rejections are the shape
+asserts at the stable boundary (`assert_model_shape`, `src/fit/common.rs`):
+`nAGQ` must be odd in `1..=25`, and `nAGQ>1` is allowed only on a single
+grouping factor (no extras), `q_p ≤ 3` random effects per group,
+binomial/Poisson GLMM. The same assert also checks the engine invariants that
+hold at `nAGQ = 1`: every primary/extra slope column must index within `p`,
+and at most one `NestedWithin` extra grouping is accepted. It also rejects
+`(Family::InverseGaussian, Some(re))` outright — a family × random-effects
+gate rather than a shape gate — because the GLMM objective needs a profiled
+`inverse.gaussian()$aic` term that is not built, so `InverseGaussian` never
+reaches the `family` diamond above; it faults before `build_workspace`
+allocates anything, and is otherwise a fixed-only GLM family (see
+[`algorithms.md`](algorithms.md#full-dispatch-map)). Prior weights are **not**
+a rejection anywhere on this path — `FitOptions::weights` is honored on every
+GLMM shape, AGQ included (see the weights paragraph in the PIRLS section).
 
 **Validation:** the NoZ binomial/Poisson/Gamma path is pinned by cbpp
 (`fit_glmm_cbpp_matches_lme4`), grouseticks
@@ -87,10 +93,12 @@ the over-count sparse rungs `sim_sparse_binomial` / `sim_sparse_poisson`
 
 ## PIRLS inner loop
 
-**Code:** `pirls_solve` (dense fallback), `pirls_solve_blocked` (no extras) and
-`pirls_solve_blocked_extras` (structured crossed/nested) in
-`src/glmm/pirls.rs`; caps `PIRLS_MAX_ITERS = 50`, `PIRLS_MAX_HALVINGS = 16` and
-the tolerance selector `pirls_tol` in `src/glmm/mod.rs`.
+**Code:** `pirls_solve` (dense fallback, `src/glmm/pirls/dense.rs`),
+`pirls_solve_blocked` (no extras, `src/glmm/pirls/blocked.rs`) and
+`pirls_solve_blocked_extras` (structured crossed/nested,
+`src/glmm/pirls/blocked_extras.rs`); caps `PIRLS_MAX_ITERS = 50`,
+`PIRLS_MAX_HALVINGS = 16` and the tolerance selector `pirls_tol` in
+`src/glmm/mod.rs`.
 
 At a fixed θ the conditional modes ũ are found by penalized IRLS — Fisher
 scoring on the penalized likelihood. The RE design is the scaled `M = ZΛ_θ`, and
@@ -124,7 +132,8 @@ the penalty term alone.
 The tolerance is link-dependent. Canonical links — exactly the two
 `family::is_canonical` cases, logit and Poisson-log — are Newton with quadratic
 convergence, and use `PIRLS_TOL_REL = 1e-9`. Non-canonical links (probit,
-Gamma-log/inverse, NB-log) are Fisher-scoring with only linear convergence, and
+cloglog, Gamma-log/inverse, NB-log) are Fisher-scoring with only linear
+convergence, and
 use `PIRLS_TOL_REL_NONCANON = 1e-8`. That non-canonical value is a decade looser
 than the canonical exit — Newton overshoots its tolerance to machine precision
 for free, whereas every extra Fisher-scoring digit costs iterations. It is
@@ -166,7 +175,7 @@ pinned by `fit_glmm_cbpp_aggregated_matches_lme4`,
 
 ### β profiling — the two-stage optimizer
 
-**Code:** `BetaStep::{Fixed, Profile}` in `src/glmm/pirls.rs`; the two-stage
+**Code:** `BetaStep::{Fixed, Profile}` in `src/glmm/pirls/mod.rs`; the two-stage
 driver in `glmm::fit_glmm` (`src/glmm/mod.rs`), gated by `GlmmWorkspace.two_stage`.
 
 The outer search over θ (and β) is a two-stage BOBYQA, following lme4's
@@ -375,13 +384,13 @@ the `loop_advanced` MCPower hot-loop surface.
 ## Boundary handling and the `singular` flag
 
 **Code:** the pin loop after stage-2 BOBYQA in `glmm::fit_glmm`
-(`src/glmm/mod.rs`; `PIN_THETA` imported from `src/lmm.rs`); the sparse mirror
+(`src/glmm/mod.rs`; `PIN_THETA` imported from `src/lmm/mod.rs`); the sparse mirror
 in `src/sparse/glmm.rs`; the flag assembly and `has_negligible_component`
 (`SINGULAR_REL_TOL = 1e-3`) in `src/fit/mod.rs` and `src/fit/glmm.rs`.
 
 θ is the vech of the RE-covariance Cholesky factor Λ, searched in a box:
 diagonal entries in `[0, THETA_HI]`, off-diagonals in `[−THETA_HI, THETA_HI]`
-(`blind_theta_and_bounds` in `src/lmm.rs`, shared with the LMM path; the GLMM
+(`blind_theta_and_bounds` in `src/lmm/mod.rs`, shared with the LMM path; the GLMM
 workspace appends `±BETA_BOX` bounds for the joint `[θ | β]` stage). Under this
 parameterization the singular boundary is a **finite, reachable point** of the
 search space: a variance collapsing to zero is a diagonal `λ_dd` at its lower
@@ -423,7 +432,7 @@ Cholesky (`glmer`'s θ lower bounds are `0` on diagonals) and flags the same
 fits via `isSingular` (θ diagonal `< 1e-4`), but reports the raw converged
 θ rather than pinning; the two engines flag near-identical boundary sets on
 identical data (see the engine comparison below). **Validation:** the LMM τ̂≈0
-tests in `src/lmm.rs` pin the shared pin loop; the accuracy study
+tests in `src/lmm/tests.rs` pin the shared pin loop; the accuracy study
 (`validation/campaigns/monte_carlo/`) exercises the GLMM boundary at scale.
 
 ## Standard errors
@@ -535,6 +544,7 @@ the vector-RE anchors `sim_binomial_slope1` / `sim_poisson_slope1` /
 | Poisson, real nested | Arabidopsis (rung 14) | lme4 + MixedModels.jl | landed |
 | Sparse binomial, slope-crossed | `sim_binomial_slope_crossed` (rung 18) | lme4 (+ glmm golden) | landed (2-way gate); in-crate golden gated |
 | Probit GLMM (non-canonical) | `goldens/cbpp_probit_glmm.json` (`fit_glmm_probit_cbpp_matches_lme4`) | lme4 | in-crate golden |
+| Cloglog GLMM (non-canonical) | `sim_cloglog_glmm` (rung 50) | lme4 | in-crate golden |
 | Gamma GLMM, dense | `goldens/sim_gamma_glmm.json` (`fit_glmm_gamma_sim_matches_lme4`) | lme4 | in-crate golden |
 | NB GLMM, dense | `goldens/sim_nb_glmm.json` (`fit_glmm_nb_sim_matches_lme4`) | lme4 | in-crate golden |
 | AGQ (nAGQ 1/7/11) | `goldens/{cbpp,grouseticks}_agq_k{1,7,11}.json` | lme4 | in-crate golden |

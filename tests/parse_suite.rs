@@ -1,6 +1,7 @@
 #![cfg(feature = "formula")]
-//! Proves the mirrored parser is faithful to MCPower's. Two corpora, both copied
-//! from the MCPower repo (d3 §6a):
+//! Proves the parser is a superset of MCPower's — the 28 canonical cases parse
+//! identically; everything below the canonical suite is glmm-only grammar.
+//! Two corpora, both copied from the MCPower repo (d3 §6a):
 //!   - the 28-case canonical suite (`configs/formula-fixtures/canonical-suite.json`),
 //!     inlined here as Rust data and checked via the same canonical normalization
 //!     the app-spec `formula_suite.rs` harness uses;
@@ -464,4 +465,155 @@ fn explicit_intercept_forms_unchanged() {
             vars: vec!["x".into()]
         }]
     );
+}
+
+// ── Fixed-intercept removal ─────────────────────────────────────────────────
+
+#[test]
+fn minus_one_and_zero_plus_drop_the_intercept() {
+    for f in [
+        "y ~ x - 1",
+        "y ~ x -1",
+        "y ~ -1 + x",
+        "y ~ 0 + x",
+        "y ~ x + 0",
+        "y ~ 0 + x + (1|g)",
+    ] {
+        let p = parse(f).unwrap_or_else(|e| panic!("{f}: {e}"));
+        assert!(!p.has_intercept, "{f}");
+        assert_eq!(p.predictors, vec!["x".to_string()], "{f}");
+    }
+    assert!(parse("y ~ x").unwrap().has_intercept);
+    assert!(parse("y ~ x + (1|g)").unwrap().has_intercept);
+}
+
+#[test]
+fn other_term_removal_still_rejected() {
+    for f in ["y ~ x - z", "y ~ x - 10", "y ~ x - 1 - z"] {
+        let msg = parse(f).expect_err(f).to_string();
+        assert!(msg.contains("term removal"), "{f}: {msg}");
+    }
+}
+
+#[test]
+fn intercept_only_removal_leaves_no_terms() {
+    let p = parse("y ~ -1 + (1|g)").unwrap();
+    assert!(!p.has_intercept);
+    assert!(p.terms.is_empty());
+    assert_eq!(p.random_effects.len(), 1);
+}
+
+// ── Whitelist transforms ────────────────────────────────────────────────────
+
+#[test]
+fn whitelist_transforms_are_terms_named_as_r_spells_them() {
+    let p = parse("y ~ log(x) + I(z ^ 2) + sqrt(w):f + exp(x)*z").unwrap();
+    let (_, fixed, _) = canonical(&p);
+    assert_eq!(
+        fixed,
+        ["log(x)", "I(z^2)", "sqrt(w):f", "exp(x)", "z", "exp(x):z"].map(String::from)
+    );
+    assert_eq!(p.predictors[0], "log(x)");
+}
+
+#[test]
+fn transform_random_slope_parses() {
+    let p = parse("y ~ log(x) + (1 + log(x) | g) + (I(z^2) | h)").unwrap();
+    assert_eq!(
+        p.random_effects,
+        vec![
+            RandomEffect::Slope {
+                group: "g".into(),
+                vars: vec!["log(x)".into()]
+            },
+            RandomEffect::Slope {
+                group: "h".into(),
+                vars: vec!["I(z^2)".into()]
+            },
+        ]
+    );
+}
+
+#[test]
+fn transform_term_beside_a_random_intercept_does_not_confuse_re_extraction() {
+    // Before the slope regexes excluded parens, `(x)+(1|g)` matched as an
+    // implicit-intercept slope term.
+    let p = parse("y ~ log(x) + (1|g)").unwrap();
+    let (_, fixed, re) = canonical(&p);
+    assert_eq!(fixed, vec!["log(x)".to_string()]);
+    assert_eq!(re, vec!["intercept|g".to_string()]);
+}
+
+#[test]
+fn non_whitelist_calls_are_rejected() {
+    for f in [
+        "y ~ poly(x, 2)",
+        "y ~ log(x, 10)",
+        "y ~ log(sqrt(x))",
+        "y ~ I(x^2 + z)",
+        "y ~ I(x^1)",
+        "y ~ I(x^2.5)",
+        "y ~ log(x + z)",
+        "y ~ abs(x)",
+    ] {
+        let msg = parse(f).expect_err(f).to_string();
+        assert!(msg.contains("formula syntax error"), "{f}: {msg}");
+    }
+}
+
+// ── offset() term ───────────────────────────────────────────────────────────
+
+#[test]
+fn offset_term_is_recorded_and_removed_from_the_design() {
+    let p = parse("y ~ x + offset(log(exposure)) + (1|g)").unwrap();
+    assert_eq!(p.offset.as_deref(), Some("log(exposure)"));
+    let (_, fixed, re) = canonical(&p);
+    assert_eq!(fixed, vec!["x".to_string()]);
+    assert_eq!(re, vec!["intercept|g".to_string()]);
+    assert_eq!(p.predictors, vec!["x".to_string()]);
+
+    let p = parse("y ~ offset(e) + x").unwrap();
+    assert_eq!(p.offset.as_deref(), Some("e"));
+    assert!(parse("y ~ x").unwrap().offset.is_none());
+}
+
+#[test]
+fn offset_term_rejections() {
+    for (f, needle) in [
+        ("y ~ x + offset(a) + offset(b)", "one offset"),
+        ("y ~ x + offset(a + b)", "formula syntax error"),
+        ("y ~ x + offset(poly(a, 2))", "formula syntax error"),
+        ("y ~ x + offset()", "formula syntax error"),
+        ("y ~ foffset(e) + x", "formula syntax error"),
+        ("y ~ x*offset(e)", "formula syntax error"),
+        ("y ~ a:offset(e)", "formula syntax error"),
+    ] {
+        let msg = parse(f).expect_err(f).to_string();
+        assert!(msg.contains(needle), "{f}: {msg}");
+    }
+}
+
+// ── cbind() response ────────────────────────────────────────────────────────
+
+#[test]
+fn cbind_response_is_recorded() {
+    let p = parse("cbind(inc, size - inc) ~ period + (1|herd)");
+    assert!(p.is_err(), "arithmetic inside cbind is not accepted: {p:?}");
+    let p = parse("cbind(inc, fail) ~ period + (1|herd)").unwrap();
+    assert_eq!(p.cbind, Some(("inc".to_string(), "fail".to_string())));
+    assert_eq!(p.dependent, "cbind(inc,fail)");
+    assert!(parse("y ~ x").unwrap().cbind.is_none());
+}
+
+#[test]
+fn cbind_rejections() {
+    for f in [
+        "cbind(a) ~ x",
+        "cbind(a, b, c) ~ x",
+        "cbind(a, log(b)) ~ x",
+        "y ~ cbind(a, b)",
+    ] {
+        let msg = parse(f).expect_err(f).to_string();
+        assert!(msg.contains("formula syntax error"), "{f}: {msg}");
+    }
 }

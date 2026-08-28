@@ -44,7 +44,7 @@ flowchart TD
   RD -->|no| BW["build_workspace: match family, re"]
 
   BW -->|"Gaussian, None"| OLS["fit_ols_prebuilt (incl. WLS by weights)"]
-  BW -->|"Binomial/Poisson/Gamma, None"| GLM["fit_glm_prebuilt (IRLS)"]
+  BW -->|"Binomial/Poisson/Gamma/InverseGaussian, None"| GLM["fit_glm_prebuilt (IRLS)"]
   BW -->|"NegativeBinomial, None"| GLMNB["fit_glm_nb (outer theta loop)"]
   BW -->|"any family, Some(re)"| CD{"classify_design"}
 
@@ -99,7 +99,11 @@ have non-obvious reasons:
 
 The one hard rejection is a shape assert: `assert_model_shape` still panics on
 true invariant violations (a bad `nagq`, an out-of-range slope column, more
-than one nested grouping). The level-count clause reads real
+than one nested grouping) — and, as a family × random-effects gate, on
+`(Family::InverseGaussian, Some(re))`: the GLMM objective needs a profiled
+`inverse.gaussian()$aic` term that is not built, so `fit_warm` faults there
+before `build_workspace` allocates anything (`InverseGaussian` reaches only
+the fixed-only GLM arm above). The level-count clause reads real
 `Crossed { n_clusters }`, so the entry sizes the spec from the row ids
 (`spec_sized_from_ids`) before classifying.
 
@@ -159,12 +163,12 @@ and are not user-facing.
 
 | Knob | Value / formula | Owned by |
 |---|---|---|
-| BOBYQA `npt` | `2·n_θ + 1` for `n_θ < 3`, else `(3·n_θ).div_ceil(2) + 1` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm.rs`) |
-| `rho_begin` schedule | `(0.1·min diag θ₀).min(RHO_BEGIN)`, `RHO_BEGIN = 0.5` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm.rs`) |
-| `rho_end` | `RHO_END = 1e-6` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm.rs`) |
-| `PIN_THETA` | `1e-4` — diagonal variance component pinned to `0`, tested on the internal (scaled) θ | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm.rs`) |
+| BOBYQA `npt` | `2·n_θ + 1` for `n_θ < 3`, else `(3·n_θ).div_ceil(2) + 1` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm/mod.rs`) |
+| `rho_begin` schedule | `(0.1·min diag θ₀).min(RHO_BEGIN)`, `RHO_BEGIN = 0.5` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm/mod.rs`) |
+| `rho_end` | `RHO_END = 1e-6` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm/mod.rs`) |
+| `PIN_THETA` | `1e-4` — diagonal variance component pinned to `0`, tested on the internal (scaled) θ | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm/mod.rs`) |
 | `SINGULAR_REL_TOL` | `1e-3` — post-hoc relative check: any RE stddev `≤ 1e-3 ×` the largest ⇒ `singular`, on the internal (scaled) stddevs | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/fit/mod.rs`) |
-| RE design column scale | per random-slope column, `√(Σ wᵢxᵢ²/Σ wᵢ)`; intercept subcolumns exactly `1.0`; always on, no trigger | [`algorithms-lmm.md`](algorithms-lmm.md#random-effect-design-column-scaling) (`src/lmm.rs`) |
+| RE design column scale | per random-slope column, `√(Σ wᵢxᵢ²/Σ wᵢ)`; intercept subcolumns exactly `1.0`; always on, no trigger | [`algorithms-lmm.md`](algorithms-lmm.md#random-effect-design-column-scaling) (`src/lmm/mod.rs`) |
 | `two_stage` warm-start gate | disabled when `n_θ ≤ 2 && p ≤ 4`, else enabled | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-two-stage-optimizer) (`src/glmm/workspace.rs`) |
 | `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: any `|η_i| > 30` at IRLS iter ≥ 3 → non-converged; skipped under the Gamma inverse link | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `SATURATION_W` / `SATURATION_FRAC` | `1e-5` / `0.5` — post-fit separation guard: > half the (weighted) rows saturated → non-converged | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
@@ -247,11 +251,16 @@ math through the GLMM cold-start GLM fit.
 that β = 0 start is **family-specific** — a plain η = 0 start is wrong for two
 of the regimes:
 
-- **Logit/probit binomial:** η = 0 (μ = ½), the standard start.
+- **Logit/probit/cloglog binomial:** η = 0 (μ = ½), the standard start.
 - **Gamma with the inverse link:** η = 0 is singular under `g(μ) = 1/μ`, so
   each row seeds `η = 1/clamp(yᵢ)` (R's `etastart = 1/y` convention), where
   `clamp` floors the response at `MU_FLOOR = 1e-10` so a zero/negative row
   cannot produce an infinite or negative seed.
+- **Inverse-Gaussian with the `InverseSquared` link:** η = 0 puts μ at ∞ under
+  `g(μ) = 1/μ²`, so each row seeds `η = 1/clamp(yᵢ)²` (R's `mustart = y`
+  convention), the same shape of fix as the Gamma-inverse seed above. The
+  Inverse-Gaussian **log** link needs no special seed — η = 0 gives μ = 1, the
+  same treatment Gamma-log gets.
 - **Log-link count families (Poisson, NB):** each row seeds the null model,
   `η = ln(ȳ + 0.1)`. A plain η = 0 start (μ = 1) overshoots so badly on
   high-mean counts (`ȳ ≳ 25–30`) that IRLS diverges past the
@@ -273,12 +282,20 @@ rather than once per row:
 - **Probit** evaluates Φ through a branch-free SIMD `erfc` — Cody's CALERF with
   all three `|x|` regions computed and blended by mask, since one lane vector
   straddles the region seams — and `dμ/dη = φ(η)` through the same owned `exp`.
-- **Log links** (Poisson, Gamma-log, NB-log) compute `exp(η)` **once** and reuse
-  it for both μ and `dμ/dη`, where the scalar `link_inv`/`mu_eta` pair evaluated
-  it twice.
+- **Log links** (Poisson, Gamma-log, NB-log, Inverse-Gaussian-log) compute
+  `exp(η)` **once** and reuse it for both μ and `dμ/dη`, where the scalar
+  `link_inv`/`mu_eta` pair evaluated it twice.
+- **Cloglog** computes both of its exponentials (`exp(η)`, then `exp(−exp(η))`
+  for μ and `exp(η − exp(η))` for `dμ/dη`) through the same owned
+  `simd_exp_reduced` the other arms use — a real vectorized arm, not a scalar
+  fallback.
+- **Inverse-Gaussian `InverseSquared`** (`μ = η^(−1/2)`) uses pulp's
+  `sqrt_f64s`, which is IEEE-exact, so this arm's SIMD and scalar halves agree
+  to the bit — the same domain-infeasibility handling as Gamma-inverse below
+  (`η > 0`).
 - **Weighted logit** and **Gamma-inverse** have arms of the same shape; the
-  Gamma-inverse one carries the only live domain-infeasibility flag (`μ = 1/η`
-  needs `η > 0`), reduced lane-wise rather than OR'd per row.
+  Gamma-inverse one carries one of the two live domain-infeasibility flags
+  (`μ = 1/η` needs `η > 0`), reduced lane-wise rather than OR'd per row.
 
 Every arm is a `pulp` SIMD body plus a bit-identical scalar tail for the
 sub-lane remainder, and reads its formulas from `src/family.rs`, which stays the

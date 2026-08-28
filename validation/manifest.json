@@ -734,6 +734,30 @@
       "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)"
     },
     {
+      "name": "sim_cloglog_glm",
+      "kind": "glm",
+      "data": "sim_probit_large",
+      "family": "binomial",
+      "link": "cloglog",
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + z",
+      "//": "Reuses rung 48's data (sim_probit_large, 9600 Bernoulli rows) rather than a new fixture: no domain hazard fitting cloglog on probit-simulated data (mu stays in (0,1) for every eta), and it is the only large binomial fixture in the corpus."
+    },
+    {
+      "name": "sim_cloglog_glmm",
+      "kind": "glmm",
+      "data": "sim_probit_large",
+      "family": "binomial",
+      "link": "cloglog",
+      "tolPwrss": 1e-13,
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + z + (1 | g)"
+    },
+    {
       "name": "sim_gamma_glm",
       "kind": "glm",
       "data": "sim_gamma",
@@ -750,6 +774,29 @@
       "data": "sim_gamma",
       "family": "gamma",
       "link": "inverse",
+      "factors": [
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
+      "name": "sim_igauss_glm",
+      "kind": "glm",
+      "data": "sim_igauss",
+      "family": "inversegaussian",
+      "link": "log",
+      "factors": [
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp",
+      "//": "The corpus's only inverse-Gaussian fixture (prep/gen_igauss_data.R, which carries the sizing rationale), and GLM-only by design: the family's mixed-model path is not built (fit faults at the model-shape gate), so no glmm cell and no jl_formula (MixedModels.jl has no fixed-only inverse-Gaussian GLM path). Paired with sim_igauss_inv_sq_glm below on the same data -- link 'log' and link '1/mu^2' -- mirroring sim_gamma_glm / sim_gamma_inv_glm, because inverse-Gaussian data is link-agnostic the same way Gamma data is: any y > 0 fits under both."
+    },
+    {
+      "name": "sim_igauss_inv_sq_glm",
+      "kind": "glm",
+      "data": "sim_igauss",
+      "family": "inversegaussian",
+      "link": "inverse_squared",
       "factors": [
         "grp"
       ],

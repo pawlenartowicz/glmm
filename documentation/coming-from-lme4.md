@@ -52,9 +52,9 @@ lme4/MixedModels.jl oracles.
   you pass the object), but the string `"gamma"` means the port's own
   default, `link = "log"` — see
   [`formula.md#language-notes`](formula.md#language-notes).
-- There is no `cbind(successes, failures)` response: pass the proportion as
-  the response column and the trial count as `weights=` instead — see
-  [`formula.md`](formula.md#not-accepted-and-the-workaround).
+- `cbind(successes, failures) ~ …` works with `family = binomial`, lowered to
+  the same proportion + trial-count-weights objective lme4 uses underneath it
+  — see [`formula.md`](formula.md).
 - Factors are always coded with treatment contrasts (base = the column's
   first level); `contrasts=` is not an accepted argument — relevel the
   factor instead. See [`formula.md`](formula.md#not-accepted-and-the-workaround).
@@ -210,7 +210,6 @@ fit.summary()
 Full recipe, with output and the goldens cross-check:
 [`examples-python.md#4-aggregated-binomial-via-weights-cbpp`](examples-python.md#4-aggregated-binomial-via-weights-cbpp) /
 [`examples-r.md#4-aggregated-binomial-via-weights-cbpp`](examples-r.md#4-aggregated-binomial-via-weights-cbpp).
-See [below](#the-cbind-migration-in-full) for the `cbind()` arithmetic spelled out.
 
 ### Crossed grouping factors (`Penicillin`)
 
@@ -270,58 +269,24 @@ Full recipe, with output and the goldens cross-check:
 [`examples-python.md#2-crossed-grouping-factors-penicillin`](examples-python.md#2-crossed-grouping-factors-penicillin) /
 [`examples-r.md#2-crossed-grouping-factors-penicillin`](examples-r.md#2-crossed-grouping-factors-penicillin).
 
-## The `cbind()` migration in full
+## The `cbind()` migration
 
-This is the single most common lme4 line with no direct translation. lme4
-writes an aggregated binomial — one row per group of trials rather than one
-row per trial — as a two-column response built with `cbind()`:
+lme4 writes an aggregated binomial — one row per group of trials rather than
+one row per trial — as a two-column response built with `cbind()`:
 
 ```r
 cbind(incidence, size - incidence) ~ period + (1 | herd)
 ```
 
-`cbind()`'s first column is the success count, the second is the failure
-count, and lme4 derives the number of trials as their sum
-(`incidence + (size - incidence) = size`). The shared formula parser has no
-`cbind()` term — the response is always looked up as a single, literal
-column name (see [`formula.md`](formula.md#not-accepted-and-the-workaround))
-— so the same model is spelled as the success **proportion** as the response
-plus the trial count as `weights=`. That is exactly lme4's own objective
-underneath `cbind()`; only the arithmetic that produces it moves into your
-data-prep step:
-
-| | lme4 | glmm |
-|---|---|---|
-| Response | `cbind(incidence, size - incidence)` | `incidence / size` (a proportion in `[0, 1]`) |
-| Trial count | derived: `incidence + (size - incidence)` | `weights = size`, passed explicitly |
-| Formula | `cbind(incidence, size - incidence) ~ period + (1 \| herd)` | `prop ~ period + (1 \| herd)`, `family="binomial"`, `weights=size` |
-
-R, spelling out the arithmetic:
+`cbind()` here takes two column names, not an arithmetic expression: compute
+the failures column yourself first (`size - incidence`), then pass both as
+plain columns, with `family = binomial`:
 
 ```r
-data(cbpp)
-cbpp$prop <- cbpp$incidence / cbpp$size
-
-fit <- fastglmm(prop ~ period + (1 | herd), cbpp, family = binomial(), weights = size)
+cbpp$failures <- cbpp$size - cbpp$incidence
+fastglmm(cbind(incidence, failures) ~ period + (1 | herd), cbpp, family = binomial())
 ```
 
-Python, spelling out the arithmetic:
-
-```python
-incidence = [float(r["incidence"]) for r in rows]
-size = [float(r["size"]) for r in rows]
-data = {
-    "prop": [i / s for i, s in zip(incidence, size)],
-    "period": [r["period"] for r in rows],
-    "herd": [r["herd"] for r in rows],
-}
-
-fit = glmm.fit(data, "prop ~ period + (1 | herd)", family="binomial", weights=size)
-```
-
-The trap: `weights=` is the **denominator** — the trial count (`size`), not
-the numerator (`incidence`). Passing `incidence` itself as `weights=` gets it
-backwards, weighting every row by how many *cases* it had, which is
-correlated with the very thing being modeled. This is recipe 4 in the worked
-examples; see it there for the fitted output and the oracle cross-check
-against `goldens/cbpp_agq_k1.json`.
+The kernel lowers it to the proportion + trial-count-weights objective
+internally, so there is no further data-prep arithmetic to do by hand beyond
+that one subtraction.

@@ -24,10 +24,7 @@
 use std::time::Instant;
 
 use glmm::formula::{lower, ReGroupInfo};
-use glmm::{
-    fit_cold, BinomialLink, Family, Fit, FitOptions, GammaLink, NegBinomialLink, PoissonLink,
-    WaldSe,
-};
+use glmm::{fit_cold, Fit, FitOptions};
 use serde_json::{json, Value};
 
 #[path = "common.rs"]
@@ -138,7 +135,7 @@ fn main() {
     let agq = agq_nagq().is_some();
     for spec in manifest["datasets"].as_array().expect("manifest.datasets") {
         let ds = spec["name"].as_str().expect("dataset entry missing name");
-        if want(ds) && (!agq || spec["agq"].is_number()) {
+        if want(ds) && (!agq || rung_agq(spec).is_some()) {
             fit_one(spec);
         }
     }
@@ -154,10 +151,6 @@ fn fit_one(spec: &Value) {
         .as_str()
         .expect("manifest entry missing family");
     let gaussian = family_str == "gaussian";
-    let factors: Vec<String> = spec["factors"]
-        .as_array()
-        .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
-        .unwrap_or_default();
     let source = if spec["source"].as_str() == Some("sim") {
         "simulated"
     } else {
@@ -165,107 +158,13 @@ fn fit_one(spec: &Value) {
     };
 
     let suite = suite_dir();
-    // `data` field: CSV to read when it differs from the rung name (mirrors
-    // lme4.R/mixedmodels.jl) — a re-linked rung (cbpp_probit) reuses the committed
-    // dataset byte-for-byte instead of duplicating it.
-    let data_name = spec["data"].as_str().unwrap_or(ds);
-    let (header, rows) = read_csv_path(&format!("{suite}/data/{source}/{data_name}.csv"));
-
-    // jl_formula, not r_formula: guaranteed cbind-free for every rung (design doc),
-    // so it is already a safe generic lowering source. Strip the literal
-    // "@formula(...)" wrapper to get a plain formula string. Rungs WITHOUT a
-    // jl_formula (weights suite fixed-only / R-only rungs -- the field's absence
-    // is mixedmodels.jl's skip signal) fall back to r_formula; an aggregated-binomial
-    // r_formula's `cbind(...)` response is rewritten to the `prop` column
-    // lower_dataset_generic synthesizes (the same lowering mixedmodels.jl's manifest
-    // entries spell out by hand).
-    let formula_str = match spec["jl_formula"].as_str() {
-        Some(jl) => jl
-            .strip_prefix("@formula(")
-            .and_then(|s| s.strip_suffix(')'))
-            .unwrap_or_else(|| panic!("jl_formula not in @formula(...) shape: {jl}"))
-            .to_string(),
-        None => {
-            let r = spec["r_formula"]
-                .as_str()
-                .expect("manifest entry missing both jl_formula and r_formula");
-            match r.split_once('~') {
-                Some((resp, rhs)) if resp.trim_start().starts_with("cbind(") => {
-                    format!("prop ~{rhs}")
-                }
-                _ => r.to_string(),
-            }
-        }
-    };
-    // Julia's own crossed-interaction grouping operator is `&` (e.g. cake's
-    // `(1 | recipe & replicate)`); the formula frontend's parser uses `:`
-    // for the same grouping (`(1|A:B)`). `&` occurs nowhere else in the manifest
-    // (checked: only cake's RE term), so a global replace is safe and generic.
-    let formula_str = formula_str.replace(" & ", ":");
-    // Julia's @formula requires an explicit `1` intercept term; this crate's
-    // parser (mirroring MCPower's) treats the intercept as always-implicit and
-    // has no term for a literal `1`, so strip it — every jl_formula in the
-    // manifest writes it as the fixed side's leading term, `"<dep> ~ 1 + ..."`.
-    let formula_str = formula_str.replacen(" ~ 1 + ", " ~ ", 1);
-
-    // `link` field: non-canonical link override (cbpp_probit). Absent = the
-    // family's canonical link, the pre-existing behavior for every other rung.
-    let link_str = spec["link"].as_str();
-    let family = match family_str {
-        "gaussian" => Family::Gaussian,
-        "binomial" => Family::Binomial {
-            link: match link_str {
-                None | Some("logit") => BinomialLink::Logit,
-                Some("probit") => BinomialLink::Probit,
-                Some(other) => panic!("unsupported binomial link: {other}"),
-            },
-        },
-        "poisson" => Family::Poisson {
-            link: PoissonLink::Log,
-        },
-        "gamma" => Family::Gamma {
-            link: match link_str {
-                None | Some("log") => GammaLink::Log,
-                Some("inverse") => GammaLink::Inverse,
-                Some(other) => panic!("unsupported gamma link: {other}"),
-            },
-        },
-        "negbin" => Family::NegativeBinomial {
-            link: NegBinomialLink::Log,
-        },
-        other => panic!("unsupported family: {other}"),
-    };
-
     // `table` is kept (not just `lo`) so the construction-inclusive timing below
     // can re-run `lower(&table)` in a loop — the Rust analogue of what lme4 /
     // MixedModels / the Python port time (formula+data → model → fit), so all
-    // four engines compare same-to-same. See the `_full` timing fields.
-    let (mut lo, table) =
-        lower_dataset_generic(spec, &header, &rows, &factors, &formula_str, family);
-    // `weights_col`: plain per-row prior weights read off the named CSV column
-    // (every weights-suite rung except the aggregated-binomial ones, which use
-    // the `weights` field lower_dataset_generic already routes -- the two are
-    // mutually exclusive per rung by design).
-    if let Some(wc) = spec["weights_col"].as_str() {
-        assert!(
-            spec["weights"].is_null(),
-            "{ds}: weights_col and weights are mutually exclusive"
-        );
-        let w_idx = header
-            .iter()
-            .position(|h| h == wc)
-            .unwrap_or_else(|| panic!("{ds}: weights_col {wc:?} not in CSV header"));
-        lo.opts.weights = Some(rows.iter().map(|r| r[w_idx].parse().unwrap()).collect());
-    }
-    // `offset` field: per-row known additive term on the linear-predictor scale
-    // (R's `offset=`) -- a named CSV column, mirroring `weights_col` above.
-    if let Some(oc) = spec["offset"].as_str() {
-        let o_idx = header
-            .iter()
-            .position(|h| h == oc)
-            .unwrap_or_else(|| panic!("{ds}: offset {oc:?} not in CSV header"));
-        lo.opts.offset = Some(rows.iter().map(|r| r[o_idx].parse().unwrap()).collect());
-    }
+    // four engines compare same-to-same. See the `_full` timing fields. Data
+    // load, formula/family resolution, lowering, and weights_col/offset are
+    // shared with `bit_identity/dump.rs` via `lower_rung` (common.rs).
+    let (mut lo, table, family, formula_str) = lower_rung(spec, &suite);
     // AGQ pass: quadrature order from the env, and `parallel_inner` left OFF. This
     // pass once turned it on to time the shipped config, which made the aK row
     // uninterpretable: run.sh pins timed fits to one core, so rayon had nothing to
@@ -412,17 +311,7 @@ fn fit_one(spec: &Value) {
         // GLMM SE has two genuinely different variants (Laplace) — emit both so
         // compare.R checks like to like: se_hessian (keeps θ–β coupling, glmm
         // default) vs se_rx (conditional on θ̂). β/τ is wald_se-independent.
-        let o_r = FitOptions {
-            target_indices: lo.opts.target_indices.clone(),
-            wald_se: WaldSe::Rx,
-            weights: lo.opts.weights.clone(),
-            offset: lo.opts.offset.clone(),
-            // Carried over from `lo.opts`, NOT defaulted: it is 1 on a normal run,
-            // but on an AGQ pass a defaulted `o_r` would silently time the Rx arm at
-            // Laplace while the Hessian arm ran quadrature.
-            nagq: lo.opts.nagq,
-            ..FitOptions::default()
-        };
+        let o_r = rx_options(&lo.opts);
         let fh = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
         let fr = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &o_r);
         // Split timing by SE method — the FD-Hessian is the main time consumer,

@@ -2,10 +2,9 @@
 
 `glmm.fit` parses `formula` against `data`'s columns through the Rust
 `glmm::formula` module, fits via the `glmm` kernel (through the `glmm._native`
-PyO3 extension), and returns a `Fit`. Four family/link combinations are GLMM
-0.1.1 — approved design, not yet implemented in the kernel — and
-raise a clean `NotImplementedError`: `family="inversegaussian"`,
-`link="cloglog"`, quasi-likelihood `dispersion=` on binomial/poisson, and
+PyO3 extension), and returns a `Fit`. Two options are GLMM 0.1.1 —
+approved design, not yet implemented in the kernel — and raise a clean
+`NotImplementedError`: quasi-likelihood `dispersion=` on binomial/poisson, and
 `init_theta=<float>` (no kernel hook exists yet to seed the negative-binomial
 search — only the default `init_theta=None` cold-start is supported).
 
@@ -286,6 +285,23 @@ class Fit:
     # dependency is numpy, and `fit()` accepts duck-typed data precisely so it
     # does not require pandas. Empty exactly when `ranef` is.
     ranef_blocks: list
+    # Header inputs for `summary()`. `formula`/`family`/`link` are `fit()`'s
+    # own arguments, kept so the report can name what was fitted.
+    formula: str
+    family: str
+    link: str  # resolved link, after the family default is applied
+    nagq: int  # quadrature nodes that actually ran (1 after a warn-and-strip)
+    # Row count the kernel fitted. Not `len(fitted)`: `fitted` is empty on a
+    # non-converged fit and the summary header still prints.
+    nobs: int
+    # The response as the kernel fitted it (`Lowered::y` in Rust): after
+    # lowering, so a `cbind(s, f)` response is the proportion s/(s+f). Backs
+    # `residuals()` and the scaled-residuals block.
+    y: np.ndarray
+    # (n,) prior weights the kernel fitted with, None if unweighted. From the
+    # kernel, not the `weights=` argument: a `cbind(s, f)` response lowers to
+    # trial-count weights the caller never passed.
+    weights: np.ndarray | None
 
     @property
     def converged(self):
@@ -325,61 +341,38 @@ class Fit:
         return stddev, corr
 
     def summary(self):
-        """Build the coefficient table, print it, and return it as text.
-
-        z/p are Wald (z = beta/se, p = 2*(1 - Phi(|z|)) = erfc(|z|/sqrt 2)),
-        derived here — the Rust `Fit` carries no p-values. Wald-z (not t)
-        matches the GLM/GLMM convention and the absence of a residual-df
-        field on the kernel output."""
-        beta = np.asarray(self.beta, dtype=float)
-        se = np.asarray(self.se, dtype=float)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            z = beta / se
-        p = np.array(
-            [math.erfc(abs(v) / math.sqrt(2.0)) if math.isfinite(v) else math.nan for v in z]
-        )
-
-        name_w = max(12, max((len(n) for n in self.names), default=4))
-        lines = [f"{'name':<{name_w}} {'estimate':>12} {'std.error':>12} {'z':>10} {'p':>10}"]
-        for i, name in enumerate(self.names):
-            if self.aliased[i]:
-                est = se_i = z_i = p_i = math.nan  # lme4 prints NA here
-            else:
-                est, se_i, z_i, p_i = beta[i], se[i], z[i], p[i]
-            lines.append(f"{name:<{name_w}} {est:>12.4g} {se_i:>12.4g} {z_i:>10.4g} {p_i:>10.4g}")
-
-        if len(self.varcorr):
-            lines.append("")
-            lines.append("Random effects:")
-            # stddev_se is theta-layout: one entry per vech element per
-            # grouping; a stddev's SE sits at its diagonal vech position.
-            theta_off = 0
-            for g in range(len(self.varcorr)):
-                sd, corr = self.stddev_corr(g)
-                q = len(sd)
-                # re_groups is emitted in varcorr order (asserted in the Rust
-                # shim), so index g names block g.
-                group_name, terms = self.re_groups[g]
-                lines.append(f"  {group_name}:")
-                term_w = max((len(t) for t in terms), default=0)
-                for i in range(q):
-                    di = theta_off + (i * q - (i * i - i) // 2)
-                    sd_se = self.stddev_se[di] if di < len(self.stddev_se) else math.nan
-                    corr_cells = " ".join(f"{corr[i][j]:>8.3f}" for j in range(i + 1))
-                    term = terms[i] if i < len(terms) else ""
-                    lines.append(
-                        f"    {term:<{term_w}}  sd {sd[i]:>10.4g}  se {sd_se:>10.4g}"
-                        f"  corr {corr_cells}"
-                    )
-                theta_off += q * (q + 1) // 2
-
-        lines.append("")
-        lines.append(
-            f"dispersion: {self.dispersion:.6g}   converged: {self.converged}   singular: {self.singular}"
-        )
-        text = "\n".join(lines)
+        """Print the lme4-shaped summary and return it as text. The blocks as
+        data, and the HTML/LaTeX/Typst renders, are on `summary_object()`."""
+        text = self.summary_object().text()
         print(text)
         return text
+
+    def summary_object(self):
+        """The summary as plain data with `.text()/.html()/.latex()/.typst()`
+        renderers — see `glmm.summary.Summary`. Name is provisional until 1.0.0.
+
+        Imported locally: `summary.py` never imports `glmm`, but `__init__`
+        must finish defining `Fit` before `summary.py` is needed."""
+        from glmm.summary import build_summary
+
+        return build_summary(self)
+
+    def residuals(self, type="response"):
+        """Response (`y - fitted`) or Pearson residuals. Deviance and working
+        residuals are not offered: they need per-family deviance formulas
+        nothing else in the package carries, and a wrong default would
+        silently differ from lme4's `residuals(type=)`."""
+        if type not in ("response", "pearson"):
+            raise ValueError(f"type must be 'response' or 'pearson', got {type!r}")
+        if len(self.fitted) != len(self.y) or len(self.fitted) == 0:
+            raise ValueError(
+                "residuals are unavailable: the fit did not converge, so `fitted` is empty"
+            )
+        if type == "response":
+            return np.asarray(self.y, dtype=float) - np.asarray(self.fitted, dtype=float)
+        from glmm.summary import pearson_residuals
+
+        return pearson_residuals(self)
 
 
 def _pinned_detail(res):
@@ -620,17 +613,8 @@ def fit(
             warnings.warn(f"warm_start keys ignored: {sorted(unknown)}", stacklevel=2)
             warm_start = {k: v for k, v in warm_start.items() if k in ("beta", "theta")}
 
-    # --- kernel-gap checks: GLMM 0.1.1 not yet implemented (see module docstring) ---
-    if family == "inversegaussian":
-        raise NotImplementedError(
-            "family 'inversegaussian' requires GLMM 0.1.1; not yet implemented in the kernel"
-        )
-    if link == "cloglog":
-        raise NotImplementedError(
-            "link 'cloglog' requires GLMM 0.1.1; not yet implemented in the kernel"
-        )
-    if dispersion == "estimate" and family == "gamma":
-        # gamma's family default (dispersion=None) already computes the
+    if dispersion == "estimate" and family in ("gamma", "inversegaussian"):
+        # The phi families' default (dispersion=None) already computes the
         # Pearson estimate, so "estimate" needs no distinct kernel state.
         dispersion = None
     if family in ("binomial", "poisson") and dispersion is not None:
@@ -729,6 +713,13 @@ def fit(
             }
             for b in r["ranef_blocks"]
         ],
+        formula=formula,
+        family=family,
+        link=link,
+        nagq=nagq if r["agq_warning"] is None else 1,
+        nobs=int(r["nobs"]),
+        y=np.asarray(r["y"], dtype=float),
+        weights=np.asarray(r["weights"], dtype=float) if r["weights"] is not None else None,
     )
     # lme4 agreement (boundary-fits follow-up spec Part B step 4): lme4's exact
     # text, extended with the degenerate components. The R port emits the same

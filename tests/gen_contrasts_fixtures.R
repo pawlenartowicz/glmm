@@ -13,7 +13,10 @@ dat <- data.frame(
   g = factor(c("p", "q", "p", "q", "p", "q")),  # levels p,q
   # Same labels as f but an explicit non-lexicographic order: the declared
   # order picks the treatment-contrast reference level (here c, not a).
-  h = factor(c("a", "b", "c", "a", "b", "c"), levels = c("c", "a", "b"))
+  h = factor(c("a", "b", "c", "a", "b", "c"), levels = c("c", "a", "b")),
+  # Strictly positive — x/z carry negatives, and log(w) on a non-positive
+  # value would make model.frame silently drop the row via na.omit.
+  w = c(1.5, 2.0, 0.5, 4.0, 3.0, 2.5)
 )
 
 # d3 supports interactions in the marginal-present form: treatment dummies (base
@@ -30,7 +33,21 @@ formulas <- c(
   "y ~ f + x",
   "y ~ f*g",
   "y ~ x*f",
-  "y ~ h + x"
+  "y ~ h + x",
+  "y ~ x - 1",
+  "y ~ f - 1",
+  "y ~ x + f - 1",
+  "y ~ f + g - 1",
+  "y ~ f*g - 1",
+  "y ~ 0 + x",
+  "y ~ log(w)",
+  "y ~ sqrt(w) + z",
+  "y ~ exp(x)",
+  "y ~ I(x^2)",
+  "y ~ I(z^3)",
+  "y ~ log(w)*f",
+  "y ~ I(x^2):z",
+  "y ~ log(w) - 1"
 )
 
 # A dedicated frame for the 3-way numeric interaction case.
@@ -74,6 +91,11 @@ cat("    pub formula: &'static str,\n", file = con)
 cat("    pub names: &'static [&'static str],\n", file = con)
 cat("    pub n: usize,\n    pub p: usize,\n", file = con)
 cat("    pub x: &'static [f64],\n}\n\n", file = con)
+# A transform value can land on/near a named constant (log(2) here) or on a
+# literal clippy judges reducible without changing its value — both are
+# properties of the frozen R output, not something the generator should round
+# away.
+cat("#[allow(clippy::excessive_precision, clippy::approx_constant)]\n", file = con)
 cat("pub const FIXTURES: &[Fx] = &[\n", file = con)
 for (fm in formulas) emit(con, fm, dat)
 emit(con, "y ~ x1:x2:x3", dat3)  # numeric 3-way (no factor base-level subtlety)

@@ -15,16 +15,14 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::formula::{label_ranef, lower, Column, Table};
 use crate::{fit_warm, Boundary, Family, Note, StartValues, WaldSe};
-use crate::{BinomialLink, GammaLink, NegBinomialLink, PoissonLink};
+use crate::{BinomialLink, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink};
 
 /// Maps the ports' `family`/`link` strings to [`Family`]. `family` and `link`
-/// are already validated against the full (0.1.1-aware) spec table by each
-/// port's wrapper layer (`glmm/__init__.py`, `r/R/fastglmm.R`) before this
-/// ever runs — the "not yet implemented in the kernel" arms below are the
-/// FFI-boundary backstop for the two 0.1.1 additions (`inversegaussian`,
-/// `cloglog`) the current `Family`/`BinomialLink` enums have no variant for;
-/// every other `Err` arm is unreachable via the ports and exists only for
-/// direct callers.
+/// are already validated against the full spec table by each port's wrapper
+/// layer (`glmm/__init__.py`, `r/R/fastglmm.R`) before this ever runs — every
+/// family and link in that table now maps to a `Family`/`BinomialLink`
+/// variant, so every `Err` arm below is unreachable via the ports and exists
+/// only for direct callers.
 pub fn family_from_str(family: &str, link: &str) -> Result<Family, String> {
     match family {
         "gaussian" => Ok(Family::Gaussian),
@@ -35,9 +33,9 @@ pub fn family_from_str(family: &str, link: &str) -> Result<Family, String> {
             "probit" => Ok(Family::Binomial {
                 link: BinomialLink::Probit,
             }),
-            "cloglog" => Err(
-                "link 'cloglog' requires GLMM 0.1.1; not yet implemented in the kernel".to_string(),
-            ),
+            "cloglog" => Ok(Family::Binomial {
+                link: BinomialLink::Cloglog,
+            }),
             other => Err(format!("unsupported binomial link {other:?}")),
         },
         "poisson" => match link {
@@ -61,11 +59,15 @@ pub fn family_from_str(family: &str, link: &str) -> Result<Family, String> {
             }),
             other => Err(format!("unsupported negativebinomial link {other:?}")),
         },
-        "inversegaussian" => Err(
-            "family 'inversegaussian' requires GLMM 0.1.1; not yet implemented \
-             in the kernel"
-                .to_string(),
-        ),
+        "inversegaussian" => match link {
+            "log" => Ok(Family::InverseGaussian {
+                link: InverseGaussianLink::Log,
+            }),
+            "inverse_squared" => Ok(Family::InverseGaussian {
+                link: InverseGaussianLink::InverseSquared,
+            }),
+            other => Err(format!("unsupported inversegaussian link {other:?}")),
+        },
         other => Err(format!("unknown family {other:?}")),
     }
 }
@@ -240,6 +242,21 @@ pub struct FitResult {
     /// in is a data-dependent routing decision inside the kernel, so only the
     /// crate can label it.
     pub ranef_blocks: Vec<RanefBlockTuple>,
+    /// The response as the kernel fitted it (`Lowered::y`): after lowering, so
+    /// a `cbind(s, f)` response is the proportion `s/(s+f)` and a formula
+    /// transform on the LHS is already applied. Retained so a port can compute
+    /// residuals and the summary's scaled-residual quartiles without a second
+    /// copy of the data. Coupled sites — change together: `glmm-python`'s
+    /// `fit_dict` and `glmm-r`'s returned list flatten every field here.
+    pub y: Vec<f64>,
+    /// Prior weights the kernel fitted with, `None` when unweighted. For a
+    /// `cbind(s, f)` response these are the trial counts `s + f` the lowering
+    /// made up, which the caller never passed — the ports' Pearson residuals
+    /// need them, and `weights=` alone cannot say.
+    pub weights: Option<Vec<f64>>,
+    /// Row count the kernel fitted (`Lowered::n`). NOT `fitted.len()`: `fitted`
+    /// is empty on a non-converged fit and the ports' headers print on those.
+    pub nobs: usize,
     /// Where the accepted θ sits, from `crate::Diagnostics::boundary`; see
     /// `boundary_name` for the vocabulary.
     pub boundary: &'static str,
@@ -360,8 +377,28 @@ pub fn run_fit(
     }
     lowered.opts.nagq = nagq;
     lowered.opts.dispersion = dispersion;
-    lowered.opts.weights = weights;
-    lowered.opts.offset = offset;
+    // Mirrors `formula::materialize`'s `opts` construction — change together:
+    // lowering sets `weights`/`offset` only for a `cbind()` response /
+    // `offset()` formula term, so a value here AND the matching argument is
+    // the user saying it twice.
+    if weights.is_some() && lowered.opts.weights.is_some() {
+        return Err(
+            "weights given both as a cbind() response and as the weights= argument; use one"
+                .to_string(),
+        );
+    }
+    if weights.is_some() {
+        lowered.opts.weights = weights;
+    }
+    if offset.is_some() && lowered.opts.offset.is_some() {
+        return Err(
+            "offset given both as an offset() formula term and as the offset= argument; use one"
+                .to_string(),
+        );
+    }
+    if offset.is_some() {
+        lowered.opts.offset = offset;
+    }
 
     // Taken before the fit so the borrow below is clean; these are the
     // LOWERING's observations, decided before any solver ran.
@@ -446,6 +483,9 @@ pub fn run_fit(
         ranef: fit.ranef,
         ranef_levels: fit.ranef_levels,
         ranef_blocks,
+        y: lowered.y,
+        weights: lowered.opts.weights,
+        nobs: lowered.n,
         boundary: boundary_name(diagnostics.boundary),
         pinned: diagnostics.pinned,
         // The lowering's own observations (unused grouping levels) join the
@@ -494,9 +534,13 @@ mod tests {
     }
 
     #[test]
-    fn binomial_cloglog_is_a_kernel_gap() {
-        let err = family_from_str("binomial", "cloglog").unwrap_err();
-        assert!(err.contains("not yet implemented in the kernel"), "{err}");
+    fn binomial_cloglog_maps() {
+        assert_eq!(
+            family_from_str("binomial", "cloglog").unwrap(),
+            Family::Binomial {
+                link: BinomialLink::Cloglog
+            }
+        );
     }
 
     #[test]
@@ -536,9 +580,21 @@ mod tests {
     }
 
     #[test]
-    fn inversegaussian_is_a_kernel_gap() {
-        let err = family_from_str("inversegaussian", "log").unwrap_err();
-        assert!(err.contains("not yet implemented in the kernel"), "{err}");
+    fn inversegaussian_maps_both_links() {
+        assert_eq!(
+            family_from_str("inversegaussian", "log").unwrap(),
+            Family::InverseGaussian {
+                link: InverseGaussianLink::Log
+            }
+        );
+        assert_eq!(
+            family_from_str("inversegaussian", "inverse_squared").unwrap(),
+            Family::InverseGaussian {
+                link: InverseGaussianLink::InverseSquared
+            }
+        );
+        let err = family_from_str("inversegaussian", "identity").unwrap_err();
+        assert!(err.contains("unsupported inversegaussian link"), "{err}");
     }
 
     #[test]
@@ -636,6 +692,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("z"), "{err}");
+    }
+
+    #[test]
+    fn offset_given_both_ways_is_a_clean_error() {
+        let (numeric, factor) = toy_ols();
+        let n = numeric["y"].len();
+        let err = run_fit(
+            "y ~ x + offset(x)",
+            numeric,
+            factor,
+            "gaussian",
+            "identity",
+            "hessian",
+            1,
+            None,
+            None,
+            Some(vec![0.0; n]),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("use one"), "{err}");
+    }
+
+    #[test]
+    fn weights_given_both_ways_is_a_clean_error() {
+        let mut numeric = HashMap::new();
+        numeric.insert("s".to_string(), vec![1.0, 2.0, 3.0, 4.0]);
+        numeric.insert("f".to_string(), vec![3.0, 2.0, 1.0, 0.5]);
+        numeric.insert("x".to_string(), vec![0.0, 1.0, 2.0, 3.0]);
+        let n = numeric["s"].len();
+        let err = run_fit(
+            "cbind(s, f) ~ x",
+            numeric,
+            HashMap::new(),
+            "binomial",
+            "logit",
+            "hessian",
+            1,
+            None,
+            Some(vec![1.0; n]),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("use one"), "{err}");
     }
 
     #[test]

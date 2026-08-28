@@ -404,6 +404,19 @@ pub fn glm_irls_fit<'a>(
                         irls_eta[i] = 1.0 / crate::family::clamp_mu(family, y[i]);
                     }
                 }
+                // η = 1/μ² with μ₀ = y (R's `mustart = y` for
+                // inverse.gaussian): η = 0 would put μ at ∞ for this link, and
+                // η ≤ 0 is outside its domain entirely. Mirrors the
+                // Gamma-inverse seed above. The IG **log** link needs no seed —
+                // η = 0 gives μ = 1, the same treatment Gamma-log gets.
+                Family::InverseGaussian {
+                    link: crate::spec::InverseGaussianLink::InverseSquared,
+                } => {
+                    for i in 0..n {
+                        let mu0 = crate::family::clamp_mu(family, y[i]);
+                        irls_eta[i] = 1.0 / (mu0 * mu0);
+                    }
+                }
                 Family::Poisson { .. } | Family::NegativeBinomial { .. } => {
                     let ybar = y[..n].iter().sum::<f64>() / n.max(1) as f64;
                     irls_eta[..n].fill((ybar + 0.1).ln());

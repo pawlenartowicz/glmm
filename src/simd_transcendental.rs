@@ -50,7 +50,7 @@
 //! `r` inside the poly domain); only the Horner steps double-round, ~1–2 extra
 //! ULP composed (pinned by `unfused_kernel_within_3ulp_of_libm`).
 
-use crate::spec::{BinomialLink, Family, GammaLink};
+use crate::spec::{BinomialLink, Family, GammaLink, InverseGaussianLink};
 use pulp::Simd;
 
 // exp(r) Horner coefficients (ascending), exp on (-∞,0], degree 11.
@@ -1179,6 +1179,44 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                     }
                 );
             }
+            // μ = 1 − exp(−exp η), dμ/dη = exp(η)·exp(−exp η); general Fisher
+            // weight (dμ/dη)²/V(μ). Two `exp`s, both reused: `t = exp η` is the
+            // derivative's first factor and `s = exp(−t)` is 1−μ. η carries a real
+            // upper clamp here (ln ETA_MAX) — without it exp(exp η) overflows.
+            // μ is `1 − s`, not `−expm1(−t)` as in `family::link_inv`: no owned
+            // SIMD expm1 exists, so μ below ~1e-8 differs from the scalar
+            // statement in relative terms (same class of gap as the owned `exp`,
+            // see this file's preamble).
+            Family::Binomial {
+                link: BinomialLink::Cloglog,
+            } => {
+                let elo = simd.splat_f64s(-crate::family::ETA_MAX);
+                let ehi = simd.splat_f64s(crate::family::ETA_MAX.ln());
+                let lo = simd.splat_f64s(crate::family::PROB_EPS);
+                let hi = simd.splat_f64s(1.0 - crate::family::PROB_EPS);
+                run_arm!(
+                    |e, yi| {
+                        let ec = simd.min_f64s(simd.max_f64s(e, elo), ehi);
+                        let t = simd_exp_reduced::<S, FUSED>(simd, ec);
+                        let s = simd_exp_reduced::<S, FUSED>(simd, simd.neg_f64s(t));
+                        let mu = simd.min_f64s(simd.max_f64s(simd.sub_f64s(one, s), lo), hi);
+                        let dmu = simd.mul_f64s(t, s);
+                        let v = simd.mul_f64s(mu, simd.sub_f64s(one, mu));
+                        let w_raw = simd.div_f64s(simd.mul_f64s(dmu, dmu), v);
+                        (ec, mu, w_raw, simd.div_f64s(simd.sub_f64s(yi, mu), dmu))
+                    },
+                    |e, yi| {
+                        let ec = e.clamp(-crate::family::ETA_MAX, crate::family::ETA_MAX.ln());
+                        let t = scalar_exp_reduced::<FUSED>(ec);
+                        let s = scalar_exp_reduced::<FUSED>(-t);
+                        let mu =
+                            (1.0 - s).clamp(crate::family::PROB_EPS, 1.0 - crate::family::PROB_EPS);
+                        let dmu = t * s;
+                        let v = mu * (1.0 - mu);
+                        (ec, mu, dmu * dmu / v, (yi - mu) / dmu)
+                    }
+                );
+            }
             // Weighted binomial logit — the canonical shortcut W_raw = V(μ),
             // matching `family::irls_weight_and_resid`. Unweighted Bernoulli
             // logit never reaches here (`family_pass` routes it to the fused
@@ -1261,8 +1299,8 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                     }
                 );
             }
-            // Gamma inverse link: no transcendental, but the only live
-            // `eta_infeasible` case (μ = 1/η needs η > 0). The infeasible rows are
+            // Gamma inverse link: no transcendental, but one of the two live
+            // `eta_infeasible` cases (μ = 1/η needs η > 0). The infeasible rows are
             // counted lane-wise and reduced once, rather than OR'd per row.
             Family::Gamma {
                 link: GammaLink::Inverse,
@@ -1305,6 +1343,81 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                     pt[i] = mu;
                     let pw = if gt.is_empty() { 1.0 } else { gt[i] };
                     wt[i] = (pw * (dmu * dmu / v)).max(crate::glm::WEIGHT_CLAMP);
+                    if let Some(slot) = zt.get_mut(i) {
+                        *slot = ec + (yt[i] - mu) / dmu;
+                    }
+                }
+            }
+            // IG log link: `exp(η)` once, reused for μ and dμ/dη. V(μ) = μ³, so
+            // the general Fisher weight is exp(η)²/μ³.
+            Family::InverseGaussian {
+                link: InverseGaussianLink::Log,
+            } => {
+                let elo = simd.splat_f64s(-crate::family::ETA_MAX);
+                let ehi = simd.splat_f64s(crate::family::ETA_MAX);
+                let mfl = simd.splat_f64s(crate::family::MU_FLOOR);
+                run_arm!(
+                    |e, yi| {
+                        let ec = simd.min_f64s(simd.max_f64s(e, elo), ehi);
+                        let ex = simd_exp_reduced::<S, FUSED>(simd, ec);
+                        let mu = simd.max_f64s(ex, mfl);
+                        let v = simd.mul_f64s(simd.mul_f64s(mu, mu), mu);
+                        let w_raw = simd.div_f64s(simd.mul_f64s(ex, ex), v);
+                        (ec, mu, w_raw, simd.div_f64s(simd.sub_f64s(yi, mu), ex))
+                    },
+                    |e, yi| {
+                        let ec = e.clamp(-crate::family::ETA_MAX, crate::family::ETA_MAX);
+                        let ex = scalar_exp_reduced::<FUSED>(ec);
+                        let mu = ex.max(crate::family::MU_FLOOR);
+                        let v = mu * mu * mu;
+                        (ec, mu, ex * ex / v, (yi - mu) / ex)
+                    }
+                );
+            }
+            // IG 1/μ² link: μ = η^(−1/2), dμ/dη = −μ³/2, V = μ³ ⇒ W_raw = μ³/4.
+            // The second live `eta_infeasible` case (η > 0 required), counted
+            // lane-wise exactly as the Gamma-inverse arm above does. `sqrt` is
+            // IEEE-exact on both paths, so head and tail agree to the bit. Spelled
+            // out by hand rather than through `run_arm!`, which has no channel to
+            // carry the `bad`/`bad_tail` accumulation out of its lane closures —
+            // same reason the Gamma-inverse arm above bypasses the macro.
+            Family::InverseGaussian {
+                link: InverseGaussianLink::InverseSquared,
+            } => {
+                let elo = simd.splat_f64s(crate::family::MU_FLOOR);
+                let ehi = simd.splat_f64s(crate::family::ETA_MAX);
+                let half = simd.splat_f64s(0.5);
+                for i in 0..eh.len() {
+                    let raw = eh[i];
+                    bad = simd.add_f64s(
+                        bad,
+                        simd.select_f64s(simd.less_than_or_equal_f64s(raw, zero), one, zero),
+                    );
+                    let ec = simd.min_f64s(simd.max_f64s(raw, elo), ehi);
+                    let mu = simd.max_f64s(simd.div_f64s(one, simd.sqrt_f64s(ec)), elo);
+                    let mu3 = simd.mul_f64s(simd.mul_f64s(mu, mu), mu);
+                    let dmu = simd.neg_f64s(simd.mul_f64s(half, mu3));
+                    let w_raw = simd.div_f64s(simd.mul_f64s(dmu, dmu), mu3);
+                    eh[i] = ec;
+                    ph[i] = mu;
+                    let pw = if gh.is_empty() { one } else { gh[i] };
+                    wh[i] = simd.max_f64s(simd.mul_f64s(pw, w_raw), clampv);
+                    if let Some(slot) = zh.get_mut(i) {
+                        *slot = simd.add_f64s(ec, simd.div_f64s(simd.sub_f64s(yh[i], mu), dmu));
+                    }
+                }
+                for i in 0..et.len() {
+                    let raw = et[i];
+                    bad_tail |= raw <= 0.0;
+                    let ec = raw.clamp(crate::family::MU_FLOOR, crate::family::ETA_MAX);
+                    let mu = (1.0 / ec.sqrt()).max(crate::family::MU_FLOOR);
+                    let mu3 = mu * mu * mu;
+                    let dmu = -0.5 * mu3;
+                    let w_raw = dmu * dmu / mu3;
+                    et[i] = ec;
+                    pt[i] = mu;
+                    let pw = if gt.is_empty() { 1.0 } else { gt[i] };
+                    wt[i] = (pw * w_raw).max(crate::glm::WEIGHT_CLAMP);
                     if let Some(slot) = zt.get_mut(i) {
                         *slot = ec + (yt[i] - mu) / dmu;
                     }
@@ -1620,14 +1733,22 @@ mod tests {
         // The `simd_fused`/`scalar_fused` discipline, applied per family arm: a
         // whole-slice call (SIMD head + tail) must agree TO THE BIT with the same
         // rows run one at a time (which is pure tail, every lane width).
-        use crate::spec::{BinomialLink, Family, GammaLink, NegBinomialLink, PoissonLink};
+        use crate::spec::{
+            BinomialLink, Family, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink,
+        };
         let n = 1_003usize;
         let eta: Vec<f64> = (0..n).map(|k| -4.0 + 8.0 * k as f64 / n as f64).collect();
         let pw: Vec<f64> = (0..n).map(|k| 1.0 + (k % 5) as f64).collect();
-        let cases: [(Family, f64); 5] = [
+        let cases: [(Family, f64); 8] = [
             (
                 Family::Binomial {
                     link: BinomialLink::Probit,
+                },
+                f64::NAN,
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Cloglog,
                 },
                 f64::NAN,
             ),
@@ -1655,11 +1776,25 @@ mod tests {
                 },
                 1.7,
             ),
+            (
+                Family::InverseGaussian {
+                    link: InverseGaussianLink::Log,
+                },
+                f64::NAN,
+            ),
+            (
+                Family::InverseGaussian {
+                    link: InverseGaussianLink::InverseSquared,
+                },
+                f64::NAN,
+            ),
         ];
         for (family, nb_theta) in cases {
             let y: Vec<f64> = match family {
                 Family::Binomial { .. } => (0..n).map(|k| (k % 3) as f64 / 2.0).collect(),
-                Family::Gamma { .. } => (0..n).map(|k| 0.5 + (k % 7) as f64).collect(),
+                Family::Gamma { .. } | Family::InverseGaussian { .. } => {
+                    (0..n).map(|k| 0.5 + (k % 7) as f64).collect()
+                }
                 _ => (0..n).map(|k| (k % 9) as f64).collect(),
             };
             let run = |lo: usize,

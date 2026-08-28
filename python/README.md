@@ -59,10 +59,11 @@ adding a `(… | g)` term makes it LMM/GLMM.
 | `family` | default link | other links | fixed-only | with `(… \| g)` |
 |---|---|---|---|---|
 | `gaussian` | identity | — | OLS | LMM |
-| `binomial` | `logit` | `probit` | GLM | GLMM |
+| `binomial` | `logit` | `probit`, `cloglog` | GLM | GLMM |
 | `poisson` | `log` | — | GLM | GLMM |
 | `gamma` | `log` | `inverse` | GLM | GLMM |
 | `negativebinomial` | `log` | — | GLM | GLMM |
+| `inversegaussian` | `log` | `inverse_squared` | GLM | random effects raise |
 
 ```python
 fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
@@ -78,10 +79,10 @@ in
 
 ### Not yet implemented
 
-Four combinations have an approved design but no kernel support, and raise a
-clean `NotImplementedError`: `family="inversegaussian"`, `link="cloglog"`,
-quasi-likelihood `dispersion=` on binomial/poisson, and a float `init_theta=`
-seed (only the default `init_theta=None` cold start is supported). See
+Two combinations have an approved design but no kernel support, and raise a
+clean `NotImplementedError`: quasi-likelihood `dispersion=` on
+binomial/poisson, and a float `init_theta=` seed (only the default
+`init_theta=None` cold start is supported). See
 [`troubleshooting.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/troubleshooting.md)
 for fixes to common errors.
 

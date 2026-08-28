@@ -510,7 +510,7 @@ pub fn fd_hessian_cov(
 /// `structured_schur_fill`: all three read the identical `ws.w`/`x` pair for this
 /// block (they differ only in how they build `X'W̃M`), so one GEMM fill serves
 /// all three rather than three copies of the same scalar triple loop. Mirrors the
-/// `pirls.rs` `BetaStep::Profile` xtwx GEMM this construction is shared with.
+/// `glmm/pirls/dense.rs` `BetaStep::Profile` xtwx GEMM this construction is shared with.
 fn xtwx_fill(ws: &mut GlmmWorkspace, x: MatRef<f64>, n: usize) {
     let p = ws.p;
     for c in 0..p {
@@ -533,7 +533,7 @@ fn xtwx_fill(ws: &mut GlmmWorkspace, x: MatRef<f64>, n: usize) {
 /// arg}`. Returns false on a non-PD `ws.a`. Unchanged from the pre-Phase-2 inline
 /// inference — moved verbatim so the crossed path is byte-for-byte identical.
 ///
-/// PIRLS's `BetaStep::Profile` β-Schur border step (pirls.rs) reuses this exact
+/// PIRLS's `BetaStep::Profile` β-Schur border step (`glmm/pirls/dense.rs`) reuses this exact
 /// C = X'WX, B' = X'WM, T = A⁻¹B, S_β = C − B'T construction each iteration (with
 /// that iteration's own W and factor), then additionally solves
 /// δβ = S_β⁻¹·(X'ρ − B'δu₀) and folds `u_joint = u_new − T·δβ` back into the

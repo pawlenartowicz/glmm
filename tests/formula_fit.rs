@@ -16,10 +16,14 @@
 //! hand-built spec.
 
 use glmm::formula::{lower, Column, Table};
+#[cfg(feature = "orchestrate")]
+use glmm::orchestrate::run_fit;
 use glmm::{
     fit_cold, Family, Fit, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec,
     ReStructure, Sizing,
 };
+#[cfg(feature = "orchestrate")]
+use std::collections::HashMap;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -273,6 +277,73 @@ fn sleepstudy_random_slope_matches_hand_built_spec() {
         &hand,
         "sleepstudy",
     );
+}
+
+/// `(1 + log(x) | g)` must lower to the same design and fit as computing the
+/// column by hand and naming it — the transform is a name, not a model.
+#[test]
+fn random_slope_on_a_transform_matches_precomputed_column() {
+    let data = rows(include_str!("../validation/data/empirical/sleepstudy.csv"));
+    let reaction: Vec<f64> = data.iter().map(|r| r[0].parse().unwrap()).collect();
+    let days: Vec<f64> = data
+        .iter()
+        .map(|r| r[1].parse::<f64>().unwrap() + 1.0)
+        .collect();
+    let n = reaction.len();
+    let by_hand = Table {
+        columns: vec![
+            ("Reaction".into(), Column::Numeric(reaction.clone())),
+            (
+                "ld".into(),
+                Column::Numeric(days.iter().map(|d| d.ln()).collect()),
+            ),
+            ("Subject".into(), factor(&data, 2)),
+        ],
+        n,
+    };
+    let via = Table {
+        columns: vec![
+            ("Reaction".into(), Column::Numeric(reaction)),
+            ("Days1".into(), Column::Numeric(days)),
+            ("Subject".into(), factor(&data, 2)),
+        ],
+        n,
+    };
+    let lo_hand = lower(
+        "Reaction ~ ld + (1 + ld | Subject)",
+        &by_hand,
+        Family::Gaussian,
+    )
+    .unwrap();
+    let lo_via = lower(
+        "Reaction ~ log(Days1) + (1 + log(Days1) | Subject)",
+        &via,
+        Family::Gaussian,
+    )
+    .unwrap();
+    assert_eq!(lo_via.col_names, vec!["(Intercept)", "log(Days1)"]);
+    assert_eq!(lo_via.x, lo_hand.x);
+    assert_eq!(lo_via.model, lo_hand.model);
+    assert_eq!(lo_via.re_groups[0].terms, vec!["(Intercept)", "log(Days1)"]);
+    let a = fit_cold(
+        &lo_via.x,
+        &lo_via.y,
+        lo_via.n,
+        lo_via.p,
+        &lo_via.model,
+        &lo_via.ids,
+        &lo_via.opts,
+    );
+    let b = fit_cold(
+        &lo_hand.x,
+        &lo_hand.y,
+        lo_hand.n,
+        lo_hand.p,
+        &lo_hand.model,
+        &lo_hand.ids,
+        &lo_hand.opts,
+    );
+    assert_same_fit(&a, &b, "log slope");
 }
 
 #[test]
@@ -534,6 +605,98 @@ fn cbpp_binomial_matches_hand_built_spec() {
     );
 }
 
+/// `cbind(incidence, failures) ~ …` must lower to exactly the proportion +
+/// trial-count fit the tutorials describe as the workaround.
+#[test]
+fn cbind_response_equals_proportion_plus_weights() {
+    let data = rows(include_str!("../validation/data/empirical/cbpp.csv"));
+    let inc: Vec<f64> = data.iter().map(|r| r[1].parse().unwrap()).collect();
+    let size: Vec<f64> = data.iter().map(|r| r[2].parse().unwrap()).collect();
+    let fail: Vec<f64> = inc.iter().zip(&size).map(|(i, s)| s - i).collect();
+    let prop: Vec<f64> = inc.iter().zip(&size).map(|(i, s)| i / s).collect();
+    let n = inc.len();
+    let table = Table {
+        columns: vec![
+            ("inc".into(), Column::Numeric(inc)),
+            ("fail".into(), Column::Numeric(fail)),
+            ("prop".into(), Column::Numeric(prop)),
+            ("period".into(), factor(&data, 3)),
+            ("herd".into(), factor(&data, 0)),
+        ],
+        n,
+    };
+    let fam = Family::Binomial {
+        link: glmm::BinomialLink::Logit,
+    };
+    let lo_c = lower("cbind(inc, fail) ~ period + (1|herd)", &table, fam).unwrap();
+    let mut lo_w = lower("prop ~ period + (1|herd)", &table, fam).unwrap();
+    lo_w.opts.weights = Some(size);
+    assert_eq!(lo_c.y, lo_w.y);
+    assert_eq!(lo_c.opts.weights, lo_w.opts.weights);
+    let a = fit_cold(
+        &lo_c.x,
+        &lo_c.y,
+        lo_c.n,
+        lo_c.p,
+        &lo_c.model,
+        &lo_c.ids,
+        &lo_c.opts,
+    );
+    let b = fit_cold(
+        &lo_w.x,
+        &lo_w.y,
+        lo_w.n,
+        lo_w.p,
+        &lo_w.model,
+        &lo_w.ids,
+        &lo_w.opts,
+    );
+    assert_same_fit(&a, &b, "cbind");
+}
+
+#[test]
+fn cbind_rejects_zero_trials_and_non_binomial() {
+    let table = Table {
+        columns: vec![
+            ("s".into(), Column::Numeric(vec![1.0, 0.0, 2.0])),
+            ("f".into(), Column::Numeric(vec![1.0, 0.0, 1.0])),
+            ("x".into(), Column::Numeric(vec![0.1, 0.2, 0.3])),
+        ],
+        n: 3,
+    };
+    let fam = Family::Binomial {
+        link: glmm::BinomialLink::Logit,
+    };
+    let err = match lower("cbind(s, f) ~ x", &table, fam) {
+        Ok(_) => panic!("expected the zero-trials row to be rejected"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("row 1"), "{err}");
+    let err = match lower("cbind(s, f) ~ x", &table, Family::Gaussian) {
+        Ok(_) => panic!("expected a non-binomial cbind() response to be rejected"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("binomial"), "{err}");
+    // A negative count passes the positive-sum check (-2 + 10 = 8) and would
+    // lower to a proportion outside [0, 1]; it must be its own rejection.
+    let table = Table {
+        columns: vec![
+            ("s".into(), Column::Numeric(vec![1.0, -2.0, 2.0])),
+            ("f".into(), Column::Numeric(vec![1.0, 10.0, 1.0])),
+            ("x".into(), Column::Numeric(vec![0.1, 0.2, 0.3])),
+        ],
+        n: 3,
+    };
+    let err = match lower("cbind(s, f) ~ x", &table, fam) {
+        Ok(_) => panic!("expected the negative-count row to be rejected"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("non-negative") && err.contains("row 1"),
+        "{err}"
+    );
+}
+
 #[test]
 fn grouseticks_poisson_matches_hand_built_spec() {
     let data = rows(include_str!("../validation/data/empirical/grouseticks.csv"));
@@ -587,6 +750,112 @@ fn grouseticks_poisson_matches_hand_built_spec() {
 // `lower()` is pure enough not to need a converging fit for this — small
 // fabricated tables are enough to exercise `lower_random_effects`'s
 // primary/extra bookkeeping.
+
+#[test]
+fn intercept_free_re_only_formula_is_rejected() {
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+            (
+                "g".into(),
+                Column::factor_from_labels(&["a", "a", "b", "b"].map(String::from)),
+            ),
+        ],
+        n: 4,
+    };
+    let err = match lower("y ~ 0 + (1|g)", &table, Family::Gaussian) {
+        Ok(_) => panic!("expected an intercept-free, term-free formula to be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("no columns"), "{err}");
+}
+
+/// The first-factor promotion (`y ~ 0 + f + ...`) is a FIXED-DESIGN coding
+/// convention only. A random slope on the promoted factor must not inherit the
+/// promotion: `(f|g)` should resolve to the same treatment-coded slope block
+/// (intercept + non-base dummies) that `y ~ f + (f|g)` gets, never the
+/// promoted factor's full indicator set (which would make the RE block
+/// structurally singular — intercept + 3 dummies for a 3-level factor).
+#[test]
+fn promoted_factor_re_slope_keeps_treatment_dummies() {
+    let table = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            ),
+            (
+                "f".into(),
+                Column::factor_from_labels(&["a", "b", "c", "a", "b", "c"].map(String::from)),
+            ),
+            (
+                "g".into(),
+                Column::factor_from_labels(&["g1", "g1", "g1", "g2", "g2", "g2"].map(String::from)),
+            ),
+        ],
+        n: 6,
+    };
+
+    let promoted = lower("y ~ 0 + f + (f|g)", &table, Family::Gaussian).unwrap();
+    assert_eq!(promoted.col_names, vec!["fa", "fb", "fc"]);
+    assert_eq!(promoted.re_groups[0].terms, vec!["(Intercept)", "fb", "fc"]);
+
+    let plain = lower("y ~ f + (f|g)", &table, Family::Gaussian).unwrap();
+    assert_eq!(plain.col_names, vec!["(Intercept)", "fb", "fc"]);
+    assert_eq!(plain.re_groups[0].terms, vec!["(Intercept)", "fb", "fc"]);
+
+    // Same slope columns in both designs — resolve each design's `ColumnId`s
+    // back through its own `col_names` and check they name the same dummies,
+    // rather than assuming identical indices (the intercept column shifts
+    // everything after it by one when present).
+    let promoted_slopes = &promoted.model.re.as_ref().unwrap().slopes;
+    let plain_slopes = &plain.model.re.as_ref().unwrap().slopes;
+    let promoted_names: Vec<&str> = promoted_slopes
+        .iter()
+        .map(|&c| promoted.col_names[c as usize].as_str())
+        .collect();
+    let plain_names: Vec<&str> = plain_slopes
+        .iter()
+        .map(|&c| plain.col_names[c as usize].as_str())
+        .collect();
+    assert_eq!(promoted_names, vec!["fb", "fc"]);
+    assert_eq!(plain_names, vec!["fb", "fc"]);
+}
+
+#[test]
+fn log_of_a_nonpositive_value_is_reported_not_finite_at_its_row() {
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+            ("x".into(), Column::Numeric(vec![1.0, 2.0, -1.0, 4.0])),
+        ],
+        n: 4,
+    };
+    let err = match lower("y ~ log(x)", &table, Family::Gaussian) {
+        Ok(_) => panic!("expected log(x) on a non-positive x to be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("not finite at row 2"), "{err}");
+}
+
+#[test]
+fn transform_of_a_factor_column_is_rejected_as_not_numeric() {
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+            (
+                "f".into(),
+                Column::factor_from_labels(&["a", "b", "a", "b"].map(String::from)),
+            ),
+        ],
+        n: 4,
+    };
+    let err = match lower("y ~ log(f)", &table, Family::Gaussian) {
+        Ok(_) => panic!("expected log(f) on a factor column to be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("is not numeric"), "{err}");
+}
 
 #[test]
 fn re_groups_intercept_only() {
@@ -920,4 +1189,90 @@ fn declared_factor_level_order_picks_the_reference_level() {
         "base high: {}",
         f2.beta[0]
     );
+}
+
+/// `offset(log(e))` in the formula must produce the same fit as passing the
+/// same vector through `FitOptions.offset`.
+#[test]
+fn offset_term_equals_offset_argument() {
+    let data = rows(include_str!("../validation/data/empirical/grouseticks.csv"));
+    let ticks: Vec<f64> = data.iter().map(|r| r[1].parse().unwrap()).collect();
+    let height: Vec<f64> = data.iter().map(|r| r[3].parse().unwrap()).collect();
+    let n = ticks.len();
+    let table = Table {
+        columns: vec![
+            ("TICKS".into(), Column::Numeric(ticks)),
+            ("HEIGHT".into(), Column::Numeric(height.clone())),
+            ("BROOD".into(), factor(&data, 2)),
+        ],
+        n,
+    };
+    let fam = Family::Poisson {
+        link: glmm::PoissonLink::Log,
+    };
+    let lo_term = lower("TICKS ~ offset(log(HEIGHT)) + (1|BROOD)", &table, fam).unwrap();
+    let mut lo_arg = lower("TICKS ~ (1|BROOD)", &table, fam).unwrap();
+    lo_arg.opts.offset = Some(height.iter().map(|h| h.ln()).collect());
+    assert_eq!(lo_term.col_names, vec!["(Intercept)"]);
+    assert_eq!(lo_term.opts.offset, lo_arg.opts.offset);
+    let a = fit_cold(
+        &lo_term.x,
+        &lo_term.y,
+        lo_term.n,
+        lo_term.p,
+        &lo_term.model,
+        &lo_term.ids,
+        &lo_term.opts,
+    );
+    let b = fit_cold(
+        &lo_arg.x,
+        &lo_arg.y,
+        lo_arg.n,
+        lo_arg.p,
+        &lo_arg.model,
+        &lo_arg.ids,
+        &lo_arg.opts,
+    );
+    assert_same_fit(&a, &b, "offset term");
+}
+
+// ── FitResult carries the response and the row count ─────────────────────────
+
+/// `y` on the result is the response AFTER lowering — for `cbind(s, f)` the
+/// proportion the kernel fitted, not either raw column — and `nobs` is the
+/// lowered row count. Both ports print a header from these on fits where
+/// `fitted` is empty, so they must not be derived from `fitted`.
+///
+/// Behind `orchestrate`: `run_fit` and `FitResult` are gated on that
+/// off-by-default feature, so this test is too — the plain `cargo test`
+/// default-feature build never sees this import.
+#[cfg(feature = "orchestrate")]
+#[test]
+fn run_fit_returns_lowered_response_and_nobs() {
+    let mut numeric = HashMap::new();
+    numeric.insert("s".to_string(), vec![1.0, 2.0, 0.0, 3.0, 1.0, 2.0]);
+    numeric.insert("f".to_string(), vec![3.0, 2.0, 4.0, 1.0, 3.0, 2.0]);
+    numeric.insert("x".to_string(), vec![0.1, 0.5, 0.9, 0.2, 0.6, 0.8]);
+    let factor = HashMap::new();
+    let r = run_fit(
+        "cbind(s, f) ~ x",
+        numeric,
+        factor,
+        "binomial",
+        "logit",
+        "hessian",
+        1,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(r.nobs, 6);
+    let expected: Vec<f64> = [1.0, 2.0, 0.0, 3.0, 1.0, 2.0]
+        .iter()
+        .zip([3.0, 2.0, 4.0, 1.0, 3.0, 2.0])
+        .map(|(s, f)| s / (s + f))
+        .collect();
+    assert_eq!(r.y, expected);
 }

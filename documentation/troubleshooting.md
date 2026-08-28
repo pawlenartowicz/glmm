@@ -72,19 +72,21 @@ reports honestly if it didn't converge.
 
 ## NotImplementedError: family/link/knob
 
-Four combinations have an approved design but no kernel support yet, and
+Two combinations have an approved design but no kernel support yet, and
 raise a clean `NotImplementedError` rather than silently falling back to
 something close:
 
-- `family="inversegaussian"`
-- `link="cloglog"`
 - quasi-likelihood `dispersion=` on binomial/Poisson
 - a float `init_theta=` seed (only the default `init_theta=None` cold start
   is supported)
 
-If you hit one of these, there's nothing to configure around it today — wait
-for the family/link/knob to land, or restructure the model to avoid it (e.g.
-use `link="logit"` instead of `"cloglog"`, or drop the `dispersion=` request).
+`family="inversegaussian"` (fixed-effect GLM only — mixed models fault with a
+message naming the deferral) and `link="cloglog"` (GLM and GLMM) are both
+implemented.
+
+If you hit one of the two remaining gaps, there's nothing to configure around
+it today — wait for the knob to land, or restructure the model to avoid it
+(e.g. drop the `dispersion=` request).
 
 ## Warning: falling back to Laplace
 
@@ -104,10 +106,12 @@ Laplace fit.
 
 ## My formula is rejected
 
-The formula parser only accepts bare column names, not R's function-call
-syntax — `log(x)`, `I(x^2)`, `cbind(s, f)`, `- 1`, `(x || g)`, `offset()`,
-`.`, and `contrasts=` are all clear parse-time errors, never a silent
-reinterpretation. See
+The formula parser accepts bare column names, `- 1`/`0 +`, a small whitelist
+of transforms (`log(x)`, `sqrt(x)`, `exp(x)`, `I(x^2)`), `offset()`, and
+`cbind(s, f)` on the response — but not R's general function-call syntax:
+`poly(x, 2)`, nested calls, arithmetic inside a call, `(x || g)`,
+`(0 + x | g)`, `.`, and `contrasts=` are all clear parse-time errors, never a
+silent reinterpretation. See
 [`formula.md#not-accepted-and-the-workaround`](formula.md#not-accepted-and-the-workaround)
 for the full list and the workaround for each.
 

@@ -13,9 +13,9 @@ is a string or scalar argument, not a type.
 > **Status:** this release ships the full API surface — signatures, argument
 > validation, `Fit`, `summary()` — wired end to end through the PyO3 binding:
 > a valid `fit(...)` call parses the formula, fits, and returns a real `Fit`.
-> Four narrow combinations are open gaps and raise a clean `NotImplementedError`
-> instead: `family="inversegaussian"`, `link="cloglog"`, quasi-likelihood
-> `dispersion=` on binomial/poisson, and an `init_theta=` float seed (see §2).
+> Two narrow combinations are open gaps and raise a clean `NotImplementedError`
+> instead: quasi-likelihood `dispersion=` on binomial/poisson, and an
+> `init_theta=` float seed (see §2).
 
 Install from PyPI:
 
@@ -80,18 +80,19 @@ string only where the kernel offers a choice:
 | `family` | default link | other links | distribution params |
 |---|---|---|---|
 | `gaussian` | identity | — | — |
-| `binomial` | `logit` | `probit`; `cloglog` not yet available (see status above) | — |
+| `binomial` | `logit` | `probit`, `cloglog` | — |
 | `poisson` | `log` | — | — |
 | `gamma` | `log` | `inverse` | `dispersion` |
 | `negativebinomial` | `log` | — | `theta` |
-| `inversegaussian` | not yet available (see status above) | — | — |
+| `inversegaussian` | `log` | `inverse_squared` (fixed-effect GLM only — mixed models raise `ValueError`) | — |
 
 ```python
 fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
 ```
 
-- `dispersion` — three states. `None` (default): gamma estimates φ̂ post-fit
-  by Pearson and scales SE by √φ̂; other families hold φ ≡ 1. `"estimate"`:
+- `dispersion` — three states. `None` (default): gamma and inverse-Gaussian
+  estimate φ̂ post-fit by Pearson and scale SE by √φ̂; other families hold
+  φ ≡ 1. `"estimate"`:
   force the Pearson estimate — on binomial/poisson this
   *is* quasi-binomial/quasi-Poisson, GLM only. A float: hold φ fixed (still
   scales SE). Fix-vs-estimate, not a warm start.
@@ -116,8 +117,9 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
   for it and no column added to the design. The canonical use is a Poisson
   rate model against a known exposure, `offset = np.log(exposure)`. Honored
   for every family and every solver path; `None` (default) means no offset.
-  The formula's `offset()` term is still rejected (see
-  [`formula.md`](formula.md)) — pass the array here instead.
+  The formula also accepts an `offset(expr)` term (see
+  [`formula.md`](formula.md)); passing both this argument and a formula
+  `offset()` term is an error asking you to use one.
 
 **Error vs. warning.** An *invalid* value — unknown family, a link the family
 doesn't offer, even `nagq` (`ValueError`), a non-dict `warm_start`
@@ -125,7 +127,9 @@ doesn't offer, even `nagq` (`ValueError`), a non-dict `warm_start`
 gaussian, `init_theta=` off negative-binomial, quasi-dispersion on a mixed
 binomial/poisson formula — warns (`UserWarning`) and is stripped, so it never
 reaches the kernel: loud enough to catch the mistake, lenient enough for
-exploration. `inversegaussian` is not yet implemented (see status above).
+exploration. `family="inversegaussian"` with a random-effect term raises
+`ValueError` before the call reaches the kernel — mixed models are fixed-effect
+GLM only for this family (see status above).
 
 ## 3. Reading the result — `Fit`
 
@@ -142,7 +146,7 @@ them). It is returned by `fit`, never constructed by callers.
 | `varcorr` | per grouping: vech-packed lower-triangular RE covariance D̂ |
 | `tau2` | legacy per-element RE variances (q=1 only) — prefer `varcorr` |
 | `stddev_se` | SE of each RE stddev, θ layout (not beta-aligned); `NaN` where unavailable |
-| `dispersion` | φ (gamma) / θ (negbin) / 1.0 otherwise |
+| `dispersion` | φ (gamma / inverse-gaussian) / θ (negbin) / 1.0 otherwise |
 | `re_groups` | per grouping, in `varcorr` order: `(name, [term names])` — what `summary()` labels the RE block with |
 | `n_eval` | optimizer objective evaluations (0 on the closed-form/IRLS paths) |
 | `deviance` | minimized optimizer criterion — **not** comparable across models, and not an AIC input (see below) |

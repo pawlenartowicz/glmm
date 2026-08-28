@@ -45,6 +45,33 @@ source(file.path(script_dir, "dev_align.R"))
 # label style.
 norm_coef <- function(x) gsub("[:& ]", "", x)
 
+# Permutation that reorders `b_names` into `a_names`'s order (after norm_coef),
+# or NULL when the two coefficient sets can't be matched unambiguously --
+# different name sets, a name repeated after normalization, or a missing
+# name. NULL means "do not compare": engines are free to order factor levels
+# differently (lme4's `dept` numeric vs MixedModels/glmm's lexicographic,
+# rung 47 InstEval), so a caller must never fall back to positional order.
+coef_perm <- function(a_names, b_names) {
+  na <- norm_coef(a_names); nb <- norm_coef(b_names)
+  if (length(na) != length(nb) || anyDuplicated(na) || anyDuplicated(nb) ||
+      !setequal(na, nb)) {
+    return(NULL)
+  }
+  match(na, nb)
+}
+
+# rel_max over a coefficient-indexed vector pair, reordering `y` into `x`'s
+# coefficient order first via coef_perm. NA_real_ (rendered FAIL(len)/n/a by
+# the existing mark()/cell() machinery, same as any other non-comparable
+# case) when alignment fails or the lengths don't match their name vectors --
+# never a positional number over mismatched coefficients.
+rel_max_by_coef <- function(x, a_names, y, b_names) {
+  if (length(x) != length(a_names) || length(y) != length(b_names)) return(NA_real_)
+  perm <- coef_perm(a_names, b_names)
+  if (is.null(perm)) return(NA_real_)
+  rel_max(x, y[perm])
+}
+
 read_engine <- function(engine) {
   files <- unlist(lapply(c("empirical", "simulated"), function(s)
     list.files(file.path(suite_dir, "results", paste0(engine, "_", s)),
@@ -147,7 +174,7 @@ for (engine in others) {
     if (is.null(b)) next
     gaussian <- a$family == "gaussian"
 
-    d_beta <- rel_max(a$estimates$beta, b$estimates$beta)
+    d_beta <- rel_max_by_coef(a$estimates$beta, a$coef_names, b$estimates$beta, b$coef_names)
     # Fixed-only rungs (weights suite) carry an empty varcomp on both sides --
     # n/a, not a comparison (rel_max over zero-length vectors would warn -Inf).
     d_sd   <- if (is.null(stddevs(a)) && is.null(stddevs(b))) NA_real_
@@ -173,21 +200,28 @@ for (engine in others) {
                  else "DEV-OK"
       }
     } else { d_dev <- NA_real_; m_dev <- "n/a" }
-    coef_ok <- identical(norm_coef(a$coef_names), norm_coef(b$coef_names))
+    # "ok" means the two engines' coefficient sets can be aligned by name --
+    # order is not part of the contract here (factor-level ordering is an
+    # engine convention, e.g. lme4's numeric `dept` vs MixedModels/glmm's
+    # lexicographic one on InstEval, rung 47). A set mismatch, a missing
+    # name, or a name repeated after normalization is the only thing that
+    # makes this FALSE; d_beta/d_se_* above already refuse to compare (NA)
+    # under those same conditions via rel_max_by_coef.
+    coef_ok <- !is.null(coef_perm(a$coef_names, b$coef_names))
 
     # SE by method (gap 1.1). Gaussian: single profiled `se`, shown in the rx slot.
     # GLMM: se_rx is method-matched across all engines (gated tight); se_hessian
     # exists only where both sides compute it (lme4 & glmm) -- n/a when the engine
     # lacks it (MixedModels), gated at se_hessian_rel when present.
     if (gaussian) {
-      d_se_rx <- rel_max(a$estimates$se, b$estimates$se)
+      d_se_rx <- rel_max_by_coef(a$estimates$se, a$coef_names, b$estimates$se, b$coef_names)
       m_se_rx <- mark(d_se_rx, TOL$se_rel)
       d_se_h  <- NA_real_; m_se_h <- "n/a"
     } else {
-      d_se_rx <- rel_max(a$estimates$se_rx, b$estimates$se_rx)
+      d_se_rx <- rel_max_by_coef(a$estimates$se_rx, a$coef_names, b$estimates$se_rx, b$coef_names)
       m_se_rx <- mark(d_se_rx, TOL$se_rel)
       if (!is.null(b$estimates$se_hessian)) {
-        d_se_h <- rel_max(a$estimates$se_hessian, b$estimates$se_hessian)
+        d_se_h <- rel_max_by_coef(a$estimates$se_hessian, a$coef_names, b$estimates$se_hessian, b$coef_names)
         # The ONE per-rung band in the harness (tol.R's TOL_PER_RUNG): every other
         # gate here reads its flat TOL entry directly. se_hessian is singled out
         # because it is the only quantity where the corpus-wide band (1e-3) is
@@ -205,7 +239,7 @@ for (engine in others) {
     # is a real flag, not a tolerance to relax.
     bmm <- mixedmodels[[name]]
     if (engine != "mixedmodels" && !is.null(bmm)) {
-      d_se_mm <- rel_max(se_rx_of(b), se_rx_of(bmm))
+      d_se_mm <- rel_max_by_coef(se_rx_of(b), b$coef_names, se_rx_of(bmm), bmm$coef_names)
       m_se_mm <- mark(d_se_mm, TOL$se_rel)
     } else { d_se_mm <- NA_real_; m_se_mm <- "n/a" }
 

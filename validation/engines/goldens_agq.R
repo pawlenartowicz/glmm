@@ -55,6 +55,9 @@ fam_obj <- function(family, link) switch(family,
   poisson  = poisson(link = link),
   binomial = binomial(link = link),
   gamma    = Gamma(link = link),
+  # "inverse_squared" is the port's spelling of R's "1/mu^2" -- the same mapping
+  # .normalize_family applies on the R port side; keep the two spellings consistent.
+  inversegaussian = inverse.gaussian(link = if (link == "inverse_squared") "1/mu^2" else link),
   stop("fam_obj: unsupported family ", family))
 
 # VarCorr -> per grouping factor: term names, stddevs, correlation matrix. Mirrors
@@ -218,7 +221,11 @@ fit_one <- function(spec) {
   # (summary()$dispersion). For the GLMM, emit the same Pearson form computed by
   # hand -- whether glmer couples phi into the fit is the design-3 open question the
   # in-crate test resolves; emitting Pearson + the lme4 sigma() lets the test pick.
-  if (spec$family == "gamma") {
+  # Gamma and inverse-Gaussian both profile phi out of the likelihood the same
+  # way, so both get the Pearson dispersion (and, for a glmm kind, sigma()) --
+  # inversegaussian currently only registers glm cells, but the branch is
+  # written for both kinds like Gamma's, not special-cased to glm alone.
+  if (spec$family %in% c("gamma", "inversegaussian")) {
     if (spec$kind == "glm") {
       est$dispersion <- summary(m)$dispersion
     } else {

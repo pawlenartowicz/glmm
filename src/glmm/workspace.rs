@@ -255,8 +255,8 @@ pub struct GlmmWorkspace {
     pub theta_se: Vec<f64>,
     /// length p; Var(β̂)_jj forward-solve scratch (per-target)
     pub fwd_solve: Vec<f64>,
-    // joint Wald scratch (reuse lme::joint_wald_chi_sq):
-    /// Inverse of the joint Wald K matrix, p×p (see `lme::joint_wald_chi_sq`).
+    // joint Wald scratch (reuse lmm::joint_wald_chi_sq):
+    /// Inverse of the joint Wald K matrix, p×p (see `lmm::joint_wald_chi_sq`).
     pub joint_k_inv: Mat<f64>,
     /// Cholesky factor of the joint Wald Σ_t, p×p.
     pub joint_sigma_t_chol: Mat<f64>,
@@ -382,7 +382,7 @@ impl GlmmWorkspace {
         crate::lmm::apply_campaign_overrides(&mut config, n_theta + p);
         // Stage-1 θ-only BOBYQA config: same rho_begin/rho_end schedule as the
         // joint solver above, but `npt` mirrors `sparse_lmm_seed`'s mid-model
-        // rule (lmm.rs), NOT the joint solver's — the two are sized for
+        // rule (`src/lmm/mod.rs`), NOT the joint solver's — the two are sized for
         // different-dimension searches and this crate's precedent for a
         // θ-only search is `sparse_lmm_seed`. MIRRORS `config1` in
         // `fit_glmm_sparse` (sparse.rs) — change together. Both feed through
@@ -1067,8 +1067,8 @@ pub(crate) fn build_packed_m(
     for i in 0..n {
         let f = cluster_ids[i] as usize;
         // Core primary block: the identical `Σ_{r≥c} z_r·lam[r·q+c]` reduction
-        // that `pirls.rs`'s per-solve M fill runs (pirls.rs:617-630, whose own
-        // comment records it as bit-identical to the z-sourced form) — z_r is
+        // that `glmm/pirls/blocked.rs`'s `pirls_solve_blocked` per-solve M fill runs
+        // (whose own comment records it as bit-identical to the z-sourced form) — z_r is
         // 1.0 at r==0 (the intercept `build_z` always writes) or the
         // pre-widened slope value `z_buf[i·(q−1)+(r−1)]` otherwise (the same
         // `x` column `build_z` would have widened into the row's `z` block).

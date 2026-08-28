@@ -11,8 +11,15 @@
 **Standalone f64 GLM(M) fit kernels — OLS → GLM → LMM → GLMM — in pure Rust on faer.**
 
 Fits fixed-effect and mixed (random-intercept/random-slope) models for
-Gaussian, Binomial (logit/probit), Poisson, Gamma, and Negative-Binomial
-outcomes, validated against R/lme4 and Julia/MixedModels.jl goldens.
+Gaussian, Binomial (logit/probit/cloglog), Poisson, Gamma, Negative-Binomial,
+and (fixed-effect GLM only) Inverse-Gaussian outcomes, validated against
+R/lme4 and Julia/MixedModels.jl goldens.
+
+**Beta.** Handles the usual mixed models, supports AGQ more widely than lme4,
+and is typically several times faster on them. Some lme4 features are still
+missing (see [`docs`](documentation/)). Version 1.0 will add a built-in test
+for whether a random effect matters — currently you need the separate RLRsim
+package, and it only works for normal (Gaussian) outcomes.
 
 **New to the crate? Start with [`tutorial-rust.md`](documentation/tutorial-rust.md)** — a
 single-page, three-layer walkthrough (cold fit → warm fit → advanced loop)
@@ -75,15 +82,16 @@ The semver-covered surface is `fit_cold`/`fit_warm` + `ModelSpec` + `GroupIds`.
 | Model                      | Fixed-only (`re: None`) | Mixed (`re: Some`)                                          |
 |-----------------------------|--------------------------|---------------------------------------------------------------|
 | Gaussian                    | OLS                      | LMM — dense, or sparse-Z when an extra grouping carries a random slope |
-| Binomial (logit/probit)     | GLM                      | GLMM — dense, or sparse-Z over-envelope                          |
+| Binomial (logit/probit/cloglog) | GLM                  | GLMM — dense, or sparse-Z over-envelope                          |
 | Poisson (log)                | GLM                      | GLMM — dense, or sparse-Z over-envelope                          |
 | Gamma (log/inverse)          | GLM                      | GLMM — dense, or sparse-Z over-envelope                          |
 | Negative-Binomial (log)      | GLM                      | GLMM — dense, or sparse-Z over-envelope                          |
+| Inverse-Gaussian (log / 1/μ²) | GLM                     | not supported (faults)                                          |
 
-Every wired family fits through both routes — there is no reachable panic for
-falling outside the dense solver's envelope (too many extra groupings, or an
-extra grouping too wide); classification just routes to the sparse-Z solver
-instead. See [`tutorial-rust.md`](documentation/tutorial-rust.md) and
+Every wired family, except Inverse-Gaussian (fixed-effects only), fits
+through both routes — there is no reachable panic for falling outside the
+dense solver's envelope (too many extra groupings, or an extra grouping too
+wide); classification just routes to the sparse-Z solver instead. See [`tutorial-rust.md`](documentation/tutorial-rust.md) and
 [`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md) for the
 dense/sparse routing envelope.
 

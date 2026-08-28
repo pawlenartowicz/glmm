@@ -53,14 +53,17 @@ rm -rf "$local_dir/glmm/r" "$local_dir/glmm/.github" \
 # glmm-r: unpackageable while this glmm version is unpublished (cargo package
 # verifies version deps against the registry), so copy + de-workspace its
 # manifest by hand. Anchored edits — mirrors glmm-r/Cargo.toml, change
-# together.
+# together. The glmm dep line has only `path = ".."` cut out of it, so the
+# version pin and the feature list ride along; rewriting the whole line
+# instead dropped `features = ["orchestrate"]` and the staticlib build failed
+# with `unresolved import glmm::orchestrate`.
 cp -r "$repo/glmm-r" "$local_dir/glmm-r"
 rm -rf "$local_dir/glmm-r/target"
 sed -i \
   -e 's/^edition\.workspace = true$/edition = "2021"/' \
   -e 's/^rust-version\.workspace = true$/rust-version = "1.85"/' \
   -e 's/^license\.workspace = true$/license = "GPL-3.0-or-later"/' \
-  -e "s/^glmm = .*\$/glmm = { version = \"$ver\" }/" \
+  -e 's|^glmm = { path = "\.\.", |glmm = { |' \
   -e '/^\[lints\]$/,/^workspace = true$/d' \
   "$local_dir/glmm-r/Cargo.toml"
 

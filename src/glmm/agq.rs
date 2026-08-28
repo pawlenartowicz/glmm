@@ -141,7 +141,7 @@ pub(crate) fn agq_deviance(
     crate::lmm::primary_lambda(&params[..n_theta], groupings.primary_q, lam);
     // `weighted` threads through to PIRLS so the converged mode ũ_c and curvature
     // A_c fold in the prior weights: on the logit-binomial fast path (a `!weighted`
-    // match arm in pirls.rs) an unweighted flag would skip `prior_w` entirely and
+    // match arm in glmm/pirls/dense.rs) an unweighted flag would skip `prior_w` entirely and
     // give an unweighted mode/scale, wrong for aggregated-binomial cells. Poisson/
     // probit fold `prior_w` regardless, but the flag must still be correct.
     let (_dev, _pen, _logdet, conv) = pirls_solve_blocked(

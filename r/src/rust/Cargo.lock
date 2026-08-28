@@ -35,9 +35,9 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bobyqa"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e67434f0d246f3a568c19e1232d45e8c1006f593fae3139f9909507c7831bc7f"
+checksum = "29652fc14c962e886cb95080521404983d791286b465baf11ee6decb2842b490"
 
 [[package]]
 name = "bytemuck"
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "fastglmm"
-version = "0.2.0"
+version = "0.3.1"
 dependencies = [
  "extendr-api",
  "glmm-r",
@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "glmm"
-version = "0.2.0"
+version = "0.3.1"
 dependencies = [
  "bobyqa",
  "faer",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "glmm-r"
-version = "0.2.0"
+version = "0.3.1"
 dependencies = [
  "extendr-api",
  "glmm",

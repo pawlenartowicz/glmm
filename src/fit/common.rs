@@ -1,5 +1,5 @@
-//! Shared helpers used by 2+ estimator dispatch files (`ols.rs`/`lmm.rs`/
-//! `glm.rs`/`glmm.rs`): θ-width/varcorr bookkeeping, RE-count sizing from
+//! Shared helpers used by 2+ estimator dispatch files (`ols.rs`/`lmm/mod.rs`/
+//! `glm.rs`/`glmm/`): θ-width/varcorr bookkeeping, RE-count sizing from
 //! `GroupIds`, rank-deficiency salvage, and the two `Fit::se` fill conventions
 //! (target-compact vs predictor-indexed). None of this touches a kernel
 //! directly — it is `fit`'s own marshalling logic, factored out of `mod.rs`
@@ -260,7 +260,7 @@ pub(super) fn varcorr_block(
 /// per grouping, declaration order (primary, then each extra). `scale` is σ̂²
 /// (LMM) or 1.0 (GLMM link scale). Path-independent — a function of θ̂ only.
 /// The primary-then-extras vech walk mirrors the `vech_start` layout assigned
-/// in `LmmGroupings::from_cluster_spec_ext` (`src/lmm.rs`) — change together.
+/// in `LmmGroupings::from_cluster_spec_ext` (`src/lmm/mod.rs`) — change together.
 /// `pub(crate)` so the sparse-Z path (`sparse::fit_mle_sparse`) recovers varcorr
 /// from θ̂ through the same path-independent assembly as the NoZ `fit_mle`.
 pub(crate) fn assemble_varcorr(
@@ -338,7 +338,7 @@ pub(crate) fn model_df(
 ) -> usize {
     let scale = match family {
         Family::Gaussian | Family::NegativeBinomial { .. } => 1,
-        Family::Gamma { .. } => usize::from(!dispersion_fixed),
+        Family::Gamma { .. } | Family::InverseGaussian { .. } => usize::from(!dispersion_fixed),
         Family::Binomial { .. } | Family::Poisson { .. } => 0,
     };
     p_retained + n_theta + scale
@@ -1154,6 +1154,16 @@ pub(super) fn assert_model_shape(model: &ModelSpec, p: usize, nagq: u8) {
     let Some(re) = model.re.as_ref() else {
         return;
     };
+    // Inverse-Gaussian mixed models are deliberately not built: the GLMM
+    // objective needs the profiled `inverse.gaussian()$aic` term, which the
+    // kernel does not have. Faulting here rather than in `build_workspace`'s
+    // dispatch means no workspace is allocated for a model that cannot be fit,
+    // and `fit_warm` runs this same gate at entry. `orchestrate`'s
+    // `catch_unwind` turns it into a clean `Err` for the FFI ports.
+    assert!(
+        !matches!(model.family, Family::InverseGaussian { .. }),
+        "inverse-Gaussian mixed models are not implemented (fixed-effects GLM only)"
+    );
     // The RE-envelope caps (extra-grouping count, q_p, q_g) are
     // `classify_design`'s routing boundary — over-envelope designs route to
     // the sparse path instead of aborting here. Only the column-bounds

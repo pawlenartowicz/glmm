@@ -41,6 +41,9 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     d.set_item("fitted", r.fitted)?;
     d.set_item("ranef", r.ranef)?;
     d.set_item("ranef_levels", r.ranef_levels)?;
+    d.set_item("y", r.y)?;
+    d.set_item("weights", r.weights)?;
+    d.set_item("nobs", r.nobs)?;
     // Labelled blocks as their own dicts, same reason the notes below are: the
     // Python layer reshapes each into `(n_levels, n_terms)` and never has to
     // know a positional order.

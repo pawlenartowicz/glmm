@@ -210,13 +210,14 @@ pub(crate) fn glm_view_to_fit(
     };
 
     // Dispersion. Binomial/Poisson hold φ≡1 (the kernel's `(XᵀWX)⁻¹` is the full
-    // covariance). Gamma recovers φ post-fit — the mean model β is φ-independent,
-    // so φ stays out of the IRLS — and scales the SE by √φ (the kernel folded
-    // φ=1, so Var(β̂)=φ·(XᵀWX)⁻¹). `dispersion: Some(v)` holds φ=v fixed; `None`
-    // estimates the Pearson moment `φ̂=Σ wᵢrᵢ²/(n−p)`, `rᵢ=(yᵢ−μ̂ᵢ)/√V(μ̂ᵢ)`,
-    // raw-row df — exactly `summary(glm(family=Gamma, weights=w))$dispersion`.
+    // covariance). Gamma and inverse-Gaussian recover φ post-fit — the mean
+    // model β is φ-independent, so φ stays out of the IRLS — and scale the SE
+    // by √φ (the kernel folded φ=1, so Var(β̂)=φ·(XᵀWX)⁻¹). `dispersion: Some(v)`
+    // holds φ=v fixed; `None` estimates the Pearson moment `φ̂=Σ wᵢrᵢ²/(n−p)`,
+    // `rᵢ=(yᵢ−μ̂ᵢ)/√V(μ̂ᵢ)`, raw-row df — exactly
+    // `summary(glm(family=Gamma/inverse.gaussian, weights=w))$dispersion`.
     let dispersion = match family {
-        Family::Gamma { .. } if converged => {
+        Family::Gamma { .. } | Family::InverseGaussian { .. } if converged => {
             let phi = match opts.dispersion {
                 Some(v) => v,
                 None => crate::family::pearson_dispersion(
@@ -261,6 +262,14 @@ pub(crate) fn glm_view_to_fit(
             Family::Gamma { .. } => {
                 -0.5 * (crate::family::gamma_aic(y, &mu, irls_deviance, n, opts.weights.as_deref())
                     - 2.0)
+            }
+            Family::InverseGaussian { .. } => {
+                -0.5 * (crate::family::inv_gaussian_aic(
+                    y,
+                    irls_deviance,
+                    n,
+                    opts.weights.as_deref(),
+                ) - 2.0)
             }
             _ => {
                 -0.5 * irls_deviance
@@ -352,7 +361,7 @@ pub(crate) fn nb_profile_loglik(y: &[f64], mu: &[f64], theta: f64, weights: Opti
 ///
 /// Stopping width `1e-4` on `ln θ` (2026-08-06, was `1e-8`): for the GLMM route,
 /// `g` is a full inner GLMM refit at fixed θ, and that refit's own inner
-/// two-stage BOBYQA is converged only to `GLMM_RHO_END = 3e-6` (`src/lmm.rs`) —
+/// two-stage BOBYQA is converged only to `GLMM_RHO_END = 3e-6` (`src/lmm/mod.rs`) —
 /// no evaluation of `g` resolves θ differences finer than that on its own. Below
 /// that radius the inner refit exhibits a knife-edge: two nearby θ values can
 /// land the refit in different local optima of its own objective, with the same

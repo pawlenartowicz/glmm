@@ -20,7 +20,6 @@ pub use crate::fit::{
 pub use crate::fit::{spec_sized_from_ids_pub, Perm};
 pub use crate::glm::{glm_irls_fit, sigmoid_stable, GlmFitView, GlmScratch, MAX_IRLS_ITERS};
 pub use crate::glmm::GlmmFit;
-pub use crate::lme::{lme_fit, LmeFitView, LmeScratch, LmeSuffStats};
 pub use crate::lmm::{primary_lambda, LmmFit, LmmGroupings, LmmSuffStats};
 pub use crate::ols::{
     fit_suff_stats_t_sq, ols_contrast_t_sq, OlsFitView, OlsScratch, OlsSuffStats, PANEL_ROWS,

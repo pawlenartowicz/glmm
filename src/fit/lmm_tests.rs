@@ -1153,7 +1153,7 @@ fn fit_lmm_offset_matches_lme4() {
 /// gated against a frozen lme4 golden. Pins β, SE, the 2×2 RE covariance
 /// (SDs + correlation), σ̂, and the `−Σlog wᵢ` deviance-constant convention:
 /// weighted REMLcrit strips the same `df·(1+ln 2π)` constant as the
-/// unweighted case (see `lme::profiled_deviance`) PLUS the weighted Gaussian log-density's
+/// unweighted case (see `lmm::reml_deviance`) PLUS the weighted Gaussian log-density's
 /// `+½Σlog wᵢ` per row (`−Σlog wᵢ` on the −2ℓ deviance scale). Generated
 /// with (R 4.5.3, lme4 1.1-38):
 /// ```r
@@ -2485,7 +2485,7 @@ fn lmm_rescaling_slope_column_moves_every_quantity_by_the_predicted_power_of_c()
 /// Warm-start forward map, on the same sleepstudy slope design: warm-starting
 /// at a fit's own reported θ̂ (via [`FitView::theta`], which hands back θ in the
 /// CALLER's units) must be a FIXED POINT of the map `LmmGroupings::
-/// theta_row_scales` installs in `src/lmm.rs`'s `fit_lmm_impl`. `Days`' RMS
+/// theta_row_scales` installs in `src/lmm/mod.rs`'s `fit_lmm_impl`. `Days`' RMS
 /// scale is clearly off 1.0 (values run 0..9), so a dropped forward map moves
 /// this test's θ̂ rather than leaving it untouched by construction.
 ///

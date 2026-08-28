@@ -1,0 +1,20 @@
+{
+  "name": "sim_cloglog_glm",
+  "engine": "stats::glm",
+  "engine_version": "R-4.5.3",
+  "kind": "glm",
+  "data": "sim_probit_large",
+  "family": "binomial",
+  "link": "cloglog",
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "y ~ 1 + x1 + x2 + x3 + z",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x1", "x2", "x3", "z"],
+  "estimates": {
+    "beta": [0.0284899934174711, 0.432010019796386, -0.345842927736584, 0.192639099878277, -0.51719986105143],
+    "se": [0.0199775612287933, 0.0156164313872971, 0.0152923154008697, 0.0148074298207126, 0.029541138884397],
+    "loglik": -5703.08325170466
+  }
+}

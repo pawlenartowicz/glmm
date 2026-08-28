@@ -50,13 +50,13 @@ Three real routing decisions sit between `fit_cold`/`fit_warm` and a returned
    **or** the total `Crossed` level count exceeds `MAX_CROSSED_LEVELS` (500).
    Otherwise `NoZ`.
 2. **Kernel** — `NoZ` Gaussian goes to `accumulate_lmm_rows` + `lmm_run_on`
-   (`src/fit/lmm.rs`) → `fit_lmm` (`src/lmm.rs`); `Sparse` Gaussian goes to
+   (`src/fit/lmm.rs`) → `fit_lmm` (`src/lmm/mod.rs`); `Sparse` Gaussian goes to
    `fit_mle_sparse` (`src/sparse/mod.rs`). Both minimise the same profiled-REML objective over
    the same θ seed/bounds; the sparse path is a superset that reproduces the
    dense fit to machine precision on any in-envelope design (see
    [the sparse section](#the-sparse-kernel-two-level-schur-block-cholesky)
    for why that equivalence is structural, not approximate).
-3. **Deviance sub-path** (inside `fit_lmm`'s `reml_deviance`, `src/lmm.rs`) —
+3. **Deviance sub-path** (inside `fit_lmm`'s `reml_deviance`, `src/lmm/kernel.rs`) —
    extra-grouping random slopes route to `reml_deviance_blocked`; an
    intercept-only primary with a balanced level structure takes the
    closed-form collapse shortcut; everything else takes the general
@@ -84,8 +84,8 @@ only when an extra grouping carries a random slope.
 
 **Code**: `classify_design` (`src/fit/mod.rs`); `build_workspace`/`fit_on`
 (`src/fit/core.rs`); `accumulate_lmm_rows`, `lmm_run_on` (`src/fit/lmm.rs`);
-`fit_lmm`, `reml_deviance`, `reml_deviance_blocked`,
-`precompute_balanced_collapse` (`src/lmm.rs`); `fit_mle_sparse`,
+`fit_lmm` (`src/lmm/mod.rs`); `reml_deviance`, `reml_deviance_blocked`,
+`precompute_balanced_collapse` (`src/lmm/kernel.rs`); `fit_mle_sparse`,
 `sparse_reml_deviance` (`src/sparse/mod.rs`); caps in `src/consts.rs`.
 **Convention**: the NoZ/Sparse split is a scratch-capacity boundary, not a model
 limit — lme4 and MixedModels.jl fit any of these designs with one solver; `glmm`
@@ -120,7 +120,7 @@ block (`tau2 = θ²·σ̂²` in the scalar case).
 
 **Code**: `LmmGroupings` (θ-layout: `n_theta`, `diagonal_theta`,
 `blind_theta_and_bounds`), `primary_lambda`, constants `THETA0`/`THETA_HI`
-(`src/lmm.rs`); `assemble_varcorr` (`src/fit/common.rs`). **Convention**: lme4's
+(`src/lmm/mod.rs`); `assemble_varcorr` (`src/fit/common.rs`). **Convention**: lme4's
 relative Cholesky factor `Λ_θ`; θ is σ-relative, so σ² factors cleanly out of
 the objective. **Validation**: the covariance recovery is checked by the varcomp
 std-dev gate (relative ~1e-3) on sleepstudy (a full `2×2` Λ with a correlation),
@@ -163,9 +163,9 @@ per dataset — on the dense path in `accumulate_lmm_rows`, on the sparse path
 before the workspace is built.
 
 **Code**: `rms_column_scale`, `LmmGroupings::set_slope_scales` /
-`theta_row_scales` / `block_row_scale` (`src/lmm.rs`); the Z-read sites in
-`LmmSuffStats::add_rows_multi` / `primary_gram` / `reml_deviance_blocked`
-(`src/lmm.rs`), `for_each_z_entry` (`src/sparse/mod.rs`), `build_z` /
+`theta_row_scales` / `block_row_scale` (`src/lmm/mod.rs`); the Z-read sites in
+`LmmSuffStats::add_rows_multi` / `reml_deviance_blocked` (`src/lmm/kernel.rs`),
+`primary_gram` (`src/lmm/mod.rs`), `for_each_z_entry` (`src/sparse/mod.rs`), `build_z` /
 `fill_z_f64` (`src/glmm/workspace.rs`), `fill_m_vals` (`src/sparse/glmm.rs`);
 the back-maps in `varcorr_block` / `assemble_ranef_sparse` /
 `assemble_ranef_dense` (`src/fit/common.rs`). **Convention**: lme4 leaves the RE
@@ -186,13 +186,11 @@ covariance V. The kernel factors Ω_θ over the stacked
 `[primary | nested children | crossed | X y]` system: `log|V|` comes from the
 random-effect pivots (family blocks plus the crossed-tail diagonal),
 `log|X'V⁻¹X|` from the trailing fixed-effect factor `L_XX`, and `(N − P)·log σ̂²`
-from the residual entry `L[p,p]²` — no per-evaluation β backsolve. The scalar
-Brent kernel (`profiled_deviance`, `src/lme.rs`) computes the byte-identical
-normalisation, so the two agree to floating-point error rather than up to an
-additive constant. `N − P` is the raw-row residual degrees of freedom.
+from the residual entry `L[p,p]²` — no per-evaluation β backsolve. `N − P` is
+the raw-row residual degrees of freedom.
 
 **Prior weights.** With `FitOptions::weights`, the sufficient-statistics
-accumulator (`LmmSuffStats::add_rows_multi`, `src/lmm.rs`) folds `√wᵢ` into
+accumulator (`LmmSuffStats::add_rows_multi`, `src/lmm/kernel.rs`) folds `√wᵢ` into
 every accumulated quantity exactly once per side, so every Gram product carries
 `wᵢ` — but the level counts and df stay raw-row (`n − p`). The weighted
 Gaussian deviance needs one further θ-independent term, `−Σ log wᵢ`; because it
@@ -209,8 +207,8 @@ The objective returns `f64::INFINITY` on any Cholesky failure or non-positive σ
 — that value is the deviance failure surface BOBYQA is driven over.
 
 **Code**: `reml_deviance`, `reml_deviance_blocked`, `LmmSuffStats::add_rows_multi`
-(`src/lmm.rs`); `accumulate_lmm_rows` (`src/fit/lmm.rs`); `sparse_reml_deviance`
-(`src/sparse/mod.rs`); `profiled_deviance` (`src/lme.rs`).
+(`src/lmm/kernel.rs`); `accumulate_lmm_rows` (`src/fit/lmm.rs`); `sparse_reml_deviance`
+(`src/sparse/mod.rs`).
 **Convention**: lme4's profiled REML `devfun` — β and σ² profiled out, optimiser
 on θ. **Validation**: the loglik gate is near-exact for LMM rungs (absolute
 ~1e-6 on the shared scale, ~1e-9 observed) across Dyestuff, sleepstudy,
@@ -237,38 +235,6 @@ shrink-downdate arithmetic up to floating-point re-association, so the `q = 1`
 corpus reproduces on this machine. Unbalanced counts, or any slope on the
 primary, fall back to the loop.
 
-A second, self-contained scalar kernel exists in `src/lme.rs`. `lme_fit` fits a
-single random-intercept LMM by **Brent minimisation on `log(θ)`** (NR §10.3),
-recovering β̂/σ̂²/Var(β̂) in closed form at θ̂. Brent runs to
-`BRENT_REL_TOL = 1e-4`, capped at `MAX_BRENT_ITERS = 50`. Its bracketing has
-several stages: with no start value it uses
-the cold 3-point bracket `[LOG_THETA_LOW, LOG_THETA_MID, LOG_THETA_HIGH]`
-(`LOG_THETA_LOW = ln(1e-4)`); a caller-supplied warm θ₀ gets a truth-centered
-3-point bracket instead. A bracket that fails the down-up shape is repaired by
-interior bisection and then up to two rounds of outward decade expansion, and a
-truth bracket whose repair fails retries once from the cold bracket. A
-left-edge failure is the τ̂≈0 boundary (`boundary_hit = 1`); a **right-edge**
-(high-τ) failure is re-bracketed and retried once, and only then reported as
-`boundary_hit = 2` — so in this kernel `boundary_hit = 2` covers both the
-high-τ edge and genuine numerical failure (unlike `fit_lmm`, where 2 always
-means failure/cap-out — see the boundary section). Its rank guard is a local
-`EPS_RANK = 1e-8` (numerically identical to the `lmm.rs` copy) applied to the
-pinning Cholesky after Brent converges.
-
-This kernel is on **no** fitting path — `mod lme` is private, re-exported only
-through the unstable `loop_advanced` cargo feature for a caller that wants to
-drive it directly. Every tier, stable and loop, routes the single-intercept
-Gaussian LMM through `fit_lmm`'s collapse shortcut instead; the two agree up to
-re-association.
-
-**Code**: `precompute_balanced_collapse`, the `collapse` branch of `reml_deviance`
-(`src/lmm.rs`); `lme_fit`, `profiled_deviance`, `brent_minimize`, constants
-`BRENT_REL_TOL`/`LOG_THETA_LOW`/`MAX_BRENT_ITERS` (`src/lme.rs`). **Convention**:
-lme4's single-scalar-θ profiled REML; Brent per NR (Press et al. 2007) §10.3.
-**Validation**: Dyestuff (rung 1) is the single-intercept balanced rung; the
-collapse and general paths are also cross-checked bit-for-bit by in-crate tests
-(`src/lmm.rs` deviance-equivalence tests).
-
 ## General path: BOBYQA over θ
 
 For everything the shortcut does not cover — slope primaries, unbalanced designs,
@@ -283,8 +249,8 @@ route) is:
 | Parameter | Value | Source |
 |---|---|---|
 | `rho_begin` (initial trust radius) | `(0.1 · min diagonal θ₀).min(RHO_BEGIN)` → `0.1` at the cold blind start | `for_cluster_spec_ext` |
-| `RHO_BEGIN` (cap) | `0.5` | `src/lmm.rs` |
-| `rho_end` (final trust radius) | `RHO_END = 1e-6` | `src/lmm.rs` |
+| `RHO_BEGIN` (cap) | `0.5` | `src/lmm/mod.rs` |
+| `rho_end` (final trust radius) | `RHO_END = 1e-6` | `src/lmm/mod.rs` |
 | `npt` (interpolation points) | `2·n_θ + 1` for `n_θ < 3`, else `⌈3·n_θ/2⌉ + 1` (`(3·n_θ).div_ceil(2) + 1`) | `for_cluster_spec_ext` |
 | `max_fun` | PRIMA default `500·n_θ` | `Config::new` |
 
@@ -316,7 +282,7 @@ diagnostics from that same dense path.
 
 **Code**: `fit_lmm`/`fit_lmm_impl`, `LmmWorkspace::for_cluster_spec_ext`,
 `bobyqa_config`, `sparse_lmm_seed`, constants `RHO_BEGIN`/`RHO_END`/`THETA0`
-(`src/lmm.rs`); the external `bobyqa` crate supplies the solver.
+(`src/lmm/mod.rs`); the external `bobyqa` crate supplies the solver.
 **Convention**: derivative-free BOBYQA over relative-Cholesky θ, as in lme4's
 default `nloptwrap`/`bobyqa` optimiser for `lmer`. **Validation**: sleepstudy
 (`n_θ = 3`, correlated slope), Penicillin (crossed), Pastes (nested) drive the
@@ -333,8 +299,8 @@ PIN_THETA (1e-4)` is set to exactly `0.0`, the fit is still counted as converged
 and the component's bit is recorded in `pinned_components`. Off-diagonal
 covariances are never pinned — a correlation running to `±1` shows up as the
 *diagonal* `λ_dd → 0` under the Cholesky parameterization, so pinning the
-diagonal is the complete policy. `PIN_THETA = 1e-4` aligns the class boundary with
-the scalar Brent kernel's τ̂≈0 detection. The test is on the **internal**
+diagonal is the complete policy. `PIN_THETA = 1e-4` matched the retired scalar
+Brent kernel's τ̂≈0 detection threshold. The test is on the **internal**
 (scaled) θ — see
 [Random-effect design column scaling](#random-effect-design-column-scaling) — so
 its verdict does not change when a random-slope covariate is re-expressed in
@@ -358,7 +324,7 @@ near-zero true θ never begins the search on the boundary itself.
 
 Distinct from a pin, the failure/cap-out outcomes (`boundary_hit == 2`) split
 into two cases — the **plateau policy**, pinned by
-`maxfun_cap_reports_honest_endpoint` (`src/lmm.rs`):
+`maxfun_cap_reports_honest_endpoint` (`src/lmm/tests.rs`):
 
 - A `MaxFunReached` cap-out runs the full β̂/σ̂²/SE recovery and returns **real
   finite numbers** with `converged: false` — the best point found is reported
@@ -370,21 +336,15 @@ into two cases — the **plateau policy**, pinned by
   rank guard on the endpoint's factor: `fit_lmm` fits a near-singular but
   finite endpoint instead of refusing it.
 
-The sparse path mirrors the same plateau policy. Note the code-point overlap
-with the scalar Brent kernel: in `fit_lmm`, `boundary_hit == 2` always means
-failure or cap-out; in `lme_fit` it can also mean the high-τ right edge of the
-Brent bracket (see the shortcut section) — the two kernels share the code's
-numeric values but not their exact semantics.
+The sparse path mirrors the same plateau policy.
 
 **Code**: the pin loop and endpoint recovery in `fit_lmm_impl`, constants
-`PIN_THETA`/`THETA_TRUTH_FLOOR` (`src/lmm.rs`; `EPS_RANK` survives only as the
-constant the private Brent kernel in `src/lme.rs` reads — `fit_lmm_impl` no
-longer consults it); the mirror pin and
+`PIN_THETA`/`THETA_TRUTH_FLOOR` (`src/lmm/mod.rs`); the mirror pin and
 plateau policy in `fit_mle_sparse` (`src/sparse/mod.rs`). **Convention**:
 lme4 reports such fits as `isSingular`; `glmm` pins to exactly `0` (FP-stable
 across platforms) and still returns the fit. **Validation**: Dyestuff sits near
 the interior; the boundary behaviour is pinned by in-crate τ̂≈0 tests
-(`src/lmm.rs`) that assert `boundary_hit == 1` and `θ̂ == 0.0`, the plateau
+(`src/lmm/tests.rs`) that assert `boundary_hit == 1` and `θ̂ == 0.0`, the plateau
 policy by `maxfun_cap_reports_honest_endpoint`, and the singular-fit handling
 by the reference engines flagging the same data.
 
@@ -430,8 +390,8 @@ Wald statistic is `t² = β̂_j² / Var(β̂_j)`. SEs are computed only for the 
 `FitOptions::target_indices`. A joint Wald χ² over the target set is available via
 the shared `joint_wald_chi_sq` helper (re-Choleskying `X'V⁻¹X = L_XX·L_XXᵀ`).
 
-**Code**: the recovery block in `fit_lmm_impl` (`src/lmm.rs`),
-`joint_wald_chi_sq` (`src/lme.rs`, promoted `pub(crate)`). **Convention**:
+**Code**: the recovery block in `fit_lmm_impl`, `joint_wald_chi_sq`
+(`src/lmm/mod.rs`). **Convention**:
 lme4's profiled fixed-effect covariance `σ̂²·(X'V⁻¹X)⁻¹`; all engines compute
 the LMM SE identically. **Validation**: the LMM `se` gate is tight (~1e-3)
 across Dyestuff, sleepstudy, Penicillin, Pastes against both lme4 and
@@ -471,7 +431,7 @@ targets non-Gaussian GLMMs and defers Gaussian LMMs to nlme/lme4.)
 | | lme4 (`lmer`) | MixedModels.jl | `glmm` |
 |---|---|---|---|
 | Criterion default | REML (ML switch) | **ML** (REML switch) | **REML, locked** — no switch |
-| Optimiser | BOBYQA via nloptwrap (default) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE) | BOBYQA (PRIMA), tuned `npt`/ρ schedule; Brent for the `loop_advanced` scalar kernel |
+| Optimiser | BOBYQA via nloptwrap (default) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE) | BOBYQA (PRIMA), tuned `npt`/ρ schedule |
 | Linear algebra per eval | sparse Cholesky of `ΛᵀZᵀZΛ + I` (CHOLMOD), Z materialised | blocked/amalgamated Cholesky, Z materialised | dense path: **no Z at all** — sufficient statistics + family-block elimination, with a closed-form collapse for balanced single-intercept designs; sparse path: Schur-block Cholesky (AMD sparse tail) |
 | Singular fit | fits, `isSingular` warns | fits, flags | pins diagonal components ≤ `1e-4` to exact `0`, still `converged`, sets `Diagnostics::singular`/`Diagnostics::pinned` |
 | Optimiser cap-out | warns, returns last point | warns, returns last point | returns the best finite point, `converged: false`; dense path: `Diagnostics::boundary == Boundary::NoOptimum`; sparse path: `boundary` is back-derived from `singular`, so `NoOptimum` never appears there |
@@ -501,6 +461,3 @@ list of differences from the other engines, with justification, is in
   optimization without derivatives*. Report DAMTP 2009/NA06, University of
   Cambridge. — the θ optimizer; the `npt` bounds cited in the schedule table
   are Powell's.
-- Press, W. H., Teukolsky, S. A., Vetterling, W. T. & Flannery, B. P. (2007).
-  *Numerical Recipes* (3rd ed.), §10.3. Cambridge University Press. — the Brent
-  minimizer in the `loop_advanced` scalar kernel (`lme_fit`).

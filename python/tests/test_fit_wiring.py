@@ -379,3 +379,60 @@ def test_degenerate_mixed_fit_returns_instead_of_panicking():
     assert result.re_groups == [("g", ["(Intercept)"])]
     # summary() walks varcorr/re_groups together — it must print, not raise.
     assert "Random effects:" not in result.summary()
+
+
+def test_cbind_response_equals_proportion_plus_weights():
+    s = [3.0, 1.0, 4.0, 2.0] * (_N // 4)
+    f = [2.0, 4.0, 1.0, 3.0] * (_N // 4)
+    x = [0.1 * (i % 7) for i in range(_N)]
+    data = {"s": s, "f": f, "x": x, "p": [a / (a + b) for a, b in zip(s, f)]}
+    via = glmm.fit(data, "cbind(s, f) ~ x", "binomial")
+    hand = glmm.fit(data, "p ~ x", "binomial", weights=[a + b for a, b in zip(s, f)])
+    assert via.beta == pytest.approx(hand.beta, rel=1e-12)
+    # The trial counts the lowering made up come back as the fit's weights, so
+    # Pearson residuals match the hand-weighted fit's instead of silently
+    # dropping the sqrt(trials) factor.
+    np.testing.assert_allclose(via.weights, [a + b for a, b in zip(s, f)])
+    np.testing.assert_allclose(
+        via.residuals(type="pearson"), hand.residuals(type="pearson"), rtol=1e-10
+    )
+    with pytest.raises(ValueError, match="use one"):
+        glmm.fit(data, "cbind(s, f) ~ x", "binomial", weights=[a + b for a, b in zip(s, f)])
+    data["s"][0] = -2.0
+    with pytest.raises(ValueError, match="non-negative"):
+        glmm.fit(data, "cbind(s, f) ~ x", "binomial")
+
+
+def test_offset_term_equals_offset_argument():
+    x = [0.1 * (i % 7) for i in range(_N)]
+    e = [1.0 + (i % 3) for i in range(_N)]
+    y = [float(i % 5) for i in range(_N)]
+    data = {"y": y, "x": x, "e": e}
+    via = glmm.fit(data, "y ~ x + offset(log(e))", "poisson")
+    hand = glmm.fit(data, "y ~ x", "poisson", offset=np.log(e))
+    assert via.beta == pytest.approx(hand.beta, rel=1e-12)
+    with pytest.raises(ValueError, match="use one"):
+        glmm.fit(data, "y ~ x + offset(log(e))", "poisson", offset=np.log(e))
+
+
+def test_fit_carries_header_inputs():
+    y = (1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)).tolist()
+    w = np.full(_N, 2.0)
+    fit = glmm.fit(_data(y), "y ~ x + (1 | g)", weights=w)
+    assert fit.formula == "y ~ x + (1 | g)"
+    assert fit.family == "gaussian"
+    assert fit.link == "identity"
+    assert fit.nagq == 1
+    assert fit.nobs == _N
+    np.testing.assert_array_equal(fit.y, np.asarray(y))
+    np.testing.assert_array_equal(fit.weights, w)
+    assert glmm.fit(_data(y), "y ~ x").weights is None
+
+
+def test_fit_y_is_the_lowered_response_for_cbind():
+    s = _rng.integers(0, 5, size=_N).astype(float)
+    f = _rng.integers(1, 5, size=_N).astype(float)
+    data = {"x": _X.tolist(), "s": s.tolist(), "f": f.tolist()}
+    fit = glmm.fit(data, "cbind(s, f) ~ x", "binomial")
+    np.testing.assert_allclose(fit.y, s / (s + f))
+    assert fit.link == "logit"

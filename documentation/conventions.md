@@ -36,9 +36,10 @@ the linear-predictor scale — R's `offset=`: `η = offset + Xβ (+ Zb)`, with n
 coefficient estimated for it and no column added to the design. The
 canonical use is a rate model against a known exposure, `offset =
 log(exposure)`. `None`/`NULL` (the default) means no offset — byte-identical
-to the pre-offset fit paths. The formula syntax `offset()` is not accepted;
-pass the vector as the `offset=`/`offset` argument instead (see
-[`formula.md#not-accepted-and-the-workaround`](formula.md#not-accepted-and-the-workaround)).
+to the pre-offset fit paths. The formula syntax `offset(expr)` is also
+accepted as a term; passing both a formula `offset()` term and the
+`offset=`/`offset` argument is an error asking you to use one (see
+[`formula.md`](formula.md)).
 
 ## Standard errors
 

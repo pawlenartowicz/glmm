@@ -3,7 +3,8 @@
 `glmm` is a standalone f64 mixed-model fit kernel — OLS → GLM → LMM → GLMM, in
 pure Rust on [`faer`](https://crates.io/crates/faer) — fitting fixed-effect and
 mixed (random-intercept/random-slope) models for Gaussian, Binomial
-(logit/probit), Poisson, Gamma, and Negative-Binomial outcomes, validated
+(logit/probit/cloglog), Poisson, Gamma, Negative-Binomial, and (fixed-effect
+GLM only) Inverse-Gaussian outcomes, validated
 against R/lme4 and Julia/MixedModels.jl goldens. It is derivative-free (BOBYQA
 over the profiled deviance, no autodiff), REML-locked for Gaussian mixed
 models (no ML switch), validation-pinned against a frozen lme4/MixedModels.jl

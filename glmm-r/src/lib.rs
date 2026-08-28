@@ -143,6 +143,10 @@ fn fastglmm_fit(
         Some(msg) => r!(msg),
         None => r!(NULL),
     };
+    let weights: Robj = match r.weights {
+        Some(w) => r!(w),
+        None => r!(NULL),
+    };
     let pinned = List::from_values(r.pinned.iter().map(|flags| r!(flags.clone())));
     // Column indices become 1-based HERE, once, so nothing on the R side of
     // this boundary ever handles a 0-based index: `notes[[i]]$columns` indexes
@@ -204,6 +208,9 @@ fn fastglmm_fit(
             .map(|&v| v as f64)
             .collect::<Vec<f64>>(),
         ranef_blocks = ranef_blocks,
+        y = r.y,
+        weights = weights,
+        nobs = r.nobs as f64,
         boundary = r.boundary,
         pinned = pinned,
         notes = notes

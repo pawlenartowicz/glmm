@@ -19,7 +19,7 @@
 //! no-op on wasm32; gated at runtime by `FitOptions::parallel_inner` (also off
 //! by default — both the feature and the knob are explicit opt-ins).
 
-// The scratch-explicit kernels (glm/glmm/lme + most of lmm) exist to serve the
+// The scratch-explicit kernels (glm/glmm + most of lmm) exist to serve the
 // `loop_advanced` feature; the stable `fit` wires only a subset (OLS + LMM). With
 // the feature OFF they are intentionally unreachable, not stale — so suppress
 // dead_code only in that build. The `loop_advanced` build uses all of it, so
@@ -44,7 +44,6 @@ mod fit;
 mod glm;
 mod glmm;
 mod ids;
-mod lme;
 mod lmm;
 mod ols;
 mod sparse;

@@ -44,6 +44,10 @@ fn dat() -> Table {
                     codes: vec![1, 2, 0, 1, 2, 0],
                 },
             ),
+            (
+                "w".into(),
+                Column::Numeric(vec![1.5, 2.0, 0.5, 4.0, 3.0, 2.5]),
+            ),
         ],
         n: 6,
     }

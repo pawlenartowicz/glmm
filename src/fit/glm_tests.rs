@@ -4,7 +4,7 @@
 use super::glm::{fit_glm, fit_glm_prebuilt, glm_view_to_fit, GlmScratchBuf};
 use super::*;
 use crate::test_support::assert_near;
-use crate::{BinomialLink, Family, GroupIds, ModelSpec};
+use crate::{BinomialLink, Family, GroupIds, ModelSpec, ReStructure, Sizing};
 
 use super::common_tests::{lcg, sim_clustered};
 
@@ -578,6 +578,127 @@ fn fit_glm_probit_matches_r() {
     }
 }
 
+/// Cloglog GLM through stable `fit` (re: None): the fitted means must reproduce
+/// the link's own inverse at the converged η, and the deviance must be the
+/// binomial `dev_resid` sum at those means. Non-canonical → general
+/// Fisher-scoring branch. The R-gated version is
+/// `fit_glm_cloglog_matches_r` (validation golden `sim_cloglog_glm`).
+#[test]
+fn fit_glm_cloglog_is_self_consistent() {
+    // Small separable-free design: 200 rows, one continuous predictor.
+    let n = 200usize;
+    let p = 2usize;
+    let mut x = Vec::<f64>::with_capacity(n * p);
+    let mut y = Vec::<f64>::with_capacity(n);
+    for i in 0..n {
+        let xi = -2.0 + 4.0 * (i as f64) / (n as f64);
+        x.push(1.0);
+        x.push(xi);
+        // Deterministic 0/1 pattern with both classes present at every x range.
+        y.push(f64::from(u32::from(i % 3 == 0)));
+    }
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        re: None,
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "cloglog GLM must converge");
+    assert_eq!(f.dispersion, 1.0, "binomial holds φ≡1");
+    for (i, &mu) in f.fitted.iter().enumerate() {
+        let eta = f.beta[0] + f.beta[1] * x[i * p + 1];
+        let want = crate::family::link_inv(model.family, eta);
+        assert!((mu - want).abs() < 1e-9, "μ[{i}] = {mu} vs {want}");
+        assert!(mu > 0.0 && mu < 1.0);
+    }
+}
+
+/// Cloglog binomial GLM through stable `fit` (re: None), gated against frozen R
+/// `glm(binomial("cloglog"))` (`validation/goldens/sim_cloglog_glm.json`) on the
+/// 9,600-row `sim_probit_large` fixture. Cloglog is non-canonical → the general
+/// Fisher-scoring branch; `φ≡1`. The oracle is sacred.
+#[test]
+fn fit_glm_cloglog_matches_r() {
+    const REF_BETA: [f64; 5] = [
+        0.0284899934174711,
+        0.432010019796386,
+        -0.345842927736584,
+        0.192639099878277,
+        -0.51719986105143,
+    ];
+    const REF_SE: [f64; 5] = [
+        0.0199775612287933,
+        0.0156164313872971,
+        0.0152923154008697,
+        0.0148074298207126,
+        0.029541138884397,
+    ];
+    let csv = include_str!("../../validation/data/simulated/sim_probit_large.csv");
+    let p = 5; // [intercept, x1, x2, x3, z]
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        x.extend_from_slice(&[
+            1.0,
+            f[1].parse().unwrap(),
+            f[2].parse().unwrap(),
+            f[3].parse().unwrap(),
+            f[4].parse().unwrap(),
+        ]);
+    }
+    let n = y.len();
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        re: None,
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3, 4],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "cloglog GLM must converge");
+    assert!((f.dispersion - 1.0).abs() < 1e-12, "cloglog φ≡1");
+    for j in 0..p {
+        let b_rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
+        assert!(
+            b_rel < 1e-3,
+            "β[{j}] = {} vs R {} (rel {b_rel})",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        assert!(
+            se_rel < 3e-2,
+            "se[{j}] = {} vs R {} (rel {se_rel})",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+}
+
 /// `y ~ 1 + x + grp` design from the committed `sim_gamma.csv`
 /// (cluster,x,grp,y); X = [intercept, x, grp=="b"]. Shared by the Gamma
 /// goldens.
@@ -670,6 +791,112 @@ fn fit_glm_gamma_inverse_matches_r() {
         },
     );
     assert!(f.converged(), "gamma-inverse GLM must converge");
+    let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
+    assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
+            "β[{j}] = {} vs R {}",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        assert!(se_rel < 3e-2, "se[{j}] = {} vs R {}", f.se[j], REF_SE[j]);
+    }
+}
+
+/// `y ~ 1 + x + grp` design from the committed `sim_igauss.csv` (y,x,grp);
+/// X = [intercept, x, grp=="b"]. Shared by the inverse-Gaussian goldens.
+fn sim_igauss_xy() -> (Vec<f64>, Vec<f64>, usize) {
+    let csv = include_str!("../../validation/data/simulated/sim_igauss.csv");
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        let yv: f64 = f[0].parse().unwrap();
+        let xv: f64 = f[1].parse().unwrap();
+        let grp_b = f64::from(u32::from(f[2] == "b"));
+        x.extend_from_slice(&[1.0, xv, grp_b]);
+        y.push(yv);
+    }
+    let n = y.len();
+    (x, y, n)
+}
+
+/// Inverse-Gaussian GLM, log link, gated against frozen R
+/// `glm(family=inverse.gaussian("log"))` (`validation/goldens/sim_igauss_glm.json`).
+/// V(μ)=μ³, φ̂ Pearson post-fit as for Gamma. The oracle is sacred.
+#[test]
+fn fit_glm_igauss_matches_r() {
+    const REF_BETA: [f64; 3] = [0.388918465368179, 0.0547374103199151, 0.0848741285568016];
+    const REF_SE: [f64; 3] = [0.020676393123407, 0.0149473668365438, 0.0298734973282543];
+    const REF_DISP: f64 = 0.289727973895683;
+    let (x, y, n) = sim_igauss_xy();
+    let p = 3;
+    let model = ModelSpec {
+        family: Family::InverseGaussian {
+            link: crate::InverseGaussianLink::Log,
+        },
+        re: None,
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "igauss-log GLM must converge");
+    let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
+    assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
+            "β[{j}] = {} vs R {}",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        assert!(se_rel < 3e-2, "se[{j}] = {} vs R {}", f.se[j], REF_SE[j]);
+    }
+}
+
+/// Inverse-Gaussian GLM, 1/μ² link, gated against frozen R
+/// `glm(family=inverse.gaussian("1/mu^2"))`
+/// (`validation/goldens/sim_igauss_inv_sq_glm.json`). The link is canonical only
+/// up to sign and scale, so it takes the general Fisher-scoring branch, with the
+/// η₀ = 1/y² cold start. The oracle is sacred.
+#[test]
+fn fit_glm_igauss_inverse_squared_matches_r() {
+    const REF_BETA: [f64; 3] = [0.459456921305253, -0.0419956854008115, -0.0679438262942649];
+    const REF_SE: [f64; 3] = [0.0189525417126228, 0.0125108528341764, 0.0251747245203818];
+    const REF_DISP: f64 = 0.29048859329441;
+    let (x, y, n) = sim_igauss_xy();
+    let p = 3;
+    let model = ModelSpec {
+        family: Family::InverseGaussian {
+            link: crate::InverseGaussianLink::InverseSquared,
+        },
+        re: None,
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "igauss-inverse_squared GLM must converge");
     let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
     assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
     for j in 0..p {
@@ -1301,4 +1528,78 @@ fn fit_glm_gamma_inverse_small_mean_matches_r() {
             REF_SE[j]
         );
     }
+}
+
+/// Inverse-Gaussian GLM, log link, through stable `fit` (re: None):
+/// self-consistency of the fitted means and the Pearson dispersion. The R-gated
+/// version is `fit_glm_igauss_matches_r` (validation golden `sim_igauss_glm`).
+#[test]
+fn fit_glm_inverse_gaussian_log_is_self_consistent() {
+    // 300 rows, y > 0 by construction, one continuous predictor.
+    let n = 300usize;
+    let p = 2usize;
+    let mut x = Vec::<f64>::with_capacity(n * p);
+    let mut y = Vec::<f64>::with_capacity(n);
+    for i in 0..n {
+        let xi = (i as f64) / (n as f64);
+        x.push(1.0);
+        x.push(xi);
+        y.push(1.0 + 0.5 * xi + 0.05 * ((i % 7) as f64));
+    }
+    let model = ModelSpec {
+        family: Family::InverseGaussian {
+            link: crate::InverseGaussianLink::Log,
+        },
+        re: None,
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "inverse-Gaussian GLM must converge");
+    assert!(
+        f.dispersion > 0.0 && f.dispersion.is_finite(),
+        "φ̂ = {}",
+        f.dispersion
+    );
+    assert!(f.loglik.is_finite(), "logLik must be finite");
+    for (i, &mu) in f.fitted.iter().enumerate() {
+        let want = (f.beta[0] + f.beta[1] * x[i * p + 1]).exp();
+        assert!((mu - want).abs() / want < 1e-9, "μ[{i}] = {mu} vs {want}");
+    }
+}
+
+/// Inverse-Gaussian with random effects is not wired (the profiled
+/// `inverse.gaussian()$aic` objective term is not built) and must fault at the
+/// model-shape gate, before any workspace is allocated.
+#[test]
+#[should_panic(expected = "inverse-Gaussian mixed models are not implemented")]
+fn fit_inverse_gaussian_mixed_faults() {
+    let n = 8usize;
+    let p = 1usize;
+    let x = vec![1.0; n];
+    let y: Vec<f64> = (1..=n).map(|k| k as f64).collect();
+    let ids = GroupIds {
+        primary: vec![0, 0, 0, 0, 1, 1, 1, 1],
+        extra: vec![],
+    };
+    let model = ModelSpec {
+        family: Family::InverseGaussian {
+            link: crate::InverseGaussianLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 2 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let _ = fit_cold(&x, &y, n, p, &model, &ids, &FitOptions::default());
 }

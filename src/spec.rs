@@ -130,10 +130,23 @@ pub enum Family {
         /// Link function — log only (`log(μ/(μ+θ))` canonical link not offered).
         link: NegBinomialLink,
     },
+    /// Inverse-Gaussian response (`y>0`) → GLM. Variance `V(μ)=μ³`. Dispersion
+    /// `φ` is estimated post-fit as the Pearson moment estimator
+    /// `φ̂=Σ rᵢ²/(n−p)` (`rᵢ=(yᵢ−μ̂ᵢ)/√(μ̂ᵢ³)`) and scales the SE by `√φ̂`, the
+    /// same convention as [`Family::Gamma`]. **Mixed models are not wired**:
+    /// `fit` faults at the model-shape gate for `re: Some(..)`, because the
+    /// profiled `inverse.gaussian()$aic` objective term the GLMM needs is not
+    /// built. Validated against R `glm(family=inverse.gaussian(link))`
+    /// (validation goldens `sim_igauss_glm`, `sim_igauss_inv_sq_glm`).
+    InverseGaussian {
+        /// Link function — [`InverseGaussianLink::Log`] (safe default) or
+        /// `InverseSquared`.
+        link: InverseGaussianLink,
+    },
 }
 
 /// Binomial link function. `Logit` is canonical (the fused-SIMD kernel);
-/// `Probit` (added M3) uses the general Fisher-scoring branch.
+/// `Probit` and `Cloglog` both use the general Fisher-scoring branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinomialLink {
     /// Canonical logit link `g(μ) = ln(μ/(1−μ))`.
@@ -141,6 +154,13 @@ pub enum BinomialLink {
     /// Probit link `g(μ) = Φ⁻¹(μ)` (inverse standard-normal CDF). Non-canonical:
     /// `μ=Φ(η)`, `dμ/dη=φ(η)`. Validated against R `binomial(link="probit")`.
     Probit,
+    /// Complementary log-log link `g(μ) = ln(−ln(1−μ))`. Non-canonical:
+    /// `μ = 1−exp(−exp(η))`, `dμ/dη = exp(η−exp(η))`, so it uses the general
+    /// Fisher-scoring branch. Asymmetric — μ approaches 1 much faster than 0,
+    /// which is why η carries an upper clamp the other two links do not need.
+    /// Validated against R `binomial(link="cloglog")` (validation goldens
+    /// `sim_cloglog_glm`, `sim_cloglog_glmm`).
+    Cloglog,
 }
 
 /// Poisson link function. M3 ships the canonical log link only.
@@ -168,6 +188,22 @@ pub enum GammaLink {
 pub enum NegBinomialLink {
     /// Log link `g(μ) = ln(μ)`, `μ=exp(η)`. Non-canonical (the NB canonical link
     /// `log(μ/(μ+θ))` is not offered) → general Fisher-scoring branch.
+    Log,
+}
+
+/// Inverse-Gaussian link function. `Log` is the safe default; `InverseSquared`
+/// is R's `inverse.gaussian()` default and can drive `μ≤0` mid-IRLS
+/// (domain-clamped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InverseGaussianLink {
+    /// `g(μ) = 1/μ²`, `μ = η^(−1/2)` (R `inverse.gaussian(link="1/mu^2")`).
+    /// This is the family's canonical link only up to sign and scale (the
+    /// natural parameter is `θ = −1/(2μ²)`), so `dμ/dη ≠ V(μ)` and the
+    /// canonical IRLS shortcut would mis-sign and mis-scale the working
+    /// residual — it takes the general Fisher-scoring branch, exactly as
+    /// [`GammaLink::Inverse`] does. Requires `μ>0` → `η>0`.
+    InverseSquared,
+    /// Log link `g(μ) = ln μ`, `μ = exp(η)`. Non-canonical but stable.
     Log,
 }
 

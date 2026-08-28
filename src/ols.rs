@@ -19,7 +19,7 @@ use faer::{Accum, MatMut, MatRef, Par};
 use crate::FLOAT_NEAR_ZERO;
 
 /// Rows per widened f64 panel in the suff-stats GEMM accumulate
-/// (`OlsSuffStats::add_rows` / `LmeSuffStats::add_rows`). Bounds the f64
+/// (`OlsSuffStats::add_rows`). Bounds the f64
 /// working set to PANEL_ROWS·P so the GEMM stays cache-resident instead of
 /// streaming a full n×p copy.
 /// Tuned 2026-06-12 over {128, 256, 512}, clock-locked, off-mode fits/s:
@@ -272,35 +272,6 @@ fn nonconverged_view<'a>(
     }
 }
 
-/// Min/max diagonal-ratio rank-deficiency test on a Cholesky factor `L`
-/// (`p × p`, lower-triangular). Returns `true` when `L` is degenerate — either
-/// a non-positive max diagonal or `min|L_ii| < eps · max|L_ii|`.
-///
-/// **Do not reuse this for new rank guards.** `min|L_ii| / max|L_ii|` is a ratio
-/// ACROSS columns, so it is not scale-invariant: it conflates near-collinearity
-/// with the design's column scaling, and on a design with no collinearity
-/// anywhere it falls by six decades as one column is rescaled while the fitted
-/// β̂ does not move by one part in 1e10. Measured 2026-07-31 on a 1-ULP
-/// perturbation sweep; the OLS, dense-LMM and sparse-LMM guards were moved off
-/// it onto [`min_pivot_ratio`], which is per-column and therefore scale-free.
-/// The one surviving caller is `lme.rs`'s `loop_advanced`-only sufficient-
-/// statistics route, which fits off pre-accumulated sums and was left
-/// unextended.
-pub(crate) fn chol_rank_deficient(factor: MatRef<'_, f64>, p: usize, eps: f64) -> bool {
-    let mut max_diag: f64 = 0.0;
-    let mut min_diag: f64 = f64::INFINITY;
-    for i in 0..p {
-        let d = factor[(i, i)].abs();
-        if d > max_diag {
-            max_diag = d;
-        }
-        if d < min_diag {
-            min_diag = d;
-        }
-    }
-    max_diag <= 0.0 || min_diag < eps * max_diag
-}
-
 /// Relative pivot floor for rank-deficiency detection. A column is
 /// aliased when its Cholesky Schur pivot drops below `ALIAS_EPS · G_dd` (its OWN
 /// Gram diagonal) — i.e. its residual norm, after projecting onto the retained
@@ -389,8 +360,8 @@ pub(crate) const PIVOT_MIN: f64 = 1e-12;
 ///
 /// Scale-invariant because each column is compared against its own norm:
 /// rescaling one column of `X` scales pivot and diagonal together and leaves the
-/// ratio fixed. That is the property `min|L_ii| / max|L_ii|` lacks; see
-/// [`chol_rank_deficient`].
+/// ratio fixed — unlike a min/max diagonal ratio, which conflates
+/// near-collinearity with the design's column scaling.
 ///
 /// A non-finite pivot or a non-positive reconstructed diagonal is arithmetic
 /// exhaustion rather than a ratio, and returns `(0.0, d)` — the hardest possible

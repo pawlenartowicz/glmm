@@ -15,6 +15,19 @@ _rng = _np.random.default_rng(0)
 _N = 200
 _GROUPS = _np.repeat(_np.arange(20), _N // 20)
 _X = _rng.normal(size=_N)
+
+
+def _wald_rng(mu, lam, rng):
+    # Michael-Schucany-Haas transform: a chi-square(1) draw via a squared
+    # normal, folded into the two-root Wald solution by an acceptance test on
+    # which root has the right mean (Wald 1947 identity, see also Chhikara &
+    # Folks 1989 §4.5). Used only to build a positive, inverse-Gaussian-shaped
+    # test fixture — not part of the fitted model.
+    v = rng.normal(size=mu.shape) ** 2
+    x = mu + mu**2 * v / (2 * lam) - (mu / (2 * lam)) * _np.sqrt(4 * mu * lam * v + mu**2 * v**2)
+    return _np.where(rng.uniform(size=mu.shape) <= mu / (mu + x), x, mu**2 / x)
+
+
 FIT_DATA = {
     "x": _X.tolist(),
     "g": [f"g{i}" for i in _GROUPS.tolist()],
@@ -25,6 +38,7 @@ FIT_DATA = {
     "y_bin": _rng.binomial(1, 1.0 / (1.0 + _np.exp(-(0.2 + 0.8 * _X)))).astype(float).tolist(),
     "y_pois": _rng.poisson(_np.exp(0.5 + 0.3 * _X)).astype(float).tolist(),
     "y_gamma": _rng.gamma(shape=2.0, scale=_np.exp(0.5 + 0.1 * _X) / 2.0).tolist(),
+    "y_invgauss": _wald_rng(_np.exp(0.3 + 0.2 * _X), 3.0, _rng).tolist(),
 }
 
 
@@ -38,11 +52,11 @@ def test_link_not_offered_raises():
         glmm.fit(DATA, "y ~ x", "poisson", link="identity")
 
 
-def test_valid_link_reaches_kernel():
-    # cloglog is a legal binomial link (0.1.1 addition) — passes Python
-    # validation but the kernel doesn't have the variant yet.
-    with pytest.raises(NotImplementedError, match="cloglog"):
-        glmm.fit(DATA, "y ~ x", "binomial", link="cloglog")
+def test_cloglog_glm_fits():
+    result = glmm.fit(FIT_DATA, "y_bin ~ x", "binomial", link="cloglog")
+    assert result.converged
+    assert len(result.beta) == 2
+    assert result.dispersion == 1.0
 
 
 def test_inversegaussian_mixed_raises():
@@ -52,9 +66,19 @@ def test_inversegaussian_mixed_raises():
         glmm.fit(DATA, "y ~ x + (1 | g)", "inversegaussian")
 
 
-def test_inversegaussian_glm_is_a_kernel_gap():
-    with pytest.raises(NotImplementedError, match="inversegaussian"):
-        glmm.fit(DATA, "y ~ x", "inversegaussian")
+def test_inversegaussian_glm_fits():
+    result = glmm.fit(FIT_DATA, "y_invgauss ~ x", "inversegaussian")
+    assert result.converged
+    assert result.dispersion > 0
+    result_inv_sq = glmm.fit(FIT_DATA, "y_invgauss ~ x", "inversegaussian", link="inverse_squared")
+    assert result_inv_sq.converged
+
+
+def test_inversegaussian_dispersion_estimate_is_accepted():
+    # "estimate" is the family default for a phi family; it must be stripped
+    # to None rather than reaching the kernel as a string.
+    result = glmm.fit(FIT_DATA, "y_invgauss ~ x", "inversegaussian", dispersion="estimate")
+    assert result.converged
 
 
 def test_wald_se_invalid_raises():

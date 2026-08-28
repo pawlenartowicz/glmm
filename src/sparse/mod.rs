@@ -4,7 +4,7 @@
 //! (levels never co-occur across families) and ALL crossed-extra columns form
 //! one tail (dense for `e ≤ TAIL_SPARSE_MIN`, fill-reducing sparse above) —
 //! lifting the `MAX_*` caps that bound the dense no-Z tail.
-//! Mirrors `lmm::reml_deviance` (`lmm.rs:1396`) one level down; validated
+//! Mirrors `lmm::reml_deviance` (`src/lmm/kernel.rs`) one level down; validated
 //! against it by the both-paths cross-check (`sparse` tests + `glmm/tests.rs`).
 //!
 //! Split into this LMM half (`mod.rs`) and the GLMM half (`glmm.rs`); test
@@ -17,7 +17,7 @@
 //! decision is made by `fit::classify_design` (see `fit/mod.rs:609`).
 //
 // `SymbolicCholesky` at module level serves `logdet_llt`, shared by the GLMM
-// sparse-Schur PIRLS path (`glmm/pirls.rs`) and the LMM sparse-tail branch
+// sparse-Schur PIRLS path (`glmm/pirls/dense.rs`'s `pirls_solve`) and the LMM sparse-tail branch
 // (`SparseTail`); the small-e LMM eval loop stays faer-sparse-free (blocked
 // kernel with the dense tail).
 use crate::lmm::LmmGroupings;
@@ -63,7 +63,7 @@ use glmm::{sparse_glmm_deviance, SparseGlmmWorkspace};
 /// superset of the dense NoZ `fit_mle` — on an in-envelope design it reproduces
 /// that fit to machine precision (`fit_mle_sparse_matches_noz_in_envelope`).
 ///
-/// Mirrors `fit_lmm` (`lmm.rs:1859`) onto the sparse workspace: the θ seed/bounds
+/// Mirrors `fit_lmm` (`src/lmm/mod.rs`) onto the sparse workspace: the θ seed/bounds
 /// and BOBYQA schedule come from `crate::lmm::sparse_lmm_seed` (byte-identical to
 /// the NoZ path), and the recovery reads the augmented Schur factor `L`
 /// (`sparse_schur_factor`) exactly as `fit_lmm` reads its `fit.factor`. `aliased`
@@ -138,7 +138,7 @@ pub(crate) fn fit_mle_sparse(
     // Cold start = blind seed (diagonals THETA0, off-diagonals 0 — mirror
     // `fit_lmm`'s cold arm, see the basin rationale there); a warm start
     // clamps only its diagonal coordinates to the truth floor, off-diagonals
-    // verbatim (mirror `fit_lmm` `lmm.rs:1888-1900`).
+    // verbatim (mirror `fit_lmm`, `src/lmm/mod.rs`).
     match start {
         Some(s) => {
             debug_assert_eq!(s.theta.len(), theta.len());
@@ -168,7 +168,7 @@ pub(crate) fn fit_mle_sparse(
         &upper,
     );
     debug_assert!(out.status != Status::InvalidArgs);
-    // The plateau policy, mirrored from `fit_lmm` (`lmm.rs`): a `MaxFunReached`
+    // The plateau policy, mirrored from `fit_lmm` (`src/lmm/mod.rs`): a `MaxFunReached`
     // cap-out reports its finite endpoint with `converged == false` rather than
     // NaN-filling — it runs the same pin + rank-guard + recovery as `Converged`.
     // `ModelDegenerate` has no endpoint worth reporting and NaN-fills below.
@@ -176,8 +176,8 @@ pub(crate) fn fit_mle_sparse(
     let has_endpoint = matches!(out.status, Status::Converged | Status::MaxFunReached);
 
     // Per-component deterministic pin: every DIAGONAL variance component ≤ PIN_THETA
-    // collapses to exactly 0 so tau2/varcorr reflect the boundary (mirror `fit_lmm`
-    // `lmm.rs:1917-1927`). Applied to any reported endpoint, but the mask (⇒
+    // collapses to exactly 0 so tau2/varcorr reflect the boundary (mirror `fit_lmm`,
+    // `src/lmm/mod.rs`). Applied to any reported endpoint, but the mask (⇒
     // `singular`) only latches when the fit actually converged — a capped
     // endpoint is reported as a point, not accepted onto the boundary. The bit
     // index is the position in `diagonal_theta()` order, not the θ index: that
@@ -203,7 +203,7 @@ pub(crate) fn fit_mle_sparse(
     }
 
     // Final eval at θ̂ (post-pin) → augmented Schur factor L in `ws.factor`;
-    // rank-guard the p×p fixed block (mirror `fit_lmm` `lmm.rs:1932-1940`).
+    // rank-guard the p×p fixed block (mirror `fit_lmm`, `src/lmm/mod.rs`).
     let factor_ok = has_endpoint && sparse_schur_factor(&theta, &mut ws).is_some();
     let degenerate = if factor_ok {
         crate::ols::min_pivot_ratio(ws.factor.as_ref(), p).0 < PIVOT_MIN
@@ -248,7 +248,7 @@ pub(crate) fn fit_mle_sparse(
         lyy * lyy / ((n - p) as f64)
     };
 
-    // β̂: backward solve L_XXᵀ β̂ = l_yX, l_yX[j] = L[(p, j)] (mirror `lmm.rs:1961-1967`).
+    // β̂: backward solve L_XXᵀ β̂ = l_yX, l_yX[j] = L[(p, j)] (mirror `fit_lmm`, `src/lmm/mod.rs`).
     let mut beta = vec![0.0f64; p];
     for j in (0..p).rev() {
         let mut acc = l[(p, j)];
@@ -258,7 +258,7 @@ pub(crate) fn fit_mle_sparse(
         beta[j] = acc / l[(j, j)];
     }
 
-    // Var(β̂_j) = σ̂²·‖L_XX⁻¹e_j‖² per target; SE = √Var (mirror `lmm.rs:1972-1993`
+    // Var(β̂_j) = σ̂²·‖L_XX⁻¹e_j‖² per target; SE = √Var (mirror `fit_lmm`, `src/lmm/mod.rs`,
     // + `fit_mle` `fit.rs:708-714`). Non-target slots stay NaN.
     let mut se = vec![f64::NAN; p];
     let mut u = vec![0.0f64; p];
@@ -311,10 +311,12 @@ pub(crate) fn fit_mle_sparse(
     // NaN-fill returns, which have no varcorr to place bits against.
     let pinned_grid = crate::fit::pinned_flags(pinned_components, &varcorr);
 
+    // Level counts are design-only and reported regardless — see `fit/lmm.rs`.
     // Conditional modes and the per-row means they unlock, off the factors the
-    // evaluation above kept. Gated on `converged` like the dense path: a mode at
-    // a non-converged θ̂ is not a BLUP of anything.
-    let (fitted, ranef, ranef_levels) = match converged.then(|| sparse_recover_u(&ws, &beta)) {
+    // evaluation above kept, stay gated on `converged` like the dense path: a
+    // mode at a non-converged θ̂ is not a BLUP of anything.
+    let ranef_levels = crate::fit::ranef_level_counts(&g);
+    let (fitted, ranef) = match converged.then(|| sparse_recover_u(&ws, &beta)) {
         Some(Some(u)) => {
             let ranef = crate::fit::assemble_ranef_sparse(&theta, &g, &u);
             let fitted = crate::fit::lmm_fitted(
@@ -328,9 +330,9 @@ pub(crate) fn fit_mle_sparse(
                 extra_ids,
                 opts.offset.as_deref(),
             );
-            (fitted, ranef, crate::fit::ranef_level_counts(&g))
+            (fitted, ranef)
         }
-        _ => (vec![], vec![], vec![]),
+        _ => (vec![], vec![]),
     };
 
     let mut fit = crate::Fit {
@@ -374,7 +376,7 @@ pub(crate) fn fit_mle_sparse(
 /// (`SparseLmmWorkspace::new`, `StructuredSchur::new`/`clone_scratch` —
 /// `glmm/workspace.rs`). Returns `+INFINITY` if any diagonal is
 /// non-positive/non-finite (mirrors the dense evaluators' non-PD sentinel,
-/// `lmm.rs:1530–1561`).
+/// `src/lmm/kernel.rs`'s `reml_deviance`/`reml_deviance_blocked`).
 pub(crate) fn logdet_llt(symbolic: &SymbolicCholesky<usize>, l_values: &[f64]) -> f64 {
     use faer::sparse::linalg::cholesky::{supernodal::SupernodalLltRef, SymbolicCholeskyRaw};
     // `ljj <= 0.0` handles negative and zero; `!is_finite()` covers NaN and ±Inf
@@ -641,7 +643,7 @@ pub(crate) struct SparseLmmWorkspace {
     pub(crate) fam_a: Vec<f64>,
     /// `L21 = A21·L11⁻ᵀ` (`e×k_family` column-major, `e = k_crossed`; columns
     /// family-major, `f·w + local`) — the crossed-tail coupling after family
-    /// elimination. A plain col-major `Vec` (the `lmm.rs` `fit.bt` pattern) so
+    /// elimination. A plain col-major `Vec` (the `src/lmm/kernel.rs` `fit.bt` pattern) so
     /// the per-family tri-solve runs as contiguous-column axpys and the syrk
     /// downdate views it through `MatRef::from_column_major_slice`. DENSE-TAIL
     /// branch only — zero-length when `tail` is Some (the sparse branch keeps
@@ -677,7 +679,7 @@ pub(crate) struct SparseLmmWorkspace {
     pub(crate) factor_llt_mem: MemBuffer,
     pub(crate) m: usize,
     pub(crate) p: usize,
-    /// Row count N — REML df is `N − p` (mirrors `reml_deviance` `lmm.rs:1813`).
+    /// Row count N — REML df is `N − p` (mirrors `reml_deviance`, `src/lmm/kernel.rs`).
     pub(crate) n: usize,
     /// `Some` only for the one post-fit evaluation that feeds
     /// [`sparse_recover_u`]; see [`SparseRecovery`].
@@ -710,7 +712,7 @@ pub(crate) struct SparseRecovery {
 /// lives at RE column `start + d·stride` (primary blocks are slope-major with
 /// stride `n_primary`; nested/crossed blocks contiguous, stride 1), with values
 /// at `lam_small[lam_off + r·q + c]` (r ≥ c). Layout mirrors the deleted dense
-/// `build_block_lambda` walk / `reml_deviance_blocked`'s Λ walk (`lmm.rs:1115`).
+/// `build_block_lambda` walk / `reml_deviance_blocked`'s Λ walk (`src/lmm/kernel.rs`).
 pub(crate) struct LamBlock {
     start: usize,
     stride: usize,
@@ -920,7 +922,7 @@ impl SparseLmmWorkspace {
         // total, same accumulation the dense Gram + `pack` copy produced,
         // block-pair-keyed instead of k×k-staged. NOT the shared
         // `add_rows_multi` accumulator: that path packs per-row level ids into
-        // a fixed `[usize; 1 + MAX_EXTRA_GROUPINGS]` stack array (`lmm.rs:542`)
+        // a fixed `[usize; 1 + MAX_EXTRA_GROUPINGS]` stack array (`src/lmm/kernel.rs`)
         // and would index out of bounds for over-envelope-by-count designs —
         // the sparse route must stay cap-free.
         let mut ztxy = vec![0.0f64; g.k_total * m];
@@ -1347,7 +1349,7 @@ fn build_sparse_tail(
 /// depends on — its own raw x/y reads carry a matching `√wᵢ` factor (see
 /// `SparseLmmWorkspace::new`), so every product of two z entries, or of a z
 /// entry with an x/y read, ends up carrying exactly `wᵢ` (mirrors
-/// `add_rows_multi`'s `zw`-per-side scheme, `lmm.rs:696-733`).
+/// `add_rows_multi`'s `zw`-per-side scheme, `src/lmm/kernel.rs`).
 #[inline]
 fn for_each_z_entry(
     g: &LmmGroupings,
@@ -1480,10 +1482,10 @@ fn fold_packed_col(
 ///   3. S = C_xy − UᵀU (dense m×m, C_xy = ws.cxy = [X y]'[X y]), Crout → L_XX;
 ///   4. σ̂² = L_XX[p,p]² / (N−p); deviance = log|L_ZZ|² + log|L_XX|² + (N−p)·ln σ̂².
 ///
-/// Normalization transcribed from `reml_deviance` (`lmm.rs:1801-1820`): REML
+/// Normalization transcribed from `reml_deviance` (`src/lmm/kernel.rs`): REML
 /// df = N−p, `σ̂² = L[p,p]²/df`, `log|L_XX|² = 2Σ_{j<p} ln L[j,j]`; drops the same
 /// additive constants (2π, …). Returns INFINITY on any non-PD factor / non-finite
-/// σ̂² (mirrors the dense diagonal guards, `lmm.rs:1804/1815`).
+/// σ̂² (mirrors the dense diagonal guards, same function).
 pub(crate) fn sparse_reml_deviance(theta: &[f64], ws: &mut SparseLmmWorkspace) -> f64 {
     let p = ws.p;
     let log_lzz_sq = match sparse_schur_factor(theta, ws) {
@@ -1544,22 +1546,23 @@ pub(crate) fn sparse_reml_deviance(theta: &[f64], ws: &mut SparseLmmWorkspace) -
 /// sparse numeric LLT runs off a pre-sized `MemStack`). Numerically this is
 /// the same Cholesky as the generic sparse factorization it replaced up to the
 /// elimination order (structure-driven here vs AMD) and GEMM accumulation
-/// order — a sanctioned reassociation (same argument as `lmm.rs:1796-1802`),
+/// order — a sanctioned reassociation (same argument as `reml_deviance`,
+/// `src/lmm/kernel.rs`),
 /// gated by the both-paths deviance-equality tests and the validation suite.
 ///
 /// Returns `log|L_ZZ|²`; `None` on any non-PD pivot (family Crout, tail LLT —
 /// `LltRegularization::default()` is a verified no-op, delta = 0 — or Schur
-/// Crout), the same INFINITY surface as the dense evaluators (`lmm.rs:1795`).
+/// Crout), the same INFINITY surface as the dense evaluators (`src/lmm/kernel.rs`).
 /// Shared by `sparse_reml_deviance` (diagonal → deviance) and `fit_mle_sparse`
 /// (the full factor → β̂/σ̂²/SE recovery). By Cholesky uniqueness `ws.factor`
 /// equals the dense path's augmented `fit.factor` at the same θ (both factor
 /// the identical reduced augmented Gram X'V⁻¹[X y]): `L[(j,j)]` (j<p) is the
 /// L_XX diagonal, `L[(p,j)]` the y-row `l_yX[j]`, and `L[(p,p)]²/(N−p)` the
-/// profiled σ̂² — the recovery reads them exactly as `fit_lmm` reads
-/// `fit.factor` (`lmm.rs:1959-1993`).
+/// profiled σ̂² — the recovery reads them exactly as `fit_lmm` (`src/lmm/mod.rs`)
+/// reads `fit.factor`.
 /// Schur L21 Phase B: tri-solve each of the `w` family columns against `L_fᵀ`
 /// (stored col-major in `fam_a`, `w×w`) as contiguous-column axpys — columns
-/// before `fb+c` are final when read (the lmm.rs:1779 `fit.bt` split_at_mut
+/// before `fb+c` are final when read (the `src/lmm/kernel.rs` `fit.bt` split_at_mut
 /// pattern). `buf` is exactly the family's `w` columns, each `col_len` long
 /// (`e` for the dense global `l21` slice, `e_f` for the compact panel), so the
 /// dense and sparse-panel arms share this verbatim. One reciprocal replaces `e`
@@ -1711,8 +1714,8 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
         // off the packed family stream — (primary, primary), each
         // (child, primary) coupling, each child's own diagonal block; sibling
         // child–child blocks are structurally zero (children never share rows
-        // — mirror lmm.rs:1631) and zero-filled. Then Crout in place → L_f
-        // (the `reml_deviance` family-Crout pattern, lmm.rs:1668-1687).
+        // — mirror `src/lmm/kernel.rs`) and zero-filled. Then Crout in place → L_f
+        // (the `reml_deviance` family-Crout pattern, `src/lmm/kernel.rs`).
         let fam_gram = &pk_fam[f * fam_len..(f + 1) * fam_len];
         let pb = &lam_blocks[f];
         let lo_p = pb.lam_off;
@@ -1803,7 +1806,7 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
         }
         // U1 family rows: B1_f = (Λ'Z'[X y])[family rows] — row r is
         // Σ_{a≥il} Λ[a,il]·ztxy_row(col_a) over its owning block (mirrors
-        // `reml_deviance_blocked`'s P_zx = ΛᵀZᵀ[Xy], lmm.rs:1291-1303), read
+        // `reml_deviance_blocked`'s P_zx = ΛᵀZᵀ[Xy], `src/lmm/kernel.rs`), read
         // off the row-major ztxy — then forward-solved by L_f (col-major
         // kf-stride Vec; the row ops span m ≤ p+1 columns).
         let fb = f * w;
@@ -2080,7 +2083,7 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
                 // crossed block pairs (same-factor level pairs never co-occur, so a
                 // single crossed factor's A22 is block-DIAGONAL — most pairs skip),
                 // add +I, then ONE triangular syrk downdate through faer's blocked
-                // FMA kernels (same call shape as lmm.rs:1811-1821; RESULT-MOVING
+                // FMA kernels (same call shape as `src/lmm/kernel.rs`; RESULT-MOVING
                 // reassociation vs entry-wise subtraction, sanctioned as there).
                 for tj in 0..e {
                     for ti in tj..e {
@@ -2452,7 +2455,7 @@ fn sparse_recover_u(ws: &SparseLmmWorkspace, beta: &[f64]) -> Option<Vec<f64>> {
 }
 
 /// TEST ONLY: the deterministic LCG the LMM tests use for reproducible designs
-/// (copied from `lmm.rs`'s test `lcg`). Yields a value in `(-1, 1)`.
+/// (copied from `src/lmm/tests.rs`'s test `lcg`). Yields a value in `(-1, 1)`.
 #[cfg(test)]
 pub(crate) fn test_lcg(state: &mut u64) -> f64 {
     *state = state

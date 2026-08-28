@@ -54,12 +54,13 @@ watch for the warning).
 ## What the formula accepts
 
 The formula is parsed by the same Rust parser the Python port uses: bare
-column names, `+`, `:`, `*`, `A/B` nesting, and `(1 + x | g)` random effects
-with a full correlation structure. Not accepted (each is a clear error with a
-workaround): `log(x)`/`I()`/`poly()` (compute the column first),
-`cbind(s, f)` (pass the proportion as response and trials as `weights=`), and
-`- 1`/`0 +` (not available; the model always carries an intercept) — full
-list and workarounds in
+column names, `+`, `:`, `*`, `A/B` nesting, `- 1`/`0 +` (drops the
+intercept), `log()`/`sqrt()`/`exp()`/`I(x^k)` on one bare column,
+`offset()`, `cbind(s, f) ~ …` (with `family = binomial`), and `(1 + x | g)`
+random effects with a full correlation structure. Not accepted (each is a
+clear error with a workaround): `poly()` and other general function calls
+(compute the column first), `(x || g)` (uncorrelated random effects), and
+`(0 + x | g)` (intercept-free random slopes) — full list and workarounds in
 [`formula.md`](../documentation/formula.md). R's `Gamma()` object means
 `link = "inverse"` (R semantics win); the string `"gamma"` means the glmm
 default `link = "log"`.

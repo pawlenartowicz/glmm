@@ -93,4 +93,11 @@ def test_fit_fields():
         "ranef",
         "ranef_levels",
         "ranef_blocks",
+        "formula",
+        "family",
+        "link",
+        "nagq",
+        "nobs",
+        "y",
+        "weights",
     ]

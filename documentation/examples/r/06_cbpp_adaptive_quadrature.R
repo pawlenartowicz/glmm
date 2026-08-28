@@ -6,7 +6,7 @@
 # one random effect per level (q=1) -- AGQ's current cap is q<=3 on a single
 # binomial/Poisson grouping factor.
 #
-# Data: lme4's own `cbpp` -- see recipe 4 for the weights= migration from
+# Data: lme4's own `cbpp` -- see recipe 4 for the weights= spelling of
 # lme4's cbind().
 #
 # Rung: manifest.json rung 5 at nAGQ=7 / goldens/cbpp_agq_k7.json (the same

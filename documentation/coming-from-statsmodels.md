@@ -15,15 +15,16 @@ was checked against the installed wheel rather than assumed.
 
 The formula string looks like patsy's — `~` separates response from
 predictors, `+` adds terms — but the grammar underneath is a separate, much
-smaller parser (`glmm::formula`, shared by Rust, Python and R) that accepts
-**bare column names only**, never a function call. Every claim below is the
-literal, verified output of `glmm.fit` on the installed wheel.
+smaller parser (`glmm::formula`, shared by Rust, Python and R) with a small,
+closed whitelist of function calls (`log()`/`sqrt()`/`exp()`/`I(x^k)`,
+`offset()`, `cbind()`) rather than patsy's general call syntax. Every claim
+below is the literal, verified output of `glmm.fit` on the installed wheel.
 
 | patsy construct | Result | Workaround |
 |---|---|---|
 | `C(group)` | `ValueError: formula syntax error at position 0: expected identifier, got 'C(group)'` | Don't wrap it. A plain string (or `pandas.Categorical`) column is *always* treatment-coded — just write the bare column name, `y ~ group`. Control the base level by sorting (`pandas.Categorical(x, categories=[...])`); its first category is the base. See [`formula.md#factor-coding`](formula.md#factor-coding). |
-| `np.log(x)` (or bare `log(x)`) | `ValueError: formula syntax error at position 0: expected identifier, got 'np.log(x2)'` (same shape for `log(x2)`: `got 'log(x2)'`) | No transforms inside the formula, dotted or not. Compute the column yourself — `data["log_x"] = np.log(data["x"])` — and reference `log_x` as a bare name. |
-| `y ~ x - 1` (intercept suppression) | `ValueError: formula syntax error at position 0: expected identifier, got 'x-1'` | Not available at all, in either direction: the model always carries an intercept, and there is no way to remove it. Don't write `- 1` or `0 +`. |
+| `np.log(x)` | `ValueError: formula syntax error at position 0: expected identifier, got 'np.log(x2)'` | The dotted `np.`/`scipy.` spelling isn't in the whitelist. Write the bare-column form instead — `log(x2)`, `sqrt(x2)`, `exp(x2)`, or `I(x2^2)` — which does work; see [`formula.md`](formula.md). |
+| `y ~ x - 1` (intercept suppression) | **Works.** `- 1` and `0 +` both drop the fixed-effect intercept. | None needed. |
 | `bs(x, df=3)` (spline basis) | `ValueError: formula syntax error at position 0: expected identifier, got 'bs(x,df=3)'` | No basis-expansion support in the formula. Build the basis columns yourself outside the fit (e.g. `patsy.dmatrix("bs(x, df=3)", data)` or `scipy.interpolate`) and add each resulting column as its own bare fixed-effect term. |
 | `x:y` interaction | **Works unchanged.** `glmm.fit(data, "y ~ x:x2")` fits — `:` means pure interaction (no main effects added) in both patsy and this parser, and `*` desugars to main effects + interaction in both too. | None needed. |
 

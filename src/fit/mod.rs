@@ -21,7 +21,7 @@
 //! module per family — `ols`/`lmm` (Gaussian), `glm` (fixed-effects
 //! binomial/Poisson/Gamma/NB), `glmm` (mixed non-Gaussian, plus GLMM-NB) —
 //! each of which marshals into the matching numerical kernel
-//! (`src/ols.rs`/`src/lmm.rs`/`src/glm.rs`/`src/glmm/`). `common` holds
+//! (`src/ols.rs`/`src/lmm/mod.rs`/`src/glm.rs`/`src/glmm/`). `common` holds
 //! helpers shared by 2+ of those modules; `loop_advanced_seam` holds the
 //! unstable dev-only surface re-exported through `crate::loop_advanced`.
 
