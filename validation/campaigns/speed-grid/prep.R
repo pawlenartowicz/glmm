@@ -14,7 +14,6 @@ suppressMessages({ library(jsonlite); library(MASS) })
 
 here_dir <- normalizePath(dirname(sub(
   "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))))
-suite_dir <- normalizePath(file.path(here_dir, "..", ".."))  # validation/ (manifest_diligent.json stays here)
 grid_dir <- file.path(here_dir, "data")
 dir.create(grid_dir, showWarnings = FALSE, recursive = TRUE)
 
@@ -271,42 +270,3 @@ write(toJSON(manifest, auto_unbox = TRUE, pretty = TRUE, digits = NA, null = "nu
 cat(sprintf("cells: %d (b1-flagged: %d)  csvs in %s\n",
             length(manifest$cells),
             sum(vapply(manifest$cells, function(c) isTRUE(c$b1), TRUE)), grid_dir))
-
-# ---- diligent manifest (spec: docs/GLMM/plans/2026-07-12-full-agq-vector-re-spec.md
-# Part 6) ---------------------------------------------------------------------
-# Same 510 cells, same data CSVs/seeds -- no new simulation. Stamps nagq=7 on the
-# 33 AGQ-eligible cells: the non-Gaussian, single-grouping-factor structures
-# (int1 = scalar intercept -> glmer(nAGQ=7); q2s = intercept+slope vector RE ->
-# GLMMadaptive mixed_model(nAGQ=7), since glmer refuses nAGQ>1 for vector REs,
-# full-AGQ spec locked decision 6). q2s cells additionally get ma_fixed/ma_random
-# (GLMMadaptive's split fixed/random formula args), same string convention as the
-# m3_goldens manifest's AGQ rungs (`ma_fixed`/`ma_random` fields) -- response is
-# `cbind(incidence, size - incidence)` for aggregated-binomial cells
-# (entry$weights == "size"; mixed_model's own `weights` arg is a per-CLUSTER
-# replicate multiplier, not a per-row trial count -- verified empirically,
-# "the length of 'weights' does not match with the number of groups in 'data'"
-# -- so it cannot carry glm/glmer's trial-count convention; cbind is
-# GLMMadaptive's actual binomial-trials form, confirmed against a live fit),
-# else "y"; the random part carries only the slope covariates (GLMMadaptive's
-# random formula implies its own intercept), q2s always has exactly one slope (x1).
-diligent <- manifest
-diligent$schema <- "glmm-grid-manifest-diligent/1"
-n_agq <- 0L
-for (i in seq_along(diligent$cells)) {
-  cell <- diligent$cells[[i]]
-  eligible <- cell$family != "gaussian" && cell$structure %in% c("int1", "q2s")
-  if (!eligible) next
-  n_agq <- n_agq + 1L
-  cell$nagq <- 7L
-  if (cell$structure == "q2s") {
-    resp <- if (!is.null(cell$weights)) "cbind(incidence, size - incidence)" else "y"
-    fx <- paste(paste0("x", seq_len(cell$n_x)), collapse = " + ")
-    cell$ma_fixed <- sprintf("%s ~ %s", resp, fx)
-    cell$ma_random <- sprintf("~ %s | g1", fx)  # q2s: n_x == 1 slope (x1), primary grouping is always "g1"
-  }
-  diligent$cells[[i]] <- cell
-}
-stopifnot("33 AGQ-eligible cells (15 int1 + 18 q2s)" = n_agq == 33L)
-write(toJSON(diligent, auto_unbox = TRUE, pretty = TRUE, digits = NA, null = "null"),
-      file.path(suite_dir, "manifest_diligent.json"))
-cat(sprintf("diligent cells: %d (agq-eligible: %d)\n", length(diligent$cells), n_agq))

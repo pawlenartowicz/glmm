@@ -30,6 +30,7 @@
 
 pub mod consts;
 pub mod linalg;
+pub mod scalar;
 pub mod simd_transcendental;
 
 // R-style formula frontend (`formula` feature, on by default). Off for the
@@ -39,6 +40,7 @@ pub mod simd_transcendental;
 #[cfg(feature = "formula")]
 pub mod formula;
 
+mod counters;
 mod family;
 mod fit;
 mod glm;
@@ -49,6 +51,8 @@ mod ols;
 mod sparse;
 mod spec;
 mod start;
+#[cfg(feature = "counters")]
+pub use counters::{EvalCounters, Stage};
 pub use fit::{fit_cold, fit_warm, Boundary, Diagnostics, Fit, FitOptions, Note};
 pub use ids::GroupIds;
 /// The blind θ start. Re-exported because a caller that must supply

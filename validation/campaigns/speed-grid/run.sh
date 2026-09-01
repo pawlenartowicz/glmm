@@ -29,7 +29,14 @@ mkdir -p "$(dirname "$OUT")"
 export GRID_OUT="$OUT" GRID_MANIFEST="$MANIFEST" GRID_CONFIG_TAG="${GRID_CONFIG_TAG:-$TAG}"
 
 case "$ENGINE" in
-  glmm)        CMD=(cargo run --quiet --release --manifest-path "$ROOT/../Cargo.toml" -p validation --example grid_fit)
+  glmm)        FEATFLAGS=()
+               # Counter pass: build the driver against glmm's `counters`
+               # feature so the per-cell record carries the stage split, the
+               # shrink counts, the PIRLS histogram and the AGQ node cost.
+               # Off by default — rationale on the `counters` feature in
+               # validation/Cargo.toml.
+               [ -n "${GRID_COUNTERS:-}" ] && FEATFLAGS=(--features validation/counters)
+               CMD=(cargo run --quiet --release --manifest-path "$ROOT/../Cargo.toml" -p validation --example grid_fit "${FEATFLAGS[@]}")
                # Soft budget, enforced inside fit.rs (fit_cell reads
                # GRID_CELL_BUDGET). TIMEOUT here is a hang backstop only —
                # budget + 60s of slack for marshalling/process start
@@ -65,13 +72,13 @@ GRACE="${GRID_STARTUP_GRACE:-$((TIMEOUT + 180))}"
 # glmm: compile OUTSIDE the watchdog — a first build takes minutes with no
 # output writes, which would read as a per-fit timeout and kill the compiler.
 [ "$ENGINE" = "glmm" ] && cargo build --quiet --release \
-  --manifest-path "$ROOT/../Cargo.toml" -p validation --example grid_fit
+  --manifest-path "$ROOT/../Cargo.toml" -p validation --example grid_fit "${FEATFLAGS[@]}"
 
 # clock state into run meta (recorded, never set — user's bench-l/bench-u)
 NO_TURBO=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo "?")
 printf '{"engine":"%s","tag":"%s","timeout_s":%s,"no_turbo":"%s","started":"%s"}\n' \
   "$ENGINE" "$TAG" "$TIMEOUT" "$NO_TURBO" "$(date -Is)" \
-  > "$HERE/results/run_meta_${ENGINE}_${TAG}.json"
+  > "$(dirname "$OUT")/run_meta_${ENGINE}_${TAG}.json"
 [ "$NO_TURBO" = "1" ] || echo "WARNING: clock NOT locked (no_turbo=$NO_TURBO) — timings from this pass must be excluded from timing aggregates" >&2
 
 # cell universe (lme4 runs only its GRID_TODO subset; other engines respect

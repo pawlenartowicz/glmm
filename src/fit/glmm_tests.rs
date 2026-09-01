@@ -3683,3 +3683,173 @@ fn glmm_rescaling_slope_column_moves_stddev_se_by_the_predicted_power_of_c() {
         base.deviance
     );
 }
+
+/// The stage split must add up to the reported eval count, and the shrink
+/// count must be a real subset of stage 2's evals — counters 1 and 2 in
+/// `crate::counters`' module header, on the dense GLMM route. cbpp (n_theta=1,
+/// p=4) is single-stage
+/// under the public route's `two_stage` heuristic
+/// (`GlmmWorkspace::for_cluster_spec`'s `n_theta <= 2 && p <= 4` skip), and the
+/// stage split only exists on the two-stage path, so this drives the kernel
+/// entry `crate::glmm::fit_glmm` directly with `ws.two_stage` forced on,
+/// mirroring `assert_two_stage_matches_single_local` (glmm_tests.rs:2676).
+#[cfg(feature = "counters")]
+#[test]
+fn dense_glmm_counters_split_stages_and_count_shrink_evals() {
+    use crate::counters::Stage;
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let model = cbpp_model();
+    let p = 4;
+    let ids = crate::GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let (sized, ids, _perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut xm = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        for j in 0..p {
+            xm[(i, j)] = x[i * p + j];
+        }
+    }
+    let beta_start = glm_warm_start_beta(
+        sized.family,
+        f64::NAN,
+        xm.as_ref().subrows(0, n),
+        &y,
+        n,
+        p,
+        None,
+    );
+    let targets: Vec<u32> = (0..p as u32).collect();
+
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &sized, n, &[], 1);
+    ws.nb_theta = f64::NAN; // non-NB families ignore it (mirrors fit_glmm_impl)
+    build_z(
+        &mut ws,
+        xm.as_ref().subrows(0, n),
+        &ids.primary,
+        &ids.extra,
+        n,
+    );
+    ws.structured_schur = if ws.groupings.structured_extras_eligible() {
+        StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
+    } else {
+        None
+    };
+    ws.two_stage = true;
+    let f = crate::glmm::fit_glmm(
+        &mut ws,
+        xm.as_ref().subrows(0, n),
+        &y,
+        &ids.primary,
+        &ids.extra,
+        &targets,
+        None,
+        &beta_start,
+        n,
+        WaldSe::Rx,
+    );
+    assert!(f.converged, "cbpp (two-stage forced) must converge");
+    let c = f.counters;
+    assert!(
+        c.stage_evals[0] > 0,
+        "two-stage path must record stage-1 evals"
+    );
+    assert!(c.stage_evals[1] > 0, "stage 2 always runs");
+    assert_eq!(
+        (c.stage_evals[0] + c.stage_evals[1]) as usize,
+        f.n_eval,
+        "stage split must reconstruct n_eval"
+    );
+    assert!(
+        c.evals_after_last_improve(Stage::Two) < c.stage_evals[1],
+        "shrink evals are a strict subset of stage-2 evals"
+    );
+}
+
+/// One histogram entry per fit-path outer evaluation, and none from the
+/// FD-Hessian SE pass — the same fit-path-vs-SE-eval discriminator
+/// `Note::PirlsExhausted` already uses. PIRLS never converges in zero
+/// iterations, so bucket 0 must stay empty.
+#[cfg(feature = "counters")]
+#[test]
+fn dense_glmm_counters_histogram_one_entry_per_outer_eval() {
+    let (x, y, ids, n) = cbpp_design();
+    let model = cbpp_model();
+    let ids = crate::GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let opts = crate::FitOptions {
+        target_indices: vec![1],
+        ..crate::FitOptions::default() // WaldSe::Hessian — the FD pass runs
+    };
+    let f = crate::fit_cold(&x, &y, n, 4, &model, &ids, &opts);
+    assert!(f.converged(), "cbpp must converge");
+    let c = f.counters;
+    assert_eq!(
+        c.pirls_hist.iter().sum::<u32>() as usize,
+        f.n_eval,
+        "one PIRLS histogram entry per fit-path eval, SE evals excluded"
+    );
+    assert_eq!(
+        c.pirls_hist[0], 0,
+        "no eval solves PIRLS in zero iterations"
+    );
+}
+
+/// An AGQ fit must report one AGQ evaluation per outer eval and the node cost
+/// they carry: clusters x nagq^q per evaluation. A Laplace fit records none.
+#[cfg(feature = "counters")]
+#[test]
+fn agq_counters_report_evals_times_nodes() {
+    let (x, y, ids, n) = cbpp_design();
+    let model = cbpp_model();
+    let n_clusters = (ids.iter().copied().max().unwrap() as u64) + 1;
+    let ids = crate::GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+
+    let laplace = crate::fit_cold(
+        &x,
+        &y,
+        n,
+        4,
+        &model,
+        &ids,
+        &crate::FitOptions {
+            target_indices: vec![1],
+            ..crate::FitOptions::default()
+        },
+    );
+    assert_eq!(
+        laplace.counters.agq_evals, 0,
+        "nagq == 1 records no AGQ eval"
+    );
+    assert_eq!(laplace.counters.agq_node_evals, 0);
+
+    let agq = crate::fit_cold(
+        &x,
+        &y,
+        n,
+        4,
+        &model,
+        &ids,
+        &crate::FitOptions {
+            target_indices: vec![1],
+            nagq: 7,
+            ..crate::FitOptions::default()
+        },
+    );
+    assert!(agq.converged(), "cbpp nAGQ=7 must converge");
+    assert_eq!(
+        agq.counters.agq_evals as usize, agq.n_eval,
+        "every AGQ outer eval evaluates the quadrature"
+    );
+    assert_eq!(
+        agq.counters.agq_node_evals,
+        agq.counters.agq_evals as u64 * n_clusters * 7,
+        "node cost is evals x clusters x nagq^1"
+    );
+}

@@ -205,6 +205,11 @@ pub struct GlmmFit {
     /// Total BOBYQA evaluations across both stages (stage 1 + stage 2; 0 + stage 2
     /// on the single-stage path).
     pub n_eval: usize,
+    /// Observation-only evaluation counters for this fit. Gated because
+    /// `GlmmFit` is re-exported `pub` under `loop_advanced`: with `counters`
+    /// off, that tier's surface must be unchanged.
+    #[cfg(feature = "counters")]
+    pub counters: crate::counters::EvalCounters,
     /// Estimated random-intercept variance D̂[0][0] (NaN on non-converged).
     pub tau_squared_hat: f64,
     /// Joint Wald-χ² over `target_indices` (NaN when empty / non-converged).
@@ -362,6 +367,7 @@ pub fn fit_glmm(
     // draw's count into the next (see `Note::PirlsExhausted`).
     ws.pirls_exhausted = 0;
     ws.final_pirls_exhausted = false;
+    ws.counters.reset();
     ws.coup_mask = None; // CSR validity is per (fit, pinning mask): ids/z may differ across fits
                          // Cluster-outer AGQ substrate: built once per fit (cluster_ids is fit-fixed),
                          // ONLY in `parallel` builds — it exists as rayon's work-splitting substrate.
@@ -457,6 +463,7 @@ pub fn fit_glmm(
         beta_prev,
         p: pf,
         pirls_exhausted,
+        counters,
         ..
     } = ws;
     // x is fixed for this fit: widen the slope columns to f64 once (blocked AND
@@ -561,6 +568,7 @@ pub fn fit_glmm(
                     cluster_rows.as_ref(),
                     offset,
                     pirls_exhausted,
+                    counters,
                 );
                 if obj < best1 {
                     best1 = obj;
@@ -569,6 +577,7 @@ pub fn fit_glmm(
                     u_seed[..k].copy_from_slice(&u[..k]);
                     beta_seed[..p].copy_from_slice(&beta_prof[..p]);
                 }
+                counters.record_eval(crate::counters::Stage::One, obj);
                 obj
             },
             params_stage1,
@@ -659,11 +668,13 @@ pub fn fit_glmm(
                 cluster_rows.as_ref(),
                 offset,
                 pirls_exhausted,
+                counters,
             );
             if obj < best_obj {
                 best_obj = obj;
                 u_seed[..k].copy_from_slice(&u[..k]);
             }
+            counters.record_eval(crate::counters::Stage::Two, obj);
             obj
         },
         params,
@@ -704,6 +715,9 @@ pub fn fit_glmm(
     // final re-eval is the case where a truncated solve would feed the
     // returned estimates directly — see `Note::PirlsExhausted`).
     let mut final_exhausted_count = 0u32;
+    // The pinned re-eval is not a search evaluation: it gets its own throwaway
+    // counter for the same reason `final_exhausted_count` is separate above.
+    let mut final_counters = crate::counters::EvalCounters::new();
     if ok {
         // Warm-start the pinned re-eval from the incumbent (its modes are the
         // inference iterate); u_seed holds the BOBYQA incumbent after minimize.
@@ -820,6 +834,7 @@ pub fn fit_glmm(
             cluster_rows.as_ref(),
             offset,
             &mut final_exhausted_count,
+            &mut final_counters,
         );
     }
     ws.final_pirls_exhausted = final_exhausted_count > 0;
@@ -1045,6 +1060,8 @@ pub fn fit_glmm(
         boundary_hit: u8::from(pinned),
         pinned_components,
         n_eval,
+        #[cfg(feature = "counters")]
+        counters: ws.counters,
         tau_squared_hat: d00,
         joint_t_sq,
         hessian_fallback,
@@ -1080,6 +1097,8 @@ fn nan_fit(ws: &mut GlmmWorkspace, targets: &[u32], n_eval: usize) -> GlmmFit {
         boundary_hit: 2,
         pinned_components: 0,
         n_eval,
+        #[cfg(feature = "counters")]
+        counters: ws.counters,
         tau_squared_hat: f64::NAN,
         joint_t_sq: f64::NAN,
         hessian_fallback: false,

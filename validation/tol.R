@@ -368,8 +368,8 @@ rel_max <- function(x, y, atol = TOL$near_zero_abs) {
 # compare.R's two port blocks call this and nothing else -- change together.
 port_rel_max <- function(x, y) rel_max(x, y, atol = 0)
 
-# Shared join helpers (campaigns/estimate-grid/analyze.R + verify_boundary37.R --
-# change together).
+# Shared join helpers (campaigns/estimate-grid/analyze.R, the speed-grid
+# analyze.R/counters.R scripts + verify_boundary37.R -- change together).
 
 # Torn-line tolerant (kill -9 watchdog can truncate the final line) -- same
 # discipline as analyze_grid.R's reader.
@@ -381,6 +381,14 @@ read_jsonl <- function(path) {
     if (!is.null(rec)) recs[[length(recs) + 1L]] <- rec
   }
   setNames(recs, vapply(recs, `[[`, "", "case_id"))
+}
+
+# Manifest cells keyed by case_id. simplifyDataFrame = FALSE keeps `cells` a
+# list of per-cell lists, so `cell$family` etc. read off one cell; the default
+# would collapse the array into a data.frame.
+manifest_cells <- function(path) {
+  m <- fromJSON(path, simplifyDataFrame = FALSE)
+  setNames(m$cells, vapply(m$cells, `[[`, "", "case_id"))
 }
 
 # varcomp -> stddev vector and off-diagonal correlations, flattened across

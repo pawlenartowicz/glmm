@@ -31,7 +31,7 @@ use super::*;
 /// jointly PQL-optimal for this θ, β̂ written back through `beta`. A non-PD S_β
 /// surfaces as `(NaN, NaN, NaN, false)`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn pirls_solve_blocked(
+pub(crate) fn pirls_solve_blocked<T: Scalar>(
     family: Family,
     nb_theta: f64,
     g: &crate::lmm::LmmGroupings,
@@ -40,19 +40,19 @@ pub(crate) fn pirls_solve_blocked(
     y: &[f64],
     prior_w: &[f64],
     weighted: bool,
-    beta: &mut [f64],
+    beta: &mut [T],
     mut beta_step: BetaStep,
-    lam: &[f64],
+    lam: &[T],
     z_buf: &[f64],
-    m_buf: &mut [f64],
-    eta: &mut [f64],
-    prob: &mut [f64],
-    w: &mut [f64],
-    u: &mut [f64],
-    u_prev: &mut [f64],
-    eta_fixed: &mut [f64],
-    a_blocks: &mut [f64],
-    a_rhs: &mut [f64],
+    m_buf: &mut [T],
+    eta: &mut [T],
+    prob: &mut [T],
+    w: &mut [T],
+    u: &mut [T],
+    u_prev: &mut [T],
+    eta_fixed: &mut [T],
+    a_blocks: &mut [T],
+    a_rhs: &mut [T],
     // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
     // (mirrors `pirls_solve`'s `wx`; this variant has no dense M so there is no
     // `wm` twin here — B' = X'WM is filled by cluster-scatter instead).
@@ -62,22 +62,34 @@ pub(crate) fn pirls_solve_blocked(
     offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,
     n: usize,
-) -> (f64, f64, f64, bool) {
+    // Observation-only — mirrors `pirls_solve`'s `counters` (dense.rs), where
+    // the contract is stated.
+    counters: &mut crate::counters::EvalCounters,
+) -> (T, T, T, bool) {
+    // The β-Schur border below runs in f64 (its X'WX GEMM and p×p Cholesky are
+    // faer's, and reproducing them generically would move f64 bits). A non-f64
+    // instantiation must use BetaStep::Fixed — the derivative entry points do;
+    // exact generic β-profiling comes later. Loud, not silent: dropping
+    // derivatives here would be a wrong gradient, not a slow one.
+    assert!(
+        T::IS_F64 || matches!(beta_step, BetaStep::Fixed),
+        "BetaStep::Profile is f64-only"
+    );
     let q = g.primary_q;
     let s = g.n_primary;
     let k = q * s;
     let p = beta.len();
     // η_fixed,ᵢ = Σ_j x·β, hoisted out of the iteration (β fixed within the solve).
     for i in 0..n {
-        let mut e = 0.0;
+        let mut e = T::ZERO;
         for j in 0..p {
-            e += x[(i, j)] * beta[j];
+            e += T::from_f64(x[(i, j)]) * beta[j];
         }
         eta_fixed[i] = e;
     }
     if let Some(o) = offset {
         for i in 0..n {
-            eta_fixed[i] += o[i];
+            eta_fixed[i] += T::from_f64(o[i]);
         }
     }
     // M = ZΛ_p (mᵢ = Λ_p'·zᵢ, zᵢ = [1, x[i, slope_cols]] pre-widened into z_buf
@@ -91,12 +103,12 @@ pub(crate) fn pirls_solve_blocked(
     // the same f64 values in the same order.
     for i in 0..n {
         for c in 0..q {
-            let mut acc = 0.0;
+            let mut acc = T::ZERO;
             for r in c..q {
                 let zr = if r == 0 {
-                    1.0
+                    T::ONE
                 } else {
-                    z_buf[i * (q - 1) + (r - 1)]
+                    T::from_f64(z_buf[i * (q - 1) + (r - 1)])
                 };
                 acc += zr * lam[r * q + c];
             }
@@ -105,24 +117,27 @@ pub(crate) fn pirls_solve_blocked(
     }
     // First-trial backtrack seeds (u_prev = 0, beta_prev = caller's β) — only
     // the domain-infeasibility trigger can read them; see `pirls_solve`.
-    u_prev[..k].fill(0.0);
+    u_prev[..k].fill(T::ZERO);
     if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
-        beta_prev[..p].copy_from_slice(&beta[..p]);
+        for j in 0..p {
+            beta_prev[j] = beta[j].value();
+        }
     }
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
     let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
     let mut converged = false;
-    let (mut dev, mut pen, mut logdet) = (f64::NAN, f64::NAN, 0.0);
+    let (mut dev, mut pen, mut logdet) = (T::from_f64(f64::NAN), T::from_f64(f64::NAN), T::ZERO);
     let tol = pirls_tol_override.unwrap_or_else(|| super::super::pirls_tol(family));
-    for _ in 0..PIRLS_MAX_ITERS {
+    for it in 0..PIRLS_MAX_ITERS {
+        counters.set_pirls_iters(it + 1);
         // --- trial evaluation at the CURRENT u: η-pass then η→prob/w/dev. On a
         // fresh accept this is the newly-stepped u; after a halving `continue` it
         // is the backtracked u. Either way the recompute IS the trial evaluation.
         // Loop-split: the transcendental runs vectorized over a materialized η[]
         // with no gather/scatter data deps.
         // --- pass 1: η-pass (scalar gather): form ηᵢ, accumulate Σ y·η ---
-        let mut yeta = 0.0;
+        let mut yeta = T::ZERO;
         for i in 0..n {
             let m_row = &m_buf[i * q..i * q + q];
             let ubase = cluster_ids[i] as usize * q;
@@ -131,12 +146,12 @@ pub(crate) fn pirls_solve_blocked(
                 e += m_row[c] * u[ubase + c];
             }
             eta[i] = e;
-            yeta += y[i] * e;
+            yeta += T::from_f64(y[i]) * e;
         }
         // --- pass 2: η[] → prob[]/w[] + deviance, through the shared family
         // kernel (clamps η in place; `infeasible` flags any raw η outside the
         // link's open domain — Gamma-inverse only, mirrors `pirls_solve`). ---
-        let (d, infeasible) = crate::simd_transcendental::family_pass(
+        let (d, infeasible) = T::family_pass(
             family,
             nb_theta,
             &mut eta[..n],
@@ -154,21 +169,25 @@ pub(crate) fn pirls_solve_blocked(
         // Fisher scoring is not strictly monotone — a step can land ε above
         // `pen_accepted` yet inside the tol band, and that must converge, not burn
         // all 10 halvings against FP noise). ‖u‖² is at the CURRENT trial u.
-        let pen_u: f64 = u[..k].iter().map(|v| v * v).sum();
+        let mut pen_u = T::ZERO;
+        #[allow(clippy::needless_range_loop)]
+        for c in 0..k {
+            pen_u += u[c] * u[c];
+        }
         let penalized = dev + pen_u;
         // BAND-TOLERANT overshoot test, mirrors `pirls_solve` (see its comments
         // for why a within-band rise is accepted rather than converged-on or
         // halved): only a rise EXCEEDING the tol band backtracks. A
         // domain-infeasible trial halves regardless of the band (see
         // `pirls_solve`'s comment).
-        if infeasible || penalized - pen_accepted > tol * (1.0 + penalized.abs()) {
+        if infeasible || penalized.value() - pen_accepted > tol * (1.0 + penalized.value().abs()) {
             if halvings < PIRLS_MAX_HALVINGS {
                 // Last full step overshot: halve δu = u − u_prev and re-enter the
                 // top (the recompute above is the trial evaluation of the halved
                 // step).
                 halvings += 1;
                 for c in 0..k {
-                    u[c] = 0.5 * (u[c] + u_prev[c]);
+                    u[c] = T::from_f64(0.5) * (u[c] + u_prev[c]);
                 }
                 // Profile mode: the trial point is the JOINT (u,β) step, so the
                 // backtrack halves β toward `beta_prev` in lockstep with u, then
@@ -176,29 +195,36 @@ pub(crate) fn pirls_solve_blocked(
                 // `pirls_solve`'s Profile backtrack.
                 if let BetaStep::Profile { beta_prev, .. } = &beta_step {
                     for j in 0..p {
-                        beta[j] = 0.5 * (beta[j] + beta_prev[j]);
+                        beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
                     }
                     refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
                 }
                 continue;
             }
-            return (f64::NAN, f64::NAN, f64::NAN, false); // halvings exhausted
+            return (
+                T::from_f64(f64::NAN),
+                T::from_f64(f64::NAN),
+                T::from_f64(f64::NAN),
+                false,
+            ); // halvings exhausted
         }
         // Accept this iterate, snapshot it for the next backtrack, and take a
         // fresh full Fisher step from it (cold start: pen_accepted = ∞ ⇒ always
         // accepts).
         halvings = 0;
-        pen_accepted = penalized;
+        pen_accepted = penalized.value();
         u_prev[..k].copy_from_slice(&u[..k]);
         // Profile mode: snapshot the accepted β as the β-halving twin of u_prev.
         if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
-            beta_prev[..p].copy_from_slice(&beta[..p]);
+            for j in 0..p {
+                beta_prev[j] = beta[j].value();
+            }
         }
         for v in a_blocks[..s * q * q].iter_mut() {
-            *v = 0.0;
+            *v = T::ZERO;
         }
         for v in a_rhs[..k].iter_mut() {
-            *v = 0.0;
+            *v = T::ZERO;
         }
         // --- pass 3: scatter-pass (scalar): wᵢmᵢmᵢ' and rᵢ·mᵢ into the blocks.
         // The effective residual rᵢ is logit's (yᵢ−pᵢ) or the general W·working_resid. ---
@@ -208,15 +234,15 @@ pub(crate) fn pirls_solve_blocked(
             let ubase = f * q;
             let ablk = f * q * q;
             let wi = w[i];
-            let resid = prior_w[i]
+            let resid = T::from_f64(prior_w[i])
                 * match family {
                     Family::Binomial {
                         link: BinomialLink::Logit,
-                    } => y[i] - prob[i],
+                    } => T::from_f64(y[i]) - prob[i],
                     other => {
                         let dmu = crate::family::mu_eta(other, eta[i]);
                         let v = crate::family::variance(other, nb_theta, prob[i]);
-                        dmu * (y[i] - prob[i]) / v
+                        dmu * (T::from_f64(y[i]) - prob[i]) / v
                     }
                 };
             for r in 0..q {
@@ -240,7 +266,7 @@ pub(crate) fn pirls_solve_blocked(
                     link: BinomialLink::Logit,
                 } => {
                     for i in 0..n {
-                        let rho = prior_w[i] * (y[i] - prob[i]);
+                        let rho = prior_w[i] * (y[i] - prob[i].value());
                         for j in 0..p {
                             beta_rhs[j] += x[(i, j)] * rho;
                         }
@@ -248,9 +274,9 @@ pub(crate) fn pirls_solve_blocked(
                 }
                 other => {
                     for i in 0..n {
-                        let dmu = crate::family::mu_eta(other, eta[i]);
-                        let v = crate::family::variance(other, nb_theta, prob[i]);
-                        let rho = prior_w[i] * dmu * (y[i] - prob[i]) / v;
+                        let dmu = crate::family::mu_eta(other, eta[i]).value();
+                        let v = crate::family::variance(other, nb_theta, prob[i]).value();
+                        let rho = prior_w[i] * dmu * (y[i] - prob[i].value()) / v;
                         for j in 0..p {
                             beta_rhs[j] += x[(i, j)] * rho;
                         }
@@ -264,8 +290,8 @@ pub(crate) fn pirls_solve_blocked(
         // holding that iterate's per-block L — describe exactly the factor that
         // produced the returned u, preserving the `blocked_schur_fill` contract
         // (a step may be re-taken after a halving, hence the reset). ---
-        logdet = 0.0;
-        pen = 0.0;
+        logdet = T::ZERO;
+        pen = T::ZERO;
         for f in 0..s {
             let ablk = f * q * q;
             let ubase = f * q;
@@ -280,10 +306,15 @@ pub(crate) fn pirls_solve_blocked(
                 a_rhs[ubase + r] = acc;
             }
             for r in 0..q {
-                a_blocks[ablk + r * q + r] += 1.0;
+                a_blocks[ablk + r * q + r] += T::ONE;
             }
             if !glmm_block_chol(&mut a_blocks[ablk..ablk + q * q], q) {
-                return (f64::NAN, f64::NAN, f64::NAN, false);
+                return (
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    false,
+                );
             }
             for r in 0..q {
                 logdet += a_blocks[ablk + r * q + r].ln();
@@ -321,7 +352,7 @@ pub(crate) fn pirls_solve_blocked(
             // this is exact.
             for c in 0..p {
                 for i in 0..n {
-                    wx[(i, c)] = w[i] * x[(i, c)];
+                    wx[(i, c)] = w[i].value() * x[(i, c)];
                 }
             }
             faer::linalg::matmul::matmul(
@@ -341,11 +372,11 @@ pub(crate) fn pirls_solve_blocked(
             }
             for i in 0..n {
                 let f = cluster_ids[i] as usize;
-                let wi = w[i];
+                let wi = w[i].value();
                 for r in 0..p {
                     let xw = x[(i, r)] * wi;
                     for c in 0..q {
-                        xtwm[(r, f * q + c)] += xw * m_buf[i * q + c];
+                        xtwm[(r, f * q + c)] += xw * m_buf[i * q + c].value();
                     }
                 }
             }
@@ -355,13 +386,13 @@ pub(crate) fn pirls_solve_blocked(
             for f in 0..s {
                 let ablk = f * q * q;
                 for col in 0..p {
-                    let mut rhs = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
+                    let mut rhs = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
                     for c in 0..q {
-                        rhs[c] = xtwm[(col, f * q + c)];
+                        rhs[c] = T::from_f64(xtwm[(col, f * q + c)]);
                     }
                     glmm_block_solve(&a_blocks[ablk..ablk + q * q], q, &mut rhs[..q]);
                     for c in 0..q {
-                        ainv_mtwx[(f * q + c, col)] = rhs[c];
+                        ainv_mtwx[(f * q + c, col)] = rhs[c].value();
                     }
                 }
             }
@@ -380,7 +411,7 @@ pub(crate) fn pirls_solve_blocked(
             for r in 0..p {
                 let mut acc = 0.0;
                 for c in 0..k {
-                    acc += xtwm[(r, c)] * (u[c] - u_prev[c]);
+                    acc += xtwm[(r, c)] * (u[c] - u_prev[c]).value();
                 }
                 beta_rhs[r] -= acc;
             }
@@ -394,7 +425,12 @@ pub(crate) fn pirls_solve_blocked(
             )
             .is_err()
             {
-                return (f64::NAN, f64::NAN, f64::NAN, false);
+                return (
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    false,
+                );
             }
             solve_in_place(
                 schur.as_ref(),
@@ -405,19 +441,19 @@ pub(crate) fn pirls_solve_blocked(
             // Apply: β += δβ; u = u_joint = u_new − T·δβ, i.e.
             // u[f·q+c] −= Σ_j T[(f·q+c, j)]·δβ[j].
             for j in 0..p {
-                beta[j] += beta_rhs[j];
+                beta[j] += T::from_f64(beta_rhs[j]);
             }
             for c in 0..k {
                 let mut acc = 0.0;
                 for j in 0..p {
                     acc += ainv_mtwx[(c, j)] * beta_rhs[j];
                 }
-                u[c] -= acc;
+                u[c] -= T::from_f64(acc);
             }
             // η_fixed depends on β; refresh for the next trial. `pen` must track the
             // moved u (‖u_joint‖²), so recompute it.
             refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
-            pen = 0.0;
+            pen = T::ZERO;
             #[allow(clippy::needless_range_loop)]
             for c in 0..k {
                 pen += u[c] * u[c];
@@ -427,7 +463,7 @@ pub(crate) fn pirls_solve_blocked(
         // successive steps — bit-identical iterate path and returned values to the
         // pre-halving loop when no halving fires (see `pirls_solve` for why the
         // same-point band cannot be a converge trigger).
-        let mixed = dev + pen;
+        let mixed = (dev + pen).value();
         if (mixed - mixed_prev).abs() < tol * (1.0 + mixed.abs()) {
             converged = true;
             break;

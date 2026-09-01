@@ -39,12 +39,11 @@ out_dir <- file.path(suite_dir, "reports")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 glmm <- read_jsonl(glmm_path); oracle <- read_jsonl(oracle_path)
-manifest <- fromJSON(file.path(suite_dir, "manifest.json"),
-                     simplifyDataFrame = FALSE)
-cells <- setNames(manifest$cells, vapply(manifest$cells, `[[`, "", "case_id"))
+cells <- manifest_cells(file.path(suite_dir, "manifest.json"))
 
 # ---- helpers -------------------------------------------------------------------
-# read_jsonl/stddevs_of/corrs_of live in tol.R (shared with verify_boundary37.R).
+# read_jsonl/manifest_cells/stddevs_of/corrs_of live in tol.R (shared with
+# verify_boundary37.R).
 # Aligned -2logL on the oracle's recorded -2*logLik(m) scale (GLMMadaptive rows
 # have deviance=null -> NA). Gaussian: glmm carries the REML criterion minus the
 # df*(1+log 2pi) offset (validated in-crate, Task 2); add it back. GLMM: glmm is

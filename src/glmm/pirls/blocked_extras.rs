@@ -367,6 +367,9 @@ pub(crate) fn pirls_solve_blocked_extras(
     offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,
     n: usize,
+    // Observation-only — mirrors `pirls_solve`'s `counters` (dense.rs), where
+    // the contract is stated.
+    counters: &mut crate::counters::EvalCounters,
 ) -> (f64, f64, f64, bool) {
     let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
     let q = g.primary_q;
@@ -413,7 +416,8 @@ pub(crate) fn pirls_solve_blocked_extras(
     let mut converged = false;
     let (mut dev, mut pen, mut logdet) = (f64::NAN, f64::NAN, 0.0);
     let tol = pirls_tol_override.unwrap_or_else(|| super::super::pirls_tol(family));
-    for _ in 0..PIRLS_MAX_ITERS {
+    for it in 0..PIRLS_MAX_ITERS {
+        counters.set_pirls_iters(it + 1);
         // --- trial evaluation at the CURRENT u (pass 1 + pass 2). On a fresh accept
         // this is the newly-stepped u; after a halving `continue` it is the
         // backtracked u. Either way the recompute IS the trial evaluation. ---

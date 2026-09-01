@@ -141,6 +141,13 @@ pub struct Fit {
     /// optimizer runs (OLS/GLM closed-form or IRLS paths). Deterministic and
     /// clock-independent; the optimizer-grid campaign's primary metric.
     pub n_eval: usize,
+    /// Dev-only optimizer evaluation counters — the stage split, the shrink
+    /// phase, the PIRLS-iteration histogram and the AGQ node cost. Present
+    /// only under the off-by-default `counters` feature, which is NOT
+    /// semver-covered; zeros on every route that runs no derivative-free
+    /// search (OLS, GLM).
+    #[cfg(feature = "counters")]
+    pub counters: crate::counters::EvalCounters,
     /// Minimized optimizer criterion at the accepted point. LMM: the profiled
     /// REML deviance as computed by `reml_deviance` — equals lme4's REMLcrit
     /// minus the data-independent constant df·(1 + ln 2π), df = n − p

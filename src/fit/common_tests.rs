@@ -459,6 +459,8 @@ fn fit_with_varcorr(vech: Vec<f64>) -> Fit {
         varcorr: vec![vech],
         stddev_se: vec![],
         n_eval: 0,
+        #[cfg(feature = "counters")]
+        counters: crate::counters::EvalCounters::new(),
         deviance: f64::NAN,
         loglik: f64::NAN,
         df: 0,
@@ -1494,7 +1496,7 @@ fn diagnostics_moved_fields_agree_through_both_paths() {
 
 /// `Boundary` at both ends of the range the dense LMM route can report:
 /// the deterministic τ̂=0 pin fixture (`fit_lmm_weighted_boundary_matches_wls`'s
-/// design, same construction) lands `AtBoundary`, sleepstudy lands `Interior`.
+/// design, same construction) lands `AtBoundary`, lmm_hand_dataset() with `i % 6` grouping lands `Interior`.
 /// Also pins the one place `singular` and `boundary` are NOT interchangeable —
 /// `singular` additionally carries the post-hoc negligible-component check.
 #[test]

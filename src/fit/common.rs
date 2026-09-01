@@ -914,6 +914,8 @@ fn unfittable_random_slope_fit(p: usize, model: &ModelSpec, aliased: &[bool]) ->
         varcorr: vec![],
         stddev_se: vec![],
         n_eval: 0,
+        #[cfg(feature = "counters")]
+        counters: crate::counters::EvalCounters::new(),
         deviance: f64::NAN,
         loglik: f64::NAN,
         df: 0,
@@ -1071,6 +1073,8 @@ pub(super) fn fit_rank_deficient(
         varcorr: fr.varcorr,
         stddev_se: fr.stddev_se,
         n_eval: fr.n_eval,
+        #[cfg(feature = "counters")]
+        counters: crate::counters::EvalCounters::new(),
         deviance: fr.deviance,
         // Scalars/per-row/RE-shaped fields pass through: loglik and df come
         // from the REDUCED fit (aliased columns carry no parameter — lme4's

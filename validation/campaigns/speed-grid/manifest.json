@@ -1,6 +1,6 @@
 {
   "schema": "glmm-grid-manifest/1",
-  "generated_by": "prep/export_grid.R",
+  "generated_by": "campaigns/speed-grid/prep.R",
   "b1_seed_suffixes": ["s1", "s2", "s3", "s4", "s5"],
   "cells": [
     {

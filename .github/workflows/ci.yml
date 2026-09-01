@@ -77,11 +77,16 @@ jobs:
         #   no-default     — the parse-once/fit-many formula-free kernel; the
         #                    formula tests are #![cfg(feature = "formula")] and
         #                    skip themselves.
+        #   counters       — dev-only evaluation/PIRLS counters, off by default
+        #                    and cfg'd out entirely without the feature, so no
+        #                    other leg even compiles this code; fit output is
+        #                    pinned bit-identical with the feature on.
         include:
           - { name: default, flags: "" }
           - { name: loop_advanced, flags: "--features loop_advanced" }
           - { name: parallel, flags: "--features parallel" }
           - { name: no-default, flags: "--no-default-features" }
+          - { name: counters, flags: "--features counters" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

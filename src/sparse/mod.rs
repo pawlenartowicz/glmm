@@ -161,8 +161,13 @@ pub(crate) fn fit_mle_sparse(
             }
         }
     }
+    let mut counters = crate::counters::EvalCounters::new();
     let out = solver.minimize(
-        |xs| sparse_reml_deviance(xs, &mut ws),
+        |xs| {
+            let d = sparse_reml_deviance(xs, &mut ws);
+            counters.record_eval(crate::counters::Stage::Two, d);
+            d
+        },
         &mut theta,
         &lower,
         &upper,
@@ -224,6 +229,8 @@ pub(crate) fn fit_mle_sparse(
             varcorr: vec![],
             stddev_se: vec![],
             n_eval: out.n_eval,
+            #[cfg(feature = "counters")]
+            counters,
             deviance: f64::NAN,
             loglik: f64::NAN,
             df: 0,
@@ -352,6 +359,8 @@ pub(crate) fn fit_mle_sparse(
         varcorr,
         stddev_se: vec![],
         n_eval: out.n_eval,
+        #[cfg(feature = "counters")]
+        counters,
         deviance: dev,
         // REML criterion off the weight-corrected deviance (mirrors `fit_mle`'s
         // loglik).

@@ -363,9 +363,12 @@ impl LmmSuffStats {
 /// slope primary, or is empty. Balance = counts[f] equal over an active prefix
 /// and zero after, per child slot c equal across active families (the
 /// grid-atom-snapped layout; non-prefix actives are conservatively rejected).
-/// `fit.bt` is per-eval scratch, free here — its first w·t_dim slots stage each
-/// family's raw rows.
-pub(crate) fn precompute_balanced_collapse(suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> bool {
+/// `fit.collapse_stage` is this precompute's own staging buffer — its first
+/// w·t_dim slots stage each family's raw rows.
+pub(crate) fn precompute_balanced_collapse(
+    suff: &LmmSuffStats,
+    fit: &mut LmmFitScratch<f64>,
+) -> bool {
     let g = &suff.groupings;
     fit.collapse_n_active = 0;
     if g.primary_q != 1 || g.n_primary == 0 || suff.n_rows == 0 {
@@ -408,14 +411,14 @@ pub(crate) fn precompute_balanced_collapse(suff: &LmmSuffStats, fit: &mut LmmFit
             } else {
                 g.n_primary + f * np + (r - 1)
             };
-            let dst = &mut fit.bt[r * t_dim..(r + 1) * t_dim];
+            let dst = &mut fit.collapse_stage[r * t_dim..(r + 1) * t_dim];
             for (b, slot) in dst[..kx].iter_mut().enumerate() {
                 *slot = suff.zx[(gcol, b)];
             }
             let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
             dst[kx..kx + m].copy_from_slice(scol);
         }
-        let (bt, gram) = (&fit.bt, &mut fit.fam_gram);
+        let (bt, gram) = (&fit.collapse_stage, &mut fit.fam_gram);
         let mut pidx = 0;
         for r in 0..w {
             for rp in r..w {
@@ -453,7 +456,7 @@ pub(crate) fn precompute_balanced_collapse(suff: &LmmSuffStats, fit: &mut LmmFit
 ///
 /// Zero-alloc warm path: every buffer lives in `LmmFitScratch` (`blocked_*`),
 /// sized once when `extra_slopes_any`. Returns INFINITY on any Cholesky failure.
-fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> f64 {
+fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch<f64>) -> f64 {
     let g = &suff.groupings;
     let m = suff.m;
     let p = m - 1;
@@ -721,7 +724,8 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
 /// old sequential per-family subtraction).
 /// Crossed factors couple everything (the dense Z_a′Z_b coupling, sanctioned
 /// dense within the stated regime), so they stay in the tail with [X y]: one
-/// dense (k_crossed+m) faer llt per evaluation. With no extras this is the
+/// dense (k_crossed+m) `Scalar::chol_lower`, out-of-place into `tail_l`, per
+/// evaluation. With no extras this is the
 /// per-cluster shrink downdate up to FP reassociation, and with no crossed
 /// factors the tail is just the m×m [X y] block.
 ///
@@ -753,18 +757,50 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
 /// coupling reads the slope-weighted `zx_slope` twin (each slope row d at level f
 /// is `zx_slope[(d·n_primary+f, b)]`, vs the intercept's unweighted `zx[(f, b)]`).
 /// The extra-grouping scalars keep q_g = 1.
-pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> f64 {
+///
+/// # Panics
+///
+/// If `suff.groupings.extra_slopes_any` and `T` is not `f64`: crossed/nested
+/// random slopes route to the `f64`-only `reml_deviance_blocked` tail.
+pub fn reml_deviance<T: Scalar + 'static>(
+    theta: &[T],
+    suff: &LmmSuffStats,
+    fit: &mut LmmFitScratch<T>,
+) -> T {
     let g = &suff.groupings;
     debug_assert_eq!(theta.len(), g.n_theta());
     let m = suff.m;
     let p = m - 1;
     if suff.n_rows <= p || p == 0 {
-        return f64::INFINITY;
+        return T::from_f64(f64::INFINITY);
     }
     // Crossed/nested random slopes route to the dense blocked path; the scalar
     // tail below stays byte-identical for every current (q_g==1) contract.
+    // `reml_deviance_blocked` is `f64`-only — the crossed/nested-slopes tail
+    // keeps a hand-written f64 route; a generic route is future work, so a
+    // non-`f64` T must not reach it.
     if g.extra_slopes_any {
-        return reml_deviance_blocked(theta, suff, fit);
+        assert!(
+            T::IS_F64,
+            "reml_deviance_blocked (crossed/nested slopes) is f64-only"
+        );
+        // Zero-alloc theta staging: `MAX_THETA` already bounds every fixed
+        // θ-unpack scratch in this module (`lam_n`/`lam_g` above).
+        let mut theta_f64 = [0.0f64; crate::consts::MAX_THETA];
+        for (dst, src) in theta_f64.iter_mut().zip(theta.iter()) {
+            *dst = src.value();
+        }
+        // `T::IS_F64` guarantees `T` and `f64` are the same type here; `Any` is
+        // the safe way to recover that fact since the type system does not
+        // track it structurally. No `unsafe`, no reinterpret cast.
+        let fit64: &mut LmmFitScratch<f64> = (fit as &mut dyn std::any::Any)
+            .downcast_mut()
+            .expect("T::IS_F64 asserted above");
+        return T::from_f64(reml_deviance_blocked(
+            &theta_f64[..theta.len()],
+            suff,
+            fit64,
+        ));
     }
     let kf = g.k_family();
     let kx = g.k_crossed();
@@ -772,7 +808,7 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
     let np = g.nested_per_parent;
     let w = g.primary_q + np; // width-general family width: q_p primary cols + nested children
     let th_p = theta[0];
-    let th_n = g.nested.map(|nf| theta[nf.vech_start]).unwrap_or(0.0);
+    let th_n = g.nested.map(|nf| theta[nf.vech_start]).unwrap_or(T::ZERO);
 
     // Width-general primary factor (q_p ≥ 2 ⇒ slope path; q_p == 1 ⇒ scalar,
     // kept byte-identical). The slope path may now carry a crossed/nested tail
@@ -798,7 +834,7 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
     }
 
     // --- tail init: [[H, ·],[B_x, C]] (lower triangle, column-major) ---
-    fit.tail[..t_dim * t_dim].fill(0.0);
+    fit.tail[..t_dim * t_dim].fill(T::ZERO);
     for b in 0..kx {
         let lam = fit.lam_x[b];
         let gcol = kf + b;
@@ -806,48 +842,54 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
         // zx entries are structurally 0.
         let zxb = suff.zx.col(b).try_as_col_major().unwrap().as_slice();
         for a in 0..b {
-            fit.tail[a * t_dim + b] = lam * fit.lam_x[a] * zxb[kf + a];
+            fit.tail[a * t_dim + b] = lam * fit.lam_x[a] * T::from_f64(zxb[kf + a]);
         }
         let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
         let tcol = &mut fit.tail[b * t_dim..(b + 1) * t_dim];
-        tcol[b] = 1.0 + lam * lam * suff.counts[gcol];
+        tcol[b] = T::ONE + lam * lam * T::from_f64(suff.counts[gcol]);
         for j in 0..m {
-            tcol[kx + j] = lam * scol[j];
+            tcol[kx + j] = lam * T::from_f64(scol[j]);
         }
     }
     for j in 0..m {
         let ccol = suff.c.col(j).try_as_col_major().unwrap().as_slice();
         let tcol = &mut fit.tail[(kx + j) * t_dim..(kx + j + 1) * t_dim];
-        tcol[kx + j..kx + m].copy_from_slice(&ccol[j..m]);
+        for (dst, &src) in tcol[kx + j..kx + m].iter_mut().zip(&ccol[j..m]) {
+            *dst = T::from_f64(src);
+        }
     }
 
     // --- family elimination ---
+    // `collapse_n_active` is written only by `precompute_balanced_collapse`,
+    // which is pinned to `LmmFitScratch<f64>`. A non-f64 scratch always has
+    // it at 0 and takes the per-family loop below — the same objective
+    // mathematically, but not bit-equal to the f64 collapse route.
     let collapse = !slope && fit.collapse_n_active > 0;
-    let mut log_lzz_half = 0.0_f64; // hoisted — single binding both arms write
+    let mut log_lzz_half = T::ZERO; // hoisted — single binding both arms write
     if collapse {
         let n_active = fit.collapse_n_active;
         // One representative A from the balanced prefix (family 0) — the
         // legacy q=1 fill verbatim.
-        let n_f = suff.counts[0];
-        fit.fam_a[0] = 1.0 + th_p * th_p * n_f;
+        let n_f = T::from_f64(suff.counts[0]);
+        fit.fam_a[0] = T::ONE + th_p * th_p * n_f;
         for c in 0..np {
-            let n_c = suff.counts[g.n_primary + c];
+            let n_c = T::from_f64(suff.counts[g.n_primary + c]);
             for c2 in 0..np {
-                fit.fam_a[(1 + c) * w + (1 + c2)] = 0.0;
+                fit.fam_a[(1 + c) * w + (1 + c2)] = T::ZERO;
             }
             fit.fam_a[(1 + c) * w] = th_p * th_n * n_c;
-            fit.fam_a[(1 + c) * w + (1 + c)] = 1.0 + th_n * th_n * n_c;
+            fit.fam_a[(1 + c) * w + (1 + c)] = T::ONE + th_n * th_n * n_c;
         }
         // Crout — the legacy in-place loop, one factor for all families.
-        let mut log_l_half = 0.0_f64;
+        let mut log_l_half = T::ZERO;
         for j in 0..w {
             let mut d = fit.fam_a[j * w + j];
             for k in 0..j {
                 let v = fit.fam_a[j * w + k];
                 d -= v * v;
             }
-            if !(d.is_finite() && d > 0.0) {
-                return f64::INFINITY;
+            if !(d.value().is_finite() && d.value() > 0.0) {
+                return T::from_f64(f64::INFINITY);
             }
             let l = d.sqrt();
             fit.fam_a[j * w + j] = l;
@@ -860,12 +902,12 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
                 fit.fam_a[i * w + j] = v / l;
             }
         }
-        log_lzz_half = (n_active as f64) * log_l_half;
+        log_lzz_half = T::from_f64(n_active as f64) * log_l_half;
         // A⁻¹ = L⁻ᵀL⁻¹ column by column (w ≤ 1+n_per — hand-rolled). comb's
         // first w slots are the forward-solve temp; comb is refilled below.
         for r in 0..w {
             for i in 0..w {
-                let mut acc = if i == r { 1.0 } else { 0.0 };
+                let mut acc = if i == r { T::ONE } else { T::ZERO };
                 for k in 0..i {
                     acc -= fit.fam_a[i * w + k] * fit.comb[k];
                 }
@@ -881,7 +923,7 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
         }
         // Combine: comb(lower) = Σ_{r≤r′} scale_r·scale_r′·A⁻¹[r,r′]·(G + [r≠r′]Gᵀ).
         let t2 = t_dim * t_dim;
-        fit.comb[..t2].fill(0.0);
+        fit.comb[..t2].fill(T::ZERO);
         let (comb, gram) = (&mut fit.comb, &fit.fam_gram);
         let mut pidx = 0;
         for r in 0..w {
@@ -890,18 +932,18 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
                 let srp = if rp == 0 { th_p } else { th_n };
                 let coeff = sr * srp * fit.a_inv[r * w + rp];
                 let gblk = &gram[pidx * t2..(pidx + 1) * t2];
-                if coeff != 0.0 {
+                if coeff.value() != 0.0 {
                     if r == rp {
                         for j in 0..t_dim {
                             for i in j..t_dim {
-                                comb[j * t_dim + i] += coeff * gblk[j * t_dim + i];
+                                comb[j * t_dim + i] += coeff * T::from_f64(gblk[j * t_dim + i]);
                             }
                         }
                     } else {
                         for j in 0..t_dim {
                             for i in j..t_dim {
                                 comb[j * t_dim + i] +=
-                                    coeff * (gblk[j * t_dim + i] + gblk[i * t_dim + j]);
+                                    coeff * T::from_f64(gblk[j * t_dim + i] + gblk[i * t_dim + j]);
                             }
                         }
                     }
@@ -911,9 +953,9 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
         }
         // Tail −= D·comb·D, D = diag(λ_x | 1_m) — column scaling folded here.
         for j in 0..t_dim {
-            let dj = if j < kx { fit.lam_x[j] } else { 1.0 };
+            let dj = if j < kx { fit.lam_x[j] } else { T::ONE };
             for i in j..t_dim {
-                let di = if i < kx { fit.lam_x[i] } else { 1.0 };
+                let di = if i < kx { fit.lam_x[i] } else { T::ONE };
                 fit.tail[j * t_dim + i] -= di * dj * fit.comb[j * t_dim + i];
             }
         }
@@ -949,9 +991,9 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
             // per-family scoping (bounded product, reset each family) stays
             // finite.
             if !crate::linalg::block_chol(&mut fit.fam_a[..w * w], w) {
-                return f64::INFINITY;
+                return T::from_f64(f64::INFINITY);
             }
-            let mut fam_prod = 1.0_f64;
+            let mut fam_prod = T::ONE;
             for j in 0..w {
                 fam_prod *= fit.fam_a[j * w + j];
             }
@@ -983,67 +1025,61 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
         // sanctioned, verified against the brute-force oracle + validation bands which
         // are orders wider than the reorder's last-ulp footprint.
         let w_tot = g.n_primary * w;
-        {
-            let bt = faer::MatRef::from_column_major_slice(&fit.bt[..t_dim * w_tot], t_dim, w_tot);
-            let tail = faer::MatMut::from_column_major_slice_mut(
-                &mut fit.tail[..t_dim * t_dim],
-                t_dim,
-                t_dim,
-            );
-            faer::linalg::matmul::triangular::matmul(
-                tail,
-                faer::linalg::matmul::triangular::BlockStructure::TriangularLower,
-                faer::Accum::Add,
-                bt,
-                faer::linalg::matmul::triangular::BlockStructure::Rectangular,
-                bt.transpose(),
-                faer::linalg::matmul::triangular::BlockStructure::Rectangular,
-                -1.0,
-                faer::Par::Seq,
-            );
-        }
+        T::syrk_lower_sub(
+            &fit.bt[..t_dim * w_tot],
+            t_dim,
+            w_tot,
+            &mut fit.tail[..t_dim * t_dim],
+        );
     }
 
-    // --- dense tail factorization (faer llt on a MatRef view of the tail
-    // scratch — same call/FP exposure as before) ---
-    let tail_ref = faer::MatRef::from_column_major_slice(&fit.tail[..t_dim * t_dim], t_dim, t_dim);
-    let chol = match tail_ref.llt(faer::Side::Lower) {
-        Ok(c) => c,
-        Err(_) => return f64::INFINITY,
-    };
-    let l = chol.L();
+    // Out-of-place: `fit.tail` must survive holding the UNFACTORED matrix for
+    // `recover_ranef_family`, which re-factors it at θ̂.
+    if !T::chol_lower(
+        &fit.tail[..t_dim * t_dim],
+        t_dim,
+        &mut fit.tail_l[..t_dim * t_dim],
+    ) {
+        return T::from_f64(f64::INFINITY);
+    }
     for b in 0..kx {
-        let lbb = l[(b, b)];
-        if !(lbb.is_finite() && lbb > 0.0) {
-            return f64::INFINITY;
+        let lbb = fit.tail_l[b * t_dim + b];
+        if !(lbb.value().is_finite() && lbb.value() > 0.0) {
+            return T::from_f64(f64::INFINITY);
         }
         log_lzz_half += lbb.ln();
     }
-    let log_lzz_sq = 2.0 * log_lzz_half;
-    // Trailing m×m → fit.factor (augmented [X y] semantics; recovery reads only this).
+    let log_lzz_sq = T::from_f64(2.0) * log_lzz_half;
+    // Trailing m×m → fit.factor (augmented [X y] semantics; recovery reads only
+    // this). Read off `tail_l`, not `fit.factor` — the copy is exact, so reading
+    // either gives the same f64, but this is what lets `fit.factor` stay
+    // `Mat<f64>` and receive `.value()`.
     for j in 0..m {
-        let lcol = l.col(kx + j).try_as_col_major().unwrap().as_slice();
         for i in 0..m {
-            fit.factor[(i, j)] = if i >= j { lcol[kx + i] } else { 0.0 };
+            fit.factor[(i, j)] = if i >= j {
+                fit.tail_l[(kx + j) * t_dim + (kx + i)].value()
+            } else {
+                0.0
+            };
         }
     }
 
-    let mut log_lxx_sq = 0.0_f64;
+    let mut log_lxx_sq = T::ZERO;
     for j in 0..p {
-        let ljj = fit.factor[(j, j)];
-        if !(ljj.is_finite() && ljj > 0.0) {
-            return f64::INFINITY;
+        let ljj = fit.tail_l[(kx + j) * t_dim + (kx + j)];
+        if !(ljj.value().is_finite() && ljj.value() > 0.0) {
+            return T::from_f64(f64::INFINITY);
         }
         log_lxx_sq += ljj.ln();
     }
-    log_lxx_sq *= 2.0;
+    log_lxx_sq *= T::from_f64(2.0);
 
-    let lyy = fit.factor[(p, p)];
+    let lyy = fit.tail_l[(kx + p) * t_dim + (kx + p)];
     let r_sq = lyy * lyy;
-    let df = (suff.n_rows - p) as f64;
+    let df = T::from_f64((suff.n_rows - p) as f64);
     let sigma_sq = r_sq / df;
-    if !(sigma_sq.is_finite() && sigma_sq > 0.0) {
-        return f64::INFINITY;
+    if !(sigma_sq.value().is_finite() && sigma_sq.value() > 0.0) {
+        return T::from_f64(f64::INFINITY);
     }
     fit.sigma_sq = sigma_sq;
 

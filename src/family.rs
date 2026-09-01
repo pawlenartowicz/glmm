@@ -22,6 +22,7 @@
 //! Weights are returned raw; the IRLS caller applies the
 //! `glm::WEIGHT_CLAMP` floor.
 
+use crate::scalar::Scalar;
 use crate::spec::{BinomialLink, Family, GammaLink, InverseGaussianLink};
 
 /// `exp(η)` stays finite up to η≈709; clamp short of it so log-link μ never
@@ -44,7 +45,7 @@ pub(crate) const FRAC_1_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 /// evaluates `exp(exp(η))`, which overflows above `η = ln(ETA_MAX)`). Logit,
 /// probit, and Gaussian bound their own range internally or need none, so η
 /// passes through unclamped.
-pub(crate) fn clamp_eta(family: Family, eta: f64) -> f64 {
+pub(crate) fn clamp_eta<T: Scalar>(family: Family, eta: T) -> T {
     match family {
         Family::Gamma {
             link: GammaLink::Inverse,
@@ -52,7 +53,7 @@ pub(crate) fn clamp_eta(family: Family, eta: f64) -> f64 {
         }
         | Family::InverseGaussian {
             link: InverseGaussianLink::InverseSquared,
-        } => eta.clamp(MU_FLOOR, ETA_MAX),
+        } => eta.clamp_f64(MU_FLOOR, ETA_MAX),
         Family::Poisson { .. }
         | Family::Gamma {
             link: GammaLink::Log,
@@ -61,7 +62,7 @@ pub(crate) fn clamp_eta(family: Family, eta: f64) -> f64 {
         | Family::NegativeBinomial { .. }
         | Family::InverseGaussian {
             link: InverseGaussianLink::Log,
-        } => eta.clamp(-ETA_MAX, ETA_MAX),
+        } => eta.clamp_f64(-ETA_MAX, ETA_MAX),
         // Logit (`sigmoid_stable`) and probit (`phi_hp`) each bound their own
         // range internally, so η passes through. Cloglog does not: `link_inv`
         // evaluates exp(exp(η)), which overflows above η = ln(ETA_MAX) ≈ 6.55.
@@ -71,7 +72,7 @@ pub(crate) fn clamp_eta(family: Family, eta: f64) -> f64 {
         | Family::Gaussian => eta,
         Family::Binomial {
             link: BinomialLink::Cloglog,
-        } => eta.clamp(-ETA_MAX, ETA_MAX.ln()),
+        } => eta.clamp_f64(-ETA_MAX, ETA_MAX.ln()),
     }
 }
 
@@ -87,7 +88,7 @@ pub(crate) fn clamp_eta(family: Family, eta: f64) -> f64 {
 /// row dominates the WLS solve, and PIRLS reports a spuriously converged
 /// boundary answer (measured on the Gamma-inverse `sim_gamma` cell: a ~98-unit
 /// deviance cliff in the θ surface, one clamped row carrying all of it).
-pub(crate) fn eta_infeasible(family: Family, eta: f64) -> bool {
+pub(crate) fn eta_infeasible<T: Scalar>(family: Family, eta: T) -> bool {
     matches!(
         family,
         Family::Gamma {
@@ -96,39 +97,39 @@ pub(crate) fn eta_infeasible(family: Family, eta: f64) -> bool {
         } | Family::InverseGaussian {
             link: InverseGaussianLink::InverseSquared,
         }
-    ) && eta <= 0.0
+    ) && eta.value() <= 0.0
 }
 
 /// Clamp μ to each family's valid domain: `≥ MU_FLOOR` for Poisson/Gamma/NB
 /// (positive mean), `(PROB_EPS, 1−PROB_EPS)` for binomial. Gaussian passes through.
-pub(crate) fn clamp_mu(family: Family, mu: f64) -> f64 {
+pub(crate) fn clamp_mu<T: Scalar>(family: Family, mu: T) -> T {
     match family {
-        Family::Binomial { .. } => mu.clamp(PROB_EPS, 1.0 - PROB_EPS),
+        Family::Binomial { .. } => mu.clamp_f64(PROB_EPS, 1.0 - PROB_EPS),
         Family::Poisson { .. }
         | Family::Gamma { .. }
         | Family::NegativeBinomial { .. }
-        | Family::InverseGaussian { .. } => mu.max(MU_FLOOR),
+        | Family::InverseGaussian { .. } => mu.max_f64(MU_FLOOR),
         Family::Gaussian => mu,
     }
 }
 
 /// Inverse link `g⁻¹(η) → μ`, with the link's domain clamps applied so μ is
 /// always valid for [`variance`]/[`dev_resid`].
-pub(crate) fn link_inv(family: Family, eta: f64) -> f64 {
+pub(crate) fn link_inv<T: Scalar>(family: Family, eta: T) -> T {
     let eta = clamp_eta(family, eta);
     let mu = match family {
         Family::Gaussian => eta,
         Family::Binomial {
             link: BinomialLink::Logit,
-        } => crate::glm::sigmoid_stable(eta),
+        } => eta.sigmoid(),
         Family::Binomial {
             link: BinomialLink::Probit,
-        } => crate::simd_transcendental::phi_hp(eta),
+        } => eta.probit_cdf(),
         // μ = 1 − exp(−exp η). `−expm1(−t)` rather than `1 − exp(−t)` so small μ
         // keeps its relative precision (McCullagh–Nelder 1989 §4.3.1).
         Family::Binomial {
             link: BinomialLink::Cloglog,
-        } => -((-eta.exp()).exp_m1()),
+        } => -((-Scalar::exp(eta)).exp_m1()),
         Family::Poisson { .. }
         | Family::Gamma {
             link: GammaLink::Log,
@@ -137,39 +138,39 @@ pub(crate) fn link_inv(family: Family, eta: f64) -> f64 {
         | Family::NegativeBinomial { .. }
         | Family::InverseGaussian {
             link: InverseGaussianLink::Log,
-        } => eta.exp(),
+        } => Scalar::exp(eta),
         Family::Gamma {
             link: GammaLink::Inverse,
             ..
-        } => 1.0 / eta,
+        } => T::ONE / eta,
         Family::InverseGaussian {
             link: InverseGaussianLink::InverseSquared,
-        } => 1.0 / eta.sqrt(),
+        } => T::ONE / eta.sqrt(),
     };
     clamp_mu(family, mu)
 }
 
 /// Link derivative `dμ/dη` at η. Used by the general Fisher-scoring weight and
 /// working residual for the non-canonical links.
-pub(crate) fn mu_eta(family: Family, eta: f64) -> f64 {
+pub(crate) fn mu_eta<T: Scalar>(family: Family, eta: T) -> T {
     let eta = clamp_eta(family, eta);
     match family {
-        Family::Gaussian => 1.0,
+        Family::Gaussian => T::ONE,
         Family::Binomial {
             link: BinomialLink::Logit,
         } => {
-            let mu = crate::glm::sigmoid_stable(eta);
-            mu * (1.0 - mu)
+            let mu = eta.sigmoid();
+            mu * (T::ONE - mu)
         }
         Family::Binomial {
             link: BinomialLink::Probit,
-        } => FRAC_1_SQRT_2PI * (-0.5 * eta * eta).exp(),
+        } => T::from_f64(FRAC_1_SQRT_2PI) * (T::from_f64(-0.5) * eta * eta).exp(),
         // dμ/dη = exp(η − exp η). Bounded above by e⁻¹ at η=0 and underflowing at
         // both tails; the `glm::WEIGHT_CLAMP` floor is the downstream guard, as
         // for probit.
         Family::Binomial {
             link: BinomialLink::Cloglog,
-        } => (eta - eta.exp()).exp(),
+        } => (eta - Scalar::exp(eta)).exp(),
         Family::Poisson { .. }
         | Family::Gamma {
             link: GammaLink::Log,
@@ -178,21 +179,21 @@ pub(crate) fn mu_eta(family: Family, eta: f64) -> f64 {
         | Family::NegativeBinomial { .. }
         | Family::InverseGaussian {
             link: InverseGaussianLink::Log,
-        } => eta.exp(),
+        } => Scalar::exp(eta),
         // μ=1/η ⇒ dμ/dη = −1/η² = −μ².
         Family::Gamma {
             link: GammaLink::Inverse,
             ..
         } => {
-            let mu = 1.0 / eta;
+            let mu = T::ONE / eta;
             -mu * mu
         }
         // μ=η^(−1/2) ⇒ dμ/dη = −½·η^(−3/2) = −μ³/2.
         Family::InverseGaussian {
             link: InverseGaussianLink::InverseSquared,
         } => {
-            let mu = 1.0 / eta.sqrt();
-            -0.5 * mu * mu * mu
+            let mu = T::ONE / eta.sqrt();
+            T::from_f64(-0.5) * mu * mu * mu
         }
     }
 }
@@ -200,55 +201,71 @@ pub(crate) fn mu_eta(family: Family, eta: f64) -> f64 {
 /// Family variance function `V(μ)`. `nb_theta` is the NB dispersion θ̂ the fit's
 /// outer loop fixes for this evaluation — read only by the NB arm; every other
 /// family ignores it (pass `f64::NAN`).
-pub(crate) fn variance(family: Family, nb_theta: f64, mu: f64) -> f64 {
+pub(crate) fn variance<T: Scalar>(family: Family, nb_theta: f64, mu: T) -> T {
     match family {
-        Family::Gaussian => 1.0,
-        Family::Binomial { .. } => mu * (1.0 - mu),
+        Family::Gaussian => T::ONE,
+        Family::Binomial { .. } => mu * (T::ONE - mu),
         Family::Poisson { .. } => mu,
         Family::Gamma { .. } => mu * mu,
-        Family::NegativeBinomial { .. } => mu + mu * mu / nb_theta,
+        Family::NegativeBinomial { .. } => mu + mu * mu / T::from_f64(nb_theta),
         Family::InverseGaussian { .. } => mu * mu * mu,
     }
 }
 
 /// Per-observation deviance contribution `dᵢ ≥ 0` (`Σ dᵢ` is the GLM deviance,
 /// −2·log-likelihood up to the saturated constant). Zero at `y=μ`.
-pub(crate) fn dev_resid(family: Family, nb_theta: f64, y: f64, mu: f64) -> f64 {
+pub(crate) fn dev_resid<T: Scalar>(family: Family, nb_theta: f64, y: f64, mu: T) -> T {
     match family {
         Family::Gaussian => {
-            let r = y - mu;
+            let r = T::from_f64(y) - mu;
             r * r
         }
         // 2[ y ln(y/μ) + (1−y) ln((1−y)/(1−μ)) ], with the 0·ln0→0 limits.
         Family::Binomial { .. } => {
-            let a = if y > 0.0 { y * (y / mu).ln() } else { 0.0 };
-            let b = if y < 1.0 {
-                (1.0 - y) * ((1.0 - y) / (1.0 - mu)).ln()
+            let a = if y > 0.0 {
+                T::from_f64(y) * (T::from_f64(y) / mu).ln()
             } else {
-                0.0
+                T::ZERO
             };
-            2.0 * (a + b)
+            let b = if y < 1.0 {
+                T::from_f64(1.0 - y) * (T::from_f64(1.0 - y) / (T::ONE - mu)).ln()
+            } else {
+                T::ZERO
+            };
+            T::from_f64(2.0) * (a + b)
         }
         // 2[ y ln(y/μ) − (y−μ) ], y·ln(y/μ)→0 at y=0. Written y·(ln y − ln μ), not
         // y·ln(y/μ): for subnormal y and μ ≥ 2 the quotient y/μ underflows to exactly
         // 0.0 before the log, punching a −inf hole in the objective.
         Family::Poisson { .. } => {
-            let t = if y > 0.0 { y * (y.ln() - mu.ln()) } else { 0.0 };
-            2.0 * (t - (y - mu))
+            let t = if y > 0.0 {
+                T::from_f64(y) * (T::from_f64(y.ln()) - mu.ln())
+            } else {
+                T::ZERO
+            };
+            T::from_f64(2.0) * (t - (T::from_f64(y) - mu))
         }
         // 2[ −ln(y/μ) + (y−μ)/μ ]; same form for log and inverse links.
-        Family::Gamma { .. } => 2.0 * (-(y / mu).ln() + (y - mu) / mu),
+        Family::Gamma { .. } => {
+            T::from_f64(2.0) * (-(T::from_f64(y) / mu).ln() + (T::from_f64(y) - mu) / mu)
+        }
         // 2[ y ln(y/μ) − (y+θ) ln((y+θ)/(μ+θ)) ], y·ln(y/μ)→0 at y=0; θ = nb_theta.
         // Same subtraction form as Poisson — see the subnormal-underflow note above.
         Family::NegativeBinomial { .. } => {
-            let t = if y > 0.0 { y * (y.ln() - mu.ln()) } else { 0.0 };
-            2.0 * (t - (y + nb_theta) * ((y + nb_theta) / (mu + nb_theta)).ln())
+            let t = if y > 0.0 {
+                T::from_f64(y) * (T::from_f64(y.ln()) - mu.ln())
+            } else {
+                T::ZERO
+            };
+            T::from_f64(2.0)
+                * (t - (T::from_f64(y + nb_theta))
+                    * (T::from_f64(y + nb_theta) / (mu + T::from_f64(nb_theta))).ln())
         }
         // dᵢ = (yᵢ−μᵢ)²/(μᵢ²·yᵢ) (McCullagh–Nelder 1989 §2.2.4; R
         // inverse.gaussian()$dev.resids). Requires y>0.
         Family::InverseGaussian { .. } => {
-            let r = y - mu;
-            r * r / (mu * mu * y)
+            let r = T::from_f64(y) - mu;
+            r * r / (mu * mu * T::from_f64(y))
         }
     }
 }
@@ -270,18 +287,27 @@ pub(crate) fn dev_resid(family: Family, nb_theta: f64, y: f64, mu: f64) -> f64 {
 /// scalar shape `1/disp`) — no digamma, since the dispersion is profiled rather
 /// than ML-solved. Validated against the `fit::tests::fit_glmm_gamma_sim_matches_lme4`
 /// golden (unweighted) and `fit_glmm_gamma_weighted_matches_lme4` (weighted).
-pub(crate) fn gamma_aic(y: &[f64], mu: &[f64], dev: f64, n: usize, prior_w: Option<&[f64]>) -> f64 {
+pub(crate) fn gamma_aic<T: Scalar>(
+    y: &[f64],
+    mu: &[T],
+    dev: T,
+    n: usize,
+    prior_w: Option<&[f64]>,
+) -> T {
     let sum_w = prior_w.map_or(n as f64, |w| w[..n].iter().sum());
-    let disp = dev / sum_w;
-    let a = 1.0 / disp; // shape = 1/disp
-    let ln_gamma_a = crate::simd_transcendental::ln_gamma(a);
-    let mut s = 0.0;
+    let disp = dev / T::from_f64(sum_w);
+    let a = T::ONE / disp; // shape = 1/disp
+    let ln_gamma_a = a.ln_gamma();
+    let mut s = T::ZERO;
     for (i, (&yi, &mui)) in y.iter().zip(mu).take(n).enumerate() {
         let scale = mui * disp; // sᵢ = μᵢ·disp
-        s += prior_w.map_or(1.0, |w| w[i])
-            * ((a - 1.0) * yi.ln() - yi / scale - a * scale.ln() - ln_gamma_a);
+        s += T::from_f64(prior_w.map_or(1.0, |w| w[i]))
+            * ((a - T::ONE) * T::from_f64(yi.ln())
+                - T::from_f64(yi) / scale
+                - a * scale.ln()
+                - ln_gamma_a);
     }
-    -2.0 * s + 2.0
+    T::from_f64(-2.0) * s + T::from_f64(2.0)
 }
 
 /// R's `inverse.gaussian()$aic` — the family's `−2·logLik + 2` with the
@@ -298,14 +324,21 @@ pub(crate) fn gamma_aic(y: &[f64], mu: &[f64], dev: f64, n: usize, prior_w: Opti
 /// which is R's expression verbatim (R `src/library/stats/R/family.R`,
 /// `inverse.gaussian()$aic`). `μ` enters only through `dev`, so it is not a
 /// parameter here. Requires `y > 0`, the family's own domain.
-pub(crate) fn inv_gaussian_aic(y: &[f64], dev: f64, n: usize, prior_w: Option<&[f64]>) -> f64 {
+pub(crate) fn inv_gaussian_aic<T: Scalar>(
+    y: &[f64],
+    dev: T,
+    n: usize,
+    prior_w: Option<&[f64]>,
+) -> T {
     let sum_w = prior_w.map_or(n as f64, |w| w[..n].iter().sum());
-    let disp = dev / sum_w;
+    let disp = dev / T::from_f64(sum_w);
     let mut ln_y = 0.0;
     for (i, &yi) in y.iter().take(n).enumerate() {
         ln_y += prior_w.map_or(1.0, |w| w[i]) * yi.ln();
     }
-    sum_w * ((2.0 * std::f64::consts::PI * disp).ln() + 1.0) + 3.0 * ln_y + 2.0
+    T::from_f64(sum_w) * ((T::from_f64(2.0 * std::f64::consts::PI) * disp).ln() + T::ONE)
+        + T::from_f64(3.0 * ln_y)
+        + T::from_f64(2.0)
 }
 
 /// Saturated log-likelihood `Σᵢ log f(yᵢ; μ=yᵢ)` — the data-only constant the
@@ -449,20 +482,20 @@ pub(crate) fn is_canonical(family: Family) -> bool {
 /// Fisher-scoring form `W=(dμ/dη)²/V(μ)`, `r=(y−μ)·dη/dμ`. `φ` folded as 1. The
 /// working response the caller forms is `z = η + r`; weights are raw (caller
 /// floors with `glm::WEIGHT_CLAMP`).
-pub(crate) fn irls_weight_and_resid(
+pub(crate) fn irls_weight_and_resid<T: Scalar>(
     family: Family,
     nb_theta: f64,
     y: f64,
-    eta: f64,
-) -> (f64, f64, f64) {
+    eta: T,
+) -> (T, T, T) {
     let mu = link_inv(family, eta);
     let v = variance(family, nb_theta, mu);
     if is_canonical(family) {
         // dμ/dη = V(μ) here, so the general form collapses to this shortcut.
-        (mu, v, (y - mu) / v)
+        (mu, v, (T::from_f64(y) - mu) / v)
     } else {
         let dm = mu_eta(family, eta);
-        (mu, dm * dm / v, (y - mu) / dm)
+        (mu, dm * dm / v, (T::from_f64(y) - mu) / dm)
     }
 }
 

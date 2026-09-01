@@ -141,6 +141,9 @@ pub(crate) struct SparseGlmmWorkspace {
     /// Whether the FINAL re-evaluation at the pinned γ̂ itself exhausted the
     /// PIRLS cap.
     pub(super) final_pirls_exhausted: bool,
+    /// Observation-only optimizer counters for the fit in progress — the sparse
+    /// twin of `GlmmWorkspace::counters`. Never read by any numeric path.
+    pub(super) counters: crate::counters::EvalCounters,
 }
 
 impl SparseGlmmWorkspace {
@@ -226,6 +229,7 @@ impl SparseGlmmWorkspace {
             offset: None,
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
+            counters: crate::counters::EvalCounters::new(),
         }
     }
 
@@ -277,6 +281,7 @@ impl SparseGlmmWorkspace {
             offset,
             pirls_exhausted: _,
             final_pirls_exhausted: _,
+            counters: _,
         } = self;
         SparseGlmmWorkspace {
             g: g.clone(),
@@ -322,6 +327,7 @@ impl SparseGlmmWorkspace {
             // Some`, which never increments these — fresh per-worker state.
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
+            counters: crate::counters::EvalCounters::new(),
         }
     }
 
@@ -442,7 +448,8 @@ impl SparseGlmmWorkspace {
         let mut dev = f64::NAN;
         let mut pen = f64::NAN;
         let mut logdet = 0.0;
-        for _ in 0..crate::glmm::PIRLS_MAX_ITERS {
+        for it in 0..crate::glmm::PIRLS_MAX_ITERS {
+            self.counters.set_pirls_iters(it + 1);
             // Trial evaluation at the current u: (Mu)ᵢ, then η/μ/W/deviance.
             // `infeasible` flags any raw η outside the link's open domain
             // (Gamma-inverse only — mirrors `pirls_solve`).
@@ -740,6 +747,11 @@ pub(super) fn sparse_glmm_deviance(
     if !conv && dev.is_finite() && ws.pirls_tol_override.is_none() {
         ws.pirls_exhausted += 1;
     }
+    // Same discriminator as the exhaustion counter above: FD-Hessian/tight-tol
+    // evals are not search evals and must not enter the histogram.
+    if ws.pirls_tol_override.is_none() {
+        ws.counters.commit_pirls_iters();
+    }
     if !conv || !dev.is_finite() {
         return f64::INFINITY;
     }
@@ -1003,6 +1015,8 @@ fn sparse_glmm_nan_fit(p: usize, n_theta: usize) -> crate::Fit {
         varcorr: vec![],
         stddev_se: vec![],
         n_eval: 0,
+        #[cfg(feature = "counters")]
+        counters: crate::counters::EvalCounters::new(),
         deviance: f64::NAN,
         loglik: f64::NAN,
         df: 0,
@@ -1153,7 +1167,9 @@ pub(crate) fn fit_glmm_sparse(
         let out1 = solver1.minimize(
             |theta| {
                 ws.beta[..p].copy_from_slice(&beta0);
-                sparse_glmm_deviance(family, nb_theta, theta, &mut ws, xm, y, n, true)
+                let d = sparse_glmm_deviance(family, nb_theta, theta, &mut ws, xm, y, n, true);
+                ws.counters.record_eval(crate::counters::Stage::One, d);
+                d
             },
             &mut theta1,
             &lower[..n_theta],
@@ -1165,6 +1181,11 @@ pub(crate) fn fit_glmm_sparse(
         // (never seen at an incumbent) just keeps the stage-1-independent seed.
         ws.beta[..p].copy_from_slice(&beta0);
         let d1 = sparse_glmm_deviance(family, nb_theta, &theta1, &mut ws, xm, y, n, true);
+        // The warm-start eval is a fit-path eval (goes through `sparse_glmm_deviance`
+        // like any stage-1 eval) but isn't reported by BOBYQA's `n_eval` — it runs
+        // after `solver1.minimize` returns. Recorded here so the stage split still
+        // reconstructs `n_eval` (see `sparse_glmm_counters_split_stages_and_histogram`).
+        ws.counters.record_eval(crate::counters::Stage::One, d1);
         if d1.is_finite() {
             params[..n_theta].copy_from_slice(&theta1);
             for (slot, &b) in params[n_theta..].iter_mut().zip(&ws.beta[..p]) {
@@ -1185,7 +1206,11 @@ pub(crate) fn fit_glmm_sparse(
     let mut solver = bobyqa::Bobyqa::new(n_theta + p, config)
         .expect("BOBYQA config constants are valid by construction");
     let out = solver.minimize(
-        |gamma| sparse_glmm_deviance(family, nb_theta, gamma, &mut ws, xm, y, n, false),
+        |gamma| {
+            let d = sparse_glmm_deviance(family, nb_theta, gamma, &mut ws, xm, y, n, false);
+            ws.counters.record_eval(crate::counters::Stage::Two, d);
+            d
+        },
         &mut params,
         &lower,
         &upper,
@@ -1221,9 +1246,12 @@ pub(crate) fn fit_glmm_sparse(
         // this eval is the truncated-final-solve case, reported separately as
         // `final_pirls_exhausted` — it must not also inflate the search count.
         let before = ws.pirls_exhausted;
+        // Same reason as `before`: the pinned re-eval is not a search eval.
+        let counters_before = ws.counters;
         final_deviance = sparse_glmm_deviance(family, nb_theta, &params, &mut ws, xm, y, n, false);
         ws.final_pirls_exhausted = ws.pirls_exhausted > before;
         ws.pirls_exhausted = before;
+        ws.counters = counters_before;
         ok = final_deviance.is_finite();
     }
     if !ok {
@@ -1433,6 +1461,8 @@ pub(crate) fn fit_glmm_sparse(
         varcorr,
         stddev_se,
         n_eval,
+        #[cfg(feature = "counters")]
+        counters: ws.counters,
         deviance: final_deviance,
         loglik,
         df: crate::fit::model_df(family, p, n_theta, opts.dispersion.is_some()),

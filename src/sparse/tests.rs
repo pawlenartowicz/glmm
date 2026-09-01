@@ -6283,3 +6283,38 @@ fn sparse_glmm_rescaling_slope_column_moves_stddev_se_by_the_predicted_power_of_
         base.deviance
     );
 }
+
+/// The sparse GLMM route runs the same two-stage search as the dense one, so
+/// it must report the same three quantities. The extra stage-1 warm-start
+/// evaluation at theta-hat-1 (`sparse/glmm.rs`'s `d1`) is a fit-path eval and
+/// is counted; `n_eval` does not include it, so the split is compared with
+/// that one evaluation allowed for.
+#[cfg(feature = "counters")]
+#[test]
+fn sparse_glmm_counters_split_stages_and_histogram() {
+    let (x, y, n, p, model, ids, weights) = sparse_glmm_slope_crossed_design();
+    let opts = crate::FitOptions {
+        target_indices: vec![0, 1],
+        weights: Some(weights),
+        ..crate::FitOptions::default()
+    };
+    let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(f.converged(), "sparse GLMM fixture must converge");
+    let c = f.counters;
+    assert!(c.stage_evals[0] > 0, "sparse stage 1 must record evals");
+    assert!(c.stage_evals[1] > 0, "sparse stage 2 must record evals");
+    assert_eq!(
+        (c.stage_evals[0] + c.stage_evals[1]) as usize,
+        f.n_eval + 1,
+        "stage split reconstructs n_eval plus the stage-1 warm-start eval"
+    );
+    assert_eq!(
+        c.pirls_hist.iter().sum::<u32>(),
+        c.stage_evals[0] + c.stage_evals[1],
+        "one histogram entry per fit-path eval"
+    );
+    assert_eq!(
+        c.pirls_hist[0], 0,
+        "no eval solves PIRLS in zero iterations"
+    );
+}

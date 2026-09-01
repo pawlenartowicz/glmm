@@ -34,6 +34,7 @@ use faer::reborrow::ReborrowMut;
 use faer::{Mat, MatMut, MatRef};
 use std::sync::OnceLock;
 
+use crate::scalar::Scalar;
 use crate::FLOAT_NEAR_ZERO;
 
 mod kernel;
@@ -207,6 +208,10 @@ fn two_stage_enabled() -> bool {
 /// summed n_eval. LMM_STAGE_PROBE=1 prints per-stage evals + the θ₁→θ̂ distance,
 /// for judging whether a third stage would pay for itself. Dev seam only —
 /// allocates two solvers per fit, which the shipped path never does.
+///
+/// Deliberately left uncounted (`EvalCounters` stays empty on this path): it
+/// is not the shipped path, and `LMM_STAGE_PROBE=1` above already prints its
+/// per-stage evals.
 fn two_stage_minimize(
     suff: &LmmSuffStats,
     fit: &mut LmmFitScratch,
@@ -757,41 +762,52 @@ impl LmmGroupings {
 }
 
 // ---------------------------------------------------------------------------
-// LmmFitScratch — per-fit scratch, allocated once per (p, max_clusters).
+// LmmFitScratch
 // ---------------------------------------------------------------------------
 
-pub struct LmmFitScratch {
+/// Per-fit scratch, allocated once per (p, max_clusters). `T` is the kernel
+/// scalar (`f64` today; the dual-number type when the derivative work lands);
+/// fields that stay `f64` say why at their own doc.
+pub struct LmmFitScratch<T = f64> {
     /// Row-major w×w family block (w = q_p + n_per) — assembled and
     /// Crout-factored in place per family; rows contiguous for the Crout.
-    pub fam_a: Vec<f64>,
+    pub fam_a: Vec<T>,
     /// Stacked forward-solved family couplings, t_dim × W_tot column-major
     /// (W_tot = n_primary·w): column f·w+r is family f's L_f⁻¹B_f row r,
     /// contiguous. Filled and solved per family, consumed by ONE triangular
     /// GEMM downdate after the family loop — the per-family tail re-traversals
     /// are gone.
-    pub bt: Vec<f64>,
+    pub bt: Vec<T>,
     /// (k_crossed+m)² tail [[H, B_x],[B_xᵀ, C]] over [crossed | X y],
     /// column-major lower triangle (entry (i,j) at j·t_dim+i); GEMM-downdated
-    /// once per eval, then one dense faer llt over a MatRef view.
-    pub tail: Vec<f64>,
+    /// once per eval, then factored out-of-place into `tail_l` below.
+    pub tail: Vec<T>,
+    /// Out-of-place `chol_lower` output for `tail` (`t_dim²`, same layout):
+    /// `tail` must survive UNFACTORED for `recover_ranef_family`, which
+    /// re-factors it at θ̂ (see that function's doc for the contract).
+    pub tail_l: Vec<T>,
     /// λ per local crossed column (θ of the owning factor), refreshed per eval.
-    pub lam_x: Vec<f64>,
+    pub lam_x: Vec<T>,
     /// q_p×q_p primary-slope scratch (row-major), refreshed per eval/family: the
     /// lower-tri Λ_p and the per-level Gram G_f. Empty on the q_p=1 path. Kept in
     /// scratch so the deviance hot loop stays zero-alloc (the warm-path invariant).
-    pub prim_lam: Vec<f64>,
-    pub prim_gram: Vec<f64>,
+    pub prim_lam: Vec<T>,
+    pub prim_gram: Vec<T>,
     /// Balanced-collapse Grams: pair-major r ≤ r′ blocks, w(w+1)/2 of
     /// them, each a FULL t_dim×t_dim column-major G_rr′ = Σ_f raw_r(f)·raw_r′(f)ᵀ
     /// over the active balanced prefix — θ-independent, refreshed once per fit
     /// by `precompute_balanced_collapse`. Empty on the slope path (collapse
-    /// never applies there).
+    /// never applies there). Stays `f64`: θ-independent.
     pub fam_gram: Vec<f64>,
+    /// `w·t_dim` staging buffer for `precompute_balanced_collapse`'s per-family
+    /// raw rows — its own field so that θ-independent precompute stops
+    /// borrowing the now-`T` `bt` (which is per-eval scratch).
+    pub collapse_stage: Vec<f64>,
     /// t_dim² combine scratch for the collapse downdate (lower triangle used);
     /// its first w slots double as the A⁻¹ forward-solve temp.
-    pub comb: Vec<f64>,
+    pub comb: Vec<T>,
     /// w×w row-major A(θ)⁻¹, rebuilt per eval on the collapse path.
-    pub a_inv: Vec<f64>,
+    pub a_inv: Vec<T>,
     /// Active balanced families (prefix length). 0 = collapse off → the
     /// per-family loop runs (the fallback and the pre-F behaviour).
     pub collapse_n_active: usize,
@@ -819,7 +835,7 @@ pub struct LmmFitScratch {
     /// entry is overwritten before it is read, so no per-fit reset is needed.
     pub ranef_ux: Vec<f64>,
     pub ranef_rhs: Vec<f64>,
-    pub sigma_sq: f64,
+    pub sigma_sq: T,
     /// p×p X'V⁻¹X rebuild (L_XX·L_XXᵀ) + the shared joint-Wald scratch
     /// (mirrors the lme workspace triple the promoted helper expects).
     pub joint_xtvix: Mat<f64>,
@@ -841,7 +857,7 @@ pub struct LmmFitScratch {
     pub blocked_p: Vec<f64>,
 }
 
-impl LmmFitScratch {
+impl<T: Scalar> LmmFitScratch<T> {
     pub fn new(p: usize, max_clusters: usize) -> Self {
         Self::with_groupings(p, &LmmGroupings::single(max_clusters))
     }
@@ -869,24 +885,26 @@ impl LmmFitScratch {
         };
         let blocked_dim = if g.extra_slopes_any { g.k_total + m } else { 0 };
         LmmFitScratch {
-            fam_a: vec![0.0; w * w],
-            bt: vec![0.0; g.n_primary * w * t_dim],
-            tail: vec![0.0; t_dim * t_dim],
-            lam_x: vec![0.0; g.k_crossed()],
-            prim_lam: vec![0.0; q2],
-            prim_gram: vec![0.0; q2],
+            fam_a: vec![T::ZERO; w * w],
+            bt: vec![T::ZERO; g.n_primary * w * t_dim],
+            tail: vec![T::ZERO; t_dim * t_dim],
+            tail_l: vec![T::ZERO; t_dim * t_dim],
+            lam_x: vec![T::ZERO; g.k_crossed()],
+            prim_lam: vec![T::ZERO; q2],
+            prim_gram: vec![T::ZERO; q2],
             fam_gram: vec![0.0; npairs * t_dim * t_dim],
+            collapse_stage: vec![0.0; w * t_dim],
             // max(t_dim², w): the first w slots double as the A⁻¹ forward-solve
             // temp, and deep nesting can push w past t_dim² (tiny p, large n_per).
             comb: vec![
-                0.0;
+                T::ZERO;
                 if npairs > 0 {
                     (t_dim * t_dim).max(w)
                 } else {
                     0
                 }
             ],
-            a_inv: vec![0.0; if npairs > 0 { w * w } else { 0 }],
+            a_inv: vec![T::ZERO; if npairs > 0 { w * w } else { 0 }],
             collapse_n_active: 0,
             factor: Mat::zeros(m, m),
             betas: vec![0.0; p],
@@ -897,7 +915,7 @@ impl LmmFitScratch {
             ranef_ok: false,
             ranef_ux: vec![0.0; g.k_crossed()],
             ranef_rhs: vec![0.0; w],
-            sigma_sq: f64::NAN,
+            sigma_sq: T::from_f64(f64::NAN),
             joint_xtvix: Mat::zeros(p, p),
             joint_k_inv: Mat::zeros(p, p),
             joint_sigma_t_chol: Mat::zeros(p, p),
@@ -1048,9 +1066,9 @@ impl LmmWorkspace {
 /// into `lam` (row-major, len q·q; upper triangle zeroed). `pub(crate)` — the
 /// introspection surface reuses it to reconstruct the RE covariance D = ΛΛ′.
 /// Caller owns `lam` so the deviance hot loop stays zero-alloc.
-pub fn primary_lambda(theta: &[f64], q: usize, lam: &mut [f64]) {
+pub fn primary_lambda<T: Scalar>(theta: &[T], q: usize, lam: &mut [T]) {
     for v in lam[..q * q].iter_mut() {
-        *v = 0.0;
+        *v = T::ZERO;
     }
     let mut t = 0;
     for c in 0..q {
@@ -1066,24 +1084,30 @@ pub fn primary_lambda(theta: &[f64], q: usize, lam: &mut [f64]) {
 /// G[a][b]=Σ x_{a-1} x_{b-1} over f. The slope covariates are [X y] rows, so
 /// every entry sits in `s`. Component d's RE col at level f is `d·n_primary + f`
 /// (mirrors `from_cluster_spec`'s RE-column layout — change together).
-fn primary_gram(suff: &LmmSuffStats, g: &LmmGroupings, f: usize, q: usize, gram: &mut [f64]) {
+fn primary_gram<T: Scalar>(
+    suff: &LmmSuffStats,
+    g: &LmmGroupings,
+    f: usize,
+    q: usize,
+    gram: &mut [T],
+) {
     let n_prim = g.n_primary;
     for v in gram[..q * q].iter_mut() {
-        *v = 0.0;
+        *v = T::ZERO;
     }
-    gram[0] = suff.counts[f]; // G[0][0]
+    gram[0] = T::from_f64(suff.counts[f]); // G[0][0]
     for a in 1..q {
         // `s`'s COLUMN carries the RE column's own internal scale (divided in at
         // accumulation), but its ROW is the raw `[X y]` entry — so a Gram between
         // two RE columns picks up only one of the two divisions here and needs the
         // row side applied explicitly. Intercept rows have scale 1 by construction.
         let s_a = g.primary_slope_scales[a - 1];
-        let sa = suff.s[(g.primary_slope_cols[a - 1], f)] / s_a; // Σ z_{a-1} over f
+        let sa = T::from_f64(suff.s[(g.primary_slope_cols[a - 1], f)] / s_a); // Σ z_{a-1} over f
         gram[a] = sa;
         gram[a * q] = sa;
         for b in 1..=a {
             // Σ z_{a-1} z_{b-1} over f — slope_{a-1}'s subcol against slope_{b-1}'s level.
-            let v = suff.s[(g.primary_slope_cols[a - 1], b * n_prim + f)] / s_a;
+            let v = T::from_f64(suff.s[(g.primary_slope_cols[a - 1], b * n_prim + f)] / s_a);
             gram[a * q + b] = v;
             gram[b * q + a] = v;
         }
@@ -1098,22 +1122,22 @@ fn primary_gram(suff: &LmmSuffStats, g: &LmmGroupings, f: usize, q: usize, gram:
 /// loop made this O(q⁴)) — same d/e summation order, so bit-identical.
 /// Measured ~0 wall-clock change even at q=8 (sim_max_q_slope): the
 /// per-eval cost lives elsewhere; kept for the strictly-lower op count.
-fn assemble_primary_a(fam_a: &mut [f64], stride: usize, lam: &[f64], gram: &[f64], q: usize) {
-    let mut m_r = [0.0_f64; MAX_PRIMARY_Q];
+fn assemble_primary_a<T: Scalar>(fam_a: &mut [T], stride: usize, lam: &[T], gram: &[T], q: usize) {
+    let mut m_r = [T::ZERO; MAX_PRIMARY_Q];
     for r in 0..q {
         for (e, m_re) in m_r.iter_mut().enumerate().take(q) {
-            let mut acc = 0.0;
+            let mut acc = T::ZERO;
             for d in r..q {
                 acc += lam[d * q + r] * gram[d * q + e];
             }
             *m_re = acc;
         }
         for c in 0..=r {
-            let mut s = 0.0;
+            let mut s = T::ZERO;
             for e in c..q {
                 s += m_r[e] * lam[e * q + c];
             }
-            fam_a[r * stride + c] = if r == c { 1.0 + s } else { s };
+            fam_a[r * stride + c] = if r == c { T::ONE + s } else { s };
         }
     }
 }
@@ -1128,15 +1152,15 @@ fn assemble_primary_a(fam_a: &mut [f64], stride: usize, lam: &[f64], gram: &[f64
 /// them. Pure extraction: same operations in the same order, so the deviance is
 /// bit-identical to the pre-extraction path.
 #[allow(clippy::too_many_arguments)] // one call site each; the alternative is a struct of borrows
-fn assemble_fam_a(
-    fam_a: &mut [f64],
-    prim_gram: &mut [f64],
-    prim_lam: &[f64],
+fn assemble_fam_a<T: Scalar>(
+    fam_a: &mut [T],
+    prim_gram: &mut [T],
+    prim_lam: &[T],
     suff: &LmmSuffStats,
     f: usize,
     w: usize,
-    th_p: f64,
-    th_n: f64,
+    th_p: T,
+    th_n: T,
     slope: bool,
 ) {
     let g = &suff.groupings;
@@ -1155,15 +1179,15 @@ fn assemble_fam_a(
         for c in 0..np {
             // Nested child RE col = prim_width + f·np + c (prim_width = q_p·n_primary).
             let gcol = g.n_primary * g.primary_q + f * np + c;
-            let n_c = suff.counts[gcol];
+            let n_c = T::from_f64(suff.counts[gcol]);
             for c2 in 0..np {
-                fam_a[(q + c) * w + (q + c2)] = 0.0;
+                fam_a[(q + c) * w + (q + c2)] = T::ZERO;
             }
-            fam_a[(q + c) * w + (q + c)] = 1.0 + th_n * th_n * n_c;
+            fam_a[(q + c) * w + (q + c)] = T::ONE + th_n * th_n * n_c;
             // Primary↔child: A[(q+c, e)] = θ_n · Σ_{d≥e} Λ_p[d,e] · Graw_d,
             // Graw_0 = n_c (intercept), Graw_d = Σ_{i∈child} x_{slope_{d-1}}.
             for e in 0..q {
-                let mut acc = 0.0;
+                let mut acc = T::ZERO;
                 for d in e..q {
                     // `s`-ROW read of a slope covariate ⇒ apply the internal scale
                     // (the column here is the child's intercept, scale 1); see
@@ -1171,7 +1195,10 @@ fn assemble_fam_a(
                     let graw_d = if d == 0 {
                         n_c
                     } else {
-                        suff.s[(g.primary_slope_cols[d - 1], gcol)] / g.primary_slope_scales[d - 1]
+                        T::from_f64(
+                            suff.s[(g.primary_slope_cols[d - 1], gcol)]
+                                / g.primary_slope_scales[d - 1],
+                        )
                     };
                     acc += prim_lam[d * q + e] * graw_d;
                 }
@@ -1181,16 +1208,16 @@ fn assemble_fam_a(
     } else {
         // parent–child counts = child row counts (a child's rows all lie
         // inside its parent).
-        let n_f = suff.counts[f];
-        fam_a[0] = 1.0 + th_p * th_p * n_f;
+        let n_f = T::from_f64(suff.counts[f]);
+        fam_a[0] = T::ONE + th_p * th_p * n_f;
         for c in 0..np {
             let gcol = g.n_primary + f * np + c;
-            let n_c = suff.counts[gcol];
+            let n_c = T::from_f64(suff.counts[gcol]);
             for c2 in 0..np {
-                fam_a[(1 + c) * w + (1 + c2)] = 0.0;
+                fam_a[(1 + c) * w + (1 + c2)] = T::ZERO;
             }
             fam_a[(1 + c) * w] = th_p * th_n * n_c;
-            fam_a[(1 + c) * w + (1 + c)] = 1.0 + th_n * th_n * n_c;
+            fam_a[(1 + c) * w + (1 + c)] = T::ONE + th_n * th_n * n_c;
         }
     }
 }
@@ -1201,17 +1228,17 @@ fn assemble_fam_a(
 /// alongside [`assemble_fam_a`], for the same reason and with the same
 /// bit-identity claim.
 #[allow(clippy::too_many_arguments)] // as `assemble_fam_a`
-fn assemble_fam_b(
-    bt_fam: &mut [f64],
-    lam_x: &[f64],
-    prim_lam: &[f64],
+fn assemble_fam_b<T: Scalar>(
+    bt_fam: &mut [T],
+    lam_x: &[T],
+    prim_lam: &[T],
     suff: &LmmSuffStats,
     f: usize,
     t_dim: usize,
     kx: usize,
     slope: bool,
-    th_p: f64,
-    th_n: f64,
+    th_p: T,
+    th_n: T,
 ) {
     let g = &suff.groupings;
     let m = suff.m;
@@ -1231,9 +1258,9 @@ fn assemble_fam_b(
             let zxb = suff.zx.col(b).try_as_col_major().unwrap().as_slice();
             let zxsb = suff.zx_slope.col(b).try_as_col_major().unwrap().as_slice();
             for r in 0..q {
-                let mut brb = 0.0;
+                let mut brb = T::ZERO;
                 for d in r..q {
-                    let zeta = if d == 0 { zxb[f] } else { zxsb[d * n_prim + f] };
+                    let zeta = T::from_f64(if d == 0 { zxb[f] } else { zxsb[d * n_prim + f] });
                     brb += prim_lam[d * q + r] * zeta;
                 }
                 bt_fam[r * t_dim + b] = lam_b * brb;
@@ -1254,10 +1281,10 @@ fn assemble_fam_b(
         for r in 0..q {
             let bcol = &mut bt_fam[r * t_dim + kx..r * t_dim + kx + m];
             for j in 0..m {
-                let mut brj = 0.0;
+                let mut brj = T::ZERO;
                 #[allow(clippy::needless_range_loop)]
                 for d in r..q {
-                    brj += prim_lam[d * q + r] * s_cols[d][j];
+                    brj += prim_lam[d * q + r] * T::from_f64(s_cols[d][j]);
                 }
                 bcol[j] = brj;
             }
@@ -1267,35 +1294,35 @@ fn assemble_fam_b(
             let gcol = n_prim * q + f * np + c; // prim_width + f·np + c
             let off = (q + c) * t_dim;
             for b in 0..kx {
-                bt_fam[off + b] = th_n * lam_x[b] * suff.zx[(gcol, b)];
+                bt_fam[off + b] = th_n * lam_x[b] * T::from_f64(suff.zx[(gcol, b)]);
             }
             let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
             let bcol = &mut bt_fam[off + kx..off + kx + m];
             for j in 0..m {
-                bcol[j] = th_n * scol[j];
+                bcol[j] = th_n * T::from_f64(scol[j]);
             }
         }
     } else {
         let s_f = suff.s.col(f).try_as_col_major().unwrap().as_slice();
         for b in 0..kx {
-            bt_fam[b] = th_p * lam_x[b] * suff.zx[(f, b)];
+            bt_fam[b] = th_p * lam_x[b] * T::from_f64(suff.zx[(f, b)]);
         }
         {
             let bcol = &mut bt_fam[kx..kx + m];
             for j in 0..m {
-                bcol[j] = th_p * s_f[j];
+                bcol[j] = th_p * T::from_f64(s_f[j]);
             }
         }
         for c in 0..np {
             let gcol = g.n_primary + f * np + c;
             let off = (1 + c) * t_dim;
             for b in 0..kx {
-                bt_fam[off + b] = th_n * lam_x[b] * suff.zx[(gcol, b)];
+                bt_fam[off + b] = th_n * lam_x[b] * T::from_f64(suff.zx[(gcol, b)]);
             }
             let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
             let bcol = &mut bt_fam[off + kx..off + kx + m];
             for j in 0..m {
-                bcol[j] = th_n * scol[j];
+                bcol[j] = th_n * T::from_f64(scol[j]);
             }
         }
     }
@@ -1308,7 +1335,7 @@ fn assemble_fam_b(
 /// The divide is deliberately NOT hoisted into a reciprocal the way the sparse
 /// path's `schur_phase_b` does it — that is a ≤1-ulp change, and this path's
 /// values are pinned.
-fn fam_forward_solve(bt_fam: &mut [f64], t_dim: usize, w: usize, fam_a: &[f64]) {
+fn fam_forward_solve<T: Scalar>(bt_fam: &mut [T], t_dim: usize, w: usize, fam_a: &[T]) {
     for r in 0..w {
         let (done, rest) = bt_fam.split_at_mut(r * t_dim);
         let col_r = &mut rest[..t_dim];
@@ -1573,6 +1600,11 @@ pub struct LmmFit {
     pub boundary_hit: u8,
     /// Objective evaluations consumed (diagnostics only).
     pub n_eval: usize,
+    /// Observation-only evaluation counters for this fit. Gated because
+    /// `LmmFit` is re-exported `pub` under `loop_advanced`: with `counters`
+    /// off, that tier's surface must be unchanged.
+    #[cfg(feature = "counters")]
+    pub counters: crate::counters::EvalCounters,
     /// Joint Wald-χ² over the target set (the shared `joint_wald_chi_sq` helper). Under
     /// H₀: β_T = 0, asymptotically χ²(k). NaN on optimizer/numerical failure
     /// or an empty target set; finite on a `MaxFunReached` endpoint.
@@ -1808,10 +1840,20 @@ fn fit_lmm_impl(
             }
         }
     }
+    let mut counters = crate::counters::EvalCounters::new();
     let out = if two_stage {
         two_stage_minimize(suff, fit, theta, lower, upper)
     } else {
-        solver.minimize(|xs| reml_deviance(xs, suff, fit), theta, lower, upper)
+        solver.minimize(
+            |xs| {
+                let d = reml_deviance(xs, suff, fit);
+                counters.record_eval(crate::counters::Stage::Two, d);
+                d
+            },
+            theta,
+            lower,
+            upper,
+        )
     };
 
     // Status mapping (the plateau policy): a `MaxFunReached` cap-out reports
@@ -1898,6 +1940,8 @@ fn fit_lmm_impl(
             converged: false,
             boundary_hit: 2,
             n_eval: out.n_eval,
+            #[cfg(feature = "counters")]
+            counters,
             joint_t_sq: f64::NAN,
             pinned_components: 0,
             deviance: f64::NAN,
@@ -1979,6 +2023,8 @@ fn fit_lmm_impl(
         converged,
         boundary_hit: if converged { u8::from(pinned) } else { 2 },
         n_eval: out.n_eval,
+        #[cfg(feature = "counters")]
+        counters,
         joint_t_sq,
         pinned_components,
         deviance: dev,

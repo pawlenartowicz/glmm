@@ -83,6 +83,10 @@ pub(crate) fn pirls_solve(
     offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,
     n: usize,
+    // Observation-only: the iteration index of the solve in progress, written
+    // every iteration so an early return still leaves the right value pending.
+    // Committed to the histogram by the caller, once per outer evaluation.
+    counters: &mut crate::counters::EvalCounters,
 ) -> (f64, f64, f64, bool) {
     use faer::linalg::matmul::triangular::BlockStructure;
     use faer::linalg::matmul::{matmul, triangular};
@@ -112,7 +116,8 @@ pub(crate) fn pirls_solve(
     let mut pen = f64::NAN; // ‖u‖² at the returned (post-step) iterate
     let mut logdet = 0.0;
     let tol = pirls_tol_override.unwrap_or_else(|| super::super::pirls_tol(family));
-    for _ in 0..PIRLS_MAX_ITERS {
+    for it in 0..PIRLS_MAX_ITERS {
+        counters.set_pirls_iters(it + 1);
         // --- trial evaluation at the CURRENT u: (Mu)ᵢ, then η/dev/prob/W. On a
         // fresh accept this is the newly-stepped u; after a halving `continue` it is
         // the backtracked u. Either way the recompute IS the trial evaluation. ---

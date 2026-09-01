@@ -163,6 +163,8 @@ fn fit_glmm_build(
                 varcorr: vec![],
                 stddev_se: vec![],
                 n_eval: 0,
+                #[cfg(feature = "counters")]
+                counters: crate::counters::EvalCounters::new(),
                 deviance: f64::NAN,
                 loglik: f64::NAN,
                 df: 0,
@@ -539,6 +541,8 @@ pub(crate) fn glmm_view_to_fit(
         varcorr,
         stddev_se,
         n_eval: glmm_fit.n_eval,
+        #[cfg(feature = "counters")]
+        counters: glmm_fit.counters,
         deviance: if glmm_fit.deviance.is_finite() {
             glmm_fit.deviance
         } else {

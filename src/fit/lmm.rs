@@ -279,6 +279,8 @@ pub(crate) fn lmm_view_to_fit(
         varcorr,
         stddev_se: vec![], // LMM has no Hessian SE machinery
         n_eval: lmm_fit.n_eval,
+        #[cfg(feature = "counters")]
+        counters: lmm_fit.counters,
         deviance: lmm_fit.deviance,
         // REML criterion on the logLik scale, from the base (unweighted) deviance;
         // the weighted correction below rewrites both together (using `n`, not

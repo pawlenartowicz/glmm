@@ -17,6 +17,7 @@ use faer::MatRef;
 
 use super::pirls::{pirls_solve_blocked, BetaStep};
 use crate::lmm::LmmGroupings;
+use crate::scalar::Scalar;
 use crate::spec::Family;
 
 /// Per-cluster row index (CSR): `ptr[c]..ptr[c+1]` slices `rows` down to cluster `c`'s
@@ -94,33 +95,33 @@ impl ClusterRowIndex {
 /// what remains is `−2ℓ_c(ũ_c) + log A_c` — the Laplace term. Validated against
 /// frozen `glmer(nAGQ=k)` goldens (`fit::tests::fit_glmm_{binomial,poisson}_agq_*`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn agq_deviance(
+pub(crate) fn agq_deviance<T: Scalar>(
     family: Family,
     nb_theta: f64,
     groupings: &LmmGroupings,
-    params: &[f64],
-    beta: &mut [f64],
-    lam: &mut [f64],
+    params: &[T],
+    beta: &mut [T],
+    lam: &mut [T],
     z_buf: &[f64],
-    m_buf: &mut [f64],
+    m_buf: &mut [T],
     x: MatRef<f64>,
     y: &[f64],
     prior_w: &[f64],
     weighted: bool,
     cluster_ids: &[u32],
-    eta: &mut [f64],
-    prob: &mut [f64],
-    w: &mut [f64],
-    u: &mut [f64],
-    u_prev: &mut [f64],
-    eta_fixed: &mut [f64],
-    a_blocks: &mut [f64],
-    a_rhs: &mut [f64],
+    eta: &mut [T],
+    prob: &mut [T],
+    w: &mut [T],
+    u: &mut [T],
+    u_prev: &mut [T],
+    eta_fixed: &mut [T],
+    a_blocks: &mut [T],
+    a_rhs: &mut [T],
     // AGQ is always `BetaStep::Fixed`, so `pirls_solve_blocked`'s Profile-only
     // C = X'WX GEMM never runs here — this is just uniform plumbing across the
     // three PIRLS variants.
     wx: &mut faer::Mat<f64>,
-    agq_scratch: &mut [f64],
+    agq_scratch: &mut [T],
     nagq: u8,
     pirls_tol_override: Option<f64>,
     n: usize,
@@ -130,7 +131,8 @@ pub(crate) fn agq_deviance(
     // the `eta_fixed` that fill leaves, so nothing else here changes. `None` ⇒
     // no offset.
     offset: Option<&[f64]>,
-) -> f64 {
+    counters: &mut crate::counters::EvalCounters,
+) -> T {
     // β length p is `beta.len()` (the Fixed-mode buffer the caller filled) — the
     // blocked PIRLS derives p from it, so no separate `p` param is threaded here.
     let n_theta = groupings.n_theta();
@@ -170,16 +172,18 @@ pub(crate) fn agq_deviance(
         offset,
         pirls_tol_override,
         n,
+        counters,
     );
     if !conv {
-        return f64::INFINITY;
+        return T::from_f64(f64::INFINITY);
     }
     let lambda = lam[0]; // scalar Λ_p (q_p == 1, gated)
     let k = nagq as usize;
     let blk = crate::consts::GH_OFFSETS[(k - 1) / 2];
     let nodes = &crate::consts::GH_NODES[blk..blk + k];
     let wts = &crate::consts::GH_WEIGHTS[blk..blk + k];
-    let ln_sqrt_pi = 0.5 * std::f64::consts::PI.ln();
+    let ln_sqrt_pi_f64 = 0.5 * std::f64::consts::PI.ln();
+    let ln_sqrt_pi = T::from_f64(ln_sqrt_pi_f64);
 
     // Per-cluster scratch (size s each): ℓ_c(ũ_c) | node u_cj | ℓ_c(u_cj) | running Σ.
     let (ctr, rest) = agq_scratch.split_at_mut(s);
@@ -189,26 +193,27 @@ pub(crate) fn agq_deviance(
     // ctr_c = ℓ_c(ũ_c): RE prior −½ũ_c², then Σ_{i∈c} −½·dev_resid at the converged
     // mode (prob[i] already holds g⁻¹(η_fix,i + λ·ũ_c)).
     for c in 0..s {
-        ctr[c] = -0.5 * u[c] * u[c];
-        sum[c] = 0.0;
+        ctr[c] = T::from_f64(-0.5) * u[c] * u[c];
+        sum[c] = T::ZERO;
     }
     for i in 0..n {
         let c = cluster_ids[i] as usize;
         // w_i·dev_resid: prior_w[i] is exactly 1.0 on the unweighted path (workspace
         // init), and x·1.0 is bit-exact, so unweighted stays byte-identical.
-        ctr[c] -= 0.5 * prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
+        ctr[c] -= T::from_f64(0.5 * prior_w[i])
+            * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
     }
 
     // GH sum over nodes. σ_c = 1/√A_c = 1/a_blocks[c] (the 1×1 Cholesky factor).
     // Shared reborrows for the `Some` arm's closure below: rayon's `par_iter_mut`
-    // needs `Sync` captures, and `&mut [f64]` isn't `Sync` — downgrade to `&[f64]`
+    // needs `Sync` captures, and `&mut [T]` isn't `Sync` — downgrade to `&[T]`
     // since the per-cluster body only ever reads these buffers, never writes them.
     // Kept as separate bindings (not a shadow) so the `None` arm and the dev-sum
     // loop below still use the original mutable names unchanged.
-    let eta_fixed_ro: &[f64] = eta_fixed;
-    let u_ro: &[f64] = u;
-    let a_blocks_ro: &[f64] = a_blocks;
-    let ctr_ro: &[f64] = ctr;
+    let eta_fixed_ro: &[T] = eta_fixed;
+    let u_ro: &[T] = u;
+    let a_blocks_ro: &[T] = a_blocks;
+    let ctr_ro: &[T] = ctr;
     match cluster_rows {
         // Cluster-outer: per cluster, same node order and (via the CSR's
         // ascending-row guarantee) same per-accumulator operand order as the
@@ -224,26 +229,27 @@ pub(crate) fn agq_deviance(
             // on many-tiny-cluster shapes. Same operands, deterministic —
             // bit-identical to the inline form (only reader — the node-outer
             // `None` arm below recomputes `ln_wj` per node instead).
-            let mut ln_wj_buf = [0.0f64; crate::consts::MAX_NAGQ as usize];
+            let mut ln_wj_buf = [T::ZERO; crate::consts::MAX_NAGQ as usize];
             for (j, (&zj, &wj)) in nodes.iter().zip(wts).enumerate() {
-                ln_wj_buf[j] = wj.ln() + zj * zj;
+                ln_wj_buf[j] = T::from_f64(wj.ln() + zj * zj);
             }
-            let ln_wj_ro: &[f64] = &ln_wj_buf[..k];
+            let ln_wj_ro: &[T] = &ln_wj_buf[..k];
             // Per-cluster closure: reads shared slices, writes only its own sum slot —
             // deterministic under any thread schedule, so parallel == serial bitwise.
-            let per_cluster = |c: usize, sum_c: &mut f64| {
+            let per_cluster = |c: usize, sum_c: &mut T| {
                 let rows = idx.cluster_rows(c);
-                let sigma_c = 1.0 / a_blocks_ro[c];
-                let mut acc_sum = 0.0;
+                let sigma_c = T::ONE / a_blocks_ro[c];
+                let mut acc_sum = T::ZERO;
                 for (j, &zj) in nodes.iter().enumerate() {
                     let ln_wj = ln_wj_ro[j];
-                    let u_cj = u_ro[c] + std::f64::consts::SQRT_2 * sigma_c * zj;
-                    let mut acc_c = -0.5 * u_cj * u_cj;
+                    let u_cj =
+                        u_ro[c] + T::from_f64(std::f64::consts::SQRT_2) * sigma_c * T::from_f64(zj);
+                    let mut acc_c = T::from_f64(-0.5) * u_cj * u_cj;
                     for &i in rows {
                         let i = i as usize;
                         let mu = crate::family::link_inv(family, eta_fixed_ro[i] + lambda * u_cj);
-                        acc_c -=
-                            0.5 * prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], mu);
+                        acc_c -= T::from_f64(0.5 * prior_w[i])
+                            * crate::family::dev_resid(family, nb_theta, y[i], mu);
                     }
                     acc_sum += (ln_wj + acc_c - ctr_ro[c]).exp();
                 }
@@ -265,17 +271,18 @@ pub(crate) fn agq_deviance(
         // Node-outer original (parallel_inner == false): unchanged, verbatim.
         None => {
             for (&zj, &wj) in nodes.iter().zip(wts) {
-                let ln_wj = wj.ln() + zj * zj; // log(w_j·e^{z_j²}) — the Liu–Pierce reweight
+                let ln_wj = T::from_f64(wj.ln() + zj * zj); // log(w_j·e^{z_j²}) — the Liu–Pierce reweight
                 for c in 0..s {
-                    let sigma_c = 1.0 / a_blocks[c];
-                    ucj[c] = u[c] + std::f64::consts::SQRT_2 * sigma_c * zj;
-                    acc[c] = -0.5 * ucj[c] * ucj[c]; // RE prior at the node
+                    let sigma_c = T::ONE / a_blocks[c];
+                    ucj[c] =
+                        u[c] + T::from_f64(std::f64::consts::SQRT_2) * sigma_c * T::from_f64(zj);
+                    acc[c] = T::from_f64(-0.5) * ucj[c] * ucj[c]; // RE prior at the node
                 }
                 for i in 0..n {
                     let c = cluster_ids[i] as usize;
                     let mu = crate::family::link_inv(family, eta_fixed[i] + lambda * ucj[c]);
-                    acc[c] -=
-                        0.5 * prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], mu);
+                    acc[c] -= T::from_f64(0.5 * prior_w[i])
+                        * crate::family::dev_resid(family, nb_theta, y[i], mu);
                 }
                 for c in 0..s {
                     sum[c] += (ln_wj + acc[c] - ctr[c]).exp();
@@ -285,10 +292,10 @@ pub(crate) fn agq_deviance(
     }
 
     // −2·Σ_c [ ℓ_c(ũ_c) + log σ_c + log((1/√π)·Σ_j …) ].
-    let mut dev = 0.0;
+    let mut dev = T::ZERO;
     for c in 0..s {
         let log_sigma_c = -a_blocks[c].ln(); // log σ_c = −log √A_c
-        dev += -2.0 * (ctr[c] + log_sigma_c + sum[c].ln() - ln_sqrt_pi);
+        dev += T::from_f64(-2.0) * (ctr[c] + log_sigma_c + sum[c].ln() - ln_sqrt_pi);
     }
     dev
 }
@@ -330,30 +337,30 @@ pub(crate) fn agq_deviance(
 /// **Oracle.** Validated against **GLMMadaptive** (`mixed_model(nAGQ=k)`) — lme4
 /// `glmer` refuses `nAGQ>1` for vector REs, so it covers only the scalar rungs.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn agq_deviance_vec(
+pub(crate) fn agq_deviance_vec<T: Scalar>(
     family: Family,
     nb_theta: f64,
     groupings: &LmmGroupings,
-    params: &[f64],
-    beta: &mut [f64],
-    lam: &mut [f64],
+    params: &[T],
+    beta: &mut [T],
+    lam: &mut [T],
     z_buf: &[f64],
-    m_buf: &mut [f64],
+    m_buf: &mut [T],
     x: MatRef<f64>,
     y: &[f64],
     prior_w: &[f64],
     weighted: bool,
     cluster_ids: &[u32],
-    eta: &mut [f64],
-    prob: &mut [f64],
-    w: &mut [f64],
-    u: &mut [f64],
-    u_prev: &mut [f64],
-    eta_fixed: &mut [f64],
-    a_blocks: &mut [f64],
-    a_rhs: &mut [f64],
+    eta: &mut [T],
+    prob: &mut [T],
+    w: &mut [T],
+    u: &mut [T],
+    u_prev: &mut [T],
+    eta_fixed: &mut [T],
+    a_blocks: &mut [T],
+    a_rhs: &mut [T],
     wx: &mut faer::Mat<f64>,
-    agq_scratch: &mut [f64],
+    agq_scratch: &mut [T],
     nagq: u8,
     pirls_tol_override: Option<f64>,
     n: usize,
@@ -362,7 +369,8 @@ pub(crate) fn agq_deviance_vec(
     // inner `pirls_solve_blocked` call — the node loop below reads it back off
     // the `eta_fixed` that fill leaves. `None` ⇒ no offset.
     offset: Option<&[f64]>,
-) -> f64 {
+    counters: &mut crate::counters::EvalCounters,
+) -> T {
     let n_theta = groupings.n_theta();
     let s = groupings.n_primary;
     let q = groupings.primary_q; // 2 or 3 (gate-enforced)
@@ -397,20 +405,21 @@ pub(crate) fn agq_deviance_vec(
         offset,
         pirls_tol_override,
         n,
+        counters,
     );
     if !conv {
-        return f64::INFINITY;
+        return T::from_f64(f64::INFINITY);
     }
     let k = nagq as usize;
     let blk = crate::consts::GH_OFFSETS[(k - 1) / 2];
     let nodes = &crate::consts::GH_NODES[blk..blk + k];
     let wts = &crate::consts::GH_WEIGHTS[blk..blk + k];
-    let ln_sqrt_pi = 0.5 * std::f64::consts::PI.ln();
+    let ln_sqrt_pi_f64 = 0.5 * std::f64::consts::PI.ln();
     let kq = k.pow(q as u32);
 
     // Scratch: ctr_c = ℓ_c(ũ_c) (s) | running Σ_j (s) | product-grid node table
     // (k^q·(q+1): the q z-vector components + the summed Liu–Pierce reweight per
-    // node). Per-cluster temporaries (u_cj, v_cj) are [f64;3] stack arrays.
+    // node). Per-cluster temporaries (u_cj, v_cj) are [T;3] stack arrays.
     let (ctr, rest) = agq_scratch.split_at_mut(s);
     let (sum, node_tbl) = rest.split_at_mut(s);
     let node_tbl = &mut node_tbl[..kq * (q + 1)];
@@ -422,56 +431,57 @@ pub(crate) fn agq_deviance_vec(
     for t in 0..kq {
         let base = t * (q + 1);
         let mut rem = t;
-        let mut ln_wj = 0.0;
+        let mut ln_wj = 0.0f64;
         for d in 0..q {
             let jd = rem % k;
             rem /= k;
             let zj = nodes[jd];
-            node_tbl[base + d] = zj;
+            node_tbl[base + d] = T::from_f64(zj);
             ln_wj += wts[jd].ln() + zj * zj;
         }
-        node_tbl[base + q] = ln_wj;
+        node_tbl[base + q] = T::from_f64(ln_wj);
     }
 
     // ctr_c = ℓ_c(ũ_c): RE prior −½‖ũ_c‖², then Σ_{i∈c} −½·dev_resid at the mode
     // (prob[i] already holds g⁻¹ at the converged η).
     for c in 0..s {
         let ubase = c * q;
-        let mut acc = 0.0;
+        let mut acc = T::ZERO;
         for r in 0..q {
-            acc -= 0.5 * u[ubase + r] * u[ubase + r];
+            acc -= T::from_f64(0.5) * u[ubase + r] * u[ubase + r];
         }
         ctr[c] = acc;
-        sum[c] = 0.0;
+        sum[c] = T::ZERO;
     }
     for i in 0..n {
         let c = cluster_ids[i] as usize;
         // w_i·dev_resid; prior_w[i]==1.0 exactly on the unweighted path ⇒ byte-identical.
-        ctr[c] -= 0.5 * prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
+        ctr[c] -= T::from_f64(0.5 * prior_w[i])
+            * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
     }
 
     // Shared read-only reborrows for the parallel closure (rayon needs Sync
-    // captures; `&mut [f64]` isn't Sync). The per-cluster body only reads these.
-    let lam_ro: &[f64] = lam;
-    let eta_fixed_ro: &[f64] = eta_fixed;
-    let u_ro: &[f64] = u;
-    let a_blocks_ro: &[f64] = a_blocks;
-    let ctr_ro: &[f64] = ctr;
-    let node_tbl_ro: &[f64] = node_tbl;
+    // captures; `&mut [T]` isn't Sync). The per-cluster body only reads these.
+    let lam_ro: &[T] = lam;
+    let eta_fixed_ro: &[T] = eta_fixed;
+    let u_ro: &[T] = u;
+    let a_blocks_ro: &[T] = a_blocks;
+    let ctr_ro: &[T] = ctr;
+    let node_tbl_ro: &[T] = node_tbl;
     // Per-cluster integral: reads shared slices, writes only its own `sum` slot —
     // deterministic under any thread schedule ⇒ parallel == serial bitwise.
-    let per_cluster = |idx: &ClusterRowIndex, c: usize, sum_c: &mut f64| {
+    let per_cluster = |idx: &ClusterRowIndex, c: usize, sum_c: &mut T| {
         let rows = idx.cluster_rows(c);
         let lblk = &a_blocks_ro[c * q * q..c * q * q + q * q]; // L_c (row-major lower)
         let ubase = c * q;
-        let mut acc_sum = 0.0;
+        let mut acc_sum = T::ZERO;
         for t in 0..kq {
             let nbase = t * (q + 1);
             let znode = &node_tbl_ro[nbase..nbase + q];
             let ln_wj = node_tbl_ro[nbase + q];
             // u_cj = ũ_c + √2·L_cᵀ⁻¹·z_j: back-solve L_cᵀ·w = z (upper-tri), then
             // shift/scale. L_cᵀ[r][cc] = L_c[cc][r] = lblk[cc·q + r].
-            let mut u_cj = [0.0f64; 3];
+            let mut u_cj = [T::ZERO; 3];
             for r in (0..q).rev() {
                 let mut v = znode[r];
                 for cc in (r + 1)..q {
@@ -480,12 +490,12 @@ pub(crate) fn agq_deviance_vec(
                 u_cj[r] = v / lblk[r * q + r];
             }
             for r in 0..q {
-                u_cj[r] = u_ro[ubase + r] + std::f64::consts::SQRT_2 * u_cj[r];
+                u_cj[r] = u_ro[ubase + r] + T::from_f64(std::f64::consts::SQRT_2) * u_cj[r];
             }
             // v_cj = Λ_p·u_cj (Λ_p lower-tri row-major = lam): v[r] = Σ_{cc≤r} lam[r·q+cc]·u_cj[cc].
-            let mut v_cj = [0.0f64; 3];
+            let mut v_cj = [T::ZERO; 3];
             for r in 0..q {
-                let mut vv = 0.0;
+                let mut vv = T::ZERO;
                 for cc in 0..=r {
                     vv += lam_ro[r * q + cc] * u_cj[cc];
                 }
@@ -493,18 +503,19 @@ pub(crate) fn agq_deviance_vec(
             }
             // ℓ_c(u_cj): RE prior −½‖u_cj‖², then the per-row deviance at η_i =
             // eta_fixed[i] + z_i·v_cj (z_i = [1, z_buf row]).
-            let mut acc_c = 0.0;
+            let mut acc_c = T::ZERO;
             for &uc in &u_cj[..q] {
-                acc_c -= 0.5 * uc * uc;
+                acc_c -= T::from_f64(0.5) * uc * uc;
             }
             for &i in rows {
                 let i = i as usize;
                 let mut eta_i = eta_fixed_ro[i] + v_cj[0]; // z_i0 = 1
                 for d in 0..q - 1 {
-                    eta_i += z_buf[i * (q - 1) + d] * v_cj[d + 1];
+                    eta_i += T::from_f64(z_buf[i * (q - 1) + d]) * v_cj[d + 1];
                 }
                 let mu = crate::family::link_inv(family, eta_i);
-                acc_c -= 0.5 * prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], mu);
+                acc_c -= T::from_f64(0.5 * prior_w[i])
+                    * crate::family::dev_resid(family, nb_theta, y[i], mu);
             }
             acc_sum += (ln_wj + acc_c - ctr_ro[c]).exp();
         }
@@ -542,15 +553,15 @@ pub(crate) fn agq_deviance_vec(
     }
 
     // −2·Σ_c [ ℓ_c(ũ_c) − Σ_r ln L_c[r,r] + log((1/√π)^q·Σ_j …) ].
-    let mut dev = 0.0;
-    let q_ln_sqrt_pi = q as f64 * ln_sqrt_pi;
+    let mut dev = T::ZERO;
+    let q_ln_sqrt_pi = T::from_f64(q as f64 * ln_sqrt_pi_f64);
     for c in 0..s {
         let lblk = &a_blocks[c * q * q..c * q * q + q * q];
-        let mut log_scale = 0.0; // −Σ_r ln L_c[r,r] = −½ log|A_c|
+        let mut log_scale = T::ZERO; // −Σ_r ln L_c[r,r] = −½ log|A_c|
         for r in 0..q {
             log_scale -= lblk[r * q + r].ln();
         }
-        dev += -2.0 * (ctr[c] + log_scale + sum[c].ln() - q_ln_sqrt_pi);
+        dev += T::from_f64(-2.0) * (ctr[c] + log_scale + sum[c].ln() - q_ln_sqrt_pi);
     }
     dev
 }
@@ -607,9 +618,9 @@ pub(crate) fn glmm_agq_deviance(
     let nt = groupings.n_theta();
     beta_rhs[..*p].copy_from_slice(&prm[nt..nt + *p]);
     let kernel = if groupings.primary_q == 1 {
-        agq_deviance
+        agq_deviance::<f64>
     } else {
-        agq_deviance_vec
+        agq_deviance_vec::<f64>
     };
     kernel(
         family,
@@ -640,5 +651,6 @@ pub(crate) fn glmm_agq_deviance(
         n,
         cluster_rows.as_ref(),
         offset,
+        &mut crate::counters::EvalCounters::new(),
     )
 }

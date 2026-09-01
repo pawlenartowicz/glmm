@@ -297,6 +297,12 @@ pub struct GlmmWorkspace {
     /// Whether the FINAL re-evaluation at the pinned γ̂ itself exhausted the
     /// PIRLS cap. Reset to `false` at the top of every `fit_glmm`.
     pub(crate) final_pirls_exhausted: bool,
+    /// Observation-only optimizer counters for the fit in progress — the stage
+    /// split, the shrink phase, the PIRLS histogram and the AGQ node cost.
+    /// Never read by any numeric path. Reset to `new()` at the top of every
+    /// `fit_glmm` (mirrors `pirls_exhausted`) so a `loop_advanced` reuse never
+    /// carries a prior draw's counts.
+    pub(crate) counters: crate::counters::EvalCounters,
 }
 
 impl GlmmWorkspace {
@@ -568,6 +574,7 @@ impl GlmmWorkspace {
             offset: None,
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
+            counters: crate::counters::EvalCounters::new(),
         }
     }
 
@@ -650,14 +657,14 @@ pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
 /// (lower triangle read; on return the lower triangle holds L). Returns false on
 /// a non-positive pivot — the module's failure surface. q ≤ MAX_PRIMARY_Q (8).
 /// Thin wrapper over the shared kernel in `crate::linalg::block_chol`.
-pub(crate) fn glmm_block_chol(blk: &mut [f64], q: usize) -> bool {
+pub(crate) fn glmm_block_chol<T: crate::scalar::Scalar>(blk: &mut [T], q: usize) -> bool {
     crate::linalg::block_chol(blk, q)
 }
 
 /// Solve `L Lᵀ x = b` in place (`b` overwritten with `x`) for the `q×q` lower
 /// factor `l` produced by `glmm_block_chol` (row-major, diagonal = L pivots).
 /// Forward `L y = b` then back `Lᵀ x = y`.
-pub(crate) fn glmm_block_solve(l: &[f64], q: usize, b: &mut [f64]) {
+pub(crate) fn glmm_block_solve<T: crate::scalar::Scalar>(l: &[T], q: usize, b: &mut [T]) {
     for r in 0..q {
         let mut v = b[r];
         for c in 0..r {
@@ -680,7 +687,12 @@ pub(crate) fn glmm_block_solve(l: &[f64], q: usize, b: &mut [f64]) {
 /// each factor entry is read once per row op and the inner loop runs over the
 /// contiguous row slice (vectorizable axpy) instead of re-walking the factor
 /// once per RHS column.
-pub(crate) fn glmm_block_solve_panel(l: &[f64], q: usize, panel: &mut [f64], nc: usize) {
+pub(crate) fn glmm_block_solve_panel<T: crate::scalar::Scalar>(
+    l: &[T],
+    q: usize,
+    panel: &mut [T],
+    nc: usize,
+) {
     for r in 0..q {
         let (done, rest) = panel.split_at_mut(r * nc);
         let row_r = &mut rest[..nc];

@@ -10,6 +10,7 @@ use super::workspace::{
     glmm_block_chol, glmm_block_solve, glmm_block_solve_panel, StructuredSchur,
 };
 use super::{PIRLS_MAX_HALVINGS, PIRLS_MAX_ITERS};
+use crate::scalar::Scalar;
 use crate::sparse::logdet_llt;
 use crate::spec::{BinomialLink, Family};
 
@@ -48,24 +49,24 @@ pub(crate) enum BetaStep<'a> {
 /// evaluation at the top of the loop reads `eta_fixed`, so it must track the
 /// current β. `offset` is `FitOptions::offset` (`None` ⇒ this function is
 /// byte-identical to the pre-offset version).
-fn refresh_eta_fixed(
+fn refresh_eta_fixed<T: crate::scalar::Scalar>(
     x: MatRef<f64>,
-    beta: &[f64],
-    eta_fixed: &mut [f64],
+    beta: &[T],
+    eta_fixed: &mut [T],
     n: usize,
     p: usize,
     offset: Option<&[f64]>,
 ) {
     for i in 0..n {
-        let mut e = 0.0;
+        let mut e = T::ZERO;
         for j in 0..p {
-            e += x[(i, j)] * beta[j];
+            e += T::from_f64(x[(i, j)]) * beta[j];
         }
         eta_fixed[i] = e;
     }
     if let Some(o) = offset {
         for i in 0..n {
-            eta_fixed[i] += o[i];
+            eta_fixed[i] += T::from_f64(o[i]);
         }
     }
 }

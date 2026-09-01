@@ -22,6 +22,12 @@ publish = false
 [dependencies]
 glmm = { path = "..", features = ["formula", "loop_advanced"] }
 
+# Dev-only pass-through of the kernel's optimizer counters, for the speed
+# grid's counter pass. OFF by default: the counters perturb wall time
+# slightly, and every other pass of this campaign reads wall time.
+[features]
+counters = ["glmm/counters"]
+
 # No `parallel` passthrough: every engine target here fits serial, including the
 # VALIDATION_AGQ pass (engines/glmm.rs). The one example that wants inner
 # parallelism, campaigns/speed-grid/agq_par_probe.rs, asks for it on the dependency

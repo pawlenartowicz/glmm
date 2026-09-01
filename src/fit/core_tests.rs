@@ -1120,6 +1120,7 @@ fn fit_on_lmm_dense_offset_round_trip_varying_n() {
 /// Dense random-slope LMM whose slope column is deliberately far off unit RMS,
 /// so `LmmGroupings::set_slope_scales` installs a scale != 1 and the θ̂ read-back
 /// in `FitView::new` has real work to do.
+#[cfg(feature = "alloc-tests")]
 fn lmm_slope_case() -> (
     Vec<f64>,
     Vec<f64>,
@@ -1170,6 +1171,7 @@ fn lmm_slope_case() -> (
 /// Intercept-only crossed design whose EXTRA factor outnumbers the primary, so
 /// `spec_sized_from_ids` swaps the two and the workspace carries a non-identity
 /// `Perm` — the state that makes a warm start arrive in the wrong slot order.
+#[cfg(feature = "alloc-tests")]
 fn reordered_crossed_case() -> (
     Vec<f64>,
     Vec<f64>,
@@ -1303,4 +1305,69 @@ fn fit_on_theta_marshalling_bounded_alloc() {
         N_CALLS,
         BOUND
     );
+}
+
+/// Semantics pin for the shrink counter: `evals_after_last_improve` is the
+/// number of evaluations recorded after the last strict improvement of the
+/// per-stage incumbent. A ten-eval stage whose last improvement was eval 7
+/// has three shrink evals.
+#[cfg(feature = "counters")]
+#[test]
+fn eval_counters_count_evals_after_last_improvement() {
+    use crate::counters::{EvalCounters, Stage};
+    let mut c = EvalCounters::new();
+    for obj in [5.0, 4.0, 4.5, 3.0, 3.5, 3.5, 3.5] {
+        c.record_eval(Stage::Two, obj);
+    }
+    assert_eq!(c.stage_evals[Stage::Two as usize], 7);
+    assert_eq!(c.stage_last_improve[Stage::Two as usize], 4);
+    assert_eq!(c.evals_after_last_improve(Stage::Two), 3);
+    assert_eq!(c.evals_after_last_improve(Stage::One), 0);
+}
+
+/// The PIRLS histogram buckets the pending per-eval iteration count and
+/// clears it, so two evals of 3 and 5 iterations land in two different
+/// buckets and nothing carries over into a third eval.
+#[cfg(feature = "counters")]
+#[test]
+fn eval_counters_bucket_pirls_iterations_per_eval() {
+    use crate::counters::EvalCounters;
+    let mut c = EvalCounters::new();
+    c.set_pirls_iters(3);
+    c.commit_pirls_iters();
+    c.set_pirls_iters(5);
+    c.commit_pirls_iters();
+    c.set_pirls_iters(3);
+    c.commit_pirls_iters();
+    assert_eq!(c.pirls_hist[3], 2);
+    assert_eq!(c.pirls_hist[5], 1);
+    assert_eq!(c.pirls_hist.iter().sum::<u32>(), 3);
+}
+
+/// AGQ records one evaluation and its node count per call; the node total is
+/// evaluations x nodes — counter 4 in `crate::counters`' module header.
+#[cfg(feature = "counters")]
+#[test]
+fn eval_counters_accumulate_agq_nodes() {
+    use crate::counters::EvalCounters;
+    let mut c = EvalCounters::new();
+    c.record_agq_eval(8 * 7);
+    c.record_agq_eval(8 * 7);
+    assert_eq!(c.agq_evals, 2);
+    assert_eq!(c.agq_node_evals, 112);
+}
+
+/// Every route must carry the counters field, and a route with no
+/// derivative-free search must report zeros rather than garbage.
+#[cfg(feature = "counters")]
+#[test]
+fn fit_carries_zeroed_counters_on_closed_form_routes() {
+    use crate::counters::Stage;
+    let (x, y, n, p, model, ids, opts) = ols_case();
+    let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert_eq!(f.n_eval, 0, "OLS runs no optimizer");
+    assert_eq!(f.counters.stage_evals, [0, 0]);
+    assert_eq!(f.counters.evals_after_last_improve(Stage::Two), 0);
+    assert_eq!(f.counters.agq_evals, 0);
+    assert_eq!(f.counters.pirls_hist.iter().sum::<u32>(), 0);
 }

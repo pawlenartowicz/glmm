@@ -44,6 +44,15 @@ orchestrate = ["formula"]
 # `cargo test --features alloc-tests <name> -- --ignored` — no
 # `--test-threads=1` needed.
 alloc-tests = []
+# Dev-only optimizer instrumentation (`glmm::EvalCounters` on `Fit`): the
+# stage-1/stage-2 evaluation split, evaluations after the last incumbent
+# improvement, a PIRLS-iterations-per-evaluation histogram, and AGQ
+# evaluations x nodes. OFF by default and — like `loop_advanced` and
+# `orchestrate` — NOT part of the semver-covered surface. Zero cost when off —
+# the contract lives in `src/counters.rs`'s module header; the feature adds no
+# dependency and no I/O, so the wasm and no-default-features builds are
+# unaffected.
+counters = []
 # Tier 2, the cross-engine tier: asserts the crate against the frozen lme4 /
 # MixedModels / GLMMadaptive goldens in `validation/goldens/` at `validation/tol.R`'s
 # agreement bands. OFF by default because it is slow — it refits all 35 goldens

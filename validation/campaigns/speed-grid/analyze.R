@@ -18,17 +18,7 @@ source(file.path(suite_dir, "..", "..", "tol.R"))
 out_dir <- file.path(suite_dir, "reports")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-# Torn-line tolerant: a kill-9'd runner (watchdog) can leave a truncated final
-# line -- skip lines that don't parse rather than aborting the whole analysis.
-read_jsonl <- function(path) {
-  lines <- readLines(path); lines <- lines[nzchar(lines)]
-  recs <- list()
-  for (ln in lines) {
-    rec <- tryCatch(fromJSON(ln, simplifyVector = TRUE), error = function(e) NULL)
-    if (!is.null(rec)) recs[[length(recs) + 1L]] <- rec
-  }
-  setNames(recs, vapply(recs, `[[`, "", "case_id"))
-}
+# read_jsonl lives in tol.R (sourced above), torn-line tolerant.
 glmm <- read_jsonl(args[1]); mm <- read_jsonl(args[2])
 
 # JIT guard: fit.jl warm-up-fits each cell and records compile_seconds
@@ -48,10 +38,7 @@ if (all(is.na(mm_compile)))
   warning("MixedModels pass has no compile_seconds field -- pre-warm-up data, ",
           "walls include JIT and must not be quoted", call. = FALSE)
 anchor <- if (length(args) >= 3 && file.exists(args[3])) read_jsonl(args[3]) else list()
-manifest <- fromJSON(file.path(suite_dir, "manifest.json"),
-                     simplifyDataFrame = FALSE)
-cells <- setNames(manifest$cells,
-                  vapply(manifest$cells, `[[`, "", "case_id"))
+cells <- manifest_cells(file.path(suite_dir, "manifest.json"))
 
 # ---- deviance alignment to MixedModels' objective() scale ----------------------
 # glmm's deviance conventions, pinned empirically on grid cells: poisson,
@@ -155,7 +142,7 @@ write.csv(do.call(rbind, prof), file.path(out_dir, "data_profiles.csv"), row.nam
 
 # ---- lme4 to-do: mismatches + rival engine-fails + seeded 20-cell audit --------
 # Manifest order (not case_id sort or sample order) -- the watchdog's lme4
-# timeout-attribution keys off this file's line order (Task 9 constraint).
+# timeout-attribution keys off this file's line order.
 # Rival engine-fail cells (glmm ok, MM crashes -- 2026-07-11: all nest2s
 # PosDefException) get status "ok" above with glmm's answer unverified; anchor
 # them all so "converges where MM can't" also means "to the right answer".

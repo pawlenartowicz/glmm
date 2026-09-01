@@ -8,7 +8,99 @@ use super::pirls::{
 use super::workspace::fill_z_f64;
 use super::workspace::{apply_lambda, build_packed_m, GlmmWorkspace, StructuredSchur};
 use crate::lmm::LmmGroupings;
+use crate::scalar::Scalar;
 use crate::spec::Family;
+
+/// The blocked (`extra_offsets` empty) Laplace objective at (θ, β), generic
+/// over the scalar: build Λ_p, solve the blocked PIRLS conditional modes, and
+/// return `d(y,ũ) + ‖ũ‖² + log|A|` — the same three terms `laplace_deviance`
+/// assembles, extracted so a non-f64 scalar has an entry point that does not
+/// carry the dense and structured branches' buffers.
+/// Non-convergence / Cholesky failure ⇒ `+∞`. The third element of the
+/// return is the raw PIRLS deviance's finiteness, read before the `+∞` fold,
+/// so the router's `pirls_exhausted` counter can keep telling an
+/// iteration-cap exhaustion (finite raw deviance) apart from a hard failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn blocked_laplace_deviance<T: Scalar>(
+    family: Family,
+    nb_theta: f64,
+    groupings: &LmmGroupings,
+    params: &[T],
+    beta: &mut [T],
+    lam: &mut [T],
+    z_buf: &[f64],
+    m_buf: &mut [T],
+    x: MatRef<f64>,
+    y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
+    cluster_ids: &[u32],
+    eta: &mut [T],
+    prob: &mut [T],
+    w: &mut [T],
+    u: &mut [T],
+    u_prev: &mut [T],
+    eta_fixed: &mut [T],
+    a_blocks: &mut [T],
+    a_rhs: &mut [T],
+    wx: &mut Mat<f64>,
+    beta_step: BetaStep,
+    offset: Option<&[f64]>,
+    pirls_tol_override: Option<f64>,
+    // Unused on the blocked path (`pirls_solve_blocked` reads `p` off
+    // `beta.len()`) — kept so the signature matches the dense/structured arms'
+    // shape.
+    _p: usize,
+    n: usize,
+    counters: &mut crate::counters::EvalCounters,
+) -> (T, bool, bool) {
+    crate::lmm::primary_lambda(&params[..groupings.n_theta()], groupings.primary_q, lam);
+    let (dev, pen, logdet, conv) = pirls_solve_blocked(
+        family,
+        nb_theta,
+        groupings,
+        cluster_ids,
+        x,
+        y,
+        prior_w,
+        weighted,
+        beta,
+        beta_step,
+        lam,
+        z_buf,
+        m_buf,
+        eta,
+        prob,
+        w,
+        u,
+        u_prev,
+        eta_fixed,
+        a_blocks,
+        a_rhs,
+        wx,
+        offset,
+        pirls_tol_override,
+        n,
+        counters,
+    );
+    let raw_dev_finite = dev.value().is_finite();
+    if !conv || !raw_dev_finite {
+        return (T::from_f64(f64::INFINITY), conv, raw_dev_finite);
+    }
+    // Gamma substitutes its AIC-style objective for the bare deviance —
+    // rationale on the structured arm in `laplace_deviance`; mirrors that
+    // branch, change together.
+    let data_term = if matches!(family, Family::Gamma { .. }) {
+        crate::family::gamma_aic(y, prob, dev, n, Some(prior_w))
+    } else {
+        dev
+    };
+    (
+        data_term + pen + T::from_f64(2.0) * logdet,
+        conv,
+        raw_dev_finite,
+    )
+}
 
 /// Laplace deviance at (θ, β): rebuild M = ZΛ, solve the PIRLS conditional
 /// modes, then return `d(y,ũ) + ‖ũ‖² + log|A|` (A = M'WM + I at ũ). The +I in A
@@ -120,6 +212,10 @@ pub(crate) fn laplace_deviance(
     // instrumented) runs the full iteration cap without converging. Never read
     // by anything on the numeric path; see `Note::PirlsExhausted`.
     pirls_exhausted: &mut u32,
+    // Observation-only optimizer counters (`counters` feature; a zero-sized
+    // no-op otherwise). The FD-Hessian SE path passes its own discard value,
+    // which is how SE evals stay out of every count.
+    counters: &mut crate::counters::EvalCounters,
 ) -> f64 {
     let n_theta = groupings.n_theta();
     // Fixed-mode β: a value-exact copy of `params[n_theta..n_theta+p]` into the
@@ -156,7 +252,14 @@ pub(crate) fn laplace_deviance(
         } else {
             super::agq::agq_deviance_vec
         };
-        return kernel(
+        // AGQ cost per evaluation: one q-dimensional product grid per cluster,
+        // `nagq^q` nodes each (`agq_deviance_vec`'s `kq`; `nagq` itself in the
+        // scalar q == 1 kernel). Recorded here rather than inside the node loop
+        // so the hot loop is untouched.
+        counters.record_agq_eval(
+            groupings.n_primary as u64 * (nagq as u64).pow(groupings.primary_q as u32),
+        );
+        let dev = kernel(
             family,
             nb_theta,
             groupings,
@@ -185,7 +288,10 @@ pub(crate) fn laplace_deviance(
             n,
             cluster_rows,
             offset,
+            counters,
         );
+        counters.commit_pirls_iters();
+        return dev;
     }
     let k = groupings.k_total;
     // One BetaStep, moved into whichever PIRLS branch runs (the branches are
@@ -203,23 +309,22 @@ pub(crate) fn laplace_deviance(
     } else {
         BetaStep::Fixed
     };
-    let (dev, pen, logdet, conv) = if groupings.extra_offsets.is_empty() {
+    if groupings.extra_offsets.is_empty() {
         // No extras ⇒ A is block-diagonal: reconstruct mᵢ per row, never build Z/M.
-        crate::lmm::primary_lambda(&params[..n_theta], groupings.primary_q, lam);
-        pirls_solve_blocked(
+        let (obj, conv, raw_dev_finite) = blocked_laplace_deviance(
             family,
             nb_theta,
             groupings,
-            cluster_ids,
+            params,
+            beta,
+            lam,
+            z_buf,
+            m_buf,
             x,
             y,
             prior_w,
             weighted,
-            beta,
-            beta_step,
-            lam,
-            z_buf,
-            m_buf,
+            cluster_ids,
             eta,
             prob,
             w,
@@ -229,11 +334,20 @@ pub(crate) fn laplace_deviance(
             a_blocks,
             a_rhs,
             wx,
+            beta_step,
             offset,
             pirls_tol_override,
+            p,
             n,
-        )
-    } else if groupings.structured_extras_eligible() {
+            counters,
+        );
+        if !conv && raw_dev_finite && pirls_tol_override.is_none() {
+            *pirls_exhausted += 1;
+        }
+        counters.commit_pirls_iters();
+        return obj;
+    }
+    let (dev, pen, logdet, conv) = if groupings.structured_extras_eligible() {
         // Intercept-only crossed/nested ⇒ block-diagonal core + Schur on the
         // crossed width. The M = ZΛ nonzeros are packed once here (core slice +
         // crossed entries) instead of materializing the dense n×k M every eval; the
@@ -307,6 +421,7 @@ pub(crate) fn laplace_deviance(
             offset,
             pirls_tol_override,
             n,
+            counters,
         )
     } else {
         // Non-eligible extras (oversized core) ⇒ A genuinely dense: dense fallback.
@@ -339,6 +454,7 @@ pub(crate) fn laplace_deviance(
             offset,
             pirls_tol_override,
             n,
+            counters,
         )
     };
     // `!conv` with a FINITE `dev` is exactly the natural iteration-cap
@@ -352,6 +468,7 @@ pub(crate) fn laplace_deviance(
     if !conv && dev.is_finite() && pirls_tol_override.is_none() {
         *pirls_exhausted += 1;
     }
+    counters.commit_pirls_iters();
     if !conv || !dev.is_finite() {
         return f64::INFINITY;
     }
@@ -387,6 +504,7 @@ pub(crate) fn laplace_deviance_at(
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
     n: usize,
+    counters: &mut crate::counters::EvalCounters,
 ) -> f64 {
     let kk = ws.k.max(1);
     if ws.warm_seed_active {
@@ -399,7 +517,7 @@ pub(crate) fn laplace_deviance_at(
     // Fixed mode: β = ws.beta_rhs (transient scratch, never ws.betas — see
     // laplace_deviance's doc). `beta_step_rhs` just needs a distinct spare
     // buffer (inert under Fixed) — ws.beta_prof is it.
-    laplace_deviance_ws(ws, x, y, cluster_ids, extra_ids, n, false)
+    laplace_deviance_ws(ws, x, y, cluster_ids, extra_ids, n, false, counters)
 }
 
 /// Shared borrow-split body of `laplace_deviance_at` and (test-only)
@@ -409,6 +527,7 @@ pub(crate) fn laplace_deviance_at(
 /// β vs. the spare `beta_step_rhs` (Fixed: β = `beta_rhs`, spare = `beta_prof`;
 /// Profile: β = `beta_prof`, spare = `beta_rhs` — the two must never alias).
 /// Callers own all u/β seeding — this helper seeds nothing.
+#[allow(clippy::too_many_arguments)]
 fn laplace_deviance_ws(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
@@ -417,6 +536,7 @@ fn laplace_deviance_ws(
     extra_ids: &[Vec<u32>],
     n: usize,
     profile_beta: bool,
+    counters: &mut crate::counters::EvalCounters,
 ) -> f64 {
     let family = ws.family;
     let nb_theta = ws.nb_theta;
@@ -537,6 +657,7 @@ fn laplace_deviance_ws(
         cluster_rows.as_ref(),
         offset,
         pirls_exhausted,
+        counters,
     )
 }
 
@@ -558,7 +679,8 @@ pub(crate) fn glmm_laplace_deviance(
 ) -> f64 {
     ws.params[..params.len()].copy_from_slice(params);
     fill_z_f64(&ws.groupings, x, &mut ws.z_buf, n);
-    laplace_deviance_at(ws, x, y, cluster_ids, extra_ids, n)
+    let mut counters = crate::counters::EvalCounters::new();
+    laplace_deviance_at(ws, x, y, cluster_ids, extra_ids, n, &mut counters)
 }
 
 /// Test-only Profile twin of `glmm_laplace_deviance`: drives `laplace_deviance`
@@ -588,5 +710,6 @@ pub(crate) fn glmm_laplace_deviance_profile(
     for v in ws.beta_prof.iter_mut() {
         *v = 0.0;
     }
-    laplace_deviance_ws(ws, x, y, cluster_ids, extra_ids, n, true)
+    let mut counters = crate::counters::EvalCounters::new();
+    laplace_deviance_ws(ws, x, y, cluster_ids, extra_ids, n, true, &mut counters)
 }

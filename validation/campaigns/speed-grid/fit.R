@@ -4,12 +4,11 @@
 #
 # - manifest.json (default): lazy anchor -- fits ONLY the cells named in
 #   GRID_TODO (mismatch cells + audit sample from analyze.R) or GRID_ONLY.
-# - manifest_diligent.json (diligent run, spec Part 6: docs/GLMM/plans/
-#   2026-07-12-full-agq-vector-re-spec.md): three engine branches selected off
+# - estimate-grid's manifest.json: three engine branches selected off
 #   the manifest's per-cell `nagq`/`structure` -- lmer/glmer Laplace for the 477
 #   AGQ-ineligible cells (as the anchor above), glmer(nAGQ=k) for the 15 `int1`
 #   scalar-AGQ cells, GLMMadaptive::mixed_model(nAGQ=k) for the 18 `q2s`
-#   vector-AGQ cells (glmer refuses nAGQ>1 for vector REs -- locked decision 6).
+#   vector-AGQ cells (glmer refuses nAGQ>1 for vector REs).
 #   Every branch also records varcomp (theta hat), the one new diligent quantity.
 #
 # One JSONL line per cell, resume-safe. Eval cap: the manifest's pre-registered

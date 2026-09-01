@@ -2617,3 +2617,35 @@ fn theta_row_scales_reads_off_the_hand_built_grouping() {
         "column-major vech: [primary (0,0),(1,0),(1,1)] then [extra (0,0),(1,0),(1,1)]"
     );
 }
+
+/// The LMM search is single-stage, so everything lands in stage 2 and the
+/// stage-2 count must equal `n_eval`. The shrink count is counter 2 in
+/// `crate::counters`' module header on this route.
+#[cfg(feature = "counters")]
+#[test]
+fn lmm_counters_record_stage_two_and_shrink_evals() {
+    use crate::counters::Stage;
+    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(f.converged(), "sleepstudy must converge");
+    let c = f.counters;
+    assert_eq!(c.stage_evals[0], 0, "the LMM path runs one stage");
+    assert_eq!(
+        c.stage_evals[1] as usize, f.n_eval,
+        "stage 2 accounts for every eval"
+    );
+    assert!(
+        c.evals_after_last_improve(Stage::Two) < c.stage_evals[1],
+        "shrink evals are a strict subset"
+    );
+    assert_eq!(
+        c.pirls_hist.iter().sum::<u32>(),
+        0,
+        "no PIRLS on a Gaussian LMM"
+    );
+    assert_eq!(c.agq_evals, 0, "no AGQ on a Gaussian LMM");
+}

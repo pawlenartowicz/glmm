@@ -31,7 +31,12 @@ fn fd_eval(
     // caller's β, so β must NOT move under these directional evals — a Profile step
     // here would make each `f(γ)` depend on the profiled β̂(γ) and corrupt the
     // second differences.
-    laplace_deviance_at(ws, x, y, cluster_ids, extra_ids, n)
+    // The FD-Hessian evaluations run their own tight PIRLS tolerance and are
+    // not part of the search; they get a throwaway counter so nothing they do
+    // reaches the reported counts (mirrors the `pirls_tol_override.is_some()`
+    // discriminator the exhaustion counter uses).
+    let mut fd_counters = crate::counters::EvalCounters::new();
+    laplace_deviance_at(ws, x, y, cluster_ids, extra_ids, n, &mut fd_counters)
 }
 
 /// Central second difference of coordinate `k` at step `s`: `(f(+s) − 2·f0 +

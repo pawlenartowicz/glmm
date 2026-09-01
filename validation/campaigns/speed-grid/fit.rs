@@ -282,6 +282,21 @@ fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
             let max_fun = lowered.as_ref().map(|(_, _, m)| *m).unwrap_or(0);
             let maxeval = !f.converged() && f.n_eval >= max_fun;
             rec["n_eval"] = json!(f.n_eval);
+            // Optimizer counters. Present only under the `counters`
+            // feature; every other pass of this campaign writes no such field,
+            // so analyze.R must treat them as optional.
+            #[cfg(feature = "counters")]
+            {
+                use glmm::Stage;
+                let c = f.counters;
+                rec["stage1_evals"] = json!(c.stage_evals[0]);
+                rec["stage2_evals"] = json!(c.stage_evals[1]);
+                rec["stage1_shrink_evals"] = json!(c.evals_after_last_improve(Stage::One));
+                rec["stage2_shrink_evals"] = json!(c.evals_after_last_improve(Stage::Two));
+                rec["pirls_hist"] = json!(c.pirls_hist.to_vec());
+                rec["agq_evals"] = json!(c.agq_evals);
+                rec["agq_node_evals"] = json!(c.agq_node_evals);
+            }
             rec["converged"] = json!(f.converged());
             rec["singular"] = json!(f.singular());
             rec["deviance"] = num(f.deviance);

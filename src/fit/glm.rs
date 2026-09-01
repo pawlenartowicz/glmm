@@ -43,6 +43,8 @@ fn fit_unsupported_family(p: usize) -> Fit {
         varcorr: vec![],
         stddev_se: vec![],
         n_eval: 0,
+        #[cfg(feature = "counters")]
+        counters: crate::counters::EvalCounters::new(),
         deviance: f64::NAN,
         loglik: f64::NAN,
         df: 0,
@@ -293,6 +295,8 @@ pub(crate) fn glm_view_to_fit(
         varcorr: vec![],
         stddev_se: vec![],
         n_eval: 0,
+        #[cfg(feature = "counters")]
+        counters: crate::counters::EvalCounters::new(),
         deviance: f64::NAN,
         loglik,
         df: if converged {

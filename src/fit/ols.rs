@@ -259,6 +259,8 @@ pub(crate) fn ols_view_to_fit(
         varcorr: vec![],
         stddev_se: vec![],
         n_eval: 0,
+        #[cfg(feature = "counters")]
+        counters: crate::counters::EvalCounters::new(),
         deviance: f64::NAN,
         loglik,
         // p fixed effects + σ² (R logLik.lm's df).

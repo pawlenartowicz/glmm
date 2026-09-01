@@ -236,14 +236,41 @@ fn scalar_z<const FUSED: bool>(eta: f64) -> f64 {
 #[inline]
 fn scalar_fused<const FUSED: bool>(eta: f64) -> (f64, f64, f64) {
     let z = scalar_z::<FUSED>(eta);
-    let l = scalar_log1p_unit::<FUSED>(z);
-    let (p, lp) = if eta >= 0.0 {
-        (1.0 / (1.0 + z), eta + l)
+    let lp = scalar_log1pexp_from_z::<FUSED>(z, eta);
+    let p = if eta >= 0.0 {
+        1.0 / (1.0 + z)
     } else {
-        (z / (1.0 + z), l)
+        z / (1.0 + z)
     };
     let w = (p * (1.0 - p)).max(crate::glm::WEIGHT_CLAMP);
     (p, w, lp)
+}
+
+// `log(1 + eᵉᵗᵃ)` core, taking the caller's `z = e^{−|η|}` so `scalar_fused`
+// reuses the `z` it already computed for μ/W; the eta-only wrapper below
+// serves `scalar_log1pexp` (the `Scalar::log1pexp` binding).
+#[inline]
+fn scalar_log1pexp_from_z<const FUSED: bool>(z: f64, eta: f64) -> f64 {
+    let l = scalar_log1p_unit::<FUSED>(z);
+    if eta >= 0.0 {
+        eta + l
+    } else {
+        l
+    }
+}
+
+#[inline]
+fn scalar_log1pexp_generic<const FUSED: bool>(eta: f64) -> f64 {
+    scalar_log1pexp_from_z::<FUSED>(scalar_z::<FUSED>(eta), eta)
+}
+
+/// `log(1 + eᵉᵗᵃ)`, overflow-safe on both tails: the `z = e^{−|η|}` reduction
+/// plus `log1p(z)`, with the `η ≥ 0` branch adding `η` back. Same two kernels
+/// `scalar_fused` uses — extracted so `Scalar::log1pexp` binds to them without
+/// computing the μ/W companions.
+#[inline]
+pub(crate) fn scalar_log1pexp(eta: f64) -> f64 {
+    scalar_log1pexp_generic::<{ FUSED_DEFAULT }>(eta)
 }
 
 struct PwLog1pexpOp<'a, const FUSED: bool> {

@@ -942,7 +942,15 @@ fn fd_hessian_cov_matches_glmer_use_hessian_true() {
     for j in 0..p {
         ws.params[1 + j] = fx.beta[j];
     }
-    let _ = laplace_deviance_at(&mut ws, xf64.as_ref(), &y, &ids, &[], n);
+    let _ = laplace_deviance_at(
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &[],
+        n,
+        &mut crate::counters::EvalCounters::new(),
+    );
     let mut rx = Mat::<f64>::zeros(p, p);
     assert!(rx_cov_into(&mut ws, xf64.as_ref(), &ids, p, n, &mut rx));
     for i in 0..p {
@@ -1864,6 +1872,7 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         None, // offset
         None,
         n,
+        &mut crate::counters::EvalCounters::new(),
     );
 
     // Blocked: primary_lambda → pirls_solve_blocked, fresh scratch.
@@ -1916,6 +1925,7 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         None, // offset
         None,
         n,
+        &mut crate::counters::EvalCounters::new(),
     );
 
     // Dense and blocked now share the same lme4 step-halving backtrack and
@@ -2037,6 +2047,7 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         None, // offset
         None,
         n,
+        &mut crate::counters::EvalCounters::new(),
     );
 
     // Blocked: primary_lambda → pirls_solve_blocked, fresh scratch.
@@ -2089,6 +2100,7 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         None, // offset
         None,
         n,
+        &mut crate::counters::EvalCounters::new(),
     );
 
     // Re-tightened to 1e-9 (u 1e-7) — dense and blocked share the same
@@ -2715,6 +2727,7 @@ fn structured_extras_matches_dense() {
             None, // offset
             None,
             n,
+            &mut crate::counters::EvalCounters::new(),
         );
 
         // Structured: build_packed_m → pirls_solve_blocked_extras, fresh scratch.
@@ -2817,6 +2830,7 @@ fn structured_extras_matches_dense() {
                 None, // offset
                 None,
                 n,
+                &mut crate::counters::EvalCounters::new(),
             )
         };
 
@@ -2934,6 +2948,7 @@ fn structured_extras_matches_dense() {
             None, // offset
             None,
             n,
+            &mut crate::counters::EvalCounters::new(),
         );
 
         // Structured: build_packed_m → pirls_solve_blocked_extras, fresh scratch.
@@ -3041,6 +3056,7 @@ fn structured_extras_matches_dense() {
                 None, // offset
                 None,
                 n,
+                &mut crate::counters::EvalCounters::new(),
             )
         };
 
@@ -3202,6 +3218,7 @@ fn structured_panel_downdate_matches_scalar() {
                 None, // offset
                 None,
                 n,
+                &mut crate::counters::EvalCounters::new(),
             );
             (out, u.clone())
         };
@@ -3871,6 +3888,7 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
         None, // offset
         None,
         n,
+        &mut crate::counters::EvalCounters::new(),
     );
     assert!(out.3, "Profile-mode solve must converge");
     // Recompute ρ = y − p̂ at the RETURNED (u, β): η = Xβ + Mu. The eta/prob
@@ -3998,6 +4016,7 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         None, // offset
         None,
         n,
+        &mut crate::counters::EvalCounters::new(),
     );
     assert!(out.3, "Profile-mode blocked solve must converge");
     // Recompute ρ = y − p̂ at the RETURNED (u, β): η = Xβ + Mu, with Mu applied
@@ -4165,6 +4184,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             None, // offset
             None,
             n,
+            &mut crate::counters::EvalCounters::new(),
         )
     };
     assert!(out.3, "Profile-mode structured solve must converge");
@@ -4318,6 +4338,7 @@ fn structured_profile_beta_matches_dense_profile() {
             None, // offset
             None,
             n,
+            &mut crate::counters::EvalCounters::new(),
         )
     };
     assert!(dense.3, "dense Profile solve must converge");
@@ -4437,6 +4458,7 @@ fn structured_profile_beta_matches_dense_profile() {
             None, // offset
             None,
             n,
+            &mut crate::counters::EvalCounters::new(),
         )
     };
     assert!(structured.3, "structured Profile solve must converge");
