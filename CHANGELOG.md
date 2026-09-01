@@ -24,6 +24,30 @@ shares these entries; Python-specific notes are called out where they differ.
   counters pass (`validation/campaigns/speed-grid/counters.R`) that reads
   these counters instead of wall time.
 
+- **Forward-mode dual numbers and exact derivative entry points.** New
+  `src/dual.rs`: `Dual<N>` (value + `N` first-derivative lanes) and
+  `HyperDual<N, H>` (adds the packed second-derivative triangle), both
+  implementing the sealed `Scalar` trait, with crate-own `digamma`/`trigamma`
+  for the Gamma-family derivative. On top of them, exact gradients and
+  Hessians of the fit criteria, obtained by running the existing generic
+  kernels at a dual scalar — no finite differences, no hand-written adjoints:
+  - GLMM (new `src/glmm/derivative.rs`): `laplace_gradient`/`laplace_hessian`
+    differentiate the joint Laplace or AGQ deviance in `(θ, β)`, with
+    dual-typed twins of the θ-dependent PIRLS buffers sized at compile-time
+    lane counts `N ∈ {4, 8, 12}` and allocated only on the first derivative
+    request (`GlmmWorkspace::dual_scratch`, `None` on every `f64`-only fit).
+    Models off the blocked path (nested/crossed extras) or with
+    `n_theta + p > 12` return `Unsupported`, and the caller keeps its current
+    fallback (FD Hessian, or BOBYQA on the objective).
+  - LMM (`src/lmm/kernel.rs`): `reml_gradient`/`reml_hessian` differentiate
+    the family-blocked REML criterion in θ — one closed-form dual evaluation,
+    no mode solve. Same lane set; crossed/nested-slopes designs and
+    `n_theta > 12` return `Unsupported`.
+
+  Substrate only: nothing calls these yet — the standard-error and optimizer
+  workstreams wire them up in later milestones. The `f64` fit path is
+  untouched and bit-identical, and pays no memory for the unused scratch.
+
 #### Changed (internal)
 
 - **The blocked fit kernel is generic over a scalar type.** Family primitives,

@@ -1992,6 +1992,31 @@ fn noz_sparse_grid_agrees() {
 /// ```sh
 /// cargo test --release noz_sparse_grid_agrees_heavy -- --ignored --nocapture
 /// ```
+///
+/// Cell 20 (n_primary=50, q_p=2, n_extra=6, q_g=4) is a frozen basin split,
+/// measured 2026-09-01 on x86_64: sparse converges to deviance
+/// −734.101866542, NoZ to −735.990789395, rel 2.563e-3. It is the grid's
+/// widest θ space — 63 coordinates, 3 primary vech entries plus 10 per extra
+/// grouping — so it is the extreme of the same multimodality
+/// `run_grid_agreement`'s doc comment measures at cell 12; the other seven
+/// heavy cells stay in band, at max rel 2.32e-5 (cell 18, varcorr).
+///
+/// The four probes that separate "two basins" from "one route is wrong",
+/// all on this cell:
+/// 1. At 8 random matched θ the dense and sparse profiled-REML objectives
+///    agree to rel ≤ 2.1e-12 — one surface, as at cell 18
+///    (`crossover_worst_cell_deviance_parity`).
+/// 2. Both cold runs report BOBYQA `Converged`, dense in 6354 evaluations
+///    and sparse in 5442, so neither endpoint is an evaluation-cap stop.
+/// 3. Each route re-evaluates the OTHER route's endpoint to that endpoint's
+///    own value (dense at θ̂_sparse → −734.101866542, sparse at θ̂_dense →
+///    −735.990789392): both points are points of the shared objective, not
+///    of two different ones.
+/// 4. Warm-restarted at the other route's θ̂, sparse reaches −735.990789389
+///    in 1671 evaluations, while dense STAYS at −734.101866533 in 1096. The
+///    worse point is a genuine local optimum that either route settles into
+///    once seeded there — what differs is only which one the cold seed
+///    funnels to.
 #[test]
 #[ignore = "8 heavy cells, 27–242s each — run on demand (see doc-comment)"]
 fn noz_sparse_grid_agrees_heavy() {
@@ -1999,7 +2024,7 @@ fn noz_sparse_grid_agrees_heavy() {
     // concurrent dhat profiler window on an `-- --ignored` run.
     #[cfg(feature = "alloc-tests")]
     let _serial = crate::test_support::alloc_test_guard();
-    run_grid_agreement(true, "noz_sparse_grid_agrees_heavy", &[]);
+    run_grid_agreement(true, "noz_sparse_grid_agrees_heavy", &[20]);
 }
 
 /// Conditional-mode parity on the blocked dense path. `classify_design`

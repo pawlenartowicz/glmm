@@ -303,6 +303,11 @@ pub struct GlmmWorkspace {
     /// `fit_glmm` (mirrors `pirls_exhausted`) so a `loop_advanced` reuse never
     /// carries a prior draw's counts.
     pub(crate) counters: crate::counters::EvalCounters,
+    /// Dual-arithmetic twins of the θ-dependent PIRLS buffers, allocated on the
+    /// first derivative request for this workspace and reused thereafter. `None`
+    /// on every `f64`-only fit, so a caller that never asks for a gradient pays
+    /// no memory and the existing alloc bounds do not move.
+    pub(crate) dual_scratch: Option<Box<super::derivative::GlmmDualScratch>>,
 }
 
 impl GlmmWorkspace {
@@ -575,6 +580,7 @@ impl GlmmWorkspace {
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
             counters: crate::counters::EvalCounters::new(),
+            dual_scratch: None,
         }
     }
 

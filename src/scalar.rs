@@ -15,6 +15,8 @@ use crate::spec::{BinomialLink, Family};
 mod sealed {
     pub trait Sealed {}
     impl Sealed for f64 {}
+    impl<const N: usize> Sealed for crate::dual::Dual<N> {}
+    impl<const N: usize, const H: usize> Sealed for crate::dual::HyperDual<N, H> {}
 }
 
 /// One scalar of the fit kernel: the arithmetic, the elementary functions and
@@ -295,6 +297,56 @@ impl Scalar for f64 {
             -1.0,
             faer::Par::Seq,
         );
+    }
+}
+
+/// Lower Cholesky by the plain column algorithm, generic over the scalar.
+/// Column-major, element `(i, j)` at `j*dim + i`; only the lower triangle of
+/// `a` is read and only the lower triangle of `l_out` is written. `false` on a
+/// non-positive or non-finite pivot, tested on the value part.
+///
+/// This is what a non-`f64` scalar uses in place of faer's blocked kernel.
+/// It is NOT bit-identical to faer and is not meant to be: `impl Scalar for f64`
+/// keeps the faer override, which is what holds the bit-identity dump.
+pub(crate) fn chol_lower_generic<T: Scalar>(a: &[T], dim: usize, l_out: &mut [T]) -> bool {
+    for j in 0..dim {
+        let mut d = a[j * dim + j];
+        for k in 0..j {
+            let l = l_out[k * dim + j];
+            d -= l * l;
+        }
+        if !(d.value().is_finite() && d.value() > 0.0) {
+            return false;
+        }
+        let ljj = d.sqrt();
+        l_out[j * dim + j] = ljj;
+        for i in (j + 1)..dim {
+            let mut s = a[j * dim + i];
+            for k in 0..j {
+                s -= l_out[k * dim + i] * l_out[k * dim + j];
+            }
+            l_out[j * dim + i] = s / ljj;
+        }
+    }
+    true
+}
+
+/// `tail(lower) -= bt · btᵀ`, generic over the scalar. `tail` is column-major
+/// `t_dim×t_dim` (lower triangle touched), `bt` column-major `t_dim×w_tot`.
+pub(crate) fn syrk_lower_sub_generic<T: Scalar>(
+    bt: &[T],
+    t_dim: usize,
+    w_tot: usize,
+    tail: &mut [T],
+) {
+    for j in 0..t_dim {
+        for i in j..t_dim {
+            let mut s = T::ZERO;
+            for k in 0..w_tot {
+                s += bt[k * t_dim + i] * bt[k * t_dim + j];
+            }
+            tail[j * t_dim + i] -= s;
+        }
     }
 }
 

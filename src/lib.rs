@@ -29,6 +29,7 @@
 #![warn(missing_docs)]
 
 pub mod consts;
+pub mod dual;
 pub mod linalg;
 pub mod scalar;
 pub mod simd_transcendental;

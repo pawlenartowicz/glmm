@@ -1,12 +1,15 @@
 use super::agq::*;
+use super::derivative::*;
 use super::deviance::*;
 use super::pirls::*;
 use super::se::*;
 use super::workspace::*;
 use super::*;
+use crate::counters::EvalCounters;
 use crate::test_support::{intercept_only_spec, TestWs};
 use crate::{
-    BinomialLink, Family, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing, WaldSe,
+    BinomialLink, Family, GammaLink, Grouping, GroupingRelation, ModelSpec, NegBinomialLink,
+    PoissonLink, ReStructure, Sizing, WaldSe,
 };
 use faer::linalg::solvers::Solve;
 
@@ -1634,6 +1637,45 @@ fn fit_glmm_structured_warm_path_bounded_alloc() {
         stats.total_blocks,
         BOUND
     );
+}
+
+/// The zero-alloc gate: unlike the two BOUND-based fits above,
+/// `laplace_gradient` claims ZERO allocation on a repeat call at the same
+/// shape (`dual_scratch` and its `GlmmModeBufs` mode-transfer pair are both
+/// sized once, on the first call, by `for_shape`) — so this asserts equality,
+/// not a bound; a bound would hide a regression back into a per-call `Vec`.
+/// Before this gate's fix, `laplace_gradient` built a fresh `saved_u` and
+/// `u_mode` `Vec` (`.to_vec()`) on EVERY call, which this test caught; both
+/// are now buffers on the dual scratch's `GlmmModeBufs` (`derivative.rs`).
+/// `#[ignore]` + `alloc_test_guard` for the same process-wide-profiler reason
+/// as the fits above.
+/// Run: `cargo test -p glmm --features alloc-tests dual_gradient_repeat_calls_allocate_nothing -- --ignored`
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn dual_gradient_repeat_calls_allocate_nothing() {
+    let _serial = crate::test_support::alloc_test_guard();
+    let (mut ws, x, y, ids, p, n) = fixture(
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        "int1",
+    );
+    let m = ws.n_theta + p;
+    let mut grad = vec![0.0; m];
+    // First call builds `dual_scratch` (six `GlmmDualBufs<Dual<4>>` `Vec`s +
+    // its `ClusterRowIndex` + its `GlmmModeBufs` pair) — measured 19 blocks
+    // (this machine, RAYON_NUM_THREADS unset) for this int1/m=3 shape. Not
+    // asserted: `for_shape`'s own allocation is a one-time, per-shape cost,
+    // never claimed zero.
+    let _ = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, p, n, &mut grad);
+    let prof = dhat::Profiler::builder().testing().build();
+    for _ in 0..3 {
+        let _ = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, p, n, &mut grad);
+    }
+    let stats = dhat::HeapStats::get();
+    drop(prof);
+    assert_eq!(stats.total_blocks, 0, "repeat dual gradient allocated");
 }
 
 /// `glmm_block_chol` factors a q×q SPD block in place to its lower Crout L,
@@ -5053,4 +5095,786 @@ fn cluster_row_index_handles_empty_cluster() {
     assert_eq!(idx.cluster_rows(0), &[0, 2]);
     assert!(idx.cluster_rows(1).is_empty());
     assert_eq!(idx.cluster_rows(2), &[1, 3]);
+}
+
+// --- `laplace_gradient`'s FD gate ---
+
+/// Family × RE-shape fixture for the gradient FD gate: reuses the blocked-path
+/// round-robin datasets' X design (`glmm_intercept_dataset` for `"int1"`,
+/// n_theta=1; `glmm_slope_noextra_dataset` for `"q2s"`, n_theta=3), but
+/// regenerates y in the family's own domain — Bernoulli for Binomial (every
+/// link shares the same 0/1 domain), positive counts for Poisson/
+/// NegativeBinomial, positive reals for Gamma — from a shape-keyed LCG stream,
+/// so every cell is reproducible and none of the y values sit outside the
+/// family's support regardless of which θ draw the gate later perturbs around.
+/// NB's dispersion (`ws.nb_theta`) is held at a fixed constant: the gradient
+/// this gate checks is with respect to `ws.params = [θ | β]` only.
+fn fixture(
+    family: Family,
+    shape: &str,
+) -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u32>, usize, usize) {
+    fixture_with_nagq(family, shape, 1)
+}
+
+/// `fixture`, generalized over `nagq` — the AGQ gate tests need
+/// `ws.agq_scratch` (and `ws.dual_scratch`'s eventual AGQ node table) sized
+/// for `nagq > 1` from construction, which only `for_cluster_spec`'s own
+/// `nagq` argument controls (`workspace.rs:415-427`); setting `ws.nagq` after
+/// the fact would leave `agq_scratch` sized for the wrong `k`. `fixture`
+/// itself is the `nagq = 1` case, unchanged.
+fn fixture_with_nagq(
+    family: Family,
+    shape: &str,
+    nagq: u8,
+) -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u32>, usize, usize) {
+    let (xf64, ids, n_clusters, slope_cols, seed): (Mat<f64>, Vec<u32>, u32, Vec<usize>, u64) =
+        match shape {
+            "int1" => {
+                let (x, _y, ids) = glmm_intercept_dataset();
+                (x, ids, 8, vec![], 4001)
+            }
+            "q2s" => {
+                let (x, _y, ids) = glmm_slope_noextra_dataset();
+                (x, ids, 8, vec![1], 4002)
+            }
+            other => panic!("unknown gradient-gate shape {other}"),
+        };
+    let n = xf64.nrows();
+    let p = 2usize;
+    let mut y = vec![0.0f64; n];
+    let mut st = seed;
+    for i in 0..n {
+        let x1 = xf64[(i, 1)];
+        let eta = 0.2 + 0.8 * x1;
+        let noise = 0.4 + 1.6 * (lcg(&mut st) + 0.5); // in [0.4, 2.0]
+        y[i] = match family {
+            Family::Binomial { .. } => {
+                let mu = 1.0 / (1.0 + (-eta).exp());
+                if lcg(&mut st) + 0.5 < mu {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Family::Poisson { .. } | Family::NegativeBinomial { .. } => {
+                let mu = eta.exp().min(20.0);
+                (mu * noise).round().max(0.0)
+            }
+            Family::Gamma { .. } => eta.exp() * noise,
+            other => panic!("gradient-gate fixture: family {other:?} not wired"),
+        };
+    }
+    let model = ModelSpec {
+        family,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters },
+            slopes: slope_cols.iter().map(|&c| c as u32).collect(),
+            extra_groupings: vec![],
+        }),
+    };
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, nagq);
+    if matches!(family, Family::NegativeBinomial { .. }) {
+        ws.nb_theta = 4.0;
+    }
+    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
+    (ws, xf64, y, ids, p, n)
+}
+
+/// `fixture`, widened by `extra_p` synthetic zero-truth predictor columns
+/// (small noise, no signal) so `m` crosses into the `Dual<12>` band — one
+/// gate cell needs to exercise `N = 12` numerically, not only via
+/// the speed-grid's padded timing run.
+fn fixture_padded(
+    family: Family,
+    shape: &str,
+    extra_p: usize,
+) -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u32>, usize, usize) {
+    let (_ws0, x0, y, ids, p0, n) = fixture(family, shape);
+    let p = p0 + extra_p;
+    let mut x = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        x[(i, 0)] = x0[(i, 0)];
+        x[(i, 1)] = x0[(i, 1)];
+    }
+    let mut st = 7777u64;
+    for i in 0..n {
+        for c in p0..p {
+            x[(i, c)] = 0.3 * lcg(&mut st);
+        }
+    }
+    let slope_cols: Vec<usize> = match shape {
+        "q2s" => vec![1],
+        "int1" => vec![],
+        other => panic!("unknown gradient-gate shape {other}"),
+    };
+    let model = ModelSpec {
+        family,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            slopes: slope_cols.iter().map(|&c| c as u32).collect(),
+            extra_groupings: vec![],
+        }),
+    };
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
+    if matches!(family, Family::NegativeBinomial { .. }) {
+        ws.nb_theta = 4.0;
+    }
+    build_z(&mut ws, x.as_ref(), &ids, &[], n);
+    (ws, x, y, ids, p, n)
+}
+
+/// Ten fixed-seed θ draws per RE shape for the gradient FD gate, β pinned at
+/// the design's own true coefficients — the `0.2 + 0.8·x1` linear predictor
+/// every `fixture` y is generated from. Diagonal θ lanes (vech(Λ) diagonal)
+/// are drawn positive; off-diagonal lanes are unconstrained — Λ need not be
+/// PD itself, only D = ΛΛ' is, and that holds for any off-diagonal value.
+struct FixedSeedTheta {
+    state: u64,
+    n_theta: usize,
+    diag: &'static [usize],
+    beta: Vec<f64>,
+}
+
+impl FixedSeedTheta {
+    fn next_params(&mut self) -> Vec<f64> {
+        let mut out = vec![0.0f64; self.n_theta + self.beta.len()];
+        #[allow(clippy::needless_range_loop)]
+        for j in 0..self.n_theta {
+            let r = lcg(&mut self.state);
+            out[j] = if self.diag.contains(&j) {
+                0.3 + 0.4 * (r + 0.5) // in [0.3, 0.7]
+            } else {
+                0.5 * r // in [-0.25, 0.25]
+            };
+        }
+        out[self.n_theta..].copy_from_slice(&self.beta);
+        out
+    }
+}
+
+fn fixed_seed_theta(shape: &str) -> FixedSeedTheta {
+    match shape {
+        "int1" => FixedSeedTheta {
+            state: 5001,
+            n_theta: 1,
+            diag: &[0],
+            beta: vec![0.2, 0.8],
+        },
+        "q2s" => FixedSeedTheta {
+            state: 5002,
+            n_theta: 3,
+            diag: &[0, 2],
+            beta: vec![0.2, 0.8],
+        },
+        other => panic!("unknown gradient-gate shape {other}"),
+    }
+}
+
+/// `fixed_seed_theta`, β widened with `extra_p` small fixed synthetic
+/// coefficients for `fixture_padded`'s extra zero-truth columns.
+fn fixed_seed_theta_padded(shape: &str, extra_p: usize) -> FixedSeedTheta {
+    let mut rng = fixed_seed_theta(shape);
+    let mut st = 8888u64;
+    for _ in 0..extra_p {
+        rng.beta.push(0.1 * lcg(&mut st));
+    }
+    rng
+}
+
+/// `{Binomial-logit, Binomial-probit, Binomial-cloglog, Poisson-log,
+/// Gamma-log, NegativeBinomial}` × `{int1, q2s}` — the family/shape product
+/// the gradient FD gate runs. `int1` (n_θ=1) and `q2s` (n_θ=3) are the only
+/// GLMM-reachable blocked shapes among the speed-grid catalogue's four:
+/// `nest2` is nested (extras non-empty, routes to `pirls_solve_blocked_extras`
+/// — `Unsupported` by the routing gate, nothing for an FD gate to compare) and
+/// `q3s` carries `glmm = FALSE` in the same catalogue (never fit as a GLMM, no
+/// GLMM fixture exists). Binomial-cloglog is added in their place: a
+/// post-0.3.1 GLMM-validated link, non-canonical (exercises the refinement
+/// loop), and the only caller of `Scalar::exp_m1`.
+const GRADIENT_GATE_CELLS: &[(Family, &str)] = &[
+    (
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        "int1",
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        "q2s",
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        "int1",
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        "q2s",
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        "int1",
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        "q2s",
+    ),
+    (
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        "int1",
+    ),
+    (
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        "q2s",
+    ),
+    (
+        Family::Gamma {
+            link: GammaLink::Log,
+        },
+        "int1",
+    ),
+    (
+        Family::Gamma {
+            link: GammaLink::Log,
+        },
+        "q2s",
+    ),
+    (
+        Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+        "int1",
+    ),
+    (
+        Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+        "q2s",
+    ),
+];
+
+/// Shared per-draw body of the gradient FD gate: `n_draws` fixed-seed θ (+
+/// fixed β) draws, each checked coordinate-by-coordinate against a central FD
+/// stencil of the SAME blocked Laplace deviance `laplace_gradient`
+/// differentiates. Step: `h = 1e-5` absolute on θ, `1e-5·max(1, |β_k|)` on β
+/// (`FD_STEP_BASE`'s asymmetry is calibrated against the FD-Hessian noise
+/// floor, not a first difference — this uses its own steps). Band: 1e-6
+/// relative. Both run at the CALLER's `ws.pirls_tol_override` (the gate sets
+/// `Some(1e-12)` — see `dual_gradient_matches_central_fd_per_family_and_shape`'s
+/// doc comment for why the tolerance is tightened this far).
+#[allow(clippy::too_many_arguments)]
+fn assert_dual_gradient_matches_fd(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    p: usize,
+    n: usize,
+    family: Family,
+    shape: &str,
+    n_draws: usize,
+    mut rng: FixedSeedTheta,
+) {
+    let no_extras: [Vec<u32>; 0] = [];
+    let m = ws.n_theta + p;
+    let kk = ws.k.max(1);
+    let mut ctrs = EvalCounters::new();
+    for _ in 0..n_draws {
+        ws.params[..m].copy_from_slice(&rng.next_params());
+        let saved: Vec<f64> = ws.params[..m].to_vec();
+        let mut grad = vec![0.0; m];
+        let st = laplace_gradient(ws, x, y, ids, p, n, &mut grad);
+        assert!(
+            matches!(st, DerivStatus::Ok(_)),
+            "{family:?}/{shape} did not converge"
+        );
+        for k in 0..m {
+            let h = if k < ws.n_theta {
+                1e-5
+            } else {
+                1e-5 * saved[k].abs().max(1.0)
+            };
+            // Cold-start `ws.u` (mirrors `laplace_deviance_at`'s own default
+            // seed) before EACH directional eval, rather than letting it carry
+            // over from the previous eval's converged mode: `laplace_deviance_ws`
+            // seeds nothing itself, so an un-reset `u` chains a growing
+            // warm-start history across the whole draw × coordinate loop, and
+            // PIRLS's OWN convergence band (`tol`, however tight) is a band on
+            // the mixed deviance, not on `u` — two warm starts can converge to
+            // the same `mixed` to 1e-12 while `u` itself, and so the deviance
+            // AT A DIFFERENT NEARBY θ, differ by more than that. Measured: on
+            // this cell (Binomial-cloglog), an un-reset `u` puts the FD/dual
+            // gap as high as ~1.5e-6 relative (over the 1e-6 band); resetting
+            // to zero here brings every draw back to ~1e-9.
+            for v in ws.u[..kk].iter_mut() {
+                *v = 0.0;
+            }
+            ws.params[k] = saved[k] + h;
+            ws.beta_rhs[..p].copy_from_slice(&ws.params[ws.n_theta..m]);
+            let fp = laplace_deviance_ws(ws, x, y, ids, &no_extras, n, false, &mut ctrs);
+            for v in ws.u[..kk].iter_mut() {
+                *v = 0.0;
+            }
+            ws.params[k] = saved[k] - h;
+            ws.beta_rhs[..p].copy_from_slice(&ws.params[ws.n_theta..m]);
+            let fm = laplace_deviance_ws(ws, x, y, ids, &no_extras, n, false, &mut ctrs);
+            ws.params[k] = saved[k];
+            let fd = (fp - fm) / (2.0 * h);
+            assert!(
+                (grad[k] - fd).abs() <= 1e-6 * fd.abs().max(1.0),
+                "{family:?}/{shape} coord {k}: dual {} vs fd {fd}",
+                grad[k]
+            );
+        }
+    }
+}
+
+/// Central FD of the Laplace deviance against the dual gradient, per family and
+/// per RE shape, at a TIGHTENED PIRLS tolerance.
+///
+/// Why the tolerance is tightened: at the production 1e-9 band the PIRLS mode
+/// carries an O(1e-5) positional error, and a gradient inherits it at first
+/// order — an FD/analytic mismatch there would be the mode's error, not the
+/// chain rule's. Forcing 1e-12 tests the math. Same reasoning the parked
+/// gradient spec's validation section gives; the switch already exists as
+/// `ws.pirls_tol_override`.
+#[test]
+fn dual_gradient_matches_central_fd_per_family_and_shape() {
+    for &(family, shape) in GRADIENT_GATE_CELLS {
+        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+        ws.pirls_tol_override = Some(1e-12);
+        let rng = fixed_seed_theta(shape);
+        assert_dual_gradient_matches_fd(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            p,
+            n,
+            family,
+            shape,
+            10,
+            rng,
+        );
+        ws.pirls_tol_override = None;
+    }
+}
+
+/// One gate cell padded past `m = 8` so `Dual<12>` is exercised by a numerical
+/// gradient check, not only by the speed-grid's padded timing run. `q2s`
+/// (n_θ=3) padded by 7 zero-truth columns (`p = 2 + 7 = 9`) lands exactly on
+/// `m = 12`.
+#[test]
+fn dual_gradient_matches_central_fd_padded_to_n12() {
+    let family = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let shape = "q2s";
+    let extra_p = 7;
+    let (mut ws, x, y, ids, p, n) = fixture_padded(family, shape, extra_p);
+    ws.pirls_tol_override = Some(1e-12);
+    let m = ws.n_theta + p;
+    assert_eq!(m, 12, "padding must land exactly on the N=12 band");
+    let rng = fixed_seed_theta_padded(shape, extra_p);
+    assert_dual_gradient_matches_fd(&mut ws, x.as_ref(), &y, &ids, p, n, family, shape, 10, rng);
+    ws.pirls_tol_override = None;
+}
+
+/// Shared per-draw body of the Hessian FD gate: `n_draws` fixed-seed θ (+
+/// fixed β) draws. `laplace_hessian`'s Hessian is checked against a central
+/// FD stencil of `laplace_gradient`'s ANALYTIC gradient — not a second
+/// difference of the deviance itself — matching how `laplace_hessian` is
+/// built (both objectives come off the same kernel calls). Step and band as
+/// the gradient gate above. Every gradient eval also cold-starts `ws.u` first
+/// (same reason as `assert_dual_gradient_matches_fd`'s directional evals: the
+/// `f64` mode solve underneath `laplace_gradient` warm-starts from whatever
+/// `ws.u` currently holds, and the plus/minus evals need to land in the same
+/// basin for their difference to be the smooth branch's curvature). Also
+/// asserts `hess[(i, j)] == hess[(j, i)]` exactly (`==`, no band) — both
+/// entries are copies of the same packed `h` slot.
+#[allow(clippy::too_many_arguments)]
+fn assert_dual_hessian_matches_fd_of_gradient(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    p: usize,
+    n: usize,
+    family: Family,
+    shape: &str,
+    n_draws: usize,
+    mut rng: FixedSeedTheta,
+) {
+    let m = ws.n_theta + p;
+    let kk = ws.k.max(1);
+    for _ in 0..n_draws {
+        ws.params[..m].copy_from_slice(&rng.next_params());
+        let saved: Vec<f64> = ws.params[..m].to_vec();
+        let mut grad = vec![0.0; m];
+        let mut hess = Mat::<f64>::zeros(m, m);
+        let st = laplace_hessian(ws, x, y, ids, p, n, &mut grad, &mut hess);
+        assert!(
+            matches!(st, DerivStatus::Ok(_)),
+            "{family:?}/{shape} did not converge"
+        );
+
+        for i in 0..m {
+            for j in 0..m {
+                assert_eq!(
+                    hess[(i, j)],
+                    hess[(j, i)],
+                    "{family:?}/{shape} hess[{i}][{j}] vs hess[{j}][{i}]"
+                );
+            }
+        }
+
+        for k in 0..m {
+            let h = if k < ws.n_theta {
+                1e-5
+            } else {
+                1e-5 * saved[k].abs().max(1.0)
+            };
+            for v in ws.u[..kk].iter_mut() {
+                *v = 0.0;
+            }
+            ws.params[k] = saved[k] + h;
+            let mut grad_p = vec![0.0; m];
+            let stp = laplace_gradient(ws, x, y, ids, p, n, &mut grad_p);
+            assert!(
+                matches!(stp, DerivStatus::Ok(_)),
+                "{family:?}/{shape} coord {k} (+h) did not converge"
+            );
+            for v in ws.u[..kk].iter_mut() {
+                *v = 0.0;
+            }
+            ws.params[k] = saved[k] - h;
+            let mut grad_m = vec![0.0; m];
+            let stm = laplace_gradient(ws, x, y, ids, p, n, &mut grad_m);
+            assert!(
+                matches!(stm, DerivStatus::Ok(_)),
+                "{family:?}/{shape} coord {k} (-h) did not converge"
+            );
+            ws.params[k] = saved[k];
+
+            for row in 0..m {
+                let fd = (grad_p[row] - grad_m[row]) / (2.0 * h);
+                assert!(
+                    (hess[(row, k)] - fd).abs() <= 1e-5 * fd.abs().max(1.0),
+                    "{family:?}/{shape} hess[{row}][{k}]: analytic {} vs fd-of-grad {fd}",
+                    hess[(row, k)]
+                );
+            }
+        }
+    }
+}
+
+/// Central FD of `laplace_gradient` against `laplace_hessian`, per family and
+/// per RE shape, at a TIGHTENED PIRLS tolerance — same reasoning and same
+/// tolerance as `dual_gradient_matches_central_fd_per_family_and_shape`.
+#[test]
+fn dual_hessian_matches_central_fd_of_gradient_per_family_and_shape() {
+    for &(family, shape) in GRADIENT_GATE_CELLS {
+        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+        ws.pirls_tol_override = Some(1e-12);
+        let rng = fixed_seed_theta(shape);
+        assert_dual_hessian_matches_fd_of_gradient(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            p,
+            n,
+            family,
+            shape,
+            10,
+            rng,
+        );
+        ws.pirls_tol_override = None;
+    }
+}
+
+/// One gate cell padded past `m = 8` so `HyperDual<12, 78>` is exercised by a
+/// numerical Hessian check — mirrors `dual_gradient_matches_central_fd_padded_to_n12`.
+#[test]
+fn dual_hessian_matches_central_fd_of_gradient_padded_to_n12() {
+    let family = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let shape = "q2s";
+    let extra_p = 7;
+    let (mut ws, x, y, ids, p, n) = fixture_padded(family, shape, extra_p);
+    ws.pirls_tol_override = Some(1e-12);
+    let m = ws.n_theta + p;
+    assert_eq!(m, 12, "padding must land exactly on the N=12 band");
+    let rng = fixed_seed_theta_padded(shape, extra_p);
+    assert_dual_hessian_matches_fd_of_gradient(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        p,
+        n,
+        family,
+        shape,
+        10,
+        rng,
+    );
+    ws.pirls_tol_override = None;
+}
+
+// --- The AGQ branch inside `laplace_gradient`/`laplace_hessian` ---
+
+/// `{Binomial-logit, Poisson-log} × {int1, q2s}`, each paired with the `nagq`
+/// the speed-grid's AGQ-eligible cells use (`validation/campaigns/speed-grid/prep.R:297`,
+/// `:309`) — `int1` at `k=7`, `q2s` at `k=5`. Both families/shapes satisfy the
+/// AGQ gate mirrored in `derivative.rs` (`nagq > 1 && extra_offsets.is_empty()
+/// && (1..=3).contains(&primary_q) && Binomial|Poisson`) and are canonical
+/// links, so these cells exercise `agq_deviance` (`int1`, `q_p==1`) and
+/// `agq_deviance_vec` (`q2s`, `q_p==2`) without touching the refinement loop —
+/// that loop is `canonical`-gated, orthogonal to AGQ routing, and already
+/// covered by the gradient/Hessian FD gates' own non-canonical cells.
+const AGQ_GATE_CELLS: &[(Family, &str, u8)] = &[
+    (
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        "int1",
+        7,
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        "q2s",
+        5,
+    ),
+    (
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        "int1",
+        7,
+    ),
+    (
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        "q2s",
+        5,
+    ),
+];
+
+/// Central FD of the AGQ deviance against the dual gradient, per
+/// `AGQ_GATE_CELLS` cell, at the same tightened PIRLS tolerance as the
+/// gradient FD gate. Reuses `assert_dual_gradient_matches_fd` verbatim: its FD reference
+/// (`laplace_deviance_ws`) already routes through the production AGQ gate at
+/// `ws.nagq > 1` (`deviance.rs:245`, unmodified), so it evaluates the SAME
+/// AGQ objective `laplace_gradient`'s own AGQ branch differentiates — no new
+/// FD evaluator needed.
+#[test]
+fn agq_dual_gradient_matches_central_fd() {
+    for &(family, shape, nagq) in AGQ_GATE_CELLS {
+        let (mut ws, x, y, ids, p, n) = fixture_with_nagq(family, shape, nagq);
+        ws.pirls_tol_override = Some(1e-12);
+        let rng = fixed_seed_theta(shape);
+        assert_dual_gradient_matches_fd(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            p,
+            n,
+            family,
+            shape,
+            10,
+            rng,
+        );
+        ws.pirls_tol_override = None;
+    }
+}
+
+/// Central FD of `agq_dual_gradient_matches_central_fd`'s own analytic
+/// gradient against the dual Hessian, per `AGQ_GATE_CELLS` cell — mirrors
+/// `agq_dual_gradient_matches_central_fd`, reusing
+/// `assert_dual_hessian_matches_fd_of_gradient` verbatim for the same reason.
+#[test]
+fn agq_dual_hessian_matches_central_fd() {
+    for &(family, shape, nagq) in AGQ_GATE_CELLS {
+        let (mut ws, x, y, ids, p, n) = fixture_with_nagq(family, shape, nagq);
+        ws.pirls_tol_override = Some(1e-12);
+        let rng = fixed_seed_theta(shape);
+        assert_dual_hessian_matches_fd_of_gradient(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            p,
+            n,
+            family,
+            shape,
+            10,
+            rng,
+        );
+        ws.pirls_tol_override = None;
+    }
+}
+
+/// AGQ gate, family clause: Gamma is not `Binomial|Poisson`, so the gate
+/// stays closed regardless of `nagq` — `laplace_gradient` takes the same
+/// blocked-path route at `nagq = 1` and `nagq = 7`. Two independently built
+/// workspaces at the same params, one at each `nagq`, must therefore return
+/// bit-identical (`==` every lane) gradients: the AGQ condition is evaluated
+/// on every call but never taken, and evaluating it introduces no
+/// nondeterminism into the blocked route.
+#[test]
+fn agq_gate_stays_closed_on_family_exclusion() {
+    let family = Family::Gamma {
+        link: GammaLink::Log,
+    };
+    let shape = "int1";
+    let params = fixed_seed_theta(shape).next_params();
+
+    let (mut ws_a, xa, ya, ids_a, p, n) = fixture_with_nagq(family, shape, 1);
+    let (mut ws_b, xb, yb, ids_b, _, _) = fixture_with_nagq(family, shape, 7);
+    let m = ws_a.n_theta + p;
+    ws_a.params[..m].copy_from_slice(&params);
+    ws_b.params[..m].copy_from_slice(&params);
+
+    let mut grad_a = vec![0.0; m];
+    let mut grad_b = vec![0.0; m];
+    let st_a = laplace_gradient(&mut ws_a, xa.as_ref(), &ya, &ids_a, p, n, &mut grad_a);
+    let st_b = laplace_gradient(&mut ws_b, xb.as_ref(), &yb, &ids_b, p, n, &mut grad_b);
+    assert!(matches!(st_a, DerivStatus::Ok(_)));
+    assert!(matches!(st_b, DerivStatus::Ok(_)));
+    assert_eq!(
+        grad_a, grad_b,
+        "Gamma is outside the AGQ gate's family clause — nagq must not change the route"
+    );
+}
+
+/// AGQ gate, `nagq` clause: Binomial-logit `int1` satisfies every OTHER gate
+/// clause, so `nagq = 1` keeps the gate closed (blocked route) while
+/// `nagq = 7` opens it (`agq_deviance` route) — two different objectives, so
+/// at least one gradient lane must differ. Paired with
+/// `agq_gate_stays_closed_on_family_exclusion` above, this pins both halves
+/// of the gate condition at the derivative level: family alone cannot open
+/// it, and `nagq` alone (on an eligible family/shape) does.
+#[test]
+fn agq_gate_opens_on_eligible_family_and_nagq() {
+    let family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let shape = "int1";
+    let params = fixed_seed_theta(shape).next_params();
+
+    let (mut ws_a, xa, ya, ids_a, p, n) = fixture_with_nagq(family, shape, 1);
+    let (mut ws_b, xb, yb, ids_b, _, _) = fixture_with_nagq(family, shape, 7);
+    let m = ws_a.n_theta + p;
+    ws_a.params[..m].copy_from_slice(&params);
+    ws_b.params[..m].copy_from_slice(&params);
+
+    let mut grad_a = vec![0.0; m];
+    let mut grad_b = vec![0.0; m];
+    let st_a = laplace_gradient(&mut ws_a, xa.as_ref(), &ya, &ids_a, p, n, &mut grad_a);
+    let st_b = laplace_gradient(&mut ws_b, xb.as_ref(), &yb, &ids_b, p, n, &mut grad_b);
+    assert!(matches!(st_a, DerivStatus::Ok(_)));
+    assert!(matches!(st_b, DerivStatus::Ok(_)));
+    assert!(
+        grad_a.iter().zip(&grad_b).any(|(a, b)| a != b),
+        "nagq=1 (blocked) and nagq=7 (AGQ) must not evaluate the same objective: \
+         grad_a={grad_a:?}, grad_b={grad_b:?}"
+    );
+}
+
+/// Wiring sanity check, not a gate (W3 owns the production replacement and
+/// its bands): on one converged `int1` binomial fit, `laplace_hessian`'s β
+/// block (rows/cols `n_theta..m`), inverted and ×2 for the deviance-Hessian
+/// -> information convention (`se.rs:121`), should agree with
+/// `fd_hessian_cov`'s covariance (`WaldSe::Hessian`'s own `2·(H_dev⁻¹)_ββ`
+/// convention, `mod.rs:254`) to within a generous relative band — both are
+/// approximations of the same quantity from two different differentiation
+/// schemes (exact dual vs `fd_hessian_cov`'s own FD stencil), so the two are
+/// not expected to be bit-identical.
+///
+/// Measured worst per-entry relative gap: 4.2e-7 (2026-09-01) — two orders of
+/// magnitude inside the 1e-4 band, which is generous on purpose since the two
+/// paths differ in more than rounding (exact dual second derivatives vs
+/// `fd_hessian_cov`'s own central-difference stencil at a different PIRLS
+/// tolerance chain).
+#[test]
+fn laplace_hessian_beta_block_matches_fd_hessian_cov_int1_binomial() {
+    let family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let shape = "int1";
+    let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+
+    let fit = fit_glmm(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &[],
+        &[],
+        None,
+        &vec![0.0; p],
+        n,
+        WaldSe::Rx,
+    );
+    assert!(fit.converged, "fixture fit must converge");
+    let m = ws.n_theta + p;
+    let n_theta = ws.n_theta;
+
+    let mut cov_fd = Mat::<f64>::zeros(p, p);
+    let status = fd_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
+    assert_eq!(status, FdHessianStatus::Ok);
+
+    let mut grad = vec![0.0; m];
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let st = laplace_hessian(&mut ws, x.as_ref(), &y, &ids, p, n, &mut grad, &mut hess);
+    assert!(
+        matches!(st, DerivStatus::Ok(_)),
+        "laplace_hessian must converge at the fit's optimum"
+    );
+
+    // `fd_hessian_cov` inverts the WHOLE joint (θ,β) Hessian and reads off the
+    // β-β block of THAT inverse — the marginal β covariance, which folds in
+    // the θ-β correlation the Hessian carries. Inverting only the β-β
+    // sub-block (the conditional covariance) is a different quantity and
+    // does not match; the joint inverse below is what `WaldSe::Hessian`'s
+    // `2·(H_dev⁻¹)_ββ` convention (`mod.rs:254`) actually means.
+    let chol = hess
+        .as_ref()
+        .llt(faer::Side::Lower)
+        .expect("joint deviance Hessian must be PD at a converged fit");
+    let mut inv = Mat::<f64>::identity(m, m);
+    chol.solve_in_place(inv.as_mut());
+
+    let mut worst_rel = 0.0f64;
+    for a in 0..p {
+        for b in 0..p {
+            let ours = 2.0 * inv[(n_theta + a, n_theta + b)]; // info = hess/2, cov = info^-1 = 2*hess^-1
+            let theirs = cov_fd[(a, b)];
+            let rel = (ours - theirs).abs() / theirs.abs().max(1.0);
+            worst_rel = worst_rel.max(rel);
+            assert!(
+                rel < 1e-4,
+                "cov[{a}][{b}]: laplace_hessian-derived {ours} vs fd_hessian_cov {theirs} (rel {rel})"
+            );
+        }
+    }
+    let _ = worst_rel; // measured value recorded in the doc comment above
 }

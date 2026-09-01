@@ -1,6 +1,8 @@
 //! Unit tests for `lmm::kernel` and `lmm` (dispatch, workspace, BOBYQA config, joint Wald).
 
+use super::kernel::{reml_gradient, reml_hessian, LmmDualScratch, LmmHyperScratch};
 use super::*;
+use crate::glmm::DerivStatus;
 use crate::test_support::{extra_level_of_row, intercept_only_spec, model_atom};
 use crate::{Family, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing};
 
@@ -2466,4 +2468,604 @@ fn lmm_fit_slope_warm_path_bounded_alloc() {
         N_CALLS,
         BOUND_SLOPE
     );
+}
+
+// -----------------------------------------------------------------------
+// Task 10: LMM REML dual gradient/Hessian vs. `dense_reml_score`, a
+// hand-written verification reference sharing no code with the blocked
+// kernel. Gate fixtures reuse the existing int1/nest2/q2s/q3s LMM shapes
+// already built above in this module.
+// -----------------------------------------------------------------------
+
+/// Dense `n × k` RE design Z for [`dense_reml_score`]. LEVEL-major column
+/// order in the primary block (`f·q + c`) — matching that function's own Λ
+/// packing, NOT `LmmGroupings`'s own scattered `d·n_primary + f` convention
+/// (see `dense_reml_score`'s doc comment on Λ). Extra groupings (`q_g == 1`
+/// only, matching every gate fixture) get one one-hot column per level,
+/// declaration order, right after the primary block. Z and Λ agreeing on this
+/// ordering is what keeps `V = I + ZΛΛᵀZᵀ` correct; the two orderings agree
+/// up to a simultaneous column permutation of Z and Λ, so using an
+/// independent one here (rather than `LmmGroupings`'s own) is the point —
+/// the reference shares no code path with the kernel.
+fn dense_z(
+    groupings: &LmmGroupings,
+    primary_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    x: &Mat<f64>,
+    slope_cols: &[usize],
+) -> Mat<f64> {
+    let n = primary_ids.len();
+    let q = groupings.primary_q;
+    let s = groupings.n_primary;
+    let prim_width = q * s;
+    let extra_widths: Vec<usize> = extra_ids
+        .iter()
+        .map(|ids| ids.iter().copied().max().map_or(0, |m| m as usize + 1))
+        .collect();
+    let k = prim_width + extra_widths.iter().sum::<usize>();
+    let mut z = Mat::<f64>::zeros(n, k);
+    for i in 0..n {
+        let f = primary_ids[i] as usize;
+        z[(i, f * q)] = 1.0;
+        for (d, &sc) in slope_cols.iter().enumerate() {
+            z[(i, f * q + 1 + d)] = x[(i, sc)];
+        }
+    }
+    let mut off = prim_width;
+    for (e, ids) in extra_ids.iter().enumerate() {
+        for i in 0..n {
+            z[(i, off + ids[i] as usize)] = 1.0;
+        }
+        off += extra_widths[e];
+    }
+    z
+}
+
+/// Dense REML score, the verification reference for `reml_gradient`.
+///
+/// **The criterion it differentiates**, matching `reml_deviance`'s own
+/// normalization comment (`src/lmm/kernel.rs:739–742`) exactly:
+///
+///   `d(θ) = log|V| + log|XᵀV⁻¹X| + (N−P)·log σ̂²`,  `V = I + ZΛΛᵀZᵀ`
+///
+/// Two things about that statement decide the score's form and both are easy to
+/// get wrong. First, `V` is the σ²-FREE relative covariance — σ² is not a
+/// parameter of `V`, it is profiled out as `σ̂² = yᵀPy/(N−P)` and re-enters only
+/// through the third term. Second, the criterion carries NO additive Gaussian
+/// REML constant: no `(N−P)log 2π`, no `+(N−P)`. lme4's `REMLcrit` does carry
+/// it, which is why the speed-grid's `analyze.R` adds it back before comparing.
+/// A reference that includes it would still have the right SCORE (a constant
+/// differentiates away) but would not let the deviance values be compared, so
+/// write the criterion without it and say so.
+///
+/// With `P = V⁻¹ − V⁻¹X(XᵀV⁻¹X)⁻¹XᵀV⁻¹`, `∂(log|V| + log|XᵀV⁻¹X|)/∂θ_j =
+/// tr(P V_j)` and `∂(yᵀPy)/∂θ_j = −yᵀP V_j P y`, so
+///
+///   `∂d/∂θ_j = tr(P V_j) − (N−P)·(yᵀP V_j P y)/(yᵀPy)`
+///
+/// (Harville 1977 eq. 4; the same identity AI-REML differentiates — Gilmour,
+/// Thompson & Cullis 1995 §2). The `(N−P)/(yᵀPy)` factor is the profiled σ̂²'s
+/// contribution; dropping it gives the score of the criterion at fixed σ² = 1,
+/// which is a different function and will miss the 1e-8 band everywhere.
+/// `Py = Pr` with `r = y − Xβ̂_GLS`, since `PX = 0`.
+///
+/// Every matrix is formed densely and factored with faer: O(n³) is fine for a
+/// test fixture at n ≤ 200, and the point is that this shares no code path with
+/// the blocked kernel.
+///
+/// `z` is the dense `n × k` RE design, `x` the `n × p` fixed design, `theta` the
+/// vech-packed Cholesky parameters. Returns `n_theta` entries in `theta`'s order.
+#[cfg(test)]
+fn dense_reml_score(
+    theta: &[f64],
+    z: MatRef<f64>,
+    x: MatRef<f64>,
+    y: &[f64],
+    groupings: &LmmGroupings,
+) -> Vec<f64> {
+    use faer::linalg::solvers::Solve;
+    let (n, k) = (z.nrows(), z.ncols());
+    let p = x.ncols();
+    let q = groupings.primary_q;
+    let s = groupings.n_primary;
+    let n_theta = theta.len();
+
+    // 1. Λ (k×k) from theta. The packing is `primary_lambda`'s
+    //    (`src/lmm/mod.rs:1051`), rebuilt here rather than called so the
+    //    reference shares nothing with the kernel: theta is column-major vech
+    //    of a LOWER-triangular q×q block, enumerated column c outer, row r ≥ c
+    //    inner, i.e. theta[t] ↦ Λ_p[(r, c)] for t = 0, 1, 2, … over
+    //    (c, r) = (0,0), (0,1), …, (0,q−1), (1,1), …, (q−1,q−1).
+    //    Λ is that q×q block repeated on the diagonal once per primary level,
+    //    followed by one scalar θ per extra grouping level (q_g == 1 on every
+    //    extra in the gate cells), in declaration order.
+    let mut lam = Mat::<f64>::zeros(k, k);
+    let mut slot = vec![(0usize, 0usize); theta.len()]; // theta index → (r, c) in the q×q block
+    {
+        let mut t = 0;
+        for c in 0..q {
+            for r in c..q {
+                slot[t] = (r, c);
+                t += 1;
+            }
+        }
+    }
+    let prim_theta = q * (q + 1) / 2;
+    for f in 0..s {
+        for (t, &(r, c)) in slot[..prim_theta].iter().enumerate() {
+            lam[(f * q + r, f * q + c)] = theta[t];
+        }
+    }
+    // Extra groupings: one scalar θ per level, own diagonal band — matches
+    // `dense_z`'s column order (primary block first, then each extra grouping
+    // in declaration order). q_g == 1 on every gate fixture.
+    let mut extras: Vec<(usize, usize, usize)> = Vec::new(); // (vech_start, n_levels, lam_col_offset)
+    let mut off = q * s;
+    if let Some(nf) = groupings.nested {
+        debug_assert_eq!(nf.q, 1, "dense_reml_score only covers q_g == 1 extras");
+        let n_levels = s * groupings.nested_per_parent;
+        extras.push((nf.vech_start, n_levels, off));
+        off += n_levels;
+    }
+    for cf in &groupings.crossed {
+        debug_assert_eq!(cf.q, 1, "dense_reml_score only covers q_g == 1 extras");
+        extras.push((cf.vech_start, cf.n_levels, off));
+        off += cf.n_levels;
+    }
+    debug_assert_eq!(off, k, "z's columns must match the groupings layout");
+    for &(vs, n_levels, lam_off) in &extras {
+        for l in 0..n_levels {
+            lam[(lam_off + l, lam_off + l)] = theta[vs];
+        }
+    }
+
+    // 2. V = I + Z Λ Λᵀ Zᵀ. σ² is NOT here — it profiles out (see above).
+    let mut zl = Mat::<f64>::zeros(n, k);
+    for i in 0..n {
+        for c in 0..k {
+            let mut acc = 0.0;
+            for mm in 0..k {
+                acc += z[(i, mm)] * lam[(mm, c)];
+            }
+            zl[(i, c)] = acc;
+        }
+    }
+    let mut v = Mat::<f64>::zeros(n, n);
+    for i in 0..n {
+        v[(i, i)] = 1.0;
+    }
+    for i in 0..n {
+        for j in 0..n {
+            let mut acc = 0.0;
+            for c in 0..k {
+                acc += zl[(i, c)] * zl[(j, c)];
+            }
+            v[(i, j)] += acc;
+        }
+    }
+
+    // 3. Vi applied to X, Z, y through one Cholesky factorization — Vi is
+    //    never formed as an explicit n×n inverse; XtViX and its own Cholesky
+    //    solve the GLS step.
+    let vc = v
+        .as_ref()
+        .llt(faer::Side::Lower)
+        .expect("V must be SPD at a valid θ draw");
+    let mut vix = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        for a in 0..p {
+            vix[(i, a)] = x[(i, a)];
+        }
+    }
+    vc.solve_in_place(vix.as_mut());
+    let mut viz = Mat::<f64>::zeros(n, k);
+    for i in 0..n {
+        for c in 0..k {
+            viz[(i, c)] = z[(i, c)];
+        }
+    }
+    vc.solve_in_place(viz.as_mut());
+    let mut viy = Mat::<f64>::zeros(n, 1);
+    for i in 0..n {
+        viy[(i, 0)] = y[i];
+    }
+    vc.solve_in_place(viy.as_mut());
+
+    let mut xtvix = Mat::<f64>::zeros(p, p);
+    for a in 0..p {
+        for b in 0..p {
+            let mut acc = 0.0;
+            for i in 0..n {
+                acc += x[(i, a)] * vix[(i, b)];
+            }
+            xtvix[(a, b)] = acc;
+        }
+    }
+    let mut xtviz = Mat::<f64>::zeros(p, k);
+    for a in 0..p {
+        for c in 0..k {
+            let mut acc = 0.0;
+            for i in 0..n {
+                acc += x[(i, a)] * viz[(i, c)];
+            }
+            xtviz[(a, c)] = acc;
+        }
+    }
+    let mut xtviy = Mat::<f64>::zeros(p, 1);
+    for a in 0..p {
+        let mut acc = 0.0;
+        for i in 0..n {
+            acc += x[(i, a)] * viy[(i, 0)];
+        }
+        xtviy[(a, 0)] = acc;
+    }
+    let kc = xtvix
+        .as_ref()
+        .llt(faer::Side::Lower)
+        .expect("X'ViX must be SPD (X full column rank)");
+
+    // 4. β̂_GLS = (X'ViX)⁻¹X'Viy; Py = Vi r with r = y − Xβ̂ (Vi is linear, so
+    //    Vi r = Vi y − Vi X β̂ needs no extra solve). X'Vi r = 0 by
+    //    construction (the GLS normal equations), which is exactly why
+    //    Py = Pr = Vi r carries no projector correction — the doc comment's
+    //    "Py = Pr … since PX = 0".
+    let mut beta_hat = xtviy.clone();
+    kc.solve_in_place(beta_hat.as_mut());
+    let mut py = Mat::<f64>::zeros(n, 1);
+    for i in 0..n {
+        let mut acc = viy[(i, 0)];
+        for b in 0..p {
+            acc -= vix[(i, b)] * beta_hat[(b, 0)];
+        }
+        py[(i, 0)] = acc;
+    }
+    let mut ypy = 0.0;
+    for i in 0..n {
+        ypy += y[i] * py[(i, 0)];
+    }
+    let df = (n - p) as f64;
+
+    // Z'PZ, reduced to k×k by the same Woodbury-style identity:
+    //   Z'PZ = Z'ViZ − (X'ViZ)'(X'ViX)⁻¹(X'ViZ)
+    // so the per-θ_j trace below never needs an n×n P (see the cyclic-trace
+    // note at the score loop).
+    let mut ztviz = Mat::<f64>::zeros(k, k);
+    for a in 0..k {
+        for b in 0..k {
+            let mut acc = 0.0;
+            for i in 0..n {
+                acc += z[(i, a)] * viz[(i, b)];
+            }
+            ztviz[(a, b)] = acc;
+        }
+    }
+    let mut w = xtviz.clone(); // (X'ViX)⁻¹ X'ViZ, p×k
+    kc.solve_in_place(w.as_mut());
+    let mut ztpz = Mat::<f64>::zeros(k, k);
+    for a in 0..k {
+        for b in 0..k {
+            let mut acc = 0.0;
+            for i in 0..p {
+                acc += xtviz[(i, a)] * w[(i, b)];
+            }
+            ztpz[(a, b)] = ztviz[(a, b)] - acc;
+        }
+    }
+    let mut zpy = vec![0.0f64; k];
+    for a in 0..k {
+        let mut acc = 0.0;
+        for i in 0..n {
+            acc += z[(i, a)] * py[(i, 0)];
+        }
+        zpy[a] = acc;
+    }
+
+    // 5. Per θ_j: ∂Λ/∂θ_j is the indicator matrix E_j — ones at
+    //    (f·q+r_j, f·q+c_j) for every primary level f, zero everywhere else
+    //    (an extra grouping's θ_j puts ones on its own diagonal band
+    //    instead). Then V_j = Z(E_jΛᵀ + ΛE_jᵀ)Zᵀ and
+    //        score_j = tr(P V_j) − (n − p)·(pyᵀ V_j py) / ypy.
+    //    By trace cyclicity tr(P V_j) = tr((Z'PZ)(E_jΛᵀ + ΛE_jᵀ)) — a k×k
+    //    trace, not an n×n one — and pyᵀV_jpy = zpyᵀ(E_jΛᵀ + ΛE_jᵀ)zpy, a
+    //    k-length quadratic form; `n` never reappears past `ztpz`/`zpy` above.
+    //    Note `(n − p)/ypy` is `1/σ̂²`: the profiled scale, not a fixed 1.
+    let mut score = vec![0.0f64; n_theta];
+    for j in 0..n_theta {
+        let mut ej = Mat::<f64>::zeros(k, k);
+        if j < prim_theta {
+            let (r, c) = slot[j];
+            for f in 0..s {
+                ej[(f * q + r, f * q + c)] = 1.0;
+            }
+        } else {
+            for &(vs, n_levels, lam_off) in &extras {
+                if vs == j {
+                    for l in 0..n_levels {
+                        ej[(lam_off + l, lam_off + l)] = 1.0;
+                    }
+                }
+            }
+        }
+        // mid = E_j Λᵀ + Λ E_jᵀ  (k×k)
+        let mut mid = Mat::<f64>::zeros(k, k);
+        for a in 0..k {
+            for b in 0..k {
+                let mut acc = 0.0;
+                for c in 0..k {
+                    acc += ej[(a, c)] * lam[(b, c)]; // E_j Λᵀ
+                    acc += lam[(a, c)] * ej[(b, c)]; // Λ E_jᵀ
+                }
+                mid[(a, b)] = acc;
+            }
+        }
+        let mut tr = 0.0;
+        for a in 0..k {
+            for b in 0..k {
+                tr += ztpz[(a, b)] * mid[(b, a)];
+            }
+        }
+        let mut quad = 0.0;
+        for a in 0..k {
+            for b in 0..k {
+                quad += zpy[a] * mid[(a, b)] * zpy[b];
+            }
+        }
+        score[j] = tr - df * quad / ypy;
+    }
+    score
+}
+
+/// Ten fixed-seed θ draws per LMM shape for the REML gradient/Hessian gate.
+/// Diagonal vech(Λ) lanes drawn positive (mirrors GLMM's own
+/// `FixedSeedTheta`, `src/glmm/tests.rs`); off-diagonal lanes unconstrained —
+/// `D = ΛΛ'` is PD for any off-diagonal value, only the diagonal needs to
+/// stay positive.
+struct FixedSeedThetaLmm {
+    state: u64,
+    n_theta: usize,
+    diag: Vec<usize>,
+}
+
+impl FixedSeedThetaLmm {
+    fn next_theta(&mut self) -> Vec<f64> {
+        let mut out = vec![0.0f64; self.n_theta];
+        for (j, out_j) in out.iter_mut().enumerate() {
+            let r = lcg(&mut self.state);
+            *out_j = if self.diag.contains(&j) {
+                0.3 + 0.4 * (r + 0.5) // in [0.3, 0.7]
+            } else {
+                0.5 * r // in [-0.25, 0.25]
+            };
+        }
+        out
+    }
+}
+
+/// θ-layout diagonal indices per gate shape — column-major vech, so `q2s`
+/// (q=2) is `[0, 2]` and `q3s` (q=3) is `[0, 3, 5]`; `nest2`'s two scalars
+/// (primary + one nested extra) are both diagonal.
+fn fixed_seed_theta_lmm(shape: &str, state: u64) -> FixedSeedThetaLmm {
+    match shape {
+        "int1" => FixedSeedThetaLmm {
+            state,
+            n_theta: 1,
+            diag: vec![0],
+        },
+        "nest2" => FixedSeedThetaLmm {
+            state,
+            n_theta: 2,
+            diag: vec![0, 1],
+        },
+        "q2s" => FixedSeedThetaLmm {
+            state,
+            n_theta: 3,
+            diag: vec![0, 2],
+        },
+        "q3s" => FixedSeedThetaLmm {
+            state,
+            n_theta: 6,
+            diag: vec![0, 3, 5],
+        },
+        other => panic!("unknown LMM gate shape {other}"),
+    }
+}
+
+/// One (x, y, primary ids, extra ids, groupings, primary-slope x-cols, p)
+/// gate fixture per shape name. `int1` reuses `hand_dataset`; `q2s`/`q3s`
+/// reuse `slope_dataset`/`slope_groupings` and `multislope_dataset`/
+/// `multislope_groupings` (defined above in this module); `nest2` mirrors
+/// `nested_regime_b_deviance_matches_brute_force`'s own dataset shape (same
+/// family — 8 primary clusters × 2 nested children, n=64 — an independent
+/// draw, own seed).
+#[allow(clippy::type_complexity)]
+fn lmm_gate_fixture(
+    shape: &str,
+) -> (
+    Mat<f64>,
+    Vec<f64>,
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    LmmGroupings,
+    Vec<usize>,
+    usize,
+) {
+    match shape {
+        "int1" => {
+            let (x, y, ids) = hand_dataset();
+            (x, y, ids, vec![], LmmGroupings::single(6), vec![], 3)
+        }
+        "nest2" => {
+            let mut cluster = intercept_only_spec(Sizing::FixedSize { cluster_size: 8 });
+            cluster.re.as_mut().unwrap().extra_groupings.push(Grouping {
+                relation: GroupingRelation::NestedWithin { n_per_parent: 2 },
+                slopes: vec![],
+            });
+            let n = 4 * model_atom(&cluster); // 64
+            let mut st = 5101u64;
+            let mut x = Mat::<f64>::zeros(n, 2);
+            let mut y = vec![0.0f64; n];
+            let mut pid = vec![0u32; n];
+            let mut cid = vec![0u32; n];
+            let u_p: Vec<f64> = (0..8).map(|_| 0.5 * lcg(&mut st)).collect();
+            let u_c: Vec<f64> = (0..16).map(|_| 0.3 * lcg(&mut st)).collect();
+            for i in 0..n {
+                pid[i] = cluster.re.as_ref().unwrap().sizing.cluster_of_row(i) as u32;
+                cid[i] = extra_level_of_row(&cluster, 0, i) as u32;
+                let x1 = lcg(&mut st);
+                x[(i, 0)] = 1.0;
+                x[(i, 1)] = x1;
+                y[i] = 0.5
+                    + 0.4 * x1
+                    + u_p[pid[i] as usize]
+                    + u_c[cid[i] as usize]
+                    + 0.8 * lcg(&mut st);
+            }
+            let groupings = LmmGroupings::from_cluster_spec(&cluster, n, &[]);
+            (x, y, pid, vec![cid], groupings, vec![], 2)
+        }
+        "q2s" => {
+            let (x, y, ids) = slope_dataset();
+            (x, y, ids, vec![], slope_groupings(), vec![1], 2)
+        }
+        "q3s" => {
+            let (x, y, ids) = multislope_dataset();
+            (x, y, ids, vec![], multislope_groupings(), vec![1, 2], 3)
+        }
+        other => panic!("unknown LMM gate shape {other}"),
+    }
+}
+
+/// Gate (a): `reml_gradient` vs. `dense_reml_score`, ten fixed-seed θ draws
+/// per shape (`{int1, nest2, q2s, q3s}`), band `1e-8` relative. The LMM
+/// criterion has no PIRLS inside it — it is a closed-form evaluation of the
+/// suff stats — so there is no mode error and no tolerance to tighten: this
+/// band is tighter than the GLMM gates on purpose, and a miss here is a real
+/// bug rather than a convergence artefact.
+#[test]
+fn reml_gradient_matches_dense_score_per_shape() {
+    for shape in ["int1", "nest2", "q2s", "q3s"] {
+        let (x, y, primary_ids, extra_ids, groupings, slope_cols, p) = lmm_gate_fixture(shape);
+        let mut suff = LmmSuffStats::with_groupings(p, groupings.clone());
+        suff.add_rows_multi(x.as_ref(), &y, &primary_ids, &extra_ids, None);
+        let z = dense_z(&groupings, &primary_ids, &extra_ids, &x, &slope_cols);
+        let n_theta = groupings.n_theta();
+        let mut scratch =
+            LmmDualScratch::for_groupings(n_theta, p, &groupings).unwrap_or_else(|| {
+                panic!("{shape}: n_theta {n_theta} exceeds the instantiated lane set")
+            });
+        let mut rng = fixed_seed_theta_lmm(shape, 6001);
+        debug_assert_eq!(
+            rng.n_theta, n_theta,
+            "{shape}: seed rng/groupings n_theta mismatch"
+        );
+        for draw in 0..10 {
+            let theta = rng.next_theta();
+            let mut grad = vec![0.0; n_theta];
+            match reml_gradient(&theta, &suff, &mut scratch, &mut grad) {
+                DerivStatus::Ok(_) => {}
+                DerivStatus::NotConverged => {
+                    panic!("{shape} draw {draw} θ={theta:?}: reml_gradient NotConverged")
+                }
+                DerivStatus::Unsupported => {
+                    panic!("{shape} draw {draw} θ={theta:?}: reml_gradient Unsupported")
+                }
+            }
+            let want = dense_reml_score(&theta, z.as_ref(), x.as_ref(), &y, &groupings);
+            for j in 0..n_theta {
+                let band = 1e-8 * want[j].abs().max(1.0);
+                assert!(
+                    (grad[j] - want[j]).abs() <= band,
+                    "{shape} draw {draw} θ={theta:?} coord {j}: dual {} vs dense {}",
+                    grad[j],
+                    want[j]
+                );
+            }
+        }
+    }
+}
+
+/// Gate (b): `reml_hessian` vs. central FD of `reml_gradient` (step `1e-5`,
+/// band `1e-6` relative), same shapes, plus exact `hess[(i,j)] ==
+/// hess[(j,i)]` symmetry. `q3s` reaches `n_θ = 6`, so `N = 8` is the largest
+/// lane count either gate exercises.
+#[test]
+fn reml_hessian_matches_fd_of_gradient_per_shape() {
+    for shape in ["int1", "nest2", "q2s", "q3s"] {
+        let (x, y, primary_ids, extra_ids, groupings, _slope_cols, p) = lmm_gate_fixture(shape);
+        let mut suff = LmmSuffStats::with_groupings(p, groupings.clone());
+        suff.add_rows_multi(x.as_ref(), &y, &primary_ids, &extra_ids, None);
+        let n_theta = groupings.n_theta();
+        let mut dual_scratch = LmmDualScratch::for_groupings(n_theta, p, &groupings)
+            .unwrap_or_else(|| {
+                panic!("{shape}: n_theta {n_theta} exceeds the instantiated lane set")
+            });
+        let mut hyper_scratch = LmmHyperScratch::for_groupings(n_theta, p, &groupings)
+            .unwrap_or_else(|| {
+                panic!("{shape}: n_theta {n_theta} exceeds the instantiated lane set")
+            });
+        let mut rng = fixed_seed_theta_lmm(shape, 6501);
+        for draw in 0..10 {
+            let theta = rng.next_theta();
+            let mut grad = vec![0.0; n_theta];
+            let mut hess = Mat::<f64>::zeros(n_theta, n_theta);
+            match reml_hessian(&theta, &suff, &mut hyper_scratch, &mut grad, &mut hess) {
+                DerivStatus::Ok(_) => {}
+                DerivStatus::NotConverged => {
+                    panic!("{shape} draw {draw} θ={theta:?}: reml_hessian NotConverged")
+                }
+                DerivStatus::Unsupported => {
+                    panic!("{shape} draw {draw} θ={theta:?}: reml_hessian Unsupported")
+                }
+            }
+            for i in 0..n_theta {
+                for j in 0..n_theta {
+                    assert_eq!(
+                        hess[(i, j)],
+                        hess[(j, i)],
+                        "{shape} draw {draw} θ={theta:?}: hess not symmetric at ({i},{j})"
+                    );
+                }
+            }
+            let h = 1e-5;
+            for kcoord in 0..n_theta {
+                let mut tp = theta.clone();
+                tp[kcoord] += h;
+                let mut gp = vec![0.0; n_theta];
+                match reml_gradient(&tp, &suff, &mut dual_scratch, &mut gp) {
+                    DerivStatus::Ok(_) => {}
+                    DerivStatus::NotConverged => {
+                        panic!(
+                            "{shape} draw {draw} coord {kcoord} (+h): reml_gradient NotConverged"
+                        )
+                    }
+                    DerivStatus::Unsupported => {
+                        panic!("{shape} draw {draw} coord {kcoord} (+h): reml_gradient Unsupported")
+                    }
+                }
+                let mut tm = theta.clone();
+                tm[kcoord] -= h;
+                let mut gm = vec![0.0; n_theta];
+                match reml_gradient(&tm, &suff, &mut dual_scratch, &mut gm) {
+                    DerivStatus::Ok(_) => {}
+                    DerivStatus::NotConverged => {
+                        panic!(
+                            "{shape} draw {draw} coord {kcoord} (-h): reml_gradient NotConverged"
+                        )
+                    }
+                    DerivStatus::Unsupported => {
+                        panic!("{shape} draw {draw} coord {kcoord} (-h): reml_gradient Unsupported")
+                    }
+                }
+                for j in 0..n_theta {
+                    let fd = (gp[j] - gm[j]) / (2.0 * h);
+                    let band = 1e-6 * fd.abs().max(1.0);
+                    assert!(
+                        (hess[(j, kcoord)] - fd).abs() <= band,
+                        "{shape} draw {draw} θ={theta:?} hess[{j},{kcoord}]: {} vs fd {fd}",
+                        hess[(j, kcoord)]
+                    );
+                }
+            }
+        }
+    }
 }

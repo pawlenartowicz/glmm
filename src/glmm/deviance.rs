@@ -238,14 +238,14 @@ pub(crate) fn laplace_deviance(
     debug_assert!(!profile_beta || nagq == 1);
     // AGQ (nagq>1) only on a single grouping factor (no extras), q_p ≤ 3,
     // binomial/Poisson — the shapes where the marginal likelihood factorizes into
-    // independent per-cluster q-D integrals (a k^q product quadrature). Route by
+    // independent per-cluster q-D integrals (a k^q product quadrature). The
+    // family/nagq/q_p terms are `derivative::agq_eligible`, shared with the
+    // derivative path. Route by
     // q_p: scalar (q_p==1) → agq_deviance (verbatim, frozen goldens), vector
     // (q_p∈2..=3) → agq_deviance_vec. Every other shape (and nagq==1) uses the
     // Laplace path below unchanged (nagq==1 IS Laplace, so it is bit-identical).
-    if nagq > 1
+    if super::derivative::agq_eligible(family, nagq, groupings.primary_q)
         && groupings.extra_offsets.is_empty()
-        && (1..=3).contains(&groupings.primary_q)
-        && matches!(family, Family::Binomial { .. } | Family::Poisson { .. })
     {
         let kernel = if groupings.primary_q == 1 {
             super::agq::agq_deviance
@@ -528,7 +528,7 @@ pub(crate) fn laplace_deviance_at(
 /// Profile: β = `beta_prof`, spare = `beta_rhs` — the two must never alias).
 /// Callers own all u/β seeding — this helper seeds nothing.
 #[allow(clippy::too_many_arguments)]
-fn laplace_deviance_ws(
+pub(crate) fn laplace_deviance_ws(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
     y: &[f64],

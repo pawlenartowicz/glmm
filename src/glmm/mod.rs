@@ -227,6 +227,7 @@ pub struct GlmmFit {
 }
 
 mod agq;
+mod derivative;
 mod deviance;
 mod pirls;
 mod se;
@@ -234,6 +235,10 @@ mod workspace;
 
 #[cfg(test)]
 pub(crate) use deviance::glmm_laplace_deviance;
+// Re-exported so `lmm::kernel`'s REML dual entry points can reuse
+// these instead of duplicating them — `derivative` itself is private to
+// `glmm`, so a sibling module needs the items re-exported one level up.
+pub(crate) use derivative::{unpack_hessian, DerivStatus};
 pub use se::fd_hessian_cov;
 pub(crate) use se::{fd_mixed_diff, fd_second_diff};
 pub(crate) use workspace::StructuredSchur;
