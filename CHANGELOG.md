@@ -8,6 +8,36 @@ shares these entries; Python-specific notes are called out where they differ.
 
 ## [Unreleased]
 
+### 0.4.0 substrate — internal milestone, not a published release
+
+#### Added
+
+- **Dev-only `counters` Cargo feature.** With the feature on, `Fit` carries an
+  `EvalCounters` struct recording four observation-only quantities per fit: the
+  stage-1/stage-2 evaluation split of the two-stage GLMM search, evaluations
+  after the last strict improvement of a stage's incumbent (the trust-radius
+  shrink phase), a PIRLS-iterations-per-evaluation histogram, and AGQ
+  evaluations with the node evaluations they cost. Off by default and — like
+  `loop_advanced` — not part of the semver-covered surface. With the feature
+  off the code compiles out entirely and fit output is bit-identical; a new CI
+  leg runs the test suite with it on. The speed-grid campaign gained a
+  counters pass (`validation/campaigns/speed-grid/counters.R`) that reads
+  these counters instead of wall time.
+
+#### Changed (internal)
+
+- **The blocked fit kernel is generic over a scalar type.** Family primitives,
+  blocked PIRLS, the Laplace/AGQ deviance, and the family-blocked REML kernel
+  now take a sealed, `#[doc(hidden)]` `Scalar` trait (new `src/scalar.rs`)
+  instead of bare `f64`. `f64` is the production instantiation and is
+  bit-identical to the pre-generic kernel (bit-identity dumps and frozen
+  goldens unchanged); its trait overrides call the existing SIMD and faer code
+  verbatim, so the shipped path pays nothing. Every kernel branch compares the
+  value part, so the iterate path a fit takes is the same at every scalar
+  type. No public API change: the trait is sealed and hidden, and existing
+  callers infer `f64`. This is the substrate for a forward-mode dual-number
+  instantiation (exact derivatives) in a later milestone.
+
 ## [0.3.1] — 2026-08-27
 
 ### Added
