@@ -563,7 +563,7 @@ pub(crate) fn scalar_phi(z: f64) -> f64 {
 /// Used **only** by the probit link in `family.rs`. Deliberately separate from
 /// `scalar_phi`/`phi_fill`: that data-gen path is bit-pinned to
 /// the A&S-7.1.26 form (~7.5e-8) and must not change, but the probit
-/// FD-Hessian SE differentiates Φ twice and amplifies its error, so the fit
+/// Hessian SE differentiates Φ twice and amplifies its error, so the fit
 /// needs a Φ good to machine precision. `erfc` is W. J. Cody's rational
 /// Chebyshev approximation (CALERF, Netlib SPECFUN), the same algorithm libm
 /// uses; coefficients verbatim from the reference.

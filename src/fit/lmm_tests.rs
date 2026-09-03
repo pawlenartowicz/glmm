@@ -75,7 +75,7 @@ fn lmm_run_on_view_maps_to_same_fit_as_fit_cold() {
     ws.suff
         .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], None);
     let via = {
-        let v = lmm_run_on(&mut ws, &opts.target_indices, None);
+        let v = lmm_run_on(&mut ws, &opts.target_indices, None, opts.boundary_score);
         lmm_view_to_fit(&v, &x, &ids, n, p, &opts)
     };
     assert_near(&cold.beta, &via.beta, "beta");

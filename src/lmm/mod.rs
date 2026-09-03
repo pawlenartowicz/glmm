@@ -43,6 +43,7 @@ mod tests;
 
 pub(crate) use kernel::precompute_balanced_collapse;
 pub use kernel::{reml_deviance, LmmSuffStats};
+pub(crate) use kernel::{reml_gradient, reml_hessian, LmmDualScratch, LmmHyperScratch};
 
 /// θ start — DIAGONAL vech entries only; off-diagonals cold-start at 0
 /// (unit diagonal, the lme4/MixedModels.jl default — the

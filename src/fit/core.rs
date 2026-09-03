@@ -765,7 +765,12 @@ pub fn fit_on<'a>(
                 &ids.extra,
                 opts.weights.as_deref(),
             );
-            let v = super::lmm::lmm_run_on(lmm_ws, &opts.target_indices, warm_theta(start));
+            let v = super::lmm::lmm_run_on(
+                lmm_ws,
+                &opts.target_indices,
+                warm_theta(start),
+                opts.boundary_score,
+            );
             FitView::new(FitViewKind::Lmm(v), perm, theta_buf)
         }
         FitKind::GlmmDense { ws: glmm_ws, x_mat } => {

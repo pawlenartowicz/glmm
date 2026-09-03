@@ -1,5 +1,6 @@
 use faer::{Mat, MatRef};
 
+use super::derivative::DerivStatus;
 use super::deviance::laplace_deviance_at;
 use super::pirls::structured_ainv_solve;
 use super::workspace::{fill_z_f64, glmm_block_solve, GlmmWorkspace};
@@ -121,7 +122,7 @@ fn mixed_diff(
 /// where info = H_dev/2). Reuses `fit_glmm`'s inference-block Schur-fill dispatch
 /// (`blocked`/`structured`/`dense`), so it requires `ws.{w, lam, a_blocks, …}` to
 /// hold the factors a converged PIRLS at the current `ws.params` left behind.
-/// Returns false on a non-PD Schur. Shared by the `fd_hessian_cov` fallback and
+/// Returns false on a non-PD Schur. Shared by the `joint_hessian_cov` fallback and
 /// (later) the Rx production path.
 pub(crate) fn rx_cov_into(
     ws: &mut GlmmWorkspace,
@@ -156,13 +157,25 @@ pub(crate) fn rx_cov_into(
     true
 }
 
-/// Finite-difference Hessian of the Laplace deviance over the joint (θ,β) at the
-/// converged point in `ws.params`; inverts and writes the p×p fixed-effect
-/// covariance block into `out_cov`. On a non-PD joint Hessian (or a non-finite
-/// perturbed deviance — the few-cluster failure mode) writes the RX/Schur
-/// covariance instead and returns the fallback status. Restores `ws.params` on
-/// return. Matches glmer `vcov(use.hessian = TRUE)` (factor of 2: deviance =
-/// −2logL, so observed info = H_dev/2 and cov = info⁻¹ = 2·H_dev⁻¹).
+/// Joint (θ,β) Hessian of the Laplace deviance at the converged point in
+/// `ws.params`; inverts and writes the p×p fixed-effect covariance block into
+/// `out_cov`. On a non-PD joint Hessian (or a non-finite perturbed deviance —
+/// the few-cluster failure mode) writes the RX/Schur covariance instead and
+/// returns the fallback status. Restores `ws.params` on return. Matches glmer
+/// `vcov(use.hessian = TRUE)` (factor of 2: deviance = −2logL, so observed
+/// info = H_dev/2 and cov = info⁻¹ = 2·H_dev⁻¹).
+///
+/// Two arms. On every shape `derivative::supports_shape` accepts — the blocked
+/// path (no extra groupings, which includes every AGQ shape) and the structured
+/// extras path — the joint Hessian is EXACT, from the hyper-dual kernel: no
+/// step, no stencil, no per-cell PIRLS re-solve. Two things send such a shape
+/// back to the stencil anyway: `m > MAX_DUAL_N` (12), and a θ̂ with a pinned
+/// crossed component (`derivative::extras_theta_pin_free`), which has no
+/// derivative lane. Everything below
+/// about `FD_STEP_BASE`, step-invariance, the corpus margin measurement and the
+/// comparison against lme4's own `deriv12` describes the FD arm, which is what
+/// those two cases and the oversized-core dense fallback still run. (The sparse
+/// driver has its own stencil in `src/sparse/glmm.rs`.)
 ///
 /// FD scheme (tuned against `tests/fixtures/glmm_hessian_vcov.json`, the n=96 /
 /// 12-cluster `y ~ x1 + (1|grp)` glmer fit): single-step central second
@@ -241,7 +254,7 @@ pub(crate) fn rx_cov_into(
 /// Precondition: `ws` is at a CONVERGED fit and `ws.z_buf`-eligible scratch is
 /// valid for (x, ids, n) (the deviance evals re-solve PIRLS).
 #[allow(clippy::too_many_arguments)]
-pub fn fd_hessian_cov(
+pub fn joint_hessian_cov(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
     y: &[f64],
@@ -255,27 +268,16 @@ pub fn fd_hessian_cov(
     let m = ws.params.len();
     let n_theta = ws.n_theta;
 
-    // Every deviance eval below (f0, the f± stencil, and the fallback's central
-    // re-eval) converges PIRLS at the FD-pass tol — see the doc comment.
-    // Reset on every exit alongside `warm_seed_active`.
-    ws.pirls_tol_override = Some(super::pirls_tol_fd(ws.family));
-
-    // Snapshot γ̂ and the per-coordinate FD step; fill z_buf once (blocked AND
+    // Snapshot γ̂; fill z_buf once (blocked AND
     // structured paths — `build_packed_m`'s primary-core reduction reads it the
     // same way `pirls_solve_blocked`'s does; the dense-fallback path skips it,
-    // matching `fit_glmm`'s hoist).
+    // matching `fit_glmm`'s hoist). Both live OUTSIDE the exact/FD branch below:
+    // `fallback!()` restores `ws.params` from `fd_saved` and `rx_cov_into` reads
+    // `z_buf` on both arms. STRICT SUPERSET of the exact branch's gate, not the
+    // same test: a structured shape whose θ̂ has a pinned crossed component
+    // needs `z_buf` filled and then takes the FD stencil, so collapsing the two
+    // would starve it.
     ws.fd_saved[..m].copy_from_slice(&ws.params[..m]);
-    // Step construction per `FD_STEP_BASE` (θ absolute, β relative). On toenail
-    // (θ̂ = 4.708), a θ-relative step of h_θ = 0.047 puts se(β₀) 4.9e-4 above the
-    // converged value; at h_θ = 1e-2 it is 2.2e-5, against a noise floor near
-    // h = 2.5e-3.
-    for k in 0..m {
-        ws.fd_steps[k] = if k < n_theta {
-            FD_STEP_BASE
-        } else {
-            FD_STEP_BASE * ws.fd_saved[k].abs().max(1.0)
-        };
-    }
     if ws.groupings.extra_offsets.is_empty() || ws.groupings.structured_extras_eligible() {
         let GlmmWorkspace {
             groupings, z_buf, ..
@@ -287,7 +289,7 @@ pub fn fd_hessian_cov(
     // seeding block below), and every eval here overwrites `ws.u` with its own
     // perturbed mode, so without this the workspace exits carrying an FD leftover
     // where the fit's mode used to be — and since the seed is now READ from
-    // `ws.u`, a second `fd_hessian_cov` on the same workspace would anchor on that
+    // `ws.u`, a second `joint_hessian_cov` on the same workspace would anchor on that
     // leftover and return a different (still valid, but different) covariance.
     // `fd_hessian_parallel_bit_identical_to_serial` calls it exactly twice and is
     // what holds this line. Same contract as the `ws.params`/`fd_saved` restore it
@@ -380,90 +382,153 @@ pub fn fd_hessian_cov(
     ws.u_seed[..kk].copy_from_slice(&ws.u[..kk]);
     ws.warm_seed_active = true;
 
-    let f0 = fd_eval(ws, &[], &[], x, y, cluster_ids, extra_ids, n);
-    if !f0.is_finite() {
-        fallback!();
-    }
-
-    // Build the symmetric m×m Hessian into ws.hess_scratch (upper, then mirror).
-    // Each grid cell is a pure function of the frozen FD seed (fd_saved, fd_steps,
-    // u_seed) — see `fd_hessian_cov`'s doc comment — so per-thread worker
-    // workspaces compute bit-identical values in any order. Diagonal cells use a
-    // single-step central second difference (no Richardson — the fixture is
-    // step-invariant to ~7 sig figs across h ∈ [1e-4, 1e-1], see the doc comment).
-    let use_par = cfg!(all(feature = "parallel", not(target_arch = "wasm32"))) && ws.parallel_inner;
-    if use_par {
-        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-        {
-            use super::workspace::fd_worker_ws;
-            use rayon::prelude::*;
-            let cells: Vec<(usize, usize)> =
-                (0..m).flat_map(|i| (i..m).map(move |j| (i, j))).collect();
-            let ws_ro: &GlmmWorkspace = ws; // shared read-only view for map_init
-            let results: Vec<(usize, usize, f64)> = cells
-                .par_iter()
-                .map_init(
-                    || fd_worker_ws(ws_ro, n),
-                    |wws, &(i, j)| {
-                        let h = if i == j {
-                            second_diff(
-                                wws,
-                                i,
-                                ws_ro.fd_steps[i],
-                                f0,
-                                x,
-                                y,
-                                cluster_ids,
-                                extra_ids,
-                                n,
-                            )
-                        } else {
-                            mixed_diff(
-                                wws,
-                                i,
-                                j,
-                                ws_ro.fd_steps[i],
-                                ws_ro.fd_steps[j],
-                                x,
-                                y,
-                                cluster_ids,
-                                extra_ids,
-                                n,
-                            )
-                        };
-                        (i, j, h)
-                    },
-                )
-                .collect();
-            // The serial arm fallback!()s on the FIRST non-finite eval; here the
-            // whole grid ran first, then we check — same destination (RX fallback),
-            // extra work only on the already-failing path. `results` is collected
-            // before this point, ending map_init's immutable borrow of `ws` so the
-            // fallback (which needs `&mut ws`) is legal.
-            if results.iter().any(|&(_, _, h)| !h.is_finite()) {
-                fallback!();
-            }
-            for (i, j, h) in results {
-                ws.hess_scratch[(i, j)] = h;
-                ws.hess_scratch[(j, i)] = h;
-            }
+    // Exact hyper-dual joint Hessian wherever a dual kernel exists for the
+    // shape — the blocked path, which is also the whole AGQ envelope since the
+    // AGQ gate in `deviance.rs` requires `extra_offsets.is_empty()`, and the
+    // structured extras path. Differentiates the
+    // final evaluation at the converged mode, so there is no stencil, no step,
+    // no per-cell PIRLS re-solve and no FD-pass tolerance here. `Unsupported`
+    // (m > MAX_DUAL_N, or a pinned crossed θ̂ — `extras_theta_pin_free`) is a
+    // ROUTING answer, not an error: it falls THROUGH to the FD stencil. Only
+    // `NotConverged` — a real failure at the accepted point — routes to RX.
+    // What is left on the stencil is the oversized-core dense fallback and
+    // those two refusals; the sparse driver has its own twin in
+    // `src/sparse/glmm.rs`.
+    //
+    // The one owner is `derivative::supports_shape` (with its θ-valued
+    // companion `extras_theta_pin_free`) — do not inline either test.
+    let mut used_exact = false;
+    if super::derivative::supports_shape(&ws.groupings) && !ws.force_fd_hessian {
+        // `std::mem::replace` (faer's `Mat` implements no `Default`, so
+        // `mem::take` does not compile; the swapped-in `Mat::zeros(0, 0)`
+        // allocates nothing) avoids aliasing: `laplace_hessian` takes
+        // `&mut ws`, so `&mut ws.hess_scratch` cannot be passed alongside it.
+        // Replace-and-put-back leaves the field valid on every path, including
+        // the `fallback!()` early return, because the put-back precedes the check.
+        let mut hess = std::mem::replace(&mut ws.hess_scratch, Mat::zeros(0, 0));
+        let mut g = std::mem::take(&mut ws.grad_scratch);
+        let st = super::derivative::laplace_hessian(
+            ws,
+            x,
+            y,
+            cluster_ids,
+            extra_ids,
+            p,
+            n,
+            &mut g,
+            &mut hess,
+        );
+        ws.grad_scratch = g;
+        ws.hess_scratch = hess;
+        match st {
+            DerivStatus::Ok(_) => used_exact = true,
+            DerivStatus::Unsupported => {} // fall through to the FD arm
+            DerivStatus::NotConverged => fallback!(),
         }
-    } else {
-        for i in 0..m {
-            let hi = ws.fd_steps[i];
-            let hii = second_diff(ws, i, hi, f0, x, y, cluster_ids, extra_ids, n);
-            if !hii.is_finite() {
-                fallback!();
-            }
-            ws.hess_scratch[(i, i)] = hii;
-            for j in (i + 1)..m {
-                let hj = ws.fd_steps[j];
-                let hij = mixed_diff(ws, i, j, hi, hj, x, y, cluster_ids, extra_ids, n);
-                if !hij.is_finite() {
+    }
+    if !used_exact {
+        // Every deviance eval below (f0, the f± stencil, and the fallback's central
+        // re-eval) converges PIRLS at the FD-pass tol — see the doc comment.
+        // Reset on every exit alongside `warm_seed_active`.
+        ws.pirls_tol_override = Some(super::pirls_tol_fd(ws.family));
+        // Step construction per `FD_STEP_BASE` (θ absolute, β relative). On toenail
+        // (θ̂ = 4.708), a θ-relative step of h_θ = 0.047 puts se(β₀) 4.9e-4 above the
+        // converged value; at h_θ = 1e-2 it is 2.2e-5, against a noise floor near
+        // h = 2.5e-3.
+        for k in 0..m {
+            ws.fd_steps[k] = if k < n_theta {
+                FD_STEP_BASE
+            } else {
+                FD_STEP_BASE * ws.fd_saved[k].abs().max(1.0)
+            };
+        }
+
+        let f0 = fd_eval(ws, &[], &[], x, y, cluster_ids, extra_ids, n);
+        if !f0.is_finite() {
+            fallback!();
+        }
+
+        // Build the symmetric m×m Hessian into ws.hess_scratch (upper, then mirror).
+        // Each grid cell is a pure function of the frozen FD seed (fd_saved, fd_steps,
+        // u_seed) — see `joint_hessian_cov`'s doc comment — so per-thread worker
+        // workspaces compute bit-identical values in any order. Diagonal cells use a
+        // single-step central second difference (no Richardson — the fixture is
+        // step-invariant to ~7 sig figs across h ∈ [1e-4, 1e-1], see the doc comment).
+        let use_par =
+            cfg!(all(feature = "parallel", not(target_arch = "wasm32"))) && ws.parallel_inner;
+        if use_par {
+            #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+            {
+                use super::workspace::fd_worker_ws;
+                use rayon::prelude::*;
+                let cells: Vec<(usize, usize)> =
+                    (0..m).flat_map(|i| (i..m).map(move |j| (i, j))).collect();
+                let ws_ro: &GlmmWorkspace = ws; // shared read-only view for map_init
+                let results: Vec<(usize, usize, f64)> = cells
+                    .par_iter()
+                    .map_init(
+                        || fd_worker_ws(ws_ro, n),
+                        |wws, &(i, j)| {
+                            let h = if i == j {
+                                second_diff(
+                                    wws,
+                                    i,
+                                    ws_ro.fd_steps[i],
+                                    f0,
+                                    x,
+                                    y,
+                                    cluster_ids,
+                                    extra_ids,
+                                    n,
+                                )
+                            } else {
+                                mixed_diff(
+                                    wws,
+                                    i,
+                                    j,
+                                    ws_ro.fd_steps[i],
+                                    ws_ro.fd_steps[j],
+                                    x,
+                                    y,
+                                    cluster_ids,
+                                    extra_ids,
+                                    n,
+                                )
+                            };
+                            (i, j, h)
+                        },
+                    )
+                    .collect();
+                // The serial arm fallback!()s on the FIRST non-finite eval; here the
+                // whole grid ran first, then we check — same destination (RX fallback),
+                // extra work only on the already-failing path. `results` is collected
+                // before this point, ending map_init's immutable borrow of `ws` so the
+                // fallback (which needs `&mut ws`) is legal.
+                if results.iter().any(|&(_, _, h)| !h.is_finite()) {
                     fallback!();
                 }
-                ws.hess_scratch[(i, j)] = hij;
-                ws.hess_scratch[(j, i)] = hij;
+                for (i, j, h) in results {
+                    ws.hess_scratch[(i, j)] = h;
+                    ws.hess_scratch[(j, i)] = h;
+                }
+            }
+        } else {
+            for i in 0..m {
+                let hi = ws.fd_steps[i];
+                let hii = second_diff(ws, i, hi, f0, x, y, cluster_ids, extra_ids, n);
+                if !hii.is_finite() {
+                    fallback!();
+                }
+                ws.hess_scratch[(i, i)] = hii;
+                for j in (i + 1)..m {
+                    let hj = ws.fd_steps[j];
+                    let hij = mixed_diff(ws, i, j, hi, hj, x, y, cluster_ids, extra_ids, n);
+                    if !hij.is_finite() {
+                        fallback!();
+                    }
+                    ws.hess_scratch[(i, j)] = hij;
+                    ws.hess_scratch[(j, i)] = hij;
+                }
             }
         }
     }
@@ -737,8 +802,13 @@ pub(crate) fn structured_schur_fill(
             &ws.schur_blk,
             &ws.coup_cols,
             &ws.coup_ptr,
-            ws.structured_schur.as_mut(),
-            ws.force_dense_schur,
+            // force_dense → ss fold: see the structured_ainv_solve calls in
+            // pirls_solve_blocked_extras (pirls/blocked_extras.rs).
+            if ws.force_dense_schur {
+                None
+            } else {
+                ws.structured_schur.as_mut()
+            },
             &mut ws.a_rhs,
         );
         for f in 0..s {

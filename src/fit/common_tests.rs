@@ -1494,6 +1494,132 @@ fn diagnostics_moved_fields_agree_through_both_paths() {
     assert!(dup.converged(), "the reduced model fits");
 }
 
+/// The LMM reports the same two derivative diagnostics as the GLMM: the KKT
+/// residual on the θ box at the accepted point, and the variance score at each
+/// pinned component. Its SEs are unchanged — the LMM has no Hessian SE path and
+/// the diagnostics do not add one. Same two fixtures as
+/// `diagnostics_boundary_reports_both_ends`, which is what makes the boundary
+/// half of this test a real boundary: that grouping's ±0.8 cancels exactly per
+/// cluster, so the between-cluster variance MLE is 0.
+#[test]
+fn lmm_reports_kkt_and_boundary_score() {
+    let (xs, ys, ns, ps) = lmm_hand_dataset();
+    let ids_s: Vec<u32> = (0..ns).map(|i| (i % 6) as u32).collect();
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 6 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let opts = FitOptions {
+        target_indices: (0..ps as u32).collect(),
+        ..FitOptions::default()
+    };
+    let interior = fit_cold(
+        &xs,
+        &ys,
+        ns,
+        ps,
+        &model,
+        &GroupIds {
+            primary: ids_s,
+            extra: vec![],
+        },
+        &opts,
+    );
+    assert_eq!(interior.diagnostics.boundary, Boundary::Interior);
+    assert!(interior.diagnostics.kkt_grad_norm.is_finite());
+    // KKT_INTERIOR_MAX is calibrated on GLMM Laplace deviances and does not
+    // transfer to the REML criterion — assert only finiteness here. An
+    // LMM-calibrated constant is W5's call, where the LMM Newton needs these
+    // derivatives anyway.
+    assert!(interior.diagnostics.boundary_score.is_empty());
+    assert!(interior.stddev_se.is_empty(), "W3 adds no LMM stddev_se");
+
+    // The pinning Gaussian dataset, inline exactly as
+    // `diagnostics_boundary_reports_both_ends` builds it: n = 48, 6 clusters,
+    // the ±0.8 per-cluster cancellation that pins the between-cluster variance
+    // MLE at 0.
+    let n2 = 48usize;
+    let n_clusters2 = 6usize;
+    let mut st = 7u64;
+    let mut xs2 = vec![0.0f64; n2 * 2];
+    let mut ys2 = vec![0.0f64; n2];
+    let mut ids2 = vec![0u32; n2];
+    for i in 0..n2 {
+        ids2[i] = (i % n_clusters2) as u32;
+        let x1 = lcg(&mut st);
+        xs2[i * 2] = 1.0;
+        xs2[i * 2 + 1] = x1;
+        let e = if (i / n_clusters2) % 2 == 0 {
+            0.8
+        } else {
+            -0.8
+        };
+        ys2[i] = 0.5 + 0.4 * x1 + e;
+    }
+    let model2 = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters2 as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids2 = GroupIds {
+        primary: ids2,
+        extra: vec![],
+    };
+    // The score is opt-in (`FitOptions::boundary_score`): the default fit pins
+    // and reports the KKT residual, but runs no hyper-dual Hessian.
+    let unrequested = fit_cold(
+        &xs2,
+        &ys2,
+        n2,
+        2,
+        &model2,
+        &ids2,
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert_eq!(unrequested.diagnostics.boundary, Boundary::AtBoundary);
+    assert!(unrequested.diagnostics.kkt_grad_norm.is_finite());
+    assert!(unrequested.diagnostics.boundary_score.is_empty());
+    let pinned = fit_cold(
+        &xs2,
+        &ys2,
+        n2,
+        2,
+        &model2,
+        &ids2,
+        &FitOptions {
+            target_indices: vec![0, 1],
+            boundary_score: true,
+            ..FitOptions::default()
+        },
+    );
+    assert_eq!(pinned.diagnostics.boundary, Boundary::AtBoundary);
+    assert!(pinned.diagnostics.kkt_grad_norm.is_finite());
+    let mut seen = 0usize;
+    for (g, flags) in pinned.diagnostics.pinned.iter().enumerate() {
+        for (i, &p) in flags.iter().enumerate() {
+            if p {
+                seen += 1;
+                let s = pinned.diagnostics.boundary_score[g][i];
+                assert!(s.is_finite() && s > 0.0, "score[{g}][{i}] = {s}");
+            }
+        }
+    }
+    assert_eq!(seen, 1);
+    assert!(pinned.stddev_se.is_empty());
+}
+
 /// `Boundary` at both ends of the range the dense LMM route can report:
 /// the deterministic τ̂=0 pin fixture (`fit_lmm_weighted_boundary_matches_wls`'s
 /// design, same construction) lands `AtBoundary`, lmm_hand_dataset() with `i % 6` grouping lands `Interior`.

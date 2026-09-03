@@ -282,21 +282,7 @@ impl Scalar for f64 {
     }
 
     fn syrk_lower_sub(bt: &[f64], t_dim: usize, w_tot: usize, tail: &mut [f64]) {
-        use faer::linalg::matmul::triangular::{matmul, BlockStructure};
-        let bt = faer::MatRef::from_column_major_slice(&bt[..t_dim * w_tot], t_dim, w_tot);
-        let tail =
-            faer::MatMut::from_column_major_slice_mut(&mut tail[..t_dim * t_dim], t_dim, t_dim);
-        matmul(
-            tail,
-            BlockStructure::TriangularLower,
-            faer::Accum::Add,
-            bt,
-            BlockStructure::Rectangular,
-            bt.transpose(),
-            BlockStructure::Rectangular,
-            -1.0,
-            faer::Par::Seq,
-        );
+        tri_lower_sub_gemm(tail, t_dim, bt, bt, w_tot);
     }
 }
 
@@ -329,6 +315,35 @@ pub(crate) fn chol_lower_generic<T: Scalar>(a: &[T], dim: usize, l_out: &mut [T]
         }
     }
     true
+}
+
+/// `tail(lower) -= a · bᵀ` via faer's blocked triangular `matmul`. `tail` is
+/// column-major `t_dim×t_dim` (lower triangle touched and written), `a` and
+/// `b` are column-major `t_dim×w_tot`. Pulled out of `<f64 as Scalar>::syrk_lower_sub`
+/// so the dual-number override below can drive the same faer call once per
+/// lane instead of duplicating it.
+pub(crate) fn tri_lower_sub_gemm(
+    tail: &mut [f64],
+    t_dim: usize,
+    a: &[f64],
+    b: &[f64],
+    w_tot: usize,
+) {
+    use faer::linalg::matmul::triangular::{matmul, BlockStructure};
+    let a = faer::MatRef::from_column_major_slice(&a[..t_dim * w_tot], t_dim, w_tot);
+    let b = faer::MatRef::from_column_major_slice(&b[..t_dim * w_tot], t_dim, w_tot);
+    let tail = faer::MatMut::from_column_major_slice_mut(&mut tail[..t_dim * t_dim], t_dim, t_dim);
+    matmul(
+        tail,
+        BlockStructure::TriangularLower,
+        faer::Accum::Add,
+        a,
+        BlockStructure::Rectangular,
+        b.transpose(),
+        BlockStructure::Rectangular,
+        -1.0,
+        faer::Par::Seq,
+    );
 }
 
 /// `tail(lower) -= bt · btᵀ`, generic over the scalar. `tail` is column-major
@@ -523,5 +538,18 @@ mod tests {
         for (pa, pb) in a.3.iter().zip(&b.3) {
             assert!((pa - pb).abs() < 1e-15, "gamma-log mu drifted beyond 1 ULP");
         }
+    }
+
+    /// Every implementor of the sealed trait must stay `Send + Sync` (both
+    /// are supertraits already; this pins that no method smuggled in a
+    /// `!Send`/`!Sync` associated type). Sealing itself is a property of
+    /// `mod sealed` staying private; nothing further to assert here beyond
+    /// these three types still implementing `Scalar` at all.
+    #[test]
+    fn scalar_trait_is_still_sealed_and_send_sync() {
+        fn assert_send_sync<T: Scalar + Send + Sync>() {}
+        assert_send_sync::<f64>();
+        assert_send_sync::<crate::dual::Dual<4>>();
+        assert_send_sync::<crate::dual::HyperDual<4, 10>>();
     }
 }

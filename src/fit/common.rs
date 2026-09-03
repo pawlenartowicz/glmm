@@ -155,6 +155,8 @@ pub(super) fn materialize_diagnostics(
             other => unreachable!("FitDiagnostics::boundary_hit is 0/1/2, got {other}"),
         },
         pinned,
+        boundary_score: vec![],
+        kkt_grad_norm: f64::NAN,
         notes,
     }
 }
@@ -193,6 +195,34 @@ pub(crate) fn pinned_flags(mask: u64, varcorr: &[Vec<f64>]) -> Vec<Vec<bool>> {
                     let bit = k < u64::BITS as usize && (mask >> k) & 1 == 1;
                     k += 1;
                     bit
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Reshape a `diagonal_theta`-ordered per-component score into
+/// [`Diagnostics::boundary_score`]'s varcorr-aligned layout. **Mirrors
+/// [`pinned_flags`] — change together**: the two must place their `[g][i]` on
+/// the same component or a reader pairing them silently reads the wrong score.
+/// The owning explanation of why `varcorr` is the only thing that can place a
+/// bit lives on `pinned_flags`.
+///
+/// An all-NaN input returns empty, matching `pinned_flags`'s mask-0
+/// short-circuit: nothing measured allocates nothing.
+pub(crate) fn pinned_scores(scores: &[f64], varcorr: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    if scores.iter().all(|s| s.is_nan()) {
+        return vec![];
+    }
+    let mut k = 0usize;
+    varcorr
+        .iter()
+        .map(|vech| {
+            (0..super::vech_q(vech.len()))
+                .map(|_| {
+                    let s = scores.get(k).copied().unwrap_or(f64::NAN);
+                    k += 1;
+                    s
                 })
                 .collect()
         })

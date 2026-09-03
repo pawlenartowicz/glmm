@@ -205,6 +205,16 @@ pub struct GlmmWorkspace {
     /// cached sparse one, so the both-paths cross-check runs both at one θ. Always
     /// `false` in production (the sparse factor is the only path).
     pub(crate) force_dense_schur: bool,
+    /// Force the FD stencil on every shape `derivative::supports_shape`
+    /// accepts, where the exact hyper-dual Hessian is otherwise used.
+    /// Test-and-A/B only: nothing on a fitting path sets it, and the two arms
+    /// are compared against each other by `exact_hessian_matches_fd_on_fixture`.
+    /// Mirrors `force_dense_schur`.
+    pub(crate) force_fd_hessian: bool,
+    /// `FitOptions::boundary_score`, set per fit by `run_glmm_on`: run the
+    /// hyper-dual Hessian for the pinned-component score in `fit_glmm`'s
+    /// diagnostics block. `false` ⇒ that block takes the gradient alone.
+    pub(crate) boundary_score_requested: bool,
     // inference scratch:
     /// p × p
     pub xtwx: Mat<f64>,
@@ -236,7 +246,7 @@ pub struct GlmmWorkspace {
     /// `GlmmFit`, so filling it costs no per-fit allocation and the `Rx` warm
     /// path keeps its zero-alloc gate. Sourced from the full matrix each SE arm
     /// already forms: `Rx` from the Schur forward-solve columns, `Hessian` from
-    /// `fd_hessian_cov`'s β block. Mapped to `Fit::vcov` by `fit/glmm.rs`.
+    /// `joint_hessian_cov`'s β block. Mapped to `Fit::vcov` by `fit/glmm.rs`.
     pub vcov: Mat<f64>,
     /// p×p scratch holding column `j` of `L⁻¹` at each target `j` — the `Rx`
     /// arm's per-target forward solves, kept so their pairwise dots can fill
@@ -245,14 +255,30 @@ pub struct GlmmWorkspace {
     /// length p
     pub t_sq: Vec<f64>,
     // SE of each θ coordinate = sqrt of the θ-block diagonal of the joint (θ,β)
-    // FD-Hessian covariance (length n_theta). Filled ONLY on the `WaldSe::Hessian`
-    // GLMM path from the θ block `fd_hessian_cov` already inverts (it otherwise
+    // Hessian covariance (length n_theta). Filled ONLY on the `WaldSe::Hessian`
+    // GLMM path from the θ block `joint_hessian_cov` already inverts (it otherwise
     // discards it); NaN under `WaldSe::Rx`, on the Hessian RX fallback, and on a
     // non-converged fit. For a SCALAR grouping (q=1, dispersion≡1) the RE stddev
     // equals its θ, so this is that stddev's SE directly (identity delta map); the
     // only reachable GLMM groupings are scalar (intercept-only).
     /// length n_theta
     pub theta_se: Vec<f64>,
+    /// ∞-norm of the box-projected θ gradient of the deviance at the accepted
+    /// γ̂ — the KKT residual, projected in the internal θ̃ where the box lives
+    /// and reported in the caller's θ units (× `theta_row_scales`, the opposite
+    /// direction to `stddev_se`'s division, because this is a derivative w.r.t.
+    /// θ and that is an SE in θ). NaN when no exact gradient was available —
+    /// every shape outside `derivative::supports_shape`, over `MAX_DUAL_N`, or
+    /// at a pinned crossed θ̂. Observation only: nothing branches on it.
+    pub(crate) kkt_grad_norm: f64,
+    /// Per-θ-coordinate variance score at the boundary: `½·∂²D/∂θ_jj²` at the
+    /// accepted γ̂, which is `dD/ds_j` at `s_j = θ_jj² = 0`. In the CALLER's
+    /// variance units — the Hessian entry comes out in the internal θ̃ and is
+    /// multiplied by the row scale SQUARED, because a second derivative takes
+    /// the scale twice where `kkt_grad_norm` takes it once. Written only for
+    /// PINNED diagonal coordinates; NaN for interior coordinates, for every
+    /// off-diagonal, and everywhere no exact Hessian exists. Length `n_theta`.
+    pub(crate) boundary_score: Vec<f64>,
     /// length p; Var(β̂)_jj forward-solve scratch (per-target)
     pub fwd_solve: Vec<f64>,
     // joint Wald scratch (reuse lmm::joint_wald_chi_sq):
@@ -262,23 +288,25 @@ pub struct GlmmWorkspace {
     pub joint_sigma_t_chol: Mat<f64>,
     /// Joint Wald right-hand side, length p.
     pub joint_rhs: Vec<f64>,
-    // FD-Hessian SE scratch (`fd_hessian_cov`), allocated once so the per-fit
+    // FD-Hessian SE scratch (`joint_hessian_cov`), allocated once so the per-fit
     // hessian path reuses them. `m = n_theta + p = params.len()`.
     /// m × m joint-deviance Hessian
     pub hess_scratch: Mat<f64>,
+    /// Scratch for the joint gradient, length `m`. Sized once.
+    pub(crate) grad_scratch: Vec<f64>,
     /// length m; converged γ̂ snapshot restored each return
     pub fd_saved: Vec<f64>,
     /// length m; per-coordinate FD step h_k
     pub fd_steps: Vec<f64>,
     /// When true, `laplace_deviance_at` seeds PIRLS from `u_seed` (the fitted mode
-    /// û(γ̂)) instead of û = 0. Set ONLY by `fd_hessian_cov`, for **every** one of
-    /// its evals including the central f0, and reset on every `fd_hessian_cov` exit
+    /// û(γ̂)) instead of û = 0. Set ONLY by `joint_hessian_cov`, for **every** one of
+    /// its evals including the central f0, and reset on every `joint_hessian_cov` exit
     /// so non-FD callers keep their cold, order-free û = 0 start. Same fixed-seed
-    /// FD-derivative invariant as `fd_hessian_cov` in se.rs — see there for the
+    /// FD-derivative invariant as `joint_hessian_cov` in se.rs — see there for the
     /// derivation and for why f0 is inside the warm set too.
     pub warm_seed_active: bool,
     /// PIRLS exit-tol override read by `laplace_deviance_at` and forwarded to every
-    /// PIRLS variant. `Some(pirls_tol_fd(family))` ONLY while `fd_hessian_cov` runs
+    /// PIRLS variant. `Some(pirls_tol_fd(family))` ONLY while `joint_hessian_cov` runs
     /// (set on entry, reset on every exit — the `warm_seed_active` discipline), so
     /// the FD second differences see a deviance converged at least as far as the
     /// fit's own exit. `None` everywhere else: the fit/BOBYQA path never pays the
@@ -548,6 +576,8 @@ impl GlmmWorkspace {
             coup_mask: None,
             structured_schur: None,
             force_dense_schur: false,
+            force_fd_hessian: false,
+            boundary_score_requested: false,
             xtwx: Mat::zeros(p, p),
             xtwm: Mat::zeros(p, k.max(1)),
             ainv_mtwx: Mat::zeros(k.max(1), p),
@@ -567,11 +597,14 @@ impl GlmmWorkspace {
             vcov_cols: Mat::zeros(p, p),
             t_sq: vec![0.0; p],
             theta_se: vec![f64::NAN; n_theta],
+            kkt_grad_norm: f64::NAN,
+            boundary_score: vec![f64::NAN; n_theta],
             fwd_solve: vec![0.0; p],
             joint_k_inv: Mat::zeros(p, p),
             joint_sigma_t_chol: Mat::zeros(p, p),
             joint_rhs: vec![0.0; p],
             hess_scratch: Mat::zeros((n_theta + p).max(1), (n_theta + p).max(1)),
+            grad_scratch: vec![0.0; n_theta + p],
             fd_saved: vec![0.0; n_theta + p],
             fd_steps: vec![0.0; n_theta + p],
             warm_seed_active: false,
@@ -620,7 +653,7 @@ impl GlmmWorkspace {
 /// CLONE of `src`'s groupings, then copies the load-bearing state the fresh
 /// constructor zeroes: the built design (`z`, `z_buf`), the structured crossed
 /// factor (rebuilt as its own per-thread scratch — see `StructuredSchur::
-/// clone_scratch`), and the FD seed state `fd_hessian_cov` set before the grid.
+/// clone_scratch`), and the FD seed state `joint_hessian_cov` set before the grid.
 /// A missed field is a silent aliasing bug; the knob-on-vs-off bit-identity test
 /// in `glmm/tests.rs` is the enforcement.
 ///
@@ -645,7 +678,8 @@ pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
     w.structured_schur = src.structured_schur.as_ref().map(|ss| ss.clone_scratch());
     w.nb_theta = src.nb_theta;
     w.force_dense_schur = src.force_dense_schur;
-    // FD seed state (fd_hessian_cov sets these before the grid).
+    w.force_fd_hessian = src.force_fd_hessian;
+    // FD seed state (joint_hessian_cov sets these before the grid).
     w.params.copy_from_slice(&src.params);
     w.fd_saved.copy_from_slice(&src.fd_saved);
     w.fd_steps.copy_from_slice(&src.fd_steps);
@@ -735,7 +769,13 @@ pub(crate) fn glmm_block_solve_panel<T: crate::scalar::Scalar>(
 /// iteration / BOBYQA eval into `l_values`. Mirrors `SparseLmmWorkspace`
 /// (`sparse.rs`), one factor narrower — only the crossed tail, not the whole system.
 /// `None` for nested-only shapes (`e = 0`, no Schur).
-pub(crate) struct StructuredSchur {
+// `pub` (fields stay `pub(crate)`) so `Scalar`'s `tail_*` methods — a `pub`
+// trait — can name this type in their signatures without tripping the
+// default-on `private_interfaces` lint; `#[doc(hidden)]` plus `mod glmm`
+// staying private keeps it reachable-but-unnameable outside the crate, so
+// nothing joins the public surface.
+#[doc(hidden)]
+pub struct StructuredSchur {
     /// Symbolic Cholesky of `S`'s pattern (AMD; simplicial or supernodal by
     /// faer's AUTO heuristic — `logdet_llt` handles both). Reused every refactor.
     pub(crate) symbolic: SymbolicCholesky<usize>,
@@ -756,13 +796,11 @@ pub(crate) struct StructuredSchur {
     /// `dd_temp` the `C_f'·Y` product (col-major `e_f×e_f`, lower). Sized once
     /// to `max_f e_f` off the FULL θ-independent incidence (`cols_of` in `new` —
     /// a superset of every θ-masked `coup_cols` CSR the fit visits), overwritten
-    /// per cluster. Used only at `qc > 1`: at `qc == 1` `structured_factor`
-    /// routes to the scalar walk and `new` sizes these to 0 (change together).
-    /// The panel is NOT a win at qc=1 — the downdate is rank-1, so the staging
-    /// (gather + `dd_temp` + a second scatter pass) doubles memory traffic for
-    /// identical arithmetic and measured a +4–7% per-eval loss on the cross6
-    /// GLMM cells (2026-07-14 drift investigation). It stays for qc>1, the only
-    /// case that has real qc×e_f batched work to amortize the staging.
+    /// per cluster. Used only at `qc > 1`: at `qc == 1` `TailKernel::tail_downdate`'s
+    /// `f64` override routes to the scalar walk instead and `new` sizes these to
+    /// 0 (change together — that override's doc carries the qc=1 panel-vs-scalar
+    /// measurement behind the split). It stays for qc>1, the only case that has
+    /// real qc×e_f batched work to amortize the staging.
     pub(crate) c_panel: Vec<f64>,
     pub(crate) y_panel: Vec<f64>,
     pub(crate) dd_temp: Vec<f64>,
@@ -837,12 +875,13 @@ impl StructuredSchur {
         let solve_mem = MemBuffer::new(symbolic.solve_in_place_scratch::<f64>(1, Par::Seq));
         let qc = g.primary_q + g.nested_per_parent;
         let max_ef = cols_of.iter().map(|v| v.len()).max().unwrap_or(0);
-        // At qc == 1 `structured_factor` routes the downdate to its scalar arm
-        // (the panel staging is a +4–7% per-eval loss there; 2026-07-14 drift
-        // investigation), so the panel buffers are never touched — size them to 0.
-        // Mirrors the `qc != 1` filter in `structured_factor` — change together:
-        // widening the route without resizing slices zero-length buffers and
-        // panics. `clone_scratch` follows automatically (it mirrors these lengths).
+        // At qc == 1 `TailKernel::tail_downdate`'s `f64` override routes the downdate
+        // to its scalar arm (the panel staging is a +4–7% per-eval loss there;
+        // that override's doc carries the measurement), so the panel buffers are
+        // never touched — size them to 0. Mirrors the `qc != 1` filter in that
+        // override — change together: widening the route without resizing
+        // slices zero-length buffers and panics. `clone_scratch` follows
+        // automatically (it mirrors these lengths).
         let panel_ef = if qc == 1 { 0 } else { max_ef };
         Some(StructuredSchur {
             symbolic,
@@ -1054,15 +1093,15 @@ pub(crate) fn apply_lambda(
 /// `cluster_ids` (only for the nested global→local id conversion — see below),
 /// `lam` (filled here via `primary_lambda`), and `params`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_packed_m(
+pub(crate) fn build_packed_m<T: crate::scalar::Scalar>(
     g: &LmmGroupings,
-    params: &[f64],
+    params: &[T],
     z_buf: &[f64],
     extra_ids: &[Vec<u32>],
-    lam: &mut [f64],
+    lam: &mut [T],
     cluster_ids: &[u32],
-    m_core_buf: &mut [f64],
-    cross_val: &mut [f64],
+    m_core_buf: &mut [T],
+    cross_val: &mut [T],
     cross_col: &mut [u32],
     n_cross: &mut [u8],
     n: usize,
@@ -1077,7 +1116,7 @@ pub(crate) fn build_packed_m(
     // `classify_design` routes extra-slopes shapes to Sparse for every family).
     debug_assert!(!g.extra_slopes_any);
     crate::lmm::primary_lambda(&params[..g.n_theta()], q, lam);
-    let theta_nested = g.nested.map(|nf| params[nf.vech_start]).unwrap_or(0.0);
+    let theta_nested = g.nested.map(|nf| params[nf.vech_start]).unwrap_or(T::ZERO);
     // Declaration index into `extra_offsets`/`extra_ids` for the nested factor;
     // `None` when there is no nested grouping (`np == 0`, the loop below never
     // reads it then).
@@ -1091,12 +1130,12 @@ pub(crate) fn build_packed_m(
         // pre-widened slope value `z_buf[i·(q−1)+(r−1)]` otherwise (the same
         // `x` column `build_z` would have widened into the row's `z` block).
         for c in 0..q {
-            let mut acc = 0.0;
+            let mut acc = T::ZERO;
             for r in c..q {
                 let zr = if r == 0 {
-                    1.0
+                    T::ONE
                 } else {
-                    z_buf[i * (q - 1) + (r - 1)]
+                    T::from_f64(z_buf[i * (q - 1) + (r - 1)])
                 };
                 acc += zr * lam[r * q + c];
             }
@@ -1133,7 +1172,7 @@ pub(crate) fn build_packed_m(
                 m_core_buf[i * qc + q + j] = if j == local_id {
                     theta_nested
                 } else {
-                    0.0 * theta_nested
+                    T::ZERO * theta_nested
                 };
             }
         }
@@ -1144,7 +1183,14 @@ pub(crate) fn build_packed_m(
         let mut cnt = 0usize;
         for cf in &g.crossed {
             let theta = params[cf.vech_start];
-            if theta == 0.0 {
+            // A pinned grouping is pinned by its value part — never by a
+            // derivative lane — so the CSR pattern this fills stays identical
+            // across every T at the same θ̂ (mirrors deviance.rs's pin mask —
+            // change together). The skip is why a pinned crossed θ has no
+            // derivative lane at all: `derivative::extras_theta_pin_free`
+            // routes such a θ̂ to `Unsupported`, and its comment carries the
+            // mechanism and the fix — third site in this chain, change together.
+            if theta.value() == 0.0 {
                 continue;
             }
             // q_g==1 here (see debug_assert above), so vech_start − base_theta is

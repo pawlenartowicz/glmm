@@ -11,6 +11,22 @@
 use crate::ols::PANEL_ROWS;
 use faer::Mat;
 
+/// Ceiling on `Diagnostics::kkt_grad_norm` at a converged GLMM optimum,
+/// interior or boundary — "at or below what BOBYQA actually leaves", not zero
+/// (BOBYQA stops on a trust radius, not on a gradient). Shared by the KKT
+/// tests in `src/glmm/tests.rs` and `src/fit/common_tests.rs`.
+///
+/// Calibrated 2026-09-01 by `kkt_calibration_measurement`
+/// (`tests/validation_oracle.rs`, `--features oracle-tests -- --ignored`) over
+/// every GLMM golden the cross-engine tier loads plus the committed
+/// `glmm_hessian_vcov.json` fixture: worst finite residual 1.1311e-1
+/// (`sim_cloglog_glmm`, deviance ≈ 9848; the rest sit between 5.5e-8 and
+/// 2.2e-2). Pinned absolute — the residuals do not cleanly track `|deviance|`
+/// across rungs (ratio spans ~5 decades) — at ceil-to-one-significant-figure
+/// of ten times that worst, the margin convention `validation/tol.R` uses for
+/// its own measured bands.
+pub(crate) const KKT_INTERIOR_MAX: f64 = 2.0;
+
 /// Near-identity slice comparison shared by the fit-core equivalence tests
 /// (`fit_on`-on-reused-ws vs `fit_cold`, view-mapper vs direct). Tolerance is
 /// `1e-12 + 1e-9·|want|` — tight enough to catch every failure these gates

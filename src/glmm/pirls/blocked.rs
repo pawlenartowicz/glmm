@@ -53,6 +53,9 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
     eta_fixed: &mut [T],
     a_blocks: &mut [T],
     a_rhs: &mut [T],
+    // Dual derivative kernels' per-solve controls (see `DualStep`); `None` on
+    // every f64 fit-path call.
+    mut dual: Option<&mut DualStep<T>>,
     // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
     // (mirrors `pirls_solve`'s `wx`; this variant has no dense M so there is no
     // `wm` twin here — B' = X'WM is filled by cluster-scatter instead).
@@ -127,6 +130,17 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
     let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
     let mut converged = false;
+    let min_iters = match dual.as_deref_mut() {
+        Some(d) => {
+            // Unconditional `true` because this path pairs it with
+            // `observed = !canonical`: the step it takes IS the Hessian step.
+            // Mirrors `pirls_solve_blocked_extras`'s `exact` contract — change
+            // together; the reasoning is written out there.
+            d.exact = true;
+            d.min_iters
+        }
+        None => 0,
+    };
     let (mut dev, mut pen, mut logdet) = (T::from_f64(f64::NAN), T::from_f64(f64::NAN), T::ZERO);
     let tol = pirls_tol_override.unwrap_or_else(|| super::super::pirls_tol(family));
     for it in 0..PIRLS_MAX_ITERS {
@@ -226,6 +240,11 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         for v in a_rhs[..k].iter_mut() {
             *v = T::ZERO;
         }
+        if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
+            for v in d.obs_blocks[..s * q * q].iter_mut() {
+                *v = T::ZERO;
+            }
+        }
         // --- pass 3: scatter-pass (scalar): wᵢmᵢmᵢ' and rᵢ·mᵢ into the blocks.
         // The effective residual rᵢ is logit's (yᵢ−pᵢ) or the general W·working_resid. ---
         for i in 0..n {
@@ -250,6 +269,20 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 let wr = wi * m_row[r];
                 for c in 0..=r {
                     a_blocks[ablk + r * q + c] += wr * m_row[c];
+                }
+            }
+            // Observed-weight twin of the Fisher scatter above, into the
+            // observed blocks (same lower-triangle layout).
+            if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
+                let wo = crate::family::observed_weight(
+                    family, nb_theta, y[i], prior_w[i], eta[i], prob[i], wi,
+                );
+                for r in 0..q {
+                    let wr = wo * m_row[r];
+                    #[allow(clippy::needless_range_loop)]
+                    for c in 0..=r {
+                        d.obs_blocks[ablk + r * q + c] += wr * m_row[c];
+                    }
                 }
             }
         }
@@ -295,6 +328,34 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         for f in 0..s {
             let ablk = f * q * q;
             let ubase = f * q;
+            // Observed step first (reads g_f off `a_rhs` before the Fisher rhs
+            // overwrites it): rhs_obs = (A_obs,f − I)·u_old_f + g_f, +I, factor,
+            // solve into `obs_u`. A non-PD observed block leaves `obs_u` unused
+            // and the step below falls back to the Fisher solve for this block.
+            // The Fisher block is still formed and factored below on every
+            // route — it is what `log|A|` and the returned factor come from.
+            let mut obs_u = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
+            let mut have_obs = false;
+            if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
+                let ob = &mut d.obs_blocks[ablk..ablk + q * q];
+                for r in 0..q {
+                    let mut acc = a_rhs[ubase + r];
+                    for c in 0..q {
+                        let (hi, lo) = if r >= c { (r, c) } else { (c, r) };
+                        acc += ob[hi * q + lo] * u[ubase + c];
+                    }
+                    obs_u[r] = acc;
+                }
+                for r in 0..q {
+                    ob[r * q + r] += T::ONE;
+                }
+                if glmm_block_chol(ob, q) {
+                    glmm_block_solve(ob, q, &mut obs_u[..q]);
+                    have_obs = true;
+                } else {
+                    d.exact = false;
+                }
+            }
             // (A_f − I)·u_old_f added to g_f (in a_rhs), using the still-unfactored
             // symmetric lower triangle.
             for r in 0..q {
@@ -322,6 +383,9 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             // solve u_new_f = A_f⁻¹ rhs_f in place (rhs lives in a_rhs[ubase..], copy to u).
             u[ubase..ubase + q].copy_from_slice(&a_rhs[ubase..ubase + q]);
             glmm_block_solve(&a_blocks[ablk..ablk + q * q], q, &mut u[ubase..ubase + q]);
+            if have_obs {
+                u[ubase..ubase + q].copy_from_slice(&obs_u[..q]);
+            }
             for r in 0..q {
                 pen += u[ubase + r] * u[ubase + r];
             }
@@ -464,7 +528,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         // pre-halving loop when no halving fires (see `pirls_solve` for why the
         // same-point band cannot be a converge trigger).
         let mixed = (dev + pen).value();
-        if (mixed - mixed_prev).abs() < tol * (1.0 + mixed.abs()) {
+        if it + 1 >= min_iters && (mixed - mixed_prev).abs() < tol * (1.0 + mixed.abs()) {
             converged = true;
             break;
         }

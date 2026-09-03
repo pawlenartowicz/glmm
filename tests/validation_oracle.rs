@@ -776,3 +776,98 @@ fn oracle_name(glmm_name: &str) -> String {
         None => glmm_name.to_string(),
     }
 }
+
+/// Calibration measurement for `KKT_INTERIOR_MAX` (`src/test_support.rs`) —
+/// prints, for every GLMM rung the tier loads plus the committed
+/// `tests/fixtures/glmm_hessian_vcov.json` fixture: name, boundary, deviance
+/// and `kkt_grad_norm`. It asserts nothing; the constant is pinned BY HAND
+/// from its output (ceil-to-one-significant-figure of ten times the worst
+/// finite value — the margin convention `validation/tol.R` uses for its own
+/// measured bands). NaN rows are the shapes with no exact gradient
+/// (structured extras, dense fallback, sparse) and are not part of the
+/// calibration. Run:
+///
+/// ```sh
+/// cargo test --features oracle-tests kkt_calibration -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn kkt_calibration_measurement() {
+    for (g, factors) in corpus() {
+        if !matches!(shape_of(&g), Shape::Glmm | Shape::VectorAgq) {
+            continue;
+        }
+        let factor_refs: Vec<&str> = factors.iter().map(String::as_str).collect();
+        let (f, _cols, _groups) = refit(&g, &factor_refs);
+        println!(
+            "{}\tboundary={:?}\tdeviance={}\tkkt={:e}",
+            g.name, f.diagnostics.boundary, f.deviance, f.diagnostics.kkt_grad_norm
+        );
+    }
+    // The committed n=96 / 12-cluster `y ~ x1 + (1|grp)` binomial fixture,
+    // through the same public `fit_cold` route.
+    let s = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/glmm_hessian_vcov.json"
+    ))
+    .expect("read hessian fixture");
+    let v: Value = serde_json::from_str(&s).expect("parse hessian fixture");
+    let n = v["n"].as_u64().unwrap() as usize;
+    let x_rows: Vec<Vec<f64>> = v["x"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            r.as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e.as_f64().unwrap())
+                .collect()
+        })
+        .collect();
+    let p = x_rows[0].len();
+    let x: Vec<f64> = x_rows.iter().flat_map(|r| r.iter().copied()).collect();
+    let y: Vec<f64> = v["y"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_f64().unwrap())
+        .collect();
+    let ids: Vec<u32> = v["cluster_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_u64().unwrap() as u32)
+        .collect();
+    let n_clusters = ids.iter().max().unwrap() + 1;
+    let model = glmm::ModelSpec {
+        family: glmm::Family::Binomial {
+            link: glmm::BinomialLink::Logit,
+        },
+        re: Some(glmm::ReStructure {
+            sizing: glmm::Sizing::FixedClusters { n_clusters },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let opts = glmm::FitOptions {
+        target_indices: (0..p as u32).collect(),
+        ..glmm::FitOptions::default()
+    };
+    let f = glmm::fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &glmm::GroupIds {
+            primary: ids,
+            extra: vec![],
+        },
+        &opts,
+    );
+    println!(
+        "glmm_hessian_vcov_fixture\tboundary={:?}\tdeviance={}\tkkt={:e}",
+        f.diagnostics.boundary, f.deviance, f.diagnostics.kkt_grad_norm
+    );
+}

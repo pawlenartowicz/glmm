@@ -499,12 +499,130 @@ pub(crate) fn irls_weight_and_resid<T: Scalar>(
     }
 }
 
+/// Observed (Newton) IRLS weight `−½·d²devᵢ/dηᵢ²` at η, from the Fisher weight
+/// `w = (dμ/dη)²/V` the caller already holds: `w_obs = w − (y−μ)·dr/dη` with
+/// `r(η) = (dμ/dη)/V(μ)` the score factor (`−½·d devᵢ/dη = r·(y−μ)`). `dr/dη`
+/// is 0 exactly where `r` is constant — the canonical links, Gamma-inverse
+/// (`r ≡ −1`) and inverse-Gaussian inverse-squared (`r ≡ −½`) — so the
+/// observed and Fisher weights coincide there. Per link, `μ' = dμ/dη`:
+/// probit `r = φ/V`, `dr/dη = −φ(ηV + φ(1−2μ))/V²`; cloglog `r = eᵑ/μ`,
+/// `dr/dη = r(1 − μ'/μ)`; Gamma-log `r = 1/μ`, `dr/dη = −1/μ`; NB-log
+/// `r = θ/(θ+μ)`, `dr/dη = −θμ/(θ+μ)²`; inverse-Gaussian-log `r = 1/μ²`,
+/// `dr/dη = −2/μ²`. Checked against a central difference of `r` per family
+/// in `observed_weight_matches_fd_of_score_factor`. `eta`/`mu` are the pass's
+/// already-clamped values; `w` carries the prior weight, so the correction is
+/// scaled by `prior_w` too. Only the dual derivative kernels read this
+/// (`pirls::DualStep::observed`).
+pub(crate) fn observed_weight<T: Scalar>(
+    family: Family,
+    nb_theta: f64,
+    y: f64,
+    prior_w: f64,
+    eta: T,
+    mu: T,
+    w: T,
+) -> T {
+    let dr = match family {
+        Family::Gaussian
+        | Family::Poisson { .. }
+        | Family::Binomial {
+            link: BinomialLink::Logit,
+        }
+        | Family::Gamma {
+            link: GammaLink::Inverse,
+        }
+        | Family::InverseGaussian {
+            link: InverseGaussianLink::InverseSquared,
+        } => return w,
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        } => {
+            let phi = mu_eta(family, eta);
+            let v = mu * (T::ONE - mu);
+            -phi * (eta * v + phi * (T::ONE - T::from_f64(2.0) * mu)) / (v * v)
+        }
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        } => {
+            let r = Scalar::exp(eta) / mu;
+            r * (T::ONE - mu_eta(family, eta) / mu)
+        }
+        Family::Gamma {
+            link: GammaLink::Log,
+        } => -(T::ONE / mu),
+        Family::NegativeBinomial { .. } => {
+            let th = T::from_f64(nb_theta);
+            let d = th + mu;
+            -th * mu / (d * d)
+        }
+        Family::InverseGaussian {
+            link: InverseGaussianLink::Log,
+        } => T::from_f64(-2.0) / (mu * mu),
+    };
+    w - T::from_f64(prior_w) * (T::from_f64(y) - mu) * dr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         BinomialLink, Family, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink,
     };
+
+    /// `observed_weight`'s `dr/dη` per link against a central difference of
+    /// `r(η) = (dμ/dη)/V(μ(η))`, read back through `w_obs = w − (y−μ)·dr/dη`
+    /// at `y − μ = 1` (so `dr/dη = w − w_obs`). Step 1e-5, band 1e-7: the
+    /// truncation error is O(h²) ≈ 1e-10 on these smooth links, the
+    /// cancellation error ≈ 1e-11, so the band is ~1000× the expected error.
+    #[test]
+    fn observed_weight_matches_fd_of_score_factor() {
+        let fams = [
+            Family::Binomial {
+                link: BinomialLink::Probit,
+            },
+            Family::Binomial {
+                link: BinomialLink::Cloglog,
+            },
+            Family::Gamma {
+                link: GammaLink::Log,
+            },
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            Family::InverseGaussian {
+                link: InverseGaussianLink::Log,
+            },
+            // Constant-`r` links: the derivative is exactly 0.
+            Family::Gamma {
+                link: GammaLink::Inverse,
+            },
+            Family::InverseGaussian {
+                link: InverseGaussianLink::InverseSquared,
+            },
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
+        ];
+        let nb_theta = 2.5;
+        let r = |f: Family, eta: f64| mu_eta(f, eta) / variance(f, nb_theta, link_inv(f, eta));
+        for f in fams {
+            // Positive η only: Gamma-inverse and IG-inverse-squared need η > 0.
+            for eta in [0.3_f64, 0.9, 1.7] {
+                let h = 1e-5;
+                let fd = (r(f, eta + h) - r(f, eta - h)) / (2.0 * h);
+                let mu = link_inv(f, eta);
+                let w = 1.0;
+                let got = w - observed_weight(f, nb_theta, mu + 1.0, 1.0, eta, mu, w);
+                assert!(
+                    (got - fd).abs() < 1e-7,
+                    "{f:?} eta={eta}: dr/deta {got} vs fd {fd}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn poisson_log_canonical_quantities() {

@@ -1549,7 +1549,7 @@ fn sparse_schur_small_e_matches_dense() {
 /// `fit_glmm_cbpp_matches_lme4` on this very fit, and at nAGQ = 7/11 by
 /// `fit_glmm_binomial_bigsd_agq_matches_lme4`.
 ///
-/// AGQ does not leave the SE *convention* alone: `fd_hessian_cov` differentiates
+/// AGQ does not leave the SE *convention* alone: `joint_hessian_cov` differentiates
 /// the deviance through `ws.nagq`, so at k > 1 it differences the AGQ deviance,
 /// not the Laplace one — the SE is a property of the quadrature order like
 /// everything else. What is true, measured
@@ -2101,7 +2101,7 @@ fn fit_glmm_cloglog_matches_lme4() {
 /// formula as the log-link test below — only the link differs, which is what
 /// makes it a controlled pair.
 ///
-/// Regression guard for the FD-Hessian seeding bug: `fd_hessian_cov` used to
+/// Regression guard for the FD-Hessian seeding bug: `joint_hessian_cov` used to
 /// re-derive the random-effect mode û(γ̂) by a COLD PIRLS solve rather than
 /// reusing the one the fit had just converged to. Where the mode problem has more
 /// than one basin the cold solve lands in a different one, and the inverse link is
@@ -2140,7 +2140,7 @@ fn fit_glmm_gamma_inverse_link_matches_lme4() {
         }),
     };
     // Default `WaldSe::Hessian` deliberately — the Rx arm never touches
-    // `fd_hessian_cov` and stayed green all through the bug.
+    // `joint_hessian_cov` and stayed green all through the bug.
     let f = fit_cold(
         &x,
         &y,
@@ -2401,10 +2401,18 @@ fn fit_glmm_nb_sim_matches_lme4() {
     // just ran at.
     const BAND: f64 = 1e-7;
     const REF_BETA_PIN: [f64; 3] = [-0.02075568116330833, 0.5939541494671592, 0.5994666840076409];
+    // Re-pinned 2026-09-01: the exact hyper-dual joint (θ, β) Hessian replaced
+    // the finite-difference stencil on the blocked GLMM path (W3). The fit is
+    // unchanged — β̂, τ̂², θ̂ and the deviance keep their pins — so the movement
+    // here is the FD stencil's own truncation-plus-noise error, measured at
+    // 1.34e-5 rel (se[0], worst) on this fixture against the `se_hessian_rel`
+    // band of 1e-3. Regenerate by running this test and reading the reported
+    // value; the value is glmm's own, not a reference (the lme4 comparison in
+    // this same test keeps its 5e-2 band and did not move).
     const REF_SE_PIN: [f64; 3] = [
-        0.16316851193776868,
-        0.07212836302375578,
-        0.14148159540123056,
+        0.16316631869132972,
+        0.07212836278258408,
+        0.14148157243560103,
     ];
     const REF_TAU2_PIN: [f64; 1] = [0.3297226921658576];
     const REF_THETA_PIN: f64 = 1.783_599_975_969_345;
@@ -2531,7 +2539,16 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
     // just ran at.
     const BAND: f64 = 1e-7;
     const REF_BETA_PIN: [f64; 2] = [0.5849258898680778, 0.5073630231065611];
-    const REF_SE_PIN: [f64; 2] = [0.2048298934582241, 0.053993815699549405];
+    // Re-pinned 2026-09-02: the exact hyper-dual joint (θ, β) Hessian replaced
+    // the finite-difference stencil on the STRUCTURED extras path too, so this
+    // nested fixture now takes the arm the blocked NB fixture took on
+    // 2026-09-01. The fit is unchanged — β̂, τ̂², θ̂ and the deviance keep their
+    // pins — so the movement is the FD stencil's own truncation-plus-noise
+    // error, 9.58e-6 rel (se[0], worst) against the `se_hessian_rel` band of
+    // 1e-3. Regenerate by running this test and reading the reported value; the
+    // value is glmm's own, not a reference (the lme4 comparison in this same
+    // test keeps its 5e-2 band and did not move).
+    const REF_SE_PIN: [f64; 2] = [0.2048279321099271, 0.0539936652016425];
     const REF_TAU2_PIN: [f64; 2] = [0.39569392783021273, 0.12615822089462564];
     const REF_THETA_PIN: f64 = 1.430_063_029_750_896_3;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb_nested pinned beta");
@@ -2945,8 +2962,15 @@ fn fit_glmm_binomial_slope1_vector_agq_is_pinned() {
         1,
         family,
         &[0.42897645003558754, 0.43458315523970653],
-        // re-anchored 2026-07-31
-        &[0.15626746700186334, 0.13104758685425869],
+        // Re-pinned 2026-09-01 (was the 2026-07-31 re-anchor): the exact
+        // hyper-dual joint (θ, β) Hessian replaced the FD stencil on the
+        // blocked GLMM path (W3), which covers this vector-AGQ shape. The fit
+        // is unchanged — β/stddev/corr keep their constants — so the movement
+        // is the FD stencil's own truncation-plus-noise error, measured at
+        // 1.32e-5 rel (k=7 se[1], worst) against the `se_hessian_rel` band of
+        // 1e-3. Regenerate by running this test and reading the reported value;
+        // the value is glmm's own, not a reference.
+        &[0.1562674235527202, 0.13104931577314224],
         &[0.8758219936062426, 0.3726397459266911],
         &[0.5283132632086392],
         BAND,
@@ -2958,7 +2982,9 @@ fn fit_glmm_binomial_slope1_vector_agq_is_pinned() {
         1,
         family,
         &[0.42897959050352286, 0.43458759206119546],
-        &[0.15627012841005886, 0.13105001203556532],
+        // Re-pinned 2026-09-01, same W3 exact-Hessian movement as the k=7 row
+        // above (1.32e-5 rel worst) — see the provenance comment there.
+        &[0.15627017032650084, 0.13105173822010058],
         &[0.8758453743269463, 0.3726611962891021],
         &[0.5283433982271978],
         BAND,

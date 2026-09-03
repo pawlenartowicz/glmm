@@ -341,6 +341,7 @@ pub(crate) fn run_glmm_on<'a>(
     // NB θ̂ is threaded explicitly (the spec is θ-free); the PIRLS/AGQ variance and
     // deviance read it off the workspace. NaN for every non-NB family (unread).
     ws.nb_theta = nb_theta;
+    ws.boundary_score_requested = opts.boundary_score;
 
     // Warm start threads β + θ into the GLMM kernel. A caller-supplied `start` (the
     // MCPower hot loop) uses its β verbatim; a cold start seeds β from the no-RE GLM
@@ -479,10 +480,13 @@ pub(crate) fn glmm_view_to_fit(
 
     // SE of the RE stddevs from the joint-Hessian θ block (`WaldSe::Hessian` only;
     // NaN under Rx / RX fallback / non-converged — `ws.theta_se` is reset per fit
-    // and refilled only by `fd_hessian_cov`). For the reachable scalar groupings
+    // and refilled only by `joint_hessian_cov`). For the reachable scalar groupings
     // θ = stddev, so the θ-scale SE is the stddev SE.
     //
-    // The FD stencil perturbs the INTERNAL θ̃ = s·θ, so `theta_se` is an SE on θ̃.
+    // The joint Hessian is taken in the INTERNAL θ̃ = s·θ on both arms (the FD
+    // stencil perturbs it, the exact kernel differentiates w.r.t. it), so
+    // `theta_se` is an SE on θ̃ — mirrors §Boundary handling in
+    // `documentation/algorithms-glmm.md`, change together.
     // The map is a fixed diagonal linear reparametrization, so its Jacobian is the
     // constant `s` — the back-map is the same plain division θ̂ itself takes, with
     // no delta-method term.
@@ -531,13 +535,36 @@ pub(crate) fn glmm_view_to_fit(
         &y[..n],
         ws.weighted.then(|| &ws.prior_w[..n]),
     );
+    let mut diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
+    // The derivative diagnostics do not pass through `FitDiagnostics`: that
+    // carrier is `Copy`, holds no `Vec`, and is re-exported by `loop_advanced`,
+    // which takes no new capability before 1.0.0. They ride the same route
+    // `stddev_se` does — workspace buffer, read here.
+    diagnostics.kkt_grad_norm = if converged {
+        ws.kkt_grad_norm
+    } else {
+        f64::NAN
+    };
+    // `pinned_scores` is keyed to `diagonal_theta` order like `pinned_flags`,
+    // so collapse the θ-coordinate buffer onto the diagonals first.
+    let diag_scores: Vec<f64> = ws
+        .groupings
+        .diagonal_theta()
+        .iter()
+        .map(|&ti| ws.boundary_score[ti])
+        .collect();
+    diagnostics.boundary_score = if converged {
+        super::common::pinned_scores(&diag_scores, &varcorr)
+    } else {
+        vec![]
+    };
     let mut fit = Fit {
         beta,
         se,
         vcov,
         tau2,
         dispersion,
-        diagnostics: super::common::materialize_diagnostics(&diag, p, &varcorr),
+        diagnostics,
         varcorr,
         stddev_se,
         n_eval: glmm_fit.n_eval,

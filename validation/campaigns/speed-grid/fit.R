@@ -149,8 +149,12 @@ for (cell in cells) {
       fam <- switch(cell$family, binomial = binomial(), poisson = poisson())
       m <- glmer(as.formula(cell$r_formula), data = df, family = fam,
             nAGQ = if (is_agq) as.integer(cell$nagq) else 1L,
-            control = glmerControl(tolPwrss = 1e-13,
-                                   optCtrl = list(maxfun = cell$max_fun)))
+            # GRID_TOLPWRSS: PIRLS tolerance override for the seed-extension
+            # passes (estimate-grid seedext_gen.R study); default keeps the
+            # 1e-13 the frozen campaign results were fit at.
+            control = glmerControl(
+              tolPwrss = as.numeric(Sys.getenv("GRID_TOLPWRSS", "1e-13")),
+              optCtrl = list(maxfun = cell$max_fun)))
       msgs <- as.character(unlist(m@optinfo$conv$lme4$messages))
       conv <- length(msgs) == 0
       feval <- as.integer(m@optinfo$feval)

@@ -3,6 +3,7 @@ use faer::{Mat, MatRef};
 
 use super::pirls::{
     build_coupling_csr, pirls_solve, pirls_solve_blocked, pirls_solve_blocked_extras, BetaStep,
+    DualStep, TailKernel,
 };
 #[cfg(test)]
 use super::workspace::fill_z_f64;
@@ -43,6 +44,7 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
     eta_fixed: &mut [T],
     a_blocks: &mut [T],
     a_rhs: &mut [T],
+    dual: Option<&mut DualStep<T>>,
     wx: &mut Mat<f64>,
     beta_step: BetaStep,
     offset: Option<&[f64]>,
@@ -77,6 +79,7 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
         eta_fixed,
         a_blocks,
         a_rhs,
+        dual,
         wx,
         offset,
         pirls_tol_override,
@@ -88,8 +91,158 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
         return (T::from_f64(f64::INFINITY), conv, raw_dev_finite);
     }
     // Gamma substitutes its AIC-style objective for the bare deviance —
-    // rationale on the structured arm in `laplace_deviance`; mirrors that
-    // branch, change together.
+    // rationale in `laplace_deviance`'s doc comment (`family::gamma_aic`);
+    // mirrors that branch, change together.
+    let data_term = if matches!(family, Family::Gamma { .. }) {
+        crate::family::gamma_aic(y, prob, dev, n, Some(prior_w))
+    } else {
+        dev
+    };
+    (
+        data_term + pen + T::from_f64(2.0) * logdet,
+        conv,
+        raw_dev_finite,
+    )
+}
+
+/// The structured (`extra_offsets` non-empty, `structured_extras_eligible()`)
+/// Laplace objective at (θ, β), generic over the scalar: pack `M = ZΛ`'s
+/// nonzeros, refresh the coupling CSR when the pin mask changed, solve the
+/// block+Schur PIRLS conditional modes, and return `d(y,ũ) + ‖ũ‖² + log|A|` —
+/// the same three terms `laplace_deviance` assembles on this arm.
+/// Non-convergence / non-PD core or Schur ⇒ `+∞`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn structured_laplace_deviance<T: TailKernel>(
+    family: Family,
+    nb_theta: f64,
+    groupings: &LmmGroupings,
+    params: &[T],
+    z_buf: &[f64],
+    extra_ids: &[Vec<u32>],
+    lam: &mut [T],
+    cluster_ids: &[u32],
+    m_core_buf: &mut [T],
+    cross_val: &mut [T],
+    cross_col: &mut [u32],
+    n_cross: &mut [u8],
+    coup_cols: &mut [u32],
+    coup_ptr: &mut [u32],
+    coup_mask: &mut Option<u32>,
+    x: MatRef<f64>,
+    y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
+    beta: &mut [T],
+    beta_step: BetaStep,
+    eta: &mut [T],
+    prob: &mut [T],
+    w: &mut [T],
+    u: &mut [T],
+    u_prev: &mut [T],
+    eta_fixed: &mut [T],
+    mu: &mut [T],
+    core_blocks: &mut [T],
+    coupling: &mut [T],
+    schur_blk: &mut [T],
+    structured_schur: Option<&mut StructuredSchur>,
+    force_dense: bool,
+    a_rhs: &mut [T],
+    dual: Option<&mut DualStep<T>>,
+    wx: &mut Mat<f64>,
+    offset: Option<&[f64]>,
+    pirls_tol_override: Option<f64>,
+    n: usize,
+    counters: &mut crate::counters::EvalCounters,
+) -> (T, bool, bool) {
+    // Intercept-only crossed/nested ⇒ block-diagonal core + Schur on the
+    // crossed width. The M = ZΛ nonzeros are packed once here (core slice +
+    // crossed entries) instead of materializing the dense n×k M every eval; the
+    // structured passes read the packed buffers. `z`/`m` are untouched on this
+    // path now (the dense `m` only feeds the genuinely-dense fallback below).
+    build_packed_m(
+        groupings,
+        params,
+        z_buf,
+        extra_ids,
+        lam,
+        cluster_ids,
+        m_core_buf,
+        cross_val,
+        cross_col,
+        n_cross,
+        n,
+    );
+    // CSR cache: pattern = f(design, pinning mask). Rebuild only when the set
+    // of θ-pinned crossed groupings changes (see build_coupling_csr's contract).
+    debug_assert!(groupings.crossed.len() <= 32);
+    let mut pin_mask: u32 = 0;
+    for (gi, cf) in groupings.crossed.iter().enumerate() {
+        // Mirrors `build_packed_m`'s pin skip — change together: both must
+        // test the value part only, or a dual `T`'s CSR pattern (built
+        // there) would diverge from this f64 pin mask (built here). Third site
+        // in the chain: `derivative::extras_theta_pin_free`, which refuses a
+        // derivative at a θ̂ these two skips have narrowed; its comment owns the
+        // explanation.
+        if params[cf.vech_start].value() == 0.0 {
+            pin_mask |= 1 << gi;
+        }
+    }
+    if *coup_mask != Some(pin_mask) {
+        build_coupling_csr(
+            cluster_ids,
+            cross_col,
+            n_cross,
+            groupings.n_primary,
+            n,
+            coup_cols,
+            coup_ptr,
+        );
+        *coup_mask = Some(pin_mask);
+    }
+    let (dev, pen, logdet, conv) = pirls_solve_blocked_extras(
+        family,
+        nb_theta,
+        groupings,
+        cluster_ids,
+        m_core_buf,
+        cross_val,
+        cross_col,
+        n_cross,
+        x,
+        y,
+        prior_w,
+        weighted,
+        beta,
+        beta_step,
+        eta,
+        prob,
+        w,
+        u,
+        u_prev,
+        eta_fixed,
+        mu,
+        core_blocks,
+        coupling,
+        schur_blk,
+        coup_cols,
+        coup_ptr,
+        structured_schur,
+        force_dense,
+        a_rhs,
+        dual,
+        wx,
+        offset,
+        pirls_tol_override,
+        n,
+        counters,
+    );
+    let raw_dev_finite = dev.value().is_finite();
+    if !conv || !raw_dev_finite {
+        return (T::from_f64(f64::INFINITY), conv, raw_dev_finite);
+    }
+    // Gamma substitutes its AIC-style objective for the bare deviance —
+    // rationale in `laplace_deviance`'s doc comment (`family::gamma_aic`);
+    // mirrors that branch, change together.
     let data_term = if matches!(family, Family::Gamma { .. }) {
         crate::family::gamma_aic(y, prob, dev, n, Some(prior_w))
     } else {
@@ -196,7 +349,7 @@ pub(crate) fn laplace_deviance(
     profile_beta: bool,
     // PIRLS exit-tol override, forwarded verbatim to whichever PIRLS variant (or
     // `agq_deviance`) runs. `Some(pirls_tol_fd(family))` only under the FD-Hessian
-    // SE evals (`ws.pirls_tol_override`, set by `fd_hessian_cov`); `None` on the fit
+    // SE evals (`ws.pirls_tol_override`, set by `joint_hessian_cov`); `None` on the fit
     // path, which therefore stays bit-identical.
     pirls_tol_override: Option<f64>,
     p: usize,
@@ -281,6 +434,7 @@ pub(crate) fn laplace_deviance(
             eta_fixed,
             a_blocks,
             a_rhs,
+            None,
             wx,
             agq_scratch,
             nagq,
@@ -333,6 +487,7 @@ pub(crate) fn laplace_deviance(
             eta_fixed,
             a_blocks,
             a_rhs,
+            None,
             wx,
             beta_step,
             offset,
@@ -347,13 +502,10 @@ pub(crate) fn laplace_deviance(
         counters.commit_pirls_iters();
         return obj;
     }
-    let (dev, pen, logdet, conv) = if groupings.structured_extras_eligible() {
-        // Intercept-only crossed/nested ⇒ block-diagonal core + Schur on the
-        // crossed width. The M = ZΛ nonzeros are packed once here (core slice +
-        // crossed entries) instead of materializing the dense n×k M every eval; the
-        // structured passes read the packed buffers. `z`/`m` are untouched on this
-        // path now (the dense `m` only feeds the genuinely-dense fallback below).
-        build_packed_m(
+    if groupings.structured_extras_eligible() {
+        let (obj, conv, raw_dev_finite) = structured_laplace_deviance(
+            family,
+            nb_theta,
             groupings,
             params,
             z_buf,
@@ -364,38 +516,9 @@ pub(crate) fn laplace_deviance(
             cross_val,
             cross_col,
             n_cross,
-            n,
-        );
-        // CSR cache: pattern = f(design, pinning mask). Rebuild only when the set
-        // of θ-pinned crossed groupings changes (see build_coupling_csr's contract).
-        debug_assert!(groupings.crossed.len() <= 32);
-        let mut pin_mask: u32 = 0;
-        for (gi, cf) in groupings.crossed.iter().enumerate() {
-            if params[cf.vech_start] == 0.0 {
-                pin_mask |= 1 << gi;
-            }
-        }
-        if *coup_mask != Some(pin_mask) {
-            build_coupling_csr(
-                cluster_ids,
-                cross_col,
-                n_cross,
-                groupings.n_primary,
-                n,
-                coup_cols,
-                coup_ptr,
-            );
-            *coup_mask = Some(pin_mask);
-        }
-        pirls_solve_blocked_extras(
-            family,
-            nb_theta,
-            groupings,
-            cluster_ids,
-            m_core_buf,
-            cross_val,
-            cross_col,
-            n_cross,
+            coup_cols,
+            coup_ptr,
+            coup_mask,
             x,
             y,
             prior_w,
@@ -412,51 +535,57 @@ pub(crate) fn laplace_deviance(
             core_blocks,
             coupling,
             schur_blk,
-            coup_cols,
-            coup_ptr,
             structured_schur,
             force_dense_schur,
             a_rhs,
+            None,
             wx,
             offset,
             pirls_tol_override,
             n,
             counters,
-        )
-    } else {
-        // Non-eligible extras (oversized core) ⇒ A genuinely dense: dense fallback.
-        apply_lambda(groupings, params, z, m, lam, n);
-        pirls_solve(
-            family,
-            nb_theta,
-            k,
-            p,
-            m.as_ref(),
-            x,
-            y,
-            prior_w,
-            weighted,
-            beta,
-            beta_step,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            wm,
-            wx,
-            a,
-            a_chol,
-            a_rhs,
-            a_llt_mem,
-            offset,
-            pirls_tol_override,
-            n,
-            counters,
-        )
-    };
+        );
+        // Same iteration-cap-exhaustion discriminator as the shared tail below
+        // (see its comment): `raw_dev_finite` alongside `!conv` is the natural
+        // exhaustion case, not a hard (NaN) failure.
+        if !conv && raw_dev_finite && pirls_tol_override.is_none() {
+            *pirls_exhausted += 1;
+        }
+        counters.commit_pirls_iters();
+        return obj;
+    }
+    // Non-eligible extras (oversized core) ⇒ A genuinely dense: dense fallback.
+    apply_lambda(groupings, params, z, m, lam, n);
+    let (dev, pen, logdet, conv) = pirls_solve(
+        family,
+        nb_theta,
+        k,
+        p,
+        m.as_ref(),
+        x,
+        y,
+        prior_w,
+        weighted,
+        beta,
+        beta_step,
+        eta,
+        prob,
+        w,
+        u,
+        u_prev,
+        eta_fixed,
+        mu,
+        wm,
+        wx,
+        a,
+        a_chol,
+        a_rhs,
+        a_llt_mem,
+        offset,
+        pirls_tol_override,
+        n,
+        counters,
+    );
     // `!conv` with a FINITE `dev` is exactly the natural iteration-cap
     // exhaustion: the three PIRLS variants return `(NaN, NaN, NaN, false)` from
     // every OTHER failure path (halving exhausted, non-PD Cholesky), so a
@@ -486,17 +615,17 @@ pub(crate) fn laplace_deviance(
 }
 
 /// Evaluate the joint Laplace deviance at the params CURRENTLY in `ws.params`
-/// (the FD loop in `fd_hessian_cov` writes them before each call). Borrow-split
+/// (the FD loop in `joint_hessian_cov` writes them before each call). Borrow-split
 /// twin of `fit_glmm`'s BOBYQA-closure body: destructures the workspace into the
 /// disjoint borrows `laplace_deviance` needs (z read; m/lam/a/etc. written) and
 /// calls it. Seeds the PIRLS conditional modes from û = 0 each call — UNLESS
 /// `ws.warm_seed_active`, in which case it seeds from the fixed shared `ws.u_seed`
-/// (the fitted mode û(γ̂), set by `fd_hessian_cov`). Same fixed-seed FD-derivative
-/// invariant as `fd_hessian_cov` in se.rs — see there for the derivation.
+/// (the fitted mode û(γ̂), set by `joint_hessian_cov`). Same fixed-seed FD-derivative
+/// invariant as `joint_hessian_cov` in se.rs — see there for the derivation.
 ///
 /// Caller must have filled `ws.z_buf` for this fit's `x` (blocked path) — `x` is
 /// constant across all FD perturbations, so fill it ONCE before the FD loop, not
-/// per eval (`fd_hessian_cov` does; `glmm_laplace_deviance` does it inline).
+/// per eval (`joint_hessian_cov` does; `glmm_laplace_deviance` does it inline).
 pub(crate) fn laplace_deviance_at(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,

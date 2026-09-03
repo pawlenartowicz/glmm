@@ -61,7 +61,7 @@ case "$ENGINE" in
                TIMEOUT="$BUDGET" ;;
   *) echo "unknown engine: $ENGINE" >&2; exit 2 ;;
 esac
-PIN=""; command -v taskset >/dev/null && PIN="taskset -c 1"
+PIN=""; command -v taskset >/dev/null && PIN="taskset -c ${GRID_PIN_CORE:-1}"
 
 # per-launch startup grace: engine load writes nothing (Julia pkg load +
 # first-fit JIT can exceed the per-cell budget) — until this launch appends

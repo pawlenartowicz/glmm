@@ -15,7 +15,7 @@
 
 use faer::MatRef;
 
-use super::pirls::{pirls_solve_blocked, BetaStep};
+use super::pirls::{pirls_solve_blocked, BetaStep, DualStep};
 use crate::lmm::LmmGroupings;
 use crate::scalar::Scalar;
 use crate::spec::Family;
@@ -117,6 +117,7 @@ pub(crate) fn agq_deviance<T: Scalar>(
     eta_fixed: &mut [T],
     a_blocks: &mut [T],
     a_rhs: &mut [T],
+    dual: Option<&mut DualStep<T>>,
     // AGQ is always `BetaStep::Fixed`, so `pirls_solve_blocked`'s Profile-only
     // C = X'WX GEMM never runs here — this is just uniform plumbing across the
     // three PIRLS variants.
@@ -168,6 +169,7 @@ pub(crate) fn agq_deviance<T: Scalar>(
         eta_fixed,
         a_blocks,
         a_rhs,
+        dual,
         wx,
         offset,
         pirls_tol_override,
@@ -359,6 +361,7 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
     eta_fixed: &mut [T],
     a_blocks: &mut [T],
     a_rhs: &mut [T],
+    dual: Option<&mut DualStep<T>>,
     wx: &mut faer::Mat<f64>,
     agq_scratch: &mut [T],
     nagq: u8,
@@ -401,6 +404,7 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
         eta_fixed,
         a_blocks,
         a_rhs,
+        dual,
         wx,
         offset,
         pirls_tol_override,
@@ -644,6 +648,7 @@ pub(crate) fn glmm_agq_deviance(
         eta_fixed,
         a_blocks,
         a_rhs,
+        None,
         wx,
         agq_scratch,
         nagq,

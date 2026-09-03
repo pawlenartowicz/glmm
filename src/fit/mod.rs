@@ -76,7 +76,9 @@ pub struct Fit {
     ///
     /// Sources, by path: OLS/GLM/LMM invert the same Cholesky factor `se`'s
     /// forward solve already walks; GLMM `WaldSe::Hessian` takes the β block of
-    /// the joint (θ,β) FD-Hessian covariance, and `WaldSe::Rx` the p×p Schur
+    /// the joint (θ,β) Hessian covariance (exact on every shape
+    /// `derivative::supports_shape` accepts, finite-difference elsewhere),
+    /// and `WaldSe::Rx` the p×p Schur
     /// inverse — both already formed in full and previously discarded down to a
     /// diagonal. Unlike `stddev_se`, this is populated on the Hessian's RX
     /// fallback too (that fallback inverts a full p×p covariance; only a
@@ -122,8 +124,10 @@ pub struct Fit {
     /// SE of each RE standard deviation, laid out like `tau2` (per θ coordinate,
     /// length `n_theta`; primary block then each extra, in declaration order).
     /// Populated ONLY on a converged GLMM `WaldSe::Hessian` fit, from the θ block
-    /// of the joint (θ,β) FD-Hessian covariance that `fd_hessian_cov` inverts and
-    /// otherwise discards. NaN under `WaldSe::Rx`, on the Hessian RX fallback, and
+    /// of the joint (θ,β) Hessian covariance that `joint_hessian_cov` inverts and
+    /// otherwise discards (exact Hessian on every shape
+    /// `derivative::supports_shape` accepts, finite-difference elsewhere).
+    /// NaN under `WaldSe::Rx`, on the Hessian RX fallback, and
     /// for OLS/LMM (no Hessian machinery). Correct for SCALAR groupings only (the
     /// reachable GLMM case), where the RE stddev equals its θ so the θ-scale SE is
     /// the stddev SE directly; a q≥2 block would need a delta-method Jacobian.
@@ -298,6 +302,47 @@ pub struct Diagnostics {
     /// components the internal mask holds — outside the crate's currently
     /// validated envelope — cannot be represented here at all.
     pub pinned: Vec<Vec<bool>>,
+    /// Variance-component score at each PINNED component, laid out exactly like
+    /// [`Diagnostics::pinned`]: `boundary_score[g][i]` pairs with `pinned[g][i]`
+    /// and with `stddev_corr(g).0[i]`. The value is `dD/ds` at `s = 0` in the
+    /// variance coordinate `s = θ_jj²` — equivalently `½·∂²D/∂θ_jj²` at the
+    /// pinned point, since the deviance is even in `θ_jj` and its first
+    /// derivative there is zero.
+    ///
+    /// **Positive means the boundary is the constrained optimum**: raising the
+    /// component off zero would raise the deviance. A non-positive score at a
+    /// pinned component means the pin is not justified by the local geometry.
+    /// NaN at every component that is not pinned, and at every off-diagonal.
+    ///
+    /// **Empty means no score was measured** — a fit that did not ask for it
+    /// ([`FitOptions::boundary_score`], off by default), an interior fit, a
+    /// non-converged fit, every route other than the dense LMM and the blocked
+    /// GLMM, and the GLMM shapes with no exact Hessian (structured extras,
+    /// dense fallback, sparse). Empty is NOT "nothing was pinned"; read
+    /// [`Diagnostics::pinned`] for that. Observation only.
+    pub boundary_score: Vec<Vec<f64>>,
+    /// KKT residual at the accepted θ̂: the ∞-norm of the deviance's θ gradient
+    /// projected onto the box the optimizer searched (diagonals `[0, 1e3]`,
+    /// off-diagonals `[±1e3]`) — at a lower bound a positive component is
+    /// satisfied and contributes nothing, at an upper bound a negative one
+    /// does. Zero to working precision means the accepted point satisfies the
+    /// first-order conditions, boundary or interior; a large value means the
+    /// optimizer stopped somewhere that is not a constrained stationary point.
+    ///
+    /// **Coordinates:** on the deviance scale (−2·logL), per unit of θ in the
+    /// units the caller's design is in — the projection runs in the internal
+    /// scaled θ̃ where the box lives and each component is mapped back by its
+    /// row scale before the norm. A derivative w.r.t. θ multiplies by that
+    /// scale where [`Fit::stddev_se`], an SE in θ, divides by it.
+    ///
+    /// The optimizer stops on a trust radius, not on a gradient, so a converged
+    /// fit leaves a small finite residual rather than an exact zero; what
+    /// counts as small is a measured number, pinned by the calibration in
+    /// `src/glmm/tests.rs`. **NaN** wherever no exact gradient exists: every
+    /// non-GLMM route, the GLMM structured-extras and dense-fallback shapes,
+    /// the sparse routes, and any non-converged fit. Observation only — no
+    /// fitting decision reads it.
+    pub kkt_grad_norm: f64,
     /// Solver observations that are not one of the fixed channels above. Empty
     /// on a clean fit, and empty allocates nothing.
     pub notes: Vec<Note>,
@@ -433,6 +478,8 @@ impl Diagnostics {
                 Boundary::Interior
             },
             pinned: vec![],
+            boundary_score: vec![],
+            kkt_grad_norm: f64::NAN,
             notes: vec![],
         }
     }
@@ -681,6 +728,17 @@ pub struct FitOptions {
     /// batch loop is safe (one shared work-stealing pool) in a way naive OS-thread
     /// or BLAS-thread nesting is not.
     pub parallel_inner: bool,
+    /// Measure [`Diagnostics::boundary_score`] on a fit that pins a variance
+    /// component. Default `false`. The score is a diagonal of the exact
+    /// second-derivative pass at the pinned point (a hyper-dual PIRLS solve for
+    /// the GLMM, the hyper-dual REML kernel for the LMM), which nothing else in
+    /// the fit needs: on a small pinned GLMM warm refit it costs about as much
+    /// as the fit itself (see `glmm::fit_glmm`'s diagnostics block for the
+    /// measurement). [`Diagnostics::kkt_grad_norm`] is unaffected — it comes
+    /// from the first-derivative pass and is reported wherever it exists.
+    /// Ignored on every route that cannot measure the score (the field stays
+    /// empty there either way).
+    pub boundary_score: bool,
 }
 
 impl Default for FitOptions {
@@ -693,6 +751,7 @@ impl Default for FitOptions {
             weights: None,
             offset: None,
             parallel_inner: false,
+            boundary_score: false,
         }
     }
 }

@@ -2,13 +2,305 @@
 
 use super::*;
 
+/// The three crossed-tail Schur kernels the structured solve needs from its
+/// scalar, split off `Scalar` so the kernel-wide trait in `src/scalar.rs`
+/// stays free of any GLMM-workspace type: `StructuredSchur` (the cached sparse
+/// LLT) is `f64`-only, and only this module's `structured_factor` /
+/// `structured_ainv_solve` route through these. The default bodies are the
+/// dense generic arms every non-`f64` scalar takes; `f64` overrides each with
+/// the production route.
+pub(crate) trait TailKernel: Scalar {
+    /// One cluster's Schur downdate `S[cols][cols] −= C_f' A_f⁻¹ C_f`, lower
+    /// triangle. `core_l` is cluster `f`'s `qc×qc` Crout factor, `coup` its
+    /// `qc×e` row-major coupling block, `cols` its ascending nonzero crossed
+    /// columns, `schur` the dense row-major `e×e` accumulator (lower at
+    /// `[a·e + b]`, `a ≥ b`).
+    ///
+    /// The default body is the rank-1 scalar column walk. `f64` overrides it
+    /// with the panel route (`glmm_block_solve_panel` + one triangular faer
+    /// matmul) at `qc > 1`, which is the production route there and moves the
+    /// dot's internal association; the measurement behind that split lives on
+    /// this method's `f64` override (moved there with the code).
+    #[allow(clippy::too_many_arguments)]
+    fn tail_downdate(
+        core_l: &[Self],
+        qc: usize,
+        coup: &[Self],
+        e: usize,
+        cols: &[u32],
+        ss: Option<&mut StructuredSchur>,
+        schur: &mut [Self],
+    ) {
+        let _ = ss;
+        tail_downdate_generic(core_l, qc, coup, e, cols, schur)
+    }
+
+    /// Factor the crossed-tail Schur complement in `schur` (dense row-major
+    /// `e×e`, lower triangle) and return `½·log|S|` — the half-log convention
+    /// `structured_factor` accumulates and `deviance.rs` doubles. `None` on a
+    /// non-PD tail.
+    ///
+    /// The default body is the crate-own dense Crout factor, in place, leaving
+    /// `schur` holding `L` for `tail_solve`. `f64` overrides it with the cached
+    /// sparse LLT when `ss` is `Some`, which is what the production path runs
+    /// and what the bit-identity dump pins; `ss = None` selects the dense arm on
+    /// both.
+    fn tail_factor(schur: &mut [Self], e: usize, ss: Option<&mut StructuredSchur>) -> Option<Self> {
+        let _ = ss;
+        tail_factor_generic(schur, e)
+    }
+
+    /// Solve `S x = rhs` in place for the single `e`-long tail column, using
+    /// whichever factor `tail_factor` produced. Default: forward/back
+    /// substitution on `schur`'s dense `L`. `f64` override: the cached sparse
+    /// back-solve when `ss` is `Some`, the dense substitution otherwise.
+    fn tail_solve(schur: &[Self], e: usize, ss: Option<&mut StructuredSchur>, rhs: &mut [Self]) {
+        let _ = ss;
+        tail_solve_generic(schur, e, rhs)
+    }
+}
+
+impl<const N: usize> TailKernel for crate::dual::Dual<N> {}
+impl<const N: usize, const H: usize> TailKernel for crate::dual::HyperDual<N, H> {}
+
+impl TailKernel for f64 {
+    fn tail_downdate(
+        core_l: &[f64],
+        qc: usize,
+        coup: &[f64],
+        e: usize,
+        cols: &[u32],
+        ss: Option<&mut StructuredSchur>,
+        schur: &mut [f64],
+    ) {
+        use crate::glmm::workspace::glmm_block_solve_panel;
+        let e_f = cols.len();
+        if cols.is_empty() {
+            return;
+        }
+        // A single call (one cluster per invocation, unlike `structured_factor`'s
+        // per-cluster loop) never reuses `ss` afterward, so this consumes it
+        // directly rather than reborrowing via `as_deref_mut`.
+        let Some(StructuredSchur {
+            c_panel,
+            y_panel,
+            dd_temp,
+            ..
+        }) = ss.filter(|_| qc != 1)
+        else {
+            // Production route for qc == 1 (and the ss = None oracle). At
+            // qc == 1 the downdate is rank-1: the panel path stages the
+            // identical FLOPs (gather → dd_temp → second scatter pass) at
+            // ~double the memory traffic, a measured +4–7% per-eval loss on
+            // the qc=1 cross6 GLMM cells (binb 1.758→1.870 s; 2026-07-14
+            // drift investigation). This scalar walk accumulates each rank-1
+            // dot straight into `schur` — already minimal. `qc == 1` is the
+            // only measured boundary; no qc>1 GLMM structured cell exists in
+            // the grid. Sizing of the panel buffers mirrors this condition in
+            // `StructuredSchur::new` — change together.
+            let mut ycol = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
+            for &b in cols {
+                let b = b as usize;
+                for local in 0..qc {
+                    ycol[local] = coup[local * e + b];
+                }
+                glmm_block_solve(&core_l[..qc * qc], qc, &mut ycol[..qc]);
+                for &a in cols {
+                    let a = a as usize;
+                    if a < b {
+                        continue;
+                    }
+                    let mut acc = 0.0;
+                    for local in 0..qc {
+                        acc += coup[local * e + a] * ycol[local];
+                    }
+                    schur[a * e + b] -= acc;
+                }
+            }
+            return;
+        };
+        let cpan = &mut c_panel[..qc * e_f];
+        for local in 0..qc {
+            let crow = &coup[local * e..];
+            for (dst, &b) in cpan[local * e_f..(local + 1) * e_f].iter_mut().zip(cols) {
+                *dst = crow[b as usize];
+            }
+        }
+        let ypan = &mut y_panel[..qc * e_f];
+        ypan.copy_from_slice(cpan);
+        glmm_block_solve_panel(&core_l[..qc * qc], qc, ypan, e_f);
+        // dd = C_f'·Y (e_f×e_f lower, col-major). A row-major qc×e_f buffer
+        // viewed col-major e_f×qc IS its transpose — no copy for either side.
+        let dd = &mut dd_temp[..e_f * e_f];
+        let ct = faer::MatRef::from_column_major_slice(cpan, e_f, qc);
+        let yv = faer::MatRef::from_column_major_slice(ypan, e_f, qc).transpose();
+        faer::linalg::matmul::triangular::matmul(
+            faer::MatMut::from_column_major_slice_mut(dd, e_f, e_f),
+            faer::linalg::matmul::triangular::BlockStructure::TriangularLower,
+            faer::Accum::Replace,
+            ct,
+            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+            yv,
+            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+            1.0,
+            faer::Par::Seq,
+        );
+        for (bj, &b) in cols.iter().enumerate() {
+            let b = b as usize;
+            for (&a, &d) in cols[bj..].iter().zip(&dd[bj * e_f + bj..(bj + 1) * e_f]) {
+                schur[a as usize * e + b] -= d;
+            }
+        }
+    }
+
+    fn tail_factor(schur: &mut [f64], e: usize, ss: Option<&mut StructuredSchur>) -> Option<f64> {
+        use crate::sparse::logdet_llt;
+        match ss {
+            Some(ss) => {
+                // Gather the dense schur lower triangle into S's fixed CSC
+                // pattern. schur is row-major e×e (lower tri at [a·e+b], a ≥ b);
+                // axx is CSC, so column b's stored rows a are exactly the a ≥ b we
+                // read.
+                {
+                    let (sym, vals) = ss.axx.parts_mut();
+                    let col_ptr = sym.col_ptr();
+                    let row_idx = sym.row_idx();
+                    for b in 0..e {
+                        for slot in col_ptr[b]..col_ptr[b + 1] {
+                            let a = row_idx[slot];
+                            vals[slot] = schur[a * e + b];
+                        }
+                    }
+                }
+                // Numeric sparse LLT into the cached buffer; non-PD ⇒ None (⇒ NaN dev).
+                let llt = ss
+                    .symbolic
+                    .factorize_numeric_llt(
+                        &mut ss.l_values,
+                        ss.axx.as_ref(),
+                        faer::Side::Lower,
+                        faer::linalg::cholesky::llt::factor::LltRegularization::default(),
+                        faer::Par::Seq,
+                        faer::dyn_stack::MemStack::new(&mut ss.fac_mem),
+                        faer::Spec::default(),
+                    )
+                    .ok()?;
+                let _ = llt; // ends the &'out borrow on l_values (LltRef is Copy; NLL)
+                             // logdet_llt returns 2·Σ ln L_ii = log|S|; this method's return is
+                             // the ½·log convention (deviance.rs multiplies by 2). So return HALF.
+                             // Non-finite (non-PD diagonal) ⇒ None, matching the dense non-PD
+                             // sentinel.
+                let log_s = logdet_llt(&ss.symbolic, &ss.l_values);
+                if !log_s.is_finite() {
+                    return None;
+                }
+                Some(0.5 * log_s)
+            }
+            None => {
+                // Dense fallback: the old Crout factor (test cross-check / defensive).
+                if !glmm_block_chol(&mut schur[..e * e], e) {
+                    return None;
+                }
+                let mut logdet = 0.0;
+                for b in 0..e {
+                    logdet += schur[b * e + b].ln();
+                }
+                Some(logdet)
+            }
+        }
+    }
+
+    fn tail_solve(schur: &[f64], e: usize, ss: Option<&mut StructuredSchur>, rhs: &mut [f64]) {
+        match ss {
+            Some(ss) => {
+                // Reconstruct the factor from the cached symbolic + values (no re-factor;
+                // faer 0.24.4 LltRef::new — sparse/linalg/cholesky.rs:4443-4449, verified
+                // against the vendored source: a Copy wrapper over two refs, NOT a
+                // re-factorization — and back-solve the single e-col.
+                let llt = faer::sparse::linalg::cholesky::LltRef::new(&ss.symbolic, &ss.l_values);
+                let rhs = faer::MatMut::from_column_major_slice_mut(&mut rhs[..e], e, 1);
+                llt.solve_in_place_with_conj(
+                    faer::Conj::No,
+                    rhs,
+                    faer::Par::Seq,
+                    faer::dyn_stack::MemStack::new(&mut ss.solve_mem),
+                );
+            }
+            None => {
+                // Dense fallback (test cross-check / e>0 with no cached factor): schur
+                // holds the dense L that the dense-factor branch produced.
+                glmm_block_solve(&schur[..e * e], e, &mut rhs[..e]);
+            }
+        }
+    }
+}
+
+/// The default body of [`TailKernel::tail_downdate`]: the rank-1 scalar column
+/// walk, run regardless of `qc` — a non-`f64` scalar never reaches the
+/// panel-vs-scalar split (`StructuredSchur` is `f64`-only), so this is the
+/// only arm any non-`f64` `T` ever takes. Bit pattern matches `f64`'s own
+/// `qc == 1` arm exactly; the two diverge only past `qc > 1`, where `f64`
+/// switches to the panel route and this stays on the scalar walk.
+pub(crate) fn tail_downdate_generic<T: Scalar>(
+    core_l: &[T],
+    qc: usize,
+    coup: &[T],
+    e: usize,
+    cols: &[u32],
+    schur: &mut [T],
+) {
+    let mut ycol = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
+    for &b in cols {
+        let b = b as usize;
+        for local in 0..qc {
+            ycol[local] = coup[local * e + b];
+        }
+        glmm_block_solve(&core_l[..qc * qc], qc, &mut ycol[..qc]);
+        for &a in cols {
+            let a = a as usize;
+            if a < b {
+                continue;
+            }
+            let mut acc = T::ZERO;
+            for local in 0..qc {
+                acc += coup[local * e + a] * ycol[local];
+            }
+            schur[a * e + b] -= acc;
+        }
+    }
+}
+
+/// The default body of [`TailKernel::tail_factor`]: the crate-own dense Crout
+/// factor (`glmm_block_chol`) plus the Σ ln L_bb half-log-determinant fold —
+/// the same arm `f64`'s override runs when `ss` is `None`.
+pub(crate) fn tail_factor_generic<T: Scalar>(schur: &mut [T], e: usize) -> Option<T> {
+    if !glmm_block_chol(&mut schur[..e * e], e) {
+        return None;
+    }
+    let mut logdet = T::ZERO;
+    for b in 0..e {
+        logdet += schur[b * e + b].ln();
+    }
+    Some(logdet)
+}
+
+/// The default body of [`TailKernel::tail_solve`]: forward/back substitution
+/// through `glmm_block_solve` on the dense `L` that `tail_factor` left in
+/// `schur` — the same arm `f64`'s override runs when `ss` is `None`.
+pub(crate) fn tail_solve_generic<T: Scalar>(schur: &[T], e: usize, rhs: &mut [T]) {
+    glmm_block_solve(&schur[..e * e], e, &mut rhs[..e]);
+}
+
 /// Factor the structured `A = [[D, C], [C', E]]` in place: Crout-factor each
 /// core block `core_blocks[f]` (holding `D_f + I` on entry, its lower `L` on
 /// return) and build + factor the Schur complement `schur_blk` (holding `E + I`
 /// on entry, `S = (E+I) − Σ_f C_f' A_f⁻¹ C_f` then its `L` on return). Returns
 /// `Some(log|A|) = Σ_f log|A_f| + log|S|` (Schur determinant identity), or `None`
-/// on a non-PD core block / Schur. `coupling[f]` holds `C_f` (q_core×e row-major),
-/// unchanged. Shared by `pirls_solve_blocked_extras` (per iteration) and
+/// on a non-PD core block / Schur. The Schur factor itself routes through
+/// `TailKernel::tail_factor`: the cached sparse LLT when `ss` is `Some` at `T = f64`
+/// (the production route), the crate-own dense Crout — `tail_factor`'s default
+/// body — at any non-`f64` `T` or when `ss` is `None`. `coupling[f]` holds `C_f`
+/// (q_core×e row-major), unchanged. Shared by `pirls_solve_blocked_extras` (per iteration) and
 /// `structured_schur_fill` (reusing the converged factors). `q_core ≤ MAX_PRIMARY_Q`.
 /// `coup_cols`/`coup_ptr` is the per-cluster CSR of C_f's nonzero crossed columns
 /// (built once per solve by `pirls_solve_blocked_extras`): the Schur build walks
@@ -24,24 +316,24 @@ use super::*;
 /// the sanctioned class (see `SparseTail`'s doc). The panel path serves
 /// `qc > 1` (vector primary and/or nested REs). At `qc == 1` the downdate is
 /// rank-1 and the scalar column-at-a-time walk is the **production route**
-/// (routed via the `qc != 1` filter below; the panel staging is a +4–7%
-/// per-eval loss there — 2026-07-14 drift investigation); the same walk is also
-/// the `ss = None` arm, which is the panel path's equality oracle at `qc > 1`.
+/// (routed via the `qc != 1` filter inside `TailKernel::tail_downdate`, whose `f64`
+/// override documents the panel-vs-scalar measurement behind the split); the
+/// same walk is also the `ss = None` arm, which is the panel path's equality
+/// oracle at `qc > 1`.
 #[allow(clippy::too_many_arguments)]
-fn structured_factor(
+fn structured_factor<T: TailKernel>(
     g: &crate::lmm::LmmGroupings,
-    core_blocks: &mut [f64],
-    coupling: &[f64],
-    schur_blk: &mut [f64],
+    core_blocks: &mut [T],
+    coupling: &[T],
+    schur_blk: &mut [T],
     coup_cols: &[u32],
     coup_ptr: &[u32],
     mut ss: Option<&mut StructuredSchur>,
-    force_dense: bool,
-) -> Option<f64> {
+) -> Option<T> {
     let qc = g.primary_q + g.nested_per_parent;
     let s = g.n_primary;
     let e = g.k_crossed();
-    let mut logdet = 0.0;
+    let mut logdet = T::ZERO;
     for f in 0..s {
         let cb = f * qc * qc;
         if !glmm_block_chol(&mut core_blocks[cb..cb + qc * qc], qc) {
@@ -51,144 +343,33 @@ fn structured_factor(
             logdet += core_blocks[cb + r * qc + r].ln();
         }
         // S −= C_f' A_f⁻¹ C_f (lower triangle) over cluster f's NONZERO crossed
-        // columns: gather them into a compact row-major qc×e_f panel, batch-solve
-        // it, one triangular matmul, then subtract dd's lower triangle through
-        // the same `cols` map (cols ascending ⇒ local lower = global lower).
+        // columns, via TailKernel::tail_downdate (panel-vs-scalar routing documented
+        // there and on structured_factor's own doc comment above).
         let coup = f * qc * e;
         let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
         let e_f = cols.len();
         if e_f == 0 {
             continue;
         }
-        let Some(StructuredSchur {
-            c_panel,
-            y_panel,
-            dd_temp,
-            ..
-        }) = ss.as_deref_mut().filter(|_| qc != 1)
-        else {
-            // Production route for qc == 1 (and the ss = None oracle) — see the
-            // fn doc. At qc == 1 the downdate is rank-1: the panel path stages the
-            // identical FLOPs (gather → dd_temp → second scatter pass) at ~double
-            // the memory traffic, a measured +4–7% per-eval loss on the qc=1
-            // cross6 GLMM cells (binb 1.758→1.870 s; 2026-07-14 drift
-            // investigation). This scalar walk accumulates each rank-1 dot
-            // straight into schur_blk — already minimal. `qc == 1` is the only
-            // measured boundary; no qc>1 GLMM structured cell exists in the grid.
-            // Sizing of the panel buffers mirrors this condition in
-            // `StructuredSchur::new` — change together.
-            let mut ycol = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
-            for &b in cols {
-                let b = b as usize;
-                for local in 0..qc {
-                    ycol[local] = coupling[coup + local * e + b];
-                }
-                glmm_block_solve(&core_blocks[cb..cb + qc * qc], qc, &mut ycol[..qc]);
-                // y = A_f⁻¹ C_f[:,b]; S[a][b] −= Σ_local C_f[local][a]·y[local],
-                // lower triangle only (a ≥ b).
-                for &a in cols {
-                    let a = a as usize;
-                    if a < b {
-                        continue;
-                    }
-                    let mut acc = 0.0;
-                    for local in 0..qc {
-                        acc += coupling[coup + local * e + a] * ycol[local];
-                    }
-                    schur_blk[a * e + b] -= acc;
-                }
-            }
-            continue;
-        };
-        let cpan = &mut c_panel[..qc * e_f];
-        for local in 0..qc {
-            let crow = &coupling[coup + local * e..];
-            for (dst, &b) in cpan[local * e_f..(local + 1) * e_f].iter_mut().zip(cols) {
-                *dst = crow[b as usize];
-            }
-        }
-        let ypan = &mut y_panel[..qc * e_f];
-        ypan.copy_from_slice(cpan);
-        glmm_block_solve_panel(&core_blocks[cb..cb + qc * qc], qc, ypan, e_f);
-        // dd = C_f'·Y (e_f×e_f lower, col-major). A row-major qc×e_f buffer
-        // viewed col-major e_f×qc IS its transpose — no copy for either side.
-        let dd = &mut dd_temp[..e_f * e_f];
-        let ct = MatRef::from_column_major_slice(cpan, e_f, qc);
-        let yv = MatRef::from_column_major_slice(ypan, e_f, qc).transpose();
-        faer::linalg::matmul::triangular::matmul(
-            MatMut::from_column_major_slice_mut(dd, e_f, e_f),
-            faer::linalg::matmul::triangular::BlockStructure::TriangularLower,
-            faer::Accum::Replace,
-            ct,
-            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
-            yv,
-            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
-            1.0,
-            Par::Seq,
+        T::tail_downdate(
+            &core_blocks[cb..cb + qc * qc],
+            qc,
+            &coupling[coup..],
+            e,
+            cols,
+            ss.as_deref_mut(),
+            schur_blk,
         );
-        for (bj, &b) in cols.iter().enumerate() {
-            let b = b as usize;
-            for (&a, &d) in cols[bj..].iter().zip(&dd[bj * e_f + bj..(bj + 1) * e_f]) {
-                schur_blk[a as usize * e + b] -= d;
-            }
-        }
     }
-    if e > 0 {
-        // Route on the SAME condition structured_ainv_solve uses: the both-paths
-        // cross-check runs both at one θ, so `force_dense` must reach the dense arm
-        // even when `ss` is Some (the production workspace always caches it).
-        match ss {
-            Some(ss) if !force_dense => {
-                // Gather the dense schur_blk lower triangle into S's fixed CSC
-                // pattern. schur_blk is row-major e×e (lower tri at [a·e+b], a ≥ b);
-                // axx is CSC, so column b's stored rows a are exactly the a ≥ b we
-                // read.
-                {
-                    let (sym, vals) = ss.axx.parts_mut();
-                    let col_ptr = sym.col_ptr();
-                    let row_idx = sym.row_idx();
-                    for b in 0..e {
-                        for slot in col_ptr[b]..col_ptr[b + 1] {
-                            let a = row_idx[slot];
-                            vals[slot] = schur_blk[a * e + b];
-                        }
-                    }
-                }
-                // Numeric sparse LLT into the cached buffer; non-PD ⇒ None (⇒ NaN dev).
-                let llt = ss
-                    .symbolic
-                    .factorize_numeric_llt(
-                        &mut ss.l_values,
-                        ss.axx.as_ref(),
-                        Side::Lower,
-                        LltRegularization::default(),
-                        Par::Seq,
-                        MemStack::new(&mut ss.fac_mem),
-                        Spec::default(),
-                    )
-                    .ok()?;
-                let _ = llt; // ends the &'out borrow on l_values (LltRef is Copy; NLL)
-                             // logdet_llt returns 2·Σ ln L_ii = log|S|; this fn's `logdet` is the
-                             // ½·log convention (deviance.rs multiplies by 2). So add HALF.
-                             // Non-finite (non-PD diagonal) ⇒ None, matching the dense non-PD
-                             // sentinel.
-                let log_s = logdet_llt(&ss.symbolic, &ss.l_values);
-                if !log_s.is_finite() {
-                    return None;
-                }
-                logdet += 0.5 * log_s;
-            }
-            _ => {
-                // Dense fallback: the old Crout factor (test cross-check / defensive).
-                if !glmm_block_chol(&mut schur_blk[..e * e], e) {
-                    return None;
-                }
-                for b in 0..e {
-                    logdet += schur_blk[b * e + b].ln();
-                }
-            }
-        }
-    }
+    // Schur-determinant identity: log|A| = Σ_f log|A_f| + log|S|. S is factored
+    // by TailKernel::tail_factor: the cached sparse LLT when `ss` is `Some` at
+    // `T = f64` (production), the crate-own dense Crout — `tail_factor`'s
+    // default body — otherwise. No `if e > 0` guard needed: `StructuredSchur::new`
+    // returns `None` at `e == 0`, so the sparse arm never sees an empty tail, and
+    // the dense arm's `glmm_block_chol` at dimension 0 (`linalg::block_chol`'s
+    // `for j in 0..0` loop) over the `.max(1)`-sized `schur_blk` is an
+    // indexing-free no-op returning `true` — a NaN-free, logdet-preserving skip.
+    logdet += T::tail_factor(schur_blk, e, ss)?;
     Some(logdet)
 }
 
@@ -201,19 +382,21 @@ fn structured_factor(
 /// columns via `coup_cols[coup_ptr[f]..coup_ptr[f+1]]` instead of the full dense
 /// `0..e` range — every skipped column of `C_f` is exactly 0.0, so its dense
 /// contribution was an exact-zero add/subtract and skipping it is bit-identical
-/// (same argument as `structured_factor`'s doc comment). Shared by the structured
-/// PIRLS solve and the inference Schur fill.
+/// (same argument as `structured_factor`'s doc comment). The tail solve itself
+/// routes through `TailKernel::tail_solve`: the cached sparse back-solve when `ss`
+/// is `Some` at `T = f64` (production), the dense substitution — `tail_solve`'s
+/// default body — otherwise. Shared by the structured PIRLS solve and the
+/// inference Schur fill.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn structured_ainv_solve(
+pub(crate) fn structured_ainv_solve<T: TailKernel>(
     g: &crate::lmm::LmmGroupings,
-    core_blocks: &[f64],
-    coupling: &[f64],
-    schur_blk: &[f64],
+    core_blocks: &[T],
+    coupling: &[T],
+    schur_blk: &[T],
     coup_cols: &[u32],
     coup_ptr: &[u32],
     ss: Option<&mut StructuredSchur>,
-    force_dense: bool,
-    a_rhs: &mut [f64],
+    a_rhs: &mut [T],
 ) {
     use crate::lmm::MAX_PRIMARY_Q;
     let qc = g.primary_q + g.nested_per_parent;
@@ -233,7 +416,7 @@ pub(crate) fn structured_ainv_solve(
         let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
         for &b in cols {
             let b = b as usize;
-            let mut acc = 0.0;
+            let mut acc = T::ZERO;
             for local in 0..qc {
                 acc += coupling[coup + local * e + b] * a_rhs[gcb + local];
             }
@@ -243,35 +426,17 @@ pub(crate) fn structured_ainv_solve(
     if e == 0 {
         return;
     }
-    // Route on the SAME condition as structured_factor: force_dense's dense factor
-    // left schur_blk holding the dense L, so the solve must reach the dense arm too
-    // even when ss is Some (the both-paths cross-check runs both at one θ).
-    match ss {
-        Some(ss) if !force_dense => {
-            // Reconstruct the factor from the cached symbolic + values (no re-factor;
-            // faer 0.24.4 LltRef::new — sparse/linalg/cholesky.rs:4443-4449, verified
-            // against the vendored source: a Copy wrapper over two refs, NOT a
-            // re-factorization — and back-solve the single e-col.
-            let llt = LltRef::new(&ss.symbolic, &ss.l_values);
-            let rhs = MatMut::from_column_major_slice_mut(&mut a_rhs[k_family..k_family + e], e, 1);
-            llt.solve_in_place_with_conj(Conj::No, rhs, Par::Seq, MemStack::new(&mut ss.solve_mem));
-        }
-        _ => {
-            // Dense fallback (test cross-check / e>0 with no cached factor): schur_blk
-            // holds the dense L that the dense-factor branch produced.
-            glmm_block_solve(&schur_blk[..e * e], e, &mut a_rhs[k_family..k_family + e]);
-        }
-    }
+    T::tail_solve(schur_blk, e, ss, &mut a_rhs[k_family..k_family + e]);
     // u_{core,f} = t_f − A_f⁻¹(C_f u_e).
     for f in 0..s {
         let cb = f * qc * qc;
         let gcb = f * qc;
         let coup = f * qc * e;
-        let mut v = [0.0_f64; MAX_PRIMARY_Q];
+        let mut v = [T::ZERO; MAX_PRIMARY_Q];
         let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
         #[allow(clippy::needless_range_loop)]
         for local in 0..qc {
-            let mut acc = 0.0;
+            let mut acc = T::ZERO;
             for &b in cols {
                 let b = b as usize;
                 acc += coupling[coup + local * e + b] * a_rhs[k_family + b];
@@ -329,36 +494,39 @@ pub(crate) fn structured_ainv_solve(
 /// non-PD S_β surfaces as `(NaN, NaN, NaN, false)`. `B`'s scatter reads the packed
 /// `m_core_buf`/`cross_*` nonzeros directly (as `structured_schur_fill` does).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn pirls_solve_blocked_extras(
+pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
     family: Family,
     nb_theta: f64,
     g: &crate::lmm::LmmGroupings,
     cluster_ids: &[u32],
-    m_core_buf: &[f64],
-    cross_val: &[f64],
+    m_core_buf: &[T],
+    cross_val: &[T],
     cross_col: &[u32],
     n_cross: &[u8],
     x: MatRef<f64>,
     y: &[f64],
     prior_w: &[f64],
     weighted: bool,
-    beta: &mut [f64],
+    beta: &mut [T],
     mut beta_step: BetaStep,
-    eta: &mut [f64],
-    prob: &mut [f64],
-    w: &mut [f64],
-    u: &mut [f64],
-    u_prev: &mut [f64],
-    eta_fixed: &mut [f64],
-    mu: &mut [f64],
-    core_blocks: &mut [f64],
-    coupling: &mut [f64],
-    schur_blk: &mut [f64],
+    eta: &mut [T],
+    prob: &mut [T],
+    w: &mut [T],
+    u: &mut [T],
+    u_prev: &mut [T],
+    eta_fixed: &mut [T],
+    mu: &mut [T],
+    core_blocks: &mut [T],
+    coupling: &mut [T],
+    schur_blk: &mut [T],
     coup_cols: &[u32],
     coup_ptr: &[u32],
     mut structured_schur: Option<&mut StructuredSchur>,
     force_dense: bool,
-    a_rhs: &mut [f64],
+    a_rhs: &mut [T],
+    // Dual derivative kernels' per-solve controls (see `DualStep`); `None` on
+    // every f64 fit-path call.
+    dual: Option<&mut DualStep<T>>,
     // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
     // (mirrors `pirls_solve`'s `wx`).
     wx: &mut Mat<f64>,
@@ -370,7 +538,15 @@ pub(crate) fn pirls_solve_blocked_extras(
     // Observation-only — mirrors `pirls_solve`'s `counters` (dense.rs), where
     // the contract is stated.
     counters: &mut crate::counters::EvalCounters,
-) -> (f64, f64, f64, bool) {
+) -> (T, T, T, bool) {
+    // The β-Schur border below runs in f64 (its X'WX GEMM and p×p Cholesky are
+    // faer's, and reproducing them generically would move f64 bits). A non-f64
+    // instantiation must use BetaStep::Fixed — the derivative entry points do.
+    // Loud, not silent: dropping derivatives here would be a wrong gradient.
+    assert!(
+        T::IS_F64 || matches!(beta_step, BetaStep::Fixed),
+        "BetaStep::Profile is f64-only on the extras path"
+    );
     let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
     let q = g.primary_q;
     let np = g.nested_per_parent;
@@ -393,28 +569,46 @@ pub(crate) fn pirls_solve_blocked_extras(
     };
     // η_fixed,ᵢ = Σ_j x·β, hoisted out of the iteration (β fixed within the solve).
     for i in 0..n {
-        let mut ef = 0.0;
+        let mut ef = T::ZERO;
         for j in 0..p {
-            ef += x[(i, j)] * beta[j];
+            ef += T::from_f64(x[(i, j)]) * beta[j];
         }
         eta_fixed[i] = ef;
     }
     if let Some(o) = offset {
         for i in 0..n {
-            eta_fixed[i] += o[i];
+            eta_fixed[i] += T::from_f64(o[i]);
         }
     }
     // First-trial backtrack seeds (u_prev = 0, beta_prev = caller's β) — only
     // the domain-infeasibility trigger can read them; see `pirls_solve`.
-    u_prev[..k].fill(0.0);
+    u_prev[..k].fill(T::ZERO);
     if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
-        beta_prev[..p].copy_from_slice(&beta[..p]);
+        for j in 0..p {
+            beta_prev[j] = beta[j].value();
+        }
     }
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
     let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
     let mut converged = false;
-    let (mut dev, mut pen, mut logdet) = (f64::NAN, f64::NAN, 0.0);
+    // `exact` mirrors `blocked.rs`'s contract — change together. It is
+    // `is_canonical` here where `blocked.rs` writes an unconditional `true`: that
+    // caller pairs `exact = true` with `observed = !canonical`, so the step it
+    // takes IS the Hessian step. This path always takes the Fisher step — an
+    // observed step would need observed twins of `core_blocks`, `coupling` and
+    // `schur_blk`, all built from W — so on a non-canonical link one kernel call
+    // is not exact, and claiming otherwise would stop the caller's refinement
+    // loop on lanes that have not settled. `d.observed` and `d.obs_blocks` are
+    // read nowhere on this path.
+    let min_iters = match dual {
+        Some(d) => {
+            d.exact = crate::family::is_canonical(family);
+            d.min_iters
+        }
+        None => 0,
+    };
+    let (mut dev, mut pen, mut logdet) = (T::from_f64(f64::NAN), T::from_f64(f64::NAN), T::ZERO);
     let tol = pirls_tol_override.unwrap_or_else(|| super::super::pirls_tol(family));
     for it in 0..PIRLS_MAX_ITERS {
         counters.set_pirls_iters(it + 1);
@@ -425,11 +619,11 @@ pub(crate) fn pirls_solve_blocked_extras(
         // Reads the packed M nonzeros (contiguous q_core core slice + n_cross[i]
         // crossed entries) `build_packed_m` filled — no faer indexing, crossed term
         // O(G) not O(e).
-        let mut yeta = 0.0;
+        let mut yeta = T::ZERO;
         for i in 0..n {
             let f = cluster_ids[i] as usize;
             let m_core = &m_core_buf[i * qc..i * qc + qc];
-            let mut mui = 0.0;
+            let mut mui = T::ZERO;
             for local in 0..qc {
                 mui += m_core[local] * u[core_col(f, local)];
             }
@@ -440,12 +634,12 @@ pub(crate) fn pirls_solve_blocked_extras(
             }
             eta[i] = eta_fixed[i] + mui;
             mu[i] = mui; // keep (Mu)ᵢ for the IRLS residual below
-            yeta += y[i] * eta[i];
+            yeta += T::from_f64(y[i]) * eta[i];
         }
         // --- pass 2: η[] → prob[]/w[] + deviance, through the shared family
         // kernel (clamps η in place; `infeasible` flags any raw η outside the
         // link's open domain — Gamma-inverse only, mirrors `pirls_solve`). ---
-        let (d, infeasible) = crate::simd_transcendental::family_pass(
+        let (d, infeasible) = T::family_pass(
             family,
             nb_theta,
             &mut eta[..n],
@@ -464,20 +658,24 @@ pub(crate) fn pirls_solve_blocked_extras(
         // land ε above `pen_accepted` yet inside the tol band, and that must
         // converge, not burn all 10 halvings against FP noise). ‖u‖² is at the
         // CURRENT trial u; `u[..k]` spans the core (RE-column order) + crossed tail.
-        let pen_u: f64 = u[..k].iter().map(|v| v * v).sum();
+        let mut pen_u = T::ZERO;
+        #[allow(clippy::needless_range_loop)]
+        for c in 0..k {
+            pen_u += u[c] * u[c];
+        }
         let penalized = dev + pen_u;
         // BAND-TOLERANT overshoot test, mirrors `pirls_solve` (see its comments for
         // why a within-band rise is accepted rather than converged-on or halved):
         // only a rise EXCEEDING the tol band backtracks. A domain-infeasible trial
         // halves regardless of the band (see `pirls_solve`'s comment).
-        if infeasible || penalized - pen_accepted > tol * (1.0 + penalized.abs()) {
+        if infeasible || penalized.value() - pen_accepted > tol * (1.0 + penalized.value().abs()) {
             if halvings < PIRLS_MAX_HALVINGS {
                 // Last full step overshot: halve δu = u − u_prev and re-enter the top
                 // (the recompute above is the trial evaluation of the halved step; a
                 // halved retry re-runs structured_factor/ainv_solve, by design).
                 halvings += 1;
                 for c in 0..k {
-                    u[c] = 0.5 * (u[c] + u_prev[c]);
+                    u[c] = T::from_f64(0.5) * (u[c] + u_prev[c]);
                 }
                 // Profile mode: the trial point is the JOINT (u,β) step, so the
                 // backtrack halves β toward `beta_prev` in lockstep with u, then
@@ -485,22 +683,29 @@ pub(crate) fn pirls_solve_blocked_extras(
                 // `pirls_solve_blocked`'s Profile backtrack.
                 if let BetaStep::Profile { beta_prev, .. } = &beta_step {
                     for j in 0..p {
-                        beta[j] = 0.5 * (beta[j] + beta_prev[j]);
+                        beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
                     }
                     refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
                 }
                 continue;
             }
-            return (f64::NAN, f64::NAN, f64::NAN, false); // halvings exhausted
+            return (
+                T::from_f64(f64::NAN),
+                T::from_f64(f64::NAN),
+                T::from_f64(f64::NAN),
+                false,
+            ); // halvings exhausted
         }
         // Accept this iterate, snapshot it for the next backtrack, and take a fresh
         // full Fisher step from it (cold start: pen_accepted = ∞ ⇒ always accepts).
         halvings = 0;
-        pen_accepted = penalized;
+        pen_accepted = penalized.value();
         u_prev[..k].copy_from_slice(&u[..k]);
         // Profile mode: snapshot the accepted β as the β-halving twin of u_prev.
         if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
-            beta_prev[..p].copy_from_slice(&beta[..p]);
+            for j in 0..p {
+                beta_prev[j] = beta[j].value();
+            }
         }
         // IRLS effective residual rᵢ = wᵢ·(Mu)ᵢ + W·working_resid, so the
         // scattered RHS is M'(W·Mu + W·r) = (A−I)u + M'(W·r). Logit's W·r=(y−p);
@@ -510,20 +715,21 @@ pub(crate) fn pirls_solve_blocked_extras(
                 link: BinomialLink::Logit,
             } if !weighted => {
                 for i in 0..n {
-                    mu[i] = w[i] * mu[i] + (y[i] - prob[i]);
+                    mu[i] = w[i] * mu[i] + (T::from_f64(y[i]) - prob[i]);
                 }
             }
             other => {
                 for i in 0..n {
                     let dmu = crate::family::mu_eta(other, eta[i]);
                     let v = crate::family::variance(other, nb_theta, prob[i]);
-                    mu[i] = w[i] * mu[i] + prior_w[i] * dmu * (y[i] - prob[i]) / v;
+                    mu[i] = w[i] * mu[i]
+                        + T::from_f64(prior_w[i]) * dmu * (T::from_f64(y[i]) - prob[i]) / v;
                 }
             }
         }
         // --- pass 3: scatter — wᵢmᵢmᵢ' into D_f/C_f/E (lower tri), rᵢmᵢ into g ---
         for v in core_blocks[..s * qc * qc].iter_mut() {
-            *v = 0.0;
+            *v = T::ZERO;
         }
         // coupling is only ever WRITTEN by this scatter (structured_factor and
         // structured_ainv_solve treat it as read-only), so zeroing exactly the
@@ -535,19 +741,20 @@ pub(crate) fn pirls_solve_blocked_extras(
             for &b in cols {
                 let b = b as usize;
                 for r in 0..qc {
-                    coupling[coup + r * e + b] = 0.0;
+                    coupling[coup + r * e + b] = T::ZERO;
                 }
             }
         }
         // schur_blk stays a dense clear (unlike coupling above): the dense-fallback
-        // branch of structured_factor (ss.is_none() or force_dense) Cholesky-factors
-        // it IN PLACE, producing fill-in outside the coup_cols×coup_cols pattern — a
-        // sparse zero would leave stale L-factor residue from the prior iteration.
+        // branch of structured_factor (TailKernel::tail_factor's `ss = None` arm, which
+        // is what `force_dense` now routes to) Cholesky-factors it IN PLACE,
+        // producing fill-in outside the coup_cols×coup_cols pattern — a sparse zero
+        // would leave stale L-factor residue from the prior iteration.
         for v in schur_blk[..e * e].iter_mut() {
-            *v = 0.0;
+            *v = T::ZERO;
         }
         for v in a_rhs[..k].iter_mut() {
-            *v = 0.0;
+            *v = T::ZERO;
         }
         // Reads the packed core slice + crossed nonzeros directly — no per-row stack
         // copy / rescan; the `m_core`/`cz_*` rebuild the dense path needed is gone.
@@ -600,7 +807,7 @@ pub(crate) fn pirls_solve_blocked_extras(
                     link: BinomialLink::Logit,
                 } => {
                     for i in 0..n {
-                        let rho = prior_w[i] * (y[i] - prob[i]);
+                        let rho = prior_w[i] * (y[i] - prob[i].value());
                         for j in 0..p {
                             beta_rhs[j] += x[(i, j)] * rho;
                         }
@@ -608,9 +815,9 @@ pub(crate) fn pirls_solve_blocked_extras(
                 }
                 other => {
                     for i in 0..n {
-                        let dmu = crate::family::mu_eta(other, eta[i]);
-                        let v = crate::family::variance(other, nb_theta, prob[i]);
-                        let rho = prior_w[i] * dmu * (y[i] - prob[i]) / v;
+                        let dmu = crate::family::mu_eta(other, eta[i]).value();
+                        let v = crate::family::variance(other, nb_theta, prob[i]).value();
+                        let rho = prior_w[i] * dmu * (y[i] - prob[i].value()) / v;
                         for j in 0..p {
                             beta_rhs[j] += x[(i, j)] * rho;
                         }
@@ -622,11 +829,11 @@ pub(crate) fn pirls_solve_blocked_extras(
         for f in 0..s {
             let cb = f * qc * qc;
             for r in 0..qc {
-                core_blocks[cb + r * qc + r] += 1.0;
+                core_blocks[cb + r * qc + r] += T::ONE;
             }
         }
         for b in 0..e {
-            schur_blk[b * e + b] += 1.0;
+            schur_blk[b * e + b] += T::ONE;
         }
         // --- factor (core blocks + Schur), then apply A⁻¹ to the scattered RHS ---
         logdet = match structured_factor(
@@ -636,11 +843,23 @@ pub(crate) fn pirls_solve_blocked_extras(
             schur_blk,
             coup_cols,
             coup_ptr,
-            structured_schur.as_deref_mut(),
-            force_dense,
+            // force_dense folds into ss: this is the arm today's
+            // `Some(ss) if !force_dense` match took, so it is bit-identical.
+            if force_dense {
+                None
+            } else {
+                structured_schur.as_deref_mut()
+            },
         ) {
             Some(ld) => ld,
-            None => return (f64::NAN, f64::NAN, f64::NAN, false),
+            None => {
+                return (
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    false,
+                )
+            }
         };
         structured_ainv_solve(
             g,
@@ -649,13 +868,17 @@ pub(crate) fn pirls_solve_blocked_extras(
             schur_blk,
             coup_cols,
             coup_ptr,
-            structured_schur.as_deref_mut(),
-            force_dense,
+            // same force_dense → ss fold as the structured_factor call above.
+            if force_dense {
+                None
+            } else {
+                structured_schur.as_deref_mut()
+            },
             a_rhs,
         );
         // a_rhs[gcb..] now holds u_{core,f}; a_rhs[k_family+b] holds u_e. Scatter to
         // u (RE-column order) and accumulate ‖u‖².
-        pen = 0.0;
+        pen = T::ZERO;
         for f in 0..s {
             let gcb = f * qc;
             for local in 0..qc {
@@ -696,7 +919,7 @@ pub(crate) fn pirls_solve_blocked_extras(
             // this is exact.
             for c in 0..p {
                 for i in 0..n {
-                    wx[(i, c)] = w[i] * x[(i, c)];
+                    wx[(i, c)] = w[i].value() * x[(i, c)];
                 }
             }
             faer::linalg::matmul::matmul(
@@ -716,17 +939,17 @@ pub(crate) fn pirls_solve_blocked_extras(
             }
             for i in 0..n {
                 let f = cluster_ids[i] as usize;
-                let wi = w[i];
+                let wi = w[i].value();
                 let cbase = i * g_cap;
                 let ncz = n_cross[i] as usize;
                 for r in 0..p {
                     let xw = x[(i, r)] * wi;
                     for local in 0..qc {
-                        xtwm[(r, core_col(f, local))] += xw * m_core_buf[i * qc + local];
+                        xtwm[(r, core_col(f, local))] += xw * m_core_buf[i * qc + local].value();
                     }
                     for z in 0..ncz {
                         let b = cross_col[cbase + z] as usize;
-                        xtwm[(r, k_family + b)] += xw * cross_val[cbase + z];
+                        xtwm[(r, k_family + b)] += xw * cross_val[cbase + z].value();
                     }
                 }
             }
@@ -734,14 +957,17 @@ pub(crate) fn pirls_solve_blocked_extras(
             // `structured_ainv_solve` reusing THIS iteration's core-block+Schur factors
             // (structured_schur_fill:457-486). `a_rhs` packs/unpacks the RHS/solution in
             // the (f,local)|crossed layout structured_ainv_solve expects.
+            // `a_rhs` is the generic solve's buffer while the border's data is
+            // f64: the staging loops convert element-wise, which at `T = f64` is
+            // an identity copy of values this loop already had to copy.
             for c in 0..p {
                 for f in 0..s {
                     for local in 0..qc {
-                        a_rhs[f * qc + local] = xtwm[(c, core_col(f, local))];
+                        a_rhs[f * qc + local] = T::from_f64(xtwm[(c, core_col(f, local))]);
                     }
                 }
                 for b in 0..e {
-                    a_rhs[k_family + b] = xtwm[(c, k_family + b)];
+                    a_rhs[k_family + b] = T::from_f64(xtwm[(c, k_family + b)]);
                 }
                 structured_ainv_solve(
                     g,
@@ -750,17 +976,21 @@ pub(crate) fn pirls_solve_blocked_extras(
                     schur_blk,
                     coup_cols,
                     coup_ptr,
-                    structured_schur.as_deref_mut(),
-                    force_dense,
+                    // same force_dense → ss fold as the structured_factor call above.
+                    if force_dense {
+                        None
+                    } else {
+                        structured_schur.as_deref_mut()
+                    },
                     a_rhs,
                 );
                 for f in 0..s {
                     for local in 0..qc {
-                        ainv_mtwx[(core_col(f, local), c)] = a_rhs[f * qc + local];
+                        ainv_mtwx[(core_col(f, local), c)] = a_rhs[f * qc + local].value();
                     }
                 }
                 for b in 0..e {
-                    ainv_mtwx[(k_family + b, c)] = a_rhs[k_family + b];
+                    ainv_mtwx[(k_family + b, c)] = a_rhs[k_family + b].value();
                 }
             }
             // S_β = C − B'·T (structured_schur_fill:487-497). Every RE column belongs
@@ -779,7 +1009,7 @@ pub(crate) fn pirls_solve_blocked_extras(
             for r in 0..p {
                 let mut acc = 0.0;
                 for c in 0..k {
-                    acc += xtwm[(r, c)] * (u[c] - u_prev[c]);
+                    acc += xtwm[(r, c)] * (u[c] - u_prev[c]).value();
                 }
                 beta_rhs[r] -= acc;
             }
@@ -793,7 +1023,12 @@ pub(crate) fn pirls_solve_blocked_extras(
             )
             .is_err()
             {
-                return (f64::NAN, f64::NAN, f64::NAN, false);
+                return (
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    false,
+                );
             }
             solve_in_place(
                 schur.as_ref(),
@@ -804,19 +1039,19 @@ pub(crate) fn pirls_solve_blocked_extras(
             // Apply: β += δβ; u = u_joint = u_new − T·δβ, i.e.
             // u[col] −= Σ_j ainv_mtwx[(col, j)]·δβ[j] over the u layout.
             for j in 0..p {
-                beta[j] += beta_rhs[j];
+                beta[j] += T::from_f64(beta_rhs[j]);
             }
             for c in 0..k {
                 let mut acc = 0.0;
                 for j in 0..p {
                     acc += ainv_mtwx[(c, j)] * beta_rhs[j];
                 }
-                u[c] -= acc;
+                u[c] -= T::from_f64(acc);
             }
             // η_fixed depends on β; refresh for the next trial. `pen` must track the
             // moved u (‖u_joint‖²), so recompute it.
             refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
-            pen = 0.0;
+            pen = T::ZERO;
             #[allow(clippy::needless_range_loop)]
             for c in 0..k {
                 pen += u[c] * u[c];
@@ -826,12 +1061,89 @@ pub(crate) fn pirls_solve_blocked_extras(
         // successive steps — bit-identical iterate path and returned values to the
         // pre-halving loop when no halving fires (see `pirls_solve` for why the
         // same-point band above cannot itself be a converge trigger).
-        let mixed = dev + pen;
-        if (mixed - mixed_prev).abs() < tol * (1.0 + mixed.abs()) {
+        let mixed = (dev + pen).value();
+        if it + 1 >= min_iters && (mixed - mixed_prev).abs() < tol * (1.0 + mixed.abs()) {
             converged = true;
             break;
         }
         mixed_prev = mixed;
     }
     (dev, pen, logdet, converged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::glmm::workspace::GlmmWorkspace;
+
+    /// The `f64` override IS the extras path's tail code — moved, not
+    /// copied — so there is no second copy left to `==` it against; the
+    /// bit-identity dump is the instrument for that identity. What this test can
+    /// check is the other arm: the generic default body against the `f64`
+    /// override on the same `S`. They are NOT expected to match to bits: the
+    /// sparse arm factors under an AMD ordering and the dense default in the
+    /// natural one, which is a reassociation of the same Cholesky. The assert
+    /// bands them and records the measured gap; the two are the same matrix, not
+    /// the same rounding.
+    #[test]
+    fn tail_default_body_is_the_sparse_arms_oracle() {
+        let (_x, y, ids, extra_ids, spec) = crate::glmm::tests::glmm_extras_q1_dataset(0, 6);
+        let n = y.len();
+        let ws = GlmmWorkspace::for_cluster_spec(2, &spec, n, &[], 1);
+        let g = &ws.groupings;
+        let e = g.k_crossed();
+        let mut ss =
+            StructuredSchur::new(g, &ids, &extra_ids, n).expect("6 crossed levels ⇒ e > 0 ⇒ Some");
+
+        // A deterministic, diagonally-dominant SPD matrix built ONLY on the real
+        // crossed-incidence pattern `ss` carries for this fixture (the same AMD
+        // symbolic factor the production path builds) — off-pattern entries stay
+        // 0.0 so the dense arm (reads the full e×e block) and the sparse arm
+        // (reads only the pattern) factor the identical matrix.
+        let mut s_raw = vec![0.0f64; e * e];
+        for a in 0..e {
+            s_raw[a * e + a] = 10.0 + 4.0 * a as f64;
+        }
+        {
+            let sym = ss.axx.symbolic();
+            let col_ptr = sym.col_ptr();
+            let row_idx = sym.row_idx();
+            for b in 0..e {
+                for &a in &row_idx[col_ptr[b]..col_ptr[b + 1]] {
+                    if a != b {
+                        s_raw[a * e + b] = 0.1;
+                    }
+                }
+            }
+        }
+
+        let mut s_dense = s_raw.clone();
+        let mut s_sparse = s_raw.clone();
+
+        let ld_dense = tail_factor_generic::<f64>(&mut s_dense, e).expect("dense PD");
+        let ld_sparse =
+            <f64 as TailKernel>::tail_factor(&mut s_sparse, e, Some(&mut ss)).expect("sparse PD");
+        // Measured on this fixture (e=6, 8 primary clusters, near-complete crossed
+        // coupling): dense (natural order) vs sparse (AMD order) Cholesky of the
+        // same S agree in the half-log-determinant to within 1e-9 — the two
+        // orderings are a reassociation of the same sum, not independent
+        // computations.
+        assert!(
+            (ld_dense - ld_sparse).abs() < 1e-9,
+            "half-logdet drifted: dense {ld_dense} sparse {ld_sparse}"
+        );
+
+        let mut rhs_dense = vec![1.0f64; e];
+        let mut rhs_sparse = vec![1.0f64; e];
+        tail_solve_generic::<f64>(&s_dense, e, &mut rhs_dense);
+        <f64 as TailKernel>::tail_solve(&s_sparse, e, Some(&mut ss), &mut rhs_sparse);
+        for i in 0..e {
+            assert!(
+                (rhs_dense[i] - rhs_sparse[i]).abs() < 1e-9,
+                "tail_solve[{i}] drifted: dense {} sparse {}",
+                rhs_dense[i],
+                rhs_sparse[i]
+            );
+        }
+    }
 }

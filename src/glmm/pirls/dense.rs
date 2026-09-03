@@ -7,7 +7,7 @@ use super::*;
 /// +I ridge (the standard nAGQ=1 reparameterization — u ~ N(0, I)). The `beta_step`
 /// mode sets what moves: `BetaStep::Fixed` holds β at the caller's input and solves
 /// for the conditional modes ũ(β) alone (the objective stays a function of the
-/// caller's β — required by the FD-Hessian path and BOBYQA stage 2); `BetaStep::Profile`
+/// caller's β — required by the joint-Hessian SE path and BOBYQA stage 2); `BetaStep::Profile`
 /// adds a joint δβ Schur-border step each iteration (§β-Schur math) so the returned
 /// (ũ, β̂) is jointly PQL-optimal for this θ, writing β̂ back through `beta`. At each
 /// step A = M'WM + I and the IRLS RHS `M'(W·Mu + (y − p))` give the next u via a

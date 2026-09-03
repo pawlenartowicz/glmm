@@ -3,15 +3,11 @@
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::cholesky::llt::factor::{cholesky_in_place, LltRegularization};
 use faer::linalg::cholesky::llt::solve::solve_in_place;
-use faer::sparse::linalg::cholesky::LltRef;
-use faer::{Conj, Mat, MatMut, MatRef, Par, Side, Spec};
+use faer::{Mat, MatMut, MatRef, Par, Spec};
 
-use super::workspace::{
-    glmm_block_chol, glmm_block_solve, glmm_block_solve_panel, StructuredSchur,
-};
+use super::workspace::{glmm_block_chol, glmm_block_solve, StructuredSchur};
 use super::{PIRLS_MAX_HALVINGS, PIRLS_MAX_ITERS};
 use crate::scalar::Scalar;
-use crate::sparse::logdet_llt;
 use crate::spec::{BinomialLink, Family};
 
 mod blocked;
@@ -19,7 +15,7 @@ mod blocked_extras;
 mod dense;
 
 pub(crate) use blocked::pirls_solve_blocked;
-pub(crate) use blocked_extras::{pirls_solve_blocked_extras, structured_ainv_solve};
+pub(crate) use blocked_extras::{pirls_solve_blocked_extras, structured_ainv_solve, TailKernel};
 pub(crate) use dense::pirls_solve;
 
 /// β handling for one PIRLS solve. `Fixed` = today's behavior verbatim (β is an
@@ -41,6 +37,47 @@ pub(crate) enum BetaStep<'a> {
         // `.llt(Side::Lower)` per-iteration heap allocation on this hot β-Schur step.
         schur_llt_mem: &'a mut MemBuffer,
     },
+}
+
+/// Per-solve controls the dual-scalar derivative kernels (`derivative.rs`'s
+/// `run_gradient`/`run_hessian`) hand `pirls_solve_blocked`; `None` on every
+/// `f64` fit-path call, which is then byte-identical to the pre-existing
+/// Fisher-only solve.
+///
+/// **Observed-information step (`observed`).** Each PIRLS step solves
+/// `u_new = A_obs⁻¹((A_obs − I)u + g)` with `A_obs = M'W_obs M + I`, `W_obs`
+/// the observed (Newton) weight `family::observed_weight`, while `log|A|`,
+/// the returned factor and the convergence test stay on the Fisher `A` — the
+/// objective and its fixed point `ũ` are unchanged, only the path the iterate
+/// takes to it. Why: at the mode the lane fixed-point map
+/// `du ← (I − A⁻¹H_uu)·du + b` contracts by `‖I − A⁻¹H_uu‖`, which is 0 for
+/// `A_obs = H_uu` (lanes exact in one step, as on a canonical link) but only
+/// 0.2–0.5 for the Fisher `A` on a non-canonical link, where the refinement
+/// loop needed 6–10 kernel calls per gradient (measured 2026-09-02,
+/// cbpp_probit / sim_gamma / sim_probit_large). Canonical links pass
+/// `observed = false`: their Fisher `A` already IS `½h_uu`.
+///
+/// **Step floor (`min_iters`).** The mixed-deviance exit fires after two
+/// steps once the `f64` value sits at the mode, but the second-order lanes
+/// need two steps to become exact and the objective must then be read at
+/// that `u` — three steps in one solve, where the value test alone would
+/// stop at two and force a second kernel call (two more steps) just to read
+/// it. `0` leaves the exit rule untouched.
+pub(crate) struct DualStep<T> {
+    /// Take the observed-information step (non-canonical links).
+    pub(crate) observed: bool,
+    /// `s·q_p²` scratch for the observed blocks, same layout as `a_blocks`;
+    /// untouched when `observed` is false.
+    pub(crate) obs_blocks: Vec<T>,
+    /// Do not exit before this many steps have run.
+    pub(crate) min_iters: usize,
+    /// Written by the solve: true iff every step of every block was an
+    /// exact-Hessian step — always on a canonical link, and on a
+    /// non-canonical one unless some observed block was not PD (the observed
+    /// weight can go negative on an outlying row), in which case that step
+    /// fell back to its Fisher block and the caller's refinement loop runs as
+    /// before.
+    pub(crate) exact: bool,
 }
 
 /// Refill `eta_fixed[i] = offset[i] + Σ_j x[i,j]·β[j]` (the fixed-effect linear

@@ -868,7 +868,7 @@ fn capture_gamma_hat(params: &[f64]) {
 }
 
 /// FD-Hessian joint (θ,β) covariance on the sparse path — mirrors
-/// `glmm::fd_hessian_cov`'s scheme (single-step central differences, no
+/// `glmm::joint_hessian_cov`'s scheme (single-step central differences, no
 /// Richardson extrapolation, step `h_k = SPARSE_FD_STEP_REL·max(1, |γ̂_k|)`
 /// (sparse-calibrated, see the constant above),
 /// `cov = 2·(H_dev⁻¹)_ββ`, θ SE from the θ diagonal) minus the warm-seed
@@ -879,7 +879,7 @@ fn capture_gamma_hat(params: &[f64]) {
 /// Tolerance contract: the CALLER sets `ws.pirls_tol_override =
 /// Some(pirls_tol_fd(family))` around this call (and its fallback re-eval) and
 /// resets it after — set/reset can't live here because the `?` early returns
-/// would skip the reset. Same rationale as the dense `fd_hessian_cov`: at a loose
+/// would skip the reset. Same rationale as the dense `joint_hessian_cov`: at a loose
 /// exit tolerance the FD is not step-invariant, and the FD-pass tol is capped at
 /// `PIRLS_TOL_REL_FD` while never exceeding the family's own fit tolerance, so
 /// the stencil differences a deviance at least as converged as the fit's.
@@ -969,7 +969,7 @@ fn sparse_fd_hessian_cov(
         }
     } else {
         // Diagonal cells are single-step central second differences (no Richardson —
-        // see the doc comment above `fd_hessian_cov`). Serial arm returns None on the
+        // see the doc comment above `joint_hessian_cov`). Serial arm returns None on the
         // FIRST non-finite eval via `?`; the same per-entry stencil the rayon arm uses.
         let mut pt = gamma_hat.to_vec();
         for i in 0..m {

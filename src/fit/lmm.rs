@@ -75,6 +75,14 @@ pub(crate) struct LmmResultView<'a> {
     /// Spherical conditional modes û at θ̂, or empty when the recovery did not
     /// run or did not succeed (see `LmmFitScratch::ranef_ok`).
     ranef_u: &'a [f64],
+    /// Derivative diagnostics, computed in [`lmm_run_on`] (the one place the
+    /// suff stats are in scope): the box-projected θ-gradient ∞-norm of the
+    /// REML criterion at the accepted θ̂ (caller's θ units; NaN when no exact
+    /// gradient — extra slopes, `n_theta > 12`, non-converged), and the
+    /// per-θ-coordinate boundary score `½·∂²D/∂θ_jj²·s_j²` (NaN except at
+    /// pinned diagonals). Length `n_theta`.
+    kkt_grad_norm: f64,
+    boundary_score: Vec<f64>,
 }
 
 // Loop-tier read accessors (via the `FitView`/`loop_advanced` surface); the
@@ -147,13 +155,91 @@ impl LmmResultView<'_> {
 /// of the results. Caller contract: `ws.suff` holds the accumulated rows
 /// ([`accumulate_lmm_rows`]). Warm start threads `theta` only — the LMM β is
 /// solved exactly given θ, so a β start is irrelevant; `None` (cold) uses the
-/// kernel's THETA0 blind start.
+/// kernel's THETA0 blind start. `want_score` is `FitOptions::boundary_score`:
+/// the hyper-dual REML Hessian behind the pinned-component score runs only
+/// when asked; the gradient (and `kkt_grad_norm`) runs regardless.
 pub(crate) fn lmm_run_on<'a>(
     ws: &'a mut LmmWorkspace,
     target_indices: &[u32],
     theta_start: Option<&[f64]>,
+    want_score: bool,
 ) -> LmmResultView<'a> {
     let fit = fit_lmm(ws, target_indices, theta_start);
+
+    // W3 derivative diagnostics, from the exact dual-number REML derivatives
+    // (`reml_gradient`/`reml_hessian`). Same box projection, the same opt-in
+    // for the score, and the same `½·H_jj` boundary-score identity as the GLMM
+    // block in `glmm::fit_glmm` — the θ box is the same one
+    // (`blind_theta_and_bounds`), the scales come from the same
+    // `theta_row_scales`, the gradient taking them once and the score twice.
+    // The scratch is built lazily per fit as a local: W2 leaves
+    // `LmmDualScratch`/`LmmHyperScratch` caller-owned, and this is their first
+    // caller. That allocates once per fit on the dense LMM route; the LMM
+    // alloc bounds profile `fit_lmm` directly, below this frame, so the
+    // scratch is outside their window. Hoisting it onto `LmmWorkspace` for
+    // zero-alloc warm refits is W5's call (its optimizer owns that state
+    // anyway). `Unsupported` (extra slopes, `n_theta > 12`) leaves NaN.
+    let n_theta = ws.suff.groupings.n_theta();
+    let mut kkt_grad_norm = f64::NAN;
+    let mut boundary_score = vec![f64::NAN; n_theta];
+    if fit.converged {
+        let g = &ws.suff.groupings;
+        let p = ws.suff.m - 1;
+        let sc = g.theta_row_scales();
+        let diag = g.diagonal_theta();
+        if let Some(mut scratch) = crate::lmm::LmmDualScratch::for_groupings(n_theta, p, g) {
+            let mut grad = vec![0.0; n_theta];
+            let st =
+                crate::lmm::reml_gradient(&ws.theta[..n_theta], &ws.suff, &mut scratch, &mut grad);
+            if matches!(st, crate::glmm::DerivStatus::Ok(_)) {
+                let mut acc = 0.0_f64;
+                for j in 0..n_theta {
+                    let gj = grad[j];
+                    let is_diag = diag.contains(&j);
+                    let (lo, hi) = if is_diag {
+                        (0.0, crate::lmm::THETA_HI)
+                    } else {
+                        (-crate::lmm::THETA_HI, crate::lmm::THETA_HI)
+                    };
+                    // Projected gradient on a box, in the internal θ̃ where the
+                    // box lives; back-mapped by ×s_j (∂D/∂θ = s·∂D/∂θ̃) — see
+                    // the GLMM twin for the derivation.
+                    let pj = if ws.theta[j] <= lo {
+                        gj.min(0.0)
+                    } else if ws.theta[j] >= hi {
+                        gj.max(0.0)
+                    } else {
+                        gj
+                    };
+                    acc = acc.max((pj * sc[j]).abs());
+                }
+                kkt_grad_norm = acc;
+            }
+        }
+        if fit.pinned_components != 0 && want_score {
+            if let Some(mut scratch) = crate::lmm::LmmHyperScratch::for_groupings(n_theta, p, g) {
+                let mut grad = vec![0.0; n_theta];
+                let mut hess = faer::Mat::<f64>::zeros(n_theta, n_theta);
+                let st = crate::lmm::reml_hessian(
+                    &ws.theta[..n_theta],
+                    &ws.suff,
+                    &mut scratch,
+                    &mut grad,
+                    &mut hess,
+                );
+                if matches!(st, crate::glmm::DerivStatus::Ok(_)) {
+                    for (kk, &ti) in diag.iter().enumerate() {
+                        if kk < u64::BITS as usize && (fit.pinned_components >> kk) & 1 == 1 {
+                            // s = θ_jj², θ̃ = sc·θ ⇒ dD/ds = sc²·dD/ds̃: the
+                            // score takes the SQUARE of the scale.
+                            boundary_score[ti] = 0.5 * hess[(ti, ti)] * sc[ti] * sc[ti];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     LmmResultView {
         ranef_u: if ws.fit.ranef_ok {
             &ws.fit.ranef_u[..ws.suff.groupings.k_total]
@@ -168,6 +254,8 @@ pub(crate) fn lmm_run_on<'a>(
         theta: &ws.theta,
         groupings: &ws.suff.groupings,
         n_rows: ws.suff.n_rows,
+        kkt_grad_norm,
+        boundary_score,
     }
 }
 
@@ -267,6 +355,21 @@ pub(crate) fn lmm_view_to_fit(
         (vec![], vec![])
     };
 
+    let mut diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
+    // W3 derivative diagnostics, computed in `lmm_run_on` and carried on the
+    // view (they do not pass through `FitDiagnostics` — same routing rule as
+    // the GLMM side, see `fit/glmm.rs`). Both are NaN/empty already when the
+    // fit did not converge (`lmm_run_on` gates the computation on it).
+    diagnostics.kkt_grad_norm = view.kkt_grad_norm;
+    // `pinned_scores` is keyed to `diagonal_theta` order like `pinned_flags`,
+    // so collapse the θ-coordinate buffer onto the diagonals first.
+    let diag_scores: Vec<f64> = view
+        .groupings
+        .diagonal_theta()
+        .iter()
+        .map(|&ti| view.boundary_score[ti])
+        .collect();
+    diagnostics.boundary_score = super::common::pinned_scores(&diag_scores, &varcorr);
     let mut fit = Fit {
         beta,
         se,
@@ -275,7 +378,7 @@ pub(crate) fn lmm_view_to_fit(
         // REML σ̂² (NaN-filled by the kernel alongside var_diag on the
         // degenerate path, so this stays honest without an endpoint gate).
         dispersion: sigma_sq,
-        diagnostics: super::common::materialize_diagnostics(&diag, p, &varcorr),
+        diagnostics,
         varcorr,
         stddev_se: vec![], // LMM has no Hessian SE machinery
         n_eval: lmm_fit.n_eval,
@@ -326,7 +429,12 @@ pub(super) fn fit_lmm_into(
     opts: &FitOptions,
     start: Option<&StartValues>,
 ) -> Fit {
-    let view = lmm_run_on(ws, &opts.target_indices, warm_theta(start));
+    let view = lmm_run_on(
+        ws,
+        &opts.target_indices,
+        warm_theta(start),
+        opts.boundary_score,
+    );
     lmm_view_to_fit(&view, x, ids, n, p, opts)
 }
 /// LMM dispatch adapter. `cluster_ids`/`extra_ids` are the per-row level ids from

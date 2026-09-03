@@ -210,8 +210,12 @@ pub enum InverseGaussianLink {
 /// GLMM fixed-effect Wald-SE denominator.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WaldSe {
-    /// FD-Hessian of the joint (θ, β) Laplace deviance — the lme4
-    /// `use.hessian = TRUE`-matching default.
+    /// Hessian of the joint (θ, β) Laplace deviance — the lme4
+    /// `use.hessian = TRUE`-matching default. Exact (hyper-dual) on every
+    /// shape `derivative::supports_shape` accepts (the blocked path and the
+    /// structured-extras shapes within the measured tail bound),
+    /// finite-difference on the oversized-core dense fallback and on the
+    /// sparse driver.
     #[default]
     Hessian,
     /// Direct inverse of the expected-information Schur complement (assumes

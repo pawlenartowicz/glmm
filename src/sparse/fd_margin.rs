@@ -612,6 +612,12 @@ fn measure_dense(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
         r.opts.offset.as_deref(),
     );
     let targets: Vec<u32> = (0..p as u32).collect();
+    // Force the FD arm: the probe MEASURES the FD stencil's margin, and since
+    // W3 the blocked path ships the exact hyper-dual Hessian instead — without
+    // the flag the `se_shipped` self-check below would compare the probe's FD
+    // numbers against exact ones and fail at the size of the stencil's own
+    // error, which is the quantity being measured.
+    ws.force_fd_hessian = true;
     let fit = crate::glmm::fit_glmm(
         &mut ws,
         x_mat.as_ref(),
@@ -627,7 +633,7 @@ fn measure_dense(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     assert!(fit.converged, "{}: dense fit must converge", r.name);
     let se_shipped: Vec<f64> = (0..p).map(|j| ws.var_diag[j].sqrt()).collect();
 
-    // Freeze the FD grid on the fit's own converged mode, as `fd_hessian_cov`
+    // Freeze the FD grid on the fit's own converged mode, as `joint_hessian_cov`
     // does: every eval below warm-starts from this one seed, so each f(γ) is a
     // function of γ alone.
     let m = ws.params.len();

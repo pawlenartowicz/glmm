@@ -269,8 +269,60 @@ impl<const N: usize> crate::scalar::Scalar for Dual<N> {
         crate::scalar::chol_lower_generic(a, dim, l_out)
     }
 
+    // Write `bt = B0 + Σ_k ε_k B_k`, where `B0` is the value lanes of `bt` and
+    // `B_k` is derivative lane `k`. Since `ε_k ε_l = 0`,
+    //   bt · btᵀ = B0 B0ᵀ + Σ_k ε_k (B_k B0ᵀ + B0 B_kᵀ).
+    // The value part of the result is exactly `B0 B0ᵀ`, so it goes through the
+    // same faer call `f64` uses (`tri_lower_sub_gemm(_, _, B0, B0, _)`) and
+    // keeps `f64`'s rounding. Each derivative lane is the sum of two
+    // rectangular gemms, `B_k B0ᵀ` and `B0 B_kᵀ`, added in that order — the
+    // generic triple loop instead accumulates value and derivative terms
+    // together inside one `k`-sum, so the two routes reorder floating-point
+    // addition relative to each other. That reordering only ever shows up in
+    // the last ulp (checked by `dual_syrk_faer_lanes_match_generic_loop`
+    // below), never in a validated answer. `HyperDual` keeps the generic
+    // loop: unpacking its packed second-derivative block into rectangular
+    // buffers would cost more than the loop it replaces.
     fn syrk_lower_sub(bt: &[Self], t_dim: usize, w_tot: usize, tail: &mut [Self]) {
-        crate::scalar::syrk_lower_sub_generic(bt, t_dim, w_tot, tail)
+        // One allocation per call, on the gradient path (once per fit), not
+        // the fit's inner loop — accepted here, unlike the alloc-free kernel
+        // paths this crate otherwise holds to.
+        let mut b0 = vec![0.0_f64; t_dim * w_tot];
+        let mut bk = vec![0.0_f64; t_dim * w_tot];
+        let mut scratch = vec![0.0_f64; t_dim * t_dim];
+
+        for (k, dst) in b0.iter_mut().enumerate() {
+            *dst = bt[k].v;
+        }
+        for j in 0..t_dim {
+            for i in j..t_dim {
+                scratch[j * t_dim + i] = tail[j * t_dim + i].v;
+            }
+        }
+        crate::scalar::tri_lower_sub_gemm(&mut scratch, t_dim, &b0, &b0, w_tot);
+        for j in 0..t_dim {
+            for i in j..t_dim {
+                tail[j * t_dim + i].v = scratch[j * t_dim + i];
+            }
+        }
+
+        for lane in 0..N {
+            for (k, dst) in bk.iter_mut().enumerate() {
+                *dst = bt[k].d[lane];
+            }
+            for j in 0..t_dim {
+                for i in j..t_dim {
+                    scratch[j * t_dim + i] = tail[j * t_dim + i].d[lane];
+                }
+            }
+            crate::scalar::tri_lower_sub_gemm(&mut scratch, t_dim, &bk, &b0, w_tot);
+            crate::scalar::tri_lower_sub_gemm(&mut scratch, t_dim, &b0, &bk, w_tot);
+            for j in 0..t_dim {
+                for i in j..t_dim {
+                    tail[j * t_dim + i].d[lane] = scratch[j * t_dim + i];
+                }
+            }
+        }
     }
 }
 
@@ -967,6 +1019,95 @@ mod tests {
                 } else {
                     // Strict upper triangle: untouched sentinel.
                     assert_eq!(tail[idx], SENTINEL, "({i},{j}) was touched");
+                }
+            }
+        }
+    }
+
+    /// Small deterministic LCG, `x_{n+1} = (1103515245 x_n + 12345) mod 2^31`,
+    /// mapped to `[-1, 1]` — enough spread to exercise every lane without
+    /// pulling in an RNG crate.
+    fn lcg_next(state: &mut u64) -> f64 {
+        *state = (state.wrapping_mul(1_103_515_245).wrapping_add(12_345)) % (1u64 << 31);
+        (*state as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
+    }
+
+    /// `<Dual<4> as Scalar>::syrk_lower_sub`'s faer-per-lane path against
+    /// `syrk_lower_sub_generic`'s triple loop, on a `7×11` `bt` with all four
+    /// lanes nonzero. Checks the value lane and every derivative lane agree
+    /// on the lower triangle (the reordering the override introduces is a
+    /// last-ulp effect, not a correctness gap) and that the strict upper
+    /// triangle of `tail` is untouched.
+    #[test]
+    fn dual_syrk_faer_lanes_match_generic_loop() {
+        for (t_dim, w_tot) in [(7usize, 11usize), (1usize, 1usize)] {
+            let mut state = 12_345_u64;
+            let mut bt = vec![
+                Dual::<4> {
+                    v: 0.0,
+                    d: [0.0; 4]
+                };
+                t_dim * w_tot
+            ];
+            for e in bt.iter_mut() {
+                e.v = lcg_next(&mut state);
+                for lane in 0..4 {
+                    e.d[lane] = lcg_next(&mut state);
+                }
+            }
+            const SENTINEL: f64 = -777.0;
+            let seed = Dual::<4> {
+                v: SENTINEL,
+                d: [SENTINEL; 4],
+            };
+            let mut tail_faer = vec![seed; t_dim * t_dim];
+            for j in 0..t_dim {
+                for i in j..t_dim {
+                    let mut v = Dual::<4> {
+                        v: lcg_next(&mut state),
+                        d: [0.0; 4],
+                    };
+                    for lane in 0..4 {
+                        v.d[lane] = lcg_next(&mut state);
+                    }
+                    tail_faer[j * t_dim + i] = v;
+                }
+            }
+            let mut tail_generic = tail_faer.clone();
+
+            <Dual<4> as Scalar>::syrk_lower_sub(&bt, t_dim, w_tot, &mut tail_faer);
+            syrk_lower_sub_generic(&bt, t_dim, w_tot, &mut tail_generic);
+
+            for j in 0..t_dim {
+                for i in 0..t_dim {
+                    let idx = j * t_dim + i;
+                    if i >= j {
+                        let a = tail_faer[idx];
+                        let b = tail_generic[idx];
+                        assert!(
+                            (a.v - b.v).abs() <= 1e-12 * a.v.abs().max(1.0),
+                            "t_dim={t_dim} w_tot={w_tot} ({i},{j}) value: {} vs {}",
+                            a.v,
+                            b.v
+                        );
+                        for lane in 0..4 {
+                            assert!(
+                                (a.d[lane] - b.d[lane]).abs() <= 1e-12 * a.d[lane].abs().max(1.0),
+                                "t_dim={t_dim} w_tot={w_tot} ({i},{j}) lane {lane}: {} vs {}",
+                                a.d[lane],
+                                b.d[lane]
+                            );
+                        }
+                    } else {
+                        assert_eq!(
+                            tail_faer[idx].v, SENTINEL,
+                            "t_dim={t_dim} w_tot={w_tot} ({i},{j}) value was touched"
+                        );
+                        assert_eq!(
+                            tail_faer[idx].d, [SENTINEL; 4],
+                            "t_dim={t_dim} w_tot={w_tot} ({i},{j}) derivative was touched"
+                        );
+                    }
                 }
             }
         }

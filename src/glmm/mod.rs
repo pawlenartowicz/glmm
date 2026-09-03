@@ -100,7 +100,7 @@ pub const PIRLS_TOL_REL: f64 = 1e-9;
 /// only when SEs go through the FD-Hessian (`se_rx` skips it entirely).
 pub const PIRLS_TOL_REL_NONCANON: f64 = 1e-8;
 /// CEILING on the PIRLS exit tolerance under the FD-Hessian SE evals ONLY
-/// (`fd_hessian_cov` / `sparse_fd_hessian_cov`). Never applied on its own —
+/// (`joint_hessian_cov` / `sparse_fd_hessian_cov`). Never applied on its own —
 /// `pirls_tol_fd` takes `min(this, pirls_tol(family))`, so the SE pass is always
 /// at least as converged as the fit that produced the point it differences.
 /// Applying it as a plain replacement would put canonical links (fitting at
@@ -138,7 +138,7 @@ pub(crate) fn pirls_tol(family: crate::spec::Family) -> f64 {
 /// more converged than the fit, never less. Canonical links take
 /// `PIRLS_TOL_REL` (1e-9); non-canonical links fit at 1e-8 and so take the
 /// ceiling. Both FD-Hessian arms write this into `pirls_tol_override` —
-/// `glmm::se::fd_hessian_cov` and `sparse::glmm`'s `WaldSe::Hessian` arm,
+/// `glmm::se::joint_hessian_cov` and `sparse::glmm`'s `WaldSe::Hessian` arm,
 /// change together.
 pub(crate) fn pirls_tol_fd(family: crate::spec::Family) -> f64 {
     PIRLS_TOL_REL_FD.min(pirls_tol(family))
@@ -153,7 +153,7 @@ pub(crate) fn pirls_tol_fd(family: crate::spec::Family) -> f64 {
 /// silently a change to the other. Like any absolute bound on β this box is
 /// itself unit-dependent; that is a known, separate question.
 pub const BETA_BOX: f64 = 30.0;
-/// Base FD step for `fd_hessian_cov`'s joint-deviance Hessian. It is applied
+/// Base FD step for `joint_hessian_cov`'s joint-deviance Hessian. It is applied
 /// ASYMMETRICALLY across the joint (θ, β) vector: `h_θ = FD_STEP_BASE` absolute on
 /// the θ block, `h_β = FD_STEP_BASE·max(1, |β̂_k|)` relative on the β block.
 /// β enters through η = Xβ and wants relative stepping; θ does not — scaling h_θ
@@ -214,7 +214,7 @@ pub struct GlmmFit {
     pub tau_squared_hat: f64,
     /// Joint Wald-χ² over `target_indices` (NaN when empty / non-converged).
     pub joint_t_sq: f64,
-    /// Set iff the fit ran `WaldSe::Hessian` and `fd_hessian_cov` fell back to the
+    /// Set iff the fit ran `WaldSe::Hessian` and `joint_hessian_cov` fell back to the
     /// RX/Schur block (non-PD joint Hessian / non-finite perturbed deviance) — its
     /// `NonPdFellBackToRx` status. Always `false` under `WaldSe::Rx`.
     pub hessian_fallback: bool,
@@ -239,7 +239,7 @@ pub(crate) use deviance::glmm_laplace_deviance;
 // these instead of duplicating them — `derivative` itself is private to
 // `glmm`, so a sibling module needs the items re-exported one level up.
 pub(crate) use derivative::{unpack_hessian, DerivStatus};
-pub use se::fd_hessian_cov;
+pub use se::joint_hessian_cov;
 pub(crate) use se::{fd_mixed_diff, fd_second_diff};
 pub(crate) use workspace::StructuredSchur;
 pub use workspace::{build_z, GlmmWorkspace};
@@ -248,10 +248,14 @@ pub(crate) use workspace::{glmm_block_chol, glmm_block_solve};
 
 use deviance::laplace_deviance;
 
+// `pub(crate)` so `src/scalar.rs`'s tail-methods test can reuse
+// `glmm_extras_q1_dataset` instead of duplicating a structured fixture.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-/// Outcome of the FD-Hessian fixed-effect covariance.
+/// Outcome of the joint-Hessian fixed-effect covariance (either arm — the
+/// exact hyper-dual one on every shape `derivative::supports_shape` accepts,
+/// the FD stencil elsewhere).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FdHessianStatus {
     /// The joint-deviance Hessian was PD and every perturbed eval finite; the
@@ -270,8 +274,9 @@ pub enum FdHessianStatus {
 /// Convention: `wald_se` selects the fixed-effect covariance — `WaldSe::Rx`
 /// inverts the expected-information Schur complement directly (assumes β–θ
 /// orthogonality; anticonservative for the GLMM); `WaldSe::Hessian` (glmer
-/// `use.hessian = TRUE`) sources it from the FD-Hessian of the joint Laplace
-/// deviance instead, the lme4-matching default. The optimizer runs a two-stage
+/// `use.hessian = TRUE`) sources it from the Hessian of the joint Laplace
+/// deviance instead (exact on every shape `derivative::supports_shape`
+/// accepts, finite-difference elsewhere), the lme4-matching default. The optimizer runs a two-stage
 /// β-profiling search when `ws.two_stage` (default `true`): stage 1 profiles β
 /// out of a θ-only BOBYQA on the PQL objective purely as a warm-start
 /// accelerant; stage 2's joint [θ | β] BOBYQA polish alone gates convergence,
@@ -476,7 +481,7 @@ pub fn fit_glmm(
     // same way `pirls_solve_blocked`'s does), so every BOBYQA eval's per-solve M
     // fill runs MatRef-free. The dense-fallback path skips it: it never reads
     // z_buf (it reads `x` through `z`/`apply_lambda` instead). `se.rs`'s
-    // `fd_hessian_cov` mirrors this same hoist for its own FD deviance evals.
+    // `joint_hessian_cov` mirrors this same hoist for its own FD deviance evals.
     if groupings.extra_offsets.is_empty() || groupings.structured_extras_eligible() {
         fill_z_f64(groupings, x, z_buf, n);
     }
@@ -566,7 +571,7 @@ pub fn fit_glmm(
                     beta_prev,
                     true,
                     // Never the FD-pass tol here — stage-1 objective evals stay at
-                    // `pirls_tol` (the field is None outside `fd_hessian_cov`).
+                    // `pirls_tol` (the field is None outside `joint_hessian_cov`).
                     None,
                     *pf,
                     n,
@@ -666,7 +671,7 @@ pub fn fit_glmm(
                 beta_prev,
                 false,
                 // Never the FD-pass tol here — BOBYQA objective evals stay at
-                // `pirls_tol` (the field is None outside `fd_hessian_cov`).
+                // `pirls_tol` (the field is None outside `joint_hessian_cov`).
                 None,
                 *pf,
                 n,
@@ -708,6 +713,131 @@ pub fn fit_glmm(
                 }
             }
         }
+    }
+
+    // KKT residual at the accepted (pinned) γ̂. Available only where the exact
+    // gradient is — the shapes `derivative::supports_shape` accepts, i.e. the
+    // blocked path and the structured extras path, and only at a θ̂ whose
+    // crossed components are all unpinned (`extras_theta_pin_free`); NaN
+    // elsewhere, which includes a refused Hessian below — there is no gradient
+    // retry, so a pinned crossed θ̂ leaves this and `boundary_score` both NaN.
+    // Read at `Fit` assembly, never by a fitting decision. This runs
+    // on BOTH `WaldSe` arms: it is a statement about the optimum, not the
+    // covariance.
+    //
+    // Placed BEFORE the pinned re-eval below, deliberately: `laplace_gradient`
+    // runs its own f64 mode solve, which perturbs the PIRLS state (W̃, μ̂, block
+    // factors, and on the structured route `core_blocks`/`coupling`/`schur_blk`)
+    // and restores only `ws.u` — and the Rx Schur reads that state.
+    // The pinned re-eval rebuilds every one of those buffers as a pure function
+    // of (params, u_seed, design), so running the gradient first leaves the
+    // post-re-eval state bit-identical to a build without this block, on the
+    // structured route as much as the blocked one. Measured
+    // the other way round (gradient after the re-eval): `se_rx` moved at
+    // ~1e-10 relative on every blocked derivative rung of the bit-identity dump.
+    //
+    // NaN-for-non-converged is enforced at the `Fit` read (`fit/glmm.rs`), not
+    // here — every `ok` path reaching the assembly reports this measurement.
+    //
+    // The second number, the variance-component score at each pinned diagonal,
+    // is ½·∂²D/∂θ_jj² at γ̂ — dD/ds at s = θ_jj² = 0 (the deviance is even in
+    // θ_jj, so its first derivative there vanishes and the second derivative IS
+    // the score in the variance coordinate — the design doc's `s_j = θ_jj²`
+    // construction). Positive ⇒ the boundary is the constrained optimum.
+    //
+    // The score is opt-in (`FitOptions::boundary_score`, read here as
+    // `ws.boundary_score_requested`). It needs the hyper-dual Hessian — three
+    // hyper-dual PIRLS steps at roughly 100× the cost of an f64 step each —
+    // which nothing else on the `WaldSe::Rx` arm needs, and on a small pinned
+    // warm refit that pass costs about as much as the fit itself (measured
+    // 2026-09-02, 96-row binomial-logit intercept fixture, Rx, 200 warm refits
+    // per pass, min of 3 passes on a clock-locked core: 242 µs/fit with the
+    // score, 181 µs/fit without). An unrequested score leaves the same NaN an
+    // unpinned fit does; `kkt_grad_norm` is still measured from the gradient.
+    //
+    // When it is requested, ONE kernel call serves both numbers:
+    // `laplace_hessian` returns the gradient too, and a separate
+    // `laplace_gradient` call first would leave a `Dual` scratch that the
+    // Hessian call rebuilds as `HyperDual` — two full scratch builds per fit on
+    // every pinned warm refit (measured as an 884-vs-124-block regression of
+    // `fit_glmm_warm_path_bounded_alloc`). Every other fit calls the gradient
+    // alone. `ws.hess_scratch` is reusable here: nothing has written it this
+    // fit, and the `WaldSe::Hessian` arm below overwrites it wholesale, so the
+    // two uses cannot interleave.
+    ws.kkt_grad_norm = f64::NAN;
+    for v in ws.boundary_score.iter_mut() {
+        *v = f64::NAN;
+    }
+    // The one owner is `derivative::supports_shape` — do not inline this test.
+    // Its θ-valued companion `extras_theta_pin_free` is not repeated here: the
+    // entry points below check it themselves, and both NaN resets already ran.
+    if ok && derivative::supports_shape(&ws.groupings) {
+        let mut g = std::mem::take(&mut ws.grad_scratch);
+        let mut got_grad = false;
+        if pinned && ws.boundary_score_requested {
+            let mut h = std::mem::replace(&mut ws.hess_scratch, Mat::zeros(0, 0));
+            let st =
+                derivative::laplace_hessian(ws, x, y, cluster_ids, extra_ids, p, n, &mut g, &mut h);
+            if matches!(st, DerivStatus::Ok(_)) {
+                got_grad = true;
+                let mut sc = [0.0_f64; crate::consts::MAX_THETA];
+                let sc = &mut sc[..n_theta];
+                ws.groupings.fill_theta_row_scales(sc);
+                let diag = ws.groupings.diagonal_theta();
+                for (kk, &ti) in diag.iter().enumerate() {
+                    if kk < u64::BITS as usize && (pinned_components >> kk) & 1 == 1 {
+                        // `h` is a faer Mat<f64>, so the diagonal entry is
+                        // h[(ti, ti)] — the same indexing the FD grid uses in
+                        // se.rs. Back-map to the caller's variance coordinate:
+                        // s = θ_jj² and θ̃ = sc·θ, so s̃ = sc²·s and
+                        // dD/ds = sc²·dD/ds̃ — the score is a SECOND
+                        // derivative, so it takes the SQUARE of the scale
+                        // where the KKT gradient takes it once.
+                        ws.boundary_score[ti] = 0.5 * h[(ti, ti)] * sc[ti] * sc[ti];
+                    }
+                }
+            }
+            ws.hess_scratch = h;
+        } else {
+            let st = derivative::laplace_gradient(ws, x, y, cluster_ids, extra_ids, p, n, &mut g);
+            got_grad = matches!(st, DerivStatus::Ok(_));
+        }
+        if got_grad {
+            // θ row scales, same stack-sized fill the θ₀ forward map uses at
+            // the top of this function.
+            let mut sc = [0.0_f64; crate::consts::MAX_THETA];
+            let sc = &mut sc[..n_theta];
+            ws.groupings.fill_theta_row_scales(sc);
+            let diag = ws.groupings.diagonal_theta();
+            let mut acc = 0.0_f64;
+            for j in 0..n_theta {
+                let gj = g[j];
+                let is_diag = diag.contains(&j);
+                let (lo, hi) = if is_diag {
+                    (0.0, crate::lmm::THETA_HI)
+                } else {
+                    (-crate::lmm::THETA_HI, crate::lmm::THETA_HI)
+                };
+                // Projected gradient on a box: at a bound, only the component
+                // pointing back INTO the box is a violation. Done in the
+                // INTERNAL θ̃, because that is where the box the optimizer
+                // searched lives (`blind_theta_and_bounds`).
+                let pj = if ws.params[j] <= lo {
+                    gj.min(0.0)
+                } else if ws.params[j] >= hi {
+                    gj.max(0.0)
+                } else {
+                    gj
+                };
+                // Back-map to the caller's θ: ∂D/∂θ = s·∂D/∂θ̃. A derivative
+                // MULTIPLIES by the scale where `stddev_se` divides by it
+                // (fit/glmm.rs) — same map, opposite side. Scales are > 0, so
+                // this changes no sign and no active set.
+                acc = acc.max((pj * sc[j]).abs());
+            }
+            ws.kkt_grad_norm = acc;
+        }
+        ws.grad_scratch = g;
     }
 
     // Re-evaluate at the (possibly pinned) γ̂ to refresh M, ũ, W̃. ws.params already
@@ -770,8 +900,16 @@ pub fn fit_glmm(
             schur_llt_mem,
             beta_prof,
             beta_prev,
+            agq_scratch,
+            cluster_rows,
+            offset,
             ..
         } = ws;
+        // Shadow the function-level `offset` borrow (taken before the BOBYQA
+        // destructure) with this destructure's own — the function-level one must
+        // die before the KKT block above, or `laplace_gradient(&mut ws)` cannot
+        // borrow the whole workspace.
+        let offset = offset.as_deref();
         // z_buf still holds this fit's slope copy — x is unchanged since fill_z_f64.
         // On the structured path this re-eval re-packs m_core_buf/cross_* at γ̂, which
         // `structured_schur_fill` then reads (the dense `m` it formerly read is no
@@ -832,7 +970,7 @@ pub fn fit_glmm(
             beta_prev,
             false,
             // Never the FD-pass tol here — the pinned re-eval stays at `pirls_tol`
-            // (the field is None outside `fd_hessian_cov`).
+            // (the field is None outside `joint_hessian_cov`).
             None,
             *p,
             n,
@@ -872,11 +1010,13 @@ pub fn fit_glmm(
     // Var(β̂): `Rx` inverts the β-information (Schur) directly — fast, but the
     // expected-information Schur complement assumes β–θ orthogonality (exact for
     // the Gaussian LMM, anticonservative for the GLMM where IRLS weights couple
-    // β,θ). `Hessian` (default) sources Var(β̂) from the FD-Hessian of the joint
-    // Laplace deviance (glmer `use.hessian = TRUE`), the lme4 "correct" denom.
+    // β,θ). `Hessian` (default) sources Var(β̂) from the Hessian of the joint
+    // Laplace deviance (glmer `use.hessian = TRUE`), the lme4 "correct" denom —
+    // exact on every shape `derivative::supports_shape` accepts,
+    // finite-difference elsewhere.
     let mut hessian_fallback = false;
     // Reset the θ-block SE each fit (the workspace is reused across fits). Only the
-    // Hessian arm's `fd_hessian_cov` refills it; the Rx arm leaves it NaN.
+    // Hessian arm's `joint_hessian_cov` refills it; the Rx arm leaves it NaN.
     for v in ws.theta_se[..n_theta].iter_mut() {
         *v = f64::NAN;
     }
@@ -972,13 +1112,13 @@ pub fn fit_glmm(
             }
         }
         WaldSe::Hessian => {
-            // FD-Hessian covariance into a LOCAL p×p Mat — NOT a ws field: the kernel
+            // Joint-Hessian covariance into a LOCAL p×p Mat — NOT a ws field: the kernel
             // takes `&mut ws`, so `&mut ws.<field>` for out_cov would alias it. The
             // allocation is acceptable on this default path (the zero-alloc gate
             // pins the Rx warm path). The kernel re-evals PIRLS itself and its
             // RX fallback runs schur_fill internally, so skip the schur_fill above.
             let mut cov = Mat::<f64>::zeros(p, p);
-            let status = fd_hessian_cov(ws, x, y, cluster_ids, extra_ids, p, n, &mut cov);
+            let status = joint_hessian_cov(ws, x, y, cluster_ids, extra_ids, p, n, &mut cov);
             // Double-failure sentinel: the kernel NaN-fills `cov` when BOTH the joint
             // Hessian and the RX fallback fail. Treat as a failed fit.
             if !cov[(0, 0)].is_finite() {

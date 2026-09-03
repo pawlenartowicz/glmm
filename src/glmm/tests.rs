@@ -6,10 +6,10 @@ use super::se::*;
 use super::workspace::*;
 use super::*;
 use crate::counters::EvalCounters;
-use crate::test_support::{intercept_only_spec, TestWs};
+use crate::test_support::{intercept_only_spec, TestWs, KKT_INTERIOR_MAX};
 use crate::{
-    BinomialLink, Family, GammaLink, Grouping, GroupingRelation, ModelSpec, NegBinomialLink,
-    PoissonLink, ReStructure, Sizing, WaldSe,
+    BinomialLink, Boundary, Family, FitOptions, GammaLink, GroupIds, Grouping, GroupingRelation,
+    ModelSpec, NegBinomialLink, PoissonLink, ReStructure, Sizing, WaldSe,
 };
 use faer::linalg::solvers::Solve;
 
@@ -918,7 +918,7 @@ fn load_hessian_fixture() -> HessianFixture {
 /// to ~0.07% and β̂ to ~0.1%; against the artifact-free fixture the vcov gap is
 /// ~3.4e-7 (see the band comment at the assertion).
 #[test]
-fn fd_hessian_cov_matches_glmer_use_hessian_true() {
+fn joint_hessian_cov_matches_glmer_use_hessian_true() {
     let fx = load_hessian_fixture();
     let n = fx.n;
     let p = fx.beta.len();
@@ -1005,7 +1005,7 @@ fn fd_hessian_cov_matches_glmer_use_hessian_true() {
     let our_theta = ws.params[0];
 
     let mut cov = Mat::<f64>::zeros(p, p);
-    let status = fd_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov);
+    let status = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov);
     assert_eq!(status, FdHessianStatus::Ok);
     // ws.params restored to OUR converged snapshot on return.
     assert!((ws.params[0] - our_theta).abs() < 1e-15);
@@ -1014,12 +1014,12 @@ fn fd_hessian_cov_matches_glmer_use_hessian_true() {
     // (gen_glmm_hessian_vcov.R, glmer tolPwrss = 1e-13 — at lme4's default
     // 1e-7 its ldL2 uses working weights one PIRLS iteration behind the mode
     // and vcov(use.hessian=TRUE) carried ~1.7e-3 of spurious θ/θβ curvature,
-    // which this band used to absorb; see fd_hessian_cov's doc comment) and
+    // which this band used to absorb; see joint_hessian_cov's doc comment) and
     // our FD runs PIRLS at `pirls_tol_fd` — never looser than the fit's own exit
     // tolerance and capped at PIRLS_TOL_REL_FD — so what remains is the
     // two solvers' θ̂ offset plus FD truncation. tol = achieved band + ~30×
     // margin (cross-platform FP headroom); it pins the convention + the
-    // load-bearing factor of 2. Mirrors hessian_mode_t_sq_uses_fd_hessian_cov's
+    // load-bearing factor of 2. Mirrors hessian_mode_t_sq_uses_joint_hessian_cov's
     // band — change together.
     let tol = 1e-5;
     for i in 0..p {
@@ -1034,7 +1034,583 @@ fn fd_hessian_cov_matches_glmer_use_hessian_true() {
     }
 }
 
-/// Run `fd_hessian_cov` twice on the same converged workspace — serial
+/// The exact hyper-dual joint Hessian and the FD stencil agree on the committed
+/// n=96 / 12-cluster `y ~ x1 + (1|grp)` fixture, to the `validation/tol.R`
+/// `se_hessian_rel` default band (1e-3). The two sides are the SAME function's
+/// second derivative computed two ways, so the gap is the FD stencil's own
+/// truncation-plus-noise error and nothing else — this is the test that says
+/// the exact arm did not change the meaning of the quantity, only its accuracy.
+#[test]
+fn exact_hessian_matches_fd_on_fixture() {
+    let fx = load_hessian_fixture();
+    let n = fx.n;
+    let p = fx.beta.len();
+    let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters });
+    let mut xf64 = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        for j in 0..p {
+            xf64[(i, j)] = fx.x[i][j];
+        }
+    }
+    let y = fx.y.clone();
+    let ids = fx.cluster_ids.clone();
+
+    let mut cov_exact = Mat::<f64>::zeros(p, p);
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
+    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
+    // Rx: mirrors the sibling test — an in-fit SE fallback under Hessian would
+    // return nan_fit and fail the wrong assertion; the explicit joint_hessian_cov
+    // calls below are the comparison.
+    let fit = fit_glmm(
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &[],
+        &[1u32],
+        None,
+        &vec![0.0; p],
+        n,
+        WaldSe::Rx,
+    );
+    assert!(fit.converged);
+    let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_exact);
+    assert_eq!(st, FdHessianStatus::Ok);
+    let tse_exact = ws.theta_se.clone();
+
+    let mut cov_fd = Mat::<f64>::zeros(p, p);
+    ws.force_fd_hessian = true;
+    let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
+    assert_eq!(st, FdHessianStatus::Ok);
+    let tse_fd = ws.theta_se.clone();
+
+    // Band = tol.R's `se_hessian_rel` default (1e-3), applied to the SEs the
+    // caller sees, not to the raw covariance entries.
+    for j in 0..p {
+        let (a, b) = (cov_exact[(j, j)].sqrt(), cov_fd[(j, j)].sqrt());
+        assert!(
+            (a - b).abs() <= 1e-3 * b.abs(),
+            "se[{j}]: exact {a} vs fd {b}"
+        );
+    }
+    for k in 0..ws.n_theta {
+        assert!(
+            (tse_exact[k] - tse_fd[k]).abs() <= 1e-3 * tse_fd[k].abs(),
+            "theta_se[{k}]: exact {} vs fd {}",
+            tse_exact[k],
+            tse_fd[k]
+        );
+    }
+}
+
+/// Same exact-vs-FD comparison at nAGQ > 1. The AGQ gate
+/// (`deviance.rs`: no extras, `q_p ≤ 3`, binomial/Poisson) sits entirely inside
+/// the blocked branch, so the exact Hessian differentiates the AGQ deviance
+/// rather than the Laplace one — this is the test that says so. Identical to
+/// `exact_hessian_matches_fd_on_fixture` except the workspace is built at
+/// `nagq = 7` (the order rungs 44/45 carry in `validation/manifest.json`) and
+/// the band is `AGQ_SE_HESSIAN_REL` (`2e-2`) in place of the Laplace default.
+#[test]
+fn exact_hessian_matches_fd_on_fixture_agq() {
+    let fx = load_hessian_fixture();
+    let n = fx.n;
+    let p = fx.beta.len();
+    let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
+    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters });
+    let mut xf64 = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        for j in 0..p {
+            xf64[(i, j)] = fx.x[i][j];
+        }
+    }
+    let y = fx.y.clone();
+    let ids = fx.cluster_ids.clone();
+
+    let mut cov_exact = Mat::<f64>::zeros(p, p);
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 7);
+    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
+    // Rx: mirrors the sibling test — an in-fit SE fallback under Hessian would
+    // return nan_fit and fail the wrong assertion; the explicit joint_hessian_cov
+    // calls below are the comparison.
+    let fit = fit_glmm(
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &[],
+        &[1u32],
+        None,
+        &vec![0.0; p],
+        n,
+        WaldSe::Rx,
+    );
+    assert!(fit.converged);
+    let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_exact);
+    assert_eq!(st, FdHessianStatus::Ok);
+    let tse_exact = ws.theta_se.clone();
+
+    let mut cov_fd = Mat::<f64>::zeros(p, p);
+    ws.force_fd_hessian = true;
+    let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
+    assert_eq!(st, FdHessianStatus::Ok);
+    let tse_fd = ws.theta_se.clone();
+
+    // Band = `AGQ_SE_HESSIAN_REL` (2e-2, `tests/oracle_support/mod.rs`),
+    // applied to the SEs the caller sees, not to the raw covariance entries.
+    for j in 0..p {
+        let (a, b) = (cov_exact[(j, j)].sqrt(), cov_fd[(j, j)].sqrt());
+        assert!(
+            (a - b).abs() <= 2e-2 * b.abs(),
+            "se[{j}]: exact {a} vs fd {b}"
+        );
+    }
+    for k in 0..ws.n_theta {
+        assert!(
+            (tse_exact[k] - tse_fd[k]).abs() <= 2e-2 * tse_fd[k].abs(),
+            "theta_se[{k}]: exact {} vs fd {}",
+            tse_exact[k],
+            tse_fd[k]
+        );
+    }
+}
+
+/// The exact hyper-dual Hessian and the FD stencil agree on the structured
+/// extras path, to `validation/tol.R`'s `se_hessian_rel` default band (1e-3).
+/// Three regimes, because they take three different tails: nested-only
+/// (`e = 0`, no tail), crossed with a scalar rank-1 downdate (`qc == 1`), and
+/// nested+crossed (`qc > 1`, whose f64 route is the panel downdate and whose
+/// dual route is the scalar default). The two sides are the same function's
+/// second derivative computed two ways; the gap is the FD stencil's own
+/// truncation-plus-noise error.
+///
+/// Each regime carries its own `(n_primary, n)`, chosen so every θ̂ lands well
+/// inside the box (≥0.25 here), for two reasons the band cannot absorb:
+///
+/// - A θ-pinned crossed component has no derivative at all — the entry points
+///   refuse it (`derivative::extras_theta_pin_free`) and the caller keeps the
+///   stencil, so there would be no exact side to compare against.
+///   `pinned_crossed_theta_keeps_the_fd_hessian` covers that case instead.
+/// - The stencil's θ step is ABSOLUTE (`FD_STEP_BASE`), so its truncation error
+///   in the θ block grows as θ̂ shrinks: measured on this fixture family, the
+///   θ SE gap runs 2e-5 at θ̂ = 0.41, 1.1e-3 at θ̂ = 0.13 and 3.3e-3 at
+///   θ̂ = 0.08 — the stencil moving, not the exact side. The β SEs, which are
+///   what the validation dump's `se_hessian` reports, stay under 1e-4 across
+///   all of them.
+#[test]
+fn exact_hessian_matches_fd_on_structured_fixture() {
+    for (np, ncr, n_prim, n_rows, label) in [
+        (2usize, 0usize, 16usize, 320usize, "nested2"),
+        (0, 6, 20, 200, "crossed6"),
+        (2, 6, 18, 180, "nested2_crossed6"),
+    ] {
+        let (xf64, y, ids, extra_ids, spec) = glmm_extras_q1_dataset_sized(np, ncr, n_prim, n_rows);
+        let n = y.len();
+        let p = 2usize;
+        let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
+        assert!(
+            ws.groupings.structured_extras_eligible(),
+            "{label}: fixture must route through the structured extras path"
+        );
+        build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
+        // Built so the f64 FD side runs the production cached tail (`None` on the
+        // nested-only cell, where `e == 0` skips the tail altogether).
+        ws.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+        // Rx: mirrors `exact_hessian_matches_fd_on_fixture` — an in-fit SE
+        // fallback under Hessian would return nan_fit and fail the wrong
+        // assertion; the explicit joint_hessian_cov calls below are the comparison.
+        let fit = fit_glmm(
+            &mut ws,
+            xf64.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            &[1u32],
+            None,
+            &vec![0.0; p],
+            n,
+            WaldSe::Rx,
+        );
+        assert!(fit.converged, "{label}: fixture must converge");
+        assert!(
+            ws.params[..ws.n_theta].iter().all(|v| *v > 0.0),
+            "{label}: θ̂ = {:?} touches the pin — see this test's doc comment",
+            &ws.params[..ws.n_theta]
+        );
+
+        // `dual_scratch` is `None` until a dual kernel call sizes it, and the FD
+        // stencil never touches it — so it is what separates the two arms here,
+        // which the band alone cannot do: with both calls on the stencil the two
+        // sides agree BITWISE and every band below passes vacuously. Cleared
+        // first because `fit_glmm`'s KKT block leaves a gradient-order scratch.
+        ws.dual_scratch = None;
+        let mut cov_exact = Mat::<f64>::zeros(p, p);
+        let st = joint_hessian_cov(
+            &mut ws,
+            xf64.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut cov_exact,
+        );
+        assert_eq!(st, FdHessianStatus::Ok, "{label}");
+        assert!(
+            ws.dual_scratch.is_some(),
+            "{label}: joint_hessian_cov fell through to the FD stencil"
+        );
+        let tse_exact = ws.theta_se.clone();
+
+        let mut cov_fd = Mat::<f64>::zeros(p, p);
+        ws.force_fd_hessian = true;
+        let st = joint_hessian_cov(
+            &mut ws,
+            xf64.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut cov_fd,
+        );
+        assert_eq!(st, FdHessianStatus::Ok, "{label}");
+        let tse_fd = ws.theta_se.clone();
+        ws.force_fd_hessian = false;
+
+        // Band = tol.R's `se_hessian_rel` default (1e-3), applied to the SEs the
+        // caller sees, not to the raw covariance entries.
+        for j in 0..p {
+            let (a, b) = (cov_exact[(j, j)].sqrt(), cov_fd[(j, j)].sqrt());
+            assert!(
+                (a - b).abs() <= 1e-3 * b.abs(),
+                "{label} se[{j}]: exact {a} vs fd {b}"
+            );
+        }
+        for k in 0..ws.n_theta {
+            assert!(
+                (tse_exact[k] - tse_fd[k]).abs() <= 1e-3 * tse_fd[k].abs(),
+                "{label} theta_se[{k}]: exact {} vs fd {}",
+                tse_exact[k],
+                tse_fd[k]
+            );
+        }
+    }
+}
+
+/// A structured extras fit whose crossed θ̂ pins to 0 keeps the FD stencil,
+/// exactly as it did before the exact branch reached the extras path.
+///
+/// `build_packed_m` and the coupling-CSR pin mask both drop a crossed grouping
+/// at θ = 0 by value — they must, at `f64` — which leaves a dual lane seeded on
+/// that θ with nothing to differentiate and a zero Hessian row. Both entry
+/// points therefore refuse the point (`derivative::extras_theta_pin_free`,
+/// fallback rule (d)), and the caller must fall through unchanged: an FD Hessian
+/// SE, finite and with no `Note::HessianSeFallback`, and NaN for BOTH
+/// diagnostics, because a refused Hessian is not retried as a gradient.
+///
+/// `glmm_extras_q1_dataset(0, 6)` at its committed `n = 96` is the cell that
+/// pins: θ̂ = [0.271, 0.0]. That is why
+/// `exact_hessian_matches_fd_on_structured_fixture` had to enlarge it.
+#[test]
+fn pinned_crossed_theta_keeps_the_fd_hessian() {
+    let (xf64, y, ids, extra_ids, spec) = glmm_extras_q1_dataset(0, 6);
+    let n = y.len();
+    let p = 2usize;
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
+    build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
+    ws.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+    // Opt in, so a wrongly-computed score would show up as a number here rather
+    // than as the NaN an unrequested score also leaves.
+    ws.boundary_score_requested = true;
+    let fit = fit_glmm(
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        &[1u32],
+        None,
+        &vec![0.0; p],
+        n,
+        WaldSe::Hessian,
+    );
+    assert!(fit.converged, "pinned-crossed fixture must converge");
+    let crossed_ti = ws.groupings.crossed[0].vech_start;
+    assert_eq!(
+        ws.params[crossed_ti],
+        0.0,
+        "fixture must pin its crossed θ — θ̂ = {:?}",
+        &ws.params[..ws.n_theta]
+    );
+    // The SHAPE is differentiable; only this θ̂ is not. Separating the two is the
+    // point of the second predicate.
+    assert!(derivative::supports_shape(&ws.groupings));
+    assert!(!derivative::extras_theta_pin_free(&ws));
+
+    let m = ws.n_theta + p;
+    let mut grad = vec![0.0f64; m];
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let st = derivative::laplace_gradient(
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut grad,
+    );
+    assert!(matches!(st, DerivStatus::Unsupported));
+    let st = derivative::laplace_hessian(
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut grad,
+        &mut hess,
+    );
+    assert!(matches!(st, DerivStatus::Unsupported));
+
+    // Pre-W8 behaviour: the stencil produced a usable Hessian covariance here,
+    // so neither the RX fallback nor a NaN SE is acceptable.
+    assert!(
+        !fit.hessian_fallback,
+        "pinned-crossed fit must keep the FD Hessian SE, not fall back to Rx"
+    );
+    assert!(
+        ws.var_diag[1].is_finite() && ws.var_diag[1] > 0.0,
+        "var_diag[1] = {}",
+        ws.var_diag[1]
+    );
+    assert!(ws.kkt_grad_norm.is_nan(), "kkt = {}", ws.kkt_grad_norm);
+    assert!(
+        ws.boundary_score.iter().all(|v| v.is_nan()),
+        "boundary_score = {:?}",
+        ws.boundary_score
+    );
+}
+
+/// The committed n=96 / 12-cluster fixture as `fit_cold` takes it: `x`
+/// row-major, binomial-logit, one scalar grouping. Same data as
+/// `joint_hessian_cov_matches_glmer_use_hessian_true`, one level up — that test
+/// drives the kernel, these read the assembled `Fit`.
+fn hessian_fixture_fit(wald_se: WaldSe) -> crate::Fit {
+    let fx = load_hessian_fixture();
+    let p = fx.beta.len();
+    let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
+    let x: Vec<f64> = fx.x.iter().flat_map(|r| r.iter().copied()).collect();
+    let opts = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        wald_se,
+        ..FitOptions::default()
+    };
+    crate::fit_cold(
+        &x,
+        &fx.y,
+        fx.n,
+        p,
+        &logit_intercept_spec(Sizing::FixedClusters { n_clusters }),
+        &GroupIds {
+            primary: fx.cluster_ids.clone(),
+            extra: vec![],
+        },
+        &opts,
+    )
+}
+
+/// A binomial GLMM whose grouping carries no signal at all: every cluster gets
+/// the SAME eight (x, y) rows, so the between-cluster deviance is flat in θ and
+/// the MLE is exactly 0 — the optimizer pins it. This is the τ̂≈0 shape the LMM
+/// tests use (`diagnostics_boundary_reports_both_ends`, `src/fit/common_tests.rs`),
+/// ported to binomial-logit. x alternates ±, so nothing separates and the
+/// design stays full rank.
+fn glmm_pinning_fit(wald_se: WaldSe, boundary_score: bool) -> crate::Fit {
+    let (n_clusters, per) = (6usize, 8usize);
+    let n = n_clusters * per;
+    let mut x = vec![0.0f64; n * 2];
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for g in 0..n_clusters {
+        for i in 0..per {
+            let r = g * per + i;
+            ids[r] = g as u32;
+            x[r * 2] = 1.0;
+            x[r * 2 + 1] = i as f64 * 0.25 - 0.875;
+            y[r] = (i % 2) as f64;
+        }
+    }
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        wald_se,
+        boundary_score,
+        ..FitOptions::default()
+    };
+    crate::fit_cold(
+        &x,
+        &y,
+        n,
+        2,
+        &logit_intercept_spec(Sizing::FixedClusters {
+            n_clusters: n_clusters as u32,
+        }),
+        &GroupIds {
+            primary: ids,
+            extra: vec![],
+        },
+        &opts,
+    )
+}
+
+/// At a converged INTERIOR fit the projected θ gradient is the plain gradient,
+/// and it sits at the optimizer's own stationarity level rather than at zero:
+/// BOBYQA stops on a trust radius (`rho_end`), so the residual is small but
+/// finite. The band is `KKT_INTERIOR_MAX` (`src/test_support.rs`), measured by
+/// the calibration step above — the assertion is "at or below what BOBYQA
+/// actually leaves", which is what a KKT residual is read as, not "== 0".
+#[test]
+fn kkt_grad_norm_small_at_interior_optimum() {
+    let f = hessian_fixture_fit(WaldSe::Hessian);
+    assert!(f.converged());
+    assert_eq!(f.diagnostics.boundary, Boundary::Interior);
+    let k = f.diagnostics.kkt_grad_norm;
+    assert!(
+        k.is_finite(),
+        "kkt_grad_norm must be measured here, got {k}"
+    );
+    assert!(
+        k <= KKT_INTERIOR_MAX,
+        "kkt {k} exceeds calibrated {KKT_INTERIOR_MAX}"
+    );
+}
+
+/// The same residual is reported, and is just as small, on a fit that stops ON
+/// the boundary — a boundary fit is a constrained stationary point, not a
+/// failure to leave. What the projection removes is NOT visible here: the
+/// deviance is even in θ_jj (Σ = ΛΛᵀ is invariant under a sign flip of the
+/// column), so at a diagonal pinned to exactly 0 the raw gradient component is
+/// already 0 and there is nothing for `min(g_j, 0)` to clip. The projection
+/// bites at an UPPER bound (θ̃ = THETA_HI = 1e3) and at an off-diagonal resting
+/// on its signed bound; no fixture in the crate reaches either, so that arm of
+/// the projection is written and reviewed but not covered by a test — a named
+/// gap, not a silent one.
+#[test]
+fn kkt_grad_norm_small_at_boundary_optimum() {
+    let f = glmm_pinning_fit(WaldSe::Hessian, false);
+    assert!(f.converged(), "a boundary fit still converges");
+    assert_eq!(f.diagnostics.boundary, Boundary::AtBoundary);
+    let k = f.diagnostics.kkt_grad_norm;
+    assert!(
+        k.is_finite(),
+        "kkt_grad_norm must be measured here, got {k}"
+    );
+    assert!(
+        k <= KKT_INTERIOR_MAX,
+        "kkt {k} exceeds calibrated {KKT_INTERIOR_MAX}"
+    );
+}
+
+/// Both diagnostics are reported under `WaldSe::Rx` too: they are statements
+/// about the optimum, not about which covariance the caller asked for. This is
+/// the test that holds the "runs on BOTH arms" wiring, and the reason the warm
+/// Rx loop's alloc bound moves (W3 constraint 5).
+#[test]
+fn kkt_grad_norm_reported_under_rx() {
+    let f = hessian_fixture_fit(WaldSe::Rx);
+    assert!(f.diagnostics.kkt_grad_norm.is_finite());
+    assert!(
+        f.stddev_se.iter().all(|s| s.is_nan()),
+        "Rx still reports no θ-block SE"
+    );
+}
+
+/// On a fit that pins a variance component, the boundary score at that
+/// component is POSITIVE — the constrained optimum really is the boundary, not
+/// a point the optimizer failed to leave. Positive is the whole claim: the
+/// magnitude is a curvature and is not pinned here.
+#[test]
+fn boundary_score_positive_at_pinned_component() {
+    let f = glmm_pinning_fit(WaldSe::Hessian, true);
+    assert!(f.converged());
+    assert_eq!(f.diagnostics.boundary, Boundary::AtBoundary);
+    let mut seen = 0usize;
+    for (g, flags) in f.diagnostics.pinned.iter().enumerate() {
+        for (i, &p) in flags.iter().enumerate() {
+            if !p {
+                continue;
+            }
+            seen += 1;
+            let s = f.diagnostics.boundary_score[g][i];
+            assert!(
+                s.is_finite() && s > 0.0,
+                "score[{g}][{i}] = {s} must be positive"
+            );
+        }
+    }
+    assert_eq!(
+        seen, 1,
+        "this fixture pins exactly its one variance component"
+    );
+}
+
+/// An interior fit reports no boundary score: the quantity is defined at
+/// `s_j = 0` and there is no pinned component to define it at.
+#[test]
+fn boundary_score_absent_at_interior_optimum() {
+    let f = hessian_fixture_fit(WaldSe::Hessian);
+    assert!(f.converged());
+    assert_eq!(f.diagnostics.boundary, Boundary::Interior);
+    assert!(
+        f.diagnostics.boundary_score.is_empty(),
+        "interior fit reported {:?}",
+        f.diagnostics.boundary_score
+    );
+}
+
+/// The score is opt-in (`FitOptions::boundary_score`): a pinned fit that did
+/// not ask for it still reports the pin and the KKT residual, but no score —
+/// that is the hyper-dual Hessian pass the option exists to skip.
+#[test]
+fn boundary_score_empty_unless_requested() {
+    let f = glmm_pinning_fit(WaldSe::Hessian, false);
+    assert!(f.converged());
+    assert_eq!(f.diagnostics.boundary, Boundary::AtBoundary);
+    assert!(f.diagnostics.pinned.iter().flatten().any(|&p| p));
+    assert!(f.diagnostics.kkt_grad_norm.is_finite());
+    assert!(
+        f.diagnostics.boundary_score.is_empty(),
+        "unrequested score reported {:?}",
+        f.diagnostics.boundary_score
+    );
+}
+
+/// `boundary_score` is laid out exactly like `pinned`, so `boundary_score[g][i]`
+/// pairs with `pinned[g][i]` and with `stddev_corr(g).0[i]`. Pins the
+/// alignment, which is the only thing that makes the field readable.
+#[test]
+fn boundary_score_aligns_with_pinned() {
+    let f = glmm_pinning_fit(WaldSe::Hessian, true);
+    assert_eq!(
+        f.diagnostics.boundary_score.len(),
+        f.diagnostics.pinned.len()
+    );
+    for (bs, pn) in f
+        .diagnostics
+        .boundary_score
+        .iter()
+        .zip(&f.diagnostics.pinned)
+    {
+        assert_eq!(bs.len(), pn.len());
+        for (s, &p) in bs.iter().zip(pn) {
+            assert_eq!(s.is_finite(), p, "score finite iff component pinned");
+        }
+    }
+}
+
+/// Run `joint_hessian_cov` twice on the same converged workspace — serial
 /// (`parallel_inner = false`) then parallel (`= true`) — and assert every returned
 /// covariance entry, θ-block SE, and `FdHessianStatus` is BITWISE equal. `.to_bits()`
 /// comparison so a NaN (RX-fallback θ SE) matches a NaN. A mismatch means a
@@ -1051,12 +1627,12 @@ fn assert_fd_hessian_serial_eq_parallel(
 ) {
     let mut cov_s = Mat::<f64>::zeros(p, p);
     ws.parallel_inner = false;
-    let st_s = fd_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_s);
+    let st_s = joint_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_s);
     let tse_s = ws.theta_se.clone();
 
     let mut cov_p = Mat::<f64>::zeros(p, p);
     ws.parallel_inner = true;
-    let st_p = fd_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_p);
+    let st_p = joint_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_p);
     let tse_p = ws.theta_se.clone();
 
     assert_eq!(st_s, st_p, "FdHessianStatus differs serial vs parallel");
@@ -1086,6 +1662,13 @@ fn assert_fd_hessian_serial_eq_parallel(
 /// pure function of the frozen (fd_saved, fd_steps, u_seed) seed, so per-thread
 /// workspaces change nothing — a mismatch is an `fd_worker_ws` field-liveness bug,
 /// not floating-point noise.
+///
+/// Runs the FD arm explicitly (`force_fd_hessian`): both fixtures here now take
+/// the exact hyper-dual Hessian, which has no rayon in it and is bit-identical
+/// by construction. The grid's order-independence is still a live property on
+/// the shapes that keep the stencil — the oversized-core dense fallback, a θ̂
+/// with a pinned crossed component (`derivative::extras_theta_pin_free`), and
+/// the sparse driver's own grid — and that is what this test stands in for.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 #[test]
 fn fd_hessian_parallel_bit_identical_to_serial() {
@@ -1119,6 +1702,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             WaldSe::Rx,
         );
         assert!(fit.converged, "no-extras fixture must converge");
+        ws.force_fd_hessian = true;
         assert_fd_hessian_serial_eq_parallel(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n);
     }
     // Case B: structured crossed (grouseticks INDEX primary + BROOD, LOCATION) —
@@ -1148,6 +1732,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             fit.converged,
             "grouseticks structured fixture must converge"
         );
+        ws.force_fd_hessian = true;
         assert_fd_hessian_serial_eq_parallel(
             &mut ws,
             x.as_ref(),
@@ -1161,13 +1746,13 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
 }
 
 /// `fit_glmm(.., WaldSe::Hessian)` sources the per-fit marginal SE from
-/// `fd_hessian_cov` (glmer `use.hessian = TRUE`) instead of the Schur
+/// `joint_hessian_cov` (glmer `use.hessian = TRUE`) instead of the Schur
 /// forward-solve: on the committed fixture the x1 Hessian SE EXCEEDS the Rx
 /// SE and matches the fixture's `vcov_hessian` diagonal. `WaldSe::Rx` keeps
 /// the unchanged Schur path. Pins that the dispatch reads the FD-Hessian
 /// covariance into `ws.var_diag` end-to-end (not just the standalone kernel).
 #[test]
-fn hessian_mode_t_sq_uses_fd_hessian_cov() {
+fn hessian_mode_t_sq_uses_joint_hessian_cov() {
     let fx = load_hessian_fixture();
     let n = fx.n;
     let p = fx.beta.len();
@@ -1221,7 +1806,7 @@ fn hessian_mode_t_sq_uses_fd_hessian_cov() {
     // Match the FD-Hessian kernel band (1e-5 ABSOLUTE on the covariance entries,
     // achieved ~3.4e-7 against the artifact-free fixture) on the variance the
     // dispatch wrote into ws.var_diag — the band source is
-    // `fd_hessian_cov_matches_glmer_use_hessian_true`: change together.
+    // `joint_hessian_cov_matches_glmer_use_hessian_true`: change together.
     let want_var = fx.vcov_hessian[t1][t1];
     assert!(
         (ws_h.var_diag[t1] - want_var).abs() < 1e-5,
@@ -1230,7 +1815,7 @@ fn hessian_mode_t_sq_uses_fd_hessian_cov() {
     );
 }
 
-/// A non-PD joint (θ,β) Hessian makes `fd_hessian_cov` fall back to the
+/// A non-PD joint (θ,β) Hessian makes `joint_hessian_cov` fall back to the
 /// RX/Schur covariance (`NonPdFellBackToRx`) with the produced cov equal to
 /// `rx_cov_into`'s, while the β-only Schur stays PD.
 ///
@@ -1289,7 +1874,7 @@ fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
     build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
 
-    // Converge a fit (kernel precondition for fd_hessian_cov).
+    // Converge a fit (kernel precondition for joint_hessian_cov).
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
@@ -1312,13 +1897,13 @@ fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
     );
     // Step past the minimum into the genuinely concave stretch (H_θθ < 0 from
     // the `2s·log θ` term — see the doc comment): at 5·θ̂ the LLT failure is
-    // deterministic, not tolerance noise. fd_hessian_cov evaluates AT ws.params
+    // deterministic, not tolerance noise. joint_hessian_cov evaluates AT ws.params
     // (its f0 re-solves PIRLS there), so overwriting θ is the supported way to
     // probe the fallback; β stays at the fitted values.
     ws.params[0] *= 5.0;
 
     let mut cov = Mat::<f64>::zeros(p, p);
-    let status = fd_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov);
+    let status = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov);
     assert_eq!(
         status,
         FdHessianStatus::NonPdFellBackToRx,
@@ -1343,7 +1928,7 @@ fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
     );
 
     // Fallback cov must equal the RX/Schur cov (a real inverse, not NaN). The
-    // central deviance was re-evaluated inside fd_hessian_cov's fallback, so
+    // central deviance was re-evaluated inside joint_hessian_cov's fallback, so
     // the β-information factors are valid for rx_cov_into here too.
     let mut rx = Mat::<f64>::zeros(p, p);
     assert!(
@@ -1623,14 +2208,34 @@ fn fit_glmm_structured_warm_path_bounded_alloc() {
     }
     let stats = dhat::HeapStats::get();
     drop(profiler);
-    // Measured floor on this machine (RAYON_NUM_THREADS=1): exactly 124 blocks
-    // across 20 fits — the SAME count as the no-extras blocked gate. The
-    // structured path factors/solves on pre-allocated buffers
+    // The structured path factors/solves on pre-allocated buffers
     // (core_blocks/schur_blk/coupling) with stack-sized per-block scratch, so it
     // adds NO per-fit faer `llt` allocation; what remains is purely the joint
     // [θ|β] BOBYQA's own per-eval scratch. A change here flags a new allocation
-    // or a shifted eval trajectory; do not relax — find the alloc.
-    const BOUND: u64 = 124;
+    // or a shifted eval trajectory; do not relax past the noise floor below —
+    // find the alloc.
+    //
+    // Re-pinned 124 → 160 on 2026-09-02. What this fixture allocates has not
+    // changed: run inside the alloc tier
+    // (`cargo test --features alloc-tests -- --ignored --test-threads=1`) it
+    // reads a flat 120 blocks over three runs, and it read the same 120 on this
+    // tree with `fit_glmm`'s KKT/boundary-score guard reverted to
+    // `extra_offsets.is_empty()` — the widened guard's extra `laplace_gradient`
+    // per warm Rx refit costs no block, because `for_shape` sizes the dual
+    // scratch on the warm-up fit outside the profiler window and all 20 profiled
+    // fits reuse it.
+    //
+    // What moved is the measurement's own spread. A SINGLE-TEST invocation of
+    // this gate reads anywhere in 123–148 across machines and runs (123/124/126
+    // /130 here; 126 and 136/148 elsewhere on the same tree), and the pre-W8
+    // tree reads 148 against the old 124 — so the spread predates this change
+    // and is not the fixture's. It is unexplained; the suspected mechanism
+    // (libtest spawning the next test's thread inside an open dhat window,
+    // which `alloc_test_guard` does not serialize) is recorded in the project
+    // bug tracker with these numbers. 160 sits above the largest count anyone
+    // has observed, with margin; the in-tier floor of 120 is the number to watch
+    // for a real regression.
+    const BOUND: u64 = 160;
     assert!(
         stats.total_blocks <= BOUND,
         "structured warm-path alloc regressed: {} blocks across 20 fits (BOUND = {})",
@@ -1663,19 +2268,60 @@ fn dual_gradient_repeat_calls_allocate_nothing() {
     );
     let m = ws.n_theta + p;
     let mut grad = vec![0.0; m];
-    // First call builds `dual_scratch` (six `GlmmDualBufs<Dual<4>>` `Vec`s +
-    // its `ClusterRowIndex` + its `GlmmModeBufs` pair) — measured 19 blocks
+    // First call builds `dual_scratch` (the `GlmmDualBufs<Dual<4>>` `Vec`s +
+    // its `ClusterRowIndex` + its `GlmmModeBufs` pair) — measured 26 blocks
     // (this machine, RAYON_NUM_THREADS unset) for this int1/m=3 shape. Not
     // asserted: `for_shape`'s own allocation is a one-time, per-shape cost,
     // never claimed zero.
-    let _ = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, p, n, &mut grad);
+    let _ = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut grad);
     let prof = dhat::Profiler::builder().testing().build();
     for _ in 0..3 {
-        let _ = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, p, n, &mut grad);
+        let _ = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut grad);
     }
     let stats = dhat::HeapStats::get();
     drop(prof);
     assert_eq!(stats.total_blocks, 0, "repeat dual gradient allocated");
+}
+
+/// The same zero-alloc claim on the structured-extras route, where the dual
+/// scratch also carries the packed-M / core / coupling / Schur twins: they are
+/// sized once by `for_shape` alongside the blocked buffers, never lazily on the
+/// first extras call, and the CSR pattern is borrowed from the workspace rather
+/// than mirrored — so a repeat call at the same shape must allocate nothing at
+/// all. Runs the `(0, 6)` crossed cell, the one whose tail actually factors.
+/// `#[ignore]` + `alloc_test_guard` for the process-wide-profiler reason the
+/// other alloc gates give.
+/// Run: `cargo test -p glmm --features alloc-tests structured_dual_gradient_repeat_calls_allocate_nothing -- --ignored`
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn structured_dual_gradient_repeat_calls_allocate_nothing() {
+    let _serial = crate::test_support::alloc_test_guard();
+    let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        0,
+        6,
+    );
+    let m = ws.n_theta + p;
+    let mut grad = vec![0.0; m];
+    // First call builds `dual_scratch` (the `GlmmDualBufs<Dual<4>>` `Vec`s,
+    // structured twins included, + its `ClusterRowIndex` + its `GlmmModeBufs`
+    // pair) — measured 26 blocks (this machine, RAYON_NUM_THREADS unset) for
+    // this crossed/m=4 shape. Not asserted: `for_shape`'s own allocation is a
+    // one-time, per-shape cost, never claimed zero.
+    let _ = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut grad);
+    let prof = dhat::Profiler::builder().testing().build();
+    for _ in 0..3 {
+        let _ = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut grad);
+    }
+    let stats = dhat::HeapStats::get();
+    drop(prof);
+    assert_eq!(
+        stats.total_blocks, 0,
+        "repeat structured dual gradient allocated"
+    );
 }
 
 /// `glmm_block_chol` factors a q×q SPD block in place to its lower Crout L,
@@ -1963,6 +2609,7 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         eta_fixed,
         a_blocks,
         a_rhs,
+        None,
         &mut wx_scratch,
         None, // offset
         None,
@@ -2138,6 +2785,7 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         eta_fixed,
         a_blocks,
         a_rhs,
+        None,
         &mut wx_scratch,
         None, // offset
         None,
@@ -2417,12 +3065,28 @@ fn warm_start_objective_is_seed_independent() {
 /// every level is populated); the spec declares nested before crossed so the
 /// θ vector is `[θ_p, θ_nested?, θ_crossed?]` and the engine's `extra_offsets`
 /// land nested at `prim_width`, crossed in the trailing block.
+// `pub(crate)`: reused by `src/scalar.rs`'s tail-methods test so that test's
+// `S` comes from a real crossed-incidence pattern rather than a fabricated
+// one.
 #[allow(clippy::type_complexity)]
-fn glmm_extras_q1_dataset(
+pub(crate) fn glmm_extras_q1_dataset(
     np: usize,
     n_crossed: usize,
 ) -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<Vec<u32>>, ModelSpec) {
-    let (n, n_prim) = (96usize, 8usize);
+    glmm_extras_q1_dataset_sized(np, n_crossed, 8, 96)
+}
+
+/// `glmm_extras_q1_dataset` generalized to a caller-chosen primary cluster
+/// count and row count (the tail-boundary sweep needs both large enough to
+/// keep a 500-level crossed tail populated). `glmm_extras_q1_dataset`'s own
+/// `(n_prim, n) = (8, 96)` reproduces its committed callers byte-for-byte.
+#[allow(clippy::type_complexity)]
+pub(crate) fn glmm_extras_q1_dataset_sized(
+    np: usize,
+    n_crossed: usize,
+    n_prim: usize,
+    n: usize,
+) -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<Vec<u32>>, ModelSpec) {
     let mut st = 29u64;
     let u0: Vec<f64> = (0..n_prim).map(|_| 0.6 * lcg(&mut st)).collect();
     // Nested children are globalized: parent·np + within ⇒ n_prim·np draws.
@@ -2684,12 +3348,54 @@ fn structured_extras_laplace_matches_brute_force() {
 /// from fresh scratch. The Schur reassociation is the same estimator. Bands
 /// mirror the no-extras blocked parity (`blocked_pirls_matches_dense_slope_noextra`):
 /// dev/pen/logdet 1e-9, u 1e-7.
+///
+/// Each shape also carries a bit-exact `pin` on the structured return. A band
+/// against the dense path is blind to anything that moves both sides, and to
+/// anything smaller than the band; the pin is not. `==`, not a band: the
+/// structured kernel is generic over `crate::scalar::Scalar` and its `f64`
+/// instantiation must reproduce the pre-generic arithmetic exactly.
+///
+/// Every `(dev, pen, logdet, converged)` pin in this file — here, the
+/// `slope_q2_crossed` case below, `structured_panel_downdate_matches_scalar`,
+/// and the two Profile-mode fixtures that cite this comment — was recorded
+/// 2026-09-02 from the pre-generic `f64` run, bit-exact by construction at
+/// `T = f64`. Regenerate by running the test and reading the reported value.
 #[test]
 fn structured_extras_matches_dense() {
-    for (np, ncr, label) in [
-        (0usize, 6usize, "crossed"),
-        (2, 0, "nested"),
-        (2, 6, "crossed_nested"),
+    for (np, ncr, label, pin) in [
+        (
+            0usize,
+            6usize,
+            "crossed",
+            (
+                125.67124626047038,
+                2.5918113333145234,
+                3.6813261287276076,
+                true,
+            ),
+        ),
+        (
+            2,
+            0,
+            "nested",
+            (
+                118.97819264449518,
+                2.3541525230817135,
+                3.4543524781217796,
+                true,
+            ),
+        ),
+        (
+            2,
+            6,
+            "crossed_nested",
+            (
+                124.21745688349301,
+                3.2946873844575992,
+                4.973355567039545,
+                true,
+            ),
+        ),
     ] {
         let (xf64, y, ids, extra_ids, cluster) = glmm_extras_q1_dataset(np, ncr);
         let n = y.len();
@@ -2868,6 +3574,7 @@ fn structured_extras_matches_dense() {
                 None,
                 false,
                 a_rhs,
+                None, // dual
                 &mut wx_scratch,
                 None, // offset
                 None,
@@ -2876,6 +3583,7 @@ fn structured_extras_matches_dense() {
             )
         };
 
+        assert_eq!(structured, pin, "{label}: structured return moved");
         // Re-tightened to 1e-9 (u 1e-7): when no halving fires the dense loop's
         // iterate path is bit-identical to the pre-halving one, and the
         // structured path (`pirls_solve_blocked_extras`, which shares the same
@@ -2996,7 +3704,7 @@ fn structured_extras_matches_dense() {
         // Structured: build_packed_m → pirls_solve_blocked_extras, fresh scratch.
         // build_packed_m's primary-core read (read 1) sources the slope value from
         // z_buf, not the dense z build_z fills above -- production hoists this fill
-        // once per fit (`fit_glmm`/`fd_hessian_cov`, see the widened gate in mod.rs/
+        // once per fit (`fit_glmm`/`joint_hessian_cov`, see the widened gate in mod.rs/
         // se.rs); this raw kernel-level test must do the same thing by hand.
         let mut ws2 = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
         build_z(&mut ws2, xf64.as_ref(), &ids, &extra_ids, n);
@@ -3094,6 +3802,7 @@ fn structured_extras_matches_dense() {
                 None,
                 false,
                 a_rhs,
+                None, // dual
                 &mut wx_scratch,
                 None, // offset
                 None,
@@ -3102,6 +3811,17 @@ fn structured_extras_matches_dense() {
             )
         };
 
+        // Bit-exact pin, same contract as the three shapes above.
+        assert_eq!(
+            structured,
+            (
+                118.0785725377299,
+                1.4514364377459454,
+                3.307542873021056,
+                true
+            ),
+            "{label}: structured return moved"
+        );
         assert_eq!(dense.3, structured.3, "{label}: convergence flag");
         assert!(
             (dense.0 - structured.0).abs() < 1e-9,
@@ -3148,7 +3868,30 @@ fn structured_extras_matches_dense() {
 ///   agree bit-exact — the band tightens to `== 0.0`.
 #[test]
 fn structured_panel_downdate_matches_scalar() {
-    for (np, ncr, label) in [(0usize, 6usize, "crossed"), (2, 6, "crossed_nested")] {
+    for (np, ncr, label, pin) in [
+        (
+            0usize,
+            6usize,
+            "crossed",
+            (
+                125.67124626047038,
+                2.5918113333145234,
+                3.6813261287276076,
+                true,
+            ),
+        ),
+        (
+            2,
+            6,
+            "crossed_nested",
+            (
+                124.21745688349301,
+                3.2946873844575992,
+                4.973355567039545,
+                true,
+            ),
+        ),
+    ] {
         // qc == 1 (np == 0) ⇒ both runs are the same scalar arm ⇒ bit-exact.
         let tol = if np == 0 { 0.0 } else { 1e-9 };
         let u_tol = if np == 0 { 0.0 } else { 1e-7 };
@@ -3256,6 +3999,7 @@ fn structured_panel_downdate_matches_scalar() {
                 ss.as_mut(),
                 true, // force_dense: same factor arm both runs — isolate the downdate
                 a_rhs,
+                None, // dual
                 &mut wx_scratch,
                 None, // offset
                 None,
@@ -3266,6 +4010,10 @@ fn structured_panel_downdate_matches_scalar() {
         };
         let (scalar, u_scalar) = run(false);
         let (panel, u_panel) = run(true);
+        // Bit-exact pin on the scalar-arm return (`structured_extras_matches_dense`
+        // states the contract). The panel arm rides the same generic kernel and is
+        // held to `scalar` by the bands below.
+        assert_eq!(scalar, pin, "{label}: structured return moved");
         assert_eq!(scalar.3, panel.3, "{label}: convergence flag");
         assert!(
             (scalar.0 - panel.0).abs() <= tol,
@@ -4054,6 +4802,7 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         eta_fixed,
         a_blocks,
         a_rhs,
+        None,
         wx,
         None, // offset
         None,
@@ -4222,6 +4971,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             None,
             false,
             a_rhs,
+            None, // dual
             wx,
             None, // offset
             None,
@@ -4230,6 +4980,18 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
         )
     };
     assert!(out.3, "Profile-mode structured solve must converge");
+    // Bit-exact pin (`structured_extras_matches_dense` states the contract); the
+    // stationarity bound below is a 1e-6·n band and cannot see a small move.
+    assert_eq!(
+        out,
+        (
+            259.1091786447752,
+            224.4136716318005,
+            189.17876051534213,
+            true
+        ),
+        "structured return moved"
+    );
     // Recompute ρ at the RETURNED (u, β): η = Xβ + Mu over the packed M nonzeros.
     // The eta/prob left in the workspace are the pre-step trial values, NOT the
     // returned joint iterate.
@@ -4496,6 +5258,7 @@ fn structured_profile_beta_matches_dense_profile() {
             None,
             false,
             a_rhs,
+            None, // dual
             wx,
             None, // offset
             None,
@@ -4504,6 +5267,18 @@ fn structured_profile_beta_matches_dense_profile() {
         )
     };
     assert!(structured.3, "structured Profile solve must converge");
+    // Bit-exact pin (`structured_extras_matches_dense` states the contract); the
+    // β comparison below is a 1e-8 relative band and cannot see a small move.
+    assert_eq!(
+        structured,
+        (
+            124.69314344477421,
+            2.7692222052497977,
+            3.7225226795924997,
+            true
+        ),
+        "structured return moved"
+    );
 
     for j in 0..p {
         let rel = (beta_dense[j] - beta_str[j]).abs() / beta_dense[j].abs().max(1.0);
@@ -5266,6 +6041,28 @@ fn fixed_seed_theta(shape: &str) -> FixedSeedTheta {
             diag: &[0, 2],
             beta: vec![0.2, 0.8],
         },
+        // Structured-extras shapes: every factor is intercept-only (q = 1), so
+        // every θ lane is a diagonal vech entry and is drawn positive. θ order
+        // is the declaration order `glmm_extras_q1_dataset` builds — primary,
+        // then nested, then crossed.
+        "nested2" => FixedSeedTheta {
+            state: 5003,
+            n_theta: 2,
+            diag: &[0, 1],
+            beta: vec![0.2, 0.8],
+        },
+        "crossed6" => FixedSeedTheta {
+            state: 5004,
+            n_theta: 2,
+            diag: &[0, 1],
+            beta: vec![0.2, 0.8],
+        },
+        "nested2_crossed6" => FixedSeedTheta {
+            state: 5005,
+            n_theta: 3,
+            diag: &[0, 1, 2],
+            beta: vec![0.2, 0.8],
+        },
         other => panic!("unknown gradient-gate shape {other}"),
     }
 }
@@ -5381,6 +6178,9 @@ fn assert_dual_gradient_matches_fd(
     x: MatRef<f64>,
     y: &[f64],
     ids: &[u32],
+    // Per-row extra-grouping level ids: empty on the blocked cells, the
+    // fixture's own `[nested?, crossed?]` on the structured-extras cells.
+    extra_ids: &[Vec<u32>],
     p: usize,
     n: usize,
     family: Family,
@@ -5388,7 +6188,6 @@ fn assert_dual_gradient_matches_fd(
     n_draws: usize,
     mut rng: FixedSeedTheta,
 ) {
-    let no_extras: [Vec<u32>; 0] = [];
     let m = ws.n_theta + p;
     let kk = ws.k.max(1);
     let mut ctrs = EvalCounters::new();
@@ -5396,7 +6195,7 @@ fn assert_dual_gradient_matches_fd(
         ws.params[..m].copy_from_slice(&rng.next_params());
         let saved: Vec<f64> = ws.params[..m].to_vec();
         let mut grad = vec![0.0; m];
-        let st = laplace_gradient(ws, x, y, ids, p, n, &mut grad);
+        let st = laplace_gradient(ws, x, y, ids, extra_ids, p, n, &mut grad);
         assert!(
             matches!(st, DerivStatus::Ok(_)),
             "{family:?}/{shape} did not converge"
@@ -5424,13 +6223,13 @@ fn assert_dual_gradient_matches_fd(
             }
             ws.params[k] = saved[k] + h;
             ws.beta_rhs[..p].copy_from_slice(&ws.params[ws.n_theta..m]);
-            let fp = laplace_deviance_ws(ws, x, y, ids, &no_extras, n, false, &mut ctrs);
+            let fp = laplace_deviance_ws(ws, x, y, ids, extra_ids, n, false, &mut ctrs);
             for v in ws.u[..kk].iter_mut() {
                 *v = 0.0;
             }
             ws.params[k] = saved[k] - h;
             ws.beta_rhs[..p].copy_from_slice(&ws.params[ws.n_theta..m]);
-            let fm = laplace_deviance_ws(ws, x, y, ids, &no_extras, n, false, &mut ctrs);
+            let fm = laplace_deviance_ws(ws, x, y, ids, extra_ids, n, false, &mut ctrs);
             ws.params[k] = saved[k];
             let fd = (fp - fm) / (2.0 * h);
             assert!(
@@ -5462,6 +6261,7 @@ fn dual_gradient_matches_central_fd_per_family_and_shape() {
             x.as_ref(),
             &y,
             &ids,
+            &[],
             p,
             n,
             family,
@@ -5489,7 +6289,19 @@ fn dual_gradient_matches_central_fd_padded_to_n12() {
     let m = ws.n_theta + p;
     assert_eq!(m, 12, "padding must land exactly on the N=12 band");
     let rng = fixed_seed_theta_padded(shape, extra_p);
-    assert_dual_gradient_matches_fd(&mut ws, x.as_ref(), &y, &ids, p, n, family, shape, 10, rng);
+    assert_dual_gradient_matches_fd(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &[],
+        p,
+        n,
+        family,
+        shape,
+        10,
+        rng,
+    );
     ws.pirls_tol_override = None;
 }
 
@@ -5511,6 +6323,8 @@ fn assert_dual_hessian_matches_fd_of_gradient(
     x: MatRef<f64>,
     y: &[f64],
     ids: &[u32],
+    // As `assert_dual_gradient_matches_fd`'s own `extra_ids`.
+    extra_ids: &[Vec<u32>],
     p: usize,
     n: usize,
     family: Family,
@@ -5525,7 +6339,7 @@ fn assert_dual_hessian_matches_fd_of_gradient(
         let saved: Vec<f64> = ws.params[..m].to_vec();
         let mut grad = vec![0.0; m];
         let mut hess = Mat::<f64>::zeros(m, m);
-        let st = laplace_hessian(ws, x, y, ids, p, n, &mut grad, &mut hess);
+        let st = laplace_hessian(ws, x, y, ids, extra_ids, p, n, &mut grad, &mut hess);
         assert!(
             matches!(st, DerivStatus::Ok(_)),
             "{family:?}/{shape} did not converge"
@@ -5552,7 +6366,7 @@ fn assert_dual_hessian_matches_fd_of_gradient(
             }
             ws.params[k] = saved[k] + h;
             let mut grad_p = vec![0.0; m];
-            let stp = laplace_gradient(ws, x, y, ids, p, n, &mut grad_p);
+            let stp = laplace_gradient(ws, x, y, ids, extra_ids, p, n, &mut grad_p);
             assert!(
                 matches!(stp, DerivStatus::Ok(_)),
                 "{family:?}/{shape} coord {k} (+h) did not converge"
@@ -5562,7 +6376,7 @@ fn assert_dual_hessian_matches_fd_of_gradient(
             }
             ws.params[k] = saved[k] - h;
             let mut grad_m = vec![0.0; m];
-            let stm = laplace_gradient(ws, x, y, ids, p, n, &mut grad_m);
+            let stm = laplace_gradient(ws, x, y, ids, extra_ids, p, n, &mut grad_m);
             assert!(
                 matches!(stm, DerivStatus::Ok(_)),
                 "{family:?}/{shape} coord {k} (-h) did not converge"
@@ -5595,6 +6409,7 @@ fn dual_hessian_matches_central_fd_of_gradient_per_family_and_shape() {
             x.as_ref(),
             &y,
             &ids,
+            &[],
             p,
             n,
             family,
@@ -5625,6 +6440,7 @@ fn dual_hessian_matches_central_fd_of_gradient_padded_to_n12() {
         x.as_ref(),
         &y,
         &ids,
+        &[],
         p,
         n,
         family,
@@ -5633,6 +6449,206 @@ fn dual_hessian_matches_central_fd_of_gradient_padded_to_n12() {
         rng,
     );
     ws.pirls_tol_override = None;
+}
+
+// --- The same two FD gates on the structured-extras route ---
+
+/// Family × extras-shape fixture for the structured FD gates. Reuses
+/// `glmm_extras_q1_dataset`'s design wholesale — X, primary ids, extra ids and
+/// the RE structure — and only swaps the family and, where the domain differs,
+/// regenerates `y`: the generator draws Bernoulli, which every Binomial link
+/// already shares, so Poisson is the one case that needs counts. Same
+/// regenerate-y-on-a-fixed-design construction `fixture` uses for the blocked
+/// cells, with its own seed stream.
+///
+/// `ws.structured_schur` is built here, so on the crossed cells the FD
+/// reference (`laplace_deviance_ws`) runs the production cached sparse tail
+/// while the dual gradient runs the dense generic one. The gate therefore
+/// covers the tail routing on top of the chain rule: the two are a
+/// reassociation of the same Cholesky, orders of magnitude inside the 1e-6
+/// band. On the nested-only cell `StructuredSchur::new` returns `None`
+/// (`e == 0`) and both sides take the dense arm, which is the whole tail
+/// story there.
+#[allow(clippy::type_complexity)]
+fn extras_fixture(
+    family: Family,
+    np: usize,
+    n_crossed: usize,
+) -> (
+    GlmmWorkspace,
+    Mat<f64>,
+    Vec<f64>,
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    usize,
+    usize,
+) {
+    let (x, y_bin, ids, extra_ids, mut spec) = glmm_extras_q1_dataset(np, n_crossed);
+    let (n, p) = (y_bin.len(), 2usize);
+    let mut st = 6101u64;
+    let y = match family {
+        Family::Binomial { .. } => y_bin,
+        Family::Poisson { .. } => (0..n)
+            .map(|i| {
+                let eta = 0.2 + 0.8 * x[(i, 1)];
+                let noise = 0.4 + 1.6 * (lcg(&mut st) + 0.5); // in [0.4, 2.0]
+                (eta.exp().min(20.0) * noise).round().max(0.0)
+            })
+            .collect(),
+        other => panic!("structured gradient-gate fixture: family {other:?} not wired"),
+    };
+    spec.family = family;
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
+    build_z(&mut ws, x.as_ref(), &ids, &extra_ids, n);
+    ws.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+    (ws, x, y, ids, extra_ids, p, n)
+}
+
+/// `{Binomial-logit, Binomial-probit, Poisson-log}` × the three structured
+/// extras shapes, as `(family, shape label, nested children per parent, crossed
+/// levels)`.
+///
+/// The shapes are the speed-grid catalogue's `nest2` and `int2x` classes plus
+/// their combination: nested-only (`q_core = 3`, `e = 0`, the tail is skipped
+/// entirely), crossed-only (`q_core = 1`, `e = 6`, the rank-1 scalar downdate
+/// that is the production route at `q_core == 1`), and both (`q_core = 3`,
+/// `e = 6`, whose `f64` route is the panel downdate while the dual route takes
+/// the scalar default). Probit is in because it is non-canonical: the extras
+/// kernel has no observed step, so a probit cell is what exercises the
+/// refinement loop on this route.
+///
+/// Deliberate gap: Gamma, NegativeBinomial and Binomial-cloglog are gated on
+/// the blocked path by `GRADIENT_GATE_CELLS` and are not re-gated here. The
+/// extras corpus carries binomial and Poisson only, and nothing about the
+/// structured tail is family-specific — the family enters through W and μ,
+/// which the blocked cells already cover across all six.
+const STRUCTURED_GATE_CELLS: &[(Family, &str, usize, usize)] = &[
+    (
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        "nested2",
+        2,
+        0,
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        "crossed6",
+        0,
+        6,
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        "nested2_crossed6",
+        2,
+        6,
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        "nested2",
+        2,
+        0,
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        "crossed6",
+        0,
+        6,
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        "nested2_crossed6",
+        2,
+        6,
+    ),
+    (
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        "nested2",
+        2,
+        0,
+    ),
+    (
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        "crossed6",
+        0,
+        6,
+    ),
+    (
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        "nested2_crossed6",
+        2,
+        6,
+    ),
+];
+
+/// Central FD of the Laplace deviance against the dual gradient on the
+/// structured-extras route — the same stencil, step, band and tightened PIRLS
+/// tolerance as `dual_gradient_matches_central_fd_per_family_and_shape`, run
+/// through the same shared helper, on the extras cells instead of the blocked
+/// ones.
+#[test]
+fn structured_dual_gradient_matches_central_fd_per_family_and_shape() {
+    for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
+        let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
+        ws.pirls_tol_override = Some(1e-12);
+        let rng = fixed_seed_theta(shape);
+        assert_dual_gradient_matches_fd(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            family,
+            shape,
+            10,
+            rng,
+        );
+        ws.pirls_tol_override = None;
+    }
+}
+
+/// Central FD of `laplace_gradient` against `laplace_hessian` on the
+/// structured-extras route — same cells, same shared helper and same band as
+/// `dual_hessian_matches_central_fd_of_gradient_per_family_and_shape`.
+#[test]
+fn structured_dual_hessian_matches_central_fd_of_the_gradient() {
+    for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
+        let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
+        ws.pirls_tol_override = Some(1e-12);
+        let rng = fixed_seed_theta(shape);
+        assert_dual_hessian_matches_fd_of_gradient(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            family,
+            shape,
+            10,
+            rng,
+        );
+        ws.pirls_tol_override = None;
+    }
 }
 
 // --- The AGQ branch inside `laplace_gradient`/`laplace_hessian` ---
@@ -5695,6 +6711,7 @@ fn agq_dual_gradient_matches_central_fd() {
             x.as_ref(),
             &y,
             &ids,
+            &[],
             p,
             n,
             family,
@@ -5721,6 +6738,7 @@ fn agq_dual_hessian_matches_central_fd() {
             x.as_ref(),
             &y,
             &ids,
+            &[],
             p,
             n,
             family,
@@ -5755,8 +6773,8 @@ fn agq_gate_stays_closed_on_family_exclusion() {
 
     let mut grad_a = vec![0.0; m];
     let mut grad_b = vec![0.0; m];
-    let st_a = laplace_gradient(&mut ws_a, xa.as_ref(), &ya, &ids_a, p, n, &mut grad_a);
-    let st_b = laplace_gradient(&mut ws_b, xb.as_ref(), &yb, &ids_b, p, n, &mut grad_b);
+    let st_a = laplace_gradient(&mut ws_a, xa.as_ref(), &ya, &ids_a, &[], p, n, &mut grad_a);
+    let st_b = laplace_gradient(&mut ws_b, xb.as_ref(), &yb, &ids_b, &[], p, n, &mut grad_b);
     assert!(matches!(st_a, DerivStatus::Ok(_)));
     assert!(matches!(st_b, DerivStatus::Ok(_)));
     assert_eq!(
@@ -5788,8 +6806,8 @@ fn agq_gate_opens_on_eligible_family_and_nagq() {
 
     let mut grad_a = vec![0.0; m];
     let mut grad_b = vec![0.0; m];
-    let st_a = laplace_gradient(&mut ws_a, xa.as_ref(), &ya, &ids_a, p, n, &mut grad_a);
-    let st_b = laplace_gradient(&mut ws_b, xb.as_ref(), &yb, &ids_b, p, n, &mut grad_b);
+    let st_a = laplace_gradient(&mut ws_a, xa.as_ref(), &ya, &ids_a, &[], p, n, &mut grad_a);
+    let st_b = laplace_gradient(&mut ws_b, xb.as_ref(), &yb, &ids_b, &[], p, n, &mut grad_b);
     assert!(matches!(st_a, DerivStatus::Ok(_)));
     assert!(matches!(st_b, DerivStatus::Ok(_)));
     assert!(
@@ -5803,19 +6821,19 @@ fn agq_gate_opens_on_eligible_family_and_nagq() {
 /// its bands): on one converged `int1` binomial fit, `laplace_hessian`'s β
 /// block (rows/cols `n_theta..m`), inverted and ×2 for the deviance-Hessian
 /// -> information convention (`se.rs:121`), should agree with
-/// `fd_hessian_cov`'s covariance (`WaldSe::Hessian`'s own `2·(H_dev⁻¹)_ββ`
+/// `joint_hessian_cov`'s covariance (`WaldSe::Hessian`'s own `2·(H_dev⁻¹)_ββ`
 /// convention, `mod.rs:254`) to within a generous relative band — both are
 /// approximations of the same quantity from two different differentiation
-/// schemes (exact dual vs `fd_hessian_cov`'s own FD stencil), so the two are
+/// schemes (exact dual vs `joint_hessian_cov`'s own FD stencil), so the two are
 /// not expected to be bit-identical.
 ///
 /// Measured worst per-entry relative gap: 4.2e-7 (2026-09-01) — two orders of
 /// magnitude inside the 1e-4 band, which is generous on purpose since the two
 /// paths differ in more than rounding (exact dual second derivatives vs
-/// `fd_hessian_cov`'s own central-difference stencil at a different PIRLS
+/// `joint_hessian_cov`'s own central-difference stencil at a different PIRLS
 /// tolerance chain).
 #[test]
-fn laplace_hessian_beta_block_matches_fd_hessian_cov_int1_binomial() {
+fn laplace_hessian_beta_block_matches_joint_hessian_cov_int1_binomial() {
     let family = Family::Binomial {
         link: BinomialLink::Logit,
     };
@@ -5839,18 +6857,28 @@ fn laplace_hessian_beta_block_matches_fd_hessian_cov_int1_binomial() {
     let n_theta = ws.n_theta;
 
     let mut cov_fd = Mat::<f64>::zeros(p, p);
-    let status = fd_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
+    let status = joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
     assert_eq!(status, FdHessianStatus::Ok);
 
     let mut grad = vec![0.0; m];
     let mut hess = Mat::<f64>::zeros(m, m);
-    let st = laplace_hessian(&mut ws, x.as_ref(), &y, &ids, p, n, &mut grad, &mut hess);
+    let st = laplace_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &[],
+        p,
+        n,
+        &mut grad,
+        &mut hess,
+    );
     assert!(
         matches!(st, DerivStatus::Ok(_)),
         "laplace_hessian must converge at the fit's optimum"
     );
 
-    // `fd_hessian_cov` inverts the WHOLE joint (θ,β) Hessian and reads off the
+    // `joint_hessian_cov` inverts the WHOLE joint (θ,β) Hessian and reads off the
     // β-β block of THAT inverse — the marginal β covariance, which folds in
     // the θ-β correlation the Hessian carries. Inverting only the β-β
     // sub-block (the conditional covariance) is a different quantity and
@@ -5872,9 +6900,361 @@ fn laplace_hessian_beta_block_matches_fd_hessian_cov_int1_binomial() {
             worst_rel = worst_rel.max(rel);
             assert!(
                 rel < 1e-4,
-                "cov[{a}][{b}]: laplace_hessian-derived {ours} vs fd_hessian_cov {theirs} (rel {rel})"
+                "cov[{a}][{b}]: laplace_hessian-derived {ours} vs joint_hessian_cov {theirs} (rel {rel})"
             );
         }
     }
     let _ = worst_rel; // measured value recorded in the doc comment above
+}
+
+// -- W8: tail-boundary timing instrument -------------------------------------
+//
+// Locates the crossed tail width `e` above which the dual kernel's dense
+// generic tail factor costs more per evaluation than the caller's fallback
+// would have cost anyway (the FD Hessian, or ~2m² objective evaluations for a
+// BOBYQA-driven search). Measurement only — does not read or write
+// `DUAL_TAIL_MAX`; a human pins that from the printed table on a locked
+// machine.
+
+/// Machine-state header, read (never written) — mirrors
+/// `src/sparse/tests.rs`'s `machine_lock_header`. A run whose header does not
+/// say LOCKED is noise, not a measurement.
+fn w8_machine_lock_header() {
+    let read = |path: &str| {
+        std::fs::read_to_string(path)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "<unreadable>".into())
+    };
+    let no_turbo = read("/sys/devices/system/cpu/intel_pstate/no_turbo");
+    let gov = read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+    let state = if no_turbo == "1" && gov == "performance" {
+        "LOCKED"
+    } else {
+        "UNLOCKED"
+    };
+    println!("machine: no_turbo={no_turbo} cpu0_governor={gov} -> {state}");
+}
+
+/// Smallest instantiated dual lane count `NLanes::pick` resolves `m` to, or
+/// `None` above `MAX_DUAL_N` — computed independently of `supports_shape` so a
+/// gated cell's row still shows what the dual scratch WOULD have been sized to.
+fn w8_lane_n(m: usize) -> Option<usize> {
+    match m {
+        0..=MAX_DUAL_N => Some(if m <= 4 {
+            4
+        } else if m <= 8 {
+            8
+        } else {
+            12
+        }),
+        _ => None,
+    }
+}
+
+/// One sweep table row: `label` distinguishes the synthetic sweep (`"sweep"`,
+/// `e`/`s` from the caller-built shape) from a named corpus anchor (`e` =
+/// `k_crossed()`, `s` = `n_primary`, read off the fitted shape instead).
+#[allow(clippy::too_many_arguments)]
+fn w8_print_row(
+    label: &str,
+    e: usize,
+    s: usize,
+    n: usize,
+    m: usize,
+    n_lanes: Option<usize>,
+    t_f: f64,
+    t_grad: Option<f64>,
+    t_hess: Option<f64>,
+) {
+    let fd_equiv = 2.0 * (m as f64) * (m as f64) * t_f;
+    let lanes = n_lanes.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+    let grad_s = t_grad.map_or_else(|| "GATED".to_string(), |v| format!("{v:.1}"));
+    let hess_s = t_hess.map_or_else(|| "GATED".to_string(), |v| format!("{v:.1}"));
+    let rg = t_grad.map_or_else(|| "GATED".to_string(), |v| format!("{:.2}", v / t_f));
+    let rh = t_hess.map_or_else(|| "GATED".to_string(), |v| format!("{:.2}", v / t_f));
+    println!(
+        "{label}\t{e}\t{s}\t{n}\t{m}\t{lanes}\t{t_f:.1}\t{grad_s}\t{hess_s}\t{fd_equiv:.1}\t{rg}\t{rh}"
+    );
+}
+
+/// Times the four quantities the boundary decision needs on one already-built
+/// shape and prints its row: one plain `f64` objective evaluation
+/// (`laplace_deviance_ws`, the entry point the FD gates already use), one
+/// `laplace_gradient` call, one `laplace_hessian` call, and the derived
+/// `2·m²`-evaluation FD-Hessian equivalent. Min-of-3 with one cold pass
+/// discarded first (cache + frequency ramp), for each of the three timed
+/// calls independently — direct `&mut` reuse across sequential calls (not a
+/// generic closure) so the borrow checker's ordinary reborrow-on-call-site
+/// rule applies without needing `unsafe` or a boxed closure.
+/// `supports_shape` false (crossed tail past `DUAL_TAIL_MAX`, now measured
+/// and pinned at `MAX_CROSSED_LEVELS`) skips the two dual calls and reports
+/// the row `GATED` — the branch stays live for a future lower pin, not this
+/// instrument's business to raise or revert.
+#[allow(clippy::too_many_arguments)]
+fn w8_time_cell(
+    label: &str,
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    p: usize,
+    n: usize,
+) {
+    let m = ws.n_theta + p;
+    let s = ws.groupings.n_primary;
+    let e = ws.groupings.k_crossed();
+    let mut counters = EvalCounters::new();
+
+    std::hint::black_box(laplace_deviance_ws(
+        ws,
+        x,
+        y,
+        ids,
+        extra_ids,
+        n,
+        false,
+        &mut counters,
+    ));
+    let mut t_f = f64::INFINITY;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        std::hint::black_box(laplace_deviance_ws(
+            ws,
+            x,
+            y,
+            ids,
+            extra_ids,
+            n,
+            false,
+            &mut counters,
+        ));
+        t_f = t_f.min(t0.elapsed().as_secs_f64() * 1e6);
+    }
+
+    let n_lanes = w8_lane_n(m);
+    if !supports_shape(&ws.groupings) {
+        w8_print_row(label, e, s, n, m, n_lanes, t_f, None, None);
+        return;
+    }
+
+    let mut grad = vec![0.0f64; m];
+    let cold = laplace_gradient(ws, x, y, ids, extra_ids, p, n, &mut grad);
+    assert!(
+        matches!(cold, DerivStatus::Ok(_)),
+        "{label}: cold laplace_gradient call did not return Ok"
+    );
+    let mut t_grad = f64::INFINITY;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        let st = laplace_gradient(ws, x, y, ids, extra_ids, p, n, &mut grad);
+        let dt = t0.elapsed().as_secs_f64() * 1e6;
+        assert!(
+            matches!(st, DerivStatus::Ok(_)),
+            "{label}: laplace_gradient call did not return Ok"
+        );
+        t_grad = t_grad.min(dt);
+    }
+
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let cold = laplace_hessian(ws, x, y, ids, extra_ids, p, n, &mut grad, &mut hess);
+    assert!(
+        matches!(cold, DerivStatus::Ok(_)),
+        "{label}: cold laplace_hessian call did not return Ok"
+    );
+    let mut t_hess = f64::INFINITY;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        let st = laplace_hessian(ws, x, y, ids, extra_ids, p, n, &mut grad, &mut hess);
+        let dt = t0.elapsed().as_secs_f64() * 1e6;
+        assert!(
+            matches!(st, DerivStatus::Ok(_)),
+            "{label}: laplace_hessian call did not return Ok"
+        );
+        t_hess = t_hess.min(dt);
+    }
+
+    w8_print_row(label, e, s, n, m, n_lanes, t_f, Some(t_grad), Some(t_hess));
+}
+
+/// Builds and times one crossed-only (`qc = 1`, `np = 0`) sweep cell at
+/// crossed width `e` and primary cluster count `s`. Row count scales with
+/// both so `glmm_extras_q1_dataset_sized`'s round-robin ids populate every
+/// crossed level and every primary cluster; `(n_prim, n) = (8, 96)` (the
+/// existing fixture's own density, 12 rows/cluster) is the floor.
+fn w8_sweep_row(e: usize, s: usize) {
+    let n = (s * 12).max(e * 4).max(96);
+    let (x, y, ids, extra_ids, spec) = glmm_extras_q1_dataset_sized(0, e, s, n);
+    let p = 2usize;
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
+    build_z(&mut ws, x.as_ref(), &ids, &extra_ids, n);
+    // Seed away from the cold default (θ=identity scale, β=0): a positive
+    // variance component and the design's own true β, so the timed PIRLS
+    // solves take a realistic number of steps rather than the ~1-step
+    // shortcut a degenerate seed can hit.
+    let n_theta = ws.n_theta;
+    for slot in ws.params[..n_theta].iter_mut() {
+        *slot = 0.5;
+    }
+    ws.params[n_theta] = 0.2;
+    ws.params[n_theta + 1] = 0.8;
+    w8_time_cell("sweep", &mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n);
+}
+
+/// Minimal empirical-corpus loader for the two tail-boundary anchors (rung 12
+/// `VerbAgg`, rung 6 `grouseticks`, `validation/manifest.json`): reads the
+/// CSV, builds a `Table` with just the columns the formula needs
+/// (`factor_cols` get `Column::factor_from_labels`, everything else is
+/// numeric), and lowers it exactly as `tests/oracle_support::refit_with` does
+/// for the full cross-engine corpus. Neither anchor is aggregated-binomial or
+/// weighted, so this skips that machinery rather than duplicating it.
+#[cfg(feature = "formula")]
+#[allow(clippy::type_complexity)]
+fn load_empirical_corpus(
+    csv_name: &str,
+    formula: &str,
+    family: Family,
+    columns_needed: &[&str],
+    factor_cols: &[&str],
+) -> (
+    GlmmWorkspace,
+    Mat<f64>,
+    Vec<f64>,
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    usize,
+    usize,
+) {
+    let path = format!(
+        "{}/validation/data/empirical/{csv_name}.csv",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let split = |line: &str| -> Vec<String> {
+        line.split(',')
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .collect()
+    };
+    let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
+    let header = split(lines.next().expect("CSV has a header"));
+    let rows: Vec<Vec<String>> = lines.map(split).collect();
+    let columns = columns_needed
+        .iter()
+        .map(|&name| {
+            let j = header
+                .iter()
+                .position(|h| h == name)
+                .unwrap_or_else(|| panic!("{csv_name}: no column {name}"));
+            let cells: Vec<String> = rows.iter().map(|r| r[j].clone()).collect();
+            let col = if factor_cols.contains(&name) {
+                crate::formula::Column::factor_from_labels(&cells)
+            } else {
+                crate::formula::Column::Numeric(
+                    cells
+                        .iter()
+                        .map(|c| c.parse().expect("numeric parse"))
+                        .collect(),
+                )
+            };
+            (name.to_string(), col)
+        })
+        .collect();
+    let table = crate::formula::Table {
+        n: rows.len(),
+        columns,
+    };
+    let lo = crate::formula::lower(formula, &table, family)
+        .unwrap_or_else(|e| panic!("{csv_name} {formula}: {e:?}"));
+    let mut x = Mat::<f64>::zeros(lo.n, lo.p);
+    for i in 0..lo.n {
+        for j in 0..lo.p {
+            x[(i, j)] = lo.x[i * lo.p + j];
+        }
+    }
+    // `lo.model`'s counts are placeholders (`formula::materialize`'s own doc) —
+    // the kernel re-derives real level counts from `lo.ids` via the same
+    // `spec_sized_from_ids` `fit_warm` runs on every real fit. Skipping this
+    // sizes the workspace off the placeholder and panics deep in
+    // `build_coupling_csr` on the real ids' level range.
+    let (sized_model, sized_ids, _perm) = crate::fit::spec_sized_from_ids_pub(&lo.model, &lo.ids);
+    let sized_ids = sized_ids.into_owned();
+    let mut ws = GlmmWorkspace::for_cluster_spec(lo.p, &sized_model, lo.n, &[], 1);
+    build_z(
+        &mut ws,
+        x.as_ref(),
+        &sized_ids.primary,
+        &sized_ids.extra,
+        lo.n,
+    );
+    (ws, x, lo.y, sized_ids.primary, sized_ids.extra, lo.p, lo.n)
+}
+
+/// Loads and times one named corpus anchor, at the workspace's own cold
+/// default seed (θ = identity scale, β = 0) — exactly the point the
+/// optimizer's own first evaluation would time.
+#[cfg(feature = "formula")]
+fn w8_corpus_row(
+    csv_name: &str,
+    formula: &str,
+    family: Family,
+    columns_needed: &[&str],
+    factor_cols: &[&str],
+) {
+    let (mut ws, x, y, ids, extra_ids, p, n) =
+        load_empirical_corpus(csv_name, formula, family, columns_needed, factor_cols);
+    w8_time_cell(csv_name, &mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n);
+}
+
+/// Tail-boundary sweep: `e ∈ {6,16,32,64,128,192,256,384,500}` (500 is
+/// `MAX_CROSSED_LEVELS`, `src/consts.rs:46` — above it `classify_design`
+/// routes Sparse, a different question) at two primary cluster counts
+/// (`s = 8`, `s = 200`, plan open decision 5), plus the two corpus anchors
+/// that bracket the region (`VerbAgg`, small crossed tail; `grouseticks`,
+/// the 403-level factor). Prints one table; a human reads the crossover off
+/// it and pins `DUAL_TAIL_MAX` by hand — this test asserts nothing about
+/// timings, only that every dual call it ran returned `Ok` (a broken
+/// instrument must not print silently-garbage numbers).
+///
+/// ```sh
+/// taskset -c 0 cargo test --release w8_tail_boundary_sweep_timed -- \
+///     --ignored --nocapture --test-threads=1
+/// ```
+#[test]
+#[ignore = "timed sweep — run pinned on a user-locked machine"]
+fn w8_tail_boundary_sweep_timed() {
+    // Serialized under alloc-tests for the same reason the sparse crossover
+    // sweeps are: its allocations must not land in a concurrent dhat
+    // profiler window on an `-- --ignored` run.
+    #[cfg(feature = "alloc-tests")]
+    let _serial = crate::test_support::alloc_test_guard();
+    w8_machine_lock_header();
+    println!("label\te\ts\tn\tm\tN\tt_f_us\tt_grad_us\tt_hess_us\tt_fd_equiv_us\tratio_grad/f\tratio_hess/f");
+    for &e in &[6usize, 16, 32, 64, 128, 192, 256, 384, 500] {
+        for &s in &[8usize, 200] {
+            w8_sweep_row(e, s);
+        }
+    }
+    #[cfg(feature = "formula")]
+    {
+        w8_corpus_row(
+            "VerbAgg",
+            "y ~ Anger + Gender + btype + situ + mode + (1|id) + (1|item)",
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            &[
+                "y", "Anger", "Gender", "btype", "situ", "mode", "id", "item",
+            ],
+            &["Gender", "btype", "situ", "mode", "id", "item"],
+        );
+        w8_corpus_row(
+            "grouseticks",
+            "TICKS ~ YEAR + cHEIGHT + (1|BROOD) + (1|INDEX) + (1|LOCATION)",
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            &["TICKS", "YEAR", "cHEIGHT", "BROOD", "INDEX", "LOCATION"],
+            &["YEAR", "BROOD", "INDEX", "LOCATION"],
+        );
+    }
 }

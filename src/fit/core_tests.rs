@@ -1251,7 +1251,18 @@ fn fit_on_theta_marshalling_bounded_alloc() {
     // (scaled arm: scale vector + θ̂ copy; reordered arm: θ̂ copy + a two-`Vec`
     // start clone). Pinned at the measurement with no slack. If faer's Cholesky
     // internals change, re-measure and update — do not relax.
-    const BOUND: u64 = 10000;
+    //
+    // Re-pinned 10000 → 16500 on 2026-09-01 (W3): the dense LMM route now
+    // computes the two derivative diagnostics per converged fit
+    // (`lmm_run_on`, `src/fit/lmm.rs`), and the `LmmDualScratch` /
+    // `LmmHyperScratch` it needs are deliberately per-fit locals — W2 left
+    // them caller-owned, and hoisting them onto `LmmWorkspace` for zero-alloc
+    // warm refits is W5's call, where the LMM Newton owns that state anyway.
+    // The delta is ~32 blocks/call across the two arms (the scratch's buffer
+    // list, plus the `theta_row_scales`/gradient/score vectors), measured at
+    // exactly 16500 with the same guard and thread pinning. The marshalling
+    // blocks this test exists to keep at zero are still zero.
+    const BOUND: u64 = 16500;
 
     let (xs, ys, ns, ps, ms, ids_s, os) = lmm_slope_case();
     let (sized_s, ids_s, perm_s) = spec_sized_from_ids_pub(&ms, &ids_s);
