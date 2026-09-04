@@ -18,6 +18,17 @@ pub(crate) use blocked::pirls_solve_blocked;
 pub(crate) use blocked_extras::{pirls_solve_blocked_extras, structured_ainv_solve, TailKernel};
 pub(crate) use dense::pirls_solve;
 
+/// What one `laplace_deviance` call does with β. `Fixed` = β is the caller's input
+/// (every SE, derivative and joint-BOBYQA eval). `ProfilePql` = the PQL border, today's
+/// stage 1. `ProfileExact` = the P1 border with the log|A| correction and the Laplace
+/// merit — the objective is then the exact Laplace β-profile at θ.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BetaMode {
+    Fixed,
+    ProfilePql,
+    ProfileExact,
+}
+
 /// β handling for one PIRLS solve. `Fixed` = today's behavior verbatim (β is an
 /// immutable input; the FD-Hessian path and BOBYQA stage 2 REQUIRE this so the
 /// objective stays a function of the caller's β). `Profile` = PQL/stage-1 mode:
@@ -26,6 +37,9 @@ pub(crate) use dense::pirls_solve;
 pub(crate) enum BetaStep<'a> {
     Fixed,
     Profile {
+        // `Some` = exact Laplace profile (`BetaMode::ProfileExact`); `None` = the PQL
+        // border, verbatim. Set only by `laplace_deviance`.
+        exact: Option<&'a mut ExactProfileBufs>,
         xtwx: &'a mut Mat<f64>,      // p×p  C = X'WX          (ws.xtwx)
         xtwm: &'a mut Mat<f64>,      // p×k  B' = X'WM         (ws.xtwm)
         ainv_mtwx: &'a mut Mat<f64>, // k×p  T = A⁻¹B          (ws.ainv_mtwx)
@@ -78,6 +92,52 @@ pub(crate) struct DualStep<T> {
     /// fell back to its Fisher block and the caller's refinement loop runs as
     /// before.
     pub(crate) exact: bool,
+}
+
+/// P1 scratch for the exact Laplace β-profile inside `pirls_solve_blocked`'s and
+/// `pirls_solve_blocked_extras`'s Profile mode. `f64` throughout — the β border
+/// is `f64`-only. Sized once per workspace, so the warm path allocates nothing.
+pub(crate) struct ExactProfileBufs {
+    /// len `k_total`. Holds `g_u = ∂log|A|/∂u` after the row pass, then
+    /// `v = Ã⁻¹ g_u` in place after the block solve. On the structured-extras
+    /// path both live in the `a_rhs` packing (`[f·q_core + local | k_family + b]`),
+    /// NOT the RE-column order `u` uses.
+    pub(crate) logdet_u: Vec<f64>,
+    /// len p. `c_β = d log|A|/dβ` (direct part, then minus the û path).
+    pub(crate) logdet_beta: Vec<f64>,
+    /// `s·q²`, `a_blocks` layout. `A_obs = M'W_obs M + I` per cluster; only
+    /// written on a non-canonical link (blocked path only).
+    pub(crate) obs_blocks: Vec<f64>,
+    /// len `k_total`. Last ACCEPTED `u` (RE-column order, as `u` itself) — the
+    /// halving target once the accept decision moves after the block sweep
+    /// (`u_prev` then holds the trial).
+    pub(crate) u_acc: Vec<f64>,
+    /// `e×e` column-major `S⁻¹` (`tail_inv[b·e + a] = (S⁻¹)_{a,b}`), the dense
+    /// inverse of the structured path's crossed-tail Schur complement. Rebuilt
+    /// every exact-mode structured iteration by `e` `TailKernel::tail_solve`
+    /// calls on unit vectors; length 1 (unread) when `e == 0` and on the
+    /// blocked path.
+    pub(crate) tail_inv: Vec<f64>,
+    /// len `e`. Per-row crossed residual `r_i = C_f'(A_f⁻¹ m_c) − m_x`, indexed
+    /// by crossed column. Only cluster `f`'s coupling columns are ever written
+    /// or read in one row, and each is written before it is read, so it needs no
+    /// clearing between rows. A stack array cannot serve: `e` is a data
+    /// dimension (181 on grouseticks), not a compile-time cap.
+    pub(crate) tail_r: Vec<f64>,
+}
+
+/// `h = ‖L⁻¹ m‖²` for one row: the forward half of `glmm_block_solve` on the
+/// row-major lower factor `l` (q×q), `m` the row's `q` RE-design entries.
+pub(crate) fn block_leverage(l: &[f64], q: usize, m: &[f64]) -> f64 {
+    let mut t = [0.0_f64; crate::consts::MAX_PRIMARY_Q];
+    for r in 0..q {
+        let mut v = m[r];
+        for c in 0..r {
+            v -= l[r * q + c] * t[c];
+        }
+        t[r] = v / l[r * q + r];
+    }
+    t[..q].iter().map(|x| x * x).sum()
 }
 
 /// Refill `eta_fixed[i] = offset[i] + Σ_j x[i,j]·β[j]` (the fixed-effect linear

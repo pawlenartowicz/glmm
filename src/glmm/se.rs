@@ -27,8 +27,8 @@ fn fd_eval(
     for (&c, &d) in coords.iter().zip(deltas) {
         ws.params[c] += d;
     }
-    // β-FIXED by construction: `laplace_deviance_at` hardcodes `profile_beta =
-    // false`. The FD-Hessian differentiates a function of the
+    // β-FIXED by construction: `laplace_deviance_at` hardcodes `beta_mode =
+    // BetaMode::Fixed`. The FD-Hessian differentiates a function of the
     // caller's β, so β must NOT move under these directional evals — a Profile step
     // here would make each `f(γ)` depend on the profiled β̂(γ) and corrupt the
     // second differences.

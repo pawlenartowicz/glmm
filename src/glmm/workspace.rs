@@ -12,6 +12,19 @@ use crate::lmm::{LmmGroupings, GLMM_RHO_END, RHO_BEGIN, THETA_TRUTH_FLOOR};
 
 use super::BETA_BOX;
 
+/// Outer search over the variance components, fixed per shape at construction.
+/// `Joint`: one `[θ | β]` BOBYQA on the Laplace deviance, β held fixed inside PIRLS —
+/// the A/B reference every other route is checked against. `PqlThenJoint`: a θ-only
+/// BOBYQA on the PQL β-profile as a warm start, then `Joint` from there; the warm start
+/// never gates convergence. `ExactProfile` (P1): a θ-only BOBYQA on the exact Laplace
+/// β-profile — the search itself; its status alone decides `converged`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OuterSearch {
+    Joint,
+    PqlThenJoint,
+    ExactProfile,
+}
+
 /// All GLMM solver scratch — allocated once per (spec, max_n) shape.
 pub struct GlmmWorkspace {
     /// reused RE structure (estimator-agnostic)
@@ -70,32 +83,31 @@ pub struct GlmmWorkspace {
     /// Joint solver's live iterate: `[θ (n_theta) | β (p)]`. STABLE READ-BACK
     /// CONVENTION: after `fit_glmm` returns with `converged == true`, this
     /// holds the pinned optimum — `params[..n_theta]` is θ̂ (boundary
-    /// components zeroed) and `params[n_theta..n_theta + p]` is β̂ (stage 2 is
-    /// a joint [θ | β] solve, and `betas` is copied from this suffix) — so a
-    /// caller may read it back as the warm start for a subsequent fit of
-    /// related data. On a non-converged fit the content is an arbitrary
-    /// iterate — do not read it.
+    /// components zeroed) and `params[n_theta..n_theta + p]` is β̂ (on `Joint`
+    /// and `PqlThenJoint` a joint `[θ | β]` solve writes this suffix directly;
+    /// on `ExactProfile` the θ-only stage-1 incumbent snapshot is copied in
+    /// instead — see `OuterSearch` — and `betas` is copied from this suffix
+    /// either way) — so a caller may read it back as the warm start for a
+    /// subsequent fit of related data. On a non-converged fit the content is an
+    /// arbitrary iterate — do not read it.
     pub params: Vec<f64>, // [θ | β]
     /// Joint solver box lower bounds, length `n_theta + p`.
     pub lower: Vec<f64>,
     /// Joint solver box upper bounds, length `n_theta + p`.
     pub upper: Vec<f64>,
-    /// θ-only BOBYQA solver for the two-stage optimizer's stage 1: sized
-    /// `n_theta`, configured with the same `rho_begin`/`GLMM_RHO_END` schedule
-    /// as `solver` and the `sparse_lmm_seed` mid-model `npt` rule
-    /// (`ceil(1.5·n_theta) + 1` at `n_theta ≥ 3`, else `2·n_theta + 1`) — not
+    /// θ-only BOBYQA solver for the θ-only outer search shared by
+    /// `PqlThenJoint` (a warm-start accelerant) and `ExactProfile` (the search
+    /// itself — see `OuterSearch`): sized `n_theta`, configured with the same
+    /// `rho_begin`/`GLMM_RHO_END` schedule as `solver` and the `sparse_lmm_seed`
+    /// mid-model `npt` rule (`ceil(1.5·n_theta) + 1` at `n_theta ≥ 3`, else
+    /// `2·n_theta + 1`) — not
     /// the joint solver's `npt`, which differs. See `fit_glmm`.
     pub solver_stage1: Bobyqa,
     /// θ-only candidate/incumbent buffer for stage 1, length `n_theta`; seeded
     /// from `params`'s θ prefix at construction.
     pub params_stage1: Vec<f64>,
-    /// Two-stage optimizer flag, `true` by default: a θ-only stage-1 BOBYQA
-    /// warm-starts the joint (θ,β) stage-2 solve, cutting the outer evaluation
-    /// count (~2× on grouseticks). Set to `false` for the single joint (θ,β)
-    /// solve — retained as an A/B escape hatch (the `force_dense_schur`
-    /// precedent), not a supported alternative; both paths converge to the same
-    /// optimum within oracle tolerances.
-    pub two_stage: bool,
+    /// Outer search route for this shape — see `OuterSearch`.
+    pub outer_search: OuterSearch,
     // PIRLS scratch (sized max_n / k):
     /// PIRLS linear predictor η, length max_n.
     pub eta: Vec<f64>,
@@ -239,6 +251,8 @@ pub struct GlmmWorkspace {
     pub beta_prof: Vec<f64>,
     /// len p: stage-1 incumbent β snapshot (mirrors u_seed)
     pub beta_seed: Vec<f64>,
+    /// P1 exact-profile scratch (`pirls::ExactProfileBufs`), sized once here.
+    pub(crate) exact_prof: super::pirls::ExactProfileBufs,
     /// length p
     pub var_diag: Vec<f64>,
     /// p×p Cov(β̂) — `var_diag` is its diagonal, and both are filled together at
@@ -439,6 +453,70 @@ impl GlmmWorkspace {
         // θ-only incumbent buffer, seeded from the θ-prefix of the joint start.
         let params_stage1 = params[..n_theta].to_vec();
 
+        // Route per shape — see `OuterSearch`. Computed here, before `groupings`
+        // moves into the struct literal below.
+        //
+        // The `n_theta <= 2 && p <= 4` skip (to `Joint`, only where the PQL route
+        // is still the one taken) is dimension-gated: for small (n_theta, p)
+        // shapes stage 1 roughly doubles the PIRLS-solve count (see the field
+        // doc) while BOBYQA reaches the same stage-2 optimum blind almost as
+        // fast, so it isn't worth its own cost — BUT for wider joint dims the
+        // un-warm-started single-stage search can cost much MORE than stage 1
+        // saves (a first cut at this threshold, gated only on named datasets
+        // rather than a corpus sweep, missed this and shipped a regression — see
+        // below).
+        //
+        // Threshold below is from a locked-machine (`bench-l`, `taskset -c 1`)
+        // timing sweep of every rung that reaches this constructor (non-Gaussian
+        // dense NoZ; `validation/` datasets with a sparse/LMM path are unaffected by
+        // this field and were confirmed identical across both sweep arms) — the
+        // full corpus, not a hand-picked dataset list: an earlier hand-picked list
+        // missed one loser (Arabidopsis, see below). Protocol: per arm (forced skip
+        // vs forced keep), two independent
+        // `validation_fit` invocations, each itself the median of 9 timed samples
+        // after a discarded warmup (see validation/engines/glmm.rs); invocations agreed
+        // within ~2% everywhere, and the table shows the keep-arm/skip-arm medians
+        // (Poisson rows re-measured after the dense-PIRLS weight-loop revert that
+        // restored the pre-helper per-row math; the logit rows — cbpp, VerbAgg —
+        // run the fused-SIMD arm that revert never touched):
+        //
+        //   dataset             (n_theta,p)  skip-vs-keep fit_median   verdict
+        //   cbpp                (1,4)        0.0036 vs 0.0041s (-14%)  SKIP wins
+        //   sim_poisson_nested  (2,2)        0.0085 vs 0.0099s (-14%)  SKIP wins
+        //   grouseticks         (3,4)        0.4053 vs 0.2168s (+87%)  KEEP wins
+        //   Arabidopsis         (2,6)        0.0772 vs 0.0276s (+180%) KEEP wins
+        //   VerbAgg             (2,7)        2.1575 vs 1.0082s (+114%) KEEP wins
+        //   sim_crossed_at_cap  (7,2)        0.1736 vs 0.1263s (+37%)  KEEP wins
+        //
+        // Arabidopsis (n_theta=2, p=6) is the false positive: an earlier version of
+        // this threshold (`n_theta <= 2 && p <= 6`) put it in the skip set purely
+        // because it matched the two true winners on n_theta, without checking p
+        // against a real measurement — it is in fact the single biggest regression
+        // in the corpus (skip is 2.8x SLOWER), because the un-warm-started 8-dim
+        // joint BOBYQA search costs far more than the skipped stage-1 pass saves.
+        // (Correctness was NOT at risk either way — beta/SE/varcomp agreed to
+        // ~1e-6 relative between skip and keep on Arabidopsis; this is purely a
+        // performance threshold, re-derive it if the corpus changes.)
+        //
+        // The two true winners both have p ≤ 4; every loser (including the false
+        // positive) has p ≥ 6 — a wide, data-supported margin — so `p ≤ 4` replaces
+        // the earlier `p ≤ 6`. `n_theta ≤ 2` is unchanged (grouseticks at n_theta=3
+        // is the nearest loser on that axis and was never miscategorized).
+        //
+        // Since the `ExactProfile` route landed, none of the rows above reach this
+        // branch any more: every dataset in the table is an nAGQ=1 non-Gamma shape
+        // and routes `ExactProfile` first. What still reaches `n_theta <= 2 && p <= 4`
+        // is Gamma, non-canonical structured extras, and dense-fallback extras — a
+        // population this sweep never measured. The threshold stands because nothing
+        // has re-measured it, not because these numbers still cover it.
+        let outer_search = if super::exact_profile_shape(family, nagq, &groupings) {
+            OuterSearch::ExactProfile
+        } else if nagq > 1 || (n_theta <= 2 && p <= 4) {
+            OuterSearch::Joint
+        } else {
+            OuterSearch::PqlThenJoint
+        };
+
         GlmmWorkspace {
             groupings,
             family,
@@ -480,51 +558,7 @@ impl GlmmWorkspace {
             solver_stage1: Bobyqa::new(n_theta, config_stage1)
                 .expect("BOBYQA config constants are valid by construction"),
             params_stage1,
-            // Dimension-gated: for small (n_theta, p) shapes stage 1 roughly doubles
-            // the PIRLS-solve count (see the field doc) while BOBYQA reaches the same
-            // stage-2 optimum blind almost as fast, so it isn't worth its own cost —
-            // BUT for wider joint dims the un-warm-started single-stage search can cost
-            // much MORE than stage 1 saves (a first cut at this threshold, gated only
-            // on named datasets rather than a corpus sweep, missed this and shipped a
-            // regression — see below).
-            //
-            // Threshold below is from a locked-machine (`bench-l`, `taskset -c 1`)
-            // timing sweep of every rung that reaches this constructor (non-Gaussian
-            // dense NoZ; `validation/` datasets with a sparse/LMM path are unaffected by
-            // this field and were confirmed identical across both sweep arms) — the
-            // full corpus, not a hand-picked dataset list: an earlier hand-picked list
-            // missed one loser (Arabidopsis, see below). Protocol: per arm (forced skip
-            // vs forced keep), two independent
-            // `validation_fit` invocations, each itself the median of 9 timed samples
-            // after a discarded warmup (see validation/engines/glmm.rs); invocations agreed
-            // within ~2% everywhere, and the table shows the keep-arm/skip-arm medians
-            // (Poisson rows re-measured after the dense-PIRLS weight-loop revert that
-            // restored the pre-helper per-row math; the logit rows — cbpp, VerbAgg —
-            // run the fused-SIMD arm that revert never touched):
-            //
-            //   dataset             (n_theta,p)  skip-vs-keep fit_median   verdict
-            //   cbpp                (1,4)        0.0036 vs 0.0041s (-14%)  SKIP wins
-            //   sim_poisson_nested  (2,2)        0.0085 vs 0.0099s (-14%)  SKIP wins
-            //   grouseticks         (3,4)        0.4053 vs 0.2168s (+87%)  KEEP wins
-            //   Arabidopsis         (2,6)        0.0772 vs 0.0276s (+180%) KEEP wins
-            //   VerbAgg             (2,7)        2.1575 vs 1.0082s (+114%) KEEP wins
-            //   sim_crossed_at_cap  (7,2)        0.1736 vs 0.1263s (+37%)  KEEP wins
-            //
-            // Arabidopsis (n_theta=2, p=6) is the false positive: an earlier version of
-            // this threshold (`n_theta <= 2 && p <= 6`) put it in the skip set purely
-            // because it matched the two true winners on n_theta, without checking p
-            // against a real measurement — it is in fact the single biggest regression
-            // in the corpus (skip is 2.8x SLOWER), because the un-warm-started 8-dim
-            // joint BOBYQA search costs far more than the skipped stage-1 pass saves.
-            // (Correctness was NOT at risk either way — beta/SE/varcomp agreed to
-            // ~1e-6 relative between skip and keep on Arabidopsis; this is purely a
-            // performance threshold, re-derive it if the corpus changes.)
-            //
-            // The two true winners both have p ≤ 4; every loser (including the false
-            // positive) has p ≥ 6 — a wide, data-supported margin — so `p ≤ 4` replaces
-            // the earlier `p ≤ 6`. `n_theta ≤ 2` is unchanged (grouseticks at n_theta=3
-            // is the nearest loser on that axis and was never miscategorized).
-            two_stage: !(n_theta <= 2 && p <= 4),
+            outer_search,
             eta: vec![0.0; max_n],
             prob: vec![0.0; max_n],
             w: vec![0.0; max_n],
@@ -592,6 +626,16 @@ impl GlmmWorkspace {
             beta_prev: vec![0.0; p],
             beta_prof: vec![0.0; p],
             beta_seed: vec![0.0; p],
+            exact_prof: super::pirls::ExactProfileBufs {
+                // `k` is `groupings.k_total`, so these span the structured
+                // path's `k_family + e` as well as the blocked path's `q·s`.
+                logdet_u: vec![0.0; k.max(1)],
+                logdet_beta: vec![0.0; p],
+                obs_blocks: vec![0.0; (q * q * n_primary).max(1)],
+                u_acc: vec![0.0; k.max(1)],
+                tail_inv: vec![0.0; (e_crossed * e_crossed).max(1)],
+                tail_r: vec![0.0; e_crossed.max(1)],
+            },
             var_diag: vec![0.0; p],
             vcov: Mat::zeros(p, p),
             vcov_cols: Mat::zeros(p, p),

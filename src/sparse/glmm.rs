@@ -38,7 +38,7 @@ use super::fill_lambda_small;
 // explicitly out of scope (YAGNI).
 //
 // The outer optimizer is the single joint [θ | β] BOBYQA — the dense kernel's
-// `two_stage = false` shape, which the A/B gate keeps converging to the same
+// `OuterSearch::Joint` route, which the A/B gate keeps converging to the same
 // Laplace optimum. The θ-only PQL stage 1 is an accelerant only and is not
 // replicated here.
 
@@ -1031,7 +1031,7 @@ fn sparse_glmm_nan_fit(p: usize, n_theta: usize) -> crate::Fit {
 /// over-envelope sibling of the dense `fit::fit_glmm` adapter, serving
 /// Binomial / Poisson / Gamma (and, via `fit_glmm_nb_sparse`, NB) designs that
 /// exceed the NoZ envelope. Single joint [θ | β] BOBYQA over the sparse Laplace
-/// deviance (the dense kernel's `two_stage = false` shape), θ/β seeding and
+/// deviance (the dense kernel's `OuterSearch::Joint` route), θ/β seeding and
 /// ρ schedule mirroring `GlmmWorkspace::for_cluster_spec` + `glmm::fit_glmm`
 /// (blind THETA0 θ₀ or a warm start floored at `THETA_TRUTH_FLOOR`; β from the
 /// no-RE GLM warm start or the caller's `start`), diagonal-θ pin at

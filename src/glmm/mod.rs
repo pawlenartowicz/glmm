@@ -1,20 +1,23 @@
 //! GLMM kernel: PIRLS + Laplace/AGQ, glmer-faithful nAGQ=1. Covers
 //! Binomial/Poisson/Gamma/negative-binomial with random effects; NB's extra
 //! dispersion θ̂ is set by an outer marginal-θ search in `fit::glmm`
-//! (`glmer.nb`-style) that calls into this module at a fixed θ. Optimized in
-//! two stages, mirroring lme4's structure (Bates, Mächler, Bolker, Walker,
-//! *JSS* 67(1), 2015, §3): stage 1 runs BOBYQA over θ alone (`n_theta` dims),
-//! and at each candidate θ the penalized-IRLS inner loop profiles β out by
-//! solving for the conditional modes ũ **and** β jointly per iteration (a
-//! small dense p×p β-Schur border on the RE solve) — the PQL-optimal β for
-//! that θ; stage 2 is a short joint [θ | β] BOBYQA polish on the true Laplace
-//! objective, warm-started from stage 1. Stage 1 is only an accelerant: stage
-//! 2 guarantees the reported (θ̂, β̂) is the Laplace optimum, not the PQL one.
-//! The objective is the Laplace deviance d(y,ũ) + ‖ũ‖² + log|L|²; PIRLS gains
-//! step-halving to keep the higher-dimensional joint (u, β) step stable.
-//! Setting `GlmmWorkspace.two_stage = false` reverts to the single joint
-//! [θ | β] solve (β held fixed within each PIRLS solve) as an A/B escape
-//! hatch.
+//! (`glmer.nb`-style) that calls into this module at a fixed θ. Optimized per
+//! `OuterSearch` (`GlmmWorkspace.outer_search`, fixed per shape at construction),
+//! mirroring lme4's structure (Bates, Mächler, Bolker, Walker, *JSS* 67(1), 2015,
+//! §3) on the two routes that use it: `Joint` runs one BOBYQA over `[θ | β]`
+//! directly, β held fixed inside each PIRLS solve. `PqlThenJoint` first runs
+//! BOBYQA over θ alone (`n_theta` dims), profiling β out at each candidate θ by
+//! solving for the conditional modes ũ **and** β jointly per PIRLS iteration (a
+//! small dense p×p β-Schur border on the RE solve) — the PQL-optimal β for that
+//! θ — then warm-starts a `Joint` polish from there; the θ-only pass is only an
+//! accelerant, so the polish alone gates convergence and the reported (θ̂, β̂)
+//! is the Laplace optimum, not the PQL one. `ExactProfile` (P1, the blocked
+//! in-scope shapes) instead profiles β out EXACTLY at each candidate θ — the
+//! Laplace optimum for that θ, not merely the PQL one — so the θ-only BOBYQA
+//! pass IS the search: no joint polish follows, and its status alone gates
+//! convergence. The objective is the Laplace deviance d(y,ũ) + ‖ũ‖² + log|L|²;
+//! PIRLS gains step-halving to keep the higher-dimensional joint (u, β) step
+//! stable.
 //!
 //! This module holds three dense PIRLS backends, picked per RE design shape:
 //! `pirls_solve` (single grouping, no extra slopes), `pirls_solve_blocked`
@@ -62,6 +65,28 @@ pub const PIRLS_MAX_ITERS: usize = 50;
 /// minimum. Dense PIRLS and the blocked/structured sparse solve steps don't hit
 /// this regime and converge well inside the cap.
 pub const PIRLS_MAX_HALVINGS: usize = 16;
+/// The shapes whose stage-1 Profile solve is the EXACT Laplace β-profile and whose
+/// outer search is therefore θ-only (P1, `OuterSearch::ExactProfile`): Laplace, a data
+/// term that is the plain deviance, and a PIRLS variant carrying the exact border —
+/// the blocked path (`pirls_solve_blocked`, either link class), plus the structured
+/// crossed/nested path (`pirls_solve_blocked_extras`) on a CANONICAL link. Gamma's
+/// `gamma_aic` objective has a different β score and keeps the joint search; AGQ and
+/// the dense fallback keep theirs. Non-canonical structured shapes stay out too: their
+/// û path needs `Ã = A_obs`, an observed twin of the whole structured factor (core
+/// blocks, coupling and Schur), where the blocked path needs only a second set of
+/// per-cluster blocks. Read by the workspace constructor and by the driver's
+/// `debug_assert!` — the tests choose the route through `outer_search`, never through
+/// this.
+pub(crate) fn exact_profile_shape(
+    family: crate::spec::Family,
+    nagq: u8,
+    g: &crate::lmm::LmmGroupings,
+) -> bool {
+    nagq == 1
+        && !matches!(family, crate::spec::Family::Gamma { .. })
+        && (g.extra_offsets.is_empty()
+            || (g.structured_extras_eligible() && crate::family::is_canonical(family)))
+}
 /// Adaptive PIRLS exit on |Δ penalized-deviance|, relative to the objective
 /// scale (lme4's pwrss discipline): converged when
 /// `|Δpen| < PIRLS_TOL_REL · (1 + |pen|)`. The penalized deviance is O(n), so
@@ -242,11 +267,12 @@ pub(crate) use derivative::{unpack_hessian, DerivStatus};
 pub use se::joint_hessian_cov;
 pub(crate) use se::{fd_mixed_diff, fd_second_diff};
 pub(crate) use workspace::StructuredSchur;
-pub use workspace::{build_z, GlmmWorkspace};
+pub use workspace::{build_z, GlmmWorkspace, OuterSearch};
 #[cfg(test)]
 pub(crate) use workspace::{glmm_block_chol, glmm_block_solve};
 
 use deviance::laplace_deviance;
+use pirls::BetaMode;
 
 // `pub(crate)` so `src/scalar.rs`'s tail-methods test can reuse
 // `glmm_extras_q1_dataset` instead of duplicating a structured fixture.
@@ -276,20 +302,26 @@ pub enum FdHessianStatus {
 /// orthogonality; anticonservative for the GLMM); `WaldSe::Hessian` (glmer
 /// `use.hessian = TRUE`) sources it from the Hessian of the joint Laplace
 /// deviance instead (exact on every shape `derivative::supports_shape`
-/// accepts, finite-difference elsewhere), the lme4-matching default. The optimizer runs a two-stage
-/// β-profiling search when `ws.two_stage` (default `true`): stage 1 profiles β
-/// out of a θ-only BOBYQA on the PQL objective purely as a warm-start
-/// accelerant; stage 2's joint [θ | β] BOBYQA polish alone gates convergence,
-/// so the reported (θ̂, β̂) is always the Laplace optimum, not the PQL one.
+/// accepts, finite-difference elsewhere), the lme4-matching default. The optimizer
+/// runs one of three routes fixed per shape by `ws.outer_search` (see `OuterSearch`):
+/// `Joint` searches `[θ | β]` directly; `PqlThenJoint` profiles β out of a θ-only
+/// BOBYQA on the PQL objective purely as a warm-start accelerant, then a joint
+/// `[θ | β]` BOBYQA polish alone gates convergence; `ExactProfile` profiles β out
+/// EXACTLY at each candidate θ, so its θ-only BOBYQA pass alone gates convergence —
+/// no joint polish follows. On every route the reported (θ̂, β̂) is the Laplace
+/// optimum, not the PQL one.
 ///
 /// Matches `lme4::glmer` (binomial cbpp fixture; see
 /// `fit::tests::fit_glmm_cbpp_matches_lme4`).
 ///
 /// Read-back: on `converged == true`, `ws.params[..n_theta + p]` holds the
 /// pinned optimum `[θ̂ | β̂]` — the stable convention documented on
-/// `GlmmWorkspace::params`; callers may feed it back as
-/// `theta_start`/`beta_start` for a subsequent fit of related data (both pass
-/// through the same `THETA_TRUTH_FLOOR`/`BETA_BOX` clamps as any other start).
+/// `GlmmWorkspace::params`. On `ExactProfile` this β̂ itself is never
+/// BETA_BOX-projected (see the `n_eval` write-back below); callers may still
+/// feed it back as `theta_start`/`beta_start` for a subsequent fit of related
+/// data, and that fed-back start passes through the same
+/// `THETA_TRUTH_FLOOR`/`BETA_BOX` clamps as any other start, regardless of
+/// which route produced it.
 ///
 /// Errors: no `Result` — non-convergence (BOBYQA failure, a non-PD Schur, or the
 /// degenerate-fit guard tripping on an all-infeasible BOBYQA simplex) is
@@ -414,10 +446,22 @@ pub fn fit_glmm(
     // objective and the pinned-γ̂ re-eval below so a fit-level comparison (not just
     // a single deviance eval) exercises the dense factor/solve end to end.
     let force_dense_schur = ws.force_dense_schur;
-    // Two-stage A/B flag (the β-profiling two-stage optimizer design). Read before
-    // the destructure moves `ws`'s fields out by mutable reference; `bool` is Copy
+    // Outer search route for this shape (`OuterSearch`). Read before the
+    // destructure moves `ws`'s fields out by mutable reference; the enum is Copy
     // so this is a plain read.
-    let two_stage = ws.two_stage;
+    let route = ws.outer_search;
+    debug_assert!(
+        route != OuterSearch::ExactProfile || exact_profile_shape(family, nagq, &ws.groupings),
+        "ExactProfile requested on a shape without an exact profile"
+    );
+    // Which `BetaMode` stage 1 profiles β with, or `None` to skip stage 1 entirely
+    // (the `Joint` route). `stage1_mode` alone decides whether stage 1 runs; the
+    // route decides what happens AFTER it — see the `route ==` split below.
+    let stage1_mode = match route {
+        OuterSearch::Joint => None,
+        OuterSearch::PqlThenJoint => Some(BetaMode::ProfilePql),
+        OuterSearch::ExactProfile => Some(BetaMode::ProfileExact),
+    };
     let weighted = ws.weighted;
     let offset = ws.offset.as_deref();
     let GlmmWorkspace {
@@ -471,6 +515,7 @@ pub fn fit_glmm(
         beta_prof,
         beta_seed,
         beta_prev,
+        exact_prof,
         p: pf,
         pirls_exhausted,
         counters,
@@ -486,17 +531,20 @@ pub fn fit_glmm(
         fill_z_f64(groupings, x, z_buf, n);
     }
 
-    // STAGE 1 (two-stage β-profiling optimizer design) — θ-only BOBYQA on the PQL
-    // objective, β profiled inside PIRLS. An accelerant that warm-starts stage 2; it
-    // never gates convergence. Skipped bit-identically when `two_stage == false`
-    // (the A/B tests pin this for the single-stage reference) and when `nagq > 1` —
+    // STAGE 1 — θ-only BOBYQA profiling β out of PIRLS at each candidate θ. On
+    // `PqlThenJoint` this is an accelerant that warm-starts the `Joint` polish below
+    // and never gates convergence; on `ExactProfile` this IS the search — its
+    // status alone gates convergence (the `route ==` split after this block).
+    // Skipped bit-identically when `stage1_mode` is `None` (the `Joint` route; the
+    // A/B tests pin this as the single-stage reference) and when `nagq > 1` —
     // Profile deviance is undefined on the AGQ early-return path
-    // (`debug_assert!(!profile_beta || nagq == 1)`), and AGQ fits must bypass stage 1
+    // (`debug_assert!(beta_mode == BetaMode::Fixed || nagq == 1)`), and AGQ fits must bypass stage 1
     // unchanged. A Laplace-pass warm start for AGQ was measured on the 33 diligent
     // AGQ cells (2026-07-14) and reverted: total eval count was a wash (−0.3%),
     // not worth the added code path for that little a gain.
     let mut n_eval_stage1 = 0usize;
-    if two_stage && nagq == 1 {
+    let mut stage1_out = None;
+    if let Some(mode) = stage1_mode.filter(|_| nagq == 1) {
         params_stage1.copy_from_slice(&params[..n_theta]); // θ₀ as today
         beta_prof[..p].copy_from_slice(&params[n_theta..n_theta + p]); // β₀ (GLM warm start)
         beta_seed[..p].copy_from_slice(&beta_prof[..p]);
@@ -569,7 +617,10 @@ pub fn fit_glmm(
                     schur_llt_mem,
                     beta_rhs,
                     beta_prev,
-                    true,
+                    exact_prof,
+                    // `mode` is `ProfilePql` on `PqlThenJoint`, `ProfileExact` on
+                    // `ExactProfile` — the two routes that reach this block.
+                    mode,
                     // Never the FD-pass tol here — stage-1 objective evals stay at
                     // `pirls_tol` (the field is None outside `joint_hessian_cov`).
                     None,
@@ -594,109 +645,127 @@ pub fn fit_glmm(
             &lower[..n_theta],
             &upper[..n_theta],
         );
-        // Non-convergence does NOT fail the fit — stage 1 is an accelerant. Proceed to
-        // stage 2 from wherever the incumbent landed (worst case = today's cold start).
+        // On `PqlThenJoint`, non-convergence does NOT fail the fit — stage 1 is an
+        // accelerant, and the joint polish below proceeds from wherever the
+        // incumbent landed (worst case = today's cold start). On `ExactProfile`
+        // this status IS the fit's convergence status — read below.
         n_eval_stage1 = out1.n_eval;
-        // Warm-start stage 2: θ̂₁ (BOBYQA leaves the incumbent in `params_stage1`) and
-        // β̂₁ (the incumbent snapshot, NOT `beta_prof`'s last-evaluated value).
+        // Warm-start / final θ̂,β̂: θ̂₁ (BOBYQA leaves the incumbent in `params_stage1`)
+        // and β̂₁ (the incumbent snapshot, NOT `beta_prof`'s last-evaluated value).
+        // On `ExactProfile` this write IS the reported optimum, not a warm start.
         params[..n_theta].copy_from_slice(params_stage1);
         // β̂₁ is not re-clamped to ±BETA_BOX here: the bobyqa crate itself projects
         // an out-of-box start onto the bounds (PRIMA moderatex-style preproc), so
-        // stage 2's solver init already lands in-box without a redundant clamp.
+        // a subsequent joint solve's init already lands in-box without a redundant
+        // clamp — and `ExactProfile` never re-clamps at all.
         params[n_theta..].copy_from_slice(&beta_seed[..p]);
+        stage1_out = Some(out1);
     }
 
-    let mut best_obj = f64::INFINITY;
-    let out = solver.minimize(
-        |gamma| {
-            // Within-fit û warm-start: seed PIRLS from the incumbent (best point so
-            // far), not from 0. The conditional mode is point-determined, so the seed
-            // only shifts the stopping iterate within the PIRLS exit band.
-            u[..k].copy_from_slice(&u_seed[..k]);
-            let obj = laplace_deviance(
-                family,
-                nb_theta,
-                nagq,
-                groupings,
-                gamma,
-                beta_rhs,
-                z.as_ref(),
-                m,
-                lam,
-                z_buf,
-                m_buf,
-                x,
-                y,
-                &prior_w[..n],
-                weighted,
-                cluster_ids,
-                extra_ids,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                mu,
-                wm,
-                wx,
-                a,
-                a_chol,
-                a_llt_mem,
-                a_rhs,
-                a_blocks,
-                core_blocks,
-                coupling,
-                schur_blk,
-                m_core_buf,
-                cross_val,
-                cross_col,
-                n_cross,
-                coup_cols,
-                coup_ptr,
-                coup_mask,
-                structured_schur.as_mut(),
-                force_dense_schur,
-                agq_scratch,
-                xtwx,
-                xtwm,
-                ainv_mtwx,
-                schur,
-                schur_llt_mem,
-                // Stage-2 BOBYQA objective is β-FIXED; the Profile
-                // border scratch is inert. `beta_prof` is the spare distinct buffer
-                // (`beta_rhs` is `beta` above). The stage-1 objective above flips this
-                // to Profile, behind `ws.two_stage`.
-                beta_prof,
-                beta_prev,
-                false,
-                // Never the FD-pass tol here — BOBYQA objective evals stay at
-                // `pirls_tol` (the field is None outside `joint_hessian_cov`).
-                None,
-                *pf,
-                n,
-                cluster_rows.as_ref(),
-                offset,
-                pirls_exhausted,
-                counters,
-            );
-            if obj < best_obj {
-                best_obj = obj;
-                u_seed[..k].copy_from_slice(&u[..k]);
-            }
-            counters.record_eval(crate::counters::Stage::Two, obj);
-            obj
-        },
-        params,
-        lower,
-        upper,
-    );
+    let (ok, n_eval) = if route == OuterSearch::ExactProfile {
+        // P1: stage 1 IS the search — θ-only BOBYQA on the exact Laplace profile.
+        // `params` already holds [θ̂ | β̂] (the incumbent snapshot written above);
+        // no joint polish follows, so `ws.u_seed` written by stage 1's own
+        // incumbent-gated snapshot is already the final conditional mode.
+        let o = stage1_out.as_ref().expect("ExactProfile runs stage 1");
+        debug_assert!(o.status != Status::InvalidArgs);
+        (matches!(o.status, Status::Converged), o.n_eval)
+    } else {
+        let mut best_obj = f64::INFINITY;
+        let out = solver.minimize(
+            |gamma| {
+                // Within-fit û warm-start: seed PIRLS from the incumbent (best point so
+                // far), not from 0. The conditional mode is point-determined, so the seed
+                // only shifts the stopping iterate within the PIRLS exit band.
+                u[..k].copy_from_slice(&u_seed[..k]);
+                let obj = laplace_deviance(
+                    family,
+                    nb_theta,
+                    nagq,
+                    groupings,
+                    gamma,
+                    beta_rhs,
+                    z.as_ref(),
+                    m,
+                    lam,
+                    z_buf,
+                    m_buf,
+                    x,
+                    y,
+                    &prior_w[..n],
+                    weighted,
+                    cluster_ids,
+                    extra_ids,
+                    eta,
+                    prob,
+                    w,
+                    u,
+                    u_prev,
+                    eta_fixed,
+                    mu,
+                    wm,
+                    wx,
+                    a,
+                    a_chol,
+                    a_llt_mem,
+                    a_rhs,
+                    a_blocks,
+                    core_blocks,
+                    coupling,
+                    schur_blk,
+                    m_core_buf,
+                    cross_val,
+                    cross_col,
+                    n_cross,
+                    coup_cols,
+                    coup_ptr,
+                    coup_mask,
+                    structured_schur.as_mut(),
+                    force_dense_schur,
+                    agq_scratch,
+                    xtwx,
+                    xtwm,
+                    ainv_mtwx,
+                    schur,
+                    schur_llt_mem,
+                    // The `Joint` polish's objective is β-FIXED; the Profile border
+                    // scratch is inert. `beta_prof` is the spare distinct buffer
+                    // (`beta_rhs` is `beta` above). Stage 1 above flips this to Profile
+                    // (`ProfilePql` or `ProfileExact`, by `stage1_mode`).
+                    beta_prof,
+                    beta_prev,
+                    exact_prof,
+                    BetaMode::Fixed,
+                    // Never the FD-pass tol here — BOBYQA objective evals stay at
+                    // `pirls_tol` (the field is None outside `joint_hessian_cov`).
+                    None,
+                    *pf,
+                    n,
+                    cluster_rows.as_ref(),
+                    offset,
+                    pirls_exhausted,
+                    counters,
+                );
+                if obj < best_obj {
+                    best_obj = obj;
+                    u_seed[..k].copy_from_slice(&u[..k]);
+                }
+                counters.record_eval(crate::counters::Stage::Two, obj);
+                obj
+            },
+            params,
+            lower,
+            upper,
+        );
 
-    debug_assert!(out.status != Status::InvalidArgs);
-    let ok = matches!(out.status, Status::Converged);
-    // Reported eval count is stage 1 + stage 2 (0 + stage 2 on the single-stage path,
-    // so byte-identical to today). Only stage 2's status feeds `converged`.
-    let n_eval = n_eval_stage1 + out.n_eval;
+        debug_assert!(out.status != Status::InvalidArgs);
+        // Reported eval count is stage 1 + stage 2 (0 + stage 2 on the `Joint` route,
+        // so byte-identical to today). Only stage 2's status feeds `converged`.
+        (
+            matches!(out.status, Status::Converged),
+            n_eval_stage1 + out.n_eval,
+        )
+    };
 
     // Per-component diagonal pin (β never pins). `diag` borrows ws.groupings; the
     // loop mutates the disjoint field ws.params, so no clone is needed.
@@ -900,6 +969,7 @@ pub fn fit_glmm(
             schur_llt_mem,
             beta_prof,
             beta_prev,
+            exact_prof,
             agq_scratch,
             cluster_rows,
             offset,
@@ -968,7 +1038,8 @@ pub fn fit_glmm(
             // scratch inert. `beta_prof` is the spare distinct buffer.
             beta_prof,
             beta_prev,
-            false,
+            exact_prof,
+            BetaMode::Fixed,
             // Never the FD-pass tol here — the pinned re-eval stays at `pirls_tol`
             // (the field is None outside `joint_hessian_cov`).
             None,

@@ -511,8 +511,9 @@ pub(crate) fn irls_weight_and_resid<T: Scalar>(
 /// `dr/dη = −2/μ²`. Checked against a central difference of `r` per family
 /// in `observed_weight_matches_fd_of_score_factor`. `eta`/`mu` are the pass's
 /// already-clamped values; `w` carries the prior weight, so the correction is
-/// scaled by `prior_w` too. Only the dual derivative kernels read this
-/// (`pirls::DualStep::observed`).
+/// scaled by `prior_w` too. Read by the dual derivative kernels
+/// (`pirls::DualStep::observed`) and by exact β-profiling's non-canonical pass
+/// C in `src/glmm/pirls/blocked.rs` (the û-path adjoint's `W̃`).
 pub(crate) fn observed_weight<T: Scalar>(
     family: Family,
     nb_theta: f64,
@@ -620,6 +621,59 @@ mod tests {
                     (got - fd).abs() < 1e-7,
                     "{f:?} eta={eta}: dr/deta {got} vs fd {fd}"
                 );
+            }
+        }
+    }
+
+    /// P1: the working-weight derivative `dw/dη` read off a `Dual<1>` pass through
+    /// `irls_weight_and_resid` must match a central difference of the f64 weight
+    /// on every link the blocked GLMM path serves, and the two hand forms the
+    /// design doc names (logit `w(1−2μ)`, Poisson-log `μ`).
+    #[test]
+    fn working_weight_dual_derivative_matches_fd() {
+        use crate::dual::Dual;
+        let fams = [
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            Family::Binomial {
+                link: BinomialLink::Probit,
+            },
+            Family::Binomial {
+                link: BinomialLink::Cloglog,
+            },
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+        ];
+        let nb_theta = 2.5;
+        for f in fams {
+            for eta in [-1.3_f64, 0.2, 1.7] {
+                let h = 1e-5;
+                let wf = |e: f64| irls_weight_and_resid(f, nb_theta, 1.0, e).1;
+                let fd = (wf(eta + h) - wf(eta - h)) / (2.0 * h);
+                let e = Dual::<1> { v: eta, d: [1.0] };
+                let (mu, w, _) = irls_weight_and_resid(f, nb_theta, 1.0, e);
+                let got = w.d[0];
+                assert!(
+                    (got - fd).abs() < 1e-7,
+                    "{f:?} eta={eta}: dw/deta {got} vs fd {fd}"
+                );
+                match f {
+                    Family::Binomial {
+                        link: BinomialLink::Logit,
+                    } => {
+                        let hand = w.v * (1.0 - 2.0 * mu.v);
+                        assert!((got - hand).abs() < 1e-12, "logit hand form");
+                    }
+                    Family::Poisson { .. } => {
+                        assert!((got - mu.v).abs() < 1e-12, "poisson hand form")
+                    }
+                    _ => {}
+                }
             }
         }
     }

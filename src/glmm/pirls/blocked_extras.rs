@@ -476,9 +476,16 @@ pub(crate) fn structured_ainv_solve<T: TailKernel>(
 /// seed); the caller owns resetting it per fit. `a_rhs` (length ≥ k_total) is the
 /// RHS scratch, packed `[g_core in (f,local) order | g_e]`.
 ///
-/// Step-halving: see `pirls_solve`'s doc — identical mechanism, scoped here to
-/// `u_prev` only (β is FIXED in this variant). A halved retry re-enters the top
-/// and re-runs the full structured factor + Schur (`structured_factor` /
+/// Step-halving differs by `beta_step`. `Fixed` and `Profile { exact: None }`
+/// (the PQL border) share `pirls_solve`'s retrospective `dev + pen_u` band,
+/// halving `u` back toward `u_prev`. `Profile { exact: Some(_) }` (P1) instead
+/// halves on the exact Laplace merit (`dev + pen_u + 2·logdet` plus its
+/// mode-consistency correction — see the assembly below) and, at the top of
+/// the loop, on `infeasible` alone; it also treats a non-PD structured factor
+/// on the trial `u` as a rejected step rather than a hard failure, backtracking
+/// toward `(u_acc, beta_prev)` the same way — mirrors `pirls_solve_blocked`,
+/// change together. Every mode's halved retry re-enters the top and re-runs
+/// the full structured factor + Schur (`structured_factor` /
 /// `structured_ainv_solve`) on the backtracked `u`; `core_blocks` / `schur_blk` /
 /// `coupling` and `log|A|` on return are from the final step's assembly,
 /// preserving the `structured_schur_fill` contract above (it reads those
@@ -588,6 +595,17 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
             beta_prev[j] = beta[j].value();
         }
     }
+    // `ex.u_acc` is workspace-persistent (it survives across `laplace_deviance`
+    // calls at different θ) and is only ever written by an ACCEPTED post-sweep
+    // iterate — reseed it here so a pre-first-accept halving in exact mode
+    // targets this solve's own `u_prev` seed, not a stale value left by a
+    // previous call. Mirrors `pirls_solve_blocked` — change together.
+    if let BetaStep::Profile {
+        exact: Some(ex), ..
+    } = &mut beta_step
+    {
+        ex.u_acc[..k].fill(0.0);
+    }
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
     let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
@@ -610,6 +628,17 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
     };
     let (mut dev, mut pen, mut logdet) = (T::from_f64(f64::NAN), T::from_f64(f64::NAN), T::ZERO);
     let tol = pirls_tol_override.unwrap_or_else(|| super::super::pirls_tol(family));
+    // Exact-Laplace β-profile: the accept/halve decision moves from the
+    // penalized-deviance band (below) to the FULL Laplace merit `dev + pen_u +
+    // 2·log|A| + g_u'·δu₀` after the structured factor, since log|A| depends on
+    // this iteration's A and is not known until the factor is formed. `l_acc` is
+    // that merit at the last ACCEPTED (u, β) — a cold start accepts
+    // unconditionally. Mirrors `pirls_solve_blocked` — change together.
+    let exact = matches!(beta_step, BetaStep::Profile { exact: Some(_), .. });
+    let mut l_acc = f64::INFINITY;
+    // `|g_u'·δu₀|` at the point `l_acc` was measured at — the accepted endpoint's
+    // half of the accept band. Mirrors `pirls_solve_blocked`.
+    let mut l_acc_slack = 0.0_f64;
     for it in 0..PIRLS_MAX_ITERS {
         counters.set_pirls_iters(it + 1);
         // --- trial evaluation at the CURRENT u (pass 1 + pass 2). On a fresh accept
@@ -668,14 +697,33 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         // why a within-band rise is accepted rather than converged-on or halved):
         // only a rise EXCEEDING the tol band backtracks. A domain-infeasible trial
         // halves regardless of the band (see `pirls_solve`'s comment).
-        if infeasible || penalized.value() - pen_accepted > tol * (1.0 + penalized.value().abs()) {
+        // Exact mode: the retrospective band above is on `dev + pen_u` alone,
+        // which is not the profiled objective (missing 2·log|A|) — only a
+        // domain-infeasible trial halves here; an overshoot on `dev + pen_u` is
+        // judged later, after log|A| is known, against the FULL merit.
+        if infeasible
+            || (!exact && penalized.value() - pen_accepted > tol * (1.0 + penalized.value().abs()))
+        {
             if halvings < PIRLS_MAX_HALVINGS {
                 // Last full step overshot: halve δu = u − u_prev and re-enter the top
                 // (the recompute above is the trial evaluation of the halved step; a
                 // halved retry re-runs structured_factor/ainv_solve, by design).
+                // Exact mode halves toward the last ACCEPTED u (`u_acc`, set by the
+                // post-sweep merit test below) since `u_prev` there holds the
+                // just-rejected trial, not an accepted point.
                 halvings += 1;
-                for c in 0..k {
-                    u[c] = T::from_f64(0.5) * (u[c] + u_prev[c]);
+                if let BetaStep::Profile {
+                    exact: Some(ex), ..
+                } = &beta_step
+                {
+                    #[allow(clippy::needless_range_loop)]
+                    for c in 0..k {
+                        u[c] = T::from_f64(0.5 * (u[c].value() + ex.u_acc[c]));
+                    }
+                } else {
+                    for c in 0..k {
+                        u[c] = T::from_f64(0.5) * (u[c] + u_prev[c]);
+                    }
                 }
                 // Profile mode: the trial point is the JOINT (u,β) step, so the
                 // backtrack halves β toward `beta_prev` in lockstep with u, then
@@ -698,13 +746,19 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         }
         // Accept this iterate, snapshot it for the next backtrack, and take a fresh
         // full Fisher step from it (cold start: pen_accepted = ∞ ⇒ always accepts).
-        halvings = 0;
-        pen_accepted = penalized.value();
+        // `u_prev` is unconditional — the β-Schur border needs δu₀ = u_new − u_prev
+        // regardless of mode. Exact mode defers `halvings`/`pen_accepted`/`beta_prev`
+        // bookkeeping to the post-sweep merit test below, since this trial has not
+        // been judged against the full Laplace objective yet.
         u_prev[..k].copy_from_slice(&u[..k]);
-        // Profile mode: snapshot the accepted β as the β-halving twin of u_prev.
-        if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
-            for j in 0..p {
-                beta_prev[j] = beta[j].value();
+        if !exact {
+            halvings = 0;
+            pen_accepted = penalized.value();
+            // Profile mode: snapshot the accepted β as the β-halving twin of u_prev.
+            if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
+                for j in 0..p {
+                    beta_prev[j] = beta[j].value();
+                }
             }
         }
         // IRLS effective residual rᵢ = wᵢ·(Mu)ᵢ + W·working_resid, so the
@@ -853,12 +907,43 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         ) {
             Some(ld) => ld,
             None => {
+                // Mirrors the block-Cholesky failure arm in
+                // `pirls_solve_blocked` (`blocked.rs`, the no-extras twin) —
+                // change together. Exact mode has no retrospective `dev + pen_u`
+                // band (the merit test below owns the accept decision), so
+                // nothing stands between a wildly overshooting joint (u, β) step
+                // and this factor. On
+                // grouseticks the cold-start Newton step lands at dev ≈ 3e26,
+                // where the crossed-tail Schur loses positive-definiteness to
+                // cancellation and the solve would end here — while the same step
+                // under the PQL band is simply halved away. An unevaluable trial
+                // is a REJECTED trial, not a failed solve: backtrack toward the
+                // last accepted (u, β) exactly as the merit rejection below does,
+                // and surface the failure only once the halvings are spent.
+                if let BetaStep::Profile {
+                    exact: Some(ex),
+                    beta_prev,
+                    ..
+                } = &beta_step
+                {
+                    if halvings < PIRLS_MAX_HALVINGS {
+                        halvings += 1;
+                        for c in 0..k {
+                            u[c] = T::from_f64(0.5 * (u_prev[c].value() + ex.u_acc[c]));
+                        }
+                        for j in 0..p {
+                            beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
+                        }
+                        refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+                        continue;
+                    }
+                }
                 return (
                     T::from_f64(f64::NAN),
                     T::from_f64(f64::NAN),
                     T::from_f64(f64::NAN),
                     false,
-                )
+                );
             }
         };
         structured_ainv_solve(
@@ -892,6 +977,268 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
             u[k_family + b] = val;
             pen += val * val;
         }
+        // Exact mode: assemble c_β off THIS iteration's structured factors, then
+        // judge the trial against the full Laplace merit. Both live here rather
+        // than in the β-Schur border below: the assembly reads only the factors and
+        // the live W (nothing the border produces), and the merit needs the `g_u`
+        // its first pass forms. The border still runs on the accepted-or-halved
+        // u/β, so this must land before it. A rise past the tol band re-halves
+        // toward the last accepted (u, β) exactly like the retrospective test
+        // above, just on the merit that actually matters; the first trial always
+        // accepts (`l_acc = ∞`). Mirrors `pirls_solve_blocked`'s exact block —
+        // change together.
+        if let BetaStep::Profile {
+            exact: Some(ex),
+            beta_prev,
+            ..
+        } = &mut beta_step
+        {
+            // Canonical links only, and `exact_profile_shape` is what keeps a
+            // non-canonical structured shape off this route: the û path would need
+            // Ã = A_obs, i.e. an observed twin of the WHOLE structured factor (core
+            // blocks, coupling AND Schur), where the blocked path needs only a
+            // second set of per-cluster blocks. On a canonical link the Fisher A
+            // already IS the exact ∂²/∂u², so the factor left by
+            // `structured_factor` is the one every pass below wants.
+            debug_assert!(crate::family::is_canonical(family));
+            let gu_dot_du = {
+                // f64 copy of one q_core×q_core `core_blocks` factor for the passes
+                // below: the buffer is generic `&[T]` (the derivative kernels
+                // instantiate T = Dual<N>) while exact mode runs in f64 only, and
+                // `block_leverage`/`glmm_block_solve` here need a plain `&[f64]`.
+                // Mirrors `pirls_solve_blocked`'s `a_blocks_f64`; the copy is qc²
+                // values, cheaper than the O(qc³) solve and leverage it feeds.
+                fn core_block_f64<T: crate::scalar::Scalar>(
+                    blk: &[T],
+                ) -> [f64; crate::lmm::MAX_PRIMARY_Q * crate::lmm::MAX_PRIMARY_Q] {
+                    let mut out = [0.0_f64; crate::lmm::MAX_PRIMARY_Q * crate::lmm::MAX_PRIMARY_Q];
+                    for (o, v) in out.iter_mut().zip(blk.iter()) {
+                        *o = v.value();
+                    }
+                    out
+                }
+                let ExactProfileBufs {
+                    logdet_u,
+                    logdet_beta,
+                    tail_inv,
+                    tail_r,
+                    ..
+                } = &mut **ex;
+                let logdet_u = &mut logdet_u[..k];
+                let logdet_beta = &mut logdet_beta[..p];
+                logdet_u.fill(0.0);
+                logdet_beta.fill(0.0);
+                // S⁻¹ column by column, through the same tail solve the u-step
+                // uses, so it inherits whichever factor `structured_factor` left
+                // (cached sparse LLT, or the dense L in `schur_blk`). `a_rhs`'s
+                // crossed tail is the T-typed staging slot — free now, its u-solve
+                // was scattered to `u` just above. Column-major:
+                // `tail_inv[b·e + a] = (S⁻¹)_{a,b}`.
+                for b in 0..e {
+                    for slot in a_rhs[k_family..k_family + e].iter_mut() {
+                        *slot = T::ZERO;
+                    }
+                    a_rhs[k_family + b] = T::ONE;
+                    T::tail_solve(
+                        schur_blk,
+                        e,
+                        if force_dense {
+                            None
+                        } else {
+                            structured_schur.as_deref_mut()
+                        },
+                        &mut a_rhs[k_family..k_family + e],
+                    );
+                    for a in 0..e {
+                        tail_inv[b * e + a] = a_rhs[k_family + a].value();
+                    }
+                }
+                // pass A: hᵢ, w'ᵢ → direct part of c_β, and gᵤ = ∂log|A|/∂u.
+                // c_β = d log|A|/dβ enters the same Newton RHS with the same ½ as
+                // the objective's `2·logdet` term. Direct part: Σᵢ w'ᵢ·xᵢⱼ·hᵢ with
+                // hᵢ = mᵢ'A⁻¹mᵢ the RE leverage. û path: β also moves ũ(β), so
+                // log|A|(β) picks up gᵤ'·dũ/dβ with dũ/dβ = −A⁻¹M'WX; folded as ONE
+                // adjoint solve v = A⁻¹gᵤ (pass B) rather than materializing the
+                // k×p `dũ/dβ`.
+                let mut mc = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
+                let mut yc = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
+                for i in 0..n {
+                    let f = cluster_ids[i] as usize;
+                    let cb = f * qc * qc;
+                    let cbase = i * g_cap;
+                    let ncz = n_cross[i] as usize;
+                    for local in 0..qc {
+                        mc[local] = m_core_buf[i * qc + local].value();
+                    }
+                    let fac = core_block_f64(&core_blocks[cb..cb + qc * qc]);
+                    // Block inverse of A = [[D, C], [C', E]] applied to one row:
+                    // mᵢ'A⁻¹mᵢ = ‖L_f⁻¹m_c‖² + rᵢ'S⁻¹rᵢ with rᵢ = C_f'(A_f⁻¹m_c) − m_x.
+                    // `rᵢ` is supported on CLUSTER f's coupling columns — a strict
+                    // superset of row i's own crossed columns as soon as f has rows
+                    // at more than one crossed level — so the walk is over
+                    // `coup_cols[f]`; restricting it to the row's columns would drop
+                    // real off-column terms of the quadratic form.
+                    let mut h = block_leverage(&fac[..qc * qc], qc, &mc[..qc]);
+                    let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
+                    if !cols.is_empty() {
+                        let coup = f * qc * e;
+                        yc[..qc].copy_from_slice(&mc[..qc]);
+                        glmm_block_solve(&fac[..qc * qc], qc, &mut yc[..qc]);
+                        // `tail_r` needs no clearing: every column of `cols` is
+                        // written here before it is read below, and no other column
+                        // is touched.
+                        for &b in cols {
+                            let b = b as usize;
+                            let mut acc = 0.0;
+                            for local in 0..qc {
+                                acc += coupling[coup + local * e + b].value() * yc[local];
+                            }
+                            tail_r[b] = acc;
+                        }
+                        for z in 0..ncz {
+                            tail_r[cross_col[cbase + z] as usize] -= cross_val[cbase + z].value();
+                        }
+                        for &b in cols {
+                            let b = b as usize;
+                            let col = &tail_inv[b * e..b * e + e];
+                            let mut acc = 0.0;
+                            for &az in cols {
+                                let az = az as usize;
+                                acc += tail_r[az] * col[az];
+                            }
+                            h += acc * tail_r[b];
+                        }
+                    }
+                    let wp = if w[i].value() <= crate::glm::WEIGHT_CLAMP {
+                        0.0
+                    } else {
+                        let et = crate::dual::Dual::<1> {
+                            v: eta[i].value(),
+                            d: [1.0],
+                        };
+                        let (_, w_raw, _) =
+                            crate::family::irls_weight_and_resid(family, nb_theta, y[i], et);
+                        prior_w[i] * w_raw.d[0]
+                    };
+                    let a = wp * h;
+                    for j in 0..p {
+                        logdet_beta[j] += a * x[(i, j)];
+                    }
+                    for local in 0..qc {
+                        logdet_u[f * qc + local] += a * mc[local];
+                    }
+                    for z in 0..ncz {
+                        let b = cross_col[cbase + z] as usize;
+                        logdet_u[k_family + b] += a * cross_val[cbase + z].value();
+                    }
+                }
+                // Mode-consistency term for the merit below, formed here because
+                // pass B overwrites `logdet_u` in place. See the merit's own
+                // comment for why it is needed; δu₀ = u_new − u_prev is this
+                // iteration's step toward the mode. `g_u` sits in the `a_rhs`
+                // packing while u/u_prev are in RE-column order, so the core part
+                // maps through `core_col` (the two coincide only at np == 0).
+                let mut gu_dot_du = 0.0;
+                for f in 0..s {
+                    for local in 0..qc {
+                        let c = core_col(f, local);
+                        gu_dot_du += logdet_u[f * qc + local] * (u[c] - u_prev[c]).value();
+                    }
+                }
+                for b in 0..e {
+                    gu_dot_du +=
+                        logdet_u[k_family + b] * (u[k_family + b] - u_prev[k_family + b]).value();
+                }
+                // pass B: v = A⁻¹gᵤ through this iteration's structured factors
+                // (Fisher A — canonical links only reach here). `a_rhs` stages it in
+                // the generic T the solve is written for; at T = f64 the two staging
+                // loops are an identity copy of values the solve would have moved
+                // anyway (the same trick the border below uses for its p columns).
+                for c in 0..k {
+                    a_rhs[c] = T::from_f64(logdet_u[c]);
+                }
+                structured_ainv_solve(
+                    g,
+                    core_blocks,
+                    coupling,
+                    schur_blk,
+                    coup_cols,
+                    coup_ptr,
+                    // same force_dense → ss fold as the structured_factor call above.
+                    if force_dense {
+                        None
+                    } else {
+                        structured_schur.as_deref_mut()
+                    },
+                    a_rhs,
+                );
+                for c in 0..k {
+                    logdet_u[c] = a_rhs[c].value();
+                }
+                // pass C: û path, c_β_j −= Σᵢ wᵢ·(mᵢ·v)·xᵢⱼ.
+                for i in 0..n {
+                    let f = cluster_ids[i] as usize;
+                    let cbase = i * g_cap;
+                    let mut sdot = 0.0;
+                    for local in 0..qc {
+                        sdot += m_core_buf[i * qc + local].value() * logdet_u[f * qc + local];
+                    }
+                    for z in 0..n_cross[i] as usize {
+                        let b = cross_col[cbase + z] as usize;
+                        sdot += cross_val[cbase + z].value() * logdet_u[k_family + b];
+                    }
+                    let a = w[i].value() * sdot;
+                    for j in 0..p {
+                        logdet_beta[j] -= a * x[(i, j)];
+                    }
+                }
+                gu_dot_du
+            };
+            // The Laplace objective is `dev + ‖u‖² + log|A|` AT the conditional
+            // mode ũ(β); at a trial u off the mode it is not, and the two error
+            // terms are not the same order. `dev + ‖u‖²` is stationary at ũ, so it
+            // errs by O(‖u−ũ‖²) and from above; `log|A(u)|` errs at FIRST order,
+            // either sign. Comparing raw sums across iterates therefore compares
+            // points at different mode-offsets, and a trial sitting a first-order
+            // step off the mode can score BELOW the attainable optimum — a warm
+            // start from a neighbouring θ lands exactly there, and taking it as
+            // `l_acc` rejects every later (correct) iterate until the iteration
+            // cap. Undo that first-order part with the gradient already at hand:
+            // g_u'·δu₀ ≈ log|A(ũ)| − log|A(u)|, a correction that vanishes as δu₀ → 0.
+            let l_trial = (dev + pen_u).value() + 2.0 * logdet.value() + gu_dot_du;
+            // Accept band charges the mode-consistency correction at BOTH
+            // endpoints — reasoning in `pirls_solve_blocked`'s merit test,
+            // change together.
+            if l_trial - l_acc > tol * (1.0 + l_trial.abs()) + gu_dot_du.abs() + l_acc_slack {
+                if halvings < PIRLS_MAX_HALVINGS {
+                    halvings += 1;
+                    for c in 0..k {
+                        u[c] = T::from_f64(0.5 * (u_prev[c].value() + ex.u_acc[c]));
+                    }
+                    for j in 0..p {
+                        beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
+                    }
+                    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+                    continue;
+                }
+                return (
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    false,
+                );
+            }
+            halvings = 0;
+            l_acc = l_trial;
+            l_acc_slack = gu_dot_du.abs();
+            #[allow(clippy::needless_range_loop)]
+            for c in 0..k {
+                ex.u_acc[c] = u_prev[c].value();
+            }
+            for j in 0..p {
+                beta_prev[j] = beta[j].value();
+            }
+        }
         // --- Profile-mode joint δβ step (β-Schur border), run AFTER the structured
         // factor + A⁻¹ u-solve so every core-block / Schur factor is live in
         // `core_blocks`/`schur_blk`/`coupling` and δu₀ = u_new − u_prev is complete
@@ -903,6 +1250,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         // this mirrors). `a_rhs` is reused as the per-column A⁻¹ in/out scratch —
         // safe now, its u-solve was scattered to `u` just above (the borrow note). ---
         if let BetaStep::Profile {
+            exact,
             xtwx,
             xtwm,
             ainv_mtwx,
@@ -1013,6 +1361,11 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 }
                 beta_rhs[r] -= acc;
             }
+            if let Some(ex) = exact.as_deref() {
+                for r in 0..p {
+                    beta_rhs[r] -= 0.5 * ex.logdet_beta[r];
+                }
+            }
             // δβ = S_β⁻¹·rhs in place. Non-PD S_β ⇒ the (NaN,…,false) failure surface.
             if cholesky_in_place(
                 schur.as_mut(),
@@ -1061,7 +1414,13 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         // successive steps — bit-identical iterate path and returned values to the
         // pre-halving loop when no halving fires (see `pirls_solve` for why the
         // same-point band above cannot itself be a converge trigger).
-        let mixed = (dev + pen).value();
+        // Exact mode: the exit band must track the same merit the accept/halve
+        // decision above uses (dev + pen + 2·log|A|), or the loop could settle on a
+        // point that is a fixed point of dev+pen alone but still moving in log|A|.
+        // The merit's mode-consistency term is deliberately absent here: it is
+        // proportional to δu₀, which the band already forces to zero, so including
+        // it would change no fixed point and only the iterate count.
+        let mixed = (dev + pen).value() + if exact { 2.0 * logdet.value() } else { 0.0 };
         if it + 1 >= min_iters && (mixed - mixed_prev).abs() < tol * (1.0 + mixed.abs()) {
             converged = true;
             break;

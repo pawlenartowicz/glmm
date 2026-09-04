@@ -2,7 +2,7 @@
 //! `re: Some`, dense + sparse-Schur equivalence + AGQ + two-stage).
 
 use super::*;
-use crate::glmm::{build_z, glmm_laplace_deviance, GlmmWorkspace, StructuredSchur};
+use crate::glmm::{build_z, glmm_laplace_deviance, GlmmWorkspace, OuterSearch, StructuredSchur};
 use crate::test_support::assert_near;
 use crate::{
     BinomialLink, Family, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing,
@@ -2400,22 +2400,27 @@ fn fit_glmm_nb_sim_matches_lme4() {
     // `golden_max_ln_theta` stopping width (1e-4) this fixture's fit above
     // just ran at.
     const BAND: f64 = 1e-7;
-    const REF_BETA_PIN: [f64; 3] = [-0.02075568116330833, 0.5939541494671592, 0.5994666840076409];
-    // Re-pinned 2026-09-01: the exact hyper-dual joint (θ, β) Hessian replaced
-    // the finite-difference stencil on the blocked GLMM path (W3). The fit is
-    // unchanged — β̂, τ̂², θ̂ and the deviance keep their pins — so the movement
-    // here is the FD stencil's own truncation-plus-noise error, measured at
-    // 1.34e-5 rel (se[0], worst) on this fixture against the `se_hessian_rel`
-    // band of 1e-3. Regenerate by running this test and reading the reported
-    // value; the value is glmm's own, not a reference (the lme4 comparison in
-    // this same test keeps its 5e-2 band and did not move).
-    const REF_SE_PIN: [f64; 3] = [
-        0.16316631869132972,
-        0.07212836278258408,
-        0.14148157243560103,
+    // re-pinned 2026-09-03: exact β-profile, θ-only outer search (was
+    // [-0.02075568116330833, 0.5939541494671592, 0.5994666840076409]). This
+    // shape (blocked, no extras, nAGQ=1, non-Gamma) now routes through
+    // `OuterSearch::ExactProfile`.
+    //
+    // Re-pinned a second time the same day, once the exact-mode merit's accept
+    // band was widened to carry its own correction residual
+    // (`pirls_solve_blocked`): the first re-pin recorded values the warm-start
+    // deadlock had produced, where uphill θ probes came back non-finite and the
+    // outer search stopped early — β₀ landed at -0.020603 with θ̂_NB = 1.77368.
+    // At the fixture's own θ̂_NB (1.783599975969345) the two routes now agree,
+    // Δdev = exact − joint = -7.512e-8 (deviance 327.90301823213406 vs
+    // 327.90301830725440), well inside `GLMM_RHO_END` (3e-6).
+    const REF_BETA_PIN: [f64; 3] = [
+        -0.020772684227064696,
+        0.5939577927279746,
+        0.5994409570567505,
     ];
-    const REF_TAU2_PIN: [f64; 1] = [0.3297226921658576];
-    const REF_THETA_PIN: f64 = 1.783_599_975_969_345;
+    const REF_SE_PIN: [f64; 3] = [0.1631695206794065, 0.07212850508079749, 0.1414816654249278];
+    const REF_TAU2_PIN: [f64; 1] = [0.32973894328360587];
+    const REF_THETA_PIN: f64 = 1.783599975969345;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb pinned tau2");
@@ -2563,10 +2568,11 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
 }
 
 /// AGQ-bypass canary (the `GLMM_RHO_END` canary's two-stage counterpart).
-/// nAGQ>1 fits bypass stage 1: the `two_stage && nagq == 1` gate
+/// nAGQ>1 fits bypass stage 1: the `stage1_mode.filter(|_| nagq == 1)` gate
 /// excludes them (Profile deviance is undefined on the AGQ early-return path,
-/// `debug_assert!(!profile_beta || nagq == 1)`), so setting `ws.two_stage = true`
-/// on an AGQ fit must be a strict no-op. Runs the Poisson grouseticks AGQ fixture
+/// `debug_assert!(beta_mode == BetaMode::Fixed || nagq == 1)`), so setting
+/// `ws.outer_search = OuterSearch::PqlThenJoint` on an AGQ fit must be a strict
+/// no-op. Runs the Poisson grouseticks AGQ fixture
 /// (nAGQ=7) through `crate::glmm::fit_glmm` both ways and asserts β̂, θ̂, τ̂², and
 /// n_eval are BIT-identical — the bypass is clean. (A Laplace-pass warm start for
 /// AGQ was measured on the diligent AGQ cells (2026-07-14) and reverted as a wash;
@@ -2631,7 +2637,11 @@ fn two_stage_agq_bypass_is_bit_identical() {
     let run = |two_stage: bool| -> (Vec<f64>, Vec<f64>, f64, usize) {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &sized, n, &[], nagq);
         build_z(&mut ws, xm.as_ref().subrows(0, n), &cluster_ids, &[], n);
-        ws.two_stage = two_stage;
+        ws.outer_search = if two_stage {
+            OuterSearch::PqlThenJoint
+        } else {
+            OuterSearch::Joint
+        };
         let fit = crate::glmm::fit_glmm(
             &mut ws,
             xm.as_ref().subrows(0, n),
@@ -2685,11 +2695,12 @@ fn two_stage_agq_bypass_is_bit_identical() {
 /// Two-stage A/B for a fixture whose data/model helpers live only in fit.rs's
 /// private `#[cfg(test)]` module (unreachable from glmm/tests.rs). Mirrors
 /// glmm/tests.rs `assert_two_stage_matches_single`: two fresh workspaces —
-/// single- vs two-stage — must land on the same optimum at ORACLE tolerances
+/// `outer_search = OuterSearch::Joint` vs forced `OuterSearch::PqlThenJoint` —
+/// must land on the same optimum at ORACLE tolerances
 /// (β_rel 1e-3; θ abs+rel 1e-3 band; τ² rel 1e-3). Prints the
 /// `(n_eval_single, n_eval_two)` pair for the baseline doc; NO n_eval assertion —
 /// the eval-count win is a separate, measured concern. Drives
-/// `crate::glmm::fit_glmm` directly so `ws.two_stage` is settable.
+/// `crate::glmm::fit_glmm` directly so `ws.outer_search` is settable.
 fn assert_two_stage_matches_single_local(
     label: &str,
     model: &ModelSpec,
@@ -2732,7 +2743,17 @@ fn assert_two_stage_matches_single_local(
         } else {
             None
         };
-        ws.two_stage = two_stage;
+        // false: pin the single-stage reference (`OuterSearch::Joint`). true:
+        // force `PqlThenJoint` explicitly rather than trust the constructor's
+        // default — `gamma_sim` (n_θ=1, p=3) now falls into the
+        // `n_theta <= 2 && p <= 4` skip and defaults to `Joint`, which would
+        // make this A/B compare two identical configurations and leave
+        // `PqlThenJoint` with no other end-to-end optimum check.
+        ws.outer_search = if two_stage {
+            OuterSearch::PqlThenJoint
+        } else {
+            OuterSearch::Joint
+        };
         let fit = crate::glmm::fit_glmm(
             &mut ws,
             xm.as_ref().subrows(0, n),
@@ -3713,11 +3734,11 @@ fn glmm_rescaling_slope_column_moves_stddev_se_by_the_predicted_power_of_c() {
 /// The stage split must add up to the reported eval count, and the shrink
 /// count must be a real subset of stage 2's evals — counters 1 and 2 in
 /// `crate::counters`' module header, on the dense GLMM route. cbpp (n_theta=1,
-/// p=4) is single-stage
-/// under the public route's `two_stage` heuristic
-/// (`GlmmWorkspace::for_cluster_spec`'s `n_theta <= 2 && p <= 4` skip), and the
-/// stage split only exists on the two-stage path, so this drives the kernel
-/// entry `crate::glmm::fit_glmm` directly with `ws.two_stage` forced on,
+/// p=4) is a logit-link blocked shape, so its default `outer_search` is
+/// `OuterSearch::ExactProfile` (`exact_profile_shape`), which has no stage-2
+/// solve to split evals against. The stage split this test measures only
+/// exists on `PqlThenJoint`, so this drives the kernel entry `crate::glmm::fit_glmm`
+/// directly with `ws.outer_search` forced to `PqlThenJoint`,
 /// mirroring `assert_two_stage_matches_single_local` (glmm_tests.rs:2676).
 #[cfg(feature = "counters")]
 #[test]
@@ -3762,7 +3783,7 @@ fn dense_glmm_counters_split_stages_and_count_shrink_evals() {
     } else {
         None
     };
-    ws.two_stage = true;
+    ws.outer_search = OuterSearch::PqlThenJoint;
     let f = crate::glmm::fit_glmm(
         &mut ws,
         xm.as_ref().subrows(0, n),

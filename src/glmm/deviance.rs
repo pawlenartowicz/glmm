@@ -2,8 +2,8 @@ use faer::dyn_stack::MemBuffer;
 use faer::{Mat, MatRef};
 
 use super::pirls::{
-    build_coupling_csr, pirls_solve, pirls_solve_blocked, pirls_solve_blocked_extras, BetaStep,
-    DualStep, TailKernel,
+    build_coupling_csr, pirls_solve, pirls_solve_blocked, pirls_solve_blocked_extras, BetaMode,
+    BetaStep, DualStep, TailKernel,
 };
 #[cfg(test)]
 use super::workspace::fill_z_f64;
@@ -328,7 +328,7 @@ pub(crate) fn laplace_deviance(
     agq_scratch: &mut [f64],
     // Profile-mode (β-profiling / stage-1) scratch — the β-Schur border buffers
     // each PIRLS variant's Profile δβ step reads (mirrors `dense/blocked/structured
-    // _schur_fill` in se.rs). All inert when `profile_beta == false`. `beta_step_rhs`
+    // _schur_fill` in se.rs). All inert when `beta_mode == BetaMode::Fixed`. `beta_step_rhs`
     // is the caller-owned δβ RHS/solution scratch (BetaStep::Profile.beta_rhs) and
     // MUST be a distinct buffer from `beta` — Fixed callers pass `ws.beta_prof` here
     // (spare) and `ws.beta_rhs` as `beta`; the Profile caller passes `ws.beta_rhs`
@@ -342,11 +342,15 @@ pub(crate) fn laplace_deviance(
     schur_llt_mem: &mut MemBuffer,
     beta_step_rhs: &mut [f64],
     beta_prev: &mut [f64],
-    // β mode: `true` builds `BetaStep::Profile` (joint (u,β) PQL step, converged β
-    // written back through `beta`); `false` builds `BetaStep::Fixed` (β held at the
-    // caller's input — the FD-Hessian and stage-2 contract). No default: every call
-    // site chooses.
-    profile_beta: bool,
+    // P1 exact-profile scratch (`pirls::ExactProfileBufs`), threaded into
+    // `BetaStep::Profile { exact: .. }` only under `BetaMode::ProfileExact` — inert
+    // (unread) under `Fixed`/`ProfilePql`.
+    exact_prof: &mut super::pirls::ExactProfileBufs,
+    // β mode: `ProfilePql`/`ProfileExact` build `BetaStep::Profile` (joint (u,β) step,
+    // converged β written back through `beta`); `Fixed` builds `BetaStep::Fixed` (β
+    // held at the caller's input — the FD-Hessian and stage-2 contract). No default:
+    // every call site chooses.
+    beta_mode: BetaMode,
     // PIRLS exit-tol override, forwarded verbatim to whichever PIRLS variant (or
     // `agq_deviance`) runs. `Some(pirls_tol_fd(family))` only under the FD-Hessian
     // SE evals (`ws.pirls_tol_override`, set by `joint_hessian_cov`); `None` on the fit
@@ -381,14 +385,14 @@ pub(crate) fn laplace_deviance(
     // corrupt the reported coefficients. In Profile mode `beta` is the caller's β
     // in/out state (the stage-1 warm-start buffer, `ws.beta_prof`): it must NOT be
     // reseeded from params — the joint (u,β) step drives it, so this copy is gated
-    // `!profile_beta`.
-    if !profile_beta {
+    // `beta_mode == BetaMode::Fixed`.
+    if beta_mode == BetaMode::Fixed {
         beta[..p].copy_from_slice(&params[n_theta..n_theta + p]);
     }
     // Profile mode is only defined on the PIRLS path below. The nAGQ>1 early-return
-    // bypasses PIRLS entirely, so Profile there is undefined; the two-stage
-    // optimizer's stage-1 gating routes around it (`two_stage && nagq == 1`).
-    debug_assert!(!profile_beta || nagq == 1);
+    // bypasses PIRLS entirely, so Profile there is undefined; the driver's
+    // `stage1_mode.filter(|_| nagq == 1)` gate routes around it.
+    debug_assert!(beta_mode == BetaMode::Fixed || nagq == 1);
     // AGQ (nagq>1) only on a single grouping factor (no extras), q_p ≤ 3,
     // binomial/Poisson — the shapes where the marginal likelihood factorizes into
     // independent per-cluster q-D integrals (a k^q product quadrature). The
@@ -450,8 +454,10 @@ pub(crate) fn laplace_deviance(
     let k = groupings.k_total;
     // One BetaStep, moved into whichever PIRLS branch runs (the branches are
     // mutually exclusive). Fixed leaves the border buffers untouched.
-    let beta_step = if profile_beta {
-        BetaStep::Profile {
+    let beta_step = match beta_mode {
+        BetaMode::Fixed => BetaStep::Fixed,
+        BetaMode::ProfilePql | BetaMode::ProfileExact => BetaStep::Profile {
+            exact: (beta_mode == BetaMode::ProfileExact).then_some(exact_prof),
             xtwx,
             xtwm,
             ainv_mtwx,
@@ -459,9 +465,7 @@ pub(crate) fn laplace_deviance(
             beta_rhs: beta_step_rhs,
             beta_prev,
             schur_llt_mem,
-        }
-    } else {
-        BetaStep::Fixed
+        },
     };
     if groupings.extra_offsets.is_empty() {
         // No extras ⇒ A is block-diagonal: reconstruct mᵢ per row, never build Z/M.
@@ -646,12 +650,21 @@ pub(crate) fn laplace_deviance_at(
     // Fixed mode: β = ws.beta_rhs (transient scratch, never ws.betas — see
     // laplace_deviance's doc). `beta_step_rhs` just needs a distinct spare
     // buffer (inert under Fixed) — ws.beta_prof is it.
-    laplace_deviance_ws(ws, x, y, cluster_ids, extra_ids, n, false, counters)
+    laplace_deviance_ws(
+        ws,
+        x,
+        y,
+        cluster_ids,
+        extra_ids,
+        n,
+        BetaMode::Fixed,
+        counters,
+    )
 }
 
 /// Shared borrow-split body of `laplace_deviance_at` and (test-only)
 /// `glmm_laplace_deviance_profile`: destructures the workspace into the
-/// disjoint borrows `laplace_deviance` needs and calls it. `profile_beta`
+/// disjoint borrows `laplace_deviance` needs and calls it. `beta_mode`
 /// selects both `laplace_deviance`'s β mode AND which workspace buffer plays
 /// β vs. the spare `beta_step_rhs` (Fixed: β = `beta_rhs`, spare = `beta_prof`;
 /// Profile: β = `beta_prof`, spare = `beta_rhs` — the two must never alias).
@@ -664,7 +677,7 @@ pub(crate) fn laplace_deviance_ws(
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
     n: usize,
-    profile_beta: bool,
+    beta_mode: BetaMode,
     counters: &mut crate::counters::EvalCounters,
 ) -> f64 {
     let family = ws.family;
@@ -719,13 +732,14 @@ pub(crate) fn laplace_deviance_ws(
         schur_llt_mem,
         beta_prof,
         beta_prev,
+        exact_prof,
         pirls_exhausted,
         ..
     } = ws;
-    let (beta, beta_step_rhs): (&mut [f64], &mut [f64]) = if profile_beta {
-        (beta_prof, beta_rhs)
-    } else {
+    let (beta, beta_step_rhs): (&mut [f64], &mut [f64]) = if beta_mode == BetaMode::Fixed {
         (beta_rhs, beta_prof)
+    } else {
+        (beta_prof, beta_rhs)
     };
     laplace_deviance(
         family,
@@ -779,7 +793,8 @@ pub(crate) fn laplace_deviance_ws(
         schur_llt_mem,
         beta_step_rhs,
         beta_prev,
-        profile_beta,
+        exact_prof,
+        beta_mode,
         pirls_tol_override,
         *p,
         n,
@@ -813,12 +828,12 @@ pub(crate) fn glmm_laplace_deviance(
 }
 
 /// Test-only Profile twin of `glmm_laplace_deviance`: drives `laplace_deviance`
-/// with `profile_beta = true` and `beta = ws.beta_prof` (the stage-1 in/out β),
-/// so it evaluates the PQL objective at θ and leaves the profiled β̂(θ) in
+/// with `beta_mode = BetaMode::ProfilePql` and `beta = ws.beta_prof` (the stage-1
+/// in/out β), so it evaluates the PQL objective at θ and leaves the profiled β̂(θ) in
 /// `ws.beta_prof`. Seeds BOTH the conditional mode (`ws.u`) and `beta_prof` at 0
 /// each call, making the result depend only on `params` — the determinism (BOBYQA
 /// objective-consistency) the two-stage optimizer needs. This is the stage-1
-/// production call shape (`laplace_deviance(profile_beta = true, beta =
+/// production call shape (`laplace_deviance(beta_mode = BetaMode::ProfilePql, beta =
 /// &mut ws.beta_prof, …)`) exercised from a `&[f64]` in tests.
 #[cfg(test)]
 pub(crate) fn glmm_laplace_deviance_profile(
@@ -840,5 +855,14 @@ pub(crate) fn glmm_laplace_deviance_profile(
         *v = 0.0;
     }
     let mut counters = crate::counters::EvalCounters::new();
-    laplace_deviance_ws(ws, x, y, cluster_ids, extra_ids, n, true, &mut counters)
+    laplace_deviance_ws(
+        ws,
+        x,
+        y,
+        cluster_ids,
+        extra_ids,
+        n,
+        BetaMode::ProfilePql,
+        &mut counters,
+    )
 }

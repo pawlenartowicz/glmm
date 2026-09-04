@@ -4192,12 +4192,13 @@ fn structured_cold_start_overshoot_is_finite() {
 }
 
 /// Runs one GLMM shape through `fit_glmm` both ways — single-stage
-/// (`two_stage = false`) and two-stage (`two_stage = true`) — and asserts the
-/// two optimizer paths land on the same optimum within the ORACLE tolerances
-/// (β̂: beta_rel 1e-3; θ̂: abs+rel 1e-3 band; τ̂²: stddev_rel 1e-3). Returns
-/// `(n_eval_single, n_eval_two)` for the baseline-doc print (the eval-count win is
-/// a separate, measured concern; it is NOT gated here). Both workspaces are built
-/// fresh from the same spec/data; only `two_stage` differs.
+/// (`outer_search = OuterSearch::Joint`) and the shape's default route — and
+/// asserts the two optimizer paths land on the same optimum within the ORACLE
+/// tolerances (β̂: beta_rel 1e-3; θ̂: abs+rel 1e-3 band; τ̂²: stddev_rel 1e-3).
+/// Returns `(n_eval_single, n_eval_two)` for the baseline-doc print (the
+/// eval-count win is a separate, measured concern; it is NOT gated here). Both
+/// workspaces are built fresh from the same spec/data; only `outer_search`
+/// differs.
 #[allow(clippy::too_many_arguments)]
 fn assert_two_stage_matches_single(
     label: &str,
@@ -4213,7 +4214,7 @@ fn assert_two_stage_matches_single(
     let beta_start = vec![0.0_f64; p];
 
     let mut ws1 = GlmmWorkspace::for_cluster_spec(p, spec, n, &[], 1);
-    ws1.two_stage = false; // pin the single-stage reference: two_stage now defaults true
+    ws1.outer_search = OuterSearch::Joint; // pin the single-stage reference
     build_z(&mut ws1, x, primary, extra, n);
     let fit1 = fit_glmm(
         &mut ws1,
@@ -4229,8 +4230,9 @@ fn assert_two_stage_matches_single(
     );
     assert!(fit1.converged, "{label}: single-stage fit must converge");
 
+    // Second workspace keeps the constructor's default route — the A/B is
+    // "default route vs `Joint`", not "PQL warm start vs `Joint`" specifically.
     let mut ws2 = GlmmWorkspace::for_cluster_spec(p, spec, n, &[], 1);
-    ws2.two_stage = true;
     build_z(&mut ws2, x, primary, extra, n);
     let fit2 = fit_glmm(
         &mut ws2,
@@ -4273,12 +4275,13 @@ fn assert_two_stage_matches_single(
     (fit1.n_eval, fit2.n_eval)
 }
 
-/// A/B: the two-stage β-profiling optimizer reaches the same optimum as the
-/// single joint solve on the grouseticks 3-crossed Poisson fixture (the flagship
-/// structured shape). θ̂/β̂/τ̂² agree within oracle tolerances — NOT bit-identity
-/// (two optimizer paths). n_eval both ways is printed as a baseline doc; there is
-/// deliberately NO n_eval assertion (the eval-count win is a separate, measured
-/// concern).
+/// A/B: the default outer route reaches the same optimum as the single joint
+/// solve on the grouseticks 3-crossed Poisson fixture (the flagship structured
+/// shape) — grouseticks (canonical log link, structured extras) now defaults
+/// to `OuterSearch::ExactProfile`, not `PqlThenJoint`. θ̂/β̂/τ̂² agree within
+/// oracle tolerances — NOT bit-identity (two optimizer paths). n_eval both
+/// ways is printed as a baseline doc; there is deliberately NO n_eval
+/// assertion (the eval-count win is a separate, measured concern).
 #[test]
 fn two_stage_matches_single_stage_on_grouseticks() {
     let (model, ids, x, y, n, p) = grouseticks_3crossed_fixture();
@@ -4298,14 +4301,14 @@ fn two_stage_matches_single_stage_on_grouseticks() {
 /// Corpus A/B sweep: every cheaply-reachable committed GLMM fixture shape run
 /// both ways (single- vs two-stage) must agree at oracle tolerances. Covers all
 /// three PIRLS variants and both link classes: grouseticks 3-crossed Poisson-log
-/// (structured, non-canonical), the logit intercept fixture (blocked, canonical),
+/// (structured, canonical — routes `ExactProfile`), the logit intercept fixture (blocked, canonical),
 /// its probit twin (blocked, non-canonical), and the crossed / nested /
 /// crossed+nested logit extras shapes (structured). The cbpp herd-intercept
 /// binomial GLMM (logit + probit, lme4-validated) and the Gamma mixed golden DO
 /// exist as genuine GLMM fixtures, but their data/model helpers are private to
 /// `fit.rs`'s `#[cfg(test)]` module and not reachable from here — the probit-GLMM
 /// twin substitutes in this sweep, and `fit.rs`'s own test module covers
-/// cbpp-probit + Gamma two-stage A/B coverage separately (where `ws.two_stage` is
+/// cbpp-probit + Gamma two-stage A/B coverage separately (where `ws.outer_search` is
 /// settable). `#[ignore]`: run explicitly as the corpus proof; it is out of the
 /// default fast suite.
 #[test]
@@ -4315,7 +4318,7 @@ fn two_stage_matches_single_stage_corpus_sweep() {
     // concurrent dhat profiler window on an `-- --ignored` run.
     #[cfg(feature = "alloc-tests")]
     let _serial = crate::test_support::alloc_test_guard();
-    // grouseticks 3-crossed Poisson (structured, non-canonical log link).
+    // grouseticks 3-crossed Poisson (structured, canonical log link).
     {
         let (model, ids, x, y, n, p) = grouseticks_3crossed_fixture();
         let (a, b) = assert_two_stage_matches_single(
@@ -4372,6 +4375,337 @@ fn two_stage_matches_single_stage_corpus_sweep() {
         );
         println!("extras_{label} n_eval: single {a} vs two {b}");
     }
+}
+
+/// What the exact-profile helpers below take: `(spec, primary ids, extra-grouping
+/// ids, X, y, n, p)`. An empty `extra` marks a no-extras (blocked-path) shape;
+/// a non-empty one routes the same helper through the structured-extras solve.
+type ExactProfileFixture = (
+    ModelSpec,
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    Mat<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+);
+
+/// The blocked no-extras intercept fixture (canonical logit link) the corpus
+/// sweep above builds inline — pulled out so exact-profile tests can reuse it
+/// without duplicating the dataset/spec wiring.
+fn logit_intercept_fixture() -> ExactProfileFixture {
+    let (x, y, ids) = glmm_intercept_dataset();
+    let spec = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+    (spec, ids, Vec::new(), x, y, 80, 2)
+}
+
+/// Its probit twin (blocked, non-canonical link) — the shape exact-mode
+/// profiling exists for, since the Laplace merit and the PQL merit only
+/// diverge off the canonical link.
+fn probit_intercept_fixture() -> ExactProfileFixture {
+    let (x, y, ids) = glmm_intercept_dataset();
+    let mut spec = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+    spec.family = Family::Binomial {
+        link: BinomialLink::Probit,
+    };
+    (spec, ids, Vec::new(), x, y, 80, 2)
+}
+
+/// The `sim_nb` validation fixture as a blocked NB-log shape (24 clusters,
+/// `p = 3`). Non-canonical link with a live `nb_theta`, which is the pairing the
+/// merit's accept band is calibrated against — the other two fixtures leave
+/// `nb_theta` NaN.
+fn sim_nb_intercept_fixture() -> ExactProfileFixture {
+    let (xv, y, ids, n_clusters) = crate::fit::common_tests::sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_nb.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let mut x = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        for j in 0..p {
+            x[(i, j)] = xv[i * p + j];
+        }
+    }
+    let spec = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    (spec, ids, Vec::new(), x, y, n, p)
+}
+
+/// The 6-level crossed logit extras shape the corpus sweep builds as
+/// `extras_crossed` (structured path, canonical link, `q_core = 1`, `e = 6`).
+fn extras_crossed_logit_fixture() -> ExactProfileFixture {
+    let (x, y, ids, extra_ids, spec) = glmm_extras_q1_dataset(0, 6);
+    let n = y.len();
+    (spec, ids, extra_ids, x, y, n, 2)
+}
+
+/// Grouseticks, INDEX primary + BROOD/LOCATION crossed (structured path,
+/// Poisson-log = canonical, `e = 181`) — the flagship structured rung.
+fn grouseticks_exact_fixture() -> ExactProfileFixture {
+    let (spec, ids, x, y, n, p) = grouseticks_3crossed_fixture();
+    (spec, ids.primary, ids.extra, x, y, n, p)
+}
+
+/// P1: an exact-Profile solve at θ returns (ũ, β̂) such that a Fixed-mode
+/// solve at that β̂ reproduces the same Laplace objective — the profile value IS
+/// the objective at the profiled point, not a PQL surrogate.
+#[test]
+fn exact_profile_value_equals_fixed_mode_value_at_profiled_beta() {
+    let (model, ids, extra, x, y, n, p) = probit_intercept_fixture();
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+    build_z(&mut ws, x.as_ref(), &ids, &extra, n);
+    let mut ctrs = EvalCounters::new();
+    ws.params[..ws.n_theta].fill(0.7);
+    ws.beta_prof[..p].fill(0.0);
+    ws.u.fill(0.0);
+    let prof = laplace_deviance_ws(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra,
+        n,
+        BetaMode::ProfileExact,
+        &mut ctrs,
+    );
+    assert!(prof.is_finite(), "exact profile solve must converge");
+    let beta_hat = ws.beta_prof[..p].to_vec();
+    // Fixed mode reads β off `ws.params[n_theta..]` (`laplace_deviance`'s own
+    // convention), not off the transient `beta_rhs` scratch buffer.
+    let nt = ws.n_theta;
+    ws.params[nt..nt + p].copy_from_slice(&beta_hat);
+    ws.u.fill(0.0);
+    let fixed = laplace_deviance_ws(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra,
+        n,
+        BetaMode::Fixed,
+        &mut ctrs,
+    );
+    assert!(
+        (prof - fixed).abs() < 1e-6 * (1.0 + fixed.abs()),
+        "profile {prof} vs fixed {fixed}"
+    );
+}
+
+/// P1 gate in unit form: at a fixed θ, minimizing the Fixed-mode Laplace deviance over
+/// β with BOBYQA lands on (within BOBYQA's own tolerance) the value the exact
+/// Profile solve returns in one PIRLS call. Logit (canonical, Fisher û path),
+/// probit (non-canonical, observed û path), and the two canonical structured
+/// shapes (crossed logit, grouseticks Poisson-log).
+fn assert_exact_profile_is_beta_minimum(fixture: fn() -> ExactProfileFixture, label: &str) {
+    let (model, ids, extra, x, y, n, p) = fixture();
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+    build_z(&mut ws, x.as_ref(), &ids, &extra, n);
+    let mut ctrs = EvalCounters::new();
+    let n_theta = ws.n_theta;
+    ws.params[..n_theta].fill(0.6);
+    ws.beta_prof[..p].fill(0.0);
+    ws.u.fill(0.0);
+    let prof = laplace_deviance_ws(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra,
+        n,
+        BetaMode::ProfileExact,
+        &mut ctrs,
+    );
+    let beta_hat = ws.beta_prof[..p].to_vec();
+    // β-only BOBYQA on the Fixed objective from β = 0.
+    let mut cfg = bobyqa::Config::new(p);
+    cfg.rho_begin = 0.5;
+    cfg.rho_end = 1e-8;
+    let mut solver = bobyqa::Bobyqa::new(p, cfg).unwrap();
+    let mut b0 = vec![0.0; p];
+    let lo = vec![-20.0; p];
+    let hi = vec![20.0; p];
+    let out = solver.minimize(
+        |b| {
+            ws.params[n_theta..n_theta + p].copy_from_slice(b);
+            ws.u.fill(0.0);
+            laplace_deviance_ws(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &extra,
+                n,
+                BetaMode::Fixed,
+                &mut ctrs,
+            )
+        },
+        &mut b0,
+        &lo,
+        &hi,
+    );
+    assert!(
+        matches!(out.status, bobyqa::Status::Converged),
+        "{label}: β-only BOBYQA"
+    );
+    let joint_min = out.f;
+    assert!(
+        prof - joint_min < 1e-7 * (1.0 + joint_min.abs()),
+        "{label}: profile {prof} above β-minimum {joint_min}"
+    );
+    for j in 0..p {
+        assert!(
+            (beta_hat[j] - b0[j]).abs() < 1e-4,
+            "{label}: β̂[{j}] profile {} vs bobyqa {}",
+            beta_hat[j],
+            b0[j]
+        );
+    }
+}
+
+/// P1: the exact-Profile solve must converge when PIRLS is warm-started from the
+/// converged (ũ, β̂) of a LOWER θ — the directional warm start the θ-only outer
+/// search does on every uphill probe. A cold start at the same θ converges, so a
+/// non-finite value here is a globalization defect in the exact border, not a
+/// property of the objective.
+#[test]
+fn exact_profile_converges_from_lower_theta_warm_start() {
+    const WIDE: [(f64, f64); 4] = [(0.7, 0.9), (1.0, 1.1), (0.5, 0.6), (0.45, 0.65)];
+    assert_exact_profile_warm_start(logit_intercept_fixture, "logit", f64::NAN, &WIDE);
+    assert_exact_profile_warm_start(probit_intercept_fixture, "probit", f64::NAN, &WIDE);
+    // `sim_nb` at a FIXED θ_NB near the optimum — one of the values the outer
+    // NB-θ bracket visits, not the fixture's own θ̂_NB — on the θ steps the θ-only
+    // search takes there (θ̂ ≈ 0.5742). Every one of these returned a non-finite
+    // value while the accept band charged neither endpoint's mode-consistency
+    // correction: the outer search read them as `inf`, stopped at θ = 0.5567 and
+    // put β₀ 15% off lme4. The steps are deliberately small — the failure needs a
+    // warm start already close to the mode, so a coarse pair like (0.5, 0.6) can
+    // miss it.
+    const NEAR: [(f64, f64); 4] = [
+        (0.5567410345061036, 0.5569180345061036),
+        (0.5567410345061036, 0.5584201322395581),
+        (0.5567410345061036, 0.575),
+        (0.5567410345061036, 0.58),
+    ];
+    assert_exact_profile_warm_start(
+        sim_nb_intercept_fixture,
+        "sim_nb",
+        1.7832168350542466,
+        &NEAR,
+    );
+}
+
+/// `nb_theta` is NaN on every family that does not estimate one (`fit_glmm_impl`
+/// threads it the same way); `pairs` are `(θ_cold, θ_warm)` probes in the RE
+/// scale.
+fn assert_exact_profile_warm_start(
+    fixture: fn() -> ExactProfileFixture,
+    label: &str,
+    nb_theta: f64,
+    pairs: &[(f64, f64)],
+) {
+    let (model, ids, extra, x, y, n, p) = fixture();
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+    ws.nb_theta = nb_theta;
+    build_z(&mut ws, x.as_ref(), &ids, &extra, n);
+    let mut ctrs = EvalCounters::new();
+    let nt = ws.n_theta;
+    for &(theta_lo, theta_hi) in pairs {
+        ws.params[..nt].fill(theta_lo);
+        ws.beta_prof[..p].fill(0.0);
+        ws.u.fill(0.0);
+        let lo = laplace_deviance_ws(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra,
+            n,
+            BetaMode::ProfileExact,
+            &mut ctrs,
+        );
+        assert!(
+            lo.is_finite(),
+            "{label}: cold solve at theta={theta_lo} must converge"
+        );
+        let u_warm = ws.u.clone();
+        let beta_warm = ws.beta_prof[..p].to_vec();
+        // Uphill probe, warm-started exactly as the outer search does.
+        ws.params[..nt].fill(theta_hi);
+        ws.u.copy_from_slice(&u_warm);
+        ws.beta_prof[..p].copy_from_slice(&beta_warm);
+        let hi_warm = laplace_deviance_ws(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra,
+            n,
+            BetaMode::ProfileExact,
+            &mut ctrs,
+        );
+        // Cold reference at the same theta — the value the warm solve must match.
+        ws.params[..nt].fill(theta_hi);
+        ws.beta_prof[..p].fill(0.0);
+        ws.u.fill(0.0);
+        let hi_cold = laplace_deviance_ws(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra,
+            n,
+            BetaMode::ProfileExact,
+            &mut ctrs,
+        );
+        assert!(
+            hi_warm.is_finite(),
+            "{label}: warm start {theta_lo} -> {theta_hi}: got {hi_warm}, cold gives {hi_cold}"
+        );
+        assert!(
+            (hi_warm - hi_cold).abs() < 1e-6 * (1.0 + hi_cold.abs()),
+            "{label}: warm start {theta_lo} -> {theta_hi}: warm {hi_warm} vs cold {hi_cold}"
+        );
+    }
+}
+
+#[test]
+fn exact_profile_is_beta_minimum_logit() {
+    assert_exact_profile_is_beta_minimum(logit_intercept_fixture, "logit");
+}
+#[test]
+fn exact_profile_is_beta_minimum_probit() {
+    assert_exact_profile_is_beta_minimum(probit_intercept_fixture, "probit");
+}
+#[test]
+fn exact_profile_is_beta_minimum_extras_crossed_logit() {
+    assert_exact_profile_is_beta_minimum(extras_crossed_logit_fixture, "extras crossed logit");
+}
+#[test]
+fn exact_profile_is_beta_minimum_grouseticks() {
+    assert_exact_profile_is_beta_minimum(grouseticks_exact_fixture, "grouseticks");
+}
+
+/// The structured twin of `exact_profile_converges_from_lower_theta_warm_start`:
+/// the crossed extras path must not jam on the directional warm start either.
+/// Separate test so a failure names the structured solve, not the blocked one.
+#[test]
+fn exact_profile_converges_from_lower_theta_warm_start_extras() {
+    assert_exact_profile_warm_start(
+        extras_crossed_logit_fixture,
+        "extras crossed logit",
+        f64::NAN,
+        &[(0.7, 0.9), (1.0, 1.1), (0.5, 0.6), (0.45, 0.65)],
+    );
 }
 
 /// Structured inference (Var(β̂)_jj, z²) matches a dense Schur recomputation on
@@ -4654,6 +4988,7 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
         false,
         &mut beta,
         BetaStep::Profile {
+            exact: None,
             xtwx,
             xtwm,
             ainv_mtwx,
@@ -4783,6 +5118,7 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         false,
         &mut beta,
         BetaStep::Profile {
+            exact: None,
             xtwx,
             xtwm,
             ainv_mtwx,
@@ -4948,6 +5284,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             false,
             &mut beta,
             BetaStep::Profile {
+                exact: None,
                 xtwx,
                 xtwm,
                 ainv_mtwx,
@@ -5118,6 +5455,7 @@ fn structured_profile_beta_matches_dense_profile() {
             false,
             &mut beta_dense,
             BetaStep::Profile {
+                exact: None,
                 xtwx,
                 xtwm,
                 ainv_mtwx,
@@ -5235,6 +5573,7 @@ fn structured_profile_beta_matches_dense_profile() {
             false,
             &mut beta_str,
             BetaStep::Profile {
+                exact: None,
                 xtwx,
                 xtwm,
                 ainv_mtwx,
@@ -5418,7 +5757,7 @@ fn pirls_blocked_step_halving_recovers_from_overshoot() {
 }
 
 /// Profile evaluation via the `laplace_deviance` production entry point
-/// (`glmm_laplace_deviance_profile` = the test-only twin: `profile_beta = true`,
+/// (`glmm_laplace_deviance_profile` = the test-only twin: `beta_mode = BetaMode::ProfilePql`,
 /// `beta = ws.beta_prof`). Asserts (a) finite deviance; (b) `beta_prof` moved off
 /// its 0 seed — β was PROFILED, not held (this is what would fail if the copy
 /// gating or the Profile δβ wiring were wrong); (c) two calls from the same seed
@@ -5476,7 +5815,7 @@ fn laplace_deviance_profile_evaluates_and_is_deterministic() {
     }
 }
 
-/// The θ-only stage-1 scratch (`solver_stage1`, `params_stage1`, `two_stage`)
+/// The θ-only stage-1 scratch (`solver_stage1`, `params_stage1`, `outer_search`)
 /// exists on every `GlmmWorkspace` and is the shipped default fit path (see
 /// `fit_glmm`'s STAGE 1 block), not an inert addition. Uses the 1-slope +
 /// 1-crossed fixture so `n_theta = 4 >= 3`, exercising the `sparse_lmm_seed`
@@ -5502,9 +5841,10 @@ fn workspace_carries_stage1_scratch_sized_for_n_theta() {
         ws.n_theta,
         "params_stage1 is a θ-only candidate/incumbent buffer"
     );
-    assert!(
-        ws.two_stage,
-        "two_stage defaults to true (the two-stage optimizer is the shipped path)"
+    assert_eq!(
+        ws.outer_search,
+        OuterSearch::ExactProfile,
+        "structured-eligible extras on a canonical link default to the θ-only exact-profile route"
     );
     // solver_stage1 must be usable as an n_theta-dim BOBYQA solver over the
     // θ-only bound slices — smoke-test one minimize call on a trivial objective.
@@ -5527,14 +5867,14 @@ fn workspace_carries_stage1_scratch_sized_for_n_theta() {
 
 /// Objective-identity gate. Both the stage-2 BOBYQA
 /// objective and the single-stage joint objective are, by construction, the SAME
-/// function call — `laplace_deviance(profile_beta = false)` — with `ws.two_stage`
-/// only gating whether stage 1 runs BEFORE that objective, never the objective
-/// itself. This test does not exercise those two call sites directly; instead it
-/// evaluates `glmm_laplace_deviance` (production stage-2 / single-stage closure
-/// shape) at five [θ|β] points — the blind start, the converged optimum, and
+/// function call — `laplace_deviance(beta_mode = BetaMode::Fixed)` — with
+/// `ws.outer_search` only gating whether stage 1 runs BEFORE that objective, never
+/// the objective itself. This test does not exercise those two call sites directly;
+/// instead it evaluates `glmm_laplace_deviance` (production stage-2 / single-stage
+/// closure shape) at five [θ|β] points — the blind start, the converged optimum, and
 /// three perturbations — on two independently built, identically-seeded
 /// grouseticks-3crossed workspaces (structured, non-canonical log link), varying
-/// only `ws.two_stage` (false vs true), and asserts `to_bits` equality. The
+/// only `ws.outer_search` (`Joint` vs `PqlThenJoint`), and asserts `to_bits` equality. The
 /// warm-start seed û is pinned to the SAME constant on both (`warm_seed_active` +
 /// a fixed `u_seed`) so the only remaining difference between the two evals is
 /// the flag itself — proving the objective is flag-independent and deterministic,
@@ -5604,13 +5944,17 @@ fn stage2_objective_is_bit_identical_to_single_stage_objective() {
         points.push(q);
     }
 
-    // Evaluate glmm_laplace_deviance (= laplace_deviance with profile_beta=false,
+    // Evaluate glmm_laplace_deviance (= laplace_deviance with beta_mode=BetaMode::Fixed,
     // the production stage-2 / single-stage closure shape) on a freshly built
     // workspace with the warm seed pinned to a shared constant.
     let eval = |pt: &[f64], two_stage: bool| -> f64 {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
         build_z(&mut ws, x.as_ref(), &ids.primary, &ids.extra, n);
-        ws.two_stage = two_stage;
+        ws.outer_search = if two_stage {
+            OuterSearch::PqlThenJoint
+        } else {
+            OuterSearch::Joint
+        };
         let k = ws.k.max(1);
         ws.warm_seed_active = true;
         for v in ws.u_seed[..k].iter_mut() {
@@ -5631,8 +5975,9 @@ fn stage2_objective_is_bit_identical_to_single_stage_objective() {
 }
 
 /// Adversarial halving coverage. Runs a
-/// deliberately hostile fit both ways — single-stage (`two_stage = false`, the
-/// trusted reference) and two-stage (`two_stage = true`) — and asserts the
+/// deliberately hostile fit both ways — single-stage (`outer_search =
+/// OuterSearch::Joint`, the trusted reference) and the shape's default route —
+/// and asserts the
 /// two-stage path lands on exactly one of two surfaces, never a third:
 /// (a) it converges to genuinely finite estimates AND, when single-stage also
 /// converged, agrees with it at ORACLE tolerances, or
@@ -5656,7 +6001,7 @@ fn assert_two_stage_adversarial(
     let beta_start = vec![0.0_f64; p];
 
     let mut ws1 = GlmmWorkspace::for_cluster_spec(p, spec, n, &[], 1);
-    ws1.two_stage = false; // pin the single-stage reference: two_stage now defaults true
+    ws1.outer_search = OuterSearch::Joint; // pin the single-stage reference
     build_z(&mut ws1, x, primary, extra, n);
     let fit1 = fit_glmm(
         &mut ws1,
@@ -5671,8 +6016,9 @@ fn assert_two_stage_adversarial(
         WaldSe::Rx,
     );
 
+    // Second workspace keeps the constructor's default route — the A/B is
+    // "default route vs `Joint`", not "PQL warm start vs `Joint`" specifically.
     let mut ws2 = GlmmWorkspace::for_cluster_spec(p, spec, n, &[], 1);
-    ws2.two_stage = true;
     build_z(&mut ws2, x, primary, extra, n);
     let fit2 = fit_glmm(
         &mut ws2,
@@ -6223,13 +6569,13 @@ fn assert_dual_gradient_matches_fd(
             }
             ws.params[k] = saved[k] + h;
             ws.beta_rhs[..p].copy_from_slice(&ws.params[ws.n_theta..m]);
-            let fp = laplace_deviance_ws(ws, x, y, ids, extra_ids, n, false, &mut ctrs);
+            let fp = laplace_deviance_ws(ws, x, y, ids, extra_ids, n, BetaMode::Fixed, &mut ctrs);
             for v in ws.u[..kk].iter_mut() {
                 *v = 0.0;
             }
             ws.params[k] = saved[k] - h;
             ws.beta_rhs[..p].copy_from_slice(&ws.params[ws.n_theta..m]);
-            let fm = laplace_deviance_ws(ws, x, y, ids, extra_ids, n, false, &mut ctrs);
+            let fm = laplace_deviance_ws(ws, x, y, ids, extra_ids, n, BetaMode::Fixed, &mut ctrs);
             ws.params[k] = saved[k];
             let fd = (fp - fm) / (2.0 * h);
             assert!(
@@ -7013,7 +7359,7 @@ fn w8_time_cell(
         ids,
         extra_ids,
         n,
-        false,
+        BetaMode::Fixed,
         &mut counters,
     ));
     let mut t_f = f64::INFINITY;
@@ -7026,7 +7372,7 @@ fn w8_time_cell(
             ids,
             extra_ids,
             n,
-            false,
+            BetaMode::Fixed,
             &mut counters,
         ));
         t_f = t_f.min(t0.elapsed().as_secs_f64() * 1e6);
@@ -7257,4 +7603,33 @@ fn w8_tail_boundary_sweep_timed() {
             &["YEAR", "BROOD", "INDEX", "LOCATION"],
         );
     }
+}
+
+/// P1: `block_leverage` equals `mᵀA⁻¹m` computed by a `glmm_block_solve`
+/// against the same 3×3 factor (not an explicit matrix inverse).
+#[test]
+fn block_leverage_matches_explicit_inverse() {
+    use crate::glmm::pirls::block_leverage;
+    use crate::glmm::workspace::glmm_block_chol;
+    let q = 3;
+    // SPD: B Bᵀ + I with B lower-ish
+    let b = [2.0, 0.0, 0.0, 0.5, 1.5, 0.0, -0.3, 0.7, 1.2];
+    let mut a = [0.0; 9];
+    for r in 0..q {
+        for c in 0..q {
+            for kk in 0..q {
+                a[r * q + c] += b[r * q + kk] * b[c * q + kk];
+            }
+        }
+        a[r * q + r] += 1.0;
+    }
+    let m = [0.4, -1.1, 0.9];
+    // explicit A⁻¹m by solving with the same factor twice (L then Lᵀ) — glmm_block_solve
+    let mut l = a;
+    assert!(glmm_block_chol(&mut l, q));
+    let mut x = m;
+    crate::glmm::workspace::glmm_block_solve(&l, q, &mut x);
+    let want: f64 = (0..q).map(|i| m[i] * x[i]).sum();
+    let got = block_leverage(&l, q, &m);
+    assert!((got - want).abs() < 1e-12, "h {got} vs mᵀA⁻¹m {want}");
 }
