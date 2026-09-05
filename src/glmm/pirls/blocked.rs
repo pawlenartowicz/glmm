@@ -547,30 +547,11 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             // non-PD observed block already means this trial falls back to Fisher
             // everywhere for consistency with the fixed-point map `dual` uses.
             let gu_dot_du = {
-                // f64 copy of one q×q `a_blocks` factor for the passes below:
-                // `a_blocks` is generic `&[T]` (the derivative kernels instantiate
-                // T = Dual<N>), but exact mode runs in f64 only and
-                // `block_leverage`/`glmm_block_solve` need a plain `&[f64]`, and a
-                // `transmute` is not allowed here — so a stack copy is the cheap
-                // way to get one, and cheaper than keeping a persistent f64 mirror
-                // of `a_blocks` around. Frequency and size: pass A calls this once
-                // per ROW and pass B once per cluster, and `out` is a fixed
-                // MAX_PRIMARY_Q² = 64 zero-init regardless of `q`.
-                fn a_blocks_f64<T: crate::scalar::Scalar>(
-                    blk: &[T],
-                ) -> [f64; crate::consts::MAX_PRIMARY_Q * crate::consts::MAX_PRIMARY_Q]
-                {
-                    let mut out =
-                        [0.0_f64; crate::consts::MAX_PRIMARY_Q * crate::consts::MAX_PRIMARY_Q];
-                    for (o, v) in out.iter_mut().zip(blk.iter()) {
-                        *o = v.value();
-                    }
-                    out
-                }
                 let ExactProfileBufs {
                     logdet_u,
                     logdet_beta,
                     obs_blocks,
+                    fac_f64,
                     ..
                 } = &mut **ex;
                 let logdet_u = &mut logdet_u[..k];
@@ -578,6 +559,15 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 logdet_u.fill(0.0);
                 logdet_beta.fill(0.0);
                 let use_obs = obs_ok;
+                // One f64 mirror of the s per-cluster factors for the three
+                // passes below (see `ExactProfileBufs::fac_f64`). Built from
+                // THIS iterate's factors: the block sweep above leaves
+                // `a_blocks` factored, and nothing between here and pass B
+                // writes it.
+                let fac_f64 = &mut fac_f64[..q * q * s];
+                for (o, v) in fac_f64.iter_mut().zip(a_blocks[..q * q * s].iter()) {
+                    *o = v.value();
+                }
                 // pass A: hᵢ, w'ᵢ → direct part into c_β, and gᵤ = ∂log|A|/∂u.
                 let mut mrow = [0.0_f64; crate::consts::MAX_PRIMARY_Q];
                 for i in 0..n {
@@ -586,8 +576,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     for c in 0..q {
                         mrow[c] = m_buf[i * q + c].value();
                     }
-                    let fac = a_blocks_f64(&a_blocks[ablk..ablk + q * q]);
-                    let h = block_leverage(&fac[..q * q], q, &mrow[..q]);
+                    let h = block_leverage(&fac_f64[ablk..ablk + q * q], q, &mrow[..q]);
                     let wp = if w[i].value() <= crate::glm::WEIGHT_CLAMP {
                         0.0
                     } else {
@@ -619,12 +608,10 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 // link when its factor is PD, else the Fisher factor in `a_blocks`).
                 for f in 0..s {
                     let ablk = f * q * q;
-                    let fac_owned;
                     let fac: &[f64] = if use_obs {
                         &obs_blocks[ablk..ablk + q * q]
                     } else {
-                        fac_owned = a_blocks_f64(&a_blocks[ablk..ablk + q * q]);
-                        &fac_owned[..q * q]
+                        &fac_f64[ablk..ablk + q * q]
                     };
                     glmm_block_solve(fac, q, &mut logdet_u[f * q..f * q + q]);
                 }

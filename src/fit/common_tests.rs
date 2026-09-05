@@ -1533,10 +1533,13 @@ fn lmm_reports_kkt_and_boundary_score() {
     assert!(interior.diagnostics.kkt_grad_norm.is_finite());
     // KKT_INTERIOR_MAX is calibrated on GLMM Laplace deviances and does not
     // transfer to the REML criterion — assert only finiteness here. An
-    // LMM-calibrated constant is W5's call, where the LMM Newton needs these
-    // derivatives anyway.
+    // LMM-calibrated constant needs its own calibration run and does not exist
+    // yet.
     assert!(interior.diagnostics.boundary_score.is_empty());
-    assert!(interior.stddev_se.is_empty(), "W3 adds no LMM stddev_se");
+    assert!(
+        interior.stddev_se.is_empty(),
+        "the LMM route reports no stddev_se"
+    );
 
     // The pinning Gaussian dataset, inline exactly as
     // `diagnostics_boundary_reports_both_ends` builds it: n = 48, 6 clusters,
@@ -1618,6 +1621,93 @@ fn lmm_reports_kkt_and_boundary_score() {
     }
     assert_eq!(seen, 1);
     assert!(pinned.stddev_se.is_empty());
+}
+
+/// A `q=2` primary (intercept + slope) shape where the intercept variance
+/// pins at 0 while the slope's off-diagonal covariance entry below it
+/// (`vech(Λ)` index 1, i.e. λ₁₀) stays non-zero: the case
+/// `LmmGroupings::diagonal_has_nonzero_below` exists for. Data construction
+/// mirrors `diagnostics_boundary_reports_both_ends`'s ±0.8 cancellation for
+/// the intercept (forcing its between-cluster variance MLE to exactly 0),
+/// plus a per-cluster slope offset so the slope variance is genuinely
+/// positive (not pinned). λ₁₀ is pushed off 0 by a warm start: once λ₀₀ = 0,
+/// the deviance depends on (λ₁₀, λ₁₁) only through λ₁₀² + λ₁₁², a flat
+/// (rotation-invariant) direction, so a non-zero λ₁₀ start is not pulled back
+/// to 0 by the fit.
+#[test]
+fn lmm_boundary_score_skips_component_with_nonzero_off_diagonal() {
+    let n_clusters = 6usize;
+    let reps_per_half = 8usize;
+    let n = n_clusters * reps_per_half * 2;
+    let mut st = 11u64;
+    let mut x = vec![0.0f64; n * 2];
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    let mut idx = 0usize;
+    for half in 0..2 {
+        for _ in 0..reps_per_half {
+            for c in 0..n_clusters {
+                let x1 = lcg(&mut st);
+                let slope_c = 0.5 * (c as f64 - 2.5); // distinct per cluster
+                let intercept_e = if half == 0 { 0.8 } else { -0.8 }; // cancels per cluster
+                x[idx * 2] = 1.0;
+                x[idx * 2 + 1] = x1;
+                ids[idx] = c as u32;
+                y[idx] = 0.5 + (0.4 + slope_c) * x1 + intercept_e + 0.002 * lcg(&mut st);
+                idx += 1;
+            }
+        }
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    // vech(Λ), q=2: [λ00, λ10, λ11]. Warm-start λ00 near the pin threshold and
+    // λ10 well off 0, so the flat (λ10,λ11) direction preserves a non-zero
+    // λ10 at the accepted point instead of settling on the symmetric λ10=0.
+    let start = StartValues {
+        beta: vec![],
+        theta: vec![0.05, 3.0, 0.3],
+    };
+    let fit = fit_warm(
+        &x,
+        &y,
+        n,
+        2,
+        &model,
+        &ids,
+        Some(&start),
+        &FitOptions {
+            target_indices: vec![0, 1],
+            boundary_score: true,
+            ..FitOptions::default()
+        },
+    );
+    assert!(fit.converged(), "status = {:?}", fit.diagnostics.boundary);
+    assert_eq!(fit.diagnostics.boundary, Boundary::AtBoundary);
+    // pinned[0][0] is the intercept variance component (θ00); it must be
+    // pinned for this test to exercise the case at all.
+    assert!(
+        fit.diagnostics.pinned[0][0],
+        "intercept variance did not pin: pinned = {:?}",
+        fit.diagnostics.pinned
+    );
+    let s = fit.diagnostics.boundary_score[0][0];
+    assert!(
+        s.is_nan(),
+        "boundary_score for the pinned intercept must be withheld \
+         (non-zero λ10 below it breaks the evenness the ½·H_jj shortcut needs), got {s}"
+    );
 }
 
 /// `Boundary` at both ends of the range the dense LMM route can report:

@@ -124,6 +124,16 @@ pub(crate) struct ExactProfileBufs {
     /// clearing between rows. A stack array cannot serve: `e` is a data
     /// dimension (181 on grouseticks), not a compile-time cap.
     pub(crate) tail_r: Vec<f64>,
+    /// f64 mirror of THIS iterate's per-cluster factor, filled once per exact
+    /// block and read by every pass below it: `s·q²` in `a_blocks` layout on the
+    /// blocked path, `s·q_core²` in `core_blocks` layout on the structured one
+    /// (sized for the wider, `q_core ≥ q`). Those buffers are generic `&[T]` (the
+    /// derivative kernels instantiate `T = Dual<N>`) while exact mode is f64-only,
+    /// and `block_leverage`/`glmm_block_solve` need a plain `&[f64]`; a transmute
+    /// is not allowed. Filled per CLUSTER, not per row: `cluster_ids` is the
+    /// caller's row order and is not contiguous by cluster, so a per-row copy
+    /// cannot be hoisted by a last-seen-cluster check.
+    pub(crate) fac_f64: Vec<f64>,
 }
 
 /// `h = ‖L⁻¹ m‖²` for one row: the forward half of `glmm_block_solve` on the
@@ -177,10 +187,12 @@ fn refresh_eta_fixed<T: crate::scalar::Scalar>(
 /// to an all-empty CSR — n_cross is all zero.
 ///
 /// The pattern is a function of the design AND the θ-pinning mask
-/// (`build_packed_m` drops θ=0 crossed groupings from `cross_col`/`n_cross`),
-/// so it is fit-invariant only while the pinning mask is: the caller
-/// (deviance.rs structured branch) caches it keyed on that mask and rebuilds
-/// on transitions — not per eval, not blindly per fit.
+/// (`build_packed_m` drops θ=0 crossed groupings from `cross_col`/`n_cross`,
+/// but only at `T = f64`; a dual `T` keeps them, so the dual pattern can be
+/// wider), so it is fit-invariant only while the pinning mask is: the caller
+/// (deviance.rs structured branch) caches it keyed on that mask — which is
+/// `f64`-only for the same reason — and rebuilds on transitions, not per
+/// eval and not blindly per fit.
 pub(crate) fn build_coupling_csr(
     cluster_ids: &[u32],
     cross_col: &[u32],

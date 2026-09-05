@@ -306,7 +306,9 @@ pub(crate) fn tail_solve_generic<T: Scalar>(schur: &[T], e: usize, rhs: &mut [T]
 /// (built once per solve by `pirls_solve_blocked_extras`): the Schur build walks
 /// only those columns instead of all `e` — every skipped column of `C_f` is
 /// exactly 0.0 (no row of cluster `f` touches that crossed level), so skipping it
-/// drops only exact-zero contributions. On an observation-level primary (s ≈ n,
+/// drops only exact-zero contributions. A θ-pinned crossed grouping that a dual
+/// `T` retains (`build_packed_m`'s pin skip is `f64`-only) is exactly-zero for
+/// the other reason — its θ is 0 — so it costs a column here and moves no value. On an observation-level primary (s ≈ n,
 /// grouseticks) this collapses the build from `s·e²/2` to the ~G² true nonzeros
 /// per cluster. The downdate itself runs panel-wise per cluster (one batched
 /// `A_f⁻¹` solve + one triangular `C_f'·Y` matmul through `ss`'s scratch — the
@@ -382,7 +384,11 @@ fn structured_factor<T: TailKernel>(
 /// columns via `coup_cols[coup_ptr[f]..coup_ptr[f+1]]` instead of the full dense
 /// `0..e` range — every skipped column of `C_f` is exactly 0.0, so its dense
 /// contribution was an exact-zero add/subtract and skipping it is bit-identical
-/// (same argument as `structured_factor`'s doc comment). The tail solve itself
+/// (same argument as `structured_factor`'s doc comment). That argument runs the
+/// other way too, and is why `build_packed_m` can keep a θ-pinned crossed column
+/// at a dual `T`: the retained column's value is exactly 0.0, so carrying it
+/// changes no number here and only gives the seeded lane something to
+/// differentiate. The tail solve itself
 /// routes through `TailKernel::tail_solve`: the cached sparse back-solve when `ss`
 /// is `Some` at `T = f64` (production), the dense substitution — `tail_solve`'s
 /// default body — otherwise. Shared by the structured PIRLS solve and the
@@ -1002,32 +1008,28 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
             // `structured_factor` is the one every pass below wants.
             debug_assert!(crate::family::is_canonical(family));
             let gu_dot_du = {
-                // f64 copy of one q_core×q_core `core_blocks` factor for the passes
-                // below: the buffer is generic `&[T]` (the derivative kernels
-                // instantiate T = Dual<N>) while exact mode runs in f64 only, and
-                // `block_leverage`/`glmm_block_solve` here need a plain `&[f64]`.
-                // Mirrors `pirls_solve_blocked`'s `a_blocks_f64`; the copy is qc²
-                // values, cheaper than the O(qc³) solve and leverage it feeds.
-                fn core_block_f64<T: crate::scalar::Scalar>(
-                    blk: &[T],
-                ) -> [f64; crate::lmm::MAX_PRIMARY_Q * crate::lmm::MAX_PRIMARY_Q] {
-                    let mut out = [0.0_f64; crate::lmm::MAX_PRIMARY_Q * crate::lmm::MAX_PRIMARY_Q];
-                    for (o, v) in out.iter_mut().zip(blk.iter()) {
-                        *o = v.value();
-                    }
-                    out
-                }
                 let ExactProfileBufs {
                     logdet_u,
                     logdet_beta,
                     tail_inv,
                     tail_r,
+                    fac_f64,
                     ..
                 } = &mut **ex;
                 let logdet_u = &mut logdet_u[..k];
                 let logdet_beta = &mut logdet_beta[..p];
                 logdet_u.fill(0.0);
                 logdet_beta.fill(0.0);
+                // One f64 mirror of the s per-cluster factors for pass A below
+                // (see `ExactProfileBufs::fac_f64`). Mirrors
+                // `pirls_solve_blocked`'s own fill — change together. Built from
+                // THIS iterate's factors: `structured_factor` above leaves
+                // `core_blocks` factored, and nothing between here and pass A
+                // writes it.
+                let fac_f64 = &mut fac_f64[..qc * qc * s];
+                for (o, v) in fac_f64.iter_mut().zip(core_blocks[..qc * qc * s].iter()) {
+                    *o = v.value();
+                }
                 // S⁻¹ column by column, through the same tail solve the u-step
                 // uses, so it inherits whichever factor `structured_factor` left
                 // (cached sparse LLT, or the dense L in `schur_blk`). `a_rhs`'s
@@ -1070,7 +1072,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     for local in 0..qc {
                         mc[local] = m_core_buf[i * qc + local].value();
                     }
-                    let fac = core_block_f64(&core_blocks[cb..cb + qc * qc]);
+                    let fac = &fac_f64[cb..cb + qc * qc];
                     // Block inverse of A = [[D, C], [C', E]] applied to one row:
                     // mᵢ'A⁻¹mᵢ = ‖L_f⁻¹m_c‖² + rᵢ'S⁻¹rᵢ with rᵢ = C_f'(A_f⁻¹m_c) − m_x.
                     // `rᵢ` is supported on CLUSTER f's coupling columns — a strict
@@ -1078,12 +1080,12 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     // at more than one crossed level — so the walk is over
                     // `coup_cols[f]`; restricting it to the row's columns would drop
                     // real off-column terms of the quadratic form.
-                    let mut h = block_leverage(&fac[..qc * qc], qc, &mc[..qc]);
+                    let mut h = block_leverage(fac, qc, &mc[..qc]);
                     let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
                     if !cols.is_empty() {
                         let coup = f * qc * e;
                         yc[..qc].copy_from_slice(&mc[..qc]);
-                        glmm_block_solve(&fac[..qc * qc], qc, &mut yc[..qc]);
+                        glmm_block_solve(fac, qc, &mut yc[..qc]);
                         // `tail_r` needs no clearing: every column of `cols` is
                         // written here before it is read below, and no other column
                         // is touched.

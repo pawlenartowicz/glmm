@@ -112,6 +112,12 @@ pub fn lower_grid_cell(cell: &Value, manifest_dir: &str) -> (Lowered, bool, usiz
         "poisson" => Family::Poisson {
             link: glmm::PoissonLink::Log,
         },
+        "negbin" => Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+        "gamma" => Family::Gamma {
+            link: GammaLink::Log,
+        },
         other => panic!("family {other}"),
     };
     // aggregated binomial reuses the tier-0 lowering (weights/prop/expansion);

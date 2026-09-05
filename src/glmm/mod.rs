@@ -786,10 +786,8 @@ pub fn fit_glmm(
 
     // KKT residual at the accepted (pinned) γ̂. Available only where the exact
     // gradient is — the shapes `derivative::supports_shape` accepts, i.e. the
-    // blocked path and the structured extras path, and only at a θ̂ whose
-    // crossed components are all unpinned (`extras_theta_pin_free`); NaN
-    // elsewhere, which includes a refused Hessian below — there is no gradient
-    // retry, so a pinned crossed θ̂ leaves this and `boundary_score` both NaN.
+    // blocked path and the structured extras path; NaN elsewhere, which
+    // includes a refused Hessian below, since there is no gradient retry.
     // Read at `Fit` assembly, never by a fitting decision. This runs
     // on BOTH `WaldSe` arms: it is a statement about the optimum, not the
     // covariance.
@@ -809,10 +807,13 @@ pub fn fit_glmm(
     // here — every `ok` path reaching the assembly reports this measurement.
     //
     // The second number, the variance-component score at each pinned diagonal,
-    // is ½·∂²D/∂θ_jj² at γ̂ — dD/ds at s = θ_jj² = 0 (the deviance is even in
-    // θ_jj, so its first derivative there vanishes and the second derivative IS
-    // the score in the variance coordinate — the design doc's `s_j = θ_jj²`
-    // construction). Positive ⇒ the boundary is the constrained optimum.
+    // is ½·∂²D/∂θ_jj² at γ̂ — dD/ds at s = θ_jj² = 0. This equals the score
+    // only where the deviance is even in θ_jj at θ_jj = 0, which holds iff Λ's
+    // column j has no non-zero entry below the diagonal (`Σ_kj` for k > j
+    // carries `Λ_kj·Λ_jj`, linear in `Λ_jj`, so a non-zero `Λ_kj` breaks
+    // evenness). `LmmGroupings::diagonal_has_nonzero_below` gates this per
+    // component below; where it holds, positive ⇒ the boundary is the
+    // constrained optimum. The design doc's `s_j = θ_jj²` construction.
     //
     // The score is opt-in (`FitOptions::boundary_score`, read here as
     // `ws.boundary_score_requested`). It needs the hyper-dual Hessian — three
@@ -838,8 +839,6 @@ pub fn fit_glmm(
         *v = f64::NAN;
     }
     // The one owner is `derivative::supports_shape` — do not inline this test.
-    // Its θ-valued companion `extras_theta_pin_free` is not repeated here: the
-    // entry points below check it themselves, and both NaN resets already ran.
     if ok && derivative::supports_shape(&ws.groupings) {
         let mut g = std::mem::take(&mut ws.grad_scratch);
         let mut got_grad = false;
@@ -854,7 +853,12 @@ pub fn fit_glmm(
                 ws.groupings.fill_theta_row_scales(sc);
                 let diag = ws.groupings.diagonal_theta();
                 for (kk, &ti) in diag.iter().enumerate() {
-                    if kk < u64::BITS as usize && (pinned_components >> kk) & 1 == 1 {
+                    if kk < u64::BITS as usize
+                        && (pinned_components >> kk) & 1 == 1
+                        && !ws
+                            .groupings
+                            .diagonal_has_nonzero_below(kk, &ws.params[..n_theta])
+                    {
                         // `h` is a faer Mat<f64>, so the diagonal entry is
                         // h[(ti, ti)] — the same indexing the FD grid uses in
                         // se.rs. Back-map to the caller's variance coordinate:

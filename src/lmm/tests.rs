@@ -2,6 +2,7 @@
 
 use super::kernel::{reml_gradient, reml_hessian, LmmDualScratch, LmmHyperScratch};
 use super::*;
+use crate::dual::Dual;
 use crate::glmm::DerivStatus;
 use crate::test_support::{extra_level_of_row, intercept_only_spec, model_atom};
 use crate::{Family, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing};
@@ -45,15 +46,45 @@ fn lcg(state: &mut u64) -> f64 {
 /// n=48, p=3 (intercept + x1 + x2), 6 clusters,
 /// y = 0.5 + 0.4·x1 − 0.2·x2 + u_c + 0.8·e.
 fn hand_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>) {
-    let n = 48usize;
-    let n_clusters = 6usize;
+    hand_dataset_sized(48, 6, false)
+}
+
+/// `hand_dataset`, generalized over row/cluster count and cluster balance —
+/// the dual-call cost table's size axis needs this q_p=1 shape at 3,000/
+/// 30,000 rows, and its balanced-collapse comparison needs an unbalanced
+/// variant of the same shape (`precompute_balanced_collapse` only arms on a
+/// balanced primary). `skew` mirrors the speed grid's own skew recipe
+/// (`campaigns/speed-grid/prep.R`): ~20% of clusters ("heavy") draw ~80% of
+/// the rows. The balanced branch (`skew = false`) still assigns `i % nc`
+/// exactly as before, drawing no extra `lcg` values, so `hand_dataset()`'s
+/// output is bit-identical to what it was before this generalization.
+fn hand_dataset_sized(n: usize, nc: usize, skew: bool) -> (Mat<f64>, Vec<f64>, Vec<u32>) {
     let mut st = 42u64;
-    let u_c: Vec<f64> = (0..n_clusters).map(|_| 0.6 * lcg(&mut st)).collect();
+    let u_c: Vec<f64> = (0..nc).map(|_| 0.6 * lcg(&mut st)).collect();
     let mut x = Mat::<f64>::zeros(n, 3);
     let mut y = vec![0.0f64; n];
     let mut ids = vec![0u32; n];
+    // n_heavy clusters (0..n_heavy) draw 80% of rows, the rest draw 20% --
+    // clamped strictly below nc so a "light" cluster always exists to fall
+    // back into. Final index is clamped to nc-1 rather than trusted from the
+    // float arithmetic, since r can round up to exactly 0.8 or 1.0's boundary.
+    let n_heavy = if nc < 2 {
+        0
+    } else {
+        ((nc as f64 * 0.2).round() as usize).clamp(1, nc - 1)
+    };
     for i in 0..n {
-        let c = i % n_clusters;
+        let c = if !skew || nc < 2 {
+            i % nc
+        } else {
+            let r = lcg(&mut st) + 0.5; // in [0, 1)
+            let raw = if r < 0.8 {
+                (r / 0.8) * n_heavy as f64
+            } else {
+                n_heavy as f64 + ((r - 0.8) / 0.2) * (nc - n_heavy) as f64
+            };
+            (raw as usize).min(nc - 1)
+        };
         ids[i] = c as u32;
         let x1 = lcg(&mut st);
         let x2 = lcg(&mut st);
@@ -435,28 +466,30 @@ fn theta_start_some_matches_blind_fit() {
 
 /// Bounded-allocation warm-path check for `fit_lmm`.
 /// Marked #[ignore] because dhat measures
-/// process-wide allocations; `alloc_test_guard` serializes it against the
-/// other `#[ignore]` tests:
-///   cargo test -p glmm --features alloc-tests lmm_fit_warm_path_bounded_alloc -- --ignored
+/// process-wide allocations; `alloc_test_guard` serializes test bodies, but
+/// libtest's own per-test thread spawn still needs `--test-threads=1`:
+///   RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests lmm_fit_warm_path_bounded_alloc -- --ignored --test-threads=1
 ///
 /// BOUND locks the measured warm-path block count. LmmWorkspace itself is
 /// allocation-free across fits (Bobyqa::new is the only solver allocation,
-/// done once). On the faer kernel the per-call blocks are `llt` internals —
-/// ~2 per deviance evaluation (15.1–15.7 evals/fit at rho_end 1e-6, the
-/// measured mean), the same acceptance the shipped path's 26
-/// blocks/call carry; if a future faer version changes its Cholesky
-/// internals, update the bound — do not relax it. A hand-rolled
-/// owned-kernel replacement for faer's `llt` was tried and rejected: its
-/// wasm `f64::ln` took a different ULP path than the native build (the
-/// factorization itself was fine), which broke cross-platform
-/// bit-equality. The faer bound stays the locked steady state.
+/// done once). On the faer kernel the per-call blocks are `chol_lower`'s
+/// single `MemBuffer` — ~1 per deviance evaluation (15.1–15.7 evals/fit at
+/// rho_end 1e-6, the measured mean; `chol_lower` factors `l_out` in place
+/// instead of calling `MatRef::llt`, dropping its own `Mat::zeros`
+/// allocation), the same acceptance the shipped path's 26 blocks/call carry;
+/// if a future faer version changes its Cholesky internals, update the
+/// bound — do not relax it. A hand-rolled owned-kernel replacement for
+/// faer's `llt` was tried and rejected: its wasm `f64::ln` took a different
+/// ULP path than the native build (the factorization itself was fine),
+/// which broke cross-platform bit-equality. The faer bound stays the locked
+/// steady state.
 #[cfg(feature = "alloc-tests")]
 #[test]
 #[ignore]
 fn lmm_fit_warm_path_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    const BOUND: u64 = 4800; // Measured 4600 (this machine) — ~46 blocks/fit of faer `llt` internals on the family-blocked q=1 path (one m×m tail llt per eval). `fit_lmm` no longer allocates per fit (the diagonal_theta index map is cached once on LmmGroupings; the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields), so this count is purely faer's Cholesky internals — faer-version/machine specific. q=1 deviance is byte-identical to the hand-rolled augmented-factor deviance (held by the lmm_parity corpus + golden_rng), so the eval trajectory is unchanged; the count differs from the prior 3804 only because faer's blocked llt allocates more per eval than the hand-rolled augmented factor. If faer changes its Cholesky internals, update — do not relax.
+    const BOUND: u64 = 2700; // Measured 2500 (this machine) — ~25 blocks/fit of faer `llt` internals on the family-blocked q=1 path (one m×m tail llt per eval). `fit_lmm` no longer allocates per fit (the diagonal_theta index map is cached once on LmmGroupings; the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields), so this count is purely faer's Cholesky internals — faer-version/machine specific. q=1 deviance is byte-identical to the hand-rolled augmented-factor deviance (held by the lmm_parity corpus + golden_rng), so the eval trajectory is unchanged; the count dropped from the prior 4600 because `chol_lower` now factors in place (one heap block per eval instead of two). If faer changes its Cholesky internals, update — do not relax.
 
     let (x, y, ids) = hand_dataset();
     let targets: Vec<u32> = vec![1, 2];
@@ -872,7 +905,7 @@ fn balanced_collapse_applicability() {
     let eids = vec![cid.clone()];
     suff.add_rows_multi(x.as_ref(), &y, &pid, &eids, None);
     let gref = LmmGroupings::from_cluster_spec(&cluster, max_n, &[]);
-    let mut fit = LmmFitScratch::with_groupings(2, &gref);
+    let mut fit = LmmFitScratch::<f64>::with_groupings(2, &gref);
     assert!(precompute_balanced_collapse(&suff, &mut fit));
     assert_eq!(fit.collapse_n_active, n / 8);
     assert!(fit.collapse_n_active < n_primary); // genuinely a prefix
@@ -898,7 +931,7 @@ fn balanced_collapse_applicability() {
     let gs = slope_groupings();
     let mut suff_s = LmmSuffStats::with_groupings(2, slope_groupings());
     suff_s.add_rows_multi(xs.as_ref(), &ys, &ids_s, &[], None);
-    let mut fit_s = LmmFitScratch::with_groupings(2, &gs);
+    let mut fit_s = LmmFitScratch::<f64>::with_groupings(2, &gs);
     assert!(!precompute_balanced_collapse(&suff_s, &mut fit_s));
 }
 
@@ -1020,6 +1053,61 @@ fn two_crossed_factors_deviance_matches_brute_force() {
     }
 }
 
+/// The dual REML objective takes the balanced collapse the `f64` objective
+/// takes: on a balanced design `precompute_balanced_collapse` arms on a
+/// `Dual<4>` scratch, and the gradient it then produces still matches the dense
+/// score — the collapse is a reassociation of the same criterion, not a
+/// different one. On an unbalanced design it must refuse on both scalars alike.
+#[test]
+fn dual_scratch_arms_the_balanced_collapse() {
+    let (x, y, ids) = hand_dataset_sized(240, 6, false);
+    let groupings = LmmGroupings::single(6);
+    let p = 3;
+    let mut suff = LmmSuffStats::with_groupings(p, groupings.clone());
+    suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
+    let n_theta = groupings.n_theta();
+
+    let mut fit_d = LmmFitScratch::<Dual<4>>::with_groupings(p, &groupings);
+    assert!(
+        precompute_balanced_collapse(&suff, &mut fit_d),
+        "balanced design must arm on a dual scratch"
+    );
+    assert_eq!(fit_d.collapse_n_active, 6);
+
+    // Same criterion: the armed dual gradient still matches the dense score.
+    let z = dense_z(&groupings, &ids, &[], &x, &[]);
+    let mut scratch = LmmDualScratch::for_groupings(n_theta, p, &groupings)
+        .expect("n_theta 1 is inside the lane set");
+    let mut rng = fixed_seed_theta_lmm("int1", 6001);
+    for _ in 0..5 {
+        let theta = rng.next_theta();
+        let mut grad = vec![0.0; n_theta];
+        assert!(matches!(
+            reml_gradient(&theta, &suff, &mut scratch, &mut grad),
+            DerivStatus::Ok(_)
+        ));
+        let want = dense_reml_score(&theta, z.as_ref(), x.as_ref(), &y, &groupings);
+        for j in 0..n_theta {
+            let band = 1e-8 * want[j].abs().max(1.0);
+            assert!(
+                (grad[j] - want[j]).abs() <= band,
+                "coord {j}: dual {} vs dense {}",
+                grad[j],
+                want[j]
+            );
+        }
+    }
+
+    // Unbalanced: refused on both scalars, so the dual arm keeps the loop.
+    let (xs, ys, ids_s) = hand_dataset_sized(240, 6, true);
+    let mut suff_s = LmmSuffStats::with_groupings(p, groupings.clone());
+    suff_s.add_rows_multi(xs.as_ref(), &ys, &ids_s, &[], None);
+    let mut fit_s_f64 = LmmFitScratch::<f64>::with_groupings(p, &groupings);
+    let mut fit_s_dual = LmmFitScratch::<Dual<4>>::with_groupings(p, &groupings);
+    assert!(!precompute_balanced_collapse(&suff_s, &mut fit_s_f64));
+    assert!(!precompute_balanced_collapse(&suff_s, &mut fit_s_dual));
+}
+
 /// Per-component pin: items carry NO between-level signal by construction
 /// (each item sees every subject equally, and the ±0.8 residual pattern is
 /// block-constant so item means cancel exactly), while subjects carry a
@@ -1104,7 +1192,7 @@ fn crossed_nested_fit_recovers_betas() {
 fn lmm_fit_general_warm_path_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    const BOUND_GENERAL: u64 = 8400; // Measured 8000 (this machine) — ~80 blocks/fit truth-started (scaled rho + spec-derived start; the few-eval regime the production path runs). Per-eval faer `llt` internals only: the family loop is hand-rolled zero-alloc, the cached diagonal_theta map removed the per-fit Vec, and the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields, so this count is faer-version/machine specific. If faer changes its Cholesky internals, update — do not relax.
+    const BOUND_GENERAL: u64 = 3700; // Measured 3500 (this machine) — ~35 blocks/fit truth-started (scaled rho + spec-derived start; the few-eval regime the production path runs). Per-eval faer `llt` internals only: the family loop is hand-rolled zero-alloc, the cached diagonal_theta map removed the per-fit Vec, and the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields, so this count is faer-version/machine specific. Dropped from the prior 8000 because `chol_lower` now factors in place. If faer changes its Cholesky internals, update — do not relax.
 
     let (x, y, pid, eids, cluster) = multi_dataset(true, 2);
     let targets: Vec<u32> = vec![1, 2];
@@ -1145,8 +1233,9 @@ fn lmm_fit_general_warm_path_bounded_alloc() {
 fn lmm_fit_crossed_slope_warm_path_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    // Measured ~46100 (this machine, faer 0.x): ~460 blocks/fit = the dim≈31
-    // tail `llt` internals × the ~50–90 BOBYQA evals of a 6-θ fit. ALL faer-
+    // Measured ~5004 (this machine, faer 0.x, 2026-09-05): the per-eval Cholesky
+    // now runs through `chol_lower`'s own scratch buffer at `Par::Seq` instead
+    // of `MatRef::llt`, so it never touches faer's global rayon pool. ALL faer-
     // internal — `reml_deviance_blocked` itself is zero-alloc (every buffer is
     // in `blocked_*` scratch; only a stack `lam_g`). faer-version/machine
     // specific; if faer changes its Cholesky internals, update — do not relax.
@@ -1200,7 +1289,17 @@ fn lmm_fit_crossed_slope_warm_path_bounded_alloc() {
 
 /// n=64, p=2 (intercept + x1), 8 clusters, y carries u₀ + u₁·x1.
 fn slope_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>) {
-    let (n, nc) = (64usize, 8usize);
+    slope_dataset_sized(64, 8)
+}
+
+/// `slope_dataset`, generalized over row/cluster count — the dual-call cost
+/// table's size axis needs this slope-primary shape at 3,000/30,000 rows.
+/// No balance parameter: `precompute_balanced_collapse` requires a q_p=1
+/// primary (`kernel.rs`'s `g.primary_q != 1` guard), and this shape's
+/// primary carries a slope (q_p=2), so it never arms the collapse regardless
+/// of cluster balance — a skewed variant would tell the cost table nothing
+/// the balanced one doesn't already show.
+fn slope_dataset_sized(n: usize, nc: usize) -> (Mat<f64>, Vec<f64>, Vec<u32>) {
     let mut st = 71u64;
     let u0: Vec<f64> = (0..nc).map(|_| 0.5 * lcg(&mut st)).collect();
     let u1: Vec<f64> = (0..nc).map(|_| 0.3 * lcg(&mut st)).collect();
@@ -1216,6 +1315,103 @@ fn slope_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>) {
         y[i] = 0.5 + 0.4 * x1 + u0[c] + u1[c] * x1 + 0.8 * lcg(&mut st);
     }
     (x, y, ids)
+}
+
+/// A crossed-tail LMM dataset with the shape the speed grid's `cross*` cells
+/// have: an intercept (or intercept+slope) primary at `nc` levels plus
+/// `n_extra` crossed factors of `levels` levels each, `p = 2`. The tail the
+/// deviance factors is `t_dim = n_extra·levels + p + 1` — 93 at
+/// `(3, 30)` and 153 at `(5, 30)`, matching `cross4_g3000p5` and
+/// `cross6_g30000p5`. `skew` uses the same ~20%-of-clusters-draw-~80%-of-rows
+/// recipe as `hand_dataset_sized`, applied to the PRIMARY only: the collapse's
+/// balance test reads the primary counts (and the nested-child counts, of which
+/// there are none here), so skewing the crossed factors would not disarm it.
+/// `slope` puts a random slope on x-column 1, taking the primary to `q_p = 2`
+/// — that shape never arms the collapse, and exists only to push `n_theta` to
+/// the `D12` rung (`3 + n_extra`).
+fn cross_dataset_sized(
+    n: usize,
+    nc: usize,
+    n_extra: usize,
+    levels: usize,
+    slope: bool,
+    skew: bool,
+) -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<Vec<u32>>) {
+    let mut st = 3307u64;
+    let u_p: Vec<f64> = (0..nc).map(|_| 0.5 * lcg(&mut st)).collect();
+    let u_s: Vec<f64> = (0..nc).map(|_| 0.3 * lcg(&mut st)).collect();
+    let u_e: Vec<Vec<f64>> = (0..n_extra)
+        .map(|_| (0..levels).map(|_| 0.4 * lcg(&mut st)).collect())
+        .collect();
+    let mut x = Mat::<f64>::zeros(n, 2);
+    let mut y = vec![0.0f64; n];
+    let mut pid = vec![0u32; n];
+    let mut eids = vec![vec![0u32; n]; n_extra];
+    let n_heavy = if nc < 2 {
+        0
+    } else {
+        ((nc as f64 * 0.2).round() as usize).clamp(1, nc - 1)
+    };
+    for i in 0..n {
+        let c = if !skew || nc < 2 {
+            i % nc
+        } else {
+            let r = lcg(&mut st) + 0.5; // in [0, 1)
+            let raw = if r < 0.8 {
+                (r / 0.8) * n_heavy as f64
+            } else {
+                n_heavy as f64 + ((r - 0.8) / 0.2) * (nc - n_heavy) as f64
+            };
+            (raw as usize).min(nc - 1)
+        };
+        pid[i] = c as u32;
+        let x1 = lcg(&mut st);
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = x1;
+        let mut yi = 0.5 + 0.4 * x1 + u_p[c] + 0.8 * lcg(&mut st);
+        if slope {
+            yi += u_s[c] * x1;
+        }
+        for g in 0..n_extra {
+            // Each factor gets its own stride so the crossed levels are not all
+            // aligned with each other (aligned factors would be one factor).
+            let l = (i / (g + 1)) % levels;
+            eids[g][i] = l as u32;
+            yi += u_e[g][l];
+        }
+        y[i] = yi;
+    }
+    (x, y, pid, eids)
+}
+
+/// The `LmmGroupings` matching `cross_dataset_sized`'s layout. `n_theta` is
+/// `1 + n_extra` without a slope and `3 + n_extra` with one.
+fn cross_groupings(
+    nc: usize,
+    n_extra: usize,
+    levels: usize,
+    slope: bool,
+    n: usize,
+) -> LmmGroupings {
+    let cluster = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: nc as u32,
+            },
+            slopes: if slope { vec![0] } else { vec![] },
+            extra_groupings: (0..n_extra)
+                .map(|_| Grouping {
+                    relation: GroupingRelation::Crossed {
+                        n_clusters: levels as u32,
+                    },
+                    slopes: vec![],
+                })
+                .collect(),
+        }),
+    };
+    let slope_cols: &[usize] = if slope { &[1] } else { &[] };
+    LmmGroupings::from_cluster_spec(&cluster, n, slope_cols)
 }
 
 /// n=96, p=3 (intercept + x1 + x2), 8 clusters, y carries u₀ + u₁·x1 + u₂·x2.
@@ -1355,16 +1551,24 @@ fn brute_force_slope_deviance(
 }
 
 fn slope_groupings() -> LmmGroupings {
-    // 8 primary clusters, one slope on x_full col 1; no extras.
+    slope_groupings_sized(64, 8)
+}
+
+/// `slope_groupings`, generalized over row/cluster count to match
+/// `slope_dataset_sized`.
+fn slope_groupings_sized(n: usize, nc: usize) -> LmmGroupings {
+    // nc primary clusters, one slope on x_full col 1; no extras.
     let cluster = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            sizing: Sizing::FixedClusters {
+                n_clusters: nc as u32,
+            },
             slopes: vec![0],
             extra_groupings: vec![],
         }),
     };
-    LmmGroupings::from_cluster_spec(&cluster, 64, &[1])
+    LmmGroupings::from_cluster_spec(&cluster, n, &[1])
 }
 
 fn multislope_groupings() -> LmmGroupings {
@@ -2435,15 +2639,17 @@ fn composed_nested_deviance_matches_brute_force() {
 
 /// Bounded-allocation twin — the standalone slope workspace
 /// allocates only faer `llt` internals on the warm `fit_lmm` loop, the same
-/// acceptance class as the q=1 / general twins.
-///   cargo test -p glmm --features alloc-tests lmm_fit_slope_warm_path_bounded_alloc -- --ignored
+/// acceptance class as the q=1 / general twins. `alloc_test_guard` serializes
+/// test bodies, but libtest's own per-test thread spawn still needs
+/// `--test-threads=1`:
+///   RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests lmm_fit_slope_warm_path_bounded_alloc -- --ignored --test-threads=1
 #[cfg(feature = "alloc-tests")]
 #[test]
 #[ignore]
 fn lmm_fit_slope_warm_path_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    const BOUND_SLOPE: u64 = 12000; // Measured 11400 (this machine) — ~114 blocks/fit of faer `llt` internals (one m×m tail llt per eval × ~54 evals on the blind 3-D q_p=2 surface; the family loop + primary Λ/Gram are zero-alloc scratch, the cached diagonal_theta map removed the per-fit Vec, and the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields). Higher total than q=1's 4600 only via the larger blind eval count, not a richer per-eval alloc — faer-version/machine specific. If faer's Cholesky internals change, update — do not relax.
+    const BOUND_SLOPE: u64 = 5500; // Measured 5200 (this machine) — ~52 blocks/fit of faer `llt` internals (one m×m tail llt per eval × ~54 evals on the blind 3-D q_p=2 surface; the family loop + primary Λ/Gram are zero-alloc scratch, the cached diagonal_theta map removed the per-fit Vec, and the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields). Higher total than q=1's 2500 only via the larger blind eval count, not a richer per-eval alloc — faer-version/machine specific. Dropped from the prior 11400 because `chol_lower` now factors in place. If faer's Cholesky internals change, update — do not relax.
 
     let (x, y, ids) = slope_dataset();
     let targets: Vec<u32> = vec![1];
@@ -2843,7 +3049,11 @@ impl FixedSeedThetaLmm {
 
 /// θ-layout diagonal indices per gate shape — column-major vech, so `q2s`
 /// (q=2) is `[0, 2]` and `q3s` (q=3) is `[0, 3, 5]`; `nest2`'s two scalars
-/// (primary + one nested extra) are both diagonal.
+/// (primary + one nested extra) are both diagonal. `cross3`/`cross5` have an
+/// intercept-only (q=1) primary plus `n_extra` scalar crossed factors, so
+/// every one of their `1 + n_extra` entries is diagonal. `cross6s`'s q=2
+/// slope primary puts one off-diagonal entry (index 1) ahead of its six
+/// scalar crossed factors.
 fn fixed_seed_theta_lmm(shape: &str, state: u64) -> FixedSeedThetaLmm {
     match shape {
         "int1" => FixedSeedThetaLmm {
@@ -2866,8 +3076,66 @@ fn fixed_seed_theta_lmm(shape: &str, state: u64) -> FixedSeedThetaLmm {
             n_theta: 6,
             diag: vec![0, 3, 5],
         },
+        "cross3" => FixedSeedThetaLmm {
+            state,
+            n_theta: 4,
+            diag: vec![0, 1, 2, 3],
+        },
+        "cross5" => FixedSeedThetaLmm {
+            state,
+            n_theta: 6,
+            diag: (0..6).collect(),
+        },
+        // q_p=2 primary's vech is [λ00, λ10, λ11] (indices 0..2), so index 1
+        // is the only off-diagonal entry; indices 3..9 are the six crossed
+        // factors' scalar variances, all diagonal.
+        "cross6s" => FixedSeedThetaLmm {
+            state,
+            n_theta: 9,
+            diag: vec![0, 2, 3, 4, 5, 6, 7, 8],
+        },
         other => panic!("unknown LMM gate shape {other}"),
     }
+}
+
+/// `lmm_gate_fixture`'s `nest2` construction, generalized over row count and
+/// primary cluster count (`n`, `nc` vary independently, `n` a multiple of
+/// `nc` — child count is always `2*nc`). Preserves the original row→cluster
+/// mapping exactly: the primary stays `Sizing::FixedSize { cluster_size: n /
+/// nc }` (contiguous blocks of `n / nc` rows, `cluster_of_row(i) = i /
+/// cluster_size` — `src/spec.rs`), NOT `FixedClusters` (`i % n_clusters`,
+/// round-robin) — the two only happen to agree on `pid[i]` when `n / nc == 1`.
+/// Same seed `5101`, same draw order as the original bespoke construction, so
+/// `nest_dataset_sized(64, 8)` reproduces it row for row (`cluster_size =
+/// 64/8 = 8`, matching the original `FixedSize { cluster_size: 8 }`).
+fn nest_dataset_sized(n: usize, nc: usize) -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<u32>) {
+    assert!(
+        n % nc == 0,
+        "nest_dataset_sized: n={n} must be a multiple of nc={nc} for every cluster to keep the same size"
+    );
+    let mut cluster = intercept_only_spec(Sizing::FixedSize {
+        cluster_size: (n / nc) as u32,
+    });
+    cluster.re.as_mut().unwrap().extra_groupings.push(Grouping {
+        relation: GroupingRelation::NestedWithin { n_per_parent: 2 },
+        slopes: vec![],
+    });
+    let mut st = 5101u64;
+    let mut x = Mat::<f64>::zeros(n, 2);
+    let mut y = vec![0.0f64; n];
+    let mut pid = vec![0u32; n];
+    let mut cid = vec![0u32; n];
+    let u_p: Vec<f64> = (0..nc).map(|_| 0.5 * lcg(&mut st)).collect();
+    let u_c: Vec<f64> = (0..2 * nc).map(|_| 0.3 * lcg(&mut st)).collect();
+    for i in 0..n {
+        pid[i] = cluster.re.as_ref().unwrap().sizing.cluster_of_row(i) as u32;
+        cid[i] = extra_level_of_row(&cluster, 0, i) as u32;
+        let x1 = lcg(&mut st);
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = x1;
+        y[i] = 0.5 + 0.4 * x1 + u_p[pid[i] as usize] + u_c[cid[i] as usize] + 0.8 * lcg(&mut st);
+    }
+    (x, y, pid, cid)
 }
 
 /// One (x, y, primary ids, extra ids, groupings, primary-slope x-cols, p)
@@ -2895,32 +3163,13 @@ fn lmm_gate_fixture(
             (x, y, ids, vec![], LmmGroupings::single(6), vec![], 3)
         }
         "nest2" => {
+            let (x, y, pid, cid) = nest_dataset_sized(64, 8);
             let mut cluster = intercept_only_spec(Sizing::FixedSize { cluster_size: 8 });
             cluster.re.as_mut().unwrap().extra_groupings.push(Grouping {
                 relation: GroupingRelation::NestedWithin { n_per_parent: 2 },
                 slopes: vec![],
             });
-            let n = 4 * model_atom(&cluster); // 64
-            let mut st = 5101u64;
-            let mut x = Mat::<f64>::zeros(n, 2);
-            let mut y = vec![0.0f64; n];
-            let mut pid = vec![0u32; n];
-            let mut cid = vec![0u32; n];
-            let u_p: Vec<f64> = (0..8).map(|_| 0.5 * lcg(&mut st)).collect();
-            let u_c: Vec<f64> = (0..16).map(|_| 0.3 * lcg(&mut st)).collect();
-            for i in 0..n {
-                pid[i] = cluster.re.as_ref().unwrap().sizing.cluster_of_row(i) as u32;
-                cid[i] = extra_level_of_row(&cluster, 0, i) as u32;
-                let x1 = lcg(&mut st);
-                x[(i, 0)] = 1.0;
-                x[(i, 1)] = x1;
-                y[i] = 0.5
-                    + 0.4 * x1
-                    + u_p[pid[i] as usize]
-                    + u_c[cid[i] as usize]
-                    + 0.8 * lcg(&mut st);
-            }
-            let groupings = LmmGroupings::from_cluster_spec(&cluster, n, &[]);
+            let groupings = LmmGroupings::from_cluster_spec(&cluster, 64, &[]);
             (x, y, pid, vec![cid], groupings, vec![], 2)
         }
         "q2s" => {
@@ -2932,6 +3181,79 @@ fn lmm_gate_fixture(
             (x, y, ids, vec![], multislope_groupings(), vec![1, 2], 3)
         }
         other => panic!("unknown LMM gate shape {other}"),
+    }
+}
+
+/// `lmm_gate_fixture`'s `int1`/`q2s`/`nest2` shapes, generalized over row
+/// count, primary cluster count, and (where a slope primary does not already
+/// rule it out) cluster balance — the dual-call cost table's size axis. Also
+/// serves the new crossed shapes `cross3`/`cross5`/`cross6s` (see
+/// `cross_dataset_sized`). `q3s` is left at its fixed size: it has a slope
+/// primary, like `q2s`, and tells the balanced-collapse story nothing `q2s`
+/// doesn't already. `q2s`/`nest2`/`cross6s` never take `skew = true` — `q2s`
+/// and `cross6s` have a slope primary (see `slope_dataset_sized`'s doc
+/// comment), and `nest2` has no skewed variant defined.
+#[allow(clippy::type_complexity)]
+fn lmm_gate_fixture_sized(
+    shape: &str,
+    n: usize,
+    nc: usize,
+    skew: bool,
+) -> (
+    Mat<f64>,
+    Vec<f64>,
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    LmmGroupings,
+    Vec<usize>,
+    usize,
+) {
+    match shape {
+        "int1" => {
+            let (x, y, ids) = hand_dataset_sized(n, nc, skew);
+            (x, y, ids, vec![], LmmGroupings::single(nc), vec![], 3)
+        }
+        "q2s" => {
+            assert!(
+                !skew,
+                "q2s has a slope primary and never arms the balanced collapse; no skewed variant exists"
+            );
+            let (x, y, ids) = slope_dataset_sized(n, nc);
+            (x, y, ids, vec![], slope_groupings_sized(n, nc), vec![1], 2)
+        }
+        "nest2" => {
+            assert!(
+                !skew,
+                "nest2 has no skewed variant — see nest_dataset_sized"
+            );
+            let (x, y, pid, cid) = nest_dataset_sized(n, nc);
+            let mut cluster = intercept_only_spec(Sizing::FixedSize {
+                cluster_size: (n / nc) as u32,
+            });
+            cluster.re.as_mut().unwrap().extra_groupings.push(Grouping {
+                relation: GroupingRelation::NestedWithin { n_per_parent: 2 },
+                slopes: vec![],
+            });
+            let groupings = LmmGroupings::from_cluster_spec(&cluster, n, &[]);
+            (x, y, pid, vec![cid], groupings, vec![], 2)
+        }
+        "cross3" => {
+            let (x, y, pid, eids) = cross_dataset_sized(n, nc, 3, 30, false, skew);
+            let groupings = cross_groupings(nc, 3, 30, false, n);
+            (x, y, pid, eids, groupings, vec![], 2)
+        }
+        "cross5" => {
+            let (x, y, pid, eids) = cross_dataset_sized(n, nc, 5, 30, false, skew);
+            let groupings = cross_groupings(nc, 5, 30, false, n);
+            (x, y, pid, eids, groupings, vec![], 2)
+        }
+        "cross6s" => {
+            assert!(!skew, "cross6s has a slope primary; no skewed variant");
+            let (x, y, pid, eids) = cross_dataset_sized(n, nc, 6, 30, true, false);
+            let groupings = cross_groupings(nc, 6, 30, true, n);
+            (x, y, pid, eids, groupings, vec![1], 2)
+        }
+        other => panic!("lmm_gate_fixture_sized: unsupported shape {other}"),
     }
 }
 
@@ -2953,6 +3275,12 @@ fn reml_gradient_matches_dense_score_per_shape() {
             LmmDualScratch::for_groupings(n_theta, p, &groupings).unwrap_or_else(|| {
                 panic!("{shape}: n_theta {n_theta} exceeds the instantiated lane set")
             });
+        if shape == "q3s" {
+            assert!(
+                matches!(scratch, LmmDualScratch::D6(_)),
+                "n_theta 6 must take the D6 rung, not D8"
+            );
+        }
         let mut rng = fixed_seed_theta_lmm(shape, 6001);
         debug_assert_eq!(
             rng.n_theta, n_theta,
@@ -2984,9 +3312,115 @@ fn reml_gradient_matches_dense_score_per_shape() {
     }
 }
 
+/// A chunked gradient is bit-for-bit a single wide pass. `q3s` has n_θ = 6, so
+/// a `Dual<6>` scratch seeds it in ONE pass while a `Dual<4>` scratch seeds it
+/// in two (coordinates 0..4, then 4..6). Forward-mode lanes are independent, so
+/// every entry must be EXACTLY equal — not close. This is the property the
+/// chunked gradient rests on; a difference means some operation in `dual.rs`
+/// mixes lanes.
+#[test]
+fn chunked_gradient_is_bit_identical_to_one_pass() {
+    let (x, y, primary_ids, extra_ids, groupings, _slope_cols, p) = lmm_gate_fixture("q3s");
+    let mut suff = LmmSuffStats::with_groupings(p, groupings.clone());
+    suff.add_rows_multi(x.as_ref(), &y, &primary_ids, &extra_ids, None);
+    let n_theta = groupings.n_theta();
+    assert_eq!(n_theta, 6);
+    let mut one = LmmDualScratch::D6(LmmFitScratch::with_groupings(p, &groupings));
+    let mut two = LmmDualScratch::D4(LmmFitScratch::with_groupings(p, &groupings));
+    let mut rng = fixed_seed_theta_lmm("q3s", 6001);
+    for draw in 0..10 {
+        let theta = rng.next_theta();
+        let mut g1 = vec![0.0; n_theta];
+        let mut g2 = vec![0.0; n_theta];
+        assert!(matches!(
+            reml_gradient(&theta, &suff, &mut one, &mut g1),
+            DerivStatus::Ok(_)
+        ));
+        assert!(matches!(
+            reml_gradient(&theta, &suff, &mut two, &mut g2),
+            DerivStatus::Ok(_)
+        ));
+        assert_eq!(g1, g2, "draw {draw} θ={theta:?}: one pass vs two chunks");
+    }
+}
+
+/// The chunked gradient reaches a shape no single instantiated rung covers:
+/// a `q_p = 8` primary has n_θ = 36, three `Dual<12>` passes. Checked against
+/// `dense_reml_score`, the same independent textbook criterion
+/// `reml_gradient_matches_dense_score_per_shape` uses, at the same `1e-8`
+/// relative band — the REML criterion has no PIRLS inside it, so there is no
+/// mode error to loosen the band for.
+#[test]
+fn chunked_gradient_reaches_n_theta_36() {
+    let (nc, n, p) = (30usize, 300usize, 8usize);
+    let slope_cols: Vec<usize> = (1..8).collect();
+    let mut st = 8801u64;
+    let u: Vec<Vec<f64>> = (0..8)
+        .map(|_| (0..nc).map(|_| 0.4 * lcg(&mut st)).collect())
+        .collect();
+    let mut x = Mat::<f64>::zeros(n, p);
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        let c = i % nc;
+        ids[i] = c as u32;
+        x[(i, 0)] = 1.0;
+        let mut yi = 0.5 + u[0][c] + 0.8 * lcg(&mut st);
+        for d in 1..p {
+            let xd = lcg(&mut st);
+            x[(i, d)] = xd;
+            yi += 0.2 * xd + u[d][c] * xd;
+        }
+        y[i] = yi;
+    }
+    let cluster = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: nc as u32,
+            },
+            slopes: (0..7).collect(),
+            extra_groupings: vec![],
+        }),
+    };
+    let groupings = LmmGroupings::from_cluster_spec(&cluster, n, &slope_cols);
+    let n_theta = groupings.n_theta();
+    assert_eq!(n_theta, 36, "q_p = 8 must give vech length 36");
+    let mut suff = LmmSuffStats::with_groupings(p, groupings.clone());
+    suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
+    let z = dense_z(&groupings, &ids, &[], &x, &slope_cols);
+    let mut scratch = LmmDualScratch::for_groupings(n_theta, p, &groupings)
+        .expect("the gradient ladder covers every n_theta");
+    assert!(
+        matches!(scratch, LmmDualScratch::D12(_)),
+        "top rung expected"
+    );
+    // Diagonal-positive θ; the diagonal indices come from the groupings' own
+    // cached map rather than a hand-written vech offset list.
+    let mut theta = vec![0.15_f64; n_theta];
+    for &d in groupings.diagonal_theta() {
+        theta[d] = 0.6;
+    }
+    let mut grad = vec![0.0; n_theta];
+    assert!(matches!(
+        reml_gradient(&theta, &suff, &mut scratch, &mut grad),
+        DerivStatus::Ok(_)
+    ));
+    let want = dense_reml_score(&theta, z.as_ref(), x.as_ref(), &y, &groupings);
+    for j in 0..n_theta {
+        let band = 1e-8 * want[j].abs().max(1.0);
+        assert!(
+            (grad[j] - want[j]).abs() <= band,
+            "coord {j}: chunked {} vs dense {}",
+            grad[j],
+            want[j]
+        );
+    }
+}
+
 /// Gate (b): `reml_hessian` vs. central FD of `reml_gradient` (step `1e-5`,
 /// band `1e-6` relative), same shapes, plus exact `hess[(i,j)] ==
-/// hess[(j,i)]` symmetry. `q3s` reaches `n_θ = 6`, so `N = 8` is the largest
+/// hess[(j,i)]` symmetry. `q3s` reaches `n_θ = 6`, so `N = 6` is the largest
 /// lane count either gate exercises.
 #[test]
 fn reml_hessian_matches_fd_of_gradient_per_shape() {
@@ -3066,6 +3500,255 @@ fn reml_hessian_matches_fd_of_gradient_per_shape() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// LMM twin of `glmm::tests::glmm_dual_call_cost_table` — per-call wall cost
+/// of the plain `f64` REML deviance vs. its `Dual<N>` gradient vs. its
+/// `HyperDual<N,H>` gradient+Hessian, at fixed θ, across `n_theta` rungs
+/// **and** a row-count axis. An instrument, not a gate.
+///
+/// Rung coverage: unlike the GLMM side, the lane pick here is on `n_theta`
+/// alone (`run_reml_hessian` refuses `n_theta > N`; `run_reml_gradient` has
+/// no refusal — above the top rung it runs `⌈n_theta / 12⌉` passes of
+/// `Dual<12>` instead), not `n_theta + p`, so padding `p` cannot move the
+/// rung — the shape itself
+/// must carry more θ. `int1`/`nest2`/`q2s`/`q3s` give n_θ = 1, 2, 3, 6 — D4
+/// through D6. `cross3`/`cross5` add n_θ = 4, 6 (D4, D6); `cross6s`
+/// (n_θ = 9, a slope primary plus six crossed factors) is the first fixture
+/// in this file to reach the D12 rung. `reml_gradient`/`reml_hessian` also
+/// refuse `extra_slopes_any` shapes (`kernel.rs`), but none of these are —
+/// `nest2`'s and the `cross*` shapes' extra groupings carry no slope, so they
+/// are unaffected. `n_theta` is structural, like GLMM's `m`, so it does not
+/// move with row count — every size tier below repeats the same rung.
+///
+/// Size and balance coverage: a profile on the speed grid found the
+/// mechanism this table exists to isolate — on a **balanced** design the
+/// `f64` REML objective takes `precompute_balanced_collapse`'s fast path
+/// (`kernel.rs:370`, gated on `primary_q == 1`: a plain-intercept primary),
+/// skipping the whole per-family loop and the syrk that `f64` would
+/// otherwise share with `Dual`/`HyperDual`; both the dual and hyper scalars
+/// arm the same collapse (`reml_gradient`/`reml_hessian` call
+/// `precompute_balanced_collapse` on every call), so the balanced/skewed
+/// split isolates the collapse's own saving on both sides. A table with
+/// only balanced rows cannot show this, because it never isolates the
+/// collapse's own saving from the dual/hyper overhead. So every q_p=1
+/// primary shape (`int1`, `nest2`, `cross3`, `cross5`) is generalized over
+/// both size and a `balance` column: `bal` (unchanged `i % nc` assignment)
+/// vs. `skew` (~20% of clusters draw ~80% of rows, mirroring
+/// `campaigns/speed-grid/prep.R`'s own skew recipe). The `armed` column
+/// prints whether `precompute_balanced_collapse` actually took the fast path
+/// on that row's `f64` fit, so a row cannot silently claim a collapse it did
+/// not take. The predicate is the same for both scalars — it reads `suff`
+/// alone, not the scratch type — so one `armed` column speaks for all three.
+/// `q2s`/`q3s`/`cross6s` (slope primaries) never arm the collapse
+/// regardless of balance, so they get the size axis (where generalized)
+/// without a skew variant — see `slope_dataset_sized`'s doc comment. `q3s`
+/// keeps only its original fixed-size row: like `q2s`, it has a slope
+/// primary and so would add no new information. New size tiers use
+/// `nc = n / 20`: `prep.R`'s `per_group = 20` is the one rows-per-cluster
+/// value its own generator uses at every one of its three size magnitudes,
+/// so it is the ratio mirrored here rather than invented.
+///
+/// Timing method: adaptive repetition count — see
+/// `glmm::tests::glmm_dual_call_cost_table`'s doc comment for the full
+/// rationale (fixed `R = 20` is both too slow for a 30,000-row `HyperDual`
+/// cell and too few reps for the small fixtures' noise floor). One probe
+/// call sizes the rest to `BUDGET_NS`, floored at `REP_FLOOR` total calls;
+/// the count actually used is printed per quantity.
+///
+/// Run: `cargo test -p glmm --release lmm_dual_call_cost_table -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn lmm_dual_call_cost_table() {
+    // Serialized under alloc-tests so its allocations can't land in a
+    // concurrent dhat profiler window on an `-- --ignored` run.
+    #[cfg(feature = "alloc-tests")]
+    let _serial = crate::test_support::alloc_test_guard();
+    use std::time::Instant;
+
+    const BUDGET_NS: u128 = 3_000_000_000;
+    const REP_FLOOR: usize = 3;
+    const REP_CAP: usize = 200_000; // bounds the loop for cells so cheap the budget implies absurd rep counts
+
+    /// Returns `(min_ns_over_the_timed_calls, reps_used, impractical)`.
+    fn adaptive_call_ns(mut call: impl FnMut()) -> (u128, usize, bool) {
+        let t0 = Instant::now();
+        call();
+        let probe = t0.elapsed().as_nanos().max(1);
+        if probe > BUDGET_NS {
+            return (probe, 1, true);
+        }
+        let reps = ((BUDGET_NS / probe).max(REP_FLOOR as u128) as usize).min(REP_CAP);
+        let mut best = u128::MAX;
+        for _ in 0..reps - 1 {
+            let t = Instant::now();
+            call();
+            best = best.min(t.elapsed().as_nanos());
+        }
+        (best, reps, false)
+    }
+
+    // Slope-primary shapes (q2s, q3s) never arm the collapse (`primary_q ==
+    // 1` guard), so their balance is reported as "n/a" rather than "bal" —
+    // the label would otherwise imply a comparison this shape can't make.
+    fn balance_label(shape: &str, skew: bool) -> &'static str {
+        match shape {
+            "int1" | "nest2" | "cross3" | "cross5" => {
+                if skew {
+                    "skew"
+                } else {
+                    "bal"
+                }
+            }
+            _ => "n/a",
+        }
+    }
+
+    println!(
+        "engine\tfixture\tbalance\tarmed\tn_rows\tn_theta\tp\tm\trung\tf64_reps\tdual_reps\thyper_reps\tf64_ns\tdual_ns\thyper_ns\tdual_over_f64\thyper_over_f64"
+    );
+
+    // `None` = the original fixed fixture (unchanged, via `lmm_gate_fixture`);
+    // `Some((n, nc, skew))` = a size-axis tier via `lmm_gate_fixture_sized`.
+    type SizeTier = (usize, usize, bool);
+    let cells: &[(&str, Option<SizeTier>)] = &[
+        ("int1", None),
+        ("int1", Some((3000, 150, false))),
+        ("int1", Some((3000, 150, true))),
+        ("int1", Some((30_000, 1500, false))),
+        ("int1", Some((30_000, 1500, true))),
+        ("nest2", None),
+        ("q2s", None),
+        ("q2s", Some((3000, 150, false))),
+        ("q2s", Some((30_000, 1500, false))),
+        ("q3s", None),
+        ("nest2", Some((3000, 150, false))),
+        ("nest2", Some((30_000, 1500, false))),
+        ("cross3", Some((3000, 600, false))),
+        ("cross3", Some((3000, 600, true))),
+        ("cross5", Some((30_000, 6000, false))),
+        ("cross5", Some((30_000, 6000, true))),
+        ("cross6s", Some((3000, 600, false))),
+    ];
+
+    for &(shape, tier) in cells {
+        let (x, y, primary_ids, extra_ids, groupings, _slope_cols, p) = match tier {
+            None => lmm_gate_fixture(shape),
+            Some((n, nc, skew)) => lmm_gate_fixture_sized(shape, n, nc, skew),
+        };
+        let skew = tier.map(|(_, _, s)| s).unwrap_or(false);
+        let balance = balance_label(shape, skew);
+        let n_rows = x.nrows();
+        let mut suff = LmmSuffStats::with_groupings(p, groupings.clone());
+        suff.add_rows_multi(x.as_ref(), &y, &primary_ids, &extra_ids, None);
+        let n_theta = groupings.n_theta();
+        let mut rng = fixed_seed_theta_lmm(shape, 9001);
+        let theta = rng.next_theta();
+
+        let mut fit_f64 = LmmFitScratch::<f64>::with_groupings(p, &groupings);
+        // The production `f64` path arms the collapse once per fit
+        // (`fit_lmm_impl`), so a table that times `reml_deviance::<f64>` on a
+        // bare scratch times the fallback loop and the balanced/skewed rows say
+        // nothing. `armed` is printed once so a row cannot silently claim a
+        // collapse it did not take.
+        let armed = precompute_balanced_collapse(&suff, &mut fit_f64);
+        // `reml_gradient`/`reml_hessian` call `precompute_balanced_collapse`
+        // on every call (production arms once per gradient call), so the
+        // `f64` timed closure re-arms it here too — otherwise this side pays
+        // zero precomputes per timed call while the dual/hyper side pays one,
+        // and `dual_over_f64`/`hyper_over_f64` would overstate the dual cost
+        // on exactly the balanced high-`t_dim` cells this table exists to
+        // measure.
+        let (f64_ns, f64_reps, f64_impractical) = adaptive_call_ns(|| {
+            precompute_balanced_collapse(&suff, &mut fit_f64);
+            let _ = reml_deviance(&theta, &suff, &mut fit_f64);
+        });
+
+        let dual_scratch = LmmDualScratch::for_groupings(n_theta, p, &groupings);
+        let hyper_scratch = LmmHyperScratch::for_groupings(n_theta, p, &groupings);
+
+        let (dual_ns_str, dual_over, dual_reps, dual_impractical) = match dual_scratch {
+            Some(mut scratch) => {
+                let mut grad = vec![0.0; n_theta];
+                let mut status = false;
+                let (dual_ns, dual_reps, dual_impractical) = adaptive_call_ns(|| {
+                    status = matches!(
+                        reml_gradient(&theta, &suff, &mut scratch, &mut grad),
+                        DerivStatus::Ok(_)
+                    );
+                });
+                if status {
+                    (
+                        dual_ns.to_string(),
+                        format!("{:.2}", dual_ns as f64 / f64_ns as f64),
+                        dual_reps,
+                        dual_impractical,
+                    )
+                } else {
+                    (
+                        "NA".to_string(),
+                        "NA".to_string(),
+                        dual_reps,
+                        dual_impractical,
+                    )
+                }
+            }
+            None => ("NA".to_string(), "NA".to_string(), 0, false),
+        };
+
+        let (hyper_ns_str, hyper_over, hyper_reps, hyper_impractical) = match hyper_scratch {
+            Some(mut scratch) => {
+                let mut grad = vec![0.0; n_theta];
+                let mut hess = Mat::<f64>::zeros(n_theta, n_theta);
+                let mut status = false;
+                let (hyper_ns, hyper_reps, hyper_impractical) = adaptive_call_ns(|| {
+                    status = matches!(
+                        reml_hessian(&theta, &suff, &mut scratch, &mut grad, &mut hess),
+                        DerivStatus::Ok(_)
+                    );
+                });
+                if status {
+                    (
+                        hyper_ns.to_string(),
+                        format!("{:.2}", hyper_ns as f64 / f64_ns as f64),
+                        hyper_reps,
+                        hyper_impractical,
+                    )
+                } else {
+                    (
+                        "NA".to_string(),
+                        "NA".to_string(),
+                        hyper_reps,
+                        hyper_impractical,
+                    )
+                }
+            }
+            None => ("NA".to_string(), "NA".to_string(), 0, false),
+        };
+
+        let rung = match n_theta {
+            0..=4 => "D4",
+            5 => "D5",
+            6 => "D6",
+            7..=8 => "D8",
+            9..=12 => "D12",
+            _ => "NA",
+        };
+
+        let armed_str = if armed { "yes" } else { "no" };
+        println!(
+            "lmm\t{shape}\t{balance}\t{armed_str}\t{n_rows}\t{n_theta}\t{p}\t{n_theta}\t{rung}\t{f64_reps}\t{dual_reps}\t{hyper_reps}\t{f64_ns}\t{dual_ns_str}\t{hyper_ns_str}\t{dual_over}\t{hyper_over}"
+        );
+        if f64_impractical {
+            println!("# note: {shape}/{balance}/n={n_rows} f64 probe alone exceeded the {BUDGET_NS}ns budget; reporting a single call, not a minimum");
+        }
+        if dual_impractical {
+            println!("# note: {shape}/{balance}/n={n_rows} dual probe alone exceeded the {BUDGET_NS}ns budget; reporting a single call, not a minimum");
+        }
+        if hyper_impractical {
+            println!("# note: {shape}/{balance}/n={n_rows} hyper probe alone exceeded the {BUDGET_NS}ns budget; reporting a single call, not a minimum");
         }
     }
 }

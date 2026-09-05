@@ -78,7 +78,7 @@ pub(crate) struct LmmResultView<'a> {
     /// Derivative diagnostics, computed in [`lmm_run_on`] (the one place the
     /// suff stats are in scope): the box-projected θ-gradient ∞-norm of the
     /// REML criterion at the accepted θ̂ (caller's θ units; NaN when no exact
-    /// gradient — extra slopes, `n_theta > 12`, non-converged), and the
+    /// gradient — extra slopes, non-converged), and the
     /// per-θ-coordinate boundary score `½·∂²D/∂θ_jj²·s_j²` (NaN except at
     /// pinned diagonals). Length `n_theta`.
     kkt_grad_norm: f64,
@@ -166,72 +166,107 @@ pub(crate) fn lmm_run_on<'a>(
 ) -> LmmResultView<'a> {
     let fit = fit_lmm(ws, target_indices, theta_start);
 
-    // W3 derivative diagnostics, from the exact dual-number REML derivatives
+    // Derivative diagnostics, from the exact dual-number REML derivatives
     // (`reml_gradient`/`reml_hessian`). Same box projection, the same opt-in
     // for the score, and the same `½·H_jj` boundary-score identity as the GLMM
     // block in `glmm::fit_glmm` — the θ box is the same one
     // (`blind_theta_and_bounds`), the scales come from the same
     // `theta_row_scales`, the gradient taking them once and the score twice.
-    // The scratch is built lazily per fit as a local: W2 leaves
-    // `LmmDualScratch`/`LmmHyperScratch` caller-owned, and this is their first
-    // caller. That allocates once per fit on the dense LMM route; the LMM
-    // alloc bounds profile `fit_lmm` directly, below this frame, so the
-    // scratch is outside their window. Hoisting it onto `LmmWorkspace` for
-    // zero-alloc warm refits is W5's call (its optimizer owns that state
-    // anyway). `Unsupported` (extra slopes, `n_theta > 12`) leaves NaN.
+    // Both scratches live on the workspace (`LmmWorkspace::dual_scratch` /
+    // `hyper_scratch`), built on the first request and reused by every later
+    // fit on the same workspace — a warm refit allocates nothing here. They are
+    // separate slots because the gradient and the score resolve to different
+    // scalar types. `Unsupported` (extra slopes) leaves NaN, and so does an
+    // absent score scratch: `LmmHyperScratch::for_groupings` is `None` above
+    // `n_theta = 12`, where the gradient's own scratch still resolves because
+    // `reml_gradient` chunks.
     let n_theta = ws.suff.groupings.n_theta();
     let mut kkt_grad_norm = f64::NAN;
     let mut boundary_score = vec![f64::NAN; n_theta];
     if fit.converged {
-        let g = &ws.suff.groupings;
         let p = ws.suff.m - 1;
-        let sc = g.theta_row_scales();
-        let diag = g.diagonal_theta();
-        if let Some(mut scratch) = crate::lmm::LmmDualScratch::for_groupings(n_theta, p, g) {
-            let mut grad = vec![0.0; n_theta];
-            let st =
-                crate::lmm::reml_gradient(&ws.theta[..n_theta], &ws.suff, &mut scratch, &mut grad);
-            if matches!(st, crate::glmm::DerivStatus::Ok(_)) {
-                let mut acc = 0.0_f64;
-                for j in 0..n_theta {
-                    let gj = grad[j];
-                    let is_diag = diag.contains(&j);
-                    let (lo, hi) = if is_diag {
-                        (0.0, crate::lmm::THETA_HI)
-                    } else {
-                        (-crate::lmm::THETA_HI, crate::lmm::THETA_HI)
-                    };
-                    // Projected gradient on a box, in the internal θ̃ where the
-                    // box lives; back-mapped by ×s_j (∂D/∂θ = s·∂D/∂θ̃) — see
-                    // the GLMM twin for the derivation.
-                    let pj = if ws.theta[j] <= lo {
-                        gj.min(0.0)
-                    } else if ws.theta[j] >= hi {
-                        gj.max(0.0)
-                    } else {
-                        gj
-                    };
-                    acc = acc.max((pj * sc[j]).abs());
+        // Owned, so it survives the two `&mut ws` destructures below; `diag`
+        // borrows the groupings and has to be re-derived inside each.
+        let sc = ws.suff.groupings.theta_row_scales();
+        if ws.dual_scratch.is_none() {
+            ws.dual_scratch =
+                crate::lmm::LmmDualScratch::for_groupings(n_theta, p, &ws.suff.groupings)
+                    .map(Box::new);
+        }
+        {
+            let LmmWorkspace {
+                suff,
+                theta,
+                dual_scratch,
+                ..
+            } = &mut *ws;
+            if let Some(scratch) = dual_scratch.as_deref_mut() {
+                let g = &suff.groupings;
+                let diag = g.diagonal_theta();
+                let mut grad = vec![0.0; n_theta];
+                let st = crate::lmm::reml_gradient(&theta[..n_theta], suff, scratch, &mut grad);
+                if matches!(st, crate::glmm::DerivStatus::Ok(_)) {
+                    let mut acc = 0.0_f64;
+                    for j in 0..n_theta {
+                        let gj = grad[j];
+                        let is_diag = diag.contains(&j);
+                        let (lo, hi) = if is_diag {
+                            (0.0, crate::lmm::THETA_HI)
+                        } else {
+                            (-crate::lmm::THETA_HI, crate::lmm::THETA_HI)
+                        };
+                        // Projected gradient on a box, in the internal θ̃ where the
+                        // box lives; back-mapped by ×s_j (∂D/∂θ = s·∂D/∂θ̃) — see
+                        // the GLMM twin for the derivation.
+                        let pj = if theta[j] <= lo {
+                            gj.min(0.0)
+                        } else if theta[j] >= hi {
+                            gj.max(0.0)
+                        } else {
+                            gj
+                        };
+                        acc = acc.max((pj * sc[j]).abs());
+                    }
+                    kkt_grad_norm = acc;
                 }
-                kkt_grad_norm = acc;
             }
         }
         if fit.pinned_components != 0 && want_score {
-            if let Some(mut scratch) = crate::lmm::LmmHyperScratch::for_groupings(n_theta, p, g) {
+            if ws.hyper_scratch.is_none() {
+                ws.hyper_scratch =
+                    crate::lmm::LmmHyperScratch::for_groupings(n_theta, p, &ws.suff.groupings)
+                        .map(Box::new);
+            }
+            let LmmWorkspace {
+                suff,
+                theta,
+                hyper_scratch,
+                ..
+            } = &mut *ws;
+            if let Some(scratch) = hyper_scratch.as_deref_mut() {
+                let g = &suff.groupings;
+                let diag = g.diagonal_theta();
                 let mut grad = vec![0.0; n_theta];
                 let mut hess = faer::Mat::<f64>::zeros(n_theta, n_theta);
                 let st = crate::lmm::reml_hessian(
-                    &ws.theta[..n_theta],
-                    &ws.suff,
-                    &mut scratch,
+                    &theta[..n_theta],
+                    suff,
+                    scratch,
                     &mut grad,
                     &mut hess,
                 );
                 if matches!(st, crate::glmm::DerivStatus::Ok(_)) {
                     for (kk, &ti) in diag.iter().enumerate() {
-                        if kk < u64::BITS as usize && (fit.pinned_components >> kk) & 1 == 1 {
+                        if kk < u64::BITS as usize
+                            && (fit.pinned_components >> kk) & 1 == 1
+                            && !g.diagonal_has_nonzero_below(kk, &theta[..n_theta])
+                        {
                             // s = θ_jj², θ̃ = sc·θ ⇒ dD/ds = sc²·dD/ds̃: the
-                            // score takes the SQUARE of the scale.
+                            // score takes the SQUARE of the scale. Valid only
+                            // where the deviance is even in θ_jj at θ_jj = 0
+                            // — see `LmmGroupings::diagonal_has_nonzero_below`
+                            // for why a non-zero entry below the diagonal
+                            // breaks that and rules the component out.
                             boundary_score[ti] = 0.5 * hess[(ti, ti)] * sc[ti] * sc[ti];
                         }
                     }
@@ -356,7 +391,7 @@ pub(crate) fn lmm_view_to_fit(
     };
 
     let mut diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
-    // W3 derivative diagnostics, computed in `lmm_run_on` and carried on the
+    // Derivative diagnostics, computed in `lmm_run_on` and carried on the
     // view (they do not pass through `FitDiagnostics` — same routing rule as
     // the GLMM side, see `fit/glmm.rs`). Both are NaN/empty already when the
     // fit did not converge (`lmm_run_on` gates the computation on it).

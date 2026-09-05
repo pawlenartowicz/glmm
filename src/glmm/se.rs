@@ -168,13 +168,11 @@ pub(crate) fn rx_cov_into(
 /// Two arms. On every shape `derivative::supports_shape` accepts — the blocked
 /// path (no extra groupings, which includes every AGQ shape) and the structured
 /// extras path — the joint Hessian is EXACT, from the hyper-dual kernel: no
-/// step, no stencil, no per-cell PIRLS re-solve. Two things send such a shape
-/// back to the stencil anyway: `m > MAX_DUAL_N` (12), and a θ̂ with a pinned
-/// crossed component (`derivative::extras_theta_pin_free`), which has no
-/// derivative lane. Everything below
-/// about `FD_STEP_BASE`, step-invariance, the corpus margin measurement and the
+/// step, no stencil, no per-cell PIRLS re-solve. One thing sends such a shape
+/// back to the stencil anyway: `m > MAX_DUAL_N` (12). Everything below about
+/// `FD_STEP_BASE`, step-invariance, the corpus margin measurement and the
 /// comparison against lme4's own `deriv12` describes the FD arm, which is what
-/// those two cases and the oversized-core dense fallback still run. (The sparse
+/// that case and the oversized-core dense fallback still run. (The sparse
 /// driver has its own stencil in `src/sparse/glmm.rs`.)
 ///
 /// FD scheme (tuned against `tests/fixtures/glmm_hessian_vcov.json`, the n=96 /
@@ -274,9 +272,9 @@ pub fn joint_hessian_cov(
     // matching `fit_glmm`'s hoist). Both live OUTSIDE the exact/FD branch below:
     // `fallback!()` restores `ws.params` from `fd_saved` and `rx_cov_into` reads
     // `z_buf` on both arms. STRICT SUPERSET of the exact branch's gate, not the
-    // same test: a structured shape whose θ̂ has a pinned crossed component
-    // needs `z_buf` filled and then takes the FD stencil, so collapsing the two
-    // would starve it.
+    // same test: `force_fd_hessian` and an `m > MAX_DUAL_N` refusal both send a
+    // structured shape to the stencil, which still needs `z_buf` filled, so
+    // collapsing the two would starve it.
     ws.fd_saved[..m].copy_from_slice(&ws.params[..m]);
     if ws.groupings.extra_offsets.is_empty() || ws.groupings.structured_extras_eligible() {
         let GlmmWorkspace {
@@ -298,6 +296,7 @@ pub fn joint_hessian_cov(
         () => {{
             let kk = ws.k.max(1);
             ws.u[..kk].copy_from_slice(&ws.u_seed[..kk]);
+            ws.prob[..n].copy_from_slice(&ws.fd_saved_prob[..n]);
         }};
     }
 
@@ -380,6 +379,7 @@ pub fn joint_hessian_cov(
     // this is the self-consistency the FD needed on every link, not a Gamma patch.
     let kk = ws.k.max(1);
     ws.u_seed[..kk].copy_from_slice(&ws.u[..kk]);
+    ws.fd_saved_prob[..n].copy_from_slice(&ws.prob[..n]);
     ws.warm_seed_active = true;
 
     // Exact hyper-dual joint Hessian wherever a dual kernel exists for the
@@ -388,15 +388,13 @@ pub fn joint_hessian_cov(
     // structured extras path. Differentiates the
     // final evaluation at the converged mode, so there is no stencil, no step,
     // no per-cell PIRLS re-solve and no FD-pass tolerance here. `Unsupported`
-    // (m > MAX_DUAL_N, or a pinned crossed θ̂ — `extras_theta_pin_free`) is a
-    // ROUTING answer, not an error: it falls THROUGH to the FD stencil. Only
-    // `NotConverged` — a real failure at the accepted point — routes to RX.
-    // What is left on the stencil is the oversized-core dense fallback and
-    // those two refusals; the sparse driver has its own twin in
-    // `src/sparse/glmm.rs`.
+    // (m > MAX_DUAL_N) is a ROUTING answer, not an error: it falls THROUGH to
+    // the FD stencil. Only `NotConverged` — a real failure at the accepted
+    // point — routes to RX. What is left on the stencil is the oversized-core
+    // dense fallback and that one refusal; the sparse driver has its own twin
+    // in `src/sparse/glmm.rs`.
     //
-    // The one owner is `derivative::supports_shape` (with its θ-valued
-    // companion `extras_theta_pin_free`) — do not inline either test.
+    // The one owner is `derivative::supports_shape` — do not inline the test.
     let mut used_exact = false;
     if super::derivative::supports_shape(&ws.groupings) && !ws.force_fd_hessian {
         // `std::mem::replace` (faer's `Mat` implements no `Default`, so
@@ -566,9 +564,9 @@ pub fn joint_hessian_cov(
     // That re-eval lands on û(γ̂) again but at the FD-pass tol, which is never
     // looser than the fit's, so it is at least as converged as the mode this call
     // was handed. Take the handed one back verbatim, so a second call on the same
-    // workspace seeds from the same vector and returns the same bits. The ≲1e-12
-    // it leaves between `ws.u` and the `ws.prob`/W̃ the re-eval just wrote is far
-    // below anything read off them.
+    // workspace seeds from the same vector and returns the same bits. `ws.prob`
+    // is put back beside `ws.u` (`fd_saved_prob`, snapshotted above) so the pair
+    // the caller reads comes from one solve, not this re-eval's separate one.
     restore_fd_mode!();
     ws.warm_seed_active = false; // never leak the FD seed into a later fit / BOBYQA
     ws.pirls_tol_override = None; // nor the FD-pass tol
@@ -764,6 +762,17 @@ pub(crate) fn structured_schur_fill(
     // M nonzeros (`m_core_buf` core slice + `cross_*`/`n_cross` crossed entries) the
     // converged re-eval's `build_packed_m` left behind — the dense `ws.m` is no
     // longer maintained on the structured path.
+    //
+    // This is the one `f64` reader of the `cross_col`/`n_cross`/`cross_val`
+    // triple that does not evaluate the deviance itself, so it depends on its
+    // callers having done so — `joint_hessian_cov`'s `fallback!()` central
+    // `fd_eval`, or `fit_glmm_ws`'s pinned re-eval. It must, because the
+    // pattern half of the triple is shared with the dual kernel while
+    // `cross_val` is dual-private (`derivative::ExtrasPattern`'s doc comment
+    // owns the invariant): at a θ̂ with a pinned crossed grouping a dual call
+    // leaves `cross_col`/`n_cross` WIDER than the last `f64` `cross_val`.
+    // Reading it un-refreshed does not panic — it picks up a stale θ from an
+    // earlier optimizer trial and returns a plausible wrong SE.
     for r in 0..p {
         for c in 0..k {
             ws.xtwm[(r, c)] = 0.0;

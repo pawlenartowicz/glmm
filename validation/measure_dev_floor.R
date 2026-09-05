@@ -71,8 +71,9 @@ is_benign <- function(a, b) {
 # route field, and a "sparse" substring in the dataset name is not the route --
 # e.g. sim_sparse_binomial_bigsd (46) IS sparse but sim_sparse_gamma (24) is
 # also sparse despite the family-first name; sim_slope_extra (7) has no
-# "sparse" in its name at all despite being sparse-routed).
-SPARSE_RUNGS <- c(7, 8, 9, 17, 18, 24, 38, 46)
+# "sparse" in its name at all despite being sparse-routed; sim_crossed_at_cap (17)
+# sits exactly at MAX_EXTRA_GROUPINGS and is dense -- sparse needs strictly more).
+SPARSE_RUNGS <- c(7, 8, 9, 18, 24, 38, 46)
 
 lme4 <- read_engine("lme4")
 mm   <- read_engine("mixedmodels")

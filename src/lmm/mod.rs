@@ -375,6 +375,15 @@ pub struct LmmGroupings {
     /// workspace by `compute_diagonal_theta` (the vech-diagonal walk lives there,
     /// single-sourced) so the per-fit pin loop borrows instead of reallocating.
     pub diagonal_theta: Vec<usize>,
+    /// Parallel to `diagonal_theta`: for diagonal `k` at column `d` of a
+    /// `q`-wide vech block, `q − d` — the diagonal's own vech run, diagonal
+    /// entry first, followed by its `q − d − 1` off-diagonal entries below it
+    /// in the same column, contiguous at `diagonal_theta[k] + 1 ..
+    /// diagonal_theta[k] + diagonal_run_len[k]` (column-major vech packs a
+    /// column's rows contiguously). `1` when the diagonal has no off-diagonal
+    /// below it. Computed once per workspace by `compute_diagonal_run_len`,
+    /// the companion walk to `compute_diagonal_theta`.
+    pub diagonal_run_len: Vec<usize>,
     /// Solver-path gate: true iff any extra grouping carries a random slope
     /// (`q_g > 1`). The scalar tail in `reml_deviance` stays byte-identical when
     /// false; the blocked per-factor `Λ_g` tail is taken when true.
@@ -456,6 +465,24 @@ fn compute_diagonal_theta(primary_q: usize, extra_qs: &[usize]) -> Vec<usize> {
     idx
 }
 
+/// Companion walk to `compute_diagonal_theta`, single source of truth for
+/// `LmmGroupings::diagonal_run_len`: for each diagonal, `q − d` where `d` is
+/// its column within its `q`-wide vech block. Must walk the same
+/// `(primary_q, extra_qs)` factor/column loop as `compute_diagonal_theta` —
+/// the two are kept as separate loops rather than one returning both, so a
+/// future edit to the walk itself has to be made in two obviously-named
+/// functions instead of silently drifting between a tuple and a caller
+/// working out which half is which.
+fn compute_diagonal_run_len(primary_q: usize, extra_qs: &[usize]) -> Vec<usize> {
+    let mut run_len = Vec::with_capacity(primary_q + extra_qs.len());
+    for &q in std::iter::once(&primary_q).chain(extra_qs.iter()) {
+        for d in 0..q {
+            run_len.push(q - d);
+        }
+    }
+    run_len
+}
+
 impl LmmGroupings {
     /// Single q=1 grouping shape.
     pub fn single(max_clusters: usize) -> Self {
@@ -469,6 +496,7 @@ impl LmmGroupings {
             primary_q: 1,
             primary_slope_cols: vec![],
             diagonal_theta: compute_diagonal_theta(1, &[]), // [0]
+            diagonal_run_len: compute_diagonal_run_len(1, &[]), // [1]
             extra_slopes_any: false,
             extra_q: vec![],
             extra_slope_cols: vec![],
@@ -605,6 +633,7 @@ impl LmmGroupings {
             primary_q: q_p,
             primary_slope_cols: slope_cols.to_vec(),
             diagonal_theta: compute_diagonal_theta(q_p, &extra_qs),
+            diagonal_run_len: compute_diagonal_run_len(q_p, &extra_qs),
             extra_slopes_any,
             extra_q: extra_qs,
             primary_slope_scales: vec![1.0; slope_cols.len()],
@@ -739,6 +768,25 @@ impl LmmGroupings {
         &self.diagonal_theta
     }
 
+    /// True iff pinned diagonal `k` (index into `diagonal_theta`) has a
+    /// non-zero off-diagonal entry below it in the same Λ column, at the
+    /// current `theta`.
+    ///
+    /// `boundary_score`'s ½·∂²D/∂θ_jj² shortcut needs the deviance to be even
+    /// in θ_jj at θ_jj = 0, i.e. dD/dθ_jj = 0 there. With `D = ΛΛ′`, entry
+    /// `Σ_kj` for `k > j` carries `Λ_kj·Λ_jj`, linear in `Λ_jj` — so a
+    /// non-zero `Λ_kj` below the pinned diagonal breaks evenness and the
+    /// shortcut no longer equals the score. This is exactly when this
+    /// returns true: the caller must not report a score for that component.
+    pub fn diagonal_has_nonzero_below(&self, k: usize, theta: &[f64]) -> bool {
+        let run_len = self.diagonal_run_len[k];
+        if run_len <= 1 {
+            return false;
+        }
+        let ti = self.diagonal_theta[k];
+        theta[ti + 1..ti + run_len].iter().any(|&v| v != 0.0)
+    }
+
     /// Blind θ₀ and per-component boxes. Diagonal vech entries (the q_p primary
     /// variances + extra scalars) start at THETA0 with box [0, HI]; off-diagonal
     /// vech entries start at 0 with the signed box [−HI, HI]. q_p=1 ⇒ the
@@ -812,6 +860,16 @@ pub struct LmmFitScratch<T = f64> {
     /// Active balanced families (prefix length). 0 = collapse off → the
     /// per-family loop runs (the fallback and the pre-F behaviour).
     pub collapse_n_active: usize,
+    /// `Dual<N>`'s `syrk_lower_sub` lane-decomposition buffers, laid out
+    /// `[B0 (t_dim·w_tot) | B_k (t_dim·w_tot) | tail lane (t_dim²)]`. Stays
+    /// `f64` — the decomposition works one lane at a time, on `f64` planes cut
+    /// out of the dual array. EMPTY at `T = f64`, which ignores the argument
+    /// and goes straight to one faer triangular GEMM. `HyperDual` also ignores
+    /// it — it takes the generic triple loop — but is still sized under the
+    /// one `IS_F64` predicate below: 15 MB on the largest LMM hyper-dual shape
+    /// against the 330 MB the rest of this scratch already is, and one
+    /// predicate is worth more than the byte.
+    pub syrk_scratch: Vec<f64>,
     /// m×m trailing block of the tail factor — identical semantics to the
     /// augmented [X y] factor; every recovery step reads only this.
     pub factor: Mat<f64>,
@@ -854,8 +912,12 @@ pub struct LmmFitScratch<T = f64> {
     /// k×k scratch holding Λᵀ·ZᵀZ between the two Λ-applications.
     pub blocked_tmp: Vec<f64>,
     /// dim×dim penalized augmented matrix [[ΛᵀZᵀZΛ+I, ΛᵀZᵀ[Xy]],[·, [Xy]ᵀ[Xy]]]
-    /// (column-major lower-tri), faer-llt'd per θ-eval.
+    /// (column-major lower-tri). Read again by `recover_ranef_blocked` after the
+    /// fit, so it must stay unfactored — the Cholesky factor goes in `blocked_l`.
     pub blocked_p: Vec<f64>,
+    /// dim×dim Cholesky factor of `blocked_p`, filled per θ-eval by a copy +
+    /// in-place factor at `Par::Seq` (see `reml_deviance_blocked` in kernel.rs).
+    pub blocked_l: Vec<f64>,
 }
 
 impl<T: Scalar> LmmFitScratch<T> {
@@ -907,6 +969,13 @@ impl<T: Scalar> LmmFitScratch<T> {
             ],
             a_inv: vec![T::ZERO; if npairs > 0 { w * w } else { 0 }],
             collapse_n_active: 0,
+            // `Dual`'s syrk route is the only consumer; sizing it at `f64` would
+            // add a 15 MB buffer to every LMM fit for nothing.
+            syrk_scratch: if T::IS_F64 {
+                Vec::new()
+            } else {
+                vec![0.0; 2 * g.n_primary * w * t_dim + t_dim * t_dim]
+            },
             factor: Mat::zeros(m, m),
             betas: vec![0.0; p],
             var_diag: vec![0.0; p],
@@ -925,6 +994,7 @@ impl<T: Scalar> LmmFitScratch<T> {
             blocked_g: vec![0.0; blocked_kk],
             blocked_tmp: vec![0.0; blocked_kk],
             blocked_p: vec![0.0; blocked_dim * blocked_dim],
+            blocked_l: vec![0.0; blocked_dim * blocked_dim],
         }
     }
 }
@@ -950,6 +1020,19 @@ pub struct LmmWorkspace {
     /// Upper box bound, always THETA_HI regardless of diagonal/off-diagonal
     /// (see `lower` for the entry that carries the diagonal/off-diagonal split).
     pub upper: Vec<f64>,
+    /// REML dual-gradient scratch, built on the first derivative request for
+    /// this workspace and reused thereafter. `None` on a workspace that never
+    /// asks for a gradient, so an `f64`-only caller pays no memory. The shape
+    /// it is sized for — `p` and `groupings` — is fixed at construction and
+    /// cannot change under a workspace, so unlike the GLMM twin there is no
+    /// shape re-check on reuse. Boxed because `LmmFitScratch<Dual<12>>` is a
+    /// large value and this struct is moved.
+    pub(crate) dual_scratch: Option<Box<LmmDualScratch>>,
+    /// Hessian twin of `dual_scratch`, its own slot so a gradient request and a
+    /// boundary-score request never evict each other: they resolve to different
+    /// scalar types, and one shared slot would rebuild the whole buffer list on
+    /// every alternation.
+    pub(crate) hyper_scratch: Option<Box<LmmHyperScratch>>,
 }
 
 impl LmmWorkspace {
@@ -1033,6 +1116,8 @@ impl LmmWorkspace {
             theta,
             lower,
             upper,
+            dual_scratch: None,
+            hyper_scratch: None,
         }
     }
 
@@ -1055,6 +1140,8 @@ impl LmmWorkspace {
             theta,
             lower,
             upper,
+            dual_scratch: None,
+            hyper_scratch: None,
         }
     }
 }
@@ -1790,6 +1877,7 @@ fn fit_lmm_impl(
         theta,
         lower,
         upper,
+        ..
     } = ws;
     let p = suff.m - 1;
 

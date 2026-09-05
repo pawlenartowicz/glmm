@@ -177,13 +177,15 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
     debug_assert!(groupings.crossed.len() <= 32);
     let mut pin_mask: u32 = 0;
     for (gi, cf) in groupings.crossed.iter().enumerate() {
-        // Mirrors `build_packed_m`'s pin skip — change together: both must
-        // test the value part only, or a dual `T`'s CSR pattern (built
-        // there) would diverge from this f64 pin mask (built here). Third site
-        // in the chain: `derivative::extras_theta_pin_free`, which refuses a
-        // derivative at a θ̂ these two skips have narrowed; its comment owns the
-        // explanation.
-        if params[cf.vech_start].value() == 0.0 {
+        // Mirrors `build_packed_m`'s pin skip — change together: both are
+        // `f64`-only, so an `f64` call at a pinned θ̂ keys the cache on the
+        // narrow mask and a dual call keys it on 0 (= full pattern). The two
+        // keys differ exactly where the two patterns differ, which is what
+        // makes the cache correct across the alternating calls inside one
+        // derivative request. Dropping the `T::IS_F64` here while keeping it
+        // there is a silent wrong answer: the CSR would not be rebuilt for the
+        // widened pattern, so the retained column would never be read back.
+        if T::IS_F64 && params[cf.vech_start].value() == 0.0 {
             pin_mask |= 1 << gi;
         }
     }

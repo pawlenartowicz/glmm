@@ -1,12 +1,14 @@
 //! Machine-local bit-identity baseline for refactors that must not change any
-//! fitted number: fits all 48 `manifest.json` rungs and writes one JSON array
+//! fitted number: fits all 48 `manifest.json` rungs, appends two more nAGQ=1
+//! twin records (see `NAGQ1_TWIN_RUNGS` below), and writes one JSON array
 //! — `{rung, config, deviance, theta, beta, se_hessian, se_rx, n_eval,
-//! converged, singular}` per rung, in manifest order — to
-//! `bit_identity/<config>.json`. Diffing that file before and after a refactor
-//! is the fast check its cuts are measured against; the full cross-engine
-//! sweep (`run.sh`) is minutes, this is under a second. Not expected to
-//! reproduce across CPU microarchitectures — regenerate locally before
-//! diffing, never compare a checked-in dump against a different machine's.
+//! converged, singular}` per record, manifest rungs first in manifest order
+//! then the twins — to `bit_identity/<config>.json`. Diffing that file before
+//! and after a refactor is the fast check its cuts are measured against; the
+//! full cross-engine sweep (`run.sh`) is minutes, this is under a second. Not
+//! expected to reproduce across CPU microarchitectures — regenerate locally
+//! before diffing, never compare a checked-in dump against a different
+//! machine's.
 //!
 //! `theta` is `Fit::tau2` (`theta[k]^2 * sigma_sq`, declaration order) — the
 //! stable API's only public per-component θ-scale quantity; `Fit` itself has
@@ -19,7 +21,8 @@
 //! `nagq` is 1 (Laplace) except on the manifest's `agq`-marked rungs, which
 //! fit at the manifest's stated order (`harness_common::rung_agq`) — the only
 //! run in this validation harness that puts `src/glmm/agq.rs` on a bit-identity
-//! tripwire without an opt-in env var.
+//! tripwire without an opt-in env var. Two of those rungs (26, 44) also get a
+//! twin record fit at nAGQ=1 instead — see `NAGQ1_TWIN_RUNGS`.
 //!
 //! `config` is a required CLI arg, used only to label the JSON `config` field
 //! and the output filename — the crate feature set that actually produced the
@@ -61,6 +64,18 @@ use harness_common::*;
 
 const DIR: &str = env!("CARGO_MANIFEST_DIR");
 
+/// Manifest rungs that get a SECOND record fitted at nAGQ=1. Their manifest
+/// `agq` order forces `nagq > 1`, so `exact_profile_shape`'s first clause
+/// (`src/glmm/mod.rs`) rejects them and they route the joint search; without a
+/// twin the dump has no canonical-link (logit / Poisson-log) single-grouping
+/// record on the exact-profile route, and no exact-profile record at all with
+/// a random slope (rung 26, `q = 2`).
+/// Twin `rung` id = 1000 + the manifest rung: two dumps are compared by keying
+/// records on `rung`, so a twin needs an id of its own, and 1000+ keeps it
+/// unmistakable for a manifest rung.
+const NAGQ1_TWIN_RUNGS: [u64; 2] = [26, 44];
+const TWIN_RUNG_OFFSET: u64 = 1000;
+
 fn main() {
     let config = std::env::args()
         .nth(1)
@@ -76,7 +91,20 @@ fn main() {
         if i > 0 {
             out.push_str(",\n");
         }
-        out.push_str(&rung_record(spec, &config));
+        let rung = spec["rung"].as_u64().expect("manifest entry missing rung");
+        out.push_str(&rung_record(spec, &config, rung, rung_agq(spec)));
+    }
+    for spec in datasets {
+        let rung = spec["rung"].as_u64().expect("manifest entry missing rung");
+        if NAGQ1_TWIN_RUNGS.contains(&rung) {
+            out.push_str(",\n");
+            out.push_str(&rung_record(
+                spec,
+                &config,
+                TWIN_RUNG_OFFSET + rung,
+                Some(1),
+            ));
+        }
     }
     out.push_str("\n]\n");
 
@@ -85,15 +113,17 @@ fn main() {
     std::fs::write(&path, &out).expect("write dump");
     println!(
         "bit_identity  config={config}  rungs={}  -> {path}",
-        datasets.len()
+        datasets.len() + NAGQ1_TWIN_RUNGS.len()
     );
 }
 
-/// One rung's record, field order fixed by hand (not `serde_json::Map`'s
-/// default alphabetical order) to match the spec's `{rung, config, deviance,
-/// theta, beta, se_hessian, se_rx, n_eval, converged, singular}`.
-fn rung_record(spec: &Value, config: &str) -> String {
-    let rung = spec["rung"].as_u64().expect("manifest entry missing rung");
+/// One record for `rung` (a manifest rung id, or a twin's `TWIN_RUNG_OFFSET`-shifted
+/// id), field order fixed by hand (not `serde_json::Map`'s default alphabetical
+/// order) to match the spec's `{rung, config, deviance, theta, beta, se_hessian,
+/// se_rx, n_eval, converged, singular}`. `nagq` is the caller's choice, not
+/// derived from `spec`, so a twin can reuse its parent's `spec` at a different
+/// AGQ order.
+fn rung_record(spec: &Value, config: &str, rung: u64, nagq: Option<u8>) -> String {
     let family_str = spec["family"]
         .as_str()
         .expect("manifest entry missing family");
@@ -111,7 +141,7 @@ fn rung_record(spec: &Value, config: &str) -> String {
     // opt-in `VALIDATION_AGQ` pass), the dump applies the manifest's per-rung
     // AGQ order unconditionally: this is the only run that puts `src/glmm/agq.rs`
     // on the bit-identity tripwire.
-    if let Some(k) = rung_agq(spec) {
+    if let Some(k) = nagq {
         lo.opts.nagq = k;
     }
 

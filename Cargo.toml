@@ -39,10 +39,11 @@ orchestrate = ["formula"]
 # Installs dhat as the test binary's #[global_allocator] for the `#[ignore]`
 # bounded-alloc tests. OFF by default: dhat locks a global mutex on every
 # allocation, which serializes the whole parallel test suite when it's always
-# installed. The `#[ignore]` lib tests serialize themselves via
-# `test_support::alloc_test_guard` (dhat counts process-wide), so run with
-# `cargo test --features alloc-tests <name> -- --ignored` — no
-# `--test-threads=1` needed.
+# installed. The `#[ignore]` lib tests serialize their own bodies via
+# `test_support::alloc_test_guard` (dhat counts process-wide), but that guard
+# doesn't reach libtest's own per-test thread spawn, so run with
+# `RAYON_NUM_THREADS=1 cargo test --features alloc-tests <name> -- --ignored
+# --test-threads=1` — both flags are needed, or stray blocks land in the count.
 alloc-tests = []
 # Dev-only optimizer instrumentation (`glmm::EvalCounters` on `Fit`): the
 # stage-1/stage-2 evaluation split, evaluations after the last incumbent

@@ -116,8 +116,17 @@ pub trait Scalar:
     fn chol_lower(a: &[Self], dim: usize, l_out: &mut [Self]) -> bool;
 
     /// `tail(lower) -= bt · btᵀ`, `tail` column-major `t_dim×t_dim` (lower
-    /// triangle), `bt` column-major `t_dim×w_tot`.
-    fn syrk_lower_sub(bt: &[Self], t_dim: usize, w_tot: usize, tail: &mut [Self]);
+    /// triangle), `bt` column-major `t_dim×w_tot`. `scratch` is
+    /// `2·t_dim·w_tot + t_dim²` `f64`s for the implementations that decompose
+    /// the product lane by lane (`Dual<N>`); the `f64` and `HyperDual` bodies
+    /// ignore it and accept an empty slice.
+    fn syrk_lower_sub(
+        bt: &[Self],
+        t_dim: usize,
+        w_tot: usize,
+        tail: &mut [Self],
+        scratch: &mut [f64],
+    );
 }
 
 /// The default body of [`Scalar::family_pass`], the row-by-row scalar
@@ -263,25 +272,49 @@ impl Scalar for f64 {
     }
 
     fn chol_lower(a: &[f64], dim: usize, l_out: &mut [f64]) -> bool {
-        // `Llt` owns its storage, so the immutable borrow of `a` ends with the
-        // block and the copy-out below is free to write `l_out`.
-        let chol = {
-            let r = faer::MatRef::from_column_major_slice(&a[..dim * dim], dim, dim);
-            match r.llt(faer::Side::Lower) {
-                Ok(c) => c,
-                Err(_) => return false,
-            }
+        use faer::dyn_stack::{MemBuffer, MemStack};
+        use faer::linalg::cholesky::llt::factor::{
+            cholesky_in_place, cholesky_in_place_scratch, LltRegularization,
         };
-        let l = chol.L();
+        use faer::{Par, Spec};
+        // Copy A's lower triangle into `l_out` and factor THAT in place instead of calling
+        // `MatRef::llt`. `.llt` reads `faer::get_global_parallelism()` on every call
+        // (faer 0.24.4 `linalg/solvers.rs:789`), which is `Par::rayon(0)` in any build with
+        // faer's default `rayon` feature: the first call spawns rayon's whole global pool
+        // and every later call with dim > 64 hands the blocked recursion to it.
+        // `cholesky_in_place` takes `Par` as an argument — the same rule the PIRLS
+        // Choleskys and `tri_lower_sub_gemm`'s GEMM already follow.
+        // The zero-fill mirrors `.llt`'s own `Mat::zeros` + `copy_from_triangular_lower`:
+        // faer's kernel also writes the columns above the diagonal, so the input's upper
+        // triangle must be zero for the factor to match what `.llt` produced.
+        l_out[..dim * dim].fill(0.0);
         for j in 0..dim {
-            for i in j..dim {
-                l_out[j * dim + i] = l[(i, j)];
-            }
+            let col = j * dim;
+            l_out[col + j..col + dim].copy_from_slice(&a[col + j..col + dim]);
         }
-        true
+        let mut mem = MemBuffer::new(cholesky_in_place_scratch::<f64>(
+            dim,
+            Par::Seq,
+            Spec::default(),
+        ));
+        let l = faer::MatMut::from_column_major_slice_mut(&mut l_out[..dim * dim], dim, dim);
+        cholesky_in_place(
+            l,
+            LltRegularization::default(),
+            Par::Seq,
+            MemStack::new(&mut mem),
+            Spec::default(),
+        )
+        .is_ok()
     }
 
-    fn syrk_lower_sub(bt: &[f64], t_dim: usize, w_tot: usize, tail: &mut [f64]) {
+    fn syrk_lower_sub(
+        bt: &[f64],
+        t_dim: usize,
+        w_tot: usize,
+        tail: &mut [f64],
+        _scratch: &mut [f64],
+    ) {
         tri_lower_sub_gemm(tail, t_dim, bt, bt, w_tot);
     }
 }

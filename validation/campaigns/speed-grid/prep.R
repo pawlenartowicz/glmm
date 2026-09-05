@@ -114,7 +114,9 @@ sim_cell <- function(cell) {
   if (cell$family == "binomial_bin" || cell$family == "binomial_agg") {
     eta <- if (cell$regime == "rare") qlogis(0.02) else 0.2
   }
-  if (cell$family == "poisson") eta <- if (cell$regime == "lowmu") log(0.5) else 0.4
+  if (cell$family == "poisson" || cell$family == "negbin")
+    eta <- if (cell$regime == "lowmu") log(0.5) else 0.4
+  if (cell$family == "gamma") eta <- 0.4
   for (j in seq_len(nx)) eta <- eta + betas[j] * X[, j]
 
   df <- data.frame(X)
@@ -157,6 +159,10 @@ sim_cell <- function(cell) {
     df$incidence <- rbinom(n, df$size, plogis(eta))
   } else if (cell$family == "poisson") {
     df$y <- rpois(n, exp(eta))
+  } else if (cell$family == "negbin") {
+    df$y <- MASS::rnegbin(n, mu = exp(eta), theta = 1.5)   # sim_nb convention (export_data.R)
+  } else if (cell$family == "gamma") {
+    df$y <- rgamma(n, shape = 2, scale = exp(eta) / 2)     # E[y] = mu, shape 2, as sim_gamma
   }
   list(df = df, factors = fac_names, n_x = nx)
 }
@@ -183,7 +189,7 @@ add_cell <- function(structure, family, n_obs, per, balance, regime, b1 = FALSE)
   idx <<- idx + 1L
   st <- STRUCTURES[[structure]]
   fam_tag <- c(gaussian = "lmm", binomial_bin = "binb", binomial_agg = "bina",
-               poisson = "pois")[family]
+               poisson = "pois", negbin = "nb", gamma = "gam")[family]
   cells[[length(cells) + 1L]] <<- list(
     case_id = sprintf("%s_%s_g%dp%d_%s_%s", fam_tag, structure, n_obs, per, balance, regime),
     family = family, structure = structure, n_theta = n_theta_of(st),
@@ -219,6 +225,26 @@ for (sname in names(STRUCTURES)) {
       add_cell(sname, fam, sz[1], sz[2], "skew", "base")
       extra <- if (fam == "poisson") "lowmu" else "rare"
       add_cell(sname, fam, sz[1], sz[2], "bal", extra)
+      add_cell(sname, fam, sz[1], sz[2], "bal", "nearzero")
+    }
+  }
+}
+# NB and Gamma arms (P4 campaign prep, 2026-09-06): same structures, sizes and
+# variant stripe as the GLMM arms above. Appended AFTER every earlier cell on
+# purpose: seed = SEED_BASE + cell index, so inserting these into the loop above
+# would reseed the whole grid and void the recorded baselines keyed on those
+# cells (W0 counters, p1_per_cell). Gamma has no per-family extra regime.
+P4_ARMS <- c("negbin", "gamma")
+p4_i <- 0L
+for (sname in names(STRUCTURES)) {
+  if (!isTRUE(STRUCTURES[[sname]]$glmm)) next
+  for (sz in GLMM_SIZES) for (fam in P4_ARMS) {
+    if (!feasible(STRUCTURES[[sname]], sz[1], sz[2])) next
+    p4_i <- p4_i + 1L
+    add_cell(sname, fam, sz[1], sz[2], "bal", "base")
+    if (p4_i %% 10L < 3L) {
+      add_cell(sname, fam, sz[1], sz[2], "skew", "base")
+      if (fam == "negbin") add_cell(sname, fam, sz[1], sz[2], "bal", "lowmu")
       add_cell(sname, fam, sz[1], sz[2], "bal", "nearzero")
     }
   }
@@ -262,7 +288,8 @@ for (cell in cells) {
   entry$reml <- if (cell$family == "gaussian") TRUE else NULL
   entry$weights <- if (cell$family == "binomial_agg") "size" else NULL
   entry$family <- c(gaussian = "gaussian", binomial_bin = "binomial",
-                    binomial_agg = "binomial", poisson = "poisson")[[cell$family]]
+                    binomial_agg = "binomial", poisson = "poisson",
+                    negbin = "negbin", gamma = "gamma")[[cell$family]]
   manifest$cells[[length(manifest$cells) + 1L]] <- entry
 }
 write(toJSON(manifest, auto_unbox = TRUE, pretty = TRUE, digits = NA, null = "null"),

@@ -2313,6 +2313,143 @@ fn fit_glmm_gamma_sim_matches_lme4() {
     }
 }
 
+/// `WaldSe::Hessian` and `WaldSe::Rx` must report the same fitted point on
+/// `sim_gamma`: `joint_hessian_cov`'s tail re-eval used to leave `ws.prob` at
+/// its own re-solve while `ws.u` was put back to the pinned re-eval's mode,
+/// so Gamma's σ̂² (`family::glmm_sigma_sq`) was built from a mismatched pair.
+/// `tau2`/`varcorr`/`dispersion` derive from that σ̂², and `fitted` IS `ws.prob`.
+#[test]
+fn fit_glmm_gamma_hessian_rx_agree_on_fitted() {
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let f_hess = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            wald_se: WaldSe::Hessian,
+            ..FitOptions::default()
+        },
+    );
+    let f_rx = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            wald_se: WaldSe::Rx,
+            ..FitOptions::default()
+        },
+    );
+    assert!(f_hess.converged() && f_rx.converged());
+    assert_eq!(
+        f_hess.tau2[0].to_bits(),
+        f_rx.tau2[0].to_bits(),
+        "tau2[0]: {} vs {}",
+        f_hess.tau2[0],
+        f_rx.tau2[0]
+    );
+    assert_eq!(
+        f_hess.varcorr[0][0].to_bits(),
+        f_rx.varcorr[0][0].to_bits(),
+        "varcorr[0][0]: {} vs {}",
+        f_hess.varcorr[0][0],
+        f_rx.varcorr[0][0]
+    );
+    assert_eq!(
+        f_hess.dispersion.to_bits(),
+        f_rx.dispersion.to_bits(),
+        "dispersion: {} vs {}",
+        f_hess.dispersion,
+        f_rx.dispersion
+    );
+    for i in 0..n {
+        assert_eq!(
+            f_hess.fitted[i].to_bits(),
+            f_rx.fitted[i].to_bits(),
+            "fitted[{i}]: {} vs {}",
+            f_hess.fitted[i],
+            f_rx.fitted[i]
+        );
+    }
+}
+
+/// Same fitted-point check as [`fit_glmm_gamma_hessian_rx_agree_on_fitted`] on
+/// a φ≡1 family (cbpp, binomial-logit): `glmm_sigma_sq` is a literal `1.0`
+/// here, so only `fitted` can move — the split was never Gamma-specific, it
+/// is just too small to see at canonical links' quadratic PIRLS convergence.
+#[test]
+fn fit_glmm_cbpp_hessian_rx_agree_on_fitted() {
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let p = 4;
+    let model = cbpp_model();
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let f_hess = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            wald_se: WaldSe::Hessian,
+            ..FitOptions::default()
+        },
+    );
+    let f_rx = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            wald_se: WaldSe::Rx,
+            ..FitOptions::default()
+        },
+    );
+    assert!(f_hess.converged() && f_rx.converged());
+    for i in 0..n {
+        assert_eq!(
+            f_hess.fitted[i].to_bits(),
+            f_rx.fitted[i].to_bits(),
+            "fitted[{i}]: {} vs {}",
+            f_hess.fitted[i],
+            f_rx.fitted[i]
+        );
+    }
+}
+
 /// NB GLMM `y ~ 1 + x + grp + (1|cluster)` on sim_nb via the outer-θ loop,
 /// gated against frozen `lme4::glmer.nb` (`validation/goldens/sim_nb_glmm.json`).
 /// `dispersion = θ̂`. lme4-only SE. The oracle is sacred.

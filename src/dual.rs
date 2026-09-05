@@ -283,13 +283,24 @@ impl<const N: usize> crate::scalar::Scalar for Dual<N> {
     // below), never in a validated answer. `HyperDual` keeps the generic
     // loop: unpacking its packed second-derivative block into rectangular
     // buffers would cost more than the loop it replaces.
-    fn syrk_lower_sub(bt: &[Self], t_dim: usize, w_tot: usize, tail: &mut [Self]) {
-        // One allocation per call, on the gradient path (once per fit), not
-        // the fit's inner loop — accepted here, unlike the alloc-free kernel
-        // paths this crate otherwise holds to.
-        let mut b0 = vec![0.0_f64; t_dim * w_tot];
-        let mut bk = vec![0.0_f64; t_dim * w_tot];
-        let mut scratch = vec![0.0_f64; t_dim * t_dim];
+    fn syrk_lower_sub(
+        bt: &[Self],
+        t_dim: usize,
+        w_tot: usize,
+        tail: &mut [Self],
+        scratch: &mut [f64],
+    ) {
+        let plane = t_dim * w_tot;
+        debug_assert!(scratch.len() >= 2 * plane + t_dim * t_dim);
+        // No zeroing between calls: `b0` and `bk` are fully overwritten each
+        // pass, and the `t_dim×t_dim` block is only ever used as a
+        // `BlockStructure::TriangularLower` destination by
+        // `tri_lower_sub_gemm`, so faer neither reads nor writes its strict
+        // upper triangle — stale bytes there from a previous pass can never
+        // reach a result.
+        let (b0, rest) = scratch.split_at_mut(plane);
+        let (bk, scratch) = rest.split_at_mut(plane);
+        let scratch = &mut scratch[..t_dim * t_dim];
 
         for (k, dst) in b0.iter_mut().enumerate() {
             *dst = bt[k].v;
@@ -299,7 +310,7 @@ impl<const N: usize> crate::scalar::Scalar for Dual<N> {
                 scratch[j * t_dim + i] = tail[j * t_dim + i].v;
             }
         }
-        crate::scalar::tri_lower_sub_gemm(&mut scratch, t_dim, &b0, &b0, w_tot);
+        crate::scalar::tri_lower_sub_gemm(&mut *scratch, t_dim, b0, b0, w_tot);
         for j in 0..t_dim {
             for i in j..t_dim {
                 tail[j * t_dim + i].v = scratch[j * t_dim + i];
@@ -315,8 +326,8 @@ impl<const N: usize> crate::scalar::Scalar for Dual<N> {
                     scratch[j * t_dim + i] = tail[j * t_dim + i].d[lane];
                 }
             }
-            crate::scalar::tri_lower_sub_gemm(&mut scratch, t_dim, &bk, &b0, w_tot);
-            crate::scalar::tri_lower_sub_gemm(&mut scratch, t_dim, &b0, &bk, w_tot);
+            crate::scalar::tri_lower_sub_gemm(&mut *scratch, t_dim, bk, b0, w_tot);
+            crate::scalar::tri_lower_sub_gemm(&mut *scratch, t_dim, b0, bk, w_tot);
             for j in 0..t_dim {
                 for i in j..t_dim {
                     tail[j * t_dim + i].d[lane] = scratch[j * t_dim + i];
@@ -354,8 +365,8 @@ const _: () = {
 /// `H` is a second const parameter carrying `N*(N+1)/2` — stable Rust cannot
 /// write `[f64; N * (N + 1) / 2]` in a struct field, so the packed length is
 /// passed alongside `N` and checked by a `const _` assertion in the impl
-/// block below. Only the consistent pairs `(4,10)`, `(8,36)`, `(12,78)` are
-/// instantiated.
+/// block below. Only the consistent pairs `(4,10)`, `(5,15)`, `(6,21)`,
+/// `(8,36)`, `(12,78)` are instantiated.
 #[derive(Clone, Copy, Debug)]
 pub struct HyperDual<const N: usize, const H: usize> {
     /// The value part.
@@ -678,7 +689,13 @@ impl<const N: usize, const H: usize> crate::scalar::Scalar for HyperDual<N, H> {
         crate::scalar::chol_lower_generic(a, dim, l_out)
     }
 
-    fn syrk_lower_sub(bt: &[Self], t_dim: usize, w_tot: usize, tail: &mut [Self]) {
+    fn syrk_lower_sub(
+        bt: &[Self],
+        t_dim: usize,
+        w_tot: usize,
+        tail: &mut [Self],
+        _scratch: &mut [f64],
+    ) {
         crate::scalar::syrk_lower_sub_generic(bt, t_dim, w_tot, tail)
     }
 }
@@ -1075,7 +1092,14 @@ mod tests {
             }
             let mut tail_generic = tail_faer.clone();
 
-            <Dual<4> as Scalar>::syrk_lower_sub(&bt, t_dim, w_tot, &mut tail_faer);
+            let mut syrk_scratch = vec![0.0; 2 * t_dim * w_tot + t_dim * t_dim];
+            <Dual<4> as Scalar>::syrk_lower_sub(
+                &bt,
+                t_dim,
+                w_tot,
+                &mut tail_faer,
+                &mut syrk_scratch,
+            );
             syrk_lower_sub_generic(&bt, t_dim, w_tot, &mut tail_generic);
 
             for j in 0..t_dim {

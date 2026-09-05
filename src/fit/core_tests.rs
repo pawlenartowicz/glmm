@@ -506,9 +506,10 @@ fn fitview_diagnostics_flag_a_weighted_collinear_ols_fit() {
 /// that owns several `Vec`s; if a future field starts cloning one of them, this
 /// is what catches it.
 ///
-/// Run: `cargo test -p glmm --features alloc-tests fitview_diagnostics_zero_alloc
-/// -- --ignored` (`alloc-tests` installs the dhat allocator; `alloc_test_guard`
-/// serializes it against the other `#[ignore]` tests).
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// fitview_diagnostics_zero_alloc -- --ignored --test-threads=1` (`alloc-tests`
+/// installs the dhat allocator; `alloc_test_guard` serializes test bodies, but
+/// libtest's own per-test thread spawn still needs `--test-threads=1`).
 #[cfg(feature = "alloc-tests")]
 #[test]
 #[ignore]
@@ -1236,33 +1237,37 @@ fn reordered_crossed_case() -> (
 /// call count. Re-materializing θ̂ or re-cloning a start costs 2 blocks per draw,
 /// so a regression overshoots by `2 * N_CALLS`, well outside the pin.
 ///
-/// Run: `cargo test -p glmm --features alloc-tests fit_on_theta_marshalling_bounded_alloc
-/// -- --ignored` (`alloc-tests` installs the dhat allocator; `alloc_test_guard`
-/// serializes it against the other `#[ignore]` tests).
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// fit_on_theta_marshalling_bounded_alloc -- --ignored --test-threads=1`
+/// (`alloc-tests` installs the dhat allocator; `alloc_test_guard` serializes
+/// test bodies, but libtest's own per-test thread spawn still needs
+/// `--test-threads=1`).
 #[cfg(feature = "alloc-tests")]
 #[test]
 #[ignore]
 fn fit_on_theta_marshalling_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    // Measured 10000 (this machine): ~50 blocks/draw of faer `llt` internals
-    // across the two arms, and nothing else — the pre-fix code measured 10500,
-    // the 5 marshalling blocks per iteration this test exists to keep at zero
-    // (scaled arm: scale vector + θ̂ copy; reordered arm: θ̂ copy + a two-`Vec`
-    // start clone). Pinned at the measurement with no slack. If faer's Cholesky
-    // internals change, re-measure and update — do not relax.
+    // Measured exactly 6200 on 2026-09-05 (this machine, under this test's own
+    // `RAYON_NUM_THREADS=1` + `--test-threads=1` protocol): ~31 blocks per
+    // arm-draw of faer `llt` internals plus the three per-call derivative
+    // vectors (`theta_row_scales`, `grad`, `boundary_score`), and nothing
+    // else. Pinned at the measurement with no slack — if faer's Cholesky
+    // internals change, re-measure and update, do not relax.
     //
-    // Re-pinned 10000 → 16500 on 2026-09-01 (W3): the dense LMM route now
-    // computes the two derivative diagnostics per converged fit
-    // (`lmm_run_on`, `src/fit/lmm.rs`), and the `LmmDualScratch` /
-    // `LmmHyperScratch` it needs are deliberately per-fit locals — W2 left
-    // them caller-owned, and hoisting them onto `LmmWorkspace` for zero-alloc
-    // warm refits is W5's call, where the LMM Newton owns that state anyway.
-    // The delta is ~32 blocks/call across the two arms (the scratch's buffer
-    // list, plus the `theta_row_scales`/gradient/score vectors), measured at
-    // exactly 16500 with the same guard and thread pinning. The marshalling
-    // blocks this test exists to keep at zero are still zero.
-    const BOUND: u64 = 16500;
+    // The blocks this test exists to keep at ZERO are the marshalling ones — 5
+    // per iteration in the code that motivated the gate (scaled arm: scale
+    // vector + θ̂ copy; reordered arm: θ̂ copy + a two-`Vec` start clone). They
+    // are still zero.
+    //
+    // Re-pinned 16500 → 6200: `LmmDualScratch`/`LmmHyperScratch` moved from
+    // per-fit locals in `lmm_run_on` onto `LmmWorkspace`, so a warm refit no
+    // longer rebuilds their buffer lists. That move accounts for 4200 of the
+    // drop — the same gate on the tree immediately before it measures 10400
+    // here (21 blocks per arm-draw of scratch). The remaining 6100 was already
+    // gone before that move: the 16500 figure was taken on 2026-09-01 and does
+    // not reproduce on today's tree, and the gap was not attributed.
+    const BOUND: u64 = 6200;
 
     let (xs, ys, ns, ps, ms, ids_s, os) = lmm_slope_case();
     let (sized_s, ids_s, perm_s) = spec_sized_from_ids_pub(&ms, &ids_s);
@@ -1312,6 +1317,72 @@ fn fit_on_theta_marshalling_bounded_alloc() {
     assert!(
         stats.total_blocks <= BOUND,
         "fit_on allocated {} blocks across {} warm-path calls per arm (BOUND = {})",
+        stats.total_blocks,
+        N_CALLS,
+        BOUND
+    );
+}
+
+/// The LMM derivative diagnostics allocate their scratch once per WORKSPACE,
+/// not once per fit: `lmm_run_on` builds `LmmDualScratch` on the first
+/// converged fit and every later fit on the same workspace reuses it. So the
+/// unprofiled warm-up fit below pays for the buffer list and the profiled loop
+/// never pays again — a regression back to a per-fit local reappears as the
+/// scratch's whole buffer list per call, far outside the pin. `grad` and
+/// `boundary_score` stay per-call `Vec`s; they are inside the BOUND but are
+/// not what this gate claims.
+///
+/// Lives here rather than next to the LMM warm-path gates because it needs
+/// `lmm_slope_case` / `build_workspace` / `fit_on`, the same fixture and entry
+/// point `fit_on_theta_marshalling_bounded_alloc` above uses.
+///
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// lmm_dual_scratch_built_once_per_workspace -- --ignored --test-threads=1`
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn lmm_dual_scratch_built_once_per_workspace() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: usize = 20;
+    // Measured 704 on 2026-09-05 (this machine): ~35 blocks/call of faer `llt`
+    // internals plus the three per-call derivative `Vec`s
+    // (`theta_row_scales`, `grad`, `boundary_score`), and nothing else — the
+    // `LmmDualScratch` buffer list is built by the warm-up fit above and never
+    // rebuilt inside the loop. Pinned at the measurement with no slack. If
+    // faer's Cholesky internals change, re-measure and update — do not relax.
+    const BOUND: u64 = 704;
+
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    assert!(perm.is_identity());
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    assert!(ws.is_lmm_dense());
+
+    // One fit outside the profiler: it warms every lazy workspace buffer —
+    // the derivative scratch this gate is about included — and produces the
+    // warm start the profiled loop carries.
+    let start = {
+        let v = fit_on(&mut ws, &x, &y, &ids, None, &opts);
+        assert!(
+            v.converged(),
+            "the gate needs a converged fit — the derivative block is skipped otherwise"
+        );
+        crate::StartValues {
+            beta: v.betas().to_vec(),
+            theta: v.theta().to_vec(),
+        }
+    };
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    for _ in 0..N_CALLS {
+        let v = fit_on(&mut ws, &x, &y, &ids, Some(&start), &opts);
+        std::hint::black_box(std::hint::black_box(&v).theta());
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    assert!(
+        stats.total_blocks <= BOUND,
+        "fit_on allocated {} blocks across {} warm-path calls (BOUND = {})",
         stats.total_blocks,
         N_CALLS,
         BOUND

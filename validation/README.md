@@ -155,7 +155,7 @@ added late so no existing rung had to be renumbered).
 | 14 | Arabidopsis | Poisson GLMM (real nested) | real nested Poisson GLMM |
 | 15 | sim_three_level | gaussian (3-level nesting) | 3-level nesting |
 | 16 | sim_max_q_slope | gaussian (q=8, `MAX_PRIMARY_Q` boundary) | RE block exactly at `MAX_PRIMARY_Q` |
-| 17 | sim_crossed_at_cap | Poisson GLMM (6 crossed extras, at cap) | sparse GLMM exactly at `MAX_EXTRA_GROUPINGS` |
+| 17 | sim_crossed_at_cap | Poisson GLMM (6 crossed extras, at cap) | dense GLMM exactly at `MAX_EXTRA_GROUPINGS`, the last case below sparse-routed rung 9 |
 | 18 | sim_binomial_slope_crossed | binomial GLMM (2 crossed q=2 groupings) | sparse GLMM, two slope-carrying crossed groupings; 2-way gate (MixedModels can't construct) |
 | 19 | sim_poisson_nested | Poisson GLMM (3-level nesting) | 3-level nested Poisson GLMM |
 | 20 | sim_unbalanced_nested | gaussian (3-level, heavily unbalanced) | heavily unbalanced nesting |

@@ -367,9 +367,14 @@ impl LmmSuffStats {
 /// grid-atom-snapped layout; non-prefix actives are conservatively rejected).
 /// `fit.collapse_stage` is this precompute's own staging buffer — its first
 /// w·t_dim slots stage each family's raw rows.
-pub(crate) fn precompute_balanced_collapse(
+///
+/// Generic over the scratch's scalar: every field it writes is `f64` or
+/// `usize` at any `T` (`fam_gram`, `collapse_stage`, `collapse_n_active`), and
+/// the Grams it accumulates come from the `f64` sufficient statistics, so a
+/// dual scratch arms exactly the same collapse the `f64` scratch does.
+pub(crate) fn precompute_balanced_collapse<T: Scalar>(
     suff: &LmmSuffStats,
-    fit: &mut LmmFitScratch<f64>,
+    fit: &mut LmmFitScratch<T>,
 ) -> bool {
     let g = &suff.groupings;
     fit.collapse_n_active = 0;
@@ -674,12 +679,17 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
     }
 
     // --- one dense Cholesky; read the deviance off the factor ---
-    let pref = faer::MatRef::from_column_major_slice(&fit.blocked_p[..dim * dim], dim, dim);
-    let chol = match pref.llt(faer::Side::Lower) {
-        Ok(c) => c,
-        Err(_) => return f64::INFINITY,
-    };
-    let l = chol.L();
+    // Factor a separate `blocked_l` buffer at `Par::Seq`, never `blocked_p` itself
+    // via `MatRef::llt` — `.llt` reads `faer::get_global_parallelism()`, which is
+    // `Par::rayon(0)` whenever faer's default `rayon` feature is on, so above
+    // dim 64 it would spawn and use the global rayon pool on every θ-eval even
+    // without the `parallel` feature or `FitOptions::parallel_inner` (RULE 1).
+    // `blocked_p` itself must stay unfactored: `recover_ranef_blocked` re-reads
+    // it after the fit. Mirrors `<f64 as Scalar>::chol_lower` in scalar.rs.
+    if !<f64 as Scalar>::chol_lower(&fit.blocked_p, dim, &mut fit.blocked_l) {
+        return f64::INFINITY;
+    }
+    let l = faer::MatRef::from_column_major_slice(&fit.blocked_l[..dim * dim], dim, dim);
     let mut log_lzz_half = 0.0_f64;
     for i in 0..k {
         let lii = l[(i, i)];
@@ -863,9 +873,12 @@ pub fn reml_deviance<T: Scalar + 'static>(
 
     // --- family elimination ---
     // `collapse_n_active` is written only by `precompute_balanced_collapse`,
-    // which is pinned to `LmmFitScratch<f64>`. A non-f64 scratch always has
-    // it at 0 and takes the per-family loop below — the same objective
-    // mathematically, but not bit-equal to the f64 collapse route.
+    // which every entry point arms once per call — the `f64` fit through
+    // `fit_lmm_impl`, the dual gradient and Hessian through `reml_gradient` /
+    // `reml_hessian`. A scratch that was never armed has it at 0 and takes the
+    // per-family loop below: the same objective mathematically, but not
+    // bit-equal to the collapse route (the collapse reassociates the family sum
+    // into a θ-independent Gram combine).
     let collapse = !slope && fit.collapse_n_active > 0;
     let mut log_lzz_half = T::ZERO; // hoisted — single binding both arms write
     if collapse {
@@ -1027,11 +1040,20 @@ pub fn reml_deviance<T: Scalar + 'static>(
         // sanctioned, verified against the brute-force oracle + validation bands which
         // are orders wider than the reorder's last-ulp footprint.
         let w_tot = g.n_primary * w;
+        // Disjoint field borrows: `bt` and `tail` are read/written by the
+        // decomposition, `syrk_scratch` is its lane workspace.
+        let LmmFitScratch {
+            bt,
+            tail,
+            syrk_scratch,
+            ..
+        } = &mut *fit;
         T::syrk_lower_sub(
-            &fit.bt[..t_dim * w_tot],
+            &bt[..t_dim * w_tot],
             t_dim,
             w_tot,
-            &mut fit.tail[..t_dim * t_dim],
+            &mut tail[..t_dim * t_dim],
+            syrk_scratch,
         );
     }
 
@@ -1094,12 +1116,6 @@ pub fn reml_deviance<T: Scalar + 'static>(
 // evaluation of the suff stats, so one dual call gives exact derivatives —
 // unlike the GLMM side (`glmm::derivative`), there is no mode solve and no
 // non-canonical refinement loop.
-//
-// Every item below has no non-test caller yet — this is W5's optimizer
-// state to own, not wired up here — so each carries its own
-// `#[cfg_attr(feature = "loop_advanced", allow(dead_code))]`: the crate's
-// blanket `not(feature = "loop_advanced")` allow (`lib.rs`) does not cover a
-// `loop_advanced` build. Remove these once W5 calls in.
 // ---------------------------------------------------------------------------
 
 /// Dual-arithmetic twin of `LmmFitScratch`, sized to hold `n_theta` θ-lanes
@@ -1107,18 +1123,19 @@ pub fn reml_deviance<T: Scalar + 'static>(
 /// the REML criterion, unlike the GLMM side's `N` (`n_theta + p`; see
 /// `glmm::derivative`'s own module doc on where its dual buffers live and
 /// how they are sized).
-/// Same instantiated `{4, 8, 12}` lane set as the GLMM dual scratch's
+/// Same instantiated `{4, 5, 6, 8, 12}` lane set as the GLMM dual scratch's
 /// `MAX_DUAL_N`/`GlmmDualScratch` (`glmm::derivative` — change together) —
-/// `q3s`'s `n_θ = 6` is the largest any LMM gate cell reaches, so `N = 8`
-/// covers every gate cell; `N = 12` is headroom.
+/// 12 is the top rung; the gradient chunks above it (`⌈n_theta / 12⌉` passes
+/// of `Dual<12>`), so no `n_theta` is out of reach.
 ///
-/// OWNED BY THE CALLER (W5's optimizer state), not by `LmmWorkspace` —
-/// deliberate asymmetry with the GLMM side's `ws.dual_scratch`: nothing in
-/// the `f64` fit path (`fit_lmm`'s BOBYQA loop) needs a derivative, so there
-/// is no workspace field to hang it on.
-#[cfg_attr(feature = "loop_advanced", allow(dead_code))]
+/// Held by `LmmWorkspace` (`dual_scratch`), built on the first derivative
+/// request and reused: the derivative diagnostics run once per converged fit,
+/// so a per-fit local would reallocate the whole buffer list on every warm
+/// refit — `bt` alone is `n_primary·w·t_dim` dual numbers.
 pub(crate) enum LmmDualScratch {
     D4(LmmFitScratch<Dual<4>>),
+    D5(LmmFitScratch<Dual<5>>),
+    D6(LmmFitScratch<Dual<6>>),
     D8(LmmFitScratch<Dual<8>>),
     D12(LmmFitScratch<Dual<12>>),
 }
@@ -1126,22 +1143,25 @@ pub(crate) enum LmmDualScratch {
 impl LmmDualScratch {
     /// Allocate the smallest instantiated `N` covering `n_theta`, built by
     /// the existing generic `LmmFitScratch::with_groupings` constructor — no
-    /// new buffer list. `None` iff `n_theta > 12`, mirroring `reml_gradient`'s
-    /// own ceiling (this constructor is caller-side sizing, not on that path
-    /// itself, so the ceiling is duplicated as a fact, not a call).
-    #[cfg_attr(feature = "loop_advanced", allow(dead_code))]
+    /// new buffer list. Always `Some` — above the top rung the gradient
+    /// chunks, so the top rung covers every `n_theta`. The `Option` stays
+    /// because [`LmmHyperScratch::for_groupings`], which mirrors this
+    /// constructor, still refuses above 12.
     pub(crate) fn for_groupings(n_theta: usize, p: usize, g: &LmmGroupings) -> Option<Self> {
         Some(match n_theta {
             0..=4 => LmmDualScratch::D4(LmmFitScratch::with_groupings(p, g)),
-            5..=8 => LmmDualScratch::D8(LmmFitScratch::with_groupings(p, g)),
-            9..=12 => LmmDualScratch::D12(LmmFitScratch::with_groupings(p, g)),
-            _ => return None,
+            5 => LmmDualScratch::D5(LmmFitScratch::with_groupings(p, g)),
+            6 => LmmDualScratch::D6(LmmFitScratch::with_groupings(p, g)),
+            7..=8 => LmmDualScratch::D8(LmmFitScratch::with_groupings(p, g)),
+            _ => LmmDualScratch::D12(LmmFitScratch::with_groupings(p, g)),
         })
     }
 }
 
-/// Hessian twin of [`LmmDualScratch`] — same sizing rule and lane set,
-/// `HyperDual<N, H>` buffers.
+/// Hessian twin of [`LmmDualScratch`] — same lane set, `HyperDual<N, H>`
+/// buffers, but capped: `None` iff `n_theta > 12`. A Hessian cannot chunk the
+/// way the gradient does, because a cross-chunk second-derivative block needs
+/// both coordinates' first-order lanes live in the same pass.
 ///
 /// The variants' size gap (clippy's `large_enum_variant`) comes entirely from
 /// `LmmFitScratch::sigma_sq: T`, the one field that is a bare `T` rather than
@@ -1151,20 +1171,24 @@ impl LmmDualScratch {
 /// move the same bytes to the heap for a value this type is always accessed
 /// through `&mut`, never moved or copied.
 #[allow(clippy::large_enum_variant)]
-#[cfg_attr(feature = "loop_advanced", allow(dead_code))]
 pub(crate) enum LmmHyperScratch {
     H4(LmmFitScratch<HyperDual<4, 10>>),
+    H5(LmmFitScratch<HyperDual<5, 15>>),
+    H6(LmmFitScratch<HyperDual<6, 21>>),
     H8(LmmFitScratch<HyperDual<8, 36>>),
     H12(LmmFitScratch<HyperDual<12, 78>>),
 }
 
 impl LmmHyperScratch {
-    /// See [`LmmDualScratch::for_groupings`] — same rule, `HyperDual` buffers.
-    #[cfg_attr(feature = "loop_advanced", allow(dead_code))]
+    /// See [`LmmDualScratch::for_groupings`] — same ladder, `HyperDual`
+    /// buffers, and `None` above the top rung rather than that constructor's
+    /// chunking.
     pub(crate) fn for_groupings(n_theta: usize, p: usize, g: &LmmGroupings) -> Option<Self> {
         Some(match n_theta {
             0..=4 => LmmHyperScratch::H4(LmmFitScratch::with_groupings(p, g)),
-            5..=8 => LmmHyperScratch::H8(LmmFitScratch::with_groupings(p, g)),
+            5 => LmmHyperScratch::H5(LmmFitScratch::with_groupings(p, g)),
+            6 => LmmHyperScratch::H6(LmmFitScratch::with_groupings(p, g)),
+            7..=8 => LmmHyperScratch::H8(LmmFitScratch::with_groupings(p, g)),
             9..=12 => LmmHyperScratch::H12(LmmFitScratch::with_groupings(p, g)),
             _ => return None,
         })
@@ -1177,7 +1201,11 @@ impl LmmHyperScratch {
 /// seed is a plain struct literal — no `Seed` trait needed the way the GLMM
 /// side has one (that trait also serves a multi-call refinement loop this
 /// function has no equivalent of).
-#[cfg_attr(feature = "loop_advanced", allow(dead_code))]
+///
+/// `theta.len()` may exceed `N`: the body then runs `⌈n_theta / N⌉` passes,
+/// each seeding its own chunk of θ and writing that chunk's slice of `grad`.
+/// One pass whenever `n_theta <= N`, which is every shape the ladder covers
+/// exactly.
 fn run_reml_gradient<const N: usize>(
     theta: &[f64],
     suff: &LmmSuffStats,
@@ -1185,40 +1213,54 @@ fn run_reml_gradient<const N: usize>(
     grad: &mut [f64],
 ) -> DerivStatus {
     let n_theta = theta.len();
-    if n_theta > N {
-        return DerivStatus::Unsupported;
-    }
     let zero = Dual::<N> {
         v: 0.0,
         d: [0.0; N],
     };
-    let mut theta_t = [zero; N];
+    let mut last = f64::NAN;
+    // `⌈n_theta / N⌉` passes of at most `N` seeded coordinates: a pass gives
+    // coordinate `offset + j` the lane `j`, and every other coordinate rides
+    // along in `theta_full` as a plain value with zero lanes. Lanes are
+    // independent in forward mode, so the concatenated slices are bit for bit
+    // what one `Dual<n_theta>` pass would give. `MAX_THETA` is the crate's own
+    // θ-length ceiling and already sizes every fixed θ-unpack buffer in this
+    // module.
+    let mut theta_full = [zero; crate::consts::MAX_THETA];
     for (j, &tj) in theta.iter().enumerate() {
-        let mut d = [0.0; N];
-        d[j] = 1.0; // unit lane j — theta[j] is linear in itself
-        theta_t[j] = Dual { v: tj, d };
+        theta_full[j] = Dual { v: tj, d: [0.0; N] };
     }
-    let dev = reml_deviance(&theta_t[..n_theta], suff, fit);
-    // The kernel's only failure signal is a bare +∞ (see reml_deviance's own
-    // Cholesky/non-positive-σ̂² early returns) — `Dual::from_f64` zeroes the
-    // lanes there, so checking the value alone is sufficient.
-    if !dev.value().is_finite() {
-        return DerivStatus::NotConverged;
+    for offset in (0..n_theta).step_by(N) {
+        let width = N.min(n_theta - offset);
+        for t in theta_full[..n_theta].iter_mut() {
+            t.d = [0.0; N];
+        }
+        for j in 0..width {
+            theta_full[offset + j].d[j] = 1.0; // unit lane j — θ is linear in itself
+        }
+        let dev = reml_deviance(&theta_full[..n_theta], suff, fit);
+        // The kernel's only failure signal is a bare +∞ (see reml_deviance's own
+        // Cholesky/non-positive-σ̂² early returns) — `Dual::from_f64` zeroes the
+        // lanes there, so checking the value alone is sufficient.
+        if !dev.value().is_finite() {
+            return DerivStatus::NotConverged;
+        }
+        grad[offset..offset + width].copy_from_slice(&dev.d[..width]);
+        last = dev.value();
     }
-    grad[..n_theta].copy_from_slice(&dev.d[..n_theta]);
-    DerivStatus::Ok(dev.value())
+    DerivStatus::Ok(last)
 }
 
 /// Gradient of the family-blocked REML deviance with respect to θ. `grad` has
 /// `theta.len()` entries. `scratch` is sized by the caller ([`LmmDualScratch::for_groupings`]).
 ///
-/// `Unsupported`: `theta.len() > 12` (no instantiated lane covers it), the
-/// crossed/nested-slopes path (`suff.groupings.extra_slopes_any`, which
-/// routes `reml_deviance` to the `f64`-only `reml_deviance_blocked` and would
-/// otherwise panic on a non-`f64` `T` — checked here so that panic is never
-/// reached), or a `scratch` variant too small for `theta.len()`.
+/// `Unsupported`: the crossed/nested-slopes path
+/// (`suff.groupings.extra_slopes_any`, which routes `reml_deviance` to the
+/// `f64`-only `reml_deviance_blocked` and would otherwise panic on a non-`f64`
+/// `T` — checked here so that panic is never reached). A `theta.len()` above
+/// the top rung is NOT refused: the gradient chunks, `⌈n_θ / 12⌉` passes of
+/// `13` lane-evaluations each, so any `scratch` variant serves any
+/// `theta.len()`.
 /// `NotConverged`: the evaluated deviance is non-finite.
-#[cfg_attr(feature = "loop_advanced", allow(dead_code))]
 pub(crate) fn reml_gradient(
     theta: &[f64],
     suff: &LmmSuffStats,
@@ -1229,17 +1271,39 @@ pub(crate) fn reml_gradient(
     if suff.groupings.extra_slopes_any {
         return DerivStatus::Unsupported;
     }
+    // The collapse is a pure function of `suff` (a full overwrite of the
+    // collapse buffers, not an incremental accumulate), so arming it once per
+    // call here is correct however many times the caller reuses the scratch.
+    // Without this the dual objective runs the per-family loop and the whole
+    // `t_dim × w_tot` syrk on designs where the `f64` objective takes one `w×w`
+    // Crout and a θ-independent Gram combine.
     match scratch {
-        LmmDualScratch::D4(fit) => run_reml_gradient::<4>(theta, suff, fit, grad),
-        LmmDualScratch::D8(fit) => run_reml_gradient::<8>(theta, suff, fit, grad),
-        LmmDualScratch::D12(fit) => run_reml_gradient::<12>(theta, suff, fit, grad),
+        LmmDualScratch::D4(fit) => {
+            precompute_balanced_collapse(suff, fit);
+            run_reml_gradient::<4>(theta, suff, fit, grad)
+        }
+        LmmDualScratch::D5(fit) => {
+            precompute_balanced_collapse(suff, fit);
+            run_reml_gradient::<5>(theta, suff, fit, grad)
+        }
+        LmmDualScratch::D6(fit) => {
+            precompute_balanced_collapse(suff, fit);
+            run_reml_gradient::<6>(theta, suff, fit, grad)
+        }
+        LmmDualScratch::D8(fit) => {
+            precompute_balanced_collapse(suff, fit);
+            run_reml_gradient::<8>(theta, suff, fit, grad)
+        }
+        LmmDualScratch::D12(fit) => {
+            precompute_balanced_collapse(suff, fit);
+            run_reml_gradient::<12>(theta, suff, fit, grad)
+        }
     }
 }
 
 /// Hessian twin of [`run_reml_gradient`] — same seed-call-read shape, one
 /// `reml_deviance::<HyperDual<N, H>>` call gives exact first AND second
 /// derivatives (no refinement loop needed here either).
-#[cfg_attr(feature = "loop_advanced", allow(dead_code))]
 fn run_reml_hessian<const N: usize, const H: usize>(
     theta: &[f64],
     suff: &LmmSuffStats,
@@ -1282,9 +1346,12 @@ fn run_reml_hessian<const N: usize, const H: usize>(
 /// Gradient and exact Hessian of the same criterion [`reml_gradient`]
 /// differentiates. `hess` is an `n_theta × n_theta` `Mat<f64>`, both triangles
 /// filled (the packed hyper-dual lower triangle mirrored) — same output-shape
-/// rule as `glmm::derivative::laplace_hessian`. Same `Unsupported`/
-/// `NotConverged` contract as `reml_gradient`.
-#[cfg_attr(feature = "loop_advanced", allow(dead_code))]
+/// rule as `glmm::derivative::laplace_hessian`. `Unsupported` for
+/// `extra_slopes_any` and for `n_theta > MAX` (12, the top instantiated
+/// `HyperDual` rung) — unlike `reml_gradient`, a Hessian cannot chunk above
+/// that rung, because a cross-chunk second-derivative block needs both
+/// coordinates' first-order lanes in one pass. `NotConverged` on a
+/// non-finite deviance.
 pub(crate) fn reml_hessian(
     theta: &[f64],
     suff: &LmmSuffStats,
@@ -1296,9 +1363,32 @@ pub(crate) fn reml_hessian(
     if suff.groupings.extra_slopes_any {
         return DerivStatus::Unsupported;
     }
+    // The collapse is a pure function of `suff` (a full overwrite of the
+    // collapse buffers, not an incremental accumulate), so arming it once per
+    // call here is correct however many times the caller reuses the scratch.
+    // Without this the dual objective runs the per-family loop and the whole
+    // `t_dim × w_tot` syrk on designs where the `f64` objective takes one `w×w`
+    // Crout and a θ-independent Gram combine.
     match scratch {
-        LmmHyperScratch::H4(fit) => run_reml_hessian::<4, 10>(theta, suff, fit, grad, hess),
-        LmmHyperScratch::H8(fit) => run_reml_hessian::<8, 36>(theta, suff, fit, grad, hess),
-        LmmHyperScratch::H12(fit) => run_reml_hessian::<12, 78>(theta, suff, fit, grad, hess),
+        LmmHyperScratch::H4(fit) => {
+            precompute_balanced_collapse(suff, fit);
+            run_reml_hessian::<4, 10>(theta, suff, fit, grad, hess)
+        }
+        LmmHyperScratch::H5(fit) => {
+            precompute_balanced_collapse(suff, fit);
+            run_reml_hessian::<5, 15>(theta, suff, fit, grad, hess)
+        }
+        LmmHyperScratch::H6(fit) => {
+            precompute_balanced_collapse(suff, fit);
+            run_reml_hessian::<6, 21>(theta, suff, fit, grad, hess)
+        }
+        LmmHyperScratch::H8(fit) => {
+            precompute_balanced_collapse(suff, fit);
+            run_reml_hessian::<8, 36>(theta, suff, fit, grad, hess)
+        }
+        LmmHyperScratch::H12(fit) => {
+            precompute_balanced_collapse(suff, fit);
+            run_reml_hessian::<12, 78>(theta, suff, fit, grad, hess)
+        }
     }
 }

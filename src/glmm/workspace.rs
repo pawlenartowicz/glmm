@@ -282,8 +282,8 @@ pub struct GlmmWorkspace {
     /// and reported in the caller's θ units (× `theta_row_scales`, the opposite
     /// direction to `stddev_se`'s division, because this is a derivative w.r.t.
     /// θ and that is an SE in θ). NaN when no exact gradient was available —
-    /// every shape outside `derivative::supports_shape`, over `MAX_DUAL_N`, or
-    /// at a pinned crossed θ̂. Observation only: nothing branches on it.
+    /// every shape outside `derivative::supports_shape`, or at a pinned crossed
+    /// θ̂. Observation only: nothing branches on it.
     pub(crate) kkt_grad_norm: f64,
     /// Per-θ-coordinate variance score at the boundary: `½·∂²D/∂θ_jj²` at the
     /// accepted γ̂, which is `dD/ds_j` at `s_j = θ_jj² = 0`. In the CALLER's
@@ -310,6 +310,18 @@ pub struct GlmmWorkspace {
     pub(crate) grad_scratch: Vec<f64>,
     /// length m; converged γ̂ snapshot restored each return
     pub fd_saved: Vec<f64>,
+    /// μ̂ as `joint_hessian_cov` was handed it, restored on every exit beside
+    /// `ws.u`. The tail re-eval at the end of that function re-solves PIRLS at γ̂
+    /// and writes a fresh `ws.prob`, while `ws.u` is put back verbatim — so
+    /// without this the workspace exits carrying a (`u`, `prob`) pair from two
+    /// different converged solves, and Gamma's σ̂² (`family::glmm_sigma_sq`,
+    /// read in `fit/glmm.rs`) is built from the mismatch. Length max_n.
+    /// Adding the restore (2026-09-05) moved the bit-identity dump's `theta`
+    /// on the dense Gamma rung (`sim_gamma`, rung 23) from 0.23550934106996388
+    /// to 0.23550934100844045 — a 2.6e-10 relative shift, the Hessian arm now
+    /// reporting the same σ̂² as the Rx arm; every other record stayed
+    /// byte-identical.
+    pub(crate) fd_saved_prob: Vec<f64>,
     /// length m; per-coordinate FD step h_k
     pub fd_steps: Vec<f64>,
     /// When true, `laplace_deviance_at` seeds PIRLS from `u_seed` (the fitted mode
@@ -345,11 +357,17 @@ pub struct GlmmWorkspace {
     /// `fit_glmm` (mirrors `pirls_exhausted`) so a `loop_advanced` reuse never
     /// carries a prior draw's counts.
     pub(crate) counters: crate::counters::EvalCounters,
-    /// Dual-arithmetic twins of the θ-dependent PIRLS buffers, allocated on the
-    /// first derivative request for this workspace and reused thereafter. `None`
-    /// on every `f64`-only fit, so a caller that never asks for a gradient pays
-    /// no memory and the existing alloc bounds do not move.
+    /// Dual-arithmetic twins of the θ-dependent PIRLS buffers at the FIRST-
+    /// derivative order (`Dual<N>`), allocated on the first gradient request for
+    /// this workspace and reused thereafter. `None` on every `f64`-only fit, so
+    /// a caller that never asks for a gradient pays no memory.
     pub(crate) dual_scratch: Option<Box<super::derivative::GlmmDualScratch>>,
+    /// The same at the SECOND-derivative order (`HyperDual<N, H>`), in its own
+    /// slot. A shared slot is what a fit that takes both the KKT gradient and
+    /// a Hessian SE would rebuild — one buffer list into the other and back
+    /// on every warm refit; the `HyperDual<8,36>` list is 45 `f64` per
+    /// element. The separate slot avoids that rebuild.
+    pub(crate) hyper_scratch: Option<Box<super::derivative::GlmmDualScratch>>,
 }
 
 impl GlmmWorkspace {
@@ -635,6 +653,7 @@ impl GlmmWorkspace {
                 u_acc: vec![0.0; k.max(1)],
                 tail_inv: vec![0.0; (e_crossed * e_crossed).max(1)],
                 tail_r: vec![0.0; e_crossed.max(1)],
+                fac_f64: vec![0.0; (q_core * q_core * n_primary).max(1)],
             },
             var_diag: vec![0.0; p],
             vcov: Mat::zeros(p, p),
@@ -650,6 +669,7 @@ impl GlmmWorkspace {
             hess_scratch: Mat::zeros((n_theta + p).max(1), (n_theta + p).max(1)),
             grad_scratch: vec![0.0; n_theta + p],
             fd_saved: vec![0.0; n_theta + p],
+            fd_saved_prob: vec![0.0; max_n],
             fd_steps: vec![0.0; n_theta + p],
             warm_seed_active: false,
             pirls_tol_override: None,
@@ -658,6 +678,7 @@ impl GlmmWorkspace {
             final_pirls_exhausted: false,
             counters: crate::counters::EvalCounters::new(),
             dual_scratch: None,
+            hyper_scratch: None,
         }
     }
 
@@ -1227,14 +1248,28 @@ pub(crate) fn build_packed_m<T: crate::scalar::Scalar>(
         let mut cnt = 0usize;
         for cf in &g.crossed {
             let theta = params[cf.vech_start];
-            // A pinned grouping is pinned by its value part — never by a
-            // derivative lane — so the CSR pattern this fills stays identical
-            // across every T at the same θ̂ (mirrors deviance.rs's pin mask —
-            // change together). The skip is why a pinned crossed θ has no
-            // derivative lane at all: `derivative::extras_theta_pin_free`
-            // routes such a θ̂ to `Unsupported`, and its comment carries the
-            // mechanism and the fix — third site in this chain, change together.
-            if theta.value() == 0.0 {
+            // Pin skip, `f64` only (mirrors deviance.rs's pin mask — change
+            // together). Dropping a θ=0 crossed grouping narrows the CSR this
+            // fills, and that is all it buys: the `e×e` Schur clear and the
+            // Crout factorisation run at full design width either way
+            // (`pirls/blocked_extras.rs`), so the skip saves scatter and
+            // downdate work, never a factorisation.
+            //
+            // At a dual `T` the column is KEPT, so a lane seeded on that θ has
+            // a column to differentiate instead of an all-zero Hessian row.
+            // The value part is unchanged by keeping it: the retained column's
+            // value is exactly 0.0, so every contribution it makes is an
+            // exact-zero add — the same argument `structured_ainv_solve`'s doc
+            // comment makes for skipping it.
+            //
+            // Changing this site WITHOUT deviance.rs's mask is a silent wrong
+            // answer, not a no-op: this would write the wide
+            // `cross_col`/`n_cross` while the CSR cache key stayed narrow,
+            // `build_coupling_csr` would not rerun, and the newly retained
+            // column would be scattered into `coupling` but never read back —
+            // `structured_factor` and `structured_ainv_solve` walk `coup_cols`
+            // only.
+            if T::IS_F64 && theta.value() == 0.0 {
                 continue;
             }
             // q_g==1 here (see debug_assert above), so vech_start − base_theta is

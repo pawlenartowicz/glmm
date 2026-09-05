@@ -306,13 +306,18 @@ pub struct Diagnostics {
     /// [`Diagnostics::pinned`]: `boundary_score[g][i]` pairs with `pinned[g][i]`
     /// and with `stddev_corr(g).0[i]`. The value is `dD/ds` at `s = 0` in the
     /// variance coordinate `s = θ_jj²` — equivalently `½·∂²D/∂θ_jj²` at the
-    /// pinned point, since the deviance is even in `θ_jj` and its first
-    /// derivative there is zero.
+    /// pinned point, but only where the deviance is even in `θ_jj`. That holds
+    /// iff Λ's column `j` has no non-zero entry below the diagonal: with one,
+    /// `Σ_kj` for `k > j` carries the term `Λ_kj·Λ_jj`, which is linear (not
+    /// even) in `θ_jj`, so the shortcut does not apply.
+    /// [`crate::lmm::LmmGroupings::diagonal_has_nonzero_below`] is the gate on this.
     ///
     /// **Positive means the boundary is the constrained optimum**: raising the
     /// component off zero would raise the deviance. A non-positive score at a
     /// pinned component means the pin is not justified by the local geometry.
-    /// NaN at every component that is not pinned, and at every off-diagonal.
+    /// NaN at every component that is not pinned, at every off-diagonal, and
+    /// at a pinned diagonal whose column carries a live off-diagonal below it
+    /// — so NaN does not mean "not pinned".
     ///
     /// **Empty means no score was measured** — a fit that did not ask for it
     /// ([`FitOptions::boundary_score`], off by default), an interior fit, a

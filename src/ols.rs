@@ -1168,8 +1168,9 @@ mod tests {
     /// path fails loudly here instead of surfacing as a benchmark mystery.
     ///
     /// `#[ignore]` because `dhat::Profiler` measures process-wide allocations;
-    /// `alloc_test_guard` serializes it against the other `#[ignore]` tests:
-    ///   `cargo test -p glmm --features alloc-tests fit_suff_stats_warm_path_bounded_alloc -- --ignored`
+    /// `alloc_test_guard` serializes test bodies, but libtest's own per-test
+    /// thread spawn still needs `--test-threads=1`:
+    ///   `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests fit_suff_stats_warm_path_bounded_alloc -- --ignored --test-threads=1`
     /// (`alloc-tests` installs the dhat global allocator the profiler requires.)
     #[cfg(feature = "alloc-tests")]
     #[test]

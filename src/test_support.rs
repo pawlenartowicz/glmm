@@ -61,7 +61,12 @@ pub(crate) fn assert_near(got: &[f64], want: &[f64], ctx: &str) {
 /// bounded-alloc tests hold this for their whole body; the non-alloc
 /// `#[ignore]` tests take it too (feature-gated), since their allocations
 /// would otherwise land in a concurrent profiler window on an `-- --ignored`
-/// run. This makes `--test-threads=1` unnecessary. Poisoning is deliberately
+/// run. It serializes test bodies only: libtest spawns each test's OS thread
+/// up front and does its own per-thread bookkeeping before that thread ever
+/// reaches the guard, so those allocations can still land in another test's
+/// open profiler window. The tier is run `--test-threads=1` for that reason.
+/// Every alloc test also needs `RAYON_NUM_THREADS=1` — rayon worker startup
+/// otherwise adds ~4-24 stray blocks to the count. Poisoning is deliberately
 /// swallowed: one failing test must not cascade into the rest.
 #[cfg(feature = "alloc-tests")]
 pub(crate) fn alloc_test_guard() -> std::sync::MutexGuard<'static, ()> {
