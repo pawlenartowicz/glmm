@@ -177,13 +177,12 @@ fn fit_lmm_rank_deficient_drops_the_aliased_column() {
 // `ALIAS_EPS = 1e-14`): nothing in them is redundant in f64, so there is no
 // column whose removal is the right answer. They are merely badly conditioned,
 // which means the fit is computable and unique and the honest expression of the
-// imprecision is a large standard error. Both used to be discarded — one
-// NaN-filled, the other had a column silently dropped — by a rank guard whose
-// statistic (`min|L_ii| / max|L_ii|` on X'V⁻¹X) measured column SCALE rather
-// than collinearity. That guard is gone: the dense-LMM route refuses no design
-// on conditioning grounds at all, and instead records the scale-invariant
-// per-column pivot ratio for the diagnostics channel to flag below
-// `lmm::PIVOT_MIN = 1e-12`. Neither design reaches even that.
+// imprecision is a large standard error. The dense-LMM route refuses no
+// design on conditioning grounds: `min|L_ii| / max|L_ii|` on X'V⁻¹X measures
+// column SCALE rather than collinearity, so it is not used as a rejection
+// statistic. Instead the route records the scale-invariant per-column pivot
+// ratio for the diagnostics channel to flag below `lmm::PIVOT_MIN = 1e-12`.
+// Neither design reaches even that.
 //
 // Designs generated from a 16-bit LCG (`s <- (75s + 74) mod 65537`, value
 // `s/65537 - 0.5`); every intermediate is below 2^53, so the stream is exact in
@@ -236,8 +235,9 @@ fn intercept_only_lmm() -> ModelSpec {
 /// `validation/prep/gen_illcond_data.R`, and `tests/validation_oracle.rs` bands
 /// its β, SE, σ̂, log-likelihood and variance components against lme4 on the FULL
 /// three-column design at `validation/tol.R`'s cross-engine tolerances. That
-/// golden exists because of this change: while the design NaN-filled there was
-/// nothing for a reference to agree with. The two engines land within 6e-11 on β
+/// golden is possible because the fit returns all three columns rather than
+/// NaN-filling one: a NaN-filled column would leave nothing for a reference to
+/// agree with. The two engines land within 6e-11 on β
 /// and 1.1e-7 on the SEs — this design is ill-conditioned in the old statistic's
 /// eyes only, and both engines say so.
 #[test]
@@ -419,10 +419,9 @@ fn build_gap_a_salvage_design(
 ///
 /// `t` and `v` are not separately identified to any useful precision, and the
 /// fit says so: each gets a coefficient near ±3.8e7 with a standard error of the
-/// same size. That is the deliverable. It is also where lme4 already was — it
+/// same size. That is the deliverable. It is also where lme4 lands — it
 /// fits all four columns of this design with the same ±3.8e7 blow-up — so the
-/// crate now agrees with the reference on the column set instead of returning a
-/// three-column model lme4 never proposed.
+/// crate's four-column fit agrees with the reference on the column set.
 ///
 /// The pair sits in the within-cluster block deliberately. V⁻¹ downdates the
 /// cluster-level block with per-cluster outer products, and on a near-collinear
@@ -433,10 +432,9 @@ fn build_gap_a_salvage_design(
 ///
 /// Reference values are lme4's on the FULL four-column design — the same design
 /// this test fits, column for column. That is what makes the entangled pair
-/// itself assertable: until this release the crate returned a three-column
-/// model lme4 never proposed, so there was nothing to compare the pair against
-/// and the test could only band the unentangled columns and the identified sum
-/// against lme4 on an explicitly-reduced design. Bands are `validation/tol.R`'s
+/// itself assertable: the four-column fit matches lme4's four-column
+/// reference directly, with no need to band only the unentangled columns and
+/// the identified sum against a reduced design. Bands are `validation/tol.R`'s
 /// cross-engine ones, unchanged.
 ///
 /// The provenance, since these constants are frozen in-crate rather than under
@@ -452,7 +450,7 @@ fn build_gap_a_salvage_design(
 /// and the reason is worth stating rather than leaving to be rediscovered. Every
 /// quantity below agrees inside its band, but the REML criterion does not:
 /// glmm reports −239.09477 against lme4's −239.09437, a gap of 4.0e-4 where
-/// `tol.R`'s `loglik_abs_lmm` is an absolute 2e-6. That band was calibrated on
+/// `tol.R`'s `loglik_abs_lmm` is an absolute 2e-6. That band assumes
 /// well-conditioned designs.
 ///
 /// The cause was measured rather than inferred, by re-evaluating this design's

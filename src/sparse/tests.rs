@@ -637,15 +637,15 @@ fn run_sparse_deviance_equals_dense_crossed() {
     }
 }
 
-/// Regression for the structural-pattern seeding fix: a PRIMARY RANDOM SLOPE
+/// Regression guarding the structural-pattern seeding: a PRIMARY RANDOM SLOPE
 /// (q_p=2) design whose slope covariate is balanced ±1 within each primary
 /// cluster, so `Σx = 0` exactly over every cluster's rows → the intercept×slope
-/// cross-Gram entry `Z'Z[(n_prim+f, f)]` is EXACTLY 0.0. Under the old numeric
-/// seeding (`v != 0.0`) that off-diagonal within-block slot was never reserved,
-/// so a non-diagonal Λ's fill there (Λ'GΛ has a nonzero at that slot) was
-/// silently dropped → wrong A → wrong deviance with no error. With structural
-/// seeding (`|Z|ᵀ|Z| > 0.0`) the slot exists and the deviance matches the dense
-/// oracle. θ is chosen with all three vech components nonzero so Λ is genuinely
+/// cross-Gram entry `Z'Z[(n_prim+f, f)]` is EXACTLY 0.0. Seeding the sparsity
+/// pattern from `|Z|ᵀ|Z| > 0.0` — rather than from the numeric Gram entry
+/// (`v != 0.0`) — reserves that off-diagonal within-block slot even when the
+/// entry is exactly zero, so a non-diagonal Λ's fill there (Λ'GΛ has a nonzero
+/// at that slot) is captured instead of silently dropped, and the deviance
+/// matches the dense oracle. θ is chosen with all three vech components nonzero so Λ is genuinely
 /// non-diagonal. Random-continuous data can't hit the exact zero — it must be
 /// constructed. Companion to `sparse_deviance_equals_dense_crossed` (scalar Λ).
 #[test]
@@ -969,7 +969,8 @@ fn build_case(
         "primary_random_slope_q2" => {
             // (1 + x | g): q_p=2 primary with random slope on col 1. The key
             // q_p>1 runtime gate — exercises the non-diagonal primary Λ block
-            // in both the dense (reml_deviance_blocked) and sparse paths.
+            // in both the dense (general family elimination; no extra
+            // groupings, so not the blocked tail) and sparse paths.
             let n = 24;
             let p = 2;
             let (xflat, y, pid) = build_case_fill(17, 4, 0.5, 0.3);
@@ -2545,10 +2546,10 @@ fn dense_ids(raw: &[String]) -> Vec<u32> {
 /// settled), and **Rx** against `se_rx` — glmm's Gamma Rx carries lme4's
 /// σ̂² = pwrss/n like `vcov(use.hessian=FALSE)` (`family::glmm_sigma_sq`;
 /// unscaled, the two differ by exactly σ̂ on this dataset).
-/// Tier 2 (cross-engine): compiled only under `oracle-tests`. It used to skip
-/// at runtime under default features and still report PASS, which is strictly
-/// worse than `#[ignore]` — a golden that asserted nothing while being counted
-/// as covered. A compile-time gate makes its absence visible in the test count.
+/// Tier 2 (cross-engine): compiled only under `oracle-tests`, so its absence
+/// is visible in the test count — a runtime skip under default features would
+/// still report PASS, which is strictly worse than `#[ignore]`, a golden that
+/// asserts nothing while being counted as covered.
 /// Also ~8 min release (n=1200, 21-dim joint BOBYQA + FD-Hessian SE), so the
 /// off-by-default tier is where the cost belongs anyway.
 ///
@@ -2661,7 +2662,7 @@ fn fit_sparse_gamma_glmm_matches_lme4() {
         "φ̂ glmm={} lme4={rd}",
         f.dispersion
     );
-    // Varcomp via stddev_corr — varcorr is σ̂²-scaled like tau2 (B1 fix),
+    // Varcomp via stddev_corr — varcorr is σ̂²-scaled like tau2,
     // directly lme4's Gamma VarCorr stddev scale. glmm order
     // [gp (primary), ge (extra)]; lme4's VarCorr order is descending level
     // count [ge(40), gp(20)] — map by group NAME.
@@ -2720,9 +2721,9 @@ fn fit_sparse_gamma_glmm_matches_lme4() {
 /// string, not from a hand-built `ModelSpec`.
 ///
 /// This is a separate assertion from the hand-built ones above on purpose.
-/// Random-effect lowering order decides which grouping becomes primary, and a
-/// sparse rung was once mis-routed to the dense kernel for a whole release
-/// because the frontend extracted slope random effects before intercept ones.
+/// Random-effect lowering order decides which grouping becomes primary:
+/// extracting slope random effects before intercept ones can mis-route a
+/// sparse rung to the dense kernel.
 /// Rung 46 is all-intercept, so that particular reordering cannot change the
 /// answer — seven extras stay seven extras, over `MAX_EXTRA_GROUPINGS` either
 /// way — but "cannot" is the claim this test exists to check rather than assert
@@ -2814,11 +2815,10 @@ fn sparse_binomial_bigsd_formula_routes_sparse() {
 /// against lme4 already exists just above
 /// (`fit_sparse_gamma_glmm_matches_lme4`), but that test is
 /// `#[cfg(feature = "oracle-tests")]` and does not run under plain
-/// `cargo test`. The rejected 0.1.4 FD-Hessian seeding change moved THIS
-/// fixture's `se_hessian` by −27% and its `stddev_se` to NaN while the
-/// entire default tier stayed green, because this cell had no default-tier
-/// Hessian coverage at all — not absent everywhere, just missing here. This
-/// pin closes that hole. It is self-referential (glmm's own values, not
+/// `cargo test`. This pin catches an FD-Hessian seeding regression class that
+/// moves `se_hessian` by −27% and `stddev_se` to NaN — a class the rest of the
+/// default tier cannot see, since this cell has no other default-tier
+/// Hessian coverage. It is self-referential (glmm's own values, not
 /// lme4's), so it needs no oracle and catches movement in `cargo test`
 /// alone.
 ///
@@ -2833,9 +2833,9 @@ fn sparse_binomial_bigsd_formula_routes_sparse() {
 /// below; both pin sets passed on the anchor unchanged, so this swap is a
 /// re-freeze, not a regression fix.
 ///
-/// **Band derivation, measured not assumed.** This fixture had no prior
-/// default-tier Hessian pin, so there was no existing cross-platform figure
-/// to reuse (unlike the NB test below, which already documents one). The
+/// **Band derivation, measured not assumed.** This fixture has no other
+/// default-tier Hessian pin to reuse a cross-platform figure from (unlike the
+/// NB test below, which already documents one). The
 /// substitute measured here is the same mechanism that produced the NB
 /// fixture's own documented drift: a NEON-vs-scalar-forced-pulp lane-width
 /// swap on this host, via the committed harness
@@ -2850,8 +2850,8 @@ fn sparse_binomial_bigsd_formula_routes_sparse() {
 /// thinner 3e-3 (that number belongs to a different, noisier quantity on a
 /// 2-parameter fit — copying it here without its own measurement would be
 /// arbitrary, which is exactly what this comment exists to avoid). At
-/// 1.5e-2 the pin still catches the 0.1.4 regression class (−27% on
-/// `se_hessian`, NaN on `stddev_se`) by 18×–∞.
+/// 1.5e-2 the pin still catches a regression of this class (−27% on
+/// `se_hessian`, NaN on `stddev_se`) with 18×–∞ margin.
 #[test]
 fn fit_sparse_gamma_hessian_is_pinned() {
     // Band unchanged on re-pin (2026-08-05) — its derivation above measured
@@ -2946,9 +2946,9 @@ fn fit_sparse_gamma_hessian_is_pinned() {
 ///
 /// Why it exists: this is the sparse solver's only large-θ̂ cell, and the FD
 /// Hessian's θ step is built per-component as a relative step clamped at 1,
-/// so it is the first cell any recalibration of that step will move. Before
-/// this fixture existed, the sparse arm's behavior in this regime was
-/// untested rather than merely uncalibrated. It is a PIN, not an oracle: it
+/// so it is the first cell any recalibration of that step will move. Without
+/// this pin, the sparse arm's behavior in this regime is untested rather
+/// than merely uncalibrated. It is a PIN, not an oracle: it
 /// catches movement. The lme4 agreement for this rung lives in the
 /// validation harness (`validation/tol.R`'s `sim_sparse_binomial_bigsd`
 /// override), not here.
@@ -2972,13 +2972,12 @@ fn fit_sparse_gamma_hessian_is_pinned() {
 /// meaningful 1-ULP nudge that stays inside `{0,1}`) measured worst relative
 /// movement `se` 2.017e-4, `beta` 2.726e-5, `stddev_se` 3.059e-5, `var`
 /// 1.199e-5 — noisier than the ≤1e-5 target the conditioning gate
-/// was written for, though the same order of magnitude as an earlier
-/// investigation's own measurement on this exact design under a different
-/// probe (a 3e-6 post-convergence γ̂ nudge, 8.4e-5 on `se(β₀)`). Neither
-/// figure is close to the blow-ups that condemned the alternatives measured
-/// during that investigation (a rejected FD-seeding change moved
-/// `sim_sparse_gamma`'s `se_hessian` −27% and `sim_sparse_nb`'s −61% —
-/// three to four orders of magnitude worse), and the self-noise here (2e-4)
+/// was written for, though the same order of magnitude as a measurement on
+/// this exact design under a different probe (a 3e-6 post-convergence γ̂
+/// nudge, 8.4e-5 on `se(β₀)`). Neither figure is close to the blow-ups an
+/// FD-seeding regression class can cause (`sim_sparse_gamma`'s `se_hessian`
+/// moving −27% and `sim_sparse_nb`'s −61% — three to four orders of
+/// magnitude worse), and the self-noise here (2e-4)
 /// is still below the corpus-wide `se_hessian_rel` cross-engine band
 /// (1e-3, `validation/tol.R`), so it is read as "noisier than hoped, not
 /// pathological." `BAND_HESSIAN` below is 10× the measured worst (2.017e-4),
@@ -3157,23 +3156,23 @@ fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
 /// negbin/log — 7 crossed extras > MAX_EXTRA_GROUPINGS route to the sparse NB
 /// marginal-θ wrapper (`fit_glmm_nb_sparse`). Rx SE, as the gamma rung.
 ///
-/// **The `Rx` arm's bit-exact Rust pin was dropped 2026-08-06.** This fixture
+/// **The `Rx` arm carries no bit-exact Rust pin.** This fixture
 /// is the crate's worst-conditioned NB fit: a
-/// single-ULP input nudge moved `beta[0]` 4.8e-4 median / 1.5e-3 worst
-/// (~1e12–1e13 amplification), and its old bit-exact pin needed a 3e-3 band —
-/// ~3.8x the drift, the thinnest margin any pin in the crate ever carried —
-/// just to survive normal cross-machine rounding. The fix found and closed
-/// the CAUSE (a golden-section stopping width three
-/// decades tighter than the per-evaluation noise floor, `glm.rs:372`'s
-/// provenance comment has the trace), and re-pinned the bit-exact NB gate on
-/// `sim_nb`/`sim_nb_nested` instead (`fit_glmm_nb_sim_matches_lme4`,
+/// single-ULP input nudge moves `beta[0]` 4.8e-4 median / 1.5e-3 worst
+/// (~1e12–1e13 amplification), so a bit-exact pin here needs a 3e-3 band —
+/// ~3.8x the drift, the thinnest margin any pin in the crate would carry —
+/// just to survive normal cross-machine rounding. The amplification traces to
+/// a golden-section stopping width three
+/// decades tighter than the per-evaluation noise floor (`glm.rs:372`'s
+/// provenance comment has the trace). The bit-exact NB gate is pinned instead on
+/// `sim_nb`/`sim_nb_nested` (`fit_glmm_nb_sim_matches_lme4`,
 /// `fit_glmm_nb_nested_unbalanced_matches_lme4`, `src/fit/glmm_tests.rs`) —
 /// those fixtures are well-conditioned, so a pin there can actually tell a
-/// regression from rounding, which a pin on THIS fixture never could even
-/// with the width fix (its conditioning is a property of the design, not the
-/// θ-search). Buying a second copy of that same gate here, on the crate's
-/// worst-conditioned NB fit, was the trade the original `sim_sparse_nb`
-/// rebuild plan tried and abandoned. What replaces the bit-exact
+/// regression from rounding, which a pin on THIS fixture never could, even
+/// with the width fixed, because its conditioning is a property of the
+/// design, not the θ-search. A second copy of that same gate here, on the
+/// crate's worst-conditioned NB fit, would buy nothing beyond what those
+/// well-conditioned fixtures already gate. What replaces the bit-exact
 /// pin below is oracle agreement: the fixture converges and its `Rx` arm
 /// agrees with frozen `lme4::glmer.nb` (`validation/goldens/sim_sparse_nb.json`)
 /// at the same relative bands `validation/tol.R` uses for every other
@@ -3188,11 +3187,11 @@ fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
 /// cross-machine drift accumulates in either.
 ///
 /// **Hessian arm unchanged.** Everything below is about the `Rx`
-/// arm this test already ran (`wald_se: WaldSe::Rx` below). Before this
-/// addition the crate's default tier never exercised this fixture's
-/// `WaldSe::Hessian` SEs at all — the rejected 0.1.4 FD-Hessian seeding
-/// change moved this exact fixture's Hessian `se`/`stddev_se` by -61% with
-/// nothing in `cargo test` able to notice. One extra `fit_cold` under
+/// arm this test already ran (`wald_se: WaldSe::Rx` below). Without this
+/// pin the crate's default tier does not exercise this fixture's
+/// `WaldSe::Hessian` SEs at all, so an FD-Hessian seeding regression class
+/// that moves this exact fixture's Hessian `se`/`stddev_se` by -61% would go
+/// unnoticed in `cargo test`. One extra `fit_cold` under
 /// default options (glmm's default IS `WaldSe::Hessian`) plus pins on `se`
 /// and `stddev_se` close that.
 ///
@@ -3217,10 +3216,10 @@ fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
 /// does. `BAND_HESSIAN = 1e-2` clears the measured worst (9.09e-4) by ~11x
 /// and the documented cross-machine figure (7.91e-4) by ~13x: normal
 /// headroom, deliberately NOT this test's existing 3.8x-margin `BAND` (that
-/// number was sized for the `Rx`-arm beta/varcorr quantities specifically,
+/// number is sized for the `Rx`-arm beta/varcorr quantities specifically,
 /// on grounds stated above that do not transfer here unexamined). At 1e-2
-/// the pin still catches the 0.1.4 regression class (-61% on Hessian SEs)
-/// by 61x.
+/// the pin still catches a regression of this class (-61% on Hessian SEs)
+/// with 61x margin.
 #[test]
 fn fit_sparse_nb_glmm_is_pinned() {
     // Oracle-agreement bands, matching `validation/tol.R`'s corpus-wide
@@ -4011,15 +4010,16 @@ fn sparse_glmm_fit_matches_dense_in_envelope() {
     }
 }
 
-/// Regression test for the Gamma-inverse boundary-convergence defect: forced
+/// Regression test for the Gamma-inverse boundary-convergence defect
+/// `family::eta_infeasible` guards against: forced
 /// through the sparse solver, `y ~ 1 + x + grp + (1|cluster)` on `sim_gamma`
-/// with the INVERSE link used to report `converged = true` under `WaldSe::Rx`
+/// with the INVERSE link would report `converged = true` under `WaldSe::Rx`
 /// at an optimum ~937 deviance units above the dense one (β₀ off by 11%), and
-/// `deviance = inf` under `WaldSe::Hessian` — PIRLS accepted iterates that
-/// `clamp_eta` had projected onto the η > 0 domain boundary, and the projected
-/// row's μ² ≈ 1e20 working weight kept the WLS solve pinned there (see
-/// `family::eta_infeasible` for the fix: infeasible trial ⇒ step-halve). The
-/// log-link twin of this model was green throughout, which is what pins the
+/// `deviance = inf` under `WaldSe::Hessian`, if PIRLS accepted iterates that
+/// `clamp_eta` projects onto the η > 0 domain boundary — the projected
+/// row's μ² ≈ 1e20 working weight would keep the WLS solve pinned there (see
+/// `family::eta_infeasible`: infeasible trial ⇒ step-halve). The
+/// log-link twin of this model fits cleanly throughout, which is what pins the
 /// defect to the link rather than the sparse forcing.
 ///
 /// Asserts the sparse fit against the dense `fit_cold` on identical inputs
@@ -6341,5 +6341,68 @@ fn sparse_glmm_counters_split_stages_and_histogram() {
     assert_eq!(
         c.pirls_hist[0], 0,
         "no eval solves PIRLS in zero iterations"
+    );
+}
+
+/// Sparse route (an extra grouping carries a random slope, which pushes
+/// `classify_design` off the dense envelope), overparameterized into
+/// genuine non-convergence: one row per primary cluster (`n_clusters = n`,
+/// intercept-only) crossed with a 6-level extra grouping carrying a slope on
+/// `x`, on `y ∈ {0, 1e6}` split exactly on `x ∈ {0, 1}`. Unlike the plain
+/// separation case (which converges fine — the θ_NB coordinate absorbs it by
+/// parking at `NB_THETA_HI`), the random-effects design here has more
+/// parameters than the data can identify, and the golden-section search's
+/// final θ lands on a fit the inner sparse solver itself rejects.
+/// `dispersion` must be NaN, not the last golden-section θ that search
+/// stood on when it gave up.
+#[test]
+fn sparse_glmm_nb_failed_fit_dispersion_is_nan() {
+    let n = 24;
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = if i < 12 { 0.0 } else { 1.0 };
+        y[i] = if i < 12 { 0.0 } else { 1e6 };
+    }
+    let primary: Vec<u32> = (0..n as u32).collect(); // one row per cluster
+    let extra: Vec<u32> = (0..n as u32).map(|i| i % 6).collect();
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 6 },
+                slopes: vec![1],
+            }],
+        }),
+    };
+    assert!(matches!(
+        crate::fit::classify_design_pub(&model, 1),
+        crate::fit::Solver::Sparse
+    ));
+    let ids = crate::GroupIds {
+        primary,
+        extra: vec![extra],
+    };
+    let opts = crate::FitOptions {
+        target_indices: vec![0, 1],
+        ..crate::FitOptions::default()
+    };
+    let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(
+        !f.converged(),
+        "overparameterized sparse NB GLMM must not converge"
+    );
+    assert!(
+        f.dispersion.is_nan(),
+        "dispersion must be NaN on a failed fit, not the θ the golden-section search stood on: {}",
+        f.dispersion
     );
 }

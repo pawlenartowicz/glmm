@@ -271,10 +271,16 @@ sample count (integer ≥ 2, first discarded, median of the rest). The count liv
 reaches all five, and each result JSON still records its own `n_runs`, keeping files
 timed under older counts (10, and its 100-run predecessor) self-describing. Without
 `--timings` the engines write `"timing": null`, so a default run **drops any timings
-already recorded in `results/`** — re-measure with `--timings` when you need them. Each timed engine also gets a `results/run_meta_<engine>.json` (machine, git
+already recorded in `results/`** — recover them from `results/archive/` (below), or
+re-measure with `--timings`. Each timed engine also gets a `results/run_meta_<engine>.json` (machine, git
 rev, `no_turbo`, core pin), which `summarize_timing.R` prints and uses to refuse to
 put two machines' seconds in one comparison — seconds never transfer across boxes,
 and the ratios only weakly. Real speed work belongs in `campaigns/speed-grid/`.
+
+Every pass also copies the result trees it just wrote, plus their `run_meta`, to
+`results/archive/<YYYY-MM-DD_HHMM>/`. Nothing reads that directory: it is there so an
+overwrite is recoverable by copying a subtree back into `results/`. It grows without
+bound and is never pruned automatically — delete old snapshots by hand.
 
 The ports reach the same kernel through a different binding and must match the Rust
 engine to round-off, so `--ports` is what you run when a port, the lowering, or the

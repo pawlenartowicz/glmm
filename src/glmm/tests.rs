@@ -16,8 +16,8 @@ use faer::linalg::solvers::Solve;
 /// The dense GLMM kernel entry rejects a hand-built workspace whose extra
 /// grouping carries a random slope (`extra_slopes_any`). In normal use
 /// `classify_design` routes any extra-slope shape to Sparse, so the guard is the
-/// backstop for a caller that constructs the dense `GlmmWorkspace` directly — in
-/// release this path used to silently drop the slope. The panic now comes from
+/// backstop for a caller that constructs the dense `GlmmWorkspace` directly — without
+/// it, a release build would silently drop the slope. The panic comes from
 /// `from_groupings` (release too), not from the per-eval `debug_assert`s, so it
 /// fires at `for_cluster_spec` above rather than inside `fit_glmm`.
 #[test]
@@ -56,10 +56,9 @@ fn dense_glmm_entry_rejects_extra_slopes() {
     );
 }
 
-/// Intercept-only spec carrying the **binomial-logit** family — the family the
-/// GLMM kernel has always used here. (Pre-M3 the kernel ignored `spec.family`;
-/// M3 made `ws.family` load-bearing, so these legacy binomial tests must set it
-/// rather than inherit `intercept_only_spec`'s Gaussian default.)
+/// Intercept-only spec carrying the **binomial-logit** family. `ws.family` drives
+/// the deviance and IRLS weights the GLMM kernel computes, so these binomial tests
+/// must set it explicitly rather than inherit `intercept_only_spec`'s Gaussian default.
 fn logit_intercept_spec(sizing: Sizing) -> ModelSpec {
     let mut s = intercept_only_spec(sizing);
     s.family = Family::Binomial {
@@ -1017,7 +1016,7 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
     // (gen_glmm_hessian_vcov.R, glmer tolPwrss = 1e-13 — at lme4's default
     // 1e-7 its ldL2 uses working weights one PIRLS iteration behind the mode
     // and vcov(use.hessian=TRUE) carried ~1.7e-3 of spurious θ/θβ curvature,
-    // which this band used to absorb; see joint_hessian_cov's doc comment) and
+    // which this band absorbs; see joint_hessian_cov's doc comment) and
     // our FD runs PIRLS at `pirls_tol_fd` — never looser than the fit's own exit
     // tolerance and capped at PIRLS_TOL_REL_FD — so what remains is the
     // two solvers' θ̂ offset plus FD truncation. tol = achieved band + ~30×
@@ -1323,8 +1322,8 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
     build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
     ws.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
-    // Opt in, so a refused score would show up as the NaN it used to be rather
-    // than as the NaN an unrequested score also leaves.
+    // Opt in, so a refused score surfaces as the NaN this test wants to see,
+    // distinct from the NaN an unrequested score also leaves.
     ws.boundary_score_requested = true;
     let fit = fit_glmm(
         &mut ws,
@@ -1678,11 +1677,12 @@ fn boundary_score_aligns_with_pinned() {
     {
         assert_eq!(bs.len(), pn.len());
         for (s, &p) in bs.iter().zip(pn) {
-            // Finite implies pinned, not the reverse: a pinned diagonal whose
-            // column carries a live off-diagonal below it is withheld as NaN
-            // (`LmmGroupings::diagonal_has_nonzero_below`). See
-            // `lmm_boundary_score_skips_component_with_nonzero_off_diagonal`
-            // in `src/fit/common_tests.rs` for that other direction.
+            // Finite implies pinned, not the reverse: an unpinned component
+            // carries NaN. The other direction — a pinned diagonal whose score
+            // is reported because `canonicalize_pinned_blocks` zeroed the
+            // column below it — is
+            // `lmm_boundary_score_reported_after_canonicalization` in
+            // `src/fit/common_tests.rs`.
             assert!(!s.is_finite() || p, "score finite implies component pinned");
         }
     }
@@ -1899,12 +1899,12 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
 ///
 /// Where non-PD genuinely lives: NOT at the θ→0 floor (the intercept-only
 /// Laplace deviance is EVEN in θ, so its θ-curvature there is structurally
-/// POSITIVE), and — since the FD evals run at `pirls_tol_fd`, never looser than
-/// the fit's own exit tolerance — no longer at a converged high-variance fit
-/// either: an interior minimum has PSD curvature by definition, and the non-PD
-/// this fixture used to produce AT θ̂ was loose-tol FD noise on that near-flat θ
-/// direction (this very fixture flipped Ok when the tightened FD tolerance
-/// landed — the noise it removes is exactly what made the LLT fail). The
+/// POSITIVE), and NOT at a converged high-variance fit either — since the FD
+/// evals run at `pirls_tol_fd`, never looser than the fit's own exit tolerance,
+/// an interior minimum has PSD curvature by definition. Any non-PD result this
+/// fixture would produce AT θ̂ traces to loose-tol FD noise on that near-flat θ
+/// direction; at this FD tolerance that noise is removed, which is exactly
+/// what keeps the LLT from failing. The
 /// deviance is genuinely concave
 /// BEYOND the minimum along θ: at large θ the Laplace `log|A|` term grows
 /// like `2s·log θ` (concave) while the data deviance saturates and the
@@ -2236,8 +2236,8 @@ fn fit_glmm_warm_path_bounded_alloc() {
 }
 
 /// Structured-path warm zero-alloc lock, the crossed/nested twin of
-/// `fit_glmm_warm_path_bounded_alloc`. There was no such gate before — the dense
-/// crossed/nested path allocated inside faer's per-eval `llt`. The structured
+/// `fit_glmm_warm_path_bounded_alloc`. The dense crossed/nested path allocates
+/// inside faer's per-eval `llt`, so it carries no equivalent gate. The structured
 /// path replaces that with `glmm_block_chol`/`glmm_block_solve` on the
 /// pre-allocated `core_blocks`/`schur_blk`/`coupling` + stack-sized per-block
 /// scratch, so the only per-eval blocks left are the joint [θ|β] BOBYQA's own
@@ -2984,10 +2984,8 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         &mut crate::counters::EvalCounters::new(),
     );
 
-    // Dense and blocked now share the same lme4 step-halving backtrack and
-    // today's mixed stopping rule, so the paths agree to FP error again —
-    // re-tightened from an earlier interim relaxation back to the original
-    // dev/pen/logdet 1e-9, u 1e-7.
+    // Dense and blocked share the same lme4 step-halving backtrack and mixed
+    // stopping rule, so the paths agree to FP error: dev/pen/logdet 1e-9, u 1e-7.
     assert_eq!(dense.3, blocked.3, "convergence flag");
     assert!(
         (dense.0 - blocked.0).abs() < 1e-9,
@@ -3320,8 +3318,9 @@ fn blocked_inference_matches_dense_slope_noextra() {
 
 /// Within-fit û warm-start MUST reset per fit. A reused-workspace re-fit must
 /// match a fresh-workspace (canonically cold) fit BIT-FOR-BIT. Carrying the
-/// incumbent across fits is the rejected cross-sim warm-start that breaks
-/// merge / same-seed reproducibility. This is the per-fit-reset guard.
+/// incumbent across fits would warm-start one simulation from another's state,
+/// breaking merge / same-seed reproducibility. This is the per-fit-reset guard
+/// against that.
 #[test]
 fn warm_start_is_per_fit_deterministic() {
     let (xf64, y, ids) = glmm_intercept_dataset();
@@ -4823,7 +4822,7 @@ fn grouseticks_exact_fixture() -> ExactProfileFixture {
     (spec, ids.primary, ids.extra, x, y, n, p)
 }
 
-/// P1: an exact-Profile solve at θ returns (ũ, β̂) such that a Fixed-mode
+/// An exact-Profile solve at θ returns (ũ, β̂) such that a Fixed-mode
 /// solve at that β̂ reproduces the same Laplace objective — the profile value IS
 /// the objective at the profiled point, not a PQL surrogate.
 #[test]
@@ -4868,7 +4867,7 @@ fn exact_profile_value_equals_fixed_mode_value_at_profiled_beta() {
     );
 }
 
-/// P1 gate in unit form: at a fixed θ, minimizing the Fixed-mode Laplace deviance over
+/// The exact-profile gate in unit form: at a fixed θ, minimizing the Fixed-mode Laplace deviance over
 /// β with BOBYQA lands on (within BOBYQA's own tolerance) the value the exact
 /// Profile solve returns in one PIRLS call. Logit (canonical, Fisher û path),
 /// probit (non-canonical, observed û path), and the two canonical structured
@@ -4939,7 +4938,7 @@ fn assert_exact_profile_is_beta_minimum(fixture: fn() -> ExactProfileFixture, la
     }
 }
 
-/// P1: the exact-Profile solve must converge when PIRLS is warm-started from the
+/// The exact-Profile solve must converge when PIRLS is warm-started from the
 /// converged (ũ, β̂) of a LOWER θ — the directional warm start the θ-only outer
 /// search does on every uphill probe. A cold start at the same θ converges, so a
 /// non-finite value here is a globalization defect in the exact border, not a
@@ -6118,7 +6117,7 @@ fn pirls_blocked_step_halving_recovers_from_overshoot() {
         "step-halving must rescue the cold-start overshoot, got {dev}"
     );
     // Sanity ceiling against a finite-but-absurd recovery (the guarded bug
-    // returned INFINITY). A run of this fixture converges to dev≈1837; 3700
+    // returns INFINITY). A run of this fixture converges to dev≈1837; 3700
     // is a generous 2× headroom above that.
     assert!(dev < 3700.0, "recovered deviance {dev} implausibly large");
 }
@@ -6230,6 +6229,62 @@ fn workspace_carries_stage1_scratch_sized_for_n_theta() {
         "stage1 solver must be a valid n_theta-dim BOBYQA config, got {:?}",
         out.status
     );
+}
+
+/// The NB dispersion is one trailing coordinate of both outer searches — joint
+/// `[θ_RE | β | ln θ_NB]`, stage 1 `[θ_RE | ln θ_NB]` — boxed on the GLM bracket's
+/// `[ln NB_THETA_LO, ln NB_THETA_HI]`. Every other family has no such slot, so its
+/// solver dimensions are what they were.
+#[test]
+fn nb_workspace_carries_the_theta_nb_coordinate() {
+    let re = Some(ReStructure {
+        sizing: Sizing::FixedClusters { n_clusters: 4 },
+        slopes: vec![],
+        extra_groupings: vec![],
+    });
+    let p = 3;
+    let nb = GlmmWorkspace::for_cluster_spec(
+        p,
+        &ModelSpec {
+            family: Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            re: re.clone(),
+        },
+        40,
+        &[],
+        1,
+    );
+    let m = nb.n_theta + p;
+    assert_eq!(nb.params.len(), m + 1);
+    assert_eq!(nb.lower.len(), m + 1);
+    assert_eq!(nb.upper.len(), m + 1);
+    assert_eq!(nb.lower[m], crate::fit::NB_THETA_LO.ln());
+    assert_eq!(nb.upper[m], crate::fit::NB_THETA_HI.ln());
+    assert_eq!(nb.params_stage1.len(), nb.n_theta + 1);
+    assert_eq!(nb.lower_stage1.len(), nb.n_theta + 1);
+    assert_eq!(nb.lower_stage1[nb.n_theta], crate::fit::NB_THETA_LO.ln());
+    assert_eq!(nb.upper_stage1[nb.n_theta], crate::fit::NB_THETA_HI.ln());
+    assert_eq!(&nb.lower_stage1[..nb.n_theta], &nb.lower[..nb.n_theta]);
+
+    let pois = GlmmWorkspace::for_cluster_spec(
+        p,
+        &ModelSpec {
+            family: Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            re,
+        },
+        40,
+        &[],
+        1,
+    );
+    let m = pois.n_theta + p;
+    assert_eq!(pois.params.len(), m);
+    assert_eq!(pois.lower.len(), m);
+    assert_eq!(pois.params_stage1.len(), pois.n_theta);
+    assert_eq!(&pois.lower_stage1[..], &pois.lower[..pois.n_theta]);
+    assert_eq!(&pois.upper_stage1[..], &pois.upper[..pois.n_theta]);
 }
 
 /// Objective-identity gate. Both the stage-2 BOBYQA
@@ -6844,8 +6899,8 @@ fn fixed_seed_theta_padded(shape: &str, extra_p: usize) -> FixedSeedTheta {
 /// `nest2` is nested (extras non-empty, routes to `pirls_solve_blocked_extras`
 /// — `Unsupported` by the routing gate, nothing for an FD gate to compare) and
 /// `q3s` carries `glmm = FALSE` in the same catalogue (never fit as a GLMM, no
-/// GLMM fixture exists). Binomial-cloglog is added in their place: a
-/// post-0.3.1 GLMM-validated link, non-canonical (exercises the refinement
+/// GLMM fixture exists). Binomial-cloglog stands in their place: a
+/// GLMM-validated link, non-canonical (exercises the refinement
 /// loop), and the only caller of `Scalar::exp_m1`.
 const GRADIENT_GATE_CELLS: &[(Family, &str)] = &[
     (
@@ -7699,7 +7754,7 @@ fn laplace_hessian_beta_block_matches_joint_hessian_cov_int1_binomial() {
     let _ = worst_rel; // measured value recorded in the doc comment above
 }
 
-// -- W8: tail-boundary timing instrument -------------------------------------
+// -- Tail-boundary timing instrument -------------------------------------
 //
 // Locates the crossed tail width `e` above which the dual kernel's dense
 // generic tail factor costs more per evaluation than the caller's fallback
@@ -7999,7 +8054,7 @@ fn w8_corpus_row(
 /// Tail-boundary sweep: `e ∈ {6,16,32,64,128,192,256,384,500}` (500 is
 /// `MAX_CROSSED_LEVELS`, `src/consts.rs:46` — above it `classify_design`
 /// routes Sparse, a different question) at two primary cluster counts
-/// (`s = 8`, `s = 200`, plan open decision 5), plus the two corpus anchors
+/// (`s = 8`, `s = 200`), plus the two corpus anchors
 /// that bracket the region (`VerbAgg`, small crossed tail; `grouseticks`,
 /// the 403-level factor). Prints one table; a human reads the crossover off
 /// it and pins `DUAL_TAIL_MAX` by hand — this test asserts nothing about
@@ -8050,7 +8105,7 @@ fn w8_tail_boundary_sweep_timed() {
     }
 }
 
-/// P1: `block_leverage` equals `mᵀA⁻¹m` computed by a `glmm_block_solve`
+/// `block_leverage` equals `mᵀA⁻¹m` computed by a `glmm_block_solve`
 /// against the same 3×3 factor (not an explicit matrix inverse).
 #[test]
 fn block_leverage_matches_explicit_inverse() {

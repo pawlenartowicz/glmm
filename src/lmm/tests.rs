@@ -55,9 +55,9 @@ fn hand_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>) {
 /// variant of the same shape (`precompute_balanced_collapse` only arms on a
 /// balanced primary). `skew` mirrors the speed grid's own skew recipe
 /// (`campaigns/speed-grid/prep.R`): ~20% of clusters ("heavy") draw ~80% of
-/// the rows. The balanced branch (`skew = false`) still assigns `i % nc`
-/// exactly as before, drawing no extra `lcg` values, so `hand_dataset()`'s
-/// output is bit-identical to what it was before this generalization.
+/// the rows. The balanced branch (`skew = false`) assigns `i % nc` and draws
+/// no extra `lcg` values, so `hand_dataset_sized(n, nc, false)`'s output is
+/// bit-identical to `hand_dataset()`'s.
 fn hand_dataset_sized(n: usize, nc: usize, skew: bool) -> (Mat<f64>, Vec<f64>, Vec<u32>) {
     let mut st = 42u64;
     let u_c: Vec<f64> = (0..nc).map(|_| 0.6 * lcg(&mut st)).collect();
@@ -101,12 +101,9 @@ fn hand_dataset_sized(n: usize, nc: usize, skew: bool) -> (Mat<f64>, Vec<f64>, V
 /// (≤ 1e-9 rel), not up-to-a-constant. THE formulation proof, held on
 /// every θ probed.
 ///
-/// `PINNED_DEV` is `profiled_deviance(theta, &mut scratch)` on
-/// `hand_dataset` from the scalar Brent kernel retired in this commit
-/// (`src/lme.rs`, deleted 2026-08-26, commit 95dfe90 with uncommitted
-/// working-tree edits), `scratch` built via `test_support::build_lme_scratch`
-/// at that same commit — pinned so the cross-check between the collapse
-/// and general REML paths survives the kernel that produced it.
+/// `PINNED_DEV` values are frozen reference deviances for `hand_dataset`
+/// across θ, pinned so the cross-check between the collapse and general
+/// REML paths in `reml_deviance` holds against a fixed reference.
 #[test]
 fn deviance_matches_pinned_across_theta() {
     const PINNED_DEV: [(f64, f64); 9] = [
@@ -147,8 +144,7 @@ fn deviance_matches_pinned_across_theta() {
 }
 
 /// All scratch is overwritten per call — re-evaluating a θ after an
-/// intervening different-θ call reproduces bit-identical deviance and σ̂²
-/// (mirrors the retired `lme.rs`'s stale-state test).
+/// intervening different-θ call reproduces bit-identical deviance and σ̂².
 #[test]
 fn reml_deviance_overwrites_state() {
     let (x, y, ids) = hand_dataset();
@@ -301,10 +297,10 @@ fn maxfun_cap_reports_honest_endpoint() {
 /// frozen literal endpoints, at the amended tolerances (rel 1e-4, abs floors
 /// β̂ 1e-5 / stat 1e-4 — the measured Brent θ̂-placement-noise floor).
 ///
-/// `PINNED_BETAS`/`PINNED_STATS`/`PINNED_JOINT_T_SQ` are the retired scalar
-/// `lme_fit`'s output on `hand_dataset` (targets `[1, 2]`) from the Brent
-/// kernel retired in this commit (`src/lme.rs`, deleted 2026-08-26,
-/// commit 95dfe90 with uncommitted working-tree edits).
+/// `PINNED_BETAS`/`PINNED_STATS`/`PINNED_JOINT_T_SQ` are frozen reference
+/// outputs on `hand_dataset` (targets `[1, 2]`), pinned so `fit_lmm`'s
+/// general θ-search agrees with a fixed reference at the amended tolerances
+/// above.
 #[test]
 fn fit_matches_pinned_q1_endpoint_on_hand_dataset() {
     const PINNED_BETAS: [f64; 3] = [
@@ -479,17 +475,17 @@ fn theta_start_some_matches_blind_fit() {
 /// allocation), the same acceptance the shipped path's 26 blocks/call carry;
 /// if a future faer version changes its Cholesky internals, update the
 /// bound — do not relax it. A hand-rolled owned-kernel replacement for
-/// faer's `llt` was tried and rejected: its wasm `f64::ln` took a different
-/// ULP path than the native build (the factorization itself was fine),
-/// which broke cross-platform bit-equality. The faer bound stays the locked
-/// steady state.
+/// faer's `llt` is not used: its wasm `f64::ln` takes a different ULP path
+/// than the native build (the factorization itself is fine), which breaks
+/// cross-platform bit-equality. The faer bound stays the locked steady
+/// state.
 #[cfg(feature = "alloc-tests")]
 #[test]
 #[ignore]
 fn lmm_fit_warm_path_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    const BOUND: u64 = 2700; // Measured 2500 (this machine) — ~25 blocks/fit of faer `llt` internals on the family-blocked q=1 path (one m×m tail llt per eval). `fit_lmm` no longer allocates per fit (the diagonal_theta index map is cached once on LmmGroupings; the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields), so this count is purely faer's Cholesky internals — faer-version/machine specific. q=1 deviance is byte-identical to the hand-rolled augmented-factor deviance (held by the lmm_parity corpus + golden_rng), so the eval trajectory is unchanged; the count dropped from the prior 4600 because `chol_lower` now factors in place (one heap block per eval instead of two). If faer changes its Cholesky internals, update — do not relax.
+    const BOUND: u64 = 2700; // Measured 2500 (this machine) — ~25 blocks/fit of faer `llt` internals on the family-blocked q=1 path (one m×m tail llt per eval). `fit_lmm` does not allocate per fit (the diagonal_theta index map is cached once on LmmGroupings; the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields), so this count is purely faer's Cholesky internals — faer-version/machine specific. q=1 deviance is byte-identical to the hand-rolled augmented-factor deviance (held by the lmm_parity corpus + golden_rng), so the eval trajectory is unchanged; `chol_lower` factors `l_out` in place, one heap block per eval instead of two, which keeps this count low. If faer changes its Cholesky internals, update — do not relax.
 
     let (x, y, ids) = hand_dataset();
     let targets: Vec<u32> = vec![1, 2];
@@ -609,6 +605,92 @@ fn groupings_vech_layout() {
     assert_eq!(g3.k_family(), 12); // 4 clusters × 3
     assert_eq!(g3.k_total, 12);
     assert_eq!(g3.diagonal_theta(), &[0, 3, 5][..]);
+}
+
+/// `vech(Σ)` (column-major, matching the θ layout) for one `q×q` block's
+/// `vech(Λ)` — the quantity `canonicalize_pinned_blocks` must leave alone.
+fn sigma_vech(theta: &[f64], q: usize) -> Vec<f64> {
+    let mut lam = vec![0.0f64; q * q];
+    primary_lambda(theta, q, &mut lam);
+    let mut out = Vec::new();
+    for c in 0..q {
+        for r in c..q {
+            let mut s = 0.0;
+            for k in 0..=c {
+                s += lam[r * q + k] * lam[c * q + k];
+            }
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// `canonicalize_pinned_blocks`: a pinned diagonal's column folds into the
+/// trailing diagonals with Σ preserved, a second pass is a no-op, and a block
+/// with no pinned diagonal comes back BIT-identical (that last one is what
+/// keeps every non-singular fit's dump unmoved).
+#[test]
+fn canonicalize_pinned_blocks_folds_preserves_sigma_and_is_idempotent() {
+    let sizing = Sizing::FixedClusters { n_clusters: 4 };
+    let base = intercept_only_spec(sizing);
+
+    // q_p = 2, vech(Λ) = [λ00, λ10, λ11]: both diagonals at 0 with the whole
+    // variance carried by the unidentified λ10 — the shape a pinned q=2 fit
+    // stops at.
+    let mut spec2 = base.clone();
+    spec2.re.as_mut().unwrap().slopes.push(1);
+    let g2 = LmmGroupings::from_cluster_spec(&spec2, 40, &[1]);
+    let mut th2 = [0.0, 0.8172902747418043, 0.0];
+    let sig2 = sigma_vech(&th2, 2);
+    assert!(canonicalize_pinned_blocks(&g2, &mut th2));
+    assert_eq!(th2[0], 0.0);
+    assert_eq!(th2[1], 0.0); // column 0 zeroed outright
+    assert!((th2[2] - 0.8172902747418043).abs() <= 1e-15); // mass on λ11
+    for (got, want) in sigma_vech(&th2, 2).iter().zip(&sig2) {
+        assert!((got - want).abs() <= 1e-15 * want.abs().max(1.0));
+    }
+    // The pinned diagonal now has nothing below it, which is what makes the
+    // boundary-score shortcut valid there.
+    assert!(!g2.diagonal_has_nonzero_below(0, &th2));
+    let again = th2;
+    assert!(!canonicalize_pinned_blocks(&g2, &mut th2));
+    assert_eq!(th2[0].to_bits(), again[0].to_bits());
+    assert_eq!(th2[1].to_bits(), again[1].to_bits());
+    assert_eq!(th2[2].to_bits(), again[2].to_bits());
+
+    // No pinned diagonal ⇒ strict no-op, bit-for-bit.
+    let mut th_live = [1.3, 0.37, 0.9];
+    let before = th_live;
+    assert!(!canonicalize_pinned_blocks(&g2, &mut th_live));
+    for (a, b) in th_live.iter().zip(&before) {
+        assert_eq!(a.to_bits(), b.to_bits());
+    }
+
+    // q_p = 3, vech(Λ) = [λ00, λ10, λ20, λ11, λ21, λ22]: the pinned leading
+    // column carries two live entries that have to fold into columns 1 and 2.
+    let mut spec3 = base.clone();
+    spec3.re.as_mut().unwrap().slopes.push(1);
+    spec3.re.as_mut().unwrap().slopes.push(2);
+    let g3 = LmmGroupings::from_cluster_spec(&spec3, 40, &[1, 2]);
+    let mut th3 = [0.0, 0.5, 0.25, 0.0, 0.3, 0.4];
+    let sig3 = sigma_vech(&th3, 3);
+    assert!(canonicalize_pinned_blocks(&g3, &mut th3));
+    assert_eq!(&th3[..3], &[0.0, 0.0, 0.0]); // pinned column 0 gone
+    assert!(th3[3] > PIN_THETA); // its variance re-emerges on λ11
+    for (got, want) in sigma_vech(&th3, 3).iter().zip(&sig3) {
+        assert!(
+            (got - want).abs() <= 1e-14 * want.abs().max(1.0),
+            "Σ moved: {:?} vs {:?}",
+            sigma_vech(&th3, 3),
+            sig3
+        );
+    }
+    assert!(!g3.diagonal_has_nonzero_below(0, &th3));
+    let again3 = th3;
+    assert!(!canonicalize_pinned_blocks(&g3, &mut th3));
+    for (a, b) in th3.iter().zip(&again3) {
+        assert_eq!(a.to_bits(), b.to_bits());
+    }
 }
 
 /// Suff-stats bookkeeping on a hand-checkable block: counts per RE column,
@@ -786,7 +868,7 @@ fn crossed_plus_nested_deviance_matches_brute_force() {
     );
 }
 
-/// Unbalanced counts must take the legacy loop byte-for-byte: a failed
+/// Unbalanced counts must take the general loop byte-for-byte: a failed
 /// precompute leaves collapse_n_active = 0 and the eval path untouched.
 #[test]
 fn unbalanced_counts_fall_back_byte_identical() {
@@ -1192,7 +1274,7 @@ fn crossed_nested_fit_recovers_betas() {
 fn lmm_fit_general_warm_path_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    const BOUND_GENERAL: u64 = 3700; // Measured 3500 (this machine) — ~35 blocks/fit truth-started (scaled rho + spec-derived start; the few-eval regime the production path runs). Per-eval faer `llt` internals only: the family loop is hand-rolled zero-alloc, the cached diagonal_theta map removed the per-fit Vec, and the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields, so this count is faer-version/machine specific. Dropped from the prior 8000 because `chol_lower` now factors in place. If faer changes its Cholesky internals, update — do not relax.
+    const BOUND_GENERAL: u64 = 3700; // Measured 3500 (this machine) — ~35 blocks/fit truth-started (scaled rho + spec-derived start; the few-eval regime the production path runs). Per-eval faer `llt` internals only: the family loop is hand-rolled zero-alloc, the cached diagonal_theta map avoids a per-fit Vec allocation, and the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields, so this count is faer-version/machine specific. `chol_lower` factors in place, which keeps this count low. If faer changes its Cholesky internals, update — do not relax.
 
     let (x, y, pid, eids, cluster) = multi_dataset(true, 2);
     let targets: Vec<u32> = vec![1, 2];
@@ -1201,7 +1283,7 @@ fn lmm_fit_general_warm_path_bounded_alloc() {
     ws.suff.reset();
     ws.suff.add_rows_multi(x.as_ref(), &y, &pid, &eids, None);
     // prime cold, then warm-start subsequent refits from the previous fit's fitted θ
-    // (the loop tier's production pattern; replaces the deleted spec truth-start).
+    // (the loop tier's production pattern).
     let _ = fit_lmm(&mut ws, &targets, None);
     let warm = ws.theta.clone();
 
@@ -1234,7 +1316,7 @@ fn lmm_fit_crossed_slope_warm_path_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
     // Measured ~5004 (this machine, faer 0.x, 2026-09-05): the per-eval Cholesky
-    // now runs through `chol_lower`'s own scratch buffer at `Par::Seq` instead
+    // runs through `chol_lower`'s own scratch buffer at `Par::Seq` instead
     // of `MatRef::llt`, so it never touches faer's global rayon pool. ALL faer-
     // internal — `reml_deviance_blocked` itself is zero-alloc (every buffer is
     // in `blocked_*` scratch; only a stack `lam_g`). faer-version/machine
@@ -1258,7 +1340,7 @@ fn lmm_fit_crossed_slope_warm_path_bounded_alloc() {
     ws.suff
         .add_rows_multi(x.as_ref(), &y, &pid, std::slice::from_ref(&eid), None);
     // prime cold, then warm-start subsequent refits from the previous fit's fitted θ
-    // (the loop tier's production pattern; replaces the deleted spec truth-start).
+    // (the loop tier's production pattern).
     let _ = fit_lmm(&mut ws, &[1], None);
     let warm = ws.theta.clone();
 
@@ -1672,7 +1754,7 @@ fn multislope_fit_converges_interior() {
     assert!(fit.converged);
     // Planted [0.5, 0.4, 0.2]; recovered ≈[0.51, 0.64, 0.28]. Both slopes positive
     // with β̂₁ > β̂₂ (planted ordering preserved) — pin that, so a β₁/β₂ swap or a
-    // scale collapse fails where the old `is_finite` pair passed.
+    // scale collapse fails, which a bare finiteness check would not catch.
     assert!(
         (0.2..0.9).contains(&ws.fit.betas[0]),
         "intercept {}",
@@ -1874,7 +1956,7 @@ fn groupings_primary1_crossed_qg(q_g: usize) -> LmmGroupings {
 
 #[test]
 fn extra_qg1_theta_layout_matches_scalar() {
-    // Intercept-only crossed factor through the slope machinery = the old
+    // Intercept-only crossed factor through the slope machinery = the plain
     // scalar layout: one primary scalar + one extra scalar.
     let g = groupings_primary1_crossed_qg(1);
     assert_eq!(g.n_theta(), 1 + 1);
@@ -2270,9 +2352,9 @@ fn nested_slope_deviance_matches_brute_force() {
     }
 }
 
-/// End-to-end NESTED-SLOPE fit: the original nested-slope symptom was BOBYQA diverging
-/// to NaN (`converged = false`) on every seed because the blocked objective was
-/// mis-assembled. With the correct objective the full θ-search must converge to
+/// End-to-end NESTED-SLOPE fit: guards against a mis-assembled blocked
+/// objective, which makes BOBYQA diverge to NaN (`converged = false`) on
+/// every seed. With the correct objective the full θ-search must converge to
 /// a finite interior fit. Asserts `converged`, no numerical failure
 /// (`boundary_hit != 2`), finite θ̂/σ̂², and β̂ recovered near the planted
 /// [0.5, 0.4].
@@ -2649,7 +2731,7 @@ fn composed_nested_deviance_matches_brute_force() {
 fn lmm_fit_slope_warm_path_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    const BOUND_SLOPE: u64 = 5500; // Measured 5200 (this machine) — ~52 blocks/fit of faer `llt` internals (one m×m tail llt per eval × ~54 evals on the blind 3-D q_p=2 surface; the family loop + primary Λ/Gram are zero-alloc scratch, the cached diagonal_theta map removed the per-fit Vec, and the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields). Higher total than q=1's 2500 only via the larger blind eval count, not a richer per-eval alloc — faer-version/machine specific. Dropped from the prior 11400 because `chol_lower` now factors in place. If faer's Cholesky internals change, update — do not relax.
+    const BOUND_SLOPE: u64 = 5500; // Measured 5200 (this machine) — ~52 blocks/fit of faer `llt` internals (one m×m tail llt per eval × ~54 evals on the blind 3-D q_p=2 surface; the family loop + primary Λ/Gram are zero-alloc scratch, the cached diagonal_theta map avoids a per-fit Vec allocation, and the ranef recovery pass solves in the ranef_ux/ranef_rhs scratch fields). Higher total than q=1's 2500 only via the larger blind eval count, not a richer per-eval alloc — faer-version/machine specific. `chol_lower` factors in place, which keeps this count low. If faer's Cholesky internals change, update — do not relax.
 
     let (x, y, ids) = slope_dataset();
     let targets: Vec<u32> = vec![1];

@@ -92,8 +92,8 @@ jobs:
         # produce a green run that measured nothing.
         #
         # THE PER-TEST `const BAND` SWEEP IS LOAD-BEARING, not belt-and-braces.
-        # Seven pins moved off PIN_REL_ITER onto their own in-function `BAND` in
-        # 0.1.4, and they are exactly the pins with a measured cross-arch drift —
+        # Seven pins carry their own in-function `BAND` instead of PIN_REL_ITER,
+        # and they are exactly the pins with a measured cross-arch drift —
         # rewriting only the two PIN_REL_* constants would leave every one of
         # them running at its shipped band and silently measure nothing. Mirrors
         # the band list in `assert_pinned`'s anchor note: add a `const BAND` in a

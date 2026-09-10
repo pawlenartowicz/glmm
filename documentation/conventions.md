@@ -24,9 +24,10 @@ AGQ gate.
 
 Negative binomial fits carry an extra **outer loop for the shape parameter**
 θ (not to be confused with the covariance θ above): the GLM path alternates a
-fixed-θ inner fit with a profile-θ update, and the GLMM path maximizes the
-marginal log-likelihood over `ln θ` by golden-section search around a full
-inner GLMM fit at each candidate. Either way, θ̂ is reported as the fit's
+fixed-θ inner fit with a profile-θ update, and the GLMM path maximizes the same
+marginal log-likelihood over `ln θ` — as one more coordinate of its outer search
+on the dense route, and by golden-section search around a full inner GLMM fit at
+each candidate on the sparse one. Either way, θ̂ is reported as the fit's
 `dispersion`.
 
 ## Offset

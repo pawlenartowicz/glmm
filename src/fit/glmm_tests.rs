@@ -12,10 +12,10 @@ use faer::Mat;
 
 use super::common_tests::{assert_pinned, dense_ids, dense_str, sim_clustered};
 
-/// `fit_glmm` (now `run_glmm_on` + `glmm_view_to_fit`) must reproduce the `Fit`
+/// `run_glmm_on` + `glmm_view_to_fit` must reproduce the `Fit`
 /// that the full `fit_cold` dispatch produces for a clustered binomial GLMM —
 /// pins the view/assembly split as behavior-preserving. The mu_hat/deviance
-/// tuple that the NB marginal-θ loop reads must also stay populated.
+/// tuple the route-comparison tests read must also stay populated.
 #[test]
 fn glmm_view_maps_to_same_fit_as_fit_cold() {
     let (x, y, cluster_ids, n) = cbpp_design();
@@ -358,10 +358,9 @@ fn fit_glmm_cbpp_matches_lme4() {
     // stddev_rel = 1e-3) — change together with that file. This is a glmm↔lme4
     // claim, so tol.R's calibration is the one that applies. Measured agreement
     // against the artifact-free reference is far inside them: SE worst 6.0e-6.
-    // The SE band was 3e-2 only because the constants above were the
-    // default-tolPwrss ones; with the citation corrected, that band no longer
-    // has a reason to exist. The oracle is sacred — these bound glmm to lme4,
-    // never the reverse.
+    // A looser SE band has no reason to exist: the reference constants above
+    // are the citation-corrected ones, not the default-tolPwrss ones. The
+    // oracle is sacred — these bound glmm to lme4, never the reverse.
     for j in 0..p {
         let b_rel = (f.beta[j] - CBPP_REF_BETA[j]).abs() / CBPP_REF_BETA[j].abs();
         assert!(
@@ -901,7 +900,7 @@ fn fit_glmm_gamma_weighted_matches_lme4() {
         );
     }
     // varcorr[0][0] = σ̂²·θ̂² — directly lme4's VarCorr vcov for the g
-    // intercept, via the public block (σ̂²-scaled like tau2, B1 fix).
+    // intercept, via the public block (σ̂²-scaled like tau2).
     let vc_rel = (f.varcorr[0][0] - REF_G_VCOV).abs() / REF_G_VCOV;
     assert!(
         vc_rel < 1e-2,
@@ -1553,7 +1552,7 @@ fn sparse_schur_small_e_matches_dense() {
 /// the deviance through `ws.nagq`, so at k > 1 it differences the AGQ deviance,
 /// not the Laplace one — the SE is a property of the quadrature order like
 /// everything else. What is true, measured
-/// 2026-07-30 across the 0.1.4 FD-θ-step fix, is the *step rule*'s behaviour: the
+/// 2026-07-30 across the FD-θ-step fix, is the *step rule*'s behaviour: the
 /// θ-profile of the AGQ deviance obeys the same O(h²) truncation law as the
 /// Laplace one, with the same constant. Dropping the `max(1, |θ̂|)` scaling
 /// divides the error by θ̂² to within 6% at nAGQ = 1 and 7 and 11 alike, over
@@ -2009,8 +2008,8 @@ fn fit_glmm_probit_cbpp_matches_lme4() {
 /// Cloglog binomial GLMM `y ~ 1 + x1 + x2 + x3 + z + (1 | g)` on the 9,600-row
 /// `sim_probit_large` fixture, gated against frozen
 /// `glmer(binomial("cloglog"), tolPwrss = 1e-13)`
-/// (`validation/goldens/sim_cloglog_glmm.json`). lme4-only SE. No kernel change
-/// was needed for this arm: `build_workspace`'s `(family, Some(re))` branch
+/// (`validation/goldens/sim_cloglog_glmm.json`). lme4-only SE. This arm needs no
+/// kernel change: `build_workspace`'s `(family, Some(re))` branch
 /// already catch-alls to the dense GLMM route and PIRLS reaches the link
 /// through `family_pass`. The oracle is sacred.
 #[test]
@@ -2101,15 +2100,15 @@ fn fit_glmm_cloglog_matches_lme4() {
 /// formula as the log-link test below — only the link differs, which is what
 /// makes it a controlled pair.
 ///
-/// Regression guard for the FD-Hessian seeding bug: `joint_hessian_cov` used to
-/// re-derive the random-effect mode û(γ̂) by a COLD PIRLS solve rather than
-/// reusing the one the fit had just converged to. Where the mode problem has more
-/// than one basin the cold solve lands in a different one, and the inverse link is
-/// where that shows: the fit reaches deviance 936.7683 and the cold re-eval at the
-/// same γ̂ returned 1034.5678. The finite differences then straddled the two
-/// branches, the joint Hessian came out indefinite, the RX fallback's Schur was
-/// indefinite at the same wrong mode, and the whole fit was reported failed for
-/// want of a standard error — `converged` was `false` and every estimate NaN.
+/// Regression guard for the FD-Hessian seeding bug: `joint_hessian_cov` reuses
+/// the random-effect mode û(γ̂) the fit already converged to, rather than
+/// re-deriving it by a COLD PIRLS solve. Where the mode problem has more
+/// than one basin a cold solve can land in a different one, and the inverse link is
+/// where that shows: the fit reaches deviance 936.7683 while a cold re-eval at the
+/// same γ̂ returns 1034.5678. Finite differences that straddle the two
+/// branches leave the joint Hessian indefinite, the RX fallback's Schur
+/// indefinite at the same wrong mode, and the whole fit reported failed for
+/// want of a standard error — `converged` false and every estimate NaN.
 ///
 /// So `converged` is the assertion that would have caught it, and `loglik` is the
 /// one that keeps catching it: landing on the wrong branch moves the
@@ -2259,7 +2258,7 @@ fn fit_glmm_gamma_sim_matches_lme4() {
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
         assert!(se_rel < 3e-2, "se[{j}] = {} vs lme4 {}", f.se[j], REF_SE[j]);
     }
-    // Via stddev_corr/varcorr — σ̂²-scaled like tau2 (B1 fix), so it gates
+    // Via stddev_corr/varcorr — σ̂²-scaled like tau2, so it gates
     // the public accessor directly against lme4's VarCorr stddev.
     let (sd, _corr) = f.stddev_corr(0);
     let sd_rel = (sd[0] - REF_CLUSTER_SD).abs() / REF_CLUSTER_SD;
@@ -2314,9 +2313,10 @@ fn fit_glmm_gamma_sim_matches_lme4() {
 }
 
 /// `WaldSe::Hessian` and `WaldSe::Rx` must report the same fitted point on
-/// `sim_gamma`: `joint_hessian_cov`'s tail re-eval used to leave `ws.prob` at
-/// its own re-solve while `ws.u` was put back to the pinned re-eval's mode,
-/// so Gamma's σ̂² (`family::glmm_sigma_sq`) was built from a mismatched pair.
+/// `sim_gamma`: `joint_hessian_cov`'s tail re-eval keeps `ws.prob` and `ws.u`
+/// at the same pinned re-eval mode, so Gamma's σ̂² (`family::glmm_sigma_sq`)
+/// is built from a matched pair — leaving `ws.prob` at its own re-solve while
+/// `ws.u` is put back to the pinned mode would mismatch them.
 /// `tau2`/`varcorr`/`dispersion` derive from that σ̂², and `fitted` IS `ws.prob`.
 #[test]
 fn fit_glmm_gamma_hessian_rx_agree_on_fitted() {
@@ -2454,18 +2454,19 @@ fn fit_glmm_cbpp_hessian_rx_agree_on_fitted() {
 /// gated against frozen `lme4::glmer.nb` (`validation/goldens/sim_nb_glmm.json`).
 /// `dispersion = θ̂`. lme4-only SE. The oracle is sacred.
 ///
-/// **Additive Rust-vs-Rust pin (2026-08-06).** Gates `golden_max_ln_theta`
-/// (`src/fit/glm.rs`) and the NB marginal-θ path (`fit_glmm_nb`,
-/// `src/fit/glmm.rs`) directly — the lme4 bands above (5e-3 β, 5e-2 se/θ̂) are
-/// too loose to tell a regression from rounding: a knife-edge
-/// in the inner fixed-θ fit that a 1e-8-wide
-/// golden-section stopping width could land on either side of; loosening the
-/// width to 1e-4 (`glm.rs`'s own provenance comment) removed the two-branch
-/// behavior. `BAND = 1e-7` is 10-50× the measured worst-case drift on this
-/// fixture at the new width: 6.17e-9 relative under a 128-draw 1-ULP sweep on
-/// `sim_nb`'s inputs (K=64 on `x`, K=64 on `y`), 5.16e-11 under the committed
-/// `pulp` lane-width probe (scalar-forced vs normal dispatch) — both far
-/// inside the band, both probes agree on the order of magnitude.
+/// **Additive Rust-vs-Rust pin (2026-08-06; scope updated 2026-09-06).** Gates
+/// the NB coordinate's read-back (`fit_glmm_nb` → `run_glmm_on` →
+/// `glmm_view_to_fit`) and the marginal objective directly — the lme4 bands
+/// above (5e-3 β, 5e-2 se/θ̂) are too loose to tell a regression from rounding.
+/// Before 2026-09-06 this pin instead gated `golden_max_ln_theta`
+/// (`src/fit/glm.rs`)'s golden-section bracket: a knife-edge in the inner
+/// fixed-θ fit that a 1e-8-wide stopping width could land on either side of,
+/// fixed by loosening the width to 1e-4. `BAND = 1e-7` is 10-50× the measured
+/// worst-case drift on this fixture at that width: 6.17e-9 relative under a
+/// 128-draw 1-ULP sweep on `sim_nb`'s inputs (K=64 on `x`, K=64 on `y`),
+/// 5.16e-11 under the committed `pulp` lane-width probe (scalar-forced vs
+/// normal dispatch) — both far inside the band, both probes agree on the
+/// order of magnitude.
 #[test]
 fn fit_glmm_nb_sim_matches_lme4() {
     const REF_BETA: [f64; 3] = [-0.0207782143496, 0.593950952004, 0.59944069353];
@@ -2533,31 +2534,27 @@ fn fit_glmm_nb_sim_matches_lme4() {
     );
     assert_eq!(f.df, 5); // 3 β + cluster θ_RE + NB θ
 
-    // Additive bit-exact pin (see doc comment above). Frozen at the same
-    // `golden_max_ln_theta` stopping width (1e-4) this fixture's fit above
-    // just ran at.
     const BAND: f64 = 1e-7;
-    // re-pinned 2026-09-03: exact β-profile, θ-only outer search (was
-    // [-0.02075568116330833, 0.5939541494671592, 0.5994666840076409]). This
-    // shape (blocked, no extras, nAGQ=1, non-Gamma) now routes through
-    // `OuterSearch::ExactProfile`.
-    //
-    // Re-pinned a second time the same day, once the exact-mode merit's accept
-    // band was widened to carry its own correction residual
-    // (`pirls_solve_blocked`): the first re-pin recorded values the warm-start
-    // deadlock had produced, where uphill θ probes came back non-finite and the
-    // outer search stopped early — β₀ landed at -0.020603 with θ̂_NB = 1.77368.
-    // At the fixture's own θ̂_NB (1.783599975969345) the two routes now agree,
-    // Δdev = exact − joint = -7.512e-8 (deviance 327.90301823213406 vs
-    // 327.90301830725440), well inside `GLMM_RHO_END` (3e-6).
-    const REF_BETA_PIN: [f64; 3] = [
-        -0.020772684227064696,
-        0.5939577927279746,
-        0.5994409570567505,
+    // Additive bit-exact pin (see doc comment above). Re-pinned 2026-09-06 (twice).
+    // First: θ_NB became a coordinate of the outer BOBYQA on the marginal
+    // objective, not a golden-section bracket over re-fits; the incumbent is
+    // the answer and there is no final fit at θ̂. That move was 7.2e-6 relative
+    // on θ̂ — inside the bracket's own 1e-4 `ln θ` resolution — and the two
+    // routes' marginal log-likelihoods agreed to 4.6e-7 absolute
+    // (`nb_coordinate_reaches_the_bracket_optimum`). Second: the coordinate's
+    // cold start moved from the method-of-moments seed to the no-RE GLM-NB's
+    // own θ̂ (the moment seed charges the RE variance to the dispersion, which
+    // is harmless on this intercept-only fixture but breaks random-slope NB
+    // shapes). That move was 1.00e-4 relative on θ̂, still inside the bracket's
+    // own resolution.
+    const REF_BETA_PIN: [f64; 3] = [-0.020769389421119777, 0.59395431629629, 0.5994447607631596];
+    const REF_SE_PIN: [f64; 3] = [
+        0.16316288715392654,
+        0.07212626650783861,
+        0.14147781125669748,
     ];
-    const REF_SE_PIN: [f64; 3] = [0.1631695206794065, 0.07212850508079749, 0.1414816654249278];
-    const REF_TAU2_PIN: [f64; 1] = [0.32973894328360587];
-    const REF_THETA_PIN: f64 = 1.783599975969345;
+    const REF_TAU2_PIN: [f64; 1] = [0.32970146424114105];
+    const REF_THETA_PIN: f64 = 1.7837951781306456;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb pinned tau2");
@@ -2566,6 +2563,87 @@ fn fit_glmm_nb_sim_matches_lme4() {
         &[REF_THETA_PIN],
         BAND,
         "sim_nb pinned theta",
+    );
+}
+
+/// The dense route searches `ln θ_NB` as a coordinate of its BOBYQA; the sparse
+/// route still maximises the same marginal objective by the golden-section
+/// bracket over full re-fits. On one dataset both must reach the same optimum:
+/// `loglik` to 1e-5 absolute (optimizer-noise deviance gaps on rungs of this
+/// size measured 1e-7 to 1e-10 when the exact β-profile landed, 2026-09-04;
+/// two decades of margin) and θ̂ to 1e-3 relative (the bracket resolves `ln θ`
+/// to 1e-4). `sim_nb` is in the dense envelope; the sparse driver is called
+/// directly, which the in-envelope cross-check test does too.
+#[test]
+fn nb_coordinate_reaches_the_bracket_optimum() {
+    let (x, y, cluster_ids, n_clusters) =
+        sim_clustered(include_str!("../../validation/data/simulated/sim_nb.csv"));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        wald_se: crate::WaldSe::Rx,
+        ..FitOptions::default()
+    };
+    let dense = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
+    let sparse = crate::sparse::fit_glmm_nb_sparse(
+        &x,
+        &y,
+        n,
+        p,
+        &sized,
+        &ids.primary,
+        &ids.extra,
+        None,
+        &opts,
+    );
+    assert!(dense.converged() && sparse.converged());
+    assert!(
+        (dense.loglik - sparse.loglik).abs() < 1e-5,
+        "loglik dense {} vs bracket {}",
+        dense.loglik,
+        sparse.loglik
+    );
+    assert!(
+        (dense.dispersion - sparse.dispersion).abs() < 1e-3 * sparse.dispersion,
+        "θ̂ dense {} vs bracket {}",
+        dense.dispersion,
+        sparse.dispersion
+    );
+    assert!(dense.n_eval > 0);
+}
+
+/// The GLM outer loop's cold-start seed, pinned against its own formula. The
+/// GLMM `ln θ_NB` coordinate reaches it only through `fit_glm_nb`'s start.
+#[test]
+fn nb_theta_moment_seed_is_the_glm_seed() {
+    let y = [0.0, 4.0, 1.0, 7.0, 2.0, 0.0, 3.0, 9.0];
+    let ybar = y.iter().sum::<f64>() / 8.0;
+    let var = y.iter().map(|v| (v - ybar).powi(2)).sum::<f64>() / 7.0;
+    let expect = (ybar * ybar / (var - ybar).max(1e-6))
+        .clamp(crate::fit::NB_THETA_LO, crate::fit::NB_THETA_HI);
+    assert_eq!(crate::fit::nb_theta_moment_seed(&y, 8), expect);
+    // Underdispersed input pins to the ε floor and the top of the box.
+    let flat = [2.0; 8];
+    assert_eq!(
+        crate::fit::nb_theta_moment_seed(&flat, 8),
+        crate::fit::NB_THETA_HI
     );
 }
 
@@ -2676,23 +2754,25 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
         f.tau2[1].sqrt()
     );
 
-    // Additive bit-exact pin (see doc comment above). Frozen at the same
-    // `golden_max_ln_theta` stopping width (1e-4) this fixture's fit above
-    // just ran at.
     const BAND: f64 = 1e-7;
-    const REF_BETA_PIN: [f64; 2] = [0.5849258898680778, 0.5073630231065611];
-    // Re-pinned 2026-09-02: the exact hyper-dual joint (θ, β) Hessian replaced
-    // the finite-difference stencil on the STRUCTURED extras path too, so this
-    // nested fixture now takes the arm the blocked NB fixture took on
-    // 2026-09-01. The fit is unchanged — β̂, τ̂², θ̂ and the deviance keep their
-    // pins — so the movement is the FD stencil's own truncation-plus-noise
-    // error, 9.58e-6 rel (se[0], worst) against the `se_hessian_rel` band of
-    // 1e-3. Regenerate by running this test and reading the reported value; the
-    // value is glmm's own, not a reference (the lme4 comparison in this same
-    // test keeps its 5e-2 band and did not move).
-    const REF_SE_PIN: [f64; 2] = [0.2048279321099271, 0.0539936652016425];
-    const REF_TAU2_PIN: [f64; 2] = [0.39569392783021273, 0.12615822089462564];
-    const REF_THETA_PIN: f64 = 1.430_063_029_750_896_3;
+    // Additive bit-exact pin (see doc comment above). Re-pinned 2026-09-06 (twice).
+    // First: θ_NB became a coordinate of the outer BOBYQA on the marginal
+    // objective, not a golden-section bracket over re-fits. This fixture takes
+    // `OuterSearch::Joint` (nested extra grouping, non-canonical NB-log,
+    // n_theta = 2, p = 2) rather than the `ExactProfile` arm `sim_nb` takes —
+    // it is the joint-closure pin, where `sim_nb`
+    // (`fit_glmm_nb_sim_matches_lme4`) is the stage-1 pin for the same
+    // coordinate mechanism. That move was 1.3e-5 relative on θ̂ — inside the
+    // bracket's own 1e-4 `ln θ` resolution. Second: the coordinate's cold
+    // start moved from the method-of-moments seed to the no-RE GLM-NB's own
+    // θ̂, for the same reason as `sim_nb`'s second re-pin (the moment seed
+    // charges the RE variance to the dispersion, which breaks random-slope NB
+    // shapes elsewhere in the corpus). That move was 1.79e-4 relative on θ̂,
+    // still inside the bracket's own resolution.
+    const REF_BETA_PIN: [f64; 2] = [0.5849198389846797, 0.5073583977812322];
+    const REF_SE_PIN: [f64; 2] = [0.20484603992926306, 0.053993175017998295];
+    const REF_TAU2_PIN: [f64; 2] = [0.39577064162133146, 0.12619524118998068];
+    const REF_THETA_PIN: f64 = 1.4301256222511467;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb_nested pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb_nested pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb_nested pinned tau2");
@@ -2711,9 +2791,9 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
 /// `ws.outer_search = OuterSearch::PqlThenJoint` on an AGQ fit must be a strict
 /// no-op. Runs the Poisson grouseticks AGQ fixture
 /// (nAGQ=7) through `crate::glmm::fit_glmm` both ways and asserts β̂, θ̂, τ̂², and
-/// n_eval are BIT-identical — the bypass is clean. (A Laplace-pass warm start for
-/// AGQ was measured on the diligent AGQ cells (2026-07-14) and reverted as a wash;
-/// the bypass this canary pins is the shipped state.)
+/// n_eval are BIT-identical — the bypass is clean. (AGQ fits do not use a
+/// Laplace-pass warm start: measured 2026-07-14 on the diligent AGQ cells as a
+/// wash. The bypass this canary pins is the shipped state.)
 #[test]
 fn two_stage_agq_bypass_is_bit_identical() {
     let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
@@ -3120,9 +3200,9 @@ fn fit_glmm_binomial_slope1_vector_agq_is_pinned() {
         1,
         family,
         &[0.42897645003558754, 0.43458315523970653],
-        // Re-pinned 2026-09-01 (was the 2026-07-31 re-anchor): the exact
-        // hyper-dual joint (θ, β) Hessian replaced the FD stencil on the
-        // blocked GLMM path (W3), which covers this vector-AGQ shape. The fit
+        // Re-pinned 2026-09-01: the exact hyper-dual joint (θ, β) Hessian
+        // replaced the FD stencil on the
+        // blocked GLMM path, which covers this vector-AGQ shape. The fit
         // is unchanged — β/stddev/corr keep their constants — so the movement
         // is the FD stencil's own truncation-plus-noise error, measured at
         // 1.32e-5 rel (k=7 se[1], worst) against the `se_hessian_rel` band of
@@ -3140,7 +3220,7 @@ fn fit_glmm_binomial_slope1_vector_agq_is_pinned() {
         1,
         family,
         &[0.42897959050352286, 0.43458759206119546],
-        // Re-pinned 2026-09-01, same W3 exact-Hessian movement as the k=7 row
+        // Re-pinned 2026-09-01, same exact-Hessian movement as the k=7 row
         // above (1.32e-5 rel worst) — see the provenance comment there.
         &[0.15627017032650084, 0.13105173822010058],
         &[0.8758453743269463, 0.3726611962891021],
@@ -3161,7 +3241,7 @@ fn fit_glmm_binomial_slope1_vector_agq_is_pinned() {
 /// observed drift: loose enough to absorb cross-arch reassociation, tight
 /// enough that a real change in the fit still trips it.
 ///
-/// **`ref_se` re-pinned 2026-07-30 (0.1.4 FD-θ-step fix), then re-anchored
+/// **`ref_se` re-pinned 2026-07-30 (FD-θ-step fix), then re-anchored
 /// 2026-07-31; β / stddev / corr are untouched throughout.** This fit's leading
 /// Cholesky diagonal is 1.0118, the only θ coordinate here above 1, so dropping
 /// the `max(1, |θ̂|)` scaling from the FD Hessian's θ step (`glmm::FD_STEP_BASE`,
@@ -3223,7 +3303,7 @@ fn fit_glmm_poisson_slope1_vector_agq_is_pinned() {
 /// long reductions. 5e-5 is ~14x that: loose enough to absorb cross-arch
 /// reassociation, tight enough that a real change in the fit still trips it.
 ///
-/// **`ref_se` re-pinned 2026-07-30 (0.1.4 FD-θ-step fix), then re-anchored
+/// **`ref_se` re-pinned 2026-07-30 (FD-θ-step fix), then re-anchored
 /// 2026-07-31; β / stddev / corr are untouched throughout.** Same mechanism as
 /// the `sim_poisson_slope1` sibling above and documented there: only this fit's
 /// leading Cholesky diagonal (1.0640) is above 1, so exactly one FD θ step shrank,
@@ -3362,7 +3442,115 @@ fn fit_glmm_binomial_no_cluster_signal_is_singular() {
     );
 }
 
-/// R1 of the large-θ̂ coverage spec, AGQ arm: binomial GLMM
+/// The ρ = −1 trap: a `ExactProfile` stage-1 search that stops on the singular
+/// circle Λ_jj = 0, a full deviance unit's sixth above the optimum, and the
+/// pinned-exit re-run at `npt = n + 2` that walks out of it (`fit_glmm`'s trap
+/// comment carries the mechanism).
+///
+/// `tests/fixtures/glmm_npt_trap.csv` is one 800-row Bernoulli draw —
+/// `y ~ x1 + x2 + (1 + x1 + x2 | g)`, 40 clusters × 20 rows, true RE
+/// correlation ≈ −0.76 between the intercept and `x1`. Nothing in the 48-rung
+/// validation corpus exits at a boundary, so without this fixture the whole
+/// re-run path would be untested in-crate.
+///
+/// The two constants are the two basins, both reproduced by this fixture before
+/// the re-run landed: the shipped interpolation set stops at 910.3787 with the
+/// `x1` diagonal pinned, `npt = n + 2` reaches 910.2127 with the `x2` diagonal
+/// pinned instead. lme4 on the same draw: 910.2151 by default and 910.3823 with
+/// `nAGQ0initStep = FALSE` — the same two basins, so this is a property of the
+/// surface, not of one optimizer. `DEV_BAND` is loose because only the basin is
+/// being asserted; the gap between the basins is 170× it.
+///
+/// The RE stddevs, not the pinned-component flags, are what identifies the
+/// basin here. Which diagonal reads as pinned is not stable: the escaped
+/// optimum leaves that diagonal within a few 1e-5 of `PIN_THETA`, and merely
+/// renumbering the 40 clusters (numeric instead of lexicographic label order —
+/// the same model, the same optimum to 1e-9 in deviance) moves it to the other
+/// side of the threshold. The stddevs agree to 5e-5 relative across that
+/// relabelling and separate the two basins by 8–23%, and they also reproduce
+/// lme4's `0.89153 / 0.10321 / 0.23743` on this draw to 0.1%.
+#[test]
+fn fit_glmm_pinned_exit_rerun_escapes_the_singular_circle() {
+    const DEV_BAND: f64 = 1e-3;
+    const SD_BAND: f64 = 5e-3;
+    const TRAPPED_DEVIANCE: f64 = 910.3787035640;
+    const ESCAPED_DEVIANCE: f64 = 910.2127359705;
+    let csv = include_str!("../../tests/fixtures/glmm_npt_trap.csv");
+    let mut y = Vec::<f64>::new();
+    let mut x1 = Vec::<f64>::new();
+    let mut x2 = Vec::<f64>::new();
+    let mut g_raw = Vec::<String>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        x1.push(f[1].parse().unwrap());
+        x2.push(f[2].parse().unwrap());
+        g_raw.push(f[3].to_string());
+    }
+    let n = y.len();
+    let p = 3;
+    let mut x = vec![0.0f64; n * p];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1[i];
+        x[i * p + 2] = x2[i];
+    }
+    let mut labels: Vec<&str> = g_raw.iter().map(String::as_str).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    let primary: Vec<u32> = g_raw
+        .iter()
+        .map(|l| labels.iter().position(|x| x == l).unwrap() as u32)
+        .collect();
+    let n_clusters = labels.len();
+    let ids = GroupIds {
+        primary,
+        extra: vec![],
+    };
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![1, 2],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: (0..p as u32).collect(),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "trap draw must converge");
+    assert!(
+        (f.deviance - ESCAPED_DEVIANCE).abs() < DEV_BAND,
+        "deviance {} is not the interior basin {ESCAPED_DEVIANCE} (trapped basin is {TRAPPED_DEVIANCE})",
+        f.deviance
+    );
+    assert!(
+        f.deviance < TRAPPED_DEVIANCE - DEV_BAND,
+        "the re-run must beat the shipped-npt arm, got {} vs {TRAPPED_DEVIANCE}",
+        f.deviance
+    );
+    assert_pinned(
+        &f.stddev_corr(0).0,
+        &[0.8922556154657538, 0.10371641873371715, 0.23757089840392914],
+        SD_BAND,
+        "trap draw stddev",
+    );
+}
+
+/// Large-θ̂ coverage, AGQ arm: binomial GLMM
 /// `y ~ 1 + x + z + (1 | g)` on `sim_binomial_bigsd` at nAGQ ∈ {7, 11}, gated
 /// against the frozen `glmer(nAGQ = k, tolPwrss = 1e-13)` goldens
 /// `validation/goldens/sim_binomial_bigsd_agq_k{7,11}.json`. lme4-only SE
@@ -3476,12 +3664,11 @@ fn fit_glmm_binomial_bigsd_agq_matches_lme4() {
     }
 }
 
-/// R3 of the large-θ̂ coverage spec: the
-/// θ = 0 end of the same axis, on the **committed** `sim_binomial_zerosd`
-/// fixture rather than a synthetic draw.
+/// The θ = 0 end of the large-θ̂ coverage axis, on the **committed**
+/// `sim_binomial_zerosd` fixture rather than a synthetic draw.
 ///
 /// This gates a *documented behavioural divergence*, not a number, and it is why
-/// R3 is deliberately NOT a curated `datasets` rung (`//large_theta_rungs` in
+/// this test is deliberately NOT a curated `datasets` rung (`//large_theta_rungs` in
 /// `validation/manifest.json`). What diverges from lme4 is only the reporting:
 ///
 /// - **glmm** pins the component and reports `converged = true` with
@@ -3495,14 +3682,15 @@ fn fit_glmm_binomial_bigsd_agq_matches_lme4() {
 /// `compare.R` cannot supply one: it compares β, SEs, stddevs, loglik and
 /// coefficient names and reads no convergence flag at all — and both engines land
 /// on a **bit-exact 0.0** stddev, so every numeric gate it does run reports
-/// perfect agreement. Two further reasons the rung track is closed to R3, both
+/// perfect agreement. Two further reasons the rung track is closed to this test, both
 /// measured 2026-07-30 rather than assumed: lme4's
 /// `vcov(m, use.hessian = TRUE)` — exactly what `engines/lme4.R:269` and `:146`
 /// call — **hard-errors** on this fit (`'use.hessian'=TRUE specified, but Hessian
-/// is unavailable`; `m@optinfo$derivs` is `NULL` on a boundary fit), so R3 as a
-/// rung would abort the whole oracle run; and at θ̂ = 0 the θ↔β coupling block
+/// is unavailable`; `m@optinfo$derivs` is `NULL` on a boundary fit), so running it as
+/// a rung would abort the whole oracle run; and at θ̂ = 0 the θ↔β coupling block
 /// vanishes, so `se_hessian` and `se_rx` collapse onto each other (9.4e-6 apart
-/// here, against 9.7e-2 on R1) — R3 gates nothing about the coupling term.
+/// here, against 9.7e-2 on `fit_glmm_binomial_bigsd_agq_matches_lme4`) — this test
+/// gates nothing about the coupling term.
 ///
 /// Hence: in-crate, no oracle JSON, asserting the flags and the exact zero.
 /// The exact zero is the assert that has to be `==`, not a band: `rel_max` floors
@@ -4035,5 +4223,468 @@ fn agq_counters_report_evals_times_nodes() {
         agq.counters.agq_node_evals,
         agq.counters.agq_evals as u64 * n_clusters * 7,
         "node cost is evals x clusters x nagq^1"
+    );
+}
+
+/// Uniform(0,1) off the shared LCG (`lcg` is uniform on (-1,1)).
+fn nb_slope_uniform01(st: &mut u64) -> f64 {
+    (super::common_tests::lcg(st) + 1.0) / 2.0
+}
+
+/// Standard normal via a Box-Muller transform of two `nb_slope_uniform01` draws.
+fn nb_slope_std_normal(st: &mut u64) -> f64 {
+    let u1 = nb_slope_uniform01(st).max(1e-12);
+    let u2 = nb_slope_uniform01(st);
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+/// Gamma(shape, scale) via Marsaglia-Tsang (2000): direct rejection sampling
+/// for `shape >= 1`, boosted by one unit and corrected by a
+/// `Uniform(0,1)^(1/shape)` factor below that.
+fn nb_slope_gamma(st: &mut u64, shape: f64, scale: f64) -> f64 {
+    if shape < 1.0 {
+        let u = nb_slope_uniform01(st);
+        return nb_slope_gamma(st, shape + 1.0, scale) * u.powf(1.0 / shape);
+    }
+    let d = shape - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    loop {
+        let mut x;
+        let mut v;
+        loop {
+            x = nb_slope_std_normal(st);
+            v = 1.0 + c * x;
+            if v > 0.0 {
+                break;
+            }
+        }
+        v = v * v * v;
+        let u = nb_slope_uniform01(st);
+        if u < 1.0 - 0.0331 * x.powi(4) || u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+            return d * v * scale;
+        }
+    }
+}
+
+/// Poisson(lambda) via Knuth's multiplicative sampler — exact, and cheap at
+/// the small means this fixture draws.
+fn nb_slope_poisson(st: &mut u64, lambda: f64) -> f64 {
+    let l = (-lambda).exp();
+    let mut k = 0.0;
+    let mut p = 1.0;
+    loop {
+        k += 1.0;
+        p *= nb_slope_uniform01(st);
+        if p <= l {
+            break;
+        }
+    }
+    k - 1.0
+}
+
+/// Negative-binomial counts on an imbalanced correlated random-INTERCEPT-AND-
+/// SLOPE design: `y ~ 1 + x + (1 + x | g)`, 15 groups over 300 rows, 20% of
+/// the groups carrying 80% of the rows. Each group's `(intercept, slope)`
+/// pair is a correlated bivariate normal (correlation 0.2, sd 0.6 on the
+/// intercept and 0.54 on the slope) built from two `nb_slope_std_normal`
+/// draws; `x` is standard normal; counts are a genuine Gamma(θ, μ/θ)-Poisson
+/// mixture at θ = 1.5 (`nb_slope_gamma` + `nb_slope_poisson`), which is
+/// exactly how `MASS::rnegbin` draws negative-binomial counts. Every draw
+/// comes off one seeded LCG, so the fixture is exactly reproducible.
+///
+/// The group-size imbalance is what makes the naive method-of-moments
+/// dispersion seed collapse far enough below θ̂ for a fixed seed to still
+/// reliably trip the bug this file guards against (see the test below): a
+/// balanced version of the same random-slope design usually seeds close
+/// enough to θ̂ that PIRLS still converges from there, so it doesn't
+/// reproduce the failure on every run.
+fn sim_nb_slope_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
+    const N: usize = 300;
+    const N_CLUSTERS: usize = 15;
+    const BETA0: f64 = 0.4;
+    const BETA1: f64 = 0.8;
+    const SD0: f64 = 0.6;
+    const SD1: f64 = 0.54;
+    const RHO: f64 = 0.2;
+    const THETA_TRUE: f64 = 1.5;
+    const N_HEAVY: usize = 3; // 20% of 15 groups carry 80% of the rows
+
+    let mut st = 900012u64;
+    let mut cluster_ids = vec![0u32; N];
+    for (i, cid) in cluster_ids.iter_mut().enumerate() {
+        // 80% of rows round-robin over the N_HEAVY heavy groups, the
+        // remaining 20% round-robin over the rest — deterministic stand-in
+        // for the weighted multinomial group draw an R simulation would use.
+        let u = nb_slope_uniform01(&mut st);
+        *cid = if u < 0.8 {
+            (i % N_HEAVY) as u32
+        } else {
+            (N_HEAVY + i % (N_CLUSTERS - N_HEAVY)) as u32
+        };
+    }
+    let mut b0 = [0.0f64; N_CLUSTERS];
+    let mut b1 = [0.0f64; N_CLUSTERS];
+    for g in 0..N_CLUSTERS {
+        let z0 = nb_slope_std_normal(&mut st);
+        let z1 = nb_slope_std_normal(&mut st);
+        b0[g] = SD0 * z0;
+        b1[g] = SD1 * (RHO * z0 + (1.0 - RHO * RHO).sqrt() * z1);
+    }
+    let mut x = vec![0.0f64; N * 2];
+    let mut y = vec![0.0f64; N];
+    for i in 0..N {
+        let g = cluster_ids[i] as usize;
+        let xi = nb_slope_std_normal(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = xi;
+        let mu = (BETA0 + BETA1 * xi + b0[g] + b1[g] * xi).exp();
+        let lambda = nb_slope_gamma(&mut st, THETA_TRUE, mu / THETA_TRUE);
+        y[i] = nb_slope_poisson(&mut st, lambda);
+    }
+    (x, y, cluster_ids, N_CLUSTERS)
+}
+
+/// Pins the fix for the NB dispersion coordinate's cold start on a
+/// random-slope shape. `fit_glmm_nb` searches `ln θ_NB` as a trailing
+/// coordinate of the outer BOBYQA over the marginal objective, and that
+/// coordinate needs a starting value where the exact-profile PIRLS inside it
+/// actually converges. The naive method-of-moments seed
+/// (`nb_theta_moment_seed`, `ȳ²/(s²−ȳ)`) charges every source of variance in
+/// `y` — including random-slope variance — to the NB dispersion, so on a
+/// random-slope shape it can land one to two orders of magnitude below the
+/// fitted θ̂, on a start where PIRLS does not converge. That handed the outer
+/// BOBYQA a `+∞` incumbent it could not climb out of: on this exact fixture,
+/// reverting to the naive seed makes the fit report `converged = false` with
+/// `loglik = NaN` after only a handful of evaluations, stuck at the seed
+/// value. The fix seeds the coordinate from the no-RE NB GLM's own θ̂
+/// (`fit_glm_nb`) instead, which starts inside the basin PIRLS can converge
+/// in.
+///
+/// Every other negative-binomial fixture in this file is intercept-shaped
+/// (one scalar grouping, or two scalar-intercept blocks), so none of them
+/// exercise the random-slope case. This fixture uses `y ~ 1 + x + (1 + x | g)`
+/// — two random-effect variances and a correlation (`n_theta = 3`), `p = 2`
+/// fixed effects — the shape the naive seed breaks. The test checks the
+/// fixture actually reproduces that precondition (the moment seed at least
+/// 10x below θ̂) before trusting anything else, so a fixture whose
+/// random-effect variance or group imbalance drifted over time cannot pass
+/// while silently no longer covering the bug. It then checks the dense fit
+/// converges and agrees with the sparse negative-binomial route
+/// (`fit_glmm_nb_sparse`), which still finds θ̂ by a golden-section bracket
+/// over full re-fits rather than as a BOBYQA coordinate — a solver
+/// independent of the one under test, on the same marginal objective.
+#[test]
+fn fit_glmm_nb_random_slope_seed_lands_in_convergent_basin() {
+    let (x, y, cluster_ids, n_clusters) = sim_nb_slope_dataset();
+    let (n, p) = (y.len(), 2);
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        wald_se: crate::WaldSe::Rx,
+        ..FitOptions::default()
+    };
+
+    let dense = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(dense.converged(), "NB random-slope GLMM must converge");
+
+    // The precondition the original bug needed: the naive moment seed must
+    // land at least an order of magnitude below θ̂. A fixture that lost this
+    // property would no longer start the coordinate outside the convergent
+    // basin, so it would stop being a regression test for the bug at all.
+    let moment_seed = crate::fit::nb_theta_moment_seed(&y, n);
+    assert!(
+        moment_seed < dense.dispersion / 10.0,
+        "fixture must put the moment seed >=10x below θ̂: seed={moment_seed} θ̂={}",
+        dense.dispersion
+    );
+
+    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
+    let sparse = crate::sparse::fit_glmm_nb_sparse(
+        &x,
+        &y,
+        n,
+        p,
+        &sized,
+        &ids.primary,
+        &ids.extra,
+        None,
+        &opts,
+    );
+    assert!(
+        sparse.converged(),
+        "sparse NB random-slope reference must converge"
+    );
+    assert!(
+        (dense.loglik - sparse.loglik).abs() < 1e-5,
+        "loglik dense {} vs sparse bracket {}",
+        dense.loglik,
+        sparse.loglik
+    );
+    assert!(
+        (dense.dispersion - sparse.dispersion).abs() < 1e-3 * sparse.dispersion,
+        "θ̂ dense {} vs sparse bracket {}",
+        dense.dispersion,
+        sparse.dispersion
+    );
+    assert!(dense.n_eval > 0);
+}
+
+/// Uniform(0,1) via a 64-bit LCG (splitmix-style constants). Reproduces the
+/// `+INF`-plateau cell bit for bit.
+fn inf_plateau_lcg_next(state: &mut u64) -> f64 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (((*state >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
+}
+
+fn inf_plateau_normal(state: &mut u64) -> f64 {
+    let (u1, u2) = (inf_plateau_lcg_next(state), inf_plateau_lcg_next(state));
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+}
+
+fn inf_plateau_exp1(state: &mut u64) -> f64 {
+    -inf_plateau_lcg_next(state).ln()
+}
+
+/// Poisson(lambda) by the naive product-of-uniforms method — matches the
+/// reproduction exactly, including its large-lambda normal-approximation
+/// branch (never hit at this fixture's means).
+fn inf_plateau_poisson(state: &mut u64, lambda: f64) -> f64 {
+    if lambda > 200.0 {
+        return (lambda + lambda.sqrt() * inf_plateau_normal(state))
+            .max(0.0)
+            .round();
+    }
+    let l = (-lambda).exp();
+    let (mut k, mut prod) = (0.0f64, inf_plateau_lcg_next(state));
+    while prod > l {
+        k += 1.0;
+        prod *= inf_plateau_lcg_next(state);
+        if k > 1e6 {
+            break;
+        }
+    }
+    k
+}
+
+/// Negative-binomial counts (as a Poisson-Exponential(1) mixture, i.e. NB with
+/// shape 1) on a random-INTERCEPT-only design: `y ~ 1 + x + (1 | g)`, 10
+/// clusters x 3 rows. This is the pathological-sweep cell that reproduces the
+/// `+INF` plateau: 15 of the 16 gating-stage BOBYQA evaluations
+/// diverge in PIRLS (`laplace_deviance` returns `+INFINITY`), one evaluation
+/// is finite, and — before the finite-eval-count guard — the run exits
+/// `Status::Converged` at the untouched θ_RE cold start (`THETA0 = 1.0`)
+/// with a KKT residual above the crate's own interior band. Every draw comes
+/// off one seeded LCG, so the fixture is exactly reproducible.
+fn sim_nb_inf_plateau_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
+    const N_CLUSTERS: usize = 10;
+    const PER: usize = 3;
+    const SD_INT: f64 = 1.5;
+    const SD_SLOPE: f64 = 4.0;
+    const SEED: u64 = 4;
+
+    let mut state = SEED
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(0x1234_5678 ^ (N_CLUSTERS as u64) << 20);
+    let n = N_CLUSTERS * PER;
+    let mut x = Vec::with_capacity(n * 2);
+    let mut y = Vec::with_capacity(n);
+    let mut cluster_ids = Vec::with_capacity(n);
+    for c in 0..N_CLUSTERS {
+        let ui = SD_INT * inf_plateau_normal(&mut state);
+        let us = SD_SLOPE * inf_plateau_normal(&mut state);
+        for _ in 0..PER {
+            let xv = inf_plateau_lcg_next(&mut state) * 2.0 - 1.0;
+            let eta = 0.5 + 0.8 * xv + ui + us * xv;
+            let mu = eta.exp().clamp(1e-8, 1e6);
+            let e = inf_plateau_exp1(&mut state);
+            x.push(1.0);
+            x.push(xv);
+            y.push(inf_plateau_poisson(&mut state, mu * e));
+            cluster_ids.push(c as u32);
+        }
+    }
+    (x, y, cluster_ids, N_CLUSTERS)
+}
+
+/// Pins the fix for the `+INF` plateau: BOBYQA's `moderatef` maps both `NaN`
+/// and `+inf` to `FUNCMAX`, so a gating-stage search where PIRLS diverges on
+/// (almost) every evaluation is a flat *finite* surface — it shrinks to
+/// `rho_end` and exits `Status::Converged` having compared close to nothing.
+/// On this fixture only 1 of 16 stage-1 evaluations is genuinely finite, so
+/// before the fix the fit reported `converged = true` with `theta_RE` still
+/// at its cold start and a KKT residual above the interior band. The fix
+/// requires at least 2 finite evaluations before trusting `Status::Converged`.
+#[test]
+fn fit_glmm_nb_random_intercept_inf_plateau_does_not_converge() {
+    let (x, y, cluster_ids, n_clusters) = sim_nb_inf_plateau_dataset();
+    let n = y.len();
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions::default();
+
+    let f = fit_cold(&x, &y, n, 2, &model, &ids, &opts);
+
+    assert!(
+        !f.converged(),
+        "the +INF plateau fit must not report converged"
+    );
+    assert!(
+        f.varcorr.iter().all(|row| row.iter().all(|v| v.is_nan())),
+        "varcorr must be NaN-filled on a non-converged fit: {:?}",
+        f.varcorr
+    );
+    assert!(
+        f.tau2.iter().all(|t| t.is_nan()),
+        "tau2 must be NaN-filled on a non-converged fit: {:?}",
+        f.tau2
+    );
+}
+
+/// Perfectly separated data forced through the dense GLMM route:
+/// `y ~ x + (1|g)`, `y ∈ {1e-6, 1e6}` split exactly on `x ∈ {0, 1}` — no
+/// finite Gamma-log fit exists. `dispersion` must be NaN, not the Gamma
+/// exponential special case `φ=1`, which a caller cannot tell from a real
+/// estimate.
+#[test]
+fn fit_glmm_gamma_failed_fit_dispersion_is_nan() {
+    let n = 24;
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = if i < 12 { 0.0 } else { 1.0 };
+        y[i] = if i < 12 { 1e-6 } else { 1e6 };
+    }
+    let cluster_ids: Vec<u32> = (0..n as u32).map(|i| i % 4).collect();
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 4 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(
+        !f.converged(),
+        "perfectly separated Gamma GLMM must not converge"
+    );
+    assert!(
+        f.dispersion.is_nan(),
+        "dispersion must be NaN on a failed fit, not the Gamma exponential special case 1.0: {}",
+        f.dispersion
+    );
+}
+
+/// Negative-binomial log link, dense route: `dispersion` must be NaN rather
+/// than whatever θ coordinate the outer BOBYQA search happened to be
+/// standing on when it gave up. The perfectly-separated reproducer above
+/// (`y ∈ {1e-6, 1e6}` on `x ∈ {0, 1}`) converges fine under NB — the extra θ
+/// coordinate absorbs the separation that starves Gamma, parking at
+/// `NB_THETA_HI` and reporting `converged = true` (boundary counts as
+/// converged) — so this instead reuses [`sim_nb_inf_plateau_dataset`]'s LCG
+/// (random-slope-generated counts fit as random-INTERCEPT-only) at a much
+/// larger slope spread (`sd_slope = 8`, vs. that fixture's `4`) so that NO
+/// evaluation is ever finite, not just "almost every" one. That is
+/// deliberately outside the reach of the separate `+INF`-plateau finite-eval-
+/// count guard (`fit_glmm_nb_random_intercept_inf_plateau_
+/// does_not_converge`): `best` never turns finite in the first place, so this
+/// reports `converged = false` on the guard's ORIGINAL logic already, with no
+/// dependency on that separate fix's state.
+#[test]
+fn fit_glmm_nb_failed_fit_dispersion_is_nan() {
+    const N_CLUSTERS: usize = 10;
+    const PER: usize = 3;
+    const SD_INT: f64 = 1.5;
+    const SD_SLOPE: f64 = 8.0;
+    const SEED: u64 = 4;
+    let mut state = SEED
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(0x1234_5678 ^ (N_CLUSTERS as u64) << 20);
+    let n = N_CLUSTERS * PER;
+    let mut x = Vec::with_capacity(n * 2);
+    let mut y = Vec::with_capacity(n);
+    let mut cluster_ids = Vec::with_capacity(n);
+    for c in 0..N_CLUSTERS {
+        let ui = SD_INT * inf_plateau_normal(&mut state);
+        let us = SD_SLOPE * inf_plateau_normal(&mut state);
+        for _ in 0..PER {
+            let xv = inf_plateau_lcg_next(&mut state) * 2.0 - 1.0;
+            let eta = 0.5 + 0.8 * xv + ui + us * xv;
+            let mu = eta.exp().clamp(1e-8, 1e6);
+            let e = inf_plateau_exp1(&mut state);
+            x.push(1.0);
+            x.push(xv);
+            y.push(inf_plateau_poisson(&mut state, mu * e));
+            cluster_ids.push(c as u32);
+        }
+    }
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: N_CLUSTERS as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let f = fit_cold(&x, &y, n, 2, &model, &ids, &FitOptions::default());
+    assert!(
+        !f.converged(),
+        "random-slope counts fit as random-intercept-only at this slope spread must not converge"
+    );
+    assert!(
+        f.dispersion.is_nan(),
+        "dispersion must be NaN on a failed fit, not the θ the outer search stood on: {}",
+        f.dispersion
     );
 }

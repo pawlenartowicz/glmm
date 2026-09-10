@@ -1,4 +1,4 @@
-"""Factor level order — §6 of the python-port-bugs spec.
+"""Factor level order.
 
 Level 0 is the treatment-contrast base, so a column's level order picks the
 reference level. A declared order (pandas `Categorical`) must survive to the
@@ -52,8 +52,8 @@ def test_plain_string_column_still_sorts_lexicographically():
 
 
 def test_categorical_of_non_strings_is_not_fit_as_numeric():
-    # The old detection was `isinstance(values[0], str)`, so a categorical of
-    # ints fell through to the numeric branch and was fit as ONE continuous
+    # Detection must not rely on `isinstance(values[0], str)`: a categorical of
+    # ints would fall through to the numeric branch and fit as ONE continuous
     # slope instead of expanding to dummies.
     data = {"y": _Y, "f": _FakeCategorical([10, 20, 30], [0, 2, 1, 0, 2, 1])}
     result = glmm.fit(data, "y ~ f")
@@ -84,7 +84,7 @@ def test_pandas_categorical_round_trips():
 
 
 def test_vcov_matches_se_and_is_symmetric():
-    # §4: vcov is the full p×p, se is its diagonal.
+    # vcov is the full p×p, se is its diagonal.
     result = glmm.fit({"y": _Y, "f": _LABELS}, "y ~ f")
     p = len(result.beta)
     assert result.vcov.shape == (p, p)

@@ -43,15 +43,10 @@ cells <- manifest_cells(file.path(suite_dir, "manifest.json"))
 # ---- deviance alignment to MixedModels' objective() scale ----------------------
 # glmm's deviance conventions, pinned empirically on grid cells: poisson,
 # binary binomial AND aggregated binomial are ALL on MixedModels'
-# unit-deviance scale -- identity, no constant. Aggregated binomial was
-# re-pinned 2026-07-11: the 2026-07-09 pin had it on the choose-free scale
-# (correction = twice the aggregated saturated kernel), but the prior-weights
-# landing of 2026-07-10 moved the weighted-binomial deviance onto the
-# unit-deviance scale; on the 2026-07-11 Study-A run identity agrees with
-# MixedModels to 1.7e-9 worst-case across all 36 agreed aggregated cells while
-# the old kernel correction was off by ~1e1 relative on every one (the
-# align-check hard stop below is what caught it). Gaussian: REML offset
-# df*(1+log(2pi)) validated in-crate against lme4 (Task 2).
+# unit-deviance scale -- identity, no constant. On the 2026-07-11 Study-A run
+# identity agrees with MixedModels to 1.7e-9 worst-case across all 36 agreed
+# aggregated cells (the align-check hard stop below catches any drift).
+# Gaussian: REML offset df*(1+log(2pi)) validated in-crate against lme4.
 glmm_dev_aligned <- function(cell, dev) {
   # timeout/engine-fail records carry deviance:null -> NULL here; is.finite(NULL)
   # is logical(0) and would abort the whole analysis

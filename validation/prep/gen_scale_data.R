@@ -4,13 +4,13 @@
 # uses. Run standalone with `Rscript validation/prep/gen_scale_data.R`, or as one
 # of the prep scripts `run.sh --prep` invokes.
 #
-# WHY THESE EXIST. The GLM/IRLS divergence guard used to bound |beta|, an
-# absolute bound on a quantity that is not a property of the model: multiplying a
-# predictor column by 1000 divides its coefficient by 1000 and changes nothing
-# else -- same fitted values, same deviance, same conditioning, same iteration
-# count. The guard therefore accepted or rejected the same model depending on the
-# caller's units. It now bounds max|eta|, which does not move under rescaling.
-# These designs are the reference side of that claim:
+# WHY THESE EXIST. The GLM/IRLS divergence guard bounds max|eta|, not |beta|:
+# |beta| is not a property of the model -- multiplying a predictor column by
+# 1000 divides its coefficient by 1000 and changes nothing else (same fitted
+# values, same deviance, same conditioning, same iteration count), so bounding
+# it would accept or reject the same model depending on the caller's units.
+# max|eta| does not move under rescaling. These designs are the reference side
+# of that claim:
 #
 #   sim_scale_logit      y ~ x, y ~ x_small, y ~ x_big   ONE logistic fit in
 #                        three unit systems (x_small = x/1000, x_big = x*1000).

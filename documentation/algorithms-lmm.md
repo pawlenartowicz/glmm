@@ -2,7 +2,7 @@
 
 This is the LMM page of the algorithm map — the path taken when
 `ModelSpec.family == Family::Gaussian` and `re: Some(..)`. It documents only
-what the code does today. For the dispatch overview, the knob index, and the
+what the code does. For the dispatch overview, the knob index, and the
 OLS/GLM paths, start at [`algorithms.md`](algorithms.md); for the family table
 see [`supported_families.md`](supported_families.md). The page ends with a
 [comparison](#how-the-other-engines-fit-an-lmm) against lme4 and
@@ -57,10 +57,12 @@ Three real routing decisions sit between `fit_cold`/`fit_warm` and a returned
    [the sparse section](#the-sparse-kernel-two-level-schur-block-cholesky)
    for why that equivalence is structural, not approximate).
 3. **Deviance sub-path** (inside `fit_lmm`'s `reml_deviance`, `src/lmm/kernel.rs`) —
-   extra-grouping random slopes route to `reml_deviance_blocked`; an
-   intercept-only primary with a balanced level structure takes the
+   an intercept-only primary with a balanced level structure takes the
    closed-form collapse shortcut; everything else takes the general
-   family-by-family elimination.
+   family-by-family elimination. `reml_deviance` also has a
+   `reml_deviance_blocked` branch for extra-grouping random slopes, but
+   decision 1 sends every such design to `Sparse`, so from `fit_cold`/`fit_warm`
+   that branch is unreachable; only in-crate tests call it.
 
 ```mermaid
 flowchart TD
@@ -68,19 +70,18 @@ flowchart TD
     B -->|"over envelope / slope on extra / >500 crossed levels"| S["Solver::Sparse: fit_mle_sparse"]
     B -->|"in envelope"| N["Solver::NoZ: lmm_run_on -> fit_lmm"]
     N --> C{"reml_deviance sub-path"}
-    C -->|"slope on extra grouping"| BL["reml_deviance_blocked"]
     C -->|"intercept-only primary, balanced"| CO["balanced collapse shortcut"]
     C -->|"otherwise"| GP["general family elimination"]
 ```
 
-The blocked sub-path is a different, more expensive factorization, not a
+The blocked sub-path (test-only from the public entry points, see decision 3)
+is a different, more expensive factorization, not a
 variant of the general one. The general path
 eliminates family-by-family and never materialises a joint RE system; the
 **blocked** path builds the full `k_total × k_total` block-diagonal Λ
 (component-scattered for the primary, contiguous per-level for nested/crossed
 extras), forms the raw RE Gram `G = ZᵀZ`, and takes **one dense Cholesky** of
-`P = ΛᵀGΛ + I` augmented with `[X y]` — `O(k_total³)` per evaluation, paid
-only when an extra grouping carries a random slope.
+`P = ΛᵀGΛ + I` augmented with `[X y]` — `O(k_total³)` per evaluation.
 
 **Code**: `classify_design` (`src/fit/mod.rs`); `build_workspace`/`fit_on`
 (`src/fit/core.rs`); `accumulate_lmm_rows`, `lmm_run_on` (`src/fit/lmm.rs`);
@@ -226,7 +227,11 @@ per-level counts for an equal-count active prefix starting at family 0, and
 additionally requires the *nested-child* counts to match one common template
 across the active families and to be exactly zero outside it — any hole in the
 prefix silently disarms the collapse (`collapse_n_active = 0`) rather than
-producing a wrong answer. When armed, it accumulates the θ-independent
+producing a wrong answer. The same precompute arms the dual and hyper-dual
+REML scratches, so the exact gradient and Hessian evaluate the collapsed form
+too — the collapse is a reassociation of the same criterion, not a different
+one, so it moves the derivative values only in their last ulps. When armed,
+it accumulates the θ-independent
 cross-Grams `G_rr′` once; each θ-evaluation then replaces the per-family loop
 with three cheap pieces: a single Crout of the common block `A(θ)`, an
 `n_active·log|L|` term for the family log-determinant, and one θ-independent
@@ -299,8 +304,8 @@ PIN_THETA (1e-4)` is set to exactly `0.0`, the fit is still counted as converged
 and the component's bit is recorded in `pinned_components`. Off-diagonal
 covariances are never pinned — a correlation running to `±1` shows up as the
 *diagonal* `λ_dd → 0` under the Cholesky parameterization, so pinning the
-diagonal is the complete policy. `PIN_THETA = 1e-4` matched the retired scalar
-Brent kernel's τ̂≈0 detection threshold. The test is on the **internal**
+diagonal is the complete policy. `PIN_THETA = 1e-4` is kept at the value the
+scalar q=1 Brent kernel used for its τ̂≈0 detection threshold. The test is on the **internal**
 (scaled) θ — see
 [Random-effect design column scaling](#random-effect-design-column-scaling) — so
 its verdict does not change when a random-slope covariate is re-expressed in
@@ -319,6 +324,28 @@ policy after its stage-2 BOBYQA
 ([`algorithms-glmm.md` §Boundary handling](algorithms-glmm.md#boundary-handling-and-the-singular-flag)
 — change together).
 
+### Canonical Λ after the pin
+
+On a `q ≥ 2` block, a pinned diagonal `λ_jj = 0` leaves the entries *below* it in
+column `j` unidentified: rotating that column changes θ but not `Σ = ΛΛ′`, so it
+changes neither the deviance nor β̂, `varcorr` or `ranef`, and BOBYQA can stop
+anywhere on that flat circle. So the pin loop is followed by
+`canonicalize_pinned_blocks` (`src/lmm/mod.rs`), which rebuilds `Σ` from each
+pinned block's Λ and re-factors it with a semidefinite-tolerant lower Cholesky —
+a pivot at or below `q·ε·tr Σ` zeroes that whole column. The variance that was
+sitting below a pinned diagonal folds into the trailing diagonals, where it is a
+component the caller can read, and the pin test then runs again on the new
+diagonals. Because Σ is preserved, the reported answer does not move; what
+changes is θ itself (and `tau2`, which is per-θ). A block with no pinned diagonal
+is skipped untouched, so a non-singular fit is bit-identical.
+
+Two reported fields depend on this canonical form. `Diagnostics::pinned` becomes
+truthful — a zero θ diagonal is now a zero standard deviation, which on a
+non-canonical Λ it need not be — and `Diagnostics::boundary_score` is reportable
+at every pinned diagonal, because its `½·∂²D/∂θ_jj²` shortcut needs the deviance
+to be even in `θ_jj`, which needs exactly the zero column below the diagonal that
+canonicalization produces. The sparse and GLMM paths run the same step.
+
 A truth-seeded warm start is clamped to `THETA_TRUTH_FLOOR = 0.01` first, so a
 near-zero true θ never begins the search on the boundary itself.
 
@@ -332,8 +359,8 @@ into two cases — the **plateau policy**, pinned by
   `max_fun` on a flat deviance plateau, that point is usually close to the
   optimum.)
 - `ModelDegenerate` (no accepted endpoint), or a non-finite deviance at the
-  endpoint, yields the NaN-filled, non-converged fit. There is no longer a
-  rank guard on the endpoint's factor: `fit_lmm` fits a near-singular but
+  endpoint, yields the NaN-filled, non-converged fit. The endpoint's factor
+  carries no rank guard: `fit_lmm` fits a near-singular but
   finite endpoint instead of refusing it.
 
 The sparse path mirrors the same plateau policy.

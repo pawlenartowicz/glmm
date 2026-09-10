@@ -137,7 +137,7 @@ Penicillin, Pastes, sim_slope_extra on the Gaussian side; cbpp, grouseticks,
   `src/fit/{ols,glm,lmm,glmm}.rs`, their tests in the sibling `*_tests.rs`
   files, and the sparse solver in `src/sparse/`.)
 - The map grows with the crate: future optimizer tiers and additional families
-  will add leaves and edges, but this document tracks only what ships today.
+  will add leaves and edges, but this document tracks only what currently ships.
 
 ## Knob index
 
@@ -169,7 +169,7 @@ and are not user-facing.
 | `PIN_THETA` | `1e-4` — diagonal variance component pinned to `0`, tested on the internal (scaled) θ | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm/mod.rs`) |
 | `SINGULAR_REL_TOL` | `1e-3` — post-hoc relative check: any RE stddev `≤ 1e-3 ×` the largest ⇒ `singular`, on the internal (scaled) stddevs | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/fit/mod.rs`) |
 | RE design column scale | per random-slope column, `√(Σ wᵢxᵢ²/Σ wᵢ)`; intercept subcolumns exactly `1.0`; always on, no trigger | [`algorithms-lmm.md`](algorithms-lmm.md#random-effect-design-column-scaling) (`src/lmm/mod.rs`) |
-| `two_stage` warm-start gate | disabled when `n_θ ≤ 2 && p ≤ 4`, else enabled | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-two-stage-optimizer) (`src/glmm/workspace.rs`) |
+| `outer_search` route | `ExactProfile` on the `exact_profile_shape` shapes (nAGQ=1, non-Gamma, no extras or canonical structured extras); else `Joint` when `nAGQ>1 \|\| (n_θ ≤ 2 && p ≤ 4)`; else `PqlThenJoint` | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/workspace.rs`, `src/glmm/mod.rs`) |
 | `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: any `|η_i| > 30` at IRLS iter ≥ 3 → non-converged; skipped under the Gamma inverse link | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `SATURATION_W` / `SATURATION_FRAC` | `1e-5` / `0.5` — post-fit separation guard: > half the (weighted) rows saturated → non-converged | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `MAX_PRIMARY_Q` | `8` — primary width cap (over → Sparse) | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
@@ -178,11 +178,13 @@ and are not user-facing.
 | `MAX_THETA` | derived θ-length ceiling: `vech(Λ_p)` + one `vech(Λ_g)` block per extra = `8·9/2 + 6·(4·5/2) = 96` | [dispatch](#full-dispatch-map) (`src/consts.rs`) — sizes every θ-length stack buffer |
 | `MAX_CROSSED_LEVELS` | `500` — total crossed-level cap (over → Sparse; a performance boundary, not scratch) | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
 | `MAX_NAGQ` | `25` — largest odd AGQ order the GH table stores | [`algorithms-glmm.md`](algorithms-glmm.md#adaptive-gausshermite-quadrature-agq) (`src/consts.rs`) |
+| `MAX_DUAL_N` / `MAX_DUAL_H` | `12` / `78` — the top instantiated dual and hyper-dual rung; lanes are instantiated at `N ∈ {4, 5, 6, 8, 12}`. Above `MAX_DUAL_N` the gradient chunks, the Hessian takes the FD stencil | [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (`src/glmm/derivative.rs`) |
 
 The NB GLM outer-loop constants (`NB_MAX_OUTER = 25`, `NB_THETA_TOL = 1e-6`,
 `NB_THETA_LO = 1e-3`, `NB_THETA_HI = 1e4`) are covered in the
-[GLM section](#generalised-linear-models-glm) below; the GLMM NB path reuses the
-same bracket through a global golden-section search
+[GLM section](#generalised-linear-models-glm) below; both GLMM NB paths reuse the
+same bounds — the sparse one as a global golden-section bracket, the dense one as
+the box on its outer BOBYQA's `ln θ` coordinate
 ([`algorithms-glmm.md`](algorithms-glmm.md#negative-binomial-outer-θ-loop)).
 
 ## Ordinary least squares (OLS)
@@ -209,8 +211,8 @@ column is `√(σ̂²·‖L⁻¹e_j‖²)` from one forward solve against the Ch
 returns a non-converged, `NaN`-filled fit; a near-singular but PD factor is
 fitted, and its scale-invariant pivot ratio (`min_pivot_ratio`) is measured
 and, below `PIVOT_MIN = 1e-12`, recorded as an `IllConditioned` note on
-`Fit::diagnostics` rather than refused. `fit_suff_stats_t_sq` no longer takes
-an `eps_rank` parameter. `Fit::dispersion` carries `σ̂²` on this path (`NaN` on
+`Fit::diagnostics` rather than refused. `fit_suff_stats_t_sq` takes no
+`eps_rank` parameter. `Fit::dispersion` carries `σ̂²` on this path (`NaN` on
 any non-converged return); `Fit::deviance` is **always** `NaN` on the OLS
 path — it is never populated, converged or not.
 
@@ -371,9 +373,11 @@ One reporting caveat, pinned by `fit_glm_nb_outer_cap_semantics`
 tolerance is met, `converged` reflects only the **last inner IRLS fit** — it
 can read `true` while β/SE are one θ-update stale relative to the reported
 `dispersion`. A caller who needs the alternation itself converged must check
-θ stability, not just the flag. (The GLMM NB path is immune by construction:
-it uses a single global golden-section search over `ln θ` rather than this
-warm-seeded alternation — see
+θ stability, not just the flag. (The sparse GLMM NB path is immune by
+construction: it uses a single global golden-section search over `ln θ` rather
+than this warm-seeded alternation. The dense one seeds its `ln θ_NB` coordinate
+from exactly this alternation, so a cap-exhausted prefit hands it a stale start
+— a start only, which the outer search then moves — see
 [`algorithms-glmm.md`](algorithms-glmm.md#negative-binomial-outer-θ-loop).)
 
 ## How the other engines organize this

@@ -277,9 +277,9 @@ fn fit_ols_constant_weights_invariant() {
 /// so in `X'WX` — the matrix β̂ and its SEs actually come from — the columns are
 /// very nearly the same column, and the pivot ratio falls below 1e-12.
 ///
-/// The route used to guard this on `min|L_ii| / max|L_ii|`, which conflates
-/// collinearity with column scale and never fires here (measured 4.8e-8, four
-/// orders above its own 1e-12 threshold). It is not fixed by refusing on the
+/// The `min|L_ii| / max|L_ii|` statistic conflates collinearity with column
+/// scale and never fires here (measured 4.8e-8, four orders above its own
+/// 1e-12 threshold), so the route does not guard on it. It is not fixed by refusing on the
 /// right statistic either: the 2026-07-31 1-ULP sweep showed this route's
 /// standard errors stay stable to 1.3e-13 relative and never understate the
 /// error, all the way past total loss of β̂. So the deliverable is the

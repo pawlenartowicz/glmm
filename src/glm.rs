@@ -180,8 +180,8 @@ pub fn sigmoid_stable(eta: f64) -> f64 {
 ///
 /// `family` selects the IRLS math, all of it behind one batched call into
 /// `simd_transcendental::family_pass`. Unweighted `Family::Binomial { link:
-/// Logit }` reaches the fused kernel `pw_and_log1pexp_sum` there — the MCPower
-/// hot loop, byte-identical to before that kernel was shared; every other
+/// Logit }` reaches the fused kernel `pw_and_log1pexp_sum` there, byte-identical
+/// to the MCPower hot loop's own computation; every other
 /// family/link runs a vectorized arm written against [`crate::family`]'s scalar
 /// formulas. Gamma/NB dispersion is handled by the caller (`fit.rs`),
 /// not here — this kernel folds `φ=1`. `nb_theta` is the NB shape θ̂ the caller's
@@ -1022,9 +1022,9 @@ mod tests {
 
     /// η = Xβ does not move when a predictor column is rescaled — the
     /// compensating change in β̂ is exact — so a guard that bounds η gives the
-    /// same accept/reject decision in every unit system. Under the old
-    /// `|β_j| > 30` cap the x/1000 fit was rejected with NaN variances while the
-    /// identical x and x·1000 fits were accepted.
+    /// same accept/reject decision in every unit system. A guard bounding
+    /// `|β_j| > 30` instead would reject the x/1000 fit with NaN variances while
+    /// accepting the identical x and x·1000 fits — scale-dependent, unlike the η-based guard here.
     #[test]
     fn glm_logit_guard_is_scale_invariant() {
         let n = 200;

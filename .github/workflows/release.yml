@@ -5,11 +5,11 @@ name: Publish
 # package is a thin wrapper over the crate with no independent version or
 # changelog, so it has no separate cadence.
 #
-# This used to be two workflows (release.yml + publish-r-universe.yml) both firing
-# on `v*` and both calling ci.yml. ci.yml's concurrency group is keyed only on
-# github.ref, so the two ci.yml invocations collided in group ci-refs/tags/<tag>
-# and cancel-in-progress killed one — taking its whole release run down. Folding
-# r-universe in here means a single ci.yml call per tag, so no collision.
+# Folding the r-universe publish into this workflow avoids a concurrency
+# collision: two separate workflows firing on `v*` and both calling ci.yml
+# would collide in ci.yml's concurrency group (keyed only on github.ref) at
+# group ci-refs/tags/<tag>, and cancel-in-progress would kill one — taking its
+# whole release run down. A single ci.yml call per tag avoids that.
 #
 # Both indexes use Trusted Publishing (OIDC) — no stored tokens.
 #
@@ -117,9 +117,9 @@ jobs:
               # python/LICENSE must stay a real copy, never a symlink to ../LICENSE:
               # Git for Windows does not materialize symlinks without core.symlinks,
               # which actions/checkout does not set, so the runner would embed the
-              # 10-byte string "../LICENSE" as the GPL text. This catches that.
-              if "GNU GENERAL PUBLIC LICENSE" not in body:
-                  sys.exit(f"::error::LICENSE in {whl} is not the GPL text")
+              # 10-byte string "../LICENSE" as the LGPL text. This catches that.
+              if "GNU LESSER GENERAL PUBLIC LICENSE" not in body:
+                  sys.exit(f"::error::LICENSE in {whl} is not the LGPL text")
               print(f"  ok: {whl}")
           PY
       - name: Install the built wheel and run the suite
@@ -248,8 +248,7 @@ jobs:
   # offline-vendored package (cran-tarball.sh --vendor) and force-pushes that tree
   # as the *root* of an orphan `r-universe` branch. r-universe's registry (a
   # separate repo the user controls) points at that branch and rebuilds on ref
-  # change. main never holds the vendored tree — the branch is a generated artifact
-  # (docs/GLMM/plans/2026-07-16-r-repo-publishing-spec.md).
+  # change. main never holds the vendored tree — the branch is a generated artifact.
   #
   # Gated on verify + version-check only: the vendored package bundles the kernel
   # source, so it needs neither crates.io nor PyPI to have published first. Runs in

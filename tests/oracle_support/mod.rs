@@ -32,10 +32,10 @@ pub mod tol {
     pub const BETA_REL: f64 = 1e-3;
     pub const STDDEV_REL: f64 = 1e-3;
     pub const SE_REL: f64 = 1e-3;
-    /// The retired 3e-2 band is gone: it existed only while the frozen oracle
-    /// carried lme4's lagged-`ldL2` `tolPwrss` artifact, which was fixed and the
-    /// band tightened to 1e-3 on 2026-07-04. `tests/formula_fit.rs` never
-    /// followed; Tier 2 does.
+    /// AGREEMENT band for `use.hessian=TRUE` GLMM SEs. `tolPwrss = 1e-13` in
+    /// `validation/engines/lme4.R` (see `tests/fixtures/gen_glmm_hessian_vcov.R`)
+    /// keeps the frozen oracle free of lme4's lagged-`ldL2` `tolPwrss` artifact,
+    /// which is what makes 1e-3 tight enough here.
     pub const SE_HESSIAN_REL: f64 = 1e-3;
     // `tol.R`'s stddev_se_rel = 3e-3 is deliberately NOT mirrored: no golden in
     // `validation/goldens/` carries a `stddev_se` field. lme4's SE-of-RE-stddev is

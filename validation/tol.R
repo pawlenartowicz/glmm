@@ -18,9 +18,9 @@ TOL <- list(
                             #   agree to worst 2e-5 (grouseticks); 1e-3 = measured-worst + the
                             #   same ~margin se_rel carries over ITS measured worst.
   stddev_se_rel   = 3e-3,   # GLMM RE-stddev SE (lme4 numDeriv vs glmm single-step FD, both on
-                            #   the joint (theta,beta) Hessian theta block). Same artifact
-                            #   history as se_hessian_rel (was 3e-2). Against the artifact-free
-                            #   oracle the worst gap is 8e-4 (sim_sparse_poisson) -- the
+                            #   the joint (theta,beta) Hessian theta block). Anchored against the
+                            #   same artifact-free oracle as se_hessian_rel: the worst gap is
+                            #   8e-4 (sim_sparse_poisson) -- the
                             #   single-step-FD vs numDeriv-Richardson method floor on the theta
                             #   block, noisier than the beta block, hence the wider band.
 
@@ -35,7 +35,7 @@ TOL <- list(
   port_rel        = 1e-12,
 
   # Absolute floor below which `rel_max` stops asking a RELATIVE question. Same
-  # defect `agq_corr_abs` below was created for -- a relative difference has no
+  # defect `agq_corr_abs` below addresses -- a relative difference has no
   # meaning once both sides are at zero -- but reached from the other direction:
   # there the whole quantity lives near zero, here a single coordinate does.
   #

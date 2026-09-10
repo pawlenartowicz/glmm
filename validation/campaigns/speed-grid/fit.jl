@@ -85,8 +85,8 @@ function fit_cell(cell)
     # hard-stops on nonzero — never as a subtraction/correction.
     dofit!(build())
     # wall_seconds = model build + θ-solve, so it stays comparable to glmm's
-    # wall (which folds its own O(N) suff-stats build into the fit). The two are
-    # no longer reported apart — the build/solve split diagnostic was retired.
+    # wall (which folds its own O(N) suff-stats build into the fit). The two
+    # are reported together; there is no build/solve split diagnostic.
     build_seconds = @elapsed (m = build())
     t = @timed dofit!(m)
     conv = m.optsum.returnvalue in OK_RETURN

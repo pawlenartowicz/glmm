@@ -35,9 +35,9 @@ PULP_VERSION="0.22.2"
 [[ -f "$PATCH_FILE" ]] || { echo "missing patch file: $PATCH_FILE" >&2; exit 2; }
 [[ -f "$CRATE_ROOT/Cargo.toml" ]] || { echo "cannot find crate root from $SELF" >&2; exit 2; }
 
-# Default test filter: the sparse NB fit tests this harness was originally
-# built to check (the crate's most lane-width-sensitive pin, per its own
-# doc comment in src/sparse/tests.rs). Override with positional args.
+# Default test filter: the sparse NB fit tests, the crate's most
+# lane-width-sensitive pin (per its own doc comment in src/sparse/tests.rs).
+# Override with positional args.
 DEFAULT_FILTERS=(fit_sparse_nb_glmm_is_pinned sparse_weighted_nb_matches_replicated)
 if [[ $# -gt 0 ]]; then
   FILTERS=("$@")

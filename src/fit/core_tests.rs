@@ -444,7 +444,7 @@ fn fitview_diagnostics_flag_a_rank_deficient_lmm_draw() {
 
 /// The OLS twin of the LMM positive control, and the reason there are two: the
 /// two routes compare against two SEPARATE constants that both happen to read
-/// 1e-12 today, so a swapped comparison is invisible by value. Firing each arm
+/// 1e-12, so a swapped comparison is invisible by value. Firing each arm
 /// against its own design is what keeps both wirings under test if either
 /// constant is ever recalibrated.
 ///
@@ -929,7 +929,7 @@ fn fit_on_weighted_reuse_matches_fit_cold() {
     assert_near(&cold_u.se, &via_u.se, "unit-weight-after-weighted se");
 }
 
-// --- fit_on alloc reduction (0.1.3): stale-row tripwire per touched arm ---
+// --- fit_on alloc reduction: stale-row tripwire per touched arm ---
 //
 // `Ols`/`Glm`/`LmmDense` each gained a build-once `x_mat` sibling buffer that
 // `fit_on` fills in place instead of allocating fresh every call: workspace
@@ -1266,7 +1266,7 @@ fn fit_on_theta_marshalling_bounded_alloc() {
     // drop — the same gate on the tree immediately before it measures 10400
     // here (21 blocks per arm-draw of scratch). The remaining 6100 was already
     // gone before that move: the 16500 figure was taken on 2026-09-01 and does
-    // not reproduce on today's tree, and the gap was not attributed.
+    // not reproduce here, and the gap was not attributed.
     const BOUND: u64 = 6200;
 
     let (xs, ys, ns, ps, ms, ids_s, os) = lmm_slope_case();

@@ -25,8 +25,8 @@
 #                 MixedModels value (glmm == MM ~2e-8 on cbpp) while lme4 is the outlier
 #                 -- so checking only vs lme4 hides glmm's exact agreement with an
 #                 independent engine. n/a in the mixedmodels row (mm-vs-mm).
-#   se_hessian -- only lme4 and glmm compute it; gated like se_rx (the references are
-#                 artifact-free since 2026-07-04 -- see TOL); MixedModels has none, shown n/a.
+#   se_hessian -- only lme4 and glmm compute it; gated like se_rx (no artifact in the
+#                 references, measured 2026-07-04 -- see TOL); MixedModels has none, shown n/a.
 # Gaussian rungs have a single profiled `se` (no method choice), compared in the se_rx slot.
 
 suppressMessages(library(jsonlite))

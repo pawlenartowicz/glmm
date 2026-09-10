@@ -1,5 +1,5 @@
-//! Family/link IRLS math primitives for the **new** M3 outcome families
-//! (Poisson, Gamma, negative-binomial, and the binomial probit link).
+//! Family/link IRLS math primitives for the Poisson, Gamma, negative-binomial,
+//! and binomial-probit outcome families.
 //!
 //! Single source of the four McCullagh–Nelder (1989) GLM quantities per
 //! `(family, link)` — inverse link, link derivative, variance function, and
@@ -625,7 +625,7 @@ mod tests {
         }
     }
 
-    /// P1: the working-weight derivative `dw/dη` read off a `Dual<1>` pass through
+    /// The working-weight derivative `dw/dη` read off a `Dual<1>` pass through
     /// `irls_weight_and_resid` must match a central difference of the f64 weight
     /// on every link the blocked GLMM path serves, and the two hand forms the
     /// design doc names (logit `w(1−2μ)`, Poisson-log `μ`).

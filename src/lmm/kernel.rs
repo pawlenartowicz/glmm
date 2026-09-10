@@ -883,8 +883,8 @@ pub fn reml_deviance<T: Scalar + 'static>(
     let mut log_lzz_half = T::ZERO; // hoisted — single binding both arms write
     if collapse {
         let n_active = fit.collapse_n_active;
-        // One representative A from the balanced prefix (family 0) — the
-        // legacy q=1 fill verbatim.
+        // One representative A from the balanced prefix (family 0): balanced
+        // families share identical structure, so a single fill serves all of them.
         let n_f = T::from_f64(suff.counts[0]);
         fit.fam_a[0] = T::ONE + th_p * th_p * n_f;
         for c in 0..np {
@@ -895,7 +895,7 @@ pub fn reml_deviance<T: Scalar + 'static>(
             fit.fam_a[(1 + c) * w] = th_p * th_n * n_c;
             fit.fam_a[(1 + c) * w + (1 + c)] = T::ONE + th_n * th_n * n_c;
         }
-        // Crout — the legacy in-place loop, one factor for all families.
+        // Crout, in place: one factorization serves all families.
         let mut log_l_half = T::ZERO;
         for j in 0..w {
             let mut d = fit.fam_a[j * w + j];

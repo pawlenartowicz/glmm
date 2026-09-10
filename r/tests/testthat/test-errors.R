@@ -1,5 +1,5 @@
-# Spec §4's error table, row by row: everything the engine or the shared
-# parser cannot do must be an error naming the reason (Decision 5) — and the
+# The error table, row by row: everything the engine or the shared
+# parser cannot do must be an error naming the reason — and the
 # parser-limit errors must say what to do instead.
 
 err_data <- function() {
@@ -89,11 +89,11 @@ test_that("offset() formula term matches the offset= argument, and forbids both 
   )
 })
 
-test_that("quasi-likelihood dispersion on binomial errors naming the spec", {
+test_that("quasi-likelihood dispersion on binomial errors as not implemented", {
   d <- err_data()
   d$yb <- rbinom(40, 1, 0.5)
   expect_error(fastglmm(yb ~ x, d, family = binomial(), dispersion = 2),
-               "quasi-likelihood.*0\\.1\\.1")
+               "quasi-likelihood.*not yet implemented")
 })
 
 test_that("cloglog GLM fits", {

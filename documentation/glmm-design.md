@@ -74,15 +74,24 @@ the loop — no single-fit benchmark claim is made.
 **What.** The BOBYQA configuration is tuned, not default: interpolation-set
 size `⌈1.5n⌉+1` instead of Powell's `2n+1` (from `n_θ ≥ 3`), a trust-radius
 schedule scaled to the start point, a stopping radius relaxed from `1e-8` to
-`1e-6`, and for GLMMs a two-stage search (θ-only with β profiled inside PIRLS,
-then a joint `[θ|β]` polish that alone decides convergence).
+`1e-6`, and for GLMMs one of three outer routes, fixed per shape and never
+mixed within a fit: `Joint` runs a single θ-and-β BOBYQA; `PqlThenJoint` runs a
+θ-only warm-start pass first (β profiled by PQL inside PIRLS), then a joint
+`[θ|β]` polish whose status alone decides convergence — skipping the warm-start
+pass is bit-identical, just slower; `ExactProfile` profiles β out exactly at
+each candidate θ, so that single θ-only search already reaches the Laplace
+optimum and its status alone decides convergence, with no joint polish after
+it. The routing is a three-way chain: `ExactProfile` takes every nAGQ=1
+non-Gamma shape whose extra groupings are absent, or structured-eligible on a
+canonical link; of what is left, `Joint` takes `nAGQ > 1` and the small
+`n_θ ≤ 2 && p ≤ 4` shapes; `PqlThenJoint` takes the rest — the wider Gamma,
+non-canonical-extras and dense-fallback shapes.
 
 **Why it is faster.** Every choice was swept against the validation corpus and
 kept only where it cut evaluations without moving any gated result: the `npt`
 mid-size won on every dimension ≥ 3, the relaxed stopping radius saved ~25% of
-evaluations at measured-equivalent accuracy, and stage 1 is a pure warm-start
-accelerant (skipping it is bit-identical, just slower). The reported optimum
-is always the full Laplace one.
+evaluations at measured-equivalent accuracy. The reported optimum is always
+the full Laplace one.
 
 ## 5. Fused SIMD transcendentals
 

@@ -278,7 +278,7 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
 /// input can embed one RE term inside another (e.g. `(1+x+(1|a/b)|g)`), and an
 /// earlier stage's removal then leaves a seam a later stage matches across —
 /// the seam match's text is absent from `rhs` and `find` returns `None`. Such
-/// input parses without error today and must not start panicking; `usize::MAX`
+/// input parses without error and must not start panicking; `usize::MAX`
 /// parks any seam match at the end, in stage order via the stable sort.
 fn extract_stage(
     rhs: &str,
@@ -575,8 +575,8 @@ fn parse_single_identifier(s: &str) -> Result<String, ParseError> {
 
 /// A whitelisted single-column transform. The whitelist is deliberately
 /// closed: R's `poly()` defaults to orthogonal polynomials, so emitting raw
-/// powers under its name would claim R's column name for a different column
-/// (`docs/parity_gaps.md` #6 in the wrapper repo); `I(x^k)` covers the same
+/// powers under its name would claim R's column name for a different column.
+/// `I(x^k)` covers the same
 /// models with an honest name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Transform {

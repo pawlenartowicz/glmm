@@ -162,9 +162,14 @@ pub(crate) fn fit_mle_sparse(
         }
     }
     let mut counters = crate::counters::EvalCounters::new();
+    // mirrors the stage-1 read in glmm/mod.rs — change together.
+    let mut finite_evals = 0usize;
     let out = solver.minimize(
         |xs| {
             let d = sparse_reml_deviance(xs, &mut ws);
+            if d.is_finite() {
+                finite_evals += 1;
+            }
             counters.record_eval(crate::counters::Stage::Two, d);
             d
         },
@@ -177,7 +182,7 @@ pub(crate) fn fit_mle_sparse(
     // cap-out reports its finite endpoint with `converged == false` rather than
     // NaN-filling — it runs the same pin + rank-guard + recovery as `Converged`.
     // `ModelDegenerate` has no endpoint worth reporting and NaN-fills below.
-    let converged_status = matches!(out.status, Status::Converged);
+    let converged_status = matches!(out.status, Status::Converged) && finite_evals >= 2;
     let has_endpoint = matches!(out.status, Status::Converged | Status::MaxFunReached);
 
     // Per-component deterministic pin: every DIAGONAL variance component ≤ PIN_THETA
@@ -201,6 +206,27 @@ pub(crate) fn fit_mle_sparse(
                     pinned = true;
                     if kk < u64::BITS as usize {
                         pinned_components |= 1u64 << kk;
+                    }
+                }
+            }
+        }
+        // Σ-preserving canonical Λ, then the pin test again on the new
+        // diagonals (mirror `fit_lmm`, `src/lmm/mod.rs` — change together).
+        // No score is reported on this route; it runs here so `pinned`/`tau2`
+        // stay route-independent. Nothing moves unless a diagonal pinned, so an
+        // interior fit stays bit-identical, and the post-pin factor below is
+        // built at the canonicalized θ.
+        if crate::lmm::canonicalize_pinned_blocks(&g, &mut theta) {
+            pinned = false;
+            pinned_components = 0;
+            for (kk, &ti) in g.diagonal_theta().iter().enumerate() {
+                if theta[ti] <= crate::lmm::PIN_THETA {
+                    theta[ti] = 0.0;
+                    if converged_status {
+                        pinned = true;
+                        if kk < u64::BITS as usize {
+                            pinned_components |= 1u64 << kk;
+                        }
                     }
                 }
             }
@@ -892,8 +918,8 @@ impl SparseLmmWorkspace {
             v.sort_unstable();
             v.dedup();
         }
-        // The retired dense scan's iteration order (col block asc, then row
-        // block asc) — the kernel's `cur` replay over pk_a22 depends on it.
+        // Iteration order is col block asc, then row block asc — the kernel's
+        // `cur` replay over pk_a22 depends on it.
         a22_pairs.sort_unstable_by_key(|pr| (pr[1], pr[0]));
 
         // Packed-stream allocation + scatter offsets, sized from the pattern.

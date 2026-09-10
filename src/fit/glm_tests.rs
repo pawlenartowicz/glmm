@@ -1316,17 +1316,18 @@ fn fit_glm_nb_outer_cap_semantics() {
     };
     let seed = Some(super::glm::NB_THETA_LO);
 
-    let f0 = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, 0);
+    let f0 = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, 0).0;
     assert!(
         !f0.converged(),
         "cap 0: never-ran placeholder is converged=false"
     );
     assert!(f0.beta.iter().all(|b| b.is_nan()), "cap 0: β all NaN");
+    assert!(f0.dispersion.is_nan(), "cap 0: dispersion NaN, never ran");
 
-    let f1 = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, 1);
-    let full = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, super::glm::NB_MAX_OUTER);
+    let f1 = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, 1).0;
+    let full = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, super::glm::NB_MAX_OUTER).0;
     // Cap exhaustion is silent: the inner IRLS converged, so the flag is true
-    // even though the θ alternation was cut off mid-flight.
+    // even though the θ alternation stops mid-flight, short of running to convergence.
     assert!(
         f1.converged(),
         "capped fit reports the INNER convergence flag"
@@ -1361,10 +1362,9 @@ fn fit_glm_nb_outer_cap_semantics() {
 /// `..._small_glm.json`, `..._big_glm.json`): `y ~ x`, `y ~ x/1000`,
 /// `y ~ x*1000` on sim_scale_logit. R fits all three identically — same
 /// deviance to 10 digits, same iteration count, coefficients and standard errors
-/// scaling exactly — because `glm.fit` has no coefficient cap. glmm used to
-/// reject the middle one: its divergence guard bounded |β|, so the accept/reject
-/// decision moved with the caller's choice of units. The guard bounds |η| now,
-/// which is invariant. The oracle is sacred.
+/// scaling exactly — because `glm.fit` has no coefficient cap. glmm's
+/// divergence guard bounds |η| rather than |β|, so the accept/reject decision
+/// is invariant to the caller's choice of units. The oracle is sacred.
 #[test]
 fn fit_glm_scale_variation_matches_r() {
     // From validation/goldens/sim_scale_logit_glm.json (estimates.beta / .se).
@@ -1471,6 +1471,98 @@ fn fit_glm_separated_rejected_like_r() {
     assert!(
         !f.converged(),
         "completely separated data must be refused, as R's glm.fit refuses it"
+    );
+    assert!(
+        f.dispersion.is_nan(),
+        "dispersion must be NaN on a refused fit, not binomial's structural 1.0: {}",
+        f.dispersion
+    );
+}
+
+/// Failed Gamma GLM (no random effects), perfectly separated: `y ~ x`,
+/// `y ∈ {1e-6, 1e6}` split exactly on `x ∈ {0, 1}` — no finite Gamma-log fit
+/// exists. `dispersion` must be NaN, not the Gamma exponential special case
+/// `φ=1`, which a caller cannot tell from a real estimate.
+#[test]
+fn fit_glm_gamma_failed_fit_dispersion_is_nan() {
+    let n = 24;
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = if i < 12 { 0.0 } else { 1.0 };
+        y[i] = if i < 12 { 1e-6 } else { 1e6 };
+    }
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &ModelSpec {
+            family: Family::Gamma {
+                link: crate::GammaLink::Log,
+            },
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(
+        !f.converged(),
+        "perfectly separated Gamma GLM must not converge"
+    );
+    assert!(
+        f.dispersion.is_nan(),
+        "dispersion must be NaN on a failed fit, not the Gamma exponential special case 1.0: {}",
+        f.dispersion
+    );
+}
+
+/// Same reproducer with a caller-held φ: `FitOptions::dispersion = Some(2.0)`
+/// on a failed fit must report NaN. The held value is neither an estimate
+/// off this fit nor honored when the fit never reached an endpoint, so `2.0`
+/// would be as dishonest here as the unheld case's `1.0`.
+#[test]
+fn fit_glm_gamma_held_dispersion_failed_fit_is_nan() {
+    let n = 24;
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = if i < 12 { 0.0 } else { 1.0 };
+        y[i] = if i < 12 { 1e-6 } else { 1e6 };
+    }
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &ModelSpec {
+            family: Family::Gamma {
+                link: crate::GammaLink::Log,
+            },
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1],
+            dispersion: Some(2.0),
+            ..FitOptions::default()
+        },
+    );
+    assert!(
+        !f.converged(),
+        "perfectly separated Gamma GLM must not converge"
+    );
+    assert!(
+        f.dispersion.is_nan(),
+        "a held φ must not be reported off a failed fit: {}",
+        f.dispersion
     );
 }
 

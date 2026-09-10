@@ -54,6 +54,10 @@ build_row <- function(cid, rec, cell, pass_name) {
     pirls_iters_p50 = p50, pirls_iters_p90 = p90, pirls_iters_max = iters_max,
     agq_evals = if (is.null(rec$agq_evals)) 0L else rec$agq_evals,
     agq_node_evals = if (is.null(rec$agq_node_evals)) 0L else rec$agq_node_evals,
+    nb_nodes = if (is.null(rec$nb_nodes)) 0L else rec$nb_nodes,
+    nb_evals_total = if (is.null(rec$nb_evals_total)) 0L else rec$nb_evals_total,
+    loglik = if (is.null(rec$loglik)) NA_real_ else rec$loglik,
+    dispersion = if (is.null(rec$dispersion)) NA_real_ else rec$dispersion,
     singular = if (is.null(rec$singular)) NA else rec$singular,
     wall_seconds = if (is.null(rec$wall_seconds)) NA_real_ else rec$wall_seconds,
     stringsAsFactors = FALSE)
@@ -72,7 +76,8 @@ out_cols <- c("case_id", "pass", "family", "structure", "n_theta", "p", "status"
               "converged", "n_eval", "stage1_evals", "stage2_evals",
               "stage1_shrink_evals", "stage2_shrink_evals", "pirls_evals",
               "pirls_iters_total", "pirls_iters_p50", "pirls_iters_p90",
-              "pirls_iters_max", "agq_evals", "agq_node_evals")
+              "pirls_iters_max", "agq_evals", "agq_node_evals",
+              "nb_nodes", "nb_evals_total", "loglik", "dispersion", "wall_seconds")
 write.csv(res[, out_cols], args[3], row.names = FALSE)
 
 # ---- speed baseline (locked Laplace pass, ok cells only) -------------------

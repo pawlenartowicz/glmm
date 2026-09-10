@@ -8,8 +8,7 @@
 # tolPwrss = 1e-13, matching validation/engines/lme4.R (change together): at glmer's
 # default 1e-7 the ldL2 term uses working weights one PIRLS iteration behind the
 # mode, putting a ~1% spurious theta/theta-beta curvature into
-# vcov(use.hessian=TRUE) -- the artifact the fixture carried until 2026-07-04
-# (docs/GLMM/2026-07-04-glmm-hessian-curvature-diagnosis.md, Resolution).
+# vcov(use.hessian=TRUE) -- tolPwrss=1e-13 avoids that distortion.
 # vcov_rx (use.hessian=FALSE) never reads that curvature and only moves at the
 # theta-hat level (~1e-7).
 #

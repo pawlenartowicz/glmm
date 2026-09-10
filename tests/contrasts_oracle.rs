@@ -1,5 +1,5 @@
 #![cfg(feature = "formula")]
-//! materialize's fixed design vs R `model.matrix` (d3 §6b). The fixtures are
+//! materialize's fixed design vs R `model.matrix`. The fixtures are
 //! frozen R output (`fixtures/contrasts_fixtures.rs`, regenerate with
 //! `gen_contrasts_fixtures.R`); the oracle is sacred — a mismatch is a
 //! formula-frontend bug, never a relaxed fixture. Interactions are checked in the

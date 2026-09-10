@@ -84,8 +84,7 @@ pub enum GroupingRelation {
 
 /// Outcome distribution + link. Selects the fit kernel together with
 /// [`ModelSpec::re`] (`re.is_some()` ⇒ mixed): `Gaussian` → OLS / LMM,
-/// `Binomial{Logit}` → GLM / GLMM. M2 wires only the variants whose kernel
-/// exists — `Poisson`/probit/etc. are added when their kernels land (M3), so no
+/// `Binomial{Logit}` → GLM / GLMM. Every variant here has a wired kernel, so no
 /// kernel-less variant is reachable through [`crate::fit_cold`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Family {
@@ -163,7 +162,7 @@ pub enum BinomialLink {
     Cloglog,
 }
 
-/// Poisson link function. M3 ships the canonical log link only.
+/// Poisson link function. Only the canonical log link is offered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoissonLink {
     /// Canonical log link `g(μ) = ln(μ)`, `μ=exp(η)`.
@@ -183,7 +182,7 @@ pub enum GammaLink {
     Inverse,
 }
 
-/// Negative-binomial link function. M3 ships the log link only.
+/// Negative-binomial link function. Only the log link is offered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NegBinomialLink {
     /// Log link `g(μ) = ln(μ)`, `μ=exp(η)`. Non-canonical (the NB canonical link

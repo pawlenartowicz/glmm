@@ -116,7 +116,7 @@ while MISSING=$(next_missing); do
     sleep 1
     # One-cell-per-launch engines write nothing until the cell is done, so the
     # first-line test can never fire for them and the startup grace would apply
-    # for the whole run (bugtracker 30). Their launch-to-write time IS the cell
+    # for the whole run. Their launch-to-write time IS the cell
     # time, so hold them to TIMEOUT from the start. The grace is for engines that
     # amortise a slow startup across many cells in one process (Julia).
     if [ -n "${GRID_ONE_CELL:-}" ]; then EFF=$TIMEOUT

@@ -883,8 +883,8 @@ fn lower_random_effects(
         let slopes = slope_cols(re, numeric_main_col, factor_main_cols)?;
         // Explicit `parent:child` syntax → nested. A flat scalar-intercept
         // grouping with no `:` may STILL nest within the primary (the lme4 idiom
-        // `(1|batch)+(1|sample)`, T3); detect that from the id structure and fail
-        // closed to Crossed on any parent conflict. Both relation counts are
+        // `(1|batch)+(1|sample)`); `detect_flat_nesting` recognizes that from the
+        // id structure and fails closed to Crossed on any parent conflict. Both relation counts are
         // placeholders — the kernel re-derives real level counts from the ids.
         let (relation, layout) = match re {
             RandomEffect::Intercept {
@@ -1112,8 +1112,8 @@ mod tests {
 
     /// Flat lme4 idiom `(1|parent)+(1|child)`, BALANCED — each parent has the
     /// same distinct-child count and every label is unique to one parent (Pastes'
-    /// `sample = batch:cask`, 3 casks per batch). T3 detects the nesting and
-    /// returns the zero-waste padded layout. Parent ids [0,0,1,1] each with 2
+    /// `sample = batch:cask`, 3 casks per batch). `detect_flat_nesting` detects
+    /// the nesting and returns the zero-waste padded layout. Parent ids [0,0,1,1] each with 2
     /// distinct children (W=2, no padding) → ids [0,1,2,3].
     #[test]
     fn detect_flat_nesting_balanced_is_nested() {
@@ -1135,8 +1135,8 @@ mod tests {
     }
 
     /// Genuinely crossed with matching cardinality — a child label reused across
-    /// parents (Penicillin's `sample` spans every `plate`). T3 must fail closed
-    /// to `Crossed` (`None`), never routing it through the nested padded layout.
+    /// parents (Penicillin's `sample` spans every `plate`). `detect_flat_nesting`
+    /// must fail closed to `Crossed` (`None`), never routing it through the nested padded layout.
     #[test]
     fn detect_flat_nesting_shared_child_stays_crossed() {
         let primary = vec![0, 1, 0, 1];

@@ -170,10 +170,10 @@ fn config_tag(lo: &glmm::formula::Lowered, gaussian: bool, user_tag: &str) -> St
 ///
 /// Timing protocol: one discarded warm-up fit, then up to two timed fits,
 /// reporting the min-wall rep when both run. The warm-up absorbs one-time
-/// per-process lazy init — faer's first triangular matmul costs ~4–9 ms and
-/// used to land inside the timed solve of whichever cell first took the
-/// unbalanced dense-LMM path (the 40× `lmm_int1_g300p5_skew_base` outlier in
-/// every pre-fix pass). The min is honest: fits are deterministic (identical
+/// per-process lazy init — faer's first triangular matmul costs ~4–9 ms;
+/// without the warm-up that cost lands inside the timed solve of whichever
+/// cell first takes the unbalanced dense-LMM path (a 40× `lmm_int1_g300p5_skew_base`
+/// outlier). The min is honest: fits are deterministic (identical
 /// eval sequence — `rep_mismatch` flags any drift) and timing noise on a
 /// locked machine is one-sided. Mirrors fit.jl's warm-up discard.
 ///
@@ -296,10 +296,17 @@ fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
                 rec["pirls_hist"] = json!(c.pirls_hist.to_vec());
                 rec["agq_evals"] = json!(c.agq_evals);
                 rec["agq_node_evals"] = json!(c.agq_node_evals);
+                rec["nb_nodes"] = json!(c.nb_nodes);
+                rec["nb_evals_total"] = json!(c.nb_evals_total);
             }
             rec["converged"] = json!(f.converged());
             rec["singular"] = json!(f.singular());
             rec["deviance"] = num(f.deviance);
+            // The NB marginal log-likelihood (saturated term restored at θ̂) and θ̂
+            // itself: the deviance alone is not comparable across fits that land
+            // on different θ̂_NB.
+            rec["loglik"] = num(f.loglik);
+            rec["dispersion"] = num(f.dispersion);
             rec["beta"] = nums(&f.beta);
             rec["se"] = nums(&f.se);
             // theta hat (diligent-run recording, spec Part 6): reduced to

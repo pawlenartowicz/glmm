@@ -1,4 +1,4 @@
-# Gate 5 (R-port spec §8): the accuracy benchmark's two formulas x two
+# The accuracy benchmark's two formulas x two
 # families x both nAGQ arms fit end-to-end through this API and produce
 # tau0/tau1/rho01 matching a glmer golden. The package is done when this
 # passes. Live-golden (glmer refit on the same data) rather than frozen

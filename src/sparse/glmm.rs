@@ -1205,9 +1205,14 @@ pub(crate) fn fit_glmm_sparse(
     crate::lmm::apply_campaign_overrides(&mut config, n_theta + p);
     let mut solver = bobyqa::Bobyqa::new(n_theta + p, config)
         .expect("BOBYQA config constants are valid by construction");
+    // mirrors the stage-1 read in glmm/mod.rs — change together.
+    let mut finite_evals2 = 0usize;
     let out = solver.minimize(
         |gamma| {
             let d = sparse_glmm_deviance(family, nb_theta, gamma, &mut ws, xm, y, n, false);
+            if d.is_finite() {
+                finite_evals2 += 1;
+            }
             ws.counters.record_eval(crate::counters::Stage::Two, d);
             d
         },
@@ -1216,7 +1221,7 @@ pub(crate) fn fit_glmm_sparse(
         &upper,
     );
     debug_assert!(out.status != Status::InvalidArgs);
-    let mut ok = matches!(out.status, Status::Converged);
+    let mut ok = matches!(out.status, Status::Converged) && finite_evals2 >= 2;
 
     // Diagonal-θ pin (mirror `glmm::fit_glmm`; β never pins). The mask's bit
     // index is the position in `diagonal_theta()` order — the order
@@ -1232,6 +1237,25 @@ pub(crate) fn fit_glmm_sparse(
                 pinned = true;
                 if kk < u64::BITS as usize {
                     pinned_components |= 1u64 << kk;
+                }
+            }
+        }
+        // Σ-preserving canonical Λ, then the pin test again on the new
+        // diagonals (mirror `fit_lmm`, `src/lmm/mod.rs` — change together).
+        // No score is reported on this route; it runs here so `pinned`/`tau2`
+        // stay route-independent. Nothing moves unless a diagonal pinned, so an
+        // interior fit stays bit-identical, and the pinned-γ̂ re-eval below runs
+        // on the canonicalized θ.
+        if crate::lmm::canonicalize_pinned_blocks(&g, &mut params[..n_theta]) {
+            pinned = false;
+            pinned_components = 0;
+            for (kk, &ti) in g.diagonal_theta().iter().enumerate() {
+                if params[ti] <= crate::lmm::PIN_THETA {
+                    params[ti] = 0.0;
+                    pinned = true;
+                    if kk < u64::BITS as usize {
+                        pinned_components |= 1u64 << kk;
+                    }
                 }
             }
         }
@@ -1477,14 +1501,16 @@ pub(crate) fn fit_glmm_sparse(
 }
 
 /// Sparse-Z negative-binomial GLMM: the over-envelope sibling of
-/// `fit::fit_glmm_nb`, same **marginal-θ** profile (`lme4::glmer.nb`) — for
-/// each candidate θ the inner `fit_glmm_sparse` re-fits the full GLMM at that
-/// fixed θ and its minimized marginal Laplace deviance feeds
-/// `logL_marginal(θ) = −½·D(θ) + nb_profile_loglik(y, y, θ, weights)`, maximized
-/// over `ln θ` by the shared golden-section bracket (mirrors `fit::fit_glmm_nb`,
-/// fit.rs:1806). The spec is θ-free (the NB shape is threaded explicitly per
-/// candidate); a warm `start` is irrelevant to the global bracket search,
-/// exactly as on the dense path. `dispersion = θ̂`.
+/// `fit::fit_glmm_nb`. Same **marginal-θ** objective (`lme4::glmer.nb`),
+/// different search — for each candidate θ the inner `fit_glmm_sparse` re-fits
+/// the full GLMM at that fixed θ and its minimized marginal Laplace deviance
+/// feeds `logL_marginal(θ) = −½·D(θ) + nb_profile_loglik(y, y, θ, weights)`,
+/// maximized over `ln θ` by the shared golden-section bracket, then one final
+/// fit at θ̂. The dense path searches that same objective's `ln θ_NB` as a
+/// coordinate of its outer BOBYQA instead. The spec is θ-free (the NB shape is
+/// threaded explicitly per candidate); a warm `start` is irrelevant to a global
+/// bracket search and is ignored here, where the dense path threads it into
+/// β/θ_RE. `dispersion = θ̂`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_glmm_nb_sparse(
     x: &[f64],
@@ -1503,10 +1529,15 @@ pub(crate) fn fit_glmm_nb_sparse(
         },
         re: model.re.clone(),
     };
+    // Evaluation bookkeeping for the bracket, `counters` feature only: the
+    // reported `Fit` is the final fit's, whose `n_eval` is that one fit's count;
+    // the sum over every node is what the fit really spent.
+    let mut nodes = crate::counters::EvalCounters::new();
     let theta = crate::fit::golden_max_ln_theta(|t| {
         let th = t.exp();
-        let (_fit, dev) =
+        let (fit, dev) =
             fit_glmm_sparse(x, y, n, p, &nb_spec, cluster_ids, extra_ids, th, None, opts);
+        nodes.record_nb_node(fit.n_eval);
         -0.5 * dev + crate::fit::nb_profile_loglik(y, y, th, opts.weights.as_deref())
     });
     let mut fit_result = fit_glmm_sparse(
@@ -1522,6 +1553,14 @@ pub(crate) fn fit_glmm_nb_sparse(
         opts,
     )
     .0;
-    fit_result.dispersion = theta;
+    nodes.record_nb_node(fit_result.n_eval);
+    #[cfg(feature = "counters")]
+    {
+        fit_result.counters.nb_nodes = nodes.nb_nodes;
+        fit_result.counters.nb_evals_total = nodes.nb_evals_total;
+    }
+    if fit_result.converged() {
+        fit_result.dispersion = theta;
+    }
     fit_result
 }

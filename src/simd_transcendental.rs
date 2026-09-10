@@ -745,9 +745,10 @@ pub fn phi_fill(buf: &mut [f64]) {
 // Shared family kernel — one batched η → (μ, W, z) pass per (family, link)
 // ---------------------------------------------------------------------------
 //
-// `family_pass` below replaces the per-row scalar loop that every non-canonical
-// family used to run at the four IRLS/PIRLS assembly sites (`glm::glm_irls_fit`
-// and the three `glmm::pirls::pirls_solve*` variants). One dispatch on `family`
+// `family_pass` below is the vectorized η → (μ, W, z) pass for every
+// non-canonical family at the four IRLS/PIRLS assembly sites
+// (`glm::glm_irls_fit` and the three `glmm::pirls::pirls_solve*` variants),
+// used in place of a per-row scalar loop. One dispatch on `family`
 // picks a vectorized arm instead of one `match` + two libm calls per row; the
 // log-link arms additionally compute `exp(η)` ONCE and reuse it for both μ and
 // dμ/dη, where the scalar `family::link_inv` + `family::mu_eta` pair computed it
@@ -999,7 +1000,7 @@ fn scalar_sigmoid_owned<const FUSED: bool>(eta: f64) -> f64 {
 /// PIRLS sites do not). Returns `(Σ wᵢ·dᵢ, any-η-outside-the-link's-open-domain)`.
 ///
 /// - `prior_w` empty ⇒ unit prior weights.
-/// - `weighted` selects between the two logit forms that exist today: unweighted
+/// - `weighted` selects between the two logit forms: unweighted
 ///   Bernoulli logit keeps the fused `2·(Σ log1pexp(η) − Σ y·η)` deviance (hence
 ///   `yeta`, which the caller's η-pass accumulates), weighted binomial goes
 ///   through `family::dev_resid` because that identity does not hold for
@@ -1460,8 +1461,8 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
 mod tests {
     use super::*;
 
-    // Reference: system libm (std f64). Accuracy was established offline against
-    // an MPFR oracle (primitives ≤1 ULP); in-repo we re-assert SIMD == scalar-libm
+    // Reference: system libm (std f64). Accuracy against an MPFR oracle
+    // (primitives ≤1 ULP) is verified offline; in-repo we re-assert SIMD == scalar-libm
     // accuracy (exp/log1p ≤1 ULP, composed p ≤2 ULP) — the regression net for the coeffs.
     fn ulp(a: f64, b: f64) -> i128 {
         let o = |x: f64| {

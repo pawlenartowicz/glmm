@@ -12,8 +12,8 @@
 # box (R 4.5.3, glibc 2.42, x86_64): a re-run reproduces R4 byte-identically
 # but writes R1-R3 with ~1-ULP differences in scattered rnorm/rpois draws
 # (78/1800, 24/600, 4/160 rows), self-consistent across reruns -- so the
-# staged R1-R3 content came from a libm environment this machine no longer
-# provides, and which one was not recorded. Frozen lme4 references exist for
+# staged R1-R3 content came from a libm environment not available on this
+# machine, and which one was not recorded. Frozen lme4 references exist for
 # R1/R2, so regenerating the CSVs silently invalidates them. If regeneration
 # is ever unavoidable, regenerate CSVs and references together in one step
 # and record the generating R and libm versions here.
@@ -58,7 +58,7 @@ emit <- function(name, df) {
 # realized intercept turns a small absolute beta[0] gap into a spurious >1e-3
 # RELATIVE gap at compare.R's beta gate. The fitted intercept here lands at
 # 0.83, comfortably clear of that.
-# Also fit at nAGQ = 7 and 11 as separate goldens (spec section 2, R1): Bernoulli
+# Also fit at nAGQ = 7 and 11 as separate goldens: Bernoulli
 # keeps those clear of lme4's nAGQ > 1 logLik offset, which is zero for
 # per-row trials and nonzero for the aggregated form.
 set.seed(20260901)
@@ -133,10 +133,10 @@ emit("sim_binomial_zerosd",
 # of R1/R2 with the 1-primary-plus-7-crossed-extras skeleton that
 # prep/export_data.R uses for sim_sparse_poisson.
 #
-# WHY BERNOULLI, NOT POISSON. A Poisson design was tried first and abandoned.
-# On a log link, the dynamic range of the fitted mean across groups is
-# exp(+-3*theta-hat) -- at theta-hat in [3,4.5] that is e^+-11, so the largest
-# counts run into the tens of thousands. Two independent problems live in that
+# WHY BERNOULLI, NOT POISSON. On a log link, the dynamic range of the fitted
+# mean across groups is exp(+-3*theta-hat) -- at theta-hat in [3,4.5] that is
+# e^+-11, so a Poisson design would run its largest counts into the tens of
+# thousands. Two independent problems live in that
 # regime and neither is a tuning knob: (1) the sparse PIRLS cold start (u = 0)
 # needed one halving more than PIRLS_MAX_HALVINGS to walk back to the mode on
 # the design that reaches theta-hat(g1) ~ 3.6 (fixed separately, see
@@ -166,13 +166,13 @@ emit("sim_binomial_zerosd",
 # per-component; one large component alongside seven small ones exercises both
 # sides of that rule in a single fit.
 #
-# WHY 300 GROUPS OF 12 (3600 ROWS), NOT A SMALLER SKELETON. A first attempt
-# reused rung 44's 120-groups-of-6 shape with sd_c = 0.4; at a theta-hat(g1)
-# high enough to be interesting almost every Bernoulli row saturates (y is
-# determined by which side of 0 the linear predictor falls, with little
-# per-row information left), and four of the seven crossed components pinned
-# at zero. 300 groups of 12 with sd_c = 0.5 keeps every component clear of the
-# boundary; do not shrink the row count back.
+# WHY 300 GROUPS OF 12 (3600 ROWS), NOT A SMALLER SKELETON. Rung 44's
+# 120-groups-of-6 shape with sd_c = 0.4 would saturate almost every Bernoulli
+# row at a theta-hat(g1) high enough to be interesting (y is determined by
+# which side of 0 the linear predictor falls, with little per-row information
+# left), pinning four of the seven crossed components at zero. 300 groups of
+# 12 with sd_c = 0.5 keeps every component clear of the boundary; do not
+# shrink the row count back.
 #
 # sd_g1 below is a TUNED value, not the target theta-hat -- same rule as R1/R2:
 # the target is on the FITTED theta-hat under glmer nAGQ = 1, tolPwrss = 1e-13

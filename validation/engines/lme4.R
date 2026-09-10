@@ -135,16 +135,15 @@ fit_call <- function(spec, df) {
     # compare like-to-like with it. AGQ (nAGQ > 1, single scalar RE only) is MORE
     # accurate but a different estimator -- on cbpp it shifts beta ~5e-4 and the Hessian
     # SE ~1.2% (converged by nAGQ=10). It lives in the SEPARATE goldens track
-    # (engines/goldens_agq.R: lme4 at nAGQ=1/7/11), where glmm's AGQ joins once its M3
-    # kernel lands -- not here (design 6: the 6-rung oracle is not expanded).
+    # (engines/goldens_agq.R: lme4 at nAGQ=1/7/11), where glmm's AGQ joins once its
+    # kernel supports it -- not here (design 6: the 6-rung oracle is not expanded).
     # tolPwrss = 1e-13 (default 1e-7), recorded in the result JSON: glmer's ldL2
     # is assembled from pp$Xwts -- working weights one PIRLS iteration behind the
     # mode -- so at the default tolPwrss its devfun sits ~5.6e-4 above the true
     # Laplace deviance (cbpp) and vcov(use.hessian=TRUE)/logLik carry ~1% spurious
     # theta/theta-beta curvature. Value picked by a per-rung sweep (2026-07-04,
     # measured against glmm's tight-tol FD, all four GLMM rungs): cbpp is converged
-    # by 1e-10 (docs/GLMM/2026-07-04-glmm-hessian-curvature-diagnosis.md,
-    # Resolution) but sim_sparse_poisson keeps a 1.3% se_hessian residual until
+    # by 1e-10 but sim_sparse_poisson keeps a 1.3% se_hessian residual until
     # 1e-12, and grouseticks' vcov blips 1.5% on cHEIGHT at EXACTLY 1e-12 (fine at
     # 1e-10/1e-11/1e-13) -- 1e-13 is the value all four rungs agree at, flat vs
     # 1e-12 where 1e-12 is itself clean (1e-16 aborts in step-halving; stay above

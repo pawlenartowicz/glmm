@@ -9,8 +9,9 @@
 //! always, and now unconditionally `pub` (a stable input to `fit_warm`).
 //!
 //! Carries only `beta`/`theta`: Gamma φ is profiled (`family::gamma_aic`, no
-//! warm-startable state) and the GLMM neg-binomial θ search is a global bracket
-//! (`fit::golden_max_ln_theta`), so neither warm-starts anything reachable here.
+//! warm-startable state) and the GLMM negative-binomial θ_NB, though a
+//! coordinate of the outer search, has no slot here yet — the dense route
+//! cold-starts it from the no-RE GLM-NB's own θ̂ (`fit::fit_glm_nb`).
 
 /// Raw optimizer warm-start state for one model fit.
 ///

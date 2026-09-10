@@ -97,9 +97,11 @@ pub struct Fit {
     /// and the REML `pwrss/(n−p)` for LMM (matching lme4 `sigma()²`; oracle:
     /// `validation/goldens/sleepstudy_lmm.json` `sigma`, asserted in
     /// `fit_sleepstudy_slope_varcorr_matches_lme4`) — and `1.0` for
-    /// binomial/Poisson (where dispersion is fixed, not estimated). NaN on a
-    /// Gaussian fit with no honest endpoint (non-converged OLS, degenerate
-    /// LMM).
+    /// binomial/Poisson (where dispersion is fixed by the family, not
+    /// estimated). NaN on any fit reporting `converged == false` — no route
+    /// reports a dispersion off a fit that never reached an endpoint,
+    /// including the fixed families' `1.0` and a φ held fixed through
+    /// [`FitOptions::dispersion`].
     pub dispersion: f64,
     /// Everything the fit reports about itself: convergence, singularity, the
     /// aliased-column mask, the θ boundary state, which variance components
@@ -286,6 +288,15 @@ pub struct Diagnostics {
     /// with `stddev_corr(g).0[i]`. That alignment is the point — it is the
     /// layout both wrapper packages already iterate.
     ///
+    /// A pinned θ diagonal is a zero variance component because the pin loop is
+    /// followed by a Σ-preserving re-factorization of each pinned RE block
+    /// (`crate::lmm::canonicalize_pinned_blocks`): the reported Λ is the
+    /// canonical lower Cholesky of Σ̂, so a pinned diagonal's whole column is
+    /// exactly zero and the variance that used to sit below it has been folded
+    /// into a trailing diagonal. Without that, a zero θ diagonal on a `q ≥ 2`
+    /// block could sit above a live off-diagonal and name a component whose
+    /// standard deviation is not zero.
+    ///
     /// **Empty means nothing was pinned** — every route with variance
     /// components to pin fills this field on every converged fit; the
     /// dense-view mappers read it straight off the fitted mask
@@ -306,18 +317,18 @@ pub struct Diagnostics {
     /// [`Diagnostics::pinned`]: `boundary_score[g][i]` pairs with `pinned[g][i]`
     /// and with `stddev_corr(g).0[i]`. The value is `dD/ds` at `s = 0` in the
     /// variance coordinate `s = θ_jj²` — equivalently `½·∂²D/∂θ_jj²` at the
-    /// pinned point, but only where the deviance is even in `θ_jj`. That holds
-    /// iff Λ's column `j` has no non-zero entry below the diagonal: with one,
-    /// `Σ_kj` for `k > j` carries the term `Λ_kj·Λ_jj`, which is linear (not
-    /// even) in `θ_jj`, so the shortcut does not apply.
-    /// [`crate::lmm::LmmGroupings::diagonal_has_nonzero_below`] is the gate on this.
+    /// pinned point. That shortcut needs the deviance to be even in `θ_jj`,
+    /// which needs Λ's column `j` to be zero below the diagonal, and the
+    /// canonical form the pin loop leaves behind guarantees exactly that (see
+    /// [`Diagnostics::pinned`]) — so a score is reported at every pinned
+    /// diagonal.
     ///
-    /// **Positive means the boundary is the constrained optimum**: raising the
-    /// component off zero would raise the deviance. A non-positive score at a
-    /// pinned component means the pin is not justified by the local geometry.
-    /// NaN at every component that is not pinned, at every off-diagonal, and
-    /// at a pinned diagonal whose column carries a live off-diagonal below it
-    /// — so NaN does not mean "not pinned".
+    /// **Positive means the boundary is the constrained optimum** of the basin
+    /// the search settled in: raising the component off zero would raise the
+    /// deviance there. A non-positive score at a pinned component means the pin
+    /// is not justified by the local geometry. NaN at every component that is
+    /// not pinned and at every off-diagonal — so NaN does not mean "not
+    /// pinned".
     ///
     /// **Empty means no score was measured** — a fit that did not ask for it
     /// ([`FitOptions::boundary_score`], off by default), an interior fit, a
@@ -333,6 +344,9 @@ pub struct Diagnostics {
     /// does. Zero to working precision means the accepted point satisfies the
     /// first-order conditions, boundary or interior; a large value means the
     /// optimizer stopped somewhere that is not a constrained stationary point.
+    /// **RE coordinates only:** on negative-binomial GLMMs the outer search carries
+    /// one further coordinate, `ln θ_NB`, which is held fixed in this gradient and
+    /// contributes nothing to the norm.
     ///
     /// **Coordinates:** on the deviance scale (−2·logL), per unit of θ in the
     /// units the caller's design is in — the projection runs in the internal
@@ -1035,7 +1049,12 @@ pub(crate) use common::{
 // through `Fit`, never directly.
 #[cfg(feature = "loop_advanced")]
 pub use common::FitDiagnostics;
-pub(crate) use glm::{golden_max_ln_theta, nb_profile_loglik};
+pub(crate) use glm::{golden_max_ln_theta, nb_profile_loglik, NB_THETA_HI, NB_THETA_LO};
+// Test-only since the GLMM NB coordinate stopped seeding from it (it seeds from
+// `fit_glm_nb`'s θ̂ instead): `fit_glm_nb_capped` calls it inside `glm.rs`, so the
+// only cross-module readers left are the tests that pin it.
+#[cfg(test)]
+pub(crate) use glm::nb_theta_moment_seed;
 pub(crate) use glmm::glm_warm_start_beta;
 #[cfg(test)]
 pub(crate) use lmm::fit_mle_noz_pub;

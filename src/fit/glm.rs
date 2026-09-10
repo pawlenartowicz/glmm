@@ -29,9 +29,10 @@ impl GlmFitView<'_> {
 
 /// Builds the standard non-converged NaN `Fit` used to seed
 /// [`fit_glm_nb_capped`]'s θ↔β alternation before the first inner IRLS fit
-/// runs. If `max_outer` were ever `0` this is what the loop would return
-/// unmodified; in practice `max_outer >= 1` always, so the first iteration
-/// overwrites it before it's read.
+/// runs. If `max_outer` were ever `0` this is what the loop returns unmodified,
+/// `dispersion: NaN` included — the loop only overwrites `dispersion` with the
+/// alternation's θ when the final fit converged; in practice `max_outer >= 1`
+/// always, so the first iteration replaces it before it's read.
 fn fit_unsupported_family(p: usize) -> Fit {
     Fit {
         beta: vec![f64::NAN; p],
@@ -218,29 +219,33 @@ pub(crate) fn glm_view_to_fit(
     // holds φ=v fixed; `None` estimates the Pearson moment `φ̂=Σ wᵢrᵢ²/(n−p)`,
     // `rᵢ=(yᵢ−μ̂ᵢ)/√V(μ̂ᵢ)`, raw-row df — exactly
     // `summary(glm(family=Gamma/inverse.gaussian, weights=w))$dispersion`.
-    let dispersion = match family {
-        Family::Gamma { .. } | Family::InverseGaussian { .. } if converged => {
-            let phi = match opts.dispersion {
-                Some(v) => v,
-                None => crate::family::pearson_dispersion(
-                    y,
-                    view.mu,
-                    family,
-                    nb_theta,
-                    n,
-                    p,
-                    opts.weights.as_deref(),
-                ),
-            };
-            let sqrt_phi = phi.sqrt();
-            for v in se.iter_mut() {
-                if v.is_finite() {
-                    *v *= sqrt_phi;
+    let dispersion = if !converged {
+        f64::NAN
+    } else {
+        match family {
+            Family::Gamma { .. } | Family::InverseGaussian { .. } => {
+                let phi = match opts.dispersion {
+                    Some(v) => v,
+                    None => crate::family::pearson_dispersion(
+                        y,
+                        view.mu,
+                        family,
+                        nb_theta,
+                        n,
+                        p,
+                        opts.weights.as_deref(),
+                    ),
+                };
+                let sqrt_phi = phi.sqrt();
+                for v in se.iter_mut() {
+                    if v.is_finite() {
+                        *v *= sqrt_phi;
+                    }
                 }
+                phi
             }
-            phi
+            _ => 1.0,
         }
-        _ => 1.0,
     };
 
     // Var(β̂) = φ·(X'WX)⁻¹ — the same φ the SE loop applied as √φ. A no-op for
@@ -322,8 +327,8 @@ const NB_THETA_TOL: f64 = 1e-6;
 /// so large θ (near `1e4`) drives `μ²/θ` toward zero — near-Poisson, low
 /// overdispersion; small θ (near `1e-3`) is the highly overdispersed end,
 /// implausibly so beyond this bound for the validation datasets.
-pub(super) const NB_THETA_LO: f64 = 1e-3;
-pub(super) const NB_THETA_HI: f64 = 1e4;
+pub(crate) const NB_THETA_LO: f64 = 1e-3;
+pub(crate) const NB_THETA_HI: f64 = 1e4;
 
 /// NB profile log-likelihood in θ at fixed μ̂, up to the θ-independent `−ln(yᵢ!)`:
 /// `Σ[ lnΓ(yᵢ+θ) − lnΓ(θ) + θ·ln(θ/(θ+μ̂ᵢ)) + yᵢ·ln(μ̂ᵢ/(θ+μ̂ᵢ)) ]`. Counts are
@@ -360,8 +365,10 @@ pub(crate) fn nb_profile_loglik(y: &[f64], mu: &[f64], theta: f64, weights: Opti
 /// Maximise `g(ln θ)` over `ln θ ∈ [ln NB_THETA_LO, ln NB_THETA_HI]` by
 /// golden-section (the NB likelihood is far more symmetric in ln θ than in θ).
 /// Returns `θ̂ = exp(argmax)`. Shared by the GLM conditional θ profile
-/// ([`optimize_nb_theta`]) and the GLMM marginal-θ objective in [`fit_glmm_nb`];
-/// `g` is the log-likelihood to maximise as a function of `ln θ`.
+/// ([`optimize_nb_theta`]) and the sparse GLMM marginal-θ objective in
+/// `sparse::fit_glmm_nb_sparse` (the dense GLMM searches `ln θ` as a coordinate
+/// of its outer BOBYQA instead); `g` is the log-likelihood to maximise as a
+/// function of `ln θ`.
 ///
 /// Stopping width `1e-4` on `ln θ` (2026-08-06, was `1e-8`): for the GLMM route,
 /// `g` is a full inner GLMM refit at fixed θ, and that refit's own inner
@@ -414,6 +421,19 @@ fn optimize_nb_theta(y: &[f64], mu: &[f64], weights: Option<&[f64]>) -> f64 {
     golden_max_ln_theta(|t| nb_profile_loglik(y, mu, t.exp(), weights))
 }
 
+/// Cold-start seed for the NB dispersion: the method-of-moments
+/// `θ₀ = ȳ²/max(s²−ȳ, ε)`, clamped into `[NB_THETA_LO, NB_THETA_HI]`. Unweighted on
+/// purpose (a seed only). The GLM outer loop's own start; the GLMM `ln θ_NB`
+/// coordinate does NOT use it directly — it seeds from `fit_glm_nb`'s θ̂, which
+/// reaches this only as that fit's own start. On a GLMM the random effects
+/// inflate `s²`, so this seed sits one to two orders of magnitude below θ̂,
+/// which is why the GLMM route does not take it.
+pub(crate) fn nb_theta_moment_seed(y: &[f64], n: usize) -> f64 {
+    let ybar = y.iter().sum::<f64>() / n as f64;
+    let var = y.iter().map(|&yi| (yi - ybar).powi(2)).sum::<f64>() / (n.max(2) - 1) as f64;
+    (ybar * ybar / (var - ybar).max(1e-6)).clamp(NB_THETA_LO, NB_THETA_HI)
+}
+
 /// Negative-binomial GLM via the alternating outer-θ loop (`MASS::glm.nb`):
 /// (1) fit the GLM at fixed θ; (2) 1-D maximise the NB profile log-likelihood
 /// over θ holding β̂/μ̂; (3) repeat to convergence. `theta_seed = Some(v)` seeds
@@ -422,7 +442,10 @@ fn optimize_nb_theta(y: &[f64], mu: &[f64], weights: Option<&[f64]>) -> f64 {
 /// weighted θ optimisation below washes out the seed's influence). The β SE
 /// conditions on θ̂ (lme4/MASS convention; θ-uncertainty is out of scope), so
 /// `dispersion = θ̂` and the SE comes straight from the final fixed-θ fit (NB
-/// has `φ≡1`; overdispersion lives in `V=μ+μ²/θ`).
+/// has `φ≡1`; overdispersion lives in `V=μ+μ²/θ`). Returns `(Fit, θ)`: the
+/// `Fit`'s own `dispersion` is NaN unless the fit converged, but the second
+/// element is always the last θ the alternation stood on, for callers that
+/// need a seed regardless of convergence (`fit_glmm_nb`'s outer-BOBYQA seed).
 pub(super) fn fit_glm_nb(
     x: &[f64],
     y: &[f64],
@@ -430,7 +453,7 @@ pub(super) fn fit_glm_nb(
     p: usize,
     theta_seed: Option<f64>,
     opts: &FitOptions,
-) -> Fit {
+) -> (Fit, f64) {
     fit_glm_nb_capped(x, y, n, p, theta_seed, opts, NB_MAX_OUTER)
 }
 
@@ -441,7 +464,9 @@ pub(super) fn fit_glm_nb(
 ///
 /// Cap-exhaustion semantics (pinned by `fit_glm_nb_outer_cap_semantics`): the
 /// exit is SILENT — `converged` reflects only the last inner IRLS fit, β/se
-/// stay at the stale pre-update θ, and `dispersion` carries the newer θ.
+/// stay at the stale pre-update θ, and the returned `Fit::dispersion` carries
+/// the newer θ only when that last inner IRLS converged (NaN otherwise); the
+/// second return value carries the newer θ unconditionally.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_glm_nb_capped(
     x: &[f64],
@@ -451,12 +476,8 @@ pub(super) fn fit_glm_nb_capped(
     theta_seed: Option<f64>,
     opts: &FitOptions,
     max_outer: usize,
-) -> Fit {
-    let mut theta = theta_seed.unwrap_or_else(|| {
-        let ybar = y.iter().sum::<f64>() / n as f64;
-        let var = y.iter().map(|&yi| (yi - ybar).powi(2)).sum::<f64>() / (n.max(2) - 1) as f64;
-        (ybar * ybar / (var - ybar).max(1e-6)).clamp(NB_THETA_LO, NB_THETA_HI)
-    });
+) -> (Fit, f64) {
+    let mut theta = theta_seed.unwrap_or_else(|| nb_theta_moment_seed(y, n));
 
     let family = Family::NegativeBinomial {
         link: NegBinomialLink::Log,
@@ -494,6 +515,8 @@ pub(super) fn fit_glm_nb_capped(
             break;
         }
     }
-    fit_result.dispersion = theta;
-    fit_result
+    if fit_result.converged() {
+        fit_result.dispersion = theta;
+    }
+    (fit_result, theta)
 }

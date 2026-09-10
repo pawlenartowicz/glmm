@@ -2,8 +2,8 @@
 
 `glmm.fit` parses `formula` against `data`'s columns through the Rust
 `glmm::formula` module, fits via the `glmm` kernel (through the `glmm._native`
-PyO3 extension), and returns a `Fit`. Two options are GLMM 0.1.1 —
-approved design, not yet implemented in the kernel — and raise a clean
+PyO3 extension), and returns a `Fit`. Two options are not yet implemented
+in the kernel and raise a clean
 `NotImplementedError`: quasi-likelihood `dispersion=` on binomial/poisson, and
 `init_theta=<float>` (no kernel hook exists yet to seed the negative-binomial
 search — only the default `init_theta=None` cold-start is supported).
@@ -386,8 +386,8 @@ def _pinned_detail(res):
     rather than at 0 — a scan for exactly-zero stddevs misses those pins.
 
     That same fact is why the message says "pinned at the variance boundary" and
-    not "= 0", which is what it used to say. What is pinned is the Cholesky
-    diagonal; the stddev this fit reports for the component keeps whatever the
+    not "= 0": what is pinned is the Cholesky diagonal; the stddev this fit
+    reports for the component keeps whatever the
     off-diagonal settled on, and on a q >= 2 block that has been measured as
     high as 2.2e-3 against a 0.689 sibling — a number that shows up in a printed
     VarCorr at default rounding. A warning must not contradict a number the same
@@ -554,7 +554,7 @@ def fit(
         )
 
     # `|` marks a random-effect term, so its presence is the mixed/GLM split
-    # — decidable without the (M6, Rust-side) formula parser.
+    # — decidable without the (Rust-side) formula parser.
     mixed = "|" in formula
 
     if family == "inversegaussian" and mixed:
@@ -619,8 +619,7 @@ def fit(
         dispersion = None
     if family in ("binomial", "poisson") and dispersion is not None:
         raise NotImplementedError(
-            f"quasi-likelihood dispersion on family {family!r} requires GLMM "
-            "0.1.1; not yet implemented in the kernel"
+            f"quasi-likelihood dispersion on family {family!r} is not yet implemented in the kernel"
         )
     if init_theta is not None:
         raise NotImplementedError(

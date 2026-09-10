@@ -227,9 +227,10 @@ fn fit_rank_deficient_drops_and_matches_reduced() {
 /// then has to remap the RE slope index through the kept-columns map and finds
 /// the slope's column gone. Dropping the random slope alongside the fixed column
 /// would be a different model, so the model is genuinely unfittable; the question
-/// is only how that is reported. It used to `assert!`, which takes the caller's
-/// whole process down — an R/Python user got an abort instead of an inspectable
-/// fit, and a loop caller lost the entire run over one degenerate draw.
+/// is only how that is reported. Panicking here would take the caller's
+/// whole process down — an R/Python user would get an abort instead of an
+/// inspectable fit, and a loop caller would lose the entire run over one
+/// degenerate draw.
 ///
 /// Deliberately written with `catch_unwind` rather than `#[should_panic]`: the
 /// assertion under test is that NO panic happens, so a regression must surface as
@@ -655,7 +656,7 @@ fn spec_sized_from_ids_nested_unbalanced_first_parent_widest() {
 }
 
 /// A `q_g = 5` (intercept + 4 slopes) extra grouping is over the `MAX_EXTRA_Q = 4`
-/// NoZ-scratch envelope and routes to Sparse (d1 #2). The sparse numeric path
+/// NoZ-scratch envelope and routes to Sparse. The sparse numeric path
 /// makes this a *supported* design — it routes to Sparse and
 /// `fit_cold` runs the sparse solver (returning a degenerate non-converged `Fit`
 /// on this n=0 input) instead of hitting the removed stub.
@@ -693,11 +694,11 @@ fn fit_extra_grouping_q_too_large_routes_sparse() {
     assert!(!fit.converged());
 }
 
-/// d1 #2: 7 crossed extras exceed `MAX_EXTRA_GROUPINGS = 6`, the NoZ-scratch
-/// envelope. Over-envelope-by-count designs are now supported: `classify_design`
+/// 7 crossed extras exceed `MAX_EXTRA_GROUPINGS = 6`, the NoZ-scratch
+/// envelope. Over-envelope-by-count designs are supported: `classify_design`
 /// routes them to Sparse, and the sparse path builds its own cap-free structures
-/// (`SparseLmmWorkspace::new` no longer calls `add_rows_multi`, and
-/// `from_cluster_spec_ext`'s `n_extras <= MAX_EXTRA_GROUPINGS` guard is gone).
+/// (`SparseLmmWorkspace::new` does not call `add_rows_multi`, and
+/// `from_cluster_spec_ext` carries no `n_extras <= MAX_EXTRA_GROUPINGS` guard).
 /// So `fit_cold` runs the sparse solver rather than panicking. Mirrors the
 /// sibling `fit_extra_grouping_q_too_large_routes_sparse` (over-envelope by width).
 #[test]
@@ -1100,7 +1101,7 @@ fn classify_routes_many_crossed_levels_to_sparse() {
     ));
 }
 
-/// The measured q_g performance boundary (d2 Phase-1 crossover sweep) for
+/// The measured q_g performance boundary for
 /// Gaussian, and the only-implemented-route boundary for non-Gaussian: ANY
 /// slope-carrying extra grouping routes Sparse. Gaussian intercept-only
 /// extras (q_g = 1) stay NoZ (NoZ won 12–15× on the measured slice); the
@@ -1238,7 +1239,7 @@ fn fixed_only_fit_runs_zero_bobyqa_evals() {
 // ---------------------------------------------------------------------------
 
 /// `vcov` must be a symmetric p×p whose diagonal IS `se²`, on every estimator
-/// path — the spec's plan gate 2: no path may report a finite `se[j]` next to a
+/// path — no path may report a finite `se[j]` next to a
 /// NaN `vcov[j][j]`. Covers OLS / GLM / LMM / GLMM (both `WaldSe` arms), since
 /// each sources `vcov` from a different matrix.
 fn assert_vcov_agrees_with_se(fit: &Fit, p: usize, ctx: &str) {
@@ -1444,7 +1445,7 @@ fn vcov_rows_are_nan_for_aliased_columns() {
 }
 
 // ---------------------------------------------------------------------------
-// The public `Diagnostics` surface (0.2.0): the three moved fields, the two
+// The public `Diagnostics` surface: the three moved fields, the two
 // reshaped ones, and the notes channel.
 // ---------------------------------------------------------------------------
 
@@ -1624,18 +1625,23 @@ fn lmm_reports_kkt_and_boundary_score() {
 }
 
 /// A `q=2` primary (intercept + slope) shape where the intercept variance
-/// pins at 0 while the slope's off-diagonal covariance entry below it
-/// (`vech(Λ)` index 1, i.e. λ₁₀) stays non-zero: the case
-/// `LmmGroupings::diagonal_has_nonzero_below` exists for. Data construction
-/// mirrors `diagnostics_boundary_reports_both_ends`'s ±0.8 cancellation for
-/// the intercept (forcing its between-cluster variance MLE to exactly 0),
-/// plus a per-cluster slope offset so the slope variance is genuinely
-/// positive (not pinned). λ₁₀ is pushed off 0 by a warm start: once λ₀₀ = 0,
-/// the deviance depends on (λ₁₀, λ₁₁) only through λ₁₀² + λ₁₁², a flat
-/// (rotation-invariant) direction, so a non-zero λ₁₀ start is not pulled back
-/// to 0 by the fit.
+/// pins at 0 and BOBYQA stops with the slope's off-diagonal entry below it
+/// (`vech(Λ)` index 1, i.e. λ₁₀) non-zero. Data construction mirrors
+/// `diagnostics_boundary_reports_both_ends`'s ±0.8 cancellation for the
+/// intercept (forcing its between-cluster variance MLE to exactly 0), plus a
+/// per-cluster slope offset so the slope variance is genuinely positive (not
+/// pinned). λ₁₀ is pushed off 0 by a warm start: once λ₀₀ = 0, the deviance
+/// depends on (λ₁₀, λ₁₁) only through λ₁₀² + λ₁₁², a flat (rotation-invariant)
+/// direction, so a non-zero λ₁₀ start is not pulled back to 0 by the fit.
+///
+/// `canonicalize_pinned_blocks` rotates that flat direction back onto the
+/// trailing diagonal after the pin loop, so this fixture now pins what it
+/// should: a finite score at the pinned intercept, `pinned == [[true, false]]`
+/// against `sd = [0, 0.817]`, and — the reason the rewrite is safe —
+/// deviance and `varcorr` unmoved from the pre-canonicalization values
+/// measured on this fixture (2026-09-09), because the rewrite preserves Σ.
 #[test]
-fn lmm_boundary_score_skips_component_with_nonzero_off_diagonal() {
+fn lmm_boundary_score_reported_after_canonicalization() {
     let n_clusters = 6usize;
     let reps_per_half = 8usize;
     let n = n_clusters * reps_per_half * 2;
@@ -1695,19 +1701,37 @@ fn lmm_boundary_score_skips_component_with_nonzero_off_diagonal() {
     );
     assert!(fit.converged(), "status = {:?}", fit.diagnostics.boundary);
     assert_eq!(fit.diagnostics.boundary, Boundary::AtBoundary);
-    // pinned[0][0] is the intercept variance component (θ00); it must be
-    // pinned for this test to exercise the case at all.
-    assert!(
-        fit.diagnostics.pinned[0][0],
-        "intercept variance did not pin: pinned = {:?}",
-        fit.diagnostics.pinned
+    // The intercept variance pins; the slope variance does not, despite a
+    // stddev of 0.817 that a looser check would flag as a second pinned
+    // component.
+    assert_eq!(
+        fit.diagnostics.pinned,
+        vec![vec![true, false]],
+        "pinned = {:?}, stddev = {:?}",
+        fit.diagnostics.pinned,
+        fit.stddev_corr(0).0
     );
     let s = fit.diagnostics.boundary_score[0][0];
     assert!(
-        s.is_nan(),
-        "boundary_score for the pinned intercept must be withheld \
-         (non-zero λ10 below it breaks the evenness the ½·H_jj shortcut needs), got {s}"
+        s.is_finite(),
+        "boundary_score for the pinned intercept must be reported on a \
+         canonical Λ (its column below the diagonal is zero), got {s}"
     );
+    assert!(fit.diagnostics.boundary_score[0][1].is_nan());
+    // Σ is preserved by the canonicalization, so these are the same numbers a
+    // pre-canonicalization build reported on this fixture.
+    let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1.0);
+    assert!(
+        rel(fit.deviance, -2.017076489408452e1) < 1e-9,
+        "deviance = {}",
+        fit.deviance
+    );
+    for (&got, &want) in fit.varcorr[0]
+        .iter()
+        .zip([0.0, 0.0, 0.6679633931875338].iter())
+    {
+        assert!(rel(got, want) < 1e-9, "varcorr = {:?}", fit.varcorr[0]);
+    }
 }
 
 /// `Boundary` at both ends of the range the dense LMM route can report:

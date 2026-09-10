@@ -2,9 +2,9 @@
 //! estimator dispatch, the numerical kernel lives in `src/glmm/`. Builds the
 //! `GlmmWorkspace`/RE design `Z`/crossed-Schur symbolic factor, cold-starts β
 //! from the no-RE GLM fit (`glm_warm_start_beta`), and maps `GlmmFit` +
-//! workspace state back to `Fit`. `fit_glmm_nb` runs the NB **marginal-θ**
-//! outer search (`lme4::glmer.nb`) on top of the fixed-θ `fit_glmm`/`fit_glmm_build`
-//! pair.
+//! workspace state back to `Fit`. `fit_glmm_nb` searches the NB dispersion
+//! `θ_NB` as one more coordinate of the kernel's own outer BOBYQA
+//! (`glmm::fit_glmm`), so one call fits β, θ_RE and θ_NB together.
 
 use faer::Mat;
 
@@ -15,7 +15,6 @@ use crate::{Family, ModelSpec, NegBinomialLink, StartValues};
 use super::common::{
     assemble_varcorr, fill_se_by_predictor, nan_vcov, to_col_major, warm_theta, FitDiagnostics,
 };
-use super::glm::{golden_max_ln_theta, nb_profile_loglik};
 use super::{Diagnostics, Fit, FitOptions};
 
 // ---------------------------------------------------------------------------
@@ -33,8 +32,8 @@ use super::{Diagnostics, Fit, FitOptions};
 /// slope (q≥2) models are not yet validated through this field.
 /// Returns the mapped `Fit`, the converged conditional means `μ̂` (length `n`, from
 /// `ws.prob` after the pinned-γ̂ re-eval), and the minimized marginal Laplace
-/// deviance — the NB GLMM marginal-θ loop needs the deviance (μ̂ is now unused by
-/// it but kept for any conditional-mean caller); other callers take `.0`.
+/// deviance; callers take `.0`, the deviance rides along for the tests that
+/// compare routes at fixed θ.
 /// Cold-start β for a GLMM fit: the coefficients of the fixed-effects-only GLM
 /// (no random effects), matching lme4/glmer's initialization. Starting the joint
 /// [θ|β] BOBYQA (and its inner PIRLS) from η ≈ Xβ̂_glm — the mean already explained
@@ -114,11 +113,11 @@ pub(crate) fn glm_warm_start_beta(
 /// the crossed-Schur symbolic factor — none of which depend on `nb_theta`.
 /// Returns the prebuilt `(ws, x_mat)` for [`fit_glmm_prebuilt`], or (on the
 /// degenerate n=0/p=0 short-circuit) `Err` carrying the same NaN `Fit` triple
-/// the public path returns. Hoisted so the NB marginal-θ search
-/// ([`fit_glmm_nb`]) builds it ONCE and re-solves per θ instead of rebuilding
-/// `Z` + the symbolic factor every golden-section eval.
+/// the public path returns. Split from [`fit_glmm_prebuilt`] so a caller with
+/// its own workspace policy can build once and solve on it; the stable path
+/// composes both.
 /// θ-invariant build state returned by [`fit_glmm_build`]: the sized workspace
-/// and the column-major `X`, both reusable across NB marginal-θ evals.
+/// and the column-major `X`.
 type BuiltGlmm = (GlmmWorkspace, Mat<f64>);
 
 fn fit_glmm_build(
@@ -206,7 +205,7 @@ fn fit_glmm_build(
 
 /// Test-only baseline (fixed-θ dense GLMM as a single call). The stable path
 /// dispatches through the unified core ([`super::core::fit_on`]) over
-/// `run_glmm_on`/`glmm_view_to_fit`; the NB marginal-θ loop uses
+/// `run_glmm_on`/`glmm_view_to_fit`; the NB route (`fit_glmm_nb`) composes
 /// `fit_glmm_build`/`fit_glmm_prebuilt` directly.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)] // marshals the kernel's (x, y, n, p, spec, ids…) surface
@@ -318,10 +317,10 @@ impl GlmmResultView<'_> {
 /// `nan_fit` bail there (`glmm/mod.rs`) skips the `theta_se` reset and leaves
 /// the previous fit's values in the workspace; harmless since `stddev_se` is
 /// itself gated on `converged`. The workspace is designed for cross-fit reuse
-/// (see `glmm::fit_glmm`), so calling this repeatedly on one prebuilt `ws` (the
-/// NB marginal-θ search) is bit-identical to a fresh construction per θ except
-/// for that one stale-on-bail slot. `Z`, the symbolic factor, and
-/// `x_mat` are θ-invariant reads; the numeric factorization the kernel writes
+/// (see `glmm::fit_glmm`), so calling this repeatedly on one prebuilt `ws` is
+/// bit-identical to a fresh construction per call except for that one
+/// stale-on-bail slot. `Z`, the symbolic factor, and `x_mat` are inputs the
+/// caller fixes before calling; the numeric factorization the kernel writes
 /// into `structured_schur` is recomputed every eval. [`glmm_view_to_fit`] maps
 /// the returned view to `Fit`.
 #[allow(clippy::too_many_arguments)]
@@ -338,8 +337,8 @@ pub(crate) fn run_glmm_on<'a>(
     start: Option<&StartValues>,
     opts: &FitOptions,
 ) -> GlmmResultView<'a> {
-    // NB θ̂ is threaded explicitly (the spec is θ-free); the PIRLS/AGQ variance and
-    // deviance read it off the workspace. NaN for every non-NB family (unread).
+    // NB θ₀ (the start of the `ln θ_NB` coordinate) is threaded explicitly; the
+    // kernel leaves θ̂_NB in `ws.nb_theta`. NaN for every non-NB family (unread).
     ws.nb_theta = nb_theta;
     ws.boundary_score_requested = opts.boundary_score;
 
@@ -373,6 +372,8 @@ pub(crate) fn run_glmm_on<'a>(
         n,
         opts.wald_se,
     );
+    // θ̂_NB after the search (NaN on every other family, untouched by the kernel).
+    let nb_theta = ws.nb_theta;
     GlmmResultView {
         fit: glmm_fit,
         nb_theta,
@@ -381,10 +382,10 @@ pub(crate) fn run_glmm_on<'a>(
 }
 
 /// Maps a [`GlmmResultView`] to the full stable `Fit`, the converged conditional
-/// means `μ̂` (length `n`), and the minimized marginal Laplace deviance (the NB
-/// marginal-θ loop needs the raw deviance; other callers take `.0`). Needs raw
-/// `y` (σ̂²/dispersion/loglik read it) and `model` (family selection); θ̂ comes
-/// from the view.
+/// means `μ̂` (length `n`), and the minimized marginal Laplace deviance; callers
+/// take `.0`, the deviance rides along for the tests that compare routes at
+/// fixed θ. Needs raw `y` (σ̂²/dispersion/loglik read it) and `model` (family
+/// selection); θ̂ comes from the view.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glmm_view_to_fit(
     view: &GlmmResultView<'_>,
@@ -450,21 +451,26 @@ pub(crate) fn glmm_view_to_fit(
     // SE here — the kernel already reports each arm on lme4's convention: Hessian
     // unscaled (`vcov(use.hessian=TRUE)`, oracle-settled) and Rx carrying σ̂² =
     // pwrss/n (`vcov(use.hessian=FALSE)`; `family::glmm_sigma_sq`, a DIFFERENT
-    // quantity than this φ̂). NB θ̂ is set by the outer-θ wrapper, not here.
-    let dispersion = match model.family {
-        Family::Gamma { .. } if converged => match opts.dispersion {
-            Some(v) => v,
-            None => crate::family::pearson_dispersion(
-                &y[..n],
-                &ws.prob[..n],
-                model.family,
-                nb_theta,
-                n,
-                p,
-                Some(&ws.prior_w[..n]),
-            ),
-        },
-        _ => 1.0,
+    // quantity than this φ̂).
+    let dispersion = if !converged {
+        f64::NAN
+    } else {
+        match model.family {
+            Family::Gamma { .. } => match opts.dispersion {
+                Some(v) => v,
+                None => crate::family::pearson_dispersion(
+                    &y[..n],
+                    &ws.prob[..n],
+                    model.family,
+                    nb_theta,
+                    n,
+                    p,
+                    Some(&ws.prior_w[..n]),
+                ),
+            },
+            Family::NegativeBinomial { .. } => nb_theta,
+            _ => 1.0,
+        }
     };
 
     // GLMM D̂ = σ̂²·Λ̂Λ̂' — the same σ̂² that scales tau2 above, so the two
@@ -594,8 +600,8 @@ pub(crate) fn glmm_view_to_fit(
 /// θ-dependent solve + `Fit` assembly on a prebuilt workspace. Composes
 /// [`run_glmm_on`] + [`glmm_view_to_fit`] — the same split the unified fit core
 /// drives (`fit_on` calls `run_glmm_on`; `FitView::into_fit` calls
-/// `glmm_view_to_fit`). Returns `(Fit, μ̂, deviance)`; the NB marginal-θ loop
-/// takes the deviance, other callers `.0`.
+/// `glmm_view_to_fit`). Returns `(Fit, μ̂, deviance)`; callers take `.0`, the
+/// deviance rides along for the tests that compare routes at fixed θ.
 #[allow(clippy::too_many_arguments)]
 fn fit_glmm_prebuilt(
     ws: &mut GlmmWorkspace,
@@ -626,31 +632,15 @@ fn fit_glmm_prebuilt(
     glmm_view_to_fit(&view, y, n, p, model, opts)
 }
 
-/// Negative-binomial GLMM via the **marginal-θ** profile (`lme4::glmer.nb`):
-/// optimise the dispersion θ on the *marginal* (Laplace-integrated) likelihood,
-/// not the conditional one. For each candidate θ the inner [`fit_glmm`] re-fits
-/// the full GLMM (variance components + β) at that fixed θ and returns its
-/// minimized marginal Laplace deviance `D(θ)`; the marginal log-likelihood is then
-///
-/// ```text
-///   logL_marginal(θ) = −½·D(θ) + nb_profile_loglik(y, y, θ, weights)
-/// ```
-///
-/// where the second term is the NB **saturated** log-likelihood (the θ-dependent
-/// `Σᵢ wᵢ·[lnΓ(yᵢ+θ)−lnΓ(θ)]` normalisation the deviance cancels against its
-/// saturated reference — see [`nb_profile_loglik`]'s derivation), `weights =
-/// opts.weights` (`None` ⇒ unit weights, matching `D(θ)`'s own weighting since
-/// both come from the same fit). Maximising this over `ln θ`
-/// by [`golden_max_ln_theta`] reproduces `glmer.nb`'s outer `optimize()`, which
-/// likewise re-fits the GLMM per θ. A non-converging inner fit returns
-/// `D=∞ ⇒ logL=−∞`, so the maximiser rejects that θ.
-///
-/// The earlier conditional-μ̂ profile (optimise θ on `nb_profile_loglik(y, μ̂, θ)`
-/// at the fitted conditional means) is biased by ~21% on the sim_nb oracle — it
-/// treats the conditional modes as data and ignores both the RE-integration and
-/// the curvature term's θ-dependence. `dispersion = θ̂`; the reported β/SE come
-/// from a final fit at θ̂ (`theta_seed` is irrelevant to the global ln-θ bracket
-/// search and unused).
+/// Negative-binomial GLMM: the dispersion θ_NB is a coordinate of the outer
+/// search on the marginal objective `dev − 2·nb_profile_loglik(y, y, θ_NB, w)`
+/// (`glmm::fit_glmm`), so β, θ_RE and θ_NB come out of one fit — the same optimum
+/// `lme4::glmer.nb`'s outer `optimize()` over re-fitted GLMMs reaches, without
+/// the re-fits. The coordinate cold-starts at the no-RE GLM-NB's own θ̂ (one
+/// extra fixed-effects-only `fit_glm_nb`, itself an IRLS/θ-profile alternation
+/// capped at `NB_MAX_OUTER`); a caller's `start` seeds β/θ_RE as on every
+/// other family (θ_NB has no start slot). `dispersion = θ̂_NB`; the β SE
+/// conditions on θ̂ (lme4/MASS convention).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_glmm_nb(
     x: &[f64],
@@ -660,63 +650,45 @@ pub(super) fn fit_glmm_nb(
     model: &ModelSpec,
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
-    _start: Option<&StartValues>,
+    start: Option<&StartValues>,
     opts: &FitOptions,
 ) -> Fit {
-    // θ-free spec; θ̂ is threaded to fit_glmm explicitly per candidate. The NB
-    // marginal-θ search is a global ln-θ bracket, so a warm `_start` is irrelevant
-    // (matches the former unused `theta_seed`) — the inner fits cold-start.
     let nb_spec = ModelSpec {
         family: Family::NegativeBinomial {
             link: NegBinomialLink::Log,
         },
         re: model.re.clone(),
     };
-
-    // Build the θ-invariant state (workspace, Z, symbolic factor, col-major x)
-    // ONCE — every golden-section eval below re-solves on it at a new θ instead
-    // of reconstructing it. Degenerate n=0/p=0 returns the NaN Fit directly.
     let (mut ws, x_mat) = match fit_glmm_build(x, n, p, &nb_spec, cluster_ids, extra_ids, opts) {
         Ok(built) => built,
         Err(degenerate) => return degenerate.0,
     };
-    let x_ref = x_mat.as_ref().subrows(0, n);
-
-    let theta = golden_max_ln_theta(|t| {
-        let th = t.exp();
-        let (_fit, _mu, dev) = fit_glmm_prebuilt(
-            &mut ws,
-            x_ref,
-            y,
-            n,
-            p,
-            &nb_spec,
-            cluster_ids,
-            extra_ids,
-            th,
-            None,
-            opts,
-        );
-        // `dev` is already weighted (opts threads through fit_glmm → ws.prior_w,
-        // 4c); the saturated-reference term takes the same per-row weights so
-        // both halves of `logL_marginal` are on the same weighted scale.
-        -0.5 * dev + nb_profile_loglik(y, y, th, opts.weights.as_deref())
-    });
-
-    let mut fit_result = fit_glmm_prebuilt(
+    // The method-of-moments seed (`nb_theta_moment_seed`) charges the random-effect
+    // variance to the dispersion: on a GLMM it lands one to two orders of magnitude
+    // below θ̂, and on random-slope shapes PIRLS never converges at those dispersions,
+    // handing the outer BOBYQA a `+∞` plateau it can't escape. The no-RE GLM-NB's own
+    // θ̂ is a start, not an estimate (the fixed effects alone under-explain the mean,
+    // so it still moves under the outer search), but it starts inside the basin PIRLS
+    // can actually converge in. Taken unguarded: on finite `y` the prefit always
+    // reports a θ inside `[NB_THETA_LO, NB_THETA_HI]` (its own seed is clamped there
+    // and the profile search never leaves the box), so there is nothing a fallback
+    // could rescue. `fit_glm_nb` hands back that θ as its second return value —
+    // the last θ its alternation stood on, the moment seed if the first inner IRLS
+    // failed, the θ reached so far if a later one did — because the `Fit`'s own
+    // `dispersion` field is NaN unless the prefit converged.
+    let nb_seed = super::glm::fit_glm_nb(x, y, n, p, None, opts).1;
+    fit_glmm_prebuilt(
         &mut ws,
-        x_ref,
+        x_mat.as_ref().subrows(0, n),
         y,
         n,
         p,
         &nb_spec,
         cluster_ids,
         extra_ids,
-        theta,
-        None,
+        nb_seed,
+        start,
         opts,
     )
-    .0;
-    fit_result.dispersion = theta;
-    fit_result
+    .0
 }

@@ -248,7 +248,9 @@ pub(crate) fn rx_cov_into(
 /// correction RAISES cbpp SEs above RX — as ours does; lme4's default-tol value
 /// lowers them, a sign artifact of the lagged weights.
 ///
-/// `m = ws.params.len() = n_theta + p`; the β block is rows/cols `n_theta..m`.
+/// `m = n_theta + p`; the β block is rows/cols `n_theta..m`. On NB `ws.params`
+/// carries one more trailing entry (`ln θ_NB`), which the grid never perturbs —
+/// the SE conditions on θ̂ (lme4/MASS convention).
 /// Precondition: `ws` is at a CONVERGED fit and `ws.z_buf`-eligible scratch is
 /// valid for (x, ids, n) (the deviance evals re-solve PIRLS).
 #[allow(clippy::too_many_arguments)]
@@ -263,7 +265,7 @@ pub fn joint_hessian_cov(
     out_cov: &mut Mat<f64>,
 ) -> FdHessianStatus {
     use faer::linalg::solvers::Solve;
-    let m = ws.params.len();
+    let m = ws.n_theta + p;
     let n_theta = ws.n_theta;
 
     // Snapshot γ̂; fill z_buf once (blocked AND
@@ -285,8 +287,8 @@ pub fn joint_hessian_cov(
 
     // Put û(γ̂) back the way it was found. `u_seed` holds the entry mode (see the
     // seeding block below), and every eval here overwrites `ws.u` with its own
-    // perturbed mode, so without this the workspace exits carrying an FD leftover
-    // where the fit's mode used to be — and since the seed is now READ from
+    // perturbed mode, so without this the workspace would exit carrying an FD
+    // leftover in place of the fit's mode — and since the seed is read from
     // `ws.u`, a second `joint_hessian_cov` on the same workspace would anchor on that
     // leftover and return a different (still valid, but different) covariance.
     // `fd_hessian_parallel_bit_identical_to_serial` calls it exactly twice and is
@@ -360,23 +362,23 @@ pub fn joint_hessian_cov(
     // the seed for the same reason and so reproduces the deviance the optimizer
     // actually reached.
     //
-    // This used to run f0 cold (u = 0) and take ITS mode as the seed, on the
-    // assumption that a cold solve at γ̂ re-finds û(γ̂). That assumption holds
-    // wherever the PIRLS mode problem has one basin, and fails where it has more
-    // than one: on a Gamma fit with the INVERSE link the cold solve lands in a
-    // different basin than the fit did, and the whole Hessian is then built around
-    // a point that is not the fit's optimum. Measured on `sim_gamma`
+    // The PIRLS mode problem is not guaranteed to have one basin: on a Gamma fit
+    // with the INVERSE link, a cold solve (u = 0) at γ̂ can land in a different
+    // basin than the fit's own mode, so seeding f0 from a cold start instead of
+    // from `ws.u_seed` would build the whole Hessian around a point that is not
+    // the fit's optimum. Measured on `sim_gamma`
     // (`y ~ 1 + x + grp + (1 | cluster)`, Gamma-inverse): the fit reaches deviance
-    // 936.7683 and a cold f0 at the same γ̂ returns 1034.5678, ~98 above it. The
-    // deviance seen along each coordinate then jumps between the two branches, so
-    // the second differences measure the branch gap rather than curvature — every
-    // diagonal entry came out around −9.8e5, the joint Hessian was indefinite, and
-    // the RX fallback formed its Schur at the same wrong mode and was indefinite
-    // too. The fit was reported as failed for want of a standard error.
+    // 936.7683 while a cold f0 at the same γ̂ returns 1034.5678, ~98 above it. The
+    // deviance seen along each coordinate would then jump between the two
+    // branches, so the second differences would measure the branch gap rather
+    // than curvature — every diagonal entry comes out around −9.8e5, the joint
+    // Hessian is indefinite, and the RX fallback forms its Schur at the same
+    // wrong mode and is indefinite too, so the fit reports as failed for want of
+    // a standard error.
     //
-    // Seeding from û(γ̂) makes f0 equal the fit's deviance exactly there, and moves
-    // the log-link sibling's f0 from 1.2e-6 to 1.0e-7 off its own `Fit::deviance` —
-    // this is the self-consistency the FD needed on every link, not a Gamma patch.
+    // Seeding from û(γ̂) makes f0 equal the fit's deviance exactly there, and
+    // keeps the log-link sibling's f0 within 1.0e-7 of its own `Fit::deviance` —
+    // this is the self-consistency the FD needs on every link, not a Gamma patch.
     let kk = ws.k.max(1);
     ws.u_seed[..kk].copy_from_slice(&ws.u[..kk]);
     ws.fd_saved_prob[..n].copy_from_slice(&ws.prob[..n]);

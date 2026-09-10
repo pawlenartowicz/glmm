@@ -142,10 +142,10 @@ fn m3_corpus() -> Vec<(Golden, Vec<String>)> {
 /// These are promoted into `m3_goldens` coverage: asserted from
 /// `cargo test` instead of only by `compare.R` on a machine with R. Reading them
 /// in place achieves that without a second copy of 15 frozen JSONs. The `goldens/`
-/// and `results/` trees held
-/// overlapping values that had silently drifted onto different `tolPwrss`
-/// settings, and the fix was to put them back on the same footing. A third
-/// overlapping tree would rebuild exactly that hazard.
+/// and `results/` trees would risk drifting onto different `tolPwrss`
+/// settings if it held a second, separately-maintained copy of these values;
+/// reading `results/` in place keeps them on one footing. A third overlapping
+/// tree would rebuild exactly that hazard.
 ///
 /// Its result JSONs use the harness's own field names (`dataset`, no `kind`, no
 /// `r_formula` — the model lives in the manifest, not the result). The three
@@ -290,9 +290,10 @@ fn unasserted_fields(g: &Golden) -> Vec<(&'static str, &'static str)> {
 /// elsewhere, and blocked on a decision that is not this tier's to make. The
 /// count is asserted below so entries cannot accumulate quietly.
 fn known_open(_g: &Golden) -> Option<&'static str> {
-    // Empty since 2026-07-21: the last entry (sim_sparse_gamma) closed when the
-    // formula frontend switched to lowering random effects in formula order,
-    // which routes that model sparse — see `//gamma_rungs` in validation/manifest.json.
+    // Empty: the formula frontend lowers random effects in formula order, which
+    // routes `sim_sparse_gamma` sparse instead of leaving it blocked — see
+    // `//gamma_rungs` in validation/manifest.json. No golden here is presently
+    // gated on an open decision.
     None
 }
 
@@ -439,9 +440,11 @@ mod flag_semantics {
     }
 }
 
-/// The defect this tier was built to fix: a reader struct silently dropping a
+/// The defect this test guards against: a reader struct silently dropping a
 /// golden field, so the value is frozen, costs an R run, and is never checked.
-/// `Est` used to drop `sigma`, `se_rx`, `loglik`, `dispersion` and `theta`.
+/// It walks every key under `estimates` in the golden JSON and requires each
+/// one to be either asserted (`asserted_fields`) or explicitly excused
+/// (`unasserted_fields`).
 ///
 /// Deliberately not `deny_unknown_fields`: every golden carries top-level
 /// metadata no assertion reads, and refusing unknown fields is a different
@@ -507,8 +510,8 @@ fn goldens_agree_with_the_references() {
     //
     // 53 -> 55 on 2026-07-30: the two `sim_binomial_bigsd_agq_k{7,11}` references
     // were frozen, so their specs lost `pending_reference` and rejoined
-    // `m3_corpus()`. 55 -> 56 on 2026-08-01: `sim_dynrange_lmm` joined, a design
-    // the crate used to NaN-fill on conditioning grounds and now fits — which is
+    // `m3_corpus()`. 55 -> 56 on 2026-08-01: `sim_dynrange_lmm` joined: this
+    // design now fits instead of NaN-filling on conditioning grounds, which is
     // what made a reference possible at all. 56 -> 61 on 2026-08-06: the five
     // `sim_scale_*_glm` goldens joined, pinning that the GLM divergence guard's
     // switch from bounding |β| to bounding |η| gives the same accept/reject

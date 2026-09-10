@@ -55,12 +55,12 @@ for (spec in manifest$datasets) {
   cat(sprintf("wrote %-12s  %3d rows x %d cols\n", spec$name, nrow(df), ncol(df)))
 }
 
-# --- Simulated Gamma / NB datasets for the M3 family goldens ------------------
+# --- Simulated Gamma / NB datasets for the family goldens ------------------
 # Gamma and NB have no lme4-bundled dataset, so the frozen reference is "R's fit on
 # THIS committed CSV". A fixed seed makes the data reproducible; the CSV (not the
 # seed) is the artifact every consumer reads. A scalar random intercept over 24
-# clusters with sd 0.6 keeps the GLMM references non-singular (Task R required a
-# bump from the design's 20x10/sd0.5 sketch -- glmer(Gamma) went singular there).
+# clusters with sd 0.6 keeps the GLMM references non-singular (a bump from the
+# design's 20x10/sd0.5 sketch -- glmer(Gamma) went singular there).
 set.seed(20260630)
 make_clustered <- function(n_clust = 24, per = 12) {
   cl  <- factor(rep(seq_len(n_clust), each = per))
@@ -194,8 +194,8 @@ cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_wide_slopes", nrow(d_ws), 
 # on purpose: the formula frontend hoists the FIRST slope-carrying term to the
 # primary grouping, so `(1|g1) + (1+x|g2)` would lower to a q_p=2 primary + an
 # intercept-only extra (NoZ-routed). With slopes on both, g1 is primary and g2
-# stays a slope-carrying extra (q_g=2) — the exact in-envelope class the d2
-# crossover routing sends to the sparse kernel, previously absent from the corpus.
+# stays a slope-carrying extra (q_g=2) — the exact in-envelope class the
+# crossover routing sends to the sparse kernel, not otherwise present in the corpus.
 # g1 has more levels than g2 so lme4's VarCorr order (descending levels) matches
 # glmm's [primary | extra] block order positionally in compare.R.
 # Reference = lme4/MixedModels fits on THIS committed CSV (fixed seed).
@@ -218,7 +218,7 @@ write.csv(d_se, file.path(suite_dir, "data", "simulated", "sim_slope_extra.csv")
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_slope_extra", nrow(d_se), ncol(d_se)))
 
 # --- Step-2 sparse non-Gaussian validation datasets (rungs 8-9 + two goldens) -----
-# One dataset per newly-wired over-envelope family arm (step-2 spec §4). Each
+# One dataset per newly-wired over-envelope family arm. Each
 # design trips a REAL envelope cap so classify_design routes to Solver::Sparse
 # (the non-Gaussian router has no slope-extra clause — only `over` reaches
 # Sparse): over-COUNT = 7 crossed intercept extras (> MAX_EXTRA_GROUPINGS=6,
@@ -403,7 +403,7 @@ write.csv(d_bsc, file.path(suite_dir, "data", "simulated", "sim_binomial_slope_c
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_binomial_slope_crossed", nrow(d_bsc), ncol(d_bsc)))
 
 # --- Rung 19: sim_poisson_nested -- 3-level nesting depth in the Poisson/Laplace
-# kernel; today's Poisson coverage (grouseticks, sim_sparse_poisson) is
+# kernel; the rest of the Poisson coverage (grouseticks, sim_sparse_poisson) is
 # crossed-only, never nested. Same g1/g2 nesting shape as sim_three_level,
 # smaller RE sds to keep the log-link mean in a sane range.
 set.seed(20260714)
@@ -541,7 +541,7 @@ d_cl <- make_collinear_lmm()
 write.csv(d_cl, file.path(suite_dir, "data", "simulated", "sim_collinear_lmm.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_collinear_lmm", nrow(d_cl), ncol(d_cl)))
 
-# --- High-mean Poisson GLM dataset (bug-fixes B3) ------------------------------
+# --- High-mean Poisson GLM dataset ------------------------------
 # Regression dataset for the IRLS log-link cold start: from the old mu = 1 seed
 # (eta = 0) any count data with ybar over ~25-30 made the first WLS step
 # overshoot and IRLS run away (beta -> ~9e304); R converges via its

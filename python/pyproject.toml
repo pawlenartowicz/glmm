@@ -1,5 +1,5 @@
 [build-system]
-# Floor is 1.9, not 1.7: `license = "GPL-3.0-or-later"` below is a PEP 639 SPDX
+# Floor is 1.9, not 1.7: `license = "LGPL-3.0-or-later"` below is a PEP 639 SPDX
 # expression, which older maturin emits as an invalid `License:` field.
 requires = ["maturin>=1.9,<2.0"]
 build-backend = "maturin"
@@ -7,10 +7,10 @@ build-backend = "maturin"
 [project]
 name = "glmm"
 # Lockstep with the crate: must equal GLMM/Cargo.toml [package] version.
-version = "0.3.1"
+version = "0.3.2"
 description = "Linear-regression family OLS / GLM / LMM / GLMM — Python port of the glmm crate"
 readme = "README.md"
-license = "GPL-3.0-or-later"
+license = "LGPL-3.0-or-later"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 authors = [{ name = "Paweł Lenartowicz" }]

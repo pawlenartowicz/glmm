@@ -19,8 +19,8 @@ pub(crate) use blocked_extras::{pirls_solve_blocked_extras, structured_ainv_solv
 pub(crate) use dense::pirls_solve;
 
 /// What one `laplace_deviance` call does with β. `Fixed` = β is the caller's input
-/// (every SE, derivative and joint-BOBYQA eval). `ProfilePql` = the PQL border, today's
-/// stage 1. `ProfileExact` = the P1 border with the log|A| correction and the Laplace
+/// (every SE, derivative and joint-BOBYQA eval). `ProfilePql` = the PQL border, stage 1.
+/// `ProfileExact` = the exact-profile border with the log|A| correction and the Laplace
 /// merit — the objective is then the exact Laplace β-profile at θ.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BetaMode {
@@ -29,7 +29,7 @@ pub(crate) enum BetaMode {
     ProfileExact,
 }
 
-/// β handling for one PIRLS solve. `Fixed` = today's behavior verbatim (β is an
+/// β handling for one PIRLS solve. `Fixed` = the behavior verbatim (β is an
 /// immutable input; the FD-Hessian path and BOBYQA stage 2 REQUIRE this so the
 /// objective stays a function of the caller's β). `Profile` = PQL/stage-1 mode:
 /// a δβ Schur-border update runs each iteration and the converged β is written
@@ -94,7 +94,7 @@ pub(crate) struct DualStep<T> {
     pub(crate) exact: bool,
 }
 
-/// P1 scratch for the exact Laplace β-profile inside `pirls_solve_blocked`'s and
+/// Exact-profile scratch for the exact Laplace β-profile inside `pirls_solve_blocked`'s and
 /// `pirls_solve_blocked_extras`'s Profile mode. `f64` throughout — the β border
 /// is `f64`-only. Sized once per workspace, so the warm path allocates nothing.
 pub(crate) struct ExactProfileBufs {

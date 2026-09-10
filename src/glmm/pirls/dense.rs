@@ -31,7 +31,7 @@ use super::*;
 /// the optimum and is accepted — it never burns a halving. `u_prev` is the
 /// caller-owned length-k backtrack buffer; in `Profile` mode the joint (u,β) step
 /// is backtracked in lockstep, halving β toward `beta_prev` (the `BetaStep::Profile`
-/// twin of `u_prev`) alongside u. Convergence is today's rule, verbatim: the mixed
+/// twin of `u_prev`) alongside u. Convergence is the rule, verbatim: the mixed
 /// `dev(uⱼ) + ‖uⱼ₊₁‖²` band on successive steps, checked AFTER the step — so
 /// when no halving fires the iterate path and returned values are bit-identical
 /// to the pre-halving loop (`dev`/`w`/`eta`/`prob` at the assembly point,
@@ -109,7 +109,7 @@ pub(crate) fn pirls_solve(
         beta_prev[..p].copy_from_slice(&beta[..p]);
     }
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
-    let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
+    let mut mixed_prev = f64::INFINITY; // the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
     let mut converged = false;
     let mut dev = f64::NAN;
@@ -155,19 +155,19 @@ pub(crate) fn pirls_solve(
         // Retrospective step-halving (lme4 `pwrssUpdate`): the convergence band is
         // tested BEFORE the overshoot test because near the optimum Fisher scoring
         // is not strictly monotone — a step can land ε above `pen_accepted` yet
-        // inside the tol band, and that must converge (today's behavior), not burn
+        // inside the tol band, and that must converge (the behavior), not burn
         // all 10 halvings against FP noise.
         let pen_u: f64 = u[..k].iter().map(|v| v * v).sum();
         let penalized = dev + pen_u;
         // BAND-TOLERANT overshoot test (the convergence band is consulted before
         // any halving): a rise within the tol band is FP noise near the optimum —
         // Fisher scoring is not strictly monotone there — so it is ACCEPTED (never
-        // burns a halving) and the mixed rule below terminates, today's behavior.
+        // burns a halving) and the mixed rule below terminates, the behavior.
         // Only a rise EXCEEDING the band is a genuine overshoot worth backtracking.
         // The band must NOT itself be a converge trigger: the same-point objective
         // flattens quadratically while the iterate is still moving (dev and pen
         // trade off along the valley), so it fires one full iteration before
-        // today's mixed rule — measured on the intercept fixture (samepoint diff
+        // the mixed rule — measured on the intercept fixture (samepoint diff
         // 3.9e-5 inside the 1.07e-4 band while the mixed sequence was still 7.2e-3
         // apart), returning an iterate ~4e-7 coarse in the objective and breaking
         // the AGQ(k=1) ≡ Laplace 1e-12 gate and the non-canonical FD-Hessian SEs.
@@ -311,7 +311,7 @@ pub(crate) fn pirls_solve(
         }
         // log|A| off the factor that produces this step's u_new. On the converged
         // (final) iteration it — and `a`, left holding that A — describe exactly
-        // the factor that produced the returned u, preserving today's "log|A| off
+        // the factor that produced the returned u, preserving the "log|A| off
         // the final-iterate factor" contract. Reset before accumulating (a step
         // may be re-taken after a halving).
         logdet = 0.0;
@@ -440,7 +440,7 @@ pub(crate) fn pirls_solve(
                 pen += u[c] * u[c];
             }
         }
-        // Today's stopping rule, verbatim: the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` band on
+        // The stopping rule, verbatim: the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` band on
         // successive steps — when no halving fires the iterate path, trigger
         // point, and returned values are bit-identical to the pre-halving loop
         // (returned u is the post-step Newton-refined iterate; dev/w/eta/prob at

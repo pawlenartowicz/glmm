@@ -75,8 +75,8 @@ TIMINGS=0
 TIER2=0
 # Quadrature order for the AGQ pass, empty on a normal (Laplace) run. Exported as
 # VALIDATION_AGQ, which every engine reads (glmm.rs / lme4.R / glmm_python.py /
-# glmm_r.R) -- the pass used to be hand-run only, which is how a leg fitted UNPINNED
-# ended up in one table beside pinned ones.
+# glmm_r.R): exporting it here keeps a leg fitted UNPINNED from ending up in one
+# table beside pinned ones.
 AGQ=""
 # Sample count for --timings, warm-up included. 4 taken, first discarded, median of
 # 3 -- enough to see a 10x regression, cheap enough that nobody is tempted to make
@@ -140,8 +140,8 @@ else
   AGQ=""
 fi
 
-# Per-ENGINE run metadata for timed passes, mirroring campaigns/speed-grid/run.sh
-# (which is where the no_turbo discipline was worked out) and memory/memory.sh's
+# Per-ENGINE run metadata for timed passes, mirroring campaigns/speed-grid/run.sh's
+# no_turbo discipline and memory/memory.sh's
 # write_run_meta. Per engine, not per invocation: results/ legitimately holds legs
 # fitted at different times on different boxes, so one run-level file would lie
 # about the mix. Seconds do not transfer across machines -- `machine` is what lets
@@ -213,6 +213,8 @@ if [[ "$PREP" == 1 ]]; then
   Rscript "$ROOT/prep/gen_igauss_data.R"
 fi
 
+# Engines that actually fitted, for the archive snapshot after the loop.
+ARCHIVED=()
 for e in "${ENGINES[@]}"; do
   # Cleared by the skip branches below, so a missing julia/cargo/wheel/package does
   # not leave behind a run_meta claiming that engine was timed on this box.
@@ -267,10 +269,11 @@ for e in "${ENGINES[@]}"; do
   esac
   # run_meta and the timings it describes move together. An untimed pass has just
   # rewritten this engine's results with "timing": null, so a meta left behind from
-  # an earlier --timings run would advertise provenance for numbers that no longer
-  # exist. Plain rm, not trash-put: this is a regenerable file in a gitignored dir,
+  # an earlier --timings run would advertise provenance for numbers this pass just
+  # erased. Plain rm, not trash-put: this is a regenerable file in a gitignored dir,
   # and the harness must not require trash-cli to run.
   if [[ "$RAN" == 1 ]]; then
+    ARCHIVED=("${ARCHIVED[@]}" "$e")
     if [[ "$TIMINGS" == 1 ]]; then
       write_run_meta "$e"
     else
@@ -278,6 +281,41 @@ for e in "${ENGINES[@]}"; do
     fi
   fi
 done
+
+# Dated snapshot of what this pass just wrote. results/ is the LIVE tree every reader
+# (compare.R, the summarize_*.R views) globs, and each pass overwrites the engines it
+# ran -- which is how an untimed pass silently destroyed a set of --timings numbers
+# that had cost ~20 minutes on a locked machine and could only be got back by refitting
+# lme4 and Julia. The archive is append-only and nothing reads it: it exists so that a
+# later overwrite is recoverable by copying a directory back. Gitignored with the rest
+# of results/, so it never enters a commit.
+#
+# Per-engine result-dir stems, which differ from both the ENGINES loop names and
+# RUN_META_NAME -- a third spelling of the same set. Change together with the loop.
+archive_dirs() {
+  case "$1" in
+    lme4)    echo "lme4_empirical lme4_simulated" ;;
+    jl)      echo "mixedmodels_empirical mixedmodels_simulated" ;;
+    rust)    echo "glmm${OUT_SUFFIX}_empirical glmm${OUT_SUFFIX}_simulated" ;;
+    py)      echo "glmm_python${OUT_SUFFIX}_empirical glmm_python${OUT_SUFFIX}_simulated" ;;
+    glmm_r)  echo "glmm_r${OUT_SUFFIX}_empirical glmm_r${OUT_SUFFIX}_simulated" ;;
+  esac
+}
+if (( ${#ARCHIVED[@]} )); then
+  # Minutes, not just the date: two passes on one day are the common case, and a
+  # day-resolution stem would make the second overwrite the first -- the exact
+  # failure this snapshot exists to prevent.
+  SNAP="$ROOT/results/archive/$(date +%Y-%m-%d_%H%M)"
+  mkdir -p "$SNAP"
+  for e in "${ARCHIVED[@]}"; do
+    for d in $(archive_dirs "$e"); do
+      [[ -d "$ROOT/results/$d" ]] && cp -r "$ROOT/results/$d" "$SNAP/"
+    done
+    m="$ROOT/results/run_meta_${e}${META_SUFFIX}.json"
+    [[ -f "$m" ]] && cp "$m" "$SNAP/"
+  done
+  echo ">> archived this pass to results/archive/$(basename "$SNAP")/"
+fi
 
 # compare.R discovers references by globbing the LAPLACE trees, which an AGQ pass
 # never writes -- running it here would print the previous run's gate as if it were

@@ -1,6 +1,6 @@
 name: CI
 
-# Single-crate mirror of the MCPower engine's `rust` job, plus the three gates a
+# Lint, the full #[test] suite across feature configs, plus the three gates a
 # standalone publishable crate needs: an MSRV floor check, a wasm compile (the
 # crate ships a cfg(wasm32) faer split), and a publish dry-run so `main` is always
 # in a releasable state.
@@ -43,7 +43,7 @@ jobs:
       - name: guard — the default-off kernel links no regex
         # `formula` is on by default (semver-covered surface), so the kernel's
         # regex-free property is no longer structural — this assertion IS the
-        # guarantee. See GLMM.md's dependency-direction decision.
+        # guarantee.
         run: |
           if cargo tree -e normal -p glmm --no-default-features | grep -q regex; then
             echo "::error::default-off kernel pulls in regex — the formula feature is leaking"
@@ -133,7 +133,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo publish --dry-run
 
-  # ── python: build the glmm wheel, install it, test + lint (spec §7) ───────
+  # ── python: build the glmm wheel, install it, test + lint ───────
   python:
     name: python (glmm wheel)
     runs-on: ubuntu-latest

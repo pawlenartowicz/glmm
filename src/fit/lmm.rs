@@ -25,9 +25,8 @@ use super::{Fit, FitOptions};
 
 /// Accumulates the θ-independent sufficient statistics (reset + add_rows_multi)
 /// from an already-column-major `x_mat`. Single-sourced across `fit_mle` and
-/// `with_lmm_objective`'s dense arm — both were byte-identical copies of this
-/// block, differing only in `weights` and whether the guard was written out at
-/// the call site. Takes `x_mat` rather than row-major `x` so the `fit_on` hot
+/// `with_lmm_objective`'s dense arm, which differ only in `weights` and in
+/// whether the guard is written out at the call site. Takes `x_mat` rather than row-major `x` so the `fit_on` hot
 /// path can fill a build-once `n_max`-sized buffer and pass a `subrows(0, n)`
 /// view in, instead of allocating a fresh `Mat` every call; the three other
 /// callers (`fit_mle`, `build_lmm_seam_ws`, `refit_lmm`) each build their own
@@ -266,7 +265,9 @@ pub(crate) fn lmm_run_on<'a>(
                             // where the deviance is even in θ_jj at θ_jj = 0
                             // — see `LmmGroupings::diagonal_has_nonzero_below`
                             // for why a non-zero entry below the diagonal
-                            // breaks that and rules the component out.
+                            // breaks that. `canonicalize_pinned_blocks` runs
+                            // after the pin loop and zeroes that column, so
+                            // this gate never fires; it is defensive only.
                             boundary_score[ti] = 0.5 * hess[(ti, ti)] * sc[ti] * sc[ti];
                         }
                     }

@@ -1,6 +1,6 @@
 [package]
 name = "glmm"
-version = "0.3.1"
+version = "0.3.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -27,7 +27,7 @@ default = ["formula"]
 formula = ["dep:regex"]
 # Unstable scratch-explicit hot-path surface (the loop tier: scratch-explicit
 # kernels + `StartValues` warm-start). Capability-named, multi-consumer. OFF by
-# default so the semver-covered public API is just `fit` + `ModelSpec`. (spec §5)
+# default so the semver-covered public API is just `fit` + `ModelSpec`.
 loop_advanced = []
 # String-typed fit orchestration shared by the FFI ports (`glmm-python`,
 # `glmm-r`): one definition of the family/link string vocabulary and the
@@ -112,7 +112,7 @@ members = ["glmm-python", "glmm-r", "validation"]
 [workspace.package]
 edition = "2021"
 rust-version = "1.85"      # floor set by the bobyqa dep (edition 2024, MSRV 1.85)
-license = "GPL-3.0-or-later"
+license = "LGPL-3.0-or-later"
 
 [workspace.lints.rust]
 # glmm is pure-Rust and uses no `unsafe`; this baseline matches the mcpower

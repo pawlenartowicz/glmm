@@ -6,19 +6,18 @@
 # scripts `run.sh --prep` invokes (alongside export_data.R for rungs 1-28,
 # gen_weights_data.R for 29-43 and gen_large_theta_data.R for 44-45).
 #
-# WHY THESE EXIST. Both designs are built in Rust inside src/fit/lmm_tests.rs and
-# both used to be discarded -- one NaN-filled, the other silently reduced by a
-# column -- by a rank guard whose statistic measured column SCALE rather than
-# collinearity. They are fitted now, so for the first time there is a reference
-# to fit them against: lme4 fits both full designs. The reference values frozen
-# in those tests come from lmer() on the CSVs this script writes.
+# WHY THESE EXIST. Both designs are built in Rust inside src/fit/lmm_tests.rs.
+# The rank guard's statistic measures column SCALE rather than collinearity, so
+# both designs are fitted and flagged rather than discarded or silently reduced
+# by a column; lme4 fits both full designs as the reference. The reference
+# values frozen in those tests come from lmer() on the CSVs this script writes.
 #
 #   sim_dynrange_lmm       y ~ 1 + u + w + (1|g)      no collinearity anywhere;
 #                          `u` is a CLUSTER-LEVEL column at scale 3e-7. Every
 #                          per-column pivot ratio is O(1) -- the columns are
-#                          mutually distinguishable to full precision -- and the
-#                          old min/max L-diagonal statistic threw the whole fit
-#                          away purely over a choice of units.
+#                          mutually distinguishable to full precision -- and a
+#                          min/max L-diagonal statistic would throw the whole
+#                          fit away purely over a choice of units.
 #   sim_entangled_pair_lmm y ~ 1 + t + v + z + (1|g)  v = t*(1 + 3e-6*(-1)^i),
 #                          near-collinear with t but four orders clear of
 #                          ALIAS_EPS, so nothing is redundant and no column may

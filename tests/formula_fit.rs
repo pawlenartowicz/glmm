@@ -8,12 +8,11 @@
 //! `tests/validation_oracle.rs` refits `sleepstudy_lmm`, `penicillin_lmm`,
 //! `pastes_lmm`, `cbpp_agq_k1` and `grouseticks_agq_k1` from each golden's own
 //! recorded formula — through this same frontend — and gates them against the
-//! frozen lme4 values at `validation/tol.R`'s bands. This file used to read the same
-//! five goldens at bands one to two orders of magnitude looser, which asserted
-//! nothing the oracle tier did not already assert more tightly. Those reads are
-//! gone. What is left is the one claim the oracle tier cannot make, because it
-//! only ever fits through the frontend: that the frontend agrees with the
-//! hand-built spec.
+//! frozen lme4 values at `validation/tol.R`'s bands. This file does not repeat
+//! that comparison: doing so would assert nothing the oracle tier does not
+//! already assert more tightly. What is left is the one claim the oracle tier
+//! cannot make, because it only ever fits through the frontend: that the
+//! frontend agrees with the hand-built spec.
 
 use glmm::formula::{lower, Column, Table};
 #[cfg(feature = "orchestrate")]
@@ -940,7 +939,7 @@ fn intercept_written_first_becomes_primary_over_slope() {
     // `(1+x|h)` makes `g` primary even though the parser's slope stage runs
     // before its intercept stage. The slope block then sits on the EXTRA
     // grouping — which is itself a sparse-routing trigger (algorithms-lmm.md),
-    // the orientation that re-landed validation rung 24 (`sim_sparse_gamma`).
+    // the orientation validation rung 24 (`sim_sparse_gamma`) exercises.
     let table = Table {
         columns: vec![
             ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
@@ -1161,7 +1160,7 @@ fn declared_factor_level_order_picks_the_reference_level() {
     assert_eq!(lo.col_names, vec!["(Intercept)", "fmed", "fhigh"]);
 
     // The same labels with no declared order sort lexicographically, base
-    // "high" — today's behavior, now a default rather than an imposition.
+    // "high" — the default ordering, not an imposition.
     let sorted = Table {
         columns: vec![
             ("y".into(), y),

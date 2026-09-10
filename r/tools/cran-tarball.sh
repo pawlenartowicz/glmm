@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Build the self-contained fastglmm source tarball (R-port spec §6).
+# Build the self-contained fastglmm source tarball.
 #
 # In the repo, src/rust depends on ../../../glmm-r, which depends on ../
 # (the glmm kernel) — path deps that do not exist inside a built tarball. This
@@ -12,11 +12,11 @@
 # --vendor additionally packs the crates.io dependency tree
 # (vendor.tar.xz + vendor-config.toml, consumed by src/Makevars for offline
 # CRAN builds — measured 2026-07-15: 137 crates, ~13 MB; the 6 MB no-gemm
-# faer config was rejected, it drops the BLAS-3 backend). Without it the
+# faer config is not used because it drops the BLAS-3 backend). Without it the
 # tarball builds online (cargo fetches), which is all a local check needs.
 #
-# The vendored tree lives only in the produced tarball, never in git
-# (spec §6). Plan gate 4 (extendr vendoring vs current CRAN policy) is
+# The vendored tree lives only in the produced tarball, never in git.
+# Extendr vendoring against current CRAN policy is
 # verified by running --as-cran on the --vendor artifact.
 set -eu
 
@@ -62,7 +62,7 @@ rm -rf "$local_dir/glmm-r/target"
 sed -i \
   -e 's/^edition\.workspace = true$/edition = "2021"/' \
   -e 's/^rust-version\.workspace = true$/rust-version = "1.85"/' \
-  -e 's/^license\.workspace = true$/license = "GPL-3.0-or-later"/' \
+  -e 's/^license\.workspace = true$/license = "LGPL-3.0-or-later"/' \
   -e 's|^glmm = { path = "\.\.", |glmm = { |' \
   -e '/^\[lints\]$/,/^workspace = true$/d' \
   "$local_dir/glmm-r/Cargo.toml"

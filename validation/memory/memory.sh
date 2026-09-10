@@ -10,7 +10,7 @@
 # a process AND its waited-for children, so wrapping `cargo run` would measure
 # cargo, not the fit -- the Rust engine is therefore built once
 # (`cargo build --release`) and invoked as the built binary, never through
-# `cargo run`. Every engine fits the whole manifest in one process today, so
+# `cargo run`. Every engine fits the whole manifest in one process, so
 # this is the only way to get a per-dataset number out of any of them.
 #
 #   ./memory.sh <leg> --manifest [ds...]        [--engines e1,e2,...]

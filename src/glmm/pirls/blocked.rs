@@ -138,7 +138,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         ex.u_acc[..k].fill(0.0);
     }
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
-    let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
+    let mut mixed_prev = f64::INFINITY; // the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
     let mut converged = false;
     let min_iters = match dual.as_deref_mut() {
@@ -532,7 +532,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             ..
         } = &mut beta_step
         {
-            // P1 exact-profile correction: c_β = d log|A|/dβ, entering the same
+            // Exact-profile correction: c_β = d log|A|/dβ, entering the same
             // Newton RHS with the same ½ as the objective's `2·logdet` term
             // (`logdet = ½ log|A|`). Direct part: Σᵢ w'ᵢ·xᵢⱼ·hᵢ, hᵢ = mᵢ'A⁻¹mᵢ the
             // RE leverage (`block_leverage` on this iteration's factor). û path:
@@ -844,7 +844,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 pen += u[c] * u[c];
             }
         }
-        // Today's stopping rule, verbatim: the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` band on
+        // The stopping rule, verbatim: the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` band on
         // successive steps — bit-identical iterate path and returned values to the
         // pre-halving loop when no halving fires (see `pirls_solve` for why the
         // same-point band cannot be a converge trigger).

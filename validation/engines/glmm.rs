@@ -3,7 +3,7 @@
 //! in the common schema (validation/README.md), to be checked against the frozen lme4 /
 //! MixedModels references by `compare.R`. Committed alongside the other engines' results.
 //!
-//! The design matrix, `ModelSpec` and per-row `GroupIds` are built by the `d3`
+//! The design matrix, `ModelSpec` and per-row `GroupIds` are built by the
 //! formula frontend (`glmm::formula::lower`, the `formula` feature) from an R-style
 //! formula string + a columnar `Table`, not hand-assembled — the same path SDOC /
 //! MCPower will drive. This doubles as the frontend's end-to-end oracle: the
@@ -42,9 +42,9 @@ fn suite_dir() -> String {
 // min, is the user's chosen estimator for this harness. NOT a locked-machine
 // benchmark — the timing field is indicative only until the box is stabilized/locked
 // (see README "Timing").
-// 10 runs (was 100): the corpus now holds multi-second GLMM fits where 100 repeats
-// cost an hour per engine for no extra precision; each JSON records its own n_runs,
-// so files timed under the old convention stay self-describing.
+// 10 runs, not 100: the corpus holds multi-second GLMM fits where 100 repeats
+// would cost an hour per engine for no extra precision; each JSON records its own
+// n_runs, so files timed at a different run count stay self-describing.
 //
 // TWO timings per fit, both recorded: `fit_seconds_median*` times `fit_cold` ALONE
 // (lowering hoisted out) — the solver-isolation number the per-eval / solve-gap
@@ -53,7 +53,7 @@ fn suite_dir() -> String {
 // the cross-engine speedups and the port's `py_gap` compare same-to-same
 // (summarize_timing.R reads the `_full` fields for glmm).
 // Timing is OPT-IN, and its sample count lives in run.sh rather than here, so the
-// five engines no longer carry mirrored N_RUNS constants to keep in step. compare.R
+// five engines do not carry mirrored N_RUNS constants to keep in step. compare.R
 // reads no timing field at all, so the default gate pays only the one fit per SE
 // method it already needed for the estimates, instead of N x (Rx, Hessian, and both
 // `_full` variants) — ~35 seconds over the corpus rather than ~10 minutes.
@@ -165,14 +165,13 @@ fn fit_one(spec: &Value) {
     // load, formula/family resolution, lowering, and weights_col/offset are
     // shared with `bit_identity/dump.rs` via `lower_rung` (common.rs).
     let (mut lo, table, family, formula_str) = lower_rung(spec, &suite);
-    // AGQ pass: quadrature order from the env, and `parallel_inner` left OFF. This
-    // pass once turned it on to time the shipped config, which made the aK row
-    // uninterpretable: run.sh pins timed fits to one core, so rayon had nothing to
-    // spread across and the flag cost 27-37% on the sub-4ms rungs, while the earlier
-    // UNPINNED results it was compared against had all P-cores (sim_binomial_slope2
-    // measured 0.212 s unpinned vs 1.569 s pinned, both parallel — a 7.4x swing on
-    // the pin alone, which read as the two ports being 5.6x slower than the same
-    // kernel). Serial is the only config all five engines can share, and neither
+    // AGQ pass: quadrature order from the env, and `parallel_inner` left OFF. Turning
+    // it on to time the shipped config makes the aK row uninterpretable: run.sh pins
+    // timed fits to one core, so rayon has nothing to spread across and the flag costs
+    // 27-37% on the sub-4ms rungs, while unpinned results comparable to it get all
+    // P-cores (sim_binomial_slope2 measured 0.212 s unpinned vs 1.569 s pinned, both
+    // parallel — a 7.4x swing on the pin alone, which reads as the two ports being
+    // 5.6x slower than the same kernel). Serial is the only config all five engines can share, and neither
     // port can turn inner parallelism on at all (both wrapper crates take glmm with
     // "orchestrate" only). Inner parallelism is measured in
     // campaigns/speed-grid/agq_par_probe.rs, which is built for it.

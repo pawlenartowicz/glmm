@@ -231,7 +231,7 @@ do_fit <- function(data, formula, family, wald_se) {
   # `validation_off`) referenced by name so fastglmm's eval-in-data resolves them
   # deterministically inside the timing closures, never via parent.frame() -- which is
   # why the four arms are spelled out rather than assembled with do.call(). No manifest
-  # rung carries both today; the arm exists so one would not silently drop its offset.
+  # rung carries both; the arm exists so one would not silently drop its offset.
   # suppressWarnings: the expected singular-boundary / nAGQ-fallback notices are captured
   # on the fit object (singular, converged), not needed on stderr for a batch run.
   has_w <- "validation_wts" %in% names(data)

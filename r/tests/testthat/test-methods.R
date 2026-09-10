@@ -14,7 +14,7 @@ test_that("VarCorr returns SD/correlation-scale components for a slope model", {
   sd <- attr(v, "stddev")
   corr <- attr(v, "correlation")
   # The attributes must be exactly the sqrt-diagonal / normalized off-diagonal
-  # of the covariance block (spec §2: take sqrt(diag), normalize).
+  # of the covariance block (take sqrt(diag), normalize).
   expect_equal(unname(sd), unname(sqrt(diag(v))), tolerance = 1e-12)
   expect_equal(corr[2, 1], v[2, 1] / (sd[[1]] * sd[[2]]), tolerance = 1e-12)
   expect_true(abs(corr[2, 1]) <= 1)

@@ -6,9 +6,9 @@
 # wall-time ratio. Usage:
 #   Rscript report.R [status_map.csv] [out.html]
 # Timing caveat rendered into the page header: walls are meaningful only for
-# clock-locked passes (run_meta no_turbo==1). MixedModels walls are now hot --
+# clock-locked passes (run_meta no_turbo==1). MixedModels walls are hot --
 # fit.jl warm-up-fits each cell before the timed fit (compile_seconds
-# recorded as proof), so the JIT-inflation caveat no longer applies.
+# recorded as proof), so no JIT-inflation caveat applies.
 args <- commandArgs(TRUE)
 suite_dir <- normalizePath(dirname(sub(
   "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))))

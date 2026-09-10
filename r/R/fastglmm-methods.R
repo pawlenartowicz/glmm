@@ -394,8 +394,8 @@ isSingular <- function(x, ...) UseMethod("isSingular")
 #' @export
 isSingular.fastglmm <- function(x, ...) x$singular
 
-# -- Engine-blocked accessors (spec section 4): each is a hard "cannot be done
-# honestly today", erroring with the reason and the lifting spec - never a
+# -- Engine-blocked accessors: each is a hard "cannot be done honestly",
+# erroring with the reason and what would be needed to lift it - never a
 # silently different answer. ----------------------------------------------
 
 .engine_blocked <- function(what) {

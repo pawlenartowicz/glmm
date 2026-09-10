@@ -96,19 +96,22 @@ ref <- data[["lme4"]]
 if (is.null(ref)) stop("no lme4 reference present -- run engines/lme4.R first")
 order_names <- names(ref)[order(vapply(ref, `[[`, 0L, "rung"))]
 
-TIMING_COLS <- c("glmm", "glmm_python", "glmm_r", "lme4", "mixedmodels")
+TIMING_COLS <- c("glmm", "lme4", "mixedmodels")
 timing_engines <- Filter(function(e) e %in% present, TIMING_COLS)
 
 # glmm speedup vs lme4/mmjl: how many times faster glmm is (other_time / glmm_time).
 fmt_x <- function(other, mine) {
   if (is.na(other) || is.na(mine) || mine == 0) "-" else sprintf("%.1fx", other / mine)
 }
-# py_gap/r_gap read in the same direction as vs_lme4/vs_mmjl (other/glmm), but each
-# port is the same kernel, so it is the port tax (conversion + FFI), not a speedup.
+# r_gap reads in the same direction as vs_lme4/vs_mmjl (other/glmm), but the R port
+# is the same kernel, so it is the port tax (conversion + FFI), not a speedup.
 SPEEDUP_VS <- Filter(function(e) e %in% present,
-                     c("lme4", "mixedmodels", "glmm_python", "glmm_r"))
+                     c("lme4", "mixedmodels", "glmm_r"))
 # A port column is a tax, not a speedup, so it is headed <lang>_gap rather than vs_<lang>.
-PORT_ENGINES <- c("glmm_python", "glmm_r")
+PORT_ENGINES <- c("glmm_r")
+# glmm_r supplies r_gap without getting a seconds column of its own, so times are read
+# for the union while only timing_engines is printed.
+read_engines <- union(timing_engines, SPEEDUP_VS)
 speedup_label <- function(e) {
   if (e %in% PORT_ENGINES) paste0(ENGINE_LABEL[[e]], "_gap") else paste0("vs_", ENGINE_LABEL[[e]])
 }
@@ -128,7 +131,7 @@ read_run_meta <- function(e, suffix = "") {
   fromJSON(p, simplifyVector = TRUE)
 }
 metas <- Filter(Negate(is.null),
-                setNames(lapply(timing_engines, read_run_meta), timing_engines))
+                setNames(lapply(read_engines, read_run_meta), read_engines))
 # The aK rows come from a SEPARATE pass with its own run_meta (run.sh --agq=K), so
 # they get their own provenance lines -- printing them under the Laplace legs' meta
 # is what once hid an unpinned glmm AGQ leg sitting beside pinned port ones.
@@ -148,7 +151,7 @@ if (!length(metas)) {
     cat(sprintf("  %-6s %-30s no_turbo=%-2s pin=%-13s %s  %s\n", ENGINE_LABEL[[e]],
                 m$machine, m$no_turbo, m$pin, substr(m$glmm_git_rev, 1, 8), m$started))
   }
-  unlabelled <- setdiff(timing_engines, names(metas))
+  unlabelled <- setdiff(read_engines, names(metas))
   if (length(unlabelled))
     cat(sprintf("  WARNING: no run_meta for %s -- provenance unknown, its seconds are uncomparable.\n",
                 label_of(unlabelled)))
@@ -191,17 +194,17 @@ for (group in c("empirical", "simulated")) {
   names_in_group <- if (group == "empirical") empirical_names else setdiff(order_names, empirical_names)
   for (name in intersect(order_names, names_in_group)) {
     a <- ref[[name]]
-    tms <- setNames(lapply(timing_engines, function(e) {
+    tms <- setNames(lapply(read_engines, function(e) {
       b <- data[[e]][[name]]
       if (is.null(b)) c(rx = NA_real_, hess = NA_real_) else time_of(b)
-    }), timing_engines)
+    }), read_engines)
     rx_row <- lead_row(name, a$rung, "rx")
-    for (tm in tms) rx_row <- paste0(rx_row, sprintf(" %9s", fmt_t(tm["rx"])))
+    for (e in timing_engines) rx_row <- paste0(rx_row, sprintf(" %9s", fmt_t(tms[[e]]["rx"])))
     if ("glmm" %in% present) for (e in SPEEDUP_VS) rx_row <- paste0(rx_row, sprintf(" %7s", fmt_x(tms[[e]]["rx"], tms[["glmm"]]["rx"])))
     cat(rx_row, "\n")
     if (any(!is.na(vapply(tms, `[[`, 0, "hess")))) {
       h_row <- lead_row("", "", "h")
-      for (tm in tms) h_row <- paste0(h_row, sprintf(" %9s", fmt_t(tm["hess"])))
+      for (e in timing_engines) h_row <- paste0(h_row, sprintf(" %9s", fmt_t(tms[[e]]["hess"])))
       if ("glmm" %in% present) for (e in SPEEDUP_VS) h_row <- paste0(h_row, sprintf(" %7s", fmt_x(tms[[e]]["hess"], tms[["glmm"]]["hess"])))
       cat(h_row, "\n")
     }
@@ -209,12 +212,12 @@ for (group in c("empirical", "simulated")) {
     # one to read: glmm's AGQ pass records the same rx/hessian split, and rx is the
     # arm without the FD-Hessian on top, so it is the closest thing to "time to fit".
     if (length(agq) && !is.null(agq[["glmm"]][[name]])) {
-      a_tms <- setNames(lapply(timing_engines, function(e) {
+      a_tms <- setNames(lapply(read_engines, function(e) {
         b <- if (e %in% names(agq)) agq[[e]][[name]] else NULL
         if (is.null(b)) c(rx = NA_real_, hess = NA_real_) else time_of(b)
-      }), timing_engines)
+      }), read_engines)
       a_row <- lead_row("", "", sprintf("a%d", AGQ_K[[name]]))
-      for (tm in a_tms) a_row <- paste0(a_row, sprintf(" %9s", fmt_t(tm["rx"])))
+      for (e in timing_engines) a_row <- paste0(a_row, sprintf(" %9s", fmt_t(a_tms[[e]]["rx"])))
       if ("glmm" %in% present) for (e in SPEEDUP_VS) a_row <- paste0(a_row, sprintf(" %7s", fmt_x(a_tms[[e]]["rx"], a_tms[["glmm"]]["rx"])))
       cat(a_row, "\n")
     }
@@ -223,13 +226,11 @@ for (group in c("empirical", "simulated")) {
 cat("\nrx/h = time to fit + produce that SE (Hessian is the cost);",
     "gaussian/legacy single time shown under rx (no h row).\n",
     "vs_lme4/vs_mmjl = glmm speedup factor (other engine's time / glmm's time).\n",
-    "py_gap = Python port time / glmm time (same kernel; the port tax of dict scan,\n",
-    "  float() conversion, and the FFI copy). See engines/glmm_python.py.\n",
     "r_gap = R port time / glmm time (same kernel through the fastglmm extendr\n",
     "  wrapper; the port tax of the R<->Rust copy). See engines/glmm_r.R.\n",
     "aK = the same fit at nAGQ=K instead of Laplace (opt-in `run.sh --agq=K` pass;\n",
     "  absent unless it was run). Every engine fits SERIAL here, glmm included --\n",
     "  the only config all of them share, since neither port can turn inner\n",
-    "  parallelism on. So py_gap/r_gap read the same way as on the rx rows.\n",
+    "  parallelism on. So r_gap reads the same way as on the rx rows.\n",
     "  Inner parallelism is measured in campaigns/speed-grid/agq_par_probe.rs.\n",
     "  A blank lme4 cell is glmer refusing nAGQ>1 on a vector RE, not a missing run.\n")

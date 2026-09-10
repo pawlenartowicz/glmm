@@ -3,7 +3,7 @@
 //! [`Dual`] carries a value and `N` first-derivative lanes; [`HyperDual`] carries
 //! a value, `N` first-derivative lanes and the packed second-derivative block.
 //! On both types the value part is always the
-//! `f64` binding — the same number W1's `impl Scalar for f64` would compute at
+//! `f64` binding — the same number `impl Scalar for f64` would compute at
 //! the same iterate — so control flow that branches on the value takes the
 //! same path at every scalar type.
 

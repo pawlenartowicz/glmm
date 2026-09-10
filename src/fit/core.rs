@@ -56,15 +56,15 @@ pub struct FitView<'a> {
 // assembled `Fit` — which is the arm's entire reason to exist, and got wider
 // again when `Fit`'s diagnostics moved behind `Diagnostics`. Clippy's fix is to
 // box it, and that is the wrong trade here: the enum lives for one call frame,
-// while `Box::new` would add a heap block PER DRAW on the loop tier, which is
-// the one cost this crate spent 0.1.3 removing.
+// while `Box::new` would add a heap block PER DRAW on the loop tier, and that
+// per-draw allocation is the one cost this crate keeps off the loop tier.
 #[allow(clippy::large_enum_variant)]
 enum FitViewKind<'a> {
     Ols(crate::ols::OlsFitView<'a>),
     Glm(crate::glm::GlmFitView<'a>),
     Lmm(LmmResultView<'a>),
     Glmm(super::glmm::GlmmResultView<'a>),
-    /// NB outer-loops (GLM-NB, GLMM-NB) and every sparse-routed design: the
+    /// The NB routes (GLM-NB, GLMM-NB) and every sparse-routed design: the
     /// kernel already assembled a `Fit`. `t_sq`/`var_diag` are reconstructed
     /// predictor-indexed from β̂/se for the accessor surface (Wald t²_j =
     /// (β̂_j/se_j)², Var = se_j²) — a best-effort convenience; `into_fit` returns
@@ -424,7 +424,7 @@ enum FitKind {
         x_mat: Mat<f64>,
     },
     /// Routes whose kernel allocates per call and returns a fully-assembled
-    /// `Fit`: the NB outer-θ loops (GLM-NB, GLMM-NB) and every sparse-routed
+    /// `Fit`: the NB routes (GLM-NB, GLMM-NB) and every sparse-routed
     /// design. `build_workspace` pins the exact kernel here (classify once), but
     /// the buffers are still allocated per call inside `fit_on` — these routes
     /// get the routing guarantee without the workspace-reuse win.
@@ -824,7 +824,7 @@ pub fn fit_on<'a>(
             let route = *route;
             let sized = &ws.sized;
             let fit = match route {
-                PrebuiltRoute::GlmNb => super::glm::fit_glm_nb(x, y, n, p, None, opts),
+                PrebuiltRoute::GlmNb => super::glm::fit_glm_nb(x, y, n, p, None, opts).0,
                 PrebuiltRoute::GlmmNbDense => super::glmm::fit_glmm_nb(
                     x,
                     y,

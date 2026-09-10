@@ -4,7 +4,7 @@ A reusable, documented procedure for measuring how much of a `glmm` fit
 result is SIMD-lane-width / summation-order dependent: run the crate's own
 tests once normally, once with SIMD dispatch forced to the scalar path, and
 diff the two. Built as its own deliverable — it does not depend on any
-other in-flight investigation and stays useful regardless of what test
+other in-flight work and stays useful regardless of what test
 filter is pointed at it.
 
 ## Why this exists
@@ -22,12 +22,12 @@ Most of the time that drift is unobservable. One test is not so lucky:
 `fit_sparse_nb_glmm_is_pinned` (`src/sparse/tests.rs`) sits on a genuinely
 ill-conditioned NB fit where a 1-ULP input perturbation already moves
 `beta[0]` by ~4.8e-4 median — so lane-width alone (not a bug, not a port
-error) is enough to move the pinned quantities by a comparable amount. The
-original investigation found this by vendoring `pulp 0.22.2` locally,
+error) is enough to move the pinned quantities by a comparable amount. This
+drift can be checked by vendoring `pulp 0.22.2` locally,
 forcing `Arch::new()` to always return `Scalar`, and comparing an AVX2
 anchor machine's report against the reproduced-locally scalar drift (4.3e-4
-vs 7.9e-4 on `beta[0]` — same worst element, same ordering). That was a
-one-off. This directory is the reusable version: run
+vs 7.9e-4 on `beta[0]` — same worst element, same ordering). This directory
+generalizes that one-off check into a reusable harness: run
 it against any test filter, on any host, and get a self-describing report
 of what lane width was actually exercised and how much the pinned
 quantities moved between a normal run and a scalar-forced run.
@@ -117,7 +117,7 @@ reads `pulp::Arch::new() = Scalar`. On x86_64 the normal line instead reads
 `V3(..)`/`V4(..)` depending on what the host CPU and pulp's `x86-v3`/
 `x86-v4` features resolve to. **The contrast this harness measures depends
 on host µarch** — "NEON vs scalar" on an Apple Silicon Mac, "AVX2/AVX-512 vs
-scalar" on the x86_64 anchor machine from the original investigation. That
+scalar" on the x86_64 anchor machine referenced above. That
 is why the probe line is always printed and recorded: a run is
 self-describing about which lane widths it actually exercised, rather than
 assuming a fixed contrast.
@@ -172,7 +172,7 @@ between the two:
 | `varcorr[0]` | 0.3819422537218528 | 0.381979557816595 | 3.7e-5 | 9.7e-5 |
 
 `beta[0]`'s 5.58e-4 NEON-vs-scalar movement on this host is the same order
-of magnitude as an earlier cross-machine investigation's figures (4.3e-4
+of magnitude as the earlier cross-machine figures above (4.3e-4
 x86_64 AVX2 host scalar-forced vs 7.9e-4 cross-machine arm64 report) —
 independent confirmation that lane-width dispatch, not a
 port defect, is a real contributor to that fixture's drift, this time
@@ -181,10 +181,10 @@ measured from the NEON side rather than AVX2. Both trees'
 comfortably absorbs a 5.6e-4 movement); the failure mode this harness
 would surface is a future, tighter fixture that does not.
 
-## Reusing this for other tests or other investigations
+## Reusing this for other tests
 
 Pass any `cargo test` filter string(s) as positional arguments. The harness
 does not know anything about NB/sparse specifically past its default
 filter — it is the general "does this pass/this quantity move under a
 forced scalar SIMD dispatch" instrument for the whole crate, reusable for
-any test filter, not a one-off tied to this investigation.
+any test filter, not a one-off tied to a single check.

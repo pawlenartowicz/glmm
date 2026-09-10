@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-# Optimizer-grid campaign generator (design: docs/GLMM 2026-07-09 grid campaign):
+# Optimizer-grid campaign generator:
 # writes manifest.json (committed — THE reproducibility artifact; CSVs are
 # derived) and data/<case_id>.csv (gitignored). Deliberately
 # non-full crossing: core = structure x size x {balanced} x {baseline}; balance
@@ -229,11 +229,11 @@ for (sname in names(STRUCTURES)) {
     }
   }
 }
-# NB and Gamma arms (P4 campaign prep, 2026-09-06): same structures, sizes and
+# NB and Gamma arms (added 2026-09-06): same structures, sizes and
 # variant stripe as the GLMM arms above. Appended AFTER every earlier cell on
 # purpose: seed = SEED_BASE + cell index, so inserting these into the loop above
 # would reseed the whole grid and void the recorded baselines keyed on those
-# cells (W0 counters, p1_per_cell). Gamma has no per-family extra regime.
+# cells (existing counters, p1_per_cell). Gamma has no per-family extra regime.
 P4_ARMS <- c("negbin", "gamma")
 p4_i <- 0L
 for (sname in names(STRUCTURES)) {
@@ -249,7 +249,7 @@ for (sname in names(STRUCTURES)) {
     }
   }
 }
-# B1 subgrid: ~30 LMM cells spanning the ladder (5 seeds each), plus the GLMM
+# LMM subgrid: ~30 LMM cells spanning the ladder (5 seeds each), plus the GLMM
 # satellite. Marked on EXISTING cells: every structure at (3000, 20) plus a
 # ladder-spanning subset at (300, 20), balanced/baseline only. IDs that turn
 # out infeasible simply never match (the flag loop is a no-op for them).

@@ -24,7 +24,7 @@ own page.
 `fastglmm` is deliberately scoped to **fast fitting**: fixed effects, Wald
 standard errors, variance components on the SD/correlation scale, and the
 conditional modes with the per-row means they imply. Anything the engine
-cannot compute honestly today — `predict`, `residuals`, profiling — is an
+cannot compute honestly — `predict`, `residuals`, profiling — is an
 error naming the reason, never a silently different answer. `predict()` needs
 a design matrix built from rows the fit never saw, and the formula machinery
 is Rust-side; `residuals()` would have to guess which of lme4's four `type=`

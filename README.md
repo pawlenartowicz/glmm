@@ -5,7 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/glmm.svg)](https://pypi.org/project/glmm/)
 [![r-universe](https://pawlenartowicz.r-universe.dev/badges/fastglmm)](https://pawlenartowicz.r-universe.dev/fastglmm)
 [![docs.rs](https://img.shields.io/docsrs/glmm)](https://docs.rs/glmm)
-[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: LGPL-3.0-or-later](https://img.shields.io/badge/license-LLGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/lgpl-3.0)
 ![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)
 
 **Standalone f64 GLM(M) fit kernels — OLS → GLM → LMM → GLMM — in pure Rust on faer.**
@@ -202,7 +202,7 @@ warm-start hot loop as a consumer of this crate.
 
 ## License
 
-`GPL-3.0-or-later` (coupled to the GPL-3 MCPower flagship).
+`LGPL-3.0-or-later`. See [`LICENSE`](LICENSE) and [`LICENSE-GPL`](LICENSE-GPL).
 
 ---
 **Paweł Lenartowicz** — [Freestyler Scientist](https://freestylerscientist.pl) · [GitHub](https://github.com/pawlenartowicz/) · [ORCID](https://orcid.org/0000-0002-6906-7217)

@@ -16,7 +16,7 @@ use super::BETA_BOX;
 /// `Joint`: one `[θ | β]` BOBYQA on the Laplace deviance, β held fixed inside PIRLS —
 /// the A/B reference every other route is checked against. `PqlThenJoint`: a θ-only
 /// BOBYQA on the PQL β-profile as a warm start, then `Joint` from there; the warm start
-/// never gates convergence. `ExactProfile` (P1): a θ-only BOBYQA on the exact Laplace
+/// never gates convergence. `ExactProfile`: a θ-only BOBYQA on the exact Laplace
 /// β-profile — the search itself; its status alone decides `converged`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OuterSearch {
@@ -32,10 +32,11 @@ pub struct GlmmWorkspace {
     /// Outcome family/link selecting the PIRLS IRLS math — the arm
     /// `simd_transcendental::family_pass` dispatches to each iteration.
     pub family: crate::Family,
-    /// NB dispersion θ̂ fixed for this fit by the marginal-θ outer loop — read by
-    /// the PIRLS/AGQ variance/deviance only when `family` is `NegativeBinomial`.
-    /// Defaulted to `f64::NAN` at construction; the `fit::fit_glmm` adapter sets it
-    /// per fit (NB passes the current θ iterate, every other family leaves it NaN).
+    /// NB dispersion fixed for this fit's PIRLS/AGQ variance/deviance — read only
+    /// when `family` is `NegativeBinomial`. Defaulted to `f64::NAN` at
+    /// construction; `fit::run_glmm_on` sets it per fit — NB passes its start θ₀,
+    /// every other family leaves it NaN — and `fit_glmm` leaves θ̂_NB in it on
+    /// exit.
     pub nb_theta: f64,
     /// adaptive GH node count; 1 = Laplace. >1 only fires on the single-grouping-factor
     /// binomial/Poisson AGQ paths — scalar intercept (`agq::agq_deviance`) or vector RE
@@ -78,7 +79,8 @@ pub struct GlmmWorkspace {
     /// `!structured_extras_eligible()`) — 0×0 on the blocked and structured
     /// routes, which never read it (`deviance.rs:194`).
     pub m: Mat<f64>,
-    /// Joint (θ,β) BOBYQA solver, dimension `n_theta + p`.
+    /// Joint (θ,β) BOBYQA solver, dimension `n_theta + p` (+1 on NB: the trailing
+    /// `ln θ_NB` coordinate).
     pub solver: Bobyqa, // sized n_theta + p
     /// Joint solver's live iterate: `[θ (n_theta) | β (p)]`. STABLE READ-BACK
     /// CONVENTION: after `fit_glmm` returns with `converged == true`, this
@@ -89,23 +91,44 @@ pub struct GlmmWorkspace {
     /// instead — see `OuterSearch` — and `betas` is copied from this suffix
     /// either way) — so a caller may read it back as the warm start for a
     /// subsequent fit of related data. On a non-converged fit the content is an
-    /// arbitrary iterate — do not read it.
+    /// arbitrary iterate — do not read it. On NB the vector has one more trailing
+    /// entry, `ln θ_NB`, whose exponential `fit_glmm` writes back into `nb_theta`
+    /// — the `[..n_theta + p]` read-back contract is unchanged.
     pub params: Vec<f64>, // [θ | β]
-    /// Joint solver box lower bounds, length `n_theta + p`.
+    /// Joint solver box lower bounds, length `n_theta + p` (+1 on NB).
     pub lower: Vec<f64>,
-    /// Joint solver box upper bounds, length `n_theta + p`.
+    /// Joint solver box upper bounds, length `n_theta + p` (+1 on NB).
     pub upper: Vec<f64>,
     /// θ-only BOBYQA solver for the θ-only outer search shared by
     /// `PqlThenJoint` (a warm-start accelerant) and `ExactProfile` (the search
-    /// itself — see `OuterSearch`): sized `n_theta`, configured with the same
-    /// `rho_begin`/`GLMM_RHO_END` schedule as `solver` and the `sparse_lmm_seed`
-    /// mid-model `npt` rule (`ceil(1.5·n_theta) + 1` at `n_theta ≥ 3`, else
-    /// `2·n_theta + 1`) — not
+    /// itself — see `OuterSearch`): sized `n_theta` (+1 on NB), configured with
+    /// the same `rho_begin`/`GLMM_RHO_END` schedule as `solver` and the
+    /// `sparse_lmm_seed` mid-model `npt` rule (`ceil(1.5·n_theta) + 1` at
+    /// `n_theta ≥ 3`, else `2·n_theta + 1`) — not
     /// the joint solver's `npt`, which differs. See `fit_glmm`.
     pub solver_stage1: Bobyqa,
-    /// θ-only candidate/incumbent buffer for stage 1, length `n_theta`; seeded
-    /// from `params`'s θ prefix at construction.
+    /// θ-only candidate/incumbent buffer for stage 1, length `n_theta` (+1 on
+    /// NB); seeded from `params`'s θ prefix at construction.
     pub params_stage1: Vec<f64>,
+    /// Stage-1 box, length `n_theta + n_nb`: `lower[..n_theta]` / `upper[..n_theta]`
+    /// plus the `ln θ_NB` bound on NB — see `params_stage1`.
+    pub lower_stage1: Vec<f64>,
+    pub upper_stage1: Vec<f64>,
+    /// Second stage-1 solver, same box and rho ladder as `solver_stage1` but at
+    /// `npt = n_stage1 + 2` — BOBYQA's minimum legal interpolation set. Drives the
+    /// pinned-exit re-run in `fit_glmm` (see the trap comment there). `None`
+    /// wherever that re-run cannot pay: off the `ExactProfile` route (stage 1 is
+    /// only an accelerant there, so its exit is not the fit's pin outcome), and
+    /// where the shipped `npt` already IS `n_stage1 + 2` — an identical config
+    /// from an identical start reproduces arm 1 exactly.
+    pub solver_stage1_alt: Option<Bobyqa>,
+    /// The re-run's own incumbent snapshots, twins of `u_seed` (len k) and
+    /// `beta_seed` (len p): the two arms are compared on deviance AFTER both
+    /// have run, so arm 1's latent state must survive arm 2 intact. Empty
+    /// unless `solver_stage1_alt` is `Some`.
+    pub u_seed_alt: Vec<f64>,
+    /// See `u_seed_alt`.
+    pub beta_seed_alt: Vec<f64>,
     /// Outer search route for this shape — see `OuterSearch`.
     pub outer_search: OuterSearch,
     // PIRLS scratch (sized max_n / k):
@@ -251,7 +274,7 @@ pub struct GlmmWorkspace {
     pub beta_prof: Vec<f64>,
     /// len p: stage-1 incumbent β snapshot (mirrors u_seed)
     pub beta_seed: Vec<f64>,
-    /// P1 exact-profile scratch (`pirls::ExactProfileBufs`), sized once here.
+    /// Exact-profile scratch (`pirls::ExactProfileBufs`), sized once here.
     pub(crate) exact_prof: super::pirls::ExactProfileBufs,
     /// length p
     pub var_diag: Vec<f64>,
@@ -303,7 +326,8 @@ pub struct GlmmWorkspace {
     /// Joint Wald right-hand side, length p.
     pub joint_rhs: Vec<f64>,
     // FD-Hessian SE scratch (`joint_hessian_cov`), allocated once so the per-fit
-    // hessian path reuses them. `m = n_theta + p = params.len()`.
+    // hessian path reuses them. `m = n_theta + p`, the `[θ | β]` block the SE
+    // grid covers (never the NB slot).
     /// m × m joint-deviance Hessian
     pub hess_scratch: Mat<f64>,
     /// Scratch for the joint gradient, length `m`. Sized once.
@@ -410,6 +434,10 @@ impl GlmmWorkspace {
         );
         let k = groupings.k_total;
         let n_theta = groupings.n_theta();
+        // The NB dispersion is one trailing coordinate of the outer search, on
+        // `ln θ_NB` boxed to the GLM bracket's range. Every other family has no
+        // such slot: `n_nb = 0` leaves every dimension and bound below as it was.
+        let n_nb = usize::from(matches!(family, crate::Family::NegativeBinomial { .. }));
         let q = groupings.primary_q;
         let n_primary = groupings.n_primary;
         // Structured-path block sizes: core width q_core = q_p + nested children,
@@ -431,10 +459,15 @@ impl GlmmWorkspace {
         params.extend(std::iter::repeat_n(0.0, p)); // β cold default; overwritten at fit
         lower.extend(std::iter::repeat_n(-BETA_BOX, p));
         upper.extend(std::iter::repeat_n(BETA_BOX, p));
+        if n_nb == 1 {
+            params.push(0.0); // ln θ_NB start; written by `fit_glmm` from `nb_theta`
+            lower.push(crate::fit::NB_THETA_LO.ln());
+            upper.push(crate::fit::NB_THETA_HI.ln());
+        }
 
         // ρ_begin ≤ RHO_BEGIN and ≤ 0.1·min diagonal θ₀ (mirror for_cluster_spec_ext)
-        // so the cold blind start is not projected onto a bound. The start is now the
-        // structure-only blind θ₀ (M3.5), so each diagonal entry is THETA0.
+        // so the cold blind start is not projected onto a bound. The start is the
+        // structure-only blind θ₀, so each diagonal entry is THETA0.
         let blind_theta = vec![crate::lmm::THETA0; n_theta];
         let min_diag = groupings
             .diagonal_theta()
@@ -447,29 +480,43 @@ impl GlmmWorkspace {
         let rho_begin = (0.1 * min_diag).min(RHO_BEGIN);
         // MIRRORS the joint config in `sparse::glmm::fit_glmm_sparse` — both feed
         // through the shared `apply_campaign_overrides` tail.
-        let mut config = Config::new(n_theta + p);
+        let mut config = Config::new(n_theta + p + n_nb);
         config.rho_begin = rho_begin;
         config.rho_end = GLMM_RHO_END;
-        crate::lmm::apply_campaign_overrides(&mut config, n_theta + p);
+        crate::lmm::apply_campaign_overrides(&mut config, n_theta + p + n_nb);
         // Stage-1 θ-only BOBYQA config: same rho_begin/rho_end schedule as the
         // joint solver above, but `npt` mirrors `sparse_lmm_seed`'s mid-model
         // rule (`src/lmm/mod.rs`), NOT the joint solver's — the two are sized for
         // different-dimension searches and this crate's precedent for a
         // θ-only search is `sparse_lmm_seed`. MIRRORS `config1` in
-        // `fit_glmm_sparse` (sparse.rs) — change together. Both feed through
+        // `fit_glmm_sparse` (sparse.rs) — change together, though the dimension
+        // fed into the shared rule differs: this one takes `n_stage1` (θ, plus
+        // the `ln θ_NB` coordinate on NB), the sparse one takes `n_theta` alone
+        // (no NB coordinate there). Both feed through
         // the shared `apply_campaign_overrides` tail.
-        let npt_stage1 = if n_theta >= 3 {
-            (3 * n_theta).div_ceil(2) + 1
+        let n_stage1 = n_theta + n_nb;
+        let npt_stage1 = if n_stage1 >= 3 {
+            (3 * n_stage1).div_ceil(2) + 1
         } else {
-            2 * n_theta + 1
+            2 * n_stage1 + 1
         };
-        let mut config_stage1 = Config::new(n_theta);
+        let mut config_stage1 = Config::new(n_stage1);
         config_stage1.rho_begin = rho_begin;
         config_stage1.rho_end = GLMM_RHO_END;
         config_stage1.npt = npt_stage1;
-        crate::lmm::apply_campaign_overrides(&mut config_stage1, n_theta);
-        // θ-only incumbent buffer, seeded from the θ-prefix of the joint start.
-        let params_stage1 = params[..n_theta].to_vec();
+        crate::lmm::apply_campaign_overrides(&mut config_stage1, n_stage1);
+        // θ-only incumbent buffer and its box: the θ prefix of the joint start,
+        // plus the ln θ_NB slot on NB (the joint vector's LAST entry, so the
+        // stage-1 box is no longer a prefix of the joint box there).
+        let mut params_stage1 = params[..n_theta].to_vec();
+        let mut lower_stage1 = lower[..n_theta].to_vec();
+        let mut upper_stage1 = upper[..n_theta].to_vec();
+        if n_nb == 1 {
+            let m = n_theta + p;
+            params_stage1.push(params[m]);
+            lower_stage1.push(lower[m]);
+            upper_stage1.push(upper[m]);
+        }
 
         // Route per shape — see `OuterSearch`. Computed here, before `groupings`
         // moves into the struct literal below.
@@ -506,23 +553,24 @@ impl GlmmWorkspace {
         //   VerbAgg             (2,7)        2.1575 vs 1.0082s (+114%) KEEP wins
         //   sim_crossed_at_cap  (7,2)        0.1736 vs 0.1263s (+37%)  KEEP wins
         //
-        // Arabidopsis (n_theta=2, p=6) is the false positive: an earlier version of
-        // this threshold (`n_theta <= 2 && p <= 6`) put it in the skip set purely
-        // because it matched the two true winners on n_theta, without checking p
-        // against a real measurement — it is in fact the single biggest regression
-        // in the corpus (skip is 2.8x SLOWER), because the un-warm-started 8-dim
-        // joint BOBYQA search costs far more than the skipped stage-1 pass saves.
-        // (Correctness was NOT at risk either way — beta/SE/varcomp agreed to
+        // Arabidopsis (n_theta=2, p=6) would be a false positive under a looser
+        // `n_theta <= 2 && p <= 6` bound: it matches the two true winners on
+        // n_theta only, without checking p against a real measurement — it is
+        // in fact the single biggest regression in the corpus (skip is 2.8x
+        // SLOWER), because the un-warm-started 8-dim joint BOBYQA search costs
+        // far more than the skipped stage-1 pass saves.
+        // (Correctness is NOT at risk either way — beta/SE/varcomp agree to
         // ~1e-6 relative between skip and keep on Arabidopsis; this is purely a
         // performance threshold, re-derive it if the corpus changes.)
         //
-        // The two true winners both have p ≤ 4; every loser (including the false
-        // positive) has p ≥ 6 — a wide, data-supported margin — so `p ≤ 4` replaces
-        // the earlier `p ≤ 6`. `n_theta ≤ 2` is unchanged (grouseticks at n_theta=3
-        // is the nearest loser on that axis and was never miscategorized).
+        // The two true winners both have p ≤ 4; every loser (including
+        // Arabidopsis) has p ≥ 6 — a wide, data-supported margin — so the
+        // threshold is `p ≤ 4`. `n_theta ≤ 2` holds too (grouseticks at
+        // n_theta=3 is the nearest loser on that axis and is never
+        // miscategorized).
         //
-        // Since the `ExactProfile` route landed, none of the rows above reach this
-        // branch any more: every dataset in the table is an nAGQ=1 non-Gamma shape
+        // With the `ExactProfile` route in place, none of the rows above reach
+        // this branch: every dataset in the table is an nAGQ=1 non-Gamma shape
         // and routes `ExactProfile` first. What still reaches `n_theta <= 2 && p <= 4`
         // is Gamma, non-canonical structured extras, and dense-fallback extras — a
         // population this sweep never measured. The threshold stands because nothing
@@ -534,6 +582,20 @@ impl GlmmWorkspace {
         } else {
             OuterSearch::PqlThenJoint
         };
+        // Second stage-1 arm — see `solver_stage1_alt` and the trap comment in
+        // `fit_glmm`. Everything but `npt` is arm 1's config, `LMM_NPT_FORMULA`
+        // excepted: the campaign override steers arm 1 only, so a sweep still
+        // measures one interpolation rule at a time.
+        let npt_alt = n_stage1 + 2;
+        let solver_stage1_alt = (outer_search == OuterSearch::ExactProfile
+            && config_stage1.npt != npt_alt)
+            .then(|| {
+                let mut config_alt = config_stage1;
+                config_alt.npt = npt_alt;
+                Bobyqa::new(n_stage1, config_alt)
+                    .expect("BOBYQA config constants are valid by construction")
+            });
+        let alt_bufs = solver_stage1_alt.is_some();
 
         GlmmWorkspace {
             groupings,
@@ -568,14 +630,19 @@ impl GlmmWorkspace {
             } else {
                 Mat::zeros(0, 0)
             },
-            solver: Bobyqa::new(n_theta + p, config)
+            solver: Bobyqa::new(n_theta + p + n_nb, config)
                 .expect("BOBYQA config constants are valid by construction"),
             params,
             lower,
             upper,
-            solver_stage1: Bobyqa::new(n_theta, config_stage1)
+            solver_stage1: Bobyqa::new(n_stage1, config_stage1)
                 .expect("BOBYQA config constants are valid by construction"),
             params_stage1,
+            lower_stage1,
+            upper_stage1,
+            solver_stage1_alt,
+            u_seed_alt: vec![0.0; if alt_bufs { k.max(1) } else { 0 }],
+            beta_seed_alt: vec![0.0; if alt_bufs { p } else { 0 }],
             outer_search,
             eta: vec![0.0; max_n],
             prob: vec![0.0; max_n],
@@ -1149,8 +1216,8 @@ pub(crate) fn apply_lambda(
 /// (θ=0) grouping is skipped, mirroring `apply_lambda`'s `z·θ=0` ⇒ no nonzero.
 /// Packs M's nonzeros from the grouping ids and `z_buf`; the dense `z` is
 /// never materialized on this route (it is 0×0 there — see
-/// `GlmmWorkspace::z`'s doc). Every value it used to read
-/// back out of `z` is reconstructed straight from what `build_z` would have
+/// `GlmmWorkspace::z`'s doc). Every value that would otherwise come from `z`
+/// is reconstructed straight from what `build_z` would have
 /// written there: the primary core from `z_buf` (the pre-widened slope buffer
 /// `fill_z_f64` fills, same source `build_z` widens from `x`), the nested
 /// indicator and the crossed level from `extra_ids` (the same slice `build_z`

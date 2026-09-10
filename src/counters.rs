@@ -59,6 +59,14 @@ pub struct EvalCounters {
     /// Sum over AGQ evaluations of (clusters x nodes-per-cluster) — the
     /// evaluations-x-nodes product the AGQ counter asks for.
     pub agq_node_evals: u64,
+    /// Inner GLMM fits the NB marginal-θ bracket ran — every golden-section
+    /// node plus the final fit at θ̂. 0 on every route that searches θ_NB as a
+    /// coordinate of the outer search, and on every other family.
+    pub nb_nodes: u32,
+    /// `n_eval` summed over those inner fits — the evaluation count the
+    /// bracketed NB fit really spent, where `Fit::n_eval` reports only the
+    /// last inner fit's.
+    pub nb_evals_total: u64,
 }
 
 #[cfg(feature = "counters")]
@@ -72,6 +80,8 @@ impl EvalCounters {
             pending_pirls_iters: 0,
             agq_evals: 0,
             agq_node_evals: 0,
+            nb_nodes: 0,
+            nb_evals_total: 0,
         }
     }
 
@@ -110,6 +120,12 @@ impl EvalCounters {
         self.agq_node_evals += nodes;
     }
 
+    /// One inner fit of the NB marginal-θ bracket, with the evaluations it spent.
+    pub(crate) fn record_nb_node(&mut self, n_eval: usize) {
+        self.nb_nodes += 1;
+        self.nb_evals_total += n_eval as u64;
+    }
+
     /// Evaluations recorded after the stage's last incumbent improvement.
     pub fn evals_after_last_improve(&self, stage: Stage) -> u32 {
         let s = stage as usize;
@@ -139,4 +155,6 @@ impl EvalCounters {
     pub(crate) fn commit_pirls_iters(&mut self) {}
     #[inline(always)]
     pub(crate) fn record_agq_eval(&mut self, _nodes: u64) {}
+    #[inline(always)]
+    pub(crate) fn record_nb_node(&mut self, _n_eval: usize) {}
 }

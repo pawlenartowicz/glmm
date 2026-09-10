@@ -1,5 +1,5 @@
-# Data marshalling: the R -> Table trip (plan gate 3) and the row filtering
-# (subset/na.action) that spec §3.1 assigns to the R side.
+# Data marshalling: the R -> Table trip and the row filtering
+# (subset/na.action) that the R side owns.
 
 ols_data <- function() {
   set.seed(7)

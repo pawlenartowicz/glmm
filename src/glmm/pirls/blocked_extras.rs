@@ -92,8 +92,8 @@ impl TailKernel for f64 {
             // qc == 1 the downdate is rank-1: the panel path stages the
             // identical FLOPs (gather → dd_temp → second scatter pass) at
             // ~double the memory traffic, a measured +4–7% per-eval loss on
-            // the qc=1 cross6 GLMM cells (binb 1.758→1.870 s; 2026-07-14
-            // drift investigation). This scalar walk accumulates each rank-1
+            // the qc=1 cross6 GLMM cells (binb 1.758→1.870 s; measured 2026-07-14).
+            // This scalar walk accumulates each rank-1
             // dot straight into `schur` — already minimal. `qc == 1` is the
             // only measured boundary; no qc>1 GLMM structured cell exists in
             // the grid. Sizing of the panel buffers mirrors this condition in
@@ -484,7 +484,7 @@ pub(crate) fn structured_ainv_solve<T: TailKernel>(
 ///
 /// Step-halving differs by `beta_step`. `Fixed` and `Profile { exact: None }`
 /// (the PQL border) share `pirls_solve`'s retrospective `dev + pen_u` band,
-/// halving `u` back toward `u_prev`. `Profile { exact: Some(_) }` (P1) instead
+/// halving `u` back toward `u_prev`. `Profile { exact: Some(_) }` instead
 /// halves on the exact Laplace merit (`dev + pen_u + 2·logdet` plus its
 /// mode-consistency correction — see the assembly below) and, at the top of
 /// the loop, on `infeasible` alone; it also treats a non-PD structured factor
@@ -613,7 +613,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         ex.u_acc[..k].fill(0.0);
     }
     let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
-    let mut mixed_prev = f64::INFINITY; // today's mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
+    let mut mixed_prev = f64::INFINITY; // the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
     let mut converged = false;
     // `exact` mirrors `blocked.rs`'s contract — change together. It is
@@ -903,7 +903,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
             schur_blk,
             coup_cols,
             coup_ptr,
-            // force_dense folds into ss: this is the arm today's
+            // force_dense folds into ss: this is the arm the
             // `Some(ss) if !force_dense` match took, so it is bit-identical.
             if force_dense {
                 None
@@ -1412,7 +1412,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 pen += u[c] * u[c];
             }
         }
-        // Today's stopping rule, verbatim: the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` band on
+        // The stopping rule, verbatim: the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` band on
         // successive steps — bit-identical iterate path and returned values to the
         // pre-halving loop when no halving fires (see `pirls_solve` for why the
         // same-point band above cannot itself be a converge trigger).

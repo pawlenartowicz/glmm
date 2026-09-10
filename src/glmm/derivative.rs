@@ -14,7 +14,7 @@
 //!
 //! `laplace_gradient` and `laplace_hessian` return `DerivStatus::Unsupported`
 //! — a routing answer, not an error — in exactly three cases. Each names the
-//! caller's own fallback, unchanged from what runs today:
+//! caller's own fallback:
 //!
 //! - **(a) [`supports_shape`] is false** — an extras design the dual kernel
 //!   has no exact derivative for: an oversized core
@@ -71,7 +71,7 @@ use faer::{Mat, MatRef};
 
 /// Outcome of a derivative request. `Unsupported` is a routing answer, not an
 /// error: the caller falls back to the finite-difference Hessian (`se.rs`) or
-/// to BOBYQA on the objective, exactly as it does today.
+/// to BOBYQA on the objective.
 pub(crate) enum DerivStatus {
     /// Objective value at the seeded parameters; the gradient (and Hessian, if
     /// requested) has been written to the caller's buffers.
@@ -317,7 +317,7 @@ pub(crate) const MAX_DUAL_N: usize = 12;
 /// own constant rather than `MAX_DUAL_N·(MAX_DUAL_N+1)/2`: the two ladders are
 /// allowed to differ, because the gradient can chunk and the Hessian cannot, so
 /// a gradient-only rung above the largest `HyperDual` would otherwise grow this
-/// buffer for nothing. Equal to `12·13/2` today — change together with the
+/// buffer for nothing. Equal to `12·13/2` — change together with the
 /// `HyperDual` variants of `GlmmDualScratch` and `LmmHyperScratch`.
 const MAX_DUAL_H: usize = 78;
 
@@ -327,13 +327,13 @@ const MAX_DUAL_H: usize = 78;
 const _: () = assert!(MAX_DUAL_H == MAX_DUAL_N * (MAX_DUAL_N + 1) / 2);
 
 /// Cap on the dual re-entries the FALLBACK refinement loop may take before
-/// the returned derivatives stop moving. Since 2026-09-02 every dual call
-/// takes an exact-Hessian step (`pirls::DualStep`: canonical `A`, or the
+/// the returned derivatives stop moving. Every dual call takes an
+/// exact-Hessian step (`pirls::DualStep`: canonical `A`, or the
 /// observed-information `A_obs` on a non-canonical link), so the IFT lanes are
 /// reached in one step and the loop is entered only when some observed block
 /// was not PD and that step fell back to its Fisher block
 /// (`DualStep::exact == false`). There the lanes contract by
-/// `‖I − A⁻¹h_uu‖` per step; the pre-2026-09-02 Fisher-only kernel needed 5–7
+/// `‖I − A⁻¹h_uu‖` per step; a Fisher-only fallback needed 5–7
 /// calls on the FD gates' draws and 9–10 on `sim_gamma` at its converged fit
 /// (each call two steps), so 12 keeps two calls of headroom above the worst
 /// measured. Hitting the cap is `DerivStatus::NotConverged`, not a silently
@@ -768,7 +768,7 @@ fn run_gradient<T: Seed>(
             bufs.u[c] = T::from_f64(u_mode[c]);
         }
         bufs.dual.min_iters = 0;
-        // Throwaway (W0): the dual evaluation is not a fit-path PIRLS solve, so
+        // Throwaway: the dual evaluation is not a fit-path PIRLS solve, so
         // it must not reach `ws.counters` — mirrors `se.rs`'s `fd_eval`
         // discipline.
         let mut counters = crate::counters::EvalCounters::new();
@@ -1142,7 +1142,7 @@ pub(crate) fn laplace_gradient(
     // solve and the dual call would differentiate different objectives).
     let agq_eligible = agq_eligible(family, nagq, groupings.primary_q) && !extras;
 
-    // --- f64 mode solve, at `tol`, THROWAWAY counters. W0's
+    // --- f64 mode solve, at `tol`, THROWAWAY counters. The
     // `pirls_hist`-sum == `n_eval` invariant holds only if a mode solve run
     // for a derivative request never reaches `ws.counters` — mirrors
     // `se.rs`'s `fd_eval` discipline exactly. `u` is mutated in place by the
@@ -1466,7 +1466,7 @@ fn run_hessian<T: SeedHessian>(
     // `run_gradient`'s, change together.
     let agq_eligible = agq_eligible(family, nagq, groupings.primary_q) && !extras;
     let scalar_agq = groupings.primary_q == 1;
-    // Throwaway (W0), same discipline as `run_gradient`.
+    // Throwaway, same discipline as `run_gradient`.
     let mut counters = crate::counters::EvalCounters::new();
 
     macro_rules! seed_params {
@@ -1659,10 +1659,7 @@ fn run_hessian<T: SeedHessian>(
     // vanishes at the mode, so reading them one step earlier (at the
     // zero-second-order-lane input of step 2) would be wrong. The value part
     // sits at the mode throughout, so the mixed-deviance exit would fire
-    // after step 2 without the floor. Before 2026-09-02 this was two kernel
-    // calls of two steps each (the first discarded) — four hyper-dual steps
-    // for the same answer at ULP level (same iterate path, read one step
-    // earlier).
+    // after step 2 without the floor.
     // `!extras` for the same reason `run_gradient` gives: the extras kernel
     // takes no observed step and reads neither flag, so claiming one here
     // would be a lie about the step it takes.
@@ -2243,7 +2240,7 @@ mod tests {
         }
     }
 
-    /// `m = ws.n_theta + p > MAX_DUAL_N` is no longer a refusal: the gradient
+    /// `m = ws.n_theta + p > MAX_DUAL_N` is not a refusal: the gradient
     /// resolves to the top rung and chunks. The numbers are the FD gates' job
     /// (`glmm/tests.rs`) — all this asserts is the routing, that the call is
     /// not `Unsupported`, and that the top-rung scratch was actually built.
@@ -2270,7 +2267,7 @@ mod tests {
         let status = laplace_gradient(&mut ws, x.as_ref(), &y, &cluster_ids, &[], p, n, &mut grad);
         // Three rows against 13 parameters is a degenerate design, so the
         // refinement loop may or may not settle — `Unsupported` is the one
-        // answer the lane cap must no longer give.
+        // answer the lane cap must not give.
         assert!(
             matches!(status, DerivStatus::Ok(_) | DerivStatus::NotConverged),
             "above the cap the gradient must chunk, not refuse"

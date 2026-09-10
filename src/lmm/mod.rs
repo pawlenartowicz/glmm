@@ -7,17 +7,16 @@
 //!
 //! Engine-resident: ALL Gaussian mixed (LMM) specs dispatch here through the
 //! unified fit core — the single-random-intercept shape is an `LmmDense`/BOBYQA
-//! case like any other, from every tier (stable and loop). A scalar-Brent
-//! kernel for this shape was retired: its measured 3× win on that shape was
-//! an allocation artifact — it reused preallocated scratch while
-//! the old dispatch rebuilt a workspace per call, and handing BOBYQA the true θ
-//! changed BOBYQA's runtime by under 6%, so the θ search was never the cost.
-//! The reusable `FitWorkspace` captures that win for every shape. Brent is also
-//! strictly worse at high cluster counts (its `O(n_clusters·P)` per-evaluation
-//! downdate has no counterpart in `reml_deviance`'s balanced-collapse path), and
-//! the two agree on β̂ to ~1e-9, so there was no accuracy axis to trade either.
+//! case like any other, from every tier (stable and loop). A scalar closed-form
+//! solve for this shape would only save the per-call workspace allocation that
+//! the reusable `FitWorkspace` (allocated once per (p, max_clusters) shape)
+//! already avoids for every shape, so BOBYQA's θ-search itself costs under 6%
+//! of runtime here. BOBYQA also scales better at high cluster counts than a
+//! scalar per-cluster downdate (`O(n_clusters·P)` per evaluation, with no
+//! counterpart in `reml_deviance`'s balanced-collapse path), and matches a
+//! scalar solve's β̂ to ~1e-9, so there is no accuracy axis to trade either.
 //!
-//! Hot-loop invariants (carried over from the retired `lme.rs`):
+//! Hot-loop invariants:
 //!  * Bounded allocations on the warm path (twin test in `lmm::tests`): all
 //!    scratch and the BOBYQA solver live in `LmmWorkspace`, allocated once
 //!    per (p, max_clusters) shape; the only per-call allocations are faer
@@ -50,7 +49,7 @@ pub(crate) use kernel::{reml_gradient, reml_hessian, LmmDualScratch, LmmHyperScr
 /// `blind_theta_and_bounds` shape). Cold start per fit; no warm-start
 /// across sims (would re-import cross-grid-point path dependence).
 pub const THETA0: f64 = 1.0;
-/// Per-component θ upper box — mirrors the retired scalar Brent kernel's reach (θ ≤ 1e3).
+/// Per-component θ upper box (θ ≤ 1e3).
 pub const THETA_HI: f64 = 1e3;
 /// Initial trust radius. Must be ≤ 1.0: PRIMA start-projection silently moves
 /// an x₀ within rho_begin of a bound; 0.5 keeps θ₀ = 1.0 strictly clear of
@@ -82,8 +81,8 @@ pub const GLMM_RHO_END: f64 = 3e-6;
 pub const THETA_TRUTH_FLOOR: f64 = 0.01;
 /// Pin threshold: a Converged diagonal component ≤ this is deterministically
 /// pinned at exactly 0 and counted converged. 1e-4 aligns the class boundary
-/// with the shipped τ̂≈0 detection (the retired `lme.rs` pinned boundary_hit=1
-/// fits at θ = 1e-4).
+/// with the shipped τ̂≈0 detection, which pins `boundary_hit=1` fits at
+/// θ = 1e-4.
 ///
 /// **Tested on the INTERNAL θ** — the scaled coordinate the solver minimizes over
 /// ([`LmmGroupings::set_slope_scales`]), not on θ in the design's own units.
@@ -219,6 +218,7 @@ fn two_stage_minimize(
     theta: &mut [f64],
     lower: &[f64],
     upper: &[f64],
+    finite_evals: &mut usize,
 ) -> bobyqa::Outcome {
     let n = theta.len();
     let c1 = {
@@ -229,7 +229,18 @@ fn two_stage_minimize(
         c
     };
     let mut s1 = Bobyqa::new(n, c1).expect("stage-1 config valid");
-    let out1 = s1.minimize(|xs| reml_deviance(xs, suff, fit), theta, lower, upper);
+    let out1 = s1.minimize(
+        |xs| {
+            let d = reml_deviance(xs, suff, fit);
+            if d.is_finite() {
+                *finite_evals += 1;
+            }
+            d
+        },
+        theta,
+        lower,
+        upper,
+    );
     let theta1 = theta.to_vec();
 
     let min_diag = suff
@@ -247,7 +258,18 @@ fn two_stage_minimize(
         c
     };
     let mut s2 = Bobyqa::new(n, c2).expect("stage-2 config valid");
-    let out2 = s2.minimize(|xs| reml_deviance(xs, suff, fit), theta, lower, upper);
+    let out2 = s2.minimize(
+        |xs| {
+            let d = reml_deviance(xs, suff, fit);
+            if d.is_finite() {
+                *finite_evals += 1;
+            }
+            d
+        },
+        theta,
+        lower,
+        upper,
+    );
 
     if std::env::var("LMM_STAGE_PROBE").is_ok_and(|v| v == "1") {
         let dist = theta1
@@ -556,9 +578,9 @@ impl LmmGroupings {
         let n_extras = re.extra_groupings.len();
         // Over-envelope-by-count designs are legal — they route to the
         // sparse-Z path (`fit::classify_design`), which builds its own cap-free
-        // structures. The old `n_extras <= MAX_EXTRA_GROUPINGS` guard was a
-        // NoZ-envelope check; routing (not this constructor) now enforces it, so
-        // dense code is never handed an over-envelope design.
+        // structures. Routing enforces the `n_extras <= MAX_EXTRA_GROUPINGS`
+        // NoZ-envelope check (not this constructor), so dense code is never
+        // handed an over-envelope design.
         // θ order is declaration order: each extra owns a vech(Λ_g) block of
         // q_g(q_g+1)/2 slots starting at `vech_start`, packed after the primary
         // vech. For all q_g == 1, `vech_start == base_theta + g` — the pre-slope
@@ -778,6 +800,13 @@ impl LmmGroupings {
     /// non-zero `Λ_kj` below the pinned diagonal breaks evenness and the
     /// shortcut no longer equals the score. This is exactly when this
     /// returns true: the caller must not report a score for that component.
+    ///
+    /// A DEFENCE, not a live gate: [`canonicalize_pinned_blocks`] zeroes the
+    /// whole column below a pinned diagonal after every pin loop, so on a
+    /// canonical θ̂ this is false at every pinned diagonal. It is kept because
+    /// nothing in the type system says the canonical form holds at the two
+    /// score sites, and reporting a score where it does not would be silently
+    /// wrong rather than merely absent.
     pub fn diagonal_has_nonzero_below(&self, k: usize, theta: &[f64]) -> bool {
         let run_len = self.diagonal_run_len[k];
         if run_len <= 1 {
@@ -815,7 +844,7 @@ impl LmmGroupings {
 // ---------------------------------------------------------------------------
 
 /// Per-fit scratch, allocated once per (p, max_clusters). `T` is the kernel
-/// scalar (`f64` today; the dual-number type when the derivative work lands);
+/// scalar (`f64` by default; the dual-number type once the derivative work lands);
 /// fields that stay `f64` say why at their own doc.
 pub struct LmmFitScratch<T = f64> {
     /// Row-major w×w family block (w = q_p + n_per) — assembled and
@@ -1048,8 +1077,8 @@ impl LmmWorkspace {
     /// the spec-derived truth start and a scaled BOBYQA schedule.
     /// `slope_cols` are the x_full column indices for the primary slopes
     /// (`spec.cluster_slope_design_cols` as usize); pass `&[]` for callers without slopes.
-    /// Test-only convenience over [`Self::for_cluster_spec_ext`] (the live path)
-    /// since the raw `LmmWorkspace` loop surface was retired.
+    /// Test-only convenience over [`Self::for_cluster_spec_ext`] (the live path);
+    /// no production caller constructs a raw `LmmWorkspace` directly.
     #[cfg(test)]
     pub fn for_cluster_spec(
         p: usize,
@@ -1122,8 +1151,8 @@ impl LmmWorkspace {
     }
 
     /// Allocates the suff-stats accumulator, fit scratch, and BOBYQA solver
-    /// state for the given grouping shape, once per problem shape. Test-only
-    /// (reached only via [`Self::new`]) since the raw loop surface was retired.
+    /// state for the given grouping shape, once per problem shape. Test-only;
+    /// production code reaches this only via [`Self::new`].
     #[cfg(test)]
     pub fn with_groupings(p: usize, groupings: LmmGroupings) -> Self {
         let n_theta = groupings.n_theta();
@@ -1165,6 +1194,121 @@ pub fn primary_lambda<T: Scalar>(theta: &[T], q: usize, lam: &mut [T]) {
             t += 1;
         }
     }
+}
+
+/// Rewrite every pinned RE block's Λ into the canonical Σ-preserving form and
+/// report whether any θ entry moved. Run AFTER a pin loop has snapped diagonals
+/// to exactly 0, and re-run the pin test on the result.
+///
+/// At a pinned diagonal `Λ_jj = 0` the entries BELOW it in column `j` are not
+/// identified: rotating that column leaves `Σ = ΛΛ′` — and so the deviance, β̂,
+/// û, `varcorr` and `ranef` — unchanged, so BOBYQA can stop anywhere on that
+/// flat circle. Re-factoring Σ with a semidefinite-tolerant lower Cholesky
+/// picks the one representative whose redundant column is exactly zero: the
+/// mass below a pinned diagonal folds into the trailing diagonals, where it is
+/// a variance component the caller can read. Σ is preserved by construction, so
+/// this changes the coordinate, not the fit.
+///
+/// Two things depend on it. `Diagnostics::pinned` stops calling a column with a
+/// live off-diagonal a zero variance component; and
+/// [`LmmGroupings::diagonal_has_nonzero_below`] is false at every pinned
+/// diagonal afterwards, which is what makes `boundary_score`'s ½·∂²D/∂θ_jj²
+/// shortcut valid there.
+///
+/// `theta` is the INTERNAL row-scaled θ̃ = S·θ. No scale map is needed here:
+/// `S·chol(Σ)` is lower triangular with the same zero pattern and squares to
+/// `SΣS`, so it IS the lower Cholesky of the scaled Σ — row scaling commutes
+/// with this factorization, and canonicalizing the internal θ̃ is the same
+/// operation as canonicalizing θ in the design's own units.
+pub(crate) fn canonicalize_pinned_blocks(g: &LmmGroupings, theta: &mut [f64]) -> bool {
+    let mut changed = false;
+    let mut start = 0usize;
+    // Same factor walk as `compute_diagonal_theta` / `fill_theta_row_scales`
+    // (primary, then each extra in declaration order) — change together.
+    for &q in std::iter::once(&g.primary_q).chain(g.extra_q.iter()) {
+        let len = q * (q + 1) / 2;
+        // q == 1 has nothing below a diagonal to fold. Past MAX_PRIMARY_Q the
+        // stack scratch below would not hold the block; only the sparse route
+        // builds those, and it reports no `boundary_score` at all, so such a
+        // block keeps whatever representative the optimizer stopped at.
+        if (2..=MAX_PRIMARY_Q).contains(&q) && canonicalize_block(&mut theta[start..start + len], q)
+        {
+            changed = true;
+        }
+        start += len;
+    }
+    changed
+}
+
+/// One block of [`canonicalize_pinned_blocks`]: `vech` is that block's
+/// column-major lower-triangular vech slice and `2 ≤ q ≤ MAX_PRIMARY_Q` its
+/// width. Returns whether any entry moved.
+fn canonicalize_block(vech: &mut [f64], q: usize) -> bool {
+    // With no diagonal at the pin threshold Λ is already the unique Cholesky
+    // factor of its own Σ and the factorization below would only reproduce it
+    // up to round-off. Returning early instead keeps every non-singular fit
+    // BIT-identical, which is what the bit-identity dumps check.
+    let mut off = 0usize;
+    let mut any_pinned = false;
+    for d in 0..q {
+        any_pinned |= vech[off] <= PIN_THETA;
+        off += q - d;
+    }
+    if !any_pinned {
+        return false;
+    }
+
+    let mut lam = [0.0_f64; MAX_PRIMARY_Q * MAX_PRIMARY_Q];
+    primary_lambda(vech, q, &mut lam); // Λ lower-tri, row-major
+    let mut sig = [0.0_f64; MAX_PRIMARY_Q * MAX_PRIMARY_Q];
+    let mut trace = 0.0;
+    for r in 0..q {
+        for c in 0..=r {
+            let mut s = 0.0;
+            for k in 0..=c {
+                s += lam[r * q + k] * lam[c * q + k];
+            }
+            sig[r * q + c] = s;
+        }
+        trace += sig[r * q + r];
+    }
+
+    // Pivot floor. Round-off in forming Σ and in the factorization is
+    // O(q·eps·‖Σ‖₂) and ‖Σ‖₂ ≤ tr Σ for a PSD Σ, so a pivot at or below this is
+    // the rank the pin removed, not a direction. A rank-deficient pivot can
+    // come out slightly NEGATIVE, and the NaN arm catches a non-finite θ̂ —
+    // between them nothing unsound reaches `sqrt`.
+    let tol = q as f64 * f64::EPSILON * trace;
+    let mut l = [0.0_f64; MAX_PRIMARY_Q * MAX_PRIMARY_Q];
+    for c in 0..q {
+        let mut d = sig[c * q + c];
+        for k in 0..c {
+            d -= l[c * q + k] * l[c * q + k];
+        }
+        if d <= tol || d.is_nan() {
+            continue; // column c stays exactly zero
+        }
+        let lcc = d.sqrt();
+        l[c * q + c] = lcc;
+        for r in (c + 1)..q {
+            let mut s = sig[r * q + c];
+            for k in 0..c {
+                s -= l[r * q + k] * l[c * q + k];
+            }
+            l[r * q + c] = s / lcc;
+        }
+    }
+
+    let mut changed = false;
+    let mut t = 0usize;
+    for c in 0..q {
+        for r in c..q {
+            changed |= l[r * q + c].to_bits() != vech[t].to_bits();
+            vech[t] = l[r * q + c];
+            t += 1;
+        }
+    }
+    changed
 }
 
 /// Per-level primary Gram G_f (q×q, row-major) recovered from suff stats into
@@ -1681,7 +1825,7 @@ pub struct LmmFit {
     /// endpoint is still reported, honestly, as non-converged) and on
     /// optimizer/numerical failure.
     pub converged: bool,
-    /// Coding inherited from the retired `lme.rs`: 0 = interior min, 1 = pinned at a variance
+    /// Coding: 0 = interior min, 1 = pinned at a variance
     /// boundary (counted converged), 2 = no accepted optimum — either a
     /// `MaxFunReached` cap-out (finite endpoint still reported below) or an
     /// optimizer/numerical failure (NaN-filled).
@@ -1930,12 +2074,17 @@ fn fit_lmm_impl(
         }
     }
     let mut counters = crate::counters::EvalCounters::new();
+    // mirrors the stage-1 read in glmm/mod.rs — change together.
+    let mut finite_evals = 0usize;
     let out = if two_stage {
-        two_stage_minimize(suff, fit, theta, lower, upper)
+        two_stage_minimize(suff, fit, theta, lower, upper, &mut finite_evals)
     } else {
         solver.minimize(
             |xs| {
                 let d = reml_deviance(xs, suff, fit);
+                if d.is_finite() {
+                    finite_evals += 1;
+                }
                 counters.record_eval(crate::counters::Stage::Two, d);
                 d
             },
@@ -1955,7 +2104,7 @@ fn fit_lmm_impl(
     // unreachable (f_target stays -inf); InvalidArgs would be an engine bug —
     // the workspace fixes shapes and bounds.
     debug_assert!(out.status != Status::InvalidArgs);
-    let converged = matches!(out.status, Status::Converged);
+    let converged = matches!(out.status, Status::Converged) && finite_evals >= 2;
     let has_endpoint = matches!(out.status, Status::Converged | Status::MaxFunReached);
 
     // Per-component deterministic pin: every DIAGONAL variance component ≤
@@ -1978,6 +2127,27 @@ fn fit_lmm_impl(
                     pinned = true;
                     if k < u64::BITS as usize {
                         pinned_components |= 1u64 << k;
+                    }
+                }
+            }
+        }
+        // Σ-preserving canonical Λ, then the pin test again on the new
+        // diagonals: the fold can retire a component that was pinned only as a
+        // degenerate coordinate, and can expose a trailing diagonal that pins.
+        // The flags are rebuilt from scratch rather than OR'd. Nothing moves
+        // unless a diagonal pinned, so an interior fit stays bit-identical, and
+        // the pinned re-eval below runs on the canonicalized θ.
+        if canonicalize_pinned_blocks(&suff.groupings, theta) {
+            pinned = false;
+            pinned_components = 0;
+            for (k, &ti) in diag.iter().enumerate() {
+                if theta[ti] <= PIN_THETA {
+                    theta[ti] = 0.0;
+                    if converged {
+                        pinned = true;
+                        if k < u64::BITS as usize {
+                            pinned_components |= 1u64 << k;
+                        }
                     }
                 }
             }
@@ -2049,8 +2219,8 @@ fn fit_lmm_impl(
         fit.betas[j] = acc / fit.factor[(j, j)];
     }
 
-    // Var(β̂_j) = σ̂²·‖L_XX⁻¹e_j‖² per target; t² = β̂²/Var — the retired `lme.rs`'s
-    // step-7 forward-solve recipe on this factor.
+    // Var(β̂_j) = σ̂²·‖L_XX⁻¹e_j‖² per target; t² = β̂²/Var, via a forward
+    // solve on this factor.
     let sigma_sq = fit.sigma_sq;
     for &tj in target_indices {
         let tj = tj as usize;

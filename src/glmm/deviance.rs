@@ -344,7 +344,7 @@ pub(crate) fn laplace_deviance(
     schur_llt_mem: &mut MemBuffer,
     beta_step_rhs: &mut [f64],
     beta_prev: &mut [f64],
-    // P1 exact-profile scratch (`pirls::ExactProfileBufs`), threaded into
+    // Exact-profile scratch (`pirls::ExactProfileBufs`), threaded into
     // `BetaStep::Profile { exact: .. }` only under `BetaMode::ProfileExact` — inert
     // (unread) under `Fixed`/`ProfilePql`.
     exact_prof: &mut super::pirls::ExactProfileBufs,

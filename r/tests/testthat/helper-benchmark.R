@@ -1,5 +1,4 @@
-# Data generators shaped like the Li & Signorelli harness (accuracy-benchmark
-# spec §3, docs/GLMM/plans/2026-07-12-accuracy-benchmark-spec.md): numeric
+# Data generators shaped like the Li & Signorelli harness: numeric
 # time grid t, Bernoulli(0.4) treatment d, grouping g; random intercept or
 # intercept + t slope. Used by both the unit tests and the gate-5 acceptance
 # test against glmer.

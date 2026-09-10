@@ -226,8 +226,8 @@ pub(crate) fn agq_deviance<T: Scalar>(
             // ln(w_j·e^{z_j²}) per node — the Liu–Pierce reweight, a function of
             // the GH table only. Filled once (k ≤ MAX_NAGQ, stack buffer — no
             // alloc on the hot path) so this arm reads it instead of
-            // recomputing per (cluster, node): that recomputation cost s·k
-            // ln() calls per eval and was the dominant cluster-outer overhead
+            // recomputing per (cluster, node): that recomputation costs s·k
+            // ln() calls per eval, the dominant cluster-outer overhead
             // on many-tiny-cluster shapes. Same operands, deterministic —
             // bit-identical to the inline form (only reader — the node-outer
             // `None` arm below recomputes `ln_wj` per node instead).

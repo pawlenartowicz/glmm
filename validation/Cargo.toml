@@ -75,6 +75,12 @@ path = "memory/memory_fit.rs"
 name = "agq_par_probe"
 path = "campaigns/speed-grid/agq_par_probe.rs"
 
+# Scratch NB θ-search probe (see its header): the three NB GLMM m3_goldens rungs,
+# evaluation counts, θ̂, log-likelihood, min wall. Delete with the sparse bracket.
+[[example]]
+name = "nb_theta_probe"
+path = "nb_theta_probe.rs"
+
 # Machine-local bit-identity baseline for refactors that must not change any
 # fitted number: fits all 48 manifest rungs and writes bit_identity/<config>.json
 # (rung, deviance, theta, beta, se_hessian, se_rx, n_eval, converged, singular).

@@ -52,8 +52,8 @@ pub type LmmTrace<'a> = dyn FnMut(usize, &[f64], f64) + 'a;
 
 /// θ-independent, design-bound state for the LMM sweep seam. [`build_lmm_seam_ws`]
 /// builds this ONCE from x/y/ids; [`lmm_sweep_fit_on`] re-solves it at any number
-/// of θ₀ without re-accumulating the design (the redundant rebuild a two-stage
-/// warm-restart run previously paid per stage). Deliberately holds no raw
+/// of θ₀ without re-accumulating the design (avoiding the redundant rebuild a
+/// two-stage warm-restart run would otherwise pay per stage). Deliberately holds no raw
 /// x/y/ids — the type shape is the reuse guard: a caller has no field through
 /// which to smuggle different data into a second sweep on the same `LmmSeamWs`.
 // `SparseLmmWorkspace` is `pub(crate)` (sparse.rs, untouched here) — an
@@ -204,7 +204,7 @@ pub fn build_lmm_seam_ws(
 
 /// Marshal the LMM inputs exactly as `fit_mle` does and hand the
 /// ready-to-evaluate workspace to `f`. Thin adapter over [`build_lmm_seam_ws`]:
-/// reconstructs the same `obj` closure `f` used to see directly, so
+/// reconstructs the same `obj` closure `f` sees directly, so
 /// [`lmm_objective_at`] keeps its one-shot build-then-evaluate behavior
 /// unchanged.
 #[cfg(feature = "loop_advanced")]

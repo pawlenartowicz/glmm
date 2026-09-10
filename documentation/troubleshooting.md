@@ -85,7 +85,7 @@ message naming the deferral) and `link="cloglog"` (GLM and GLMM) are both
 implemented.
 
 If you hit one of the two remaining gaps, there's nothing to configure around
-it today — wait for the knob to land, or restructure the model to avoid it
+it — wait for the knob to land, or restructure the model to avoid it
 (e.g. drop the `dispersion=` request).
 
 ## Warning: falling back to Laplace
@@ -120,7 +120,7 @@ for the full list and the workaround for each.
 These aren't missing by oversight — the ports error, naming the reason, on
 anything the kernel can't compute honestly rather than returning a
 fixed-effects-only or otherwise silently different answer. `ranef()`,
-`fitted()` and `logLik()`/`AIC()`/`BIC()` used to be on this list and now
-work. See
+`fitted()` and `logLik()`/`AIC()`/`BIC()` are implemented and not part of
+this list. See
 [`coming-from-lme4.md#what-is-deliberately-missing`](coming-from-lme4.md#what-is-deliberately-missing)
 for what's blocked and why.

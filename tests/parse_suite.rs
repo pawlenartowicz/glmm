@@ -1,7 +1,7 @@
 #![cfg(feature = "formula")]
 //! Proves the parser is a superset of MCPower's — the 28 canonical cases parse
 //! identically; everything below the canonical suite is glmm-only grammar.
-//! Two corpora, both copied from the MCPower repo (d3 §6a):
+//! Two corpora:
 //!   - the 28-case canonical suite (`configs/formula-fixtures/canonical-suite.json`),
 //!     inlined here as Rust data and checked via the same canonical normalization
 //!     the app-spec `formula_suite.rs` harness uses;

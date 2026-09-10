@@ -61,7 +61,7 @@ def test_cloglog_glm_fits():
 
 def test_inversegaussian_mixed_raises():
     # GLM-only family: a mixed formula must be a clean Python error,
-    # never a kernel panic (spec §3.2).
+    # never a kernel panic.
     with pytest.raises(ValueError, match="GLM-only"):
         glmm.fit(DATA, "y ~ x + (1 | g)", "inversegaussian")
 
@@ -97,7 +97,7 @@ def test_nagq_max_odd_fits():
     assert result.converged
 
 
-# Ineligible-shape nagq>1 is valid-but-inapplicable (spec §3.5): warn and strip
+# Ineligible-shape nagq>1 is valid-but-inapplicable: warn and strip
 # to nagq=1, never surface the kernel's shape panic as a ValueError. Eligibility
 # mirrors src/fit/common.rs::assert_model_shape — single grouping factor,
 # binomial/Poisson, q ≤ 3.
@@ -150,15 +150,15 @@ def test_dispersion_on_gaussian_warns_and_strips_then_fits():
 
 
 def test_dispersion_on_negativebinomial_warns_then_fits():
-    # negbin's distribution param is theta, not phi (spec §3.2 table).
+    # negbin's distribution param is theta, not phi.
     with pytest.warns(UserWarning, match="dispersion"):
         result = glmm.fit(FIT_DATA, "y_pois ~ x", "negativebinomial", dispersion=1.5)
     assert result.converged
 
 
 def test_quasi_on_mixed_binomial_warns_then_fits():
-    # "estimate" on binomial/poisson is quasi-likelihood, GLM only (spec
-    # §3.2) — on a MIXED formula it is stripped (warn), not a kernel gap.
+    # "estimate" on binomial/poisson is quasi-likelihood, GLM only —
+    # on a MIXED formula it is stripped (warn), not a kernel gap.
     with pytest.warns(UserWarning, match="GLM-only"):
         result = glmm.fit(FIT_DATA, "y_bin ~ x + (1 | g)", "binomial", dispersion="estimate")
     assert result.converged
@@ -166,7 +166,7 @@ def test_quasi_on_mixed_binomial_warns_then_fits():
 
 def test_quasi_on_glm_poisson_is_a_kernel_gap():
     # Non-mixed: dispersion reaches the family check un-stripped, and
-    # quasi-Poisson has no kernel implementation yet (0.1.1).
+    # quasi-Poisson has no kernel implementation yet.
     with pytest.raises(NotImplementedError, match="quasi-likelihood"):
         glmm.fit(FIT_DATA, "y_pois ~ x", "poisson", dispersion="estimate")
 
@@ -196,7 +196,7 @@ def test_init_theta_on_negbin_is_a_kernel_gap():
 
 
 def test_init_theta_and_warm_start_theta_are_independent(recwarn):
-    # The §3 collision: `init_theta` (negative-binomial shape) and
+    # The collision: `init_theta` (negative-binomial shape) and
     # `warm_start["theta"]` (RE Cholesky vector) are unrelated knobs that may
     # legally appear in one call. `init_theta` on a Gaussian is inapplicable and
     # strips with a warning; the warm start still takes effect.

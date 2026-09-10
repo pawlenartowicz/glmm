@@ -13,7 +13,7 @@
 # fresh process under `/usr/bin/time -f '%M'`.
 #
 #   Rscript summarize_memory.R [leg]
-#     Defaults to after-alloc (the final 0.1.3 leg: all three glmm engines
+#     Defaults to after-alloc (all three glmm engines
 #     present, oracles backfilled across all 13 large models). Pass a leg name
 #     to render an earlier one (e.g. after-phase1).
 #

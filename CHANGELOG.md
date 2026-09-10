@@ -6,11 +6,26 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
-## [Unreleased]
+## [0.3.2] — 2026-09-10
 
-### 0.4.0 substrate — internal milestone, not a published release
+Published to crates.io, PyPI and R-universe. Evaluation counters, a
+generic-scalar kernel, dual-number derivatives, exact-Hessian standard errors,
+the θ-only exact-profile search, the negative-binomial θ search change and the
+relicense.
 
-#### Added
+### Added
+
+- **Two observation-only convergence numbers on `Diagnostics`.**
+  `kkt_grad_norm`: the ∞-norm of the exact deviance gradient in θ, projected
+  onto the box the optimizer searched, at the accepted θ̂; NaN wherever no
+  exact gradient exists (every non-GLMM route, structured extras above the
+  tail bound, the dense fallback, the sparse routes, any non-converged fit).
+  `boundary_score`: per pinned variance component, whether the pin is the
+  constrained optimum of its basin — requested through the new
+  `FitOptions::boundary_score` (off by default), empty otherwise. Nothing
+  branches on either. Rust surface only: the Python and R wrappers do not
+  expose them yet.
+
 
 - **Dev-only `counters` Cargo feature.** With the feature on, `Fit` carries an
   `EvalCounters` struct recording four observation-only quantities per fit: the
@@ -44,11 +59,50 @@ shares these entries; Python-specific notes are called out where they differ.
     no mode solve. Same lane set; crossed/nested-slopes designs and
     `n_theta > 12` return `Unsupported`.
 
-  Substrate only: nothing calls these yet — the standard-error and optimizer
-  workstreams wire them up in later milestones. The `f64` fit path is
-  untouched and bit-identical, and pays no memory for the unused scratch.
+  The exact-Hessian SE pass and the θ-only exact-profile search above are
+  their first callers. The `f64` fit path is bit-identical and pays no memory
+  for scratch it never requests.
 
-#### Changed (internal)
+### Changed
+
+- **License is `LGPL-3.0-or-later`, was `GPL-3.0-or-later`.** Crate, Python
+  wheel and R package alike. `LICENSE` now carries the LGPL text; the GPL
+  text it extends ships alongside as `LICENSE-GPL`.
+
+- **Negative-binomial θ is a coordinate of the outer BOBYQA search.** The
+  dense NB GLMM used to wrap a golden-section bracket over `ln θ_NB` around
+  the whole fit, running a complete GLMM fit (outer θ search, PIRLS inside)
+  at each of about 28 bracket nodes and once more at θ̂. Now `ln θ_NB` is one
+  more trailing coordinate of the single outer search over the random-effect
+  parameters, on the same marginal objective, and the bracket is deleted.
+  Measured on the locked 2026-09-08 paired run over the 36 speed-grid
+  `negbin` cells and the 3 NB validation rungs: per-subfamily median
+  evaluation and wall ratios 0.04–0.07 of before; every cell converged in
+  both arms; converged `−2 logL` differs by at most 7.5e-5 and θ̂_NB by at
+  most 6.2e-4 on `ln θ`. The sparse NB route is unchanged (identical
+  evaluations and θ̂). `Diagnostics::kkt_grad_norm` holds `ln θ_NB` fixed and
+  covers the random-effect coordinates only.
+
+- **`WaldSe::Hessian`, the default, is an exact Hessian where the dual kernel
+  reaches.** On the blocked path and on the structured-extras shapes inside
+  the measured dense-tail bound (nested and small crossed designs), the joint
+  `(θ, β)` Hessian behind `se_hessian`, `vcov` and `stddev_se` is the
+  hyper-dual Hessian of the Laplace deviance, no longer an `m(m+1)/2`-cell
+  finite-difference stencil of PIRLS solves. The stencil still runs on the
+  oversized-core dense fallback, on the sparse driver, and above the lane cap
+  (`n_θ + p > 12`). θ̂, β̂, deviance and `n_eval` are untouched; `se_hessian`
+  moves within its bands on the affected shapes, and the re-pinned goldens
+  carry provenance comments.
+
+- **θ-only exact-profile search on the blocked path.** Where the exact
+  derivative kernel runs (the blocked path, and structured extras on
+  canonical links), the outer BOBYQA searches θ alone on the exact Laplace
+  β-profile, and the joint `[θ | β]` stage no longer runs for those shapes.
+  Same objective and optimum, a different search path: `n_eval` and the
+  iterate sequence change there. The joint search stays for AGQ,
+  non-canonical structured extras, Gamma, the dense fallback and the sparse
+  route.
+
 
 - **The blocked fit kernel is generic over a scalar type.** Family primitives,
   blocked PIRLS, the Laplace/AGQ deviance, and the family-blocked REML kernel
@@ -59,8 +113,77 @@ shares these entries; Python-specific notes are called out where they differ.
   verbatim, so the shipped path pays nothing. Every kernel branch compares the
   value part, so the iterate path a fit takes is the same at every scalar
   type. No public API change: the trait is sealed and hidden, and existing
-  callers infer `f64`. This is the substrate for a forward-mode dual-number
-  instantiation (exact derivatives) in a later milestone.
+  callers infer `f64`. This is the substrate the dual-number derivatives
+  above are built on.
+
+### Fixed
+
+- **`Fit::dispersion` is NaN on every non-converged fit.** Before, a failed
+  Gamma / inverse-Gaussian fit reported `1.0`, a failed binomial / Poisson fit
+  reported `1.0`, a failed negative-binomial fit reported the last θ the search
+  stood on (often the `NB_THETA_HI` box edge), and a φ held through
+  `FitOptions::dispersion` came back as `1.0` — on the GLM, dense GLMM and
+  sparse NB routes alike. `Diagnostics::converged`'s doc already promised the
+  NaN fill; the four mapping sites now keep it. `fit_glm_nb` /
+  `fit_glm_nb_capped` return `(Fit, f64)` so the dense NB GLMM still seeds its
+  θ_NB search from the alternation's last θ. Python `Fit.dispersion` and R
+  `$dispersion` / `sigma()` move to NaN on the same fits. Bit-identity dumps
+  and goldens carry no dispersion field, so nothing recorded moves.
+
+- **`converged` needs at least two finite objective evaluations.** BOBYQA
+  maps a `+INF` objective (PIRLS non-convergence) to a finite ceiling, so a
+  search whose probes all diverged saw a flat finite surface, exhausted its
+  trust-region ladder and exited `Converged` with the random-effect
+  coordinates still at their cold start. The convergence read on every route
+  (dense GLMM stages 1 and 2, sparse GLMM, dense and sparse LMM) now also
+  requires that the gating stage evaluated the objective to a finite value at
+  least twice; a fit below that bar is NaN-filled as non-converged, the same
+  treatment the all-diverged case already had. No in-crate test, oracle rung
+  or bit-identity rung flips; on a 3888-cell pathological sweep it flips 1 of
+  3053 previously-`converged` fits.
+
+- **A pinned diagonal now leaves its RE block in canonical Λ.** At `Λ_jj = 0`
+  the entries below it in that column are unidentified (Σ sees only their
+  squares summed with the trailing diagonals), so BOBYQA stopped anywhere on
+  a flat circle and the reported θ̂, `pinned` and `tau2` depended on where.
+  After the pin loop each block with a pinned diagonal is rewritten as the
+  lower Cholesky of its own Σ (redundant column exactly zero, its variance
+  folded into the trailing diagonals), then the pin test is re-run. Σ is
+  preserved, so `deviance`, `loglik`, `beta`, `se`, `vcov`, `varcorr`,
+  `stddev_corr`, `fitted` and `ranef` do not move; on q ≥ 2 fits with a
+  pinned diagonal `theta`, `tau2`, `stddev_se` and `pinned` move to the
+  canonical representative (`pinned` no longer flags a component whose
+  stddev is non-zero), and `boundary_score` is now reported at pinned
+  diagonals that were previously withheld as NaN because their column
+  carried a live off-diagonal. Non-singular fits are a bit-for-bit no-op;
+  the bit-identity dumps are unchanged. `boundary_score` on the θ-only
+  exact-profile route stays the raw joint-Hessian diagonal: with the column
+  below the pinned diagonal zero, the deviance is even in that coordinate
+  for every β, so its Hessian row vanishes and the raw and β-profiled
+  diagonals are the same number (recorded in the source comment).
+
+- **A pinned stage-1 exit on the θ-only exact-profile route re-runs the search
+  once with the minimum interpolation set.** At `Λ_jj = 0` the entries below
+  it in that column are unidentified, so BOBYQA's quadratic model is singular
+  along that circle and the trust region can collapse there before escaping —
+  a binary GLMM with an intercept and two random slopes (now
+  `tests/fixtures/glmm_npt_trap.csv`) stopped at deviance 910.379 with the
+  (intercept, slope 1) correlation at −1 where lme4 reaches 910.215 in the
+  interior; the
+  interpolation-set size alone decided which basin (npt 9–11 trapped, 8 and
+  12+ escaped), and no single npt rule wins on every draw. Now, when the
+  `ExactProfile` search exits with a diagonal at or below `PIN_THETA`, stage 1
+  runs once more from the same blind start at `npt = n_theta + 2` (BOBYQA's
+  minimum, minqa/lme4's default) and the fit keeps the arm with the strictly
+  lower deviance (margin 1e-8 relative; the second arm must also meet the
+  same convergence bar). `n_eval` counts both arms. Measured 2026-09-08: the
+  gate never fires on the 48-rung validation grid (no rung pins), so goldens
+  and bit-identity dumps are unchanged; on the 60-draw simulation cell the
+  fixture came from it fixes all four trapped draws and worsens none, at +86%
+  evaluations on that cell.
+  `LMM_NPT_FORMULA` still governs the first arm only. Sparse GLMM is not
+  affected: its θ-only stage is a warm-start accelerant, the joint stage is
+  the search there. The new fixture pins the escape.
 
 ## [0.3.1] — 2026-08-27
 

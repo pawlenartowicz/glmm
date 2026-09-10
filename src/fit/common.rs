@@ -21,9 +21,9 @@ use super::{Boundary, Diagnostics, Fit, FitOptions, Note};
 /// path materializes it into `Fit` inside the `*_view_to_fit` mappers. One
 /// carrier, so a new diagnostic costs no new accessor set.
 ///
-/// **Plain `Copy` data, no `Vec`.** The warm loop calls this per draw and 0.1.3
-/// spent a whole batch removing allocations from that path, so the carrier holds
-/// nothing that allocates. The public reshape — `Boundary` for `boundary_hit`,
+/// **Plain `Copy` data, no `Vec`.** The warm loop calls this per draw, so the
+/// carrier holds nothing that allocates — a per-draw allocation here would cost
+/// every warm-start caller once per fit. The public reshape — `Boundary` for `boundary_hit`,
 /// varcorr-aligned flags for `pinned_components`, a note carrying
 /// `(pivot_col, pivot)` — is a translation of these fields and nothing more.
 ///
@@ -1054,7 +1054,7 @@ pub(super) fn fit_rank_deficient(
     // the chain runs: if the recursive `fit_warm` salvages again, `fr.aliased[r]`
     // is true for a column this level KEPT and `fr.beta[r]` is the NaN that goes
     // with it, and reporting only this level's mask would scatter that NaN into
-    // a slot flagged `aliased == false`. The alias gate cannot fire twice today
+    // a slot flagged `aliased == false`. The alias gate cannot fire twice
     // (see the recursion note above), so this is insurance rather than a live
     // path, but it is the cheap kind and the contract is worth pinning.
     let mut aliased_out = aliased.to_vec();
@@ -1151,7 +1151,8 @@ pub(super) fn assert_model_shape(model: &ModelSpec, p: usize, nagq: u8) {
     // q_p ≤ 3, binomial/Poisson GLMM — the shapes whose marginal likelihood is a
     // product of independent per-cluster q-D integrals. Checked before the RE
     // early-return so even fixed-only specs can't smuggle a bad nagq through.
-    // Sourced from `FitOptions` (M3.5), not the spec. Mirrors the Python layer's
+    // `nagq` controls how the fit is computed, not what model is being fit, so
+    // it is sourced from `FitOptions`, not the spec. Mirrors the Python layer's
     // warn-and-strip boundary (`glmm.fit`) — change together.
     assert!(
         (1..=crate::consts::MAX_NAGQ).contains(&nagq) && nagq % 2 == 1,

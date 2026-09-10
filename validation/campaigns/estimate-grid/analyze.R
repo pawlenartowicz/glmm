@@ -1,6 +1,5 @@
 #!/usr/bin/env Rscript
-# Diligent-grid analysis (full-AGQ vector-RE spec Part 6: docs/GLMM/plans/
-# 2026-07-12-full-agq-vector-re-spec.md). Joins glmm vs the oracle per cell over
+# Diligent-grid analysis. Joins glmm vs the oracle per cell over
 # the 510-cell diligent manifest and answers: does glmm match the reference
 # engines' ANSWERS -- estimates, variance components, Hessian SEs -- across the
 # whole grid, and where AGQ applies is it right at matched nodes?
@@ -15,12 +14,12 @@
 #   * agq_q2s  (18 cells; 17 joinable) -- oracle GLMMadaptive(nAGQ=7); agq_*
 #                                         bands, NO deviance (GLMMadaptive's
 #                                         logLik carries different additive
-#                                         constants than glmer's devfun -- spec
-#                                         Part 6). The 6 bina_q2s_* aggregated-
-#                                         binomial cells join like the rest since
-#                                         the AGQ x weights gate was lifted
-#                                         2026-07-14 (1 GLMMadaptive oracle-timeout
-#                                         leaves 17 joinable).
+#                                         constants than glmer's devfun). The 6
+#                                         bina_q2s_* aggregated-binomial cells
+#                                         join like the rest: the AGQ x weights
+#                                         gate no longer excludes them, as of
+#                                         2026-07-14 (1 GLMMadaptive
+#                                         oracle-timeout leaves 17 joinable).
 #
 # Deviance is a cross-check (aligned -2logL) only on lme4/lmer rows, matching
 # analyze_grid.R's alignment (gaussian REML offset; GLMM identity). It is not a
@@ -70,11 +69,10 @@ glmm_dev_aligned <- function(cell, dev) {
   } else dev - 2 * sat_loglik(cell)
 }
 
-# AGQ x weights: the gate that made aggregated-binomial AGQ cells oracle-only was
-# lifted 2026-07-14 (docs/GLMM/plans/2026-07-14-agq-prior-weights-spec.md -- prior
-# weights now thread through both AGQ kernels). All 12 bina_ AGQ cells (6 int1 +
-# 6 q2s) fit and join like any other cell; there is no named coverage boundary
-# anymore, so any AGQ engine-fail is once again a real flag.
+# AGQ x weights: aggregated-binomial AGQ cells are no longer oracle-only, as of
+# 2026-07-14 (prior weights thread through both AGQ kernels). All 12 bina_ AGQ cells (6 int1 +
+# 6 q2s) fit and join like any other cell; there is no named coverage boundary,
+# so any AGQ engine-fail is a real flag.
 
 rows <- list()
 for (cid in names(cells)) {
@@ -186,8 +184,7 @@ for (cid in names(cells)) {
 }
 res <- do.call(rbind, rows)
 
-# Boundary-fits follow-up (docs/GLMM/plans/2026-07-14-boundary-fits-followup-
-# spec.md, Part A): the 37 oracle-error cells (lme4 identifiability refusal,
+# Boundary-fits follow-up (2026-07-14, Part A): the 37 oracle-error cells (lme4 identifiability refusal,
 # obs<=REs) verified against a third oracle, MixedModels.jl
 # (verify_boundary37.R -> boundary37_verdicts.csv). 36/37 confirmed correct
 # (34 direct agreement + 2 same-optimum-flat-direction, REML criterion aligns
@@ -257,10 +254,10 @@ ADJUDICATED <- c(
   #      Each verdict was checked by running lme4's own answer through the
   #      identical path first: it reproduces lme4's recorded deviance to <=4e-5,
   #      so the theta reconstruction the scoring depends on is sound.
-  #   2. WHAT LME4 SAID. fit.R now records m@optinfo$conv$lme4$messages
+  #   2. WHAT LME4 SAID. fit.R records m@optinfo$conv$lme4$messages
   #      verbatim. Two cells turn out to carry lme4's own max|grad| convergence
   #      FAILURE rather than its singular-fit note -- lme4 reporting that it did
-  #      not converge, on cells previously read as glmm disagreeing with it.
+  #      not converge, on cells that a raw comparison would read as glmm disagreeing with it.
   #
   # The remaining 38 oracle-singular cells all carry the singular-fit note and
   # nothing else, and 25 of them break no band at all.

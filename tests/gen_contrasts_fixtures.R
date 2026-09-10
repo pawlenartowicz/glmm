@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 # Freezes R `model.matrix` output (default treatment contrasts) as a committed
 # Rust fixture (`contrasts_fixtures.rs`) — the oracle for materialize's fixed
-# design (d3 §6b). The oracle is sacred: a mismatch is a formula-frontend bug, never
+# design. The oracle is sacred: a mismatch is a formula-frontend bug, never
 # a relaxed fixture. Re-run to regenerate; commit the result.
 
 # Shared fixture data — mirrored verbatim in contrasts_oracle.rs.
@@ -19,10 +19,11 @@ dat <- data.frame(
   w = c(1.5, 2.0, 0.5, 4.0, 3.0, 2.5)
 )
 
-# d3 supports interactions in the marginal-present form: treatment dummies (base
-# dropped), which matches R model.matrix only when the interacting factors' main
-# effects are also in the model (exactly what `*`/factorial produces — the only
-# interaction form any d3 consumer uses). R's marginal-term contrast promotion for
+# The formula frontend supports interactions in the marginal-present form:
+# treatment dummies (base dropped), which matches R model.matrix only when the
+# interacting factors' main effects are also in the model (exactly what
+# `*`/factorial produces — the only interaction form any caller uses). R's
+# marginal-term contrast promotion for
 # a BARE factor interaction (e.g. `y ~ f:g` with no `f`/`g` main effect keeps the
 # base level: `fa:gp`) is deliberately out of scope, so those formulas are not in
 # the oracle.

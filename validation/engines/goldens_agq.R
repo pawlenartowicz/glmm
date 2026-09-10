@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
-# M3 family/link/AGQ reference fits -> validation/goldens/<name>.json.
+# Family/link/AGQ reference fits -> validation/goldens/<name>.json.
 #
-# THE ORACLE IS SACRED. These JSONs are the frozen reference the in-crate M3 goldens
+# THE ORACLE IS SACRED. These JSONs are the frozen reference the in-crate goldens
 # (hardcoded constants in src/*.rs tests) are validated against. On any glmm
 # disagreement, glmm is presumed wrong -- never relax a tolerance or edit a reference.
 #
@@ -36,7 +36,7 @@ suppressMessages({
 })
 # GLMMadaptive (vector-RE AGQ oracle: specs with oracle="GLMMadaptive"; glmer refuses
 # nAGQ>1 for vector REs -- see validation/README.md) is attached at FIRST USE, inside
-# fit_one_glmmadaptive, not here. It was a top-level library() call, which made the
+# fit_one_glmmadaptive, not here: a top-level library() call would make the
 # whole script unloadable on a machine without the package -- including a
 # VALIDATION_ONLY run naming only glmer/glm/lmer specs, which never touch it. Those
 # are the majority (34 of 40 goldens) and are exactly what a single-golden
@@ -193,10 +193,10 @@ fit_one <- function(spec) {
     # goldens stay frozen at the default they were generated with.
     ctrl <- if (!is.null(spec$tolPwrss)) glmerControl(tolPwrss = spec$tolPwrss)
             else glmerControl()
-    # glmer.nb takes the same control object (it forwards ... to glmer). It used
-    # NOT to be given one, so a spec's tolPwrss was silently ignored on the negbin
-    # rungs while it applied everywhere else -- the kind of split that makes a
-    # golden's provenance unreadable from its own file.
+    # glmer.nb takes the same control object (it forwards ... to glmer): without
+    # one, a spec's tolPwrss would be silently ignored on the negbin rungs while
+    # applying everywhere else -- the kind of split that makes a golden's
+    # provenance unreadable from its own file.
     m <- if (spec$family == "negbin")
            lme4::glmer.nb(fm, data = df, nAGQ = nagq, control = ctrl)
          else glmer(fm, data = df, family = fam_obj(spec$family, spec$link),

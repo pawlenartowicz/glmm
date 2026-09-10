@@ -1,6 +1,6 @@
 Package: fastglmm
 Title: Fast (Generalized) Linear Mixed Models via the 'glmm' Rust Kernel
-Version: 0.3.1
+Version: 0.3.2
 Authors@R:
     person("Paweł", "Lenartowicz", role = c("aut", "cre"), email = "pawellenartowicz@europe.com",
            comment = c(ORCID = "0000-0002-6906-7217"))
@@ -13,7 +13,7 @@ Description: Fits linear models, generalized linear models, and (generalized)
     components; anything the backend cannot compute honestly (random-effect
     predictions, likelihood-based criteria, profiling) is a documented error,
     never a silently different answer.
-License: GPL (>= 3)
+License: LGPL (>= 3)
 URL: https://github.com/pawlenartowicz/glmm
 BugReports: https://github.com/pawlenartowicz/glmm/issues
 Encoding: UTF-8

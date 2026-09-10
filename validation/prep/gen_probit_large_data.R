@@ -17,7 +17,7 @@
 # CORRECTNESS and nothing else: at 56 rows a vectorized family kernel is pure
 # measurement noise, so a probit performance regression, or an accuracy
 # regression that only appears once the row loop is long enough for its rounding
-# to accumulate, was invisible. This rung makes both visible.
+# to accumulate, would go undetected. This rung makes both visible.
 #
 # WHY A SEPARATE PREP SCRIPT. Every rung export_data.R / gen_weights_data.R /
 # gen_large_theta_data.R emits is already backed by a frozen reference that

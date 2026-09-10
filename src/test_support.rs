@@ -142,9 +142,9 @@ pub(crate) struct TestWs {
 impl TestWs {
     /// Allocate scratch sized for `max_n` rows, `n_predictors` columns.
     /// Alloc lines copied verbatim from `SimWorkspace::new`. `_max_n_clusters`
-    /// is accepted-but-unused: kept so every existing `TestWs::new` call site
-    /// (positional, cluster count still passed) needs no change now that the
-    /// LME scratch it used to size is gone.
+    /// is accepted-but-unused: `TestWs` holds no cluster-sized LME scratch, so
+    /// the parameter is kept only so every existing `TestWs::new` call site
+    /// (positional, cluster count still passed) needs no change.
     pub(crate) fn new(max_n: usize, n_predictors: usize, _max_n_clusters: usize) -> Self {
         Self {
             fit_betas: vec![0.0; n_predictors],

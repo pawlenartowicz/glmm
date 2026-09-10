@@ -8,7 +8,7 @@ lme4 and MixedModels.jl (see [`validation.md`](../documentation/validation.md)).
 
 Deliberately scoped to **fast fitting**: fixed effects, Wald standard errors,
 variance components on the SD/correlation scale, conditional modes, fitted
-values, and log-likelihood. Anything the engine cannot compute honestly today
+values, and log-likelihood. Anything the engine cannot compute honestly
 (`predict`, `residuals`, `coef`, profiling) is an error naming the reason —
 never a silently different answer.
 

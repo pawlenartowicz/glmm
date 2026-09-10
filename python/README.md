@@ -2,7 +2,7 @@
 
 **Linear-regression family — OLS → GLM → LMM → GLMM — in pure Rust, with an eight-name Python API.**
 
-[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: LGPL-3.0-or-later](https://img.shields.io/badge/license-LLGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/lgpl-3.0)
 
 Fits fixed-effect and mixed (random-intercept / random-slope) models for
 Gaussian, Binomial (logit/probit), Poisson, Gamma, and Negative-Binomial
@@ -97,7 +97,7 @@ code in
 
 ## License
 
-`GPL-3.0-or-later`.
+`LGPL-3.0-or-later`.
 
 ---
 **Paweł Lenartowicz** — [Freestyler Scientist](https://freestylerscientist.pl) · [GitHub](https://github.com/pawlenartowicz/) · [ORCID](https://orcid.org/0000-0002-6906-7217)

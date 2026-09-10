@@ -115,7 +115,7 @@
 #' @param dispersion Gamma/inverse-Gaussian dispersion directive: `NULL`
 #'   (estimate via Pearson, the default), `"estimate"` (same), or a number to
 #'   hold it fixed. Non-`NULL` on binomial/poisson would mean
-#'   quasi-likelihood - GLMM 0.1.1, errors today.
+#'   quasi-likelihood - not implemented, errors.
 #' @param init.theta negative-binomial shape seed, named for
 #'   `MASS::glm.nb(init.theta=)`. No kernel hook exists yet to seed the shape
 #'   search, so any non-`NULL` value is an error (the default cold start is
@@ -202,7 +202,7 @@ fastglmm <- function(formula, data, family = gaussian(),
   if (!is.null(dispersion) && fam$name %in% c("binomial", "poisson")) {
     # mirrors python/glmm/__init__.py's NotImplementedError block - change together.
     stop("quasi-likelihood dispersion on family '", fam$name,
-         "' requires GLMM 0.1.1; not yet implemented in the kernel",
+         "' is not yet implemented in the kernel",
          call. = FALSE)
   }
   if (!is.null(init.theta) && fam$name != "negativebinomial") {
@@ -296,7 +296,7 @@ fastglmm <- function(formula, data, family = gaussian(),
 
   # --- marshalling: factors cross as (levels, 0-based codes) so the caller's
   # declared level order (the treatment base) survives into Rust's
-  # Column::Factor - the declared-order path, plan gate 3. ---
+  # Column::Factor - the declared-order path. ---
   numeric_cols <- list()
   factor_levels <- list()
   factor_codes <- list()
@@ -436,11 +436,11 @@ fastglmm <- function(formula, data, family = gaussian(),
 # so a scan for exactly-zero stddevs misses those pins entirely.
 #
 # That same fact is why the message says "pinned at the variance boundary" and
-# not "= 0", which is what it used to say. What is pinned is the Cholesky
-# diagonal; the stddev this fit reports for the component keeps whatever the
-# off-diagonal settled on, measured as high as 2.2e-3 against a 0.689 sibling on
-# a q >= 2 block - a number VarCorr() prints at default rounding. A warning must
-# not contradict a number the same fit prints.
+# not "= 0": what is pinned is the Cholesky diagonal, while the stddev this fit
+# reports for the component keeps whatever the off-diagonal settled on,
+# measured as high as 2.2e-3 against a 0.689 sibling on a q >= 2 block - a
+# number VarCorr() prints at default rounding. A warning must not contradict a
+# number the same fit prints.
 #
 # character(0) means nothing was pinned - including a model with no variance
 # components to pin. `singular` can still be TRUE with `pinned` empty (the
