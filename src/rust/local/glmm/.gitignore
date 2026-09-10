@@ -1,0 +1,23 @@
+/target
+/Cargo.lock
+dhat-heap.json
+python/venv/
+__pycache__/
+*.egg-info/
+python/build/
+python/.pytest_cache/
+.DS_Store
+python/glmm/_native*.so
+python/glmm/_native*.pyd
+
+# validation: per-engine result JSONs are regenerated every run and never
+# committed. All input CSVs under data/ ARE committed (empirical from lme4/nlme
+# byte-for-byte; simulated frozen by committed seed + prep script AND bytes --
+# cargo test include_str! reads them, incl. in CI). Campaign raw output is
+# regenerable and ignored; campaign reports/ are committed.
+/validation/results/
+/validation/campaigns/speed-grid/data/
+/validation/campaigns/speed-grid/results/
+/validation/campaigns/estimate-grid/results/
+# lane-width harness: per-run probe/test output, regenerated every run.
+/validation/lanewidth/results/

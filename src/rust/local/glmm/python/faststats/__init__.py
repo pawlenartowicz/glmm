@@ -1,0 +1,1 @@
+"""faststats namespace root"""
