@@ -52,9 +52,11 @@ pub const THETA0: f64 = 1.0;
 /// Per-component θ upper box (θ ≤ 1e3).
 pub const THETA_HI: f64 = 1e3;
 /// Initial trust radius. Must be ≤ 1.0: PRIMA start-projection silently moves
-/// an x₀ within rho_begin of a bound; 0.5 keeps θ₀ = 1.0 strictly clear of
-/// the 0 lower bound. Box width 1e3 ≥ 2·rho_begin is the crate's up-front
-/// validity requirement.
+/// an x₀ within rho_begin of a bound, and the box is [−THETA_HI, THETA_HI] on
+/// every coordinate (`blind_theta_and_bounds`), so θ₀ = 1.0 stays clear of
+/// both bounds at any rho_begin ≤ 1.0. Box width 2e3 ≥ 2·rho_begin is the
+/// crate's up-front validity requirement. 0.5 is the value the eval schedule
+/// was measured under.
 pub const RHO_BEGIN: f64 = 0.5;
 /// Final trust radius = θ̂ target accuracy. 1e-6 measured equivalent to 1e-8
 /// on every validation check under the amended abs floors (stat 1e-4 /
@@ -111,8 +113,8 @@ pub const PIN_THETA: f64 = 1e-4;
 pub const PIVOT_MIN: f64 = 1e-12;
 
 /// BOBYQA config for an n_theta-dimensional θ-search. `Config::new` supplies
-/// the PRIMA defaults (npt = 2n+1, max_fun = 500·n) — at n = 1 exactly
-/// npt = 3 / max_fun = 500. Test-only (reached only via the test-gated
+/// the PRIMA default npt = 2n+1 (3 at n = 1); `apply_campaign_overrides` sets
+/// max_fun = 1000·n. Test-only (reached only via the test-gated
 /// [`LmmWorkspace::with_groupings`]); the live path inlines its own config.
 #[cfg(test)]
 pub fn bobyqa_config(n_theta: usize) -> Config {
@@ -174,10 +176,23 @@ pub(crate) fn max_fun_override(n: usize) -> Option<usize> {
 /// BOBYQA keeps the best point across cycles, so a restart never returns worse
 /// than stopping would have.
 ///
+/// The evaluation budget is `1000·n`, twice PRIMA's `500·n` default. The budget
+/// sets the restart trigger together with `cycle_budget_frac`: the first cycle
+/// restarts after 1/8 of the budget, so 1000·n at 1/8 fires at 750 evaluations
+/// for n = 6 (500·n at 1/8: 375), and the second cycle then runs to `rho_end`.
+/// Measured 2026-09-11 on the boundary-pin corpora (q3 4,500 fits, R1 12,600,
+/// two AGQ cells of 3,000): a fit stopping before the trigger is bit-identical;
+/// on q3, 17 fits improve by more than 1e-6 (largest −3.5e-4), 8 worsen
+/// (largest +6.6e-5), the one fit that hit the 500·n cap converges at 796
+/// evaluations, total evaluations 0.985×, KKT distribution unchanged; R1 and
+/// the AGQ cells move no fit by more than 3e-6. No corpus fit reaches 1000·n.
+/// A fit that never converges spends twice the evaluations before reporting it.
+///
 /// The four fields are written out even though they are `RestartConfig::new()`'s
 /// own defaults: the schedule is adopted by value, so a later bobyqa release
 /// changing its defaults cannot silently move this fit path.
 pub(crate) fn apply_campaign_overrides(config: &mut Config, n: usize) {
+    config.max_fun = 1000 * n;
     if let Some(npt) = npt_override(n) {
         config.npt = npt;
     }
@@ -243,11 +258,13 @@ fn two_stage_minimize(
     );
     let theta1 = theta.to_vec();
 
+    // Magnitude, not value: the box lets a diagonal end stage 1 negative
+    // (`blind_theta_and_bounds`; the sign is fixed only at the fit's exit).
     let min_diag = suff
         .groupings
         .diagonal_theta()
         .iter()
-        .map(|&i| theta[i])
+        .map(|&i| theta[i].abs())
         .fold(f64::INFINITY, f64::min);
     let rho_begin2 = (0.1 * min_diag).clamp(10.0 * RHO_END, RHO_BEGIN);
     let c2 = {
@@ -817,22 +834,39 @@ impl LmmGroupings {
     }
 
     /// Blind θ₀ and per-component boxes. Diagonal vech entries (the q_p primary
-    /// variances + extra scalars) start at THETA0 with box [0, HI]; off-diagonal
-    /// vech entries start at 0 with the signed box [−HI, HI]. q_p=1 ⇒ the
-    /// all-diagonal shape (every entry diagonal: θ₀ = [THETA0;n], box [0, HI]).
+    /// variances + extra scalars) start at THETA0; off-diagonal vech entries
+    /// start at 0. Every entry, diagonal included, gets the signed box
+    /// [−HI, HI]. q_p=1 ⇒ the all-diagonal shape (θ₀ = [THETA0;n]).
+    ///
+    /// The diagonals are deliberately NOT boxed at 0. Σ = ΛΛᵀ is unchanged when
+    /// a whole column of Λ is negated, so the deviance is even in each block
+    /// column; with Λ_jj ≥ 0 enforced, the two sign halves of column j meet
+    /// only on the face Λ_jj = 0, and a search that reaches that face from
+    /// the wrong half (the entries below with the sign that does not lead to
+    /// the optimum) sees the deviance rise in every in-box direction and
+    /// stops there, a deviance unit or more above the optimum — the exit is
+    /// first-order stationary on the box, so no local check tells it apart.
+    /// With the bound gone the face is an interior point of a smooth
+    /// function and the search walks through it into the other half on its
+    /// own. MixedModels.jl searches the same unbounded box. Every pin site
+    /// calls `fix_column_signs` on the endpoint, so a negative diagonal never
+    /// leaves the crate.
+    ///
+    /// The box changes BOBYQA's interpolation set and trust-region steps on
+    /// every fit, boundary or not, so the bit-identity dumps
+    /// (`validation/bit_identity/`) were re-pinned with it.
     pub fn blind_theta_and_bounds(&self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let n = self.n_theta();
         let mut theta = vec![THETA0; n];
-        let mut lower = vec![0.0; n];
+        let lower = vec![-THETA_HI; n];
         let upper = vec![THETA_HI; n];
         let diag = self.diagonal_theta();
         // Off-diagonal vech entries (primary AND every extra factor's Λ_g) get a
-        // blind start of 0 and a signed box; diagonals keep θ₀ = THETA0, box
-        // [0, HI]. q_g=1 extras are all-diagonal, so they are untouched.
-        for i in 0..n {
+        // blind start of 0; diagonals keep θ₀ = THETA0. q_g=1 extras are
+        // all-diagonal, so they are untouched.
+        for (i, t) in theta.iter_mut().enumerate() {
             if !diag.contains(&i) {
-                theta[i] = 0.0; // off-diagonal blind start
-                lower[i] = -THETA_HI; // signed box
+                *t = 0.0; // off-diagonal blind start
             }
         }
         (theta, lower, upper)
@@ -1044,10 +1078,9 @@ pub struct LmmWorkspace {
     pub solver: Bobyqa,
     /// θ in/out buffer for `minimize`; holds θ̂ (post-pin) after `fit_lmm`.
     pub theta: Vec<f64>,
-    /// Per-component box bounds. Diagonal entries: [0, THETA_HI].
+    /// Lower box bound, −THETA_HI on every entry (`blind_theta_and_bounds`).
     pub lower: Vec<f64>,
-    /// Upper box bound, always THETA_HI regardless of diagonal/off-diagonal
-    /// (see `lower` for the entry that carries the diagonal/off-diagonal split).
+    /// Upper box bound, THETA_HI on every entry.
     pub upper: Vec<f64>,
     /// REML dual-gradient scratch, built on the first derivative request for
     /// this workspace and reused thereafter. `None` on a workspace that never
@@ -1223,8 +1256,9 @@ pub fn primary_lambda<T: Scalar>(theta: &[T], q: usize, lam: &mut [T]) {
 pub(crate) fn canonicalize_pinned_blocks(g: &LmmGroupings, theta: &mut [f64]) -> bool {
     let mut changed = false;
     let mut start = 0usize;
-    // Same factor walk as `compute_diagonal_theta` / `fill_theta_row_scales`
-    // (primary, then each extra in declaration order) — change together.
+    // Same factor walk as `compute_diagonal_theta` / `fill_theta_row_scales` /
+    // `fix_column_signs` (primary, then each extra in declaration order) —
+    // change together.
     for &q in std::iter::once(&g.primary_q).chain(g.extra_q.iter()) {
         let len = q * (q + 1) / 2;
         // q == 1 has nothing below a diagonal to fold. Past MAX_PRIMARY_Q the
@@ -1238,6 +1272,101 @@ pub(crate) fn canonicalize_pinned_blocks(g: &LmmGroupings, theta: &mut [f64]) ->
         start += len;
     }
     changed
+}
+
+/// Sign canonicalization of a search endpoint: every block column whose
+/// diagonal is negative is negated whole — the diagonal and every entry
+/// below it in that column. The search box lets a diagonal go negative
+/// (`blind_theta_and_bounds` carries the reason); this restores the
+/// non-negative-diagonal Cholesky convention every reader of θ assumes.
+/// Σ = ΛΛᵀ is unchanged BIT for bit — each entry of Σ is a sum of products
+/// `Λ_rk·Λ_ck` over columns k, and `(−a)·(−b)` is the same double as `a·b` —
+/// so the deviance is unchanged too and nothing needs re-evaluating. Runs at
+/// every pin site on the raw endpoint, before the pin test, the canonical
+/// block and the SE pass. Returns whether any column was negated.
+///
+/// Same block walk as [`canonicalize_pinned_blocks`] and [`fix_mode_signs`] —
+/// change together. It
+/// needs no scratch, so unlike that one it has no block-width limit and
+/// covers the sparse route's wide blocks too.
+pub(crate) fn fix_column_signs(g: &LmmGroupings, theta: &mut [f64]) -> bool {
+    let mut changed = false;
+    let mut start = 0usize;
+    for &q in std::iter::once(&g.primary_q).chain(g.extra_q.iter()) {
+        // Column-major vech: column d of a q-wide block is the run of q − d
+        // entries starting at its diagonal.
+        let mut off = start;
+        for d in 0..q {
+            if theta[off] < 0.0 {
+                for v in theta[off..off + (q - d)].iter_mut() {
+                    *v = -*v;
+                }
+                changed = true;
+            }
+            off += q - d;
+        }
+        start += q * (q + 1) / 2;
+    }
+    changed
+}
+
+/// Companion of [`fix_column_signs`] for a GLMM's conditional modes. Call it on
+/// the same θ just BEFORE that one: it reads the diagonal signs that one clears.
+/// b = Λu, so negating column d of a block's Λ keeps b only if column d's u
+/// entries, at every level of that factor, are negated too. A mode solve
+/// warm-started from the result then starts next to the mode at the sign-fixed
+/// θ instead of at its mirror image — which on a link with more than one PIRLS
+/// basin (Gamma-inverse, `glmm::se`) can be a different mode.
+/// `primary_slope_major` picks the primary RE-column layout: the sparse path's
+/// `d·n_primary + level` (true) or the dense GLMM's `level·q_p + d` (false);
+/// extra groupings are level-major, `extra_offsets[decl] + level·q + d`, on
+/// both. Same block walk as [`fix_column_signs`] — change together.
+pub(crate) fn fix_mode_signs(
+    g: &LmmGroupings,
+    theta: &[f64],
+    u: &mut [f64],
+    primary_slope_major: bool,
+) {
+    let q_p = g.primary_q;
+    let mut off = 0usize;
+    for d in 0..q_p {
+        if theta[off] < 0.0 {
+            for lvl in 0..g.n_primary {
+                let c = if primary_slope_major {
+                    d * g.n_primary + lvl
+                } else {
+                    lvl * q_p + d
+                };
+                u[c] = -u[c];
+            }
+        }
+        off += q_p - d;
+    }
+    let nested = g.nested.map(|nf| {
+        (
+            nf.vech_start,
+            nf.q,
+            nf.decl,
+            g.n_primary * g.nested_per_parent,
+        )
+    });
+    let crossed = g
+        .crossed
+        .iter()
+        .map(|cf| (cf.vech_start, cf.q, cf.decl, cf.n_levels));
+    for (vech_start, q, decl, n_levels) in nested.into_iter().chain(crossed) {
+        let base = g.extra_offsets[decl];
+        let mut off = vech_start;
+        for d in 0..q {
+            if theta[off] < 0.0 {
+                for lvl in 0..n_levels {
+                    let c = base + lvl * q + d;
+                    u[c] = -u[c];
+                }
+            }
+            off += q - d;
+        }
+    }
 }
 
 /// One block of [`canonicalize_pinned_blocks`]: `vech` is that block's
@@ -2116,6 +2245,15 @@ fn fit_lmm_impl(
     // (signed slope covariances) are never pinned: a corr → ±1 boundary
     // presents as the *diagonal* λ_{dd} → 0 under the Cholesky
     // parameterization, so pinning the diagonal is the whole policy.
+    //
+    // Sign canonicalization first (`fix_column_signs`): the box lets a
+    // diagonal end negative, so a block column whose diagonal did is negated
+    // whole. Σ and the deviance are unchanged, and the pin test then sees
+    // non-negative diagonals. Mirror the three other pin sites — change
+    // together.
+    if has_endpoint {
+        fix_column_signs(&suff.groupings, theta);
+    }
     let diag = suff.groupings.diagonal_theta();
     let mut pinned = false;
     let mut pinned_components = 0u64;

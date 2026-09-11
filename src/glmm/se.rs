@@ -241,8 +241,16 @@ pub(crate) fn rx_cov_into(
 /// so its default devfun sits a smooth ~5.6e-4 above the true Laplace deviance
 /// (cbpp) and carries ~1% spurious θ/θβ curvature; its shipped vcov and
 /// numDeriv agree with each other because both differentiate that same lagged
-/// function. Our `log|A|` uses fully-converged weights — for canonical links
-/// W = μ(1−μ) at û is the exact η-Hessian, i.e. the textbook Laplace term.
+/// function. Our PIRLS exit lags too, on different terms: `pirls_solve_blocked`
+/// returns `dev` and `log|A|` at the iterate BEFORE the last Newton step and
+/// `‖u‖²` at the step's result. The lag is float noise here because canonical
+/// links converge quadratically and overshoot the tolerance — the last step
+/// moves u by ~1e-16 — and because the pinned re-eval starts PIRLS from the
+/// incumbent mode. Measured 2026-09-10 on a 180-block logistic factorial design,
+/// cold (u = 0) evals: ~2e-12 at a PIRLS tolerance of 1e-9 or 1e-7, 3e-10 at
+/// 1e-4, 2.5e-4 at 1e-3; lme4's default devfun is 0.049 off on the same design.
+/// With W at û, W = μ(1−μ) is the exact η-Hessian for canonical links, i.e. the
+/// textbook Laplace term.
 /// Supporting facts: H_ββ is exact (`rx_cov_into` matches lme4
 /// `vcov(use.hessian=FALSE)` to ~3.6e-6 method-matched), and the true θ↔β
 /// correction RAISES cbpp SEs above RX — as ours does; lme4's default-tol value

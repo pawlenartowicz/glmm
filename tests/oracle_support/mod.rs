@@ -255,7 +255,8 @@ pub mod divergence {
     pub struct Entry {
         pub id: String,
         pub dataset: String,
-        pub rung: u32,
+        /// `None` on an `m3_goldens` cell, which carries no manifest rung.
+        pub rung: Option<u32>,
         pub comparison: Vec<String>,
         pub quantities: Vec<String>,
         pub max_rel: f64,

@@ -200,20 +200,13 @@ pub(crate) fn lmm_run_on<'a>(
                 ..
             } = &mut *ws;
             if let Some(scratch) = dual_scratch.as_deref_mut() {
-                let g = &suff.groupings;
-                let diag = g.diagonal_theta();
                 let mut grad = vec![0.0; n_theta];
                 let st = crate::lmm::reml_gradient(&theta[..n_theta], suff, scratch, &mut grad);
                 if matches!(st, crate::glmm::DerivStatus::Ok(_)) {
                     let mut acc = 0.0_f64;
                     for j in 0..n_theta {
                         let gj = grad[j];
-                        let is_diag = diag.contains(&j);
-                        let (lo, hi) = if is_diag {
-                            (0.0, crate::lmm::THETA_HI)
-                        } else {
-                            (-crate::lmm::THETA_HI, crate::lmm::THETA_HI)
-                        };
+                        let (lo, hi) = (-crate::lmm::THETA_HI, crate::lmm::THETA_HI);
                         // Projected gradient on a box, in the internal θ̃ where the
                         // box lives; back-mapped by ×s_j (∂D/∂θ = s·∂D/∂θ̃) — see
                         // the GLMM twin for the derivation.

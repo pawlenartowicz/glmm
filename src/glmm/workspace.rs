@@ -114,21 +114,6 @@ pub struct GlmmWorkspace {
     /// plus the `ln θ_NB` bound on NB — see `params_stage1`.
     pub lower_stage1: Vec<f64>,
     pub upper_stage1: Vec<f64>,
-    /// Second stage-1 solver, same box and rho ladder as `solver_stage1` but at
-    /// `npt = n_stage1 + 2` — BOBYQA's minimum legal interpolation set. Drives the
-    /// pinned-exit re-run in `fit_glmm` (see the trap comment there). `None`
-    /// wherever that re-run cannot pay: off the `ExactProfile` route (stage 1 is
-    /// only an accelerant there, so its exit is not the fit's pin outcome), and
-    /// where the shipped `npt` already IS `n_stage1 + 2` — an identical config
-    /// from an identical start reproduces arm 1 exactly.
-    pub solver_stage1_alt: Option<Bobyqa>,
-    /// The re-run's own incumbent snapshots, twins of `u_seed` (len k) and
-    /// `beta_seed` (len p): the two arms are compared on deviance AFTER both
-    /// have run, so arm 1's latent state must survive arm 2 intact. Empty
-    /// unless `solver_stage1_alt` is `Some`.
-    pub u_seed_alt: Vec<f64>,
-    /// See `u_seed_alt`.
-    pub beta_seed_alt: Vec<f64>,
     /// Outer search route for this shape — see `OuterSearch`.
     pub outer_search: OuterSearch,
     // PIRLS scratch (sized max_n / k):
@@ -582,20 +567,6 @@ impl GlmmWorkspace {
         } else {
             OuterSearch::PqlThenJoint
         };
-        // Second stage-1 arm — see `solver_stage1_alt` and the trap comment in
-        // `fit_glmm`. Everything but `npt` is arm 1's config, `LMM_NPT_FORMULA`
-        // excepted: the campaign override steers arm 1 only, so a sweep still
-        // measures one interpolation rule at a time.
-        let npt_alt = n_stage1 + 2;
-        let solver_stage1_alt = (outer_search == OuterSearch::ExactProfile
-            && config_stage1.npt != npt_alt)
-            .then(|| {
-                let mut config_alt = config_stage1;
-                config_alt.npt = npt_alt;
-                Bobyqa::new(n_stage1, config_alt)
-                    .expect("BOBYQA config constants are valid by construction")
-            });
-        let alt_bufs = solver_stage1_alt.is_some();
 
         GlmmWorkspace {
             groupings,
@@ -640,9 +611,6 @@ impl GlmmWorkspace {
             params_stage1,
             lower_stage1,
             upper_stage1,
-            solver_stage1_alt,
-            u_seed_alt: vec![0.0; if alt_bufs { k.max(1) } else { 0 }],
-            beta_seed_alt: vec![0.0; if alt_bufs { p } else { 0 }],
             outer_search,
             eta: vec![0.0; max_n],
             prob: vec![0.0; max_n],

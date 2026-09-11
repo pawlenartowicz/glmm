@@ -3834,3 +3834,205 @@ fn lmm_dual_call_cost_table() {
         }
     }
 }
+
+/// `fix_column_signs`: a block column whose diagonal is negative is negated
+/// whole, so the fixed θ has non-negative diagonals and the SAME Σ = ΛΛᵀ to
+/// the bit (every entry of Σ is a sum of products of two entries from one
+/// column, and `(−a)·(−b)` is the double `a·b`). A θ with no negative
+/// diagonal comes back bit-identical and reports no change.
+#[test]
+fn fix_column_signs_restores_nonnegative_diagonals_and_keeps_sigma_to_the_bit() {
+    let sizing = Sizing::FixedClusters { n_clusters: 4 };
+    let base = intercept_only_spec(sizing);
+
+    // q_p = 2, vech(Λ) = [λ00, λ10, λ11]: both diagonals negative.
+    let mut spec2 = base.clone();
+    spec2.re.as_mut().unwrap().slopes.push(1);
+    let g2 = LmmGroupings::from_cluster_spec(&spec2, 40, &[1]);
+    let mut th2 = [-0.7, 0.3, -0.5];
+    let sig2 = sigma_vech(&th2, 2);
+    assert!(fix_column_signs(&g2, &mut th2));
+    assert_eq!(th2, [0.7, -0.3, 0.5]);
+    for (got, want) in sigma_vech(&th2, 2).iter().zip(&sig2) {
+        assert_eq!(got.to_bits(), want.to_bits());
+    }
+    let again = th2;
+    assert!(!fix_column_signs(&g2, &mut th2));
+    assert_eq!(th2, again);
+
+    // q_p = 3, vech(Λ) = [λ00, λ10, λ20, λ11, λ21, λ22]: columns 1 and 2
+    // negative, column 0 left alone.
+    let mut spec3 = base.clone();
+    spec3.re.as_mut().unwrap().slopes.push(1);
+    spec3.re.as_mut().unwrap().slopes.push(2);
+    let g3 = LmmGroupings::from_cluster_spec(&spec3, 40, &[1, 2]);
+    let mut th3 = [0.5, -0.2, 0.1, -0.4, 0.3, -0.6];
+    let sig3 = sigma_vech(&th3, 3);
+    assert!(fix_column_signs(&g3, &mut th3));
+    assert_eq!(th3, [0.5, -0.2, 0.1, 0.4, -0.3, 0.6]);
+    for (got, want) in sigma_vech(&th3, 3).iter().zip(&sig3) {
+        assert_eq!(got.to_bits(), want.to_bits());
+    }
+
+    // No negative diagonal ⇒ strict no-op, bit-for-bit.
+    let mut th_live = [1.3, -0.37, 0.9, 0.2, -0.1, 0.4];
+    let before = th_live;
+    assert!(!fix_column_signs(&g3, &mut th_live));
+    for (a, b) in th_live.iter().zip(&before) {
+        assert_eq!(a.to_bits(), b.to_bits());
+    }
+}
+
+/// `fix_mode_signs`: the u entries of each block column with a negative
+/// diagonal are negated at every level of that factor, on both primary
+/// layouts, and nothing else moves. The expected indices are written out for
+/// two small shapes — 5 primary levels with a slope (primary width 10), then a
+/// crossed extra with 4 levels or a nested extra with 3 children per parent,
+/// each with a slope — not recomputed from the layout formulas.
+#[test]
+fn fix_mode_signs_negates_the_modes_of_negative_columns() {
+    let spec = |relation: GroupingRelation| ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 5 },
+            slopes: vec![1],
+            extra_groupings: vec![Grouping {
+                relation,
+                slopes: vec![1],
+            }],
+        }),
+    };
+    let check = |g: &LmmGroupings, theta: &[f64], slope_major: bool, negated: &[usize]| {
+        let mut u: Vec<f64> = (1..=g.k_total).map(|i| i as f64).collect();
+        fix_mode_signs(g, theta, &mut u, slope_major);
+        for (i, &v) in u.iter().enumerate() {
+            let plain = (i + 1) as f64;
+            let want = if negated.contains(&i) { -plain } else { plain };
+            assert_eq!(v, want, "u[{i}], slope_major = {slope_major}");
+        }
+    };
+
+    // Crossed, θ = [primary λ00 λ10 λ11 | crossed λ00 λ10 λ11]: primary
+    // column 0 and crossed column 1 negative.
+    let gc = LmmGroupings::from_cluster_spec_ext(
+        &spec(GroupingRelation::Crossed { n_clusters: 4 }),
+        60,
+        &[1],
+        &[vec![1]],
+    );
+    assert_eq!((gc.k_total, gc.extra_offsets.as_slice()), (18, &[10][..]));
+    let th = [-0.7, 0.2, 0.5, 0.6, 0.1, -0.4];
+    check(&gc, &th, false, &[0, 2, 4, 6, 8, 11, 13, 15, 17]);
+    check(&gc, &th, true, &[0, 1, 2, 3, 4, 11, 13, 15, 17]);
+
+    // Nested, same θ layout: primary column 1 and nested column 0 negative.
+    let gn = LmmGroupings::from_cluster_spec_ext(
+        &spec(GroupingRelation::NestedWithin { n_per_parent: 3 }),
+        60,
+        &[1],
+        &[vec![1]],
+    );
+    assert_eq!((gn.k_total, gn.extra_offsets.as_slice()), (40, &[10][..]));
+    let th = [0.7, 0.2, -0.5, -0.6, 0.1, 0.4];
+    let nested_col0 = [10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38];
+    check(
+        &gn,
+        &th,
+        false,
+        &[&[1, 3, 5, 7, 9][..], &nested_col0].concat(),
+    );
+    check(
+        &gn,
+        &th,
+        true,
+        &[&[5, 6, 7, 8, 9][..], &nested_col0].concat(),
+    );
+}
+
+/// A search that exits with a negative diagonal, and the exit sign fix on it.
+/// `tests/fixtures/sign_trap_lmm_dense_slope.csv` is a simulated Gaussian
+/// draw from the 2026-09-10 sign-trap simulation study: `y ~ x1 +
+/// (1 + x1 | g1)`, 300 rows, 30 groups, random-slope SD 0.05, dense LMM
+/// route. The raw BOBYQA endpoint under the
+/// signed box (`blind_theta_and_bounds`) carries a negative diagonal; the
+/// fixed θ has non-negative diagonals and the same REML deviance to the bit,
+/// and it is exactly the θ̂ `fit_lmm` reports (no diagonal is near the pin
+/// here, so the pin and the canonical block do nothing).
+#[test]
+fn fit_lmm_negative_diagonal_exit_is_sign_fixed_without_moving_the_deviance() {
+    let csv = include_str!("../../tests/fixtures/sign_trap_lmm_dense_slope.csv");
+    let mut y = Vec::<f64>::new();
+    let mut x1 = Vec::<f64>::new();
+    let mut g_raw = Vec::<String>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        x1.push(f[1].parse().unwrap());
+        g_raw.push(f[2].to_string());
+    }
+    let n = y.len();
+    let mut labels: Vec<&str> = g_raw.iter().map(String::as_str).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    let ids: Vec<u32> = g_raw
+        .iter()
+        .map(|l| labels.iter().position(|x| x == l).unwrap() as u32)
+        .collect();
+    let mut x = Mat::<f64>::zeros(n, 2);
+    for i in 0..n {
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = x1[i];
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: labels.len() as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    // Mirror `fit::lmm::lmm_run_on`: scales first, then the rows.
+    let build = || {
+        let mut ws = LmmWorkspace::for_cluster_spec(2, &model, n, &[1]);
+        ws.suff.groupings.set_slope_scales(x.as_ref(), None);
+        ws.suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
+        ws
+    };
+
+    // The raw search, exactly as `fit_lmm` drives it.
+    let mut ws1 = build();
+    let LmmWorkspace {
+        solver,
+        suff,
+        fit,
+        theta,
+        lower,
+        upper,
+        ..
+    } = &mut ws1;
+    let mut raw = theta.clone();
+    let out = solver.minimize(|t| reml_deviance(t, suff, fit), &mut raw, lower, upper);
+    assert!(matches!(out.status, Status::Converged), "{:?}", out.status);
+    let diag = suff.groupings.diagonal_theta();
+    assert!(
+        diag.iter().any(|&i| raw[i] < 0.0),
+        "the search must exit with a negative diagonal on this draw, got {raw:?}"
+    );
+    let d_raw = reml_deviance(&raw, suff, fit);
+    let mut fixed = raw.clone();
+    assert!(fix_column_signs(&suff.groupings, &mut fixed));
+    assert!(diag.iter().all(|&i| fixed[i] >= 0.0), "{fixed:?}");
+    assert_eq!(reml_deviance(&fixed, suff, fit).to_bits(), d_raw.to_bits());
+
+    // The shipped fit reports that fixed θ, bit for bit.
+    let mut ws2 = build();
+    let f = fit_lmm(&mut ws2, &[0, 1], None);
+    assert!(f.converged);
+    assert_eq!(f.boundary_hit, 0, "no component pins on this draw");
+    for (a, b) in ws2.theta.iter().zip(&fixed) {
+        assert_eq!(a.to_bits(), b.to_bits(), "θ̂ {:?} vs {fixed:?}", ws2.theta);
+    }
+    assert_eq!(f.deviance.to_bits(), d_raw.to_bits());
+}

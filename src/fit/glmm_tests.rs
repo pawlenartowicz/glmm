@@ -5,8 +5,8 @@ use super::*;
 use crate::glmm::{build_z, glmm_laplace_deviance, GlmmWorkspace, OuterSearch, StructuredSchur};
 use crate::test_support::assert_near;
 use crate::{
-    BinomialLink, Family, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing,
-    StartValues, WaldSe,
+    BinomialLink, Family, GroupIds, Grouping, GroupingRelation, ModelSpec, PoissonLink,
+    ReStructure, Sizing, StartValues, WaldSe,
 };
 use faer::Mat;
 
@@ -2768,11 +2768,19 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
     // θ̂, for the same reason as `sim_nb`'s second re-pin (the moment seed
     // charges the RE variance to the dispersion, which breaks random-slope NB
     // shapes elsewhere in the corpus). That move was 1.79e-4 relative on θ̂,
-    // still inside the bracket's own resolution.
-    const REF_BETA_PIN: [f64; 2] = [0.5849198389846797, 0.5073583977812322];
-    const REF_SE_PIN: [f64; 2] = [0.20484603992926306, 0.053993175017998295];
-    const REF_TAU2_PIN: [f64; 2] = [0.39577064162133146, 0.12619524118998068];
-    const REF_THETA_PIN: f64 = 1.4301256222511467;
+    // still inside the bracket's own resolution. Third (2026-09-10): every
+    // θ coordinate is boxed [−THETA_HI, THETA_HI] (`blind_theta_and_bounds`).
+    // This fixture has no off-diagonal, so no sign is in play, but the box
+    // changes BOBYQA's interpolation set and trust-region steps on every
+    // fit. The deviance moved DOWN by 8.6e-3 (605.667764 → 605.659188, 94 →
+    // 110 evaluations, both converged, KKT norm 9.9e-3 → 8.8e-3): the old
+    // endpoint was the less converged one on the flat ln θ_NB direction.
+    // θ̂ moved 3.6e-5 relative, β[0] 2.3e-4, and β̂ sits closer to lme4's
+    // (`REF_BETA`) than before.
+    const REF_BETA_PIN: [f64; 2] = [0.5850540080177592, 0.5073813410114352];
+    const REF_SE_PIN: [f64; 2] = [0.20484834476932942, 0.053993931676619006];
+    const REF_TAU2_PIN: [f64; 2] = [0.39581383779083495, 0.1261544293365773];
+    const REF_THETA_PIN: f64 = 1.4300734514802722;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb_nested pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb_nested pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb_nested pinned tau2");
@@ -3442,24 +3450,25 @@ fn fit_glmm_binomial_no_cluster_signal_is_singular() {
     );
 }
 
-/// The ρ = −1 trap: a `ExactProfile` stage-1 search that stops on the singular
-/// circle Λ_jj = 0, a full deviance unit's sixth above the optimum, and the
-/// pinned-exit re-run at `npt = n + 2` that walks out of it (`fit_glmm`'s trap
-/// comment carries the mechanism).
-///
+/// The ρ = −1 trap on a 3-term block, dense GLMM `ExactProfile` route.
 /// `tests/fixtures/glmm_npt_trap.csv` is one 800-row Bernoulli draw —
 /// `y ~ x1 + x2 + (1 + x1 + x2 | g)`, 40 clusters × 20 rows, true RE
 /// correlation ≈ −0.76 between the intercept and `x1`. Nothing in the 48-rung
-/// validation corpus exits at a boundary, so without this fixture the whole
-/// re-run path would be untested in-crate.
+/// validation corpus exits at a boundary, so without this fixture the trap
+/// mechanism would be untested in-crate on this route.
 ///
-/// The two constants are the two basins, both reproduced by this fixture before
-/// the re-run landed: the shipped interpolation set stops at 910.3787 with the
-/// `x1` diagonal pinned, `npt = n + 2` reaches 910.2127 with the `x2` diagonal
-/// pinned instead. lme4 on the same draw: 910.2151 by default and 910.3823 with
-/// `nAGQ0initStep = FALSE` — the same two basins, so this is a property of the
-/// surface, not of one optimizer. `DEV_BAND` is loose because only the basin is
-/// being asserted; the gap between the basins is 170× it.
+/// With the diagonal θ boxed at `[0, THETA_HI]` the search stopped on the face
+/// Λ_jj = 0 at 910.3787 with the `x1` diagonal pinned and the entries below
+/// it of the wrong sign — a first-order stationary point of the boxed
+/// problem, since Σ = ΛΛᵀ is even in each block column and the two sign
+/// halves meet only on that face. Under the signed box
+/// (`blind_theta_and_bounds`) the face is an interior point and the search
+/// walks through it to 910.2127 in one search of 148 evaluations (the
+/// retired `npt = n + 2` re-run reached the same basin at 284). lme4 on the
+/// same draw: 910.2151 by default and 910.3823 with `nAGQ0initStep = FALSE`
+/// — the same two basins, so this is a property of the surface, not of one
+/// optimizer. `DEV_BAND` is loose because only the basin is being asserted;
+/// the gap between the basins is 170× it.
 ///
 /// The RE stddevs, not the pinned-component flags, are what identifies the
 /// basin here. Which diagonal reads as pinned is not stable: the escaped
@@ -3470,7 +3479,7 @@ fn fit_glmm_binomial_no_cluster_signal_is_singular() {
 /// relabelling and separate the two basins by 8–23%, and they also reproduce
 /// lme4's `0.89153 / 0.10321 / 0.23743` on this draw to 0.1%.
 #[test]
-fn fit_glmm_pinned_exit_rerun_escapes_the_singular_circle() {
+fn fit_glmm_signed_box_escapes_the_singular_circle() {
     const DEV_BAND: f64 = 1e-3;
     const SD_BAND: f64 = 5e-3;
     const TRAPPED_DEVIANCE: f64 = 910.3787035640;
@@ -3539,7 +3548,7 @@ fn fit_glmm_pinned_exit_rerun_escapes_the_singular_circle() {
     );
     assert!(
         f.deviance < TRAPPED_DEVIANCE - DEV_BAND,
-        "the re-run must beat the shipped-npt arm, got {} vs {TRAPPED_DEVIANCE}",
+        "the signed box must beat the boxed search's face, got {} vs {TRAPPED_DEVIANCE}",
         f.deviance
     );
     assert_pinned(
@@ -3547,6 +3556,140 @@ fn fit_glmm_pinned_exit_rerun_escapes_the_singular_circle() {
         &[0.8922556154657538, 0.10371641873371715, 0.23757089840392914],
         SD_BAND,
         "trap draw stddev",
+    );
+}
+
+/// One measured sign-trap draw per dense GLMM route shape, each a simulated
+/// 300-row draw (30 groups × 10 rows, `g1` the one grouping column) frozen
+/// as a fixture from the 2026-09-10 sign-trap simulation study. `stopped` is
+/// where the search
+/// ended with the diagonal θ boxed at `[0, THETA_HI]` — a diagonal on the
+/// face Λ_jj = 0 with entries below it of the wrong sign, or, on the
+/// "walk-back" and "empty-column" draws, a stop the retired flip / push /
+/// kick re-runs were needed for — and `reached` is what the signed box
+/// reaches in one search. Both are asserted: the fit must land within
+/// `DEV_BAND` of `reached` and below `stopped` by more than `DEV_BAND`.
+/// Convergence, not just the deviance, is checked on every draw.
+#[cfg(feature = "formula")]
+fn assert_sign_trap_escaped(
+    what: &str,
+    csv: &str,
+    formula: &str,
+    family: Family,
+    nagq: u8,
+    stopped: f64,
+    reached: f64,
+) {
+    const DEV_BAND: f64 = 1e-3;
+    let lo = super::common_tests::fixture_lowered(csv, &["g1"], formula, family);
+    let opts = FitOptions {
+        nagq,
+        ..lo.opts.clone()
+    };
+    let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &opts);
+    assert!(
+        f.converged(),
+        "{what}: must converge ({:?})",
+        f.diagnostics.boundary
+    );
+    let dev = -2.0 * f.loglik;
+    assert!(
+        (dev - reached).abs() < DEV_BAND,
+        "{what}: −2·loglik {dev} is not the escaped basin {reached} (boxed search stopped at {stopped}; {} evaluations)",
+        f.n_eval
+    );
+    assert!(
+        dev < stopped - DEV_BAND,
+        "{what}: −2·loglik {dev} does not beat the boxed search's stop {stopped}"
+    );
+}
+
+/// Dense GLMM `ExactProfile`: Bernoulli `y ~ x1 + (1 + x1 | g1)`, generated
+/// with a zero random-slope SD. Boxed, the search stopped on Λ₀₀ = 0 with
+/// λ₁₀ = 0.094 (internal) below it, deviance 397.6085, the intercept pinned
+/// (57 evaluations, 105 with the retired re-run); the signed box reaches
+/// 397.4577 in 55, with the slope diagonal at the pin instead.
+#[cfg(feature = "formula")]
+#[test]
+fn fit_glmm_sign_trap_dense_exact_profile() {
+    assert_sign_trap_escaped(
+        "dense ExactProfile",
+        include_str!("../../tests/fixtures/sign_trap_glmm_dense_slope.csv"),
+        "y ~ x1 + (1 + x1 | g1)",
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        1,
+        397.6085441897,
+        397.4576798411,
+    );
+}
+
+/// Dense GLMM `Joint` under AGQ (nAGQ = 3 on a 3-term block, the vector
+/// kernel): Bernoulli `y ~ x1 + x2 + (1 + x1 + x2 | g1)`, generated with a
+/// rank-1 random-effect covariance. Boxed, the search stopped at 387.3085 in
+/// 270 evaluations; the signed box
+/// reaches 387.2703 in 316. lme4 refuses nAGQ > 1 on a vector random effect,
+/// so this shape has no external reference — the two basins are glmm's own.
+#[cfg(feature = "formula")]
+#[test]
+fn fit_glmm_sign_trap_dense_joint_agq() {
+    assert_sign_trap_escaped(
+        "dense Joint AGQ",
+        include_str!("../../tests/fixtures/sign_trap_glmm_agq_q3.csv"),
+        "y ~ x1 + x2 + (1 + x1 + x2 | g1)",
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        3,
+        387.3084738547,
+        387.2702811551,
+    );
+}
+
+/// The walk-back case: Poisson `y ~ x1 + x2 + (1 + x1 + x2 | g1)`, generated
+/// with a rank-1 random-effect covariance, dense `ExactProfile`. Boxed, the
+/// first search stopped
+/// at 998.0913 with the `x1` diagonal on the face and both entries below it
+/// non-zero; a flipped warm start alone did not reach the optimum (it needed
+/// the diagonal pushed off the face first). The signed box reaches 994.7496
+/// in 211 evaluations (368 with the retired re-run).
+#[cfg(feature = "formula")]
+#[test]
+fn fit_glmm_sign_trap_walk_back() {
+    assert_sign_trap_escaped(
+        "walk-back",
+        include_str!("../../tests/fixtures/sign_trap_glmm_walkback_q3.csv"),
+        "y ~ x1 + x2 + (1 + x1 + x2 | g1)",
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        1,
+        998.0913393396,
+        994.7495903063,
+    );
+}
+
+/// The empty-column case: Bernoulli, same formula as the walk-back draw,
+/// generated with random-effect correlations of 0.95. Boxed, the first
+/// search stopped at 384.1806 with the
+/// `x1` diagonal on the face and nothing below it to flip (both entries at
+/// or under the pin threshold), so no sign-flip re-run could move it. The
+/// signed box reaches 384.0195 in 110 evaluations (189 with the retired
+/// re-run).
+#[cfg(feature = "formula")]
+#[test]
+fn fit_glmm_sign_trap_empty_column() {
+    assert_sign_trap_escaped(
+        "empty column",
+        include_str!("../../tests/fixtures/sign_trap_glmm_emptycol_q3.csv"),
+        "y ~ x1 + x2 + (1 + x1 + x2 | g1)",
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        1,
+        384.1806428649,
+        384.0194701453,
     );
 }
 

@@ -1231,6 +1231,12 @@ pub(crate) fn fit_glmm_sparse(
     let mut pinned = false;
     let mut pinned_components = 0u64;
     if ok {
+        // Sign canonicalization first (mirror `fit_lmm`, `src/lmm/mod.rs` —
+        // change together): Σ and the deviance are unchanged. The modes the
+        // pinned re-eval starts from flip with their columns first
+        // (`fix_mode_signs`; this path's primary layout is slope-major).
+        crate::lmm::fix_mode_signs(&g, &params[..n_theta], &mut ws.u, true);
+        crate::lmm::fix_column_signs(&g, &mut params[..n_theta]);
         for (kk, &ti) in g.diagonal_theta().iter().enumerate() {
             if params[ti] <= crate::lmm::PIN_THETA {
                 params[ti] = 0.0;

@@ -66,14 +66,6 @@ pub const PIRLS_MAX_ITERS: usize = 50;
 /// minimum. Dense PIRLS and the blocked/structured sparse solve steps don't hit
 /// this regime and converge well inside the cap.
 pub const PIRLS_MAX_HALVINGS: usize = 16;
-/// Relative deviance margin the pinned-exit stage-1 re-run must clear before its
-/// θ̂ replaces the first arm's (see the trap comment in [`fit_glmm`]). Two arms
-/// that land on the same optimum agree to round-off, and adopting either one of
-/// those would move a fit's reported last digits for no gain; 1e-8 relative sits
-/// far above that round-off and far below the ~0.04–1.5 deviance gaps the
-/// re-run exists to close.
-pub(crate) const STAGE1_RERUN_MARGIN: f64 = 1e-8;
-
 /// The shapes whose stage-1 Profile solve is the EXACT Laplace β-profile and whose
 /// outer search is therefore θ-only (`OuterSearch::ExactProfile`): Laplace, a data
 /// term that is the plain deviance, and a PIRLS variant carrying the exact border —
@@ -365,10 +357,11 @@ pub fn fit_glmm(
     // γ₀ = [θ₀ | β₀].
     match theta_start {
         Some(ts) => {
-            // Floor is diagonal-only: diagonals are boxed [0, THETA_HI] so 0 is
-            // their edge; off-diagonals are boxed [-THETA_HI, THETA_HI] where 0 is
-            // mid-range, so flooring them would silently rewrite a negative
-            // correlation start. lme4 passes `start$theta` through verbatim.
+            // Floor is diagonal-only: a caller's θ is a Cholesky factor, so its
+            // diagonals are non-negative and the floor only keeps them off the
+            // pin threshold; off-diagonals are signed, so flooring them would
+            // silently rewrite a negative correlation start. lme4 passes
+            // `start$theta` through verbatim.
             // A caller's θ is in the design's own units; the solver works on the
             // internally scaled θ̃ = s·θ (`LmmGroupings::set_slope_scales`), so the
             // forward map runs before the floor — which then floors the INTERNAL
@@ -483,9 +476,6 @@ pub fn fit_glmm(
     let GlmmWorkspace {
         solver,
         solver_stage1,
-        solver_stage1_alt,
-        u_seed_alt,
-        beta_seed_alt,
         params,
         params_stage1,
         lower_stage1,
@@ -603,16 +593,9 @@ pub fn fit_glmm(
         }
         beta_prof[..p].copy_from_slice(&params[n_theta..n_theta + p]); // β₀ (GLM warm start)
         beta_seed[..p].copy_from_slice(&beta_prof[..p]);
-        // The blind start, kept because the search overwrites `params_stage1` in
-        // place and the second arm below must start from the same point.
-        let n_stage1 = n_theta + n_nb;
-        let mut start_stage1 = [0.0_f64; crate::consts::MAX_THETA + 1];
-        start_stage1[..n_stage1].copy_from_slice(&params_stage1[..n_stage1]);
-        // Named rather than passed inline so the second arm can drive the same
-        // objective again. The incumbent state — best value, finite-evaluation
-        // count and the û/β̂ snapshots — is per-ARM and therefore passed in
-        // rather than captured: the two arms are scored against each other only
-        // after both have run, so neither may overwrite the other's.
+        // The incumbent state — best value, finite-evaluation count and the
+        // û/β̂ snapshots — is passed in rather than captured so the closure
+        // borrows only the PIRLS buffers.
         let mut stage1_obj = |theta: &[f64],
                               best: &mut f64,
                               finite: &mut usize,
@@ -721,7 +704,7 @@ pub fn fit_glmm(
             counters.record_eval(crate::counters::Stage::One, obj);
             obj
         };
-        let mut out1 = solver_stage1.minimize(
+        let out1 = solver_stage1.minimize(
             |theta| {
                 stage1_obj(
                     theta,
@@ -735,86 +718,6 @@ pub fn fit_glmm(
             lower_stage1,
             upper_stage1,
         );
-        // The ρ = −1 trap. Where a diagonal Λ_jj sits at 0 the entries BELOW it
-        // in that column are unidentified, so BOBYQA's interpolation model is
-        // singular along that whole circle and its trust region collapses before
-        // the search can walk off it — the exit is genuinely first-order
-        // stationary and can still sit a deviance unit or more above what a
-        // search that never entered the circle reaches, so nothing local
-        // (KKT norm, boundary certificate) tells the two apart. A different
-        // interpolation set from the same start walks a different path. So on a
-        // pinned exit, and only where stage 1 IS the whole search, run stage 1
-        // once more at `npt = n + 2` — BOBYQA's minimum legal set and
-        // minqa's (hence lme4's) own default, not a tuned constant — and keep
-        // whichever arm scored lower on the SAME objective, which makes a
-        // regression impossible by construction. The strict relative margin is
-        // what keeps a tie from moving an existing fit's last digits. Measured
-        // on the binary GLMM with intercept and two random slopes
-        // (`tests/fixtures/glmm_npt_trap.csv`) 2026-09-08: +0 evaluations across
-        // the 48-rung validation grid (no rung exits pinned), 4 of 4 bad draws
-        // fixed, none worsened.
-        //
-        // The gate is the pin loop's own first test, run here on the raw θ̂:
-        // canonicalization can move WHICH component is pinned but never clears
-        // the flag, since `canonicalize_block` returns unchanged unless a
-        // diagonal is already at the threshold and a lower-triangular Λ with a
-        // zeroed diagonal is rank-deficient, so its canonical factor keeps a
-        // zero diagonal.
-        if route == OuterSearch::ExactProfile {
-            if let Some(alt) = solver_stage1_alt.as_mut() {
-                let arm1_ok = matches!(out1.status, Status::Converged)
-                    && best1.is_finite()
-                    && finite_evals1 >= 2;
-                let arm1_pinned = arm1_ok
-                    && groupings
-                        .diagonal_theta()
-                        .iter()
-                        .any(|&ti| params_stage1[ti] <= PIN_THETA);
-                if arm1_pinned {
-                    let mut theta_alt = [0.0_f64; crate::consts::MAX_THETA + 1];
-                    theta_alt[..n_stage1].copy_from_slice(&start_stage1[..n_stage1]);
-                    // Same blind latent seeds arm 1 began from (û = 0, β₀), so
-                    // the two arms differ in the interpolation set alone.
-                    for v in u_seed_alt[..k].iter_mut() {
-                        *v = 0.0;
-                    }
-                    beta_seed_alt[..p].copy_from_slice(&params[n_theta..n_theta + p]);
-                    let mut best_alt = f64::INFINITY;
-                    let mut finite_alt = 0usize;
-                    let out_alt = alt.minimize(
-                        |theta| {
-                            stage1_obj(
-                                theta,
-                                &mut best_alt,
-                                &mut finite_alt,
-                                &mut u_seed_alt[..],
-                                &mut beta_seed_alt[..],
-                            )
-                        },
-                        &mut theta_alt[..n_stage1],
-                        lower_stage1,
-                        upper_stage1,
-                    );
-                    // Adopted only on the same convergence bar arm 1 had to
-                    // clear: a lower value reached by a search that never
-                    // converged is not a better answer, it is an unfinished one.
-                    let arm_alt_ok = matches!(out_alt.status, Status::Converged)
-                        && best_alt.is_finite()
-                        && finite_alt >= 2;
-                    if arm_alt_ok && best_alt < best1 - STAGE1_RERUN_MARGIN * best1.abs() {
-                        params_stage1[..n_stage1].copy_from_slice(&theta_alt[..n_stage1]);
-                        u_seed[..k].copy_from_slice(&u_seed_alt[..k]);
-                        beta_seed[..p].copy_from_slice(&beta_seed_alt[..p]);
-                        best1 = best_alt;
-                        finite_evals1 = finite_alt;
-                        out1.f = out_alt.f;
-                        out1.status = out_alt.status;
-                    }
-                    // Both arms are search evaluations of this fit.
-                    out1.n_eval += out_alt.n_eval;
-                }
-            }
-        }
         // On `PqlThenJoint`, non-convergence does NOT fail the fit — stage 1 is an
         // accelerant, and the joint polish below proceeds from wherever the
         // incumbent landed (worst case = the cold start). On `ExactProfile`
@@ -965,8 +868,18 @@ pub fn fit_glmm(
     }
     let nb_theta = ws.nb_theta;
 
-    // Per-component diagonal pin (β never pins). `diag` borrows ws.groupings; the
-    // loop mutates the disjoint field ws.params, so no clone is needed.
+    // Sign canonicalization first, then the per-component diagonal pin (β never
+    // pins) — mirror `fit_lmm`, `src/lmm/mod.rs`; change together. `diag`
+    // borrows ws.groupings; the loop mutates the disjoint field ws.params, so
+    // no clone is needed.
+    if ok {
+        // The modes flip with their columns (`fix_mode_signs`), before the θ
+        // flip clears the signs that reads: `ws.u` seeds the gradient's mode
+        // solve below, `ws.u_seed` the pinned re-eval.
+        crate::lmm::fix_mode_signs(&ws.groupings, &ws.params[..n_theta], &mut ws.u, false);
+        crate::lmm::fix_mode_signs(&ws.groupings, &ws.params[..n_theta], &mut ws.u_seed, false);
+        crate::lmm::fix_column_signs(&ws.groupings, &mut ws.params[..n_theta]);
+    }
     let diag = ws.groupings.diagonal_theta();
     let mut pinned_components = 0u64;
     let mut pinned = false;
@@ -1113,16 +1026,10 @@ pub fn fit_glmm(
             let mut sc = [0.0_f64; crate::consts::MAX_THETA];
             let sc = &mut sc[..n_theta];
             ws.groupings.fill_theta_row_scales(sc);
-            let diag = ws.groupings.diagonal_theta();
             let mut acc = 0.0_f64;
             for j in 0..n_theta {
                 let gj = g[j];
-                let is_diag = diag.contains(&j);
-                let (lo, hi) = if is_diag {
-                    (0.0, crate::lmm::THETA_HI)
-                } else {
-                    (-crate::lmm::THETA_HI, crate::lmm::THETA_HI)
-                };
+                let (lo, hi) = (-crate::lmm::THETA_HI, crate::lmm::THETA_HI);
                 // Projected gradient on a box: at a bound, only the component
                 // pointing back INTO the box is a violation. Done in the
                 // INTERNAL θ̃, because that is where the box the optimizer

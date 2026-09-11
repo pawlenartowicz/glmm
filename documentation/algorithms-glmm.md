@@ -105,8 +105,10 @@ scoring on the penalized likelihood. The RE design is the scaled `M = ZΛ_θ`, a
 the penalty adds a `+I` ridge; this is the standard `nAGQ=1` reparameterization,
 under which the prior is `u ~ N(0, I)`. Each iteration forms `A = MᵀWM + I` and
 the IRLS right-hand side `Mᵀ(W·Mu + (y − μ))`, then takes the next `u` from a
-Cholesky solve of `A`. `log|A|` is read off that same converged factor, so the
-deviance term needs no re-factorization. Three variants handle the RE
+Cholesky solve of `A`. `log|A|` is read off that same factor, so the
+deviance term needs no re-factorization. The factor is built from W at the
+iterate the last step started from, not at the returned `u` — see
+[§Laplace approximation](#laplace-approximation). Three variants handle the RE
 structure:
 
 - **Blocked** (no extra groupings): `A` is block-diagonal, one `q_p×q_p` block
@@ -228,10 +230,18 @@ The `nAGQ=1` marginal objective is the Laplace deviance
 `+I` is the same ridge the penalty `‖ũ‖²` carries. Concretely the return is
 `data_term + pen + 2·logdet` — `logdet` accumulates `Σ ln L_ii` off the
 Cholesky factor, i.e. `½·log|A|`, so `2·logdet` *is* the `log|A|` of the
-formula. For binomial and Poisson the data term is the bare deviance `D`
-(`glmer` substitutes the family `aic = D + const`, same minimizer, kept as `D`
-for byte-identity). **Gamma** is the sole exception: its data term is
-`family::gamma_aic`, which profiles the dispersion as `D/n` (`D/Σwᵢ` when
+formula. At a PIRLS exit these terms come from two iterates, the same pairing
+as the stopping rule's `mixed`: `data_term` and `logdet` from uⱼ, the point the
+last step started from, and `pen` from uⱼ₊₁, the returned mode. The gap to the
+objective rebuilt entirely at uⱼ₊₁ is float noise at the shipped tolerance: a
+canonical-link last step moves u by ~1e-16, and the outer search seeds PIRLS
+from a converged mode ([§Warm starts](#warm-starts-and-workspace-reuse)).
+`glmer` pairs the terms differently — its deviance and penalty sit at the new
+mode and only `log|A|` lags one iteration. For binomial and Poisson the data
+term is the bare deviance `D` (`glmer` substitutes the family
+`aic = D + const`, same minimizer, kept as `D` for byte-identity). **Gamma**
+is the sole exception: its data term is `family::gamma_aic`, which profiles
+the dispersion as `D/n` (`D/Σwᵢ` when
 weighted), making the objective a nonlinear function of `D` — the only route by
 which dispersion shifts `glmer`'s β̂/τ̂. No σ² scale enters the binomial/Poisson
 objective (dispersion fixed at 1). Non-convergence or a Cholesky failure
@@ -406,7 +416,15 @@ lme4/`glmer`'s own initialization — and θ from the blind `THETA0`. Within a
 fit, `u_seed` holds the conditional-mode warm start incumbent, but it is
 **reset to 0 at the start of every `fit_glmm`** and never carried across fits — a
 cross-fit carry is deliberately rejected (it would break same-seed
-reproducibility).
+reproducibility). Every outer-search objective evaluation, in either stage,
+starts PIRLS from `u_seed` rather than from 0, and copies its mode back into
+`u_seed` only on a strict improvement, so `u_seed` is always the mode at the
+best point so far. The pinned γ̂ re-evaluation starts from it too. Its PIRLS
+therefore begins at (or, after a pin, next to) a converged mode, and the
+reported deviance carries no measurable gap between the two iterates it is
+assembled from. The sparse path (`sparse_glmm_deviance` in `src/sparse/glmm.rs`)
+seeds differently: a fit-path evaluation starts from the previous evaluation's
+converged mode, not the incumbent's, and its FD-Hessian evaluations start from 0.
 
 The seed is usually immaterial: where the conditional mode is unique given
 (θ, β) it only shifts the stopping iterate within the PIRLS exit band. That is
@@ -435,19 +453,25 @@ the `loop_advanced` MCPower hot-loop surface.
 in `src/sparse/glmm.rs`; the flag assembly and `has_negligible_component`
 (`SINGULAR_REL_TOL = 1e-3`) in `src/fit/mod.rs` and `src/fit/glmm.rs`.
 
-θ is the vech of the RE-covariance Cholesky factor Λ, searched in a box:
-diagonal entries in `[0, THETA_HI]`, off-diagonals in `[−THETA_HI, THETA_HI]`
-(`blind_theta_and_bounds` in `src/lmm/mod.rs`, shared with the LMM path; the GLMM
-workspace appends `±BETA_BOX` bounds for the joint `[θ | β]` stage). Under this
-parameterization the singular boundary is a **finite, reachable point** of the
-search space: a variance collapsing to zero is a diagonal `λ_dd` at its lower
-bound `0`, and a correlation running to `±1` is *also* a diagonal hitting `0`
+θ is the vech of the RE-covariance Cholesky factor Λ, searched in the box
+`[−THETA_HI, THETA_HI]` on every entry, diagonals included
+(`blind_theta_and_bounds` in `src/lmm/mod.rs`, shared with the LMM path — the
+owning description of why the diagonals are not boxed at `0` is
+[`algorithms-lmm.md` §Covariance parameterization](algorithms-lmm.md#covariance-parameterization-θ-cholesky);
+the GLMM workspace appends `±BETA_BOX` bounds for the joint `[θ | β]` stage).
+Under this parameterization the singular boundary is a **finite, reachable
+point** of the search space: a variance collapsing to zero is a diagonal
+`λ_dd` at `0`, and a correlation running to `±1` is *also* a diagonal at `0`
 (for `q = 2`, `ρ = λ₂₁/√(λ₂₁² + λ₂₂²)`, so `|ρ| = 1 ⇔ λ₂₂ = 0`). BOBYQA walks
-onto that face like onto any other point — no reparameterization pushes the
-boundary to infinity.
+through that point like through any other — no reparameterization pushes the
+boundary to infinity, and no bound makes it a face to stop on.
 
-After the outer search converges, the same per-component pin as the LMM path applies
-(the owning description is
+After the outer search converges, every block column whose diagonal ended
+negative is negated whole (`fix_column_signs`; Σ = ΛΛ′ and the deviance are
+unchanged, so nothing is re-evaluated). The conditional modes of each negated
+column are negated with it (`fix_mode_signs`), so the mode solves that follow
+start next to the mode instead of at its mirror image. Then the same
+per-component pin as the LMM path applies (the owning description is
 [`algorithms-lmm.md` §Boundary handling](algorithms-lmm.md#boundary-handling-pin_theta)
 — change together): every **diagonal** θ entry `≤ PIN_THETA (1e-4)` is set to
 exactly `0.0`, the component's bit is recorded in `pinned_components`,
@@ -486,11 +510,13 @@ is taken in the internal θ̃ on both arms (the FD stencil perturbs it, the exac
 kernel differentiates with respect to it), so `stddev_se` is divided by the
 same scales before it is reported.
 
-**Convention/reference:** lme4 searches the identical bounded linear-scale
-Cholesky (`glmer`'s θ lower bounds are `0` on diagonals) and flags the same
+**Convention/reference:** lme4 searches the same linear-scale Cholesky with
+the diagonals boxed at `≥ 0` (`glmer`'s θ lower bounds) and flags the same
 fits via `isSingular` (θ diagonal `< 1e-4`), but reports the raw converged
-θ rather than pinning; the two engines flag near-identical boundary sets on
-identical data (see the engine comparison below). **Validation:** the LMM τ̂≈0
+θ rather than pinning; MixedModels.jl searches the unbounded box glmm does
+and reports negative diagonals as they come. The two engines flag
+near-identical boundary sets on identical data (see the engine comparison
+below). **Validation:** the LMM τ̂≈0
 tests in `src/lmm/tests.rs` pin the shared pin loop; the accuracy study
 (`validation/campaigns/monte_carlo/`) exercises the GLMM boundary at scale.
 

@@ -108,9 +108,16 @@ slope factor contributes three entries (two diagonal, one off-diagonal
 covariance), and so on.
 
 Diagonal `vech` entries are the relative variances — they carry a start of
-`THETA0 = 1.0` and a box `[0, THETA_HI]` with `THETA_HI = 1e3`. Off-diagonal
-entries are signed covariances — they start at `0` with a symmetric box
-`[−THETA_HI, THETA_HI]`.
+`THETA0 = 1.0`. Off-diagonal entries are signed covariances — they start at
+`0`. Every entry, diagonal included, is searched in the symmetric box
+`[−THETA_HI, THETA_HI]` with `THETA_HI = 1e3`: `Σ = ΛΛ′` does not change when a
+whole column of Λ is negated, so the deviance is even in each block column, and
+a diagonal boxed at `≥ 0` would make the face `Λ_jj = 0` a place the search can
+stop on from the wrong sign half (every in-box move raises the deviance there).
+A diagonal that ends the search negative has its whole column negated at exit
+(`fix_column_signs`, `src/lmm/mod.rs`; same Σ, same deviance), so the reported
+Λ has non-negative diagonals. MixedModels.jl searches the same unbounded box;
+lme4 keeps the diagonals at `≥ 0`.
 
 After the fit, the absolute covariance is recovered per grouping factor by
 `assemble_varcorr` (`src/fit/common.rs`): it walks the θ vector in
@@ -257,12 +264,13 @@ route) is:
 | `RHO_BEGIN` (cap) | `0.5` | `src/lmm/mod.rs` |
 | `rho_end` (final trust radius) | `RHO_END = 1e-6` | `src/lmm/mod.rs` |
 | `npt` (interpolation points) | `2·n_θ + 1` for `n_θ < 3`, else `⌈3·n_θ/2⌉ + 1` (`(3·n_θ).div_ceil(2) + 1`) | `for_cluster_spec_ext` |
-| `max_fun` | PRIMA default `500·n_θ` | `Config::new` |
+| `max_fun` | `1000·n_θ` (twice PRIMA's default; with the restart trigger at 1/8 of the remaining budget, the first cycle restarts at 750 evaluations for n_θ = 6) | `apply_campaign_overrides` |
 
 `rho_begin` is scaled to `0.1·θ₀` because the eval count is dominated by
-trust-radius shrinkage, not travel distance. It is then capped at `0.5` so the
-start `θ₀ = 1` stays clear of the `0` lower bound — PRIMA nudges any start that
-lands within `rho_begin` of a bound. `RHO_END = 1e-6` was measured equivalent to
+trust-radius shrinkage, not travel distance. It is then capped at `0.5`, the
+value the schedule was measured under; PRIMA nudges any start that lands within
+`rho_begin` of a bound, and the box is `2·THETA_HI` wide on every coordinate, so
+no start is near one. `RHO_END = 1e-6` was measured equivalent to
 `1e-8` on every validation check under the crate's absolute floors, at ~25% fewer
 evals. (The neighbouring constant `GLMM_RHO_END` in the same file is the GLMM
 outer loop's own, separately-swept schedule — it never applies here.)
@@ -298,7 +306,11 @@ constants were swept against the validation corpus (27 manifest datasets, rungs
 ## Boundary handling (PIN_THETA)
 
 A singular fit — a variance component collapsing to zero — presents as a diagonal
-θ entry driven to the lower bound. After BOBYQA converges, `fit_lmm` applies a
+θ entry driven to zero. After BOBYQA converges, `fit_lmm` first negates every
+block column whose diagonal ended negative (`fix_column_signs`; the box lets a
+diagonal cross zero — see
+[Covariance parameterization](#covariance-parameterization-θ-cholesky) — and
+Σ is unchanged by the negation), then applies a
 deterministic per-component pin: every **diagonal** variance component `≤
 PIN_THETA (1e-4)` is set to exactly `0.0`, the fit is still counted as converged,
 and the component's bit is recorded in `pinned_components`. Off-diagonal

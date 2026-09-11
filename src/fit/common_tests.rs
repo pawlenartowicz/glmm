@@ -1630,16 +1630,23 @@ fn lmm_reports_kkt_and_boundary_score() {
 /// `diagnostics_boundary_reports_both_ends`'s ±0.8 cancellation for the
 /// intercept (forcing its between-cluster variance MLE to exactly 0), plus a
 /// per-cluster slope offset so the slope variance is genuinely positive (not
-/// pinned). λ₁₀ is pushed off 0 by a warm start: once λ₀₀ = 0, the deviance
-/// depends on (λ₁₀, λ₁₁) only through λ₁₀² + λ₁₁², a flat (rotation-invariant)
-/// direction, so a non-zero λ₁₀ start is not pulled back to 0 by the fit.
+/// pinned). Once λ₀₀ = 0 the deviance depends on (λ₁₀, λ₁₁) only through
+/// λ₁₀² + λ₁₁², a flat (rotation-invariant) direction, and the cold search
+/// stops on it with λ₁₀ carrying the slope variance.
+///
+/// Cold start on purpose. A warm start near the pin (`θ = [0.05, 3.0, 0.3]`
+/// or `[0.05, 1.0, 0.3]`) walks through λ₀₀ = 0 under the signed search box
+/// (`blind_theta_and_bounds`) and settles at an interior point 1.9e-5 below
+/// the pinned deviance — λ₀₀ ≈ 4.2e-4 with the correlation at −1, measured
+/// 2026-09-10 — which pins nothing. The cold start stops on the pin in 48
+/// evaluations.
 ///
 /// `canonicalize_pinned_blocks` rotates that flat direction back onto the
-/// trailing diagonal after the pin loop, so this fixture now pins what it
+/// trailing diagonal after the pin loop, so this fixture pins what it
 /// should: a finite score at the pinned intercept, `pinned == [[true, false]]`
-/// against `sd = [0, 0.817]`, and — the reason the rewrite is safe —
-/// deviance and `varcorr` unmoved from the pre-canonicalization values
-/// measured on this fixture (2026-09-09), because the rewrite preserves Σ.
+/// against `sd = [0, 0.817]`, and deviance and `varcorr` equal to what a
+/// build without the rewrite reports on this fixture, because the rewrite
+/// preserves Σ.
 #[test]
 fn lmm_boundary_score_reported_after_canonicalization() {
     let n_clusters = 6usize;
@@ -1678,13 +1685,6 @@ fn lmm_boundary_score_reported_after_canonicalization() {
         primary: ids,
         extra: vec![],
     };
-    // vech(Λ), q=2: [λ00, λ10, λ11]. Warm-start λ00 near the pin threshold and
-    // λ10 well off 0, so the flat (λ10,λ11) direction preserves a non-zero
-    // λ10 at the accepted point instead of settling on the symmetric λ10=0.
-    let start = StartValues {
-        beta: vec![],
-        theta: vec![0.05, 3.0, 0.3],
-    };
     let fit = fit_warm(
         &x,
         &y,
@@ -1692,7 +1692,7 @@ fn lmm_boundary_score_reported_after_canonicalization() {
         2,
         &model,
         &ids,
-        Some(&start),
+        None,
         &FitOptions {
             target_indices: vec![0, 1],
             boundary_score: true,
@@ -1719,16 +1719,16 @@ fn lmm_boundary_score_reported_after_canonicalization() {
     );
     assert!(fit.diagnostics.boundary_score[0][1].is_nan());
     // Σ is preserved by the canonicalization, so these are the same numbers a
-    // pre-canonicalization build reported on this fixture.
+    // build without it reports on this fixture (cold start, 2026-09-10).
     let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1.0);
     assert!(
-        rel(fit.deviance, -2.017076489408452e1) < 1e-9,
+        rel(fit.deviance, -2.017076489402e1) < 1e-9,
         "deviance = {}",
         fit.deviance
     );
     for (&got, &want) in fit.varcorr[0]
         .iter()
-        .zip([0.0, 0.0, 0.6679633931875338].iter())
+        .zip([0.0, 0.0, 0.6679595387461011].iter())
     {
         assert!(rel(got, want) < 1e-9, "varcorr = {:?}", fit.varcorr[0]);
     }
@@ -2050,4 +2050,52 @@ fn re_design_scale_spread_note_absent_on_well_scaled_design() {
         "well-scaled design should not warn, got {:?}",
         lo.notes
     );
+}
+
+/// One frozen CSV fixture lowered through the formula frontend: `factors`
+/// names the grouping columns, every other column is numeric.
+#[cfg(feature = "formula")]
+pub(crate) fn fixture_lowered(
+    csv: &str,
+    factors: &[&str],
+    formula: &str,
+    family: Family,
+) -> crate::formula::Lowered {
+    use crate::formula::{lower, Column, Table};
+    let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
+    let header: Vec<String> = lines
+        .next()
+        .unwrap()
+        .split(',')
+        .map(|s| s.trim_matches('"').to_string())
+        .collect();
+    let rows: Vec<Vec<String>> = lines
+        .map(|l| {
+            l.split(',')
+                .map(|s| s.trim_matches('"').to_string())
+                .collect()
+        })
+        .collect();
+    let columns = header
+        .iter()
+        .enumerate()
+        .map(|(j, name)| {
+            let col = if factors.contains(&name.as_str()) {
+                let labels: Vec<String> = rows.iter().map(|r| r[j].clone()).collect();
+                Column::factor_from_labels(&labels)
+            } else {
+                Column::Numeric(rows.iter().map(|r| r[j].parse().unwrap()).collect())
+            };
+            (name.clone(), col)
+        })
+        .collect();
+    lower(
+        formula,
+        &Table {
+            n: rows.len(),
+            columns,
+        },
+        family,
+    )
+    .unwrap()
 }

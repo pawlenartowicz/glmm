@@ -261,6 +261,9 @@ pub struct LmmSweepOutcome {
     /// Profiled REML deviance at `theta`.
     pub deviance: f64,
     /// θ at the accepted point, in the same vech layout as [`lmm_objective_at`].
+    /// Raw search output: a diagonal may be negative — the search box is signed
+    /// and no sign fix runs here — and Σ = ΛΛᵀ is the same as with that column
+    /// negated.
     pub theta: Vec<f64>,
     /// Number of objective evaluations the solver used.
     pub n_eval: usize,
@@ -274,7 +277,7 @@ pub struct LmmSweepOutcome {
 /// blind start) — unlike `fit`'s warm start, which floors only diagonal
 /// components to `THETA_TRUTH_FLOOR` and passes off-diagonals through verbatim.
 /// npt and rho_begin are derived exactly as the shipped sites derive them (mid
-/// npt ⌈1.5n⌉+1 from n ≥ 3, rho_begin = min(0.1·min diag θ₀, RHO_BEGIN) floored
+/// npt ⌈1.5n⌉+1 from n ≥ 3, rho_begin = min(0.1·min |diag θ₀|, RHO_BEGIN) floored
 /// at 10·rho_end), so `(theta0 = None, rho_end = RHO_END, max_fun = None)`
 /// replays a shipped grid fit trajectory-identically; `trace` then observes
 /// every (k, θ, f) evaluation without any hook in the shipped path. A fresh
@@ -310,7 +313,7 @@ fn lmm_sweep_search(
     let min_diag = g
         .diagonal_theta()
         .iter()
-        .map(|&i| theta[i])
+        .map(|&i| theta[i].abs())
         .fold(f64::INFINITY, f64::min);
     let rho_begin = (0.1 * min_diag)
         .min(crate::lmm::RHO_BEGIN)

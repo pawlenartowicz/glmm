@@ -1823,26 +1823,24 @@ fn grid_agreement_cells() -> Vec<GridCell> {
 /// The gate's claim is about the OBJECTIVE the two routes share, not about
 /// BOBYQA landing at the same point on it. At n_primary=10, q_p=8 (36 θ
 /// parameters, effectively flat: only 10 clusters constrain an 8×8 vech
-/// block) the objective surface is genuinely multimodal, and a difference at
-/// the noise floor is enough to send the two independent minimizations into
-/// different basins. Measured on that cell: at four matched-θ probes (flat
-/// 1.0, flat 0.5, flat 2.0, a ramp) the dense and sparse profiled-REML
-/// objectives agree to ≤1.3e-14 relative — essentially the same function.
-/// Yet cold, dense reaches deviance −207.553008925 in 11101 evaluations
-/// while sparse reaches −202.142398734 in 1543; warm-restarting the sparse
-/// route at the dense route's own θ̂ takes it to −207.553008934 in 1442
-/// evaluations, so the sparse cold endpoint is a second, worse basin on the
-/// same surface, not an early stop. Four other seeds of the same cell
-/// (`0x5eed_000c + k*7919`, k = 1..4) funnel to the same basin and agree on
-/// β to ≤5e-7, on deviance to ≤1e-9 — so a basin split is the multimodal
-/// exception, not the rule, on this shape of cell.
+/// block) the surface has stationary points the two independent
+/// minimizations can split between. Measured on that cell: at four
+/// matched-θ probes (flat 1.0, flat 0.5, flat 2.0, a ramp) the dense and
+/// sparse profiled-REML objectives agree to ≤1.3e-14 relative —
+/// essentially the same function. With the diagonal θ boxed at `[0,
+/// THETA_HI]` that cell split (sparse stopped on a face Λ_jj = 0 at
+/// −202.142398734 while dense reached −207.553008925, and the heavy half's
+/// cell 20 split the same way, 1.9 deviance units apart); under the signed
+/// box (`blind_theta_and_bounds`) both routes reach the lower basin cold
+/// (cell 12: −207.553008931 / −207.553008925; cell 20: −737.059439657 /
+/// −737.059439629, measured 2026-09-10) and no cell splits.
 ///
-/// So the per-quantity checks below only run when the two routes' deviances
+/// The per-quantity checks below only run when the two routes' deviances
 /// agree (same basin, `DEV_TOL`); on a split, β/se/varcorr comparison would
 /// be comparing two different fits and is skipped, but the split itself is
 /// recorded against `expected_splits` — an unexpected split (new cell splits,
 /// or a listed one stops splitting) still fails the test, so this scoping
-/// can't turn into a silent pass. What still holds unconditionally, split or
+/// can't turn into a silent pass. What holds unconditionally, split or
 /// not, is the ≤1.3e-14 matched-θ objective agreement this scoping rests on.
 ///
 /// `heavy` picks which side of `is_heavy_cell` to sweep; the two callers
@@ -1976,13 +1974,11 @@ fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
 
 /// The always-on half of the accuracy gate: the 15 cheap cells, ~4s release.
 /// Spans every axis endpoint except q_g=4 — see `is_heavy_cell` for what
-/// covers that width instead. Cell 12 (n_primary=10, q_p=8, n_extra=0,
-/// q_g=1) is a frozen basin split — see `run_grid_agreement`'s doc comment
-/// for the warm-restart evidence that it's a multimodal-surface artifact,
-/// not a path bug.
+/// covers that width instead. No cell splits; the frozen list is empty so
+/// that a new split fails loudly (see `run_grid_agreement`'s doc comment).
 #[test]
 fn noz_sparse_grid_agrees() {
-    run_grid_agreement(false, "noz_sparse_grid_agrees", &[12]);
+    run_grid_agreement(false, "noz_sparse_grid_agrees", &[]);
 }
 
 /// The other half: the 8 cells of `is_heavy_cell`, 27–242s each in release.
@@ -1994,30 +1990,10 @@ fn noz_sparse_grid_agrees() {
 /// cargo test --release noz_sparse_grid_agrees_heavy -- --ignored --nocapture
 /// ```
 ///
-/// Cell 20 (n_primary=50, q_p=2, n_extra=6, q_g=4) is a frozen basin split,
-/// measured 2026-09-01 on x86_64: sparse converges to deviance
-/// −734.101866542, NoZ to −735.990789395, rel 2.563e-3. It is the grid's
-/// widest θ space — 63 coordinates, 3 primary vech entries plus 10 per extra
-/// grouping — so it is the extreme of the same multimodality
-/// `run_grid_agreement`'s doc comment measures at cell 12; the other seven
-/// heavy cells stay in band, at max rel 2.32e-5 (cell 18, varcorr).
-///
-/// The four probes that separate "two basins" from "one route is wrong",
-/// all on this cell:
-/// 1. At 8 random matched θ the dense and sparse profiled-REML objectives
-///    agree to rel ≤ 2.1e-12 — one surface, as at cell 18
-///    (`crossover_worst_cell_deviance_parity`).
-/// 2. Both cold runs report BOBYQA `Converged`, dense in 6354 evaluations
-///    and sparse in 5442, so neither endpoint is an evaluation-cap stop.
-/// 3. Each route re-evaluates the OTHER route's endpoint to that endpoint's
-///    own value (dense at θ̂_sparse → −734.101866542, sparse at θ̂_dense →
-///    −735.990789392): both points are points of the shared objective, not
-///    of two different ones.
-/// 4. Warm-restarted at the other route's θ̂, sparse reaches −735.990789389
-///    in 1671 evaluations, while dense STAYS at −734.101866533 in 1096. The
-///    worse point is a genuine local optimum that either route settles into
-///    once seeded there — what differs is only which one the cold seed
-///    funnels to.
+/// No cell splits (cell 20, the grid's widest θ space at 63 coordinates,
+/// did with the diagonal θ boxed at ≥ 0 — see `run_grid_agreement`'s doc
+/// comment); the eight cells agree at max rel 3.1e-6 (cell 20, varcorr),
+/// measured 2026-09-10 on x86_64.
 #[test]
 #[ignore = "8 heavy cells, 27–242s each — run on demand (see doc-comment)"]
 fn noz_sparse_grid_agrees_heavy() {
@@ -2025,7 +2001,7 @@ fn noz_sparse_grid_agrees_heavy() {
     // concurrent dhat profiler window on an `-- --ignored` run.
     #[cfg(feature = "alloc-tests")]
     let _serial = crate::test_support::alloc_test_guard();
-    run_grid_agreement(true, "noz_sparse_grid_agrees_heavy", &[20]);
+    run_grid_agreement(true, "noz_sparse_grid_agrees_heavy", &[]);
 }
 
 /// Conditional-mode parity on the blocked dense path. `classify_design`
@@ -2363,6 +2339,12 @@ fn noz_sparse_crossover_heavy_timed() {
 /// Re-pinned 2026-08-23 with random-effect design column scaling: `ge` carries
 /// four real column scales, so this fit sits in the reassociation band the change
 /// allows (worst move here 1.2e-4 on the `ge` off-diagonal covariance).
+/// Re-pinned 2026-09-10 with every θ coordinate boxed [−THETA_HI, THETA_HI]
+/// (`blind_theta_and_bounds`): the box changes BOBYQA's interpolation set on
+/// every fit, and here the deviance moved 1.9e-9 (−433.5431481841 →
+/// −433.5431481822, 796 → 610 evaluations), worst move 4.0e-6 absolute on
+/// the `ge` off-diagonal covariance −0.02568 — 1.6e-4 relative, over `BAND`
+/// only because that entry is small.
 ///
 /// Relative-tolerance, not bit-equal. These values reproduce BIT-EXACTLY on the
 /// anchor machine (see `fit::common_tests::assert_pinned`, "which machine the
@@ -2374,39 +2356,39 @@ fn noz_sparse_crossover_heavy_timed() {
 fn fit_wide_slopes_sparse_is_pinned() {
     const BAND: f64 = 5e-5;
     const REF_BETA: [f64; 5] = [
-        1.7059457447877522,
-        0.6799307380087812,
-        -0.5337786880029339,
-        0.3961595342142479,
-        -0.23725708532053053,
+        1.7059457411838472,
+        0.6799307274818567,
+        -0.5337786807640252,
+        0.39615954749070753,
+        -0.23725707491665174,
     ];
     const REF_SE: [f64; 5] = [
-        0.2635797634299826,
-        0.13544570755514324,
-        0.11236950513293584,
-        0.06849216626722299,
-        0.04723930439453695,
+        0.26358070314864507,
+        0.13544534462542981,
+        0.1123693535774618,
+        0.06849217986854006,
+        0.04723934077034158,
     ];
     // gp: scalar block. ge: q=5, column-major lower-triangle vech of D̂.
-    const REF_VC_GP: f64 = 0.83171497209491;
+    const REF_VC_GP: f64 = 0.8317227715961614;
     const REF_VC_GE: [f64; 15] = [
-        1.0998838508246986,
-        -0.02567559548875538,
-        0.22422096561536567,
-        0.0968135518710221,
-        0.08265911370742436,
-        0.7159780677389519,
-        0.2979603145366615,
-        0.02504493141157207,
-        0.007685066803612515,
-        0.488219498511271,
-        0.07347543147914619,
-        0.041592437917156784,
-        0.17210525013901,
-        0.008381294965910347,
-        0.07263556319841555,
+        1.099888069751484,
+        -0.02567959907663154,
+        0.2242207764039021,
+        0.09681474324321798,
+        0.08265963768802698,
+        0.7159741381765924,
+        0.29795672945857005,
+        0.025044406241823698,
+        0.007684940206366342,
+        0.4882181388643109,
+        0.07347579753851738,
+        0.04159226366357781,
+        0.17210532731318395,
+        0.008381340235342889,
+        0.0726357030084376,
     ];
-    const REF_SIGMA2: f64 = 0.37644138278272;
+    const REF_SIGMA2: f64 = 0.3764413144985405;
 
     let csv = include_str!("../../validation/data/simulated/sim_wide_slopes.csv");
     // Columns: y, x1, x2, x3, x4, gp, ge (indices 0..7).
@@ -6404,5 +6386,80 @@ fn sparse_glmm_nb_failed_fit_dispersion_is_nan() {
         f.dispersion.is_nan(),
         "dispersion must be NaN on a failed fit, not the θ the golden-section search stood on: {}",
         f.dispersion
+    );
+}
+
+/// One measured sign-trap draw per sparse route, each a simulated 300-row
+/// draw of `y ~ x1 + (1 | g1) + (1 + x1 | g2)` frozen as a fixture from the
+/// 2026-09-10 sign-trap simulation study (the slope on the extra grouping is
+/// what routes these sparse). `stopped` is where the search
+/// ended with the diagonal θ boxed at `[0, THETA_HI]`: the `g2` intercept
+/// diagonal on the face Λ_jj = 0 with the entry below it of the wrong sign,
+/// which no re-run on this route ever addressed. `reached` is what the signed
+/// box (`blind_theta_and_bounds`) reaches in one search. Deviance here is
+/// `−2·loglik`, the corpus convention, so the Gaussian draw compares on the
+/// same scale the study recorded.
+#[cfg(feature = "formula")]
+fn assert_sparse_sign_trap_escaped(
+    what: &str,
+    csv: &str,
+    family: Family,
+    stopped: f64,
+    reached: f64,
+) {
+    const DEV_BAND: f64 = 1e-3;
+    let lo = crate::fit::common_tests::fixture_lowered(
+        csv,
+        &["g1", "g2"],
+        "y ~ x1 + (1 | g1) + (1 + x1 | g2)",
+        family,
+    );
+    let f = crate::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    assert!(
+        f.converged(),
+        "{what}: must converge ({:?})",
+        f.diagnostics.boundary
+    );
+    let dev = -2.0 * f.loglik;
+    assert!(
+        (dev - reached).abs() < DEV_BAND,
+        "{what}: −2·loglik {dev} is not the escaped basin {reached} (boxed search stopped at {stopped}; {} evaluations)",
+        f.n_eval
+    );
+    assert!(
+        dev < stopped - DEV_BAND,
+        "{what}: −2·loglik {dev} does not beat the boxed search's stop {stopped}"
+    );
+}
+
+/// Sparse LMM: Gaussian, generated with a `g2` random-slope SD of 0.15.
+/// Boxed, the search stopped at 843.8383 in 60 evaluations, 2.137 above lme4
+/// and MixedModels.jl, which agree; the signed box reaches 841.7010 in 67.
+#[cfg(feature = "formula")]
+#[test]
+fn sparse_lmm_sign_trap_escaped() {
+    assert_sparse_sign_trap_escaped(
+        "sparse LMM",
+        include_str!("../../tests/fixtures/sign_trap_lmm_sparse_xslope.csv"),
+        Family::Gaussian,
+        843.8382918954,
+        841.7009852268,
+    );
+}
+
+/// Sparse GLMM: Bernoulli, generated with a zero `g2` random-slope SD.
+/// Boxed, the search stopped at 395.2847 in 126 evaluations; the signed box
+/// reaches 393.9605 in 107.
+#[cfg(feature = "formula")]
+#[test]
+fn sparse_glmm_sign_trap_escaped() {
+    assert_sparse_sign_trap_escaped(
+        "sparse GLMM",
+        include_str!("../../tests/fixtures/sign_trap_glmm_sparse_xslope.csv"),
+        Family::Binomial {
+            link: crate::BinomialLink::Logit,
+        },
+        395.2847160881,
+        393.9604531018,
     );
 }

@@ -742,7 +742,7 @@ fn assert_documented_divergences_all_fired() {
             eprintln!(
                 "documented divergence: {} rung {} [{}] <= {:.1e}\n  {}\n  direction: {}\n  see: {}",
                 e.dataset,
-                e.rung,
+                e.rung.map_or("-".to_string(), |r| r.to_string()),
                 e.quantities.join(","),
                 e.max_rel,
                 e.summary,

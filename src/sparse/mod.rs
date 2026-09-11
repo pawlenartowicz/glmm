@@ -199,6 +199,9 @@ pub(crate) fn fit_mle_sparse(
     let mut pinned = false;
     let mut pinned_components = 0u64;
     if has_endpoint {
+        // Sign canonicalization first (mirror `fit_lmm`, `src/lmm/mod.rs` —
+        // change together): Σ and the deviance are unchanged.
+        crate::lmm::fix_column_signs(&g, &mut theta);
         for (kk, &ti) in g.diagonal_theta().iter().enumerate() {
             if theta[ti] <= crate::lmm::PIN_THETA {
                 theta[ti] = 0.0;

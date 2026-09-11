@@ -6,6 +6,76 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [0.3.3] — 2026-09-11
+
+The random-effect search no longer stops at a false boundary where a Cholesky
+diagonal is 0. The stage-1 re-run that 0.3.2 added for the same trap is
+removed, and the outer search gets twice the evaluation budget.
+
+### Changed
+
+- **The outer BOBYQA search may spend up to `1000·n` evaluations, was PRIMA's
+  default `500·n`.** This holds on every route (dense and sparse, LMM and
+  GLMM); `n` is the number of search coordinates. The budget also sets when
+  the search restarts (after 1/8 of it), so a long fit now restarts later: at
+  750 evaluations for six coordinates, was 375. A fit that stops before that
+  point is bit-identical. Measured 2026-09-11 on boundary-heavy simulation
+  sets: on a set of 4,500 fits, 17 fits reach a deviance more than 1e-6 lower
+  (the largest by 3.5e-4), 8 end higher (the largest by 6.6e-5), the one fit
+  that used to hit the cap now converges at 796 evaluations, and total
+  evaluations are 0.985× of before. On a set of 12,600 fits and two AGQ cells
+  of 3,000 fits no fit moves by more than 3e-6. No fit reaches the new cap. A
+  fit that never converges now spends twice as many evaluations before it
+  reports that.
+
+### Removed
+
+- **The pinned-exit stage-1 re-run added in 0.3.2.** It ran the θ-only
+  exact-profile search a second time when the first run ended at a pinned
+  diagonal, and kept the better run. The signed search box (under Fixed)
+  escapes the same trap in one search: on the
+  `tests/fixtures/glmm_npt_trap.csv` draw the fit reaches 910.2127 in 148
+  evaluations, where the re-run needed 284. `n_eval` no longer counts a
+  second run.
+
+### Fixed
+
+- **The random-effect search no longer stops at a false boundary where a
+  Cholesky diagonal is 0.** θ holds the Cholesky factor Λ of each
+  random-effect covariance, and its diagonals were boxed at `[0, THETA_HI]`.
+  Σ = ΛΛ′ does not change when a whole column of Λ changes sign, so the two
+  sign choices of a column meet only where its diagonal is 0. A search that
+  reached that point with the wrong sign on the entries below the diagonal
+  saw the deviance rise in every allowed direction and stopped there, a
+  deviance unit or more above the optimum, at a point no local check can tell
+  apart from a real boundary. Now every θ entry, diagonals included, is
+  searched in `[−THETA_HI, THETA_HI]` on every route, so the search walks
+  through that point. At exit, each block column whose diagonal ended
+  negative has its sign flipped: Σ and the deviance do not change, and the
+  reported θ keeps non-negative diagonals. On GLMM routes the matching
+  conditional modes are flipped with it, so the final mode solve starts at
+  the mode. MixedModels.jl searches the same unbounded box; lme4 keeps the
+  diagonals at `≥ 0`. Examples: a Bernoulli `y ~ x1 + (1 + x1 | g1)` draw
+  used to stop at deviance 397.6085 and now reaches 397.4577; a Gaussian
+  `y ~ x1 + (1 | g1) + (1 + x1 | g2)` draw on the sparse route used to stop
+  2.14 above lme4 and MixedModels.jl, which agree, and now reaches 841.7010.
+  Seven new fixtures (`tests/fixtures/sign_trap_*.csv`) pin the escape on
+  dense and sparse, LMM and GLMM, Laplace and AGQ routes.
+
+  The wider box changes the search path on every fit, not only near a
+  boundary, so `n_eval` and the last digits of θ̂, β̂ and the deviance can
+  move on any fit; the bit-identity dumps are re-pinned. The oracle rung
+  `sim_sparse_nb` now ends 8.35e-5 deviance above lme4 (was 1.7e-6), inside
+  the 2e-4 gate, and is registered in `validation/divergences.json`.
+  `Diagnostics::kkt_grad_norm` projects the gradient onto the new box.
+
+### Changed — `loop_advanced` (no semver guarantee)
+
+- `LmmSweepOutcome.theta` is the raw search output and can now hold a
+  negative diagonal; Σ is the same as with that column's sign flipped.
+  `lmm_sweep_fit` and `lmm_sweep_fit_on` size the start radius from the
+  absolute values of the start's diagonals.
+
 ## [0.3.2] — 2026-09-10
 
 Published to crates.io, PyPI and R-universe. Evaluation counters, a
