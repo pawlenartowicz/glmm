@@ -113,6 +113,23 @@ pub(crate) fn clamp_mu<T: Scalar>(family: Family, mu: T) -> T {
     }
 }
 
+/// The `(lo, hi)` bounds [`clamp_mu`] holds μ inside, per family — mirrors the
+/// match above, change together. Split out so the callers that need to ask
+/// "did the clamp bind on this row?" after the fact share one table with the
+/// clamp itself: `glmm::assembled::clamped_row_counts` (the assembled SE
+/// engine's refusal) and `glmm::pirls::clamped_row_present` (the dual kernels'
+/// one-step exactness flag).
+pub(crate) fn clamp_mu_bounds(family: Family) -> (f64, f64) {
+    match family {
+        Family::Binomial { .. } => (PROB_EPS, 1.0 - PROB_EPS),
+        Family::Poisson { .. }
+        | Family::Gamma { .. }
+        | Family::NegativeBinomial { .. }
+        | Family::InverseGaussian { .. } => (MU_FLOOR, f64::INFINITY),
+        Family::Gaussian => (f64::NEG_INFINITY, f64::INFINITY),
+    }
+}
+
 /// Inverse link `g⁻¹(η) → μ`, with the link's domain clamps applied so μ is
 /// always valid for [`variance`]/[`dev_resid`].
 pub(crate) fn link_inv<T: Scalar>(family: Family, eta: T) -> T {
@@ -310,6 +327,30 @@ pub(crate) fn gamma_aic<T: Scalar>(
     T::from_f64(-2.0) * s + T::from_f64(2.0)
 }
 
+/// `Φ' = daic/dD` for the Gamma family, in closed form: the total derivative
+/// along `D = Σᵢ prior_wᵢ·dev_resid(yᵢ, μᵢ)`, where the μ terms cancel — not
+/// the partial of `gamma_aic` at fixed `mu`, which is a different (and
+/// useless) number. `gamma_aic` reads `y` and `mu` as well as `dev`, but substituting the Gamma deviance
+/// `D = 2Σᵢwᵢ[yᵢ/μᵢ − 1 − ln yᵢ + ln μᵢ]` into the `aic` sum kills both the
+/// `Σw·ln μ` and the `Σw·y/μ` dependence, leaving `aic` a function of `D`
+/// alone through `a = Σwᵢ/D = 1/disp`:
+/// ```text
+///   aic(D) = 2Σw·ln y + Σw + 2 + Σw·[2a − 2a·ln a + 2·lnΓ(a)]
+///   Φ'(D)  = daic/dD = 2a²·(ln a − ψ(a))                     ψ = digamma
+/// ```
+/// Positive for `a > 0` (`ln a > ψ(a)` there).
+///
+/// Generic over `Scalar`, and the same expression at every `T`: `digamma` is
+/// itself a `Scalar` series, so at a dual `T` this returns `Φ'` with lanes
+/// `Φ''·dD`, and at `HyperDual` one order further. Reading `Φ'` off
+/// `gamma_aic`'s own lanes instead would give the value only — an `aic` lane is
+/// `Φ'·dD`, which fixes `Φ'` but says nothing about `Φ''`.
+pub(crate) fn gamma_phi_prime<T: Scalar>(dev: T, n: usize, prior_w: Option<&[f64]>) -> T {
+    let sum_w = prior_w.map_or(n as f64, |w| w[..n].iter().sum());
+    let a = T::from_f64(sum_w) / dev;
+    T::from_f64(2.0) * a * a * (a.ln() - crate::dual::digamma(a))
+}
+
 /// R's `inverse.gaussian()$aic` — the family's `−2·logLik + 2` with the
 /// dispersion **profiled** as `disp = D/Σwᵢ` rather than carried as a free
 /// parameter, the same convention `gamma_aic` follows:
@@ -499,7 +540,7 @@ pub(crate) fn irls_weight_and_resid<T: Scalar>(
     }
 }
 
-/// Observed (Newton) IRLS weight `−½·d²devᵢ/dηᵢ²` at η, from the Fisher weight
+/// Observed (Newton) IRLS weight `½·d²devᵢ/dηᵢ²` at η, from the Fisher weight
 /// `w = (dμ/dη)²/V` the caller already holds: `w_obs = w − (y−μ)·dr/dη` with
 /// `r(η) = (dμ/dη)/V(μ)` the score factor (`−½·d devᵢ/dη = r·(y−μ)`). `dr/dη`
 /// is 0 exactly where `r` is constant — the canonical links, Gamma-inverse
@@ -563,12 +604,121 @@ pub(crate) fn observed_weight<T: Scalar>(
     w - T::from_f64(prior_w) * (T::from_f64(y) - mu) * dr
 }
 
+/// `dw/dη` of the (prior-weighted) IRLS working weight `w = (dμ/dη)²/V(μ)`
+/// (general form) or `w = V(μ)` (canonical). Every arm reduces to `w·g(η,μ)`,
+/// so a caller that passes an already prior-weighted `w` gets a
+/// prior-weighted derivative back with no separate `prior_w` argument — unlike
+/// [`observed_weight`], whose `w − prior_w·(y−μ)·dr` shape needs `prior_w`
+/// explicitly. `eta`/`mu` are the pass's already-clamped values, as for
+/// [`observed_weight`]: the probit arm reads `η` and the cloglog arm `exp(η)`
+/// directly, so an unclamped caller disagrees with the `Dual<1>` lines this
+/// function is held equal to. Per link, with `μ' = dμ/dη`, `φ = μ'` on probit:
+///
+/// - Gaussian identity, Gamma log: `w ≡ 1`, `dw/dη = 0`.
+/// - Poisson log (canonical, `w=μ`): `dw/dη = μ' = μ`.
+/// - Binomial logit (canonical, `w=μ(1−μ)`): `dw/dη = (1−2μ)μ' = w(1−2μ)`.
+/// - Binomial probit (`w=φ²/V`, `V=μ(1−μ)`): `φ'=−ηφ`, `V'=(1−2μ)φ`, so
+///   `dw/dη = 2φφ'/V − φ²V'/V² = −w[2η + φ(1−2μ)/V]`.
+/// - Binomial cloglog (`w=e^{2η}(1−μ)/μ`): with `t=e^η`, `s=1−μ`,
+///   `d ln w/dη = 2 − t − ts/μ`, and `μ+s=1` collapses `t+ts/μ` to `t/μ`, so
+///   `dw/dη = w(2 − t/μ) = w(2 − e^η/μ)`.
+/// - Gamma inverse (`μ'=−μ²`, `V=μ²`, `w=μ'²/V=μ²`): `dw/dη = 2μμ' = −2μ³ =
+///   −2wμ`. **Negative**, unlike the log arm above.
+/// - NegBinomial log (`w=μθ/(θ+μ)`): `dw/dη = θ²μ'/(θ+μ)² = w·θ/(θ+μ)` (using
+///   `μ'=μ` on the log link).
+/// - InvGaussian log (`w=μ'²/V=1/μ`): `dw/dη = −μ'/μ² = −1/μ = −w`.
+/// - InvGaussian inverse-squared (`μ'=−μ³/2`, `V=μ³`, `w=μ'²/V=μ³/4`):
+///   `dw/dη = (3μ²/4)μ' = −3μ⁵/8 = −1.5wμ²`.
+///
+/// The `WEIGHT_CLAMP` zero-fill mirrors the guard the exact β-profile applies
+/// by hand at the two sites that hold a `Dual<1>` of `irls_weight_and_resid`
+/// equal to this function rather than calling it (`pirls/blocked.rs`'s pass A
+/// and `pirls/blocked_extras.rs`'s pass A): replacing either `Dual<1>` line
+/// with a call here would move `f64` bits, so a test
+/// (`weight_eta_deriv_matches_dual1_of_irls_weight`) holds the two forms
+/// equal instead.
+pub(crate) fn weight_eta_deriv<T: Scalar>(family: Family, nb_theta: f64, eta: T, mu: T, w: T) -> T {
+    if w.value() <= crate::glm::WEIGHT_CLAMP {
+        return T::ZERO;
+    }
+    match family {
+        Family::Gaussian
+        | Family::Gamma {
+            link: GammaLink::Log,
+        } => T::ZERO,
+        Family::Poisson { .. } => w,
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        } => w * (T::ONE - T::from_f64(2.0) * mu),
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        } => {
+            let v = mu * (T::ONE - mu);
+            let phi = mu_eta(family, eta);
+            -w * (T::from_f64(2.0) * eta + phi * (T::ONE - T::from_f64(2.0) * mu) / v)
+        }
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        } => w * (T::from_f64(2.0) - Scalar::exp(eta) / mu),
+        Family::Gamma {
+            link: GammaLink::Inverse,
+        } => T::from_f64(-2.0) * w * mu,
+        Family::NegativeBinomial { .. } => {
+            let th = T::from_f64(nb_theta);
+            w * th / (th + mu)
+        }
+        Family::InverseGaussian {
+            link: InverseGaussianLink::Log,
+        } => -w,
+        Family::InverseGaussian {
+            link: InverseGaussianLink::InverseSquared,
+        } => T::from_f64(-1.5) * w * mu * mu,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         BinomialLink, Family, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink,
     };
+
+    /// `gamma_phi_prime` against `gamma_aic`'s own `Dual<1>` lane, seeded
+    /// along a μ-perturbation so the lane is the TOTAL derivative `daic/dD` —
+    /// the same quantity the closed form gives, and not the partial of
+    /// `gamma_aic` at fixed `mu`, which is a different number. `Φ' =
+    /// (daic/dt)/(dD/dt)` for any perturbation direction `t`, so one
+    /// arbitrary direction settles it. Band 1e-12 relative: both sides are
+    /// smooth `f64` reductions over four rows.
+    #[test]
+    fn phi_prime_matches_dual1_lane_of_aic() {
+        use crate::dual::Dual;
+        let y = [0.7_f64, 1.4, 2.2, 3.1];
+        let mu0 = [0.9_f64, 1.2, 2.6, 2.8];
+        let dmu = [0.3_f64, -0.4, 0.7, 0.2];
+        let w = [1.0_f64, 2.0, 0.5, 1.5];
+        let n = 4;
+        let family = Family::Gamma {
+            link: GammaLink::Log,
+        };
+        let mu: Vec<Dual<1>> = (0..n)
+            .map(|i| Dual::<1> {
+                v: mu0[i],
+                d: [dmu[i]],
+            })
+            .collect();
+        let mut dev = Dual::<1>::ZERO;
+        for i in 0..n {
+            dev += Dual::<1>::from_f64(w[i]) * dev_resid(family, f64::NAN, y[i], mu[i]);
+        }
+        let aic = gamma_aic(&y, &mu, dev, n, Some(&w));
+        let got = aic.d[0] / dev.d[0];
+        let want = gamma_phi_prime(dev.v, n, Some(&w));
+        assert!(
+            (got - want).abs() <= 1e-12 * want.abs().max(1.0),
+            "{family:?}: lane {got} vs closed form {want}"
+        );
+    }
 
     /// `observed_weight`'s `dr/dη` per link against a central difference of
     /// `r(η) = (dμ/dη)/V(μ(η))`, read back through `w_obs = w − (y−μ)·dr/dη`
@@ -673,6 +823,141 @@ mod tests {
                         assert!((got - mu.v).abs() < 1e-12, "poisson hand form")
                     }
                     _ => {}
+                }
+            }
+        }
+    }
+
+    /// The ten `(family, link)` cells `weight_eta_deriv` and D4's table cover,
+    /// paired with the η domain each needs (Gamma-inverse and IG-inverse-squared
+    /// need `η > 0`).
+    fn weight_eta_deriv_cells() -> Vec<(Family, &'static [f64])> {
+        const GEN: &[f64] = &[-1.3, 0.2, 1.7];
+        // 0.5 rather than 0.3: at h = 1e-5 the central difference's O(h²) truncation
+        // term tracks the third derivative of w(η), which is steep enough near
+        // η = 0.3 on the Gamma-inverse link (w = η⁻²) to exceed the 1e-7 band;
+        // IG-inverse-squared (w = η^(-3/2)/4) is milder and rides along.
+        const POS: &[f64] = &[0.5, 0.9, 1.7];
+        vec![
+            (Family::Gaussian, GEN),
+            (
+                Family::Poisson {
+                    link: PoissonLink::Log,
+                },
+                GEN,
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Logit,
+                },
+                GEN,
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Probit,
+                },
+                GEN,
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Cloglog,
+                },
+                GEN,
+            ),
+            (
+                Family::Gamma {
+                    link: GammaLink::Log,
+                },
+                GEN,
+            ),
+            (
+                Family::Gamma {
+                    link: GammaLink::Inverse,
+                },
+                POS,
+            ),
+            (
+                Family::NegativeBinomial {
+                    link: NegBinomialLink::Log,
+                },
+                GEN,
+            ),
+            (
+                Family::InverseGaussian {
+                    link: InverseGaussianLink::Log,
+                },
+                GEN,
+            ),
+            (
+                Family::InverseGaussian {
+                    link: InverseGaussianLink::InverseSquared,
+                },
+                POS,
+            ),
+        ]
+    }
+
+    /// `weight_eta_deriv` against the `Dual<1>` derivative of the Fisher weight
+    /// `irls_weight_and_resid` returns — the quantity the exact β-profile's
+    /// pass A reads off a nested dual at an `f64` base. The two must agree to
+    /// round-off: pass A keeps its `Dual<1>` line because replacing it would
+    /// move `f64` bits, so this test is what holds the closed form and the
+    /// nested dual together.
+    #[test]
+    fn weight_eta_deriv_matches_dual1_of_irls_weight() {
+        use crate::dual::Dual;
+        let nb_theta = 2.5;
+        for (f, etas) in weight_eta_deriv_cells() {
+            for &eta in etas {
+                // The 2.5 row is implied by the 1.0 row while every arm is
+                // `w·g(η, μ)`; it guards a future arm that is not.
+                for &prior_w in &[1.0_f64, 2.5_f64] {
+                    let e = Dual::<1> { v: eta, d: [1.0] };
+                    let (mu_d, w_d, _) = irls_weight_and_resid(f, nb_theta, 1.0, e);
+                    let want = prior_w * w_d.d[0];
+                    let got = weight_eta_deriv(f, nb_theta, eta, mu_d.v, prior_w * w_d.v);
+                    assert!(
+                        (got - want).abs() <= 1e-12 * want.abs().max(1.0),
+                        "{f:?} eta={eta} prior_w={prior_w}: got {got} want {want}"
+                    );
+                }
+            }
+        }
+
+        // Clamped weight: an eta that drives w below WEIGHT_CLAMP returns exactly 0.
+        let f = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        let eta = -20.0_f64;
+        let (mu, w, _) = irls_weight_and_resid(f, nb_theta, 1.0, eta);
+        assert!(
+            w <= crate::glm::WEIGHT_CLAMP,
+            "fixture must exercise the clamp"
+        );
+        assert_eq!(weight_eta_deriv(f, nb_theta, eta, mu, w), 0.0);
+    }
+
+    /// `weight_eta_deriv` against a central difference of the same
+    /// `irls_weight_and_resid` weight, at the step and band
+    /// `observed_weight_matches_fd_of_score_factor` uses. Independent of the
+    /// gate above: both could pass together wrong only if `Dual<1>`'s chain
+    /// rule itself were wrong, which this catches.
+    #[test]
+    fn weight_eta_deriv_matches_fd_of_irls_weight() {
+        let nb_theta = 2.5;
+        let h = 1e-5;
+        for (f, etas) in weight_eta_deriv_cells() {
+            let w_at = |e: f64| irls_weight_and_resid(f, nb_theta, 1.0, e).1;
+            for &eta in etas {
+                for &prior_w in &[1.0_f64, 2.5_f64] {
+                    let fd = prior_w * (w_at(eta + h) - w_at(eta - h)) / (2.0 * h);
+                    let mu = link_inv(f, eta);
+                    let w = prior_w * w_at(eta);
+                    let got = weight_eta_deriv(f, nb_theta, eta, mu, w);
+                    assert!(
+                        (got - fd).abs() < 1e-7,
+                        "{f:?} eta={eta} prior_w={prior_w}: got {got} vs fd {fd}"
+                    );
                 }
             }
         }

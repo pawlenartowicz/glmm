@@ -658,3 +658,28 @@ make_poisson_offset <- function(n_clust = 30, per = 80) {
 d_po <- make_poisson_offset()
 write.csv(d_po, file.path(suite_dir, "data", "simulated", "sim_poisson_offset.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_poisson_offset", nrow(d_po), ncol(d_po)))
+
+# --- Rung 49: sim_cloglog_nested_crossed -- rung 21's nested+crossed design
+# (g1/g2 nested, c1 independently crossed) with a Bernoulli response drawn
+# from cloglog's own inverse link instead of a gaussian one: the one
+# non-canonical, structured-extras (nested AND crossed) shape on the
+# bit-identity tripwire. Own isolated seed block appended at the end -- does
+# not disturb any earlier dataset's draws.
+set.seed(20260802)
+make_cloglog_nested_crossed <- function(n_g1 = 8, n_g2 = 3, per = 12, n_c1 = 6) {
+  n   <- n_g1 * n_g2 * per
+  g1  <- factor(rep(seq_len(n_g1), each = n_g2 * per))
+  g2  <- factor(rep(rep(seq_len(n_g2), each = per), times = n_g1))
+  c1  <- factor(sample(seq_len(n_c1), n, replace = TRUE))
+  x   <- rnorm(n)
+  ig  <- interaction(g1, g2, drop = TRUE)
+  u1  <- rnorm(n_g1, sd = 0.5)[g1]
+  u2  <- rnorm(nlevels(ig), sd = 0.3)[as.integer(ig)]
+  uc  <- rnorm(n_c1, sd = 0.4)[c1]
+  eta <- -0.8 + 0.5 * x + u1 + u2 + uc
+  p   <- 1 - exp(-exp(eta))  # cloglog inverse link: mu = 1 - exp(-exp(eta))
+  data.frame(y = rbinom(n, 1, p), x = x, g1 = g1, g2 = g2, c1 = c1)
+}
+d_cnc <- make_cloglog_nested_crossed()
+write.csv(d_cnc, file.path(suite_dir, "data", "simulated", "sim_cloglog_nested_crossed.csv"), row.names = FALSE)
+cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_cloglog_nested_crossed", nrow(d_cnc), ncol(d_cnc)))

@@ -251,7 +251,9 @@ VarCorr.fastglmm <- function(x, ...) {
     attr(v, "correlation") <- sc$correlation
     v
   })
-  names(out) <- x$re_group_names
+  # A `no_optimum` exit carries an empty `varcorr` next to its grouping names;
+  # `names<-` on a zero-length list rejects a non-empty name vector.
+  if (length(out)) names(out) <- x$re_group_names
   # "sc" mirrors lme4's residual-sd attribute name; NA for non-gaussian
   # families (phi==1 families have no free residual scale; gamma's
   # sqrt(phi) is a dispersion, reported by sigma(), not a Residual row).

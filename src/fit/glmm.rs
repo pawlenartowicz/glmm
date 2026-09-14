@@ -120,7 +120,7 @@ pub(crate) fn glm_warm_start_beta(
 /// and the column-major `X`.
 type BuiltGlmm = (GlmmWorkspace, Mat<f64>);
 
-fn fit_glmm_build(
+pub(super) fn fit_glmm_build(
     x: &[f64],
     n: usize,
     p: usize,
@@ -199,6 +199,17 @@ fn fit_glmm_build(
     } else {
         None
     };
+    // Observed twin of the crossed-Schur symbolic factor, so the exact β-profile's
+    // adjoint solve can run on `A_obs` without overwriting the Fisher factor every
+    // later pass reads. Built only where the exact profile can read it: a
+    // non-canonical link on the structured route — canonical links never read
+    // it, so building it there would be pure cost on every warm-path draw.
+    ws.exact_prof.obs_schur =
+        if ws.groupings.structured_extras_eligible() && !crate::family::is_canonical(ws.family) {
+            StructuredSchur::new(&ws.groupings, cluster_ids, extra_ids, n)
+        } else {
+            None
+        };
 
     Ok((ws, x_mat))
 }
@@ -255,6 +266,13 @@ pub(crate) struct GlmmResultView<'a> {
 // stable path reads the workspace slots through `glmm_view_to_fit` instead.
 #[allow(dead_code)]
 impl GlmmResultView<'_> {
+    /// Whether the search converged, and the minimized marginal deviance it
+    /// reached — the two scalars a caller that only wants the workspace left
+    /// at γ̂ needs, without mapping the whole view to a `Fit`.
+    #[cfg(test)]
+    pub(crate) fn converged_deviance(&self) -> (bool, f64) {
+        (self.fit.converged, self.fit.deviance)
+    }
     /// Per-target Wald statistic, predictor-indexed length p — only the
     /// `target_indices` slots are written; a non-target slot reads 0.0 on a
     /// fresh workspace or a previous fit's value on a reused one.

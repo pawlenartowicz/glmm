@@ -256,6 +256,7 @@ pub fn lower_rung(spec: &Value, manifest_dir: &str) -> (Lowered, Table, Family, 
             link: match link_str {
                 None | Some("logit") => BinomialLink::Logit,
                 Some("probit") => BinomialLink::Probit,
+                Some("cloglog") => BinomialLink::Cloglog,
                 Some(other) => panic!("unsupported binomial link: {other}"),
             },
         },

@@ -1248,8 +1248,8 @@ fn reordered_crossed_case() -> (
 fn fit_on_theta_marshalling_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    // Measured exactly 6200 on 2026-09-05 (this machine, under this test's own
-    // `RAYON_NUM_THREADS=1` + `--test-threads=1` protocol): ~31 blocks per
+    // Measured exactly 8600 on this machine, under this test's own
+    // `RAYON_NUM_THREADS=1` + `--test-threads=1` protocol: ~43 blocks per
     // arm-draw of faer `llt` internals plus the three per-call derivative
     // vectors (`theta_row_scales`, `grad`, `boundary_score`), and nothing
     // else. Pinned at the measurement with no slack — if faer's Cholesky
@@ -1260,14 +1260,15 @@ fn fit_on_theta_marshalling_bounded_alloc() {
     // vector + θ̂ copy; reordered arm: θ̂ copy + a two-`Vec` start clone). They
     // are still zero.
     //
-    // Re-pinned 16500 → 6200: `LmmDualScratch`/`LmmHyperScratch` moved from
-    // per-fit locals in `lmm_run_on` onto `LmmWorkspace`, so a warm refit no
-    // longer rebuilds their buffer lists. That move accounts for 4200 of the
-    // drop — the same gate on the tree immediately before it measures 10400
-    // here (21 blocks per arm-draw of scratch). The remaining 6100 was already
-    // gone before that move: the 16500 figure was taken on 2026-09-01 and does
-    // not reproduce here, and the gap was not attributed.
-    const BOUND: u64 = 6200;
+    // `LmmGroupings::blind_theta_and_bounds`'s diagonal box is unbounded
+    // (`[-THETA_HI, THETA_HI]` on every θ coordinate, not `[0, THETA_HI]`) and
+    // `apply_campaign_overrides` doubles `max_fun` to `1000·n` — both change
+    // BOBYQA's interpolation set and trust-region path on every fit, warm
+    // start included, so a warm refit now runs more objective evaluations
+    // before reaching `rho_end` and pays more faer `llt` allocations per
+    // call. The per-call block count moved with it; this is the algorithm
+    // doing more evaluations to reach a correct endpoint, not a leak.
+    const BOUND: u64 = 8600;
 
     let (xs, ys, ns, ps, ms, ids_s, os) = lmm_slope_case();
     let (sized_s, ids_s, perm_s) = spec_sized_from_ids_pub(&ms, &ids_s);
@@ -1344,13 +1345,18 @@ fn fit_on_theta_marshalling_bounded_alloc() {
 fn lmm_dual_scratch_built_once_per_workspace() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 20;
-    // Measured 704 on 2026-09-05 (this machine): ~35 blocks/call of faer `llt`
-    // internals plus the three per-call derivative `Vec`s
-    // (`theta_row_scales`, `grad`, `boundary_score`), and nothing else — the
-    // `LmmDualScratch` buffer list is built by the warm-up fit above and never
-    // rebuilt inside the loop. Pinned at the measurement with no slack. If
-    // faer's Cholesky internals change, re-measure and update — do not relax.
-    const BOUND: u64 = 704;
+    // Measured 1184 on this machine: ~59 blocks/call of faer `llt` internals
+    // plus the three per-call derivative `Vec`s (`theta_row_scales`, `grad`,
+    // `boundary_score`), and nothing else — the `LmmDualScratch` buffer list
+    // is built by the warm-up fit above and never rebuilt inside the loop.
+    // `LmmGroupings::blind_theta_and_bounds`'s unbounded diagonal box and
+    // `apply_campaign_overrides`'s doubled `max_fun` (both `src/lmm/mod.rs`)
+    // change BOBYQA's per-fit evaluation count on every fit, warm start
+    // included, which is why the per-call block count sits above the count
+    // measured before that box change. Pinned at the measurement with no
+    // slack. If faer's Cholesky internals change, re-measure and update — do
+    // not relax.
+    const BOUND: u64 = 1184;
 
     let (x, y, n, p, model, ids, opts) = lmm_slope_case();
     let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);

@@ -143,9 +143,11 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
     let mut converged = false;
     let min_iters = match dual.as_deref_mut() {
         Some(d) => {
-            // Unconditional `true` because this path pairs it with
-            // `observed = !canonical`: the step it takes IS the Hessian step.
-            // Mirrors `pirls_solve_blocked_extras`'s `exact` contract — change
+            // Optimistic seed: paired with `observed = !canonical` the step
+            // this path takes IS the Hessian step, so one call suffices unless
+            // the clamp test below the family pass or the non-PD observed
+            // factor further down takes it back. Mirrors
+            // `pirls_solve_blocked_extras`'s `exact` contract — change
             // together; the reasoning is written out there.
             d.exact = true;
             d.min_iters
@@ -201,6 +203,18 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             &mut [],
         );
         dev = d;
+        // A clamped row costs the one-step lane claim `exact` makes, on every
+        // link — see `clamped_row_present`. Tested on every trial rather than
+        // only on accepted ones, and never reset to true: over-reporting
+        // `false` costs the caller kernel calls, under-reporting it is a wrong
+        // derivative with no detector. Mirrors `pirls_solve_blocked_extras` —
+        // change together. Runs only on a dual solve, so the f64 fit path is
+        // untouched.
+        if let Some(d) = dual.as_deref_mut() {
+            if d.exact && clamped_row_present(family, &w[..n], &prob[..n]) {
+                d.exact = false;
+            }
+        }
         // Retrospective step-halving (lme4 `pwrssUpdate`, mirrors `pirls_solve`):
         // convergence band checked BEFORE the overshoot test (near the optimum
         // Fisher scoring is not strictly monotone — a step can land ε above
@@ -577,6 +591,10 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                         mrow[c] = m_buf[i * q + c].value();
                     }
                     let h = block_leverage(&fac_f64[ablk..ablk + q * q], q, &mrow[..q]);
+                    // `family::weight_eta_deriv` is the closed form of this same
+                    // `dw/dη`, held equal to this `Dual<1>` line by
+                    // `weight_eta_deriv_matches_dual1_of_irls_weight`
+                    // (`src/family.rs`); changing either alone moves `f64` bits.
                     let wp = if w[i].value() <= crate::glm::WEIGHT_CLAMP {
                         0.0
                     } else {

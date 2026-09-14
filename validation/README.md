@@ -78,7 +78,7 @@ ports call the same kernel, so a miss there is a wiring bug, not a divergence.
 
 ## Layout
 
-    manifest.json     single source of truth: the 48 curated `datasets` rungs
+    manifest.json     single source of truth: the 49 curated `datasets` rungs
                       (the `m3_goldens` cells 49-52 are registered separately,
                       see below), both formula dialects, per-rung options
                       (data, link, weights_col, tier)
@@ -186,10 +186,16 @@ added late so no existing rung had to be renumbered).
 | 45 | sim_poisson_bigsd | Poisson GLMM (scalar RE) | large θ̂ (2.97 fitted) — the count-family counterpart of rung 44 |
 | 46 | sim_sparse_binomial_bigsd | binomial GLMM (Bernoulli, 1 primary + 7 crossed scalar RE) | the SPARSE arm of the large-θ̂ regime — large θ̂ (3.91 fitted on `g1`) crossed with 7 crossed intercept-only extras, which is what routes it past `MAX_EXTRA_GROUPINGS` to the sparse solver. **2-way (glmm ↔ lme4) by decision, not by MixedModels limitation** — see the rung's `//` comment in `manifest.json`. Bernoulli rather than Poisson: a Poisson design in this regime pushes counts into the tens of thousands, where deviance-sum rounding noise dominates the FD Hessian's step independent of solver tuning; sparse-large-θ̂-Poisson coverage is deliberately not attempted for that reason. |
 | 48 | sim_probit_large | binomial GLMM, probit link (Bernoulli, scalar RE) | the corpus's **large** probit rung — 100 groups × 96 rows = 9600 rows, p = 5, θ̂ ≈ 0.66. `cbpp_probit` (rung 22) is the only other probit fit in the suite and is 56 rows at ~3 ms, where a vectorized family kernel is pure measurement noise; this rung is what makes probit speed, and accuracy drift that needs a long row loop to show up, visible at all. The row count is capped by lme4, not by taste: above `glmerControl`'s `check.conv.nobsmax = 10000` glmer stops computing the optimizer Hessian and `engines/lme4.R`'s `vcov(use.hessian = TRUE)` hard-errors. Data from `prep/gen_probit_large_data.R`. |
+| 49 | sim_cloglog_nested_crossed | binomial GLMM, cloglog link (nested + crossed) | rung 21's design (`g1/g2` nested, `c1` crossed) with a cloglog Bernoulli response in place of the gaussian one — the one non-canonical link paired with a structured-extras shape that combines a nested and a crossed grouping in the same model. **2-way (glmm ↔ lme4) gate, lme4 only** — same reason rungs 23/24/36/46 stay 2-way: MixedModels.jl's binomial dispatch only builds `LogitLink`/`ProbitLink` and errors on any other link string. |
 | 49 | sim_cloglog_glm | binomial GLM, cloglog link | non-canonical asymmetric link, GLM arm — reuses rung 48's data |
 | 50 | sim_cloglog_glmm | binomial GLMM, cloglog link (Bernoulli, scalar RE) | cloglog GLMM, dense scalar RE — the link's mixed arm |
 | 51 | sim_igauss_glm | inverse-Gaussian GLM, log link | V(μ)=μ³ family kernel, log link, on the new `sim_igauss` fixture |
 | 52 | sim_igauss_inv_sq_glm | inverse-Gaussian GLM, 1/μ² link | same data, non-canonical 1/μ² link — general Fisher-scoring branch |
+
+The 49–52 block below is the `m3_goldens` list's own sequential numbering in
+this table, unrelated to the `datasets` `rung` field above — it collides in
+digits only with `datasets` rung 49 (`sim_cloglog_nested_crossed`), a
+different entry.
 
 Rungs 49–52 are `m3_goldens` cells (`stats::glm` / `lme4::glmer` only, frozen by
 `engines/goldens_agq.R`), not curated 3-way rungs — they do not appear in

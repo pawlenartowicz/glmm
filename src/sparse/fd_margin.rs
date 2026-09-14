@@ -602,6 +602,18 @@ fn measure_dense(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     } else {
         None
     };
+    // Observed twin of the crossed-Schur symbolic factor, so the exact β-profile's
+    // adjoint solve can run on `A_obs` without overwriting the Fisher factor every
+    // later pass reads. Built only where the exact profile can read it: a
+    // non-canonical link on the structured route — canonical links never read
+    // it, so building it here would be pure cost.
+    ws.exact_prof.obs_schur = if ws.groupings.structured_extras_eligible()
+        && !crate::family::is_canonical(sized.family)
+    {
+        StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
+    } else {
+        None
+    };
     let beta_start = crate::fit::glm_warm_start_beta(
         sized.family,
         f64::NAN,

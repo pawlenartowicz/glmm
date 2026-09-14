@@ -1734,6 +1734,150 @@ fn lmm_boundary_score_reported_after_canonicalization() {
     }
 }
 
+/// `unpermute_fit` must map [`Diagnostics::boundary_score`] back to declaration
+/// order exactly like [`Diagnostics::pinned`] — both are varcorr-aligned,
+/// per-grouping outputs (see `pinned_scores`'s doc comment: "Mirrors
+/// `pinned_flags` — change together"). Two intercept-only `Crossed` groupings,
+/// `g1` (8 levels) and `g2` (40 levels), trip `size_rule_perm`'s size rule when
+/// `g1` is declared primary: `g2` has more levels, so the kernel runs with `g2`
+/// in slot 0 and the reorder is undone on the way out. `g1`'s between-cluster
+/// variance is pinned to exactly 0 by the same ±0.8-per-replication
+/// cancellation `diagnostics_boundary_reports_both_ends` uses; `g2` carries a
+/// genuine per-level random effect, so its variance is estimated, not pinned.
+///
+/// Declaring `g1` first (`(1 | g1) + (1 | g2)`) exercises the swap; declaring
+/// `g2` first (`(1 | g2) + (1 | g1)`) does not (`g2`, with more levels, is
+/// already primary — `size_rule_perm` leaves it alone). Both must report
+/// `pinned` and `boundary_score` on the SAME slot: `pinned[g][0]` true and
+/// `boundary_score[g][0]` finite together, for whichever `g` is `g1`.
+#[test]
+fn unpermute_fit_aligns_boundary_score_with_pinned_across_size_rule_swap() {
+    let n_g1 = 8usize;
+    let n_g2 = 40usize;
+    let n = n_g1 * n_g2 * 2; // 2 replications per (g1, g2) cell
+    let mut st = 13u64;
+    // Fixed per-g2-level random effect: real, nonzero between-level variance.
+    let u2: Vec<f64> = (0..n_g2).map(|_| 0.6 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * 2];
+    let mut y = vec![0.0f64; n];
+    let mut g1_ids = vec![0u32; n];
+    let mut g2_ids = vec![0u32; n];
+    let mut idx = 0usize;
+    for rep in 0..2 {
+        // ±0.8 cancels exactly within EVERY g1 cluster (it is the same for
+        // every g2 level at a given rep), so g1's between-cluster variance
+        // MLE is 0. It also cancels within every g2 cluster (both reps hit
+        // every g1 level), so it does not contaminate g2's real effect.
+        let offset = if rep == 0 { 0.8 } else { -0.8 };
+        for (e, &u2e) in u2.iter().enumerate() {
+            for c in 0..n_g1 {
+                let x1 = lcg(&mut st);
+                x[idx * 2] = 1.0;
+                x[idx * 2 + 1] = x1;
+                g1_ids[idx] = c as u32;
+                g2_ids[idx] = e as u32;
+                y[idx] = 0.5 + 0.4 * x1 + offset + u2e + 0.02 * lcg(&mut st);
+                idx += 1;
+            }
+        }
+    }
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        boundary_score: true,
+        ..FitOptions::default()
+    };
+    let g1_grouping = || Grouping {
+        relation: GroupingRelation::Crossed {
+            n_clusters: n_g1 as u32,
+        },
+        slopes: vec![],
+    };
+    let g2_grouping = || Grouping {
+        relation: GroupingRelation::Crossed {
+            n_clusters: n_g2 as u32,
+        },
+        slopes: vec![],
+    };
+
+    // Declared as `(1 | g1) + (1 | g2)`: g1 is primary but g2 (more levels)
+    // becomes the kernel's slot-0 primary under the size rule.
+    let model_g1_primary = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g1 as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![g2_grouping()],
+        }),
+    };
+    let ids_g1_primary = GroupIds {
+        primary: g1_ids.clone(),
+        extra: vec![g2_ids.clone()],
+    };
+    let fit_g1_primary = fit_cold(&x, &y, n, 2, &model_g1_primary, &ids_g1_primary, &opts);
+    assert!(
+        fit_g1_primary.converged(),
+        "status = {:?}",
+        fit_g1_primary.diagnostics.boundary
+    );
+    assert_eq!(
+        fit_g1_primary.diagnostics.pinned,
+        vec![vec![true], vec![false]],
+        "pinned = {:?}",
+        fit_g1_primary.diagnostics.pinned
+    );
+    assert!(
+        fit_g1_primary.diagnostics.boundary_score[0][0].is_finite(),
+        "g1 (declared primary, pinned) must carry a finite score, got {:?}",
+        fit_g1_primary.diagnostics.boundary_score
+    );
+    assert!(
+        fit_g1_primary.diagnostics.boundary_score[1][0].is_nan(),
+        "g2 (declared extra, not pinned) must carry NaN, got {:?}",
+        fit_g1_primary.diagnostics.boundary_score
+    );
+
+    // Declared as `(1 | g2) + (1 | g1)`: g2 is already primary (more levels),
+    // so the size rule leaves the order alone — the control case.
+    let model_g2_primary = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g2 as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![g1_grouping()],
+        }),
+    };
+    let ids_g2_primary = GroupIds {
+        primary: g2_ids,
+        extra: vec![g1_ids],
+    };
+    let fit_g2_primary = fit_cold(&x, &y, n, 2, &model_g2_primary, &ids_g2_primary, &opts);
+    assert!(
+        fit_g2_primary.converged(),
+        "status = {:?}",
+        fit_g2_primary.diagnostics.boundary
+    );
+    assert_eq!(
+        fit_g2_primary.diagnostics.pinned,
+        vec![vec![false], vec![true]],
+        "pinned = {:?}",
+        fit_g2_primary.diagnostics.pinned
+    );
+    assert!(
+        fit_g2_primary.diagnostics.boundary_score[0][0].is_nan(),
+        "g2 (declared primary, not pinned) must carry NaN, got {:?}",
+        fit_g2_primary.diagnostics.boundary_score
+    );
+    assert!(
+        fit_g2_primary.diagnostics.boundary_score[1][0].is_finite(),
+        "g1 (declared extra, pinned) must carry a finite score, got {:?}",
+        fit_g2_primary.diagnostics.boundary_score
+    );
+}
+
 /// `Boundary` at both ends of the range the dense LMM route can report:
 /// the deterministic τ̂=0 pin fixture (`fit_lmm_weighted_boundary_matches_wls`'s
 /// design, same construction) lands `AtBoundary`, lmm_hand_dataset() with `i % 6` grouping lands `Interior`.

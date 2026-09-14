@@ -704,6 +704,7 @@ pub(super) fn unpermute_fit(perm: Perm, fit: &mut Fit) {
     perm.swap_slots(&mut fit.stddev_se);
     perm.swap_slots(&mut fit.varcorr);
     perm.swap_slots(&mut fit.diagnostics.pinned);
+    perm.swap_slots(&mut fit.diagnostics.boundary_score);
 }
 
 /// The size rule: **when every grouping is intercept-only and `Crossed`, the

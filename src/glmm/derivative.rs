@@ -61,7 +61,7 @@
 
 use super::agq::{agq_deviance, agq_deviance_vec, ClusterRowIndex};
 use super::deviance::{blocked_laplace_deviance, structured_laplace_deviance};
-use super::pirls::{BetaStep, DualStep, TailKernel};
+use super::pirls::{obs_len, BetaStep, DualStep, TailKernel};
 use super::workspace::GlmmWorkspace;
 use crate::dual::{Dual, HyperDual};
 use crate::lmm::LmmGroupings;
@@ -89,24 +89,24 @@ pub(crate) enum DerivStatus {
 /// at a non-`f64` scalar. Mirrors the `GlmmWorkspace` fields of the same names —
 /// change together with the workspace's sizing block (`workspace.rs:495-571`).
 pub(crate) struct GlmmDualBufs<T: Scalar> {
-    params: Vec<T>,    // m (seeded per call)
-    beta: Vec<T>,      // p
-    lam: Vec<T>,       // q_p²
-    m_buf: Vec<T>,     // rows · q_p
-    eta: Vec<T>,       // rows
-    prob: Vec<T>,      // rows
-    w: Vec<T>,         // rows
-    u: Vec<T>,         // k
-    u_prev: Vec<T>,    // k.max(1)
-    eta_fixed: Vec<T>, // rows
-    a_blocks: Vec<T>,  // s · q_p²
-    a_rhs: Vec<T>,     // k
+    pub(super) params: Vec<T>,    // m (seeded per call)
+    pub(super) beta: Vec<T>,      // p
+    pub(super) lam: Vec<T>,       // q_p²
+    pub(super) m_buf: Vec<T>,     // rows · q_p
+    pub(super) eta: Vec<T>,       // rows
+    pub(super) prob: Vec<T>,      // rows
+    pub(super) w: Vec<T>,         // rows
+    pub(super) u: Vec<T>,         // k
+    pub(super) u_prev: Vec<T>,    // k.max(1)
+    pub(super) eta_fixed: Vec<T>, // rows
+    pub(super) a_blocks: Vec<T>,  // s · q_p²
+    pub(super) a_rhs: Vec<T>,     // k
     // Same shape rule as the f64 `ws.agq_scratch` (`workspace.rs:415-426`):
     // `2·s + nagq^q_p·(q_p+1)` at q_p ≥ 2, `4·s` at q_p == 1, `.max(1)`.
     // Read by `agq_deviance`/`agq_deviance_vec` when `ws.nagq > 1`;
     // allocated but untouched on every model shape that takes the blocked
     // path instead.
-    agq_scratch: Vec<T>,
+    pub(super) agq_scratch: Vec<T>,
     // Structured-extras twins, sized exactly as `GlmmWorkspace::from_groupings`
     // sizes their f64 namesakes (`workspace.rs:562-570`) — `q_core = primary_q
     // + nested_per_parent`, `e = k_crossed()`, `G_cap = MAX_EXTRA_GROUPINGS`.
@@ -114,15 +114,27 @@ pub(crate) struct GlmmDualBufs<T: Scalar> {
     // which is why they are sized here rather than lazily: the zero-alloc gate
     // is about repeat calls, and a lazy first-extras-call allocation would
     // break it on the very shape it is meant to cover.
-    mu: Vec<T>,          // rows
-    core_blocks: Vec<T>, // (q_core² · s).max(1)
-    coupling: Vec<T>,    // (q_core · s · e).max(1)
-    schur_blk: Vec<T>,   // (e²).max(1)
-    m_core_buf: Vec<T>,  // (rows · q_core).max(1)
-    cross_val: Vec<T>,   // (rows · G_cap).max(1)
-    // Per-solve controls + observed-step scratch (`s · q_p²`) handed to every
-    // dual kernel call; see `pirls::DualStep`.
-    dual: DualStep<T>,
+    pub(super) mu: Vec<T>,          // rows
+    pub(super) core_blocks: Vec<T>, // (q_core² · s).max(1)
+    pub(super) coupling: Vec<T>,    // (q_core · s · e).max(1)
+    pub(super) schur_blk: Vec<T>,   // (e²).max(1)
+    pub(super) m_core_buf: Vec<T>,  // (rows · q_core).max(1)
+    pub(super) cross_val: Vec<T>,   // (rows · G_cap).max(1)
+    // Per-solve controls handed to every dual kernel call; see `pirls::DualStep`.
+    // Carries the blocked twin's scratch (`obs_blocks`, `s · q_p²`) and the
+    // structured twin's (`obs_core_blocks` `(q_core² · s).max(1)`,
+    // `obs_coupling` `(q_core · s · e).max(1)`, `obs_schur_blk` `(e²).max(1)`,
+    // `obs_rhs` `k`, `obs_resid` `rows`) — same sizes `for_shape` allocates.
+    pub(super) dual: DualStep<T>,
+    /// The assembled gradient at `T`, one entry per `γ` coordinate: the value
+    /// part is the gradient, the lanes of a seeded pass are that pass's
+    /// columns of the joint Hessian.
+    pub(super) grad_t: Vec<T>, // m
+    /// Row passes, adjoint solve and observed factor of the assembled
+    /// derivative, at `T`. Its own struct because every length in it is a
+    /// function of the same shape terms and the assembly reads them as one
+    /// group.
+    pub(super) asm: super::assembled::AssemblyBufs<T>,
 }
 
 /// The `T`-independent half of a structured-extras call: the per-row extra
@@ -173,12 +185,12 @@ pub(crate) struct GlmmModeBufs {
     /// mutates `ws.u` in place, and copied back after so the workspace's fit
     /// state comes back as found — same role the removed local `saved_u`
     /// played.
-    saved_u: Vec<f64>,
+    pub(super) saved_u: Vec<f64>,
     /// The converged PIRLS mode `ws.u[..k]`, copied out of `ws.u` once per
     /// call before the dual kernel(s) below read it as `run_gradient`'s /
     /// `run_hessian`'s `u_mode` argument — same role the removed local
     /// `u_mode` played.
-    u_mode: Vec<f64>,
+    pub(super) u_mode: Vec<f64>,
 }
 
 impl GlmmModeBufs {
@@ -240,7 +252,7 @@ impl GlmmDualScratch {
     /// `(order, N)` and shape reuses the stored scratch, a different one
     /// reallocates once (the zero-alloc-on-repeat gate is about
     /// repeat calls at the SAME shape; a shape change is not a repeat call).
-    fn lanes(&self) -> NLanes {
+    pub(super) fn lanes(&self) -> NLanes {
         match self {
             GlmmDualScratch::D4(..) => NLanes::D4,
             GlmmDualScratch::D5(..) => NLanes::D5,
@@ -284,7 +296,7 @@ impl GlmmDualScratch {
     /// resolved to (the type-specific match comes after), so it reaches the
     /// buffers through this accessor rather than the final match's `mode`
     /// binding.
-    fn mode_bufs_mut(&mut self) -> &mut GlmmModeBufs {
+    pub(super) fn mode_bufs_mut(&mut self) -> &mut GlmmModeBufs {
         match self {
             GlmmDualScratch::D4(_, _, mode)
             | GlmmDualScratch::D5(_, _, mode)
@@ -296,6 +308,55 @@ impl GlmmDualScratch {
             | GlmmDualScratch::H6(_, _, mode)
             | GlmmDualScratch::H8(_, _, mode)
             | GlmmDualScratch::H12(_, _, mode) => mode,
+        }
+    }
+
+    /// The `DualStep::exact` flag the last dual kernel call left: true iff
+    /// that call's lanes were the answer on their own, so the refinement loop
+    /// in `run_gradient` / `run_hessian` did not have to run. The one thing
+    /// that separates a cell where one kernel call suffices from one where it
+    /// does not, and therefore the observable a test pins that split on.
+    pub(crate) fn exit_exact(&self) -> bool {
+        match self {
+            GlmmDualScratch::D4(b, ..) => b.dual.exact,
+            GlmmDualScratch::D5(b, ..) => b.dual.exact,
+            GlmmDualScratch::D6(b, ..) => b.dual.exact,
+            GlmmDualScratch::D8(b, ..) => b.dual.exact,
+            GlmmDualScratch::D12(b, ..) => b.dual.exact,
+            GlmmDualScratch::H4(b, ..) => b.dual.exact,
+            GlmmDualScratch::H5(b, ..) => b.dual.exact,
+            GlmmDualScratch::H6(b, ..) => b.dual.exact,
+            GlmmDualScratch::H8(b, ..) => b.dual.exact,
+            GlmmDualScratch::H12(b, ..) => b.dual.exact,
+        }
+    }
+
+    /// `max|u − u_prev|` over the value parts of the buffers the last dual
+    /// kernel call left — how far that call's final PIRLS step moved.
+    ///
+    /// The Laplace objective is built at `u_prev` and penalized at `u`, so
+    /// this distance is the size of the iterate mix whatever differentiated
+    /// those buffers was differentiating. A pass entered with a step floor
+    /// (`DualStep::min_iters`) exits at a different distance from one entered
+    /// without, which is the one thing the two Hessian passes do not share.
+    pub(crate) fn exit_mode_step(&self) -> f64 {
+        fn step<T: Scalar>(b: &GlmmDualBufs<T>) -> f64 {
+            b.u.iter()
+                .zip(&b.u_prev)
+                .map(|(a, c)| (a.value() - c.value()).abs())
+                .fold(0.0, f64::max)
+        }
+        match self {
+            GlmmDualScratch::D4(b, ..) => step(b),
+            GlmmDualScratch::D5(b, ..) => step(b),
+            GlmmDualScratch::D6(b, ..) => step(b),
+            GlmmDualScratch::D8(b, ..) => step(b),
+            GlmmDualScratch::D12(b, ..) => step(b),
+            GlmmDualScratch::H4(b, ..) => step(b),
+            GlmmDualScratch::H5(b, ..) => step(b),
+            GlmmDualScratch::H6(b, ..) => step(b),
+            GlmmDualScratch::H8(b, ..) => step(b),
+            GlmmDualScratch::H12(b, ..) => step(b),
         }
     }
 }
@@ -327,12 +388,14 @@ const MAX_DUAL_H: usize = 78;
 const _: () = assert!(MAX_DUAL_H == MAX_DUAL_N * (MAX_DUAL_N + 1) / 2);
 
 /// Cap on the dual re-entries the FALLBACK refinement loop may take before
-/// the returned derivatives stop moving. Every dual call takes an
+/// the returned derivatives stop moving. A dual call normally takes an
 /// exact-Hessian step (`pirls::DualStep`: canonical `A`, or the
 /// observed-information `A_obs` on a non-canonical link), so the IFT lanes are
-/// reached in one step and the loop is entered only when some observed block
-/// was not PD and that step fell back to its Fisher block
-/// (`DualStep::exact == false`). There the lanes contract by
+/// reached in one step and the loop is skipped. It is entered on
+/// `DualStep::exact == false`, which is either a row on one of the kernel's
+/// clamps (`pirls::clamped_row_present`) or a non-PD observed factor — one
+/// block on the blocked path, the whole crossed-tail Schur on the
+/// structured-extras path. There the lanes contract by
 /// `‖I − A⁻¹h_uu‖` per step; a Fisher-only fallback needed 5–7
 /// calls on the FD gates' draws and 9–10 on `sim_gamma` at its converged fit
 /// (each call two steps), so 12 keeps two calls of headroom above the worst
@@ -460,10 +523,21 @@ pub(super) fn agq_eligible(family: Family, nagq: u8, primary_q: usize) -> bool {
 /// (checking `eta` covers `prob`/`w`/`eta_fixed`/`mu`, allocated together at
 /// the same `rows`; `u` pins `k` and with it `u_prev`, `a_rhs`, and the
 /// `GlmmModeBufs`; `core_blocks` pins `q_core` and with it `m_core_buf`, and
-/// `schur_blk` pins `e` — the pair together pins `coupling`). Lengths only:
-/// the `ClusterRowIndex` built from `cluster_ids` is not covered — same-shape
-/// data with different cluster assignment is still the caller's
-/// responsibility.
+/// `schur_blk` pins `e` — the pair together pins `coupling`). The
+/// `DualStep` twins mirror the same pinning: `obs_core_blocks` re-checks
+/// `q_core`, `obs_schur_blk` re-checks `e`, and `obs_rhs`/`obs_resid` need no
+/// separate check because `u`'s `k` and `eta`'s `rows` already cover them.
+/// Both twin checks also pin `observed`: an empty twin matches only an
+/// `observed == false` request, so a scratch sized without the twins is never
+/// handed to a call that reads them.
+/// The assembly scratch adds one length nothing else pins — `G_γ`'s `m·k`
+/// product — plus `grad_t`'s `m`; every other buffer in `AssemblyBufs` is a
+/// function of `m`, `k`, `rows`, `s`, `q_core` or `e`, each already pinned
+/// above. `assembly` says which of the two cases the caller's variant is:
+/// the `Dual` rungs carry the sized set, the `HyperDual` rungs an empty one.
+/// Lengths only: the `ClusterRowIndex` built from `cluster_ids` is not
+/// covered — same-shape data with different cluster assignment is still the
+/// caller's responsibility.
 #[allow(clippy::too_many_arguments)]
 fn bufs_match_shape<T: Scalar>(
     b: &GlmmDualBufs<T>,
@@ -476,6 +550,12 @@ fn bufs_match_shape<T: Scalar>(
     q_core: usize,
     e: usize,
     nagq: u8,
+    // Whether this fit takes the observed-information step (`!is_canonical`),
+    // which is what decides whether the `DualStep` twins carry storage.
+    observed: bool,
+    // True on the `Dual` rungs, where the assembly runs and its scratch is
+    // sized; false on the `HyperDual` rungs, which carry none.
+    assembly: bool,
 ) -> bool {
     b.params.len() == m
         && b.beta.len() == p
@@ -487,10 +567,25 @@ fn bufs_match_shape<T: Scalar>(
         && b.agq_scratch.len() == agq_len(s, q_p, nagq)
         && b.core_blocks.len() == (q_core * q_core * s).max(1)
         && b.schur_blk.len() == (e * e).max(1)
+        // `obs_core_blocks` pins `q_core` (and with it `obs_coupling`),
+        // `obs_schur_blk` pins `e`; `u`'s `k` and `eta`'s `rows`, already
+        // checked above, pin `obs_rhs` and `obs_resid` — no separate check
+        // needed for either.
+        && b.dual.obs_core_blocks.len() == obs_len(observed, (q_core * q_core * s).max(1))
+        && b.dual.obs_schur_blk.len() == obs_len(observed, (e * e).max(1))
+        && b.grad_t.len() == m
+        && if assembly {
+            b.asm.g_gamma.len() == (m * k).max(1)
+        } else {
+            b.asm.g_gamma.is_empty()
+        }
 }
 
 impl GlmmDualScratch {
-    /// Allocate the dual scratch for one model shape at one lane count. Row
+    /// Allocate the dual scratch for one model shape at one lane count.
+    /// `observed` says whether this fit takes the observed-information step;
+    /// the `DualStep` twins are sized through [`obs_len`] off it, so a
+    /// canonical link allocates none of them. Row
     /// buffers (`eta`, `prob`, `w`, `eta_fixed`, `m_buf`) are `rows`-length on
     /// every route — `rows` is `n`, the global row count: the row passes and
     /// the AGQ kernels both index by global row (see the module doc on
@@ -521,12 +616,13 @@ impl GlmmDualScratch {
         q_core: usize,
         e: usize,
         nagq: u8,
+        observed: bool,
         cluster_ids: &[u32],
     ) -> GlmmDualScratch {
         let idx = ClusterRowIndex::build(cluster_ids, s);
         let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
         macro_rules! build {
-            ($T:ty, $variant:ident) => {
+            ($T:ty, $variant:ident, $asm:expr) => {
                 GlmmDualScratch::$variant(
                     GlmmDualBufs::<$T> {
                         params: vec![<$T as Scalar>::ZERO; m],
@@ -550,34 +646,81 @@ impl GlmmDualScratch {
                         cross_val: vec![<$T as Scalar>::ZERO; (rows * g_cap).max(1)],
                         dual: DualStep {
                             observed: false,
-                            obs_blocks: vec![<$T as Scalar>::ZERO; s * q_p * q_p],
+                            obs_blocks: vec![
+                                <$T as Scalar>::ZERO;
+                                obs_len(observed, s * q_p * q_p)
+                            ],
+                            obs_core_blocks: vec![
+                                <$T as Scalar>::ZERO;
+                                obs_len(observed, (q_core * q_core * s).max(1))
+                            ],
+                            obs_coupling: vec![
+                                <$T as Scalar>::ZERO;
+                                obs_len(observed, (q_core * s * e).max(1))
+                            ],
+                            obs_schur_blk: vec![
+                                <$T as Scalar>::ZERO;
+                                obs_len(observed, (e * e).max(1))
+                            ],
+                            obs_rhs: vec![<$T as Scalar>::ZERO; obs_len(observed, k)],
+                            obs_resid: vec![<$T as Scalar>::ZERO; obs_len(observed, rows)],
                             min_iters: 0,
                             exact: false,
                         },
+                        grad_t: vec![<$T as Scalar>::ZERO; m],
+                        asm: $asm,
                     },
                     idx,
                     GlmmModeBufs::for_shape(k),
                 )
             };
         }
+        // The assembled Hessian runs on the `Dual` rungs only, so the
+        // `HyperDual` rungs carry no assembly scratch at all — see
+        // `AssemblyBufs::empty`.
+        macro_rules! sized_asm {
+            ($T:ty) => {
+                super::assembled::AssemblyBufs::<$T>::for_shape(m, k, rows, s, q_core, e)
+            };
+        }
         match n {
-            NLanes::D4 => build!(Dual<4>, D4),
-            NLanes::D5 => build!(Dual<5>, D5),
-            NLanes::D6 => build!(Dual<6>, D6),
-            NLanes::D8 => build!(Dual<8>, D8),
-            NLanes::D12 => build!(Dual<12>, D12),
-            NLanes::H4 => build!(HyperDual<4, 10>, H4),
-            NLanes::H5 => build!(HyperDual<5, 15>, H5),
-            NLanes::H6 => build!(HyperDual<6, 21>, H6),
-            NLanes::H8 => build!(HyperDual<8, 36>, H8),
-            NLanes::H12 => build!(HyperDual<12, 78>, H12),
+            NLanes::D4 => build!(Dual<4>, D4, sized_asm!(Dual<4>)),
+            NLanes::D5 => build!(Dual<5>, D5, sized_asm!(Dual<5>)),
+            NLanes::D6 => build!(Dual<6>, D6, sized_asm!(Dual<6>)),
+            NLanes::D8 => build!(Dual<8>, D8, sized_asm!(Dual<8>)),
+            NLanes::D12 => build!(Dual<12>, D12, sized_asm!(Dual<12>)),
+            NLanes::H4 => build!(
+                HyperDual<4, 10>,
+                H4,
+                super::assembled::AssemblyBufs::empty()
+            ),
+            NLanes::H5 => build!(
+                HyperDual<5, 15>,
+                H5,
+                super::assembled::AssemblyBufs::empty()
+            ),
+            NLanes::H6 => build!(
+                HyperDual<6, 21>,
+                H6,
+                super::assembled::AssemblyBufs::empty()
+            ),
+            NLanes::H8 => build!(
+                HyperDual<8, 36>,
+                H8,
+                super::assembled::AssemblyBufs::empty()
+            ),
+            NLanes::H12 => build!(
+                HyperDual<12, 78>,
+                H12,
+                super::assembled::AssemblyBufs::empty()
+            ),
         }
     }
 
     /// Shape half of the reuse-policy check (see [`Self::lanes`]) —
     /// [`bufs_match_shape`] against the stored buffers, whatever the variant.
     #[allow(clippy::too_many_arguments)]
-    fn matches_shape(
+    pub(super) fn matches_shape(
         &self,
         m: usize,
         p: usize,
@@ -588,23 +731,24 @@ impl GlmmDualScratch {
         q_core: usize,
         e: usize,
         nagq: u8,
+        observed: bool,
     ) -> bool {
         macro_rules! check {
-            ($b:expr) => {
-                bufs_match_shape($b, m, p, k, rows, s, q_p, q_core, e, nagq)
+            ($b:expr, $asm:expr) => {
+                bufs_match_shape($b, m, p, k, rows, s, q_p, q_core, e, nagq, observed, $asm)
             };
         }
         match self {
-            GlmmDualScratch::D4(b, ..) => check!(b),
-            GlmmDualScratch::D5(b, ..) => check!(b),
-            GlmmDualScratch::D6(b, ..) => check!(b),
-            GlmmDualScratch::D8(b, ..) => check!(b),
-            GlmmDualScratch::D12(b, ..) => check!(b),
-            GlmmDualScratch::H4(b, ..) => check!(b),
-            GlmmDualScratch::H5(b, ..) => check!(b),
-            GlmmDualScratch::H6(b, ..) => check!(b),
-            GlmmDualScratch::H8(b, ..) => check!(b),
-            GlmmDualScratch::H12(b, ..) => check!(b),
+            GlmmDualScratch::D4(b, ..) => check!(b, true),
+            GlmmDualScratch::D5(b, ..) => check!(b, true),
+            GlmmDualScratch::D6(b, ..) => check!(b, true),
+            GlmmDualScratch::D8(b, ..) => check!(b, true),
+            GlmmDualScratch::D12(b, ..) => check!(b, true),
+            GlmmDualScratch::H4(b, ..) => check!(b, false),
+            GlmmDualScratch::H5(b, ..) => check!(b, false),
+            GlmmDualScratch::H6(b, ..) => check!(b, false),
+            GlmmDualScratch::H8(b, ..) => check!(b, false),
+            GlmmDualScratch::H12(b, ..) => check!(b, false),
         }
     }
 }
@@ -614,7 +758,7 @@ impl GlmmDualScratch {
 /// concept of a derivative lane, and only the derivative entry points below
 /// need this, so it lives here rather than widening the kernel's own trait.
 /// Both `Dual<N>` and `HyperDual<N, H>` implement it, below.
-trait Seed: TailKernel {
+pub(super) trait Seed: TailKernel {
     /// Instantiated first-derivative lane count of this type — `N`. The chunk
     /// width `run_gradient` seeds per pass.
     const LANES: usize;
@@ -728,16 +872,16 @@ fn run_gradient<T: Seed>(
     // one step there too. Two steps per call either way: the first moves the
     // lanes, the second reads `dev`/`log|A|` at the moved `u`.
     //
-    // The extras kernel has no observed step — that would need observed twins
-    // of `core_blocks`/`coupling`/`schur_blk`, all built from W — so it reads
-    // neither `observed` nor `obs_blocks` and reports `exact = is_canonical`
-    // instead (`pirls_solve_blocked_extras`). `observed` is set false there so
-    // the flag never claims a step the kernel does not take; a non-canonical
-    // link on that path reaches its answer through the Fisher contraction in
-    // the loop below.
+    // Both the blocked and the structured-extras kernel take this step:
+    // `pirls_solve_blocked_extras` packs its twin as the core-block + Schur
+    // split the Fisher factor already uses, since a crossed-tail column
+    // couples every cluster and there is no per-cluster block to solve alone.
+    // What is left for the refinement loop below to do any work on, on either
+    // path: a row on one of the kernel's clamps, which holds on canonical
+    // links too, and a non-PD twin factor.
     let extras = !groupings.extra_offsets.is_empty();
     let canonical = crate::family::is_canonical(family);
-    bufs.dual.observed = !canonical && !extras;
+    bufs.dual.observed = !canonical;
     // AGQ routing: the full `laplace_deviance` gate — the shape terms AND an
     // empty `extra_offsets`, since an extras design takes the Laplace
     // structured arm whatever `nagq` says. Any Binomial link (not just the
@@ -958,12 +1102,13 @@ fn run_gradient<T: Seed>(
                 return DerivStatus::NotConverged;
             }
             let d = obj.dslice();
-            // Every step of this call was an exact-Hessian step (`DualStep::exact`:
-            // always on a canonical link), so its lanes are the answer. Two things
-            // leave the Fisher contraction below to do the work instead, both
-            // re-entering from the returned `u` with its lanes: a non-PD observed
-            // block on the blocked path, and any non-canonical link on the extras
-            // path, which has no observed step at all.
+            // Every step of this call was an exact-Hessian step
+            // (`DualStep::exact`), so its lanes are the answer. What leaves the
+            // contraction below to do the work instead, on either path: a row
+            // on one of the kernel's clamps, or a non-PD observed factor — a
+            // block on the blocked path, the whole crossed-tail Schur on the
+            // extras one. Either way the loop re-enters from the returned `u`
+            // with its lanes.
             if bufs.dual.exact {
                 grad[base..base + width].copy_from_slice(&d[..width]);
                 pass_value = Some(obj.value());
@@ -1051,8 +1196,11 @@ pub(crate) fn laplace_gradient(
         ws.groupings.k_crossed(),
         ws.nagq,
     );
+    // Sizes the `DualStep` twins as well as pinning them in the reuse check —
+    // same condition `bufs.dual.observed` takes below.
+    let observed = !crate::family::is_canonical(ws.family);
     let need_build = ws.dual_scratch.as_deref().is_none_or(|sc| {
-        sc.lanes() != nl || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq)
+        sc.lanes() != nl || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq, observed)
     });
     if need_build {
         ws.dual_scratch = Some(Box::new(GlmmDualScratch::for_shape(
@@ -1066,6 +1214,7 @@ pub(crate) fn laplace_gradient(
             q_core,
             e,
             nagq,
+            observed,
             cluster_ids,
         )));
     }
@@ -1651,8 +1800,10 @@ fn run_hessian<T: SeedHessian>(
         }};
     }
 
-    // One solve of at least three exact-Hessian steps (two-pass Newton-map
-    // argument): step 1 makes `u`'s first-order lanes exact, step 2 its
+    // One solve of at least three steps, which on a cell where those steps are
+    // exact-Hessian ones is the whole answer (two-pass Newton-map argument;
+    // the `DualStep::exact` guard below is what says they were):
+    // step 1 makes `u`'s first-order lanes exact, step 2 its
     // second-order lanes, and step 3 is the read — `dev` and `log|A|` are
     // evaluated at step 3's INPUT `u` (the step-2 output) and `‖u‖²` at its
     // output, all with exact lanes. Neither `∂dev/∂u` nor `∂logdet/∂u`
@@ -1660,10 +1811,10 @@ fn run_hessian<T: SeedHessian>(
     // zero-second-order-lane input of step 2) would be wrong. The value part
     // sits at the mode throughout, so the mixed-deviance exit would fire
     // after step 2 without the floor.
-    // `!extras` for the same reason `run_gradient` gives: the extras kernel
-    // takes no observed step and reads neither flag, so claiming one here
-    // would be a lie about the step it takes.
-    bufs.dual.observed = !canonical && !extras;
+    // Same routing `run_gradient` gives: both the blocked and the
+    // structured-extras kernel take the observed step on a non-canonical
+    // link, the latter through its core-block + Schur twin.
+    bufs.dual.observed = !canonical;
     bufs.dual.min_iters = 3;
     seed_params!();
     let obj: T = call_kernel!();
@@ -1673,15 +1824,15 @@ fn run_hessian<T: SeedHessian>(
         return DerivStatus::Ok(obj.value());
     }
 
-    // Fallback: the solve was not exact — some observed block was not PD on
-    // the blocked path, or this is a non-canonical link on the extras path,
-    // which has only the Fisher step. Either way the step took a Fisher block
-    // and the lanes only contracted toward the IFT answer. Re-enter from
-    // the returned `u` (lanes included) until the objective's `d` and `h`
-    // settle, or until two successive calls were both exact — second-order
-    // lanes are exact once the last two steps were exact ones, and the read
-    // call's objective is evaluated at its input `u`, which the previous call
-    // produced.
+    // Fallback: the solve was not exact — a row on one of the kernel's clamps,
+    // or a non-PD observed factor (a block on the blocked path, the whole
+    // crossed-tail Schur on the extras one) whose step took a Fisher factor
+    // instead — so the lanes only contracted toward the IFT answer, they did
+    // not reach it. Re-enter from the returned `u` (lanes included) until the
+    // objective's `d` and `h` settle, or until two successive calls were both
+    // exact — second-order lanes are exact once the last two steps were exact
+    // ones, and the read call's objective is evaluated at its input `u`, which
+    // the previous call produced.
     //
     // `MAX_DUAL_REFINEMENTS` counted AS READ CALLS ONLY here (`max_reads`
     // calls, i.e. the second kernel call onward) — the first call above sits
@@ -1785,8 +1936,10 @@ pub(crate) fn laplace_hessian(
         ws.groupings.k_crossed(),
         ws.nagq,
     );
+    // Same twin sizing/pinning `laplace_gradient` uses.
+    let observed = !crate::family::is_canonical(ws.family);
     let need_build = ws.hyper_scratch.as_deref().is_none_or(|sc| {
-        sc.lanes() != nl || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq)
+        sc.lanes() != nl || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq, observed)
     });
     if need_build {
         ws.hyper_scratch = Some(Box::new(GlmmDualScratch::for_shape(
@@ -1800,6 +1953,7 @@ pub(crate) fn laplace_hessian(
             q_core,
             e,
             nagq,
+            observed,
             cluster_ids,
         )));
     }
@@ -2109,7 +2263,10 @@ mod tests {
 
     /// `for_shape` at `q_p == 1` (the scalar-intercept shape, `agq_scratch`'s
     /// `4·s` arm): every `GlmmDualBufs` field's `len()` must equal the same
-    /// expression `for_shape` used to allocate it.
+    /// expression `for_shape` used to allocate it. Built with `observed`, so
+    /// the `DualStep` twins carry their sized lengths here;
+    /// `for_shape_leaves_observed_twins_empty_on_a_canonical_link` covers the
+    /// other side.
     #[test]
     fn for_shape_buffer_lengths_match_at_q_p_1() {
         let (m, p, k, rows, s, q_p, nagq) = (5usize, 3usize, 7usize, 40usize, 7usize, 1usize, 7u8);
@@ -2127,6 +2284,7 @@ mod tests {
             q_core,
             e,
             nagq,
+            true,
             &cluster_ids,
         );
         match scratch {
@@ -2151,6 +2309,31 @@ mod tests {
                 assert_eq!(bufs.schur_blk.len(), e * e);
                 assert_eq!(bufs.m_core_buf.len(), rows * q_core);
                 assert_eq!(bufs.cross_val.len(), rows * crate::lmm::MAX_EXTRA_GROUPINGS);
+                assert_eq!(bufs.dual.obs_core_blocks.len(), q_core * q_core * s);
+                assert_eq!(bufs.dual.obs_coupling.len(), q_core * s * e);
+                assert_eq!(bufs.dual.obs_schur_blk.len(), e * e);
+                assert_eq!(bufs.dual.obs_rhs.len(), k);
+                assert_eq!(bufs.dual.obs_resid.len(), rows);
+                assert_eq!(bufs.grad_t.len(), m);
+                assert_eq!(bufs.asm.tail_inv.len(), e * e);
+                assert_eq!(bufs.asm.tail_col.len(), e);
+                assert_eq!(bufs.asm.rho.len(), rows);
+                assert_eq!(bufs.asm.w_eta.len(), rows);
+                assert_eq!(bufs.asm.w_obs.len(), rows);
+                assert_eq!(bufs.asm.lev.len(), rows);
+                assert_eq!(bufs.asm.d_gamma.len(), m);
+                assert_eq!(bufs.asm.l_gamma.len(), m);
+                assert_eq!(bufs.asm.d_u.len(), k);
+                assert_eq!(bufs.asm.l_u.len(), k);
+                assert_eq!(bufs.asm.g_gamma.len(), m * k);
+                assert_eq!(bufs.asm.adj.len(), k);
+                assert_eq!(bufs.asm.rb.len(), e);
+                assert_eq!(bufs.asm.sb.len(), e);
+                assert_eq!(bufs.asm.ra.len(), e);
+                assert_eq!(bufs.asm.sa.len(), e);
+                assert_eq!(bufs.asm.obs_core.len(), s * q_core * q_core);
+                assert_eq!(bufs.asm.obs_coup.len(), q_core * s * e);
+                assert_eq!(bufs.asm.obs_schur.len(), e * e);
                 assert_eq!(mode.saved_u.len(), k.max(1));
                 assert_eq!(mode.u_mode.len(), k);
             }
@@ -2159,7 +2342,8 @@ mod tests {
     }
 
     /// Same check at `q_p == 2` (the vector-RE shape, `agq_scratch`'s
-    /// `2·s + nagq^q_p·(q_p+1)` arm), on the `HyperDual` order.
+    /// `2·s + nagq^q_p·(q_p+1)` arm), on the `HyperDual` order — which is also
+    /// where the assembly scratch is expected to be absent entirely.
     #[test]
     fn for_shape_buffer_lengths_match_at_q_p_2() {
         let (m, p, k, rows, s, q_p, nagq) = (6usize, 2usize, 18usize, 50usize, 9usize, 2usize, 5u8);
@@ -2178,6 +2362,7 @@ mod tests {
             q_core,
             e,
             nagq,
+            true,
             &cluster_ids,
         );
         match scratch {
@@ -2203,11 +2388,80 @@ mod tests {
                 assert_eq!(bufs.schur_blk.len(), 1);
                 assert_eq!(bufs.m_core_buf.len(), rows * q_core);
                 assert_eq!(bufs.cross_val.len(), rows * crate::lmm::MAX_EXTRA_GROUPINGS);
+                assert_eq!(bufs.dual.obs_core_blocks.len(), q_core * q_core * s);
+                assert_eq!(bufs.dual.obs_coupling.len(), 1); // e == 0 ⇒ the .max(1) minimum
+                assert_eq!(bufs.dual.obs_schur_blk.len(), 1);
+                assert_eq!(bufs.dual.obs_rhs.len(), k);
+                assert_eq!(bufs.dual.obs_resid.len(), rows);
+                assert_eq!(bufs.grad_t.len(), m);
+                // A `HyperDual` rung carries NO assembly scratch: the assembled
+                // pass runs on the `Dual` rungs alone, and `m·k` second-order
+                // numbers would be megabytes on a wide `k`.
+                assert!(bufs.asm.tail_inv.is_empty());
+                assert!(bufs.asm.tail_col.is_empty());
+                assert!(bufs.asm.rho.is_empty());
+                assert!(bufs.asm.w_eta.is_empty());
+                assert!(bufs.asm.w_obs.is_empty());
+                assert!(bufs.asm.lev.is_empty());
+                assert!(bufs.asm.d_gamma.is_empty());
+                assert!(bufs.asm.l_gamma.is_empty());
+                assert!(bufs.asm.d_u.is_empty());
+                assert!(bufs.asm.l_u.is_empty());
+                assert!(bufs.asm.g_gamma.is_empty());
+                assert!(bufs.asm.adj.is_empty());
+                assert!(bufs.asm.rb.is_empty());
+                assert!(bufs.asm.sb.is_empty());
+                assert!(bufs.asm.ra.is_empty());
+                assert!(bufs.asm.sa.is_empty());
+                assert!(bufs.asm.obs_core.is_empty());
+                assert!(bufs.asm.obs_coup.is_empty());
+                assert!(bufs.asm.obs_schur.is_empty());
                 assert_eq!(mode.saved_u.len(), k.max(1));
                 assert_eq!(mode.u_mode.len(), k);
             }
             _ => panic!("expected H8 variant"),
         }
+    }
+
+    /// A canonical link never reads an observed twin, so `for_shape` gives it
+    /// none — on a wide crossed shape `obs_coupling` alone is the largest
+    /// buffer in the scratch. The reuse check must pin the same thing, or a
+    /// canonical-sized scratch could be handed to a call that indexes them.
+    #[test]
+    fn for_shape_leaves_observed_twins_empty_on_a_canonical_link() {
+        let (m, p, k, rows, s, q_p, nagq) = (5usize, 3usize, 7usize, 40usize, 7usize, 1usize, 7u8);
+        let (q_core, e) = (q_p + 2, 6usize);
+        let cluster_ids: Vec<u32> = (0..rows as u32).map(|i| i % s as u32).collect();
+        let scratch = GlmmDualScratch::for_shape(
+            NLanes::D8,
+            m,
+            p,
+            k,
+            rows,
+            s,
+            q_p,
+            q_core,
+            e,
+            nagq,
+            false,
+            &cluster_ids,
+        );
+        match &scratch {
+            GlmmDualScratch::D8(bufs, ..) => {
+                assert!(bufs.dual.obs_blocks.is_empty());
+                assert!(bufs.dual.obs_core_blocks.is_empty());
+                assert!(bufs.dual.obs_coupling.is_empty());
+                assert!(bufs.dual.obs_schur_blk.is_empty());
+                assert!(bufs.dual.obs_rhs.is_empty());
+                assert!(bufs.dual.obs_resid.is_empty());
+                // The Fisher buffers are untouched by the twin sizing.
+                assert_eq!(bufs.coupling.len(), q_core * s * e);
+                assert_eq!(bufs.schur_blk.len(), e * e);
+            }
+            _ => panic!("expected D8 variant"),
+        }
+        assert!(scratch.matches_shape(m, p, k, rows, s, q_p, q_core, e, nagq, false));
+        assert!(!scratch.matches_shape(m, p, k, rows, s, q_p, q_core, e, nagq, true));
     }
 
     /// Every `m` in `0..=MAX_DUAL_N` resolves to the smallest instantiated rung

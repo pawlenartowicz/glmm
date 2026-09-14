@@ -805,6 +805,18 @@ pub fn fit_on<'a>(
             } else {
                 None
             };
+            // Observed twin of the crossed-Schur symbolic factor, so the exact β-profile's
+            // adjoint solve can run on `A_obs` without overwriting the Fisher factor every
+            // later pass reads. Built only where the exact profile can read it: a
+            // non-canonical link on the structured route — canonical links never
+            // read it, so building it here would be pure cost on every warm draw.
+            glmm_ws.exact_prof.obs_schur = if glmm_ws.groupings.structured_extras_eligible()
+                && !crate::family::is_canonical(glmm_ws.family)
+            {
+                StructuredSchur::new(&glmm_ws.groupings, &ids.primary, &ids.extra, n)
+            } else {
+                None
+            };
             let v = super::glmm::run_glmm_on(
                 glmm_ws,
                 x_mat.as_ref().subrows(0, n),

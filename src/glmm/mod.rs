@@ -70,14 +70,19 @@ pub const PIRLS_MAX_HALVINGS: usize = 16;
 /// outer search is therefore θ-only (`OuterSearch::ExactProfile`): Laplace, a data
 /// term that is the plain deviance, and a PIRLS variant carrying the exact border —
 /// the blocked path (`pirls_solve_blocked`, either link class), plus the structured
-/// crossed/nested path (`pirls_solve_blocked_extras`) on a CANONICAL link. Gamma's
-/// `gamma_aic` objective has a different β score and keeps the joint search; AGQ and
-/// the dense fallback keep theirs. Non-canonical structured shapes stay out too: their
-/// û path needs `Ã = A_obs`, an observed twin of the whole structured factor (core
-/// blocks, coupling and Schur), where the blocked path needs only a second set of
-/// per-cluster blocks. Read by the workspace constructor and by the driver's
-/// `debug_assert!` — the tests choose the route through `outer_search`, never through
-/// this.
+/// crossed/nested path (`pirls_solve_blocked_extras`), which carries an observed-
+/// information twin of its factor (core blocks, coupling, Schur) on both canonical
+/// and non-canonical links. Gamma's `gamma_aic` objective has a different β score and
+/// keeps the joint search; AGQ keeps theirs too. Two separate boundaries also keep
+/// the joint search on their own shapes: a NoZ/dense-envelope design whose extras
+/// fail `structured_extras_eligible()` (`q_core = primary_q + nested_per_parent`
+/// over `MAX_PRIMARY_Q`) falls back to the plain dense factor (`needs_dense`,
+/// `workspace.rs`) instead of the structured one; a design over `classify_design`'s
+/// separate NoZ-envelope boundary (`q_p`, extra-grouping count/width, total crossed
+/// levels — `src/fit/mod.rs`) is over-envelope and routes to the sparse solver
+/// entirely, which runs its own joint search. Read by the workspace constructor and
+/// by the driver's `debug_assert!` — the tests choose the route through
+/// `outer_search`, never through this.
 pub(crate) fn exact_profile_shape(
     family: crate::spec::Family,
     nagq: u8,
@@ -85,8 +90,7 @@ pub(crate) fn exact_profile_shape(
 ) -> bool {
     nagq == 1
         && !matches!(family, crate::spec::Family::Gamma { .. })
-        && (g.extra_offsets.is_empty()
-            || (g.structured_extras_eligible() && crate::family::is_canonical(family)))
+        && (g.extra_offsets.is_empty() || g.structured_extras_eligible())
 }
 /// Adaptive PIRLS exit on |Δ penalized-deviance|, relative to the objective
 /// scale (lme4's pwrss discipline): converged when
@@ -252,6 +256,7 @@ pub struct GlmmFit {
 }
 
 mod agq;
+mod assembled;
 mod derivative;
 mod deviance;
 mod pirls;
@@ -264,6 +269,25 @@ pub(crate) use deviance::glmm_laplace_deviance;
 // these instead of duplicating them — `derivative` itself is private to
 // `glmm`, so a sibling module needs the items re-exported one level up.
 pub(crate) use derivative::{unpack_hessian, DerivStatus};
+// Both exact Hessian engines, reachable from the test module that drives the
+// validation corpus's own datasets through them side by side. Production
+// reaches them through `se::joint_hessian_cov` alone. Every caller of these
+// four is a `#[cfg(feature = "formula")]` test in `fit::glmm_tests`, so the
+// re-export carries that gate too — otherwise `--no-default-features` warns
+// on an import nothing left standing can use.
+#[cfg(all(test, feature = "formula"))]
+pub(crate) use assembled::{
+    clamped_row_counts, gradient_f64, gradient_f64_mode_residual, joint_hessian_columns,
+};
+// The paired-timing driver's forcing switch and success counter — see their
+// doc comments in `assembled.rs`. Same formula-only caller as the block above.
+#[cfg(all(test, feature = "formula"))]
+pub(crate) use assembled::{ASSEMBLED_OK_COUNT, FORCE_DECLINE};
+// Same formula-only caller as the two blocks above.
+#[cfg(all(test, feature = "formula"))]
+pub(crate) use derivative::{
+    laplace_gradient, laplace_hessian, supports_shape as supports_exact_shape,
+};
 pub use se::joint_hessian_cov;
 pub(crate) use se::{fd_mixed_diff, fd_second_diff};
 pub(crate) use workspace::StructuredSchur;

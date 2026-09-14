@@ -1,5 +1,5 @@
 //! Machine-local bit-identity baseline for refactors that must not change any
-//! fitted number: fits all 48 `manifest.json` rungs, appends two more nAGQ=1
+//! fitted number: fits all 49 `manifest.json` rungs, appends two more nAGQ=1
 //! twin records (see `NAGQ1_TWIN_RUNGS` below), and writes one JSON array
 //! — `{rung, config, deviance, theta, beta, se_hessian, se_rx, n_eval,
 //! converged, singular}` per record, manifest rungs first in manifest order

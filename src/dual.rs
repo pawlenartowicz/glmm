@@ -16,18 +16,27 @@
 /// closed-form test's 1e-14 band with ~25× margin. (At the often-quoted
 /// `x ≥ 6` threshold it is ~1e-11 and the test fails.) That accuracy is what
 /// the Gamma-GLMM derivative needs.
-pub(crate) fn digamma(mut x: f64) -> f64 {
-    let mut acc = 0.0;
-    while x < 14.0 {
-        acc -= 1.0 / x;
-        x += 1.0;
+///
+/// Generic over [`crate::scalar::Scalar`]: the recurrence and the series are
+/// plain arithmetic plus one `ln`, so at a dual `T` the lanes carry the
+/// trigamma, tetragamma, ... values by forward-mode differentiation of this
+/// same series, and no higher polygamma table is needed anywhere. The loop
+/// test reads the value part, so every `T` walks the same recurrence as `f64`
+/// and the `f64` instantiation runs exactly the arithmetic below.
+pub(crate) fn digamma<T: crate::scalar::Scalar>(mut x: T) -> T {
+    let mut acc = T::ZERO;
+    while x.value() < 14.0 {
+        acc -= T::ONE / x;
+        x += T::ONE;
     }
-    let r = 1.0 / x;
+    let r = T::ONE / x;
     let r2 = r * r;
     acc + x.ln()
-        - 0.5 * r
-        - r2 * (1.0 / 12.0
-            - r2 * (1.0 / 120.0 - r2 * (1.0 / 252.0 - r2 * (1.0 / 240.0 - r2 / 132.0))))
+        - T::from_f64(0.5) * r
+        - r2 * (T::from_f64(1.0 / 12.0)
+            - r2 * (T::from_f64(1.0 / 120.0)
+                - r2 * (T::from_f64(1.0 / 252.0)
+                    - r2 * (T::from_f64(1.0 / 240.0) - r2 / T::from_f64(132.0)))))
 }
 
 /// `ψ′(x)`, the trigamma function, for `x > 0`.
@@ -734,6 +743,24 @@ mod tests {
             assert!(
                 (trigamma(x) - want).abs() <= 1e-13 * want.abs().max(1.0),
                 "psi'({x})"
+            );
+        }
+    }
+
+    /// `digamma`'s own lane is `trigamma`. The generic series is what supplies
+    /// every polygamma the Gamma-GLMM derivative path needs — nothing tabulates
+    /// ψ′ there — so the AD of the series has to reproduce the hand-written
+    /// `trigamma` exactly, not just to a finite-difference floor. `x = 2.5`
+    /// and `x = 0.75` go through the `x < 14` recurrence, `x = 30` reaches the
+    /// asymptotic series directly.
+    #[test]
+    fn digamma_lane_is_trigamma() {
+        for &x in &[0.75_f64, 2.5, 9.0, 30.0] {
+            let lane = digamma(Dual::<1> { v: x, d: [1.0] }).d[0];
+            let want = trigamma(x);
+            assert!(
+                (lane - want).abs() <= 1e-12 * want.abs().max(1.0),
+                "x = {x}: lane {lane} vs trigamma {want}"
             );
         }
     }

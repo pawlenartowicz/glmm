@@ -680,6 +680,21 @@
       "r_formula": "y ~ 1 + x1 + x2 + x3 + z + (1 | g)",
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + z + (1 | g))",
       "//": "The corpus's LARGE probit rung. Bernoulli, scalar (1|g), 100 groups x 96 rows = 9600 rows, p = 5, fitted theta-hat ~0.66. cbpp_probit (rung 22) is the only other probit fit anywhere in the suite and is 56 rows at ~3 ms, where a vectorized family kernel is pure measurement noise -- so probit SPEED, and any accuracy drift that needs a long row loop to accumulate, were both invisible before this rung. 96 rows per cluster is deliberate: it puts every conditional mode in the well-determined regime where Laplace is accurate, so a gate miss here means a kernel defect rather than the approximation's own bias (rungs 44-46 own the hard-cell axis). The row count sits under lme4's check.conv.nobsmax = 10000 ceiling, above which glmer stops computing the optimizer Hessian and engines/lme4.R's vcov(use.hessian = TRUE) hard-errors -- that ceiling, not taste, is what caps the rung. Data from prep/gen_probit_large_data.R, which carries the full sizing and coefficient rationale."
+    },
+    {
+      "name": "sim_cloglog_nested_crossed",
+      "rung": 49,
+      "source": "sim",
+      "family": "binomial",
+      "link": "cloglog",
+      "reml": null,
+      "factors": [
+        "g1",
+        "g2",
+        "c1"
+      ],
+      "r_formula": "y ~ 1 + x + (1 | g1/g2) + (1 | c1)",
+      "//": "2-WAY GATE (glmm vs lme4), no jl_formula: engines/mixedmodels.jl's binomial-link dispatch only builds LogitLink/ProbitLink and errors on any other link string, so a cloglog leg there would abort the whole --oracles run, same reason rungs 23/24/36/46 stay 2-way. Rung 21 (sim_nested_crossed_mix)'s design (g1/g2 nested, c1 crossed) with a cloglog Bernoulli response in place of the gaussian one -- the one non-canonical link paired with a structured-extras shape that combines a nested and a crossed grouping in the same model, on the bit-identity tripwire from here on."
     }
   ],
   "//large_theta_rungs": "Rungs 44-46 + the two sim_binomial_bigsd_agq_k* goldens: the large-theta-hat regime. Rung 44 sim_binomial_bigsd is Bernoulli, scalar (1|g), 300 groups x 6 obs, fitted theta-hat 4.5106 -- 3.4x the corpus's previous GLMM maximum (1.339, VerbAgg); rung 45 sim_poisson_bigsd is the count-family counterpart at 2.9716. Both are Laplace (nAGQ=1) curated rungs on the EXISTING tiers, not a new tier and not an expansion of the curated 6-rung cross-engine oracle (design 6). Rung 46 sim_sparse_binomial_bigsd is the SPARSE arm of the same regime -- one primary grouping g1 (300 groups x 12) plus seven crossed intercept-only extras c1-c7, fitted theta-hat(g1) 3.9076 -- added because rungs 44-45 are both dense-routed scalar (1|g), so the sparse solver's large-theta-hat behavior was untested rather than merely uncalibrated; it is a 2-way gate (glmm vs lme4 only, see its own '//' comment above for why). Their data comes from prep/gen_large_theta_data.R, the third of the five prep scripts (export_data.R rungs 1-28, gen_weights_data.R 29-43, gen_illcond_data.R, gen_scale_data.R). THE THIRD DATASET OF THAT SPEC, sim_binomial_zerosd (theta = 0 exactly), IS DELIBERATELY NOT A RUNG: lme4's vcov(m, use.hessian = TRUE) HARD-ERRORS on a boundary fit ('Hessian is unavailable' -- m@optinfo$derivs is NULL), which is exactly what engines/lme4.R:269 and :146 call, so adding it as a curated rung would abort the whole oracle run. What it exists to gate is a FLAG divergence, not a number -- lme4 warns 'boundary (singular) fit' (so engines/lme4.R records converged = FALSE) while glmm pins the component and reports converged = true with singular = true, and BOTH land on a bit-exact 0.0 stddev, so compare.R's numeric gates would see nothing. It is gated in-crate instead, by glmm_zerosd_boundary_reports_converged_and_singular in src/fit/glmm_tests.rs, which needs no oracle JSON. Verified 2026-07-30 that rel_max(0.0, 0.0) = 0 on this dataset, i.e. the two engines do not straddle rel_max's 1e-12 denominator floor.",

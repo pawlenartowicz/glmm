@@ -1236,12 +1236,14 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
             &ws.params[..ws.n_theta]
         );
 
-        // Cleared first so the assertion below has teeth: `hyper_scratch` is
-        // `None` until a hyper-dual call sizes it and the FD stencil never
-        // touches it, which is what separates the two arms here — with both
-        // calls on the stencil the two sides agree BITWISE and every band below
+        // Cleared first so the assertion below has teeth: each exact arm sizes
+        // its own dual scratch — the assembled pass `dual_scratch`, the
+        // hyper-dual pass `hyper_scratch` — and the FD stencil touches
+        // neither, which is what separates the two arms here. With both calls
+        // on the stencil the two sides agree BITWISE and every band below
         // passes vacuously.
         ws.hyper_scratch = None;
+        ws.dual_scratch = None;
         let mut cov_exact = Mat::<f64>::zeros(p, p);
         let st = joint_hessian_cov(
             &mut ws,
@@ -1255,7 +1257,7 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
         );
         assert_eq!(st, FdHessianStatus::Ok, "{label}");
         assert!(
-            ws.hyper_scratch.is_some(),
+            ws.hyper_scratch.is_some() || ws.dual_scratch.is_some(),
             "{label}: joint_hessian_cov fell through to the FD stencil"
         );
         let tse_exact = ws.theta_se.clone();
@@ -1405,10 +1407,12 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
         grad[ti]
     );
 
-    // `hyper_scratch` is `None` until a hyper-dual call sizes it and the FD
-    // stencil never touches it, so it is what separates the two arms below —
-    // the bands alone cannot, since two stencil runs agree bitwise.
+    // Each exact arm sizes its own dual scratch — the assembled pass
+    // `dual_scratch`, the hyper-dual pass `hyper_scratch` — and the FD stencil
+    // touches neither, so the pair is what separates the two arms below; the
+    // bands alone cannot, since two stencil runs agree bitwise.
     ws.hyper_scratch = None;
+    ws.dual_scratch = None;
     let mut cov_exact = Mat::<f64>::zeros(p, p);
     let st = joint_hessian_cov(
         &mut ws,
@@ -1422,7 +1426,7 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
     );
     assert_eq!(st, FdHessianStatus::Ok);
     assert!(
-        ws.hyper_scratch.is_some(),
+        ws.hyper_scratch.is_some() || ws.dual_scratch.is_some(),
         "joint_hessian_cov fell through to the FD stencil"
     );
     let hess_exact_tt = ws.hess_scratch[(ti, ti)];
@@ -4743,6 +4747,166 @@ fn two_stage_matches_single_stage_corpus_sweep() {
     }
 }
 
+/// Route measurement: `OuterSearch::PqlThenJoint` pinned vs the constructor's
+/// default route (now `ExactProfile`) on the nine non-canonical structured
+/// cells that take the exact-profile route — probit, cloglog and NB-log, each on
+/// `extras_fixture`'s three structured shapes (nested2, crossed6,
+/// nested2_crossed6). Both fits must converge, and `ExactProfile`'s deviance
+/// must be no worse than `PqlThenJoint`'s by more than `GLMM_RHO_END` — the
+/// same regression check `assert_two_stage_matches_single` makes on its own
+/// A/B, in deviance rather than parameter terms. Also prints one line per
+/// cell: the full table (both deviances, both `n_eval`, Δdev) is read by hand
+/// in the write-up, not gated in-crate. `#[ignore]`: a measurement, not part
+/// of the fast suite, matching `two_stage_matches_single_stage_corpus_sweep`
+/// above.
+#[test]
+#[ignore]
+fn route_measurement_pql_then_joint_vs_exact_profile() {
+    let cells: &[(Family, &str, &str, usize, usize)] = &[
+        (
+            Family::Binomial {
+                link: BinomialLink::Probit,
+            },
+            "binomial-probit",
+            "nested2",
+            2,
+            0,
+        ),
+        (
+            Family::Binomial {
+                link: BinomialLink::Probit,
+            },
+            "binomial-probit",
+            "crossed6",
+            0,
+            6,
+        ),
+        (
+            Family::Binomial {
+                link: BinomialLink::Probit,
+            },
+            "binomial-probit",
+            "nested2_crossed6",
+            2,
+            6,
+        ),
+        (
+            Family::Binomial {
+                link: BinomialLink::Cloglog,
+            },
+            "binomial-cloglog",
+            "nested2",
+            2,
+            0,
+        ),
+        (
+            Family::Binomial {
+                link: BinomialLink::Cloglog,
+            },
+            "binomial-cloglog",
+            "crossed6",
+            0,
+            6,
+        ),
+        (
+            Family::Binomial {
+                link: BinomialLink::Cloglog,
+            },
+            "binomial-cloglog",
+            "nested2_crossed6",
+            2,
+            6,
+        ),
+        (
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            "nb-log",
+            "nested2",
+            2,
+            0,
+        ),
+        (
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            "nb-log",
+            "crossed6",
+            0,
+            6,
+        ),
+        (
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            "nb-log",
+            "nested2_crossed6",
+            2,
+            6,
+        ),
+    ];
+    let targets = [1u32];
+    for &(family, family_label, shape, np, n_crossed) in cells {
+        let (mut ws1, x1, y1, ids1, extra1, p, n) = extras_fixture(family, np, n_crossed);
+        ws1.outer_search = OuterSearch::PqlThenJoint;
+        let beta_start = vec![0.0_f64; p];
+        let fit1 = fit_glmm(
+            &mut ws1,
+            x1.as_ref(),
+            &y1,
+            &ids1,
+            &extra1,
+            &targets,
+            None,
+            &beta_start,
+            n,
+            WaldSe::Rx,
+        );
+
+        // Independent workspace, same fixture, constructor's default route
+        // (`ExactProfile` on these shapes).
+        let (mut ws2, x2, y2, ids2, extra2, _p2, _n2) = extras_fixture(family, np, n_crossed);
+        let fit2 = fit_glmm(
+            &mut ws2,
+            x2.as_ref(),
+            &y2,
+            &ids2,
+            &extra2,
+            &targets,
+            None,
+            &beta_start,
+            n,
+            WaldSe::Rx,
+        );
+
+        println!(
+            "{family_label} {shape}: PqlThenJoint dev={:.10} n_eval={} converged={} | ExactProfile dev={:.10} n_eval={} converged={} | delta_dev={:.6e}",
+            fit1.deviance,
+            fit1.n_eval,
+            fit1.converged,
+            fit2.deviance,
+            fit2.n_eval,
+            fit2.converged,
+            fit2.deviance - fit1.deviance,
+        );
+        assert!(
+            fit1.converged,
+            "{family_label} {shape}: PqlThenJoint fit must converge"
+        );
+        assert!(
+            fit2.converged,
+            "{family_label} {shape}: ExactProfile fit must converge"
+        );
+        assert!(
+            fit2.deviance <= fit1.deviance + crate::lmm::GLMM_RHO_END,
+            "{family_label} {shape}: ExactProfile dev {} above PqlThenJoint dev {} by more than GLMM_RHO_END ({})",
+            fit2.deviance,
+            fit1.deviance,
+            crate::lmm::GLMM_RHO_END,
+        );
+    }
+}
+
 /// What the exact-profile helpers below take: `(spec, primary ids, extra-grouping
 /// ids, X, y, n, p)`. An empty `extra` marks a no-extras (blocked-path) shape;
 /// a non-empty one routes the same helper through the structured-extras solve.
@@ -4867,30 +5031,40 @@ fn exact_profile_value_equals_fixed_mode_value_at_profiled_beta() {
     );
 }
 
-/// The exact-profile gate in unit form: at a fixed θ, minimizing the Fixed-mode Laplace deviance over
-/// β with BOBYQA lands on (within BOBYQA's own tolerance) the value the exact
-/// Profile solve returns in one PIRLS call. Logit (canonical, Fisher û path),
-/// probit (non-canonical, observed û path), and the two canonical structured
-/// shapes (crossed logit, grouseticks Poisson-log).
+/// Builds the fixture's blocked-path workspace, then hands off to the shared
+/// core assertion — see `assert_exact_profile_is_beta_minimum_ws`. The cells
+/// are the `#[test]` fns below this pair (logit, probit, extras crossed logit,
+/// grouseticks); the structured-extras cells further down use the sibling
+/// `assert_structured_exact_profile_is_beta_minimum` instead, since their
+/// workspace comes from `extras_fixture`, not an `ExactProfileFixture` tuple.
 fn assert_exact_profile_is_beta_minimum(fixture: fn() -> ExactProfileFixture, label: &str) {
     let (model, ids, extra, x, y, n, p) = fixture();
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
     build_z(&mut ws, x.as_ref(), &ids, &extra, n);
+    assert_exact_profile_is_beta_minimum_ws(&mut ws, x.as_ref(), &y, &ids, &extra, n, p, label);
+}
+
+/// The exact-profile gate in unit form, shared by both callers above and
+/// below: at a fixed θ, minimizing the Fixed-mode Laplace deviance over β
+/// with BOBYQA lands on (within BOBYQA's own tolerance) the value the exact
+/// Profile solve returns in one PIRLS call.
+#[allow(clippy::too_many_arguments)]
+fn assert_exact_profile_is_beta_minimum_ws(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    extra: &[Vec<u32>],
+    n: usize,
+    p: usize,
+    label: &str,
+) {
     let mut ctrs = EvalCounters::new();
     let n_theta = ws.n_theta;
     ws.params[..n_theta].fill(0.6);
     ws.beta_prof[..p].fill(0.0);
     ws.u.fill(0.0);
-    let prof = laplace_deviance_ws(
-        &mut ws,
-        x.as_ref(),
-        &y,
-        &ids,
-        &extra,
-        n,
-        BetaMode::ProfileExact,
-        &mut ctrs,
-    );
+    let prof = laplace_deviance_ws(ws, x, y, ids, extra, n, BetaMode::ProfileExact, &mut ctrs);
     let beta_hat = ws.beta_prof[..p].to_vec();
     // β-only BOBYQA on the Fixed objective from β = 0.
     let mut cfg = bobyqa::Config::new(p);
@@ -4904,16 +5078,7 @@ fn assert_exact_profile_is_beta_minimum(fixture: fn() -> ExactProfileFixture, la
         |b| {
             ws.params[n_theta..n_theta + p].copy_from_slice(b);
             ws.u.fill(0.0);
-            laplace_deviance_ws(
-                &mut ws,
-                x.as_ref(),
-                &y,
-                &ids,
-                &extra,
-                n,
-                BetaMode::Fixed,
-                &mut ctrs,
-            )
+            laplace_deviance_ws(ws, x, y, ids, extra, n, BetaMode::Fixed, &mut ctrs)
         },
         &mut b0,
         &lo,
@@ -4936,6 +5101,18 @@ fn assert_exact_profile_is_beta_minimum(fixture: fn() -> ExactProfileFixture, la
             b0[j]
         );
     }
+}
+
+/// The structured-extras twin of `assert_exact_profile_is_beta_minimum`:
+/// same assertion, on `extras_fixture`'s `nested2_crossed6` shape (`q_core =
+/// 3`, `e = 6`) instead of a blocked no-extras fixture. Cells are the
+/// non-canonical links the observed-information twin exists for — probit,
+/// cloglog, NB-log — forced through `BetaMode::ProfileExact` directly rather
+/// than through `fit_glmm`, isolating the profile solve itself from route
+/// selection (the route's own A/B is `route_measurement_pql_then_joint_vs_exact_profile`).
+fn assert_structured_exact_profile_is_beta_minimum(family: Family, label: &str) {
+    let (mut ws, x, y, ids, extra, p, n) = extras_fixture(family, 2, 6);
+    assert_exact_profile_is_beta_minimum_ws(&mut ws, x.as_ref(), &y, &ids, &extra, n, p, label);
 }
 
 /// The exact-Profile solve must converge when PIRLS is warm-started from the
@@ -5059,6 +5236,33 @@ fn exact_profile_is_beta_minimum_extras_crossed_logit() {
 #[test]
 fn exact_profile_is_beta_minimum_grouseticks() {
     assert_exact_profile_is_beta_minimum(grouseticks_exact_fixture, "grouseticks");
+}
+#[test]
+fn exact_profile_is_beta_minimum_structured_probit() {
+    assert_structured_exact_profile_is_beta_minimum(
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        "structured probit nested2_crossed6",
+    );
+}
+#[test]
+fn exact_profile_is_beta_minimum_structured_cloglog() {
+    assert_structured_exact_profile_is_beta_minimum(
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        "structured cloglog nested2_crossed6",
+    );
+}
+#[test]
+fn exact_profile_is_beta_minimum_structured_nb_log() {
+    assert_structured_exact_profile_is_beta_minimum(
+        Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+        "structured NB-log nested2_crossed6",
+    );
 }
 
 /// The structured twin of `exact_profile_converges_from_lower_theta_warm_start`:
@@ -7087,6 +7291,510 @@ fn dual_gradient_matches_central_fd_per_family_and_shape() {
     }
 }
 
+/// The assembled `f64` gradient against `laplace_gradient`, the exact in-tree
+/// oracle, per coordinate on every blocked and every structured-extras gate
+/// cell. Both differentiate the same Laplace objective at the same `ws.params`
+/// and the same tightened PIRLS tolerance, one through dual lanes and one
+/// through the explicit `F`/`G` adjoint, so they must agree to round-off — the
+/// band is `1e-10` relative, not the FD gates' `1e-6`.
+///
+/// A gap at the `1e-7` scale rather than at round-off would be the Laplace
+/// objective's own iterate lag (its `dev`/`log|A|` are built at `u_prev` while
+/// its penalty is read at `u`) reaching the two sides differently; the fix for
+/// that is the assembly's evaluation point, never a wider band here.
+#[test]
+fn assembled_gradient_matches_laplace_gradient() {
+    const BAND: f64 = 1e-10;
+    let mut cells: Vec<(String, f64)> = Vec::new();
+    for &(family, shape) in GRADIENT_GATE_CELLS {
+        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+        ws.pirls_tol_override = Some(1e-12);
+        let rng = fixed_seed_theta(shape);
+        let worst = assert_assembled_gradient_matches_laplace(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            family,
+            shape,
+            10,
+            rng,
+            BAND,
+        );
+        cells.push((format!("{family:?}/{shape}"), worst));
+        ws.pirls_tol_override = None;
+    }
+    for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
+        let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
+        ws.pirls_tol_override = Some(1e-12);
+        let rng = fixed_seed_theta(shape);
+        let worst = assert_assembled_gradient_matches_laplace(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            family,
+            shape,
+            10,
+            rng,
+            BAND,
+        );
+        cells.push((format!("{family:?}/{shape}"), worst));
+        ws.pirls_tol_override = None;
+    }
+    for (name, worst) in &cells {
+        println!("assembled-gradient cell {name}: worst relative gap {worst:e}");
+    }
+}
+
+/// Shared per-draw body of the assembled-gradient gate: `n_draws` fixed-seed θ
+/// (+ fixed β) draws, each compared coordinate by coordinate against
+/// `laplace_gradient` on the same parameters. Returns the worst relative gap
+/// seen over the whole cell.
+#[allow(clippy::too_many_arguments)]
+fn assert_assembled_gradient_matches_laplace(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    p: usize,
+    n: usize,
+    family: Family,
+    shape: &str,
+    n_draws: usize,
+    mut rng: FixedSeedTheta,
+    band: f64,
+) -> f64 {
+    let m = ws.n_theta + p;
+    let mut worst = 0.0f64;
+    for _ in 0..n_draws {
+        ws.params[..m].copy_from_slice(&rng.next_params());
+        let mut want = vec![0.0; m];
+        let st = laplace_gradient(ws, x, y, ids, extra_ids, p, n, &mut want);
+        assert!(
+            matches!(st, DerivStatus::Ok(_)),
+            "{family:?}/{shape}: laplace_gradient did not converge"
+        );
+        let mut got = vec![0.0; m];
+        super::assembled::gradient_f64(ws, x, y, ids, extra_ids, p, n, &mut got)
+            .unwrap_or_else(|| panic!("{family:?}/{shape}: the assembled gradient declined"));
+        for c in 0..m {
+            let gap = (got[c] - want[c]).abs() / want[c].abs().max(1.0);
+            worst = worst.max(gap);
+            assert!(
+                gap <= band,
+                "{family:?}/{shape} coord {c}: assembled {} vs laplace_gradient {} (relative gap {gap:e})",
+                got[c],
+                want[c]
+            );
+        }
+    }
+    worst
+}
+
+/// `glmm_extras_q1_dataset(0, 6)` with a SECOND crossed grouping (4 levels)
+/// bolted onto the spec and the id list, so the design carries two crossed
+/// factors and pinning the first at θ = 0 leaves a surviving one. The
+/// response is the base dataset's own — a derivative gate compares two
+/// differentiations of one objective and does not need `y` to reflect the
+/// extra factor.
+#[allow(clippy::type_complexity)]
+fn two_crossed_fixture(
+    family: Family,
+) -> (
+    GlmmWorkspace,
+    Mat<f64>,
+    Vec<f64>,
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    usize,
+    usize,
+) {
+    const N_C2: usize = 4;
+    let (x, y, ids, mut extra_ids, mut spec) = glmm_extras_q1_dataset(0, 6);
+    let (n, p) = (y.len(), 2usize);
+    spec.family = family;
+    spec.re
+        .as_mut()
+        .expect("the extras dataset always declares an RE structure")
+        .extra_groupings
+        .push(Grouping {
+            relation: GroupingRelation::Crossed {
+                n_clusters: N_C2 as u32,
+            },
+            slopes: vec![],
+        });
+    extra_ids.push((0..n).map(|i| ((i / 3) % N_C2) as u32).collect());
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
+    build_z(&mut ws, x.as_ref(), &ids, &extra_ids, n);
+    assert_eq!(ws.groupings.crossed.len(), 2, "two crossed groupings");
+    (ws, x, y, ids, extra_ids, p, n)
+}
+
+/// Every column of the assembled joint Hessian against a central difference of
+/// the assembled `f64` gradient in that column's coordinate, on every blocked
+/// and every structured-extras gate cell and every coordinate of each.
+///
+/// This is the supply check for the second derivatives, not a second gradient
+/// check: at `T = Dual<N>` the assembly's own first-order quantities have to
+/// carry the third derivatives of the likelihood in their lanes —
+/// `observed_weight`'s lane is `½·dev'''`, `weight_eta_deriv`'s is `w''`, and
+/// `gamma_phi_prime`'s is `Φ''` — with no third-derivative table written
+/// anywhere. A lane-plumbing mistake (a quantity lifted with `from_f64` that
+/// should have been differentiated, an `f64` evaluation point where a `T` one
+/// belongs) shows here as a whole-coordinate miss.
+///
+/// The last cell is padded past the lane ladder's top rung so the pass runs in
+/// two chunks: it is the only gate that exercises the chunk driver's
+/// `base`/`width` bookkeeping, since the per-entry comparison against the
+/// hyper-dual Hessian cannot go above that pass's own cap.
+///
+/// Steps are the ones the gradient gates use — `1e-5` absolute on θ,
+/// `1e-5·max(1,|β_k|)` on β — and the band is the `1e-6` relative band the
+/// existing FD-of-gradient gate uses, at `pirls_tol_override = Some(1e-12)`.
+#[test]
+fn assembled_hessian_columns_match_fd_of_f64_gradient() {
+    const BAND: f64 = 1e-6;
+    const DRAWS: usize = 3;
+    let mut cells: Vec<(String, f64, f64)> = Vec::new();
+    for &(family, shape) in GRADIENT_GATE_CELLS {
+        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+        ws.pirls_tol_override = Some(1e-12);
+        let rng = fixed_seed_theta(shape);
+        let (wt, wb) = assert_assembled_hessian_columns_match_fd(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            family,
+            shape,
+            DRAWS,
+            rng,
+            &[],
+            BAND,
+        );
+        cells.push((format!("{family:?}/{shape}"), wt, wb));
+        ws.pirls_tol_override = None;
+    }
+    for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
+        let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
+        ws.pirls_tol_override = Some(1e-12);
+        let rng = fixed_seed_theta(shape);
+        let (wt, wb) = assert_assembled_hessian_columns_match_fd(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            family,
+            shape,
+            DRAWS,
+            rng,
+            &[],
+            BAND,
+        );
+        cells.push((format!("{family:?}/{shape}"), wt, wb));
+        ws.pirls_tol_override = None;
+    }
+    // One cell with the FIRST of two crossed θ pinned at 0. The `f64` packer
+    // drops that grouping's column and the dual packer keeps it, so the two
+    // arms disagree on both the packed width and the column order; the
+    // surviving grouping's derivative has to land on its own arm's slot, or
+    // the seeded lanes read a column belonging to the pinned grouping. Two
+    // groupings are the minimum that shows it: a single pinned crossed factor
+    // is an exact-zero column whose adjoint entry is zero, so a misplaced
+    // derivative there cancels.
+    {
+        let family = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        let (mut ws, x, y, ids, extra_ids, p, n) = two_crossed_fixture(family);
+        ws.pirls_tol_override = Some(1e-12);
+        let pinned = [ws.groupings.crossed[0].vech_start];
+        let rng = FixedSeedTheta {
+            state: 5006,
+            n_theta: 3,
+            diag: &[0, 1, 2],
+            beta: vec![0.2, 0.8],
+        };
+        let (wt, wb) = assert_assembled_hessian_columns_match_fd(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            family,
+            "crossed6x4_pinned",
+            DRAWS,
+            rng,
+            &pinned,
+            BAND,
+        );
+        cells.push((format!("{family:?}/crossed6x4_pinned"), wt, wb));
+        ws.pirls_tol_override = None;
+    }
+    // One cell above the lane ladder's top rung: `q2s` (n_θ = 3) padded by 12
+    // zero-truth columns gives `m = 17`, so the pass runs in two `Dual<12>`
+    // chunks and the second chunk's five columns land at `base = 12`. Nothing
+    // else in this file compares a chunked Hessian column against anything.
+    {
+        let family = Family::Poisson {
+            link: PoissonLink::Log,
+        };
+        let extra_p = 12;
+        let (mut ws, x, y, ids, p, n) = fixture_padded(family, "q2s", extra_p);
+        assert_eq!(ws.n_theta + p, 17, "the padding must give two chunks");
+        ws.pirls_tol_override = Some(1e-12);
+        let rng = fixed_seed_theta_padded("q2s", extra_p);
+        let (wt, wb) = assert_assembled_hessian_columns_match_fd(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            family,
+            "q2s_p14",
+            DRAWS,
+            rng,
+            &[],
+            BAND,
+        );
+        cells.push((format!("{family:?}/q2s_p14"), wt, wb));
+        ws.pirls_tol_override = None;
+    }
+    for (name, wt, wb) in &cells {
+        println!("hessian-column cell {name}: worst relative gap theta {wt:e}, beta {wb:e}");
+    }
+}
+
+/// Shared per-draw body of the supply check. Every coordinate of every draw is
+/// compared — none is skipped and none is filtered — and the worst relative
+/// gap is returned split by coordinate class, `(θ, β)`.
+#[allow(clippy::too_many_arguments)]
+fn assert_assembled_hessian_columns_match_fd(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    p: usize,
+    n: usize,
+    family: Family,
+    shape: &str,
+    n_draws: usize,
+    mut rng: FixedSeedTheta,
+    // γ coordinates forced to 0.0 in every draw — a θ-pinned crossed
+    // grouping. They are also the only coordinates NOT seeded: at a pinned
+    // θ_e the `f64` packer drops that grouping's column, so the `f64`
+    // gradient's own θ_e entry is identically zero and a central difference
+    // in that direction has nothing to difference. Every other coordinate is
+    // seeded, and the pinned grouping is what the seeded ones have to pair
+    // around.
+    pinned: &[usize],
+    band: f64,
+) -> (f64, f64) {
+    let n_theta = ws.n_theta;
+    let m = n_theta + p;
+    let kk = ws.k.max(1);
+    let mut worst_theta = 0.0f64;
+    let mut worst_beta = 0.0f64;
+    for _ in 0..n_draws {
+        ws.params[..m].copy_from_slice(&rng.next_params());
+        for &j in pinned {
+            ws.params[j] = 0.0;
+        }
+        let saved: Vec<f64> = ws.params[..m].to_vec();
+        // The whole Hessian once per draw, unsymmetrized so each column is the
+        // chunk's own answer. Forward-mode lanes are independent, so column
+        // `coord` of a pass seeding a whole chunk is the number a pass seeding
+        // `coord` alone would return.
+        for v in ws.u[..kk].iter_mut() {
+            *v = 0.0;
+        }
+        let mut hess = Mat::<f64>::zeros(m, m);
+        let mut hgrad = vec![0.0; m];
+        let st = super::assembled::joint_hessian_columns(
+            ws, x, y, ids, extra_ids, p, n, &mut hgrad, &mut hess,
+        );
+        let DerivStatus::Ok(v_hess) = st else {
+            panic!("{family:?}/{shape}: the assembled Hessian declined")
+        };
+        // The objective value the pass reports is the objective, whichever
+        // chunk it came out of. Asserted in release, not only in debug: on the
+        // padded cell this pass runs two chunks, and a chunk that
+        // differentiated a different point would show here.
+        for v in ws.u[..kk].iter_mut() {
+            *v = 0.0;
+        }
+        let mut gref = vec![0.0; m];
+        let DerivStatus::Ok(v_grad) = laplace_gradient(ws, x, y, ids, extra_ids, p, n, &mut gref)
+        else {
+            panic!("{family:?}/{shape}: the reference gradient declined")
+        };
+        assert!(
+            (v_hess - v_grad).abs() <= 1e-9 * (1.0 + v_grad.abs()),
+            "{family:?}/{shape}: the chunked pass reports objective {v_hess}, \
+             the dual gradient reports {v_grad}"
+        );
+        // And the gradient the pass writes on its FIRST chunk is the gradient,
+        // entry by entry — the value alone would not catch a chunk that filled
+        // `grad` from a different point.
+        for a in 0..m {
+            let gap = (hgrad[a] - gref[a]).abs() / gref[a].abs().max(1.0);
+            assert!(
+                gap <= 1e-9,
+                "{family:?}/{shape} coord {a}: the chunked pass's gradient {} vs \
+                 the dual gradient {} (relative gap {gap:e})",
+                hgrad[a],
+                gref[a]
+            );
+        }
+        for coord in 0..m {
+            if pinned.contains(&coord) {
+                continue;
+            }
+            let h = if coord < n_theta {
+                1e-5
+            } else {
+                1e-5 * saved[coord].abs().max(1.0)
+            };
+            // Cold-start `ws.u` before EVERY evaluation, as the FD gradient
+            // gate does: a warm start chained across the coordinate loop
+            // converges to the same objective at a slightly different `u`, and
+            // the difference reaches a differenced gradient at a scale this
+            // band would catch.
+            let eval = |ws: &mut GlmmWorkspace, at: &[f64], out: &mut [f64]| {
+                ws.params[..m].copy_from_slice(at);
+                for v in ws.u[..kk].iter_mut() {
+                    *v = 0.0;
+                }
+                super::assembled::gradient_f64(ws, x, y, ids, extra_ids, p, n, out).unwrap_or_else(
+                    || panic!("{family:?}/{shape} coord {coord}: the assembled gradient declined"),
+                );
+            };
+            let mut at = saved.clone();
+            at[coord] = saved[coord] + h;
+            let mut gp = vec![0.0; m];
+            eval(ws, &at, &mut gp);
+            at[coord] = saved[coord] - h;
+            let mut gm = vec![0.0; m];
+            eval(ws, &at, &mut gm);
+
+            ws.params[..m].copy_from_slice(&saved);
+
+            for a in 0..m {
+                let fd = (gp[a] - gm[a]) / (2.0 * h);
+                let gap = (hess[(a, coord)] - fd).abs() / fd.abs().max(1.0);
+                if coord < n_theta {
+                    worst_theta = worst_theta.max(gap);
+                } else {
+                    worst_beta = worst_beta.max(gap);
+                }
+                assert!(
+                    gap <= band,
+                    "{family:?}/{shape} column {coord} entry {a}: lane {} vs fd {fd} (relative gap {gap:e})",
+                    hess[(a, coord)]
+                );
+            }
+        }
+        ws.params[..m].copy_from_slice(&saved);
+    }
+    (worst_theta, worst_beta)
+}
+
+/// How often the assembled Hessian pass refuses a cell because the observed
+/// factor is not positive definite. A MEASUREMENT, not a gate: it asserts
+/// nothing about the counts, only that every cell it visits ran.
+///
+/// The refusal cannot fire on a canonical link — there `A_obs` IS the Fisher
+/// `A` the mode solve already factored — so the cells here are the
+/// non-canonical ones: every non-canonical blocked and structured gate cell,
+/// at three fixed-seed θ draws each. `m ≤ 12` on all of them, so each
+/// evaluation is exactly one kernel call and a refusal is a refusal of that
+/// one call. The corpus's own non-canonical rungs are covered separately, at
+/// their own γ̂, by the per-entry gate against the packed second-order pass,
+/// which would fail rather than print if either engine declined.
+///
+/// `#[ignore]`: it prints a table and is a measurement, not a gate.
+/// Run: `cargo test --lib assembled_hessian_observed_factor_refusals -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn assembled_hessian_observed_factor_refusals() {
+    let mut rows: Vec<(String, usize, usize)> = Vec::new();
+    const DRAWS: usize = 3;
+    for &(family, shape) in GRADIENT_GATE_CELLS {
+        if crate::family::is_canonical(family) {
+            continue;
+        }
+        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+        let rng = fixed_seed_theta(shape);
+        let (calls, refused) =
+            count_assembled_refusals(&mut ws, x.as_ref(), &y, &ids, &[], p, n, DRAWS, rng);
+        rows.push((format!("{family:?}/{shape}"), calls, refused));
+    }
+    for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
+        if crate::family::is_canonical(family) {
+            continue;
+        }
+        let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
+        let rng = fixed_seed_theta(shape);
+        let (calls, refused) =
+            count_assembled_refusals(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, DRAWS, rng);
+        rows.push((format!("{family:?}/{shape}"), calls, refused));
+    }
+    for (cell, calls, refused) in &rows {
+        println!("obs-pd {cell}: kernel calls {calls}, refusals {refused}");
+    }
+}
+
+/// `n_draws` fixed-seed θ draws through the assembled Hessian pass, returning
+/// `(kernel calls, refusals)`. One call per draw: every cell that reaches here
+/// has `m ≤ 12`, so the pass runs a single chunk.
+#[allow(clippy::too_many_arguments)]
+fn count_assembled_refusals(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    p: usize,
+    n: usize,
+    n_draws: usize,
+    mut rng: FixedSeedTheta,
+) -> (usize, usize) {
+    let m = ws.n_theta + p;
+    assert!(m <= 12, "one chunk per evaluation is assumed here");
+    let mut refused = 0usize;
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let mut grad = vec![0.0; m];
+    for _ in 0..n_draws {
+        ws.params[..m].copy_from_slice(&rng.next_params());
+        let st = super::assembled::joint_hessian_columns(
+            ws, x, y, ids, extra_ids, p, n, &mut grad, &mut hess,
+        );
+        if matches!(st, DerivStatus::Unsupported) {
+            refused += 1;
+        }
+    }
+    (n_draws, refused)
+}
+
 /// One gate cell padded past `m = 8` so `Dual<12>` is exercised by a numerical
 /// gradient check, not only by the speed-grid's padded timing run. `q2s`
 /// (n_θ=3) padded by 7 zero-truth columns (`p = 2 + 7 = 9`) lands exactly on
@@ -7299,13 +8007,21 @@ fn dual_hessian_matches_central_fd_of_gradient_padded_to_n12() {
 
 // --- The same two FD gates on the structured-extras route ---
 
-/// Family × extras-shape fixture for the structured FD gates. Reuses
-/// `glmm_extras_q1_dataset`'s design wholesale — X, primary ids, extra ids and
-/// the RE structure — and only swaps the family and, where the domain differs,
-/// regenerates `y`: the generator draws Bernoulli, which every Binomial link
-/// already shares, so Poisson is the one case that needs counts. Same
+/// Family × extras-shape fixture for the structured FD gates and the
+/// structured exact-profile unit gate. Reuses `glmm_extras_q1_dataset`'s
+/// design wholesale — X, primary ids, extra ids and the RE structure — and
+/// only swaps the family and, where the domain differs, regenerates `y`: the
+/// generator draws Bernoulli, which every Binomial link already shares, so
+/// Poisson/NegativeBinomial (counts) and Gamma (a continuous positive
+/// response) are the cases that need their own draw. Same
 /// regenerate-y-on-a-fixed-design construction `fixture` uses for the blocked
-/// cells, with its own seed stream.
+/// cells, with its own seed stream; the Gamma and NegativeBinomial arms copy
+/// `fixture_with_nagq_sized`'s own. The Bernoulli draw is generated under
+/// `p = sigmoid(eta)` regardless of which Binomial link is being fit, so
+/// cloglog fits it too — not degenerate here: `eta` stays inside roughly
+/// `[0.2, 2.1]` on this design, so `p` never approaches 0 or 1 closely enough
+/// to flatten cloglog's `dμ/dη`, confirmed by the passing FD gate cells below
+/// and by the structured-exact-profile unit gate's cloglog cell.
 ///
 /// `ws.structured_schur` is built here, so on the crossed cells the FD
 /// reference (`laplace_deviance_ws`) runs the production cached sparse tail
@@ -7314,7 +8030,10 @@ fn dual_hessian_matches_central_fd_of_gradient_padded_to_n12() {
 /// reassociation of the same Cholesky, orders of magnitude inside the 1e-6
 /// band. On the nested-only cell `StructuredSchur::new` returns `None`
 /// (`e == 0`) and both sides take the dense arm, which is the whole tail
-/// story there.
+/// story there. `ws.exact_prof.obs_schur` is built alongside it, gated the
+/// same way production gates it (structured-eligible and non-canonical), so
+/// the structured exact-profile unit gate's non-canonical cells run the
+/// twin's cached sparse arm too, not only its dense fallback.
 #[allow(clippy::type_complexity)]
 fn extras_fixture(
     family: Family,
@@ -7334,40 +8053,68 @@ fn extras_fixture(
     let mut st = 6101u64;
     let y = match family {
         Family::Binomial { .. } => y_bin,
-        Family::Poisson { .. } => (0..n)
+        Family::Poisson { .. } | Family::NegativeBinomial { .. } => (0..n)
             .map(|i| {
                 let eta = 0.2 + 0.8 * x[(i, 1)];
                 let noise = 0.4 + 1.6 * (lcg(&mut st) + 0.5); // in [0.4, 2.0]
                 (eta.exp().min(20.0) * noise).round().max(0.0)
             })
             .collect(),
+        // Copies the blocked `fixture_with_nagq_sized`'s Gamma arm — same eta,
+        // same noise term, no rounding (a Gamma response is continuous).
+        Family::Gamma { .. } => (0..n)
+            .map(|i| {
+                let eta = 0.2 + 0.8 * x[(i, 1)];
+                let noise = 0.4 + 1.6 * (lcg(&mut st) + 0.5); // in [0.4, 2.0]
+                eta.exp() * noise
+            })
+            .collect(),
         other => panic!("structured gradient-gate fixture: family {other:?} not wired"),
     };
     spec.family = family;
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
+    if matches!(family, Family::NegativeBinomial { .. }) {
+        ws.nb_theta = 4.0;
+    }
     build_z(&mut ws, x.as_ref(), &ids, &extra_ids, n);
     ws.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+    // Observed twin of the crossed-Schur factor, gated the same way production
+    // builds it: only where the exact profile can read it, a non-canonical
+    // link on a structured-eligible shape. Same pattern, same arguments as
+    // the Fisher cache above — change together.
+    ws.exact_prof.obs_schur =
+        if ws.groupings.structured_extras_eligible() && !crate::family::is_canonical(family) {
+            StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n)
+        } else {
+            None
+        };
     (ws, x, y, ids, extra_ids, p, n)
 }
 
-/// `{Binomial-logit, Binomial-probit, Poisson-log}` × the three structured
-/// extras shapes, as `(family, shape label, nested children per parent, crossed
-/// levels)`.
+/// `{Binomial-logit, Binomial-probit, Binomial-cloglog, Poisson-log,
+/// Gamma-log, NegativeBinomial-log}` × the three structured extras shapes, as
+/// `(family, shape label, nested children per parent, crossed levels)`.
 ///
 /// The shapes are the speed-grid catalogue's `nest2` and `int2x` classes plus
 /// their combination: nested-only (`q_core = 3`, `e = 0`, the tail is skipped
 /// entirely), crossed-only (`q_core = 1`, `e = 6`, the rank-1 scalar downdate
 /// that is the production route at `q_core == 1`), and both (`q_core = 3`,
 /// `e = 6`, whose `f64` route is the panel downdate while the dual route takes
-/// the scalar default). Probit is in because it is non-canonical: the extras
-/// kernel has no observed step, so a probit cell is what exercises the
-/// refinement loop on this route.
+/// the scalar default). Logit and Poisson-log are canonical controls; probit,
+/// cloglog, Gamma-log and NegativeBinomial-log are the four non-canonical
+/// links the observed-information twin (`DualStep::observed` on the dual
+/// side, `ExactProfileBufs::obs_schur` on the `f64` side) actually serves on
+/// this route, so between them this gate checks the twin's chain rule family
+/// by family, not just once.
 ///
-/// Deliberate gap: Gamma, NegativeBinomial and Binomial-cloglog are gated on
-/// the blocked path by `GRADIENT_GATE_CELLS` and are not re-gated here. The
-/// extras corpus carries binomial and Poisson only, and nothing about the
-/// structured tail is family-specific — the family enters through W and μ,
-/// which the blocked cells already cover across all six.
+/// Remaining gap: `GammaLink::Inverse` and `InverseGaussian` (both links) are
+/// also non-canonical and structured-extras-eligible, so they build and read
+/// the same twin, but neither is gated here or on the blocked path's
+/// `GRADIENT_GATE_CELLS` — no FD gate anywhere exercises them yet. Each
+/// family/link pair above stands in for its own W/μ/dμ-dη formula, which is
+/// where a family or link actually enters the chain rule; the crossed-tail
+/// factoring and scatter code the twin adds is link-agnostic, so the four
+/// links here are believed to already exercise every branch that code takes.
 const STRUCTURED_GATE_CELLS: &[(Family, &str, usize, usize)] = &[
     (
         Family::Binomial {
@@ -7436,6 +8183,78 @@ const STRUCTURED_GATE_CELLS: &[(Family, &str, usize, usize)] = &[
     (
         Family::Poisson {
             link: PoissonLink::Log,
+        },
+        "nested2_crossed6",
+        2,
+        6,
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        "nested2",
+        2,
+        0,
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        "crossed6",
+        0,
+        6,
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        "nested2_crossed6",
+        2,
+        6,
+    ),
+    (
+        Family::Gamma {
+            link: GammaLink::Log,
+        },
+        "nested2",
+        2,
+        0,
+    ),
+    (
+        Family::Gamma {
+            link: GammaLink::Log,
+        },
+        "crossed6",
+        0,
+        6,
+    ),
+    (
+        Family::Gamma {
+            link: GammaLink::Log,
+        },
+        "nested2_crossed6",
+        2,
+        6,
+    ),
+    (
+        Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+        "nested2",
+        2,
+        0,
+    ),
+    (
+        Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+        "crossed6",
+        0,
+        6,
+    ),
+    (
+        Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
         },
         "nested2_crossed6",
         2,
@@ -8132,4 +8951,34 @@ fn block_leverage_matches_explicit_inverse() {
     let want: f64 = (0..q).map(|i| m[i] * x[i]).sum();
     let got = block_leverage(&l, q, &m);
     assert!((got - want).abs() < 1e-12, "h {got} vs mᵀA⁻¹m {want}");
+}
+
+/// `block_leverage`'s `‖L⁻¹m‖²` and `block_forward_solve`'s `t = L⁻¹m` cannot
+/// drift apart: on the same factor, `block_leverage` must equal `Σt²`.
+#[test]
+fn block_forward_solve_matches_block_leverage() {
+    use crate::glmm::pirls::{block_forward_solve, block_leverage};
+    use crate::glmm::workspace::glmm_block_chol;
+    let q = 3;
+    let b = [2.0, 0.0, 0.0, 0.5, 1.5, 0.0, -0.3, 0.7, 1.2];
+    let mut a = [0.0; 9];
+    for r in 0..q {
+        for c in 0..q {
+            for kk in 0..q {
+                a[r * q + c] += b[r * q + kk] * b[c * q + kk];
+            }
+        }
+        a[r * q + r] += 1.0;
+    }
+    let m = [0.4, -1.1, 0.9];
+    let mut l = a;
+    assert!(glmm_block_chol(&mut l, q));
+    let want = block_leverage(&l, q, &m);
+    let mut t = [0.0_f64; 3];
+    block_forward_solve(&l, q, &m, &mut t);
+    let got: f64 = t.iter().map(|x| x * x).sum();
+    assert_eq!(
+        got, want,
+        "Σt² vs block_leverage: same arithmetic, same order"
+    );
 }

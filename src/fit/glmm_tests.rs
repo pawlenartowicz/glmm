@@ -2776,11 +2776,22 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
     // 110 evaluations, both converged, KKT norm 9.9e-3 → 8.8e-3): the old
     // endpoint was the less converged one on the flat ln θ_NB direction.
     // θ̂ moved 3.6e-5 relative, β[0] 2.3e-4, and β̂ sits closer to lme4's
-    // (`REF_BETA`) than before.
-    const REF_BETA_PIN: [f64; 2] = [0.5850540080177592, 0.5073813410114352];
-    const REF_SE_PIN: [f64; 2] = [0.20484834476932942, 0.053993931676619006];
-    const REF_TAU2_PIN: [f64; 2] = [0.39581383779083495, 0.1261544293365773];
-    const REF_THETA_PIN: f64 = 1.4300734514802722;
+    // (`REF_BETA`) than before. Fourth (2026-09-13): the structured-extras
+    // kernel carries an observed-information twin of its factor, so this
+    // shape's exact Laplace β-profile is available and the outer search is
+    // θ-only on that profile instead of the joint `[θ | β]` search — this
+    // fixture moves from `OuterSearch::Joint` to `OuterSearch::ExactProfile`.
+    // The deviance moved UP by 4.686e-3 (605.659188 → 605.663874, 110 → 53
+    // evaluations, both converged), a smaller swing than the Third re-pin's
+    // own 8.6e-3 move on this fixture's flat ln θ_NB direction. The relative
+    // move stays tiny everywhere it is checked: θ̂ 2.0e-5, β[0] 6.7e-5, β[1]
+    // 3.1e-5, the g1 SD 2.0e-4, the g2:g1 SD 5.5e-6 — all far inside this
+    // test's own 5e-3/2e-2/5e-2 lme4 bands. The pin is re-taken at the new
+    // point.
+    const REF_BETA_PIN: [f64; 2] = [0.5850147343882003, 0.5073656491270585];
+    const REF_SE_PIN: [f64; 2] = [0.20481658210561515, 0.05399324240273177];
+    const REF_TAU2_PIN: [f64; 2] = [0.3956529554051399, 0.12615582632807115];
+    const REF_THETA_PIN: f64 = 1.4301019630196756;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb_nested pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb_nested pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb_nested pinned tau2");
@@ -4830,4 +4841,1225 @@ fn fit_glmm_nb_failed_fit_dispersion_is_nan() {
         "dispersion must be NaN on a failed fit, not the θ the outer search stood on: {}",
         f.dispersion
     );
+}
+
+/// One dense Laplace GLMM rung of the validation corpus, driven from the
+/// committed dataset the harness fits: the CSV, the formula, the family/link
+/// and the per-rung weights/offset the manifest records.
+///
+/// `formula` is the manifest's own formula with the two mechanical rewrites the
+/// validation harness applies before lowering: the `@formula(...)` wrapper and
+/// the explicit `1` intercept term come off a `jl_formula` (this parser treats
+/// the intercept as implicit and has no term for a literal `1`), and an
+/// aggregated-binomial `cbind(s, n - s)` response becomes the synthesized
+/// `prop` column, which with the trial count as prior weights IS lme4's own
+/// objective for that response.
+struct DenseLaplaceRung {
+    rung: u32,
+    csv: &'static str,
+    formula: &'static str,
+    family: Family,
+    /// Columns lowered as categorical. Everything else is numeric, except a
+    /// column that fails to parse as `f64` anywhere, which falls back to a
+    /// factor — a CSV can carry a categorical helper column no formula names.
+    factors: &'static [&'static str],
+    /// Aggregated binomial `(successes, trials)` column names: the response
+    /// becomes `successes/trials` in a synthesized `prop` column and the trials
+    /// become prior weights.
+    agg: Option<(&'static str, &'static str)>,
+    /// Per-row prior weights read off this column.
+    weights_col: Option<&'static str>,
+    /// Per-row known additive term on the linear-predictor scale.
+    offset_col: Option<&'static str>,
+}
+
+/// Every non-Gaussian dense-routed rung of the validation corpus, at Laplace
+/// (`nagq = 1`) — the set whose standard errors the exact joint Hessian
+/// produces today. The AGQ orders some of these carry in the manifest are not
+/// applied: quadrature keeps the packed second-order pass and is out of this
+/// comparison's scope.
+const DENSE_LAPLACE_RUNGS: &[DenseLaplaceRung] = &[
+    DenseLaplaceRung {
+        rung: 5,
+        csv: include_str!("../../validation/data/empirical/cbpp.csv"),
+        formula: "prop ~ period + (1 | herd)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["herd", "period"],
+        agg: Some(("incidence", "size")),
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 6,
+        csv: include_str!("../../validation/data/empirical/grouseticks.csv"),
+        formula: "TICKS ~ YEAR + cHEIGHT + (1 | BROOD) + (1 | INDEX) + (1 | LOCATION)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["BROOD", "INDEX", "LOCATION", "YEAR"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 12,
+        csv: include_str!("../../validation/data/empirical/VerbAgg.csv"),
+        formula: "y ~ Anger + Gender + btype + situ + mode + (1|id) + (1|item)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["Gender", "btype", "situ", "mode", "id", "item"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 14,
+        csv: include_str!("../../validation/data/empirical/Arabidopsis.csv"),
+        formula: "total_fruits ~ nutrient + amd + rack + status + (1 | popu/gen)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["nutrient", "rack", "amd", "status", "popu", "gen"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 17,
+        csv: include_str!("../../validation/data/simulated/sim_crossed_at_cap.csv"),
+        formula: "y ~ x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g1", "c1", "c2", "c3", "c4", "c5", "c6"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 19,
+        csv: include_str!("../../validation/data/simulated/sim_poisson_nested.csv"),
+        formula: "y ~ x + (1 | g1/g2)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g1", "g2"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 22,
+        csv: include_str!("../../validation/data/empirical/cbpp.csv"),
+        formula: "prop ~ period + (1 | herd)",
+        family: Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        factors: &["herd", "period"],
+        agg: Some(("incidence", "size")),
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 23,
+        csv: include_str!("../../validation/data/simulated/sim_gamma.csv"),
+        formula: "y ~ x + grp + (1 | cluster)",
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        factors: &["cluster", "grp"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 25,
+        csv: include_str!("../../validation/data/simulated/sim_binomial_slope1.csv"),
+        formula: "y ~ x + (1 + x | g)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 26,
+        csv: include_str!("../../validation/data/simulated/sim_poisson_slope1.csv"),
+        formula: "y ~ x + (1 + x | g)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 27,
+        csv: include_str!("../../validation/data/simulated/sim_binomial_slope2.csv"),
+        formula: "y ~ x1 + x2 + (1 + x1 + x2 | g)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 28,
+        csv: include_str!("../../validation/data/simulated/sim_poisson_offset.csv"),
+        formula: "y ~ x + (1 | cluster)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["cluster"],
+        agg: None,
+        weights_col: None,
+        offset_col: Some("log_exposure"),
+    },
+    DenseLaplaceRung {
+        rung: 37,
+        csv: include_str!("../../validation/data/simulated/glmm_poisson.csv"),
+        formula: "y ~ x + (1 | g)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: Some("w"),
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 44,
+        csv: include_str!("../../validation/data/simulated/sim_binomial_bigsd.csv"),
+        formula: "y ~ x + z + (1 | g)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 45,
+        csv: include_str!("../../validation/data/simulated/sim_poisson_bigsd.csv"),
+        formula: "y ~ x + z + (1 | g)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 48,
+        csv: include_str!("../../validation/data/simulated/sim_probit_large.csv"),
+        formula: "y ~ x1 + x2 + x3 + z + (1 | g)",
+        family: Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 49,
+        csv: include_str!("../../validation/data/simulated/sim_cloglog_nested_crossed.csv"),
+        formula: "y ~ x + (1 | g1/g2) + (1 | c1)",
+        family: Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        factors: &["g1", "g2", "c1"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+];
+
+/// Header + row cells of an embedded CSV, quotes stripped. Mirrors the
+/// validation harness's own reader; the corpus CSVs carry no embedded commas.
+fn rung_csv(csv: &'static str) -> (Vec<String>, Vec<Vec<String>>) {
+    let unquote = |s: &str| s.trim().trim_matches('"').to_string();
+    let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
+    let header: Vec<String> = lines
+        .next()
+        .expect("csv header")
+        .split(',')
+        .map(unquote)
+        .collect();
+    let rows: Vec<Vec<String>> = lines.map(|l| l.split(',').map(unquote).collect()).collect();
+    (header, rows)
+}
+
+/// The rung's CSV as a lowering `Table`, plus the prior weights an aggregated
+/// binomial response implies. A column named in `factors`, or one that fails to
+/// parse as `f64` anywhere, becomes a factor at its lexicographic level order —
+/// which is what R's own `factor()` did when the references were frozen.
+/// Header dots become underscores, as this parser cannot read a dot inside an
+/// identifier (`Arabidopsis`'s `total.fruits`).
+#[cfg(feature = "formula")]
+fn rung_table(r: &DenseLaplaceRung) -> (crate::formula::Table, Option<Vec<f64>>, Option<Vec<f64>>) {
+    use crate::formula::{Column, Table};
+    let (header, rows) = rung_csv(r.csv);
+    let n = rows.len();
+    let numeric =
+        |j: usize| -> Vec<f64> { rows.iter().map(|row| row[j].parse().unwrap()).collect() };
+    let mut columns: Vec<(String, Column)> = header
+        .iter()
+        .enumerate()
+        .map(|(j, name)| {
+            let is_factor = r.factors.contains(&name.as_str())
+                || rows.iter().any(|row| row[j].parse::<f64>().is_err());
+            let col = if is_factor {
+                let labels: Vec<String> = rows.iter().map(|row| row[j].clone()).collect();
+                Column::factor_from_labels(&labels)
+            } else {
+                Column::Numeric(numeric(j))
+            };
+            (name.replace('.', "_"), col)
+        })
+        .collect();
+    let col_of = |name: &str| -> Vec<f64> {
+        let j = header
+            .iter()
+            .position(|h| h == name)
+            .unwrap_or_else(|| panic!("rung {}: column {name:?} not in header", r.rung));
+        numeric(j)
+    };
+    let weights = match r.agg {
+        Some((succ, trials)) => {
+            let s = col_of(succ);
+            let t = col_of(trials);
+            let prop: Vec<f64> = s.iter().zip(&t).map(|(a, b)| a / b).collect();
+            columns.push(("prop".into(), Column::Numeric(prop)));
+            Some(t)
+        }
+        None => r.weights_col.map(col_of),
+    };
+    let offset = r.offset_col.map(col_of);
+    (Table { columns, n }, weights, offset)
+}
+
+/// Rows the kernel's own clamps hold at the workspace's current point:
+/// `(Fisher weight floored at `glm::WEIGHT_CLAMP`, μ at `family::clamp_mu`'s
+/// bound, η at the link's `clamp_eta` bound)`.
+///
+/// The first two come from `assembled::clamped_row_counts`, which is what the
+/// assembled engine itself refuses on, so this census and that refusal cannot
+/// drift apart. The η count is this test's own: no corpus rung reaches an η
+/// clamp at γ̂, and one appearing is a regime change worth failing on.
+#[cfg(feature = "formula")]
+fn clamp_census(ws: &GlmmWorkspace, family: Family, n: usize) -> (usize, usize, usize) {
+    let (lo_eta, hi_eta) = match family {
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        } => (-crate::family::ETA_MAX, crate::family::ETA_MAX.ln()),
+        Family::Poisson { .. } | Family::Gamma { .. } | Family::NegativeBinomial { .. } => {
+            (-crate::family::ETA_MAX, crate::family::ETA_MAX)
+        }
+        _ => (f64::NEG_INFINITY, f64::INFINITY),
+    };
+    let (w_clamped, mu_clamped) =
+        crate::glmm::clamped_row_counts(family, &ws.w[..n], &ws.prob[..n]);
+    let mut eta_clamped = 0usize;
+    for i in 0..n {
+        if ws.eta[i] <= lo_eta || ws.eta[i] >= hi_eta {
+            eta_clamped += 1;
+        }
+    }
+    (w_clamped, mu_clamped, eta_clamped)
+}
+
+/// One rung lowered, fitted to its own γ̂ with `WaldSe::Rx` (so the fit runs
+/// neither Hessian pass), and handed back as the workspace sitting at that γ̂
+/// with everything the two Hessian engines need.
+#[cfg(feature = "formula")]
+#[allow(clippy::type_complexity)]
+fn rung_at_gamma_hat(
+    r: &DenseLaplaceRung,
+) -> (
+    GlmmWorkspace,
+    Mat<f64>,
+    Vec<f64>,
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    usize,
+    usize,
+    f64,
+) {
+    let (table, weights, offset) = rung_table(r);
+    let lo = crate::formula::lower(r.formula, &table, r.family)
+        .unwrap_or_else(|e| panic!("rung {}: lower: {e}", r.rung));
+    let opts = FitOptions {
+        target_indices: lo.opts.target_indices.clone(),
+        wald_se: WaldSe::Rx,
+        weights: weights.or(lo.opts.weights.clone()),
+        offset: offset.or(lo.opts.offset.clone()),
+        nagq: 1,
+        ..FitOptions::default()
+    };
+    // Level counts come from the ids, exactly as the shipped dispatch derives
+    // them before it builds a workspace; the lowering leaves placeholders.
+    let (sized_model, sized_ids, _perm) = super::spec_sized_from_ids(&lo.model, &lo.ids);
+    let (mut ws, x_mat) = super::glmm::fit_glmm_build(
+        &lo.x,
+        lo.n,
+        lo.p,
+        &sized_model,
+        &sized_ids.primary,
+        &sized_ids.extra,
+        &opts,
+    )
+    .unwrap_or_else(|_| panic!("rung {}: degenerate design", r.rung));
+    // The shipped dispatch's own inner call, so the fit reaches the same γ̂ the
+    // corpus is fitted at — β seeded from the no-RE GLM, θ from the kernel's
+    // blind start.
+    let deviance = {
+        let view = super::glmm::run_glmm_on(
+            &mut ws,
+            x_mat.as_ref(),
+            &lo.y,
+            lo.n,
+            lo.p,
+            &sized_model,
+            &sized_ids.primary,
+            &sized_ids.extra,
+            f64::NAN,
+            None,
+            &opts,
+        );
+        let (converged, deviance) = view.converged_deviance();
+        assert!(converged, "rung {}: fit must converge", r.rung);
+        deviance
+    };
+    assert!(
+        crate::glmm::supports_exact_shape(&ws.groupings),
+        "rung {}: dense exact-derivative shape expected",
+        r.rung
+    );
+    let sized_ids = sized_ids.into_owned();
+    (
+        ws,
+        x_mat,
+        lo.y,
+        sized_ids.primary,
+        sized_ids.extra,
+        lo.p,
+        lo.n,
+        deviance,
+    )
+}
+
+/// One row of the corpus gate's printed table.
+#[cfg(feature = "formula")]
+struct RungReport {
+    rung: u32,
+    m: usize,
+    /// The assembled engine declined this rung's clamped mode state, so every
+    /// measured field below is zero and nothing was compared.
+    refused: bool,
+    /// Worst relative gap between the `f64` assembled gradient and the dual one.
+    worst_grad: f64,
+    /// Worst relative gap between the two Hessians, per entry.
+    worst: f64,
+    /// The assembled pass's own pre-symmetrization asymmetry.
+    asym: f64,
+    /// Each pass's exit `‖u − u_prev‖`.
+    step_asm: f64,
+    step_hd: f64,
+    /// Rows on the Fisher-weight floor at γ̂.
+    w_clamped: usize,
+}
+
+/// The assembled joint Hessian against the hyper-dual one, entry by entry, at
+/// the same converged γ̂, on every dense Laplace GLMM rung of the validation
+/// corpus — the real datasets, lowered from the manifest's own formula through
+/// the crate's formula frontend, not a stand-in.
+///
+/// Two independent exact routes to the same matrix: one differentiates the
+/// objective twice through packed second-order lanes, the other differentiates
+/// an explicit `F`/`G` adjoint once and reads the second order off first-order
+/// lanes. They share the `f64` mode solve and the PIRLS tolerance and nothing
+/// else.
+///
+/// The run also reports, per rung: the assembled pass's own pre-symmetrization
+/// asymmetry (`max|H_ij − H_ji|` relative, over columns built by different
+/// chunks — a consistency check the packed pass cannot offer, its triangle
+/// being symmetric by construction), and each pass's exit `‖u − u_prev‖`, which
+/// is the size of the iterate mix each one differentiates.
+///
+/// A rung whose mode state carries a clamped row is the one case with nothing
+/// to compare: the assembled engine declines it and the fit ships the
+/// hyper-dual answer, so the assertion there is the refusal.
+#[cfg(feature = "formula")]
+#[test]
+fn assembled_hessian_matches_hyperdual_per_entry() {
+    // One band per comparison, both fixed from the first run on the real
+    // datasets and neither tuned since. Gradient: every compared rung agrees to
+    // 8.94e-9 or better, the worst being rung 23 (`sim_gamma`), and fifteen of
+    // the sixteen are at or below 1.75e-11. Hessian: every compared rung agrees
+    // to 6.11e-12 or better, the worst being rung 14 (`Arabidopsis`).
+    const GRAD_BAND: f64 = 1e-7;
+    const BAND: f64 = 1e-10;
+
+    // A rung whose mode state carries a clamped row is not compared at all:
+    // both assembled entry points decline it, because the adjoint they run
+    // differentiates the mode equation `G = D_u + 2u = 0` and the floored
+    // weighted least squares PIRLS iterates does not satisfy it there. Such a
+    // fit ships the hyper-dual pass's Hessian, so what this test asserts on it
+    // is the refusal itself.
+    //
+    // `CLAMPED_RUNGS` is a tripwire: it fixes how many rungs of the corpus are
+    // in that regime — one, rung 49 (`sim_cloglog_nested_crossed`), with a
+    // single row of 288 whose raw Fisher weight is 3.39e-8 against the 1e-6
+    // floor — so a second one appearing, or that one leaving, fails here.
+    const CLAMPED_RUNGS: usize = 1;
+    let mut clamped_rungs = 0usize;
+    let mut rows: Vec<RungReport> = Vec::new();
+    for r in DENSE_LAPLACE_RUNGS {
+        let (mut ws, x, y, ids, extra_ids, p, n, dev) = rung_at_gamma_hat(r);
+        let m = ws.n_theta + p;
+        let (w_clamped, mu_clamped, eta_clamped) = clamp_census(&ws, r.family, n);
+        assert_eq!(
+            eta_clamped, 0,
+            "rung {}: a clamped η at γ̂ is a new regime, not a band",
+            r.rung
+        );
+        if w_clamped > 0 || mu_clamped > 0 {
+            clamped_rungs += 1;
+            let mut h = Mat::<f64>::zeros(m, m);
+            let mut g = vec![0.0; m];
+            let st = crate::glmm::joint_hessian_columns(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &extra_ids,
+                p,
+                n,
+                &mut g,
+                &mut h,
+            );
+            assert!(
+                matches!(st, crate::glmm::DerivStatus::Unsupported),
+                "rung {}: a clamped mode state must be refused",
+                r.rung
+            );
+            assert!(
+                crate::glmm::gradient_f64(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut g)
+                    .is_none(),
+                "rung {}: the f64 assembled gradient must refuse the same state",
+                r.rung
+            );
+            rows.push(RungReport {
+                rung: r.rung,
+                m,
+                refused: true,
+                worst_grad: 0.0,
+                worst: 0.0,
+                asym: 0.0,
+                step_asm: 0.0,
+                step_hd: 0.0,
+                w_clamped,
+            });
+            continue;
+        }
+
+        // Stage 1 on the real data: the `f64` assembled gradient against
+        // `laplace_gradient`, per coordinate. Two ways of differentiating the
+        // same objective once — an explicit `F`/`G` adjoint against the dual
+        // kernel's own lanes — so they must agree to round-off, and a rung
+        // where they do not is a rung where the Hessian comparison below is
+        // measuring the gradient, not the second derivative.
+        let mut g_dual = vec![0.0; m];
+        let st = crate::glmm::laplace_gradient(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut g_dual,
+        );
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "rung {}: the dual gradient declined",
+            r.rung
+        );
+        let mut g_f64 = vec![0.0; m];
+        crate::glmm::gradient_f64(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut g_f64)
+            .unwrap_or_else(|| panic!("rung {}: the assembled f64 gradient declined", r.rung));
+        let mut worst_grad = 0.0f64;
+        for c in 0..m {
+            let gap = (g_f64[c] - g_dual[c]).abs() / g_dual[c].abs().max(1.0);
+            worst_grad = worst_grad.max(gap);
+            assert!(
+                gap <= GRAD_BAND,
+                "rung {} coord {c}: assembled {} vs dual {} (relative gap {gap:e})",
+                r.rung,
+                g_f64[c],
+                g_dual[c]
+            );
+        }
+
+        let mut h_asm = Mat::<f64>::zeros(m, m);
+        let mut g_asm = vec![0.0; m];
+        let st = crate::glmm::joint_hessian_columns(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut g_asm,
+            &mut h_asm,
+        );
+        let v_asm = match st {
+            crate::glmm::DerivStatus::Ok(v) => v,
+            _ => panic!("rung {}: the assembled Hessian declined", r.rung),
+        };
+        let step_asm = ws
+            .dual_scratch
+            .as_deref()
+            .expect("the assembled pass sizes the dual scratch")
+            .exit_mode_step();
+        let mut asym = 0.0f64;
+        for i in 0..m {
+            for j in 0..i {
+                asym =
+                    asym.max((h_asm[(i, j)] - h_asm[(j, i)]).abs() / h_asm[(i, j)].abs().max(1.0));
+                let v = 0.5 * (h_asm[(i, j)] + h_asm[(j, i)]);
+                h_asm[(i, j)] = v;
+                h_asm[(j, i)] = v;
+            }
+        }
+
+        let mut h_hd = Mat::<f64>::zeros(m, m);
+        let mut g_hd = vec![0.0; m];
+        let st = crate::glmm::laplace_hessian(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut g_hd,
+            &mut h_hd,
+        );
+        let v_hd = match st {
+            crate::glmm::DerivStatus::Ok(v) => v,
+            _ => panic!("rung {}: the hyper-dual Hessian declined", r.rung),
+        };
+        let step_hd = ws
+            .hyper_scratch
+            .as_deref()
+            .expect("the hyper-dual pass sizes its own scratch")
+            .exit_mode_step();
+
+        // The objective value each pass reports is the same function at the
+        // same point whichever chunk it came out of, and it is the fit's own
+        // minimized deviance. Asserted in release, not only in debug: on a
+        // chunked pass this is what says every chunk differentiated the same
+        // objective.
+        for (what, v) in [("assembled", v_asm), ("hyper-dual", v_hd)] {
+            assert!(
+                (v - dev).abs() <= 1e-6 * (1.0 + dev.abs()),
+                "rung {}: {what} pass reports objective {v}, the fit's deviance is {dev}",
+                r.rung
+            );
+        }
+
+        let mut worst = 0.0f64;
+        for i in 0..m {
+            for j in 0..m {
+                let gap = (h_asm[(i, j)] - h_hd[(i, j)]).abs() / h_hd[(i, j)].abs().max(1.0);
+                worst = worst.max(gap);
+                assert!(
+                    gap <= BAND,
+                    "rung {} entry ({i},{j}): assembled {} vs hyper-dual {} (relative gap {gap:e})",
+                    r.rung,
+                    h_asm[(i, j)],
+                    h_hd[(i, j)]
+                );
+            }
+        }
+        // The asymmetry compares the assembled pass with itself: columns built
+        // by different chunks against each other.
+        assert!(
+            asym <= BAND,
+            "rung {}: pre-symmetrization asymmetry {asym:e} above the band",
+            r.rung
+        );
+        rows.push(RungReport {
+            rung: r.rung,
+            m,
+            refused: false,
+            worst_grad,
+            worst,
+            asym,
+            step_asm,
+            step_hd,
+            w_clamped,
+        });
+    }
+    assert_eq!(rows.len(), DENSE_LAPLACE_RUNGS.len(), "every rung must run");
+    assert_eq!(
+        clamped_rungs, CLAMPED_RUNGS,
+        "the number of rungs whose mode state carries a clamped row at γ̂ moved"
+    );
+    for r in &rows {
+        if r.refused {
+            println!(
+                "rung {}: m {}, refused — {} clamped rows at γ̂",
+                r.rung, r.m, r.w_clamped
+            );
+            continue;
+        }
+        println!(
+            "rung {}: m {}, gradient {:e}, worst entry {:e}, asymmetry {:e}, \
+             exit |u-u_prev| assembled {:e} hyper-dual {:e}, clamped rows {}",
+            r.rung, r.m, r.worst_grad, r.worst, r.asym, r.step_asm, r.step_hd, r.w_clamped
+        );
+    }
+}
+
+/// Rung 48's dataset read under the cloglog link — the 9,600-row model
+/// `fit_glmm_cloglog_matches_lme4` fits, expressed as a rung so the harness
+/// above can drive it to its own γ̂. Not in `DENSE_LAPLACE_RUNGS`: the corpus
+/// gate's set is the manifest's, one entry per dataset and link, and this is a
+/// second link on a dataset already in it.
+#[cfg(feature = "formula")]
+static CLOGLOG_LARGE: DenseLaplaceRung = DenseLaplaceRung {
+    rung: 48,
+    csv: include_str!("../../validation/data/simulated/sim_probit_large.csv"),
+    formula: "y ~ x1 + x2 + x3 + z + (1 | g)",
+    family: Family::Binomial {
+        link: BinomialLink::Cloglog,
+    },
+    factors: &["g"],
+    agg: None,
+    weights_col: None,
+    offset_col: None,
+};
+
+/// The corpus rung carrying this number.
+#[cfg(feature = "formula")]
+fn rung_by_number(rung: u32) -> &'static DenseLaplaceRung {
+    DENSE_LAPLACE_RUNGS
+        .iter()
+        .find(|r| r.rung == rung)
+        .unwrap_or_else(|| panic!("rung {rung} is in the corpus"))
+}
+
+/// One fixture of [`laplace_gradient_lanes_settle_on_a_clamped_mode_state`]:
+/// the point to drive, how many clamped rows its mode state is expected to
+/// carry, whether the dual kernel should still be reporting one-call
+/// exactness there, and the band the lanes must meet.
+#[cfg(feature = "formula")]
+struct LaneFixture {
+    what: &'static str,
+    rung: &'static DenseLaplaceRung,
+    w_clamped: usize,
+    mu_clamped: usize,
+    exact: bool,
+    band: f64,
+}
+
+/// The dual Laplace gradient's lanes against a Richardson-extrapolated central
+/// difference of the very objective they claim to differentiate, on the corpus
+/// points whose mode state carries a clamped row and on two that do not.
+///
+/// **What can go wrong here.** The dual PIRLS kernels take the Hessian step
+/// (`pirls::DualStep`), so the lanes normally reach the implicit-function
+/// answer in one kernel call and the kernels say so through `DualStep::exact`;
+/// the caller then skips its refinement loop. On a row sitting on one of the
+/// kernel's clamps the step matrix is no longer the Jacobian of the map the
+/// iteration walks (`pirls::clamped_row_present` carries the derivation), the
+/// contraction is not zero, and lanes read after one call are part-converged —
+/// wrong in a way nothing downstream can see, because they are smooth,
+/// plausible, and only a few digits short.
+///
+/// So both halves are asserted. On the two clamped points the lanes must meet
+/// the band a settled kernel reaches, which is far tighter than a single call
+/// gets there. On the two clean points `exact` must still be true, so the
+/// refinement loop stays off where it costs and buys nothing.
+///
+/// The arbiter is the `f64` objective's own central difference, Richardson
+/// extrapolated from base `h` and `h/2`, with `ws.u` zeroed before every
+/// evaluation so each one is the same cold function of γ. It is an independent
+/// route to the gradient — no dual arithmetic, no adjoint — and its own
+/// resolution is what sets the bands, not taste.
+#[cfg(feature = "formula")]
+#[test]
+fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
+    // Tight enough that the mode solve's last step is at round-off, so the
+    // differentiated objective and the differenced one are the same function
+    // rather than two nearby ones.
+    const TOL: f64 = 1e-12;
+    // Base FD step: absolute on θ, relative × max(|β|, 1) on β.
+    const FD_BASE: f64 = 1e-3;
+    // The two bands, both set from the first run on these four points and
+    // neither tuned since. `SMALL_BAND` covers the two few-hundred-row points,
+    // where the arbiter resolves the gradient to ~5e-10 and the settled lanes
+    // land at 4.2e-11 to 6.2e-10. `BIG_BAND` covers the two 9,600-row ones,
+    // where the arbiter's own drift between base steps is up to 6.4e-8 and the
+    // settled lanes land at 1.0e-9 to 6.8e-8 — nothing tighter than the
+    // arbiter's resolution is a statement about the lanes. Part-converged
+    // lanes on the two clamped points sit at 1.6e-7 to 9.8e-7 (rung 49) and
+    // 4.0e-8 to 6.4e-7 (the cloglog fixture), so the bands catch every
+    // coordinate of the first and half of the second.
+    const SMALL_BAND: f64 = 1e-8;
+    const BIG_BAND: f64 = 2e-7;
+
+    let fixtures = [
+        LaneFixture {
+            what: "rung 49 sim_cloglog_nested_crossed",
+            rung: rung_by_number(49),
+            w_clamped: 1,
+            mu_clamped: 0,
+            exact: false,
+            band: SMALL_BAND,
+        },
+        LaneFixture {
+            what: "cloglog 9,600-row fixture",
+            rung: &CLOGLOG_LARGE,
+            w_clamped: 4,
+            mu_clamped: 3,
+            exact: false,
+            band: BIG_BAND,
+        },
+        LaneFixture {
+            what: "rung 22 cbpp_probit",
+            rung: rung_by_number(22),
+            w_clamped: 0,
+            mu_clamped: 0,
+            exact: true,
+            band: SMALL_BAND,
+        },
+        LaneFixture {
+            what: "rung 48 sim_probit_large",
+            rung: rung_by_number(48),
+            w_clamped: 0,
+            mu_clamped: 0,
+            exact: true,
+            band: BIG_BAND,
+        },
+    ];
+
+    for f in &fixtures {
+        let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(f.rung);
+        let m = ws.n_theta + p;
+        let n_theta = ws.n_theta;
+        let (w_clamped, mu_clamped, eta_clamped) = clamp_census(&ws, f.rung.family, n);
+        assert_eq!(
+            (w_clamped, mu_clamped, eta_clamped),
+            (f.w_clamped, f.mu_clamped, 0),
+            "{}: the clamp census at γ̂ moved — this fixture is here for its clamp state",
+            f.what
+        );
+
+        ws.pirls_tol_override = Some(TOL);
+        let mut g_dual = vec![0.0; m];
+        let st = crate::glmm::laplace_gradient(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut g_dual,
+        );
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "{}: the dual gradient declined",
+            f.what
+        );
+        assert_eq!(
+            ws.dual_scratch
+                .as_deref()
+                .expect("the dual gradient sizes the dual scratch")
+                .exit_exact(),
+            f.exact,
+            "{}: one-call exactness is not what this mode state supports",
+            f.what
+        );
+
+        let params: Vec<f64> = ws.params[..m].to_vec();
+        let at = |ws: &mut GlmmWorkspace, k: usize, step: f64| -> f64 {
+            let mut q = params.clone();
+            q[k] += step;
+            ws.u.fill(0.0);
+            glmm_laplace_deviance(&q, ws, x.as_ref(), &y, &ids, &extra_ids, n)
+        };
+        let mut worst = 0.0f64;
+        let mut gaps = vec![0.0; m];
+        for k in 0..m {
+            let h = if k < n_theta {
+                FD_BASE
+            } else {
+                FD_BASE * params[k].abs().max(1.0)
+            };
+            // Central difference at h and at h/2, combined as
+            // (4·D_{h/2} − D_h)/3 — the O(h⁴) Richardson step for a stencil
+            // whose own error is O(h²).
+            let c1 = (at(&mut ws, k, h) - at(&mut ws, k, -h)) / (2.0 * h);
+            let c2 = (at(&mut ws, k, 0.5 * h) - at(&mut ws, k, -0.5 * h)) / h;
+            let fd = (4.0 * c2 - c1) / 3.0;
+            gaps[k] = (g_dual[k] - fd).abs();
+            worst = worst.max(gaps[k]);
+        }
+        println!(
+            "{}: m {}, clamped rows (w {w_clamped}, μ {mu_clamped}), exact {}, \
+             per-coordinate |lane − FD| {:?}, worst {:e}",
+            f.what, m, f.exact, gaps, worst
+        );
+        for k in 0..m {
+            assert!(
+                gaps[k] <= f.band,
+                "{} coord {k}: lane {} vs central difference (absolute gap {:e}, band {:e})",
+                f.what,
+                g_dual[k],
+                gaps[k],
+                f.band
+            );
+        }
+    }
+}
+
+/// One timed rep of a rung, construction-inclusive: a fresh lowering plus one
+/// public `fit_cold` call at the given [`WaldSe`], timed end to end — the same
+/// shape of measurement as the bit-identity dump's `_full` fields
+/// (`validation/summarize_timing.R:47-59`), which prefer the wall that
+/// includes formula lowering and workspace construction over a fit-only
+/// wall. Re-lowering every rep (rather than lowering once and timing only
+/// `fit_cold`) is what makes each rep independent and comparable to a real
+/// caller's cold entry.
+#[cfg(feature = "formula")]
+fn timed_rung_fit(r: &DenseLaplaceRung, wald_se: WaldSe) -> (std::time::Duration, Fit) {
+    let (table, weights, offset) = rung_table(r);
+    let lo = crate::formula::lower(r.formula, &table, r.family)
+        .unwrap_or_else(|e| panic!("rung {}: lower: {e}", r.rung));
+    let opts = FitOptions {
+        target_indices: lo.opts.target_indices.clone(),
+        wald_se,
+        weights: weights.or(lo.opts.weights.clone()),
+        offset: offset.or(lo.opts.offset.clone()),
+        nagq: lo.opts.nagq,
+        ..FitOptions::default()
+    };
+    let t0 = std::time::Instant::now();
+    let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &opts);
+    (t0.elapsed(), f)
+}
+
+/// `REPS` runs of [`timed_rung_fit`] at one `wald_se`, first discarded: returns
+/// the min elapsed across the kept reps, the LAST rep's `Fit` (every rep fits
+/// the same deterministic problem, so any rep's diagnostics represent the
+/// series), and how many of the `reps` runs converged.
+#[cfg(feature = "formula")]
+fn timed_series(
+    r: &DenseLaplaceRung,
+    wald_se: WaldSe,
+    reps: usize,
+) -> (std::time::Duration, Fit, usize) {
+    assert!(
+        reps >= 2,
+        "REPS must be >= 2 so the first rep can be discarded"
+    );
+    let mut best: Option<std::time::Duration> = None;
+    let mut last: Option<Fit> = None;
+    let mut n_converged = 0usize;
+    for rep in 0..reps {
+        let (elapsed, f) = timed_rung_fit(r, wald_se);
+        if f.converged() {
+            n_converged += 1;
+        }
+        if rep > 0 {
+            best = Some(best.map_or(elapsed, |b| b.min(elapsed)));
+        }
+        last = Some(f);
+    }
+    (best.unwrap(), last.unwrap(), n_converged)
+}
+
+/// The Hessian-inclusive fit wall against the Rx-only fit wall, paired within
+/// one session, on grouseticks (rung 6) and VerbAgg (rung 12) — the large-N,
+/// complex-model cells the speed comparison is judged on. Two arms for the
+/// Hessian wall, on the same binary: the
+/// assembled pass as the tree stands, and the hyper-dual pass reached by
+/// forcing the assembled pass to decline through the test-only
+/// `assembled::FORCE_DECLINE` switch — never a `FitOptions` flag. Prints one
+/// table with both arms' wall, the ratio `hess/rx − 1`, and the convergence
+/// axes (`converged`, `n_eval`, `kkt_grad_norm`, `deviance`,
+/// `boundary_score` presence) alongside `ASSEMBLED_OK_COUNT`'s movement,
+/// which is this crate's only signal that a given arm actually took its
+/// intended path (`Diagnostics` carries no exact-vs-fallback field).
+///
+/// Asserts only that both arms converge and report finite SEs — this is a
+/// measurement driver, not a speed gate; the numbers it prints are read by a
+/// human against the locked-run report.
+#[cfg(feature = "formula")]
+#[test]
+#[ignore]
+fn assembled_vs_hyperdual_paired_timing() {
+    use std::sync::atomic::Ordering;
+
+    let reps: usize = std::env::var("REPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+
+    struct Row {
+        cell: &'static str,
+        arm: &'static str,
+        rx_wall: std::time::Duration,
+        hess_wall: std::time::Duration,
+        n_converged: usize,
+        reps: usize,
+        f: Fit,
+        assembled_delta: usize,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+
+    for (cell, rung) in [("grouseticks", 6u32), ("VerbAgg", 12u32)] {
+        let r = DENSE_LAPLACE_RUNGS.iter().find(|r| r.rung == rung).unwrap();
+
+        // Rx wall does not touch the joint-Hessian machinery at all — one
+        // series serves both arms' ratio.
+        let (rx_wall, rx_fit, rx_converged) = timed_series(r, WaldSe::Rx, reps);
+        assert!(rx_fit.converged(), "{cell}: Rx-only fit must converge");
+
+        for (arm, force_decline) in [("assembled", false), ("hyper-dual", true)] {
+            crate::glmm::FORCE_DECLINE.store(force_decline, Ordering::Relaxed);
+            let before = crate::glmm::ASSEMBLED_OK_COUNT.load(Ordering::Relaxed);
+            let (hess_wall, hess_fit, hess_converged) = timed_series(r, WaldSe::Hessian, reps);
+            let after = crate::glmm::ASSEMBLED_OK_COUNT.load(Ordering::Relaxed);
+            crate::glmm::FORCE_DECLINE.store(false, Ordering::Relaxed);
+
+            assert!(
+                hess_fit.converged(),
+                "{cell} {arm}: Hessian fit must converge"
+            );
+            assert!(
+                hess_fit.se.iter().all(|v| v.is_finite() || v.is_nan()),
+                "{cell} {arm}: se must be finite or NaN, never garbage"
+            );
+            assert!(
+                hess_fit.se.iter().any(|v| v.is_finite()),
+                "{cell} {arm}: at least one target SE must be finite"
+            );
+            // The construction of the switch guarantees this by itself for
+            // the forced arm; assert it anyway so a future edit that breaks
+            // the routing fails here rather than silently mismeasuring.
+            if force_decline {
+                assert_eq!(
+                    after, before,
+                    "{cell} {arm}: FORCE_DECLINE must keep the assembled arm from running"
+                );
+            } else {
+                assert!(
+                    after > before,
+                    "{cell} {arm}: the assembled arm must actually run when not forced off"
+                );
+            }
+
+            rows.push(Row {
+                cell,
+                arm,
+                rx_wall,
+                hess_wall,
+                n_converged: hess_converged.min(rx_converged),
+                reps,
+                f: hess_fit,
+                assembled_delta: after - before,
+            });
+        }
+    }
+
+    // The driver does not read the machine's clock state: a run is a
+    // measurement only when the caller locked the CPU clock first.
+    println!("paired timing, REPS={reps} (first rep discarded, min of the rest); lock state not read here.");
+    println!(
+        "{:<12} {:<11} {:>12} {:>12} {:>9} {:>10} {:>9} {:>12} {:>13} {:>9} {:>10}",
+        "cell",
+        "arm",
+        "rx_wall_s",
+        "hess_wall_s",
+        "ratio",
+        "converged",
+        "n_eval",
+        "kkt_norm",
+        "deviance",
+        "bscore",
+        "asm_delta"
+    );
+    for row in &rows {
+        let ratio = row.hess_wall.as_secs_f64() / row.rx_wall.as_secs_f64() - 1.0;
+        println!(
+            "{:<12} {:<11} {:>12.6} {:>12.6} {:>9.4} {:>8}/{:<2}{:>9} {:>12.4e} {:>13.4} {:>9} {:>10}",
+            row.cell,
+            row.arm,
+            row.rx_wall.as_secs_f64(),
+            row.hess_wall.as_secs_f64(),
+            ratio,
+            row.n_converged,
+            row.reps,
+            row.f.n_eval,
+            row.f.diagnostics.kkt_grad_norm,
+            row.f.deviance,
+            !row.f.diagnostics.boundary_score.is_empty(),
+            row.assembled_delta,
+        );
+    }
+}
+
+/// How much the `f64` assembled gradient (the Laplace objective's explicit
+/// `F`/`G` adjoint that `src/glmm/assembled.rs` builds) moves between the
+/// PIRLS exit band the fit ships and a band shrunk until the penalized
+/// deviance stops changing, alongside the exact mode residual `‖G_u‖`,
+/// `G_u = D_u + 2u` (`assembled.rs`'s own `G(γ,u)`), at each band — the
+/// quantity every formula in that construction assumes is zero, and the one
+/// the assembled gradient's own error is first order in.
+///
+/// `sim_sparse_gamma` is a sparse-route rung: `gradient_f64` only reaches the
+/// dense blocked and structured routes (`assembly_routes`), so it cannot
+/// evaluate there at all. `sim_gamma` (rung 23, Gamma-log, dense) is the
+/// nearest dense Gamma rung and stands in for it; `sim_poisson_nested` (rung
+/// 19) is the canonical-link rung run alongside it.
+///
+/// The reference band is picked the way `fd_margin.rs` picks its own FD
+/// reference: shrink `pirls_tol_override` down the same seven-value exit-band
+/// ladder that module tries (`sparse/fd_margin.rs`'s `REF_TOL_LADDER`), and
+/// gate the choice on step-freeness exactly as that module hard-gates
+/// `pick_ref_tol` on its own precondition rather than merely reporting it —
+/// the tightest finite rung is taken only once it agrees with its
+/// next-loosest neighbor to within `STEP_FREE_BAND`, falling back down the
+/// ladder when it does not, and panicking if no neighboring pair ever agrees.
+/// `fd_margin.rs` itself scans ±3δ in γ because it is protecting an FD
+/// stencil built by perturbing γ; this probe evaluates the gradient at one
+/// fixed γ̂ with no such stencil, so neighboring-rung agreement in tolerance
+/// space is the applicable form of the same check.
+#[cfg(feature = "formula")]
+#[test]
+#[ignore]
+fn assembled_gradient_mode_residual_probe() {
+    // The same seven values `sparse/fd_margin.rs`'s `REF_TOL_LADDER` tries, in
+    // the same order, tightest last.
+    const REF_TOL_LADDER: [f64; 7] = [0.0, 1e-15, 1e-14, 1e-13, 1e-12, 1e-11, 1e-10];
+    // "Near round-off" for a penalized deviance summed over up to a few
+    // thousand rows: comfortably above bit-level noise, comfortably below the
+    // FD stencil's own 2.0e-5 margin this probe's result is judged against.
+    const STEP_FREE_BAND: f64 = 1e-9;
+
+    println!("sim_gamma stands in for sim_sparse_gamma, which the dense assembly cannot take.");
+
+    for rung in [23u32, 19] {
+        let r = DENSE_LAPLACE_RUNGS.iter().find(|r| r.rung == rung).unwrap();
+        let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
+        let m = ws.n_theta + p;
+
+        // (a) production band: pirls_tol_override unset, so gradient_f64 falls
+        // back to pirls_tol_fd(family) (glmm/mod.rs:173), PIRLS_TOL_REL_FD =
+        // 1e-8 unless the family's own fit tolerance is tighter.
+        ws.pirls_tol_override = None;
+        let prod_tol = crate::glmm::pirls_tol_fd(r.family);
+        let mut g_prod = vec![0.0; m];
+        let resid_prod = crate::glmm::gradient_f64_mode_residual(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut g_prod,
+        )
+        .unwrap_or_else(|| panic!("rung {}: production-band gradient declined", r.rung));
+
+        // (b) reference band: shrink pirls_tol_override along the ladder,
+        // reading the penalized deviance glmm_laplace_deviance leaves at γ̂,
+        // until it stops moving.
+        let params: Vec<f64> = ws.params[..m].to_vec();
+        let mut ladder: Vec<(f64, f64)> = Vec::new();
+        for &tol in &REF_TOL_LADDER {
+            ws.pirls_tol_override = Some(tol);
+            let d = glmm_laplace_deviance(&params, &mut ws, x.as_ref(), &y, &ids, &extra_ids, n);
+            if d.is_finite() {
+                ladder.push((tol, d));
+            }
+        }
+        assert!(
+            !ladder.is_empty(),
+            "rung {}: no ladder rung gave a finite penalized deviance at γ̂",
+            r.rung
+        );
+        // Climb down from the tightest finite rung until neighboring rungs
+        // agree inside STEP_FREE_BAND — mirrors fd_margin.rs's pick_ref_tol
+        // hard-gating on its own precondition instead of merely reporting it.
+        let mut ref_idx = ladder.len() - 1;
+        let step_free_gap = loop {
+            assert!(
+                ref_idx > 0,
+                "rung {}: no ladder rung neighbor pair agrees within {STEP_FREE_BAND:e} \
+                 — the reference band cannot be established",
+                r.rung
+            );
+            let (_, dev_here) = ladder[ref_idx];
+            let (_, dev_prev) = ladder[ref_idx - 1];
+            let gap = (dev_here - dev_prev).abs() / dev_here.abs().max(1.0);
+            if gap <= STEP_FREE_BAND {
+                break gap;
+            }
+            ref_idx -= 1;
+        };
+        let (ref_tol, _) = ladder[ref_idx];
+
+        ws.pirls_tol_override = Some(ref_tol);
+        let mut g_ref = vec![0.0; m];
+        let resid_ref = crate::glmm::gradient_f64_mode_residual(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut g_ref,
+        )
+        .unwrap_or_else(|| panic!("rung {}: reference-band gradient declined", r.rung));
+
+        let gaps: Vec<f64> = (0..m)
+            .map(|c| (g_prod[c] - g_ref[c]).abs() / g_ref[c].abs().max(1.0))
+            .collect();
+        let worst_gap = gaps.iter().copied().fold(0.0, f64::max);
+
+        println!(
+            "rung {}: m {}, production tol {:e} (‖G_u‖ {:e}), reference tol {:e} \
+             (‖G_u‖ {:e}, ladder rungs {}, step-free gap {:e}), \
+             per-coordinate relative gradient gap {:?}, worst {:e}",
+            r.rung,
+            m,
+            prod_tol,
+            resid_prod,
+            ref_tol,
+            resid_ref,
+            ladder.len(),
+            step_free_gap,
+            gaps,
+            worst_gap
+        );
+    }
 }

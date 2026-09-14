@@ -15,7 +15,9 @@ mod blocked_extras;
 mod dense;
 
 pub(crate) use blocked::pirls_solve_blocked;
-pub(crate) use blocked_extras::{pirls_solve_blocked_extras, structured_ainv_solve, TailKernel};
+pub(crate) use blocked_extras::{
+    pirls_solve_blocked_extras, structured_ainv_solve, structured_factor, TailKernel,
+};
 pub(crate) use dense::pirls_solve;
 
 /// What one `laplace_deviance` call does with β. `Fixed` = β is the caller's input
@@ -53,10 +55,29 @@ pub(crate) enum BetaStep<'a> {
     },
 }
 
+/// Length to allocate for an observed-information twin buffer: `len` where the
+/// fit takes the observed step, nothing where it does not. Every read and write
+/// of a twin — in [`DualStep`] and in [`ExactProfileBufs`] alike — sits behind
+/// `dual.observed` or `!family::is_canonical(family)`, the same condition
+/// `observed` carries here, so a canonical link never touches one. On a large
+/// crossed shape the twins are the biggest buffers in the scratch
+/// (`obs_coupling` is `q_core·s·e` elements, 45 `f64` each at
+/// `HyperDual<8, 36>`), and sizing them off the fit keeps that allocation and
+/// its first-touch page faults off every canonical fit. `obs_schur`, the
+/// `StructuredSchur` twin, is gated on the same condition at its own build
+/// sites.
+pub(crate) fn obs_len(observed: bool, len: usize) -> usize {
+    if observed {
+        len
+    } else {
+        0
+    }
+}
+
 /// Per-solve controls the dual-scalar derivative kernels (`derivative.rs`'s
-/// `run_gradient`/`run_hessian`) hand `pirls_solve_blocked`; `None` on every
-/// `f64` fit-path call, which is then byte-identical to the pre-existing
-/// Fisher-only solve.
+/// `run_gradient`/`run_hessian`) hand `pirls_solve_blocked` and
+/// `pirls_solve_blocked_extras`; `None` on every `f64` fit-path call, which is
+/// then byte-identical to the pre-existing Fisher-only solve.
 ///
 /// **Observed-information step (`observed`).** Each PIRLS step solves
 /// `u_new = A_obs⁻¹((A_obs − I)u + g)` with `A_obs = M'W_obs M + I`, `W_obs`
@@ -71,6 +92,15 @@ pub(crate) enum BetaStep<'a> {
 /// cbpp_probit / sim_gamma / sim_probit_large). Canonical links pass
 /// `observed = false`: their Fisher `A` already IS `½h_uu`.
 ///
+/// The blocked kernel packs the twin as `s` independent `q_p×q_p` blocks
+/// (`obs_blocks`); the structured-extras kernel packs it as the same
+/// core-block + crossed-tail Schur split the Fisher factor uses
+/// (`obs_core_blocks`/`obs_coupling`/`obs_schur_blk`), because a crossed-tail
+/// column couples every cluster and there is no per-cluster block to solve
+/// alone. Both packings solve through the same `A_obs⁻¹` step. Every twin
+/// below is allocated through [`obs_len`], so a canonical link carries none of
+/// them at all.
+///
 /// **Step floor (`min_iters`).** The mixed-deviance exit fires after two
 /// steps once the `f64` value sits at the mode, but the second-order lanes
 /// need two steps to become exact and the objective must then be read at
@@ -80,17 +110,48 @@ pub(crate) enum BetaStep<'a> {
 pub(crate) struct DualStep<T> {
     /// Take the observed-information step (non-canonical links).
     pub(crate) observed: bool,
-    /// `s·q_p²` scratch for the observed blocks, same layout as `a_blocks`;
-    /// untouched when `observed` is false.
+    /// `s·q_p²` scratch for the observed blocked-path blocks, same layout as
+    /// `a_blocks`; untouched when `observed` is false, and untouched on the
+    /// structured-extras path, which packs its twin into the four buffers
+    /// below instead.
     pub(crate) obs_blocks: Vec<T>,
+    /// `(q_core² · s).max(1)` twin of the structured kernel's `core_blocks`,
+    /// same per-cluster lower-triangle layout, scattered from `W_obs`.
+    /// Untouched when `observed` is false and on the blocked path.
+    pub(crate) obs_core_blocks: Vec<T>,
+    /// `(q_core · s · e).max(1)` twin of `coupling`, `C_obs[f·q_core·e + local·e + b]`.
+    /// Shares the `coup_cols`/`coup_ptr` CSR pattern with the Fisher coupling:
+    /// the pattern is a function of the design and the θ-pin mask, not of `W`.
+    pub(crate) obs_coupling: Vec<T>,
+    /// `(e²).max(1)` twin of `schur_blk`, lower triangle.
+    pub(crate) obs_schur_blk: Vec<T>,
+    /// len `k_total`. The observed right-hand side in the `a_rhs` packing
+    /// (`[f·q_core + local | k_family + b]`), then `u_obs = A_obs⁻¹ rhs` in place.
+    pub(crate) obs_rhs: Vec<T>,
+    /// len `n`. Per-row observed IRLS residual `w_obs,i·(Mu)ᵢ + W·working_residᵢ`.
+    /// The structured kernel folds `(A − I)u` into its residual before the
+    /// scatter, so the observed right-hand side cannot be recovered from
+    /// `a_rhs` and needs its own residual, formed while `mu` still holds `(Mu)ᵢ`.
+    pub(crate) obs_resid: Vec<T>,
     /// Do not exit before this many steps have run.
     pub(crate) min_iters: usize,
     /// Written by the solve: true iff every step of every block was an
-    /// exact-Hessian step — always on a canonical link, and on a
-    /// non-canonical one unless some observed block was not PD (the observed
-    /// weight can go negative on an outlying row), in which case that step
-    /// fell back to its Fisher block and the caller's refinement loop runs as
-    /// before.
+    /// exact-Hessian step, so the caller may read the lanes after this one
+    /// call. Two things take it back, and either is enough:
+    ///
+    /// - A row on one of the kernel's clamps, on any link, canonical
+    ///   included — the step matrix is then not the Jacobian of the map the
+    ///   iteration actually walks. See [`clamped_row_present`], which is the
+    ///   test, for the derivation.
+    /// - A non-PD observed factor on a non-canonical link (the observed weight
+    ///   can go negative on an outlying row), where that step fell back to its
+    ///   Fisher factor. On the structured-extras path a non-PD twin downgrades
+    ///   the WHOLE iteration, not one block: the crossed Schur couples every
+    ///   cluster, so there is no per-cluster fallback to take.
+    ///
+    /// `false` means the lanes have only contracted toward the answer, and the
+    /// caller's refinement loop (`derivative.rs`'s `run_gradient` /
+    /// `run_hessian`) re-enters until they stop moving.
     pub(crate) exact: bool,
 }
 
@@ -108,6 +169,26 @@ pub(crate) struct ExactProfileBufs {
     /// `s·q²`, `a_blocks` layout. `A_obs = M'W_obs M + I` per cluster; only
     /// written on a non-canonical link (blocked path only).
     pub(crate) obs_blocks: Vec<f64>,
+    /// `(q_core² · s).max(1)` twin of the structured kernel's `core_blocks`,
+    /// same per-cluster lower-triangle layout, scattered from `W_obs`. Written
+    /// only in exact mode on a non-canonical link, on the structured-extras
+    /// path (`obs_blocks` above is the blocked-path twin).
+    pub(crate) obs_core_blocks: Vec<f64>,
+    /// `(q_core · s · e).max(1)` twin of the structured kernel's `coupling`,
+    /// `C_obs[f·q_core·e + local·e + b]`. Shares the `coup_cols`/`coup_ptr`
+    /// CSR pattern with the Fisher coupling: the pattern is a function of the
+    /// design and the θ-pin mask, not of `W`.
+    pub(crate) obs_coupling: Vec<f64>,
+    /// `(e²).max(1)` twin of the structured kernel's `schur_blk`, lower
+    /// triangle.
+    pub(crate) obs_schur_blk: Vec<f64>,
+    /// Cached sparse factor of the OBSERVED crossed Schur — a second
+    /// `StructuredSchur` on the same symbolic pattern as the Fisher one, so the
+    /// twin factor and the twin solve take the production sparse arm without
+    /// overwriting the `axx` / `l_values` that the `tail_inv` columns, the β
+    /// border and `se::structured_schur_fill` read off the Fisher factor.
+    /// `None` on nested-only shapes (`e = 0`) and on the blocked path.
+    pub(crate) obs_schur: Option<StructuredSchur>,
     /// len `k_total`. Last ACCEPTED `u` (RE-column order, as `u` itself) — the
     /// halving target once the accept decision moves after the block sweep
     /// (`u_prev` then holds the trial).
@@ -136,6 +217,31 @@ pub(crate) struct ExactProfileBufs {
     pub(crate) fac_f64: Vec<f64>,
 }
 
+/// Does any of these rows sit on a clamp — Fisher weight on
+/// `glm::WEIGHT_CLAMP`, or μ on one of `family::clamp_mu`'s bounds? The test
+/// [`DualStep::exact`] is taken back by; same two conditions the assembled SE
+/// engine refuses a fit on (`glmm::assembled::clamped_row_counts`), sharing
+/// `family::clamp_mu_bounds` with it so the two can never drift apart.
+///
+/// Why a clamped row costs the one-step claim. Writing the PIRLS step as
+/// `u ← u + A_obs⁻¹(g(u) − u)` with `g(u) = M'r(u)`, the lane fixed-point map
+/// contracts by `‖I − A_obs⁻¹(I − ∂g/∂u)‖`, which is zero — lanes exact after
+/// one step — exactly when `A_obs = I − ∂g/∂u = M'W_obs M + I` with the true
+/// `W_obs = −∂r/∂η`. A clamp breaks that equality on the row it binds: the
+/// floor pins `w` to a constant while `family::observed_weight` (and, on a
+/// canonical link, the Fisher `W` that IS the step matrix) still reports the
+/// unfloored curvature, and a pinned μ freezes the deviance's η-dependence the
+/// same way. The contraction is then nonzero and the caller's refinement loop
+/// has to run.
+///
+/// Branches on `.value()` only, so every lane count decides identically.
+pub(crate) fn clamped_row_present<T: Scalar>(family: Family, w: &[T], prob: &[T]) -> bool {
+    let (mu_lo, mu_hi) = crate::family::clamp_mu_bounds(family);
+    w.iter().zip(prob).any(|(wi, mu)| {
+        wi.value() <= crate::glm::WEIGHT_CLAMP || mu.value() <= mu_lo || mu.value() >= mu_hi
+    })
+}
+
 /// `h = ‖L⁻¹ m‖²` for one row: the forward half of `glmm_block_solve` on the
 /// row-major lower factor `l` (q×q), `m` the row's `q` RE-design entries.
 pub(crate) fn block_leverage(l: &[f64], q: usize, m: &[f64]) -> f64 {
@@ -148,6 +254,20 @@ pub(crate) fn block_leverage(l: &[f64], q: usize, m: &[f64]) -> f64 {
         t[r] = v / l[r * q + r];
     }
     t[..q].iter().map(|x| x * x).sum()
+}
+
+/// Forward half of `glmm_block_solve` on the row-major lower factor `l` (q×q):
+/// `t = L⁻¹m`, written into `t`. `block_leverage` is `‖t‖²` at `f64`; a
+/// bilinear form `mᵢ'A⁻¹mⱼ` over the same block is `tᵢ·tⱼ`, which is why the
+/// assembled gradient needs the vector and not only its norm.
+pub(crate) fn block_forward_solve<T: Scalar>(l: &[T], q: usize, m: &[T], t: &mut [T]) {
+    for r in 0..q {
+        let mut v = m[r];
+        for c in 0..r {
+            v -= l[r * q + c] * t[c];
+        }
+        t[r] = v / l[r * q + r];
+    }
 }
 
 /// Refill `eta_fixed[i] = offset[i] + Σ_j x[i,j]·β[j]` (the fixed-effect linear

@@ -208,8 +208,10 @@ never mixed within a fit:
   `src/glmm/pirls/blocked_extras.rs`). Because this θ-only pass already
   reaches the Laplace optimum, no joint polish follows — its status alone
   gates convergence, on the shapes `exact_profile_shape` selects (nAGQ=1,
-  non-Gamma, and either no extra groupings or a canonical-link structured-extras
-  shape within `structured_extras_eligible`).
+  non-Gamma, and either no extra groupings or a structured-extras shape
+  within `structured_extras_eligible`): the kernel's observed-information
+  twin gives the û-path adjoint solve its `Ã = A_obs` on every link, so the
+  route carries no canonical-link restriction on either shape.
 
 **Validation:** `two_stage_matches_single_stage_on_grouseticks` (in
 `src/glmm/tests.rs`) pins `ExactProfile` against `Joint` — grouseticks
@@ -543,16 +545,20 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   differentiating the AGQ deviance where the fit used AGQ. One dual kernel
   call per derivative on every link: the dual PIRLS steps with the exact
   `½h_uu` — the Fisher `A` on a canonical link, the observed-information
-  `A_obs = M'W_obs M + I` on a non-canonical one (`pirls::DualStep`,
-  `family::observed_weight`) — so the implicit-function lanes are exact after
-  one step; `log|A|` and the fit itself stay on the Fisher `A`. A blocked shape with
-  `m = n_theta + p > 12` (`MAX_DUAL_N`) keeps the FD stencil, because a
-  Hessian cannot be chunked: a cross-chunk second-derivative block needs both
-  coordinates' first-order lanes live in the same pass. Structured-extras
-  shapes take the same exact kernel (`derivative::supports_shape`; its
-  `k_crossed ≤ DUAL_TAIL_MAX` clause is unreachable while `DUAL_TAIL_MAX`
-  equals `MAX_CROSSED_LEVELS`). Only the **dense-fallback** shape and the
-  `m > 12` refusal run the FD stencil:
+  `A_obs = M'W_obs M + I` on a non-canonical one — so the implicit-function
+  lanes are exact after one step; `log|A|` and the fit itself stay on the
+  Fisher `A`. `A_obs` is built twice over, once per packing: a single `q_p ×
+  q_p` block on the blocked path (`pirls::DualStep`, `family::observed_weight`),
+  and, on the structured-extras path, the same twin packed as `s` core
+  blocks plus the coupling and `e×e` Schur blocks — both paths take this
+  step on every link. A blocked shape with `m = n_theta + p > 12`
+  (`MAX_DUAL_N`) keeps the FD stencil, because a Hessian cannot be chunked: a
+  cross-chunk second-derivative block needs both coordinates' first-order
+  lanes live in the same pass. Structured-extras shapes take the same exact
+  kernel too (`derivative::supports_shape`; its `k_crossed ≤ DUAL_TAIL_MAX`
+  clause is unreachable while `DUAL_TAIL_MAX` equals `MAX_CROSSED_LEVELS`).
+  Only the **dense-fallback** shape and the `m > 12` refusal run the FD
+  stencil:
   single-step central second differences, with the base step applied
   asymmetrically across the joint vector: `h_θ = FD_STEP_BASE` **absolutely** on
   the θ block, `h_β = FD_STEP_BASE · max(1, |β̂_k|)` relatively on the β block.

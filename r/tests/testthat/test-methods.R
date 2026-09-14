@@ -255,8 +255,11 @@ test_that("diagnostics is additive: the top-level names keep working", {
 test_that("a q >= 2 pin is named even though its stddev is not zero", {
   # Mirrors the Python port's test of the same name: on a grouping with
   # q >= 2 the pin fixes the Cholesky DIAGONAL while the reported stddev is
-  # sqrt(offdiag^2 + diag^2), so it lands at ~1e-10 and the correlation at
-  # 1 + 2e-16. Reading `pinned` names it.
+  # sqrt(offdiag^2 + diag^2), so it lands at ~1e-6, not at 0. The resulting
+  # 2x2 covariance block is then rank 1 (one Cholesky diagonal pinned to
+  # zero), so the correlation is exactly +/-1 by construction - not a
+  # rounding artifact. lme4 reports the same exact 1.000 on this design.
+  # Reading `pinned` names the component.
   #
   # Design mirrors the Rust lmm::tests::zero_slope_variance_pins_slope_component:
   # 16 clusters x 16 rows, a real fixed slope but zero cluster-varying slope,
@@ -285,11 +288,9 @@ test_that("a q >= 2 pin is named even though its stddev is not zero", {
   vc <- VarCorr(fit)$g
   sd <- attr(vc, "stddev")
   expect_length(fit$diagnostics$pinned[[1L]], length(sd))
-  # The pinned slot is negligible against its sibling but is NOT exactly 0,
-  # and the correlation is NOT exactly +/-1.
+  # The pinned slot is negligible against its sibling but is NOT exactly 0.
   expect_false(sd[[2L]] == 0)
   expect_lt(sd[[2L]] / sd[[1L]], 1e-6)
-  expect_false(abs(attr(vc, "correlation")[2L, 1L]) == 1)
 })
 
 test_that("a pin is named on a sparse-route fit too", {

@@ -392,30 +392,48 @@ pub fn joint_hessian_cov(
     ws.fd_saved_prob[..n].copy_from_slice(&ws.prob[..n]);
     ws.warm_seed_active = true;
 
-    // Exact hyper-dual joint Hessian wherever a dual kernel exists for the
-    // shape — the blocked path, which is also the whole AGQ envelope since the
-    // AGQ gate in `deviance.rs` requires `extra_offsets.is_empty()`, and the
-    // structured extras path. Differentiates the
-    // final evaluation at the converged mode, so there is no stencil, no step,
-    // no per-cell PIRLS re-solve and no FD-pass tolerance here. `Unsupported`
-    // (m > MAX_DUAL_N) is a ROUTING answer, not an error: it falls THROUGH to
-    // the FD stencil. Only `NotConverged` — a real failure at the accepted
-    // point — routes to RX. What is left on the stencil is the oversized-core
-    // dense fallback and that one refusal; the sparse driver has its own twin
-    // in `src/sparse/glmm.rs`.
+    // An exact joint Hessian wherever a dual kernel exists for the shape — the
+    // blocked path, which is also the whole AGQ envelope since the AGQ gate in
+    // `deviance.rs` requires `extra_offsets.is_empty()`, and the structured
+    // extras path. Both arms below differentiate the final evaluation at the
+    // converged mode, so neither pays a stencil, a step, a per-cell PIRLS
+    // re-solve or an FD-pass tolerance.
     //
-    // The one owner is `derivative::supports_shape` — do not inline the test.
+    // Three rungs, in order, and what sends a cell down to the next:
+    //
+    //   1. the assembled pass (`assembled::joint_hessian`), first-order lanes
+    //      over an explicit `F`/`G` adjoint. It declines on an AGQ-routed
+    //      shape; wherever the observed factor `A_obs` its adjoint equation
+    //      needs is not positive definite — either inside the kernel (the
+    //      returned lanes would then be a Fisher approximation with no
+    //      detector) or in its own build; and on a mode state where one of the
+    //      kernel's clamps binds, which breaks the mode equation its adjoint
+    //      differentiates (`assembled::clamped_row_counts`). It chunks, so no
+    //      `m` refuses it.
+    //   2. the hyper-dual pass (`derivative::laplace_hessian`), a packed
+    //      second-order pass. It takes the AGQ envelope, and it takes what
+    //      rung 1 declined. It refuses `m > MAX_DUAL_N`, which is its lane cap.
+    //   3. the FD stencil below, for the oversized-core dense fallback
+    //      (`supports_shape` false) and for whatever rung 2 refused.
+    //
+    // `Unsupported` is a ROUTING answer at both exact rungs, not an error:
+    // it falls THROUGH. Only `NotConverged` — a real failure at the accepted
+    // point — routes to RX. The sparse driver has its own twin in
+    // `src/sparse/glmm.rs`.
+    //
+    // The one owner of the shape question is `derivative::supports_shape` —
+    // do not inline the test.
     let mut used_exact = false;
     if super::derivative::supports_shape(&ws.groupings) && !ws.force_fd_hessian {
         // `std::mem::replace` (faer's `Mat` implements no `Default`, so
         // `mem::take` does not compile; the swapped-in `Mat::zeros(0, 0)`
-        // allocates nothing) avoids aliasing: `laplace_hessian` takes
+        // allocates nothing) avoids aliasing: both Hessian entry points take
         // `&mut ws`, so `&mut ws.hess_scratch` cannot be passed alongside it.
         // Replace-and-put-back leaves the field valid on every path, including
         // the `fallback!()` early return, because the put-back precedes the check.
         let mut hess = std::mem::replace(&mut ws.hess_scratch, Mat::zeros(0, 0));
         let mut g = std::mem::take(&mut ws.grad_scratch);
-        let st = super::derivative::laplace_hessian(
+        let st = super::assembled::joint_hessian(
             ws,
             x,
             y,
@@ -426,6 +444,22 @@ pub fn joint_hessian_cov(
             &mut g,
             &mut hess,
         );
+        let st = match st {
+            DerivStatus::Ok(v) => DerivStatus::Ok(v),
+            DerivStatus::NotConverged => DerivStatus::NotConverged,
+            // Rung 2 on its own terms: the assembled pass declined this cell.
+            DerivStatus::Unsupported => super::derivative::laplace_hessian(
+                ws,
+                x,
+                y,
+                cluster_ids,
+                extra_ids,
+                p,
+                n,
+                &mut g,
+                &mut hess,
+            ),
+        };
         ws.grad_scratch = g;
         ws.hess_scratch = hess;
         match st {
