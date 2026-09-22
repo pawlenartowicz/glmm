@@ -47,23 +47,24 @@ match in `fit_warm` (`src/fit/mod.rs`); `assert_model_shape`
 (`q_p > 8`, more than 6 extra groupings, or any extra grouping with
 `1 + slopes.len() > 4`), when *any* extra grouping carries a random slope, or
 when the total crossed level count exceeds `MAX_CROSSED_LEVELS`; otherwise it
-stays **NoZ**. (For a slope-carrying extra the sparse route is not a speed
-choice: the dense kernel's `build_z` emits intercept-only columns for extras,
-so no dense slope-on-extra path exists.) Within each solver, the family selects
-the entry point:
+stays **NoZ**. (For a slope-carrying extra `Solver::Sparse` is not a speed
+choice: only the packed-row `A`-layout applies a full `q_g×q_g` Λ block per
+extra level.) On the non-Gaussian side `classify_design`'s answer selects the
+`A`-layout, not a separate driver — every family reaches the same entry point:
 
 ```mermaid
 flowchart TD
-  A["family, re: Some"] --> B{"classify_design"}
-  B -->|NoZ| C{family}
-  B -->|Sparse| D{family}
+  A["family, re: Some"] --> C{family}
   C -->|"Binomial / Poisson / Gamma"| E["glmm::fit_glmm"]
   C -->|NegativeBinomial| F["fit_glmm_nb"]
-  D -->|"Binomial / Poisson / Gamma"| G["sparse::fit_glmm_sparse"]
-  D -->|NegativeBinomial| H["sparse::fit_glmm_nb_sparse"]
+  E --> L{"GlmmLayout::for_design"}
+  F --> L
+  L -->|"NoZ, no extras"| M["blocked"]
+  L -->|"NoZ, structured extras"| N["structured"]
+  L -->|"Sparse, or an oversized core"| O["packed-row"]
 ```
 
-(Gaussian `re: Some` is the LMM path — `fit_mle` / `fit_mle_sparse` — covered in
+(Gaussian `re: Some` is the LMM path — `fit_lmm` — covered in
 [`algorithms-lmm.md`](algorithms-lmm.md), not here.) Every family that reaches
 this match fits on both solver arms: there is **no reachable `unimplemented!`**
 once dispatch is inside the GLMM path. The hard rejections are the shape
@@ -86,14 +87,14 @@ GLMM shape, AGQ included (see the weights paragraph in the PIRLS section).
 (`fit_glmm_cbpp_matches_lme4`), grouseticks
 (`fit_glmm_poisson_grouseticks_matches_lme4`) and the Gamma goldens
 (`fit_glmm_gamma_sim_matches_lme4`, `goldens/sim_gamma_glmm.json`); the Sparse
-arm by `sim_binomial_slope_crossed` (a slope-carrying crossed extra →
-`fit_sparse_binomial_slope_crossed_matches_lme4` in `src/sparse/tests.rs`) and
-the over-count sparse rungs `sim_sparse_binomial` / `sim_sparse_poisson`
+arm (the packed-row layout) by `sim_binomial_slope_crossed` (a slope-carrying
+crossed extra → `fit_sparse_binomial_slope_crossed_is_pinned` in
+`src/sparse/tests.rs`) and the over-count rungs `sim_sparse_binomial` / `sim_sparse_poisson`
 (rungs 8–9, green against both lme4 and MixedModels.jl).
 
 ## PIRLS inner loop
 
-**Code:** `pirls_solve` (dense fallback, `src/glmm/pirls/dense.rs`),
+**Code:** `pirls_solve_packed` (packed-row, `src/glmm/pirls/packed.rs`),
 `pirls_solve_blocked` (no extras, `src/glmm/pirls/blocked.rs`) and
 `pirls_solve_blocked_extras` (structured crossed/nested,
 `src/glmm/pirls/blocked_extras.rs`); caps `PIRLS_MAX_ITERS = 50`,
@@ -122,7 +123,10 @@ structure:
   the θ-pinning mask changes), and the crossed-width Schur complement
   `S = (E + I) − Σ_f C_fᵀA_f⁻¹C_f` (`schur_blk`). The determinant splits by
   the Schur identity, `log|A| = Σ_f log|A_f| + log|S|`.
-- **Dense fallback**: a genuinely dense `A` (oversized core) is factored whole.
+- **Packed** (everything else — a slope-carrying extra, over the envelope
+  caps, too many crossed levels, or an extras core too wide for the
+  structured route): `M = ZΛ` in fixed-width rows and a dense `k×k` `A`,
+  factored whole.
 
 Convergence follows the lme4 `pwrss` rule: exit when
 `|mixed − mixed_prev| < tol · (1 + |mixed|)`, checked after each step, with
@@ -232,12 +236,13 @@ The `nAGQ=1` marginal objective is the Laplace deviance
 `+I` is the same ridge the penalty `‖ũ‖²` carries. Concretely the return is
 `data_term + pen + 2·logdet` — `logdet` accumulates `Σ ln L_ii` off the
 Cholesky factor, i.e. `½·log|A|`, so `2·logdet` *is* the `log|A|` of the
-formula. At a PIRLS exit these terms come from two iterates, the same pairing
-as the stopping rule's `mixed`: `data_term` and `logdet` from uⱼ, the point the
-last step started from, and `pen` from uⱼ₊₁, the returned mode. The gap to the
-objective rebuilt entirely at uⱼ₊₁ is float noise at the shipped tolerance: a
-canonical-link last step moves u by ~1e-16, and the outer search seeds PIRLS
-from a converged mode ([§Warm starts](#warm-starts-and-workspace-reuse)).
+formula. All three terms come from the returned mode ũ: a converged PIRLS solve
+ends by re-evaluating η/μ/W there, rebuilding `A = MᵀWM + I` from that W and
+refactoring it, so `data_term`, `pen`, `logdet` and the factor the standard-error
+pass inherits describe one iterate. That last rebuild is what the objective needs:
+`D + ‖u‖²` is stationary in u at the mode, so reading it a step early costs
+`O(‖δu‖²)`, but `log|A(u)|` is not stationary and a lagged factor puts a
+first-order error in the objective and in every lane differentiated through it.
 `glmer` pairs the terms differently — its deviance and penalty sit at the new
 mode and only `log|A|` lags one iteration. For binomial and Poisson the data
 term is the bare deviance `D` (`glmer` substitutes the family
@@ -277,7 +282,7 @@ flowchart TD
   A["laplace_deviance at (θ, β)"] --> B{"nAGQ > 1 AND no extras AND q_p ≤ 3 AND binomial/Poisson"}
   B -->|"yes, q_p == 1"| C["agq_deviance (Liu-Pierce adaptive GH)"]
   B -->|"yes, q_p ∈ 2..=3"| E["agq_deviance_vec (k^q_p product grid)"]
-  B -->|no| D["Laplace PIRLS branch (blocked / structured / dense)"]
+  B -->|no| D["Laplace PIRLS branch (blocked / structured / packed)"]
 ```
 
 `agq_deviance` first converges each cluster's mode ũ_c and curvature A_c via the
@@ -290,8 +295,10 @@ collapses to the Laplace term exactly — so `nagq == 1` routes to
 `1, 3, …, 25`), enforced by `assert_model_shape`. Prior weights thread through
 unchanged — the per-row `dev_resid` sums carry `wᵢ` and PIRLS folds the weights
 into each cluster's mode and curvature, so aggregated binomial with AGQ
-(`glmer(cbind(s, m−s) ~ …, nAGQ=k)`) is supported. AGQ has **no sparse
-counterpart**. `q_p ≥ 4` is refused by `assert_model_shape` as a temporary
+(`glmer(cbind(s, m−s) ~ …, nAGQ=k)`) is supported. AGQ runs on the blocked
+layout only — the packed layout pins `nagq = 1` in `from_groupings` before
+`outer_search` is computed, silently Laplace regardless of the caller's
+`nagq`. `q_p ≥ 4` is refused by `assert_model_shape` as a temporary
 cost/oracle-coverage boundary, not a code limit on the `k^q_p` product grid
 itself (the grid cost is the user's to pay: `k=25` at `q_p=3` is already
 15,625 nodes per cluster per evaluation).
@@ -307,49 +314,55 @@ sweep — that corpus is pinned to Laplace (`nAGQ=1`) so it can compare
 like-to-like across lme4, MixedModels.jl and glmm; AGQ lives in the goldens
 track alone, since it is fundamentally an lme4-vs-glmm comparison.
 
-## Dense vs sparse-Z solvers
+## The three `A`-layouts
 
-**Code:** dense clustered kernel `glmm::fit_glmm` (`src/glmm/mod.rs`) with the
-three PIRLS variants; sparse driver `fit_glmm_sparse` / `fit_glmm_nb_sparse`
-(`src/sparse/glmm.rs`); router `classify_design` (`src/fit/mod.rs`).
+**Code:** `glmm::fit_glmm` (`src/glmm/mod.rs`) with the three PIRLS variants;
+`GlmmLayout::for_design` (`src/glmm/workspace.rs`); router `classify_design`
+(`src/fit/mod.rs`).
 
-The dense (`NoZ`) kernel never materializes a sparse Z: with no extras `A` is
-block-diagonal and rebuilt per row; intercept-only crossed/nested extras use the
-structured core-plus-Schur factorization described in the PIRLS section; a
-genuinely dense `A` (oversized core) uses the dense fallback. It implements
-**intercept-only** extra groupings only — `build_z` emits no slope columns for
-extras. Any design that needs full q_g×q_g Λ-blocks per extra level (a
-slope-carrying extra), or that busts the envelope caps, or that has too many
-crossed levels, is routed by `classify_design` to the **sparse** driver, whose
-PIRLS applies the full per-level Λ-blocks. Because the router redirects rather
-than aborts, the caps are a routing boundary, not a panic — every family fits
-on whichever side it lands.
+No layout materializes a dense `Z`. `GlmmLayout::for_design` reads
+`classify_design`'s NoZ/Sparse answer and the extras shape to pick one of three:
 
-**Convention/reference:** both solvers target the identical `glmer` Laplace
-optimum; the sparse path differs only in linear algebra (sparse Cholesky over
-the full Z), not in objective, so a BOBYQA optimum is shared. **Validation:**
-the sparse Schur/deviance are cross-checked against the dense kernel on
-grouseticks (`sparse_schur_deviance_equals_dense_grouseticks`,
+| layout | `A` | kernel | dual kernel | exact profile | route |
+|---|---|---|---|---|---|
+| blocked | block-diagonal, `q ≤ MAX_PRIMARY_Q` | `pirls_solve_blocked<T>` | yes | yes | no extras |
+| structured | `[[A_cc, C], [C', S]]` | `pirls_solve_blocked_extras<T: TailKernel>` | yes | yes | extras, `q_core ≤ MAX_PRIMARY_Q`, crossed levels ≤ 500 |
+| packed | one dense `k×k` | `pirls_solve_packed` (`f64`) | no | no | everything `classify_design` sends to `Solver::Sparse`, plus an extras design whose core is too wide for the structured route |
+
+The outer search, the NB coordinate search, the SE dispatch and the
+diagnostics are one code path over all three layouts: `fit_glmm` and
+`fit_glmm_nb` never branch on which layout a fit took, only
+`GlmmLayout::for_design` does. The packed layout has no dual kernel — its
+PIRLS is `f64`-only — but its derivatives come from the assembled engine,
+which rebuilds `M`, `η`, `W` and the dense `A` at `Dual<N>` around û's
+explicitly solved lanes `U = −G_u⁻¹G_γ`, so its Hessian standard error is
+the exact assembled one ([§Standard errors](#standard-errors)). Because the router
+selects a layout rather than aborting, the envelope caps are a routing
+boundary, not a panic — every family fits whichever layout it lands on.
+
+**Convention/reference:** all three layouts target the identical `glmer` Laplace
+optimum; they differ only in linear algebra, not in objective, so a BOBYQA
+optimum is shared. **Validation:** the packed Schur/deviance are cross-checked
+against the blocked and structured kernels on grouseticks
+(`sparse_schur_deviance_equals_dense_grouseticks`,
 `sparse_schur_se_equals_dense_grouseticks`); external truth is
 `sim_binomial_slope_crossed` (slope-carrying crossed extra), `sim_sparse_binomial`
 and `sim_sparse_poisson` (rungs 8–9, both reference engines), plus the
-lme4-only sparse Gamma/NB goldens `sim_sparse_gamma` / `sim_sparse_nb`.
+lme4-only Gamma/NB goldens `sim_sparse_gamma` / `sim_sparse_nb`.
 
 ## Negative-Binomial outer θ-loop
 
-**Code:** `fit_glmm_nb` (`src/fit/glmm.rs`) and `fit_glmm_nb_sparse`
-(`src/sparse/glmm.rs`); the marginal-θ objective term `nb_profile_loglik`, the
-sparse route's 1-D search `golden_max_ln_theta`, and caps `NB_THETA_LO = 1e-3`,
-`NB_THETA_HI = 1e4` in `src/fit/glm.rs`.
+**Code:** `fit_glmm_nb` (`src/fit/glmm.rs`); the marginal-θ objective term
+`nb_profile_loglik` and caps `NB_THETA_LO = 1e-3`, `NB_THETA_HI = 1e4` in
+`src/fit/glm.rs`.
 
-The NB shape parameter θ is not carried in the spec — the spec is θ-free. Both
-routes maximize the same **marginal** log-likelihood over `ln θ` (the NB
-likelihood is far more symmetric in `ln θ` than in θ), `logL_marginal =
-−½·deviance + nb_profile_loglik(y, y, θ)`, where the second term is the NB
-saturated-reference log-likelihood on the same (weighted) scale. They differ in
-how they search it.
+The NB shape parameter θ is not carried in the spec — the spec is θ-free. The
+route maximizes the **marginal** log-likelihood over `ln θ` (the NB likelihood is
+far more symmetric in `ln θ` than in θ), `logL_marginal = −½·deviance +
+nb_profile_loglik(y, y, θ)`, where the second term is the NB saturated-reference
+log-likelihood on the same (weighted) scale.
 
-**Dense (`fit_glmm_nb`).** `ln θ_NB` is one more trailing coordinate of the outer
+**`fit_glmm_nb`.** `ln θ_NB` is one more trailing coordinate of the outer
 BOBYQA — `[θ_RE | ln θ_NB]` on the θ-only stage, `[θ_RE | β | ln θ_NB]` on the
 joint one — minimizing `deviance − 2·nb_profile_loglik(y, y, θ_NB, w)`, which is
 `logL_marginal` times −2 and so has the same optimum. β, θ_RE and θ_NB come out
@@ -360,27 +373,26 @@ It cold-starts from the no-RE GLM-NB's own θ̂ (one extra fixed-effects-only
 dispersion and lands one to two orders of magnitude low, where PIRLS does not
 converge on random-slope shapes.
 
-**Sparse (`fit_glmm_nb_sparse`).** Keeps the outer search: for each candidate θ
-the inner `fit_glmm_sparse` re-fits the whole GLMM at that fixed θ and returns
-its minimized marginal Laplace deviance, maximized over `ln θ` on the bracket
-`[ln 1e-3, ln 1e4]` by golden-section, then one final fit at the converged θ̂.
+The reported `Fit::deviance` on an NB GLMM is the search's own objective,
+`deviance + (−2·saturated_loglik(θ̂))` at the fitted θ̂ — equal to `−2·logLik`
+exactly, since the saturated term the marginal Laplace deviance drops is
+restored here rather than inside `Fit::loglik` (`fit::common::glmm_loglik`).
 
 For integer
 counts that term needs no `lgamma` at all: the profile uses the exact identity
 `lnΓ(y+θ) − lnΓ(θ) = Σ_{k=0}^{y−1} ln(θ+k)`, a finite sum, which is what makes
-the match to `MASS::theta.ml` exact rather than approximate. Either way θ̂ is
-reported as the fit's `dispersion`. (Both differ from the *GLM* NB path
-`fit_glm_nb`, which uses an alternating fixed-θ / profile-θ outer loop capped at
-`NB_MAX_OUTER = 25` with `|Δθ|/θ < NB_THETA_TOL = 1e-6`. The sparse global
-search is immune to that path's cap-exhaustion staleness caveat; the dense one
+the match to `MASS::theta.ml` exact rather than approximate. θ̂ is reported as the
+fit's `dispersion`. (This differs from the *GLM* NB path `fit_glm_nb`, which
+uses an alternating fixed-θ / profile-θ outer loop capped at
+`NB_MAX_OUTER = 25` with `|Δθ|/θ < NB_THETA_TOL = 1e-6`. The GLMM coordinate
 seeds from it, so a cap-exhausted prefit gives it a stale start — a start only,
 which the coordinate then moves.)
 
 **Convention/reference:** the θ profile mirrors `MASS::theta.ml`; the outer
 marginal-θ maximization matches `lme4::glmer.nb`. The β SE conditions on θ̂
 (θ-uncertainty out of scope, the lme4/MASS convention). **Validation:**
-`fit_glmm_nb_sim_matches_lme4` against `goldens/sim_nb_glmm.json` (dense); the
-sparse NB path by `goldens/sim_sparse_nb.json`.
+`fit_glmm_nb_sim_matches_lme4` against `goldens/sim_nb_glmm.json`; the
+packed-row layout by `goldens/sim_sparse_nb.json`.
 
 ## Warm starts and workspace reuse
 
@@ -393,11 +405,19 @@ rather than handing it over.
 
 All GLMM solver scratch lives in one `GlmmWorkspace`, allocated **once per
 (spec, max_n) shape** — its buffers depend only on `(groupings, family, p,
-max_n, nAGQ)`, never on the data values. Buffers are sized to `max_n` rows
+max_n, nAGQ)`, never on the data values. Inside it most of the scratch is
+grouped by the stage that writes it — `PirlsScratch` (every route),
+`StructuredScratch` and `StructuredPattern` (the crossed/nested route),
+`PackedScratch` (the packed-row layout), `BorderScratch` (the β border and the
+Schur fillers), `FdState` and `InferenceScratch` (the post-search passes; a
+few buffers stay flat on the workspace, and `StructuredPattern` is a
+read-mostly index pattern rather than a stage's write target) — and the derivative passes'
+`GlmmDualBufs` carry the same `PirlsScratch`/`StructuredScratch` at dual
+scalar types. Buffers are sized to `max_n` rows
 and `k` RE columns (with `n_theta` and `p` fixed by the spec), with one
-route-dependent exception: the dense random-effects matrices (`z`, `m`, `wm`
-and their `k × k` products `a`, `a_chol`) exist only on the dense fallback
-route — the blocked and structured routes never read them and get 0×0 stubs,
+route-dependent exception: the packed `M` rows (`m_cols`, `m_vals`) and their
+`k × k` products `a`, `a_chol` exist only on the packed-row
+layout — the blocked and structured routes never read them and get 0-length stubs,
 so the workspace's footprint stays cluster-sized rather than data-sized on
 the common shapes. A single workspace is reused across every BOBYQA
 evaluation and PIRLS iteration of one fit with no reallocation; the warm path
@@ -409,8 +429,9 @@ in `k`, `n_theta`, the groupings, the family, or `nAGQ`). At the stable
 `fit_cold`/`fit_warm` surface this is moot — the workspace is built per call.
 
 Two seeding mechanisms feed the optimizer. Across fits, a caller-supplied
-`StartValues` threads β and θ into the search (`fit_warm`; the dense GLMM kernel
-warm-starts both, unlike the LMM kernel which seeds θ only). A cold start seeds
+`StartValues` threads β and θ into the search (`fit_warm`; `fit_glmm`
+warm-starts both, on every layout, unlike the LMM kernel which seeds θ only).
+A cold start seeds
 β from a full no-RE GLM fit — `glm_warm_start_beta` runs the actual IRLS GLM of
 [`algorithms.md`](algorithms.md#generalised-linear-models-glm) once (with its
 own scratch) before the RE structure is even considered, which is
@@ -422,11 +443,10 @@ reproducibility). Every outer-search objective evaluation, in either stage,
 starts PIRLS from `u_seed` rather than from 0, and copies its mode back into
 `u_seed` only on a strict improvement, so `u_seed` is always the mode at the
 best point so far. The pinned γ̂ re-evaluation starts from it too. Its PIRLS
-therefore begins at (or, after a pin, next to) a converged mode, and the
-reported deviance carries no measurable gap between the two iterates it is
-assembled from. The sparse path (`sparse_glmm_deviance` in `src/sparse/glmm.rs`)
-seeds differently: a fit-path evaluation starts from the previous evaluation's
-converged mode, not the incumbent's, and its FD-Hessian evaluations start from 0.
+therefore begins at (or, after a pin, next to) a converged mode.
+The packed-row layout seeds its FD-Hessian evaluations from 0
+instead (`laplace_deviance`'s packed arm), which is the constant seed that
+stencil's order-freeness rests on.
 
 The seed is usually immaterial: where the conditional mode is unique given
 (θ, β) it only shifts the stopping iterate within the PIRLS exit band. That is
@@ -438,9 +458,8 @@ in a different basin than the fit itself reached — measured on `sim_gamma`,
 deviance 1034.57 against the fit's 936.77 at the same γ̂. `joint_hessian_cov`
 therefore anchors on the fit's own converged mode on both of its arms: the FD
 arm seeds every one of its finite-difference evaluations, the central one
-included, from that mode rather than re-deriving it cold, and the exact
-hyper-dual arm differentiates the final evaluation at the same mode (a Gamma
-shape routes to one arm or the other depending on link and size).
+included, from that mode rather than re-deriving it cold, and the exact rungs
+differentiate the final evaluation at that same mode.
 Differentiating around the wrong basin produced an indefinite Hessian and cost
 the fit its SEs entirely.
 
@@ -451,8 +470,8 @@ the `loop_advanced` MCPower hot-loop surface.
 ## Boundary handling and the `singular` flag
 
 **Code:** the pin loop after the outer search converges in `glmm::fit_glmm`
-(`src/glmm/mod.rs`; `PIN_THETA` imported from `src/lmm/mod.rs`); the sparse mirror
-in `src/sparse/glmm.rs`; the flag assembly and `has_negligible_component`
+(`src/glmm/mod.rs`; `PIN_THETA` imported from `src/lmm/mod.rs`); the flag
+assembly and `has_negligible_component`
 (`SINGULAR_REL_TOL = 1e-3`) in `src/fit/mod.rs` and `src/fit/glmm.rs`.
 
 θ is the vech of the RE-covariance Cholesky factor Λ, searched in the box
@@ -491,8 +510,7 @@ rewritten into its canonical Σ-preserving Λ by `canonicalize_pinned_blocks`
 folded into the trailing diagonals by re-factoring Σ, the pin test runs again,
 and the re-evaluation therefore rebuilds ũ, W̃ and the deviance at the canonical
 θ. Σ is unchanged, so the reported estimates are unchanged; `pinned` becomes
-truthful, and `Diagnostics::boundary_score` becomes reportable at every pinned
-diagonal.
+truthful.
 
 `Fit::diagnostics.singular` is `boundary_hit == 1` **or** the post-hoc
 `has_negligible_component()` check at `Fit` assembly (`src/fit/glmm.rs`,
@@ -506,11 +524,11 @@ expressed in — the owning description is
 [`algorithms-lmm.md` §Random-effect design column scaling](algorithms-lmm.md#random-effect-design-column-scaling).
 The GLMM path scales its RE design the same way and by the same code: the
 per-column scales live on the shared grouping structure and are applied where Z
-is built (`build_z` / `fill_z_f64` in `src/glmm/workspace.rs`, `fill_m_vals` in
-`src/sparse/glmm.rs`, and the Rx M row in `src/glmm/se.rs`). The joint Hessian
-is taken in the internal θ̃ on both arms (the FD stencil perturbs it, the exact
-kernel differentiates with respect to it), so `stddev_se` is divided by the
-same scales before it is reported.
+is built (`fill_z_f64` in `src/glmm/workspace.rs`, `fill_m_vals` in
+`src/glmm/pirls/packed.rs`, and the Rx M row in `src/glmm/se.rs`). The joint Hessian
+is taken in the internal θ̃ on every arm (the FD stencils perturb it, the
+assembled and hyper-dual passes differentiate with respect to it), so
+`stddev_se` is divided by the same scales before it is reported.
 
 **Convention/reference:** lme4 searches the same linear-scale Cholesky with
 the diagonals boxed at `≥ 0` (`glmer`'s θ lower bounds) and flags the same
@@ -525,12 +543,14 @@ tests in `src/lmm/tests.rs` pin the shared pin loop; the accuracy study
 ## Standard errors
 
 **Code:** the `WaldSe` arms in `glmm::fit_glmm` and `joint_hessian_cov` /
-`rx_cov_into` in `src/glmm/se.rs`; the exact-Hessian entry point
-`laplace_hessian` in `src/glmm/derivative.rs`; the sparse twins
-`sparse_fd_hessian_cov` and the sparse Rx Schur in `src/sparse/glmm.rs`;
+`rx_cov_into` in `src/glmm/se.rs`; the assembled exact-Hessian engine
+`assembled::joint_hessian` (body `joint_hessian_columns`, `f64` gradient
+`packed_gradient`, routing gate `assembly_routes`, memory guard
+`PACKED_ASSEMBLY_MAX_BYTES`) in `src/glmm/assembled.rs`; the hyper-dual
+fallback `laplace_hessian` in `src/glmm/derivative.rs`; the packed-row stencil
+`packed_fd_hessian_cov` and `packed_schur_fill` in `src/glmm/se.rs`;
 `FD_STEP_BASE = 1e-2` and `PIRLS_TOL_REL_FD = 1e-8` in `src/glmm/mod.rs` (both
-scoped to the FD arm only); `SPARSE_FD_STEP_REL = 1e-4` in
-`src/sparse/glmm.rs`.
+scoped to the FD arm only); `SPARSE_FD_STEP_REL = 1e-4` in `src/glmm/se.rs`.
 
 Two genuinely different Wald covariances are offered, selected by `WaldSe`:
 
@@ -538,28 +558,87 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   TRUE)`): the fixed-effect covariance is the β-block of `2·H_dev⁻¹`. Here
   `H_dev` is the Hessian of the joint `(θ, β)` Laplace deviance at the
   converged point. The factor of 2 arises because the deviance is −2·logL, so
-  the observed information is `H_dev/2`. On the **blocked** path
-  (`extra_offsets` empty — which includes every AGQ shape, since the AGQ gate
-  requires it) `H_dev` is **exact**, from the hyper-dual kernel
-  (`laplace_hessian`): no step, no stencil, no per-cell PIRLS re-solve;
-  differentiating the AGQ deviance where the fit used AGQ. One dual kernel
-  call per derivative on every link: the dual PIRLS steps with the exact
-  `½h_uu` — the Fisher `A` on a canonical link, the observed-information
+  the observed information is `H_dev/2`. Three rungs produce `H_dev`, each
+  answering only what the rung above it declines; a decline is a routing
+  answer, not a failure.
+
+  **Rung 1 — the assembled pass** (`assembled::joint_hessian`), the default on
+  all three `A`-layouts and at every `m = n_theta + p`. The total derivative of
+  the profiled Laplace deviance `D*(γ) = F(γ, û(γ))` is closed form in the
+  objective `F`, the mode equation `G = D_u + 2u` that PIRLS drives to zero,
+  and one adjoint solve — no derivative of `û` appears:
+  `D*_γ = F_γ − adj'·G_γ` with `adj = G_u⁻ᵀF_u` (Skaug & Fournier 2006;
+  Kristensen et al. 2016; the adjoint itself is Griewank & Walther 2008
+  ch. 3–4, the `log|A|` differential Giles 2008 and Magnus & Neudecker 2019
+  ch. 8). That expression is written once, generically over the scalar type,
+  out of row quantities the exact β-profile already forms — the RE leverage
+  `hᵢ = mᵢ'A⁻¹mᵢ`, the Fisher-weight derivative `dw/dη`, the observed weight —
+  and is then evaluated at `Dual<N>`. The identity holds at every γ in a
+  neighbourhood and not only at γ̂, so those **first-order** lanes are the exact
+  joint `(θ, β)` Hessian: no step, no stencil, no per-cell PIRLS re-solve, and,
+  first-order lanes being chunkable in `⌈m / MAX_DUAL_N⌉` passes, no `m` refuses
+  this rung. The blocked and structured kernels supply their own dual twin; the
+  packed-row kernel is `f64`-only and is not differentiated at all — there the
+  engine rebuilds `M`, `η`, `W` and the dense `k×k` `A` at `Dual<N>` around û's
+  explicitly solved lanes `U = −G_u⁻¹G_γ`.
+
+  A row whose μ sits on a `family::clamp_mu` bound is handled per row. There
+  the deviance stops depending on η while the kernel's score
+  `ρ̃ = prior_w·μ'(η)·(y − μ_c)/V(μ_c)` does not, so the mode equation PIRLS
+  solves, `u = M'ρ̃`, and the objective part company: `D_γ` and `D_u` take a
+  zero deviance slope on that row, `G` keeps `ρ̃`, and the observed weight and
+  `dw/dη` come from the closed forms `family::clamped_observed_weight` and
+  `family::clamped_weight_eta_deriv` (both built on `family::mu_eta_eta`). With
+  such a row `A_obs` differs from the Fisher `A` on a canonical link too, so
+  it is built and factored there. Unweighted Bernoulli logit has no such
+  row: its family pass applies no μ clamp (`family::pinned_mu_bounds`). On
+  the blocked and structured layouts the dual kernel's own step is inexact
+  with a clamped row (`DualStep::exact`), so `run_assembled_hessian` re-enters
+  the kernel from the returned `u` until the assembled columns stop moving
+  (band `1e-10·(1 + |h|)` per entry, at most `MAX_DUAL_REFINEMENTS` calls, a
+  spent cap is `NotConverged`); a clean fit takes one call.
+
+  It declines in five cases. An AGQ-routed shape, which is rung 2's: the
+  identity above is the Laplace one. A row on one of `family::clamp_eta`'s
+  bounds (`assembled::eta_clamped_rows`): η is a constant there, which the
+  per-row derivatives do not model. A μ-clamped row on the weighted logit
+  link (`assembled::logit_clamp_refused`): the assembly writes the logit
+  score as `prior_w·(y − μ)`, the structured and packed kernels write the
+  general form, and on a clamped row the two differ. A non-positive-definite
+  observed factor `A_obs`, which the adjoint equation needs and which is never
+  silently replaced by the Fisher factor. And, on the packed-row layout alone,
+  a working set over `PACKED_ASSEMBLY_MAX_BYTES` (256 MiB; the widest corpus
+  rung, `sim_sparse_binomial_bigsd` at `k = 356`, sits 5.4× under it).
+
+  **Rung 2 — the hyper-dual pass** (`laplace_hessian`), one
+  `HyperDual<N, H>` pass that differentiates the deviance twice at once and
+  reads the packed second-derivative block. It is AGQ's own route —
+  differentiating the AGQ deviance where the fit used AGQ — and it is the
+  per-cell fallback for what rung 1 declines on a layout that has a dual twin
+  of its PIRLS kernel (`derivative::supports_shape`: blocked and structured,
+  never packed; its `k_crossed ≤ DUAL_TAIL_MAX` clause is unreachable while
+  `DUAL_TAIL_MAX` equals `MAX_CROSSED_LEVELS`). It refuses
+  `m > MAX_DUAL_N` (12), because a second-order pass cannot be chunked: a
+  cross-chunk second-derivative block needs both coordinates' first-order lanes
+  live in the same pass. The dual PIRLS steps with the exact `½h_uu` — the
+  Fisher `A` on a canonical link, the observed-information
   `A_obs = M'W_obs M + I` on a non-canonical one — so the implicit-function
   lanes are exact after one step; `log|A|` and the fit itself stay on the
   Fisher `A`. `A_obs` is built twice over, once per packing: a single `q_p ×
   q_p` block on the blocked path (`pirls::DualStep`, `family::observed_weight`),
   and, on the structured-extras path, the same twin packed as `s` core
   blocks plus the coupling and `e×e` Schur blocks — both paths take this
-  step on every link. A blocked shape with `m = n_theta + p > 12`
-  (`MAX_DUAL_N`) keeps the FD stencil, because a Hessian cannot be chunked: a
-  cross-chunk second-derivative block needs both coordinates' first-order
-  lanes live in the same pass. Structured-extras shapes take the same exact
-  kernel too (`derivative::supports_shape`; its `k_crossed ≤ DUAL_TAIL_MAX`
-  clause is unreachable while `DUAL_TAIL_MAX` equals `MAX_CROSSED_LEVELS`).
-  Only the **dense-fallback** shape and the `m > 12` refusal run the FD
-  stencil:
-  single-step central second differences, with the base step applied
+  step on every link.
+
+  **Rung 3 — the finite-difference stencils**, what neither exact rung
+  answered. On the packed-row layout that is `packed_fd_hessian_cov` at its own
+  step constant; on the blocked and structured layouts it is the grid in
+  `joint_hessian_cov` at `FD_STEP_BASE`, reached by a cell both exact rungs
+  declined and by the `force_fd_hessian` A/B switch the crate's own
+  FD-vs-exact comparisons run. The rung stays because a fit the exact engines
+  refuse keeps a finite-difference Hessian standard error instead of dropping
+  to Rx. Both stencils take single-step central second differences, and each
+  has its own step rule. The dense grid applies the base step
   asymmetrically across the joint vector: `h_θ = FD_STEP_BASE` **absolutely** on
   the θ block, `h_β = FD_STEP_BASE · max(1, |β̂_k|)` relatively on the β block.
   β enters through η = Xβ and wants relative stepping; θ does not — scaling h_θ
@@ -573,14 +652,14 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   `min(PIRLS_TOL_REL_FD, pirls_tol(family))` — the FD ceiling capped by the
   family's own fit tolerance, so the stencil is never looser than the fit that
   produced the point it differences — and the second differences are
-  step-invariant by construction rather than by luck. On either arm, if the
-  joint Hessian is non-PD, or a perturbed deviance is non-finite (the
-  few-cluster failure mode), it falls back to the Rx/Schur covariance and
-  reports `FdHessianStatus::NonPdFellBackToRx`.
+  step-invariant by construction rather than by luck. Whichever rung produced
+  it, if the joint Hessian is non-PD, or a perturbed deviance is non-finite
+  (the few-cluster failure mode), the covariance falls back to the Rx/Schur one
+  and reports `FdHessianStatus::NonPdFellBackToRx`.
 
 - **`WaldSe::Rx`** (conditional on θ̂): inverts the expected-information Schur
   complement of the β block directly (`rx_cov_into`, via `blocked_` /
-  `structured_` / `dense_schur_fill`). This is fast — one closed-form Schur
+  `structured_` / `packed_schur_fill`). This is fast — one closed-form Schur
   solve, reusing the factors PIRLS left behind. Its cost is an assumption of
   β–θ orthogonality: exact for the Gaussian LMM, but anticonservative for a
   GLMM, where the IRLS weights couple β and θ. Gamma carries lme4's σ̂² on this
@@ -588,30 +667,23 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   σ̂² ≡ 1.
 
 Both are computed on the deviance/log-odds scale (the fit's linear-predictor
-scale). The sparse driver emits the same two arms: `sparse_fd_hessian_cov`
-mirrors the dense FD scheme (single-step central differences, identical Rx
-fallback) but carries its own sparse-calibrated step
-`SPARSE_FD_STEP_REL = 1e-4` — deliberately not the dense `1e-2`; the two paths
-sit on opposite sides of the truncation-vs-noise trade and the constants must
-not be folded together. It also keeps the relative
-`h_k = SPARSE_FD_STEP_REL · max(1, |γ̂_k|)` rule on **every** coordinate, θ
-included: the dense θ-step fix above does not transfer, because a step already
-calibrated on the noise side gets pushed further into noise by shrinking it.
-Large-θ̂ calibration of the sparse arm is open work. The sparse twin keeps the
-FD scheme and `SPARSE_FD_STEP_REL` unchanged under the exact-Hessian dense arm:
-the sparse tail is not generic over the scalar, so there is no dual kernel to
-call there. The FD Hessian arm is the dominant time cost (≈ O(m²) deviance
-re-solves); on cbpp the FD Hessian fit was ~1.9× its Rx fit.
+scale), and both are emitted on every layout. The packed-row stencil's step is
+its own constant, `SPARSE_FD_STEP_REL = 1e-4` — deliberately not the `1e-2`
+the other layouts' grid takes; the two sit on opposite sides of the
+truncation-vs-noise trade and must not be folded together. It also keeps the
+relative `h_k = SPARSE_FD_STEP_REL · max(1, |γ̂_k|)` rule on **every**
+coordinate, θ included: the θ-step rule above does not transfer, because a
+step already calibrated on the noise side gets pushed further into noise by
+shrinking it. Large-θ̂ calibration of that step is open work. A stencil costs
+≈ O(m²) deviance re-solves, which is why it sits last: the two rungs above it
+differentiate a single evaluation at the converged mode.
 
 **Convention/reference:** `WaldSe::Hessian` ≡ `glmer` `vcov(use.hessian = TRUE)`
 in *convention* — the same quantity, the same factor of 2 — but not in
-*method* on the blocked path or on the structured-extras shapes
-`derivative::supports_shape` accepts (nested-only, crossed-intercept, and
-nested+crossed designs with intercept-only extra factors, up to the measured
-crossed-level cap `DUAL_TAIL_MAX`): glmer differentiates numerically (numDeriv)
-and we do not there; the oversized-core dense-fallback and sparse shapes still
-difference numerically. `WaldSe::Rx` ≡ `vcov(use.hessian = FALSE)` and the
-MixedModels.jl vcov. **Validation:** the committed fixture
+*method* on any layout: glmer differentiates numerically (numDeriv), and the
+two exact rungs above differentiate the Laplace deviance itself, leaving a
+stencil only for the cells both of them decline. `WaldSe::Rx` ≡
+`vcov(use.hessian = FALSE)` and the MixedModels.jl vcov. **Validation:** the committed fixture
 `tests/fixtures/glmm_hessian_vcov.json` (n=96 / 12-cluster `y ~ x1 + (1|grp)`)
 pins the scheme at its unchanged band; in the `validation/` sweep the two
 methods are gated separately — `se_rx` against all three engines
@@ -626,12 +698,11 @@ switch.
 **Code:** the rayon arms in `src/glmm/agq.rs` (cluster-outer AGQ over
 `ClusterRowIndex`) and `src/glmm/se.rs::joint_hessian_cov` (the FD grid over
 `(i, j)` Hessian cells), both gated on the `parallel` cargo feature **and**
-`FitOptions::parallel_inner` at runtime. The exact hyper-dual Hessian now
-covers the blocked path and the structured-extras shapes
-`derivative::supports_shape` accepts, and that call has no rayon in it: a
-single deterministic `laplace_hessian` call. The FD grid arm runs only on what
-is left — the oversized-core dense fallback, `m = n_theta + p > MAX_DUAL_N`, or
-the `force_fd_hessian` A/B switch.
+`FitOptions::parallel_inner` at runtime. Neither exact Hessian rung has rayon
+in it — the assembled pass and the hyper-dual pass are one deterministic call
+each — so the FD grids (the `FD_STEP_BASE` one in `joint_hessian_cov`, the
+packed-row one in `packed_fd_hessian_cov`) run only on what is left: a cell
+both exact rungs declined, and the `force_fd_hessian` A/B switch.
 
 The two parallel surfaces are exactly the embarrassingly-parallel outer loops —
 per-cluster AGQ integrals and per-cell FD deviance evaluations. The design
@@ -692,7 +763,7 @@ GLMMadaptive is quadrature-first.
 | Grouping structure | multiple, crossed/nested | multiple, crossed/nested | **single grouping factor only** | multiple, crossed/nested (dense/sparse routing) |
 | Outer optimisation | derivative-free, θ-then-joint two-stage (BOBYQA/Nelder-Mead) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE); `fast=true` θ-only or joint | hybrid: EM first, then quasi-Newton over all parameters | derivative-free BOBYQA, one of three routes fixed per shape: joint `[θ\|β]`, θ-only PQL profile then joint polish, or θ-only EXACT Laplace profile alone |
 | Fixed-effect vcov | Hessian (default) or RX | RX-style only | observed information (numeric), sandwich available | both arms: `Hessian` (default, ≡ `use.hessian=TRUE`) and `Rx` (≡ MixedModels) |
-| Families beyond binomial/Poisson | Gamma, NB (`glmer.nb`), … | limited | broad: NB, beta, Student-t, zero-inflated/hurdle, censored, user-defined density | Gamma, NB (marginal-θ; dense: a BOBYQA coordinate, sparse: golden-section) |
+| Families beyond binomial/Poisson | Gamma, NB (`glmer.nb`), … | limited | broad: NB, beta, Student-t, zero-inflated/hurdle, censored, user-defined density | Gamma, NB (marginal-θ as a BOBYQA coordinate) |
 | RE-covariance boundary (singular fits) | bounded linear-scale Cholesky, θ diagonals `≥ 0`: boundary reachable; flagged via `isSingular` (θ `< 1e-4`), raw θ reported | same bounded Cholesky, boundary reachable | **log-Cholesky** (`chol_transf`: Cholesky diagonal on the log scale), unconstrained — the boundary sits at `−∞` and is unreachable | bounded Cholesky as lme4, plus the exact-`0` pin (`PIN_THETA`) and `Diagnostics::singular`/`Diagnostics::boundary`/`Diagnostics::pinned` |
 
 In practice:
@@ -737,6 +808,17 @@ In practice:
   Mixed-Effects Models Using lme4. *Journal of Statistical Software*, 67(1),
   1–48. — the PIRLS/Laplace `devfun`, the θ-then-joint two-stage structure
   (§3), and the `pwrssUpdate` step-halving discipline.
+- Giles, M. B. (2008). Collected Matrix Derivative Results for Forward and
+  Reverse Mode Algorithmic Differentiation. In *Advances in Automatic
+  Differentiation*. Springer. — the `log|A|` differential the assembled
+  gradient carries.
+- Griewank, A. & Walther, A. (2008). *Evaluating Derivatives: Principles and
+  Techniques of Algorithmic Differentiation* (2nd ed.). SIAM, ch. 3–4. — the
+  adjoint `adj = G_u⁻ᵀF_u` and why the profiled derivative needs no `dû/dγ`.
+- Kristensen, K., Nielsen, A., Berg, C. W., Skaug, H. & Bell, B. M. (2016).
+  TMB: Automatic Differentiation and Laplace Approximation. *Journal of
+  Statistical Software*, 70(5). — the same Laplace-gradient assembly, in the
+  engine this one is measured against.
 - Li, X. & Signorelli, M. (2026). A Comparison of R Packages for Estimating
   Generalized Linear Mixed Models. *arXiv:2606.15933v1*. — the accuracy
   study `validation/campaigns/monte_carlo/` mirrors: the DGP, cell grid, and
@@ -744,11 +826,18 @@ In practice:
 - Liu, Q. & Pierce, D. A. (1994). A note on Gauss–Hermite quadrature.
   *Biometrika*, 81(3), 624–629. — the adaptive-GH centering/reweighting
   `agq_deviance` implements.
+- Magnus, J. R. & Neudecker, H. (2019). *Matrix Differential Calculus with
+  Applications in Statistics and Econometrics* (3rd ed.). Wiley, ch. 8. — the
+  matrix differentials the `log|A|` and `A⁻¹` terms are written from.
 - Powell, M. J. D. (2009). *The BOBYQA algorithm for bound constrained
   optimization without derivatives*. Report DAMTP 2009/NA06, University of
   Cambridge. — the outer optimizer for both stages.
 - Rizopoulos, D. *GLMMadaptive: Generalized Linear Mixed Models using Adaptive
   Gaussian Quadrature*. R package (CRAN). — the quadrature-first comparison
   engine.
+- Skaug, H. J. & Fournier, D. A. (2006). Automatic approximation of the
+  marginal likelihood in non-Gaussian hierarchical models. *Computational
+  Statistics & Data Analysis*, 51(2), 699–709. — the `F`/`G` adjoint identity
+  `D*_γ = F_γ − adj'G_γ` the assembled gradient is written from.
 - Venables, W. N. & Ripley, B. D. (2002). *Modern Applied Statistics with S*
   (4th ed.). Springer. — `MASS::theta.ml`, the NB θ-profile convention.

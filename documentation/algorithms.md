@@ -46,18 +46,11 @@ flowchart TD
   BW -->|"Gaussian, None"| OLS["fit_ols_prebuilt (incl. WLS by weights)"]
   BW -->|"Binomial/Poisson/Gamma/InverseGaussian, None"| GLM["fit_glm_prebuilt (IRLS)"]
   BW -->|"NegativeBinomial, None"| GLMNB["fit_glm_nb (outer theta loop)"]
-  BW -->|"any family, Some(re)"| CD{"classify_design"}
+  BW -->|"any family, Some(re)"| CD{"classify_design: NoZ or Sparse"}
 
-  CD -->|"in envelope"| NZ{"family (NoZ)"}
-  CD -->|"over envelope / slope on extra / crossed levels > 500"| SP{"family (Sparse)"}
-
-  NZ -->|Gaussian| MLE["lmm_run_on"]
-  NZ -->|NegativeBinomial| GNB["fit_glmm_nb"]
-  NZ -->|"Binomial/Poisson/Gamma"| GMM["run_glmm_on"]
-
-  SP -->|Gaussian| MLES["fit_mle_sparse"]
-  SP -->|NegativeBinomial| GNBS["fit_glmm_nb_sparse"]
-  SP -->|"Binomial/Poisson/Gamma"| GMMS["fit_glmm_sparse"]
+  CD -->|Gaussian| MLE["lmm_run_on (Dense or Sparse LmmKernel)"]
+  CD -->|NegativeBinomial| GNB["fit_glmm_nb (blocked, structured or packed layout)"]
+  CD -->|"Binomial/Poisson/Gamma"| GMM["run_glmm_on (blocked, structured or packed layout)"]
 ```
 
 **Rank-deficiency salvage.** Before any solver runs, `detect_aliased` forms the
@@ -89,8 +82,9 @@ have non-obvious reasons:
 - *Slope-carrying extras always go Sparse* for two independent reasons. On the
   Gaussian side it is a measured performance crossover (the sparse kernel won
   4–13× on the 2026-07-02 sweep). On the non-Gaussian side it is the only
-  implementation: the dense GLMM kernel's `build_z` emits intercept-only
-  columns for extra groupings, so a dense slope-on-extra path does not exist.
+  implementation: only the packed-row `A`-layout applies a full `q_g×q_g` Λ
+  block per extra level, so the blocked and structured layouts stay
+  intercept-only on extras.
 - *`MAX_CROSSED_LEVELS` (500) is a performance boundary, not a scratch
   ceiling*: the dense crossed tail is cubic in the total crossed column count
   (a measured 22,714-level crossed factor cost ~10¹³ flops and ~6 GB of
@@ -125,7 +119,7 @@ Penicillin, Pastes, sim_slope_extra on the Gaussian side; cbpp, grouseticks,
 
 - **Node** = a named function the dispatch actually calls; the terminal leaves
   (`fit_ols_prebuilt`, `fit_glm_prebuilt`, `fit_glm_nb`, `lmm_run_on`,
-  `run_glmm_on`, `fit_glmm_nb`, and the three `*_sparse` twins) are the solvers.
+  `run_glmm_on`, `fit_glmm_nb`) are the solvers.
   **Diamond** = a real branch in the code (`match`, `classify_design`, a guard).
   **Edge label** = the condition under which that branch is taken.
 - **Code citations** across all three pages use the form `src/path/file.rs` plus
@@ -170,7 +164,7 @@ and are not user-facing.
 | `SINGULAR_REL_TOL` | `1e-3` — post-hoc relative check: any RE stddev `≤ 1e-3 ×` the largest ⇒ `singular`, on the internal (scaled) stddevs | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/fit/mod.rs`) |
 | RE design column scale | per random-slope column, `√(Σ wᵢxᵢ²/Σ wᵢ)`; intercept subcolumns exactly `1.0`; always on, no trigger | [`algorithms-lmm.md`](algorithms-lmm.md#random-effect-design-column-scaling) (`src/lmm/mod.rs`) |
 | `outer_search` route | `ExactProfile` on the `exact_profile_shape` shapes (nAGQ=1, non-Gamma, no extras or structured extras eligible, canonical or not); else `Joint` when `nAGQ>1 \|\| (n_θ ≤ 2 && p ≤ 4)`; else `PqlThenJoint` | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/workspace.rs`, `src/glmm/mod.rs`) |
-| `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: any `|η_i| > 30` at IRLS iter ≥ 3 → non-converged; skipped under the Gamma inverse link | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
+| `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: any `|η_i| > 30` at IRLS iter ≥ 3 → non-converged; skipped under the Gamma inverse and inverse-Gaussian `1/μ²` links | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `SATURATION_W` / `SATURATION_FRAC` | `1e-5` / `0.5` — post-fit separation guard: > half the (weighted) rows saturated → non-converged | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `MAX_PRIMARY_Q` | `8` — primary width cap (over → Sparse) | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
 | `MAX_EXTRA_Q` | `4` — per-extra-grouping width cap | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
@@ -178,7 +172,7 @@ and are not user-facing.
 | `MAX_THETA` | derived θ-length ceiling: `vech(Λ_p)` + one `vech(Λ_g)` block per extra = `8·9/2 + 6·(4·5/2) = 96` | [dispatch](#full-dispatch-map) (`src/consts.rs`) — sizes every θ-length stack buffer |
 | `MAX_CROSSED_LEVELS` | `500` — total crossed-level cap (over → Sparse; a performance boundary, not scratch) | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
 | `MAX_NAGQ` | `25` — largest odd AGQ order the GH table stores | [`algorithms-glmm.md`](algorithms-glmm.md#adaptive-gausshermite-quadrature-agq) (`src/consts.rs`) |
-| `MAX_DUAL_N` / `MAX_DUAL_H` | `12` / `78` — the top instantiated dual and hyper-dual rung; lanes are instantiated at `N ∈ {4, 5, 6, 8, 12}`. Above `MAX_DUAL_N` the gradient chunks, the Hessian takes the FD stencil | [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (`src/glmm/derivative.rs`) |
+| `MAX_DUAL_N` / `MAX_DUAL_H` | `12` / `78` — the top instantiated dual and hyper-dual rung; lanes are instantiated at `N ∈ {4, 5, 6, 8, 12}`. Above `MAX_DUAL_N` the gradient chunks, and so does the joint Hessian, which the assembled pass reads off first-order lanes; the hyper-dual Hessian cannot chunk and refuses above the cap | [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (`src/glmm/derivative.rs`) |
 
 The NB GLM outer-loop constants (`NB_MAX_OUTER = 25`, `NB_THETA_TOL = 1e-6`,
 `NB_THETA_LO = 1e-3`, `NB_THETA_HI = 1e4`) are covered in the
@@ -234,7 +228,7 @@ scaling; they are deliberately never mapped into `Fit`.
 **Code:** `fit_glm_prebuilt` + `glm_view_to_fit` and (for negative binomial)
 `fit_glm_nb` (`src/fit/glm.rs`);
 the IRLS kernel `glm_irls_fit` with its constants `MAX_IRLS_ITERS = 50`,
-`DEVIANCE_TOL = 1e-8`, `WEIGHT_CLAMP = 1e-6`, `ETA_DIVERGENCE_CAP = 30`,
+`DEVIANCE_TOL = 1e-8`, `WEIGHT_CLAMP = 1e-300`, `ETA_DIVERGENCE_CAP = 30`,
 `SATURATION_W = 1e-5`, `SATURATION_FRAC = 0.5` (`src/glm.rs`); the SIMD
 transcendental fast paths in `src/simd_transcendental.rs`; per-family link,
 variance and deviance in `src/family.rs`. **Convention:** McCullagh & Nelder
@@ -324,10 +318,12 @@ loop, all in `glm_irls_fit`:
   the caller's units: rescaling a predictor column divides its coefficient by
   the same factor and leaves η, the fitted values and the deviance untouched, so
   a bound on `|β_j|` would accept or reject the same model depending on whether
-  a height column is in metres or kilometres. The guard is skipped for
-  `Family::Gamma { link: Inverse }`, where η = 1/μ and a small-mean fit carries a
-  large |η| honestly; that arm exits through `clamp_eta`'s ±700, the non-finite
-  guard, or `MAX_IRLS_ITERS` instead.
+  a height column is in metres or kilometres. The guard is skipped for the two
+  reciprocal links, `Family::Gamma { link: Inverse }` (η = 1/μ) and
+  `Family::InverseGaussian { link: InverseSquared }` (η = 1/μ²), where a
+  small-mean fit carries a large |η| honestly — under 1/μ² already at μ = 0.18;
+  those arms exit through `clamp_eta`'s upper 700, the non-finite guard, or
+  `MAX_IRLS_ITERS` instead.
 - A **degenerate-response short-circuit**: an all-0 or all-1 (weighted)
   Bernoulli response returns early rather than dividing by zero in the working
   response.

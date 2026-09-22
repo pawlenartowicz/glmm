@@ -1,5 +1,8 @@
 //! `glmm` — standalone f64 GLMM fit kernels (OLS → GLM → LMM → GLMM).
 //!
+//! The full dispatch — every route from `fit_cold`/`fit_warm` down to its
+//! solver — is traced in `documentation/algorithms.md`.
+//!
 //! Two public surfaces:
 //! - [`fit_cold`]/[`fit_warm`] + [`ModelSpec`] + [`GroupIds`]: the stable,
 //!   semver-covered friendly API.
@@ -18,12 +21,26 @@
 //! parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool; a
 //! no-op on wasm32; gated at runtime by `FitOptions::parallel_inner` (also off
 //! by default — both the feature and the knob are explicit opt-ins).
+//!
+//! - `counters` (cargo feature, off by default, dev-only): adds
+//!   `glmm::EvalCounters` on `Fit` — stage-1/stage-2 evaluation split, evaluations
+//!   after the last incumbent improvement, a PIRLS-iterations-per-evaluation
+//!   histogram, and AGQ evaluations x nodes.
+//! - `alloc-tests` (cargo feature, off by default, dev-only): installs dhat as
+//!   the test binary's global allocator for the bounded-allocation tests.
+//! - `oracle-tests` (cargo feature, off by default, dev-only): the cross-engine
+//!   tier that checks the crate against the frozen lme4 / MixedModels /
+//!   GLMMadaptive goldens.
 
-// The scratch-explicit kernels (glm/glmm + most of lmm) exist to serve the
-// `loop_advanced` feature; the stable `fit` wires only a subset (OLS + LMM). With
-// the feature OFF they are intentionally unreachable, not stale — so suppress
-// dead_code only in that build. The `loop_advanced` build uses all of it, so
-// genuinely dead code is still caught there (it's the superset).
+// Every fit route (OLS, GLM, LMM, GLMM) is wired into the stable `fit` module
+// regardless of this feature — see `documentation/algorithms.md` for the full
+// dispatch. What goes dead with the feature OFF is mainly the narrower
+// `loop_advanced` surface: the `FitView` hot-loop accessors and the
+// gradient/Hessian kernels in `src/lmm/kernel.rs` and `src/glmm/derivative.rs`,
+// plus a few other loop-only helpers scattered through `src/lmm/mod.rs`,
+// `src/glmm/assembled.rs`, and `src/ols.rs`. So suppress dead_code only in
+// that build. The `loop_advanced` build uses all of it, so genuinely dead
+// code is still caught there (it's the superset).
 #![cfg_attr(not(feature = "loop_advanced"), allow(dead_code))]
 // Every public statistical item must state its convention and cite its oracle.
 #![warn(missing_docs)]

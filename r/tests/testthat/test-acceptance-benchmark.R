@@ -72,6 +72,29 @@ test_that("poisson random slope (tau0, tau1, rho01) matches glmer", {
   expect_matches_glmer(fit, ref)
 })
 
+test_that("gamma GLMM matches glmer", {
+  # Same grouping/time grid as benchmark_data(), built inline (that helper
+  # only generates binomial/poisson), with a gamma response on the log link
+  # (rgamma() pattern from the Gamma() link trap test in test-methods.R).
+  set.seed(208)
+  n_g <- 60L
+  m <- 10L
+  g <- factor(rep(seq_len(n_g), each = m))
+  t <- rep(seq(0, length.out = m, by = 1 / m), n_g)
+  dtrt <- rbinom(n_g * m, 1L, 0.4)
+  u0 <- rnorm(n_g, sd = 0.3)
+  beta <- c(0.5, 0.3, 0.2, 0.1)
+  eta <- beta[1] + beta[2] * t + beta[3] * dtrt + beta[4] * t * dtrt +
+    u0[as.integer(g)]
+  shape <- 4
+  y <- rgamma(n_g * m, shape = shape, rate = shape / exp(eta))
+  d <- data.frame(y = y, t = t, d = dtrt, g = g)
+  f <- y ~ t + d + t:d + (1 | g)
+  fit <- fastglmm(f, d, family = Gamma(link = "log"))
+  ref <- glmer_quietly(f, d, family = Gamma(link = "log"))
+  expect_matches_glmer(fit, ref)
+})
+
 test_that("logLik and AIC match lme4, and the LMM value is lmer's REML criterion", {
   d <- benchmark_data(seed = 206, family = "binomial", tau0 = 0.8)
   f <- y ~ t + d + (1 | g)

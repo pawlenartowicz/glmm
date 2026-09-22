@@ -107,6 +107,47 @@ pub(crate) fn assert_pinned(got: &[f64], want: &[f64], band: f64, what: &str) {
     );
 }
 
+/// Uniform(0,1) via a 64-bit LCG (splitmix-style constants). Reproduces the
+/// `+INF`-plateau cell bit for bit. `pub(crate)` so `src/sparse/tests.rs`
+/// shares this generator with `src/fit/glmm_tests.rs` instead of each keeping
+/// its own copy.
+pub(crate) fn inf_plateau_lcg_next(state: &mut u64) -> f64 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (((*state >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
+}
+
+pub(crate) fn inf_plateau_normal(state: &mut u64) -> f64 {
+    let (u1, u2) = (inf_plateau_lcg_next(state), inf_plateau_lcg_next(state));
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+}
+
+pub(crate) fn inf_plateau_exp1(state: &mut u64) -> f64 {
+    -inf_plateau_lcg_next(state).ln()
+}
+
+/// Poisson(lambda) by the naive product-of-uniforms method — matches the
+/// reproduction exactly, including its large-lambda normal-approximation
+/// branch (never hit at this fixture's means).
+pub(crate) fn inf_plateau_poisson(state: &mut u64, lambda: f64) -> f64 {
+    if lambda > 200.0 {
+        return (lambda + lambda.sqrt() * inf_plateau_normal(state))
+            .max(0.0)
+            .round();
+    }
+    let l = (-lambda).exp();
+    let (mut k, mut prod) = (0.0f64, inf_plateau_lcg_next(state));
+    while prod > l {
+        k += 1.0;
+        prod *= inf_plateau_lcg_next(state);
+        if k > 1e6 {
+            break;
+        }
+    }
+    k
+}
+
 /// Parse a `cluster,x,grp,y` sim CSV → (X=[1,x,grp_b], y, dense cluster ids, n_clusters).
 /// `pub(crate)` so `src/sparse/tests.rs` can load the same fixtures.
 pub(crate) fn sim_clustered(csv: &str) -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
@@ -145,6 +186,162 @@ fn weights_shape_still_asserted() {
         ..FitOptions::default()
     };
     let _ = fit_cold(&x, &y, n, 1, &model, &GroupIds::default(), &opts);
+}
+
+/// Valid 4-row, 1-column fixed-only Gaussian OLS input, shared by the five
+/// entry-shape panic tests below — each breaks exactly one field of it.
+fn shape_check_fixture() -> (Vec<f64>, Vec<f64>, ModelSpec) {
+    let n = 4;
+    let x = vec![1.0f64; n];
+    let y = vec![1.0, 2.0, 3.0, 4.0];
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    (x, y, model)
+}
+
+/// `y` shorter than `n` faults at the entry, the same shape check as the
+/// weights length above.
+#[test]
+#[should_panic(expected = "y must have n elements")]
+fn fit_warm_panics_on_wrong_y_length() {
+    let (x, _y, model) = shape_check_fixture();
+    let y = vec![1.0, 2.0, 3.0];
+    let _ = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// `x` short of `n*p` elements faults at the entry, the same shape check as
+/// the weights length above.
+#[test]
+#[should_panic(expected = "x must have n*p elements")]
+fn fit_warm_panics_on_wrong_x_length() {
+    let (x, y, model) = shape_check_fixture();
+    let x = x[..x.len() - 1].to_vec();
+    let _ = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// A zero weight is not finite-and-positive, so it faults the same way as a
+/// wrong-length weights vector.
+#[test]
+#[should_panic(expected = "must be finite and > 0")]
+fn nonpositive_weight_is_rejected() {
+    let (x, y, model) = shape_check_fixture();
+    let opts = FitOptions {
+        weights: Some(vec![1.0, 0.0, 1.0, 1.0]),
+        ..FitOptions::default()
+    };
+    let _ = fit_cold(&x, &y, 4, 1, &model, &GroupIds::default(), &opts);
+}
+
+/// The offset finiteness check is family-independent, so a NaN offset faults
+/// a negative-binomial GLM the same way it faults the Gaussian case above —
+/// there is no NB-specific rejection anywhere else on this route.
+#[test]
+#[should_panic(expected = "FitOptions.offset must be finite")]
+fn nonfinite_offset_on_a_negative_binomial_glm_is_rejected() {
+    let (x, y, mut model) = shape_check_fixture();
+    model.family = Family::NegativeBinomial {
+        link: NegBinomialLink::Log,
+    };
+    let opts = FitOptions {
+        offset: Some(vec![0.0, f64::NAN, 0.0, 0.0]),
+        ..FitOptions::default()
+    };
+    let _ = fit_cold(&x, &y, 4, 1, &model, &GroupIds::default(), &opts);
+}
+
+/// A NaN in `x` faults at the entry, the same finiteness check as weights and
+/// offset above.
+#[test]
+#[should_panic(expected = "x must be finite")]
+fn nonfinite_x_nan_is_rejected() {
+    let (mut x, y, model) = shape_check_fixture();
+    x[2] = f64::NAN;
+    let _ = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// An infinite value in `x` faults the same way as a NaN in `x` above.
+#[test]
+#[should_panic(expected = "x must be finite")]
+fn nonfinite_x_inf_is_rejected() {
+    let (mut x, y, model) = shape_check_fixture();
+    x[2] = f64::INFINITY;
+    let _ = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// A NaN in `y` faults at the entry, the same finiteness check as weights and
+/// offset above.
+#[test]
+#[should_panic(expected = "y must be finite")]
+fn nonfinite_y_nan_is_rejected() {
+    let (x, mut y, model) = shape_check_fixture();
+    y[1] = f64::NAN;
+    let _ = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// A `StartValues.beta` neither empty nor exactly `p`-wide faults through
+/// `fit_warm` — `fit_cold` never takes a start, so this is the one entry
+/// this file's fixtures call `fit_warm` directly.
+#[test]
+#[should_panic(expected = "StartValues.beta must have p elements")]
+fn wrong_width_start_beta_is_rejected() {
+    let (x, y, model) = shape_check_fixture();
+    let p = 1;
+    let start = StartValues {
+        beta: vec![0.0; p + 1],
+        theta: vec![],
+    };
+    let _ = fit_warm(
+        &x,
+        &y,
+        4,
+        p,
+        &model,
+        &GroupIds::default(),
+        Some(&start),
+        &FitOptions::default(),
+    );
 }
 
 #[test]
@@ -388,9 +585,10 @@ fn fit_sim_collinear_drops_the_aliased_column() {
     assert_pinned(&f.se[..3], &REF_SE, PIN_REL_OLS, "se");
 }
 
-/// Deterministic pseudo-data (NR LCG), uniform in (−1, 1). Mirrors the
-/// LCG in `src/lmm/tests.rs` so the smoke dataset behaves the same way.
-pub(super) fn lcg(state: &mut u64) -> f64 {
+/// Deterministic pseudo-data (NR LCG), uniform in (−1, 1). The shared LCG
+/// fixture generator for the crate's unit tests, so fixtures seeded alike
+/// draw the same stream.
+pub(crate) fn lcg(state: &mut u64) -> f64 {
     *state = state
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
@@ -417,6 +615,36 @@ pub(super) fn lmm_hand_dataset() -> (Vec<f64>, Vec<f64>, usize, usize) {
         y[i] = 0.5 + 0.4 * x1 - 0.2 * x2 + u_c[c] + 0.8 * lcg(&mut st);
     }
     (x, y, n, p)
+}
+
+/// n=60, p=3 weighted-collinear OLS design: predictor columns 1 and 2
+/// (`a` and `a + delta`) are identical on the first `split` rows and differ by
+/// exactly 1 on the rest, and those differing rows carry weight `WSMALL`. Full
+/// rank on the raw `X` (the alias gate passes it through untouched) and
+/// near-singular on the weighted Gram `X'WX`, which is the case nothing
+/// upstream of the solve can see. `WSMALL = 1e-11` puts the weighted pivot at
+/// ~2e-13 — inside the flagging band and still positive-definite enough for
+/// faer's Cholesky to accept it; a smaller weight makes `X'WX` numerically
+/// indefinite and the route refuses on `llt` instead, which is a different
+/// path. Shared by the ill-conditioned-flag pin (`FitDiagnostics`), the
+/// `Note::IllConditioned` pin through the stable entry, and the honest-SE
+/// report — each reads a different downstream field off the same design, so
+/// the three must stay byte-identical or one could pass while silently no
+/// longer testing what it claims to.
+pub(crate) fn weighted_collinear_ols_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>, usize, usize) {
+    let (n, p, split) = (60usize, 3usize, 40usize);
+    const WSMALL: f64 = 1e-11;
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    let mut w = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = ((i * 13) % 17) as f64 - 8.0;
+        let delta = if i < split { 0.0 } else { 1.0 };
+        x.extend_from_slice(&[1.0, a, a + delta]);
+        y.push(0.5 + 1.3 * a + 0.477 * (a + delta) + ((i % 3) as f64 - 1.0));
+        w.push(if i < split { 1.0 } else { WSMALL });
+    }
+    (x, y, w, n, p)
 }
 
 #[test]
@@ -675,8 +903,8 @@ fn fit_extra_grouping_q_too_large_routes_sparse() {
     };
     assert!(matches!(classify_design(&model, 1), Solver::Sparse));
     // n=0: bypasses rank-deficiency detection (guarded by `if n > 0 && p > 0`)
-    // so routing reaches classify_design → Sparse → fit_mle_sparse, which now
-    // runs (no PD data at n=0 ⇒ non-converged) rather than panicking.
+    // so routing reaches classify_design → Sparse → the LMM's sparse kernel,
+    // which runs (no PD data at n=0 ⇒ non-converged) rather than panicking.
     let n = 0;
     let p = 5; // slopes [1,2,3,4] in-bounds; q_g=5 over the NoZ envelope
     let fit = fit_cold(
@@ -845,6 +1073,145 @@ fn fit_over_envelope_non_gaussian_never_panics() {
             },
         );
         assert_eq!(fit.beta.len(), p, "{family:?} over-width returns a Fit");
+    }
+}
+
+/// Degenerate shapes on the mixed non-Gaussian route: `p == 0` (no fixed
+/// columns at all), `n == 0` and `n <= p` must return a non-converged `Fit`,
+/// never panic — for the in-envelope (dense) layout, the over-envelope (7
+/// crossed extras, routes `Sparse`/`Packed`) layout, and the `n == 0` shape,
+/// across the wired non-Gaussian families. The all-zero-column case is the
+/// width-0 re-entry: the column is aliased, so `fit_rank_deficient` re-enters
+/// the fit with no column kept. The last case is `n == p`.
+#[test]
+fn fit_glmm_degenerate_width_never_panics() {
+    let families = [
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+    ];
+    for family in families {
+        // p == 0, in-envelope (no extra groupings).
+        let model = ModelSpec {
+            family,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters { n_clusters: 2 },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let (n, p) = (4, 0);
+        let ids = GroupIds {
+            primary: vec![0, 1, 0, 1],
+            extra: vec![],
+        };
+        let fit = fit_cold(
+            &[],
+            &vec![1.0f64; n],
+            n,
+            p,
+            &model,
+            &ids,
+            &FitOptions::default(),
+        );
+        assert!(
+            !fit.converged(),
+            "{family:?} p=0 in-envelope: degenerate fit does not report converged"
+        );
+
+        // p == 0, over-envelope (7 crossed extras > MAX_EXTRA_GROUPINGS).
+        let extra_groupings: Vec<Grouping> = (0..7)
+            .map(|_| Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 2 },
+                slopes: vec![],
+            })
+            .collect();
+        let model_over = ModelSpec {
+            family,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters { n_clusters: 2 },
+                slopes: vec![],
+                extra_groupings,
+            }),
+        };
+        assert!(matches!(classify_design(&model_over, 1), Solver::Sparse));
+        let (n, p) = (8, 0);
+        let ids = GroupIds {
+            primary: vec![0; n],
+            extra: vec![vec![0; n]; 7],
+        };
+        let fit = fit_cold(
+            &[],
+            &vec![1.0f64; n],
+            n,
+            p,
+            &model_over,
+            &ids,
+            &FitOptions::default(),
+        );
+        assert!(
+            !fit.converged(),
+            "{family:?} p=0 over-envelope: degenerate fit does not report converged"
+        );
+
+        // n == 0, p == 1.
+        let ids_n0 = GroupIds {
+            primary: vec![],
+            extra: vec![],
+        };
+        let fit = fit_cold(&[], &[], 0, 1, &model, &ids_n0, &FitOptions::default());
+        assert!(
+            !fit.converged(),
+            "{family:?} n=0: degenerate fit does not report converged"
+        );
+
+        // p == 1 with the one fixed column all zero.
+        let n = 4;
+        let ids = GroupIds {
+            primary: vec![0, 1, 0, 1],
+            extra: vec![],
+        };
+        let fit = fit_cold(
+            &vec![0.0f64; n],
+            &vec![1.0f64; n],
+            n,
+            1,
+            &model,
+            &ids,
+            &FitOptions::default(),
+        );
+        assert!(
+            !fit.converged(),
+            "{family:?} all-zero column: degenerate fit does not report converged"
+        );
+
+        // n == p: four independent columns (lower-triangular ones) on four rows.
+        let (n, p) = (4, 4);
+        let x: Vec<f64> = (0..n * p)
+            .map(|t| if t % p <= t / p { 1.0 } else { 0.0 })
+            .collect();
+        let fit = fit_cold(
+            &x,
+            &vec![1.0f64; n],
+            n,
+            p,
+            &model,
+            &ids,
+            &FitOptions::default(),
+        );
+        assert!(
+            !fit.converged() && fit.beta.iter().all(|b| b.is_nan()),
+            "{family:?} n == p: degenerate fit is NaN and does not report converged"
+        );
     }
 }
 
@@ -1156,6 +1523,67 @@ fn classify_fixed_only_is_noz() {
         super::classify_design_pub(&ols, 1),
         super::Solver::NoZ
     ));
+}
+
+/// A primary random slope column past `p` faults at the entry, before any
+/// workspace is built — the RE-envelope caps above route a design to
+/// `Solver::Sparse`, but the column has to name a real design column on
+/// every route regardless of which solver it reaches.
+#[test]
+#[should_panic(expected = "primary slope column")]
+fn out_of_range_primary_slope_column_is_rejected() {
+    let n = 4;
+    let p = 2;
+    let x = vec![0.0f64; n * p];
+    let y = vec![0.0f64; n];
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 2 },
+            slopes: vec![7],
+            extra_groupings: vec![],
+        }),
+    };
+    let _ = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// An extra-grouping random slope column past `p` faults the same way as the
+/// primary one above.
+#[test]
+#[should_panic(expected = "extra-grouping slope column")]
+fn out_of_range_extra_slope_column_is_rejected() {
+    let n = 4;
+    let p = 2;
+    let x = vec![0.0f64; n * p];
+    let y = vec![0.0f64; n];
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 2 },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 2 },
+                slopes: vec![7],
+            }],
+        }),
+    };
+    let _ = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
 }
 
 /// Tier-0 short-circuit: a fixed-only
@@ -1495,389 +1923,6 @@ fn diagnostics_moved_fields_agree_through_both_paths() {
     assert!(dup.converged(), "the reduced model fits");
 }
 
-/// The LMM reports the same two derivative diagnostics as the GLMM: the KKT
-/// residual on the θ box at the accepted point, and the variance score at each
-/// pinned component. Its SEs are unchanged — the LMM has no Hessian SE path and
-/// the diagnostics do not add one. Same two fixtures as
-/// `diagnostics_boundary_reports_both_ends`, which is what makes the boundary
-/// half of this test a real boundary: that grouping's ±0.8 cancels exactly per
-/// cluster, so the between-cluster variance MLE is 0.
-#[test]
-fn lmm_reports_kkt_and_boundary_score() {
-    let (xs, ys, ns, ps) = lmm_hand_dataset();
-    let ids_s: Vec<u32> = (0..ns).map(|i| (i % 6) as u32).collect();
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 6 },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let opts = FitOptions {
-        target_indices: (0..ps as u32).collect(),
-        ..FitOptions::default()
-    };
-    let interior = fit_cold(
-        &xs,
-        &ys,
-        ns,
-        ps,
-        &model,
-        &GroupIds {
-            primary: ids_s,
-            extra: vec![],
-        },
-        &opts,
-    );
-    assert_eq!(interior.diagnostics.boundary, Boundary::Interior);
-    assert!(interior.diagnostics.kkt_grad_norm.is_finite());
-    // KKT_INTERIOR_MAX is calibrated on GLMM Laplace deviances and does not
-    // transfer to the REML criterion — assert only finiteness here. An
-    // LMM-calibrated constant needs its own calibration run and does not exist
-    // yet.
-    assert!(interior.diagnostics.boundary_score.is_empty());
-    assert!(
-        interior.stddev_se.is_empty(),
-        "the LMM route reports no stddev_se"
-    );
-
-    // The pinning Gaussian dataset, inline exactly as
-    // `diagnostics_boundary_reports_both_ends` builds it: n = 48, 6 clusters,
-    // the ±0.8 per-cluster cancellation that pins the between-cluster variance
-    // MLE at 0.
-    let n2 = 48usize;
-    let n_clusters2 = 6usize;
-    let mut st = 7u64;
-    let mut xs2 = vec![0.0f64; n2 * 2];
-    let mut ys2 = vec![0.0f64; n2];
-    let mut ids2 = vec![0u32; n2];
-    for i in 0..n2 {
-        ids2[i] = (i % n_clusters2) as u32;
-        let x1 = lcg(&mut st);
-        xs2[i * 2] = 1.0;
-        xs2[i * 2 + 1] = x1;
-        let e = if (i / n_clusters2) % 2 == 0 {
-            0.8
-        } else {
-            -0.8
-        };
-        ys2[i] = 0.5 + 0.4 * x1 + e;
-    }
-    let model2 = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_clusters2 as u32,
-            },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids2 = GroupIds {
-        primary: ids2,
-        extra: vec![],
-    };
-    // The score is opt-in (`FitOptions::boundary_score`): the default fit pins
-    // and reports the KKT residual, but runs no hyper-dual Hessian.
-    let unrequested = fit_cold(
-        &xs2,
-        &ys2,
-        n2,
-        2,
-        &model2,
-        &ids2,
-        &FitOptions {
-            target_indices: vec![0, 1],
-            ..FitOptions::default()
-        },
-    );
-    assert_eq!(unrequested.diagnostics.boundary, Boundary::AtBoundary);
-    assert!(unrequested.diagnostics.kkt_grad_norm.is_finite());
-    assert!(unrequested.diagnostics.boundary_score.is_empty());
-    let pinned = fit_cold(
-        &xs2,
-        &ys2,
-        n2,
-        2,
-        &model2,
-        &ids2,
-        &FitOptions {
-            target_indices: vec![0, 1],
-            boundary_score: true,
-            ..FitOptions::default()
-        },
-    );
-    assert_eq!(pinned.diagnostics.boundary, Boundary::AtBoundary);
-    assert!(pinned.diagnostics.kkt_grad_norm.is_finite());
-    let mut seen = 0usize;
-    for (g, flags) in pinned.diagnostics.pinned.iter().enumerate() {
-        for (i, &p) in flags.iter().enumerate() {
-            if p {
-                seen += 1;
-                let s = pinned.diagnostics.boundary_score[g][i];
-                assert!(s.is_finite() && s > 0.0, "score[{g}][{i}] = {s}");
-            }
-        }
-    }
-    assert_eq!(seen, 1);
-    assert!(pinned.stddev_se.is_empty());
-}
-
-/// A `q=2` primary (intercept + slope) shape where the intercept variance
-/// pins at 0 and BOBYQA stops with the slope's off-diagonal entry below it
-/// (`vech(Λ)` index 1, i.e. λ₁₀) non-zero. Data construction mirrors
-/// `diagnostics_boundary_reports_both_ends`'s ±0.8 cancellation for the
-/// intercept (forcing its between-cluster variance MLE to exactly 0), plus a
-/// per-cluster slope offset so the slope variance is genuinely positive (not
-/// pinned). Once λ₀₀ = 0 the deviance depends on (λ₁₀, λ₁₁) only through
-/// λ₁₀² + λ₁₁², a flat (rotation-invariant) direction, and the cold search
-/// stops on it with λ₁₀ carrying the slope variance.
-///
-/// Cold start on purpose. A warm start near the pin (`θ = [0.05, 3.0, 0.3]`
-/// or `[0.05, 1.0, 0.3]`) walks through λ₀₀ = 0 under the signed search box
-/// (`blind_theta_and_bounds`) and settles at an interior point 1.9e-5 below
-/// the pinned deviance — λ₀₀ ≈ 4.2e-4 with the correlation at −1, measured
-/// 2026-09-10 — which pins nothing. The cold start stops on the pin in 48
-/// evaluations.
-///
-/// `canonicalize_pinned_blocks` rotates that flat direction back onto the
-/// trailing diagonal after the pin loop, so this fixture pins what it
-/// should: a finite score at the pinned intercept, `pinned == [[true, false]]`
-/// against `sd = [0, 0.817]`, and deviance and `varcorr` equal to what a
-/// build without the rewrite reports on this fixture, because the rewrite
-/// preserves Σ.
-#[test]
-fn lmm_boundary_score_reported_after_canonicalization() {
-    let n_clusters = 6usize;
-    let reps_per_half = 8usize;
-    let n = n_clusters * reps_per_half * 2;
-    let mut st = 11u64;
-    let mut x = vec![0.0f64; n * 2];
-    let mut y = vec![0.0f64; n];
-    let mut ids = vec![0u32; n];
-    let mut idx = 0usize;
-    for half in 0..2 {
-        for _ in 0..reps_per_half {
-            for c in 0..n_clusters {
-                let x1 = lcg(&mut st);
-                let slope_c = 0.5 * (c as f64 - 2.5); // distinct per cluster
-                let intercept_e = if half == 0 { 0.8 } else { -0.8 }; // cancels per cluster
-                x[idx * 2] = 1.0;
-                x[idx * 2 + 1] = x1;
-                ids[idx] = c as u32;
-                y[idx] = 0.5 + (0.4 + slope_c) * x1 + intercept_e + 0.002 * lcg(&mut st);
-                idx += 1;
-            }
-        }
-    }
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_clusters as u32,
-            },
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds {
-        primary: ids,
-        extra: vec![],
-    };
-    let fit = fit_warm(
-        &x,
-        &y,
-        n,
-        2,
-        &model,
-        &ids,
-        None,
-        &FitOptions {
-            target_indices: vec![0, 1],
-            boundary_score: true,
-            ..FitOptions::default()
-        },
-    );
-    assert!(fit.converged(), "status = {:?}", fit.diagnostics.boundary);
-    assert_eq!(fit.diagnostics.boundary, Boundary::AtBoundary);
-    // The intercept variance pins; the slope variance does not, despite a
-    // stddev of 0.817 that a looser check would flag as a second pinned
-    // component.
-    assert_eq!(
-        fit.diagnostics.pinned,
-        vec![vec![true, false]],
-        "pinned = {:?}, stddev = {:?}",
-        fit.diagnostics.pinned,
-        fit.stddev_corr(0).0
-    );
-    let s = fit.diagnostics.boundary_score[0][0];
-    assert!(
-        s.is_finite(),
-        "boundary_score for the pinned intercept must be reported on a \
-         canonical Λ (its column below the diagonal is zero), got {s}"
-    );
-    assert!(fit.diagnostics.boundary_score[0][1].is_nan());
-    // Σ is preserved by the canonicalization, so these are the same numbers a
-    // build without it reports on this fixture (cold start, 2026-09-10).
-    let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1.0);
-    assert!(
-        rel(fit.deviance, -2.017076489402e1) < 1e-9,
-        "deviance = {}",
-        fit.deviance
-    );
-    for (&got, &want) in fit.varcorr[0]
-        .iter()
-        .zip([0.0, 0.0, 0.6679595387461011].iter())
-    {
-        assert!(rel(got, want) < 1e-9, "varcorr = {:?}", fit.varcorr[0]);
-    }
-}
-
-/// `unpermute_fit` must map [`Diagnostics::boundary_score`] back to declaration
-/// order exactly like [`Diagnostics::pinned`] — both are varcorr-aligned,
-/// per-grouping outputs (see `pinned_scores`'s doc comment: "Mirrors
-/// `pinned_flags` — change together"). Two intercept-only `Crossed` groupings,
-/// `g1` (8 levels) and `g2` (40 levels), trip `size_rule_perm`'s size rule when
-/// `g1` is declared primary: `g2` has more levels, so the kernel runs with `g2`
-/// in slot 0 and the reorder is undone on the way out. `g1`'s between-cluster
-/// variance is pinned to exactly 0 by the same ±0.8-per-replication
-/// cancellation `diagnostics_boundary_reports_both_ends` uses; `g2` carries a
-/// genuine per-level random effect, so its variance is estimated, not pinned.
-///
-/// Declaring `g1` first (`(1 | g1) + (1 | g2)`) exercises the swap; declaring
-/// `g2` first (`(1 | g2) + (1 | g1)`) does not (`g2`, with more levels, is
-/// already primary — `size_rule_perm` leaves it alone). Both must report
-/// `pinned` and `boundary_score` on the SAME slot: `pinned[g][0]` true and
-/// `boundary_score[g][0]` finite together, for whichever `g` is `g1`.
-#[test]
-fn unpermute_fit_aligns_boundary_score_with_pinned_across_size_rule_swap() {
-    let n_g1 = 8usize;
-    let n_g2 = 40usize;
-    let n = n_g1 * n_g2 * 2; // 2 replications per (g1, g2) cell
-    let mut st = 13u64;
-    // Fixed per-g2-level random effect: real, nonzero between-level variance.
-    let u2: Vec<f64> = (0..n_g2).map(|_| 0.6 * lcg(&mut st)).collect();
-    let mut x = vec![0.0f64; n * 2];
-    let mut y = vec![0.0f64; n];
-    let mut g1_ids = vec![0u32; n];
-    let mut g2_ids = vec![0u32; n];
-    let mut idx = 0usize;
-    for rep in 0..2 {
-        // ±0.8 cancels exactly within EVERY g1 cluster (it is the same for
-        // every g2 level at a given rep), so g1's between-cluster variance
-        // MLE is 0. It also cancels within every g2 cluster (both reps hit
-        // every g1 level), so it does not contaminate g2's real effect.
-        let offset = if rep == 0 { 0.8 } else { -0.8 };
-        for (e, &u2e) in u2.iter().enumerate() {
-            for c in 0..n_g1 {
-                let x1 = lcg(&mut st);
-                x[idx * 2] = 1.0;
-                x[idx * 2 + 1] = x1;
-                g1_ids[idx] = c as u32;
-                g2_ids[idx] = e as u32;
-                y[idx] = 0.5 + 0.4 * x1 + offset + u2e + 0.02 * lcg(&mut st);
-                idx += 1;
-            }
-        }
-    }
-    let opts = FitOptions {
-        target_indices: vec![0, 1],
-        boundary_score: true,
-        ..FitOptions::default()
-    };
-    let g1_grouping = || Grouping {
-        relation: GroupingRelation::Crossed {
-            n_clusters: n_g1 as u32,
-        },
-        slopes: vec![],
-    };
-    let g2_grouping = || Grouping {
-        relation: GroupingRelation::Crossed {
-            n_clusters: n_g2 as u32,
-        },
-        slopes: vec![],
-    };
-
-    // Declared as `(1 | g1) + (1 | g2)`: g1 is primary but g2 (more levels)
-    // becomes the kernel's slot-0 primary under the size rule.
-    let model_g1_primary = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_g1 as u32,
-            },
-            slopes: vec![],
-            extra_groupings: vec![g2_grouping()],
-        }),
-    };
-    let ids_g1_primary = GroupIds {
-        primary: g1_ids.clone(),
-        extra: vec![g2_ids.clone()],
-    };
-    let fit_g1_primary = fit_cold(&x, &y, n, 2, &model_g1_primary, &ids_g1_primary, &opts);
-    assert!(
-        fit_g1_primary.converged(),
-        "status = {:?}",
-        fit_g1_primary.diagnostics.boundary
-    );
-    assert_eq!(
-        fit_g1_primary.diagnostics.pinned,
-        vec![vec![true], vec![false]],
-        "pinned = {:?}",
-        fit_g1_primary.diagnostics.pinned
-    );
-    assert!(
-        fit_g1_primary.diagnostics.boundary_score[0][0].is_finite(),
-        "g1 (declared primary, pinned) must carry a finite score, got {:?}",
-        fit_g1_primary.diagnostics.boundary_score
-    );
-    assert!(
-        fit_g1_primary.diagnostics.boundary_score[1][0].is_nan(),
-        "g2 (declared extra, not pinned) must carry NaN, got {:?}",
-        fit_g1_primary.diagnostics.boundary_score
-    );
-
-    // Declared as `(1 | g2) + (1 | g1)`: g2 is already primary (more levels),
-    // so the size rule leaves the order alone — the control case.
-    let model_g2_primary = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_g2 as u32,
-            },
-            slopes: vec![],
-            extra_groupings: vec![g1_grouping()],
-        }),
-    };
-    let ids_g2_primary = GroupIds {
-        primary: g2_ids,
-        extra: vec![g1_ids],
-    };
-    let fit_g2_primary = fit_cold(&x, &y, n, 2, &model_g2_primary, &ids_g2_primary, &opts);
-    assert!(
-        fit_g2_primary.converged(),
-        "status = {:?}",
-        fit_g2_primary.diagnostics.boundary
-    );
-    assert_eq!(
-        fit_g2_primary.diagnostics.pinned,
-        vec![vec![false], vec![true]],
-        "pinned = {:?}",
-        fit_g2_primary.diagnostics.pinned
-    );
-    assert!(
-        fit_g2_primary.diagnostics.boundary_score[0][0].is_nan(),
-        "g2 (declared primary, not pinned) must carry NaN, got {:?}",
-        fit_g2_primary.diagnostics.boundary_score
-    );
-    assert!(
-        fit_g2_primary.diagnostics.boundary_score[1][0].is_finite(),
-        "g1 (declared extra, pinned) must carry a finite score, got {:?}",
-        fit_g2_primary.diagnostics.boundary_score
-    );
-}
-
 /// `Boundary` at both ends of the range the dense LMM route can report:
 /// the deterministic τ̂=0 pin fixture (`fit_lmm_weighted_boundary_matches_wls`'s
 /// design, same construction) lands `AtBoundary`, lmm_hand_dataset() with `i % 6` grouping lands `Interior`.
@@ -2047,18 +2092,7 @@ fn diagnostics_pinned_aligns_with_varcorr_blocks() {
 /// can see. Negative: the same design at unit weights raises nothing.
 #[test]
 fn diagnostics_ill_conditioned_note_through_fit_cold() {
-    let (n, p, split) = (60usize, 3usize, 40usize);
-    const WSMALL: f64 = 1e-11;
-    let mut x = Vec::with_capacity(n * p);
-    let mut y = Vec::with_capacity(n);
-    let mut w = Vec::with_capacity(n);
-    for i in 0..n {
-        let a = ((i * 13) % 17) as f64 - 8.0;
-        let delta = if i < split { 0.0 } else { 1.0 };
-        x.extend_from_slice(&[1.0, a, a + delta]);
-        y.push(0.5 + 1.3 * a + 0.477 * (a + delta) + ((i % 3) as f64 - 1.0));
-        w.push(if i < split { 1.0 } else { WSMALL });
-    }
+    let (x, y, w, n, p) = weighted_collinear_ols_fixture();
     let model = ModelSpec {
         family: Family::Gaussian,
         re: None,
@@ -2110,6 +2144,39 @@ fn diagnostics_ill_conditioned_note_through_fit_cold() {
         "unweighted, the same design is well-conditioned"
     );
     assert!(clean.diagnostics.pinned.is_empty(), "no RE, nothing to pin");
+}
+
+/// The two GLMM-only carrier flags each become their own `Note`, through
+/// `materialize_diagnostics` directly rather than a real GLMM fit: this pins the
+/// mapping itself, one flag at a time, without depending on a fixture that
+/// happens to trip both. The payloads a real solve produces are asserted
+/// separately — `pirls_exhausted_note_counts_fit_path_evals_only` and
+/// `gamma_inverse_non_pd_hessian_falls_back_to_rx_se` in `glmm_tests`.
+#[test]
+fn carrier_flags_become_pirls_and_hessian_notes() {
+    let d = super::common::FitDiagnostics {
+        pirls_exhausted: 3,
+        final_pirls_exhausted: true,
+        hessian_fallback: true,
+        ..super::common::FitDiagnostics::fixed_only(true)
+    };
+    let diag = super::common::materialize_diagnostics(&d, 0, &[]);
+    assert_eq!(
+        diag.notes.len(),
+        2,
+        "expected one PirlsExhausted and one HessianSeFallback, got {:?}",
+        diag.notes
+    );
+    let Note::PirlsExhausted { evals, final_eval } = &diag.notes[0] else {
+        panic!("expected PirlsExhausted, got {:?}", diag.notes[0]);
+    };
+    assert_eq!(*evals, 3);
+    assert!(*final_eval);
+    assert!(
+        matches!(diag.notes[1], Note::HessianSeFallback),
+        "expected HessianSeFallback, got {:?}",
+        diag.notes[1]
+    );
 }
 
 /// A grouping `g` with a random slope on `x`, `x` built at the requested RMS

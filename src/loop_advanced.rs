@@ -27,18 +27,11 @@ pub use crate::ols::{
 
 #[cfg(test)]
 mod tests {
+    use crate::fit::common_tests::lcg;
     use crate::lmm::{fit_lmm, LmmWorkspace};
     use crate::start::StartValues;
-    use crate::{Family, ModelSpec, ReStructure, Sizing};
+    use crate::Sizing;
     use faer::Mat;
-
-    /// Deterministic pseudo-data (NR LCG), uniform in (−1, 1) — mirrors lmm's tests.
-    fn lcg(state: &mut u64) -> f64 {
-        *state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (((*state >> 11) as f64) / ((1u64 << 53) as f64)) * 2.0 - 1.0
-    }
 
     /// n=48, p=3, 6 clusters; intercept-only Gaussian LMM (mirror of lmm's
     /// `hand_dataset`): `y = 0.5 + 0.4·x1 − 0.2·x2 + u_c + 0.8·e`.
@@ -63,17 +56,6 @@ mod tests {
         (x, y, ids)
     }
 
-    fn intercept_lmm_spec() -> ModelSpec {
-        ModelSpec {
-            family: Family::Gaussian,
-            re: Some(ReStructure {
-                sizing: Sizing::FixedClusters { n_clusters: 6 },
-                slopes: vec![],
-                extra_groupings: vec![],
-            }),
-        }
-    }
-
     /// `StartValues.theta` threads into the loop kernel `fit_lmm`, and the LMM MLE is
     /// start-independent: a cold fit (`None` → the kernel's THETA0 blind start) and a
     /// warm fit from a perturbed `StartValues.theta` reach the same β̂ up to optimizer
@@ -83,11 +65,14 @@ mod tests {
     fn start_values_theta_threads_into_loop_kernel() {
         let (x, y, pid) = hand_dataset();
         let (n, p) = (x.nrows(), 3);
-        let model = intercept_lmm_spec();
+        let model =
+            crate::test_support::intercept_only_spec(Sizing::FixedClusters { n_clusters: 6 });
 
         let mut ws_cold = LmmWorkspace::for_cluster_spec(p, &model, n, &[]);
-        ws_cold.suff.reset();
-        ws_cold.suff.add_rows_multi(x.as_ref(), &y, &pid, &[], None);
+        ws_cold.suff_mut().reset();
+        ws_cold
+            .suff_mut()
+            .add_rows_multi(x.as_ref(), &y, &pid, &[], None);
         let cold = fit_lmm(&mut ws_cold, &[1, 2], None);
 
         // n_theta == 1 here (one intercept variance component); warm-start it well off
@@ -97,8 +82,10 @@ mod tests {
             theta: vec![5.0],
         };
         let mut ws_warm = LmmWorkspace::for_cluster_spec(p, &model, n, &[]);
-        ws_warm.suff.reset();
-        ws_warm.suff.add_rows_multi(x.as_ref(), &y, &pid, &[], None);
+        ws_warm.suff_mut().reset();
+        ws_warm
+            .suff_mut()
+            .add_rows_multi(x.as_ref(), &y, &pid, &[], None);
         let warm = fit_lmm(&mut ws_warm, &[1, 2], Some(&warm_start.theta));
 
         assert!(
@@ -106,7 +93,7 @@ mod tests {
             "both starts must converge"
         );
         for j in [1usize, 2] {
-            let (a, b) = (ws_cold.fit.betas[j], ws_warm.fit.betas[j]);
+            let (a, b) = (ws_cold.recovery.betas[j], ws_warm.recovery.betas[j]);
             let d = (a - b).abs();
             assert!(
                 d <= 1e-7 || d <= 1e-6 * a.abs().max(b.abs()),

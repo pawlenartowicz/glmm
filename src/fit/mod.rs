@@ -1,9 +1,12 @@
 //! Friendly stable `fit` entry point for the `glmm` crate.
 //!
-//! Owns all scratch; dispatches on `ModelSpec::estimator`; returns `Fit`.
+//! Owns all scratch; dispatches on `(family, re.is_some())`; returns `Fit`.
 //! This is the additive stable public surface —
 //! it never touches any kernel; only marshals data and scratch into kernel
-//! calls, then copies results out.
+//! calls, then copies results out. The full route table — every path from
+//! `fit_cold`/`fit_warm` to its solver — is in `documentation/algorithms.md`;
+//! no route there is feature-gated. This file only tracks its own module
+//! split.
 //!
 //! # Calling convention
 //!
@@ -72,7 +75,9 @@ pub struct Fit {
     /// iff `se[i]` and `se[j]` both are. So a [`FitOptions::target_indices`]
     /// subset leaves everything outside the target block NaN (there is no
     /// covariance to report for a coefficient whose variance was never
-    /// computed), and a non-converged fit is all-NaN.
+    /// computed), and a non-converged fit is all-NaN — except an LMM or GLMM
+    /// fit that hit `MaxFunReached`: that budget-exhausted exit reports its
+    /// finite covariance at the capped endpoint here instead.
     ///
     /// Sources, by path: OLS/GLM/LMM invert the same Cholesky factor `se`'s
     /// forward solve already walks; GLMM `WaldSe::Hessian` takes the β block of
@@ -83,7 +88,8 @@ pub struct Fit {
     /// diagonal. Unlike `stddev_se`, this is populated on the Hessian's RX
     /// fallback too (that fallback inverts a full p×p covariance; only a
     /// double failure, where the Hessian AND the fallback both fail, NaN-fills
-    /// — as a non-converged fit).
+    /// — as any other non-converged fit does, other than the LMM/GLMM
+    /// `MaxFunReached` endpoint above).
     pub vcov: Vec<Vec<f64>>,
     /// Per-element Cholesky-scaled values `theta[k]^2 * sigma_sq`. These equal
     /// the random-effect variance components only for diagonal/scalar RE
@@ -160,11 +166,13 @@ pub struct Fit {
     /// (validated against the frozen lme4 sleepstudy reference). GLMM: the
     /// marginal Laplace deviance `d(y,ũ) + ‖ũ‖² + log|A|` (see
     /// `GlmmFit::deviance`), which differs from −2·logLik by a data-only
-    /// saturated constant. NaN for OLS/GLM and on optimizer/numerical
-    /// failure (GLMM non-convergence surfaces as +∞ internally; mapped to
-    /// NaN here). An LMM fit that hits `MaxFunReached` still reports the
-    /// finite endpoint deviance here with `converged == false` — the plateau
-    /// policy: a `MaxFunReached` cap-out reports its finite endpoint with
+    /// saturated constant on binomial/Poisson fits and equals −2·logLik
+    /// exactly on Gamma and NB fits (see `fit::common::glmm_loglik`). NaN for
+    /// OLS/GLM and on optimizer/numerical failure (GLMM non-convergence
+    /// surfaces as +∞ internally; mapped to NaN here). An LMM or GLMM fit
+    /// that hits `MaxFunReached` still reports the finite endpoint deviance
+    /// here with `converged == false` — the plateau policy: a
+    /// `MaxFunReached` cap-out reports its finite endpoint with
     /// `converged == false` rather than NaN-filling.
     pub deviance: f64,
     /// The actual log-likelihood at the fitted parameters — `deviance` with its
@@ -178,22 +186,30 @@ pub struct Fit {
     ///   AIC/LRT across different fixed parts is meaningless; check [`Fit::reml`]
     ///   before comparing. Matches `lme4::logLik` on a `REML=TRUE` fit.
     /// - **GLMM** — the marginal Laplace/AGQ log-likelihood:
-    ///   `−½·deviance + saturated_loglik` (binomial/Poisson/NB, see
-    ///   `family::saturated_loglik`), `−½·deviance` for Gamma (lme4's
-    ///   `logLik(glmer)` is `−devfun/2` verbatim, `gamma_aic`'s `+2`
-    ///   included — see `fit::common::glmm_loglik`). Matches `lme4::logLik`
-    ///   on the same fit, including the aggregated-binomial `cbind(s, m−s)`
-    ///   form under `weights=`.
+    ///   `−½·deviance + saturated_loglik` (binomial/Poisson, see
+    ///   `family::saturated_loglik`), `−½·deviance` alone for Gamma and NB
+    ///   (Gamma: lme4's `logLik(glmer)` is `−devfun/2` verbatim, `gamma_aic`'s
+    ///   `+2` included; NB: `deviance` already carries the θ̂-dependent
+    ///   saturated term the outer θ search adds — see
+    ///   `fit::common::glmm_loglik`). Matches `lme4::logLik` on the same fit,
+    ///   including the aggregated-binomial `cbind(s, m−s)` form under
+    ///   `weights=`.
     ///
     /// NaN wherever `deviance`'s failure modes apply (non-converged/degenerate
-    /// fits); finite on an LMM `MaxFunReached` endpoint, like `deviance`.
-    /// `AIC = 2·df − 2·loglik`, `BIC = df·ln(n) − 2·loglik` with [`Fit::df`].
+    /// fits); finite on an LMM or GLMM `MaxFunReached` endpoint, like
+    /// `deviance`.
+    /// `AIC = 2·df − 2·loglik`, `BIC = df·ln(n) − 2·loglik` with [`Fit::df`] —
+    /// on a GLMM budget-exhausted exit `df` is 0 (see [`Fit::df`]) and this
+    /// identity does not apply there, even though `loglik` itself is finite.
     pub loglik: f64,
     /// Parameters counted for AIC/BIC: retained fixed effects (`p` minus
     /// aliased columns, matching lme4's NA-coefficient handling) + `n_theta`
     /// RE parameters + 1 if the family estimates a dispersion/scale (Gaussian
     /// σ², Gamma φ unless held fixed via [`FitOptions::dispersion`], NB θ).
-    /// 0 on degenerate NaN-fill paths.
+    /// 0 on degenerate NaN-fill paths, and also 0 on a GLMM fit that hits
+    /// `MaxFunReached` (gated on `converged`, unlike `loglik`/`deviance`) — the
+    /// AIC/BIC identity in [`Fit::loglik`] does not apply at that endpoint. An
+    /// LMM `MaxFunReached` endpoint reports its usual nonzero `df` instead.
     pub df: usize,
     /// `true` iff `loglik` is a REML criterion (the Gaussian LMM paths — REML
     /// is this engine's locked LMM objective) rather than an ML log-likelihood.
@@ -241,11 +257,9 @@ pub struct Fit {
 /// **Coverage is not uniform across routes**, and the per-field docs say where
 /// each one is real. The short version: `converged` and `aliased` are filled
 /// everywhere; `pinned` is real on every route that has variance components to
-/// pin, while `boundary` distinguishes all three states only on the dense LMM
-/// and dense GLMM routes; `notes` can only ever be raised by OLS, GLM and dense
-/// LMM — dense GLMM forms no factor to measure a pivot on, and the sparse route
-/// refuses an ill-conditioned design outright (reporting `converged: false`)
-/// rather than fitting it and flagging. An absent note is therefore "not
+/// pin, while `boundary` distinguishes all three states only on the LMM and
+/// GLMM routes; `notes` can only ever be raised by OLS, GLM and LMM — the GLMM
+/// forms no factor to measure a pivot on. An absent note is therefore "not
 /// detected", never "checked and clean".
 ///
 /// `#[non_exhaustive]`: match with a trailing `..`. That is the whole point of
@@ -254,15 +268,18 @@ pub struct Fit {
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct Diagnostics {
-    /// Whether the optimizer reached its convergence criterion. `false` means
-    /// `se`/`vcov`/`dispersion` are the NaN-fill described on each of those
-    /// fields.
+    /// Whether the optimizer reached its convergence criterion. `false`
+    /// usually means `se`/`vcov`/`dispersion` are the NaN-fill described on
+    /// each of those fields — the exception is an LMM or GLMM fit that hit
+    /// `MaxFunReached`: `se` and `vcov` report finite values at that
+    /// budget-exhausted endpoint, while `dispersion` still takes the
+    /// NaN-fill.
     pub converged: bool,
     /// `true` iff the fit converged onto the θ boundary (≥ 1 diagonal variance
     /// component pinned at 0 — `boundary == AtBoundary`, OR a converged
     /// diagonal stddev negligible next to its fit's largest — see
     /// [`Fit::has_negligible_component`]), the same condition lme4's
-    /// `isSingular` reports. `false` for OLS/GLM and for an LMM
+    /// `isSingular` reports. `false` for OLS/GLM and for an LMM or GLMM
     /// `MaxFunReached` cap-out — a capped endpoint is reported as a point,
     /// not accepted onto the boundary, so it never sets this flag even when
     /// its diagonals are near zero.
@@ -298,11 +315,10 @@ pub struct Diagnostics {
     /// standard deviation is not zero.
     ///
     /// **Empty means nothing was pinned** — every route with variance
-    /// components to pin fills this field on every converged fit; the
-    /// dense-view mappers read it straight off the fitted mask
-    /// (`common::materialize_diagnostics`) and the two sparse routes name
-    /// their own collapsed components explicitly (`pinned_flags`), so there is
-    /// no route left that knows a component pinned but declines to say which.
+    /// components to pin fills this field on every converged fit: each view
+    /// mapper reshapes the fitted mask through
+    /// `common::materialize_diagnostics`, so there is no route left that knows
+    /// a component pinned but declines to say which.
     /// A fit with no pinned component leaves this empty rather than allocating
     /// a grid of `false`: the kernels carry the state as a u64 bit mask and
     /// `pinned_flags` short-circuits to `vec![]` when the mask is zero, so a
@@ -313,55 +329,6 @@ pub struct Diagnostics {
     /// components the internal mask holds — outside the crate's currently
     /// validated envelope — cannot be represented here at all.
     pub pinned: Vec<Vec<bool>>,
-    /// Variance-component score at each PINNED component, laid out exactly like
-    /// [`Diagnostics::pinned`]: `boundary_score[g][i]` pairs with `pinned[g][i]`
-    /// and with `stddev_corr(g).0[i]`. The value is `dD/ds` at `s = 0` in the
-    /// variance coordinate `s = θ_jj²` — equivalently `½·∂²D/∂θ_jj²` at the
-    /// pinned point. That shortcut needs the deviance to be even in `θ_jj`,
-    /// which needs Λ's column `j` to be zero below the diagonal, and the
-    /// canonical form the pin loop leaves behind guarantees exactly that (see
-    /// [`Diagnostics::pinned`]) — so a score is reported at every pinned
-    /// diagonal.
-    ///
-    /// **Positive means the boundary is the constrained optimum** of the basin
-    /// the search settled in: raising the component off zero would raise the
-    /// deviance there. A non-positive score at a pinned component means the pin
-    /// is not justified by the local geometry. NaN at every component that is
-    /// not pinned and at every off-diagonal — so NaN does not mean "not
-    /// pinned".
-    ///
-    /// **Empty means no score was measured** — a fit that did not ask for it
-    /// ([`FitOptions::boundary_score`], off by default), an interior fit, a
-    /// non-converged fit, every route other than the dense LMM and the blocked
-    /// GLMM, and the GLMM shapes with no exact Hessian (structured extras,
-    /// dense fallback, sparse). Empty is NOT "nothing was pinned"; read
-    /// [`Diagnostics::pinned`] for that. Observation only.
-    pub boundary_score: Vec<Vec<f64>>,
-    /// KKT residual at the accepted θ̂: the ∞-norm of the deviance's θ gradient
-    /// projected onto the box the optimizer searched (diagonals `[0, 1e3]`,
-    /// off-diagonals `[±1e3]`) — at a lower bound a positive component is
-    /// satisfied and contributes nothing, at an upper bound a negative one
-    /// does. Zero to working precision means the accepted point satisfies the
-    /// first-order conditions, boundary or interior; a large value means the
-    /// optimizer stopped somewhere that is not a constrained stationary point.
-    /// **RE coordinates only:** on negative-binomial GLMMs the outer search carries
-    /// one further coordinate, `ln θ_NB`, which is held fixed in this gradient and
-    /// contributes nothing to the norm.
-    ///
-    /// **Coordinates:** on the deviance scale (−2·logL), per unit of θ in the
-    /// units the caller's design is in — the projection runs in the internal
-    /// scaled θ̃ where the box lives and each component is mapped back by its
-    /// row scale before the norm. A derivative w.r.t. θ multiplies by that
-    /// scale where [`Fit::stddev_se`], an SE in θ, divides by it.
-    ///
-    /// The optimizer stops on a trust radius, not on a gradient, so a converged
-    /// fit leaves a small finite residual rather than an exact zero; what
-    /// counts as small is a measured number, pinned by the calibration in
-    /// `src/glmm/tests.rs`. **NaN** wherever no exact gradient exists: every
-    /// non-GLMM route, the GLMM structured-extras and dense-fallback shapes,
-    /// the sparse routes, and any non-converged fit. Observation only — no
-    /// fitting decision reads it.
-    pub kkt_grad_norm: f64,
     /// Solver observations that are not one of the fixed channels above. Empty
     /// on a clean fit, and empty allocates nothing.
     pub notes: Vec<Note>,
@@ -369,11 +336,11 @@ pub struct Diagnostics {
 
 /// Where the accepted θ sits in its parameter space.
 ///
-/// Only the dense LMM and dense GLMM routes distinguish all three. On the
-/// sparse routes this is back-derived from `singular`, so `NoOptimum` is
-/// unreachable there and `Interior` means "not pinned", not "verified
-/// interior" — `pinned` on those routes is nonetheless exact. OLS and GLM have
-/// no θ and always report `Interior`.
+/// Every θ-carrying route distinguishes all three — the LMM over either kernel
+/// and the GLMM over every layout report the state the search reached, cap-out
+/// (`NoOptimum`) included. OLS and GLM have no θ and always report `Interior`,
+/// and so does a `Fit` that failed before any search ran (the degenerate `n`/`p`
+/// guards), which says so through `converged: false`.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Boundary {
@@ -411,19 +378,24 @@ pub enum Note {
         /// The measured scale-invariant pivot ratio — smaller is worse.
         pivot: f64,
     },
-    /// A GLMM PIRLS inner solve ran the full `PIRLS_MAX_ITERS` (50) cap without
+    /// A GLMM PIRLS inner solve ran the full `PIRLS_MAX_ITERS` (200) cap without
     /// satisfying its convergence band — never a failure surfaced any other way
     /// (that is the `(NaN, NaN, NaN, false)` halving-exhaustion/Cholesky-failure
     /// case, which the fit already rejects or NaN-fills through the usual
-    /// channels). Observation-only: the cap stays 50 and no fitted number moves.
+    /// channels). The cap stays 200. A note where `final_eval` is `false` costs
+    /// nothing observable — that inner solve was a rejected trial point, not
+    /// what the fit reports; a note where `final_eval` is `true` means the
+    /// reported numbers rest on a PIRLS solve that never settled inside the cap.
     /// FD-Hessian SE evals are excluded — only fit-path evals count.
     PirlsExhausted {
         /// How many fit-path BOBYQA objective evals hit the cap over the course
         /// of this fit (0 if `final_eval` alone is what fired).
         evals: u32,
-        /// Whether the FINAL re-evaluation at the converged γ̂ itself hit the
+        /// Whether the FINAL re-evaluation at the reported γ̂ itself hit the
         /// cap — the case that matters, since that solve's ũ/W̃ feed the
-        /// reported estimates directly rather than being a rejected trial point.
+        /// reported estimates directly rather than being a rejected trial
+        /// point. That re-evaluation runs on a budget-exhausted outer exit
+        /// too, not only on a converged one.
         final_eval: bool,
     },
     /// A grouping factor declares levels that carry no row but still occupy
@@ -475,17 +447,17 @@ pub enum Note {
 }
 
 impl Diagnostics {
-    /// The diagnostics a route that reports no θ-boundary detail can honestly
-    /// fill: `boundary` back-derived from `singular`, nothing pinned, no notes,
-    /// no aliased column. Every direct-`Fit`-building site (the NaN-fill
-    /// returns, and the sparse routes, which assemble a `Fit` rather than a
-    /// view) goes through here; the four view mappers go through
+    /// The diagnostics a `Fit` built without a solver carrier can honestly fill:
+    /// `boundary` back-derived from `singular`, nothing pinned, no notes, no
+    /// aliased column. Its callers are the NaN-fill returns — the degenerate
+    /// `n`/`p` guards, the NB alternation's seed fit, the unfittable-random-slope
+    /// return — which stand in for a search that never ran and all pass
+    /// `converged: false`. Every fitting route goes through
     /// `common::materialize_diagnostics` instead, which has a carrier to read.
     ///
-    /// The two sparse routes overwrite `pinned` on top of this with
-    /// [`pinned_flags`] — they do know which components collapsed. `pinned`
-    /// stays empty here because the NaN-fill returns share this helper and have
-    /// no varcorr to align a grid against.
+    /// `pinned` stays empty here because those callers have no varcorr to align
+    /// a grid against; [`pinned_flags`] is what places the bits when there is
+    /// one.
     pub(crate) fn from_flags(converged: bool, singular: bool, p: usize) -> Self {
         Diagnostics {
             converged,
@@ -497,8 +469,6 @@ impl Diagnostics {
                 Boundary::Interior
             },
             pinned: vec![],
-            boundary_score: vec![],
-            kkt_grad_norm: f64::NAN,
             notes: vec![],
         }
     }
@@ -703,8 +673,8 @@ pub struct FitOptions {
     ///   emitted z values and every raw x/y read in `SparseLmmWorkspace::new`'s
     ///   pass 2 each carry one `√wᵢ` factor, so every Gram product (`ztxy`,
     ///   `cxy`, the packed `pk_*` raw-Gram streams) ends up carrying exactly
-    ///   `wᵢ`. Deviance/df stay raw (`n − p`); `fit_mle_sparse` adds the same
-    ///   `−Σlog wᵢ` constant as `fit_mle` above. Validated against
+    ///   `wᵢ`. Deviance/df stay raw (`n − p`); the `−Σlog wᵢ` constant is added
+    ///   in `lmm_view_to_fit`, the one site both kernels reach. Validated against
     ///   `fit_sparse_lmm_weighted_matches_lme4` (lme4 `lmer`, sparse) and
     ///   `sparse_lmm_constant_weights_invariant`.
     pub weights: Option<Vec<f64>>,
@@ -747,17 +717,6 @@ pub struct FitOptions {
     /// batch loop is safe (one shared work-stealing pool) in a way naive OS-thread
     /// or BLAS-thread nesting is not.
     pub parallel_inner: bool,
-    /// Measure [`Diagnostics::boundary_score`] on a fit that pins a variance
-    /// component. Default `false`. The score is a diagonal of the exact
-    /// second-derivative pass at the pinned point (a hyper-dual PIRLS solve for
-    /// the GLMM, the hyper-dual REML kernel for the LMM), which nothing else in
-    /// the fit needs: on a small pinned GLMM warm refit it costs about as much
-    /// as the fit itself (see `glmm::fit_glmm`'s diagnostics block for the
-    /// measurement). [`Diagnostics::kkt_grad_norm`] is unaffected — it comes
-    /// from the first-derivative pass and is reported wherever it exists.
-    /// Ignored on every route that cannot measure the score (the field stays
-    /// empty there either way).
-    pub boundary_score: bool,
 }
 
 impl Default for FitOptions {
@@ -770,7 +729,6 @@ impl Default for FitOptions {
             weights: None,
             offset: None,
             parallel_inner: false,
-            boundary_score: false,
         }
     }
 }
@@ -881,7 +839,9 @@ pub fn fit_warm(
         n * p,
         "x must have n*p elements in row-major layout"
     );
+    assert!(x.iter().all(|&v| v.is_finite()), "x must be finite");
     assert_eq!(y.len(), n, "y must have n elements");
+    assert!(y.iter().all(|&v| v.is_finite()), "y must be finite");
     assert_model_shape(model, p, opts.nagq);
     // An EMPTY field means "cold-start this component" — a caller that knows only
     // one of the two (an R `start = list(theta = …)`, lme4's shape) cannot compute
@@ -925,9 +885,7 @@ pub fn fit_warm(
     // columns indistinguishable in f64, where there is no separate coefficient
     // to estimate. This is the only place a column is ever dropped. A design
     // that is merely ill-conditioned has a unique, computable answer, and the
-    // estimator routes fit it in full and record how badly conditioned it was;
-    // the sparse-LMM route is the one exception and still refuses below its own
-    // pivot floor.
+    // estimator routes fit it in full and record how badly conditioned it was.
     if n > 0 && p > 0 {
         let aliased = detect_aliased(x, n, p);
         if aliased.iter().any(|&a| a) {
@@ -999,10 +957,9 @@ pub(crate) fn classify_design(model: &ModelSpec, _nagq: u8) -> Solver {
     // locked-clock benchmark run — Sparse wins 4–13× across q_g ∈ {2,3,4},
     // n_extra ∈ {2,4,6}; intercept-only extras stay NoZ, 2–1500× the other
     // way. Non-Gaussian: the dense NoZ GLMM
-    // kernel builds intercept-only extras exclusively (`glmm::build_z` emits
-    // no slope columns for extras; `apply_lambda`/`build_packed_m` carry
-    // debug_asserts), so Sparse — whose PIRLS applies full q_g×q_g Λ-blocks
-    // per extra level — is the only implemented route.
+    // blocked and structured kernels build intercept-only extras exclusively
+    // (`build_packed_m` carries a debug_assert), so Sparse — whose PIRLS applies
+    // full q_g×q_g Λ-blocks per extra level — is the only implemented route.
     let slope_extras = re.extra_groupings.iter().any(|g| !g.slopes.is_empty());
     // Many-level crossed extras route Sparse: every crossed level lands in the
     // dense tail (`reml_deviance`'s `t_dim`; the dense GLMM path's Schur
@@ -1037,27 +994,32 @@ pub(crate) fn classify_design_pub(model: &ModelSpec, nagq: u8) -> Solver {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+pub(crate) use common::assemble_varcorr;
+#[cfg(test)]
 pub(crate) use common::assert_model_shape_pub;
 #[cfg(any(test, feature = "loop_advanced"))]
 pub use common::spec_sized_from_ids_pub;
-pub(crate) use common::{
-    assemble_ranef_sparse, assemble_varcorr, glmm_loglik, lmm_fitted, lmm_loglik, model_df,
-    nan_vcov, pinned_flags, ranef_level_counts, re_scale_grid, vcov_from_chol,
-};
 // The one diagnostics carrier. Always `pub` (it is `FitView::diagnostics`'s
 // return type), re-exported only for the loop tier — the stable path reads it
 // through `Fit`, never directly.
 #[cfg(feature = "loop_advanced")]
 pub use common::FitDiagnostics;
-pub(crate) use glm::{golden_max_ln_theta, nb_profile_loglik, NB_THETA_HI, NB_THETA_LO};
+pub(crate) use glm::{nb_profile_loglik, NB_THETA_HI, NB_THETA_LO};
 // Test-only since the GLMM NB coordinate stopped seeding from it (it seeds from
 // `fit_glm_nb`'s θ̂ instead): `fit_glm_nb_capped` calls it inside `glm.rs`, so the
 // only cross-module readers left are the tests that pin it.
 #[cfg(test)]
 pub(crate) use glm::nb_theta_moment_seed;
-pub(crate) use glmm::glm_warm_start_beta;
+// The GLMM β cold start. `fit/glmm.rs` calls it directly; the re-export serves
+// the tests that seed a hand-built workspace the same way a fit does.
 #[cfg(test)]
-pub(crate) use lmm::fit_mle_noz_pub;
+pub(crate) use glmm::glm_warm_start_beta;
+// The packed-row cross-check entry point: `src/sparse/tests.rs` fits an
+// in-envelope design both ways through it.
+#[cfg(test)]
+pub(crate) use glmm::fit_glmm_packed;
+#[cfg(test)]
+pub(crate) use lmm::{fit_mle_noz_pub, fit_mle_sparse_pub};
 // Unified fit-core surface for the loop tier.
 #[cfg(feature = "loop_advanced")]
 pub use core::{build_workspace, fit_on, FitView, FitWorkspace};

@@ -210,11 +210,12 @@ pub enum InverseGaussianLink {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WaldSe {
     /// Hessian of the joint (θ, β) Laplace deviance — the lme4
-    /// `use.hessian = TRUE`-matching default. Exact (hyper-dual) on every
-    /// shape `derivative::supports_shape` accepts (the blocked path and the
-    /// structured-extras shapes within the measured tail bound),
-    /// finite-difference on the oversized-core dense fallback and on the
-    /// sparse driver.
+    /// `use.hessian = TRUE`-matching default. Computed exactly wherever an
+    /// exact pass takes the shape: the assembled adjoint pass, which includes
+    /// the packed-row layout, and the hyper-dual pass on the shapes
+    /// `derivative::supports_shape` accepts (the blocked path and the
+    /// structured-extras shapes within the measured tail bound). A shape both
+    /// passes decline falls back to a finite-difference Hessian.
     #[default]
     Hessian,
     /// Direct inverse of the expected-information Schur complement (assumes
@@ -311,5 +312,59 @@ mod tests {
         };
         // nagq=4 (even) is now a FitOptions value, passed straight to the checker.
         crate::fit::assert_model_shape_pub(&model, 2, 4);
+    }
+
+    /// A binomial-logit GLMM with a single intercept-only grouping (4
+    /// clusters) — the nagq-rejection tests below each override exactly the
+    /// field that trips their own check.
+    fn nagq_check_spec() -> ModelSpec {
+        ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters { n_clusters: 4 },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must be odd in 1..=")]
+    fn nagq_above_max_rejected() {
+        let model = nagq_check_spec();
+        // nagq=27 is odd but past MAX_NAGQ (25).
+        crate::fit::assert_model_shape_pub(&model, 2, 27);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a mixed model")]
+    fn nagq_on_a_fixed_only_model_is_rejected() {
+        let mut model = nagq_check_spec();
+        model.re = None;
+        crate::fit::assert_model_shape_pub(&model, 2, 3);
+    }
+
+    /// Fills the NB-GLMM Rust-entry gap: `nagq>1` is legal only on a
+    /// binomial/Poisson single-grouping-factor GLMM, so a negative-binomial
+    /// mixed model is rejected the same way a multi-grouping one is.
+    #[test]
+    #[should_panic(expected = "binomial/Poisson GLMM")]
+    fn nagq_on_a_negative_binomial_glmm_is_rejected() {
+        let mut model = nagq_check_spec();
+        model.family = Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        };
+        crate::fit::assert_model_shape_pub(&model, 2, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the temporary")]
+    fn nagq_over_the_q_cap_is_rejected() {
+        let mut model = nagq_check_spec();
+        // q_p = 4, past the temporary q_p<=3 cap.
+        model.re.as_mut().unwrap().slopes = vec![0, 1, 2];
+        crate::fit::assert_model_shape_pub(&model, 3, 3);
     }
 }

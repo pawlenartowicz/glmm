@@ -6,7 +6,7 @@
 //! reassociation), so the q=1 validation corpus re-proves on this machine.
 //!
 //! Engine-resident: ALL Gaussian mixed (LMM) specs dispatch here through the
-//! unified fit core — the single-random-intercept shape is an `LmmDense`/BOBYQA
+//! unified fit core — the single-random-intercept shape is a `FitKind::Lmm`/BOBYQA
 //! case like any other, from every tier (stable and loop). A scalar closed-form
 //! solve for this shape would only save the per-call workspace allocation that
 //! the reusable `FitWorkspace` (allocated once per (p, max_clusters) shape)
@@ -42,7 +42,6 @@ mod tests;
 
 pub(crate) use kernel::precompute_balanced_collapse;
 pub use kernel::{reml_deviance, LmmSuffStats};
-pub(crate) use kernel::{reml_gradient, reml_hessian, LmmDualScratch, LmmHyperScratch};
 
 /// θ start — DIAGONAL vech entries only; off-diagonals cold-start at 0
 /// (unit diagonal, the lme4/MixedModels.jl default — the
@@ -94,7 +93,7 @@ pub const THETA_TRUTH_FLOOR: f64 = 0.01;
 /// badly scaled design can be flagged differently from lme4's `isSingular`,
 /// which applies the same 1e-4 to user-scale θ.
 pub const PIN_THETA: f64 = 1e-4;
-/// Ill-conditioning DETECTION floor for the dense-LMM route, on the
+/// Ill-conditioning DETECTION floor for the LMM route, on the
 /// scale-invariant per-column pivot ratio of X'V⁻¹X at θ̂
 /// ([`crate::ols::min_pivot_ratio`]). Below it the fixed-effect coefficients are
 /// barely identified and the diagnostics channel says so — it is **not** a
@@ -106,6 +105,12 @@ pub const PIN_THETA: f64 = 1e-4;
 /// this route, which is the range where it still ranks designs. It is
 /// conservative: β̂'s measured movement here is 9.1e-8 at pivot 9.7e-13, far
 /// steadier than the `1e-15 / pivot` law the OLS and GLM routes obey.
+///
+/// That sweep is on a single-grouping design, where the dense and the sparse
+/// kernel report the same pivot and the same movement. The floor does not track
+/// the random-effect structure: with one crossed grouping added, β̂'s movement at
+/// pivot 9.7e-11 — above the floor, so unflagged — is 4.3e-5 on the dense kernel
+/// and 1.1e-4 on the sparse one, against 9.4e-10 without it.
 ///
 /// No SOLVER path reads it: the kernel records the raw pivot and the comparison
 /// happens once, in `LmmResultView::diagnostics`, which is what fills
@@ -128,10 +133,9 @@ pub fn bobyqa_config(n_theta: usize) -> Config {
 /// Dev-only env hooks for sweeping BOBYQA's npt/max_fun without recompiling
 /// (npt and max_fun share this seam).
 /// `LMM_NPT_FORMULA=<mult>n<add>` overrides npt at EVERY BOBYQA config site:
-/// dense LMM (`for_cluster_spec_ext`), the blind seed (`bobyqa_config`), the
-/// sparse θ seed (`sparse_lmm_seed`), the sparse GLMM stage-1 + joint configs
-/// (`sparse.rs`), and the GLMM joint + stage-1 solvers (`glmm/workspace.rs`)
-/// — each evaluated against that solver's own dimension (joint: n_theta + p).
+/// LMM (`for_cluster_spec_ext`), the blind seed (`bobyqa_config`), and the GLMM
+/// joint + stage-1 solvers (`glmm/workspace.rs`) — each evaluated against that
+/// solver's own dimension (joint: n_theta + p).
 /// `LMM_MAX_FUN_FORMULA` does the same for max_fun (unclamped). Formula-shaped
 /// values only: a flat constant would violate `n+2 ≤ npt ≤ (n+1)(n+2)/2` at
 /// small n once n changes between call sites, so flat inputs parse to None
@@ -207,140 +211,6 @@ pub(crate) fn apply_campaign_overrides(config: &mut Config, n: usize) {
     // a cycle that crawls without reducing rho.
     restart.stall_reductions = 0;
     config.restart = Some(restart);
-}
-
-fn two_stage_enabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("LMM_TWO_STAGE").is_ok_and(|v| v == "1"))
-}
-
-/// Experimental two-stage warm restart, gated behind `LMM_TWO_STAGE=1`. Stage 1:
-/// cheapest legal model (npt = n+2), loose rho_end 1e-3 — reach the basin.
-/// Stage 2: fresh solver (BOBYQA cannot grow npt mid-run — the inverse-KKT
-/// update assumes a constant set size), npt = 2n+1, shipped RHO_END, rho_begin
-/// shrunk to the local scale (0.1·min diagonal θ₁, clamped to
-/// [10·RHO_END, RHO_BEGIN]). Returns a merged Outcome: stage-2 status/point,
-/// summed n_eval. LMM_STAGE_PROBE=1 prints per-stage evals + the θ₁→θ̂ distance,
-/// for judging whether a third stage would pay for itself. Dev seam only —
-/// allocates two solvers per fit, which the shipped path never does.
-///
-/// Deliberately left uncounted (`EvalCounters` stays empty on this path): it
-/// is not the shipped path, and `LMM_STAGE_PROBE=1` above already prints its
-/// per-stage evals.
-fn two_stage_minimize(
-    suff: &LmmSuffStats,
-    fit: &mut LmmFitScratch,
-    theta: &mut [f64],
-    lower: &[f64],
-    upper: &[f64],
-    finite_evals: &mut usize,
-) -> bobyqa::Outcome {
-    let n = theta.len();
-    let c1 = {
-        let mut c = Config::new(n);
-        c.npt = n + 2;
-        c.rho_begin = RHO_BEGIN;
-        c.rho_end = 1e-3;
-        c
-    };
-    let mut s1 = Bobyqa::new(n, c1).expect("stage-1 config valid");
-    let out1 = s1.minimize(
-        |xs| {
-            let d = reml_deviance(xs, suff, fit);
-            if d.is_finite() {
-                *finite_evals += 1;
-            }
-            d
-        },
-        theta,
-        lower,
-        upper,
-    );
-    let theta1 = theta.to_vec();
-
-    // Magnitude, not value: the box lets a diagonal end stage 1 negative
-    // (`blind_theta_and_bounds`; the sign is fixed only at the fit's exit).
-    let min_diag = suff
-        .groupings
-        .diagonal_theta()
-        .iter()
-        .map(|&i| theta[i].abs())
-        .fold(f64::INFINITY, f64::min);
-    let rho_begin2 = (0.1 * min_diag).clamp(10.0 * RHO_END, RHO_BEGIN);
-    let c2 = {
-        let mut c = Config::new(n);
-        c.npt = 2 * n + 1;
-        c.rho_begin = rho_begin2;
-        c.rho_end = RHO_END;
-        c
-    };
-    let mut s2 = Bobyqa::new(n, c2).expect("stage-2 config valid");
-    let out2 = s2.minimize(
-        |xs| {
-            let d = reml_deviance(xs, suff, fit);
-            if d.is_finite() {
-                *finite_evals += 1;
-            }
-            d
-        },
-        theta,
-        lower,
-        upper,
-    );
-
-    if std::env::var("LMM_STAGE_PROBE").is_ok_and(|v| v == "1") {
-        let dist = theta1
-            .iter()
-            .zip(theta.iter())
-            .map(|(a, b)| (a - b).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        eprintln!(
-            "stage_evals={},{} stage1_dist={dist:.6e}",
-            out1.n_eval, out2.n_eval
-        );
-    }
-    bobyqa::Outcome {
-        n_eval: out1.n_eval + out2.n_eval,
-        ..out2
-    }
-}
-
-/// Topology-only BOBYQA solver + blind θ₀ + per-component boxes for the sparse-Z
-/// path (`sparse::fit_mle_sparse`), byte-identical to what
-/// `LmmWorkspace::for_cluster_spec_ext` seeds — but WITHOUT the dense O(K)
-/// suff-stats / fit scratch the sparse path exists to avoid. The θ schedule
-/// (scaled `rho_begin`, mid `npt`) and the blind seed/bounds are TOPOLOGY-ONLY
-/// (functions of `n_theta`/`diagonal_theta`, not of K), so an in-envelope design
-/// fit through here matches the NoZ path to machine precision (the superset
-/// property).
-///
-/// MIRRORS the config/seed in `LmmWorkspace::for_cluster_spec_ext` — change
-/// together (both feed through the shared `apply_campaign_overrides` tail).
-pub(crate) fn sparse_lmm_seed(groupings: &LmmGroupings) -> (Bobyqa, Vec<f64>, Vec<f64>, Vec<f64>) {
-    let n_theta = groupings.n_theta();
-    let blind_theta = vec![THETA0; n_theta];
-    let rho_begin = (0.1
-        * groupings
-            .diagonal_theta()
-            .iter()
-            .map(|&i| blind_theta[i])
-            .fold(f64::INFINITY, f64::min))
-    .min(RHO_BEGIN);
-    let npt = if n_theta >= 3 {
-        (3 * n_theta).div_ceil(2) + 1
-    } else {
-        2 * n_theta + 1
-    };
-    let mut config = Config::new(n_theta);
-    config.rho_begin = rho_begin;
-    config.rho_end = RHO_END;
-    config.npt = npt;
-    apply_campaign_overrides(&mut config, n_theta);
-    let (theta, lower, upper) = groupings.blind_theta_and_bounds();
-    let solver =
-        Bobyqa::new(n_theta, config).expect("BOBYQA config constants are valid by construction");
-    (solver, theta, lower, upper)
 }
 
 /// Capacity ceilings — single-sourced in `crate::consts` and re-exported here
@@ -795,7 +665,7 @@ impl LmmGroupings {
     /// Extra groupings here are intercept-only because `classify_design` routes
     /// any extra-slopes shape to `Solver::Sparse` for every family, so no
     /// slopes-on-extras check is needed. A non-eligible extras shape
-    /// (oversized core) falls through to the dense `glmm::pirls_solve`.
+    /// (oversized core) falls through to the packed `glmm::pirls_solve_packed`.
     pub fn structured_extras_eligible(&self) -> bool {
         !self.extra_offsets.is_empty() && self.primary_q + self.nested_per_parent <= MAX_PRIMARY_Q
     }
@@ -805,32 +675,6 @@ impl LmmGroupings {
     /// `diagonal_theta` field doc for the column-major vech layout.
     pub fn diagonal_theta(&self) -> &[usize] {
         &self.diagonal_theta
-    }
-
-    /// True iff pinned diagonal `k` (index into `diagonal_theta`) has a
-    /// non-zero off-diagonal entry below it in the same Λ column, at the
-    /// current `theta`.
-    ///
-    /// `boundary_score`'s ½·∂²D/∂θ_jj² shortcut needs the deviance to be even
-    /// in θ_jj at θ_jj = 0, i.e. dD/dθ_jj = 0 there. With `D = ΛΛ′`, entry
-    /// `Σ_kj` for `k > j` carries `Λ_kj·Λ_jj`, linear in `Λ_jj` — so a
-    /// non-zero `Λ_kj` below the pinned diagonal breaks evenness and the
-    /// shortcut no longer equals the score. This is exactly when this
-    /// returns true: the caller must not report a score for that component.
-    ///
-    /// A DEFENCE, not a live gate: [`canonicalize_pinned_blocks`] zeroes the
-    /// whole column below a pinned diagonal after every pin loop, so on a
-    /// canonical θ̂ this is false at every pinned diagonal. It is kept because
-    /// nothing in the type system says the canonical form holds at the two
-    /// score sites, and reporting a score where it does not would be silently
-    /// wrong rather than merely absent.
-    pub fn diagonal_has_nonzero_below(&self, k: usize, theta: &[f64]) -> bool {
-        let run_len = self.diagonal_run_len[k];
-        if run_len <= 1 {
-            return false;
-        }
-        let ti = self.diagonal_theta[k];
-        theta[ti + 1..ti + run_len].iter().any(|&v| v != 0.0)
     }
 
     /// Blind θ₀ and per-component boxes. Diagonal vech entries (the q_p primary
@@ -936,14 +780,10 @@ pub struct LmmFitScratch<T = f64> {
     /// m×m trailing block of the tail factor — identical semantics to the
     /// augmented [X y] factor; every recovery step reads only this.
     pub factor: Mat<f64>,
-    pub betas: Vec<f64>,
-    pub var_diag: Vec<f64>,
-    pub t_sq: Vec<f64>,
-    pub u: Vec<f64>,
     /// Spherical conditional modes `û` at θ̂ over the full RE-column set
     /// (elimination order, length `k_total`), written once per fit by
-    /// [`recover_ranef`]. Its OWN buffer, not `u`: `u`'s head is the
-    /// standard-error forward-solve scratch, which runs first and would be
+    /// [`recover_ranef`]. Its OWN buffer, not [`LmmRecovery::u`]: that one is
+    /// the standard-error forward-solve scratch, which runs first and would be
     /// overwritten.
     pub ranef_u: Vec<f64>,
     /// Whether `ranef_u` holds a usable recovery for the current fit. False
@@ -958,12 +798,6 @@ pub struct LmmFitScratch<T = f64> {
     pub ranef_ux: Vec<f64>,
     pub ranef_rhs: Vec<f64>,
     pub sigma_sq: T,
-    /// p×p X'V⁻¹X rebuild (L_XX·L_XXᵀ) + the shared joint-Wald scratch
-    /// (mirrors the lme workspace triple the promoted helper expects).
-    pub joint_xtvix: Mat<f64>,
-    pub joint_k_inv: Mat<f64>,
-    pub joint_sigma_t_chol: Mat<f64>,
-    pub joint_rhs: Vec<f64>,
     // --- crossed/nested-slopes blocked path (`reml_deviance_blocked`) ---
     // All empty unless `extra_slopes_any`; sized once here so the blocked warm
     // path stays zero-alloc. `k = k_total`, `dim = k + m`.
@@ -1040,19 +874,11 @@ impl<T: Scalar> LmmFitScratch<T> {
                 vec![0.0; 2 * g.n_primary * w * t_dim + t_dim * t_dim]
             },
             factor: Mat::zeros(m, m),
-            betas: vec![0.0; p],
-            var_diag: vec![0.0; p],
-            t_sq: vec![0.0; p],
-            u: vec![0.0; p],
             ranef_u: vec![0.0; g.k_total],
             ranef_ok: false,
             ranef_ux: vec![0.0; g.k_crossed()],
             ranef_rhs: vec![0.0; w],
             sigma_sq: T::from_f64(f64::NAN),
-            joint_xtvix: Mat::zeros(p, p),
-            joint_k_inv: Mat::zeros(p, p),
-            joint_sigma_t_chol: Mat::zeros(p, p),
-            joint_rhs: vec![0.0; p],
             blocked_lam: vec![0.0; blocked_kk],
             blocked_g: vec![0.0; blocked_kk],
             blocked_tmp: vec![0.0; blocked_kk],
@@ -1063,16 +889,200 @@ impl<T: Scalar> LmmFitScratch<T> {
 }
 
 // ---------------------------------------------------------------------------
+// LmmRecovery / LmmKernel — the once-at-θ̂ buffers, and the objective behind them.
+// ---------------------------------------------------------------------------
+
+/// The `p`-sized buffers the once-at-θ̂ recovery block fills: β̂, its per-target
+/// variance and squared Wald statistic, and the joint-Wald scratch. Kernel-
+/// independent — both objectives leave the same augmented `[X y]` factor, and
+/// every step here reads only that — so they live beside [`LmmKernel`] rather
+/// than inside it.
+pub struct LmmRecovery {
+    /// Fixed-effect estimates β̂, predictor-indexed.
+    pub betas: Vec<f64>,
+    /// Per-target `Var(β̂_j)`; non-target slots are never written.
+    pub var_diag: Vec<f64>,
+    /// Per-target `t² = β̂_j²/Var(β̂_j)`; non-target slots are never written.
+    pub t_sq: Vec<f64>,
+    /// `L_XX⁻¹e_j` forward-solve scratch for `var_diag` (first `p` slots).
+    pub u: Vec<f64>,
+    /// p×p X'V⁻¹X rebuild (L_XX·L_XXᵀ) + the shared joint-Wald scratch
+    /// (mirrors the lme workspace triple the promoted helper expects).
+    pub joint_xtvix: Mat<f64>,
+    pub joint_k_inv: Mat<f64>,
+    pub joint_sigma_t_chol: Mat<f64>,
+    pub joint_rhs: Vec<f64>,
+}
+
+impl LmmRecovery {
+    pub fn new(p: usize) -> Self {
+        LmmRecovery {
+            betas: vec![0.0; p],
+            var_diag: vec![0.0; p],
+            t_sq: vec![0.0; p],
+            u: vec![0.0; p],
+            joint_xtvix: Mat::zeros(p, p),
+            joint_k_inv: Mat::zeros(p, p),
+            joint_sigma_t_chol: Mat::zeros(p, p),
+            joint_rhs: vec![0.0; p],
+        }
+    }
+}
+
+/// The REML objective and the augmented factor it leaves: dense sufficient
+/// statistics with the family-blocked Cholesky, or the sparse-Z Gram/Schur
+/// workspace. [`fit_lmm`] reads both through the same five calls.
+pub(crate) enum LmmKernel {
+    Dense {
+        suff: Box<LmmSuffStats>,
+        fit: Box<LmmFitScratch>,
+    },
+    /// `ws` is built per call by `fit::lmm::accumulate_lmm_rows` (the Gram
+    /// scatter is the constructor) and is `None` before the first accumulate;
+    /// `g` is the grouping structure it is built from, carrying the RE column
+    /// scales of the current design.
+    Sparse {
+        g: Box<LmmGroupings>,
+        ws: Option<Box<crate::sparse::SparseLmmWorkspace>>,
+    },
+}
+
+impl LmmKernel {
+    /// Profiled-REML deviance at `theta`, leaving the augmented `[X y]` factor
+    /// [`Self::factor`] reads. `f64::INFINITY` is the failure surface.
+    pub(crate) fn deviance(&mut self, theta: &[f64]) -> f64 {
+        match self {
+            LmmKernel::Dense { suff, fit } => reml_deviance(theta, suff, fit),
+            LmmKernel::Sparse { ws, .. } => {
+                crate::sparse::sparse_reml_deviance(theta, Self::sparse_ws_mut(ws))
+            }
+        }
+    }
+
+    /// Keep back what the NEXT evaluation would otherwise throw away, so
+    /// [`Self::recover_ranef`] can back-substitute the conditional modes off
+    /// it. The dense kernel needs nothing: it re-factors from `fit.tail` /
+    /// `fit.blocked_p`, which every evaluation leaves behind.
+    pub(crate) fn prepare_recovery(&mut self) {
+        match self {
+            LmmKernel::Dense { .. } => {}
+            LmmKernel::Sparse { ws, .. } => Self::sparse_ws_mut(ws).arm_recovery(),
+        }
+    }
+
+    /// The augmented `m×m` `[X y]` factor the last evaluation left (lower
+    /// triangular, y row at index `p`): β̂, `Var(β̂)` and the pivot ratio all
+    /// come off it.
+    pub(crate) fn factor(&self) -> MatRef<'_, f64> {
+        match self {
+            LmmKernel::Dense { fit, .. } => fit.factor.as_ref(),
+            LmmKernel::Sparse { ws, .. } => Self::sparse_ws(ws).factor.as_ref(),
+        }
+    }
+
+    /// σ̂² at the last evaluation's θ.
+    pub(crate) fn sigma_sq(&self) -> f64 {
+        match self {
+            LmmKernel::Dense { fit, .. } => fit.sigma_sq,
+            LmmKernel::Sparse { ws, .. } => Self::sparse_ws(ws).sigma_sq,
+        }
+    }
+
+    /// Spherical conditional modes `û` at θ̂ from the state the last evaluation
+    /// left; `betas` must hold β̂. Returns whether the recovery succeeded.
+    pub(crate) fn recover_ranef(&mut self, theta: &[f64], betas: &[f64]) -> bool {
+        match self {
+            LmmKernel::Dense { suff, fit } => {
+                recover_ranef(theta, suff, fit, betas);
+                fit.ranef_ok
+            }
+            LmmKernel::Sparse { ws, .. } => {
+                let ws = Self::sparse_ws_mut(ws);
+                match crate::sparse::sparse_recover_u(ws, betas) {
+                    Some(u) => {
+                        ws.ranef_u = u;
+                        true
+                    }
+                    None => {
+                        ws.ranef_u.clear();
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop any `û` a previous fit on this workspace left, so [`Self::ranef_u`]
+    /// reports none for a fit that reached no endpoint.
+    pub(crate) fn invalidate_recovery(&mut self) {
+        match self {
+            LmmKernel::Dense { fit, .. } => fit.ranef_ok = false,
+            LmmKernel::Sparse { ws, .. } => Self::sparse_ws_mut(ws).ranef_u.clear(),
+        }
+    }
+
+    /// `û` over the full RE-column set, or empty when no recovery succeeded for
+    /// the current fit.
+    pub(crate) fn ranef_u(&self) -> &[f64] {
+        match self {
+            LmmKernel::Dense { fit, .. } => {
+                if fit.ranef_ok {
+                    &fit.ranef_u
+                } else {
+                    &[]
+                }
+            }
+            LmmKernel::Sparse { ws, .. } => &Self::sparse_ws(ws).ranef_u,
+        }
+    }
+
+    /// Grouping structure, carrying the RE column scales of the current design.
+    pub(crate) fn groupings(&self) -> &LmmGroupings {
+        match self {
+            LmmKernel::Dense { suff, .. } => &suff.groupings,
+            LmmKernel::Sparse { g, .. } => g,
+        }
+    }
+
+    /// Rows behind the accumulated Grams. Equal to the caller's `n` except on
+    /// the degenerate dense `p == 0` shape, where nothing was accumulated.
+    pub(crate) fn n_rows(&self) -> usize {
+        match self {
+            LmmKernel::Dense { suff, .. } => suff.n_rows,
+            LmmKernel::Sparse { ws, .. } => Self::sparse_ws(ws).n,
+        }
+    }
+
+    fn sparse_ws(
+        ws: &Option<Box<crate::sparse::SparseLmmWorkspace>>,
+    ) -> &crate::sparse::SparseLmmWorkspace {
+        ws.as_deref().expect(SPARSE_NOT_ACCUMULATED)
+    }
+
+    fn sparse_ws_mut(
+        ws: &mut Option<Box<crate::sparse::SparseLmmWorkspace>>,
+    ) -> &mut crate::sparse::SparseLmmWorkspace {
+        ws.as_deref_mut().expect(SPARSE_NOT_ACCUMULATED)
+    }
+}
+
+/// The sparse kernel's Gram scatter IS its constructor, so every call below the
+/// accumulate step has a workspace by construction; reaching this is a wiring
+/// bug, not a runtime condition.
+const SPARSE_NOT_ACCUMULATED: &str = "sparse LMM kernel used before accumulate_lmm_rows";
+
+// ---------------------------------------------------------------------------
 // LmmWorkspace — everything a fit needs, allocated once per problem shape.
 // ---------------------------------------------------------------------------
 
-/// Per-problem-shape scratch: sufficient stats, deviance/PIRLS buffers, and
-/// θ-solver state, allocated once and reused across fits of the same shape.
+/// Per-problem-shape scratch: the REML objective and its buffers, the once-at-θ̂
+/// recovery buffers, and θ-solver state, allocated once and reused across fits
+/// of the same shape.
 pub struct LmmWorkspace {
-    /// Accumulated per-RE-column sufficient statistics for the current data.
-    pub suff: LmmSuffStats,
-    /// Deviance/PIRLS scratch buffers sized to the same problem shape.
-    pub fit: LmmFitScratch,
+    /// The objective and the augmented factor it leaves.
+    pub(crate) kernel: LmmKernel,
+    /// β̂ and the standard-error/Wald buffers, filled once at θ̂.
+    pub recovery: LmmRecovery,
     /// BOBYQA solver state — `Bobyqa::new` is the crate's only allocation
     /// site; `minimize` is zero-alloc on the warm path.
     pub solver: Bobyqa,
@@ -1082,19 +1092,6 @@ pub struct LmmWorkspace {
     pub lower: Vec<f64>,
     /// Upper box bound, THETA_HI on every entry.
     pub upper: Vec<f64>,
-    /// REML dual-gradient scratch, built on the first derivative request for
-    /// this workspace and reused thereafter. `None` on a workspace that never
-    /// asks for a gradient, so an `f64`-only caller pays no memory. The shape
-    /// it is sized for — `p` and `groupings` — is fixed at construction and
-    /// cannot change under a workspace, so unlike the GLMM twin there is no
-    /// shape re-check on reuse. Boxed because `LmmFitScratch<Dual<12>>` is a
-    /// large value and this struct is moved.
-    pub(crate) dual_scratch: Option<Box<LmmDualScratch>>,
-    /// Hessian twin of `dual_scratch`, its own slot so a gradient request and a
-    /// boundary-score request never evict each other: they resolve to different
-    /// scalar types, and one shared slot would rebuild the whole buffer list on
-    /// every alternation.
-    pub(crate) hyper_scratch: Option<Box<LmmHyperScratch>>,
 }
 
 impl LmmWorkspace {
@@ -1119,26 +1116,29 @@ impl LmmWorkspace {
         max_n: usize,
         slope_cols: &[usize],
     ) -> Self {
-        Self::for_cluster_spec_ext(p, cluster, max_n, slope_cols, &[])
+        Self::for_cluster_spec_ext(p, cluster, max_n, slope_cols, &[], false)
     }
 
     /// As [`for_cluster_spec`], plus each extra grouping's resolved slope x-columns
     /// (`extra_slope_cols`, declaration order; `&[]` for intercept-only extras) —
     /// the crossed/nested-slopes entry. Both `glmm::fit` (standalone) and
     /// `glmm::mcpower` bind through here.
+    ///
+    /// `sparse` picks the kernel: it is `fit::classify_design(spec) ==
+    /// Solver::Sparse` on the live path, and the sparse kernel is a superset of
+    /// the dense one, so a caller may pass `true` on an in-envelope design to
+    /// cross-check the two at the same θ schedule.
     pub fn for_cluster_spec_ext(
         p: usize,
         cluster: &crate::ModelSpec,
         max_n: usize,
         slope_cols: &[usize],
         extra_slope_cols: &[Vec<usize>],
+        sparse: bool,
     ) -> Self {
         let groupings =
             LmmGroupings::from_cluster_spec_ext(cluster, max_n, slope_cols, extra_slope_cols);
         let n_theta = groupings.n_theta();
-        // MIRRORED by `sparse_lmm_seed` (the sparse-Z path's topology-only solver
-        // seed) — change the schedule (rho_begin / npt / bounds) together (both
-        // feed through the shared `apply_campaign_overrides` tail).
         // Scaled schedule: rho_begin = 0.1·min θ₀ — the eval count is
         // dominated by rho shrinkage, not travel distance. The start is now the cold
         // blind θ₀ (ModelSpec is structure-only), so every diagonal entry is
@@ -1168,18 +1168,30 @@ impl LmmWorkspace {
         config.rho_end = RHO_END;
         config.npt = npt;
         apply_campaign_overrides(&mut config, n_theta);
-        let fit = LmmFitScratch::with_groupings(p, &groupings);
         let (theta, lower, upper) = groupings.blind_theta_and_bounds();
+        // The sparse kernel carries no dense O(K) suff-stats / fit scratch —
+        // that is what it exists to avoid — and its Gram scatter is its
+        // constructor, so it is empty until the first accumulate.
+        let kernel = if sparse {
+            LmmKernel::Sparse {
+                g: Box::new(groupings),
+                ws: None,
+            }
+        } else {
+            let fit = Box::new(LmmFitScratch::with_groupings(p, &groupings));
+            LmmKernel::Dense {
+                suff: Box::new(LmmSuffStats::with_groupings(p, groupings)),
+                fit,
+            }
+        };
         LmmWorkspace {
-            suff: LmmSuffStats::with_groupings(p, groupings),
-            fit,
+            kernel,
+            recovery: LmmRecovery::new(p),
             solver: Bobyqa::new(n_theta, config)
                 .expect("BOBYQA config constants are valid by construction"),
             theta,
             lower,
             upper,
-            dual_scratch: None,
-            hyper_scratch: None,
         }
     }
 
@@ -1189,11 +1201,14 @@ impl LmmWorkspace {
     #[cfg(test)]
     pub fn with_groupings(p: usize, groupings: LmmGroupings) -> Self {
         let n_theta = groupings.n_theta();
-        let fit = LmmFitScratch::with_groupings(p, &groupings);
+        let fit = Box::new(LmmFitScratch::with_groupings(p, &groupings));
         let (theta, lower, upper) = groupings.blind_theta_and_bounds();
         LmmWorkspace {
-            suff: LmmSuffStats::with_groupings(p, groupings),
-            fit,
+            kernel: LmmKernel::Dense {
+                suff: Box::new(LmmSuffStats::with_groupings(p, groupings)),
+                fit,
+            },
+            recovery: LmmRecovery::new(p),
             // The constants are valid by construction for the crate's checks
             // (npt default within bounds; box width 1e3 ≥ 2·RHO_BEGIN), so a
             // failure here is an engine bug, not a runtime branch.
@@ -1202,8 +1217,26 @@ impl LmmWorkspace {
             theta,
             lower,
             upper,
-            dual_scratch: None,
-            hyper_scratch: None,
+        }
+    }
+
+    /// The dense kernel's accumulated sufficient statistics. Panics on a sparse
+    /// workspace, which has none.
+    #[cfg(test)]
+    pub fn suff_mut(&mut self) -> &mut LmmSuffStats {
+        match &mut self.kernel {
+            LmmKernel::Dense { suff, .. } => suff,
+            LmmKernel::Sparse { .. } => panic!("sparse LMM workspace has no suff stats"),
+        }
+    }
+
+    /// The dense kernel's deviance scratch. Panics on a sparse workspace, which
+    /// has none.
+    #[cfg(test)]
+    pub fn fit_mut(&mut self) -> &mut LmmFitScratch {
+        match &mut self.kernel {
+            LmmKernel::Dense { fit, .. } => fit,
+            LmmKernel::Sparse { .. } => panic!("sparse LMM workspace has no fit scratch"),
         }
     }
 }
@@ -1242,11 +1275,8 @@ pub fn primary_lambda<T: Scalar>(theta: &[T], q: usize, lam: &mut [T]) {
 /// a variance component the caller can read. Σ is preserved by construction, so
 /// this changes the coordinate, not the fit.
 ///
-/// Two things depend on it. `Diagnostics::pinned` stops calling a column with a
-/// live off-diagonal a zero variance component; and
-/// [`LmmGroupings::diagonal_has_nonzero_below`] is false at every pinned
-/// diagonal afterwards, which is what makes `boundary_score`'s ½·∂²D/∂θ_jj²
-/// shortcut valid there.
+/// `Diagnostics::pinned` depends on it: without this fold, a column with a
+/// live off-diagonal would be called a zero variance component.
 ///
 /// `theta` is the INTERNAL row-scaled θ̃ = S·θ. No scale map is needed here:
 /// `S·chol(Σ)` is lower triangular with the same zero pattern and squares to
@@ -1263,8 +1293,8 @@ pub(crate) fn canonicalize_pinned_blocks(g: &LmmGroupings, theta: &mut [f64]) ->
         let len = q * (q + 1) / 2;
         // q == 1 has nothing below a diagonal to fold. Past MAX_PRIMARY_Q the
         // stack scratch below would not hold the block; only the sparse route
-        // builds those, and it reports no `boundary_score` at all, so such a
-        // block keeps whatever representative the optimizer stopped at.
+        // builds those, so such a block keeps whatever representative the
+        // optimizer stopped at.
         if (2..=MAX_PRIMARY_Q).contains(&q) && canonicalize_block(&mut theta[start..start + len], q)
         {
             changed = true;
@@ -1742,7 +1772,12 @@ fn fam_forward_solve<T: Scalar>(bt_fam: &mut [T], t_dim: usize, w: usize, fam_a:
 /// or `fit.blocked_p` (crossed/nested-slopes path) must hold the state that
 /// evaluation left. Nothing on the fit path is read back afterwards, so this
 /// moves no reported estimate.
-pub(crate) fn recover_ranef(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch) {
+pub(crate) fn recover_ranef(
+    theta: &[f64],
+    suff: &LmmSuffStats,
+    fit: &mut LmmFitScratch,
+    betas: &[f64],
+) {
     fit.ranef_ok = false;
     let k = suff.groupings.k_total;
     if k == 0 || suff.n_rows == 0 {
@@ -1750,9 +1785,9 @@ pub(crate) fn recover_ranef(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFit
     }
     fit.ranef_u[..k].fill(0.0);
     fit.ranef_ok = if suff.groupings.extra_slopes_any {
-        recover_ranef_blocked(theta, suff, fit)
+        recover_ranef_blocked(theta, suff, fit, betas)
     } else {
-        recover_ranef_family(theta, suff, fit)
+        recover_ranef_family(theta, suff, fit, betas)
     };
 }
 
@@ -1761,7 +1796,12 @@ pub(crate) fn recover_ranef(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFit
 /// fresh factor rather than working in place), so one re-factorization hands
 /// back both halves at once: `L_ZZ` is its leading `k×k` block and `U` its
 /// `[X y]` rows, `U[a][j] = L[(k+j), a]`.
-fn recover_ranef_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> bool {
+fn recover_ranef_blocked(
+    theta: &[f64],
+    suff: &LmmSuffStats,
+    fit: &mut LmmFitScratch,
+    betas: &[f64],
+) -> bool {
     let _ = theta; // Λ is reconstructed by the caller; only the factor is read here
     let g = &suff.groupings;
     let m = suff.m;
@@ -1779,7 +1819,7 @@ fn recover_ranef_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
     for a in 0..k {
         let mut acc = l[(k + p, a)];
         for j in 0..p {
-            acc -= l[(k + j, a)] * fit.betas[j];
+            acc -= l[(k + j, a)] * betas[j];
         }
         u[a] = acc;
     }
@@ -1808,7 +1848,12 @@ fn recover_ranef_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
 /// one representative `A(θ)` and a θ-independent Gram combine, but the per-family
 /// `A_f` it stands in for is exactly what [`assemble_fam_a`] rebuilds, and the
 /// tail it leaves behind is the same downdated tail.
-fn recover_ranef_family(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> bool {
+fn recover_ranef_family(
+    theta: &[f64],
+    suff: &LmmSuffStats,
+    fit: &mut LmmFitScratch,
+    betas: &[f64],
+) -> bool {
     let g = &suff.groupings;
     let m = suff.m;
     let p = m - 1;
@@ -1851,7 +1896,7 @@ fn recover_ranef_family(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScra
         for b in 0..kx {
             let mut acc = l[(kx + p, b)];
             for j in 0..p {
-                acc -= l[(kx + j, b)] * fit.betas[j];
+                acc -= l[(kx + j, b)] * betas[j];
             }
             u_x[b] = acc;
         }
@@ -1909,7 +1954,7 @@ fn recover_ranef_family(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScra
             let col = &bt_fam[r * t_dim..(r + 1) * t_dim];
             let mut acc = col[kx + p];
             for j in 0..p {
-                acc -= col[kx + j] * fit.betas[j];
+                acc -= col[kx + j] * betas[j];
             }
             for (b, &ux) in u_x.iter().enumerate() {
                 acc -= col[b] * ux;
@@ -2121,43 +2166,25 @@ pub fn fit_lmm(
     target_indices: &[u32],
     theta_start: Option<&[f64]>,
 ) -> LmmFit {
-    fit_lmm_impl(ws, target_indices, theta_start, two_stage_enabled())
-}
-
-/// Test-visible wrapper: runs [`fit_lmm`]'s body with the two-stage warm
-/// restart forced on, bypassing the `LMM_TWO_STAGE` env read — the unit test
-/// asserting stage parity never touches the process environment (env
-/// mutation races the parallel test runner).
-#[cfg(test)]
-pub(crate) fn fit_lmm_two_stage(
-    ws: &mut LmmWorkspace,
-    target_indices: &[u32],
-    theta_start: Option<&[f64]>,
-) -> LmmFit {
-    fit_lmm_impl(ws, target_indices, theta_start, true)
-}
-
-fn fit_lmm_impl(
-    ws: &mut LmmWorkspace,
-    target_indices: &[u32],
-    theta_start: Option<&[f64]>,
-    two_stage: bool,
-) -> LmmFit {
     let LmmWorkspace {
-        suff,
-        fit,
+        kernel,
+        recovery,
         solver,
         theta,
         lower,
         upper,
         ..
     } = ws;
-    let p = suff.m - 1;
+    // p is the width the recovery buffers were allocated at.
+    let p = recovery.betas.len();
 
     // Arm the balanced collapse for this dataset's counts (cheap —
     // O(n_primary·w²·t_dim²) once per fit; sets collapse_n_active = 0 on any
-    // unbalanced/slope shape, which keeps the per-family loop).
-    precompute_balanced_collapse(suff, fit);
+    // unbalanced/slope shape, which keeps the per-family loop). The sparse
+    // kernel has no family loop to collapse.
+    if let LmmKernel::Dense { suff, fit } = &mut *kernel {
+        precompute_balanced_collapse(suff, fit);
+    }
 
     // Cold start per fit (no warm-start across sims — would re-import
     // cross-grid-point path dependence). A Some-start is clamped to the
@@ -2176,11 +2203,11 @@ fn fit_lmm_impl(
             // warm start takes the forward map before anything else touches it.
             // THETA_TRUTH_FLOOR then floors the INTERNAL diagonals — the same scale
             // `PIN_THETA` tests, so the two absolute thresholds stay on one axis.
-            let s = suff.groupings.theta_row_scales();
+            let s = kernel.groupings().theta_row_scales();
             for ((t, &v), &sc) in theta.iter_mut().zip(ts).zip(s.iter()) {
                 *t = v * sc;
             }
-            for &i in suff.groupings.diagonal_theta() {
+            for &i in kernel.groupings().diagonal_theta() {
                 theta[i] = theta[i].max(THETA_TRUTH_FLOOR);
             }
         }
@@ -2191,13 +2218,12 @@ fn fit_lmm_impl(
             // lme4/MixedModels unit-diagonal convention — and on the wide-slope
             // grid stratum that start funnels BOBYQA into a second-best optimum
             // in 8/9 cells (regression goldens at validation/goldens/optima/ pin
-            // the correct optimum). Mirrors the sparse GLMM joint seed, which
-            // fixed the same trap earlier (`fit_glmm_sparse`'s θ cold start,
-            // sparse.rs).
+            // the correct optimum). Mirrors the GLMM joint seed
+            // (`glmm::fit_glmm`'s θ cold start), which carries the same rule.
             for t in theta.iter_mut() {
                 *t = 0.0;
             }
-            for &i in suff.groupings.diagonal_theta() {
+            for &i in kernel.groupings().diagonal_theta() {
                 theta[i] = THETA0;
             }
         }
@@ -2205,23 +2231,19 @@ fn fit_lmm_impl(
     let mut counters = crate::counters::EvalCounters::new();
     // mirrors the stage-1 read in glmm/mod.rs — change together.
     let mut finite_evals = 0usize;
-    let out = if two_stage {
-        two_stage_minimize(suff, fit, theta, lower, upper, &mut finite_evals)
-    } else {
-        solver.minimize(
-            |xs| {
-                let d = reml_deviance(xs, suff, fit);
-                if d.is_finite() {
-                    finite_evals += 1;
-                }
-                counters.record_eval(crate::counters::Stage::Two, d);
-                d
-            },
-            theta,
-            lower,
-            upper,
-        )
-    };
+    let out = solver.minimize(
+        |xs| {
+            let d = kernel.deviance(xs);
+            if d.is_finite() {
+                finite_evals += 1;
+            }
+            counters.record_eval(crate::counters::Stage::Two, d);
+            d
+        },
+        theta,
+        lower,
+        upper,
+    );
 
     // Status mapping (the plateau policy): a `MaxFunReached` cap-out reports
     // its finite endpoint with `converged == false` rather than NaN-filling.
@@ -2249,12 +2271,11 @@ fn fit_lmm_impl(
     // Sign canonicalization first (`fix_column_signs`): the box lets a
     // diagonal end negative, so a block column whose diagonal did is negated
     // whole. Σ and the deviance are unchanged, and the pin test then sees
-    // non-negative diagonals. Mirror the three other pin sites — change
-    // together.
+    // non-negative diagonals. Mirror the GLMM pin site — change together.
     if has_endpoint {
-        fix_column_signs(&suff.groupings, theta);
+        fix_column_signs(kernel.groupings(), theta);
     }
-    let diag = suff.groupings.diagonal_theta();
+    let diag = kernel.groupings().diagonal_theta();
     let mut pinned = false;
     let mut pinned_components = 0u64;
     if has_endpoint {
@@ -2275,7 +2296,7 @@ fn fit_lmm_impl(
         // The flags are rebuilt from scratch rather than OR'd. Nothing moves
         // unless a diagonal pinned, so an interior fit stays bit-identical, and
         // the pinned re-eval below runs on the canonicalized θ.
-        if canonicalize_pinned_blocks(&suff.groupings, theta) {
+        if canonicalize_pinned_blocks(kernel.groupings(), theta) {
             pinned = false;
             pinned_components = 0;
             for (k, &ti) in diag.iter().enumerate() {
@@ -2293,9 +2314,12 @@ fn fit_lmm_impl(
     }
 
     // Pin eval at θ̂ — refreshes factor/σ̂² at the accepted-or-capped point
-    // (the shipped path's "pin Cholesky at θ̂" step).
+    // (the shipped path's "pin Cholesky at θ̂" step). Armed first: this is the
+    // evaluation the conditional-mode recovery rides on, and arming keeps the
+    // per-family factors it needs for this call alone.
     let dev = if has_endpoint {
-        reml_deviance(theta, suff, fit)
+        kernel.prepare_recovery();
+        kernel.deviance(theta)
     } else {
         f64::INFINITY
     };
@@ -2319,18 +2343,18 @@ fn fit_lmm_impl(
     // Those two remain the only NaN-fill conditions, and they are what they
     // always were — no honest endpoint at all.
     let (pivot, pivot_col) = if dev.is_finite() {
-        crate::ols::min_pivot_ratio(fit.factor.as_ref(), p)
+        crate::ols::min_pivot_ratio(kernel.factor(), p)
     } else {
         (f64::NAN, 0)
     };
     if !has_endpoint || !dev.is_finite() {
-        fit.ranef_ok = false;
-        for v in fit.betas.iter_mut() {
+        kernel.invalidate_recovery();
+        for v in recovery.betas.iter_mut() {
             *v = f64::NAN;
         }
         for &t in target_indices {
-            fit.var_diag[t as usize] = f64::NAN;
-            fit.t_sq[t as usize] = f64::NAN;
+            recovery.var_diag[t as usize] = f64::NAN;
+            recovery.t_sq[t as usize] = f64::NAN;
         }
         return LmmFit {
             sigma_sq: f64::NAN,
@@ -2349,35 +2373,36 @@ fn fit_lmm_impl(
 
     // β̂: backward solve L_XXᵀ β̂ = l_yX, where l_yX[j] = factor[(p, j)] (the
     // y-row of the augmented factor) — the once-at-θ̂ backsolve.
+    let factor = kernel.factor();
     for j in (0..p).rev() {
-        let mut acc = fit.factor[(p, j)];
+        let mut acc = factor[(p, j)];
         for k in (j + 1)..p {
-            acc -= fit.factor[(k, j)] * fit.betas[k];
+            acc -= factor[(k, j)] * recovery.betas[k];
         }
-        fit.betas[j] = acc / fit.factor[(j, j)];
+        recovery.betas[j] = acc / factor[(j, j)];
     }
 
     // Var(β̂_j) = σ̂²·‖L_XX⁻¹e_j‖² per target; t² = β̂²/Var, via a forward
     // solve on this factor.
-    let sigma_sq = fit.sigma_sq;
+    let sigma_sq = kernel.sigma_sq();
     for &tj in target_indices {
         let tj = tj as usize;
-        for v in fit.u[..p].iter_mut() {
+        for v in recovery.u[..p].iter_mut() {
             *v = 0.0;
         }
         for i in 0..p {
             let b_i = if i == tj { 1.0 } else { 0.0 };
             let mut acc = b_i;
             for k in 0..i {
-                acc -= fit.factor[(i, k)] * fit.u[k];
+                acc -= factor[(i, k)] * recovery.u[k];
             }
-            fit.u[i] = acc / fit.factor[(i, i)];
+            recovery.u[i] = acc / factor[(i, i)];
         }
-        let norm_sq: f64 = fit.u[..p].iter().map(|v| v * v).sum();
+        let norm_sq: f64 = recovery.u[..p].iter().map(|v| v * v).sum();
         let vd = sigma_sq * norm_sq;
-        fit.var_diag[tj] = vd;
-        fit.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
-            (fit.betas[tj] * fit.betas[tj]) / vd
+        recovery.var_diag[tj] = vd;
+        recovery.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
+            (recovery.betas[tj] * recovery.betas[tj]) / vd
         } else {
             f64::NAN
         };
@@ -2386,7 +2411,7 @@ fn fit_lmm_impl(
     // Joint Wald-χ² over the target set — the shared `joint_wald_chi_sq` helper
     // (`pub(crate)`). It re-Choleskys X'V⁻¹X internally, so hand it the product
     // the augmented factor already encodes: X'V⁻¹X = L_XX·L_XXᵀ (leading p×p
-    // of fit.factor; the y row is index p).
+    // of the augmented factor; the y row is index p).
     let joint_t_sq = if target_indices.is_empty() {
         f64::NAN
     } else {
@@ -2394,26 +2419,26 @@ fn fit_lmm_impl(
             for i in 0..p {
                 let mut acc = 0.0;
                 for k in 0..=i.min(j) {
-                    acc += fit.factor[(i, k)] * fit.factor[(j, k)];
+                    acc += factor[(i, k)] * factor[(j, k)];
                 }
-                fit.joint_xtvix[(i, j)] = acc;
+                recovery.joint_xtvix[(i, j)] = acc;
             }
         }
         joint_wald_chi_sq(
-            fit.joint_xtvix.as_ref(),
-            &fit.betas,
+            recovery.joint_xtvix.as_ref(),
+            &recovery.betas,
             sigma_sq,
             target_indices,
-            fit.joint_k_inv.as_mut(),
-            fit.joint_sigma_t_chol.as_mut(),
-            &mut fit.joint_rhs,
+            recovery.joint_k_inv.as_mut(),
+            recovery.joint_sigma_t_chol.as_mut(),
+            &mut recovery.joint_rhs,
         )
     };
 
-    // Conditional modes, last: it reads β̂ and reuses `fit.tail`/`fit.bt`/
-    // `fit.fam_a` as scratch, so it must come after every step that reads the
-    // factor state the θ̂ evaluation left.
-    recover_ranef(theta, suff, fit);
+    // Conditional modes, last: it reads β̂ and reuses the evaluation's own
+    // scratch, so it must come after every step that reads the factor state the
+    // θ̂ evaluation left.
+    kernel.recover_ranef(theta, &recovery.betas);
 
     LmmFit {
         sigma_sq,

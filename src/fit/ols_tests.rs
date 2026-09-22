@@ -1,9 +1,10 @@
 //! OLS estimator tests (`Family::Gaussian`, `re: None`).
 
+use super::common_tests::weighted_collinear_ols_fixture;
 use super::ols::{fit_ols, fit_ols_prebuilt, ols_view_to_fit, OlsWorkspace};
 use super::*;
 use crate::test_support::assert_near;
-use crate::{Family, GroupIds, ModelSpec};
+use crate::{BinomialLink, Family, GroupIds, ModelSpec};
 
 /// A small fixed OLS dataset (n=20, p=3: intercept + two predictors) used by the
 /// workspace-reuse gate. Deterministic, no RNG.
@@ -288,28 +289,7 @@ fn fit_ols_constant_weights_invariant() {
 /// the number is worthless.
 #[test]
 fn fit_ols_weighted_collinear_fits_with_an_honest_se() {
-    let n = 60;
-    let p = 3;
-    // Rows at or above `split` carry a negligible weight. 1e-11 is the value
-    // that puts the WEIGHTED pivot at 2.0e-13 — inside the flagging band, and
-    // still comfortably positive-definite so faer's Cholesky accepts it and the
-    // fit is actually produced. A smaller weight makes X'WX numerically
-    // indefinite and the route refuses on `llt` instead, which tests a
-    // different path.
-    let split = 40;
-    const WSMALL: f64 = 1e-11;
-    let mut x = Vec::with_capacity(n * p);
-    let mut y = Vec::with_capacity(n);
-    let mut w = Vec::with_capacity(n);
-    for i in 0..n {
-        let a = ((i * 13) % 17) as f64 - 8.0;
-        // `delta` is what separates the two predictor columns, and it lives
-        // ENTIRELY on the negligibly-weighted rows.
-        let delta = if i < split { 0.0 } else { 1.0 };
-        x.extend_from_slice(&[1.0, a, a + delta]);
-        y.push(0.5 + 1.3 * a + 0.477 * (a + delta) + ((i % 3) as f64 - 1.0));
-        w.push(if i < split { 1.0 } else { WSMALL });
-    }
+    let (x, y, w, n, p) = weighted_collinear_ols_fixture();
     let opts = FitOptions {
         target_indices: vec![0, 1, 2],
         weights: Some(w),
@@ -364,6 +344,83 @@ fn fit_ols_weighted_collinear_fits_with_an_honest_se() {
             "β[{j}] = {} must carry an SE orders above it, got {}",
             f.beta[j],
             f.se[j]
+        );
+    }
+}
+
+/// Fixed-only (`re: None`) counterpart to `fit_glmm_degenerate_width_never_panics`
+/// (`src/fit/common_tests.rs`): that test covers the mixed route's own `p == 0`
+/// short-circuit, but `re: None` takes a completely separate one in `fit_ols`
+/// and `fit_glm`, so a regression there is invisible to it. Covers `p == 0`,
+/// `n == p`, `n == 0`, and an all-zero column, for the OLS route
+/// (`Family::Gaussian`) and one GLM route (`Family::Binomial { link: Logit }`).
+#[test]
+fn fit_fixed_degenerate_width_never_panics() {
+    let families = [
+        Family::Gaussian,
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+    ];
+    for family in families {
+        let model = ModelSpec { family, re: None };
+        let ids = GroupIds::default();
+
+        // p == 0.
+        let n = 4;
+        let fit = fit_cold(
+            &[],
+            &vec![1.0f64; n],
+            n,
+            0,
+            &model,
+            &ids,
+            &FitOptions::default(),
+        );
+        assert!(
+            !fit.converged(),
+            "{family:?} p=0: degenerate fit does not report converged"
+        );
+
+        // n == 0, p == 1.
+        let fit = fit_cold(&[], &[], 0, 1, &model, &ids, &FitOptions::default());
+        assert!(
+            !fit.converged(),
+            "{family:?} n=0: degenerate fit does not report converged"
+        );
+
+        // n == p: four independent columns (lower-triangular ones) on four
+        // rows. The `n <= p` guard fires before rank is ever examined, so
+        // even this full-rank design comes back NaN rather than fitted.
+        let (n, p) = (4, 4);
+        let x: Vec<f64> = (0..n * p)
+            .map(|t| if t % p <= t / p { 1.0 } else { 0.0 })
+            .collect();
+        let fit = fit_cold(
+            &x,
+            &vec![1.0f64; n],
+            n,
+            p,
+            &model,
+            &ids,
+            &FitOptions::default(),
+        );
+        assert!(
+            !fit.converged() && fit.beta.iter().all(|b| b.is_nan()),
+            "{family:?} n == p: degenerate fit is NaN and does not report converged"
+        );
+
+        // p == 1 with the one fixed column all zero. A mixed 0/1 response
+        // (rather than a constant one) keeps binomial off its OWN all-0/all-1
+        // short-circuit, so this exercises the shared zero-column path (X'WX
+        // singular, Cholesky refuses) instead.
+        let n = 4;
+        let x = vec![0.0f64; n];
+        let y = vec![1.0, 0.0, 1.0, 0.0];
+        let fit = fit_cold(&x, &y, n, 1, &model, &ids, &FitOptions::default());
+        assert!(
+            !fit.converged() && fit.beta.iter().all(|b| b.is_nan()),
+            "{family:?} all-zero column: degenerate fit does not report converged"
         );
     }
 }

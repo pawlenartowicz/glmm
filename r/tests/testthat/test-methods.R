@@ -49,9 +49,15 @@ test_that("the Gamma() link trap: object honored, string means log", {
   fit_obj <- fastglmm(y ~ x, d, family = Gamma()) # R's default: inverse
   expect_equal(fit_obj$family$link, "inverse")
   ref <- glm(y ~ x, data = d, family = Gamma(link = "log"))
-  expect_equal(unname(fixef(fit_str)), unname(coef(ref)), tolerance = 1e-5)
+  expect_equal(unname(fixef(fit_str)), unname(coef(ref)), tolerance = 1e-5,
+               info = "gamma log-link vs glm")
   # sigma() for gamma is sqrt(phi), phi the Pearson dispersion.
   expect_equal(sigma(fit_str)^2, summary(ref)$dispersion, tolerance = 1e-5)
+  # The other half of the trap: fit_obj used the inverse link, so its
+  # coefficients must match glm() on the inverse link, not the log one.
+  ref_inv <- glm(y ~ x, data = d, family = Gamma(link = "inverse"))
+  expect_equal(unname(fixef(fit_obj)), unname(coef(ref_inv)), tolerance = 1e-5,
+               info = "gamma inverse-link vs glm")
 })
 
 test_that("sigma for inverse-Gaussian is sqrt(phi), phi the Pearson dispersion", {
@@ -98,6 +104,17 @@ test_that("gaussian LMM sigma matches lme4 and VarCorr prints a Residual row", {
   vc <- VarCorr(fit)
   expect_equal(attr(vc, "sc"), sigma(fit))
   expect_match(paste(capture.output(print(vc)), collapse = "\n"), "Residual")
+})
+
+test_that("VarCorr omits the Residual row on a non-gaussian mixed fit", {
+  d <- benchmark_data(seed = 116, family = "binomial")
+  fit <- fastglmm(y ~ t + (1 | g), d, family = binomial())
+  vc <- VarCorr(fit)
+  # phi==1 families carry no free residual scale (see VarCorr.fastglmm), so
+  # the sc attribute is NA and print.VarCorr.fastglmm's is.finite(sc) guard
+  # must take its false branch.
+  expect_true(is.na(attr(vc, "sc")))
+  expect_false(grepl("Residual", paste(capture.output(print(vc)), collapse = "\n")))
 })
 
 test_that("accessors: nobs, formula string, family, model.frame, isSingular", {
@@ -150,6 +167,22 @@ test_that("summary on a gaussian LMM prints the REML criterion, not AIC", {
   # Scaled residuals are (y - mu) / sigma, quantiles type 7.
   r <- (fit$y - fitted(fit)) / sigma(fit)
   expect_equal(unname(s$scaled_residuals), unname(quantile(r, c(0, .25, .5, .75, 1))))
+})
+
+test_that("print and summary on a non-mixed fit skip the random-effects block", {
+  set.seed(115)
+  d <- data.frame(x = rnorm(50))
+  d$y <- 1 + 2 * d$x + rnorm(50, sd = 0.5)
+  fit <- fastglmm(y ~ x, d)
+  out <- capture.output(print(fit))
+  expect_true(any(grepl("Number of obs: 50", out, fixed = TRUE)))
+  expect_false(any(grepl("Random effects:", out, fixed = TRUE)))
+  expect_false(any(grepl("groups:", out, fixed = TRUE)))
+
+  sout <- paste(capture.output(print(summary(fit))), collapse = "\n")
+  expect_true(grepl("Number of obs: 50", sout, fixed = TRUE))
+  expect_false(grepl("Random effects:", sout, fixed = TRUE))
+  expect_false(grepl("groups:", sout, fixed = TRUE))
 })
 
 test_that("summary carries the correlation of fixed effects off vcov", {
@@ -228,10 +261,10 @@ test_that("ranef and fitted return lme4-shaped values on a Gaussian LMM", {
 test_that("boundary fits warn with lme4's text plus the pinned component", {
   # tau0 = 0 data: the RE variance pins to the boundary.
   d <- benchmark_data(seed = 107, family = "binomial", tau0 = 1e-8)
-  expect_warning(fit <- fastglmm(y ~ t + (1 | g), d, family = binomial()),
-                 paste0("boundary \\(singular\\) fit: see help\\('isSingular'\\); ",
-                        "sd\\(\\(Intercept\\) \\| g\\) pinned at the variance boundary"))
-  expect_true(isSingular(fit))
+  expect_pinned_boundary_fit(
+    function() fastglmm(y ~ t + (1 | g), d, family = binomial()),
+    "sd\\(\\(Intercept\\) \\| g\\)"
+  )
 })
 
 test_that("diagnostics is additive: the top-level names keep working", {
@@ -277,10 +310,10 @@ test_that("a q >= 2 pin is named even though its stddev is not zero", {
   d <- data.frame(y = 0.5 + 0.4 * x + u0[rows$c + 1L] + e, x = x,
                   g = factor(paste0("g", rows$c)))
 
-  expect_warning(fit <- fastglmm(y ~ x + (1 + x | g), d),
-                 paste0("boundary \\(singular\\) fit: see help\\('isSingular'\\); ",
-                        "sd\\(x \\| g\\) pinned at the variance boundary"))
-  expect_true(isSingular(fit))
+  fit <- expect_pinned_boundary_fit(
+    function() fastglmm(y ~ x + (1 + x | g), d),
+    "sd\\(x \\| g\\)"
+  )
   expect_equal(fit$diagnostics$boundary, "at_boundary")
   # The SLOPE component is the pinned one, aligned with the varcorr block.
   expect_equal(fit$diagnostics$pinned, list(c(FALSE, TRUE)))
@@ -314,9 +347,10 @@ test_that("a pin is named on a sparse-route fit too", {
     x = x, g = factor(paste0("g", g)), h = factor(paste0("h", h))
   )
 
-  expect_warning(fit <- fastglmm(y ~ x + (1 | g) + (1 + x | h), d),
-                 "sd\\(\\(Intercept\\) \\| g\\) pinned at the variance boundary")
-  expect_true(isSingular(fit))
+  fit <- expect_pinned_boundary_fit(
+    function() fastglmm(y ~ x + (1 | g) + (1 + x | h), d),
+    "sd\\(\\(Intercept\\) \\| g\\)"
+  )
   expect_equal(fit$diagnostics$pinned, list(TRUE, c(FALSE, FALSE)))
   # One flag per stddev, per block - the alignment .pinned_detail walks.
   for (nm in names(VarCorr(fit))) {
@@ -368,22 +402,50 @@ test_that("an ill-conditioned design warns with its own condition class", {
   expect_length(clean$diagnostics$notes, 0L)
 })
 
-test_that("pirls_exhausted message distinguishes the final re-evaluation", {
-  # No known dataset reaches final_eval=TRUE end-to-end, so both message
-  # branches are asserted from constructed notes; the Rust-side test
+test_that("unused_grouping_levels message names the empty levels", {
+  # No fixture here drives the note through a real fit (that path is the
+  # formula lowering, not the solver); asserted from a constructed note, like
+  # re_design_scale_spread and hessian_se_fallback below.
+  note <- list(kind = "unused_grouping_levels", columns = integer(0), pivot = NaN,
+               evals = 0L, final_eval = FALSE, detail = "g3, g7")
+  cond <- note_condition(note)
+  expect_s3_class(cond, "fastglmm_unused_grouping_levels")
+  expect_s3_class(cond, "fastglmm_diagnostic")
+  expect_match(conditionMessage(cond), "g3, g7")
+  expect_match(conditionMessage(cond), "droplevels\\(\\)")
+})
+
+test_that("pirls_exhausted message distinguishes the four cases", {
+  # This package's test fixtures do not reach final_eval=TRUE or a
+  # non-converged exhausted fit end-to-end, so all four message branches are
+  # asserted from constructed notes; the Rust-side test
   # pirls_exhausted_payload_survives_flattening pins the payload itself.
   note <- list(kind = "pirls_exhausted", columns = integer(0), pivot = NaN,
                evals = 3L, final_eval = FALSE, detail = "")
-  benign <- tryCatch(fastglmm:::.warn_note(note, character(0)),
-                     warning = identity)
+  benign <- note_condition(note)
   expect_s3_class(benign, "fastglmm_pirls_exhausted")
   expect_match(conditionMessage(benign),
                "observation-only and no fitted number is affected")
 
+  not_converged <- tryCatch(
+    fastglmm:::.warn_note(note, character(0), FALSE, c(1.5, -2), c(FALSE, FALSE)),
+    warning = identity)
+  expect_s3_class(not_converged, "fastglmm_pirls_exhausted")
+  expect_match(conditionMessage(not_converged),
+               "the search ran out of its evaluation budget")
+  expect_match(conditionMessage(not_converged),
+               "the variance components are not reported")
+
+  failed <- tryCatch(
+    fastglmm:::.warn_note(note, character(0), FALSE, c(NaN, NaN), c(FALSE, FALSE)),
+    warning = identity)
+  expect_s3_class(failed, "fastglmm_pirls_exhausted")
+  expect_match(conditionMessage(failed), "the fit failed")
+  expect_match(conditionMessage(failed), "No estimate is reported")
+
   note$evals <- 0L
   note$final_eval <- TRUE
-  serious <- tryCatch(fastglmm:::.warn_note(note, character(0)),
-                      warning = identity)
+  serious <- note_condition(note)
   expect_s3_class(serious, "fastglmm_pirls_exhausted")
   expect_match(conditionMessage(serious),
                "the reported estimates rest on that truncated solve")
@@ -396,8 +458,7 @@ test_that("re_design_scale_spread message names the grouping and ratio", {
   # so the message is asserted from a constructed note.
   note <- list(kind = "re_design_scale_spread", columns = integer(0), pivot = NaN,
                evals = 0L, final_eval = FALSE, detail = "g", ratio = 4200.0)
-  cond <- tryCatch(fastglmm:::.warn_note(note, character(0)),
-                   warning = identity)
+  cond <- note_condition(note)
   expect_s3_class(cond, "fastglmm_re_design_scale_spread")
   expect_match(conditionMessage(cond), "grouping 'g'")
   expect_match(conditionMessage(cond), "4.2e\\+03")
@@ -407,8 +468,7 @@ test_that("re_design_scale_spread message names the grouping and ratio", {
 test_that("hessian_se_fallback message", {
   note <- list(kind = "hessian_se_fallback", columns = integer(0), pivot = NaN,
                evals = 0L, final_eval = FALSE, detail = "", ratio = NaN)
-  cond <- tryCatch(fastglmm:::.warn_note(note, character(0)),
-                   warning = identity)
+  cond <- note_condition(note)
   expect_s3_class(cond, "fastglmm_hessian_se_fallback")
   expect_match(conditionMessage(cond), "not positive definite")
   expect_match(conditionMessage(cond), "stddev_se is NaN")
@@ -490,4 +550,16 @@ test_that("warm start (lme4's start=) is accepted and unknown parts warn", {
              start = list(beta = unname(fixef(cold)), theta = 0.7, bogus = 1)),
     "start elements ignored: bogus"
   )
+})
+
+test_that("wald.se = \"rx\" is marshalled through to the kernel", {
+  # Same beta either way (both are Wald SE methods on the same fit); the SEs
+  # themselves must differ, or the option never reached the kernel.
+  d <- benchmark_data(seed = 114, family = "binomial")
+  fit_hessian <- fastglmm(y ~ t + (1 | g), d, family = binomial())
+  fit_rx <- fastglmm(y ~ t + (1 | g), d, family = binomial(), wald.se = "rx")
+  expect_true(fit_rx$converged)
+  expect_true(all(is.finite(fit_rx$se)))
+  expect_equal(unname(fixef(fit_rx)), unname(fixef(fit_hessian)), tolerance = 1e-8)
+  expect_false(isTRUE(all.equal(unname(fit_rx$se), unname(fit_hessian$se))))
 })

@@ -14,13 +14,39 @@ use faer::linalg::solvers::Solve;
 // AsMatMut: gives as_mat_mut() → MatMut<'_, T>; as_mut() gives &mut Mat, wrong type.
 use faer::mat::AsMatMut;
 
-use crate::fit::common_tests::assert_pinned;
+use crate::fit::common_tests::{
+    assert_pinned, inf_plateau_exp1, inf_plateau_lcg_next, inf_plateau_normal, inf_plateau_poisson,
+    lcg,
+};
+// Only `fit_sparse_gamma_glmm_weighted_matches_lme4` (oracle-tests-gated) reads this.
+#[cfg(feature = "oracle-tests")]
+use crate::fit::common_tests::PIN_REL_ITER;
 use crate::{Family, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing};
 
 /// One extra grouping's per-row level ids, packed as the `extra_ids` shape
-/// (`&[Vec<u32>]`) `fit_mle_sparse` expects.
+/// (`&[Vec<u32>]`) the fit entry points expect.
 fn cr_as_extra(cr: &[u32]) -> Vec<Vec<u32>> {
     vec![cr.to_vec()]
+}
+
+// Test-only override: force the sparse-tail branch for small-e fixtures so the
+// dense↔sparse equality tests exercise the sparse factor at their existing
+// tolerances. Thread-local (each #[test] runs on its own thread), read once in
+// `SparseLmmWorkspace::new` — the branch is a construction-time decision.
+thread_local! {
+    pub(super) static FORCE_SPARSE_TAIL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+// Test-only override for the family-downdate route (`FamDowndate`), mirroring
+// `FORCE_SPARSE_TAIL` above: `Some(true)` forces the dense accumulator (still
+// subject to the memory cap), `Some(false)` the scatter, `None` leaves
+// `DD_DENSE_BETA` in charge. Exists so one fixture can be fit both ways and the
+// two answers compared; the production rule keeps no fallback of its own, so
+// neither arm is dead code kept as an oracle.
+thread_local! {
+    pub(super) static FORCE_DD_ROUTE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Run `f` with the sparse-tail branch forced on (workspaces built inside
@@ -28,13 +54,13 @@ fn cr_as_extra(cr: &[u32]) -> Vec<Vec<u32>> {
 /// the flag before returning; each #[test] has its own thread, so a
 /// panicked test cannot leak the flag into another.
 fn with_forced_sparse_tail<T>(f: impl FnOnce() -> T) -> T {
-    super::FORCE_SPARSE_TAIL.with(|c| c.set(true));
+    FORCE_SPARSE_TAIL.with(|c| c.set(true));
     let out = f();
-    super::FORCE_SPARSE_TAIL.with(|c| c.set(false));
+    FORCE_SPARSE_TAIL.with(|c| c.set(false));
     out
 }
 
-/// fit_mle_sparse on an in-envelope crossed LMM matches the NoZ fit_mle on
+/// The sparse kernel on an in-envelope crossed LMM matches the NoZ fit on
 /// β, varcomp, and SE — the superset property. This is the
 /// unit-level seed of the both-paths cross-check harness.
 #[test]
@@ -48,12 +74,12 @@ fn fit_mle_sparse_matches_noz_in_envelope() {
     let mut cr = vec![0u32; n];
     let mut st = 5u64;
     for i in 0..n {
-        let cov = super::test_lcg(&mut st);
+        let cov = lcg(&mut st);
         xflat[i * p] = 1.0;
         xflat[i * p + 1] = cov;
         cl[i] = (i % 4) as u32;
         cr[i] = (i % 3) as u32;
-        y[i] = 1.0 + 0.5 * cov + super::test_lcg(&mut st);
+        y[i] = 1.0 + 0.5 * cov + lcg(&mut st);
     }
     let model = ModelSpec {
         family: Family::Gaussian,
@@ -79,7 +105,7 @@ fn fit_mle_sparse_matches_noz_in_envelope() {
                                                                       // Force the sparse path directly (bypassing classify_design's NoZ route).
     let x = Mat::<f64>::from_fn(n, p, |i, j| xflat[i * p + j]);
     let (sized, _ids, _perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
-    let sp = super::fit_mle_sparse(
+    let sp = crate::fit::fit_mle_sparse_pub(
         &xflat,
         &y,
         n,
@@ -149,10 +175,10 @@ fn run_nested_route_matches_forced_crossed_sparse() {
     let mut padded = vec![0u32; n];
     let mut st = 11u64;
     let parent_eff = [0.8, -0.3, 0.1];
-    let child_eff: Vec<f64> = (0..8).map(|_| 0.5 * super::test_lcg(&mut st)).collect();
+    let child_eff: Vec<f64> = (0..8).map(|_| 0.5 * lcg(&mut st)).collect();
     for i in 0..n {
         let c = (i % 8) as u32;
-        let cov = super::test_lcg(&mut st);
+        let cov = lcg(&mut st);
         xflat[i * p] = 1.0;
         xflat[i * p + 1] = cov;
         cl[i] = parent_of_child[c as usize];
@@ -162,7 +188,7 @@ fn run_nested_route_matches_forced_crossed_sparse() {
             + 0.5 * cov
             + parent_eff[cl[i] as usize]
             + child_eff[c as usize]
-            + 0.3 * super::test_lcg(&mut st);
+            + 0.3 * lcg(&mut st);
     }
     let spec = |relation: GroupingRelation| ModelSpec {
         family: Family::Gaussian,
@@ -198,7 +224,7 @@ fn run_nested_route_matches_forced_crossed_sparse() {
     // sized spec describes.
     let (sized, crossed_ids, _perm) =
         crate::fit::spec_sized_from_ids_pub(&crossed_model, &crossed_ids);
-    let sp = super::fit_mle_sparse(
+    let sp = crate::fit::fit_mle_sparse_pub(
         &xflat,
         &y,
         n,
@@ -250,7 +276,7 @@ fn sparse_over_32_components_no_overflow() {
         .collect();
     let primary: Vec<u32> = (0..n).map(|i| (i % 4) as u32).collect();
     for yi in y.iter_mut() {
-        *yi = 1.0 + 0.5 * super::test_lcg(&mut st);
+        *yi = 1.0 + 0.5 * lcg(&mut st);
     }
 
     let model = ModelSpec {
@@ -330,7 +356,9 @@ fn sparse_over_32_components_no_overflow() {
 
 /// Spike: prove the faer 0.24 sparse-LLT call sequence + logdet-off-the-CSC
 /// convention on a hand-checked 3×3 SPD matrix. Locks the API the whole
-/// sparse path is built on. det(A)=18 ⇒ logdet=ln 18.
+/// sparse path is built on. det(A)=18 ⇒ logdet=ln 18. Closes with the
+/// simplicial arm's non-PD `+INFINITY` sentinel, the twin of the one in
+/// `sparse_llt_supernodal_logdet`.
 #[test]
 fn sparse_llt_spike_logdet_and_solve() {
     let n = 3usize;
@@ -405,6 +433,24 @@ fn sparse_llt_spike_logdet_and_solve() {
             rhs[(i, 0)]
         );
     }
+
+    // Non-PD sentinel, simplicial arm: zero ONE stored diagonal — the last
+    // factor column's, so two healthy columns are read first. Zeroing the whole
+    // value buffer would also return +∞ through the scan's not-found `NAN`
+    // default, and so would pass even if the CSC diagonal scan found nothing;
+    // one zeroed entry can only be seen by a scan that resolves that entry.
+    let simp = match symbolic.raw() {
+        faer::sparse::linalg::cholesky::SymbolicCholeskyRaw::Simplicial(s) => s,
+        _ => panic!("FORCE_SIMPLICIAL produced a supernodal symbolic factor"),
+    };
+    let (col_ptr, row_idx) = (simp.col_ptr(), simp.row_idx());
+    let last = n - 1;
+    let slot = (col_ptr[last]..col_ptr[last + 1])
+        .find(|&k| row_idx[k] == last)
+        .expect("L's last column stores its own diagonal");
+    let mut zeroed = l_values.clone();
+    zeroed[slot] = 0.0;
+    assert_eq!(logdet_llt(&symbolic, &zeroed), f64::INFINITY);
 }
 
 /// `logdet_llt`'s supernodal arm on the spike test's fixture: same 3×3 SPD
@@ -471,6 +517,27 @@ fn sparse_llt_supernodal_logdet() {
     assert_eq!(logdet_llt(&symbolic, &zeros), f64::INFINITY);
 }
 
+/// Explicit sparse design `Z` (`n × k_total`) in `for_each_z_entry`'s column
+/// layout. Test-only since the blocked kernel: production accumulates the
+/// Grams per row without materializing Z; the layout tests densify this to
+/// pin the column convention.
+pub(crate) fn build_sparse_z(
+    g: &LmmGroupings,
+    x: MatRef<f64>,
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    n: usize,
+) -> SparseColMat<usize, f64> {
+    let mut trips: Vec<Triplet<usize, usize, f64>> =
+        Vec::with_capacity(n * (g.primary_q + extra_ids.len()));
+    for i in 0..n {
+        for_each_z_entry(g, x, cluster_ids, extra_ids, i, None, |col, v| {
+            trips.push(Triplet::new(i, col, v));
+        });
+    }
+    SparseColMat::try_new_from_triplets(n, g.k_total, &trips).expect("Z triplets well-formed")
+}
+
 /// Blocked-kernel logdet oracle: `sparse_schur_factor`'s log|L_ZZ|² at an
 /// identity-Λ θ (all scalar components 1.0) matches the dense
 /// `logdet(Z'Z + I)` — the θ=identity-Λ case, where A = Z'Z + I exactly.
@@ -495,7 +562,7 @@ fn blocked_logdet_matches_dense_ztz_plus_i() {
         }),
     };
     let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[vec![]]);
-    let z = super::build_sparse_z(&g, x.as_ref(), &cluster_ids, &extra_ids, n);
+    let z = build_sparse_z(&g, x.as_ref(), &cluster_ids, &extra_ids, n);
 
     let mut ws =
         super::SparseLmmWorkspace::new(&g, x.as_ref(), &cluster_ids, &extra_ids, &y, n, p, None);
@@ -548,7 +615,7 @@ fn sparse_z_matches_dense_crossed_intercept() {
         }),
     };
     let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[vec![]]);
-    let z = super::build_sparse_z(&g, x.as_ref(), &cluster_ids, &extra_ids, n);
+    let z = build_sparse_z(&g, x.as_ref(), &cluster_ids, &extra_ids, n);
 
     assert_eq!(z.nrows(), n);
     assert_eq!(z.ncols(), g.k_total);
@@ -598,12 +665,12 @@ fn run_sparse_deviance_equals_dense_crossed() {
     let mut cr = vec![0u32; n];
     let mut st = 11u64;
     for i in 0..n {
-        let cov = super::test_lcg(&mut st);
+        let cov = lcg(&mut st);
         x[(i, 0)] = 1.0;
         x[(i, 1)] = cov;
         cl[i] = (i % 2) as u32;
         cr[i] = (i % 3) as u32;
-        y[i] = 1.0 + 0.5 * cov + super::test_lcg(&mut st);
+        y[i] = 1.0 + 0.5 * cov + lcg(&mut st);
     }
     let extra_ids = vec![cr.clone()];
     let model = ModelSpec {
@@ -665,7 +732,7 @@ fn sparse_deviance_equals_dense_primary_slope_balanced_zero() {
         x[(i, 0)] = 1.0;
         x[(i, 1)] = slope_cov;
         cl[i] = (i / 4) as u32;
-        y[i] = 0.5 + 0.3 * slope_cov + super::test_lcg(&mut st);
+        y[i] = 0.5 + 0.3 * slope_cov + lcg(&mut st);
     }
     let extra_ids: Vec<Vec<u32>> = vec![]; // no extra groupings
     let model = ModelSpec {
@@ -682,7 +749,7 @@ fn sparse_deviance_equals_dense_primary_slope_balanced_zero() {
 
     // Confirm the target cross-Gram entry is EXACTLY 0.0 (would be dropped
     // under old numeric seeding): intercept col f vs slope col n_prim+f.
-    let z = super::build_sparse_z(&g, x.as_ref(), &cl, &extra_ids, n);
+    let z = build_sparse_z(&g, x.as_ref(), &cl, &extra_ids, n);
     let ztz = z.to_dense().transpose() * &z.to_dense();
     let n_prim = g.n_primary;
     for f in 0..n_prim {
@@ -731,7 +798,7 @@ fn sparse_tail_pattern_two_family_cliques_unobserved_level() {
     let mut y = vec![0.0f64; n];
     let mut st = 23u64;
     for v in y.iter_mut() {
-        *v = 1.0 + super::test_lcg(&mut st);
+        *v = 1.0 + lcg(&mut st);
     }
     // 3 replicates of each (family, crossed) incidence pair.
     let cl: Vec<u32> = vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1];
@@ -784,9 +851,9 @@ fn sparse_tail_pattern_two_family_cliques_unobserved_level() {
         target_indices: vec![0],
         ..crate::FitOptions::default()
     };
-    let fd = super::fit_mle_sparse(&xflat, &y, n, p, &model, &cl, &extra_ids, None, &opts);
+    let fd = crate::fit::fit_mle_sparse_pub(&xflat, &y, n, p, &model, &cl, &extra_ids, None, &opts);
     let fs = with_forced_sparse_tail(|| {
-        super::fit_mle_sparse(&xflat, &y, n, p, &model, &cl, &extra_ids, None, &opts)
+        crate::fit::fit_mle_sparse_pub(&xflat, &y, n, p, &model, &cl, &extra_ids, None, &opts)
     });
     assert!(fd.converged() && fs.converged());
     assert!(
@@ -817,12 +884,12 @@ fn sparse_tail_natural_over_cutover_matches_noz() {
     let mut cr = vec![0u32; n];
     let mut st = 31u64;
     for i in 0..n {
-        let cov = super::test_lcg(&mut st);
+        let cov = lcg(&mut st);
         xflat[i * p] = 1.0;
         xflat[i * p + 1] = cov;
         cl[i] = (i % 4) as u32;
         cr[i] = (i as u32) % e_levels;
-        y[i] = 1.0 + 0.5 * cov + super::test_lcg(&mut st);
+        y[i] = 1.0 + 0.5 * cov + lcg(&mut st);
     }
     let model = ModelSpec {
         family: Family::Gaussian,
@@ -860,7 +927,7 @@ fn sparse_tail_natural_over_cutover_matches_noz() {
             super::SparseLmmWorkspace::new(&g, x.as_ref(), &cl, &cr_as_extra(&cr), &y, n, p, None);
         assert!(ws.tail.is_some(), "e=150 routes sparse naturally");
     }
-    let sp = super::fit_mle_sparse(
+    let sp = crate::fit::fit_mle_sparse_pub(
         &xflat,
         &y,
         n,
@@ -905,7 +972,7 @@ fn sparse_tail_natural_over_cutover_matches_noz() {
 /// Deterministic builder for one RE-topology case in the cross-check table.
 /// Returns `(xflat, y, n, p, model, ids, opts)`. All designs are
 /// in-envelope (q_p ≤ 8, extras ≤ 6, q_g ≤ 4) so `fit_cold` routes to NoZ
-/// and `fit_mle_sparse` is a valid superset. `test_lcg` seeds are chosen
+/// and the sparse kernel is a valid superset. `lcg` seeds are chosen
 /// unique per case so the designs are independent deterministic instances.
 /// Shared LCG covariate/response/primary-id fill for `build_case`'s five
 /// n=24, p=2 topology cases: column 0 = intercept, column 1 = LCG
@@ -922,11 +989,11 @@ fn build_case_fill(seed: u64, n_primary: u32, c0: f64, c1: f64) -> (Vec<f64>, Ve
     let mut pid = vec![0u32; n];
     let mut st = seed;
     for i in 0..n {
-        let cov = super::test_lcg(&mut st);
+        let cov = lcg(&mut st);
         xflat[i * p] = 1.0;
         xflat[i * p + 1] = cov;
         pid[i] = (i as u32) % n_primary;
-        y[i] = c0 + c1 * cov + super::test_lcg(&mut st);
+        y[i] = c0 + c1 * cov + lcg(&mut st);
     }
     (xflat, y, pid)
 }
@@ -1076,6 +1143,52 @@ fn build_case(
             let ids = crate::GroupIds {
                 primary: pid,
                 extra: vec![eid],
+            };
+            let opts = crate::FitOptions {
+                target_indices: vec![0, 1],
+                ..crate::FitOptions::default()
+            };
+            (xflat, y, n, p, model, ids, opts)
+        }
+        "crossed_plus_nested" => {
+            // (1 | g1/g2) + (1 | g3): primary (4 levels) with a NESTED child
+            // factor (2 per parent) and a CROSSED extra (3 levels). The only
+            // case mixing the two extra relations, so it is the only one where
+            // the crossed tail starts at a `kf` the nested children widened:
+            // kf = 4 + 4·2 = 12, e = 3, and every crossed block's tail offset
+            // is `start − kf`. An off-by-one there is invisible on a
+            // crossed-only or nested-only design. Mirrors the dense kernel's
+            // `crossed_plus_nested_deviance_matches_brute_force`
+            // (`src/lmm/tests.rs`). k_total = 4 + 8 + 3 = 15; n_theta = 3.
+            // Periods 4 and 3 are coprime, so n=24 populates every
+            // (primary, crossed) cell twice.
+            let n = 24;
+            let p = 2;
+            let (xflat, y, pid) = build_case_fill(53, 4, 0.7, 0.5);
+            let eid: Vec<u32> = (0..n as u32).map(|i| i % 3).collect();
+            // Global nested id, same formula as `nested_intercept`:
+            // parent·n_per_parent + within_child.
+            let cid: Vec<u32> = (0..n).map(|i| pid[i] * 2 + ((i / 4) % 2) as u32).collect();
+            let model = ModelSpec {
+                family: Family::Gaussian,
+                re: Some(ReStructure {
+                    sizing: Sizing::FixedClusters { n_clusters: 4 },
+                    slopes: vec![],
+                    extra_groupings: vec![
+                        Grouping {
+                            relation: GroupingRelation::Crossed { n_clusters: 3 },
+                            slopes: vec![],
+                        },
+                        Grouping {
+                            relation: GroupingRelation::NestedWithin { n_per_parent: 2 },
+                            slopes: vec![],
+                        },
+                    ],
+                }),
+            };
+            let ids = crate::GroupIds {
+                primary: pid,
+                extra: vec![eid, cid],
             };
             let opts = crate::FitOptions {
                 target_indices: vec![0, 1],
@@ -1266,9 +1379,9 @@ fn fit_wide_crossed_sparse_is_pinned() {
 /// Pin the family-downdate route for one workspace construction, mirroring
 /// `with_forced_sparse_tail`. `None` is restored so no later test inherits it.
 fn with_forced_dd_route<T>(dense: bool, f: impl FnOnce() -> T) -> T {
-    super::FORCE_DD_ROUTE.with(|c| c.set(Some(dense)));
+    FORCE_DD_ROUTE.with(|c| c.set(Some(dense)));
     let out = f();
-    super::FORCE_DD_ROUTE.with(|c| c.set(None));
+    FORCE_DD_ROUTE.with(|c| c.set(None));
     out
 }
 
@@ -1313,9 +1426,7 @@ fn family_downdate_dense_route_matches_scatter_route() {
         let mut st = seed;
         let mut worst = 0.0f64;
         for _ in 0..8 {
-            let theta: Vec<f64> = (0..n_theta)
-                .map(|_| 0.3 + 0.6 * super::test_lcg(&mut st))
-                .collect();
+            let theta: Vec<f64> = (0..n_theta).map(|_| 0.3 + 0.6 * lcg(&mut st)).collect();
             let a = super::sparse_reml_deviance(&theta, &mut ws_s);
             let b = super::sparse_reml_deviance(&theta, &mut ws_d);
             worst = worst.max((a - b).abs() / (1.0 + a.abs()));
@@ -1379,12 +1490,12 @@ fn family_downdate_dense_route_matches_scatter_route() {
     let mut cr = vec![0u32; nn];
     let mut st = 4242u64;
     for i in 0..nn {
-        let cov = super::test_lcg(&mut st);
+        let cov = lcg(&mut st);
         xs[(i, 0)] = 1.0;
         xs[(i, 1)] = cov;
         cl[i] = (i % 5) as u32;
         cr[i] = (i % 7) as u32;
-        ys[i] = 1.0 + 0.4 * cov + super::test_lcg(&mut st);
+        ys[i] = 1.0 + 0.4 * cov + lcg(&mut st);
     }
     let model2 = crate::ModelSpec {
         family: crate::Family::Gaussian,
@@ -1412,6 +1523,67 @@ fn family_downdate_dense_route_matches_scatter_route() {
     assert!(
         w2 < 1e-12,
         "w==2 routes disagree beyond reassociation: {w2:.3e}"
+    );
+}
+
+/// The dense family-downdate accumulator is an `e×e` f64 buffer, so
+/// `build_sparse_tail` refuses it above `DD_DENSE_MAX_BYTES` whatever the
+/// entry counts — or the test override — ask for. No corpus design comes near
+/// that width, so this one declares a crossed factor with far more levels than
+/// it observes: `n_levels` reaches the tail straight from the spec, unclamped
+/// by the ids, and an unobserved level costs one diagonal pattern entry rather
+/// than a row.
+///
+/// e = 5793 is the first width the cap rejects (5792²·8 B fits in 256 MB,
+/// 5793²·8 B does not). Only the rejected side is built: taking the accepting
+/// side would allocate the 268 MB the cap exists to refuse.
+#[test]
+fn family_downdate_dense_route_vetoed_above_the_memory_cap() {
+    use faer::Mat;
+
+    // `n_levels` declared crossed levels, three of them observed over the
+    // shared 24-row fixture fill.
+    let build = |n_levels: u32| {
+        let n = 24;
+        let p = 2;
+        let (xflat, y, pid) = build_case_fill(67, 4, 0.9, 0.3);
+        let eid: Vec<u32> = (0..n as u32).map(|i| i % 3).collect();
+        let model = ModelSpec {
+            family: Family::Gaussian,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters { n_clusters: 4 },
+                slopes: vec![],
+                extra_groupings: vec![Grouping {
+                    relation: GroupingRelation::Crossed {
+                        n_clusters: n_levels,
+                    },
+                    slopes: vec![],
+                }],
+            }),
+        };
+        let x = Mat::<f64>::from_fn(n, p, |i, j| xflat[i * p + j]);
+        let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[vec![]]);
+        super::SparseLmmWorkspace::new(&g, x.as_ref(), &pid, &cr_as_extra(&eid), &y, n, p, None)
+    };
+    let is_dense = |ws: &super::SparseLmmWorkspace| {
+        matches!(
+            ws.tail
+                .as_ref()
+                .expect("both widths clear TAIL_SPARSE_MIN")
+                .fam_dd,
+            super::FamDowndate::Dense { .. }
+        )
+    };
+
+    // Control: e = 200 is past `TAIL_SPARSE_MIN` and under the cap, so the
+    // override alone decides and the accumulator is 320 KB.
+    let under = with_forced_dd_route(true, || build(200));
+    assert!(is_dense(&under), "e=200: the override must reach the route");
+    // The same request at e = 5793, which the cap must overrule.
+    let over = with_forced_dd_route(true, || build(5793));
+    assert!(
+        !is_dense(&over),
+        "e=5793: the memory cap must send the downdate back to the scatter"
     );
 }
 
@@ -1508,11 +1680,14 @@ fn fit_warm_sparse_wide_crossed_matches_cold_optimum() {
 
 /// Cross-check: force Sparse on in-envelope designs and diff every
 /// output against NoZ. A mismatch is a bug in exactly one path (NoZ is the
-/// oracle). Spans the five RE-topology axes: scalar-intercept, primary slope
-/// (q_p=2 runtime gate), crossed, nested, slope+crossed. Run for both tail
-/// branches — the forced-sparse pass covers the non-diagonal-Λ crossed
-/// tail (`primary_slope_plus_crossed`) through the fill-reducing factor;
-/// the e=0 topologies are unaffected by the flag (no tail exists).
+/// oracle). Spans the six RE-topology axes: scalar-intercept, primary slope
+/// (q_p=2 runtime gate), crossed, nested, slope+crossed, and crossed beside
+/// nested — the last being the only shape where the crossed tail's
+/// `start − kf` offsets are taken over a `kf` that the nested children
+/// widened. Run for both tail branches — the forced-sparse pass covers the
+/// non-diagonal-Λ crossed tail (`primary_slope_plus_crossed`) and the
+/// widened-`kf` tail through the fill-reducing factor; the e=0 topologies
+/// are unaffected by the flag (no tail exists).
 #[test]
 fn sparse_vs_noz_cross_check_table() {
     run_sparse_vs_noz_cross_check_table();
@@ -1528,12 +1703,13 @@ fn run_sparse_vs_noz_cross_check_table() {
         "crossed_two_intercepts",     // (1 | g1) + (1 | g2)
         "nested_intercept",           // (1 | g1/g2)
         "primary_slope_plus_crossed", // (1 + x | g1) + (1 | g2)
+        "crossed_plus_nested",        // (1 | g1/g2) + (1 | g3), tail offset over a widened kf
     ];
     for label in cases {
         let (xflat, y, n, p, model, ids, opts) = build_case(label);
         let noz = crate::fit_cold(&xflat, &y, n, p, &model, &ids, &opts);
         let (sized, ids, perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
-        let mut sp = super::fit_mle_sparse(
+        let mut sp = crate::fit::fit_mle_sparse_pub(
             &xflat,
             &y,
             n,
@@ -1591,7 +1767,7 @@ fn run_sparse_vs_noz_cross_check_table() {
 /// One cell of the crossover grid. All structural cells sit inside the NoZ
 /// overlap envelope (`q_p ≤ MAX_PRIMARY_Q`, `n_extra ≤ MAX_EXTRA_GROUPINGS`,
 /// `q_g ≤ MAX_EXTRA_Q`) so both kernels are valid on every cell; each side
-/// is forced directly (`fit_mle_noz_pub` / `fit_mle_sparse`), bypassing
+/// is forced directly (`fit_mle_noz_pub` / `fit_mle_sparse_pub`), bypassing
 /// `classify_design` — whose q_g performance boundary these sweeps set.
 /// Widths include the intercept: `q_p = 1 + primary slopes`,
 /// `q_g = 1 + per-extra slopes`.
@@ -1684,7 +1860,7 @@ fn crossover_structures() -> Vec<GridCell> {
 /// always reference existing columns. True per-level effects (primary
 /// intercept+slopes, extras likewise, amplitude 0.5·LCG) are injected so
 /// fitted variance components sit off the θ = 0 boundary. Covariates,
-/// effects, and noise all come from `test_lcg(seed)` — unique seed per
+/// effects, and noise all come from `lcg(seed)` — unique seed per
 /// cell, no wall clock, no `rand`.
 fn build_grid_case(
     cell: &GridCell,
@@ -1720,13 +1896,11 @@ fn build_grid_case(
         })
         .collect();
 
-    let prim_eff: Vec<f64> = (0..n_primary * q_p)
-        .map(|_| 0.5 * super::test_lcg(&mut st))
-        .collect();
+    let prim_eff: Vec<f64> = (0..n_primary * q_p).map(|_| 0.5 * lcg(&mut st)).collect();
     let extra_eff: Vec<Vec<f64>> = (0..n_extra)
         .map(|g| {
             (0..extra_levels(g) * q_g)
-                .map(|_| 0.5 * super::test_lcg(&mut st))
+                .map(|_| 0.5 * lcg(&mut st))
                 .collect()
         })
         .collect();
@@ -1736,7 +1910,7 @@ fn build_grid_case(
     for i in 0..n {
         xflat[i * p] = 1.0;
         for j in 1..p {
-            xflat[i * p + j] = super::test_lcg(&mut st);
+            xflat[i * p + j] = lcg(&mut st);
         }
         let mut mu = 1.0;
         for j in 1..p {
@@ -1754,7 +1928,7 @@ fn build_grid_case(
                 mu += extra_eff[g][l * q_g + k] * xflat[i * p + k];
             }
         }
-        y[i] = mu + super::test_lcg(&mut st);
+        y[i] = mu + lcg(&mut st);
     }
 
     let model = ModelSpec {
@@ -1897,7 +2071,7 @@ fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
             None,
             &opts,
         );
-        let sp = super::fit_mle_sparse(
+        let sp = crate::fit::fit_mle_sparse_pub(
             &xflat,
             &y,
             n,
@@ -2041,7 +2215,7 @@ fn noz_sparse_ranef_agrees() {
         None,
         &opts,
     );
-    let sp = super::fit_mle_sparse(
+    let sp = crate::fit::fit_mle_sparse_pub(
         &xflat,
         &y,
         n,
@@ -2113,9 +2287,7 @@ fn crossover_worst_cell_deviance_parity() {
     let mut st = 99u64;
     let mut max_rel = 0.0f64;
     for t in 0..8 {
-        let theta: Vec<f64> = (0..n_theta)
-            .map(|_| 0.3 + 0.6 * super::test_lcg(&mut st))
-            .collect();
+        let theta: Vec<f64> = (0..n_theta).map(|_| 0.3 + 0.6 * lcg(&mut st)).collect();
         let dense = crate::lmm::reml_deviance(&theta, &suff, &mut fit);
         let sparse = super::sparse_reml_deviance(&theta, &mut ws);
         let rel = (dense - sparse).abs() / (1.0 + dense.abs());
@@ -2208,7 +2380,7 @@ fn run_timed_sweep(cells: &[GridCell]) {
             ));
         });
         let t_sparse = min_time_us(TARGET_LOOP_S, || {
-            std::hint::black_box(super::fit_mle_sparse(
+            std::hint::black_box(crate::fit::fit_mle_sparse_pub(
                 &xflat,
                 &y,
                 n,
@@ -2519,7 +2691,7 @@ fn dense_ids(raw: &[String]) -> Vec<u32> {
 
 /// OVER-WIDTH gamma GLMM golden: `y ~ 1 + x1..x4 + (1|gp) + (1 + x1..x4 | ge)`,
 /// gamma/log — `ge` carries q_g = 5 > MAX_EXTRA_Q, so the design routes to the
-/// sparse non-Gaussian PIRLS (`fit_glmm_sparse`); no dense twin exists.
+/// packed-row GLMM layout; no blocked or structured twin exists.
 /// Gated against frozen `glmer(Gamma("log"))` (`validation/goldens/sim_sparse_gamma.json`).
 /// The oracle is sacred.
 ///
@@ -2596,29 +2768,27 @@ fn fit_sparse_gamma_glmm_matches_lme4() {
     };
     let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert!(f.converged(), "sparse gamma GLMM must converge");
-    // Exactly one stage-1 trial point exhausts PIRLS_MAX_ITERS on this rung
-    // (eval 29/267), and the final re-eval at θ̂ converges cleanly in 5
-    // iterations — a rejected trial point, not a truncated returned fit.
-    assert_eq!(
-        f.diagnostics.notes.len(),
-        1,
-        "expected exactly one PirlsExhausted note, got {:?}",
+    // Every PIRLS solve of this fit converges inside PIRLS_MAX_ITERS, so no
+    // trial point ever exhausts it and no PirlsExhausted note is carried.
+    assert!(
+        !f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, crate::Note::PirlsExhausted { .. })),
+        "expected no PirlsExhausted note, got {:?}",
         f.diagnostics.notes
     );
-    match &f.diagnostics.notes[0] {
-        crate::Note::PirlsExhausted { evals, final_eval } => {
-            assert_eq!(*evals, 1, "exactly one stage-1 trial point exhausts");
-            assert!(
-                !final_eval,
-                "the final re-eval at θ̂ converges in 5 iterations"
-            );
-        }
-        other => panic!("expected PirlsExhausted, got {other:?}"),
-    }
 
-    // β: 2e-2 relative (the over-cap phase-1 band the wide-slopes golden
-    // uses); se_hessian at the FD-Hessian floor 3e-2 (compare.R's
-    // se_hessian_rel).
+    // Both SE arms of this rung against the same golden, at the band the
+    // harness gates them on: `tol.R`'s `se_hessian_rel` and `se_rel` are both
+    // 1e-3 and this rung takes no `TOL_PER_RUNG` override, so `compare.R`
+    // scores rung 24's `se_hessian` and `se_rx` columns at exactly this value.
+    // It is far above what the fits need — the worst coordinate measured here
+    // is 1.5e-4 on `se_hessian[3]` and 1.2e-4 on `se_rx[3]`, both on x3 — and
+    // is kept AT the harness band rather than at the measurement so the
+    // in-crate gate and the cross-engine table cannot drift apart.
+    const SE_REL: f64 = 1e-3;
+    // β: 2e-2 relative (the over-cap phase-1 band the wide-slopes golden uses).
     for j in 0..p {
         let rb = gold.estimates.beta[j];
         let rs = gold.estimates.se_hessian[j];
@@ -2628,7 +2798,7 @@ fn fit_sparse_gamma_glmm_matches_lme4() {
             f.beta[j]
         );
         assert!(
-            (f.se[j] - rs).abs() / rs.abs().max(1e-6) < 3e-2,
+            (f.se[j] - rs).abs() / rs.abs().max(1e-6) < SE_REL,
             "se[{j}] glmm={} lme4={rs}",
             f.se[j]
         );
@@ -2691,7 +2861,7 @@ fn fit_sparse_gamma_glmm_matches_lme4() {
     for j in 0..p {
         let rs = gold.estimates.se_rx[j];
         assert!(
-            (f_rx.se[j] - rs).abs() / rs.abs().max(1e-6) < 3e-2,
+            (f_rx.se[j] - rs).abs() / rs.abs().max(1e-6) < SE_REL,
             "rx se[{j}] glmm={} lme4={rs}",
             f_rx.se[j]
         );
@@ -2840,33 +3010,49 @@ fn fit_sparse_gamma_hessian_is_pinned() {
     // headroom, not a machine-specific value.
     const BAND_HESSIAN: f64 = 1.5e-2;
     // Re-anchored 2026-08-05 on x86_64-unknown-linux-gnu; was aarch64-apple-darwin.
+    //
+    // Re-pinned 2026-09-16: the packed-row layout's joint Hessian is the exact
+    // assembled one — first-order lanes over the `F`/`G` adjoint — not the
+    // central stencil at `SPARSE_FD_STEP_REL`. `se_hessian` moves by at most
+    // 2.2e-4 relative (`se[2]`, and 2.1e-4 on `se[0]`), `stddev_se` by at most
+    // 8.1e-4 (coordinate 0), both more than an order inside `BAND_HESSIAN`,
+    // which is therefore untouched. Part of that is older than this change:
+    // the 2026-08-05 values were never re-pinned through the PIRLS exit-iterate
+    // refresh, which the weighted twin below records as a 1.0e-3 move on its
+    // own `se[0]`. This engine's own contribution, measured at one γ̂ on this
+    // dataset by `fit::glmm_tests::packed_assembled_se_matches_the_packed_stencil`,
+    // is 1.4e-5 on `se` and 2.5e-6 on `theta_se` — inside the 2.0e-5 δ-vs-δ/2
+    // agreement `src/sparse/fd_margin.rs`'s header records for the stencil on
+    // this very dataset, so the stencil's own step error covers it.
     const REF_SE_HESSIAN: [f64; 5] = [
-        0.18919738058439473,
-        0.09146492656440869,
-        0.08363897681514539,
-        0.058861416253009266,
-        0.047327399530816265,
+        0.18923696697582912,
+        0.0914621218702054,
+        0.08362037032956678,
+        0.05884882635464031,
+        0.04733354703744511,
     ];
     // Re-anchored 2026-08-05 on x86_64-unknown-linux-gnu; was aarch64-apple-darwin.
+    // Re-pinned 2026-09-16 with `REF_SE_HESSIAN` above — same mechanism, same
+    // measurement.
     // θ-scale SE, 16 coordinates: gp's 1 (scalar intercept) then ge's 15
     // (vech of the 5×5 slope block).
     const REF_STDDEV_SE: [f64; 16] = [
-        0.09870430140167974,
-        0.09180799701884287,
-        0.09242606966375577,
-        0.08329298246933324,
-        0.058600841435353594,
-        0.04946625171071949,
-        0.06731917309870179,
-        0.08208207780133939,
-        0.05728301432143014,
-        0.05109452639817435,
-        0.0581195005290471,
-        0.055103112849115336,
-        0.05128458872417365,
-        0.04223593518280066,
-        0.05601701110304042,
-        0.0410549179101112,
+        0.09878471001347627,
+        0.09183656489561516,
+        0.09243572708007547,
+        0.0832847501480564,
+        0.05859560131265973,
+        0.049478972261464936,
+        0.06731791105795289,
+        0.08206000453227787,
+        0.05726684188258767,
+        0.05110246014120478,
+        0.058085466112637374,
+        0.05508337994725216,
+        0.051282003465962,
+        0.04222774728025347,
+        0.05601956238089785,
+        0.04106578456764979,
     ];
 
     let csv = include_str!("../../validation/data/simulated/sim_sparse_gamma.csv");
@@ -2979,18 +3165,35 @@ fn fit_sparse_gamma_hessian_is_pinned() {
 fn fit_sparse_binomial_bigsd_hessian_is_pinned() {
     const BAND_HESSIAN: f64 = 2e-3;
     // Frozen 2026-08-06 on x86_64-unknown-linux-gnu.
-    const REF_SE_HESSIAN: [f64; 3] = [0.4909865616608065, 0.06080857558362023, 0.12165156247329076];
+    //
+    // Re-pinned 2026-09-16: the packed-row layout's joint Hessian is the exact
+    // assembled one, not the central stencil at `SPARSE_FD_STEP_REL`.
+    // `se_hessian` moves 8.8e-5 relative on `se[0]` and ≤6.8e-6 on the other
+    // two, `stddev_se` by at most 1.7e-5 (coordinate 7) — an order and a half
+    // inside `BAND_HESSIAN`, which is untouched. This is the large-θ̂ cell
+    // where the stencil is at its worst: `src/sparse/fd_margin.rs`'s header
+    // records its truncation-dominated δ sequence here with the two
+    // extrapolations 20% apart and the shipped step 1.4e-4 from the limit, and
+    // `fit::glmm_tests::packed_assembled_se_matches_the_packed_stencil`
+    // measures the two engines 1.65e-4 apart on `se` at one γ̂ — the same size,
+    // so the movement is the stencil's error being removed.
+    const REF_SE_HESSIAN: [f64; 3] = [
+        0.49102955618526756,
+        0.06080867980871085,
+        0.12165239214737847,
+    ];
     // Frozen 2026-08-06 on x86_64-unknown-linux-gnu. Eight q=1 blocks, glmm
-    // order [g1 | c1..c7].
+    // order [g1 | c1..c7]. Re-pinned 2026-09-16 with `REF_SE_HESSIAN` above —
+    // same mechanism, same measurement.
     const REF_STDDEV_SE: [f64; 8] = [
-        0.2572890687064059,
-        0.14371548959136732,
-        0.12949644379802713,
-        0.10753876761222778,
-        0.0986178147917577,
-        0.1264814679057893,
-        0.14014902259598055,
-        0.18715584406711308,
+        0.2572895795273598,
+        0.14371665545468593,
+        0.1294974885539299,
+        0.10753945072071049,
+        0.0986181805454642,
+        0.12648277763095034,
+        0.14015041232962533,
+        0.18715902725312136,
     ];
 
     let (x, y, n, p, model, ids) = sparse_binomial_bigsd_design();
@@ -3135,8 +3338,8 @@ fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
 }
 
 /// OVER-COUNT NB GLMM golden: `y ~ 1 + x + (1|g1) + (1|c1) + … + (1|c7)`,
-/// negbin/log — 7 crossed extras > MAX_EXTRA_GROUPINGS route to the sparse NB
-/// marginal-θ wrapper (`fit_glmm_nb_sparse`). Rx SE, as the gamma rung.
+/// negbin/log — 7 crossed extras > MAX_EXTRA_GROUPINGS route to the packed-row
+/// GLMM layout. Rx SE, as the gamma rung.
 ///
 /// **The `Rx` arm carries no bit-exact Rust pin.** This fixture
 /// is the crate's worst-conditioned NB fit: a
@@ -3293,18 +3496,29 @@ fn fit_sparse_nb_glmm_is_pinned() {
     // headroom, not a machine-specific value.
     const BAND_HESSIAN: f64 = 1e-2;
     // Re-anchored 2026-08-05 on x86_64-unknown-linux-gnu; was aarch64-apple-darwin.
-    const REF_SE_HESSIAN: [f64; 2] = [0.3704422044067882, 0.062359975459493726];
+    //
+    // Re-pinned 2026-09-16: the packed-row layout's joint Hessian is the exact
+    // assembled one, not the central stencil at `SPARSE_FD_STEP_REL`.
+    // `se_hessian` moves 1.5e-4 relative on `se[0]` and 2.2e-5 on `se[1]`,
+    // `stddev_se` by at most 7.9e-4 (coordinate 2) — inside `BAND_HESSIAN`,
+    // which is untouched. Negative binomial is a non-canonical link, so this
+    // is one of the two packed cells where the engine builds and factors its
+    // own observed `A_obs`; the other, `sim_sparse_gamma`, moves by the same
+    // order.
+    const REF_SE_HESSIAN: [f64; 2] = [0.3704970921733068, 0.06236135008357675];
     // Re-anchored 2026-08-05 on x86_64-unknown-linux-gnu; was aarch64-apple-darwin.
+    // Re-pinned 2026-09-16 with `REF_SE_HESSIAN` above — same mechanism, same
+    // measurement.
     // θ-scale SE, 8 coordinates (one per scalar grouping: g1, c1..c7).
     const REF_STDDEV_SE: [f64; 8] = [
-        0.14775362243032253,
-        0.10397840749812272,
-        0.10740948771648906,
-        0.13998274984112666,
-        0.1296563634917967,
-        0.09305621725489749,
-        0.12372555179327623,
-        0.10387227423118507,
+        0.1477052202187355,
+        0.10399108319253193,
+        0.10749427183072686,
+        0.14005375454697064,
+        0.12971211039097802,
+        0.09308282303428671,
+        0.12376828707526051,
+        0.10389243666516638,
     ];
     let f_hessian = crate::fit_cold(
         &x,
@@ -3354,15 +3568,13 @@ fn fit_sparse_nb_glmm_is_pinned() {
 ///   f <- glmer(y ~ 1 + x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge),
 ///              family = Gamma("log"), weights = d$w, data = d)
 /// ```
-/// se_hessian/dispersion at the unweighted golden's bands (3e-2). β at
-/// 4e-2, not the unweighted golden's 2e-2: `x1..x4` land within 1% (the
+/// β at 4e-2, not the unweighted golden's 2e-2: `x1..x4` land within 1% (the
 /// weighting math is exact there), but `(Intercept)` — the design's
 /// least-identified coefficient, t ≈ 1.2, SE ≈ 80% of the point estimate
 /// — drifts ~3.4% between glmm's and lme4's independent 21-dim BOBYQA
-/// paths to the same shallow optimum; se_hessian on that same coefficient
-/// still lands within 0.1%, confirming the curvature (hence the
-/// weighting) is correct and this is optimizer-path scatter on a
-/// poorly-determined direction, not a weighting bug.
+/// paths to the same shallow optimum. Dispersion and the SEs are checked
+/// against lme4 at the unweighted golden's 3e-2 band; the SEs are also pinned
+/// to glmm's own joint-Hessian values.
 #[cfg(feature = "oracle-tests")]
 #[test]
 fn fit_sparse_gamma_glmm_weighted_matches_lme4() {
@@ -3373,6 +3585,12 @@ fn fit_sparse_gamma_glmm_weighted_matches_lme4() {
         0.236273530986550,
         -0.228445413694595,
     ];
+    // Pearson moment Σwᵢrᵢ²/(n−p) (`residuals(f, type="pearson")`), NOT
+    // `sigma(f)^2` (pwrss/n on the link scale) — the two are different
+    // quantities (see `glmm_view_to_fit`'s `dispersion` arm doc) and only
+    // the Pearson form matches `glmm`'s `Fit::dispersion` field.
+    const REF_DISPERSION: f64 = 0.411217227312831;
+    // lme4's `vcov(use.hessian = TRUE)` SEs.
     const REF_SE_HESSIAN: [f64; 5] = [
         0.1890907576028805,
         0.0921338121875385,
@@ -3380,11 +3598,26 @@ fn fit_sparse_gamma_glmm_weighted_matches_lme4() {
         0.0585608862317671,
         0.0475892885636111,
     ];
-    // Pearson moment Σwᵢrᵢ²/(n−p) (`residuals(f, type="pearson")`), NOT
-    // `sigma(f)^2` (pwrss/n on the link scale) — the two are different
-    // quantities (see `fit_glmm_sparse`'s `dispersion` arm doc) and only
-    // the Pearson form matches `glmm`'s `Fit::dispersion` field.
-    const REF_DISPERSION: f64 = 0.411217227312831;
+    // glmm's own joint-Hessian SEs. Values are the x86_64 anchor's
+    // (`x86_64-unknown-linux-gnu`, Intel Core Ultra 7 265H — see
+    // `fit::common_tests::assert_pinned`, "which machine the pins are frozen
+    // on").
+    //
+    // Where the numbers come from: the packed-row layout's joint Hessian is the
+    // exact assembled one — first-order lanes over the `F`/`G` adjoint on a
+    // dense `k×k` `A`, not a central stencil at `SPARSE_FD_STEP_REL` —
+    // evaluated at the γ̂ `fit_glmm`'s outer search returns, where it is
+    // positive definite, so the SE arm never falls back to the Rx Schur (the
+    // `notes.is_empty()` assertion below pins that). `se[0]` sits 8.7e-6
+    // relative from `REF_SE_HESSIAN[0]`, the other four within 2.7e-3. The
+    // `PIN_REL_ITER` band these carry is the ordinary cross-machine one.
+    const OWN_SE_HESSIAN: [f64; 5] = [
+        0.189089106512416,
+        0.0923845802159574,
+        0.08468100250395746,
+        0.05859775113437361,
+        0.04761013906901773,
+    ];
 
     let csv = include_str!("../../validation/data/simulated/sim_sparse_gamma.csv");
     // Columns: y, x1..x4, gp, ge (indices 0..6).
@@ -3434,6 +3667,7 @@ fn fit_sparse_gamma_glmm_weighted_matches_lme4() {
     };
     let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert!(f.converged(), "weighted sparse gamma GLMM must converge");
+    #[allow(clippy::needless_range_loop)] // j indexes f.beta, f.se and the REF arrays
     for j in 0..p {
         assert!(
             (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs().max(1e-6) < 4e-2,
@@ -3448,6 +3682,12 @@ fn fit_sparse_gamma_glmm_weighted_matches_lme4() {
             REF_SE_HESSIAN[j]
         );
     }
+    assert_pinned(&f.se, &OWN_SE_HESSIAN, PIN_REL_ITER, "se");
+    assert!(
+        f.diagnostics.notes.is_empty(),
+        "joint Hessian must carry this fit, got {:?}",
+        f.diagnostics.notes
+    );
     assert!(
         (f.dispersion - REF_DISPERSION).abs() / REF_DISPERSION < 3e-2,
         "φ̂ glmm={} lme4={REF_DISPERSION}",
@@ -3478,8 +3718,8 @@ fn fit_sparse_gamma_glmm_weighted_matches_lme4() {
 /// Integer prior weights = row replication (NB): `w = 2` on `n` unique
 /// rows fits identically to the same rows each duplicated once — Σwᵢ·devᵢ
 /// over unique rows equals Σdevᵢ over duplicated rows, so the two
-/// marginal-θ profiles (`fit_glmm_nb_sparse`'s golden-section search over
-/// `−½D(θ) + nb_profile_loglik(y, y, θ, weights)`) share an argmax. Full
+/// marginal-θ objectives (`−½D(θ) + nb_profile_loglik(y, y, θ, weights)`,
+/// searched as the outer BOBYQA's `ln θ_NB` coordinate) share an argmax. Full
 /// β/SE/θ equality (NB's dispersion IS θ̂ itself, driven by the SAME
 /// weighted profile on both sides — unlike Gamma's Pearson φ̂, nothing
 /// here depends on the raw row count). Tolerances mirror the
@@ -3630,18 +3870,14 @@ fn build_glmm_case(
     let mut st = seed;
     let n_primary = 4usize;
     let n_extra_levels = 3usize;
-    let u_c: Vec<f64> = (0..n_primary)
-        .map(|_| 0.6 * super::test_lcg(&mut st))
-        .collect();
-    let v_e: Vec<f64> = (0..n_extra_levels)
-        .map(|_| 0.4 * super::test_lcg(&mut st))
-        .collect();
+    let u_c: Vec<f64> = (0..n_primary).map(|_| 0.6 * lcg(&mut st)).collect();
+    let v_e: Vec<f64> = (0..n_extra_levels).map(|_| 0.4 * lcg(&mut st)).collect();
     let mut x = vec![0.0f64; n * p];
     let mut y = vec![0.0f64; n];
     let mut pid = vec![0u32; n];
     let mut eid = vec![0u32; n];
     for i in 0..n {
-        let cov = super::test_lcg(&mut st);
+        let cov = lcg(&mut st);
         x[i * p] = 1.0;
         x[i * p + 1] = cov;
         pid[i] = (i % n_primary) as u32;
@@ -3650,7 +3886,7 @@ fn build_glmm_case(
         y[i] = match family {
             Family::Binomial { .. } => {
                 let pr = 1.0 / (1.0 + (-eta).exp());
-                let uni = 0.5 * (super::test_lcg(&mut st) + 1.0); // (0, 1)
+                let uni = 0.5 * (lcg(&mut st) + 1.0); // (0, 1)
                 if uni < pr {
                     1.0
                 } else {
@@ -3661,11 +3897,11 @@ fn build_glmm_case(
                 // Count-like data around exp(η) with one-sided jitter — the test
                 // compares two fitters on the SAME data, so exact Poisson/NB
                 // sampling is unnecessary.
-                let jit = 1.0 + 0.4 * super::test_lcg(&mut st);
+                let jit = 1.0 + 0.4 * lcg(&mut st);
                 (eta.exp() * jit).round().max(0.0)
             }
             Family::Gamma { .. } | Family::InverseGaussian { .. } => {
-                let jit = 1.0 + 0.3 * super::test_lcg(&mut st);
+                let jit = 1.0 + 0.3 * lcg(&mut st);
                 (eta.exp() * jit).max(0.05)
             }
             Family::Gaussian => unreachable!("non-Gaussian cases only"),
@@ -3693,15 +3929,14 @@ fn build_glmm_case(
     (x, y, n, p, model, ids)
 }
 
-/// The sparse parallel FD-Hessian grid must reproduce the serial one BITWISE.
-/// Drives a full `fit_glmm_sparse` (WaldSe::Hessian) twice — `parallel_inner`
-/// off then on — on a crossed binomial design routed through the sparse path,
-/// and asserts the returned marginal deviance, `se`, and `stddev_se` are
-/// bit-identical. `parallel_inner` gates ONLY `sparse_fd_hessian_cov` here (the
-/// sparse fit has no AGQ), so the BOBYQA optimum is shared and any difference
-/// isolates to the parallel grid. Every eval cold-seeds û = 0, so per-thread
-/// worker workspaces (`clone_worker`) are exact — a mismatch is a field-liveness
-/// bug, not noise.
+/// The packed-row parallel FD-Hessian grid must reproduce the serial one
+/// BITWISE. Drives a full packed fit (WaldSe::Hessian) twice — `parallel_inner`
+/// off then on — on a crossed binomial design, and asserts the returned marginal
+/// deviance, `se`, and `stddev_se` are bit-identical. `parallel_inner` gates ONLY
+/// `packed_fd_hessian_cov` here (this layout has no AGQ), so the BOBYQA optimum
+/// is shared and any difference isolates to the parallel grid. Every eval
+/// cold-seeds û = 0, so per-thread worker workspaces (`fd_worker_ws`) are exact —
+/// a mismatch is a field-liveness bug, not noise.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 #[test]
 fn sparse_fd_hessian_parallel_bit_identical_to_serial() {
@@ -3719,7 +3954,7 @@ fn sparse_fd_hessian_parallel_bit_identical_to_serial() {
             parallel_inner,
             ..crate::FitOptions::default()
         };
-        super::fit_glmm_sparse(
+        let (fit, _mu, dev) = crate::fit::fit_glmm_packed(
             &xflat,
             &y,
             n,
@@ -3730,7 +3965,8 @@ fn sparse_fd_hessian_parallel_bit_identical_to_serial() {
             f64::NAN,
             None,
             &opts,
-        )
+        );
+        (fit, dev)
     };
     let (fit_s, dev_s) = run(false);
     let (fit_p, dev_p) = run(true);
@@ -3766,13 +4002,13 @@ fn sparse_fd_hessian_parallel_bit_identical_to_serial() {
     }
 }
 
-/// Deviance-value cross-check (the internal correctness anchor):
-/// `sparse_glmm_deviance` equals the dense `glmm_laplace_deviance`
-/// at the same (θ, β) on in-envelope designs both can evaluate. The two
-/// PIRLS drivers share the discipline but not the arithmetic order (and the
-/// dense logit path is fused-SIMD where the sparse one takes the general
-/// family branch), so the bound is relative, not bitwise. A disagreement is
-/// a bug in exactly one path.
+/// Deviance-value cross-check (the internal correctness anchor): the packed-row
+/// layout's `glmm_laplace_deviance` equals the blocked/structured one at the
+/// same (θ, β) on in-envelope designs both can evaluate. The three PIRLS
+/// kernels share the discipline but not the arithmetic order (and the blocked
+/// logit path is fused-SIMD where the packed one takes the general family
+/// branch), so the bound is relative, not bitwise. A disagreement is a bug in
+/// exactly one kernel.
 #[test]
 fn sparse_glmm_deviance_matches_dense() {
     use faer::Mat;
@@ -3820,18 +4056,20 @@ fn sparse_glmm_deviance_matches_dense() {
             f64::NAN
         };
 
-        // Dense workspace, mirroring the fit.rs adapter's construction.
+        // Blocked/structured workspace, mirroring the fit.rs adapter's construction.
         let mut dws = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
-        crate::glmm::build_z(&mut dws, x.as_ref(), &ids.primary, &ids.extra, n);
-        dws.structured_schur = if dws.groupings.structured_extras_eligible() {
+        dws.pattern.structured_schur = if dws.groupings.structured_extras_eligible() {
             crate::glmm::StructuredSchur::new(&dws.groupings, &ids.primary, &ids.extra, n)
         } else {
             None
         };
         dws.nb_theta = nb_theta;
 
-        let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[]);
-        let mut sws = super::SparseGlmmWorkspace::new(&g, &ids.primary, &ids.extra, n, p);
+        // The same design on the packed-row layout, which this in-envelope
+        // shape would not otherwise take.
+        let mut sws = crate::glmm::GlmmWorkspace::for_cluster_spec_packed(p, &model, n, &[], 1);
+        sws.nb_theta = nb_theta;
+        crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n);
 
         // (θ, β) probe points: [θ_primary, θ_extra, β0, β1]. The inverse link
         // gets its own β probes with β₀ well inside the η > 0 domain (μ = 1/η):
@@ -3866,19 +4104,18 @@ fn sparse_glmm_deviance_matches_dense() {
                 &ids.extra,
                 n,
             );
-            let sparse = super::sparse_glmm_deviance(
-                family,
-                nb_theta,
+            let sparse = crate::glmm::glmm_laplace_deviance(
                 &params,
                 &mut sws,
                 x.as_ref(),
                 &y,
+                &ids.primary,
+                &ids.extra,
                 n,
-                false,
             );
             assert!(
                 (dense - sparse).abs() < 1e-6 * (1.0 + dense.abs()),
-                "{family:?} params={params:?}: dense {dense} vs sparse {sparse}"
+                "{family:?} params={params:?}: dense {dense} vs packed {sparse}"
             );
         }
     }
@@ -3929,33 +4166,19 @@ fn sparse_glmm_fit_matches_dense_in_envelope() {
             };
             let dense = crate::fit_cold(&xflat, &y, n, p, &model, &ids, &opts);
             let (sized, ids, _perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
-            let sp = if matches!(family, Family::NegativeBinomial { .. }) {
-                super::fit_glmm_nb_sparse(
-                    &xflat,
-                    &y,
-                    n,
-                    p,
-                    &sized,
-                    &ids.primary,
-                    &ids.extra,
-                    None,
-                    &opts,
-                )
-            } else {
-                super::fit_glmm_sparse(
-                    &xflat,
-                    &y,
-                    n,
-                    p,
-                    &sized,
-                    &ids.primary,
-                    &ids.extra,
-                    f64::NAN,
-                    None,
-                    &opts,
-                )
-                .0
-            };
+            let sp = crate::fit::fit_glmm_packed(
+                &xflat,
+                &y,
+                n,
+                p,
+                &sized,
+                &ids.primary,
+                &ids.extra,
+                f64::NAN,
+                None,
+                &opts,
+            )
+            .0;
             let tag = format!("{family:?}/{wald_se:?}");
             assert!(
                 dense.converged() && sp.converged(),
@@ -3988,6 +4211,34 @@ fn sparse_glmm_fit_matches_dense_in_envelope() {
                 sp.dispersion,
                 dense.dispersion
             );
+            // The θ-block standard error, which only the joint-Hessian arm
+            // produces: NaN on both sides under `Rx`, and under `Hessian` two
+            // EXACT engines' answers at two independently-reached γ̂. That is
+            // why its band is three orders tighter than the β/`se` bands
+            // above rather than optimizer-scatter-sized: measured worst gap
+            // 1.3e-7 (negative binomial), 2.3e-10 at best (Gamma-log), so
+            // `1e-4` clears the worst by ~760× and still catches any real
+            // movement in this quantity. The per-entry agreement of the two
+            // engines away from an optimizer is pinned separately, at
+            // 2.6e-13, by `packed_and_dense_assembled_hessians_agree`.
+            assert_eq!(
+                sp.stddev_se.len(),
+                dense.stddev_se.len(),
+                "{tag}: stddev_se length"
+            );
+            for (j, (a, b)) in sp.stddev_se.iter().zip(dense.stddev_se.iter()).enumerate() {
+                assert_eq!(
+                    a.is_finite(),
+                    b.is_finite(),
+                    "{tag} stddev_se[{j}]: sparse={a} dense={b} — finiteness must match"
+                );
+                if b.is_finite() {
+                    assert!(
+                        (a - b).abs() < 1e-4 * (1.0 + b.abs()),
+                        "{tag} stddev_se[{j}]: sparse={a} dense={b}"
+                    );
+                }
+            }
         }
     }
 }
@@ -4041,7 +4292,7 @@ fn sparse_glmm_gamma_inverse_fit_matches_dense_and_lme4() {
         };
         let dense = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
         let (sized, ids, _perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
-        let (sp, _dev) = super::fit_glmm_sparse(
+        let (sp, _mu, _dev) = crate::fit::fit_glmm_packed(
             &x,
             &y,
             n,
@@ -4109,12 +4360,10 @@ fn build_binomial_weighted_pair() -> (
     let mut st = 401u64;
     let n_primary = 6usize;
     let extra_levels = [3usize, 4, 3, 5, 3, 4, 3];
-    let u_c: Vec<f64> = (0..n_primary)
-        .map(|_| 0.5 * super::test_lcg(&mut st))
-        .collect();
+    let u_c: Vec<f64> = (0..n_primary).map(|_| 0.5 * lcg(&mut st)).collect();
     let v_e: Vec<Vec<f64>> = extra_levels
         .iter()
-        .map(|&l| (0..l).map(|_| 0.3 * super::test_lcg(&mut st)).collect())
+        .map(|&l| (0..l).map(|_| 0.3 * lcg(&mut st)).collect())
         .collect();
     let pid_a: Vec<u32> = (0..n_agg).map(|i| (i % n_primary) as u32).collect();
     let extra_a: Vec<Vec<u32>> = extra_levels
@@ -4129,7 +4378,7 @@ fn build_binomial_weighted_pair() -> (
     let mut extra_e: Vec<Vec<u32>> = vec![Vec::new(); extra_levels.len()];
     let mut sat = 0.0f64;
     for i in 0..n_agg {
-        let cov = super::test_lcg(&mut st);
+        let cov = lcg(&mut st);
         xa[i * p] = 1.0;
         xa[i * p + 1] = cov;
         let mut e = 0.3 + 0.5 * cov + u_c[pid_a[i] as usize];
@@ -4140,7 +4389,7 @@ fn build_binomial_weighted_pair() -> (
         let m = 2 + (i % 4);
         let mut s = 0usize;
         for _ in 0..m {
-            let uni = 0.5 * (super::test_lcg(&mut st) + 1.0);
+            let uni = 0.5 * (lcg(&mut st) + 1.0);
             let yk = if uni < pr { 1.0 } else { 0.0 };
             s += yk as usize;
             ye.push(yk);
@@ -4222,12 +4471,10 @@ fn build_sparse_weighted_replication_case(
     let mut st = seed;
     let n_primary = 6usize;
     let extra_levels = [3usize, 4, 3, 5, 3, 4, 3];
-    let u_c: Vec<f64> = (0..n_primary)
-        .map(|_| 0.3 * super::test_lcg(&mut st))
-        .collect();
+    let u_c: Vec<f64> = (0..n_primary).map(|_| 0.3 * lcg(&mut st)).collect();
     let v_e: Vec<Vec<f64>> = extra_levels
         .iter()
-        .map(|&l| (0..l).map(|_| 0.2 * super::test_lcg(&mut st)).collect())
+        .map(|&l| (0..l).map(|_| 0.2 * lcg(&mut st)).collect())
         .collect();
     let pid: Vec<u32> = (0..n).map(|i| (i % n_primary) as u32).collect();
     let extra: Vec<Vec<u32>> = extra_levels
@@ -4238,7 +4485,7 @@ fn build_sparse_weighted_replication_case(
     let mut x = vec![0.0f64; n * p];
     let mut y = vec![0.0f64; n];
     for i in 0..n {
-        let cov = 0.3 * super::test_lcg(&mut st);
+        let cov = 0.3 * lcg(&mut st);
         x[i * p] = 1.0;
         x[i * p + 1] = cov;
         let mut eta = 0.3 + 0.4 * cov + u_c[pid[i] as usize];
@@ -4247,11 +4494,11 @@ fn build_sparse_weighted_replication_case(
         }
         y[i] = match family {
             Family::Poisson { .. } => {
-                let jit = 1.0 + 0.4 * super::test_lcg(&mut st);
+                let jit = 1.0 + 0.4 * lcg(&mut st);
                 (eta.exp() * jit).round().max(0.0)
             }
             Family::Gamma { .. } => {
-                let jit = 1.0 + 0.3 * super::test_lcg(&mut st);
+                let jit = 1.0 + 0.3 * lcg(&mut st);
                 (eta.exp() * jit).max(0.05)
             }
             Family::NegativeBinomial { .. } => {
@@ -4259,7 +4506,7 @@ fn build_sparse_weighted_replication_case(
                 // rationale as `build_glmm_case`'s NB arm: the test
                 // compares two fitters on the SAME data, so exact NB
                 // sampling is unnecessary.
-                let jit = 1.0 + 0.4 * super::test_lcg(&mut st);
+                let jit = 1.0 + 0.4 * lcg(&mut st);
                 (eta.exp() * jit).round().max(0.0)
             }
             _ => unreachable!("Poisson/Gamma/NB cases only"),
@@ -4415,14 +4662,17 @@ fn sparse_weighted_binomial_deviance_matches_expanded() {
     use faer::Mat;
     let ((xa, ya, wa, n_a, ids_a), (xe, ye, n_e, ids_e), p, model, sat) =
         build_binomial_weighted_pair();
-    let family = Family::Binomial {
-        link: crate::BinomialLink::Logit,
-    };
-    let g_a = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n_a, &[], &[]);
-    let mut ws_a = super::SparseGlmmWorkspace::new(&g_a, &ids_a.primary, &ids_a.extra, n_a, p);
+    let mut ws_a = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &model, n_a, &[], 1);
+    // The fixture is over-envelope, so it picks the packed-row layout on its
+    // own; pin that, or a fixture drift would quietly move this onto the
+    // blocked kernel and stop testing the Λ-block application.
+    assert_eq!(ws_a.layout, crate::glmm::GlmmLayout::Packed);
+    crate::glmm::fill_packed_cols(&mut ws_a, &ids_a.primary, &ids_a.extra, n_a);
     ws_a.prior_w[..n_a].copy_from_slice(&wa);
-    let g_e = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n_e, &[], &[]);
-    let mut ws_e = super::SparseGlmmWorkspace::new(&g_e, &ids_e.primary, &ids_e.extra, n_e, p);
+    ws_a.weighted = true;
+    let mut ws_e = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &model, n_e, &[], 1);
+    assert_eq!(ws_e.layout, crate::glmm::GlmmLayout::Packed);
+    crate::glmm::fill_packed_cols(&mut ws_e, &ids_e.primary, &ids_e.extra, n_e);
     let xam = Mat::<f64>::from_fn(n_a, p, |i, j| xa[i * p + j]);
     let xem = Mat::<f64>::from_fn(n_e, p, |i, j| xe[i * p + j]);
     // (θ×8, β×2) probe points spanning small/moderate RE scales.
@@ -4430,25 +4680,23 @@ fn sparse_weighted_binomial_deviance_matches_expanded() {
         [0.4f64, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.3, 0.5],
         [0.8, 0.2, 0.5, 0.3, 0.6, 0.2, 0.4, 0.7, -0.2, 0.8],
     ] {
-        let da = super::sparse_glmm_deviance(
-            family,
-            f64::NAN,
+        let da = crate::glmm::glmm_laplace_deviance(
             &params,
             &mut ws_a,
             xam.as_ref(),
             &ya,
+            &ids_a.primary,
+            &ids_a.extra,
             n_a,
-            false,
         );
-        let de = super::sparse_glmm_deviance(
-            family,
-            f64::NAN,
+        let de = crate::glmm::glmm_laplace_deviance(
             &params,
             &mut ws_e,
             xem.as_ref(),
             &ye,
+            &ids_e.primary,
+            &ids_e.extra,
             n_e,
-            false,
         );
         assert!(
             da.is_finite() && de.is_finite(),
@@ -4522,7 +4770,7 @@ fn sparse_weighted_binomial_fit_matches_expanded() {
 /// check: every RE here is scalar (q_p = 1, all extras scalar) and the
 /// family has σ² ≡ 1, so `θ_i = √tau2[i]` exactly reconstructs the
 /// converged Cholesky factor — feeding `[θ.., β..]` back through
-/// `sparse_glmm_deviance` at the SAME (θ, β) must reproduce `f.deviance`
+/// `glmm_laplace_deviance` at the SAME (θ, β) must reproduce `f.deviance`
 /// (mirrors `sparse_glmm_deviance_matches_dense`'s workspace-build pattern).
 #[test]
 fn sparse_glmm_over_envelope_converges_binomial() {
@@ -4531,13 +4779,11 @@ fn sparse_glmm_over_envelope_converges_binomial() {
     let p = 2;
     let mut st = 301u64;
     let n_primary = 6usize;
-    let u_c: Vec<f64> = (0..n_primary)
-        .map(|_| 0.5 * super::test_lcg(&mut st))
-        .collect();
+    let u_c: Vec<f64> = (0..n_primary).map(|_| 0.5 * lcg(&mut st)).collect();
     let extra_levels = [3usize, 4, 3, 5, 3, 4, 3];
     let v_e: Vec<Vec<f64>> = extra_levels
         .iter()
-        .map(|&l| (0..l).map(|_| 0.3 * super::test_lcg(&mut st)).collect())
+        .map(|&l| (0..l).map(|_| 0.3 * lcg(&mut st)).collect())
         .collect();
     let mut x = vec![0.0f64; n * p];
     let mut eta = vec![0.0f64; n];
@@ -4548,7 +4794,7 @@ fn sparse_glmm_over_envelope_converges_binomial() {
         .map(|(g, &l)| (0..n).map(|i| ((i / (g + 1)) % l) as u32).collect())
         .collect();
     for i in 0..n {
-        let cov = super::test_lcg(&mut st);
+        let cov = lcg(&mut st);
         x[i * p] = 1.0;
         x[i * p + 1] = cov;
         let mut e = 0.3 + 0.5 * cov + u_c[pid[i] as usize];
@@ -4589,7 +4835,7 @@ fn sparse_glmm_over_envelope_converges_binomial() {
         .iter()
         .map(|&e| {
             let pr = 1.0 / (1.0 + (-e).exp());
-            let uni = 0.5 * (super::test_lcg(&mut st) + 1.0);
+            let uni = 0.5 * (lcg(&mut st) + 1.0);
             if uni < pr {
                 1.0
             } else {
@@ -4610,17 +4856,20 @@ fn sparse_glmm_over_envelope_converges_binomial() {
     params.extend(f.tau2.iter().map(|t| t.sqrt()));
     params.extend(f.beta.iter().copied());
     let x_mat = Mat::<f64>::from_fn(n, p, |i, j| x[i * p + j]);
-    let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[]);
-    let mut sws = super::SparseGlmmWorkspace::new(&g, &ids.primary, &ids.extra, n, p);
-    let recomputed = super::sparse_glmm_deviance(
-        model.family,
-        f64::NAN,
+    let mut sws = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+    // Over-envelope by construction (the `classify_design_pub` assert above),
+    // so the layout follows; pin it, so a fixture drift cannot move this onto
+    // the blocked kernel.
+    assert_eq!(sws.layout, crate::glmm::GlmmLayout::Packed);
+    crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n);
+    let recomputed = crate::glmm::glmm_laplace_deviance(
         &params,
         &mut sws,
         x_mat.as_ref(),
         &yb,
+        &ids.primary,
+        &ids.extra,
         n,
-        false,
     );
     assert!(
         (recomputed - f.deviance).abs() < 1e-8 * (1.0 + f.deviance.abs()),
@@ -4639,13 +4888,11 @@ fn sparse_glmm_over_envelope_converges_poisson() {
     let p = 2;
     let mut st = 401u64;
     let n_primary = 6usize;
-    let u_c: Vec<f64> = (0..n_primary)
-        .map(|_| 0.5 * super::test_lcg(&mut st))
-        .collect();
+    let u_c: Vec<f64> = (0..n_primary).map(|_| 0.5 * lcg(&mut st)).collect();
     let extra_levels = [3usize, 4, 3, 5, 3, 4, 3];
     let v_e: Vec<Vec<f64>> = extra_levels
         .iter()
-        .map(|&l| (0..l).map(|_| 0.3 * super::test_lcg(&mut st)).collect())
+        .map(|&l| (0..l).map(|_| 0.3 * lcg(&mut st)).collect())
         .collect();
     let mut x = vec![0.0f64; n * p];
     let mut eta = vec![0.0f64; n];
@@ -4656,7 +4903,7 @@ fn sparse_glmm_over_envelope_converges_poisson() {
         .map(|(g, &l)| (0..n).map(|i| ((i / (g + 1)) % l) as u32).collect())
         .collect();
     for i in 0..n {
-        let cov = super::test_lcg(&mut st);
+        let cov = lcg(&mut st);
         x[i * p] = 1.0;
         x[i * p + 1] = cov;
         let mut e = 0.3 + 0.5 * cov + u_c[pid[i] as usize];
@@ -4696,7 +4943,7 @@ fn sparse_glmm_over_envelope_converges_poisson() {
     let yp: Vec<f64> = eta
         .iter()
         .map(|&e| {
-            let jit = 1.0 + 0.4 * super::test_lcg(&mut st);
+            let jit = 1.0 + 0.4 * lcg(&mut st);
             (e.exp() * jit).round().max(0.0)
         })
         .collect();
@@ -4737,17 +4984,19 @@ fn sparse_glmm_over_envelope_converges_poisson() {
     params.extend(f.tau2.iter().map(|t| t.sqrt()));
     params.extend(f.beta.iter().copied());
     let x_mat = Mat::<f64>::from_fn(n, p, |i, j| x[i * p + j]);
-    let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[]);
-    let mut sws = super::SparseGlmmWorkspace::new(&g, &ids.primary, &ids.extra, n, p);
-    let recomputed = super::sparse_glmm_deviance(
-        model.family,
-        f64::NAN,
+    let mut sws = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+    // Same pin as the binomial twin: the layout follows from the over-envelope
+    // shape, and a fixture drift must not move it onto the blocked kernel.
+    assert_eq!(sws.layout, crate::glmm::GlmmLayout::Packed);
+    crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n);
+    let recomputed = crate::glmm::glmm_laplace_deviance(
         &params,
         &mut sws,
         x_mat.as_ref(),
         &yp,
+        &ids.primary,
+        &ids.extra,
         n,
-        false,
     );
     assert!(
         (recomputed - f.deviance).abs() < 1e-8 * (1.0 + f.deviance.abs()),
@@ -4774,10 +5023,8 @@ fn sparse_glmm_over_envelope_converges_gamma() {
     let n_gp = 8usize;
     let n_ge = 6usize;
     let q_g = 5usize;
-    let u_gp: Vec<f64> = (0..n_gp).map(|_| 0.4 * super::test_lcg(&mut st)).collect();
-    let v_ge: Vec<f64> = (0..n_ge * q_g)
-        .map(|_| 0.25 * super::test_lcg(&mut st))
-        .collect();
+    let u_gp: Vec<f64> = (0..n_gp).map(|_| 0.4 * lcg(&mut st)).collect();
+    let v_ge: Vec<f64> = (0..n_ge * q_g).map(|_| 0.25 * lcg(&mut st)).collect();
     let mut x = vec![0.0f64; n * p];
     let mut y = vec![0.0f64; n];
     let gp: Vec<u32> = (0..n).map(|i| (i % n_gp) as u32).collect();
@@ -4785,14 +5032,14 @@ fn sparse_glmm_over_envelope_converges_gamma() {
     for i in 0..n {
         x[i * p] = 1.0;
         for j in 1..p {
-            x[i * p + j] = super::test_lcg(&mut st);
+            x[i * p + j] = lcg(&mut st);
         }
         let l = ge[i] as usize;
         let mut e = 0.5 + u_gp[gp[i] as usize] + v_ge[l * q_g];
         for j in 1..p {
             e += (0.4 + v_ge[l * q_g + j]) * x[i * p + j];
         }
-        let jit = 1.0 + 0.3 * super::test_lcg(&mut st);
+        let jit = 1.0 + 0.3 * lcg(&mut st);
         y[i] = (e.exp() * jit).max(0.05);
     }
     let model = ModelSpec {
@@ -5503,12 +5750,12 @@ fn sparse_lmm_constant_weights_invariant() {
     for i in 0..n {
         g1[i] = (i % n_g1) as u32;
         g2[i] = (i % n_g2) as u32;
-        let x1 = super::test_lcg(&mut st);
+        let x1 = lcg(&mut st);
         x[i * 2] = 1.0;
         x[i * 2 + 1] = x1;
         let re1 = 0.4 * ((g1[i] as f64) - (n_g1 as f64) / 2.0);
         let re2 = 0.3 * ((g2[i] as f64) - (n_g2 as f64) / 2.0);
-        y[i] = 0.5 + 0.4 * x1 + re1 + re2 + 0.2 * super::test_lcg(&mut st);
+        y[i] = 0.5 + 0.4 * x1 + re1 + re2 + 0.2 * lcg(&mut st);
     }
     let model = ModelSpec {
         family: Family::Gaussian,
@@ -5644,12 +5891,12 @@ fn sparse_lmm_constant_weights_invariant() {
     }
 }
 
-/// The sparse LMM route names the components it pinned.
+/// The sparse LMM kernel names the components it pinned.
 ///
-/// Both sparse routes assemble a `Fit` directly rather than going through a
-/// `FitView`, so their `Diagnostics::pinned` is filled at the pin loop instead
-/// of by `fit::common::materialize_diagnostics`. This asserts the two halves
-/// that can drift: that the grid is non-empty at all on this route, and that it
+/// Its pin mask travels the same way the dense kernel's does — out of `fit_lmm`
+/// on the diagnostics carrier, reshaped by `fit::common::materialize_diagnostics`
+/// — so what can drift is the mask itself, not the placement. This asserts the
+/// two halves: that the grid is non-empty at all on this kernel, and that it
 /// lines up block-for-block and slot-for-slot with `stddev_corr`, which is the
 /// alignment both wrapper packages iterate to name the collapsed component.
 ///
@@ -5672,7 +5919,7 @@ fn sparse_lmm_pinned_names_the_collapsed_component() {
     let mut st = 7u64;
     let mut noise = vec![0.0f64; n];
     for e in noise.iter_mut() {
-        *e = 0.1 * (super::test_lcg(&mut st) - 0.5);
+        *e = 0.1 * (lcg(&mut st) - 0.5);
     }
     for lvl in 0..12u32 {
         let rows: Vec<usize> = (0..n).filter(|&i| gp[i] == lvl).collect();
@@ -5682,7 +5929,7 @@ fn sparse_lmm_pinned_names_the_collapsed_component() {
         }
     }
     for i in 0..n {
-        let xi = super::test_lcg(&mut st) * 2.0 - 1.0;
+        let xi = lcg(&mut st) * 2.0 - 1.0;
         let g = ge[i] as f64;
         x[i * p] = 1.0;
         x[i * p + 1] = xi;
@@ -5769,15 +6016,15 @@ fn sparse_lmm_pinned_names_the_second_groupings_slope() {
     let h: Vec<u32> = (0..n).map(|i| (i / 12) as u32).collect();
 
     let mut st = 11u64;
-    let u0: Vec<f64> = (0..12).map(|_| 0.6 * super::test_lcg(&mut st)).collect();
-    let v0: Vec<f64> = (0..20).map(|_| 0.6 * super::test_lcg(&mut st)).collect();
+    let u0: Vec<f64> = (0..12).map(|_| 0.6 * lcg(&mut st)).collect();
+    let v0: Vec<f64> = (0..20).map(|_| 0.6 * lcg(&mut st)).collect();
     // One noise draw per (g-pair, h) cell, shared by the pair's even/odd `g`
     // — see the doc comment above for why this zeroes the x-noise covariance
     // exactly rather than only in expectation.
     let mut noise = vec![0.0f64; n];
     for hh in 0..20u32 {
         for pair in 0..6usize {
-            let v = 0.4 * super::test_lcg(&mut st);
+            let v = 0.4 * lcg(&mut st);
             for gi in [2 * pair, 2 * pair + 1] {
                 let i = hh as usize * 12 + gi;
                 noise[i] = v;
@@ -5854,10 +6101,9 @@ fn sparse_lmm_pinned_names_the_second_groupings_slope() {
     assert!(h_sd[0] > 0.0, "h's intercept variance is real");
 }
 
-/// The sparse GLMM route names the components it pinned — the binomial twin of
-/// [`sparse_lmm_pinned_names_the_collapsed_component`], covering the second of
-/// the two sites that fill `Diagnostics::pinned` outside the view mappers. The
-/// sparse NB route reaches the same site through `fit_glmm_sparse`.
+/// The packed-row GLMM layout names the components it pinned — the binomial
+/// twin of [`sparse_lmm_pinned_names_the_collapsed_component`]. NB reaches the
+/// same site through the same route.
 #[test]
 fn sparse_glmm_pinned_names_the_collapsed_component() {
     let n = 240;
@@ -5868,12 +6114,12 @@ fn sparse_glmm_pinned_names_the_collapsed_component() {
     let ge: Vec<u32> = (0..n).map(|i| (i / 12) as u32).collect();
     let mut st = 13u64;
     for i in 0..n {
-        let xi = super::test_lcg(&mut st) * 2.0 - 1.0;
+        let xi = lcg(&mut st) * 2.0 - 1.0;
         let g = ge[i] as f64;
         x[i * p] = 1.0;
         x[i * p + 1] = xi;
         let eta = 0.4 + 1.2 * xi + 1.5 * (g * 0.37).sin();
-        y[i] = f64::from(super::test_lcg(&mut st) < 1.0 / (1.0 + (-eta).exp()));
+        y[i] = f64::from(lcg(&mut st) < 1.0 / (1.0 + (-eta).exp()));
     }
 
     let model = ModelSpec {
@@ -5966,16 +6212,16 @@ fn sparse_lmm_slope_extra_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSp
     let h: Vec<u32> = (0..n).map(|i| (i / 12) as u32).collect();
 
     let mut st = 71u64;
-    let u0: Vec<f64> = (0..12).map(|_| 0.6 * super::test_lcg(&mut st)).collect();
-    let v0: Vec<f64> = (0..20).map(|_| 0.6 * super::test_lcg(&mut st)).collect();
-    let v1: Vec<f64> = (0..20).map(|_| 0.3 * super::test_lcg(&mut st)).collect();
+    let u0: Vec<f64> = (0..12).map(|_| 0.6 * lcg(&mut st)).collect();
+    let v0: Vec<f64> = (0..20).map(|_| 0.6 * lcg(&mut st)).collect();
+    let v1: Vec<f64> = (0..20).map(|_| 0.3 * lcg(&mut st)).collect();
     for i in 0..n {
         let gi = g[i] as usize;
         let hi = h[i] as usize;
         let x1 = if gi % 2 == 0 { 1.0 } else { -1.0 };
         x[i * p] = 1.0;
         x[i * p + 1] = x1;
-        y[i] = 1.0 + 0.75 * x1 + u0[gi] + v0[hi] + v1[hi] * x1 + 0.3 * super::test_lcg(&mut st);
+        y[i] = 1.0 + 0.75 * x1 + u0[gi] + v0[hi] + v1[hi] * x1 + 0.3 * lcg(&mut st);
     }
 
     let model = ModelSpec {
@@ -6291,11 +6537,8 @@ fn sparse_glmm_rescaling_slope_column_moves_stddev_se_by_the_predicted_power_of_
     );
 }
 
-/// The sparse GLMM route runs the same two-stage search as the dense one, so
-/// it must report the same three quantities. The extra stage-1 warm-start
-/// evaluation at theta-hat-1 (`sparse/glmm.rs`'s `d1`) is a fit-path eval and
-/// is counted; `n_eval` does not include it, so the split is compared with
-/// that one evaluation allowed for.
+/// The packed-row layout runs the same two-stage search the other layouts do,
+/// so it must report the same three quantities.
 #[cfg(feature = "counters")]
 #[test]
 fn sparse_glmm_counters_split_stages_and_histogram() {
@@ -6306,14 +6549,14 @@ fn sparse_glmm_counters_split_stages_and_histogram() {
         ..crate::FitOptions::default()
     };
     let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert!(f.converged(), "sparse GLMM fixture must converge");
+    assert!(f.converged(), "packed GLMM fixture must converge");
     let c = f.counters;
-    assert!(c.stage_evals[0] > 0, "sparse stage 1 must record evals");
-    assert!(c.stage_evals[1] > 0, "sparse stage 2 must record evals");
+    assert!(c.stage_evals[0] > 0, "stage 1 must record evals");
+    assert!(c.stage_evals[1] > 0, "stage 2 must record evals");
     assert_eq!(
         (c.stage_evals[0] + c.stage_evals[1]) as usize,
-        f.n_eval + 1,
-        "stage split reconstructs n_eval plus the stage-1 warm-start eval"
+        f.n_eval,
+        "stage split reconstructs n_eval"
     );
     assert_eq!(
         c.pirls_hist.iter().sum::<u32>(),
@@ -6326,42 +6569,75 @@ fn sparse_glmm_counters_split_stages_and_histogram() {
     );
 }
 
-/// Sparse route (an extra grouping carries a random slope, which pushes
-/// `classify_design` off the dense envelope), overparameterized into
-/// genuine non-convergence: one row per primary cluster (`n_clusters = n`,
-/// intercept-only) crossed with a 6-level extra grouping carrying a slope on
-/// `x`, on `y ∈ {0, 1e6}` split exactly on `x ∈ {0, 1}`. Unlike the plain
-/// separation case (which converges fine — the θ_NB coordinate absorbs it by
-/// parking at `NB_THETA_HI`), the random-effects design here has more
-/// parameters than the data can identify, and the golden-section search's
-/// final θ lands on a fit the inner sparse solver itself rejects.
-/// `dispersion` must be NaN, not the last golden-section θ that search
-/// stood on when it gave up.
+/// Fit as random-intercept-only on data whose true per-cluster slope varies
+/// with SD 8 — the same mismatch
+/// `fit::glmm_tests::fit_glmm_nb_failed_fit_dispersion_is_nan` drives on the
+/// dense route, shared through `fit::common_tests::inf_plateau_*`. Each of
+/// `N_CLUSTERS` clusters draws its own intercept and slope (SD_INT, SD_SLOPE)
+/// and a Gamma-mixed Poisson count at `PER` values of `x`; the fitted primary
+/// grouping carries no slope, so its working-weights PIRLS iteration diverges
+/// on every trial (no random-intercept, fixed-β, fixed-θ_NB point can carry
+/// the SD-8 spread in per-cluster slopes), never settling inside
+/// `PIRLS_MAX_ITERS`. The Laplace objective
+/// forces an unconverged PIRLS solve to `+INFINITY` regardless of whether its
+/// raw deviance was itself finite, so every evaluation the outer search tries
+/// is rejected and the search never sees a finite objective — measured at
+/// caps 200 and 400 alike, bit-identical `n_eval` and outcome. The
+/// intercept-only extra grouping (`slopes: vec![]`) exists only to route
+/// `classify_design` to `Solver::Sparse`, through the crossed-level-count
+/// threshold (`n_clusters: 501` declared, only 6 levels ever populated), not
+/// through a slope: an intercept can shift a level's mean but never supply the
+/// slope the primary grouping is missing, so it cannot rescue the mismatch.
+/// `dispersion` must be NaN, not the last θ any inner search stood on when it
+/// gave up.
 #[test]
 fn sparse_glmm_nb_failed_fit_dispersion_is_nan() {
-    let n = 24;
+    const N_CLUSTERS: usize = 10;
+    const PER: usize = 3;
+    const SD_INT: f64 = 1.5;
+    const SD_SLOPE: f64 = 8.0;
+    const SEED: u64 = 4;
+    let mut state = SEED
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(0x1234_5678 ^ (N_CLUSTERS as u64) << 20);
+    let n = N_CLUSTERS * PER;
     let p = 2;
-    let mut x = vec![0.0f64; n * p];
-    let mut y = vec![0.0f64; n];
-    for i in 0..n {
-        x[i * p] = 1.0;
-        x[i * p + 1] = if i < 12 { 0.0 } else { 1.0 };
-        y[i] = if i < 12 { 0.0 } else { 1e6 };
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    let mut primary = Vec::with_capacity(n);
+    let mut extra = Vec::with_capacity(n);
+    for c in 0..N_CLUSTERS {
+        let ui = SD_INT * inf_plateau_normal(&mut state);
+        let us = SD_SLOPE * inf_plateau_normal(&mut state);
+        for j in 0..PER {
+            let xv = inf_plateau_lcg_next(&mut state) * 2.0 - 1.0;
+            let eta = 0.5 + 0.8 * xv + ui + us * xv;
+            let mu = eta.exp().clamp(1e-8, 1e6);
+            let e = inf_plateau_exp1(&mut state);
+            x.push(1.0);
+            x.push(xv);
+            y.push(inf_plateau_poisson(&mut state, mu * e));
+            primary.push(c as u32);
+            extra.push(((c * PER + j) % 6) as u32);
+        }
     }
-    let primary: Vec<u32> = (0..n as u32).collect(); // one row per cluster
-    let extra: Vec<u32> = (0..n as u32).map(|i| i % 6).collect();
     let model = ModelSpec {
         family: Family::NegativeBinomial {
             link: crate::NegBinomialLink::Log,
         },
         re: Some(ReStructure {
             sizing: Sizing::FixedClusters {
-                n_clusters: n as u32,
+                n_clusters: N_CLUSTERS as u32,
             },
             slopes: vec![],
+            // Intercept-only (`slopes: vec![]`): it can only shift a level's mean,
+            // never absorb a per-cluster SLOPE, so it cannot rescue the mismatch
+            // below. It routes Sparse through the crossed-level-count threshold
+            // (`n_clusters: 501` > `MAX_CROSSED_LEVELS`), not through a slope —
+            // only 6 of the 501 declared levels ever appear in `extra`.
             extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 6 },
-                slopes: vec![1],
+                relation: GroupingRelation::Crossed { n_clusters: 501 },
+                slopes: vec![],
             }],
         }),
     };
@@ -6380,11 +6656,11 @@ fn sparse_glmm_nb_failed_fit_dispersion_is_nan() {
     let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert!(
         !f.converged(),
-        "overparameterized sparse NB GLMM must not converge"
+        "random-slope counts fit as random-intercept-only at this slope spread must not converge"
     );
     assert!(
         f.dispersion.is_nan(),
-        "dispersion must be NaN on a failed fit, not the θ the golden-section search stood on: {}",
+        "dispersion must be NaN on a failed fit, not the θ the search stood on: {}",
         f.dispersion
     );
 }
@@ -6462,4 +6738,263 @@ fn sparse_glmm_sign_trap_escaped() {
         395.2847160881,
         393.9604531018,
     );
+}
+
+/// Both exact Hessian engines on ONE model at ONE (θ, β): the blocked or
+/// structured assembled Hessian against the packed-row assembled one, over
+/// seven cells at two probe points each.
+///
+/// The sharpest statement available about the packed engine. Both sides are
+/// exact — one `F`/`G` adjoint identity, two layouts of the same `A` — and
+/// they differentiate the same objective at the same parameters, so the
+/// agreement is the two PIRLS mode solves' own, not an optimizer's. That is
+/// what separates this from the fit-level cross-check below, where two
+/// independent BOBYQA runs land at nearby but different γ̂ and the bound is
+/// optimizer-scatter-sized.
+///
+/// What the seven cells cover, and what they do not. Four families at
+/// `q_p = 1`, `q_g = 1`, unweighted; the same design again with a random
+/// slope on the PRIMARY grouping (`q_p = 2`, `q_g = 1`, `m = 6`, binomial-logit
+/// and Gamma-log), which is what puts the packed `∂M/∂θ` selection's slope arm
+/// — the `r > 0` branch and its `z_r / s_r` division, live because
+/// `set_slope_scales` runs on both sides — against an exact reference; and a
+/// WEIGHTED Gamma-log cell, which is the one combination where prior weights
+/// and the `aic` substitution's `Φ'`/`Φ''` meet.
+///
+/// A random slope on an EXTRA grouping (`q_g ≥ 2`) cannot be compared here at
+/// all: the dense structured packer is intercept-only on extras by
+/// construction (`workspace::build_packed_m` asserts `!extra_slopes_any`, and
+/// `fit::classify_design` routes any extra-slopes design to the packed layout
+/// for every family), so there is no dense engine to compare against on that
+/// shape. The packed layout's own extra-grouping vech walk is held by
+/// `pirls::packed`'s selection-vs-fill test and, at `q_g = 2`, by the corpus
+/// gates on rung 18.
+///
+/// Gradients and Hessians are compared entry by entry, unsymmetrized, so a
+/// column that a layout fills from the wrong coordinate shows here rather
+/// than averaging away. `BAND = 1e-10` relative, from the first measurement.
+/// Worst gradient / Hessian gap per cell: scalar Gamma-log 6.8e-14 / 1.0e-13,
+/// primary-slope Gamma-log 5.7e-14 / **2.6e-13**, weighted Gamma-log
+/// 3.1e-14 / 5.7e-14; every canonical cell is at or below 7.9e-15 / 8.0e-15.
+/// The three Gamma cells are the large ones because the `aic` substitution
+/// puts a `Φ'`/`Φ''` factor on every term. The band clears the worst by
+/// ~380×.
+#[test]
+fn packed_and_dense_assembled_hessians_agree() {
+    const BAND: f64 = 1e-10;
+    struct CrossCase {
+        family: Family,
+        seed: u64,
+        /// Random slope on the primary grouping, taking `q_p` to 2.
+        primary_slope: bool,
+        weighted: bool,
+    }
+    for case in [
+        CrossCase {
+            family: Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            seed: 101,
+            primary_slope: false,
+            weighted: false,
+        },
+        CrossCase {
+            family: Family::Poisson {
+                link: crate::PoissonLink::Log,
+            },
+            seed: 103,
+            primary_slope: false,
+            weighted: false,
+        },
+        CrossCase {
+            family: Family::Gamma {
+                link: crate::GammaLink::Log,
+            },
+            seed: 107,
+            primary_slope: false,
+            weighted: false,
+        },
+        CrossCase {
+            family: Family::NegativeBinomial {
+                link: crate::NegBinomialLink::Log,
+            },
+            seed: 109,
+            primary_slope: false,
+            weighted: false,
+        },
+        CrossCase {
+            family: Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            seed: 101,
+            primary_slope: true,
+            weighted: false,
+        },
+        CrossCase {
+            family: Family::Gamma {
+                link: crate::GammaLink::Log,
+            },
+            seed: 107,
+            primary_slope: true,
+            weighted: false,
+        },
+        CrossCase {
+            family: Family::Gamma {
+                link: crate::GammaLink::Log,
+            },
+            seed: 107,
+            primary_slope: false,
+            weighted: true,
+        },
+    ] {
+        let family = case.family;
+        let (xflat, y, n, p, mut model, ids) = build_glmm_case(family, case.seed);
+        if case.primary_slope {
+            model
+                .re
+                .as_mut()
+                .expect("build_glmm_case builds a mixed model")
+                .slopes = vec![1];
+        }
+        let slope_cols: &[usize] = if case.primary_slope { &[1] } else { &[] };
+        let x = Mat::<f64>::from_fn(n, p, |i, j| xflat[i * p + j]);
+        // The same gentle weights the weighted sparse-Gamma replication uses,
+        // for the same reason: large integer weights make the reference
+        // engine's Hessian ill-conditioned on this design class.
+        let weights: Vec<f64> = (0..n).map(|i| 1.0 + 0.2 * ((i % 3) as f64 - 1.0)).collect();
+        let wopt = case.weighted.then_some(&weights[..]);
+        let tag = format!(
+            "{family:?}/slope={}/weighted={}",
+            case.primary_slope, case.weighted
+        );
+        // Fixed-(θ,β) derivative cross-check, not a fit, so NB's θ — normally
+        // profiled by the outer search — is a probe constant fed identically
+        // to both sides, as in the deviance cross-check above.
+        let nb_theta = if matches!(family, Family::NegativeBinomial { .. }) {
+            5.0
+        } else {
+            f64::NAN
+        };
+
+        let mut dws = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &model, n, slope_cols, 1);
+        dws.pattern.structured_schur = if dws.groupings.structured_extras_eligible() {
+            crate::glmm::StructuredSchur::new(&dws.groupings, &ids.primary, &ids.extra, n)
+        } else {
+            None
+        };
+        dws.nb_theta = nb_theta;
+        let mut sws =
+            crate::glmm::GlmmWorkspace::for_cluster_spec_packed(p, &model, n, slope_cols, 1);
+        sws.nb_theta = nb_theta;
+        // Both sides get the design's own RE column scales and the same prior
+        // weights, exactly as the production adapter sets them, so θ means the
+        // same thing on each.
+        dws.groupings.set_slope_scales(x.as_ref(), wopt);
+        sws.groupings.set_slope_scales(x.as_ref(), wopt);
+        if case.weighted {
+            dws.prior_w[..n].copy_from_slice(&weights);
+            sws.prior_w[..n].copy_from_slice(&weights);
+            dws.weighted = true;
+            sws.weighted = true;
+        }
+        crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n);
+
+        // `[θ vech | β]`. The slope cells carry the primary block's full 3-entry
+        // vech in place of its single variance.
+        let probes: &[&[f64]] = if case.primary_slope {
+            &[
+                &[0.5, 0.2, 0.4, 0.7, 0.3, 0.5],
+                &[0.8, -0.1, 0.3, 0.2, -0.2, 0.8],
+            ]
+        } else {
+            &[&[0.5, 0.7, 0.3, 0.5], &[1.0, 0.2, -0.2, 0.8]]
+        };
+        for params in probes {
+            let m = params.len();
+            assert_eq!(m, dws.n_theta + p, "{tag}: probe length");
+            dws.fd.pirls_tol_override = Some(1e-12);
+            sws.fd.pirls_tol_override = Some(1e-12);
+            // One deviance evaluation per side first: it is what fills
+            // `z_buf` on the dense side and leaves both workspaces at a mode
+            // for this (θ, β), which is where each engine's own solve then
+            // warm-starts.
+            let _ = crate::glmm::glmm_laplace_deviance(
+                params,
+                &mut dws,
+                x.as_ref(),
+                &y,
+                &ids.primary,
+                &ids.extra,
+                n,
+            );
+            let _ = crate::glmm::glmm_laplace_deviance(
+                params,
+                &mut sws,
+                x.as_ref(),
+                &y,
+                &ids.primary,
+                &ids.extra,
+                n,
+            );
+            dws.params[..m].copy_from_slice(params);
+            sws.params[..m].copy_from_slice(params);
+
+            let mut hd = Mat::<f64>::zeros(m, m);
+            let mut hs = Mat::<f64>::zeros(m, m);
+            let mut gd = vec![0.0; m];
+            let mut gs = vec![0.0; m];
+            let st_d = crate::glmm::joint_hessian_columns(
+                &mut dws,
+                x.as_ref(),
+                &y,
+                &ids.primary,
+                &ids.extra,
+                p,
+                n,
+                &mut gd,
+                &mut hd,
+            );
+            let st_s = crate::glmm::joint_hessian_columns(
+                &mut sws,
+                x.as_ref(),
+                &y,
+                &ids.primary,
+                &ids.extra,
+                p,
+                n,
+                &mut gs,
+                &mut hs,
+            );
+            assert!(
+                matches!(st_d, crate::glmm::DerivStatus::Ok(_)),
+                "{tag} params={params:?}: the dense assembled engine declined"
+            );
+            assert!(
+                matches!(st_s, crate::glmm::DerivStatus::Ok(_)),
+                "{tag} params={params:?}: the packed assembled engine declined"
+            );
+            for a in 0..m {
+                let gap = (gd[a] - gs[a]).abs() / gd[a].abs().max(1.0);
+                assert!(
+                    gap <= BAND,
+                    "{tag} params={params:?} grad[{a}]: dense {} vs packed {} \
+                     (relative gap {gap:e})",
+                    gd[a],
+                    gs[a]
+                );
+                for b in 0..m {
+                    let gap = (hd[(a, b)] - hs[(a, b)]).abs() / hd[(a, b)].abs().max(1.0);
+                    assert!(
+                        gap <= BAND,
+                        "{tag} params={params:?} hess[({a},{b})]: dense {} vs packed {} \
+                         (relative gap {gap:e})",
+                        hd[(a, b)],
+                        hs[(a, b)]
+                    );
+                }
+            }
+            dws.fd.pirls_tol_override = None;
+            sws.fd.pirls_tol_override = None;
+        }
+    }
 }

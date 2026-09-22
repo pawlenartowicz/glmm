@@ -41,23 +41,18 @@
 //! `H·δ²` — and a coordinate where that cannot be established is reported as
 //! such rather than quietly given a number.
 //!
-//! Both paths are driven here. The measurement lives under `sparse` because the
-//! sparse deviance evaluator is private to this module tree, while the dense
-//! one is `pub(crate)` and reachable from anywhere.
+//! Every mixed non-Gaussian rung in the corpus is driven here, whichever
+//! `A`-layout its design takes.
 
 use faer::linalg::solvers::Solve;
-use faer::{Mat, MatRef};
+use faer::Mat;
 use serde_json::Value;
 
-use super::glmm::{
-    sparse_glmm_deviance, SparseGlmmWorkspace, GAMMA_HAT_CAPTURE, SPARSE_FD_STEP_REL,
-};
 use crate::formula::{lower, Column, Table};
 use crate::glmm::{
-    build_z, fd_mixed_diff, fd_second_diff, glmm_laplace_deviance, pirls_tol_fd, GlmmWorkspace,
-    StructuredSchur, FD_STEP_BASE,
+    fd_mixed_diff, fd_second_diff, fill_packed_cols, glmm_laplace_deviance, pirls_tol_fd,
+    GlmmLayout, GlmmWorkspace, StructuredSchur, FD_STEP_BASE, SPARSE_FD_STEP_REL,
 };
-use crate::lmm::LmmGroupings;
 use crate::{
     BinomialLink, Family, FitOptions, GammaLink, GroupIds, ModelSpec, NegBinomialLink, PoissonLink,
     WaldSe,
@@ -149,6 +144,7 @@ fn family_of(spec: &Value) -> Family {
             link: match link {
                 None | Some("logit") => BinomialLink::Logit,
                 Some("probit") => BinomialLink::Probit,
+                Some("cloglog") => BinomialLink::Cloglog,
                 Some(o) => panic!("binomial link {o}"),
             },
         },
@@ -579,15 +575,21 @@ fn probe(
     }
 }
 
-/// Dense (`Solver::NoZ`) arm: fit through the dense GLMM kernel, then difference
-/// its own deviance evaluator at exactly the point and seed the shipped FD pass
-/// differences. Mirrors `fit_glmm_build`'s workspace construction — the FD grid
-/// is only the shipped one if the design, scales and Z are built the same way.
-fn measure_dense(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
+/// Fit through the GLMM kernel, then difference its own deviance evaluator at
+/// exactly the point and seed the shipped FD pass differences. Mirrors
+/// `fit_glmm_build`'s workspace construction — the FD grid is only the shipped
+/// one if the design, scales and the built `M` columns come out the same way.
+fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     let (n, p) = (r.n, r.p);
     let re = sized.re.as_ref().expect("mixed rung");
     let slope_cols: Vec<usize> = re.slopes.iter().map(|&c| c as usize).collect();
-    let mut ws = GlmmWorkspace::for_cluster_spec(p, sized, n, &slope_cols, 1);
+    let extra_slope_cols: Vec<Vec<usize>> = re
+        .extra_groupings
+        .iter()
+        .map(|g| g.slopes.iter().map(|&c| c as usize).collect())
+        .collect();
+    let mut ws =
+        GlmmWorkspace::for_cluster_spec_ext(p, sized, n, &slope_cols, &extra_slope_cols, 1);
     if let Some(w) = &r.opts.weights {
         ws.prior_w[..n].copy_from_slice(w);
         ws.weighted = true;
@@ -596,8 +598,8 @@ fn measure_dense(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     let x_mat = Mat::<f64>::from_fn(n, p, |i, j| r.x[i * p + j]);
     ws.groupings
         .set_slope_scales(x_mat.as_ref(), r.opts.weights.as_deref());
-    build_z(&mut ws, x_mat.as_ref(), &ids.primary, &ids.extra, n);
-    ws.structured_schur = if ws.groupings.structured_extras_eligible() {
+    fill_packed_cols(&mut ws, &ids.primary, &ids.extra, n);
+    ws.pattern.structured_schur = if ws.layout == GlmmLayout::Structured {
         StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
     } else {
         None
@@ -605,15 +607,14 @@ fn measure_dense(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     // Observed twin of the crossed-Schur symbolic factor, so the exact β-profile's
     // adjoint solve can run on `A_obs` without overwriting the Fisher factor every
     // later pass reads. Built only where the exact profile can read it: a
-    // non-canonical link on the structured route — canonical links never read
+    // non-canonical link on the structured layout — canonical links never read
     // it, so building it here would be pure cost.
-    ws.exact_prof.obs_schur = if ws.groupings.structured_extras_eligible()
-        && !crate::family::is_canonical(sized.family)
-    {
-        StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
-    } else {
-        None
-    };
+    ws.exact_prof.obs_schur =
+        if ws.layout == GlmmLayout::Structured && !crate::family::is_canonical(sized.family) {
+            StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
+        } else {
+            None
+        };
     let beta_start = crate::fit::glm_warm_start_beta(
         sized.family,
         f64::NAN,
@@ -629,7 +630,7 @@ fn measure_dense(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     // the flag the `se_shipped` self-check below would compare the probe's FD
     // numbers against exact ones and fail at the size of the stencil's own
     // error, which is the quantity being measured.
-    ws.force_fd_hessian = true;
+    ws.fd.force_fd_hessian = true;
     let fit = crate::glmm::fit_glmm(
         &mut ws,
         x_mat.as_ref(),
@@ -642,8 +643,8 @@ fn measure_dense(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
         n,
         WaldSe::Hessian,
     );
-    assert!(fit.converged, "{}: dense fit must converge", r.name);
-    let se_shipped: Vec<f64> = (0..p).map(|j| ws.var_diag[j].sqrt()).collect();
+    assert!(fit.converged, "{}: fit must converge", r.name);
+    let se_shipped: Vec<f64> = (0..p).map(|j| ws.inference.var_diag[j].sqrt()).collect();
 
     // Freeze the FD grid on the fit's own converged mode, as `joint_hessian_cov`
     // does: every eval below warm-starts from this one seed, so each f(γ) is a
@@ -652,12 +653,16 @@ fn measure_dense(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     let n_theta = ws.n_theta;
     let gamma: Vec<f64> = ws.params[..m].to_vec();
     let kk = ws.k.max(1);
-    let seed: Vec<f64> = ws.u[..kk].to_vec();
+    let seed: Vec<f64> = ws.pirls.u[..kk].to_vec();
     ws.u_seed[..kk].copy_from_slice(&seed);
-    ws.warm_seed_active = true;
+    ws.fd.warm_seed_active = true;
+    // Whichever step rule the layout's shipped stencil uses — the packed-row one
+    // is relative on every coordinate, the other two absolute on the θ block.
     let steps: Vec<f64> = (0..m)
         .map(|k| {
-            if k < n_theta {
+            if ws.layout == GlmmLayout::Packed {
+                SPARSE_FD_STEP_REL * gamma[k].abs().max(1.0)
+            } else if k < n_theta {
                 FD_STEP_BASE
             } else {
                 FD_STEP_BASE * gamma[k].abs().max(1.0)
@@ -672,7 +677,7 @@ fn measure_dense(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
         for (&c, &d) in coords.iter().zip(deltas) {
             scratch[c] += d;
         }
-        ws.pirls_tol_override = Some(tol);
+        ws.fd.pirls_tol_override = Some(tol);
         glmm_laplace_deviance(&scratch, &mut ws, xr, y, cid, eid, n)
     };
     let out = probe(
@@ -684,69 +689,8 @@ fn measure_dense(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
         se_shipped,
         &mut dev,
     );
-    ws.pirls_tol_override = None;
-    ws.warm_seed_active = false;
-    out
-}
-
-/// Sparse (`Solver::Sparse`) arm. Every sparse deviance eval cold-seeds û = 0,
-/// so it is a pure function of γ and no seed discipline is needed; γ̂ comes from
-/// the shipped fit through `GAMMA_HAT_CAPTURE` (see its comment for why it
-/// cannot be read off the returned `Fit`).
-fn measure_sparse(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
-    let (n, p) = (r.n, r.p);
-    let re = sized.re.as_ref().expect("mixed rung");
-    let slope_cols: Vec<usize> = re.slopes.iter().map(|&c| c as usize).collect();
-    let extra_slope_cols: Vec<Vec<usize>> = re
-        .extra_groupings
-        .iter()
-        .map(|g| g.slopes.iter().map(|&c| c as usize).collect())
-        .collect();
-
-    GAMMA_HAT_CAPTURE.with(|s| *s.borrow_mut() = Some(vec![]));
-    let fit = crate::fit_cold(&r.x, &r.y, n, p, &r.model, &r.ids, &r.opts);
-    let gamma = GAMMA_HAT_CAPTURE
-        .with(|s| s.borrow_mut().take())
-        .expect("capture armed");
-    assert!(fit.converged(), "{}: sparse fit must converge", r.name);
-    let se_shipped = fit.se.clone();
-
-    let xm = MatRef::from_row_major_slice(&r.x, n, p);
-    let mut g = LmmGroupings::from_cluster_spec_ext(sized, n, &slope_cols, &extra_slope_cols);
-    g.set_slope_scales(xm, r.opts.weights.as_deref());
-    let n_theta = g.n_theta();
-    let m = n_theta + p;
-    assert_eq!(gamma.len(), m, "{}: captured γ̂ width", r.name);
-    let mut ws = SparseGlmmWorkspace::new(&g, &ids.primary, &ids.extra, n, p);
-    if let Some(w) = &r.opts.weights {
-        ws.prior_w[..n].copy_from_slice(w);
-    }
-    ws.offset = r.opts.offset.clone();
-
-    let steps: Vec<f64> = gamma
-        .iter()
-        .map(|&v| SPARSE_FD_STEP_REL * v.abs().max(1.0))
-        .collect();
-    let (y, family) = (&r.y, r.family);
-    let mut scratch = vec![0.0f64; m];
-    let mut dev = |tol: f64, coords: &[usize], deltas: &[f64]| {
-        scratch.copy_from_slice(&gamma);
-        for (&c, &d) in coords.iter().zip(deltas) {
-            scratch[c] += d;
-        }
-        ws.pirls_tol_override = Some(tol);
-        sparse_glmm_deviance(family, f64::NAN, &scratch, &mut ws, xm, y, n, false)
-    };
-    let out = probe(
-        m,
-        n_theta,
-        p,
-        steps,
-        pirls_tol_fd(family),
-        se_shipped,
-        &mut dev,
-    );
-    ws.pirls_tol_override = None;
+    ws.fd.pirls_tol_override = None;
+    ws.fd.warm_seed_active = false;
     out
 }
 
@@ -771,11 +715,7 @@ fn cell_of(sized: &ModelSpec, family: Family) -> (&'static str, &'static str) {
 fn measure_rung(r: &Rung) -> (&'static str, &'static str, Measured) {
     let (sized, sids, _perm) = crate::fit::spec_sized_from_ids_pub(&r.model, &r.ids);
     let (path, link) = cell_of(&sized, r.family);
-    let meas = if path == "sparse" {
-        measure_sparse(r, &sized, &sids)
-    } else {
-        measure_dense(r, &sized, &sids)
-    };
+    let meas = measure_fit(r, &sized, &sids);
     if let Some(se) = &meas.se[FULL] {
         for (j, (&a, &b)) in se.iter().zip(&meas.se_shipped).enumerate() {
             let rel = (a - b).abs() / b.abs().max(f64::MIN_POSITIVE);

@@ -28,9 +28,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Run the full CI suite (fmt + clippy + test + msrv + wasm + publish dry-run)
-  # against the tagged commit. Everything downstream is gated on this — a tag that
-  # fails any gate never reaches an index.
+  # Run the full CI suite (fmt + clippy + test + msrv + wasm + publish dry-run +
+  # r + python) against the tagged commit. Everything downstream is gated on
+  # this — a tag that fails any gate never reaches an index.
   verify:
     uses: ./.github/workflows/ci.yml
 

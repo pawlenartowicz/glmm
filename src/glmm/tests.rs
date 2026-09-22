@@ -6,23 +6,63 @@ use super::se::*;
 use super::workspace::*;
 use super::*;
 use crate::counters::EvalCounters;
-use crate::test_support::{intercept_only_spec, TestWs, KKT_INTERIOR_MAX};
+use crate::test_support::{intercept_only_spec, TestWs};
 use crate::{
-    BinomialLink, Boundary, Family, FitOptions, GammaLink, GroupIds, Grouping, GroupingRelation,
-    ModelSpec, NegBinomialLink, PoissonLink, ReStructure, Sizing, WaldSe,
+    BinomialLink, Family, GammaLink, Grouping, GroupingRelation, ModelSpec, NegBinomialLink,
+    PoissonLink, ReStructure, Sizing, WaldSe,
 };
 use faer::linalg::solvers::Solve;
 
-/// The dense GLMM kernel entry rejects a hand-built workspace whose extra
-/// grouping carries a random slope (`extra_slopes_any`). In normal use
-/// `classify_design` routes any extra-slope shape to Sparse, so the guard is the
-/// backstop for a caller that constructs the dense `GlmmWorkspace` directly — without
-/// it, a release build would silently drop the slope. The panic comes from
-/// `from_groupings` (release too), not from the per-eval `debug_assert`s, so it
-/// fires at `for_cluster_spec` above rather than inside `fit_glmm`.
+/// Fold the packed `M` values at `params` into a workspace already built on the
+/// packed layout with its columns filled (`fill_packed_cols`) — the oracle fill
+/// the blocked and structured kernels are checked against below. The packed
+/// layout orders the primary RE block component-major (`c·n_primary + f`) where
+/// the other two are level-major (`f·q_p + c`), so `u` and `M`'s columns come
+/// out permuted; see [`packed_u_index`].
+fn packed_oracle_fill(ws: &mut GlmmWorkspace, x: faer::MatRef<f64>, params: &[f64], n: usize) {
+    let nt = ws.n_theta;
+    crate::sparse::fill_lambda_small(&params[..nt], &ws.groupings, &mut ws.packed.lam_small);
+    fill_m_vals(&mut ws.packed, &ws.groupings, x, n);
+}
+
+/// Level-major RE index (`f·q_p + c`, the blocked and structured layouts) → the
+/// packed layout's component-major index (`c·n_primary + f`). Outside the
+/// primary block the two orders coincide.
+fn packed_u_index(q: usize, s: usize, idx: usize) -> usize {
+    if idx < q * s {
+        (idx % q) * s + idx / q
+    } else {
+        idx
+    }
+}
+
+/// Dense `M = ZΛ` scattered out of a packed workspace's rows — the dense Schur
+/// recomputations below need a full `n×k` matrix. Columns are in the packed
+/// layout's order, which permutes `M` relative to the blocked and structured
+/// layouts; a Schur complement is invariant under that permutation, since `A`
+/// and `X'W̃M` permute together.
+fn packed_dense_m(ws: &GlmmWorkspace, n: usize, k: usize) -> Mat<f64> {
+    let width = ws.packed.width;
+    let mut m = Mat::<f64>::zeros(n, k);
+    for i in 0..n {
+        for t in i * width..(i + 1) * width {
+            m[(i, ws.packed.m_cols[t] as usize)] = ws.packed.m_vals[t];
+        }
+    }
+    m
+}
+
+/// The blocked and structured GLMM kernels reject a hand-built workspace whose
+/// extra grouping carries a random slope (`extra_slopes_any`): they build
+/// intercept-only extras, so such a design would fit a REDUCED model and report
+/// it as a normal success. `classify_design` routes any extra-slope shape to
+/// Sparse and `GlmmLayout::for_design` puts it on the packed layout, which does
+/// carry the slope — the guard is the backstop for a caller that asks for a
+/// blocked or structured workspace over that design anyway. The panic comes from
+/// `from_groupings` (release too), not from a per-eval `debug_assert`.
 #[test]
-#[should_panic(expected = "route it to the sparse solver")]
-fn dense_glmm_entry_rejects_extra_slopes() {
+#[should_panic(expected = "slope-carrying extra grouping")]
+fn structured_glmm_entry_rejects_extra_slopes() {
     let model = ModelSpec {
         family: Family::Binomial {
             link: BinomialLink::Logit,
@@ -38,22 +78,34 @@ fn dense_glmm_entry_rejects_extra_slopes() {
     };
     let n = 8;
     let p = 2;
-    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
-    let x = faer::Mat::<f64>::zeros(n, p);
-    let y = vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
-    let cluster_ids = vec![0u32, 0, 1, 1, 0, 0, 1, 1];
-    let _ = fit_glmm(
-        &mut ws,
-        x.as_ref(),
-        &y,
-        &cluster_ids,
-        &[],
-        &[],
-        None,
-        &[0.0; 2],
-        n,
-        WaldSe::Hessian,
-    );
+    let groupings = crate::lmm::LmmGroupings::from_cluster_spec(&model, n, &[]);
+    let _ = GlmmWorkspace::from_groupings(groupings, model.family, p, n, 1, GlmmLayout::Structured);
+}
+
+/// The packed layout is Laplace-only (see `from_groupings`'s doc): whatever
+/// `nagq` the caller asks for, a packed workspace pins it to 1 before
+/// `outer_search` is computed, so the route decision sees the nAGQ the
+/// workspace will actually run.
+#[test]
+fn packed_layout_pins_nagq_to_one() {
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 2 },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 2 },
+                slopes: vec![1],
+            }],
+        }),
+    };
+    let n = 8;
+    let p = 2;
+    let groupings = crate::lmm::LmmGroupings::from_cluster_spec(&model, n, &[]);
+    let ws = GlmmWorkspace::from_groupings(groupings, model.family, p, n, 7, GlmmLayout::Packed);
+    assert_eq!(ws.nagq, 1);
 }
 
 /// Intercept-only spec carrying the **binomial-logit** family. `ws.family` drives
@@ -65,6 +117,30 @@ fn logit_intercept_spec(sizing: Sizing) -> ModelSpec {
         link: BinomialLink::Logit,
     };
     s
+}
+
+/// `for_design` on the two NoZ edges the `Packed` assertions elsewhere don't
+/// cover: no extras picks the no-extras blocked path, and intercept-only
+/// crossed extras (in-envelope, so `structured_extras_eligible`) pick the
+/// structured path.
+#[test]
+fn for_design_picks_blocked_and_structured() {
+    let no_extras = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 10 });
+    let g = crate::lmm::LmmGroupings::from_cluster_spec(&no_extras, 40, &[]);
+    assert_eq!(
+        GlmmLayout::for_design(&no_extras, &g),
+        GlmmLayout::Blocked,
+        "no extras must pick the no-extras blocked path"
+    );
+
+    let (_, _, _, _, with_extras) = glmm_extras_q1_dataset(0, 3);
+    let g = crate::lmm::LmmGroupings::from_cluster_spec(&with_extras, 96, &[]);
+    assert!(g.structured_extras_eligible());
+    assert_eq!(
+        GlmmLayout::for_design(&with_extras, &g),
+        GlmmLayout::Structured,
+        "in-envelope intercept-only crossed extras must pick the structured path"
+    );
 }
 
 // Tiny deterministic LCG → reproducible test data without RNG-determinism caveats.
@@ -134,8 +210,8 @@ fn glmm_slope_crossed_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<u32>, Mode
         let p = 1.0 / (1.0 + (-eta).exp());
         y[i] = if lcg(&mut st) + 0.5 < p { 1.0 } else { 0.0 };
     }
-    // Slope on design col 0 of the [1, x1] X passed to build_z (the slope_cols
-    // arg is &[1] there — the x1 column index in the full X); the spec carries
+    // Slope on design col 0 of the [1, x1] X the kernels read (the slope_cols
+    // arg is &[1] — the x1 column index in the full X); the spec carries
     // ONE slope + ONE crossed grouping so for_cluster_spec sizes q_p=2 + tail.
     let cluster = ModelSpec {
         family: Family::Binomial {
@@ -278,7 +354,6 @@ fn laplace_deviance_matches_brute_force_intercept() {
     let want = brute_force_intercept_laplace(0.5, &beta, &xf64, &y, &ids, 8);
     let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.5;
     ws.params[1] = beta[0];
     ws.params[2] = beta[1];
@@ -307,7 +382,6 @@ fn beta_fixed_mode_is_pure_plumbing() {
     let (xf64, y, ids) = glmm_intercept_dataset();
     let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.5;
     ws.params[1] = 0.2;
     ws.params[2] = 0.8;
@@ -329,7 +403,6 @@ fn agq_k1_reduces_to_laplace() {
     let (xf64, y, ids) = glmm_intercept_dataset();
     let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.5; // θ (Λ scalar) ≠ 1 — exercises the λ-scale
     ws.params[1] = 0.2;
     ws.params[2] = 0.8;
@@ -407,7 +480,6 @@ fn agq_weighted_aggregated_equals_expanded_plus_saturated_const() {
     });
     for nagq in [1u8, 7] {
         let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, n_a, &[], nagq);
-        build_z(&mut ws_a, xa_mat.as_ref(), &ids_a, &[], n_a);
         ws_a.weighted = true;
         ws_a.prior_w[..n_a].copy_from_slice(&wa);
         ws_a.params[0] = 0.5; // θ (Λ scalar)
@@ -417,7 +489,6 @@ fn agq_weighted_aggregated_equals_expanded_plus_saturated_const() {
         let da = glmm_agq_deviance(&pa, &mut ws_a, xa_mat.as_ref(), &ya, &ids_a, n_a, nagq);
 
         let mut ws_e = GlmmWorkspace::for_cluster_spec(2, &cluster, n_e, &[], nagq);
-        build_z(&mut ws_e, xe_mat.as_ref(), &ids_e, &[], n_e);
         ws_e.params[0] = 0.5;
         ws_e.params[1] = 0.2;
         ws_e.params[2] = 0.8;
@@ -444,7 +515,6 @@ fn agq_cluster_outer_bit_identical_to_node_outer() {
     let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     for nagq in [3u8, 7, 11] {
         let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
-        build_z(&mut ws_a, xf64.as_ref(), &ids, &[], 80);
         ws_a.params[0] = 0.5; // θ (Λ scalar) ≠ 1 — exercises the λ-scale, mirrors agq_k1_reduces_to_laplace
         ws_a.params[1] = 0.2;
         ws_a.params[2] = 0.8;
@@ -452,7 +522,6 @@ fn agq_cluster_outer_bit_identical_to_node_outer() {
         ws_a.cluster_rows = Some(ClusterRowIndex::build(&ids, ws_a.groupings.n_primary));
 
         let mut ws_b = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
-        build_z(&mut ws_b, xf64.as_ref(), &ids, &[], 80);
         ws_b.cluster_rows = None;
 
         let da = glmm_agq_deviance(&params, &mut ws_a, xf64.as_ref(), &y, &ids, 80, nagq);
@@ -470,7 +539,6 @@ fn agq_parallel_bit_identical_to_serial() {
     let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     for nagq in [3u8, 7, 11] {
         let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
-        build_z(&mut ws_a, xf64.as_ref(), &ids, &[], 80);
         ws_a.params[0] = 0.5; // θ (Λ scalar) ≠ 1 — exercises the λ-scale, mirrors agq_k1_reduces_to_laplace
         ws_a.params[1] = 0.2;
         ws_a.params[2] = 0.8;
@@ -480,7 +548,6 @@ fn agq_parallel_bit_identical_to_serial() {
         ws_a.cluster_rows = Some(ClusterRowIndex::build(&ids, ws_a.groupings.n_primary));
 
         let mut ws_b = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
-        build_z(&mut ws_b, xf64.as_ref(), &ids, &[], 80);
         ws_b.cluster_rows = None; // knob-off path: always the original serial node-outer loop
 
         let da = glmm_agq_deviance(&params, &mut ws_a, xf64.as_ref(), &y, &ids, 80, nagq);
@@ -557,7 +624,6 @@ fn agq_vec_k1_reduces_to_laplace_q2() {
     let n = y.len();
     let cluster = slope1_spec();
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     ws.params[0] = 0.5; // vech(Λ_p): [σ_int, cov, σ_slope] ≠ I
     ws.params[1] = 0.1;
     ws.params[2] = 0.4;
@@ -580,7 +646,6 @@ fn agq_vec_k1_reduces_to_laplace_q3() {
     let n = y.len();
     let cluster = slope2_spec();
     let mut ws = GlmmWorkspace::for_cluster_spec(3, &cluster, n, &[1, 2], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     // vech(Λ_p) column-major lower-tri of a 3×3, non-identity.
     let theta = [0.6, 0.1, 0.05, 0.4, 0.08, 0.3];
     ws.params[..6].copy_from_slice(&theta);
@@ -607,7 +672,6 @@ fn agq_vec_parallel_bit_identical_to_serial_q2() {
     let cluster = slope1_spec();
     for nagq in [3u8, 7, 9] {
         let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], nagq);
-        build_z(&mut ws_a, xf64.as_ref(), &ids, &[], n);
         ws_a.params[0] = 0.5;
         ws_a.params[1] = 0.1;
         ws_a.params[2] = 0.4;
@@ -619,7 +683,6 @@ fn agq_vec_parallel_bit_identical_to_serial_q2() {
         ws_a.cluster_rows = Some(ClusterRowIndex::build(&ids, ws_a.groupings.n_primary));
 
         let mut ws_b = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], nagq);
-        build_z(&mut ws_b, xf64.as_ref(), &ids, &[], n);
         ws_b.cluster_rows = None; // serial cluster-outer arm (builds a transient index)
 
         let da = glmm_agq_deviance(&params, &mut ws_a, xf64.as_ref(), &y, &ids, n, nagq);
@@ -639,7 +702,6 @@ fn agq_vec_k_convergence_self_consistent_q2() {
     let theta_beta = [0.5_f64, 0.1, 0.4, 0.2, 0.8];
     let dev_at = |nagq: u8| {
         let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], nagq);
-        build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
         ws.params[..5].copy_from_slice(&theta_beta);
         let p = ws.params.clone();
         glmm_agq_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, n, nagq)
@@ -673,7 +735,6 @@ fn laplace_deviance_collapses_to_glm_at_theta_zero() {
     let beta = [0.2_f64, 0.8];
     let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.0;
     ws.params[1] = beta[0];
     ws.params[2] = beta[1];
@@ -703,52 +764,42 @@ fn laplace_deviance_collapses_to_glm_at_theta_zero() {
 }
 
 #[test]
-fn build_z_width_general_populates_all_columns() {
-    let (xf64, _y, ids, crossed_ids, cluster) = glmm_slope_crossed_dataset();
+fn packed_cols_populate_every_re_column() {
+    let (_xf64, _y, ids, crossed_ids, cluster) = glmm_slope_crossed_dataset();
     let n = ids.len();
-    let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
     // This model (q_p=2 slope + one intercept-only crossed extra) is
-    // structured-eligible, so `ws.z` is 0×0 by construction (`build_z` fills
-    // it only on the dense-fallback route). This test drives
-    // `build_z` directly to check its column layout, not through the
-    // structured deviance path, so force the dense buffers into existence.
-    ws.ensure_dense_buffers();
-    build_z(
-        &mut ws,
-        xf64.as_ref(),
-        &ids,
-        std::slice::from_ref(&crossed_ids),
-        n,
-    );
-    let mut touched = vec![false; ws.k];
-    #[allow(clippy::needless_range_loop)]
-    for c in 0..ws.k {
-        for i in 0..n {
-            if ws.z[(i, c)] != 0.0 {
-                touched[c] = true;
-            }
+    // structured-eligible, so its packed buffers are zero-length by
+    // construction. The test pins `fill_packed_cols`'s column layout, not the
+    // structured deviance path, so it builds the workspace on the packed layout.
+    let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
+    fill_packed_cols(&mut ws, &ids, &[crossed_ids], n);
+    let width = ws.packed.width;
+    // rows[c] = the rows whose packed nonzeros touch RE column c.
+    let mut rows: Vec<Vec<usize>> = vec![Vec::new(); ws.k];
+    for i in 0..n {
+        for t in i * width..(i + 1) * width {
+            rows[ws.packed.m_cols[t] as usize].push(i);
         }
     }
     assert!(
-        touched.iter().all(|&t| t),
+        rows.iter().all(|r| !r.is_empty()),
         "every RE column must be populated — offset wiring"
     );
 
-    // "some nonzero" can't catch an offset swap between two same-width
-    // groupings (e.g. crossed level 1 landing in level 2's slot) — pin the
-    // EXACT nonzero row set per column instead. Layout from `build_z`:
-    // primary is per-level (`base = lvl*q`, col `2*lvl` = intercept, col
-    // `2*lvl+1` = slope), n_prim=8 levels at q=2; the crossed block starts
-    // at the absolute offset `n_prim*q=16`, one column per of its 4 levels.
+    // "some row" can't catch an offset swap between two same-width groupings
+    // (e.g. crossed level 1 landing in level 2's slot) — pin the EXACT row set
+    // per column instead. Packed layout: the primary block is component-major
+    // (`c·n_prim + lvl`, n_prim=8 levels at q=2, so cols 0..7 are intercepts and
+    // 8..15 slopes); the crossed block starts at the absolute offset
+    // `n_prim*q = 16`, one column per of its 4 levels.
     // `glmm_slope_crossed_dataset` sets `ids[i] = i % 8`, `crossed[i] = i % 4`.
     let n_prim = 8usize;
     let n_crossed = 4usize;
     for lvl in 0..n_prim {
         let expect_rows: Vec<usize> = (0..n).filter(|&i| i % n_prim == lvl).collect();
-        for (kind, col) in [("intercept", 2 * lvl), ("slope", 2 * lvl + 1)] {
-            let got_rows: Vec<usize> = (0..n).filter(|&i| ws.z[(i, col)] != 0.0).collect();
+        for (kind, col) in [("intercept", lvl), ("slope", n_prim + lvl)] {
             assert_eq!(
-                got_rows, expect_rows,
+                rows[col], expect_rows,
                 "primary col {col} (level {lvl}, {kind}) nonzero rows"
             );
         }
@@ -756,23 +807,21 @@ fn build_z_width_general_populates_all_columns() {
     for cc in 0..n_crossed {
         let col = n_prim * 2 + cc;
         let expect_rows: Vec<usize> = (0..n).filter(|&i| i % n_crossed == cc).collect();
-        let got_rows: Vec<usize> = (0..n).filter(|&i| ws.z[(i, col)] != 0.0).collect();
         assert_eq!(
-            got_rows, expect_rows,
+            rows[col], expect_rows,
             "crossed col {col} (level {cc}) nonzero rows"
         );
     }
 }
 
-/// `apply_lambda` must scale each extra grouping's columns by ITS OWN θ over
-/// ITS OWN width, even when `extra_offsets` is non-monotonic. A
-/// crossed-before-nested declaration places the nested block at the low
-/// `prim_width` slot (small offset) AFTER the crossed block (large offset),
-/// so a "span to the next declaration's offset" loop would leave the crossed
-/// block unscaled and over-scale the nested block with the crossed θ.
-/// Regression guard for that extra-offset span bug.
+/// The packed `M` fill must scale each extra grouping's slot by ITS OWN θ, even
+/// when `extra_offsets` is non-monotonic. A crossed-before-nested declaration
+/// places the nested block at the low `prim_width` slot (small offset) AFTER the
+/// crossed block (large offset), so a fill that walked offsets in address order
+/// would pair each slot with the wrong θ. `lam_off_decl` is what keeps the two
+/// in declaration order; this is its regression guard.
 #[test]
-fn apply_lambda_handles_nonmonotonic_extra_offsets() {
+fn packed_m_vals_scale_each_extra_by_its_own_theta() {
     let (n_prim, n_crossed, n_per_parent) = (4usize, 3usize, 2usize);
     // Declaration order [Crossed, Nested] ⇒ extra_offsets[0] (crossed, high) >
     // extra_offsets[1] (nested, low) — the non-monotonic precondition.
@@ -802,44 +851,55 @@ fn apply_lambda_handles_nonmonotonic_extra_offsets() {
         }),
     };
     let n = 8usize;
-    let ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
-    let g = &ws.groupings;
-    assert!(
-        g.extra_offsets[0] > g.extra_offsets[1],
-        "fixture must produce non-monotonic offsets, got {:?}",
-        g.extra_offsets
-    );
+    let ids: Vec<u32> = (0..n).map(|i| (i % n_prim) as u32).collect();
+    let crossed: Vec<u32> = (0..n).map(|i| (i % n_crossed) as u32).collect();
+    // Nested ids are GLOBAL and dense over all parents: child `i / n_prim` of
+    // parent `ids[i]`.
+    let nested: Vec<u32> = (0..n)
+        .map(|i| ids[i] * n_per_parent as u32 + (i / n_prim) as u32)
+        .collect();
     // q_p = 1 ⇒ base_theta = 1; θ_crossed at idx 1, θ_nested at idx 2.
     let base_theta = 1usize;
     let (theta_crossed, theta_nested) = (2.0_f64, 3.0_f64);
-    let mut params = vec![0.0; g.n_theta()];
+    let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[], 1);
+    let mut params = vec![0.0; ws.n_theta];
     params[0] = 1.0; // primary Λ (irrelevant to the extra blocks)
     params[base_theta] = theta_crossed;
     params[base_theta + 1] = theta_nested;
-    // z = ones everywhere so M directly reveals the per-column scale.
-    let mut z = Mat::<f64>::zeros(n, g.k_total);
+    assert!(
+        ws.groupings.extra_offsets[0] > ws.groupings.extra_offsets[1],
+        "fixture must produce non-monotonic offsets, got {:?}",
+        ws.groupings.extra_offsets
+    );
+    fill_packed_cols(&mut ws, &ids, &[crossed.clone(), nested.clone()], n);
+    // Every grouping here is intercept-only (q = 1), so `x` is never read.
+    let x = Mat::<f64>::zeros(n, 2);
+    packed_oracle_fill(&mut ws, x.as_ref(), &params, n);
+    // Row slots, in declaration order: [primary | crossed | nested].
+    let width = ws.packed.width;
+    assert_eq!(width, 3);
+    let (coff, noff) = (ws.groupings.extra_offsets[0], ws.groupings.extra_offsets[1]);
     for i in 0..n {
-        for c in 0..g.k_total {
-            z[(i, c)] = 1.0;
-        }
-    }
-    let mut m = Mat::<f64>::zeros(n, g.k_total);
-    let mut lam = vec![0.0; g.primary_q * g.primary_q];
-    apply_lambda(g, &params, z.as_ref(), &mut m, &mut lam, n);
-    let coff = g.extra_offsets[0];
-    for c in coff..coff + n_crossed {
-        assert!(
-            (m[(0, c)] - theta_crossed).abs() < 1e-12,
-            "crossed col {c} = {}, want {theta_crossed}",
-            m[(0, c)]
+        let base = i * width;
+        assert_eq!(
+            ws.packed.m_cols[base + 1] as usize,
+            coff + crossed[i] as usize,
+            "row {i} crossed column"
         );
-    }
-    let noff = g.extra_offsets[1];
-    for c in noff..noff + n_prim * n_per_parent {
         assert!(
-            (m[(0, c)] - theta_nested).abs() < 1e-12,
-            "nested col {c} = {}, want {theta_nested}",
-            m[(0, c)]
+            (ws.packed.m_vals[base + 1] - theta_crossed).abs() < 1e-12,
+            "row {i} crossed value = {}, want {theta_crossed}",
+            ws.packed.m_vals[base + 1]
+        );
+        assert_eq!(
+            ws.packed.m_cols[base + 2] as usize,
+            noff + nested[i] as usize,
+            "row {i} nested column"
+        );
+        assert!(
+            (ws.packed.m_vals[base + 2] - theta_nested).abs() < 1e-12,
+            "row {i} nested value = {}, want {theta_nested}",
+            ws.packed.m_vals[base + 2]
         );
     }
 }
@@ -849,7 +909,6 @@ fn fit_glmm_recovers_direction_and_finite_inference() {
     let (xf64, y, ids) = glmm_intercept_dataset();
     let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     let targets = [1u32];
     let beta_truth = [0.2_f64, 0.8];
     let fit = fit_glmm(
@@ -876,9 +935,9 @@ fn fit_glmm_recovers_direction_and_finite_inference() {
     // one fixed binary dataset (n=80), not a power sim, so the single draw
     // need not clear significance.
     assert!(
-        ws.t_sq[1].is_finite() && ws.t_sq[1] > 0.0,
+        ws.inference.t_sq[1].is_finite() && ws.inference.t_sq[1] > 0.0,
         "t²[1] = {} must be finite and strictly positive",
-        ws.t_sq[1]
+        ws.inference.t_sq[1]
     );
     assert!(fit.tau_squared_hat.is_finite() && fit.tau_squared_hat >= 0.0);
 }
@@ -935,7 +994,6 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
     }
     let y = fx.y.clone();
     let ids = fx.cluster_ids.clone();
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
 
     // RX/Schur machinery-exactness check, evaluated at lme4's EXACT θ̂/β̂ so the
     // comparison is point-matched: rx_cov_into reproduces lme4 vcov(use.hessian
@@ -1060,7 +1118,6 @@ fn exact_hessian_matches_fd_on_fixture() {
 
     let mut cov_exact = Mat::<f64>::zeros(p, p);
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     // Rx: mirrors the sibling test — an in-fit SE fallback under Hessian would
     // return nan_fit and fail the wrong assertion; the explicit joint_hessian_cov
     // calls below are the comparison.
@@ -1079,13 +1136,13 @@ fn exact_hessian_matches_fd_on_fixture() {
     assert!(fit.converged);
     let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_exact);
     assert_eq!(st, FdHessianStatus::Ok);
-    let tse_exact = ws.theta_se.clone();
+    let tse_exact = ws.inference.theta_se.clone();
 
     let mut cov_fd = Mat::<f64>::zeros(p, p);
-    ws.force_fd_hessian = true;
+    ws.fd.force_fd_hessian = true;
     let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
     assert_eq!(st, FdHessianStatus::Ok);
-    let tse_fd = ws.theta_se.clone();
+    let tse_fd = ws.inference.theta_se.clone();
 
     // Band = tol.R's `se_hessian_rel` default (1e-3), applied to the SEs the
     // caller sees, not to the raw covariance entries.
@@ -1131,7 +1188,6 @@ fn exact_hessian_matches_fd_on_fixture_agq() {
 
     let mut cov_exact = Mat::<f64>::zeros(p, p);
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 7);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     // Rx: mirrors the sibling test — an in-fit SE fallback under Hessian would
     // return nan_fit and fail the wrong assertion; the explicit joint_hessian_cov
     // calls below are the comparison.
@@ -1150,13 +1206,13 @@ fn exact_hessian_matches_fd_on_fixture_agq() {
     assert!(fit.converged);
     let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_exact);
     assert_eq!(st, FdHessianStatus::Ok);
-    let tse_exact = ws.theta_se.clone();
+    let tse_exact = ws.inference.theta_se.clone();
 
     let mut cov_fd = Mat::<f64>::zeros(p, p);
-    ws.force_fd_hessian = true;
+    ws.fd.force_fd_hessian = true;
     let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
     assert_eq!(st, FdHessianStatus::Ok);
-    let tse_fd = ws.theta_se.clone();
+    let tse_fd = ws.inference.theta_se.clone();
 
     // Band = `AGQ_SE_HESSIAN_REL` (2e-2, `tests/oracle_support/mod.rs`),
     // applied to the SEs the caller sees, not to the raw covariance entries.
@@ -1210,10 +1266,9 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
             ws.groupings.structured_extras_eligible(),
             "{label}: fixture must route through the structured extras path"
         );
-        build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
         // Built so the f64 FD side runs the production cached tail (`None` on the
         // nested-only cell, where `e == 0` skips the tail altogether).
-        ws.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+        ws.pattern.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
         // Rx: mirrors `exact_hessian_matches_fd_on_fixture` — an in-fit SE
         // fallback under Hessian would return nan_fit and fail the wrong
         // assertion; the explicit joint_hessian_cov calls below are the comparison.
@@ -1260,10 +1315,10 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
             ws.hyper_scratch.is_some() || ws.dual_scratch.is_some(),
             "{label}: joint_hessian_cov fell through to the FD stencil"
         );
-        let tse_exact = ws.theta_se.clone();
+        let tse_exact = ws.inference.theta_se.clone();
 
         let mut cov_fd = Mat::<f64>::zeros(p, p);
-        ws.force_fd_hessian = true;
+        ws.fd.force_fd_hessian = true;
         let st = joint_hessian_cov(
             &mut ws,
             xf64.as_ref(),
@@ -1275,8 +1330,8 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
             &mut cov_fd,
         );
         assert_eq!(st, FdHessianStatus::Ok, "{label}");
-        let tse_fd = ws.theta_se.clone();
-        ws.force_fd_hessian = false;
+        let tse_fd = ws.inference.theta_se.clone();
+        ws.fd.force_fd_hessian = false;
 
         // Band = tol.R's `se_hessian_rel` default (1e-3), applied to the SEs the
         // caller sees, not to the raw covariance entries.
@@ -1307,8 +1362,7 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
 /// something to differentiate instead of returning an all-zero Hessian row.
 /// This is the direct anti-regression for that: before the `T::IS_F64` guards
 /// the crossed Hessian row was exactly `[0, 0, 0, 0]`, the joint Hessian was
-/// singular, both entry points refused the point, and the fit reported
-/// `kkt_grad_norm = NaN` with an all-NaN `boundary_score`.
+/// singular, and both entry points refused the point.
 ///
 /// `glmm_extras_q1_dataset(0, 6)` at its committed `n = 96` is the cell that
 /// pins: θ̂ = [0.271, 0.0]. That is why
@@ -1322,11 +1376,7 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
     let n = y.len();
     let p = 2usize;
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
-    ws.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
-    // Opt in, so a refused score surfaces as the NaN this test wants to see,
-    // distinct from the NaN an unrequested score also leaves.
-    ws.boundary_score_requested = true;
+    ws.pattern.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
@@ -1347,26 +1397,14 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
         "fixture must pin its crossed θ — θ̂ = {:?}",
         &ws.params[..ws.n_theta]
     );
-    // Both diagnostics come off the one `laplace_hessian` call the fit's
-    // boundary block makes; they were NaN and `[]` while the point was refused.
-    assert!(
-        ws.kkt_grad_norm.is_finite(),
-        "kkt_grad_norm = {}",
-        ws.kkt_grad_norm
-    );
-    assert!(
-        ws.boundary_score[ti].is_finite(),
-        "boundary_score = {:?}",
-        ws.boundary_score
-    );
     assert!(
         !fit.hessian_fallback,
         "pinned-crossed fit must not fall back to Rx"
     );
     assert!(
-        ws.var_diag[1].is_finite() && ws.var_diag[1] > 0.0,
+        ws.inference.var_diag[1].is_finite() && ws.inference.var_diag[1] > 0.0,
         "var_diag[1] = {}",
-        ws.var_diag[1]
+        ws.inference.var_diag[1]
     );
 
     // The exact kernel accepts the point now. Read the row directly, because
@@ -1399,8 +1437,8 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
         "crossed Hessian row is identically zero"
     );
     // The deviance is even in θ, so the true gradient entry at θ = 0 is 0; what
-    // is left is the PIRLS solve's own noise, which this fit's whole KKT norm
-    // puts at ~1.8e-6.
+    // is left is the PIRLS solve's own noise, measured at ~1.8e-6 on this
+    // fixture.
     assert!(
         grad[ti].abs() <= 1e-6,
         "crossed gradient entry {} above the PIRLS noise floor",
@@ -1429,10 +1467,10 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
         ws.hyper_scratch.is_some() || ws.dual_scratch.is_some(),
         "joint_hessian_cov fell through to the FD stencil"
     );
-    let hess_exact_tt = ws.hess_scratch[(ti, ti)];
+    let hess_exact_tt = ws.inference.hess_scratch[(ti, ti)];
 
     let mut cov_fd = Mat::<f64>::zeros(p, p);
-    ws.force_fd_hessian = true;
+    ws.fd.force_fd_hessian = true;
     let st = joint_hessian_cov(
         &mut ws,
         xf64.as_ref(),
@@ -1444,8 +1482,8 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
         &mut cov_fd,
     );
     assert_eq!(st, FdHessianStatus::Ok);
-    let hess_fd_tt = ws.hess_scratch[(ti, ti)];
-    ws.force_fd_hessian = false;
+    let hess_fd_tt = ws.inference.hess_scratch[(ti, ti)];
+    ws.fd.force_fd_hessian = false;
 
     // β band = tol.R's `se_hessian_rel` default (1e-3), on the SEs the caller
     // sees rather than the raw covariance entries.
@@ -1470,228 +1508,6 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
     );
 }
 
-/// The committed n=96 / 12-cluster fixture as `fit_cold` takes it: `x`
-/// row-major, binomial-logit, one scalar grouping. Same data as
-/// `joint_hessian_cov_matches_glmer_use_hessian_true`, one level up — that test
-/// drives the kernel, these read the assembled `Fit`.
-fn hessian_fixture_fit(wald_se: WaldSe) -> crate::Fit {
-    let fx = load_hessian_fixture();
-    let p = fx.beta.len();
-    let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
-    let x: Vec<f64> = fx.x.iter().flat_map(|r| r.iter().copied()).collect();
-    let opts = FitOptions {
-        target_indices: (0..p as u32).collect(),
-        wald_se,
-        ..FitOptions::default()
-    };
-    crate::fit_cold(
-        &x,
-        &fx.y,
-        fx.n,
-        p,
-        &logit_intercept_spec(Sizing::FixedClusters { n_clusters }),
-        &GroupIds {
-            primary: fx.cluster_ids.clone(),
-            extra: vec![],
-        },
-        &opts,
-    )
-}
-
-/// A binomial GLMM whose grouping carries no signal at all: every cluster gets
-/// the SAME eight (x, y) rows, so the between-cluster deviance is flat in θ and
-/// the MLE is exactly 0 — the optimizer pins it. This is the τ̂≈0 shape the LMM
-/// tests use (`diagnostics_boundary_reports_both_ends`, `src/fit/common_tests.rs`),
-/// ported to binomial-logit. x alternates ±, so nothing separates and the
-/// design stays full rank.
-fn glmm_pinning_fit(wald_se: WaldSe, boundary_score: bool) -> crate::Fit {
-    let (n_clusters, per) = (6usize, 8usize);
-    let n = n_clusters * per;
-    let mut x = vec![0.0f64; n * 2];
-    let mut y = vec![0.0f64; n];
-    let mut ids = vec![0u32; n];
-    for g in 0..n_clusters {
-        for i in 0..per {
-            let r = g * per + i;
-            ids[r] = g as u32;
-            x[r * 2] = 1.0;
-            x[r * 2 + 1] = i as f64 * 0.25 - 0.875;
-            y[r] = (i % 2) as f64;
-        }
-    }
-    let opts = FitOptions {
-        target_indices: vec![0, 1],
-        wald_se,
-        boundary_score,
-        ..FitOptions::default()
-    };
-    crate::fit_cold(
-        &x,
-        &y,
-        n,
-        2,
-        &logit_intercept_spec(Sizing::FixedClusters {
-            n_clusters: n_clusters as u32,
-        }),
-        &GroupIds {
-            primary: ids,
-            extra: vec![],
-        },
-        &opts,
-    )
-}
-
-/// At a converged INTERIOR fit the projected θ gradient is the plain gradient,
-/// and it sits at the optimizer's own stationarity level rather than at zero:
-/// BOBYQA stops on a trust radius (`rho_end`), so the residual is small but
-/// finite. The band is `KKT_INTERIOR_MAX` (`src/test_support.rs`), measured by
-/// the calibration step above — the assertion is "at or below what BOBYQA
-/// actually leaves", which is what a KKT residual is read as, not "== 0".
-#[test]
-fn kkt_grad_norm_small_at_interior_optimum() {
-    let f = hessian_fixture_fit(WaldSe::Hessian);
-    assert!(f.converged());
-    assert_eq!(f.diagnostics.boundary, Boundary::Interior);
-    let k = f.diagnostics.kkt_grad_norm;
-    assert!(
-        k.is_finite(),
-        "kkt_grad_norm must be measured here, got {k}"
-    );
-    assert!(
-        k <= KKT_INTERIOR_MAX,
-        "kkt {k} exceeds calibrated {KKT_INTERIOR_MAX}"
-    );
-}
-
-/// The same residual is reported, and is just as small, on a fit that stops ON
-/// the boundary — a boundary fit is a constrained stationary point, not a
-/// failure to leave. What the projection removes is NOT visible here: the
-/// deviance is even in θ_jj (Σ = ΛΛᵀ is invariant under a sign flip of the
-/// column), so at a diagonal pinned to exactly 0 the raw gradient component is
-/// already 0 and there is nothing for `min(g_j, 0)` to clip. The projection
-/// bites at an UPPER bound (θ̃ = THETA_HI = 1e3) and at an off-diagonal resting
-/// on its signed bound; no fixture in the crate reaches either, so that arm of
-/// the projection is written and reviewed but not covered by a test — a named
-/// gap, not a silent one.
-#[test]
-fn kkt_grad_norm_small_at_boundary_optimum() {
-    let f = glmm_pinning_fit(WaldSe::Hessian, false);
-    assert!(f.converged(), "a boundary fit still converges");
-    assert_eq!(f.diagnostics.boundary, Boundary::AtBoundary);
-    let k = f.diagnostics.kkt_grad_norm;
-    assert!(
-        k.is_finite(),
-        "kkt_grad_norm must be measured here, got {k}"
-    );
-    assert!(
-        k <= KKT_INTERIOR_MAX,
-        "kkt {k} exceeds calibrated {KKT_INTERIOR_MAX}"
-    );
-}
-
-/// Both diagnostics are reported under `WaldSe::Rx` too: they are statements
-/// about the optimum, not about which covariance the caller asked for. This is
-/// the test that holds the "runs on BOTH arms" wiring, and the reason the warm
-/// Rx loop's alloc bound moves.
-#[test]
-fn kkt_grad_norm_reported_under_rx() {
-    let f = hessian_fixture_fit(WaldSe::Rx);
-    assert!(f.diagnostics.kkt_grad_norm.is_finite());
-    assert!(
-        f.stddev_se.iter().all(|s| s.is_nan()),
-        "Rx still reports no θ-block SE"
-    );
-}
-
-/// On a fit that pins a variance component, the boundary score at that
-/// component is POSITIVE — the constrained optimum really is the boundary, not
-/// a point the optimizer failed to leave. Positive is the whole claim: the
-/// magnitude is a curvature and is not pinned here.
-#[test]
-fn boundary_score_positive_at_pinned_component() {
-    let f = glmm_pinning_fit(WaldSe::Hessian, true);
-    assert!(f.converged());
-    assert_eq!(f.diagnostics.boundary, Boundary::AtBoundary);
-    let mut seen = 0usize;
-    for (g, flags) in f.diagnostics.pinned.iter().enumerate() {
-        for (i, &p) in flags.iter().enumerate() {
-            if !p {
-                continue;
-            }
-            seen += 1;
-            let s = f.diagnostics.boundary_score[g][i];
-            assert!(
-                s.is_finite() && s > 0.0,
-                "score[{g}][{i}] = {s} must be positive"
-            );
-        }
-    }
-    assert_eq!(
-        seen, 1,
-        "this fixture pins exactly its one variance component"
-    );
-}
-
-/// An interior fit reports no boundary score: the quantity is defined at
-/// `s_j = 0` and there is no pinned component to define it at.
-#[test]
-fn boundary_score_absent_at_interior_optimum() {
-    let f = hessian_fixture_fit(WaldSe::Hessian);
-    assert!(f.converged());
-    assert_eq!(f.diagnostics.boundary, Boundary::Interior);
-    assert!(
-        f.diagnostics.boundary_score.is_empty(),
-        "interior fit reported {:?}",
-        f.diagnostics.boundary_score
-    );
-}
-
-/// The score is opt-in (`FitOptions::boundary_score`): a pinned fit that did
-/// not ask for it still reports the pin and the KKT residual, but no score —
-/// that is the hyper-dual Hessian pass the option exists to skip.
-#[test]
-fn boundary_score_empty_unless_requested() {
-    let f = glmm_pinning_fit(WaldSe::Hessian, false);
-    assert!(f.converged());
-    assert_eq!(f.diagnostics.boundary, Boundary::AtBoundary);
-    assert!(f.diagnostics.pinned.iter().flatten().any(|&p| p));
-    assert!(f.diagnostics.kkt_grad_norm.is_finite());
-    assert!(
-        f.diagnostics.boundary_score.is_empty(),
-        "unrequested score reported {:?}",
-        f.diagnostics.boundary_score
-    );
-}
-
-/// `boundary_score` is laid out exactly like `pinned`, so `boundary_score[g][i]`
-/// pairs with `pinned[g][i]` and with `stddev_corr(g).0[i]`. Pins the
-/// alignment, which is the only thing that makes the field readable.
-#[test]
-fn boundary_score_aligns_with_pinned() {
-    let f = glmm_pinning_fit(WaldSe::Hessian, true);
-    assert_eq!(
-        f.diagnostics.boundary_score.len(),
-        f.diagnostics.pinned.len()
-    );
-    for (bs, pn) in f
-        .diagnostics
-        .boundary_score
-        .iter()
-        .zip(&f.diagnostics.pinned)
-    {
-        assert_eq!(bs.len(), pn.len());
-        for (s, &p) in bs.iter().zip(pn) {
-            // Finite implies pinned, not the reverse: an unpinned component
-            // carries NaN. The other direction — a pinned diagonal whose score
-            // is reported because `canonicalize_pinned_blocks` zeroed the
-            // column below it — is
-            // `lmm_boundary_score_reported_after_canonicalization` in
-            // `src/fit/common_tests.rs`.
-            assert!(!s.is_finite() || p, "score finite implies component pinned");
-        }
-    }
-}
-
 /// Run `joint_hessian_cov` twice on the same converged workspace — serial
 /// (`parallel_inner = false`) then parallel (`= true`) — and assert every returned
 /// covariance entry, θ-block SE, and `FdHessianStatus` is BITWISE equal. `.to_bits()`
@@ -1710,12 +1526,12 @@ fn assert_fd_hessian_serial_eq_parallel(
     let mut cov_s = Mat::<f64>::zeros(p, p);
     ws.parallel_inner = false;
     let st_s = joint_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_s);
-    let tse_s = ws.theta_se.clone();
+    let tse_s = ws.inference.theta_se.clone();
 
     let mut cov_p = Mat::<f64>::zeros(p, p);
     ws.parallel_inner = true;
     let st_p = joint_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_p);
-    let tse_p = ws.theta_se.clone();
+    let tse_p = ws.inference.theta_se.clone();
 
     assert_eq!(st_s, st_p, "FdHessianStatus differs serial vs parallel");
     for i in 0..p {
@@ -1745,12 +1561,12 @@ fn assert_fd_hessian_serial_eq_parallel(
 /// workspaces change nothing — a mismatch is an `fd_worker_ws` field-liveness bug,
 /// not floating-point noise.
 ///
-/// Runs the FD arm explicitly (`force_fd_hessian`): both fixtures here now take
-/// the exact hyper-dual Hessian, which has no rayon in it and is bit-identical
-/// by construction. The grid's order-independence is still a live property on
-/// the shapes that keep the stencil — the oversized-core dense fallback, an
-/// `m > MAX_DUAL_N` refusal, and the sparse driver's own grid — and that is
-/// what this test stands in for.
+/// Runs the FD arm explicitly (`force_fd_hessian`): both fixtures here take an
+/// exact Hessian otherwise, which has no rayon in it and is bit-identical by
+/// construction. The grid's order-independence is still a live property on the
+/// cells that keep a stencil — a packed-row fit the assembled pass declined,
+/// and a cell both exact rungs declined — and that is what this test stands in
+/// for.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 #[test]
 fn fd_hessian_parallel_bit_identical_to_serial() {
@@ -1770,7 +1586,6 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
         }
         let y = fx.y.clone();
         let ids = fx.cluster_ids.clone();
-        build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
         let fit = fit_glmm(
             &mut ws,
             xf64.as_ref(),
@@ -1784,7 +1599,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             WaldSe::Rx,
         );
         assert!(fit.converged, "no-extras fixture must converge");
-        ws.force_fd_hessian = true;
+        ws.fd.force_fd_hessian = true;
         assert_fd_hessian_serial_eq_parallel(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n);
     }
     // Case B: structured crossed (grouseticks INDEX primary + BROOD, LOCATION) —
@@ -1796,8 +1611,8 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             ws.groupings.structured_extras_eligible(),
             "grouseticks 3-crossed must route through the structured extras path"
         );
-        build_z(&mut ws, x.as_ref(), &ids.primary, &ids.extra, n);
-        ws.structured_schur = StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n);
+        ws.pattern.structured_schur =
+            StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n);
         let fit = fit_glmm(
             &mut ws,
             x.as_ref(),
@@ -1814,7 +1629,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             fit.converged,
             "grouseticks structured fixture must converge"
         );
-        ws.force_fd_hessian = true;
+        ws.fd.force_fd_hessian = true;
         assert_fd_hessian_serial_eq_parallel(
             &mut ws,
             x.as_ref(),
@@ -1832,7 +1647,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
 /// forward-solve: on the committed fixture the x1 Hessian SE EXCEEDS the Rx
 /// SE and matches the fixture's `vcov_hessian` diagonal. `WaldSe::Rx` keeps
 /// the unchanged Schur path. Pins that the dispatch reads the FD-Hessian
-/// covariance into `ws.var_diag` end-to-end (not just the standalone kernel).
+/// covariance into `ws.inference.var_diag` end-to-end (not just the standalone kernel).
 #[test]
 fn hessian_mode_t_sq_uses_joint_hessian_cov() {
     let fx = load_hessian_fixture();
@@ -1851,7 +1666,6 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
     let t1 = 1usize; // x1 column
 
     let mut ws_h = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
-    build_z(&mut ws_h, xf64.as_ref(), &ids, &[], n);
     let fit_h = fit_glmm(
         &mut ws_h,
         xf64.as_ref(),
@@ -1865,10 +1679,9 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
         WaldSe::Hessian,
     );
     assert!(fit_h.converged, "hessian-mode fit must converge");
-    let se_h = ws_h.var_diag[t1].sqrt();
+    let se_h = ws_h.inference.var_diag[t1].sqrt();
 
     let mut ws_rx = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
-    build_z(&mut ws_rx, xf64.as_ref(), &ids, &[], n);
     let fit_rx = fit_glmm(
         &mut ws_rx,
         xf64.as_ref(),
@@ -1882,18 +1695,18 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
         WaldSe::Rx,
     );
     assert!(fit_rx.converged, "rx-mode fit must converge");
-    let se_rx = ws_rx.var_diag[t1].sqrt();
+    let se_rx = ws_rx.inference.var_diag[t1].sqrt();
 
     assert!(se_h > se_rx, "hessian SE {se_h} must exceed rx SE {se_rx}");
     // Match the FD-Hessian kernel band (1e-5 ABSOLUTE on the covariance entries,
     // achieved ~3.4e-7 against the artifact-free fixture) on the variance the
-    // dispatch wrote into ws.var_diag — the band source is
+    // dispatch wrote into ws.inference.var_diag — the band source is
     // `joint_hessian_cov_matches_glmer_use_hessian_true`: change together.
     let want_var = fx.vcov_hessian[t1][t1];
     assert!(
-        (ws_h.var_diag[t1] - want_var).abs() < 1e-5,
+        (ws_h.inference.var_diag[t1] - want_var).abs() < 1e-5,
         "hessian var {} must match fixture vcov_hessian diag {want_var}",
-        ws_h.var_diag[t1]
+        ws_h.inference.var_diag[t1]
     );
 }
 
@@ -1954,7 +1767,6 @@ fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
         n_clusters: nc as u32,
     });
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
 
     // Converge a fit (kernel precondition for joint_hessian_cov).
     let fit = fit_glmm(
@@ -1994,18 +1806,22 @@ fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
     // Confirm this is the non-PD-Hessian branch, not the non-finite-deviance
     // branch: the joint Hessian was FULLY assembled (every perturbed deviance
     // finite) AND is non-PD (LLT errors). The fallback macro re-evals only the
-    // central deviance, leaving ws.hess_scratch holding the complete Hessian.
+    // central deviance, leaving ws.inference.hess_scratch holding the complete Hessian.
     let m = ws.params.len();
     for i in 0..m {
         for j in 0..m {
             assert!(
-                ws.hess_scratch[(i, j)].is_finite(),
+                ws.inference.hess_scratch[(i, j)].is_finite(),
                 "assembled Hessian must be finite (non-finite branch NOT taken): H[{i}][{j}]"
             );
         }
     }
     assert!(
-        ws.hess_scratch.as_ref().llt(faer::Side::Lower).is_err(),
+        ws.inference
+            .hess_scratch
+            .as_ref()
+            .llt(faer::Side::Lower)
+            .is_err(),
         "assembled joint Hessian must be non-PD (LLT must fail)"
     );
 
@@ -2092,7 +1908,6 @@ fn fit_glmm_collapses_to_plain_irls_when_tau_negligible() {
         n_clusters: nc as u32,
     });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
-    build_z(&mut ws, x.as_ref(), &ids, &[], n);
     let fit = fit_glmm(
         &mut ws,
         x.as_ref(),
@@ -2112,12 +1927,12 @@ fn fit_glmm_collapses_to_plain_irls_when_tau_negligible() {
         ws.betas[1],
         irls.0[1]
     );
-    // GLMM z² is indexed by coefficient (ws.t_sq[1] = slope = target 1); IRLS
+    // GLMM z² is indexed by coefficient (ws.inference.t_sq[1] = slope = target 1); IRLS
     // z² is indexed by target position (irls.1[0] = first target = slope).
     assert!(
-        (ws.t_sq[1].sqrt() - irls.1[0].sqrt()).abs() < 5e-2,
+        (ws.inference.t_sq[1].sqrt() - irls.1[0].sqrt()).abs() < 5e-2,
         "z glmm {} vs irls {}",
-        ws.t_sq[1].sqrt(),
+        ws.inference.t_sq[1].sqrt(),
         irls.1[0].sqrt()
     );
 }
@@ -2128,13 +1943,6 @@ fn fit_glmm_width_general_slope_and_crossed() {
     let (xf64, y, ids, crossed_ids, cluster) = glmm_slope_crossed_dataset();
     let n = y.len();
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    build_z(
-        &mut ws,
-        xf64.as_ref(),
-        &ids,
-        std::slice::from_ref(&crossed_ids),
-        n,
-    );
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
@@ -2158,9 +1966,9 @@ fn fit_glmm_width_general_slope_and_crossed() {
         ws.betas[1]
     );
     assert!(
-        ws.t_sq[1].is_finite() && ws.t_sq[1] > 3.84,
+        ws.inference.t_sq[1].is_finite() && ws.inference.t_sq[1] > 3.84,
         "z² must clear the α=0.05 bar (3.84), got {}",
-        ws.t_sq[1]
+        ws.inference.t_sq[1]
     );
     assert!(
         fit.tau_squared_hat.is_finite() && (0.0..5.0).contains(&fit.tau_squared_hat),
@@ -2184,7 +1992,6 @@ fn fit_glmm_warm_path_bounded_alloc() {
     let (xf64, y, ids) = glmm_intercept_dataset();
     let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     let _ = fit_glmm(
         &mut ws,
         xf64.as_ref(),
@@ -2245,7 +2052,8 @@ fn fit_glmm_warm_path_bounded_alloc() {
 /// path replaces that with `glmm_block_chol`/`glmm_block_solve` on the
 /// pre-allocated `core_blocks`/`schur_blk`/`coupling` + stack-sized per-block
 /// scratch, so the only per-eval blocks left are the joint [θ|β] BOBYQA's own
-/// scratch (M is built into the pre-allocated `ws.m`). `#[ignore]` + one-thread
+/// scratch (M is packed into `ws.structured.m_core_buf`/`cross_val`).
+/// `#[ignore]` + one-thread
 /// for the same reasons as the no-extras gate; `alloc_test_guard` serializes
 /// test bodies, but libtest's own per-test thread spawn still needs
 /// `--test-threads=1`. Run:
@@ -2261,7 +2069,6 @@ fn fit_glmm_structured_warm_path_bounded_alloc() {
     let n = y.len();
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
     assert!(ws.groupings.structured_extras_eligible());
-    build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
     let theta = [0.5_f64, 0.4, 0.45];
     let _ = fit_glmm(
         &mut ws,
@@ -2299,27 +2106,18 @@ fn fit_glmm_structured_warm_path_bounded_alloc() {
     // or a shifted eval trajectory; do not relax past the noise floor below —
     // find the alloc.
     //
-    // Re-pinned 124 → 160 on 2026-09-02. What this fixture allocates has not
-    // changed: run inside the alloc tier
+    // Run inside the alloc tier
     // (`RAYON_NUM_THREADS=1 cargo test --features alloc-tests -- --ignored --test-threads=1`)
-    // it reads a flat 120 blocks over three runs, and it read the same 120 on this
-    // tree with `fit_glmm`'s KKT/boundary-score guard reverted to
-    // `extra_offsets.is_empty()` — the widened guard's extra `laplace_gradient`
-    // per warm Rx refit costs no block, because `for_shape` sizes the dual
-    // scratch on the warm-up fit outside the profiler window and all 20 profiled
-    // fits reuse it.
-    //
-    // What moved is the measurement's own spread, and it is rayon startup, not
-    // first-touch or an unexplained scheduling race: with `RAYON_NUM_THREADS=1`
-    // a solo invocation of this gate reads a flat 124 across runs (124 measured
-    // five times); with rayon unset it spreads 123–148 (138/128/144 measured),
-    // because the worker pool spins up on whichever thread trips it first.
-    // Pinning rayon to one thread removes that pool's startup allocation
-    // entirely, so the count is exactly reproducible: 120 in-tier, 124 solo, a
-    // stable 4-block first-touch gap paid by an earlier test in the tier. 160
-    // keeps margin above every unset-rayon count seen on this machine; both
-    // `RAYON_NUM_THREADS=1` counts sit well under it.
-    const BOUND: u64 = 160;
+    // this fixture reads a flat 120 blocks over three runs; run solo (as this
+    // gate is run, `--test-threads=1` on its own) it reads a flat 124 across
+    // runs. The gap is rayon startup, not first-touch or an unexplained
+    // scheduling race: with `RAYON_NUM_THREADS=1` the worker pool's own
+    // startup allocation is removed, so the only spread left is a stable
+    // 4-block first-touch gap paid by an earlier test in the tier. With rayon
+    // unset the count spreads 123–148, because the worker pool spins up on
+    // whichever thread trips it first — pinning rayon to one thread is what
+    // makes 124 exactly reproducible solo.
+    const BOUND: u64 = 124;
     assert!(
         stats.total_blocks <= BOUND,
         "structured warm-path alloc regressed: {} blocks across 20 fits (BOUND = {})",
@@ -2585,8 +2383,8 @@ fn glmm_dual_call_cost_table() {
             ws.beta_rhs[..p].copy_from_slice(&pert[n_theta..m]);
             let mut seed_ctrs = EvalCounters::new();
             let _ = laplace_deviance_at(&mut ws, x.as_ref(), &y, &ids, &[], n, &mut seed_ctrs);
-            ws.u_seed[..kk].copy_from_slice(&ws.u[..kk]);
-            ws.warm_seed_active = true;
+            ws.u_seed[..kk].copy_from_slice(&ws.pirls.u[..kk]);
+            ws.fd.warm_seed_active = true;
             let (seed_ns, seed_reps, seed_impractical) = adaptive_call_ns(|| {
                 ws.params[..m].copy_from_slice(&params);
                 ws.beta_rhs[..p].copy_from_slice(&params[n_theta..m]);
@@ -2594,7 +2392,7 @@ fn glmm_dual_call_cost_table() {
                 let _ = laplace_deviance_at(&mut ws, x.as_ref(), &y, &ids, &[], n, &mut seed_ctrs);
             });
             let seed_iters = mean_pirls_iters(&seed_ctrs);
-            ws.warm_seed_active = false;
+            ws.fd.warm_seed_active = false;
 
             let mut grad = vec![0.0; m];
             let mut dual_status = None;
@@ -2793,7 +2591,6 @@ fn blocked_laplace_matches_brute_force_intercept() {
         ws.groupings.extra_offsets.is_empty(),
         "fixture must route blocked"
     );
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.5;
     ws.params[1] = beta[0];
     ws.params[2] = beta[1];
@@ -2828,7 +2625,6 @@ fn blocked_laplace_matches_brute_force_intercept_contiguous() {
         ws.groupings.extra_offsets.is_empty(),
         "fixture must route blocked"
     );
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.5;
     ws.params[1] = beta[0];
     ws.params[2] = beta[1];
@@ -2847,11 +2643,14 @@ fn blocked_laplace_matches_brute_force_intercept_contiguous() {
     );
 }
 
-/// Blocked deviance == dense deviance on the no-extras slope fixture, to FP
-/// error. Drives both kernels directly on the same M / Λ_p (dev-time
-/// equivalence smoke test; a wild divergence is a coding bug, per the spec).
+/// Blocked deviance == packed deviance on the no-extras slope fixture, to FP
+/// error. Drives `pirls_solve_blocked` and `pirls_solve_packed` directly on the
+/// same design at the same θ / β (dev-time equivalence smoke test; a wild
+/// divergence is a coding bug, per the spec). The packed oracle is a workspace
+/// built with `for_cluster_spec_packed`, which overrides the layout
+/// `GlmmLayout::for_design` would pick for this shape.
 #[test]
-fn blocked_pirls_matches_dense_slope_noextra() {
+fn blocked_pirls_matches_packed_slope_noextra() {
     let (xf64, y, ids) = glmm_slope_noextra_dataset();
     let n = y.len();
     // slope on design col 1 ⇒ slope_cols = &[1]; q_p = 2.
@@ -2865,69 +2664,42 @@ fn blocked_pirls_matches_dense_slope_noextra() {
             extra_groupings: vec![],
         }),
     };
-    let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
+    // Packed oracle: the same design on the packed-row layout, which the
+    // constructor would otherwise route to the blocked one.
+    let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
     assert!(ws.groupings.extra_offsets.is_empty());
-    // Drives the dense kernel (apply_lambda/pirls_solve) directly against a
-    // workspace the constructor sized for the blocked route (0×0 z/m/wm/a/a_chol).
-    ws.ensure_dense_buffers();
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
+    fill_packed_cols(&mut ws, &ids, &[], n);
     let theta = [0.5_f64, 0.1, 0.4]; // vech(Λ_p): [σ_int, cov, σ_slope]
     let mut beta = [0.2_f64, 0.8];
     let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
 
-    // Dense reference: apply_lambda → pirls_solve.
     let mut params = vec![0.0; nt + p];
     params[..nt].copy_from_slice(&theta);
     params[nt..].copy_from_slice(&beta);
+    packed_oracle_fill(&mut ws, xf64.as_ref(), &params, n);
     let GlmmWorkspace {
-        groupings,
-        z,
-        m,
-        lam,
         prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        wm,
         wx,
-        a,
-        a_chol,
-        a_llt_mem,
-        a_rhs,
+        pirls,
+        packed,
         ..
     } = &mut ws;
-    apply_lambda(groupings, &params, z.as_ref(), m, lam, n);
-    let dense = pirls_solve(
+    let oracle = pirls_solve_packed(
         crate::Family::Binomial {
             link: crate::BinomialLink::Logit,
         },
         f64::NAN,
         k,
         p,
-        m.as_ref(),
         xf64.as_ref(),
         &y,
         &prior_w[..n],
         false,
         &mut params[nt..],
         BetaStep::Fixed,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        wm,
+        pirls,
+        packed,
         wx,
-        a,
-        a_chol,
-        a_rhs,
-        a_llt_mem,
         None, // offset
         None,
         n,
@@ -2936,23 +2708,13 @@ fn blocked_pirls_matches_dense_slope_noextra() {
 
     // Blocked: primary_lambda → pirls_solve_blocked, fresh scratch.
     let mut ws2 = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    build_z(&mut ws2, xf64.as_ref(), &ids, &[], n);
-    crate::lmm::primary_lambda(&theta, ws2.groupings.primary_q, &mut ws2.lam);
+    crate::lmm::primary_lambda(&theta, ws2.groupings.primary_q, &mut ws2.pirls.lam);
     fill_z_f64(&ws2.groupings, xf64.as_ref(), &mut ws2.z_buf, n);
     let GlmmWorkspace {
         groupings,
-        lam,
         z_buf,
-        m_buf,
         prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        a_blocks,
-        a_rhs,
+        pirls,
         ..
     } = &mut ws2;
     let mut wx_scratch = faer::Mat::<f64>::zeros(n, beta.len());
@@ -2969,17 +2731,8 @@ fn blocked_pirls_matches_dense_slope_noextra() {
         false,
         &mut beta,
         BetaStep::Fixed,
-        lam,
+        pirls,
         z_buf,
-        m_buf,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        a_blocks,
-        a_rhs,
         None,
         &mut wx_scratch,
         None, // offset
@@ -2990,42 +2743,46 @@ fn blocked_pirls_matches_dense_slope_noextra() {
 
     // Dense and blocked share the same lme4 step-halving backtrack and mixed
     // stopping rule, so the paths agree to FP error: dev/pen/logdet 1e-9, u 1e-7.
-    assert_eq!(dense.3, blocked.3, "convergence flag");
+    assert_eq!(oracle.3, blocked.3, "convergence flag");
     assert!(
-        (dense.0 - blocked.0).abs() < 1e-9,
-        "dev: dense {} blocked {}",
-        dense.0,
+        (oracle.0 - blocked.0).abs() < 1e-9,
+        "dev: packed {} blocked {}",
+        oracle.0,
         blocked.0
     );
     assert!(
-        (dense.1 - blocked.1).abs() < 1e-9,
-        "pen: dense {} blocked {}",
-        dense.1,
+        (oracle.1 - blocked.1).abs() < 1e-9,
+        "pen: packed {} blocked {}",
+        oracle.1,
         blocked.1
     );
     assert!(
-        (dense.2 - blocked.2).abs() < 1e-9,
-        "logdet: dense {} blocked {}",
-        dense.2,
+        (oracle.2 - blocked.2).abs() < 1e-9,
+        "logdet: packed {} blocked {}",
+        oracle.2,
         blocked.2
     );
+    // `ws` is the packed layout, `ws2` the blocked one: index the packed `u`
+    // through the primary block's component-major order.
+    let (qq, ss) = (ws2.groupings.primary_q, ws2.groupings.n_primary);
     for c in 0..k {
+        let pc = packed_u_index(qq, ss, c);
         assert!(
-            (ws.u[c] - ws2.u[c]).abs() < 1e-7,
-            "u[{c}]: dense {} blocked {}",
-            ws.u[c],
-            ws2.u[c]
+            (ws.pirls.u[pc] - ws2.pirls.u[c]).abs() < 1e-7,
+            "u[{c}]: packed {} blocked {}",
+            ws.pirls.u[pc],
+            ws2.pirls.u[c]
         );
     }
 }
 
-/// Blocked == dense on the cluster-contiguous (`FixedSize`/DGEN-FS) id
-/// layout — the q_p=2 twin of `blocked_pirls_matches_dense_slope_noextra`,
+/// Blocked == packed on the cluster-contiguous (`FixedSize`/DGEN-FS) id
+/// layout — the q_p=2 twin of `blocked_pirls_matches_packed_slope_noextra`,
 /// which only exercises round-robin ids. Same FP bands; if a reordered
 /// accumulation ever moves them, re-derive the band with documentation —
 /// never widen silently.
 #[test]
-fn blocked_pirls_matches_dense_slope_contiguous() {
+fn blocked_pirls_matches_packed_slope_contiguous() {
     let (xf64, y, ids) = glmm_slope_noextra_dataset_layout(true, 96, 8);
     let n = y.len();
     // slope on design col 1 ⇒ slope_cols = &[1]; q_p = 2.
@@ -3039,69 +2796,42 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
             extra_groupings: vec![],
         }),
     };
-    let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
+    // Packed oracle: the same design on the packed-row layout, which the
+    // constructor would otherwise route to the blocked one.
+    let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
     assert!(ws.groupings.extra_offsets.is_empty());
-    // Drives the dense kernel (apply_lambda/pirls_solve) directly against a
-    // workspace the constructor sized for the blocked route (0×0 z/m/wm/a/a_chol).
-    ws.ensure_dense_buffers();
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
+    fill_packed_cols(&mut ws, &ids, &[], n);
     let theta = [0.5_f64, 0.1, 0.4]; // vech(Λ_p): [σ_int, cov, σ_slope]
     let mut beta = [0.2_f64, 0.8];
     let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
 
-    // Dense reference: apply_lambda → pirls_solve.
     let mut params = vec![0.0; nt + p];
     params[..nt].copy_from_slice(&theta);
     params[nt..].copy_from_slice(&beta);
+    packed_oracle_fill(&mut ws, xf64.as_ref(), &params, n);
     let GlmmWorkspace {
-        groupings,
-        z,
-        m,
-        lam,
         prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        wm,
         wx,
-        a,
-        a_chol,
-        a_llt_mem,
-        a_rhs,
+        pirls,
+        packed,
         ..
     } = &mut ws;
-    apply_lambda(groupings, &params, z.as_ref(), m, lam, n);
-    let dense = pirls_solve(
+    let oracle = pirls_solve_packed(
         crate::Family::Binomial {
             link: crate::BinomialLink::Logit,
         },
         f64::NAN,
         k,
         p,
-        m.as_ref(),
         xf64.as_ref(),
         &y,
         &prior_w[..n],
         false,
         &mut params[nt..],
         BetaStep::Fixed,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        wm,
+        pirls,
+        packed,
         wx,
-        a,
-        a_chol,
-        a_rhs,
-        a_llt_mem,
         None, // offset
         None,
         n,
@@ -3110,23 +2840,13 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
 
     // Blocked: primary_lambda → pirls_solve_blocked, fresh scratch.
     let mut ws2 = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    build_z(&mut ws2, xf64.as_ref(), &ids, &[], n);
-    crate::lmm::primary_lambda(&theta, ws2.groupings.primary_q, &mut ws2.lam);
+    crate::lmm::primary_lambda(&theta, ws2.groupings.primary_q, &mut ws2.pirls.lam);
     fill_z_f64(&ws2.groupings, xf64.as_ref(), &mut ws2.z_buf, n);
     let GlmmWorkspace {
         groupings,
-        lam,
         z_buf,
-        m_buf,
         prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        a_blocks,
-        a_rhs,
+        pirls,
         ..
     } = &mut ws2;
     let mut wx_scratch = faer::Mat::<f64>::zeros(n, beta.len());
@@ -3143,17 +2863,8 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         false,
         &mut beta,
         BetaStep::Fixed,
-        lam,
+        pirls,
         z_buf,
-        m_buf,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        a_blocks,
-        a_rhs,
         None,
         &mut wx_scratch,
         None, // offset
@@ -3162,44 +2873,50 @@ fn blocked_pirls_matches_dense_slope_contiguous() {
         &mut crate::counters::EvalCounters::new(),
     );
 
-    // Re-tightened to 1e-9 (u 1e-7) — dense and blocked share the same
-    // step-halving stopping rule now; see
-    // `blocked_pirls_matches_dense_slope_noextra` for the full rationale.
-    assert_eq!(dense.3, blocked.3, "convergence flag");
+    // 1e-9 on the three objective terms and 1e-7 on `u`: packed and blocked
+    // share one step-halving stopping rule, so they agree to FP error; see
+    // `blocked_pirls_matches_packed_slope_noextra` for the full rationale.
+    assert_eq!(oracle.3, blocked.3, "convergence flag");
     assert!(
-        (dense.0 - blocked.0).abs() < 1e-9,
-        "dev: dense {} blocked {}",
-        dense.0,
+        (oracle.0 - blocked.0).abs() < 1e-9,
+        "dev: packed {} blocked {}",
+        oracle.0,
         blocked.0
     );
     assert!(
-        (dense.1 - blocked.1).abs() < 1e-9,
-        "pen: dense {} blocked {}",
-        dense.1,
+        (oracle.1 - blocked.1).abs() < 1e-9,
+        "pen: packed {} blocked {}",
+        oracle.1,
         blocked.1
     );
     assert!(
-        (dense.2 - blocked.2).abs() < 1e-9,
-        "logdet: dense {} blocked {}",
-        dense.2,
+        (oracle.2 - blocked.2).abs() < 1e-9,
+        "logdet: packed {} blocked {}",
+        oracle.2,
         blocked.2
     );
+    // `ws` is the packed layout, `ws2` the blocked one: index the packed `u`
+    // through the primary block's component-major order.
+    let (qq, ss) = (ws2.groupings.primary_q, ws2.groupings.n_primary);
     for c in 0..k {
+        let pc = packed_u_index(qq, ss, c);
         assert!(
-            (ws.u[c] - ws2.u[c]).abs() < 1e-7,
-            "u[{c}]: dense {} blocked {}",
-            ws.u[c],
-            ws2.u[c]
+            (ws.pirls.u[pc] - ws2.pirls.u[c]).abs() < 1e-7,
+            "u[{c}]: packed {} blocked {}",
+            ws.pirls.u[pc],
+            ws2.pirls.u[c]
         );
     }
 }
 
-/// Blocked inference (β̂, Var(β̂)_jj, z²) matches the dense inference on the
-/// no-extras slope fixture, to tight FP tolerance — the inference reorder is
-/// the same estimator. Runs the full `fit_glmm` (blocked) and an explicit
-/// dense recomputation of the Schur Var on the same converged state.
+/// Blocked inference (β̂, Var(β̂)_jj, z²) matches an independent Schur
+/// recomputation on the no-extras slope fixture, to tight FP tolerance — the
+/// inference reorder is the same estimator. Runs the full `fit_glmm` (blocked),
+/// then rebuilds `M` as a full `n×k` matrix out of a packed workspace's rows
+/// (`packed_dense_m`) and recomputes the Schur Var by hand on the same converged
+/// state.
 #[test]
-fn blocked_inference_matches_dense_slope_noextra() {
+fn blocked_inference_matches_packed_slope_noextra() {
     let (xf64, y, ids) = glmm_slope_noextra_dataset();
     let n = y.len();
     let cluster = ModelSpec {
@@ -3213,10 +2930,6 @@ fn blocked_inference_matches_dense_slope_noextra() {
         }),
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    // The dense recomputation below reads ws.z/ws.m directly against a workspace
-    // the constructor sized for the blocked route (0×0 z/m/wm/a/a_chol).
-    ws.ensure_dense_buffers();
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
@@ -3230,32 +2943,25 @@ fn blocked_inference_matches_dense_slope_noextra() {
         WaldSe::Rx,
     );
     assert!(fit.converged);
-    // Recompute Var(β̂) densely from the converged ws.{w, lam, params} via a
-    // freshly-built M and ws.a, and compare β̂ / var_diag / t_sq.
+    // Recompute Var(β̂) densely from the converged ws.pirls.w and ws.params via a
+    // freshly-built M and its own A, and compare β̂ / var_diag / t_sq.
     let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
     let beta_blocked: Vec<f64> = ws.betas[..p].to_vec();
-    let var_blocked = ws.var_diag[1];
-    let tsq_blocked = ws.t_sq[1];
-    // Dense M = ZΛ̂ at the converged θ̂.
-    crate::lmm::primary_lambda(&ws.params[..nt], ws.groupings.primary_q, &mut ws.lam);
-    {
-        let GlmmWorkspace {
-            groupings,
-            params,
-            z,
-            m,
-            lam,
-            ..
-        } = &mut ws;
-        apply_lambda(groupings, &params[..], z.as_ref(), m, lam, n);
-    }
+    let var_blocked = ws.inference.var_diag[1];
+    let tsq_blocked = ws.inference.t_sq[1];
+    // Dense M = ZΛ̂ at the converged θ̂, scattered out of the packed rows.
+    let params: Vec<f64> = ws.params[..nt].to_vec();
+    let mut wsp = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
+    fill_packed_cols(&mut wsp, &ids, &[], n);
+    packed_oracle_fill(&mut wsp, xf64.as_ref(), &params, n);
+    let m = packed_dense_m(&wsp, n, k);
     // X'W̃X, X'W̃M, A = M'W̃M + I (dense), Schur, Var(β̂)_11.
     let mut xtwx = Mat::<f64>::zeros(p, p);
     for r in 0..p {
         for c in 0..p {
             let mut sm = 0.0;
             for i in 0..n {
-                sm += xf64[(i, r)] * ws.w[i] * xf64[(i, c)];
+                sm += xf64[(i, r)] * ws.pirls.w[i] * xf64[(i, c)];
             }
             xtwx[(r, c)] = sm;
         }
@@ -3265,7 +2971,7 @@ fn blocked_inference_matches_dense_slope_noextra() {
         for c in 0..k {
             let mut sm = 0.0;
             for i in 0..n {
-                sm += xf64[(i, r)] * ws.w[i] * ws.m[(i, c)];
+                sm += xf64[(i, r)] * ws.pirls.w[i] * m[(i, c)];
             }
             xtwm[(r, c)] = sm;
         }
@@ -3275,7 +2981,7 @@ fn blocked_inference_matches_dense_slope_noextra() {
         for c in 0..k {
             let mut sm = if r == c { 1.0 } else { 0.0 };
             for i in 0..n {
-                sm += ws.m[(i, r)] * ws.w[i] * ws.m[(i, c)];
+                sm += m[(i, r)] * ws.pirls.w[i] * m[(i, c)];
             }
             a[(r, c)] = sm;
         }
@@ -3308,15 +3014,73 @@ fn blocked_inference_matches_dense_slope_noextra() {
         }
         fwd[i] = acc / sc.L()[(i, i)];
     }
-    let var_dense: f64 = fwd.iter().map(|v| v * v).sum();
+    let var_packed: f64 = fwd.iter().map(|v| v * v).sum();
     assert!(
-        (var_blocked - var_dense).abs() < 1e-8,
-        "var: blocked {var_blocked} dense {var_dense}"
+        (var_blocked - var_packed).abs() < 1e-8,
+        "var: blocked {var_blocked} packed {var_packed}"
     );
-    let tsq_dense = beta_blocked[1] * beta_blocked[1] / var_dense;
+    let tsq_packed = beta_blocked[1] * beta_blocked[1] / var_packed;
     assert!(
-        (tsq_blocked - tsq_dense).abs() < 1e-6,
-        "z²: blocked {tsq_blocked} dense {tsq_dense}"
+        (tsq_blocked - tsq_packed).abs() < 1e-6,
+        "z²: blocked {tsq_blocked} packed {tsq_packed}"
+    );
+}
+
+/// A packed-layout fit hands the pinned-γ̂ re-evaluation a `u_seed` that already
+/// IS û at the canonical θ̂, so the re-eval's PIRLS starts on its own solution.
+///
+/// The seam this holds is `fit_glmm`'s sign canonicalization: `fix_mode_signs`
+/// negates the `u` entries of every Λ column whose diagonal θ is negative, and
+/// it has to be told how the primary block is ordered — the packed layout is
+/// slope-major (`d·n_primary + level`), the blocked and structured ones
+/// level-major. Reading a packed seed level-major negates the wrong entries, and
+/// the re-eval then starts at a scrambled point instead of at û(γ̂).
+///
+/// The fixture converges on a negative primary intercept diagonal, so the flip
+/// fires, and `k = 16` with `q_p = 2` makes the two orders disagree on 8 of the
+/// 16 entries — a gap of order 1 in û. The band is 1e-4 because it also has to
+/// absorb the honest displacement from the slope diagonal pinning to 0 between
+/// the seed and the re-eval, measured at 4.7e-7 here. `WaldSe::Rx` matters: the
+/// Hessian arm's `joint_hessian_cov` reseeds `u_seed` from `ws.pirls.u` itself,
+/// which would make the comparison vacuous.
+#[test]
+fn packed_fit_mode_seed_survives_sign_canonicalization() {
+    let (xf64, y, ids) = glmm_slope_noextra_dataset_layout(true, 96, 8);
+    let n = y.len();
+    let cluster = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
+    fill_packed_cols(&mut ws, &ids, &[], n);
+    let fit = fit_glmm(
+        &mut ws,
+        xf64.as_ref(),
+        &y,
+        &ids,
+        &[],
+        &[1],
+        Some(&[0.5, 0.1, 0.4]),
+        &[0.2, 0.8],
+        n,
+        WaldSe::Rx,
+    );
+    assert!(fit.converged, "fixture must converge");
+    let (worst, at) = (0..ws.k)
+        .map(|i| ((ws.u_seed[i] - ws.pirls.u[i]).abs(), i))
+        .fold(
+            (0.0_f64, 0usize),
+            |acc, d| if d.0 > acc.0 { d } else { acc },
+        );
+    assert!(
+        worst < 1e-4,
+        "u_seed vs û(γ̂): worst |diff| {worst:.6e} at RE column {at}"
     );
 }
 
@@ -3329,11 +3093,7 @@ fn blocked_inference_matches_dense_slope_noextra() {
 fn warm_start_is_per_fit_deterministic() {
     let (xf64, y, ids) = glmm_intercept_dataset();
     let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
-    let mk = || {
-        let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
-        build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
-        ws
-    };
+    let mk = || GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     // Canonical: a fresh workspace's first (cold) fit.
     let mut ws_ref = mk();
     let _ = fit_glmm(
@@ -3391,11 +3151,10 @@ fn warm_start_objective_is_seed_independent() {
     let (xf64, y, ids) = glmm_intercept_dataset();
     let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], 80);
     ws.params[0] = 0.5;
     ws.params[1] = 0.2;
     ws.params[2] = 0.8;
-    for v in ws.u.iter_mut() {
+    for v in ws.pirls.u.iter_mut() {
         *v = 0.0;
     }
     let cold = glmm_laplace_deviance(
@@ -3407,7 +3166,7 @@ fn warm_start_objective_is_seed_independent() {
         &[],
         80,
     );
-    for (c, v) in ws.u.iter_mut().enumerate() {
+    for (c, v) in ws.pirls.u.iter_mut().enumerate() {
         *v = 0.05 * (c as f64 - 4.0);
     }
     let warm = glmm_laplace_deviance(
@@ -3670,7 +3429,6 @@ fn structured_extras_laplace_matches_brute_force() {
             "{label}: fixture must route through the extras path"
         );
         let extra_refs: Vec<&[u32]> = extra_ids.iter().map(|v| v.as_slice()).collect();
-        build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
         // θ = [θ_p, θ_nested?, θ_crossed?] in declaration order [nested, crossed].
         let theta_p = 0.5;
         let theta_n = 0.4;
@@ -3713,14 +3471,14 @@ fn structured_extras_laplace_matches_brute_force() {
     }
 }
 
-/// Structured == dense on all three Group-G shapes, to FP error: drives the
-/// dense `pirls_solve` and `pirls_solve_blocked_extras` on the same M / θ / β
-/// from fresh scratch. The Schur reassociation is the same estimator. Bands
-/// mirror the no-extras blocked parity (`blocked_pirls_matches_dense_slope_noextra`):
-/// dev/pen/logdet 1e-9, u 1e-7.
+/// Structured == packed on all three Group-G shapes, to FP error: drives
+/// `pirls_solve_packed` and `pirls_solve_blocked_extras` on the same design at
+/// the same θ / β from fresh scratch. The Schur reassociation is the same
+/// estimator. Bands mirror the no-extras blocked parity
+/// (`blocked_pirls_matches_packed_slope_noextra`): dev/pen/logdet 1e-9, u 1e-7.
 ///
 /// Each shape also carries a bit-exact `pin` on the structured return. A band
-/// against the dense path is blind to anything that moves both sides, and to
+/// against the packed path is blind to anything that moves both sides, and to
 /// anything smaller than the band; the pin is not. `==`, not a band: the
 /// structured kernel is generic over `crate::scalar::Scalar` and its `f64`
 /// instantiation must reproduce the pre-generic arithmetic exactly.
@@ -3730,17 +3488,29 @@ fn structured_extras_laplace_matches_brute_force() {
 /// and the two Profile-mode fixtures that cite this comment — was recorded
 /// 2026-09-02 from the pre-generic `f64` run, bit-exact by construction at
 /// `T = f64`. Regenerate by running the test and reading the reported value.
+/// Re-pinned 2026-09-15: PIRLS returns the data term, `log|A|` and the factor
+/// at the returned iterate, where before the factor and `log|A|` were one
+/// Newton step behind. Four pins move, by 1 to 2 ULP (1.2e-16 to 4.4e-16
+/// relative): the `crossed` shape here and the same shape in
+/// `structured_panel_downdate_matches_scalar` (`dev` 2 ULP, `logdet` 1 ULP),
+/// `pirls_structured_profile_beta_reaches_pql_stationarity` (`dev` 2 ULP,
+/// `logdet` 2 ULP) and `structured_profile_beta_matches_packed_profile`
+/// (`logdet` 1 ULP, `dev` unchanged). `pen` moves on none of them, and the
+/// other shapes are unchanged. A move of a couple of ULP is what a converged
+/// mode that is already stationary in `u` can show when the same quantities
+/// are re-formed at it, so the pins are re-taken rather than banded — they
+/// stay `==` pins.
 #[test]
-fn structured_extras_matches_dense() {
+fn structured_extras_matches_packed() {
     for (np, ncr, label, pin) in [
         (
             0usize,
             6usize,
             "crossed",
             (
-                125.67124626047038,
+                125.67124626047035,
                 2.5918113333145234,
-                3.6813261287276076,
+                3.681326128727608,
                 true,
             ),
         ),
@@ -3779,69 +3549,41 @@ fn structured_extras_matches_dense() {
         }
         let mut beta = [0.2_f64, 0.8];
 
-        // Dense reference: apply_lambda → pirls_solve.
-        let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
+        // Packed oracle: the same design on the packed-row layout.
+        let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[], 1);
         assert!(
             ws.groupings.structured_extras_eligible(),
             "{label}: fixture must be structured-eligible"
         );
-        // Drives the dense kernel (apply_lambda/pirls_solve) directly against a
-        // workspace the constructor sized for the structured route (0×0 m/wm/a/a_chol).
-        ws.ensure_dense_buffers();
-        build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
+        fill_packed_cols(&mut ws, &ids, &extra_ids, n);
         let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
         let mut params = vec![0.0; nt + p];
         params[..nt].copy_from_slice(&theta);
         params[nt..].copy_from_slice(&beta);
+        packed_oracle_fill(&mut ws, xf64.as_ref(), &params, n);
         let GlmmWorkspace {
-            groupings,
-            z,
-            m,
-            lam,
             prior_w,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            wm,
             wx,
-            a,
-            a_chol,
-            a_llt_mem,
-            a_rhs,
+            pirls,
+            packed,
             ..
         } = &mut ws;
-        apply_lambda(groupings, &params, z.as_ref(), m, lam, n);
-        let dense = pirls_solve(
+        let oracle = pirls_solve_packed(
             crate::Family::Binomial {
                 link: crate::BinomialLink::Logit,
             },
             f64::NAN,
             k,
             p,
-            m.as_ref(),
             xf64.as_ref(),
             &y,
             &prior_w[..n],
             false,
             &mut params[nt..],
             BetaStep::Fixed,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            wm,
+            pirls,
+            packed,
             wx,
-            a,
-            a_chol,
-            a_rhs,
-            a_llt_mem,
             None, // offset
             None,
             n,
@@ -3850,17 +3592,22 @@ fn structured_extras_matches_dense() {
 
         // Structured: build_packed_m → pirls_solve_blocked_extras, fresh scratch.
         let mut ws2 = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
-        build_z(&mut ws2, xf64.as_ref(), &ids, &extra_ids, n);
         {
             let GlmmWorkspace {
                 groupings,
                 params: prm,
                 z_buf,
-                lam,
-                m_core_buf,
-                cross_val,
-                cross_col,
-                n_cross,
+                pirls: PirlsScratch { lam, .. },
+                structured:
+                    StructuredScratch {
+                        m_core_buf,
+                        cross_val,
+                        ..
+                    },
+                pattern:
+                    StructuredPattern {
+                        cross_col, n_cross, ..
+                    },
                 ..
             } = &mut ws2;
             prm[..nt].copy_from_slice(&theta);
@@ -3882,34 +3629,20 @@ fn structured_extras_matches_dense() {
         let structured = {
             let GlmmWorkspace {
                 groupings,
-                m_core_buf,
-                cross_val,
-                cross_col,
-                n_cross,
                 prior_w,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                mu,
-                core_blocks,
-                coupling,
-                schur_blk,
-                coup_cols,
-                coup_ptr,
-                a_rhs,
+                pirls,
+                structured,
+                pattern,
                 ..
             } = &mut ws2;
             build_coupling_csr(
                 &ids,
-                cross_col,
-                n_cross,
+                &pattern.cross_col,
+                &pattern.n_cross,
                 groupings.n_primary,
                 n,
-                coup_cols,
-                coup_ptr,
+                &mut pattern.coup_cols,
+                &mut pattern.coup_ptr,
             );
             let mut wx_scratch = faer::Mat::<f64>::zeros(n, p);
             pirls_solve_blocked_extras(
@@ -3919,31 +3652,15 @@ fn structured_extras_matches_dense() {
                 f64::NAN,
                 groupings,
                 &ids,
-                m_core_buf,
-                cross_val,
-                cross_col,
-                n_cross,
                 xf64.as_ref(),
                 &y,
                 &prior_w[..n],
                 false,
                 &mut beta,
                 BetaStep::Fixed,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                mu,
-                core_blocks,
-                coupling,
-                schur_blk,
-                coup_cols,
-                coup_ptr,
-                None,
-                false,
-                a_rhs,
+                pirls,
+                structured,
+                pattern,
                 None, // dual
                 &mut wx_scratch,
                 None, // offset
@@ -3954,35 +3671,39 @@ fn structured_extras_matches_dense() {
         };
 
         assert_eq!(structured, pin, "{label}: structured return moved");
-        // Re-tightened to 1e-9 (u 1e-7): when no halving fires the dense loop's
-        // iterate path is bit-identical to the pre-halving one, and the
-        // structured path (`pirls_solve_blocked_extras`, which shares the same
-        // step-halving backtrack) agrees to FP error again.
-        assert_eq!(dense.3, structured.3, "{label}: convergence flag");
+        // 1e-9 on the three objective terms and 1e-7 on `u`: the structured
+        // path (`pirls_solve_blocked_extras`) shares the packed loop's
+        // step-halving backtrack, and when no halving fires both walk the same
+        // iterate path, so they agree to FP error.
+        assert_eq!(oracle.3, structured.3, "{label}: convergence flag");
         assert!(
-            (dense.0 - structured.0).abs() < 1e-9,
-            "{label} dev: dense {} structured {}",
-            dense.0,
+            (oracle.0 - structured.0).abs() < 1e-9,
+            "{label} dev: packed {} structured {}",
+            oracle.0,
             structured.0
         );
         assert!(
-            (dense.1 - structured.1).abs() < 1e-9,
-            "{label} pen: dense {} structured {}",
-            dense.1,
+            (oracle.1 - structured.1).abs() < 1e-9,
+            "{label} pen: packed {} structured {}",
+            oracle.1,
             structured.1
         );
         assert!(
-            (dense.2 - structured.2).abs() < 1e-9,
-            "{label} logdet: dense {} structured {}",
-            dense.2,
+            (oracle.2 - structured.2).abs() < 1e-9,
+            "{label} logdet: packed {} structured {}",
+            oracle.2,
             structured.2
         );
+        // `ws` is the packed layout, `ws2` the structured one: index the packed
+        // `u` through the primary block's component-major order.
+        let (qq, ss) = (ws2.groupings.primary_q, ws2.groupings.n_primary);
         for c in 0..k {
+            let pc = packed_u_index(qq, ss, c);
             assert!(
-                (ws.u[c] - ws2.u[c]).abs() < 1e-7,
-                "{label} u[{c}]: dense {} structured {}",
-                ws.u[c],
-                ws2.u[c]
+                (ws.pirls.u[pc] - ws2.pirls.u[c]).abs() < 1e-7,
+                "{label} u[{c}]: packed {} structured {}",
+                ws.pirls.u[pc],
+                ws2.pirls.u[c]
             );
         }
     }
@@ -4004,67 +3725,41 @@ fn structured_extras_matches_dense() {
         let theta = vec![0.5_f64, 0.1, 0.4, 0.45];
         let mut beta = [0.2_f64, 0.8];
 
-        // Dense reference: apply_lambda → pirls_solve.
-        let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
+        // Packed oracle: the same design on the packed-row layout.
+        let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
         assert!(
             ws.groupings.structured_extras_eligible(),
             "{label}: fixture must be structured-eligible"
         );
-        ws.ensure_dense_buffers();
-        build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
+        fill_packed_cols(&mut ws, &ids, &extra_ids, n);
         let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
         let mut params = vec![0.0; nt + p];
         params[..nt].copy_from_slice(&theta);
         params[nt..].copy_from_slice(&beta);
+        packed_oracle_fill(&mut ws, xf64.as_ref(), &params, n);
         let GlmmWorkspace {
-            groupings,
-            z,
-            m,
-            lam,
             prior_w,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            wm,
             wx,
-            a,
-            a_chol,
-            a_llt_mem,
-            a_rhs,
+            pirls,
+            packed,
             ..
         } = &mut ws;
-        apply_lambda(groupings, &params, z.as_ref(), m, lam, n);
-        let dense = pirls_solve(
+        let oracle = pirls_solve_packed(
             crate::Family::Binomial {
                 link: crate::BinomialLink::Logit,
             },
             f64::NAN,
             k,
             p,
-            m.as_ref(),
             xf64.as_ref(),
             &y,
             &prior_w[..n],
             false,
             &mut params[nt..],
             BetaStep::Fixed,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            wm,
+            pirls,
+            packed,
             wx,
-            a,
-            a_chol,
-            a_rhs,
-            a_llt_mem,
             None, // offset
             None,
             n,
@@ -4072,23 +3767,28 @@ fn structured_extras_matches_dense() {
         );
 
         // Structured: build_packed_m → pirls_solve_blocked_extras, fresh scratch.
-        // build_packed_m's primary-core read (read 1) sources the slope value from
-        // z_buf, not the dense z build_z fills above -- production hoists this fill
-        // once per fit (`fit_glmm`/`joint_hessian_cov`, see the widened gate in mod.rs/
-        // se.rs); this raw kernel-level test must do the same thing by hand.
+        // build_packed_m's primary-core read sources the slope value from z_buf,
+        // which production hoists once per fit (`fit_glmm`/`joint_hessian_cov`,
+        // see the widened gate in mod.rs/se.rs); this raw kernel-level test must
+        // do the same thing by hand.
         let mut ws2 = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-        build_z(&mut ws2, xf64.as_ref(), &ids, &extra_ids, n);
         fill_z_f64(&ws2.groupings, xf64.as_ref(), &mut ws2.z_buf, n);
         {
             let GlmmWorkspace {
                 groupings,
                 params: prm,
                 z_buf,
-                lam,
-                m_core_buf,
-                cross_val,
-                cross_col,
-                n_cross,
+                pirls: PirlsScratch { lam, .. },
+                structured:
+                    StructuredScratch {
+                        m_core_buf,
+                        cross_val,
+                        ..
+                    },
+                pattern:
+                    StructuredPattern {
+                        cross_col, n_cross, ..
+                    },
                 ..
             } = &mut ws2;
             prm[..nt].copy_from_slice(&theta);
@@ -4110,34 +3810,20 @@ fn structured_extras_matches_dense() {
         let structured = {
             let GlmmWorkspace {
                 groupings,
-                m_core_buf,
-                cross_val,
-                cross_col,
-                n_cross,
                 prior_w,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                mu,
-                core_blocks,
-                coupling,
-                schur_blk,
-                coup_cols,
-                coup_ptr,
-                a_rhs,
+                pirls,
+                structured,
+                pattern,
                 ..
             } = &mut ws2;
             build_coupling_csr(
                 &ids,
-                cross_col,
-                n_cross,
+                &pattern.cross_col,
+                &pattern.n_cross,
                 groupings.n_primary,
                 n,
-                coup_cols,
-                coup_ptr,
+                &mut pattern.coup_cols,
+                &mut pattern.coup_ptr,
             );
             let mut wx_scratch = faer::Mat::<f64>::zeros(n, p);
             pirls_solve_blocked_extras(
@@ -4147,31 +3833,15 @@ fn structured_extras_matches_dense() {
                 f64::NAN,
                 groupings,
                 &ids,
-                m_core_buf,
-                cross_val,
-                cross_col,
-                n_cross,
                 xf64.as_ref(),
                 &y,
                 &prior_w[..n],
                 false,
                 &mut beta,
                 BetaStep::Fixed,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                mu,
-                core_blocks,
-                coupling,
-                schur_blk,
-                coup_cols,
-                coup_ptr,
-                None,
-                false,
-                a_rhs,
+                pirls,
+                structured,
+                pattern,
                 None, // dual
                 &mut wx_scratch,
                 None, // offset
@@ -4192,31 +3862,35 @@ fn structured_extras_matches_dense() {
             ),
             "{label}: structured return moved"
         );
-        assert_eq!(dense.3, structured.3, "{label}: convergence flag");
+        assert_eq!(oracle.3, structured.3, "{label}: convergence flag");
         assert!(
-            (dense.0 - structured.0).abs() < 1e-9,
-            "{label} dev: dense {} structured {}",
-            dense.0,
+            (oracle.0 - structured.0).abs() < 1e-9,
+            "{label} dev: packed {} structured {}",
+            oracle.0,
             structured.0
         );
         assert!(
-            (dense.1 - structured.1).abs() < 1e-9,
-            "{label} pen: dense {} structured {}",
-            dense.1,
+            (oracle.1 - structured.1).abs() < 1e-9,
+            "{label} pen: packed {} structured {}",
+            oracle.1,
             structured.1
         );
         assert!(
-            (dense.2 - structured.2).abs() < 1e-9,
-            "{label} logdet: dense {} structured {}",
-            dense.2,
+            (oracle.2 - structured.2).abs() < 1e-9,
+            "{label} logdet: packed {} structured {}",
+            oracle.2,
             structured.2
         );
+        // `ws` is the packed layout, `ws2` the structured one: index the packed
+        // `u` through the primary block's component-major order.
+        let (qq, ss) = (ws2.groupings.primary_q, ws2.groupings.n_primary);
         for c in 0..k {
+            let pc = packed_u_index(qq, ss, c);
             assert!(
-                (ws.u[c] - ws2.u[c]).abs() < 1e-7,
-                "{label} u[{c}]: dense {} structured {}",
-                ws.u[c],
-                ws2.u[c]
+                (ws.pirls.u[pc] - ws2.pirls.u[c]).abs() < 1e-7,
+                "{label} u[{c}]: packed {} structured {}",
+                ws.pirls.u[pc],
+                ws2.pirls.u[c]
             );
         }
     }
@@ -4231,7 +3905,7 @@ fn structured_extras_matches_dense() {
 ///
 /// - `crossed_nested` (np=2 ⇒ qc=3): the real panel-vs-scalar oracle. `use_panel`
 ///   actually exercises the panel path; bands mirror
-///   `structured_extras_matches_dense` (dev/pen/logdet 1e-9, u 1e-7) to absorb the
+///   `structured_extras_matches_packed` (dev/pen/logdet 1e-9, u 1e-7) to absorb the
 ///   panel's downdate reassociation.
 /// - `crossed` (np=0 ⇒ qc=1): a routing smoke check. Both runs take the scalar
 ///   arm (qc==1 routes there regardless of `ss`), so they run identical code and
@@ -4244,9 +3918,9 @@ fn structured_panel_downdate_matches_scalar() {
             6usize,
             "crossed",
             (
-                125.67124626047038,
+                125.67124626047035,
                 2.5918113333145234,
-                3.6813261287276076,
+                3.681326128727608,
                 true,
             ),
         ),
@@ -4276,12 +3950,11 @@ fn structured_panel_downdate_matches_scalar() {
 
         let run = |use_panel: bool| {
             let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
-            build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
             let (p, nt) = (ws.p, ws.n_theta);
             let mut prm = vec![0.0; nt + p];
             prm[..nt].copy_from_slice(&theta);
             prm[nt..].copy_from_slice(&beta0);
-            let mut ss = if use_panel {
+            ws.pattern.structured_schur = if use_panel {
                 Some(
                     StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n)
                         .expect("ncr > 0 ⇒ e > 0 ⇒ Some"),
@@ -4289,29 +3962,16 @@ fn structured_panel_downdate_matches_scalar() {
             } else {
                 None
             };
+            // force_dense: same factor arm both runs — isolate the downdate.
+            ws.pattern.force_dense_schur = true;
             let mut beta = beta0;
             let GlmmWorkspace {
                 groupings,
                 z_buf,
-                lam,
-                m_core_buf,
-                cross_val,
-                cross_col,
-                n_cross,
                 prior_w,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                mu,
-                core_blocks,
-                coupling,
-                schur_blk,
-                coup_cols,
-                coup_ptr,
-                a_rhs,
+                pirls,
+                structured,
+                pattern,
                 ..
             } = &mut ws;
             build_packed_m(
@@ -4319,22 +3979,22 @@ fn structured_panel_downdate_matches_scalar() {
                 &prm[..],
                 z_buf,
                 &extra_ids,
-                lam,
+                &mut pirls.lam,
                 &ids,
-                m_core_buf,
-                cross_val,
-                cross_col,
-                n_cross,
+                &mut structured.m_core_buf,
+                &mut structured.cross_val,
+                &mut pattern.cross_col,
+                &mut pattern.n_cross,
                 n,
             );
             build_coupling_csr(
                 &ids,
-                cross_col,
-                n_cross,
+                &pattern.cross_col,
+                &pattern.n_cross,
                 groupings.n_primary,
                 n,
-                coup_cols,
-                coup_ptr,
+                &mut pattern.coup_cols,
+                &mut pattern.coup_ptr,
             );
             let mut wx_scratch = faer::Mat::<f64>::zeros(n, 2);
             let out = pirls_solve_blocked_extras(
@@ -4344,31 +4004,15 @@ fn structured_panel_downdate_matches_scalar() {
                 f64::NAN,
                 groupings,
                 &ids,
-                m_core_buf,
-                cross_val,
-                cross_col,
-                n_cross,
                 xf64.as_ref(),
                 &y,
                 &prior_w[..n],
                 false,
                 &mut beta,
                 BetaStep::Fixed,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                mu,
-                core_blocks,
-                coupling,
-                schur_blk,
-                coup_cols,
-                coup_ptr,
-                ss.as_mut(),
-                true, // force_dense: same factor arm both runs — isolate the downdate
-                a_rhs,
+                pirls,
+                structured,
+                pattern,
                 None, // dual
                 &mut wx_scratch,
                 None, // offset
@@ -4376,11 +4020,11 @@ fn structured_panel_downdate_matches_scalar() {
                 n,
                 &mut crate::counters::EvalCounters::new(),
             );
-            (out, u.clone())
+            (out, pirls.u.clone())
         };
         let (scalar, u_scalar) = run(false);
         let (panel, u_panel) = run(true);
-        // Bit-exact pin on the scalar-arm return (`structured_extras_matches_dense`
+        // Bit-exact pin on the scalar-arm return (`structured_extras_matches_packed`
         // states the contract). The panel arm rides the same generic kernel and is
         // held to `scalar` by the bands below.
         assert_eq!(scalar, pin, "{label}: structured return moved");
@@ -4532,7 +4176,6 @@ fn structured_cold_start_overshoot_is_finite() {
         ws.groupings.structured_extras_eligible(),
         "grouseticks 3-crossed must route through the structured extras path"
     );
-    build_z(&mut ws, x.as_ref(), &ids.primary, &ids.extra, n);
     // θ = 1.0 for every component (INDEX, BROOD, LOCATION); β = 0 cold start.
     let nt = ws.n_theta;
     for t in 0..nt {
@@ -4585,7 +4228,6 @@ fn assert_two_stage_matches_single(
 
     let mut ws1 = GlmmWorkspace::for_cluster_spec(p, spec, n, &[], 1);
     ws1.outer_search = OuterSearch::Joint; // pin the single-stage reference
-    build_z(&mut ws1, x, primary, extra, n);
     let fit1 = fit_glmm(
         &mut ws1,
         x,
@@ -4603,7 +4245,6 @@ fn assert_two_stage_matches_single(
     // Second workspace keeps the constructor's default route — the A/B is
     // "default route vs `Joint`", not "PQL warm start vs `Joint`" specifically.
     let mut ws2 = GlmmWorkspace::for_cluster_spec(p, spec, n, &[], 1);
-    build_z(&mut ws2, x, primary, extra, n);
     let fit2 = fit_glmm(
         &mut ws2,
         x,
@@ -4754,7 +4395,10 @@ fn two_stage_matches_single_stage_corpus_sweep() {
 /// nested2_crossed6). Both fits must converge, and `ExactProfile`'s deviance
 /// must be no worse than `PqlThenJoint`'s by more than `GLMM_RHO_END` — the
 /// same regression check `assert_two_stage_matches_single` makes on its own
-/// A/B, in deviance rather than parameter terms. Also prints one line per
+/// A/B, in deviance rather than parameter terms. On the three NB-log cells
+/// `GlmmFit::deviance` is the outer θ search's own objective, not the plain
+/// marginal Laplace deviance, so the comparison there is between the two
+/// routes' search objectives at their own θ̂. Also prints one line per
 /// cell: the full table (both deviances, both `n_eval`, Δdev) is read by hand
 /// in the write-up, not gated in-crate. `#[ignore]`: a measurement, not part
 /// of the fast suite, matching `two_stage_matches_single_stage_corpus_sweep`
@@ -4993,11 +4637,10 @@ fn grouseticks_exact_fixture() -> ExactProfileFixture {
 fn exact_profile_value_equals_fixed_mode_value_at_profiled_beta() {
     let (model, ids, extra, x, y, n, p) = probit_intercept_fixture();
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
-    build_z(&mut ws, x.as_ref(), &ids, &extra, n);
     let mut ctrs = EvalCounters::new();
     ws.params[..ws.n_theta].fill(0.7);
     ws.beta_prof[..p].fill(0.0);
-    ws.u.fill(0.0);
+    ws.pirls.u.fill(0.0);
     let prof = laplace_deviance_ws(
         &mut ws,
         x.as_ref(),
@@ -5014,7 +4657,7 @@ fn exact_profile_value_equals_fixed_mode_value_at_profiled_beta() {
     // convention), not off the transient `beta_rhs` scratch buffer.
     let nt = ws.n_theta;
     ws.params[nt..nt + p].copy_from_slice(&beta_hat);
-    ws.u.fill(0.0);
+    ws.pirls.u.fill(0.0);
     let fixed = laplace_deviance_ws(
         &mut ws,
         x.as_ref(),
@@ -5040,7 +4683,6 @@ fn exact_profile_value_equals_fixed_mode_value_at_profiled_beta() {
 fn assert_exact_profile_is_beta_minimum(fixture: fn() -> ExactProfileFixture, label: &str) {
     let (model, ids, extra, x, y, n, p) = fixture();
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
-    build_z(&mut ws, x.as_ref(), &ids, &extra, n);
     assert_exact_profile_is_beta_minimum_ws(&mut ws, x.as_ref(), &y, &ids, &extra, n, p, label);
 }
 
@@ -5063,7 +4705,7 @@ fn assert_exact_profile_is_beta_minimum_ws(
     let n_theta = ws.n_theta;
     ws.params[..n_theta].fill(0.6);
     ws.beta_prof[..p].fill(0.0);
-    ws.u.fill(0.0);
+    ws.pirls.u.fill(0.0);
     let prof = laplace_deviance_ws(ws, x, y, ids, extra, n, BetaMode::ProfileExact, &mut ctrs);
     let beta_hat = ws.beta_prof[..p].to_vec();
     // β-only BOBYQA on the Fixed objective from β = 0.
@@ -5077,7 +4719,7 @@ fn assert_exact_profile_is_beta_minimum_ws(
     let out = solver.minimize(
         |b| {
             ws.params[n_theta..n_theta + p].copy_from_slice(b);
-            ws.u.fill(0.0);
+            ws.pirls.u.fill(0.0);
             laplace_deviance_ws(ws, x, y, ids, extra, n, BetaMode::Fixed, &mut ctrs)
         },
         &mut b0,
@@ -5159,13 +4801,12 @@ fn assert_exact_profile_warm_start(
     let (model, ids, extra, x, y, n, p) = fixture();
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
     ws.nb_theta = nb_theta;
-    build_z(&mut ws, x.as_ref(), &ids, &extra, n);
     let mut ctrs = EvalCounters::new();
     let nt = ws.n_theta;
     for &(theta_lo, theta_hi) in pairs {
         ws.params[..nt].fill(theta_lo);
         ws.beta_prof[..p].fill(0.0);
-        ws.u.fill(0.0);
+        ws.pirls.u.fill(0.0);
         let lo = laplace_deviance_ws(
             &mut ws,
             x.as_ref(),
@@ -5180,11 +4821,11 @@ fn assert_exact_profile_warm_start(
             lo.is_finite(),
             "{label}: cold solve at theta={theta_lo} must converge"
         );
-        let u_warm = ws.u.clone();
+        let u_warm = ws.pirls.u.clone();
         let beta_warm = ws.beta_prof[..p].to_vec();
         // Uphill probe, warm-started exactly as the outer search does.
         ws.params[..nt].fill(theta_hi);
-        ws.u.copy_from_slice(&u_warm);
+        ws.pirls.u.copy_from_slice(&u_warm);
         ws.beta_prof[..p].copy_from_slice(&beta_warm);
         let hi_warm = laplace_deviance_ws(
             &mut ws,
@@ -5199,7 +4840,7 @@ fn assert_exact_profile_warm_start(
         // Cold reference at the same theta — the value the warm solve must match.
         ws.params[..nt].fill(theta_hi);
         ws.beta_prof[..p].fill(0.0);
-        ws.u.fill(0.0);
+        ws.pirls.u.fill(0.0);
         let hi_cold = laplace_deviance_ws(
             &mut ws,
             x.as_ref(),
@@ -5278,13 +4919,15 @@ fn exact_profile_converges_from_lower_theta_warm_start_extras() {
     );
 }
 
-/// Structured inference (Var(β̂)_jj, z²) matches a dense Schur recomputation on
-/// all three Group-G shapes — the structured `A⁻¹` apply in `structured_schur_fill`
-/// is the same estimator as the dense `dense_schur_fill`. Runs the full
-/// `fit_glmm` (structured) then recomputes Var(β̂) densely from the converged
-/// ws.{w, lam, params}. Mirrors `blocked_inference_matches_dense_slope_noextra`.
+/// Structured inference (Var(β̂)_jj, z²) matches an independent Schur
+/// recomputation on all three Group-G shapes — the structured `A⁻¹` apply in
+/// `structured_schur_fill` is the same estimator as the plain `k×k` one. Runs
+/// the full `fit_glmm` (structured), then rebuilds `M` as a full `n×k` matrix
+/// out of a packed workspace's rows (`packed_dense_m`) and recomputes Var(β̂) by
+/// hand from the converged `ws.pirls.w` and `ws.params`. Mirrors
+/// `blocked_inference_matches_packed_slope_noextra`.
 #[test]
-fn structured_inference_matches_dense() {
+fn structured_inference_matches_packed() {
     for (np, ncr, label) in [
         (0usize, 6usize, "crossed"),
         (2, 0, "nested"),
@@ -5297,11 +4940,6 @@ fn structured_inference_matches_dense() {
             ws.groupings.structured_extras_eligible(),
             "{label}: eligible"
         );
-        // The dense recomputation below reads ws.m directly against a workspace
-        // the constructor sized for the structured route (0×0 z/m/wm/a/a_chol on
-        // this route — `ensure_dense_buffers` forces them full-size).
-        ws.ensure_dense_buffers();
-        build_z(&mut ws, xf64.as_ref(), &ids, &extra_ids, n);
         let fit = fit_glmm(
             &mut ws,
             xf64.as_ref(),
@@ -5316,28 +4954,22 @@ fn structured_inference_matches_dense() {
         );
         assert!(fit.converged, "{label}: fit must converge");
         let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
-        let var_structured = ws.var_diag[1];
-        let tsq_structured = ws.t_sq[1];
+        let var_structured = ws.inference.var_diag[1];
+        let tsq_structured = ws.inference.t_sq[1];
         let beta1 = ws.betas[1];
-        // Dense recompute of Var(β̂)_11 from the converged state.
-        crate::lmm::primary_lambda(&ws.params[..nt], ws.groupings.primary_q, &mut ws.lam);
-        {
-            let GlmmWorkspace {
-                groupings,
-                params,
-                z,
-                m,
-                lam,
-                ..
-            } = &mut ws;
-            apply_lambda(groupings, &params[..], z.as_ref(), m, lam, n);
-        }
+        // Dense recompute of Var(β̂)_11 from the converged state: M = ZΛ̂ at θ̂,
+        // scattered out of the packed rows.
+        let params: Vec<f64> = ws.params[..nt].to_vec();
+        let mut wsp = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[], 1);
+        fill_packed_cols(&mut wsp, &ids, &extra_ids, n);
+        packed_oracle_fill(&mut wsp, xf64.as_ref(), &params, n);
+        let m = packed_dense_m(&wsp, n, k);
         let mut xtwx = Mat::<f64>::zeros(p, p);
         for r in 0..p {
             for c in 0..p {
                 let mut sm = 0.0;
                 for i in 0..n {
-                    sm += xf64[(i, r)] * ws.w[i] * xf64[(i, c)];
+                    sm += xf64[(i, r)] * ws.pirls.w[i] * xf64[(i, c)];
                 }
                 xtwx[(r, c)] = sm;
             }
@@ -5347,7 +4979,7 @@ fn structured_inference_matches_dense() {
             for c in 0..k {
                 let mut sm = 0.0;
                 for i in 0..n {
-                    sm += xf64[(i, r)] * ws.w[i] * ws.m[(i, c)];
+                    sm += xf64[(i, r)] * ws.pirls.w[i] * m[(i, c)];
                 }
                 xtwm[(r, c)] = sm;
             }
@@ -5357,7 +4989,7 @@ fn structured_inference_matches_dense() {
             for c in 0..k {
                 let mut sm = if r == c { 1.0 } else { 0.0 };
                 for i in 0..n {
-                    sm += ws.m[(i, r)] * ws.w[i] * ws.m[(i, c)];
+                    sm += m[(i, r)] * ws.pirls.w[i] * m[(i, c)];
                 }
                 a[(r, c)] = sm;
             }
@@ -5390,30 +5022,29 @@ fn structured_inference_matches_dense() {
             }
             fwd[i] = acc / sc.L()[(i, i)];
         }
-        let var_dense: f64 = fwd.iter().map(|v| v * v).sum();
+        let var_packed: f64 = fwd.iter().map(|v| v * v).sum();
         assert!(
-            (var_structured - var_dense).abs() < 1e-8,
-            "{label} var: structured {var_structured} dense {var_dense}"
+            (var_structured - var_packed).abs() < 1e-8,
+            "{label} var: structured {var_structured} packed {var_packed}"
         );
-        let tsq_dense = beta1 * beta1 / var_dense;
+        let tsq_packed = beta1 * beta1 / var_packed;
         assert!(
-            (tsq_structured - tsq_dense).abs() < 1e-6,
-            "{label} z²: structured {tsq_structured} dense {tsq_dense}"
+            (tsq_structured - tsq_packed).abs() < 1e-6,
+            "{label} z²: structured {tsq_structured} packed {tsq_packed}"
         );
     }
 }
 
-/// Dense-path (`pirls_solve`) overshoot fixture. The primary grouping carries
-/// 8 slopes (q_p = 9 > MAX_PRIMARY_Q = 8), so with a crossed extra present the
-/// core width q_core = 9 makes `structured_extras_eligible()` false and
-/// `laplace_deviance` routes to the genuinely-dense `pirls_solve` (not the
-/// blocked / structured paths). Poisson-log with large counts (~5000) at the
-/// β = 0, u = 0 cold start drives the first full Fisher step into the exp()
-/// blow-up regime (the grouseticks non-convergence class). The crossed ids are
-/// baked into ws.z via `build_z` here, since `glmm_laplace_deviance` threads
-/// only the primary ids. Verified to return INFINITY on the pre-step-halving
-/// dense loop (non-convergence).
-fn dense_path_overshoot_fixture() -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u32>, usize) {
+/// Packed-path (`pirls_solve_packed`) overshoot fixture. The primary grouping
+/// carries 8 slopes (q_p = 9 > MAX_PRIMARY_Q = 8), so `classify_design` puts the
+/// design over the NoZ envelope and `GlmmLayout::for_design` gives it the
+/// packed-row layout (not the blocked / structured ones). Poisson-log with large
+/// counts (~5000) at the β = 0, u = 0 cold start drives the first full Fisher
+/// step into the exp() blow-up regime (the grouseticks non-convergence class).
+/// The crossed ids enter the packed columns through `fill_packed_cols` here,
+/// since `glmm_laplace_deviance` threads only the primary ids. Verified to
+/// return INFINITY on the pre-step-halving packed loop (non-convergence).
+fn packed_path_overshoot_fixture() -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u32>, usize) {
     let (n, n_prim, n_crossed, n_slopes) = (48usize, 8usize, 4usize, 8usize);
     let mut st = 20240703u64;
     let ncol = 1 + n_slopes; // intercept (fixed) + slope predictor columns
@@ -5449,27 +5080,28 @@ fn dense_path_overshoot_fixture() -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u32
         }),
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(1, &cluster, n, &slope_cols, 1);
-    build_z(&mut ws, x.as_ref(), &ids, &[crossed], n);
+    fill_packed_cols(&mut ws, &ids, &[crossed], n);
     (ws, x, y, ids, n)
 }
 
 #[test]
-fn pirls_dense_step_halving_recovers_from_overshoot() {
+fn pirls_packed_step_halving_recovers_from_overshoot() {
     // Shape/data chosen so the first full Fisher step at the β=0 cold start
     // overshoots η into the exp() blow-up regime (the grouseticks failure
-    // class, on the dense path). Before step-halving this returned INFINITY.
-    let (mut ws, x, y, ids, n) = dense_path_overshoot_fixture();
-    assert!(
-        !ws.groupings.structured_extras_eligible() && !ws.groupings.extra_offsets.is_empty(),
-        "fixture must route to the dense pirls_solve (extras present, core oversized)"
+    // class, on the packed path). Before step-halving this returned INFINITY.
+    let (mut ws, x, y, ids, n) = packed_path_overshoot_fixture();
+    assert_eq!(
+        ws.layout,
+        GlmmLayout::Packed,
+        "fixture must route to pirls_solve_packed"
     );
     let n_params = ws.n_theta + ws.p;
     let params: Vec<f64> = (0..n_params)
         .map(|i| if i < ws.n_theta { 1.0 } else { 0.0 })
         .collect();
-    // Dense fallback route (asserted above): `extra_ids` is unread here
-    // (`build_packed_m` never runs), so an empty slice is safe even though the
-    // fixture's actual crossed ids aren't threaded back out of it.
+    // Packed route (asserted above): `extra_ids` is unread here (the packed
+    // columns are already filled by the fixture, and `build_packed_m` never
+    // runs), so an empty slice is safe.
     let dev = glmm_laplace_deviance(&params, &mut ws, x.as_ref(), &y, &ids, &[], n);
     assert!(
         dev.is_finite(),
@@ -5481,8 +5113,8 @@ fn pirls_dense_step_halving_recovers_from_overshoot() {
     assert!(dev < 2600.0, "recovered deviance {dev} implausibly large");
 }
 
-/// PQL stationarity of the Profile-mode dense β step: after a converged
-/// `pirls_solve` in `BetaStep::Profile` (β seeded at 0, θ held at a blind
+/// PQL stationarity of the Profile-mode packed β step: after a converged
+/// `pirls_solve_packed` in `BetaStep::Profile` (β seeded at 0, θ held at a blind
 /// value), the β-gradient X'ρ must vanish — that IS the definition of "β is
 /// PQL-optimal for this θ", needing no external oracle. Recompute ρ = y − p̂
 /// at the RETURNED (u, β) and bound ‖X'ρ‖∞ by 1e-6·n. Canonical logit
@@ -5490,7 +5122,7 @@ fn pirls_dense_step_halving_recovers_from_overshoot() {
 /// tightly; the bound is tied to `pirls_tol` — loosen it (never the PIRLS
 /// tolerance) if a non-canonical family ever falls short.
 #[test]
-fn pirls_dense_profile_beta_reaches_pql_stationarity() {
+fn pirls_packed_profile_beta_reaches_pql_stationarity() {
     let (xf64, y, ids) = glmm_slope_noextra_dataset();
     let n = y.len();
     let cluster = ModelSpec {
@@ -5503,11 +5135,10 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
             extra_groupings: vec![],
         }),
     };
-    let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    // Drives the dense kernel (apply_lambda/pirls_solve) directly against a
-    // workspace the constructor sized for the blocked route (0×0 z/m/wm/a/a_chol).
-    ws.ensure_dense_buffers();
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
+    // The constructor would route this design to the blocked layout; the packed
+    // kernel is what this test drives.
+    let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
+    fill_packed_cols(&mut ws, &ids, &[], n);
     let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
     // Blind θ (vech Λ_p), β seed = 0. β is a buffer DISTINCT from ws.beta_rhs
     // (the Profile δβ scratch), per the BetaStep contract.
@@ -5515,43 +5146,32 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
     let mut params = vec![0.0; nt + p];
     params[..nt].copy_from_slice(&theta);
     let mut beta = vec![0.0_f64; p];
+    packed_oracle_fill(&mut ws, xf64.as_ref(), &params, n);
+    let m = packed_dense_m(&ws, n, k);
     let GlmmWorkspace {
-        groupings,
-        z,
-        m,
-        lam,
         prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        wm,
         wx,
-        a,
-        a_chol,
-        a_llt_mem,
-        a_rhs,
-        xtwx,
-        xtwm,
-        ainv_mtwx,
-        schur,
-        schur_llt_mem,
         beta_rhs,
-        beta_prev,
+        pirls,
+        packed,
+        border:
+            BorderScratch {
+                xtwx,
+                xtwm,
+                ainv_mtwx,
+                schur,
+                schur_llt_mem,
+                beta_prev,
+            },
         ..
     } = &mut ws;
-    apply_lambda(groupings, &params, z.as_ref(), m, lam, n);
-    let out = pirls_solve(
+    let out = pirls_solve_packed(
         Family::Binomial {
             link: BinomialLink::Logit,
         },
         f64::NAN,
         k,
         p,
-        m.as_ref(),
         xf64.as_ref(),
         &y,
         &prior_w[..n],
@@ -5567,19 +5187,9 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
             beta_prev,
             schur_llt_mem,
         },
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        wm,
+        pirls,
+        packed,
         wx,
-        a,
-        a_chol,
-        a_rhs,
-        a_llt_mem,
         None, // offset
         None,
         n,
@@ -5597,7 +5207,7 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
             e += xf64[(i, j)] * beta[j];
         }
         for c in 0..k {
-            e += mref[(i, c)] * u[c];
+            e += mref[(i, c)] * pirls.u[c];
         }
         let pi = 1.0 / (1.0 + (-e).exp());
         let rho = y[i] - pi;
@@ -5616,7 +5226,7 @@ fn pirls_dense_profile_beta_reaches_pql_stationarity() {
 }
 
 /// PQL stationarity of the Profile-mode blocked β step: blocked twin of
-/// `pirls_dense_profile_beta_reaches_pql_stationarity`. After a converged
+/// `pirls_packed_profile_beta_reaches_pql_stationarity`. After a converged
 /// `pirls_solve_blocked` in `BetaStep::Profile` (β seeded at 0, θ held blind),
 /// the β-gradient X'ρ must vanish — the PQL-optimality definition, no external
 /// oracle. Recompute ρ = y − p̂ at the RETURNED (u, β) with η = Xβ + Mu (M
@@ -5638,7 +5248,6 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         }),
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     assert!(
         ws.groupings.extra_offsets.is_empty(),
         "fixture must route to the blocked pirls_solve_blocked (no extras)"
@@ -5648,31 +5257,25 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
     // Blind θ (vech Λ_p), β seed = 0. β is a buffer DISTINCT from ws.beta_rhs
     // (the Profile δβ scratch), per the BetaStep contract.
     let theta = [0.5_f64, 0.1, 0.4];
-    crate::lmm::primary_lambda(&theta, ws.groupings.primary_q, &mut ws.lam);
+    crate::lmm::primary_lambda(&theta, ws.groupings.primary_q, &mut ws.pirls.lam);
     fill_z_f64(&ws.groupings, xf64.as_ref(), &mut ws.z_buf, n);
     let mut beta = vec![0.0_f64; p];
     let GlmmWorkspace {
         groupings,
-        lam,
         z_buf,
-        m_buf,
         prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        a_blocks,
-        a_rhs,
-        xtwx,
-        xtwm,
-        ainv_mtwx,
-        schur,
-        schur_llt_mem,
         beta_rhs,
-        beta_prev,
         wx,
+        pirls,
+        border:
+            BorderScratch {
+                xtwx,
+                xtwm,
+                ainv_mtwx,
+                schur,
+                schur_llt_mem,
+                beta_prev,
+            },
         ..
     } = &mut ws;
     let out = pirls_solve_blocked(
@@ -5697,17 +5300,8 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
             beta_prev,
             schur_llt_mem,
         },
-        lam,
+        pirls,
         z_buf,
-        m_buf,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        a_blocks,
-        a_rhs,
         None,
         wx,
         None, // offset
@@ -5728,7 +5322,7 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         }
         let ubase = ids[i] as usize * q;
         for c in 0..q {
-            e += m_buf[i * q + c] * u[ubase + c];
+            e += pirls.m_buf[i * q + c] * pirls.u[ubase + c];
         }
         let pi = 1.0 / (1.0 + (-e).exp());
         let rho = y[i] - pi;
@@ -5764,7 +5358,6 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
         ws.groupings.structured_extras_eligible(),
         "grouseticks 3-crossed must route through the structured extras path"
     );
-    build_z(&mut ws, x.as_ref(), &ids.primary, &ids.extra, n);
     let nt = ws.n_theta;
     // Blind θ (one scalar per component: INDEX, BROOD, LOCATION); β seed = 0.
     for t in 0..nt {
@@ -5776,11 +5369,16 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             groupings,
             params,
             z_buf,
-            lam,
-            m_core_buf,
-            cross_val,
-            cross_col,
-            n_cross,
+            pirls: PirlsScratch { lam, .. },
+            structured:
+                StructuredScratch {
+                    m_core_buf,
+                    cross_val,
+                    ..
+                },
+            pattern: StructuredPattern {
+                cross_col, n_cross, ..
+            },
             ..
         } = &mut ws;
         build_packed_m(
@@ -5800,42 +5398,31 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
     let out = {
         let GlmmWorkspace {
             groupings,
-            m_core_buf,
-            cross_val,
-            cross_col,
-            n_cross,
             prior_w,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            core_blocks,
-            coupling,
-            schur_blk,
-            coup_cols,
-            coup_ptr,
-            a_rhs,
-            xtwx,
-            xtwm,
-            ainv_mtwx,
-            schur,
-            schur_llt_mem,
             beta_rhs,
-            beta_prev,
             wx,
+            pirls,
+            structured,
+            pattern,
+            border:
+                BorderScratch {
+                    xtwx,
+                    xtwm,
+                    ainv_mtwx,
+                    schur,
+                    schur_llt_mem,
+                    beta_prev,
+                },
             ..
         } = &mut ws;
         build_coupling_csr(
             &ids.primary,
-            cross_col,
-            n_cross,
+            &pattern.cross_col,
+            &pattern.n_cross,
             groupings.n_primary,
             n,
-            coup_cols,
-            coup_ptr,
+            &mut pattern.coup_cols,
+            &mut pattern.coup_ptr,
         );
         pirls_solve_blocked_extras(
             Family::Poisson {
@@ -5844,10 +5431,6 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             f64::NAN,
             groupings,
             &ids.primary,
-            m_core_buf,
-            cross_val,
-            cross_col,
-            n_cross,
             x.as_ref(),
             &y,
             &prior_w[..n],
@@ -5863,21 +5446,9 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
                 beta_prev,
                 schur_llt_mem,
             },
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            core_blocks,
-            coupling,
-            schur_blk,
-            coup_cols,
-            coup_ptr,
-            None,
-            false,
-            a_rhs,
+            pirls,
+            structured,
+            pattern,
             None, // dual
             wx,
             None, // offset
@@ -5887,14 +5458,14 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
         )
     };
     assert!(out.3, "Profile-mode structured solve must converge");
-    // Bit-exact pin (`structured_extras_matches_dense` states the contract); the
+    // Bit-exact pin (`structured_extras_matches_packed` states the contract); the
     // stationarity bound below is a 1e-6·n band and cannot see a small move.
     assert_eq!(
         out,
         (
-            259.1091786447752,
+            259.1091786447751,
             224.4136716318005,
-            189.17876051534213,
+            189.17876051534208,
             true
         ),
         "structured return moved"
@@ -5926,12 +5497,12 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             e += x[(i, j)] * beta[j];
         }
         for local in 0..qc {
-            e += ws.m_core_buf[i * qc + local] * ws.u[core_col(f, local)];
+            e += ws.structured.m_core_buf[i * qc + local] * ws.pirls.u[core_col(f, local)];
         }
         let cbase = i * g_cap;
-        for z in 0..ws.n_cross[i] as usize {
-            let b = ws.cross_col[cbase + z] as usize;
-            e += ws.cross_val[cbase + z] * ws.u[k_family + b];
+        for z in 0..ws.pattern.n_cross[i] as usize {
+            let b = ws.pattern.cross_col[cbase + z] as usize;
+            e += ws.structured.cross_val[cbase + z] * ws.pirls.u[k_family + b];
         }
         let e = crate::family::clamp_eta(fam, e);
         let mui = crate::family::link_inv(fam, e);
@@ -5953,77 +5524,58 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
 }
 
 /// Profile-mode cross-variant consistency: the structured β step must agree with
-/// the dense β step at the same θ. On a crossed extras shape the dense
-/// `pirls_solve` (full M) and the structured `pirls_solve_blocked_extras` (packed
-/// M) are the same estimator (as `structured_extras_matches_dense` proves in
-/// Fixed mode); run BOTH in `BetaStep::Profile` from β = 0 and require the
-/// converged β to agree to ≤1e-8 rel. Guards a sign/transpose slip in exactly one
-/// variant — the structured Schur-border apply is the intricate one this catches.
+/// the packed β step at the same θ. On a crossed extras shape the packed
+/// `pirls_solve_packed` (a dense `k×k` A) and the structured
+/// `pirls_solve_blocked_extras` (core blocks + crossed Schur) are the same
+/// estimator (as `structured_extras_matches_packed` proves in Fixed mode); run
+/// BOTH in `BetaStep::Profile` from β = 0 and require the converged β to agree
+/// to ≤1e-8 rel. Guards a sign/transpose slip in exactly one variant — the
+/// structured Schur-border apply is the intricate one this catches.
 #[test]
-fn structured_profile_beta_matches_dense_profile() {
+fn structured_profile_beta_matches_packed_profile() {
     let (xf64, y, ids, extra_ids, cluster) = glmm_extras_q1_dataset(0, 6);
     let n = y.len();
     let theta = [0.5_f64, 0.45];
 
-    // Dense reference: apply_lambda → pirls_solve in Profile mode, β seed 0.
-    let mut wsd = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
-    // Drives the dense kernel directly against a workspace the constructor sized
-    // for the structured route (0×0 m/wm/a/a_chol).
-    wsd.ensure_dense_buffers();
-    build_z(&mut wsd, xf64.as_ref(), &ids, &extra_ids, n);
+    // Packed reference: the same design on the packed-row layout, Profile mode,
+    // β seed 0.
+    let mut wsd = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[], 1);
+    fill_packed_cols(&mut wsd, &ids, &extra_ids, n);
     let (k, p, nt) = (wsd.k, wsd.p, wsd.n_theta);
     let mut params = vec![0.0; nt + p];
     params[..nt].copy_from_slice(&theta);
-    let mut beta_dense = vec![0.0_f64; p];
-    {
+    let mut beta_packed = vec![0.0_f64; p];
+    packed_oracle_fill(&mut wsd, xf64.as_ref(), &params, n);
+    let oracle = {
         let GlmmWorkspace {
-            groupings,
-            z,
-            m,
-            lam,
-            ..
-        } = &mut wsd;
-        apply_lambda(groupings, &params, z.as_ref(), m, lam, n);
-    }
-    let dense = {
-        let GlmmWorkspace {
-            m,
             prior_w,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            wm,
             wx,
-            a,
-            a_chol,
-            a_llt_mem,
-            a_rhs,
-            xtwx,
-            xtwm,
-            ainv_mtwx,
-            schur,
-            schur_llt_mem,
             beta_rhs,
-            beta_prev,
+            pirls,
+            packed,
+            border:
+                BorderScratch {
+                    xtwx,
+                    xtwm,
+                    ainv_mtwx,
+                    schur,
+                    schur_llt_mem,
+                    beta_prev,
+                },
             ..
         } = &mut wsd;
-        pirls_solve(
+        pirls_solve_packed(
             Family::Binomial {
                 link: BinomialLink::Logit,
             },
             f64::NAN,
             k,
             p,
-            m.as_ref(),
             xf64.as_ref(),
             &y,
             &prior_w[..n],
             false,
-            &mut beta_dense,
+            &mut beta_packed,
             BetaStep::Profile {
                 exact: None,
                 xtwx,
@@ -6034,41 +5586,35 @@ fn structured_profile_beta_matches_dense_profile() {
                 beta_prev,
                 schur_llt_mem,
             },
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            wm,
+            pirls,
+            packed,
             wx,
-            a,
-            a_chol,
-            a_rhs,
-            a_llt_mem,
             None, // offset
             None,
             n,
             &mut crate::counters::EvalCounters::new(),
         )
     };
-    assert!(dense.3, "dense Profile solve must converge");
+    assert!(oracle.3, "packed Profile solve must converge");
 
     // Structured: build_packed_m → pirls_solve_blocked_extras in Profile mode.
     let mut wss = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
-    build_z(&mut wss, xf64.as_ref(), &ids, &extra_ids, n);
     let mut beta_str = vec![0.0_f64; p];
     {
         let GlmmWorkspace {
             groupings,
             params: prm,
             z_buf,
-            lam,
-            m_core_buf,
-            cross_val,
-            cross_col,
-            n_cross,
+            pirls: PirlsScratch { lam, .. },
+            structured:
+                StructuredScratch {
+                    m_core_buf,
+                    cross_val,
+                    ..
+                },
+            pattern: StructuredPattern {
+                cross_col, n_cross, ..
+            },
             ..
         } = &mut wss;
         prm[..nt].copy_from_slice(&theta);
@@ -6089,42 +5635,31 @@ fn structured_profile_beta_matches_dense_profile() {
     let structured = {
         let GlmmWorkspace {
             groupings,
-            m_core_buf,
-            cross_val,
-            cross_col,
-            n_cross,
             prior_w,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            core_blocks,
-            coupling,
-            schur_blk,
-            coup_cols,
-            coup_ptr,
-            a_rhs,
-            xtwx,
-            xtwm,
-            ainv_mtwx,
-            schur,
-            schur_llt_mem,
             beta_rhs,
-            beta_prev,
             wx,
+            pirls,
+            structured,
+            pattern,
+            border:
+                BorderScratch {
+                    xtwx,
+                    xtwm,
+                    ainv_mtwx,
+                    schur,
+                    schur_llt_mem,
+                    beta_prev,
+                },
             ..
         } = &mut wss;
         build_coupling_csr(
             &ids,
-            cross_col,
-            n_cross,
+            &pattern.cross_col,
+            &pattern.n_cross,
             groupings.n_primary,
             n,
-            coup_cols,
-            coup_ptr,
+            &mut pattern.coup_cols,
+            &mut pattern.coup_ptr,
         );
         pirls_solve_blocked_extras(
             Family::Binomial {
@@ -6133,10 +5668,6 @@ fn structured_profile_beta_matches_dense_profile() {
             f64::NAN,
             groupings,
             &ids,
-            m_core_buf,
-            cross_val,
-            cross_col,
-            n_cross,
             xf64.as_ref(),
             &y,
             &prior_w[..n],
@@ -6152,21 +5683,9 @@ fn structured_profile_beta_matches_dense_profile() {
                 beta_prev,
                 schur_llt_mem,
             },
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            core_blocks,
-            coupling,
-            schur_blk,
-            coup_cols,
-            coup_ptr,
-            None,
-            false,
-            a_rhs,
+            pirls,
+            structured,
+            pattern,
             None, // dual
             wx,
             None, // offset
@@ -6176,25 +5695,25 @@ fn structured_profile_beta_matches_dense_profile() {
         )
     };
     assert!(structured.3, "structured Profile solve must converge");
-    // Bit-exact pin (`structured_extras_matches_dense` states the contract); the
+    // Bit-exact pin (`structured_extras_matches_packed` states the contract); the
     // β comparison below is a 1e-8 relative band and cannot see a small move.
     assert_eq!(
         structured,
         (
             124.69314344477421,
             2.7692222052497977,
-            3.7225226795924997,
+            3.7225226795925,
             true
         ),
         "structured return moved"
     );
 
     for j in 0..p {
-        let rel = (beta_dense[j] - beta_str[j]).abs() / beta_dense[j].abs().max(1.0);
+        let rel = (beta_packed[j] - beta_str[j]).abs() / beta_packed[j].abs().max(1.0);
         assert!(
             rel < 1e-8,
-            "Profile β[{j}] cross-variant: dense {} structured {} (rel {rel:.2e})",
-            beta_dense[j],
+            "Profile β[{j}] cross-variant: packed {} structured {} (rel {rel:.2e})",
+            beta_packed[j],
             beta_str[j]
         );
     }
@@ -6261,7 +5780,7 @@ fn coupling_csr_rebuilds_on_theta_pinning_transition() {
     assert_eq!(d3, d1, "un-pinning must restore the original pattern");
 }
 
-/// No-extras twin of `dense_path_overshoot_fixture`: primary-only grouping
+/// No-extras twin of `packed_path_overshoot_fixture`: primary-only grouping
 /// (8 RE slopes + intercept ⇒ q_p = 9, `extra_offsets` empty) so
 /// `laplace_deviance` routes to `pirls_solve_blocked`. Same Poisson-log large
 /// counts (~5000) at the β = 0, u = 0 cold start ⇒ the first full Fisher step
@@ -6295,8 +5814,8 @@ fn blocked_path_overshoot_fixture() -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u
             extra_groupings: vec![],
         }),
     };
-    let mut ws = GlmmWorkspace::for_cluster_spec(1, &cluster, n, &slope_cols, 1);
-    build_z(&mut ws, x.as_ref(), &ids, &[], n);
+    let groupings = crate::lmm::LmmGroupings::from_cluster_spec(&cluster, n, &slope_cols);
+    let ws = GlmmWorkspace::from_groupings(groupings, cluster.family, 1, n, 1, GlmmLayout::Blocked);
     (ws, x, y, ids, n)
 }
 
@@ -6349,7 +5868,6 @@ fn laplace_deviance_profile_evaluates_and_is_deterministic() {
         }),
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     assert!(
         ws.groupings.extra_offsets.is_empty(),
         "fixture must route to the blocked pirls_solve_blocked (no extras)"
@@ -6388,20 +5906,13 @@ fn laplace_deviance_profile_evaluates_and_is_deterministic() {
 /// The θ-only stage-1 scratch (`solver_stage1`, `params_stage1`, `outer_search`)
 /// exists on every `GlmmWorkspace` and is the shipped default fit path (see
 /// `fit_glmm`'s STAGE 1 block), not an inert addition. Uses the 1-slope +
-/// 1-crossed fixture so `n_theta = 4 >= 3`, exercising the `sparse_lmm_seed`
-/// mid-model npt branch.
+/// 1-crossed fixture so `n_theta = 4 >= 3`, exercising the mid-model npt
+/// branch.
 #[test]
 fn workspace_carries_stage1_scratch_sized_for_n_theta() {
-    let (xf64, _y, ids, crossed_ids, cluster) = glmm_slope_crossed_dataset();
+    let (_xf64, _y, ids, _crossed_ids, cluster) = glmm_slope_crossed_dataset();
     let n = ids.len();
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    build_z(
-        &mut ws,
-        xf64.as_ref(),
-        &ids,
-        std::slice::from_ref(&crossed_ids),
-        n,
-    );
     assert_eq!(
         ws.n_theta, 4,
         "fixture shape: q_p=2 vech(3) + 1 crossed scalar"
@@ -6517,7 +6028,6 @@ fn stage2_objective_is_bit_identical_to_single_stage_objective() {
     // Converged optimum: one single-stage fit, snapshot [θ̂|β̂] from ws.params.
     let converged: Vec<f64> = {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
-        build_z(&mut ws, x.as_ref(), &ids.primary, &ids.extra, n);
         let beta0 = vec![0.0_f64; p];
         let fit = fit_glmm(
             &mut ws,
@@ -6575,14 +6085,13 @@ fn stage2_objective_is_bit_identical_to_single_stage_objective() {
     // workspace with the warm seed pinned to a shared constant.
     let eval = |pt: &[f64], two_stage: bool| -> f64 {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
-        build_z(&mut ws, x.as_ref(), &ids.primary, &ids.extra, n);
         ws.outer_search = if two_stage {
             OuterSearch::PqlThenJoint
         } else {
             OuterSearch::Joint
         };
         let k = ws.k.max(1);
-        ws.warm_seed_active = true;
+        ws.fd.warm_seed_active = true;
         for v in ws.u_seed[..k].iter_mut() {
             *v = 0.05;
         }
@@ -6622,13 +6131,13 @@ fn assert_two_stage_adversarial(
     n: usize,
     p: usize,
     theta_start: Option<&[f64]>,
+    expect_converged: Option<bool>,
 ) {
     let targets = [if p >= 2 { 1u32 } else { 0u32 }];
     let beta_start = vec![0.0_f64; p];
 
     let mut ws1 = GlmmWorkspace::for_cluster_spec(p, spec, n, &[], 1);
     ws1.outer_search = OuterSearch::Joint; // pin the single-stage reference
-    build_z(&mut ws1, x, primary, extra, n);
     let fit1 = fit_glmm(
         &mut ws1,
         x,
@@ -6645,7 +6154,6 @@ fn assert_two_stage_adversarial(
     // Second workspace keeps the constructor's default route — the A/B is
     // "default route vs `Joint`", not "PQL warm start vs `Joint`" specifically.
     let mut ws2 = GlmmWorkspace::for_cluster_spec(p, spec, n, &[], 1);
-    build_z(&mut ws2, x, primary, extra, n);
     let fit2 = fit_glmm(
         &mut ws2,
         x,
@@ -6659,6 +6167,13 @@ fn assert_two_stage_adversarial(
         WaldSe::Rx,
     );
 
+    if let Some(expected) = expect_converged {
+        assert_eq!(
+            fit2.converged, expected,
+            "{label}: two-stage convergence outcome changed — was pinned so the \
+             clean-failure branch below stays exercised"
+        );
+    }
     if !fit2.converged {
         // Clean NaN failure surface (nan_fit): every inference output NaN — never
         // a finite value smuggled out under converged == false.
@@ -6730,13 +6245,17 @@ fn two_stage_adversarial_bad_theta_start() {
         80,
         2,
         Some(&[100.0]),
+        None,
     );
 }
 
 /// Adversarial: a near-collinear design (col 2 = col 1 + 1e-8·noise, condition
 /// number ~1e8) makes the β-Schur near-singular — the stress the β-profiling step's
 /// dense solve must survive. `fit_glmm` runs no rank-deficiency salvage (that lives
-/// in `fit_warm`), so this hits the ill-conditioned kernel directly.
+/// in `fit_warm`), so this hits the ill-conditioned kernel directly. This is the one
+/// adversarial cell that lands on the clean-failure surface — both stages exhaust
+/// halving on the singular Schur — so its expected outcome is pinned to keep the
+/// NaN-fill assertions in `assert_two_stage_adversarial` exercised.
 #[test]
 fn two_stage_adversarial_near_collinear_x() {
     let (n, nc) = (80usize, 8usize);
@@ -6769,6 +6288,7 @@ fn two_stage_adversarial_near_collinear_x() {
         n,
         3,
         None,
+        Some(false),
     );
 }
 
@@ -6806,6 +6326,7 @@ fn two_stage_adversarial_tiny_clusters() {
         &[],
         n,
         2,
+        None,
         None,
     );
 }
@@ -6876,7 +6397,7 @@ fn default_fixture_size(shape: &str) -> (usize, usize) {
 }
 
 /// `fixture`, generalized over `nagq` — the AGQ gate tests need
-/// `ws.agq_scratch` (and `ws.dual_scratch`'s eventual AGQ node table) sized
+/// `ws.pirls.agq_scratch` (and `ws.dual_scratch`'s eventual AGQ node table) sized
 /// for `nagq > 1` from construction, which only `for_cluster_spec`'s own
 /// `nagq` argument controls (`workspace.rs:415-427`); setting `ws.nagq` after
 /// the fact would leave `agq_scratch` sized for the wrong `k`. `fixture`
@@ -6951,7 +6472,6 @@ fn fixture_with_nagq_sized(
     if matches!(family, Family::NegativeBinomial { .. }) {
         ws.nb_theta = 4.0;
     }
-    build_z(&mut ws, xf64.as_ref(), &ids, &[], n);
     (ws, xf64, y, ids, p, n)
 }
 
@@ -7012,7 +6532,6 @@ fn fixture_padded_sized(
     if matches!(family, Family::NegativeBinomial { .. }) {
         ws.nb_theta = 4.0;
     }
-    build_z(&mut ws, x.as_ref(), &ids, &[], n);
     (ws, x, y, ids, p, n)
 }
 
@@ -7187,7 +6706,7 @@ const GRADIENT_GATE_CELLS: &[(Family, &str)] = &[
 /// differentiates. Step: `h = 1e-5` absolute on θ, `1e-5·max(1, |β_k|)` on β
 /// (`FD_STEP_BASE`'s asymmetry is calibrated against the FD-Hessian noise
 /// floor, not a first difference — this uses its own steps). Band: 1e-6
-/// relative. Both run at the CALLER's `ws.pirls_tol_override` (the gate sets
+/// relative. Both run at the CALLER's `ws.fd.pirls_tol_override` (the gate sets
 /// `Some(1e-12)` — see `dual_gradient_matches_central_fd_per_family_and_shape`'s
 /// doc comment for why the tolerance is tightened this far).
 #[allow(clippy::too_many_arguments)]
@@ -7224,7 +6743,7 @@ fn assert_dual_gradient_matches_fd(
             } else {
                 1e-5 * saved[k].abs().max(1.0)
             };
-            // Cold-start `ws.u` (mirrors `laplace_deviance_at`'s own default
+            // Cold-start `ws.pirls.u` (mirrors `laplace_deviance_at`'s own default
             // seed) before EACH directional eval, rather than letting it carry
             // over from the previous eval's converged mode: `laplace_deviance_ws`
             // seeds nothing itself, so an un-reset `u` chains a growing
@@ -7236,13 +6755,13 @@ fn assert_dual_gradient_matches_fd(
             // this cell (Binomial-cloglog), an un-reset `u` puts the FD/dual
             // gap as high as ~1.5e-6 relative (over the 1e-6 band); resetting
             // to zero here brings every draw back to ~1e-9.
-            for v in ws.u[..kk].iter_mut() {
+            for v in ws.pirls.u[..kk].iter_mut() {
                 *v = 0.0;
             }
             ws.params[k] = saved[k] + h;
             ws.beta_rhs[..p].copy_from_slice(&ws.params[ws.n_theta..m]);
             let fp = laplace_deviance_ws(ws, x, y, ids, extra_ids, n, BetaMode::Fixed, &mut ctrs);
-            for v in ws.u[..kk].iter_mut() {
+            for v in ws.pirls.u[..kk].iter_mut() {
                 *v = 0.0;
             }
             ws.params[k] = saved[k] - h;
@@ -7267,12 +6786,12 @@ fn assert_dual_gradient_matches_fd(
 /// order — an FD/analytic mismatch there would be the mode's error, not the
 /// chain rule's. Forcing 1e-12 tests the math. Same reasoning the parked
 /// gradient spec's validation section gives; the switch already exists as
-/// `ws.pirls_tol_override`.
+/// `ws.fd.pirls_tol_override`.
 #[test]
 fn dual_gradient_matches_central_fd_per_family_and_shape() {
     for &(family, shape) in GRADIENT_GATE_CELLS {
         let (mut ws, x, y, ids, p, n) = fixture(family, shape);
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta(shape);
         assert_dual_gradient_matches_fd(
             &mut ws,
@@ -7287,7 +6806,7 @@ fn dual_gradient_matches_central_fd_per_family_and_shape() {
             10,
             rng,
         );
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
 }
 
@@ -7298,17 +6817,17 @@ fn dual_gradient_matches_central_fd_per_family_and_shape() {
 /// through the explicit `F`/`G` adjoint, so they must agree to round-off — the
 /// band is `1e-10` relative, not the FD gates' `1e-6`.
 ///
-/// A gap at the `1e-7` scale rather than at round-off would be the Laplace
-/// objective's own iterate lag (its `dev`/`log|A|` are built at `u_prev` while
-/// its penalty is read at `u`) reaching the two sides differently; the fix for
-/// that is the assembly's evaluation point, never a wider band here.
+/// A gap at the `1e-7` scale rather than at round-off would be the assembly
+/// reading some η-dependent quantity at an iterate the kernel did not leave it
+/// at; the fix for that is the assembly's evaluation point, never a wider band
+/// here.
 #[test]
 fn assembled_gradient_matches_laplace_gradient() {
     const BAND: f64 = 1e-10;
     let mut cells: Vec<(String, f64)> = Vec::new();
     for &(family, shape) in GRADIENT_GATE_CELLS {
         let (mut ws, x, y, ids, p, n) = fixture(family, shape);
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta(shape);
         let worst = assert_assembled_gradient_matches_laplace(
             &mut ws,
@@ -7325,11 +6844,11 @@ fn assembled_gradient_matches_laplace_gradient() {
             BAND,
         );
         cells.push((format!("{family:?}/{shape}"), worst));
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
     for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
         let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta(shape);
         let worst = assert_assembled_gradient_matches_laplace(
             &mut ws,
@@ -7346,10 +6865,77 @@ fn assembled_gradient_matches_laplace_gradient() {
             BAND,
         );
         cells.push((format!("{family:?}/{shape}"), worst));
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
     for (name, worst) in &cells {
         println!("assembled-gradient cell {name}: worst relative gap {worst:e}");
+    }
+}
+
+/// The same comparison as [`assembled_gradient_matches_laplace_gradient`], run
+/// at the SHIPPED PIRLS tolerance instead of a tightened one.
+///
+/// What this gate separates, and the tightened twin cannot: whether the
+/// objective's three terms and the factor sit at one iterate. At
+/// `pirls_tol_override = Some(1e-12)` the last PIRLS step is at round-off, so
+/// `u` and the point before it coincide and a wrong evaluation point is
+/// invisible — that twin stays green either way. At the shipped tolerance the
+/// step is not at round-off on a non-canonical link, and the refreshed
+/// objective agrees with `laplace_gradient` two to three orders more closely
+/// than an objective whose `log|A|` and factor lag the returned mode by a
+/// Newton step (probit, cloglog, Gamma-log and NB-log cells; canonical logit
+/// and Poisson-log cells sit at 1e-14 either way).
+///
+/// Band provenance, measured 2026-09-15 over all 30 gate cells: ten times the
+/// worst cell. The five worst are Gamma-Log/int1 7.24e-9,
+/// Binomial-Cloglog/nested2_crossed6 5.43e-9, Gamma-Log/crossed6 3.28e-9,
+/// Gamma-Log/nested2_crossed6 2.37e-9 and Binomial-Cloglog/nested2 2.11e-9;
+/// the rest of the non-canonical set runs 3.25e-13…8.49e-10, and every
+/// canonical cell sits at 1.25e-15…2.84e-14.
+#[test]
+fn assembled_gradient_matches_laplace_gradient_at_shipped_tolerance() {
+    const BAND: f64 = 7.3e-8;
+    let mut cells: Vec<(String, f64)> = Vec::new();
+    for &(family, shape) in GRADIENT_GATE_CELLS {
+        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+        let rng = fixed_seed_theta(shape);
+        let worst = assert_assembled_gradient_matches_laplace(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            family,
+            shape,
+            10,
+            rng,
+            BAND,
+        );
+        cells.push((format!("{family:?}/{shape}"), worst));
+    }
+    for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
+        let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
+        let rng = fixed_seed_theta(shape);
+        let worst = assert_assembled_gradient_matches_laplace(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            family,
+            shape,
+            10,
+            rng,
+            BAND,
+        );
+        cells.push((format!("{family:?}/{shape}"), worst));
+    }
+    for (name, worst) in &cells {
+        println!("shipped-tolerance assembled-gradient cell {name}: worst relative gap {worst:e}");
     }
 }
 
@@ -7432,8 +7018,7 @@ fn two_crossed_fixture(
             slopes: vec![],
         });
     extra_ids.push((0..n).map(|i| ((i / 3) % N_C2) as u32).collect());
-    let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
-    build_z(&mut ws, x.as_ref(), &ids, &extra_ids, n);
+    let ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
     assert_eq!(ws.groupings.crossed.len(), 2, "two crossed groupings");
     (ws, x, y, ids, extra_ids, p, n)
 }
@@ -7466,7 +7051,7 @@ fn assembled_hessian_columns_match_fd_of_f64_gradient() {
     let mut cells: Vec<(String, f64, f64)> = Vec::new();
     for &(family, shape) in GRADIENT_GATE_CELLS {
         let (mut ws, x, y, ids, p, n) = fixture(family, shape);
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta(shape);
         let (wt, wb) = assert_assembled_hessian_columns_match_fd(
             &mut ws,
@@ -7484,11 +7069,11 @@ fn assembled_hessian_columns_match_fd_of_f64_gradient() {
             BAND,
         );
         cells.push((format!("{family:?}/{shape}"), wt, wb));
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
     for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
         let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta(shape);
         let (wt, wb) = assert_assembled_hessian_columns_match_fd(
             &mut ws,
@@ -7506,7 +7091,7 @@ fn assembled_hessian_columns_match_fd_of_f64_gradient() {
             BAND,
         );
         cells.push((format!("{family:?}/{shape}"), wt, wb));
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
     // One cell with the FIRST of two crossed θ pinned at 0. The `f64` packer
     // drops that grouping's column and the dual packer keeps it, so the two
@@ -7521,7 +7106,7 @@ fn assembled_hessian_columns_match_fd_of_f64_gradient() {
             link: BinomialLink::Logit,
         };
         let (mut ws, x, y, ids, extra_ids, p, n) = two_crossed_fixture(family);
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let pinned = [ws.groupings.crossed[0].vech_start];
         let rng = FixedSeedTheta {
             state: 5006,
@@ -7545,7 +7130,7 @@ fn assembled_hessian_columns_match_fd_of_f64_gradient() {
             BAND,
         );
         cells.push((format!("{family:?}/crossed6x4_pinned"), wt, wb));
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
     // One cell above the lane ladder's top rung: `q2s` (n_θ = 3) padded by 12
     // zero-truth columns gives `m = 17`, so the pass runs in two `Dual<12>`
@@ -7558,7 +7143,7 @@ fn assembled_hessian_columns_match_fd_of_f64_gradient() {
         let extra_p = 12;
         let (mut ws, x, y, ids, p, n) = fixture_padded(family, "q2s", extra_p);
         assert_eq!(ws.n_theta + p, 17, "the padding must give two chunks");
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta_padded("q2s", extra_p);
         let (wt, wb) = assert_assembled_hessian_columns_match_fd(
             &mut ws,
@@ -7576,7 +7161,7 @@ fn assembled_hessian_columns_match_fd_of_f64_gradient() {
             BAND,
         );
         cells.push((format!("{family:?}/q2s_p14"), wt, wb));
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
     for (name, wt, wb) in &cells {
         println!("hessian-column cell {name}: worst relative gap theta {wt:e}, beta {wb:e}");
@@ -7624,7 +7209,7 @@ fn assert_assembled_hessian_columns_match_fd(
         // chunk's own answer. Forward-mode lanes are independent, so column
         // `coord` of a pass seeding a whole chunk is the number a pass seeding
         // `coord` alone would return.
-        for v in ws.u[..kk].iter_mut() {
+        for v in ws.pirls.u[..kk].iter_mut() {
             *v = 0.0;
         }
         let mut hess = Mat::<f64>::zeros(m, m);
@@ -7639,7 +7224,7 @@ fn assert_assembled_hessian_columns_match_fd(
         // chunk it came out of. Asserted in release, not only in debug: on the
         // padded cell this pass runs two chunks, and a chunk that
         // differentiated a different point would show here.
-        for v in ws.u[..kk].iter_mut() {
+        for v in ws.pirls.u[..kk].iter_mut() {
             *v = 0.0;
         }
         let mut gref = vec![0.0; m];
@@ -7674,14 +7259,14 @@ fn assert_assembled_hessian_columns_match_fd(
             } else {
                 1e-5 * saved[coord].abs().max(1.0)
             };
-            // Cold-start `ws.u` before EVERY evaluation, as the FD gradient
+            // Cold-start `ws.pirls.u` before EVERY evaluation, as the FD gradient
             // gate does: a warm start chained across the coordinate loop
             // converges to the same objective at a slightly different `u`, and
             // the difference reaches a differenced gradient at a scale this
             // band would catch.
             let eval = |ws: &mut GlmmWorkspace, at: &[f64], out: &mut [f64]| {
                 ws.params[..m].copy_from_slice(at);
-                for v in ws.u[..kk].iter_mut() {
+                for v in ws.pirls.u[..kk].iter_mut() {
                     *v = 0.0;
                 }
                 super::assembled::gradient_f64(ws, x, y, ids, extra_ids, p, n, out).unwrap_or_else(
@@ -7807,7 +7392,7 @@ fn dual_gradient_matches_central_fd_padded_to_n12() {
     let shape = "q2s";
     let extra_p = 7;
     let (mut ws, x, y, ids, p, n) = fixture_padded(family, shape, extra_p);
-    ws.pirls_tol_override = Some(1e-12);
+    ws.fd.pirls_tol_override = Some(1e-12);
     let m = ws.n_theta + p;
     assert_eq!(m, 12, "padding must land exactly on the N=12 band");
     let rng = fixed_seed_theta_padded(shape, extra_p);
@@ -7824,7 +7409,7 @@ fn dual_gradient_matches_central_fd_padded_to_n12() {
         10,
         rng,
     );
-    ws.pirls_tol_override = None;
+    ws.fd.pirls_tol_override = None;
 }
 
 /// The GLMM gradient above the lane cap: `q2s` (n_θ=3) padded by 12 zero-truth
@@ -7838,7 +7423,7 @@ fn dual_gradient_matches_central_fd_chunked_above_n12() {
     let shape = "q2s";
     let extra_p = 12;
     let (mut ws, x, y, ids, p, n) = fixture_padded(family, shape, extra_p);
-    ws.pirls_tol_override = Some(1e-12);
+    ws.fd.pirls_tol_override = Some(1e-12);
     let m = ws.n_theta + p;
     assert_eq!(m, 17, "padding must land above the N=12 rung");
     assert_eq!(NLanes::pick(m, false), Some(NLanes::D12));
@@ -7856,7 +7441,7 @@ fn dual_gradient_matches_central_fd_chunked_above_n12() {
         10,
         rng,
     );
-    ws.pirls_tol_override = None;
+    ws.fd.pirls_tol_override = None;
 }
 
 /// Shared per-draw body of the Hessian FD gate: `n_draws` fixed-seed θ (+
@@ -7864,10 +7449,10 @@ fn dual_gradient_matches_central_fd_chunked_above_n12() {
 /// FD stencil of `laplace_gradient`'s ANALYTIC gradient — not a second
 /// difference of the deviance itself — matching how `laplace_hessian` is
 /// built (both objectives come off the same kernel calls). Step and band as
-/// the gradient gate above. Every gradient eval also cold-starts `ws.u` first
+/// the gradient gate above. Every gradient eval also cold-starts `ws.pirls.u` first
 /// (same reason as `assert_dual_gradient_matches_fd`'s directional evals: the
 /// `f64` mode solve underneath `laplace_gradient` warm-starts from whatever
-/// `ws.u` currently holds, and the plus/minus evals need to land in the same
+/// `ws.pirls.u` currently holds, and the plus/minus evals need to land in the same
 /// basin for their difference to be the smooth branch's curvature). Also
 /// asserts `hess[(i, j)] == hess[(j, i)]` exactly (`==`, no band) — both
 /// entries are copies of the same packed `h` slot.
@@ -7915,7 +7500,7 @@ fn assert_dual_hessian_matches_fd_of_gradient(
             } else {
                 1e-5 * saved[k].abs().max(1.0)
             };
-            for v in ws.u[..kk].iter_mut() {
+            for v in ws.pirls.u[..kk].iter_mut() {
                 *v = 0.0;
             }
             ws.params[k] = saved[k] + h;
@@ -7925,7 +7510,7 @@ fn assert_dual_hessian_matches_fd_of_gradient(
                 matches!(stp, DerivStatus::Ok(_)),
                 "{family:?}/{shape} coord {k} (+h) did not converge"
             );
-            for v in ws.u[..kk].iter_mut() {
+            for v in ws.pirls.u[..kk].iter_mut() {
                 *v = 0.0;
             }
             ws.params[k] = saved[k] - h;
@@ -7956,7 +7541,7 @@ fn assert_dual_hessian_matches_fd_of_gradient(
 fn dual_hessian_matches_central_fd_of_gradient_per_family_and_shape() {
     for &(family, shape) in GRADIENT_GATE_CELLS {
         let (mut ws, x, y, ids, p, n) = fixture(family, shape);
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta(shape);
         assert_dual_hessian_matches_fd_of_gradient(
             &mut ws,
@@ -7971,7 +7556,7 @@ fn dual_hessian_matches_central_fd_of_gradient_per_family_and_shape() {
             10,
             rng,
         );
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
 }
 
@@ -7985,7 +7570,7 @@ fn dual_hessian_matches_central_fd_of_gradient_padded_to_n12() {
     let shape = "q2s";
     let extra_p = 7;
     let (mut ws, x, y, ids, p, n) = fixture_padded(family, shape, extra_p);
-    ws.pirls_tol_override = Some(1e-12);
+    ws.fd.pirls_tol_override = Some(1e-12);
     let m = ws.n_theta + p;
     assert_eq!(m, 12, "padding must land exactly on the N=12 band");
     let rng = fixed_seed_theta_padded(shape, extra_p);
@@ -8002,7 +7587,7 @@ fn dual_hessian_matches_central_fd_of_gradient_padded_to_n12() {
         10,
         rng,
     );
-    ws.pirls_tol_override = None;
+    ws.fd.pirls_tol_override = None;
 }
 
 // --- The same two FD gates on the structured-extras route ---
@@ -8023,7 +7608,7 @@ fn dual_hessian_matches_central_fd_of_gradient_padded_to_n12() {
 /// to flatten cloglog's `dμ/dη`, confirmed by the passing FD gate cells below
 /// and by the structured-exact-profile unit gate's cloglog cell.
 ///
-/// `ws.structured_schur` is built here, so on the crossed cells the FD
+/// `ws.pattern.structured_schur` is built here, so on the crossed cells the FD
 /// reference (`laplace_deviance_ws`) runs the production cached sparse tail
 /// while the dual gradient runs the dense generic one. The gate therefore
 /// covers the tail routing on top of the chain rule: the two are a
@@ -8076,8 +7661,7 @@ fn extras_fixture(
     if matches!(family, Family::NegativeBinomial { .. }) {
         ws.nb_theta = 4.0;
     }
-    build_z(&mut ws, x.as_ref(), &ids, &extra_ids, n);
-    ws.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+    ws.pattern.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
     // Observed twin of the crossed-Schur factor, gated the same way production
     // builds it: only where the exact profile can read it, a non-canonical
     // link on a structured-eligible shape. Same pattern, same arguments as
@@ -8271,7 +7855,7 @@ const STRUCTURED_GATE_CELLS: &[(Family, &str, usize, usize)] = &[
 fn structured_dual_gradient_matches_central_fd_per_family_and_shape() {
     for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
         let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta(shape);
         assert_dual_gradient_matches_fd(
             &mut ws,
@@ -8286,7 +7870,7 @@ fn structured_dual_gradient_matches_central_fd_per_family_and_shape() {
             10,
             rng,
         );
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
 }
 
@@ -8297,7 +7881,7 @@ fn structured_dual_gradient_matches_central_fd_per_family_and_shape() {
 fn structured_dual_hessian_matches_central_fd_of_the_gradient() {
     for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
         let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta(shape);
         assert_dual_hessian_matches_fd_of_gradient(
             &mut ws,
@@ -8312,7 +7896,7 @@ fn structured_dual_hessian_matches_central_fd_of_the_gradient() {
             10,
             rng,
         );
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
 }
 
@@ -8356,6 +7940,16 @@ const AGQ_GATE_CELLS: &[(Family, &str, u8)] = &[
         "q2s",
         5,
     ),
+    // Non-canonical binomial link: `agq_eligible` admits `Binomial { .. }` at
+    // any link, so this cell exercises the general Fisher-scoring PIRLS mode
+    // inside the AGQ node loop, not just the logit fast path the other cells cover.
+    (
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        "int1",
+        7,
+    ),
 ];
 
 /// Central FD of the AGQ deviance against the dual gradient, per
@@ -8369,7 +7963,7 @@ const AGQ_GATE_CELLS: &[(Family, &str, u8)] = &[
 fn agq_dual_gradient_matches_central_fd() {
     for &(family, shape, nagq) in AGQ_GATE_CELLS {
         let (mut ws, x, y, ids, p, n) = fixture_with_nagq(family, shape, nagq);
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta(shape);
         assert_dual_gradient_matches_fd(
             &mut ws,
@@ -8384,7 +7978,7 @@ fn agq_dual_gradient_matches_central_fd() {
             10,
             rng,
         );
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
 }
 
@@ -8396,7 +7990,7 @@ fn agq_dual_gradient_matches_central_fd() {
 fn agq_dual_hessian_matches_central_fd() {
     for &(family, shape, nagq) in AGQ_GATE_CELLS {
         let (mut ws, x, y, ids, p, n) = fixture_with_nagq(family, shape, nagq);
-        ws.pirls_tol_override = Some(1e-12);
+        ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta(shape);
         assert_dual_hessian_matches_fd_of_gradient(
             &mut ws,
@@ -8411,7 +8005,7 @@ fn agq_dual_hessian_matches_central_fd() {
             10,
             rng,
         );
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
     }
 }
 
@@ -8698,7 +8292,7 @@ fn w8_time_cell(
     }
 
     let n_lanes = w8_lane_n(m);
-    if !supports_shape(&ws.groupings) {
+    if !supports_shape(ws.layout, &ws.groupings) {
         w8_print_row(label, e, s, n, m, n_lanes, t_f, None, None);
         return;
     }
@@ -8752,7 +8346,6 @@ fn w8_sweep_row(e: usize, s: usize) {
     let (x, y, ids, extra_ids, spec) = glmm_extras_q1_dataset_sized(0, e, s, n);
     let p = 2usize;
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
-    build_z(&mut ws, x.as_ref(), &ids, &extra_ids, n);
     // Seed away from the cold default (θ=identity scale, β=0): a positive
     // variance component and the design's own true β, so the timed PIRLS
     // solves take a realistic number of steps rather than the ~1-step
@@ -8843,14 +8436,7 @@ fn load_empirical_corpus(
     // `build_coupling_csr` on the real ids' level range.
     let (sized_model, sized_ids, _perm) = crate::fit::spec_sized_from_ids_pub(&lo.model, &lo.ids);
     let sized_ids = sized_ids.into_owned();
-    let mut ws = GlmmWorkspace::for_cluster_spec(lo.p, &sized_model, lo.n, &[], 1);
-    build_z(
-        &mut ws,
-        x.as_ref(),
-        &sized_ids.primary,
-        &sized_ids.extra,
-        lo.n,
-    );
+    let ws = GlmmWorkspace::for_cluster_spec(lo.p, &sized_model, lo.n, &[], 1);
     (ws, x, lo.y, sized_ids.primary, sized_ids.extra, lo.p, lo.n)
 }
 

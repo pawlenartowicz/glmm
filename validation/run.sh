@@ -152,13 +152,16 @@ fi
 # file, and unlike summarize_parallel.R it has no run_meta.json skip -- dropping one
 # in there would break the gate.
 write_run_meta() {
-  local engine="$1" rev no_turbo
+  local engine="$1" rev no_turbo loadavg
   rev="$(git -C "$ROOT/.." rev-parse HEAD 2>/dev/null || echo unknown)"
   # Recorded, never set -- clock locking is the user's `bench-l`/`bench-u`.
   no_turbo="$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo '?')"
   mkdir -p "$ROOT/results"
-  printf '{"engine":"%s","machine":"%s","glmm_git_rev":"%s","n_runs":%s,"nagq":%s,"no_turbo":"%s","pin":"%s","started":"%s"}\n' \
-    "$engine" "$(uname -n) $(uname -s)/$(uname -m)" "$rev" "$TIMING_RUNS" "${AGQ:-1}" "$no_turbo" "${PIN:-none}" "$(date -Is)" \
+  # The 1/5/15-minute load averages as the pass starts: foreign load is invisible to
+  # `no_turbo` and the pin, and it is what makes two locked passes disagree.
+  loadavg="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '?')"
+  printf '{"engine":"%s","machine":"%s","glmm_git_rev":"%s","n_runs":%s,"nagq":%s,"no_turbo":"%s","pin":"%s","loadavg_start":"%s","started":"%s"}\n' \
+    "$engine" "$(uname -n) $(uname -s)/$(uname -m)" "$rev" "$TIMING_RUNS" "${AGQ:-1}" "$no_turbo" "${PIN:-none}" "$loadavg" "$(date -Is)" \
     > "$ROOT/results/run_meta_${engine}${META_SUFFIX}.json"
   [[ "$no_turbo" == "1" ]] || echo \
     "   WARNING: clock NOT locked (no_turbo=$no_turbo) -- timings from this $engine pass are powersave noise; run bench-l first" >&2

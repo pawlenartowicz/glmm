@@ -17,6 +17,7 @@ R's function-call syntax: `log()`/`sqrt()`/`exp()`/`I(x^k)` on one bare column,
 | `:` | Interaction only (no main effects added) | `x1:x2` |
 | `*` | Desugars to main effects + interaction | `x1*x2` → `x1 + x2 + x1:x2` |
 | `A/B` | Nesting: `A` main effect + `A:B` interaction | `a/b` → `a + a:b` |
+| `1` | The intercept, written out. It is always there unless removed, so `1 + x` and `x` are the same model | `1 + x` |
 | `- 1`, `0 +` | Drops the fixed-effect intercept | `x - 1`, `0 + x` |
 | `log(x)`, `sqrt(x)`, `exp(x)` | Transform of one bare column, used as its own design column | `log(x)` |
 | `I(x^k)`, `k ≥ 2` | Integer power of one bare column | `I(x^2)` |
@@ -58,7 +59,7 @@ not a positive, finite number is a clear error naming the row.
 | Construct | Error behavior | Workaround |
 |---|---|---|
 | `poly(x, 2)`, nested calls (`log(log(x))`), arithmetic inside a call (`log(x+1)`), two-argument calls | Clear parse error — the transform whitelist accepts exactly one bare column name inside `log()`/`sqrt()`/`exp()`/`I(x^k)`, nothing more | Compute the column yourself and pass it as a plain column, or as `I(x^k)`/`log(x)`/etc. if it fits that whitelist |
-| bare `1` (e.g. `y ~ 1 + x`) | Clear error — the parser only accepts bare identifiers (or a whitelisted transform) as fixed-effect terms, and `1` is not one; the intercept is always carried implicitly unless dropped with `- 1`/`0 +`, so there is no term for it to spell | Drop the explicit `1 +`; write `y ~ x` |
+| `1` together with `- 1` or `0 +` (e.g. `y ~ 1 + x - 1`) | Clear error — the formula both writes the intercept and removes it. R decides this by term order; this parser does not guess | Keep only the one you mean |
 | `(x || g)` | Clear error — the double-pipe form (uncorrelated random effects) matches none of the random-effect patterns and is rejected as invalid syntax | Not available; random slopes are always fit with a full correlation structure via `(1 + x | g)` |
 | `(0 + x | g)` | Clear error — intercept suppression inside a random-effects term is not supported | Not available; a random slope always carries a random intercept: `(x | g)` or `(1 + x | g)` |
 | `.` | Clear error — `.` (all other columns) is not a valid identifier | Spell out the predictors explicitly |

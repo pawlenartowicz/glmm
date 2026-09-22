@@ -1173,7 +1173,13 @@ mod tests {
 
     /// Two flat extras that BOTH nest cleanly in the primary: the kernel holds
     /// one nested slot, so only the first detects `NestedWithin`; the second
-    /// fails closed to `Crossed` (same statistical model either way).
+    /// fails closed to `Crossed` (same statistical model either way). Beyond
+    /// the `matches!` on the relation tag — whose `n_per_parent`/`n_clusters`
+    /// are placeholders the kernel re-derives from `ids` — this pins the actual
+    /// padded ids and slot labels `lower()` built: `g2`'s two children per
+    /// parent land at global ids `[0,1]`/`[2,3]` (bare child labels, hand-traced
+    /// in `nested_padded_ids`), and `g3`'s crossed codes are its own
+    /// lexicographic factor codes, unrelated to `g1`.
     #[test]
     fn second_flat_nesting_candidate_stays_crossed() {
         let table = Table {
@@ -1216,5 +1222,116 @@ mod tests {
             GroupingRelation::NestedWithin { .. }
         ));
         assert!(matches!(relations[1], GroupingRelation::Crossed { .. }));
+        assert_eq!(
+            lo.ids.extra[0],
+            vec![0, 0, 1, 1, 2, 2, 3, 3],
+            "g2's two children per g1 parent, padded id per row"
+        );
+        assert_eq!(
+            lo.re_groups[1].slot_labels,
+            vec![
+                Some("a1".into()),
+                Some("a2".into()),
+                Some("b1".into()),
+                Some("b2".into())
+            ],
+            "g2's slot labels stay bare child labels, not parent:child"
+        );
+        assert_eq!(
+            lo.ids.extra[1],
+            vec![0, 0, 1, 1, 2, 2, 3, 3],
+            "g3's own lexicographic factor codes (c1,c2,d1,d2), independent of g1"
+        );
+        assert_eq!(
+            lo.re_groups[2].slot_labels,
+            vec![
+                Some("c1".into()),
+                Some("c2".into()),
+                Some("d1".into()),
+                Some("d2".into())
+            ]
+        );
+    }
+
+    /// A formula with the intercept removed and no other fixed term (`y ~ 0`)
+    /// leaves the design with zero columns — `materialize` refuses this
+    /// outright rather than handing `fit_cold` a `p == 0` design.
+    #[test]
+    fn empty_fixed_design_is_refused() {
+        let table = Table {
+            columns: vec![("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0]))],
+            n: 3,
+        };
+        assert!(matches!(
+            super::lower("y ~ 0", &table, Family::Gaussian),
+            Err(Error::EmptyDesign)
+        ));
+    }
+
+    /// Fixture for the `label_ranef` mismatch tests below: 3 groups of 4 rows
+    /// each, one numeric predictor, random intercept on `g`.
+    fn ranef_mismatch_fixture() -> (crate::Fit, Vec<ReGroupInfo>) {
+        let g_labels = strs(&[
+            "g1", "g1", "g1", "g1", "g2", "g2", "g2", "g2", "g3", "g3", "g3", "g3",
+        ]);
+        let group_effect = [0.6, -0.4, 0.9];
+        let mut seed = 7u64;
+        let x: Vec<f64> = (0..12)
+            .map(|_| crate::fit::common_tests::lcg(&mut seed))
+            .collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                1.0 + 0.5 * v
+                    + group_effect[i / 4]
+                    + 0.05 * crate::fit::common_tests::lcg(&mut seed)
+            })
+            .collect();
+        let table = Table {
+            columns: vec![
+                ("y".into(), Column::Numeric(y)),
+                ("x".into(), Column::Numeric(x)),
+                ("g".into(), Column::factor_from_labels(&g_labels)),
+            ],
+            n: 12,
+        };
+        let lo = super::lower("y ~ x + (1 | g)", &table, Family::Gaussian).unwrap();
+        let fit = crate::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+        (fit, lo.re_groups)
+    }
+
+    /// The total-length branch: grouping count agrees with the fit, but an
+    /// inflated `terms` count for that grouping makes the block width
+    /// `label_ranef` computes disagree with `fit.ranef.len()`.
+    #[test]
+    fn label_ranef_refuses_a_total_length_mismatch() {
+        let (fit, mut re_groups) = ranef_mismatch_fixture();
+        assert!(
+            !fit.ranef.is_empty(),
+            "fixture must produce conditional modes"
+        );
+        re_groups[0].terms.push("(Intercept)".to_string());
+        assert!(matches!(
+            label_ranef(&fit, &re_groups),
+            Err(Error::RanefShapeMismatch(_))
+        ));
+    }
+
+    /// The slot-label-count branch: grouping and term counts both agree with
+    /// the fit (so the total-length check passes), but the slot-label vector
+    /// for that grouping is a level short of `fit.ranef_levels`.
+    #[test]
+    fn label_ranef_refuses_a_slot_label_count_mismatch() {
+        let (fit, mut re_groups) = ranef_mismatch_fixture();
+        assert!(
+            !fit.ranef.is_empty(),
+            "fixture must produce conditional modes"
+        );
+        re_groups[0].slot_labels.pop();
+        assert!(matches!(
+            label_ranef(&fit, &re_groups),
+            Err(Error::RanefShapeMismatch(_))
+        ));
     }
 }

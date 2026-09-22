@@ -16,6 +16,7 @@
 use faer::MatRef;
 
 use super::pirls::{pirls_solve_blocked, BetaStep, DualStep};
+use super::workspace::PirlsScratch;
 use crate::lmm::LmmGroupings;
 use crate::scalar::Scalar;
 use crate::spec::Family;
@@ -101,28 +102,18 @@ pub(crate) fn agq_deviance<T: Scalar>(
     groupings: &LmmGroupings,
     params: &[T],
     beta: &mut [T],
-    lam: &mut [T],
+    scratch: &mut PirlsScratch<T>,
     z_buf: &[f64],
-    m_buf: &mut [T],
     x: MatRef<f64>,
     y: &[f64],
     prior_w: &[f64],
     weighted: bool,
     cluster_ids: &[u32],
-    eta: &mut [T],
-    prob: &mut [T],
-    w: &mut [T],
-    u: &mut [T],
-    u_prev: &mut [T],
-    eta_fixed: &mut [T],
-    a_blocks: &mut [T],
-    a_rhs: &mut [T],
     dual: Option<&mut DualStep<T>>,
     // AGQ is always `BetaStep::Fixed`, so `pirls_solve_blocked`'s Profile-only
     // C = X'WX GEMM never runs here — this is just uniform plumbing across the
     // three PIRLS variants.
     wx: &mut faer::Mat<f64>,
-    agq_scratch: &mut [T],
     nagq: u8,
     pirls_tol_override: Option<f64>,
     n: usize,
@@ -141,12 +132,15 @@ pub(crate) fn agq_deviance<T: Scalar>(
     // Converge ũ_c / A_c via the same blocked PIRLS the Laplace path uses (β is the
     // caller's Fixed-mode buffer = params[n_theta..]; leaves prob = g⁻¹ at the mode,
     // a_blocks[c] = √A_c). AGQ is always β-fixed, so pass `BetaStep::Fixed` explicitly.
-    crate::lmm::primary_lambda(&params[..n_theta], groupings.primary_q, lam);
+    crate::lmm::primary_lambda(&params[..n_theta], groupings.primary_q, &mut scratch.lam);
     // `weighted` threads through to PIRLS so the converged mode ũ_c and curvature
-    // A_c fold in the prior weights: on the logit-binomial fast path (a `!weighted`
-    // match arm in glmm/pirls/dense.rs) an unweighted flag would skip `prior_w` entirely and
-    // give an unweighted mode/scale, wrong for aggregated-binomial cells. Poisson/
-    // probit fold `prior_w` regardless, but the flag must still be correct.
+    // A_c fold in the prior weights: `pirls_solve_blocked`'s μ/W pass is
+    // `Scalar::family_pass`, whose fused Bernoulli-logit kernel is gated on
+    // `!weighted` (`simd_transcendental.rs` at `f64`,
+    // `scalar::generic_family_pass` on the dual twins), so a wrong unweighted
+    // flag would skip `prior_w` entirely and give an unweighted mode/scale —
+    // wrong for aggregated-binomial cells. Poisson/probit fold `prior_w`
+    // regardless, but the flag must still be correct.
     let (_dev, _pen, _logdet, conv) = pirls_solve_blocked(
         family,
         nb_theta,
@@ -158,17 +152,8 @@ pub(crate) fn agq_deviance<T: Scalar>(
         weighted,
         beta,
         BetaStep::Fixed,
-        lam,
+        scratch,
         z_buf,
-        m_buf,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        a_blocks,
-        a_rhs,
         dual,
         wx,
         offset,
@@ -179,6 +164,15 @@ pub(crate) fn agq_deviance<T: Scalar>(
     if !conv {
         return T::from_f64(f64::INFINITY);
     }
+    let PirlsScratch {
+        lam,
+        prob,
+        u,
+        eta_fixed,
+        a_blocks,
+        agq_scratch,
+        ..
+    } = scratch;
     let lambda = lam[0]; // scalar Λ_p (q_p == 1, gated)
     let k = nagq as usize;
     let blk = crate::consts::GH_OFFSETS[(k - 1) / 2];
@@ -345,25 +339,15 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
     groupings: &LmmGroupings,
     params: &[T],
     beta: &mut [T],
-    lam: &mut [T],
+    scratch: &mut PirlsScratch<T>,
     z_buf: &[f64],
-    m_buf: &mut [T],
     x: MatRef<f64>,
     y: &[f64],
     prior_w: &[f64],
     weighted: bool,
     cluster_ids: &[u32],
-    eta: &mut [T],
-    prob: &mut [T],
-    w: &mut [T],
-    u: &mut [T],
-    u_prev: &mut [T],
-    eta_fixed: &mut [T],
-    a_blocks: &mut [T],
-    a_rhs: &mut [T],
     dual: Option<&mut DualStep<T>>,
     wx: &mut faer::Mat<f64>,
-    agq_scratch: &mut [T],
     nagq: u8,
     pirls_tol_override: Option<f64>,
     n: usize,
@@ -381,7 +365,7 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
                                  // prob = g⁻¹ at the mode, a_blocks[c] = the q×q Cholesky factor L_c of A_c.
                                  // AGQ is always β-fixed; `weighted` folds prior weights into the mode/curvature
                                  // (see agq_deviance for why the flag must be correct on the logit fast path).
-    crate::lmm::primary_lambda(&params[..n_theta], q, lam);
+    crate::lmm::primary_lambda(&params[..n_theta], q, &mut scratch.lam);
     let (_dev, _pen, _logdet, conv) = pirls_solve_blocked(
         family,
         nb_theta,
@@ -393,17 +377,8 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
         weighted,
         beta,
         BetaStep::Fixed,
-        lam,
+        scratch,
         z_buf,
-        m_buf,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        a_blocks,
-        a_rhs,
         dual,
         wx,
         offset,
@@ -414,6 +389,15 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
     if !conv {
         return T::from_f64(f64::INFINITY);
     }
+    let PirlsScratch {
+        lam,
+        prob,
+        u,
+        eta_fixed,
+        a_blocks,
+        agq_scratch,
+        ..
+    } = scratch;
     let k = nagq as usize;
     let blk = crate::consts::GH_OFFSETS[(k - 1) / 2];
     let nodes = &crate::consts::GH_NODES[blk..blk + k];
@@ -587,7 +571,7 @@ pub(crate) fn glmm_agq_deviance(
 ) -> f64 {
     ws.params[..params.len()].copy_from_slice(params);
     super::workspace::fill_z_f64(&ws.groupings, x, &mut ws.z_buf, n);
-    for v in ws.u.iter_mut() {
+    for v in ws.pirls.u.iter_mut() {
         *v = 0.0; // self-contained PIRLS seed (mode is point-determined; seed only shifts iterates)
     }
     let family = ws.family;
@@ -599,20 +583,10 @@ pub(crate) fn glmm_agq_deviance(
         params: prm,
         beta_rhs,
         p,
-        lam,
+        pirls,
         z_buf,
-        m_buf,
         prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        a_blocks,
-        a_rhs,
         wx,
-        agq_scratch,
         cluster_rows,
         ..
     } = ws;
@@ -632,25 +606,15 @@ pub(crate) fn glmm_agq_deviance(
         groupings,
         &prm[..],
         beta_rhs,
-        lam,
+        pirls,
         z_buf,
-        m_buf,
         x,
         y,
         &prior_w[..n],
         weighted,
         cluster_ids,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        a_blocks,
-        a_rhs,
         None,
         wx,
-        agq_scratch,
         nagq,
         None,
         n,

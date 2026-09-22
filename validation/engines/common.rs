@@ -102,8 +102,7 @@ pub fn lower_grid_cell(cell: &Value, manifest_dir: &str) -> (Lowered, bool, usiz
     let formula = jl
         .strip_prefix("@formula(")
         .and_then(|s| s.strip_suffix(')'))
-        .unwrap()
-        .replacen(" ~ 1 + ", " ~ ", 1);
+        .unwrap();
     let family = match cell["family"].as_str().unwrap() {
         "gaussian" => Family::Gaussian,
         "binomial" => Family::Binomial {

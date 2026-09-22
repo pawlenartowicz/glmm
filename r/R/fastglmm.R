@@ -335,7 +335,7 @@ fastglmm <- function(formula, data, family = gaussian(),
                                    r$re_group_terms)),
                   collapse = "; "), call. = FALSE)
   }
-  for (note in r$notes) .warn_note(note, r$names)
+  for (note in r$notes) .warn_note(note, r$names, r$converged, r$beta, r$aliased)
 
   p <- length(r$beta)
   beta <- stats::setNames(r$beta, r$names)
@@ -360,11 +360,13 @@ fastglmm <- function(formula, data, family = gaussian(),
     # `Diagnostics` (src/fit/mod.rs) and the Python port's `Fit$diagnostics` -
     # change together. `converged`, `singular` and `aliased` stay at the top
     # level as well; this element is additive.
-    #   boundary  "interior" / "at_boundary" / "no_optimum" / "unknown": where
-    #             the accepted theta sits. Only the dense LMM and dense GLMM
-    #             routes distinguish all three; elsewhere it is back-derived
-    #             from `singular`, so "no_optimum" is unreachable there and
-    #             "interior" means "not pinned", not "verified interior".
+    #   boundary  "interior" / "at_boundary" / "no_optimum": where the
+    #             accepted theta sits. Every theta-carrying route
+    #             distinguishes all three (LMM over either kernel, GLMM over
+    #             every layout, negative binomial included). OLS and GLM (no
+    #             theta) always report "interior", and so does a fit that
+    #             failed before any search ran (a degenerate guard), reported
+    #             through converged = FALSE.
     #   pinned    one logical vector per grouping, in varcorr order, one entry
     #             per variance component: pinned[[g]][i] pairs with
     #             .stddev_corr(varcorr[[g]])$stddev[i]. ON A CONVERGED FIT,
@@ -379,8 +381,8 @@ fastglmm <- function(formula, data, family = gaussian(),
     #             detail=, ratio=); `columns` is
     #             1-based into `names`. Each is raised as a classed warning by
     #             the call above. An absent note means "not detected", never
-    #             "checked and clean": the dense GLMM route records no pivot
-    #             and the sparse route refuses rather than flagging.
+    #             "checked and clean": the GLMM routes record no pivot, and
+    #             the LMM routes flag `IllConditioned` rather than refuse.
     diagnostics = list(
       converged = r$converged,
       singular = r$singular,
@@ -476,7 +478,7 @@ fastglmm <- function(formula, data, family = gaussian(),
 # note comes from the solver: "unused_grouping_levels" and
 # "re_design_scale_spread" are raised by the formula lowering, which is the
 # only layer that sees both the declared levels/design and the per-row codes.
-.warn_note <- function(note, coef_names) {
+.warn_note <- function(note, coef_names, converged, beta, aliased) {
   if (identical(note$kind, "ill_conditioned")) {
     # `columns` arrives 1-based from the shim, so it indexes `coef_names`
     # directly. Out of range falls back to the index rather than printing NA,
@@ -509,18 +511,37 @@ fastglmm <- function(formula, data, family = gaussian(),
       "remove both the rows and the wasted model width."), note$detail)
     cls <- c("fastglmm_unused_grouping_levels", "fastglmm_diagnostic")
   } else if (identical(note$kind, "pirls_exhausted")) {
-    # `final_eval` is the case split: a rejected trial point is benign, the
-    # final re-evaluation at the converged fit feeds the reported estimates.
+    # Four cases, from `final_eval`, `converged`, and (on the not-converged
+    # branch) whether the estimated entries of `beta` (aliased slots are NaN
+    # by contract) came back finite: a rejected trial point is
+    # benign regardless of the outcome; the final re-evaluation at a fit
+    # that did converge feeds the reported estimates; a fit that did not
+    # converge but still has a finite beta means the search ran out of its
+    # evaluation budget before settling; and a fit that did not converge and
+    # has no finite beta failed outright, so there is no estimate to report
+    # at all.
     if (isTRUE(note$final_eval)) {
       msg <- paste(
-        "the final PIRLS re-evaluation at the converged fit ran its full",
+        "the final PIRLS re-evaluation at the reported fit ran its full",
         "iteration cap without converging: the reported estimates rest on",
         "that truncated solve."
       )
-    } else {
+    } else if (isTRUE(converged)) {
       msg <- paste(
         "a GLMM inner PIRLS solve ran its full iteration cap without converging.",
         "This is observation-only and no fitted number is affected."
+      )
+    } else if (all(is.finite(beta[!aliased]))) {
+      msg <- paste(
+        "the search ran out of its evaluation budget while some inner PIRLS",
+        "solves hit their iteration cap. The fit did not converge. The",
+        "reported estimates are the best point the search found.",
+        "converged is FALSE, and the variance components are not reported."
+      )
+    } else {
+      msg <- paste(
+        "some inner PIRLS solves hit their iteration cap, and the fit failed.",
+        "No estimate is reported. converged is FALSE."
       )
     }
     cls <- c("fastglmm_pirls_exhausted", "fastglmm_diagnostic")
@@ -535,8 +556,9 @@ fastglmm <- function(formula, data, family = gaussian(),
   } else if (identical(note$kind, "hessian_se_fallback")) {
     msg <- paste(
       "the requested Hessian-based standard errors were not usable (the",
-      "finite-difference joint Hessian was not positive definite, or a",
-      "perturbed deviance evaluation was non-finite), so the RX",
+      "joint Hessian was not positive definite, or the fit took the",
+      "finite-difference Hessian and a perturbed deviance evaluation",
+      "was non-finite), so the RX",
       "standard errors are reported instead and stddev_se is NaN."
     )
     cls <- c("fastglmm_hessian_se_fallback", "fastglmm_diagnostic")

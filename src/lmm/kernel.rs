@@ -874,7 +874,7 @@ pub fn reml_deviance<T: Scalar + 'static>(
     // --- family elimination ---
     // `collapse_n_active` is written only by `precompute_balanced_collapse`,
     // which every entry point arms once per call — the `f64` fit through
-    // `fit_lmm_impl`, the dual gradient and Hessian through `reml_gradient` /
+    // `fit_lmm`, the dual gradient and Hessian through `reml_gradient` /
     // `reml_hessian`. A scratch that was never armed has it at 0 and takes the
     // per-family loop below: the same objective mathematically, but not
     // bit-equal to the collapse route (the collapse reassociates the family sum
@@ -1128,10 +1128,13 @@ pub fn reml_deviance<T: Scalar + 'static>(
 /// 12 is the top rung; the gradient chunks above it (`⌈n_theta / 12⌉` passes
 /// of `Dual<12>`), so no `n_theta` is out of reach.
 ///
-/// Held by `LmmWorkspace` (`dual_scratch`), built on the first derivative
-/// request and reused: the derivative diagnostics run once per converged fit,
-/// so a per-fit local would reallocate the whole buffer list on every warm
-/// refit — `bt` alone is `n_primary·w·t_dim` dual numbers.
+/// Built once per shape by the caller (`for_groupings`) and reused across
+/// calls — `bt` alone is `n_primary·w·t_dim` dual numbers, so a per-call
+/// local would reallocate the whole buffer list every time.
+///
+/// No production caller: built directly by the [`reml_gradient`] tests in
+/// `lmm::tests`, the same way `reml_gradient` itself is only a test reference.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum LmmDualScratch {
     D4(LmmFitScratch<Dual<4>>),
     D5(LmmFitScratch<Dual<5>>),
@@ -1147,6 +1150,7 @@ impl LmmDualScratch {
     /// chunks, so the top rung covers every `n_theta`. The `Option` stays
     /// because [`LmmHyperScratch::for_groupings`], which mirrors this
     /// constructor, still refuses above 12.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn for_groupings(n_theta: usize, p: usize, g: &LmmGroupings) -> Option<Self> {
         Some(match n_theta {
             0..=4 => LmmDualScratch::D4(LmmFitScratch::with_groupings(p, g)),
@@ -1170,7 +1174,10 @@ impl LmmDualScratch {
 /// point, so the allow stays rather than boxing a variant, which would only
 /// move the same bytes to the heap for a value this type is always accessed
 /// through `&mut`, never moved or copied.
+/// No production caller: built directly by the [`reml_hessian`] tests in
+/// `lmm::tests`, the same way `reml_hessian` itself is only a test reference.
 #[allow(clippy::large_enum_variant)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum LmmHyperScratch {
     H4(LmmFitScratch<HyperDual<4, 10>>),
     H5(LmmFitScratch<HyperDual<5, 15>>),
@@ -1183,6 +1190,7 @@ impl LmmHyperScratch {
     /// See [`LmmDualScratch::for_groupings`] — same ladder, `HyperDual`
     /// buffers, and `None` above the top rung rather than that constructor's
     /// chunking.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn for_groupings(n_theta: usize, p: usize, g: &LmmGroupings) -> Option<Self> {
         Some(match n_theta {
             0..=4 => LmmHyperScratch::H4(LmmFitScratch::with_groupings(p, g)),
@@ -1261,6 +1269,10 @@ fn run_reml_gradient<const N: usize>(
 /// `13` lane-evaluations each, so any `scratch` variant serves any
 /// `theta.len()`.
 /// `NotConverged`: the evaluated deviance is non-finite.
+///
+/// No production caller: this stays as the exact-derivative reference the
+/// dense-shape tests in `lmm::tests` compare against.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn reml_gradient(
     theta: &[f64],
     suff: &LmmSuffStats,
@@ -1352,6 +1364,10 @@ fn run_reml_hessian<const N: usize, const H: usize>(
 /// that rung, because a cross-chunk second-derivative block needs both
 /// coordinates' first-order lanes in one pass. `NotConverged` on a
 /// non-finite deviance.
+///
+/// No production caller: this stays as the exact-derivative reference the
+/// dense-shape tests in `lmm::tests` compare against.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn reml_hessian(
     theta: &[f64],
     suff: &LmmSuffStats,

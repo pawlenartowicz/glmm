@@ -32,6 +32,58 @@ class _FakeCategorical:
         return len(self.codes)
 
 
+class _FakeArrowTable:
+    """Duck-typed stand-in for a pyarrow Table: `glmm.fit`'s `_columns` keys on
+    `.column_names`/`.column(name)`, not on the pyarrow type, so this exercises
+    the real contract with no pyarrow dependency (CI installs neither pandas
+    nor pyarrow)."""
+
+    def __init__(self, columns):
+        self._columns = columns
+        self.column_names = list(columns)
+
+    def column(self, name):
+        return self._columns[name]
+
+
+class _FakeArrowList:
+    """Minimal `.to_pylist()` stand-in for a pyarrow Array/ChunkedArray —
+    `_levels_and_codes` calls nothing else on `.dictionary`/`.indices`."""
+
+    def __init__(self, values):
+        self._values = values
+
+    def to_pylist(self):
+        return list(self._values)
+
+
+class _FakeDictionaryArray:
+    """Duck-typed stand-in for pyarrow's dictionary-encoded column:
+    `glmm.fit`'s `_levels_and_codes` keys on `.dictionary`/`.indices`, not on
+    the pyarrow type."""
+
+    def __init__(self, dictionary, indices):
+        self.dictionary = _FakeArrowList(dictionary)
+        self.indices = _FakeArrowList(indices)
+
+
+def test_pyarrow_table_dictionary_column_sets_the_reference_level():
+    data = _FakeArrowTable(
+        {"y": _Y, "f": _FakeDictionaryArray(["low", "med", "high"], [0, 2, 1, 0, 2, 1])}
+    )
+    result = glmm.fit(data, "y ~ f")
+    assert result.names == ["(Intercept)", "fmed", "fhigh"]
+    assert result.beta[0] == pytest.approx(1.05, abs=1e-6)  # mean of "low"
+
+
+def test_pyarrow_dictionary_missing_index_is_rejected():
+    data = _FakeArrowTable(
+        {"y": _Y, "f": _FakeDictionaryArray(["low", "med"], [0, 1, None, 0, 1, 0])}
+    )
+    with pytest.raises(ValueError, match="missing values"):
+        glmm.fit(data, "y ~ f")
+
+
 def test_declared_level_order_sets_the_reference_level():
     data = {
         "y": _Y,

@@ -80,6 +80,14 @@ fn dat3() -> Table {
 
 #[test]
 fn fixed_design_matches_model_matrix() {
+    // Pinned so a regenerated-empty fixture file (a missing R dependency, a
+    // manifest path that moved) fails loudly instead of leaving this loop
+    // running zero times and reporting green.
+    assert_eq!(
+        FIXTURES.len(),
+        22,
+        "the frozen contrast fixture set changed size"
+    );
     for fx in FIXTURES {
         let table = if fx.formula.contains("x1") {
             dat3()

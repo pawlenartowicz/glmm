@@ -364,11 +364,10 @@ pub(crate) fn nb_profile_loglik(y: &[f64], mu: &[f64], theta: f64, weights: Opti
 
 /// Maximise `g(ln θ)` over `ln θ ∈ [ln NB_THETA_LO, ln NB_THETA_HI]` by
 /// golden-section (the NB likelihood is far more symmetric in ln θ than in θ).
-/// Returns `θ̂ = exp(argmax)`. Shared by the GLM conditional θ profile
-/// ([`optimize_nb_theta`]) and the sparse GLMM marginal-θ objective in
-/// `sparse::fit_glmm_nb_sparse` (the dense GLMM searches `ln θ` as a coordinate
-/// of its outer BOBYQA instead); `g` is the log-likelihood to maximise as a
-/// function of `ln θ`.
+/// Returns `θ̂ = exp(argmax)`. The GLM conditional θ profile
+/// ([`optimize_nb_theta`]) is its only caller — the GLMM searches `ln θ` as a
+/// coordinate of its outer BOBYQA instead; `g` is the log-likelihood to maximise
+/// as a function of `ln θ`.
 ///
 /// Stopping width `1e-4` on `ln θ` (2026-08-06, was `1e-8`): for the GLMM route,
 /// `g` is a full inner GLMM refit at fixed θ, and that refit's own inner

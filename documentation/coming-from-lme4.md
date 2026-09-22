@@ -89,11 +89,9 @@ produced each rung's frozen golden (`validation/manifest.json`'s `r_formula`
 for that rung), fit the ordinary lme4 way, for direct comparison — see the
 linked recipe for the actual printed output and the oracle cross-check. Every
 lme4 formula below spells its intercept explicitly (`1 + …`), lme4's own
-convention; the `fastglmm`/`glmm.fit` column drops that leading `1 +`, since
-the shared parser has no bare-`1` fixed-effect term and errors on it
-(`expected identifier, got '1'`) — the intercept is never optional there,
-only ever implicit. See [`formula.md`](formula.md) for what the parser
-accepts.
+convention; the `fastglmm`/`glmm.fit` column leaves that `1 +` out. Both
+spellings give the same model. See [`formula.md`](formula.md) for what the
+parser accepts.
 
 ### Correlated random slope (`sleepstudy`)
 

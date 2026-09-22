@@ -2,6 +2,149 @@
 
 use super::*;
 
+/// The block-diagonal Laplace layout: `A = M'WM + I` is `s` independent
+/// `q×q` blocks because each row loads exactly one cluster's `q` columns of
+/// `M = ZΛ_p`. Borrowed from the buffers `pirls_solve_blocked` destructures.
+pub(crate) struct BlockedFactor<'a, T> {
+    /// `s·q²`, cluster `f` at `f·q²`, row-major lower triangle. Left FACTORED
+    /// (per-cluster Crout `L`) by `factor_logdet`.
+    pub(crate) a_blocks: &'a mut [T],
+    /// len `k`, packed `f·q + local`: `M'r`, then `A⁻¹M'r` in place.
+    pub(crate) a_rhs: &'a mut [T],
+    /// Row-major `n×q`: `mᵢ = Λ_p'·zᵢ`.
+    pub(crate) m_buf: &'a [T],
+    /// len `n`: the primary cluster each row loads.
+    pub(crate) cluster_ids: &'a [u32],
+    pub(crate) family: Family,
+    pub(crate) nb_theta: f64,
+    /// Primary RE width per cluster.
+    pub(crate) q: usize,
+    /// Number of primary clusters.
+    pub(crate) s: usize,
+    /// `q·s`, the packed RE length.
+    pub(crate) k: usize,
+}
+
+impl<T: Scalar> LaplaceFactor<T> for BlockedFactor<'_, T> {
+    fn eta_from_mode(&mut self, u: &[T], eta_fixed: &[T], eta: &mut [T], y: &[f64], n: usize) -> T {
+        let (m_buf, cluster_ids, q) = (self.m_buf, self.cluster_ids, self.q);
+        let mut yeta = T::ZERO;
+        for i in 0..n {
+            let m_row = &m_buf[i * q..i * q + q];
+            let ubase = cluster_ids[i] as usize * q;
+            let mut e = eta_fixed[i];
+            for c in 0..q {
+                e += m_row[c] * u[ubase + c];
+            }
+            eta[i] = e;
+            yeta += T::from_f64(y[i]) * eta[i];
+        }
+        yeta
+    }
+
+    fn scatter(
+        &mut self,
+        w: &[T],
+        prob: &[T],
+        eta: &[T],
+        y: &[f64],
+        prior_w: &[f64],
+        _weighted: bool,
+        n: usize,
+        mut dual: Option<&mut DualStep<T>>,
+    ) {
+        let (m_buf, cluster_ids) = (self.m_buf, self.cluster_ids);
+        let (family, nb_theta, q, s, k) = (self.family, self.nb_theta, self.q, self.s, self.k);
+        let a_blocks = &mut *self.a_blocks;
+        let a_rhs = &mut *self.a_rhs;
+        for v in a_blocks[..s * q * q].iter_mut() {
+            *v = T::ZERO;
+        }
+        for v in a_rhs[..k].iter_mut() {
+            *v = T::ZERO;
+        }
+        if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
+            for v in d.obs_blocks[..s * q * q].iter_mut() {
+                *v = T::ZERO;
+            }
+        }
+        // --- scatter-pass (scalar): wᵢmᵢmᵢ' and rᵢ·mᵢ into the blocks.
+        // The effective residual rᵢ is logit's (yᵢ−pᵢ) or the general W·working_resid. ---
+        for i in 0..n {
+            let m_row = &m_buf[i * q..i * q + q];
+            let f = cluster_ids[i] as usize;
+            let ubase = f * q;
+            let ablk = f * q * q;
+            let wi = w[i];
+            let resid = T::from_f64(prior_w[i])
+                * match family {
+                    Family::Binomial {
+                        link: BinomialLink::Logit,
+                    } => T::from_f64(y[i]) - prob[i],
+                    other => {
+                        let dmu = crate::family::mu_eta(other, eta[i]);
+                        let v = crate::family::variance(other, nb_theta, prob[i]);
+                        dmu * (T::from_f64(y[i]) - prob[i]) / v
+                    }
+                };
+            for r in 0..q {
+                a_rhs[ubase + r] += m_row[r] * resid;
+                let wr = wi * m_row[r];
+                for c in 0..=r {
+                    a_blocks[ablk + r * q + c] += wr * m_row[c];
+                }
+            }
+            // Observed-weight twin of the Fisher scatter above, into the
+            // observed blocks (same lower-triangle layout).
+            if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
+                let wo = crate::family::observed_weight(
+                    family, nb_theta, y[i], prior_w[i], eta[i], prob[i], wi,
+                );
+                for r in 0..q {
+                    let wr = wo * m_row[r];
+                    #[allow(clippy::needless_range_loop)]
+                    for c in 0..=r {
+                        d.obs_blocks[ablk + r * q + c] += wr * m_row[c];
+                    }
+                }
+            }
+        }
+    }
+
+    fn factor_logdet(&mut self) -> Option<T> {
+        let (q, s) = (self.q, self.s);
+        let a_blocks = &mut *self.a_blocks;
+        let mut logdet = T::ZERO;
+        for f in 0..s {
+            let ablk = f * q * q;
+            for r in 0..q {
+                a_blocks[ablk + r * q + r] += T::ONE;
+            }
+            if !glmm_block_chol(&mut a_blocks[ablk..ablk + q * q], q) {
+                return None;
+            }
+            for r in 0..q {
+                logdet += a_blocks[ablk + r * q + r].ln();
+            }
+        }
+        Some(logdet)
+    }
+
+    fn solve_in_place(&mut self) {
+        let (q, s) = (self.q, self.s);
+        let a_blocks = &*self.a_blocks;
+        let a_rhs = &mut *self.a_rhs;
+        for f in 0..s {
+            let ablk = f * q * q;
+            glmm_block_solve(
+                &a_blocks[ablk..ablk + q * q],
+                q,
+                &mut a_rhs[f * q..f * q + q],
+            );
+        }
+    }
+}
+
 /// Block-diagonal PIRLS for the no-extras regime (`groupings.extra_offsets` empty):
 /// `A = M'WM + I` is `s` independent `q_p×q_p` blocks because each row loads exactly
 /// one cluster's `q_p` columns. `m_buf` (row-major n×q_p) holds `mᵢ = Λ_p'·zᵢ`
@@ -10,8 +153,8 @@ use super::*;
 /// The η-pass forms ηᵢ and the deviance from it; the scatter-pass accumulates
 /// `wᵢ·mᵢmᵢ'` into cluster `i`'s block plus `mᵢ·(yᵢ−pᵢ)` into its RHS — keeping
 /// the dense path's `O(n·k²)` Gram/RHS collapsed to `O(n·q_p²)`. Then per block: `rhs_f = (A_f−I)·u_f + g_f`, Crout factor (log|A|
-/// off the pivots), solve `u_f`. NOT bit-identical to `pirls_solve` (reordered
-/// accumulation) but the same estimator. Mirrors `pirls_solve`'s half-step
+/// off the pivots), solve `u_f`. NOT bit-identical to `pirls_solve_packed` (reordered
+/// accumulation) but the same estimator. Mirrors `pirls_solve_packed`'s half-step
 /// (w/A from the pre-update u, u updated after) so the two agree to FP error.
 /// `lam` is Λ_p row-major (`lam[r·q+c]`) from `primary_lambda`. Leaves `a_blocks`
 /// FACTORED (per-block L of the final iterate) for `blocked_schur_fill` to reuse,
@@ -19,9 +162,11 @@ use super::*;
 /// block ⇒ `(NaN, NaN, NaN, false)`. Iterates from the caller-provided `u` (the
 /// warm-start seed); the caller owns resetting it per fit.
 ///
-/// Step-halving: see `pirls_solve`'s doc — identical mechanism, `a_blocks` here
-/// plays the role of `pirls_solve`'s `A`, so `a_blocks`/`log|A|` on return are
-/// from the final step's assembly, preserving the `blocked_schur_fill` contract
+/// Step-halving: see `pirls_solve_packed`'s doc — identical mechanism, `a_blocks` here
+/// plays the role of `pirls_solve_packed`'s `A`. A converged solve ends by
+/// re-evaluating η/μ/W at the returned `u` and rebuilding and refactoring the
+/// blocks there ([`evaluate_at_mode`]), so `a_blocks`, `log|A|` and `dev` on
+/// return describe that iterate, preserving the `blocked_schur_fill` contract
 /// above.
 ///
 /// **β mode (`beta_step`):** `Fixed` holds β at the caller's input (β read-only,
@@ -42,30 +187,21 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
     weighted: bool,
     beta: &mut [T],
     mut beta_step: BetaStep,
-    lam: &[T],
+    scratch: &mut PirlsScratch<T>,
     z_buf: &[f64],
-    m_buf: &mut [T],
-    eta: &mut [T],
-    prob: &mut [T],
-    w: &mut [T],
-    u: &mut [T],
-    u_prev: &mut [T],
-    eta_fixed: &mut [T],
-    a_blocks: &mut [T],
-    a_rhs: &mut [T],
     // Dual derivative kernels' per-solve controls (see `DualStep`); `None` on
     // every f64 fit-path call.
     mut dual: Option<&mut DualStep<T>>,
     // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
-    // (mirrors `pirls_solve`'s `wx`; this variant has no dense M so there is no
+    // (mirrors `pirls_solve_packed`'s `wx`; this variant has no dense M so there is no
     // `wm` twin here — B' = X'WM is filled by cluster-scatter instead).
     wx: &mut Mat<f64>,
     // Per-row linear-predictor offset (`FitOptions::offset`), added into
-    // `eta_fixed` below and by every `refresh_eta_fixed` call. `None` ⇒ no offset.
+    // `eta_fixed` by every `refresh_eta_fixed` call. `None` ⇒ no offset.
     offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,
     n: usize,
-    // Observation-only — mirrors `pirls_solve`'s `counters` (dense.rs), where
+    // Observation-only — mirrors `pirls_solve_packed`'s `counters`, where
     // the contract is stated.
     counters: &mut crate::counters::EvalCounters,
 ) -> (T, T, T, bool) {
@@ -78,23 +214,25 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         T::IS_F64 || matches!(beta_step, BetaStep::Fixed),
         "BetaStep::Profile is f64-only"
     );
+    let PirlsScratch {
+        eta,
+        prob,
+        w,
+        u,
+        u_prev,
+        eta_fixed,
+        m_buf,
+        lam,
+        a_blocks,
+        a_rhs,
+        ..
+    } = scratch;
     let q = g.primary_q;
     let s = g.n_primary;
     let k = q * s;
     let p = beta.len();
     // η_fixed,ᵢ = Σ_j x·β, hoisted out of the iteration (β fixed within the solve).
-    for i in 0..n {
-        let mut e = T::ZERO;
-        for j in 0..p {
-            e += T::from_f64(x[(i, j)]) * beta[j];
-        }
-        eta_fixed[i] = e;
-    }
-    if let Some(o) = offset {
-        for i in 0..n {
-            eta_fixed[i] += T::from_f64(o[i]);
-        }
-    }
+    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
     // M = ZΛ_p (mᵢ = Λ_p'·zᵢ, zᵢ = [1, x[i, slope_cols]] pre-widened into z_buf
     // per fit) is invariant within one solve — Λ and x are fixed; the iteration
     // only mutates u/η/prob/w/blocks. Fill it once per solve. Measured on the
@@ -118,8 +256,22 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             m_buf[i * q + c] = acc;
         }
     }
+    // The `A`-layout view over the buffers the assembly, the factor and the
+    // `A⁻¹` solve own. `m_buf` is complete above and read-only from here, so
+    // the loop below keeps reading it directly alongside the view.
+    let mut layout = BlockedFactor {
+        a_blocks: &mut a_blocks[..],
+        a_rhs: &mut a_rhs[..],
+        m_buf: &m_buf[..],
+        cluster_ids,
+        family,
+        nb_theta,
+        q,
+        s,
+        k,
+    };
     // First-trial backtrack seeds (u_prev = 0, beta_prev = caller's β) — only
-    // the domain-infeasibility trigger can read them; see `pirls_solve`.
+    // the domain-infeasibility trigger can read them; see `pirls_solve_packed`.
     u_prev[..k].fill(T::ZERO);
     if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
         for j in 0..p {
@@ -175,21 +327,13 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         // is the backtracked u. Either way the recompute IS the trial evaluation.
         // Loop-split: the transcendental runs vectorized over a materialized η[]
         // with no gather/scatter data deps.
-        // --- pass 1: η-pass (scalar gather): form ηᵢ, accumulate Σ y·η ---
-        let mut yeta = T::ZERO;
-        for i in 0..n {
-            let m_row = &m_buf[i * q..i * q + q];
-            let ubase = cluster_ids[i] as usize * q;
-            let mut e = eta_fixed[i];
-            for c in 0..q {
-                e += m_row[c] * u[ubase + c];
-            }
-            eta[i] = e;
-            yeta += T::from_f64(y[i]) * e;
-        }
+        // --- pass 1: η-pass (scalar gather): form ηᵢ and Σ y·η in one pass ---
+        let yeta = layout.eta_from_mode(&u[..], &eta_fixed[..], &mut eta[..], y, n);
         // --- pass 2: η[] → prob[]/w[] + deviance, through the shared family
         // kernel (clamps η in place; `infeasible` flags any raw η outside the
-        // link's open domain — Gamma-inverse only, mirrors `pirls_solve`). ---
+        // link's open domain — the two `family::eta_infeasible` names,
+        // Gamma-inverse and inverse-Gaussian-inverse-squared; mirrors
+        // `pirls_solve_packed`). ---
         let (d, infeasible) = T::family_pass(
             family,
             nb_theta,
@@ -211,11 +355,11 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         // change together. Runs only on a dual solve, so the f64 fit path is
         // untouched.
         if let Some(d) = dual.as_deref_mut() {
-            if d.exact && clamped_row_present(family, &w[..n], &prob[..n]) {
+            if d.exact && clamped_row_present(family, weighted, &prob[..n]) {
                 d.exact = false;
             }
         }
-        // Retrospective step-halving (lme4 `pwrssUpdate`, mirrors `pirls_solve`):
+        // Retrospective step-halving (lme4 `pwrssUpdate`, mirrors `pirls_solve_packed`):
         // convergence band checked BEFORE the overshoot test (near the optimum
         // Fisher scoring is not strictly monotone — a step can land ε above
         // `pen_accepted` yet inside the tol band, and that must converge, not burn
@@ -226,11 +370,11 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             pen_u += u[c] * u[c];
         }
         let penalized = dev + pen_u;
-        // BAND-TOLERANT overshoot test, mirrors `pirls_solve` (see its comments
+        // BAND-TOLERANT overshoot test, mirrors `pirls_solve_packed` (see its comments
         // for why a within-band rise is accepted rather than converged-on or
         // halved): only a rise EXCEEDING the tol band backtracks. A
         // domain-infeasible trial halves regardless of the band (see
-        // `pirls_solve`'s comment).
+        // `pirls_solve_packed`'s comment).
         // Exact mode: the retrospective band above is on `dev + pen_u` alone,
         // which is not the profiled objective (missing 2·log|A|) — only a
         // domain-infeasible trial halves here; an overshoot on `dev + pen_u`
@@ -262,7 +406,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 // Profile mode: the trial point is the JOINT (u,β) step, so the
                 // backtrack halves β toward `beta_prev` in lockstep with u, then
                 // refreshes η_fixed for the re-evaluation at the top. Mirrors
-                // `pirls_solve`'s Profile backtrack.
+                // `pirls_solve_packed`'s Profile backtrack.
                 if let BetaStep::Profile { beta_prev, .. } = &beta_step {
                     for j in 0..p {
                         beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
@@ -296,17 +440,6 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 }
             }
         }
-        for v in a_blocks[..s * q * q].iter_mut() {
-            *v = T::ZERO;
-        }
-        for v in a_rhs[..k].iter_mut() {
-            *v = T::ZERO;
-        }
-        if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
-            for v in d.obs_blocks[..s * q * q].iter_mut() {
-                *v = T::ZERO;
-            }
-        }
         // Exact-mode observed twin of `a_blocks` (non-canonical links only —
         // canonical Fisher IS observed, so `obs_blocks` stays unused there).
         if let BetaStep::Profile {
@@ -319,55 +452,33 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 }
             }
         }
-        // --- pass 3: scatter-pass (scalar): wᵢmᵢmᵢ' and rᵢ·mᵢ into the blocks.
-        // The effective residual rᵢ is logit's (yᵢ−pᵢ) or the general W·working_resid. ---
-        for i in 0..n {
-            let m_row = &m_buf[i * q..i * q + q];
-            let f = cluster_ids[i] as usize;
-            let ubase = f * q;
-            let ablk = f * q * q;
-            let wi = w[i];
-            let resid = T::from_f64(prior_w[i])
-                * match family {
-                    Family::Binomial {
-                        link: BinomialLink::Logit,
-                    } => T::from_f64(y[i]) - prob[i],
-                    other => {
-                        let dmu = crate::family::mu_eta(other, eta[i]);
-                        let v = crate::family::variance(other, nb_theta, prob[i]);
-                        dmu * (T::from_f64(y[i]) - prob[i]) / v
-                    }
-                };
-            for r in 0..q {
-                a_rhs[ubase + r] += m_row[r] * resid;
-                let wr = wi * m_row[r];
-                for c in 0..=r {
-                    a_blocks[ablk + r * q + c] += wr * m_row[c];
-                }
-            }
-            // Observed-weight twin of the Fisher scatter above, into the
-            // observed blocks (same lower-triangle layout).
-            if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
-                let wo = crate::family::observed_weight(
-                    family, nb_theta, y[i], prior_w[i], eta[i], prob[i], wi,
-                );
-                for r in 0..q {
-                    let wr = wo * m_row[r];
-                    #[allow(clippy::needless_range_loop)]
-                    for c in 0..=r {
-                        d.obs_blocks[ablk + r * q + c] += wr * m_row[c];
-                    }
-                }
-            }
-            // Exact-mode twin: A_obs = M'W_obs M + I for the û-path adjoint solve
-            // (pass B below reads this same non-canonical observed factor).
-            if let BetaStep::Profile {
-                exact: Some(ex), ..
-            } = &mut beta_step
-            {
-                if !crate::family::is_canonical(family) {
+        // --- pass 3: the Fisher scatter — wᵢmᵢmᵢ' into cluster i's block, rᵢ·mᵢ
+        // into its RHS — with the dual kernels' observed twin filled in the same
+        // row pass. ---
+        layout.scatter(
+            &w[..],
+            &prob[..],
+            &eta[..],
+            y,
+            prior_w,
+            weighted,
+            n,
+            dual.as_deref_mut(),
+        );
+        // Exact-mode twin: A_obs = M'W_obs M + I for the û-path adjoint solve
+        // (pass B below reads this same non-canonical observed factor). Its own
+        // row pass into its own f64 buffers — the dual twin above writes only
+        // `DualStep<T>`, so one fold never writes both.
+        if let BetaStep::Profile {
+            exact: Some(ex), ..
+        } = &mut beta_step
+        {
+            if !crate::family::is_canonical(family) {
+                for i in 0..n {
+                    let m_row = &m_buf[i * q..i * q + q];
+                    let ablk = cluster_ids[i] as usize * q * q;
                     let wo = crate::family::observed_weight(
-                        family, nb_theta, y[i], prior_w[i], eta[i], prob[i], wi,
+                        family, nb_theta, y[i], prior_w[i], eta[i], prob[i], w[i],
                     )
                     .value();
                     for r in 0..q {
@@ -383,7 +494,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         // Profile mode: accumulate the β-gradient X'ρ (ρ = effective residual) into
         // `beta_rhs` — the joint system's bottom-block RHS. A dedicated pass off the
         // fresh prob/eta/w (NOT folded into the scatter loop above), so the Fixed
-        // path stays byte-identical. Mirrors `pirls_solve`'s Profile X'ρ fold.
+        // path stays byte-identical. Mirrors `pirls_solve_packed`'s Profile X'ρ fold.
         if let BetaStep::Profile { beta_rhs, .. } = &mut beta_step {
             for v in beta_rhs[..p].iter_mut() {
                 *v = 0.0;
@@ -412,58 +523,54 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             }
         }
         // --- per block: rhs_f = (A_f−I)·u_old_f + g_f ; +I ; factor ; solve u_new.
-        // logdet is reset-then-accumulated here (off the factor that produces this
-        // step's u); on the converged (final) iteration it — and a_blocks, left
-        // holding that iterate's per-block L — describe exactly the factor that
-        // produced the returned u, preserving the `blocked_schur_fill` contract
-        // (a step may be re-taken after a halving, hence the reset). ---
-        logdet = T::ZERO;
-        pen = T::ZERO;
+        // `log|A|` comes off the factor that produces this step's u; the exit
+        // refresh below replaces it and a_blocks with their values at the
+        // returned u (a step may be re-taken after a halving, so every
+        // iteration re-factors).
+        // Three phases, in this order because of what each one reads. The fold
+        // below needs the UNFACTORED blocks and the pre-step `u`, and the
+        // observed twin needs `a_rhs`'s bare `g_f` before the fold overwrites
+        // it — so the whole fold runs first. Then the factor (`+I`, Crout,
+        // `log|A|` off the pivots) and the `A⁻¹` solve, both over the whole
+        // block-diagonal `A`. Then, per cluster, the Fisher solution into `u`,
+        // the observed twin's own factor and solve over it, and `‖u‖²`.
         for f in 0..s {
             let ablk = f * q * q;
             let ubase = f * q;
-            // Observed step first (reads g_f off `a_rhs` before the Fisher rhs
-            // overwrites it): rhs_obs = (A_obs,f − I)·u_old_f + g_f, +I, factor,
-            // solve into `obs_u`. A non-PD observed block leaves `obs_u` unused
-            // and the step below falls back to the Fisher solve for this block.
-            // The Fisher block is still formed and factored below on every
+            // Observed right-hand side: rhs_obs = (A_obs,f − I)·u_old_f + g_f,
+            // staged in `obs_rhs` (the `a_rhs` packing) for the twin factor and
+            // solve below. The Fisher block is formed and factored on every
             // route — it is what `log|A|` and the returned factor come from.
-            let mut obs_u = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
-            let mut have_obs = false;
             if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
-                let ob = &mut d.obs_blocks[ablk..ablk + q * q];
+                let DualStep {
+                    obs_blocks,
+                    obs_rhs,
+                    ..
+                } = &mut *d;
+                let ob = &obs_blocks[ablk..ablk + q * q];
                 for r in 0..q {
-                    let mut acc = a_rhs[ubase + r];
+                    let mut acc = layout.a_rhs[ubase + r];
                     for c in 0..q {
                         let (hi, lo) = if r >= c { (r, c) } else { (c, r) };
                         acc += ob[hi * q + lo] * u[ubase + c];
                     }
-                    obs_u[r] = acc;
-                }
-                for r in 0..q {
-                    ob[r * q + r] += T::ONE;
-                }
-                if glmm_block_chol(ob, q) {
-                    glmm_block_solve(ob, q, &mut obs_u[..q]);
-                    have_obs = true;
-                } else {
-                    d.exact = false;
+                    obs_rhs[ubase + r] = acc;
                 }
             }
             // (A_f − I)·u_old_f added to g_f (in a_rhs), using the still-unfactored
             // symmetric lower triangle.
             for r in 0..q {
-                let mut acc = a_rhs[ubase + r];
+                let mut acc = layout.a_rhs[ubase + r];
                 for c in 0..q {
                     let (hi, lo) = if r >= c { (r, c) } else { (c, r) };
-                    acc += a_blocks[ablk + hi * q + lo] * u[ubase + c];
+                    acc += layout.a_blocks[ablk + hi * q + lo] * u[ubase + c];
                 }
-                a_rhs[ubase + r] = acc;
+                layout.a_rhs[ubase + r] = acc;
             }
-            for r in 0..q {
-                a_blocks[ablk + r * q + r] += T::ONE;
-            }
-            if !glmm_block_chol(&mut a_blocks[ablk..ablk + q * q], q) {
+        }
+        logdet = match layout.factor_logdet() {
+            Some(ld) => ld,
+            None => {
                 // Mirrors the `structured_factor` failure arm in
                 // `pirls_solve_blocked_extras` (`blocked_extras.rs`, the extras
                 // twin) — see its comment for why: an unevaluable trial here is
@@ -493,14 +600,33 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     false,
                 );
             }
-            for r in 0..q {
-                logdet += a_blocks[ablk + r * q + r].ln();
-            }
-            // solve u_new_f = A_f⁻¹ rhs_f in place (rhs lives in a_rhs[ubase..], copy to u).
-            u[ubase..ubase + q].copy_from_slice(&a_rhs[ubase..ubase + q]);
-            glmm_block_solve(&a_blocks[ablk..ablk + q * q], q, &mut u[ubase..ubase + q]);
-            if have_obs {
-                u[ubase..ubase + q].copy_from_slice(&obs_u[..q]);
+        };
+        layout.solve_in_place();
+        pen = T::ZERO;
+        for f in 0..s {
+            let ablk = f * q * q;
+            let ubase = f * q;
+            // u_new_f = A_f⁻¹ rhs_f, solved above in `a_rhs`.
+            u[ubase..ubase + q].copy_from_slice(&layout.a_rhs[ubase..ubase + q]);
+            // Observed step: +I, factor, solve the staged right-hand side. A
+            // non-PD observed block leaves this cluster on its Fisher solve.
+            if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
+                let DualStep {
+                    obs_blocks,
+                    obs_rhs,
+                    exact,
+                    ..
+                } = &mut *d;
+                let ob = &mut obs_blocks[ablk..ablk + q * q];
+                for r in 0..q {
+                    ob[r * q + r] += T::ONE;
+                }
+                if glmm_block_chol(ob, q) {
+                    glmm_block_solve(ob, q, &mut obs_rhs[ubase..ubase + q]);
+                    u[ubase..ubase + q].copy_from_slice(&obs_rhs[ubase..ubase + q]);
+                } else {
+                    *exact = false;
+                }
             }
             for r in 0..q {
                 pen += u[ubase + r] * u[ubase + r];
@@ -579,7 +705,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 // `a_blocks` factored, and nothing between here and pass B
                 // writes it.
                 let fac_f64 = &mut fac_f64[..q * q * s];
-                for (o, v) in fac_f64.iter_mut().zip(a_blocks[..q * q * s].iter()) {
+                for (o, v) in fac_f64.iter_mut().zip(layout.a_blocks[..q * q * s].iter()) {
                     *o = v.value();
                 }
                 // pass A: hᵢ, w'ᵢ → direct part into c_β, and gᵤ = ∂log|A|/∂u.
@@ -595,9 +721,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     // `dw/dη`, held equal to this `Dual<1>` line by
                     // `weight_eta_deriv_matches_dual1_of_irls_weight`
                     // (`src/family.rs`); changing either alone moves `f64` bits.
-                    let wp = if w[i].value() <= crate::glm::WEIGHT_CLAMP {
-                        0.0
-                    } else {
+                    let wp = {
                         let e = crate::dual::Dual::<1> {
                             v: eta[i].value(),
                             d: [1.0],
@@ -688,7 +812,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             // turns the whole evaluation into a non-convergence. Measured on the
             // single-intercept NB-log shape: a warm start carried from θ = 0.55674
             // to θ = 0.55692 left `l_acc` 3.2e-5 under the value the cold solve
-            // reaches, all 50 iterations went to halving, and the θ-only outer
+            // reaches, every iteration went to halving, and the θ-only outer
             // search read the `inf` that came back as a wall — with the seed's own
             // 1.4e-4 correction charged, that deficit is inside the band. Both
             // terms shrink with their δu₀, so at the mode the test is the value
@@ -729,7 +853,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         // iterate). Mirrors `se::blocked_schur_fill` with THIS iteration's W and
         // this iteration's per-block factors: T = A⁻¹B, S_β = C − B'T,
         // δβ = S_β⁻¹·(X'ρ − B'δu₀), then u_joint = u_new − T·δβ (see
-        // `se::dense_schur_fill`'s doc comment for the shared β-Schur Newton step
+        // `se::packed_schur_fill`'s doc comment for the shared β-Schur Newton step
         // this mirrors). `m_buf` already holds mᵢ = Λ'zᵢ, so B's scatter reads it
         // directly (cheaper than se.rs's per-row reconstruction). ---
         if let BetaStep::Profile {
@@ -788,7 +912,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     for c in 0..q {
                         rhs[c] = T::from_f64(xtwm[(col, f * q + c)]);
                     }
-                    glmm_block_solve(&a_blocks[ablk..ablk + q * q], q, &mut rhs[..q]);
+                    glmm_block_solve(&layout.a_blocks[ablk..ablk + q * q], q, &mut rhs[..q]);
                     for c in 0..q {
                         ainv_mtwx[(f * q + c, col)] = rhs[c].value();
                     }
@@ -864,7 +988,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         }
         // The stopping rule, verbatim: the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` band on
         // successive steps — bit-identical iterate path and returned values to the
-        // pre-halving loop when no halving fires (see `pirls_solve` for why the
+        // pre-halving loop when no halving fires (see `pirls_solve_packed` for why the
         // same-point band cannot be a converge trigger).
         // Exact mode: the exit band must track the same merit the accept/halve
         // decision above uses (dev + pen + 2·log|A|), or the loop could settle
@@ -879,6 +1003,38 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             break;
         }
         mixed_prev = mixed;
+    }
+    // The returned `dev`, `log|A|` and per-block factor at the returned iterate,
+    // so the objective's three terms and the factor `blocked_schur_fill`
+    // inherits describe one point — see [`evaluate_at_mode`].
+    if converged {
+        match evaluate_at_mode(
+            &mut layout,
+            family,
+            nb_theta,
+            y,
+            prior_w,
+            weighted,
+            &eta_fixed[..],
+            &u[..],
+            &mut eta[..],
+            &mut prob[..],
+            &mut w[..],
+            n,
+        ) {
+            Some((d, ld)) => {
+                dev = d;
+                logdet = ld;
+            }
+            None => {
+                return (
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    T::from_f64(f64::NAN),
+                    false,
+                )
+            }
+        }
     }
     (dev, pen, logdet, converged)
 }

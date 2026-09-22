@@ -677,7 +677,7 @@ make_cloglog_nested_crossed <- function(n_g1 = 8, n_g2 = 3, per = 12, n_c1 = 6) 
   u2  <- rnorm(nlevels(ig), sd = 0.3)[as.integer(ig)]
   uc  <- rnorm(n_c1, sd = 0.4)[c1]
   eta <- -0.8 + 0.5 * x + u1 + u2 + uc
-  p   <- 1 - exp(-exp(eta))  # cloglog inverse link: mu = 1 - exp(-exp(eta))
+  p   <- 1 - exp(-exp(eta))  # cloglog inverse link
   data.frame(y = rbinom(n, 1, p), x = x, g1 = g1, g2 = g2, c1 = c1)
 }
 d_cnc <- make_cloglog_nested_crossed()

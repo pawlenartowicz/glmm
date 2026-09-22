@@ -10,6 +10,9 @@
 
 suppressMessages(library(jsonlite))
 
+# base R has this only from 4.4.0.
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
 suite_dir <- normalizePath(dirname(sub(
   "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))))
 
@@ -148,8 +151,9 @@ if (!length(metas)) {
 } else {
   for (e in names(metas)) {
     m <- metas[[e]]
-    cat(sprintf("  %-6s %-30s no_turbo=%-2s pin=%-13s %s  %s\n", ENGINE_LABEL[[e]],
-                m$machine, m$no_turbo, m$pin, substr(m$glmm_git_rev, 1, 8), m$started))
+    cat(sprintf("  %-6s %-30s no_turbo=%-2s pin=%-13s load=%-14s %s  %s\n", ENGINE_LABEL[[e]],
+                m$machine, m$no_turbo, m$pin, m$loadavg_start %||% "?",
+                substr(m$glmm_git_rev, 1, 8), m$started))
   }
   unlabelled <- setdiff(read_engines, names(metas))
   if (length(unlabelled))
@@ -174,8 +178,9 @@ if (length(agq)) {
                   ENGINE_LABEL[[e]],
                   "         do not read its aK cell against another engine's (run.sh --agq=K).\n"))
     } else {
-      cat(sprintf("  %-6s %-30s no_turbo=%-2s pin=%-13s %s  %s\n", ENGINE_LABEL[[e]],
-                  m$machine, m$no_turbo, m$pin, substr(m$glmm_git_rev, 1, 8), m$started))
+      cat(sprintf("  %-6s %-30s no_turbo=%-2s pin=%-13s load=%-14s %s  %s\n", ENGINE_LABEL[[e]],
+                  m$machine, m$no_turbo, m$pin, m$loadavg_start %||% "?",
+                  substr(m$glmm_git_rev, 1, 8), m$started))
     }
   }
 }

@@ -414,6 +414,8 @@ mod tests {
             assert_eq!(Scalar::probit_cdf(v), crate::simd_transcendental::phi_hp(v));
             assert_eq!(Scalar::value(v), v);
             assert_eq!(<f64 as Scalar>::from_f64(v), v);
+            assert_eq!(Scalar::abs(v), v.abs());
+            assert_eq!(Scalar::mul_add(v, 2.0, -1.0), v.mul_add(2.0, -1.0));
         }
         for &v in &[1e-8_f64, 0.5, 1.0, 12.0] {
             assert_eq!(Scalar::ln(v), v.ln());

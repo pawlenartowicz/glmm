@@ -41,32 +41,31 @@ pub struct FitDiagnostics {
     /// Whether the fit reached its convergence criterion.
     pub converged: bool,
     /// θ boundary: 0 interior, 1 a component pinned to the floor, 2 no optimum.
-    /// **Placeholder on the sparse and NB (`Prebuilt`) routes** — they report no
-    /// boundary state, so this is back-derived from their `Fit::singular` and
-    /// cannot distinguish 2 from 0. **Meaningless on OLS/GLM** (no θ): always 0.
+    /// **Placeholder on the NB (`Prebuilt`) routes** — they report no boundary
+    /// state, so this is back-derived from their `Fit::singular` and cannot
+    /// distinguish 2 from 0. **Meaningless on OLS/GLM** (no θ): always 0.
     pub boundary_hit: u8,
     /// Bitmask of θ components pinned to the boundary, `diagonal_theta` order.
     /// **Meaningless on OLS/GLM** (no θ): always 0. **Placeholder on the
     /// `Prebuilt` routes** — reported as 0, which is indistinguishable from
-    /// "nothing was pinned". Those routes assemble a `Fit` themselves and the
-    /// sparse ones fill `Diagnostics::pinned` on it directly, so the stable
-    /// surface is complete; only this loop-tier carrier, which is read back off
-    /// the assembled `Fit` and holds no `Vec`, cannot carry the mask.
+    /// "nothing was pinned". Those routes assemble a `Fit` themselves and fill
+    /// `Diagnostics::pinned` on it directly, so the stable surface is complete;
+    /// only this loop-tier carrier, which is read back off the assembled `Fit`
+    /// and holds no `Vec`, cannot carry the mask.
     pub pinned_components: u64,
     /// Scale-invariant per-column pivot ratio of the route's own Gram
     /// ([`crate::ols::min_pivot_ratio`]), and the column attaining it. NaN on
-    /// every route and every return that formed no factor to measure — the
-    /// dense-GLMM, sparse and NB routes record none at all.
+    /// every route and every return that formed no factor to measure — the GLMM
+    /// and NB routes record none at all.
     pub pivot: f64,
     /// Column attaining `pivot`. Meaningless when `pivot` is NaN.
     pub pivot_col: u32,
     /// `pivot` fell below the recording route's own detection floor: the design
     /// is computable but its coefficients are barely identified. Each route
     /// compares against its own constant (`ols::PIVOT_MIN` for OLS and GLM,
-    /// `lmm::PIVOT_MIN` for dense LMM) because the routes were calibrated
+    /// `lmm::PIVOT_MIN` for the LMM) because the routes were calibrated
     /// separately. NaN pivots compare false, so a route that records none never
-    /// flags. The sparse route is NOT a detector — it refuses below its own
-    /// floor and reports that as `converged: false`, so it flags nothing here.
+    /// flags.
     pub ill_conditioned: bool,
     /// GLMM-only: count of fit-path PIRLS solves (BOBYQA objective evals, not
     /// FD-Hessian SE evals) that ran the full `PIRLS_MAX_ITERS` cap without
@@ -155,16 +154,14 @@ pub(super) fn materialize_diagnostics(
             other => unreachable!("FitDiagnostics::boundary_hit is 0/1/2, got {other}"),
         },
         pinned,
-        boundary_score: vec![],
-        kkt_grad_norm: f64::NAN,
         notes,
     }
 }
 
 /// Reshape a `diagonal_theta`-ordered pin bitmask into [`Diagnostics::pinned`]'s
-/// varcorr-aligned flags. Single source for that placement, shared by the four
-/// view mappers (through [`materialize_diagnostics`]) and by the two sparse
-/// routes, which assemble a `Fit` directly.
+/// varcorr-aligned flags. Single source for that placement: every route reaches
+/// it through [`materialize_diagnostics`], which each of the four view mappers
+/// calls.
 ///
 /// `varcorr` is the ONLY thing that maps bit order onto `pinned[g][i]`: the
 /// bitmask is keyed to `diagonal_theta` order, which walks the primary factor's
@@ -175,11 +172,9 @@ pub(super) fn materialize_diagnostics(
 /// `stddev_corr(g).0[i]` cannot drift apart.
 ///
 /// Mask 0 ⇒ no grid: on every success path this function is fed the fitting
-/// route's real pin mask (via [`materialize_diagnostics`] for the four dense
-/// view mappers, or directly by the two sparse routes, which overwrite
-/// `Diagnostics::from_flags`'s empty placeholder with this call's result), so
-/// mask 0 here means the fit genuinely pinned nothing — never a route
-/// declining to say. The short-circuit itself is a memory choice, not a
+/// route's real pin mask, carried in from the view mapper through
+/// [`materialize_diagnostics`], so mask 0 here means the fit genuinely pinned
+/// nothing — never a route declining to say. The short-circuit itself is a memory choice, not a
 /// meaning: a warm loop over draws that never pin allocates no grid of
 /// `false` per draw for saying so.
 pub(crate) fn pinned_flags(mask: u64, varcorr: &[Vec<f64>]) -> Vec<Vec<bool>> {
@@ -195,34 +190,6 @@ pub(crate) fn pinned_flags(mask: u64, varcorr: &[Vec<f64>]) -> Vec<Vec<bool>> {
                     let bit = k < u64::BITS as usize && (mask >> k) & 1 == 1;
                     k += 1;
                     bit
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Reshape a `diagonal_theta`-ordered per-component score into
-/// [`Diagnostics::boundary_score`]'s varcorr-aligned layout. **Mirrors
-/// [`pinned_flags`] — change together**: the two must place their `[g][i]` on
-/// the same component or a reader pairing them silently reads the wrong score.
-/// The owning explanation of why `varcorr` is the only thing that can place a
-/// bit lives on `pinned_flags`.
-///
-/// An all-NaN input returns empty, matching `pinned_flags`'s mask-0
-/// short-circuit: nothing measured allocates nothing.
-pub(crate) fn pinned_scores(scores: &[f64], varcorr: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    if scores.iter().all(|s| s.is_nan()) {
-        return vec![];
-    }
-    let mut k = 0usize;
-    varcorr
-        .iter()
-        .map(|vech| {
-            (0..super::vech_q(vech.len()))
-                .map(|_| {
-                    let s = scores.get(k).copied().unwrap_or(f64::NAN);
-                    k += 1;
-                    s
                 })
                 .collect()
         })
@@ -291,8 +258,8 @@ pub(super) fn varcorr_block(
 /// (LMM) or 1.0 (GLMM link scale). Path-independent — a function of θ̂ only.
 /// The primary-then-extras vech walk mirrors the `vech_start` layout assigned
 /// in `LmmGroupings::from_cluster_spec_ext` (`src/lmm/mod.rs`) — change together.
-/// `pub(crate)` so the sparse-Z path (`sparse::fit_mle_sparse`) recovers varcorr
-/// from θ̂ through the same path-independent assembly as the NoZ `fit_mle`.
+/// `pub(crate)` so every route recovers varcorr from θ̂ through the same
+/// path-independent assembly.
 pub(crate) fn assemble_varcorr(
     theta: &[f64],
     groupings: &crate::lmm::LmmGroupings,
@@ -333,13 +300,16 @@ pub(crate) fn lmm_loglik(deviance: f64, n: usize, p: usize) -> f64 {
 
 /// [`Fit::loglik`] for the GLMM paths (dense and sparse, Laplace and AGQ):
 /// restore the data-only saturated constant the marginal deviance drops.
-/// Binomial/Poisson/NB: `−½·deviance + saturated_loglik` (the deviance's data
-/// term is the weighted `dev_resid` sum). Gamma: `−½·deviance` with NO
-/// correction — lme4's `logLik(glmer fit)` is literally `−devfun/2`, and the
-/// `+2` its `Gamma()$aic` data term carries stays inside (so glmer's Gamma
-/// logLik sits 1 below `Σwᵢ·log f`; R's `logLik.glm` subtracts that 2 back
-/// out, glmer does not — pinned against the sim_gamma validation loglik). NaN in
-/// ⇒ NaN out (the non-converged contract).
+/// Binomial/Poisson: `−½·deviance + saturated_loglik` (the deviance's data
+/// term is the weighted `dev_resid` sum). Gamma and NB: `−½·deviance` with NO
+/// correction — for Gamma, lme4's `logLik(glmer fit)` is literally
+/// `−devfun/2`, and the `+2` its `Gamma()$aic` data term carries stays inside
+/// (so glmer's Gamma logLik sits 1 below `Σwᵢ·log f`; R's `logLik.glm`
+/// subtracts that 2 back out, glmer does not — pinned against the sim_gamma
+/// validation loglik). For NB, `deviance` is `dev(θ̂) − 2·saturated_loglik(θ̂)`
+/// (see `fit_glmm`'s `nb_dev_term`), which already carries the saturated term,
+/// so adding it again here would count it twice. NaN in ⇒ NaN out (the
+/// non-converged contract).
 pub(crate) fn glmm_loglik(
     family: Family,
     nb_theta: f64,
@@ -351,7 +321,7 @@ pub(crate) fn glmm_loglik(
         return f64::NAN;
     }
     match family {
-        Family::Gamma { .. } => -0.5 * deviance,
+        Family::Gamma { .. } | Family::NegativeBinomial { .. } => -0.5 * deviance,
         _ => -0.5 * deviance + crate::family::saturated_loglik(family, nb_theta, y, prior_w),
     }
 }
@@ -411,9 +381,13 @@ pub(crate) fn ranef_level_counts(g: &crate::lmm::LmmGroupings) -> Vec<usize> {
 }
 
 /// [`Fit::ranef`] from the DENSE GLMM workspace's spherical modes `u`
-/// (`glmm::build_z` layout: primary block level-major `lvl·q_p + c`, then each
+/// (blocked/structured layout: primary block level-major `lvl·q_p + c`, then each
 /// extra's scalar indicator columns at its absolute `extra_offsets[e]` — this
-/// path carries intercept-only extras exclusively, see `apply_lambda`).
+/// path carries intercept-only extras exclusively, which is why each extra
+/// contributes a single scalar θ here; the Λ_p it shares comes from
+/// `crate::lmm::primary_lambda`, the per-eval fill both dense layouts run
+/// (`glmm::deviance`'s blocked arm and `glmm::workspace::build_packed_m` for
+/// the structured one)).
 /// `b = Λ̂û` per block: the primary level's `q_p`-vector through the lower-tri
 /// `Λ_p`, each extra level through its scalar θ. Output is `Fit::ranef`'s
 /// public layout (per grouping, level-major) — for this path the primary block
@@ -704,7 +678,6 @@ pub(super) fn unpermute_fit(perm: Perm, fit: &mut Fit) {
     perm.swap_slots(&mut fit.stddev_se);
     perm.swap_slots(&mut fit.varcorr);
     perm.swap_slots(&mut fit.diagnostics.pinned);
-    perm.swap_slots(&mut fit.diagnostics.boundary_score);
 }
 
 /// The size rule: **when every grouping is intercept-only and `Crossed`, the
@@ -922,8 +895,8 @@ fn remap_spec_slopes(model: &ModelSpec, to_reduced: &[usize]) -> Option<ModelSpe
 /// The "unfittable model" return: an aliased fixed column is also used as an RE
 /// slope, so no reduced spec exists (see [`remap_spec_slopes`]). Carries the
 /// crate's standard numerical-failure convention — NaN β/se/vcov/dispersion,
-/// `converged: false`, no varcorr, `df: 0` — the same shape `fit_mle_sparse`
-/// returns on its own failures, so a caller that already handles
+/// `converged: false`, no varcorr, `df: 0` — the same shape the solver routes
+/// return on their own failures, so a caller that already handles
 /// `converged == false` needs no new branch. `n_eval: 0` is honest: no optimizer
 /// ran.
 ///
@@ -1255,10 +1228,10 @@ pub fn spec_sized_from_ids_pub<'a>(
     spec_sized_from_ids(model, ids)
 }
 /// Fills `dst[0..n, 0..p]` from row-major `x` (n·p, unweighted). Factored out
-/// of `to_col_major` so the `fit_on` hot-path arms (`Ols`/`Glm`/`LmmDense`) can
+/// of `to_col_major` so the `fit_on` hot-path arms (`Ols`/`Glm`/`Lmm`) can
 /// fill an `n_max`-sized buffer allocated once at `build_workspace`, instead of
 /// allocating a fresh `n×p` `Mat` every call — the same buffer-reuse pattern
-/// `FitKind::GlmmDense`'s `x_mat` already uses. `dst` must be at least `n×p`;
+/// `FitKind::Glmm`'s `x_mat` already uses. `dst` must be at least `n×p`;
 /// rows/columns past `n`/`p` are left untouched.
 pub(super) fn fill_col_major(dst: &mut Mat<f64>, x: &[f64], n: usize, p: usize) {
     for i in 0..n {

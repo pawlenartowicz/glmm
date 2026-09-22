@@ -69,7 +69,7 @@ Distinct from \code{init.theta}, which is the negative-binomial shape.}
 \item{dispersion}{Gamma/inverse-Gaussian dispersion directive: \code{NULL}
 (estimate via Pearson, the default), \code{"estimate"} (same), or a number to
 hold it fixed. Non-\code{NULL} on binomial/poisson would mean
-quasi-likelihood - GLMM 0.1.1, errors today.}
+quasi-likelihood - not implemented, errors.}
 
 \item{init.theta}{negative-binomial shape seed, named for
 \code{MASS::glm.nb(init.theta=)}. No kernel hook exists yet to seed the shape

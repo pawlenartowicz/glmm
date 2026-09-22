@@ -261,7 +261,7 @@ fn fit_one(spec: &Value) {
     };
 
     let fixed_only = lo.re_groups.is_empty();
-    let (converged, singular, estimates, timing, n_eval, deviance) = if gaussian {
+    let (converged, singular, estimates, timing, n_eval, n_eval_per_fit, deviance) = if gaussian {
         let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
         let t = if let Some(n_runs) = timings {
             json!({
@@ -281,7 +281,15 @@ fn fit_one(spec: &Value) {
             "df": f.df,
             "varcomp": varcomp(&f, &lo.re_groups, &ref_order, false),
         });
-        (f.converged(), f.singular(), est, t, f.n_eval, f.deviance)
+        (
+            f.converged(),
+            f.singular(),
+            est,
+            t,
+            f.n_eval,
+            f.n_eval,
+            f.deviance,
+        )
     } else if fixed_only {
         // Fixed-only GLM (weights suite): no θ, so the Rx-vs-Hessian method
         // split is moot — one fit, one SE, emitted as `se_rx` to line up with
@@ -305,7 +313,15 @@ fn fit_one(spec: &Value) {
             "df": f.df,
             "varcomp": varcomp(&f, &lo.re_groups, &ref_order, false),
         });
-        (f.converged(), f.singular(), est, t, f.n_eval, f.deviance)
+        (
+            f.converged(),
+            f.singular(),
+            est,
+            t,
+            f.n_eval,
+            f.n_eval,
+            f.deviance,
+        )
     } else {
         // GLMM SE has two genuinely different variants (Laplace) — emit both so
         // compare.R checks like to like: se_hessian (keeps θ–β coupling, glmm
@@ -348,6 +364,7 @@ fn fit_one(spec: &Value) {
             est,
             t,
             fh.n_eval + fr.n_eval,
+            fh.n_eval,
             fh.deviance,
         )
     };
@@ -359,7 +376,11 @@ fn fit_one(spec: &Value) {
         "rung": rung,
         "converged": converged, "singular": singular,
         "optimizer": "bobyqa",
+        // `n_eval` sums the fits this rung ran (a GLMM rung runs the Hessian-SE fit
+        // and the Rx fit); `n_eval_per_fit` is one fit's count, the divisor for a
+        // per-evaluation wall.
         "n_eval": n_eval,
+        "n_eval_per_fit": n_eval_per_fit,
         "deviance": num(deviance),
         "coef_names": std::mem::take(&mut lo.col_names),
         "estimates": estimates,

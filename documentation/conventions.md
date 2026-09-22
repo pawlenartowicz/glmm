@@ -55,10 +55,15 @@ For GLMM, two genuinely different Wald covariances are offered, selected by
 `wald_se`/`WaldSe`:
 
 - **Hessian** (the default, matching `glmer`'s `vcov(use.hessian = TRUE)`):
-  the β-block of `2·H_dev⁻¹`, where `H_dev` is a finite-difference Hessian of
-  the joint `(θ, β)` Laplace deviance at the converged point. If the joint
-  Hessian is non-positive-definite, or a perturbed deviance is non-finite, it
-  falls back to the Rx covariance below.
+  the β-block of `2·H_dev⁻¹`, where `H_dev` is the exact Hessian of the joint
+  `(θ, β)` Laplace deviance at the converged point. It is computed by
+  automatic differentiation of the analytic gradient, with no
+  finite-difference step. A fit the exact pass declines (for example a model
+  over its memory guard) gets a finite-difference Hessian instead; the full
+  list is in `algorithms-glmm.md`, "Standard errors". If the joint Hessian is
+  not positive definite, the fit falls back to the Rx covariance below. The
+  finite-difference Hessian also falls back when a perturbed deviance is
+  non-finite.
 - **Rx** (conditional on θ̂): the expected-information Schur complement of the
   β block, inverted directly from the factors PIRLS already left behind. This
   is cheaper but assumes β–θ orthogonality — exact for the Gaussian LMM, but
@@ -123,8 +128,10 @@ R), but they are three of six: the full report is `diagnostics.converged`,
 - `boundary` says where the accepted θ sits — `Interior`, `AtBoundary` (≥ 1
   variance component pinned at 0), or `NoOptimum` (the optimizer capped out at
   a finite endpoint, reported as a point rather than accepted onto the
-  boundary). Only the dense LMM and dense GLMM routes distinguish all three;
-  elsewhere it is back-derived from `singular`.
+  boundary). Every θ-carrying route distinguishes all three — LMM over either
+  kernel, GLMM over every layout, negative binomial included. OLS and GLM
+  (no θ) always report `Interior`, and so does a fit that failed before any
+  search ran (a degenerate guard), which says so through `converged: false`.
 - `pinned` names which variance components were pinned, aligned with the
   `varcorr` block layout so `pinned[g][i]` pairs with `stddev_corr(g)`'s `i`-th
   stddev. Empty means "nothing to report" (no components at all, or none
@@ -155,9 +162,9 @@ R), but they are three of six: the full report is `diagnostics.converged`,
     Also raised by the formula frontend, for the same reason
     `UnusedGroupingLevels` is.
   - `HessianSeFallback`: `wald_se`/`WaldSe::Hessian` was requested, but the
-    finite-difference joint Hessian was not usable (not positive definite, or
-    a perturbed deviance evaluation was non-finite), so the SE pass fell back
-    to the RX/Schur route. `se`/`vcov` are still filled from the fallback;
+    joint Hessian was not usable: it was not positive definite, or the fit
+    took the finite-difference Hessian and a perturbed deviance evaluation was
+    non-finite. The SE pass fell back to the RX/Schur route. `se`/`vcov` are still filled from the fallback;
     the random-effect stddev SEs (`stddev_se`) stay `NaN`.
 
   `notes` is empty on a clean fit, and an absent note means "not detected,"

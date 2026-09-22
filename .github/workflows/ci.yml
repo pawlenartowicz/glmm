@@ -3,7 +3,7 @@ name: CI
 # Lint, the full #[test] suite across feature configs, plus the three gates a
 # standalone publishable crate needs: an MSRV floor check, a wasm compile (the
 # crate ships a cfg(wasm32) faer split), and a publish dry-run so `main` is always
-# in a releasable state.
+# in a releasable state. Also builds and checks the fastglmm R package.
 on:
   push:
     branches: [main, dev]
@@ -81,12 +81,16 @@ jobs:
         #                    and cfg'd out entirely without the feature, so no
         #                    other leg even compiles this code; fit output is
         #                    pinned bit-identical with the feature on.
+        #   orchestrate    — string-typed fit orchestration shared by the FFI
+        #                    ports, off by default; not exercised by any other
+        #                    leg, so its own tests need this one.
         include:
           - { name: default, flags: "" }
           - { name: loop_advanced, flags: "--features loop_advanced" }
           - { name: parallel, flags: "--features parallel" }
           - { name: no-default, flags: "--no-default-features" }
           - { name: counters, flags: "--features counters" }
+          - { name: orchestrate, flags: "--features orchestrate" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -133,6 +137,83 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo publish --dry-run
 
+  # ── r: build the fastglmm source tarball and run R CMD check on it ────────
+  # Independent of the Rust/Python jobs above: it builds the tarball
+  # r-universe users get (see r/tools/cran-tarball.sh), not the workspace
+  # crate directly.
+  r:
+    name: r (fastglmm package)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The lme4 acceptance suite calls skip_on_cran() — without this, R CMD
+      # check would skip it quietly instead of running it.
+      NOT_CRAN: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The real compile happens later, inside the unpacked tarball under
+      # $RUNNER_TEMP — a path that does not exist yet and has no stable
+      # lockfile to key on. Default settings still warm ~/.cargo's registry
+      # and git caches, which that later compile does share.
+      - uses: Swatinem/rust-cache@v2
+      - uses: r-lib/actions/setup-r@v2
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          working-directory: r
+      - name: Build source tarball (self-contained, un-vendored)
+        # Runs from a scratch directory so the tarball never lands in the
+        # source tree; cran-tarball.sh finds the repo from its own path.
+        run: |
+          mkdir -p "$RUNNER_TEMP/r-build"
+          (cd "$RUNNER_TEMP/r-build" && "$GITHUB_WORKSPACE/r/tools/cran-tarball.sh")
+      - name: R CMD check
+        # Also run from a scratch directory, for the same reason. Not
+        # --as-cran: that mode adds a "Rust compilation" check that reports a
+        # WARNING on this un-vendored tarball (it downloads crates), and the
+        # step below fails on any WARNING. The vendored CRAN artifact is
+        # checked with --as-cran by hand (r/tools/cran-tarball.sh --vendor).
+        # --no-manual: the runner has no TeX, so a PDF manual is not
+        # something to check here.
+        run: |
+          mkdir -p "$RUNNER_TEMP/r-check"
+          cd "$RUNNER_TEMP/r-check"
+          R CMD check --no-manual "$RUNNER_TEMP"/r-build/fastglmm_*.tar.gz
+      - name: Fail on a check WARNING
+        # R CMD check's own exit code only goes non-zero on a check ERROR
+        # (Log$errors > 0); a WARNING passes silently. Read the final Status
+        # line from the check log instead. A NOTE does not fail this step.
+        run: |
+          log="$RUNNER_TEMP/r-check/fastglmm.Rcheck/00check.log"
+          if [ ! -f "$log" ]; then
+            echo "::error::00check.log not found at $log — the check step did not produce a log"
+            exit 1
+          fi
+          status=$(grep "^Status:" "$log" || true)
+          if [ -z "$status" ]; then
+            echo "::error::no Status: line in $log — the check log looks incomplete"
+            exit 1
+          fi
+          if echo "$status" | grep -q WARNING; then
+            echo "::error::R CMD check reported a WARNING: $status"
+            exit 1
+          fi
+      - name: Fail on any skipped test
+        # R CMD check does not fail its exit code on a skip, only on a real
+        # error — so a missing lme4/broom or a misfired skip_on_cran() would
+        # otherwise pass quietly.
+        run: |
+          out="$RUNNER_TEMP/r-check/fastglmm.Rcheck/tests/testthat.Rout"
+          if [ ! -f "$out" ]; then
+            echo "::error::testthat.Rout not found at $out — the check step did not run the test suite"
+            exit 1
+          fi
+          if grep -qE "SKIP [1-9]" "$out"; then
+            echo "::error::testthat skipped a test — treating as a job setup error"
+            grep -A6 "Skipped tests" "$out" || true
+            exit 1
+          fi
+
   # ── python: build the glmm wheel, install it, test + lint ───────
   python:
     name: python (glmm wheel)
@@ -155,8 +236,11 @@ jobs:
         run: pip install --find-links python/dist glmm
       - name: Install test + lint deps
         # ruff pinned so a new release's rule/formatter changes can't break CI
-        # mid-release (0.16.0 did exactly that); bump deliberately.
-        run: pip install pytest ruff==0.16.0
+        # mid-release (0.16.0 did exactly that); bump deliberately. pandas is
+        # not a package dependency — it is installed here only so the
+        # pandas-categorical `.cat`-accessor branch runs under test instead of
+        # skipping itself.
+        run: pip install pytest pandas ruff==0.16.0
       - name: pytest against the installed wheel, run outside the source tree
         run: |
           cd "$RUNNER_TEMP"

@@ -44,9 +44,10 @@ reported stddevs land on comparable magnitudes.
 ## Warning: Hessian-based standard errors fell back to RX
 
 `wald_se="hessian"` (Python) / `wald.se = "hessian"` (R) was requested, but
-the finite-difference joint Hessian this GLMM's SE pass builds was not
-usable — either it was not positive definite, or a perturbed deviance
-evaluation it needed was non-finite. The fit falls back to the RX/Schur
+the joint Hessian this GLMM's SE pass builds was not usable. Either it was
+not positive definite, or the fit took the finite-difference Hessian (the
+fallback of the exact pass) and a perturbed deviance evaluation it needed was
+non-finite. The fit falls back to the RX/Schur
 standard errors instead: `se`/`vcov` are still filled (from the fallback),
 but `stddev_se` (the standard errors of the random-effect standard
 deviations) stays `NaN`, since only the joint-Hessian route can fill it. This

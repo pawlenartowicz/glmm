@@ -747,7 +747,7 @@ pub fn phi_fill(buf: &mut [f64]) {
 //
 // `family_pass` below is the vectorized η → (μ, W, z) pass for every
 // non-canonical family at the four IRLS/PIRLS assembly sites
-// (`glm::glm_irls_fit` and the three `glmm::pirls::pirls_solve*` variants),
+// (`glm::glm_irls_fit` and the three `glmm::pirls::pirls_solve_*` variants),
 // used in place of a per-row scalar loop. One dispatch on `family`
 // picks a vectorized arm instead of one `match` + two libm calls per row; the
 // log-link arms additionally compute `exp(η)` ONCE and reuse it for both μ and
@@ -1483,24 +1483,42 @@ mod tests {
 
     #[test]
     fn simd_kernel_within_1ulp_of_libm() {
-        // dense grid straddling the η=0 seam and into both tails
-        let n = 20_003usize; // not a multiple of any lane count -> exercises the SIMD tail too
-        let eta: Vec<f64> = (0..n).map(|k| -40.0 + 80.0 * k as f64 / n as f64).collect();
+        // Dense grid straddling the η=0 seam, widened to the certified ±700
+        // domain (the exp/log1p reduction's clamp bound) — the deep tail is
+        // reachable during the first three IRLS iterations, before the
+        // divergence guard in `glm.rs` engages. One extra point past the clamp
+        // (1e3) checks the saturated regime.
+        let n = 20_002usize;
+        let mut eta: Vec<f64> = (0..n)
+            .map(|k| -700.0 + 1400.0 * k as f64 / n as f64)
+            .collect();
+        eta.push(1.0e3);
+        let n = eta.len(); // 20_003 -> not a multiple of any lane count, exercises the SIMD tail too
 
         // Per-element accuracy of the kernel formula. `scalar_fused` is bit-identical
         // op-for-op to the SIMD path, so this guards the coefficients directly. The
         // primitives are ≤1 ULP of the true value (proved offline vs an MPFR oracle);
         // in-repo we bound the kernel-vs-libm difference (both ≤1 ULP of truth → ≤2 apart).
-        let (mut pmax, mut lpmax) = (0i128, 0i128);
+        let (mut pmax, mut lpmax, mut wmax) = (0i128, 0i128, 0i128);
         for &e in &eta {
             let (p, w, lp) = scalar_fused::<{ FUSED_DEFAULT }>(e);
             let (libp, liblp) = libm_fused(e);
             pmax = pmax.max(ulp(p, libp));
             lpmax = lpmax.max(ulp(lp, liblp));
             assert!(w >= crate::glm::WEIGHT_CLAMP && w.is_finite());
+            // `w` is only clamp/finite-checked above, which a wrong-but-in-range
+            // weight formula would still pass — recompute p(1-p) from the libm
+            // reference p, floored the same way, and ULP-check against it.
+            // Measured 1 ULP over this grid; pinned at measured+1.
+            let w_ref = (libp * (1.0 - libp)).max(crate::glm::WEIGHT_CLAMP);
+            wmax = wmax.max(ulp(w, w_ref));
         }
         assert!(pmax <= 2, "sigmoid p drifted {pmax} ULP from libm");
         assert!(lpmax <= 2, "log1pexp drifted {lpmax} ULP from libm");
+        assert!(
+            wmax <= 2,
+            "IRLS weight w drifted {wmax} ULP from libm p(1-p)"
+        );
 
         // End-to-end SIMD dispatch path: p filled within the same band, and the
         // lane-reduced Σlog1pexp tracks the scalar Σ (the reorder moves only last bits).
@@ -1534,16 +1552,27 @@ mod tests {
         // policy is wrong — investigate before shipping.
         let n = 20_003usize;
         let eta: Vec<f64> = (0..n).map(|k| -40.0 + 80.0 * k as f64 / n as f64).collect();
-        let (mut pmax, mut lpmax) = (0i128, 0i128);
+        let (mut pmax, mut lpmax, mut wmax) = (0i128, 0i128, 0i128);
         for &e in &eta {
             let (p, w, lp) = scalar_fused::<false>(e);
             let (libp, liblp) = libm_fused(e);
             pmax = pmax.max(ulp(p, libp));
             lpmax = lpmax.max(ulp(lp, liblp));
             assert!(w >= crate::glm::WEIGHT_CLAMP && w.is_finite());
+            // Same libm-formula ULP check as the fused kernel test, against the
+            // unfused (plain mul/add) weight. `w = p(1-p)`'s derivative `1-2p`
+            // amplifies whatever ULP gap the unfused `p` already carries (up to
+            // 3 ULP here) at interior η, well away from either tail. Measured
+            // 29 ULP; pinned at measured+1.
+            let w_ref = (libp * (1.0 - libp)).max(crate::glm::WEIGHT_CLAMP);
+            wmax = wmax.max(ulp(w, w_ref));
         }
         assert!(pmax <= 3, "unfused sigmoid p drifted {pmax} ULP from libm");
         assert!(lpmax <= 3, "unfused log1pexp drifted {lpmax} ULP from libm");
+        assert!(
+            wmax <= 30,
+            "unfused IRLS weight w drifted {wmax} ULP from libm p(1-p)"
+        );
 
         // End-to-end dispatch of the unfused op on native SIMD lanes.
         let mut p = vec![0.0; n];
@@ -1605,10 +1634,12 @@ mod tests {
             smax = smax.max(ulp(buf[i], xs[i].exp()));
         }
         assert!(smax <= 1, "exp_fill drifted {smax} ULP from libm");
-        // Clamp behaviour at the edges stays finite.
+        // Clamp bound itself, not just "still finite": a wrong clamp constant
+        // would still pass a finite/positive check.
         let mut edge = vec![-1.0e9, 1.0e9];
         exp_fill(&mut edge);
-        assert!(edge[0] > 0.0 && edge[1].is_finite());
+        assert_eq!(edge[0].to_bits(), exp_clamped(EXP_ARG_FLOOR).to_bits());
+        assert_eq!(edge[1].to_bits(), exp_clamped(EXP_ARG_CEIL).to_bits());
     }
 
     #[test]
@@ -1906,14 +1937,169 @@ mod tests {
     }
 
     #[test]
-    fn weight_clamped_and_finite() {
-        let eta: Vec<f64> = vec![-50.0, -10.0, -1e-9, 0.0, 1e-9, 10.0, 50.0, 1e3];
-        let mut p = vec![0.0; eta.len()];
-        let mut w = vec![0.0; eta.len()];
-        pw_and_log1pexp_sum(&eta, &mut p, &mut w);
-        for i in 0..eta.len() {
-            assert!(p[i].is_finite() && (0.0..=1.0).contains(&p[i]));
-            assert!(w[i] >= crate::glm::WEIGHT_CLAMP && w[i].is_finite());
+    fn exp_fill_infinity_saturates_the_domain_clamp() {
+        // ±inf sits past [-700, 700] on either side, ordered normally against
+        // the clamp bounds (no NaN ambiguity), so the SIMD head's `min_f64s`/
+        // `max_f64s` and the scalar tail's `f64::clamp` agree: both floor/ceil
+        // it exactly like any other out-of-range finite input.
+        let mut short = vec![f64::NEG_INFINITY, f64::INFINITY]; // scalar tail only
+        exp_fill(&mut short);
+        assert_eq!(short[0].to_bits(), exp_clamped(EXP_ARG_FLOOR).to_bits());
+        assert_eq!(short[1].to_bits(), exp_clamped(EXP_ARG_CEIL).to_bits());
+
+        let mut long = vec![0.0; 16]; // forces indices 0,1 through the SIMD head
+        long[0] = f64::NEG_INFINITY;
+        long[1] = f64::INFINITY;
+        for (i, x) in long.iter_mut().enumerate().skip(2) {
+            *x = -4.0 + i as f64;
         }
+        exp_fill(&mut long);
+        assert_eq!(long[0].to_bits(), exp_clamped(EXP_ARG_FLOOR).to_bits());
+        assert_eq!(long[1].to_bits(), exp_clamped(EXP_ARG_CEIL).to_bits());
+    }
+
+    #[test]
+    fn exp_fill_nan_diverges_between_simd_head_and_scalar_tail() {
+        // Scalar tail: `f64::clamp` leaves a NaN `self` unclamped, so the
+        // reduction runs on NaN and NaN survives to the output — no silent
+        // finite value here.
+        let mut tail_only = vec![f64::NAN];
+        exp_fill(&mut tail_only);
+        assert!(tail_only[0].is_nan());
+
+        // SIMD head: `min_f64s`/`max_f64s` lower to hardware min/max, which
+        // return the non-NaN operand instead of propagating NaN. A NaN landing
+        // in a full lane is floored to EXP_ARG_FLOOR before the polynomial runs,
+        // so it comes out as exp(-700), not NaN — head and tail disagree.
+        let mut head_nan = vec![0.0; 16];
+        head_nan[0] = f64::NAN;
+        for (i, x) in head_nan.iter_mut().enumerate().skip(1) {
+            *x = -4.0 + i as f64;
+        }
+        exp_fill(&mut head_nan);
+        assert_eq!(head_nan[0].to_bits(), exp_clamped(EXP_ARG_FLOOR).to_bits());
+    }
+
+    #[test]
+    fn ln_fill_infinity_saturates_the_domain_clamp() {
+        let mut short = vec![f64::NEG_INFINITY, f64::INFINITY];
+        ln_fill(&mut short);
+        assert_eq!(short[0].to_bits(), ln_owned(LN_U_FLOOR).to_bits());
+        assert_eq!(short[1].to_bits(), ln_owned(LN_U_CEIL).to_bits());
+
+        let mut long = vec![0.5; 16];
+        long[0] = f64::NEG_INFINITY;
+        long[1] = f64::INFINITY;
+        ln_fill(&mut long);
+        assert_eq!(long[0].to_bits(), ln_owned(LN_U_FLOOR).to_bits());
+        assert_eq!(long[1].to_bits(), ln_owned(LN_U_CEIL).to_bits());
+    }
+
+    #[test]
+    fn ln_fill_nan_is_laundered_not_propagated() {
+        // Scalar tail: `f64::clamp` leaves NaN unclamped, so `to_bits()` feeds
+        // the mantissa/exponent bit trick NaN's own bit pattern as if it were a
+        // real `u` in the domain. The output is finite and reproducible, not
+        // NaN — a NaN can silently turn into a plausible-looking ln value here.
+        let mut tail_only = vec![f64::NAN];
+        ln_fill(&mut tail_only);
+        assert!(tail_only[0].is_finite());
+        assert_eq!(tail_only[0].to_bits(), ln_owned(f64::NAN).to_bits());
+
+        // SIMD head: the hardware clamp floors NaN to LN_U_FLOOR before the bit
+        // trick runs, landing on the same value as a legitimate out-of-domain
+        // low input — a different finite number from the tail's NaN-bits value.
+        let mut head_nan = vec![0.5; 16];
+        head_nan[0] = f64::NAN;
+        ln_fill(&mut head_nan);
+        assert_eq!(head_nan[0].to_bits(), ln_owned(LN_U_FLOOR).to_bits());
+    }
+
+    #[test]
+    fn sigmoid_fill_nonfinite_input() {
+        // +inf saturates to 1.0 (the η ≥ 0 branch). -inf and NaN both fall
+        // through the same path as a very negative η: `z = exp(-|η|)` clamps to
+        // exp(-700) either way (NaN's `.abs()` is NaN, and `.max(EXP_ARG_FLOOR)`
+        // returns the non-NaN operand — the same NaN-eating `simd_z_mask`/
+        // `scalar_z` rely on), and `η >= 0.0` is false for both, selecting the
+        // tiny-p branch. So NaN is silently treated as η → -∞ here, and head and
+        // tail agree because this kernel does no bit-pattern trick on `z`.
+        let floor_z = exp_clamped(EXP_ARG_FLOOR);
+        let expect_tiny = floor_z / (1.0 + floor_z);
+
+        let mut short = vec![f64::NAN, f64::NEG_INFINITY, f64::INFINITY];
+        sigmoid_fill(&mut short);
+        assert_eq!(short[0].to_bits(), expect_tiny.to_bits());
+        assert_eq!(short[1].to_bits(), expect_tiny.to_bits());
+        assert_eq!(short[2], 1.0);
+
+        let mut long = vec![0.0; 16];
+        long[0] = f64::NAN;
+        long[1] = f64::NEG_INFINITY;
+        long[2] = f64::INFINITY;
+        for (i, x) in long.iter_mut().enumerate().skip(3) {
+            *x = -4.0 + i as f64;
+        }
+        sigmoid_fill(&mut long);
+        assert_eq!(long[0].to_bits(), expect_tiny.to_bits());
+        assert_eq!(long[1].to_bits(), expect_tiny.to_bits());
+        assert_eq!(long[2], 1.0);
+    }
+
+    #[test]
+    fn phi_fill_nonfinite_input() {
+        // ±inf saturate to the sensible tail limits; plain arithmetic (no
+        // clamp, no bit trick) propagates NaN through instead of laundering it.
+        let mut short = vec![f64::NAN, f64::NEG_INFINITY, f64::INFINITY];
+        phi_fill(&mut short);
+        assert!(short[0].is_nan());
+        assert_eq!(short[1], 0.0);
+        assert_eq!(short[2], 1.0);
+
+        let mut long = vec![0.0; 16];
+        long[0] = f64::NAN;
+        long[1] = f64::NEG_INFINITY;
+        long[2] = f64::INFINITY;
+        for (i, x) in long.iter_mut().enumerate().skip(3) {
+            *x = -4.0 + i as f64;
+        }
+        phi_fill(&mut long);
+        assert!(long[0].is_nan());
+        assert_eq!(long[1], 0.0);
+        assert_eq!(long[2], 1.0);
+    }
+
+    #[test]
+    fn pw_and_log1pexp_sum_nan_eta_launders_into_a_finite_deviance_row() {
+        // Pins the gap the divergence guard in `glm.rs` cannot see: `ae >
+        // max_abs` is false whenever `ae` is NaN, so a NaN η never raises
+        // `max_abs` and never trips that cap. This kernel does not reject NaN
+        // either — `scalar_fused`/`simd_fused` treat it exactly like a very
+        // negative η (see `sigmoid_fill_nonfinite_input`), so the row comes out
+        // as a finite p ≈ exp(-700), w = WEIGHT_CLAMP, and a finite, near-zero
+        // deviance contribution: indistinguishable from a legitimate confident
+        // η → -∞ row. `family_pass`'s unweighted-logit arm calls this function
+        // directly on an unclamped η, so this is reachable from a live fit, not
+        // just from this test.
+        let (expect_p, expect_w, expect_lp) = scalar_fused::<{ FUSED_DEFAULT }>(f64::NAN);
+        assert!(expect_p.is_finite() && expect_w.is_finite() && expect_lp.is_finite());
+
+        let eta = [f64::NAN];
+        let mut p = [0.0];
+        let mut w = [0.0];
+        let sum = pw_and_log1pexp_sum(&eta, &mut p, &mut w);
+        assert_eq!(p[0].to_bits(), expect_p.to_bits());
+        assert_eq!(w[0].to_bits(), expect_w.to_bits());
+        assert_eq!(sum.to_bits(), expect_lp.to_bits());
+
+        // Contrast: +inf does NOT launder — it produces an infinite deviance
+        // contribution, which a finite-value check downstream would catch.
+        let eta = [f64::INFINITY];
+        let mut p = [0.0];
+        let mut w = [0.0];
+        let sum = pw_and_log1pexp_sum(&eta, &mut p, &mut w);
+        assert_eq!(p[0], 1.0);
+        assert_eq!(w[0], crate::glm::WEIGHT_CLAMP);
+        assert!(sum.is_infinite() && sum > 0.0);
     }
 }

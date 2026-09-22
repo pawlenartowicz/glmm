@@ -522,8 +522,11 @@ coef.fastglmm <- function(object, ...) {
 #' Log-likelihood of a fastglmm fit
 #'
 #' On `stats::logLik`'s scale, so `AIC()` and `BIC()` work directly. This is
-#' `glmm::Fit::loglik`, not `$deviance` - the latter is the optimizer criterion
-#' and differs from `-2*logLik` by model-dependent constants.
+#' `glmm::Fit::loglik`, not `$deviance` - the latter is the optimizer
+#' criterion. For an LMM it is lme4's REMLcrit minus a data-independent
+#' constant. For a GLMM it differs from `-2*logLik` by a data-only saturated
+#' constant on binomial/Poisson fits, and equals `-2*logLik` exactly on Gamma
+#' and negative-binomial fits.
 #'
 #' For an LMM the value is the **REML criterion**, matching `lme4::logLik` on a
 #' REML fit, and the returned object carries `REML = TRUE`. REML criteria are

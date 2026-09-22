@@ -143,8 +143,14 @@ pub fn build_lmm_seam_ws(
         .collect();
     match classify_design(&sized, 1) {
         Solver::NoZ => {
-            let mut ws =
-                LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &slope_cols, &extra_slope_cols);
+            let mut ws = LmmWorkspace::for_cluster_spec_ext(
+                p,
+                &sized,
+                n,
+                &slope_cols,
+                &extra_slope_cols,
+                false,
+            );
             let x_mat = super::common::to_col_major(x, n, p);
             accumulate_lmm_rows(
                 &mut ws,
@@ -156,17 +162,12 @@ pub fn build_lmm_seam_ws(
                 &ids.extra,
                 None,
             );
-            let LmmWorkspace { suff, mut fit, .. } = ws;
+            let crate::lmm::LmmKernel::Dense { suff, mut fit } = ws.kernel else {
+                unreachable!("Solver::NoZ builds the dense kernel")
+            };
             crate::lmm::precompute_balanced_collapse(&suff, &mut fit);
             let g = suff.groupings.clone();
-            (
-                LmmSeamWs::Dense {
-                    suff: Box::new(suff),
-                    fit: Box::new(fit),
-                    perm,
-                },
-                g,
-            )
+            (LmmSeamWs::Dense { suff, fit, perm }, g)
         }
         Solver::Sparse => {
             let mut g = crate::lmm::LmmGroupings::from_cluster_spec_ext(
@@ -178,7 +179,7 @@ pub fn build_lmm_seam_ws(
             let xm = faer::MatRef::from_row_major_slice(x, n, p);
             // The seam exists so a caller can drive the EXACT objective the crate
             // minimizes, so its Z must carry the same internal RE column scales
-            // `fit_mle_sparse` installs — change together.
+            // `accumulate_lmm_rows` installs — change together.
             g.set_slope_scales(xm, None);
             let g = g;
             let ws = crate::sparse::SparseLmmWorkspace::new(
@@ -443,7 +444,14 @@ pub fn build_lmm_workspace(p: usize, model: &ModelSpec, n: usize) -> LmmWorkspac
         .iter()
         .map(|g| g.slopes.iter().map(|&c| c as usize).collect())
         .collect();
-    LmmWorkspace::for_cluster_spec_ext(p, model, n, &slope_cols, &extra_slope_cols)
+    LmmWorkspace::for_cluster_spec_ext(
+        p,
+        model,
+        n,
+        &slope_cols,
+        &extra_slope_cols,
+        matches!(classify_design(model, 1), Solver::Sparse),
+    )
 }
 
 /// "Different `y`, same shape" per-call refit on a caller-owned `ws` (built

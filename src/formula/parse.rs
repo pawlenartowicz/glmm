@@ -62,6 +62,11 @@ static OFFSET_TERM: LazyLock<Regex> =
 static NO_INTERCEPT_MINUS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-1(\+|$)").unwrap());
 static NO_INTERCEPT_ZERO: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|\+)0(\+|$)").unwrap());
+// The intercept written out, R-style (`y ~ 1 + x`): a whole term `1`, same
+// boundary handling as `NO_INTERCEPT_ZERO`. It names the intercept the fixed
+// part carries anyway, so it is dropped rather than parsed as a term.
+static EXPLICIT_INTERCEPT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|\+)1(\+|$)").unwrap());
 
 /// The parsed formula AST. A frozen contract — its shape must stay stable
 /// since the parse test suite depends on it. The suite proves a superset of
@@ -223,7 +228,18 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
     }
 
     let mut has_intercept = true;
+    let explicit_intercept = EXPLICIT_INTERCEPT.is_match(&rhs_stripped);
     if NO_INTERCEPT_MINUS.is_match(&rhs_stripped) || NO_INTERCEPT_ZERO.is_match(&rhs_stripped) {
+        // R resolves `1 + x - 1` and `0 + 1 + x` by term order; a formula that
+        // both writes the intercept and removes it is refused instead of
+        // guessed at.
+        if explicit_intercept {
+            return Err(ParseError::Syntax {
+                pos: 0,
+                msg: "the fixed part both writes the intercept (`1`) and removes it (`- 1` / `0`)"
+                    .into(),
+            });
+        }
         has_intercept = false;
         // `$1` restores the trailing `+`/end-of-string the match consumed (no
         // look-around available); `clean_residual_plusses` mops up the
@@ -235,6 +251,9 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
             .replace_all(&rhs_stripped, "+$1")
             .into_owned();
         rhs_stripped = clean_residual_plusses(&rhs_stripped);
+    } else if explicit_intercept {
+        rhs_stripped =
+            clean_residual_plusses(&EXPLICIT_INTERCEPT.replace_all(&rhs_stripped, "+$1"));
     }
 
     // Reject term removal: a '-' that isn't inside parens and isn't a digit sign.

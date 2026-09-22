@@ -20,17 +20,18 @@
 //! PIRLS gains step-halving to keep the higher-dimensional joint (u, β) step
 //! stable.
 //!
-//! This module holds three dense PIRLS backends, picked per RE design shape:
-//! `pirls_solve` (single grouping, no extra slopes), `pirls_solve_blocked`
-//! (crossed/nested groupings, block-diagonal Λ_θ), and
-//! `pirls_solve_blocked_extras` (blocked plus extra random-slope columns) —
-//! see `se::blocked_schur_fill`/`se::structured_schur_fill` for their Schur
-//! complement fills. All three keep Z and Λ_θ dense, which is exact and fast
-//! within the spec-sanctioned regime (bounded groups × levels). Designs that
-//! fall outside that regime route to the separate sparse-matrix driver in
-//! `crate::sparse::glmm` (`fit_glmm_sparse`) instead. All scratch for the
-//! dense backends lives in `GlmmWorkspace`, allocated once per (spec, max_n)
-//! shape — the warm path is zero-alloc (Bobyqa::new once).
+//! This module holds three PIRLS backends, one per `A`-layout
+//! ([`workspace::GlmmLayout`], picked per RE design shape):
+//! `pirls_solve_blocked` (a single grouping, `A` block-diagonal),
+//! `pirls_solve_blocked_extras` (intercept-only crossed/nested extras, core
+//! blocks plus a crossed Schur), and `pirls_solve_packed` (everything else:
+//! fixed-width packed `M` rows and a dense `k×k` `A`) — see
+//! `se::blocked_schur_fill`/`se::structured_schur_fill`/`se::packed_schur_fill`
+//! for their Schur complement fills. None of them materializes `Z` or `Λ_θ`
+//! densely. Designs over `classify_design`'s NoZ envelope take the packed-row
+//! backend through this same entry point.
+//! All scratch for the three backends lives in `GlmmWorkspace`, allocated once
+//! per (spec, max_n) shape — the warm path is zero-alloc (Bobyqa::new once).
 //!
 //! No σ² scale: binomial dispersion is fixed at 1, so D̂ = Λ̂Λ̂′ directly.
 //!
@@ -43,28 +44,33 @@ use faer::{Mat, MatRef};
 
 use crate::lmm::{PIN_THETA, THETA0, THETA_TRUTH_FLOOR};
 
-use se::{blocked_schur_fill, dense_schur_fill, structured_schur_fill};
-use workspace::fill_z_f64;
+use se::{blocked_schur_fill, packed_schur_fill, structured_schur_fill};
+pub(crate) use workspace::GlmmLayout;
+use workspace::{fill_z_f64, FitData};
 
-/// PIRLS inner-loop caps — the same as glm.rs's IRLS (PIRLS *is* that IRLS plus
-/// the +I ridge).
-pub const PIRLS_MAX_ITERS: usize = 50;
+/// PIRLS inner-loop caps. `glm.rs`'s plain IRLS caps at `MAX_IRLS_ITERS = 50`
+/// (PIRLS *is* that IRLS plus the +I ridge), but PIRLS itself needs a higher
+/// cap: the joint `(u, β)` step of the β-profile outer route can oscillate
+/// around its fixed point with a decay ratio near 0.84 on some Bernoulli
+/// random-slope fits, and 50 iterations is not always enough to reach the exit
+/// band. A solve that exits on the band is bit-identical at any cap, so only
+/// fits that exhaust the cap can change.
+pub const PIRLS_MAX_ITERS: usize = 200;
 /// Backtracking cap for PIRLS step-halving, mirroring lme4 `pwrssUpdate`'s
 /// 10-halving discipline: when a full Fisher step raises the penalized deviance
 /// above the last accepted value, the u-step is halved and re-evaluated up to
 /// this many times before the solve is declared failed. Exhausting it surfaces as
 /// the module's `(NaN, NaN, NaN, false)` failure — the same terminal state a raw
 /// overshoot reaches, but reached deliberately. Shared by all three PIRLS
-/// variants (dense / blocked / structured).
+/// variants (blocked / structured / packed).
 ///
-/// 16, above lme4's 10: the sparse GLMM's FD-Hessian central deviance eval
-/// cold-seeds `û = 0` on every evaluation (see `sparse::glmm`'s step-size
-/// constant doc comment), and on a large-θ̂, many-crossed-grouping, large-count
-/// design that cold seed needs more halvings to walk back to the mode than a
-/// warm-started fit does. Measured floor on the sparse large-θ̂ rung is 11
-/// halvings; 16 was chosen for margin above that floor, not tuned to the exact
-/// minimum. Dense PIRLS and the blocked/structured sparse solve steps don't hit
-/// this regime and converge well inside the cap.
+/// 16, above lme4's 10: the packed-row layout's FD-Hessian central deviance eval
+/// cold-seeds `û = 0` on every evaluation (see `se::SPARSE_FD_STEP_REL`), and on
+/// a large-θ̂, many-crossed-grouping, large-count design that cold seed needs more
+/// halvings to walk back to the mode than a warm-started fit does. Measured floor
+/// on the packed large-θ̂ rung is 11 halvings; 16 was chosen for margin above that
+/// floor, not tuned to the exact minimum. The blocked and structured solve steps
+/// don't hit this regime and converge well inside the cap.
 pub const PIRLS_MAX_HALVINGS: usize = 16;
 /// The shapes whose stage-1 Profile solve is the EXACT Laplace β-profile and whose
 /// outer search is therefore θ-only (`OuterSearch::ExactProfile`): Laplace, a data
@@ -73,24 +79,20 @@ pub const PIRLS_MAX_HALVINGS: usize = 16;
 /// crossed/nested path (`pirls_solve_blocked_extras`), which carries an observed-
 /// information twin of its factor (core blocks, coupling, Schur) on both canonical
 /// and non-canonical links. Gamma's `gamma_aic` objective has a different β score and
-/// keeps the joint search; AGQ keeps theirs too. Two separate boundaries also keep
-/// the joint search on their own shapes: a NoZ/dense-envelope design whose extras
-/// fail `structured_extras_eligible()` (`q_core = primary_q + nested_per_parent`
-/// over `MAX_PRIMARY_Q`) falls back to the plain dense factor (`needs_dense`,
-/// `workspace.rs`) instead of the structured one; a design over `classify_design`'s
-/// separate NoZ-envelope boundary (`q_p`, extra-grouping count/width, total crossed
-/// levels — `src/fit/mod.rs`) is over-envelope and routes to the sparse solver
-/// entirely, which runs its own joint search. Read by the workspace constructor and
-/// by the driver's `debug_assert!` — the tests choose the route through
-/// `outer_search`, never through this.
+/// keeps the joint search; AGQ keeps theirs too. So does the packed-row layout
+/// (`GlmmLayout::Packed`, `workspace.rs`), whose PIRLS carries no observed twin and
+/// therefore no exact border — `pirls_solve_packed` refuses a `ProfileExact` step
+/// outright. Read by the workspace constructor and by the driver's
+/// `debug_assert!` — the tests choose the route through `outer_search`, never
+/// through this.
 pub(crate) fn exact_profile_shape(
     family: crate::spec::Family,
     nagq: u8,
-    g: &crate::lmm::LmmGroupings,
+    layout: GlmmLayout,
 ) -> bool {
     nagq == 1
         && !matches!(family, crate::spec::Family::Gamma { .. })
-        && (g.extra_offsets.is_empty() || g.structured_extras_eligible())
+        && layout != GlmmLayout::Packed
 }
 /// Adaptive PIRLS exit on |Δ penalized-deviance|, relative to the objective
 /// scale (lme4's pwrss discipline): converged when
@@ -130,7 +132,7 @@ pub const PIRLS_TOL_REL: f64 = 1e-9;
 /// only when SEs go through the FD-Hessian (`se_rx` skips it entirely).
 pub const PIRLS_TOL_REL_NONCANON: f64 = 1e-8;
 /// CEILING on the PIRLS exit tolerance under the FD-Hessian SE evals ONLY
-/// (`joint_hessian_cov` / `sparse_fd_hessian_cov`). Never applied on its own —
+/// (`joint_hessian_cov`, either stencil arm). Never applied on its own —
 /// `pirls_tol_fd` takes `min(this, pirls_tol(family))`, so the SE pass is always
 /// at least as converged as the fit that produced the point it differences.
 /// Applying it as a plain replacement would put canonical links (fitting at
@@ -167,9 +169,8 @@ pub(crate) fn pirls_tol(family: crate::spec::Family) -> f64 {
 /// ceiling and the family's own fit tolerance, so the stencil can only ever be
 /// more converged than the fit, never less. Canonical links take
 /// `PIRLS_TOL_REL` (1e-9); non-canonical links fit at 1e-8 and so take the
-/// ceiling. Both FD-Hessian arms write this into `pirls_tol_override` —
-/// `glmm::se::joint_hessian_cov` and `sparse::glmm`'s `WaldSe::Hessian` arm,
-/// change together.
+/// ceiling. `glmm::se::joint_hessian_cov` writes it into `pirls_tol_override` on
+/// both of its stencil arms.
 pub(crate) fn pirls_tol_fd(family: crate::spec::Family) -> f64 {
     PIRLS_TOL_REL_FD.min(pirls_tol(family))
 }
@@ -194,7 +195,7 @@ pub const BETA_BOX: f64 = 30.0;
 /// θ̂ exceeds 1, at nAGQ = 1 and 7 and 11 alike (θ̂ 1.13 → 5.16, a 20× range in
 /// θ̂²), on both `se_hessian` and the θ-block SEs. The step
 /// construction, and the toenail evidence behind it, is at `se.rs`'s
-/// `ws.fd_steps` loop.
+/// `ws.fd.fd_steps` loop.
 ///
 /// The BASE VALUE 1e-2 is unchanged by that fix and stays pinned by the curated
 /// sweep, not just by the fixture: the Hessian is step-invariant over h ∈
@@ -205,8 +206,8 @@ pub const BETA_BOX: f64 = 30.0;
 /// asymmetry above does not disturb the sweep that pinned this number — h_θ on
 /// them is bit-for-bit what it was. Independently, the measured noise knee in θ is
 /// at h_θ ≈ 2.5e-4, so 1e-2 keeps a 40× margin on the truncation side.
-/// The sparse path needs the opposite trade and carries its own
-/// `sparse::SPARSE_FD_STEP_REL` (1e-4, landing on the weighted sparse Gamma
+/// The packed-row layout needs the opposite trade and carries its own
+/// `se::SPARSE_FD_STEP_REL` (1e-4, landing on the weighted sparse-Z Gamma
 /// golden's FD-step plateau — 1e-3 biases se(β₀) high there) — calibrated
 /// separately, do not fold the two constants together. The θ-step fix does NOT
 /// transfer to it: that constant is calibrated on the noise side, so removing the
@@ -215,18 +216,23 @@ pub const BETA_BOX: f64 = 30.0;
 /// **The `_BASE` / `_REL` split in the two names is deliberate.** This one is
 /// `_BASE` because the asymmetry above makes "relative" false of the θ block;
 /// `SPARSE_FD_STEP_REL` keeps its suffix because it really is applied relatively
-/// on every coordinate, θ included. If the sparse step ever takes the same
+/// on every coordinate, θ included. If the packed step ever takes the same
 /// asymmetry, rename it in the same change, or the suffix starts lying there
 /// instead.
 pub const FD_STEP_BASE: f64 = 1e-2;
 
 /// Per-fit GLMM result (mirrors `LmmFit`; no σ² — dispersion is fixed at 1).
 pub struct GlmmFit {
-    /// `true` iff stage-2 BOBYQA converged AND the pinned-γ̂ re-eval deviance is
-    /// finite; `false` NaN-fills every inference field (see `nan_fit`).
+    /// `true` iff the outer BOBYQA converged AND the pinned-γ̂ re-eval deviance is
+    /// finite. `false` on two distinct exits: an outer search that exhausted its
+    /// evaluation budget (`Status::MaxFunReached`) still reports its incumbent
+    /// β̂, SEs and deviance here, with `boundary_hit = 2` and
+    /// `pinned_components` empty; every other non-convergence (BOBYQA failure,
+    /// a non-PD Schur, the degenerate-fit guard) NaN-fills every inference
+    /// field instead (see `nan_fit`).
     pub converged: bool,
     /// 0 = interior, 1 = ≥1 diagonal θ pinned (converged), 2 = optimizer/Schur
-    /// failure (non-converged).
+    /// failure or a budget-exhausted exit (non-converged).
     pub boundary_hit: u8,
     /// Bit k set iff diagonal variance component k pinned (order
     /// [intercept, slope_0, …, extra_1, …]). Mirrors `LmmFit.pinned_components`
@@ -249,9 +255,11 @@ pub struct GlmmFit {
     /// `NonPdFellBackToRx` status. Always `false` under `WaldSe::Rx`.
     pub hessian_fallback: bool,
     /// Minimized marginal Laplace deviance at the pinned γ̂ (`d(y,ũ)+‖ũ‖²+log|A|`,
-    /// or the AGQ deviance when `nagq>1`). `f64::INFINITY` on non-convergence.
-    /// Reported as `Fit::deviance`; the NB marginal log-likelihood restores its
-    /// θ̂-dependent saturated term from it (`family::glmm_loglik`).
+    /// or the AGQ deviance when `nagq>1`), reported as `Fit::deviance`.
+    /// `f64::INFINITY` on non-convergence. On an NB fit it carries
+    /// `−2·saturated_loglik(θ̂)` on top — not the search's own `nb_term`, which
+    /// differs from it by the θ̂-independent constant `2·Σwᵢ·lgamma(yᵢ+1)` — so
+    /// the reported value is exactly `−2·logLik`.
     pub deviance: f64,
 }
 
@@ -277,23 +285,34 @@ pub(crate) use derivative::{unpack_hessian, DerivStatus};
 // on an import nothing left standing can use.
 #[cfg(all(test, feature = "formula"))]
 pub(crate) use assembled::{
-    clamped_row_counts, gradient_f64, gradient_f64_mode_residual, joint_hessian_columns,
+    assembly_routes, gradient_f64, gradient_f64_mode_residual, joint_hessian, mu_clamped_rows,
+    packed_gradient,
 };
+// The unsymmetrized column pass, read by the corpus drivers in
+// `fit::glmm_tests` and by the both-layouts cross-check in `sparse::tests`,
+// which carries no `formula` gate.
+#[cfg(test)]
+pub(crate) use assembled::joint_hessian_columns;
 // The paired-timing driver's forcing switch and success counter — see their
-// doc comments in `assembled.rs`. Same formula-only caller as the block above.
+// doc comments in `assembled.rs`. Same formula-only callers as the block
+// above.
 #[cfg(all(test, feature = "formula"))]
 pub(crate) use assembled::{ASSEMBLED_OK_COUNT, FORCE_DECLINE};
 // Same formula-only caller as the two blocks above.
 #[cfg(all(test, feature = "formula"))]
 pub(crate) use derivative::{
-    laplace_gradient, laplace_hessian, supports_shape as supports_exact_shape,
+    laplace_gradient, laplace_hessian, supports_shape as supports_exact_shape, MAX_DUAL_N,
 };
 pub use se::joint_hessian_cov;
-pub(crate) use se::{fd_mixed_diff, fd_second_diff};
+// The FD stencils and the packed-row step constant: `se.rs` is their only
+// production reader, the FD-margin measurement their only cross-module one.
+#[cfg(all(test, feature = "formula"))]
+pub(crate) use se::{fd_mixed_diff, fd_second_diff, SPARSE_FD_STEP_REL};
+pub(crate) use workspace::fill_packed_cols;
 pub(crate) use workspace::StructuredSchur;
-pub use workspace::{build_z, GlmmWorkspace, OuterSearch};
 #[cfg(test)]
 pub(crate) use workspace::{glmm_block_chol, glmm_block_solve};
+pub use workspace::{GlmmWorkspace, OuterSearch};
 
 use deviance::laplace_deviance;
 use pirls::BetaMode;
@@ -316,10 +335,10 @@ pub enum FdHessianStatus {
     NonPdFellBackToRx,
 }
 
-/// Fit the clustered-logistic GLMM. `build_z` must already have run (a no-op on
-/// the no-extras blocked route, where `ws.z` is 0×0 and nothing reads it) for
-/// this (X, ids, N). `beta_start` = spec.effect_sizes. Writes β̂/Var/z² into
-/// ws.{betas,var_diag,t_sq}; returns the GlmmFit summary.
+/// Fit the clustered-logistic GLMM. `fill_packed_cols` must already have run (a
+/// no-op off the packed layout, whose buffers are zero-length) for this
+/// (X, ids, N). `beta_start` = spec.effect_sizes. Writes β̂/Var/z² into
+/// `ws.betas`, `ws.inference.var_diag`, `ws.inference.t_sq`; returns the GlmmFit summary.
 ///
 /// Convention: `wald_se` selects the fixed-effect covariance — `WaldSe::Rx`
 /// inverts the expected-information Schur complement directly (assumes β–θ
@@ -347,10 +366,13 @@ pub enum FdHessianStatus {
 /// `THETA_TRUTH_FLOOR`/`BETA_BOX` clamps as any other start, regardless of
 /// which route produced it.
 ///
-/// Errors: no `Result` — non-convergence (BOBYQA failure, a non-PD Schur, or the
-/// degenerate-fit guard tripping on an all-infeasible BOBYQA simplex) is
-/// reported through `GlmmFit`: `converged = false`, `boundary_hit = 2`, and
-/// every β̂/SE/deviance field NaN or `f64::INFINITY` (see `nan_fit`).
+/// Errors: no `Result`. An outer search that exhausts its evaluation budget
+/// (`Status::MaxFunReached`) still reports its incumbent through `GlmmFit`:
+/// `converged = false`, `boundary_hit = 2`, `pinned_components` empty, and the
+/// incumbent's β̂, SEs and deviance in the usual fields. Every other
+/// non-convergence (BOBYQA failure, a non-PD Schur, or the degenerate-fit
+/// guard tripping on an all-infeasible BOBYQA simplex) NaN-fills every
+/// β̂/SE/deviance field instead (`f64::NAN` or `f64::INFINITY`; see `nan_fit`).
 #[allow(clippy::too_many_arguments)]
 pub fn fit_glmm(
     ws: &mut GlmmWorkspace,
@@ -364,17 +386,16 @@ pub fn fit_glmm(
     n: usize,
     wald_se: WaldSe,
 ) -> GlmmFit {
-    // Backstop for a hand-built dense workspace: the dense GLMM path builds
-    // intercept-only extras (`build_z` emits no extra slope columns; `apply_lambda`
-    // / `build_packed_m` carry the per-eval debug_asserts). `classify_design`
-    // routes any extra-slope shape to Sparse, so this is unreachable through
-    // `fit_on`/`fit_warm` — it catches a caller that constructs `GlmmWorkspace`
-    // directly. Mirrors the same debug_assert in `apply_lambda` and
+    // Backstop for a hand-built workspace: the blocked and structured layouts
+    // build intercept-only extras (`build_packed_m` carries the per-eval
+    // debug_assert). `classify_design` routes any extra-slope shape to Sparse,
+    // so this is unreachable through `fit_on`/`fit_warm` — it catches a caller
+    // that constructs `GlmmWorkspace` directly. Mirrors the same debug_assert in
     // `build_packed_m` (`glmm/workspace.rs`) and `assemble_ranef_dense`
     // (`fit/common.rs`) — change together.
     assert!(
-        !ws.groupings.extra_slopes_any,
-        "dense GLMM entry: extra_slopes_any — slope-on-extra must route Sparse"
+        ws.layout == GlmmLayout::Packed || !ws.groupings.extra_slopes_any,
+        "GLMM entry: extra_slopes_any on a blocked or structured layout"
     );
     let (k, p, n_theta) = (ws.k, ws.p, ws.n_theta);
 
@@ -390,11 +411,19 @@ pub fn fit_glmm(
             // internally scaled θ̃ = s·θ (`LmmGroupings::set_slope_scales`), so the
             // forward map runs before the floor — which then floors the INTERNAL
             // diagonals, the same scale `PIN_THETA` tests.
-            // Stack-sized off the θ ceiling this dense route is bounded by
-            // (extras are intercept-only here — the `extra_slopes_any` assert
-            // above), so a warm loop pays no heap block for the forward map.
-            let mut s = [0.0_f64; crate::consts::MAX_THETA];
-            let s = &mut s[..n_theta];
+            // `MAX_THETA` is the dense envelope's vech ceiling, so the stack
+            // block covers every in-envelope shape and a warm loop pays no heap
+            // block for the forward map. The packed layout also takes designs
+            // past that ceiling (an over-envelope primary block, say), and those
+            // — off the warm-loop envelope by construction — take the `Vec`.
+            let mut stack = [0.0_f64; crate::consts::MAX_THETA];
+            let mut heap: Vec<f64>;
+            let s: &mut [f64] = if n_theta <= crate::consts::MAX_THETA {
+                &mut stack[..n_theta]
+            } else {
+                heap = vec![0.0; n_theta];
+                &mut heap
+            };
             ws.groupings.fill_theta_row_scales(s);
             for ((t, &v), &sc) in ws.params[..n_theta].iter_mut().zip(ts).zip(s.iter()) {
                 *t = v * sc;
@@ -408,7 +437,7 @@ pub fn fit_glmm(
             // blind θ₀ `GlmmWorkspace::new` builds (workspace.rs). The former
             // all-THETA0 start implied RE correlation +0.707 for every pair, and
             // on negative-correlation data that converges into the τ=0 boundary
-            // basin (mirror the 2026-07-11 sparse basin fix, `sparse/glmm.rs`).
+            // basin.
             for t in ws.params[..n_theta].iter_mut() {
                 *t = 0.0;
             }
@@ -443,17 +472,17 @@ pub fn fit_glmm(
     ws.pirls_exhausted = 0;
     ws.final_pirls_exhausted = false;
     ws.counters.reset();
-    ws.coup_mask = None; // CSR validity is per (fit, pinning mask): ids/z may differ across fits
-                         // Cluster-outer AGQ substrate: built once per fit (cluster_ids is fit-fixed),
-                         // ONLY in `parallel` builds — it exists as rayon's work-splitting substrate.
-                         // Serial builds always run the original node-outer loop: even with the
-                         // reweight hoist in agq_deviance, cluster-outer's residual per-cluster
-                         // overhead (loop restart + CSR gather) regresses many-tiny-cluster shapes
-                         // (observation-level REs: +12–16% measured on grouseticks (1|INDEX), 403
-                         // clusters × 1 row) while its serial cache win on large clusters is small
-                         // (−4% on cbpp), so the non-parallel hot path (batch loops) stays
-                         // byte-for-byte unchanged. The grid campaign's parallel pass owns the
-                         // decision of whether a rows-per-cluster dispatch can unlock the win.
+    ws.pattern.coup_mask = None; // CSR validity is per (fit, pinning mask): ids/z may differ across fits
+                                 // Cluster-outer AGQ substrate: built once per fit (cluster_ids is fit-fixed),
+                                 // ONLY in `parallel` builds — it exists as rayon's work-splitting substrate.
+                                 // Serial builds always run the original node-outer loop: even with the
+                                 // reweight hoist in agq_deviance, cluster-outer's residual per-cluster
+                                 // overhead (loop restart + CSR gather) regresses many-tiny-cluster shapes
+                                 // (observation-level REs: +12–16% measured on grouseticks (1|INDEX), 403
+                                 // clusters × 1 row) while its serial cache win on large clusters is small
+                                 // (−4% on cbpp), so the non-parallel hot path (batch loops) stays
+                                 // byte-for-byte unchanged. The grid campaign's parallel pass owns the
+                                 // decision of whether a rows-per-cluster dispatch can unlock the win.
     ws.cluster_rows = if cfg!(all(feature = "parallel", not(target_arch = "wasm32")))
         && ws.nagq > 1
         && ws.parallel_inner
@@ -474,17 +503,12 @@ pub fn fit_glmm(
     let family = ws.family;
     let nb_theta = ws.nb_theta;
     let nagq = ws.nagq;
-    // Always false in production; test-only escape hatch for the both-paths
-    // cross-check (`ws.force_dense_schur`), threaded through both the BOBYQA
-    // objective and the pinned-γ̂ re-eval below so a fit-level comparison (not just
-    // a single deviance eval) exercises the dense factor/solve end to end.
-    let force_dense_schur = ws.force_dense_schur;
     // Outer search route for this shape (`OuterSearch`). Read before the
     // destructure moves `ws`'s fields out by mutable reference; the enum is Copy
     // so this is a plain read.
     let route = ws.outer_search;
     debug_assert!(
-        route != OuterSearch::ExactProfile || exact_profile_shape(family, nagq, &ws.groupings),
+        route != OuterSearch::ExactProfile || exact_profile_shape(family, nagq, ws.layout),
         "ExactProfile requested on a shape without an exact profile"
     );
     // Which `BetaMode` stage 1 profiles β with, or `None` to skip stage 1 entirely
@@ -508,70 +532,60 @@ pub fn fit_glmm(
         lower,
         upper,
         groupings,
-        agq_scratch,
         cluster_rows,
-        z,
-        m,
+        layout,
         prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
         u_seed,
-        eta_fixed,
-        mu,
-        wm,
         wx,
-        a,
-        a_chol,
-        a_llt_mem,
-        a_rhs,
-        a_blocks,
-        core_blocks,
-        coupling,
-        schur_blk,
-        lam,
+        pirls,
+        packed,
+        structured,
+        pattern,
         z_buf,
-        m_buf,
-        m_core_buf,
-        cross_val,
-        cross_col,
-        n_cross,
-        coup_cols,
-        coup_ptr,
-        coup_mask,
-        structured_schur,
-        xtwx,
-        xtwm,
-        ainv_mtwx,
-        schur,
-        schur_llt_mem,
+        border,
         beta_prof,
         beta_seed,
-        beta_prev,
         exact_prof,
         p: pf,
         pirls_exhausted,
         counters,
         ..
     } = ws;
-    // Joint vector's trailing `ln θ_NB` index — named apart from the destructured
-    // `m` above (`ws.m`, the ZΛ design) to avoid shadowing it.
+    // Joint vector's trailing `ln θ_NB` index.
     let nb_col = n_theta + p;
     // x is fixed for this fit: widen the slope columns to f64 once (blocked AND
     // structured paths — `build_packed_m`'s primary-core reduction reads it the
     // same way `pirls_solve_blocked`'s does), so every BOBYQA eval's per-solve M
-    // fill runs MatRef-free. The dense-fallback path skips it: it never reads
-    // z_buf (it reads `x` through `z`/`apply_lambda` instead). `se.rs`'s
-    // `joint_hessian_cov` mirrors this same hoist for its own FD deviance evals.
-    if groupings.extra_offsets.is_empty() || groupings.structured_extras_eligible() {
+    // fill runs MatRef-free. The packed layout skips it: it never reads z_buf
+    // (`fill_m_vals` reads `x` directly). `se.rs`'s `joint_hessian_cov` mirrors
+    // this same hoist for its own FD deviance evals.
+    if *layout != GlmmLayout::Packed {
         fill_z_f64(groupings, x, z_buf, n);
     }
+    // Read-only design view every `laplace_deviance` call below shares — see
+    // [`FitData`]. Borrows `groupings`/`z_buf`/`prior_w` only for the lifetime
+    // of this destructure's borrow of the workspace; the pinned γ̂ re-evaluation
+    // builds its own view from a fresh workspace destructure.
+    let data = FitData {
+        family,
+        groupings,
+        layout: *layout,
+        x,
+        y,
+        prior_w: &prior_w[..n],
+        weighted,
+        cluster_ids,
+        extra_ids,
+        z_buf,
+        offset,
+        n,
+        p: *pf,
+    };
 
     // NB marginal objective: `dev(θ_RE, β, θ_NB) − 2·nb_profile_loglik(y, y, θ_NB, w)`,
-    // the golden-section bracket's `logL_marginal` times −2, so the optimum is the
-    // same point; the saturated term depends on θ_NB alone. Same weights the
+    // the `logL_marginal` the GLM θ profile (`fit::optimize_nb_theta`) maximizes,
+    // times −2, so the optimum is the same point; the saturated term depends on
+    // θ_NB alone. Same weights the
     // deviance carries (`prior_w`, when `weighted`).
     let nb_term = |ln_theta: f64| -> f64 {
         -2.0 * crate::fit::nb_profile_loglik(
@@ -631,7 +645,7 @@ pub fn fit_glmm(
             // û is point-determined given θ, and β is likewise point-determined
             // (the PQL β̂(θ)); the incumbent seed only shifts the stopping iterate
             // within tol — the same argument that justifies the u_seed warm start.
-            u[..k].copy_from_slice(&u_seed[..k]);
+            pirls.u[..k].copy_from_slice(&u_seed[..k]);
             beta_prof[..p].copy_from_slice(&beta_seed[..p]);
             // Profile mode SWAPS the β buffers vs the Fixed stage-2 call below:
             // `beta = beta_prof` (in/out profiled β), `beta_step_rhs = beta_rhs`
@@ -642,61 +656,22 @@ pub fn fit_glmm(
                 (nb_theta, None)
             };
             let dev = laplace_deviance(
-                family,
+                &data,
                 nb,
                 nagq,
-                groupings,
                 &theta[..n_theta],
                 beta_prof,
-                z.as_ref(),
-                m,
-                lam,
-                z_buf,
-                m_buf,
-                x,
-                y,
-                &prior_w[..n],
-                weighted,
-                cluster_ids,
-                extra_ids,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                mu,
-                wm,
                 wx,
-                a,
-                a_chol,
-                a_llt_mem,
-                a_rhs,
-                a_blocks,
-                core_blocks,
-                coupling,
-                schur_blk,
-                m_core_buf,
-                cross_val,
-                cross_col,
-                n_cross,
-                coup_cols,
-                coup_ptr,
-                coup_mask,
-                structured_schur.as_mut(),
-                force_dense_schur,
-                agq_scratch,
-                xtwx,
-                xtwm,
-                ainv_mtwx,
-                // Stage 1 writes ws.schur via the Profile S_β border; the post-fit
-                // SE path runs AFTER stage 2 and its dense/blocked/structured
-                // schur_fill rebuilds ws.schur from scratch, so this transient use
+                pirls,
+                structured,
+                pattern,
+                packed,
+                // Stage 1 writes ws.border.schur via the Profile S_β border; the post-fit
+                // SE path runs AFTER stage 2 and its blocked/structured/packed
+                // schur_fill rebuilds ws.border.schur from scratch, so this transient use
                 // is safe (no read survives into inference).
-                schur,
-                schur_llt_mem,
+                border,
                 beta_rhs,
-                beta_prev,
                 exact_prof,
                 // `mode` is `ProfilePql` on `PqlThenJoint`, `ProfileExact` on
                 // `ExactProfile` — the two routes that reach this block.
@@ -704,10 +679,7 @@ pub fn fit_glmm(
                 // Never the FD-pass tol here — stage-1 objective evals stay at
                 // `pirls_tol` (the field is None outside `joint_hessian_cov`).
                 None,
-                *pf,
-                n,
                 cluster_rows.as_ref(),
-                offset,
                 pirls_exhausted,
                 counters,
             );
@@ -722,7 +694,7 @@ pub fn fit_glmm(
                 *best = obj;
                 // INCUMBENT-gated snapshot — snapshot only on strict
                 // improvement, NOT every eval.
-                u_seed[..k].copy_from_slice(&u[..k]);
+                u_seed[..k].copy_from_slice(&pirls.u[..k]);
                 beta_seed[..p].copy_from_slice(&beta_prof[..p]);
             }
             counters.record_eval(crate::counters::Stage::One, obj);
@@ -762,6 +734,11 @@ pub fn fit_glmm(
         stage1_out = Some(out1);
     }
 
+    // `budget_exhausted` drives the plateau policy mirrored from `fit_lmm`
+    // (`src/lmm/mod.rs`): a
+    // `Status::MaxFunReached` exit reports its finite incumbent below with
+    // `converged == false` and `boundary_hit == 2` rather than NaN-filling.
+    let budget_exhausted;
     let (ok, n_eval) = if route == OuterSearch::ExactProfile {
         // ExactProfile: stage 1 IS the search — θ-only BOBYQA on the exact Laplace profile.
         // `params` already holds [θ̂ | β̂] (the incumbent snapshot written above);
@@ -769,8 +746,11 @@ pub fn fit_glmm(
         // incumbent-gated snapshot is already the final conditional mode.
         let o = stage1_out.as_ref().expect("ExactProfile runs stage 1");
         debug_assert!(o.status != Status::InvalidArgs);
+        budget_exhausted = matches!(o.status, Status::MaxFunReached);
         (
-            matches!(o.status, Status::Converged) && best1.is_finite() && finite_evals1 >= 2,
+            matches!(o.status, Status::Converged | Status::MaxFunReached)
+                && best1.is_finite()
+                && finite_evals1 >= 2,
             o.n_eval,
         )
     } else {
@@ -782,77 +762,35 @@ pub fn fit_glmm(
                 // Within-fit û warm-start: seed PIRLS from the incumbent (best point so
                 // far), not from 0. The conditional mode is point-determined, so the seed
                 // only shifts the stopping iterate within the PIRLS exit band.
-                u[..k].copy_from_slice(&u_seed[..k]);
+                pirls.u[..k].copy_from_slice(&u_seed[..k]);
                 let (nb, coord) = if n_nb == 1 {
                     (gamma[nb_col].exp(), Some(gamma[nb_col]))
                 } else {
                     (nb_theta, None)
                 };
                 let dev = laplace_deviance(
-                    family,
+                    &data,
                     nb,
                     nagq,
-                    groupings,
                     gamma,
                     beta_rhs,
-                    z.as_ref(),
-                    m,
-                    lam,
-                    z_buf,
-                    m_buf,
-                    x,
-                    y,
-                    &prior_w[..n],
-                    weighted,
-                    cluster_ids,
-                    extra_ids,
-                    eta,
-                    prob,
-                    w,
-                    u,
-                    u_prev,
-                    eta_fixed,
-                    mu,
-                    wm,
                     wx,
-                    a,
-                    a_chol,
-                    a_llt_mem,
-                    a_rhs,
-                    a_blocks,
-                    core_blocks,
-                    coupling,
-                    schur_blk,
-                    m_core_buf,
-                    cross_val,
-                    cross_col,
-                    n_cross,
-                    coup_cols,
-                    coup_ptr,
-                    coup_mask,
-                    structured_schur.as_mut(),
-                    force_dense_schur,
-                    agq_scratch,
-                    xtwx,
-                    xtwm,
-                    ainv_mtwx,
-                    schur,
-                    schur_llt_mem,
+                    pirls,
+                    structured,
+                    pattern,
+                    packed,
                     // The `Joint` polish's objective is β-FIXED; the Profile border
                     // scratch is inert. `beta_prof` is the spare distinct buffer
                     // (`beta_rhs` is `beta` above). Stage 1 above flips this to Profile
                     // (`ProfilePql` or `ProfileExact`, by `stage1_mode`).
+                    border,
                     beta_prof,
-                    beta_prev,
                     exact_prof,
                     BetaMode::Fixed,
                     // Never the FD-pass tol here — BOBYQA objective evals stay at
                     // `pirls_tol` (the field is None outside `joint_hessian_cov`).
                     None,
-                    *pf,
-                    n,
                     cluster_rows.as_ref(),
-                    offset,
                     pirls_exhausted,
                     counters,
                 );
@@ -865,7 +803,7 @@ pub fn fit_glmm(
                 }
                 if obj < best_obj {
                     best_obj = obj;
-                    u_seed[..k].copy_from_slice(&u[..k]);
+                    u_seed[..k].copy_from_slice(&pirls.u[..k]);
                 }
                 counters.record_eval(crate::counters::Stage::Two, obj);
                 obj
@@ -876,32 +814,64 @@ pub fn fit_glmm(
         );
 
         debug_assert!(out.status != Status::InvalidArgs);
+        budget_exhausted = matches!(out.status, Status::MaxFunReached);
         // Reported eval count is stage 1 + stage 2 (0 + stage 2 on the `Joint` route,
         // so byte-identical to a single-stage run). Only stage 2's status feeds `converged`.
         (
-            matches!(out.status, Status::Converged) && best_obj.is_finite() && finite_evals2 >= 2,
+            matches!(out.status, Status::Converged | Status::MaxFunReached)
+                && best_obj.is_finite()
+                && finite_evals2 >= 2,
             n_eval_stage1 + out.n_eval,
         )
     };
 
     // NB: the incumbent's dispersion becomes the workspace's fixed θ_NB for
-    // everything downstream — the KKT gradient, the pinned re-eval, the SE path —
-    // which all read `ws.nb_theta` the way they read it for a fixed-θ fit.
+    // everything downstream — the pinned re-eval, the SE path — which all read
+    // `ws.nb_theta` the way they read it for a fixed-θ fit.
     if n_nb == 1 {
         ws.nb_theta = ws.params[nb_col].exp();
     }
     let nb_theta = ws.nb_theta;
+    // The reported deviance's NB correction: `−2·saturated_loglik(θ̂)`, NOT
+    // `nb_term(θ̂)`. `nb_term` (used above, inside the search only) is
+    // `−2·nb_profile_loglik(y,y,θ,w)`, which differs from `−2·saturated_loglik`
+    // by the θ-independent constant `2·Σwᵢ·lgamma(yᵢ+1)` — irrelevant to an
+    // argmin, so the search keeps using `nb_term` unchanged, but wrong by that
+    // constant if reused here, where the exact value is what makes
+    // `deviance = −2·loglik` hold. Cached now, as a plain f64: this reads
+    // `prior_w` out of the destructure above, a borrow the pinned re-eval's own
+    // reborrow of `ws.prior_w` further down cannot coexist with.
+    let nb_dev_term = if n_nb == 1 {
+        -2.0 * crate::family::saturated_loglik(
+            family,
+            nb_theta,
+            y,
+            weighted.then_some(&prior_w[..n]),
+        )
+    } else {
+        0.0
+    };
 
     // Sign canonicalization first, then the per-component diagonal pin (β never
     // pins) — mirror `fit_lmm`, `src/lmm/mod.rs`; change together. `diag`
     // borrows ws.groupings; the loop mutates the disjoint field ws.params, so
-    // no clone is needed.
+    // no clone is needed. `ok` is true on both a converged fit and a
+    // budget-exhausted one, so the pin below applies to any reported
+    // endpoint; `pinned`/`pinned_components` are still latched here on both,
+    // but only survive into the returned `GlmmFit` on a converged fit — a
+    // budget-exhausted exit zeroes `pinned_components` at assembly.
     if ok {
         // The modes flip with their columns (`fix_mode_signs`), before the θ
-        // flip clears the signs that reads: `ws.u` seeds the gradient's mode
-        // solve below, `ws.u_seed` the pinned re-eval.
-        crate::lmm::fix_mode_signs(&ws.groupings, &ws.params[..n_theta], &mut ws.u, false);
-        crate::lmm::fix_mode_signs(&ws.groupings, &ws.params[..n_theta], &mut ws.u_seed, false);
+        // flip clears the signs that reads: `ws.u_seed` seeds the pinned re-eval.
+        // The packed layout orders the primary block slope-major; blocked and
+        // structured order it level-major.
+        let primary_slope_major = ws.layout == GlmmLayout::Packed;
+        crate::lmm::fix_mode_signs(
+            &ws.groupings,
+            &ws.params[..n_theta],
+            &mut ws.u_seed,
+            primary_slope_major,
+        );
         crate::lmm::fix_column_signs(&ws.groupings, &mut ws.params[..n_theta]);
     }
     let diag = ws.groupings.diagonal_theta();
@@ -922,8 +892,7 @@ pub fn fit_glmm(
         // The flags are rebuilt from scratch, not OR'd: the fold can retire a
         // component that pinned only as a degenerate coordinate. Nothing moves
         // unless a diagonal pinned, so an interior fit stays bit-identical, and
-        // both the score block and the pinned re-eval below see the
-        // canonicalized θ.
+        // the pinned re-eval below sees the canonicalized θ.
         if crate::lmm::canonicalize_pinned_blocks(&ws.groupings, &mut ws.params[..n_theta]) {
             pinned = false;
             pinned_components = 0;
@@ -937,143 +906,6 @@ pub fn fit_glmm(
                 }
             }
         }
-    }
-
-    // KKT residual at the accepted (pinned) γ̂. Available only where the exact
-    // gradient is — the shapes `derivative::supports_shape` accepts, i.e. the
-    // blocked path and the structured extras path; NaN elsewhere, which
-    // includes a refused Hessian below, since there is no gradient retry.
-    // Read at `Fit` assembly, never by a fitting decision. This runs
-    // on BOTH `WaldSe` arms: it is a statement about the optimum, not the
-    // covariance.
-    //
-    // Placed BEFORE the pinned re-eval below, deliberately: `laplace_gradient`
-    // runs its own f64 mode solve, which perturbs the PIRLS state (W̃, μ̂, block
-    // factors, and on the structured route `core_blocks`/`coupling`/`schur_blk`)
-    // and restores only `ws.u` — and the Rx Schur reads that state.
-    // The pinned re-eval rebuilds every one of those buffers as a pure function
-    // of (params, u_seed, design), so running the gradient first leaves the
-    // post-re-eval state bit-identical to a build without this block, on the
-    // structured route as much as the blocked one. Measured
-    // the other way round (gradient after the re-eval): `se_rx` moved at
-    // ~1e-10 relative on every blocked derivative rung of the bit-identity dump.
-    //
-    // NaN-for-non-converged is enforced at the `Fit` read (`fit/glmm.rs`), not
-    // here — every `ok` path reaching the assembly reports this measurement.
-    //
-    // The second number, the variance-component score at each pinned diagonal,
-    // is ½·∂²D/∂θ_jj² at γ̂ — dD/ds at s = θ_jj² = 0. This equals the score
-    // only where the deviance is even in θ_jj at θ_jj = 0, which holds iff Λ's
-    // column j has no non-zero entry below the diagonal (`Σ_kj` for k > j
-    // carries `Λ_kj·Λ_jj`, linear in `Λ_jj`, so a non-zero `Λ_kj` breaks
-    // evenness). `canonicalize_pinned_blocks` above zeroes that column, so
-    // evenness holds at every pinned diagonal and
-    // `LmmGroupings::diagonal_has_nonzero_below` is only a defence below;
-    // positive ⇒ the boundary is the constrained optimum. The design doc's
-    // `s_j = θ_jj²` construction.
-    //
-    // `h` is the RAW joint Hessian over (θ, β) and no Schur complement is
-    // taken, which is right on the `ExactProfile` route as much as on `Joint`.
-    // Evenness in θ_jj holds for EVERY β and every other θ, not just at the
-    // optimum, so ∂D/∂θ_jj is odd in θ_jj and vanishes identically on the
-    // whole slice θ_jj = 0 — hence the entire Hessian row `H_θ_jj ·` is zero
-    // off the diagonal, β columns included, and `H_θθ − H_θβ H_ββ⁻¹ H_βθ`
-    // agrees with `H_θθ` on this entry exactly (measured 2026-09-09: the
-    // correction is 0 on Laplace, ~1e-64 against a diagonal of 48 on AGQ).
-    // This rests on the column below the pinned diagonal being zero — the
-    // canonical form is what guarantees that, so a change that reported a
-    // score without it would make the profiled correction live again.
-    //
-    // The score is opt-in (`FitOptions::boundary_score`, read here as
-    // `ws.boundary_score_requested`). It needs the hyper-dual Hessian — three
-    // hyper-dual PIRLS steps at roughly 100× the cost of an f64 step each —
-    // which nothing else on the `WaldSe::Rx` arm needs, and on a small pinned
-    // warm refit that pass costs about as much as the fit itself (measured
-    // 2026-09-02, 96-row binomial-logit intercept fixture, Rx, 200 warm refits
-    // per pass, min of 3 passes on a clock-locked core: 242 µs/fit with the
-    // score, 181 µs/fit without). An unrequested score leaves the same NaN an
-    // unpinned fit does; `kkt_grad_norm` is still measured from the gradient.
-    //
-    // When it is requested, ONE kernel call serves both numbers:
-    // `laplace_hessian` returns the gradient too, and a separate
-    // `laplace_gradient` call first would leave a `Dual` scratch that the
-    // Hessian call rebuilds as `HyperDual` — two full scratch builds per fit on
-    // every pinned warm refit (measured as an 884-vs-124-block regression of
-    // `fit_glmm_warm_path_bounded_alloc`). Every other fit calls the gradient
-    // alone. `ws.hess_scratch` is reusable here: nothing has written it this
-    // fit, and the `WaldSe::Hessian` arm below overwrites it wholesale, so the
-    // two uses cannot interleave.
-    ws.kkt_grad_norm = f64::NAN;
-    for v in ws.boundary_score.iter_mut() {
-        *v = f64::NAN;
-    }
-    // The one owner is `derivative::supports_shape` — do not inline this test.
-    if ok && derivative::supports_shape(&ws.groupings) {
-        let mut g = std::mem::take(&mut ws.grad_scratch);
-        let mut got_grad = false;
-        if pinned && ws.boundary_score_requested {
-            let mut h = std::mem::replace(&mut ws.hess_scratch, Mat::zeros(0, 0));
-            let st =
-                derivative::laplace_hessian(ws, x, y, cluster_ids, extra_ids, p, n, &mut g, &mut h);
-            if matches!(st, DerivStatus::Ok(_)) {
-                got_grad = true;
-                let mut sc = [0.0_f64; crate::consts::MAX_THETA];
-                let sc = &mut sc[..n_theta];
-                ws.groupings.fill_theta_row_scales(sc);
-                let diag = ws.groupings.diagonal_theta();
-                for (kk, &ti) in diag.iter().enumerate() {
-                    if kk < u64::BITS as usize
-                        && (pinned_components >> kk) & 1 == 1
-                        && !ws
-                            .groupings
-                            .diagonal_has_nonzero_below(kk, &ws.params[..n_theta])
-                    {
-                        // `h` is a faer Mat<f64>, so the diagonal entry is
-                        // h[(ti, ti)] — the same indexing the FD grid uses in
-                        // se.rs. Back-map to the caller's variance coordinate:
-                        // s = θ_jj² and θ̃ = sc·θ, so s̃ = sc²·s and
-                        // dD/ds = sc²·dD/ds̃ — the score is a SECOND
-                        // derivative, so it takes the SQUARE of the scale
-                        // where the KKT gradient takes it once.
-                        ws.boundary_score[ti] = 0.5 * h[(ti, ti)] * sc[ti] * sc[ti];
-                    }
-                }
-            }
-            ws.hess_scratch = h;
-        } else {
-            let st = derivative::laplace_gradient(ws, x, y, cluster_ids, extra_ids, p, n, &mut g);
-            got_grad = matches!(st, DerivStatus::Ok(_));
-        }
-        if got_grad {
-            // θ row scales, same stack-sized fill the θ₀ forward map uses at
-            // the top of this function.
-            let mut sc = [0.0_f64; crate::consts::MAX_THETA];
-            let sc = &mut sc[..n_theta];
-            ws.groupings.fill_theta_row_scales(sc);
-            let mut acc = 0.0_f64;
-            for j in 0..n_theta {
-                let gj = g[j];
-                let (lo, hi) = (-crate::lmm::THETA_HI, crate::lmm::THETA_HI);
-                // Projected gradient on a box: at a bound, only the component
-                // pointing back INTO the box is a violation. Done in the
-                // INTERNAL θ̃, because that is where the box the optimizer
-                // searched lives (`blind_theta_and_bounds`).
-                let pj = if ws.params[j] <= lo {
-                    gj.min(0.0)
-                } else if ws.params[j] >= hi {
-                    gj.max(0.0)
-                } else {
-                    gj
-                };
-                // Back-map to the caller's θ: ∂D/∂θ = s·∂D/∂θ̃. A derivative
-                // MULTIPLIES by the scale where `stddev_se` divides by it
-                // (fit/glmm.rs) — same map, opposite side. Scales are > 0, so
-                // this changes no sign and no active set.
-                acc = acc.max((pj * sc[j]).abs());
-            }
-            ws.kkt_grad_norm = acc;
-        }
-        ws.grad_scratch = g;
     }
 
     // Re-evaluate at the (possibly pinned) γ̂ to refresh M, ũ, W̃. ws.params already
@@ -1092,128 +924,69 @@ pub fn fit_glmm(
     if ok {
         // Warm-start the pinned re-eval from the incumbent (its modes are the
         // inference iterate); u_seed holds the BOBYQA incumbent after minimize.
-        ws.u[..k].copy_from_slice(&ws.u_seed[..k]);
+        ws.pirls.u[..k].copy_from_slice(&ws.u_seed[..k]);
         let GlmmWorkspace {
             groupings,
             params,
             beta_rhs,
             p,
-            z,
-            m,
-            lam,
+            layout,
             z_buf,
-            m_buf,
             prior_w,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            wm,
+            pirls,
+            packed,
+            structured,
+            pattern,
             wx,
-            a,
-            a_chol,
-            a_llt_mem,
-            a_rhs,
-            a_blocks,
-            core_blocks,
-            coupling,
-            schur_blk,
-            m_core_buf,
-            cross_val,
-            cross_col,
-            n_cross,
-            coup_cols,
-            coup_ptr,
-            coup_mask,
-            structured_schur,
-            xtwx,
-            xtwm,
-            ainv_mtwx,
-            schur,
-            schur_llt_mem,
+            border,
             beta_prof,
-            beta_prev,
             exact_prof,
-            agq_scratch,
             cluster_rows,
             offset,
             ..
         } = ws;
         // Shadow the function-level `offset` borrow (taken before the BOBYQA
-        // destructure) with this destructure's own — the function-level one must
-        // die before the KKT block above, or `laplace_gradient(&mut ws)` cannot
-        // borrow the whole workspace.
+        // destructure) with this destructure's own, scoped to the pinned re-eval.
         let offset = offset.as_deref();
         // z_buf still holds this fit's slope copy — x is unchanged since fill_z_f64.
         // On the structured path this re-eval re-packs m_core_buf/cross_* at γ̂, which
-        // `structured_schur_fill` then reads (the dense `m` it formerly read is no
-        // longer maintained here).
-        final_deviance = laplace_deviance(
+        // `structured_schur_fill` then reads.
+        let data = FitData {
             family,
-            nb_theta,
-            nagq,
             groupings,
-            &params[..],
-            beta_rhs,
-            z.as_ref(),
-            m,
-            lam,
-            z_buf,
-            m_buf,
+            layout: *layout,
             x,
             y,
-            &prior_w[..n],
+            prior_w: &prior_w[..n],
             weighted,
             cluster_ids,
             extra_ids,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            wm,
+            z_buf,
+            offset,
+            n,
+            p: *p,
+        };
+        final_deviance = laplace_deviance(
+            &data,
+            nb_theta,
+            nagq,
+            &params[..],
+            beta_rhs,
             wx,
-            a,
-            a_chol,
-            a_llt_mem,
-            a_rhs,
-            a_blocks,
-            core_blocks,
-            coupling,
-            schur_blk,
-            m_core_buf,
-            cross_val,
-            cross_col,
-            n_cross,
-            coup_cols,
-            coup_ptr,
-            coup_mask,
-            structured_schur.as_mut(),
-            force_dense_schur,
-            agq_scratch,
-            xtwx,
-            xtwm,
-            ainv_mtwx,
-            schur,
-            schur_llt_mem,
+            pirls,
+            structured,
+            pattern,
+            packed,
+            border,
             // Pinned-γ̂ re-eval is β-FIXED (reports the fitted β); Profile border
             // scratch inert. `beta_prof` is the spare distinct buffer.
             beta_prof,
-            beta_prev,
             exact_prof,
             BetaMode::Fixed,
             // Never the FD-pass tol here — the pinned re-eval stays at `pirls_tol`
             // (the field is None outside `joint_hessian_cov`).
             None,
-            *p,
-            n,
             cluster_rows.as_ref(),
-            offset,
             &mut final_exhausted_count,
             &mut final_counters,
         );
@@ -1228,7 +1001,7 @@ pub fn fit_glmm(
     // that maps to `Status::Converged`. The marginal deviance recomputed at γ̂ above
     // is the honest witness: if it is non-finite the optimizer sat on the start and
     // this is not a converged fit. Step-halving in the PIRLS variants
-    // (`pirls_solve*`) recovers the grouseticks 3-crossed β=0 cold start, which
+    // (`pirls_solve_*`) recovers the grouseticks 3-crossed β=0 cold start, which
     // would otherwise overshoot into a ~1e30 weight regime and bail — so this
     // guard does not fire on that case. It remains the backstop for the genuinely
     // unrecoverable path: when halving is EXHAUSTED (`PIRLS_MAX_HALVINGS` reached)
@@ -1255,21 +1028,19 @@ pub fn fit_glmm(
     let mut hessian_fallback = false;
     // Reset the θ-block SE each fit (the workspace is reused across fits). Only the
     // Hessian arm's `joint_hessian_cov` refills it; the Rx arm leaves it NaN.
-    for v in ws.theta_se[..n_theta].iter_mut() {
+    for v in ws.inference.theta_se[..n_theta].iter_mut() {
         *v = f64::NAN;
     }
     let joint_t_sq = match wald_se {
         WaldSe::Rx => {
-            // Schur fill. No-extras reuses the per-block factors the blocked PIRLS
-            // left in ws.a_blocks; structured-eligible extras reuse the core+Schur
-            // factors the structured PIRLS left in ws.{core_blocks, schur_blk,
-            // coupling}; the dense fallback factors ws.a.
-            let inf_ok = if ws.groupings.extra_offsets.is_empty() {
-                blocked_schur_fill(ws, x, cluster_ids, n)
-            } else if ws.groupings.structured_extras_eligible() {
-                structured_schur_fill(ws, x, cluster_ids, n)
-            } else {
-                dense_schur_fill(ws, x, n)
+            // Schur fill. The blocked layout reuses the per-block factors the
+            // blocked PIRLS left in ws.pirls.a_blocks; the structured one reuses
+            // the core+Schur factors left in ws.structured.{core_blocks,
+            // schur_blk, coupling}; the packed one factors ws.packed.a.
+            let inf_ok = match ws.layout {
+                GlmmLayout::Blocked => blocked_schur_fill(ws, x, cluster_ids, n),
+                GlmmLayout::Structured => structured_schur_fill(ws, x, cluster_ids, n),
+                GlmmLayout::Packed => packed_schur_fill(ws, x, n),
             };
             if !inf_ok {
                 return nan_fit(ws, target_indices, n_eval);
@@ -1282,12 +1053,12 @@ pub fn fit_glmm(
             let sigma_sq = crate::family::glmm_sigma_sq(
                 family,
                 &y[..n],
-                &ws.prob[..n],
-                &ws.u[..ws.k],
+                &ws.pirls.prob[..n],
+                &ws.pirls.u[..ws.k],
                 ws.weighted.then(|| &ws.prior_w[..n]),
             );
             // Var(β̂)_jj from chol(Schur) forward-solve (mirrors fit_lmm's recovery).
-            let sc = match ws.schur.as_ref().llt(faer::Side::Lower) {
+            let sc = match ws.border.schur.as_ref().llt(faer::Side::Lower) {
                 Ok(c) => c,
                 Err(_) => return nan_fit(ws, target_indices, n_eval),
             };
@@ -1301,13 +1072,17 @@ pub fn fit_glmm(
                 for i in 0..p {
                     let mut acc = if i == tj { 1.0 } else { 0.0 };
                     for kk in 0..i {
-                        acc -= lschur[(i, kk)] * ws.fwd_solve[kk];
+                        acc -= lschur[(i, kk)] * ws.inference.fwd_solve[kk];
                     }
-                    ws.fwd_solve[i] = acc / lschur[(i, i)];
+                    ws.inference.fwd_solve[i] = acc / lschur[(i, i)];
                 }
-                let vd: f64 = ws.fwd_solve[..p].iter().map(|v| v * v).sum::<f64>() * sigma_sq;
-                ws.var_diag[tj] = vd;
-                ws.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
+                let vd: f64 = ws.inference.fwd_solve[..p]
+                    .iter()
+                    .map(|v| v * v)
+                    .sum::<f64>()
+                    * sigma_sq;
+                ws.inference.var_diag[tj] = vd;
+                ws.inference.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
                     ws.betas[tj] * ws.betas[tj] / vd
                 } else {
                     f64::NAN
@@ -1316,7 +1091,7 @@ pub fn fit_glmm(
                 // pairwise dots below are `vcov`'s off-diagonals — the same
                 // arithmetic `vd` takes the norm of, not thrown away.
                 for i in 0..p {
-                    ws.vcov_cols[(i, tj)] = ws.fwd_solve[i];
+                    ws.inference.vcov_cols[(i, tj)] = ws.inference.fwd_solve[i];
                 }
             }
             for &ta in target_indices {
@@ -1327,10 +1102,10 @@ pub fn fit_glmm(
                     }
                     let mut acc = 0.0;
                     for i in 0..p {
-                        acc += ws.vcov_cols[(i, a)] * ws.vcov_cols[(i, b)];
+                        acc += ws.inference.vcov_cols[(i, a)] * ws.inference.vcov_cols[(i, b)];
                     }
-                    ws.vcov[(a, b)] = acc * sigma_sq;
-                    ws.vcov[(b, a)] = acc * sigma_sq;
+                    ws.inference.vcov[(a, b)] = acc * sigma_sq;
+                    ws.inference.vcov[(b, a)] = acc * sigma_sq;
                 }
             }
             // Joint Wald-χ² via the lme helper (Schur is the β-information; σ̂²
@@ -1339,13 +1114,13 @@ pub fn fit_glmm(
                 f64::NAN
             } else {
                 crate::lmm::joint_wald_chi_sq(
-                    ws.schur.as_ref(),
+                    ws.border.schur.as_ref(),
                     &ws.betas,
                     sigma_sq,
                     target_indices,
-                    ws.joint_k_inv.as_mut(),
-                    ws.joint_sigma_t_chol.as_mut(),
-                    &mut ws.joint_rhs,
+                    ws.inference.joint_k_inv.as_mut(),
+                    ws.inference.joint_sigma_t_chol.as_mut(),
+                    &mut ws.inference.joint_rhs,
                 )
             }
         }
@@ -1367,8 +1142,8 @@ pub fn fit_glmm(
             for &tj in target_indices {
                 let tj = tj as usize;
                 let vd = cov[(tj, tj)];
-                ws.var_diag[tj] = vd;
-                ws.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
+                ws.inference.var_diag[tj] = vd;
+                ws.inference.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
                     ws.betas[tj] * ws.betas[tj] / vd
                 } else {
                     f64::NAN
@@ -1392,14 +1167,14 @@ pub fn fit_glmm(
                     if b > a {
                         continue;
                     }
-                    ws.vcov[(a, b)] = cov[(a, b)];
-                    ws.vcov[(b, a)] = cov[(a, b)];
+                    ws.inference.vcov[(a, b)] = cov[(a, b)];
+                    ws.inference.vcov[(b, a)] = cov[(a, b)];
                 }
             }
             // Joint Wald-χ²: `joint_wald_chi_sq` expects the β-INFORMATION (it inverts
             // and sub-blocks internally), so pass info = cov⁻¹. Write cov⁻¹ into the
-            // now-free ws.schur (schur_fill was skipped on this arm) and reuse the
-            // helper verbatim — same faer LLT-inverse idiom as `rx_cov_into`.
+            // now-free ws.border.schur (schur_fill was skipped on this arm) and reuse
+            // the helper verbatim — same faer LLT-inverse idiom as `rx_cov_into`.
             if target_indices.is_empty() {
                 f64::NAN
             } else {
@@ -1410,17 +1185,17 @@ pub fn fit_glmm(
                         chol.solve_in_place(inv.as_mut());
                         for a in 0..p {
                             for b in 0..p {
-                                ws.schur[(a, b)] = inv[(a, b)];
+                                ws.border.schur[(a, b)] = inv[(a, b)];
                             }
                         }
                         crate::lmm::joint_wald_chi_sq(
-                            ws.schur.as_ref(),
+                            ws.border.schur.as_ref(),
                             &ws.betas,
                             1.0,
                             target_indices,
-                            ws.joint_k_inv.as_mut(),
-                            ws.joint_sigma_t_chol.as_mut(),
-                            &mut ws.joint_rhs,
+                            ws.inference.joint_k_inv.as_mut(),
+                            ws.inference.joint_sigma_t_chol.as_mut(),
+                            &mut ws.inference.joint_rhs,
                         )
                     }
                     Err(_) => f64::NAN,
@@ -1432,33 +1207,45 @@ pub fn fit_glmm(
     // τ̂² = D̂[0][0] = (Λ̂Λ̂')[0][0]. No σ² (binomial). For lower-tri Λ_p stored
     // row-major (lam[r*q + c]), row 0 has only the (0,0) entry nonzero, so
     // D̂[0][0] = Σ_c Λ[0,c]² = Λ[0,0]² — the random-INTERCEPT variance.
-    crate::lmm::primary_lambda(&ws.params[..n_theta], ws.groupings.primary_q, &mut ws.lam);
+    crate::lmm::primary_lambda(
+        &ws.params[..n_theta],
+        ws.groupings.primary_q,
+        &mut ws.pirls.lam,
+    );
     let q = ws.groupings.primary_q;
     let mut d00 = 0.0;
     for r in 0..q {
-        d00 += ws.lam[r] * ws.lam[r];
+        d00 += ws.pirls.lam[r] * ws.pirls.lam[r];
     }
     GlmmFit {
-        converged: true,
-        boundary_hit: u8::from(pinned),
-        pinned_components,
+        converged: !budget_exhausted,
+        boundary_hit: if budget_exhausted {
+            2
+        } else {
+            u8::from(pinned)
+        },
+        pinned_components: if budget_exhausted {
+            0
+        } else {
+            pinned_components
+        },
         n_eval,
         #[cfg(feature = "counters")]
         counters: ws.counters,
         tau_squared_hat: d00,
         joint_t_sq,
         hessian_fallback,
-        deviance: final_deviance,
+        deviance: final_deviance + nb_dev_term,
     }
 }
 
-/// NaN-fill `ws.vcov` — the workspace is reused across fits, so every SE arm
+/// NaN-fill `ws.inference.vcov` — the workspace is reused across fits, so every SE arm
 /// clears it before writing its target block; entries outside that block stay
 /// NaN, keeping `vcov` finite exactly where `var_diag` is.
 fn nan_fill_vcov(ws: &mut GlmmWorkspace, p: usize) {
     for a in 0..p {
         for b in 0..p {
-            ws.vcov[(a, b)] = f64::NAN;
+            ws.inference.vcov[(a, b)] = f64::NAN;
         }
     }
 }
@@ -1472,8 +1259,8 @@ fn nan_fit(ws: &mut GlmmWorkspace, targets: &[u32], n_eval: usize) -> GlmmFit {
     let p = ws.betas.len();
     nan_fill_vcov(ws, p);
     for &t in targets {
-        ws.var_diag[t as usize] = f64::NAN;
-        ws.t_sq[t as usize] = f64::NAN;
+        ws.inference.var_diag[t as usize] = f64::NAN;
+        ws.inference.t_sq[t as usize] = f64::NAN;
     }
     GlmmFit {
         converged: false,

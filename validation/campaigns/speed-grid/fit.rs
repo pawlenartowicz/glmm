@@ -151,15 +151,10 @@ fn config_tag(lo: &glmm::formula::Lowered, gaussian: bool, user_tag: &str) -> St
         (false, false) => "glmm",
     };
     let npt = std::env::var("LMM_NPT_FORMULA").unwrap_or_else(|_| "shipped".into());
-    let two = if std::env::var("LMM_TWO_STAGE").is_ok() {
-        ":2stage"
-    } else {
-        ""
-    };
     if user_tag.is_empty() {
-        format!("{site}:{npt}{two}")
+        format!("{site}:{npt}")
     } else {
-        format!("{site}:{npt}{two}:{user_tag}")
+        format!("{site}:{npt}:{user_tag}")
     }
 }
 

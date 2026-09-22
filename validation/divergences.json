@@ -1,40 +1,5 @@
 {
   "//": "Documented divergences from the reference engines. The rules this file plays by \u2014 what makes an entry green, what still fails, and why a stale entry fails too \u2014 are written once in validation/README.md under 'Documented divergences'. Read them there; they are deliberately not restated here. Consumers: validation/compare.R and the in-crate cross-engine tier (tests/oracle_support). `summary` is the standalone short form, so an entry means something without the long-form review.",
   "//fields": "id: stable key. dataset/rung: which fixture (rung is null on an m3_goldens cell, which has no manifest rung). comparison: 'lme4-vs-glmm' for compare.R's reference table, 'oracle-tier' for the in-crate goldens tier; an entry may list both. quantities: the comparison labels each consumer uses. max_rel: the largest relative difference the entry covers \u2014 an observation exceeding it FAILS, so a divergence that grows is not silently absorbed. direction: which way the criterion moved.",
-  "entries": [
-    {
-      "id": "rung24-gamma-basin-under-re-scaling",
-      "dataset": "sim_sparse_gamma",
-      "rung": 24,
-      "comparison": [
-        "lme4-vs-glmm",
-        "oracle-tier"
-      ],
-      "quantities": [
-        "beta"
-      ],
-      "max_rel": 0.007,
-      "direction": "glmm's criterion is 1.55937e-04 deviance WORSE than lme4's (3427.047732 vs lme4's 3427.047576), measured fresh against the full 48-rung corpus on 2026-08-24 -- supersedes the stale 1.328578e-04 figure, which had compared glmm's post-scaling criterion against its own pre-scaling value rather than against lme4. This sits inside the corpus-wide dev_eps = 2e-4 deviance gate, so the divergence stands: a basin choice, not a regression.",
-      "summary": "Always-on random-effect design column scaling moves this rung's blind start, and its gamma surface is flat and multimodal enough that BOBYQA lands in a neighbouring basin. The scaling map itself is exact: at matched theta the scaled and unscaled objectives agree to <= 1.3e-14 relative on both the dense and sparse LMM routes, and the scaled sparse and dense objectives agree to <= 1.3e-14 with each other. So this is a basin choice on a shared objective, not an arithmetic disagreement \u2014 beta[0] 0.23137381978057783 against lme4's 0.230029021531563 (rel 5.812e-3, compare.R's rel_max metric: |x-y| over max(|x|,|y|,1e-12)). lme4's basin is the better one by 1.56e-4 deviance. The same rung's beta also drifts 3.3e-3 on aarch64 from cross-microarchitecture FP reassociation; the two observations likely want one answer, and the aarch64 side is not resolved here.",
-      "review": "pending user review; `summary` above is the standalone record"
-    },
-    {
-      "id": "sparse-nb-flat-surface-under-signed-box",
-      "dataset": "sim_sparse_nb",
-      "rung": null,
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "beta",
-        "c1 stddev",
-        "c4 stddev",
-        "c5 stddev"
-      ],
-      "max_rel": 0.002,
-      "direction": "glmm's criterion is 8.35e-05 deviance WORSE than lme4's (-2*loglik 1641.882252 vs lme4's 1641.882167), measured 2026-09-10 when every theta coordinate got the signed box [-THETA_HI, THETA_HI]; before that change the gap was 1.7e-06. Inside the corpus-wide dev_eps = 2e-4 deviance gate, so the divergence stands: a stopping point on a flat surface, not a regression.",
-      "summary": "The signed search box changes BOBYQA's interpolation set and trust-region steps on every fit; this rung has eight intercept-only random effects, no off-diagonal, so no sign is in play and only the path moved (on the sparse NB route ln theta_NB is bracketed by golden section to 1e-4 and the bracket's pick moved one resolution step with the inner endpoints). It ends 8.35e-5 deviance above lme4's optimum (1.7e-6 before). Over the 1e-3 band by the tier's |a-b|/max(|a|,|b|): beta[0] 0.5082257547641844 against lme4's 0.508973335305305 (rel 1.469e-3; 8.3e-4 before), and the c1 / c4 / c5 stddevs at rel 1.308e-3 / 1.400e-3 / 1.249e-3 (2.2e-5 / 8.1e-5 / 4.4e-5 before). Converged on both sides, not singular, 250 -> 259 evaluations. compare.R's |a-b|/(1+|b|) form gives 4.95e-4 on beta[0], under its band, so only the oracle-tier comparison carries the entry.",
-      "review": "pending user review; `summary` above is the standalone record"
-    }
-  ]
+  "entries": []
 }

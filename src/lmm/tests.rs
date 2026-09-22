@@ -3,6 +3,7 @@
 use super::kernel::{reml_gradient, reml_hessian, LmmDualScratch, LmmHyperScratch};
 use super::*;
 use crate::dual::Dual;
+use crate::fit::common_tests::lcg;
 use crate::glmm::DerivStatus;
 use crate::test_support::{extra_level_of_row, intercept_only_spec, model_atom};
 use crate::{Family, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing};
@@ -31,16 +32,6 @@ fn formula_eval_unclamped() {
     assert_eq!(eval_formula("500n500", 8), Some(4500));
     assert_eq!(eval_formula("2n1", 36), Some(73));
     assert_eq!(eval_formula("n2", 8), None); // mult is mandatory: write 1n2
-}
-
-/// Deterministic pseudo-data (NR LCG), uniform in (−1, 1). NR = Press,
-/// Teukolsky, Vetterling & Flannery (2007), *Numerical Recipes: The Art of
-/// Scientific Computing*, 3rd ed., Cambridge University Press.
-fn lcg(state: &mut u64) -> f64 {
-    *state = state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (((*state >> 11) as f64) / ((1u64 << 53) as f64)) * 2.0 - 1.0
 }
 
 /// n=48, p=3 (intercept + x1 + x2), 6 clusters,
@@ -177,17 +168,17 @@ fn reused_workspace_refill_matches_fresh() {
 
     // Fresh workspace, fit B directly.
     let mut ws_fresh = LmmWorkspace::new(3, 6);
-    ws_fresh.suff.reset();
-    ws_fresh.suff.add_rows(x.as_ref(), &y_b, &ids);
+    ws_fresh.suff_mut().reset();
+    ws_fresh.suff_mut().add_rows(x.as_ref(), &y_b, &ids);
     let fit_fresh = fit_lmm(&mut ws_fresh, &targets, None);
 
     // Reused workspace: fit A first, reset, refill with B, fit again.
     let mut ws_reused = LmmWorkspace::new(3, 6);
-    ws_reused.suff.reset();
-    ws_reused.suff.add_rows(x.as_ref(), &y_a, &ids);
+    ws_reused.suff_mut().reset();
+    ws_reused.suff_mut().add_rows(x.as_ref(), &y_a, &ids);
     let _ = fit_lmm(&mut ws_reused, &targets, None);
-    ws_reused.suff.reset();
-    ws_reused.suff.add_rows(x.as_ref(), &y_b, &ids);
+    ws_reused.suff_mut().reset();
+    ws_reused.suff_mut().add_rows(x.as_ref(), &y_b, &ids);
     let fit_reused = fit_lmm(&mut ws_reused, &targets, None);
 
     assert_eq!(
@@ -195,11 +186,11 @@ fn reused_workspace_refill_matches_fresh() {
         "deviance must be bit-identical after reset+refill on new data"
     );
     assert_eq!(
-        ws_fresh.fit.betas, ws_reused.fit.betas,
+        ws_fresh.recovery.betas, ws_reused.recovery.betas,
         "betas must be bit-identical after reset+refill on new data"
     );
     assert_eq!(
-        ws_fresh.fit.var_diag, ws_reused.fit.var_diag,
+        ws_fresh.recovery.var_diag, ws_reused.recovery.var_diag,
         "var_diag must be bit-identical after reset+refill on new data"
     );
 }
@@ -217,7 +208,7 @@ fn maxfun_cap_reports_honest_endpoint() {
     let targets: Vec<u32> = vec![1, 2];
 
     let mut ws = LmmWorkspace::new(3, 6);
-    ws.suff.add_rows(x.as_ref(), &y, &ids);
+    ws.suff_mut().add_rows(x.as_ref(), &y, &ids);
     let n_theta = ws.theta.len();
     let npt = 2 * n_theta + 1; // n_theta == 1 here: PRIMA's minimum npt
     let config = {
@@ -253,7 +244,7 @@ fn maxfun_cap_reports_honest_endpoint() {
     );
     for &tj in &targets {
         assert!(
-            ws.fit.betas[tj as usize].is_finite(),
+            ws.recovery.betas[tj as usize].is_finite(),
             "plateau policy: capped endpoint must not NaN-fill beta"
         );
     }
@@ -285,9 +276,9 @@ fn maxfun_cap_reports_honest_endpoint() {
     ];
     for (j, &wb) in want_betas.iter().enumerate() {
         assert!(
-            rel(ws.fit.betas[j], wb) < 1e-6,
+            rel(ws.recovery.betas[j], wb) < 1e-6,
             "betas[{j}] = {}, want {}",
-            ws.fit.betas[j],
+            ws.recovery.betas[j],
             wb
         );
     }
@@ -315,13 +306,13 @@ fn fit_matches_pinned_q1_endpoint_on_hand_dataset() {
     let targets: Vec<u32> = vec![1, 2];
 
     let mut ws = LmmWorkspace::new(3, 6);
-    ws.suff.add_rows(x.as_ref(), &y, &ids);
+    ws.suff_mut().add_rows(x.as_ref(), &y, &ids);
     let fit = fit_lmm(&mut ws, &targets, None);
     assert!(fit.converged);
     assert!(fit.boundary_hit <= 1);
 
     for (j, &want) in PINNED_BETAS.iter().enumerate() {
-        let (a, b) = (want, ws.fit.betas[j]);
+        let (a, b) = (want, ws.recovery.betas[j]);
         let d = (a - b).abs();
         assert!(
             d <= 1e-5 || d <= 1e-4 * a.abs().max(b.abs()),
@@ -330,7 +321,7 @@ fn fit_matches_pinned_q1_endpoint_on_hand_dataset() {
     }
     for (idx, &tj) in targets.iter().enumerate() {
         let a = PINNED_STATS[idx];
-        let b = ws.fit.t_sq[tj as usize].sqrt();
+        let b = ws.recovery.t_sq[tj as usize].sqrt();
         let d = (a - b).abs();
         assert!(
             d <= 1e-4 || d <= 1e-4 * a.abs().max(b.abs()),
@@ -370,12 +361,12 @@ fn zero_between_cluster_variance_pins_at_exactly_zero() {
         y[i] = 0.5 + 0.4 * x1 + e;
     }
     let mut ws = LmmWorkspace::new(2, n_clusters);
-    ws.suff.add_rows(x.as_ref(), &y, &ids);
+    ws.suff_mut().add_rows(x.as_ref(), &y, &ids);
     let fit = fit_lmm(&mut ws, &[1], None);
     assert!(fit.converged);
     assert_eq!(fit.boundary_hit, 1);
     assert_eq!(ws.theta[0], 0.0, "pin must be exact 0.0, not merely small");
-    assert!(ws.fit.betas[1].is_finite());
+    assert!(ws.recovery.betas[1].is_finite());
 }
 
 /// Rank deficiency is DETECTED, not refused, at kernel level: x2 = 0.1·x1
@@ -407,7 +398,7 @@ fn rank_deficient_design_is_flagged_not_refused() {
         y[i] = 0.5 + 0.4 * x1 + 0.8 * lcg(&mut st);
     }
     let mut ws = LmmWorkspace::new(3, n_clusters);
-    ws.suff.add_rows(x.as_ref(), &y, &ids);
+    ws.suff_mut().add_rows(x.as_ref(), &y, &ids);
     let fit = fit_lmm(&mut ws, &[1, 2], None);
     assert!(
         fit.pivot < PIVOT_MIN,
@@ -422,10 +413,10 @@ fn rank_deficient_design_is_flagged_not_refused() {
     // the coefficient is reported with an error eight orders larger than
     // itself. That is the channel a caller reads, and it does not lie.
     assert!(
-        ws.fit.var_diag[2].sqrt() > 1e6 * ws.fit.betas[2].abs(),
+        ws.recovery.var_diag[2].sqrt() > 1e6 * ws.recovery.betas[2].abs(),
         "β̂₂ = {} must carry an SE orders above it, got {}",
-        ws.fit.betas[2],
-        ws.fit.var_diag[2].sqrt()
+        ws.recovery.betas[2],
+        ws.recovery.var_diag[2].sqrt()
     );
 }
 
@@ -440,23 +431,49 @@ fn theta_start_some_matches_blind_fit() {
     let targets: Vec<u32> = vec![1, 2];
 
     let mut ws_blind = LmmWorkspace::new(3, 6);
-    ws_blind.suff.add_rows(x.as_ref(), &y, &ids);
+    ws_blind.suff_mut().add_rows(x.as_ref(), &y, &ids);
     let blind = fit_lmm(&mut ws_blind, &targets, None);
     assert!(blind.converged);
 
     for start in [[0.0], [0.6]] {
         let mut ws = LmmWorkspace::new(3, 6);
-        ws.suff.add_rows(x.as_ref(), &y, &ids);
+        ws.suff_mut().add_rows(x.as_ref(), &y, &ids);
         let fit = fit_lmm(&mut ws, &targets, Some(&start));
         assert!(fit.converged, "start {start:?}");
         for j in 0..3 {
-            let (a, b) = (ws_blind.fit.betas[j], ws.fit.betas[j]);
+            let (a, b) = (ws_blind.recovery.betas[j], ws.recovery.betas[j]);
             let d = (a - b).abs();
             assert!(
                 d <= 1e-5 || d <= 1e-4 * a.abs().max(b.abs()),
                 "start {start:?} β[{j}]: blind {a} vs started {b}"
             );
         }
+    }
+
+    // THETA_TRUTH_FLOOR clamp, directly: two raw starts on opposite sides of
+    // 0 but both below the floor (0.0 and 0.005, THETA_TRUTH_FLOOR = 0.01)
+    // must collapse to the identical internal starting point and so drive
+    // BOBYQA through a bit-for-bit identical search — n_eval, θ̂ and deviance
+    // all equal. Without the clamp the two starts differ from each other and
+    // from THETA_TRUTH_FLOOR, so BOBYQA's very first interpolation point
+    // would not agree between the two runs.
+    let mut ws_zero = LmmWorkspace::new(3, 6);
+    ws_zero.suff_mut().add_rows(x.as_ref(), &y, &ids);
+    let fit_zero = fit_lmm(&mut ws_zero, &targets, Some(&[0.0]));
+    assert!(fit_zero.converged);
+
+    let mut ws_below_floor = LmmWorkspace::new(3, 6);
+    ws_below_floor.suff_mut().add_rows(x.as_ref(), &y, &ids);
+    let fit_below_floor = fit_lmm(&mut ws_below_floor, &targets, Some(&[0.005]));
+    assert!(fit_below_floor.converged);
+
+    assert_eq!(fit_zero.n_eval, fit_below_floor.n_eval);
+    assert_eq!(
+        fit_zero.deviance.to_bits(),
+        fit_below_floor.deviance.to_bits()
+    );
+    for (a, b) in ws_zero.theta.iter().zip(&ws_below_floor.theta) {
+        assert_eq!(a.to_bits(), b.to_bits());
     }
 }
 
@@ -492,14 +509,14 @@ fn lmm_fit_warm_path_bounded_alloc() {
     let mut ws = LmmWorkspace::new(3, 6);
 
     // Warmup drives one-time setup outside the profiler window.
-    ws.suff.reset();
-    ws.suff.add_rows(x.as_ref(), &y, &ids);
+    ws.suff_mut().reset();
+    ws.suff_mut().add_rows(x.as_ref(), &y, &ids);
     let _ = fit_lmm(&mut ws, &targets, None);
 
     let profiler = dhat::Profiler::builder().testing().build();
     for _ in 0..N_CALLS {
-        ws.suff.reset();
-        ws.suff.add_rows(x.as_ref(), &y, &ids);
+        ws.suff_mut().reset();
+        ws.suff_mut().add_rows(x.as_ref(), &y, &ids);
         let _ = fit_lmm(&mut ws, &targets, None);
     }
     let stats = dhat::HeapStats::get();
@@ -649,9 +666,6 @@ fn canonicalize_pinned_blocks_folds_preserves_sigma_and_is_idempotent() {
     for (got, want) in sigma_vech(&th2, 2).iter().zip(&sig2) {
         assert!((got - want).abs() <= 1e-15 * want.abs().max(1.0));
     }
-    // The pinned diagonal now has nothing below it, which is what makes the
-    // boundary-score shortcut valid there.
-    assert!(!g2.diagonal_has_nonzero_below(0, &th2));
     let again = th2;
     assert!(!canonicalize_pinned_blocks(&g2, &mut th2));
     assert_eq!(th2[0].to_bits(), again[0].to_bits());
@@ -685,7 +699,6 @@ fn canonicalize_pinned_blocks_folds_preserves_sigma_and_is_idempotent() {
             sig3
         );
     }
-    assert!(!g3.diagonal_has_nonzero_below(0, &th3));
     let again3 = th3;
     assert!(!canonicalize_pinned_blocks(&g3, &mut th3));
     for (a, b) in th3.iter().zip(&again3) {
@@ -723,8 +736,17 @@ fn suff_stats_multi_accumulators() {
     assert_eq!(suff.zx[(5, 3)], 2.0);
     // Same-factor crossed pairs never co-occur.
     assert_eq!(suff.zx[(18, 1)], 0.0);
-    // Intercept column sum = row count per level.
-    assert!((suff.s[(0, 0)] - 8.0).abs() < 1e-12);
+    // Intercept-row sum of `s` = row count per level, on EVERY RE column
+    // (primary, nested children, crossed) — a wrong scatter into any one of
+    // them would otherwise slip past a check of column 0 alone.
+    for col in 0..22 {
+        assert!(
+            (suff.s[(0, col)] - suff.counts[col]).abs() < 1e-12,
+            "col {col}: s[(0,{col})] = {}, counts = {}",
+            suff.s[(0, col)],
+            suff.counts[col]
+        );
+    }
 }
 
 /// Textbook REML deviance on the explicit n×n V — the oracle for the
@@ -1034,25 +1056,28 @@ fn balanced_collapse_weighted_fit_invariant() {
     let w = vec![2.0f64; n];
 
     let mut ws_w = LmmWorkspace::new(3, 6);
-    ws_w.suff
+    ws_w.suff_mut()
         .add_rows_multi(x.as_ref(), &y, &ids, &[], Some(&w));
+    let crate::lmm::LmmKernel::Dense { suff, fit } = &mut ws_w.kernel else {
+        unreachable!("LmmWorkspace::new builds the dense kernel")
+    };
     assert!(
-        precompute_balanced_collapse(&ws_w.suff, &mut ws_w.fit),
+        precompute_balanced_collapse(suff, fit),
         "constant weights keep exact per-cluster counts equality"
     );
-    assert_eq!(ws_w.fit.collapse_n_active, 6);
+    assert_eq!(ws_w.fit_mut().collapse_n_active, 6);
     let fit_w = fit_lmm(&mut ws_w, &targets, None);
     assert!(fit_w.converged);
 
     let mut ws_u = LmmWorkspace::new(3, 6);
-    ws_u.suff.add_rows(x.as_ref(), &y, &ids);
+    ws_u.suff_mut().add_rows(x.as_ref(), &y, &ids);
     let fit_u = fit_lmm(&mut ws_u, &targets, None);
     assert!(fit_u.converged);
 
     // Two independent BOBYQA runs agree to the rho_end floor, not machine
     // precision — same 1e-6 relative band as the fit.rs invariance tests.
     for j in 0..3 {
-        let (a, b) = (ws_u.fit.betas[j], ws_w.fit.betas[j]);
+        let (a, b) = (ws_u.recovery.betas[j], ws_w.recovery.betas[j]);
         assert!(
             (a - b).abs() / a.abs() < 1e-6,
             "β[{j}] unweighted {a} vs w≡2 {b}"
@@ -1060,8 +1085,8 @@ fn balanced_collapse_weighted_fit_invariant() {
     }
     for &tj in &targets {
         let (a, b) = (
-            ws_u.fit.var_diag[tj as usize].sqrt(),
-            ws_w.fit.var_diag[tj as usize].sqrt(),
+            ws_u.recovery.var_diag[tj as usize].sqrt(),
+            ws_w.recovery.var_diag[tj as usize].sqrt(),
         );
         assert!(
             (a - b).abs() / a < 1e-6,
@@ -1137,9 +1162,11 @@ fn two_crossed_factors_deviance_matches_brute_force() {
 
 /// The dual REML objective takes the balanced collapse the `f64` objective
 /// takes: on a balanced design `precompute_balanced_collapse` arms on a
-/// `Dual<4>` scratch, and the gradient it then produces still matches the dense
-/// score — the collapse is a reassociation of the same criterion, not a
-/// different one. On an unbalanced design it must refuse on both scalars alike.
+/// `Dual<4>` scratch — the collapse is a reassociation of the same criterion,
+/// not a different one. On an unbalanced design it must refuse on both
+/// scalars alike. (The armed dual gradient matching the dense score is
+/// `reml_gradient_matches_dense_score_per_shape`'s own claim, on this exact
+/// balanced single-intercept shape among others — not re-proved here.)
 #[test]
 fn dual_scratch_arms_the_balanced_collapse() {
     let (x, y, ids) = hand_dataset_sized(240, 6, false);
@@ -1147,7 +1174,6 @@ fn dual_scratch_arms_the_balanced_collapse() {
     let p = 3;
     let mut suff = LmmSuffStats::with_groupings(p, groupings.clone());
     suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
-    let n_theta = groupings.n_theta();
 
     let mut fit_d = LmmFitScratch::<Dual<4>>::with_groupings(p, &groupings);
     assert!(
@@ -1155,30 +1181,6 @@ fn dual_scratch_arms_the_balanced_collapse() {
         "balanced design must arm on a dual scratch"
     );
     assert_eq!(fit_d.collapse_n_active, 6);
-
-    // Same criterion: the armed dual gradient still matches the dense score.
-    let z = dense_z(&groupings, &ids, &[], &x, &[]);
-    let mut scratch = LmmDualScratch::for_groupings(n_theta, p, &groupings)
-        .expect("n_theta 1 is inside the lane set");
-    let mut rng = fixed_seed_theta_lmm("int1", 6001);
-    for _ in 0..5 {
-        let theta = rng.next_theta();
-        let mut grad = vec![0.0; n_theta];
-        assert!(matches!(
-            reml_gradient(&theta, &suff, &mut scratch, &mut grad),
-            DerivStatus::Ok(_)
-        ));
-        let want = dense_reml_score(&theta, z.as_ref(), x.as_ref(), &y, &groupings);
-        for j in 0..n_theta {
-            let band = 1e-8 * want[j].abs().max(1.0);
-            assert!(
-                (grad[j] - want[j]).abs() <= band,
-                "coord {j}: dual {} vs dense {}",
-                grad[j],
-                want[j]
-            );
-        }
-    }
 
     // Unbalanced: refused on both scalars, so the dual arm keeps the loop.
     let (xs, ys, ids_s) = hand_dataset_sized(240, 6, true);
@@ -1230,7 +1232,8 @@ fn zero_crossed_variance_pins_only_that_component() {
     }
     let mut ws = LmmWorkspace::for_cluster_spec(2, &cluster, n, &[]);
     let eids = vec![eid];
-    ws.suff.add_rows_multi(x.as_ref(), &y, &pid, &eids, None);
+    ws.suff_mut()
+        .add_rows_multi(x.as_ref(), &y, &pid, &eids, None);
     let fit = fit_lmm(&mut ws, &[1], None);
     assert!(fit.converged);
     assert_eq!(fit.boundary_hit, 1);
@@ -1249,16 +1252,21 @@ fn zero_crossed_variance_pins_only_that_component() {
 fn crossed_nested_fit_recovers_betas() {
     let (x, y, pid, eids, cluster) = multi_dataset(true, 4); // n = 192
     let mut ws = LmmWorkspace::for_cluster_spec(3, &cluster, x.nrows(), &[]);
-    ws.suff.add_rows_multi(x.as_ref(), &y, &pid, &eids, None);
+    ws.suff_mut()
+        .add_rows_multi(x.as_ref(), &y, &pid, &eids, None);
     let fit = fit_lmm(&mut ws, &[1, 2], None);
     assert!(fit.converged);
-    assert!((ws.fit.betas[1] - 0.4).abs() < 0.15);
-    assert!((ws.fit.betas[2] + 0.2).abs() < 0.15);
+    assert!((ws.recovery.betas[1] - 0.4).abs() < 0.15);
+    assert!((ws.recovery.betas[2] + 0.2).abs() < 0.15);
     // Deterministic regression lock (lcg-seeded multi_dataset) alongside the
     // planted-value recovers-check above, which documents intent.
-    assert!((ws.fit.betas[1] - 0.40829926961384383).abs() / 0.40829926961384383_f64.abs() < 1e-6);
-    assert!((ws.fit.betas[2] - -0.2916210839321183).abs() / 0.2916210839321183_f64.abs() < 1e-6);
-    assert!(ws.fit.t_sq[1].is_finite() && ws.fit.t_sq[2].is_finite());
+    assert!(
+        (ws.recovery.betas[1] - 0.40829926961384383).abs() / 0.40829926961384383_f64.abs() < 1e-6
+    );
+    assert!(
+        (ws.recovery.betas[2] - -0.2916210839321183).abs() / 0.2916210839321183_f64.abs() < 1e-6
+    );
+    assert!(ws.recovery.t_sq[1].is_finite() && ws.recovery.t_sq[2].is_finite());
     assert!(fit.joint_t_sq.is_finite() && fit.joint_t_sq > 0.0);
     assert_eq!(ws.theta.len(), 3);
 }
@@ -1280,8 +1288,9 @@ fn lmm_fit_general_warm_path_bounded_alloc() {
     let targets: Vec<u32> = vec![1, 2];
     let mut ws = LmmWorkspace::for_cluster_spec(3, &cluster, x.nrows(), &[]);
 
-    ws.suff.reset();
-    ws.suff.add_rows_multi(x.as_ref(), &y, &pid, &eids, None);
+    ws.suff_mut().reset();
+    ws.suff_mut()
+        .add_rows_multi(x.as_ref(), &y, &pid, &eids, None);
     // prime cold, then warm-start subsequent refits from the previous fit's fitted θ
     // (the loop tier's production pattern).
     let _ = fit_lmm(&mut ws, &targets, None);
@@ -1289,8 +1298,9 @@ fn lmm_fit_general_warm_path_bounded_alloc() {
 
     let profiler = dhat::Profiler::builder().testing().build();
     for _ in 0..N_CALLS {
-        ws.suff.reset();
-        ws.suff.add_rows_multi(x.as_ref(), &y, &pid, &eids, None);
+        ws.suff_mut().reset();
+        ws.suff_mut()
+            .add_rows_multi(x.as_ref(), &y, &pid, &eids, None);
         let _ = fit_lmm(&mut ws, &targets, Some(&warm));
     }
     let stats = dhat::HeapStats::get();
@@ -1335,9 +1345,10 @@ fn lmm_fit_crossed_slope_warm_path_bounded_alloc() {
             }],
         }),
     };
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(2, &cluster, x.nrows(), &[1], &[vec![1]]);
-    ws.suff.reset();
-    ws.suff
+    let mut ws =
+        LmmWorkspace::for_cluster_spec_ext(2, &cluster, x.nrows(), &[1], &[vec![1]], false);
+    ws.suff_mut().reset();
+    ws.suff_mut()
         .add_rows_multi(x.as_ref(), &y, &pid, std::slice::from_ref(&eid), None);
     // prime cold, then warm-start subsequent refits from the previous fit's fitted θ
     // (the loop tier's production pattern).
@@ -1346,8 +1357,8 @@ fn lmm_fit_crossed_slope_warm_path_bounded_alloc() {
 
     let profiler = dhat::Profiler::builder().testing().build();
     for _ in 0..N_CALLS {
-        ws.suff.reset();
-        ws.suff
+        ws.suff_mut().reset();
+        ws.suff_mut()
             .add_rows_multi(x.as_ref(), &y, &pid, std::slice::from_ref(&eid), None);
         let _ = fit_lmm(&mut ws, &[1], Some(&warm));
     }
@@ -1721,7 +1732,8 @@ fn multislope_deviance_matches_brute_force() {
 fn slope_fit_converges_interior() {
     let (x, y, ids) = slope_dataset();
     let mut ws = LmmWorkspace::with_groupings(2, slope_groupings());
-    ws.suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
+    ws.suff_mut()
+        .add_rows_multi(x.as_ref(), &y, &ids, &[], None);
     let fit = fit_lmm(&mut ws, &[1], None);
     assert!(fit.converged);
     // Planted [intercept 0.5, slope 0.4]; small (n=64, 8 clusters) REML draw
@@ -1729,18 +1741,22 @@ fn slope_fit_converges_interior() {
     // Pin sign + a band tight enough to catch a sign flip, a collapse to 0, or a
     // blow-up (mere `is_finite` passed any of those).
     assert!(
-        (0.2..0.8).contains(&ws.fit.betas[0]),
+        (0.2..0.8).contains(&ws.recovery.betas[0]),
         "intercept {}",
-        ws.fit.betas[0]
+        ws.recovery.betas[0]
     );
     assert!(
-        (0.05..0.6).contains(&ws.fit.betas[1]),
+        (0.05..0.6).contains(&ws.recovery.betas[1]),
         "slope {}",
-        ws.fit.betas[1]
+        ws.recovery.betas[1]
     );
     // Deterministic regression lock alongside the bands above.
-    assert!((ws.fit.betas[0] - 0.46265883331118085).abs() / 0.46265883331118085_f64.abs() < 1e-6);
-    assert!((ws.fit.betas[1] - 0.20152611939449563).abs() / 0.20152611939449563_f64.abs() < 1e-6);
+    assert!(
+        (ws.recovery.betas[0] - 0.46265883331118085).abs() / 0.46265883331118085_f64.abs() < 1e-6
+    );
+    assert!(
+        (ws.recovery.betas[1] - 0.20152611939449563).abs() / 0.20152611939449563_f64.abs() < 1e-6
+    );
     assert_eq!(fit.pinned_components & !0b11, 0); // only 2 components exist
 }
 
@@ -1749,65 +1765,43 @@ fn slope_fit_converges_interior() {
 fn multislope_fit_converges_interior() {
     let (x, y, ids) = multislope_dataset();
     let mut ws = LmmWorkspace::with_groupings(3, multislope_groupings());
-    ws.suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
+    ws.suff_mut()
+        .add_rows_multi(x.as_ref(), &y, &ids, &[], None);
     let fit = fit_lmm(&mut ws, &[1, 2], None);
     assert!(fit.converged);
     // Planted [0.5, 0.4, 0.2]; recovered ≈[0.51, 0.64, 0.28]. Both slopes positive
     // with β̂₁ > β̂₂ (planted ordering preserved) — pin that, so a β₁/β₂ swap or a
     // scale collapse fails, which a bare finiteness check would not catch.
     assert!(
-        (0.2..0.9).contains(&ws.fit.betas[0]),
+        (0.2..0.9).contains(&ws.recovery.betas[0]),
         "intercept {}",
-        ws.fit.betas[0]
+        ws.recovery.betas[0]
     );
     assert!(
-        (0.2..1.1).contains(&ws.fit.betas[1]),
+        (0.2..1.1).contains(&ws.recovery.betas[1]),
         "slope x1 {}",
-        ws.fit.betas[1]
+        ws.recovery.betas[1]
     );
     assert!(
-        (0.0..0.7).contains(&ws.fit.betas[2]),
+        (0.0..0.7).contains(&ws.recovery.betas[2]),
         "slope x2 {}",
-        ws.fit.betas[2]
+        ws.recovery.betas[2]
     );
     assert!(
-        ws.fit.betas[1] > ws.fit.betas[2],
+        ws.recovery.betas[1] > ws.recovery.betas[2],
         "x1 slope must exceed x2 slope"
     );
     // Deterministic regression lock alongside the bands above.
-    assert!((ws.fit.betas[0] - 0.5129839426148501).abs() / 0.5129839426148501_f64.abs() < 1e-6);
-    assert!((ws.fit.betas[1] - 0.6442611282130077).abs() / 0.6442611282130077_f64.abs() < 1e-6);
-    assert!((ws.fit.betas[2] - 0.28355377896623535).abs() / 0.28355377896623535_f64.abs() < 1e-6);
-    assert_eq!(fit.pinned_components & !0b111, 0); // only 3 components exist
-}
-
-/// The experimental two-stage warm restart must reach the same
-/// optimum as single-stage on a well-behaved rung — stage 1 (npt = n+2,
-/// rho_end 1e-3, measured correctness-safe on the validation corpus) finds the
-/// basin, stage 2 (npt = 2n+1, shipped rho_end) refines from stage 1's point.
-/// Uses the multislope fixture (n_theta = 6) so the shipped mid-npt formula
-/// (`n_theta >= 3`) is the one exercised by the single-stage comparator.
-#[test]
-fn two_stage_matches_single_stage_optimum() {
-    let (x, y, ids) = multislope_dataset();
-    let mut ws1 = LmmWorkspace::with_groupings(3, multislope_groupings());
-    ws1.suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
-    let targets = [1u32, 2];
-    let f1 = fit_lmm(&mut ws1, &targets, None);
-
-    let (x, y, ids) = multislope_dataset();
-    let mut ws2 = LmmWorkspace::with_groupings(3, multislope_groupings());
-    ws2.suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
-    let f2 = fit_lmm_two_stage(&mut ws2, &targets, None);
-
-    assert!(f2.converged);
     assert!(
-        (f1.deviance - f2.deviance).abs() < 1e-6,
-        "two-stage must land on the same optimum: {} vs {}",
-        f1.deviance,
-        f2.deviance
+        (ws.recovery.betas[0] - 0.5129839426148501).abs() / 0.5129839426148501_f64.abs() < 1e-6
     );
-    assert!(f2.n_eval > 0);
+    assert!(
+        (ws.recovery.betas[1] - 0.6442611282130077).abs() / 0.6442611282130077_f64.abs() < 1e-6
+    );
+    assert!(
+        (ws.recovery.betas[2] - 0.28355377896623535).abs() / 0.28355377896623535_f64.abs() < 1e-6
+    );
+    assert_eq!(fit.pinned_components & !0b111, 0); // only 3 components exist
 }
 
 /// Slope-variance collapse pins the SLOPE component (bit 1), not the
@@ -1866,7 +1860,8 @@ fn zero_slope_variance_pins_slope_component() {
             &[1],
         ),
     );
-    ws.suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
+    ws.suff_mut()
+        .add_rows_multi(x.as_ref(), &y, &ids, &[], None);
     let fit = fit_lmm(&mut ws, &[1], None);
     assert!(fit.converged);
     assert!(
@@ -2399,9 +2394,9 @@ fn nested_slope_fit_converges() {
             + u1e[child] * x1
             + 0.8 * lcg(&mut st);
     }
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(2, &cluster, n, &[1], &[vec![1]]);
-    ws.suff.reset();
-    ws.suff
+    let mut ws = LmmWorkspace::for_cluster_spec_ext(2, &cluster, n, &[1], &[vec![1]], false);
+    ws.suff_mut().reset();
+    ws.suff_mut()
         .add_rows_multi(x.as_ref(), &y, &pid, &[eid.clone()], None);
     let fit = fit_lmm(&mut ws, &[1], None);
     assert!(fit.converged, "nested-slope fit must converge");
@@ -2412,19 +2407,37 @@ fn nested_slope_fit_converges() {
         fit.sigma_sq
     );
     assert!(ws.theta.iter().all(|t| t.is_finite()), "θ̂ {:?}", ws.theta);
+    // Deterministic regression lock (seed 137): θ̂ = [primary vech (λ00,λ10,λ11) ;
+    // nested-child vech (λ00,λ10,λ11)] — the defect this test guards against is a
+    // corrupted θ̂ that a finiteness check alone would not catch (β̂ locks below
+    // catch it only indirectly).
+    const PINNED_THETA: [f64; 6] = [
+        0.17956992444424705,
+        0.043694448493027414,
+        0.0,
+        0.5406149250057827,
+        0.13052687983935188,
+        0.0,
+    ];
+    for (j, (&got, &want)) in ws.theta.iter().zip(&PINNED_THETA).enumerate() {
+        let rel = (got - want).abs() / want.abs().max(1e-12);
+        assert!(rel < 1e-6, "θ̂[{j}] = {got}, want {want}");
+    }
     assert!(
-        (0.2..0.8).contains(&ws.fit.betas[0]),
+        (0.2..0.8).contains(&ws.recovery.betas[0]),
         "intercept {}",
-        ws.fit.betas[0]
+        ws.recovery.betas[0]
     );
     assert!(
-        (0.1..0.7).contains(&ws.fit.betas[1]),
+        (0.1..0.7).contains(&ws.recovery.betas[1]),
         "slope {}",
-        ws.fit.betas[1]
+        ws.recovery.betas[1]
     );
     // Deterministic regression lock (seed 137) alongside the wide recovers-check above.
-    assert!((ws.fit.betas[0] - 0.6209080774915476).abs() / 0.6209080774915476_f64.abs() < 1e-6);
-    assert!((ws.fit.betas[1] - 0.257915422474595).abs() / 0.257915422474595_f64.abs() < 1e-6);
+    assert!(
+        (ws.recovery.betas[0] - 0.6209080774915476).abs() / 0.6209080774915476_f64.abs() < 1e-6
+    );
+    assert!((ws.recovery.betas[1] - 0.257915422474595).abs() / 0.257915422474595_f64.abs() < 1e-6);
 }
 
 /// General brute-force REML deviance: V = I + Σ_g Z_g D_g Z_gᵀ where each
@@ -2614,9 +2627,9 @@ fn crossed_slope_fit_matches_lme4_golden() {
             }],
         }),
     };
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(2, &cluster, n, &[1], &[vec![1]]);
-    ws.suff.reset();
-    ws.suff
+    let mut ws = LmmWorkspace::for_cluster_spec_ext(2, &cluster, n, &[1], &[vec![1]], false);
+    ws.suff_mut().reset();
+    ws.suff_mut()
         .add_rows_multi(x.as_ref(), &y, &pid, std::slice::from_ref(&eid), None);
     let fit = fit_lmm(&mut ws, &[1], None);
     assert!(fit.converged, "golden fit must converge");
@@ -2624,14 +2637,14 @@ fn crossed_slope_fit_matches_lme4_golden() {
 
     // Fixed effects + residual variance.
     assert!(
-        (ws.fit.betas[0] - G_BETA0).abs() < 1e-4,
+        (ws.recovery.betas[0] - G_BETA0).abs() < 1e-4,
         "β0 {} vs {G_BETA0}",
-        ws.fit.betas[0]
+        ws.recovery.betas[0]
     );
     assert!(
-        (ws.fit.betas[1] - G_BETA1).abs() < 1e-4,
+        (ws.recovery.betas[1] - G_BETA1).abs() < 1e-4,
         "β1 {} vs {G_BETA1}",
-        ws.fit.betas[1]
+        ws.recovery.betas[1]
     );
     assert!(
         (s2 - G_SIGMA2).abs() <= 1e-3 * G_SIGMA2,
@@ -2737,14 +2750,16 @@ fn lmm_fit_slope_warm_path_bounded_alloc() {
     let targets: Vec<u32> = vec![1];
     let mut ws = LmmWorkspace::with_groupings(2, slope_groupings());
 
-    ws.suff.reset();
-    ws.suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
+    ws.suff_mut().reset();
+    ws.suff_mut()
+        .add_rows_multi(x.as_ref(), &y, &ids, &[], None);
     let _ = fit_lmm(&mut ws, &targets, None);
 
     let profiler = dhat::Profiler::builder().testing().build();
     for _ in 0..N_CALLS {
-        ws.suff.reset();
-        ws.suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
+        ws.suff_mut().reset();
+        ws.suff_mut()
+            .add_rows_multi(x.as_ref(), &y, &ids, &[], None);
         let _ = fit_lmm(&mut ws, &targets, None);
     }
     let stats = dhat::HeapStats::get();
@@ -3731,7 +3746,7 @@ fn lmm_dual_call_cost_table() {
 
         let mut fit_f64 = LmmFitScratch::<f64>::with_groupings(p, &groupings);
         // The production `f64` path arms the collapse once per fit
-        // (`fit_lmm_impl`), so a table that times `reml_deviance::<f64>` on a
+        // (`fit_lmm`), so a table that times `reml_deviance::<f64>` on a
         // bare scratch times the fallback loop and the balanced/skewed rows say
         // nothing. `armed` is printed once so a row cannot silently claim a
         // collapse it did not take.
@@ -3996,8 +4011,9 @@ fn fit_lmm_negative_diagonal_exit_is_sign_fixed_without_moving_the_deviance() {
     // Mirror `fit::lmm::lmm_run_on`: scales first, then the rows.
     let build = || {
         let mut ws = LmmWorkspace::for_cluster_spec(2, &model, n, &[1]);
-        ws.suff.groupings.set_slope_scales(x.as_ref(), None);
-        ws.suff.add_rows_multi(x.as_ref(), &y, &ids, &[], None);
+        ws.suff_mut().groupings.set_slope_scales(x.as_ref(), None);
+        ws.suff_mut()
+            .add_rows_multi(x.as_ref(), &y, &ids, &[], None);
         ws
     };
 
@@ -4005,13 +4021,15 @@ fn fit_lmm_negative_diagonal_exit_is_sign_fixed_without_moving_the_deviance() {
     let mut ws1 = build();
     let LmmWorkspace {
         solver,
-        suff,
-        fit,
+        kernel,
         theta,
         lower,
         upper,
         ..
     } = &mut ws1;
+    let crate::lmm::LmmKernel::Dense { suff, fit } = kernel else {
+        unreachable!("for_cluster_spec builds the dense kernel")
+    };
     let mut raw = theta.clone();
     let out = solver.minimize(|t| reml_deviance(t, suff, fit), &mut raw, lower, upper);
     assert!(matches!(out.status, Status::Converged), "{:?}", out.status);
@@ -4035,4 +4053,359 @@ fn fit_lmm_negative_diagonal_exit_is_sign_fixed_without_moving_the_deviance() {
         assert_eq!(a.to_bits(), b.to_bits(), "θ̂ {:?} vs {fixed:?}", ws2.theta);
     }
     assert_eq!(f.deviance.to_bits(), d_raw.to_bits());
+}
+
+/// A search that pins one Cholesky-factor diagonal to (near) zero while a
+/// live entry sits below it in the same column: `canonicalize_pinned_blocks`
+/// must re-derive Λ from Σ so the reported variance component reflects the
+/// mass that is actually there, not the raw endpoint's near-zero coordinate.
+/// Synthetic q_p=2 slope draw (10 clusters, 5 rows each, LCG seed 1) — this
+/// shape is what `canonicalize_pinned_blocks_folds_preserves_sigma_and_is_idempotent`
+/// exercises on a hand-built θ; no `fit_lmm` draw had reached the branch
+/// where the fold actually fires before this one.
+#[test]
+fn fit_lmm_pin_rebuild_folds_the_raw_endpoint() {
+    let nc = 10usize;
+    let nper = 5usize;
+    let n = nc * nper;
+    let mut st = 1u64;
+    let u1: Vec<f64> = (0..nc).map(|_| 0.5 * lcg(&mut st)).collect();
+    let mut x = Mat::<f64>::zeros(n, 2);
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        let c = i % nc;
+        ids[i] = c as u32;
+        let x1 = lcg(&mut st);
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = x1;
+        y[i] = 0.5 + 0.4 * x1 + u1[c] * x1 + 0.1 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: nc as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let build = || {
+        let mut ws = LmmWorkspace::for_cluster_spec(2, &model, n, &[1]);
+        ws.suff_mut().groupings.set_slope_scales(x.as_ref(), None);
+        ws.suff_mut()
+            .add_rows_multi(x.as_ref(), &y, &ids, &[], None);
+        ws
+    };
+
+    // The raw search, exactly as `fit_lmm` drives it, then the same
+    // sign-fix + pin sequence `fit_lmm` runs after it.
+    let mut ws1 = build();
+    let LmmWorkspace {
+        solver,
+        kernel,
+        theta,
+        lower,
+        upper,
+        ..
+    } = &mut ws1;
+    let crate::lmm::LmmKernel::Dense { suff, fit } = kernel else {
+        unreachable!("for_cluster_spec builds the dense kernel")
+    };
+    let mut raw = theta.clone();
+    let out = solver.minimize(|t| reml_deviance(t, suff, fit), &mut raw, lower, upper);
+    assert!(matches!(out.status, Status::Converged), "{:?}", out.status);
+    fix_column_signs(&suff.groupings, &mut raw);
+    let diag = suff.groupings.diagonal_theta().to_vec();
+    assert!(
+        diag.iter().any(|&i| raw[i] <= PIN_THETA),
+        "this draw's search must land with a diagonal at the pin floor, got {raw:?}"
+    );
+    let mut folded = raw.clone();
+    for &ti in &diag {
+        if folded[ti] <= PIN_THETA {
+            folded[ti] = 0.0;
+        }
+    }
+    assert!(
+        canonicalize_pinned_blocks(&suff.groupings, &mut folded),
+        "the pinned diagonal must carry live mass below it that the fold has to move"
+    );
+
+    // The shipped fit reaches the same rebuild internally and reports the
+    // folded θ̂, bit for bit.
+    let mut ws2 = build();
+    let f = fit_lmm(&mut ws2, &[1], None);
+    assert!(f.converged);
+    for (a, b) in ws2.theta.iter().zip(&folded) {
+        assert_eq!(a.to_bits(), b.to_bits(), "θ̂ {:?} vs {folded:?}", ws2.theta);
+    }
+}
+
+/// A design with no rows accumulated has `reml_deviance` return `+INFINITY`
+/// at every θ BOBYQA probes (the `n_rows <= p` guard, `kernel.rs`). BOBYQA's
+/// interpolation model is built entirely from non-finite values, so the
+/// search itself degenerates (`Status::ModelDegenerate`) rather than
+/// converging or capping out — the only other path into `fit_lmm`'s NaN-fill
+/// exit besides a non-finite re-evaluated deviance at a real endpoint.
+#[test]
+fn fit_lmm_nan_fills_on_model_degenerate_search() {
+    let mut ws = LmmWorkspace::new(2, 6);
+    let fit = fit_lmm(&mut ws, &[1], None);
+    assert!(!fit.converged);
+    assert_eq!(fit.boundary_hit, 2);
+    assert_eq!(fit.pinned_components, 0);
+    assert!(fit.sigma_sq.is_nan());
+    assert!(fit.deviance.is_nan());
+    assert!(fit.joint_t_sq.is_nan());
+    assert!(ws.recovery.betas.iter().all(|b| b.is_nan()));
+    assert!(ws.recovery.var_diag[1].is_nan());
+    assert!(ws.recovery.t_sq[1].is_nan());
+}
+
+/// The cheap `+INFINITY` guards of `reml_deviance` (`kernel.rs`): too few
+/// rows for the design (`n_rows <= p`), no fixed effects at all (`p == 0`),
+/// and a non-positive residual variance. All three return the deviance
+/// failure sentinel rather than a garbage finite value BOBYQA could accept
+/// as an optimum.
+#[test]
+fn reml_deviance_infinity_guards() {
+    // n_rows <= p: nothing accumulated, p = 2.
+    let suff_empty = LmmSuffStats::new(2, 6);
+    let mut fit_empty = LmmFitScratch::new(2, 6);
+    assert_eq!(
+        reml_deviance(&[1.0], &suff_empty, &mut fit_empty),
+        f64::INFINITY
+    );
+
+    // p == 0: m = 1 (y only, no fixed effects), rows present so only the
+    // `p == 0` half of the guard can be firing.
+    let mut suff_p0 = LmmSuffStats::new(0, 4);
+    let x0 = Mat::<f64>::zeros(3, 0);
+    suff_p0.add_rows(x0.as_ref(), &[1.0, 2.0, 3.0], &[0, 1, 2]);
+    let mut fit_p0 = LmmFitScratch::new(0, 4);
+    assert_eq!(reml_deviance(&[1.0], &suff_p0, &mut fit_p0), f64::INFINITY);
+
+    // Non-positive σ̂²: a constant y through an intercept-only design at
+    // θ = 0 (Λ = 0, plain OLS) has an exact-zero residual — 16.0 / 4.0 is
+    // exact in f64, so the residual sum of squares rounds to exactly 0.0,
+    // not merely small.
+    let mut suff_perfect = LmmSuffStats::new(1, 4);
+    let mut x1 = Mat::<f64>::zeros(4, 1);
+    for i in 0..4 {
+        x1[(i, 0)] = 1.0;
+    }
+    let y_perfect = [4.0; 4];
+    let ids_perfect: Vec<u32> = (0..4).collect();
+    suff_perfect.add_rows(x1.as_ref(), &y_perfect, &ids_perfect);
+    let mut fit_perfect = LmmFitScratch::new(1, 4);
+    assert_eq!(
+        reml_deviance(&[0.0], &suff_perfect, &mut fit_perfect),
+        f64::INFINITY
+    );
+}
+
+/// The blocked twin (`reml_deviance_blocked`, crossed/nested random slopes)
+/// hits the same failure surface: a perfect fit (X exactly spans y, no
+/// residual) makes the augmented `[Λ′ZᵀZΛ+I | Λ′Zᵀ[Xy]; · | [Xy]ᵀ[Xy]]`
+/// factor exactly rank-deficient at θ = 0 (Λ = 0 collapses the RE penalty to
+/// the identity, so the trailing [X y] block alone is singular at the exact
+/// fit) — caught by the same-shaped `chol_lower` guard the non-blocked path
+/// hits first, since a semidefinite-boundary pivot fails the factorization
+/// before the later σ̂² check would ever see it.
+#[test]
+fn reml_deviance_blocked_infinity_guard() {
+    let cluster = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 3 },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 3 },
+                slopes: vec![1],
+            }],
+        }),
+    };
+    let n = 12;
+    let mut x = Mat::<f64>::zeros(n, 2);
+    let mut y = vec![0.0f64; n];
+    let mut pid = vec![0u32; n];
+    let mut eid = vec![0u32; n];
+    for i in 0..n {
+        pid[i] = (i % 3) as u32;
+        eid[i] = ((i / 3) % 3) as u32;
+        let x1 = (i % 2) as f64;
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = x1;
+        y[i] = 2.0 + 3.0 * x1; // exact linear fit, zero residual
+    }
+    let g = LmmGroupings::from_cluster_spec_ext(&cluster, n, &[], &[vec![1]]);
+    assert!(g.extra_slopes_any, "must route to the blocked path");
+    let mut suff = LmmSuffStats::with_groupings(2, g);
+    suff.add_rows_multi(x.as_ref(), &y, &pid, &[eid.clone()], None);
+    let gref = LmmGroupings::from_cluster_spec_ext(&cluster, n, &[], &[vec![1]]);
+    let mut fit = LmmFitScratch::with_groupings(2, &gref);
+    let th = vec![0.0; gref.n_theta()];
+    assert_eq!(reml_deviance(&th, &suff, &mut fit), f64::INFINITY);
+}
+
+/// `reml_gradient`/`reml_hessian` refuse a crossed/nested-slopes design
+/// outright: `reml_deviance` routes that shape to the `f64`-only
+/// `reml_deviance_blocked` tail, which the dual/hyper-dual objectives below
+/// cannot differentiate through. Every other `Unsupported` mention in this
+/// file (`reml_gradient_matches_dense_score_per_shape`,
+/// `hessian_matches_gradient_fd_per_shape`) is a `panic!` arm guarding
+/// against reaching it by accident on an in-range shape; this is the witness
+/// that the status is actually returned on the shape it exists for.
+#[test]
+fn reml_gradient_and_hessian_refuse_crossed_slopes() {
+    let cluster = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 5 },
+            slopes: vec![1],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 4 },
+                slopes: vec![1],
+            }],
+        }),
+    };
+    let g = LmmGroupings::from_cluster_spec_ext(&cluster, 60, &[1], &[vec![1]]);
+    assert!(g.extra_slopes_any, "must be a crossed/nested-slopes shape");
+    let n_theta = g.n_theta();
+    let p = 2;
+    let suff = LmmSuffStats::with_groupings(p, g.clone());
+    let theta = vec![1.0; n_theta];
+
+    let mut dual_scratch = LmmDualScratch::for_groupings(n_theta, p, &g)
+        .unwrap_or_else(|| panic!("n_theta {n_theta} exceeds the instantiated lane set"));
+    let mut grad = vec![0.0; n_theta];
+    assert!(matches!(
+        reml_gradient(&theta, &suff, &mut dual_scratch, &mut grad),
+        DerivStatus::Unsupported
+    ));
+
+    let mut hyper_scratch = LmmHyperScratch::for_groupings(n_theta, p, &g)
+        .unwrap_or_else(|| panic!("n_theta {n_theta} exceeds the instantiated hyper-dual rung"));
+    let mut hess = Mat::<f64>::zeros(n_theta, n_theta);
+    assert!(matches!(
+        reml_hessian(&theta, &suff, &mut hyper_scratch, &mut grad, &mut hess),
+        DerivStatus::Unsupported
+    ));
+}
+
+/// With a single target, the joint Wald-χ² collapses to the per-target `t²`
+/// (`W = β̂_T'[(K⁻¹)_TT]⁻¹β̂_T/σ̂²` at k=1 is `β̂²/Var(β̂)`, the same quantity
+/// `t_sq` already holds). Every multi-grouping fit test checks `joint_t_sq`
+/// with `is_finite` alone, so a wrong Σ_T gather in `joint_wald_chi_sq` would
+/// pass unnoticed on a single-target design.
+#[test]
+fn joint_wald_matches_single_target_t_sq() {
+    let (x, y, ids) = hand_dataset();
+    let mut ws = LmmWorkspace::new(3, 6);
+    ws.suff_mut().add_rows(x.as_ref(), &y, &ids);
+    let fit = fit_lmm(&mut ws, &[1], None);
+    assert!(fit.converged);
+    let want = ws.recovery.t_sq[1];
+    assert!(want.is_finite());
+    let band = 1e-9 * want.abs().max(1.0);
+    assert!(
+        (fit.joint_t_sq - want).abs() <= band,
+        "joint {} vs t_sq[1] {}",
+        fit.joint_t_sq,
+        want
+    );
+}
+
+/// `LmmHyperScratch::for_groupings` refuses above the top instantiated
+/// `HyperDual` rung (n_θ = 12) — a Hessian cannot chunk the way the gradient
+/// does. `LmmDualScratch::for_groupings`, which shares the same ladder, has
+/// no such ceiling: it always returns a scratch, chunking above the top rung
+/// instead.
+#[test]
+fn hyper_scratch_refuses_above_n_theta_12() {
+    let g = LmmGroupings::single(2);
+    assert!(LmmHyperScratch::for_groupings(12, 1, &g).is_some());
+    assert!(LmmHyperScratch::for_groupings(13, 1, &g).is_none());
+    assert!(LmmDualScratch::for_groupings(13, 1, &g).is_some());
+}
+
+/// A near-exact-duplicate design (x2 = x1 + 1e-12·noise) is so ill-conditioned
+/// that almost every θ BOBYQA probes fails the Cholesky and moderates to
+/// PRIMA's `FUNCMAX` — a flat surface that can still report `Status::Converged`
+/// (`SMALL_TR_RADIUS` on a moderated surface, `bobyqa::FUNCMAX`'s own
+/// documented case). Here the search sees only one genuinely finite
+/// evaluation before reporting Converged; the reported θ̂ happens to
+/// re-evaluate finite too, so nothing else would mark this endpoint
+/// unusable. `finite_evals >= 2` is what does — deleting that conjunct
+/// would report this one-finite-point draw as a converged fit with real
+/// (non-NaN) β̂/σ̂².
+#[test]
+fn converged_status_with_one_finite_eval_is_not_reported_converged() {
+    let n = 48usize;
+    let nc = 8usize;
+    let mut st = 3u64;
+    let mut x = Mat::<f64>::zeros(n, 3);
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        ids[i] = (i % nc) as u32;
+        let x1 = lcg(&mut st);
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = x1;
+        x[(i, 2)] = x1 + 1e-12 * lcg(&mut st); // near-exact duplicate of x1
+        y[i] = 0.5 + 0.4 * x1 + 0.8 * lcg(&mut st);
+    }
+
+    // Witness: the raw search, run exactly as `fit_lmm` drives it, converges
+    // with fewer than 2 finite evaluations.
+    let mut ws1 = LmmWorkspace::new(3, nc);
+    ws1.suff_mut().add_rows(x.as_ref(), &y, &ids);
+    let LmmWorkspace {
+        solver,
+        kernel,
+        theta,
+        lower,
+        upper,
+        ..
+    } = &mut ws1;
+    let crate::lmm::LmmKernel::Dense { suff, fit } = kernel else {
+        unreachable!("LmmWorkspace::new builds the dense kernel")
+    };
+    let mut raw = theta.clone();
+    let mut finite_evals = 0usize;
+    let out = solver.minimize(
+        |t| {
+            let d = reml_deviance(t, suff, fit);
+            if d.is_finite() {
+                finite_evals += 1;
+            }
+            d
+        },
+        &mut raw,
+        lower,
+        upper,
+    );
+    assert!(matches!(out.status, Status::Converged), "{:?}", out.status);
+    assert!(
+        finite_evals < 2,
+        "this draw's search must see fewer than 2 finite evaluations, got {finite_evals}"
+    );
+
+    // The shipped fit must not call this converged, even though its θ̂
+    // re-evaluates finite and every other field looks like a normal fit.
+    let mut ws2 = LmmWorkspace::new(3, nc);
+    ws2.suff_mut().add_rows(x.as_ref(), &y, &ids);
+    let f = fit_lmm(&mut ws2, &[1, 2], None);
+    assert!(
+        !f.converged,
+        "too few finite evaluations must not be reported converged"
+    );
+    assert!(
+        f.deviance.is_finite(),
+        "this endpoint is a real fit, not the NaN-fill exit"
+    );
+    assert!(f.sigma_sq.is_finite());
+    assert!(ws2.recovery.betas.iter().all(|b| b.is_finite()));
 }

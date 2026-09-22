@@ -11,7 +11,8 @@
 //!   - Adaptive convergence: `|Δdeviance| < DEVIANCE_TOL = 1e-8`
 //!   - Safety cap: `MAX_IRLS_ITERS = 50`
 //!   - ETA_DIVERGENCE_CAP divergence guard: `iter ≥ 3 ∧ ‖η‖_∞ > 30 →
-//!     non-converged` (skipped under the Gamma inverse link)
+//!     non-converged` (skipped under the Gamma inverse and inverse-Gaussian
+//!     1/μ² links)
 //!   - All-0 / all-1 short circuit
 //!   - Post-fit saturation guard (50% of weights < 1e-5 ⇒ non-converged)
 //!   - No step-halving: β_new is accepted directly
@@ -49,12 +50,15 @@ pub const DEVIANCE_TOL: f64 = 1e-8;
 /// choice of units — height in metres and height in kilometres give the same
 /// verdict. 30 is the number the physical argument actually supports: on the
 /// logit scale |η| = 30 is already p ≈ 1 − 1e-13, which is separation, not
-/// signal. Skipped under the Gamma inverse link, where η = 1/μ makes a large
-/// |η| an honest small-mean fit (see the guard site).
+/// signal. Skipped under the two reciprocal links — Gamma `1/μ` and
+/// inverse-Gaussian `1/μ²` — where a large |η| is an honest small-mean fit
+/// (see the guard site).
 pub const ETA_DIVERGENCE_CAP: f64 = 30.0;
-/// Floor on per-row IRLS weight `W_i = p_i (1-p_i)` to avoid division by zero
-/// in the working response.
-pub const WEIGHT_CLAMP: f64 = 1e-6;
+/// Floor on the stored per-row IRLS weight `W_i = p_i (1-p_i)`, keeping it
+/// strictly positive. This keeps the logit fast path's working response
+/// `z = η + (y − p)/w` and the GLM's `X'WX` finite on a row where `p(1 − p)`
+/// rounds to 0. The GLMM kernels never divide by `w`.
+pub const WEIGHT_CLAMP: f64 = 1e-300;
 /// Saturation post-fit guard: rows with `p_i(1-p_i) < SATURATION_W` count as
 /// saturated. If the fraction exceeds `SATURATION_FRAC`, the fit is marked
 /// non-converged.
@@ -450,15 +454,20 @@ pub fn glm_irls_fit<'a>(
     // `log1pexp` sweep — so `deviance_final` is always one pass behind the β
     // that produced it, by construction, not by an accident of ordering.
     //
-    // The divergence guard bounds |η|, which under the Gamma inverse link is
-    // 1/μ — a legitimate small-mean fit sits far above the threshold there. That
-    // family/link pair falls through to the other exits instead: clamp_eta's
-    // ±700 (src/family.rs), the non-finite guard on β_new, and MAX_IRLS_ITERS.
-    // Loop-invariant, so it is evaluated once.
+    // The divergence guard bounds |η|, which the two reciprocal links invert:
+    // η = 1/μ under the Gamma inverse link, η = 1/μ² under the inverse-Gaussian
+    // 1/μ² link. On both, η grows without bound as μ → 0, so a legitimate
+    // small-mean fit sits far above the threshold (μ = 0.18 already gives
+    // η = 30 under 1/μ²). Those two family/link pairs — the same pair
+    // `family::eta_infeasible` names — fall through to the other exits instead:
+    // clamp_eta's upper 700 (src/family.rs), the non-finite guard on β_new, and
+    // MAX_IRLS_ITERS. Loop-invariant, so it is evaluated once.
     let eta_guard_active = !matches!(
         family,
         Family::Gamma {
             link: crate::spec::GammaLink::Inverse
+        } | Family::InverseGaussian {
+            link: crate::spec::InverseGaussianLink::InverseSquared
         }
     );
 
@@ -622,19 +631,24 @@ pub fn glm_irls_fit<'a>(
         }
 
         // Divergence guard at iter ≥ 3, on the linear predictor just recomputed
-        // above. Fires before the next pass's convergence check — a capped fit
-        // never reports converged. The sweep is over n rather than p; that is a
-        // longer pass than the old |β| one, and negligible beside the GEMM that
-        // builds X'WX each iteration.
+        // above. Fires before the next pass's convergence check, so a fit still
+        // iterating at pass 4 or later never reports converged with a capped η. A
+        // fit whose deviance settles by pass 3 is not checked: the guard detects a
+        // diverging run, and that fit has reached its fixed point (reachable from
+        // a caller-supplied start β near a quasi-separated solution). The sweep
+        // is over n rather than p, negligible beside the GEMM that builds X'WX
+        // each iteration.
         if eta_guard_active && iter >= 3 {
             let mut max_abs: f64 = 0.0;
             for &e in &irls_eta[..n] {
                 let ae = e.abs();
-                if ae > max_abs {
+                // `ae > max_abs` is false for NaN, so a NaN η needs its own arm;
+                // once `max_abs` is NaN no later finite `ae` can overwrite it.
+                if ae.is_nan() || ae > max_abs {
                     max_abs = ae;
                 }
             }
-            if max_abs > ETA_DIVERGENCE_CAP {
+            if max_abs.is_nan() || max_abs > ETA_DIVERGENCE_CAP {
                 break;
             }
         }
@@ -650,18 +664,16 @@ pub fn glm_irls_fit<'a>(
     if converged {
         // irls_w already holds the FINAL η's weights: convergence only breaks
         // right after the top-of-pass fused kernel refilled p/W from the carried
-        // η — no recompute needed. The clamp floor (WEIGHT_CLAMP = 1e-6) sits
-        // below SATURATION_W (1e-5), so `w < SATURATION_W` is equivalent to the
-        // raw `p(1-p) < SATURATION_W` test the scalar guard used.
+        // η — no recompute needed. The clamp floor sits far below anything this
+        // guard compares against, so irls_w is the raw weight on every row a
+        // fit can reach, and `w < SATURATION_W·wᵢ` is the raw
+        // `p(1-p) < SATURATION_W` test the scalar guard used.
         //
         // Weighted case: irls_w carries wᵢ·W_raw, so the threshold scales with
         // wᵢ too — otherwise a legitimately small prior weight would masquerade
         // as saturation. The guard tests the FAMILY weight μ(1−μ) (or its
         // generalization), not the case weight, so it compares against
-        // SATURATION_W·wᵢ rather than a fixed floor. Sub-unit-weight edge:
-        // for wᵢ < WEIGHT_CLAMP/SATURATION_W = 0.1 the clamp floor (1e-6)
-        // exceeds the scaled threshold SATURATION_W·wᵢ, so a truly saturated
-        // row escapes the guard — accepted edge; case weights are typically ≥ 1.
+        // SATURATION_W·wᵢ rather than a fixed floor.
         let saturated = (0..n)
             .filter(|&i| {
                 let pw = prior_w.map_or(1.0, |w| w[i]);
@@ -875,11 +887,12 @@ mod tests {
         );
     }
 
-    /// GLM Wald z² is NaN on a non-converged fit (the variance is not
-    /// recoverable). Error path for the z² shape rule — a broken kernel that
-    /// emitted a finite garbage z² when the fit failed would be caught.
+    /// GLM Wald z² and both deviances are NaN on a non-converged fit (the
+    /// variance is not recoverable, and the deviance NaN-fill signals
+    /// non-convergence to callers). A broken kernel that emitted finite
+    /// garbage in any of the three on a failed fit would be caught here.
     #[test]
-    fn glm_z_sq_nan_on_non_converged() {
+    fn glm_z_sq_and_deviances_nan_on_non_converged() {
         // All-zero y short-circuits to non-converged.
         let n = 100;
         let p = 2;
@@ -908,35 +921,6 @@ mod tests {
         for &t in fit.t_sq.iter() {
             assert!(t.is_nan(), "z² must be NaN on non-converged fit, got {t}");
         }
-    }
-
-    #[test]
-    fn glm_deviance_nan_on_non_converged() {
-        // All-0 y short-circuit → non-converged.
-        let n = 100;
-        let p = 2;
-        let mut x = Mat::<f64>::zeros(n, p);
-        for i in 0..n {
-            x[(i, 0)] = 1.0;
-            x[(i, 1)] = (i as f64) / (n as f64) - 0.5;
-        }
-        let y = vec![0.0f64; n];
-        let mut ws = TestWs::new(n, p, 0);
-        let targets: Vec<u32> = vec![0, 1];
-        let fit = glm_irls_fit(
-            crate::Family::Binomial {
-                link: crate::BinomialLink::Logit,
-            },
-            f64::NAN,
-            x.as_ref(),
-            &y,
-            &targets,
-            None,
-            None,
-            None,
-            glm_scratch(&mut ws),
-        );
-        assert!(!fit.converged);
         assert!(
             fit.deviance.is_nan(),
             "deviance must be NaN on non-converged"
@@ -980,6 +964,65 @@ mod tests {
             !fit.converged,
             "fully separated data must report non-converged"
         );
+    }
+
+    /// `beta_start` seeds β and η directly instead of the family's cold-start
+    /// rule, so warm-starting at an already-converged optimum should settle
+    /// in far fewer IRLS iterations than a cold start and land on the same β.
+    /// Every production call site passes `beta_start: None`, so without this
+    /// test the branch that copies `b0` into `irls_betas`/`irls_eta` never runs.
+    #[test]
+    fn glm_irls_fit_warm_start_reaches_same_optimum_in_fewer_iterations() {
+        let n = 200;
+        let p = 2;
+        let targets: Vec<u32> = vec![0, 1];
+        let (x, y) = scaled_logit_design(n, 1.0);
+
+        let mut ws_cold = TestWs::new(n, p, 0);
+        let cold = glm_irls_fit(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &targets,
+            None,
+            None,
+            None,
+            glm_scratch(&mut ws_cold),
+        );
+        assert!(cold.converged, "cold fit must converge");
+        let cold_betas = cold.betas.to_vec();
+        let cold_iter = cold.n_iter;
+
+        let mut ws_warm = TestWs::new(n, p, 0);
+        let warm = glm_irls_fit(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &targets,
+            Some(&cold_betas),
+            None,
+            None,
+            glm_scratch(&mut ws_warm),
+        );
+        assert!(warm.converged, "warm fit must converge");
+        assert!(
+            warm.n_iter < cold_iter,
+            "warm-starting at the converged optimum must take fewer IRLS \
+             iterations than the cold start: warm={} cold={cold_iter}",
+            warm.n_iter
+        );
+        for (w, c) in warm.betas.iter().zip(cold_betas.iter()) {
+            assert!(
+                (w - c).abs() < 1e-9,
+                "warm start must land on the same optimum as the cold fit: {w} vs {c}"
+            );
+        }
     }
 
     /// Well-conditioned logistic design whose slope column is multiplied by
@@ -1091,6 +1134,25 @@ mod tests {
                 "variances must be finite in every unit system: {v:?}"
             );
         }
+        // Column scaling D = diag(1, s) turns X'WX into D(X'WX)D, so the
+        // covariance (X'WX)⁻¹ picks up D⁻¹ on both sides: the intercept
+        // variance is exactly unchanged and the slope variance is divided by
+        // s². A `|β_j| > 30`-style guard that let a scale-dependent variance
+        // through would fail this, not just the finiteness check above.
+        for (v, s) in [(&v2, 1e-3f64), (&v3, 1e3f64)] {
+            assert!(
+                (v[0] - v1[0]).abs() <= 1e-9 * v1[0].abs(),
+                "intercept variance must not depend on the slope column's units: {} vs {}",
+                v[0],
+                v1[0]
+            );
+            let rescaled = v[1] * s * s;
+            assert!(
+                (rescaled - v1[1]).abs() <= 1e-9 * v1[1].abs(),
+                "slope variance must scale by s²: {rescaled} vs {}",
+                v1[1]
+            );
+        }
     }
 
     /// The Poisson log link repeats the logistic invariance property. Under the
@@ -1146,6 +1208,20 @@ mod tests {
             "poisson deviance: {d2} vs {d1}"
         );
         assert!(v1.iter().chain(v2.iter()).all(|q| q.is_finite()));
+        // Same D = diag(1, s) argument as the logit guard above: intercept
+        // variance is unchanged, slope variance is divided by s².
+        assert!(
+            (v2[0] - v1[0]).abs() <= 1e-9 * v1[0].abs(),
+            "poisson intercept variance: {} vs {}",
+            v2[0],
+            v1[0]
+        );
+        let rescaled_var = v2[1] * 1e-3 * 1e-3;
+        assert!(
+            (rescaled_var - v1[1]).abs() <= 1e-9 * v1[1].abs(),
+            "poisson slope variance must scale by s²: {rescaled_var} vs {}",
+            v1[1]
+        );
     }
 
     /// Under the Gamma inverse link η = 1/μ, so a legitimate small-mean fit sits
@@ -1188,9 +1264,14 @@ mod tests {
             "a small-mean Gamma inverse-link fit carries |η| ≈ 100 honestly and \
              must not be rejected as divergence"
         );
+        // The multiplicative jitter is not centered exactly at 1 under the
+        // Gamma/inverse-link weighting (its IRLS weight is μ⁻² = η², so the
+        // η-dependent jitter values do not average out to the noise-free
+        // η = 100 − 20x line): the fit lands at intercept ≈ 100.0512, not
+        // exactly 100.
         assert!(
-            (fit.betas[0] - 100.0).abs() < 5.0,
-            "intercept on the 1/μ scale should land near 100, got {}",
+            (fit.betas[0] - 100.0512).abs() < 1e-4,
+            "intercept on the 1/μ scale should land at ≈100.0512, got {}",
             fit.betas[0]
         );
     }

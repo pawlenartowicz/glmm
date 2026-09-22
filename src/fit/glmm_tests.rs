@@ -2,7 +2,7 @@
 //! `re: Some`, dense + sparse-Schur equivalence + AGQ + two-stage).
 
 use super::*;
-use crate::glmm::{build_z, glmm_laplace_deviance, GlmmWorkspace, OuterSearch, StructuredSchur};
+use crate::glmm::{glmm_laplace_deviance, GlmmWorkspace, OuterSearch, StructuredSchur};
 use crate::test_support::assert_near;
 use crate::{
     BinomialLink, Family, GroupIds, Grouping, GroupingRelation, ModelSpec, PoissonLink,
@@ -10,7 +10,10 @@ use crate::{
 };
 use faer::Mat;
 
-use super::common_tests::{assert_pinned, dense_ids, dense_str, sim_clustered};
+use super::common_tests::{
+    assert_pinned, dense_ids, dense_str, inf_plateau_exp1, inf_plateau_lcg_next,
+    inf_plateau_normal, inf_plateau_poisson, lcg, sim_clustered,
+};
 
 /// `run_glmm_on` + `glmm_view_to_fit` must reproduce the `Fit`
 /// that the full `fit_cold` dispatch produces for a clustered binomial GLMM —
@@ -199,8 +202,9 @@ fn fit_warm_glmm_partial_start_cold_starts_the_missing_component() {
 
 /// Committed cbpp design, expanded to `size` Bernoulli 0/1 rows per record:
 /// `(x [n·4 row-major], y, herd cluster_ids, n)`. Shared by the cbpp oracle
-/// test and `fit_grouped_honors_opts_wald_se`.
-fn cbpp_design() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
+/// test, `fit_grouped_honors_opts_wald_se`, and (`pub(crate)`)
+/// `core_tests::counters_show_the_outer_search_stage_split`.
+pub(crate) fn cbpp_design() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
     let csv = include_str!("../../validation/data/empirical/cbpp.csv");
     let mut x = Vec::<f64>::new();
     let mut y = Vec::<f64>::new();
@@ -230,8 +234,9 @@ fn cbpp_design() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
 
 /// Structure-only cbpp model: `Binomial{Logit}` + a single intercept herd
 /// grouping (15 clusters; explicit ids place each row). Method knobs live in
-/// `FitOptions` now, not here.
-fn cbpp_model() -> ModelSpec {
+/// `FitOptions` now, not here. `pub(crate)`: also used by
+/// `core_tests::counters_show_the_outer_search_stage_split`.
+pub(crate) fn cbpp_model() -> ModelSpec {
     ModelSpec {
         family: Family::Binomial {
             link: BinomialLink::Logit,
@@ -383,6 +388,145 @@ fn fit_glmm_cbpp_matches_lme4() {
     assert!(
         sd_rel < 1e-3,
         "herd SD = {herd_sd} vs lme4 {CBPP_REF_HERD_SD} (rel {sd_rel})"
+    );
+}
+
+/// The presence half of the `PirlsExhausted` contract `fit_glmm_cbpp_matches_lme4`
+/// above asserts the absence of: a real solve whose opening trial points run the
+/// full `PIRLS_MAX_ITERS` cap, so the note's payload is produced by the fit path
+/// rather than by a hand-built `FitDiagnostics` carrier.
+///
+/// The design itself is benign — a 4-cluster Gamma-log GLMM that cold-fits with
+/// no note at all — and the pathology is the warm start alone. θ₀ = 1e5 puts
+/// BOBYQA's opening trial points at a random-effect scale where the penalized
+/// deviance has no mode reachable inside the cap; each such eval scores
+/// `+INFINITY` and is rejected, and the search walks back to the cold optimum.
+/// So `final_eval` stays false and the reported estimates are the cold ones
+/// (measured: worst β gap 7.9e-6 relative, deviance 2.4e-12) — this is exactly
+/// the "a note with `final_eval == false` costs nothing observable" case.
+///
+/// The second arm re-fits the same warm start under the RX/Schur SE denominator
+/// instead of the FD joint Hessian. Both arms share one fit path and differ only
+/// in the post-fit SE pass, so an `evals` that moved between them would mean the
+/// SE pass's own tight-tolerance PIRLS solves had leaked into the fit-path
+/// counter that the note is defined over.
+#[test]
+fn pirls_exhausted_note_counts_fit_path_evals_only() {
+    let (n, n_clusters, p) = (24usize, 4usize, 2usize);
+    // Cluster offsets live on the log-mean scale and span ±3, which is what
+    // makes the far-out θ trial points unsolvable rather than merely slow;
+    // y is Gamma(shape 1) about exp(η), so the cold fit is ordinary.
+    let mut st = 7u64;
+    let u: Vec<f64> = (0..n_clusters).map(|_| 3.0 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        y[i] = (0.5 + 0.8 * x1 + u[i % n_clusters]).exp() * inf_plateau_exp1(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % n_clusters) as u32).collect(),
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(
+        cold.converged(),
+        "the cold fit of this design must converge"
+    );
+    assert!(
+        cold.diagnostics.notes.is_empty(),
+        "cold-started, no trial point reaches the cap, got {:?}",
+        cold.diagnostics.notes
+    );
+
+    let start = StartValues {
+        beta: vec![],
+        theta: vec![1e5],
+    };
+    let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+    assert!(
+        warm.converged(),
+        "the search must still reach the optimum from the absurd start"
+    );
+    let [note] = &warm.diagnostics.notes[..] else {
+        panic!(
+            "expected exactly one note, got {:?}",
+            warm.diagnostics.notes
+        );
+    };
+    let Note::PirlsExhausted { evals, final_eval } = note else {
+        panic!("expected PirlsExhausted, got {note:?}");
+    };
+    // Not pinned to the observed 17: how many of BOBYQA's trial points land in
+    // the unsolvable region moves with the optimizer. What is pinned is that
+    // fit-path evals are counted at all, and that the solve behind the reported
+    // estimates is not one of them.
+    assert!(*evals > 0, "the exhausted trial evals must be counted");
+    assert!(
+        !*final_eval,
+        "the re-evaluation at γ̂ converges, so the reported estimates are untruncated"
+    );
+    for j in 0..p {
+        let rel = (warm.beta[j] - cold.beta[j]).abs() / cold.beta[j].abs();
+        assert!(
+            rel < 1e-4,
+            "β[{j}] warm {} vs cold {} (rel {rel})",
+            warm.beta[j],
+            cold.beta[j]
+        );
+    }
+    let dev_rel = (warm.deviance - cold.deviance).abs() / cold.deviance.abs();
+    assert!(
+        dev_rel < 1e-9,
+        "deviance warm {} vs cold {} (rel {dev_rel})",
+        warm.deviance,
+        cold.deviance
+    );
+
+    let rx = fit_warm(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        Some(&start),
+        &FitOptions {
+            wald_se: WaldSe::Rx,
+            ..opts.clone()
+        },
+    );
+    let Some(Note::PirlsExhausted {
+        evals: rx_evals, ..
+    }) = rx.diagnostics.notes.first()
+    else {
+        panic!(
+            "expected PirlsExhausted on the Rx arm, got {:?}",
+            rx.diagnostics.notes
+        );
+    };
+    assert_eq!(
+        rx_evals, evals,
+        "the FD-Hessian SE pass must not add to the fit-path eval count"
     );
 }
 
@@ -697,12 +841,15 @@ fn weighted_glmm_design(x1: &[f64]) -> (Vec<f64>, Vec<u32>, usize, usize) {
 /// x1 <- round(rnorm(n), 4); w <- sample(1:4, n, TRUE)
 /// b <- rnorm(12, 0, 0.5)
 /// y <- rpois(n, exp(0.3 + 0.5 * x1 + b[g]))
-/// f <- glmer(y ~ x1 + (1 | g), family = poisson, weights = w)
+/// f <- glmer(y ~ x1 + (1 | g), family = poisson, weights = w,
+///            control = glmerControl(tolPwrss = 1e-13))
 /// print(summary(f)$coefficients, digits = 15)
 /// print(as.data.frame(VarCorr(f)), digits = 15)
 /// ```
-/// Tolerances mirror `fit_glmm_cbpp_matches_lme4` (2e-3 abs β, 3e-2 rel SE,
-/// 3e-3 rel RE SD).
+/// β (2e-3 abs) and the RE SD (3e-3 rel) mirror `fit_glmm_cbpp_matches_lme4`.
+/// SE band 1e-3, like the other goldens in this file: `tolPwrss = 1e-13` holds
+/// `glmer` to the mode, so its log|A| comes from working weights at the mode
+/// (see src/glmm/se.rs).
 #[test]
 fn fit_glmm_poisson_weighted_matches_lme4() {
     const X1: [f64; 120] = [
@@ -735,9 +882,9 @@ fn fit_glmm_poisson_weighted_matches_lme4() {
         5., 1., 1., 1., 3., 1., 5., 0., 4., 2., 3., 1., 3., 0., 2., 3., 0., 1., 2., 4., 2., 2., 0.,
         1., 0., 2., 0., 1., 1., 0.,
     ];
-    const REF_BETA: [f64; 2] = [0.235954720439220, 0.547941515043755];
-    const REF_SE: [f64; 2] = [0.1756494873870279, 0.0594199356963711];
-    const REF_G_SD: f64 = 0.575359686811311;
+    const REF_BETA: [f64; 2] = [0.235917526156541, 0.547943727436689];
+    const REF_SE: [f64; 2] = [0.1758115943204218, 0.0597574539823975];
+    const REF_G_SD: f64 = 0.575373557412504;
 
     let (x, ids, n, p) = weighted_glmm_design(&X1);
     let model = ModelSpec {
@@ -776,8 +923,10 @@ fn fit_glmm_poisson_weighted_matches_lme4() {
             (f.beta[j] - REF_BETA[j]).abs()
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        // `validation/tol.R`'s se_hessian_rel, the same band the artifact-free
+        // goldens in this file hold.
         assert!(
-            se_rel < 3e-2,
+            se_rel < 1e-3,
             "se[{j}] = {} vs lme4 {} (rel {se_rel})",
             f.se[j],
             REF_SE[j]
@@ -803,12 +952,13 @@ fn fit_glmm_poisson_weighted_matches_lme4() {
 /// b <- rnorm(12, 0, 0.4)
 /// mu <- exp(0.8 + 0.4 * x1 + b[g])
 /// y <- round(rgamma(n, shape = 3, scale = mu / 3), 6)
-/// f <- glmer(y ~ x1 + (1 | g), family = Gamma("log"), weights = w)
+/// f <- glmer(y ~ x1 + (1 | g), family = Gamma("log"), weights = w,
+///            control = glmerControl(tolPwrss = 1e-13))
 /// print(summary(f)$coefficients, digits = 15)
 /// print(as.data.frame(VarCorr(f)), digits = 15); print(sigma(f)^2, digits = 15)
 /// ```
 /// τ² is compared on lme4's VarCorr vcov scale (σ̂²·θ̂²). SE tolerance is the
-/// cbpp 3e-2; β mirrors `fit_glmm_gamma_sim_matches_lme4`'s relative gate.
+/// cbpp 1e-3; β mirrors `fit_glmm_gamma_sim_matches_lme4`'s relative gate.
 #[test]
 fn fit_glmm_gamma_weighted_matches_lme4() {
     // R-generated covariate data; 1.1283 coincidentally approximates 2/√π.
@@ -851,9 +1001,9 @@ fn fit_glmm_gamma_weighted_matches_lme4() {
         4.525327, 5.201431, 1.504496, 5.951359, 1.258666, 5.439477, 2.243875, 0.603161, 1.000063,
         2.337211, 0.981631, 0.914213,
     ];
-    const REF_BETA: [f64; 2] = [0.863125471935252, 0.372178348714047];
-    const REF_SE: [f64; 2] = [0.0654914008493939, 0.0333300007320761];
-    const REF_G_VCOV: f64 = 0.0510221486396947; // σ̂²·θ̂² (lme4 VarCorr vcov)
+    const REF_BETA: [f64; 2] = [0.863096050047979, 0.372185978193556];
+    const REF_SE: [f64; 2] = [0.0654910409193553, 0.0333306334749443];
+    const REF_G_VCOV: f64 = 0.0510270265232477; // σ̂²·θ̂² (lme4 VarCorr vcov)
 
     let (x, ids, n, p) = weighted_glmm_design(&X1);
     let model = ModelSpec {
@@ -892,8 +1042,9 @@ fn fit_glmm_gamma_weighted_matches_lme4() {
             REF_BETA[j]
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        // `validation/tol.R`'s se_hessian_rel; measured worst here 8.8e-6.
         assert!(
-            se_rel < 3e-2,
+            se_rel < 1e-3,
             "se[{j}] = {} vs lme4 {} (rel {se_rel})",
             f.se[j],
             REF_SE[j]
@@ -988,7 +1139,8 @@ fn fit_glmm_poisson_grouseticks_matches_lme4() {
             REF_BETA[j]
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
-        assert!(se_rel < 3e-2, "se[{j}] = {} vs lme4 {}", f.se[j], REF_SE[j]);
+        // `validation/tol.R`'s se_hessian_rel; measured worst here 1.5e-4.
+        assert!(se_rel < 1e-3, "se[{j}] = {} vs lme4 {}", f.se[j], REF_SE[j]);
     }
     let sd_rel = (f.tau2[0].sqrt() - REF_INDEX_SD).abs() / REF_INDEX_SD;
     assert!(
@@ -1260,21 +1412,14 @@ fn sparse_schur_deviance_equals_dense_grouseticks() {
     let (model, ids, _perm) = spec_sized_from_ids_pub(&model, &ids);
     let slope_cols: Vec<usize> = vec![];
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
-    // Column-major x + build_z + StructuredSchur, as fit_glmm does.
+    // Column-major x + StructuredSchur, as fit_glmm does.
     let mut xm = Mat::<f64>::zeros(n, p);
     for i in 0..n {
         for j in 0..p {
             xm[(i, j)] = x[i * p + j];
         }
     }
-    build_z(
-        &mut ws,
-        xm.as_ref().subrows(0, n),
-        &ids.primary,
-        &ids.extra,
-        n,
-    );
-    ws.structured_schur = StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n);
+    ws.pattern.structured_schur = StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n);
     // A representative interior θ (the blind start θ₀ for the 3 groupings) + a β
     // (the GLM warm start, matching what `fit_glmm` would open PIRLS at).
     let params: Vec<f64> = {
@@ -1292,7 +1437,7 @@ fn sparse_schur_deviance_equals_dense_grouseticks() {
         prm
     };
 
-    ws.force_dense_schur = true;
+    ws.pattern.force_dense_schur = true;
     let dev_dense = glmm_laplace_deviance(
         &params,
         &mut ws,
@@ -1302,7 +1447,7 @@ fn sparse_schur_deviance_equals_dense_grouseticks() {
         &ids.extra,
         n,
     );
-    ws.force_dense_schur = false;
+    ws.pattern.force_dense_schur = false;
     let dev_sparse = glmm_laplace_deviance(
         &params,
         &mut ws,
@@ -1356,19 +1501,12 @@ fn sparse_schur_se_equals_dense_grouseticks() {
 
     let run = |force_dense: bool| -> (Vec<f64>, bool) {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
-        build_z(
-            &mut ws,
-            xm.as_ref().subrows(0, n),
-            &ids.primary,
-            &ids.extra,
-            n,
-        );
-        ws.structured_schur = if ws.groupings.structured_extras_eligible() {
+        ws.pattern.structured_schur = if ws.groupings.structured_extras_eligible() {
             StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
         } else {
             None
         };
-        ws.force_dense_schur = force_dense;
+        ws.pattern.force_dense_schur = force_dense;
         let fit = crate::glmm::fit_glmm(
             &mut ws,
             xm.as_ref().subrows(0, n),
@@ -1381,7 +1519,7 @@ fn sparse_schur_se_equals_dense_grouseticks() {
             n,
             WaldSe::Rx,
         );
-        (ws.var_diag[..p].to_vec(), fit.converged)
+        (ws.inference.var_diag[..p].to_vec(), fit.converged)
     };
 
     let (var_dense, conv_dense) = run(true);
@@ -1430,10 +1568,10 @@ fn sparse_schur_small_e_matches_dense() {
     for (pi, &pe) in prim_eff.iter().enumerate() {
         for (ei, &ee) in extra_eff.iter().enumerate() {
             for _ in 0..reps {
-                let cov = crate::sparse::test_lcg(&mut st);
+                let cov = lcg(&mut st);
                 let eta = 0.2 + 0.6 * cov + pe + ee;
                 let prob = 1.0 / (1.0 + (-eta).exp());
-                let draw = (crate::sparse::test_lcg(&mut st) + 1.0) / 2.0;
+                let draw = (lcg(&mut st) + 1.0) / 2.0;
                 xm[(i, 0)] = 1.0;
                 xm[(i, 1)] = cov;
                 cl[i] = pi as u32;
@@ -1478,19 +1616,12 @@ fn sparse_schur_small_e_matches_dense() {
 
     let run = |force_dense: bool| -> (Vec<f64>, Vec<f64>, bool) {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
-        build_z(
-            &mut ws,
-            xm.as_ref().subrows(0, n),
-            &ids.primary,
-            &ids.extra,
-            n,
-        );
-        ws.structured_schur = if ws.groupings.structured_extras_eligible() {
+        ws.pattern.structured_schur = if ws.groupings.structured_extras_eligible() {
             StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
         } else {
             None
         };
-        ws.force_dense_schur = force_dense;
+        ws.pattern.force_dense_schur = force_dense;
         let fit = crate::glmm::fit_glmm(
             &mut ws,
             xm.as_ref().subrows(0, n),
@@ -1503,7 +1634,11 @@ fn sparse_schur_small_e_matches_dense() {
             n,
             WaldSe::Rx,
         );
-        (ws.betas.clone(), ws.var_diag[..p].to_vec(), fit.converged)
+        (
+            ws.betas.clone(),
+            ws.inference.var_diag[..p].to_vec(),
+            fit.converged,
+        )
     };
 
     let (beta_dense, var_dense, conv_dense) = run(true);
@@ -1999,9 +2134,11 @@ fn fit_glmm_probit_cbpp_matches_lme4() {
         "herd sd = {} vs lme4 {REF_HERD_SD}",
         f.tau2[0].sqrt()
     );
+    // SE band is `validation/tol.R`'s se_hessian_rel; measured worst 1.1e-4,
+    // the ~1e-4 agreement the header attributes to `PIRLS_TOL_REL_NONCANON`.
     for ((&b, &rb), (&s, &rs)) in f.beta.iter().zip(&REF_BETA).zip(f.se.iter().zip(&REF_SE)) {
         assert!((b - rb).abs() / rb.abs() < 2e-3, "β = {b} vs lme4 {rb}");
-        assert!((s - rs).abs() / rs < 3e-2, "se = {s} vs lme4 {rs}");
+        assert!((s - rs).abs() / rs < 1e-3, "se = {s} vs lme4 {rs}");
     }
 }
 
@@ -2077,9 +2214,10 @@ fn fit_glmm_cloglog_matches_lme4() {
         },
     );
     assert!(f.converged(), "cloglog GLMM must converge");
+    // SE band is `validation/tol.R`'s se_hessian_rel; measured worst 6.9e-6.
     for ((&b, &rb), (&s, &rs)) in f.beta.iter().zip(&REF_BETA).zip(f.se.iter().zip(&REF_SE)) {
         assert!((b - rb).abs() / rb.abs() < 2e-3, "β = {b} vs lme4 {rb}");
-        assert!((s - rs).abs() / rs < 3e-2, "se = {s} vs lme4 {rs}");
+        assert!((s - rs).abs() / rs < 1e-3, "se = {s} vs lme4 {rs}");
     }
     let (sd, _corr) = f.stddev_corr(0);
     assert!(
@@ -2256,7 +2394,8 @@ fn fit_glmm_gamma_sim_matches_lme4() {
             REF_BETA[j]
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
-        assert!(se_rel < 3e-2, "se[{j}] = {} vs lme4 {}", f.se[j], REF_SE[j]);
+        // `validation/tol.R`'s se_hessian_rel; measured worst here 1.9e-4.
+        assert!(se_rel < 1e-3, "se[{j}] = {} vs lme4 {}", f.se[j], REF_SE[j]);
     }
     // Via stddev_corr/varcorr — σ̂²-scaled like tau2, so it gates
     // the public accessor directly against lme4's VarCorr stddev.
@@ -2303,8 +2442,10 @@ fn fit_glmm_gamma_sim_matches_lme4() {
     #[allow(clippy::needless_range_loop)]
     for j in 0..p {
         let se_rel = (f_rx.se[j] - REF_SE_RX[j]).abs() / REF_SE_RX[j];
+        // Method-matched arm, so `validation/tol.R`'s se_rel, not se_hessian_rel;
+        // measured worst here 1.7e-4.
         assert!(
-            se_rel < 3e-2,
+            se_rel < 1e-3,
             "rx se[{j}] = {} vs lme4 {}",
             f_rx.se[j],
             REF_SE_RX[j]
@@ -2312,12 +2453,78 @@ fn fit_glmm_gamma_sim_matches_lme4() {
     }
 }
 
+/// The `dispersion: Some(v)` directive on the GLMM route: φ̂ is reported as the
+/// held value instead of the Pearson moment estimate, and φ stops costing a
+/// degree of freedom, so `df` drops to 3 β + 1 θ. Same `sim_gamma` design as
+/// `fit_glmm_gamma_sim_matches_lme4`, whose estimate-φ `df` is 5.
+#[test]
+fn fit_glmm_gamma_fixed_dispersion_is_reported_and_costs_no_df() {
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    const PHI: f64 = 0.75;
+    let held = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            dispersion: Some(PHI),
+            ..FitOptions::default()
+        },
+    );
+    let free = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    assert!(
+        held.converged() && free.converged(),
+        "gamma GLMM must converge"
+    );
+    assert_eq!(held.dispersion, PHI, "held φ must be reported verbatim");
+    assert!(
+        (free.dispersion - PHI).abs() > 1e-3,
+        "the held value must differ from the Pearson estimate {} or this proves nothing",
+        free.dispersion
+    );
+    assert_eq!(free.df, 5); // 3 β + cluster θ + φ
+    assert_eq!(held.df, free.df - 1, "a held φ costs no degree of freedom");
+}
+
 /// `WaldSe::Hessian` and `WaldSe::Rx` must report the same fitted point on
-/// `sim_gamma`: `joint_hessian_cov`'s tail re-eval keeps `ws.prob` and `ws.u`
+/// `sim_gamma`: `joint_hessian_cov`'s tail re-eval keeps `ws.pirls.prob` and `ws.pirls.u`
 /// at the same pinned re-eval mode, so Gamma's σ̂² (`family::glmm_sigma_sq`)
-/// is built from a matched pair — leaving `ws.prob` at its own re-solve while
-/// `ws.u` is put back to the pinned mode would mismatch them.
-/// `tau2`/`varcorr`/`dispersion` derive from that σ̂², and `fitted` IS `ws.prob`.
+/// is built from a matched pair — leaving `ws.pirls.prob` at its own re-solve while
+/// `ws.pirls.u` is put back to the pinned mode would mismatch them.
+/// `tau2`/`varcorr`/`dispersion` derive from that σ̂², and `fitted` IS `ws.pirls.prob`.
 #[test]
 fn fit_glmm_gamma_hessian_rx_agree_on_fitted() {
     let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
@@ -2535,26 +2742,23 @@ fn fit_glmm_nb_sim_matches_lme4() {
     assert_eq!(f.df, 5); // 3 β + cluster θ_RE + NB θ
 
     const BAND: f64 = 1e-7;
-    // Additive bit-exact pin (see doc comment above). Re-pinned 2026-09-06 (twice).
-    // First: θ_NB became a coordinate of the outer BOBYQA on the marginal
-    // objective, not a golden-section bracket over re-fits; the incumbent is
-    // the answer and there is no final fit at θ̂. That move was 7.2e-6 relative
-    // on θ̂ — inside the bracket's own 1e-4 `ln θ` resolution — and the two
-    // routes' marginal log-likelihoods agreed to 4.6e-7 absolute
-    // (`nb_coordinate_reaches_the_bracket_optimum`). Second: the coordinate's
-    // cold start moved from the method-of-moments seed to the no-RE GLM-NB's
-    // own θ̂ (the moment seed charges the RE variance to the dispersion, which
-    // is harmless on this intercept-only fixture but breaks random-slope NB
-    // shapes). That move was 1.00e-4 relative on θ̂, still inside the bracket's
-    // own resolution.
-    const REF_BETA_PIN: [f64; 3] = [-0.020769389421119777, 0.59395431629629, 0.5994447607631596];
-    const REF_SE_PIN: [f64; 3] = [
-        0.16316288715392654,
-        0.07212626650783861,
-        0.14147781125669748,
+    // Additive bit-exact pin (see doc comment above). What produces these
+    // values: θ_NB is a coordinate of the outer BOBYQA on the marginal
+    // objective — the incumbent is the answer, there is no final fit at θ̂ —
+    // started cold from the no-RE GLM-NB's own θ̂ (a method-of-moments seed
+    // charges the RE variance to the dispersion, which breaks random-slope NB
+    // shapes), and PIRLS returns the data term, `log|A|` and the factor at the
+    // returned iterate. The point meets this test's own lme4 bands (β 5e-3,
+    // se 5e-2, sd 2e-2, θ̂ 5e-2) with 2.8 to four orders to spare: β within
+    // 8.3e-6 absolute, se within 1.3e-5 relative, cluster SD 1.5e-5, θ̂ 4.5e-6.
+    const REF_BETA_PIN: [f64; 3] = [
+        -0.020769959407223825,
+        0.5939568607057298,
+        0.5994414310028326,
     ];
-    const REF_TAU2_PIN: [f64; 1] = [0.32970146424114105];
-    const REF_THETA_PIN: f64 = 1.7837951781306456;
+    const REF_SE_PIN: [f64; 3] = [0.1631665854267635, 0.0721281096331149, 0.14148098492027553];
+    const REF_TAU2_PIN: [f64; 1] = [0.32971870514707935];
+    const REF_THETA_PIN: f64 = 1.7836281070311075;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb pinned tau2");
@@ -2566,16 +2770,117 @@ fn fit_glmm_nb_sim_matches_lme4() {
     );
 }
 
-/// The dense route searches `ln θ_NB` as a coordinate of its BOBYQA; the sparse
-/// route still maximises the same marginal objective by the golden-section
-/// bracket over full re-fits. On one dataset both must reach the same optimum:
-/// `loglik` to 1e-5 absolute (optimizer-noise deviance gaps on rungs of this
-/// size measured 1e-7 to 1e-10 when the exact β-profile landed, 2026-09-04;
-/// two decades of margin) and θ̂ to 1e-3 relative (the bracket resolves `ln θ`
-/// to 1e-4). `sim_nb` is in the dense envelope; the sparse driver is called
-/// directly, which the in-envelope cross-check test does too.
+/// On an NB GLMM, `Fit::deviance` is the outer θ search's own objective —
+/// `dev(θ̂) − 2·saturated_loglik(θ̂)`, equal to `−2·logLik` exactly (see
+/// `fit_glmm`'s NB deviance and `fit::common::glmm_loglik`). Same `sim_nb`
+/// fixture and reference log-likelihood as `fit_glmm_nb_sim_matches_lme4`;
+/// this test only adds the deviance identity.
 #[test]
-fn nb_coordinate_reaches_the_bracket_optimum() {
+fn fit_glmm_nb_deviance_is_search_objective() {
+    let (x, y, cluster_ids, n_clusters) =
+        sim_clustered(include_str!("../../validation/data/simulated/sim_nb.csv"));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "NB GLMM must converge");
+    assert!(
+        (f.deviance + 2.0 * f.loglik).abs() < 1e-9 * f.deviance.abs(),
+        "deviance {} vs -2*loglik {}",
+        f.deviance,
+        -2.0 * f.loglik
+    );
+    // Same reference and band as `fit_glmm_nb_sim_matches_lme4`'s loglik pin —
+    // shows loglik did not move.
+    const REF_LOGLIK: f64 = -481.455529976646;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-2,
+        "loglik {} vs lme4 {REF_LOGLIK}",
+        f.loglik
+    );
+}
+
+/// The same `deviance = −2·logLik` identity under prior weights. The NB
+/// saturated term enters the reported deviance through
+/// `saturated_loglik(θ̂, y, weights)`, whose weighted branch no other NB GLMM
+/// test reaches. The identity is the whole test: no reference is needed, only
+/// that the deviance's correction and `loglik`'s are the same weighted sum.
+#[test]
+fn fit_glmm_nb_weighted_deviance_is_search_objective() {
+    let (x, y, cluster_ids, n_clusters) =
+        sim_clustered(include_str!("../../validation/data/simulated/sim_nb.csv"));
+    let (n, p) = (y.len(), 3);
+    let weights: Vec<f64> = (0..n).map(|i| 1.0 + 0.5 * ((i % 4) as f64)).collect();
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            weights: Some(weights),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "weighted NB GLMM must converge");
+    assert!(
+        (f.deviance + 2.0 * f.loglik).abs() < 1e-9 * f.deviance.abs(),
+        "weighted deviance {} vs -2*loglik {}",
+        f.deviance,
+        -2.0 * f.loglik
+    );
+}
+
+/// The `ln θ_NB` coordinate of the outer BOBYQA must reach the same optimum
+/// whichever `A`-layout evaluates the marginal objective under it. `sim_nb` is
+/// in the dense envelope, so the same design is fit twice: routed (blocked)
+/// through `fit_cold`, and forced onto the packed-row layout. `loglik` to 1e-5
+/// absolute (optimizer-noise deviance gaps on rungs of this size measured 1e-7
+/// to 1e-10 when the exact β-profile landed, 2026-09-04; two decades of margin)
+/// and θ̂ to 1e-3 relative.
+#[test]
+fn nb_coordinate_agrees_across_layouts() {
     let (x, y, cluster_ids, n_clusters) =
         sim_clustered(include_str!("../../validation/data/simulated/sim_nb.csv"));
     let (n, p) = (y.len(), 3);
@@ -2600,9 +2905,9 @@ fn nb_coordinate_reaches_the_bracket_optimum() {
         wald_se: crate::WaldSe::Rx,
         ..FitOptions::default()
     };
-    let dense = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let blocked = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     let (sized, ids, _perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
-    let sparse = crate::sparse::fit_glmm_nb_sparse(
+    let packed = crate::fit::fit_glmm_packed(
         &x,
         &y,
         n,
@@ -2610,23 +2915,24 @@ fn nb_coordinate_reaches_the_bracket_optimum() {
         &sized,
         &ids.primary,
         &ids.extra,
+        f64::NAN,
         None,
         &opts,
-    );
-    assert!(dense.converged() && sparse.converged());
+    )
+    .0;
+    assert!(blocked.converged() && packed.converged());
     assert!(
-        (dense.loglik - sparse.loglik).abs() < 1e-5,
-        "loglik dense {} vs bracket {}",
-        dense.loglik,
-        sparse.loglik
+        (blocked.loglik - packed.loglik).abs() < 1e-5,
+        "loglik blocked {} vs packed {}",
+        blocked.loglik,
+        packed.loglik
     );
     assert!(
-        (dense.dispersion - sparse.dispersion).abs() < 1e-3 * sparse.dispersion,
-        "θ̂ dense {} vs bracket {}",
-        dense.dispersion,
-        sparse.dispersion
+        (blocked.dispersion - packed.dispersion).abs() < 1e-3 * packed.dispersion,
+        "θ̂ blocked {} vs packed {}",
+        blocked.dispersion,
+        packed.dispersion
     );
-    assert!(dense.n_eval > 0);
 }
 
 /// The GLM outer loop's cold-start seed, pinned against its own formula. The
@@ -2788,10 +3094,18 @@ fn fit_glmm_nb_nested_unbalanced_matches_lme4() {
     // 3.1e-5, the g1 SD 2.0e-4, the g2:g1 SD 5.5e-6 — all far inside this
     // test's own 5e-3/2e-2/5e-2 lme4 bands. The pin is re-taken at the new
     // point.
-    const REF_BETA_PIN: [f64; 2] = [0.5850147343882003, 0.5073656491270585];
-    const REF_SE_PIN: [f64; 2] = [0.20481658210561515, 0.05399324240273177];
-    const REF_TAU2_PIN: [f64; 2] = [0.3956529554051399, 0.12615582632807115];
-    const REF_THETA_PIN: f64 = 1.4301019630196756;
+    // Fifth (2026-09-15): PIRLS returns the data term, `log|A|` and the factor
+    // at the returned iterate, where before the factor and `log|A|` were one
+    // Newton step behind. β[0] moved 5.5e-6, β[1] 8.4e-7, the SEs 1.6e-5 and
+    // 5.0e-6, τ̂² 3.1e-5 and 9.0e-5, θ̂ 2.1e-5 relative — an order smaller than
+    // the Fourth re-pin's own moves on this fixture, and far inside the same
+    // 5e-3/2e-2/5e-2 lme4 bands, which the new point meets at β 1.3e-5
+    // absolute, se 1.2e-5 relative, the two SDs 8.8e-6 and 5.8e-6, and θ̂
+    // 1.9e-6 (2.0e-5 before, so the fit sits closer to lme4's θ̂).
+    const REF_BETA_PIN: [f64; 2] = [0.5850115414592737, 0.5073652244060262];
+    const REF_SE_PIN: [f64; 2] = [0.20481981166967742, 0.05399297004417363];
+    const REF_TAU2_PIN: [f64; 2] = [0.3956652125784431, 0.12616717407427647];
+    const REF_THETA_PIN: f64 = 1.430132504448455;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb_nested pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb_nested pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb_nested pinned tau2");
@@ -2872,7 +3186,6 @@ fn two_stage_agq_bypass_is_bit_identical() {
 
     let run = |two_stage: bool| -> (Vec<f64>, Vec<f64>, f64, usize) {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &sized, n, &[], nagq);
-        build_z(&mut ws, xm.as_ref().subrows(0, n), &cluster_ids, &[], n);
         ws.outer_search = if two_stage {
             OuterSearch::PqlThenJoint
         } else {
@@ -2967,14 +3280,7 @@ fn assert_two_stage_matches_single_local(
     let run = |two_stage: bool| -> (Vec<f64>, Vec<f64>, f64, usize) {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &sized, n, &[], 1);
         ws.nb_theta = f64::NAN; // non-NB families ignore it (mirrors fit_glmm_impl)
-        build_z(
-            &mut ws,
-            xm.as_ref().subrows(0, n),
-            &ids.primary,
-            &ids.extra,
-            n,
-        );
-        ws.structured_schur = if ws.groupings.structured_extras_eligible() {
+        ws.pattern.structured_schur = if ws.groupings.structured_extras_eligible() {
             StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
         } else {
             None
@@ -3407,12 +3713,12 @@ fn fit_glmm_binomial_no_cluster_signal_is_singular() {
     let mut i = 0;
     for c in 0..n_clusters {
         for _ in 0..reps {
-            let cov = crate::sparse::test_lcg(&mut st);
+            let cov = lcg(&mut st);
             // Fixed-effects-only logit — no per-cluster deviation added, so
             // the true random-intercept variance is exactly zero.
             let eta = 0.3 + 0.5 * cov;
             let prob = 1.0 / (1.0 + (-eta).exp());
-            let draw = (crate::sparse::test_lcg(&mut st) + 1.0) / 2.0;
+            let draw = (lcg(&mut st) + 1.0) / 2.0;
             xm[(i, 0)] = 1.0;
             xm[(i, 1)] = cov;
             cl[i] = c;
@@ -3968,7 +4274,7 @@ fn loop_tier_honours_extra_grouping_slope() {
     for i in 0..n {
         g1[i] = (i % n_g1) as u32;
         g2[i] = (i % n_g2) as u32;
-        let x1 = crate::sparse::test_lcg(&mut st);
+        let x1 = lcg(&mut st);
         x[i * 2] = 1.0;
         x[i * 2 + 1] = x1;
         // Extra-grouping slope variance ≈ 0.9 in the fitted model — big enough that
@@ -4250,14 +4556,7 @@ fn dense_glmm_counters_split_stages_and_count_shrink_evals() {
 
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &sized, n, &[], 1);
     ws.nb_theta = f64::NAN; // non-NB families ignore it (mirrors fit_glmm_impl)
-    build_z(
-        &mut ws,
-        xm.as_ref().subrows(0, n),
-        &ids.primary,
-        &ids.extra,
-        n,
-    );
-    ws.structured_schur = if ws.groupings.structured_extras_eligible() {
+    ws.pattern.structured_schur = if ws.groupings.structured_extras_eligible() {
         StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
     } else {
         None
@@ -4522,11 +4821,10 @@ fn sim_nb_slope_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
 /// fixture actually reproduces that precondition (the moment seed at least
 /// 10x below θ̂) before trusting anything else, so a fixture whose
 /// random-effect variance or group imbalance drifted over time cannot pass
-/// while silently no longer covering the bug. It then checks the dense fit
-/// converges and agrees with the sparse negative-binomial route
-/// (`fit_glmm_nb_sparse`), which still finds θ̂ by a golden-section bracket
-/// over full re-fits rather than as a BOBYQA coordinate — a solver
-/// independent of the one under test, on the same marginal objective.
+/// while silently no longer covering the bug. It then checks the routed fit
+/// converges and agrees with the same design forced onto the packed-row
+/// layout — an independent `A`-layout under the same outer search, on the same
+/// marginal objective.
 #[test]
 fn fit_glmm_nb_random_slope_seed_lands_in_convergent_basin() {
     let (x, y, cluster_ids, n_clusters) = sim_nb_slope_dataset();
@@ -4553,8 +4851,8 @@ fn fit_glmm_nb_random_slope_seed_lands_in_convergent_basin() {
         ..FitOptions::default()
     };
 
-    let dense = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert!(dense.converged(), "NB random-slope GLMM must converge");
+    let blocked = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(blocked.converged(), "NB random-slope GLMM must converge");
 
     // The precondition the original bug needed: the naive moment seed must
     // land at least an order of magnitude below θ̂. A fixture that lost this
@@ -4562,13 +4860,13 @@ fn fit_glmm_nb_random_slope_seed_lands_in_convergent_basin() {
     // basin, so it would stop being a regression test for the bug at all.
     let moment_seed = crate::fit::nb_theta_moment_seed(&y, n);
     assert!(
-        moment_seed < dense.dispersion / 10.0,
+        moment_seed < blocked.dispersion / 10.0,
         "fixture must put the moment seed >=10x below θ̂: seed={moment_seed} θ̂={}",
-        dense.dispersion
+        blocked.dispersion
     );
 
     let (sized, ids, _perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
-    let sparse = crate::sparse::fit_glmm_nb_sparse(
+    let packed = crate::fit::fit_glmm_packed(
         &x,
         &y,
         n,
@@ -4576,65 +4874,27 @@ fn fit_glmm_nb_random_slope_seed_lands_in_convergent_basin() {
         &sized,
         &ids.primary,
         &ids.extra,
+        f64::NAN,
         None,
         &opts,
+    )
+    .0;
+    assert!(
+        packed.converged(),
+        "packed NB random-slope reference must converge"
     );
     assert!(
-        sparse.converged(),
-        "sparse NB random-slope reference must converge"
+        (blocked.loglik - packed.loglik).abs() < 1e-5,
+        "loglik blocked {} vs packed {}",
+        blocked.loglik,
+        packed.loglik
     );
     assert!(
-        (dense.loglik - sparse.loglik).abs() < 1e-5,
-        "loglik dense {} vs sparse bracket {}",
-        dense.loglik,
-        sparse.loglik
+        (blocked.dispersion - packed.dispersion).abs() < 1e-3 * packed.dispersion,
+        "θ̂ blocked {} vs packed {}",
+        blocked.dispersion,
+        packed.dispersion
     );
-    assert!(
-        (dense.dispersion - sparse.dispersion).abs() < 1e-3 * sparse.dispersion,
-        "θ̂ dense {} vs sparse bracket {}",
-        dense.dispersion,
-        sparse.dispersion
-    );
-    assert!(dense.n_eval > 0);
-}
-
-/// Uniform(0,1) via a 64-bit LCG (splitmix-style constants). Reproduces the
-/// `+INF`-plateau cell bit for bit.
-fn inf_plateau_lcg_next(state: &mut u64) -> f64 {
-    *state = state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (((*state >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
-}
-
-fn inf_plateau_normal(state: &mut u64) -> f64 {
-    let (u1, u2) = (inf_plateau_lcg_next(state), inf_plateau_lcg_next(state));
-    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-}
-
-fn inf_plateau_exp1(state: &mut u64) -> f64 {
-    -inf_plateau_lcg_next(state).ln()
-}
-
-/// Poisson(lambda) by the naive product-of-uniforms method — matches the
-/// reproduction exactly, including its large-lambda normal-approximation
-/// branch (never hit at this fixture's means).
-fn inf_plateau_poisson(state: &mut u64, lambda: f64) -> f64 {
-    if lambda > 200.0 {
-        return (lambda + lambda.sqrt() * inf_plateau_normal(state))
-            .max(0.0)
-            .round();
-    }
-    let l = (-lambda).exp();
-    let (mut k, mut prod) = (0.0f64, inf_plateau_lcg_next(state));
-    while prod > l {
-        k += 1.0;
-        prod *= inf_plateau_lcg_next(state);
-        if k > 1e6 {
-            break;
-        }
-    }
-    k
 }
 
 /// Negative-binomial counts (as a Poisson-Exponential(1) mixture, i.e. NB with
@@ -4643,9 +4903,9 @@ fn inf_plateau_poisson(state: &mut u64, lambda: f64) -> f64 {
 /// `+INF` plateau: 15 of the 16 gating-stage BOBYQA evaluations
 /// diverge in PIRLS (`laplace_deviance` returns `+INFINITY`), one evaluation
 /// is finite, and — before the finite-eval-count guard — the run exits
-/// `Status::Converged` at the untouched θ_RE cold start (`THETA0 = 1.0`)
-/// with a KKT residual above the crate's own interior band. Every draw comes
-/// off one seeded LCG, so the fixture is exactly reproducible.
+/// `Status::Converged` at the untouched θ_RE cold start (`THETA0 = 1.0`),
+/// with a KKT residual nowhere near a stationary point. Every draw comes off
+/// one seeded LCG, so the fixture is exactly reproducible.
 fn sim_nb_inf_plateau_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
     const N_CLUSTERS: usize = 10;
     const PER: usize = 3;
@@ -4683,8 +4943,8 @@ fn sim_nb_inf_plateau_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
 /// `rho_end` and exits `Status::Converged` having compared close to nothing.
 /// On this fixture only 1 of 16 stage-1 evaluations is genuinely finite, so
 /// before the fix the fit reported `converged = true` with `theta_RE` still
-/// at its cold start and a KKT residual above the interior band. The fix
-/// requires at least 2 finite evaluations before trusting `Status::Converged`.
+/// at its cold start and a KKT residual nowhere near zero. The fix requires
+/// at least 2 finite evaluations before trusting `Status::Converged`.
 #[test]
 fn fit_glmm_nb_random_intercept_inf_plateau_does_not_converge() {
     let (x, y, cluster_ids, n_clusters) = sim_nb_inf_plateau_dataset();
@@ -5150,33 +5410,26 @@ fn rung_table(r: &DenseLaplaceRung) -> (crate::formula::Table, Option<Vec<f64>>,
 }
 
 /// Rows the kernel's own clamps hold at the workspace's current point:
-/// `(Fisher weight floored at `glm::WEIGHT_CLAMP`, μ at `family::clamp_mu`'s
-/// bound, η at the link's `clamp_eta` bound)`.
+/// `(μ at `family::clamp_mu`'s bound, η at the link's `clamp_eta` bound)`.
 ///
-/// The first two come from `assembled::clamped_row_counts`, which is what the
+/// The μ count comes from `assembled::mu_clamped_rows`, which is what the
 /// assembled engine itself refuses on, so this census and that refusal cannot
-/// drift apart. The η count is this test's own: no corpus rung reaches an η
-/// clamp at γ̂, and one appearing is a regime change worth failing on.
+/// drift apart; `weighted` is what tells the two routes apart on the
+/// unweighted-logit exemption. The η count reads `family::clamp_eta_bounds`,
+/// the same table `clamp_eta` holds η inside, for the same reason. No corpus
+/// rung reaches an η clamp at γ̂, and one appearing is a regime change worth
+/// failing on.
 #[cfg(feature = "formula")]
-fn clamp_census(ws: &GlmmWorkspace, family: Family, n: usize) -> (usize, usize, usize) {
-    let (lo_eta, hi_eta) = match family {
-        Family::Binomial {
-            link: BinomialLink::Cloglog,
-        } => (-crate::family::ETA_MAX, crate::family::ETA_MAX.ln()),
-        Family::Poisson { .. } | Family::Gamma { .. } | Family::NegativeBinomial { .. } => {
-            (-crate::family::ETA_MAX, crate::family::ETA_MAX)
-        }
-        _ => (f64::NEG_INFINITY, f64::INFINITY),
-    };
-    let (w_clamped, mu_clamped) =
-        crate::glmm::clamped_row_counts(family, &ws.w[..n], &ws.prob[..n]);
+fn clamp_census(ws: &GlmmWorkspace, family: Family, weighted: bool, n: usize) -> (usize, usize) {
+    let (lo_eta, hi_eta) = crate::family::clamp_eta_bounds(family);
+    let mu_clamped = crate::glmm::mu_clamped_rows(family, weighted, &ws.pirls.prob[..n]);
     let mut eta_clamped = 0usize;
     for i in 0..n {
-        if ws.eta[i] <= lo_eta || ws.eta[i] >= hi_eta {
+        if ws.pirls.eta[i] <= lo_eta || ws.pirls.eta[i] >= hi_eta {
             eta_clamped += 1;
         }
     }
-    (w_clamped, mu_clamped, eta_clamped)
+    (mu_clamped, eta_clamped)
 }
 
 /// One rung lowered, fitted to its own γ̂ with `WaldSe::Rx` (so the fit runs
@@ -5241,9 +5494,13 @@ fn rung_at_gamma_hat(
         assert!(converged, "rung {}: fit must converge", r.rung);
         deviance
     };
+    // Either exact-derivative owner will do: `supports_exact_shape` for a
+    // layout with a dual kernel, `assembly_routes` for the packed-row layout,
+    // which has only the assembled engine. Each rung list fixes which.
     assert!(
-        crate::glmm::supports_exact_shape(&ws.groupings),
-        "rung {}: dense exact-derivative shape expected",
+        crate::glmm::supports_exact_shape(ws.layout, &ws.groupings)
+            || crate::glmm::assembly_routes(&ws, lo.n),
+        "rung {}: exact-derivative shape expected",
         r.rung
     );
     let sized_ids = sized_ids.into_owned();
@@ -5264,9 +5521,6 @@ fn rung_at_gamma_hat(
 struct RungReport {
     rung: u32,
     m: usize,
-    /// The assembled engine declined this rung's clamped mode state, so every
-    /// measured field below is zero and nothing was compared.
-    refused: bool,
     /// Worst relative gap between the `f64` assembled gradient and the dual one.
     worst_grad: f64,
     /// Worst relative gap between the two Hessians, per entry.
@@ -5276,14 +5530,87 @@ struct RungReport {
     /// Each pass's exit `‖u − u_prev‖`.
     step_asm: f64,
     step_hd: f64,
-    /// Rows on the Fisher-weight floor at γ̂.
-    w_clamped: usize,
+    /// Rows on the μ clamp at γ̂.
+    mu_clamped: usize,
+}
+
+/// Richardson-extrapolated central second difference of the f64 Laplace
+/// deviance, `(4·D_{base/2} − D_base)/3` — an independent arbiter for
+/// the `CLOGLOG_LARGE` fixture, checked against the assembled Hessian without
+/// going through the hyper-dual pass. Step absolute on θ (`k < n_theta`),
+/// relative × `max(|β|, 1)` on β, mirroring `packed_assembled_gradient_matches_richardson_fd`'s
+/// FD shape one derivative order down. `params` is γ̂, captured ONCE by the
+/// caller before any evaluation: `glmm_laplace_deviance` copies its argument
+/// into `ws.params` and leaves it there, so re-reading `ws.params` as the
+/// centre mid-sweep would walk the centre off γ̂ after the first perturbed
+/// call. `ws.pirls.u` is zeroed before every evaluation, so each one is a
+/// cold PIRLS solve at its own perturbed point, never warm-started from the
+/// last.
+#[cfg(feature = "formula")]
+#[allow(clippy::too_many_arguments)]
+fn richardson_fd_hessian(
+    ws: &mut GlmmWorkspace,
+    x: faer::MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    n: usize,
+    m: usize,
+    n_theta: usize,
+    base: f64,
+    params: &[f64],
+) -> Mat<f64> {
+    let params: Vec<f64> = params.to_vec();
+    let step = |k: usize, b: f64| -> f64 {
+        if k < n_theta {
+            b
+        } else {
+            b * params[k].abs().max(1.0)
+        }
+    };
+    let mut at = |shifts: &[(usize, f64)]| -> f64 {
+        let mut q = params.clone();
+        for &(k, s) in shifts {
+            q[k] += s;
+        }
+        ws.pirls.u.fill(0.0);
+        glmm_laplace_deviance(&q, ws, x, y, ids, extra_ids, n)
+    };
+    let f0 = at(&[]);
+    let mut raw = |b: f64| -> Mat<f64> {
+        let mut h = Mat::<f64>::zeros(m, m);
+        for i in 0..m {
+            let hi = step(i, b);
+            h[(i, i)] = (at(&[(i, hi)]) - 2.0 * f0 + at(&[(i, -hi)])) / (hi * hi);
+            for j in 0..i {
+                let hj = step(j, b);
+                let v =
+                    (at(&[(i, hi), (j, hj)]) - at(&[(i, hi), (j, -hj)]) - at(&[(i, -hi), (j, hj)])
+                        + at(&[(i, -hi), (j, -hj)]))
+                        / (4.0 * hi * hj);
+                h[(i, j)] = v;
+                h[(j, i)] = v;
+            }
+        }
+        h
+    };
+    let h1 = raw(base);
+    let h2 = raw(0.5 * base);
+    let mut out = Mat::<f64>::zeros(m, m);
+    for i in 0..m {
+        for j in 0..m {
+            out[(i, j)] = (4.0 * h2[(i, j)] - h1[(i, j)]) / 3.0;
+        }
+    }
+    out
 }
 
 /// The assembled joint Hessian against the hyper-dual one, entry by entry, at
 /// the same converged γ̂, on every dense Laplace GLMM rung of the validation
 /// corpus — the real datasets, lowered from the manifest's own formula through
-/// the crate's formula frontend, not a stand-in.
+/// the crate's formula frontend, not a stand-in — plus [`CLOGLOG_LARGE`], the
+/// 9,600-row cloglog fixture whose mode state carries a μ-clamped row, run at
+/// the same bands as everything else.
 ///
 /// Two independent exact routes to the same matrix: one differentiates the
 /// objective twice through packed second-order lanes, the other differentiates
@@ -5295,11 +5622,11 @@ struct RungReport {
 /// asymmetry (`max|H_ij − H_ji|` relative, over columns built by different
 /// chunks — a consistency check the packed pass cannot offer, its triangle
 /// being symmetric by construction), and each pass's exit `‖u − u_prev‖`, which
-/// is the size of the iterate mix each one differentiates.
-///
-/// A rung whose mode state carries a clamped row is the one case with nothing
-/// to compare: the assembled engine declines it and the fit ships the
-/// hyper-dual answer, so the assertion there is the refusal.
+/// is the size of the iterate mix each one differentiates. `mu_clamped` is a
+/// reported count now, not a switch: every rung is compared the same way
+/// whether or not any row is pinned, since a pinned row reads its deviance
+/// slope, observed weight and `dw/dη` off closed forms instead of breaking
+/// the comparison.
 #[cfg(feature = "formula")]
 #[test]
 fn assembled_hessian_matches_hyperdual_per_entry() {
@@ -5311,68 +5638,19 @@ fn assembled_hessian_matches_hyperdual_per_entry() {
     const GRAD_BAND: f64 = 1e-7;
     const BAND: f64 = 1e-10;
 
-    // A rung whose mode state carries a clamped row is not compared at all:
-    // both assembled entry points decline it, because the adjoint they run
-    // differentiates the mode equation `G = D_u + 2u = 0` and the floored
-    // weighted least squares PIRLS iterates does not satisfy it there. Such a
-    // fit ships the hyper-dual pass's Hessian, so what this test asserts on it
-    // is the refusal itself.
-    //
-    // `CLAMPED_RUNGS` is a tripwire: it fixes how many rungs of the corpus are
-    // in that regime — one, rung 49 (`sim_cloglog_nested_crossed`), with a
-    // single row of 288 whose raw Fisher weight is 3.39e-8 against the 1e-6
-    // floor — so a second one appearing, or that one leaving, fails here.
-    const CLAMPED_RUNGS: usize = 1;
-    let mut clamped_rungs = 0usize;
     let mut rows: Vec<RungReport> = Vec::new();
-    for r in DENSE_LAPLACE_RUNGS {
+    for r in DENSE_LAPLACE_RUNGS
+        .iter()
+        .chain(std::iter::once(&CLOGLOG_LARGE))
+    {
         let (mut ws, x, y, ids, extra_ids, p, n, dev) = rung_at_gamma_hat(r);
         let m = ws.n_theta + p;
-        let (w_clamped, mu_clamped, eta_clamped) = clamp_census(&ws, r.family, n);
+        let (mu_clamped, eta_clamped) = clamp_census(&ws, r.family, ws.weighted, n);
         assert_eq!(
             eta_clamped, 0,
             "rung {}: a clamped η at γ̂ is a new regime, not a band",
             r.rung
         );
-        if w_clamped > 0 || mu_clamped > 0 {
-            clamped_rungs += 1;
-            let mut h = Mat::<f64>::zeros(m, m);
-            let mut g = vec![0.0; m];
-            let st = crate::glmm::joint_hessian_columns(
-                &mut ws,
-                x.as_ref(),
-                &y,
-                &ids,
-                &extra_ids,
-                p,
-                n,
-                &mut g,
-                &mut h,
-            );
-            assert!(
-                matches!(st, crate::glmm::DerivStatus::Unsupported),
-                "rung {}: a clamped mode state must be refused",
-                r.rung
-            );
-            assert!(
-                crate::glmm::gradient_f64(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut g)
-                    .is_none(),
-                "rung {}: the f64 assembled gradient must refuse the same state",
-                r.rung
-            );
-            rows.push(RungReport {
-                rung: r.rung,
-                m,
-                refused: true,
-                worst_grad: 0.0,
-                worst: 0.0,
-                asym: 0.0,
-                step_asm: 0.0,
-                step_hd: 0.0,
-                w_clamped,
-            });
-            continue;
-        }
 
         // Stage 1 on the real data: the `f64` assembled gradient against
         // `laplace_gradient`, per coordinate. Two ways of differentiating the
@@ -5502,36 +5780,291 @@ fn assembled_hessian_matches_hyperdual_per_entry() {
             "rung {}: pre-symmetrization asymmetry {asym:e} above the band",
             r.rung
         );
+
+        // `CLOGLOG_LARGE` only: a second, independent arbiter — the
+        // Richardson-extrapolated central second difference of the f64
+        // Laplace deviance, at base steps 4e-3 and 8e-3 — so the assembled
+        // Hessian is checked against something other than the hyper-dual
+        // pass too. `FD_BAND` is the arbiter's own reproducibility between
+        // those two base steps, not a statement about either engine: nothing
+        // tighter than the arbiter's own drift would be. Measured on this
+        // tree: reproducibility (base 4e-3 vs 8e-3) 2.08e-7 over all entries,
+        // 3.95e-8 on the diagonal; assembled vs the base-4e-3 estimate
+        // 3.20e-7 worst entry — `FD_BAND` sits above that measured worst and
+        // below twice it.
+        if std::ptr::eq(r, &CLOGLOG_LARGE) {
+            const FD_BAND: f64 = 4e-7;
+            let n_theta = ws.n_theta;
+            ws.fd.pirls_tol_override = Some(1e-12);
+            let gamma_hat: Vec<f64> = ws.params[..m].to_vec();
+            let fd4 = richardson_fd_hessian(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &extra_ids,
+                n,
+                m,
+                n_theta,
+                4e-3,
+                &gamma_hat,
+            );
+            let fd8 = richardson_fd_hessian(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &extra_ids,
+                n,
+                m,
+                n_theta,
+                8e-3,
+                &gamma_hat,
+            );
+            ws.fd.pirls_tol_override = None;
+            let mut repro_all = 0.0f64;
+            let mut repro_diag = 0.0f64;
+            for i in 0..m {
+                for j in 0..m {
+                    let gap = (fd4[(i, j)] - fd8[(i, j)]).abs()
+                        / fd4[(i, j)].abs().min(fd8[(i, j)].abs()).max(1.0);
+                    repro_all = repro_all.max(gap);
+                    if i == j {
+                        repro_diag = repro_diag.max(gap);
+                    }
+                }
+            }
+            let mut worst_fd = 0.0f64;
+            for i in 0..m {
+                for j in 0..m {
+                    let gap = (h_asm[(i, j)] - fd4[(i, j)]).abs()
+                        / h_asm[(i, j)].abs().min(fd4[(i, j)].abs()).max(1.0);
+                    worst_fd = worst_fd.max(gap);
+                    assert!(
+                        gap <= FD_BAND,
+                        "CLOGLOG_LARGE entry ({i},{j}): assembled {} vs Richardson FD(4e-3) {} \
+                         (relative gap {gap:e})",
+                        h_asm[(i, j)],
+                        fd4[(i, j)]
+                    );
+                }
+            }
+            println!(
+                "CLOGLOG_LARGE: FD reproducibility (4e-3 vs 8e-3) all entries {repro_all:e}, \
+                 diagonal {repro_diag:e}; assembled vs FD(4e-3) worst {worst_fd:e}"
+            );
+        }
+
         rows.push(RungReport {
             rung: r.rung,
             m,
-            refused: false,
             worst_grad,
             worst,
             asym,
             step_asm,
             step_hd,
-            w_clamped,
+            mu_clamped,
         });
     }
-    assert_eq!(rows.len(), DENSE_LAPLACE_RUNGS.len(), "every rung must run");
     assert_eq!(
-        clamped_rungs, CLAMPED_RUNGS,
-        "the number of rungs whose mode state carries a clamped row at γ̂ moved"
+        rows.len(),
+        DENSE_LAPLACE_RUNGS.len() + 1,
+        "every rung, plus CLOGLOG_LARGE, must run"
     );
     for r in &rows {
-        if r.refused {
-            println!(
-                "rung {}: m {}, refused — {} clamped rows at γ̂",
-                r.rung, r.m, r.w_clamped
-            );
-            continue;
-        }
         println!(
             "rung {}: m {}, gradient {:e}, worst entry {:e}, asymmetry {:e}, \
              exit |u-u_prev| assembled {:e} hyper-dual {:e}, clamped rows {}",
-            r.rung, r.m, r.worst_grad, r.worst, r.asym, r.step_asm, r.step_hd, r.w_clamped
+            r.rung, r.m, r.worst_grad, r.worst, r.asym, r.step_asm, r.step_hd, r.mu_clamped
         );
+    }
+}
+
+/// A small unweighted Bernoulli-logit design whose raw sigmoid sits at (or
+/// past) `family::clamp_mu`'s upper bound on a few rows at γ̂, without any
+/// kernel ever calling `clamp_mu` there — one primary grouping, no extras, so
+/// the fit is dense (the blocked route), not packed. `y = 1` and a `+30`
+/// offset on three rows out of eighty forces `σ(η) ≥ 1 − PROB_EPS` there while
+/// leaving the rest of the design an ordinary random-intercept logit fit.
+#[cfg(feature = "formula")]
+#[allow(clippy::type_complexity)]
+fn unweighted_logit_saturated_fixture() -> (
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+) {
+    let (n_g, per) = (8usize, 10usize);
+    let n = n_g * per;
+    let p = 2;
+    let mut st = 11u64;
+    let (mut x, mut y) = (vec![0.0f64; n * p], vec![0.0f64; n]);
+    let mut g = vec![0u32; n];
+    for i in 0..n {
+        g[i] = (i % n_g) as u32;
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        let eta = 0.3 + 0.5 * x1 + 0.2 * (g[i] as f64 - 3.5);
+        y[i] = if eta.exp() / (1.0 + eta.exp()) > 0.5 {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let mut offset = vec![0.0f64; n];
+    for &i in &[0usize, 1, 2] {
+        offset[i] = 30.0;
+        y[i] = 1.0;
+    }
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: g,
+        extra: vec![],
+    };
+    (x, y, offset, n, p, model, ids)
+}
+
+/// The unweighted-logit exemption, end to end. On [`unweighted_logit_saturated_fixture`]
+/// the raw sigmoid sits at `family::clamp_mu`'s bound on a few rows while no
+/// kernel ever calls `clamp_mu` there — `family::pinned_mu_bounds` (what
+/// `assembled::mu_clamped_rows`, `pirls::clamped_row_present`, and the
+/// per-row pinned test in `assemble`/`packed_assemble` all read) must report
+/// those rows as ordinary, not pinned, so the assembled engine takes the fit
+/// and its Hessian/gradient agree with the hyper-dual pass at the per-entry
+/// gate's own bands — the one end-to-end check of that route.
+#[cfg(feature = "formula")]
+#[test]
+fn unweighted_logit_saturated_rows_are_not_pinned() {
+    const GRAD_BAND: f64 = 1e-7;
+    const BAND: f64 = 1e-10;
+
+    let (xf, y, offset, n, p, model, ids) = unweighted_logit_saturated_fixture();
+    let (mut ws, x, ids_p, extra_ids) = ws_at_gamma_hat(
+        &xf,
+        &y,
+        Some(offset),
+        n,
+        p,
+        &model,
+        &ids,
+        "unweighted logit saturated fixture",
+    );
+    assert!(!ws.weighted, "fixture must be unweighted");
+    let family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let (mu_lo, mu_hi) = crate::family::clamp_mu_bounds(family);
+    let raw_saturated = ws.pirls.prob[..n]
+        .iter()
+        .filter(|&&mu| mu <= mu_lo || mu >= mu_hi)
+        .count();
+    assert!(
+        raw_saturated > 0,
+        "fixture must reach the raw clamp_mu bound"
+    );
+    assert_eq!(
+        crate::glmm::mu_clamped_rows(family, false, &ws.pirls.prob[..n]),
+        0,
+        "unweighted logit's census must stay 0 despite the raw-bound rows"
+    );
+
+    let m = ws.n_theta + p;
+    let mut g_dual = vec![0.0; m];
+    let st = crate::glmm::laplace_gradient(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids_p,
+        &extra_ids,
+        p,
+        n,
+        &mut g_dual,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "dual gradient declined"
+    );
+    let mut g_f64 = vec![0.0; m];
+    crate::glmm::gradient_f64(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids_p,
+        &extra_ids,
+        p,
+        n,
+        &mut g_f64,
+    )
+    .expect("assembled f64 gradient declined");
+    for c in 0..m {
+        let gap = (g_f64[c] - g_dual[c]).abs() / g_dual[c].abs().max(1.0);
+        assert!(
+            gap <= GRAD_BAND,
+            "coord {c}: assembled {} vs dual {} (relative gap {gap:e})",
+            g_f64[c],
+            g_dual[c]
+        );
+    }
+
+    let mut h_asm = Mat::<f64>::zeros(m, m);
+    let mut g_asm = vec![0.0; m];
+    let st = crate::glmm::joint_hessian_columns(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids_p,
+        &extra_ids,
+        p,
+        n,
+        &mut g_asm,
+        &mut h_asm,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "assembled Hessian declined"
+    );
+    let mut h_hd = Mat::<f64>::zeros(m, m);
+    let mut g_hd = vec![0.0; m];
+    let st = crate::glmm::laplace_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids_p,
+        &extra_ids,
+        p,
+        n,
+        &mut g_hd,
+        &mut h_hd,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "hyper-dual Hessian declined"
+    );
+    for i in 0..m {
+        for j in 0..m {
+            let gap = (h_asm[(i, j)] - h_hd[(i, j)]).abs() / h_hd[(i, j)].abs().max(1.0);
+            assert!(
+                gap <= BAND,
+                "entry ({i},{j}): assembled {} vs hyper-dual {} (relative gap {gap:e})",
+                h_asm[(i, j)],
+                h_hd[(i, j)]
+            );
+        }
     }
 }
 
@@ -5571,15 +6104,14 @@ fn rung_by_number(rung: u32) -> &'static DenseLaplaceRung {
 struct LaneFixture {
     what: &'static str,
     rung: &'static DenseLaplaceRung,
-    w_clamped: usize,
     mu_clamped: usize,
     exact: bool,
     band: f64,
 }
 
 /// The dual Laplace gradient's lanes against a Richardson-extrapolated central
-/// difference of the very objective they claim to differentiate, on the corpus
-/// points whose mode state carries a clamped row and on two that do not.
+/// difference of the very objective they claim to differentiate, on the one
+/// point whose mode state carries a clamped row and on three that do not.
 ///
 /// **What can go wrong here.** The dual PIRLS kernels take the Hessian step
 /// (`pirls::DualStep`), so the lanes normally reach the implicit-function
@@ -5591,13 +6123,13 @@ struct LaneFixture {
 /// wrong in a way nothing downstream can see, because they are smooth,
 /// plausible, and only a few digits short.
 ///
-/// So both halves are asserted. On the two clamped points the lanes must meet
-/// the band a settled kernel reaches, which is far tighter than a single call
-/// gets there. On the two clean points `exact` must still be true, so the
+/// So both halves are asserted. On the clamped point the lanes must meet the
+/// band a settled kernel reaches, which is far tighter than a single call
+/// gets there. On the three clean points `exact` must still be true, so the
 /// refinement loop stays off where it costs and buys nothing.
 ///
 /// The arbiter is the `f64` objective's own central difference, Richardson
-/// extrapolated from base `h` and `h/2`, with `ws.u` zeroed before every
+/// extrapolated from base `h` and `h/2`, with `ws.pirls.u` zeroed before every
 /// evaluation so each one is the same cold function of γ. It is an independent
 /// route to the gradient — no dual arithmetic, no adjoint — and its own
 /// resolution is what sets the bands, not taste.
@@ -5612,14 +6144,13 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
     const FD_BASE: f64 = 1e-3;
     // The two bands, both set from the first run on these four points and
     // neither tuned since. `SMALL_BAND` covers the two few-hundred-row points,
-    // where the arbiter resolves the gradient to ~5e-10 and the settled lanes
-    // land at 4.2e-11 to 6.2e-10. `BIG_BAND` covers the two 9,600-row ones,
-    // where the arbiter's own drift between base steps is up to 6.4e-8 and the
-    // settled lanes land at 1.0e-9 to 6.8e-8 — nothing tighter than the
-    // arbiter's resolution is a statement about the lanes. Part-converged
-    // lanes on the two clamped points sit at 1.6e-7 to 9.8e-7 (rung 49) and
-    // 4.0e-8 to 6.4e-7 (the cloglog fixture), so the bands catch every
-    // coordinate of the first and half of the second.
+    // rung 49 and rung 22, where the arbiter resolves the gradient to ~5e-10
+    // and the lanes land at 7.6e-12 to 4.6e-10. `BIG_BAND` covers the two
+    // 9,600-row ones, where the arbiter's own drift between base steps is up
+    // to 6.4e-8 — nothing tighter than the arbiter's resolution is a
+    // statement about the lanes. There the lanes land at 1.8e-9 to 5.5e-8 on
+    // rung 48 and, settled by the refinement loop, at 9.5e-9 to 1.3e-7 on the
+    // clamped cloglog fixture.
     const SMALL_BAND: f64 = 1e-8;
     const BIG_BAND: f64 = 2e-7;
 
@@ -5627,15 +6158,13 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
         LaneFixture {
             what: "rung 49 sim_cloglog_nested_crossed",
             rung: rung_by_number(49),
-            w_clamped: 1,
             mu_clamped: 0,
-            exact: false,
+            exact: true,
             band: SMALL_BAND,
         },
         LaneFixture {
             what: "cloglog 9,600-row fixture",
             rung: &CLOGLOG_LARGE,
-            w_clamped: 4,
             mu_clamped: 3,
             exact: false,
             band: BIG_BAND,
@@ -5643,7 +6172,6 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
         LaneFixture {
             what: "rung 22 cbpp_probit",
             rung: rung_by_number(22),
-            w_clamped: 0,
             mu_clamped: 0,
             exact: true,
             band: SMALL_BAND,
@@ -5651,7 +6179,6 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
         LaneFixture {
             what: "rung 48 sim_probit_large",
             rung: rung_by_number(48),
-            w_clamped: 0,
             mu_clamped: 0,
             exact: true,
             band: BIG_BAND,
@@ -5662,15 +6189,15 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
         let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(f.rung);
         let m = ws.n_theta + p;
         let n_theta = ws.n_theta;
-        let (w_clamped, mu_clamped, eta_clamped) = clamp_census(&ws, f.rung.family, n);
+        let (mu_clamped, eta_clamped) = clamp_census(&ws, f.rung.family, ws.weighted, n);
         assert_eq!(
-            (w_clamped, mu_clamped, eta_clamped),
-            (f.w_clamped, f.mu_clamped, 0),
+            (mu_clamped, eta_clamped),
+            (f.mu_clamped, 0),
             "{}: the clamp census at γ̂ moved — this fixture is here for its clamp state",
             f.what
         );
 
-        ws.pirls_tol_override = Some(TOL);
+        ws.fd.pirls_tol_override = Some(TOL);
         let mut g_dual = vec![0.0; m];
         let st = crate::glmm::laplace_gradient(
             &mut ws,
@@ -5701,7 +6228,7 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
         let at = |ws: &mut GlmmWorkspace, k: usize, step: f64| -> f64 {
             let mut q = params.clone();
             q[k] += step;
-            ws.u.fill(0.0);
+            ws.pirls.u.fill(0.0);
             glmm_laplace_deviance(&q, ws, x.as_ref(), &y, &ids, &extra_ids, n)
         };
         let mut worst = 0.0f64;
@@ -5722,7 +6249,7 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
             worst = worst.max(gaps[k]);
         }
         println!(
-            "{}: m {}, clamped rows (w {w_clamped}, μ {mu_clamped}), exact {}, \
+            "{}: m {}, clamped rows (μ {mu_clamped}), exact {}, \
              per-coordinate |lane − FD| {:?}, worst {:e}",
             f.what, m, f.exact, gaps, worst
         );
@@ -5736,6 +6263,130 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
                 f.band
             );
         }
+    }
+}
+
+/// The dense assembled path on a clamped mode state, end to end: on a rung
+/// whose mode state carries a clamped row the assembled engine takes the
+/// fit, and `joint_hessian_cov` ships its covariance for it.
+///
+/// `CLOGLOG_LARGE`, the cloglog fixture on the 9,600-row `sim_probit_large`
+/// dataset, is that rung — three μ-clamped rows — and the corpus gate above
+/// already holds the per-entry agreement with the hyper-dual pass. What is
+/// unexercised without this test is the RESULT through the production entry
+/// point: that `joint_hessian_cov` reports `FdHessianStatus::Ok`, and that
+/// the covariance and the θ-block standard errors it ships are the assembled
+/// arm's own, bit for bit, rather than the hyper-dual pass's or a stencil's.
+///
+/// The reference side drives `joint_hessian` directly at the same γ̂ and
+/// inverts its matrix the way `joint_hessian_cov` inverts it — `cov = 2·H⁻¹`
+/// on the β block, `sqrt(2·H⁻¹_kk)` on the θ diagonal — so the comparison is
+/// bitwise and needs no band.
+///
+/// The take is asserted at the engine, not through
+/// `assembled::ASSEMBLED_OK_COUNT`: that counter is process-wide and any
+/// concurrently-running test's `WaldSe::Hessian` fit advances it too, so it
+/// cannot say this call in particular is what advanced it.
+#[cfg(feature = "formula")]
+#[test]
+fn clamped_dense_rung_ships_the_assembled_covariance() {
+    use faer::linalg::solvers::Solve;
+
+    let r = &CLOGLOG_LARGE;
+    let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
+    let n_theta = ws.n_theta;
+    let m = n_theta + p;
+    let (mu_clamped, _eta) = clamp_census(&ws, r.family, ws.weighted, n);
+    assert!(
+        mu_clamped > 0,
+        "rung {}: this fixture is here for its clamped mode state (μ {mu_clamped})",
+        r.rung
+    );
+
+    let mut g = vec![0.0; m];
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let st = crate::glmm::joint_hessian_columns(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "rung {}: the assembled engine must take a clamped mode state now",
+        r.rung
+    );
+
+    // The assembled arm on its own, symmetrized, at the same γ̂ — the
+    // reference the production entry point below is compared against.
+    let st = crate::glmm::joint_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "rung {}: the assembled arm must answer",
+        r.rung
+    );
+    let chol = hess
+        .as_ref()
+        .llt(faer::Side::Lower)
+        .expect("the assembled joint Hessian is PD at this γ̂");
+    let mut inv = Mat::<f64>::identity(m, m);
+    chol.solve_in_place(inv.as_mut());
+    let want_cov = Mat::<f64>::from_fn(p, p, |a, b| 2.0 * inv[(n_theta + a, n_theta + b)]);
+    let want_theta_se: Vec<f64> = (0..n_theta)
+        .map(|k| (2.0 * inv[(k, k)]).max(0.0).sqrt())
+        .collect();
+
+    let mut got_cov = Mat::<f64>::zeros(p, p);
+    let st = crate::glmm::joint_hessian_cov(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut got_cov,
+    );
+    assert!(
+        matches!(st, crate::glmm::FdHessianStatus::Ok),
+        "rung {}: expected Ok ({st:?})",
+        r.rung
+    );
+    for a in 0..p {
+        for b in 0..p {
+            assert_eq!(
+                got_cov[(a, b)].to_bits(),
+                want_cov[(a, b)].to_bits(),
+                "rung {}: cov[({a},{b})] {} is not the assembled arm's {}",
+                r.rung,
+                got_cov[(a, b)],
+                want_cov[(a, b)]
+            );
+        }
+    }
+    for (k, &want) in want_theta_se.iter().enumerate() {
+        assert_eq!(
+            ws.inference.theta_se[k].to_bits(),
+            want.to_bits(),
+            "rung {}: theta_se[{k}] {} is not the assembled arm's {want}",
+            r.rung,
+            ws.inference.theta_se[k]
+        );
     }
 }
 
@@ -5803,10 +6454,9 @@ fn timed_series(
 /// forcing the assembled pass to decline through the test-only
 /// `assembled::FORCE_DECLINE` switch — never a `FitOptions` flag. Prints one
 /// table with both arms' wall, the ratio `hess/rx − 1`, and the convergence
-/// axes (`converged`, `n_eval`, `kkt_grad_norm`, `deviance`,
-/// `boundary_score` presence) alongside `ASSEMBLED_OK_COUNT`'s movement,
-/// which is this crate's only signal that a given arm actually took its
-/// intended path (`Diagnostics` carries no exact-vs-fallback field).
+/// axes (`converged`, `n_eval`, `deviance`) alongside `ASSEMBLED_OK_COUNT`'s
+/// movement, which is this crate's only signal that a given arm actually took
+/// its intended path (`Diagnostics` carries no exact-vs-fallback field).
 ///
 /// Asserts only that both arms converge and report finite SEs — this is a
 /// measurement driver, not a speed gate; the numbers it prints are read by a
@@ -5893,7 +6543,7 @@ fn assembled_vs_hyperdual_paired_timing() {
     // measurement only when the caller locked the CPU clock first.
     println!("paired timing, REPS={reps} (first rep discarded, min of the rest); lock state not read here.");
     println!(
-        "{:<12} {:<11} {:>12} {:>12} {:>9} {:>10} {:>9} {:>12} {:>13} {:>9} {:>10}",
+        "{:<12} {:<11} {:>12} {:>12} {:>9} {:>10} {:>9} {:>13} {:>10}",
         "cell",
         "arm",
         "rx_wall_s",
@@ -5901,15 +6551,13 @@ fn assembled_vs_hyperdual_paired_timing() {
         "ratio",
         "converged",
         "n_eval",
-        "kkt_norm",
         "deviance",
-        "bscore",
         "asm_delta"
     );
     for row in &rows {
         let ratio = row.hess_wall.as_secs_f64() / row.rx_wall.as_secs_f64() - 1.0;
         println!(
-            "{:<12} {:<11} {:>12.6} {:>12.6} {:>9.4} {:>8}/{:<2}{:>9} {:>12.4e} {:>13.4} {:>9} {:>10}",
+            "{:<12} {:<11} {:>12.6} {:>12.6} {:>9.4} {:>8}/{:<2}{:>9} {:>13.4} {:>10}",
             row.cell,
             row.arm,
             row.rx_wall.as_secs_f64(),
@@ -5918,9 +6566,7 @@ fn assembled_vs_hyperdual_paired_timing() {
             row.n_converged,
             row.reps,
             row.f.n_eval,
-            row.f.diagnostics.kkt_grad_norm,
             row.f.deviance,
-            !row.f.diagnostics.boundary_score.is_empty(),
             row.assembled_delta,
         );
     }
@@ -5974,7 +6620,7 @@ fn assembled_gradient_mode_residual_probe() {
         // (a) production band: pirls_tol_override unset, so gradient_f64 falls
         // back to pirls_tol_fd(family) (glmm/mod.rs:173), PIRLS_TOL_REL_FD =
         // 1e-8 unless the family's own fit tolerance is tighter.
-        ws.pirls_tol_override = None;
+        ws.fd.pirls_tol_override = None;
         let prod_tol = crate::glmm::pirls_tol_fd(r.family);
         let mut g_prod = vec![0.0; m];
         let resid_prod = crate::glmm::gradient_f64_mode_residual(
@@ -5995,7 +6641,7 @@ fn assembled_gradient_mode_residual_probe() {
         let params: Vec<f64> = ws.params[..m].to_vec();
         let mut ladder: Vec<(f64, f64)> = Vec::new();
         for &tol in &REF_TOL_LADDER {
-            ws.pirls_tol_override = Some(tol);
+            ws.fd.pirls_tol_override = Some(tol);
             let d = glmm_laplace_deviance(&params, &mut ws, x.as_ref(), &y, &ids, &extra_ids, n);
             if d.is_finite() {
                 ladder.push((tol, d));
@@ -6027,7 +6673,7 @@ fn assembled_gradient_mode_residual_probe() {
         };
         let (ref_tol, _) = ladder[ref_idx];
 
-        ws.pirls_tol_override = Some(ref_tol);
+        ws.fd.pirls_tol_override = Some(ref_tol);
         let mut g_ref = vec![0.0; m];
         let resid_ref = crate::glmm::gradient_f64_mode_residual(
             &mut ws,
@@ -6060,6 +6706,1276 @@ fn assembled_gradient_mode_residual_probe() {
             step_free_gap,
             gaps,
             worst_gap
+        );
+    }
+}
+
+/// Every packed-row-routed GLMM rung of the validation corpus this instrument
+/// can drive, at Laplace — rungs 8, 9, 18, 24, 38 and 46, the manifest's
+/// `Solver::Sparse` rows that are also non-Gaussian and so reach the GLMM
+/// driver rather than the LMM one. Same two mechanical formula rewrites
+/// [`DenseLaplaceRung`] documents.
+///
+/// The manifest's other three `Solver::Sparse` rungs (7, 36, 47) are excluded,
+/// not proxied: they are Gaussian and take the LMM REML path, so no GLMM
+/// engine touches them.
+///
+/// One packed cell is covered by proxy instead of appearing here. The
+/// negative-binomial golden `sim_sparse_nb` is packed-routed and in scope,
+/// but `rung_at_gamma_hat` cannot reach it: an NB fit carries a trailing
+/// `ln θ_NB` coordinate that `run_glmm_on` expects seeded from a no-RE GLM-NB
+/// θ̂, which only the NB dispatch (`fit::glmm::fit_glmm_nb`) supplies, and
+/// with `nb_theta` NaN the outer search rejects its own box. Its packed
+/// engine is exercised through the full dispatch instead — by the
+/// `NegativeBinomial` cell of `sparse::tests`'s cross-engine envelope check,
+/// and by `sparse::tests::fit_sparse_nb_glmm_is_pinned`.
+///
+/// Every rung here is unweighted or carries its prior weights through an
+/// aggregated-binomial response (rungs 8, 18, 38), all three canonical, so
+/// prior weights on a NON-canonical packed fit are not gated from this list.
+/// That combination is covered by the weighted Gamma-log cell of
+/// `sparse::tests::packed_and_dense_assembled_hessians_agree`, against the
+/// dense assembled engine, and corroborated by
+/// `sparse::tests::fit_sparse_gamma_glmm_weighted_matches_lme4`.
+#[cfg(feature = "formula")]
+const PACKED_LAPLACE_RUNGS: &[DenseLaplaceRung] = &[
+    DenseLaplaceRung {
+        rung: 8,
+        csv: include_str!("../../validation/data/simulated/sim_sparse_binomial.csv"),
+        formula: "prop ~ x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g1", "c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+        agg: Some(("incidence", "size")),
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 9,
+        csv: include_str!("../../validation/data/simulated/sim_sparse_poisson.csv"),
+        formula: "y ~ x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g1", "c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 18,
+        csv: include_str!("../../validation/data/simulated/sim_binomial_slope_crossed.csv"),
+        formula: "prop ~ x + (1 + x | g1) + (1 + x | g2)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g1", "g2"],
+        agg: Some(("incidence", "size")),
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 24,
+        csv: include_str!("../../validation/data/simulated/sim_sparse_gamma.csv"),
+        formula: "y ~ x1 + x2 + x3 + x4 + (1 | gp) + (1 + x1 + x2 + x3 + x4 | ge)",
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        factors: &["gp", "ge"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 38,
+        csv: include_str!("../../validation/data/simulated/glmm_binomial.csv"),
+        formula: "prop ~ x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g1", "c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+        agg: Some(("incidence", "size")),
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 46,
+        csv: include_str!("../../validation/data/simulated/sim_sparse_binomial_bigsd.csv"),
+        formula:
+            "y ~ x + z + (1 | g1) + (1 | c1) + (1 | c2) + (1 | c3) + (1 | c4) + (1 | c5) + (1 | c6) + (1 | c7)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g1", "c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+];
+
+/// The packed assembled gradient at `T = f64` against a Richardson-
+/// extrapolated central difference of the Laplace deviance it differentiates,
+/// at every packed rung's own γ̂ on the corpus's own data.
+///
+/// The oracle differences `glmm_laplace_deviance` on the same workspace with
+/// `ws.fd.pirls_tol_override = Some(1e-12)`, which is where the packed arm of
+/// the deviance cold-seeds `û = 0` on every evaluation, so each `f(γ)` is a
+/// pure function of γ whatever order the coordinates run in. The engine's own
+/// mode solve warm-starts from the fit's `û(γ̂)` instead; at that tolerance
+/// both reach the same mode, so the two sides differentiate one function.
+///
+/// Central differences at `h` and `h/2`, combined as `(4·D(h/2) − D(h))/3`.
+/// That cancels the plain central difference's `O(h²)` truncation and leaves
+/// the deviance's own reproducibility divided by `h` as the floor, so the
+/// step is deliberately LARGE: `h = 1e-3·max(1, |γ̂_k|)`.
+///
+/// Band `1e-6` relative (to `max(1, |FD|)`), fixed from the first
+/// measurement: worst coordinate 2.75e-8, rung 46
+/// (`sim_sparse_binomial_bigsd`, coordinate 1), with rung 24
+/// (`sim_sparse_gamma`) next at 2.57e-8 and every other rung at or below
+/// 2.0e-9. The ~36× margin over the worst is the FD oracle's own scatter,
+/// not a statement about the engine: the engine's own accuracy is pinned
+/// against exact references — the Hessian supply check below, and the
+/// both-layouts Hessian cross-check in `sparse::tests`, which puts this
+/// engine within 2.6e-13 of the dense assembled one on the shapes the dense
+/// engine can also fit (`q_p ≤ 2`, `q_g = 1`, weighted and unweighted).
+#[cfg(feature = "formula")]
+#[test]
+fn packed_assembled_gradient_matches_richardson_fd() {
+    const BAND: f64 = 1e-6;
+    for r in PACKED_LAPLACE_RUNGS {
+        let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
+        assert_eq!(
+            ws.layout,
+            crate::glmm::GlmmLayout::Packed,
+            "rung {}: packed-row layout expected",
+            r.rung
+        );
+        let n_theta = ws.n_theta;
+        let m = n_theta + p;
+        let kk = ws.k.max(1);
+        let saved: Vec<f64> = ws.params[..m].to_vec();
+        let u_hat: Vec<f64> = ws.pirls.u[..kk].to_vec();
+        ws.fd.pirls_tol_override = Some(1e-12);
+
+        let mut g = vec![0.0; m];
+        ws.pirls.u[..kk].copy_from_slice(&u_hat);
+        let st = crate::glmm::packed_gradient(&mut ws, x.as_ref(), &y, p, n, &mut g);
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "rung {}: the packed assembled gradient declined",
+            r.rung
+        );
+
+        let mut worst = 0.0f64;
+        let mut worst_coord = 0usize;
+        for coord in 0..m {
+            let h = 1e-3 * saved[coord].abs().max(1.0);
+            let mut at = saved.clone();
+            let ev = |ws: &mut GlmmWorkspace, at: &mut Vec<f64>, d: f64| -> f64 {
+                at[coord] = saved[coord] + d;
+                glmm_laplace_deviance(at, ws, x.as_ref(), &y, &ids, &extra_ids, n)
+            };
+            let d1 = (ev(&mut ws, &mut at, h) - ev(&mut ws, &mut at, -h)) / (2.0 * h);
+            let d2 = (ev(&mut ws, &mut at, 0.5 * h) - ev(&mut ws, &mut at, -0.5 * h)) / h;
+            let fd = (4.0 * d2 - d1) / 3.0;
+            let gap = (g[coord] - fd).abs() / fd.abs().max(1.0);
+            if gap > worst {
+                worst = gap;
+                worst_coord = coord;
+            }
+            assert!(
+                gap <= BAND,
+                "rung {} coord {coord}: assembled {} vs Richardson FD {fd} (relative gap {gap:e})",
+                r.rung,
+                g[coord]
+            );
+        }
+        ws.params[..m].copy_from_slice(&saved);
+        ws.fd.pirls_tol_override = None;
+        println!(
+            "packed gradient rung {}: m {m}, k {}, worst relative gap {worst:e} at coord {worst_coord}",
+            r.rung, ws.k
+        );
+    }
+}
+
+/// The packed assembled Hessian's columns against a central difference of the
+/// packed assembled gradient at `T = f64` — the supply check that every
+/// quantity the assembly reads is differentiated rather than lifted, on the
+/// corpus's own data at each packed rung's γ̂.
+///
+/// Both sides come from one body at two scalars, so a lane-plumbing mistake —
+/// a quantity carried in with `from_f64` that should have been differentiated,
+/// `û`'s response `U` solved against the wrong factor — shows here as a whole
+/// column missing. The pre-symmetrization asymmetry is checked alongside: the
+/// two triangles come out of different chunks, so their agreement is a free
+/// consistency check on the chunk bookkeeping.
+///
+/// Richardson-extrapolated over `h` and `h/2`, as the gradient gate above is:
+/// without that, the plain central difference's `O(h²)` truncation is what
+/// the gate measures.
+///
+/// **The step and the mode tolerance are chosen together, because the
+/// oracle's error is the mode solve's own reproducibility divided by `h`.** A
+/// step too small is that noise; a step too large is what Richardson's
+/// `O(h⁴)` remainder leaves; `h = 1e-3·max(1, |γ̂_k|)` under a `1e-14` mode
+/// solve is the flat middle. Worst gap over all cells of `sim_sparse_gamma`
+/// (rung 24), the corpus's hardest packed shape, scanned over both:
+///
+/// ```text
+///   mode tol \ h_rel      1e-2      1e-3      1e-4      1e-5
+///   pirls_tol_fd (1e-8)  5.35e-2   2.59e-1   8.21e-1   2.73e0
+///   1e-12                3.35e-6   1.49e-4   9.97e-4   3.02e-3
+///   1e-14                3.32e-6   4.03e-8   5.06e-5   5.39e-5
+/// ```
+///
+/// Along each tolerance row `gap × h` is roughly constant and the whole row
+/// drops when the mode solve is tightened — round-off over step. Truncation
+/// would go the other way: a decade wider `h` multiplies an `O(h⁴)` remainder
+/// by 1e4, which is the `1e-2` column.
+///
+/// That the ENGINE is not what moves there is settled by an arbiter that
+/// never touches the assembled gradient: a Richardson-extrapolated second
+/// difference of `glmm_laplace_deviance` itself, cold-seeded per evaluation,
+/// against the engine's symmetrized Hessian. On rung 24's four worst θθ cells
+/// that arbiter is stable on `h_rel ∈ [1e-2, 3e-3]` and agrees with the
+/// engine there to 3e-9…6e-7 — its own stability — at mode tolerance `1e-12`
+/// and `1e-14` alike: at `h_rel = 1e-2`, cell (10,9) 1.02e-7, (13,0) 4.28e-8,
+/// (5,7) 5.73e-7, (10,10) 4.75e-8. The engine itself moves 1.17e-9 between
+/// those two tolerances; the oracle moves four orders.
+///
+/// Bands fixed from that measurement. Columns: worst 4.03e-8 (rung 24), with
+/// rungs 8, 9, 18, 38 and 46 at 1.4e-10 to 4.0e-10, so one `BAND = 1e-6`
+/// clears the worst by 25× and every other rung by ~3000×. Asymmetry: worst
+/// 1.6e-13 (rung 24), unchanged by the tolerance, so `ASYM_BAND = 1e-11`
+/// clears it by ~60×.
+#[cfg(feature = "formula")]
+#[test]
+fn packed_assembled_hessian_columns_match_fd_of_f64_gradient() {
+    const BAND: f64 = 1e-6;
+    const ASYM_BAND: f64 = 1e-11;
+    for r in PACKED_LAPLACE_RUNGS {
+        let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
+        let n_theta = ws.n_theta;
+        let m = n_theta + p;
+        let kk = ws.k.max(1);
+        let saved: Vec<f64> = ws.params[..m].to_vec();
+        let u_hat: Vec<f64> = ws.pirls.u[..kk].to_vec();
+        ws.fd.pirls_tol_override = Some(1e-14);
+
+        let mut hess = Mat::<f64>::zeros(m, m);
+        let mut hgrad = vec![0.0; m];
+        ws.pirls.u[..kk].copy_from_slice(&u_hat);
+        let st = crate::glmm::joint_hessian_columns(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut hgrad,
+            &mut hess,
+        );
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "rung {}: the packed assembled Hessian declined",
+            r.rung
+        );
+        let mut asym = 0.0f64;
+        for i in 0..m {
+            for j in 0..m {
+                let d = (hess[(i, j)] - hess[(j, i)]).abs();
+                asym = asym.max(d / hess[(i, j)].abs().max(1.0));
+            }
+        }
+        assert!(
+            asym <= ASYM_BAND,
+            "rung {}: pre-symmetrization asymmetry {asym:e}",
+            r.rung
+        );
+
+        // The value part of the chunked pass IS the gradient, entry by entry.
+        let mut gref = vec![0.0; m];
+        ws.params[..m].copy_from_slice(&saved);
+        ws.pirls.u[..kk].copy_from_slice(&u_hat);
+        assert!(
+            matches!(
+                crate::glmm::packed_gradient(&mut ws, x.as_ref(), &y, p, n, &mut gref),
+                crate::glmm::DerivStatus::Ok(_)
+            ),
+            "rung {}: the reference gradient declined",
+            r.rung
+        );
+        for a in 0..m {
+            let gap = (hgrad[a] - gref[a]).abs() / gref[a].abs().max(1.0);
+            assert!(
+                gap <= 1e-12,
+                "rung {} coord {a}: the chunked pass's gradient {} vs the f64 gradient {} \
+                 (relative gap {gap:e})",
+                r.rung,
+                hgrad[a],
+                gref[a]
+            );
+        }
+
+        let mut worst = 0.0f64;
+        let mut worst_cell = (0usize, 0usize);
+        for coord in 0..m {
+            let h = 1e-3 * saved[coord].abs().max(1.0);
+            let eval = |ws: &mut GlmmWorkspace, d: f64, out: &mut [f64]| {
+                let mut at = saved.clone();
+                at[coord] = saved[coord] + d;
+                ws.params[..m].copy_from_slice(&at);
+                ws.pirls.u[..kk].copy_from_slice(&u_hat);
+                assert!(
+                    matches!(
+                        crate::glmm::packed_gradient(ws, x.as_ref(), &y, p, n, out),
+                        crate::glmm::DerivStatus::Ok(_)
+                    ),
+                    "rung {} coord {coord}: the assembled gradient declined",
+                    r.rung
+                );
+            };
+            let mut gp = vec![0.0; m];
+            eval(&mut ws, h, &mut gp);
+            let mut gm = vec![0.0; m];
+            eval(&mut ws, -h, &mut gm);
+            let mut gp2 = vec![0.0; m];
+            eval(&mut ws, 0.5 * h, &mut gp2);
+            let mut gm2 = vec![0.0; m];
+            eval(&mut ws, -0.5 * h, &mut gm2);
+            for a in 0..m {
+                let d1 = (gp[a] - gm[a]) / (2.0 * h);
+                let d2 = (gp2[a] - gm2[a]) / h;
+                let fd = (4.0 * d2 - d1) / 3.0;
+                let gap = (hess[(a, coord)] - fd).abs() / fd.abs().max(1.0);
+                if gap > worst {
+                    worst = gap;
+                    worst_cell = (a, coord);
+                }
+                assert!(
+                    gap <= BAND,
+                    "rung {} column {coord} entry {a}: lane {} vs fd {fd} (relative gap {gap:e})",
+                    r.rung,
+                    hess[(a, coord)]
+                );
+            }
+        }
+        ws.params[..m].copy_from_slice(&saved);
+        ws.fd.pirls_tol_override = None;
+        println!(
+            "packed hessian rung {}: m {m}, worst relative gap {worst:e} at {worst_cell:?}, \
+             asymmetry {asym:e}",
+            r.rung
+        );
+    }
+}
+
+/// The packed assembled engine's shipped covariance against the packed FD
+/// stencil's, at every packed rung's γ̂: the `p` fixed-effect standard errors
+/// off `joint_hessian_cov`'s own `out_cov`, and the `n_θ` θ-block standard
+/// errors off `ws.inference.theta_se` (which `stddev_se` is, divided by the
+/// fixed positive Λ-row scales, so a relative gap here is a relative gap
+/// there).
+///
+/// The stencil is reached through `ws.fd.force_fd_hessian`, the workspace
+/// switch the other layouts' FD tests already use, so no global state moves
+/// and the two arms run on one workspace at one γ̂.
+///
+/// A MEASUREMENT with a guard rail, not an equality: the stencil is a
+/// single-step central difference at `SPARSE_FD_STEP_REL = 1e-4` relative and
+/// carries its own step error. `src/sparse/fd_margin.rs`'s header records the
+/// size of that error on this very layout — δ-vs-δ/2 standard-error agreement
+/// of 2.0e-5 on `sim_sparse_gamma`, and 1.4e-4 on `sim_sparse_binomial_bigsd`,
+/// whose sequence is truncation-dominated with its two extrapolations 20%
+/// apart.
+///
+/// Measured gaps, worst per rung: 1.65e-4 `se` / 2.16e-5 `theta_se` on rung
+/// 46, 1.43e-5 / 2.50e-6 on rung 24, and ≤1.5e-6 / ≤4.1e-7 on rungs 8, 9, 18
+/// and 38. The two large ones land on exactly the two rungs `fd_margin`
+/// records the stencil's own step error for, and at the size it records — so
+/// the whole gap is the stencil's, and this comparison says nothing about the
+/// assembled engine's accuracy (`sparse::tests`'s both-layouts cross-check
+/// does, at 2.6e-13, on the shapes the dense engine can also fit).
+/// `BAND = 1e-3` clears the worst by ~6× and is a tripwire
+/// for a routing or sign error: a gap far above what the stencil's own step
+/// error explains is a finding to chase, not a band to widen.
+#[cfg(feature = "formula")]
+#[test]
+fn packed_assembled_se_matches_the_packed_stencil() {
+    use std::sync::atomic::Ordering;
+    const BAND: f64 = 1e-3;
+    for r in PACKED_LAPLACE_RUNGS {
+        let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
+        let n_theta = ws.n_theta;
+        assert!(
+            crate::glmm::assembly_routes(&ws, n),
+            "rung {}: the assembled engine must route this shape",
+            r.rung
+        );
+        let before = crate::glmm::ASSEMBLED_OK_COUNT.load(Ordering::Relaxed);
+        let mut cov_exact = Mat::<f64>::zeros(p, p);
+        let st = crate::glmm::joint_hessian_cov(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut cov_exact,
+        );
+        assert!(
+            matches!(st, crate::glmm::FdHessianStatus::Ok),
+            "rung {}: the exact arm must not fall back",
+            r.rung
+        );
+        assert!(
+            crate::glmm::ASSEMBLED_OK_COUNT.load(Ordering::Relaxed) > before,
+            "rung {}: the assembled arm must actually run",
+            r.rung
+        );
+        let se_exact: Vec<f64> = (0..p).map(|j| cov_exact[(j, j)].sqrt()).collect();
+        let th_exact: Vec<f64> = ws.inference.theta_se[..n_theta].to_vec();
+
+        ws.fd.force_fd_hessian = true;
+        let mut cov_fd = Mat::<f64>::zeros(p, p);
+        let st_fd = crate::glmm::joint_hessian_cov(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut cov_fd,
+        );
+        ws.fd.force_fd_hessian = false;
+        assert!(
+            matches!(st_fd, crate::glmm::FdHessianStatus::Ok),
+            "rung {}: the stencil arm must not fall back ({st_fd:?})",
+            r.rung
+        );
+        let se_fd: Vec<f64> = (0..p).map(|j| cov_fd[(j, j)].sqrt()).collect();
+        let th_fd: Vec<f64> = ws.inference.theta_se[..n_theta].to_vec();
+
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-300);
+        let worst_se = (0..p)
+            .map(|j| rel(se_exact[j], se_fd[j]))
+            .fold(0.0, f64::max);
+        let worst_th = (0..n_theta)
+            .map(|j| rel(th_exact[j], th_fd[j]))
+            .fold(0.0, f64::max);
+        println!(
+            "packed se rung {}: worst relative gap vs the stencil — se {worst_se:e}, \
+             theta_se {worst_th:e}",
+            r.rung
+        );
+        assert!(
+            worst_se <= BAND && worst_th <= BAND,
+            "rung {}: se gap {worst_se:e}, theta_se gap {worst_th:e} — both must sit inside \
+             the stencil's own step error",
+            r.rung
+        );
+    }
+}
+
+/// A dense-routed design whose joint coordinate count sits above the dual
+/// kernel's lane cap: `q_p = 4` — an intercept and three random slopes, so
+/// `n_theta = 10` — with `p = 4`, giving `m = 14 > MAX_DUAL_N`. Inside the
+/// dense envelope on every axis (`MAX_PRIMARY_Q` is 8), so the layout stays
+/// blocked and both Hessian passes are asked the same question about it.
+#[cfg(feature = "formula")]
+fn wide_slope_fixture() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let (n_clusters, per) = (15usize, 20usize);
+    let n = n_clusters * per;
+    let p = 4;
+    let mut st = 20261u64;
+    let sd = [0.5, 0.4, 0.3, 0.3];
+    let u: Vec<[f64; 4]> = (0..n_clusters)
+        .map(|_| std::array::from_fn(|q| sd[q] * lcg(&mut st)))
+        .collect();
+    let (mut x, mut y) = (vec![0.0f64; n * p], vec![0.0f64; n]);
+    let mut g = vec![0u32; n];
+    for i in 0..n {
+        g[i] = (i % n_clusters) as u32;
+        let uc = &u[g[i] as usize];
+        x[i * p] = 1.0;
+        for j in 1..p {
+            x[i * p + j] = lcg(&mut st);
+        }
+        let fixed = [0.3, 0.5, -0.4, 0.3];
+        let eta: f64 = (0..p).map(|j| (fixed[j] + uc[j]) * x[i * p + j]).sum();
+        y[i] = eta.exp().round();
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![1, 2, 3],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: g,
+        extra: vec![],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// The assembled engine covers a dense shape the hyper-dual pass refuses for
+/// its lane count — the sibling of
+/// `glmm::derivative::tests::laplace_hessian_m_above_cap_is_unsupported`,
+/// which holds the refusal itself.
+///
+/// Both halves run on ONE workspace at ONE γ̂, so the two passes differ in
+/// nothing but the pass. `laplace_hessian` refuses because a cross-chunk
+/// second-derivative block would need both coordinates' first-order lanes
+/// live in one call; the assembled pass reads second order off FIRST-order
+/// lanes, which chunk, so nothing about `m` reaches its routing gate. What
+/// this asserts is the consequence: at `m = 14` the shipped covariance is the
+/// exact one, not the FD stencil's.
+#[cfg(feature = "formula")]
+#[test]
+fn assembled_hessian_covers_an_m_above_the_dual_lane_cap() {
+    use std::sync::atomic::Ordering;
+
+    let (xf, y, n, p, model, ids) = wide_slope_fixture();
+    let (mut ws, x, ids_p, extra_ids) = ws_at_gamma_hat(
+        &xf,
+        &y,
+        None,
+        n,
+        p,
+        &model,
+        &ids,
+        "the wide-slope dense fixture",
+    );
+    let ids = ids_p;
+    let m = ws.n_theta + p;
+    // γ̂ captured ONCE, before any evaluation walks `ws.params` off it.
+    let gamma_hat: Vec<f64> = ws.params[..m].to_vec();
+    assert!(
+        m > crate::glmm::MAX_DUAL_N,
+        "this fixture is here for its coordinate count: m {m}"
+    );
+    assert!(
+        crate::glmm::supports_exact_shape(ws.layout, &ws.groupings),
+        "the shape itself must be one the dual kernel has a twin for, so the refusal \
+         below is the lane cap and nothing else"
+    );
+
+    let mut g = vec![0.0; m];
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let st = crate::glmm::laplace_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Unsupported),
+        "the hyper-dual pass still refuses above its lane cap"
+    );
+    let st = crate::glmm::joint_hessian_columns(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "the assembled engine must not refuse a dense shape for its lane count"
+    );
+
+    let before = crate::glmm::ASSEMBLED_OK_COUNT.load(Ordering::Relaxed);
+    let mut cov = Mat::<f64>::zeros(p, p);
+    let st =
+        crate::glmm::joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut cov);
+    assert!(
+        matches!(st, crate::glmm::FdHessianStatus::Ok),
+        "the exact arm must answer at this m ({st:?})"
+    );
+    assert!(
+        crate::glmm::ASSEMBLED_OK_COUNT.load(Ordering::Relaxed) > before,
+        "the shipped covariance at this m must come from the assembled arm"
+    );
+    // Arbiter: the Richardson-extrapolated central second difference of the f64
+    // Laplace deviance, the same independent route
+    // `assembled_hessian_matches_hyperdual_per_entry` puts `CLOGLOG_LARGE`
+    // through. Needed here because this is the ONE dense shape the hyper-dual
+    // pass cannot cross-check, so without it the assembled `hess` and the `cov`
+    // built from it are only asserted to exist.
+    //
+    // Both bands sit above their measured worst and below twice it, the shape
+    // the `CLOGLOG_LARGE` arbiter there uses. Measured on this tree: the
+    // arbiter reproduces itself between base steps 4e-3 and 8e-3 to 9.36e-6,
+    // the assembled Hessian agrees with the base-4e-3 estimate to 6.31e-7, and
+    // the shipped covariance to 1.11e-8 of its own scale. The covariance is the
+    // tighter comparison because inverting the joint Hessian damps the FD step
+    // error the Hessian entries still carry.
+    const FD_BAND: f64 = 1e-6;
+    // Relative to √(cov_aa·cov_bb) — a correlation scale, so the near-zero
+    // off-diagonal entries are held to the same standard as the diagonal
+    // instead of passing on their own smallness.
+    const COV_BAND: f64 = 2e-8;
+    let n_theta = ws.n_theta;
+    ws.fd.pirls_tol_override = Some(1e-12);
+    let fd4 = richardson_fd_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        n,
+        m,
+        n_theta,
+        4e-3,
+        &gamma_hat,
+    );
+    let fd8 = richardson_fd_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        n,
+        m,
+        n_theta,
+        8e-3,
+        &gamma_hat,
+    );
+    ws.fd.pirls_tol_override = None;
+    let rel = |a: f64, b: f64| (a - b).abs() / a.abs().min(b.abs()).max(1.0);
+    let mut repro = 0.0f64;
+    let mut worst_fd = 0.0f64;
+    for i in 0..m {
+        for j in 0..m {
+            repro = repro.max(rel(fd4[(i, j)], fd8[(i, j)]));
+            let gap = rel(hess[(i, j)], fd4[(i, j)]);
+            worst_fd = worst_fd.max(gap);
+            assert!(
+                gap <= FD_BAND,
+                "entry ({i},{j}): assembled {} vs Richardson FD(4e-3) {} (relative gap {gap:e})",
+                hess[(i, j)],
+                fd4[(i, j)]
+            );
+        }
+    }
+
+    // `joint_hessian_cov` ships `cov = 2·(H⁻¹)_ββ` (`src/glmm/se.rs`), so invert
+    // the arbiter's Hessian the same way and compare the shipped covariance
+    // itself — a wrong scale factor, an off-diagonal sign slip or a missing
+    // link-derivative term all survive a positive-diagonal check.
+    let fd_cov = {
+        use faer::linalg::solvers::Solve;
+        let chol = fd4
+            .as_ref()
+            .llt(faer::Side::Lower)
+            .expect("the arbiter Hessian at γ̂ must be PD");
+        let mut inv = Mat::<f64>::identity(m, m);
+        chol.solve_in_place(inv.as_mut());
+        inv
+    };
+    let mut worst_cov = 0.0f64;
+    for a in 0..p {
+        for b in 0..p {
+            let want = 2.0 * fd_cov[(n_theta + a, n_theta + b)];
+            let scale = (cov[(a, a)] * cov[(b, b)]).sqrt();
+            let gap = (cov[(a, b)] - want).abs() / scale;
+            worst_cov = worst_cov.max(gap);
+            assert!(
+                gap <= COV_BAND,
+                "cov[({a},{b})] {} vs Richardson FD {want} (relative gap {gap:e})",
+                cov[(a, b)]
+            );
+        }
+    }
+    println!(
+        "wide-slope fixture: n {n}, m {m}, n_theta {n_theta}; FD reproducibility (4e-3 vs 8e-3) \
+         {repro:e}, assembled vs FD(4e-3) {worst_fd:e}, cov vs FD {worst_cov:e}"
+    );
+}
+
+/// Family of [`packed_clamped_fixture`], named once so the fixture, its γ̂
+/// driver and the fit that reads its diagnostics cannot drift apart.
+#[cfg(feature = "formula")]
+const PACKED_CLAMPED_FAMILY: Family = Family::Poisson {
+    link: PoissonLink::Log,
+};
+
+/// A packed-row design whose converged mode state carries a μ-clamped row:
+/// `(x, y, offset, n, p, model, ids)`. No corpus rung is in that state on
+/// this layout, so the refusal path needs a constructed cell.
+///
+/// Packed by construction: a random slope on an EXTRA grouping is a shape
+/// `classify_design` answers `Solver::Sparse` for, so `GlmmLayout::for_design`
+/// takes the packed-row layout whatever the row count. The draw is the
+/// extra-grouping-slope Poisson design `loop_tier_honours_extra_grouping_slope`
+/// fits.
+///
+/// The clamp comes from a large negative offset on row 0 and nothing else — no
+/// edited response, no outlying covariate. On the log link μ = exp(η), so an
+/// offset of −30 against an η of order 1 leaves exp(η) ≈ 1e-13, under
+/// `family::MU_FLOOR` (1e-10), and μ is held at that bound — which is what
+/// makes the census read one μ-clamped row. That row's own deviance
+/// contribution is `2(μ − y·…) ≈ 2e-10` at `y = 0`, so it moves the census
+/// without moving the optimum.
+#[cfg(feature = "formula")]
+#[allow(clippy::type_complexity)]
+fn packed_clamped_fixture() -> (
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+) {
+    let (n_g1, n_g2, per) = (8usize, 6usize, 10usize);
+    let n = n_g1 * per;
+    let p = 2;
+    let mut st = 7u64;
+    let (mut x, mut y) = (vec![0.0f64; n * p], vec![0.0f64; n]);
+    let (mut g1, mut g2) = (vec![0u32; n], vec![0u32; n]);
+    for i in 0..n {
+        g1[i] = (i % n_g1) as u32;
+        g2[i] = (i % n_g2) as u32;
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        let eta = 0.5 + 0.4 * x1 + 0.25 * (g1[i] as f64 - 4.0) + 0.6 * x1 * (g2[i] as f64 - 3.0);
+        y[i] = eta.exp().round();
+    }
+    let mut offset = vec![0.0f64; n];
+    offset[0] = -30.0;
+    y[0] = 0.0;
+    let model = ModelSpec {
+        family: PACKED_CLAMPED_FAMILY,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g1 as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed {
+                    n_clusters: n_g2 as u32,
+                },
+                slopes: vec![1],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: g1,
+        extra: vec![g2],
+    };
+    (x, y, offset, n, p, model, ids)
+}
+
+/// One design built in memory, fitted to its own γ̂ with `WaldSe::Rx` (so the
+/// fit runs no Hessian pass) and handed back as the workspace sitting at that
+/// γ̂ with the column-major `X` and the sized ids: `rung_at_gamma_hat`'s
+/// contract for a fixture that is not a corpus CSV.
+#[cfg(feature = "formula")]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn ws_at_gamma_hat(
+    x: &[f64],
+    y: &[f64],
+    offset: Option<Vec<f64>>,
+    n: usize,
+    p: usize,
+    model: &ModelSpec,
+    ids: &GroupIds,
+    what: &str,
+) -> (GlmmWorkspace, Mat<f64>, Vec<u32>, Vec<Vec<u32>>) {
+    let opts = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        wald_se: WaldSe::Rx,
+        offset,
+        nagq: 1,
+        ..FitOptions::default()
+    };
+    let (sized_model, sized_ids, _perm) = super::spec_sized_from_ids(model, ids);
+    let (mut ws, x_mat) = super::glmm::fit_glmm_build(
+        x,
+        n,
+        p,
+        &sized_model,
+        &sized_ids.primary,
+        &sized_ids.extra,
+        &opts,
+    )
+    .unwrap_or_else(|_| panic!("{what}: degenerate design"));
+    let view = super::glmm::run_glmm_on(
+        &mut ws,
+        x_mat.as_ref(),
+        y,
+        n,
+        p,
+        &sized_model,
+        &sized_ids.primary,
+        &sized_ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+    );
+    assert!(view.converged_deviance().0, "{what}: fit must converge");
+    let sized_ids = sized_ids.into_owned();
+    (ws, x_mat, sized_ids.primary, sized_ids.extra)
+}
+
+/// The packed assembled path on a clamped mode state, end to end: on a
+/// packed-row fit whose mode state carries a μ-clamped row the assembled
+/// engine takes the fit, and `joint_hessian_cov` ships its
+/// covariance for it.
+///
+/// The reference side drives `joint_hessian` directly at the same γ̂ and
+/// inverts its matrix the way `joint_hessian_cov` inverts it — `cov = 2·H⁻¹`
+/// on the β block, `sqrt(2·H⁻¹_kk)` on the θ diagonal — so the comparison is
+/// bitwise and needs no band. `packed_gradient` at this γ̂ is checked
+/// separately against a Richardson central difference of
+/// `glmm_laplace_deviance`, the shape
+/// `packed_assembled_gradient_matches_richardson_fd` uses.
+///
+/// The take is asserted at the engine, not through
+/// `assembled::ASSEMBLED_OK_COUNT`: that counter is process-wide and any
+/// concurrently-running test's `WaldSe::Hessian` fit advances it too, so it
+/// cannot say this call in particular is what advanced it.
+#[cfg(feature = "formula")]
+#[test]
+fn clamped_packed_fit_ships_the_assembled_covariance() {
+    use faer::linalg::solvers::Solve;
+
+    let (xf, y, offset, n, p, model, ids) = packed_clamped_fixture();
+    let (mut ws, x, ids_p, extra_ids) = ws_at_gamma_hat(
+        &xf,
+        &y,
+        Some(offset),
+        n,
+        p,
+        &model,
+        &ids,
+        "the packed clamped fixture",
+    );
+    let ids = ids_p;
+    assert_eq!(
+        ws.layout,
+        crate::glmm::GlmmLayout::Packed,
+        "an extra-grouping slope must take the packed-row layout"
+    );
+    let n_theta = ws.n_theta;
+    let m = n_theta + p;
+    let (mu_clamped, eta_clamped) = clamp_census(&ws, PACKED_CLAMPED_FAMILY, ws.weighted, n);
+    println!(
+        "packed clamped fixture: n {n}, m {m}, k {}, census (μ {mu_clamped}, η {eta_clamped})",
+        ws.k
+    );
+    assert!(
+        mu_clamped > 0,
+        "this fixture is here for its clamped mode state (μ {mu_clamped})"
+    );
+    assert!(
+        crate::glmm::assembly_routes(&ws, n),
+        "the shape and the memory guard must both admit the assembled engine"
+    );
+
+    let mut g = vec![0.0; m];
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let st = crate::glmm::joint_hessian_columns(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "the packed assembled engine must take a clamped mode state now"
+    );
+
+    // The assembled arm on its own, symmetrized, at the same γ̂ — the
+    // reference `joint_hessian_cov` below is compared against.
+    let st = crate::glmm::joint_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "the assembled arm must answer"
+    );
+    let chol = hess
+        .as_ref()
+        .llt(faer::Side::Lower)
+        .expect("the assembled joint Hessian is PD at this γ̂");
+    let mut inv = Mat::<f64>::identity(m, m);
+    chol.solve_in_place(inv.as_mut());
+    let want_cov = Mat::<f64>::from_fn(p, p, |a, b| 2.0 * inv[(n_theta + a, n_theta + b)]);
+    let want_theta_se: Vec<f64> = (0..n_theta)
+        .map(|k| (2.0 * inv[(k, k)]).max(0.0).sqrt())
+        .collect();
+
+    let mut got_cov = Mat::<f64>::zeros(p, p);
+    let st = crate::glmm::joint_hessian_cov(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut got_cov,
+    );
+    assert!(
+        matches!(st, crate::glmm::FdHessianStatus::Ok),
+        "expected Ok ({st:?})"
+    );
+    for a in 0..p {
+        for b in 0..p {
+            assert_eq!(
+                got_cov[(a, b)].to_bits(),
+                want_cov[(a, b)].to_bits(),
+                "cov[({a},{b})] {} is not the assembled arm's {}",
+                got_cov[(a, b)],
+                want_cov[(a, b)]
+            );
+        }
+    }
+    for (k, &want) in want_theta_se.iter().enumerate() {
+        assert_eq!(
+            ws.inference.theta_se[k].to_bits(),
+            want.to_bits(),
+            "theta_se[{k}] {} is not the assembled arm's {want}",
+            ws.inference.theta_se[k]
+        );
+    }
+
+    // `packed_gradient` at this fixture's γ̂ against a Richardson central
+    // difference of `glmm_laplace_deviance`, the same shape
+    // `packed_assembled_gradient_matches_richardson_fd` uses.
+    const GRAD_BAND: f64 = 1e-6;
+    let kk = ws.k.max(1);
+    let saved: Vec<f64> = ws.params[..m].to_vec();
+    let u_hat: Vec<f64> = ws.pirls.u[..kk].to_vec();
+    ws.fd.pirls_tol_override = Some(1e-12);
+    let mut g_pg = vec![0.0; m];
+    ws.pirls.u[..kk].copy_from_slice(&u_hat);
+    let st = crate::glmm::packed_gradient(&mut ws, x.as_ref(), &y, p, n, &mut g_pg);
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "the packed assembled gradient declined"
+    );
+    let mut worst_grad_fd = 0.0f64;
+    for coord in 0..m {
+        let h = 1e-3 * saved[coord].abs().max(1.0);
+        let mut at = saved.clone();
+        let ev = |ws: &mut GlmmWorkspace, at: &mut Vec<f64>, d: f64| -> f64 {
+            at[coord] = saved[coord] + d;
+            glmm_laplace_deviance(at, ws, x.as_ref(), &y, &ids, &extra_ids, n)
+        };
+        let d1 = (ev(&mut ws, &mut at, h) - ev(&mut ws, &mut at, -h)) / (2.0 * h);
+        let d2 = (ev(&mut ws, &mut at, 0.5 * h) - ev(&mut ws, &mut at, -0.5 * h)) / h;
+        let fd = (4.0 * d2 - d1) / 3.0;
+        let gap = (g_pg[coord] - fd).abs() / fd.abs().max(1.0);
+        worst_grad_fd = worst_grad_fd.max(gap);
+        assert!(
+            gap <= GRAD_BAND,
+            "coord {coord}: packed gradient {} vs Richardson FD {fd} (relative gap {gap:e})",
+            g_pg[coord]
+        );
+    }
+    ws.params[..m].copy_from_slice(&saved);
+    ws.fd.pirls_tol_override = None;
+    println!(
+        "packed clamped fixture gradient: worst relative gap vs Richardson FD {worst_grad_fd:e}"
+    );
+
+    // The same fixture through the shipped dispatch — a converged fit with
+    // every target SE finite.
+    let (_, _, offset, _, _, _, ids) = packed_clamped_fixture();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        wald_se: WaldSe::Hessian,
+        offset: Some(offset),
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&xf, &y, n, p, &model, &ids, &opts);
+    assert!(f.converged(), "the packed clamped fit must converge");
+    assert!(
+        f.se.iter().all(|v| v.is_finite()),
+        "every target SE is finite: {:?}",
+        f.se
+    );
+
+    // The clean control, unaffected by this flip: the same design and code
+    // path with the offset dropped still converges.
+    let clean = FitOptions {
+        offset: None,
+        ..opts
+    };
+    let fc = fit_cold(&xf, &y, n, p, &model, &ids, &clean);
+    assert!(fc.converged(), "the unclamped control fit must converge");
+}
+
+/// Gamma-inverse design that drives `joint_hessian_cov` off its main path: 12
+/// rows in 4 size-3 clusters whose means span nine decades, with the second
+/// cluster's three responses scaled by `big_scale`. The spread is what makes
+/// the fitted joint (θ,β) Hessian non-PD; `big_scale` moves the fitted point
+/// along that flank and so decides whether the RX/Schur fallback survives the
+/// Hessian (1e-2) or fails with it (1.0).
+fn gamma_inverse_adversarial(big_scale: f64) -> (Vec<f64>, Vec<f64>, ModelSpec, GroupIds) {
+    const X1: [f64; 12] = [
+        -0.2884326052962697,
+        0.15675840297260962,
+        -0.29990566105127503,
+        0.3053648563367106,
+        -0.608001199771249,
+        1.451281361998219,
+        -0.12817918698856592,
+        0.2873778743945057,
+        1.2188666482896826,
+        -1.2520230368147756,
+        -0.01938374443978608,
+        1.0354827975218956,
+    ];
+    const Y: [f64; 12] = [
+        0.013147681629338537,
+        0.022571111060908807,
+        0.009380481267257667,
+        13915684.733974772,
+        16148934.63843452,
+        47449285.58840935,
+        0.03659612272549357,
+        0.03340213953300986,
+        0.16526466878896995,
+        2288.1399088594685,
+        5963.477254271042,
+        19049.155692047607,
+    ];
+    let x: Vec<f64> = X1.iter().flat_map(|&v| [1.0, v]).collect();
+    // Rows 3..6 are the second cluster — the one the scale moves.
+    let y: Vec<f64> = Y
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if (3..6).contains(&i) {
+                v * big_scale
+            } else {
+                v
+            }
+        })
+        .collect();
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Inverse,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 4 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: (0..Y.len() as u32).map(|i| i / 3).collect(),
+        extra: vec![],
+    };
+    (x, y, model, ids)
+}
+
+/// A Gamma-inverse fit where the joint Hessian and the RX fallback's Schur are
+/// both non-PD at the returned point: 12 rows in 4 clusters whose means span
+/// nine decades. `joint_hessian_cov` NaN-fills the covariance there and the fit
+/// comes back as a failed fit, not a panic.
+#[test]
+fn gamma_inverse_double_se_failure_returns_a_failed_fit() {
+    let (x, y, model, ids) = gamma_inverse_adversarial(1.0);
+    let (n, p) = (12, 2);
+    let fit = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1],
+            wald_se: WaldSe::Hessian,
+            ..FitOptions::default()
+        },
+    );
+    assert!(!fit.converged(), "the double SE failure is a failed fit");
+    assert!(fit.se.iter().all(|s| s.is_nan()), "se = {:?}", fit.se);
+}
+
+/// The single SE failure on the same shape: the joint (θ,β) Hessian is non-PD
+/// but the β-only RX/Schur block stays PD, so `joint_hessian_cov` reports
+/// `FdHessianStatus::NonPdFellBackToRx` and the fit ships an RX covariance
+/// under `Note::HessianSeFallback` instead of failing.
+///
+/// That the SEs come from RX is asserted against a `WaldSe::Rx` fit of the same
+/// design: same kernel, same converged point, so `se` must match bit for bit
+/// and `vcov` to a few ULP. A band any wider would hide a scale slip — the
+/// Gamma σ̂² factor the fallback reapplies by hand is exactly what this pins.
+/// `stddev_se` must be NaN: the fallback never assembles a joint Hessian, so
+/// there is no θ-block SE to report, and a stale value from an earlier fit on
+/// the reused workspace must not leak out in its place.
+#[test]
+fn gamma_inverse_non_pd_hessian_falls_back_to_rx_se() {
+    let (x, y, model, ids) = gamma_inverse_adversarial(1e-2);
+    let (n, p) = (12, 2);
+    let opts = |wald_se| FitOptions {
+        target_indices: vec![0, 1],
+        wald_se,
+        ..FitOptions::default()
+    };
+    let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts(WaldSe::Hessian));
+    let rx = fit_cold(&x, &y, n, p, &model, &ids, &opts(WaldSe::Rx));
+    assert!(
+        fit.converged() && rx.converged(),
+        "both arms must converge for the comparison to mean anything"
+    );
+    assert!(
+        fit.diagnostics
+            .notes
+            .iter()
+            .any(|note| matches!(note, crate::Note::HessianSeFallback)),
+        "expected HessianSeFallback, got {:?}",
+        fit.diagnostics.notes
+    );
+    assert_eq!(fit.se, rx.se, "fallback se must BE the RX se");
+    // The covariance only meets to a few ULP off the diagonal: the production
+    // Rx arm accumulates the off-diagonal from `vcov_cols` products while the
+    // fallback reads it off `rx_cov_into`'s LLT inverse, a different
+    // reassociation of the same quantity. The diagonal IS bit-identical — that
+    // is the `se` assertion above.
+    for i in 0..p {
+        for j in 0..p {
+            let (got, want) = (fit.vcov[i][j], rx.vcov[i][j]);
+            assert!(
+                want.is_finite(),
+                "the fallback ships a real covariance, not the double-failure NaN fill"
+            );
+            assert!(
+                (got - want).abs() <= 8.0 * f64::EPSILON * want.abs(),
+                "vcov[{i}][{j}] = {got} vs rx {want}"
+            );
+        }
+    }
+    assert!(
+        fit.stddev_se.iter().all(|v| v.is_nan()),
+        "no joint Hessian ⇒ no θ-block SE: {:?}",
+        fit.stddev_se
+    );
+}
+
+/// The plateau policy on the GLMM route — the mirror of `src/lmm/tests.rs`'s
+/// `maxfun_cap_reports_honest_endpoint`. A `Status::MaxFunReached` exit reports
+/// its finite incumbent (β̂/SE/vcov/deviance) instead of NaN-filling, with
+/// `converged() == false`, `Boundary::NoOptimum` and `df == 0`.
+///
+/// The cap is forced by swapping in a joint solver whose `max_fun` is the legal
+/// minimum (`npt + 1`) — one evaluation past the initial interpolation model,
+/// nowhere near cbpp's optimum. `LMM_MAX_FUN_FORMULA` would do the same, but it
+/// is read once per process, so a test using it would race every other fit in
+/// the binary.
+#[test]
+fn glmm_maxfun_cap_reports_honest_endpoint() {
+    use bobyqa::{Bobyqa, Config};
+
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let p = 4;
+    let model = cbpp_model();
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2, 3],
+        ..FitOptions::default()
+    };
+    let (mut ws, x_mat) =
+        super::glmm::fit_glmm_build(&x, n, p, &model, &ids.primary, &ids.extra, &opts)
+            .unwrap_or_else(|_| panic!("cbpp design must build"));
+
+    // Both outer solvers are capped: which one carries the fit's status depends
+    // on `ws.outer_search` (cbpp routes `ExactProfile`, where stage 1 IS the
+    // search), and the contract under test is the same either way. Dimensions are
+    // the workspace's own: n_theta + p joint, n_theta stage 1 — no `ln θ_NB`
+    // coordinate on binomial.
+    let cap = |dim: usize| {
+        let mut c = Config::new(dim);
+        c.npt = 2 * dim + 1; // PRIMA's default, the legal minimum at dim = 1
+        c.max_fun = c.npt + 1;
+        Bobyqa::new(dim, c).expect("legal minimal config")
+    };
+    ws.solver = cap(ws.n_theta + p);
+    ws.solver_stage1 = cap(ws.n_theta);
+
+    let view = super::glmm::run_glmm_on(
+        &mut ws,
+        x_mat.as_ref(),
+        &y,
+        n,
+        p,
+        &model,
+        &ids.primary,
+        &ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+    );
+    let (fit, _mu, _dev) = super::glmm::glmm_view_to_fit(&view, &y, n, p, &model, &opts);
+
+    assert!(!fit.converged(), "a capped fit must not report converged");
+    assert_eq!(
+        fit.diagnostics.boundary,
+        Boundary::NoOptimum,
+        "a capped endpoint is not an accepted boundary"
+    );
+    assert_eq!(fit.df, 0, "df is gated on convergence");
+    assert!(
+        fit.deviance.is_finite(),
+        "plateau policy: capped endpoint must report a finite deviance, got {}",
+        fit.deviance
+    );
+    for &tj in &opts.target_indices {
+        let j = tj as usize;
+        assert!(
+            fit.beta[j].is_finite() && fit.se[j].is_finite(),
+            "plateau policy: capped endpoint must not NaN-fill β/se at j={j}: β {} se {}",
+            fit.beta[j],
+            fit.se[j]
+        );
+        assert!(
+            fit.vcov[j][j].is_finite(),
+            "plateau policy: capped endpoint must not NaN-fill vcov at j={j}"
         );
     }
 }

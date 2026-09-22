@@ -620,15 +620,8 @@ fn parse_formula(r_formula: &str) -> Spec {
     let (lhs, rhs) = r_formula
         .split_once('~')
         .expect("golden r_formula has no `~`");
-    // The oracle specs write the intercept explicitly (`y ~ 1 + x`); the crate's
-    // formula frontend has no `1` token and takes the intercept as implied. Same
-    // model either way — every golden in the corpus includes the intercept, and
-    // `refit` asserts the lowered column names against the oracle's own
-    // `coef_names`, so a dropped or added intercept fails there rather than
-    // quietly changing the model.
     let lhs = lhs.trim();
-    let rhs = rhs.trim();
-    let rhs = rhs.strip_prefix("1 +").unwrap_or(rhs).trim().to_string();
+    let rhs = rhs.trim().to_string();
 
     let Some(args) = lhs.strip_prefix("cbind(").and_then(|s| s.strip_suffix(')')) else {
         return Spec {

@@ -43,12 +43,11 @@ frozen under `validation/goldens/` for it; recipe 9 (the offset) has no
 golden at all. Each says "a run, not an oracle-pinned result" at the point it
 applies.
 
-**One formula gotcha that hits every recipe below.** The shared formula
-parser always carries an intercept implicitly and has no bare `1` term on
-the fixed-effects side — `y ~ 1 + x` is a parse error; write `y ~ x`. lme4
-formulas (including the ones in `validation/manifest.json`) are conventionally
-written `y ~ 1 + x`, so every formula string below drops that leading `1 +`
-relative to its lme4 original. See [`formula.md`](formula.md).
+**The intercept in the formulas below.** lme4 formulas (including the ones
+in `validation/manifest.json`) usually write the intercept out, `y ~ 1 + x`.
+The formula strings below leave that `1 +` out. Both spellings give the same
+model: the intercept is always there unless `- 1` or `0 +` removes it. See
+[`formula.md`](formula.md).
 
 ## 1. Correlated random slope (`sleepstudy`)
 

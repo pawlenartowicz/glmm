@@ -20,7 +20,7 @@ variance components) on every supported design.
 3. [Zero-allocation workspace and warm starts](#3-zero-allocation-workspace-and-warm-starts)
 4. [Measured optimizer schedule](#4-measured-optimizer-schedule)
 5. [Fused SIMD transcendentals](#5-fused-simd-transcendentals)
-6. [Standard errors from a tightly re-converged Hessian](#6-standard-errors-from-a-tightly-re-converged-hessian)
+6. [Standard errors from an exact Hessian](#6-standard-errors-from-an-exact-hessian)
 7. [Deterministic edge-case policy](#7-deterministic-edge-case-policy)
 8. [A pure kernel](#8-a-pure-kernel)
 
@@ -82,10 +82,9 @@ pass is bit-identical, just slower; `ExactProfile` profiles β out exactly at
 each candidate θ, so that single θ-only search already reaches the Laplace
 optimum and its status alone decides convergence, with no joint polish after
 it. The routing is a three-way chain: `ExactProfile` takes every nAGQ=1
-non-Gamma shape whose extra groupings are absent, or structured-eligible on a
-canonical link; of what is left, `Joint` takes `nAGQ > 1` and the small
-`n_θ ≤ 2 && p ≤ 4` shapes; `PqlThenJoint` takes the rest — the wider Gamma,
-non-canonical-extras and dense-fallback shapes.
+non-Gamma shape on the blocked or structured layout; of what is left, `Joint`
+takes `nAGQ > 1` and the small `n_θ ≤ 2 && p ≤ 4` shapes; `PqlThenJoint` takes
+the rest — the wider Gamma and packed-row shapes.
 
 **Why it is faster.** Every choice was swept against the validation corpus and
 kept only where it cut evaluations without moving any gated result: the `npt`
@@ -103,21 +102,25 @@ and the deviance fold in one vectorised pass over crate-own minimax `exp`/
 transcendentals. Fusing them removes redundant `exp` calls and keeps the loop
 in SIMD registers; the ≤ 2 ULP bound keeps the result within the validation gates.
 
-## 6. Standard errors from a tightly re-converged Hessian
+## 6. Standard errors from an exact Hessian
 
-**What.** The default GLMM covariance is the finite-difference Hessian of the
-Laplace deviance (lme4's `use.hessian = TRUE` method), with PIRLS re-converged
-at a tolerance two decades tighter than the fit tolerance at every perturbed
-point. The conditional-on-θ̂ alternative (`Rx`, MixedModels.jl's only method)
-is also available.
+**What.** The default GLMM covariance comes from the Hessian of the joint
+`(θ, β)` Laplace deviance, the quantity lme4's `use.hessian = TRUE` method
+estimates by finite differences. `glmm` computes it exactly. The gradient of
+the profiled deviance is written in closed form with one adjoint solve, and
+forward-mode automatic differentiation of that gradient gives the Hessian: no
+step size and no PIRLS re-solve per perturbed point. A finite-difference
+Hessian stays as the fallback for the few fits the exact passes decline
+(`algorithms-glmm.md`, "Standard errors"). The conditional-on-θ̂ alternative
+(`Rx`, MixedModels.jl's only method) is also available.
 
 **Why it is more accurate.** An FD Hessian is only as good as the objective
-under it: `glmer` at its default `tolPwrss` evaluates the Hessian on a surface
-whose working weights lag the mode by one iteration, which biases its own
-Hessian SEs by ~1%. `glmm`'s tight re-convergence makes the second differences
-step-invariant by construction; against an artifact-free lme4 oracle
-(tightened `tolPwrss`) the SEs agree to ≤ 2e-5 relative. Offering both arms
-also means either reference engine can be matched exactly.
+under it and the step it takes: `glmer` at its default `tolPwrss` evaluates
+the Hessian on a surface whose working weights lag the mode by one iteration,
+which biases its own Hessian SEs by ~1%. An exact Hessian has no step and no
+truncation error. Against an artifact-free lme4 oracle (tightened `tolPwrss`)
+the SEs agree to ≤ 2e-5 relative. Offering both arms also means either
+reference engine can be matched exactly.
 
 ## 7. Deterministic edge-case policy
 

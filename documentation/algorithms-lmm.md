@@ -49,10 +49,12 @@ Three real routing decisions sit between `fit_cold`/`fit_warm` and a returned
    caps in `src/consts.rs`), **or** any extra grouping carries a random slope,
    **or** the total `Crossed` level count exceeds `MAX_CROSSED_LEVELS` (500).
    Otherwise `NoZ`.
-2. **Kernel** — `NoZ` Gaussian goes to `accumulate_lmm_rows` + `lmm_run_on`
-   (`src/fit/lmm.rs`) → `fit_lmm` (`src/lmm/mod.rs`); `Sparse` Gaussian goes to
-   `fit_mle_sparse` (`src/sparse/mod.rs`). Both minimise the same profiled-REML objective over
-   the same θ seed/bounds; the sparse path is a superset that reproduces the
+2. **Kernel** — every Gaussian design goes to `accumulate_lmm_rows` +
+   `lmm_run_on` (`src/fit/lmm.rs`) → `fit_lmm` (`src/lmm/mod.rs`), which
+   evaluates the profiled-REML objective through the dense sufficient
+   statistics (`NoZ`) or the sparse-Z Gram/Schur workspace (`Sparse`,
+   `src/sparse/mod.rs`). One seed, one θ search, one recovery block over both;
+   the sparse kernel is a superset that reproduces the
    dense fit to machine precision on any in-envelope design (see
    [the sparse section](#the-sparse-kernel-two-level-schur-block-cholesky)
    for why that equivalence is structural, not approximate).
@@ -67,9 +69,9 @@ Three real routing decisions sit between `fit_cold`/`fit_warm` and a returned
 ```mermaid
 flowchart TD
     A["Gaussian, re: Some"] --> B{"classify_design"}
-    B -->|"over envelope / slope on extra / >500 crossed levels"| S["Solver::Sparse: fit_mle_sparse"]
-    B -->|"in envelope"| N["Solver::NoZ: lmm_run_on -> fit_lmm"]
-    N --> C{"reml_deviance sub-path"}
+    B --> N["lmm_run_on -> fit_lmm"]
+    N -->|"Solver::Sparse: over envelope / slope on extra / >500 crossed levels"| S["sparse kernel: sparse_reml_deviance"]
+    N -->|"Solver::NoZ: in envelope"| C{"reml_deviance sub-path"}
     C -->|"intercept-only primary, balanced"| CO["balanced collapse shortcut"]
     C -->|"otherwise"| GP["general family elimination"]
 ```
@@ -86,7 +88,7 @@ extras), forms the raw RE Gram `G = ZᵀZ`, and takes **one dense Cholesky** of
 **Code**: `classify_design` (`src/fit/mod.rs`); `build_workspace`/`fit_on`
 (`src/fit/core.rs`); `accumulate_lmm_rows`, `lmm_run_on` (`src/fit/lmm.rs`);
 `fit_lmm` (`src/lmm/mod.rs`); `reml_deviance`, `reml_deviance_blocked`,
-`precompute_balanced_collapse` (`src/lmm/kernel.rs`); `fit_mle_sparse`,
+`precompute_balanced_collapse` (`src/lmm/kernel.rs`); `SparseLmmWorkspace`,
 `sparse_reml_deviance` (`src/sparse/mod.rs`); caps in `src/consts.rs`.
 **Convention**: the NoZ/Sparse split is a scratch-capacity boundary, not a model
 limit — lme4 and MixedModels.jl fit any of these designs with one solver; `glmm`
@@ -173,8 +175,8 @@ before the workspace is built.
 **Code**: `rms_column_scale`, `LmmGroupings::set_slope_scales` /
 `theta_row_scales` / `block_row_scale` (`src/lmm/mod.rs`); the Z-read sites in
 `LmmSuffStats::add_rows_multi` / `reml_deviance_blocked` (`src/lmm/kernel.rs`),
-`primary_gram` (`src/lmm/mod.rs`), `for_each_z_entry` (`src/sparse/mod.rs`), `build_z` /
-`fill_z_f64` (`src/glmm/workspace.rs`), `fill_m_vals` (`src/sparse/glmm.rs`);
+`primary_gram` (`src/lmm/mod.rs`), `for_each_z_entry` (`src/sparse/mod.rs`),
+`fill_z_f64` (`src/glmm/workspace.rs`), `fill_m_vals` (`src/glmm/pirls/packed.rs`);
 the back-maps in `varcorr_block` / `assemble_ranef_sparse` /
 `assemble_ranef_dense` (`src/fit/common.rs`). **Convention**: lme4 leaves the RE
 design alone and warns on badly scaled predictors instead (`checkScaleX`);
@@ -208,7 +210,7 @@ it per evaluation. It sits in the `Fit` assembly, the one site every caller
 reaches, so no caller applies it a second time.
 
 **Offset.** A `FitOptions::offset` is an exact response shift under the
-identity link: the core's `LmmDense` arm accumulates `y − o` and nothing
+identity link: the core's `Lmm` arm accumulates `y − o` and nothing
 downstream needs to know (same convention as the OLS path).
 
 The objective returns `f64::INFINITY` on any Cholesky failure or non-positive σ̂²
@@ -279,22 +281,16 @@ The `npt` mid-size (`⌈1.5n⌉+1`, used from `n ≥ 3`) beats Powell's `2n+1` o
 measured dimension ≥ 3; below that it *is* `2n+1`. PRIMA requires
 `n+2 ≤ npt ≤ (n+1)(n+2)/2`, which the formula respects.
 
-Two alternate seeds exist alongside the shipped schedule. `bobyqa_config` is a
+One alternate seed exists alongside the shipped schedule: `bobyqa_config`, a
 generic default without the scaled schedule (`RHO_BEGIN`, PRIMA default
-`npt = 2n+1`). `sparse_lmm_seed` is the sparse path's byte-identical,
-topology-only seed (it computes the identical `npt` formula from the spec
-alone).
+`npt = 2n+1`).
 
 The dev-only env campaign hooks are no-ops unless set, and are not part of the
 shipped behaviour. `LMM_NPT_FORMULA` and `LMM_MAX_FUN_FORMULA` override single
-numeric knobs. `LMM_TWO_STAGE` switches the **dense LMM kernel only** to a
-different optimizer shape: `two_stage_minimize`, a stage-1 `npt = n+2`,
-`rho_end = 1e-3` scout that warm-restarts a stage-2 `npt = 2n+1` polish
-(`fit_mle_sparse` never calls it). `LMM_STAGE_PROBE` emits per-stage eval
-diagnostics from that same dense path.
+numeric knobs.
 
-**Code**: `fit_lmm`/`fit_lmm_impl`, `LmmWorkspace::for_cluster_spec_ext`,
-`bobyqa_config`, `sparse_lmm_seed`, constants `RHO_BEGIN`/`RHO_END`/`THETA0`
+**Code**: `fit_lmm`, `LmmWorkspace::for_cluster_spec_ext`,
+`bobyqa_config`, constants `RHO_BEGIN`/`RHO_END`/`THETA0`
 (`src/lmm/mod.rs`); the external `bobyqa` crate supplies the solver.
 **Convention**: derivative-free BOBYQA over relative-Cholesky θ, as in lme4's
 default `nloptwrap`/`bobyqa` optimiser for `lmer`. **Validation**: sleepstudy
@@ -351,12 +347,9 @@ diagonals. Because Σ is preserved, the reported answer does not move; what
 changes is θ itself (and `tau2`, which is per-θ). A block with no pinned diagonal
 is skipped untouched, so a non-singular fit is bit-identical.
 
-Two reported fields depend on this canonical form. `Diagnostics::pinned` becomes
-truthful — a zero θ diagonal is now a zero standard deviation, which on a
-non-canonical Λ it need not be — and `Diagnostics::boundary_score` is reportable
-at every pinned diagonal, because its `½·∂²D/∂θ_jj²` shortcut needs the deviance
-to be even in `θ_jj`, which needs exactly the zero column below the diagonal that
-canonicalization produces. The sparse and GLMM paths run the same step.
+`Diagnostics::pinned` depends on this canonical form: a zero θ diagonal is now a
+zero standard deviation, which on a non-canonical Λ it need not be. The sparse
+and GLMM paths run the same step.
 
 A truth-seeded warm start is clamped to `THETA_TRUTH_FLOOR = 0.01` first, so a
 near-zero true θ never begins the search on the boundary itself.
@@ -375,11 +368,11 @@ into two cases — the **plateau policy**, pinned by
   carries no rank guard: `fit_lmm` fits a near-singular but
   finite endpoint instead of refusing it.
 
-The sparse path mirrors the same plateau policy.
+Both kernels run the same pin loop and plateau policy — it is one copy, in
+`fit_lmm`.
 
-**Code**: the pin loop and endpoint recovery in `fit_lmm_impl`, constants
-`PIN_THETA`/`THETA_TRUTH_FLOOR` (`src/lmm/mod.rs`); the mirror pin and
-plateau policy in `fit_mle_sparse` (`src/sparse/mod.rs`). **Convention**:
+**Code**: the pin loop and endpoint recovery in `fit_lmm`, constants
+`PIN_THETA`/`THETA_TRUTH_FLOOR` (`src/lmm/mod.rs`). **Convention**:
 lme4 reports such fits as `isSingular`; `glmm` pins to exactly `0` (FP-stable
 across platforms) and still returns the fit. **Validation**: Dyestuff sits near
 the interior; the boundary behaviour is pinned by in-crate τ̂≈0 tests
@@ -389,8 +382,8 @@ by the reference engines flagging the same data.
 
 ## The sparse kernel: two-level Schur-block Cholesky
 
-`fit_mle_sparse` (`src/sparse/mod.rs`) minimises the same objective but
-factorises a differently-shaped system, in an elimination order chosen for
+`fit_lmm`'s sparse kernel (`src/sparse/mod.rs`) minimises the same objective
+but factorises a differently-shaped system, in an elimination order chosen for
 sparse Z. Per θ-evaluation, `sparse_schur_factor` runs:
 
 1. **Family blocks** — a per-family `w×w` Crout for `L11`, whose pivots
@@ -408,13 +401,18 @@ The dense-equivalence claim from the dispatch section is structural: at the
 same θ both kernels factor the same SPD system, and by
 Cholesky uniqueness the sparse factor equals the dense path's augmented factor
 — so the two fits agree to machine precision wherever both apply, and the
-sparse path can serve as the superset solver without a separate tolerance.
-The two routes still disagree on ill-conditioning policy, though: the dense
-path never refuses on conditioning grounds (see the plateau policy above),
-while the sparse path refuses below its own floor (`sparse::PIVOT_MIN`) and
-reports `converged: false` instead of fitting and flagging.
+sparse kernel can serve as the superset solver without a separate tolerance.
+The kernel itself is unchanged; its caller is `fit_lmm` through
+`LmmKernel::Sparse`, built per call by `accumulate_lmm_rows`. The search
+around them is one copy: the seed, the BOBYQA schedule, the pin loop, β̂ and
+`Var(β̂)` off the factor, and the joint Wald statistic are `fit_lmm`'s,
+whichever kernel evaluates the objective. The ill-conditioning policy is one
+copy too: `min_pivot_ratio` measured off whichever factor the kernel left is
+flagged `IllConditioned` below `lmm::PIVOT_MIN`, never refused. The one thing
+the sparse kernel does not carry is the exact dual REML gradient — it has no
+dual twin at all.
 
-**Code**: `fit_mle_sparse`, `sparse_reml_deviance`, `sparse_schur_factor`,
+**Code**: `sparse_reml_deviance`, `sparse_schur_factor`,
 `schur_phase_b`, `TAIL_SPARSE_MIN` (`src/sparse/mod.rs`). **Validation**:
 sim_slope_extra (rung 7) externally; the dense-vs-sparse deviance equivalence
 by in-crate cross-checks.
@@ -429,7 +427,7 @@ Wald statistic is `t² = β̂_j² / Var(β̂_j)`. SEs are computed only for the 
 `FitOptions::target_indices`. A joint Wald χ² over the target set is available via
 the shared `joint_wald_chi_sq` helper (re-Choleskying `X'V⁻¹X = L_XX·L_XXᵀ`).
 
-**Code**: the recovery block in `fit_lmm_impl`, `joint_wald_chi_sq`
+**Code**: the recovery block in `fit_lmm`, `joint_wald_chi_sq`
 (`src/lmm/mod.rs`). **Convention**:
 lme4's profiled fixed-effect covariance `σ̂²·(X'V⁻¹X)⁻¹`; all engines compute
 the LMM SE identically. **Validation**: the LMM `se` gate is tight (~1e-3)
@@ -452,7 +450,7 @@ in `validation/divergences.json`. The manifest currently carries 27 datasets (ru
 | 2 | sleepstudy | intercept + correlated slope (`q_p = 2`) | NoZ, general elimination |
 | 3 | Penicillin | crossed factors | NoZ, crossed tail |
 | 4 | Pastes | nested factor | NoZ, nested family block |
-| 7 | sim_slope_extra | slope-carrying crossed extra | Sparse (`fit_mle_sparse`) |
+| 7 | sim_slope_extra | slope-carrying crossed extra | Sparse kernel |
 
 Further Gaussian rungs in the corpus (Machines `q = 3`, Oats real nesting, cake
 interaction grouping, sim_three_level, sim_max_q_slope at the `q = 8`
@@ -473,7 +471,7 @@ targets non-Gaussian GLMMs and defers Gaussian LMMs to nlme/lme4.)
 | Optimiser | BOBYQA via nloptwrap (default) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE) | BOBYQA (PRIMA), tuned `npt`/ρ schedule |
 | Linear algebra per eval | sparse Cholesky of `ΛᵀZᵀZΛ + I` (CHOLMOD), Z materialised | blocked/amalgamated Cholesky, Z materialised | dense path: **no Z at all** — sufficient statistics + family-block elimination, with a closed-form collapse for balanced single-intercept designs; sparse path: Schur-block Cholesky (AMD sparse tail) |
 | Singular fit | fits, `isSingular` warns | fits, flags | pins diagonal components ≤ `1e-4` to exact `0`, still `converged`, sets `Diagnostics::singular`/`Diagnostics::pinned` |
-| Optimiser cap-out | warns, returns last point | warns, returns last point | returns the best finite point, `converged: false`; dense path: `Diagnostics::boundary == Boundary::NoOptimum`; sparse path: `boundary` is back-derived from `singular`, so `NoOptimum` never appears there |
+| Optimiser cap-out | warns, returns last point | warns, returns last point | returns the best finite point, `converged: false`, `Diagnostics::boundary == Boundary::NoOptimum` — the same on the dense and the sparse kernel, since `fit_lmm` sets it once with no kernel branch |
 | BLUPs / `ranef` | yes | yes | not computed (deliberate — see [`coming-from-lme4.md`](coming-from-lme4.md)) |
 
 The rows that matter in practice: the **criterion lock** (comparing `glmm` to

@@ -426,7 +426,11 @@ mod tests {
 
     /// Per-order GH weights sum to √π (the table's defining normalization; the
     /// AGQ k=1=Laplace reduction depends on it). Cross-checks the pasted literals
-    /// against the closed-form sum rather than trusting the generator.
+    /// against the closed-form sum rather than trusting the generator. A weight
+    /// sum alone would still pass a corrupted node literal (the abscissae never
+    /// enter this check), so also pin the abscissae's own defining symmetry:
+    /// each order's nodes are antisymmetric about 0 (Hermite roots come in ±
+    /// pairs), and an odd order's middle node sits exactly at 0.
     #[test]
     fn gh_table_weights_sum_sqrt_pi() {
         let sqrt_pi = std::f64::consts::PI.sqrt();
@@ -438,6 +442,24 @@ mod tests {
                 "order {} weights sum {} != √π",
                 2 * i + 1,
                 s
+            );
+
+            let order = 2 * i + 1;
+            let nodes = &GH_NODES[GH_OFFSETS[i]..GH_OFFSETS[i + 1]];
+            for j in 0..order {
+                assert!(
+                    (nodes[j] + nodes[order - 1 - j]).abs() < 1e-13,
+                    "order {order} node {j} = {} not antisymmetric with node {} = {}",
+                    nodes[j],
+                    order - 1 - j,
+                    nodes[order - 1 - j]
+                );
+            }
+            assert_eq!(
+                nodes[order / 2],
+                0.0,
+                "order {order} middle node {} != 0",
+                nodes[order / 2]
             );
         }
         assert_eq!(GH_OFFSETS[GH_OFFSETS.len() - 1], GH_NODES.len());

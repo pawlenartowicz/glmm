@@ -17,8 +17,11 @@ wherever the fit failed, matching \verb{$loglik}.
 }
 \description{
 On \code{stats::logLik}'s scale, so \code{AIC()} and \code{BIC()} work directly. This is
-\verb{glmm::Fit::loglik}, not \verb{$deviance} - the latter is the optimizer criterion
-and differs from \code{-2*logLik} by model-dependent constants.
+\verb{glmm::Fit::loglik}, not \verb{$deviance} - the latter is the optimizer
+criterion. For an LMM it is lme4's REMLcrit minus a data-independent
+constant. For a GLMM it differs from \code{-2*logLik} by a data-only saturated
+constant on binomial/Poisson fits, and equals \code{-2*logLik} exactly on Gamma
+and negative-binomial fits.
 }
 \details{
 For an LMM the value is the \strong{REML criterion}, matching \code{lme4::logLik} on a

@@ -6,6 +6,99 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [0.4.0] — 2026-09-22
+
+The default standard errors of a GLMM are much cheaper. The sparse route now
+tries an exact Hessian first and keeps the finite-difference Hessian as its
+fallback. The sparse route is a backend of the same fit code, not a second
+copy of it. Three bugs in the Laplace fit are fixed.
+
+### Changed
+
+- **The default GLMM standard errors (`WaldSe::Hessian`) come from a new exact
+  Hessian pass.** It differentiates the assembled Laplace gradient once, and
+  it has no limit on the number of parameters. On the sparse route it runs
+  first, and the finite-difference Hessian stays as the fallback. The pass
+  also takes a fit with a row whose fitted mean is held at its limit. The
+  fallback takes a fit with a row at the limit of the link's linear
+  predictor, a weighted logit fit with a saturated row, a fit whose observed
+  factor is not positive definite, and a model above the pass's 256 MiB
+  memory guard.
+  Measured on a locked machine, the pass is 4.3× faster on grouseticks, 1.8×
+  on VerbAgg, and 6.5× to 51× faster on the sparse test models. The standard
+  errors move at round-off level on dense models. On sparse models that take
+  the new pass they move within the error of the finite difference it
+  replaces. AGQ fits and the LMM keep their earlier Hessian pass.
+- **The floor on the IRLS weight is `1e-300`, was `1e-6`,** in the GLM and in
+  the GLMM. It only keeps the weight positive. A row with a weight under
+  `1e-6` (a fitted probability or mean very close to its limit) now enters
+  the fit with its own weight, so a fit with such a row can move. On the test
+  models one fit moved: a cloglog model with one such row, deviance down by
+  2.0e-7.
+- **Crossed and nested GLMMs with a probit, cloglog or negative-binomial log
+  link use the θ-only exact-profile search.** They used the joint search
+  before. The objective is the same, the search path is not, so the last
+  digits of the estimates can move on these models.
+- **One fit routine per model class.** The sparse route shares the dense
+  route's PIRLS, deviance and standard-error code. `n_eval` and the last
+  digits of the deviance can move on sparse fits; no fit in the validation
+  corpus changed its `converged` or `singular` flag. Sparse fits are 17–39 %
+  faster.
+- **A sparse LMM no longer refuses a badly conditioned design.** It used to
+  return NaN estimates with `converged: false` below a pivot ratio of `6e-10`.
+  It now fits the design and adds an `IllConditioned` note below a pivot
+  ratio of `1e-12`, the same floor as the dense LMM.
+- **The formula accepts the intercept written out.** `y ~ 1 + x` is the same
+  model as `y ~ x`; it was a syntax error before. A formula that both writes
+  the intercept and removes it (`y ~ 1 + x - 1`, `y ~ 0 + 1 + x`) is an error.
+- **Large crossed models are faster per evaluation:** 3.3× on a crossed
+  simulated model at the dense size limit, 2.7× on VerbAgg. The results move
+  at round-off level.
+- **The PIRLS iteration-cap warning in Python and R now names one of four
+  cases:** a rejected trial point, a converged fit that rests on a capped
+  solve, a search that ran out of budget, or a failed fit.
+
+### Fixed
+
+- **A Laplace fit could return all NaN when the search ran out of
+  evaluations.** The inner PIRLS cap is now 200 iterations, was 50. A fit
+  that runs out of budget reports the best point it found, with
+  `converged: false`.
+- **The Laplace deviance is evaluated at the last PIRLS iterate.** Before, its
+  log-determinant came from the iterate one step earlier. The deviance moves
+  by at most 2.8e-5 on the test models. Two registered divergences from lme4
+  stopped firing and were removed; `validation/divergences.json` is empty.
+- **`deviance` of a negative-binomial GLMM is now exactly `−2·loglik`.**
+- **R: `VarCorr()` no longer fails on a fit that found no optimum.**
+- **An inverse-Gaussian GLM with the `1/μ²` link and a small mean now
+  converges.** The `|η| > 30` divergence rule stopped it, because `η = 1/μ²` is
+  above 30 for any mean under 0.18. The rule now skips this link, as it does
+  the Gamma inverse link.
+- **A GLMM with no usable fixed-effect column no longer panics.** This happened
+  with zero fixed columns, and with one fixed column that is all zeros. The fit
+  now comes back with NaN estimates and `converged: false`.
+- **A GLMM with no more rows than fixed-effect columns (`n <= p`) now comes back
+  with NaN estimates and `converged: false`**, as the OLS, GLM and LMM routes
+  already did. Before, it reported a converged fit of a saturated model.
+- **A Gamma inverse or inverse-Gaussian `1/μ²` GLMM could report the deviance of
+  a point outside the link's domain.** The last PIRLS step could move `η` past
+  the edge; a debug build panicked there. That evaluation now counts as failed.
+
+### Removed
+
+- **Python: the `faststats.glmm` import alias.** Use `import glmm`.
+- `src/sparse/glmm.rs` and `src/glmm/pirls/dense.rs`;
+  `src/glmm/pirls/packed.rs` replaces both.
+- **`Diagnostics::kkt_grad_norm`, `Diagnostics::boundary_score` and
+  `FitOptions::boundary_score`.** Neither diagnostic fed a fitting decision.
+  `LmmGroupings::diagonal_has_nonzero_below` is also removed from the
+  `loop_advanced` surface (no semver guarantee).
+
+### Changed — `counters` (no semver guarantee)
+
+- `nb_nodes` and `nb_evals_total` are always 0. Every route searches
+  `ln θ_NB` inside the outer search, so `n_eval` already counts the whole fit.
+
 ## [0.3.3] — 2026-09-11
 
 The random-effect search no longer stops at a false boundary where a Cholesky

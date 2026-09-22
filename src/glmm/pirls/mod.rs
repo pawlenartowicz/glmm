@@ -1,24 +1,27 @@
-//! PIRLS module root: `BetaStep`, `refresh_eta_fixed`, `build_coupling_csr`, and the re-exports that keep `crate::glmm::pirls::*` paths stable across the `dense`/`blocked`/`blocked_extras` solve variants.
+//! PIRLS module root: `BetaStep`, `refresh_eta_fixed`, `build_coupling_csr`, and the re-exports that keep `crate::glmm::pirls::*` paths stable across the `packed`/`blocked`/`blocked_extras` solve variants.
 
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::cholesky::llt::factor::{cholesky_in_place, LltRegularization};
 use faer::linalg::cholesky::llt::solve::solve_in_place;
 use faer::{Mat, MatMut, MatRef, Par, Spec};
 
-use super::workspace::{glmm_block_chol, glmm_block_solve, StructuredSchur};
+use super::workspace::{
+    glmm_block_chol, glmm_block_solve, PackedScratch, PirlsScratch, StructuredPattern,
+    StructuredSchur, StructuredScratch,
+};
 use super::{PIRLS_MAX_HALVINGS, PIRLS_MAX_ITERS};
 use crate::scalar::Scalar;
 use crate::spec::{BinomialLink, Family};
 
 mod blocked;
 mod blocked_extras;
-mod dense;
+mod packed;
 
 pub(crate) use blocked::pirls_solve_blocked;
 pub(crate) use blocked_extras::{
     pirls_solve_blocked_extras, structured_ainv_solve, structured_factor, TailKernel,
 };
-pub(crate) use dense::pirls_solve;
+pub(crate) use packed::{fill_m_vals, packed_m_vals_theta_deriv, pirls_solve_packed};
 
 /// What one `laplace_deviance` call does with β. `Fixed` = β is the caller's input
 /// (every SE, derivative and joint-BOBYQA eval). `ProfilePql` = the PQL border, stage 1.
@@ -42,14 +45,14 @@ pub(crate) enum BetaStep<'a> {
         // `Some` = exact Laplace profile (`BetaMode::ProfileExact`); `None` = the PQL
         // border, verbatim. Set only by `laplace_deviance`.
         exact: Option<&'a mut ExactProfileBufs>,
-        xtwx: &'a mut Mat<f64>,      // p×p  C = X'WX          (ws.xtwx)
-        xtwm: &'a mut Mat<f64>,      // p×k  B' = X'WM         (ws.xtwm)
-        ainv_mtwx: &'a mut Mat<f64>, // k×p  T = A⁻¹B          (ws.ainv_mtwx)
-        schur: &'a mut Mat<f64>,     // p×p  S_β               (ws.schur)
+        xtwx: &'a mut Mat<f64>,      // p×p  C = X'WX          (ws.border.xtwx)
+        xtwm: &'a mut Mat<f64>,      // p×k  B' = X'WM         (ws.border.xtwm)
+        ainv_mtwx: &'a mut Mat<f64>, // k×p  T = A⁻¹B          (ws.border.ainv_mtwx)
+        schur: &'a mut Mat<f64>,     // p×p  S_β               (ws.border.schur)
         beta_rhs: &'a mut [f64],     // len p: X'ρ, then rhs, then δβ in place (ws.beta_rhs)
-        beta_prev: &'a mut [f64], // len p: last-accepted β for the halving backtrack (ws.beta_prev)
+        beta_prev: &'a mut [f64], // len p: last-accepted β for the halving backtrack (ws.border.beta_prev)
         // Persistent scratch for `schur`'s in-place `cholesky_in_place`, sized once
-        // for p×p at workspace construction (ws.schur_llt_mem) — avoids the
+        // for p×p at workspace construction (ws.border.schur_llt_mem) — avoids the
         // `.llt(Side::Lower)` per-iteration heap allocation on this hot β-Schur step.
         schur_llt_mem: &'a mut MemBuffer,
     },
@@ -112,8 +115,8 @@ pub(crate) struct DualStep<T> {
     pub(crate) observed: bool,
     /// `s·q_p²` scratch for the observed blocked-path blocks, same layout as
     /// `a_blocks`; untouched when `observed` is false, and untouched on the
-    /// structured-extras path, which packs its twin into the four buffers
-    /// below instead.
+    /// structured-extras path, which packs its twin into the three buffers
+    /// below plus `obs_rhs` instead.
     pub(crate) obs_blocks: Vec<T>,
     /// `(q_core² · s).max(1)` twin of the structured kernel's `core_blocks`,
     /// same per-cluster lower-triangle layout, scattered from `W_obs`.
@@ -125,8 +128,11 @@ pub(crate) struct DualStep<T> {
     pub(crate) obs_coupling: Vec<T>,
     /// `(e²).max(1)` twin of `schur_blk`, lower triangle.
     pub(crate) obs_schur_blk: Vec<T>,
-    /// len `k_total`. The observed right-hand side in the `a_rhs` packing
-    /// (`[f·q_core + local | k_family + b]`), then `u_obs = A_obs⁻¹ rhs` in place.
+    /// len `k_total`. The observed right-hand side in the `a_rhs` packing —
+    /// `[f·q_core + local | k_family + b]` on the structured-extras path,
+    /// `f·q_p + local` on the blocked one — then `u_obs = A_obs⁻¹ rhs` in
+    /// place. Both paths stage the twin's right-hand side here so the Fisher
+    /// `a_rhs` is free to carry its own fold.
     pub(crate) obs_rhs: Vec<T>,
     /// len `n`. Per-row observed IRLS residual `w_obs,i·(Mu)ᵢ + W·working_residᵢ`.
     /// The structured kernel folds `(A − I)u` into its residual before the
@@ -139,7 +145,7 @@ pub(crate) struct DualStep<T> {
     /// exact-Hessian step, so the caller may read the lanes after this one
     /// call. Two things take it back, and either is enough:
     ///
-    /// - A row on one of the kernel's clamps, on any link, canonical
+    /// - A row on the kernel's μ clamp, on any link, canonical
     ///   included — the step matrix is then not the Jacobian of the map the
     ///   iteration actually walks. See [`clamped_row_present`], which is the
     ///   test, for the derivation.
@@ -153,6 +159,108 @@ pub(crate) struct DualStep<T> {
     /// caller's refinement loop (`derivative.rs`'s `run_gradient` /
     /// `run_hessian`) re-enters until they stop moving.
     pub(crate) exact: bool,
+}
+
+/// One Laplace `A`-layout: how `M = ZΛ` is stored, how `A = M'WM + I` and
+/// `a_rhs = M'r` are assembled from the working weights, how `A` is factored
+/// and `log|A|` read, and how `A⁻¹` is applied. Implemented by the blocked,
+/// structured-extras and packed-row layouts over borrowed workspace buffers.
+/// The three PIRLS loops call these where their inline assembly sits; the exit
+/// refresh calls the same two assembly methods after the loop, so the
+/// objective's three terms and the factor the Schur fillers inherit describe
+/// one iterate.
+pub(crate) trait LaplaceFactor<T: Scalar> {
+    /// `eta[i] = eta_fixed[i] + (M u)_i` for `i < n`, together with every
+    /// layout-owned per-row buffer this layout's [`LaplaceFactor::scatter`]
+    /// consumes. The invariant the exit refresh rests on: after
+    /// `eta_from_mode(u)`, a family pass over the `eta` it wrote, and
+    /// `scatter`, the layout's `A` and `a_rhs` describe the iterate `u`.
+    ///
+    /// Returns `Σᵢ yᵢηᵢ` off the RAW η, before the family pass clamps it in
+    /// place — the fused-identity deviance branch inside that pass consumes
+    /// it. Accumulated inside this row pass so no caller needs a second one.
+    fn eta_from_mode(&mut self, u: &[T], eta_fixed: &[T], eta: &mut [T], y: &[f64], n: usize) -> T;
+    /// The row pass that fills `A` (without `+I`) and `a_rhs` from `w`, `prob`,
+    /// `eta`, `y` and the layout's `M`; `dual` is the observed-information twin
+    /// target the blocked and structured loops fill in the same pass (`None`
+    /// from the exit refresh, always `None` on the packed layout).
+    // The row-pass inputs plus the observed-twin target are this trait's
+    // contract; the layout owns everything else, so there is nothing left to
+    // bundle.
+    #[allow(clippy::too_many_arguments)]
+    fn scatter(
+        &mut self,
+        w: &[T],
+        prob: &[T],
+        eta: &[T],
+        y: &[f64],
+        prior_w: &[f64],
+        weighted: bool,
+        n: usize,
+        dual: Option<&mut DualStep<T>>,
+    );
+    /// `+I`, factor in place, return `log|A|`; `None` when not PD. Leaves the
+    /// factor for [`LaplaceFactor::solve_in_place`] and for the `se.rs` Schur
+    /// fill.
+    fn factor_logdet(&mut self) -> Option<T>;
+    /// `a_rhs ← A⁻¹ a_rhs` using the factor `factor_logdet` left.
+    fn solve_in_place(&mut self);
+}
+
+/// One Laplace evaluation at the returned PIRLS iterate: η, μ, W and the
+/// deviance at the returned `(u, β)` (β is already in `eta_fixed`), then
+/// `A = M'WM + I` from that W, factored, with `log|A|` off the new factor.
+/// `D(û) + ‖û‖²` is stationary in u at the mode, `log|A(u)|` is not, so a
+/// factor left one Newton step behind puts a first-order error in the
+/// objective and in every lane differentiated through it. Returns
+/// `(dev, logdet)`, `None` when the refreshed factor is not PD or when a raw η
+/// at the refreshed point sits outside the link's open domain.
+// `eta`, `prob`, `w`, `eta_fixed` and `u` are `PirlsScratch` fields the
+// `layout` value passed beside them already holds disjoint `&mut` borrows of
+// other fields of, so passing the scratch struct itself would conflict with
+// `layout` at every call site.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_at_mode<T: Scalar, L: LaplaceFactor<T>>(
+    layout: &mut L,
+    family: Family,
+    nb_theta: f64,
+    y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
+    eta_fixed: &[T],
+    u: &[T],
+    eta: &mut [T],
+    prob: &mut [T],
+    w: &mut [T],
+    n: usize,
+) -> Option<(T, T)> {
+    let yeta = layout.eta_from_mode(u, eta_fixed, eta, y, n);
+    let (dev, infeasible) = T::family_pass(
+        family,
+        nb_theta,
+        &mut eta[..n],
+        &y[..n],
+        &prior_w[..n],
+        weighted,
+        yeta,
+        &mut prob[..n],
+        &mut w[..n],
+        &mut [],
+    );
+    // The refreshed point is the loop's POST-step iterate: each loop takes a
+    // Fisher step (and, in Profile mode, the δβ border move) after accepting an
+    // iterate and only then tests the exit band, so no trial evaluation has
+    // passed on this η. A raw η outside the link's open domain therefore
+    // reaches here — on Gamma-inverse and inverse-Gaussian-inverse-squared, the
+    // two `family::eta_infeasible` names. Refusing it hands the solve its
+    // failure surface; returning the deviance would report the
+    // `clamp_eta`-projected boundary point as the converged answer.
+    if infeasible {
+        return None;
+    }
+    layout.scatter(&w[..], &prob[..], &eta[..], y, prior_w, weighted, n, None);
+    let logdet = layout.factor_logdet()?;
+    Some((dev, logdet))
 }
 
 /// Exact-profile scratch for the exact Laplace β-profile inside `pirls_solve_blocked`'s and
@@ -200,11 +308,25 @@ pub(crate) struct ExactProfileBufs {
     /// blocked path.
     pub(crate) tail_inv: Vec<f64>,
     /// len `e`. Per-row crossed residual `r_i = C_f'(A_f⁻¹ m_c) − m_x`, indexed
-    /// by crossed column. Only cluster `f`'s coupling columns are ever written
-    /// or read in one row, and each is written before it is read, so it needs no
-    /// clearing between rows. A stack array cannot serve: `e` is a data
-    /// dimension (181 on grouseticks), not a compile-time cap.
+    /// by crossed column. Filled and read only under `cfg(test)`, by the row
+    /// site's equality oracle, which needs `r_i` as a vector; the shipped row
+    /// term is the three-term form over `tail_g` and `tail_h`, so a release
+    /// build allocates this and never touches it. Only cluster `f`'s coupling
+    /// columns are ever written or read in one row, and each is written before
+    /// it is read, so it needs no clearing between rows. A stack array cannot
+    /// serve: `e` is a data dimension (181 on grouseticks), not a compile-time
+    /// cap.
     pub(crate) tail_r: Vec<f64>,
+    /// `s·q_core²`, cluster `f` at `f·q_core²`, row-major: `G_f = C_f S⁻¹ C_f'`,
+    /// the full square rather than a triangle (`q_core ≤ MAX_PRIMARY_Q`, and a
+    /// triangle would cost the row loop a branch). Rebuilt with `tail_inv`,
+    /// every exact-mode structured iteration.
+    pub(crate) tail_g: Vec<f64>,
+    /// `s·q_core·e`, `H_f[local][b]` at `f·q_core·e + local·e + b` — the same
+    /// indexing as the structured kernel's `coupling`, so the row site reuses
+    /// that arithmetic verbatim: `H_f = C_f S⁻¹`, written and read only on
+    /// cluster `f`'s coupling columns. Rebuilt with `tail_inv`.
+    pub(crate) tail_h: Vec<f64>,
     /// f64 mirror of THIS iterate's per-cluster factor, filled once per exact
     /// block and read by every pass below it: `s·q²` in `a_blocks` layout on the
     /// blocked path, `s·q_core²` in `core_blocks` layout on the structured one
@@ -217,29 +339,29 @@ pub(crate) struct ExactProfileBufs {
     pub(crate) fac_f64: Vec<f64>,
 }
 
-/// Does any of these rows sit on a clamp — Fisher weight on
-/// `glm::WEIGHT_CLAMP`, or μ on one of `family::clamp_mu`'s bounds? The test
-/// [`DualStep::exact`] is taken back by; same two conditions the assembled SE
-/// engine refuses a fit on (`glmm::assembled::clamped_row_counts`), sharing
-/// `family::clamp_mu_bounds` with it so the two can never drift apart.
+/// Does any of these rows sit on μ's clamp — μ on one of `family::clamp_mu`'s
+/// bounds? The test [`DualStep::exact`] is taken back by; the same condition
+/// the assembled SE engine refuses a fit on
+/// (`glmm::assembled::mu_clamped_rows`), sharing `family::pinned_mu_bounds`
+/// with it so the two can never drift apart, including its exemption for
+/// unweighted Bernoulli logit (`false` there whatever `prob` holds — that
+/// route's family pass calls `family::clamp_mu` on no row).
 ///
 /// Why a clamped row costs the one-step claim. Writing the PIRLS step as
 /// `u ← u + A_obs⁻¹(g(u) − u)` with `g(u) = M'r(u)`, the lane fixed-point map
 /// contracts by `‖I − A_obs⁻¹(I − ∂g/∂u)‖`, which is zero — lanes exact after
 /// one step — exactly when `A_obs = I − ∂g/∂u = M'W_obs M + I` with the true
-/// `W_obs = −∂r/∂η`. A clamp breaks that equality on the row it binds: the
-/// floor pins `w` to a constant while `family::observed_weight` (and, on a
-/// canonical link, the Fisher `W` that IS the step matrix) still reports the
-/// unfloored curvature, and a pinned μ freezes the deviance's η-dependence the
-/// same way. The contraction is then nonzero and the caller's refinement loop
-/// has to run.
+/// `W_obs = −∂r/∂η`. A row whose μ sits on the clamp breaks that equality: the
+/// kernel's score is formed from the clamped μ, so its true η-derivative is
+/// not what `family::observed_weight` (or, on a canonical link, the Fisher
+/// `W` that IS the step matrix) reports for that row. The contraction is
+/// then nonzero and the caller's refinement loop has to run.
 ///
 /// Branches on `.value()` only, so every lane count decides identically.
-pub(crate) fn clamped_row_present<T: Scalar>(family: Family, w: &[T], prob: &[T]) -> bool {
-    let (mu_lo, mu_hi) = crate::family::clamp_mu_bounds(family);
-    w.iter().zip(prob).any(|(wi, mu)| {
-        wi.value() <= crate::glm::WEIGHT_CLAMP || mu.value() <= mu_lo || mu.value() >= mu_hi
-    })
+pub(crate) fn clamped_row_present<T: Scalar>(family: Family, weighted: bool, prob: &[T]) -> bool {
+    let (mu_lo, mu_hi) = crate::family::pinned_mu_bounds(family, weighted);
+    prob.iter()
+        .any(|mu| mu.value() <= mu_lo || mu.value() >= mu_hi)
 }
 
 /// `h = ‖L⁻¹ m‖²` for one row: the forward half of `glmm_block_solve` on the
@@ -271,7 +393,7 @@ pub(crate) fn block_forward_solve<T: Scalar>(l: &[T], q: usize, m: &[T], t: &mut
 }
 
 /// Refill `eta_fixed[i] = offset[i] + Σ_j x[i,j]·β[j]` (the fixed-effect linear
-/// predictor). Called once at entry of `pirls_solve` and, in `BetaStep::Profile`,
+/// predictor). Called once at entry of each PIRLS solve and, in `BetaStep::Profile`,
 /// after every β update (the accepted δβ step and each β halving) — the trial
 /// evaluation at the top of the loop reads `eta_fixed`, so it must track the
 /// current β. `offset` is `FitOptions::offset` (`None` ⇒ this function is

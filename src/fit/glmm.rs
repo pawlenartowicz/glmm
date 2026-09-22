@@ -9,7 +9,7 @@
 use faer::Mat;
 
 use crate::glm::{glm_irls_fit, GlmScratch};
-use crate::glmm::{build_z, GlmmFit, GlmmWorkspace, StructuredSchur};
+use crate::glmm::{fill_packed_cols, GlmmFit, GlmmLayout, GlmmWorkspace, StructuredSchur};
 use crate::{Family, ModelSpec, NegBinomialLink, StartValues};
 
 use super::common::{
@@ -31,7 +31,7 @@ use super::{Diagnostics, Fit, FitOptions};
 /// RE variance component only for diagonal/scalar components (q=1 / scalar-extra);
 /// slope (q≥2) models are not yet validated through this field.
 /// Returns the mapped `Fit`, the converged conditional means `μ̂` (length `n`, from
-/// `ws.prob` after the pinned-γ̂ re-eval), and the minimized marginal Laplace
+/// `ws.pirls.prob` after the pinned-γ̂ re-eval), and the minimized marginal Laplace
 /// deviance; callers take `.0`, the deviance rides along for the tests that
 /// compare routes at fixed θ.
 /// Cold-start β for a GLMM fit: the coefficients of the fixed-effects-only GLM
@@ -107,6 +107,36 @@ pub(crate) fn glm_warm_start_beta(
     }
 }
 
+/// All-NaN, non-converged `Fit` for a degenerate GLMM shape (`n <= p` or
+/// `p == 0`), the shapes the OLS, GLM and LMM kernels refuse too: the fixed
+/// effects are not estimable, so every estimate is NaN. Shared by
+/// [`build_on_workspace`]'s build-time guard (the NB route, which rebuilds its
+/// workspace per call) and the unified core's `FitKind::Glmm` arm (the other
+/// families, which build the workspace once per shape and so need their own
+/// per-call check at the same width).
+pub(super) fn degenerate_glmm_fit(p: usize, n_theta: usize) -> Fit {
+    Fit {
+        beta: vec![f64::NAN; p],
+        se: vec![f64::NAN; p],
+        vcov: nan_vcov(p),
+        tau2: vec![f64::NAN; n_theta],
+        dispersion: f64::NAN,
+        diagnostics: Diagnostics::from_flags(false, false, p),
+        varcorr: vec![],
+        stddev_se: vec![],
+        n_eval: 0,
+        #[cfg(feature = "counters")]
+        counters: crate::counters::EvalCounters::new(),
+        deviance: f64::NAN,
+        loglik: f64::NAN,
+        df: 0,
+        reml: false,
+        fitted: vec![],
+        ranef: vec![],
+        ranef_levels: vec![],
+    }
+}
+
 /// θ-invariant build half of [`fit_glmm`]: allocates the workspace for this
 /// (spec, n) shape, copies the θ-independent options (`parallel_inner`, prior
 /// weights), converts `x` to column-major, and populates the RE design `Z` and
@@ -129,72 +159,97 @@ pub(super) fn fit_glmm_build(
     extra_ids: &[Vec<u32>],
     opts: &FitOptions,
 ) -> Result<BuiltGlmm, Box<(Fit, Vec<f64>, f64)>> {
+    let (slope_cols, extra_slope_cols) = re_slope_cols(model);
+    // Workspace for this (spec, n) shape — sizes per-cluster solver buffers off
+    // re.sizing's cluster count; the kernels cold-start θ from their blind θ₀.
+    let ws =
+        GlmmWorkspace::for_cluster_spec_ext(p, model, n, &slope_cols, &extra_slope_cols, opts.nagq);
+    build_on_workspace(ws, x, n, p, cluster_ids, extra_ids, opts)
+}
+
+/// `slope_cols`: x column indices for the primary RE slopes (empty =
+/// intercept-only). `extra_slope_cols`: the same per extra grouping, in
+/// declaration order — read by the packed-row GLMM layout, which applies a full
+/// `q_g×q_g` Λ block per extra level, and by the sparse LMM; every other
+/// layout's groupings come out identical either way.
+pub(super) fn re_slope_cols(model: &ModelSpec) -> (Vec<usize>, Vec<Vec<usize>>) {
     let re = model
         .re
         .as_ref()
-        .expect("fit_glmm requires a mixed model (re: Some)");
-    // slope_cols: x column indices for the primary RE slopes (empty = intercept-only).
+        .expect("a mixed model (re: Some) is required here");
     let slope_cols: Vec<usize> = re.slopes.iter().map(|&c| c as usize).collect();
+    let extra_slope_cols: Vec<Vec<usize>> = re
+        .extra_groupings
+        .iter()
+        .map(|g| g.slopes.iter().map(|&c| c as usize).collect())
+        .collect();
+    (slope_cols, extra_slope_cols)
+}
 
-    // Workspace for this (spec, n) shape — sizes per-cluster solver buffers off
-    // re.sizing's cluster count; the kernels cold-start θ from their blind θ₀.
-    let mut ws = GlmmWorkspace::for_cluster_spec(p, model, n, &slope_cols, opts.nagq);
-    ws.parallel_inner = opts.parallel_inner;
-    if let Some(w) = &opts.weights {
-        ws.prior_w[..n].copy_from_slice(w);
-        ws.weighted = true;
-    }
-    ws.offset = opts.offset.clone();
-
-    // --- convert row-major f64 input to column-major f64 faer matrix ---
-    let x_mat = to_col_major(x, n, p);
-
+/// The design-dependent tail of [`fit_glmm_build`], on an already-allocated
+/// workspace: the θ-independent options, the column-major `X`, the RE column
+/// scales, the packed `M` columns and the crossed-Schur symbolic factors.
+#[allow(clippy::too_many_arguments)]
+fn build_on_workspace(
+    mut ws: GlmmWorkspace,
+    x: &[f64],
+    n: usize,
+    p: usize,
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    opts: &FitOptions,
+) -> Result<BuiltGlmm, Box<(Fit, Vec<f64>, f64)>> {
     // Degenerate guard (mirrors the kernel's n≤p short-circuit contract).
-    if n == 0 || p == 0 {
+    if n <= p || p == 0 {
         return Err(Box::new((
-            Fit {
-                beta: vec![f64::NAN; p],
-                se: vec![f64::NAN; p],
-                vcov: nan_vcov(p),
-                tau2: vec![f64::NAN; ws.n_theta],
-                dispersion: f64::NAN,
-                diagnostics: Diagnostics::from_flags(false, false, p),
-                varcorr: vec![],
-                stddev_se: vec![],
-                n_eval: 0,
-                #[cfg(feature = "counters")]
-                counters: crate::counters::EvalCounters::new(),
-                deviance: f64::NAN,
-                loglik: f64::NAN,
-                df: 0,
-                reml: false,
-                fitted: vec![],
-                ranef: vec![],
-                ranef_levels: vec![],
-            },
+            degenerate_glmm_fit(p, ws.n_theta),
             vec![],
             f64::INFINITY,
         )));
     }
 
-    // Before Z is built: every slope column is stored in Z divided by its internal
-    // scale, so the scales have to be current for THIS design first. Per call, not
-    // cached on the workspace shape — the same workspace is reused across draws.
-    ws.groupings
-        .set_slope_scales(x_mat.as_ref().subrows(0, n), opts.weights.as_deref());
+    // --- convert row-major f64 input to column-major f64 faer matrix ---
+    let x_mat = to_col_major(x, n, p);
+    prep_glmm_design(&mut ws, x_mat.as_ref(), cluster_ids, extra_ids, n, opts);
+    Ok((ws, x_mat))
+}
 
-    // Build the dense RE design Z for this (X, ids) before the fit reads it.
-    build_z(
-        &mut ws,
-        x_mat.as_ref().subrows(0, n),
-        cluster_ids,
-        extra_ids,
-        n,
-    );
+/// The per-call, design-dependent workspace prep: the call-varying options, the
+/// RE column scales for this design, the packed `M` columns and the two
+/// crossed-Schur symbolic factors. Shared by [`build_on_workspace`] (a fresh
+/// workspace per call) and the unified core's `FitKind::Glmm` arm (one
+/// workspace reused across draws, hence the `weighted` reset). `x` is the
+/// column-major design with at least `n` rows.
+pub(super) fn prep_glmm_design(
+    ws: &mut GlmmWorkspace,
+    x: faer::MatRef<f64>,
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    n: usize,
+    opts: &FitOptions,
+) {
+    ws.parallel_inner = opts.parallel_inner;
+    if let Some(w) = &opts.weights {
+        ws.prior_w[..n].copy_from_slice(w);
+        ws.weighted = true;
+    } else {
+        ws.weighted = false;
+    }
+    ws.offset = opts.offset.clone();
+
+    // Before the RE design is read: every slope column enters it divided by its
+    // internal scale, so the scales have to be current for THIS design first. Per
+    // call, not cached on the workspace shape — the same workspace is reused
+    // across draws.
+    ws.groupings
+        .set_slope_scales(x.subrows(0, n), opts.weights.as_deref());
+
+    // Fill the packed M columns for this (X, ids) before the fit reads them.
+    fill_packed_cols(ws, cluster_ids, extra_ids, n);
 
     // Cache the crossed-Schur symbolic factor once per fit. Only the
-    // structured crossed path with e > 0 uses it; every other shape leaves it None.
-    ws.structured_schur = if ws.groupings.structured_extras_eligible() {
+    // structured layout reads it; every other shape leaves it None.
+    ws.pattern.structured_schur = if ws.layout == GlmmLayout::Structured {
         StructuredSchur::new(&ws.groupings, cluster_ids, extra_ids, n)
     } else {
         None
@@ -202,16 +257,14 @@ pub(super) fn fit_glmm_build(
     // Observed twin of the crossed-Schur symbolic factor, so the exact β-profile's
     // adjoint solve can run on `A_obs` without overwriting the Fisher factor every
     // later pass reads. Built only where the exact profile can read it: a
-    // non-canonical link on the structured route — canonical links never read
+    // non-canonical link on the structured layout — canonical links never read
     // it, so building it there would be pure cost on every warm-path draw.
     ws.exact_prof.obs_schur =
-        if ws.groupings.structured_extras_eligible() && !crate::family::is_canonical(ws.family) {
+        if ws.layout == GlmmLayout::Structured && !crate::family::is_canonical(ws.family) {
             StructuredSchur::new(&ws.groupings, cluster_ids, extra_ids, n)
         } else {
             None
         };
-
-    Ok((ws, x_mat))
 }
 
 /// Test-only baseline (fixed-θ dense GLMM as a single call). The stable path
@@ -235,6 +288,54 @@ pub(super) fn fit_glmm(
     let (mut ws, x_mat) = match fit_glmm_build(x, n, p, model, cluster_ids, extra_ids, opts) {
         Ok(built) => built,
         Err(degenerate) => return *degenerate,
+    };
+    fit_glmm_prebuilt(
+        &mut ws,
+        x_mat.as_ref().subrows(0, n),
+        y,
+        n,
+        p,
+        model,
+        cluster_ids,
+        extra_ids,
+        nb_theta,
+        start,
+        opts,
+    )
+}
+
+/// Test-only: the same fit on a workspace forced onto the packed-row layout,
+/// whatever layout [`crate::glmm::GlmmLayout::for_design`] would pick for this
+/// design. Lets an in-envelope design be fit both ways so the packed kernel can
+/// be checked against the blocked and structured ones.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_glmm_packed(
+    x: &[f64],
+    y: &[f64],
+    n: usize,
+    p: usize,
+    model: &ModelSpec,
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    nb_theta: f64,
+    start: Option<&StartValues>,
+    opts: &FitOptions,
+) -> (Fit, Vec<f64>, f64) {
+    let (slope_cols, extra_slope_cols) = re_slope_cols(model);
+    let groupings =
+        crate::lmm::LmmGroupings::from_cluster_spec_ext(model, n, &slope_cols, &extra_slope_cols);
+    let ws =
+        GlmmWorkspace::from_groupings(groupings, model.family, p, n, opts.nagq, GlmmLayout::Packed);
+    let (mut ws, x_mat) = match build_on_workspace(ws, x, n, p, cluster_ids, extra_ids, opts) {
+        Ok(built) => built,
+        Err(degenerate) => return *degenerate,
+    };
+    // NB seeds its `ln θ_NB` coordinate from the no-RE GLM-NB's own θ̂, exactly
+    // as [`fit_glmm_nb`] does, so the two routes start the same search.
+    let nb_theta = match model.family {
+        Family::NegativeBinomial { .. } => super::glm::fit_glm_nb(x, y, n, p, None, opts).1,
+        _ => nb_theta,
     };
     fit_glmm_prebuilt(
         &mut ws,
@@ -277,7 +378,7 @@ impl GlmmResultView<'_> {
     /// `target_indices` slots are written; a non-target slot reads 0.0 on a
     /// fresh workspace or a previous fit's value on a reused one.
     pub(crate) fn t_sq(&self) -> &[f64] {
-        &self.ws.t_sq
+        &self.ws.inference.t_sq
     }
     /// Fixed-effect estimates β̂, predictor-indexed.
     pub(crate) fn betas(&self) -> &[f64] {
@@ -287,7 +388,7 @@ impl GlmmResultView<'_> {
     /// `target_indices` slots are written; a non-target slot reads 0.0 on a
     /// fresh workspace or a previous fit's value on a reused one.
     pub(crate) fn var_diag(&self) -> &[f64] {
-        &self.ws.var_diag
+        &self.ws.inference.var_diag
     }
     /// This route's [`FitDiagnostics`]. θ boundary state and per-component pins
     /// are real; the pivot fields are NOT — the dense GLMM records no pivot, so
@@ -358,7 +459,6 @@ pub(crate) fn run_glmm_on<'a>(
     // NB θ₀ (the start of the `ln θ_NB` coordinate) is threaded explicitly; the
     // kernel leaves θ̂_NB in `ws.nb_theta`. NaN for every non-NB family (unread).
     ws.nb_theta = nb_theta;
-    ws.boundary_score_requested = opts.boundary_score;
 
     // Warm start threads β + θ into the GLMM kernel. A caller-supplied `start` (the
     // MCPower hot loop) uses its β verbatim; a cold start seeds β from the no-RE GLM
@@ -421,10 +521,10 @@ pub(crate) fn glmm_view_to_fit(
     let n_theta = ws.n_theta;
 
     // Map GlmmFit + workspace state → Fit.
-    // ws.betas: length p, all fixed effects; ws.var_diag: predictor-indexed.
+    // ws.betas: length p, all fixed effects; ws.inference.var_diag: predictor-indexed.
     let beta = ws.betas.clone();
     let mut se = vec![f64::NAN; p];
-    fill_se_by_predictor(&ws.var_diag, &opts.target_indices, &mut se);
+    fill_se_by_predictor(&ws.inference.var_diag, &opts.target_indices, &mut se);
 
     // tau2[k] = σ²·θ̂[k]². lme4 parametrizes the RE covariance as σ²·θθ', so VarCorr
     // reports sd = σ·θ̂; our internal λ̂ = ws.params[..n_theta] IS that relative factor
@@ -441,8 +541,8 @@ pub(crate) fn glmm_view_to_fit(
         crate::family::glmm_sigma_sq(
             model.family,
             &y[..n],
-            &ws.prob[..n],
-            &ws.u[..ws.k],
+            &ws.pirls.prob[..n],
+            &ws.pirls.u[..ws.k],
             ws.weighted.then(|| &ws.prior_w[..n]),
         )
     } else {
@@ -464,7 +564,7 @@ pub(crate) fn glmm_view_to_fit(
 
     // Dispersion. Binomial/Poisson hold φ≡1. Gamma recovers the (possibly
     // weighted) Pearson moment estimator on the conditional-mode residuals
-    // (μ̂ = ws.prob after the pinned-γ̂ re-eval): `φ̂ = Σ wᵢrᵢ²/(n−p)`,
+    // (μ̂ = ws.pirls.prob after the pinned-γ̂ re-eval): `φ̂ = Σ wᵢrᵢ²/(n−p)`,
     // `rᵢ = (yᵢ−μ̂ᵢ)/√V(μ̂ᵢ)` (raw `n−p` df, not `Σwᵢ−p`). It does NOT rescale the
     // SE here — the kernel already reports each arm on lme4's convention: Hessian
     // unscaled (`vcov(use.hessian=TRUE)`, oracle-settled) and Rx carrying σ̂² =
@@ -478,7 +578,7 @@ pub(crate) fn glmm_view_to_fit(
                 Some(v) => v,
                 None => crate::family::pearson_dispersion(
                     &y[..n],
-                    &ws.prob[..n],
+                    &ws.pirls.prob[..n],
                     model.family,
                     nb_theta,
                     n,
@@ -503,7 +603,7 @@ pub(crate) fn glmm_view_to_fit(
     };
 
     // SE of the RE stddevs from the joint-Hessian θ block (`WaldSe::Hessian` only;
-    // NaN under Rx / RX fallback / non-converged — `ws.theta_se` is reset per fit
+    // NaN under Rx / RX fallback / non-converged — `ws.inference.theta_se` is reset per fit
     // and refilled only by `joint_hessian_cov`). For the reachable scalar groupings
     // θ = stddev, so the θ-scale SE is the stddev SE.
     //
@@ -515,7 +615,7 @@ pub(crate) fn glmm_view_to_fit(
     // constant `s` — the back-map is the same plain division θ̂ itself takes, with
     // no delta-method term.
     let stddev_se = if converged {
-        ws.theta_se[..n_theta]
+        ws.inference.theta_se[..n_theta]
             .iter()
             .zip(theta_scales.iter())
             .map(|(&se, &s)| se / s)
@@ -524,27 +624,29 @@ pub(crate) fn glmm_view_to_fit(
         vec![f64::NAN; n_theta]
     };
 
-    // `ws.vcov` is filled at the same target indices as `ws.var_diag` by
+    // `ws.inference.vcov` is filled at the same target indices as `ws.inference.var_diag` by
     // whichever SE arm ran, and NaN elsewhere — so `Fit::vcov` is finite exactly
     // where `Fit::se` is, on both `Hessian` and `Rx`.
     let vcov: Vec<Vec<f64>> = (0..p)
-        .map(|i| (0..p).map(|j| ws.vcov[(i, j)]).collect())
+        .map(|i| (0..p).map(|j| ws.inference.vcov[(i, j)]).collect())
         .collect();
 
-    let mu_hat = ws.prob[..n].to_vec();
+    let mu_hat = ws.pirls.prob[..n].to_vec();
     // Diagnostics off the converged workspace state: μ̂ (the same conditional
     // means the tuple returns) and b̂ = Λ̂û from the spherical modes. Level
     // counts are design-only and reported regardless — see `fit/lmm.rs`.
     let ranef_levels = super::common::ranef_level_counts(&ws.groupings);
     let (fitted, ranef) = if converged {
-        (
-            mu_hat.clone(),
-            super::common::assemble_ranef_dense(
-                &ws.params[..n_theta],
-                &ws.groupings,
-                &ws.u[..ws.k],
-            ),
-        )
+        // The two layouts order û's primary block differently: blocked and
+        // structured are level-major (`lvl·q_p + c`), packed is component-major
+        // (`c·n_primary + f`). Each assembler walks its own order.
+        let u = &ws.pirls.u[..ws.k];
+        let ranef = if ws.layout == crate::glmm::GlmmLayout::Packed {
+            super::common::assemble_ranef_sparse(&ws.params[..n_theta], &ws.groupings, u)
+        } else {
+            super::common::assemble_ranef_dense(&ws.params[..n_theta], &ws.groupings, u)
+        };
+        (mu_hat.clone(), ranef)
     } else {
         (vec![], vec![])
     };
@@ -559,29 +661,7 @@ pub(crate) fn glmm_view_to_fit(
         &y[..n],
         ws.weighted.then(|| &ws.prior_w[..n]),
     );
-    let mut diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
-    // The derivative diagnostics do not pass through `FitDiagnostics`: that
-    // carrier is `Copy`, holds no `Vec`, and is re-exported by `loop_advanced`,
-    // which takes no new capability before 1.0.0. They ride the same route
-    // `stddev_se` does — workspace buffer, read here.
-    diagnostics.kkt_grad_norm = if converged {
-        ws.kkt_grad_norm
-    } else {
-        f64::NAN
-    };
-    // `pinned_scores` is keyed to `diagonal_theta` order like `pinned_flags`,
-    // so collapse the θ-coordinate buffer onto the diagonals first.
-    let diag_scores: Vec<f64> = ws
-        .groupings
-        .diagonal_theta()
-        .iter()
-        .map(|&ti| ws.boundary_score[ti])
-        .collect();
-    diagnostics.boundary_score = if converged {
-        super::common::pinned_scores(&diag_scores, &varcorr)
-    } else {
-        vec![]
-    };
+    let diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
     let mut fit = Fit {
         beta,
         se,

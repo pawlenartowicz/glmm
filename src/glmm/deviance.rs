@@ -1,13 +1,15 @@
-use faer::dyn_stack::MemBuffer;
 use faer::{Mat, MatRef};
 
 use super::pirls::{
-    build_coupling_csr, pirls_solve, pirls_solve_blocked, pirls_solve_blocked_extras, BetaMode,
-    BetaStep, DualStep, TailKernel,
+    build_coupling_csr, fill_m_vals, pirls_solve_blocked, pirls_solve_blocked_extras,
+    pirls_solve_packed, BetaMode, BetaStep, DualStep, TailKernel,
 };
 #[cfg(test)]
 use super::workspace::fill_z_f64;
-use super::workspace::{apply_lambda, build_packed_m, GlmmWorkspace, StructuredSchur};
+use super::workspace::{
+    build_packed_m, BorderScratch, FitData, GlmmLayout, GlmmWorkspace, PackedScratch, PirlsScratch,
+    StructuredPattern, StructuredScratch,
+};
 use crate::lmm::LmmGroupings;
 use crate::scalar::Scalar;
 use crate::spec::Family;
@@ -16,7 +18,7 @@ use crate::spec::Family;
 /// over the scalar: build Λ_p, solve the blocked PIRLS conditional modes, and
 /// return `d(y,ũ) + ‖ũ‖² + log|A|` — the same three terms `laplace_deviance`
 /// assembles, extracted so a non-f64 scalar has an entry point that does not
-/// carry the dense and structured branches' buffers.
+/// carry the packed and structured branches' buffers.
 /// Non-convergence / Cholesky failure ⇒ `+∞`. The third element of the
 /// return is the raw PIRLS deviance's finiteness, read before the `+∞` fold,
 /// so the router's `pirls_exhausted` counter can keep telling an
@@ -28,35 +30,30 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
     groupings: &LmmGroupings,
     params: &[T],
     beta: &mut [T],
-    lam: &mut [T],
+    scratch: &mut PirlsScratch<T>,
     z_buf: &[f64],
-    m_buf: &mut [T],
     x: MatRef<f64>,
     y: &[f64],
     prior_w: &[f64],
     weighted: bool,
     cluster_ids: &[u32],
-    eta: &mut [T],
-    prob: &mut [T],
-    w: &mut [T],
-    u: &mut [T],
-    u_prev: &mut [T],
-    eta_fixed: &mut [T],
-    a_blocks: &mut [T],
-    a_rhs: &mut [T],
     dual: Option<&mut DualStep<T>>,
     wx: &mut Mat<f64>,
     beta_step: BetaStep,
     offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,
     // Unused on the blocked path (`pirls_solve_blocked` reads `p` off
-    // `beta.len()`) — kept so the signature matches the dense/structured arms'
+    // `beta.len()`) — kept so the signature matches the packed/structured arms'
     // shape.
     _p: usize,
     n: usize,
     counters: &mut crate::counters::EvalCounters,
 ) -> (T, bool, bool) {
-    crate::lmm::primary_lambda(&params[..groupings.n_theta()], groupings.primary_q, lam);
+    crate::lmm::primary_lambda(
+        &params[..groupings.n_theta()],
+        groupings.primary_q,
+        &mut scratch.lam,
+    );
     let (dev, pen, logdet, conv) = pirls_solve_blocked(
         family,
         nb_theta,
@@ -68,17 +65,8 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
         weighted,
         beta,
         beta_step,
-        lam,
+        scratch,
         z_buf,
-        m_buf,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        a_blocks,
-        a_rhs,
         dual,
         wx,
         offset,
@@ -94,7 +82,7 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
     // rationale in `laplace_deviance`'s doc comment (`family::gamma_aic`);
     // mirrors that branch, change together.
     let data_term = if matches!(family, Family::Gamma { .. }) {
-        crate::family::gamma_aic(y, prob, dev, n, Some(prior_w))
+        crate::family::gamma_aic(y, &scratch.prob, dev, n, Some(prior_w))
     } else {
         dev
     };
@@ -119,34 +107,16 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
     params: &[T],
     z_buf: &[f64],
     extra_ids: &[Vec<u32>],
-    lam: &mut [T],
     cluster_ids: &[u32],
-    m_core_buf: &mut [T],
-    cross_val: &mut [T],
-    cross_col: &mut [u32],
-    n_cross: &mut [u8],
-    coup_cols: &mut [u32],
-    coup_ptr: &mut [u32],
-    coup_mask: &mut Option<u32>,
+    scratch: &mut PirlsScratch<T>,
+    structured: &mut StructuredScratch<T>,
+    pattern: &mut StructuredPattern,
     x: MatRef<f64>,
     y: &[f64],
     prior_w: &[f64],
     weighted: bool,
     beta: &mut [T],
     beta_step: BetaStep,
-    eta: &mut [T],
-    prob: &mut [T],
-    w: &mut [T],
-    u: &mut [T],
-    u_prev: &mut [T],
-    eta_fixed: &mut [T],
-    mu: &mut [T],
-    core_blocks: &mut [T],
-    coupling: &mut [T],
-    schur_blk: &mut [T],
-    structured_schur: Option<&mut StructuredSchur>,
-    force_dense: bool,
-    a_rhs: &mut [T],
     dual: Option<&mut DualStep<T>>,
     wx: &mut Mat<f64>,
     offset: Option<&[f64]>,
@@ -156,20 +126,19 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
 ) -> (T, bool, bool) {
     // Intercept-only crossed/nested ⇒ block-diagonal core + Schur on the
     // crossed width. The M = ZΛ nonzeros are packed once here (core slice +
-    // crossed entries) instead of materializing the dense n×k M every eval; the
-    // structured passes read the packed buffers. `z`/`m` are untouched on this
-    // path now (the dense `m` only feeds the genuinely-dense fallback below).
+    // crossed entries) instead of materializing a dense n×k M every eval; the
+    // structured passes read the packed buffers.
     build_packed_m(
         groupings,
         params,
         z_buf,
         extra_ids,
-        lam,
+        &mut scratch.lam,
         cluster_ids,
-        m_core_buf,
-        cross_val,
-        cross_col,
-        n_cross,
+        &mut structured.m_core_buf,
+        &mut structured.cross_val,
+        &mut pattern.cross_col,
+        &mut pattern.n_cross,
         n,
     );
     // CSR cache: pattern = f(design, pinning mask). Rebuild only when the set
@@ -189,48 +158,32 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
             pin_mask |= 1 << gi;
         }
     }
-    if *coup_mask != Some(pin_mask) {
+    if pattern.coup_mask != Some(pin_mask) {
         build_coupling_csr(
             cluster_ids,
-            cross_col,
-            n_cross,
+            &pattern.cross_col,
+            &pattern.n_cross,
             groupings.n_primary,
             n,
-            coup_cols,
-            coup_ptr,
+            &mut pattern.coup_cols,
+            &mut pattern.coup_ptr,
         );
-        *coup_mask = Some(pin_mask);
+        pattern.coup_mask = Some(pin_mask);
     }
     let (dev, pen, logdet, conv) = pirls_solve_blocked_extras(
         family,
         nb_theta,
         groupings,
         cluster_ids,
-        m_core_buf,
-        cross_val,
-        cross_col,
-        n_cross,
         x,
         y,
         prior_w,
         weighted,
         beta,
         beta_step,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        core_blocks,
-        coupling,
-        schur_blk,
-        coup_cols,
-        coup_ptr,
-        structured_schur,
-        force_dense,
-        a_rhs,
+        scratch,
+        structured,
+        pattern,
         dual,
         wx,
         offset,
@@ -246,7 +199,7 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
     // rationale in `laplace_deviance`'s doc comment (`family::gamma_aic`);
     // mirrors that branch, change together.
     let data_term = if matches!(family, Family::Gamma { .. }) {
-        crate::family::gamma_aic(y, prob, dev, n, Some(prior_w))
+        crate::family::gamma_aic(y, &scratch.prob, dev, n, Some(prior_w))
     } else {
         dev
     };
@@ -265,85 +218,40 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
 /// (same minimizer, kept as `D` for byte-identity), but Gamma profiles the
 /// dispersion as `D/n` (`family::gamma_aic`), the sole route by which dispersion
 /// shifts glmer's β̂/τ̂. Non-convergence / Cholesky failure ⇒ `f64::INFINITY` (the
-/// module's failure surface, mirrors `lmm::reml_deviance`). `pirls_solve` returns
-/// `log|L|` off its converged factor (L the Cholesky factor of A, so `log|A| =
-/// 2 log|L|`) — the caller below doubles it to get `log|A|`, so there is no
-/// re-factor here.
-/// The blocked AND structured branches require `z_buf` pre-filled for this
-/// fit's `x` (`fill_z_f64`) — `build_packed_m`'s primary-core reduction reads
-/// it the same way `pirls_solve_blocked`'s does; the dense branch ignores
-/// `z_buf`/`m_buf` (it reads `x` through `z`/`apply_lambda` instead).
+/// module's failure surface, mirrors `lmm::reml_deviance`). Every PIRLS variant
+/// returns `log|L|` off its converged factor (L the Cholesky factor of A, so
+/// `log|A| = 2 log|L|`) — the caller below doubles it to get `log|A|`, so there
+/// is no re-factor here.
+/// The blocked AND structured branches require `data.z_buf` pre-filled for
+/// this fit's `x` (`fill_z_f64`) — `build_packed_m`'s primary-core reduction
+/// reads it the same way `pirls_solve_blocked`'s does; the packed branch reads
+/// `x` directly through `fill_m_vals`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn laplace_deviance(
-    family: Family,
+    data: &FitData,
     nb_theta: f64,
     nagq: u8,
-    groupings: &LmmGroupings,
     params: &[f64],
     beta: &mut [f64],
-    z: MatRef<f64>,
-    m: &mut Mat<f64>,
-    lam: &mut [f64],
-    z_buf: &[f64],
-    m_buf: &mut [f64],
-    x: MatRef<f64>,
-    y: &[f64],
-    prior_w: &[f64],
-    weighted: bool,
-    cluster_ids: &[u32],
-    // Per-row extra-grouping level ids, the same slice `build_z` takes — read
-    // only on the structured route (`build_packed_m`'s nested-indicator and
-    // crossed-level reconstruction); unread on the blocked and dense-fallback
-    // routes.
-    extra_ids: &[Vec<u32>],
-    eta: &mut [f64],
-    prob: &mut [f64],
-    w: &mut [f64],
-    u: &mut [f64],
-    u_prev: &mut [f64],
-    eta_fixed: &mut [f64],
-    mu: &mut [f64],
-    wm: &mut Mat<f64>,
     wx: &mut Mat<f64>,
-    a: &mut Mat<f64>,
-    // Copy-then-factor target for `a`'s Cholesky (ws.a_chol) — dense-fallback
-    // branch only (`pirls_solve`); inert on the blocked/structured branches.
-    a_chol: &mut Mat<f64>,
-    // Persistent scratch for `a_chol`'s in-place `cholesky_in_place` (ws.a_llt_mem) —
-    // dense-fallback branch only (`pirls_solve`); inert on the blocked/structured
-    // branches, which never factor `a`.
-    a_llt_mem: &mut MemBuffer,
-    a_rhs: &mut [f64],
-    a_blocks: &mut [f64],
-    core_blocks: &mut [f64],
-    coupling: &mut [f64],
-    schur_blk: &mut [f64],
-    m_core_buf: &mut [f64],
-    cross_val: &mut [f64],
-    cross_col: &mut [u32],
-    n_cross: &mut [u8],
-    coup_cols: &mut [u32],
-    coup_ptr: &mut [u32],
-    coup_mask: &mut Option<u32>,
-    structured_schur: Option<&mut StructuredSchur>,
-    force_dense_schur: bool,
-    agq_scratch: &mut [f64],
+    // Row- and RE-sized PIRLS scratch every route writes — see [`PirlsScratch`].
+    pirls: &mut PirlsScratch<f64>,
+    // Structured crossed/nested route scratch — see [`StructuredScratch`].
+    structured: &mut StructuredScratch<f64>,
+    // Structured route's θ-independent index pattern — see [`StructuredPattern`].
+    pattern: &mut StructuredPattern,
+    // Packed-row layout scratch — see [`PackedScratch`]. Zero-length on the
+    // blocked/structured branches, which never read it.
+    packed: &mut PackedScratch,
     // Profile-mode (β-profiling / stage-1) scratch — the β-Schur border buffers
-    // each PIRLS variant's Profile δβ step reads (mirrors `dense/blocked/structured
-    // _schur_fill` in se.rs). All inert when `beta_mode == BetaMode::Fixed`. `beta_step_rhs`
-    // is the caller-owned δβ RHS/solution scratch (BetaStep::Profile.beta_rhs) and
+    // each PIRLS variant's Profile δβ step reads (mirrors `packed/blocked/structured
+    // _schur_fill` in se.rs). All inert when `beta_mode == BetaMode::Fixed`.
+    border: &mut BorderScratch,
+    // The caller-owned δβ RHS/solution scratch (BetaStep::Profile.beta_rhs) and
     // MUST be a distinct buffer from `beta` — Fixed callers pass `ws.beta_prof` here
     // (spare) and `ws.beta_rhs` as `beta`; the Profile caller passes `ws.beta_rhs`
     // here and `ws.beta_prof` as `beta`.
-    xtwx: &mut Mat<f64>,
-    xtwm: &mut Mat<f64>,
-    ainv_mtwx: &mut Mat<f64>,
-    schur: &mut Mat<f64>,
-    // Persistent scratch for `schur`'s in-place `cholesky_in_place` (ws.schur_llt_mem),
-    // threaded into `BetaStep::Profile` — inert under `BetaStep::Fixed`.
-    schur_llt_mem: &mut MemBuffer,
     beta_step_rhs: &mut [f64],
-    beta_prev: &mut [f64],
     // Exact-profile scratch (`pirls::ExactProfileBufs`), threaded into
     // `BetaStep::Profile { exact: .. }` only under `BetaMode::ProfileExact` — inert
     // (unread) under `Fixed`/`ProfilePql`.
@@ -355,17 +263,12 @@ pub(crate) fn laplace_deviance(
     beta_mode: BetaMode,
     // PIRLS exit-tol override, forwarded verbatim to whichever PIRLS variant (or
     // `agq_deviance`) runs. `Some(pirls_tol_fd(family))` only under the FD-Hessian
-    // SE evals (`ws.pirls_tol_override`, set by `joint_hessian_cov`); `None` on the fit
+    // SE evals (`ws.fd.pirls_tol_override`, set by `joint_hessian_cov`); `None` on the fit
     // path, which therefore stays bit-identical.
     pirls_tol_override: Option<f64>,
-    p: usize,
-    n: usize,
     // Cluster-outer AGQ substrate (`agq::ClusterRowIndex`), forwarded verbatim to
     // `agq_deviance`'s early return below; `None` on every non-AGQ path (unread).
     cluster_rows: Option<&super::agq::ClusterRowIndex>,
-    // Per-row linear-predictor offset (`FitOptions::offset`), forwarded to every
-    // PIRLS/AGQ variant's `eta_fixed` fill. `None` ⇒ no offset.
-    offset: Option<&[f64]>,
     // Observation-only: incremented below when a fit-path PIRLS solve (the
     // Laplace branch only — AGQ's own per-cluster PIRLS, above, is not
     // instrumented) runs the full iteration cap without converging. Never read
@@ -376,6 +279,29 @@ pub(crate) fn laplace_deviance(
     // which is how SE evals stay out of every count.
     counters: &mut crate::counters::EvalCounters,
 ) -> f64 {
+    let FitData {
+        family,
+        groupings,
+        layout,
+        x,
+        y,
+        prior_w,
+        weighted,
+        cluster_ids,
+        extra_ids,
+        z_buf,
+        offset,
+        n,
+        p,
+    } = *data;
+    let BorderScratch {
+        xtwx,
+        xtwm,
+        ainv_mtwx,
+        schur,
+        schur_llt_mem,
+        beta_prev,
+    } = border;
     let n_theta = groupings.n_theta();
     // Fixed-mode β: a value-exact copy of `params[n_theta..n_theta+p]` into the
     // caller's β buffer. β is never sliced out of `params` below — the PIRLS
@@ -424,25 +350,15 @@ pub(crate) fn laplace_deviance(
             groupings,
             params,
             beta,
-            lam,
+            pirls,
             z_buf,
-            m_buf,
             x,
             y,
             prior_w,
             weighted,
             cluster_ids,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            a_blocks,
-            a_rhs,
             None,
             wx,
-            agq_scratch,
             nagq,
             pirls_tol_override,
             n,
@@ -469,30 +385,21 @@ pub(crate) fn laplace_deviance(
             schur_llt_mem,
         },
     };
-    if groupings.extra_offsets.is_empty() {
-        // No extras ⇒ A is block-diagonal: reconstruct mᵢ per row, never build Z/M.
+    if layout == GlmmLayout::Blocked {
+        // No extras ⇒ A is block-diagonal: reconstruct mᵢ per row, never build M.
         let (obj, conv, raw_dev_finite) = blocked_laplace_deviance(
             family,
             nb_theta,
             groupings,
             params,
             beta,
-            lam,
+            pirls,
             z_buf,
-            m_buf,
             x,
             y,
             prior_w,
             weighted,
             cluster_ids,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            a_blocks,
-            a_rhs,
             None,
             wx,
             beta_step,
@@ -508,7 +415,7 @@ pub(crate) fn laplace_deviance(
         counters.commit_pirls_iters();
         return obj;
     }
-    if groupings.structured_extras_eligible() {
+    if layout == GlmmLayout::Structured {
         let (obj, conv, raw_dev_finite) = structured_laplace_deviance(
             family,
             nb_theta,
@@ -516,34 +423,16 @@ pub(crate) fn laplace_deviance(
             params,
             z_buf,
             extra_ids,
-            lam,
             cluster_ids,
-            m_core_buf,
-            cross_val,
-            cross_col,
-            n_cross,
-            coup_cols,
-            coup_ptr,
-            coup_mask,
+            pirls,
+            structured,
+            pattern,
             x,
             y,
             prior_w,
             weighted,
             beta,
             beta_step,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            core_blocks,
-            coupling,
-            schur_blk,
-            structured_schur,
-            force_dense_schur,
-            a_rhs,
             None,
             wx,
             offset,
@@ -560,33 +449,38 @@ pub(crate) fn laplace_deviance(
         counters.commit_pirls_iters();
         return obj;
     }
-    // Non-eligible extras (oversized core) ⇒ A genuinely dense: dense fallback.
-    apply_lambda(groupings, params, z, m, lam, n);
-    let (dev, pen, logdet, conv) = pirls_solve(
+    // The packed-row layout: Λ and the packed `M` values at this θ, then the
+    // dense `k×k` PIRLS over the fixed-width rows.
+    crate::sparse::fill_lambda_small(&params[..n_theta], groupings, &mut packed.lam_small);
+    fill_m_vals(packed, groupings, x, n);
+    // Fit-path evals (`pirls_tol_override == None`) carry the previous call's
+    // converged û forward as the starting point — fewer iterations to
+    // reconverge, same fixed point. Tight-tol evals (the FD-Hessian stencil)
+    // cold-seed û = 0, overriding the `u_seed` that `laplace_deviance_at` copied
+    // in. Both seeds are constant over the grid, so either makes every cell a
+    // pure function of `(γ̂, steps, design)` whatever order it runs in; the cold
+    // one is the one whose second differences match the assembled Hessian.
+    // Measured on `sim_sparse_gamma` (Gamma-log), diagonal entry of the first β
+    // coordinate: assembled 60.971162, stencil from û = 0 60.972707, stencil
+    // from `u_seed` −94.968163, which is indefinite and costs the fit its
+    // Hessian SE. The cold f0 there is 3427.047583 against the fit's 3427.047586.
+    if pirls_tol_override.is_some() {
+        pirls.u.fill(0.0);
+    }
+    let (dev, pen, logdet, conv) = pirls_solve_packed(
         family,
         nb_theta,
         k,
         p,
-        m.as_ref(),
         x,
         y,
         prior_w,
         weighted,
         beta,
         beta_step,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        wm,
+        pirls,
+        packed,
         wx,
-        a,
-        a_chol,
-        a_rhs,
-        a_llt_mem,
         offset,
         pirls_tol_override,
         n,
@@ -598,8 +492,8 @@ pub(crate) fn laplace_deviance(
     // finite `dev` alongside `!conv` can only mean the `for` loop ran out its
     // `PIRLS_MAX_ITERS` iterations still inside a rising/falling accepted
     // sequence. Gated on `pirls_tol_override.is_none()` — the FD-Hessian SE
-    // evals run their own tight tolerance and must not count (mirrors the
-    // fit-path-vs-FD-eval discriminator `sparse_glmm_deviance` already uses).
+    // evals run their own tight tolerance and must not count — the same
+    // fit-path-vs-FD-eval discriminator the cold seed above uses.
     if !conv && dev.is_finite() && pirls_tol_override.is_none() {
         *pirls_exhausted += 1;
     }
@@ -613,7 +507,7 @@ pub(crate) fn laplace_deviance(
     // making it a nonlinear function of `D` — the sole route by which the dispersion
     // shifts glmer's β̂/τ̂ (see `family::gamma_aic`). `prob` holds μ̂ at the mode.
     let data_term = if matches!(family, Family::Gamma { .. }) {
-        crate::family::gamma_aic(y, prob, dev, n, Some(prior_w))
+        crate::family::gamma_aic(y, &pirls.prob, dev, n, Some(prior_w))
     } else {
         dev
     };
@@ -623,9 +517,8 @@ pub(crate) fn laplace_deviance(
 /// Evaluate the joint Laplace deviance at the params CURRENTLY in `ws.params`
 /// (the FD loop in `joint_hessian_cov` writes them before each call). Borrow-split
 /// twin of `fit_glmm`'s BOBYQA-closure body: destructures the workspace into the
-/// disjoint borrows `laplace_deviance` needs (z read; m/lam/a/etc. written) and
-/// calls it. Seeds the PIRLS conditional modes from û = 0 each call — UNLESS
-/// `ws.warm_seed_active`, in which case it seeds from the fixed shared `ws.u_seed`
+/// disjoint borrows `laplace_deviance` needs and calls it. Seeds the PIRLS conditional modes from û = 0 each call — UNLESS
+/// `ws.fd.warm_seed_active`, in which case it seeds from the fixed shared `ws.u_seed`
 /// (the fitted mode û(γ̂), set by `joint_hessian_cov`). Same fixed-seed FD-derivative
 /// invariant as `joint_hessian_cov` in se.rs — see there for the derivation.
 ///
@@ -642,10 +535,10 @@ pub(crate) fn laplace_deviance_at(
     counters: &mut crate::counters::EvalCounters,
 ) -> f64 {
     let kk = ws.k.max(1);
-    if ws.warm_seed_active {
-        ws.u[..kk].copy_from_slice(&ws.u_seed[..kk]);
+    if ws.fd.warm_seed_active {
+        ws.pirls.u[..kk].copy_from_slice(&ws.u_seed[..kk]);
     } else {
-        for v in ws.u[..kk].iter_mut() {
+        for v in ws.pirls.u[..kk].iter_mut() {
             *v = 0.0;
         }
     }
@@ -685,55 +578,25 @@ pub(crate) fn laplace_deviance_ws(
     let family = ws.family;
     let nb_theta = ws.nb_theta;
     let nagq = ws.nagq;
-    let force_dense_schur = ws.force_dense_schur;
-    let pirls_tol_override = ws.pirls_tol_override;
+    let pirls_tol_override = ws.fd.pirls_tol_override;
     let weighted = ws.weighted;
     let offset = ws.offset.as_deref();
     let GlmmWorkspace {
         groupings,
+        layout,
         params: prm,
         beta_rhs,
         p,
-        z,
-        m,
-        lam,
+        packed,
         z_buf,
-        m_buf,
         prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        wm,
+        pirls,
         wx,
-        a,
-        a_chol,
-        a_llt_mem,
-        a_rhs,
-        a_blocks,
-        core_blocks,
-        coupling,
-        schur_blk,
-        m_core_buf,
-        cross_val,
-        cross_col,
-        n_cross,
-        coup_cols,
-        coup_ptr,
-        coup_mask,
-        structured_schur,
-        agq_scratch,
+        structured,
+        pattern,
         cluster_rows,
-        xtwx,
-        xtwm,
-        ainv_mtwx,
-        schur,
-        schur_llt_mem,
+        border,
         beta_prof,
-        beta_prev,
         exact_prof,
         pirls_exhausted,
         ..
@@ -743,65 +606,39 @@ pub(crate) fn laplace_deviance_ws(
     } else {
         (beta_prof, beta_rhs)
     };
-    laplace_deviance(
+    // Read-only design view `laplace_deviance` takes below — see [`FitData`].
+    let data = FitData {
         family,
-        nb_theta,
-        nagq,
         groupings,
-        &prm[..],
-        beta,
-        z.as_ref(),
-        m,
-        lam,
-        z_buf,
-        m_buf,
+        layout: *layout,
         x,
         y,
-        &prior_w[..n],
+        prior_w: &prior_w[..n],
         weighted,
         cluster_ids,
         extra_ids,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        wm,
+        z_buf,
+        offset,
+        n,
+        p: *p,
+    };
+    laplace_deviance(
+        &data,
+        nb_theta,
+        nagq,
+        &prm[..],
+        beta,
         wx,
-        a,
-        a_chol,
-        a_llt_mem,
-        a_rhs,
-        a_blocks,
-        core_blocks,
-        coupling,
-        schur_blk,
-        m_core_buf,
-        cross_val,
-        cross_col,
-        n_cross,
-        coup_cols,
-        coup_ptr,
-        coup_mask,
-        structured_schur.as_mut(),
-        force_dense_schur,
-        agq_scratch,
-        xtwx,
-        xtwm,
-        ainv_mtwx,
-        schur,
-        schur_llt_mem,
+        pirls,
+        structured,
+        pattern,
+        packed,
+        border,
         beta_step_rhs,
-        beta_prev,
         exact_prof,
         beta_mode,
         pirls_tol_override,
-        *p,
-        n,
         cluster_rows.as_ref(),
-        offset,
         pirls_exhausted,
         counters,
     )
@@ -832,7 +669,7 @@ pub(crate) fn glmm_laplace_deviance(
 /// Test-only Profile twin of `glmm_laplace_deviance`: drives `laplace_deviance`
 /// with `beta_mode = BetaMode::ProfilePql` and `beta = ws.beta_prof` (the stage-1
 /// in/out β), so it evaluates the PQL objective at θ and leaves the profiled β̂(θ) in
-/// `ws.beta_prof`. Seeds BOTH the conditional mode (`ws.u`) and `beta_prof` at 0
+/// `ws.beta_prof`. Seeds BOTH the conditional mode (`ws.pirls.u`) and `beta_prof` at 0
 /// each call, making the result depend only on `params` — the determinism (BOBYQA
 /// objective-consistency) the two-stage optimizer needs. This is the stage-1
 /// production call shape (`laplace_deviance(beta_mode = BetaMode::ProfilePql, beta =
@@ -850,7 +687,7 @@ pub(crate) fn glmm_laplace_deviance_profile(
     ws.params[..params.len()].copy_from_slice(params);
     fill_z_f64(&ws.groupings, x, &mut ws.z_buf, n);
     let kk = ws.k.max(1);
-    for v in ws.u[..kk].iter_mut() {
+    for v in ws.pirls.u[..kk].iter_mut() {
         *v = 0.0;
     }
     for v in ws.beta_prof.iter_mut() {

@@ -58,12 +58,19 @@ class IllConditionedWarning(DiagnosticWarning):
 class PirlsExhaustedWarning(DiagnosticWarning):
     """A GLMM's inner PIRLS solve ran its full iteration cap without converging.
 
-    Two cases, and the message states which one occurred (the note's
-    `final_eval` field carries the distinction). On a BOBYQA trial point during
-    the search, that point was rejected and the search steered around it —
-    observation-only, no fitted number is affected. On the final re-evaluation
-    at the converged fit, the reported estimates rest on that truncated solve —
-    the more serious of the two cases.
+    Four cases, and the message states which one occurred (the note's
+    `final_eval` field, the fit's `converged` field, and whether the fit's
+    `beta` came back finite together carry the distinction). On a BOBYQA
+    trial point during the search, that point was rejected and the search
+    steered around it: this is observation-only, and no fitted number is
+    affected. On the final re-evaluation at a fit that did converge, the
+    reported estimates rest on that truncated solve — the more serious of the
+    first two cases. On a fit that did not converge but still has a finite
+    `beta`, the search ran out of its evaluation budget: the reported
+    estimates are only the best point the search found, and the variance
+    components are not reported. On a fit that did not converge and has no
+    finite `beta`, the fit failed outright and no estimate is reported at
+    all.
     """
 
 
@@ -93,9 +100,9 @@ class ReDesignScaleWarning(DiagnosticWarning):
 
 
 class HessianSeFallbackWarning(DiagnosticWarning):
-    """`wald_se="hessian"` was requested, but the finite-difference joint
-    Hessian was not usable (not positive definite, or a perturbed deviance
-    evaluation was non-finite).
+    """`wald_se="hessian"` was requested, but the joint Hessian was not usable
+    (not positive definite, or the fit took the finite-difference Hessian and a
+    perturbed deviance evaluation was non-finite).
 
     The standard errors reported are the RX/Schur ones instead, and
     `Fit.stddev_se` (the random-effect standard deviations' own standard
@@ -205,12 +212,14 @@ class Fit:
     #                     (lme4's isSingular)
     #   aliased    (p,) bool — rank-deficient columns dropped (lme4's NA
     #                     coefficients)
-    #   boundary   "interior" | "at_boundary" | "no_optimum" | "unknown" —
-    #                     where the accepted theta sits. Only the dense LMM and
-    #                     dense GLMM routes distinguish all three; elsewhere it
-    #                     is back-derived from `singular`, so "no_optimum" is
-    #                     unreachable there and "interior" means "not pinned",
-    #                     not "verified interior".
+    #   boundary   "interior" | "at_boundary" | "no_optimum" — where the
+    #                     accepted theta sits. Every theta-carrying
+    #                     route distinguishes all three (LMM over either
+    #                     kernel, GLMM over every layout, negative binomial
+    #                     included). OLS and GLM (no theta) always report
+    #                     "interior", and so does a fit that failed before any
+    #                     search ran (a degenerate guard), reported through
+    #                     converged=False.
     #   pinned     list per grouping (varcorr order) of per-component bools:
     #                     pinned[g][i] pairs with stddev_corr(g)[0][i]. ON A
     #                     CONVERGED FIT, EMPTY MEANS NOTHING WAS PINNED — a
@@ -233,9 +242,9 @@ class Fit:
     #                     `columns` are 0-based indices into `names` (the R
     #                     package reports the same thing 1-based, per R's own
     #                     convention). An absent note means "not detected",
-    #                     never "checked and clean": the dense GLMM route
-    #                     records no pivot and the sparse route refuses rather
-    #                     than flagging.
+    #                     never "checked and clean": the GLMM routes record no
+    #                     pivot, and the LMM routes flag `IllConditioned`
+    #                     rather than refuse.
     # `converged`, `singular` and `aliased` also stay readable straight off the
     # Fit (properties below) — one storage location, unchanged ergonomics.
     diagnostics: dict
@@ -247,7 +256,8 @@ class Fit:
     # input — it carries the Rust `Fit::deviance` caveat: for an LMM it is lme4's
     # REMLcrit minus a data-independent constant; for a GLMM it is the marginal
     # Laplace deviance, which differs from -2*logLik by a data-only saturated
-    # constant. NaN for OLS/GLM and on numerical failure.
+    # constant on binomial/Poisson fits and equals -2*logLik exactly on Gamma
+    # and negative-binomial fits. NaN for OLS/GLM and on numerical failure.
     deviance: float
     # Log-likelihood at the fitted parameters, on the logLik() scale (R/lme4).
     # For an LMM this is the REML criterion (see `reml` below); for OLS/GLM/GLMM
@@ -414,7 +424,7 @@ def _pinned_detail(res):
     return parts
 
 
-def _note_warning(note, names):
+def _note_warning(note, names, converged, beta, aliased):
     """One kernel note as (message, warning category).
 
     The `kind` string, not the English text, is the stable identifier — an
@@ -450,23 +460,48 @@ def _note_warning(note, names):
             UnusedGroupingLevelsWarning,
         )
     if note["kind"] == "pirls_exhausted":
-        # `final_eval` is the case split the docstring describes: a rejected
-        # trial point is benign, the final re-evaluation at the converged fit
-        # feeds the reported estimates.
+        # Four cases, from `final_eval`, `converged`, and (on the
+        # not-converged branch) whether the estimated entries of `beta`
+        # (aliased slots are NaN by contract) came back finite: a rejected
+        # trial point is benign regardless of the outcome; the final
+        # re-evaluation at a fit that did converge feeds the reported
+        # estimates; a fit that did not converge but still has a finite beta
+        # means the search ran out of its evaluation budget before settling;
+        # and a fit that did not converge and has no finite beta failed
+        # outright, so there is no estimate to report at all.
         if note["final_eval"]:
             return (
                 (
-                    "the final PIRLS re-evaluation at the converged fit ran its "
+                    "the final PIRLS re-evaluation at the reported fit ran its "
                     "full iteration cap without converging: the reported "
                     "estimates rest on that truncated solve."
                 ),
                 PirlsExhaustedWarning,
             )
+        if converged:
+            return (
+                (
+                    "a GLMM inner PIRLS solve ran its full iteration cap without "
+                    "converging. This is observation-only and no fitted number is "
+                    "affected."
+                ),
+                PirlsExhaustedWarning,
+            )
+        if np.all(np.isfinite(beta[~aliased])):
+            return (
+                (
+                    "the search ran out of its evaluation budget while some inner "
+                    "PIRLS solves hit their iteration cap. The fit did not "
+                    "converge. The reported estimates are the best point the "
+                    "search found. converged is False, and the variance "
+                    "components are not reported."
+                ),
+                PirlsExhaustedWarning,
+            )
         return (
             (
-                "a GLMM inner PIRLS solve ran its full iteration cap without "
-                "converging. This is observation-only and no fitted number is "
-                "affected."
+                "some inner PIRLS solves hit their iteration cap, and the fit "
+                "failed. No estimate is reported. converged is False."
             ),
             PirlsExhaustedWarning,
         )
@@ -485,8 +520,9 @@ def _note_warning(note, names):
         return (
             (
                 "the requested Hessian-based standard errors were not usable (the "
-                "finite-difference joint Hessian was not positive definite, or a "
-                "perturbed deviance evaluation was non-finite), so the RX "
+                "joint Hessian was not positive definite, or the fit took the "
+                "finite-difference Hessian and a perturbed deviance evaluation "
+                "was non-finite), so the RX "
                 "standard errors are reported instead and stddev_se is NaN."
             ),
             HessianSeFallbackWarning,
@@ -732,6 +768,6 @@ def fit(
     # by kind. The R port raises the same set as classed conditions — change
     # together.
     for note in res.diagnostics["notes"]:
-        message, category = _note_warning(note, res.names)
+        message, category = _note_warning(note, res.names, res.converged, res.beta, res.aliased)
         warnings.warn(message, category=category, stacklevel=2)
     return res

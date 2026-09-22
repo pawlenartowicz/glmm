@@ -28,12 +28,6 @@ below is the literal, verified output of `glmm.fit` on the installed wheel.
 | `bs(x, df=3)` (spline basis) | `ValueError: formula syntax error at position 0: expected identifier, got 'bs(x,df=3)'` | No basis-expansion support in the formula. Build the basis columns yourself outside the fit (e.g. `patsy.dmatrix("bs(x, df=3)", data)` or `scipy.interpolate`) and add each resulting column as its own bare fixed-effect term. |
 | `x:y` interaction | **Works unchanged.** `glmm.fit(data, "y ~ x:x2")` fits — `:` means pure interaction (no main effects added) in both patsy and this parser, and `*` desugars to main effects + interaction in both too. | None needed. |
 
-One more, not a patsy construct but the single most common first error for
-anyone pasting a formula from an R or statsmodels tutorial: a bare `1` on the
-fixed-effects side is also a parse error —
-`glmm.fit(data, "y ~ 1 + x")` raises `expected identifier, got '1'`.
-The intercept is always implicit; write `y ~ x`, never `y ~ 1 + x`.
-
 See [`formula.md`](formula.md) for the full accepted/rejected grammar.
 
 ## Call mapping

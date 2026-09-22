@@ -335,6 +335,22 @@ fn duplicate_grouping_var_errors() {
     ));
 }
 
+/// Neither the double-bar decorrelated-slope idiom nor three-level nesting
+/// shorthand is supported grammar: `RE_SLOPE`/`RE_ISLOPE` admit exactly one
+/// `|`, and `RE_NESTED` admits exactly two identifiers around one `/`. Both
+/// chunks fall through every RE regex unmatched and are left in the RHS,
+/// where they fail as a plain syntax error rather than silently mis-parsing.
+#[test]
+fn unsupported_re_syntax_is_a_syntax_error() {
+    for f in ["y ~ x + (1+x||g)", "y ~ x + (1|A/B/C)"] {
+        assert!(
+            matches!(parse(f), Err(glmm::formula::ParseError::Syntax { .. })),
+            "expected a syntax error for {f}, got {:?}",
+            parse(f)
+        );
+    }
+}
+
 #[test]
 fn rhs_after_re_extraction_has_clean_plusses() {
     let f = parse("y ~ x + (1|g)").unwrap();
@@ -501,6 +517,34 @@ fn intercept_only_removal_leaves_no_terms() {
     assert!(!p.has_intercept);
     assert!(p.terms.is_empty());
     assert_eq!(p.random_effects.len(), 1);
+}
+
+// ── Explicit fixed intercept ────────────────────────────────────────────────
+
+#[test]
+fn explicit_one_is_the_implied_intercept() {
+    for (written, implied) in [
+        ("y ~ 1 + x", "y ~ x"),
+        ("y ~ x + 1", "y ~ x"),
+        ("y ~ 1 + x + (1 + x | g)", "y ~ x + (1 + x | g)"),
+        ("y ~ 1 + offset(log(e)) + x", "y ~ offset(log(e)) + x"),
+        ("y ~ 1 + (1|g)", "y ~ (1|g)"),
+        ("y ~ 1", "y ~ (1|g)"),
+    ] {
+        let p = parse(written).unwrap_or_else(|e| panic!("{written}: {e}"));
+        let q = parse(implied).unwrap();
+        assert!(p.has_intercept, "{written}");
+        assert_eq!(p.predictors, q.predictors, "{written}");
+        assert_eq!(p.terms, q.terms, "{written}");
+    }
+}
+
+#[test]
+fn explicit_one_beside_an_intercept_removal_is_rejected() {
+    for f in ["y ~ 1 + x - 1", "y ~ 0 + 1 + x", "y ~ 1 + x + 0"] {
+        let msg = parse(f).expect_err(f).to_string();
+        assert!(msg.contains("intercept"), "{f}: {msg}");
+    }
 }
 
 // ── Whitelist transforms ────────────────────────────────────────────────────

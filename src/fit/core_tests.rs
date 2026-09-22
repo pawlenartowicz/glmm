@@ -5,20 +5,15 @@
 //! `n_max` over-reads, or option-reset misses — this suite is that guard.
 
 use super::{build_workspace, fit_on};
-use crate::fit::{spec_sized_from_ids_pub, Perm};
+use crate::fit::{
+    common_tests::{lcg, weighted_collinear_ols_fixture},
+    spec_sized_from_ids_pub, Perm,
+};
 use crate::test_support::assert_near;
 use crate::{
     fit_cold, BinomialLink, Family, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec,
     ReStructure, Sizing,
 };
-
-/// Tiny deterministic LCG in (−1, 1) — no RNG in the fit path.
-fn lcg(state: &mut u64) -> f64 {
-    *state = state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (((*state >> 11) as f64) / ((1u64 << 53) as f64)) * 2.0 - 1.0
-}
 
 // --- case builders (deterministic, no RNG) ---
 
@@ -320,11 +315,13 @@ fn fitview_accessors_match_fit_for_ols() {
 
 /// The one diagnostics carrier agrees with what `into_fit` materializes into
 /// `Fit`, on all three shapes that reach it differently: OLS (a detection route
-/// with no θ), dense LMM (θ boundary state AND a recorded pivot), and the
-/// sparse `Prebuilt` arm (whose carrier is read back off an assembled `Fit`).
+/// with no θ), the LMM's dense kernel, and the LMM's sparse kernel (both of
+/// which report θ boundary state AND a recorded pivot).
 /// Every case here is well-conditioned, so `ill_conditioned` must be false and
-/// the OLS/LMM pivots must sit far above their floors — this is the negative
-/// control for the flag, and it is the case the alloc gate below profiles.
+/// every pivot must sit far above its floor — this is the negative control for
+/// the flag, and it is the case the alloc gate below profiles. The sparse
+/// design's measured pivot ratio is 0.998, twelve decades clear of
+/// `lmm::PIVOT_MIN`.
 #[test]
 fn fitview_diagnostics_agree_with_materialized_fit() {
     let (x, y, n, p, model, ids, opts) = ols_case();
@@ -345,6 +342,7 @@ fn fitview_diagnostics_agree_with_materialized_fit() {
     let (x, y, n, p, model, ids, opts) = lmm_intercept_case();
     let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
     let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    assert!(ws.is_lmm_dense());
     let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert_eq!(d.converged, cold.converged());
@@ -358,14 +356,13 @@ fn fitview_diagnostics_agree_with_materialized_fit() {
     let (x, y, n, p, model, ids, opts) = crossed_extra_case(vec![1]);
     let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
     let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    assert!(ws.is_prebuilt());
+    assert!(ws.is_lmm_sparse());
     let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert_eq!(d.converged, cold.converged());
     assert_eq!(d.boundary_hit == 1, cold.singular());
-    // The sparse route refuses below its own floor and records no pivot, so it
-    // never flags — spec decision, not an oversight.
-    assert!(!d.ill_conditioned && d.pivot.is_nan());
+    assert!(!d.ill_conditioned);
+    assert!(d.pivot > crate::lmm::PIVOT_MIN, "pivot {}", d.pivot);
 }
 
 /// The positive control the negative one above cannot give: a dense-LMM draw
@@ -421,7 +418,7 @@ fn fitview_diagnostics_flag_a_rank_deficient_lmm_draw() {
 
     let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
     let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    assert!(ws.is_lmm_dense());
+    assert!(ws.is_lmm());
     let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
     assert!(d.converged, "the near-duplicate design is still computable");
     assert!(
@@ -454,23 +451,7 @@ fn fitview_diagnostics_flag_a_rank_deficient_lmm_draw() {
 /// weighted Gram, which is the whole point of recording it.
 #[test]
 fn fitview_diagnostics_flag_a_weighted_collinear_ols_fit() {
-    let (n, p, split) = (60usize, 3usize, 40usize);
-    // 1e-11 puts the weighted pivot around 2e-13 — inside the flagging band and
-    // still positive-definite enough for faer's llt to accept it. A smaller
-    // weight makes X'WX numerically indefinite and the route refuses instead.
-    const WSMALL: f64 = 1e-11;
-    let mut x = Vec::with_capacity(n * p);
-    let mut y = Vec::with_capacity(n);
-    let mut w = Vec::with_capacity(n);
-    for i in 0..n {
-        let a = ((i * 13) % 17) as f64 - 8.0;
-        // What separates the two predictor columns lives ENTIRELY on the
-        // negligibly-weighted rows.
-        let delta = if i < split { 0.0 } else { 1.0 };
-        x.extend_from_slice(&[1.0, a, a + delta]);
-        y.push(0.5 + 1.3 * a + 0.477 * (a + delta) + ((i % 3) as f64 - 1.0));
-        w.push(if i < split { 1.0 } else { WSMALL });
-    }
+    let (x, y, w, n, p) = weighted_collinear_ols_fixture();
     let model = ModelSpec {
         family: Family::Gaussian,
         re: None,
@@ -571,7 +552,7 @@ fn build_workspace_routes_fixed_only_to_ols_and_mixed_to_lmm() {
     let (_, _, n, p, mixed, ids, _) = lmm_intercept_case();
     let (sized, _ids, perm) = spec_sized_from_ids_pub(&mixed, &ids);
     let ws_mix = build_workspace(&sized, perm, n, p, &FitOptions::default());
-    assert!(ws_mix.is_lmm_dense());
+    assert!(ws_mix.is_lmm());
 
     let glm = ModelSpec {
         family: Family::Poisson {
@@ -593,7 +574,7 @@ fn build_workspace_routes_fixed_only_to_ols_and_mixed_to_lmm() {
 // --- pin the absence of the scalar-Brent route ---
 
 /// The scalar-Brent kernel in `lme.rs` is deliberately not wired: every tier
-/// routes the single-random-intercept Gaussian LMM to `LmmDense`/BOBYQA (the
+/// routes the single-random-intercept Gaussian LMM to `FitKind::Lmm`/BOBYQA (the
 /// reasoning is in `lmm.rs`'s module header). If someone adds a `prefer_scalar`
 /// branch to `build_workspace` later, this fails loudly.
 #[test]
@@ -601,7 +582,7 @@ fn single_intercept_gaussian_routes_to_bobyqa_not_brent() {
     let (_x, _y, n, p, model, ids, opts) = lmm_intercept_case();
     let (sized, _ids, perm) = spec_sized_from_ids_pub(&model, &ids);
     let ws = build_workspace(&sized, perm, n, p, &opts);
-    assert!(ws.is_lmm_dense());
+    assert!(ws.is_lmm());
 }
 
 // --- reuse gate + shape pin ---
@@ -660,7 +641,7 @@ fn fit_on_glmm_dense_matches_fit_cold() {
     assert!(cold.converged());
     let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
     let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    assert!(ws.is_glmm_dense());
+    assert!(ws.is_glmm());
     let f1 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     assert_near(&cold.beta, &f1.beta, "beta vs fit_cold");
     assert_near(&cold.se, &f1.se, "se vs fit_cold");
@@ -761,7 +742,7 @@ fn fit_on_sparse_matches_fit_cold() {
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
     let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    assert!(ws.is_prebuilt()); // sparse Level 1 routes through the Prebuilt arm
+    assert!(ws.is_lmm_sparse()); // sparse Level 1 is the LMM arm's sparse kernel
     let via =
         fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
     // Near-identity (both call the same sparse kernel); guards the routing + wrap.
@@ -811,7 +792,7 @@ fn fit_on_panics_on_dense_glmm_extra_level_count_overflow() {
     let (x, y, n, p, model, ids, opts) = crossed_extra_glmm_case();
     let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
     let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    assert!(ws.is_glmm_dense());
+    assert!(ws.is_glmm());
     let mut more = ids.into_owned();
     more.extra[0][0] = *more.extra[0].iter().max().unwrap() + 1;
     let _ = fit_on(&mut ws, &x, &y, &more, None, &opts);
@@ -931,7 +912,7 @@ fn fit_on_weighted_reuse_matches_fit_cold() {
 
 // --- fit_on alloc reduction: stale-row tripwire per touched arm ---
 //
-// `Ols`/`Glm`/`LmmDense` each gained a build-once `x_mat` sibling buffer that
+// `Ols`/`Glm`/`Lmm` each gained a build-once `x_mat` sibling buffer that
 // `fit_on` fills in place instead of allocating fresh every call: workspace
 // `x_mat` reuse across different n must equal fresh single-shot fits. Rows
 // past the CURRENT call's `n` keep the PREVIOUS call's values and are never
@@ -1013,7 +994,7 @@ fn fit_on_lmm_dense_smaller_then_larger_matches_fit_cold() {
     let (full_x, full_y, n_max, p, model, ids_full, opts) = lmm_intercept_case();
     let (sized, ids_full, perm) = spec_sized_from_ids_pub(&model, &ids_full);
     let mut ws = build_workspace(&sized, perm, n_max, p, &opts);
-    assert!(ws.is_lmm_dense());
+    assert!(ws.is_lmm());
     for &n in &[24usize, n_max] {
         let x = &full_x[..n * p];
         let y = &full_y[..n];
@@ -1248,12 +1229,12 @@ fn reordered_crossed_case() -> (
 fn fit_on_theta_marshalling_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    // Measured exactly 8600 on this machine, under this test's own
-    // `RAYON_NUM_THREADS=1` + `--test-threads=1` protocol: ~43 blocks per
-    // arm-draw of faer `llt` internals plus the three per-call derivative
-    // vectors (`theta_row_scales`, `grad`, `boundary_score`), and nothing
-    // else. Pinned at the measurement with no slack — if faer's Cholesky
-    // internals change, re-measure and update, do not relax.
+    // Measured exactly 8000 on this machine, under this test's own
+    // `RAYON_NUM_THREADS=1` + `--test-threads=1` protocol: ~40 blocks per
+    // arm-draw of faer `llt` internals plus the one per-call
+    // `theta_row_scales` vector, and nothing else. Pinned at the measurement
+    // with no slack — if faer's Cholesky internals change, re-measure and
+    // update, do not relax.
     //
     // The blocks this test exists to keep at ZERO are the marshalling ones — 5
     // per iteration in the code that motivated the gate (scaled arm: scale
@@ -1268,13 +1249,13 @@ fn fit_on_theta_marshalling_bounded_alloc() {
     // before reaching `rho_end` and pays more faer `llt` allocations per
     // call. The per-call block count moved with it; this is the algorithm
     // doing more evaluations to reach a correct endpoint, not a leak.
-    const BOUND: u64 = 8600;
+    const BOUND: u64 = 8000;
 
     let (xs, ys, ns, ps, ms, ids_s, os) = lmm_slope_case();
     let (sized_s, ids_s, perm_s) = spec_sized_from_ids_pub(&ms, &ids_s);
     assert!(perm_s.is_identity());
     let mut ws_scaled = build_workspace(&sized_s, perm_s, ns, ps, &os);
-    assert!(ws_scaled.is_lmm_dense());
+    assert!(ws_scaled.is_lmm());
 
     let (xr, yr, nr, pr, mr, ids_r, or) = reordered_crossed_case();
     let (sized_r, ids_r, perm_r) = spec_sized_from_ids_pub(&mr, &ids_r);
@@ -1283,7 +1264,7 @@ fn fit_on_theta_marshalling_bounded_alloc() {
         "the warm-start permutation arm needs a reordering workspace"
     );
     let mut ws_reordered = build_workspace(&sized_r, perm_r, nr, pr, &or);
-    assert!(ws_reordered.is_lmm_dense());
+    assert!(ws_reordered.is_lmm());
 
     // One fit per arm outside the profiler, both to warm the workspace's lazy
     // buffers and to produce the warm start the profiled loop carries.
@@ -1318,77 +1299,6 @@ fn fit_on_theta_marshalling_bounded_alloc() {
     assert!(
         stats.total_blocks <= BOUND,
         "fit_on allocated {} blocks across {} warm-path calls per arm (BOUND = {})",
-        stats.total_blocks,
-        N_CALLS,
-        BOUND
-    );
-}
-
-/// The LMM derivative diagnostics allocate their scratch once per WORKSPACE,
-/// not once per fit: `lmm_run_on` builds `LmmDualScratch` on the first
-/// converged fit and every later fit on the same workspace reuses it. So the
-/// unprofiled warm-up fit below pays for the buffer list and the profiled loop
-/// never pays again — a regression back to a per-fit local reappears as the
-/// scratch's whole buffer list per call, far outside the pin. `grad` and
-/// `boundary_score` stay per-call `Vec`s; they are inside the BOUND but are
-/// not what this gate claims.
-///
-/// Lives here rather than next to the LMM warm-path gates because it needs
-/// `lmm_slope_case` / `build_workspace` / `fit_on`, the same fixture and entry
-/// point `fit_on_theta_marshalling_bounded_alloc` above uses.
-///
-/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
-/// lmm_dual_scratch_built_once_per_workspace -- --ignored --test-threads=1`
-#[cfg(feature = "alloc-tests")]
-#[test]
-#[ignore]
-fn lmm_dual_scratch_built_once_per_workspace() {
-    let _serial = crate::test_support::alloc_test_guard();
-    const N_CALLS: usize = 20;
-    // Measured 1184 on this machine: ~59 blocks/call of faer `llt` internals
-    // plus the three per-call derivative `Vec`s (`theta_row_scales`, `grad`,
-    // `boundary_score`), and nothing else — the `LmmDualScratch` buffer list
-    // is built by the warm-up fit above and never rebuilt inside the loop.
-    // `LmmGroupings::blind_theta_and_bounds`'s unbounded diagonal box and
-    // `apply_campaign_overrides`'s doubled `max_fun` (both `src/lmm/mod.rs`)
-    // change BOBYQA's per-fit evaluation count on every fit, warm start
-    // included, which is why the per-call block count sits above the count
-    // measured before that box change. Pinned at the measurement with no
-    // slack. If faer's Cholesky internals change, re-measure and update — do
-    // not relax.
-    const BOUND: u64 = 1184;
-
-    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
-    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
-    assert!(perm.is_identity());
-    let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    assert!(ws.is_lmm_dense());
-
-    // One fit outside the profiler: it warms every lazy workspace buffer —
-    // the derivative scratch this gate is about included — and produces the
-    // warm start the profiled loop carries.
-    let start = {
-        let v = fit_on(&mut ws, &x, &y, &ids, None, &opts);
-        assert!(
-            v.converged(),
-            "the gate needs a converged fit — the derivative block is skipped otherwise"
-        );
-        crate::StartValues {
-            beta: v.betas().to_vec(),
-            theta: v.theta().to_vec(),
-        }
-    };
-
-    let profiler = dhat::Profiler::builder().testing().build();
-    for _ in 0..N_CALLS {
-        let v = fit_on(&mut ws, &x, &y, &ids, Some(&start), &opts);
-        std::hint::black_box(std::hint::black_box(&v).theta());
-    }
-    let stats = dhat::HeapStats::get();
-    drop(profiler);
-    assert!(
-        stats.total_blocks <= BOUND,
-        "fit_on allocated {} blocks across {} warm-path calls (BOUND = {})",
         stats.total_blocks,
         N_CALLS,
         BOUND
@@ -1458,4 +1368,191 @@ fn fit_carries_zeroed_counters_on_closed_form_routes() {
     assert_eq!(f.counters.evals_after_last_improve(Stage::Two), 0);
     assert_eq!(f.counters.agq_evals, 0);
     assert_eq!(f.counters.pirls_hist.iter().sum::<u32>(), 0);
+}
+
+/// The GLMM outer-search route splits which BOBYQA stage runs
+/// (`documentation/algorithms-glmm.md`'s "β profiling — the three outer
+/// routes" section): `ExactProfile` (cbpp, binomial-logit, single intercept
+/// grouping) runs stage 1 only; `Joint` (the Gamma fixture below, `n_theta =
+/// 1`, `p = 3`, which `exact_profile_shape` excludes but `n_theta <= 2 && p
+/// <= 4` still selects) runs stage 2 only. The pair separates the route
+/// without reading the in-crate-only `GlmmWorkspace.outer_search` field.
+#[cfg(feature = "counters")]
+#[test]
+fn counters_show_the_outer_search_stage_split() {
+    let (x, y, cluster_ids, n) = crate::fit::glmm_tests::cbpp_design();
+    let p = 4;
+    let model = crate::fit::glmm_tests::cbpp_model();
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: (0..p as u32).collect(),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.counters.stage_evals[0] > 0, "ExactProfile runs stage 1");
+    assert_eq!(f.counters.stage_evals[1], 0, "ExactProfile skips stage 2");
+
+    let (x, y, cluster_ids, n_clusters) = crate::fit::common_tests::sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let gamma_model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let g = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &gamma_model,
+        &GroupIds {
+            primary: cluster_ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: (0..p as u32).collect(),
+            ..FitOptions::default()
+        },
+    );
+    assert_eq!(g.counters.stage_evals[0], 0, "Joint skips stage 1");
+    assert!(g.counters.stage_evals[1] > 0, "Joint runs stage 2");
+}
+
+// --- over-envelope θ width -------------------------------------------------
+//
+// `classify_design` accepts a primary block past `MAX_PRIMARY_Q` by routing it
+// to the sparse solver instead of refusing it, so a design's vech can be wider
+// than `MAX_THETA` (96) — `(1 + x1..x13 | g)` is `q_p = 14`, hence
+// `n_theta = 14·15/2 = 105`. Both cases below are that shape, at the smallest
+// data that still routes there — one grouping level, `n == p` — because the
+// search over a 105-wide θ is the whole cost of the fixture and none of its
+// point: what these pin is the θ marshalling around the solver, not the answer.
+
+/// θ width of `over_envelope_design`, past `MAX_THETA` by design.
+#[cfg(test)]
+const OVER_ENVELOPE_N_THETA: usize = 14 * 15 / 2;
+
+/// Gaussian `(1 + x1..x13 | g)` on one grouping level × 14 rows. Column 1 is
+/// pushed far off unit RMS, so `set_slope_scales` installs a scale != 1 and the
+/// θ̂ read-back in `FitView::new` has the divide to do.
+fn over_envelope_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let q_p = 14usize; // intercept + 13 slopes
+    let n = 14usize;
+    let p = q_p;
+    let mut st = 90125u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let ids_v = vec![0u32; n];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        for j in 1..p {
+            let v = lcg(&mut st);
+            x[i * p + j] = if j == 1 { 7.0 * v } else { v };
+        }
+        y[i] = 1.5 + 0.4 * x[i * p + 1] + 0.1 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: (1..p as u32).collect(),
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// A vech wider than `MAX_THETA` fits through `fit_cold` instead of panicking.
+///
+/// `FitView::new` divides θ̂ back out of the internal RE column scales in the
+/// workspace's own θ buffer. Sized off the `MAX_THETA` constant that buffer
+/// bounds-checks on this design, so the second half of the test pins the sizing
+/// rule directly — off the built kernel's θ width — and pins that the divide
+/// really ran, which is what puts the wide θ̂ in that buffer in the first place.
+#[test]
+fn over_envelope_vech_fits_through_the_theta_rescale() {
+    let (x, y, n, p, model, ids) = over_envelope_design();
+    let opts = FitOptions {
+        target_indices: vec![0],
+        ..FitOptions::default()
+    };
+    assert_eq!(
+        crate::fit::classify_design_pub(&model, 1),
+        crate::fit::Solver::Sparse,
+        "q_p past MAX_PRIMARY_Q must route to the sparse solver, not refuse"
+    );
+    let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert_eq!(fit.tau2.len(), OVER_ENVELOPE_N_THETA);
+    assert_eq!(fit.beta.len(), p);
+
+    let (sized, ids_s, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    assert_eq!(
+        ws.theta_declared_buf.len(),
+        2 * OVER_ENVELOPE_N_THETA,
+        "the θ buffer is sized off the built kernel's own θ width, not a constant"
+    );
+    let view = fit_on(&mut ws, &x, &y, &ids_s, None, &opts);
+    assert_eq!(view.theta().len(), OVER_ENVELOPE_N_THETA);
+    assert!(
+        !std::ptr::eq(view.theta().as_ptr(), view.kernel_theta().as_ptr()),
+        "a scaled RE column must materialize θ̂ — otherwise this design no \
+         longer exercises the rescale at all"
+    );
+}
+
+/// The same width through `fit_warm`'s θ start on a packed GLMM: `fit_glmm`
+/// maps a caller's θ forward into the internal scale before the floor, and that
+/// map needs the row scales for all 105 entries.
+#[test]
+fn over_envelope_vech_fits_through_a_warm_theta_start() {
+    let (x, _, n, p, mut model, ids) = over_envelope_design();
+    model.family = Family::Poisson {
+        link: crate::PoissonLink::Log,
+    };
+    let y: Vec<f64> = (0..n).map(|i| (i % 4) as f64).collect();
+    let opts = FitOptions {
+        target_indices: vec![0],
+        ..FitOptions::default()
+    };
+    // A Cholesky-factor start: unit diagonals, zero off-diagonals.
+    let mut theta = vec![0.0f64; OVER_ENVELOPE_N_THETA];
+    let mut k = 0usize;
+    for c in 0..14 {
+        for r in c..14 {
+            if r == c {
+                theta[k] = 1.0;
+            }
+            k += 1;
+        }
+    }
+    let start = crate::StartValues {
+        beta: vec![],
+        theta,
+    };
+    let fit = crate::fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+    assert_eq!(fit.tau2.len(), OVER_ENVELOPE_N_THETA);
+    assert_eq!(fit.beta.len(), p);
 }

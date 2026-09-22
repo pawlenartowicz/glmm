@@ -6,7 +6,26 @@ use super::*;
 use crate::test_support::assert_near;
 use crate::{BinomialLink, Family, GroupIds, ModelSpec, ReStructure, Sizing};
 
-use super::common_tests::{lcg, sim_clustered};
+use super::common_tests::{assert_pinned, lcg, sim_clustered, PIN_REL_OLS};
+
+/// SE agreement band against R/MASS for the φ≡1 GLM families (binomial,
+/// Poisson): dispersion is held fixed at 1, so SE is the closed-form
+/// √((XᵀWX)⁻¹) off the converged IRLS/Fisher-scoring weights with no moment
+/// estimate in the way. `3e-5` = ceil-to-one-significant-figure(2 × 1.4441e-5),
+/// the worst measured relative gap (`fit_glm_cloglog_matches_r`); the gap comes
+/// from the IRLS/Fisher-scoring stopping tolerance, not from rounding, so it
+/// sits well above machine epsilon.
+const SE_REL_PHI1: f64 = 3e-5;
+
+/// SE agreement band against R/MASS for GLM families whose dispersion is
+/// estimated rather than fixed — Gamma and inverse-Gaussian (post-fit Pearson
+/// φ̂) and negative-binomial (profile-likelihood θ̂): SE scales through the
+/// estimated dispersion on top of the same IRLS stopping-tolerance gap
+/// `SE_REL_PHI1` already carries, so it needs its own, looser floor. `7e-5` =
+/// ceil-to-one-significant-figure(2 × 3.2793e-5), the worst measured relative
+/// gap (`fit_glm_nb_theta_low_edge_matches_mass`, the heavily-overdispersed
+/// θ-bracket edge).
+const SE_REL_DISPERSION: f64 = 7e-5;
 
 /// A small non-separable binomial(logit) dataset (n=30, p=2) for the view-mapper
 /// equivalence gate. Deterministic, no RNG.
@@ -266,16 +285,14 @@ fn fit_glm_smoke() {
         "β̂ must be finite, got {:?}",
         f.beta
     );
-    assert!(
-        f.beta[1] > 0.0,
-        "slope sign should recover positive, got {}",
-        f.beta[1]
-    );
-    assert!(
-        f.se[1].is_finite() && f.se[1] > 0.0,
-        "target SE must be finite positive, got {}",
-        f.se[1]
-    );
+    // Rust-vs-Rust pin, not an R oracle — logit accuracy against R is covered
+    // separately by `fit_glm_binomial_weighted_aggregated_matches_r`. This
+    // catches a 2x-scaled or otherwise-wrong-but-finite-positive β̂ that the
+    // old finiteness/sign-only checks let through.
+    const REF_BETA: [f64; 2] = [0.491837142677357, 0.872230971652398];
+    const REF_SE1: f64 = 0.187677151494303;
+    assert_pinned(&f.beta, &REF_BETA, PIN_REL_OLS, "beta");
+    assert_pinned(&f.se[1..2], &[REF_SE1], PIN_REL_OLS, "se");
     assert!(f.tau2.is_empty(), "GLM has no variance components");
 }
 
@@ -348,7 +365,7 @@ fn fit_glm_poisson_matches_r() {
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
         assert!(
-            se_rel < 3e-2,
+            se_rel < SE_REL_PHI1,
             "se[{j}] = {} vs R {} (rel {se_rel})",
             f.se[j],
             REF_SE[j]
@@ -436,6 +453,151 @@ fn fit_glm_poisson_offset_matches_r() {
     }
 }
 
+/// Weighted Poisson(log) GLM vs R `glm(weights=)`. Prior weight multiplies the
+/// IRLS working weight and deviance the same way it does in the Gamma/NB arms
+/// (`fit_glm_gamma_weighted_matches_r`); φ stays fixed at 1.
+#[test]
+fn fit_glm_poisson_weighted_matches_r() {
+    // R 4.5.3 oracle (set.seed(43), n = 40):
+    //   x1 <- round(rnorm(n), 4); w <- sample(1:4, n, replace = TRUE)
+    //   y <- rpois(n, lambda = exp(0.3 + 0.5 * x1))
+    //   fp <- glm(y ~ x1, family = poisson, weights = w)
+    //   print(coef(summary(fp)), digits = 15); print(logLik(fp), digits = 15)
+    let x1: [f64; 40] = [
+        -0.0375, -1.5746, -0.486, 0.4652, -0.9041, -0.2774, 0.3864, -0.0604, -0.6862, -1.9061,
+        1.8038, -0.9669, -0.3531, 1.1069, 0.5663, 2.0643, 1.4693, -1.6515, 0.2026, -0.721, -0.159,
+        0.7342, -0.3633, -0.0101, 0.5828, -0.2933, -1.3944, -0.0851, -0.6881, -0.7765, 1.7442,
+        0.4566, -0.1182, 1.6754, -1.159, -0.0406, 1.0889, 1.5121, 0.8857, 0.3146,
+    ];
+    let w: Vec<f64> = vec![
+        1.0, 1.0, 2.0, 3.0, 3.0, 1.0, 1.0, 4.0, 2.0, 4.0, 2.0, 1.0, 2.0, 3.0, 3.0, 1.0, 1.0, 1.0,
+        3.0, 1.0, 1.0, 2.0, 4.0, 1.0, 1.0, 4.0, 2.0, 1.0, 4.0, 2.0, 4.0, 4.0, 1.0, 4.0, 2.0, 4.0,
+        1.0, 3.0, 2.0, 3.0,
+    ];
+    let y: Vec<f64> = vec![
+        1.0, 0.0, 1.0, 0.0, 1.0, 4.0, 2.0, 1.0, 2.0, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 3.0, 1.0, 1.0,
+        2.0, 0.0, 2.0, 1.0, 2.0, 2.0, 2.0, 2.0, 0.0, 3.0, 1.0, 3.0, 7.0, 6.0, 1.0, 5.0, 0.0, 4.0,
+        2.0, 2.0, 3.0, 1.0,
+    ];
+    const REF_BETA: [f64; 2] = [0.543560457232364, 0.506189423172992];
+    const REF_SE: [f64; 2] = [0.0863317392574266, 0.0761557350301788];
+    const REF_LOGLIK: f64 = -151.640748208627;
+    let n = 40;
+    let mut x = Vec::with_capacity(n * 2);
+    for &xi in &x1 {
+        x.extend_from_slice(&[1.0, xi]);
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: None,
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        weights: Some(w),
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, n, 2, &model, &GroupIds::default(), &opts);
+    assert!(f.converged(), "weighted poisson GLM must converge");
+    assert!((f.dispersion - 1.0).abs() < 1e-12, "poisson φ≡1");
+    for j in 0..2 {
+        let b_rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
+        assert!(
+            b_rel < 1e-3,
+            "β[{j}] = {} vs R {} (rel {b_rel})",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        assert!(
+            se_rel < SE_REL_PHI1,
+            "se[{j}] = {} vs R {} (rel {se_rel})",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs R {REF_LOGLIK}",
+        f.loglik
+    );
+    assert_eq!(f.df, 2); // β only; poisson has no free dispersion
+}
+
+/// Poisson(log) GLM with prior weights AND a per-row offset together:
+/// only `fit_ols_offset_matches_r_lm` combines the two, and only for Gaussian.
+/// Vs R `glm(weights=, offset=)`.
+#[test]
+fn fit_glm_poisson_weighted_offset_matches_r() {
+    // R 4.5.3 oracle (set.seed(44), n = 40):
+    //   x1 <- round(rnorm(n), 4); w <- sample(1:4, n, replace = TRUE)
+    //   o <- 0.1 * ((seq_len(n) - 1) %% 7)
+    //   y <- rpois(n, lambda = exp(0.3 + 0.5 * x1 + o))
+    //   fp <- glm(y ~ x1, family = poisson, weights = w, offset = o)
+    //   print(coef(summary(fp)), digits = 15); print(logLik(fp), digits = 15)
+    let x1: [f64; 40] = [
+        0.6539, 0.0191, -1.8495, -0.1328, -1.1988, -1.3297, 0.9165, -0.163, -1.6021, -0.8352,
+        0.3619, -0.3238, -0.7299, -0.7046, -0.3622, 0.1341, 1.6394, -1.3996, 3.0322, 1.1984,
+        0.0559, 0.4144, -0.9294, -0.6573, -0.0341, -2.2582, -0.5237, 1.188, 1.5156, 0.1834,
+        -0.0686, 1.6507, 1.426, -1.4339, 0.1258, 0.6734, 0.1094, 0.1095, -0.1591, -0.1998,
+    ];
+    let w: Vec<f64> = vec![
+        2.0, 3.0, 2.0, 3.0, 3.0, 4.0, 2.0, 4.0, 3.0, 3.0, 4.0, 2.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0,
+        4.0, 1.0, 1.0, 1.0, 4.0, 4.0, 1.0, 2.0, 2.0, 2.0, 3.0, 2.0, 4.0, 3.0, 4.0, 4.0, 1.0, 2.0,
+        3.0, 1.0, 1.0, 4.0,
+    ];
+    let y: Vec<f64> = vec![
+        3.0, 0.0, 0.0, 1.0, 0.0, 0.0, 5.0, 2.0, 2.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 3.0, 0.0,
+        13.0, 4.0, 3.0, 3.0, 0.0, 4.0, 0.0, 0.0, 2.0, 6.0, 4.0, 4.0, 1.0, 3.0, 3.0, 1.0, 2.0, 2.0,
+        0.0, 2.0, 3.0, 1.0,
+    ];
+    const REF_BETA: [f64; 2] = [0.0940812560237927, 0.6691944996210337];
+    const REF_SE: [f64; 2] = [0.0859428695879596, 0.0494290057981252];
+    const REF_LOGLIK: f64 = -157.855689341192;
+    let n = 40;
+    let o: Vec<f64> = (0..n).map(|i| 0.1 * (i % 7) as f64).collect();
+    let mut x = Vec::with_capacity(n * 2);
+    for &xi in &x1 {
+        x.extend_from_slice(&[1.0, xi]);
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: None,
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        weights: Some(w),
+        offset: Some(o),
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, n, 2, &model, &GroupIds::default(), &opts);
+    assert!(f.converged(), "weighted+offset poisson GLM must converge");
+    for j in 0..2 {
+        let b_rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
+        assert!(
+            b_rel < 1e-3,
+            "β[{j}] = {} vs R {} (rel {b_rel})",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        assert!(
+            se_rel < SE_REL_PHI1,
+            "se[{j}] = {} vs R {} (rel {se_rel})",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs R {REF_LOGLIK}",
+        f.loglik
+    );
+}
+
 /// High-mean Poisson GLM through stable `fit` (re: None), gated against the
 /// frozen R `glm(family=poisson)` oracle
 /// (`validation/goldens/sim_poisson_highmean_glm.json`): `y ~ 1 + x + grp` on
@@ -492,7 +654,7 @@ fn fit_glm_poisson_highmean_matches_r() {
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
         assert!(
-            se_rel < 3e-2,
+            se_rel < SE_REL_PHI1,
             "se[{j}] = {} vs R {} (rel {se_rel})",
             f.se[j],
             REF_SE[j]
@@ -570,7 +732,110 @@ fn fit_glm_probit_matches_r() {
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
         assert!(
-            se_rel < 3e-2,
+            se_rel < SE_REL_PHI1,
+            "se[{j}] = {} vs R {} (rel {se_rel})",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+}
+
+/// Weighted, aggregated, non-canonical-link (probit) binomial GLM vs R
+/// `glm(weights=)`. Prior weights only reach the canonical logit path
+/// (`fit_glm_binomial_weighted_aggregated_matches_r`) elsewhere in this file, so
+/// this exercises the weighted general Fisher-scoring branch instead.
+#[test]
+fn fit_glm_probit_weighted_matches_r() {
+    // R 4.5.3 oracle (set.seed(43), n = 40):
+    //   x2 <- round(rnorm(n), 4); m <- sample(2:6, n, replace = TRUE)
+    //   s <- rbinom(n, m, pnorm(0.2 + 0.6 * x2)); yp <- s / m
+    //   fb <- glm(yp ~ x2, family = binomial(link = "probit"), weights = m)
+    //   print(coef(summary(fb)), digits = 15)
+    let x2: [f64; 40] = [
+        -0.0375, -1.5746, -0.486, 0.4652, -0.9041, -0.2774, 0.3864, -0.0604, -0.6862, -1.9061,
+        1.8038, -0.9669, -0.3531, 1.1069, 0.5663, 2.0643, 1.4693, -1.6515, 0.2026, -0.721, -0.159,
+        0.7342, -0.3633, -0.0101, 0.5828, -0.2933, -1.3944, -0.0851, -0.6881, -0.7765, 1.7442,
+        0.4566, -0.1182, 1.6754, -1.159, -0.0406, 1.0889, 1.5121, 0.8857, 0.3146,
+    ];
+    let m: Vec<f64> = vec![
+        2.0, 2.0, 3.0, 4.0, 6.0, 6.0, 5.0, 2.0, 3.0, 4.0, 4.0, 2.0, 6.0, 6.0, 4.0, 2.0, 6.0, 3.0,
+        6.0, 6.0, 3.0, 6.0, 5.0, 6.0, 3.0, 6.0, 5.0, 3.0, 2.0, 2.0, 5.0, 4.0, 3.0, 3.0, 5.0, 2.0,
+        4.0, 4.0, 6.0, 6.0,
+    ];
+    let yp: Vec<f64> = vec![
+        0.500000000000000,
+        0.500000000000000,
+        0.666666666666667,
+        0.500000000000000,
+        0.333333333333333,
+        0.333333333333333,
+        0.600000000000000,
+        0.000000000000000,
+        1.000000000000000,
+        0.750000000000000,
+        1.000000000000000,
+        1.000000000000000,
+        0.166666666666667,
+        0.500000000000000,
+        0.750000000000000,
+        1.000000000000000,
+        0.833333333333333,
+        0.000000000000000,
+        0.666666666666667,
+        0.500000000000000,
+        0.666666666666667,
+        1.000000000000000,
+        0.200000000000000,
+        0.166666666666667,
+        1.000000000000000,
+        0.333333333333333,
+        0.400000000000000,
+        0.666666666666667,
+        1.000000000000000,
+        1.000000000000000,
+        0.600000000000000,
+        0.500000000000000,
+        0.333333333333333,
+        0.666666666666667,
+        0.000000000000000,
+        1.000000000000000,
+        1.000000000000000,
+        1.000000000000000,
+        0.500000000000000,
+        0.666666666666667,
+    ];
+    const REF_BETA: [f64; 2] = [0.148570258330836, 0.386380163829481];
+    const REF_SE: [f64; 2] = [0.100794909899017, 0.108744926783315];
+    let n = 40;
+    let mut x = Vec::with_capacity(n * 2);
+    for &xi in &x2 {
+        x.extend_from_slice(&[1.0, xi]);
+    }
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        re: None,
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        weights: Some(m),
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &yp, n, 2, &model, &GroupIds::default(), &opts);
+    assert!(f.converged(), "weighted probit GLM must converge");
+    assert!((f.dispersion - 1.0).abs() < 1e-12, "probit φ≡1");
+    for j in 0..2 {
+        let b_rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
+        assert!(
+            b_rel < 1e-3,
+            "β[{j}] = {} vs R {} (rel {b_rel})",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        assert!(
+            se_rel < SE_REL_PHI1,
             "se[{j}] = {} vs R {} (rel {se_rel})",
             f.se[j],
             REF_SE[j]
@@ -691,7 +956,7 @@ fn fit_glm_cloglog_matches_r() {
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
         assert!(
-            se_rel < 3e-2,
+            se_rel < SE_REL_PHI1,
             "se[{j}] = {} vs R {} (rel {se_rel})",
             f.se[j],
             REF_SE[j]
@@ -758,7 +1023,12 @@ fn fit_glm_gamma_log_matches_r() {
             REF_BETA[j]
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
-        assert!(se_rel < 3e-2, "se[{j}] = {} vs R {}", f.se[j], REF_SE[j]);
+        assert!(
+            se_rel < SE_REL_DISPERSION,
+            "se[{j}] = {} vs R {}",
+            f.se[j],
+            REF_SE[j]
+        );
     }
 }
 
@@ -801,8 +1071,76 @@ fn fit_glm_gamma_inverse_matches_r() {
             REF_BETA[j]
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
-        assert!(se_rel < 3e-2, "se[{j}] = {} vs R {}", f.se[j], REF_SE[j]);
+        assert!(
+            se_rel < SE_REL_DISPERSION,
+            "se[{j}] = {} vs R {}",
+            f.se[j],
+            REF_SE[j]
+        );
     }
+}
+
+/// Gamma(log) GLM with a per-row offset, vs R `glm(Gamma("log"),
+/// offset=)` on `sim_gamma.csv`, `o_i = 0.1·(i mod 7)` (the same offset shape
+/// as `fit_glm_poisson_offset_matches_r`). Log is non-canonical for Gamma in
+/// this crate, so this exercises the general Fisher-scoring branch's offset
+/// fold, which Binomial/Poisson offset coverage never touches.
+#[test]
+fn fit_glm_gamma_offset_matches_r() {
+    // R 4.5.3 oracle:
+    //   gt <- read.csv("sim_gamma.csv"); o <- 0.1 * ((seq_len(nrow(gt))-1) %% 7)
+    //   fg <- glm(y ~ x + grp, data = gt, family = Gamma("log"), offset = o)
+    //   print(coef(summary(fg)), digits = 15); print(summary(fg)$dispersion, digits = 15)
+    //   print(logLik(fg), digits = 15)
+    const REF_BETA: [f64; 3] = [0.200540179916345, 0.569394040617305, 0.455205206563064];
+    const REF_SE: [f64; 3] = [0.0828872899140855, 0.0603906433037824, 0.1214254383261718];
+    const REF_DISP: f64 = 1.0556349151192;
+    const REF_LOGLIK: f64 = -496.883857112552;
+    let (x, y, n) = sim_gamma_xy();
+    let p = 3;
+    let o: Vec<f64> = (0..n).map(|i| 0.1 * (i % 7) as f64).collect();
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: None,
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            offset: Some(o),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "gamma GLM with offset must converge");
+    let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
+    assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
+            "β[{j}] = {} vs R {}",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        assert!(
+            se_rel < SE_REL_DISPERSION,
+            "se[{j}] = {} vs R {}",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs R {REF_LOGLIK}",
+        f.loglik
+    );
 }
 
 /// `y ~ 1 + x + grp` design from the committed `sim_igauss.csv` (y,x,grp);
@@ -862,7 +1200,12 @@ fn fit_glm_igauss_matches_r() {
             REF_BETA[j]
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
-        assert!(se_rel < 3e-2, "se[{j}] = {} vs R {}", f.se[j], REF_SE[j]);
+        assert!(
+            se_rel < SE_REL_DISPERSION,
+            "se[{j}] = {} vs R {}",
+            f.se[j],
+            REF_SE[j]
+        );
     }
 }
 
@@ -907,8 +1250,134 @@ fn fit_glm_igauss_inverse_squared_matches_r() {
             REF_BETA[j]
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
-        assert!(se_rel < 3e-2, "se[{j}] = {} vs R {}", f.se[j], REF_SE[j]);
+        assert!(
+            se_rel < SE_REL_DISPERSION,
+            "se[{j}] = {} vs R {}",
+            f.se[j],
+            REF_SE[j]
+        );
     }
+}
+
+/// Same inverse-Gaussian `1/μ²` fixture with the response scaled by 0.1, which
+/// puts μ̂ in [0.128, 0.203] and so η̂ = 1/μ̂² in [24.2, 60.8] — above
+/// `ETA_DIVERGENCE_CAP`, where the fit is still the honest small-mean one and
+/// must converge. The model is exactly equivariant under `y → c·y` here
+/// (η = 1/μ² scales by `c⁻²` and so does every β), so the reference is the
+/// frozen R β of `fit_glm_igauss_inverse_squared_matches_r` times 100, which R
+/// reproduces to 15 digits on the scaled column; φ̂ scales by `c⁻¹`.
+#[test]
+fn fit_glm_igauss_inverse_squared_converges_at_small_mu() {
+    const REF_BETA: [f64; 3] = [45.9456921305253, -4.19956854008116, -6.79438262942649];
+    const REF_SE: [f64; 3] = [1.89525417126228, 1.25108528341764, 2.51747245203818];
+    const REF_DISP: f64 = 2.9048859329441;
+    let (x, y, n) = sim_igauss_xy();
+    let y: Vec<f64> = y.iter().map(|v| v * 0.1).collect();
+    let p = 3;
+    let model = ModelSpec {
+        family: Family::InverseGaussian {
+            link: crate::InverseGaussianLink::InverseSquared,
+        },
+        re: None,
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    assert!(
+        f.converged(),
+        "small-mean igauss-inverse_squared GLM must converge; β = {:?}",
+        f.beta
+    );
+    let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
+    assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
+            "β[{j}] = {} vs R {}",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        assert!(
+            se_rel < SE_REL_DISPERSION,
+            "se[{j}] = {} vs R {}",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+}
+
+/// Inverse-Gaussian(log) GLM with a per-row offset, vs R
+/// `glm(inverse.gaussian("log"), offset=)` on `sim_igauss.csv`, the same
+/// `o_i = 0.1·(i mod 7)` offset shape as the Poisson/Gamma offset goldens. Log
+/// is non-canonical for inverse-Gaussian, exercising the general
+/// Fisher-scoring branch's offset fold on the second family that never
+/// touched it before this test.
+#[test]
+fn fit_glm_igauss_offset_matches_r() {
+    // R 4.5.3 oracle:
+    //   it <- read.csv("sim_igauss.csv"); o <- 0.1 * ((seq_len(nrow(it))-1) %% 7)
+    //   fi <- glm(y ~ x + grp, data = it, family = inverse.gaussian("log"), offset = o)
+    //   print(coef(summary(fi)), digits = 15); print(summary(fi)$dispersion, digits = 15)
+    //   print(logLik(fi), digits = 15)
+    const REF_BETA: [f64; 3] = [0.1538085257325026, 0.0622414458057679, 0.0737976388898105];
+    const REF_SE: [f64; 3] = [0.0220286758020475, 0.0158884686612027, 0.0317295003334939];
+    const REF_DISP: f64 = 0.314469305573548;
+    const REF_LOGLIK: f64 = -2458.48472319725;
+    let (x, y, n) = sim_igauss_xy();
+    let p = 3;
+    let o: Vec<f64> = (0..n).map(|i| 0.1 * (i % 7) as f64).collect();
+    let model = ModelSpec {
+        family: Family::InverseGaussian {
+            link: crate::InverseGaussianLink::Log,
+        },
+        re: None,
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            offset: Some(o),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "igauss GLM with offset must converge");
+    let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
+    assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
+            "β[{j}] = {} vs R {}",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        assert!(
+            se_rel < SE_REL_DISPERSION,
+            "se[{j}] = {} vs R {}",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs R {REF_LOGLIK}",
+        f.loglik
+    );
 }
 
 /// `dispersion: Some(v)` holds φ=v fixed (skips the Pearson estimate) and
@@ -922,6 +1391,44 @@ fn fit_glm_gamma_fixed_dispersion_scales_se() {
     let model = ModelSpec {
         family: Family::Gamma {
             link: crate::GammaLink::Log,
+        },
+        re: None,
+    };
+    // φ directive lives in FitOptions, not the Family payload.
+    let opts = |phi: f64| FitOptions {
+        target_indices: vec![0, 1, 2],
+        dispersion: Some(phi),
+        ..FitOptions::default()
+    };
+    let f1 = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts(1.0));
+    let f2 = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts(2.0));
+    assert!(f1.converged() && f2.converged());
+    assert!((f2.dispersion - 2.0).abs() < 1e-12, "held φ must be 2.0");
+    assert!((f1.dispersion - 1.0).abs() < 1e-12);
+    for j in 0..p {
+        assert!((f1.beta[j] - f2.beta[j]).abs() < 1e-12, "β φ-independent");
+        // SE(φ=2) = √2 · SE(φ=1) exactly (same (XᵀWX)⁻¹, different √φ).
+        assert!(
+            (f2.se[j] - 2.0_f64.sqrt() * f1.se[j]).abs() < 1e-12,
+            "se ratio at j={j}: {} vs {}",
+            f2.se[j],
+            2.0_f64.sqrt() * f1.se[j]
+        );
+    }
+}
+
+/// `Family::Gamma { .. } | Family::InverseGaussian { .. }` share one
+/// `dispersion: Some(v)` directive: the Gamma half is covered by
+/// `fit_glm_gamma_fixed_dispersion_scales_se` above; this is its
+/// inverse-Gaussian twin, so an IG-specific φ-scaling regression cannot hide
+/// behind the Gamma-only coverage.
+#[test]
+fn fit_glm_igauss_fixed_dispersion_scales_se() {
+    let (x, y, n) = sim_igauss_xy();
+    let p = 3;
+    let model = ModelSpec {
+        family: Family::InverseGaussian {
+            link: crate::InverseGaussianLink::Log,
         },
         re: None,
     };
@@ -1004,7 +1511,12 @@ fn fit_glm_nb_matches_mass() {
             REF_BETA[j]
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
-        assert!(se_rel < 3e-2, "se[{j}] = {} vs MASS {}", f.se[j], REF_SE[j]);
+        assert!(
+            se_rel < SE_REL_DISPERSION,
+            "se[{j}] = {} vs MASS {}",
+            f.se[j],
+            REF_SE[j]
+        );
     }
 }
 
@@ -1074,7 +1586,12 @@ fn fit_glm_nb_weighted_matches_mass() {
             REF_BETA[j]
         );
         let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
-        assert!(se_rel < 3e-2, "se[{j}] = {} vs MASS {}", f.se[j], REF_SE[j]);
+        assert!(
+            se_rel < SE_REL_DISPERSION,
+            "se[{j}] = {} vs MASS {}",
+            f.se[j],
+            REF_SE[j]
+        );
     }
     let th_rel = (f.dispersion - REF_THETA).abs() / REF_THETA;
     assert!(
@@ -1191,9 +1708,9 @@ fn nb_edge_data(csv: &str) -> (Vec<f64>, Vec<f64>, usize) {
 }
 
 /// Fit the NB GLM on an edge dataset and gate against the frozen MASS
-/// reference (β rel 1e-3, SE rel 3e-2 — the `fit_glm_nb_matches_mass`
-/// bands). Returns the fit so the caller can pin its edge-specific θ̂
-/// assertions. Shared by the two θ-bracket-edge tests.
+/// reference (β rel 1e-3, SE rel `SE_REL_DISPERSION` — the
+/// `fit_glm_nb_matches_mass` bands). Returns the fit so the caller can pin its
+/// edge-specific θ̂ assertions. Shared by the two θ-bracket-edge tests.
 fn nb_edge_fit(csv: &str, ref_beta: &[f64; 3], ref_se: &[f64; 3]) -> Fit {
     let (x, y, n) = nb_edge_data(csv);
     let model = ModelSpec {
@@ -1223,7 +1740,12 @@ fn nb_edge_fit(csv: &str, ref_beta: &[f64; 3], ref_se: &[f64; 3]) -> Fit {
             ref_beta[j]
         );
         let se_rel = (f.se[j] - ref_se[j]).abs() / ref_se[j];
-        assert!(se_rel < 3e-2, "se[{j}] = {} vs MASS {}", f.se[j], ref_se[j]);
+        assert!(
+            se_rel < SE_REL_DISPERSION,
+            "se[{j}] = {} vs MASS {}",
+            f.se[j],
+            ref_se[j]
+        );
     }
     f
 }

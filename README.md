@@ -75,7 +75,7 @@ README's own copy of the essentials, not the whole set.
 | [`documentation/coming-from-statsmodels.md`](documentation/coming-from-statsmodels.md) | Migrating from `statsmodels` `MixedLM`/`GLM` to `glmm.fit` (Python only) |
 | [`documentation/troubleshooting.md`](documentation/troubleshooting.md) | Fixes for singular fits, non-convergence, NotImplementedError, and rejected formulas |
 
-## Scope and stability (0.3.x)
+## Scope and stability (0.4.x)
 
 The semver-covered surface is `fit_cold`/`fit_warm` + `ModelSpec` + `GroupIds`.
 

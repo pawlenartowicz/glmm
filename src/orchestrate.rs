@@ -676,9 +676,11 @@ mod tests {
         );
         assert_eq!(result.beta.len(), 2);
         assert!(result.converged);
-        // y ~= 1 + x, slope near 1.0 by construction.
+        // Closed-form OLS slope for this fixture: Sxy/Sxx with x̄=4.5, ȳ=5.53
+        // gives 83.55/82.5 = 1.0127272727272727; the fit matches it to
+        // machine precision (measured gap ~7e-16).
         assert!(
-            (result.beta[1] - 1.0).abs() < 0.1,
+            (result.beta[1] - 1.0127272727272727).abs() < 1e-9,
             "slope = {}",
             result.beta[1]
         );
@@ -814,5 +816,230 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("junk"), "{err}");
+    }
+
+    /// Deterministic fixed-effects-only Poisson fixture: `y = round(exp(0.3 +
+    /// 0.8·x))` on a centered `x`, so the log-link mean model fits the counts
+    /// almost exactly and both a cold and a warm-started IRLS converge.
+    #[allow(clippy::type_complexity)] // test fixture: the numeric+factor column maps run_fit takes
+    fn toy_poisson() -> (
+        HashMap<String, Vec<f64>>,
+        HashMap<String, (Vec<String>, Vec<u32>)>,
+    ) {
+        let n = 100;
+        let mut x = vec![0.0f64; n];
+        let mut y = vec![0.0f64; n];
+        for i in 0..n {
+            let xi = (i as f64) / (n as f64) - 0.5;
+            x[i] = xi;
+            y[i] = (0.3 + 0.8 * xi).exp().round();
+        }
+        let mut numeric = HashMap::new();
+        numeric.insert("y".to_string(), y);
+        numeric.insert("x".to_string(), x);
+        (numeric, HashMap::new())
+    }
+
+    /// This is the layer the Python and R packages call, and the only prior
+    /// converged-and-inspected test here (`gaussian_ols_end_to_end`) is
+    /// Gaussian. A Poisson fit exercises the family/link string hand-off into
+    /// the kernel end to end, and warm-starting from the converged β must
+    /// reach the same optimum in no more evaluations than the cold start —
+    /// the warm-start branch it drives is otherwise dead under test.
+    #[test]
+    fn poisson_end_to_end_warm_start_reaches_same_optimum() {
+        let (numeric, factor) = toy_poisson();
+        let cold = run_fit(
+            "y ~ x",
+            numeric.clone(),
+            factor.clone(),
+            "poisson",
+            "log",
+            "hessian",
+            1,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("cold poisson fit should converge");
+        assert!(cold.converged);
+        assert_eq!(cold.beta.len(), 2);
+
+        let warm = run_fit(
+            "y ~ x",
+            numeric,
+            factor,
+            "poisson",
+            "log",
+            "hessian",
+            1,
+            None,
+            None,
+            None,
+            Some((cold.beta.clone(), Vec::new())),
+        )
+        .expect("warm-started poisson fit should converge");
+        assert!(warm.converged);
+        for (c, w) in cold.beta.iter().zip(warm.beta.iter()) {
+            assert!(
+                (c - w).abs() < 1e-9,
+                "warm start from the optimum must not move it: {c} vs {w}"
+            );
+        }
+        assert!(
+            warm.n_eval <= cold.n_eval,
+            "warm start from the optimum must not need more evaluations than \
+             a cold start: warm={} cold={}",
+            warm.n_eval,
+            cold.n_eval
+        );
+    }
+
+    /// Deterministic fixed-effects-only Gamma(log) fixture: `y = exp(1 +
+    /// 0.5·x) · jitter` on a centered `x`, `jitter` a 7-cycle deterministic
+    /// wobble around 1 (same shape as `glm.rs`'s Gamma fixtures) so the
+    /// Pearson-vs-fixed dispersion paths are both exercised on real data.
+    #[allow(clippy::type_complexity)] // test fixture: the numeric+factor column maps run_fit takes
+    fn toy_gamma() -> (
+        HashMap<String, Vec<f64>>,
+        HashMap<String, (Vec<String>, Vec<u32>)>,
+    ) {
+        let n = 100;
+        let mut x = vec![0.0f64; n];
+        let mut y = vec![0.0f64; n];
+        for i in 0..n {
+            let xi = (i as f64) / (n as f64) - 0.5;
+            let mu = (1.0 + 0.5 * xi).exp();
+            let jitter = 1.0 + 0.05 * (((i % 7) as f64) - 3.0) / 3.0;
+            x[i] = xi;
+            y[i] = mu * jitter;
+        }
+        let mut numeric = HashMap::new();
+        numeric.insert("y".to_string(), y);
+        numeric.insert("x".to_string(), x);
+        (numeric, HashMap::new())
+    }
+
+    /// `dispersion: Some(v)` must hold φ fixed at exactly `v` instead of
+    /// estimating the Pearson moment — the only way `FitOptions::dispersion`
+    /// reaches the kernel from a port is through this string/option layer.
+    #[test]
+    fn gamma_end_to_end_holds_dispersion_fixed() {
+        let (numeric, factor) = toy_gamma();
+        let result = run_fit(
+            "y ~ x",
+            numeric,
+            factor,
+            "gamma",
+            "log",
+            "hessian",
+            1,
+            Some(2.5),
+            None,
+            None,
+            None,
+        )
+        .expect("gamma fit should converge");
+        assert!(result.converged);
+        assert_eq!(
+            result.dispersion, 2.5,
+            "dispersion: Some(v) must hold phi fixed at v, not estimate it"
+        );
+    }
+
+    /// The committed `cbpp` herd dataset (`validation/data/empirical/cbpp.csv`)
+    /// through `run_fit`'s `cbind()` aggregated-binomial path: `incidence`
+    /// successes out of `size` trials per herd/period. `healthy = size −
+    /// incidence` is precomputed since `cbind()` only accepts two bare column
+    /// names, not an expression.
+    #[allow(clippy::type_complexity)] // test fixture: the numeric+factor column maps run_fit takes
+    fn cbpp_columns() -> (
+        HashMap<String, Vec<f64>>,
+        HashMap<String, (Vec<String>, Vec<u32>)>,
+    ) {
+        let csv = include_str!("../validation/data/empirical/cbpp.csv");
+        let mut herd_labels: Vec<String> = Vec::new();
+        let mut period_labels: Vec<String> = Vec::new();
+        let mut incidence = Vec::new();
+        let mut healthy = Vec::new();
+        for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+            let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+            let inc: f64 = f[1].parse().unwrap();
+            let size: f64 = f[2].parse().unwrap();
+            herd_labels.push(f[0].to_string());
+            incidence.push(inc);
+            healthy.push(size - inc);
+            period_labels.push(f[3].to_string());
+        }
+        let herd_refs: Vec<&str> = herd_labels.iter().map(String::as_str).collect();
+        let period_refs: Vec<&str> = period_labels.iter().map(String::as_str).collect();
+        let mut numeric = HashMap::new();
+        numeric.insert("incidence".to_string(), incidence);
+        numeric.insert("healthy".to_string(), healthy);
+        let mut factor = HashMap::new();
+        factor.insert("herd".to_string(), factor_col(&herd_refs));
+        factor.insert("period".to_string(), factor_col(&period_refs));
+        (numeric, factor)
+    }
+
+    /// `wald_se="rx"` is the only route by which the Python/R ports select
+    /// `WaldSe::Rx`; a bad string→enum hand-off (or a no-op enum arm) would
+    /// leave `se` identical to the `"hessian"` default and pass silently.
+    /// Same herd/period random-intercept model `fit_grouped_honors_opts_wald_se`
+    /// (`fit/glmm_tests.rs`) checks at the kernel-struct layer — this is the
+    /// string-typed orchestration layer above it.
+    #[test]
+    fn cbpp_glmm_wald_se_rx_differs_from_hessian() {
+        let (numeric, factor) = cbpp_columns();
+        let hessian = run_fit(
+            "cbind(incidence, healthy) ~ period + (1 | herd)",
+            numeric.clone(),
+            factor.clone(),
+            "binomial",
+            "logit",
+            "hessian",
+            1,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("hessian-SE fit should converge");
+        assert!(hessian.converged);
+        assert_eq!(hessian.beta.len(), 4);
+
+        let rx = run_fit(
+            "cbind(incidence, healthy) ~ period + (1 | herd)",
+            numeric,
+            factor,
+            "binomial",
+            "logit",
+            "rx",
+            1,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("rx-SE fit should converge");
+        assert!(rx.converged);
+
+        for (h, r) in hessian.beta.iter().zip(rx.beta.iter()) {
+            assert!(
+                (h - r).abs() < 1e-6,
+                "wald_se must select an SE denominator, not move the fitted optimum: {h} vs {r}"
+            );
+        }
+        let se_differs = hessian
+            .se
+            .iter()
+            .zip(rx.se.iter())
+            .any(|(h, r)| (h - r).abs() > 1e-6);
+        assert!(
+            se_differs,
+            "hessian={:?} rx={:?} must differ, or wald_se=\"rx\" is a silent no-op",
+            hessian.se, rx.se
+        );
     }
 }

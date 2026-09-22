@@ -107,7 +107,32 @@ test_that("cloglog GLM fits", {
   expect_equal(length(f$beta), 2L)
 })
 
-test_that("inverse-Gaussian GLM fits on both links and refuses random effects", {
+test_that("cloglog GLM matches glm on the same data", {
+  set.seed(1)
+  n <- 300
+  x <- rnorm(n)
+  mu <- 1 - exp(-exp(0.2 + 0.8 * x))
+  d <- data.frame(y = rbinom(n, 1, mu), x = x)
+  f <- fastglmm(y ~ x, data = d, family = binomial(link = "cloglog"))
+  ref <- glm(y ~ x, data = d, family = binomial(link = "cloglog"))
+  expect_equal(unname(fixef(f)), unname(coef(ref)), tolerance = 1e-5,
+               info = "cloglog vs glm")
+})
+
+test_that("probit GLM fits and matches glm on the same data", {
+  set.seed(1)
+  n <- 300
+  x <- rnorm(n)
+  mu <- pnorm(0.2 + 0.8 * x)
+  d <- data.frame(y = rbinom(n, 1, mu), x = x)
+  f <- fastglmm(y ~ x, data = d, family = binomial(link = "probit"))
+  expect_true(f$converged)
+  ref <- glm(y ~ x, data = d, family = binomial(link = "probit"))
+  expect_equal(unname(fixef(f)), unname(coef(ref)), tolerance = 1e-5,
+               info = "probit vs glm")
+})
+
+test_that("inverse-Gaussian GLM fits and refuses random effects", {
   set.seed(2)
   n <- 400
   x <- rnorm(n)
@@ -129,6 +154,37 @@ test_that("inverse-Gaussian GLM fits on both links and refuses random effects", 
   )
 })
 
+test_that("inverse-Gaussian GLM matches glm (default link is already 1/mu^2)", {
+  # inverse.gaussian()'s default link is "1/mu^2", so f and f2 fit the same
+  # model under two spellings; fixef(f) and fixef(f2) are bit-identical.
+  set.seed(2)
+  n <- 400
+  x <- rnorm(n)
+  mu <- exp(0.3 + 0.2 * x)
+  lam <- 3
+  v <- rnorm(n)^2
+  x1 <- mu + mu^2 * v / (2 * lam) -
+    (mu / (2 * lam)) * sqrt(4 * mu * lam * v + mu^2 * v^2)
+  y <- ifelse(runif(n) <= mu / (mu + x1), x1, mu^2 / x1)
+  d <- data.frame(y = y, x = x, g = factor(rep(1:20, each = n / 20)))
+  f <- fastglmm(y ~ x, data = d, family = inverse.gaussian())
+  f2 <- fastglmm(y ~ x, data = d, family = inverse.gaussian(link = "1/mu^2"))
+  # glm()'s own IRLS needs a start near the optimum on this data (y was
+  # generated on the log-mean scale, not the canonical 1/mu^2 scale, so its
+  # default start diverges); starting it at the fit's own beta is a fair
+  # check of whether that beta solves the GLM score equations.
+  ref <- glm(y ~ x, data = d, family = inverse.gaussian(),
+             start = unname(fixef(f)))
+  ref2 <- glm(y ~ x, data = d, family = inverse.gaussian(link = "1/mu^2"),
+              start = unname(fixef(f2)))
+  expect_true(ref$converged, info = "invgauss default link glm ref converged")
+  expect_true(ref2$converged, info = "invgauss 1/mu^2 link glm ref converged")
+  expect_equal(unname(fixef(f)), unname(coef(ref)), tolerance = 1e-5,
+               info = "invgauss default link vs glm")
+  expect_equal(unname(fixef(f2)), unname(coef(ref2)), tolerance = 1e-5,
+               info = "invgauss 1/mu^2 link vs glm")
+})
+
 test_that("inverse-Gaussian accepts dispersion = \"estimate\"", {
   set.seed(3)
   d <- data.frame(y = rgamma(200, 4, 2) + 0.1, x = rnorm(200))
@@ -146,6 +202,23 @@ test_that("init.theta has no kernel hook; wrong-family use warns and strips", {
   expect_warning(fit <- fastglmm(y ~ x, d, init.theta = 1.5),
                  "applies only to family 'negativebinomial'")
   expect_true(fit$converged)
+})
+
+test_that("negative binomial GLM fits to convergence and reports theta as dispersion", {
+  set.seed(4)
+  n <- 600
+  x <- rnorm(n)
+  true_theta <- 4
+  y <- rnbinom(n, size = true_theta, mu = exp(0.5 + 0.3 * x))
+  d <- data.frame(y = y, x = x)
+  fit <- fastglmm(y ~ x, d, family = "negativebinomial")
+  expect_true(fit$converged)
+  expect_equal(fit$family_name, "negativebinomial")
+  expect_equal(unname(fixef(fit)), c(0.5, 0.3), tolerance = 0.05)
+  # dispersion carries the estimated shape theta for this family (measured
+  # 4.63 against a true 4 at this seed).
+  expect_equal(fit$dispersion, true_theta, tolerance = 0.2)
+  expect_equal(fit$df, 3L) # 2 fixed effects + the estimated theta
 })
 
 test_that("MASS::negative.binomial-style fixed-theta family objects error", {

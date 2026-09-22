@@ -9,6 +9,7 @@ use faer::sparse::{SparseColMat, Triplet};
 use faer::{Mat, MatRef, Par, Side, Spec};
 
 use crate::lmm::{LmmGroupings, GLMM_RHO_END, RHO_BEGIN, THETA_TRUTH_FLOOR};
+use crate::scalar::Scalar;
 
 use super::BETA_BOX;
 
@@ -23,6 +24,407 @@ pub enum OuterSearch {
     Joint,
     PqlThenJoint,
     ExactProfile,
+}
+
+/// Which `A`-layout a design takes. `Packed` is every design `fit::classify_design`
+/// sends to `Solver::Sparse` (over the dense envelope, slopes on an extra grouping,
+/// more than `MAX_CROSSED_LEVELS` crossed levels) plus every extras design whose
+/// core block is too wide for the structured route.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GlmmLayout {
+    Blocked,
+    Structured,
+    Packed,
+}
+
+impl GlmmLayout {
+    pub(crate) fn for_design(model: &crate::ModelSpec, g: &LmmGroupings) -> Self {
+        match crate::fit::classify_design(model, 1) {
+            crate::fit::Solver::Sparse => GlmmLayout::Packed,
+            crate::fit::Solver::NoZ if g.extra_offsets.is_empty() => GlmmLayout::Blocked,
+            crate::fit::Solver::NoZ if g.structured_extras_eligible() => GlmmLayout::Structured,
+            crate::fit::Solver::NoZ => GlmmLayout::Packed,
+        }
+    }
+}
+
+/// Row- and RE-sized PIRLS scratch every route writes: the linear predictor,
+/// mean and working weight per row, the packed `M = ZΛ` rows of the blocked
+/// path, the RE mode and its backtrack twin, the per-cluster Fisher blocks,
+/// the RHS and the AGQ per-cluster scratch. Lengths, with `rows` the row
+/// capacity, `k` the RE dimension, `q_p` the primary RE width, `s` the primary
+/// cluster count: `eta`/`prob`/`w`/`eta_fixed`/`mu` `rows`, `m_buf` `rows·q_p`,
+/// `lam` `q_p²`, `u` `k.max(1)`, `u_prev` `k.max(1)`, `a_rhs` `k.max(1)`,
+/// `a_blocks` `(s·q_p²).max(1)`, `agq_scratch` `agq_len(s, q_p, nagq)`. `T = f64` in the workspace;
+/// `Dual`/`HyperDual` in the derivative passes' twin.
+pub(crate) struct PirlsScratch<T: Scalar> {
+    /// PIRLS linear predictor η, length max_n.
+    pub eta: Vec<T>,
+    /// PIRLS fitted mean μ, length max_n.
+    pub prob: Vec<T>,
+    /// PIRLS working weights W, length max_n.
+    pub w: Vec<T>,
+    /// Σ_j x·β, hoisted out of the PIRLS iteration (β fixed within a solve)
+    pub eta_fixed: Vec<T>,
+    /// (Mu)ᵢ per row, filled by the layout's own row pass. The packed layout
+    /// leaves it at (Mu)ᵢ and reads it there; the structured layout overwrites
+    /// it in place with the IRLS residual `W·Mu + (y−prob)` before the RHS
+    /// scatter. The blocked layout does not use it.
+    pub mu: Vec<T>,
+    /// n×q_p row-major mᵢ = Λ_p'·zᵢ (blocked path) — filled once per PIRLS solve
+    pub m_buf: Vec<T>,
+    /// q_p × q_p primary Λ_p scratch (row-major)
+    pub lam: Vec<T>,
+    /// Current RE-mode iterate û, length k.
+    pub u: Vec<T>,
+    /// previous accepted PIRLS iterate, step-halving backtrack buffer (len k.max(1))
+    pub u_prev: Vec<T>,
+    /// length k
+    pub a_rhs: Vec<T>,
+    /// s · q_p² packed per-cluster q_p×q_p blocks (no-extras path; Σ wᵢmᵢmᵢ'+I then Crout L)
+    pub a_blocks: Vec<T>,
+    /// AGQ per-cluster scratch; unused on the Laplace path. Shape-dependent:
+    /// scalar (`q_p==1`) is `4·n_primary` (center loglik | node u_cj | per-node
+    /// loglik | running log-sum); vector (`q_p∈2..=3`) is `2·n_primary + k^q·(q+1)`
+    /// (center loglik | running log-sum | product-grid node table). See the
+    /// sizing at construction.
+    pub agq_scratch: Vec<T>,
+}
+
+impl<T: Scalar> PirlsScratch<T> {
+    /// Every length from the shape terms `GlmmWorkspace::from_groupings` and
+    /// the derivative scratch both derive: `rows` the row capacity, `k` the RE
+    /// dimension, `q_p` the primary width, `s` the primary cluster count.
+    pub(crate) fn for_shape(rows: usize, k: usize, q_p: usize, s: usize, nagq: u8) -> Self {
+        Self {
+            eta: vec![T::ZERO; rows],
+            prob: vec![T::ZERO; rows],
+            w: vec![T::ZERO; rows],
+            eta_fixed: vec![T::ZERO; rows],
+            mu: vec![T::ZERO; rows],
+            m_buf: vec![T::ZERO; rows * q_p],
+            lam: vec![T::ZERO; q_p * q_p],
+            u: vec![T::ZERO; k.max(1)],
+            u_prev: vec![T::ZERO; k.max(1)],
+            a_rhs: vec![T::ZERO; k.max(1)],
+            a_blocks: vec![T::ZERO; (q_p * q_p * s).max(1)],
+            agq_scratch: vec![T::ZERO; super::derivative::agq_len(s, q_p, nagq)],
+        }
+    }
+}
+
+/// θ-dependent values of the structured crossed/nested route, left FACTORED
+/// after a converged solve for the Schur fill: core blocks `(q_core²·s).max(1)`,
+/// coupling `(q_core·s·e).max(1)`, Schur `(e²).max(1)`, packed core `M`
+/// `(rows·q_core).max(1)`, crossed values `(rows·G_cap).max(1)`. Same two
+/// instantiations as `PirlsScratch`.
+pub(crate) struct StructuredScratch<T: Scalar> {
+    /// s · q_core² packed per-cluster core blocks (D_f+I then Crout L)
+    pub core_blocks: Vec<T>,
+    /// s · q_core · e core↔crossed coupling C_f (row-major per cluster)
+    pub coupling: Vec<T>,
+    /// e × e Schur S = (E+I) − Σ_f C_f'A_f⁻¹C_f (row-major; Crout L in place)
+    pub schur_blk: Vec<T>,
+    // Packed M = ZΛ nonzeros for the STRUCTURED path — filled once per deviance
+    // eval by `build_packed_m`, then read by the structured PIRLS passes and
+    // `structured_schur_fill`. `q_core = primary_q + nested_per_parent`, `G_cap =
+    // MAX_EXTRA_GROUPINGS`. Sized once at construction — no per-solve alloc.
+    /// max_n · q_core row-major; [i·q_core+local] = M[(i, core_col(f,local))]
+    pub m_core_buf: Vec<T>,
+    /// max_n · G_cap row-major; nonzero M value (z·θ) per crossed grouping
+    pub cross_val: Vec<T>,
+}
+
+impl<T: Scalar> StructuredScratch<T> {
+    /// `q_core = primary_q + nested_per_parent`, `e = k_crossed()`,
+    /// `G_cap = MAX_EXTRA_GROUPINGS`; every length `.max(1)` so the
+    /// no-extras path holds the minimum and the first call allocates nothing.
+    pub(crate) fn for_shape(rows: usize, s: usize, q_core: usize, e: usize) -> Self {
+        Self {
+            core_blocks: vec![T::ZERO; (q_core * q_core * s).max(1)],
+            coupling: vec![T::ZERO; (q_core * s * e).max(1)],
+            schur_blk: vec![T::ZERO; (e * e).max(1)],
+            m_core_buf: vec![T::ZERO; (rows * q_core).max(1)],
+            cross_val: vec![T::ZERO; (rows * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
+        }
+    }
+}
+
+/// θ-independent index pattern of the structured route — which crossed column
+/// each row touches and the per-cluster CSR of coupling columns — plus the
+/// cached sparse Schur factor and the test-only dense-Schur switch. `f64`
+/// workspace only: the dual passes read this same pattern rather than carrying
+/// a twin.
+pub(crate) struct StructuredPattern {
+    /// max_n · G_cap row-major; its crossed-block-local index b (0..e)
+    pub cross_col: Vec<u32>,
+    /// max_n; #crossed nonzeros for row i (≤ G ≤ MAX_EXTRA_GROUPINGS < 256)
+    pub n_cross: Vec<u8>,
+    // Per-cluster CSR of C_f's nonzero crossed columns (cluster f's slice is
+    // coup_cols[coup_ptr[f]..coup_ptr[f+1]], sorted + deduped). Rebuilt on
+    // pinning-mask transitions (see `coup_mask`) from cross_col/n_cross;
+    // structured_factor's Schur build walks it instead of all e columns.
+    /// ≤ max_n · G_cap entries before dedup
+    pub coup_cols: Vec<u32>,
+    /// n_primary + 1 offsets
+    pub coup_ptr: Vec<u32>,
+    /// θ-pinning mask (bit g = crossed grouping g has θ == 0.0) the current
+    /// coup_cols/coup_ptr CSR was built for; `None` ⇒ not built this fit. The
+    /// CSR pattern depends on the design AND this mask (build_packed_m drops
+    /// pinned groupings), so the structured deviance rebuilds only on mask
+    /// transitions. Reset to None at each fit_glmm start (mirrors u_seed).
+    pub coup_mask: Option<u32>,
+    /// Cached sparse factor of the crossed Schur `S`. `Some` only on the
+    /// structured crossed path with `e > 0`; built per fit by `StructuredSchur::new`
+    /// per fit by `StructuredSchur::new`. `None` ⇒ the packed/blocked/e=0 paths,
+    /// which never touch it.
+    pub(crate) structured_schur: Option<StructuredSchur>,
+    /// Test-only: force the dense `glmm_block_chol` Schur factor instead of the
+    /// cached sparse one, so the both-paths cross-check runs both at one θ. Always
+    /// `false` in production (the sparse factor is the only path). The objective
+    /// and the pinned-γ̂ re-evaluation both read this same pattern, so the
+    /// cross-check compares whole fits, not a single deviance evaluation.
+    pub(crate) force_dense_schur: bool,
+}
+
+/// Packed-row layout scratch (`GlmmLayout::Packed`): the `M = ZΛ` nonzeros in
+/// fixed-width rows, the per-grouping `Λ` factors they fold, and the dense
+/// `k×k` `A = M'WM + I` with its factor target.
+///
+/// Every row loads exactly one level of every grouping, so the row width is
+/// FIXED at `width = q_p + Σ q_g` and no CSR offsets are needed: row `i`'s
+/// nonzeros are `[i·width, (i+1)·width)`, `m_cols[i·width + t]` is the RE
+/// column row `i`'s `t`-th nonzero touches and `m_vals[i·width + t]` its value
+/// `(ZΛ)_{i,col}`. Zero-length on the blocked and structured layouts, which
+/// never read it — a missed read must panic on the bounds check, not silently
+/// return a zero.
+pub(crate) struct PackedScratch {
+    /// `lam_small` offsets per extra DECLARATION (parallel to
+    /// `LmmGroupings::extra_offsets`); the primary block is at 0. Maps
+    /// `fill_lambda_small`'s `[primary | nested | crossed]` layout back to
+    /// declaration order.
+    pub lam_off_decl: Vec<usize>,
+    /// Concatenated per-grouping `q×q` Λ factors (row-major lower-tri),
+    /// refilled once per θ eval by `fill_lambda_small`.
+    pub lam_small: Vec<f64>,
+    /// Nonzeros per packed row, `q_p + Σ q_g`.
+    pub width: usize,
+    /// len `max_n·width`. Design-fixed (filled by [`fill_packed_cols`]); column
+    /// order is slope-major primary (component `c` at `c·n_primary + f`) and
+    /// level-major extras (`extra_offsets[e] + level·q_g + c`). Initialized to
+    /// `u32::MAX`, so a solve that runs before the fill panics on the bounds
+    /// check instead of scattering every row's mass into column 0.
+    pub m_cols: Vec<u32>,
+    /// len `max_n·width`. The Λ-folded `z` entries, refilled per θ eval by
+    /// `fill_m_vals`.
+    pub m_vals: Vec<f64>,
+    /// k × k `A = M'WM + I`, full symmetric (the per-row scatter writes both
+    /// triangles). Left holding the FINAL iterate's raw `A` after a converged
+    /// solve, which `packed_schur_fill` (se.rs) re-factors — so the PIRLS
+    /// Cholesky must run on `a_chol`, never on this field in place.
+    pub a: Mat<f64>,
+    /// Copy-then-factor target for `a`'s Cholesky (k×k): the solve copies `a`'s
+    /// lower triangle in here (mirroring `.llt(Side::Lower)`'s internal copy)
+    /// and runs `cholesky_in_place` on THIS buffer.
+    pub a_chol: Mat<f64>,
+    /// Scratch for `a_chol`'s in-place `cholesky_in_place` (k×k, θ-independent
+    /// size) — avoids a per-PIRLS-iteration `.llt(Side::Lower)` allocation.
+    pub a_llt_mem: MemBuffer,
+}
+
+impl PackedScratch {
+    /// Packed-row buffers for a design with `rows` row capacity and `k` RE
+    /// columns. `m_cols` is design-fixed but level-id dependent, so it is
+    /// allocated here and filled by [`fill_packed_cols`].
+    pub(crate) fn for_shape(g: &LmmGroupings, rows: usize, k: usize) -> Self {
+        let q_p = g.primary_q;
+        // lam_small layout mirrors `fill_lambda_small` — primary, nested, crossed.
+        let mut lam_len = q_p * q_p;
+        let mut lam_off_decl = vec![0usize; g.extra_offsets.len()];
+        if let Some(nf) = g.nested {
+            lam_off_decl[nf.decl] = lam_len;
+            lam_len += nf.q * nf.q;
+        }
+        for cf in &g.crossed {
+            lam_off_decl[cf.decl] = lam_len;
+            lam_len += cf.q * cf.q;
+        }
+        let width = q_p + g.extra_q.iter().sum::<usize>();
+        PackedScratch {
+            lam_off_decl,
+            lam_small: vec![0.0; lam_len.max(1)],
+            width,
+            m_cols: vec![u32::MAX; rows * width],
+            m_vals: vec![0.0; rows * width],
+            a: Mat::zeros(k.max(1), k.max(1)),
+            a_chol: Mat::zeros(k.max(1), k.max(1)),
+            a_llt_mem: MemBuffer::new(cholesky_in_place_scratch::<f64>(
+                k.max(1),
+                Par::Seq,
+                Spec::default(),
+            )),
+        }
+    }
+
+    /// Zero-length buffers for the blocked and structured layouts, which never
+    /// read them.
+    pub(crate) fn unused() -> Self {
+        PackedScratch {
+            lam_off_decl: vec![],
+            lam_small: vec![],
+            width: 0,
+            m_cols: vec![],
+            m_vals: vec![],
+            a: Mat::zeros(0, 0),
+            a_chol: Mat::zeros(0, 0),
+            a_llt_mem: MemBuffer::new(cholesky_in_place_scratch::<f64>(
+                1,
+                Par::Seq,
+                Spec::default(),
+            )),
+        }
+    }
+}
+
+/// β-border scratch shared by the Profile-mode PIRLS step and the three
+/// Schur fillers in `se.rs`: `X'WX` (p×p), `X'WM` (p×k), `A⁻¹M'WX` (k×p), the
+/// Schur complement (p×p) with its factor memory, and the β backtrack buffer.
+pub(crate) struct BorderScratch {
+    /// p × p
+    pub xtwx: Mat<f64>,
+    /// p × k
+    pub xtwm: Mat<f64>,
+    /// k × p  = A⁻¹ M'WX
+    pub ainv_mtwx: Mat<f64>,
+    /// p × p  X'WX − X'WM A⁻¹ M'WX
+    pub schur: Mat<f64>,
+    /// Scratch for `schur`'s in-place `cholesky_in_place` (p×p) — avoids the
+    /// per-PIRLS-iteration `.llt(Side::Lower)` allocation on the `BetaStep::Profile`
+    /// β-Schur border step (packed/blocked/structured PIRLS variants alike).
+    pub schur_llt_mem: MemBuffer,
+    /// len p: Profile-mode β backtrack buffer (last-accepted β; the halving twin of `u_prev`). Untouched in Fixed mode.
+    pub beta_prev: Vec<f64>,
+}
+
+/// The finite-difference pass's seed state, set by `joint_hessian_cov` before
+/// its grid and restored on every exit; every field is `m`-sized or scalar,
+/// so a worker workspace takes it by `clone`. `m = n_theta + p`, the `[θ | β]`
+/// block the SE grid covers (never the NB slot).
+#[derive(Clone)]
+pub(crate) struct FdState {
+    /// length m; converged γ̂ snapshot restored each return
+    pub fd_saved: Vec<f64>,
+    /// length m; per-coordinate FD step h_k
+    pub fd_steps: Vec<f64>,
+    /// When true, `laplace_deviance_at` seeds PIRLS from `u_seed` (the fitted mode
+    /// û(γ̂)) instead of û = 0. Set ONLY by `joint_hessian_cov`, for **every** one of
+    /// its evals including the central f0, and reset on every `joint_hessian_cov` exit
+    /// so non-FD callers keep their cold, order-free û = 0 start. Same fixed-seed
+    /// FD-derivative invariant as `joint_hessian_cov` in se.rs — see there for the
+    /// derivation and for why f0 is inside the warm set too.
+    pub warm_seed_active: bool,
+    /// PIRLS exit-tol override read by `laplace_deviance_at` and forwarded to every
+    /// PIRLS variant. `Some(pirls_tol_fd(family))` ONLY while `joint_hessian_cov`
+    /// runs (set on entry, reset on every exit — the `warm_seed_active` discipline),
+    /// so the FD second differences see a deviance converged at least as far as the
+    /// fit's own exit. `None` everywhere else: the fit/BOBYQA path never pays the
+    /// extra inner iterations and stays bit-identical.
+    pub pirls_tol_override: Option<f64>,
+    /// Force the FD stencil on every layout, skipping both exact Hessian
+    /// rungs: the blocked and structured shapes land on
+    /// `se::joint_hessian_cov`'s own grid, the packed-row layout on
+    /// `se::packed_fd_hessian_cov`. Test-and-A/B only: nothing on a fitting
+    /// path sets it, and it is how the crate's FD-vs-exact comparisons reach
+    /// the stencil — `exact_hessian_matches_fd_on_fixture` on the dense side,
+    /// `packed_assembled_se_matches_the_packed_stencil` and
+    /// `sparse::fd_margin`'s corpus measurement on the packed one.
+    /// Mirrors `force_dense_schur`.
+    pub(crate) force_fd_hessian: bool,
+}
+
+/// Post-search inference outputs and their scratch: the joint Hessian and
+/// gradient, the μ̂ snapshot `joint_hessian_cov` restores, Cov(β̂) and its
+/// column scratch, the per-target SE vectors, and the joint-Wald matrices.
+pub(crate) struct InferenceScratch {
+    /// m × m joint-deviance Hessian
+    pub hess_scratch: Mat<f64>,
+    /// Scratch for the joint gradient, length `m`. Sized once.
+    pub(crate) grad_scratch: Vec<f64>,
+    /// μ̂ as `joint_hessian_cov` was handed it, restored on every exit beside
+    /// `ws.pirls.u`. The tail re-eval at the end of that function re-solves PIRLS
+    /// at γ̂ and writes a fresh `ws.pirls.prob`, while `ws.pirls.u` is put back
+    /// verbatim — so without this the workspace exits carrying a (`u`, `prob`) pair from two
+    /// different converged solves, and Gamma's σ̂² (`family::glmm_sigma_sq`,
+    /// read in `fit/glmm.rs`) is built from the mismatch. Length max_n.
+    /// Adding the restore (2026-09-05) moved the bit-identity dump's `theta`
+    /// on the dense Gamma rung (`sim_gamma`, rung 23) from 0.23550934106996388
+    /// to 0.23550934100844045 — a 2.6e-10 relative shift, the Hessian arm now
+    /// reporting the same σ̂² as the Rx arm; every other record stayed
+    /// byte-identical.
+    pub(crate) fd_saved_prob: Vec<f64>,
+    /// p×p Cov(β̂) — `var_diag` is its diagonal, and both are filled together at
+    /// the same target indices (NaN elsewhere). Workspace-owned, not returned on
+    /// `GlmmFit`, so filling it costs no per-fit allocation and the `Rx` warm
+    /// path keeps its zero-alloc gate. Sourced from the full matrix each SE arm
+    /// already forms: `Rx` from the Schur forward-solve columns, `Hessian` from
+    /// `joint_hessian_cov`'s β block. Mapped to `Fit::vcov` by `fit/glmm.rs`.
+    pub vcov: Mat<f64>,
+    /// p×p scratch holding column `j` of `L⁻¹` at each target `j` — the `Rx`
+    /// arm's per-target forward solves, kept so their pairwise dots can fill
+    /// `vcov`'s off-diagonals instead of only `‖·‖²` on its diagonal.
+    pub vcov_cols: Mat<f64>,
+    /// length p
+    pub var_diag: Vec<f64>,
+    /// length p
+    pub t_sq: Vec<f64>,
+    // SE of each θ coordinate = sqrt of the θ-block diagonal of the joint (θ,β)
+    // Hessian covariance (length n_theta). Filled ONLY on the `WaldSe::Hessian`
+    // GLMM path from the θ block `joint_hessian_cov` already inverts (it otherwise
+    // discards it); NaN under `WaldSe::Rx`, on the Hessian RX fallback, and on a
+    // non-converged fit. For a SCALAR grouping (q=1, dispersion≡1) the RE stddev
+    // equals its θ, so this is that stddev's SE directly (identity delta map); the
+    // only reachable GLMM groupings are scalar (intercept-only).
+    /// length n_theta
+    pub theta_se: Vec<f64>,
+    /// length p; Var(β̂)_jj forward-solve scratch (per-target)
+    pub fwd_solve: Vec<f64>,
+    // joint Wald scratch (reuse lmm::joint_wald_chi_sq):
+    /// Inverse of the joint Wald K matrix, p×p (see `lmm::joint_wald_chi_sq`).
+    pub joint_k_inv: Mat<f64>,
+    /// Cholesky factor of the joint Wald Σ_t, p×p.
+    pub joint_sigma_t_chol: Mat<f64>,
+    /// Joint Wald right-hand side, length p.
+    pub joint_rhs: Vec<f64>,
+}
+
+/// The per-fit design every GLMM kernel reads and none writes: the outcome
+/// family, the RE topology, the fixed design and response, prior weights
+/// (already `[..n]`), the RE level ids, the widened slope columns and the
+/// offset. Borrowed from the workspace and the caller's data for the duration
+/// of one fit; `nb_theta` is not here because the NB search changes it per
+/// evaluation.
+#[derive(Clone, Copy)]
+pub(crate) struct FitData<'a> {
+    pub family: crate::Family,
+    pub groupings: &'a LmmGroupings,
+    /// Which `A`-layout this design takes — see [`GlmmLayout`]. The one place
+    /// the routing decision is read; the kernels never re-derive it.
+    pub layout: GlmmLayout,
+    pub x: MatRef<'a, f64>,
+    pub y: &'a [f64],
+    pub prior_w: &'a [f64],
+    pub weighted: bool,
+    pub cluster_ids: &'a [u32],
+    /// Per-row extra-grouping level ids — read only on the structured route
+    /// (`build_packed_m`'s nested-indicator and crossed-level reconstruction);
+    /// unread on the blocked and packed routes.
+    pub extra_ids: &'a [Vec<u32>],
+    pub z_buf: &'a [f64],
+    /// Per-row linear-predictor offset (`FitOptions::offset`), forwarded to
+    /// every PIRLS/AGQ variant's `eta_fixed` fill. `None` ⇒ no offset.
+    pub offset: Option<&'a [f64]>,
+    pub n: usize,
+    pub p: usize,
 }
 
 /// All GLMM solver scratch — allocated once per (spec, max_n) shape.
@@ -42,12 +444,6 @@ pub struct GlmmWorkspace {
     /// binomial/Poisson AGQ paths — scalar intercept (`agq::agq_deviance`) or vector RE
     /// with `q_p ∈ 2..=3` (`agq::agq_deviance_vec`); ignored otherwise.
     pub nagq: u8,
-    /// AGQ per-cluster scratch; unused on the Laplace path. Shape-dependent:
-    /// scalar (`q_p==1`) is `4·n_primary` (center loglik | node u_cj | per-node
-    /// loglik | running log-sum); vector (`q_p∈2..=3`) is `2·n_primary + k^q·(q+1)`
-    /// (center loglik | running log-sum | product-grid node table). See the
-    /// sizing at construction.
-    pub agq_scratch: Vec<f64>,
     /// FitOptions::parallel_inner, copied per fit by the fit.rs adapter (the
     /// nb_theta pattern). Runtime gate for the parallel kernels in `parallel`
     /// builds: when false — or in any serial build — the per-fit
@@ -68,17 +464,12 @@ pub struct GlmmWorkspace {
     pub p: usize,
     /// count of variance-component (θ) parameters (groupings.n_theta())
     pub n_theta: usize,
-    /// max_n × k dense RE design (built per (spec, N) by `build_z`). Allocated
-    /// only on the dense fallback route (extras present and the core oversized,
-    /// `!structured_extras_eligible()`) — 0×0 on the blocked AND structured
-    /// routes: the structured route packs its nonzeros straight from the ids
-    /// (`build_packed_m`) and never materializes the dense design.
-    pub z: Mat<f64>,
-    /// max_n × k = ZΛ (rebuilt per BOBYQA eval). Allocated only on the dense
-    /// fallback route (extras present and the core oversized,
-    /// `!structured_extras_eligible()`) — 0×0 on the blocked and structured
-    /// routes, which never read it (`deviance.rs:194`).
-    pub m: Mat<f64>,
+    /// Which `A`-layout this shape takes — see [`GlmmLayout`]. Fixed at
+    /// construction; the deviance router, the Schur-fill dispatch and the
+    /// SE arms all read it instead of re-deriving the predicate.
+    pub(crate) layout: GlmmLayout,
+    /// Packed-row layout scratch — see [`PackedScratch`].
+    pub(crate) packed: PackedScratch,
     /// Joint (θ,β) BOBYQA solver, dimension `n_theta + p` (+1 on NB: the trailing
     /// `ln θ_NB` coordinate).
     pub solver: Bobyqa, // sized n_theta + p
@@ -102,8 +493,8 @@ pub struct GlmmWorkspace {
     /// θ-only BOBYQA solver for the θ-only outer search shared by
     /// `PqlThenJoint` (a warm-start accelerant) and `ExactProfile` (the search
     /// itself — see `OuterSearch`): sized `n_theta` (+1 on NB), configured with
-    /// the same `rho_begin`/`GLMM_RHO_END` schedule as `solver` and the
-    /// `sparse_lmm_seed` mid-model `npt` rule (`ceil(1.5·n_theta) + 1` at
+    /// the same `rho_begin`/`GLMM_RHO_END` schedule as `solver` and the LMM
+    /// mid-model `npt` rule (`ceil(1.5·n_theta) + 1` at
     /// `n_theta ≥ 3`, else `2·n_theta + 1`) — not
     /// the joint solver's `npt`, which differs. See `fit_glmm`.
     pub solver_stage1: Bobyqa,
@@ -116,24 +507,12 @@ pub struct GlmmWorkspace {
     pub upper_stage1: Vec<f64>,
     /// Outer search route for this shape — see `OuterSearch`.
     pub outer_search: OuterSearch,
-    // PIRLS scratch (sized max_n / k):
-    /// PIRLS linear predictor η, length max_n.
-    pub eta: Vec<f64>,
-    /// PIRLS fitted mean μ, length max_n.
-    pub prob: Vec<f64>,
-    /// PIRLS working weights W, length max_n.
-    pub w: Vec<f64>,
-    /// Σ_j x·β, hoisted out of the PIRLS iteration (β fixed within a solve)
-    pub eta_fixed: Vec<f64>,
-    /// n×q_p row-major mᵢ = Λ_p'·zᵢ (blocked path) — filled once per PIRLS solve
-    pub m_buf: Vec<f64>,
+    /// PIRLS scratch (sized max_n / k) — see [`PirlsScratch`].
+    pub(crate) pirls: PirlsScratch<f64>,
     /// n×(q_p−1) row-major f64 copy of x[:, slope_cols] — filled once per fit
     pub z_buf: Vec<f64>,
-    /// (Mu)ᵢ per iteration via GEMV; overwritten in place by the IRLS residual W·Mu + (y−p) before the RHS GEMV
-    pub mu: Vec<f64>,
     /// Per-row prior weights `wᵢ` (`FitOptions::weights`; all-1 when absent —
-    /// zero behavioral change). Semantics mirror the sparse twin
-    /// (`SparseGlmmWorkspace::prior_w`): `wᵢ·W̃ᵢ` on the working weight,
+    /// zero behavioral change). `wᵢ·W̃ᵢ` on the working weight,
     /// `wᵢ·devᵢ` on the deviance, `wᵢ·ρᵢ` on the score; everything downstream
     /// (A/RHS scatter, β border, Schur, FD Hessian) reads `w`/ρ and inherits it.
     pub(crate) prior_w: Vec<f64>,
@@ -141,215 +520,36 @@ pub struct GlmmWorkspace {
     /// the two logit arms of `simd_transcendental::family_pass`: the fused
     /// `Σ log1pexp` deviance identity holds only for unweighted Bernoulli rows.
     pub(crate) weighted: bool,
-    /// Current RE-mode iterate û, length k.
-    pub u: Vec<f64>,
-    /// previous accepted PIRLS iterate, step-halving backtrack buffer (len k.max(1))
-    pub u_prev: Vec<f64>,
     /// within-fit û warm-start incumbent; RESET to 0 each fit_glmm — never carried across fits
     pub u_seed: Vec<f64>,
-    /// k × k  M'WM + I. `dense_schur_fill` (se.rs) re-factors THIS field after a
-    /// converged Fixed-mode PIRLS solve, so `pirls_solve` must leave it holding
-    /// the raw symmetric A — never the in-place Cholesky factor. Allocated
-    /// only on the dense fallback route — 0×0 on the blocked and structured
-    /// routes, which never read it (`deviance.rs:194`).
-    pub a: Mat<f64>,
-    /// Copy-then-factor target for `a`'s Cholesky (k×k): `pirls_solve` copies
-    /// `a`'s lower triangle in here (mirroring `.llt(Side::Lower)`'s internal
-    /// copy) and runs `cholesky_in_place` on THIS buffer, leaving `a` itself
-    /// untouched for `dense_schur_fill` to re-read. Allocated only on the
-    /// dense fallback route — 0×0 on the blocked and structured routes, which
-    /// never read it (`deviance.rs:194`).
-    pub a_chol: Mat<f64>,
-    /// Scratch for `a_chol`'s in-place `cholesky_in_place` (k×k, θ-independent
-    /// size) — avoids the per-PIRLS-iteration `.llt(Side::Lower)` allocation on
-    /// the dense `pirls_solve` hot path. Allocated only on the dense fallback
-    /// route — 0×0 on the blocked and structured routes, which never read it
-    /// (`deviance.rs:194`).
-    pub a_llt_mem: MemBuffer,
-    /// max_n × k = W∘M scratch for the dense-Gram GEMM (rebuilt per PIRLS
-    /// iteration). Allocated only on the dense fallback route — 0×0 on the
-    /// blocked and structured routes, which never read it (`deviance.rs:194`).
-    pub wm: Mat<f64>,
     /// max_n × p = W∘X scratch for the X'WX GEMM (rebuilt per PIRLS iteration,
     /// all three pirls variants and the three se.rs schur-fill twins)
     pub wx: Mat<f64>,
-    /// length k
-    pub a_rhs: Vec<f64>,
-    /// s · q_p² packed per-cluster q_p×q_p blocks (no-extras path; Σ wᵢmᵢmᵢ'+I then Crout L)
-    pub a_blocks: Vec<f64>,
-    // structured (block-diagonal core + Schur) path scratch — see
-    // `pirls_solve_blocked_extras`. Sized to the worst-case grid shape; left
-    // FACTORED (core L's + Schur L) after a converged structured PIRLS so
-    // `structured_schur_fill` reuses them. `q_core = primary_q + nested_per_parent`,
-    // `e = k_crossed`, `s = n_primary`.
-    /// s · q_core² packed per-cluster core blocks (D_f+I then Crout L)
-    pub core_blocks: Vec<f64>,
-    /// s · q_core · e core↔crossed coupling C_f (row-major per cluster)
-    pub coupling: Vec<f64>,
-    /// e × e Schur S = (E+I) − Σ_f C_f'A_f⁻¹C_f (row-major; Crout L in place)
-    pub schur_blk: Vec<f64>,
-    /// q_p × q_p primary Λ_p scratch (row-major)
-    pub lam: Vec<f64>,
-    // Packed M = ZΛ nonzeros for the STRUCTURED path — filled once per deviance
-    // eval by `build_packed_m` (replaces `apply_lambda` there), then read by the
-    // structured PIRLS passes and `structured_schur_fill` so they never touch the
-    // dense faer `m`. `q_core = primary_q + nested_per_parent`, `G_cap =
-    // MAX_EXTRA_GROUPINGS`. Sized once at construction — no per-solve alloc.
-    /// max_n · q_core row-major; [i·q_core+local] = M[(i, core_col(f,local))]
-    pub m_core_buf: Vec<f64>,
-    /// max_n · G_cap row-major; nonzero M value (z·θ) per crossed grouping
-    pub cross_val: Vec<f64>,
-    /// max_n · G_cap row-major; its crossed-block-local index b (0..e)
-    pub cross_col: Vec<u32>,
-    /// max_n; #crossed nonzeros for row i (≤ G ≤ MAX_EXTRA_GROUPINGS < 256)
-    pub n_cross: Vec<u8>,
-    // Per-cluster CSR of C_f's nonzero crossed columns (cluster f's slice is
-    // coup_cols[coup_ptr[f]..coup_ptr[f+1]], sorted + deduped). Rebuilt on
-    // pinning-mask transitions (see `coup_mask`) from cross_col/n_cross;
-    // structured_factor's Schur build walks it instead of all e columns.
-    /// ≤ max_n · G_cap entries before dedup
-    pub coup_cols: Vec<u32>,
-    /// n_primary + 1 offsets
-    pub coup_ptr: Vec<u32>,
-    /// θ-pinning mask (bit g = crossed grouping g has θ == 0.0) the current
-    /// coup_cols/coup_ptr CSR was built for; `None` ⇒ not built this fit. The
-    /// CSR pattern depends on the design AND this mask (build_packed_m drops
-    /// pinned groupings), so the structured deviance rebuilds only on mask
-    /// transitions. Reset to None at each fit_glmm start (mirrors u_seed).
-    pub coup_mask: Option<u32>,
-    /// Cached sparse factor of the crossed Schur `S`. `Some` only on the
-    /// structured crossed path with `e > 0`; built per fit by `StructuredSchur::new`
-    /// after `build_z`. `None` ⇒ the dense/blocked/e=0 paths, which never touch it.
-    pub(crate) structured_schur: Option<StructuredSchur>,
-    /// Test-only: force the dense `glmm_block_chol` Schur factor instead of the
-    /// cached sparse one, so the both-paths cross-check runs both at one θ. Always
-    /// `false` in production (the sparse factor is the only path).
-    pub(crate) force_dense_schur: bool,
-    /// Force the FD stencil on every shape `derivative::supports_shape`
-    /// accepts, where the exact hyper-dual Hessian is otherwise used.
-    /// Test-and-A/B only: nothing on a fitting path sets it, and the two arms
-    /// are compared against each other by `exact_hessian_matches_fd_on_fixture`.
-    /// Mirrors `force_dense_schur`.
-    pub(crate) force_fd_hessian: bool,
-    /// `FitOptions::boundary_score`, set per fit by `run_glmm_on`: run the
-    /// hyper-dual Hessian for the pinned-component score in `fit_glmm`'s
-    /// diagnostics block. `false` ⇒ that block takes the gradient alone.
-    pub(crate) boundary_score_requested: bool,
-    // inference scratch:
-    /// p × p
-    pub xtwx: Mat<f64>,
-    /// p × k
-    pub xtwm: Mat<f64>,
-    /// k × p  = A⁻¹ M'WX
-    pub ainv_mtwx: Mat<f64>,
-    /// p × p  X'WX − X'WM A⁻¹ M'WX
-    pub schur: Mat<f64>,
-    /// Scratch for `schur`'s in-place `cholesky_in_place` (p×p) — avoids the
-    /// per-PIRLS-iteration `.llt(Side::Lower)` allocation on the `BetaStep::Profile`
-    /// β-Schur border step (dense/blocked/structured PIRLS variants alike).
-    pub schur_llt_mem: MemBuffer,
+    /// Structured crossed/nested route scratch — see [`StructuredScratch`].
+    pub(crate) structured: StructuredScratch<f64>,
+    /// Structured route's θ-independent index pattern — see [`StructuredPattern`].
+    pub(crate) pattern: StructuredPattern,
+    /// β-border scratch shared by the Profile-mode PIRLS step and `se.rs` —
+    /// see [`BorderScratch`].
+    pub(crate) border: BorderScratch,
     /// length p (copied from params[n_theta..])
     pub betas: Vec<f64>,
     // β-profiling (`BetaStep`) scratch — see `pirls::BetaStep`. All length p.
     /// len p: Profile-mode δβ RHS/solution scratch; also the Fixed-mode β-input transient (deviance.rs copies params[n_theta..] here — NOT `betas`, which is the reported output)
     pub beta_rhs: Vec<f64>,
-    /// len p: Profile-mode β backtrack buffer (last-accepted β; the halving twin of `u_prev`). Untouched in Fixed mode.
-    pub beta_prev: Vec<f64>,
     /// len p: stage-1 profiled-β in/out buffer
     pub beta_prof: Vec<f64>,
     /// len p: stage-1 incumbent β snapshot (mirrors u_seed)
     pub beta_seed: Vec<f64>,
     /// Exact-profile scratch (`pirls::ExactProfileBufs`), sized once here.
     pub(crate) exact_prof: super::pirls::ExactProfileBufs,
-    /// length p
-    pub var_diag: Vec<f64>,
-    /// p×p Cov(β̂) — `var_diag` is its diagonal, and both are filled together at
-    /// the same target indices (NaN elsewhere). Workspace-owned, not returned on
-    /// `GlmmFit`, so filling it costs no per-fit allocation and the `Rx` warm
-    /// path keeps its zero-alloc gate. Sourced from the full matrix each SE arm
-    /// already forms: `Rx` from the Schur forward-solve columns, `Hessian` from
-    /// `joint_hessian_cov`'s β block. Mapped to `Fit::vcov` by `fit/glmm.rs`.
-    pub vcov: Mat<f64>,
-    /// p×p scratch holding column `j` of `L⁻¹` at each target `j` — the `Rx`
-    /// arm's per-target forward solves, kept so their pairwise dots can fill
-    /// `vcov`'s off-diagonals instead of only `‖·‖²` on its diagonal.
-    pub vcov_cols: Mat<f64>,
-    /// length p
-    pub t_sq: Vec<f64>,
-    // SE of each θ coordinate = sqrt of the θ-block diagonal of the joint (θ,β)
-    // Hessian covariance (length n_theta). Filled ONLY on the `WaldSe::Hessian`
-    // GLMM path from the θ block `joint_hessian_cov` already inverts (it otherwise
-    // discards it); NaN under `WaldSe::Rx`, on the Hessian RX fallback, and on a
-    // non-converged fit. For a SCALAR grouping (q=1, dispersion≡1) the RE stddev
-    // equals its θ, so this is that stddev's SE directly (identity delta map); the
-    // only reachable GLMM groupings are scalar (intercept-only).
-    /// length n_theta
-    pub theta_se: Vec<f64>,
-    /// ∞-norm of the box-projected θ gradient of the deviance at the accepted
-    /// γ̂ — the KKT residual, projected in the internal θ̃ where the box lives
-    /// and reported in the caller's θ units (× `theta_row_scales`, the opposite
-    /// direction to `stddev_se`'s division, because this is a derivative w.r.t.
-    /// θ and that is an SE in θ). NaN when no exact gradient was available —
-    /// every shape outside `derivative::supports_shape`, or at a pinned crossed
-    /// θ̂. Observation only: nothing branches on it.
-    pub(crate) kkt_grad_norm: f64,
-    /// Per-θ-coordinate variance score at the boundary: `½·∂²D/∂θ_jj²` at the
-    /// accepted γ̂, which is `dD/ds_j` at `s_j = θ_jj² = 0`. In the CALLER's
-    /// variance units — the Hessian entry comes out in the internal θ̃ and is
-    /// multiplied by the row scale SQUARED, because a second derivative takes
-    /// the scale twice where `kkt_grad_norm` takes it once. Written only for
-    /// PINNED diagonal coordinates; NaN for interior coordinates, for every
-    /// off-diagonal, and everywhere no exact Hessian exists. Length `n_theta`.
-    pub(crate) boundary_score: Vec<f64>,
-    /// length p; Var(β̂)_jj forward-solve scratch (per-target)
-    pub fwd_solve: Vec<f64>,
-    // joint Wald scratch (reuse lmm::joint_wald_chi_sq):
-    /// Inverse of the joint Wald K matrix, p×p (see `lmm::joint_wald_chi_sq`).
-    pub joint_k_inv: Mat<f64>,
-    /// Cholesky factor of the joint Wald Σ_t, p×p.
-    pub joint_sigma_t_chol: Mat<f64>,
-    /// Joint Wald right-hand side, length p.
-    pub joint_rhs: Vec<f64>,
-    // FD-Hessian SE scratch (`joint_hessian_cov`), allocated once so the per-fit
-    // hessian path reuses them. `m = n_theta + p`, the `[θ | β]` block the SE
-    // grid covers (never the NB slot).
-    /// m × m joint-deviance Hessian
-    pub hess_scratch: Mat<f64>,
-    /// Scratch for the joint gradient, length `m`. Sized once.
-    pub(crate) grad_scratch: Vec<f64>,
-    /// length m; converged γ̂ snapshot restored each return
-    pub fd_saved: Vec<f64>,
-    /// μ̂ as `joint_hessian_cov` was handed it, restored on every exit beside
-    /// `ws.u`. The tail re-eval at the end of that function re-solves PIRLS at γ̂
-    /// and writes a fresh `ws.prob`, while `ws.u` is put back verbatim — so
-    /// without this the workspace exits carrying a (`u`, `prob`) pair from two
-    /// different converged solves, and Gamma's σ̂² (`family::glmm_sigma_sq`,
-    /// read in `fit/glmm.rs`) is built from the mismatch. Length max_n.
-    /// Adding the restore (2026-09-05) moved the bit-identity dump's `theta`
-    /// on the dense Gamma rung (`sim_gamma`, rung 23) from 0.23550934106996388
-    /// to 0.23550934100844045 — a 2.6e-10 relative shift, the Hessian arm now
-    /// reporting the same σ̂² as the Rx arm; every other record stayed
-    /// byte-identical.
-    pub(crate) fd_saved_prob: Vec<f64>,
-    /// length m; per-coordinate FD step h_k
-    pub fd_steps: Vec<f64>,
-    /// When true, `laplace_deviance_at` seeds PIRLS from `u_seed` (the fitted mode
-    /// û(γ̂)) instead of û = 0. Set ONLY by `joint_hessian_cov`, for **every** one of
-    /// its evals including the central f0, and reset on every `joint_hessian_cov` exit
-    /// so non-FD callers keep their cold, order-free û = 0 start. Same fixed-seed
-    /// FD-derivative invariant as `joint_hessian_cov` in se.rs — see there for the
-    /// derivation and for why f0 is inside the warm set too.
-    pub warm_seed_active: bool,
-    /// PIRLS exit-tol override read by `laplace_deviance_at` and forwarded to every
-    /// PIRLS variant. `Some(pirls_tol_fd(family))` ONLY while `joint_hessian_cov` runs
-    /// (set on entry, reset on every exit — the `warm_seed_active` discipline), so
-    /// the FD second differences see a deviance converged at least as far as the
-    /// fit's own exit. `None` everywhere else: the fit/BOBYQA path never pays the
-    /// extra inner iterations and stays bit-identical.
-    pub pirls_tol_override: Option<f64>,
+    /// Post-search inference outputs and their scratch — see [`InferenceScratch`].
+    pub(crate) inference: InferenceScratch,
+    /// The finite-difference pass's seed state — see [`FdState`].
+    pub(crate) fd: FdState,
     /// Per-row linear-predictor offset (`FitOptions::offset`), read by every
-    /// `eta_fixed` refresh (`pirls::refresh_eta_fixed` and its two blocked-path
-    /// inline twins). `None` ⇒ no offset, byte-identical to the pre-offset code.
+    /// `eta_fixed` refresh (`pirls::refresh_eta_fixed`). `None` ⇒ no offset,
+    /// byte-identical to the pre-offset code.
     pub(crate) offset: Option<Vec<f64>>,
     /// Count of fit-path (`pirls_tol_override.is_none()`) PIRLS solves that ran
     /// the full `PIRLS_MAX_ITERS` cap without converging — observation-only,
@@ -372,17 +572,62 @@ pub struct GlmmWorkspace {
     /// a caller that never asks for a gradient pays no memory.
     pub(crate) dual_scratch: Option<Box<super::derivative::GlmmDualScratch>>,
     /// The same at the SECOND-derivative order (`HyperDual<N, H>`), in its own
-    /// slot. A shared slot is what a fit that takes both the KKT gradient and
-    /// a Hessian SE would rebuild — one buffer list into the other and back
-    /// on every warm refit; the `HyperDual<8,36>` list is 45 `f64` per
-    /// element. The separate slot avoids that rebuild.
+    /// slot. A shared slot is what a caller that takes both a gradient and a
+    /// Hessian would rebuild — one buffer list into the other and back on
+    /// every warm refit; the `HyperDual<8,36>` list is 45 `f64` per element.
+    /// The separate slot avoids that rebuild.
     pub(crate) hyper_scratch: Option<Box<super::derivative::GlmmDualScratch>>,
+    /// `f64` scratch of the packed-row assembled derivative engine — its
+    /// assembly buffers, the mode snapshot its solve is taken around, and
+    /// `û`'s first-order response `U`. Its own slot rather than a field of
+    /// the dual scratch because the dual kernel does not support the
+    /// packed-row layout at all, so a packed fit never builds one; `None` on
+    /// every layout but `GlmmLayout::Packed`, and on a packed fit until its
+    /// first derivative request.
+    pub(crate) packed_asm: Option<Box<super::assembled::PackedGradientBufs>>,
 }
 
 impl GlmmWorkspace {
     /// Build the GLMM workspace for a Glm+cluster spec. `slope_cols` are the
     /// x_full indices of the primary slopes (`spec.cluster_slope_design_cols`).
-    pub fn for_cluster_spec(
+    /// Test-only: production callers go through [`Self::for_cluster_spec_ext`],
+    /// since a design whose extra groupings carry slopes needs their columns.
+    #[cfg(test)]
+    pub(crate) fn for_cluster_spec(
+        p: usize,
+        cluster: &crate::ModelSpec,
+        max_n: usize,
+        slope_cols: &[usize],
+        nagq: u8,
+    ) -> Self {
+        Self::for_cluster_spec_ext(p, cluster, max_n, slope_cols, &[], nagq)
+    }
+
+    /// The same for a design whose EXTRA groupings carry slopes:
+    /// `extra_slope_cols[e]` holds the x_full indices of extra grouping `e`'s
+    /// slopes, in declaration order. Only the packed-row layout applies a full
+    /// `q_g×q_g` Λ block per extra level, so any other layout must be handed
+    /// `&[]` here (`from_groupings` asserts it).
+    pub(crate) fn for_cluster_spec_ext(
+        p: usize,
+        cluster: &crate::ModelSpec,
+        max_n: usize,
+        slope_cols: &[usize],
+        extra_slope_cols: &[Vec<usize>],
+        nagq: u8,
+    ) -> Self {
+        let groupings =
+            LmmGroupings::from_cluster_spec_ext(cluster, max_n, slope_cols, extra_slope_cols);
+        let layout = GlmmLayout::for_design(cluster, &groupings);
+        Self::from_groupings(groupings, cluster.family, p, max_n, nagq, layout)
+    }
+
+    /// Test-only: the same workspace on the packed-row layout whatever
+    /// [`GlmmLayout::for_design`] would pick, so a test can drive the packed
+    /// kernel as the oracle for the blocked and structured ones. The caller
+    /// still owns [`fill_packed_cols`], exactly as on a production packed fit.
+    #[cfg(test)]
+    pub(crate) fn for_cluster_spec_packed(
         p: usize,
         cluster: &crate::ModelSpec,
         max_n: usize,
@@ -390,7 +635,14 @@ impl GlmmWorkspace {
         nagq: u8,
     ) -> Self {
         let groupings = LmmGroupings::from_cluster_spec(cluster, max_n, slope_cols);
-        Self::from_groupings(groupings, cluster.family, p, max_n, nagq)
+        Self::from_groupings(
+            groupings,
+            cluster.family,
+            p,
+            max_n,
+            nagq,
+            GlmmLayout::Packed,
+        )
     }
 
     /// Build the workspace from an already-constructed `LmmGroupings` (+ family).
@@ -405,18 +657,28 @@ impl GlmmWorkspace {
         p: usize,
         max_n: usize,
         nagq: u8,
+        layout: GlmmLayout,
     ) -> Self {
-        // The dense GLMM kernel builds intercept-only extra groupings exclusively
-        // (`build_z` emits no slope columns for extras), so a slope-carrying extra
-        // would fit a REDUCED model and report it as a normal success. Callers must
-        // route such a design to the sparse solver — `classify_design`'s
-        // `slope_extras` clause does. Checked here, once per workspace build, rather
-        // than in `apply_lambda`/`build_packed_m`, whose per-eval `debug_assert`s
-        // stay debug-only because they sit in the hot loop.
+        // The blocked and structured kernels build intercept-only extra groupings
+        // exclusively, so a slope-carrying extra would fit a REDUCED model and
+        // report it as a normal success. Only the packed layout applies full
+        // q_g×q_g Λ blocks per extra level. Checked here, once per workspace
+        // build, rather than in `build_packed_m`, whose per-eval `debug_assert`
+        // stays debug-only because it sits in the hot loop.
         assert!(
-            !groupings.extra_slopes_any,
-            "dense GLMM kernel cannot fit a slope-carrying extra grouping — route it to the sparse solver"
+            layout == GlmmLayout::Packed || !groupings.extra_slopes_any,
+            "blocked and structured GLMM kernels cannot fit a slope-carrying extra grouping"
         );
+        // The packed layout is Laplace-only: the AGQ kernels factorize the
+        // marginal likelihood over independent per-cluster integrals, which the
+        // shapes this layout serves (an oversized core, crossed tails, slopes on
+        // an extra grouping) do not have. Pinned before `outer_search` below, so
+        // the route decision sees the nAGQ this workspace will actually run.
+        let nagq = if layout == GlmmLayout::Packed {
+            1
+        } else {
+            nagq
+        };
         let k = groupings.k_total;
         let n_theta = groupings.n_theta();
         // The NB dispersion is one trailing coordinate of the outer search, on
@@ -427,19 +689,25 @@ impl GlmmWorkspace {
         let n_primary = groupings.n_primary;
         // Structured-path block sizes: core width q_core = q_p + nested children,
         // crossed width e. Buffers stay 1-sized minima when the shape has no
-        // extras (the no-extras blocked path never touches them).
-        let q_core = q + groupings.nested_per_parent;
-        let e_crossed = groupings.k_crossed();
+        // extras (the no-extras blocked path never touches them), and on the
+        // packed layout, which reads neither the structured scratch nor the
+        // exact profile and carries the widest crossed tail of any layout —
+        // mirrors `derivative::DenseTwinShape`, which sizes the dual twins the
+        // same way.
+        let packed_layout = layout == GlmmLayout::Packed;
+        let q_core = if packed_layout {
+            0
+        } else {
+            q + groupings.nested_per_parent
+        };
+        let e_crossed = if packed_layout {
+            0
+        } else {
+            groupings.k_crossed()
+        };
         // Whether this family's PIRLS takes the observed-information step, and
         // so whether the exact profile's observed twins carry storage at all.
-        let observed = !crate::family::is_canonical(family);
-
-        // Which of `laplace_deviance`'s three routes this shape takes is fixed by `groupings`
-        // alone (deviance.rs:194) — decided here so the n×k buffers exist only on the route
-        // that reads them. Sized 0×0 (not `.max(1)`) on the routes that don't: a missed read
-        // must panic on the bounds check, not silently return a zero.
-        let has_extras = !groupings.extra_offsets.is_empty();
-        let needs_dense = has_extras && !groupings.structured_extras_eligible();
+        let observed = !packed_layout && !crate::family::is_canonical(family);
 
         // Bounds: θ part from blind_theta_and_bounds; β part = [−BETA_BOX, BETA_BOX].
         let (theta0, mut lower, mut upper) = groupings.blind_theta_and_bounds();
@@ -466,22 +734,19 @@ impl GlmmWorkspace {
         // solver) share the exact same computed θ-portion rho_begin — a pure
         // extraction, not a new derivation.
         let rho_begin = (0.1 * min_diag).min(RHO_BEGIN);
-        // MIRRORS the joint config in `sparse::glmm::fit_glmm_sparse` — both feed
-        // through the shared `apply_campaign_overrides` tail.
+        // Feeds through the shared `apply_campaign_overrides` tail.
         let mut config = Config::new(n_theta + p + n_nb);
         config.rho_begin = rho_begin;
         config.rho_end = GLMM_RHO_END;
         crate::lmm::apply_campaign_overrides(&mut config, n_theta + p + n_nb);
         // Stage-1 θ-only BOBYQA config: same rho_begin/rho_end schedule as the
-        // joint solver above, but `npt` mirrors `sparse_lmm_seed`'s mid-model
-        // rule (`src/lmm/mod.rs`), NOT the joint solver's — the two are sized for
-        // different-dimension searches and this crate's precedent for a
-        // θ-only search is `sparse_lmm_seed`. MIRRORS `config1` in
-        // `fit_glmm_sparse` (sparse.rs) — change together, though the dimension
-        // fed into the shared rule differs: this one takes `n_stage1` (θ, plus
-        // the `ln θ_NB` coordinate on NB), the sparse one takes `n_theta` alone
-        // (no NB coordinate there). Both feed through
-        // the shared `apply_campaign_overrides` tail.
+        // joint solver above, but `npt` mirrors the LMM's mid-model rule
+        // (`LmmWorkspace::for_cluster_spec_ext`, `src/lmm/mod.rs`), NOT the
+        // joint solver's — the two are sized for different-dimension searches
+        // and this crate's precedent for a
+        // θ-only search is the LMM one. The dimension fed into that shared
+        // rule is `n_stage1` — θ, plus the `ln θ_NB` coordinate on NB. Both
+        // configs feed through the shared `apply_campaign_overrides` tail.
         let n_stage1 = n_theta + n_nb;
         let npt_stage1 = if n_stage1 >= 3 {
             (3 * n_stage1).div_ceil(2) + 1
@@ -560,10 +825,10 @@ impl GlmmWorkspace {
         // With the `ExactProfile` route in place, none of the rows above reach
         // this branch: every dataset in the table is an nAGQ=1 non-Gamma shape
         // and routes `ExactProfile` first. What still reaches `n_theta <= 2 && p <= 4`
-        // is Gamma, non-canonical structured extras, and dense-fallback extras — a
+        // is Gamma, non-canonical structured extras, and packed-layout extras — a
         // population this sweep never measured. The threshold stands because nothing
         // has re-measured it, not because these numbers still cover it.
-        let outer_search = if super::exact_profile_shape(family, nagq, &groupings) {
+        let outer_search = if super::exact_profile_shape(family, nagq, layout) {
             OuterSearch::ExactProfile
         } else if nagq > 1 || (n_theta <= 2 && p <= 4) {
             OuterSearch::Joint
@@ -571,39 +836,25 @@ impl GlmmWorkspace {
             OuterSearch::PqlThenJoint
         };
 
+        // Sized only on the layout that reads it — see [`PackedScratch`].
+        let packed = if layout == GlmmLayout::Packed {
+            PackedScratch::for_shape(&groupings, max_n, k)
+        } else {
+            PackedScratch::unused()
+        };
+
         GlmmWorkspace {
             groupings,
             family,
             nb_theta: f64::NAN,
             nagq,
-            // Scalar AGQ (`q_p==1`, `agq::agq_deviance`) uses `4·s` slots
-            // (ctr|ucj|acc|sum). The vector kernel (`q_p∈2..=3`,
-            // `agq::agq_deviance_vec`) instead needs `2·s` (ctr|sum) plus a
-            // per-eval product-grid node table of `k^q·(q+1)` f64 (the q z-vector
-            // components + the summed Liu–Pierce reweight per node), `k=nagq`
-            // fixed per workspace. `nagq=1` shapes never reach the vector kernel,
-            // so their `k^q=1` table is a harmless `q+1` slots.
-            agq_scratch: if q >= 2 {
-                let kq = (nagq as usize).pow(q as u32);
-                vec![0.0; (2 * n_primary + kq * (q + 1)).max(1)]
-            } else {
-                vec![0.0; (4 * n_primary).max(1)]
-            },
             parallel_inner: false,
             cluster_rows: None,
             k,
             p,
             n_theta,
-            z: if needs_dense {
-                Mat::zeros(max_n, k.max(1))
-            } else {
-                Mat::zeros(0, 0)
-            },
-            m: if needs_dense {
-                Mat::zeros(max_n, k.max(1))
-            } else {
-                Mat::zeros(0, 0)
-            },
+            layout,
+            packed,
             solver: Bobyqa::new(n_theta + p + n_nb, config)
                 .expect("BOBYQA config constants are valid by construction"),
             params,
@@ -615,71 +866,36 @@ impl GlmmWorkspace {
             lower_stage1,
             upper_stage1,
             outer_search,
-            eta: vec![0.0; max_n],
-            prob: vec![0.0; max_n],
-            w: vec![0.0; max_n],
-            eta_fixed: vec![0.0; max_n],
-            m_buf: vec![0.0; max_n * q],
+            pirls: PirlsScratch::for_shape(max_n, k, q, n_primary, nagq),
             z_buf: vec![0.0; max_n * (q - 1)],
-            mu: vec![0.0; max_n],
             prior_w: vec![1.0; max_n],
             weighted: false,
-            u: vec![0.0; k.max(1)],
-            u_prev: vec![0.0; k.max(1)],
             u_seed: vec![0.0; k.max(1)],
-            a: if needs_dense {
-                Mat::zeros(k.max(1), k.max(1))
-            } else {
-                Mat::zeros(0, 0)
-            },
-            a_chol: if needs_dense {
-                Mat::zeros(k.max(1), k.max(1))
-            } else {
-                Mat::zeros(0, 0)
-            },
-            a_llt_mem: MemBuffer::new(cholesky_in_place_scratch::<f64>(
-                if needs_dense { k.max(1) } else { 1 },
-                Par::Seq,
-                Spec::default(),
-            )),
-            wm: if needs_dense {
-                Mat::zeros(max_n, k.max(1))
-            } else {
-                Mat::zeros(0, 0)
-            },
             wx: Mat::zeros(max_n, p),
-            a_rhs: vec![0.0; k.max(1)],
-            a_blocks: vec![0.0; (q * q * n_primary).max(1)],
-            core_blocks: vec![0.0; (q_core * q_core * n_primary).max(1)],
-            coupling: vec![0.0; (q_core * n_primary * e_crossed).max(1)],
-            schur_blk: vec![0.0; (e_crossed * e_crossed).max(1)],
-            lam: vec![0.0; q * q],
-            // Packed-M buffers (structured path). `q_core = q + nested_per_parent`,
-            // `G_cap = MAX_EXTRA_GROUPINGS`. `.max(1)` keeps a valid (never-read)
-            // allocation on the no-extras shapes that route elsewhere.
-            m_core_buf: vec![0.0; (max_n * q_core).max(1)],
-            cross_val: vec![0.0; (max_n * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
-            cross_col: vec![0u32; (max_n * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
-            n_cross: vec![0u8; max_n.max(1)],
-            coup_cols: vec![0u32; (max_n * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
-            coup_ptr: vec![0u32; n_primary + 1],
-            coup_mask: None,
-            structured_schur: None,
-            force_dense_schur: false,
-            force_fd_hessian: false,
-            boundary_score_requested: false,
-            xtwx: Mat::zeros(p, p),
-            xtwm: Mat::zeros(p, k.max(1)),
-            ainv_mtwx: Mat::zeros(k.max(1), p),
-            schur: Mat::zeros(p, p),
-            schur_llt_mem: MemBuffer::new(cholesky_in_place_scratch::<f64>(
-                p,
-                Par::Seq,
-                Spec::default(),
-            )),
+            structured: StructuredScratch::for_shape(max_n, n_primary, q_core, e_crossed),
+            pattern: StructuredPattern {
+                cross_col: vec![0u32; (max_n * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
+                n_cross: vec![0u8; max_n.max(1)],
+                coup_cols: vec![0u32; (max_n * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
+                coup_ptr: vec![0u32; n_primary + 1],
+                coup_mask: None,
+                structured_schur: None,
+                force_dense_schur: false,
+            },
+            border: BorderScratch {
+                xtwx: Mat::zeros(p, p),
+                xtwm: Mat::zeros(p, k.max(1)),
+                ainv_mtwx: Mat::zeros(k.max(1), p),
+                schur: Mat::zeros(p, p),
+                schur_llt_mem: MemBuffer::new(cholesky_in_place_scratch::<f64>(
+                    p,
+                    Par::Seq,
+                    Spec::default(),
+                )),
+                beta_prev: vec![0.0; p],
+            },
             betas: vec![0.0; p],
             beta_rhs: vec![0.0; p],
-            beta_prev: vec![0.0; p],
             beta_prof: vec![0.0; p],
             beta_seed: vec![0.0; p],
             exact_prof: super::pirls::ExactProfileBufs {
@@ -688,8 +904,8 @@ impl GlmmWorkspace {
                 logdet_u: vec![0.0; k.max(1)],
                 logdet_beta: vec![0.0; p],
                 // Twins of the four buffers above, sized only where the exact
-                // profile reads them — the same `!is_canonical` condition
-                // `obs_schur` below and the `DualStep` twins take.
+                // profile reads them — the `observed` flag above, which the
+                // `DualStep` twins mirror through `derivative::DenseTwinShape`.
                 obs_blocks: vec![0.0; super::pirls::obs_len(observed, (q * q * n_primary).max(1))],
                 obs_core_blocks: vec![
                     0.0;
@@ -713,57 +929,39 @@ impl GlmmWorkspace {
                 u_acc: vec![0.0; k.max(1)],
                 tail_inv: vec![0.0; (e_crossed * e_crossed).max(1)],
                 tail_r: vec![0.0; e_crossed.max(1)],
+                tail_g: vec![0.0; (q_core * q_core * n_primary).max(1)],
+                tail_h: vec![0.0; (q_core * n_primary * e_crossed).max(1)],
                 fac_f64: vec![0.0; (q_core * q_core * n_primary).max(1)],
             },
-            var_diag: vec![0.0; p],
-            vcov: Mat::zeros(p, p),
-            vcov_cols: Mat::zeros(p, p),
-            t_sq: vec![0.0; p],
-            theta_se: vec![f64::NAN; n_theta],
-            kkt_grad_norm: f64::NAN,
-            boundary_score: vec![f64::NAN; n_theta],
-            fwd_solve: vec![0.0; p],
-            joint_k_inv: Mat::zeros(p, p),
-            joint_sigma_t_chol: Mat::zeros(p, p),
-            joint_rhs: vec![0.0; p],
-            hess_scratch: Mat::zeros((n_theta + p).max(1), (n_theta + p).max(1)),
-            grad_scratch: vec![0.0; n_theta + p],
-            fd_saved: vec![0.0; n_theta + p],
-            fd_saved_prob: vec![0.0; max_n],
-            fd_steps: vec![0.0; n_theta + p],
-            warm_seed_active: false,
-            pirls_tol_override: None,
+            inference: InferenceScratch {
+                hess_scratch: Mat::zeros((n_theta + p).max(1), (n_theta + p).max(1)),
+                grad_scratch: vec![0.0; n_theta + p],
+                fd_saved_prob: vec![0.0; max_n],
+                vcov: Mat::zeros(p, p),
+                vcov_cols: Mat::zeros(p, p),
+                var_diag: vec![0.0; p],
+                t_sq: vec![0.0; p],
+                theta_se: vec![f64::NAN; n_theta],
+                fwd_solve: vec![0.0; p],
+                joint_k_inv: Mat::zeros(p, p),
+                joint_sigma_t_chol: Mat::zeros(p, p),
+                joint_rhs: vec![0.0; p],
+            },
+            fd: FdState {
+                fd_saved: vec![0.0; n_theta + p],
+                fd_steps: vec![0.0; n_theta + p],
+                warm_seed_active: false,
+                pirls_tol_override: None,
+                force_fd_hessian: false,
+            },
             offset: None,
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
             counters: crate::counters::EvalCounters::new(),
             dual_scratch: None,
             hyper_scratch: None,
+            packed_asm: None,
         }
-    }
-
-    /// Test-only: materialize the six dense buffers (`z`, `m`, `wm`, `a`, `a_chol`,
-    /// `a_llt_mem`) at full size regardless of the route `from_groupings` picked.
-    /// Some tests deliberately drive the dense kernel (`apply_lambda`/`pirls_solve`)
-    /// directly against a workspace built for a blocked or structured shape, to
-    /// assert the fast path agrees with the dense one — that assertion needs the
-    /// dense buffers to exist even though production never allocates them off the
-    /// dense route. `max_n` is read back from `eta` (always allocated at full size,
-    /// on every route).
-    #[cfg(test)]
-    pub(crate) fn ensure_dense_buffers(&mut self) {
-        let max_n = self.eta.len();
-        let k = self.k.max(1);
-        self.z = Mat::zeros(max_n, k);
-        self.m = Mat::zeros(max_n, k);
-        self.wm = Mat::zeros(max_n, k);
-        self.a = Mat::zeros(k, k);
-        self.a_chol = Mat::zeros(k, k);
-        self.a_llt_mem = MemBuffer::new(cholesky_in_place_scratch::<f64>(
-            k,
-            Par::Seq,
-            Spec::default(),
-        ));
     }
 }
 
@@ -778,7 +976,7 @@ impl GlmmWorkspace {
 /// CLONE of `src`'s groupings, then copies the load-bearing state the fresh
 /// constructor zeroes: the built design (`z`, `z_buf`), the structured crossed
 /// factor (rebuilt as its own per-thread scratch — see `StructuredSchur::
-/// clone_scratch`), and the FD seed state `joint_hessian_cov` set before the grid.
+/// clone_scratch`), and the `FdState` seed `joint_hessian_cov` set before the grid.
 /// A missed field is a silent aliasing bug; the knob-on-vs-off bit-identity test
 /// in `glmm/tests.rs` is the enforcement.
 ///
@@ -789,18 +987,31 @@ impl GlmmWorkspace {
 /// node-outer fallback it triggers is bit-identical to the cluster-outer loop.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
-    let mut w =
-        GlmmWorkspace::from_groupings(src.groupings.clone(), src.family, src.p, n, src.nagq);
-    // Built design (build_z / fill_z_f64 output — constant across the FD grid).
-    // src may be sized for max_n >= n (reusable-workspace surface); only the first
-    // n rows are live, and fill_z_f64 fills row-major, so a prefix slice is correct.
-    w.z = src.z.clone();
+    let mut w = GlmmWorkspace::from_groupings(
+        src.groupings.clone(),
+        src.family,
+        src.p,
+        n,
+        src.nagq,
+        src.layout,
+    );
+    // Built design (`fill_packed_cols` / `fill_z_f64` output — constant across the
+    // FD grid). src may be sized for max_n >= n (reusable-workspace surface); only
+    // the first n rows are live, and both fills are row-major, so a prefix slice is
+    // correct.
+    let cols = w.packed.m_cols.len();
+    w.packed.m_cols.copy_from_slice(&src.packed.m_cols[..cols]);
     let len = w.z_buf.len();
     w.z_buf.copy_from_slice(&src.z_buf[..len]);
     w.prior_w[..n].copy_from_slice(&src.prior_w[..n]);
     w.weighted = src.weighted;
     // Crossed-Schur factor: fresh per-thread scratch over the same symbolic pattern.
-    w.structured_schur = src.structured_schur.as_ref().map(|ss| ss.clone_scratch());
+    w.pattern.structured_schur = src
+        .pattern
+        .structured_schur
+        .as_ref()
+        .map(|ss| ss.clone_scratch());
+    w.pattern.force_dense_schur = src.pattern.force_dense_schur;
     // Mirrors the Fisher factor above so the two cannot drift, but FD workers
     // evaluate `BetaMode::Fixed` and never read the exact-profile twin.
     w.exact_prof.obs_schur = src
@@ -809,15 +1020,10 @@ pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
         .as_ref()
         .map(|ss| ss.clone_scratch());
     w.nb_theta = src.nb_theta;
-    w.force_dense_schur = src.force_dense_schur;
-    w.force_fd_hessian = src.force_fd_hessian;
     // FD seed state (joint_hessian_cov sets these before the grid).
     w.params.copy_from_slice(&src.params);
-    w.fd_saved.copy_from_slice(&src.fd_saved);
-    w.fd_steps.copy_from_slice(&src.fd_steps);
+    w.fd = src.fd.clone();
     w.u_seed.copy_from_slice(&src.u_seed);
-    w.warm_seed_active = src.warm_seed_active;
-    w.pirls_tol_override = src.pirls_tol_override;
     w.offset = src.offset.clone();
     w
 }
@@ -1067,59 +1273,44 @@ impl StructuredSchur {
     }
 }
 
-/// Build the dense RE design Z (`max_n × k`, level-major) for one dataset.
+/// Fill the packed rows' RE column indices from the level ids, once per
+/// `(design, ids)` — the column half of `M`'s packed rows, which is
+/// θ-independent (`fill_m_vals` refills the values per eval).
 ///
-/// Layout mirrors `LmmGroupings`'s RE-column convention (`from_cluster_spec`):
-/// the primary block is `q_p · n_primary` wide, level-major within each
-/// component (`[intercept 0..S | slope_0 … | slope_{q-2}]` → at level `lvl`,
-/// component `c`, the column is `lvl·q_p + c`), then each extra grouping's
-/// indicator columns at its ABSOLUTE `extra_offsets[e]` (already includes the
-/// primary block width — do not add it again). `slope_cols` index `x`.
+/// Row `i` touches exactly one level of every grouping, so its `width` slots are
+/// the primary block's `q_p` components at `c·n_primary + f` (component-major),
+/// then each extra grouping's `q_g` components at
+/// `extra_offsets[e] + level·q_g + c` (level-major). `extra_offsets` is ABSOLUTE
+/// — it already includes the primary block width.
 ///
-/// Builds the GLMM design-`Z` (`ws.z`) for the dense-fallback path only; the
-/// block-diagonal (no-extras) and structured fits both reconstruct `mᵢ` per
-/// row from the ids instead and never read `ws.z` (0×0 there, so this returns
-/// immediately).
-pub fn build_z(
+/// No-op on the blocked and structured layouts, whose packed buffers are
+/// zero-length: they reconstruct `mᵢ` per row from the ids instead.
+pub(crate) fn fill_packed_cols(
     ws: &mut GlmmWorkspace,
-    x: MatRef<f64>,
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
     n: usize,
 ) {
-    // Sized 0×0 by `from_groupings` on the no-extras blocked route (nothing ever
-    // reads it there) — the constructor is the single place that decides this,
-    // so a route change there is all this early return needs to track.
-    if ws.z.ncols() == 0 {
+    let width = ws.packed.width;
+    if width == 0 {
         return;
     }
     let g = &ws.groupings;
-    let q = g.primary_q;
-    for c in 0..ws.k {
-        for i in 0..n {
-            ws.z[(i, c)] = 0.0;
-        }
-    }
+    let q_p = g.primary_q;
     for i in 0..n {
-        let lvl = cluster_ids[i] as usize;
-        let base = lvl * q;
-        ws.z[(i, base)] = 1.0; // intercept
-                               // Slope cols come from the workspace's own `primary_slope_cols` (set once at
-                               // construction), mirroring `fill_z_f64` — not a per-call param. q_p−1 == #slopes.
-        for d in 0..q - 1 {
-            // Read AS A RANDOM-EFFECT column, so it takes the internal scale
-            // (`LmmGroupings::set_slope_scales`); the same x column keeps its raw
-            // value everywhere the fixed-effect design reads it. Mirrored by
-            // `fill_z_f64` and by the Rx M row in `se::blocked_schur_fill` —
-            // change together.
-            ws.z[(i, base + 1 + d)] = x[(i, g.primary_slope_cols[d])] / g.primary_slope_scales[d];
+        let mut t = i * width;
+        let f = cluster_ids[i] as usize;
+        for c in 0..q_p {
+            ws.packed.m_cols[t] = (c * g.n_primary + f) as u32;
+            t += 1;
         }
-    }
-    for (e, ids) in extra_ids.iter().enumerate() {
-        let off = g.extra_offsets[e]; // ABSOLUTE — do not add primary width again
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..n {
-            ws.z[(i, off + ids[i] as usize)] = 1.0;
+        for (e, ids_e) in extra_ids.iter().enumerate() {
+            let q_g = g.extra_q[e];
+            let base = g.extra_offsets[e] + ids_e[i] as usize * q_g;
+            for c in 0..q_g {
+                ws.packed.m_cols[t] = (base + c) as u32;
+                t += 1;
+            }
         }
     }
 }
@@ -1129,8 +1320,7 @@ pub fn build_z(
 /// are fixed per fit, so this lifts the MatRef load and the scale division out of
 /// the per-solve M fill — the fill becomes a pure contiguous-f64 product. `s_d`
 /// is the RE column's internal scale (`LmmGroupings::set_slope_scales`); mirrored
-/// by `build_z` and by the Rx M row in `se::blocked_schur_fill` — change
-/// together. No-op at q_p = 1 (no slope columns).
+/// by the Rx M row in `se::blocked_schur_fill` — change together. No-op at q_p = 1 (no slope columns).
 pub(crate) fn fill_z_f64(g: &LmmGroupings, x: MatRef<f64>, z_buf: &mut [f64], n: usize) {
     let q = g.primary_q;
     for i in 0..n {
@@ -1140,88 +1330,21 @@ pub(crate) fn fill_z_f64(g: &LmmGroupings, x: MatRef<f64>, z_buf: &mut [f64], n:
     }
 }
 
-/// Form M = ZΛ in place, with Λ block-diagonal: a shared lower-triangular
-/// primary block `Λ_p` (q_p×q_p) repeated per primary level, then one scalar
-/// θ_e per extra grouping. `Λ_p` is the column-major vech θ prefix expanded by
-/// `lmm::primary_lambda` (row-major lower-tri storage, so `lam[r*q + c]` is its
-/// (r,c) entry). Each extra grouping's columns scale by its θ scalar.
-pub(crate) fn apply_lambda(
-    groupings: &LmmGroupings,
-    params: &[f64],
-    z: MatRef<f64>,
-    m: &mut Mat<f64>,
-    lam: &mut [f64],
-    n: usize,
-) {
-    let q = groupings.primary_q;
-    let s = groupings.n_primary;
-    crate::lmm::primary_lambda(&params[..groupings.n_theta()], q, lam);
-    for lvl in 0..s {
-        let base = lvl * q;
-        for i in 0..n {
-            for c in 0..q {
-                let mut acc = 0.0;
-                for r in c..q {
-                    acc += z[(i, base + r)] * lam[r * q + c];
-                }
-                m[(i, base + c)] = acc;
-            }
-        }
-    }
-    let base_theta = q * (q + 1) / 2;
-    // The GLMM structured path carries intercept-only extras (q_g == 1), so each
-    // extra owns a single scalar θ at `base_theta + e` (== its `vech_start`).
-    // Slope-carrying extras (q_g > 1) never reach here: `classify_design` routes
-    // any extra-slopes shape to `Solver::Sparse` for every family.
-    debug_assert!(!groupings.extra_slopes_any);
-    // Each extra grouping owns a CONTIGUOUS column block at its ABSOLUTE
-    // `extra_offsets[e]`, scaled by its own scalar θ. Span the block by the
-    // grouping's OWN width — NOT the gap to the next declaration's offset:
-    // `extra_offsets` is non-monotonic (a nested grouping always sits at the low
-    // `prim_width` slot, so a crossed-before-nested declaration makes offsets
-    // decrease), so a "scale up to the next offset" loop empties one block and
-    // over-scales another. A nested grouping spans `n_primary · nested_per_parent`
-    // child columns; a crossed grouping spans its stored level count.
-    for (e, &off) in groupings.extra_offsets.iter().enumerate() {
-        let theta_e = params[base_theta + e];
-        let width = if groupings.nested.map(|nf| nf.vech_start) == Some(base_theta + e) {
-            s * groupings.nested_per_parent
-        } else {
-            groupings
-                .crossed
-                .iter()
-                .find(|cf| cf.vech_start == base_theta + e)
-                .map(|cf| cf.n_levels)
-                .expect("an extra grouping is either nested or crossed")
-        };
-        for col in off..off + width {
-            for i in 0..n {
-                m[(i, col)] = z[(i, col)] * theta_e;
-            }
-        }
-    }
-}
-
 /// Pack the STRUCTURED-path nonzeros of `M = ZΛ` into the workspace's packed
-/// buffers, once per deviance eval — the structured analogue of `apply_lambda`,
-/// which it replaces on this path (`apply_lambda` writes the full dense `n×k`
-/// every eval; this writes only the `q_core` core + ≤`G` crossed nonzeros each
-/// row reads). `m_core_buf[i·q_core+local]` = the `Λ`-scaled core value
+/// buffers, once per deviance eval — only the `q_core` core + ≤`G` crossed
+/// nonzeros each row reads, never a dense `n×k` `M`.
+/// `m_core_buf[i·q_core+local]` = the `Λ`-scaled core value
 /// `M[(i, core_col(f,local))]` for row `i`'s primary cluster (primary `local<q`:
-/// `Σ_{r≥local} z_r·lam[r·q+local]`, mirroring `apply_lambda`'s core write and
-/// the blocked-path fill; nested `local≥q`: the nested indicator scaled by its
+/// `Σ_{r≥local} z_r·lam[r·q+local]`, the same reduction the blocked-path fill
+/// runs; nested `local≥q`: the nested indicator scaled by its
 /// θ). For each crossed grouping with `θ≠0`, the row's single active level
 /// contributes one nonzero: `cross_val = z·θ`, `cross_col = b` (the crossed
 /// block-local index, `0..e`), with `n_cross[i]` the count (`≤ G`). A θ-pinned
-/// (θ=0) grouping is skipped, mirroring `apply_lambda`'s `z·θ=0` ⇒ no nonzero.
-/// Packs M's nonzeros from the grouping ids and `z_buf`; the dense `z` is
-/// never materialized on this route (it is 0×0 there — see
-/// `GlmmWorkspace::z`'s doc). Every value that would otherwise come from `z`
-/// is reconstructed straight from what `build_z` would have
-/// written there: the primary core from `z_buf` (the pre-widened slope buffer
-/// `fill_z_f64` fills, same source `build_z` widens from `x`), the nested
-/// indicator and the crossed level from `extra_ids` (the same slice `build_z`
-/// takes) directly — no scan needed for either. Reads `z_buf`, `extra_ids`,
+/// (θ=0) grouping is skipped — its `z·θ` is 0, so it has no nonzero.
+/// Every RE-design value is reconstructed straight from the ids and `z_buf`:
+/// the primary core from `z_buf` (the pre-widened slope buffer `fill_z_f64`
+/// fills), the nested indicator and the crossed level from `extra_ids`
+/// directly — no scan needed for either. Reads `z_buf`, `extra_ids`,
 /// `cluster_ids` (only for the nested global→local id conversion — see below),
 /// `lam` (filled here via `primary_lambda`), and `params`.
 #[allow(clippy::too_many_arguments)]
@@ -1244,8 +1367,8 @@ pub(crate) fn build_packed_m<T: crate::scalar::Scalar>(
     let k_family = qc * g.n_primary;
     let base_theta = q * (q + 1) / 2;
     let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
-    // Intercept-only extras on the GLMM structured path (see `apply_lambda`;
-    // `classify_design` routes extra-slopes shapes to Sparse for every family).
+    // Intercept-only extras on the GLMM structured path (`classify_design`
+    // routes extra-slopes shapes to Sparse for every family).
     debug_assert!(!g.extra_slopes_any);
     crate::lmm::primary_lambda(&params[..g.n_theta()], q, lam);
     let theta_nested = g.nested.map(|nf| params[nf.vech_start]).unwrap_or(T::ZERO);
@@ -1258,9 +1381,8 @@ pub(crate) fn build_packed_m<T: crate::scalar::Scalar>(
         // Core primary block: the identical `Σ_{r≥c} z_r·lam[r·q+c]` reduction
         // that `glmm/pirls/blocked.rs`'s `pirls_solve_blocked` per-solve M fill runs
         // (whose own comment records it as bit-identical to the z-sourced form) — z_r is
-        // 1.0 at r==0 (the intercept `build_z` always writes) or the
-        // pre-widened slope value `z_buf[i·(q−1)+(r−1)]` otherwise (the same
-        // `x` column `build_z` would have widened into the row's `z` block).
+        // 1.0 at r==0 (the RE intercept column) or the pre-widened slope
+        // value `z_buf[i·(q−1)+(r−1)]` otherwise.
         for c in 0..q {
             let mut acc = T::ZERO;
             for r in c..q {
@@ -1277,7 +1399,7 @@ pub(crate) fn build_packed_m<T: crate::scalar::Scalar>(
         // GLOBAL (dense over all parents — see `GroupIds`'s doc), while the
         // packed core slots are LOCAL to this row's own parent block, so the
         // global id needs `f`'s own `f·np` prefix subtracted back off before
-        // it can be compared against the local `j`. `build_z` wrote a 1.0
+        // it can be compared against the local `j`. The RE design carries a 1.0
         // indicator at the row's own (global) nested id and 0.0 at every other
         // slot, so the packed value is θ_nested at that one local `j` and
         // `0.0 · theta_nested` everywhere else — kept as the multiply, not a
@@ -1309,9 +1431,9 @@ pub(crate) fn build_packed_m<T: crate::scalar::Scalar>(
             }
         }
         // Crossed: one nonzero per crossed grouping (its single active level), θ-pinned
-        // groupings skipped. `build_z` wrote that level's one 1.0 at column
-        // `off + extra_ids[e][i]`, so the former linear scan for the first
-        // nonzero collapses to a direct index — no scan, no `z` read.
+        // groupings skipped. The RE design carries that level's one 1.0 at
+        // column `off + extra_ids[e][i]`, so the active column is a direct
+        // index — no scan.
         let mut cnt = 0usize;
         for cf in &g.crossed {
             let theta = params[cf.vech_start];
@@ -1407,9 +1529,9 @@ pub(crate) fn packed_m_theta_deriv(
     let np = g.nested_per_parent;
     let qc = q + np;
     let base_theta = q * (q + 1) / 2;
-    // Intercept-only extras on the GLMM structured path (see `apply_lambda`
-    // and `build_packed_m`; `classify_design` routes any extra-slopes shape
-    // to Sparse for every family) — mirrors `build_packed_m`'s own assert.
+    // Intercept-only extras on the GLMM structured path (`classify_design`
+    // routes any extra-slopes shape to Sparse for every family) — mirrors
+    // `build_packed_m`'s own assert.
     debug_assert!(!g.extra_slopes_any);
     m_core_d[..qc].fill(0.0);
     if a < base_theta {

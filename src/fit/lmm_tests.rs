@@ -21,7 +21,7 @@ use super::common_tests::{assert_pinned, dense_str, lcg, PIN_REL_ITER};
 use super::loop_advanced_seam::{build_lmm_workspace, refit_lmm};
 
 use super::lmm::{lmm_run_on, lmm_view_to_fit};
-use crate::test_support::{assert_near, intercept_only_spec};
+use crate::test_support::{assert_near, extra_level_of_row, intercept_only_spec};
 
 /// `lmm_run_on` + `lmm_view_to_fit` on a hand-accumulated workspace must
 /// reproduce the `Fit` that `fit_cold` produces for the same single-random-
@@ -64,18 +64,18 @@ fn lmm_run_on_view_maps_to_same_fit_as_fit_cold() {
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
 
     let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[], &[]);
+    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[], &[], false);
     let mut x_mat = Mat::<f64>::zeros(n, p);
     for i in 0..n {
         for j in 0..p {
             x_mat[(i, j)] = x[i * p + j];
         }
     }
-    ws.suff.reset();
-    ws.suff
+    ws.suff_mut().reset();
+    ws.suff_mut()
         .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], None);
     let via = {
-        let v = lmm_run_on(&mut ws, &opts.target_indices, None, opts.boundary_score);
+        let v = lmm_run_on(&mut ws, &opts.target_indices, None);
         lmm_view_to_fit(&v, &x, &ids, n, p, &opts)
     };
     assert_near(&cold.beta, &via.beta, "beta");
@@ -945,13 +945,15 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
         "β1 {} vs {REF_B1}",
         f.beta[1]
     );
+    // Same se_rel band as tol.R's cross-engine calibration (1e-3); measured
+    // worst on this golden is 5.9e-6 (se0) / 5.0e-7 (se1), far inside it.
     assert!(
-        (f.se[0] - REF_SE0).abs() / REF_SE0 < 2e-2,
+        (f.se[0] - REF_SE0).abs() / REF_SE0 < 1e-3,
         "se0 {} vs {REF_SE0}",
         f.se[0]
     );
     assert!(
-        (f.se[1] - REF_SE1).abs() / REF_SE1 < 2e-2,
+        (f.se[1] - REF_SE1).abs() / REF_SE1 < 1e-3,
         "se1 {} vs {REF_SE1}",
         f.se[1]
     );
@@ -1291,14 +1293,14 @@ fn fit_lmm_weighted_matches_lme4() {
     // suff-stats accumulator/kernel `fit_mle` calls, reading `sigma_sq`
     // straight off `LmmFit` (mirrors fit_mle's construction verbatim).
     let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[1], &[]);
+    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[1], &[], false);
     let mut x_mat = Mat::<f64>::zeros(n, p);
     for i in 0..n {
         for j in 0..p {
             x_mat[(i, j)] = x[i * p + j];
         }
     }
-    ws.suff
+    ws.suff_mut()
         .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], Some(&w));
     let lmm_fit = fit_lmm(&mut ws, &[0, 1], None);
     let sigma = lmm_fit.sigma_sq.sqrt();
@@ -1500,6 +1502,105 @@ fn fit_lmm_crossed_constant_weights_invariant() {
                 vu[k],
                 vw[k]
             );
+        }
+    }
+}
+
+/// Varying prior weights on a design where the EXTRA (crossed) grouping
+/// itself carries a random slope: `y ~ 1 + x1 + (1+x1 | primary) + (1+x1 |
+/// extra)`. `extra_slopes_any` is true, so the dense kernel's `zx` fill takes
+/// the family-blocked path (`kernel.rs`'s "Blocked crossed/nested-slopes
+/// path"), not the scalar `zx`/`zx_slope` branch the other crossed weighted
+/// tests exercise. A per-row weight applied to the wrong factor in that fill
+/// would move the dense fit off the sparse kernel's answer; a constant weight
+/// cannot show that, since w≡c only rescales θ̂ uniformly. `classify_design`
+/// always routes `extra_slopes_any` to Sparse, so the dense side is forced
+/// through `fit_mle_noz_pub`, the same forced-NoZ entry the grid cross-checks
+/// in `src/sparse/tests.rs` use.
+#[test]
+fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
+    let cluster = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 5 },
+            slopes: vec![1],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 4 },
+                slopes: vec![1],
+            }],
+        }),
+    };
+    let n = 60;
+    let mut st = 91u64;
+    let u0p: Vec<f64> = (0..5).map(|_| 0.5 * lcg(&mut st)).collect();
+    let u1p: Vec<f64> = (0..5).map(|_| 0.3 * lcg(&mut st)).collect();
+    let u0e: Vec<f64> = (0..4).map(|_| 0.4 * lcg(&mut st)).collect();
+    let u1e: Vec<f64> = (0..4).map(|_| 0.3 * lcg(&mut st)).collect();
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut pid = vec![0u32; n];
+    let mut eid = vec![0u32; n];
+    let mut w = vec![0.0f64; n];
+    for i in 0..n {
+        let par = cluster.re.as_ref().unwrap().sizing.cluster_of_row(i);
+        let item = extra_level_of_row(&cluster, 0, i) as usize;
+        pid[i] = par as u32;
+        eid[i] = item as u32;
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        y[i] = 0.5
+            + 0.4 * x1
+            + u0p[par]
+            + u1p[par] * x1
+            + u0e[item]
+            + u1e[item] * x1
+            + 0.8 * lcg(&mut st);
+        // Varies by row, unlike the w≡2 crossed test above — a weight folded
+        // into the wrong RE column shows up as a β/varcorr mismatch here,
+        // where a constant factor would only rescale both routes alike.
+        w[i] = 1.0 + (i % 3) as f64;
+    }
+    let ids = GroupIds {
+        primary: pid,
+        extra: vec![eid],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        weights: Some(w),
+        ..FitOptions::default()
+    };
+    let (sized, ids, _perm) = spec_sized_from_ids(&cluster, &ids);
+    let noz = fit_mle_noz_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
+    let sp = fit_mle_sparse_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
+    assert!(
+        noz.converged() && sp.converged(),
+        "both routes must converge"
+    );
+    // Two independent BOBYQA solves, not a shared trajectory — bounded by the
+    // solver's own rho_end floor, same order as the unweighted grid
+    // cross-check in `src/sparse/tests.rs` (`run_grid_agreement`'s 1e-4).
+    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
+    for j in 0..p {
+        assert!(
+            rel(sp.beta[j], noz.beta[j]) < 1e-4,
+            "β[{j}] sparse={} noz={}",
+            sp.beta[j],
+            noz.beta[j]
+        );
+        assert!(
+            rel(sp.se[j], noz.se[j]) < 1e-4,
+            "se[{j}] sparse={} noz={}",
+            sp.se[j],
+            noz.se[j]
+        );
+    }
+    assert_eq!(sp.varcorr.len(), noz.varcorr.len(), "varcorr block count");
+    for (bi, (sb, nb)) in sp.varcorr.iter().zip(noz.varcorr.iter()).enumerate() {
+        assert_eq!(sb.len(), nb.len(), "varcorr[{bi}] len");
+        for (ei, (a, b)) in sb.iter().zip(nb.iter()).enumerate() {
+            assert!(rel(*a, *b) < 1e-4, "varcorr[{bi}][{ei}] sparse={a} noz={b}");
         }
     }
 }
@@ -1742,9 +1843,11 @@ fn fit_penicillin_crossed_matches_lme4() {
         "β0 = {} vs lme4 {REF_BETA}",
         f.beta[0]
     );
+    // Same se_rel band as tol.R's cross-engine calibration (1e-3); measured
+    // worst on this golden is 2.7e-5, far inside it.
     let se_rel = (f.se[0] - REF_SE).abs() / REF_SE;
     assert!(
-        se_rel < 2e-2,
+        se_rel < 1e-3,
         "se0 = {} vs lme4 {REF_SE} (rel {se_rel})",
         f.se[0]
     );
@@ -1825,9 +1928,11 @@ fn fit_pastes_nested_matches_lme4() {
         "β0 = {} vs lme4 {REF_BETA}",
         f.beta[0]
     );
+    // Same se_rel band as tol.R's cross-engine calibration (1e-3); measured
+    // worst on this golden is 2.4e-6, far inside it.
     let se_rel = (f.se[0] - REF_SE).abs() / REF_SE;
     assert!(
-        se_rel < 2e-2,
+        se_rel < 1e-3,
         "se0 = {} vs lme4 {REF_SE} (rel {se_rel})",
         f.se[0]
     );
@@ -1862,9 +1967,15 @@ fn scalar_crossed_lmm_is_grouping_order_insensitive() {
     const SMALL: usize = 4;
     let n = 180usize;
     let p = 2usize;
-    let mut st = 20_260_807u64;
+    // Seed 1: with `small_eff` zeroed out below, this draw lands the small
+    // grouping's REML variance estimate on the PIN_THETA boundary, so
+    // `diagnostics.pinned` has a real block for the order-swap check below to
+    // compare (most seeds do not pin; this one is kept for that reason).
+    let mut st = 1u64;
     let big_eff: Vec<f64> = (0..BIG).map(|_| 0.9 * lcg(&mut st)).collect();
-    let small_eff: Vec<f64> = (0..SMALL).map(|_| 0.3 * lcg(&mut st)).collect();
+    // Zero true variance on the small grouping (unlike big_eff, which is
+    // sampled) is what makes a boundary estimate possible at all.
+    let small_eff: Vec<f64> = vec![0.0; SMALL];
     let mut x = vec![0.0f64; n * p];
     let mut y = vec![0.0f64; n];
     let mut big = vec![0u32; n];
@@ -1940,10 +2051,19 @@ fn scalar_crossed_lmm_is_grouping_order_insensitive() {
         b.diagnostics.pinned.len(),
         "pinned block count"
     );
+    // Not vacuous: this design (seed 1, zero true small-grouping variance)
+    // pins the small grouping's diagonal, so both sides carry a real block —
+    // an empty `pinned` here would mean the fixture stopped pinning and the
+    // swap check below stopped checking anything.
+    assert!(
+        !a.diagnostics.pinned.is_empty(),
+        "fixture must pin the small grouping's variance for this check to compare anything"
+    );
     for (g, h) in [(0usize, 1usize), (1, 0)] {
-        if let (Some(pa), Some(pb)) = (a.diagnostics.pinned.get(g), b.diagnostics.pinned.get(h)) {
-            assert_eq!(pa, pb, "pinned[{g}] vs pinned[{h}]");
-        }
+        assert_eq!(
+            a.diagnostics.pinned[g], b.diagnostics.pinned[h],
+            "pinned[{g}] vs pinned[{h}]"
+        );
     }
     // Conditional modes are per-grouping blocks of unequal width — the case the
     // per-entry swap above cannot cover.
@@ -2483,7 +2603,7 @@ fn lmm_rescaling_slope_column_moves_every_quantity_by_the_predicted_power_of_c()
 /// Warm-start forward map, on the same sleepstudy slope design: warm-starting
 /// at a fit's own reported θ̂ (via [`FitView::theta`], which hands back θ in the
 /// CALLER's units) must be a FIXED POINT of the map `LmmGroupings::
-/// theta_row_scales` installs in `src/lmm/mod.rs`'s `fit_lmm_impl`. `Days`' RMS
+/// theta_row_scales` installs in `src/lmm/mod.rs`'s `fit_lmm`. `Days`' RMS
 /// scale is clearly off 1.0 (values run 0..9), so a dropped forward map moves
 /// this test's θ̂ rather than leaving it untouched by construction.
 ///
@@ -2646,4 +2766,55 @@ fn lmm_counters_record_stage_two_and_shrink_evals() {
         "no PIRLS on a Gaussian LMM"
     );
     assert_eq!(c.agq_evals, 0, "no AGQ on a Gaussian LMM");
+}
+
+/// `p == 0` (no fixed-effect columns at all, only a random intercept) is the
+/// one shape where `accumulate_lmm_rows` skips `add_rows_multi` entirely, so
+/// `n_rows` stays 0 while the row count `n` handed to the weighted deviance
+/// correction is not. `reml_deviance` also refuses `p == 0` unconditionally
+/// (`suff.n_rows <= p || p == 0`), so this is the crate's other documented
+/// degenerate shape (alongside `n <= p`) and the fit reports the same
+/// NaN-filled, non-converged contract — this only pins that the weighted
+/// correction reaches that contract without panicking on the empty design.
+#[test]
+fn fit_lmm_p_zero_weighted_reaches_nan_fill() {
+    let n_clusters = 4usize;
+    let n = 20usize;
+    let p = 0usize;
+    let x: Vec<f64> = vec![];
+    let y: Vec<f64> = (0..n).map(|i| 1.0 + 0.1 * i as f64).collect();
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % n_clusters) as u32).collect(),
+        extra: vec![],
+    };
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — data path derives it
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    // Varying, not constant, weights: a wrong `n_rows`-keyed correction and a
+    // correct `n`-keyed one both fold in `-Σ log wᵢ`, so this only shows up as
+    // "does this branch run to completion", not as a numeric divergence.
+    let w: Vec<f64> = (0..n).map(|i| 1.0 + (i % 3) as f64).collect();
+    let opts = FitOptions {
+        target_indices: vec![],
+        weights: Some(w),
+        ..FitOptions::default()
+    };
+
+    let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+
+    assert!(!f.converged(), "p=0 is refused, not fit");
+    assert_eq!(f.beta.len(), 0);
+    assert_eq!(f.se.len(), 0);
+    assert!(f.deviance.is_nan(), "deviance {}", f.deviance);
+    assert!(f.loglik.is_nan(), "loglik {}", f.loglik);
+    assert_eq!(
+        f.diagnostics.boundary,
+        Boundary::NoOptimum,
+        "the p==0 refusal reports NoOptimum, not a silent zero-width fit"
+    );
 }

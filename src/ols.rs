@@ -1098,6 +1098,87 @@ mod tests {
         assert!(got.is_nan(), "non-converged fit must return NaN, got={got}");
     }
 
+    /// `ols_contrast_t_sq`'s bounds guard — `p_col >= p`, `n_col >= p`, or
+    /// `scratch.len() < p` — on a fit that otherwise converges and would
+    /// return a real value, so the guard itself is what is under test, not
+    /// the earlier `!converged` short-circuit. Reuses the symmetry test's
+    /// fixture (p=3) to confirm in-range indices still compute normally.
+    #[test]
+    fn contrast_t_sq_bounds_checks_return_nan() {
+        let p = 3;
+        let mut factor = Mat::<f64>::zeros(p, p);
+        factor[(0, 0)] = 2.0;
+        factor[(1, 0)] = 1.0;
+        factor[(1, 1)] = 3.0;
+        factor[(2, 1)] = 1.0;
+        factor[(2, 2)] = 4.0;
+        let betas = [0.5_f64, 1.2, -0.7];
+        let var_diag = [0.0_f64; 3];
+        let t_sq_dummy = [0.0_f64; 3];
+        let fit = OlsFitView {
+            betas: &betas,
+            var_diag: &var_diag,
+            t_sq: &t_sq_dummy,
+            factor: factor.as_ref(),
+            sigma_sq: 0.4,
+            df_resid: 10,
+            converged: true,
+            rss: 0.0,
+            sst: 0.0,
+            pivot: 1.0,
+            pivot_col: 0,
+        };
+        let mut scratch = vec![0.0_f64; p];
+
+        assert!(
+            ols_contrast_t_sq(&fit, p as u32, 0, &mut scratch).is_nan(),
+            "p_col == p is out of range"
+        );
+        assert!(
+            ols_contrast_t_sq(&fit, 0, p as u32, &mut scratch).is_nan(),
+            "n_col == p is out of range"
+        );
+        let mut short_scratch = vec![0.0_f64; p - 1];
+        assert!(
+            ols_contrast_t_sq(&fit, 1, 2, &mut short_scratch).is_nan(),
+            "scratch shorter than p must be refused"
+        );
+        assert!(
+            ols_contrast_t_sq(&fit, 1, 2, &mut scratch).is_finite(),
+            "the same indices, in range with full-length scratch, must compute normally"
+        );
+    }
+
+    /// `triangular_solve_norm_sq`'s near-zero-diagonal guard has never run:
+    /// every production caller only ever hands it a Cholesky factor `llt`
+    /// already accepted (diagonal strictly positive by construction). Drive
+    /// it directly to pin both sides of the `FLOAT_NEAR_ZERO` (1e-30) band —
+    /// a pivot inside it must come back NaN, and an ordinary small pivot just
+    /// above it must still solve.
+    #[test]
+    fn triangular_solve_norm_sq_near_zero_diagonal_returns_nan() {
+        let p = 2;
+        let mut factor = Mat::<f64>::zeros(p, p);
+        factor[(0, 0)] = 2.0;
+        factor[(1, 0)] = 1.0;
+        let mut scratch = vec![0.0_f64; p];
+        let b = |i: usize| if i == 0 { 1.0 } else { 0.0 };
+
+        factor[(1, 1)] = 1e-35; // inside the 1e-30 band, not exactly zero
+        let got = triangular_solve_norm_sq(factor.as_ref(), b, &mut scratch, p, false);
+        assert!(
+            got.is_nan(),
+            "diagonal inside FLOAT_NEAR_ZERO must return NaN, got {got}"
+        );
+
+        factor[(1, 1)] = 1e-6; // small but outside the band
+        let got = triangular_solve_norm_sq(factor.as_ref(), b, &mut scratch, p, false);
+        assert!(
+            got.is_finite() && got > 0.0,
+            "a pivot above the band must solve normally, got {got}"
+        );
+    }
+
     #[test]
     fn suff_stats_rank_deficiency_detected() {
         // A structurally degenerate design — the suff-stats fit must classify

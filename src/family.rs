@@ -76,6 +76,38 @@ pub(crate) fn clamp_eta<T: Scalar>(family: Family, eta: T) -> T {
     }
 }
 
+/// The `(lo, hi)` bounds [`clamp_eta`] holds η inside, per family — mirrors the
+/// match above, change together. Split out so a caller can ask "did the clamp
+/// bind on this row?" after the fact from one table shared with the clamp
+/// itself: `glmm::assembled::eta_clamped_rows`.
+pub(crate) fn clamp_eta_bounds(family: Family) -> (f64, f64) {
+    match family {
+        Family::Gamma {
+            link: GammaLink::Inverse,
+            ..
+        }
+        | Family::InverseGaussian {
+            link: InverseGaussianLink::InverseSquared,
+        } => (MU_FLOOR, ETA_MAX),
+        Family::Poisson { .. }
+        | Family::Gamma {
+            link: GammaLink::Log,
+            ..
+        }
+        | Family::NegativeBinomial { .. }
+        | Family::InverseGaussian {
+            link: InverseGaussianLink::Log,
+        } => (-ETA_MAX, ETA_MAX),
+        Family::Binomial {
+            link: BinomialLink::Logit | BinomialLink::Probit,
+        }
+        | Family::Gaussian => (f64::NEG_INFINITY, f64::INFINITY),
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        } => (-ETA_MAX, ETA_MAX.ln()),
+    }
+}
+
 /// True iff η lies outside the link's OPEN domain — the Gamma inverse link
 /// (μ = 1/η needs η > 0) and the inverse-Gaussian `InverseSquared` link
 /// (μ = η^(−1/2) needs η > 0) are the two with one; every other family/link's
@@ -114,11 +146,9 @@ pub(crate) fn clamp_mu<T: Scalar>(family: Family, mu: T) -> T {
 }
 
 /// The `(lo, hi)` bounds [`clamp_mu`] holds μ inside, per family — mirrors the
-/// match above, change together. Split out so the callers that need to ask
-/// "did the clamp bind on this row?" after the fact share one table with the
-/// clamp itself: `glmm::assembled::clamped_row_counts` (the assembled SE
-/// engine's refusal) and `glmm::pirls::clamped_row_present` (the dual kernels'
-/// one-step exactness flag).
+/// match above, change together. [`pinned_mu_bounds`] is what a caller asking
+/// "did the clamp bind on this row?" actually reads; this table is its base
+/// case, with no route exempted.
 pub(crate) fn clamp_mu_bounds(family: Family) -> (f64, f64) {
     match family {
         Family::Binomial { .. } => (PROB_EPS, 1.0 - PROB_EPS),
@@ -128,6 +158,30 @@ pub(crate) fn clamp_mu_bounds(family: Family) -> (f64, f64) {
         | Family::InverseGaussian { .. } => (MU_FLOOR, f64::INFINITY),
         Family::Gaussian => (f64::NEG_INFINITY, f64::INFINITY),
     }
+}
+
+/// [`clamp_mu_bounds`], except unbounded on unweighted Bernoulli logit: that
+/// route's family pass is the fused `log1pexp` identity and calls
+/// [`clamp_mu`] on no row, so no row there ever sits on the clamp, whatever
+/// `prob` holds. The one place this exemption lives — every caller asking "is
+/// this row's μ pinned at a constant" reads it, so the exemption cannot drift
+/// between separate copies: `glmm::assembled::mu_clamped_rows` (the assembled
+/// SE engine's census), `glmm::pirls::clamped_row_present` (the dual kernels'
+/// one-step exactness flag), and the per-row pinned test in
+/// `glmm::assembled::assemble`/`packed_assemble` (which closed form a pinned
+/// row reads).
+pub(crate) fn pinned_mu_bounds(family: Family, weighted: bool) -> (f64, f64) {
+    if !weighted
+        && matches!(
+            family,
+            Family::Binomial {
+                link: BinomialLink::Logit
+            }
+        )
+    {
+        return (f64::NEG_INFINITY, f64::INFINITY);
+    }
+    clamp_mu_bounds(family)
 }
 
 /// Inverse link `g⁻¹(η) → μ`, with the link's domain clamps applied so μ is
@@ -211,6 +265,64 @@ pub(crate) fn mu_eta<T: Scalar>(family: Family, eta: T) -> T {
         } => {
             let mu = T::ONE / eta.sqrt();
             T::from_f64(-0.5) * mu * mu * mu
+        }
+    }
+}
+
+/// Second derivative `d²μ/dη²` at η. Every arm is `mu_eta(family, eta) · g(η)`,
+/// the same `w·g(η, μ)` shape [`weight_eta_deriv`] has, with `μ'` and `g` both
+/// read at the RAW μ [`mu_eta`]/[`link_inv`] build before [`clamp_mu`], not at a
+/// clamped value. Applies [`clamp_eta`] at the top exactly as [`mu_eta`] does,
+/// so the two agree row for row. Per link, with `σ = η.sigmoid()` the raw
+/// sigmoid (not a clamped `prob[i]`) and `φ = mu_eta` the probit pdf:
+///
+/// - Gaussian identity: `μ'' = 0`.
+/// - Binomial logit: `μ' = σ(1−σ)`, `g = 1 − 2σ`, `μ'' = σ(1−σ)(1−2σ)`.
+/// - Binomial probit: `μ' = φ`, `g = −η`, `μ'' = −η·φ`.
+/// - Binomial cloglog: `μ' = e^{η−e^η}`, `g = 1 − e^η`, `μ'' = e^{η−e^η}(1−e^η)`.
+/// - Poisson-log, Gamma-log, NB-log, InverseGaussian-log: `μ' = μ = e^η`,
+///   `g = 1`, `μ'' = e^η`.
+/// - Gamma inverse: `μ_r = 1/η`, `μ' = −μ_r²`, `g = −2μ_r`, `μ'' = 2μ_r³ = 2/η³`.
+/// - InverseGaussian inverse-squared: `μ_r = η^(−1/2)`, `μ' = −μ_r³/2`,
+///   `g = −1.5μ_r²`, `μ'' = 0.75·μ_r⁵ = (3/4)·η^(−5/2)`.
+pub(crate) fn mu_eta_eta<T: Scalar>(family: Family, eta: T) -> T {
+    let eta = clamp_eta(family, eta);
+    let dm = mu_eta(family, eta);
+    match family {
+        Family::Gaussian => T::ZERO,
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        } => {
+            let mu = eta.sigmoid();
+            dm * (T::ONE - T::from_f64(2.0) * mu)
+        }
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        } => -eta * dm,
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        } => dm * (T::ONE - Scalar::exp(eta)),
+        Family::Poisson { .. }
+        | Family::Gamma {
+            link: GammaLink::Log,
+            ..
+        }
+        | Family::NegativeBinomial { .. }
+        | Family::InverseGaussian {
+            link: InverseGaussianLink::Log,
+        } => dm,
+        Family::Gamma {
+            link: GammaLink::Inverse,
+            ..
+        } => {
+            let mu_r = T::ONE / eta;
+            dm * T::from_f64(-2.0) * mu_r
+        }
+        Family::InverseGaussian {
+            link: InverseGaussianLink::InverseSquared,
+        } => {
+            let mu_r = T::ONE / eta.sqrt();
+            dm * T::from_f64(-1.5) * mu_r * mu_r
         }
     }
 }
@@ -604,6 +716,23 @@ pub(crate) fn observed_weight<T: Scalar>(
     w - T::from_f64(prior_w) * (T::from_f64(y) - mu) * dr
 }
 
+/// The observed (Newton) IRLS weight of a row whose μ sits on a [`clamp_mu`]
+/// bound. There the score is `ρ̃ = prior_w·μ'(η)·(y−mu)/V(mu)` with `mu` fixed
+/// at the pinned value, so only `μ'(η)` still moves with η and
+/// `w̃_obs = −∂ρ̃/∂η = −prior_w·μ''(η)·(y−mu)/V(mu)`, read off [`mu_eta_eta`].
+/// `mu` is the already-clamped value (`prob[i]`); `eta` is unclamped η.
+pub(crate) fn clamped_observed_weight<T: Scalar>(
+    family: Family,
+    nb_theta: f64,
+    y: f64,
+    prior_w: f64,
+    eta: T,
+    mu: T,
+) -> T {
+    let v = variance(family, nb_theta, mu);
+    -T::from_f64(prior_w) * mu_eta_eta(family, eta) * (T::from_f64(y) - mu) / v
+}
+
 /// `dw/dη` of the (prior-weighted) IRLS working weight `w = (dμ/dη)²/V(μ)`
 /// (general form) or `w = V(μ)` (canonical). Every arm reduces to `w·g(η,μ)`,
 /// so a caller that passes an already prior-weighted `w` gets a
@@ -630,17 +759,13 @@ pub(crate) fn observed_weight<T: Scalar>(
 /// - InvGaussian inverse-squared (`μ'=−μ³/2`, `V=μ³`, `w=μ'²/V=μ³/4`):
 ///   `dw/dη = (3μ²/4)μ' = −3μ⁵/8 = −1.5wμ²`.
 ///
-/// The `WEIGHT_CLAMP` zero-fill mirrors the guard the exact β-profile applies
-/// by hand at the two sites that hold a `Dual<1>` of `irls_weight_and_resid`
-/// equal to this function rather than calling it (`pirls/blocked.rs`'s pass A
-/// and `pirls/blocked_extras.rs`'s pass A): replacing either `Dual<1>` line
-/// with a call here would move `f64` bits, so a test
+/// The exact β-profile's pass A in `pirls/blocked.rs` and
+/// `pirls/blocked_extras.rs` holds a `Dual<1>` of `irls_weight_and_resid`
+/// equal to this function rather than calling it: replacing either `Dual<1>`
+/// line with a call here would move `f64` bits, so a test
 /// (`weight_eta_deriv_matches_dual1_of_irls_weight`) holds the two forms
 /// equal instead.
 pub(crate) fn weight_eta_deriv<T: Scalar>(family: Family, nb_theta: f64, eta: T, mu: T, w: T) -> T {
-    if w.value() <= crate::glm::WEIGHT_CLAMP {
-        return T::ZERO;
-    }
     match family {
         Family::Gaussian
         | Family::Gamma {
@@ -674,6 +799,27 @@ pub(crate) fn weight_eta_deriv<T: Scalar>(family: Family, nb_theta: f64, eta: T,
             link: InverseGaussianLink::InverseSquared,
         } => T::from_f64(-1.5) * w * mu * mu,
     }
+}
+
+/// `dw/dη` of the (prior-weighted) IRLS working weight on a row whose μ sits on
+/// a [`clamp_mu`] bound. There `w = prior_w·V(mu)` on a canonical link — a
+/// constant in η since `mu` is pinned, so `dw/dη = 0` — and `w =
+/// prior_w·μ'(η)²/V(mu)` otherwise, so `dw/dη = 2·prior_w·μ'(η)·μ''(η)/V(mu)`.
+/// Takes `prior_w` explicitly rather than the already-weighted `w`
+/// [`weight_eta_deriv`] takes: `μ'(η)` underflows to `0` at the cloglog upper
+/// clamp bound, and recovering `w'` from `2·w·μ''/μ'` there would be a `0/0`.
+pub(crate) fn clamped_weight_eta_deriv<T: Scalar>(
+    family: Family,
+    nb_theta: f64,
+    prior_w: f64,
+    eta: T,
+    mu: T,
+) -> T {
+    if is_canonical(family) {
+        return T::ZERO;
+    }
+    let v = variance(family, nb_theta, mu);
+    T::from_f64(2.0 * prior_w) * mu_eta(family, eta) * mu_eta_eta(family, eta) / v
 }
 
 #[cfg(test)]
@@ -923,18 +1069,234 @@ mod tests {
                 }
             }
         }
+    }
 
-        // Clamped weight: an eta that drives w below WEIGHT_CLAMP returns exactly 0.
-        let f = Family::Binomial {
-            link: BinomialLink::Logit,
+    /// `mu_eta_eta` against the `Dual<1>` derivative of `mu_eta` at the same η,
+    /// for every family/link, over a grid that includes each link's
+    /// [`clamp_eta`] bounds and ordinary interior points. Band fixed from the
+    /// first run: worst observed relative error 2.1e-16, round-off on both
+    /// sides.
+    #[test]
+    fn mu_eta_eta_matches_dual1_of_mu_eta() {
+        use crate::dual::Dual;
+        let cells: Vec<(Family, Vec<f64>)> = vec![
+            (Family::Gaussian, vec![-5.0, 0.0, 3.0]),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Logit,
+                },
+                vec![-27.7, -3.0, 0.0, 1.7, 27.7],
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Probit,
+                },
+                vec![-7.03, -1.0, 0.0, 1.0, 7.03],
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Cloglog,
+                },
+                vec![-ETA_MAX, -27.6, 0.0, 3.32, ETA_MAX.ln()],
+            ),
+            (
+                Family::Poisson {
+                    link: PoissonLink::Log,
+                },
+                vec![-ETA_MAX, -23.03, 0.0, 5.0, ETA_MAX],
+            ),
+            (
+                Family::Gamma {
+                    link: GammaLink::Log,
+                },
+                vec![-ETA_MAX, -23.03, 0.0, 5.0, ETA_MAX],
+            ),
+            (
+                Family::NegativeBinomial {
+                    link: NegBinomialLink::Log,
+                },
+                vec![-ETA_MAX, -23.03, 0.0, 5.0, ETA_MAX],
+            ),
+            (
+                Family::InverseGaussian {
+                    link: InverseGaussianLink::Log,
+                },
+                vec![-ETA_MAX, -23.03, 0.0, 5.0, ETA_MAX],
+            ),
+            (
+                Family::Gamma {
+                    link: GammaLink::Inverse,
+                },
+                vec![MU_FLOOR, 0.5, 5.0, ETA_MAX],
+            ),
+            (
+                Family::InverseGaussian {
+                    link: InverseGaussianLink::InverseSquared,
+                },
+                vec![MU_FLOOR, 0.5, 5.0, ETA_MAX],
+            ),
+        ];
+        for (f, etas) in cells {
+            for eta in etas {
+                let e = Dual::<1> { v: eta, d: [1.0] };
+                let dual_lane = mu_eta(f, e).d[0];
+                let closed = mu_eta_eta(f, eta);
+                let band = 1e-12 * closed.abs().max(1.0);
+                assert!(
+                    (dual_lane - closed).abs() <= band,
+                    "{f:?} eta={eta}: dual {dual_lane} vs closed {closed}"
+                );
+            }
+        }
+    }
+
+    /// The three clamped closed forms, checked against the kernel's own
+    /// `Dual<1>` chain rather than against a restatement of the same table —
+    /// the ground truth for every sign and factor. For every family/link that
+    /// can reach a [`clamp_mu`] bound, at each reachable side: seed η in
+    /// `Dual<1>`, confirm the fixture point really sits on the bound
+    /// ([`link_inv`]'s lane is `0.0`, so is [`dev_resid`]'s), then check
+    /// [`clamped_observed_weight`] against `−∂ρ̃/∂η` built from
+    /// [`mu_eta`]/[`variance`] the same way the assembly's score is, and
+    /// [`clamped_weight_eta_deriv`] against `d/dη` of the floored,
+    /// prior-weighted [`irls_weight_and_resid`] weight. Gamma inverse and
+    /// InverseGaussian inverse-squared have no reachable μ clamp — [`clamp_eta`]
+    /// caps η first, asserted directly rather than skipped. Gaussian's
+    /// [`clamp_mu_bounds`] is unbounded, asserted the same way. Band fixed
+    /// from the first run: worst observed relative error 2.3e-16 on the
+    /// observed weight, exactly 0 on the weight derivative — both round-off.
+    #[test]
+    fn clamped_row_closed_forms_match_dual1() {
+        use crate::dual::Dual;
+        let nb_theta = 2.5;
+
+        // (family, y, prior_w, reachable η sides)
+        let cells: &[(Family, f64, f64, &[f64])] = &[
+            (
+                Family::Binomial {
+                    link: BinomialLink::Logit,
+                },
+                1.0,
+                1.0,
+                &[-27.7, 27.7],
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Probit,
+                },
+                1.0,
+                1.0,
+                &[-7.1, 7.1],
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Cloglog,
+                },
+                1.0,
+                1.0,
+                &[-27.7, 3.4],
+            ),
+            (
+                Family::Poisson {
+                    link: PoissonLink::Log,
+                },
+                0.0,
+                1.0,
+                &[-23.03],
+            ),
+            (
+                Family::Poisson {
+                    link: PoissonLink::Log,
+                },
+                5.0,
+                2.0,
+                &[-23.03],
+            ),
+            (
+                Family::Gamma {
+                    link: GammaLink::Log,
+                },
+                1.0,
+                1.0,
+                &[-23.03],
+            ),
+            (
+                Family::NegativeBinomial {
+                    link: NegBinomialLink::Log,
+                },
+                1.0,
+                1.0,
+                &[-23.03],
+            ),
+            (
+                Family::InverseGaussian {
+                    link: InverseGaussianLink::Log,
+                },
+                1.0,
+                1.0,
+                &[-23.03],
+            ),
+        ];
+
+        for &(f, y, pw, etas) in cells {
+            for &eta in etas {
+                let e = Dual::<1> { v: eta, d: [1.0] };
+                let mu_d = link_inv(f, e);
+                assert_eq!(mu_d.d[0], 0.0, "{f:?} eta={eta}: link_inv not clamped");
+                let dev_d = dev_resid(f, nb_theta, y, mu_d);
+                assert_eq!(dev_d.d[0], 0.0, "{f:?} eta={eta}: dev_resid slope not zero");
+
+                let mu = mu_d.v;
+                let y_d = Dual::<1>::from_f64(y);
+                let pw_d = Dual::<1>::from_f64(pw);
+                let rho_tilde = pw_d * mu_eta(f, e) * (y_d - mu_d) / variance(f, nb_theta, mu_d);
+                let want_obs = -rho_tilde.d[0];
+                let got_obs = clamped_observed_weight(f, nb_theta, y, pw, eta, mu);
+                let band_obs = 1e-12 * want_obs.abs().max(1.0);
+                assert!(
+                    (got_obs - want_obs).abs() <= band_obs,
+                    "{f:?} eta={eta} y={y}: observed weight {got_obs} vs {want_obs}"
+                );
+
+                let (_mu2, w_d, _resid) = irls_weight_and_resid(f, nb_theta, y, e);
+                let floored = (pw_d * w_d).max_f64(crate::glm::WEIGHT_CLAMP);
+                let want_deriv = floored.d[0];
+                let got_deriv = clamped_weight_eta_deriv(f, nb_theta, pw, eta, mu);
+                let band_deriv = 1e-12 * want_deriv.abs().max(1.0);
+                assert!(
+                    (got_deriv - want_deriv).abs() <= band_deriv,
+                    "{f:?} eta={eta} y={y}: weight deriv {got_deriv} vs {want_deriv}"
+                );
+            }
+        }
+
+        // Gamma inverse / InverseGaussian inverse-squared: `clamp_eta` caps η at
+        // `ETA_MAX` before μ ever reaches its `clamp_mu` bound.
+        let gamma_inv = Family::Gamma {
+            link: GammaLink::Inverse,
         };
-        let eta = -20.0_f64;
-        let (mu, w, _) = irls_weight_and_resid(f, nb_theta, 1.0, eta);
+        let mu_at_cap = link_inv(gamma_inv, ETA_MAX);
+        let (mu_floor, _) = clamp_mu_bounds(gamma_inv);
         assert!(
-            w <= crate::glm::WEIGHT_CLAMP,
-            "fixture must exercise the clamp"
+            mu_at_cap > mu_floor * 1e6,
+            "gamma-inverse μ at the η cap ({mu_at_cap}) should sit far above the μ floor ({mu_floor})"
         );
-        assert_eq!(weight_eta_deriv(f, nb_theta, eta, mu, w), 0.0);
+
+        let invg_sq = Family::InverseGaussian {
+            link: InverseGaussianLink::InverseSquared,
+        };
+        let mu_at_cap = link_inv(invg_sq, ETA_MAX);
+        let (mu_floor, _) = clamp_mu_bounds(invg_sq);
+        assert!(
+            mu_at_cap > mu_floor * 1e6,
+            "invGaussian-inverse-squared μ at the η cap ({mu_at_cap}) should sit far above the μ floor ({mu_floor})"
+        );
+
+        // Gaussian: `clamp_mu_bounds` is unbounded, so no row is ever pinned.
+        assert_eq!(
+            clamp_mu_bounds(Family::Gaussian),
+            (f64::NEG_INFINITY, f64::INFINITY)
+        );
     }
 
     /// `weight_eta_deriv` against a central difference of the same
@@ -1133,6 +1495,11 @@ mod tests {
         let f = Family::Binomial {
             link: BinomialLink::Cloglog,
         };
+        // Pin the bound itself: `mu.is_finite() && mu <= 1.0 - PROB_EPS` alone
+        // passes for any wrong-but-finite clamp, since `clamp_mu` floors μ to
+        // 1-PROB_EPS long before η reaches ln(ETA_MAX) anyway.
+        assert_eq!(clamp_eta(f, 1e6), ETA_MAX.ln());
+        assert_eq!(clamp_eta_bounds(f), (-ETA_MAX, ETA_MAX.ln()));
         // η above ln(ETA_MAX) would overflow exp(exp(η)) — clamped, so μ stays
         // finite and inside the binomial μ-domain.
         let mu = link_inv(f, 1e6);

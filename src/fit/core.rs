@@ -14,7 +14,7 @@
 
 use faer::Mat;
 
-use crate::glmm::{build_z, GlmmWorkspace, StructuredSchur};
+use crate::glmm::GlmmWorkspace;
 use crate::lmm::LmmWorkspace;
 use crate::{BinomialLink, Family, GroupIds, GroupingRelation, ModelSpec, StartValues};
 
@@ -64,8 +64,9 @@ enum FitViewKind<'a> {
     Glm(crate::glm::GlmFitView<'a>),
     Lmm(LmmResultView<'a>),
     Glmm(super::glmm::GlmmResultView<'a>),
-    /// The NB routes (GLM-NB, GLMM-NB) and every sparse-routed design: the
-    /// kernel already assembled a `Fit`. `t_sq`/`var_diag` are reconstructed
+    /// The NB routes (GLM-NB, GLMM-NB): the kernel searches `ln θ_NB` as an
+    /// outer coordinate and hands back an assembled `Fit`. `t_sq`/`var_diag`
+    /// are reconstructed
     /// predictor-indexed from β̂/se for the accessor surface (Wald t²_j =
     /// (β̂_j/se_j)², Var = se_j²) — a best-effort convenience; `into_fit` returns
     /// the kernel's `Fit` verbatim.
@@ -128,14 +129,15 @@ impl FitView<'_> {
             FitViewKind::Glm(v) => v.diagnostics(),
             FitViewKind::Lmm(v) => v.diagnostics(),
             FitViewKind::Glmm(v) => v.diagnostics(),
-            // The kernel already assembled a `Fit`, so the carrier is read back
-            // off it. `boundary_hit` is back-derived from `singular`, which is
-            // lossy in the documented way: this route cannot report a cap-out
+            // The NB kernels already assembled a `Fit`, so the carrier is read
+            // back off it. `boundary_hit` is back-derived from `singular`, which
+            // is lossy in the documented way: this arm cannot report a cap-out
             // (2), and the carrier holds no `Vec`, so the per-component detail
-            // stays on the assembled `Fit` (`Diagnostics::pinned`, filled by
-            // the sparse routes) and does not reach here. Its `singular` also
-            // carries the negligible-component check `into_fit` applies to the
-            // other arms afterwards, so it is at least as inclusive.
+            // stays on the assembled `Fit` (`Diagnostics::pinned`, which the
+            // kernel's own view mapper filled) and does not reach here. Its
+            // `singular` also carries the negligible-component check `into_fit`
+            // applies to the other arms afterwards, so it is at least as
+            // inclusive.
             FitViewKind::Prebuilt { fit, .. } => FitDiagnostics {
                 boundary_hit: fit.singular() as u8,
                 ..FitDiagnostics::fixed_only(fit.converged())
@@ -211,7 +213,8 @@ impl FitView<'_> {
 
     /// Fitted θ̂ vech (primary block then extras, column-major lower-triangular) —
     /// feeds the grid-sequential warm-start carry. Empty for the `Prebuilt` arm
-    /// (sparse route holds no exposed θ̂) and for OLS/GLM.
+    /// (GLM-NB has no θ, and the GLMM-NB kernel exposes none through the
+    /// assembled `Fit`) and for OLS/GLM.
     ///
     /// In the caller's DECLARATION order, matching what [`crate::StartValues`]
     /// is read in, so carrying θ̂ from one fit into the next needs no mapping.
@@ -299,13 +302,14 @@ impl<'a> FitView<'a> {
             .is_some_and(|g| g.any_slope_scaled());
         if scaled || !perm.is_identity() {
             let n_theta = view.kernel_theta().len();
-            let theta = &mut buf[..n_theta];
+            // `buf` is two `n_theta` halves: θ̂ in declaration order, then the
+            // row scales to divide it by. Sized off this workspace's own θ
+            // width, so an over-envelope vech (a primary block past
+            // `MAX_PRIMARY_Q`, say) is as bounded as an intercept-only one, and
+            // the divide still costs the warm loop no heap block.
+            let (theta, scales) = buf.split_at_mut(n_theta);
             theta.copy_from_slice(view.kernel_theta());
             if scaled {
-                // Stack-sized off the θ ceiling every dense route is bounded by
-                // (`classify_design` sends anything wider to the sparse path,
-                // which exposes no θ here), so the divide costs no heap block.
-                let mut scales = [0.0f64; crate::consts::MAX_THETA];
                 let scales = &mut scales[..n_theta];
                 view.kernel_groupings()
                     .expect("scaled implies a θ-carrying route")
@@ -378,9 +382,12 @@ pub struct FitWorkspace {
     has_weights: bool,
     has_offset: bool,
     parallel_inner: bool,
-    /// Storage for [`FitView::theta_declared`], sized once at build. Sibling of
-    /// `kind` for the same borrow reason `x_mat` is (a slice of the solver
-    /// workspace could not also be handed out alongside `&mut` to it).
+    /// Storage for [`FitView::theta_declared`] and the row scales it divides by,
+    /// `2 * n_theta` long: the first half is the θ̂ the view hands out, the second
+    /// half `FitView::new`'s scratch. Sized once at build off the built kernel's
+    /// own θ width, so the widest vech a design can carry is the widest this
+    /// holds. Sibling of `kind` for the same borrow reason `x_mat` is (a slice of
+    /// the solver workspace could not also be handed out alongside `&mut` to it).
     theta_declared_buf: Vec<f64>,
     /// Slot-order copy of a caller's warm start, refilled per call on a
     /// reordering workspace. Its capacities are the only reason permuting a
@@ -400,7 +407,7 @@ enum FitKind {
     // return a view borrowing from it, so a `MatRef` sourced from a field of
     // that same workspace would be a second mutable borrow for the whole call
     // — a hard error, not a lifetime puzzle. Sibling fields give `fit_on`
-    // disjoint borrows instead, exactly as `GlmmDense` already does below.
+    // disjoint borrows instead, exactly as `Glmm` already does below.
     Ols {
         ws: OlsWorkspace,
         x_mat: Mat<f64>,
@@ -409,7 +416,7 @@ enum FitKind {
         buf: GlmScratchBuf,
         x_mat: Mat<f64>,
     },
-    LmmDense {
+    Lmm {
         ws: LmmWorkspace,
         x_mat: Mat<f64>,
         // Offset-shifted y, filled only when `opts.offset` is set (per-call,
@@ -419,25 +426,22 @@ enum FitKind {
         // so a slice of `ws` cannot also be its `y` argument.
         y_shifted: Vec<f64>,
     },
-    GlmmDense {
+    Glmm {
         ws: GlmmWorkspace,
         x_mat: Mat<f64>,
     },
     /// Routes whose kernel allocates per call and returns a fully-assembled
-    /// `Fit`: the NB routes (GLM-NB, GLMM-NB) and every sparse-routed
-    /// design. `build_workspace` pins the exact kernel here (classify once), but
-    /// the buffers are still allocated per call inside `fit_on` — these routes
-    /// get the routing guarantee without the workspace-reuse win.
+    /// `Fit`: the NB routes (GLM-NB, GLMM-NB), which search `ln θ_NB` as an
+    /// outer coordinate. `build_workspace` pins the exact kernel here (classify
+    /// once), but the buffers are still allocated per call inside `fit_on` —
+    /// these routes get the routing guarantee without the workspace-reuse win.
     Prebuilt(PrebuiltRoute),
 }
 
 #[derive(Clone, Copy)]
 enum PrebuiltRoute {
     GlmNb,
-    GlmmNbDense,
-    LmmSparse,
-    GlmmSparse,
-    GlmmNbSparse,
+    GlmmNb,
 }
 
 #[cfg(test)]
@@ -448,11 +452,38 @@ impl FitWorkspace {
     pub(crate) fn is_glm(&self) -> bool {
         matches!(self.kind, FitKind::Glm { .. })
     }
-    pub(crate) fn is_lmm_dense(&self) -> bool {
-        matches!(self.kind, FitKind::LmmDense { .. })
+    pub(crate) fn is_lmm(&self) -> bool {
+        matches!(self.kind, FitKind::Lmm { .. })
     }
-    pub(crate) fn is_glmm_dense(&self) -> bool {
-        matches!(self.kind, FitKind::GlmmDense { .. })
+    /// Which REML kernel the LMM arm built — the routing bit `classify_design`
+    /// handed [`build_workspace`], readable again after the fact. Both are
+    /// `false` on every non-LMM workspace.
+    pub(crate) fn is_lmm_dense(&self) -> bool {
+        matches!(
+            self.kind,
+            FitKind::Lmm {
+                ws: LmmWorkspace {
+                    kernel: crate::lmm::LmmKernel::Dense { .. },
+                    ..
+                },
+                ..
+            }
+        )
+    }
+    pub(crate) fn is_lmm_sparse(&self) -> bool {
+        matches!(
+            self.kind,
+            FitKind::Lmm {
+                ws: LmmWorkspace {
+                    kernel: crate::lmm::LmmKernel::Sparse { .. },
+                    ..
+                },
+                ..
+            }
+        )
+    }
+    pub(crate) fn is_glmm(&self) -> bool {
+        matches!(self.kind, FitKind::Glmm { .. })
     }
     pub(crate) fn is_prebuilt(&self) -> bool {
         matches!(self.kind, FitKind::Prebuilt(_))
@@ -499,42 +530,40 @@ pub fn build_workspace(
             buf: GlmScratchBuf::new(n_max, p, t),
             x_mat: Mat::<f64>::zeros(n_max.max(1), p.max(1)),
         },
-        (family, Some(re)) => match classify_design(sized, opts.nagq) {
-            Solver::NoZ => match family {
-                Family::Gaussian => {
-                    let slope_cols: Vec<usize> = re.slopes.iter().map(|&c| c as usize).collect();
-                    let extra_slope_cols: Vec<Vec<usize>> = re
-                        .extra_groupings
-                        .iter()
-                        .map(|g| g.slopes.iter().map(|&c| c as usize).collect())
-                        .collect();
-                    FitKind::LmmDense {
-                        ws: LmmWorkspace::for_cluster_spec_ext(
-                            p,
-                            sized,
-                            n_max,
-                            &slope_cols,
-                            &extra_slope_cols,
-                        ),
-                        x_mat: Mat::<f64>::zeros(n_max.max(1), p.max(1)),
-                        y_shifted: vec![0.0f64; n_max.max(1)],
-                    }
-                }
-                Family::NegativeBinomial { .. } => FitKind::Prebuilt(PrebuiltRoute::GlmmNbDense),
+        (family, Some(_)) => {
+            let (slope_cols, extra_slope_cols) = super::glmm::re_slope_cols(sized);
+            let solver = classify_design(sized, opts.nagq);
+            match family {
+                // Every mixed design reaches one entry point per family and
+                // picks its kernel behind it: `fit_lmm` over the dense or the
+                // sparse-Z REML objective, `fit_glmm` over its three `A`-layouts.
+                Family::Gaussian => FitKind::Lmm {
+                    ws: LmmWorkspace::for_cluster_spec_ext(
+                        p,
+                        sized,
+                        n_max,
+                        &slope_cols,
+                        &extra_slope_cols,
+                        solver == Solver::Sparse,
+                    ),
+                    x_mat: Mat::<f64>::zeros(n_max.max(1), p.max(1)),
+                    y_shifted: vec![0.0f64; n_max.max(1)],
+                },
+                Family::NegativeBinomial { .. } => FitKind::Prebuilt(PrebuiltRoute::GlmmNb),
                 _ => {
-                    let slope_cols: Vec<usize> = re.slopes.iter().map(|&c| c as usize).collect();
-                    let ws =
-                        GlmmWorkspace::for_cluster_spec(p, sized, n_max, &slope_cols, opts.nagq);
+                    let ws = GlmmWorkspace::for_cluster_spec_ext(
+                        p,
+                        sized,
+                        n_max,
+                        &slope_cols,
+                        &extra_slope_cols,
+                        opts.nagq,
+                    );
                     let x_mat = Mat::<f64>::zeros(n_max.max(1), p.max(1));
-                    FitKind::GlmmDense { ws, x_mat }
+                    FitKind::Glmm { ws, x_mat }
                 }
-            },
-            Solver::Sparse => match family {
-                Family::Gaussian => FitKind::Prebuilt(PrebuiltRoute::LmmSparse),
-                Family::NegativeBinomial { .. } => FitKind::Prebuilt(PrebuiltRoute::GlmmNbSparse),
-                _ => FitKind::Prebuilt(PrebuiltRoute::GlmmSparse),
-            },
-        },
+            }
+        }
     };
     // `n_clusters_at` — NOT the raw sizing field: under `FixedSize` the field is
     // rows-per-cluster, so reading it directly would pin the shape against a row
@@ -568,6 +597,14 @@ pub fn build_workspace(
                 .collect()
         })
         .unwrap_or_default();
+    // θ width of the kernel this build picked — read off the built groupings, not
+    // off the spec, so it is the length the solver will actually hand back. The
+    // fixed-only and `Prebuilt` routes carry no θ and get an empty buffer.
+    let n_theta = match &kind {
+        FitKind::Lmm { ws, .. } => ws.kernel.groupings().n_theta(),
+        FitKind::Glmm { ws, .. } => ws.n_theta,
+        FitKind::Ols { .. } | FitKind::Glm { .. } | FitKind::Prebuilt(_) => 0,
+    };
     FitWorkspace {
         n_max,
         p,
@@ -580,7 +617,7 @@ pub fn build_workspace(
         has_weights: opts.weights.is_some(),
         has_offset: opts.offset.is_some(),
         parallel_inner: opts.parallel_inner,
-        theta_declared_buf: vec![0.0; crate::consts::MAX_THETA],
+        theta_declared_buf: vec![0.0; 2 * n_theta],
         start_permuted: StartValues {
             beta: Vec::with_capacity(p),
             theta: Vec::with_capacity(crate::consts::MAX_THETA),
@@ -732,7 +769,7 @@ pub fn fit_on<'a>(
             );
             FitView::new(FitViewKind::Glm(v), perm, theta_buf)
         }
-        FitKind::LmmDense {
+        FitKind::Lmm {
             ws: lmm_ws,
             x_mat,
             y_shifted,
@@ -740,12 +777,13 @@ pub fn fit_on<'a>(
             fill_col_major(x_mat, x, n, p);
             // Identity-link offset as the exact y-shift before accumulation
             // (mirrors `fit_mle`); weights fold into the Gram accumulators.
-            // The identical collect lives at `fit/lmm.rs`, `loop_advanced_seam.rs`,
-            // and `sparse/mod.rs`, each carrying a "change together"
-            // comment — what those comments pin is the numerics (offset as an
-            // exact y-shift applied before accumulation), which is unchanged
-            // here; this site only stops allocating, filling the build-once
-            // `y_shifted` buffer with a plain loop instead of a fresh `collect()`.
+            // The identical collect lives at `fit/lmm.rs`'s `fit_mle` and
+            // `loop_advanced_seam.rs`'s `refit_lmm`, each carrying a "change
+            // together" comment — what those comments pin is the numerics
+            // (offset as an exact y-shift applied before accumulation), which is
+            // unchanged here; this site only stops allocating, filling the
+            // build-once `y_shifted` buffer with a plain loop instead of a fresh
+            // `collect()`.
             let y_eff: &[f64] = match &opts.offset {
                 Some(o) => {
                     for i in 0..n {
@@ -765,58 +803,38 @@ pub fn fit_on<'a>(
                 &ids.extra,
                 opts.weights.as_deref(),
             );
-            let v = super::lmm::lmm_run_on(
-                lmm_ws,
-                &opts.target_indices,
-                warm_theta(start),
-                opts.boundary_score,
-            );
+            let v = super::lmm::lmm_run_on(lmm_ws, &opts.target_indices, warm_theta(start));
             FitView::new(FitViewKind::Lmm(v), perm, theta_buf)
         }
-        FitKind::GlmmDense { ws: glmm_ws, x_mat } => {
-            fill_col_major(x_mat, x, n, p);
-            // Reset call-varying option state (mirrors `fit_glmm_build`'s one-time
-            // set, made per-call so a reused ws is correct for the new draw).
-            glmm_ws.parallel_inner = opts.parallel_inner;
-            if let Some(w) = &opts.weights {
-                glmm_ws.prior_w[..n].copy_from_slice(w);
-                glmm_ws.weighted = true;
-            } else {
-                glmm_ws.weighted = false;
+        FitKind::Glmm { ws: glmm_ws, x_mat } => {
+            // Degenerate guard, the twin of `build_on_workspace`'s: the PIRLS
+            // kernels take no width-0 fixed block, and at `n <= p` the fixed
+            // effects are not estimable.
+            if n <= p || p == 0 {
+                let fit = super::glmm::degenerate_glmm_fit(p, glmm_ws.n_theta);
+                let (t_sq, var_diag) = prebuilt_stats(&fit);
+                return FitView::new(
+                    FitViewKind::Prebuilt {
+                        fit,
+                        t_sq,
+                        var_diag,
+                    },
+                    perm,
+                    theta_buf,
+                );
             }
-            glmm_ws.offset = opts.offset.clone();
-            // Refresh the RE column scales for THIS draw's design before Z is
-            // rebuilt from it — mirrors `fit_glmm_build`, and mirrors what
-            // `accumulate_lmm_rows` does on the LMM arm above.
-            glmm_ws
-                .groupings
-                .set_slope_scales(x_mat.as_ref().subrows(0, n), opts.weights.as_deref());
-            // Rebuild Z + the crossed-Schur symbolic factor for this (x, ids)
-            // draw (both are ids-dependent; the ws buffers are reused).
-            build_z(
+            fill_col_major(x_mat, x, n, p);
+            // Per-draw option state, RE column scales, packed M columns and
+            // crossed-Schur symbolic factors — what `accumulate_lmm_rows` does
+            // for the LMM arm above.
+            super::glmm::prep_glmm_design(
                 glmm_ws,
-                x_mat.as_ref().subrows(0, n),
+                x_mat.as_ref(),
                 &ids.primary,
                 &ids.extra,
                 n,
+                opts,
             );
-            glmm_ws.structured_schur = if glmm_ws.groupings.structured_extras_eligible() {
-                StructuredSchur::new(&glmm_ws.groupings, &ids.primary, &ids.extra, n)
-            } else {
-                None
-            };
-            // Observed twin of the crossed-Schur symbolic factor, so the exact β-profile's
-            // adjoint solve can run on `A_obs` without overwriting the Fisher factor every
-            // later pass reads. Built only where the exact profile can read it: a
-            // non-canonical link on the structured route — canonical links never
-            // read it, so building it here would be pure cost on every warm draw.
-            glmm_ws.exact_prof.obs_schur = if glmm_ws.groupings.structured_extras_eligible()
-                && !crate::family::is_canonical(glmm_ws.family)
-            {
-                StructuredSchur::new(&glmm_ws.groupings, &ids.primary, &ids.extra, n)
-            } else {
-                None
-            };
             let v = super::glmm::run_glmm_on(
                 glmm_ws,
                 x_mat.as_ref().subrows(0, n),
@@ -837,44 +855,7 @@ pub fn fit_on<'a>(
             let sized = &ws.sized;
             let fit = match route {
                 PrebuiltRoute::GlmNb => super::glm::fit_glm_nb(x, y, n, p, None, opts).0,
-                PrebuiltRoute::GlmmNbDense => super::glmm::fit_glmm_nb(
-                    x,
-                    y,
-                    n,
-                    p,
-                    sized,
-                    &ids.primary,
-                    &ids.extra,
-                    start,
-                    opts,
-                ),
-                PrebuiltRoute::LmmSparse => crate::sparse::fit_mle_sparse(
-                    x,
-                    y,
-                    n,
-                    p,
-                    sized,
-                    &ids.primary,
-                    &ids.extra,
-                    start,
-                    opts,
-                ),
-                PrebuiltRoute::GlmmSparse => {
-                    crate::sparse::fit_glmm_sparse(
-                        x,
-                        y,
-                        n,
-                        p,
-                        sized,
-                        &ids.primary,
-                        &ids.extra,
-                        f64::NAN,
-                        start,
-                        opts,
-                    )
-                    .0
-                }
-                PrebuiltRoute::GlmmNbSparse => crate::sparse::fit_glmm_nb_sparse(
+                PrebuiltRoute::GlmmNb => super::glmm::fit_glmm_nb(
                     x,
                     y,
                     n,

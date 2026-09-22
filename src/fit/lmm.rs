@@ -1,9 +1,9 @@
 //! LMM (`Family::Gaussian`, `re: Some`) dispatch — marshals `fit_warm`'s
-//! inputs into the dense LMM workspace and calls `fit_lmm`. The numerical
-//! kernel lives in `src/lmm/mod.rs`; this module only builds the workspace,
-//! accumulates sufficient statistics, and maps `LmmFit` back to `Fit`.
+//! inputs into the LMM workspace and calls `fit_lmm`. The numerical kernels
+//! live in `src/lmm/mod.rs` and `src/sparse/mod.rs`; this module only builds
+//! the workspace, accumulates the design, and maps `LmmFit` back to `Fit`.
 
-use crate::lmm::{fit_lmm, LmmFit, LmmGroupings, LmmWorkspace};
+use crate::lmm::{fit_lmm, LmmFit, LmmGroupings, LmmKernel, LmmWorkspace};
 // Used only by the test-only `fit_mle`/`fit_lmm_into` baselines. The stable core
 // reaches the LMM path via `accumulate_lmm_rows`/`lmm_run_on`, which take neither.
 #[cfg(test)]
@@ -23,10 +23,9 @@ use super::{Fit, FitOptions};
 // LMM dispatch (Estimator::Mle)
 // ---------------------------------------------------------------------------
 
-/// Accumulates the θ-independent sufficient statistics (reset + add_rows_multi)
-/// from an already-column-major `x_mat`. Single-sourced across `fit_mle` and
-/// `with_lmm_objective`'s dense arm, which differ only in `weights` and in
-/// whether the guard is written out at the call site. Takes `x_mat` rather than row-major `x` so the `fit_on` hot
+/// Accumulates the θ-independent state of the design into whichever kernel the
+/// workspace holds: the dense sufficient statistics (reset + add_rows_multi),
+/// or a freshly built sparse-Z Gram workspace. Takes `x_mat` rather than row-major `x` so the `fit_on` hot
 /// path can fill a build-once `n_max`-sized buffer and pass a `subrows(0, n)`
 /// view in, instead of allocating a fresh `Mat` every call; the three other
 /// callers (`fit_mle`, `build_lmm_seam_ws`, `refit_lmm`) each build their own
@@ -42,17 +41,44 @@ pub(super) fn accumulate_lmm_rows(
     extra_ids: &[Vec<u32>],
     weights: Option<&[f64]>,
 ) {
-    ws.suff.reset();
-    // Before any row is accumulated: the RE design-column scales are per dataset, and
-    // every slope value the accumulator stores is already divided by them. The
-    // workspace is reused across draws with different `x`, so this is refreshed per
-    // call, not cached at construction — and outside the `n > 0 && p > 0` guard,
-    // because `SuffStats::reset` does not clear the scales and an empty draw would
-    // otherwise leave the previous draw's in place.
-    ws.suff.groupings.set_slope_scales(x_mat, weights);
-    if n > 0 && p > 0 {
-        ws.suff
-            .add_rows_multi(x_mat, y, cluster_ids, extra_ids, weights);
+    match &mut ws.kernel {
+        LmmKernel::Dense { suff, .. } => {
+            suff.reset();
+            // Before any row is accumulated: the RE design-column scales are per dataset, and
+            // every slope value the accumulator stores is already divided by them. The
+            // workspace is reused across draws with different `x`, so this is refreshed per
+            // call, not cached at construction — and outside the `n > 0 && p > 0` guard,
+            // because `SuffStats::reset` does not clear the scales and an empty draw would
+            // otherwise leave the previous draw's in place.
+            suff.groupings.set_slope_scales(x_mat, weights);
+            if n > 0 && p > 0 {
+                suff.add_rows_multi(x_mat, y, cluster_ids, extra_ids, weights);
+            }
+        }
+        LmmKernel::Sparse { g, ws: sparse_ws } => {
+            // Before any Z entry is emitted: `for_each_z_entry` divides every
+            // slope value by its RE column's internal scale, so the scales must
+            // be current for THIS design first.
+            g.set_slope_scales(x_mat, weights);
+            // WLS-style √wᵢ pre-scaling, the same convention `add_rows_multi`
+            // applies on the dense arm: threaded through every z-emission and
+            // raw x/y read in the constructor, so every packed Gram carries
+            // exactly `wᵢ` per row.
+            let sqrt_w: Option<Vec<f64>> = weights.map(|w| w.iter().map(|v| v.sqrt()).collect());
+            // The Gram scatter IS the constructor on this kernel: one pass over
+            // the rows builds `Z'Z`, `Z'[X y]` and `[X y]'[X y]` and sizes every
+            // per-eval buffer.
+            *sparse_ws = Some(Box::new(crate::sparse::SparseLmmWorkspace::new(
+                g,
+                x_mat,
+                cluster_ids,
+                extra_ids,
+                y,
+                n,
+                p,
+                sqrt_w.as_deref(),
+            )));
+        }
     }
 }
 
@@ -72,16 +98,8 @@ pub(crate) struct LmmResultView<'a> {
     groupings: &'a LmmGroupings,
     n_rows: usize,
     /// Spherical conditional modes û at θ̂, or empty when the recovery did not
-    /// run or did not succeed (see `LmmFitScratch::ranef_ok`).
+    /// run or did not succeed.
     ranef_u: &'a [f64],
-    /// Derivative diagnostics, computed in [`lmm_run_on`] (the one place the
-    /// suff stats are in scope): the box-projected θ-gradient ∞-norm of the
-    /// REML criterion at the accepted θ̂ (caller's θ units; NaN when no exact
-    /// gradient — extra slopes, non-converged), and the
-    /// per-θ-coordinate boundary score `½·∂²D/∂θ_jj²·s_j²` (NaN except at
-    /// pinned diagonals). Length `n_theta`.
-    kkt_grad_norm: f64,
-    boundary_score: Vec<f64>,
 }
 
 // Loop-tier read accessors (via the `FitView`/`loop_advanced` surface); the
@@ -104,11 +122,12 @@ impl LmmResultView<'_> {
     pub(crate) fn var_diag(&self) -> &[f64] {
         self.var_diag
     }
-    /// This route's [`FitDiagnostics`] — every field is real here: the dense LMM
-    /// is the one route that reports θ boundary state, per-component pins, AND a
-    /// recorded pivot. The pivot floor is this route's own ([`crate::lmm::PIVOT_MIN`]),
-    /// which sits at the same 1e-12 as OLS/GLM but was calibrated separately and
-    /// stays a separate constant for that reason.
+    /// This route's [`FitDiagnostics`] — every field is real here: the LMM is
+    /// the one route that reports θ boundary state, per-component pins, AND a
+    /// recorded pivot, on both of its kernels. The pivot floor is this route's
+    /// own ([`crate::lmm::PIVOT_MIN`]), which sits at the same 1e-12 as OLS/GLM
+    /// but was calibrated separately and stays a separate constant for that
+    /// reason.
     pub(crate) fn diagnostics(&self) -> FitDiagnostics {
         FitDiagnostics {
             converged: self.fit.converged,
@@ -154,137 +173,24 @@ impl LmmResultView<'_> {
 /// of the results. Caller contract: `ws.suff` holds the accumulated rows
 /// ([`accumulate_lmm_rows`]). Warm start threads `theta` only — the LMM β is
 /// solved exactly given θ, so a β start is irrelevant; `None` (cold) uses the
-/// kernel's THETA0 blind start. `want_score` is `FitOptions::boundary_score`:
-/// the hyper-dual REML Hessian behind the pinned-component score runs only
-/// when asked; the gradient (and `kkt_grad_norm`) runs regardless.
+/// kernel's THETA0 blind start.
 pub(crate) fn lmm_run_on<'a>(
     ws: &'a mut LmmWorkspace,
     target_indices: &[u32],
     theta_start: Option<&[f64]>,
-    want_score: bool,
 ) -> LmmResultView<'a> {
     let fit = fit_lmm(ws, target_indices, theta_start);
 
-    // Derivative diagnostics, from the exact dual-number REML derivatives
-    // (`reml_gradient`/`reml_hessian`). Same box projection, the same opt-in
-    // for the score, and the same `½·H_jj` boundary-score identity as the GLMM
-    // block in `glmm::fit_glmm` — the θ box is the same one
-    // (`blind_theta_and_bounds`), the scales come from the same
-    // `theta_row_scales`, the gradient taking them once and the score twice.
-    // Both scratches live on the workspace (`LmmWorkspace::dual_scratch` /
-    // `hyper_scratch`), built on the first request and reused by every later
-    // fit on the same workspace — a warm refit allocates nothing here. They are
-    // separate slots because the gradient and the score resolve to different
-    // scalar types. `Unsupported` (extra slopes) leaves NaN, and so does an
-    // absent score scratch: `LmmHyperScratch::for_groupings` is `None` above
-    // `n_theta = 12`, where the gradient's own scratch still resolves because
-    // `reml_gradient` chunks.
-    let n_theta = ws.suff.groupings.n_theta();
-    let mut kkt_grad_norm = f64::NAN;
-    let mut boundary_score = vec![f64::NAN; n_theta];
-    if fit.converged {
-        let p = ws.suff.m - 1;
-        // Owned, so it survives the two `&mut ws` destructures below; `diag`
-        // borrows the groupings and has to be re-derived inside each.
-        let sc = ws.suff.groupings.theta_row_scales();
-        if ws.dual_scratch.is_none() {
-            ws.dual_scratch =
-                crate::lmm::LmmDualScratch::for_groupings(n_theta, p, &ws.suff.groupings)
-                    .map(Box::new);
-        }
-        {
-            let LmmWorkspace {
-                suff,
-                theta,
-                dual_scratch,
-                ..
-            } = &mut *ws;
-            if let Some(scratch) = dual_scratch.as_deref_mut() {
-                let mut grad = vec![0.0; n_theta];
-                let st = crate::lmm::reml_gradient(&theta[..n_theta], suff, scratch, &mut grad);
-                if matches!(st, crate::glmm::DerivStatus::Ok(_)) {
-                    let mut acc = 0.0_f64;
-                    for j in 0..n_theta {
-                        let gj = grad[j];
-                        let (lo, hi) = (-crate::lmm::THETA_HI, crate::lmm::THETA_HI);
-                        // Projected gradient on a box, in the internal θ̃ where the
-                        // box lives; back-mapped by ×s_j (∂D/∂θ = s·∂D/∂θ̃) — see
-                        // the GLMM twin for the derivation.
-                        let pj = if theta[j] <= lo {
-                            gj.min(0.0)
-                        } else if theta[j] >= hi {
-                            gj.max(0.0)
-                        } else {
-                            gj
-                        };
-                        acc = acc.max((pj * sc[j]).abs());
-                    }
-                    kkt_grad_norm = acc;
-                }
-            }
-        }
-        if fit.pinned_components != 0 && want_score {
-            if ws.hyper_scratch.is_none() {
-                ws.hyper_scratch =
-                    crate::lmm::LmmHyperScratch::for_groupings(n_theta, p, &ws.suff.groupings)
-                        .map(Box::new);
-            }
-            let LmmWorkspace {
-                suff,
-                theta,
-                hyper_scratch,
-                ..
-            } = &mut *ws;
-            if let Some(scratch) = hyper_scratch.as_deref_mut() {
-                let g = &suff.groupings;
-                let diag = g.diagonal_theta();
-                let mut grad = vec![0.0; n_theta];
-                let mut hess = faer::Mat::<f64>::zeros(n_theta, n_theta);
-                let st = crate::lmm::reml_hessian(
-                    &theta[..n_theta],
-                    suff,
-                    scratch,
-                    &mut grad,
-                    &mut hess,
-                );
-                if matches!(st, crate::glmm::DerivStatus::Ok(_)) {
-                    for (kk, &ti) in diag.iter().enumerate() {
-                        if kk < u64::BITS as usize
-                            && (fit.pinned_components >> kk) & 1 == 1
-                            && !g.diagonal_has_nonzero_below(kk, &theta[..n_theta])
-                        {
-                            // s = θ_jj², θ̃ = sc·θ ⇒ dD/ds = sc²·dD/ds̃: the
-                            // score takes the SQUARE of the scale. Valid only
-                            // where the deviance is even in θ_jj at θ_jj = 0
-                            // — see `LmmGroupings::diagonal_has_nonzero_below`
-                            // for why a non-zero entry below the diagonal
-                            // breaks that. `canonicalize_pinned_blocks` runs
-                            // after the pin loop and zeroes that column, so
-                            // this gate never fires; it is defensive only.
-                            boundary_score[ti] = 0.5 * hess[(ti, ti)] * sc[ti] * sc[ti];
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     LmmResultView {
-        ranef_u: if ws.fit.ranef_ok {
-            &ws.fit.ranef_u[..ws.suff.groupings.k_total]
-        } else {
-            &[]
-        },
+        ranef_u: ws.kernel.ranef_u(),
         fit,
-        betas: &ws.fit.betas,
-        var_diag: &ws.fit.var_diag,
-        t_sq: &ws.fit.t_sq,
-        factor: ws.fit.factor.as_ref(),
+        betas: &ws.recovery.betas,
+        var_diag: &ws.recovery.var_diag,
+        t_sq: &ws.recovery.t_sq,
+        factor: ws.kernel.factor(),
         theta: &ws.theta,
-        groupings: &ws.suff.groupings,
-        n_rows: ws.suff.n_rows,
-        kkt_grad_norm,
-        boundary_score,
+        groupings: ws.kernel.groupings(),
+        n_rows: ws.kernel.n_rows(),
     }
 }
 
@@ -384,21 +290,7 @@ pub(crate) fn lmm_view_to_fit(
         (vec![], vec![])
     };
 
-    let mut diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
-    // Derivative diagnostics, computed in `lmm_run_on` and carried on the
-    // view (they do not pass through `FitDiagnostics` — same routing rule as
-    // the GLMM side, see `fit/glmm.rs`). Both are NaN/empty already when the
-    // fit did not converge (`lmm_run_on` gates the computation on it).
-    diagnostics.kkt_grad_norm = view.kkt_grad_norm;
-    // `pinned_scores` is keyed to `diagonal_theta` order like `pinned_flags`,
-    // so collapse the θ-coordinate buffer onto the diagonals first.
-    let diag_scores: Vec<f64> = view
-        .groupings
-        .diagonal_theta()
-        .iter()
-        .map(|&ti| view.boundary_score[ti])
-        .collect();
-    diagnostics.boundary_score = super::common::pinned_scores(&diag_scores, &varcorr);
+    let diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
     let mut fit = Fit {
         beta,
         se,
@@ -458,22 +350,19 @@ pub(super) fn fit_lmm_into(
     opts: &FitOptions,
     start: Option<&StartValues>,
 ) -> Fit {
-    let view = lmm_run_on(
-        ws,
-        &opts.target_indices,
-        warm_theta(start),
-        opts.boundary_score,
-    );
+    let view = lmm_run_on(ws, &opts.target_indices, warm_theta(start));
     lmm_view_to_fit(&view, x, ids, n, p, opts)
 }
 /// LMM dispatch adapter. `cluster_ids`/`extra_ids` are the per-row level ids from
 /// the entry's [`GroupIds`]; `model` is the sizing-corrected spec (counts derived
 /// from those ids). Slope x-columns come from `model.re`. Mirrors `fit_glmm`.
+/// `sparse` picks the kernel outright instead of asking `classify_design`, which
+/// is what makes this a forced baseline on either side of the router.
 /// Test-only baseline since the stable path dispatches through the unified core
 /// ([`super::core::fit_on`]) over `accumulate_lmm_rows`/`lmm_run_on`.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)] // marshals the kernel's (x, y, n, p, spec, ids…) surface
-pub(super) fn fit_mle(
+fn fit_mle(
     x: &[f64],
     y: &[f64],
     n: usize,
@@ -483,6 +372,7 @@ pub(super) fn fit_mle(
     extra_ids: &[Vec<u32>],
     start: Option<&StartValues>,
     opts: &FitOptions,
+    sparse: bool,
 ) -> Fit {
     let re = model
         .re
@@ -500,10 +390,12 @@ pub(super) fn fit_mle(
         .collect();
 
     // Build workspace — allocates solver, suff-stats, fit scratch for this model shape
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, model, n, &slope_cols, &extra_slope_cols);
-    // Identity-link offset is an exact y-shift before accumulation (the suff
-    // stats are the only place raw y enters) — mirrors `fit_ols` / the sparse
-    // `fit_mle_sparse`; change together.
+    let mut ws =
+        LmmWorkspace::for_cluster_spec_ext(p, model, n, &slope_cols, &extra_slope_cols, sparse);
+    // Identity-link offset is an exact y-shift before accumulation (the Grams
+    // are the only place raw y enters) — the same convention `fit_ols` applies.
+    // Mirrored by `fit::core`'s `Lmm` arm and `loop_advanced_seam.rs`'s
+    // `refit_lmm` — change together.
     let y_shifted: Vec<f64>;
     let y_eff: &[f64] = match &opts.offset {
         Some(o) => {
@@ -530,11 +422,11 @@ pub(super) fn fit_mle(
     };
     fit_lmm_into(&mut ws, x, &ids, n, p, opts, start)
 }
-/// Test-only forced-NoZ entry (mirror of forcing `fit_mle_sparse` directly):
-/// the NoZ↔Sparse cross-checks and timed sweeps must reach the dense kernel
-/// regardless of where `classify_design`'s performance boundary sits — going
-/// through `fit_cold` would compare Sparse against itself on any cell the
-/// router sends to Sparse. Takes the sizing-corrected spec, like `fit_mle`.
+/// Test-only forced-NoZ entry: the NoZ↔Sparse cross-checks and timed sweeps
+/// must reach the dense kernel regardless of where `classify_design`'s
+/// performance boundary sits — going through `fit_cold` would compare Sparse
+/// against itself on any cell the router sends to Sparse. Takes the
+/// sizing-corrected spec, like `fit_mle`.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)] // marshals the same surface as fit_mle
 pub(crate) fn fit_mle_noz_pub(
@@ -548,5 +440,35 @@ pub(crate) fn fit_mle_noz_pub(
     start: Option<&StartValues>,
     opts: &FitOptions,
 ) -> Fit {
-    fit_mle(x, y, n, p, sized, cluster_ids, extra_ids, start, opts)
+    fit_mle(
+        x,
+        y,
+        n,
+        p,
+        sized,
+        cluster_ids,
+        extra_ids,
+        start,
+        opts,
+        false,
+    )
+}
+
+/// Test-only forced-sparse entry, the twin of [`fit_mle_noz_pub`]: the sparse
+/// kernel is a superset of the dense one, so the cross-checks drive it on
+/// in-envelope designs the router would otherwise send to the dense kernel.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)] // marshals the same surface as fit_mle
+pub(crate) fn fit_mle_sparse_pub(
+    x: &[f64],
+    y: &[f64],
+    n: usize,
+    p: usize,
+    sized: &ModelSpec,
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    start: Option<&StartValues>,
+    opts: &FitOptions,
+) -> Fit {
+    fit_mle(x, y, n, p, sized, cluster_ids, extra_ids, start, opts, true)
 }

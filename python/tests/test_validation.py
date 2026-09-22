@@ -59,6 +59,13 @@ def test_cloglog_glm_fits():
     assert result.dispersion == 1.0
 
 
+def test_probit_glm_fits():
+    result = glmm.fit(FIT_DATA, "y_bin ~ x", "binomial", link="probit")
+    assert result.converged
+    assert len(result.beta) == 2
+    assert result.dispersion == 1.0
+
+
 def test_inversegaussian_mixed_raises():
     # GLM-only family: a mixed formula must be a clean Python error,
     # never a kernel panic.
@@ -84,6 +91,16 @@ def test_inversegaussian_dispersion_estimate_is_accepted():
 def test_wald_se_invalid_raises():
     with pytest.raises(ValueError, match="wald_se"):
         glmm.fit(DATA, "y ~ x", wald_se="observed")
+
+
+def test_wald_se_rx_reaches_the_kernel():
+    # "rx" bypasses the joint Hessian entirely: unlike the wald_se="hessian"
+    # default, stddev_se is never filled on this route (Fit.stddev_se's own
+    # docstring: "NaN where unavailable").
+    result = glmm.fit(FIT_DATA, "y_bin ~ x + (1 | g)", "binomial", wald_se="rx")
+    assert result.converged
+    assert _np.all(_np.isfinite(result.se))
+    assert _np.all(_np.isnan(result.stddev_se))
 
 
 @pytest.mark.parametrize("nagq", [0, 2, 4, 26, 27, -1, 1.0])
@@ -235,3 +252,26 @@ def test_clean_call_emits_no_warnings_and_fits():
             warm_start={"beta": [0.0, 0.0], "theta": [1.0]},
         )
     assert result.converged
+
+
+def test_wrong_length_weights_is_an_ffi_level_valueerror():
+    # `fit()` does no length check of its own on `weights=`/`offset=` — it
+    # hands the list straight to the kernel (glmm/__init__.py's `_native.fit`
+    # call), which asserts the length and surfaces the assertion as a
+    # ValueError through catch_unwind, not as a wrapper-level message.
+    with pytest.raises(ValueError, match="weights"):
+        glmm.fit(DATA, "y ~ x", weights=[1.0, 2.0])
+
+
+def test_wrong_length_offset_is_an_ffi_level_valueerror():
+    with pytest.raises(ValueError, match="offset"):
+        glmm.fit(DATA, "y ~ x", offset=[1.0, 2.0])
+
+
+def test_nan_in_numeric_column_is_rejected_by_the_kernel_entry_check():
+    # `float(v)` in the numeric-column pass converts a NaN through with no
+    # finiteness check of its own; the kernel's entry check on `x` is what
+    # rejects it, and that fault surfaces here as a ValueError.
+    data = {"y": [1.0, 2.0, 3.0, 4.0], "x": [0.0, 1.0, float("nan"), 3.0]}
+    with pytest.raises(ValueError, match="x must be finite"):
+        glmm.fit(data, "y ~ x")

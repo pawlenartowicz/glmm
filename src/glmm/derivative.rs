@@ -16,35 +16,43 @@
 //! — a routing answer, not an error — in exactly three cases. Each names the
 //! caller's own fallback:
 //!
-//! - **(a) [`supports_shape`] is false** — an extras design the dual kernel
-//!   has no exact derivative for: an oversized core
-//!   (`!structured_extras_eligible()`), the shape `deviance.rs` sends to the
-//!   dense `pirls_solve` fallback. `supports_shape` also refuses a crossed tail
-//!   wider than [`DUAL_TAIL_MAX`], but that clause is currently unreachable:
-//!   `DUAL_TAIL_MAX` is pinned at `MAX_CROSSED_LEVELS`, and `classify_design`
-//!   routes anything wider to the sparse solver, which never enters this
-//!   module. Every other extras shape — nested-only, and crossed up to the cap
-//!   — IS differentiated here, through `structured_laplace_deviance` over the
-//!   same `pirls_solve_blocked_extras` (`pirls/blocked_extras.rs:208`) the
-//!   `f64` fit path runs. Checked first in both entry points' routing gate,
-//!   before `m` is even computed. Caller fallback: the FD Hessian
-//!   (`se::joint_hessian_cov`, `se.rs:257`) for the SE path, BOBYQA on the
-//!   objective for the optimizer.
+//! - **(a) [`supports_shape`] is false** — the packed-row layout
+//!   (`GlmmLayout::Packed`), the one kernel with no dual twin.
+//!   `GlmmLayout::for_design` sends two families of design there: every design
+//!   `classify_design` answers `Solver::Sparse` for (past the dense envelope,
+//!   slopes on an extra grouping, more than `MAX_CROSSED_LEVELS` crossed
+//!   levels), and an in-envelope extras design whose core block is too wide for
+//!   the structured route (`!structured_extras_eligible()`). `supports_shape`
+//!   also refuses a STRUCTURED design whose crossed tail is wider than
+//!   [`DUAL_TAIL_MAX`], but that clause never fires: `DUAL_TAIL_MAX` is pinned
+//!   at `MAX_CROSSED_LEVELS`, so such a design is `Packed` already and is
+//!   refused on the layout first. Every blocked and every structured shape IS
+//!   differentiated here — the structured ones through
+//!   `structured_laplace_deviance` over the same `pirls_solve_blocked_extras`
+//!   the `f64` fit path runs. Checked first in both entry points' routing gate,
+//!   before `m` is even computed. Caller fallback: on the SE path
+//!   `se::joint_hessian_cov` asks `assembled::joint_hessian` first, and that
+//!   engine DOES take the packed-row layout, so the stencil
+//!   (`se::packed_fd_hessian_cov`) is reached only where the assembled pass
+//!   declines as well; the optimizer runs BOBYQA on the objective.
 //! - **(b) `m = n_theta + p > MAX_DUAL_N` (12)** — for the **Hessian only**
-//!   (`NLanes::pick`), with the same caller fallbacks as (a). The gradient is
-//!   not refused there: it runs in `⌈m / 12⌉` passes of at most 12 seeded
-//!   coordinates on the top rung, each pass writing its own slice of `grad`.
-//!   The Hessian cannot do the same — a second-derivative block spanning two
-//!   chunks needs both coordinates' first-order lanes live in the same pass,
-//!   which is `2N` lanes, the cap again — so it keeps the FD stencil
-//!   (`se::joint_hessian_cov`) above 12.
-//! - **(c) the dense `pirls_solve` fallback route** (`deviance.rs`'s
-//!   "Non-eligible extras (oversized core)" arm, `deviance.rs:557`) — is
-//!   **(a)'s first clause, not a separate guard.** That arm runs exactly when
-//!   `extra_offsets` is non-empty AND `groupings.structured_extras_eligible()`
-//!   is false, which is the shape `supports_shape` rejects; the two conditions
-//!   are the same condition. Named here so the fallback table stays complete
-//!   against `deviance.rs`'s own three-way routing.
+//!   (`NLanes::pick`). The gradient is not refused there: it runs in
+//!   `⌈m / 12⌉` passes of at most 12 seeded coordinates on the top rung, each
+//!   pass writing its own slice of `grad`. This module's second-order pass
+//!   cannot do the same — a second-derivative block spanning two chunks needs
+//!   both coordinates' first-order lanes live in the same pass, which is `2N`
+//!   lanes, the cap again. The caller's fallback here is not the FD stencil:
+//!   `se::joint_hessian_cov` asks `assembled::joint_hessian` first, and that
+//!   pass reads second-order information off FIRST-order lanes, so it chunks
+//!   like a gradient and covers every `m`. This clause is a statement about
+//!   the hyper-dual pass, not about whether an exact Hessian exists.
+//! - **(c) the packed-row layout** (`deviance.rs`'s `GlmmLayout::Packed` arm)
+//!   — is **(a) itself, not a separate guard.** `supports_shape` refuses
+//!   `Packed` on the layout alone, and `deviance.rs` takes that arm on exactly
+//!   the designs `GlmmLayout::for_design` maps to `Packed` — the
+//!   `Solver::Sparse` ones and the oversized-core extras ones alike. Named here
+//!   so the fallback table stays complete against `deviance.rs`'s own
+//!   three-way routing.
 //!
 //! **Memory is never a fallback reason.** There is no byte budget (see
 //! `MAX_DUAL_N`'s own doc comment) — bigger buffers are allowed wherever they
@@ -62,7 +70,9 @@
 use super::agq::{agq_deviance, agq_deviance_vec, ClusterRowIndex};
 use super::deviance::{blocked_laplace_deviance, structured_laplace_deviance};
 use super::pirls::{obs_len, BetaStep, DualStep, TailKernel};
-use super::workspace::GlmmWorkspace;
+use super::workspace::{
+    FitData, GlmmLayout, GlmmWorkspace, PirlsScratch, StructuredPattern, StructuredScratch,
+};
 use crate::dual::{Dual, HyperDual};
 use crate::lmm::LmmGroupings;
 use crate::scalar::Scalar;
@@ -86,40 +96,18 @@ pub(crate) enum DerivStatus {
 }
 
 /// The θ-dependent buffers `blocked_laplace_deviance` and the AGQ kernels write,
-/// at a non-`f64` scalar. Mirrors the `GlmmWorkspace` fields of the same names —
-/// change together with the workspace's sizing block (`workspace.rs:495-571`).
+/// at a non-`f64` scalar: [`PirlsScratch`] and [`StructuredScratch`]
+/// instantiated at `T`, sized by the same two constructors the `f64` workspace
+/// uses (`PirlsScratch::for_shape`, `StructuredScratch::for_shape`).
 pub(crate) struct GlmmDualBufs<T: Scalar> {
-    pub(super) params: Vec<T>,    // m (seeded per call)
-    pub(super) beta: Vec<T>,      // p
-    pub(super) lam: Vec<T>,       // q_p²
-    pub(super) m_buf: Vec<T>,     // rows · q_p
-    pub(super) eta: Vec<T>,       // rows
-    pub(super) prob: Vec<T>,      // rows
-    pub(super) w: Vec<T>,         // rows
-    pub(super) u: Vec<T>,         // k
-    pub(super) u_prev: Vec<T>,    // k.max(1)
-    pub(super) eta_fixed: Vec<T>, // rows
-    pub(super) a_blocks: Vec<T>,  // s · q_p²
-    pub(super) a_rhs: Vec<T>,     // k
-    // Same shape rule as the f64 `ws.agq_scratch` (`workspace.rs:415-426`):
-    // `2·s + nagq^q_p·(q_p+1)` at q_p ≥ 2, `4·s` at q_p == 1, `.max(1)`.
-    // Read by `agq_deviance`/`agq_deviance_vec` when `ws.nagq > 1`;
-    // allocated but untouched on every model shape that takes the blocked
-    // path instead.
-    pub(super) agq_scratch: Vec<T>,
-    // Structured-extras twins, sized exactly as `GlmmWorkspace::from_groupings`
-    // sizes their f64 namesakes (`workspace.rs:562-570`) — `q_core = primary_q
-    // + nested_per_parent`, `e = k_crossed()`, `G_cap = MAX_EXTRA_GROUPINGS`.
-    // Untouched (and at their `.max(1)` minimum) on the no-extras blocked path,
-    // which is why they are sized here rather than lazily: the zero-alloc gate
-    // is about repeat calls, and a lazy first-extras-call allocation would
-    // break it on the very shape it is meant to cover.
-    pub(super) mu: Vec<T>,          // rows
-    pub(super) core_blocks: Vec<T>, // (q_core² · s).max(1)
-    pub(super) coupling: Vec<T>,    // (q_core · s · e).max(1)
-    pub(super) schur_blk: Vec<T>,   // (e²).max(1)
-    pub(super) m_core_buf: Vec<T>,  // (rows · q_core).max(1)
-    pub(super) cross_val: Vec<T>,   // (rows · G_cap).max(1)
+    pub(super) params: Vec<T>, // m (seeded per call)
+    pub(super) beta: Vec<T>,   // p
+    pub(super) pirls: PirlsScratch<T>,
+    /// Sized via `StructuredScratch::for_shape` even on the no-extras blocked
+    /// path, where every field sits at its `.max(1)` minimum: the zero-alloc
+    /// gate is about repeat calls, and a lazy first-extras-call allocation
+    /// would break it on the very shape it is meant to cover.
+    pub(super) structured: StructuredScratch<T>,
     // Per-solve controls handed to every dual kernel call; see `pirls::DualStep`.
     // Carries the blocked twin's scratch (`obs_blocks`, `s · q_p²`) and the
     // structured twin's (`obs_core_blocks` `(q_core² · s).max(1)`,
@@ -137,36 +125,6 @@ pub(crate) struct GlmmDualBufs<T: Scalar> {
     pub(super) asm: super::assembled::AssemblyBufs<T>,
 }
 
-/// The `T`-independent half of a structured-extras call: the per-row extra
-/// level ids and the packed-M / coupling-CSR pattern buffers, borrowed from the
-/// `GlmmWorkspace` rather than mirrored at `T`. They are `&mut` because the
-/// CSR refresh rewrites them when the cache key changes.
-///
-/// **The pattern is shared; the values are not, and the two can disagree in
-/// width.** The pin skip in `build_packed_m` and the pin mask in
-/// `structured_laplace_deviance` are both `f64`-only, so at a θ̂ with a pinned
-/// crossed grouping the pattern a DUAL call builds is WIDER than the one an
-/// `f64` call builds — while `cross_val` lives in `GlmmDualBufs<T>` and stays
-/// dual-private. On return from a derivative call `ws.cross_col` / `ws.n_cross`
-/// can therefore name slots `ws.cross_val` never filled.
-///
-/// The rule that keeps that safe: **every `f64` reader of the
-/// `cross_col`/`n_cross`/`cross_val` triple must run an `f64` deviance
-/// evaluation of its own first.** There is one such reader,
-/// `se::structured_schur_fill`, and it is reached only after
-/// `joint_hessian_cov`'s `fallback!()` central `fd_eval` or after the pinned
-/// re-eval in `glmm/mod.rs` — both of which re-pack the triple at γ̂. Breaking
-/// the rule does not panic: the reader would pick up a stale `cross_val` left
-/// by an earlier optimizer trial and return a plausible wrong SE.
-struct ExtrasPattern<'a> {
-    extra_ids: &'a [Vec<u32>],
-    cross_col: &'a mut [u32],
-    n_cross: &'a mut [u8],
-    coup_cols: &'a mut [u32],
-    coup_ptr: &'a mut [u32],
-    coup_mask: &'a mut Option<u32>,
-}
-
 /// `f64` mode-transfer buffers for one dual-scratch variant, sized once in
 /// `for_shape` alongside its `GlmmDualBufs<T>` and kept as a SEPARATE tuple
 /// field of [`GlmmDualScratch`] rather than folded into `GlmmDualBufs<T>`
@@ -181,12 +139,12 @@ struct ExtrasPattern<'a> {
 /// before this, `laplace_gradient`/`laplace_hessian` built a fresh `saved_u`
 /// and `u_mode` `Vec` on every single call.
 pub(crate) struct GlmmModeBufs {
-    /// `f64` snapshot of `ws.u[..k.max(1)]` taken right before the mode solve
-    /// mutates `ws.u` in place, and copied back after so the workspace's fit
+    /// `f64` snapshot of `ws.pirls.u[..k.max(1)]` taken right before the mode solve
+    /// mutates `ws.pirls.u` in place, and copied back after so the workspace's fit
     /// state comes back as found — same role the removed local `saved_u`
     /// played.
     pub(super) saved_u: Vec<f64>,
-    /// The converged PIRLS mode `ws.u[..k]`, copied out of `ws.u` once per
+    /// The converged PIRLS mode `ws.pirls.u[..k]`, copied out of `ws.pirls.u` once per
     /// call before the dual kernel(s) below read it as `run_gradient`'s /
     /// `run_hessian`'s `u_mode` argument — same role the removed local
     /// `u_mode` played.
@@ -334,15 +292,17 @@ impl GlmmDualScratch {
     /// `max|u − u_prev|` over the value parts of the buffers the last dual
     /// kernel call left — how far that call's final PIRLS step moved.
     ///
-    /// The Laplace objective is built at `u_prev` and penalized at `u`, so
-    /// this distance is the size of the iterate mix whatever differentiated
-    /// those buffers was differentiating. A pass entered with a step floor
+    /// The Laplace objective is built entirely at `u`, so this distance
+    /// measures how converged that call left the mode, not a mismatch between
+    /// the objective's terms. A pass entered with a step floor
     /// (`DualStep::min_iters`) exits at a different distance from one entered
     /// without, which is the one thing the two Hessian passes do not share.
     pub(crate) fn exit_mode_step(&self) -> f64 {
         fn step<T: Scalar>(b: &GlmmDualBufs<T>) -> f64 {
-            b.u.iter()
-                .zip(&b.u_prev)
+            b.pirls
+                .u
+                .iter()
+                .zip(&b.pirls.u_prev)
                 .map(|(a, c)| (a.value() - c.value()).abs())
                 .fold(0.0, f64::max)
         }
@@ -362,11 +322,15 @@ impl GlmmDualScratch {
 }
 
 /// Largest instantiated FIRST-derivative lane count. `NLanes::pick` rounds `m`
-/// up to this; above it the gradient runs in `⌈m / MAX_DUAL_N⌉` passes of at
-/// most `MAX_DUAL_N` seeded coordinates on this same top rung, while the
-/// Hessian is `DerivStatus::Unsupported` (it cannot chunk — a cross-chunk
-/// second-derivative block needs both coordinates' first-order lanes live in
-/// one pass). Mirrors the `GlmmDualScratch` variants —
+/// up to this; above it a first-order request runs in `⌈m / MAX_DUAL_N⌉`
+/// passes of at most `MAX_DUAL_N` seeded coordinates on this same top rung.
+/// The gradient chunks that way here, and so does the joint Hessian in
+/// `assembled.rs`, which reads second-order information off FIRST-order lanes.
+/// This module's hyper-dual Hessian cannot — a cross-chunk second-derivative
+/// block needs both coordinates' first-order lanes live in one pass — so
+/// `NLanes::pick(m, true)` and `laplace_hessian` return
+/// `DerivStatus::Unsupported` above the cap and the caller takes the assembled
+/// pass. Mirrors the `GlmmDualScratch` variants —
 /// change together, along with `lmm::kernel::LmmDualScratch`/
 /// `LmmHyperScratch::for_groupings` and `MAX_DUAL_H` below, all of which
 /// hardcode the same lane set.
@@ -392,8 +356,8 @@ const _: () = assert!(MAX_DUAL_H == MAX_DUAL_N * (MAX_DUAL_N + 1) / 2);
 /// exact-Hessian step (`pirls::DualStep`: canonical `A`, or the
 /// observed-information `A_obs` on a non-canonical link), so the IFT lanes are
 /// reached in one step and the loop is skipped. It is entered on
-/// `DualStep::exact == false`, which is either a row on one of the kernel's
-/// clamps (`pirls::clamped_row_present`) or a non-PD observed factor — one
+/// `DualStep::exact == false`, which is either a row on the kernel's μ clamp
+/// (`pirls::clamped_row_present`) or a non-PD observed factor — one
 /// block on the blocked path, the whole crossed-tail Schur on the
 /// structured-extras path. There the lanes contract by
 /// `‖I − A⁻¹h_uu‖` per step; a Fisher-only fallback needed 5–7
@@ -431,16 +395,25 @@ pub(crate) const MAX_DUAL_REFINEMENTS: usize = 12;
 /// measurement.
 pub(crate) const DUAL_TAIL_MAX: usize = crate::consts::MAX_CROSSED_LEVELS;
 
-/// Shapes the dual kernel can differentiate: the no-extras blocked path, or the
-/// structured extras path with a crossed tail the dense generic factor can
-/// carry. Nested-only designs have `k_crossed() == 0` and are always in.
+/// Shapes the dual kernel can differentiate: the blocked layout, or the
+/// structured layout with a crossed tail the dense generic factor can carry.
+/// Nested-only designs have `k_crossed() == 0` and are always in. The packed-row
+/// layout is out — there is no dual twin of its kernel.
 ///
-/// The one owner of this question — `laplace_gradient`, `laplace_hessian`, the
-/// exact-Hessian SE branch and the diagnostics all call it, so they can never
-/// drift apart. Widening it is a hand-adjoint change (the regime above the
+/// One of the TWO owners of the layout question, and the one that answers
+/// "is there a dual twin of this layout's PIRLS kernel": `laplace_gradient`
+/// and `laplace_hessian` route on this alone, so they can never drift apart.
+/// The other owner is `assembled::assembly_routes`, which answers "does the
+/// assembled engine run here" and takes the packed-row layout this one
+/// refuses; the exact-Hessian SE branch (`se::joint_hessian_cov`) reads both.
+/// Widening this one is a hand-adjoint change (the regime above the
 /// boundary), not a local edit at a call site.
-pub(crate) fn supports_shape(g: &LmmGroupings) -> bool {
-    g.extra_offsets.is_empty() || (g.structured_extras_eligible() && g.k_crossed() <= DUAL_TAIL_MAX)
+pub(crate) fn supports_shape(layout: GlmmLayout, g: &LmmGroupings) -> bool {
+    match layout {
+        GlmmLayout::Blocked => true,
+        GlmmLayout::Structured => g.k_crossed() <= DUAL_TAIL_MAX,
+        GlmmLayout::Packed => false,
+    }
 }
 
 /// Which instantiated `(order, N)` pair a derivative request resolves to.
@@ -470,11 +443,12 @@ impl NLanes {
     /// first, exposed here so a caller that only needs the routing decision
     /// (not the allocation) can make it.
     pub(crate) fn pick(m: usize, hessian: bool) -> Option<NLanes> {
-        // Only the Hessian is capped. A gradient above the top rung runs in
-        // `⌈m / N⌉` passes of at most `N` seeded coordinates, so the top rung
-        // covers every `m`; a Hessian cannot chunk, because a cross-chunk
-        // second-derivative block needs both coordinates' first-order lanes
-        // live in the same pass, which is `2N` lanes — the cap again.
+        // Only the second-order request is capped. A first-order one above the
+        // top rung runs in `⌈m / N⌉` passes of at most `N` seeded coordinates,
+        // so the top rung covers every `m`; a second-order pass cannot chunk,
+        // because a cross-chunk second-derivative block needs both
+        // coordinates' first-order lanes live in the same pass, which is `2N`
+        // lanes — the cap again.
         if hessian && m > MAX_DUAL_N {
             return None;
         }
@@ -493,12 +467,13 @@ impl NLanes {
     }
 }
 
-/// Scratch length for `agq_scratch`, mirroring the f64 `ws.agq_scratch` field's
-/// shape rule exactly (`workspace.rs:415-426`): the vector kernel (`q_p ≥ 2`)
-/// needs `2·s` (center loglik | running log-sum) plus a per-eval product-grid
-/// node table of `nagq^q_p · (q_p+1)`; the scalar kernel (`q_p == 1`) needs
-/// `4·s` (center loglik | node u_cj | per-node loglik | running log-sum).
-fn agq_len(s: usize, q_p: usize, nagq: u8) -> usize {
+/// Scratch length for `agq_scratch`, mirroring the f64 `ws.pirls.agq_scratch` field's
+/// shape rule exactly: the vector kernel (`q_p ≥ 2`) needs `2·s` (center loglik |
+/// running log-sum) plus a per-eval product-grid node table of `nagq^q_p · (q_p+1)`;
+/// the scalar kernel (`q_p == 1`) needs `4·s` (center loglik | node u_cj | per-node
+/// loglik | running log-sum). `nagq=1` shapes never reach the vector kernel, so
+/// their `k^q=1` table is a harmless `q+1` slots.
+pub(super) fn agq_len(s: usize, q_p: usize, nagq: u8) -> usize {
     if q_p >= 2 {
         let kq = (nagq as usize).pow(q_p as u32);
         (2 * s + kq * (q_p + 1)).max(1)
@@ -535,6 +510,7 @@ pub(super) fn agq_eligible(family: Family, nagq: u8, primary_q: usize) -> bool {
 /// function of `m`, `k`, `rows`, `s`, `q_core` or `e`, each already pinned
 /// above. `assembly` says which of the two cases the caller's variant is:
 /// the `Dual` rungs carry the sized set, the `HyperDual` rungs an empty one.
+/// The packed sub-struct adds `rows·width`, pinned here through `m_vals`.
 /// Lengths only: the `ClusterRowIndex` built from `cluster_ids` is not
 /// covered — same-shape data with different cluster assignment is still the
 /// caller's responsibility.
@@ -553,32 +529,106 @@ fn bufs_match_shape<T: Scalar>(
     // Whether this fit takes the observed-information step (`!is_canonical`),
     // which is what decides whether the `DualStep` twins carry storage.
     observed: bool,
+    // Packed-row width on `GlmmLayout::Packed`, 0 on every other layout — the
+    // same discriminator `for_shape` sizes from.
+    packed_width: usize,
     // True on the `Dual` rungs, where the assembly runs and its scratch is
     // sized; false on the `HyperDual` rungs, which carry none.
     assembly: bool,
 ) -> bool {
+    let d = DenseTwinShape::of(packed_width, k, rows, s, q_p, q_core, e, observed);
     b.params.len() == m
         && b.beta.len() == p
-        && b.lam.len() == q_p * q_p
-        && b.m_buf.len() == rows * q_p
-        && b.eta.len() == rows
-        && b.u.len() == k
-        && b.a_blocks.len() == s * q_p * q_p
-        && b.agq_scratch.len() == agq_len(s, q_p, nagq)
-        && b.core_blocks.len() == (q_core * q_core * s).max(1)
-        && b.schur_blk.len() == (e * e).max(1)
+        && b.pirls.lam.len() == d.q_p * d.q_p
+        && b.pirls.m_buf.len() == d.rows * d.q_p
+        && b.pirls.eta.len() == d.rows
+        && b.pirls.u.len() == d.k.max(1)
+        && b.pirls.a_blocks.len() == (d.s * d.q_p * d.q_p).max(1)
+        && b.pirls.agq_scratch.len() == agq_len(d.s, d.q_p, nagq)
+        && b.structured.core_blocks.len() == (d.q_core * d.q_core * d.s).max(1)
+        && b.structured.schur_blk.len() == (d.e * d.e).max(1)
         // `obs_core_blocks` pins `q_core` (and with it `obs_coupling`),
         // `obs_schur_blk` pins `e`; `u`'s `k` and `eta`'s `rows`, already
         // checked above, pin `obs_rhs` and `obs_resid` — no separate check
         // needed for either.
-        && b.dual.obs_core_blocks.len() == obs_len(observed, (q_core * q_core * s).max(1))
-        && b.dual.obs_schur_blk.len() == obs_len(observed, (e * e).max(1))
+        && b.dual.obs_core_blocks.len()
+            == obs_len(d.observed, (d.q_core * d.q_core * d.s).max(1))
+        && b.dual.obs_schur_blk.len() == obs_len(d.observed, (d.e * d.e).max(1))
         && b.grad_t.len() == m
         && if assembly {
             b.asm.g_gamma.len() == (m * k).max(1)
+                && b.asm.packed_len() == rows * packed_width
+                // `PackedAsmBufs::for_shape` sizes `obs` to `k²` on every
+                // packed shape, canonical or not — a canonical fit with a
+                // μ-clamped row needs `A_obs` too. `packed_width > 0` mirrors
+                // that function, which allocates nothing when `width == 0` —
+                // change together.
+                && b.asm.packed_obs_len() == if packed_width > 0 { k * k } else { 0 }
         } else {
             b.asm.g_gamma.is_empty()
         }
+}
+
+/// Shape terms the blocked and structured dual twins (`PirlsScratch<T>`,
+/// `StructuredScratch<T>` and the `DualStep` observed twins) are sized from:
+/// the caller's own on those two layouts, the MINIMUM on the packed one.
+///
+/// The packed-row route runs no dual PIRLS kernel — the assembled engine
+/// rebuilds `M`, η, μ, `W` and `A` at `T` in its own buffers
+/// (`assembled::PackedAsmBufs`) — so none of those twins is ever read there,
+/// and on a wide crossed shape they are megabytes of `Dual` elements. Sizing
+/// them down is what keeps the packed engine's footprint the one its own
+/// memory guard accounts for.
+///
+/// `for_shape` and [`bufs_match_shape`] both go through here, so the sized
+/// lengths and the checked lengths cannot drift apart.
+struct DenseTwinShape {
+    k: usize,
+    rows: usize,
+    s: usize,
+    q_p: usize,
+    q_core: usize,
+    e: usize,
+    observed: bool,
+}
+
+impl DenseTwinShape {
+    #[allow(clippy::too_many_arguments)]
+    fn of(
+        packed_width: usize,
+        k: usize,
+        rows: usize,
+        s: usize,
+        q_p: usize,
+        q_core: usize,
+        e: usize,
+        observed: bool,
+    ) -> DenseTwinShape {
+        if packed_width > 0 {
+            // `q_p`/`q_core` stay 1: `PirlsScratch::for_shape` divides no
+            // length by them but `lam` is `q_p²`, and 1 is the smallest width
+            // that keeps every `.max(1)` minimum honest.
+            DenseTwinShape {
+                k: 0,
+                rows: 0,
+                s: 0,
+                q_p: 1,
+                q_core: 1,
+                e: 0,
+                observed: false,
+            }
+        } else {
+            DenseTwinShape {
+                k,
+                rows,
+                s,
+                q_p,
+                q_core,
+                e,
+                observed,
+            }
+        }
+    }
 }
 
 impl GlmmDualScratch {
@@ -617,53 +667,43 @@ impl GlmmDualScratch {
         e: usize,
         nagq: u8,
         observed: bool,
+        // Packed-row width on `GlmmLayout::Packed`, 0 on every other layout.
+        packed_width: usize,
         cluster_ids: &[u32],
     ) -> GlmmDualScratch {
+        let d = DenseTwinShape::of(packed_width, k, rows, s, q_p, q_core, e, observed);
         let idx = ClusterRowIndex::build(cluster_ids, s);
-        let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
         macro_rules! build {
             ($T:ty, $variant:ident, $asm:expr) => {
                 GlmmDualScratch::$variant(
                     GlmmDualBufs::<$T> {
                         params: vec![<$T as Scalar>::ZERO; m],
                         beta: vec![<$T as Scalar>::ZERO; p],
-                        lam: vec![<$T as Scalar>::ZERO; q_p * q_p],
-                        m_buf: vec![<$T as Scalar>::ZERO; rows * q_p],
-                        eta: vec![<$T as Scalar>::ZERO; rows],
-                        prob: vec![<$T as Scalar>::ZERO; rows],
-                        w: vec![<$T as Scalar>::ZERO; rows],
-                        u: vec![<$T as Scalar>::ZERO; k],
-                        u_prev: vec![<$T as Scalar>::ZERO; k.max(1)],
-                        eta_fixed: vec![<$T as Scalar>::ZERO; rows],
-                        a_blocks: vec![<$T as Scalar>::ZERO; s * q_p * q_p],
-                        a_rhs: vec![<$T as Scalar>::ZERO; k],
-                        agq_scratch: vec![<$T as Scalar>::ZERO; agq_len(s, q_p, nagq)],
-                        mu: vec![<$T as Scalar>::ZERO; rows],
-                        core_blocks: vec![<$T as Scalar>::ZERO; (q_core * q_core * s).max(1)],
-                        coupling: vec![<$T as Scalar>::ZERO; (q_core * s * e).max(1)],
-                        schur_blk: vec![<$T as Scalar>::ZERO; (e * e).max(1)],
-                        m_core_buf: vec![<$T as Scalar>::ZERO; (rows * q_core).max(1)],
-                        cross_val: vec![<$T as Scalar>::ZERO; (rows * g_cap).max(1)],
+                        pirls: PirlsScratch::<$T>::for_shape(d.rows, d.k, d.q_p, d.s, nagq),
+                        structured: StructuredScratch::<$T>::for_shape(d.rows, d.s, d.q_core, d.e),
                         dual: DualStep {
                             observed: false,
                             obs_blocks: vec![
                                 <$T as Scalar>::ZERO;
-                                obs_len(observed, s * q_p * q_p)
+                                obs_len(d.observed, d.s * d.q_p * d.q_p)
                             ],
                             obs_core_blocks: vec![
                                 <$T as Scalar>::ZERO;
-                                obs_len(observed, (q_core * q_core * s).max(1))
+                                obs_len(
+                                    d.observed,
+                                    (d.q_core * d.q_core * d.s).max(1)
+                                )
                             ],
                             obs_coupling: vec![
                                 <$T as Scalar>::ZERO;
-                                obs_len(observed, (q_core * s * e).max(1))
+                                obs_len(d.observed, (d.q_core * d.s * d.e).max(1))
                             ],
                             obs_schur_blk: vec![
                                 <$T as Scalar>::ZERO;
-                                obs_len(observed, (e * e).max(1))
+                                obs_len(d.observed, (d.e * d.e).max(1))
                             ],
-                            obs_rhs: vec![<$T as Scalar>::ZERO; obs_len(observed, k)],
-                            obs_resid: vec![<$T as Scalar>::ZERO; obs_len(observed, rows)],
+                            obs_rhs: vec![<$T as Scalar>::ZERO; obs_len(d.observed, d.k)],
+                            obs_resid: vec![<$T as Scalar>::ZERO; obs_len(d.observed, d.rows)],
                             min_iters: 0,
                             exact: false,
                         },
@@ -680,7 +720,15 @@ impl GlmmDualScratch {
         // `AssemblyBufs::empty`.
         macro_rules! sized_asm {
             ($T:ty) => {
-                super::assembled::AssemblyBufs::<$T>::for_shape(m, k, rows, s, q_core, e)
+                super::assembled::AssemblyBufs::<$T>::for_shape(
+                    m,
+                    k,
+                    rows,
+                    s,
+                    q_core,
+                    e,
+                    packed_width,
+                )
             };
         }
         match n {
@@ -732,10 +780,25 @@ impl GlmmDualScratch {
         e: usize,
         nagq: u8,
         observed: bool,
+        packed_width: usize,
     ) -> bool {
         macro_rules! check {
             ($b:expr, $asm:expr) => {
-                bufs_match_shape($b, m, p, k, rows, s, q_p, q_core, e, nagq, observed, $asm)
+                bufs_match_shape(
+                    $b,
+                    m,
+                    p,
+                    k,
+                    rows,
+                    s,
+                    q_p,
+                    q_core,
+                    e,
+                    nagq,
+                    observed,
+                    packed_width,
+                    $asm,
+                )
             };
         }
         match self {
@@ -829,31 +892,61 @@ impl<const N: usize, const H: usize> SeedHessian for HyperDual<N, H> {
 /// `u_mode` is the `f64` PIRLS mode `laplace_gradient` already converged on
 /// (its lanes start at zero — see `Seed::unit`'s own doc comment); `ws_params` is
 /// `ws.params[..n_theta + p]`, read only to build the unit-lane seeds.
+///
+/// No production caller: [`laplace_gradient`]'s body, which has none either.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_gradient<T: Seed>(
     bufs: &mut GlmmDualBufs<T>,
-    family: Family,
+    data: &FitData,
     nb_theta: f64,
-    groupings: &LmmGroupings,
-    x: MatRef<f64>,
-    y: &[f64],
-    prior_w: &[f64],
-    weighted: bool,
-    cluster_ids: &[u32],
-    z_buf: &[f64],
-    extras_pattern: &mut ExtrasPattern,
-    offset: Option<&[f64]>,
+    // θ-independent structured index pattern — the `f64` workspace's own
+    // `ws.pattern`, shared rather than mirrored at `T`. **The pattern is
+    // shared; the values are not, and the two can disagree in width.** The
+    // pin skip in `build_packed_m` and the pin mask in
+    // `structured_laplace_deviance` are both `f64`-only, so at a θ̂ with a
+    // pinned crossed grouping the pattern a DUAL call builds is WIDER than
+    // the one an `f64` call builds — while `cross_val` lives in
+    // `GlmmDualBufs<T>` and stays dual-private. On return from a derivative
+    // call `pattern.cross_col`/`pattern.n_cross` can therefore name slots
+    // `bufs.structured.cross_val` never filled.
+    //
+    // The rule that keeps that safe: **every `f64` reader of the
+    // `cross_col`/`n_cross`/`cross_val` triple must run an `f64` deviance
+    // evaluation of its own first.** There is one such reader,
+    // `se::structured_schur_fill`, and it is reached only after
+    // `joint_hessian_cov`'s `fallback!()` central `fd_eval` or after the
+    // pinned re-eval in `glmm/mod.rs` — both of which re-pack the triple at
+    // γ̂. Breaking the rule does not panic: the reader would pick up a stale
+    // `cross_val` left by an earlier optimizer trial and return a plausible
+    // wrong SE.
+    pattern: &mut StructuredPattern,
     wx: &mut Mat<f64>,
     ws_params: &[f64],
     u_mode: &[f64],
     n_theta: usize,
-    p: usize,
-    n: usize,
     tol: f64,
     nagq: u8,
     cluster_rows: &ClusterRowIndex,
     grad: &mut [f64],
 ) -> DerivStatus {
+    let FitData {
+        family,
+        groupings,
+        // The derivative kernels serve the blocked and structured layouts only
+        // (`supports_shape`); the router's layout is not read here.
+        layout: _,
+        x,
+        y,
+        prior_w,
+        weighted,
+        cluster_ids,
+        extra_ids,
+        z_buf,
+        offset,
+        n,
+        p,
+    } = *data;
     let m = n_theta + p;
     let k = u_mode.len();
     // One pass seeds at most `T::LANES` coordinates; coordinate `base + j`
@@ -904,12 +997,12 @@ fn run_gradient<T: Seed>(
         let base = chunk * lanes;
         let width = lanes.min(m - base);
         // Every pass re-enters at the SAME `f64` mode with zero lanes: the
-        // kernel moves `bufs.u` (value and lanes) in place, so without this
-        // a later pass would start from the previous pass's moved `u` and
-        // differentiate at a different point.
+        // kernel moves `bufs.pirls.u` (value and lanes) in place, so without
+        // this a later pass would start from the previous pass's moved `u`
+        // and differentiate at a different point.
         #[allow(clippy::needless_range_loop)]
         for c in 0..k {
-            bufs.u[c] = T::from_f64(u_mode[c]);
+            bufs.pirls.u[c] = T::from_f64(u_mode[c]);
         }
         bufs.dual.min_iters = 0;
         // Throwaway: the dual evaluation is not a fit-path PIRLS solve, so
@@ -943,25 +1036,15 @@ fn run_gradient<T: Seed>(
                         groupings,
                         &bufs.params[..m],
                         &mut bufs.beta[..p],
-                        &mut bufs.lam,
+                        &mut bufs.pirls,
                         z_buf,
-                        &mut bufs.m_buf,
                         x,
                         y,
                         prior_w,
                         weighted,
                         cluster_ids,
-                        &mut bufs.eta,
-                        &mut bufs.prob,
-                        &mut bufs.w,
-                        &mut bufs.u,
-                        &mut bufs.u_prev,
-                        &mut bufs.eta_fixed,
-                        &mut bufs.a_blocks,
-                        &mut bufs.a_rhs,
                         Some(&mut bufs.dual),
                         wx,
-                        &mut bufs.agq_scratch,
                         nagq,
                         Some(tol),
                         n,
@@ -976,25 +1059,15 @@ fn run_gradient<T: Seed>(
                         groupings,
                         &bufs.params[..m],
                         &mut bufs.beta[..p],
-                        &mut bufs.lam,
+                        &mut bufs.pirls,
                         z_buf,
-                        &mut bufs.m_buf,
                         x,
                         y,
                         prior_w,
                         weighted,
                         cluster_ids,
-                        &mut bufs.eta,
-                        &mut bufs.prob,
-                        &mut bufs.w,
-                        &mut bufs.u,
-                        &mut bufs.u_prev,
-                        &mut bufs.eta_fixed,
-                        &mut bufs.a_blocks,
-                        &mut bufs.a_rhs,
                         Some(&mut bufs.dual),
                         wx,
-                        &mut bufs.agq_scratch,
                         nagq,
                         Some(tol),
                         n,
@@ -1010,40 +1083,27 @@ fn run_gradient<T: Seed>(
                     groupings,
                     &bufs.params[..m],
                     z_buf,
-                    extras_pattern.extra_ids,
-                    &mut bufs.lam,
+                    extra_ids,
                     cluster_ids,
-                    &mut bufs.m_core_buf,
-                    &mut bufs.cross_val,
-                    extras_pattern.cross_col,
-                    extras_pattern.n_cross,
-                    extras_pattern.coup_cols,
-                    extras_pattern.coup_ptr,
-                    extras_pattern.coup_mask,
+                    &mut bufs.pirls,
+                    &mut bufs.structured,
+                    // `pattern` is the `f64` workspace's own pattern (shared,
+                    // see this function's doc comment), so its
+                    // `structured_schur` genuinely holds the cached sparse LLT
+                    // here. That is harmless at a dual `T`: the cached factor
+                    // is `f64`-only (faer's `SparseColMat<usize, f64>`), and
+                    // `TailKernel`'s default `tail_factor`/`tail_downdate`/
+                    // `tail_solve` bodies (the only ones `Dual`/`HyperDual`
+                    // implement) ignore their `ss` argument outright, so the
+                    // tail always takes the dense generic path regardless of
+                    // what `pattern.structured_schur` holds.
+                    pattern,
                     x,
                     y,
                     prior_w,
                     weighted,
                     &mut bufs.beta[..p],
                     BetaStep::Fixed,
-                    &mut bufs.eta,
-                    &mut bufs.prob,
-                    &mut bufs.w,
-                    &mut bufs.u,
-                    &mut bufs.u_prev,
-                    &mut bufs.eta_fixed,
-                    &mut bufs.mu,
-                    &mut bufs.core_blocks,
-                    &mut bufs.coupling,
-                    &mut bufs.schur_blk,
-                    // No sparse Schur at a dual `T`: the cached LLT is `f64`-only
-                    // (faer's `SparseColMat<usize, f64>`), so the tail takes
-                    // `tail_factor`/`tail_solve`'s dense default body. The two are
-                    // a reassociation of the same Cholesky, not an approximation —
-                    // `force_dense` folds into `ss = None`, hence `false` here.
-                    None,
-                    false,
-                    &mut bufs.a_rhs,
                     Some(&mut bufs.dual),
                     wx,
                     offset,
@@ -1062,22 +1122,13 @@ fn run_gradient<T: Seed>(
                     groupings,
                     &bufs.params[..m],
                     &mut bufs.beta[..p],
-                    &mut bufs.lam,
+                    &mut bufs.pirls,
                     z_buf,
-                    &mut bufs.m_buf,
                     x,
                     y,
                     prior_w,
                     weighted,
                     cluster_ids,
-                    &mut bufs.eta,
-                    &mut bufs.prob,
-                    &mut bufs.w,
-                    &mut bufs.u,
-                    &mut bufs.u_prev,
-                    &mut bufs.eta_fixed,
-                    &mut bufs.a_blocks,
-                    &mut bufs.a_rhs,
                     Some(&mut bufs.dual),
                     wx,
                     BetaStep::Fixed,
@@ -1145,11 +1196,10 @@ fn run_gradient<T: Seed>(
 /// zero-lane `u` (several when the solve is not exact, see
 /// `MAX_DUAL_REFINEMENTS`; several more when `m` is above the top rung and the
 /// gradient chunks — see `run_gradient`). Writes `m = ws.n_theta + p`
-/// entries into `grad`. Restores `ws.u` to what it found; `eta`, `prob`, `w`,
+/// entries into `grad`. Restores `ws.pirls.u` to what it found; `eta`, `prob`, `w`,
 /// `mu`, `beta_rhs` and the block factors are left at the internal solve's
 /// values, not the caller's — correctness rests on the caller re-evaluating
-/// at the pinned γ̂ afterwards (the pinned re-eval in `fit_glmm`, which runs
-/// after the diagnostics block).
+/// at the pinned γ̂ afterwards (the pinned re-eval in `fit_glmm`).
 ///
 /// Which objective is differentiated mirrors `laplace_deviance`'s own
 /// three-way routing, evaluated here rather than called through because the
@@ -1160,7 +1210,11 @@ fn run_gradient<T: Seed>(
 /// (including `nagq == 1`, which IS the Laplace objective) ⇒
 /// `blocked_laplace_deviance`. The shapes with no exact derivative at all are
 /// [`supports_shape`]'s business, not this routing's.
+///
+/// No production caller: this stays as the exact gradient the FD and
+/// chunked-Hessian gates compare against.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn laplace_gradient(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
@@ -1178,7 +1232,7 @@ pub(crate) fn laplace_gradient(
     // Checked before `m`, so a shape with no exact derivative never allocates
     // scratch. Shape is the whole question — a pinned crossed θ̂ is carried by
     // the `f64`-only pin skip (`workspace.rs`/`deviance.rs`), not refused here.
-    if !supports_shape(&ws.groupings) {
+    if !supports_shape(ws.layout, &ws.groupings) {
         return DerivStatus::Unsupported;
     }
     let n_theta = ws.n_theta;
@@ -1200,7 +1254,10 @@ pub(crate) fn laplace_gradient(
     // same condition `bufs.dual.observed` takes below.
     let observed = !crate::family::is_canonical(ws.family);
     let need_build = ws.dual_scratch.as_deref().is_none_or(|sc| {
-        sc.lanes() != nl || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq, observed)
+        sc.lanes() != nl
+            // `supports_shape` above refused `GlmmLayout::Packed`, so the
+            // packed twin is never sized on this path.
+            || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq, observed, 0)
     });
     if need_build {
         ws.dual_scratch = Some(Box::new(GlmmDualScratch::for_shape(
@@ -1215,15 +1272,19 @@ pub(crate) fn laplace_gradient(
             e,
             nagq,
             observed,
+            // `supports_shape` above refused `GlmmLayout::Packed`, so the
+            // packed twin is never sized on this path.
+            0,
             cluster_ids,
         )));
     }
 
     let family = ws.family;
     // Never the fit's own exit tolerance — see "Tolerance handling":
-    // `ws.pirls_tol_override` if the caller set one, `pirls_tol_fd(family)`
+    // `ws.fd.pirls_tol_override` if the caller set one, `pirls_tol_fd(family)`
     // otherwise. The SAME value is passed to every dual kernel call below.
     let tol = ws
+        .fd
         .pirls_tol_override
         .unwrap_or_else(|| super::pirls_tol_fd(family));
 
@@ -1243,46 +1304,37 @@ pub(crate) fn laplace_gradient(
     // *ws`), even though the two borrows never touch the same field.
     let GlmmWorkspace {
         groupings,
+        layout,
         params: prm,
         beta_rhs,
-        lam,
         z_buf,
-        m_buf,
         prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        a_blocks,
-        a_rhs,
-        core_blocks,
-        coupling,
-        schur_blk,
-        m_core_buf,
-        cross_val,
-        cross_col,
-        n_cross,
-        coup_cols,
-        coup_ptr,
-        coup_mask,
+        pirls,
+        structured,
+        pattern,
         wx,
-        agq_scratch,
         offset: offset_field,
         dual_scratch,
         ..
     } = ws;
     let offset = offset_field.as_deref();
     let extras = !groupings.extra_offsets.is_empty();
-    let mut extras_pattern = ExtrasPattern {
+
+    // Read-only design view `run_gradient` takes below — see [`FitData`].
+    let data = FitData {
+        family,
+        groupings,
+        layout: *layout,
+        x,
+        y,
+        prior_w: &prior_w[..n],
+        weighted,
+        cluster_ids,
         extra_ids,
-        cross_col,
-        n_cross,
-        coup_cols,
-        coup_ptr,
-        coup_mask,
+        z_buf,
+        offset,
+        n,
+        p,
     };
 
     // AGQ routing: the full `laplace_deviance` gate — an extras design takes
@@ -1315,7 +1367,7 @@ pub(crate) fn laplace_gradient(
         .expect("just built or confirmed present above")
         .mode_bufs_mut()
         .saved_u[..kk]
-        .copy_from_slice(&u[..kk]);
+        .copy_from_slice(&pirls.u[..kk]);
     let mut mode_counters = crate::counters::EvalCounters::new();
     let mode_ok = if agq_eligible {
         let idx = dual_scratch
@@ -1329,25 +1381,15 @@ pub(crate) fn laplace_gradient(
                 groupings,
                 &prm[..m],
                 beta_rhs,
-                lam,
+                pirls,
                 z_buf,
-                m_buf,
                 x,
                 y,
                 &prior_w[..n],
                 weighted,
                 cluster_ids,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                a_blocks,
-                a_rhs,
                 None,
                 wx,
-                agq_scratch,
                 nagq,
                 Some(tol),
                 n,
@@ -1362,25 +1404,15 @@ pub(crate) fn laplace_gradient(
                 groupings,
                 &prm[..m],
                 beta_rhs,
-                lam,
+                pirls,
                 z_buf,
-                m_buf,
                 x,
                 y,
                 &prior_w[..n],
                 weighted,
                 cluster_ids,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                a_blocks,
-                a_rhs,
                 None,
                 wx,
-                agq_scratch,
                 nagq,
                 Some(tol),
                 n,
@@ -1391,47 +1423,35 @@ pub(crate) fn laplace_gradient(
         };
         dev.is_finite()
     } else if extras {
-        // Same `structured_schur = None` / `force_dense = false` pair the dual
-        // calls below take, and for a second reason on top of theirs: keeping
-        // the mode solve off the cached sparse factor means a derivative
-        // request never overwrites the converged factors
-        // `se::structured_schur_fill` reuses, and the mode this solve hands the
-        // dual kernel is produced by the very tail the dual kernel will run.
+        // Keep the mode solve off the cached sparse factor: a derivative
+        // request must never overwrite the converged factors
+        // `se::structured_schur_fill` reuses, and the mode this solve hands
+        // the dual kernel below must come from the same dense tail the dual
+        // kernel runs (dual `T` always takes the dense generic tail — see
+        // `run_gradient`'s `pattern` doc comment). `pattern.structured_schur`/
+        // `force_dense_schur` are taken out and restored around this one f64
+        // call so its CSR refresh (`cross_col`/`n_cross`/`coup_cols`/`coup_ptr`/
+        // `coup_mask`) still lands in the real, shared `pattern`.
+        let saved_schur = pattern.structured_schur.take();
+        let saved_force_dense = pattern.force_dense_schur;
+        pattern.force_dense_schur = false;
         let (dev, conv, _raw_finite) = structured_laplace_deviance::<f64>(
             family,
             nb_theta,
             groupings,
             &prm[..m],
             z_buf,
-            extras_pattern.extra_ids,
-            lam,
+            extra_ids,
             cluster_ids,
-            m_core_buf,
-            cross_val,
-            extras_pattern.cross_col,
-            extras_pattern.n_cross,
-            extras_pattern.coup_cols,
-            extras_pattern.coup_ptr,
-            extras_pattern.coup_mask,
+            pirls,
+            structured,
+            pattern,
             x,
             y,
             &prior_w[..n],
             weighted,
             beta_rhs,
             BetaStep::Fixed,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            core_blocks,
-            coupling,
-            schur_blk,
-            None,
-            false,
-            a_rhs,
             None,
             wx,
             offset,
@@ -1439,6 +1459,8 @@ pub(crate) fn laplace_gradient(
             n,
             &mut mode_counters,
         );
+        pattern.structured_schur = saved_schur;
+        pattern.force_dense_schur = saved_force_dense;
         conv && dev.is_finite()
     } else {
         let (dev, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
@@ -1447,22 +1469,13 @@ pub(crate) fn laplace_gradient(
             groupings,
             &prm[..m],
             beta_rhs,
-            lam,
+            pirls,
             z_buf,
-            m_buf,
             x,
             y,
             &prior_w[..n],
             weighted,
             cluster_ids,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            a_blocks,
-            a_rhs,
             None,
             wx,
             BetaStep::Fixed,
@@ -1475,7 +1488,7 @@ pub(crate) fn laplace_gradient(
         conv && dev.is_finite()
     };
     if !mode_ok {
-        u[..kk].copy_from_slice(
+        pirls.u[..kk].copy_from_slice(
             &dual_scratch
                 .as_deref_mut()
                 .expect("just built or confirmed present above")
@@ -1489,8 +1502,8 @@ pub(crate) fn laplace_gradient(
             .as_deref_mut()
             .expect("just built or confirmed present above")
             .mode_bufs_mut();
-        mode.u_mode[..k].copy_from_slice(&u[..k]);
-        u[..kk].copy_from_slice(&mode.saved_u[..kk]); // restore — leave ws.u as found
+        mode.u_mode[..k].copy_from_slice(&pirls.u[..k]);
+        pirls.u[..kk].copy_from_slice(&mode.saved_u[..kk]); // restore — leave ws.pirls.u as found
     }
 
     // --- dual evaluation(s), entered at the mode ---
@@ -1504,23 +1517,13 @@ pub(crate) fn laplace_gradient(
         ($bufs:expr, $idx:expr, $mode:expr) => {
             run_gradient(
                 $bufs,
-                family,
+                &data,
                 nb_theta,
-                groupings,
-                x,
-                y,
-                &prior_w[..n],
-                weighted,
-                cluster_ids,
-                z_buf,
-                &mut extras_pattern,
-                offset,
+                pattern,
                 wx,
                 &prm[..m],
                 &$mode.u_mode[..k],
                 n_theta,
-                p,
-                n,
                 tol,
                 nagq,
                 $idx,
@@ -1579,35 +1582,44 @@ pub(crate) fn unpack_hessian(hess: &mut Mat<f64>, h: &[f64], m: usize) {
 #[allow(clippy::too_many_arguments)]
 fn run_hessian<T: SeedHessian>(
     bufs: &mut GlmmDualBufs<T>,
-    family: Family,
+    data: &FitData,
     nb_theta: f64,
-    groupings: &LmmGroupings,
-    x: MatRef<f64>,
-    y: &[f64],
-    prior_w: &[f64],
-    weighted: bool,
-    cluster_ids: &[u32],
-    z_buf: &[f64],
-    extras_pattern: &mut ExtrasPattern,
-    offset: Option<&[f64]>,
+    // The `f64` workspace's shared structured pattern — see `run_gradient`'s
+    // doc comment on the same parameter.
+    pattern: &mut StructuredPattern,
     wx: &mut Mat<f64>,
     ws_params: &[f64],
     u_mode: &[f64],
     n_theta: usize,
-    p: usize,
-    n: usize,
     tol: f64,
     nagq: u8,
     cluster_rows: &ClusterRowIndex,
     grad: &mut [f64],
     hess: &mut Mat<f64>,
 ) -> DerivStatus {
+    let FitData {
+        family,
+        groupings,
+        // The derivative kernels serve the blocked and structured layouts only
+        // (`supports_shape`); the router's layout is not read here.
+        layout: _,
+        x,
+        y,
+        prior_w,
+        weighted,
+        cluster_ids,
+        extra_ids,
+        z_buf,
+        offset,
+        n,
+        p,
+    } = *data;
     let m = n_theta + p;
     let hlen = m * (m + 1) / 2;
     let k = u_mode.len();
     #[allow(clippy::needless_range_loop)]
     for c in 0..k {
-        bufs.u[c] = T::from_f64(u_mode[c]);
+        bufs.pirls.u[c] = T::from_f64(u_mode[c]);
     }
     let extras = !groupings.extra_offsets.is_empty();
     let canonical = crate::family::is_canonical(family);
@@ -1644,25 +1656,15 @@ fn run_hessian<T: SeedHessian>(
                         groupings,
                         &bufs.params[..m],
                         &mut bufs.beta[..p],
-                        &mut bufs.lam,
+                        &mut bufs.pirls,
                         z_buf,
-                        &mut bufs.m_buf,
                         x,
                         y,
                         prior_w,
                         weighted,
                         cluster_ids,
-                        &mut bufs.eta,
-                        &mut bufs.prob,
-                        &mut bufs.w,
-                        &mut bufs.u,
-                        &mut bufs.u_prev,
-                        &mut bufs.eta_fixed,
-                        &mut bufs.a_blocks,
-                        &mut bufs.a_rhs,
                         Some(&mut bufs.dual),
                         wx,
-                        &mut bufs.agq_scratch,
                         nagq,
                         Some(tol),
                         n,
@@ -1677,25 +1679,15 @@ fn run_hessian<T: SeedHessian>(
                         groupings,
                         &bufs.params[..m],
                         &mut bufs.beta[..p],
-                        &mut bufs.lam,
+                        &mut bufs.pirls,
                         z_buf,
-                        &mut bufs.m_buf,
                         x,
                         y,
                         prior_w,
                         weighted,
                         cluster_ids,
-                        &mut bufs.eta,
-                        &mut bufs.prob,
-                        &mut bufs.w,
-                        &mut bufs.u,
-                        &mut bufs.u_prev,
-                        &mut bufs.eta_fixed,
-                        &mut bufs.a_blocks,
-                        &mut bufs.a_rhs,
                         Some(&mut bufs.dual),
                         wx,
-                        &mut bufs.agq_scratch,
                         nagq,
                         Some(tol),
                         n,
@@ -1711,38 +1703,20 @@ fn run_hessian<T: SeedHessian>(
                     groupings,
                     &bufs.params[..m],
                     z_buf,
-                    extras_pattern.extra_ids,
-                    &mut bufs.lam,
+                    extra_ids,
                     cluster_ids,
-                    &mut bufs.m_core_buf,
-                    &mut bufs.cross_val,
-                    extras_pattern.cross_col,
-                    extras_pattern.n_cross,
-                    extras_pattern.coup_cols,
-                    extras_pattern.coup_ptr,
-                    extras_pattern.coup_mask,
+                    &mut bufs.pirls,
+                    &mut bufs.structured,
+                    // `pattern` is the `f64` workspace's own pattern, shared
+                    // rather than mirrored at `T` — see `run_gradient`'s doc
+                    // comment for why its `structured_schur` is harmless here.
+                    pattern,
                     x,
                     y,
                     prior_w,
                     weighted,
                     &mut bufs.beta[..p],
                     BetaStep::Fixed,
-                    &mut bufs.eta,
-                    &mut bufs.prob,
-                    &mut bufs.w,
-                    &mut bufs.u,
-                    &mut bufs.u_prev,
-                    &mut bufs.eta_fixed,
-                    &mut bufs.mu,
-                    &mut bufs.core_blocks,
-                    &mut bufs.coupling,
-                    &mut bufs.schur_blk,
-                    // `None`/`false` for the same reason `run_gradient` gives
-                    // at its own structured call — the sparse Schur is
-                    // `f64`-only, so a dual `T` takes the dense default tail.
-                    None,
-                    false,
-                    &mut bufs.a_rhs,
                     Some(&mut bufs.dual),
                     wx,
                     offset,
@@ -1761,22 +1735,13 @@ fn run_hessian<T: SeedHessian>(
                     groupings,
                     &bufs.params[..m],
                     &mut bufs.beta[..p],
-                    &mut bufs.lam,
+                    &mut bufs.pirls,
                     z_buf,
-                    &mut bufs.m_buf,
                     x,
                     y,
                     prior_w,
                     weighted,
                     cluster_ids,
-                    &mut bufs.eta,
-                    &mut bufs.prob,
-                    &mut bufs.w,
-                    &mut bufs.u,
-                    &mut bufs.u_prev,
-                    &mut bufs.eta_fixed,
-                    &mut bufs.a_blocks,
-                    &mut bufs.a_rhs,
                     Some(&mut bufs.dual),
                     wx,
                     BetaStep::Fixed,
@@ -1885,14 +1850,14 @@ fn run_hessian<T: SeedHessian>(
 /// Gradient and exact Hessian of the same joint Laplace deviance
 /// `laplace_gradient` differentiates, with respect to `ws.params = [θ | β]`.
 /// Same contract as `laplace_gradient` (`f64` PIRLS solve first, at
-/// `ws.pirls_tol_override` or `pirls_tol_fd(family)`; only `ws.u` restored,
+/// `ws.fd.pirls_tol_override` or `pirls_tol_fd(family)`; only `ws.pirls.u` restored,
 /// `eta`/`prob`/`w`/`mu`/`beta_rhs`/block factors left at the internal
 /// solve's values) plus one structural difference: its single dual kernel call runs
 /// ONE MORE PIRLS step than the gradient's before its objective is
 /// trustworthy at second order — see `run_hessian`'s doc comment for why.
 ///
 /// Writes `m = ws.n_theta + p` entries into `grad`, and both triangles of an
-/// `m×m` `hess` (same shape as `ws.hess_scratch`, `workspace.rs:268`) from
+/// `m×m` `hess` (same shape as `ws.inference.hess_scratch`, `workspace.rs:268`) from
 /// the packed lower triangle `h[i*(i+1)/2 + j]`, `i >= j`.
 ///
 /// `hess` is the **deviance** Hessian, not the information matrix: the
@@ -1916,7 +1881,7 @@ pub(crate) fn laplace_hessian(
     hess: &mut Mat<f64>,
 ) -> DerivStatus {
     // Routing gate: same as `laplace_gradient`.
-    if !supports_shape(&ws.groupings) {
+    if !supports_shape(ws.layout, &ws.groupings) {
         return DerivStatus::Unsupported;
     }
     let n_theta = ws.n_theta;
@@ -1939,7 +1904,10 @@ pub(crate) fn laplace_hessian(
     // Same twin sizing/pinning `laplace_gradient` uses.
     let observed = !crate::family::is_canonical(ws.family);
     let need_build = ws.hyper_scratch.as_deref().is_none_or(|sc| {
-        sc.lanes() != nl || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq, observed)
+        sc.lanes() != nl
+            // `supports_shape` above refused `GlmmLayout::Packed`, so the
+            // packed twin is never sized on this path.
+            || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq, observed, 0)
     });
     if need_build {
         ws.hyper_scratch = Some(Box::new(GlmmDualScratch::for_shape(
@@ -1954,6 +1922,9 @@ pub(crate) fn laplace_hessian(
             e,
             nagq,
             observed,
+            // `supports_shape` above refused `GlmmLayout::Packed`, so the
+            // packed twin is never sized on this path.
+            0,
             cluster_ids,
         )));
     }
@@ -1962,6 +1933,7 @@ pub(crate) fn laplace_hessian(
     // Never the fit's own exit tolerance — see `laplace_gradient`. The SAME
     // value is passed to every dual kernel call below.
     let tol = ws
+        .fd
         .pirls_tol_override
         .unwrap_or_else(|| super::pirls_tol_fd(family));
 
@@ -1973,46 +1945,37 @@ pub(crate) fn laplace_hessian(
     // ONE destructure, same borrow-checker reason as `laplace_gradient`.
     let GlmmWorkspace {
         groupings,
+        layout,
         params: prm,
         beta_rhs,
-        lam,
         z_buf,
-        m_buf,
         prior_w,
-        eta,
-        prob,
-        w,
-        u,
-        u_prev,
-        eta_fixed,
-        mu,
-        a_blocks,
-        a_rhs,
-        core_blocks,
-        coupling,
-        schur_blk,
-        m_core_buf,
-        cross_val,
-        cross_col,
-        n_cross,
-        coup_cols,
-        coup_ptr,
-        coup_mask,
+        pirls,
+        structured,
+        pattern,
         wx,
-        agq_scratch,
         offset: offset_field,
         hyper_scratch,
         ..
     } = ws;
     let offset = offset_field.as_deref();
     let extras = !groupings.extra_offsets.is_empty();
-    let mut extras_pattern = ExtrasPattern {
+
+    // Read-only design view `run_hessian` takes below — see [`FitData`].
+    let data = FitData {
+        family,
+        groupings,
+        layout: *layout,
+        x,
+        y,
+        prior_w: &prior_w[..n],
+        weighted,
+        cluster_ids,
         extra_ids,
-        cross_col,
-        n_cross,
-        coup_cols,
-        coup_ptr,
-        coup_mask,
+        z_buf,
+        offset,
+        n,
+        p,
     };
 
     // AGQ routing: same as `laplace_gradient` — the full `laplace_deviance`
@@ -2028,7 +1991,7 @@ pub(crate) fn laplace_hessian(
         .expect("just built or confirmed present above")
         .mode_bufs_mut()
         .saved_u[..kk]
-        .copy_from_slice(&u[..kk]);
+        .copy_from_slice(&pirls.u[..kk]);
     let mut mode_counters = crate::counters::EvalCounters::new();
     let mode_ok = if agq_eligible {
         let idx = hyper_scratch
@@ -2042,25 +2005,15 @@ pub(crate) fn laplace_hessian(
                 groupings,
                 &prm[..m],
                 beta_rhs,
-                lam,
+                pirls,
                 z_buf,
-                m_buf,
                 x,
                 y,
                 &prior_w[..n],
                 weighted,
                 cluster_ids,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                a_blocks,
-                a_rhs,
                 None,
                 wx,
-                agq_scratch,
                 nagq,
                 Some(tol),
                 n,
@@ -2075,25 +2028,15 @@ pub(crate) fn laplace_hessian(
                 groupings,
                 &prm[..m],
                 beta_rhs,
-                lam,
+                pirls,
                 z_buf,
-                m_buf,
                 x,
                 y,
                 &prior_w[..n],
                 weighted,
                 cluster_ids,
-                eta,
-                prob,
-                w,
-                u,
-                u_prev,
-                eta_fixed,
-                a_blocks,
-                a_rhs,
                 None,
                 wx,
-                agq_scratch,
                 nagq,
                 Some(tol),
                 n,
@@ -2104,43 +2047,30 @@ pub(crate) fn laplace_hessian(
         };
         dev.is_finite()
     } else if extras {
-        // `None`/`false` for the same two reasons `laplace_gradient`'s
-        // structured mode solve gives at the same spot.
+        // Keep the mode solve off the cached sparse factor — see
+        // `laplace_gradient`'s own structured mode solve for why, and why
+        // `pattern.structured_schur`/`force_dense_schur` are taken out and
+        // restored around this one f64 call.
+        let saved_schur = pattern.structured_schur.take();
+        let saved_force_dense = pattern.force_dense_schur;
+        pattern.force_dense_schur = false;
         let (dev, conv, _raw_finite) = structured_laplace_deviance::<f64>(
             family,
             nb_theta,
             groupings,
             &prm[..m],
             z_buf,
-            extras_pattern.extra_ids,
-            lam,
+            extra_ids,
             cluster_ids,
-            m_core_buf,
-            cross_val,
-            extras_pattern.cross_col,
-            extras_pattern.n_cross,
-            extras_pattern.coup_cols,
-            extras_pattern.coup_ptr,
-            extras_pattern.coup_mask,
+            pirls,
+            structured,
+            pattern,
             x,
             y,
             &prior_w[..n],
             weighted,
             beta_rhs,
             BetaStep::Fixed,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            mu,
-            core_blocks,
-            coupling,
-            schur_blk,
-            None,
-            false,
-            a_rhs,
             None,
             wx,
             offset,
@@ -2148,6 +2078,8 @@ pub(crate) fn laplace_hessian(
             n,
             &mut mode_counters,
         );
+        pattern.structured_schur = saved_schur;
+        pattern.force_dense_schur = saved_force_dense;
         conv && dev.is_finite()
     } else {
         let (dev, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
@@ -2156,22 +2088,13 @@ pub(crate) fn laplace_hessian(
             groupings,
             &prm[..m],
             beta_rhs,
-            lam,
+            pirls,
             z_buf,
-            m_buf,
             x,
             y,
             &prior_w[..n],
             weighted,
             cluster_ids,
-            eta,
-            prob,
-            w,
-            u,
-            u_prev,
-            eta_fixed,
-            a_blocks,
-            a_rhs,
             None,
             wx,
             BetaStep::Fixed,
@@ -2184,7 +2107,7 @@ pub(crate) fn laplace_hessian(
         conv && dev.is_finite()
     };
     if !mode_ok {
-        u[..kk].copy_from_slice(
+        pirls.u[..kk].copy_from_slice(
             &hyper_scratch
                 .as_deref_mut()
                 .expect("just built or confirmed present above")
@@ -2198,8 +2121,8 @@ pub(crate) fn laplace_hessian(
             .as_deref_mut()
             .expect("just built or confirmed present above")
             .mode_bufs_mut();
-        mode.u_mode[..k].copy_from_slice(&u[..k]);
-        u[..kk].copy_from_slice(&mode.saved_u[..kk]); // restore — leave ws.u as found
+        mode.u_mode[..k].copy_from_slice(&pirls.u[..k]);
+        pirls.u[..kk].copy_from_slice(&mode.saved_u[..kk]); // restore — leave ws.pirls.u as found
     }
 
     // --- dual evaluation(s), entered at the mode ---
@@ -2213,23 +2136,13 @@ pub(crate) fn laplace_hessian(
         ($bufs:expr, $idx:expr, $mode:expr) => {
             run_hessian(
                 $bufs,
-                family,
+                &data,
                 nb_theta,
-                groupings,
-                x,
-                y,
-                &prior_w[..n],
-                weighted,
-                cluster_ids,
-                z_buf,
-                &mut extras_pattern,
-                offset,
+                pattern,
                 wx,
                 &prm[..m],
                 &$mode.u_mode[..k],
                 n_theta,
-                p,
-                n,
                 tol,
                 nagq,
                 $idx,
@@ -2285,30 +2198,34 @@ mod tests {
             e,
             nagq,
             true,
+            0,
             &cluster_ids,
         );
         match scratch {
             GlmmDualScratch::D8(bufs, _idx, mode) => {
                 assert_eq!(bufs.params.len(), m);
                 assert_eq!(bufs.beta.len(), p);
-                assert_eq!(bufs.lam.len(), q_p * q_p);
-                assert_eq!(bufs.m_buf.len(), rows * q_p);
-                assert_eq!(bufs.eta.len(), rows);
-                assert_eq!(bufs.prob.len(), rows);
-                assert_eq!(bufs.w.len(), rows);
-                assert_eq!(bufs.u.len(), k);
-                assert_eq!(bufs.u_prev.len(), k.max(1));
-                assert_eq!(bufs.eta_fixed.len(), rows);
-                assert_eq!(bufs.a_blocks.len(), s * q_p * q_p);
-                assert_eq!(bufs.a_rhs.len(), k);
-                assert_eq!(bufs.agq_scratch.len(), agq_len(s, q_p, nagq));
-                assert_eq!(bufs.agq_scratch.len(), 4 * s);
-                assert_eq!(bufs.mu.len(), rows);
-                assert_eq!(bufs.core_blocks.len(), q_core * q_core * s);
-                assert_eq!(bufs.coupling.len(), q_core * s * e);
-                assert_eq!(bufs.schur_blk.len(), e * e);
-                assert_eq!(bufs.m_core_buf.len(), rows * q_core);
-                assert_eq!(bufs.cross_val.len(), rows * crate::lmm::MAX_EXTRA_GROUPINGS);
+                assert_eq!(bufs.pirls.lam.len(), q_p * q_p);
+                assert_eq!(bufs.pirls.m_buf.len(), rows * q_p);
+                assert_eq!(bufs.pirls.eta.len(), rows);
+                assert_eq!(bufs.pirls.prob.len(), rows);
+                assert_eq!(bufs.pirls.w.len(), rows);
+                assert_eq!(bufs.pirls.u.len(), k);
+                assert_eq!(bufs.pirls.u_prev.len(), k.max(1));
+                assert_eq!(bufs.pirls.eta_fixed.len(), rows);
+                assert_eq!(bufs.pirls.a_blocks.len(), s * q_p * q_p);
+                assert_eq!(bufs.pirls.a_rhs.len(), k);
+                assert_eq!(bufs.pirls.agq_scratch.len(), agq_len(s, q_p, nagq));
+                assert_eq!(bufs.pirls.agq_scratch.len(), 4 * s);
+                assert_eq!(bufs.pirls.mu.len(), rows);
+                assert_eq!(bufs.structured.core_blocks.len(), q_core * q_core * s);
+                assert_eq!(bufs.structured.coupling.len(), q_core * s * e);
+                assert_eq!(bufs.structured.schur_blk.len(), e * e);
+                assert_eq!(bufs.structured.m_core_buf.len(), rows * q_core);
+                assert_eq!(
+                    bufs.structured.cross_val.len(),
+                    rows * crate::lmm::MAX_EXTRA_GROUPINGS
+                );
                 assert_eq!(bufs.dual.obs_core_blocks.len(), q_core * q_core * s);
                 assert_eq!(bufs.dual.obs_coupling.len(), q_core * s * e);
                 assert_eq!(bufs.dual.obs_schur_blk.len(), e * e);
@@ -2363,31 +2280,35 @@ mod tests {
             e,
             nagq,
             true,
+            0,
             &cluster_ids,
         );
         match scratch {
             GlmmDualScratch::H8(bufs, _idx, mode) => {
                 assert_eq!(bufs.params.len(), m);
                 assert_eq!(bufs.beta.len(), p);
-                assert_eq!(bufs.lam.len(), q_p * q_p);
-                assert_eq!(bufs.m_buf.len(), rows * q_p);
-                assert_eq!(bufs.eta.len(), rows);
-                assert_eq!(bufs.prob.len(), rows);
-                assert_eq!(bufs.w.len(), rows);
-                assert_eq!(bufs.u.len(), k);
-                assert_eq!(bufs.u_prev.len(), k.max(1));
-                assert_eq!(bufs.eta_fixed.len(), rows);
-                assert_eq!(bufs.a_blocks.len(), s * q_p * q_p);
-                assert_eq!(bufs.a_rhs.len(), k);
+                assert_eq!(bufs.pirls.lam.len(), q_p * q_p);
+                assert_eq!(bufs.pirls.m_buf.len(), rows * q_p);
+                assert_eq!(bufs.pirls.eta.len(), rows);
+                assert_eq!(bufs.pirls.prob.len(), rows);
+                assert_eq!(bufs.pirls.w.len(), rows);
+                assert_eq!(bufs.pirls.u.len(), k);
+                assert_eq!(bufs.pirls.u_prev.len(), k.max(1));
+                assert_eq!(bufs.pirls.eta_fixed.len(), rows);
+                assert_eq!(bufs.pirls.a_blocks.len(), s * q_p * q_p);
+                assert_eq!(bufs.pirls.a_rhs.len(), k);
                 let kq = (nagq as usize).pow(q_p as u32);
-                assert_eq!(bufs.agq_scratch.len(), agq_len(s, q_p, nagq));
-                assert_eq!(bufs.agq_scratch.len(), 2 * s + kq * (q_p + 1));
-                assert_eq!(bufs.mu.len(), rows);
-                assert_eq!(bufs.core_blocks.len(), q_core * q_core * s);
-                assert_eq!(bufs.coupling.len(), 1); // e == 0 ⇒ the .max(1) minimum
-                assert_eq!(bufs.schur_blk.len(), 1);
-                assert_eq!(bufs.m_core_buf.len(), rows * q_core);
-                assert_eq!(bufs.cross_val.len(), rows * crate::lmm::MAX_EXTRA_GROUPINGS);
+                assert_eq!(bufs.pirls.agq_scratch.len(), agq_len(s, q_p, nagq));
+                assert_eq!(bufs.pirls.agq_scratch.len(), 2 * s + kq * (q_p + 1));
+                assert_eq!(bufs.pirls.mu.len(), rows);
+                assert_eq!(bufs.structured.core_blocks.len(), q_core * q_core * s);
+                assert_eq!(bufs.structured.coupling.len(), 1); // e == 0 ⇒ the .max(1) minimum
+                assert_eq!(bufs.structured.schur_blk.len(), 1);
+                assert_eq!(bufs.structured.m_core_buf.len(), rows * q_core);
+                assert_eq!(
+                    bufs.structured.cross_val.len(),
+                    rows * crate::lmm::MAX_EXTRA_GROUPINGS
+                );
                 assert_eq!(bufs.dual.obs_core_blocks.len(), q_core * q_core * s);
                 assert_eq!(bufs.dual.obs_coupling.len(), 1); // e == 0 ⇒ the .max(1) minimum
                 assert_eq!(bufs.dual.obs_schur_blk.len(), 1);
@@ -2444,6 +2365,7 @@ mod tests {
             e,
             nagq,
             false,
+            0,
             &cluster_ids,
         );
         match &scratch {
@@ -2455,13 +2377,13 @@ mod tests {
                 assert!(bufs.dual.obs_rhs.is_empty());
                 assert!(bufs.dual.obs_resid.is_empty());
                 // The Fisher buffers are untouched by the twin sizing.
-                assert_eq!(bufs.coupling.len(), q_core * s * e);
-                assert_eq!(bufs.schur_blk.len(), e * e);
+                assert_eq!(bufs.structured.coupling.len(), q_core * s * e);
+                assert_eq!(bufs.structured.schur_blk.len(), e * e);
             }
             _ => panic!("expected D8 variant"),
         }
-        assert!(scratch.matches_shape(m, p, k, rows, s, q_p, q_core, e, nagq, false));
-        assert!(!scratch.matches_shape(m, p, k, rows, s, q_p, q_core, e, nagq, true));
+        assert!(scratch.matches_shape(m, p, k, rows, s, q_p, q_core, e, nagq, false, 0));
+        assert!(!scratch.matches_shape(m, p, k, rows, s, q_p, q_core, e, nagq, true, 0));
     }
 
     /// Every `m` in `0..=MAX_DUAL_N` resolves to the smallest instantiated rung
@@ -2552,8 +2474,7 @@ mod tests {
         let (x, y, ids, extra_ids, spec) =
             crate::glmm::tests::glmm_extras_q1_dataset(np, n_crossed);
         let (n, p) = (y.len(), 2usize);
-        let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
-        crate::glmm::workspace::build_z(&mut ws, x.as_ref(), &ids, &extra_ids, n);
+        let ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
         (ws, x, y, ids, extra_ids, p, n)
     }
 
@@ -2569,7 +2490,7 @@ mod tests {
                 !ws.groupings.extra_offsets.is_empty(),
                 "fixture must carry an extra grouping"
             );
-            assert!(supports_shape(&ws.groupings));
+            assert!(supports_shape(ws.layout, &ws.groupings));
             let mut grad = vec![0.0f64; ws.n_theta + p];
             let status =
                 laplace_gradient(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut grad);
@@ -2581,7 +2502,7 @@ mod tests {
     }
 
     /// An oversized core — `primary_q + nested_per_parent > MAX_PRIMARY_Q`, the
-    /// shape `laplace_deviance` sends to the dense `pirls_solve` fallback — has
+    /// shape `laplace_deviance` sends to the packed-row layout — has
     /// no structured kernel to differentiate, so `supports_shape` rejects it
     /// and the entry point returns `Unsupported` without allocating scratch.
     #[test]
@@ -2592,15 +2513,20 @@ mod tests {
         let np = crate::lmm::MAX_PRIMARY_Q;
         let (mut ws, x, y, ids, extra_ids, p, n) = extras_routing_fixture(np, 0);
         assert!(!ws.groupings.structured_extras_eligible());
-        assert!(!supports_shape(&ws.groupings));
+        assert!(!supports_shape(ws.layout, &ws.groupings));
         let mut grad = vec![0.0f64; ws.n_theta + p];
         let status = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut grad);
         assert!(matches!(status, DerivStatus::Unsupported));
         assert!(ws.dual_scratch.is_none());
     }
 
-    /// A crossed tail one level past `DUAL_TAIL_MAX` is `Unsupported`: above
-    /// the boundary the dense generic tail factor is the wrong tool. Built
+    /// A crossed tail one level past `DUAL_TAIL_MAX` is `Unsupported` — and it
+    /// gets there through the LAYOUT, not through `supports_shape`'s
+    /// `Structured` tail clause. `DUAL_TAIL_MAX` is pinned at
+    /// `MAX_CROSSED_LEVELS`, the routing cap, so a tail past it is `Packed`
+    /// before the tail is ever looked at. That coupling is what this pins: if
+    /// `DUAL_TAIL_MAX` is ever raised above the routing cap, the layout assert
+    /// fails and the tail clause becomes reachable for the first time. Built
     /// RELATIVE to the constant, so re-pinning it moves this fixture with it
     /// rather than turning the test into a silent pass.
     #[test]
@@ -2608,7 +2534,8 @@ mod tests {
         let (mut ws, x, y, ids, extra_ids, p, n) = extras_routing_fixture(0, DUAL_TAIL_MAX + 1);
         assert_eq!(ws.groupings.k_crossed(), DUAL_TAIL_MAX + 1);
         assert!(ws.groupings.structured_extras_eligible());
-        assert!(!supports_shape(&ws.groupings));
+        assert_eq!(ws.layout, GlmmLayout::Packed);
+        assert!(!supports_shape(ws.layout, &ws.groupings));
         let mut grad = vec![0.0f64; ws.n_theta + p];
         let status = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut grad);
         assert!(matches!(status, DerivStatus::Unsupported));
@@ -2616,7 +2543,10 @@ mod tests {
     }
 
     /// `laplace_hessian`'s own cap guard — mirrors
-    /// `laplace_gradient_m_above_cap_is_unsupported`.
+    /// `laplace_gradient_m_above_cap_is_unsupported`. The cap is this pass's
+    /// alone: `fit::glmm_tests`'s
+    /// `assembled_hessian_covers_an_m_above_the_dual_lane_cap` holds the other
+    /// half, that an exact Hessian still reaches a dense shape above it.
     #[test]
     fn laplace_hessian_m_above_cap_is_unsupported() {
         assert!(NLanes::pick(MAX_DUAL_N + 1, true).is_none());
@@ -2684,7 +2614,7 @@ mod tests {
     fn laplace_hessian_unsupported_shapes_are_unsupported() {
         for (np, n_crossed) in [(crate::lmm::MAX_PRIMARY_Q, 0), (0, DUAL_TAIL_MAX + 1)] {
             let (mut ws, x, y, ids, extra_ids, p, n) = extras_routing_fixture(np, n_crossed);
-            assert!(!supports_shape(&ws.groupings));
+            assert!(!supports_shape(ws.layout, &ws.groupings));
             let m = ws.n_theta + p;
             let mut grad = vec![0.0f64; m];
             let mut hess = Mat::<f64>::zeros(m, m);
