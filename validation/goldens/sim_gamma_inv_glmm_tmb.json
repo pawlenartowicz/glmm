@@ -1,0 +1,30 @@
+{
+  "name": "sim_gamma_inv_glmm_tmb",
+  "engine": "glmmTMB::glmmTMB",
+  "engine_version": "1.1.14",
+  "kind": "glmm",
+  "data": "sim_gamma",
+  "family": "gamma",
+  "link": "inverse",
+  "nagq": 1,
+  "r_formula": "y ~ 1 + x + grp + (1 | cluster)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x", "grpb"],
+  "estimates": {
+    "beta": [0.721700542956067, -0.188682569908478, -0.14162326969197],
+    "se_hessian": [0.0684969110376061, 0.0181627076440977, 0.0351886329651889],
+    "loglik": -471.446978734087,
+    "varcomp": [
+      {
+        "group": "cluster",
+        "terms": ["(Intercept)"],
+        "stddev": [0.263998505871569],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "dispersion": 0.599211259803431
+  }
+}

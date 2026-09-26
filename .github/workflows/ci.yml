@@ -96,7 +96,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: test (${{ matrix.name }})
-        run: cargo test ${{ matrix.flags }}
+        # --no-fail-fast: every target reports, so an integration test is not
+        # hidden behind a failing lib target.
+        run: cargo test --no-fail-fast ${{ matrix.flags }}
 
   # ── MSRV floor: the bobyqa dep pins rust-version = 1.85 ───────────────────
   msrv:
@@ -146,11 +148,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # The lme4 acceptance suite calls skip_on_cran() — without this, R CMD
-      # check would skip it quietly instead of running it.
+      # No test calls skip_on_cran(); the live lme4 comparison lives in
+      # r/tools/acceptance-vs-lme4.R and is run by hand. This stays set
+      # so that a skip_on_cran() added later cannot silently skip here; the
+      # "fail on any skipped test" step below is what notices.
       NOT_CRAN: "true"
     steps:
       - uses: actions/checkout@v4
+      - name: guard — no external statistics engine in the R package
+        # CI checks this package against saved numbers, never against a live
+        # lme4/glmmTMB/GLMMadaptive fit, and none of the three is installed on
+        # the runner. This step is what keeps it that way.
+        #
+        # The test suite is greped for CALLS; R/ only for a LOAD. Roxygen prose
+        # in R/ and man/ mentions lme4:: to say which convention a value
+        # follows, and a sentence in a comment is documentation, not a
+        # dependency. r/tools/ is deliberately NOT greped: the live comparison
+        # acceptance-vs-lme4.R lives there, is run by hand, and .Rbuildignore
+        # keeps it out of the built tarball.
+        run: |
+          if grep -rnE 'lme4::|glmmTMB::|GLMMadaptive::' r/tests/; then
+            echo "::error::an R test calls an external statistics package — CI must check against saved numbers"
+            exit 1
+          fi
+          if grep -rnE 'library\((lme4|glmmTMB|GLMMadaptive)\)|require(Namespace)?\(.?(lme4|glmmTMB|GLMMadaptive)' r/R/; then
+            echo "::error::the R package's own code loads an external statistics package"
+            exit 1
+          fi
+          echo "No external statistics engine is called by r/tests/ or loaded by r/R/."
       - uses: dtolnay/rust-toolchain@stable
       # The real compile happens later, inside the unpacked tarball under
       # $RUNNER_TEMP — a path that does not exist yet and has no stable
@@ -249,3 +274,80 @@ jobs:
         run: ruff check python/
       - name: ruff format --check
         run: ruff format --check python/
+
+  # ── port-gate: the three front ends must agree to round-off ───────────────
+  # glmm (Rust), the Python wheel and the fastglmm R package all drive the SAME
+  # kernel, so on the same cells they must produce the same numbers to
+  # round-off, not merely inside a cross-engine band. A miss is a wiring bug in
+  # a binding — an argument dropped, a factor coded differently, a matrix
+  # transposed — which is exactly the class of bug no single-language test can
+  # see.
+  #
+  # It runs the accuracy grid's `fast` subset (58 cells) through all three, then
+  # compares with the grid's own comparator. No statistics package is installed:
+  # --ports-only skips every oracle lookup, and jsonlite and Rcpp (compiler
+  # glue, not a statistics engine) are the only R dependencies it has.
+  #
+  # This is the one job that builds the `validation` crate.
+  port-gate:
+    name: port-gate (Rust vs Python vs R)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the wheel (the same build the python job makes)
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          command: build
+          args: --release --out dist
+      - name: Install the wheel into python/venv
+        # run.sh drives the port through python/venv/bin/python by name, so the
+        # venv is where the wheel has to land.
+        run: |
+          python -m venv python/venv
+          python/venv/bin/pip install --no-index --find-links python/dist glmm
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          # Posit's public package manager serves Linux binaries, so jsonlite
+          # installs in seconds instead of compiling.
+          use-public-rspm: true
+      - name: Install the R dependencies (no statistics package)
+        # jsonlite: read by the grid's R engine and by compare.R.
+        # generics: an Import of fastglmm, needed to install it.
+        # Rcpp: compiles the strtod shim in engines/glmm_r.R, not a statistics engine.
+        run: Rscript -e 'install.packages(c("jsonlite", "generics", "Rcpp"))'
+      - name: Install fastglmm from source
+        # Straight from the checkout: r/configure writes src/Makevars and
+        # r/src/rust's path dependency on ../../../glmm-r resolves here. The
+        # CRAN-shaped tarball (r/tools/cran-tarball.sh) is the r job's business,
+        # not this one's.
+        run: R CMD INSTALL r
+      - name: Build the grid's glmm engine
+        # Outside run.sh so a compile error is its own red step rather than a
+        # watchdog timeout.
+        run: cargo build --release -p validation --example grid_glmm
+      - name: Fit the fast subset through all three front ends
+        # --jobs=1: one worker, pinned to core 0. The runner has no P-core/E-core
+        # split to respect and the fast subset is a couple of seconds of fitting.
+        run: |
+          validation/grid/run.sh glmm        --fast --jobs=1 --label ci
+          validation/grid/run.sh glmm_python --fast --jobs=1 --label ci
+          validation/grid/run.sh glmm_r      --fast --jobs=1 --label ci
+      - name: Port gate
+        # --glmm-run= is REQUIRED, not decoration. compare.R prefers a run with
+        # subset "full", and the committed release baseline in the checkout is
+        # one; without this flag the gate would compare CI-built ports against a
+        # run fitted on another machine at a 1e-12 band.
+        run: |
+          run=$(echo validation/grid/runs/glmm/scratch/*_ci)
+          if [ ! -d "$run" ]; then
+            echo "::error::expected exactly one glmm run directory from this job, found: $run"
+            exit 1
+          fi
+          Rscript validation/grid/compare.R --ports-only --glmm-run="$run"

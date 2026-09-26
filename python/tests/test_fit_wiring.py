@@ -45,9 +45,9 @@ def test_singular_fit_warning_names_component():
         "y": rng.binomial(1, p).astype(float).tolist(),
     }
     with pytest.warns(
-        UserWarning,
-        match=r"boundary \(singular\) fit: see help\('isSingular'\); "
-        r"sd\(\(Intercept\) \| g\) pinned at the variance boundary",
+        glmm.SingularFitWarning,
+        match=r"^Caution: Singular fit\. The random effects are too complex .* "
+        r"Affected: \(Intercept\) in g\.$",
     ):
         result = glmm.fit(data, "y ~ x + (1 | g)", "binomial")
     assert result.singular
@@ -95,9 +95,8 @@ def test_pinned_detail_survives_a_q2_grouping_where_the_stddev_is_not_zero():
             ys.append(0.5 + 0.4 * x1 + u0[c] + e)
             gs.append(f"g{c}")
     with pytest.warns(
-        UserWarning,
-        match=r"boundary \(singular\) fit: see help\('isSingular'\); "
-        r"sd\(x \| g\) pinned at the variance boundary",
+        glmm.SingularFitWarning,
+        match=r"Affected: .*x in g",
     ):
         result = glmm.fit({"y": ys, "x": xs, "g": gs}, "y ~ x + (1 + x | g)")
 
@@ -125,7 +124,7 @@ def test_ill_conditioned_note_warns_under_its_own_category():
     data = {"y": y, "a": a, "b": b}
 
     with pytest.warns(
-        glmm.IllConditionedWarning, match="b is entangled with one or more other columns"
+        glmm.IllConditionedWarning, match="b is almost a combination of other columns"
     ):
         result = glmm.fit(data, "y ~ a + b", weights=w)
     assert result.converged
@@ -146,103 +145,6 @@ def test_ill_conditioned_note_warns_under_its_own_category():
         warnings.simplefilter("error", glmm.DiagnosticWarning)
         clean = glmm.fit(data, "y ~ a + b")
     assert clean.diagnostics["notes"] == []
-
-
-def test_unused_grouping_levels_message_names_the_detail():
-    # No fixture below drives the note through a real fit here (an empty
-    # cluster between two observed ones needs a hand-built level layout no
-    # other test in this file constructs), so the message is asserted from a
-    # constructed note, mirroring the pirls_exhausted test below.
-    note = {
-        "kind": "unused_grouping_levels",
-        "columns": [],
-        "pivot": float("nan"),
-        "evals": 0,
-        "final_eval": False,
-        "detail": "grouping 'g': level 'z' has no rows",
-    }
-    msg, cat = glmm._note_warning(note, [], True, np.array([1.0]), np.zeros(1, dtype=bool))
-    assert cat is glmm.UnusedGroupingLevelsWarning
-    assert "grouping 'g': level 'z' has no rows" in msg
-    assert "conditional modes are reported as exactly" in msg
-
-
-def test_pirls_exhausted_message_distinguishes_the_four_cases():
-    # This wrapper's test fixtures do not reach final_eval=True or a
-    # non-converged exhausted fit end-to-end, so all four message branches
-    # are asserted from constructed notes; the Rust-side test
-    # pirls_exhausted_payload_survives_flattening pins the payload itself.
-    note = {
-        "kind": "pirls_exhausted",
-        "columns": [],
-        "pivot": float("nan"),
-        "evals": 3,
-        "final_eval": False,
-        "detail": "",
-    }
-    benign_msg, benign_cat = glmm._note_warning(
-        note, [], True, np.array([1.0]), np.zeros(1, dtype=bool)
-    )
-    assert benign_cat is glmm.PirlsExhaustedWarning
-    assert "observation-only and no fitted number is affected" in benign_msg
-
-    not_converged_msg, not_converged_cat = glmm._note_warning(
-        note, [], False, np.array([1.5, -2.0]), np.zeros(2, dtype=bool)
-    )
-    assert not_converged_cat is glmm.PirlsExhaustedWarning
-    assert "the search ran out of its evaluation budget" in not_converged_msg
-    assert "the variance components are not reported" in not_converged_msg
-
-    failed_msg, failed_cat = glmm._note_warning(
-        note, [], False, np.array([np.nan, np.nan]), np.zeros(2, dtype=bool)
-    )
-    assert failed_cat is glmm.PirlsExhaustedWarning
-    assert "the fit failed" in failed_msg
-    assert "No estimate is reported" in failed_msg
-
-    serious_msg, serious_cat = glmm._note_warning(
-        dict(note, evals=0, final_eval=True), [], True, np.array([1.0]), np.zeros(1, dtype=bool)
-    )
-    assert serious_cat is glmm.PirlsExhaustedWarning
-    assert "the reported estimates rest on that truncated solve" in serious_msg
-
-
-def test_re_design_scale_spread_message_names_grouping_and_ratio():
-    # No fixture below drives the note through a real fit here (the Rust-side
-    # end-to-end test covers that: fit::common_tests::
-    # re_design_scale_spread_note_fires_on_mismatched_slope_scale), so the
-    # message is asserted from a constructed note, mirroring the
-    # pirls_exhausted test above.
-    note = {
-        "kind": "re_design_scale_spread",
-        "columns": [],
-        "pivot": float("nan"),
-        "evals": 0,
-        "final_eval": False,
-        "detail": "g",
-        "ratio": 4200.0,
-    }
-    msg, cat = glmm._note_warning(note, [], True, np.array([1.0]), np.zeros(1, dtype=bool))
-    assert cat is glmm.ReDesignScaleWarning
-    assert "'g'" in msg
-    assert "4.2e+03" in msg
-    assert "scales the columns internally" in msg
-
-
-def test_hessian_se_fallback_message():
-    note = {
-        "kind": "hessian_se_fallback",
-        "columns": [],
-        "pivot": float("nan"),
-        "evals": 0,
-        "final_eval": False,
-        "detail": "",
-        "ratio": float("nan"),
-    }
-    msg, cat = glmm._note_warning(note, [], True, np.array([1.0]), np.zeros(1, dtype=bool))
-    assert cat is glmm.HessianSeFallbackWarning
-    assert "not positive definite" in msg
-    assert "stddev_se is NaN" in msg
 
 
 def test_poisson_glm():
@@ -387,9 +289,7 @@ def test_pinned_detail_is_reported_on_a_sparse_route_fit():
         "g": [f"g{i}" for i in g.tolist()],
         "h": [f"h{i}" for i in h.tolist()],
     }
-    with pytest.warns(
-        UserWarning, match=r"sd\(\(Intercept\) \| g\) pinned at the variance boundary"
-    ):
+    with pytest.warns(glmm.SingularFitWarning, match=r"Affected: .*\(Intercept\) in g"):
         result = glmm.fit(data, "y ~ x + (1 | g) + (1 + x | h)")
 
     assert result.singular

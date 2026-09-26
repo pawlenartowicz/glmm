@@ -14,7 +14,7 @@ use std::time::Instant;
 use glmm::fit_cold;
 use serde_json::Value;
 
-#[path = "../../engines/common.rs"]
+#[path = "../../tools/common.rs"]
 mod harness_common;
 use harness_common::*;
 

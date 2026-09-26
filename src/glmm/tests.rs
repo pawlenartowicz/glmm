@@ -556,7 +556,7 @@ fn agq_parallel_bit_identical_to_serial() {
     }
 }
 
-// --- Vector AGQ (agq_deviance_vec) white-box invariants (spec Part 4 layer 1) --
+// --- Vector AGQ (agq_deviance_vec) white-box invariants --
 
 /// q=2 vector-RE spec: intercept + slope on design col 1, single grouping
 /// factor, no extras — the shape the widened gate routes to `agq_deviance_vec`.
@@ -1095,7 +1095,7 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
 }
 
 /// The exact hyper-dual joint Hessian and the FD stencil agree on the committed
-/// n=96 / 12-cluster `y ~ x1 + (1|grp)` fixture, to the `validation/tol.R`
+/// n=96 / 12-cluster `y ~ x1 + (1|grp)` fixture, to the `validation/grid/tol.R`
 /// `se_hessian_rel` default band (1e-3). The two sides are the SAME function's
 /// second derivative computed two ways, so the gap is the FD stencil's own
 /// truncation-plus-noise error and nothing else — this is the test that says
@@ -1144,7 +1144,7 @@ fn exact_hessian_matches_fd_on_fixture() {
     assert_eq!(st, FdHessianStatus::Ok);
     let tse_fd = ws.inference.theta_se.clone();
 
-    // Band = tol.R's `se_hessian_rel` default (1e-3), applied to the SEs the
+    // Band = grid/tol.R's `se_hessian_rel` default (1e-3), applied to the SEs the
     // caller sees, not to the raw covariance entries.
     for j in 0..p {
         let (a, b) = (cov_exact[(j, j)].sqrt(), cov_fd[(j, j)].sqrt());
@@ -1234,7 +1234,7 @@ fn exact_hessian_matches_fd_on_fixture_agq() {
 }
 
 /// The exact hyper-dual Hessian and the FD stencil agree on the structured
-/// extras path, to `validation/tol.R`'s `se_hessian_rel` default band (1e-3).
+/// extras path, to `validation/grid/tol.R`'s `se_hessian_rel` default band (1e-3).
 /// Three regimes, because they take three different tails: nested-only
 /// (`e = 0`, no tail), crossed with a scalar rank-1 downdate (`qc == 1`), and
 /// nested+crossed (`qc > 1`, whose f64 route is the panel downdate and whose
@@ -1333,7 +1333,7 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
         let tse_fd = ws.inference.theta_se.clone();
         ws.fd.force_fd_hessian = false;
 
-        // Band = tol.R's `se_hessian_rel` default (1e-3), applied to the SEs the
+        // Band = grid/tol.R's `se_hessian_rel` default (1e-3), applied to the SEs the
         // caller sees, not to the raw covariance entries.
         for j in 0..p {
             let (a, b) = (cov_exact[(j, j)].sqrt(), cov_fd[(j, j)].sqrt());
@@ -1485,7 +1485,7 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
     let hess_fd_tt = ws.inference.hess_scratch[(ti, ti)];
     ws.fd.force_fd_hessian = false;
 
-    // β band = tol.R's `se_hessian_rel` default (1e-3), on the SEs the caller
+    // β band = grid/tol.R's `se_hessian_rel` default (1e-3), on the SEs the caller
     // sees rather than the raw covariance entries.
     for j in 0..p {
         let (a, b) = (cov_exact[(j, j)].sqrt(), cov_fd[(j, j)].sqrt());
@@ -2646,7 +2646,7 @@ fn blocked_laplace_matches_brute_force_intercept_contiguous() {
 /// Blocked deviance == packed deviance on the no-extras slope fixture, to FP
 /// error. Drives `pirls_solve_blocked` and `pirls_solve_packed` directly on the
 /// same design at the same θ / β (dev-time equivalence smoke test; a wild
-/// divergence is a coding bug, per the spec). The packed oracle is a workspace
+/// divergence is a coding bug). The packed oracle is a workspace
 /// built with `for_cluster_spec_packed`, which overrides the layout
 /// `GlmmLayout::for_design` would pick for this shape.
 #[test]
@@ -6456,7 +6456,7 @@ fn fixture_with_nagq_sized(
                 let mu = eta.exp().min(20.0);
                 (mu * noise).round().max(0.0)
             }
-            Family::Gamma { .. } => eta.exp() * noise,
+            Family::Gamma { .. } | Family::InverseGaussian { .. } => eta.exp() * noise,
             other => panic!("gradient-gate fixture: family {other:?} not wired"),
         };
     }
@@ -8009,8 +8009,10 @@ fn agq_dual_hessian_matches_central_fd() {
     }
 }
 
-/// AGQ gate, family clause: Gamma is not `Binomial|Poisson`, so the gate
-/// stays closed regardless of `nagq` — `laplace_gradient` takes the same
+/// AGQ gate, family clause: inverse-Gaussian is outside the gate's
+/// binomial/Poisson/NB/Gamma list (the public entry has no mixed
+/// inverse-Gaussian path at all; the kernel's family functions cover it), so
+/// the gate stays closed regardless of `nagq` — `laplace_gradient` takes the same
 /// blocked-path route at `nagq = 1` and `nagq = 7`. Two independently built
 /// workspaces at the same params, one at each `nagq`, must therefore return
 /// bit-identical (`==` every lane) gradients: the AGQ condition is evaluated
@@ -8018,8 +8020,8 @@ fn agq_dual_hessian_matches_central_fd() {
 /// nondeterminism into the blocked route.
 #[test]
 fn agq_gate_stays_closed_on_family_exclusion() {
-    let family = Family::Gamma {
-        link: GammaLink::Log,
+    let family = Family::InverseGaussian {
+        link: crate::InverseGaussianLink::Log,
     };
     let shape = "int1";
     let params = fixed_seed_theta(shape).next_params();
@@ -8038,7 +8040,7 @@ fn agq_gate_stays_closed_on_family_exclusion() {
     assert!(matches!(st_b, DerivStatus::Ok(_)));
     assert_eq!(
         grad_a, grad_b,
-        "Gamma is outside the AGQ gate's family clause — nagq must not change the route"
+        "inverse-Gaussian is outside the AGQ gate's family clause — nagq must not change the route"
     );
 }
 
@@ -8566,5 +8568,310 @@ fn block_forward_solve_matches_block_leverage() {
     assert_eq!(
         got, want,
         "Σt² vs block_leverage: same arithmetic, same order"
+    );
+}
+
+/// The packed layout's sparse Cholesky of `A` against its dense factor on the
+/// same design from the same start: a full fit (stage-1 PQL border solves
+/// included) and the Rx SE, which `packed_schur_fill` builds from the dense
+/// `A` the sparse path expands after its final refresh. The two factor
+/// orders differ, so the agreement is round-off carried through BOBYQA: band
+/// 1e-6 relative on β̂ and the SEs, 1e-8 on the deviance.
+#[test]
+fn packed_sparse_factor_matches_the_dense_one() {
+    let (xf64, y, ids, crossed_ids, cluster) = glmm_slope_crossed_dataset();
+    let n = y.len();
+    let extra = vec![crossed_ids];
+    let run = |sparse: bool| {
+        let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
+        fill_packed_cols_with(&mut ws, &ids, &extra, n, Some(sparse));
+        assert_eq!(ws.packed.sparse.is_some(), sparse);
+        let fit = fit_glmm(
+            &mut ws,
+            xf64.as_ref(),
+            &y,
+            &ids,
+            &extra,
+            &[0, 1],
+            None,
+            &[0.0, 0.0],
+            n,
+            WaldSe::Rx,
+        );
+        assert!(fit.converged, "sparse = {sparse}: must converge");
+        (
+            fit.deviance,
+            ws.betas.clone(),
+            ws.inference.var_diag.clone(),
+        )
+    };
+    let (dd, bd, vd) = run(false);
+    let (ds, bs, vs) = run(true);
+    assert!(
+        (dd - ds).abs() <= 1e-8 * dd.abs(),
+        "deviance dense {dd} vs sparse {ds}"
+    );
+    for j in 0..2 {
+        assert!(
+            (bd[j] - bs[j]).abs() <= 1e-6 * bd[j].abs().max(1.0),
+            "β[{j}] {} vs {}",
+            bd[j],
+            bs[j]
+        );
+        let (a, b) = (vd[j].sqrt(), vs[j].sqrt());
+        assert!((a - b).abs() <= 1e-6 * a, "se[{j}] dense {a} vs sparse {b}");
+    }
+}
+
+/// `fill_packed_cols` owns the sparse pattern: a `loop_advanced` caller that
+/// refills a reused workspace with new level ids at the same `n` gets the
+/// pattern of the new ids, identical to a fresh workspace's.
+#[test]
+fn fill_packed_cols_rebuilds_the_sparse_pattern_for_new_ids() {
+    let (_x, y, ids, crossed_a, cluster) = glmm_slope_crossed_dataset();
+    let n = y.len();
+    let crossed_b: Vec<u32> = (0..n as u32).map(|i| (i / 2) % 4).collect();
+    let mut reused = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
+    fill_packed_cols_with(&mut reused, &ids, &[crossed_a], n, Some(true));
+    fill_packed_cols_with(
+        &mut reused,
+        &ids,
+        std::slice::from_ref(&crossed_b),
+        n,
+        Some(true),
+    );
+    let mut fresh = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
+    fill_packed_cols_with(&mut fresh, &ids, &[crossed_b], n, Some(true));
+    let (r, f) = (
+        reused.packed.sparse.as_ref().unwrap(),
+        fresh.packed.sparse.as_ref().unwrap(),
+    );
+    assert_eq!(r.axx.symbolic().col_ptr(), f.axx.symbolic().col_ptr());
+    assert_eq!(r.axx.symbolic().row_idx(), f.axx.symbolic().row_idx());
+    assert_eq!(r.row_slots, f.row_slots);
+}
+
+/// The Laplace objective's `log|A|` is the EXACT curvature of the conditional
+/// log-density at the mode on every link, not the Fisher approximation: on a
+/// scalar random intercept, `A` is diagonal with
+/// `h_f = ½·∂²/∂u_f² [D(u) + ‖u‖²]` at û, so `laplace_deviance − D(û) − ‖û‖²`
+/// must equal `Σ_f ln h_f`. `h_f` is taken here straight from the data by a
+/// central second difference of the deviance in `u_f` (the clusters decouple),
+/// with no kernel code on the reference side. Probit, cloglog, NB/log and
+/// Gamma/log — the links where the two curvatures differ — plus logit as the
+/// canonical control. Band 1e-6 relative on `log|A|`: the O(h²) truncation of
+/// the stencil at h = 1e-4.
+#[test]
+fn laplace_log_det_is_the_exact_curvature_at_the_mode() {
+    let (n, s) = (60usize, 6usize);
+    let theta = 0.8_f64;
+    let beta = [0.1_f64, 0.3];
+    let mut x = Mat::<f64>::zeros(n, 2);
+    let ids: Vec<u32> = (0..n).map(|i| (i % s) as u32).collect();
+    for i in 0..n {
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = ((i * 7) % 11) as f64 / 10.0 - 0.5;
+    }
+    let fams = [
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+    ];
+    for family in fams {
+        let y: Vec<f64> = (0..n)
+            .map(|i| match family {
+                Family::Binomial { .. } => f64::from(u8::from((i * 7) % 3 == 0 || i % 5 == 1)),
+                Family::NegativeBinomial { .. } => ((i * 3) % 5) as f64,
+                _ => 0.5 + ((i * 13) % 7) as f64 / 3.0,
+            })
+            .collect();
+        let model = ModelSpec {
+            family,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: s as u32,
+                },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let mut ws = GlmmWorkspace::for_cluster_spec(2, &model, n, &[], 1);
+        let nb_theta = 2.0;
+        ws.nb_theta = nb_theta;
+        let obj = glmm_laplace_deviance(
+            &[theta, beta[0], beta[1]],
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &[],
+            n,
+        );
+        assert!(obj.is_finite(), "{family:?}: objective must be finite");
+        let u: Vec<f64> = ws.pirls.u[..s].to_vec();
+        let dev_rows = |f: usize, uf: f64| -> f64 {
+            (0..n)
+                .filter(|&i| ids[i] as usize == f)
+                .map(|i| {
+                    let eta = beta[0] + beta[1] * x[(i, 1)] + theta * uf;
+                    let mu = crate::family::link_inv(family, eta);
+                    crate::family::dev_resid(family, nb_theta, y[i], mu)
+                })
+                .sum()
+        };
+        let dev_hat: f64 = (0..s).map(|f| dev_rows(f, u[f])).sum();
+        let pen: f64 = u.iter().map(|v| v * v).sum();
+        let h = 1e-4;
+        let log_det_ref: f64 = (0..s)
+            .map(|f| {
+                let d2 = (dev_rows(f, u[f] + h) - 2.0 * dev_rows(f, u[f]) + dev_rows(f, u[f] - h))
+                    / (h * h);
+                (0.5 * d2 + 1.0).ln()
+            })
+            .sum();
+        let log_det = obj - dev_hat - pen;
+        assert!(
+            (log_det - log_det_ref).abs() <= 1e-6 * log_det_ref.abs().max(1.0),
+            "{family:?}: log|A| = {log_det} vs exact curvature {log_det_ref}"
+        );
+    }
+}
+
+/// A fitted `ln φ̂` on either bound of the Gamma coordinate's box is refused;
+/// one just inside the tolerance is not.
+#[test]
+fn gamma_phi_on_box_bound_flags_both_bounds_only() {
+    let (lo, hi) = (GAMMA_PHI_LO.ln(), GAMMA_PHI_HI.ln());
+    assert!(gamma_phi_on_box_bound(lo));
+    assert!(gamma_phi_on_box_bound(hi));
+    assert!(gamma_phi_on_box_bound(lo + 5e-7));
+    assert!(!gamma_phi_on_box_bound(lo + 1e-3));
+    assert!(!gamma_phi_on_box_bound(hi - 1e-3));
+    assert!(!gamma_phi_on_box_bound(0.0));
+}
+
+/// Negative-binomial AGQ: θ_NB sits outside the integral, so the
+/// binomial/Poisson kernels serve NB unchanged. At a fixed (θ, β) the
+/// quadrature ladder converges (7, 15 and 25 nodes agree to quadrature
+/// error), and on NB and probit — links where the exact curvature differs from
+/// Fisher — one adaptive node is the Laplace objective to round-off: the node
+/// scale reads the factor the exit refresh leaves, `A_obs`, so the k = 1
+/// reduction holds with the exact-curvature `log|A|` too.
+#[test]
+fn agq_nb_ladder_converges_and_one_node_is_laplace() {
+    let (n, s) = (60usize, 6usize);
+    let mut x = Mat::<f64>::zeros(n, 2);
+    let ids: Vec<u32> = (0..n).map(|i| (i % s) as u32).collect();
+    for i in 0..n {
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = ((i * 7) % 11) as f64 / 10.0 - 0.5;
+    }
+    let params = [0.8_f64, 0.1, 0.3];
+    for family in [
+        Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+    ] {
+        let y: Vec<f64> = (0..n)
+            .map(|i| match family {
+                Family::Binomial { .. } => f64::from(u8::from((i * 7) % 3 == 0 || i % 5 == 1)),
+                _ => ((i * 3) % 5) as f64,
+            })
+            .collect();
+        let model = ModelSpec {
+            family,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: s as u32,
+                },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let mut ws = GlmmWorkspace::for_cluster_spec(2, &model, n, &[], 1);
+        ws.nb_theta = 2.0;
+        let lap = glmm_laplace_deviance(&params, &mut ws, x.as_ref(), &y, &ids, &[], n);
+        let agq = |ws: &mut GlmmWorkspace, k: u8| {
+            glmm_agq_deviance(&params, ws, x.as_ref(), &y, &ids, n, k)
+        };
+        let agq1 = agq(&mut ws, 1);
+        assert!(
+            (agq1 - lap).abs() <= 1e-10 * lap.abs().max(1.0),
+            "{family:?}: agq(k=1) {agq1} vs laplace {lap}"
+        );
+        let (d7, d15, d25) = (agq(&mut ws, 7), agq(&mut ws, 15), agq(&mut ws, 25));
+        assert!(d25.is_finite(), "{family:?}: AGQ must evaluate");
+        assert!(
+            (d15 - d25).abs() <= 1e-7 * d25.abs(),
+            "{family:?}: 15 vs 25 nodes: {d15} vs {d25}"
+        );
+        assert!(
+            (d7 - d25).abs() <= 1e-4 * d25.abs(),
+            "{family:?}: 7 vs 25 nodes: {d7} vs {d25}"
+        );
+    }
+}
+
+/// A row whose μ sits on its `family::clamp_mu` bound keeps the Fisher weight
+/// in the Laplace `A`: there the clamped observed weight `−w·μ''(y−μ)/V`
+/// divides by `V` at the pin and turns strongly negative (cloglog's upper pin
+/// with y = 0 at η = 3.32 gives about −734·w), which would make `A` non-PD and
+/// the objective +∞. Off the clamps `W_obs ≥ 0` on every link this applies
+/// to (each log-likelihood is log-concave in η), so the rule only moves
+/// pinned rows.
+#[test]
+fn a_pinned_row_keeps_the_fisher_weight_in_the_laplace_curvature() {
+    let family = crate::Family::Binomial {
+        link: crate::BinomialLink::Cloglog,
+    };
+    let (_, mu_hi) = crate::family::pinned_mu_bounds(family, false);
+    let eta = [3.32_f64, 0.3];
+    let prob = [mu_hi, crate::family::link_inv(family, 0.3)];
+    let y = [0.0, 1.0];
+    let prior_w = [1.0, 1.0];
+    let (dmu0, dmu1) = (
+        crate::family::mu_eta(family, eta[0]),
+        crate::family::mu_eta(family, eta[1]),
+    );
+    let fisher = [
+        dmu0 * dmu0 / crate::family::variance(family, f64::NAN, prob[0]),
+        dmu1 * dmu1 / crate::family::variance(family, f64::NAN, prob[1]),
+    ];
+    let mut w = fisher;
+    observed_weights_in_place(
+        family,
+        f64::NAN,
+        &y,
+        &prior_w,
+        false,
+        &eta,
+        &prob,
+        &mut w,
+        2,
+    );
+    assert_eq!(w[0], fisher[0], "pinned row: Fisher weight kept");
+    assert!(w[0] >= 0.0);
+    let obs1 =
+        crate::family::observed_weight(family, f64::NAN, y[1], 1.0, eta[1], prob[1], fisher[1]);
+    assert_eq!(w[1], obs1, "interior row: observed weight");
+    assert!(
+        crate::family::clamped_observed_weight(family, f64::NAN, y[0], 1.0, eta[0], prob[0])
+            < -100.0,
+        "the fixture must sit where the clamped observed weight is strongly negative"
     );
 }

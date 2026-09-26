@@ -232,9 +232,9 @@ fn intercept_only_lmm() -> ModelSpec {
 /// default-tier test can check without a reference. The cross-engine check on
 /// the same fit is the `sim_dynrange_lmm` golden: this design is emitted
 /// bit-identically as `validation/data/simulated/sim_dynrange_lmm.csv` by
-/// `validation/prep/gen_illcond_data.R`, and `tests/validation_oracle.rs` bands
+/// `validation/tools/prep/gen_illcond_data.R`, and `tests/validation_oracle.rs` bands
 /// its β, SE, σ̂, log-likelihood and variance components against lme4 on the FULL
-/// three-column design at `validation/tol.R`'s cross-engine tolerances. That
+/// three-column design at `validation/grid/tol.R`'s cross-engine tolerances. That
 /// golden is possible because the fit returns all three columns rather than
 /// NaN-filling one: a NaN-filled column would leave nothing for a reference to
 /// agree with. The two engines land within 6e-11 on β
@@ -434,13 +434,13 @@ fn build_gap_a_salvage_design(
 /// this test fits, column for column. That is what makes the entangled pair
 /// itself assertable: the four-column fit matches lme4's four-column
 /// reference directly, with no need to band only the unentangled columns and
-/// the identified sum against a reduced design. Bands are `validation/tol.R`'s
+/// the identified sum against a reduced design. Bands are `validation/grid/tol.R`'s
 /// cross-engine ones, unchanged.
 ///
 /// The provenance, since these constants are frozen in-crate rather than under
 /// `validation/goldens/`: the design is emitted as
 /// `validation/data/simulated/sim_entangled_pair_lmm.csv` by
-/// `validation/prep/gen_illcond_data.R`, whose generator arithmetic is
+/// `validation/tools/prep/gen_illcond_data.R`, whose generator arithmetic is
 /// bit-identical to [`build_gap_a_salvage_design`] above (verified over all 4000
 /// doubles) and whose CSV round-trips exactly at 17 significant digits. The
 /// reference is `lmer(y ~ 1 + t + v + z + (1|g), data, REML = TRUE)` under lme4
@@ -450,7 +450,7 @@ fn build_gap_a_salvage_design(
 /// and the reason is worth stating rather than leaving to be rediscovered. Every
 /// quantity below agrees inside its band, but the REML criterion does not:
 /// glmm reports −239.09477 against lme4's −239.09437, a gap of 4.0e-4 where
-/// `tol.R`'s `loglik_abs_lmm` is an absolute 2e-6. That band assumes
+/// `grid/tol.R`'s `loglik_abs_lmm` is an absolute 2e-6. That band assumes
 /// well-conditioned designs.
 ///
 /// The cause was measured rather than inferred, by re-evaluating this design's
@@ -503,7 +503,7 @@ fn lmm_entangled_pair_fits_in_full_with_honest_ses() {
     ];
     const LME4_SD_G: f64 = 4.211895307851695;
     const LME4_SIGMA: f64 = 0.2803066654730708;
-    // validation/tol.R: beta_rel, se_rel, stddev_rel.
+    // validation/grid/tol.R: beta_rel, se_rel, stddev_rel.
     const BETA_REL: f64 = 1e-3;
     const SE_REL: f64 = 1e-3;
     const STDDEV_REL: f64 = 1e-3;
@@ -562,7 +562,7 @@ fn lmm_entangled_pair_fits_in_full_with_honest_ses() {
         "β_t + β_v vs lme4 full design",
     );
     assert_eq!(f.tau2.len(), 1, "one variance component, got {:?}", f.tau2);
-    // Compare on the STDDEV scale, which is what tol.R's stddev_rel bands.
+    // Compare on the STDDEV scale, which is what grid/tol.R's stddev_rel bands.
     assert_pinned(
         &[f.tau2[0].sqrt(), f.dispersion.sqrt()],
         &[LME4_SD_G, LME4_SIGMA],
@@ -945,7 +945,7 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
         "β1 {} vs {REF_B1}",
         f.beta[1]
     );
-    // Same se_rel band as tol.R's cross-engine calibration (1e-3); measured
+    // Same se_rel band as grid/tol.R's cross-engine calibration (1e-3); measured
     // worst on this golden is 5.9e-6 (se0) / 5.0e-7 (se1), far inside it.
     assert!(
         (f.se[0] - REF_SE0).abs() / REF_SE0 < 1e-3,
@@ -1003,7 +1003,7 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
 /// minimized criterion, and boundary/singular status. Oracle: lme4's frozen
 /// sleepstudy REML fit — REMLcrit = glmm deviance + df·(1 + ln 2π), df = n − p
 /// (glmm's reml_deviance omits the df·(1+ln 2π) constant lme4's REMLcrit
-/// carries; loglik = −REMLcrit/2 is what results/lme4_empirical stores).
+/// carries; loglik = −REMLcrit/2 is what validation/goldens/sleepstudy_lmm.json stores).
 #[test]
 fn fit_exposes_n_eval_deviance_singular() {
     let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
@@ -1056,7 +1056,7 @@ fn fit_exposes_n_eval_deviance_singular() {
     let n = 180.0_f64;
     let p = 2.0_f64; // intercept + Days
     let df = n - p;
-    let lme4_loglik = -871.814135979976; // validation/results/lme4_empirical/sleepstudy.json .estimates.loglik
+    let lme4_loglik = -871.814135979976; // validation/goldens/sleepstudy_lmm.json .estimates.loglik
     let remlcrit = -2.0 * lme4_loglik;
     let expected = remlcrit - df * (1.0 + (2.0 * std::f64::consts::PI).ln());
     assert!(
@@ -1843,7 +1843,7 @@ fn fit_penicillin_crossed_matches_lme4() {
         "β0 = {} vs lme4 {REF_BETA}",
         f.beta[0]
     );
-    // Same se_rel band as tol.R's cross-engine calibration (1e-3); measured
+    // Same se_rel band as grid/tol.R's cross-engine calibration (1e-3); measured
     // worst on this golden is 2.7e-5, far inside it.
     let se_rel = (f.se[0] - REF_SE).abs() / REF_SE;
     assert!(
@@ -1928,7 +1928,7 @@ fn fit_pastes_nested_matches_lme4() {
         "β0 = {} vs lme4 {REF_BETA}",
         f.beta[0]
     );
-    // Same se_rel band as tol.R's cross-engine calibration (1e-3); measured
+    // Same se_rel band as grid/tol.R's cross-engine calibration (1e-3); measured
     // worst on this golden is 2.4e-6, far inside it.
     let se_rel = (f.se[0] - REF_SE).abs() / REF_SE;
     assert!(
@@ -2816,5 +2816,99 @@ fn fit_lmm_p_zero_weighted_reaches_nan_fill() {
         f.diagnostics.boundary,
         Boundary::NoOptimum,
         "the p==0 refusal reports NoOptimum, not a silent zero-width fit"
+    );
+}
+
+/// Fit-level twin of `lmm::tests::maxfun_cap_reports_honest_endpoint`, through
+/// `lmm_run_on` + `lmm_view_to_fit`: a `MaxFunReached` cap-out must report
+/// finite `tau2`/`varcorr`/`dispersion` (the plateau policy) WITHOUT ever
+/// setting `diagnostics.singular` — the post-hoc negligible-component check
+/// (`Fit::has_negligible_component`) is gated on `converged` for exactly this
+/// reason (a capped endpoint is a point, not an accepted boundary). Same
+/// dataset/cap construction as `lmm_run_on_view_maps_to_same_fit_as_fit_cold`
+/// above; the cap forces the legal-minimum `max_fun` the way
+/// `lmm::tests::maxfun_cap_reports_honest_endpoint` does.
+#[test]
+fn lmm_maxfun_cap_reports_honest_endpoint_and_not_singular() {
+    use bobyqa::{Bobyqa, Config};
+
+    let n_clusters = 6usize;
+    let per = 8usize;
+    let n = n_clusters * per;
+    let p = 2usize;
+    let mut st = 13u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    for i in 0..n {
+        ids_v[i] = (i % n_clusters) as u32;
+        let x1 = lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        let re = 0.3 * ((ids_v[i] as f64) - (n_clusters as f64) / 2.0);
+        y[i] = 0.5 + 0.4 * x1 + re + 0.2 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+
+    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
+    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[], &[], false);
+    let mut x_mat = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        for j in 0..p {
+            x_mat[(i, j)] = x[i * p + j];
+        }
+    }
+    ws.suff_mut().reset();
+    ws.suff_mut()
+        .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], None);
+
+    let n_theta = ws.theta.len();
+    let npt = 2 * n_theta + 1; // PRIMA's minimum npt (n_theta == 1 here)
+    let config = {
+        let mut c = Config::new(n_theta);
+        c.npt = npt;
+        c.max_fun = npt + 1;
+        c
+    };
+    ws.solver = Bobyqa::new(n_theta, config).expect("legal minimal config");
+
+    let fit = {
+        let v = lmm_run_on(&mut ws, &opts.target_indices, None);
+        lmm_view_to_fit(&v, &x, &ids, n, p, &opts)
+    };
+
+    assert!(!fit.converged(), "a capped fit must not report converged");
+    assert!(
+        !fit.tau2.is_empty() && fit.tau2.iter().all(|v| v.is_finite()),
+        "plateau policy: capped endpoint must report tau2, got {:?}",
+        fit.tau2
+    );
+    assert!(
+        !fit.varcorr.is_empty() && fit.varcorr.iter().flatten().all(|v| v.is_finite()),
+        "plateau policy: capped endpoint must report varcorr, got {:?}",
+        fit.varcorr
+    );
+    assert!(
+        fit.dispersion.is_finite(),
+        "plateau policy: capped endpoint must report a finite dispersion"
+    );
+    assert!(
+        !fit.singular(),
+        "a capped endpoint reports singular = false"
     );
 }

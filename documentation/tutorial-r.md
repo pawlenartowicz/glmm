@@ -126,14 +126,23 @@ The knobs:
   single grouping factor and `≤ 3` random effects per group; **any other shape
   warns and falls back to Laplace** rather than erroring the way `lme4::glmer`
   does — the fit you get is a Laplace fit, and the warning is the only notice.
-- `dispersion` — Gamma dispersion directive: `NULL` (estimate φ̂ by Pearson, the
-  default), `"estimate"` (same), or a single number to hold φ fixed.
+- `dispersion` — Gamma dispersion directive: `NULL` (estimate φ̂ by maximum
+  likelihood, the default, on both a GLM and a GLMM, to place `logLik` at
+  its maximum — but the two routes report and scale the SE by different
+  numbers: a GLM's reported dispersion is the Pearson moment,
+  `summary(glm)`'s convention, a GLMM's is that ML φ̂ itself; on
+  inverse-Gaussian, GLM only, it is the Pearson moment), `"estimate"`
+  (same), or a single number to hold φ fixed.
 - `wald.se` — fixed-effect Wald-SE mode: `"hessian"` (default) or `"rx"`.
-- `weights` — per-row prior (case) weights, `lme4::glmer`'s `weights=`. For an
-  aggregated binomial, either write `cbind(successes, failures) ~ …` directly
-  in the formula, or pass the success **proportion** as the response and the
-  trial count here — the same model, spelled by hand. Weights must be
-  strictly positive.
+- `weights` — per-row prior weights, `lme4::glmer`'s `weights=`. On gaussian,
+  gamma and inverse-gaussian these are precision weights: row `i` gets
+  dispersion `φ/wᵢ`, the same convention as `lm`, `summary(glm)` and lme4,
+  not glmmTMB's, which multiplies each row's log-density by `wᵢ` instead
+  (see [`conventions.md`](conventions.md#prior-weights)). For an aggregated
+  binomial, either write `cbind(successes, failures) ~ …` directly in the
+  formula, or pass the success **proportion** as the response and the trial
+  count here — the same model, spelled by hand. Weights must be strictly
+  positive.
 - `offset` — per-row known additive term on the linear-predictor scale,
   `glm`'s `offset=`: `η = offset + Xβ (+ Zb)`, with no coefficient estimated
   for it and no column added to the design. The canonical use is a Poisson
@@ -173,7 +182,7 @@ shaped like lme4's. These **work**:
 
 | accessor | what it returns |
 |---|---|
-| `summary(fit)` | coefficient table — estimate, std. error, Wald **z**, `Pr(>|z|)` — plus the RE block and a dispersion/shape footer. **No** `AIC`/`BIC`/`logLik`/`deviance` line: the kernel surfaces no comparable log-likelihood, and a fake one would be worse than none. |
+| `summary(fit)` | coefficient table (estimate, std. error, Wald **z**, `Pr(>|z|)`), plus the RE block and a dispersion/shape footer. When the fit raised any warnings, the printed summary ends with a `Warnings:` section listing each one's tier, title and message. **No** `AIC`/`BIC`/`logLik`/`deviance` line: the kernel surfaces no comparable log-likelihood, and a fake one would be worse than none. |
 | `fixef(fit)` | named fixed-effect estimates; aliased (rank-deficient) columns are `NA`, as in `lm`/lme4. |
 | `vcov(fit)` | full `p × p` Wald covariance of β̂. |
 | `VarCorr(fit)` | variance components on the **SD/correlation** scale, one covariance per grouping, lme4-shaped; a `Residual` row (= `sigma()`) is printed for a gaussian mixed fit. |
@@ -186,16 +195,17 @@ shaped like lme4's. These **work**:
 | `logLik(fit)` | log-likelihood on `stats::logLik`'s scale, so `AIC()`/`BIC()` work; on the LMM paths this is the REML criterion (`REML = TRUE` attribute). |
 | `fit$diagnostics` | list with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; the top-level `fit$converged`/`fit$singular`/`fit$aliased` are unchanged and mirror the same values. |
 
-**Diagnostic conditions.** `fit` raises a warning for each note the kernel
-records, one of `"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`,
-`"fastglmm_unused_grouping_levels"`, `"fastglmm_re_design_scale_spread"` or
-`"fastglmm_hessian_se_fallback"`; a note kind newer than this package
-recognizes arrives as `"fastglmm_unknown_note"`. All inherit
-`"fastglmm_diagnostic"`, so one handler catches the whole channel. A design
-that is merely ill-conditioned (near-collinear but still distinguishable) is
-fitted and returns real numbers; the warning is how you find out its standard
-errors are honest but large. Select on the class rather than matching message
-text:
+**Diagnostic conditions.** `fit` raises a warning for anything worth knowing
+about the fit (a kernel note such as ill-conditioning, an ignored argument,
+or a non-convergence), each a classed condition inheriting
+`"fastglmm_diagnostic"`, so one handler catches the whole channel. The same
+information is also stored as a row (`tier`, `kind`, `title`, `message`) in
+`fit$warnings`, a data frame with one row per warning, in the order raised.
+`warnings.md` lists every kind; match on `kind` in scripts, since the title
+and message text can change between versions. A design that is merely
+ill-conditioned (near-collinear but still distinguishable) is fitted and
+returns real numbers; the warning is how you find out its standard errors are
+honest but large. Select on the class rather than matching message text:
 
 ```r
 withCallingHandlers(

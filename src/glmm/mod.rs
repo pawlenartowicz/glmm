@@ -1,8 +1,9 @@
 //! GLMM kernel: PIRLS + Laplace/AGQ, glmer-faithful nAGQ=1. Covers
-//! Binomial/Poisson/Gamma/negative-binomial with random effects; on NB the
-//! outer BOBYQA searches `ln θ_NB` as one more trailing coordinate alongside
-//! `[θ_RE | β]`, so β, θ_RE and θ_NB come out of one fit — see `fit_glmm`'s
-//! `nb_term`/`n_nb` handling. Optimized per
+//! Binomial/Poisson/Gamma/negative-binomial with random effects; on NB and
+//! Gamma the outer BOBYQA searches the dispersion (`ln θ_NB`, `ln φ`) as one
+//! more trailing coordinate alongside `[θ_RE | β]`, so β, θ_RE and the
+//! dispersion come out of one fit — see `fit_glmm`'s `nb_term`/`n_disp`
+//! handling. Optimized per
 //! `OuterSearch` (`GlmmWorkspace.outer_search`, fixed per shape at construction),
 //! mirroring lme4's structure (Bates, Mächler, Bolker, Walker, *JSS* 67(1), 2015,
 //! §3) on the two routes that use it: `Joint` runs one BOBYQA over `[θ | β]`
@@ -25,7 +26,7 @@
 //! `pirls_solve_blocked` (a single grouping, `A` block-diagonal),
 //! `pirls_solve_blocked_extras` (intercept-only crossed/nested extras, core
 //! blocks plus a crossed Schur), and `pirls_solve_packed` (everything else:
-//! fixed-width packed `M` rows and a dense `k×k` `A`) — see
+//! fixed-width packed `M` rows and a `k×k` `A`, dense or sparse-factored) — see
 //! `se::blocked_schur_fill`/`se::structured_schur_fill`/`se::packed_schur_fill`
 //! for their Schur complement fills. None of them materializes `Z` or `Λ_θ`
 //! densely. Designs over `classify_design`'s NoZ envelope take the packed-row
@@ -72,14 +73,32 @@ pub const PIRLS_MAX_ITERS: usize = 200;
 /// floor, not tuned to the exact minimum. The blocked and structured solve steps
 /// don't hit this regime and converge well inside the cap.
 pub const PIRLS_MAX_HALVINGS: usize = 16;
+/// Period-2 detector for the PIRLS iteration. Fisher scoring on a
+/// non-canonical link steps with the expected weight, while the curvature of
+/// the conditional log-density is the observed one. Where the observed
+/// curvature is more than twice the expected one along some direction, the
+/// undamped step overshoots, the iteration map has an eigenvalue at or below
+/// −1, and the iterates settle into a 2-cycle around the mode. The same-point
+/// penalized deviance then rises by less than the halving band per step, while
+/// the mixed stopping value keeps alternating by more than its band, so the
+/// solve would run out `PIRLS_MAX_ITERS`. After `PIRLS_OSC_TRIGGER`
+/// consecutive sign flips of the mixed step, each at least `PIRLS_OSC_RATIO`
+/// times the size of the one before, every later step of that solve is
+/// halved (relaxation ω = ½), which maps an eigenvalue λ of the undamped step
+/// to (1 + λ)/2. A solve that converges before the detector fires is
+/// bit-identical.
+pub const PIRLS_OSC_RATIO: f64 = 0.8;
+/// See [`PIRLS_OSC_RATIO`].
+pub const PIRLS_OSC_TRIGGER: usize = 3;
 /// The shapes whose stage-1 Profile solve is the EXACT Laplace β-profile and whose
 /// outer search is therefore θ-only (`OuterSearch::ExactProfile`): Laplace, a data
 /// term that is the plain deviance, and a PIRLS variant carrying the exact border —
 /// the blocked path (`pirls_solve_blocked`, either link class), plus the structured
 /// crossed/nested path (`pirls_solve_blocked_extras`), which carries an observed-
 /// information twin of its factor (core blocks, coupling, Schur) on both canonical
-/// and non-canonical links. Gamma's `gamma_aic` objective has a different β score and
-/// keeps the joint search; AGQ keeps theirs too. So does the packed-row layout
+/// and non-canonical links. Gamma's objective carries the `ln φ` coordinate and its
+/// dispersion term, so it has a different β score and keeps the joint search; AGQ
+/// keeps theirs too. So does the packed-row layout
 /// (`GlmmLayout::Packed`, `workspace.rs`), whose PIRLS carries no observed twin and
 /// therefore no exact border — `pirls_solve_packed` refuses a `ProfileExact` step
 /// outright. Read by the workspace constructor and by the driver's
@@ -111,7 +130,7 @@ pub(crate) fn exact_profile_shape(
 /// the quadratic basin), 3e-9 clears it at 5e-4; 1e-9 keeps a ~5× margin.
 /// The 1e-9 setting costs 2–4 extra inner iterations over a looser tolerance,
 /// but only until each canonical-link solve reaches its own quadratic floor —
-/// negligible on every rung's fit time (verified via `validation/compare.R`
+/// negligible on every rung's fit time (verified via `validation/grid/compare.R`
 /// full-suite pass, no rung regressed).
 pub const PIRLS_TOL_REL: f64 = 1e-9;
 /// PIRLS exit for NON-canonical links (probit, Gamma-log/inverse, NB-log) — a
@@ -124,7 +143,7 @@ pub const PIRLS_TOL_REL: f64 = 1e-9;
 /// canonical 1e-6 that ~1e-4 floor leaves β ~3e-3 off and the FD second
 /// differences (÷ step²) amplify the noise into a 7–41%-wrong `se_hessian`.
 /// Tightening removes that, but the accuracy PLATEAUS: a cbpp-probit tolerance
-/// sweep (see `fit::tests::fit_glmm_probit_cbpp_matches_lme4`) shows β pinned at
+/// sweep (see `fit::tests::fit_glmm_probit_cbpp_matches_glmmtmb`) shows β pinned at
 /// ~5e-5 (40× inside its 2e-3 golden limit) flat across 1e-8…1e-10, with a sharp
 /// cliff only at 1e-6→1e-7. 1e-8 sits one decade above the cliff: same β margin
 /// as 1e-10 (tighter buys no β safety, only iterations), `se_hessian` 34× inside
@@ -184,6 +203,25 @@ pub(crate) fn pirls_tol_fd(family: crate::spec::Family) -> f64 {
 /// silently a change to the other. Like any absolute bound on β this box is
 /// itself unit-dependent; that is a known, separate question.
 pub const BETA_BOX: f64 = 30.0;
+
+/// Box of the Gamma `ln φ` outer-search coordinate (`φ` the dispersion, shape
+/// `1/φ`). Wide on purpose: φ is a free maximum-likelihood parameter, and the
+/// box only keeps a probe away from overflow in `lnΓ(1/φ)` and from weights
+/// `prior_wᵢ/φ` past `f64` range.
+pub(crate) const GAMMA_PHI_LO: f64 = 1e-6;
+pub(crate) const GAMMA_PHI_HI: f64 = 1e6;
+/// Distance in `ln φ` below which a fitted φ̂ counts as on the box bound and the
+/// fit is refused (`fit_glmm`); BOBYQA projects onto the bound, so an incumbent
+/// that reached it sits there to round-off.
+const GAMMA_PHI_BOUND_TOL: f64 = 1e-6;
+
+/// Whether a fitted `ln φ̂` sits on a bound of the Gamma coordinate's box
+/// (within [`GAMMA_PHI_BOUND_TOL`]): an incumbent there describes the box, not
+/// a maximum of the likelihood, and `fit_glmm` refuses the fit.
+pub(crate) fn gamma_phi_on_box_bound(ln_phi: f64) -> bool {
+    ln_phi <= GAMMA_PHI_LO.ln() + GAMMA_PHI_BOUND_TOL
+        || ln_phi >= GAMMA_PHI_HI.ln() - GAMMA_PHI_BOUND_TOL
+}
 /// Base FD step for `joint_hessian_cov`'s joint-deviance Hessian. It is applied
 /// ASYMMETRICALLY across the joint (θ, β) vector: `h_θ = FD_STEP_BASE` absolute on
 /// the θ block, `h_β = FD_STEP_BASE·max(1, |β̂_k|)` relative on the β block.
@@ -341,7 +379,8 @@ pub enum FdHessianStatus {
 /// `ws.betas`, `ws.inference.var_diag`, `ws.inference.t_sq`; returns the GlmmFit summary.
 ///
 /// Convention: `wald_se` selects the fixed-effect covariance — `WaldSe::Rx`
-/// inverts the expected-information Schur complement directly (assumes β–θ
+/// inverts the Schur complement of the β information at the mode directly
+/// (observed where it differs from Fisher; assumes β–θ
 /// orthogonality; anticonservative for the GLMM); `WaldSe::Hessian` (glmer
 /// `use.hessian = TRUE`) sources it from the Hessian of the joint Laplace
 /// deviance instead (exact on every shape `derivative::supports_shape`
@@ -450,11 +489,47 @@ pub fn fit_glmm(
         ws.params[n_theta + j] = b.clamp(-BETA_BOX, BETA_BOX);
     }
 
-    // NB: the trailing outer-search coordinate starts at ln of the seed the
-    // adapter left in `nb_theta`, clamped into the bracket's box.
-    let n_nb = usize::from(matches!(ws.family, crate::Family::NegativeBinomial { .. }));
+    // NB and Gamma: the trailing outer-search coordinate. NB's starts at ln of
+    // the seed the adapter left in `nb_theta`; Gamma's at ln of the plug-in
+    // dispersion `D/Σw` of the β start with no random effect, the no-RE GLM's
+    // own deviance dispersion (the RE variance is charged to φ there, so the
+    // seed sits above φ̂). Both are clamped into the coordinate's box.
+    let is_gamma = matches!(ws.family, crate::Family::Gamma { .. });
+    // A caller-held Gamma φ (`GlmmWorkspace::gamma_phi_held`): every evaluation
+    // runs at it and the trailing coordinate is inert.
+    let held_phi = if is_gamma { ws.gamma_phi_held } else { None };
+    let n_disp = usize::from(matches!(
+        ws.family,
+        crate::Family::NegativeBinomial { .. } | crate::Family::Gamma { .. }
+    ));
     let m = n_theta + p;
-    if n_nb == 1 {
+    if is_gamma {
+        let fam = ws.family;
+        let (mut d, mut sw) = (0.0, 0.0);
+        for i in 0..n {
+            let mut eta = ws.offset.as_ref().map_or(0.0, |o| o[i]);
+            for j in 0..p {
+                eta += x[(i, j)] * ws.params[n_theta + j];
+            }
+            let mu = crate::family::clamp_mu(
+                fam,
+                crate::family::link_inv(fam, crate::family::clamp_eta(fam, eta)),
+            );
+            d += ws.prior_w[i] * crate::family::dev_resid(fam, f64::NAN, y[i], mu);
+            sw += ws.prior_w[i];
+        }
+        // Data the fixed effects reproduce exactly give `D = 0`, which rounds to
+        // either sign: the seed goes to the box floor then, never to `ln` of a
+        // non-positive number (a NaN start that BOBYQA refuses).
+        let disp = d / sw;
+        let disp = if disp.is_finite() && disp > 0.0 {
+            disp
+        } else {
+            GAMMA_PHI_LO
+        };
+        let disp = held_phi.unwrap_or(disp);
+        ws.params[m] = disp.ln().clamp(ws.lower[m], ws.upper[m]);
+    } else if n_disp == 1 {
         ws.params[m] = ws.nb_theta.ln().clamp(ws.lower[m], ws.upper[m]);
     }
 
@@ -535,6 +610,7 @@ pub fn fit_glmm(
         cluster_rows,
         layout,
         prior_w,
+        prior_w_phi,
         u_seed,
         wx,
         pirls,
@@ -551,7 +627,7 @@ pub fn fit_glmm(
         counters,
         ..
     } = ws;
-    // Joint vector's trailing `ln θ_NB` index.
+    // Joint vector's trailing `ln θ_NB` / `ln φ` index.
     let nb_col = n_theta + p;
     // x is fixed for this fit: widen the slope columns to f64 once (blocked AND
     // structured paths — `build_packed_m`'s primary-core reduction reads it the
@@ -587,13 +663,44 @@ pub fn fit_glmm(
     // times −2, so the optimum is the same point; the saturated term depends on
     // θ_NB alone. Same weights the
     // deviance carries (`prior_w`, when `weighted`).
+    //
+    // Gamma: `laplace_deviance` returns `D/φ + ‖u‖² + log|A|` (PIRLS on
+    // `prior_wᵢ/φ`, `prior_w` already the precision-normalised `ŵ = w/s` —
+    // see `fit::glmm::prep_glmm_design`); `family::gamma_dispersion_term` is
+    // the φ-only rest of `−2·Σᵢ log f(yᵢ; ŵᵢ/φ, μᵢ)`, so the sum is the exact
+    // Laplace deviance with φ a free parameter searched alongside θ and β.
+    let gamma_sum_ln_y = if is_gamma {
+        (0..n).map(|i| y[i].ln()).sum::<f64>()
+    } else {
+        0.0
+    };
     let nb_term = |ln_theta: f64| -> f64 {
+        if is_gamma {
+            return crate::family::gamma_dispersion_term(
+                ln_theta,
+                weighted.then_some(&prior_w[..n]),
+                n,
+                gamma_sum_ln_y,
+            );
+        }
         -2.0 * crate::fit::nb_profile_loglik(
             y,
             y,
             ln_theta.exp(),
             weighted.then_some(&prior_w[..n]),
         )
+    };
+    // The (θ_NB, φ) pair one evaluation runs at, off the trailing coordinate
+    // `c`, and the coordinate the dispersion term is read at: NB reads θ_NB =
+    // e^c at φ = 1, Gamma reads φ = e^c, and a held Gamma φ reads neither — the
+    // coordinate is inert and the objective is the fixed-φ Laplace deviance
+    // (its dispersion term a constant, restored in the reported deviance).
+    let disp_at = |c: f64| -> ((f64, f64), Option<f64>) {
+        match (is_gamma, held_phi) {
+            (true, Some(v)) => ((nb_theta, v), None),
+            (true, None) => ((nb_theta, c.exp()), Some(c)),
+            _ => ((c.exp(), 1.0), Some(c)),
+        }
     };
 
     // STAGE 1 — θ-only BOBYQA profiling β out of PIRLS at each candidate θ. On
@@ -626,8 +733,8 @@ pub fn fit_glmm(
     let mut finite_evals1 = 0usize;
     if let Some(mode) = stage1_mode.filter(|_| nagq == 1) {
         params_stage1[..n_theta].copy_from_slice(&params[..n_theta]); // θ₀ unchanged from the caller's params
-        if n_nb == 1 {
-            params_stage1[n_theta] = params[nb_col]; // ln θ_NB start, set before the search
+        if n_disp == 1 {
+            params_stage1[n_theta] = params[nb_col]; // ln θ_NB / ln φ start, set before the search
         }
         beta_prof[..p].copy_from_slice(&params[n_theta..n_theta + p]); // β₀ (GLM warm start)
         beta_seed[..p].copy_from_slice(&beta_prof[..p]);
@@ -650,14 +757,15 @@ pub fn fit_glmm(
             // Profile mode SWAPS the β buffers vs the Fixed stage-2 call below:
             // `beta = beta_prof` (in/out profiled β), `beta_step_rhs = beta_rhs`
             // (the δβ border scratch). See deviance.rs's buffer-role comment.
-            let (nb, coord) = if n_nb == 1 {
-                (theta[n_theta].exp(), Some(theta[n_theta]))
+            let ((nb, phi), coord) = if n_disp == 1 {
+                disp_at(theta[n_theta])
             } else {
-                (nb_theta, None)
+                ((nb_theta, 1.0), None)
             };
             let dev = laplace_deviance(
                 &data,
                 nb,
+                phi,
                 nagq,
                 &theta[..n_theta],
                 beta_prof,
@@ -671,6 +779,7 @@ pub fn fit_glmm(
                 // schur_fill rebuilds ws.border.schur from scratch, so this transient use
                 // is safe (no read survives into inference).
                 border,
+                prior_w_phi,
                 beta_rhs,
                 exact_prof,
                 // `mode` is `ProfilePql` on `PqlThenJoint`, `ProfileExact` on
@@ -728,7 +837,7 @@ pub fn fit_glmm(
         // a subsequent joint solve's init already lands in-box without a redundant
         // clamp — and `ExactProfile` never re-clamps at all.
         params[n_theta..nb_col].copy_from_slice(&beta_seed[..p]);
-        if n_nb == 1 {
+        if n_disp == 1 {
             params[nb_col] = params_stage1[n_theta];
         }
         stage1_out = Some(out1);
@@ -763,14 +872,15 @@ pub fn fit_glmm(
                 // far), not from 0. The conditional mode is point-determined, so the seed
                 // only shifts the stopping iterate within the PIRLS exit band.
                 pirls.u[..k].copy_from_slice(&u_seed[..k]);
-                let (nb, coord) = if n_nb == 1 {
-                    (gamma[nb_col].exp(), Some(gamma[nb_col]))
+                let ((nb, phi), coord) = if n_disp == 1 {
+                    disp_at(gamma[nb_col])
                 } else {
-                    (nb_theta, None)
+                    ((nb_theta, 1.0), None)
                 };
                 let dev = laplace_deviance(
                     &data,
                     nb,
+                    phi,
                     nagq,
                     gamma,
                     beta_rhs,
@@ -784,6 +894,7 @@ pub fn fit_glmm(
                     // (`beta_rhs` is `beta` above). Stage 1 above flips this to Profile
                     // (`ProfilePql` or `ProfileExact`, by `stage1_mode`).
                     border,
+                    prior_w_phi,
                     beta_prof,
                     exact_prof,
                     BetaMode::Fixed,
@@ -825,13 +936,20 @@ pub fn fit_glmm(
         )
     };
 
-    // NB: the incumbent's dispersion becomes the workspace's fixed θ_NB for
-    // everything downstream — the pinned re-eval, the SE path — which all read
-    // `ws.nb_theta` the way they read it for a fixed-θ fit.
-    if n_nb == 1 {
+    // NB / Gamma: the incumbent's dispersion becomes the workspace's fixed θ_NB
+    // or φ for everything downstream — the pinned re-eval, the SE path — which
+    // all read `ws.nb_theta` / `ws.gamma_phi` the way they read it for a
+    // fixed-dispersion fit.
+    if let Some(v) = held_phi {
+        ws.gamma_phi = v;
+        ws.params[nb_col] = v.ln();
+    } else if is_gamma {
+        ws.gamma_phi = ws.params[nb_col].exp();
+    } else if n_disp == 1 {
         ws.nb_theta = ws.params[nb_col].exp();
     }
     let nb_theta = ws.nb_theta;
+    let gamma_phi = ws.gamma_phi;
     // The reported deviance's NB correction: `−2·saturated_loglik(θ̂)`, NOT
     // `nb_term(θ̂)`. `nb_term` (used above, inside the search only) is
     // `−2·nb_profile_loglik(y,y,θ,w)`, which differs from `−2·saturated_loglik`
@@ -841,7 +959,16 @@ pub fn fit_glmm(
     // `deviance = −2·loglik` hold. Cached now, as a plain f64: this reads
     // `prior_w` out of the destructure above, a borrow the pinned re-eval's own
     // reborrow of `ws.prior_w` further down cannot coexist with.
-    let nb_dev_term = if n_nb == 1 {
+    // Gamma's term is the search's own: `gamma_dispersion_term` carries every
+    // constant of `−2·Σ log f` already, so `deviance = −2·loglik` holds with it.
+    let nb_dev_term = if is_gamma {
+        crate::family::gamma_dispersion_term(
+            gamma_phi.ln(),
+            weighted.then_some(&prior_w[..n]),
+            n,
+            gamma_sum_ln_y,
+        )
+    } else if n_disp == 1 {
         -2.0 * crate::family::saturated_loglik(
             family,
             nb_theta,
@@ -933,6 +1060,7 @@ pub fn fit_glmm(
             layout,
             z_buf,
             prior_w,
+            prior_w_phi,
             pirls,
             packed,
             structured,
@@ -969,6 +1097,7 @@ pub fn fit_glmm(
         final_deviance = laplace_deviance(
             &data,
             nb_theta,
+            gamma_phi,
             nagq,
             &params[..],
             beta_rhs,
@@ -978,6 +1107,7 @@ pub fn fit_glmm(
             pattern,
             packed,
             border,
+            prior_w_phi,
             // Pinned-γ̂ re-eval is β-FIXED (reports the fitted β); Profile border
             // scratch inert. `beta_prof` is the spare distinct buffer.
             beta_prof,
@@ -1009,6 +1139,12 @@ pub fn fit_glmm(
     // report `Converged` off an all-infeasible simplex (PRIMA maps `+inf` to the
     // FUNCMAX ceiling). Do NOT remove it.
     let ok = ok && final_deviance.is_finite();
+    // Gamma: a φ̂ on either bound of the `ln φ` box is not a maximum-likelihood
+    // estimate. The box only keeps probes away from overflow; a search that
+    // runs into it is following a likelihood that keeps rising as φ → 0 (data
+    // the mean model reproduces exactly) or φ → ∞, and the incumbent there
+    // describes the box, not the data.
+    let ok = ok && !(is_gamma && held_phi.is_none() && gamma_phi_on_box_bound(ws.params[nb_col]));
 
     if !ok {
         return nan_fit(ws, target_indices, n_eval);
@@ -1019,7 +1155,7 @@ pub fn fit_glmm(
     }
 
     // Var(β̂): `Rx` inverts the β-information (Schur) directly — fast, but the
-    // expected-information Schur complement assumes β–θ orthogonality (exact for
+    // Schur complement of the information at the mode assumes β–θ orthogonality (exact for
     // the Gaussian LMM, anticonservative for the GLMM where IRLS weights couple
     // β,θ). `Hessian` (default) sources Var(β̂) from the Hessian of the joint
     // Laplace deviance (glmer `use.hessian = TRUE`), the lme4 "correct" denom —
@@ -1045,18 +1181,11 @@ pub fn fit_glmm(
             if !inf_ok {
                 return nan_fit(ws, target_indices, n_eval);
             }
-            // Gamma carries lme4's σ̂² on the RX vcov (`vcov(use.hessian=FALSE)` =
-            // σ̂²·Schur⁻¹); fixed-scale families σ̂²≡1. Computed off the converged
-            // μ̂/û the pinned-γ̂ re-eval left. The Hessian arm is NOT scaled — the
-            // dispersion enters its objective via `gamma_aic`, and its unscaled SE
-            // is the oracle-settled match to `vcov(use.hessian=TRUE)`.
-            let sigma_sq = crate::family::glmm_sigma_sq(
-                family,
-                &y[..n],
-                &ws.pirls.prob[..n],
-                &ws.pirls.u[..ws.k],
-                ws.weighted.then(|| &ws.prior_w[..n]),
-            );
+            // No scale factor on any family: on Gamma the Schur is built from
+            // the working weights of the pinned re-eval, which carry `1/φ̂`
+            // (PIRLS runs on `prior_wᵢ/φ̂`), so Schur⁻¹ is already `φ̂·RX⁻¹` —
+            // the fitted objective's own information, φ̂ its ML value. lme4's
+            // `pwrss/n` belongs to lme4's φ-free objective and does not apply.
             // Var(β̂)_jj from chol(Schur) forward-solve (mirrors fit_lmm's recovery).
             let sc = match ws.border.schur.as_ref().llt(faer::Side::Lower) {
                 Ok(c) => c,
@@ -1079,8 +1208,7 @@ pub fn fit_glmm(
                 let vd: f64 = ws.inference.fwd_solve[..p]
                     .iter()
                     .map(|v| v * v)
-                    .sum::<f64>()
-                    * sigma_sq;
+                    .sum::<f64>();
                 ws.inference.var_diag[tj] = vd;
                 ws.inference.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
                     ws.betas[tj] * ws.betas[tj] / vd
@@ -1104,19 +1232,18 @@ pub fn fit_glmm(
                     for i in 0..p {
                         acc += ws.inference.vcov_cols[(i, a)] * ws.inference.vcov_cols[(i, b)];
                     }
-                    ws.inference.vcov[(a, b)] = acc * sigma_sq;
-                    ws.inference.vcov[(b, a)] = acc * sigma_sq;
+                    ws.inference.vcov[(a, b)] = acc;
+                    ws.inference.vcov[(b, a)] = acc;
                 }
             }
-            // Joint Wald-χ² via the lme helper (Schur is the β-information; σ̂²
-            // divides W as in the LMM caller — 1 except Gamma).
+            // Joint Wald-χ² via the lme helper (Schur is the β-information).
             if target_indices.is_empty() {
                 f64::NAN
             } else {
                 crate::lmm::joint_wald_chi_sq(
                     ws.border.schur.as_ref(),
                     &ws.betas,
-                    sigma_sq,
+                    1.0,
                     target_indices,
                     ws.inference.joint_k_inv.as_mut(),
                     ws.inference.joint_sigma_t_chol.as_mut(),

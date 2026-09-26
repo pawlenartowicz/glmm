@@ -4,7 +4,7 @@
 # recipe's printed comparison numbers come from the golden file, never typed
 # by hand.
 #
-# Tolerance constants mirror validation/tol.R (kept as constants here rather
+# Tolerance constants mirror validation/grid/tol.R (kept as constants here rather
 # than sourced, since tol.R defines a much larger list tied to the harness's
 # own loader).
 
@@ -21,7 +21,7 @@ load_golden <- function(name) {
   jsonlite::fromJSON(file.path(.oracle_dir(), paste0(name, ".json")))
 }
 
-# validation/tol.R
+# validation/grid/tol.R
 TOL_BETA_REL <- 1e-3
 TOL_SE_REL <- 1e-3
 TOL_SE_HESSIAN_REL <- 1e-3

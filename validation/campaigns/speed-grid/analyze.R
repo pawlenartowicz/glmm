@@ -1,10 +1,10 @@
 #!/usr/bin/env Rscript
 # Study-A analysis over the campaign JSONLs. Usage:
 #   Rscript analyze.R <glmm.jsonl> <mixedmodels.jsonl> [lme4.jsonl]
-# Correctness gate: compare.R's beta tolerance (tol.R) against the MixedModels
+# Correctness gate: the beta agreement band in common.R against the MixedModels
 # reference (lme4 where present breaks glmm-vs-MM ties). Deviance scales are
-# aligned to lme4's -2*logLik convention: LMM glmm + df*(1+log(2pi)) (validated
-# in-crate, Task 2); GLMM glmm - 2*logL_saturated(y) (validated below against
+# aligned to lme4's -2*logLik convention: LMM glmm + df*(1+log(2pi)) (the
+# constant the crate's own tests pin); GLMM glmm - 2*logL_saturated(y) (validated below against
 # any cell where both engines converged -- the offset must be constant per cell
 # family; hard-stop if not).
 suppressMessages({ library(jsonlite) })
@@ -13,12 +13,12 @@ args <- commandArgs(TRUE)
 if (length(args) < 2) stop("usage: analyze.R glmm.jsonl mm.jsonl [lme4.jsonl]")
 suite_dir <- normalizePath(dirname(sub(
   "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))))
-source(file.path(suite_dir, "..", "..", "tol.R"))
+source(file.path(suite_dir, "common.R"))
 # Durable summaries (committed) live under reports/, not results/ (gitignored).
 out_dir <- file.path(suite_dir, "reports")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-# read_jsonl lives in tol.R (sourced above), torn-line tolerant.
+# read_jsonl lives in common.R (sourced above), torn-line tolerant.
 glmm <- read_jsonl(args[1]); mm <- read_jsonl(args[2])
 
 # JIT guard: fit.jl warm-up-fits each cell and records compile_seconds

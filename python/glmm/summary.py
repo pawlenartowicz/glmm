@@ -12,7 +12,7 @@ together.
 
 import html as _html
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -31,11 +31,25 @@ _VARIANCE = {
 # others phi == 1 (negbin's `dispersion` is theta, already inside V).
 _PHI_FAMILIES = {"gaussian", "gamma", "inversegaussian"}
 
-_DISPERSION_LABEL = {
-    "gamma": "Dispersion (phi, Pearson)",
-    "inversegaussian": "Dispersion (phi, Pearson)",
-    "negativebinomial": "Shape (theta)",
-}
+
+def _dispersion_label(fit):
+    """Gamma phi is the Pearson moment on a GLM and the maximum-likelihood
+    value on a GLMM; inverse-Gaussian phi is always the Pearson moment. A
+    held `dispersion=` value (Gamma or inverse-Gaussian) reports as fixed
+    regardless of family or mixedness. The R port prints the same; change
+    together."""
+    if fit.family == "negativebinomial":
+        return "Shape (theta)"
+    if fit.family not in ("gamma", "inversegaussian"):
+        return None
+    # getattr, not fit.dispersion_held: a Fit pickled before this attribute
+    # existed still needs to summarize.
+    if getattr(fit, "dispersion_held", None) is not None:
+        return "Dispersion (phi, fixed)"
+    if fit.family == "gamma" and len(fit.varcorr) > 0:
+        return "Dispersion (phi, ML)"
+    return "Dispersion (phi, Pearson)"
+
 
 # Same sentence the R port prints - change together.
 FOOTNOTE = (
@@ -206,13 +220,16 @@ def build_summary(fit):
         p_value=p,
         aliased=aliased,
         corr_fixed=corr_fixed,
-        dispersion_label=_DISPERSION_LABEL.get(fit.family),
+        dispersion_label=_dispersion_label(fit),
         dispersion=fit.dispersion,
         n_eval=fit.n_eval,
         converged=fit.converged,
         singular=fit.singular,
         n_aliased=int(aliased.sum()),
         footnote=FOOTNOTE,
+        # getattr, not fit.warnings: a Fit pickled before this attribute existed
+        # still needs to summarize.
+        warnings=list(getattr(fit, "warnings", [])),
     )
 
 
@@ -243,6 +260,7 @@ class Summary:
     singular: bool
     n_aliased: int
     footnote: str
+    warnings: list = field(default_factory=list)
 
     def __repr__(self):
         return self.text()
@@ -324,6 +342,12 @@ class Summary:
         if self.singular:
             out.append("boundary (singular) fit: see help('isSingular')")
         out.append(self.footnote)
+        if self.warnings:
+            # Mirrors print.summary.fastglmm (r/R/fastglmm-methods.R) - change together.
+            out += ["", "Warnings:"]
+            out += [
+                f"{w['tier'].capitalize()}: {w['title']}. {w['message']}" for w in self.warnings
+            ]
         return "\n".join(out)
 
     # -- shared block decomposition ---------------------------------------

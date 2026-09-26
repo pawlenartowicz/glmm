@@ -1,0 +1,25 @@
+{
+  "dataset": "glm_binomial_agg",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "binomial",
+  "reml": null,
+  "rung": 30,
+  "converged": true,
+  "singular": false,
+  "optimizer": "glm.fit",
+  "n_eval": 4,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.321257022593468, 0.661183638511582],
+    "se_rx": [0.0483283906759349, 0.0526870315755393],
+    "loglik": -283.420857219148,
+    "varcomp": []
+  },
+  "timing": {
+    "fit_seconds_median": 0.00926017761230469,
+    "n_runs": 4,
+    "warmup_discarded": 1,
+    "fits_per_sample": 10
+  }
+}

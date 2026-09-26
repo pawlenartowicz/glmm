@@ -1,0 +1,38 @@
+{
+  "dataset": "glmm_poisson",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "poisson",
+  "reml": null,
+  "rung": 37,
+  "converged": true,
+  "singular": false,
+  "optimizer": "Nelder_Mead",
+  "n_eval": 99,
+  "tolPwrss": 1e-13,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.545105343817118, 0.386217558664878],
+    "se_hessian": [0.145666181203408, 0.040394644245973],
+    "se_rx": [0.145058100825546, 0.040408565951028],
+    "loglik": -546.974075819077,
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)"],
+        "stddev": [0.533586971149394],
+        "corr": [
+          [1]
+        ],
+        "stddev_se": [0.1143035208354]
+      }
+    ]
+  },
+  "timing": {
+    "fit_seconds_median_rx": 0.0590178966522217,
+    "fit_seconds_median_hessian": 0.05672287940979,
+    "n_runs": 4,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

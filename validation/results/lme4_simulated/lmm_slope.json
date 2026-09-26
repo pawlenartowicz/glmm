@@ -1,0 +1,37 @@
+{
+  "dataset": "lmm_slope",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 35,
+  "converged": true,
+  "singular": false,
+  "optimizer": "nloptwrap",
+  "n_eval": 43,
+  "tolPwrss": {},
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [1.41537907959544, 0.824714088435327],
+    "se": [0.236185006205946, 0.149167796652958],
+    "loglik": -374.966077906399,
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [1.13744663561856, 0.686838340757368],
+        "corr": [
+          [1, 0.341718954781152],
+          [0.341718954781152, 1]
+        ]
+      }
+    ],
+    "sigma": 0.690103275400332
+  },
+  "timing": {
+    "fit_seconds_median": 0.162861347198486,
+    "n_runs": 4,
+    "warmup_discarded": 1,
+    "fits_per_sample": 10
+  }
+}

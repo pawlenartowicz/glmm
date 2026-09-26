@@ -1,74 +1,85 @@
 # How glmm is validated
 
-## Two independent reference engines
+## The accuracy grid
 
-Every validated model is fit three ways: on the same data, with the same
-formula, in R `lme4` and in Julia `MixedModels.jl`, then compared against
-`glmm`. Two independently-implemented engines agreeing with each other
-within tolerance is the truth condition `glmm` is held to — not agreement
-with either engine alone.
+`glmm` is validated against a grid of 773 model cells in `validation/grid/`. Each
+cell fixes a family, a link, a random-effect structure, a size, a balance and a
+regime, and — where the data is simulated — records the parameters it was
+generated from. A cell is fitted by `glmm` and by every external engine that can
+fit it, on the same data and the same formula, and the results land in one JSONL
+record per cell per engine.
 
-## The references are frozen; disagreement is documented
+Four external engines are the oracles, each pinned to an exact version:
 
-The reference data and reference results are frozen and never move to
-accommodate `glmm`. A reference result is only regenerated when the
-reference's own model spec is proven wrong (wrong formula, family, or link),
-and that requires a recorded justification. Tolerances are never relaxed to
-make `glmm` pass.
+| Oracle | Version | Cells it fits | Estimator |
+|---|---|---|---|
+| R `lme4` | 2.0-6 | every family; negative binomial through `glmer.nb` | Laplace, scalar AGQ |
+| R `glmmTMB` | 1.1.14 | every family but inverse-Gaussian (771 of 773 cells) | Laplace |
+| Julia `MixedModels.jl` | 5.9.0 | gaussian, binomial logit/probit, Poisson | Laplace |
+| R `GLMMadaptive` | 0.9-7 | non-gaussian, one grouping factor | AGQ |
 
-The comparison is a reference check rather than a pass/fail gate. Where
-`glmm` and a reference disagree beyond the agreement band, the disagreement
-has to be written up and registered in
-[`../validation/divergences.json`](../validation/divergences.json) before it
-passes; an unregistered one, one that outgrows its registered magnitude, and
-a registered one that stops firing all fail the run. Every reported
-divergence is printed with its direction, so none of this is silent. Where
-the two reference engines disagree with each other beyond tolerance, that is
-recorded as a flag to investigate — the harness never silently picks
-whichever one is closer to `glmm`, and no `glmm`-side entry may excuse it.
+The pins are in `validation/grid/versions.json`. A version bump is a deliberate
+event: that oracle is rerun over the whole grid into a **new** run directory, and
+no existing run is ever edited.
+
+## No engine is "the" reference
+
+`glmm` is not gated against one chosen engine. `validation/grid/compare.R` applies
+four checks:
+
+1. **Deviance against the best oracle (hard).** On a cell's estimator arm every
+   engine minimises the same objective, so after convention alignment a converged
+   deviance worse than the best oracle's is a real regression and fails. An
+   equal-or-better deviance always passes. A gap larger than the mismatch
+   threshold in either direction fails as a suspected convention bug, not a fit
+   result.
+2. **Parameters against the nearest oracle.** Fixed effects, standard errors by
+   matching method, random-effect standard deviations and correlations pass when
+   they are within band of at least one oracle that fitted the cell. Out of band
+   against all of them passes only under an entry in
+   `validation/grid/divergences.json`: an undocumented difference fails, one that
+   outgrows its entry fails, and an entry that stops firing fails as stale.
+3. **Error against the truth, per family (hard).** On the generated cells the
+   per-cell error against the generating parameters is averaged per family and
+   estimator arm, for `glmm` and for every oracle. `glmm` fails the family if it
+   is worse than the best oracle by more than the paired band. This is the check
+   that makes an oracle's own defect visible rather than contagious.
+4. **Port gates (hard).** The Python and R packages wrap the same Rust kernel, so
+   they are compared against the Rust engine at a round-off band. A miss is a
+   wiring bug, never a divergence.
+
+Where two oracles disagree with **each other**, that is recorded as a flag to
+investigate. It is never resolved by picking whichever one sits closer to `glmm`.
 
 ## What is covered
 
-The suite spans Gaussian, binomial, Poisson, and Gamma models across a
-range of random-effect shapes (intercept-only, correlated slopes, nested
-and crossed grouping, canonical and non-canonical links, dense and sparse
-routing). The exact dataset list and per-dataset model
-spec is the single source of truth in
-[`../validation/manifest.json`](../validation/manifest.json); prior (case)
-weights get their own manifest rungs (`tier: "weights"`, rungs 29-43).
-The Python and R packages are not compared against lme4/MixedModels.jl
-directly — they wrap the same Rust kernel, so they are gated against the
-Rust engine's own results at a round-off tolerance, confirming the wrapper
-introduces no numerical drift.
+Gaussian, binomial (logit, probit, cloglog; Bernoulli and trials>1), Poisson,
+Gamma (log and inverse) and negative binomial, across intercept-only, correlated
+slopes, nested, crossed and sparse-routed structures, from 60 to 30000 rows, plus
+offsets, prior weights, AGQ cells, boundary cells where the true random-effect
+standard deviation is zero, and the `lme4`/`nlme` example datasets. Inverse-Gaussian
+has no mixed-model path in the kernel and appears as GLM cells only.
 
-## Tolerances and known exemptions
-
-Tolerances are per-quantity, not a single global threshold, because point
-estimates and standard errors have different natural agreement bands: fixed
-effects and variance-component standard deviations are compared at a
-relative tolerance, the log-likelihood at an absolute tolerance on the
-shared scale (looser for GLMM than LMM, since GLMM compares two different
-Laplace-approximation optimizers on the same objective rather than a
-near-exact profiled criterion), and standard errors similarly at a relative
-tolerance. All bands were set from the measured worst case at freeze plus a
-margin, and are never widened to accommodate a failure.
-
-The one recorded, permanent exemption is the GLMM standard-error method
-split: `glmm` and lme4 both compute a Hessian-based standard error (which
-keeps the θ–β coupling), but MixedModels.jl computes only the Rx variant
-(conditional on the estimated variance components). The comparison matches
-method to method — Rx against Rx, Hessian against Hessian — rather than
-comparing across methods, which would manufacture a spurious disagreement.
-Where lme4 and MixedModels.jl disagree with each other on a shared
-quantity, that is recorded as a flag for investigation, never resolved by
-picking whichever reference happens to sit closer to `glmm`.
+Two smaller tiers sit alongside the grid and need no external engine: tight pins on
+numbers proven correct before they were recorded, asserted on every push, and a
+cross-engine tier over the frozen single-engine references in
+`validation/goldens/` and `validation/results/lme4_simulated/`, run with
+`cargo test --features oracle-tests`.
 
 ## Running it yourself
 
-From `validation/`, `./run.sh` fits `glmm` (Rust) and its Python and R ports
-and compares them against the existing reference results on disk — R and
-Julia are not refit, so this is the fast path for iterating on `glmm`
-itself. `./run.sh --oracles` refits all engines, including the R and Julia
-references, for when the oracle itself needs regenerating. See
-[`../validation/README.md`](../validation/README.md) for the full directory layout,
-result schema, and running instructions.
+From `validation/grid/`:
+
+```sh
+./run.sh glmm --fast              # fit the fast subset with glmm
+./run.sh lme4                     # fit the whole grid with an oracle
+Rscript compare.R                 # the four gates over the newest runs
+Rscript summarize_accuracy.R      # per-cell and per-family report, no gate
+```
+
+Every run gets its own never-overwritten directory under
+`validation/grid/runs/<engine>/`. A `glmm` run lands in `scratch/` unless started
+with `--keep`. `--timed` needs a locked CPU clock and refuses to start without one.
+See [`../validation/README.md`](../validation/README.md) for the directory layout
+and the flags. The JSONL record's fields are defined in
+`validation/grid/engines/common.rs`'s `base_record`.

@@ -1,0 +1,20 @@
+{
+  "engine": "mixedmodels",
+  "engine_version": "5.9.0",
+  "machine": "centrum-zarzdzania-swiatem",
+  "date": "2026-09-23T12:14:15+02:00",
+  "glmm_crate_version": "0.4.0",
+  "glmm_git_rev": "d151aec1e378bc3b5beac3ffda8df4f3558daa5d",
+  "subset": "full",
+  "timed": null,
+  "timed_unlocked": false,
+  "no_turbo": "0",
+  "pin_cores": "0-1",
+  "jobs": 2,
+  "loadavg_start": "3.19 3.12 3.10",
+  "r_version": "4.5.3",
+  "julia_version": "1.12.6",
+  "label": "oracle pin",
+  "cells": 458,
+  "cell_list": []
+}

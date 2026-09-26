@@ -698,7 +698,7 @@ impl LmmGroupings {
     ///
     /// The box changes BOBYQA's interpolation set and trust-region steps on
     /// every fit, boundary or not, so the bit-identity dumps
-    /// (`validation/bit_identity/`) were re-pinned with it.
+    /// (`validation/tools/bit_identity/`) were re-pinned with it.
     pub fn blind_theta_and_bounds(&self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let n = self.n_theta();
         let mut theta = vec![THETA0; n];
@@ -2217,7 +2217,8 @@ pub fn fit_lmm(
             // all-THETA0 start put off-diagonal vech entries at 1.0 — off the
             // lme4/MixedModels unit-diagonal convention — and on the wide-slope
             // grid stratum that start funnels BOBYQA into a second-best optimum
-            // in 8/9 cells (regression goldens at validation/goldens/optima/ pin
+            // in 8/9 cells (regression goldens at
+            // validation/campaigns/speed-grid/optima/ pin
             // the correct optimum). Mirrors the GLMM joint seed
             // (`glmm::fit_glmm`'s θ cold start), which carries the same rule.
             for t in theta.iter_mut() {

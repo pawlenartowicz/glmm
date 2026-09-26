@@ -2,9 +2,10 @@
 
 A negative-binomial GLM: `dispersion` on the returned `Fit` is theta-hat, the
 NB shape parameter (`MASS::glm.nb`'s `theta`), not phi -- unlike gamma or
-inverse-Gaussian, where `dispersion` is the Pearson phi. Overdispersion
-relative to Poisson is 1/theta; a large theta means "close to Poisson", not
-"a lot of extra variance".
+inverse-Gaussian, where `dispersion` is phi: on a GLM (this recipe's shape)
+the Pearson moment, on a gamma GLMM the maximum-likelihood value instead.
+Overdispersion relative to Poisson is 1/theta; a large theta means "close to
+Poisson", not "a lot of extra variance".
 
 Data: validation/data/simulated/sim_nb.csv (a fixture generated for the
 validation harness, since no lme4-bundled dataset exercises negative

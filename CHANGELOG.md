@@ -6,7 +6,110 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
-## [0.4.0] — 2026-09-22
+## [0.4.1] — Unreleased
+
+GLMMs on non-canonical links and Gamma GLMMs now reach the maximum of the
+Laplace likelihood itself, which is glmmTMB's objective and not lme4's. A
+Gamma GLMM's dispersion is maximum likelihood. Prior weights are precision
+weights on every family with a dispersion, and a Gamma or inverse-Gaussian
+GLM's `Fit::loglik` is the maximised precision log-likelihood, not R's
+case-weight one.
+Negative-binomial and Gamma GLMMs take `nagq > 1`. PIRLS no longer stalls in
+a two-cycle, and the packed layout factors a sparse matrix. Every warning a
+fit raises is now also
+kept on the fit, with a tier, and a fit that did not converge always raises one
+severe warning.
+
+### Changed
+
+- **The Laplace log-determinant uses the observed curvature on non-canonical
+  links** (probit, cloglog, negative binomial, Gamma with the log link). It used
+  the expected (Fisher) weight, as lme4 does, which is not the curvature of the
+  integrand at the mode. On the eight affected validation goldens glmm now
+  matches glmmTMB's deviance to 8e-5 (to 2e-9 on five of them) and its
+  parameters inside the cross-engine bands; against lme4 the fixed effects move by up to 7.9 % on
+  cloglog and more on Gamma. Canonical links do not change. `WaldSe::Rx` and
+  the AGQ node scale use the observed curvature too.
+- **A Gamma GLMM estimates φ by maximum likelihood,** as one more coordinate of
+  the outer search. It profiled φ as `D/n` inside the objective before, which
+  is not a maximum. `Fit::dispersion` is that φ̂, `Fit::loglik` the maximised
+  Laplace log-likelihood, the joint-Hessian SEs carry φ's uncertainty, and
+  `WaldSe::Rx` is `φ̂·RX⁻¹`. The reported deviance carries every normalising
+  constant of the Gamma log-density, so `deviance = −2·logLik` exactly. A fit
+  whose φ̂ lands on the edge of its search box (`[1e-6, 1e6]`, reached by data
+  the fixed effects reproduce almost exactly) is reported as not converged. On
+  a weighted fit the box applies to `φ/w̄`, the normalised scale, so the edge
+  sits at `w̄·[1e-6, 1e6]` in raw units.
+- **A held Gamma dispersion (`FitOptions::dispersion = Some(v)`) is now held
+  on a GLMM.** The fit used to estimate φ anyway and only report `v`; it now
+  maximises over θ and β at φ = v, and the SEs carry no φ row.
+- **Prior weights are precision weights on every family with an estimated
+  dispersion** — Gaussian, Gamma, inverse-Gaussian: row `i` has dispersion
+  `φ/wᵢ`, the same convention as `lm`, `summary(glm)` and lme4. Multiplying
+  every weight by the same constant does not change the fit (φ̂ scales with
+  it). glmmTMB instead multiplies each row's log-likelihood by `wᵢ`; see its
+  `dispformula` offset recipe in `conventions.md` to reproduce glmm's fit
+  there. Binomial weights are trial counts, Poisson gives the same fit either
+  way, and NB weights multiply the log-likelihood.
+- **A Gamma or inverse-Gaussian GLM's `Fit::loglik` is the maximised
+  log-likelihood of the precision model,** at the ML φ̂. It was
+  `logLik.glm`'s: each row's log-density multiplied by `wᵢ`, with φ plugged
+  in at `D/Σwᵢ`. A Gamma GLM's SEs and `Fit::dispersion` stay
+  `summary(glm)`'s Pearson moment, `Σ wᵢrᵢ²/(n − p)`, unchanged.
+- **Negative-binomial GLMM standard errors carry the uncertainty in θ_NB.** The
+  joint Hessian gains the `ln θ_NB` row, as glmmTMB's has; before, the SEs
+  conditioned on θ̂_NB as lme4's do. On `sim_nb` the intercept SE moves from
+  0.16317 to 0.16386.
+- **PIRLS damps a two-cycle.** When the step overshoots the mode on alternate
+  iterations it is halved, and a trial with a non-finite deviance counts as an
+  overshoot. The fifteen accuracy-grid cells that ended `PirlsExhausted` now
+  converge.
+- **The packed layout factors its PIRLS matrix sparsely** when it is large and
+  sparse enough. The switch point is provisional until it is measured on a
+  locked machine.
+- **A negative-binomial GLMM whose no-RE prefit failed seeds θ_NB at 1.**
+- **Python and R print Gamma's dispersion as `Dispersion (phi, Pearson)` on
+  a GLM and `Dispersion (phi, ML)` on a GLMM,** and `Dispersion (phi, fixed)`
+  when `dispersion=`/`dispersion` holds φ, on any family that takes one.
+- **Every warning text was rewritten** in plain words, as
+  `<Tier>: <title>. <message>`. Code that matches on message text (for example
+  "boundary (singular) fit") must match on `kind` or the class instead.
+- **The singular, AGQ-fallback and ignored-argument warnings now have classes**
+  under `DiagnosticWarning` / `fastglmm_diagnostic`, so filtering that channel
+  silences them too.
+- **`nagq` / `nAGQ` above 1 on a Gaussian model or one without random effects**
+  is an ignored-argument note, not an AGQ-fallback caution.
+- **A GLMM stopped at its evaluation budget reports `tau2`, `varcorr` and
+  dispersion** at its best point instead of NaN, as the LMM already did.
+- **`singular` is no longer set on a fit that did not converge** (LMM and GLMM).
+- **A negative-binomial GLM whose shape search hits its 25-round cap** now
+  reports β and SEs refit at the reported θ; before, they came from the
+  previous θ.
+
+### Added
+
+- **`nagq > 1` on negative-binomial and Gamma GLMMs.** Adaptive quadrature was
+  refused for both before.
+- **`m.warnings` / `m$warnings`:** every warning a fit raised, with `tier`,
+  `kind`, `title` and `message`. The list of warnings is
+  `documentation/warnings.md`. The text summary in both ports ends with a
+  `Warnings:` section.
+- **Severe warnings for non-converged fits:** `search_limit`, `fit_failed`,
+  `glm_diverged`, `design_unsolvable`, `too_few_rows`, `no_coefficients` and
+  `constant_response`. Before, a non-converged fit raised nothing.
+- **`Note::NbShapeUnsettled`** (Rust, additive; `Note` is `#[non_exhaustive]`)
+  and its caution `nb_shape_unsettled` in both ports.
+- **Python: 11 warning categories** (`SearchLimitWarning`, `FitFailedWarning`,
+  `GlmDivergedWarning`, `DesignUnsolvableWarning`, `ConstantResponseWarning`,
+  `TooFewRowsWarning`, `NoCoefficientsWarning`, `SingularFitWarning`,
+  `AgqFallbackWarning`, `ArgumentIgnoredWarning`, `NbShapeUnsettledWarning`) and
+  `Fit.warnings`. R: the matching `fastglmm_<kind>` condition classes.
+- **`Fit.dispersion_held` (Python) / `$dispersion_held` (R):** the numeric
+  `dispersion=`/`dispersion` argument the caller held φ at, `None`/`NULL`
+  when it was estimated. `summary()`'s dispersion label reads it to print
+  `(phi, fixed)` instead of `(phi, ML)`/`(phi, Pearson)`.
+
+## [0.4.0] — Unreleased
 
 The default standard errors of a GLMM are much cheaper. The sparse route now
 tries an exact Hessian first and keeps the finite-difference Hessian as its

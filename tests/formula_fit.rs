@@ -8,7 +8,7 @@
 //! `tests/validation_oracle.rs` refits `sleepstudy_lmm`, `penicillin_lmm`,
 //! `pastes_lmm`, `cbpp_agq_k1` and `grouseticks_agq_k1` from each golden's own
 //! recorded formula — through this same frontend — and gates them against the
-//! frozen lme4 values at `validation/tol.R`'s bands. This file does not repeat
+//! frozen lme4 values at `validation/grid/tol.R`'s bands. This file does not repeat
 //! that comparison: doing so would assert nothing the oracle tier does not
 //! already assert more tightly. What is left is the one claim the oracle tier
 //! cannot make, because it only ever fits through the frontend: that the

@@ -114,14 +114,33 @@ def test_nagq_max_odd_fits():
     assert result.converged
 
 
+@pytest.mark.parametrize(
+    ("family", "response"),
+    [("negativebinomial", "y_pois"), ("gamma", "y_gamma")],
+)
+def test_nagq_on_negbin_and_gamma_fits_quadrature(family, response):
+    # NB's theta sits outside the AGQ integral, and Gamma's phi enters it only
+    # as a weight on the deviance (the rest of its log-density sits outside),
+    # so both families take nagq>1 like binomial/Poisson: no warn-and-strip,
+    # and the fit reports the node count it ran.
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = glmm.fit(FIT_DATA, f"{response} ~ x + (1 | g)", family, nagq=7)
+    assert not any("nagq" in str(w.message) for w in caught), [str(w.message) for w in caught]
+    assert result.nagq == 7
+    assert result.converged
+
+
 # Ineligible-shape nagq>1 is valid-but-inapplicable: warn and strip
 # to nagq=1, never surface the kernel's shape panic as a ValueError. Eligibility
 # mirrors src/fit/common.rs::assert_model_shape — single grouping factor,
-# binomial/Poisson, q ≤ 3.
+# binomial/Poisson/negative-binomial/Gamma, q ≤ 3.
 
 
 def test_nagq_on_gaussian_mixed_warns_and_strips_to_laplace():
-    with pytest.warns(UserWarning, match="nagq"):
+    with pytest.warns(glmm.ArgumentIgnoredWarning, match="nagq"):
         result = glmm.fit(FIT_DATA, "y_gauss ~ x + (1 | g)", "gaussian", nagq=3)
     assert result.converged
     # The stripped fit IS the Laplace fit — same answer as an explicit nagq=1 call.
@@ -131,7 +150,7 @@ def test_nagq_on_gaussian_mixed_warns_and_strips_to_laplace():
 
 def test_nagq_on_crossed_re_warns_and_strips():
     data = {**FIT_DATA, "h": [f"h{i % 5}" for i in range(_N)]}
-    with pytest.warns(UserWarning, match="nagq"):
+    with pytest.warns(glmm.AgqFallbackWarning, match="nagq"):
         result = glmm.fit(data, "y_bin ~ x + (1 | g) + (1 | h)", "binomial", nagq=3)
     assert result.converged
 
@@ -144,7 +163,7 @@ def test_nagq_over_q_cap_warns_and_strips():
         "x2": _rng.normal(size=_N).tolist(),
         "x3": _rng.normal(size=_N).tolist(),
     }
-    with pytest.warns(UserWarning, match="nagq"):
+    with pytest.warns(glmm.AgqFallbackWarning, match="nagq"):
         result = glmm.fit(
             data,
             "y_bin ~ x + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g)",
@@ -155,20 +174,20 @@ def test_nagq_over_q_cap_warns_and_strips():
 
 
 def test_nagq_on_fixed_only_warns_and_strips():
-    with pytest.warns(UserWarning, match="nagq"):
+    with pytest.warns(glmm.ArgumentIgnoredWarning, match="nagq"):
         result = glmm.fit(FIT_DATA, "y_bin ~ x", "binomial", nagq=3)
     assert result.converged
 
 
 def test_dispersion_on_gaussian_warns_and_strips_then_fits():
-    with pytest.warns(UserWarning, match="dispersion"):
+    with pytest.warns(glmm.ArgumentIgnoredWarning, match="dispersion"):
         result = glmm.fit(FIT_DATA, "y_gauss ~ x", "gaussian", dispersion="estimate")
     assert result.converged
 
 
 def test_dispersion_on_negativebinomial_warns_then_fits():
     # negbin's distribution param is theta, not phi.
-    with pytest.warns(UserWarning, match="dispersion"):
+    with pytest.warns(glmm.ArgumentIgnoredWarning, match="dispersion"):
         result = glmm.fit(FIT_DATA, "y_pois ~ x", "negativebinomial", dispersion=1.5)
     assert result.converged
 
@@ -176,7 +195,9 @@ def test_dispersion_on_negativebinomial_warns_then_fits():
 def test_quasi_on_mixed_binomial_warns_then_fits():
     # "estimate" on binomial/poisson is quasi-likelihood, GLM only —
     # on a MIXED formula it is stripped (warn), not a kernel gap.
-    with pytest.warns(UserWarning, match="GLM-only"):
+    with pytest.warns(
+        glmm.ArgumentIgnoredWarning, match="Quasi-likelihood dispersion= is not supported yet"
+    ):
         result = glmm.fit(FIT_DATA, "y_bin ~ x + (1 | g)", "binomial", dispersion="estimate")
     assert result.converged
 
@@ -200,7 +221,7 @@ def test_dispersion_bool_raises():
 
 
 def test_init_theta_off_negbin_warns_then_fits():
-    with pytest.warns(UserWarning, match="init_theta"):
+    with pytest.warns(glmm.ArgumentIgnoredWarning, match="init_theta"):
         result = glmm.fit(FIT_DATA, "y_gamma ~ x", "gamma", init_theta=1.5)
     assert result.converged
 
@@ -228,7 +249,7 @@ def test_init_theta_and_warm_start_theta_are_independent(recwarn):
 
 
 def test_warm_start_unknown_key_warns_then_fits():
-    with pytest.warns(UserWarning, match="warm_start"):
+    with pytest.warns(glmm.ArgumentIgnoredWarning, match="warm_start"):
         result = glmm.fit(
             FIT_DATA,
             "y_gauss ~ x",

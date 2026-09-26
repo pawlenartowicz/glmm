@@ -1,4 +1,4 @@
-//! Tier 2 support: golden schema, `validation/tol.R` mirror, and the generic driver
+//! Tier 2 support: golden schema, `validation/grid/tol.R` mirror, and the generic driver
 //! that refits a golden from its own recorded `r_formula`.
 //!
 //! Tier 2 is the cross-engine tier — it checks the crate against the frozen
@@ -9,7 +9,7 @@
 //! tight pins live beside the code in `src/**/*_tests.rs`.
 //!
 //! This is a REFERENCE CHECK, not a pass/fail gate: a difference past its band
-//! passes when `validation/divergences.json` documents it, and fails otherwise —
+//! passes when `validation/grid/divergences.json` documents it, and fails otherwise —
 //! see the [`divergence`] module for the registry and the rules that keep it from
 //! decaying into a blanket exemption.
 
@@ -21,36 +21,36 @@ use glmm::{
 use serde::Deserialize;
 use serde_json::Value;
 
-// ── Tolerances — mirrors `validation/tol.R`, change together ─────────────────────
+// ── Tolerances — mirrors `validation/grid/tol.R`, change together ────────────────
 //
-// `tol.R` is the single source of truth; these are its numbers, and the
-// reciprocal note lives there. Each band's calibration argument is recorded in
-// `tol.R` next to the value — not repeated here, so the two cannot drift into
-// disagreeing rationales. Tier 1 bands are per dispatch path, live beside their
-// pins, and are deliberately NOT here: they are not agreement bands.
+// `grid/tol.R` is the single source of truth; these are its numbers. Each band's
+// calibration argument is recorded in `grid/tol.R` next to the value — not
+// repeated here, so the two cannot drift into disagreeing rationales. Tier 1
+// bands are per dispatch path, live beside their pins, and are deliberately NOT
+// here: they are not agreement bands.
 pub mod tol {
     pub const BETA_REL: f64 = 1e-3;
     pub const STDDEV_REL: f64 = 1e-3;
     pub const SE_REL: f64 = 1e-3;
-    /// AGREEMENT band for `use.hessian=TRUE` GLMM SEs. `tolPwrss = 1e-13` in
-    /// `validation/engines/lme4.R` (see `tests/fixtures/gen_glmm_hessian_vcov.R`)
-    /// keeps the frozen oracle free of lme4's lagged-`ldL2` `tolPwrss` artifact,
-    /// which is what makes 1e-3 tight enough here.
+    /// AGREEMENT band for `use.hessian=TRUE` GLMM SEs. `tolPwrss = 1e-13`, applied
+    /// per golden by `validation/tools/goldens_agq.R` (see
+    /// `tests/fixtures/gen_glmm_hessian_vcov.R`), keeps the frozen oracle free of
+    /// lme4's lagged-`ldL2` `tolPwrss` artifact, which is what makes 1e-3 tight
+    /// enough here.
     pub const SE_HESSIAN_REL: f64 = 1e-3;
-    // `tol.R`'s stddev_se_rel = 3e-3 is deliberately NOT mirrored: no golden in
-    // `validation/goldens/` carries a `stddev_se` field. lme4's SE-of-RE-stddev is
-    // frozen only in the curated `validation/results/` tree, which `compare.R` gates
-    // and this tier does not read. Mirroring an unused constant would imply a
-    // claim Tier 2 does not make.
+    // No band for lme4's SE-of-RE-stddev: no golden in `validation/goldens/` carries
+    // a `stddev_se` field, and the only frozen copies of that quantity sit in the
+    // weights-tier references under `validation/results/lme4_simulated/`, which no
+    // assertion here compares. Naming an unused constant would imply a claim Tier 2
+    // does not make.
 
     // Vector-RE AGQ rungs vs GLMMadaptive.
     pub const AGQ_BETA_REL: f64 = 3e-3;
     pub const AGQ_STDDEV_REL: f64 = 4e-3;
     /// ABSOLUTE — correlations near zero break a relative band. Reused for the
-    /// non-AGQ LMM correlation blocks too: `tol.R` has no separate non-AGQ
-    /// correlation constant, the estimate-grid `analyze.R` already reuses this one, and
-    /// only three goldens carry a real off-diagonal — too thin a base to
-    /// calibrate a second constant on.
+    /// non-AGQ LMM correlation blocks too: `grid/tol.R` has no separate non-AGQ
+    /// correlation constant, and only three goldens carry a real off-diagonal — too
+    /// thin a base to calibrate a second constant on.
     pub const AGQ_CORR_ABS: f64 = 4e-3;
     pub const AGQ_SE_HESSIAN_REL: f64 = 2e-2;
 }
@@ -84,9 +84,9 @@ pub struct Golden {
     /// estimated, not how the harness fed it.
     #[serde(skip)]
     pub weights_col: Option<String>,
-    /// From the weights tier (rungs 29-43), whose `lme4.R` writes a different field
-    /// set for fixed-only non-Gaussian fits than `goldens_agq.R` does. Only
-    /// `shape_of` reads it.
+    /// From the weights tier (rungs 29-43), whose lme4 1.1.38 references write a
+    /// different field set for fixed-only non-Gaussian fits than `goldens_agq.R`
+    /// does. Only `shape_of` reads it.
     #[serde(skip)]
     pub weights_suite: bool,
     pub family: String,
@@ -183,11 +183,11 @@ pub fn load_golden(name: &str) -> Golden {
 /// Coordinates both engines put at zero, below which a relative difference has
 /// no answer to give: glmm pins to a hard 0.0 while an oracle stops on its own
 /// residue, and `|x-y| / max(|x|,|y|)` reads exactly 1.0 however small that
-/// residue gets. Mirrors `TOL$near_zero_abs` in `validation/tol.R`, which
+/// residue gets. Mirrors `TOL$near_zero_abs` in `validation/grid/tol.R`, which
 /// carries the measurement it was sized from — change together.
 const NEAR_ZERO_ABS: f64 = 1e-3;
 
-/// Relative difference against the larger magnitude, matching `tol.R::rel_max`
+/// Relative difference against the larger magnitude, matching `grid/tol.R::rel_max`
 /// (`|x-y| / max(|x|,|y|,1e-12)`, exempting coordinates under `NEAR_ZERO_ABS`)
 /// so a Rust failure and an R failure mean the same thing on the same pair.
 fn rel(got: f64, want: f64) -> f64 {
@@ -207,7 +207,7 @@ fn rel(got: f64, want: f64) -> f64 {
 /// a difference past the entry's own recorded `max_rel`, still panics here.
 ///
 /// `ctx` is `"<dataset>: <quantity>"` (with an optional `[i]` index suffix),
-/// which is the key `divergences.json` is written against.
+/// which is the key `grid/divergences.json` is written against.
 fn adjudicate(observed: f64, band: f64, ctx: &str, detail: &dyn Fn() -> String) {
     if observed <= band {
         return;
@@ -238,9 +238,9 @@ pub fn assert_abs(got: f64, want: f64, band: f64, ctx: &str) {
 
 // ── documented-divergence registry ───────────────────────────────────────────
 
-/// Reader for `validation/divergences.json`, the registry this tier and
-/// `validation/compare.R` share. The reference-check rule it serves is stated in
-/// the module header.
+/// Reader for `validation/grid/divergences.json`, the registry this tier and
+/// `validation/grid/compare.R` share. The reference-check rule it serves is stated
+/// in the module header.
 ///
 /// The registry is deliberately hostile to rot — [`Registry::fired`]
 /// records every match so the corpus driver can assert that each entry scoped to
@@ -254,15 +254,15 @@ pub mod divergence {
     #[derive(Deserialize)]
     pub struct Entry {
         pub id: String,
-        pub dataset: String,
-        /// `None` on an `m3_goldens` cell, which carries no manifest rung.
-        pub rung: Option<u32>,
+        /// The fixture an entry is about: an accuracy-grid cell id, or a golden's
+        /// `name` for an entry scoped to this tier. One field, two naming schemes,
+        /// so an entry covering both consumers only works where the two coincide.
+        pub cell: String,
         pub comparison: Vec<String>,
         pub quantities: Vec<String>,
         pub max_rel: f64,
         pub direction: String,
         pub summary: String,
-        pub review: String,
     }
 
     #[derive(Deserialize)]
@@ -288,18 +288,18 @@ pub mod divergence {
     const SCOPE: &str = "oracle-tier";
 
     impl Registry {
-        /// Adjudicate one over-band comparison. `ctx` is `"<dataset>: <quantity>"`,
+        /// Adjudicate one over-band comparison. `ctx` is `"<fixture>: <quantity>"`,
         /// optionally with an `[i]` coefficient-index suffix, as every assertion in
         /// this module formats it.
         pub fn covers(&self, ctx: &str, observed: f64) -> Coverage {
-            let Some((dataset, rest)) = ctx.split_once(": ") else {
+            let Some((fixture, rest)) = ctx.split_once(": ") else {
                 return Coverage::NotDocumented;
             };
             // `"beta[0]"` and `"beta"` are the same quantity to the registry: an
             // entry names the quantity, never which coordinate of it moved.
             let quantity = rest.split('[').next().unwrap_or(rest).trim();
             let Some(e) = self.entries.iter().find(|e| {
-                e.dataset == dataset
+                e.cell == fixture
                     && e.quantities.iter().any(|q| q == quantity)
                     && e.comparison.iter().any(|c| c == SCOPE)
             }) else {
@@ -337,7 +337,10 @@ pub mod divergence {
     pub fn registry() -> &'static Registry {
         static REG: OnceLock<Registry> = OnceLock::new();
         REG.get_or_init(|| {
-            let path = format!("{}/validation/divergences.json", env!("CARGO_MANIFEST_DIR"));
+            let path = format!(
+                "{}/validation/grid/divergences.json",
+                env!("CARGO_MANIFEST_DIR")
+            );
             let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
             let f: File = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{path}: {e}"));
             Registry {
@@ -350,17 +353,24 @@ pub mod divergence {
 
 // ── deviance-convention alignment ───────────────────────────────────────────
 
-// mirrors validation/tol.R dev_eps / dev_big — change together.
-// Pinned 2026-08-24 from the corpus Δdev floor measurement.
+// This tier's own deviance-convention bands, pinned 2026-08-24 from the Δdev floor
+// measured over the 48-rung golden corpus: the largest benign |Δdev| there was
+// 1.65e-5, and DEV_EPS is ceil-to-one-significant-figure of ten times it. DEV_BIG is
+// the gap only a convention mismatch produces, not a fit difference, so a "win"
+// larger than it fails as a constants bug. The accuracy grid measures the same two
+// bands on its own corpus and lands elsewhere on `dev_eps`; the numbers are
+// independent and do not move together.
 pub const DEV_EPS: f64 = 2e-4;
 pub const DEV_BIG: f64 = 0.5;
 
-// mirrors validation/dev_align.R — change together
 pub mod dev_align {
-    //! Per-family × per-method deviance convention alignment, mirroring
-    //! `validation/dev_align.R` on the Rust side (checklist comment at both
-    //! sites — change together). Shared convention: `dev = -2 * loglik` as each
-    //! engine reports it, corrected only for the one documented case below.
+    //! Per-family × per-method deviance convention alignment, pinned here for the
+    //! lme4 1.1.38 golden corpus this tier reads. `validation/grid/dev_align.R` is
+    //! the R side's own per-engine × per-family alignment table, covering four
+    //! current oracles; the two are not otherwise coupled, so nothing here
+    //! changes together with it — only the lme4 nAGQ>1 saturated-term correction
+    //! below is shared in substance. Shared convention: `dev = -2 * loglik` as
+    //! each engine reports it, corrected only for the one documented case below.
 
     use super::{col_index, csv_for, parse_formula, split_line, Golden};
 
@@ -392,7 +402,7 @@ pub mod dev_align {
         LN_SQRT_2PI + (x + 0.5) * t.ln() - t + a.ln()
     }
 
-    /// `ln C(n, k)` via `lnΓ`, continuous in `n` the same way `dev_align.R`'s
+    /// `ln C(n, k)` via `lnΓ`, continuous in `n` the same way `grid/dev_align.R`'s
     /// `lchoose` is (R's `lchoose` is also `lnΓ`-based, not a factorial table).
     fn lchoose(n: f64, k: f64) -> f64 {
         ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0)
@@ -400,14 +410,14 @@ pub mod dev_align {
 
     /// Golden `engine` strings are qualified R calls (`"lme4::glmer"`,
     /// `"lme4::glmer.nb"`, `"lme4::lmer"`), not the bare `"lme4"` the interface
-    /// doc names — matched by prefix, same as `dev_align.R::is_lme4`, so the
-    /// nAGQ>1 correction actually fires rather than never matching in silence.
+    /// doc names — matched by prefix, so the nAGQ>1 correction actually fires
+    /// rather than never matching in silence.
     fn is_lme4(engine: &str) -> bool {
         engine.starts_with("lme4")
     }
 
     /// Closed form of the saturated-model loglik (binomial/poisson), ported
-    /// (sign and form) via `dev_align.R::saturated_loglik_deficit` — the
+    /// (sign and form) via `grid/dev_align.R::saturated_loglik` — the
     /// verified closed-form saturated-model logLik correction for lme4
     /// nAGQ>1, verified 2026-08-24. This is the value `aligned_dev` adds
     /// directly to lme4's reported nAGQ>1 loglik. Sign verified against the
@@ -466,10 +476,10 @@ pub mod dev_align {
     }
 
     /// Deviance on the shared `-2*loglik` convention, aligned across engines.
-    /// Same three branches as `dev_align.R::aligned_dev`: default `-2*loglik`;
-    /// lme4 `nagq > 1` adds the saturated-model logLik deficit; no reference
-    /// loglik at all -> `None`, which the caller must exclude loudly,
-    /// never pass hollow.
+    /// Matches the same three behaviours `grid/dev_align.R::aligned_dev` also
+    /// produces for lme4: default `-2*loglik`; lme4 `nagq > 1` adds the
+    /// saturated-model logLik deficit; no reference loglik at all -> `None`,
+    /// which the caller must exclude loudly, never pass hollow.
     pub fn aligned_dev(g: &Golden) -> Option<f64> {
         let ll = g.estimates.loglik?;
         let ll = if is_lme4(&g.engine) && g.nagq > 1 {
@@ -768,10 +778,10 @@ fn col_index(header: &[String], name: &str) -> usize {
 
 fn family_of(g: &Golden) -> Family {
     // A golden with no explicit `link` used the harness default, which is the
-    // canonical link per family EXCEPT for Gamma: `engines/lme4.R` and
-    // `goldens_agq.R` both pass `Gamma(link = "log")`, not R's own
-    // `Gamma()` default of inverse. Getting this wrong would fit a different
-    // model than the one frozen, so it is spelled out rather than left to
+    // canonical link per family EXCEPT for Gamma: the oracle scripts pass
+    // `Gamma(link = "log")`, not R's own `Gamma()` default of inverse. Getting
+    // this wrong would fit a different model than the one frozen, so it is
+    // spelled out rather than left to
     // `unwrap_or("identity")`.
     let link = g.link.as_str().unwrap_or_else(|| match g.family.as_str() {
         "gaussian" => "identity",

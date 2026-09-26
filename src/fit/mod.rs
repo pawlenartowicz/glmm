@@ -96,7 +96,9 @@ pub struct Fit {
     /// components (q=1 / scalar-extra — the currently reachable case); slope
     /// (q≥2) models are not yet validated through this field. Empty for OLS.
     pub tau2: Vec<f64>,
-    /// Estimated dispersion: `φ` for Gamma (Pearson moment estimator), the
+    /// Estimated dispersion: `φ` for Gamma (the Pearson moment on a GLM,
+    /// `summary(glm)`'s; the maximum-likelihood estimate on a GLMM) and
+    /// inverse-Gaussian (the Pearson moment — GLM only, no mixed route), the
     /// estimated shape `θ` for negative-binomial, the residual variance `σ̂²`
     /// for Gaussian — `RSS/(n−p)` for OLS (raw-row df, matching R
     /// `summary.lm`'s `sigma²`; the same `sigma_sq` that scales `se`/`vcov`)
@@ -104,10 +106,10 @@ pub struct Fit {
     /// `validation/goldens/sleepstudy_lmm.json` `sigma`, asserted in
     /// `fit_sleepstudy_slope_varcorr_matches_lme4`) — and `1.0` for
     /// binomial/Poisson (where dispersion is fixed by the family, not
-    /// estimated). NaN on any fit reporting `converged == false` — no route
-    /// reports a dispersion off a fit that never reached an endpoint,
-    /// including the fixed families' `1.0` and a φ held fixed through
-    /// [`FitOptions::dispersion`].
+    /// estimated). NaN on a fit reporting `converged == false`, except an LMM
+    /// or GLMM fit that hit `MaxFunReached`, which reports it at the capped
+    /// endpoint, as `vcov` does. This includes the fixed families' `1.0` and a
+    /// φ held fixed through [`FitOptions::dispersion`].
     pub dispersion: f64,
     /// Everything the fit reports about itself: convergence, singularity, the
     /// aliased-column mask, the θ boundary state, which variance components
@@ -118,14 +120,14 @@ pub struct Fit {
     /// RE (co)variance per grouping: one **vech-packed
     /// lower-triangular** covariance block `D̂ = σ̂²·Λ̂Λ̂'` per grouping, in
     /// declaration order (primary, then each extra). σ̂² is the residual scale
-    /// for an LMM and the free GLMM scale `pwrss/n` for dispersion families
-    /// (Gamma) — exactly the factor lme4's `VarCorr` stddevs carry; it is ≡ 1
-    /// for binomial/Poisson/NB, and the same scale `tau2` reports, so the two
-    /// accessors agree. Vech order is column-major
+    /// for an LMM and ≡ 1 on every GLMM family: a Gamma GLMM carries φ in its
+    /// PIRLS weights, so θ̂ is already in the response's absolute units, as
+    /// glmmTMB's `VarCorr` reports it (lme4's reports `σ·θ̂` instead). It is the
+    /// same scale `tau2` reports, so the two accessors agree. Vech order is column-major
     /// lower-triangular (matching the θ vech convention): for a `q×q` block,
     /// `(0,0),(1,0),…,(q-1,0),(1,1),…,(q-1,q-1)`. Validated against lme4
-    /// `VarCorr` (`validation/goldens/sleepstudy_lmm.json`; Gamma scale:
-    /// `validation/goldens/sim_gamma_glmm.json`). Empty for OLS/GLM
+    /// `VarCorr` (`validation/goldens/sleepstudy_lmm.json`) and glmmTMB's on Gamma
+    /// (`validation/goldens/sim_gamma_glmm_tmb.json`). Empty for OLS/GLM
     /// (no random effects). This is the q≥2-valid replacement for `tau2`'s
     /// per-component variances; `tau2` is retained for back-compat.
     pub varcorr: Vec<Vec<f64>>,
@@ -179,7 +181,15 @@ pub struct Fit {
     /// dropped data-only constants restored, on the `logLik()` scale (R/lme4):
     ///
     /// - **OLS/GLM** — the standard closed forms (R `logLik.lm`/`logLik.glm`,
-    ///   `MASS::glm.nb`), including under prior weights.
+    ///   `MASS::glm.nb`), including under prior weights, EXCEPT Gamma and
+    ///   inverse-Gaussian: both report the precision log-likelihood (row `i`
+    ///   has variance `φ·V(μᵢ)/wᵢ`) rather than R's `logLik.glm`/`Gamma()$aic`
+    ///   case-weight one (`−½·(D/φ̂ + gamma_dispersion_term)` at the maximised
+    ///   φ̂ for Gamma, `family::inv_gaussian_aic`'s precision form for
+    ///   inverse-Gaussian). The two agree only at unit weights; a weighted
+    ///   Gamma GLM's `loglik` is the maximised precision value, not R's
+    ///   `logLik(fg)` (measured: −47.27 vs −118.21 on
+    ///   `fit_glm_gamma_weighted_matches_r`'s data).
     /// - **LMM** — the **REML criterion** `−REMLcrit/2` (this path is
     ///   REML-only): `−½(deviance + (n−p)·(1 + ln 2π))`. REML criteria are
     ///   comparable only between models with IDENTICAL fixed effects — an
@@ -188,12 +198,17 @@ pub struct Fit {
     /// - **GLMM** — the marginal Laplace/AGQ log-likelihood:
     ///   `−½·deviance + saturated_loglik` (binomial/Poisson, see
     ///   `family::saturated_loglik`), `−½·deviance` alone for Gamma and NB
-    ///   (Gamma: lme4's `logLik(glmer)` is `−devfun/2` verbatim, `gamma_aic`'s
-    ///   `+2` included; NB: `deviance` already carries the θ̂-dependent
-    ///   saturated term the outer θ search adds — see
-    ///   `fit::common::glmm_loglik`). Matches `lme4::logLik` on the same fit,
-    ///   including the aggregated-binomial `cbind(s, m−s)` form under
-    ///   `weights=`.
+    ///   (Gamma: `deviance` carries the whole precision log-density through
+    ///   `family::gamma_dispersion_term` at the ML φ̂ (`Fit::dispersion` on a
+    ///   GLMM, unlike the GLM's Pearson moment); NB: `deviance` already
+    ///   carries the θ̂-dependent saturated term the outer θ search adds — see
+    ///   `fit::common::glmm_loglik`). Matches `lme4::logLik` on the same fit on
+    ///   the canonical binomial and Poisson links, including the
+    ///   aggregated-binomial `cbind(s, m−s)` form under `weights=`. On
+    ///   non-canonical links, NB and Gamma it matches glmmTMB's instead: lme4
+    ///   builds its Laplace log-determinant from the expected (Fisher) weight
+    ///   there, and on Gamma fits at its `pwrss/n` plug-in scale, so its
+    ///   logLik is a different function of the parameters.
     ///
     /// NaN wherever `deviance`'s failure modes apply (non-converged/degenerate
     /// fits); finite on an LMM or GLMM `MaxFunReached` endpoint, like
@@ -269,11 +284,14 @@ pub struct Fit {
 #[derive(Clone, Debug)]
 pub struct Diagnostics {
     /// Whether the optimizer reached its convergence criterion. `false`
-    /// usually means `se`/`vcov`/`dispersion` are the NaN-fill described on
-    /// each of those fields — the exception is an LMM or GLMM fit that hit
-    /// `MaxFunReached`: `se` and `vcov` report finite values at that
-    /// budget-exhausted endpoint, while `dispersion` still takes the
-    /// NaN-fill.
+    /// usually means `se`/`vcov`/`dispersion`/`tau2`/`varcorr` are the
+    /// NaN-fill (or empty, for `varcorr`) described on each of those fields —
+    /// the exception is an LMM or GLMM fit that hit `MaxFunReached`: `se`,
+    /// `vcov`, `dispersion`, `tau2` and `varcorr` all report finite values at
+    /// that budget-exhausted endpoint. `stddev_se`, `fitted` and `ranef` stay
+    /// gated on `converged` on both routes; `df` follows that same gate only
+    /// on the GLMM route — an LMM `MaxFunReached` endpoint reports its usual
+    /// nonzero `df` instead (see [`Fit::df`]).
     pub converged: bool,
     /// `true` iff the fit converged onto the θ boundary (≥ 1 diagonal variance
     /// component pinned at 0 — `boundary == AtBoundary`, OR a converged
@@ -281,8 +299,10 @@ pub struct Diagnostics {
     /// [`Fit::has_negligible_component`]), the same condition lme4's
     /// `isSingular` reports. `false` for OLS/GLM and for an LMM or GLMM
     /// `MaxFunReached` cap-out — a capped endpoint is reported as a point,
-    /// not accepted onto the boundary, so it never sets this flag even when
-    /// its diagonals are near zero.
+    /// not accepted onto the boundary, so the post-hoc negligible-component
+    /// check does not run there even though `varcorr` is finite (both routes
+    /// gate that check on `converged` for exactly this reason), and it never
+    /// sets this flag even when its diagonals are near zero.
     ///
     /// Not a pure restatement of `boundary`: the negligible-component check is
     /// a reporting rule applied to the assembled `varcorr` after the fact, so
@@ -397,6 +417,17 @@ pub enum Note {
         /// point. That re-evaluation runs on a budget-exhausted outer exit
         /// too, not only on a converged one.
         final_eval: bool,
+    },
+    /// The negative-binomial GLM's alternation between β̂ (IRLS at fixed θ) and θ̂
+    /// (profile maximisation at fixed μ̂) ran its full `NB_MAX_OUTER` rounds
+    /// without meeting its relative-change tolerance on θ. The fit is reported at
+    /// the last θ, with β̂ and the SEs refit there, so the numbers are one
+    /// model's; that θ may still be short of the profile optimum. `converged`
+    /// keeps the last inner IRLS fit's flag. Mixed negative-binomial models
+    /// search ln θ inside their outer BOBYQA instead and never raise this.
+    NbShapeUnsettled {
+        /// Alternation rounds run (the cap, `NB_MAX_OUTER`, in production).
+        rounds: u32,
     },
     /// A grouping factor declares levels that carry no row but still occupy
     /// random-effect columns, because the block is `max(code)+1` wide: a level
@@ -601,27 +632,41 @@ pub struct FitOptions {
     pub wald_se: WaldSe,
     /// Adaptive Gauss–Hermite node count (relocated from `ModelSpec`). Default 1
     /// (= Laplace). Must be odd and in `1..=MAX_NAGQ`; `>1` is honored on a
-    /// binomial/Poisson GLMM with a single grouping factor and `q_p ≤ 3` random
+    /// binomial/Poisson/negative-binomial/Gamma GLMM with a single grouping factor and `q_p ≤ 3` random
     /// effects per group (scalar intercept → `agq::agq_deviance`, vector RE →
     /// `agq::agq_deviance_vec`, a `k^q_p` product grid). `q_p ≥ 4` is refused by
     /// `assert_model_shape` (a temporary cost/oracle boundary); other ineligible
     /// shapes panic there likewise.
     pub nagq: u8,
-    /// Gamma dispersion directive (relocated from `Family::Gamma`). `None` =
-    /// estimate φ post-fit (Pearson); `Some(v)` = hold φ fixed at `v`. Ignored by
-    /// non-Gamma families.
+    /// Gamma/inverse-Gaussian dispersion directive (relocated from
+    /// `Family::Gamma`). `None` = estimate φ (the Pearson moment,
+    /// `Σwᵢrᵢ²/(n−p)`, on a GLM; maximum likelihood on a GLMM); `Some(v)` =
+    /// hold φ fixed at `v`. Ignored by the φ ≡ 1 families.
     pub dispersion: Option<f64>,
-    /// Per-row prior (case) weights `wᵢ` — lme4's `weights=`. `None` = unit
-    /// weights. `wᵢ` scales each row's loglik/deviance contribution (the
-    /// Aitken/M&N prior-weight convention — not an inverse-variance analytic
-    /// weight). For an aggregated binomial, `y` is the success PROPORTION and
-    /// `wᵢ` the trial count: this is exactly lme4's `cbind(s, m−s)` objective,
-    /// whose deviance differs from the expanded-Bernoulli one only by a
-    /// data-only saturated constant (same argmin — same β/SE/varcomp).
-    /// Dispersion/σ̂² always divide by the raw row count `n−p`, never `Σwᵢ−p`.
+    /// Per-row prior weights `wᵢ` — lme4's `weights=`. `None` = unit weights.
+    /// For an aggregated binomial, `y` is the success PROPORTION and `wᵢ` the
+    /// trial count: this is exactly lme4's `cbind(s, m−s)` objective, whose
+    /// deviance differs from the expanded-Bernoulli one only by a data-only
+    /// saturated constant (same argmin — same β/SE/varcomp).
+    ///
+    /// On every family with an estimated dispersion (Gaussian, Gamma,
+    /// inverse-Gaussian) `wᵢ` is a PRECISION weight: row `i` has variance
+    /// `φ·V(μᵢ)/wᵢ` (`lm`/`glm`'s and lme4's convention, McCullagh & Nelder
+    /// 1989 §2.2), not glmmTMB's `wᵢ` multiplying the log-density. Rescaling
+    /// every weight by one constant `c` changes nothing about the fitted mean
+    /// model or the SEs, and moves `dispersion` by exactly `c` — the fit
+    /// depends on the RELATIVE weights only, up to the GLM IRLS's own
+    /// absolute stopping tolerance (`glm::DEVIANCE_TOL`), which is not itself
+    /// scale-free. Moment estimates (σ̂²,
+    /// inverse-Gaussian and Gamma-GLM's Pearson φ̂) divide by the raw row count
+    /// `n−p`, never `Σwᵢ−p`. Binomial weights are trial counts (no dispersion
+    /// to divide); Poisson's fit is identical either way (the two conventions
+    /// differ by a weight-only constant); NB's weights keep multiplying the
+    /// log-likelihood (`MASS::glm.nb`'s convention — NB's variance `μ+μ²/θ`
+    /// has no `φ` to divide).
     ///
     /// Support matrix: every (family, RE structure, solver) combination,
-    /// including AGQ (`nagq > 1`) on the binomial/Poisson shapes it covers — the
+    /// including AGQ (`nagq > 1`) on the binomial/Poisson/NB/Gamma shapes it covers — the
     /// per-row `dev_resid` sums in `glmm/agq.rs` carry `wᵢ`, and PIRLS folds the
     /// weights into the conditional mode/curvature (aggregated binomial with small
     /// clusters, e.g. `glmer(cbind(s,m−s) ~ …, nAGQ=k)`, is the canonical case).
@@ -629,31 +674,36 @@ pub struct FitOptions {
     /// - Gaussian fixed-only: WLS via √wᵢ row pre-scaling, `σ̂² = Σwᵢrᵢ²/(n−p)`;
     ///   matches R `lm(weights=)` (`fit_ols_weighted_matches_r_lm`).
     /// - GLM fixed-only, any family (Binomial/Poisson/Gamma/NB): weighted IRLS —
-    ///   `wᵢ` multiplies the working weight and deviance; Gamma's Pearson φ is
-    ///   `Σwᵢrᵢ²/(n−p)`; the null deviance uses the weighted mean. Matches R
+    ///   `wᵢ` multiplies the working weight and deviance; both Gamma's and an
+    ///   inverse-Gaussian's Pearson φ̂ are `Σwᵢrᵢ²/(n−p)`, `summary(glm)`'s value;
+    ///   Gamma's separate maximum-likelihood φ̂ (used only for `loglik`) takes
+    ///   `ŵᵢ = wᵢ/s` in the shape equation (precision weights: this Newton
+    ///   search is not scale-free on raw `w`); the null
+    ///   deviance uses the weighted mean. Matches R
     ///   `glm(weights=)` (`fit_glm_gamma_weighted_matches_r`,
     ///   `fit_glm_binomial_weighted_aggregated_matches_r`,
     ///   `glm_weighted_deviance_null_golden_value`) and `MASS::glm.nb(weights=)`
     ///   (`fit_glm_nb_weighted_matches_mass`, weighted θ profile).
     /// - Sparse (`Solver::Sparse`) non-Gaussian GLMM, every family: `wᵢ` weights
     ///   the sparse PIRLS working weight/deviance/score identically to the
-    ///   dense mixed path below; Gamma's profiled dispersion (`gamma_aic`) and
-    ///   `vcov(use.hessian=FALSE)` scale (`glmm_sigma_sq`) take `ws.prior_w`,
-    ///   its post-fit Pearson φ̂ sums `wᵢrᵢ²` over raw `n−p` df, and NB's
-    ///   marginal-θ profile (`nb_profile_loglik`) takes `opts.weights`.
-    ///   Validated against `fit_sparse_gamma_glmm_weighted_matches_lme4` (lme4
-    ///   `glmer`), the `sparse_weighted_binomial_*` expanded-vs-aggregated
-    ///   tests, and the `sparse_weighted_{poisson,gamma,nb}_matches_replicated`
-    ///   weighted-vs-replicated-row equivalence tests.
+    ///   dense mixed path below; Gamma's dispersion term
+    ///   (`family::gamma_dispersion_term`) takes `ŵᵢ = wᵢ/s` (`s` the
+    ///   weight-scale normaliser, `family::weight_scale`) in place of a row
+    ///   count, its PIRLS runs on `ŵᵢ/φ`, and NB's marginal-θ profile
+    ///   (`nb_profile_loglik`) takes `opts.weights` raw. Validated against
+    ///   `fit_sparse_gamma_glmm_weighted_matches_glmmtmb` (glmmTMB), the
+    ///   `sparse_weighted_binomial_*` expanded-vs-aggregated tests, and the
+    ///   `sparse_weighted_{poisson,nb}_matches_replicated` weighted-vs-
+    ///   replicated-row equivalence tests.
     /// - Dense (`Solver::NoZ`) mixed GLMM, every non-Gaussian family
     ///   (Binomial/Poisson/Gamma/NB): `wᵢ` weights the working weight,
     ///   deviance, and β-gradient score identically to the sparse binomial path
-    ///   above; Gamma's profiled dispersion (`family::gamma_aic`) and its
-    ///   `vcov(use.hessian=FALSE)` scale (`family::glmm_sigma_sq`) both take
-    ///   `Σwᵢ` in place of `n`. Validated against
+    ///   above; Gamma's dispersion term (`family::gamma_dispersion_term`) takes
+    ///   `ŵᵢ = wᵢ/s` in place of a row count. Validated against
     ///   `fit_glmm_cbpp_aggregated_matches_lme4`,
     ///   `fit_glmm_poisson_weighted_matches_lme4`, and
-    ///   `fit_glmm_gamma_weighted_matches_lme4` (all lme4 `glmer`, dense).
+    ///   `fit_glmm_gamma_weighted_matches_glmmtmb` (lme4 `glmer` for the
+    ///   first two, glmmTMB with a dispersion offset for the Gamma one; all dense).
     /// - Dense (`Solver::NoZ`) mixed Gaussian LMM (weighted REML): every
     ///   row of `[X y Z]` is conceptually √wᵢ-scaled before hitting the unit-
     ///   weight suff-stats/deviance kernel (`LmmSuffStats::add_rows_multi`),
@@ -744,7 +794,7 @@ impl Default for FitOptions {
 /// kernel is Bernoulli) — except when `y` is an aggregated success PROPORTION
 /// and [`FitOptions::weights`] carries the trial count, which fits directly
 /// without the expansion. That aggregated form is supported on every
-/// (family, RE, solver) path, including AGQ (`nagq > 1`) on its binomial/Poisson
+/// (family, RE, solver) path, including AGQ (`nagq > 1`) on its binomial/Poisson/NB/Gamma
 /// shapes (see `FitOptions::weights`'s support matrix).
 ///
 /// # Panics

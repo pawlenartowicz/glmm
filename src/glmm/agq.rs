@@ -1,5 +1,5 @@
 //! Adaptive Gauss–Hermite quadrature (`nAGQ>1`) for the single scalar-intercept
-//! binomial / Poisson GLMM — the only shape where the marginal likelihood is a
+//! binomial / Poisson / negative-binomial / Gamma GLMM — the only shape where the marginal likelihood is a
 //! product of independent 1-D cluster integrals, so AGQ is a per-cluster k-node
 //! sum with no curse of dimensionality. Replaces the Laplace `+log|A|` curvature
 //! term with a Liu–Pierce (1994) adaptive GH sum centered at each cluster's PIRLS
@@ -72,7 +72,7 @@ impl ClusterRowIndex {
     }
 }
 
-/// AGQ deviance for the scalar-intercept (`q_p==1`, no extras) binomial/Poisson
+/// AGQ deviance for the scalar-intercept (`q_p==1`, no extras) binomial/Poisson/NB/Gamma
 /// GLMM at `(θ,β)=params`. Converges the per-cluster conditional modes `ũ_c` and
 /// curvatures `A_c` via the same blocked PIRLS the Laplace path uses, then for
 /// each cluster integrates the conditional likelihood with `k=nagq` adaptive GH
@@ -85,7 +85,8 @@ impl ClusterRowIndex {
 /// Math — standardized u-scale (prior `u ~ N(0,1)`, `η = Xβ + λ·u` with `λ` the
 /// scalar primary Λ_p factor, so `ũ_c`/`σ_c` from PIRLS are on the u-scale and the
 /// integrand must match — a b-scale prior `−½u²/τ²` or dropping `λ` breaks the
-/// k=1≡Laplace reduction for `τ²≠1`):
+/// k=1≡Laplace reduction for `τ²≠1`; on NB the θ-dependent saturated term is
+/// constant in u, so it stays out of `ℓ_c` and the driver adds it back as `nb_term`):
 /// ```text
 ///   ℓ_c(u)     = Σ_{i∈c} −½·w_i·dev_resid(family, y_i, g⁻¹(η_fix,i + λ·u)) − ½u²
 ///   −2 log L_c = −2·ℓ_c(ũ_c) − 2·log σ_c
@@ -297,7 +298,7 @@ pub(crate) fn agq_deviance<T: Scalar>(
 }
 
 /// Multivariate AGQ deviance for the **vector**-RE (`q_p ∈ 2..=3`, single
-/// grouping factor, no extras) binomial/Poisson GLMM at `(θ,β)=params` — the
+/// grouping factor, no extras) binomial/Poisson/NB/Gamma GLMM at `(θ,β)=params` — the
 /// dimension-up sibling of [`agq_deviance`], reached via the widened
 /// `deviance.rs` gate for `q_p ≥ 2`. Converges each cluster's `q_p`-vector
 /// conditional mode `ũ_c` and curvature `A_c` with the same blocked PIRLS the
@@ -313,7 +314,8 @@ pub(crate) fn agq_deviance<T: Scalar>(
 /// u-scale (prior `u_c ~ N(0, I_q)`, `η = Xβ + Z_c·Λ_p·u_c` with `Λ_p` the
 /// lower-triangular `primary_lambda` factor), **product** grid only (`k^q`
 /// nodes; Smolyak deferred), **odd** `k` (a node at the mode ⇒ the k=1≡Laplace
-/// reduction). Binomial/Poisson only (NB/Gamma deferred). Adaptive transform per
+/// reduction). Binomial/Poisson/NB/Gamma (see
+/// `fit::common::assert_model_shape`); Gamma arrives on prior weights `wᵢ/φ`. Adaptive transform per
 /// cluster: `u_cj = ũ_c + √2·L_cᵀ⁻¹·z_j`, `L_c` = the `q×q` Cholesky factor of
 /// `A_c` (`glmm_block_chol`'s per-block output, reused as-is). Per node the
 /// generalizations from the scalar path are all direct — `η_i` per row is

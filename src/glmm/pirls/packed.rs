@@ -8,10 +8,12 @@ use super::*;
 /// row's `width²` outer-product entries. Borrowed from the buffers
 /// `pirls_solve_packed` destructures.
 ///
-/// The dense `k×k` factor rather than a block kernel: `W` changes every inner
-/// iteration, so a θ-independent packing of `Λ'Z'ZΛ` would be rebuilt per step
-/// anyway. The `O(n·width²)` weighted Gram accumulation dominates and stays
-/// sparse; only the `k×k` factor is dense.
+/// `A` is factored whole, either dense (`a_chol`) or, when `fill_packed_cols`
+/// built one, through the sparse Cholesky on `A`'s fixed pattern
+/// ([`crate::glmm::workspace::PackedSparse`]): `W` changes every inner
+/// iteration but the pattern does not, so one symbolic analysis per design
+/// serves every numeric refactor. The `O(n·width²)` weighted Gram
+/// accumulation scatters straight into whichever storage is in use.
 pub(crate) struct PackedFactor<'a> {
     /// len `n·width`: the RE column of each nonzero, row `i` at `i·width`.
     pub(crate) m_cols: &'a [u32],
@@ -37,6 +39,11 @@ pub(crate) struct PackedFactor<'a> {
     pub(crate) width: usize,
     /// Total RE columns, the side of `a`.
     pub(crate) k: usize,
+    /// When present, `scatter` writes `A` into its CSC values and
+    /// `factor_logdet` and the solves run through this sparse Cholesky instead
+    /// of the dense `a`/`a_chol`, which then hold `A` only after a converged
+    /// solve's final expansion.
+    pub(crate) sp: Option<&'a mut crate::glmm::workspace::PackedSparse>,
 }
 
 impl LaplaceFactor<f64> for PackedFactor<'_> {
@@ -80,6 +87,34 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
         debug_assert!(dual.is_none());
         let (m_cols, m_vals, width) = (self.m_cols, self.m_vals, self.width);
         let (family, nb_theta, k) = (self.family, self.nb_theta, self.k);
+        if let Some(sp) = self.sp.as_deref_mut() {
+            let a_rhs = &mut *self.a_rhs;
+            a_rhs[..k].fill(0.0);
+            let row_slots = &sp.row_slots;
+            let vals = sp.axx.val_mut();
+            vals.fill(0.0);
+            for i in 0..n {
+                let wi = w[i];
+                let dmu = crate::family::mu_eta(family, eta[i]);
+                let v = crate::family::variance(family, nb_theta, prob[i]);
+                let rho = prior_w[i] * dmu * (y[i] - prob[i]) / v;
+                let q_i = wi * self.mu[i] + rho;
+                let base = i * width;
+                for ta in base..base + width {
+                    let ca = m_cols[ta] as usize;
+                    let va = m_vals[ta];
+                    let wva = wi * va;
+                    let slots = &row_slots[ta * width..(ta + 1) * width];
+                    for (tb, &s) in (base..base + width).zip(slots) {
+                        if s != u32::MAX {
+                            vals[s as usize] += wva * m_vals[tb];
+                        }
+                    }
+                    a_rhs[ca] += va * q_i;
+                }
+            }
+            return;
+        }
         let a = &mut *self.a;
         let a_rhs = &mut *self.a_rhs;
         for c in 0..k {
@@ -119,6 +154,28 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
 
     fn factor_logdet(&mut self) -> Option<f64> {
         let k = self.k;
+        if let Some(sp) = self.sp.as_deref_mut() {
+            {
+                let vals = sp.axx.val_mut();
+                for &s in &sp.diag_slots {
+                    vals[s as usize] += 1.0;
+                }
+            }
+            sp.symbolic
+                .factorize_numeric_llt(
+                    &mut sp.l_values,
+                    sp.axx.as_ref(),
+                    faer::Side::Lower,
+                    LltRegularization::default(),
+                    Par::Seq,
+                    MemStack::new(&mut sp.fac_mem),
+                    Spec::default(),
+                )
+                .ok()?;
+            // `logdet_llt` is `log|A| = 2·Σ ln L_ii`; this method returns `Σ ln L_ii`.
+            let ld = crate::sparse::logdet_llt(&sp.symbolic, &sp.l_values);
+            return ld.is_finite().then_some(0.5 * ld);
+        }
         for r in 0..k {
             self.a[(r, r)] += 1.0;
         }
@@ -143,6 +200,16 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
 
     fn solve_in_place(&mut self) {
         let k = self.k;
+        if let Some(sp) = self.sp.as_deref_mut() {
+            faer::sparse::linalg::cholesky::LltRef::new(&sp.symbolic, &sp.l_values)
+                .solve_in_place_with_conj(
+                    faer::Conj::No,
+                    MatMut::from_column_major_slice_mut(&mut self.a_rhs[..k], k, 1),
+                    Par::Seq,
+                    MemStack::new(&mut sp.solve_mem),
+                );
+            return;
+        }
         solve_in_place(
             self.a_chol.as_ref(),
             MatMut::from_column_major_slice_mut(&mut self.a_rhs[..k], k, 1),
@@ -248,6 +315,7 @@ pub(crate) fn pirls_solve_packed(
         nb_theta,
         width,
         k,
+        sp: packed.sparse.as_deref_mut(),
     };
     // η_fixed,ᵢ = Σ_j x[i,j]·β[j]. In Fixed mode β is invariant across iterations
     // so this once-at-entry fill stands for the whole solve; in Profile mode the
@@ -266,6 +334,10 @@ pub(crate) fn pirls_solve_packed(
     let mut mixed_prev = f64::INFINITY; // the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
     let mut converged = false;
+    // Period-2 damping state — see `PIRLS_OSC_RATIO`.
+    let mut dmix_prev = f64::NAN;
+    let mut osc_flips = 0usize;
+    let mut damp = false;
     let mut dev = f64::NAN;
     let mut pen = f64::NAN; // ‖u‖² at the returned (post-step) iterate
     let mut logdet = 0.0;
@@ -305,7 +377,10 @@ pub(crate) fn pirls_solve_packed(
         // define the converged answer.
         let pen_u: f64 = u[..k].iter().map(|v| v * v).sum();
         let penalized = dev + pen_u;
-        if infeasible || penalized - pen_accepted > tol * (1.0 + penalized.abs()) {
+        if infeasible
+            || !penalized.is_finite()
+            || penalized - pen_accepted > tol * (1.0 + penalized.abs())
+        {
             if halvings < PIRLS_MAX_HALVINGS {
                 halvings += 1;
                 for c in 0..k {
@@ -412,12 +487,22 @@ pub(crate) fn pirls_solve_packed(
                     ainv_mtwx[(r, c)] = xtwm[(c, r)];
                 }
             }
-            solve_in_place(
-                layout.a_chol.as_ref(),
-                ainv_mtwx.as_mut(),
-                Par::Seq,
-                MemStack::new(layout.a_llt_mem),
-            );
+            if let Some(sp) = layout.sp.as_deref_mut() {
+                faer::sparse::linalg::cholesky::LltRef::new(&sp.symbolic, &sp.l_values)
+                    .solve_in_place_with_conj(
+                        faer::Conj::No,
+                        ainv_mtwx.as_mut(),
+                        Par::Seq,
+                        MemStack::new(&mut sp.solve_mem),
+                    );
+            } else {
+                solve_in_place(
+                    layout.a_chol.as_ref(),
+                    ainv_mtwx.as_mut(),
+                    Par::Seq,
+                    MemStack::new(layout.a_llt_mem),
+                );
+            }
             // S_β = C − B'·T.
             for r in 0..p {
                 for c in 0..p {
@@ -470,6 +555,20 @@ pub(crate) fn pirls_solve_packed(
             refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
             pen = u[..k].iter().map(|v| v * v).sum();
         }
+        // Relaxed step once the period-2 detector has fired (`PIRLS_OSC_RATIO`):
+        // move half way from the pre-step iterate, β in lockstep with u.
+        if damp {
+            for c in 0..k {
+                u[c] = u_prev[c] + 0.5 * (u[c] - u_prev[c]);
+            }
+            if let BetaStep::Profile { beta_prev, .. } = &beta_step {
+                for j in 0..p {
+                    beta[j] = beta_prev[j] + 0.5 * (beta[j] - beta_prev[j]);
+                }
+                refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+            }
+            pen = u[..k].iter().map(|v| v * v).sum();
+        }
         // The stopping rule: the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` band on successive
         // steps, read off the loop's own assembly point — the exit refresh
         // runs after this decision and never enters it.
@@ -478,6 +577,19 @@ pub(crate) fn pirls_solve_packed(
             converged = true;
             break;
         }
+        // Period-2 detector — see `PIRLS_OSC_RATIO`.
+        let dmix = mixed - mixed_prev;
+        if dmix.is_finite()
+            && dmix_prev.is_finite()
+            && dmix * dmix_prev < 0.0
+            && dmix.abs() > PIRLS_OSC_RATIO * dmix_prev.abs()
+        {
+            osc_flips += 1;
+        } else {
+            osc_flips = 0;
+        }
+        damp |= osc_flips >= PIRLS_OSC_TRIGGER;
+        dmix_prev = dmix;
         mixed_prev = mixed;
     }
     // The returned `dev`, `log|A|` and factor at the returned iterate, so the
@@ -503,6 +615,21 @@ pub(crate) fn pirls_solve_packed(
                 logdet = ld;
             }
             None => return (f64::NAN, f64::NAN, f64::NAN, false),
+        }
+        // The sparse path never wrote the dense `a`; `packed_schur_fill`
+        // re-reads the final `A` from it, so expand the CSC values once here.
+        if let Some(sp) = layout.sp.as_deref() {
+            let a = &mut *layout.a;
+            a.fill(0.0);
+            let (col_ptr, row_idx) = (sp.axx.symbolic().col_ptr(), sp.axx.symbolic().row_idx());
+            let vals = sp.axx.val();
+            for c in 0..k {
+                for s in col_ptr[c]..col_ptr[c + 1] {
+                    let r = row_idx[s];
+                    a[(r, c)] = vals[s];
+                    a[(c, r)] = vals[s];
+                }
+            }
         }
     }
     (dev, pen, logdet, converged)
@@ -767,6 +894,7 @@ mod tests {
             nb_theta: f64::NAN,
             width,
             k,
+            sp: None,
         };
         assert!(
             evaluate_at_mode(

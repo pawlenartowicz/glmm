@@ -749,6 +749,19 @@
       "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)"
     },
     {
+      "name": "cbpp_probit_glmm_tmb",
+      "kind": "glmm",
+      "oracle": "glmmTMB",
+      "data": "cbpp",
+      "family": "binomial",
+      "link": "probit",
+      "factors": [
+        "herd",
+        "period"
+      ],
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)"
+    },
+    {
       "name": "sim_cloglog_glm",
       "kind": "glm",
       "data": "sim_probit_large",
@@ -773,6 +786,18 @@
       "r_formula": "y ~ 1 + x1 + x2 + x3 + z + (1 | g)"
     },
     {
+      "name": "sim_cloglog_glmm_tmb",
+      "kind": "glmm",
+      "oracle": "glmmTMB",
+      "data": "sim_probit_large",
+      "family": "binomial",
+      "link": "cloglog",
+      "factors": [
+        "g"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + z + (1 | g)"
+    },
+    {
       "name": "sim_gamma_glm",
       "kind": "glm",
       "data": "sim_gamma",
@@ -784,8 +809,32 @@
       "r_formula": "y ~ 1 + x + grp"
     },
     {
+      "name": "sim_gamma_glm_ml",
+      "kind": "glm",
+      "oracle": "glm_ml",
+      "data": "sim_gamma",
+      "family": "gamma",
+      "link": "log",
+      "factors": [
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
       "name": "sim_gamma_inv_glm",
       "kind": "glm",
+      "data": "sim_gamma",
+      "family": "gamma",
+      "link": "inverse",
+      "factors": [
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp"
+    },
+    {
+      "name": "sim_gamma_inv_glm_ml",
+      "kind": "glm",
+      "oracle": "glm_ml",
       "data": "sim_gamma",
       "family": "gamma",
       "link": "inverse",
@@ -831,12 +880,38 @@
       "r_formula": "y ~ 1 + x + grp + (1 | cluster)"
     },
     {
+      "name": "sim_gamma_glmm_tmb",
+      "kind": "glmm",
+      "oracle": "glmmTMB",
+      "data": "sim_gamma",
+      "family": "gamma",
+      "link": "log",
+      "factors": [
+        "cluster",
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp + (1 | cluster)"
+    },
+    {
       "name": "sim_gamma_inv_glmm",
       "kind": "glmm",
       "data": "sim_gamma",
       "family": "gamma",
       "link": "inverse",
       "tolPwrss": 1e-13,
+      "factors": [
+        "cluster",
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp + (1 | cluster)"
+    },
+    {
+      "name": "sim_gamma_inv_glmm_tmb",
+      "kind": "glmm",
+      "oracle": "glmmTMB",
+      "data": "sim_gamma",
+      "family": "gamma",
+      "link": "inverse",
       "factors": [
         "cluster",
         "grp"
@@ -861,6 +936,19 @@
       "family": "negbin",
       "link": "log",
       "tolPwrss": 1e-13,
+      "factors": [
+        "cluster",
+        "grp"
+      ],
+      "r_formula": "y ~ 1 + x + grp + (1 | cluster)"
+    },
+    {
+      "name": "sim_nb_glmm_tmb",
+      "kind": "glmm",
+      "oracle": "glmmTMB",
+      "data": "sim_nb",
+      "family": "negbin",
+      "link": "log",
       "factors": [
         "cluster",
         "grp"
@@ -1105,6 +1193,19 @@
       "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge)"
     },
     {
+      "name": "sim_sparse_gamma_tmb",
+      "kind": "glmm",
+      "oracle": "glmmTMB",
+      "data": "sim_sparse_gamma",
+      "family": "gamma",
+      "link": "log",
+      "factors": [
+        "gp",
+        "ge"
+      ],
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge)"
+    },
+    {
       "name": "sim_sparse_poisson",
       "kind": "glmm",
       "data": "sim_sparse_poisson",
@@ -1130,6 +1231,25 @@
       "family": "negbin",
       "link": "log",
       "tolPwrss": 1e-13,
+      "factors": [
+        "g1",
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+        "c6",
+        "c7"
+      ],
+      "r_formula": "y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)"
+    },
+    {
+      "name": "sim_sparse_nb_tmb",
+      "kind": "glmm",
+      "oracle": "glmmTMB",
+      "data": "sim_sparse_nb",
+      "family": "negbin",
+      "link": "log",
       "factors": [
         "g1",
         "c1",
@@ -1184,6 +1304,19 @@
       "family": "negbin",
       "link": "log",
       "tolPwrss": 1e-13,
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "r_formula": "y ~ 1 + x + (1 | g1/g2)"
+    },
+    {
+      "name": "sim_nb_nested_glmm_tmb",
+      "kind": "glmm",
+      "oracle": "glmmTMB",
+      "data": "sim_nb_nested",
+      "family": "negbin",
+      "link": "log",
       "factors": [
         "g1",
         "g2"
@@ -1288,7 +1421,8 @@
     {"name": "sim_scale_logit_small_glm", "kind": "glm", "data": "sim_scale_logit", "family": "binomial", "link": "logit", "r_formula": "y ~ 1 + x_small"},
     {"name": "sim_scale_logit_big_glm", "kind": "glm", "data": "sim_scale_logit", "family": "binomial", "link": "logit", "r_formula": "y ~ 1 + x_big"},
     {"name": "sim_scale_sep_glm", "kind": "glm", "data": "sim_scale_sep", "family": "binomial", "link": "logit", "r_formula": "y ~ 1 + x"},
-    {"name": "sim_scale_gamma_inv_glm", "kind": "glm", "data": "sim_scale_gamma_inv", "family": "gamma", "link": "inverse", "r_formula": "y ~ 1 + x"}
+    {"name": "sim_scale_gamma_inv_glm", "kind": "glm", "data": "sim_scale_gamma_inv", "family": "gamma", "link": "inverse", "r_formula": "y ~ 1 + x"},
+    {"name": "sim_scale_gamma_inv_glm_ml", "kind": "glm", "oracle": "glm_ml", "data": "sim_scale_gamma_inv", "family": "gamma", "link": "inverse", "r_formula": "y ~ 1 + x"}
   ],
   "//weights_tier": "WEIGHTS validation suite, fit by the same engines/compare as every other rung. Conventions on top of the main manifest: `weights_col` names a plain per-row prior-weight CSV column (mutually exclusive with the aggregated-binomial `weights` field); rungs WITHOUT a jl_formula are lme4-only (fixed-only models MixedModels cannot fit, or R-only pathologicals) and fit.jl skips them; `gate` marks the two fit-time special gates (dropped_rows in fit.R, unit_identity in fit.rs)."
 }

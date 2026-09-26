@@ -1,44 +1,35 @@
 # Campaigns — archived validation studies
 
-Three finished studies. Their **conclusions** are frozen in each campaign's
+Two finished studies. Their **conclusions** are frozen in each campaign's
 committed `reports/`; their raw run output is gitignored (regenerable). The
 scripts stay maintained so each can be rerun after major solver work.
-Older workspace docs call estimate-grid "the diligent grid" and this whole
-directory tree "parity" — same things, renamed 2026-07-22.
 
-## speed-grid — optimizer cost across a 510-cell grid
+## speed-grid — optimizer cost across the grid
 
 **Question:** where does glmm's BOBYQA spend evaluations, and how does wall
 time compare to MixedModels.jl (and lme4 where feasible) across structure ×
 family × size × balance?
 **Verdict** (`reports/final_analysis.txt`): eval-ratio medians rise with θ
-dimension (~0.97 at 1–2 θ params to ~1.8 at 21–40); 491/510 cells ok, the
-mismatches all adjudicated (see estimate-grid).
-**Machinery:** `manifest.json` (510 cells) + `prep.R` (fixed-seed data into
-`data/`) + `run.sh <engine> <tag>` (per-cell wall watchdog with kill-and-resume)
-+ `fit.{rs,R,jl}` drivers + `analyze.R`/`report.R` → `reports/`.
+dimension (~0.97 at 1–2 θ params to ~1.8 at 21–40); 491 of the 510 cells the
+frozen run covered are ok, every mismatch adjudicated. `manifest.json` has since
+grown to 585 cells; the verdict is the 510-cell run's, and the extra cells have
+not been fitted through it.
+**Machinery:** `manifest.json` (585 cells) + `prep.R` (fixed-seed data into `data/`) +
+`run.sh <engine> <tag>` (per-cell wall watchdog with kill-and-resume) +
+`fit.{rs,R,jl}` drivers + `analyze.R`/`report.R`/`counters.R` → `reports/`.
+`common.R` holds the readers and the beta band the two analysis scripts share.
 `theta_eval.rs` and `sweep_fit.jl` are the mismatch-adjudication drivers
 (multi-start sweeps re-scored on glmm's objective); their product is the
-best-known optima frozen in `../../goldens/optima/`.
+best-known optima frozen in `optima/`.
+**Second cell list:** `estimate-grid-manifest.json` is the answer-agreement pass over
+the same grid — 477 Laplace cells against glmer/lmer, 15 scalar-AGQ cells against
+glmer(nAGQ=7), 18 vector-AGQ cells against GLMMadaptive(nAGQ=7). Its verdict is in
+`reports/`: 22 named failures of 510, every one adjudicated — boundary near-zero-θ
+artifacts, GLMMadaptive under-convergence, and one real disagreement against
+MixedModels (`lmm_q8_g3000p5_bal_lowsnr`, REML gap +2.03) kept on record. `fit.R`
+selects its three engine branches off that manifest's per-cell `nagq`/`structure`.
 **Rerun:** `./run.sh glmm <tag>` etc. after `Rscript prep.R`; user locks the
 clock first (`bench-l`) for meaningful walls.
-
-## estimate-grid — answer agreement across the same 510 cells
-
-**Question:** does glmm reproduce the reference engines' *answers* — β,
-variance components, Hessian SEs — across the whole grid? 477 Laplace cells
-vs glmer/lmer; 15 scalar-AGQ cells vs glmer(nAGQ=7); 18 vector-AGQ cells vs
-GLMMadaptive(nAGQ=7).
-**Verdict** (`reports/failures.txt`, annotated inline): 22 named failures of
-510, every one adjudicated — boundary near-zero-θ artifacts, GLMMadaptive
-under-convergence (confirmed by third-engine cross-checks: `adjudicate.R`,
-`verify_boundary37.R`), and one real disagreement vs MixedModels
-(`lmm_q8_g3000p5_bal_lowsnr`, REML gap +2.03) kept on record.
-**Machinery:** own `manifest.json`; fitting reuses `../speed-grid/run.sh`
-(`GRID_MANIFEST=$PWD/manifest.json GRID_OUT=$PWD/results/<engine>.jsonl`);
-`analyze.R` joins glmm vs oracle per cell → `reports/`.
-**Rerun:** regenerate data with `../speed-grid/prep.R`, fit both engines as
-above, then `Rscript analyze.R`.
 
 ## monte_carlo — accuracy against known truth
 

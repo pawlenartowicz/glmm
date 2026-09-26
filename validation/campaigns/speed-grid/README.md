@@ -6,8 +6,8 @@ This is a benchmark grid for the `glmm` crate. It fits a grid of simulated
 mixed models with three engines — `glmm` (Rust), `MixedModels.jl`, and
 `lme4`/`GLMMadaptive` (R) — on the same data, and records wall time and
 optimizer eval counts per cell. `manifest.json` defines 585 cells across
-family, random-effect structure, and size. The sibling campaign
-`../estimate-grid/` reuses this directory's `run.sh`, pointing it at its own
+family, random-effect structure, and size. `estimate-grid-manifest.json` is a
+second cell list fitted through the same `run.sh` and `fit.R`, pointed at its own
 manifest and output tree through `GRID_MANIFEST`/`GRID_OUT`.
 
 ## Files
@@ -18,6 +18,11 @@ manifest and output tree through `GRID_MANIFEST`/`GRID_OUT`.
 - `fit.R` — the lme4 / GLMMadaptive driver.
 - `prep.R` — generates `manifest.json` and the per-cell CSVs in `data/`.
 - `analyze.R` — reads engine JSONLs, writes the status map and summary CSVs in `reports/`.
+- `common.R` — the readers and the beta agreement band `analyze.R` and `counters.R` share.
+- `estimate-grid-manifest.json` — the second cell list (answer-agreement pass), read by
+  `counters.R`'s AGQ join and fittable through `run.sh` with `GRID_MANIFEST`.
+- `optima/` — best-known optima for the mismatch cells, frozen by `theta_eval.rs` and
+  `sweep_fit.jl`.
 - `report.R` — turns `reports/status_map.csv` into `reports/report.html`.
 - `counters.R` — aggregates the optimizer counter fields from a counters pass.
 - `sweep_fit.jl` — MixedModels.jl multi-start sweep for adjudicating β mismatches.
@@ -142,7 +147,7 @@ named `<case_id>.csv`. Cells flagged `b1` also get 5 seed-replicate CSVs,
 ## Analysis
 
 `analyze.R glmm.jsonl mixedmodels.jsonl [lme4.jsonl]` reads those JSONLs, the
-tolerance definitions from `../../tol.R`, and `manifest.json`. It writes
+tolerance definitions from `common.R`, and `manifest.json`. It writes
 `reports/status_map.csv` (one row per cell: status, eval counts, aligned
 deviances, wall times), `reports/eval_ratio.csv` (eval-ratio quantiles by
 `n_theta` bin, family, structure, and regime), `reports/data_profiles.csv`
@@ -157,7 +162,7 @@ MixedModels.jl wall time and eval count, colored by wall-time ratio.
 
 `counters.R laplace.jsonl agq.jsonl out.csv [baseline.csv]` reads the
 Laplace-pass and AGQ-pass JSONLs plus this manifest and
-`../estimate-grid/manifest.json`, and writes a joined counter table to
+`estimate-grid-manifest.json`, and writes a joined counter table to
 `out.csv`; the optional `baseline.csv` gets one row per family/structure
 combination with median wall time and eval count from converged Laplace
 cells.

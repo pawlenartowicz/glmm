@@ -703,10 +703,11 @@ fn erfc_cody(x: f64) -> f64 {
 /// `ln Γ(x)` for `x > 0`, accurate to ~1e-15 (full double). Lanczos
 /// approximation, `g = 7`, 9-coefficient series (Lanczos 1964; coefficients the
 /// widely-used Godfrey/Boost set) — relative error < 2e-16 on `x ∈ (0, ∞)`.
-/// Used by the Gamma-GLMM Laplace objective (`family::gamma_aic`, lme4's
-/// `Gamma()$aic`): the dispersion enters the deviance only through `lnΓ(1/φ)`, so
-/// matching `glmer` needs `lnΓ` to machine precision. No `digamma`/`trigamma` —
-/// lme4 profiles the dispersion as `D/Σw` rather than solving the ML score.
+/// Used by the Gamma log-density term (`family::gamma_dispersion_term`, in the
+/// mixed ML objective and the GLM log-likelihood): the dispersion enters
+/// through `lnΓ(1/φ)`, and `ln φ` is a coordinate of the mixed outer search,
+/// so `lnΓ` is needed to machine precision. Its derivatives, for the
+/// joint Hessian's `ln φ` row, are `dual::digamma`/`dual::trigamma`.
 #[allow(clippy::excessive_precision)]
 pub(crate) fn ln_gamma(x: f64) -> f64 {
     // Lanczos g=7 coefficients (c[0] is the series constant a₀).

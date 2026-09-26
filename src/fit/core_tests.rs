@@ -832,9 +832,9 @@ fn fit_on_panics_on_grown_target_count() {
 /// on every weighted call and never touches it otherwise, so a weighted →
 /// unweighted transition on one workspace would leave the previous call's
 /// weights in a buffer most consumers (the PIRLS working-weight and deviance
-/// folds, the pass-3 effective residual, `family::gamma_aic`) read without
-/// gating on `GlmmWorkspace::weighted`. The transition must fault here, before
-/// any of them runs.
+/// folds, the pass-3 effective residual) read without gating on
+/// `GlmmWorkspace::weighted`. The transition must fault here, before any of
+/// them runs.
 #[test]
 #[should_panic(expected = "weights presence is frozen at build")]
 fn fit_on_panics_when_a_weighted_glmm_workspace_is_reused_unweighted() {

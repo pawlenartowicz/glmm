@@ -1,9 +1,9 @@
 [package]
 name = "validation"
 # Lockstep with the crate: must equal GLMM/Cargo.toml [package] version.
-# glmm.rs stamps CARGO_PKG_VERSION into each result JSON's engine_version, and
-# after the move that macro reads THIS manifest, not glmm's.
-version = "0.4.0"
+# grid/engines/glmm.rs stamps CARGO_PKG_VERSION into each result record's
+# engine_version, and that macro reads THIS manifest, not glmm's.
+version = "0.4.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,12 +12,12 @@ license.workspace = true
 # -p glmm`: Cargo never descends into a subdirectory with its own Cargo.toml.
 publish = false
 
-# No lib/bin — this package exists only to own the four oracle example targets
-# below (examples satisfy Cargo's at-least-one-target requirement).
+# No lib/bin — this package exists only to own the example targets below (examples
+# satisfy Cargo's at-least-one-target requirement).
 
 # `formula` — the drivers lower R-style formulas; `loop_advanced` — theta_eval
 # drives the dev-only seam. Enabled here on the dep rather than per-example
-# `required-features` so all four examples always build (and stay under the
+# `required-features` so every example always builds (and stays under the
 # workspace clippy deny gate) in `cargo clippy --workspace --all-targets`.
 [dependencies]
 glmm = { path = "..", features = ["formula", "loop_advanced"] }
@@ -28,10 +28,9 @@ glmm = { path = "..", features = ["formula", "loop_advanced"] }
 [features]
 counters = ["glmm/counters"]
 
-# No `parallel` passthrough: every engine target here fits serial, including the
-# VALIDATION_AGQ pass (engines/glmm.rs). The one example that wants inner
-# parallelism, campaigns/speed-grid/agq_par_probe.rs, asks for it on the dependency
-# directly (`--features glmm/parallel`, see its header).
+# No `parallel` passthrough: every example here fits serial. The one that wants
+# inner parallelism, campaigns/speed-grid/agq_par_probe.rs, asks for it on the
+# dependency directly (`--features glmm/parallel`, see its header).
 
 [dev-dependencies]
 serde      = { version = "1", features = ["derive"] }
@@ -40,52 +39,45 @@ serde_json = "1"
 [lints]
 workspace = true
 
-# The glmm side of the cross-language validation suite. Kept at engines/glmm.rs
-# (where the design and run.sh name it) rather than the default examples/ dir;
-# run by run.sh's "rust" engine entry (`cargo run -p validation --example validation_fit`).
-[[example]]
-name = "validation_fit"
-path = "engines/glmm.rs"
-
 # The glmm side of the optimizer-grid campaign (campaigns/speed-grid/manifest.json,
-# 510 cells): one JSONL record per cell, appended to $GRID_OUT. Shares
-# common.rs with validation_fit above.
+# 585 cells): one JSONL record per cell, appended to $GRID_OUT. Shares
+# tools/common.rs with the examples below.
 [[example]]
 name = "grid_fit"
 path = "campaigns/speed-grid/fit.rs"
 
-# Mismatch-adjudication driver (oracle spec 2026-07-11): evaluates/minimizes
-# the LMM profiled-REML objective at caller-chosen θ/schedules through the
-# dev-only loop_advanced seam. Shares common.rs with the two above.
+# Mismatch-adjudication driver: evaluates/minimizes the LMM profiled-REML objective
+# at caller-chosen θ/schedules through the dev-only loop_advanced seam.
 [[example]]
 name = "theta_eval"
 path = "campaigns/speed-grid/theta_eval.rs"
 
-# Fits one memory-measurement model (validation/memory/models.json + gen_models.py)
-# from a CSV path + formula string, for the memory harness (memory/memory.sh) to
-# wrap in `/usr/bin/time -f '%M'`. Shares common.rs with the three examples above.
-# NOT a validation rung -- see memory/models.json's header.
+# Fits one memory-measurement model (tools/memory/models.json + gen_models.py) from a
+# CSV path + formula string, for the memory harness (tools/memory/memory.sh) to wrap
+# in `/usr/bin/time -f '%M'`. Not a validation gate -- see tools/memory/models.json's
+# header.
 [[example]]
 name = "memory_fit"
-path = "memory/memory_fit.rs"
+path = "tools/memory/memory_fit.rs"
 
-# Scratch AGQ parallel_inner probe (see its header). Temporary — delete this
-# entry and the file once the parallel-default question is answered.
+# AGQ parallel_inner probe (see its header).
 [[example]]
 name = "agq_par_probe"
 path = "campaigns/speed-grid/agq_par_probe.rs"
 
-# Scratch NB θ-search probe (see its header): the three NB GLMM m3_goldens rungs,
-# evaluation counts, θ̂, log-likelihood, min wall. Delete with the sparse bracket.
-[[example]]
-name = "nb_theta_probe"
-path = "nb_theta_probe.rs"
-
 # Machine-local bit-identity baseline for refactors that must not change any
-# fitted number: fits all 48 manifest rungs and writes bit_identity/<config>.json
-# (rung, deviance, theta, beta, se_hessian, se_rx, n_eval, converged, singular).
-# Shares common.rs with the other examples above. See bit_identity/dump.rs's
-# header for the four config commands.
+# fitted number: fits all 49 manifest rungs and writes
+# tools/bit_identity/<config>.json (rung, deviance, theta, beta, se_hessian, se_rx,
+# n_eval, converged, singular). See tools/bit_identity/dump.rs's header for the
+# four config commands.
 [[example]]
 name = "bit_identity"
-path = "bit_identity/dump.rs"
+path = "tools/bit_identity/dump.rs"
+
+# The glmm side of the accuracy grid (grid/manifest.json): one JSONL record per
+# cell, appended to $GRID_OUT. Has its own grid/engines/common.rs -- tools/common.rs
+# reads the per-rung manifest shape and stays the #[path] target of the examples
+# above.
+[[example]]
+name = "grid_glmm"
+path = "grid/engines/glmm.rs"

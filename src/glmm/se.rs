@@ -345,7 +345,7 @@ pub(crate) fn rx_cov_into(
 ///
 /// Match vs lme4 `vcov(use.hessian=TRUE)`: ~3.4e-7 worst per-entry gap on the
 /// committed fixture; worst rel `se_hessian` ≤6e-4 across validation rungs
-/// (rung 28 `sim_poisson_offset`), all within `tol.R` bands,
+/// (rung 28 `sim_poisson_offset`), all within `grid/tol.R` bands,
 /// including the two large-θ̂ rungs (`sim_binomial_bigsd` θ̂ = 4.51, 7.4e-6;
 /// `sim_poisson_bigsd` θ̂ = 2.97, 1.4e-5).
 ///
@@ -413,6 +413,80 @@ pub fn joint_hessian_cov(
     n: usize,
     out_cov: &mut Mat<f64>,
 ) -> FdHessianStatus {
+    // Mixed Gamma: at the fitted φ̂ the objective in (θ, β) is exactly a GLMM on
+    // the prior weights `prior_wᵢ/φ̂` with the bare deviance as its data term,
+    // so for the duration of this call the workspace IS that GLMM
+    // (`GlmmWorkspace::at_fixed_dispersion`). Every rung below then
+    // differentiates the fitted objective at fixed φ̂ with no Gamma case of its
+    // own, and `joint_hessian_cov_at` appends the `ln φ` row itself.
+    //
+    // Negative binomial: θ_NB is a coordinate of the outer search too, so its
+    // row is appended as well (`DispRow::Nb`), and Cov(β̂) carries its
+    // uncertainty, as glmmTMB's does.
+    match ws.family {
+        // A held φ (`GlmmWorkspace::gamma_phi_held`) is not a coordinate of the
+        // fit, so the joint Hessian is `(θ, β)`'s at that φ, with no `ln φ` row.
+        crate::spec::Family::Gamma { .. } => {
+            // Compute the `ln φ` diagonal's `Gₚ''` term from `ws.prior_w` (the
+            // internal `ŵ`) BEFORE `at_fixed_dispersion` swaps it to the
+            // per-row shapes `ŵᵢ/φ̂_int` below; `None` on an unweighted fit
+            // takes `_d2`'s bit-identical unweighted arithmetic rather than
+            // reading (possibly stale) all-ones weights.
+            let disp = ws.gamma_phi_held.is_none().then(|| {
+                let weights = ws.weighted.then_some(&ws.prior_w[..n]);
+                DispRow::Gamma {
+                    d2: crate::family::gamma_dispersion_term_d2(ws.gamma_phi.ln(), weights, n),
+                }
+            });
+            ws.at_fixed_dispersion(n, |ws| {
+                joint_hessian_cov_at(ws, x, y, cluster_ids, extra_ids, p, n, out_cov, disp)
+            })
+        }
+        crate::spec::Family::NegativeBinomial { .. } => joint_hessian_cov_at(
+            ws,
+            x,
+            y,
+            cluster_ids,
+            extra_ids,
+            p,
+            n,
+            out_cov,
+            Some(DispRow::Nb),
+        ),
+        _ => joint_hessian_cov_at(ws, x, y, cluster_ids, extra_ids, p, n, out_cov, None),
+    }
+}
+
+/// The dispersion coordinate `joint_hessian_cov_at` appends to the joint
+/// Hessian, when the family's outer search carries one.
+#[derive(Clone, Copy)]
+enum DispRow {
+    /// Mixed Gamma, `ln φ`: the row from the fixed-φ̂ scaling identity, in the
+    /// `(ξ, β, t)` coordinates. `d2` is `family::gamma_dispersion_term_d2` at
+    /// the fitted `ln φ̂_int` and weights, computed by the caller before
+    /// `GlmmWorkspace::at_fixed_dispersion` swaps `prior_w`.
+    Gamma { d2: f64 },
+    /// Negative binomial, `ln θ_NB`: the row by central differences of the full
+    /// objective, in the absolute `(θ, β, ln θ_NB)` coordinates.
+    Nb,
+}
+
+/// [`joint_hessian_cov`]'s body. `disp` names the dispersion coordinate the
+/// joint Hessian gains before it is inverted: [`DispRow::Gamma`] with the
+/// workspace already holding the fixed-φ̂ GLMM (see the wrapper), or
+/// [`DispRow::Nb`]. `None` on every family whose dispersion is fixed.
+#[allow(clippy::too_many_arguments)]
+fn joint_hessian_cov_at(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    p: usize,
+    n: usize,
+    out_cov: &mut Mat<f64>,
+    disp: Option<DispRow>,
+) -> FdHessianStatus {
     use faer::linalg::solvers::Solve;
     let m = ws.n_theta + p;
     let n_theta = ws.n_theta;
@@ -456,26 +530,10 @@ pub fn joint_hessian_cov(
     macro_rules! fallback {
         () => {{
             let _ = fd_eval(ws, &[], &[], x, y, cluster_ids, extra_ids, n);
+            // The fallback reports an RX vcov exactly as the production Rx arm
+            // does: on Gamma the weights in place here are `prior_wᵢ/φ̂`, so the
+            // Schur inverse is already `φ̂·RX⁻¹` and takes no further factor.
             let ok = rx_cov_into(ws, x, cluster_ids, p, n, out_cov);
-            // The fallback reports an RX vcov, so it carries Gamma's σ̂² like the
-            // production Rx arm (fixed-scale families: ×1). The fd_eval above
-            // restored the converged μ̂/û at γ̂.
-            if ok {
-                let sigma_sq = crate::family::glmm_sigma_sq(
-                    ws.family,
-                    &y[..n],
-                    &ws.pirls.prob[..n],
-                    &ws.pirls.u[..ws.k],
-                    ws.weighted.then(|| &ws.prior_w[..n]),
-                );
-                if sigma_sq != 1.0 {
-                    for a in 0..p {
-                        for b in 0..p {
-                            out_cov[(a, b)] *= sigma_sq;
-                        }
-                    }
-                }
-            }
             // Double failure (joint Hessian AND RX Schur both non-PD; small
             // Gamma-inverse fits with a large random-effect sd reach it):
             // rx_cov_into leaves out_cov UNTOUCHED on `false`, so it would keep
@@ -750,12 +808,103 @@ pub fn joint_hessian_cov(
         }
     }
 
+    // Mixed Gamma: the dispersion is a coordinate of the fitted objective too,
+    // so the joint Hessian gains a trailing row for `t = ln φ − ln φ̂`. PIRLS on
+    // `prior_wᵢ/(φ̂·eᵗ)` with `u = v·e^{−t/2}` is the fixed-φ̂ problem at
+    // `θ·e^{−t/2}` (Λ is linear in θ), so in the coordinates `(ξ, β, t)` with
+    // `θ = ξ·e^{t/2}` the objective separates as
+    //
+    //   F(ξ, β, t) = e^{−t}·P̂(ξ, β) + L̂(ξ, β) + G(ln φ̂ + t)
+    //
+    // `P̂ = D(û) + ‖û‖²` and `L̂ = log|A|` both at the weights in place here
+    // (`prior_wᵢ/φ̂`), `G` = `family::gamma_dispersion_term`. At `t = 0`, `ξ = θ`
+    // and the `(ξ, β)` block is the fixed-φ̂ Hessian every rung above built;
+    // the new entries are `∂²F/∂γ∂t = −∇P̂` and `∂²F/∂t² = P̂ + G''`. The β
+    // block of the inverse does not depend on how the non-β coordinates are
+    // parametrized at a stationary point, so it is Cov(β̂) with φ estimated.
+    // `∇P̂` is the partial of the penalized deviance at the mode (`û` is its own
+    // minimizer), taken by central differences over the same fixed-seed
+    // re-solves the stencil uses: it enters only this rank-one cross term, where
+    // a step of 1e-4 is far inside every tolerance the SEs are gated at.
+    let disp_hess = match disp {
+        None => None,
+        Some(DispRow::Gamma { d2 }) => {
+            ws.fd.pirls_tol_override = Some(super::pirls_tol_fd(ws.family));
+            let _ = fd_eval(ws, &[], &[], x, y, cluster_ids, extra_ids, n);
+            let pen_dev0 = penalized_deviance_at_mode(ws, y, n);
+            let mut h = Mat::<f64>::zeros(m + 1, m + 1);
+            for a in 0..m {
+                for b in 0..m {
+                    h[(a, b)] = ws.inference.hess_scratch[(a, b)];
+                }
+            }
+            for k in 0..m {
+                let step = GAMMA_PEN_GRAD_STEP * ws.fd.fd_saved[k].abs().max(1.0);
+                let _ = fd_eval(ws, &[k], &[step], x, y, cluster_ids, extra_ids, n);
+                let up = penalized_deviance_at_mode(ws, y, n);
+                let _ = fd_eval(ws, &[k], &[-step], x, y, cluster_ids, extra_ids, n);
+                let dn = penalized_deviance_at_mode(ws, y, n);
+                let g = (up - dn) / (2.0 * step);
+                if !g.is_finite() {
+                    fallback!();
+                }
+                h[(m, k)] = -g;
+                h[(k, m)] = -g;
+            }
+            h[(m, m)] = pen_dev0 + d2;
+            Some(h)
+        }
+        Some(DispRow::Nb) => {
+            // Negative binomial: θ_NB enters the variance function, so there is
+            // no scaling identity to separate it; its row is taken by central
+            // differences of the full objective `F(γ, t)` — the Laplace (or AGQ)
+            // deviance at `θ_NB = θ̂_NB·eᵗ` plus the search's own
+            // `−2·nb_profile_loglik(y, y, θ_NB)` — over the same fixed-seed
+            // re-solves the stencil uses, in the absolute `(θ, β, ln θ_NB)`
+            // coordinates the fit searches. `4m + 3` re-solves.
+            ws.fd.pirls_tol_override = Some(super::pirls_tol_fd(ws.family));
+            let th0 = ws.nb_theta;
+            let lt0 = th0.ln();
+            let ht = NB_DISP_FD_STEP * lt0.abs().max(1.0);
+            let f00 = nb_full_objective(ws, &[], &[], lt0, x, y, cluster_ids, extra_ids, n);
+            let fp = nb_full_objective(ws, &[], &[], lt0 + ht, x, y, cluster_ids, extra_ids, n);
+            let fm = nb_full_objective(ws, &[], &[], lt0 - ht, x, y, cluster_ids, extra_ids, n);
+            let mut h = Mat::<f64>::zeros(m + 1, m + 1);
+            for a in 0..m {
+                for b in 0..m {
+                    h[(a, b)] = ws.inference.hess_scratch[(a, b)];
+                }
+            }
+            h[(m, m)] = (fp - 2.0 * f00 + fm) / (ht * ht);
+            for k in 0..m {
+                let hk = NB_DISP_FD_STEP * ws.fd.fd_saved[k].abs().max(1.0);
+                let mut corner = |dk: f64, dt: f64| {
+                    nb_full_objective(ws, &[k], &[dk], lt0 + dt, x, y, cluster_ids, extra_ids, n)
+                };
+                let v = (corner(hk, ht) - corner(hk, -ht) - corner(-hk, ht) + corner(-hk, -ht))
+                    / (4.0 * hk * ht);
+                h[(m, k)] = v;
+                h[(k, m)] = v;
+            }
+            ws.nb_theta = th0;
+            if (0..=m).any(|k| !h[(m, k)].is_finite()) {
+                fallback!();
+            }
+            Some(h)
+        }
+    };
+
     // Invert the joint Hessian; non-PD ⇒ RX fallback. cov = 2·(H⁻¹)_ββ.
-    let chol = match ws.inference.hess_scratch.as_ref().llt(faer::Side::Lower) {
+    let md = if disp_hess.is_some() { m + 1 } else { m };
+    let chol = match disp_hess
+        .as_ref()
+        .map_or(ws.inference.hess_scratch.as_ref(), |h| h.as_ref())
+        .llt(faer::Side::Lower)
+    {
         Ok(c) => c,
         Err(_) => fallback!(),
     };
-    let mut inv = Mat::<f64>::identity(m, m);
+    let mut inv = Mat::<f64>::identity(md, md);
     chol.solve_in_place(inv.as_mut());
     for a in 0..p {
         for b in 0..p {
@@ -767,15 +916,24 @@ pub fn joint_hessian_cov(
     // joint Hessian). For a scalar grouping the RE stddev equals θ, so this is the
     // stddev's SE directly. A rounding-negative diagonal (never seen at a PD point,
     // but the LLT solve can leave a tiny negative) clamps to 0 before the sqrt.
+    // On mixed Gamma the inverse is in `(ξ, β, t)`, and `θ = ξ·e^{t/2}` maps it
+    // back by the delta method: `dθ = dξ + ½·θ̂·dt`, so
+    // `Var θ̂ = C_ξξ + θ̂·C_ξt + ¼·θ̂²·C_tt` with `C = 2·H⁻¹`. The NB row is in
+    // absolute coordinates already.
     for k in 0..n_theta {
-        ws.inference.theta_se[k] = (2.0 * inv[(k, k)]).max(0.0).sqrt();
+        let var = if matches!(disp, Some(DispRow::Gamma { .. })) {
+            let th = ws.fd.fd_saved[k];
+            2.0 * (inv[(k, k)] + th * inv[(k, m)] + 0.25 * th * th * inv[(m, m)])
+        } else {
+            2.0 * inv[(k, k)]
+        };
+        ws.inference.theta_se[k] = var.max(0.0).sqrt();
     }
 
     // Restore the converged PIRLS state at γ̂ (W̃/û/μ̂/factors): the stencil leaves
     // the LAST perturbed eval's state in ws, and the caller reads ws.pirls.prob/
-    // ws.pirls.u AFTER this returns, on every layout (Gamma's σ̂² for tau2/varcorr, the Pearson φ̂,
-    // mu_hat) — off the perturbed state Gamma's σ̂² was ~2e-3 high (rung-23
-    // stddev gate). Same central re-eval the RX fallback uses; the empty
+    // ws.pirls.u AFTER this returns, on every layout (mu_hat and the reported
+    // fit) — off the perturbed state rung 23's stddev once came out ~2e-3 high. Same central re-eval the RX fallback uses; the empty
     // perturbation evaluates exactly at γ̂ (fd_saved).
     let _ = fd_eval(ws, &[], &[], x, y, cluster_ids, extra_ids, n);
 
@@ -790,6 +948,53 @@ pub fn joint_hessian_cov(
     ws.fd.warm_seed_active = false; // never leak the FD seed into a later fit / BOBYQA
     ws.fd.pirls_tol_override = None; // nor the FD-pass tol
     FdHessianStatus::Ok
+}
+
+/// Central-difference step of the NB `ln θ_NB` row in `joint_hessian_cov_at`,
+/// relative with a unit floor on every coordinate: the four-point mixed
+/// second difference at this step sits inside the SE gate's 1e-3 against a
+/// brute-force Hessian of the full objective
+/// (`nb_hessian_se_matches_fd_of_the_full_objective`).
+const NB_DISP_FD_STEP: f64 = 2e-3;
+
+/// The NB fit's full objective at `fd_saved + Σ deltaₖ·e_{coordₖ}` and
+/// `θ_NB = e^{ln_theta}`: the (Laplace or AGQ) deviance plus the search's own
+/// `−2·nb_profile_loglik(y, y, θ_NB, w)`, the term `glmm::fit_glmm` adds per
+/// evaluation. Leaves `ws.nb_theta` at the probed value; the caller restores it.
+#[allow(clippy::too_many_arguments)]
+fn nb_full_objective(
+    ws: &mut GlmmWorkspace,
+    coords: &[usize],
+    deltas: &[f64],
+    ln_theta: f64,
+    x: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    n: usize,
+) -> f64 {
+    ws.nb_theta = ln_theta.exp();
+    let dev = fd_eval(ws, coords, deltas, x, y, cluster_ids, extra_ids, n);
+    let w = ws.weighted.then(|| &ws.prior_w[..n]);
+    dev - 2.0 * crate::fit::nb_profile_loglik(y, y, ws.nb_theta, w)
+}
+
+/// Central-difference step of `∇P̂` in `joint_hessian_cov_at`'s mixed-Gamma
+/// dispersion row, relative with a unit floor (`h_k = step·max(1, |γ̂_k|)`).
+const GAMMA_PEN_GRAD_STEP: f64 = 1e-4;
+
+/// `P̂ = Σᵢ wᵢ·dᵢ(yᵢ, μ̂ᵢ) + ‖û‖²` at the mode the last `fd_eval` left in the
+/// workspace, `wᵢ` the prior weights in place (`prior_wᵢ/φ̂` inside
+/// `joint_hessian_cov`'s Gamma arm).
+fn penalized_deviance_at_mode(ws: &GlmmWorkspace, y: &[f64], n: usize) -> f64 {
+    let d: f64 = y[..n]
+        .iter()
+        .zip(&ws.prior_w[..n])
+        .zip(&ws.pirls.prob[..n])
+        .map(|((&yi, &wi), &mu)| wi * crate::family::dev_resid(ws.family, ws.nb_theta, yi, mu))
+        .sum();
+    let kk = ws.k.max(1);
+    d + ws.pirls.u[..kk].iter().map(|v| v * v).sum::<f64>()
 }
 
 /// C = X'W̃X (p×p), full matrix, via the W∘X GEMM scratch `ws.wx` (rebuilt fresh

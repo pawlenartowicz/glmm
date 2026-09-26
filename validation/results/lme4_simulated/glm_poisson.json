@@ -1,0 +1,25 @@
+{
+  "dataset": "glm_poisson",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "poisson",
+  "reml": null,
+  "rung": 31,
+  "converged": true,
+  "singular": false,
+  "optimizer": "glm.fit",
+  "n_eval": 5,
+  "coef_names": ["(Intercept)", "x", "grpb"],
+  "estimates": {
+    "beta": [0.309518214268677, 0.490543513556182, 0.369877245818921],
+    "se_rx": [0.0871280728085796, 0.0561247688851625, 0.109958678867546],
+    "loglik": -311.585362925837,
+    "varcomp": []
+  },
+  "timing": {
+    "fit_seconds_median": 0.0135855674743652,
+    "n_runs": 4,
+    "warmup_discarded": 1,
+    "fits_per_sample": 10
+  }
+}

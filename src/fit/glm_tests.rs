@@ -4,7 +4,9 @@
 use super::glm::{fit_glm, fit_glm_prebuilt, glm_view_to_fit, GlmScratchBuf};
 use super::*;
 use crate::test_support::assert_near;
-use crate::{BinomialLink, Family, GroupIds, ModelSpec, ReStructure, Sizing};
+use crate::{
+    BinomialLink, Family, GroupIds, ModelSpec, NegBinomialLink, Note, ReStructure, Sizing,
+};
 
 use super::common_tests::{assert_pinned, lcg, sim_clustered, PIN_REL_OLS};
 
@@ -77,9 +79,11 @@ fn fit_glm_prebuilt_view_maps_to_same_fit() {
     assert_near(&[direct.loglik], &[via_view.loglik], "loglik");
 }
 
-/// Weighted Gamma(log) GLM vs R glm(weights=). Convention: prior weight
-/// multiplies the IRLS working weight and deviance; Pearson dispersion
-/// φ = Σwᵢrᵢ²/(n−p), raw-row df (R summary.glm).
+/// Weighted Gamma(log) GLM vs R glm(weights=). Precision weights: row `i` has
+/// variance `φ·V(μᵢ)/wᵢ`. β is the same either way (the mean model doesn't
+/// see the convention), but SE and `dispersion` are `summary(glm)`'s Pearson
+/// moment `φ̂ = Σwᵢrᵢ²/(n−p)`, and `loglik` is the maximised precision
+/// log-likelihood (Σwᵢ, the case-weight ML value, differs).
 #[test]
 fn fit_glm_gamma_weighted_matches_r() {
     // R 4.5.3 oracle (set.seed(42), n = 40):
@@ -87,7 +91,15 @@ fn fit_glm_gamma_weighted_matches_r() {
     //   eta <- 0.4 + 0.8 * x1
     //   yg <- round(rgamma(n, shape = 2, scale = exp(eta) / 2), 6)
     //   fg <- glm(yg ~ x1, family = Gamma("log"), weights = w)
-    //   print(coef(summary(fg)), digits = 15); print(summary(fg)$dispersion, digits = 15)
+    //   print(coef(fg), digits = 17)
+    //   print(coef(summary(fg))[, 2], digits = 17); print(summary(fg)$dispersion, digits = 17)
+    //   # precision loglik: row i has variance phi*V(mu_i)/w_i (shape a_i = w_i/phi)
+    //   mu <- fitted(fg)
+    //   prec_ll <- function(phi) sum(dgamma(yg, shape = w / phi, rate = (w / phi) / mu, log = TRUE))
+    //   opt <- optimize(prec_ll, c(1e-6, 100), maximum = TRUE, tol = 1e-12)
+    //   print(opt$maximum, digits = 17); print(opt$objective, digits = 17)
+    //   # cross-check: glmmTMB(yg ~ x1, family = Gamma("log"),
+    //   #                      dispformula = ~ offset(log(w))) -> same beta, logLik
     let x1: [f64; 40] = [
         1.371, -0.5647, 0.3631, 0.6329, 0.4043, -0.1061, 1.5115, -0.0947, 2.0184, -0.0627, 1.3049,
         2.2866, -1.3889, -0.2788, -0.1333, 0.636, -0.2843, -2.6565, -2.4405, 1.3201, -0.3066,
@@ -106,8 +118,8 @@ fn fit_glm_gamma_weighted_matches_r() {
         0.485665, 0.962023, 1.043896, 1.771311, 1.926229, 7.592099, 1.298714, 0.675125, 0.201756,
         1.814679, 1.104297, 0.434436, 0.470596,
     ];
-    const REF_BETA: [f64; 2] = [0.423197712262065, 0.845082014360343];
-    const REF_SE: [f64; 2] = [0.0960484092896012, 0.0763975129700953];
+    const REF_BETA: [f64; 2] = [0.4231977122620654, 0.8450820143603432];
+    const REF_SE: [f64; 2] = [0.09604840928960116, 0.07639751297009528];
     const REF_DISPERSION: f64 = 0.885577425465437;
     let n = 40;
     let mut x = Vec::with_capacity(n * 2);
@@ -132,9 +144,9 @@ fn fit_glm_gamma_weighted_matches_r() {
         assert!((f.se[j] - REF_SE[j]).abs() < 1e-6, "se[{j}]");
     }
     assert!((f.dispersion - REF_DISPERSION).abs() / REF_DISPERSION < 1e-6);
-    // logLik(fg)/df from the same R run — R's Gamma()$aic convention, whose
-    // dispersion is profiled as dev/Σwᵢ (NOT the Pearson φ̂ above).
-    const REF_LOGLIK: f64 = -118.213036736182;
+    // The maximised precision log-likelihood, cross-checked against
+    // glmmTMB(dispformula = ~ offset(log(w))) at -47.268246110587896.
+    const REF_LOGLIK: f64 = -47.26824611058739;
     assert!(
         (f.loglik - REF_LOGLIK).abs() < 1e-6,
         "loglik {} vs R {REF_LOGLIK}",
@@ -142,6 +154,105 @@ fn fit_glm_gamma_weighted_matches_r() {
     );
     assert_eq!(f.df, 3); // β0, β1, φ
     assert_eq!(f.fitted.len(), 40);
+}
+
+/// Precision weights make the fit invariant to the overall SCALE of `w`:
+/// `wᵢ → c·wᵢ` leaves every row's shape `aᵢ = wᵢ/φ` unchanged once φ absorbs
+/// the factor. The mean-model IRLS fit runs on raw, unnormalised `w`
+/// (its weighted-least-squares argmin does not depend on the overall scale
+/// in exact arithmetic, for any positive `c`), and stops on the absolute
+/// rule `|Δdeviance| < glm::DEVIANCE_TOL`: scaling every weight by `c` scales
+/// the deviance (and its row-to-row changes) by about `c` too, so the same
+/// absolute tolerance stops the iteration at a looser RELATIVE precision when
+/// `c` is small — measured up to ~3e-7 relative on β/SE at `c = 2^-6`, so
+/// those bands are 1e-6. `dispersion` (which scales by exactly `c`) is 1e-4.
+/// `loglik` — the closed-form ML φ̂ solve, which runs on the internal `ŵ`
+/// instead — agrees to 1e-9 relative, since powers of two keep `ŵ` bit-exact.
+/// `2^20` also exercises the ML solver's start. Same x1/w/yg fixture as
+/// `fit_glm_gamma_weighted_matches_r`.
+#[test]
+fn fit_glm_gamma_weight_scale_invariant() {
+    let x1: [f64; 40] = [
+        1.371, -0.5647, 0.3631, 0.6329, 0.4043, -0.1061, 1.5115, -0.0947, 2.0184, -0.0627, 1.3049,
+        2.2866, -1.3889, -0.2788, -0.1333, 0.636, -0.2843, -2.6565, -2.4405, 1.3201, -0.3066,
+        -1.7813, -0.1719, 1.2147, 1.8952, -0.4305, -0.2573, -1.7632, 0.4601, -0.64, 0.4555, 0.7048,
+        1.0351, -0.6089, 0.505, -1.717, -0.7845, -0.8509, -2.4142, 0.0361,
+    ];
+    let w: [f64; 40] = [
+        4.0, 1.0, 2.0, 1.0, 1.0, 4.0, 4.0, 1.0, 3.0, 3.0, 1.0, 4.0, 1.0, 4.0, 4.0, 2.0, 1.0, 4.0,
+        2.0, 2.0, 2.0, 4.0, 1.0, 2.0, 1.0, 2.0, 4.0, 3.0, 4.0, 1.0, 4.0, 1.0, 4.0, 3.0, 2.0, 2.0,
+        3.0, 1.0, 1.0, 2.0,
+    ];
+    let yg: [f64; 40] = [
+        2.421196, 0.850101, 1.188318, 0.917668, 1.895064, 2.717167, 4.391082, 0.266883, 1.853922,
+        1.838375, 5.959549, 19.008523, 0.121882, 1.544704, 1.422566, 0.758422, 1.264496, 0.147806,
+        0.06751, 2.907132, 0.3538, 0.223494, 0.297625, 5.273375, 12.534684, 0.514577, 1.473477,
+        0.485665, 0.962023, 1.043896, 1.771311, 1.926229, 7.592099, 1.298714, 0.675125, 0.201756,
+        1.814679, 1.104297, 0.434436, 0.470596,
+    ];
+    let n = 40;
+    let mut x = Vec::with_capacity(n * 2);
+    for &xi in &x1 {
+        x.extend_from_slice(&[1.0, xi]);
+    }
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: None,
+    };
+    let fit_at = |c: f64| {
+        let wc: Vec<f64> = w.iter().map(|&wi| c * wi).collect();
+        fit_cold(
+            &x,
+            &yg,
+            n,
+            2,
+            &model,
+            &GroupIds::default(),
+            &FitOptions {
+                target_indices: vec![0, 1],
+                weights: Some(wc),
+                ..FitOptions::default()
+            },
+        )
+    };
+    let base = fit_at(1.0);
+    assert!(base.converged());
+    for &c in &[8.0_f64, 2.0_f64.powi(-6), 2.0_f64.powi(20)] {
+        let f = fit_at(c);
+        assert!(f.converged(), "c = {c}");
+        for j in 0..2 {
+            let b_rel = (f.beta[j] - base.beta[j]).abs() / base.beta[j].abs();
+            assert!(
+                b_rel < 1e-6,
+                "c = {c}: β[{j}] {} vs {}",
+                f.beta[j],
+                base.beta[j]
+            );
+            let se_rel = (f.se[j] - base.se[j]).abs() / base.se[j].abs();
+            assert!(
+                se_rel < 1e-6,
+                "c = {c}: se[{j}] {} vs {}",
+                f.se[j],
+                base.se[j]
+            );
+        }
+        let ll_rel = (f.loglik - base.loglik).abs() / base.loglik.abs();
+        assert!(
+            ll_rel < 1e-9,
+            "c = {c}: loglik {} vs {}",
+            f.loglik,
+            base.loglik
+        );
+        let disp_rel = (f.dispersion - c * base.dispersion).abs() / (c * base.dispersion);
+        assert!(
+            disp_rel < 1e-4,
+            "c = {c}: dispersion {} vs {c}·{}",
+            f.dispersion,
+            base.dispersion
+        );
+    }
 }
 
 /// Weighted binomial-logit GLM on aggregated (proportion, trial-count)
@@ -984,14 +1095,16 @@ fn sim_gamma_xy() -> (Vec<f64>, Vec<f64>, usize) {
 }
 
 /// Gamma log-link GLM, gated against frozen R `glm(family=Gamma("log"))`
-/// (`validation/goldens/sim_gamma_glm.json`). φ is the post-fit Pearson moment
-/// estimator (`dispersion: None`); SE is √φ-scaled, matching R's
-/// `summary()$dispersion`. The oracle is sacred.
+/// (`validation/goldens/sim_gamma_glm.json`): β from `stats::glm`, φ̂ its
+/// Pearson moment, SE `summary(fg)`'s, logLik the maximised precision one
+/// (`validation/goldens/sim_gamma_glm_ml.json`'s — unweighted, so the ML and
+/// precision likelihoods coincide). The oracle is sacred.
 #[test]
 fn fit_glm_gamma_log_matches_r() {
     const REF_BETA: [f64; 3] = [0.449945830683142, 0.565796931228723, 0.526238083012209];
     const REF_SE: [f64; 3] = [0.0818215272793177, 0.0596141419705928, 0.119864153173617];
     const REF_DISP: f64 = 1.0286627876062;
+    const REF_LOGLIK: f64 = -489.6218795591715;
     let (x, y, n) = sim_gamma_xy();
     let p = 3;
     let model = ModelSpec {
@@ -1014,7 +1127,16 @@ fn fit_glm_gamma_log_matches_r() {
     );
     assert!(f.converged(), "gamma-log GLM must converge");
     let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
-    assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
+    assert!(
+        disp_rel < SE_REL_DISPERSION,
+        "φ = {} vs R {REF_DISP}",
+        f.dispersion
+    );
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-8,
+        "loglik {} vs R {REF_LOGLIK}",
+        f.loglik
+    );
     for j in 0..p {
         assert!(
             (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
@@ -1033,13 +1155,15 @@ fn fit_glm_gamma_log_matches_r() {
 }
 
 /// Gamma inverse-link GLM, gated against frozen R `glm(family=Gamma("inverse"))`
-/// (`validation/goldens/sim_gamma_inv_glm.json`). Inverse is non-canonical (η=1/μ is
-/// −θ): the general branch + the 1/y cold-start seed. The oracle is sacred.
+/// (`validation/goldens/sim_gamma_inv_glm.json`, the Pearson-φ̂ convention of
+/// `fit_glm_gamma_log_matches_r`). Inverse is non-canonical (η=1/μ is −θ): the
+/// general branch + the 1/y cold-start seed. The oracle is sacred.
 #[test]
 fn fit_glm_gamma_inverse_matches_r() {
     const REF_BETA: [f64; 3] = [0.629151640871097, -0.198980738259224, -0.176508060896549];
     const REF_SE: [f64; 3] = [0.0432089466672347, 0.0187898149082593, 0.04188122263817];
     const REF_DISP: f64 = 1.0354907206002;
+    const REF_LOGLIK: f64 = -493.0941438528882;
     let (x, y, n) = sim_gamma_xy();
     let p = 3;
     let model = ModelSpec {
@@ -1062,7 +1186,16 @@ fn fit_glm_gamma_inverse_matches_r() {
     );
     assert!(f.converged(), "gamma-inverse GLM must converge");
     let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
-    assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
+    assert!(
+        disp_rel < SE_REL_DISPERSION,
+        "φ = {} vs R {REF_DISP}",
+        f.dispersion
+    );
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-8,
+        "loglik {} vs R {REF_LOGLIK}",
+        f.loglik
+    );
     for j in 0..p {
         assert!(
             (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
@@ -1091,11 +1224,12 @@ fn fit_glm_gamma_offset_matches_r() {
     //   gt <- read.csv("sim_gamma.csv"); o <- 0.1 * ((seq_len(nrow(gt))-1) %% 7)
     //   fg <- glm(y ~ x + grp, data = gt, family = Gamma("log"), offset = o)
     //   print(coef(summary(fg)), digits = 15); print(summary(fg)$dispersion, digits = 15)
-    //   print(logLik(fg), digits = 15)
+    //   the maximised logLik is the precision ML φ̂'s, computed exactly as in
+    //   `fit_glm_gamma_weighted_matches_r` (unweighted here, so it equals R's own)
     const REF_BETA: [f64; 3] = [0.200540179916345, 0.569394040617305, 0.455205206563064];
     const REF_SE: [f64; 3] = [0.0828872899140855, 0.0603906433037824, 0.1214254383261718];
     const REF_DISP: f64 = 1.0556349151192;
-    const REF_LOGLIK: f64 = -496.883857112552;
+    const REF_LOGLIK: f64 = -495.620364037027;
     let (x, y, n) = sim_gamma_xy();
     let p = 3;
     let o: Vec<f64> = (0..n).map(|i| 0.1 * (i % 7) as f64).collect();
@@ -1120,7 +1254,11 @@ fn fit_glm_gamma_offset_matches_r() {
     );
     assert!(f.converged(), "gamma GLM with offset must converge");
     let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
-    assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
+    assert!(
+        disp_rel < SE_REL_DISPERSION,
+        "φ = {} vs R {REF_DISP}",
+        f.dispersion
+    );
     for j in 0..p {
         assert!(
             (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
@@ -1163,7 +1301,7 @@ fn sim_igauss_xy() -> (Vec<f64>, Vec<f64>, usize) {
 
 /// Inverse-Gaussian GLM, log link, gated against frozen R
 /// `glm(family=inverse.gaussian("log"))` (`validation/goldens/sim_igauss_glm.json`).
-/// V(μ)=μ³, φ̂ Pearson post-fit as for Gamma. The oracle is sacred.
+/// V(μ)=μ³, φ̂ Pearson post-fit (`summary(glm)`'s). The oracle is sacred.
 #[test]
 fn fit_glm_igauss_matches_r() {
     const REF_BETA: [f64; 3] = [0.388918465368179, 0.0547374103199151, 0.0848741285568016];
@@ -1380,7 +1518,7 @@ fn fit_glm_igauss_offset_matches_r() {
     );
 }
 
-/// `dispersion: Some(v)` holds φ=v fixed (skips the Pearson estimate) and
+/// `dispersion: Some(v)` holds φ=v fixed (skips the ML estimate) and
 /// scales SE by √v. Fitting at Some(1.0) vs Some(2.0) on identical data must
 /// give the same β and SE in the exact ratio √2, with `dispersion` reported
 /// as the held value.
@@ -1405,6 +1543,39 @@ fn fit_glm_gamma_fixed_dispersion_scales_se() {
     assert!(f1.converged() && f2.converged());
     assert!((f2.dispersion - 2.0).abs() < 1e-12, "held φ must be 2.0");
     assert!((f1.dispersion - 1.0).abs() < 1e-12);
+    // logLik is evaluated at the held φ: holding the ML φ̂ (`free.dispersion`
+    // is the Pearson moment, a different value — see
+    // validation/goldens/sim_gamma_glm_ml.json) reproduces the free fit's
+    // (maximised) logLik, and any other held value is lower.
+    const ML_PHI_HAT: f64 = 0.7857435708451531;
+    let free = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    let at_hat = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &opts(ML_PHI_HAT),
+    );
+    assert!(
+        (at_hat.loglik - free.loglik).abs() < 1e-9 * free.loglik.abs(),
+        "loglik at the held φ̂ {} vs the free fit's {}",
+        at_hat.loglik,
+        free.loglik
+    );
+    assert!(f1.loglik < free.loglik && f2.loglik < free.loglik);
     for j in 0..p {
         assert!((f1.beta[j] - f2.beta[j]).abs() < 1e-12, "β φ-independent");
         // SE(φ=2) = √2 · SE(φ=1) exactly (same (XᵀWX)⁻¹, different √φ).
@@ -1787,7 +1958,7 @@ fn fit_glm_nb_theta_low_edge_matches_mass() {
 /// committed CSV — cells with θ̂ nearer the edge all put `theta.ml` at its
 /// iteration/alternation limits, and count size is separately capped by the
 /// IRLS cold-start divergence; both constraints are documented at the
-/// generator, `prep/export_data.R`). The profile is nearly flat in θ up
+/// generator, `validation/tools/prep/export_data.R`). The profile is nearly flat in θ up
 /// here, yet both engines maximise the same profile on the same data, so
 /// θ̂ still gates at 1e-2 (measured ~2e-9); β/SE stay at the standard bands
 /// (β is θ-insensitive near the Poisson limit). The oracle is sacred.
@@ -1848,28 +2019,49 @@ fn fit_glm_nb_outer_cap_semantics() {
 
     let f1 = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, 1).0;
     let full = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, super::glm::NB_MAX_OUTER).0;
-    // Cap exhaustion is silent: the inner IRLS converged, so the flag is true
-    // even though the θ alternation stops mid-flight, short of running to convergence.
+    // Cap exhaustion is reported, not silent: the inner IRLS converged, so the
+    // fit keeps `converged = true`, but it carries a NbShapeUnsettled note with
+    // the number of rounds it ran.
     assert!(
         f1.converged(),
-        "capped fit reports the INNER convergence flag"
+        "capped fit keeps the inner convergence flag"
     );
+    let unsettled: Vec<_> = f1
+        .diagnostics
+        .notes
+        .iter()
+        .filter(|n| matches!(n, Note::NbShapeUnsettled { .. }))
+        .collect();
+    assert_eq!(
+        unsettled.len(),
+        1,
+        "one NbShapeUnsettled note: {:?}",
+        f1.diagnostics.notes
+    );
+    assert!(matches!(unsettled[0], Note::NbShapeUnsettled { rounds: 1 }));
+    // A fit whose alternation settles carries no such note.
     assert!(full.converged());
-    // The single alternation moved θ off the seed (the profile step ran) …
     assert!(
-        (f1.dispersion - super::glm::NB_THETA_LO).abs() / super::glm::NB_THETA_LO > 1.0,
-        "θ after one alternation ({}) must leave the seed",
-        f1.dispersion
+        !full
+            .diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::NbShapeUnsettled { .. })),
+        "a settled alternation raises nothing"
     );
-    // … but β/se were fit at the stale seed θ = 1e-3, whose NB variance
-    // V = μ + μ²/θ is ~10³ wider than the converged fit's — the capped SE
-    // must visibly disagree with the fully-alternated one.
-    assert!(
-        (f1.se[0] - full.se[0]).abs() / full.se[0] > 0.5,
-        "capped se[0] = {} vs full {} must reflect the stale θ",
-        f1.se[0],
-        full.se[0]
+    // One model, not two: β̂/SE are refit at the θ the fit reports, so a single
+    // fixed-θ GLM at `f1.dispersion` (the test-only `fit_glm`, cold IRLS at β = 0,
+    // as every alternation round is) reproduces them.
+    assert!(f1.dispersion.is_finite());
+    let family = Family::NegativeBinomial {
+        link: NegBinomialLink::Log,
+    };
+    let at_theta = super::glm::fit_glm(family, f1.dispersion, &x, &y, n, p, &opts);
+    assert_eq!(
+        f1.beta, at_theta.beta,
+        "β̂ must be the fit at the reported θ"
     );
+    assert_eq!(f1.se, at_theta.se, "SE must be the fit at the reported θ");
     // Sanity: the uncapped path from the same seed reaches the MASS optimum
     // (`fit_glm_nb_matches_mass`'s reference θ̂).
     assert!(
@@ -2095,7 +2287,7 @@ fn fit_glm_gamma_held_dispersion_failed_fit_is_nan() {
 /// GLM guard skips this family/link pair. The oracle is sacred.
 #[test]
 fn fit_glm_gamma_inverse_small_mean_matches_r() {
-    // From validation/goldens/sim_scale_gamma_inv_glm.json.
+    // From validation/goldens/sim_scale_gamma_inv_glm.json (SE at the Pearson φ̂).
     const REF_BETA: [f64; 2] = [99.8813244077148, -19.7574641575102];
     const REF_SE: [f64; 2] = [0.204076575867777, 0.711212166103063];
 
@@ -2188,6 +2380,94 @@ fn fit_glm_inverse_gaussian_log_is_self_consistent() {
     for (i, &mu) in f.fitted.iter().enumerate() {
         let want = (f.beta[0] + f.beta[1] * x[i * p + 1]).exp();
         assert!((mu - want).abs() / want < 1e-9, "μ[{i}] = {mu} vs {want}");
+    }
+}
+
+/// Inverse-Gaussian precision weights: `wᵢ → c·wᵢ` leaves `loglik` invariant.
+/// `D` scales by `c` (the mean-model IRLS fit doesn't move under an overall
+/// weight rescale, so `D` is unchanged in shape and only inherits `c` from
+/// the weights), so `φ̂ = D/n` scales by `c` too, `n·ln(2πφ̂)` moves by
+/// `+n·ln c`, and `inv_gaussian_aic`'s `−Σ ln wᵢ` term moves by exactly
+/// `−n·ln c` — the two shifts cancel. `dispersion` is the raw-weight Pearson
+/// moment (`family::pearson_dispersion`) on this family; β/SE/dispersion are
+/// checked too, as a sanity check alongside the loglik invariance this test
+/// targets, at 1e-4 — this design's raw-weight IRLS reaches about 1e-5
+/// relative at `c = 2^-6` (see `fit_glm_gamma_weight_scale_invariant`'s doc
+/// for the mechanism). Same dataset as
+/// `fit_glm_inverse_gaussian_log_is_self_consistent`, with a row-varying `w`.
+#[test]
+fn fit_glm_inverse_gaussian_weight_scale_invariant() {
+    let n = 300usize;
+    let p = 2usize;
+    let mut x = Vec::<f64>::with_capacity(n * p);
+    let mut y = Vec::<f64>::with_capacity(n);
+    let mut w = Vec::<f64>::with_capacity(n);
+    for i in 0..n {
+        let xi = (i as f64) / (n as f64);
+        x.push(1.0);
+        x.push(xi);
+        y.push(1.0 + 0.5 * xi + 0.05 * ((i % 7) as f64));
+        w.push(1.0 + 0.3 * ((i % 5) as f64));
+    }
+    let model = ModelSpec {
+        family: Family::InverseGaussian {
+            link: crate::InverseGaussianLink::Log,
+        },
+        re: None,
+    };
+    let fit_at = |c: f64| {
+        let wc: Vec<f64> = w.iter().map(|&wi| c * wi).collect();
+        fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds::default(),
+            &FitOptions {
+                target_indices: vec![0, 1],
+                weights: Some(wc),
+                ..FitOptions::default()
+            },
+        )
+    };
+    let base = fit_at(1.0);
+    assert!(base.converged());
+    for &c in &[8.0_f64, 2.0_f64.powi(-6), 2.0_f64.powi(20)] {
+        let f = fit_at(c);
+        assert!(f.converged(), "c = {c}");
+        let ll_rel = (f.loglik - base.loglik).abs() / base.loglik.abs();
+        assert!(
+            ll_rel < 1e-9,
+            "c = {c}: loglik {} vs {}",
+            f.loglik,
+            base.loglik
+        );
+        for j in 0..p {
+            let b_rel = (f.beta[j] - base.beta[j]).abs() / base.beta[j].abs();
+            // Raw-weight IRLS mean-model fit, same tolerance note as
+            // `fit_glm_gamma_weight_scale_invariant`.
+            assert!(
+                b_rel < 1e-4,
+                "c = {c}: β[{j}] {} vs {} rel {b_rel}",
+                f.beta[j],
+                base.beta[j]
+            );
+            let se_rel = (f.se[j] - base.se[j]).abs() / base.se[j].abs();
+            assert!(
+                se_rel < 1e-4,
+                "c = {c}: se[{j}] {} vs {} rel {se_rel}",
+                f.se[j],
+                base.se[j]
+            );
+        }
+        let disp_rel = (f.dispersion - c * base.dispersion).abs() / (c * base.dispersion);
+        assert!(
+            disp_rel < 1e-4,
+            "c = {c}: dispersion {} vs {c}·{} rel {disp_rel}",
+            f.dispersion,
+            base.dispersion
+        );
     }
 }
 

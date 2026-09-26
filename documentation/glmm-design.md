@@ -168,7 +168,7 @@ fit in R/lme4 and Julia/MixedModels.jl — two independent implementations — o
 27 committed datasets from single-intercept LMMs to crossed/nested/sparse
 GLMMs. References are never regenerated to relax a tolerance; a disagreement
 beyond the agreement band is investigated as a `glmm` bug first and passes only
-once it is written up and registered (`validation/divergences.json`). Shapes only lme4 covers (Gamma/NB/probit
+once it is written up and registered (`validation/grid/divergences.json`). Shapes only lme4 covers (Gamma/NB/probit
 GLMMs, AGQ) are pinned by committed lme4 goldens.
 
 ## Limits

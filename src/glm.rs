@@ -199,7 +199,7 @@ pub fn sigmoid_stable(eta: f64) -> f64 {
 ///   path); `Some(β₀)` (length `p`) → spec-derived truth start — seeds β and
 ///   computes η = X·β₀ once. A per-scenario constant, so determinism and
 ///   chunk merging are unaffected.
-/// - `prior_w`: per-row prior (case) weight `wᵢ`, McCullagh & Nelder's prior-
+/// - `prior_w`: per-row precision weight `wᵢ`, McCullagh & Nelder's prior-
 ///   weight sense (MN89 §2.2.2) — `None` = unit weight. Multiplies the IRLS
 ///   working weight (`irls_w[i] = (wᵢ·W_raw).max(WEIGHT_CLAMP)`) and the
 ///   per-row deviance contribution; the working response `z = η + r` is

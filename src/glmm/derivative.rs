@@ -490,7 +490,13 @@ pub(super) fn agq_len(s: usize, q_p: usize, nagq: u8) -> usize {
 pub(super) fn agq_eligible(family: Family, nagq: u8, primary_q: usize) -> bool {
     nagq > 1
         && (1..=3).contains(&primary_q)
-        && matches!(family, Family::Binomial { .. } | Family::Poisson { .. })
+        && matches!(
+            family,
+            Family::Binomial { .. }
+                | Family::Poisson { .. }
+                | Family::NegativeBinomial { .. }
+                | Family::Gamma { .. }
+        )
 }
 
 /// True iff this buffer set was sized for exactly this shape — every
@@ -1077,7 +1083,7 @@ fn run_gradient<T: Seed>(
                     )
                 }
             } else if extras {
-                let (o, conv, _raw_finite) = structured_laplace_deviance::<T>(
+                let (o, _dev, conv, _raw_finite) = structured_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     groupings,
@@ -1116,7 +1122,7 @@ fn run_gradient<T: Seed>(
                 }
                 o
             } else {
-                let (o, conv, _raw_finite) = blocked_laplace_deviance::<T>(
+                let (o, _dev, conv, _raw_finite) = blocked_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     groupings,
@@ -1228,6 +1234,14 @@ pub(crate) fn laplace_gradient(
     n: usize,
     grad: &mut [f64],
 ) -> DerivStatus {
+    // At the fitted Gamma dispersion, differentiate the fixed-φ GLMM the fit
+    // minimized (`GlmmWorkspace::at_fixed_dispersion`); inside, `gamma_phi` is 1
+    // and this guard does not fire again.
+    if ws.dispersion_scaled() {
+        return ws.at_fixed_dispersion(n, |ws| {
+            laplace_gradient(ws, x, y, cluster_ids, extra_ids, p, n, grad)
+        });
+    }
     // Routing gate: [`supports_shape`], the single owner of the question.
     // Checked before `m`, so a shape with no exact derivative never allocates
     // scratch. Shape is the whole question — a pinned crossed θ̂ is carried by
@@ -1435,7 +1449,7 @@ pub(crate) fn laplace_gradient(
         let saved_schur = pattern.structured_schur.take();
         let saved_force_dense = pattern.force_dense_schur;
         pattern.force_dense_schur = false;
-        let (dev, conv, _raw_finite) = structured_laplace_deviance::<f64>(
+        let (dev, _dev_scaled, conv, _raw_finite) = structured_laplace_deviance::<f64>(
             family,
             nb_theta,
             groupings,
@@ -1463,7 +1477,7 @@ pub(crate) fn laplace_gradient(
         pattern.force_dense_schur = saved_force_dense;
         conv && dev.is_finite()
     } else {
-        let (dev, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
+        let (dev, _dev_scaled, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
             family,
             nb_theta,
             groupings,
@@ -1697,7 +1711,7 @@ fn run_hessian<T: SeedHessian>(
                     )
                 }
             } else if extras {
-                let (o, conv, _raw_finite) = structured_laplace_deviance::<T>(
+                let (o, _dev, conv, _raw_finite) = structured_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     groupings,
@@ -1729,7 +1743,7 @@ fn run_hessian<T: SeedHessian>(
                 }
                 o
             } else {
-                let (o, conv, _raw_finite) = blocked_laplace_deviance::<T>(
+                let (o, _dev, conv, _raw_finite) = blocked_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     groupings,
@@ -1880,6 +1894,14 @@ pub(crate) fn laplace_hessian(
     grad: &mut [f64],
     hess: &mut Mat<f64>,
 ) -> DerivStatus {
+    // At the fitted Gamma dispersion, differentiate the fixed-φ GLMM the fit
+    // minimized (`GlmmWorkspace::at_fixed_dispersion`); inside, `gamma_phi` is 1
+    // and this guard does not fire again.
+    if ws.dispersion_scaled() {
+        return ws.at_fixed_dispersion(n, |ws| {
+            laplace_hessian(ws, x, y, cluster_ids, extra_ids, p, n, grad, hess)
+        });
+    }
     // Routing gate: same as `laplace_gradient`.
     if !supports_shape(ws.layout, &ws.groupings) {
         return DerivStatus::Unsupported;
@@ -2054,7 +2076,7 @@ pub(crate) fn laplace_hessian(
         let saved_schur = pattern.structured_schur.take();
         let saved_force_dense = pattern.force_dense_schur;
         pattern.force_dense_schur = false;
-        let (dev, conv, _raw_finite) = structured_laplace_deviance::<f64>(
+        let (dev, _dev_scaled, conv, _raw_finite) = structured_laplace_deviance::<f64>(
             family,
             nb_theta,
             groupings,
@@ -2082,7 +2104,7 @@ pub(crate) fn laplace_hessian(
         pattern.force_dense_schur = saved_force_dense;
         conv && dev.is_finite()
     } else {
-        let (dev, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
+        let (dev, _dev_scaled, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
             family,
             nb_theta,
             groupings,

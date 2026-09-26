@@ -26,7 +26,7 @@ the validation harness. No recipe bundles a second copy of any dataset.
 formula match a manifest rung, its fixed effects and variance components are
 checked against the frozen lme4 JSON under
 [`validation/goldens/`](../validation/goldens/), inside the tolerance bands
-in [`validation/tol.R`](../validation/tol.R) — six of the nine do (recipes
+in [`validation/grid/tol.R`](../validation/grid/tol.R) — six of the nine do (recipes
 1, 2, 3, 4, 6, 8). Three do not, and say so plainly rather than implying a
 match that isn't there: recipe 5 (grouseticks) uses a simpler, more
 pedagogical formula than manifest rung 6's, so rung 6's golden numbers do not
@@ -544,9 +544,10 @@ models.
 Overdispersed counts that a Poisson model would under-estimate the variance
 of: `dispersion` on the returned `Fit` is theta-hat, the NB shape parameter
 (`MASS::glm.nb`'s `theta`), not phi — unlike gamma or inverse-Gaussian, where
-`dispersion` *is* the Pearson phi. Overdispersion relative to Poisson is
-`1/theta`, so a *large* theta means "close to Poisson", not "a lot of extra
-variance".
+`dispersion` *is* phi: maximum likelihood on a gamma GLMM, the Pearson moment
+on a gamma GLM or on inverse-Gaussian (GLM only). Overdispersion relative to
+Poisson is `1/theta`, so a *large* theta means "close to Poisson", not "a lot
+of extra variance".
 
 ```python
 import csv

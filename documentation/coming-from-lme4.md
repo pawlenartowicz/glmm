@@ -44,8 +44,10 @@ lme4/MixedModels.jl oracles.
 
 ## Behavioral differences to watch
 
-- `nAGQ = k` only turns on adaptive quadrature for a binomial/Poisson GLMM
-  with a single grouping factor and up to 3 random effects per group; any
+- `nAGQ = k` only turns on adaptive quadrature for a binomial, Poisson,
+  negative-binomial or Gamma GLMM with a single grouping factor and up to 3
+  random effects per group (lme4 has no `nAGQ` for `glmer.nb` beyond what
+  `glmer` offers, and none for Gamma with φ estimated); any
   other shape warns and falls back to Laplace instead of erroring the way
   lme4 does — watch for the warning (`r/README.md`).
 - R's `Gamma()` family object means `link = "inverse"` (R semantics win when

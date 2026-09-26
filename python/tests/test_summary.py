@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 import glmm
+from glmm.summary import build_summary
 
 
 def make_fit(**kw):
@@ -182,7 +183,33 @@ def test_summary_dispersion_footer_by_family():
         "Dispersion (phi, Pearson): 2.5"
         in make_fit(family="gamma", link="log", dispersion=2.5).summary()
     )
+    assert (
+        "Dispersion (phi, ML): 2.5"
+        in _mixed_fit(family="gamma", link="log", dispersion=2.5).summary()
+    )
+    assert (
+        "Dispersion (phi, Pearson): 2.5"
+        in make_fit(family="inversegaussian", link="log", dispersion=2.5).summary()
+    )
     assert "Dispersion" not in make_fit(family="poisson", link="log").summary()
+
+
+def test_summary_dispersion_footer_held_label():
+    # A held dispersion= reports "fixed" regardless of family or mixedness.
+    assert (
+        "Dispersion (phi, fixed): 2.5"
+        in make_fit(family="gamma", link="log", dispersion=2.5, dispersion_held=2.5).summary()
+    )
+    assert (
+        "Dispersion (phi, fixed): 2.5"
+        in _mixed_fit(family="gamma", link="log", dispersion=2.5, dispersion_held=2.5).summary()
+    )
+    assert (
+        "Dispersion (phi, fixed): 2.5"
+        in make_fit(
+            family="inversegaussian", link="log", dispersion=2.5, dispersion_held=2.5
+        ).summary()
+    )
 
 
 def test_summary_prints_what_it_returns(capsys):
@@ -258,3 +285,41 @@ def test_html_escapes_names():
 def test_latex_escapes_names():
     s = make_fit(names=["(Intercept)", "x_1"]).summary_object()
     assert "x\\_1" in s.latex()
+
+
+def test_summary_ends_with_the_stored_warnings():
+    w = [
+        {
+            "tier": "note",
+            "kind": "argument_ignored",
+            "title": "Argument ignored",
+            "message": "dispersion= has no effect for family 'gaussian'.",
+        },
+        {
+            "tier": "severe",
+            "kind": "fit_failed",
+            "title": "Fit failed",
+            "message": "The fitting algorithm failed and returned no estimates.",
+        },
+    ]
+    lines = build_summary(make_fit(warnings=w)).text().splitlines()
+    assert lines[-3:] == [
+        "Warnings:",
+        "Note: Argument ignored. dispersion= has no effect for family 'gaussian'.",
+        "Severe: Fit failed. The fitting algorithm failed and returned no estimates.",
+    ]
+
+
+def test_clean_summary_has_no_warnings_section():
+    assert "Warnings:" not in build_summary(make_fit()).text()
+
+
+def test_summary_works_on_a_fit_pickled_before_the_warnings_attribute():
+    # A Fit pickled before `warnings` was added would unpickle without that
+    # attribute (dataclasses don't backfill missing fields on old pickles).
+    # build_summary must not blow up on it, and must render with no
+    # Warnings section.
+    fit = make_fit()
+    del fit.__dict__["warnings"]
+    text = build_summary(fit).text()
+    assert "Warnings:" not in text

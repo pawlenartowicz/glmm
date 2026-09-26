@@ -1,0 +1,37 @@
+{
+  "dataset": "all_ones",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 43,
+  "converged": true,
+  "singular": false,
+  "optimizer": "nloptwrap",
+  "n_eval": 52,
+  "tolPwrss": {},
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.749452866339643, 0.195696290846699],
+    "se": [0.228923966169604, 0.106715699313299],
+    "loglik": -244.841859000977,
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [1.00039991798829, 0.411356920867271],
+        "corr": [
+          [1, 0.27354437487681],
+          [0.27354437487681, 1]
+        ]
+      }
+    ],
+    "sigma": 0.65292387498949
+  },
+  "timing": {
+    "fit_seconds_median": 0.156883716583252,
+    "n_runs": 4,
+    "warmup_discarded": 1,
+    "fits_per_sample": 10
+  }
+}

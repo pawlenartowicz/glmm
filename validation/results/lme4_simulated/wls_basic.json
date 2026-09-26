@@ -1,0 +1,26 @@
+{
+  "dataset": "wls_basic",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "gaussian",
+  "reml": null,
+  "rung": 29,
+  "converged": true,
+  "singular": false,
+  "optimizer": "lm",
+  "n_eval": 1,
+  "coef_names": ["(Intercept)", "x1", "x2"],
+  "estimates": {
+    "beta": [1.03748242569247, 0.520873365904753, -0.338789859991966],
+    "se": [0.0552887627980204, 0.0571113461189203, 0.0539838313256864],
+    "loglik": -244.476594091369,
+    "varcomp": [],
+    "sigma": 0.821656431612597
+  },
+  "timing": {
+    "fit_seconds_median": 0.0058448314666748,
+    "n_runs": 4,
+    "warmup_discarded": 1,
+    "fits_per_sample": 10
+  }
+}

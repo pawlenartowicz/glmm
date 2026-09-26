@@ -4,7 +4,7 @@
 #
 # - manifest.json (default): lazy anchor -- fits ONLY the cells named in
 #   GRID_TODO (mismatch cells + audit sample from analyze.R) or GRID_ONLY.
-# - estimate-grid's manifest.json: three engine branches selected off
+# - estimate-grid-manifest.json: three engine branches selected off
 #   the manifest's per-cell `nagq`/`structure` -- lmer/glmer Laplace for the 477
 #   AGQ-ineligible cells (as the anchor above), glmer(nAGQ=k) for the 15 `int1`
 #   scalar-AGQ cells, GLMMadaptive::mixed_model(nAGQ=k) for the 18 `q2s`
@@ -44,8 +44,8 @@ cells <- Filter(function(c) c$case_id %in% todo && !(c$case_id %in% done),
                 manifest$cells)
 
 # theta hat: VarCorr -> per grouping factor, term names, stddevs, correlation
-# matrix (diligent run, spec Part 6). Mirrors engines/lme4.R::varcomp_of and
-# engines/goldens_agq.R::varcomp_of (the sd_se-less form -- the theta-Hessian
+# matrix. Mirrors grid/engines/lme4.R's varcomp writer and
+# tools/goldens_agq.R::varcomp_of (the sd_se-less form -- the theta-Hessian
 # SE goldens_agq.R attaches is a per-rung numDeriv Hessian, too expensive to
 # run per grid cell here) so the schema matches the glmm/GLMMadaptive
 # `varcomp` field the analysis join reads.
@@ -92,7 +92,7 @@ for (cell in cells) {
       # convention, `common.rs::lower_dataset_generic`'s `prop`
       # synthesis), and `nagq>1 + weights` is a locked-refused combination on
       # the glmm side (`FitOptions.weights with nAGQ > 1 is not supported`,
-      # src/fit/mod.rs assert_model_shape, full-AGQ spec Part 2). So these 6
+      # src/fit/mod.rs assert_model_shape). So these 6
       # `bina_q2s_*` cells fit HERE (a legitimate oracle-side AGQ reference,
       # confirmed above) but glmm engine-fails on the matching cell -- only
       # 12/18 q2s cells (and all 15 int1) are glmm-vs-oracle joinable under
@@ -106,7 +106,7 @@ for (cell in cells) {
       c(base, list(
         optimizer = "GLMMadaptive", n_eval = NA_integer_,
         converged = isTRUE(m$converged), singular = FALSE,
-        deviance = NA_real_,  # not comparable to glmer's devfun scale (spec Part 6)
+        deviance = NA_real_,  # not comparable to glmer's devfun scale
         beta = I(unname(fixef(m))),
         se = I(unname(sqrt(diag(vcov(m, parm = "fixed-effects"))))),
         varcomp = list(list(
@@ -116,7 +116,7 @@ for (cell in cells) {
           corr   = unname(cov2cor(m$D)))),
         status = if (isTRUE(m$converged)) "ok" else "engine-fail"))
     } else if (cell$family == "gaussian") {
-      # REML iff the manifest cell says so -- mirrors engines/lme4.R's `isTRUE(spec$reml)`
+      # REML iff the manifest cell says so -- mirrors grid/engines/lme4.R's `isTRUE(cell[["reml"]])`
       # and fit.jl's `get(cell, :reml, false) === true`.
       m <- lmer(as.formula(cell$r_formula), data = df, REML = isTRUE(cell$reml),
            control = lmerControl(optCtrl = list(maxeval = cell$max_fun)))
@@ -150,7 +150,7 @@ for (cell in cells) {
       m <- glmer(as.formula(cell$r_formula), data = df, family = fam,
             nAGQ = if (is_agq) as.integer(cell$nagq) else 1L,
             # GRID_TOLPWRSS: PIRLS tolerance override for the seed-extension
-            # passes (estimate-grid seedext_gen.R study); default keeps the
+            # passes of the seed-extension study; default keeps the
             # 1e-13 the frozen campaign results were fit at.
             control = glmerControl(
               tolPwrss = as.numeric(Sys.getenv("GRID_TOLPWRSS", "1e-13")),

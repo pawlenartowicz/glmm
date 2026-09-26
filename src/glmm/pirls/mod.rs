@@ -9,7 +9,7 @@ use super::workspace::{
     glmm_block_chol, glmm_block_solve, PackedScratch, PirlsScratch, StructuredPattern,
     StructuredSchur, StructuredScratch,
 };
-use super::{PIRLS_MAX_HALVINGS, PIRLS_MAX_ITERS};
+use super::{PIRLS_MAX_HALVINGS, PIRLS_MAX_ITERS, PIRLS_OSC_RATIO, PIRLS_OSC_TRIGGER};
 use crate::scalar::Scalar;
 use crate::spec::{BinomialLink, Family};
 
@@ -84,10 +84,10 @@ pub(crate) fn obs_len(observed: bool, len: usize) -> usize {
 ///
 /// **Observed-information step (`observed`).** Each PIRLS step solves
 /// `u_new = A_obs⁻¹((A_obs − I)u + g)` with `A_obs = M'W_obs M + I`, `W_obs`
-/// the observed (Newton) weight `family::observed_weight`, while `log|A|`,
-/// the returned factor and the convergence test stay on the Fisher `A` — the
-/// objective and its fixed point `ũ` are unchanged, only the path the iterate
-/// takes to it. Why: at the mode the lane fixed-point map
+/// the observed (Newton) weight `family::observed_weight`, while the in-loop
+/// factor and the convergence test stay on the Fisher `A` — the fixed point
+/// `ũ` is unchanged, only the path the iterate takes to it; the objective's
+/// `log|A|` is the exit refresh's (`evaluate_at_mode`), exact on every link. Why: at the mode the lane fixed-point map
 /// `du ← (I − A⁻¹H_uu)·du + b` contracts by `‖I − A⁻¹H_uu‖`, which is 0 for
 /// `A_obs = H_uu` (lanes exact in one step, as on a canonical link) but only
 /// 0.2–0.5 for the Fisher `A` on a non-canonical link, where the refinement
@@ -258,6 +258,20 @@ pub(crate) fn evaluate_at_mode<T: Scalar, L: LaplaceFactor<T>>(
     if infeasible {
         return None;
     }
+    // Exact Laplace curvature. `log|A|` must be the curvature of the conditional
+    // log-density at the mode, `A_obs = M'W_obs M + I` with
+    // `W_obs = −∂²ℓᵢ/∂ηᵢ²` (`family::observed_weight`), not the Fisher `A`
+    // PIRLS steps with: the two coincide on a canonical link and differ on
+    // probit, cloglog, Gamma/log and NB/log (`family::exact_curvature_differs`).
+    // The Fisher step only chooses the path to û; the mode is the same. `w`
+    // is left holding `W_obs` and the factor is `A_obs`'s, so the Rx Schur
+    // fill (the observed information) and the AGQ node scale read the same
+    // curvature. A μ-clamped row keeps its Fisher weight (see
+    // `observed_weights_in_place`: the clamped observed weight can be large
+    // and negative there). No floor otherwise: for these links `W_obs ≥ 0`
+    // strictly inside the μ clamps, and a non-PD `A_obs` is the `None`
+    // (objective `+∞`) that `factor_logdet` already returns (TMB's convention).
+    observed_weights_in_place(family, nb_theta, y, prior_w, weighted, eta, prob, w, n);
     layout.scatter(&w[..], &prob[..], &eta[..], y, prior_w, weighted, n, None);
     let logdet = layout.factor_logdet()?;
     Some((dev, logdet))
@@ -362,6 +376,98 @@ pub(crate) fn clamped_row_present<T: Scalar>(family: Family, weighted: bool, pro
     let (mu_lo, mu_hi) = crate::family::pinned_mu_bounds(family, weighted);
     prob.iter()
         .any(|mu| mu.value() <= mu_lo || mu.value() >= mu_hi)
+}
+
+/// On a link where the exact curvature differs from Fisher
+/// (`family::exact_curvature_differs`), overwrite the Fisher working weights a
+/// family pass left in `w` with the observed weights `W_obs` the Laplace
+/// objective's `A` is built from (`family::observed_weight`). A row whose μ
+/// sits on a `family::pinned_mu_bounds` bound keeps its Fisher weight: there μ
+/// is a constant, the clamped observed weight `−w·μ''(y−μ)/V` divides by `V`
+/// at the pin and can be large and negative (cloglog's upper pin at y = 0),
+/// and `A` would stop being positive definite, while the Fisher weight is the
+/// smooth ≈ 0⁺ continuation. Off the clamps `W_obs ≥ 0` on every such link,
+/// each log-likelihood being log-concave in η. A no-op on every other link. Shared by
+/// [`evaluate_at_mode`] and the packed assembled engine's dual rebuild of the
+/// mode state, which must describe the same `A`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observed_weights_in_place<T: Scalar>(
+    family: Family,
+    nb_theta: f64,
+    y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
+    eta: &[T],
+    prob: &[T],
+    w: &mut [T],
+    n: usize,
+) {
+    if !crate::family::exact_curvature_differs(family) {
+        return;
+    }
+    let (mu_lo, mu_hi) = crate::family::pinned_mu_bounds(family, weighted);
+    for i in 0..n {
+        let pinned = prob[i].value() <= mu_lo || prob[i].value() >= mu_hi;
+        if !pinned {
+            w[i] = crate::family::observed_weight(
+                family, nb_theta, y[i], prior_w[i], eta[i], prob[i], w[i],
+            );
+        }
+    }
+}
+
+/// One row's exact curvature weight `W_obs` at `f64`: `family::observed_weight`.
+/// On a row whose μ sits on a `family::pinned_mu_bounds` bound it is the Fisher
+/// weight `w` where the objective's `log|A|` is the observed one
+/// (`family::exact_curvature_differs`) — the rule [`observed_weights_in_place`]
+/// applies, so the exact β-profile's in-loop `A_obs`, which is that `log|A|`'s
+/// factor, and the objective's agree — and `family::clamped_observed_weight`,
+/// the mode equation's own Jacobian there, on the other non-canonical links.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn row_observed_weight(
+    family: Family,
+    nb_theta: f64,
+    y: f64,
+    prior_w: f64,
+    eta: f64,
+    mu: f64,
+    w: f64,
+    mu_lo: f64,
+    mu_hi: f64,
+) -> f64 {
+    if mu <= mu_lo || mu >= mu_hi {
+        if crate::family::exact_curvature_differs(family) {
+            w
+        } else {
+            crate::family::clamped_observed_weight(family, nb_theta, y, prior_w, eta, mu)
+        }
+    } else {
+        crate::family::observed_weight(family, nb_theta, y, prior_w, eta, mu, w)
+    }
+}
+
+/// `dW_obs/dη` of [`row_observed_weight`], with the same clamped-row rule:
+/// `family::observed_weight_eta_deriv`, or on a pinned row the Fisher weight's
+/// `family::clamped_weight_eta_deriv`. Only called on a
+/// link where `family::exact_curvature_differs`, so the Fisher `dw/dη` it
+/// would fall back to elsewhere is never needed and is passed as 0.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn row_observed_weight_eta_deriv(
+    family: Family,
+    nb_theta: f64,
+    y: f64,
+    prior_w: f64,
+    eta: f64,
+    mu: f64,
+    mu_lo: f64,
+    mu_hi: f64,
+) -> f64 {
+    debug_assert!(crate::family::exact_curvature_differs(family));
+    if mu <= mu_lo || mu >= mu_hi {
+        crate::family::clamped_weight_eta_deriv(family, nb_theta, prior_w, eta, mu)
+    } else {
+        crate::family::observed_weight_eta_deriv(family, nb_theta, y, prior_w, eta, mu, 0.0)
+    }
 }
 
 /// `h = ‖L⁻¹ m‖²` for one row: the forward half of `glmm_block_solve` on the

@@ -399,98 +399,228 @@ pub(crate) fn dev_resid<T: Scalar>(family: Family, nb_theta: f64, y: f64, mu: T)
     }
 }
 
-/// lme4's `Gamma()$aic` — the Gamma family's contribution to the Laplace deviance,
-/// substituted for the bare deviance `D` in the Gamma-GLMM objective. The
-/// dispersion is **profiled** inside this term as `disp = D/Σwₖ` (`Σwₖ = n` when
-/// `prior_w` is `None` — unit prior weights), not carried as a free parameter, so
-/// ```text
-///   aic = −2·Σᵢ wᵢ·log dgamma(yᵢ; shape = 1/disp, scale = μᵢ·disp) + 2
-///   log dgamma(y; a, s) = (a−1)·ln y − y/s − a·ln s − lnΓ(a)
-/// ```
-/// matching R's weighted `Gamma()$aic`: `disp = dev/Σwᵢ`, each log-density term
-/// scaled by its row's `wᵢ`. This is the **only** place the dispersion enters
-/// glmer's Gamma fit (its PIRLS weights and the `‖u‖²` penalty are unit-scale —
-/// no `1/φ` weighting, no φ-ridge; confirmed against lme4 `src/glmFamily.cpp`).
-/// Swapping `D → aic` in the objective is what makes the kernel's β̂/τ̂ and
-/// FD-Hessian SE pick up the dispersion coupling. Needs `lnΓ` (one call, on the
-/// scalar shape `1/disp`) — no digamma, since the dispersion is profiled rather
-/// than ML-solved. Validated against the `fit::tests::fit_glmm_gamma_sim_matches_lme4`
-/// golden (unweighted) and `fit_glmm_gamma_weighted_matches_lme4` (weighted).
-pub(crate) fn gamma_aic<T: Scalar>(
-    y: &[f64],
-    mu: &[T],
-    dev: T,
-    n: usize,
-    prior_w: Option<&[f64]>,
-) -> T {
-    let sum_w = prior_w.map_or(n as f64, |w| w[..n].iter().sum());
-    let disp = dev / T::from_f64(sum_w);
-    let a = T::ONE / disp; // shape = 1/disp
-    let ln_gamma_a = a.ln_gamma();
-    let mut s = T::ZERO;
-    for (i, (&yi, &mui)) in y.iter().zip(mu).take(n).enumerate() {
-        let scale = mui * disp; // sᵢ = μᵢ·disp
-        s += T::from_f64(prior_w.map_or(1.0, |w| w[i]))
-            * ((a - T::ONE) * T::from_f64(yi.ln())
-                - T::from_f64(yi) / scale
-                - a * scale.ln()
-                - ln_gamma_a);
-    }
-    T::from_f64(-2.0) * s + T::from_f64(2.0)
-}
-
-/// `Φ' = daic/dD` for the Gamma family, in closed form: the total derivative
-/// along `D = Σᵢ prior_wᵢ·dev_resid(yᵢ, μᵢ)`, where the μ terms cancel — not
-/// the partial of `gamma_aic` at fixed `mu`, which is a different (and
-/// useless) number. `gamma_aic` reads `y` and `mu` as well as `dev`, but substituting the Gamma deviance
-/// `D = 2Σᵢwᵢ[yᵢ/μᵢ − 1 − ln yᵢ + ln μᵢ]` into the `aic` sum kills both the
-/// `Σw·ln μ` and the `Σw·y/μ` dependence, leaving `aic` a function of `D`
-/// alone through `a = Σwᵢ/D = 1/disp`:
-/// ```text
-///   aic(D) = 2Σw·ln y + Σw + 2 + Σw·[2a − 2a·ln a + 2·lnΓ(a)]
-///   Φ'(D)  = daic/dD = 2a²·(ln a − ψ(a))                     ψ = digamma
-/// ```
-/// Positive for `a > 0` (`ln a > ψ(a)` there).
+/// The Gamma precision-weight normaliser `s`: the power of two closest to the
+/// geometric mean of `w`, `1.0` for unit weights. The Gamma precision-weight
+/// path runs on `ŵᵢ = wᵢ/s` internally: row shape `aᵢ = wᵢ/φ = ŵᵢ/(φ/s)`, so
+/// on `ŵ` the internal dispersion coordinate is `φ/s`, unchanged by rescaling
+/// every `wᵢ` by one constant `c` — exactly so when `c` is a power of two:
+/// `log₂(c·wᵢ) = k + log₂ wᵢ` for `c = 2^k`, so the mean of `log₂ w` shifts
+/// by exactly `k` and rounds to `k` more, giving `s(c·w) = c·s(w)` and `ŵ`
+/// bit-exact under the rescale — unless the unscaled mean already sits within
+/// round-off of a half-integer, where rounding can tip the other way and the
+/// chosen power differs by one. That changes nothing in the fit's math (`ŵ`
+/// and `φ/s` still satisfy `aᵢ = wᵢ/φ = ŵᵢ/(φ/s)`); it only shifts which
+/// internal scale the solver runs on. The raw-scale φ̂ is `s·φ̂_int`.
 ///
-/// Generic over `Scalar`, and the same expression at every `T`: `digamma` is
-/// itself a `Scalar` series, so at a dual `T` this returns `Φ'` with lanes
-/// `Φ''·dD`, and at `HyperDual` one order further. Reading `Φ'` off
-/// `gamma_aic`'s own lanes instead would give the value only — an `aic` lane is
-/// `Φ'·dD`, which fixes `Φ'` but says nothing about `Φ''`.
-pub(crate) fn gamma_phi_prime<T: Scalar>(dev: T, n: usize, prior_w: Option<&[f64]>) -> T {
-    let sum_w = prior_w.map_or(n as f64, |w| w[..n].iter().sum());
-    let a = T::from_f64(sum_w) / dev;
-    T::from_f64(2.0) * a * a * (a.ln() - crate::dual::digamma(a))
+/// A plain arithmetic mean is not robust to a single outlier weight — it can
+/// push the internal `φ_int = φ/s` outside the fixed dispersion box on data
+/// that fits fine at the raw scale — and can overflow `Σw` at very large
+/// weights. Averaging `log₂ wᵢ` instead of `wᵢ` resists both.
+pub(crate) fn weight_scale(w: Option<&[f64]>, n: usize) -> f64 {
+    match w {
+        None => 1.0,
+        Some(w) => {
+            let mean_log2: f64 = w[..n].iter().map(|&wi| wi.log2()).sum::<f64>() / n as f64;
+            2.0_f64.powi(mean_log2.round() as i32)
+        }
+    }
 }
 
-/// R's `inverse.gaussian()$aic` — the family's `−2·logLik + 2` with the
-/// dispersion **profiled** as `disp = D/Σwᵢ` rather than carried as a free
-/// parameter, the same convention `gamma_aic` follows:
+/// The dispersion-only part of the Gamma Laplace/GLM objective, as a function of
+/// `ψ = ln φ` (row shape `aᵢ = ŵᵢ/φ`, `ŵᵢ = 1` unweighted). With the Gamma unit
+/// deviance `dᵢ = 2[(yᵢ−μᵢ)/μᵢ − ln(yᵢ/μᵢ)]`, the log-density rearranges to
 /// ```text
-///   logLik = −½ Σᵢ wᵢ·[ (yᵢ−μᵢ)²/(μᵢ²·yᵢ·φ) + ln(2π·φ·yᵢ³) ]
+///   −2·log f(yᵢ; aᵢ, μᵢ) = aᵢ·dᵢ + 2aᵢ − 2aᵢ·ln aᵢ + 2·lnΓ(aᵢ) + 2·ln yᵢ
 /// ```
-/// Substituting `Σᵢ wᵢ(yᵢ−μᵢ)²/(μᵢ²yᵢ) = D` and `φ = D/Σwᵢ` collapses the first
-/// sum to `Σwᵢ`, leaving
+/// so `−2·Σᵢ log f(yᵢ; aᵢ, μᵢ) = D/φ + Σᵢ(2aᵢ − 2aᵢ·ln aᵢ + 2·lnΓ(aᵢ)) + 2·Σᵢ ln yᵢ`,
+/// `D = Σᵢ ŵᵢ·dᵢ`. PIRLS on the prior weights `ŵᵢ/φ` returns the first term
+/// itself; this is the rest, which depends on φ and the data alone. Rows have
+/// precision-weighted variance `φ·V(μᵢ)/wᵢ` (McCullagh & Nelder 1989 §2.2), so
+/// the `ln yᵢ` term carries no weight — `sum_ln_y = Σᵢ ln yᵢ`. `weights =
+/// None` is its own arithmetic path with every `aᵢ = a` (rather than routing
+/// through `Some` on an all-ones slice), so unweighted callers get exact,
+/// reproducible arithmetic independent of any weighted call's rounding.
+pub(crate) fn gamma_dispersion_term(
+    ln_phi: f64,
+    weights: Option<&[f64]>,
+    n: usize,
+    sum_ln_y: f64,
+) -> f64 {
+    let a = (-ln_phi).exp();
+    let row =
+        |ai: f64| 2.0 * ai - 2.0 * ai * ai.ln() + 2.0 * crate::simd_transcendental::ln_gamma(ai);
+    let term = match weights {
+        None => n as f64 * row(a),
+        Some(w) => w[..n].iter().map(|&wi| row(wi * a)).sum(),
+    };
+    term + 2.0 * sum_ln_y
+}
+
+/// `∂/∂ψ` of [`gamma_dispersion_term`], `ψ = ln φ`: `2·Σᵢ aᵢ·(ln aᵢ − ψ₀(aᵢ))`,
+/// ψ₀ the digamma function, `aᵢ = wᵢ·a`. Setting `∂/∂ψ (D/φ + term) = 0` at unit
+/// weights gives `ln a − ψ₀(a) = D/(2n)`, the Gamma maximum-likelihood shape
+/// equation.
+#[cfg(test)]
+pub(crate) fn gamma_dispersion_term_d1(ln_phi: f64, weights: Option<&[f64]>, n: usize) -> f64 {
+    let a = (-ln_phi).exp();
+    let term = match weights {
+        None => n as f64 * a * (a.ln() - crate::dual::digamma(a)),
+        Some(w) => w[..n]
+            .iter()
+            .map(|&wi| {
+                let ai = wi * a;
+                ai * ln_minus_digamma(ai).0
+            })
+            .sum(),
+    };
+    2.0 * term
+}
+
+/// `∂²/∂ψ²` of [`gamma_dispersion_term`]:
+/// `−2·Σᵢ aᵢ·(ln aᵢ − ψ₀(aᵢ) + 1 − aᵢ·ψ₁(aᵢ))`, ψ₁ the trigamma function,
+/// `aᵢ = wᵢ·a`. The `ln φ` diagonal of the mixed-Gamma joint Hessian is this
+/// plus `D/φ` (`glmm::se::joint_hessian_cov`). The weighted arm reads
+/// `(g, dg) = ln_minus_digamma(aᵢ)` and uses `1 − aᵢ·ψ₁(aᵢ) = aᵢ·dg`, the same
+/// cancelling difference the ML solver below needs at large `aᵢ`.
+pub(crate) fn gamma_dispersion_term_d2(ln_phi: f64, weights: Option<&[f64]>, n: usize) -> f64 {
+    let a = (-ln_phi).exp();
+    let term = match weights {
+        None => {
+            n as f64 * a * (a.ln() - crate::dual::digamma(a) + 1.0 - a * crate::dual::trigamma(a))
+        }
+        Some(w) => w[..n]
+            .iter()
+            .map(|&wi| {
+                let ai = wi * a;
+                let (g, dg) = ln_minus_digamma(ai);
+                ai * (g + ai * dg)
+            })
+            .sum(),
+    };
+    -2.0 * term
+}
+
+/// The maximum-likelihood Gamma dispersion at fixed means: the root `φ = 1/a`
+/// (unweighted) or the per-row `φ = 1/a` with `aᵢ = weightsᵢ·a` solving
+/// `Σᵢ weightsᵢ·(ln aᵢ − ψ₀(aᵢ)) = dev/2`, the stationary point in `ln φ` of
+/// `dev/φ` plus [`gamma_dispersion_term`] evaluated at those same `weights`,
+/// and `MASS::gamma.shape`'s equation at unit weights. A caller passing the
+/// precision-normalised `ŵ = w/s` (see [`weight_scale`]) must hand in
+/// `dev = D/s`: the raw-scale equation `Σᵢ wᵢ·(ln aᵢ − ψ₀(aᵢ)) = D/2` becomes,
+/// on `w = s·ŵ`, `s·Σᵢ ŵᵢ·(ln aᵢ − ψ₀(aᵢ)) = D/2`, i.e.
+/// `Σᵢ ŵᵢ·(ln aᵢ − ψ₀(aᵢ)) = D/(2s)`, so the equation this function actually
+/// solves (`Σweightsᵢ·gᵢ = dev/2`) needs `dev = D/s` to land on that same
+/// target. The returned root is `φ̂` on that internal scale — the caller
+/// rescales by `s` to recover the true φ̂. The left
+/// side falls strictly from ∞ to 0 in `a`, so the root is unique; Newton in
+/// `ln a` from MASS's start `(6 + 2d)/(d·(6 + d))`, `d = D/n`, per-row terms
+/// through `ln_minus_digamma` as the weighted `_d2` does — at large per-row
+/// `aᵢ` the plain `ln aᵢ − ψ₀(aᵢ)` difference loses enough digits that Newton
+/// never meets the stopping rule. A zero deviance (an exact fit) gives φ = 0,
+/// and so does a negative one: `D ≥ 0` exactly, so a finite negative value is
+/// the round-off of an exact fit.
+pub(crate) fn gamma_ml_dispersion(dev: f64, weights: Option<&[f64]>, n: usize) -> f64 {
+    let c = dev / (2.0 * n as f64);
+    if !c.is_finite() {
+        return f64::NAN;
+    }
+    if c <= 0.0 {
+        return 0.0;
+    }
+    let d = 2.0 * c;
+    let mut t = ((6.0 + 2.0 * d) / (d * (6.0 + d))).ln();
+    match weights {
+        None => {
+            for _ in 0..100 {
+                let a = t.exp();
+                let (g, dg_da) = ln_minus_digamma(a);
+                // d/dt = a·d/da, negative everywhere.
+                let step = (g - c) / (a * dg_da);
+                t -= step;
+                if step.abs() <= 4.0 * f64::EPSILON * t.abs().max(1.0) {
+                    break;
+                }
+            }
+        }
+        Some(w) => {
+            let w = &w[..n];
+            let target = dev / 2.0;
+            for _ in 0..100 {
+                let a = t.exp();
+                let mut f = -target;
+                let mut df = 0.0;
+                for &wi in w {
+                    let ai = wi * a;
+                    let (g, dg) = ln_minus_digamma(ai);
+                    f += wi * g;
+                    df += wi * dg * ai; // d/dt, negative everywhere.
+                }
+                let step = f / df;
+                t -= step;
+                if step.abs() <= 4.0 * f64::EPSILON * t.abs().max(1.0) {
+                    break;
+                }
+            }
+        }
+    }
+    (-t).exp()
+}
+
+/// `(ln a − ψ₀(a), 1/a − ψ₁(a))`. Above `a = 20` the two differences cancel to
+/// a small fraction of `ln a`, so they come from the asymptotic series
+/// (Abramowitz & Stegun 6.3.18, 6.4.12) instead, truncated where the next term
+/// is about 2e-16 relative at `a = 20` and smaller above.
+fn ln_minus_digamma(a: f64) -> (f64, f64) {
+    if a < 20.0 {
+        return (
+            a.ln() - crate::dual::digamma(a),
+            1.0 / a - crate::dual::trigamma(a),
+        );
+    }
+    let r = 1.0 / a;
+    let r2 = r * r;
+    let g = r
+        * (0.5
+            + r * (1.0 / 12.0
+                + r2 * (-1.0 / 120.0 + r2 * (1.0 / 252.0 + r2 * (-1.0 / 240.0 + r2 / 132.0)))));
+    let dg = -r2
+        * (0.5
+            + r * (1.0 / 6.0
+                + r2 * (-1.0 / 30.0 + r2 * (1.0 / 42.0 + r2 * (-1.0 / 30.0 + r2 * 5.0 / 66.0)))));
+    (g, dg)
+}
+
+/// The inverse-Gaussian family's `−2·logLik + 2`, precision weights (row `i`
+/// has variance `φ·V(μᵢ)/wᵢ`), with φ **profiled** as its ML value `disp = D/n`
+/// rather than carried as a free parameter, as [`gamma_ml_dispersion`] does for
+/// the Gamma family:
 /// ```text
-///   aic = Σwᵢ·(ln(2π·disp) + 1) + 3·Σᵢ wᵢ·ln yᵢ + 2
+///   logLik = −½ Σᵢ [ wᵢ·(yᵢ−μᵢ)²/(μᵢ²·yᵢ·φ) + ln(2π·φ·yᵢ³) − ln wᵢ ]
 /// ```
-/// which is R's expression verbatim (R `src/library/stats/R/family.R`,
-/// `inverse.gaussian()$aic`). `μ` enters only through `dev`, so it is not a
-/// parameter here. Requires `y > 0`, the family's own domain.
+/// Substituting `Σᵢ wᵢ(yᵢ−μᵢ)²/(μᵢ²yᵢ) = D` and `φ = D/n` collapses the first
+/// sum to `n`, leaving
+/// ```text
+///   aic = n·(ln(2π·disp) + 1) + 3·Σᵢ ln yᵢ − Σᵢ ln wᵢ + 2
+/// ```
+/// `μ` enters only through `dev`, so it is not a parameter here. At unit
+/// weights this is R's `inverse.gaussian()$aic` verbatim (R
+/// `src/library/stats/R/family.R`), and the `−Σ ln wᵢ` term is absent. Requires
+/// `y > 0`, the family's own domain.
 pub(crate) fn inv_gaussian_aic<T: Scalar>(
     y: &[f64],
     dev: T,
     n: usize,
     prior_w: Option<&[f64]>,
 ) -> T {
-    let sum_w = prior_w.map_or(n as f64, |w| w[..n].iter().sum());
-    let disp = dev / T::from_f64(sum_w);
+    let disp = dev / T::from_f64(n as f64);
     let mut ln_y = 0.0;
-    for (i, &yi) in y.iter().take(n).enumerate() {
-        ln_y += prior_w.map_or(1.0, |w| w[i]) * yi.ln();
+    for &yi in y.iter().take(n) {
+        ln_y += yi.ln();
     }
-    T::from_f64(sum_w) * ((T::from_f64(2.0 * std::f64::consts::PI) * disp).ln() + T::ONE)
+    let ln_w: f64 = prior_w.map_or(0.0, |w| w[..n].iter().map(|wi| wi.ln()).sum());
+    T::from_f64(n as f64) * ((T::from_f64(2.0 * std::f64::consts::PI) * disp).ln() + T::ONE)
         + T::from_f64(3.0 * ln_y)
+        - T::from_f64(ln_w)
         + T::from_f64(2.0)
 }
 
@@ -511,9 +641,9 @@ pub(crate) fn inv_gaussian_aic<T: Scalar>(
 ///   deliberately omits).
 /// - **Gaussian** — 0 (its `dev_resid` is the bare RSS; the Gaussian paths
 ///   build their log-likelihood directly and never call this).
-/// - **Gamma** — NaN on purpose: the Gamma objective substitutes `gamma_aic`
-///   (already `−2·Σwᵢ·log f + 2`), so its logLik is `−½(deviance − 2)` with no
-///   saturated term; a caller reaching this arm is a bug, surfaced as NaN.
+/// - **Gamma** — NaN on purpose: both Gamma paths carry the whole log-density
+///   through [`gamma_dispersion_term`] at their φ̂, so there is no saturated
+///   term to restore; a caller reaching this arm is a bug, surfaced as NaN.
 /// - **InverseGaussian** — NaN for the same reason as Gamma: the objective
 ///   substitutes `inv_gaussian_aic` (D1), which already carries the profiled
 ///   dispersion, so there is no free-standing saturated constant to restore.
@@ -559,39 +689,6 @@ pub(crate) fn saturated_loglik(
                 .sum();
             profile - counts
         }
-    }
-}
-
-/// lme4's `sigma(merMod)²` for a GLMM with a free scale: `σ̂² = pwrss/n =
-/// (Σᵢ wᵢ·rᵢ² + ‖û‖²)/n` with Pearson residuals `rᵢ = (yᵢ−μᵢ)/√V(μᵢ)` (for Gamma,
-/// `V(μ)=μ²` ⇒ `rᵢ=(yᵢ−μᵢ)/μᵢ`) and `wᵢ` the row's prior weight (`prior_w = None`
-/// ⇒ unit weights). Fixed-scale families (binomial/Poisson/NB — their
-/// overdispersion lives in θ, not σ²) return 1. This is the factor lme4's
-/// `vcov(use.hessian = FALSE)` puts on the RX/Schur vcov and the one its VarCorr
-/// stddevs carry — distinct from the Pearson/(n−p) `dispersion` moment reported
-/// separately. `mu`/`u` are the CONVERGED conditional means/modes (post pinned-γ̂
-/// re-eval); Gamma Rx-SE gating: `fit::tests::fit_glmm_gamma_sim_matches_lme4`.
-/// The denominator stays the RAW `y.len()` (not `Σwᵢ`) under weighting — verified
-/// against the `fit_glmm_gamma_weighted_matches_lme4` golden, which matches lme4's
-/// `pwrss/n` with `n` the raw row count even when `weights=` is supplied.
-pub(crate) fn glmm_sigma_sq(
-    family: Family,
-    y: &[f64],
-    mu: &[f64],
-    u: &[f64],
-    prior_w: Option<&[f64]>,
-) -> f64 {
-    match family {
-        Family::Gamma { .. } => {
-            let mut wrss = 0.0;
-            for (i, (&yi, &mui)) in y.iter().zip(mu).enumerate() {
-                let r = (yi - mui) / mui;
-                wrss += prior_w.map_or(1.0, |w| w[i]) * r * r;
-            }
-            let usq: f64 = u.iter().map(|&v| v * v).sum();
-            (wrss + usq) / y.len() as f64
-        }
-        _ => 1.0,
     }
 }
 
@@ -716,6 +813,102 @@ pub(crate) fn observed_weight<T: Scalar>(
     w - T::from_f64(prior_w) * (T::from_f64(y) - mu) * dr
 }
 
+/// Whether the exact curvature of a row's log-likelihood in η, `W_obs`
+/// ([`observed_weight`]), differs from the Fisher working weight: every
+/// non-canonical link except the ones whose link is canonical up to sign
+/// (Gamma/inverse, inverse-Gaussian/inverse-squared) and the Gaussian identity.
+/// On these links the Laplace objective's `log|A|` is taken off
+/// `A_obs = M'W_obs M + I` (`glmm::pirls::evaluate_at_mode`), not the Fisher
+/// `A` PIRLS steps with.
+pub(crate) fn exact_curvature_differs(family: Family) -> bool {
+    !is_canonical(family)
+        && !matches!(
+            family,
+            Family::Gaussian
+                | Family::Gamma {
+                    link: GammaLink::Inverse,
+                }
+                | Family::InverseGaussian {
+                    link: InverseGaussianLink::InverseSquared,
+                }
+        )
+}
+
+/// `dW_obs/dη` for [`observed_weight`], the third η-derivative of the row's
+/// log-likelihood (negated). With the score `ρ = prior_w·(y−μ)·g(η)`,
+/// `g = μ'/V(μ)`, `W_obs = −dρ/dη = prior_w·[μ'·g − (y−μ)·g']` and
+/// ```text
+///   dW_obs/dη = prior_w·[μ''·g + 2μ'·g' − (y−μ)·g'']
+/// ```
+/// with `g'` the same per-link factor `observed_weight` uses and `g''`:
+///
+/// - probit (`g' = N/V²`, `N = −φ(ηV + φ(1−2μ))`, `V' = (1−2μ)φ`):
+///   `g'' = N'/V² − 2N·V'/V³`, `N' = ηφ(ηV + φ(1−2μ)) − φ(V − 2φ²)`;
+/// - cloglog (`g = r = eᵑ/μ`, `g' = r·s`, `s = 1 − μ'/μ`):
+///   `g'' = r·s² − r·(μ''μ − μ'²)/μ²`;
+/// - Gamma/log (`g = 1/μ`): `g'' = 1/μ`, so `dW_obs/dη = −W_obs`;
+/// - NB/log (`g = θ/(θ+μ)`): `g'' = −θμ(θ−μ)/(θ+μ)³`;
+/// - inverse-Gaussian/log (`g = μ⁻²`): `g'' = 4μ⁻²`.
+///
+/// On a link where the observed and Fisher weights coincide
+/// (`!exact_curvature_differs`) it is the Fisher `dw/dη`, handed in as
+/// `w_eta` ([`weight_eta_deriv`]). `eta`/`mu` are the pass's already-clamped
+/// values, as for `observed_weight`. Held against the `Dual<1>` lane of
+/// `observed_weight` and against a central difference in
+/// `observed_weight_eta_deriv_matches_*`.
+pub(crate) fn observed_weight_eta_deriv<T: Scalar>(
+    family: Family,
+    nb_theta: f64,
+    y: f64,
+    prior_w: f64,
+    eta: T,
+    mu: T,
+    w_eta: T,
+) -> T {
+    if !exact_curvature_differs(family) {
+        return w_eta;
+    }
+    let two = T::from_f64(2.0);
+    let d1 = mu_eta(family, eta);
+    let d2 = mu_eta_eta(family, eta);
+    let v = variance(family, nb_theta, mu);
+    let g = d1 / v;
+    let (g1, g2) = match family {
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        } => {
+            let k = eta * v + d1 * (T::ONE - two * mu);
+            let nn = -d1 * k;
+            let dv = (T::ONE - two * mu) * d1;
+            let dn = eta * d1 * k - d1 * (v - two * d1 * d1);
+            (nn / (v * v), dn / (v * v) - two * nn * dv / (v * v * v))
+        }
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        } => {
+            let r = Scalar::exp(eta) / mu;
+            let sfac = T::ONE - d1 / mu;
+            (
+                r * sfac,
+                r * sfac * sfac - r * (d2 * mu - d1 * d1) / (mu * mu),
+            )
+        }
+        Family::Gamma {
+            link: GammaLink::Log,
+        } => (-(T::ONE / mu), T::ONE / mu),
+        Family::NegativeBinomial { .. } => {
+            let th = T::from_f64(nb_theta);
+            let d = th + mu;
+            (-th * mu / (d * d), -th * mu * (th - mu) / (d * d * d))
+        }
+        Family::InverseGaussian {
+            link: InverseGaussianLink::Log,
+        } => (T::from_f64(-2.0) / (mu * mu), T::from_f64(4.0) / (mu * mu)),
+        _ => unreachable!("exact_curvature_differs admits only the links above"),
+    };
+    T::from_f64(prior_w) * (d2 * g + two * d1 * g1 - (T::from_f64(y) - mu) * g2)
+}
+
 /// The observed (Newton) IRLS weight of a row whose μ sits on a [`clamp_mu`]
 /// bound. There the score is `ρ̃ = prior_w·μ'(η)·(y−mu)/V(mu)` with `mu` fixed
 /// at the pinned value, so only `μ'(η)` still moves with η and
@@ -828,43 +1021,6 @@ mod tests {
     use crate::{
         BinomialLink, Family, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink,
     };
-
-    /// `gamma_phi_prime` against `gamma_aic`'s own `Dual<1>` lane, seeded
-    /// along a μ-perturbation so the lane is the TOTAL derivative `daic/dD` —
-    /// the same quantity the closed form gives, and not the partial of
-    /// `gamma_aic` at fixed `mu`, which is a different number. `Φ' =
-    /// (daic/dt)/(dD/dt)` for any perturbation direction `t`, so one
-    /// arbitrary direction settles it. Band 1e-12 relative: both sides are
-    /// smooth `f64` reductions over four rows.
-    #[test]
-    fn phi_prime_matches_dual1_lane_of_aic() {
-        use crate::dual::Dual;
-        let y = [0.7_f64, 1.4, 2.2, 3.1];
-        let mu0 = [0.9_f64, 1.2, 2.6, 2.8];
-        let dmu = [0.3_f64, -0.4, 0.7, 0.2];
-        let w = [1.0_f64, 2.0, 0.5, 1.5];
-        let n = 4;
-        let family = Family::Gamma {
-            link: GammaLink::Log,
-        };
-        let mu: Vec<Dual<1>> = (0..n)
-            .map(|i| Dual::<1> {
-                v: mu0[i],
-                d: [dmu[i]],
-            })
-            .collect();
-        let mut dev = Dual::<1>::ZERO;
-        for i in 0..n {
-            dev += Dual::<1>::from_f64(w[i]) * dev_resid(family, f64::NAN, y[i], mu[i]);
-        }
-        let aic = gamma_aic(&y, &mu, dev, n, Some(&w));
-        let got = aic.d[0] / dev.d[0];
-        let want = gamma_phi_prime(dev.v, n, Some(&w));
-        assert!(
-            (got - want).abs() <= 1e-12 * want.abs().max(1.0),
-            "{family:?}: lane {got} vs closed form {want}"
-        );
-    }
 
     /// `observed_weight`'s `dr/dη` per link against a central difference of
     /// `r(η) = (dμ/dη)/V(μ(η))`, read back through `w_obs = w − (y−μ)·dr/dη`
@@ -1576,9 +1732,324 @@ mod tests {
         assert!(saturated_loglik(f, f64::NAN, &[1.0, 2.0], None).is_nan());
     }
 
+    /// The links whose exact (observed) curvature of the row log-likelihood in
+    /// η differs from the Fisher weight: every non-canonical link except
+    /// Gamma/inverse, whose `η = 1/μ` is canonical up to sign.
     #[test]
-    fn inv_gaussian_aic_matches_r_formula() {
-        // R: aic = sum(wt)*(log(dev/sum(wt)*2*pi)+1) + 3*sum(log(y)*wt) + 2
+    fn exact_curvature_differs_names_the_non_canonical_links() {
+        let differs = [
+            Family::Binomial {
+                link: BinomialLink::Probit,
+            },
+            Family::Binomial {
+                link: BinomialLink::Cloglog,
+            },
+            Family::Gamma {
+                link: GammaLink::Log,
+            },
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            Family::InverseGaussian {
+                link: InverseGaussianLink::Log,
+            },
+        ];
+        let same = [
+            Family::Gaussian,
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            Family::Gamma {
+                link: GammaLink::Inverse,
+            },
+            Family::InverseGaussian {
+                link: InverseGaussianLink::InverseSquared,
+            },
+        ];
+        for f in differs {
+            assert!(exact_curvature_differs(f), "{f:?}");
+        }
+        for f in same {
+            assert!(!exact_curvature_differs(f), "{f:?}");
+        }
+    }
+
+    /// Links and interior η points for the observed-weight derivative checks
+    /// (positive η for the inverse links, whose domain is η > 0).
+    fn observed_weight_cells() -> Vec<(Family, Vec<f64>)> {
+        vec![
+            (
+                Family::Binomial {
+                    link: BinomialLink::Probit,
+                },
+                vec![-1.3, 0.0, 0.4, 2.1],
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Cloglog,
+                },
+                vec![-2.0, -0.3, 0.5, 1.2],
+            ),
+            (
+                Family::Gamma {
+                    link: GammaLink::Log,
+                },
+                vec![-1.0, 0.2, 2.3],
+            ),
+            (
+                Family::NegativeBinomial {
+                    link: NegBinomialLink::Log,
+                },
+                vec![-1.0, 0.2, 2.3],
+            ),
+            (
+                Family::InverseGaussian {
+                    link: InverseGaussianLink::Log,
+                },
+                vec![-0.5, 0.2, 1.1],
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Logit,
+                },
+                vec![-1.0, 0.3],
+            ),
+            (
+                Family::Poisson {
+                    link: PoissonLink::Log,
+                },
+                vec![-1.0, 0.3],
+            ),
+            (
+                Family::Gamma {
+                    link: GammaLink::Inverse,
+                },
+                vec![0.4, 1.5],
+            ),
+        ]
+    }
+
+    /// `observed_weight_eta_deriv` (`dW_obs/dη`, the third η-derivative of the
+    /// row's log-likelihood) against the `Dual<1>` lane of `observed_weight`
+    /// itself, with the Fisher weight and μ carried as duals of the same η.
+    /// Band 1e-11 relative: both sides are closed forms at `f64`.
+    #[test]
+    fn observed_weight_eta_deriv_matches_dual1_of_observed_weight() {
+        use crate::dual::Dual;
+        let nb_theta = 2.5;
+        for (f, etas) in observed_weight_cells() {
+            for &eta in &etas {
+                for &(y, prior_w) in &[(0.3_f64, 1.0_f64), (1.0, 2.5), (4.0, 0.7)] {
+                    // Binomial rows need y in [0, 1].
+                    let y = if matches!(f, Family::Binomial { .. }) {
+                        y.min(1.0) * 0.8
+                    } else {
+                        y
+                    };
+                    let e = Dual::<1> { v: eta, d: [1.0] };
+                    let (mu_d, w_raw, _) = irls_weight_and_resid(f, nb_theta, y, e);
+                    let w_d = Dual::<1>::from_f64(prior_w) * w_raw;
+                    let want = observed_weight(f, nb_theta, y, prior_w, e, mu_d, w_d).d[0];
+                    let w_eta = weight_eta_deriv(f, nb_theta, eta, mu_d.v, w_d.v);
+                    let got =
+                        observed_weight_eta_deriv(f, nb_theta, y, prior_w, eta, mu_d.v, w_eta);
+                    assert!(
+                        (got - want).abs() <= 1e-11 * want.abs().max(1.0),
+                        "{f:?} eta={eta} y={y} pw={prior_w}: got {got} want {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same derivative against a central difference of the `f64`
+    /// `observed_weight` in η. Step 1e-5, band 1e-6 relative (O(h²) truncation
+    /// on smooth links, far below the band).
+    #[test]
+    fn observed_weight_eta_deriv_matches_fd_of_observed_weight() {
+        let nb_theta = 2.5;
+        let wobs = |f: Family, y: f64, pw: f64, eta: f64| {
+            let (mu, w_raw, _) = irls_weight_and_resid(f, nb_theta, y, eta);
+            observed_weight(f, nb_theta, y, pw, eta, mu, pw * w_raw)
+        };
+        for (f, etas) in observed_weight_cells() {
+            for &eta in &etas {
+                let y = if matches!(f, Family::Binomial { .. }) {
+                    0.6
+                } else {
+                    1.7
+                };
+                let pw = 1.3;
+                let h = 1e-5;
+                let fd = (wobs(f, y, pw, eta + h) - wobs(f, y, pw, eta - h)) / (2.0 * h);
+                let (mu, w_raw, _) = irls_weight_and_resid(f, nb_theta, y, eta);
+                let w_eta = weight_eta_deriv(f, nb_theta, eta, mu, pw * w_raw);
+                let got = observed_weight_eta_deriv(f, nb_theta, y, pw, eta, mu, w_eta);
+                assert!(
+                    (got - fd).abs() <= 1e-6 * fd.abs().max(1.0),
+                    "{f:?} eta={eta}: got {got} fd {fd}"
+                );
+            }
+        }
+    }
+
+    /// `gamma_dispersion_term(ln φ) + D/φ` is the whole `−2·Σᵢ log f(yᵢ; shape
+    /// aᵢ, mean μᵢ)`, `aᵢ = wᵢ/φ`, normalising terms included, at every φ:
+    /// PIRLS on the prior weights `wᵢ/φ` returns `D/φ`, and this term is the
+    /// rest. The reference is the Gamma log-density written out term by term,
+    /// `aᵢ·ln aᵢ − aᵢ·ln μᵢ + (aᵢ−1)·ln yᵢ − aᵢ·yᵢ/μᵢ − lnΓ(aᵢ)`, precision
+    /// weights (row `i` has variance `φ·V(μᵢ)/wᵢ`).
+    #[test]
+    fn gamma_dispersion_term_completes_the_gamma_log_density() {
+        let y = [0.7_f64, 1.4, 2.2, 3.1, 0.2];
+        let mu = [0.9_f64, 1.2, 2.6, 2.8, 0.5];
+        let w = [1.0_f64, 2.0, 0.5, 1.5, 1.0];
+        let n = y.len();
+        let family = Family::Gamma {
+            link: GammaLink::Log,
+        };
+        let sum_ln_y: f64 = y.iter().map(|v| v.ln()).sum();
+        let dev: f64 = (0..n)
+            .map(|i| w[i] * dev_resid(family, f64::NAN, y[i], mu[i]))
+            .sum();
+        for &phi in &[0.05_f64, 0.3, 1.0, 2.5] {
+            let want = -2.0
+                * (0..n)
+                    .map(|i| {
+                        let a = w[i] / phi;
+                        let lg = crate::simd_transcendental::ln_gamma(a);
+                        a * a.ln() - a * mu[i].ln() + (a - 1.0) * y[i].ln() - a * y[i] / mu[i] - lg
+                    })
+                    .sum::<f64>();
+            let got = gamma_dispersion_term(phi.ln(), Some(&w), n, sum_ln_y) + dev / phi;
+            assert!(
+                (got - want).abs() <= 1e-12 * want.abs().max(1.0),
+                "φ = {phi}: {got} vs {want}"
+            );
+        }
+        // Unweighted (`weights = None`) must equal every row sharing `w = 1`.
+        let ones = [1.0_f64; 5];
+        for &phi in &[0.05_f64, 0.3, 1.0, 2.5] {
+            let via_none = gamma_dispersion_term(phi.ln(), None, n, sum_ln_y);
+            let via_unit_weights = gamma_dispersion_term(phi.ln(), Some(&ones), n, sum_ln_y);
+            assert!(
+                (via_none - via_unit_weights).abs() <= 1e-12 * via_unit_weights.abs().max(1.0),
+                "φ = {phi}: None {via_none} vs unit weights {via_unit_weights}"
+            );
+        }
+    }
+
+    /// The closed-form first and second `ln φ` derivatives of
+    /// `gamma_dispersion_term` against central differences of the term itself,
+    /// unweighted and with row-varying weights. Bands: 1e-6 and 1e-4 relative,
+    /// the O(h²) truncation of a step of 1e-4.
+    #[test]
+    fn gamma_dispersion_term_derivatives_match_central_differences() {
+        let n = 4;
+        let sum_ln_y = 1.3_f64;
+        let w = [0.5_f64, 1.0, 2.5, 4.0];
+        let h = 1e-4;
+        for weights in [None, Some(&w[..])] {
+            let g = |t: f64| gamma_dispersion_term(t, weights, n, sum_ln_y);
+            for &psi in &[-3.0_f64, -1.0, 0.0, 0.9] {
+                let d1 = (g(psi + h) - g(psi - h)) / (2.0 * h);
+                let d2 = (g(psi + h) - 2.0 * g(psi) + g(psi - h)) / (h * h);
+                let got1 = gamma_dispersion_term_d1(psi, weights, n);
+                let got2 = gamma_dispersion_term_d2(psi, weights, n);
+                assert!(
+                    (got1 - d1).abs() <= 1e-6 * d1.abs().max(1.0),
+                    "weighted={} ψ = {psi}: d1 {got1} vs {d1}",
+                    weights.is_some()
+                );
+                assert!(
+                    (got2 - d2).abs() <= 1e-4 * d2.abs().max(1.0),
+                    "weighted={} ψ = {psi}: d2 {got2} vs {d2}",
+                    weights.is_some()
+                );
+            }
+        }
+    }
+
+    /// `gamma_ml_dispersion` solves the Gamma ML shape equation
+    /// `ln a − ψ(a) = D/(2n)`, `a = 1/φ`, from the near-Poisson end (large a)
+    /// to the heavy-tailed one (small a), and a zero deviance gives φ = 0.
+    #[test]
+    fn gamma_ml_dispersion_solves_the_shape_equation() {
+        let n = 288;
+        for &c in &[1e-8_f64, 1e-4, 0.05, 0.4418, 1.0, 5.0, 40.0] {
+            let phi = gamma_ml_dispersion(2.0 * c * n as f64, None, n);
+            let a = 1.0 / phi;
+            // The residual is itself computed with the cancelling difference,
+            // so its own rounding, a few ulp of ln a, is allowed on top.
+            let resid = a.ln() - crate::dual::digamma(a) - c;
+            let tol = 1e-12 * c + 16.0 * f64::EPSILON * a.ln().abs().max(1.0);
+            assert!(
+                phi > 0.0 && resid.abs() <= tol,
+                "c = {c}: φ = {phi}, residual {resid}"
+            );
+            // Near the Poisson end the root is φ ≈ 2c (a ≈ 1/(2c)).
+            if c < 1e-3 {
+                assert!(
+                    (phi / (2.0 * c) - 1.0).abs() < 2.0 * c,
+                    "c = {c}: φ = {phi}"
+                );
+            }
+        }
+        assert_eq!(gamma_ml_dispersion(0.0, None, n), 0.0);
+        // A deviance that rounds below zero on data the mean model reproduces
+        // exactly is still an exact fit, not a NaN.
+        assert_eq!(gamma_ml_dispersion(-1.4e-15, None, n), 0.0);
+        assert!(gamma_ml_dispersion(f64::NAN, None, n).is_nan());
+        // MASS::gamma.shape on sim_gamma's log-link GLM: dev 254.45332674125353
+        // over 288 rows gives 1/alpha = 0.78574357084515345.
+        let phi = gamma_ml_dispersion(254.45332674125353, None, 288);
+        assert!((phi - 0.7857435708451534).abs() < 1e-14, "φ = {phi}");
+    }
+
+    /// The weighted arm solves the per-row equation `Σᵢ wᵢ·(ln aᵢ − ψ₀(aᵢ)) =
+    /// D/2`, `aᵢ = wᵢ/φ`: check the residual of that equation directly at the
+    /// returned root, on weights that vary row to row (not all-equal, so the
+    /// unweighted closed form does not apply), and that `Σŵ = n` unit weights
+    /// reproduce the unweighted root.
+    #[test]
+    fn gamma_ml_dispersion_weighted_solves_the_per_row_equation() {
+        let w = [0.4_f64, 0.8, 1.3, 2.5, 3.0];
+        let n = w.len();
+        for &dev in &[0.5_f64, 3.0, 12.0, 40.0] {
+            let phi = gamma_ml_dispersion(dev, Some(&w), n);
+            assert!(phi > 0.0 && phi.is_finite(), "dev = {dev}: φ = {phi}");
+            let resid: f64 = w
+                .iter()
+                .map(|&wi| {
+                    let ai = wi / phi;
+                    wi * (ai.ln() - crate::dual::digamma(ai))
+                })
+                .sum::<f64>()
+                - dev / 2.0;
+            assert!(
+                resid.abs() <= 1e-9 * dev.max(1.0),
+                "dev = {dev}: φ = {phi}, residual {resid}"
+            );
+        }
+        let ones = [1.0_f64; 5];
+        let via_ones = gamma_ml_dispersion(12.0, Some(&ones), 5);
+        let via_none = gamma_ml_dispersion(12.0, None, 5);
+        assert!(
+            (via_ones - via_none).abs() <= 1e-12 * via_none.abs().max(1.0),
+            "unit weights {via_ones} vs None {via_none}"
+        );
+    }
+
+    /// Unweighted matches R's `inverse.gaussian()$aic` formula exactly; the
+    /// weighted half is the precision closed form (row `i` has variance
+    /// `φ·V(μᵢ)/wᵢ`, so `φ̂ = D/n`, `aic = n·(ln(2πφ̂)+1) + 3Σln yᵢ − Σln wᵢ +
+    /// 2`), a different formula from R's `Σwᵢ`/`Σwᵢln yᵢ` case-weight one.
+    #[test]
+    fn inv_gaussian_aic_matches_precision_formula() {
+        // R: aic = n*(log(dev/n*2*pi)+1) + 3*sum(log(y)) + 2
         let y = [1.5_f64, 2.0, 0.75, 3.25];
         let n = y.len();
         let dev = 0.42_f64;
@@ -1588,14 +2059,18 @@ mod tests {
             + 3.0 * y.iter().map(|v| v.ln()).sum::<f64>()
             + 2.0;
         assert!((got - want).abs() < 1e-12, "got {got} want {want}");
-        // Prior weights enter as Σw in place of n and weight each log y.
+        // Precision weights: φ̂ = D/n (n, not Σw), and an extra −Σln wᵢ term
+        // (`−2ℓ = D/φ + n·ln(2πφ) + 3·Σln yᵢ − Σln wᵢ`).
         let w = [1.0_f64, 2.0, 0.5, 1.5];
-        let sw: f64 = w.iter().sum();
         let gotw = inv_gaussian_aic(&y, dev, n, Some(&w));
-        let dispw = dev / sw;
-        let wantw = sw * ((2.0 * std::f64::consts::PI * dispw).ln() + 1.0)
-            + 3.0 * y.iter().zip(w).map(|(v, wi)| wi * v.ln()).sum::<f64>()
+        let wantw = n as f64 * ((2.0 * std::f64::consts::PI * disp).ln() + 1.0)
+            + 3.0 * y.iter().map(|v| v.ln()).sum::<f64>()
+            - w.iter().map(|wi| wi.ln()).sum::<f64>()
             + 2.0;
-        assert!((gotw - wantw).abs() < 1e-12);
+        assert!((gotw - wantw).abs() < 1e-12, "got {gotw} want {wantw}");
+        // Unit weights must reproduce the unweighted value exactly (ln 1 = 0).
+        let ones = [1.0_f64; 4];
+        let via_ones = inv_gaussian_aic(&y, dev, n, Some(&ones));
+        assert!((via_ones - got).abs() < 1e-12);
     }
 }

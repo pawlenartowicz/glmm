@@ -1,0 +1,14 @@
+# Julia environment for grid/engines/mixedmodels.jl, pinned at the MixedModels
+# version grid/versions.json names. Run the engine inside it:
+#   julia --project=<this directory> <this directory>/engines/mixedmodels.jl
+# Manifest.toml beside this file is the resolved, committed lock.
+[deps]
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+GLM = "38e38edf-8417-5370-95a0-9cbb8c7f171a"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+MixedModels = "ff71e718-51f3-5ec2-a782-8ffcbfa3c316"
+
+[compat]
+MixedModels = "=5.9.0"
+julia = "1.12"

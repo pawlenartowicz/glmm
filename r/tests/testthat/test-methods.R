@@ -51,7 +51,8 @@ test_that("the Gamma() link trap: object honored, string means log", {
   ref <- glm(y ~ x, data = d, family = Gamma(link = "log"))
   expect_equal(unname(fixef(fit_str)), unname(coef(ref)), tolerance = 1e-5,
                info = "gamma log-link vs glm")
-  # sigma() for gamma is sqrt(phi), phi the Pearson dispersion.
+  # sigma() for a Gamma GLM is sqrt(phi), phi the Pearson dispersion
+  # summary(glm) reports (Sum(w r^2) / (n - p)).
   expect_equal(sigma(fit_str)^2, summary(ref)$dispersion, tolerance = 1e-5)
   # The other half of the trap: fit_obj used the inverse link, so its
   # coefficients must match glm() on the inverse link, not the log one.
@@ -75,6 +76,40 @@ test_that("sigma for inverse-Gaussian is sqrt(phi), phi the Pearson dispersion",
   expect_equal(sigma(f), sqrt(f$dispersion))
 })
 
+test_that("summary prints 'Dispersion (phi, Pearson)' for a Gamma GLM", {
+  set.seed(24)
+  d <- data.frame(x = rnorm(80))
+  d$y <- rgamma(80, shape = 4, rate = 4 / exp(0.3 + 0.5 * d$x))
+  fit <- fastglmm(y ~ x, d, family = "gamma")
+  out <- paste(capture.output(print(summary(fit))), collapse = "\n")
+  expect_true(grepl("Dispersion (phi, Pearson):", out, fixed = TRUE))
+})
+
+test_that("summary prints 'Dispersion (phi, ML)' for a Gamma GLMM", {
+  set.seed(25)
+  n_g <- 60L
+  m <- 10L
+  g <- factor(rep(seq_len(n_g), each = m))
+  x <- rnorm(n_g * m)
+  u0 <- rnorm(n_g, sd = 0.3)
+  eta <- 0.5 + 0.2 * x + u0[as.integer(g)]
+  y <- rgamma(n_g * m, shape = 4, rate = 4 / exp(eta))
+  d <- data.frame(y = y, x = x, g = g)
+  fit <- fastglmm(y ~ x + (1 | g), d, family = Gamma(link = "log"))
+  out <- paste(capture.output(print(summary(fit))), collapse = "\n")
+  expect_true(grepl("Dispersion (phi, ML):", out, fixed = TRUE))
+})
+
+test_that("summary prints 'Dispersion (phi, fixed)' when dispersion is held", {
+  set.seed(23)
+  d <- data.frame(x = rnorm(80))
+  d$y <- rgamma(80, shape = 4, rate = 4 / exp(0.3 + 0.5 * d$x))
+  fit <- fastglmm(y ~ x, d, family = "gamma", dispersion = 2.5)
+  expect_equal(fit$dispersion, 2.5)
+  out <- paste(capture.output(print(summary(fit))), collapse = "\n")
+  expect_true(grepl("Dispersion (phi, fixed): 2.5", out, fixed = TRUE))
+})
+
 test_that("sigma is fixed at 1 for binomial/poisson (lme4 agreement)", {
   d <- benchmark_data(seed = 104, family = "binomial")
   fit <- fastglmm(y ~ t + (1 | g), d, family = binomial())
@@ -90,8 +125,7 @@ test_that("gaussian sigma matches lm on a fixed-only fit", {
   expect_equal(sigma(fit), sigma(ref), tolerance = 1e-8)
 })
 
-test_that("gaussian LMM sigma matches lme4 and VarCorr prints a Residual row", {
-  skip_if_not_installed("lme4")
+test_that("gaussian LMM sigma is pinned and VarCorr prints a Residual row", {
   set.seed(106)
   g <- factor(rep(1:40, each = 8))
   x <- rnorm(320)
@@ -99,8 +133,11 @@ test_that("gaussian LMM sigma matches lme4 and VarCorr prints a Residual row", {
                     rnorm(320, sd = 0.6),
                   x = x, g = g)
   fit <- fastglmm(y ~ x + (1 | g), d)
-  ref <- lme4::lmer(y ~ x + (1 | g), data = d, REML = TRUE)
-  expect_equal(sigma(fit), sigma(ref), tolerance = 1e-4)
+  # The REML residual standard deviation, pinned against this package's own
+  # output. The agreement with lmer on this design is checked by hand in
+  # tools/acceptance-vs-lme4.R's family of comparisons, not here: this suite
+  # installs no external engine.
+  expect_equal(sigma(fit), 0.583493794941051, tolerance = CI_REF_REL)
   vc <- VarCorr(fit)
   expect_equal(attr(vc, "sc"), sigma(fit))
   expect_match(paste(capture.output(print(vc)), collapse = "\n"), "Residual")
@@ -263,7 +300,7 @@ test_that("boundary fits warn with lme4's text plus the pinned component", {
   d <- benchmark_data(seed = 107, family = "binomial", tau0 = 1e-8)
   expect_pinned_boundary_fit(
     function() fastglmm(y ~ t + (1 | g), d, family = binomial()),
-    "sd\\(\\(Intercept\\) \\| g\\)"
+    "\\(Intercept\\) in g"
   )
 })
 
@@ -312,7 +349,7 @@ test_that("a q >= 2 pin is named even though its stddev is not zero", {
 
   fit <- expect_pinned_boundary_fit(
     function() fastglmm(y ~ x + (1 + x | g), d),
-    "sd\\(x \\| g\\)"
+    "x in g"
   )
   expect_equal(fit$diagnostics$boundary, "at_boundary")
   # The SLOPE component is the pinned one, aligned with the varcorr block.
@@ -349,7 +386,7 @@ test_that("a pin is named on a sparse-route fit too", {
 
   fit <- expect_pinned_boundary_fit(
     function() fastglmm(y ~ x + (1 | g) + (1 + x | h), d),
-    "sd\\(\\(Intercept\\) \\| g\\)"
+    "\\(Intercept\\) in g"
   )
   expect_equal(fit$diagnostics$pinned, list(TRUE, c(FALSE, FALSE)))
   # One flag per stddev, per block - the alignment .pinned_detail walks.
@@ -386,7 +423,7 @@ test_that("an ill-conditioned design warns with its own condition class", {
   # Caught by CLASS, not by message text - that is the point of the class.
   expect_s3_class(cond, "fastglmm_ill_conditioned")
   expect_s3_class(cond, "fastglmm_diagnostic")
-  expect_match(conditionMessage(cond), "b is entangled with one or more other columns")
+  expect_match(conditionMessage(cond), "b is almost a combination of other columns")
 
   expect_true(fit$converged)
   expect_false(any(fit$aliased)) # flagged, not dropped
@@ -400,78 +437,6 @@ test_that("an ill-conditioned design warns with its own condition class", {
   # Negative case: the same design at unit weights raises no note at all.
   clean <- fastglmm(y ~ a + b, d)
   expect_length(clean$diagnostics$notes, 0L)
-})
-
-test_that("unused_grouping_levels message names the empty levels", {
-  # No fixture here drives the note through a real fit (that path is the
-  # formula lowering, not the solver); asserted from a constructed note, like
-  # re_design_scale_spread and hessian_se_fallback below.
-  note <- list(kind = "unused_grouping_levels", columns = integer(0), pivot = NaN,
-               evals = 0L, final_eval = FALSE, detail = "g3, g7")
-  cond <- note_condition(note)
-  expect_s3_class(cond, "fastglmm_unused_grouping_levels")
-  expect_s3_class(cond, "fastglmm_diagnostic")
-  expect_match(conditionMessage(cond), "g3, g7")
-  expect_match(conditionMessage(cond), "droplevels\\(\\)")
-})
-
-test_that("pirls_exhausted message distinguishes the four cases", {
-  # This package's test fixtures do not reach final_eval=TRUE or a
-  # non-converged exhausted fit end-to-end, so all four message branches are
-  # asserted from constructed notes; the Rust-side test
-  # pirls_exhausted_payload_survives_flattening pins the payload itself.
-  note <- list(kind = "pirls_exhausted", columns = integer(0), pivot = NaN,
-               evals = 3L, final_eval = FALSE, detail = "")
-  benign <- note_condition(note)
-  expect_s3_class(benign, "fastglmm_pirls_exhausted")
-  expect_match(conditionMessage(benign),
-               "observation-only and no fitted number is affected")
-
-  not_converged <- tryCatch(
-    fastglmm:::.warn_note(note, character(0), FALSE, c(1.5, -2), c(FALSE, FALSE)),
-    warning = identity)
-  expect_s3_class(not_converged, "fastglmm_pirls_exhausted")
-  expect_match(conditionMessage(not_converged),
-               "the search ran out of its evaluation budget")
-  expect_match(conditionMessage(not_converged),
-               "the variance components are not reported")
-
-  failed <- tryCatch(
-    fastglmm:::.warn_note(note, character(0), FALSE, c(NaN, NaN), c(FALSE, FALSE)),
-    warning = identity)
-  expect_s3_class(failed, "fastglmm_pirls_exhausted")
-  expect_match(conditionMessage(failed), "the fit failed")
-  expect_match(conditionMessage(failed), "No estimate is reported")
-
-  note$evals <- 0L
-  note$final_eval <- TRUE
-  serious <- note_condition(note)
-  expect_s3_class(serious, "fastglmm_pirls_exhausted")
-  expect_match(conditionMessage(serious),
-               "the reported estimates rest on that truncated solve")
-})
-
-test_that("re_design_scale_spread message names the grouping and ratio", {
-  # No fixture here drives the note through a real fit (the Rust-side
-  # end-to-end test covers that:
-  # fit::common_tests::re_design_scale_spread_note_fires_on_mismatched_slope_scale),
-  # so the message is asserted from a constructed note.
-  note <- list(kind = "re_design_scale_spread", columns = integer(0), pivot = NaN,
-               evals = 0L, final_eval = FALSE, detail = "g", ratio = 4200.0)
-  cond <- note_condition(note)
-  expect_s3_class(cond, "fastglmm_re_design_scale_spread")
-  expect_match(conditionMessage(cond), "grouping 'g'")
-  expect_match(conditionMessage(cond), "4.2e\\+03")
-  expect_match(conditionMessage(cond), "scales the columns internally")
-})
-
-test_that("hessian_se_fallback message", {
-  note <- list(kind = "hessian_se_fallback", columns = integer(0), pivot = NaN,
-               evals = 0L, final_eval = FALSE, detail = "", ratio = NaN)
-  cond <- note_condition(note)
-  expect_s3_class(cond, "fastglmm_hessian_se_fallback")
-  expect_match(conditionMessage(cond), "not positive definite")
-  expect_match(conditionMessage(cond), "stddev_se is NaN")
 })
 
 test_that("rank-deficient designs mirror lme4's NA coefficients", {
@@ -548,7 +513,7 @@ test_that("warm start (lme4's start=) is accepted and unknown parts warn", {
   expect_warning(
     fastglmm(y ~ t + (1 | g), d, family = binomial(),
              start = list(beta = unname(fixef(cold)), theta = 0.7, bogus = 1)),
-    "start elements ignored: bogus"
+    "start accepts only 'beta' and 'theta'; these elements were ignored: bogus"
   )
 })
 

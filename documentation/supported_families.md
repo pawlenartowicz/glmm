@@ -46,25 +46,39 @@ mixed models go through PIRLS with Laplace/AGQ
   and `Cloglog` (`μ = 1−exp(−exp(η))`, asymmetric — μ approaches 1 much faster
   than 0, hence an upper clamp on η at `ln(ETA_MAX)` the other two links don't
   need) both take the general Fisher-scoring branch.
-- **Gamma** dispersion `φ` is estimated post-fit as the Pearson moment
-  estimator `φ̂ = Σrᵢ²/(n−p)` and scales the SE by `√φ̂`; the estimate-vs-fixed
-  directive lives in `FitOptions`, not in the family. In the GLMM objective the
-  dispersion enters via lme4's profiled `Gamma()$aic` term.
+- **Gamma**: `Fit::loglik` is always the maximised log-likelihood, at the ML
+  φ̂ of the Gamma shape equation (`MASS::gamma.shape`'s equation at unit
+  weights; see [`algorithms.md`](algorithms.md)). What `Fit::dispersion`
+  reports differs by route: a fixed-only fit solves the shape equation
+  post-fit but reports the **Pearson** moment `Σ wᵢrᵢ²/(n−p)` as
+  `Fit::dispersion` and scales its SE by it — `summary.glm`'s convention,
+  not the ML φ̂ that placed the log-likelihood; a mixed fit has no separate
+  Pearson estimator, so `Fit::dispersion` is the ML φ̂ itself, carried as one
+  more coordinate of the Laplace objective's outer search, and the SE comes
+  from the same joint fit (glmmTMB's objective, not lme4's; see
+  [`algorithms-glmm.md`](algorithms-glmm.md#gamma-dispersion)). `weights` is
+  a precision weight (row `i` has dispersion `φ/wᵢ`; see
+  [`conventions.md`](conventions.md#prior-weights)). The estimate-vs-fixed
+  directive lives in `FitOptions`, not in the family.
 - **NegativeBinomial** dispersion `θ` is estimated by an outer loop
   (`fit_glm_nb` / `fit_glmm_nb`) and threaded explicitly through the variance
   function `V(μ) = μ + μ²/θ`.
 - **InverseGaussian** (`V(μ) = μ³`) is GLM-only: mixed models fault at the
   model-shape gate because the profiled `inverse.gaussian()$aic` objective
   term the GLMM would need is not built. Dispersion `φ` is estimated post-fit
-  by the same Pearson moment estimator as Gamma, and the log-likelihood
-  follows R's `inverse.gaussian()$aic` convention (dispersion profiled inside
-  the term).
+  by the Pearson moment estimator `φ̂ = Σwᵢrᵢ²/(n−p)`, and the log-likelihood
+  is the precision-weight one, with `φ` profiled at its ML value `D/n`; at
+  unit weights this is R's `inverse.gaussian()$aic`.
 - Dispersion is fixed at `φ ≡ 1` for Binomial, Poisson, and NB (NB
   overdispersion lives in `θ`, not `φ`).
-- **Prior (case) weights** (`FitOptions::weights`) are honored on every family
+- **Prior weights** (`FitOptions::weights`) are honored on every family
   above, fixed-only and mixed alike, at any `nagq`, including AGQ (`nagq > 1`)
-  on the binomial/Poisson shapes it covers. See `FitOptions::weights`'s
-  rustdoc for the exact per-path convention and oracle citations.
+  on the binomial/Poisson shapes it covers. They are precision weights on
+  Gaussian, Gamma and inverse-Gaussian, trial counts on aggregated Binomial,
+  and multiply the log-likelihood on NB — see
+  [`conventions.md`](conventions.md#prior-weights) and
+  `FitOptions::weights`'s rustdoc for the exact per-path convention and
+  oracle citations.
 - **Offset** (`FitOptions::offset`) is honored on every family above,
   fixed-only and mixed alike, at any `nagq`. See `FitOptions::offset`'s
   rustdoc for the exact convention.

@@ -8,17 +8,20 @@
 //!
 //! ```text
 //!   D(γ,u)   = Σ_i prior_w_i · dev_resid(y_i, μ(η_i))        the raw deviance
-//!   Φ(D)     = D, except Gamma, whose objective substitutes the `aic`
-//!   A(γ,u)   = M'WM + I,  W = diag(prior_w_i · w(η_i))       the Fisher PIRLS matrix
-//!   F(γ,u)   = Φ(D) + ‖u‖² + log|A|                          the Laplace objective
+//!   A(γ,u)   = M'WM + I,  W = diag(prior_w_i · w(η_i))       the curvature: the Fisher
+//!                                                             weight, or W_obs where the
+//!                                                             exact curvature differs
+//!   F(γ,u)   = D + ‖u‖² + log|A|                             the Laplace objective
 //!   G(γ,u)   = D_u + 2u                                      what PIRLS solves: G = 0
 //!   D*(γ)    = F(γ, û(γ))
 //!   D*_γ     = F_γ − adj'·G_γ,   adj = G_u⁻ᵀ F_u             (one adjoint solve)
 //! ```
 //!
-//! `G = 0` is what PIRLS delivers on every family, including Gamma, so this
-//! form needs no special case: Gamma's only difference is `F_u ≠ 0` (the `aic`
-//! substitution's `Φ' ≠ 1`), while `G` keeps its usual shape everywhere.
+//! `G = 0` is what PIRLS delivers on every family, so this form needs no
+//! special case. Gamma is differentiated at its fitted dispersion φ̂, where the
+//! objective is exactly this one on the prior weights `prior_wᵢ/φ̂`
+//! (`se::joint_hessian_cov` puts those weights in place); the dispersion's own
+//! row of the joint Hessian is appended there.
 //!
 //! On a row where μ sits on one of `family::clamp_mu`'s bounds, `D`'s
 //! dependence on η stops while the kernel's score keeps forming from the
@@ -462,7 +465,7 @@ fn mode_solve_f64(
         let saved_schur = pattern.structured_schur.take();
         let saved_force_dense = pattern.force_dense_schur;
         pattern.force_dense_schur = false;
-        let (dev, conv, _raw_finite) = structured_laplace_deviance::<f64>(
+        let (dev, _dev_scaled, conv, _raw_finite) = structured_laplace_deviance::<f64>(
             family,
             nb_theta,
             g,
@@ -490,7 +493,7 @@ fn mode_solve_f64(
         pattern.force_dense_schur = saved_force_dense;
         conv && dev.is_finite()
     } else {
-        let (dev, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
+        let (dev, _dev_scaled, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
             family,
             nb_theta,
             g,
@@ -687,6 +690,14 @@ fn gradient_f64_impl(
     grad: &mut [f64],
     mode_residual: Option<&mut f64>,
 ) -> Option<()> {
+    // At the fitted Gamma dispersion, differentiate the fixed-φ GLMM the fit
+    // minimized (`GlmmWorkspace::at_fixed_dispersion`); inside, `gamma_phi` is 1
+    // and this guard does not fire again.
+    if ws.dispersion_scaled() {
+        return ws.at_fixed_dispersion(n, |ws| {
+            gradient_f64_impl(ws, x, y, cluster_ids, extra_ids, p, n, grad, mode_residual)
+        });
+    }
     // `assembly_routes` also admits the packed layout, whose engine is
     // `packed_gradient`; `assemble` below reads blocked/structured buffers.
     if !assembly_routes(ws, n) || ws.layout == GlmmLayout::Packed {
@@ -955,6 +966,14 @@ pub(crate) fn joint_hessian_columns(
     grad: &mut [f64],
     hess: &mut Mat<f64>,
 ) -> DerivStatus {
+    // At the fitted Gamma dispersion, differentiate the fixed-φ GLMM the fit
+    // minimized (`GlmmWorkspace::at_fixed_dispersion`); inside, `gamma_phi` is 1
+    // and this guard does not fire again.
+    if ws.dispersion_scaled() {
+        return ws.at_fixed_dispersion(n, |ws| {
+            joint_hessian_columns(ws, x, y, cluster_ids, extra_ids, p, n, grad, hess)
+        });
+    }
     #[cfg(test)]
     if FORCE_DECLINE.load(std::sync::atomic::Ordering::Relaxed) {
         return DerivStatus::Unsupported;
@@ -1226,7 +1245,7 @@ fn run_assembled_hessian<T: Seed>(
             // solve, so it must not reach `ws.counters`.
             let mut counters = crate::counters::EvalCounters::new();
             let (value, conv) = if extras {
-                let (obj, conv, _raw_finite) = structured_laplace_deviance::<T>(
+                let (obj, _dev_scaled, conv, _raw_finite) = structured_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     g,
@@ -1256,7 +1275,7 @@ fn run_assembled_hessian<T: Seed>(
                 );
                 (obj.value(), conv)
             } else {
-                let (obj, conv, _raw_finite) = blocked_laplace_deviance::<T>(
+                let (obj, _dev_scaled, conv, _raw_finite) = blocked_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     g,
@@ -1382,7 +1401,7 @@ fn run_assembled_hessian<T: Seed>(
 /// Generic over the scalar: at `T = f64` this is the gradient itself, at
 /// `T = Dual<N>` its lanes are the joint Hessian's seeded columns. Every
 /// third derivative the second order needs arrives as a lane of a first-order
-/// quantity — `observed_weight`, `weight_eta_deriv`, `gamma_phi_prime` — so
+/// quantity — `observed_weight`, `weight_eta_deriv` — so
 /// there is no third-derivative table on this path.
 ///
 /// `∂M/∂θ_a` is the one quantity lifted from `f64` rather than read off the
@@ -1497,6 +1516,7 @@ fn assemble<T: TailKernel>(
 
     let canonical = crate::family::is_canonical(family);
     let (mu_lo, mu_hi) = crate::family::pinned_mu_bounds(family, weighted);
+    let exact_obj = crate::family::exact_curvature_differs(family);
     let mut pinned_rows = 0usize;
     let mut t = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
     let mut yb = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
@@ -1572,15 +1592,33 @@ fn assemble<T: TailKernel>(
         // On a pinned row μ is the constant `prob[i]`, so only `dμ/dη` still
         // moves with η — the clamped closed forms read that directly instead
         // of the general ones, which assume μ is still a function of η.
-        w_eta[i] = if pinned {
+        //
+        // The kernel's stored `w` is the weight the objective's `A = M'WM + I`
+        // is built from (`pirls::evaluate_at_mode`): the raw Fisher weight
+        // `prior_w·(dμ/dη)²/V` on a link whose exact curvature is Fisher, and
+        // on a pinned row everywhere, the observed `W_obs` on an interior row
+        // where the two differ. `w_eta` is that same weight's `dw/dη`. `w_obs`
+        // is the mode equation's Jacobian: `w` itself on an interior row of an
+        // exact-curvature link rather than formed a second time, the clamped
+        // observed weight on a pinned row whatever the link.
+        w_eta[i] = if exact_obj && !pinned {
+            crate::family::observed_weight_eta_deriv(
+                family,
+                nb_theta,
+                y[i],
+                prior_w[i],
+                eta[i],
+                prob[i],
+                T::ZERO,
+            )
+        } else if pinned {
             crate::family::clamped_weight_eta_deriv(family, nb_theta, prior_w[i], eta[i], prob[i])
         } else {
             crate::family::weight_eta_deriv(family, nb_theta, eta[i], prob[i], w[i])
         };
-        // The kernel's stored `w` is the raw Fisher weight
-        // `prior_w·(dμ/dη)²/V`, the same weight `A = M'WM + I` is built from,
-        // and `w_obs` is formed from it.
-        w_obs[i] = if pinned {
+        w_obs[i] = if exact_obj && !pinned {
+            w[i]
+        } else if pinned {
             crate::family::clamped_observed_weight(
                 family, nb_theta, y[i], prior_w[i], eta[i], prob[i],
             )
@@ -1750,32 +1788,20 @@ fn assemble<T: TailKernel>(
         }
     }
 
-    // --- pass 3. `Φ = D` on every family but Gamma, whose objective
-    // substitutes the profiled-dispersion `aic`; `Φ' = ∂aic/∂D` in closed form
-    // there, so the substitution is one multiply rather than a second path.
-    //   F_γ = Φ'·D_γ + ℓ_γ        F_u = Φ'·D_u + 2u + ℓ_u
+    // --- pass 3.
+    //   F_γ = D_γ + ℓ_γ           F_u = D_u + 2u + ℓ_u
     //   G_u = 2·A_obs             adj = G_u⁻¹F_u
     //   D*_γ = F_γ − adj'·G_γ
     // ---
-    let phi = if matches!(family, Family::Gamma { .. }) {
-        let mut dev = T::ZERO;
-        for i in 0..n {
-            dev +=
-                T::from_f64(prior_w[i]) * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
-        }
-        crate::family::gamma_phi_prime(dev, n, Some(prior_w))
-    } else {
-        T::ONE
-    };
     for f in 0..s {
         for local in 0..qc {
             let c = f * qc + local;
-            adj[c] = phi * d_u[c] + T::from_f64(2.0) * u[core_col(f, local)] + l_u[c];
+            adj[c] = d_u[c] + T::from_f64(2.0) * u[core_col(f, local)] + l_u[c];
         }
     }
     for b in 0..e {
         let c = k_family + b;
-        adj[c] = phi * d_u[c] + T::from_f64(2.0) * u[c] + l_u[c];
+        adj[c] = d_u[c] + T::from_f64(2.0) * u[c] + l_u[c];
     }
     // `A_obs = M'W_obs M + I`. On a canonical link with every row's μ off its
     // `family::clamp_mu` bound, `A_obs` IS the Fisher `A` the mode solve
@@ -1855,7 +1881,7 @@ fn assemble<T: TailKernel>(
         *v *= T::from_f64(0.5);
     }
     for a in 0..m {
-        let mut acc = phi * d_gamma[a] + l_gamma[a];
+        let mut acc = d_gamma[a] + l_gamma[a];
         for c in 0..k {
             acc -= adj[c] * g_gamma[a * k + c];
         }
@@ -1944,14 +1970,7 @@ fn packed_mode_solve_f64(
     if !conv || !dev.is_finite() {
         return None;
     }
-    // The same `aic`-for-deviance substitution the packed deviance arm makes,
-    // so this engine differentiates the objective that arm evaluates.
-    let data_term = if matches!(family, Family::Gamma { .. }) {
-        crate::family::gamma_aic(y, &pirls.prob, dev, n, Some(&prior_w[..n]))
-    } else {
-        dev
-    };
-    let obj = data_term + pen + 2.0 * logdet;
+    let obj = dev + pen + 2.0 * logdet;
     obj.is_finite().then_some(obj)
 }
 
@@ -2045,6 +2064,12 @@ pub(crate) fn packed_gradient(
     n: usize,
     grad: &mut [f64],
 ) -> DerivStatus {
+    // At the fitted Gamma dispersion, differentiate the fixed-φ GLMM the fit
+    // minimized (`GlmmWorkspace::at_fixed_dispersion`); inside, `gamma_phi` is 1
+    // and this guard does not fire again.
+    if ws.dispersion_scaled() {
+        return ws.at_fixed_dispersion(n, |ws| packed_gradient(ws, x, y, p, n, grad));
+    }
     if !assembly_routes(ws, n) || ws.layout != GlmmLayout::Packed {
         return DerivStatus::Unsupported;
     }
@@ -2197,6 +2222,7 @@ fn packed_assemble<T: Scalar>(
     let m = n_theta + p;
     let canonical = crate::family::is_canonical(family);
     let (mu_lo, mu_hi) = crate::family::pinned_mu_bounds(family, weighted);
+    let exact_obj = crate::family::exact_curvature_differs(family);
     let mut pinned_rows = 0usize;
     let AssemblyBufs {
         rho,
@@ -2293,13 +2319,26 @@ fn packed_assemble<T: Scalar>(
         let pinned = prob[i].value() <= mu_lo || prob[i].value() >= mu_hi;
         pinned_rows += usize::from(pinned);
         lev[i] = h;
-        // Mirrors `assemble` — change together.
-        w_eta[i] = if pinned {
+        // Mirrors `assemble` — change together, including the stored-weight rule
+        // on a link whose exact curvature differs from Fisher (`exact_obj`).
+        w_eta[i] = if exact_obj && !pinned {
+            crate::family::observed_weight_eta_deriv(
+                family,
+                nb_theta,
+                y[i],
+                prior_w[i],
+                eta[i],
+                prob[i],
+                T::ZERO,
+            )
+        } else if pinned {
             crate::family::clamped_weight_eta_deriv(family, nb_theta, prior_w[i], eta[i], prob[i])
         } else {
             crate::family::weight_eta_deriv(family, nb_theta, eta[i], prob[i], w[i])
         };
-        w_obs[i] = if pinned {
+        w_obs[i] = if exact_obj && !pinned {
+            w[i]
+        } else if pinned {
             crate::family::clamped_observed_weight(
                 family, nb_theta, y[i], prior_w[i], eta[i], prob[i],
             )
@@ -2364,21 +2403,11 @@ fn packed_assemble<T: Scalar>(
         }
     }
 
-    // --- pass 3, as `assemble`'s pass 3: `F_γ = Φ'·D_γ + ℓ_γ`,
-    // `F_u = Φ'·D_u + 2u + ℓ_u`, `adj = (2·A_obs)⁻¹F_u`,
+    // --- pass 3, as `assemble`'s pass 3: `F_γ = D_γ + ℓ_γ`,
+    // `F_u = D_u + 2u + ℓ_u`, `adj = (2·A_obs)⁻¹F_u`,
     // `D*_γ = F_γ − adj'·G_γ`. ---
-    let phi = if matches!(family, Family::Gamma { .. }) {
-        let mut dev = T::ZERO;
-        for i in 0..n {
-            dev +=
-                T::from_f64(prior_w[i]) * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
-        }
-        crate::family::gamma_phi_prime(dev, n, Some(prior_w))
-    } else {
-        T::ONE
-    };
     for c in 0..k {
-        adj[c] = phi * d_u[c] + T::from_f64(2.0) * u[c] + l_u[c];
+        adj[c] = d_u[c] + T::from_f64(2.0) * u[c] + l_u[c];
     }
     // `A_obs` IS the Fisher `A` only on a canonical link with every row's μ
     // off its `clamp_mu` bound; a pinned row builds and factors it here
@@ -2412,7 +2441,7 @@ fn packed_assemble<T: Scalar>(
         *v *= T::from_f64(0.5);
     }
     for a_idx in 0..m {
-        let mut acc = phi * d_gamma[a_idx] + l_gamma[a_idx];
+        let mut acc = d_gamma[a_idx] + l_gamma[a_idx];
         for c in 0..k {
             acc -= adj[c] * g_gamma[a_idx * k + c];
         }
@@ -2642,6 +2671,11 @@ fn packed_hessian_chunks<T: Seed>(
                 &mut prob[..n],
                 &mut w[..n],
                 &mut [],
+            );
+            // The objective's curvature weight, as the mode solve's exit
+            // refresh stores it (`pirls::evaluate_at_mode`).
+            super::pirls::observed_weights_in_place(
+                family, nb_theta, y, prior_w, weighted, eta, prob, w, n,
             );
         }
         let assembled = packed_assemble(

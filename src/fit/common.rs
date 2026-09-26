@@ -35,7 +35,12 @@ use super::{Boundary, Diagnostics, Fit, FitOptions, Note};
 ///   empty and would suggest a per-route decision that does not exist.
 /// - `singular`: it is `boundary_hit == 1` on every route, ORed at
 ///   materialization with [`Fit::has_negligible_component`] — which reads the
-///   assembled `varcorr` and so cannot be decided at view level.
+///   assembled `varcorr` and so cannot be decided at view level. Both sides of
+///   that OR are only ever set on a converged fit: `boundary_hit == 1` latches
+///   only when the fit converged (a capped endpoint stays at `boundary_hit ==
+///   2`, "no optimum"), and `has_negligible_component` is checked only when
+///   materializing a converged `Fit`, so singularity is not assessed at all on
+///   a non-converged one.
 #[derive(Clone, Copy)]
 pub struct FitDiagnostics {
     /// Whether the fit reached its convergence criterion.
@@ -1055,7 +1060,8 @@ pub(super) fn fit_rank_deficient(
             Note::PirlsExhausted { .. }
             | Note::UnusedGroupingLevels { .. }
             | Note::ReDesignScaleSpread { .. }
-            | Note::HessianSeFallback => {}
+            | Note::HessianSeFallback
+            | Note::NbShapeUnsettled { .. } => {}
         }
     }
     // Same scatter in two dimensions: an aliased column has no coefficient, so
@@ -1122,8 +1128,15 @@ pub(super) fn assert_group_ids(re: &ReStructure, ids: &GroupIds, n: usize) {
 /// Fixed-only models (`re: None`) carry no RE caps to check.
 pub(super) fn assert_model_shape(model: &ModelSpec, p: usize, nagq: u8) {
     // nAGQ: odd, 1..=MAX_NAGQ; >1 only on a single grouping factor (no extras),
-    // q_p ≤ 3, binomial/Poisson GLMM — the shapes whose marginal likelihood is a
-    // product of independent per-cluster q-D integrals. Checked before the RE
+    // q_p ≤ 3, binomial/Poisson/negative-binomial/Gamma GLMM — the shapes whose
+    // marginal likelihood is a product of independent per-cluster q-D integrals of
+    // a `−½·Σ dev_resid` integrand (`glmm::agq`). NB qualifies because θ_NB enters
+    // the conditional density only through a per-row saturated term that is
+    // constant in u, so it factors out of every cluster integral and the driver
+    // adds it back outside (`nb_term`). Gamma qualifies too: φ divides the
+    // deviance inside the integral, which the kernels carry through the prior
+    // weights `wᵢ/φ`, and the rest of the log-density depends on φ alone and sits
+    // outside, as NB's term does. Checked before the RE
     // early-return so even fixed-only specs can't smuggle a bad nagq through.
     // `nagq` controls how the fit is computed, not what model is being fit, so
     // it is sourced from `FitOptions`, not the spec. Mirrors the Python layer's
@@ -1142,11 +1155,20 @@ pub(super) fn assert_model_shape(model: &ModelSpec, p: usize, nagq: u8) {
         let single_factor = re.extra_groupings.is_empty();
         let agq_family = matches!(
             model.family,
-            Family::Binomial { .. } | Family::Poisson { .. }
+            Family::Binomial { .. }
+                | Family::Poisson { .. }
+                | Family::NegativeBinomial { .. }
+                | Family::Gamma { .. }
+        );
+        // Two asserts, not one: each message names the condition that failed.
+        assert!(
+            agq_family,
+            "nagq>1 applies only to binomial, Poisson, negative-binomial and Gamma GLMMs, not {:?}",
+            model.family
         );
         assert!(
-            single_factor && agq_family,
-            "nagq>1 legal only on a single grouping factor, binomial/Poisson GLMM"
+            single_factor,
+            "nagq>1 needs a single grouping factor (no crossed or nested extra groupings)"
         );
         // q_p = 1 + #primary slopes. The q_p ≥ 4 refusal is a TEMPORARY cost /
         // oracle-coverage boundary (the k^q product grid and the dimension-generic

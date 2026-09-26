@@ -21,8 +21,7 @@ use glmm::loop_advanced::{
 };
 use serde_json::{json, Value};
 
-// path mirrors validation/engines layout — Task 6 renames it
-#[path = "../../engines/common.rs"]
+#[path = "../../tools/common.rs"]
 mod harness_common;
 use harness_common::*;
 

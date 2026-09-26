@@ -379,7 +379,7 @@ impl SparseLmmWorkspace {
     /// Accumulate the θ-independent Grams (`Z'Z`, `Z'[X y]`, `[X y]'[X y]`) in
     /// one pass over the rows and size every blocked-kernel buffer — all
     /// allocations happen here; the eval loop allocates nothing.
-    /// `sqrt_w`: `Some(√wᵢ)` per row (prior/case weights, `FitOptions::weights`
+    /// `sqrt_w`: `Some(√wᵢ)` per row (prior/precision weights, `FitOptions::weights`
     /// square-rooted once by the caller) — threaded into both the z-emission
     /// (`for_each_z_entry`) and pass 2's raw x/y reads below, so every packed
     /// Gram ends up carrying exactly `wᵢ` per row (see `for_each_z_entry`'s

@@ -1,0 +1,101 @@
+{
+  "dataset": "glmm_binomial",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "binomial",
+  "reml": null,
+  "rung": 38,
+  "converged": true,
+  "singular": false,
+  "optimizer": "Nelder_Mead",
+  "n_eval": 423,
+  "tolPwrss": 1e-13,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.280517824392994, 0.542255329899384],
+    "se_hessian": [0.466192716945214, 0.0550927125222419],
+    "se_rx": [0.466057156058594, 0.0543716599221378],
+    "loglik": -471.153287366076,
+    "varcomp": [
+      {
+        "group": "g1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.896140647956058],
+        "corr": [
+          [1]
+        ],
+        "stddev_se": [0.195098568512348]
+      },
+      {
+        "group": "c1",
+        "terms": ["(Intercept)"],
+        "stddev": [0.267532915303079],
+        "corr": [
+          [1]
+        ],
+        "stddev_se": [0.0932758277590009]
+      },
+      {
+        "group": "c2",
+        "terms": ["(Intercept)"],
+        "stddev": [0.417177233559727],
+        "corr": [
+          [1]
+        ],
+        "stddev_se": [0.124220791522956]
+      },
+      {
+        "group": "c3",
+        "terms": ["(Intercept)"],
+        "stddev": [0.603488285171233],
+        "corr": [
+          [1]
+        ],
+        "stddev_se": [0.167369538210317]
+      },
+      {
+        "group": "c4",
+        "terms": ["(Intercept)"],
+        "stddev": [0.498864030818674],
+        "corr": [
+          [1]
+        ],
+        "stddev_se": [0.143025504124524]
+      },
+      {
+        "group": "c5",
+        "terms": ["(Intercept)"],
+        "stddev": [0.215457277278086],
+        "corr": [
+          [1]
+        ],
+        "stddev_se": [0.0837515315623472]
+      },
+      {
+        "group": "c6",
+        "terms": ["(Intercept)"],
+        "stddev": [0.43123555496913],
+        "corr": [
+          [1]
+        ],
+        "stddev_se": [0.125413352325561]
+      },
+      {
+        "group": "c7",
+        "terms": ["(Intercept)"],
+        "stddev": [0.302095757542684],
+        "corr": [
+          [1]
+        ],
+        "stddev_se": [0.0984890886376511]
+      }
+    ]
+  },
+  "timing": {
+    "fit_seconds_median_rx": 0.557467937469482,
+    "fit_seconds_median_hessian": 0.557826519012451,
+    "n_runs": 4,
+    "warmup_discarded": 1,
+    "fits_per_sample": 1
+  }
+}

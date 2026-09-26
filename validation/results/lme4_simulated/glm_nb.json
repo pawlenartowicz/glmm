@@ -1,0 +1,25 @@
+{
+  "dataset": "glm_nb",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "negbin",
+  "reml": null,
+  "rung": 33,
+  "converged": true,
+  "singular": false,
+  "optimizer": "glm.nb",
+  "n_eval": 1,
+  "coef_names": ["(Intercept)", "x", "grpb"],
+  "estimates": {
+    "beta": [0.644176422698515, 0.412521271264321, 0.061668270097229],
+    "se_rx": [0.0888999859227549, 0.0604776655571647, 0.124042178350969],
+    "loglik": -667.191675088915,
+    "varcomp": []
+  },
+  "timing": {
+    "fit_seconds_median": 0.116517782211304,
+    "n_runs": 4,
+    "warmup_discarded": 1,
+    "fits_per_sample": 10
+  }
+}

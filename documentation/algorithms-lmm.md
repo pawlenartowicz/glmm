@@ -441,7 +441,7 @@ MixedModels.jl, and `glmm`, and gates β and varcomp std-devs at relative ~1e-3,
 the LMM `se` at ~1e-3, and the REML loglik at absolute ~1e-6. The committed data
 plus the reference JSONs are frozen and never regenerated to absorb a
 disagreement; a disagreement beyond the band passes only once it is registered
-in `validation/divergences.json`. The manifest currently carries 27 datasets (rungs 1–23 and
+in `validation/grid/divergences.json`. The manifest currently carries 27 datasets (rungs 1–23 and
 25–28; rung 24, the sparse Gamma, is backed out). The core Gaussian LMM rungs:
 
 | Rung | Dataset | Structure | Path exercised |
@@ -471,7 +471,7 @@ targets non-Gaussian GLMMs and defers Gaussian LMMs to nlme/lme4.)
 | Optimiser | BOBYQA via nloptwrap (default) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE) | BOBYQA (PRIMA), tuned `npt`/ρ schedule |
 | Linear algebra per eval | sparse Cholesky of `ΛᵀZᵀZΛ + I` (CHOLMOD), Z materialised | blocked/amalgamated Cholesky, Z materialised | dense path: **no Z at all** — sufficient statistics + family-block elimination, with a closed-form collapse for balanced single-intercept designs; sparse path: Schur-block Cholesky (AMD sparse tail) |
 | Singular fit | fits, `isSingular` warns | fits, flags | pins diagonal components ≤ `1e-4` to exact `0`, still `converged`, sets `Diagnostics::singular`/`Diagnostics::pinned` |
-| Optimiser cap-out | warns, returns last point | warns, returns last point | returns the best finite point, `converged: false`, `Diagnostics::boundary == Boundary::NoOptimum` — the same on the dense and the sparse kernel, since `fit_lmm` sets it once with no kernel branch |
+| Optimiser cap-out | warns, returns last point | warns, returns last point | returns the best finite point, `converged: false`, `Diagnostics::boundary == Boundary::NoOptimum` (the same on the dense and the sparse kernel, since `fit_lmm` sets it once with no kernel branch); glmm raises `search_limit` there |
 | BLUPs / `ranef` | yes | yes | not computed (deliberate — see [`coming-from-lme4.md`](coming-from-lme4.md)) |
 
 The rows that matter in practice: the **criterion lock** (comparing `glmm` to

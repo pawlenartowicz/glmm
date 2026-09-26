@@ -1,0 +1,25 @@
+{
+  "dataset": "glm_gamma",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "gamma",
+  "reml": null,
+  "rung": 32,
+  "converged": true,
+  "singular": false,
+  "optimizer": "glm.fit",
+  "n_eval": 5,
+  "coef_names": ["(Intercept)", "x", "grpb"],
+  "estimates": {
+    "beta": [0.544828724608307, 0.541585460021296, 0.39683144372329],
+    "se_rx": [0.0625380558306134, 0.0443479537938197, 0.0909329397325303],
+    "loglik": -348.8600237916,
+    "varcomp": []
+  },
+  "timing": {
+    "fit_seconds_median": 0.0141420364379883,
+    "n_runs": 4,
+    "warmup_discarded": 1,
+    "fits_per_sample": 10
+  }
+}

@@ -316,8 +316,13 @@ pub(crate) fn lmm_view_to_fit(
         ranef,
         ranef_levels,
     };
+    // A capped (`MaxFunReached`) endpoint is reported as a point, not an
+    // accepted optimum, even though `varcorr` is finite there — so the
+    // post-hoc negligible-component check only runs on a converged fit
+    // (mirrors `fit/glmm.rs`, same gate).
     fit.diagnostics.singular = fit.diagnostics.singular
-        || fit.has_negligible_component(&super::common::re_scale_grid(view.groupings));
+        || (lmm_fit.converged
+            && fit.has_negligible_component(&super::common::re_scale_grid(view.groupings)));
 
     // Weighted Gaussian log-density carries +½Σlog wᵢ per row; on the −2ℓ scale
     // the REML deviance gains −Σlog wᵢ (θ-independent — added post-optimization,

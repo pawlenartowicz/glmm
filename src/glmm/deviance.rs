@@ -48,7 +48,7 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
     _p: usize,
     n: usize,
     counters: &mut crate::counters::EvalCounters,
-) -> (T, bool, bool) {
+) -> (T, T, bool, bool) {
     crate::lmm::primary_lambda(
         &params[..groupings.n_theta()],
         groupings.primary_q,
@@ -76,18 +76,11 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
     );
     let raw_dev_finite = dev.value().is_finite();
     if !conv || !raw_dev_finite {
-        return (T::from_f64(f64::INFINITY), conv, raw_dev_finite);
+        return (T::from_f64(f64::INFINITY), dev, conv, raw_dev_finite);
     }
-    // Gamma substitutes its AIC-style objective for the bare deviance —
-    // rationale in `laplace_deviance`'s doc comment (`family::gamma_aic`);
-    // mirrors that branch, change together.
-    let data_term = if matches!(family, Family::Gamma { .. }) {
-        crate::family::gamma_aic(y, &scratch.prob, dev, n, Some(prior_w))
-    } else {
-        dev
-    };
     (
-        data_term + pen + T::from_f64(2.0) * logdet,
+        dev + pen + T::from_f64(2.0) * logdet,
+        dev,
         conv,
         raw_dev_finite,
     )
@@ -123,7 +116,7 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
     pirls_tol_override: Option<f64>,
     n: usize,
     counters: &mut crate::counters::EvalCounters,
-) -> (T, bool, bool) {
+) -> (T, T, bool, bool) {
     // Intercept-only crossed/nested ⇒ block-diagonal core + Schur on the
     // crossed width. The M = ZΛ nonzeros are packed once here (core slice +
     // crossed entries) instead of materializing a dense n×k M every eval; the
@@ -193,18 +186,11 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
     );
     let raw_dev_finite = dev.value().is_finite();
     if !conv || !raw_dev_finite {
-        return (T::from_f64(f64::INFINITY), conv, raw_dev_finite);
+        return (T::from_f64(f64::INFINITY), dev, conv, raw_dev_finite);
     }
-    // Gamma substitutes its AIC-style objective for the bare deviance —
-    // rationale in `laplace_deviance`'s doc comment (`family::gamma_aic`);
-    // mirrors that branch, change together.
-    let data_term = if matches!(family, Family::Gamma { .. }) {
-        crate::family::gamma_aic(y, &scratch.prob, dev, n, Some(prior_w))
-    } else {
-        dev
-    };
     (
-        data_term + pen + T::from_f64(2.0) * logdet,
+        dev + pen + T::from_f64(2.0) * logdet,
+        dev,
         conv,
         raw_dev_finite,
     )
@@ -213,11 +199,11 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
 /// Laplace deviance at (θ, β): rebuild M = ZΛ, solve the PIRLS conditional
 /// modes, then return `d(y,ũ) + ‖ũ‖² + log|A|` (A = M'WM + I at ũ). The +I in A
 /// is the same ridge the penalty `‖ũ‖²` carries — this is glmer's nAGQ=1 Laplace
-/// objective. Convention: the `d(y,ũ)` term is the family `aic` (glmer's own
-/// substitution), not the bare deviance — for binomial/Poisson `aic = D + const`
-/// (same minimizer, kept as `D` for byte-identity), but Gamma profiles the
-/// dispersion as `D/n` (`family::gamma_aic`), the sole route by which dispersion
-/// shifts glmer's β̂/τ̂. Non-convergence / Cholesky failure ⇒ `f64::INFINITY` (the
+/// objective. The `d(y,ũ)` term is the bare deviance on every family: the
+/// family's normalizing constants depend on the dispersion parameter alone (NB's
+/// θ, Gamma's φ), so the outer search adds them itself, and Gamma's `D` is
+/// `D/φ` here because PIRLS runs on `prior_wᵢ/φ` (`gamma_phi`). Non-convergence
+/// / Cholesky failure ⇒ `f64::INFINITY` (the
 /// module's failure surface, mirrors `lmm::reml_deviance`). Every PIRLS variant
 /// returns `log|L|` off its converged factor (L the Cholesky factor of A, so
 /// `log|A| = 2 log|L|`) — the caller below doubles it to get `log|A|`, so there
@@ -230,6 +216,9 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
 pub(crate) fn laplace_deviance(
     data: &FitData,
     nb_theta: f64,
+    // The Gamma dispersion this evaluation runs at (1.0 on every other family,
+    // unread there) — see the Gamma note in the body.
+    gamma_phi: f64,
     nagq: u8,
     params: &[f64],
     beta: &mut [f64],
@@ -247,6 +236,9 @@ pub(crate) fn laplace_deviance(
     // each PIRLS variant's Profile δβ step reads (mirrors `packed/blocked/structured
     // _schur_fill` in se.rs). All inert when `beta_mode == BetaMode::Fixed`.
     border: &mut BorderScratch,
+    // Row-sized scratch for `prior_wᵢ/φ`, rewritten on every Gamma evaluation
+    // at `gamma_phi ≠ 1` and untouched on every other family.
+    prior_w_phi: &mut [f64],
     // The caller-owned δβ RHS/solution scratch (BetaStep::Profile.beta_rhs) and
     // MUST be a distinct buffer from `beta` — Fixed callers pass `ws.beta_prof` here
     // (spare) and `ws.beta_rhs` as `beta`; the Profile caller passes `ws.beta_rhs`
@@ -321,8 +313,37 @@ pub(crate) fn laplace_deviance(
     // bypasses PIRLS entirely, so Profile there is undefined; the driver's
     // `stage1_mode.filter(|_| nagq == 1)` gate routes around it.
     debug_assert!(beta_mode == BetaMode::Fixed || nagq == 1);
+    // Gamma's Laplace objective measures misfit in units of the dispersion: the
+    // conditional modes minimize `D(b)/φ + ‖u‖²`, and `log|A|` is built from
+    // working weights carrying that same `1/φ`, while the ridge `‖u‖²` — the
+    // prior on b, which has no dispersion in it — does not. lme4 omits φ from
+    // both (1.1-38 `src/respModule.cpp` builds the PIRLS weights as
+    // `muEta·sqrt(weights/variance)`, no dispersion anywhere), which makes the
+    // data look `1/φ` times less informative, makes the ridge look `1/φ` times
+    // too expensive, and inflates θ̂ by roughly that factor; glmmTMB and
+    // GLMMadaptive both report the absolute-unit θ̂ the form below produces.
+    //
+    // Dividing the PRIOR WEIGHTS by φ is what puts the `1/φ` on the deviance,
+    // on the working weight AND on the IRLS residual in one place. That last
+    // one is the load-bearing part: scaling only the weight moves the PIRLS
+    // Hessian by `1/φ` while leaving the gradient alone, and the solve then
+    // converges to the mode of neither objective.
+    //
+    // φ is the caller's: the outer search carries `ln φ` as its trailing
+    // coordinate (`glmm::fit_glmm`) and adds the φ-only rest of the Gamma
+    // log-density (`family::gamma_dispersion_term`) itself, the way it adds
+    // NB's `nb_term`. So the value returned here is `D/φ + ‖u‖² + log|A|` on
+    // every family, and φ = 1 hands PIRLS the caller's own slice untouched.
+    let pirls_prior_w: &[f64] = if matches!(family, Family::Gamma { .. }) && gamma_phi != 1.0 {
+        for i in 0..n {
+            prior_w_phi[i] = prior_w[i] / gamma_phi;
+        }
+        &prior_w_phi[..n]
+    } else {
+        prior_w
+    };
     // AGQ (nagq>1) only on a single grouping factor (no extras), q_p ≤ 3,
-    // binomial/Poisson — the shapes where the marginal likelihood factorizes into
+    // binomial/Poisson/negative-binomial — the shapes where the marginal likelihood factorizes into
     // independent per-cluster q-D integrals (a k^q product quadrature). The
     // family/nagq/q_p terms are `derivative::agq_eligible`, shared with the
     // derivative path. Route by
@@ -354,7 +375,7 @@ pub(crate) fn laplace_deviance(
             z_buf,
             x,
             y,
-            prior_w,
+            pirls_prior_w,
             weighted,
             cluster_ids,
             None,
@@ -370,148 +391,135 @@ pub(crate) fn laplace_deviance(
         return dev;
     }
     let k = groupings.k_total;
-    // One BetaStep, moved into whichever PIRLS branch runs (the branches are
-    // mutually exclusive). Fixed leaves the border buffers untouched.
+    // Packed layout only: Λ and the packed `M` values at this θ.
+    if layout == GlmmLayout::Packed {
+        crate::sparse::fill_lambda_small(&params[..n_theta], groupings, &mut packed.lam_small);
+        fill_m_vals(packed, groupings, x, n);
+        // Fit-path evals (`pirls_tol_override == None`) carry the previous call's
+        // converged û forward as the starting point — fewer iterations to
+        // reconverge, same fixed point. Tight-tol evals (the FD-Hessian stencil)
+        // cold-seed û = 0, overriding the `u_seed` that `laplace_deviance_at` copied
+        // in. Both seeds are constant over the grid, so either makes every cell a
+        // pure function of `(γ̂, steps, design)` whatever order it runs in; the cold
+        // one is the one whose second differences match the assembled Hessian.
+        // Measured on `sim_sparse_gamma` (Gamma-log), diagonal entry of the first β
+        // coordinate: assembled 60.971162, stencil from û = 0 60.972707, stencil
+        // from `u_seed` −94.968163, which is indefinite and costs the fit its
+        // Hessian SE. The cold f0 there is 3427.047583 against the fit's 3427.047586.
+        if pirls_tol_override.is_some() {
+            pirls.u.fill(0.0);
+        }
+    }
+    // The branches are mutually exclusive, so the one `BetaStep` moves into
+    // whichever runs. Fixed leaves the border buffers untouched.
     let beta_step = match beta_mode {
         BetaMode::Fixed => BetaStep::Fixed,
         BetaMode::ProfilePql | BetaMode::ProfileExact => BetaStep::Profile {
-            exact: (beta_mode == BetaMode::ProfileExact).then_some(exact_prof),
-            xtwx,
-            xtwm,
-            ainv_mtwx,
-            schur,
-            beta_rhs: beta_step_rhs,
-            beta_prev,
-            schur_llt_mem,
+            exact: (beta_mode == BetaMode::ProfileExact).then_some(&mut *exact_prof),
+            xtwx: &mut *xtwx,
+            xtwm: &mut *xtwm,
+            ainv_mtwx: &mut *ainv_mtwx,
+            schur: &mut *schur,
+            beta_rhs: &mut *beta_step_rhs,
+            beta_prev: &mut *beta_prev,
+            schur_llt_mem: &mut *schur_llt_mem,
         },
     };
-    if layout == GlmmLayout::Blocked {
+    let (objective, conv, raw_dev_finite) = match layout {
         // No extras ⇒ A is block-diagonal: reconstruct mᵢ per row, never build M.
-        let (obj, conv, raw_dev_finite) = blocked_laplace_deviance(
-            family,
-            nb_theta,
-            groupings,
-            params,
-            beta,
-            pirls,
-            z_buf,
-            x,
-            y,
-            prior_w,
-            weighted,
-            cluster_ids,
-            None,
-            wx,
-            beta_step,
-            offset,
-            pirls_tol_override,
-            p,
-            n,
-            counters,
-        );
-        if !conv && raw_dev_finite && pirls_tol_override.is_none() {
-            *pirls_exhausted += 1;
+        GlmmLayout::Blocked => {
+            let (obj, _dev, conv, finite) = blocked_laplace_deviance(
+                family,
+                nb_theta,
+                groupings,
+                params,
+                beta,
+                pirls,
+                z_buf,
+                x,
+                y,
+                pirls_prior_w,
+                weighted,
+                cluster_ids,
+                None,
+                wx,
+                beta_step,
+                offset,
+                pirls_tol_override,
+                p,
+                n,
+                counters,
+            );
+            (obj, conv, finite)
         }
-        counters.commit_pirls_iters();
-        return obj;
-    }
-    if layout == GlmmLayout::Structured {
-        let (obj, conv, raw_dev_finite) = structured_laplace_deviance(
-            family,
-            nb_theta,
-            groupings,
-            params,
-            z_buf,
-            extra_ids,
-            cluster_ids,
-            pirls,
-            structured,
-            pattern,
-            x,
-            y,
-            prior_w,
-            weighted,
-            beta,
-            beta_step,
-            None,
-            wx,
-            offset,
-            pirls_tol_override,
-            n,
-            counters,
-        );
-        // Same iteration-cap-exhaustion discriminator as the shared tail below
-        // (see its comment): `raw_dev_finite` alongside `!conv` is the natural
-        // exhaustion case, not a hard (NaN) failure.
-        if !conv && raw_dev_finite && pirls_tol_override.is_none() {
-            *pirls_exhausted += 1;
+        GlmmLayout::Structured => {
+            let (obj, _dev, conv, finite) = structured_laplace_deviance(
+                family,
+                nb_theta,
+                groupings,
+                params,
+                z_buf,
+                extra_ids,
+                cluster_ids,
+                pirls,
+                structured,
+                pattern,
+                x,
+                y,
+                pirls_prior_w,
+                weighted,
+                beta,
+                beta_step,
+                None,
+                wx,
+                offset,
+                pirls_tol_override,
+                n,
+                counters,
+            );
+            (obj, conv, finite)
         }
-        counters.commit_pirls_iters();
-        return obj;
-    }
-    // The packed-row layout: Λ and the packed `M` values at this θ, then the
-    // dense `k×k` PIRLS over the fixed-width rows.
-    crate::sparse::fill_lambda_small(&params[..n_theta], groupings, &mut packed.lam_small);
-    fill_m_vals(packed, groupings, x, n);
-    // Fit-path evals (`pirls_tol_override == None`) carry the previous call's
-    // converged û forward as the starting point — fewer iterations to
-    // reconverge, same fixed point. Tight-tol evals (the FD-Hessian stencil)
-    // cold-seed û = 0, overriding the `u_seed` that `laplace_deviance_at` copied
-    // in. Both seeds are constant over the grid, so either makes every cell a
-    // pure function of `(γ̂, steps, design)` whatever order it runs in; the cold
-    // one is the one whose second differences match the assembled Hessian.
-    // Measured on `sim_sparse_gamma` (Gamma-log), diagonal entry of the first β
-    // coordinate: assembled 60.971162, stencil from û = 0 60.972707, stencil
-    // from `u_seed` −94.968163, which is indefinite and costs the fit its
-    // Hessian SE. The cold f0 there is 3427.047583 against the fit's 3427.047586.
-    if pirls_tol_override.is_some() {
-        pirls.u.fill(0.0);
-    }
-    let (dev, pen, logdet, conv) = pirls_solve_packed(
-        family,
-        nb_theta,
-        k,
-        p,
-        x,
-        y,
-        prior_w,
-        weighted,
-        beta,
-        beta_step,
-        pirls,
-        packed,
-        wx,
-        offset,
-        pirls_tol_override,
-        n,
-        counters,
-    );
-    // `!conv` with a FINITE `dev` is exactly the natural iteration-cap
+        // The packed-row layout: the dense `k×k` PIRLS over the fixed-width rows.
+        GlmmLayout::Packed => {
+            let (dev, pen, logdet, conv) = pirls_solve_packed(
+                family,
+                nb_theta,
+                k,
+                p,
+                x,
+                y,
+                pirls_prior_w,
+                weighted,
+                beta,
+                beta_step,
+                pirls,
+                packed,
+                wx,
+                offset,
+                pirls_tol_override,
+                n,
+                counters,
+            );
+            if !conv || !dev.is_finite() {
+                (f64::INFINITY, conv, dev.is_finite())
+            } else {
+                (dev + pen + 2.0 * logdet, conv, true)
+            }
+        }
+    };
+    // `!conv` with a FINITE raw deviance is exactly the natural iteration-cap
     // exhaustion: the three PIRLS variants return `(NaN, NaN, NaN, false)` from
     // every OTHER failure path (halving exhausted, non-PD Cholesky), so a
-    // finite `dev` alongside `!conv` can only mean the `for` loop ran out its
+    // finite deviance alongside `!conv` can only mean the `for` loop ran out its
     // `PIRLS_MAX_ITERS` iterations still inside a rising/falling accepted
     // sequence. Gated on `pirls_tol_override.is_none()` — the FD-Hessian SE
     // evals run their own tight tolerance and must not count — the same
-    // fit-path-vs-FD-eval discriminator the cold seed above uses.
-    if !conv && dev.is_finite() && pirls_tol_override.is_none() {
+    // fit-path-vs-FD-eval discriminator the packed cold seed above uses.
+    if !conv && raw_dev_finite && pirls_tol_override.is_none() {
         *pirls_exhausted += 1;
     }
     counters.commit_pirls_iters();
-    if !conv || !dev.is_finite() {
-        return f64::INFINITY;
-    }
-    // glmer substitutes the family `aic` for the bare deviance in the Laplace
-    // objective. For binomial/Poisson `aic = D + const` (same minimizer — kept as
-    // `dev` for byte-identity), but Gamma's `aic` profiles the dispersion as `D/n`,
-    // making it a nonlinear function of `D` — the sole route by which the dispersion
-    // shifts glmer's β̂/τ̂ (see `family::gamma_aic`). `prob` holds μ̂ at the mode.
-    let data_term = if matches!(family, Family::Gamma { .. }) {
-        crate::family::gamma_aic(y, &pirls.prob, dev, n, Some(prior_w))
-    } else {
-        dev
-    };
-    data_term + pen + 2.0 * logdet
+    objective
 }
 
 /// Evaluate the joint Laplace deviance at the params CURRENTLY in `ws.params`
@@ -577,6 +585,7 @@ pub(crate) fn laplace_deviance_ws(
 ) -> f64 {
     let family = ws.family;
     let nb_theta = ws.nb_theta;
+    let gamma_phi = ws.gamma_phi;
     let nagq = ws.nagq;
     let pirls_tol_override = ws.fd.pirls_tol_override;
     let weighted = ws.weighted;
@@ -590,6 +599,7 @@ pub(crate) fn laplace_deviance_ws(
         packed,
         z_buf,
         prior_w,
+        prior_w_phi,
         pirls,
         wx,
         structured,
@@ -625,6 +635,7 @@ pub(crate) fn laplace_deviance_ws(
     laplace_deviance(
         &data,
         nb_theta,
+        gamma_phi,
         nagq,
         &prm[..],
         beta,
@@ -634,6 +645,7 @@ pub(crate) fn laplace_deviance_ws(
         pattern,
         packed,
         border,
+        prior_w_phi,
         beta_step_rhs,
         exact_prof,
         beta_mode,

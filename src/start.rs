@@ -8,10 +8,11 @@
 //! `theta_start = None`. Shared internal primitive: `pub(crate)`
 //! always, and now unconditionally `pub` (a stable input to `fit_warm`).
 //!
-//! Carries only `beta`/`theta`: Gamma φ is profiled (`family::gamma_aic`, no
-//! warm-startable state) and the GLMM negative-binomial θ_NB, though a
-//! coordinate of the outer search, has no slot here yet — the dense route
-//! cold-starts it from the no-RE GLM-NB's own θ̂ (`fit::fit_glm_nb`).
+//! Carries only `beta`/`theta`: the GLMM negative-binomial θ_NB and the mixed
+//! Gamma `ln φ`, though coordinates of the outer search, have no slot here
+//! yet — the dense route cold-starts θ_NB from the no-RE GLM-NB's own θ̂
+//! (`fit::fit_glm_nb`) and `ln φ` from the no-RE deviance dispersion
+//! (`glmm::fit_glmm`).
 
 /// Raw optimizer warm-start state for one model fit.
 ///

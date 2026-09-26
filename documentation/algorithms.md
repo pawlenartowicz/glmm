@@ -149,7 +149,7 @@ and are not user-facing.
 | `wald_se` | `Hessian` (default) vs `Rx` Wald covariance | GLMM only — [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (ignored on OLS/GLM/LMM) |
 | `nagq` | AGQ node count, default 1 (Laplace) | GLMM only — [`algorithms-glmm.md`](algorithms-glmm.md#adaptive-gausshermite-quadrature-agq) |
 | `dispersion` | Gamma φ directive: `None` estimates, `Some(v)` fixes | [GLM Gamma](#generalised-linear-models-glm) here; Gamma GLMM in [`algorithms-glmm.md`](algorithms-glmm.md#laplace-approximation) |
-| `weights` | per-row prior (case) weights `wᵢ` | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages, **including** AGQ (`nagq > 1`) on the binomial/Poisson shapes AGQ covers |
+| `weights` | per-row prior weights `wᵢ`: precision weights on every family with an estimated dispersion (row `i` has dispersion `φ/wᵢ`) — Gaussian, Gamma, inverse-Gaussian; trial counts on aggregated Binomial; same fit either way on Poisson; multiply the log-likelihood on NB. See [`conventions.md`](conventions.md#prior-weights) | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages, **including** AGQ (`nagq > 1`) on the binomial/Poisson shapes AGQ covers |
 | `offset` | per-row offset `oᵢ` added to the linear predictor | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages |
 | `parallel_inner` | experimental opt-in to parallel inner kernels | GLMM only — AGQ/FD-Hessian, [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (off by default, bit-identical to serial) |
 
@@ -340,16 +340,42 @@ mixed PIRLS loop *does* step-halve, because there it mirrors lme4 — see
 [`algorithms-glmm.md`](algorithms-glmm.md#pirls-inner-loop).)
 
 **Dispersion.** Binomial and Poisson hold `φ ≡ 1`, so `(XᵀWX)⁻¹` is the full
-covariance. **Gamma** recovers `φ` post-fit: the mean model is φ-independent, so
-φ stays out of the IRLS, and either `FitOptions::dispersion = Some(v)` fixes it
-or `None` estimates the Pearson moment `φ̂ = Σ wᵢrᵢ²/(n − p)` (Pearson residual
-`rᵢ = (yᵢ − μ̂ᵢ)/√V(μ̂ᵢ)`, raw-row df) — matching
-`summary(glm(family=Gamma))$dispersion`; the SE is then scaled by `√φ̂`. One
-subtlety: Gamma's `Fit::loglik` is built from `family::gamma_aic`, which
-profiles its *own* dispersion as `D/Σwᵢ` — a different estimate from the
-Pearson `φ̂` that scales the SE. R mixes the same two conventions between
-`logLik()` and `summary()`, and `glmm` matches R on both; `Fit::loglik`
-therefore cannot be reconstructed from `Fit::dispersion`.
+covariance. **Gamma** recovers `φ` post-fit: the mean model is φ-independent,
+so φ stays out of the IRLS, and either `FitOptions::dispersion = Some(v)`
+fixes it or `None` estimates it by maximum likelihood. `weights` is a
+precision weight here, the same convention as `lm`, `summary(glm)`, and
+glmm's own Gaussian path: row `i` has dispersion `φ/wᵢ`, so its shape is
+`aᵢ = wᵢ/φ` (see [`conventions.md`](conventions.md#prior-weights)). φ̂ is
+the root of `Σᵢ wᵢ·(ln aᵢ − ψ₀(aᵢ)) = D/2` (`family::gamma_ml_dispersion`;
+at unit weights this is `MASS::gamma.shape`'s equation). Rescaling every
+weight by a constant `c` scales φ̂ by the same `c` and changes nothing else
+about the fit, so the ML search itself runs on weights normalised by
+`w̄ = 2^round(mean(log₂ wᵢ))` — a power of two near the geometric mean of
+the weights, exactly `1` when unweighted (`ŵᵢ = wᵢ/w̄`) — the search box and
+the starting point then stay fixed regardless of the weights' own scale —
+and the reported `φ̂ = w̄·φ̂_int` multiplies the internal root back onto the
+raw scale. An arithmetic mean would let one outlier weight push `φ_int` out
+of its search box; a power of two also keeps rescaling by a power of two
+exact. Unweighted fits skip the division, so they keep their exact
+arithmetic.
+
+`Fit::dispersion` reports the Pearson moment
+`φ̂_Pearson = Σ wᵢrᵢ²/(n − p)` (raw weights, raw-row df), and the SE is
+scaled by its square root — `summary(glm)`'s convention exactly, at every
+weight scale. `Fit::loglik` is `−½·(D/φ + Gₚ)`, with the raw (un-normalised)
+`D` and at `φ = w̄·φ̂_int` (or a held `v`), but `Gₚ` itself — the same
+`family::gamma_dispersion_term` the mixed path uses — is read on the
+normalised `ŵ` at `ln(φ/w̄)` rather than on raw `w` at `ln φ`; the two give
+the same value (`aᵢ = wᵢ/φ = ŵᵢ/(φ/w̄)`), so this is only the solver staying
+on the one numerically stable scale it already searched on. `Fit::loglik` is
+thus the maximised log-likelihood of the precision model, so a Gamma GLM and
+a Gamma GLMM report comparable log-likelihoods. β is `stats::glm`'s.
+`logLik(glm)` still differs from `Fit::loglik`: R's
+`logLik.glm` treats `weights` as case weights — it multiplies each row's
+log-density by `wᵢ` — and plugs in `D/Σwᵢ` for φ, which is neither the
+precision model's maximum nor `summary(glm)`'s Pearson value.
+**Inverse-Gaussian** keeps the Pearson moment `φ̂ = Σ wᵢrᵢ²/(n − p)`
+(raw-row df), `summary(glm)`'s, unchanged.
 
 **Negative-binomial outer θ-loop.** `fit_glm_nb` alternates, `MASS::glm.nb`-style:
 (1) fit the GLM at fixed θ; (2) 1-D maximise the NB profile log-likelihood

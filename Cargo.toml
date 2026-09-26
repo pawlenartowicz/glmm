@@ -1,6 +1,6 @@
 [package]
 name = "glmm"
-version = "0.4.0"
+version = "0.4.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -55,12 +55,12 @@ alloc-tests = []
 # unaffected.
 counters = []
 # Tier 2, the cross-engine tier: asserts the crate against the frozen lme4 /
-# MixedModels / GLMMadaptive goldens in `validation/goldens/` at `validation/tol.R`'s
-# agreement bands. OFF by default because it is slow — it refits all 35 goldens
+# MixedModels / GLMMadaptive goldens in `validation/goldens/` at `validation/grid/tol.R`'s
+# agreement bands. OFF by default because it is slow — it refits all 50 goldens
 # — and because CI runs the validated-answer tier instead. Reads frozen
 # JSON, so it needs neither R nor Julia. Named for the claim, not the cost, and
-# NOT `--oracles`, which is `run.sh`'s flag for refitting the references
-# themselves — a different act. Preferred over `#[ignore]` so the tier is
+# NOT an oracle run of the accuracy grid, which refits the references themselves
+# — a different act. Preferred over `#[ignore]` so the tier is
 # greppable and its absence from a run is visible rather than silent.
 oracle-tests = []
 # In-fit parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool.

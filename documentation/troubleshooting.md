@@ -1,5 +1,8 @@
 # Troubleshooting
 
+See [`warnings.md`](warnings.md) for every warning a fit raises and what to
+do about it.
+
 ## The fit is singular (isSingular is TRUE)
 
 `singular` means a random-effect variance component landed at, or negligibly
@@ -11,7 +14,7 @@ estimate, just one where the data can't support the random-effect structure
 you asked for. Simplify the RE structure — drop a random slope, drop a
 grouping factor — and refit.
 
-## Warning: ill-conditioned / entangled columns
+## Warning: Nearly collinear columns
 
 Two or more fixed-effect columns are near-collinear but not exactly
 redundant — the design is computable and the fit is real. The estimates are
@@ -41,7 +44,7 @@ hard to compare by eye. Rescale the offending variable (e.g. divide a
 day-of-experiment slope by 100, or convert a raw count to thousands) so the
 reported stddevs land on comparable magnitudes.
 
-## Warning: Hessian-based standard errors fell back to RX
+## Warning: Simpler standard errors used
 
 `wald_se="hessian"` (Python) / `wald.se = "hessian"` (R) was requested, but
 the joint Hessian this GLMM's SE pass builds was not usable. Either it was
@@ -59,10 +62,22 @@ entirely.
 ## converged is false
 
 `converged` reports whether the optimizer reached its convergence criterion.
-`false` means `se`, `vcov`, and `dispersion` come back NaN-filled — see
-[`conventions.md#flags-on-the-result`](conventions.md#flags-on-the-result)
-for the exact per-field fallback (an LMM that hits its evaluation cap is a
-partial exception: it still reports a finite endpoint `deviance`).
+What `false` means for the rest of the result depends on how the fit ended:
+see [`conventions.md#flags-on-the-result`](conventions.md#flags-on-the-result)
+for the exact per-field fallback, and `warnings.md` for the severe warning
+that always comes with it (exactly one is raised on every non-converged fit):
+
+- **A budget stop on an LMM or GLMM** (`search_limit`): the search used its
+  evaluation budget before settling. Coefficients, standard errors, the
+  covariance matrix, dispersion, `tau2` and `varcorr` are all reported at the
+  best point the search found. `stddev_se`, `fitted` and the random-effect
+  modes stay empty; a GLMM's `df` is 0 (an LMM's is its usual value, since the
+  budget stop does not change how many parameters it counted). Nothing checks
+  how close that point is to the optimum.
+- **A failed fit** (`fit_failed`, `glm_diverged`, `design_unsolvable`,
+  `constant_response`, `too_few_rows`, `no_coefficients`): the fit stopped on
+  a degenerate configuration and reports no estimates: every relevant field
+  is NaN or empty.
 
 First things to check: the scale of your predictors (wildly different
 magnitudes across columns make the optimizer's job harder), and whether the
@@ -91,10 +106,10 @@ it — wait for the knob to land, or restructure the model to avoid it
 
 ## Warning: falling back to Laplace
 
-`nagq`/`nAGQ` only takes effect on one narrow shape: a binomial or Poisson
-GLMM with a single grouping factor and up to 3 random effects per group,
-with an odd node count up to 25. Any other shape — multiple grouping
-factors, more REs per group, a non-binomial/Poisson family — warns and
+`nagq`/`nAGQ` only takes effect on one shape: a binomial, Poisson,
+negative-binomial or Gamma GLMM with a single grouping factor and up to 3
+random effects per group, with an odd node count up to 25. Any other shape —
+multiple grouping factors, more REs per group, a Gaussian model — warns and
 silently falls back to Laplace (`nAGQ = 1`) instead of honoring the
 requested node count.
 

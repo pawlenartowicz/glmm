@@ -9,8 +9,7 @@ use std::time::Instant;
 use glmm::fit_cold;
 use serde_json::{json, Value};
 
-// path mirrors validation/engines layout — Task 6 renames it
-#[path = "../../engines/common.rs"]
+#[path = "../../tools/common.rs"]
 mod harness_common;
 use harness_common::*;
 
@@ -70,7 +69,7 @@ fn main() {
 }
 
 /// θ̂ in the common cross-engine schema, one entry per grouping factor, from
-/// `Fit::stddev_corr` (arbitrary q) — same shape as `engines/glmm.rs::varcomp`
+/// `Fit::stddev_corr` (arbitrary q) — same shape as `grid/engines/glmm.rs::varcomp`
 /// (minus the reference-order reindex: the diligent run's R side joins by
 /// group name, not position) and R's `varcomp_of`/`goldens_agq.R`'s
 /// GLMMadaptive branch, so all three engines' diligent output is directly
@@ -306,7 +305,7 @@ fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
             rec["se"] = nums(&f.se);
             // theta hat (diligent-run recording, spec Part 6): reduced to
             // stddev+corr per grouping via `Fit::stddev_corr`, mirroring
-            // `engines/glmm.rs::varcomp`/R's `varcomp_of` schema so the three
+            // `grid/engines/glmm.rs::varcomp`/R's `varcomp_of` schema so the three
             // runners join on the same field. Empty for fixed-only fits (no
             // `re_groups`). `include_se` mirrors fit.rs: only the mixed
             // non-Gaussian path has a populated `stddev_se` (scalar groupings).

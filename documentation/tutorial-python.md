@@ -2,13 +2,13 @@
 
 One page, four sections. The first walks the single entry point — `glmm.fit` —
 end to end; the next two go deeper into the knobs and the returned `Fit`; the
-fourth is a short note on warm starts. The Python surface is deliberately tiny:
-**eight public names**, `glmm.fit`, `glmm.Fit`, and the six warning categories
-the diagnostics channel raises — `glmm.DiagnosticWarning` (the base) plus
-`glmm.IllConditionedWarning`, `glmm.PirlsExhaustedWarning`,
-`glmm.UnusedGroupingLevelsWarning`, `glmm.ReDesignScaleWarning` and
-`glmm.HessianSeFallbackWarning`. Everything else (families, links, knobs)
-is a string or scalar argument, not a type.
+fourth is a short note on warm starts. The Python surface is deliberately
+tiny: `glmm.fit`, `glmm.Fit`, and a family of warning categories, all
+subclasses of `glmm.DiagnosticWarning`, that `fit` can raise. Every warning it
+raises is also appended to `fit.warnings`; see
+[`warnings.md`](warnings.md) for the full list of kinds, tiers and messages
+(that page is the single source, not this one). Everything else (families,
+links, knobs) is a string or scalar argument, not a type.
 
 > **Status:** this release ships the full API surface — signatures, argument
 > validation, `Fit`, `summary()` — wired end to end through the PyO3 binding:
@@ -90,11 +90,16 @@ string only where the kernel offers a choice:
 fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
 ```
 
-- `dispersion` — three states. `None` (default): gamma and inverse-Gaussian
-  estimate φ̂ post-fit by Pearson and scale SE by √φ̂; other families hold
-  φ ≡ 1. `"estimate"`:
-  force the Pearson estimate — on binomial/poisson this
-  *is* quasi-binomial/quasi-Poisson, GLM only. A float: hold φ fixed (still
+- `dispersion` — three states. `None` (default): gamma estimates φ̂ by
+  maximum likelihood on both a GLM and a GLMM, to place `fit.loglik` at its
+  maximum, but the two routes report and scale the SE by different numbers:
+  a GLM's `fit.dispersion` is the Pearson moment `Σ wᵢrᵢ²/(n−p)`
+  (`summary(glm)`'s convention), a GLMM's is that ML φ̂ itself.
+  Inverse-Gaussian (GLM only) estimates φ̂ by the Pearson moment and scales
+  its SE by it; other families hold φ ≡ 1. `"estimate"`:
+  the same estimate as `None` on gamma and inverse-Gaussian; on
+  binomial/poisson it would force a Pearson estimate — this *is*
+  quasi-binomial/quasi-Poisson, GLM only. A float: hold φ fixed (still
   scales SE). Fix-vs-estimate, not a warm start.
 - `nagq` — adaptive Gauss–Hermite node count; `1` = Laplace (default). Must
   be odd and ≤ 25. `>1` applies to binomial/Poisson models with a single
@@ -109,9 +114,13 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
   always runs. Distinct from `warm_start["theta"]`, the random-effect Cholesky
   start (§4): unrelated knobs that happen to share a Greek letter, which is why
   this one is not just called `theta`. Both may be passed in one call.
-- `weights` — per-row prior (case) weights, lme4's `weights=`. For an
-  aggregated binomial, `y` is the success *proportion* and `weights` the
-  trial count (lme4's `cbind(s, m−s)`).
+- `weights` — per-row prior weights, lme4's `weights=`. On gaussian, gamma
+  and inverse-gaussian these are precision weights: row `i` gets dispersion
+  `φ/wᵢ`, the same convention as `lm`, `summary(glm)` and lme4, not
+  glmmTMB's, which multiplies each row's log-density by `wᵢ` instead (see
+  [`conventions.md`](conventions.md#prior-weights)). For an aggregated
+  binomial, `y` is the success *proportion* and `weights` the trial count
+  (lme4's `cbind(s, m−s)`).
 - `offset` — per-row known additive term on the linear-predictor scale, R's
   `offset=`: `eta = offset + X*beta (+ Z*b)`, with no coefficient estimated
   for it and no column added to the design. The canonical use is a Poisson
@@ -161,14 +170,16 @@ them). It is returned by `fit`, never constructed by callers.
 | `singular` | boundary (singular) fit — `>=1` RE variance component pinned at 0; mirrors lme4's `isSingular` |
 | `diagnostics` | dict with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; `converged`/`singular`/`aliased` above are `@property` forwarders over `diagnostics[...]`, kept at the top level for the most-read fields |
 
-**Diagnostic warnings.** `fit` raises a warning for each `note` the kernel
-records, one of `IllConditionedWarning`, `PirlsExhaustedWarning`,
-`UnusedGroupingLevelsWarning`, `ReDesignScaleWarning` or
-`HessianSeFallbackWarning`, every one a subclass of the base category
-`DiagnosticWarning`. A design that is merely ill-conditioned (near-collinear
-but still distinguishable in f64) is fitted and returns real numbers; the
-warning is how you find out its standard errors are honest but large. Filter
-the whole channel, or just one category:
+**Warnings.** `fit` raises a warning for anything worth knowing about the fit
+(a kernel note such as ill-conditioning, an ignored argument, or a
+non-convergence), each as its own subclass of `DiagnosticWarning`, and stores
+the same information as a dict (`tier`, `kind`, `title`, `message`) in
+`fit.warnings`, in the order raised. `warnings.md` lists every kind; match on
+`kind` in scripts, since the title and message text can change between
+versions. A design that is merely ill-conditioned (near-collinear but still
+distinguishable in f64) is fitted and returns real numbers; the warning is how
+you find out its standard errors are honest but large. Filter the whole
+channel, or just one category:
 
 ```python
 import warnings
@@ -195,7 +206,10 @@ p** — prints it, and returns it as a string. Aliased columns show `NaN`
 estimates, as lme4 prints `NA`. A footer carries `dispersion`,
 `converged` and `singular`, and when `varcorr` is non-empty an RE block shows each grouping
 by name with its per-term stddev / correlation (lme4's `VarCorr` layout) and
-`stddev_se` alongside where populated — the names come from `re_groups`. The z/p columns are derived in Python from `beta`/`se` as a
+`stddev_se` alongside where populated (the names come from `re_groups`). When the fit
+raised any warnings, the text summary ends with a `Warnings:` section listing each one's
+tier, title and message; the HTML, LaTeX and Typst renderers do not include it. The z/p
+columns are derived in Python from `beta`/`se` as a
 Wald test (`z = beta/se`, `p = 2·(1 − Φ(|z|))`); Wald-z (not t) matches the
 GLM/GLMM convention and the absence of a residual-df field on the kernel
 output.

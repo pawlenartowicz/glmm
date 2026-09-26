@@ -3,8 +3,8 @@
 #   Rscript counters.R <laplace.jsonl> <agq.jsonl> <out.csv> [baseline.csv]
 # Laplace/LMM pass: campaigns/speed-grid, no nagq key, counters 1-3
 # (stage1_evals, stage2_evals, stage1_shrink_evals, stage2_shrink_evals,
-# pirls_hist). AGQ pass: campaigns/estimate-grid restricted to its 33 nagq
-# cells, counter 4 (agq_evals, agq_node_evals). family/structure/n_theta/p
+# pirls_hist). AGQ pass: the 33 nagq cells of estimate-grid-manifest.json,
+# counter 4 (agq_evals, agq_node_evals). family/structure/n_theta/p
 # are not in the JSONL records -- both passes' manifests carry them per
 # case_id, so we join on that (same convention as analyze.R's `cells` join).
 # The optional 4th argument writes the speed baseline: one row per
@@ -21,13 +21,13 @@ args <- commandArgs(TRUE)
 if (length(args) < 3) stop("usage: counters.R laplace.jsonl agq.jsonl out.csv [baseline.csv]")
 suite_dir <- normalizePath(dirname(sub(
   "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))))
-# read_jsonl / manifest_cells live in tol.R (shared with the analyze.R scripts).
-source(file.path(suite_dir, "..", "..", "tol.R"))
+# read_jsonl / manifest_cells live in common.R (shared with analyze.R).
+source(file.path(suite_dir, "common.R"))
 
 laplace <- read_jsonl(args[1]); agq <- read_jsonl(args[2])
 
 laplace_cells <- manifest_cells(file.path(suite_dir, "manifest.json"))
-agq_cells <- manifest_cells(file.path(suite_dir, "..", "estimate-grid", "manifest.json"))
+agq_cells <- manifest_cells(file.path(suite_dir, "estimate-grid-manifest.json"))
 
 hist_zero <- function(x) if (is.null(x)) integer(0) else x
 

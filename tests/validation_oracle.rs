@@ -1,9 +1,9 @@
 //! Tier 2 — the cross-engine tier.
 //!
-//! Asserts the crate against the frozen lme4 / MASS / GLMMadaptive references at
-//! `validation/tol.R`'s agreement bands: 50 goldens in `validation/goldens/` plus the
-//! weights tier (rungs 29-43) in `validation/results/lme4_simulated/`. Reads frozen
-//! JSON, so it needs neither R nor Julia at runtime — but it refits all 65, so
+//! Asserts the crate against the frozen lme4 / MASS / GLMMadaptive / glmmTMB references
+//! at `validation/grid/tol.R`'s agreement bands: 61 goldens in `validation/goldens/` plus
+//! the weights tier (rungs 29-43) in `validation/results/lme4_simulated/`. Reads frozen
+//! JSON, so it needs neither R nor Julia at runtime — but it refits all 76, so
 //! it is off by default:
 //!
 //! ```sh
@@ -12,13 +12,12 @@
 //!
 //! A failure here means glmm and the reference no longer agree by more than the
 //! calibration allowed. There are exactly three honest endings: a bug in glmm
-//! (fix it), a documented expected divergence (add the entry, under review), or
+//! (fix it), a documented expected divergence (add the entry), or
 //! a reference-vs-reference gap. Widening a band
 //! to make red go green is none of them.
 //!
-//! This is NOT `validation/run.sh`, which refits R and Julia to check the frozen
-//! values still reflect what the references say today. Different claims, both
-//! kept; `run.sh --rust-tier2` runs this then that.
+//! This is NOT `validation/grid/run.sh`, which refits the external oracles to check
+//! what they say today. Different claims, both kept.
 #![cfg(all(feature = "oracle-tests", feature = "formula"))]
 
 mod oracle_support;
@@ -68,6 +67,102 @@ fn dev_align_none_matches_the_six_vector_agq_goldens() {
     }
 }
 
+/// The goldens whose reference maximises a different objective from glmm's
+/// (`objective_differs`), pinned by name as the six above are, and each with a
+/// twin in the corpus — glmmTMB (`_tmb`) for the lme4 GLMMs, the ML-dispersion
+/// GLM (`_ml`) for the `stats::glm` Gamma GLMs — since the twin is what gates
+/// glmm's deviance on that data and model.
+#[test]
+fn objective_differs_matches_the_pinned_goldens() {
+    let expect = [
+        ("cbpp_probit_glmm", "_tmb"),
+        ("sim_cloglog_glmm", "_tmb"),
+        ("sim_gamma_glmm", "_tmb"),
+        ("sim_gamma_inv_glmm", "_tmb"),
+        ("sim_sparse_gamma", "_tmb"),
+        ("sim_nb_glmm", "_tmb"),
+        ("sim_nb_nested_glmm", "_tmb"),
+        ("sim_sparse_nb", "_tmb"),
+        ("sim_gamma_glm", "_ml"),
+        ("sim_gamma_inv_glm", "_ml"),
+        ("sim_scale_gamma_inv_glm", "_ml"),
+        // Weights tier: no twin. Its precision loglik is gated against R
+        // directly by `fit::glm_tests::fit_glm_gamma_weighted_matches_r`.
+        ("glm_gamma", ""),
+    ];
+    let names: std::collections::BTreeSet<String> =
+        corpus().into_iter().map(|(g, _)| g.name).collect();
+    for (g, _) in corpus() {
+        assert_eq!(
+            objective_differs(&g).is_some(),
+            expect.iter().any(|(n, _)| *n == g.name),
+            "{}: objective_differs disagrees with the pinned set",
+            g.name
+        );
+    }
+    for (n, suffix) in expect.into_iter().filter(|(_, s)| !s.is_empty()) {
+        let twin = format!("{n}{suffix}");
+        assert!(names.contains(&twin), "{n}: no twin `{twin}` in the corpus");
+        let t = load_golden(&twin);
+        let engine = match suffix {
+            "_tmb" => "glmmTMB::glmmTMB",
+            _ => "stats::glm+ML-dispersion",
+        };
+        assert_eq!(t.engine, engine, "{twin}: twin is not a {engine} golden");
+        assert!(
+            objective_differs(&t).is_none(),
+            "{twin}: the twin must stay in the deviance gate"
+        );
+    }
+}
+
+/// Why a golden's deviance cannot be compared with glmm's, when it cannot.
+///
+/// lme4's `glmer` builds the Laplace log-determinant from the expected (Fisher)
+/// weight, and on a non-canonical link that is not the curvature of the
+/// integrand at the mode, so its logLik is a different function of the
+/// parameters; on Gamma it also plugs in its `pwrss/n` scale instead of
+/// maximising over φ. glmm maximises the Laplace approximation itself, and gates
+/// its deviance against the glmmTMB twin of each such golden. The parameters
+/// are still compared, and their differences are registered divergences.
+///
+/// `stats::glm`'s Gamma logLik plugs in `D/Σw` for φ; glmm's is maximised at
+/// the ML φ̂, and is gated against the `_ml` twin (same β, ML φ̂ as `dispersion`;
+/// its `se` is a different quantity from glmm's Pearson-scaled SE and stays
+/// unasserted).
+fn objective_differs(g: &Golden) -> Option<&'static str> {
+    if g.kind == "glm" && g.family == "gamma" && g.weights_suite {
+        return Some(
+            "R's logLik.glm multiplies each row's log-density by its weight and \
+             plugs in D/Σw for φ; glmm maximises the precision-weighted \
+             likelihood (row i's shape wᵢ/φ), a different function of the \
+             parameters — gated against R directly by \
+             fit_glm_gamma_weighted_matches_r",
+        );
+    }
+    if g.kind == "glm" && g.family == "gamma" && g.engine == "stats::glm" {
+        return Some(
+            "stats::glm: Gamma logLik at the D/Σw plug-in, not the ML φ̂ — deviance \
+             gated on the `_ml` twin",
+        );
+    }
+    if g.kind != "glmm" || !g.engine.starts_with("lme4::") {
+        return None;
+    }
+    let link = g.link.as_str().unwrap_or("");
+    match (g.family.as_str(), link) {
+        ("gamma", _) => Some(
+            "lme4: Fisher-weight Laplace with the pwrss/n plug-in Gamma scale — deviance \
+             gated on the `_tmb` twin",
+        ),
+        ("negbin", _) | ("binomial", "probit" | "cloglog") => Some(
+            "lme4: Fisher-weight Laplace on a non-canonical link — deviance gated on the \
+             `_tmb` twin",
+        ),
+        _ => None,
+    }
+}
+
 /// The whole cross-engine corpus: the `m3_goldens` tree plus the prior-weights
 /// suite. Two frozen reference trees, one set of assertions.
 fn corpus() -> Vec<(Golden, Vec<String>)> {
@@ -93,7 +188,7 @@ fn factors_of(spec: &Value) -> Vec<String> {
 /// `pending_reference` carries the reason as a non-empty string.
 ///
 /// Registering a spec and freezing its reference are two separate acts, and the
-/// spec has to land FIRST — `engines/goldens_agq.R` reads the manifest to know
+/// spec has to land FIRST — `validation/tools/goldens_agq.R` reads the manifest to know
 /// what to fit, so there is no ordering in which the JSON can exist before the
 /// entry does. Without this flag that gap makes [`m3_corpus`] panic on a missing
 /// file and takes the whole 56-golden tier down with it, which is the opposite of
@@ -140,7 +235,7 @@ fn m3_corpus() -> Vec<(Golden, Vec<String>)> {
 /// was generated rather than copied into `validation/goldens/`.
 ///
 /// These are promoted into `m3_goldens` coverage: asserted from
-/// `cargo test` instead of only by `compare.R` on a machine with R. Reading them
+/// `cargo test` instead of only by `grid/compare.R` on a machine with R. Reading them
 /// in place achieves that without a second copy of 15 frozen JSONs. The `goldens/`
 /// and `results/` trees would risk drifting onto different `tolPwrss`
 /// settings if it held a second, separately-maintained copy of these values;
@@ -182,7 +277,7 @@ fn weights_corpus() -> Vec<(Golden, Vec<String>)> {
         .collect()
 }
 
-/// The `kind` the weights manifest does not record, on `engines/lme4.R`'s own
+/// The `kind` the weights manifest does not record, on the weights-tier references' own
 /// branch structure: Gaussian goes to `lm`/`lmer` (which report `sigma` and a
 /// plain `se`), anything else to `glm`/`glmer`, split by whether the formula has
 /// a random-effect term.
@@ -209,7 +304,7 @@ enum Shape {
     /// drop different constants), wider bands.
     VectorAgq,
     /// Fixed-only non-Gaussian from the weights tier (rungs 29-43). Same fit as
-    /// [`Shape::Glm`], different frozen field set: `engines/lme4.R` branches on
+    /// [`Shape::Glm`], different frozen field set: the weights-tier references branch on
     /// family alone and files every non-Gaussian SE under `se_rx`, so these rungs
     /// carry `se_rx` where the `m3_goldens` GLMs carry `se`, plus an empty
     /// `varcomp`.
@@ -235,12 +330,16 @@ fn asserted_fields(shape: &Shape, g: &Golden) -> Vec<&'static str> {
         Shape::Lmm => vec!["beta", "se", "sigma", "loglik", "varcomp"],
         Shape::Glm => vec!["beta", "se", "loglik"],
         Shape::WeightedGlm => vec!["beta", "se_rx", "loglik", "varcomp"],
+        // glmmTMB reports no Rx (Schur-complement) standard error.
+        Shape::Glmm if g.engine.starts_with("glmmTMB::") => {
+            vec!["beta", "se_hessian", "loglik", "varcomp"]
+        }
         Shape::Glmm => vec!["beta", "se_hessian", "se_rx", "loglik", "varcomp"],
         Shape::VectorAgq => vec!["beta", "se_hessian", "varcomp"],
     };
     // Conditional on presence, not on family: the two reference trees freeze
     // different amounts for the same family — `goldens_agq.R` writes `theta`
-    // and `dispersion`, `engines/lme4.R`'s weights-tier branch writes neither.
+    // and `dispersion`, the weights-tier references carry neither.
     // Listing them unconditionally would fail the "asserted but absent" check on
     // the weights negbin and gamma rungs. The direction that catches the defect
     // this tier exists for — a field the golden carries that nothing reads — is
@@ -251,7 +350,13 @@ fn asserted_fields(shape: &Shape, g: &Golden) -> Vec<&'static str> {
     if g.estimates.dispersion.is_some() {
         f.push("dispersion");
     }
+    f.retain(|k| !excused(g, k));
     f
+}
+
+/// `unasserted_fields` names `field` for `g`.
+fn excused(g: &Golden, field: &str) -> bool {
+    unasserted_fields(g).iter().any(|(f, _)| *f == field)
 }
 
 /// Golden fields Tier 2 deliberately does not assert, each with the reason.
@@ -260,26 +365,53 @@ fn asserted_fields(shape: &Shape, g: &Golden) -> Vec<&'static str> {
 /// struct silently dropping a field — the defect this tier was built to fix. An
 /// entry here is a claim under review, not a way to quiet a failure.
 fn unasserted_fields(g: &Golden) -> Vec<(&'static str, &'static str)> {
-    if g.family == "gamma" && g.kind == "glmm" {
-        return vec![(
-            "sigma",
-            "lme4's sigma() on a Gamma glmer is its internal pwrss/n scale \
-             (0.57258 as a variance on sim_gamma_glmm), which matches neither the \
-             Pearson moment estimator nor deviance/df.residual. goldens_agq.R \
-             freezes both it and the Pearson `dispersion` so the in-crate test can \
-             pick; the crate picked Pearson and reports it as Fit::dispersion, \
-             which `dispersion` above asserts. glmm has no reported counterpart \
-             for this second scale. Reviewed and adopted as a deliberate \
-             divergence 2026-07-21 — see the Gamma GLMM dispersion entry under \
-             'differences that change the answer' in the crate's lme4 comparison \
-             notes, which records why the second scale is not exposed on `Fit`. \
-             Unasserted is not unverified: glmm computes the same pwrss/n \
-             (`family::glmm_sigma_sq`) and this tier gates it through two derived \
-             fields it does assert — `se_rx`, which carries σ̂² as its scale factor \
-             for Gamma, and `varcomp`, which is θ̂²·σ̂² on lme4's VarCorr \
-             convention. Reading `sigma` here would be a third check on the same \
-             number.",
-        )];
+    let mut out = unasserted_by_convention(g);
+    if objective_differs(g).is_some() {
+        out.push((
+            "loglik",
+            "the reference's logLik is a different function of the parameters \
+             (objective_differs), so it is not compared; the deviance is gated on \
+             the twin instead, and the exclusion prints as DEV-OBJ.",
+        ));
+    }
+    out
+}
+
+/// The per-convention half of [`unasserted_fields`].
+fn unasserted_by_convention(g: &Golden) -> Vec<(&'static str, &'static str)> {
+    if g.family == "gamma" && g.kind == "glmm" && g.engine.starts_with("lme4::") {
+        return vec![
+            (
+                "sigma",
+                "lme4's sigma() on a Gamma glmer is its internal pwrss/n scale \
+                 (0.57258 as a variance on sim_gamma_glmm), the plug-in value lme4 \
+                 fits at rather than an estimate of φ. glmm estimates φ by maximum \
+                 likelihood and has no pwrss/n counterpart; its φ̂ is asserted as \
+                 `dispersion` against the glmmTMB twin (`<name>_tmb`), whose \
+                 sigma()² is the same ML quantity.",
+            ),
+            (
+                "dispersion",
+                "goldens_agq.R's Pearson moment estimator at lme4's fit. glmm's \
+                 Fit::dispersion on a Gamma GLMM is the ML φ̂ of the objective it \
+                 maximises, a different estimator, so the two are not comparable \
+                 at any band; the ML value is asserted against the glmmTMB twin.",
+            ),
+        ];
+    }
+    if g.family == "gamma" && g.kind == "glm" && g.engine == "stats::glm+ML-dispersion" {
+        return vec![
+            (
+                "dispersion",
+                "the ML φ̂ (MASS::gamma.shape's equation). glmm's Gamma GLM reports \
+                 the Pearson moment, asserted against the base `stats::glm` twin.",
+            ),
+            (
+                "se",
+                "SEs scaled by the ML φ̂. glmm's are scaled by the Pearson moment, \
+                 and asserted against the base `stats::glm` twin.",
+            ),
+        ];
     }
     Vec::new()
 }
@@ -495,7 +627,7 @@ fn golden_fields_are_all_asserted() {
 // ── The cross-engine assertions ──────────────────────────────────────────────
 
 /// Refit every golden from its own recorded `r_formula` and compare every field
-/// it carries, at `tol.R`'s bands.
+/// it carries, at `grid/tol.R`'s bands.
 ///
 /// One test over the corpus rather than 56 hand-written ones: the goldens differ
 /// in data and model, not in what agreement means, and a per-golden test would
@@ -523,9 +655,15 @@ fn goldens_agree_with_the_references() {
     // `sim_igauss_glm` and `sim_igauss_inv_sq_glm` joined (the two inverse-Gaussian
     // GLM link cells, log and 1/μ², on the new `sim_igauss` fixture — GLM-only,
     // no glmm cell, since the family faults at the model-shape gate with random
-    // effects). The 50 is what `all_goldens_are_registered` proves against the
-    // goldens directory; the 15 is asserted inside `corpus()` itself.
-    assert_eq!(corpus().len(), 65, "the cross-engine corpus changed size");
+    // effects). 65 -> 73 on 2026-09-24: the eight glmmTMB `<name>_tmb` twins of
+    // the lme4 GLMM goldens whose objective is not glmm's (`objective_differs`)
+    // joined, as the exact-Laplace references those fits are gated against. The
+    // 58 is what `all_goldens_are_registered` proves against the goldens
+    // directory; the 15 is asserted inside `corpus()` itself. 73 -> 76 on
+    // 2026-09-24: the three `_ml` twins of the `stats::glm` Gamma GLM goldens
+    // joined when glmm's Gamma GLM moved to the ML dispersion, and the 58 became
+    // 61.
+    assert_eq!(corpus().len(), 76, "the cross-engine corpus changed size");
     let mut open = Vec::new();
     for (g, factors) in corpus() {
         if let Some(reason) = known_open(&g) {
@@ -574,7 +712,7 @@ fn goldens_agree_with_the_references() {
         // SE — `se` on LMM/GLM, `se_hessian` on GLMM (glmm's default WaldSe
         // matches lme4's `use.hessian=TRUE`), and `se_rx` where the golden
         // froze the Schur-complement method too.
-        if let Some(se) = &g.estimates.se {
+        if let Some(se) = g.estimates.se.as_ref().filter(|_| !excused(&g, "se")) {
             assert_coefs(
                 &f.se,
                 f.aliased(),
@@ -603,7 +741,7 @@ fn goldens_agree_with_the_references() {
         // `se_rx` is lme4's other SE method (Schur complement conditional on
         // θ̂). It needs its own fit under the matching glmm setting — comparing
         // it against the Hessian SE would be comparing two estimators.
-        if let Some(se_rx) = &g.estimates.se_rx {
+        if let Some(se_rx) = g.estimates.se_rx.as_ref().filter(|_| !excused(&g, "se_rx")) {
             let (fx, _, _) = refit_with(&g, &factor_refs, WaldSe::Rx);
             assert_coefs(
                 &fx.se,
@@ -634,7 +772,11 @@ fn goldens_agree_with_the_references() {
                 &format!("{name}: theta"),
             );
         }
-        if let Some(phi) = g.estimates.dispersion {
+        if let Some(phi) = g
+            .estimates
+            .dispersion
+            .filter(|_| !excused(&g, "dispersion"))
+        {
             assert_rel(
                 f.dispersion,
                 phi,
@@ -657,10 +799,20 @@ fn goldens_agree_with_the_references() {
         // which never report one) has no deviance to gate — printed loudly
         // rather than silently skipped, and `dev_align_none_matches_the_six_
         // vector_agq_goldens` below pins that this set of six can never grow
-        // quietly.
-        match oracle_support::dev_align::aligned_dev(&g) {
-            None => eprintln!("DEV-NA {name}: golden carries no loglik — parameter sanity only"),
-            Some(dev_ref) => {
+        // quietly. A golden whose engine maximises a different objective
+        // (`objective_differs`) is the other loud exclusion, pinned the same way
+        // by `objective_differs_matches_the_pinned_goldens`.
+        match (
+            objective_differs(&g),
+            oracle_support::dev_align::aligned_dev(&g),
+        ) {
+            (Some(why), _) => {
+                eprintln!("DEV-OBJ {name}: {why}")
+            }
+            (None, None) => {
+                eprintln!("DEV-NA {name}: golden carries no loglik — parameter sanity only")
+            }
+            (None, Some(dev_ref)) => {
                 let dev_g = -2.0 * f.loglik;
                 let d = dev_g - dev_ref;
                 assert!(
@@ -712,8 +864,8 @@ fn goldens_agree_with_the_references() {
 }
 
 /// The registry's teeth. This tier reports a documented divergence instead of
-/// failing on it (`validation/divergences.json`), which only stays honest if an
-/// entry cannot outlive the divergence it describes: an entry whose dataset the
+/// failing on it (`validation/grid/divergences.json`), which only stays honest if an
+/// entry cannot outlive the divergence it describes: an entry whose fixture the
 /// corpus above actually refit and which never matched is a standing exemption
 /// for whatever drifts there next, so it fails here.
 ///
@@ -725,29 +877,27 @@ fn assert_documented_divergences_all_fired() {
     let reg = divergence::registry();
     let fired = reg.fired();
     // Keyed on the golden's `name`, not its `data`: `Registry::covers` parses the
-    // dataset out of the `"{name}: {quantity}"` assertion context, so an oracle-tier
-    // entry's `dataset` is a golden name. (`validation/compare.R` reads the same field
-    // as a manifest dataset name — an entry scoped to both tiers only works where the
-    // two coincide.)
+    // fixture out of the `"{name}: {quantity}"` assertion context, so an oracle-tier
+    // entry's `cell` field holds a golden name. (`validation/grid/compare.R` reads that
+    // same field as a grid cell id — an entry scoped to both consumers only works
+    // where the two names coincide.)
     let in_corpus: std::collections::BTreeSet<String> =
         corpus().into_iter().map(|(g, _)| g.name).collect();
 
     let mut expected = std::collections::BTreeSet::new();
     for e in reg.scoped() {
-        if !in_corpus.contains(&e.dataset) {
-            continue; // this tier has no golden for it; compare.R owns that entry
+        if !in_corpus.contains(&e.cell) {
+            continue; // this tier has no golden for it; grid/compare.R owns that entry
         }
         expected.insert(e.id.clone());
         if fired.contains(&e.id) {
             eprintln!(
-                "documented divergence: {} rung {} [{}] <= {:.1e}\n  {}\n  direction: {}\n  see: {}",
-                e.dataset,
-                e.rung.map_or("-".to_string(), |r| r.to_string()),
+                "documented divergence: {} [{}] <= {:.1e}\n  {}\n  direction: {}",
+                e.cell,
                 e.quantities.join(","),
                 e.max_rel,
                 e.summary,
-                e.direction,
-                e.review
+                e.direction
             );
         }
     }

@@ -58,6 +58,21 @@
   }
 }
 
+# The dispersion-row label for print/summary, or NULL for a family that
+# reports none. Gamma phi is the Pearson moment on a GLM and the
+# maximum-likelihood value on a GLMM; inverse-Gaussian phi is always the
+# Pearson moment. A held `dispersion=` value (Gamma or inverse-Gaussian)
+# reports as fixed regardless of family or mixedness. The Python port prints
+# the same; change together.
+.dispersion_label <- function(object) {
+  fam <- object$family_name
+  if (fam == "negativebinomial") return("Shape (theta)")
+  if (!(fam %in% c("gamma", "inversegaussian"))) return(NULL)
+  if (!is.null(object$dispersion_held)) return("Dispersion (phi, fixed)")
+  mixed <- length(object$varcorr) > 0L
+  if (fam == "gamma" && mixed) "Dispersion (phi, ML)" else "Dispersion (phi, Pearson)"
+}
+
 #' @export
 print.fastglmm <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
   cat(.method_line(x), "\n")
@@ -185,12 +200,8 @@ print.summary.fastglmm <- function(x,
     print(noquote(m[-1L, -p, drop = FALSE]), right = TRUE)
   }
   cat("\n")
-  if (object$family_name %in% c("gamma", "negativebinomial", "inversegaussian")) {
-    label <- if (object$family_name == "negativebinomial") {
-      "Shape (theta)"
-    } else {
-      "Dispersion (phi, Pearson)"
-    }
+  label <- .dispersion_label(object)
+  if (!is.null(label)) {
     cat(label, ": ", format(object$dispersion, digits = digits), "\n", sep = "")
   }
   cat("Optimizer evaluations: ", object$n_eval,
@@ -198,6 +209,14 @@ print.summary.fastglmm <- function(x,
   if (object$singular) cat("boundary (singular) fit: see help('isSingular')\n")
   cat("z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or ",
       "residual df is reported.\n", sep = "")
+  # Mirrors Summary.text() (python/glmm/summary.py) - change together. NROW()
+  # keeps objects saved before `warnings` existed printable.
+  w <- object$warnings
+  if (NROW(w)) {
+    cat("\nWarnings:\n")
+    cat(sprintf("%s%s: %s. %s\n", toupper(substr(w$tier, 1L, 1L)), substring(w$tier, 2L),
+                w$title, w$message), sep = "")
+  }
   invisible(x)
 }
 

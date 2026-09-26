@@ -15,7 +15,7 @@ use crate::{
 ///
 /// These are Rust-vs-Rust pins, NOT cross-engine agreement bands: they say the
 /// number has not moved, and nothing about lme4. Cross-engine bands live in
-/// `validation/tol.R` and are asserted by the `oracle-tests` tier.
+/// `validation/grid/tol.R` and are asserted by the `oracle-tests` tier.
 pub(crate) const PIN_REL_OLS: f64 = 1e-9;
 
 /// Band for pins on the iterative paths — LMM/GLMM, where BOBYQA stops inside

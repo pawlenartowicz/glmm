@@ -33,9 +33,13 @@ the formula names.}
 (log/inverse), \code{inverse.gaussian} (log/\code{1/mu^2}), \code{"negativebinomial"}
 (log; the shape \code{theta} is estimated).}
 
-\item{weights}{optional per-row prior (case) weights - \code{lme4::glmer}'s
-\verb{weights=}. For an aggregated binomial, pass the success \strong{proportion}
-as the response and the trial count here, or equivalently write
+\item{weights}{optional per-row prior weights - \code{lme4::glmer}'s
+\verb{weights=}. On a family with an estimated dispersion (gaussian, gamma,
+inverse-Gaussian) these are PRECISION weights, the same convention as
+\code{lm}, \code{glm} and lme4: row \code{i} has dispersion \code{phi / weights[i]}, so
+multiplying every weight by the same constant leaves the fit unchanged.
+For an aggregated binomial, pass the success \strong{proportion} as the
+response and the trial count here, or equivalently write
 \code{cbind(successes, failures)} as the formula's left-hand side; combining
 both is an error.}
 
@@ -67,7 +71,9 @@ Distinct from \code{init.theta}, which is the negative-binomial shape.}
 \item{wald.se}{Wald standard-error mode: \code{"hessian"} (default) or \code{"rx"}.}
 
 \item{dispersion}{Gamma/inverse-Gaussian dispersion directive: \code{NULL}
-(estimate via Pearson, the default), \code{"estimate"} (same), or a number to
+(estimate it, the default: the Pearson moment on a Gamma GLM, maximum
+likelihood on a Gamma GLMM, the Pearson moment on inverse-Gaussian),
+\code{"estimate"} (same), or a number to
 hold it fixed. Non-\code{NULL} on binomial/poisson would mean
 quasi-likelihood - not implemented, errors.}
 
@@ -85,7 +91,9 @@ An object of class \code{"fastglmm"}: fixed effects (\link{fixef}), Wald
 covariance (\code{vcov()}), variance components on the SD/correlation scale
 (\link{VarCorr}), \code{converged} and \code{singular} flags (\link{isSingular}), a
 \code{diagnostics} list (the solver's own report: \code{boundary}, \code{pinned},
-\code{notes}, plus the three flags above), plus
+\code{notes}, plus the three flags above), a \code{warnings} data.frame (one row
+per warning the call raised: \code{tier}, \code{kind}, \code{title}, \code{message}; match on
+\code{kind}), plus
 \code{print()}, \link[=summary.fastglmm]{summary()}, \link[=confint.fastglmm]{confint()}
 (Wald), \code{nobs()}, \link[=formula.fastglmm]{formula()} (returns the formula
 \strong{string}), \code{family()}, and \code{model.frame()}. Engine-blocked accessors
@@ -123,8 +131,9 @@ win. The string form \code{family = "gamma"} uses the glmm default
 \code{link = "log"} instead. The two forms therefore fit different models;
 choose deliberately.
 
-\strong{\code{nAGQ} fallback (louder than lme4):} \code{nAGQ > 1} is honored on binomial
-and Poisson mixed models with a single grouping factor and at most 3 random
+\strong{\code{nAGQ} fallback (louder than lme4):} \code{nAGQ > 1} is honored on binomial,
+Poisson, negative-binomial and Gamma mixed models with a single grouping
+factor and at most 3 random
 effects per group. Any other shape \strong{warns and falls back to Laplace}
 (\code{nAGQ = 1}) instead of erroring the way \code{lme4::glmer} does - the fit you
 get is a Laplace fit, and the warning is the only notice. This mirrors the

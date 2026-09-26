@@ -81,11 +81,51 @@ Python and R surfaces go through it, so the distinction is invisible there.
 
 Which families carry an estimated dispersion parameter, and on what scale it
 is reported, is a family-level convention documented in full in
-[`supported_families.md`](supported_families.md). In short: Gamma estimates a
-dispersion φ (a Pearson moment estimator, `φ̂ = Σrᵢ²/(n−p)`, unless the caller
-pins it), negative binomial estimates a shape θ threaded through its own
-outer loop, and dispersion is fixed at `φ ≡ 1` for Binomial, Poisson, and NB
-(NB's overdispersion lives in θ, not φ).
+[`supported_families.md`](supported_families.md). In short: Gamma estimates
+a dispersion φ by maximum likelihood on a mixed fit, unless the caller pins
+it; on a fixed-only fit `Fit::dispersion` is the Pearson moment instead
+(`summary(glm)`'s convention) — the ML value is still computed, to place
+`Fit::loglik` at its maximum, but it is not what `Fit::dispersion` reports
+there. Inverse-Gaussian (fixed-only only) also reports the Pearson moment.
+Negative binomial estimates a shape θ threaded through its own outer loop,
+and dispersion is fixed at `φ ≡ 1` for Binomial, Poisson, and NB (NB's
+overdispersion lives in θ, not φ).
+
+## Prior weights
+
+What `FitOptions::weights` means depends on the family:
+
+- **Gaussian, Gamma, inverse-Gaussian** — every family that carries an
+  estimated dispersion φ — treat `weights` as **precision weights**: row `i`
+  has variance `φ·V(μᵢ)/wᵢ`. This is the convention of `lm`, `summary(glm)`,
+  and lme4. Doubling row `i`'s weight halves its variance.
+- **Binomial** weights are trial counts (`y` is the success proportion,
+  `weights` the number of trials — lme4's `cbind(s, m−s)` model).
+- **Poisson** has no dispersion parameter, so the two conventions below give
+  the same fit — the difference between them is a constant that does not
+  move β, SE, or the point where the likelihood is maximised.
+- **Negative binomial** weights multiply the log-likelihood (`MASS::glm.nb`'s
+  convention): its variance `μ + μ²/θ` has no φ to divide, so precision
+  weights are not defined for it.
+
+On the three families with a dispersion, rescaling every weight by the same
+constant `c` changes nothing about the fit: β, SE, and every reported
+quantity except the dispersion itself stay the same, and the dispersion
+scales by `c`. This differs from glmmTMB's default, which treats `weights`
+as case weights on Gaussian and Gamma — multiplying each row's log-density
+by `wᵢ` — so a glmmTMB fit with `weights = w` does change when every `wᵢ` is
+multiplied by a constant.
+
+Two recipes, depending on what the weight means in your data:
+
+- **True replicate counts** (row `i` really is `wᵢ` identical observations
+  averaged together): repeat the row `wᵢ` times instead of weighting it.
+  Replicated rows and a precision-weighted row are different data, and this
+  recipe is the one that matches `wᵢ` identical observations.
+- **Reproducing glmm's fit in glmmTMB**: fit glmmTMB with no `weights=` and a
+  `dispformula` offset instead — `~ offset(log(w))` for Gamma (glmmTMB's
+  Gamma dispersion predictor is on the log-shape scale) and
+  `~ offset(-0.5 * log(w))` for Gaussian (log σ scale).
 
 ## Variance components scale
 
@@ -107,11 +147,23 @@ the three language surfaces.
 ## Flags on the result
 
 `converged` reports whether the optimizer reached its convergence criterion.
-`false` means the SE, covariance, and dispersion fields are NaN-filled rather
-than trustworthy numbers — see the `Fit` doc comment for the exact per-field
-fallback. An LMM fit that hits its evaluation cap is a partial exception: it
-still reports its finite endpoint deviance, with `converged == false` marking
-it as not fully converged.
+What `false` means for the rest of the result splits in two, for an LMM or
+GLMM: see the `Fit` doc comment (`src/fit/mod.rs`) for the exact per-field
+detail.
+
+- A search that stopped at its evaluation budget (`MaxFunReached`) still
+  reports coefficients, `se`, `vcov`, `dispersion`, `tau2` and `varcorr` at
+  the best point found (the plateau policy). `stddev_se`, `fitted` and the
+  random-effect modes stay empty regardless. `df` is 0 for a GLMM at that
+  endpoint (the AIC/BIC identity does not apply there); an LMM at the same
+  endpoint reports its usual nonzero `df`.
+- Every other non-converged path (a degenerate configuration, a failed step,
+  a non-finite deviance) NaN-fills or empties every relevant field: there is
+  no endpoint worth reporting.
+
+`warnings.md` documents which severe warning (`search_limit` vs. `fit_failed`
+and the other failure kinds) a caller sees for each case; exactly one is
+raised on every non-converged fit.
 
 `singular` (R's `isSingular(fit)`) reports a boundary fit — the same
 condition lme4 flags: at least one diagonal random-effect variance component
@@ -148,9 +200,11 @@ R), but they are three of six: the full report is `diagnostics.converged`,
     ill-conditioned design outright (`converged: false`) instead of fitting
     and flagging it — the dense and sparse LMM routes disagree on this point.
   - `PirlsExhausted`: a GLMM's inner PIRLS solve ran its full iteration cap
-    without converging. Observation-only unless it hit the FINAL
-    re-evaluation at the converged fit, in which case the reported estimates
-    rest on that truncated solve.
+    without converging. Observation-only unless it hit the final
+    re-evaluation at the converged fit's variance parameters: that is the one
+    case the ports raise, as `pirls_exhausted`. See
+    [`warnings.md`](warnings.md) for what it means for the reported
+    estimates.
   - `UnusedGroupingLevels`: a grouping factor declares levels that own
     random-effect columns but no row. Raised by the formula frontend, not a
     solver — the only layer that sees both the declared levels and the

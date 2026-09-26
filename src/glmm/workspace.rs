@@ -230,6 +230,104 @@ pub(crate) struct PackedScratch {
     /// Scratch for `a_chol`'s in-place `cholesky_in_place` (k×k, θ-independent
     /// size) — avoids a per-PIRLS-iteration `.llt(Side::Lower)` allocation.
     pub a_llt_mem: MemBuffer,
+    /// Sparse Cholesky of `A` on its fixed pattern ([`PackedSparse`]), built by
+    /// [`fill_packed_cols`] with the design's level ids when the switch there
+    /// chooses it; `None` means the dense `a_chol` factor.
+    pub sparse: Option<Box<PackedSparse>>,
+}
+
+/// `A = M'WM + I`'s lower-triangle pattern and its AMD symbolic Cholesky.
+/// The pattern is the union over rows of each row's `width` RE columns plus
+/// the full diagonal, so it depends on the level ids only, never on θ or W:
+/// one symbolic analysis serves every numeric refactor of the fit. A nested
+/// or single-grouping-plus-small-extras design makes `A` block-diagonal plus
+/// a narrow border, so the sparse factor costs a small fraction of the dense
+/// `k³/3`.
+pub struct PackedSparse {
+    pub(crate) symbolic: SymbolicCholesky<usize>,
+    /// `A`'s values in the fixed CSC pattern, scattered per PIRLS iteration.
+    pub(crate) axx: SparseColMat<usize, f64>,
+    pub(crate) l_values: Vec<f64>,
+    pub(crate) fac_mem: MemBuffer,
+    /// Solve scratch sized for `p.max(1)` right-hand sides: the β-border's
+    /// `A⁻¹M'WX` is the widest solve the packed PIRLS takes.
+    pub(crate) solve_mem: MemBuffer,
+    /// len `n·width²`: for row `i`'s nonzero pair `(ta, tb)` with
+    /// `m_cols[ta] ≥ m_cols[tb]`, the slot of `(m_cols[ta], m_cols[tb])` in
+    /// `axx`'s values; `u32::MAX` for the upper-triangle pairs, which the
+    /// scatter skips. Lets the scatter write `A` straight into the CSC values
+    /// with no dense `k×k` pass per iteration.
+    pub(crate) row_slots: Vec<u32>,
+    /// len `k`: the diagonal slot of each column, where the `+I` goes.
+    pub(crate) diag_slots: Vec<u32>,
+}
+
+impl PackedSparse {
+    pub(crate) fn build(m_cols: &[u32], n: usize, width: usize, k: usize, p: usize) -> Self {
+        let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(k + n * width * (width + 1) / 2);
+        for b in 0..k {
+            pairs.push((b as u32, b as u32));
+        }
+        for i in 0..n {
+            let row = &m_cols[i * width..(i + 1) * width];
+            for &ca in row {
+                for &cb in row {
+                    if ca >= cb {
+                        pairs.push((cb, ca)); // (column, row), row >= column
+                    }
+                }
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        let trips: Vec<Triplet<usize, usize, f64>> = pairs
+            .iter()
+            .map(|&(c, r)| Triplet::new(r as usize, c as usize, 0.0))
+            .collect();
+        let axx = SparseColMat::<usize, f64>::try_new_from_triplets(k, k, &trips)
+            .expect("packed A pattern triplets well-formed");
+        let symbolic = factorize_symbolic_cholesky(
+            axx.symbolic(),
+            Side::Lower,
+            Default::default(), // AMD fill-reducing ordering
+            CholeskySymbolicParams {
+                supernodal_flop_ratio_threshold: SupernodalThreshold::AUTO,
+                ..Default::default()
+            },
+        )
+        .expect("packed A symbolic factorization");
+        let l_values = vec![0.0f64; symbolic.len_val()];
+        let fac_mem = MemBuffer::new(
+            symbolic.factorize_numeric_llt_scratch::<f64>(Par::Seq, Spec::default()),
+        );
+        let solve_mem = MemBuffer::new(symbolic.solve_in_place_scratch::<f64>(p.max(1), Par::Seq));
+        let (col_ptr, row_idx) = (axx.symbolic().col_ptr(), axx.symbolic().row_idx());
+        let slot = |r: usize, c: usize| -> u32 {
+            let rows = &row_idx[col_ptr[c]..col_ptr[c + 1]];
+            (col_ptr[c] + rows.binary_search(&r).expect("pair in pattern")) as u32
+        };
+        let mut row_slots = vec![u32::MAX; n * width * width];
+        for i in 0..n {
+            let row = &m_cols[i * width..(i + 1) * width];
+            for (a, &ca) in row.iter().enumerate() {
+                for (b, &cb) in row.iter().enumerate() {
+                    if ca >= cb {
+                        row_slots[(i * width + a) * width + b] = slot(ca as usize, cb as usize);
+                    }
+                }
+            }
+        }
+        let diag_slots = (0..k).map(|c| slot(c, c)).collect();
+        PackedSparse {
+            symbolic,
+            axx,
+            l_values,
+            fac_mem,
+            solve_mem,
+            row_slots,
+            diag_slots,
+        }
+    }
 }
 
 impl PackedScratch {
@@ -263,6 +361,7 @@ impl PackedScratch {
                 Par::Seq,
                 Spec::default(),
             )),
+            sparse: None,
         }
     }
 
@@ -282,6 +381,7 @@ impl PackedScratch {
                 Par::Seq,
                 Spec::default(),
             )),
+            sparse: None,
         }
     }
 }
@@ -354,8 +454,8 @@ pub(crate) struct InferenceScratch {
     /// `ws.pirls.u`. The tail re-eval at the end of that function re-solves PIRLS
     /// at γ̂ and writes a fresh `ws.pirls.prob`, while `ws.pirls.u` is put back
     /// verbatim — so without this the workspace exits carrying a (`u`, `prob`) pair from two
-    /// different converged solves, and Gamma's σ̂² (`family::glmm_sigma_sq`,
-    /// read in `fit/glmm.rs`) is built from the mismatch. Length max_n.
+    /// different converged solves, and `Fit::fitted` and `Fit::ranef` (read in
+    /// `fit/glmm.rs`) would describe two different points. Length max_n.
     /// Adding the restore (2026-09-05) moved the bit-identity dump's `theta`
     /// on the dense Gamma rung (`sim_gamma`, rung 23) from 0.23550934106996388
     /// to 0.23550934100844045 — a 2.6e-10 relative shift, the Hessian arm now
@@ -440,8 +540,21 @@ pub struct GlmmWorkspace {
     /// every other family leaves it NaN — and `fit_glmm` leaves θ̂_NB in it on
     /// exit.
     pub nb_theta: f64,
+    /// The Gamma dispersion φ the Laplace objective is evaluated at: PIRLS runs
+    /// on the prior weights `prior_wᵢ/φ` (`deviance::laplace_deviance`). 1.0 at
+    /// construction and on every other family, which is bit-identical to no
+    /// scaling. `fit_glmm` searches `ln φ` as the trailing outer coordinate and
+    /// leaves φ̂ here on exit, so the pinned re-eval and the SE path read the
+    /// fitted value.
+    pub(crate) gamma_phi: f64,
+    /// A Gamma dispersion the caller holds fixed (`FitOptions::dispersion`),
+    /// set by the fit adapter before each `fit_glmm`. With it, every evaluation
+    /// runs at that φ and the trailing `ln φ` coordinate is inert (the objective
+    /// does not read it), so the search is over `(θ, β)` alone; the SE takes no
+    /// `ln φ` row. `None` on every other family and when φ is estimated.
+    pub(crate) gamma_phi_held: Option<f64>,
     /// adaptive GH node count; 1 = Laplace. >1 only fires on the single-grouping-factor
-    /// binomial/Poisson AGQ paths — scalar intercept (`agq::agq_deviance`) or vector RE
+    /// binomial/Poisson/negative-binomial/Gamma AGQ paths — scalar intercept (`agq::agq_deviance`) or vector RE
     /// with `q_p ∈ 2..=3` (`agq::agq_deviance_vec`); ignored otherwise.
     pub nagq: u8,
     /// FitOptions::parallel_inner, copied per fit by the fit.rs adapter (the
@@ -482,27 +595,28 @@ pub struct GlmmWorkspace {
     /// instead — see `OuterSearch` — and `betas` is copied from this suffix
     /// either way) — so a caller may read it back as the warm start for a
     /// subsequent fit of related data. On a non-converged fit the content is an
-    /// arbitrary iterate — do not read it. On NB the vector has one more trailing
-    /// entry, `ln θ_NB`, whose exponential `fit_glmm` writes back into `nb_theta`
-    /// — the `[..n_theta + p]` read-back contract is unchanged.
+    /// arbitrary iterate — do not read it. On NB and Gamma the vector has one more
+    /// trailing entry, `ln θ_NB` or `ln φ`, whose exponential `fit_glmm` writes back
+    /// into `nb_theta` or `gamma_phi` — the `[..n_theta + p]` read-back contract is
+    /// unchanged.
     pub params: Vec<f64>, // [θ | β]
-    /// Joint solver box lower bounds, length `n_theta + p` (+1 on NB).
+    /// Joint solver box lower bounds, length `n_theta + p` (+1 on NB and Gamma).
     pub lower: Vec<f64>,
-    /// Joint solver box upper bounds, length `n_theta + p` (+1 on NB).
+    /// Joint solver box upper bounds, length `n_theta + p` (+1 on NB and Gamma).
     pub upper: Vec<f64>,
     /// θ-only BOBYQA solver for the θ-only outer search shared by
     /// `PqlThenJoint` (a warm-start accelerant) and `ExactProfile` (the search
-    /// itself — see `OuterSearch`): sized `n_theta` (+1 on NB), configured with
+    /// itself — see `OuterSearch`): sized `n_theta` (+1 on NB and Gamma), configured with
     /// the same `rho_begin`/`GLMM_RHO_END` schedule as `solver` and the LMM
     /// mid-model `npt` rule (`ceil(1.5·n_theta) + 1` at
     /// `n_theta ≥ 3`, else `2·n_theta + 1`) — not
     /// the joint solver's `npt`, which differs. See `fit_glmm`.
     pub solver_stage1: Bobyqa,
     /// θ-only candidate/incumbent buffer for stage 1, length `n_theta` (+1 on
-    /// NB); seeded from `params`'s θ prefix at construction.
+    /// NB and Gamma); seeded from `params`'s θ prefix at construction.
     pub params_stage1: Vec<f64>,
-    /// Stage-1 box, length `n_theta + n_nb`: `lower[..n_theta]` / `upper[..n_theta]`
-    /// plus the `ln θ_NB` bound on NB — see `params_stage1`.
+    /// Stage-1 box, length `n_theta + n_disp`: `lower[..n_theta]` / `upper[..n_theta]`
+    /// plus the `ln θ_NB` or `ln φ` bound — see `params_stage1`.
     pub lower_stage1: Vec<f64>,
     pub upper_stage1: Vec<f64>,
     /// Outer search route for this shape — see `OuterSearch`.
@@ -516,6 +630,12 @@ pub struct GlmmWorkspace {
     /// `wᵢ·devᵢ` on the deviance, `wᵢ·ρᵢ` on the score; everything downstream
     /// (A/RHS scatter, β border, Schur, FD Hessian) reads `w`/ρ and inherits it.
     pub(crate) prior_w: Vec<f64>,
+    /// `prior_wᵢ/φ`, the weights the Gamma Laplace objective feeds PIRLS at the
+    /// dispersion φ it is evaluated at — see `deviance::laplace_deviance`.
+    /// Rewritten every Gamma evaluation and never read on a family whose φ≡1.
+    /// `se::joint_hessian_cov` swaps it with `prior_w` for its duration, so the
+    /// SE engines see the fixed-φ̂ GLMM they differentiate.
+    pub(crate) prior_w_phi: Vec<f64>,
     /// True iff `prior_w` was filled from `FitOptions::weights`. Selects between
     /// the two logit arms of `simd_transcendental::family_pass`: the fused
     /// `Σ log1pexp` deviance identity holds only for unweighted Bernoulli rows.
@@ -588,6 +708,37 @@ pub struct GlmmWorkspace {
 }
 
 impl GlmmWorkspace {
+    /// True on a Gamma workspace evaluated at a dispersion other than 1 — the
+    /// state `fit_glmm` leaves behind (φ̂ in `gamma_phi`), where PIRLS runs on
+    /// `prior_wᵢ/φ` and not on `prior_w` itself.
+    pub(crate) fn dispersion_scaled(&self) -> bool {
+        matches!(self.family, crate::Family::Gamma { .. }) && self.gamma_phi != 1.0
+    }
+
+    /// Run `f` on this workspace as the fixed-dispersion GLMM it describes: on
+    /// a [`Self::dispersion_scaled`] Gamma workspace, `prior_w` holds
+    /// `prior_wᵢ/φ` and `gamma_phi` is 1 for the duration of `f`, and both are
+    /// put back after it. At a fixed φ the mixed-Gamma objective in `(θ, β)` is
+    /// exactly the Laplace deviance on those weights with the bare deviance as
+    /// its data term, so every derivative engine entered through here
+    /// differentiates the objective the fit minimized, with no Gamma case of
+    /// its own. Anything else runs `f` unchanged. `n` = live rows.
+    pub(crate) fn at_fixed_dispersion<R>(&mut self, n: usize, f: impl FnOnce(&mut Self) -> R) -> R {
+        if !self.dispersion_scaled() {
+            return f(self);
+        }
+        let phi = self.gamma_phi;
+        for i in 0..n {
+            self.prior_w_phi[i] = self.prior_w[i] / phi;
+        }
+        std::mem::swap(&mut self.prior_w, &mut self.prior_w_phi);
+        self.gamma_phi = 1.0;
+        let out = f(self);
+        std::mem::swap(&mut self.prior_w, &mut self.prior_w_phi);
+        self.gamma_phi = phi;
+        out
+    }
+
     /// Build the GLMM workspace for a Glm+cluster spec. `slope_cols` are the
     /// x_full indices of the primary slopes (`spec.cluster_slope_design_cols`).
     /// Test-only: production callers go through [`Self::for_cluster_spec_ext`],
@@ -681,10 +832,14 @@ impl GlmmWorkspace {
         };
         let k = groupings.k_total;
         let n_theta = groupings.n_theta();
-        // The NB dispersion is one trailing coordinate of the outer search, on
-        // `ln θ_NB` boxed to the GLM bracket's range. Every other family has no
-        // such slot: `n_nb = 0` leaves every dimension and bound below as it was.
-        let n_nb = usize::from(matches!(family, crate::Family::NegativeBinomial { .. }));
+        // The NB and Gamma dispersions are one trailing coordinate of the outer
+        // search each: `ln θ_NB` boxed to the GLM bracket's range, `ln φ` boxed to
+        // `[GAMMA_PHI_LO, GAMMA_PHI_HI]`. Every other family has no such slot:
+        // `n_disp = 0` leaves every dimension and bound below as it was.
+        let n_disp = usize::from(matches!(
+            family,
+            crate::Family::NegativeBinomial { .. } | crate::Family::Gamma { .. }
+        ));
         let q = groupings.primary_q;
         let n_primary = groupings.n_primary;
         // Structured-path block sizes: core width q_core = q_p + nested children,
@@ -715,10 +870,17 @@ impl GlmmWorkspace {
         params.extend(std::iter::repeat_n(0.0, p)); // β cold default; overwritten at fit
         lower.extend(std::iter::repeat_n(-BETA_BOX, p));
         upper.extend(std::iter::repeat_n(BETA_BOX, p));
-        if n_nb == 1 {
-            params.push(0.0); // ln θ_NB start; written by `fit_glmm` from `nb_theta`
-            lower.push(crate::fit::NB_THETA_LO.ln());
-            upper.push(crate::fit::NB_THETA_HI.ln());
+        if n_disp == 1 {
+            // ln θ_NB / ln φ start; written by `fit_glmm` from `nb_theta` / the
+            // Gamma seed.
+            params.push(0.0);
+            if matches!(family, crate::Family::Gamma { .. }) {
+                lower.push(super::GAMMA_PHI_LO.ln());
+                upper.push(super::GAMMA_PHI_HI.ln());
+            } else {
+                lower.push(crate::fit::NB_THETA_LO.ln());
+                upper.push(crate::fit::NB_THETA_HI.ln());
+            }
         }
 
         // ρ_begin ≤ RHO_BEGIN and ≤ 0.1·min diagonal θ₀ (mirror for_cluster_spec_ext)
@@ -735,19 +897,19 @@ impl GlmmWorkspace {
         // extraction, not a new derivation.
         let rho_begin = (0.1 * min_diag).min(RHO_BEGIN);
         // Feeds through the shared `apply_campaign_overrides` tail.
-        let mut config = Config::new(n_theta + p + n_nb);
+        let mut config = Config::new(n_theta + p + n_disp);
         config.rho_begin = rho_begin;
         config.rho_end = GLMM_RHO_END;
-        crate::lmm::apply_campaign_overrides(&mut config, n_theta + p + n_nb);
+        crate::lmm::apply_campaign_overrides(&mut config, n_theta + p + n_disp);
         // Stage-1 θ-only BOBYQA config: same rho_begin/rho_end schedule as the
         // joint solver above, but `npt` mirrors the LMM's mid-model rule
         // (`LmmWorkspace::for_cluster_spec_ext`, `src/lmm/mod.rs`), NOT the
         // joint solver's — the two are sized for different-dimension searches
         // and this crate's precedent for a
         // θ-only search is the LMM one. The dimension fed into that shared
-        // rule is `n_stage1` — θ, plus the `ln θ_NB` coordinate on NB. Both
+        // rule is `n_stage1` — θ, plus the `ln θ_NB` / `ln φ` coordinate. Both
         // configs feed through the shared `apply_campaign_overrides` tail.
-        let n_stage1 = n_theta + n_nb;
+        let n_stage1 = n_theta + n_disp;
         let npt_stage1 = if n_stage1 >= 3 {
             (3 * n_stage1).div_ceil(2) + 1
         } else {
@@ -759,12 +921,12 @@ impl GlmmWorkspace {
         config_stage1.npt = npt_stage1;
         crate::lmm::apply_campaign_overrides(&mut config_stage1, n_stage1);
         // θ-only incumbent buffer and its box: the θ prefix of the joint start,
-        // plus the ln θ_NB slot on NB (the joint vector's LAST entry, so the
+        // plus the ln θ_NB / ln φ slot (the joint vector's LAST entry, so the
         // stage-1 box is no longer a prefix of the joint box there).
         let mut params_stage1 = params[..n_theta].to_vec();
         let mut lower_stage1 = lower[..n_theta].to_vec();
         let mut upper_stage1 = upper[..n_theta].to_vec();
-        if n_nb == 1 {
+        if n_disp == 1 {
             let m = n_theta + p;
             params_stage1.push(params[m]);
             lower_stage1.push(lower[m]);
@@ -791,8 +953,8 @@ impl GlmmWorkspace {
         // full corpus, not a hand-picked dataset list: an earlier hand-picked list
         // missed one loser (Arabidopsis, see below). Protocol: per arm (forced skip
         // vs forced keep), two independent
-        // `validation_fit` invocations, each itself the median of 9 timed samples
-        // after a discarded warmup (see validation/engines/glmm.rs); invocations agreed
+        // cross-language harness invocations, each itself the median of 9 timed
+        // samples after a discarded warmup; invocations agreed
         // within ~2% everywhere, and the table shows the keep-arm/skip-arm medians
         // (Poisson rows re-measured after the dense-PIRLS weight-loop revert that
         // restored the pre-helper per-row math; the logit rows — cbpp, VerbAgg —
@@ -847,6 +1009,8 @@ impl GlmmWorkspace {
             groupings,
             family,
             nb_theta: f64::NAN,
+            gamma_phi: 1.0,
+            gamma_phi_held: None,
             nagq,
             parallel_inner: false,
             cluster_rows: None,
@@ -855,7 +1019,7 @@ impl GlmmWorkspace {
             n_theta,
             layout,
             packed,
-            solver: Bobyqa::new(n_theta + p + n_nb, config)
+            solver: Bobyqa::new(n_theta + p + n_disp, config)
                 .expect("BOBYQA config constants are valid by construction"),
             params,
             lower,
@@ -869,6 +1033,7 @@ impl GlmmWorkspace {
             pirls: PirlsScratch::for_shape(max_n, k, q, n_primary, nagq),
             z_buf: vec![0.0; max_n * (q - 1)],
             prior_w: vec![1.0; max_n],
+            prior_w_phi: vec![1.0; max_n],
             weighted: false,
             u_seed: vec![0.0; k.max(1)],
             wx: Mat::zeros(max_n, p),
@@ -982,7 +1147,7 @@ impl GlmmWorkspace {
 ///
 /// `coup_mask` is deliberately left `None` (the fresh constructor's value): the
 /// worker rebuilds its own coupling CSR on the first structured eval, matching the
-/// serial path's per-fit rebuild. `nb_theta`/`force_dense_schur` are copied because
+/// serial path's per-fit rebuild. `nb_theta`/`gamma_phi`/`force_dense_schur` are copied because
 /// the deviance reads them; `cluster_rows` stays `None` — on the AGQ path the
 /// node-outer fallback it triggers is bit-identical to the cluster-outer loop.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
@@ -1001,6 +1166,20 @@ pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
     // correct.
     let cols = w.packed.m_cols.len();
     w.packed.m_cols.copy_from_slice(&src.packed.m_cols[..cols]);
+    // The sparse factor's pattern is a function of `m_cols`, so the worker
+    // rebuilds its own over the copied columns whenever the source uses one;
+    // the symbolic analysis is deterministic, so the worker's evaluations are
+    // bit-identical to the source's.
+    if src.packed.sparse.is_some() {
+        let width = w.packed.width;
+        w.packed.sparse = Some(Box::new(PackedSparse::build(
+            &w.packed.m_cols[..n * width],
+            n,
+            width,
+            w.k,
+            w.p,
+        )));
+    }
     let len = w.z_buf.len();
     w.z_buf.copy_from_slice(&src.z_buf[..len]);
     w.prior_w[..n].copy_from_slice(&src.prior_w[..n]);
@@ -1020,6 +1199,8 @@ pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
         .as_ref()
         .map(|ss| ss.clone_scratch());
     w.nb_theta = src.nb_theta;
+    w.gamma_phi = src.gamma_phi;
+    w.gamma_phi_held = src.gamma_phi_held;
     // FD seed state (joint_hessian_cov sets these before the grid).
     w.params.copy_from_slice(&src.params);
     w.fd = src.fd.clone();
@@ -1291,6 +1472,35 @@ pub(crate) fn fill_packed_cols(
     extra_ids: &[Vec<u32>],
     n: usize,
 ) {
+    fill_packed_cols_with(ws, cluster_ids, extra_ids, n, None);
+}
+
+/// Smallest `k` at which [`fill_packed_cols`] considers the sparse factor of
+/// `A`. PROVISIONAL (2026-09-24): the measured wins are all at `k = 810–1835`
+/// (10–30× per evaluation), and below a few hundred columns the dense factor is
+/// cheap enough that the symbolic analysis is not worth it. To be replaced by
+/// a locked-machine native and WASM measurement.
+pub(crate) const PACKED_SPARSE_MIN_K: usize = 256;
+/// Largest symbolic fill `nnz(L) / (k(k+1)/2)` at which [`fill_packed_cols`]
+/// keeps the sparse factor. PROVISIONAL (2026-09-24), same measurement owed as
+/// [`PACKED_SPARSE_MIN_K`]: `binb_cross8_g3000p20` at 0.92 fill ran 2.5× slower
+/// sparse, every cell that gained was far below this.
+pub(crate) const PACKED_SPARSE_MAX_FILL: f64 = 0.5;
+
+/// [`fill_packed_cols`] with the dense/sparse choice for `A`'s factor made
+/// explicit: `None` applies the switch (`k ≥ PACKED_SPARSE_MIN_K` and the
+/// symbolic fill `≤ PACKED_SPARSE_MAX_FILL`), `Some(true)`/`Some(false)` force
+/// the sparse or the dense factor. The pattern is a function of the level ids,
+/// so it is (re)built here, where they are read, and never lazily in a solve:
+/// a `loop_advanced` caller that refills a reused workspace with new ids at the
+/// same `n` gets the new pattern.
+pub(crate) fn fill_packed_cols_with(
+    ws: &mut GlmmWorkspace,
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    n: usize,
+    sparse: Option<bool>,
+) {
     let width = ws.packed.width;
     if width == 0 {
         return;
@@ -1313,6 +1523,18 @@ pub(crate) fn fill_packed_cols(
             }
         }
     }
+    let (k, p) = (ws.k, ws.p);
+    ws.packed.sparse = match sparse {
+        Some(false) => None,
+        None if k < PACKED_SPARSE_MIN_K => None,
+        forced => {
+            let sp = PackedSparse::build(&ws.packed.m_cols[..n * width], n, width, k, p);
+            let dense_tri = (k * (k + 1) / 2) as f64;
+            let keep = forced == Some(true)
+                || sp.symbolic.len_val() as f64 <= PACKED_SPARSE_MAX_FILL * dense_tri;
+            keep.then(|| Box::new(sp))
+        }
+    };
 }
 
 /// Per-fit hoist of the primary-slope Z columns: `z_buf[i·(q−1)+d] =

@@ -1,5 +1,0 @@
-{
-  "//": "Documented divergences from the reference engines. The rules this file plays by \u2014 what makes an entry green, what still fails, and why a stale entry fails too \u2014 are written once in validation/README.md under 'Documented divergences'. Read them there; they are deliberately not restated here. Consumers: validation/compare.R and the in-crate cross-engine tier (tests/oracle_support). `summary` is the standalone short form, so an entry means something without the long-form review.",
-  "//fields": "id: stable key. dataset/rung: which fixture (rung is null on an m3_goldens cell, which has no manifest rung). comparison: 'lme4-vs-glmm' for compare.R's reference table, 'oracle-tier' for the in-crate goldens tier; an entry may list both. quantities: the comparison labels each consumer uses. max_rel: the largest relative difference the entry covers \u2014 an observation exceeding it FAILS, so a divergence that grows is not silently absorbed. direction: which way the criterion moved.",
-  "entries": []
-}

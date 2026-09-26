@@ -1044,6 +1044,10 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
     let mut mixed_prev = f64::INFINITY; // the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
     let mut halvings = 0usize;
     let mut converged = false;
+    // Period-2 damping state — see `PIRLS_OSC_RATIO`.
+    let mut dmix_prev = f64::NAN;
+    let mut osc_flips = 0usize;
+    let mut damp = false;
     // `observed = !canonical` pairs with the `exact = true` seed, mirroring
     // `blocked.rs`'s contract — change together: the step the kernel then
     // takes IS the Hessian step, so the caller may trust the lanes after one
@@ -1136,6 +1140,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         // domain-infeasible trial halves here; an overshoot on `dev + pen_u` is
         // judged later, after log|A| is known, against the FULL merit.
         if infeasible
+            || !penalized.value().is_finite()
             || (!exact && penalized.value() - pen_accepted > tol * (1.0 + penalized.value().abs()))
         {
             if halvings < PIRLS_MAX_HALVINGS {
@@ -1251,6 +1256,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         } = &mut beta_step
         {
             if non_canonical {
+                let (mu_lo, mu_hi) = crate::family::pinned_mu_bounds(family, weighted);
                 for i in 0..n {
                     let f = cluster_ids[i] as usize;
                     let m_core = &m_core_buf[i * qc..i * qc + qc];
@@ -1258,10 +1264,17 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     let ncz = n_cross[i] as usize;
                     let cb = f * qc * qc;
                     let coup = f * qc * e;
-                    let wo = crate::family::observed_weight(
-                        family, nb_theta, y[i], prior_w[i], eta[i], prob[i], w[i],
-                    )
-                    .value();
+                    let wo = row_observed_weight(
+                        family,
+                        nb_theta,
+                        y[i],
+                        prior_w[i],
+                        eta[i].value(),
+                        prob[i].value(),
+                        w[i].value(),
+                        mu_lo,
+                        mu_hi,
+                    );
                     for r in 0..qc {
                         let mr = m_core[r].value();
                         let wmr = wo * mr;
@@ -1394,6 +1407,10 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 );
             }
         };
+        // The `log|A|` the exact-profile merit and exit band read: this Fisher
+        // factor's, unless the objective's curvature is the observed one, where
+        // the observed twin below overwrites it (`exact_obj`).
+        let mut logdet_merit = logdet.value();
         layout.solve_in_place();
         // Observed-information step: the same three objects from `W_obs`, factored
         // and solved by the same two functions on their own buffers, so the Fisher
@@ -1481,10 +1498,12 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
             // for the iteration — the crossed Schur couples every cluster, so a
             // non-PD twin drops the whole trial back to Fisher rather than mixing
             // observed and Fisher blocks inside one factor. `log|A|`, the leverage
-            // hᵢ and the `S⁻¹` columns below stay on the Fisher factor: they are
-            // the objective's own quantities, not the adjoint's.
-            let obs_ok = if crate::family::is_canonical(family) {
-                false
+            // hᵢ and the `S⁻¹` columns below are the objective's own quantities:
+            // on the Fisher factor where the exact curvature IS Fisher, on this
+            // observed twin where it differs (`exact_obj`), since the objective's
+            // `log|A|` is `log|A_obs|` there (`evaluate_at_mode`).
+            let obs_ld = if crate::family::is_canonical(family) {
+                None
             } else {
                 // +I was applied above (the twin +I block, mirroring the Fisher
                 // pair's own +I); factor here, mirroring the Fisher pair below.
@@ -1501,8 +1520,36 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                         ex.obs_schur.as_mut()
                     },
                 )
-                .is_some()
             };
+            let obs_ok = obs_ld.is_some();
+            let exact_obj = crate::family::exact_curvature_differs(family);
+            // Where the objective is `log|A_obs|`, a trial whose twin is not PD
+            // has objective `+∞`: rejected and halved like an unfactorable Fisher
+            // trial (mirrors `pirls_solve_blocked`).
+            if exact_obj {
+                match obs_ld {
+                    Some(ld) => logdet_merit = ld,
+                    None => {
+                        if halvings < PIRLS_MAX_HALVINGS {
+                            halvings += 1;
+                            for c in 0..k {
+                                u[c] = T::from_f64(0.5 * (u_prev[c].value() + ex.u_acc[c]));
+                            }
+                            for j in 0..p {
+                                beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
+                            }
+                            refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+                            continue;
+                        }
+                        return (
+                            T::from_f64(f64::NAN),
+                            T::from_f64(f64::NAN),
+                            T::from_f64(f64::NAN),
+                            false,
+                        );
+                    }
+                }
+            }
             let gu_dot_du = {
                 let StructuredFactor {
                     core_blocks,
@@ -1542,34 +1589,68 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 // `core_blocks` factored, and nothing between here and pass A
                 // writes it.
                 let fac_f64 = &mut fac_f64[..qc * qc * s];
-                for (o, v) in fac_f64.iter_mut().zip(core_blocks[..qc * qc * s].iter()) {
-                    *o = v.value();
+                if exact_obj {
+                    fac_f64.copy_from_slice(&obs_core_blocks[..qc * qc * s]);
+                } else {
+                    for (o, v) in fac_f64.iter_mut().zip(core_blocks[..qc * qc * s].iter()) {
+                        *o = v.value();
+                    }
                 }
                 // S⁻¹ column by column, through the same tail solve the u-step
                 // uses, so it inherits whichever factor `structured_factor` left
                 // (cached sparse LLT, or the dense L in `schur_blk`). `a_rhs`'s
                 // crossed tail is the T-typed staging slot — free now, its u-solve
                 // was scattered to `u` just above. Column-major:
-                // `tail_inv[b·e + a] = (S⁻¹)_{a,b}`.
-                for b in 0..e {
-                    for slot in a_rhs[k_family..k_family + e].iter_mut() {
-                        *slot = T::ZERO;
+                // `tail_inv[b·e + a] = (S⁻¹)_{a,b}`. On `exact_obj` the tail is the
+                // observed twin's, solved at f64 with `logdet_u[..e]` (still all
+                // zero, rezeroed after) as the staging column.
+                if exact_obj {
+                    for b in 0..e {
+                        let col = &mut logdet_u[..e];
+                        col.fill(0.0);
+                        col[b] = 1.0;
+                        <f64 as TailKernel>::tail_solve(
+                            obs_schur_blk,
+                            e,
+                            if force_dense {
+                                None
+                            } else {
+                                obs_schur.as_mut()
+                            },
+                            col,
+                        );
+                        tail_inv[b * e..b * e + e].copy_from_slice(col);
                     }
-                    a_rhs[k_family + b] = T::ONE;
-                    T::tail_solve(
-                        schur_blk,
-                        e,
-                        if force_dense {
-                            None
-                        } else {
-                            structured_schur.as_deref_mut()
-                        },
-                        &mut a_rhs[k_family..k_family + e],
-                    );
-                    for a in 0..e {
-                        tail_inv[b * e + a] = a_rhs[k_family + a].value();
+                    logdet_u[..e].fill(0.0);
+                } else {
+                    for b in 0..e {
+                        for slot in a_rhs[k_family..k_family + e].iter_mut() {
+                            *slot = T::ZERO;
+                        }
+                        a_rhs[k_family + b] = T::ONE;
+                        T::tail_solve(
+                            schur_blk,
+                            e,
+                            if force_dense {
+                                None
+                            } else {
+                                structured_schur.as_deref_mut()
+                            },
+                            &mut a_rhs[k_family..k_family + e],
+                        );
+                        for a in 0..e {
+                            tail_inv[b * e + a] = a_rhs[k_family + a].value();
+                        }
                     }
                 }
+                // The coupling `C_f` of whichever factor the leverage is read off.
+                let cpl = |idx: usize| -> f64 {
+                    if exact_obj {
+                        obs_coupling[idx]
+                    } else {
+                        coupling[idx].value()
+                    }
+                };
                 // The two per-cluster forms pass A's row loop reads in place of
                 // a walk over cluster `f`'s coupling columns: `H_f = C_f S⁻¹`
                 // into `tail_h` (`q_core × e`, written only on `cols_f`) and
@@ -1592,7 +1673,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                             let mut acc = 0.0;
                             for &a in cols {
                                 let a = a as usize;
-                                acc += coupling[coup + l * e + a].value() * tail_inv[b * e + a];
+                                acc += cpl(coup + l * e + a) * tail_inv[b * e + a];
                             }
                             tail_h[coup + l * e + b] = acc;
                         }
@@ -1603,8 +1684,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                             let mut acc = 0.0;
                             for &b in cols {
                                 let b = b as usize;
-                                acc +=
-                                    tail_h[coup + l1 * e + b] * coupling[coup + l2 * e + b].value();
+                                acc += tail_h[coup + l1 * e + b] * cpl(coup + l2 * e + b);
                             }
                             tail_g[gb + l1 * qc + l2] = acc;
                         }
@@ -1619,6 +1699,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 // k×p `dũ/dβ`.
                 let mut mc = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
                 let mut yc = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
+                let (obs_mu_lo, obs_mu_hi) = crate::family::pinned_mu_bounds(family, weighted);
                 for i in 0..n {
                     let f = cluster_ids[i] as usize;
                     let cb = f * qc * qc;
@@ -1689,8 +1770,8 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                             for &b in cols {
                                 let b = b as usize;
                                 let mut acc = 0.0;
-                                for local in 0..qc {
-                                    acc += coupling[coup + local * e + b].value() * yc[local];
+                                for (local, &yl) in yc.iter().enumerate().take(qc) {
+                                    acc += cpl(coup + local * e + b) * yl;
                                 }
                                 tail_r[b] = acc;
                             }
@@ -1716,7 +1797,18 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     // `dw/dη`, held equal to this `Dual<1>` line by
                     // `weight_eta_deriv_matches_dual1_of_irls_weight`
                     // (`src/family.rs`); changing either alone moves `f64` bits.
-                    let wp = {
+                    let wp = if exact_obj {
+                        row_observed_weight_eta_deriv(
+                            family,
+                            nb_theta,
+                            y[i],
+                            prior_w[i],
+                            eta[i].value(),
+                            prob[i].value(),
+                            obs_mu_lo,
+                            obs_mu_hi,
+                        )
+                    } else {
                         let et = crate::dual::Dual::<1> {
                             v: eta[i].value(),
                             d: [1.0],
@@ -1812,10 +1904,17 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                         sdot += cross_val[cbase + z].value() * logdet_u[k_family + b];
                     }
                     let wt = if obs_ok {
-                        crate::family::observed_weight(
-                            family, nb_theta, y[i], prior_w[i], eta[i], prob[i], w[i],
+                        row_observed_weight(
+                            family,
+                            nb_theta,
+                            y[i],
+                            prior_w[i],
+                            eta[i].value(),
+                            prob[i].value(),
+                            w[i].value(),
+                            obs_mu_lo,
+                            obs_mu_hi,
                         )
-                        .value()
                     } else {
                         w[i].value()
                     };
@@ -1837,11 +1936,16 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
             // `l_acc` rejects every later (correct) iterate until the iteration
             // cap. Undo that first-order part with the gradient already at hand:
             // g_u'·δu₀ ≈ log|A(ũ)| − log|A(u)|, a correction that vanishes as δu₀ → 0.
-            let l_trial = (dev + pen_u).value() + 2.0 * logdet.value() + gu_dot_du;
+            let l_trial = (dev + pen_u).value() + 2.0 * logdet_merit + gu_dot_du;
             // Accept band charges the mode-consistency correction at BOTH
             // endpoints — reasoning in `pirls_solve_blocked`'s merit test,
             // change together.
-            if l_trial - l_acc > tol * (1.0 + l_trial.abs()) + gu_dot_du.abs() + l_acc_slack {
+            // A non-finite merit (an overflowed step) is an overshoot: every
+            // comparison with NaN is false, so without this test it would be
+            // accepted and poison `l_acc` for the rest of the solve.
+            if !l_trial.is_finite()
+                || l_trial - l_acc > tol * (1.0 + l_trial.abs()) + gu_dot_du.abs() + l_acc_slack
+            {
                 if halvings < PIRLS_MAX_HALVINGS {
                     halvings += 1;
                     for c in 0..k {
@@ -2050,21 +2154,58 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 pen += u[c] * u[c];
             }
         }
+        // Relaxed step once the period-2 detector has fired (`PIRLS_OSC_RATIO`):
+        // move half way from the pre-step iterate, β in lockstep with u.
+        if damp {
+            let half = T::from_f64(0.5);
+            for c in 0..k {
+                u[c] = u_prev[c] + half * (u[c] - u_prev[c]);
+            }
+            if let BetaStep::Profile { beta_prev, .. } = &beta_step {
+                for j in 0..p {
+                    beta[j] = T::from_f64(beta_prev[j] + 0.5 * (beta[j].value() - beta_prev[j]));
+                }
+                refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+            }
+            pen = T::ZERO;
+            #[allow(clippy::needless_range_loop)]
+            for c in 0..k {
+                pen += u[c] * u[c];
+            }
+        }
         // The stopping rule, verbatim: the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` band on
         // successive steps — bit-identical iterate path and returned values to the
-        // pre-halving loop when no halving fires (see `pirls_solve_packed` for why the
-        // same-point band above cannot itself be a converge trigger).
+        // pre-halving loop when no halving fires. The same-point band above cannot
+        // itself be a converge trigger: on a solve that cycles it stops at one point
+        // of the cycle rather than at the mode, and it broke the AGQ(k=1) ≡ Laplace
+        // reduction when it was one (mirrors `pirls_solve_blocked`).
         // Exact mode: the exit band must track the same merit the accept/halve
         // decision above uses (dev + pen + 2·log|A|), or the loop could settle on a
         // point that is a fixed point of dev+pen alone but still moving in log|A|.
         // The merit's mode-consistency term is deliberately absent here: it is
         // proportional to δu₀, which the band already forces to zero, so including
         // it would change no fixed point and only the iterate count.
-        let mixed = (dev + pen).value() + if exact { 2.0 * logdet.value() } else { 0.0 };
+        let mixed = (dev + pen).value() + if exact { 2.0 * logdet_merit } else { 0.0 };
         if it + 1 >= min_iters && (mixed - mixed_prev).abs() < tol * (1.0 + mixed.abs()) {
             converged = true;
             break;
         }
+        // Period-2 detector — see `PIRLS_OSC_RATIO`. Off on a dual
+        // solve: a halved step is not the one-step Hessian step `DualStep::exact`
+        // promises.
+        let dmix = mixed - mixed_prev;
+        if dual.is_none()
+            && dmix.is_finite()
+            && dmix_prev.is_finite()
+            && dmix * dmix_prev < 0.0
+            && dmix.abs() > PIRLS_OSC_RATIO * dmix_prev.abs()
+        {
+            osc_flips += 1;
+        } else {
+            osc_flips = 0;
+        }
+        damp |= osc_flips >= PIRLS_OSC_TRIGGER;
+        dmix_prev = dmix;
         mixed_prev = mixed;
     }
     // The returned `dev`, `log|A|` and core/Schur factors at the returned

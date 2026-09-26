@@ -4,7 +4,7 @@ value. Not part of the public glmm API — a doc-build convenience so every
 recipe's printed comparison numbers come from the golden file, never typed by
 hand.
 
-Tolerance constants mirror validation/tol.R (an R script, not machine-parsed
+Tolerance constants mirror validation/grid/tol.R (an R script, not machine-parsed
 from here, hence duplicated as constants with the source noted).
 """
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 GOLDENS_DIR = Path(__file__).resolve().parents[3] / "validation" / "goldens"
 
-# validation/tol.R
+# validation/grid/tol.R
 TOL_BETA_REL = 1e-3
 TOL_SE_REL = 1e-3
 TOL_SE_HESSIAN_REL = 1e-3

@@ -1,0 +1,36 @@
+{
+  "dataset": "path_huge_int",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "gaussian",
+  "reml": true,
+  "rung": 41,
+  "converged": true,
+  "singular": false,
+  "optimizer": "nloptwrap",
+  "n_eval": 29,
+  "tolPwrss": {},
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.815070369650092, 0.578337405240563],
+    "se": [0.170726591948048, 0.031645335794622],
+    "loglik": -160.928111326042,
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)"],
+        "stddev": [0.75108539603813],
+        "corr": [
+          [1]
+        ]
+      }
+    ],
+    "sigma": 23.2156854492949
+  },
+  "timing": {
+    "fit_seconds_median": 0.139031171798706,
+    "n_runs": 4,
+    "warmup_discarded": 1,
+    "fits_per_sample": 10
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "dataset": "path_dominant",
+  "engine": "lme4",
+  "engine_version": "1.1.38",
+  "family": "gaussian",
+  "reml": null,
+  "rung": 42,
+  "converged": true,
+  "singular": false,
+  "optimizer": "lm",
+  "n_eval": 1,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [1.19004369039409, 0.681671085256218],
+    "se": [0.0601758770940026, 0.0682848752021783],
+    "loglik": -136.282061572997,
+    "varcomp": [],
+    "sigma": 0.999934636821674
+  },
+  "timing": {
+    "fit_seconds_median": 0.00426673889160156,
+    "n_runs": 4,
+    "warmup_discarded": 1,
+    "fits_per_sample": 10
+  }
+}

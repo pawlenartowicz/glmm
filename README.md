@@ -70,7 +70,7 @@ README's own copy of the essentials, not the whole set.
 | [`documentation/installation.md`](documentation/installation.md) | Installing the Rust crate, Python package, and R package |
 | [`documentation/formula.md`](documentation/formula.md) | What the formula parser accepts and rejects, with workarounds |
 | [`documentation/conventions.md`](documentation/conventions.md) | Estimation, standard-error, dispersion, and variance-component conventions, and the flags on a fit result |
-| [`documentation/validation.md`](documentation/validation.md) | How glmm is validated against lme4 and MixedModels.jl, what's covered, and known tolerances/exemptions |
+| [`documentation/validation.md`](documentation/validation.md) | How glmm is validated: the accuracy grid, its four pinned oracles, the four gates, and what's covered |
 | [`documentation/coming-from-lme4.md`](documentation/coming-from-lme4.md) | Call mapping from lme4, what's deliberately missing, and behavioral differences to watch (covers both the R and Python surface) |
 | [`documentation/coming-from-statsmodels.md`](documentation/coming-from-statsmodels.md) | Migrating from `statsmodels` `MixedLM`/`GLM` to `glmm.fit` (Python only) |
 | [`documentation/troubleshooting.md`](documentation/troubleshooting.md) | Fixes for singular fits, non-convergence, NotImplementedError, and rejected formulas |

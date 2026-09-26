@@ -230,7 +230,17 @@ pub(super) fn prep_glmm_design(
 ) {
     ws.parallel_inner = opts.parallel_inner;
     if let Some(w) = &opts.weights {
-        ws.prior_w[..n].copy_from_slice(w);
+        // Gamma runs its outer φ search and dispersion term on `ŵ = w/s`
+        // (precision weights are not scale-free on raw `w` — see
+        // `family::gamma_dispersion_term`); every other family keeps raw `w`.
+        if matches!(ws.family, crate::Family::Gamma { .. }) {
+            let s = crate::family::weight_scale(Some(w), n);
+            for (dst, &wi) in ws.prior_w[..n].iter_mut().zip(w.iter()) {
+                *dst = wi / s;
+            }
+        } else {
+            ws.prior_w[..n].copy_from_slice(w);
+        }
         ws.weighted = true;
     } else {
         ws.weighted = false;
@@ -334,7 +344,10 @@ pub(crate) fn fit_glmm_packed(
     // NB seeds its `ln θ_NB` coordinate from the no-RE GLM-NB's own θ̂, exactly
     // as [`fit_glmm_nb`] does, so the two routes start the same search.
     let nb_theta = match model.family {
-        Family::NegativeBinomial { .. } => super::glm::fit_glm_nb(x, y, n, p, None, opts).1,
+        Family::NegativeBinomial { .. } => {
+            let (prefit, theta) = super::glm::fit_glm_nb(x, y, n, p, None, opts);
+            nb_glmm_seed(prefit.converged(), theta)
+        }
         _ => nb_theta,
     };
     fit_glmm_prebuilt(
@@ -351,6 +364,29 @@ pub(crate) fn fit_glmm_packed(
         opts,
     )
 }
+
+/// The NB GLMM's `ln θ_NB` start from the no-RE GLM-NB prefit: its θ̂ when the
+/// prefit converged at least a factor [`NB_SEED_FLOOR_FACTOR`] above the box
+/// floor `NB_THETA_LO`, and [`NB_SEED_FALLBACK`] otherwise. A prefit that fails,
+/// or that runs to the floor (MASS's `glm.nb` fails on the same data there),
+/// starts the outer search in a region where PIRLS barely converges and the
+/// search can settle at a wrong point: measured on grid cell
+/// `nb_q2sx2_g3000p5_bal_base`, a 0.014 start converged 3808 logLik below
+/// glmmTMB, while θ = 1 reached glmmTMB's optimum in 324 evaluations, and on
+/// `nb_q8_g3000p20_bal_base` a 0.009 start took 38143 evaluations against 1145.
+pub(crate) fn nb_glmm_seed(prefit_converged: bool, prefit_theta: f64) -> f64 {
+    if prefit_converged && prefit_theta >= NB_SEED_FLOOR_FACTOR * super::NB_THETA_LO {
+        prefit_theta
+    } else {
+        NB_SEED_FALLBACK
+    }
+}
+
+/// See [`nb_glmm_seed`].
+const NB_SEED_FLOOR_FACTOR: f64 = 10.0;
+/// See [`nb_glmm_seed`]: the measured start that reaches the optimum on both
+/// cells the floor guard exists for.
+const NB_SEED_FALLBACK: f64 = 1.0;
 
 /// Borrowed result of [`run_glmm_on`]: the [`GlmmFit`] summary, the θ̂ it was fit
 /// at, and a shared borrow of the whole solved [`GlmmWorkspace`] (the assembly
@@ -478,6 +514,15 @@ pub(crate) fn run_glmm_on<'a>(
             opts.offset.as_deref(),
         ),
     };
+    // A held Gamma φ is a fixed value of the objective, not a coordinate. The
+    // outer search runs on the internal `ŵ = w/s` scale (`prep_glmm_design`),
+    // so a held raw-scale `v` enters there as `v/s`.
+    ws.gamma_phi_held = match model.family {
+        Family::Gamma { .. } => opts
+            .dispersion
+            .map(|v| v / crate::family::weight_scale(opts.weights.as_deref(), n)),
+        _ => None,
+    };
     let glmm_fit = crate::glmm::fit_glmm(
         ws,
         x_mat,
@@ -517,6 +562,11 @@ pub(crate) fn glmm_view_to_fit(
     let glmm_fit = &view.fit;
     let diag = view.diagnostics();
     let converged = diag.converged;
+    // Gated on the finite endpoint (the re-eval deviance), not `converged`: the
+    // plateau policy `fit/lmm.rs` applies. A `MaxFunReached` exit reports τ̂², D̂
+    // and the dispersion at its incumbent with `converged == false`; every other
+    // non-convergence goes through `nan_fit`, whose deviance is +∞.
+    let has_endpoint = glmm_fit.deviance.is_finite();
     let nb_theta = view.nb_theta;
     let n_theta = ws.n_theta;
 
@@ -526,33 +576,22 @@ pub(crate) fn glmm_view_to_fit(
     let mut se = vec![f64::NAN; p];
     fill_se_by_predictor(&ws.inference.var_diag, &opts.target_indices, &mut se);
 
-    // tau2[k] = σ²·θ̂[k]². lme4 parametrizes the RE covariance as σ²·θθ', so VarCorr
-    // reports sd = σ·θ̂; our internal λ̂ = ws.params[..n_theta] IS that relative factor
-    // θ̂ (the Laplace penalty is the unit ‖u‖²). For binomial/Poisson/NB the residual
-    // scale σ²≡1, but Gamma's σ² = pwrss/n = (Pearson χ² + ‖û‖²)/n ≠ 1, so its
-    // variance components carry it. (Distinct from `dispersion` below — that is the
-    // Pearson/(n−p) moment lme4 reports separately, a different quantity.) Same
-    // q≥2-slope caveat as fit_mle's tau2.
-    // σ̂² = pwrss/n (family::glmm_sigma_sq; exactly 1.0 for the φ≡1 families),
-    // hoisted so tau2 and varcorr below carry the SAME scale — lme4's VarCorr
-    // convention. Only meaningful on a converged fit (reads the converged
-    // μ̂/û state).
-    let sigma_sq = if converged {
-        crate::family::glmm_sigma_sq(
-            model.family,
-            &y[..n],
-            &ws.pirls.prob[..n],
-            &ws.pirls.u[..ws.k],
-            ws.weighted.then(|| &ws.prior_w[..n]),
-        )
-    } else {
-        f64::NAN
-    };
+    // tau2[k] = θ̂[k]², with no residual-scale factor on any family. θ̂ =
+    // ws.params[..n_theta] is the factor of the unit ridge ‖u‖², and the
+    // dispersion is carried on the DATA side of the Gamma objective — the prior
+    // weights PIRLS runs on are divided by φ̂ (see
+    // `glmm::deviance::laplace_deviance`) — never on that ridge. θ̂ therefore
+    // comes out in the response's own absolute units, and rescaling it here
+    // would double-count φ̂. lme4 reports `σ·θ̂` instead because its own
+    // φ-free PIRLS leaves θ̂ relative; glmmTMB and GLMMadaptive report RE
+    // standard deviations in absolute units, as this does. (`dispersion` below
+    // is φ̂ itself.) Same q≥2-slope caveat as fit_mle's tau2.
+    let sigma_sq = if has_endpoint { 1.0 } else { f64::NAN };
     // θ̂ is in the solver's internal RE units (`LmmGroupings::set_slope_scales`);
     // dividing by the Λ-row scales puts every θ-derived magnitude back into the
     // design's own units before it is squared.
     let theta_scales = ws.groupings.theta_row_scales();
-    let tau2: Vec<f64> = if converged {
+    let tau2: Vec<f64> = if has_endpoint {
         ws.params[..n_theta]
             .iter()
             .zip(theta_scales.iter())
@@ -562,41 +601,30 @@ pub(crate) fn glmm_view_to_fit(
         vec![f64::NAN; n_theta]
     };
 
-    // Dispersion. Binomial/Poisson hold φ≡1. Gamma recovers the (possibly
-    // weighted) Pearson moment estimator on the conditional-mode residuals
-    // (μ̂ = ws.pirls.prob after the pinned-γ̂ re-eval): `φ̂ = Σ wᵢrᵢ²/(n−p)`,
-    // `rᵢ = (yᵢ−μ̂ᵢ)/√V(μ̂ᵢ)` (raw `n−p` df, not `Σwᵢ−p`). It does NOT rescale the
-    // SE here — the kernel already reports each arm on lme4's convention: Hessian
-    // unscaled (`vcov(use.hessian=TRUE)`, oracle-settled) and Rx carrying σ̂² =
-    // pwrss/n (`vcov(use.hessian=FALSE)`; `family::glmm_sigma_sq`, a DIFFERENT
-    // quantity than this φ̂).
-    let dispersion = if !converged {
+    // Dispersion. Binomial/Poisson hold φ≡1. Gamma reports φ̂, the maximum-
+    // likelihood value of the Laplace objective: the outer search carries
+    // `ln φ_int` as a coordinate on the internal `ŵ = w/s` scale and leaves
+    // φ̂_int in `ws.gamma_phi` (`glmm::fit_glmm`); the reported φ̂ is `s·φ̂_int`.
+    // It is the φ both SE arms already carry on that internal scale (the
+    // PIRLS weights are `ŵᵢ/φ̂_int` = `wᵢ/φ̂`), so nothing else is rescaled here.
+    let dispersion = if !has_endpoint {
         f64::NAN
     } else {
         match model.family {
             Family::Gamma { .. } => match opts.dispersion {
                 Some(v) => v,
-                None => crate::family::pearson_dispersion(
-                    &y[..n],
-                    &ws.pirls.prob[..n],
-                    model.family,
-                    nb_theta,
-                    n,
-                    p,
-                    Some(&ws.prior_w[..n]),
-                ),
+                None => crate::family::weight_scale(opts.weights.as_deref(), n) * ws.gamma_phi,
             },
             Family::NegativeBinomial { .. } => nb_theta,
             _ => 1.0,
         }
     };
 
-    // GLMM D̂ = σ̂²·Λ̂Λ̂' — the same σ̂² that scales tau2 above, so the two
-    // accessors report the one variance component on one scale (lme4 VarCorr;
-    // σ̂² ≡ 1 for binomial/Poisson/NB, so this only bites dispersion families
-    // like Gamma). Oracle: `fit_glmm_gamma_sim_matches_lme4` /
-    // `validation/goldens/sim_gamma_glmm.json` varcomp stddevs.
-    let varcorr = if converged {
+    // GLMM D̂ = σ̂²·Λ̂Λ̂' — the same σ̂² (≡ 1, see tau2 above) that scales tau2,
+    // so the two accessors report the one variance component on one scale.
+    // Oracle on Gamma: `fit_glmm_gamma_sim_matches_grid_reference` /
+    // `validation/goldens/sim_gamma_glmm_tmb.json` varcomp stddevs.
+    let varcorr = if has_endpoint {
         assemble_varcorr(&ws.params[..n_theta], &ws.groupings, sigma_sq)
     } else {
         vec![]
@@ -690,8 +718,13 @@ pub(crate) fn glmm_view_to_fit(
         ranef,
         ranef_levels,
     };
+    // A capped (`MaxFunReached`) endpoint is reported as a point, not an
+    // accepted optimum, even though `varcorr` is now finite there — so the
+    // post-hoc negligible-component check only runs on a converged fit
+    // (mirrors `fit/lmm.rs`, same gate).
     fit.diagnostics.singular = fit.diagnostics.singular
-        || fit.has_negligible_component(&super::common::re_scale_grid(&ws.groupings));
+        || (converged
+            && fit.has_negligible_component(&super::common::re_scale_grid(&ws.groupings)));
     (fit, mu_hat, glmm_fit.deviance)
 }
 
@@ -767,14 +800,14 @@ pub(super) fn fit_glmm_nb(
     // handing the outer BOBYQA a `+∞` plateau it can't escape. The no-RE GLM-NB's own
     // θ̂ is a start, not an estimate (the fixed effects alone under-explain the mean,
     // so it still moves under the outer search), but it starts inside the basin PIRLS
-    // can actually converge in. Taken unguarded: on finite `y` the prefit always
-    // reports a θ inside `[NB_THETA_LO, NB_THETA_HI]` (its own seed is clamped there
-    // and the profile search never leaves the box), so there is nothing a fallback
-    // could rescue. `fit_glm_nb` hands back that θ as its second return value —
-    // the last θ its alternation stood on, the moment seed if the first inner IRLS
-    // failed, the θ reached so far if a later one did — because the `Fit`'s own
-    // `dispersion` field is NaN unless the prefit converged.
-    let nb_seed = super::glm::fit_glm_nb(x, y, n, p, None, opts).1;
+    // can actually converge in, except where the prefit itself fails or runs to
+    // the box floor — see [`nb_glmm_seed`]. `fit_glm_nb` hands back its θ as its
+    // second return value — the last θ its alternation stood on, the moment seed
+    // if the first inner IRLS failed, the θ reached so far if a later one did —
+    // because the `Fit`'s own `dispersion` field is NaN unless the prefit
+    // converged.
+    let (prefit, prefit_theta) = super::glm::fit_glm_nb(x, y, n, p, None, opts);
+    let nb_seed = nb_glmm_seed(prefit.converged(), prefit_theta);
     fit_glmm_prebuilt(
         &mut ws,
         x_mat.as_ref().subrows(0, n),

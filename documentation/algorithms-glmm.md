@@ -27,11 +27,14 @@ The recurring symbols on this page, defined once here before first use:
   with prior `u ~ N(0, I)`; ũ is the converged mode.
 - **η, μ, W** — the linear predictor, the conditional mean (`link⁻¹` of η), and
   the IRLS working weights.
-- **A = MᵀWM + I** — the penalized-IRLS system matrix at the mode; one Cholesky
-  of A yields both the u-step and `log|A|`.
+- **A = MᵀWM + I** — the penalized-IRLS system matrix. PIRLS steps with the
+  Fisher weight; the objective's `log|A|` is taken at the mode with the exact
+  curvature `W_obs = −∂²ℓᵢ/∂ηᵢ²`, which is the Fisher weight on a canonical
+  link and differs from it on probit, cloglog, Gamma/log and NB/log (see
+  [Laplace approximation](#laplace-approximation)).
 - **β** — the fixed effects. In the objective, dispersion is fixed at 1 for
-  every family except Gamma (NB's θ is a shape parameter handled by the outer
-  loop, not an objective dispersion).
+  every family except Gamma, whose φ is a free parameter searched by the outer
+  loop as `ln φ` (NB's θ is a shape parameter searched the same way).
 - **nAGQ** — the Gauss–Hermite node count; `nAGQ=1` is the Laplace case.
 - **d(y, ũ)** — the family deviance evaluated at the converged mode.
 
@@ -86,7 +89,7 @@ GLMM shape, AGQ included (see the weights paragraph in the PIRLS section).
 **Validation:** the NoZ binomial/Poisson/Gamma path is pinned by cbpp
 (`fit_glmm_cbpp_matches_lme4`), grouseticks
 (`fit_glmm_poisson_grouseticks_matches_lme4`) and the Gamma goldens
-(`fit_glmm_gamma_sim_matches_lme4`, `goldens/sim_gamma_glmm.json`); the Sparse
+(`fit_glmm_gamma_sim_matches_grid_reference`, grid cell `sim_gamma`); the Sparse
 arm (the packed-row layout) by `sim_binomial_slope_crossed` (a slope-carrying
 crossed extra → `fit_sparse_binomial_slope_crossed_is_pinned` in
 `src/sparse/tests.rs`) and the over-count rungs `sim_sparse_binomial` / `sim_sparse_poisson`
@@ -97,8 +100,9 @@ crossed extra → `fit_sparse_binomial_slope_crossed_is_pinned` in
 **Code:** `pirls_solve_packed` (packed-row, `src/glmm/pirls/packed.rs`),
 `pirls_solve_blocked` (no extras, `src/glmm/pirls/blocked.rs`) and
 `pirls_solve_blocked_extras` (structured crossed/nested,
-`src/glmm/pirls/blocked_extras.rs`); caps `PIRLS_MAX_ITERS = 50`,
-`PIRLS_MAX_HALVINGS = 16` and the tolerance selector `pirls_tol` in
+`src/glmm/pirls/blocked_extras.rs`); caps `PIRLS_MAX_ITERS = 200`,
+`PIRLS_MAX_HALVINGS = 16`, the period-2 detector's `PIRLS_OSC_RATIO = 0.8` and
+`PIRLS_OSC_TRIGGER = 3`, and the tolerance selector `pirls_tol` in
 `src/glmm/mod.rs`.
 
 At a fixed θ the conditional modes ũ are found by penalized IRLS — Fisher
@@ -125,8 +129,20 @@ structure:
   the Schur identity, `log|A| = Σ_f log|A_f| + log|S|`.
 - **Packed** (everything else — a slope-carrying extra, over the envelope
   caps, too many crossed levels, or an extras core too wide for the
-  structured route): `M = ZΛ` in fixed-width rows and a dense `k×k` `A`,
-  factored whole.
+  structured route): `M = ZΛ` in fixed-width rows and a `k×k` `A`, factored
+  whole — densely, or through a sparse Cholesky on `A`'s fixed pattern (the
+  union of each row's `width` RE columns plus the diagonal, AMD-ordered, one
+  symbolic analysis per design, built by `fill_packed_cols`). The sparse factor
+  is taken when `k ≥ PACKED_SPARSE_MIN_K` (256) and the symbolic fill
+  `nnz(L)/(k(k+1)/2) ≤ PACKED_SPARSE_MAX_FILL` (0.5); both thresholds are
+  provisional until a locked native and WASM timing sets them. The per-row
+  scatter writes straight into whichever storage is in use, and a converged
+  solve expands the final `A` into the dense buffer once, for the Rx Schur
+  fill. Measured on the grid's wide cells (`k` = 810–1835, `A` 0.3–17 % full),
+  the dense factor was 70–91 % of the wall; the sparse one makes an evaluation
+  10–30× cheaper. A real numerical change against the dense factor (another
+  elimination order), agreeing to round-off
+  (`packed_sparse_factor_matches_the_dense_one`).
 
 Convergence follows the lme4 `pwrss` rule: exit when
 `|mixed − mixed_prev| < tol · (1 + |mixed|)`, checked after each step, with
@@ -153,8 +169,27 @@ penalized deviance rises above the last accepted value by more than the toleranc
 band is `δu = u − u_prev` halved and re-evaluated — up to `PIRLS_MAX_HALVINGS`
 times, after which the solve reports failure `(NaN, NaN, NaN, false)`. A
 within-band rise is treated as FP noise near the optimum and accepted without
-burning a halving. In Profile mode (below) the joint `(u, β)` step is backtracked
-in lockstep, halving β toward `beta_prev` alongside `u`.
+burning a halving. A non-finite trial (an overflowed step) always counts as an
+overshoot and is halved, as lme4's `ISNAN(pdev)` branch does; on the exact
+profile the same holds for a non-finite merit. In Profile mode (below) the joint
+`(u, β)` step is backtracked in lockstep, halving β toward `beta_prev` alongside
+`u`.
+
+**Period-2 damping.** On a non-canonical link the Fisher step uses the expected
+weight while the curvature of the conditional log-density is the observed one.
+Where the observed curvature exceeds twice the expected one along some
+direction, the undamped step overshoots the mode, the iteration map has an
+eigenvalue at or below −1, and the iterates settle into a 2-cycle: the
+same-point penalized deviance rises by less than the halving band per step
+while `mixed` keeps alternating by more than the stopping band, so the solve
+would run out `PIRLS_MAX_ITERS`. After `PIRLS_OSC_TRIGGER` consecutive sign
+flips of `mixed − mixed_prev`, each at least `PIRLS_OSC_RATIO` times the one
+before, every later step of that solve moves half way from the pre-step
+iterate (β in lockstep in Profile mode), which maps an eigenvalue λ of the
+undamped step to `(1 + λ)/2`. The detector is off on dual solves, whose
+one-step exactness it would break. A solve that converges before it fires is
+bit-identical. **Validation:** `nb_pirls_two_cycle_is_damped_and_the_fit_converges`
+(grid cell `nb_cross4_g300p5`, which exhausted the cap before).
 
 **Prior weights.** With `FitOptions::weights`, PIRLS folds `wᵢ` into the
 working weight (`wᵢ·W̃ᵢ`), the deviance contribution (`wᵢ·devᵢ`), and the
@@ -175,7 +210,7 @@ and the Gamma/NB goldens. The step-halving specifically recovers the
 grouseticks 3-crossed β=0 cold start
 (`fit_glmm_poisson_grouseticks_3crossed_matches_lme4`). Weighted GLMM paths are
 pinned by `fit_glmm_cbpp_aggregated_matches_lme4`,
-`fit_glmm_poisson_weighted_matches_lme4`, `fit_glmm_gamma_weighted_matches_lme4`
+`fit_glmm_poisson_weighted_matches_lme4`, `fit_glmm_gamma_weighted_matches_glmmtmb`
 (dense) and the `sparse_weighted_*` weighted-vs-replicated equivalence tests
 (sparse).
 
@@ -233,7 +268,33 @@ pin the fitted optimum.
 
 The `nAGQ=1` marginal objective is the Laplace deviance
 `d(y, ũ) + ‖ũ‖² + log|A|`, where `A = MᵀWM + I` at the converged mode ũ and the
-`+I` is the same ridge the penalty `‖ũ‖²` carries. Concretely the return is
+`+I` is the same ridge the penalty `‖ũ‖²` carries. `W` in that `A` is the exact
+curvature of the conditional log-density in η, `W_obs = −∂²ℓᵢ/∂ηᵢ²`
+(`family::observed_weight`; the Fisher weight on a μ-clamped row, see below):
+the Laplace approximation is a second-order expansion of the log integrand
+around ũ, and its curvature is the observed one. On a canonical link (logit,
+Poisson/log, and Gamma/inverse, whose observed and Fisher weights coincide
+although the crate's `is_canonical` kernel test leaves it out) it equals the
+Fisher weight PIRLS steps with. On probit, cloglog, Gamma/log and NB/log (`family::exact_curvature_differs`)
+it does not, and the exit refresh (`pirls::evaluate_at_mode`) scatters `W_obs`
+and factors `A_obs` for `log|A|`; the Fisher step only chooses the path to ũ,
+not ũ itself. lme4 and MixedModels.jl put the Fisher weight in `log|A|` on
+every link, so on those four links their objective is a different function
+from this one, and glmmTMB's (exact curvature, by automatic differentiation) is
+the same one. A non-PD `A_obs` returns `+∞`, as a non-PD Fisher factor does;
+there is no floor (`W_obs ≥ 0` strictly inside the μ clamps on all four links,
+each log-likelihood being log-concave in η). A row whose μ sits on a clamp keeps
+its Fisher weight in `log|A|`: μ is a constant there, and the clamped observed
+weight divides by `V` at the pin and can be large and negative (cloglog's upper
+pin with `y = 0`); the mode equation's Jacobian still takes the clamped observed
+weight, as it does on every link. The
+factor and weights the refresh leaves behind are the observed ones, so the Rx
+Schur fill is the observed information and the AGQ node scale is the exact
+curvature. The exact β-profile (`OuterSearch::ExactProfile`) profiles β on this
+same objective: its merit, exit band, leverage and `dW/dη` are taken off the
+observed twin factor it already builds for the adjoint
+(`family::observed_weight_eta_deriv`), and so are the assembled SE engine's
+`ℓ` terms. Concretely the return is
 `data_term + pen + 2·logdet` — `logdet` accumulates `Σ ln L_ii` off the
 Cholesky factor, i.e. `½·log|A|`, so `2·logdet` *is* the `log|A|` of the
 formula. All three terms come from the returned mode ũ: a converged PIRLS solve
@@ -244,21 +305,23 @@ pass inherits describe one iterate. That last rebuild is what the objective need
 `O(‖δu‖²)`, but `log|A(u)|` is not stationary and a lagged factor puts a
 first-order error in the objective and in every lane differentiated through it.
 `glmer` pairs the terms differently — its deviance and penalty sit at the new
-mode and only `log|A|` lags one iteration. For binomial and Poisson the data
-term is the bare deviance `D` (`glmer` substitutes the family
-`aic = D + const`, same minimizer, kept as `D` for byte-identity). **Gamma**
-is the sole exception: its data term is `family::gamma_aic`, which profiles
-the dispersion as `D/n` (`D/Σwᵢ` when
-weighted), making the objective a nonlinear function of `D` — the only route by
-which dispersion shifts `glmer`'s β̂/τ̂. No σ² scale enters the binomial/Poisson
-objective (dispersion fixed at 1). Non-convergence or a Cholesky failure
-returns `f64::INFINITY`, the module's failure surface.
+mode and only `log|A|` lags one iteration. The data term is the bare deviance
+`D` on every family (`glmer` substitutes the family `aic = D + const` on
+binomial and Poisson, same minimizer, kept as `D` for byte-identity). On
+**Gamma** PIRLS runs on the prior weights `wᵢ/φ` at the φ the caller passes
+(`gamma_phi`), so `D` there is `D/φ` and the working weights in `log|A|` carry
+the same `1/φ`; the φ-only rest of the Gamma log-density is added by the outer
+search (see [Gamma dispersion](#gamma-dispersion)). No σ² scale enters the
+binomial/Poisson objective (dispersion fixed at 1). Non-convergence or a
+Cholesky failure returns `f64::INFINITY`, the module's failure surface.
 
 **Convention/reference:** `glmer`'s `nAGQ=1` `devfun` (profiled Laplace
-deviance), with the `aic`-for-deviance substitution and the Gamma `aic`
-dispersion-profiling both matching lme4. **Validation:** cbpp (binomial),
-grouseticks (Poisson), the Gamma golden `sim_gamma_glmm`, and the white-box
-k=1 ≡ Laplace reduction asserted in `src/glmm/tests.rs`.
+deviance) on binomial and Poisson. On Gamma the objective is the exact Laplace
+log-likelihood with φ a free parameter, glmmTMB's; lme4 leaves φ out of PIRLS
+and profiles it as `D/n` inside its `aic`, a different objective (see
+[Gamma dispersion](#gamma-dispersion)). **Validation:** cbpp (binomial),
+grouseticks (Poisson), `fit_glmm_gamma_dispersion_is_the_laplace_ml_value`, and
+the white-box k=1 ≡ Laplace reduction asserted in `src/glmm/tests.rs`.
 
 ## Adaptive Gauss–Hermite quadrature (AGQ)
 
@@ -268,9 +331,9 @@ in `laplace_deviance` (`src/glmm/deviance.rs`); GH tables
 
 AGQ (`nAGQ>1`) applies only where the marginal likelihood factorizes into
 independent per-cluster integrals: a **single grouping factor, `q_p ≤ 3`
-random effects per group, binomial/Poisson GLMM**. The gate in
-`laplace_deviance` requires `nagq > 1`, no extra groupings, `primary_q` in
-`1..=3`, and a binomial/Poisson family; every other shape (and `nagq == 1`)
+random effects per group, binomial/Poisson/negative-binomial/Gamma GLMM**. The
+gate in `laplace_deviance` requires `nagq > 1`, no extra groupings, `primary_q`
+in `1..=3`, and one of those families; every other shape (and `nagq == 1`)
 falls through to the Laplace path unchanged. Within the gate, `q_p == 1`
 (scalar intercept) routes to `agq_deviance`; `q_p` in `2..=3` (vector RE)
 routes to `agq_deviance_vec`, its sibling kernel evaluating the same
@@ -279,7 +342,7 @@ scalar node set.
 
 ```mermaid
 flowchart TD
-  A["laplace_deviance at (θ, β)"] --> B{"nAGQ > 1 AND no extras AND q_p ≤ 3 AND binomial/Poisson"}
+  A["laplace_deviance at (θ, β)"] --> B{"nAGQ > 1 AND no extras AND q_p ≤ 3 AND binomial/Poisson/NB/Gamma"}
   B -->|"yes, q_p == 1"| C["agq_deviance (Liu-Pierce adaptive GH)"]
   B -->|"yes, q_p ∈ 2..=3"| E["agq_deviance_vec (k^q_p product grid)"]
   B -->|no| D["Laplace PIRLS branch (blocked / structured / packed)"]
@@ -371,7 +434,10 @@ the answer. The same `[ln 1e-3, ln 1e4]` bounds serve as the coordinate's box.
 It cold-starts from the no-RE GLM-NB's own θ̂ (one extra fixed-effects-only
 `fit_glm_nb`); the method-of-moments seed charges the RE variance to the
 dispersion and lands one to two orders of magnitude low, where PIRLS does not
-converge on random-slope shapes.
+converge on random-slope shapes. When that prefit fails, or lands within a
+factor of 10 of the box floor, the coordinate starts from θ = 1 instead
+(`fit::glmm::nb_glmm_seed`): measured on grid cell `nb_q2sx2_g3000p5`, a
+floor-side start converged 3808 logLik below glmmTMB.
 
 The reported `Fit::deviance` on an NB GLMM is the search's own objective,
 `deviance + (−2·saturated_loglik(θ̂))` at the fitted θ̂ — equal to `−2·logLik`
@@ -389,10 +455,96 @@ seeds from it, so a cap-exhausted prefit gives it a stale start — a start only
 which the coordinate then moves.)
 
 **Convention/reference:** the θ profile mirrors `MASS::theta.ml`; the outer
-marginal-θ maximization matches `lme4::glmer.nb`. The β SE conditions on θ̂
-(θ-uncertainty out of scope, the lme4/MASS convention). **Validation:**
-`fit_glmm_nb_sim_matches_lme4` against `goldens/sim_nb_glmm.json`; the
-packed-row layout by `goldens/sim_sparse_nb.json`.
+marginal-θ maximization is glmmTMB's `nbinom2` objective (lme4's `glmer.nb`
+builds its log-determinant from the Fisher weight, a different objective on this
+non-canonical link; see [Laplace approximation](#laplace-approximation)). The joint
+Hessian of `WaldSe::Hessian` carries the `ln θ_NB` coordinate, as glmmTMB's does,
+by central differences of the full objective in `(θ, β, ln θ_NB)`
+(`glmm::se::joint_hessian_cov`), so the β SE includes θ_NB's uncertainty; lme4's
+conditions on θ̂. `WaldSe::Rx` conditions on θ̂ by construction. **Validation:**
+`fit_glmm_nb_sim_matches_glmmtmb` against `goldens/sim_nb_glmm_tmb.json`,
+`nb_hessian_se_matches_fd_of_the_full_objective`; the packed-row layout by
+`goldens/sim_sparse_nb_tmb.json`.
+
+## Gamma dispersion
+
+**Code:** `glmm::fit_glmm` (the `ln φ` coordinate and its seed),
+`family::gamma_dispersion_term`, `GlmmWorkspace::gamma_phi` and
+`GlmmWorkspace::at_fixed_dispersion` in `src/glmm/workspace.rs`, and the
+dispersion row of `se::joint_hessian_cov`.
+
+With the Gamma unit deviance `dᵢ = 2[(yᵢ−μᵢ)/μᵢ − ln(yᵢ/μᵢ)]`, `weights`
+taken as precision weights (row `i`'s shape `aᵢ = wᵢ/φ`, the same convention
+as `lm`, `summary(glm)` and lme4 — see
+[`conventions.md`](conventions.md#prior-weights) — not glmmTMB's, which
+multiplies each row's log-density by `wᵢ` instead), and `D = Σ wᵢdᵢ` the
+weighted deviance, the log-density rearranges to
+`−2·log f(yᵢ; aᵢ, μᵢ) = aᵢ·dᵢ + 2aᵢ − 2aᵢ·ln aᵢ + 2·lnΓ(aᵢ) + 2·ln yᵢ`, so the
+Laplace deviance at `(θ, β, φ)` is
+
+```text
+  F(θ, β, φ) = D(û)/φ + ‖û‖² + log|A| + Gₚ(ln φ)
+  Gₚ(ψ)      = Σᵢ 2·[aᵢ + lnΓ(aᵢ) − aᵢ·ln aᵢ + ln yᵢ],   aᵢ = wᵢ·e^{−ψ}
+  ∂Gₚ/∂ψ     = Σᵢ 2·aᵢ·(ln aᵢ − ψ₀(aᵢ))
+  ∂²Gₚ/∂ψ²   = −Σᵢ 2·aᵢ·(ln aᵢ − ψ₀(aᵢ) + 1 − aᵢ·ψ₁(aᵢ))
+```
+
+where the first three terms of `F` are what `laplace_deviance` returns with
+PIRLS on `wᵢ/φ` — unaffected by which weight convention is in force, since
+the PIRLS working weight has the same form either way — and `Gₚ` depends on
+φ and the data alone. At unit weights every `aᵢ` is `1/φ`, and `Gₚ` reduces
+to the uniform-shape closed form with `Σw = n`.
+
+Rescaling every weight by a constant leaves the likelihood unchanged but
+moves φ̂ by the same constant (`aᵢ = wᵢ/φ` is invariant to `w → c·w,
+φ → c·φ`), so `ln φ` — one more trailing coordinate of the outer BOBYQA,
+exactly as NB's `ln θ` is — searches on the internal `φ_int = φ/w̄` instead,
+where `w̄ = 2^round(mean(log₂ wᵢ))` is a power of two near the geometric
+mean of the weights, exactly `1` when unweighted. An arithmetic mean would
+let one outlier weight push `φ_int` out of its search box; a power of two
+also keeps rescaling every weight by a power of two exact. `ln φ_int` is
+boxed to `[ln GAMMA_PHI_LO, ln GAMMA_PHI_HI] = [ln 1e-6, ln 1e6]` and seeded
+from the plug-in dispersion `D/Σŵ` (`ŵᵢ = wᵢ/w̄`) of the no-RE β start — a
+fixed box and a fixed seed regardless of the weights' own scale. A held
+dispersion (`FitOptions::dispersion = Some(v)`) enters the search as `v/w̄`.
+One PIRLS solve per evaluation; there
+is no inner fixed point on φ. `φ_int` is the maximum-likelihood value of the
+Laplace objective on `ŵ`, and `φ̂ = w̄·φ_int` is reported as
+`Fit::dispersion`; the reported `Fit::deviance` is `F` at the optimum (on the
+raw weights) and `Fit::loglik = −½·F` exactly.
+
+At the scaled coordinates `ξ = θ/√φ` (Λ is linear in θ, and `u = v/√φ` maps
+the mode problem at φ onto the φ = 1 one), `log|A|` does not depend on φ and
+`F = e^{−ψ}·P(ξ, β) + L(ξ, β) + Gₚ(ψ)` with `P = D + ‖u‖²` the penalized
+deviance on the φ = 1 weights. The stationarity condition in ψ is then
+`∂Gₚ/∂ψ|ψ̂ = e^{−ψ̂}·P̂`, i.e. `Σᵢ wᵢ·(ln aᵢ − ψ₀(aᵢ)) = P̂/2`: the same shape
+equation as the GLM's, with the bare deviance `D` replaced by the penalized
+deviance `P`. The left side rises strictly from 0 to ∞ in ψ, so the root is
+unique.
+
+**Standard errors.** At fixed φ̂ the objective in `(θ, β)` is exactly the
+Laplace deviance on the weights `wᵢ/φ̂` with the bare deviance as its data
+term, so every derivative engine is entered through
+`GlmmWorkspace::at_fixed_dispersion`, which puts those weights in place for the
+call; no engine has a Gamma case. The Rx arm reads the factors of the pinned
+re-eval, whose weights already carry `1/φ̂`, so its Schur inverse is
+`φ̂·RX⁻¹` with no further factor. The Hessian arm appends the `ln φ` row: in
+the coordinates `(ξ, β, t)`, `t = ψ − ψ̂`, the objective is
+`e^{−t}·P̂ + L̂ + Gₚ(ψ̂+t)` on the `wᵢ/φ̂` weights, so the new entries are
+`∂²F/∂γ∂t = −∇P̂` and `∂²F/∂t² = P̂ + ∂²Gₚ/∂ψ²|ψ̂`, with `∇P̂` the partial of the
+penalized deviance at the mode, taken by central differences over fixed-seed
+re-solves (step `1e-4·max(1, |γ̂_k|)`). The β block of the inverse is Cov(β̂)
+with φ estimated; the θ-block SE maps back through `dθ = dξ + ½·θ̂·dt`.
+
+**Convention/reference:** glmmTMB's Gamma GLMM (φ a free parameter of the
+exact Laplace objective). lme4 runs PIRLS without φ, reports θ relative to σ,
+profiles φ as `D/n` inside the family `aic` and carries `pwrss/n` on
+`vcov(use.hessian = FALSE)`; those numbers belong to that other objective.
+**Validation:** `fit_glmm_gamma_dispersion_is_the_laplace_ml_value` (φ̂
+satisfies the stationarity condition on both links),
+`gamma_hessian_se_matches_fd_of_the_full_objective` (the β and θ SEs against
+a central-difference Hessian of `F` over `[θ | β | ln φ]`), and
+`family::tests::gamma_dispersion_term_*`.
 
 ## Warm starts and workspace reuse
 
@@ -623,8 +775,9 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   live in the same pass. The dual PIRLS steps with the exact `½h_uu` — the
   Fisher `A` on a canonical link, the observed-information
   `A_obs = M'W_obs M + I` on a non-canonical one — so the implicit-function
-  lanes are exact after one step; `log|A|` and the fit itself stay on the
-  Fisher `A`. `A_obs` is built twice over, once per packing: a single `q_p ×
+  lanes are exact after one step; `log|A|` is taken off `A_obs` by the exit
+  refresh on the links where the two differ (see
+  [Laplace approximation](#laplace-approximation)). `A_obs` is built twice over, once per packing: a single `q_p ×
   q_p` block on the blocked path (`pirls::DualStep`, `family::observed_weight`),
   and, on the structured-extras path, the same twin packed as `s` core
   blocks plus the coupling and `e×e` Schur blocks — both paths take this
@@ -657,14 +810,15 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   (the few-cluster failure mode), the covariance falls back to the Rx/Schur one
   and reports `FdHessianStatus::NonPdFellBackToRx`.
 
-- **`WaldSe::Rx`** (conditional on θ̂): inverts the expected-information Schur
-  complement of the β block directly (`rx_cov_into`, via `blocked_` /
+- **`WaldSe::Rx`** (conditional on θ̂): inverts the Schur complement of the β
+  block of the information at the mode — the observed information on the links
+  where it differs from Fisher, as in `log|A|` — directly (`rx_cov_into`, via `blocked_` /
   `structured_` / `packed_schur_fill`). This is fast — one closed-form Schur
   solve, reusing the factors PIRLS left behind. Its cost is an assumption of
   β–θ orthogonality: exact for the Gaussian LMM, but anticonservative for a
-  GLMM, where the IRLS weights couple β and θ. Gamma carries lme4's σ̂² on this
-  vcov (`vcov(use.hessian = FALSE) = σ̂²·Schur⁻¹`); fixed-scale families use
-  σ̂² ≡ 1.
+  GLMM, where the IRLS weights couple β and θ. No scale factor on any family:
+  on Gamma the Schur is built from weights that already carry `1/φ̂`, so its
+  inverse is `φ̂·RX⁻¹` (see [Gamma dispersion](#gamma-dispersion)).
 
 Both are computed on the deviance/log-odds scale (the fit's linear-predictor
 scale), and both are emitted on every layout. The packed-row stencil's step is
@@ -737,14 +891,14 @@ the vector-RE anchors `sim_binomial_slope1` / `sim_poisson_slope1` /
 | Binomial, individual 0/1 | VerbAgg (rung 12) | lme4 + MixedModels.jl | landed (used to tune `PIRLS_TOL_REL`) |
 | Poisson, real nested | Arabidopsis (rung 14) | lme4 + MixedModels.jl | landed |
 | Sparse binomial, slope-crossed | `sim_binomial_slope_crossed` (rung 18) | lme4 (+ glmm golden) | landed (2-way gate); in-crate golden gated |
-| Probit GLMM (non-canonical) | `goldens/cbpp_probit_glmm.json` (`fit_glmm_probit_cbpp_matches_lme4`) | lme4 | in-crate golden |
-| Cloglog GLMM (non-canonical) | `sim_cloglog_glmm` (rung 50) | lme4 | in-crate golden |
-| Gamma GLMM, dense | `goldens/sim_gamma_glmm.json` (`fit_glmm_gamma_sim_matches_lme4`) | lme4 | in-crate golden |
-| NB GLMM, dense | `goldens/sim_nb_glmm.json` (`fit_glmm_nb_sim_matches_lme4`) | lme4 | in-crate golden |
+| Probit GLMM (non-canonical) | `goldens/cbpp_probit_glmm_tmb.json` (`fit_glmm_probit_cbpp_matches_glmmtmb`) | glmmTMB (lme4's golden: registered divergences) | in-crate golden |
+| Cloglog GLMM (non-canonical) | `goldens/sim_cloglog_glmm_tmb.json` (`fit_glmm_cloglog_matches_glmmtmb`) | glmmTMB (lme4's golden, rung 50: registered divergences) | in-crate golden |
+| Gamma GLMM, dense | grid cell `sim_gamma` (`fit_glmm_gamma_sim_matches_grid_reference`), `goldens/sim_gamma_glmm_tmb.json` | glmmTMB (lme4's golden: registered divergences) | in-crate golden |
+| NB GLMM, dense | `goldens/sim_nb_glmm_tmb.json` (`fit_glmm_nb_sim_matches_glmmtmb`) | glmmTMB (lme4's golden: registered divergences) | in-crate golden |
 | AGQ (nAGQ 1/7/11) | `goldens/{cbpp,grouseticks}_agq_k{1,7,11}.json` | lme4 | in-crate golden |
 | Vector-RE Laplace anchors | `sim_binomial_slope1` / `sim_poisson_slope1` / `sim_binomial_slope2` (rungs 25–27) | lme4 (2-way gates) | landed |
 | Poisson with offset | `sim_poisson_offset` (rung 28) | lme4 + MixedModels.jl | in manifest |
-| Sparse Gamma / NB | `goldens/sim_sparse_gamma.json`, `goldens/sim_sparse_nb.json` | lme4 | in-crate golden |
+| Sparse Gamma / NB | `goldens/sim_sparse_gamma_tmb.json`, `goldens/sim_sparse_nb_tmb.json` | glmmTMB (lme4's goldens: registered divergences) | in-crate golden |
 
 Some paths have no dedicated rung: the intercept-only nested/crossed *structured*
 non-Gaussian branch is validated only indirectly, via the grouseticks
@@ -759,7 +913,7 @@ GLMMadaptive is quadrature-first.
 | | lme4 (`glmer`) | MixedModels.jl | GLMMadaptive | `glmm` |
 |---|---|---|---|---|
 | Default objective | Laplace (`nAGQ=1`) | Laplace | **adaptive GH quadrature** (default 11 points for ≤ 2 REs) | Laplace (`nAGQ=1`) |
-| AGQ shapes | single **scalar** RE only | single scalar RE only | vector REs, product grid (its core feature) | single grouping, `q_p ≤ 3` product grid, binomial/Poisson (opt-in `nagq`) |
+| AGQ shapes | single **scalar** RE only | single scalar RE only | vector REs, product grid (its core feature) | single grouping, `q_p ≤ 3` product grid, binomial/Poisson/NB/Gamma (opt-in `nagq`) |
 | Grouping structure | multiple, crossed/nested | multiple, crossed/nested | **single grouping factor only** | multiple, crossed/nested (dense/sparse routing) |
 | Outer optimisation | derivative-free, θ-then-joint two-stage (BOBYQA/Nelder-Mead) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE); `fast=true` θ-only or joint | hybrid: EM first, then quasi-Newton over all parameters | derivative-free BOBYQA, one of three routes fixed per shape: joint `[θ\|β]`, θ-only PQL profile then joint polish, or θ-only EXACT Laplace profile alone |
 | Fixed-effect vcov | Hessian (default) or RX | RX-style only | observed information (numeric), sandwich available | both arms: `Hessian` (default, ≡ `use.hessian=TRUE`) and `Rx` (≡ MixedModels) |
@@ -789,9 +943,12 @@ In practice:
   91% of the disagreements where both engines report convergence (the rest
   are near-ties). A higher singular rate therefore means the
   optimizer *reached* the boundary MLE, not that it failed more often.
-- **lme4** is the semantics reference: `glmm` matches its Laplace deviance,
-  step-halving, cold-start, Hessian vcov, and rank-deficiency behaviour by
-  construction, byte-for-byte where possible.
+- **lme4** is the semantics reference: `glmm` matches its Laplace deviance on
+  the canonical links, its step-halving, cold-start, Hessian vcov, and
+  rank-deficiency behaviour by construction, byte-for-byte where possible. On
+  probit, cloglog, Gamma/log and NB/log `glmm`'s `log|A|` is the exact
+  curvature and lme4's the Fisher one, and on mixed Gamma φ is a free
+  parameter; there the reference objective is glmmTMB's.
 - **MixedModels.jl** implements the same derivative-free profiled design in
   Julia; its `fast=true` θ-only mode is what `glmm`'s `PqlThenJoint`/`ExactProfile`
   θ-only pass runs, and its vcov is what `glmm`'s `Rx` arm reproduces (~6e-7 on cbpp).

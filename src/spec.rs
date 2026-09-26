@@ -107,10 +107,10 @@ pub enum Family {
         link: PoissonLink,
     },
     /// Gamma response (`y>0`) → GLM/GLMM. Variance `V(μ)=μ²`. Dispersion `φ` is
-    /// estimated post-fit as the Pearson moment estimator `φ̂=Σ rᵢ²/(n−p)`
-    /// (`rᵢ=(yᵢ−μ̂ᵢ)/μ̂ᵢ`) and scales the SE by `√φ̂`. Validated against R
-    /// `glm(family=Gamma(link))` / `lme4::glmer(family=Gamma)` (validation goldens
-    /// `sim_gamma_*`).
+    /// estimated by maximum likelihood — post-fit on a GLM (`MASS::gamma.shape`'s
+    /// equation), as a coordinate of the Laplace objective on a GLMM — and scales
+    /// the SE by `√φ̂`. Validated against R `glm(family=Gamma(link))` at the ML φ̂
+    /// and glmmTMB (validation goldens `sim_gamma_*_ml` and `*_tmb`).
     Gamma {
         /// Link function — [`GammaLink::Log`] (safe default) or `Inverse`. The
         /// dispersion directive (estimate vs hold-fixed φ) lives in
@@ -131,8 +131,8 @@ pub enum Family {
     },
     /// Inverse-Gaussian response (`y>0`) → GLM. Variance `V(μ)=μ³`. Dispersion
     /// `φ` is estimated post-fit as the Pearson moment estimator
-    /// `φ̂=Σ rᵢ²/(n−p)` (`rᵢ=(yᵢ−μ̂ᵢ)/√(μ̂ᵢ³)`) and scales the SE by `√φ̂`, the
-    /// same convention as [`Family::Gamma`]. **Mixed models are not wired**:
+    /// `φ̂=Σ rᵢ²/(n−p)` (`rᵢ=(yᵢ−μ̂ᵢ)/√(μ̂ᵢ³)`), `summary(glm)`'s, and scales the
+    /// SE by `√φ̂`. **Mixed models are not wired**:
     /// `fit` faults at the model-shape gate for `re: Some(..)`, because the
     /// profiled `inverse.gaussian()$aic` objective term the GLMM needs is not
     /// built. Validated against R `glm(family=inverse.gaussian(link))`
@@ -346,12 +346,35 @@ mod tests {
         crate::fit::assert_model_shape_pub(&model, 2, 3);
     }
 
-    /// Fills the NB-GLMM Rust-entry gap: `nagq>1` is legal only on a
-    /// binomial/Poisson single-grouping-factor GLMM, so a negative-binomial
-    /// mixed model is rejected the same way a multi-grouping one is.
+    /// `nagq>1` is legal only on a binomial/Poisson/negative-binomial/Gamma
+    /// single-grouping-factor GLMM. A Gaussian mixed model has no quadrature
+    /// to do (its marginal likelihood is exact), so it is rejected the same way
+    /// a multi-grouping one is.
     #[test]
-    #[should_panic(expected = "binomial/Poisson GLMM")]
-    fn nagq_on_a_negative_binomial_glmm_is_rejected() {
+    #[should_panic(expected = "binomial, Poisson, negative-binomial and Gamma GLMMs")]
+    fn nagq_on_a_gaussian_lmm_is_rejected() {
+        let mut model = nagq_check_spec();
+        model.family = Family::Gaussian;
+        crate::fit::assert_model_shape_pub(&model, 2, 3);
+    }
+
+    /// The Gamma dispersion φ is a coordinate of the outer search: at a fixed φ
+    /// the integrand is the binomial/Poisson one on prior weights `wᵢ/φ`, and
+    /// the φ-only rest of the log-density sits outside the integral, so the
+    /// AGQ kernels serve Gamma.
+    #[test]
+    fn nagq_on_a_gamma_glmm_is_accepted() {
+        let mut model = nagq_check_spec();
+        model.family = Family::Gamma {
+            link: GammaLink::Log,
+        };
+        crate::fit::assert_model_shape_pub(&model, 2, 3);
+    }
+
+    /// The negative-binomial dispersion θ sits outside the integral (a
+    /// per-row constant in u), so the binomial/Poisson AGQ kernels serve NB.
+    #[test]
+    fn nagq_on_a_negative_binomial_glmm_is_accepted() {
         let mut model = nagq_check_spec();
         model.family = Family::NegativeBinomial {
             link: NegBinomialLink::Log,

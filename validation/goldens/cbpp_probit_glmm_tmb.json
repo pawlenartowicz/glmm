@@ -1,0 +1,29 @@
+{
+  "name": "cbpp_probit_glmm_tmb",
+  "engine": "glmmTMB::glmmTMB",
+  "engine_version": "1.1.14",
+  "kind": "glmm",
+  "data": "cbpp",
+  "family": "binomial",
+  "link": "probit",
+  "nagq": 1,
+  "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "period2", "period3", "period4"],
+  "estimates": {
+    "beta": [-0.831849997522622, -0.526596296838326, -0.615071573251887, -0.797944216833122],
+    "se_hessian": [0.125983789890752, 0.160252153085173, 0.169140881188126, 0.20443134801754],
+    "loglik": -92.5833377032345,
+    "varcomp": [
+      {
+        "group": "herd",
+        "terms": ["(Intercept)"],
+        "stddev": [0.338634475943338],
+        "corr": [
+          [1]
+        ]
+      }
+    ]
+  }
+}

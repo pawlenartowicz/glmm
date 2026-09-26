@@ -4,7 +4,7 @@
 # adaptive Gauss-Hermite quadrature instead of the nAGQ=1 Laplace default.
 # Eligible here because the model has a single grouping factor (herd) with
 # one random effect per level (q=1) -- AGQ's current cap is q<=3 on a single
-# binomial/Poisson grouping factor.
+# binomial/Poisson/negative-binomial/Gamma grouping factor.
 #
 # Data: lme4's own `cbpp` -- see recipe 4 for the weights= spelling of
 # lme4's cbind().

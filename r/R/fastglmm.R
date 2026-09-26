@@ -56,8 +56,9 @@
 #' `link = "log"` instead. The two forms therefore fit different models;
 #' choose deliberately.
 #'
-#' **`nAGQ` fallback (louder than lme4):** `nAGQ > 1` is honored on binomial
-#' and Poisson mixed models with a single grouping factor and at most 3 random
+#' **`nAGQ` fallback (louder than lme4):** `nAGQ > 1` is honored on binomial,
+#' Poisson, negative-binomial and Gamma mixed models with a single grouping
+#' factor and at most 3 random
 #' effects per group. Any other shape **warns and falls back to Laplace**
 #' (`nAGQ = 1`) instead of erroring the way `lme4::glmer` does - the fit you
 #' get is a Laplace fit, and the warning is the only notice. This mirrors the
@@ -86,9 +87,13 @@
 #'   `gaussian`, `binomial` (logit/probit/cloglog), `poisson` (log), `Gamma`
 #'   (log/inverse), `inverse.gaussian` (log/`1/mu^2`), `"negativebinomial"`
 #'   (log; the shape `theta` is estimated).
-#' @param weights optional per-row prior (case) weights - `lme4::glmer`'s
-#'   `weights=`. For an aggregated binomial, pass the success **proportion**
-#'   as the response and the trial count here, or equivalently write
+#' @param weights optional per-row prior weights - `lme4::glmer`'s
+#'   `weights=`. On a family with an estimated dispersion (gaussian, gamma,
+#'   inverse-Gaussian) these are PRECISION weights, the same convention as
+#'   `lm`, `glm` and lme4: row `i` has dispersion `phi / weights[i]`, so
+#'   multiplying every weight by the same constant leaves the fit unchanged.
+#'   For an aggregated binomial, pass the success **proportion** as the
+#'   response and the trial count here, or equivalently write
 #'   `cbind(successes, failures)` as the formula's left-hand side; combining
 #'   both is an error.
 #' @param subset optional row filter, evaluated in `data` like `lm`'s
@@ -113,7 +118,9 @@
 #'   Distinct from `init.theta`, which is the negative-binomial shape.
 #' @param wald.se Wald standard-error mode: `"hessian"` (default) or `"rx"`.
 #' @param dispersion Gamma/inverse-Gaussian dispersion directive: `NULL`
-#'   (estimate via Pearson, the default), `"estimate"` (same), or a number to
+#'   (estimate it, the default: the Pearson moment on a Gamma GLM, maximum
+#'   likelihood on a Gamma GLMM, the Pearson moment on inverse-Gaussian),
+#'   `"estimate"` (same), or a number to
 #'   hold it fixed. Non-`NULL` on binomial/poisson would mean
 #'   quasi-likelihood - not implemented, errors.
 #' @param init.theta negative-binomial shape seed, named for
@@ -128,7 +135,9 @@
 #'   covariance (`vcov()`), variance components on the SD/correlation scale
 #'   ([VarCorr]), `converged` and `singular` flags ([isSingular]), a
 #'   `diagnostics` list (the solver's own report: `boundary`, `pinned`,
-#'   `notes`, plus the three flags above), plus
+#'   `notes`, plus the three flags above), a `warnings` data.frame (one row
+#'   per warning the call raised: `tier`, `kind`, `title`, `message`; match on
+#'   `kind`), plus
 #'   `print()`, [summary()][summary.fastglmm], [confint()][confint.fastglmm]
 #'   (Wald), `nobs()`, [formula()][formula.fastglmm] (returns the formula
 #'   **string**), `family()`, and `model.frame()`. Engine-blocked accessors
@@ -175,11 +184,15 @@ fastglmm <- function(formula, data, family = gaussian(),
 
   mixed <- grepl("|", f_str, fixed = TRUE)
 
+  store <- new.env(parent = emptyenv())
+  store$rows <- list()
+  ignored <- c("fastglmm_argument_ignored", "fastglmm_diagnostic")
+
   # Valid-but-inapplicable options: warn and strip, mirroring the Python port
   # (nothing inapplicable may reach the kernel - its checks are assert!s).
   if (!is.null(dispersion) && !(fam$name %in% .DISPERSION_FAMILIES)) {
-    warning("dispersion= is not applicable to family '", fam$name,
-            "'; ignored", call. = FALSE)
+    .warn_keep(store, "argument_ignored",
+               sprintf("dispersion= has no effect for family '%s'.", fam$name), ignored)
     dispersion <- NULL
   }
   if (!is.null(dispersion)) {
@@ -190,13 +203,14 @@ fastglmm <- function(formula, data, family = gaussian(),
            call. = FALSE)
     }
     if (fam$name %in% c("binomial", "poisson") && mixed) {
-      warning("quasi-likelihood dispersion on binomial/poisson is GLM-only; ",
-              "ignored for a mixed formula", call. = FALSE)
+      .warn_keep(store, "argument_ignored", paste(
+        "Quasi-likelihood dispersion= is not supported yet for binomial or Poisson",
+        "models. The default dispersion of 1 was used."), ignored)
       dispersion <- NULL
     }
   }
   if (identical(dispersion, "estimate") && fam$name %in% c("gamma", "inversegaussian")) {
-    # The phi families' default (NULL) already computes the Pearson estimate.
+    # The phi families' default (NULL) already estimates phi.
     dispersion <- NULL
   }
   if (!is.null(dispersion) && fam$name %in% c("binomial", "poisson")) {
@@ -206,8 +220,8 @@ fastglmm <- function(formula, data, family = gaussian(),
          call. = FALSE)
   }
   if (!is.null(init.theta) && fam$name != "negativebinomial") {
-    warning("init.theta= applies only to family 'negativebinomial'; ignored",
-            call. = FALSE)
+    .warn_keep(store, "argument_ignored",
+               sprintf("init.theta= is not used for family '%s'.", fam$name), ignored)
     init.theta <- NULL
   }
   if (!is.null(init.theta)) {
@@ -230,8 +244,9 @@ fastglmm <- function(formula, data, family = gaussian(),
     }
     unknown <- setdiff(names(start), c("beta", "theta"))
     if (length(unknown)) {
-      warning("start elements ignored: ", paste(unknown, collapse = ", "),
-              call. = FALSE)
+      .warn_keep(store, "argument_ignored", paste0(
+        "start accepts only 'beta' and 'theta'; these elements were ignored: ",
+        paste(unknown, collapse = ", "), "."), ignored)
     }
   }
 
@@ -325,17 +340,45 @@ fastglmm <- function(formula, data, family = gaussian(),
     as.double(start$theta %||% double())
   )
 
-  if (!is.null(r$agq_warning)) warning(r$agq_warning, call. = FALSE)
-  if (r$singular) {
-    # lme4's exact text (cross-port agreement, spec section 5), extended with
-    # the pinned components. The Python port emits the same message
-    # (glmm/__init__.py) - change together.
-    warning(paste(c("boundary (singular) fit: see help('isSingular')",
-                    .pinned_detail(r$pinned, r$re_group_names,
-                                   r$re_group_terms)),
-                  collapse = "; "), call. = FALSE)
+  if (!is.null(r$agq_warning) && (identical(fam$name, "gaussian") || !mixed)) {
+    # nAGQ changes nothing here; see the Python port's fit() for why.
+    reason <- if (identical(fam$name, "gaussian")) {
+      "a Gaussian model"
+    } else {
+      "a model without random effects"
+    }
+    .warn_keep(store, "argument_ignored", sprintf(
+      "nAGQ=%d has no effect for %s, because nothing is approximated.", nAGQ, reason),
+      ignored)
+  } else if (!is.null(r$agq_warning)) {
+    # Built here, not taken from `agq_warning`: that string says nagq=, not nAGQ=.
+    .warn_keep(store, "agq_fallback", sprintf(paste(
+      "nAGQ=%d works only for %s models whose random effects are in one",
+      "grouping factor, with at most 3 random effects in it. This model was fitted",
+      "without adaptive quadrature."), nAGQ, .AGQ_FAMILIES),
+      c("fastglmm_agq_fallback", "fastglmm_diagnostic"))
   }
-  for (note in r$notes) .warn_note(note, r$names, r$converged, r$beta, r$aliased)
+  # Singularity is not assessed on a fit that did not converge: the kernel never sets
+  # `singular` there (the post-hoc check and the boundary flags are gated on
+  # `converged`), so `r$singular` reads FALSE on a non-converged fit. `isTRUE(r$converged)`
+  # below is a defensive guard, not load-bearing on the current kernel.
+  if (r$singular && isTRUE(r$converged)) {
+    affected <- .pinned_detail(r$pinned, r$re_group_names, r$re_group_terms)
+    .warn_keep(store, "singular", paste0(
+      "The random effects are too complex for the data: a variance is estimated at or ",
+      "near zero, or a correlation at or near \u22121 or 1. Consider removing the ",
+      "affected random effect.",
+      if (length(affected)) paste0(" Affected: ", paste(affected, collapse = ", "), ".")),
+      c("fastglmm_singular", "fastglmm_diagnostic"))
+  }
+  for (note in r$notes) {
+    out <- .note_warning(note, r$names, r$converged)
+    if (!is.null(out)) .warn_keep(store, note$kind, out$msg, out$cls)
+  }
+  if (!isTRUE(r$converged)) {
+    out <- .nonconvergence(fam$name, mixed, r$notes, r$beta, r$aliased, r$deviance, r$y)
+    .warn_keep(store, out$kind, out$msg, out$cls)
+  }
 
   p <- length(r$beta)
   beta <- stats::setNames(r$beta, r$names)
@@ -354,6 +397,10 @@ fastglmm <- function(formula, data, family = gaussian(),
     stddev_se = r$stddev_se,
     aliased = aliased,
     dispersion = r$dispersion,
+    # The numeric dispersion= argument the caller passed (Gamma or
+    # inverse-Gaussian only; NULL when left to estimate). print.summary's
+    # dispersion label reads this to print "fixed" instead of "ML"/"Pearson".
+    dispersion_held = dispersion,
     converged = r$converged,
     singular = r$singular,
     # Everything the solver reports about the fit itself, mirroring the Rust
@@ -373,10 +420,10 @@ fastglmm <- function(formula, data, family = gaussian(),
     #             EMPTY MEANS NOTHING WAS PINNED - a model with no variance
     #             components (OLS, GLM, fixed-effect-only negative binomial)
     #             reports empty for the same reason: there was nothing to pin.
-    #             fastglmm() does not error on converged = FALSE; on that path
-    #             pinned is always the empty NaN-fill default regardless of
-    #             what the optimizer was doing when it gave up, so it carries
-    #             no information there.
+    #             fastglmm() does not error on converged = FALSE: pinned is
+    #             empty on every non-converged fit - a failed fit, and a fit
+    #             stopped at its evaluation budget, where nothing is pinned at
+    #             the capped endpoint.
     #   notes     list of list(kind=, columns=, pivot=, evals=, final_eval=,
     #             detail=, ratio=); `columns` is
     #             1-based into `names`. Each is raised as a classed warning by
@@ -391,6 +438,11 @@ fastglmm <- function(formula, data, family = gaussian(),
       pinned = r$pinned,
       notes = r$notes
     ),
+    # Every warning this call raised, in raise order, one row each: tier
+    # ("severe" / "caution" / "note"), kind (stable; match on this), title and
+    # message. Texts are in documentation/warnings.md. Mirrors the Python port's
+    # `Fit.warnings` - change together.
+    warnings = .warnings_frame(store),
     n_eval = r$n_eval,
     deviance = r$deviance,
     # logLik()/AIC()/BIC() inputs. `reml` marks the LMM paths, whose `loglik`
@@ -428,8 +480,56 @@ fastglmm <- function(formula, data, family = gaussian(),
   ), class = "fastglmm")
 }
 
-# Names of the RE components the optimizer pinned at the boundary, for the
-# singular warning: "sd(term | group) pinned at the variance boundary" each.
+# kind -> c(tier, title), one fixed pair per kind. Mirrors the Python port's
+# _WARNING_KINDS (python/glmm/__init__.py) and documentation/warnings.md, which
+# holds the message text - change all three together.
+.WARNING_KINDS <- list(
+  search_limit = c("severe", "Search stopped at its step limit"),
+  fit_failed = c("severe", "Fit failed"),
+  glm_diverged = c("severe", "Fit diverged"),
+  design_unsolvable = c("severe", "Predictors could not be separated"),
+  constant_response = c("severe", "Response does not vary"),
+  too_few_rows = c("severe", "Too few rows"),
+  no_coefficients = c("severe", "Nothing to estimate"),
+  pirls_exhausted = c("caution", "Last fitting step did not finish"),
+  nb_shape_unsettled = c("caution", "Shape search did not settle"),
+  singular = c("caution", "Singular fit"),
+  ill_conditioned = c("caution", "Nearly collinear columns"),
+  hessian_se_fallback = c("caution", "Simpler standard errors used"),
+  agq_fallback = c("caution", "Adaptive quadrature not used"),
+  argument_ignored = c("note", "Argument ignored"),
+  unused_grouping_levels = c("note", "Unused grouping levels"),
+  re_design_scale_spread = c("note", "Random-effect predictors on very different scales")
+)
+# A kernel note this wrapper has no entry for keeps its own kind string.
+.UNKNOWN_KIND <- c("caution", "Unrecognized solver message")
+
+# The families nAGQ > 1 covers, as the fallback message names them. Mirrors the
+# kernel's AGQ eligibility check (src/orchestrate.rs, the `if nagq > 1` block)
+# and the Python port's _AGQ_FAMILIES - change together.
+.AGQ_FAMILIES <- "binomial, Poisson, negative-binomial or Gamma"
+
+# Raise one classed warning as "<Tier>: <title>. <message>" and append it to
+# `store` (an environment fastglmm() creates), which becomes `$warnings`.
+.warn_keep <- function(store, kind, msg, cls) {
+  tt <- .WARNING_KINDS[[kind]] %||% .UNKNOWN_KIND
+  store$rows[[length(store$rows) + 1L]] <-
+    list(tier = tt[[1L]], kind = kind, title = tt[[2L]], message = msg)
+  printed <- sprintf("%s%s: %s. %s", toupper(substr(tt[[1L]], 1L, 1L)),
+                     substring(tt[[1L]], 2L), tt[[2L]], msg)
+  warning(warningCondition(printed, class = cls, call = NULL))
+}
+
+# Every warning this call raised, in raise order, one row each. Zero rows on a
+# clean fit. Mirrors the Python port's `Fit.warnings` - change together.
+.warnings_frame <- function(store) {
+  col <- function(name) vapply(store$rows, `[[`, character(1), name)
+  data.frame(tier = col("tier"), kind = col("kind"), title = col("title"),
+             message = col("message"), stringsAsFactors = FALSE)
+}
+
+# Names of the RE components the optimizer pinned at the boundary, as
+# "<term> in <group>", for the singular warning.
 #
 # Read straight off the kernel's own record of what it pinned. Do NOT
 # reconstruct it from varcorr: on a grouping with q >= 2 the pin fixes the
@@ -437,18 +537,11 @@ fastglmm <- function(formula, data, family = gaussian(),
 # sqrt(lambda_offdiag^2 + lambda_diag^2), which lands at ~1e-9 rather than at 0,
 # so a scan for exactly-zero stddevs misses those pins entirely.
 #
-# That same fact is why the message says "pinned at the variance boundary" and
-# not "= 0": what is pinned is the Cholesky diagonal, while the stddev this fit
-# reports for the component keeps whatever the off-diagonal settled on,
-# measured as high as 2.2e-3 against a 0.689 sibling on a q >= 2 block - a
-# number VarCorr() prints at default rounding. A warning must not contradict a
-# number the same fit prints.
-#
 # character(0) means nothing was pinned - including a model with no variance
 # components to pin. `singular` can still be TRUE with `pinned` empty (the
 # post-hoc negligible-stddev check is independent of the optimizer's own pin
-# decision), so the bare lme4 text stands regardless - empty `pinned` is never
-# evidence that the fit is not singular.
+# decision), so the bare warning text stands regardless - empty `pinned` is
+# never evidence that the fit is not singular.
 # Mirrors python/glmm/__init__.py::_pinned_detail - change together.
 .pinned_detail <- function(pinned, group_names, group_terms) {
   parts <- character()
@@ -457,28 +550,28 @@ fastglmm <- function(formula, data, family = gaussian(),
     grp <- group_names[[g]]
     for (i in which(as.logical(pinned[[g]]))) {
       term <- if (i <= length(terms)) terms[[i]] else sprintf("component %d", i)
-      parts <- c(parts, sprintf("sd(%s | %s) pinned at the variance boundary",
-                                term, grp))
+      parts <- c(parts, sprintf("%s in %s", term, grp))
     }
   }
   parts
 }
 
-# One kernel note as a classed R warning, so a caller can withCallingHandlers()
-# or suppress on the CLASS rather than matching message text. The `kind` string,
-# not the English text, is the stable identifier; an unrecognized kind comes
-# from a kernel newer than this wrapper (the Rust `Note` enum is
-# #[non_exhaustive]) and still warns, under the base class. The Python port maps
-# the same kinds to warning categories (glmm/__init__.py) - change together.
+# One kernel note as list(msg=, cls=), or NULL to raise nothing. The `kind`
+# string, not the English text, is the stable identifier; an unrecognized kind
+# comes from a kernel newer than this wrapper (the Rust `Note` enum is
+# #[non_exhaustive]) and still warns, under the base class. The Python port
+# maps the same kinds to warning categories (glmm/__init__.py) - change
+# together.
 #
 # Classes: "fastglmm_ill_conditioned", "fastglmm_pirls_exhausted",
 # "fastglmm_unused_grouping_levels", "fastglmm_re_design_scale_spread",
-# "fastglmm_hessian_se_fallback", "fastglmm_unknown_note" - all inheriting
-# "fastglmm_diagnostic", so one handler catches the whole channel. Not every
-# note comes from the solver: "unused_grouping_levels" and
-# "re_design_scale_spread" are raised by the formula lowering, which is the
-# only layer that sees both the declared levels/design and the per-row codes.
-.warn_note <- function(note, coef_names, converged, beta, aliased) {
+# "fastglmm_hessian_se_fallback", "fastglmm_nb_shape_unsettled",
+# "fastglmm_unknown_note" - all inheriting "fastglmm_diagnostic", so one
+# handler catches the whole channel. Not every note comes from the solver:
+# "unused_grouping_levels" and "re_design_scale_spread" are raised by the
+# formula lowering, which is the only layer that sees both the declared
+# levels/design and the per-row codes.
+.note_warning <- function(note, coef_names, converged) {
   if (identical(note$kind, "ill_conditioned")) {
     # `columns` arrives 1-based from the shim, so it indexes `coef_names`
     # directly. Out of range falls back to the index rather than printing NA,
@@ -493,81 +586,143 @@ fastglmm <- function(formula, data, family = gaussian(),
       }, character(1)),
       collapse = ", "
     )
-    # "entangled with" rather than "the design does not identify <name>":
-    # entanglement is symmetric, and the kernel names the column attaining the
-    # SMALLEST scaled pivot, which is one member of the group and not a
-    # statement about the others. Wording it as a fact about that one column
-    # reads as if its partners were exonerated.
-    msg <- sprintf(paste0(
-      "%s is entangled with one or more other columns (scaled pivot %.3g): the ",
-      "fit is real and the estimates are honest, but the standard errors are ",
-      "large. Only the column the pivot search reached is named; its partners ",
-      "are equally implicated and are not identified here."), named, note$pivot)
+    msg <- paste(named, paste(
+      "is almost a combination of other columns in the model, so its standard error is",
+      "large. Its estimate is still correct, but imprecise. The other columns involved",
+      "are not named. Consider dropping or combining predictors that carry the same",
+      "information."))
     cls <- c("fastglmm_ill_conditioned", "fastglmm_diagnostic")
   } else if (identical(note$kind, "unused_grouping_levels")) {
-    msg <- sprintf(paste0(
-      "grouping levels with no rows occupy random-effect columns (%s); their ",
-      "conditional modes are reported as exactly zero. Use droplevels() to ",
-      "remove both the rows and the wasted model width."), note$detail)
+    # The kernel packs "<group>: <level>, <level>" (src/orchestrate.rs). Split on
+    # the first ": " only: a level label may contain one.
+    cut <- regexpr(": ", note$detail, fixed = TRUE)
+    group <- if (cut > 0L) substr(note$detail, 1L, cut - 1L) else note$detail
+    levels <- if (cut > 0L) substring(note$detail, cut + 2L) else ""
+    msg <- sprintf(paste(
+      "Grouping factor '%s' has levels with no rows (%s). They stay in the model with",
+      "random effects of exactly zero and are counted in the number of groups. Use",
+      "droplevels() before fitting to remove them."), group, levels)
     cls <- c("fastglmm_unused_grouping_levels", "fastglmm_diagnostic")
   } else if (identical(note$kind, "pirls_exhausted")) {
-    # Four cases, from `final_eval`, `converged`, and (on the not-converged
-    # branch) whether the estimated entries of `beta` (aliased slots are NaN
-    # by contract) came back finite: a rejected trial point is
-    # benign regardless of the outcome; the final re-evaluation at a fit
-    # that did converge feeds the reported estimates; a fit that did not
-    # converge but still has a finite beta means the search ran out of its
-    # evaluation budget before settling; and a fit that did not converge and
-    # has no finite beta failed outright, so there is no estimate to report
-    # at all.
-    if (isTRUE(note$final_eval)) {
-      msg <- paste(
-        "the final PIRLS re-evaluation at the reported fit ran its full",
-        "iteration cap without converging: the reported estimates rest on",
-        "that truncated solve."
-      )
-    } else if (isTRUE(converged)) {
-      msg <- paste(
-        "a GLMM inner PIRLS solve ran its full iteration cap without converging.",
-        "This is observation-only and no fitted number is affected."
-      )
-    } else if (all(is.finite(beta[!aliased]))) {
-      msg <- paste(
-        "the search ran out of its evaluation budget while some inner PIRLS",
-        "solves hit their iteration cap. The fit did not converge. The",
-        "reported estimates are the best point the search found.",
-        "converged is FALSE, and the variance components are not reported."
-      )
-    } else {
-      msg <- paste(
-        "some inner PIRLS solves hit their iteration cap, and the fit failed.",
-        "No estimate is reported. converged is FALSE."
-      )
-    }
+    # Raised only when the final re-evaluation of a converged fit hit the cap; see
+    # the Python port's _note_warning for the other three cases.
+    if (!(isTRUE(note$final_eval) && isTRUE(converged))) return(NULL)
+    msg <- paste(
+      "The final step that computes the reported results ran out of iterations. The",
+      "estimates and their standard errors may be less accurate than usual.",
+      "Try simplifying the random effects or rescaling the predictors.")
     cls <- c("fastglmm_pirls_exhausted", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "nb_shape_unsettled")) {
+    msg <- sprintf(paste(
+      "The search for the negative binomial shape parameter stopped at its limit of %d",
+      "rounds before it settled. The coefficients and standard errors are computed at the",
+      "last value it reached, which may not be the best one."), as.integer(note$evals))
+    cls <- c("fastglmm_nb_shape_unsettled", "fastglmm_diagnostic")
   } else if (identical(note$kind, "re_design_scale_spread")) {
-    msg <- sprintf(paste0(
-      "random-effect design columns for grouping '%s' are on very different ",
-      "scales (max/min column RMS ratio %.3g). fastglmm scales the columns ",
-      "internally, so the fit is unaffected; rescaling the variable makes the ",
-      "reported random-effect standard deviation easier to read."),
+    msg <- sprintf(paste(
+      "The predictors with random slopes for '%s' are on very different scales (ratio",
+      "%.3g). The fit is not affected, but the reported random-effect standard deviations",
+      "are hard to compare. Rescaling these predictors makes them easier to read."),
       note$detail, note$ratio)
     cls <- c("fastglmm_re_design_scale_spread", "fastglmm_diagnostic")
   } else if (identical(note$kind, "hessian_se_fallback")) {
     msg <- paste(
-      "the requested Hessian-based standard errors were not usable (the",
-      "joint Hessian was not positive definite, or the fit took the",
-      "finite-difference Hessian and a perturbed deviance evaluation",
-      "was non-finite), so the RX",
-      "standard errors are reported instead and stddev_se is NaN."
-    )
+      "The usual standard errors could not be computed, so a simpler method was used.",
+      "Its standard errors tend to be too small, so p-values and confidence intervals",
+      "may look more precise than they are. Standard errors for the random-effect",
+      "standard deviations are not available.")
     cls <- c("fastglmm_hessian_se_fallback", "fastglmm_diagnostic")
   } else {
-    msg <- sprintf(paste0("the kernel reported a solver note this version of ",
-                          "fastglmm does not recognize ('%s')"), note$kind)
+    msg <- sprintf(paste(
+      "The solver reported something ('%s') that this version of fastglmm does not",
+      "recognize. Please report it at https://github.com/pawlenartowicz/glmm/issues."),
+      note$kind)
     cls <- c("fastglmm_unknown_note", "fastglmm_diagnostic")
   }
-  warning(warningCondition(msg, class = cls, call = NULL))
+  list(msg = msg, cls = cls)
+}
+
+.INNER_STEPS <- "Some of its inner steps ran out of iterations."
+
+# glm_diverged messages by family: separation only means something for a binomial
+# response, and the Gamma and inverse-Gaussian fits skip the linear-predictor check
+# (src/glm.rs), so theirs cannot be called a divergence to an extreme.
+.DIVERGED_BINOMIAL <- paste(
+  "The fit did not converge. This usually means a predictor, or a combination of",
+  "predictors, predicts the outcome perfectly (separation), so some fitted probabilities",
+  "go to 0 or 1. The coefficients are from the last step; standard errors are",
+  "not reported. Check the data for separation.")
+.DIVERGED_COUNTS <- paste(
+  "The fit did not converge. This usually means that some category of a predictor, or",
+  "some combination of predictors, has only zero counts, so some fitted counts go to 0.",
+  "The coefficients are from the last step; standard errors are not reported. Check for",
+  "categories whose counts are all zero.")
+.DIVERGED_CONTINUOUS <- paste(
+  "The fit did not settle on an answer: the fitting steps stopped before converging. The",
+  "coefficients are from the last step; standard errors are not reported. Check predictors",
+  "with extreme values; with a link other than log, the log link is usually more stable.")
+
+.count <- function(n, word) sprintf("%d %s%s", as.integer(n), word, if (n == 1) "" else "s")
+
+# The one severe warning of a fit with converged = FALSE. The kernel does not say which
+# stopping rule fired, so the port reads the cause off what the fit reports, most specific
+# first: no coefficient, too few rows (a one-row response is trivially constant, so this
+# comes first), a constant response, then the model. With random effects, a finite deviance
+# means the kernel reached an end point (the budget stop, reported at its best point), and
+# finite estimated coefficients (aliased slots are NaN by contract) confirm it; anything
+# else failed. The deviance is what decides a model with no fixed effects. A GLMM inner
+# cap-out during the search is one extra sentence rather than a second warning. Mirrors the
+# Python port's _nonconvergence (python/glmm/__init__.py) - change together.
+.nonconvergence <- function(family, mixed, notes, beta, aliased, deviance, y) {
+  diag_cls <- function(kind) c(paste0("fastglmm_", kind), "fastglmm_diagnostic")
+  n_est <- sum(!aliased)
+  if (!mixed && n_est == 0L) {
+    return(list(kind = "no_coefficients", msg = paste(
+      "The model has no coefficients and no random effects, so there is nothing to",
+      "estimate. Add an intercept or a predictor."), cls = diag_cls("no_coefficients")))
+  }
+  if (length(y) <= n_est) {
+    return(list(kind = "too_few_rows", msg = sprintf(paste(
+      "The model has %s to estimate but only %s, so no estimates were computed. Use more",
+      "rows or fewer predictors."), .count(n_est, "coefficient"), .count(length(y), "row")),
+      cls = diag_cls("too_few_rows")))
+  }
+  if (length(y) && isTRUE(all(y == y[[1L]]))) {
+    return(list(kind = "constant_response", msg = sprintf(paste(
+      "Every value of the response is %s, so there is nothing to estimate. Check the",
+      "response column and the rows kept by subset= and na.action."),
+      sprintf("%g", y[[1L]])), cls = diag_cls("constant_response")))
+  }
+  if (!mixed) {
+    if (identical(family, "gaussian")) {
+      return(list(kind = "design_unsolvable", msg = paste(
+        "The predictors could not be separated numerically, so no estimates were",
+        "computed. Check for predictors that are copies or near-copies of each other."),
+        cls = diag_cls("design_unsolvable")))
+    }
+    msg <- if (identical(family, "binomial")) {
+      .DIVERGED_BINOMIAL
+    } else if (family %in% c("poisson", "negativebinomial")) {
+      .DIVERGED_COUNTS
+    } else {
+      .DIVERGED_CONTINUOUS
+    }
+    return(list(kind = "glm_diverged", msg = msg, cls = diag_cls("glm_diverged")))
+  }
+  pirls <- vapply(notes, function(n) identical(n$kind, "pirls_exhausted"), logical(1))
+  inner <- if (any(pirls)) .INNER_STEPS else character()
+  advice <- "Try a simpler random-effects structure or rescale the predictors."
+  if (is.finite(deviance) && all(is.finite(beta[!aliased]))) {
+    return(list(kind = "search_limit", msg = paste(c(
+      "The search for the variance estimates reached its step limit before it settled.",
+      inner,
+      "The estimates shown are the best point found; they are often close, but this is",
+      "not checked. Do not use them until the fit converges.", advice), collapse = " "),
+      cls = diag_cls("search_limit")))
+  }
+  list(kind = "fit_failed", msg = paste(c(
+    "The fitting algorithm failed and returned no estimates.", inner, advice),
+    collapse = " "), cls = diag_cls("fit_failed"))
 }
 
 # `...` exists only to intercept known lme4 arguments with designed errors

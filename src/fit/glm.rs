@@ -216,9 +216,12 @@ pub(crate) fn glm_view_to_fit(
     // covariance). Gamma and inverse-Gaussian recover φ post-fit — the mean
     // model β is φ-independent, so φ stays out of the IRLS — and scale the SE
     // by √φ (the kernel folded φ=1, so Var(β̂)=φ·(XᵀWX)⁻¹). `dispersion: Some(v)`
-    // holds φ=v fixed; `None` estimates the Pearson moment `φ̂=Σ wᵢrᵢ²/(n−p)`,
-    // `rᵢ=(yᵢ−μ̂ᵢ)/√V(μ̂ᵢ)`, raw-row df — exactly
-    // `summary(glm(family=Gamma/inverse.gaussian, weights=w))$dispersion`.
+    // holds φ=v fixed. `None` is the Pearson moment `φ̂=Σ wᵢrᵢ²/(n−p)`,
+    // `rᵢ=(yᵢ−μ̂ᵢ)/√V(μ̂ᵢ)`, raw-row df, raw weights — exactly `summary(glm(...,
+    // weights=w))$dispersion` on both families (precision weights: row `i` has
+    // variance `φ·V(μᵢ)/wᵢ`, so Pearson's `wᵢrᵢ²` is already on that scale).
+    // Gamma's maximum-likelihood φ̂ is a DIFFERENT estimator, computed below for
+    // `loglik` alone — see the Gamma arm.
     let dispersion = if !converged {
         f64::NAN
     } else {
@@ -260,15 +263,49 @@ pub(crate) fn glm_view_to_fit(
     // log-likelihood on R's `logLik.glm`/`MASS::glm.nb` scale.
     // Binomial/Poisson/NB: the IRLS deviance is the weighted `dev_resid` sum,
     // so restoring the saturated constant gives the exact log-likelihood.
-    // Gamma: R's `Gamma()$aic` convention — dispersion profiled as dev/Σwᵢ
-    // inside `gamma_aic` (NOT the Pearson `dispersion` above, matching R, which
-    // also mixes the two conventions between `logLik` and `summary`).
+    // Gamma: the log-likelihood at the MAXIMISED φ̂ — a different estimator
+    // from `dispersion` above (the Pearson moment) — `−½·(D/φ +
+    // gamma_dispersion_term)`, `D` raw-weighted. The ML search and
+    // `gamma_dispersion_term` itself run on `ŵ = w/s`: the seed and solver
+    // start are not scale-free on raw `w` (raw-weight Newton from MASS's
+    // start can overshoot to NaN at large `w`; on `ŵ` it does not), so φ̂ is
+    // `s` times the internal root and `gamma_dispersion_term` is read at
+    // `ln(φ̂/s)`. A held φ (`opts.dispersion
+    // = Some(v)`) is used as-is for `D/φ`, with `Gₚ` still read on `ŵ` at
+    // `ln(v/s)` — the same internal coordinate the mixed path's held-φ arm
+    // uses (`fit::glmm::run_glmm_on`).
     let (fitted, loglik) = if converged {
         let mu = view.mu.to_vec();
         let ll = match family {
             Family::Gamma { .. } => {
-                -0.5 * (crate::family::gamma_aic(y, &mu, irls_deviance, n, opts.weights.as_deref())
-                    - 2.0)
+                let w = opts.weights.as_deref();
+                let s = crate::family::weight_scale(w, n);
+                let hat_w: Option<Vec<f64>> = w.map(|w| w[..n].iter().map(|&wi| wi / s).collect());
+                let sum_ln_y: f64 = y[..n].iter().map(|v| v.ln()).sum();
+                let phi = match opts.dispersion {
+                    Some(v) => v,
+                    None => {
+                        // The raw-scale ML equation `Σwᵢgᵢ = D/2` becomes, on
+                        // `w = s·ŵ`, `Σᵢ ŵᵢ·(ln aᵢ − ψ₀(aᵢ)) = D/(2s)`, so the
+                        // deviance handed to the per-row solver is `D/s`, not
+                        // raw `D` (see `gamma_ml_dispersion`'s own doc comment).
+                        let dev_int = irls_deviance / s;
+                        s * crate::family::gamma_ml_dispersion(dev_int, hat_w.as_deref(), n)
+                    }
+                };
+                if phi == 0.0 {
+                    // An exact fit: the likelihood rises without bound as φ → 0.
+                    f64::INFINITY
+                } else {
+                    let psi_int = (phi / s).ln();
+                    -0.5 * (irls_deviance / phi
+                        + crate::family::gamma_dispersion_term(
+                            psi_int,
+                            hat_w.as_deref(),
+                            n,
+                            sum_ln_y,
+                        ))
+                }
             }
             Family::InverseGaussian { .. } => {
                 -0.5 * (crate::family::inv_gaussian_aic(
@@ -385,7 +422,7 @@ pub(crate) fn nb_profile_loglik(y: &[f64], mu: &[f64], theta: f64, weights: Opti
 /// bit-identical β. `1e-4` was chosen as the loosest of {1e-8, 1e-7, 1e-6, 1e-5,
 /// 1e-4, 1e-3} that both removes the flip and keeps every cross-engine NB golden
 /// (`cargo test --features oracle-tests -- goldens_agree_with_the_references`)
-/// inside `validation/tol.R`'s bands (`1e-3` also held; `1e-4` is one decade
+/// inside `validation/grid/tol.R`'s bands (`1e-3` also held; `1e-4` is one decade
 /// tighter for margin).
 pub(crate) fn golden_max_ln_theta(mut g: impl FnMut(f64) -> f64) -> f64 {
     const INV_PHI: f64 = 0.618_033_988_749_894_9; // 1/golden ratio
@@ -462,10 +499,13 @@ pub(super) fn fit_glm_nb(
 /// code only ever calls it through [`fit_glm_nb`] (cap = `NB_MAX_OUTER`).
 ///
 /// Cap-exhaustion semantics (pinned by `fit_glm_nb_outer_cap_semantics`): the
-/// exit is SILENT — `converged` reflects only the last inner IRLS fit, β/se
-/// stay at the stale pre-update θ, and the returned `Fit::dispersion` carries
-/// the newer θ only when that last inner IRLS converged (NaN otherwise); the
-/// second return value carries the newer θ unconditionally.
+/// exit is REPORTED, not silent, and consistent — a cap exit whose last inner
+/// IRLS converged is refit at the final θ (β̂/SE recomputed there, not left at
+/// a stale pre-update θ), `converged` reflects that refit, and a
+/// [`crate::Note::NbShapeUnsettled`] carrying the round count is pushed onto
+/// the returned `Fit`'s diagnostics. The returned `Fit::dispersion` carries
+/// the newer θ only when the (possibly refit) fit converged (NaN otherwise);
+/// the second return value carries the newer θ unconditionally.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_glm_nb_capped(
     x: &[f64],
@@ -489,7 +529,10 @@ pub(super) fn fit_glm_nb_capped(
     let mut mu = vec![0.0f64; n];
 
     let mut fit_result = fit_unsupported_family(p);
+    let mut settled = false;
+    let mut rounds: u32 = 0;
     for _ in 0..max_outer {
+        rounds += 1;
         // θ is fixed for this β fit and threaded explicitly (the spec is θ-free).
         let view = fit_glm_prebuilt(family, theta, x_ref, y, opts, &mut buf);
         fit_result = glm_view_to_fit(&view, y, family, theta, n, p, opts);
@@ -508,10 +551,23 @@ pub(super) fn fit_glm_nb_capped(
         let converged = (new_theta - theta).abs() / theta < NB_THETA_TOL;
         theta = new_theta;
         if converged {
+            settled = true;
             // Final β/SE at the converged θ for consistency.
             let view = fit_glm_prebuilt(family, theta, x_ref, y, opts, &mut buf);
             fit_result = glm_view_to_fit(&view, y, family, theta, n, p, opts);
             break;
+        }
+    }
+    if !settled && rounds == max_outer as u32 && fit_result.converged() {
+        // Cap exit: refit β̂/SE at the θ this fit reports, so the returned Fit is
+        // one model, and say that θ never settled (`Note::NbShapeUnsettled`).
+        let view = fit_glm_prebuilt(family, theta, x_ref, y, opts, &mut buf);
+        fit_result = glm_view_to_fit(&view, y, family, theta, n, p, opts);
+        if fit_result.converged() {
+            fit_result
+                .diagnostics
+                .notes
+                .push(crate::Note::NbShapeUnsettled { rounds });
         }
     }
     if fit_result.converged() {

@@ -100,7 +100,7 @@ fn suite_dir() -> String {
 }
 
 /// Unquoted-header, `,`-split CSV read — the validation corpus's own format.
-/// Mirrors `validation/engines/common.rs`'s reader; the crate cannot depend on
+/// Mirrors `validation/tools/common.rs`'s reader; the crate cannot depend on
 /// the (publish = false) validation package, so the twenty lines are repeated
 /// rather than shared.
 fn read_csv(path: &str) -> (Vec<String>, Vec<Vec<String>>) {
@@ -591,7 +591,15 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     let mut ws =
         GlmmWorkspace::for_cluster_spec_ext(p, sized, n, &slope_cols, &extra_slope_cols, 1);
     if let Some(w) = &r.opts.weights {
-        ws.prior_w[..n].copy_from_slice(w);
+        // Mirrors `fit::glmm::prep_glmm_design`: Gamma runs on `ŵ = w/s`.
+        if matches!(sized.family, crate::Family::Gamma { .. }) {
+            let s = crate::family::weight_scale(Some(w), n);
+            for (dst, &wi) in ws.prior_w[..n].iter_mut().zip(w.iter()) {
+                *dst = wi / s;
+            }
+        } else {
+            ws.prior_w[..n].copy_from_slice(w);
+        }
         ws.weighted = true;
     }
     ws.offset = r.opts.offset.clone();

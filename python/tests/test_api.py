@@ -8,15 +8,26 @@ DATA = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
 
 
 def test_module_surface():
-    # `fit`, `Fit`, and the six warning categories the diagnostics channel
+    # `fit`, `Fit`, and the seventeen warning categories the diagnostics channel
     # raises — a user has to be able to name them to filter on them.
     assert glmm.__all__ == [
+        "AgqFallbackWarning",
+        "ArgumentIgnoredWarning",
+        "ConstantResponseWarning",
+        "DesignUnsolvableWarning",
         "DiagnosticWarning",
         "Fit",
+        "FitFailedWarning",
+        "GlmDivergedWarning",
         "HessianSeFallbackWarning",
         "IllConditionedWarning",
+        "NbShapeUnsettledWarning",
+        "NoCoefficientsWarning",
         "PirlsExhaustedWarning",
         "ReDesignScaleWarning",
+        "SearchLimitWarning",
+        "SingularFitWarning",
+        "TooFewRowsWarning",
         "UnusedGroupingLevelsWarning",
         "fit",
     ]
@@ -100,4 +111,6 @@ def test_fit_fields():
         "nobs",
         "y",
         "weights",
+        "warnings",
+        "dispersion_held",
     ]

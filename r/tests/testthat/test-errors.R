@@ -200,7 +200,7 @@ test_that("init.theta has no kernel hook; wrong-family use warns and strips", {
                         init.theta = 1.5),
                "no kernel hook")
   expect_warning(fit <- fastglmm(y ~ x, d, init.theta = 1.5),
-                 "applies only to family 'negativebinomial'")
+                 "init.theta= is not used for family 'gaussian'")
   expect_true(fit$converged)
 })
 
@@ -236,15 +236,33 @@ test_that("nAGQ must be an odd integer in 1..=25", {
 })
 
 test_that("ineligible-shape nAGQ > 1 warns and falls back to Laplace", {
-  # gaussian LMM is AGQ-ineligible: must warn and fit, never panic or error
-  # (mirrors the Python port; lme4 would error here — documented divergence).
+  # gaussian LMM is AGQ-ineligible: nAGQ has no effect on it at all (mirrors
+  # the Python port; lme4 would error here — documented divergence).
   d <- err_data()
   # capture_warnings: the null-effect data also (legitimately) warns about a
   # boundary fit, which a single expect_warning would trip over.
   w <- capture_warnings(fit <- fastglmm(y ~ x + (1 | g), d, nAGQ = 3))
-  expect_match(w, "Laplace", all = FALSE)
+  expect_match(w, "nAGQ=3 has no effect for a Gaussian model", all = FALSE)
   expect_equal(fit$nAGQ, 1L)
   expect_true(fit$converged)
+})
+
+test_that("nAGQ > 1 on negative-binomial and Gamma fits quadrature", {
+  # NB's theta sits outside the AGQ integral, and Gamma's phi enters it only as
+  # a weight on the deviance (the rest of its log-density sits outside), so both
+  # families take nAGQ > 1 like binomial/Poisson: no warning, and the fit
+  # reports the node count it ran (mirrors the Python port).
+  d <- err_data()
+  set.seed(4)
+  d$cnt <- rpois(nrow(d), exp(0.5 + 0.3 * d$x))
+  d$pos <- rgamma(nrow(d), shape = 2, rate = 2 / exp(0.5 + 0.1 * d$x))
+  for (spec in list(list(y = "cnt", fam = "negativebinomial"),
+                    list(y = "pos", fam = "gamma"))) {
+    f <- stats::as.formula(paste(spec$y, "~ x + (1 | g)"))
+    w <- capture_warnings(fit <- fastglmm(f, d, family = spec$fam, nAGQ = 7))
+    expect_false(any(grepl("nAGQ", w)), info = spec$fam)
+    expect_equal(fit$nAGQ, 7L, info = spec$fam)
+  }
 })
 
 test_that("unimplemented accessors error with the reason", {
@@ -258,6 +276,6 @@ test_that("unimplemented accessors error with the reason", {
 
 test_that("dispersion on a non-dispersion family warns and strips", {
   expect_warning(fit <- fastglmm(y ~ x, err_data(), dispersion = 2),
-                 "not applicable")
+                 "has no effect for family 'gaussian'")
   expect_true(fit$converged)
 })

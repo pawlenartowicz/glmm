@@ -173,6 +173,15 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 detail: String::new(),
                 ratio: f64::NAN,
             },
+            Note::NbShapeUnsettled { rounds } => NoteInfo {
+                kind: "nb_shape_unsettled",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: rounds,
+                final_eval: false,
+                detail: String::new(),
+                ratio: f64::NAN,
+            },
         })
         .collect()
 }
@@ -353,12 +362,18 @@ pub fn run_fit(
     // the strip site; each port emits the message (Python `UserWarning`, R
     // `warning()`). Eligibility mirrors
     // `src/fit/common.rs::assert_model_shape` — change together: nagq>1 needs
-    // a mixed binomial/Poisson model with a single grouping factor and
+    // a mixed binomial/Poisson/negative-binomial/Gamma model with a single grouping factor and
     // q_p = 1 + #slopes ≤ 3 (the temporary cost/oracle cap).
     let mut nagq = nagq;
     let mut agq_warning: Option<String> = None;
     if nagq > 1 {
-        let agq_family = matches!(fam, Family::Binomial { .. } | Family::Poisson { .. });
+        let agq_family = matches!(
+            fam,
+            Family::Binomial { .. }
+                | Family::Poisson { .. }
+                | Family::NegativeBinomial { .. }
+                | Family::Gamma { .. }
+        );
         let eligible = match lowered.model.re.as_ref() {
             Some(re) => {
                 let q_p = 1 + re.slopes.len(); // intercept + slopes, as in assert_model_shape
@@ -368,7 +383,7 @@ pub fn run_fit(
         };
         if !eligible {
             agq_warning = Some(format!(
-                "nagq={nagq} (adaptive quadrature) applies only to binomial/Poisson \
+                "nagq={nagq} (adaptive quadrature) applies only to binomial/Poisson/negative-binomial/Gamma \
                  mixed models with a single grouping factor and at most 3 random \
                  effects per group; fitting with Laplace (nagq=1)"
             ));
@@ -441,11 +456,12 @@ pub fn run_fit(
     // An EMPTY `varcorr` is not a mismatch — it is the crate's numerical-failure
     // convention, "the fit assembled no variance components". Every failure
     // return uses it: the degenerate LMM endpoint (`fit/lmm.rs`, alongside its
-    // NaN-filled `tau2`/`vcov`), any non-converged dense GLMM (`fit/glmm.rs`),
-    // the unfittable-random-slope return and the sparse NaN return
-    // (`fit/common.rs`). `Fit::has_negligible_component` documents the same
-    // reading, and both ports already gate their random-effects block on
-    // `varcorr`'s length, so an empty one prints no RE section rather than
+    // NaN-filled `tau2`/`vcov`), a FAILED dense GLMM (`fit/glmm.rs`); a capped
+    // dense GLMM now reports its finite endpoint's varcorr, non-empty, under
+    // the plateau policy instead. Also the unfittable-random-slope return and
+    // the sparse NaN return (`fit/common.rs`). `Fit::has_negligible_component` documents
+    // the same reading, and both ports already gate their random-effects block
+    // on `varcorr`'s length, so an empty one prints no RE section rather than
     // mislabelling one. Only a NON-empty block list of the wrong length is the
     // kernel bug this check is for. Non-mixed fits leave both empty.
     if !fit.varcorr.is_empty() && fit.varcorr.len() != re_groups.len() {
@@ -618,6 +634,13 @@ mod tests {
         assert_eq!(notes[1].kind, "pirls_exhausted");
         assert_eq!(notes[1].evals, 0);
         assert!(notes[1].final_eval);
+    }
+
+    #[test]
+    fn nb_shape_unsettled_payload_survives_flattening() {
+        let notes = note_infos(vec![Note::NbShapeUnsettled { rounds: 25 }]);
+        assert_eq!(notes[0].kind, "nb_shape_unsettled");
+        assert_eq!(notes[0].evals, 25);
     }
 
     #[test]
@@ -899,7 +922,7 @@ mod tests {
     /// Deterministic fixed-effects-only Gamma(log) fixture: `y = exp(1 +
     /// 0.5·x) · jitter` on a centered `x`, `jitter` a 7-cycle deterministic
     /// wobble around 1 (same shape as `glm.rs`'s Gamma fixtures) so the
-    /// Pearson-vs-fixed dispersion paths are both exercised on real data.
+    /// estimated-vs-fixed dispersion paths are both exercised on real data.
     #[allow(clippy::type_complexity)] // test fixture: the numeric+factor column maps run_fit takes
     fn toy_gamma() -> (
         HashMap<String, Vec<f64>>,
@@ -922,7 +945,7 @@ mod tests {
     }
 
     /// `dispersion: Some(v)` must hold φ fixed at exactly `v` instead of
-    /// estimating the Pearson moment — the only way `FitOptions::dispersion`
+    /// estimating it — the only way `FitOptions::dispersion`
     /// reaches the kernel from a port is through this string/option layer.
     #[test]
     fn gamma_end_to_end_holds_dispersion_fixed() {
