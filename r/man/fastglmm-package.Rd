@@ -5,7 +5,7 @@
 \alias{fastglmm-package}
 \title{fastglmm: Fast (Generalized) Linear Mixed Models via the 'glmm' Rust Kernel}
 \description{
-Fits linear models, generalized linear models, and (generalized) linear mixed models with a compiled Rust backend (the 'glmm' crate): REML linear mixed models, and Laplace or adaptive Gauss-Hermite quadrature for binomial and Poisson mixed models, using 'lme4'-style formulas. Estimates are validated against 'lme4' and 'MixedModels.jl'. Deliberately scoped to fast fitting - fixed effects, Wald standard errors, and variance components; anything the backend cannot compute honestly (random-effect predictions, likelihood-based criteria, profiling) is a documented error, never a silently different answer.
+Fits linear models, generalized linear models, and (generalized) linear mixed models with a compiled Rust backend (the 'glmm' crate): REML linear mixed models, and Laplace or adaptive Gauss-Hermite quadrature for binomial, Poisson, negative-binomial, and Gamma mixed models, using 'lme4'-style formulas. Estimates are validated against 'lme4', 'glmmTMB', and 'MixedModels.jl'. Deliberately scoped to fast fitting - fixed effects, Wald standard errors, and variance components; anything the backend cannot compute honestly (random-effect predictions, profiling) is a documented error, never a silently different answer.
 }
 \seealso{
 Useful links:

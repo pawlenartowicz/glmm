@@ -1,0 +1,20 @@
+{
+  "engine": "glmmtmb",
+  "engine_version": "1.1.14",
+  "machine": "dell-fedora",
+  "date": "2026-09-27T00:00:40+02:00",
+  "glmm_crate_version": "0.4.1",
+  "glmm_git_rev": "c0893ab58f3d7db9ff0ef224e2d0e598fac12e6a",
+  "subset": "full",
+  "timed": null,
+  "timed_unlocked": false,
+  "no_turbo": "1",
+  "pin_cores": "0-1",
+  "jobs": 2,
+  "loadavg_start": "3.44 4.69 3.21",
+  "r_version": "4.5.3",
+  "julia_version": "1.12.6",
+  "label": "precision-weight dispersion offsets and inverse-link start retry",
+  "cells": 771,
+  "cell_list": []
+}

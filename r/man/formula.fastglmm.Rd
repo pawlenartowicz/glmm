@@ -19,7 +19,7 @@
 }
 \description{
 \code{formula()} returns the formula \strong{string} as given: the R side never
-builds a \code{terms} object (the parser is Rust-side, R-port spec section 3), and
+builds a \code{terms} object (the parser is Rust-side), and
 synthesizing one would disagree with how the model was actually built -
 which is also why \code{terms()} errors.
 }

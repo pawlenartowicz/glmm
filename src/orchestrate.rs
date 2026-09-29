@@ -92,7 +92,10 @@ pub struct NoteInfo {
     /// The scaled pivot behind the note; `NaN` for a variant that carries none.
     pub pivot: f64,
     /// `PirlsExhausted` payload: how many fit-path evals hit the inner-PIRLS
-    /// cap (that variant's `evals`). 0 for every other variant.
+    /// cap (that variant's `evals`). Also carries `NbShapeUnsettled`'s
+    /// `rounds` and `NonIntegerResponse`'s `rows`, which need the same "small
+    /// count" shape and no variant needs more than one at once. 0 for every
+    /// other variant.
     pub evals: u32,
     /// `PirlsExhausted` payload: whether the final re-evaluation at the
     /// converged fit itself hit the cap, so the truncated solve's ũ/W̃ feed
@@ -102,8 +105,8 @@ pub struct NoteInfo {
     pub final_eval: bool,
     /// Free text a variant needs and the fields above cannot carry (the
     /// grouping and level names of `UnusedGroupingLevels`, the grouping name
-    /// of `ReDesignScaleSpread`). Empty otherwise; the `kind`, not this
-    /// string, stays the stable identifier.
+    /// of `ReDesignScaleSpread` and of `SingleLevelGroupingDropped`). Empty
+    /// otherwise; the `kind`, not this string, stays the stable identifier.
     pub detail: String,
     /// `ReDesignScaleSpread` payload: the measured max/min column-RMS ratio
     /// (that variant's `ratio`). `NaN` for every other variant.
@@ -178,6 +181,33 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 columns: Vec::new(),
                 pivot: f64::NAN,
                 evals: rounds,
+                final_eval: false,
+                detail: String::new(),
+                ratio: f64::NAN,
+            },
+            Note::NonIntegerResponse { rows } => NoteInfo {
+                kind: "non_integer_response",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: rows,
+                final_eval: false,
+                detail: String::new(),
+                ratio: f64::NAN,
+            },
+            Note::SingleLevelGroupingDropped { grouping } => NoteInfo {
+                kind: "single_level_grouping_dropped",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: 0,
+                final_eval: false,
+                detail: grouping,
+                ratio: f64::NAN,
+            },
+            Note::ExactProfileFallback => NoteInfo {
+                kind: "exact_profile_fallback",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: 0,
                 final_eval: false,
                 detail: String::new(),
                 ratio: f64::NAN,
@@ -658,6 +688,14 @@ mod tests {
         assert_eq!(notes[1].kind, "hessian_se_fallback");
         assert_eq!(notes[1].detail, "");
         assert!(notes[1].ratio.is_nan());
+    }
+
+    #[test]
+    fn exact_profile_fallback_survives_flattening() {
+        let notes = note_infos(vec![Note::ExactProfileFallback]);
+        assert_eq!(notes[0].kind, "exact_profile_fallback");
+        assert_eq!(notes[0].detail, "");
+        assert!(notes[0].ratio.is_nan());
     }
 
     /// A factor column in the `(levels, codes)` form `run_fit` takes, with the

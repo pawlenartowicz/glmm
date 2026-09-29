@@ -2,8 +2,7 @@
 //! materialize's fixed design vs R `model.matrix`. The fixtures are
 //! frozen R output (`fixtures/contrasts_fixtures.rs`, regenerate with
 //! `gen_contrasts_fixtures.R`); the oracle is sacred — a mismatch is a
-//! formula-frontend bug, never a relaxed fixture. Interactions are checked in the
-//! marginal-present (treatment-dummy) form only; see the generator header.
+//! formula-frontend bug, never a relaxed fixture.
 
 use glmm::formula::{lower, Column, Table};
 use glmm::Family;
@@ -48,6 +47,26 @@ fn dat() -> Table {
                 "w".into(),
                 Column::Numeric(vec![1.5, 2.0, 0.5, 4.0, 3.0, 2.5]),
             ),
+            (
+                "xz".into(),
+                Column::Numeric(vec![0.5, -5.0, -1.5, 0.0, -1.5, 2.0]),
+            ),
+            (
+                "a".into(),
+                Column::Numeric(vec![0.3, -1.0, 2.0, 1.5, 0.0, -0.7]),
+            ),
+            (
+                "b".into(),
+                Column::Numeric(vec![1.1, 0.4, -0.2, 2.2, -1.3, 0.9]),
+            ),
+            (
+                "c".into(),
+                Column::Numeric(vec![-0.5, 1.7, 0.8, -2.0, 1.0, 0.2]),
+            ),
+            (
+                "d".into(),
+                Column::Numeric(vec![2.5, -0.6, 0.1, 1.3, -1.8, 0.7]),
+            ),
         ],
         n: 6,
     }
@@ -85,7 +104,7 @@ fn fixed_design_matches_model_matrix() {
     // running zero times and reporting green.
     assert_eq!(
         FIXTURES.len(),
-        22,
+        59,
         "the frozen contrast fixture set changed size"
     );
     for fx in FIXTURES {
@@ -94,7 +113,14 @@ fn fixed_design_matches_model_matrix() {
         } else {
             dat()
         };
-        let lo = lower(fx.formula, &table, Family::Gaussian)
+        // The parser has no `-` term removal; `y ~ f:g + g` is the same model,
+        // with `f` written first as in `f*g`, so the interaction is named `fb:gp`
+        // as R names it.
+        let formula = match fx.formula {
+            "y ~ f*g - f" => "y ~ f:g + g",
+            other => other,
+        };
+        let lo = lower(formula, &table, Family::Gaussian)
             .unwrap_or_else(|e| panic!("{}: lower failed: {e}", fx.formula));
 
         let want_names: Vec<String> = fx.names.iter().map(|s| s.to_string()).collect();
@@ -109,5 +135,19 @@ fn fixed_design_matches_model_matrix() {
                 fx.formula
             );
         }
+    }
+}
+
+#[test]
+fn an_interaction_repeated_in_another_order_is_coded_once() {
+    // R's `model.matrix` gives `y ~ f*g + g:f` exactly the design of
+    // `y ~ f*g`, and `y ~ f:g + g:f` that of `y ~ f:g` (checked with
+    // `identical()` in R 4.5.3): a term is its set of variables, so the
+    // repeat adds no column.
+    for (formula, same_as) in [("y ~ f*g + g:f", "y ~ f*g"), ("y ~ f:g + g:f", "y ~ f:g")] {
+        let fx = FIXTURES.iter().find(|fx| fx.formula == same_as).unwrap();
+        let lo = lower(formula, &dat(), Family::Gaussian).unwrap();
+        assert_eq!(lo.col_names, fx.names, "{formula} column names");
+        assert_eq!(lo.x, fx.x, "{formula} design");
     }
 }

@@ -44,8 +44,8 @@ mixed models go through PIRLS with Laplace/AGQ
   count — lme4's `cbind(s, m−s)` objective). `Logit` runs on the fused-SIMD
   canonical hot path; `Probit` (`μ = Φ(η)` via the high-precision `phi_hp`)
   and `Cloglog` (`μ = 1−exp(−exp(η))`, asymmetric — μ approaches 1 much faster
-  than 0, hence an upper clamp on η at `ln(ETA_MAX)` the other two links don't
-  need) both take the general Fisher-scoring branch.
+  than 0, and η is clamped at `±ETA_MAX` so `exp(η)` stays finite) both take
+  the general Fisher-scoring branch.
 - **Gamma**: `Fit::loglik` is always the maximised log-likelihood, at the ML
   φ̂ of the Gamma shape equation (`MASS::gamma.shape`'s equation at unit
   weights; see [`algorithms.md`](algorithms.md)). What `Fit::dispersion`

@@ -110,6 +110,38 @@ def test_summary_object_blocks_lmm():
     np.testing.assert_allclose(s.scaled_residuals, np.quantile(r, [0, 0.25, 0.5, 0.75, 1]))
 
 
+def test_groups_count_excludes_unused_grouping_levels():
+    # A declared level with no rows still owns a slot in ranef_levels (a
+    # block is sized by the highest observed code), but lme4's count is
+    # after droplevels() — one fewer per unused level, and the number every
+    # renderer prints must agree.
+    f = _mixed_fit(
+        diagnostics={
+            "converged": True,
+            "singular": False,
+            "aliased": np.array([False, False]),
+            "boundary": "interior",
+            "pinned": [],
+            "notes": [
+                {
+                    "kind": "unused_grouping_levels",
+                    "columns": [],
+                    "pivot": math.nan,
+                    "evals": 0,
+                    "final_eval": False,
+                    "detail": "Subject: s9, s10",
+                    "ratio": math.nan,
+                }
+            ],
+        },
+        ranef_levels=np.array([20]),  # 18 used levels + 2 declared-unused
+    )
+    s = f.summary_object()
+    assert s.groups == [("Subject", 18)]
+    for rendered in (s.text(), s.html(), s.latex(), s.typst()):
+        assert "groups:  Subject, 18" in rendered or "groups: Subject, 18" in rendered
+
+
 def test_summary_object_criterion_row_ml():
     f = make_fit(family="poisson", link="log", loglik=-92.0, df=5, nobs=56, reml=False)
     c = f.summary_object().criterion

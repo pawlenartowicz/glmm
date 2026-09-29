@@ -28,6 +28,7 @@ mod parse;
 
 pub use error::{Error, ParseError};
 pub use materialize::{
-    label_ranef, lower, materialize, Column, Lowered, RanefBlock, ReGroupInfo, Table,
+    label_ranef, lower, materialize, numeric_only_columns, referenced_columns, unresolved_columns,
+    Column, Lowered, RanefBlock, ReGroupInfo, Table,
 };
 pub use parse::{parse, ParsedFormula, RandomEffect, Term};

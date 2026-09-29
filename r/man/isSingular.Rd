@@ -3,11 +3,14 @@
 \name{isSingular}
 \alias{isSingular}
 \alias{isSingular.fastglmm}
+\alias{isSingular.default}
 \title{Is the fit singular?}
 \usage{
 isSingular(x, ...)
 
 \method{isSingular}{fastglmm}(x, ...)
+
+\method{isSingular}{default}(x, ...)
 }
 \arguments{
 \item{x}{a \link{fastglmm} fit.}
@@ -18,4 +21,31 @@ isSingular(x, ...)
 \code{TRUE} iff the fit converged onto the variance-component boundary - the
 same condition \code{lme4::isSingular} reports (the kernel computes it; see
 \verb{glmm::Fit::singular}).
+}
+\details{
+Two packages, one generic name, and neither one may depend on the other.
+\code{isSingular} is lme4's own generic (unlike \code{fixef}/\code{ranef}/\code{VarCorr}
+above, it has no shared upstream generic such as nlme's to add a method
+to). fastglmm declares its own \code{isSingular} generic too, so
+\code{isSingular(fit)} on a \link{fastglmm} fit works even with lme4 not installed
+at all.
+
+Whichever package is attached last wins the bare \code{isSingular} name in the
+search path, so both directions still need to work. When lme4's generic
+is the one left in scope, this method also being registered directly on
+lme4's generic (by delayed S3 registration - it only activates if and
+when lme4 happens to be loaded) is what makes a \link{fastglmm} fit still
+dispatch correctly. When fastglmm's generic is the one left in scope
+instead, \code{isSingular.default} below is what makes a \code{merMod} fit still
+dispatch correctly - by forwarding to lme4's generic \strong{only for a
+\code{merMod} object, and only when the lme4 namespace is already loaded},
+never by loading it: a \code{merMod} object cannot exist without lme4 already
+loaded in the first place, so this never needs to load anything, and this
+package still does not depend on lme4 (not even as a Suggests - the one
+place lme4 is used live is the hand-run comparison in \verb{tools/}). The
+\code{merMod} check also matters on its own: lme4's S4 default method calls
+\code{UseMethod("isSingular")}, which lands back here for any object that is
+neither a \code{fastglmm} fit nor a \code{merMod} - forwarding unconditionally
+would call lme4's generic again and recurse until the C stack fills up,
+so anything else still falls through to the plain error below.
 }

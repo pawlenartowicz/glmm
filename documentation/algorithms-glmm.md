@@ -12,7 +12,7 @@ lme4, MixedModels.jl, and GLMMadaptive.
 Each section names its code, the lme4/`glmer` (or `MixedModels.jl`) semantics it
 follows, and the validation rungs that pin it. Estimation is `glmer`-faithful
 `nAGQ=1` Laplace by default; AGQ (`nAGQ>1`) is an opt-in on a single grouping
-factor with up to 3 random effects per group, binomial/Poisson.
+factor with up to 3 random effects per group, binomial/Poisson/negative-binomial/Gamma.
 
 ## Notation
 
@@ -27,11 +27,11 @@ The recurring symbols on this page, defined once here before first use:
   with prior `u ~ N(0, I)`; ũ is the converged mode.
 - **η, μ, W** — the linear predictor, the conditional mean (`link⁻¹` of η), and
   the IRLS working weights.
-- **A = MᵀWM + I** — the penalized-IRLS system matrix. PIRLS steps with the
-  Fisher weight; the objective's `log|A|` is taken at the mode with the exact
-  curvature `W_obs = −∂²ℓᵢ/∂ηᵢ²`, which is the Fisher weight on a canonical
-  link and differs from it on probit, cloglog, Gamma/log and NB/log (see
-  [Laplace approximation](#laplace-approximation)).
+- **A = MᵀWM + I** — the penalized-IRLS system matrix. `W` is the exact
+  curvature `W_obs = −∂²ℓᵢ/∂ηᵢ²`, both in the PIRLS step (a Newton step) and
+  in the objective's `log|A|` at the mode. It is the Fisher weight on a
+  canonical link and differs from it on probit, cloglog, Gamma/log and NB/log
+  (see [Laplace approximation](#laplace-approximation)).
 - **β** — the fixed effects. In the objective, dispersion is fixed at 1 for
   every family except Gamma, whose φ is a free parameter searched by the outer
   loop as `ln φ` (NB's θ is a shape parameter searched the same way).
@@ -74,7 +74,7 @@ once dispatch is inside the GLMM path. The hard rejections are the shape
 asserts at the stable boundary (`assert_model_shape`, `src/fit/common.rs`):
 `nAGQ` must be odd in `1..=25`, and `nAGQ>1` is allowed only on a single
 grouping factor (no extras), `q_p ≤ 3` random effects per group,
-binomial/Poisson GLMM. The same assert also checks the engine invariants that
+binomial/Poisson/negative-binomial/Gamma GLMM. The same assert also checks the engine invariants that
 hold at `nAGQ = 1`: every primary/extra slope column must index within `p`,
 and at most one `NestedWithin` extra grouping is accepted. It also rejects
 `(Family::InverseGaussian, Some(re))` outright — a family × random-effects
@@ -105,8 +105,8 @@ crossed extra → `fit_sparse_binomial_slope_crossed_is_pinned` in
 `PIRLS_OSC_TRIGGER = 3`, and the tolerance selector `pirls_tol` in
 `src/glmm/mod.rs`.
 
-At a fixed θ the conditional modes ũ are found by penalized IRLS — Fisher
-scoring on the penalized likelihood. The RE design is the scaled `M = ZΛ_θ`, and
+At a fixed θ the conditional modes ũ are found by penalized IRLS — Newton's
+method on the penalized likelihood. The RE design is the scaled `M = ZΛ_θ`, and
 the penalty adds a `+I` ridge; this is the standard `nAGQ=1` reparameterization,
 under which the prior is `u ~ N(0, I)`. Each iteration forms `A = MᵀWM + I` and
 the IRLS right-hand side `Mᵀ(W·Mu + (y − μ))`, then takes the next `u` from a
@@ -151,17 +151,33 @@ Convergence follows the lme4 `pwrss` rule: exit when
 between iterations, so the band scales with the penalized deviance itself, not
 the penalty term alone.
 
+**Newton step.** The step weight is the exact curvature of the conditional
+log-density in η, `W_obs = −∂²ℓᵢ/∂ηᵢ²` (`pirls::observed_weights_in_place`,
+called by all three `f64` kernels before the scatter), so `A` is the Hessian of
+the penalized deviance in u and the step is Newton's. On a canonical link that
+weight is the Fisher weight. On probit, cloglog, Gamma/log and NB/log it is
+not, and Fisher scoring with the expected weight converges only linearly there:
+a loose band leaves the outer objective too noisy for BOBYQA on wide fits, a
+tight one is slow, and a cold start far from the mode can exhaust
+`PIRLS_MAX_ITERS` on most of BOBYQA's first interpolation points. `W_obs` is
+positive on every row there, each log-likelihood being log-concave in η, so
+`A` stays positive definite. A tail row (see "Tail rows" in
+[`algorithms.md`](algorithms.md#generalised-linear-models-glm)) takes the
+observed weight of its η form, positive too. The mode is the same either way;
+only the path to it changes. The dual derivative kernels keep the Fisher
+weight in their own `A` and take the same Newton step through their observed
+twin (`DualStep::observed`, see [Standard errors](#standard-errors)).
+
 The tolerance is link-dependent. Canonical links — exactly the two
-`family::is_canonical` cases, logit and Poisson-log — are Newton with quadratic
-convergence, and use `PIRLS_TOL_REL = 1e-9`. Non-canonical links (probit,
-cloglog, Gamma-log/inverse, NB-log) are Fisher-scoring with only linear
-convergence, and
-use `PIRLS_TOL_REL_NONCANON = 1e-8`. That non-canonical value is a decade looser
-than the canonical exit — Newton overshoots its tolerance to machine precision
-for free, whereas every extra Fisher-scoring digit costs iterations. It is
-nonetheless tightened far below the historical 1e-6 default, so the
-non-canonical deviance stays smooth enough for the outer optimizer and the
-FD arm of the SE.
+`family::is_canonical` cases, logit and Poisson-log — use
+`PIRLS_TOL_REL = 1e-9`. Non-canonical links (probit, cloglog, Gamma-log/inverse,
+NB-log) use `PIRLS_TOL_REL_NONCANON = 1e-8`, a decade looser. That value rests
+on the accuracy grid: with the Newton step at 1e-8, the wide probit, cloglog,
+Gamma/log and NB/log cells that stall under Fisher scoring (5e-5 to 5e-3
+deviance units above glmmTMB), the 30000-row Gamma/log cell that stalled at its
+start, and every other non-canonical mixed cell land within `dev_eps` (4e-5) of
+glmmTMB's deviance; a 1e-10 band measured no better there and cost 0–60% more
+wall.
 
 **Step-halving** mirrors lme4 `pwrssUpdate`'s 10-halving discipline, in its
 retrospective form. The trial `u` is evaluated first. Only if its same-point
@@ -175,14 +191,14 @@ profile the same holds for a non-finite merit. In Profile mode (below) the joint
 `(u, β)` step is backtracked in lockstep, halving β toward `beta_prev` alongside
 `u`.
 
-**Period-2 damping.** On a non-canonical link the Fisher step uses the expected
-weight while the curvature of the conditional log-density is the observed one.
-Where the observed curvature exceeds twice the expected one along some
-direction, the undamped step overshoots the mode, the iteration map has an
-eigenvalue at or below −1, and the iterates settle into a 2-cycle: the
-same-point penalized deviance rises by less than the halving band per step
-while `mixed` keeps alternating by more than the stopping band, so the solve
-would run out `PIRLS_MAX_ITERS`. After `PIRLS_OSC_TRIGGER` consecutive sign
+**Period-2 damping.** An undamped step can overshoot the mode so that the
+iteration map has an eigenvalue at or below −1, and the iterates settle into a
+2-cycle: the same-point penalized deviance rises by less than the halving band
+per step while `mixed` keeps alternating by more than the stopping band, so the
+solve would run out `PIRLS_MAX_ITERS`. Fisher scoring does this on a
+non-canonical link wherever the observed curvature exceeds twice the expected
+one; the Newton step does not have that cause, and the detector stays as a
+guard for any step that cycles. After `PIRLS_OSC_TRIGGER` consecutive sign
 flips of `mixed − mixed_prev`, each at least `PIRLS_OSC_RATIO` times the one
 before, every later step of that solve moves half way from the pre-step
 iterate (β in lockstep in Profile mode), which maps an eigenvalue λ of the
@@ -238,19 +254,110 @@ never mixed within a fit:
   `converged` — the reported `(θ̂, β̂)` is therefore always the Laplace
   optimum, not the PQL one.
 - **`ExactProfile`** instead profiles β out EXACTLY at each candidate θ
-  (`BetaMode::ProfileExact`): the PIRLS inner loop adds the same δβ
-  Schur-border step as `PqlThenJoint`, but its accept/halve test runs on the
-  Laplace merit `dev + ‖ũ‖² + log|A(u)| + g_u'·δu₀` — the profiled Laplace
+  (`BetaMode::ProfileExact`): the PIRLS inner loop adds a δβ Schur-border step
+  that is Newton on the Laplace profile `L(β) = dev + ‖ũ‖² + log|A|` along the
+  mode ũ(β). The PQL border solves `S_β·δβ = X'ρ − B'δu₀`; the exact one takes
+  log|A|'s gradient `½c_β` off the right-hand side and adds its curvature
+  `½·d²log|A|/dβ²` to `S_β` (`logdet_beta_curvature` in
+  `src/glmm/pirls/mod.rs` carries the derivation and the per-iteration cost).
+  Without that curvature the step overshoots wherever log|A| dominates it — a
+  few clusters at a large θ, where the profile is nearly flat in the intercept
+  — and the solve can cycle. Far from the mode even the exact quadratic model
+  can be far off, so the border step runs inside a trust region
+  (`BorderTrust`, `border_solve`; Nocedal & Wright, *Numerical Optimization*,
+  2nd ed., ch. 4). Each trial a border step produced is judged by `ρ` = actual
+  merit change / the change the model predicts; `ρ < ¼` shrinks the radius to
+  a quarter of the step taken, `ρ > ¾` on a step the radius cut doubles it,
+  and a disagreement inside the accept test's allowance for the merits' own
+  error counts as agreement. A step from a point accepted unjudged (the first
+  trial of a solve) is not judged: from a cold start the joint step's u half
+  can overshoot far more than the β model says anything about. A step longer
+  than the radius, or one on a curvature that is not positive definite, is the
+  Levenberg–Marquardt step `(H + λI)δ = g` with `‖δ‖` on the radius, λ by Moré
+  & Sorensen's safeguarded Newton iteration. The radius starts infinite (a
+  solve whose steps all agree with their model takes the plain Newton step);
+  where the curvature is not positive definite before any radius is set, the
+  first radius is the length of the `S_β` step. Its accept/halve test runs on
+  the Laplace merit `dev + ‖ũ‖² + log|A(u)| + g_u'·δu₀` — the profiled Laplace
   deviance at θ, not the PQL objective — with the correction term controlling
   for the trial `u` sitting off the conditional mode (see the PIRLS solvers'
   own comments for the full derivation: `src/glmm/pirls/blocked.rs`,
   `src/glmm/pirls/blocked_extras.rs`). Because this θ-only pass already
   reaches the Laplace optimum, no joint polish follows — its status alone
   gates convergence, on the shapes `exact_profile_shape` selects (nAGQ=1,
-  non-Gamma, and either no extra groupings or a structured-extras shape
-  within `structured_extras_eligible`): the kernel's observed-information
-  twin gives the û-path adjoint solve its `Ã = A_obs` on every link, so the
-  route carries no canonical-link restriction on either shape.
+  non-Gamma, and either no extra groupings or a structured-extras shape within
+  `structured_extras_eligible`): the kernel steps with the exact curvature, so
+  its own factor gives the û-path adjoint solve its `Ã = A_obs` on every link,
+  and the route carries no canonical-link restriction on either shape.
+
+**The β coordinates of the joint search.** The joint BOBYQA (`Joint`, and the
+polish of `PqlThenJoint`) does not step β in the caller's units. Like θ, which
+it searches as the internally scaled θ̃ (see
+[`algorithms-lmm.md` §Random-effect design column scaling](algorithms-lmm.md#random-effect-design-column-scaling)),
+it searches β as
+
+```
+G = Σᵢ wᵢ xᵢxᵢᵀ / Σᵢ wᵢ = L Lᵀ      β̃ = Lᵀβ      η = Xβ = (X L⁻ᵀ) β̃
+```
+
+with `wᵢ` the prior weights and `L` the lower Cholesky factor of the
+design's weighted Gram matrix. `X L⁻ᵀ` has the identity as its weighted Gram,
+so a unit step along any β̃ axis moves η by 1 in weighted root mean square,
+the scale θ̃ is searched on. The trust radii (`rho_begin`, `GLMM_RHO_END`) and
+the non-finite-point radius below then mean the same thing in every unit of X:
+a column `x·s` gives the same search for any `s`, and a column `x + a` next
+to the intercept is searched as the centred column (for `X = [1, x]`,
+`Lᵀβ = (β₀ + x̄β₁, sd(x)·β₁)`). On the diagonal this is the θ side's
+`rms_column_scale`. The start maps forward (`β̃₀ = Lᵀβ₀`), every objective
+evaluation maps its point back (`BetaScale::caller_point`), and the incumbent
+maps back once the convergence read has measured its distances; `ws.params`
+and everything after the search hold β in the caller's units. The map is
+linear, so it changes the path of the search and not the model or its optimum.
+If `G` has no Cholesky factor (a zero or exactly collinear column) the search
+runs on β itself. `L` is rebuilt every fit (`BetaScale::set`, `n·p²/2`
+multiply-adds). `ExactProfile` has no β coordinate in its search, so this
+does not apply there.
+Without it, a Gamma GLMM with x·10³ (β̂₁ ≈ 6·10⁻⁴) stops with a
+log-likelihood 0.37 short and reports `converged`, and x + 1000 leaves it 0.04
+short. **Code:** `BetaScale` (`src/glmm/workspace.rs`), its three call sites in
+`fit_glmm`. **Validation:** `fit_glmm_gamma_column_units_do_not_move_the_fit`
+(`src/fit/glmm_tests.rs`).
+
+Whichever search gates convergence, its `Converged` status counts only when the
+search saw a finite incumbent, at least two finite evaluations, and no
+non-finite evaluation within `rho_begin` (its initial trust radius, 0.1) of the
+point it returned, measured in the search's own coordinates `[θ̃ | β̃]`. A failed PIRLS solve scores `+∞`, which BOBYQA moderates to
+`1e30`; a search whose steps keep landing on such points shrinks its radius to
+`rho_end` at the edge of the failing region and reports `Converged` there, at a
+point it never compared with its neighbours. A far warm start whose first
+evaluations fail and are walked away from is unaffected. lme4 has no such rule
+because its `pwrssUpdate` raises an error on any PIRLS solve that does not
+converge, which ends the fit. **Validation:**
+`non_finite_neighbor_defeats_a_converged_status` (`src/glmm/tests.rs`) drives
+this check directly, below the fit level: a plain 1-D `Bobyqa` run on a
+synthetic objective with a `+INFINITY` region next to (but not at) its true
+minimum, checked with `any_within` exactly as `fit_glmm` does.
+
+**Warm-start guard and `PqlThenJoint` fallback.** A warm fit
+(`theta_start.is_some()`) first evaluates the outer objective — the route's
+own Profile mode when stage 1 runs, `BetaMode::Fixed` otherwise — at both the
+caller's θ₀ and the blind cold start `GlmmWorkspace::new` would have used, and
+begins the search from whichever is lower; a tie or a non-finite warm value
+goes to cold. This costs two extra Laplace-deviance evaluations on every warm
+fit, outside the reported `n_eval`. Separately, when the `ExactProfile` route
+ends not converged (a hard failure or a budget-exhausted plateau), the fit
+reruns once on `PqlThenJoint` from the same (possibly guard-picked) start,
+reusing the same stage-1/stage-2 code with the route rebound — never twice.
+The rerun's result is reported when it converges; when both attempts end not
+converged, the one with the lower objective is reported, still not converged
+(`Note::ExactProfileFallback`, `src/fit/mod.rs`). Both fixes address the same
+failure mode: on a scan of far binary-link warm starts, most failures are a θ₀
+where every PIRLS evaluation fails, which no border-step change can recover —
+the guard sidesteps it by not starting there when the cold point is better,
+and the fallback recovers what the guard cannot by trying a route whose warm
+start matters less. **Validation:**
+`far_warm_start_recovers_via_the_cold_guard` and
+`exact_profile_fallback_reruns_on_pql_then_joint` (`src/fit/glmm_tests.rs`).
 
 **Validation:** `two_stage_matches_single_stage_on_grouseticks` (in
 `src/glmm/tests.rs`) pins `ExactProfile` against `Joint` — grouseticks
@@ -260,7 +367,13 @@ never mixed within a fit:
 pin the `Joint`/`PqlThenJoint` A/B on shapes that still take `PqlThenJoint`.
 The `exact_profile_*` tests in `src/glmm/tests.rs` pin `ExactProfile` against a
 β-only-BOBYQA minimum and against warm-started re-solves; cbpp and grouseticks
-pin the fitted optimum.
+pin the fitted optimum. `exact_border_curvature_matches_fd_of_the_profile`
+(`src/glmm/tests.rs`) holds the border's `S_β + ½·d²log|A|/dβ²` against a
+central difference of the profile on blocked and structured fixtures,
+`nb_log_warm_start_from_theta_200_reaches_cold_optimum`
+(`src/fit/glmm_tests.rs`) the far warm starts that cycled without it, and
+`far_warm_starts_reach_cold_optimum_with_the_border_trust_region` the far
+starts that fail without the trust region.
 
 ## Laplace approximation
 
@@ -270,30 +383,27 @@ The `nAGQ=1` marginal objective is the Laplace deviance
 `d(y, ũ) + ‖ũ‖² + log|A|`, where `A = MᵀWM + I` at the converged mode ũ and the
 `+I` is the same ridge the penalty `‖ũ‖²` carries. `W` in that `A` is the exact
 curvature of the conditional log-density in η, `W_obs = −∂²ℓᵢ/∂ηᵢ²`
-(`family::observed_weight`; the Fisher weight on a μ-clamped row, see below):
+(`family::observed_weight`, its η form on a tail row):
 the Laplace approximation is a second-order expansion of the log integrand
 around ũ, and its curvature is the observed one. On a canonical link (logit,
 Poisson/log, and Gamma/inverse, whose observed and Fisher weights coincide
 although the crate's `is_canonical` kernel test leaves it out) it equals the
-Fisher weight PIRLS steps with. On probit, cloglog, Gamma/log and NB/log (`family::exact_curvature_differs`)
-it does not, and the exit refresh (`pirls::evaluate_at_mode`) scatters `W_obs`
-and factors `A_obs` for `log|A|`; the Fisher step only chooses the path to ũ,
-not ũ itself. lme4 and MixedModels.jl put the Fisher weight in `log|A|` on
+Fisher weight. On probit, cloglog, Gamma/log and NB/log
+(`family::exact_curvature_differs`) it does not; PIRLS steps with `W_obs` there
+too (the Newton step, see [PIRLS inner loop](#pirls-inner-loop)), and the exit
+refresh (`pirls::evaluate_at_mode`) scatters `W_obs` at the returned mode and
+factors `A_obs` for `log|A|`. lme4 and MixedModels.jl put the Fisher weight in `log|A|` on
 every link, so on those four links their objective is a different function
 from this one, and glmmTMB's (exact curvature, by automatic differentiation) is
 the same one. A non-PD `A_obs` returns `+∞`, as a non-PD Fisher factor does;
-there is no floor (`W_obs ≥ 0` strictly inside the μ clamps on all four links,
-each log-likelihood being log-concave in η). A row whose μ sits on a clamp keeps
-its Fisher weight in `log|A|`: μ is a constant there, and the clamped observed
-weight divides by `V` at the pin and can be large and negative (cloglog's upper
-pin with `y = 0`); the mode equation's Jacobian still takes the clamped observed
-weight, as it does on every link. The
+there is no floor (`W_obs ≥ 0` on every row of those four links, tail rows
+included, each log-likelihood being log-concave in η). The
 factor and weights the refresh leaves behind are the observed ones, so the Rx
 Schur fill is the observed information and the AGQ node scale is the exact
 curvature. The exact β-profile (`OuterSearch::ExactProfile`) profiles β on this
-same objective: its merit, exit band, leverage and `dW/dη` are taken off the
-observed twin factor it already builds for the adjoint
-(`family::observed_weight_eta_deriv`), and so are the assembled SE engine's
+same objective: its merit, exit band, leverage and adjoint solve are taken off
+the kernel's own factor, which is `A_obs`, with `dW_obs/dη` from
+`family::observed_weight_eta_deriv`, and so are the assembled SE engine's
 `ℓ` terms. Concretely the return is
 `data_term + pen + 2·logdet` — `logdet` accumulates `Σ ln L_ii` off the
 Cholesky factor, i.e. `½·log|A|`, so `2·logdet` *is* the `log|A|` of the
@@ -493,7 +603,11 @@ where the first three terms of `F` are what `laplace_deviance` returns with
 PIRLS on `wᵢ/φ` — unaffected by which weight convention is in force, since
 the PIRLS working weight has the same form either way — and `Gₚ` depends on
 φ and the data alone. At unit weights every `aᵢ` is `1/φ`, and `Gₚ` reduces
-to the uniform-shape closed form with `Σw = n`.
+to the uniform-shape closed form with `Σw = n`. Above `aᵢ = 20` the row term
+`2aᵢ − 2aᵢ·ln aᵢ + 2·lnΓ(aᵢ)` comes from Stirling's series,
+`ln 2π − ln aᵢ + 2·R(aᵢ)` with `R(a) = 1/(12a) − 1/(360a³) + 1/(1260a⁵) −
+1/(1680a⁷)`: the three direct terms are each of order `a·ln a` and cancel to
+order `ln a`.
 
 Rescaling every weight by a constant leaves the likelihood unchanged but
 moves φ̂ by the same constant (`aᵢ = wᵢ/φ` is invariant to `w → c·w,
@@ -631,7 +745,10 @@ assembly and `has_negligible_component`
 (`blind_theta_and_bounds` in `src/lmm/mod.rs`, shared with the LMM path — the
 owning description of why the diagonals are not boxed at `0` is
 [`algorithms-lmm.md` §Covariance parameterization](algorithms-lmm.md#covariance-parameterization-θ-cholesky);
-the GLMM workspace appends `±BETA_BOX` bounds for the joint `[θ | β]` stage).
+the GLMM workspace appends unbounded β coordinates for the joint `[θ | β]`
+stage, since any finite box on β is in the units of y and of the X columns;
+the search steps them as the whitened β̃ of
+[the outer routes](#β-profiling--the-three-outer-routes)).
 Under this parameterization the singular boundary is a **finite, reachable
 point** of the search space: a variance collapsing to zero is a diagonal
 `λ_dd` at `0`, and a correlation running to `±1` is *also* a diagonal at `0`
@@ -663,6 +780,13 @@ folded into the trailing diagonals by re-factoring Σ, the pin test runs again,
 and the re-evaluation therefore rebuilds ũ, W̃ and the deviance at the canonical
 θ. Σ is unchanged, so the reported estimates are unchanged; `pinned` becomes
 truthful.
+
+The AGQ route (`nagq > 1`, the `deviance::laplace_deviance` gate) is the
+exception. The vector AGQ product grid sits in the `u = Λ⁻¹b` coordinates, so
+the same Σ under a rotated Λ integrates to a different deviance. There the fold
+runs on a copy that only sets the pin flags; θ, the re-evaluation and the SE
+pass keep the search's own Λ, so the reported deviance is the value the search
+reached, not a second quadrature of the same Σ.
 
 `Fit::diagnostics.singular` is `boundary_hit == 1` **or** the post-hoc
 `has_negligible_component()` check at `Fit` assembly (`src/fit/glmm.rs`,
@@ -734,29 +858,22 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   engine rebuilds `M`, `η`, `W` and the dense `k×k` `A` at `Dual<N>` around û's
   explicitly solved lanes `U = −G_u⁻¹G_γ`.
 
-  A row whose μ sits on a `family::clamp_mu` bound is handled per row. There
-  the deviance stops depending on η while the kernel's score
-  `ρ̃ = prior_w·μ'(η)·(y − μ_c)/V(μ_c)` does not, so the mode equation PIRLS
-  solves, `u = M'ρ̃`, and the objective part company: `D_γ` and `D_u` take a
-  zero deviance slope on that row, `G` keeps `ρ̃`, and the observed weight and
-  `dw/dη` come from the closed forms `family::clamped_observed_weight` and
-  `family::clamped_weight_eta_deriv` (both built on `family::mu_eta_eta`). With
-  such a row `A_obs` differs from the Fisher `A` on a canonical link too, so
-  it is built and factored there. Unweighted Bernoulli logit has no such
-  row: its family pass applies no μ clamp (`family::pinned_mu_bounds`). On
-  the blocked and structured layouts the dual kernel's own step is inexact
-  with a clamped row (`DualStep::exact`), so `run_assembled_hessian` re-enters
-  the kernel from the returned `u` until the assembled columns stop moving
-  (band `1e-10·(1 + |h|)` per entry, at most `MAX_DUAL_REFINEMENTS` calls, a
-  spent cap is `NotConverged`); a clean fit takes one call.
+  A tail row (see "Tail rows" in
+  [`algorithms.md`](algorithms.md#generalised-linear-models-glm)) needs no
+  special case: its deviance, score (`family::row_score`), weights and their
+  η-derivatives are the η forms of one smooth row deviance, so the kernel's
+  score is the deviance's exact slope and `G = 0` is the mode equation PIRLS
+  solved. On the blocked and structured layouts the dual kernel's own step
+  is inexact only on a non-PD observed factor (`DualStep::exact`); then
+  `run_assembled_hessian` re-enters the kernel from the returned `u` until
+  the assembled columns stop moving (band `1e-10·(1 + |h|)` per entry, at
+  most `MAX_DUAL_REFINEMENTS` calls, a spent cap is `NotConverged`); a clean
+  fit takes one call.
 
-  It declines in five cases. An AGQ-routed shape, which is rung 2's: the
+  It declines in four cases. An AGQ-routed shape, which is rung 2's: the
   identity above is the Laplace one. A row on one of `family::clamp_eta`'s
   bounds (`assembled::eta_clamped_rows`): η is a constant there, which the
-  per-row derivatives do not model. A μ-clamped row on the weighted logit
-  link (`assembled::logit_clamp_refused`): the assembly writes the logit
-  score as `prior_w·(y − μ)`, the structured and packed kernels write the
-  general form, and on a clamped row the two differ. A non-positive-definite
+  per-row derivatives do not model. A non-positive-definite
   observed factor `A_obs`, which the adjoint equation needs and which is never
   silently replaced by the Fisher factor. And, on the packed-row layout alone,
   a working set over `PACKED_ASSEMBLY_MAX_BYTES` (256 MiB; the widest corpus

@@ -63,12 +63,24 @@ is_glm <- function(cell) identical(cell[["structure"]], "glm")
 
 # The fit as a closure, so the timing loop can call it more than once.
 #
-# Weights, the two cases the manifest distinguishes (mirrors lme4.R):
+# Weights, the cases the manifest distinguishes:
 #   trials cell (`weights`)            the counts are already inside
 #                                       r_formula's cbind(y, size - y)
 #                                       response -- NO weights argument, which
 #                                       would apply them a second time.
-#   prior-weight cell (`weights_col`)  weights = that column.
+#   prior-weight cell (`weights_col`),  a dispersion offset and NO weights
+#   gaussian or gamma                   argument. The grid draws these cells with
+#                                       precision weights (row i has dispersion
+#                                       phi / w_i, gen_common.R), and glmmTMB's
+#                                       `weights` instead multiplies each row's
+#                                       log-density by w_i, a different
+#                                       likelihood. The offset is on glmmTMB's
+#                                       dispersion scale: log(sigma) on gaussian,
+#                                       so -0.5 * log(w); log(shape) on gamma, so
+#                                       +log(w).
+#   prior-weight cell, other family     weights = that column. On poisson and NB
+#                                       there is no dispersion to put the weight
+#                                       on, and the two meanings coincide.
 # No `offset =` argument on any cell: the `offset(...)` term is already in
 # r_formula, and passing both would apply it twice.
 #
@@ -81,13 +93,40 @@ is_glm <- function(cell) identical(cell[["structure"]], "glm")
 # detected", "failed to invert Hessian from numDeriv::jacobian(), falling back
 # to internal vcov estimate" -- without touching `m$fit$convergence`, so the
 # warning text is the only evidence the returned model is not fully trustworthy.
+#
+# glmmTMB's default start is beta = 0. On an inverse link that is eta = 0 and
+# mu = Inf, and the fit stops with "negative log-likelihood is NaN at starting
+# parameter values". Only then is the fit retried from the fixed-effects GLM's
+# beta (as validation/tools/goldens_agq.R does), so a cell that starts from the
+# default is unaffected by this branch. The retry is recorded in `message`.
 make_fit <- function(cell, df) {
   fm <- stats::as.formula(cell[["r_formula"]])
-  w <- if (is.null(cell[["weights_col"]])) NULL else df[[cell[["weights_col"]]]]
+  wcol <- cell[["weights_col"]]
   fam <- fam_obj(cell[["family"]], cell[["link"]])
   reml <- !is_glm(cell) && isTRUE(cell[["reml"]])
-  function() with_warnings(
-    glmmTMB::glmmTMB(fm, data = df, family = fam, weights = w, REML = reml))
+  wv <- if (is.null(wcol)) NULL else df[[wcol]]
+  disp <- NULL
+  if (!is.null(wcol) && cell[["family"]] %in% c("gaussian", "gamma")) {
+    scale <- if (cell[["family"]] == "gaussian") "-0.5" else "1"
+    disp <- stats::as.formula(sprintf("~ offset(%s * log(%s))", scale, wcol))
+  }
+  w <- if (is.null(disp)) wv else NULL
+  fit_from <- function(start = NULL) {
+    if (is.null(disp))
+      glmmTMB::glmmTMB(fm, data = df, family = fam, weights = w, REML = reml,
+                       start = start)
+    else
+      glmmTMB::glmmTMB(fm, data = df, family = fam, dispformula = disp,
+                       REML = reml, start = start)
+  }
+  function() with_warnings(tryCatch(fit_from(), error = function(e) {
+    msg <- conditionMessage(e)
+    if (!grepl("NaN at starting parameter values", msg, fixed = TRUE)) stop(e)
+    b0 <- stats::coef(stats::glm(reformulas::nobars(fm), data = df, family = fam,
+                                 weights = wv))
+    warning("default start failed (", msg, "); refitted from the fixed-effects GLM beta")
+    fit_from(list(beta = unname(b0)))
+  }))
 }
 
 # Runs `expr` and returns its value together with every warning it raised,

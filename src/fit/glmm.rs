@@ -264,17 +264,6 @@ pub(super) fn prep_glmm_design(
     } else {
         None
     };
-    // Observed twin of the crossed-Schur symbolic factor, so the exact β-profile's
-    // adjoint solve can run on `A_obs` without overwriting the Fisher factor every
-    // later pass reads. Built only where the exact profile can read it: a
-    // non-canonical link on the structured layout — canonical links never read
-    // it, so building it there would be pure cost on every warm-path draw.
-    ws.exact_prof.obs_schur =
-        if ws.layout == GlmmLayout::Structured && !crate::family::is_canonical(ws.family) {
-            StructuredSchur::new(&ws.groupings, cluster_ids, extra_ids, n)
-        } else {
-            None
-        };
 }
 
 /// Test-only baseline (fixed-θ dense GLMM as a single call). The stable path
@@ -438,6 +427,7 @@ impl GlmmResultView<'_> {
             pirls_exhausted: self.ws.pirls_exhausted,
             final_pirls_exhausted: self.ws.final_pirls_exhausted,
             hessian_fallback: self.fit.hessian_fallback,
+            exact_profile_fallback: self.fit.exact_profile_fallback,
             ..FitDiagnostics::fixed_only(self.fit.converged)
         }
     }
@@ -770,8 +760,10 @@ fn fit_glmm_prebuilt(
 /// the re-fits. The coordinate cold-starts at the no-RE GLM-NB's own θ̂ (one
 /// extra fixed-effects-only `fit_glm_nb`, itself an IRLS/θ-profile alternation
 /// capped at `NB_MAX_OUTER`); a caller's `start` seeds β/θ_RE as on every
-/// other family (θ_NB has no start slot). `dispersion = θ̂_NB`; the β SE
-/// conditions on θ̂ (lme4/MASS convention).
+/// other family (θ_NB has no start slot). `dispersion = θ̂_NB`; the joint
+/// Hessian of `WaldSe::Hessian` carries the `ln θ_NB` coordinate, so the β SE
+/// includes θ_NB's uncertainty (unlike the GLM route's `fit_glm_nb`, which
+/// conditions on θ̂ — see [`crate::glmm::se::joint_hessian_cov`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_glmm_nb(
     x: &[f64],

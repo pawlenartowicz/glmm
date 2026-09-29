@@ -118,12 +118,16 @@ pub enum Family {
         link: GammaLink,
     },
     /// Negative-binomial count response → log-link GLM/GLMM. Variance
-    /// `V(μ)=μ+μ²/θ`. The shape `θ` is estimated by an alternating outer loop
-    /// (`MASS::glm.nb`/`lme4::glmer.nb` style) and reported in `Fit.dispersion`;
-    /// the β SE conditions on `θ̂`. θ̂ is not spec-carried (structure-only, see
-    /// [`ModelSpec`]): the MLE is start-independent, so a spec-supplied warm-start
-    /// could only seed the optimizer without changing the converged θ̂. The fit
-    /// threads θ̂ explicitly through the numeric stack instead. Validated against R
+    /// `V(μ)=μ+μ²/θ`. On a GLM the shape `θ` is estimated by an alternating
+    /// outer loop (`MASS::glm.nb`/`lme4::glmer.nb` style), reported in
+    /// `Fit.dispersion`, and the β SE conditions on `θ̂` (θ-uncertainty out of
+    /// scope). On a GLMM, `ln θ_NB` is instead a coordinate of the outer
+    /// search, and the β SE carries its uncertainty through an appended
+    /// Hessian row (see `crate::glmm::joint_hessian_cov`). θ̂ is not
+    /// spec-carried (structure-only, see [`ModelSpec`]): the MLE is
+    /// start-independent, so a spec-supplied warm-start could only seed the
+    /// optimizer without changing the converged θ̂. The fit threads θ̂
+    /// explicitly through the numeric stack instead. Validated against R
     /// `MASS::glm.nb` / `lme4::glmer.nb` (validation goldens `sim_nb_*`).
     NegativeBinomial {
         /// Link function — log only (`log(μ/(μ+θ))` canonical link not offered).

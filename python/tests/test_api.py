@@ -8,14 +8,15 @@ DATA = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
 
 
 def test_module_surface():
-    # `fit`, `Fit`, and the seventeen warning categories the diagnostics channel
-    # raises — a user has to be able to name them to filter on them.
+    # `fit`, `Fit`, and the twenty-one warning categories the diagnostics
+    # channel raises — a user has to be able to name them to filter on them.
     assert glmm.__all__ == [
         "AgqFallbackWarning",
         "ArgumentIgnoredWarning",
         "ConstantResponseWarning",
         "DesignUnsolvableWarning",
         "DiagnosticWarning",
+        "ExactProfileFallbackWarning",
         "Fit",
         "FitFailedWarning",
         "GlmDivergedWarning",
@@ -23,15 +24,19 @@ def test_module_surface():
         "IllConditionedWarning",
         "NbShapeUnsettledWarning",
         "NoCoefficientsWarning",
+        "NonIntegerResponseWarning",
         "PirlsExhaustedWarning",
         "ReDesignScaleWarning",
+        "RowsDroppedWarning",
         "SearchLimitWarning",
+        "SingleLevelGroupingDroppedWarning",
         "SingularFitWarning",
         "TooFewRowsWarning",
         "UnusedGroupingLevelsWarning",
         "fit",
     ]
     assert issubclass(glmm.IllConditionedWarning, glmm.DiagnosticWarning)
+    assert issubclass(glmm.ExactProfileFallbackWarning, glmm.DiagnosticWarning)
     assert issubclass(glmm.DiagnosticWarning, UserWarning)
 
 

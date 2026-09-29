@@ -1,0 +1,14 @@
+{
+  "//": "Frozen high-precision deviance references, read by validation/grid/compare.R's gate 1 in place of the oracle deviances for a cell whose manifest entry carries `dev_ref` (gen_manifest.R's DEV_REF). These cells have data where the reference engines' OWN f64 round-off is larger than dev_eps, so no oracle deviance can gate them; gate 1 keeps the normal dev_eps and the normal sign rule, just against the value here instead of best_oracle_dev's oracle comparison. Not a divergences.json-style registry: there is no band to grow stale, only a fixed reference value with its own provenance.",
+  "//fields": "cell: the grid cell id. value: the frozen reference, on the same aligned-deviance scale aligned_dev() reports for that cell (for this gaussian REML cell, -2 * restricted log-likelihood + the REML constant, glmm's own alignment addend of 0). theta: the LMM variance-ratio parameter the value was evaluated at. method: how value was computed. date: when it was pinned. script: the repo-relative path to the generator that reproduces it.",
+  "entries": [
+    {
+      "cell": "sim_entangled_pair_lmm",
+      "value": 478.188881405005,
+      "theta": 15.026026230033885,
+      "method": "REML criterion evaluated in 60-digit arithmetic (mpmath, dps=60) directly from the CSV's doubles, at lme4's fitted theta -- the smallest of the three engines' 60-digit values, which agree with each other to 1e-10 on the true objective",
+      "date": "2026-09-27",
+      "script": "validation/tools/prep/entangled_reml_reference.py"
+    }
+  ]
+}

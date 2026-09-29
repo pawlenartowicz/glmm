@@ -77,10 +77,10 @@ pub struct OlsFitView<'a> {
     /// Computed from the `sum_y` / `yty` running sums.
     pub sst: f64,
     /// Scale-invariant per-column pivot ratio of the (possibly weighted) Gram
-    /// this fit came from ([`min_pivot_ratio`]), with `pivot_col` the column
+    /// this fit came from (`min_pivot_ratio`), with `pivot_col` the column
     /// attaining it. **Detection only** — nothing here reads it to accept or
     /// reject a design, and nothing may start to; the reasoning is recorded at
-    /// the computation site. Below [`PIVOT_MIN`] the coefficients are barely
+    /// the computation site. Below `PIVOT_MIN` the coefficients are barely
     /// identified and the diagnostics channel says so. NaN on every
     /// non-converged return, where no factor was formed.
     pub pivot: f64,

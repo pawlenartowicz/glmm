@@ -3,6 +3,9 @@
 \docType{import}
 \name{reexports}
 \alias{reexports}
+\alias{fixef}
+\alias{VarCorr}
+\alias{ranef}
 \alias{tidy}
 \alias{glance}
 \title{Objects exported from other packages}
@@ -13,5 +16,7 @@ below to see their documentation.
 
 \describe{
   \item{generics}{\code{\link[generics]{glance}}, \code{\link[generics]{tidy}}}
+
+  \item{nlme}{\code{\link[nlme:fixed.effects]{fixef}}, \code{\link[nlme:random.effects]{ranef}}, \code{\link[nlme]{VarCorr}}}
 }}
 

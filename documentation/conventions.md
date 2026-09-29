@@ -196,9 +196,7 @@ R), but they are three of six: the full report is `diagnostics.converged`,
     older version of this kernel returned `NaN` for the whole fit. Contrast
     `aliased`, which is the genuinely-redundant case — an exactly aliased
     column is still dropped and reported as `NaN`, matching R. Dense GLMM
-    records no pivot at all, and the sparse LMM route refuses an
-    ill-conditioned design outright (`converged: false`) instead of fitting
-    and flagging it — the dense and sparse LMM routes disagree on this point.
+    records no pivot at all.
   - `PirlsExhausted`: a GLMM's inner PIRLS solve ran its full iteration cap
     without converging. Observation-only unless it hit the final
     re-evaluation at the converged fit's variance parameters: that is the one
@@ -222,9 +220,7 @@ R), but they are three of six: the full report is `diagnostics.converged`,
     the random-effect stddev SEs (`stddev_se`) stay `NaN`.
 
   `notes` is empty on a clean fit, and an absent note means "not detected,"
-  never "checked and clean": dense GLMM records no pivot at all, and the
-  sparse LMM route refuses an ill-conditioned design outright instead of
-  fitting and flagging it.
+  never "checked and clean": dense GLMM records no pivot at all.
 
 If a fit comes back with `converged == false` or `singular == true`, see
 [`troubleshooting.md`](troubleshooting.md) for what each flag implies and what

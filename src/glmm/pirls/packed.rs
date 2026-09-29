@@ -95,9 +95,8 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
             vals.fill(0.0);
             for i in 0..n {
                 let wi = w[i];
-                let dmu = crate::family::mu_eta(family, eta[i]);
-                let v = crate::family::variance(family, nb_theta, prob[i]);
-                let rho = prior_w[i] * dmu * (y[i] - prob[i]) / v;
+                let rho =
+                    crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i]);
                 let q_i = wi * self.mu[i] + rho;
                 let base = i * width;
                 for ta in base..base + width {
@@ -131,12 +130,7 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
         // the fused logit and SIMD arms.
         for i in 0..n {
             let wi = w[i];
-            let dmu = crate::family::mu_eta(family, eta[i]);
-            let v = crate::family::variance(family, nb_theta, prob[i]);
-            // `0/0` on an unweighted logit row whose `prob` is exactly 0 or 1. Only
-            // the exit refresh passes an unclamped `prob`, and it reads `A` alone:
-            // `a_rhs` is zeroed at the top of the next scatter before any solve.
-            let rho = prior_w[i] * dmu * (y[i] - prob[i]) / v;
+            let rho = crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i]);
             let q_i = wi * self.mu[i] + rho;
             let base = i * width;
             for ta in base..base + width {
@@ -219,12 +213,13 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
     }
 }
 
-/// Penalized-IRLS inner solve on the packed `M` rows by Fisher scoring on the
-/// penalized likelihood, with `M = ZΛ` the scaled RE design and a `+I` ridge
+/// Penalized-IRLS inner solve on the packed `M` rows by Newton's method on the
+/// penalized likelihood (the step weight is the exact curvature, see
+/// `pirls_solve_blocked`), with `M = ZΛ` the scaled RE design and a `+I` ridge
 /// (the nAGQ=1 reparameterization, `u ~ N(0, I)`). Each step assembles
-/// `A = M'WM + I` and the IRLS right-hand side `M'(W·Mu + W·r)` from the
-/// `width` nonzeros per row and takes `u ← A⁻¹M'r` through a dense `k×k`
-/// Cholesky. Returns `(deviance, ‖ũ‖², log|L|` at the returned iterate,
+/// `A = M'WM + I` and the right-hand side `M'(W·Mu + ρ)`, with the score
+/// `ρ = prior_w·μ'(y−μ)/V`, from the `width` nonzeros per row and takes
+/// `u ← A⁻¹M'(W·Mu + ρ)` through a dense `k×k` (or sparse) Cholesky. Returns `(deviance, ‖ũ‖², log|L|` at the returned iterate,
 /// converged`)`; a Cholesky failure surfaces as `(NaN, NaN, NaN, false)`.
 /// A converged solve ends by re-evaluating η/μ/W at the returned `u` and
 /// rebuilding and refactoring `A` there ([`evaluate_at_mode`]), so `log|L|`
@@ -247,9 +242,8 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
 /// times. A within-band rise is FP noise near the optimum and is accepted — it
 /// never burns a halving. In `Profile` mode the joint `(u, β)` step is
 /// backtracked in lockstep, halving β toward `beta_prev` alongside u. A
-/// domain-infeasible trial η (`family::eta_infeasible`, which names
-/// Gamma-inverse and inverse-Gaussian-inverse-squared)
-/// halves regardless of the band. Convergence is the mixed
+/// trial η past the link's clamp bounds (`family::eta_infeasible`) halves
+/// regardless of the band. Convergence is the mixed
 /// `dev(uⱼ) + ‖uⱼ₊₁‖²` band on successive steps, checked after the step.
 ///
 /// Iterates from whatever `scratch.u` holds on entry — the caller owns reset
@@ -347,9 +341,7 @@ pub(crate) fn pirls_solve_packed(
         // --- trial evaluation at the CURRENT u: (Mu)ᵢ and the raw η, then
         // μ/W/deviance per row. On a fresh accept this is the newly-stepped u;
         // after a halving `continue` it is the backtracked u. `infeasible` flags
-        // any RAW η outside the link's open domain — the two
-        // `family::eta_infeasible` names, Gamma-inverse and
-        // inverse-Gaussian-inverse-squared. ---
+        // any RAW η past the link's clamp bounds (`family::eta_infeasible`). ---
         // The returned `Σ yᵢηᵢ` is dropped: this loop forms the deviance row by
         // row below instead of calling `T::family_pass`, so nothing consumes it.
         layout.eta_from_mode(&u[..], &eta_fixed[..], &mut eta[..], y, n);
@@ -357,7 +349,7 @@ pub(crate) fn pirls_solve_packed(
         let mut infeasible = false;
         for i in 0..n {
             let raw = eta[i];
-            infeasible |= crate::family::eta_infeasible(family, raw);
+            infeasible |= crate::family::eta_infeasible(family, y[i], raw);
             let e = crate::family::clamp_eta(family, raw);
             eta[i] = e;
             // Canonical-link shortcut (Poisson-log) lives inside this call — see
@@ -365,10 +357,10 @@ pub(crate) fn pirls_solve_packed(
             let (mui, wi, _) = crate::family::irls_weight_and_resid(family, nb_theta, y[i], e);
             prob[i] = mui;
             w[i] = (prior_w[i] * wi).max(crate::glm::WEIGHT_CLAMP);
-            dev += prior_w[i] * crate::family::dev_resid(family, nb_theta, y[i], mui);
+            dev += prior_w[i] * crate::family::dev_resid_at(family, nb_theta, y[i], e, mui);
         }
         // Band-tolerant retrospective step-halving: the convergence band is
-        // consulted before any halving, because near the optimum Fisher scoring
+        // consulted before any halving, because near the optimum the iteration
         // is not strictly monotone — a step can land ε above `pen_accepted` yet
         // inside the tol band, and that must converge rather than burn all ten
         // halvings against FP noise. Only a rise EXCEEDING the band is a genuine
@@ -397,7 +389,7 @@ pub(crate) fn pirls_solve_packed(
             return (f64::NAN, f64::NAN, f64::NAN, false); // halvings exhausted
         }
         // Accept this iterate, snapshot it for the next backtrack, and take a
-        // fresh full Fisher step from it (cold start: pen_accepted = ∞ ⇒ always
+        // fresh full step from it (cold start: pen_accepted = ∞ ⇒ always
         // accepts).
         halvings = 0;
         pen_accepted = penalized;
@@ -405,6 +397,18 @@ pub(crate) fn pirls_solve_packed(
         if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
             beta_prev[..p].copy_from_slice(&beta[..p]);
         }
+        // Newton step on a link whose exact curvature differs from Fisher —
+        // reasoning in `pirls_solve_blocked`, change together.
+        observed_weights_in_place(
+            family,
+            nb_theta,
+            y,
+            prior_w,
+            &eta[..],
+            &prob[..],
+            &mut w[..],
+            n,
+        );
         layout.scatter(&w[..], &prob[..], &eta[..], y, prior_w, weighted, n, None);
         // Profile mode: accumulate the β-gradient X'ρ (ρ = effective residual)
         // into `beta_rhs` — the joint system's bottom-block RHS. Its own pass off
@@ -414,9 +418,8 @@ pub(crate) fn pirls_solve_packed(
                 *v = 0.0;
             }
             for i in 0..n {
-                let dmu = crate::family::mu_eta(family, eta[i]);
-                let v = crate::family::variance(family, nb_theta, prob[i]);
-                let rho = prior_w[i] * dmu * (y[i] - prob[i]) / v;
+                let rho =
+                    crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i]);
                 for j in 0..p {
                     beta_rhs[j] += x[(i, j)] * rho;
                 }

@@ -154,7 +154,7 @@ test_that("VarCorr omits the Residual row on a non-gaussian mixed fit", {
   expect_false(grepl("Residual", paste(capture.output(print(vc)), collapse = "\n")))
 })
 
-test_that("accessors: nobs, formula string, family, model.frame, isSingular", {
+test_that("accessors: nobs, formula string, family, model.frame", {
   d <- benchmark_data(seed = 105, family = "binomial")
   fit <- fastglmm(y ~ t + d + (1 | g), d, family = binomial())
   expect_equal(nobs(fit), nrow(d))
@@ -163,8 +163,48 @@ test_that("accessors: nobs, formula string, family, model.frame, isSingular", {
   expect_equal(family(fit)$family, "binomial")
   mf <- model.frame(fit)
   expect_setequal(names(mf), c("y", "t", "d", "g"))
-  expect_type(isSingular(fit), "logical")
+  # isSingular() dispatch is covered separately - it is lme4's own generic
+  # (see the fixef/ranef/VarCorr/isSingular masking test below), so it needs
+  # library(lme4), not just library(fastglmm).
 })
+
+test_that("isSingular(fastglmm fit) works with no other package attached", {
+  # The point of fastglmm declaring its own isSingular generic (rather than
+  # only registering on lme4's, as fixef/ranef/VarCorr do on nlme's): this
+  # must keep working with nothing but fastglmm loaded, lme4 installed or
+  # not. Runs in its own Rscript subprocess (see the load-order test below
+  # for why), and does not need lme4 installed at all - the case this
+  # checks never reaches isSingular.default.
+  skip_on_os("windows") # Rscript path/quoting below targets a POSIX shell
+  `%||%` <- function(x, y) if (is.null(x)) y else x
+
+  script <- paste(
+    "library(fastglmm);",
+    "d <- data.frame(y = rnorm(60), x = rnorm(60), g = factor(rep(1:10, 6)));",
+    "fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), d));",
+    "cat(is.logical(isSingular(fit)))"
+  )
+  out <- system2("Rscript", c("-e", shQuote(script)), stdout = TRUE, stderr = TRUE)
+  expect_equal(attr(out, "status") %||% 0L, 0L, info = paste(out, collapse = "\n"))
+  expect_equal(out[length(out)], "TRUE")
+})
+
+test_that("isSingular() on a class it cannot handle errors instead of recursing", {
+  # isSingular.default forwards only for a merMod object (and only when
+  # lme4 is already loaded); anything else, e.g. isSingular(1), must reach
+  # the plain error naming the class, not lme4's own S4 default (which
+  # calls UseMethod("isSingular") again and would recurse without the
+  # merMod check). No lme4 needed for this: the case it forwards to lme4
+  # for is checked with a real merMod fit in tools/generic-load-order.R.
+  expect_error(isSingular(1), "does not know how to handle.*numeric")
+  expect_error(isSingular("x"), "does not know how to handle.*character")
+})
+
+# The load-order dispatch checks against a real merMod object (both orders,
+# fixef/ranef/VarCorr/isSingular) need lme4 actually installed, which CI
+# deliberately does not have - they live in tools/generic-load-order.R,
+# run by hand, next to acceptance-vs-lme4.R. isSingular's own no-lme4-at-all
+# case is the test above, which does not need lme4 and so stays here.
 
 test_that("summary prints lme4's blocks in lme4's order", {
   d <- benchmark_data(seed = 106, family = "binomial")
@@ -188,6 +228,22 @@ test_that("summary prints lme4's blocks in lme4's order", {
   expect_equal(pos, sort(pos))
   # No REML line on an ML fit.
   expect_false(grepl("REML criterion", sout, fixed = TRUE))
+})
+
+test_that("a declared, unused grouping level is not counted as a group", {
+  # lme4 drops a grouping level with no rows before counting groups (its
+  # `ngrps`), so the printed count must match the number of levels that
+  # actually appear in the data, not the number of declared factor levels.
+  set.seed(118)
+  g <- factor(sample(1:5, 40, replace = TRUE), levels = 1:6) # level 6 unused
+  d <- data.frame(y = rnorm(40), x = rnorm(40), g = g)
+  fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), d))
+  expect_equal(nlevels(g), 6L)
+  expect_equal(length(unique(g)), 5L)
+  out <- capture.output(print(fit))
+  expect_true(any(grepl("groups:  g, 5", out, fixed = TRUE)))
+  sout <- paste(capture.output(print(summary(fit))), collapse = "\n")
+  expect_true(grepl("groups:  g, 5", sout, fixed = TRUE))
 })
 
 test_that("summary on a gaussian LMM prints the REML criterion, not AIC", {
@@ -513,7 +569,7 @@ test_that("warm start (lme4's start=) is accepted and unknown parts warn", {
   expect_warning(
     fastglmm(y ~ t + (1 | g), d, family = binomial(),
              start = list(beta = unname(fixef(cold)), theta = 0.7, bogus = 1)),
-    "start accepts only 'beta' and 'theta'; these elements were ignored: bogus"
+    "start accepts only 'beta' and 'theta'; these entries were ignored: bogus"
   )
 })
 

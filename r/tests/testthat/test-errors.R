@@ -36,9 +36,13 @@ test_that("cbind() matches the equivalent proportion + weights model, and forbid
   d <- err_data()
   d$s <- abs(d$s) + 0.5 # cbind() successes/failures must be positive
   d$f <- abs(d$f) + 0.5
-  f1 <- fastglmm(cbind(s, f) ~ x, d, family = binomial())
+  # Non-integer successes (s is not a whole number), so both calls raise
+  # non_integer_response - the response comparison below still holds.
+  expect_warning(f1 <- fastglmm(cbind(s, f) ~ x, d, family = binomial()),
+                 "not a whole number")
   d2 <- transform(d, p = s / (s + f))
-  f2 <- fastglmm(p ~ x, d2, family = binomial(), weights = s + f)
+  expect_warning(f2 <- fastglmm(p ~ x, d2, family = binomial(), weights = s + f),
+                 "not a whole number")
   expect_equal(unname(fixef(f1)), unname(fixef(f2)), tolerance = 1e-10)
   # The trial counts come back as the fit's weights, so Pearson residuals
   # carry the sqrt(trials) factor the hand-weighted fit has.
@@ -60,8 +64,12 @@ test_that("dot formulas error", {
 test_that("double-bar and intercept-free RE terms name the kernel property", {
   d <- err_data()
   expect_error(fastglmm(y ~ x + (x || g), d), "full RE correlation")
-  expect_error(fastglmm(y ~ x + (0 + x | g), d), "always full")
-  expect_error(fastglmm(y ~ x + (-1 + x | g), d), "always full")
+  # Intercept-free RE terms are not pre-checked in R: the shared Rust parser
+  # already raises a specific message for this (RandomInterceptSuppressionUnsupported),
+  # and it reaches both ports unchanged - see python/tests/test_validation.py's
+  # equivalent case.
+  expect_error(fastglmm(y ~ x + (0 + x | g), d), "intercept suppression")
+  expect_error(fastglmm(y ~ x + (-1 + x | g), d), "intercept suppression")
 })
 
 test_that("intercepted lme4 arguments raise designed errors", {
@@ -78,6 +86,96 @@ test_that("intercepted lme4 arguments raise designed errors", {
   expect_error(fastglmm(y ~ x, d, bogus = 1), "unused argument")
 })
 
+test_that("non-treatment contrasts on a fixed-effect factor error instead of fitting silently", {
+  set.seed(6)
+  n <- 40L
+  d <- data.frame(y = rnorm(n), x = rnorm(n),
+                  fc = factor(sample(letters[1:3], n, replace = TRUE)),
+                  g = factor(rep(1:8, 5)))
+
+  # Baseline: default contrasts fit fine. Only 3 grouping levels, so a
+  # boundary/singular warning here is fine, per the pattern above.
+  expect_no_error(suppressWarnings(fastglmm(y ~ x + fc + (1 | g), d)))
+
+  # Ordered factor used as a fixed effect errors, wherever it sits in the
+  # formula - grouping factors are exempt.
+  d_ord <- d
+  d_ord$fc <- factor(d_ord$fc, ordered = TRUE)
+  expect_error(fastglmm(y ~ x + fc + (1 | g), d_ord),
+               "ordered factor.*treatment contrasts")
+  # An ordered factor used ONLY as a grouping factor is not checked.
+  expect_no_error(suppressWarnings(fastglmm(y ~ x + (1 | fc), d_ord)))
+
+  # A factor with its own contrasts() attribute errors when it is a fixed
+  # effect.
+  d_attr <- d
+  contrasts(d_attr$fc) <- contr.sum(3)
+  expect_error(fastglmm(y ~ x + fc + (1 | g), d_attr),
+               "contrasts attribute")
+  expect_no_error(suppressWarnings(fastglmm(y ~ x + (1 | fc), d_attr)))
+
+  # A non-default options(contrasts = ) errors only when an unordered factor
+  # is actually used as a fixed effect.
+  old <- options(contrasts = c("contr.sum", "contr.poly"))
+  on.exit(options(old), add = TRUE)
+  expect_error(fastglmm(y ~ x + fc + (1 | g), d),
+               "options\\(contrasts")
+  expect_no_error(suppressWarnings(fastglmm(y ~ x + (1 | fc), d)))
+  expect_no_error(fastglmm(y ~ x, d)) # no factor used at all
+  options(old)
+})
+
+test_that("character and logical fixed-effect columns are checked the same way as an unordered factor", {
+  set.seed(7)
+  n <- 40L
+  d <- data.frame(y = rnorm(n), x = rnorm(n),
+                   ch = sample(letters[1:3], n, replace = TRUE),
+                   lg = sample(c(TRUE, FALSE), n, replace = TRUE),
+                   g = factor(rep(1:8, 5)))
+
+  old <- options(contrasts = c("contr.sum", "contr.poly"))
+  on.exit(options(old), add = TRUE)
+  # Under the default contrasts these fit fine (treatment coding is what
+  # the shared parser gives them either way).
+  expect_error(fastglmm(y ~ x + ch + (1 | g), d), "options\\(contrasts")
+  expect_error(fastglmm(y ~ x + lg + (1 | g), d), "options\\(contrasts")
+  options(old)
+  expect_no_error(suppressWarnings(fastglmm(y ~ x + ch + (1 | g), d)))
+  expect_no_error(suppressWarnings(fastglmm(y ~ x + lg + (1 | g), d)))
+})
+
+test_that("a one-level fixed-effect factor errors instead of being dropped silently", {
+  n <- 20L
+  d <- data.frame(y = rnorm(n), x = rnorm(n), f = rep("z", n), b = rep(TRUE, n))
+
+  # Character, main effect.
+  expect_error(fastglmm(y ~ f + x, d),
+               "contrasts can be applied only to factors with 2 or more levels")
+  # Logical, main effect: factor(rep(TRUE, n)) also has one level.
+  expect_error(fastglmm(y ~ b + x, d),
+               "contrasts can be applied only to factors with 2 or more levels")
+  # Inside an interaction.
+  expect_error(fastglmm(y ~ f * x, d),
+               "contrasts can be applied only to factors with 2 or more levels")
+  # The column is named.
+  expect_error(fastglmm(y ~ f + x, d), "'f'")
+})
+
+test_that("only the unordered slot of options(contrasts) is checked for an unordered factor", {
+  set.seed(8)
+  n <- 40L
+  d <- data.frame(y = rnorm(n), x = rnorm(n),
+                   fc = factor(sample(letters[1:3], n, replace = TRUE)),
+                   g = factor(rep(1:8, 5)))
+
+  # Changing only the ORDERED slot leaves the unordered slot at its default
+  # ("contr.treatment"), so an unordered factor still fits without error.
+  old <- options(contrasts = c("contr.treatment", "contr.sum"))
+  on.exit(options(old), add = TRUE)
+  expect_no_error(suppressWarnings(fastglmm(y ~ x + fc + (1 | g), d)))
+  options(old)
+})
+
 test_that("offset() formula term matches the offset= argument, and forbids both together", {
   d <- err_data()
   f1 <- fastglmm(y ~ x + offset(x), d)
@@ -89,11 +187,33 @@ test_that("offset() formula term matches the offset= argument, and forbids both 
   )
 })
 
+test_that("inf in weights= or offset= is refused up front, not by the kernel", {
+  d <- err_data()
+  w <- rep(1, 40)
+  w[1] <- Inf
+  # The plain up-front message, not the kernel's own ("FitOptions.weights
+  # must be finite and > 0") which "weights must be finite" alone would also
+  # match as a substring.
+  expect_error(fastglmm(y ~ x, d, weights = w), "no NaN, inf, or missing entries")
+  o <- rep(0, 40)
+  o[1] <- -Inf
+  expect_error(fastglmm(y ~ x, d, offset = o), "no NaN, inf, or missing entries")
+})
+
 test_that("quasi-likelihood dispersion on binomial errors as not implemented", {
   d <- err_data()
   d$yb <- rbinom(40, 1, 0.5)
   expect_error(fastglmm(yb ~ x, d, family = binomial(), dispersion = 2),
                "quasi-likelihood.*not yet implemented")
+})
+
+test_that("bad dispersion value message matches the Python port", {
+  d <- err_data()
+  expect_error(
+    fastglmm(y ~ x, d, family = Gamma(link = "log"), dispersion = "pearson"),
+    "dispersion must be NULL, 'estimate', or a number, got 'pearson'",
+    fixed = TRUE
+  )
 })
 
 test_that("cloglog GLM fits", {
@@ -148,9 +268,12 @@ test_that("inverse-Gaussian GLM fits and refuses random effects", {
   expect_gt(f$dispersion, 0)
   f2 <- fastglmm(y ~ x, data = d, family = inverse.gaussian(link = "1/mu^2"))
   expect_true(f2$converged)
+  # Caught by fastglmm()'s own client-side check, matching the Python port
+  # (python/tests/test_validation.py's equivalent case) - a raw kernel panic
+  # ("inverse-Gaussian mixed models are not implemented") never reaches here.
   expect_error(
     fastglmm(y ~ x + (1 | g), data = d, family = inverse.gaussian()),
-    "inverse-Gaussian mixed models"
+    "GLM-only"
   )
 })
 
@@ -233,6 +356,40 @@ test_that("nAGQ must be an odd integer in 1..=25", {
   expect_error(fastglmm(y ~ x, d, nAGQ = 2), "odd integer")
   expect_error(fastglmm(y ~ x, d, nAGQ = 27), "odd integer")
   expect_error(fastglmm(y ~ x, d, nAGQ = 0), "odd integer")
+  expect_error(fastglmm(y ~ x, d, nAGQ = 2), "got 2")
+})
+
+test_that("unknown family and unsupported link messages match the Python port", {
+  d <- err_data()
+  expect_error(
+    fastglmm(y ~ x, d, family = "logistic"),
+    "unknown family 'logistic'; expected one of gaussian, binomial, poisson, gamma, negativebinomial, inversegaussian",
+    fixed = TRUE
+  )
+  expect_error(
+    fastglmm(y ~ x, d, family = binomial(link = "identity")),
+    "family 'binomial' does not support link 'identity'; expected one of logit, probit, cloglog",
+    fixed = TRUE
+  )
+})
+
+test_that("start must be a list - message matches the Python port's warm_start check", {
+  d <- err_data()
+  expect_error(
+    fastglmm(y ~ x, d, start = c(0, 0)),
+    paste(
+      "start must be a list with elements 'beta' and/or 'theta' (theta is the",
+      "random-effect Cholesky vector, not the negative-binomial shape - that is",
+      "init.theta), got numeric"
+    ),
+    fixed = TRUE
+  )
+})
+
+test_that("wald.se must be 'hessian' or 'rx' - mirrors the Python port's wald_se check", {
+  d <- err_data()
+  expect_error(fastglmm(y ~ x, d, wald.se = "observed"),
+               "wald.se must be 'hessian' or 'rx', got 'observed'")
 })
 
 test_that("ineligible-shape nAGQ > 1 warns and falls back to Laplace", {

@@ -41,6 +41,24 @@ pub(super) fn accumulate_lmm_rows(
     extra_ids: &[Vec<u32>],
     weights: Option<&[f64]>,
 ) {
+    // The θ-search runs on ŵ = w/s (s = `family::weight_scale`), the same
+    // precision-weight renormalisation the Gamma dispersion path applies
+    // (`fit::glmm::prep_glmm_design`): it keeps θ's internal box (`PIN_THETA`/
+    // `THETA_HI`) meaningful regardless of the raw scale of `w`, since ŵ's
+    // scale is pinned near 1 by construction. `weight_scale` returns exactly
+    // `1.0` for `None`, and `wᵢ/1.0` is exact in IEEE-754, so an unweighted
+    // fit takes this path bit-identical to skipping it.
+    // `LmmResultView::dispersion` and `lmm_view_to_fit` undo the substitution
+    // on the one reported quantity that actually moves with the weight scale,
+    // σ̂² (times `ws.weight_scale`); β̂, SEs, vcov, τ² and varcorr come out
+    // already correct because the internal θ̂ and σ̂² carry compensating
+    // factors of √s and 1/s that cancel when they are combined
+    // (θ̂² · σ̂² = τ², σ̂² · (X'ŴX)⁻¹ = Var(β̂), …).
+    let s = crate::family::weight_scale(weights, n);
+    ws.weight_scale = s;
+    let scaled_w: Option<Vec<f64>> = weights.map(|w| w[..n].iter().map(|&wi| wi / s).collect());
+    let w_for_rows = scaled_w.as_deref();
+
     match &mut ws.kernel {
         LmmKernel::Dense { suff, .. } => {
             suff.reset();
@@ -49,10 +67,16 @@ pub(super) fn accumulate_lmm_rows(
             // workspace is reused across draws with different `x`, so this is refreshed per
             // call, not cached at construction — and outside the `n > 0 && p > 0` guard,
             // because `SuffStats::reset` does not clear the scales and an empty draw would
-            // otherwise leave the previous draw's in place.
+            // otherwise leave the previous draw's in place. `rms_column_scale` is a weighted
+            // ratio, invariant to a uniform rescale of the weights, so the raw `weights` (not
+            // `w_for_rows`) is fine here — it is what `fit::glmm::prep_glmm_design` passes too.
             suff.groupings.set_slope_scales(x_mat, weights);
             if n > 0 && p > 0 {
-                suff.add_rows_multi(x_mat, y, cluster_ids, extra_ids, weights);
+                // The fixed-effect factor U must be known before any row is
+                // accumulated (`lmm::DesignQr`); the sparse arm computes the same
+                // one inside its constructor.
+                suff.set_design_qr(x_mat, w_for_rows);
+                suff.add_rows_multi(x_mat, y, cluster_ids, extra_ids, w_for_rows);
             }
         }
         LmmKernel::Sparse { g, ws: sparse_ws } => {
@@ -60,11 +84,11 @@ pub(super) fn accumulate_lmm_rows(
             // slope value by its RE column's internal scale, so the scales must
             // be current for THIS design first.
             g.set_slope_scales(x_mat, weights);
-            // WLS-style √wᵢ pre-scaling, the same convention `add_rows_multi`
+            // WLS-style √ŵᵢ pre-scaling, the same convention `add_rows_multi`
             // applies on the dense arm: threaded through every z-emission and
             // raw x/y read in the constructor, so every packed Gram carries
-            // exactly `wᵢ` per row.
-            let sqrt_w: Option<Vec<f64>> = weights.map(|w| w.iter().map(|v| v.sqrt()).collect());
+            // exactly `ŵᵢ` per row.
+            let sqrt_w: Option<Vec<f64>> = w_for_rows.map(|w| w.iter().map(|v| v.sqrt()).collect());
             // The Gram scatter IS the constructor on this kernel: one pass over
             // the rows builds `Z'Z`, `Z'[X y]` and `[X y]'[X y]` and sizes every
             // per-eval buffer.
@@ -100,6 +124,8 @@ pub(crate) struct LmmResultView<'a> {
     /// Spherical conditional modes û at θ̂, or empty when the recovery did not
     /// run or did not succeed.
     ranef_u: &'a [f64],
+    /// The workspace's `weight_scale` s: `fit.sigma_sq` is σ̂²/s.
+    weight_scale: f64,
 }
 
 // Loop-tier read accessors (via the `FitView`/`loop_advanced` surface); the
@@ -143,6 +169,9 @@ impl LmmResultView<'_> {
             // No FD-Hessian SE pass on the Gaussian LMM path (no PIRLS to
             // perturb) — always false.
             hessian_fallback: false,
+            // No ExactProfile route on the Gaussian LMM path (GLMM-only) —
+            // always false.
+            exact_profile_fallback: false,
         }
     }
     /// Joint Wald-χ² over the target set (the omnibus significance read).
@@ -153,9 +182,10 @@ impl LmmResultView<'_> {
     pub(crate) fn n_eval(&self) -> usize {
         self.fit.n_eval
     }
-    /// Residual variance σ̂² (the LMM dispersion).
+    /// Residual variance σ̂² (the LMM dispersion) on the caller's weight scale.
+    /// Mirrors `lmm_view_to_fit`'s `fit.dispersion *= s` — change together.
     pub(crate) fn dispersion(&self) -> f64 {
-        self.fit.sigma_sq
+        self.fit.sigma_sq * self.weight_scale
     }
     /// Fitted θ̂ vech (primary block then extras, column-major lower-triangular),
     /// in the solver's INTERNAL RE column scale — `FitView::theta` divides it back
@@ -182,6 +212,7 @@ pub(crate) fn lmm_run_on<'a>(
     let fit = fit_lmm(ws, target_indices, theta_start);
 
     LmmResultView {
+        weight_scale: ws.weight_scale,
         ranef_u: ws.kernel.ranef_u(),
         fit,
         betas: &ws.recovery.betas,
@@ -331,8 +362,21 @@ pub(crate) fn lmm_view_to_fit(
     // constant the engine strips from its deviance convention (documented on
     // `lmm::reml_deviance`). This is the single site every caller reaches, so
     // no caller applies the correction itself.
+    //
+    // The kernel was accumulated on ŵ = w/s (`accumulate_lmm_rows`), so its
+    // deviance is already stripped of −Σlog ŵᵢ, not −Σlog wᵢ; the two differ
+    // by n·ln(s), which exactly cancels the n·ln(s) that `s` introduces between
+    // σ̂²_int and σ̂²_raw, so no additional correction is needed beyond using ŵ
+    // here — using raw `w` instead would leave a spurious n·ln(s) in `deviance`
+    // and `loglik`. `fit.dispersion` (σ̂²_int off the ŵ-accumulated kernel) is
+    // converted to the raw scale by the same `s` here and in
+    // `LmmResultView::dispersion` (change together) — every other field above
+    // (β, se, vcov, tau2, varcorr) is already correct on σ̂²_int, since their
+    // formulas cancel the compensating factor of `s`.
     if let Some(w) = &opts.weights {
-        fit.deviance -= w.iter().map(|v| v.ln()).sum::<f64>();
+        let s = view.weight_scale;
+        fit.dispersion *= s;
+        fit.deviance -= w.iter().map(|v| (v / s).ln()).sum::<f64>();
         fit.loglik = super::common::lmm_loglik(fit.deviance, n, p);
     }
     fit

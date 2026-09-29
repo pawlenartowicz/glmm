@@ -8,11 +8,15 @@
 # per-dimension stddevs + full correlation matrix. Mirrors Rust
 # `Fit::stddev_corr` (GLMM/src/fit/mod.rs) - change together. 0-based r/c in
 # idx() to keep the formula identical to the Rust side; +1 shifts into R.
-.stddev_corr <- function(vech) {
+# `group` (1-based, R's own indexing convention) names which varcorr block
+# failed; mirrors the Python port's `Fit.stddev_corr` (python/glmm/__init__.py),
+# which reports the same thing 0-based.
+.stddev_corr <- function(vech, group = NA_integer_) {
   m <- length(vech)
   q <- as.integer((sqrt(1 + 8 * m) - 1) / 2)
   if (q * (q + 1L) / 2L != m) {
-    stop("varcorr block is not a valid vech (length ", m, ")", call. = FALSE)
+    label <- if (is.na(group)) "varcorr block" else sprintf("varcorr[[%d]]", group)
+    stop(sprintf("%s is not a valid vech (length %d)", label, m), call. = FALSE)
   }
   idx <- function(r, c) c * q - (c * c - c) / 2 + (r - c) + 1L
   sd <- vapply(0:(q - 1L), function(i) sqrt(vech[idx(i, i)]), 0)
@@ -220,24 +224,31 @@ print.summary.fastglmm <- function(x,
   invisible(x)
 }
 
+#' @importFrom nlme fixef
+#' @export
+nlme::fixef
+
 #' Extract fixed effects
 #'
-#' Generic + method. The generic is defined here (masking `lme4::fixef` when
-#' both are attached is harmless - S3 dispatch finds the same method).
+#' Adds a method to `nlme::fixef`, the generic `lme4::fixef` also uses (lme4
+#' adds methods to nlme's generic rather than declaring its own), so a
+#' [fastglmm] fit and an lme4 `merMod` fit dispatch through the same generic
+#' regardless of load order, and `fixef(fit)` works without an explicit
+#' `library(nlme)`.
 #'
 #' @param object a [fastglmm] fit.
 #' @param ... unused.
 #' @return Named numeric vector of fixed-effect estimates; aliased
 #'   (rank-deficient) coefficients are `NA`, mirroring `lm`/lme4.
 #' @export
-fixef <- function(object, ...) UseMethod("fixef")
-
-#' @rdname fixef
-#' @export
 fixef.fastglmm <- function(object, ...) object$beta
 
 #' @export
 vcov.fastglmm <- function(object, ...) object$vcov
+
+#' @importFrom nlme VarCorr
+#' @export
+nlme::VarCorr
 
 #' Variance components on the SD/correlation scale
 #'
@@ -251,18 +262,21 @@ vcov.fastglmm <- function(object, ...) object$vcov
 #' components, as in lme4, carrying `sigma()` (the REML residual standard
 #' deviation the kernel reports as `dispersion`).
 #'
+#' Adds a method to `nlme::VarCorr`, the generic `lme4::VarCorr` also uses
+#' (lme4 adds methods to nlme's generic rather than declaring its own), so a
+#' [fastglmm] fit and an lme4 `merMod` fit dispatch through the same generic
+#' regardless of load order, and `VarCorr(fit)` works without an explicit
+#' `library(nlme)`.
+#'
 #' @param x a [fastglmm] fit.
 #' @param ... unused.
 #' @return A list of class `"VarCorr.fastglmm"`, one named element per
 #'   grouping.
-#' @export
-VarCorr <- function(x, ...) UseMethod("VarCorr")
-
-#' @rdname VarCorr
+#' @rdname VarCorr.fastglmm
 #' @export
 VarCorr.fastglmm <- function(x, ...) {
   out <- lapply(seq_along(x$varcorr), function(g) {
-    sc <- .stddev_corr(x$varcorr[[g]])
+    sc <- .stddev_corr(x$varcorr[[g]], group = g)
     terms <- x$re_group_terms[[g]]
     v <- outer(sc$stddev, sc$stddev) * sc$correlation
     dimnames(v) <- list(terms, terms)
@@ -286,7 +300,7 @@ VarCorr.fastglmm <- function(x, ...) {
 #' @param variance add a `Variance` column before `Std.Dev.` (lme4's
 #'   `print.summary.merMod` shape; the bare `print.fastglmm` header keeps
 #'   `Std.Dev.` only, as `lme4::print.merMod` does).
-#' @rdname VarCorr
+#' @rdname VarCorr.fastglmm
 #' @export
 print.VarCorr.fastglmm <- function(x,
                                    digits = max(3L,
@@ -350,7 +364,7 @@ nobs.fastglmm <- function(object, ...) object$nobs
 #' Formula, family, and model frame accessors
 #'
 #' `formula()` returns the formula **string** as given: the R side never
-#' builds a `terms` object (the parser is Rust-side, R-port spec section 3), and
+#' builds a `terms` object (the parser is Rust-side), and
 #' synthesizing one would disagree with how the model was actually built -
 #' which is also why `terms()` errors.
 #'
@@ -406,6 +420,32 @@ confint.fastglmm <- function(object, parm, level = 0.95,
 #' same condition `lme4::isSingular` reports (the kernel computes it; see
 #' `glmm::Fit::singular`).
 #'
+#' Two packages, one generic name, and neither one may depend on the other.
+#' `isSingular` is lme4's own generic (unlike `fixef`/`ranef`/`VarCorr`
+#' above, it has no shared upstream generic such as nlme's to add a method
+#' to). fastglmm declares its own `isSingular` generic too, so
+#' `isSingular(fit)` on a [fastglmm] fit works even with lme4 not installed
+#' at all.
+#'
+#' Whichever package is attached last wins the bare `isSingular` name in the
+#' search path, so both directions still need to work. When lme4's generic
+#' is the one left in scope, this method also being registered directly on
+#' lme4's generic (by delayed S3 registration - it only activates if and
+#' when lme4 happens to be loaded) is what makes a [fastglmm] fit still
+#' dispatch correctly. When fastglmm's generic is the one left in scope
+#' instead, `isSingular.default` below is what makes a `merMod` fit still
+#' dispatch correctly - by forwarding to lme4's generic **only for a
+#' `merMod` object, and only when the lme4 namespace is already loaded**,
+#' never by loading it: a `merMod` object cannot exist without lme4 already
+#' loaded in the first place, so this never needs to load anything, and this
+#' package still does not depend on lme4 (not even as a Suggests - the one
+#' place lme4 is used live is the hand-run comparison in `tools/`). The
+#' `merMod` check also matters on its own: lme4's S4 default method calls
+#' `UseMethod("isSingular")`, which lands back here for any object that is
+#' neither a `fastglmm` fit nor a `merMod` - forwarding unconditionally
+#' would call lme4's generic again and recurse until the C stack fills up,
+#' so anything else still falls through to the plain error below.
+#'
 #' @param x a [fastglmm] fit.
 #' @param ... unused.
 #' @export
@@ -413,7 +453,21 @@ isSingular <- function(x, ...) UseMethod("isSingular")
 
 #' @rdname isSingular
 #' @export
+#' @exportS3Method lme4::isSingular
 isSingular.fastglmm <- function(x, ...) x$singular
+
+#' @rdname isSingular
+#' @export
+isSingular.default <- function(x, ...) {
+  if (isNamespaceLoaded("lme4") && inherits(x, "merMod")) {
+    getExportedValue("lme4", "isSingular")(x, ...)
+  } else {
+    stop("isSingular() does not know how to handle an object of class '",
+         class(x)[[1L]], "'. This package's own method handles a fastglmm ",
+         "fit directly; any other class needs its own package loaded ",
+         "first (a merMod fit needs lme4, for example).", call. = FALSE)
+  }
+}
 
 # -- Engine-blocked accessors: each is a hard "cannot be done honestly",
 # erroring with the reason and what would be needed to lift it - never a
@@ -425,6 +479,10 @@ isSingular.fastglmm <- function(x, ...) x$singular
        "fixef(). Conditional modes: ranef(). Fitted values: fitted().",
        call. = FALSE)
 }
+
+#' @importFrom nlme ranef
+#' @export
+nlme::ranef
 
 #' Random-effect conditional modes
 #'
@@ -443,14 +501,16 @@ isSingular.fastglmm <- function(x, ...) x$singular
 #' has no such row at all; the fit warns about that case
 #' (`fastglmm_unused_grouping_levels`).
 #'
+#' Adds a method to `nlme::ranef`, the generic `lme4::ranef` also uses (lme4
+#' adds methods to nlme's generic rather than declaring its own), so a
+#' [fastglmm] fit and an lme4 `merMod` fit dispatch through the same generic
+#' regardless of load order, and `ranef(fit)` works without an explicit
+#' `library(nlme)`.
+#'
 #' @param object a [fastglmm] fit.
 #' @param ... unused.
 #' @return A named `list` of `data.frame`s, empty for a fit with no random
 #'   effects or one that did not converge.
-#' @export
-ranef <- function(object, ...) UseMethod("ranef")
-
-#' @rdname ranef
 #' @export
 ranef.fastglmm <- function(object, ...) {
   blocks <- object$ranef_blocks
@@ -498,11 +558,14 @@ fitted.fastglmm <- function(object, ...) {
 #' @param type `"response"` or `"pearson"`.
 #' @param ... unused.
 #' @export
-residuals.fastglmm <- function(object, type = c("response", "pearson"), ...) {
-  type <- match.arg(type)
+residuals.fastglmm <- function(object, type = "response", ...) {
+  if (!(is.character(type) && length(type) == 1L && type %in% c("response", "pearson"))) {
+    stop(sprintf("type must be 'response' or 'pearson', got %s", .arg_repr(type)),
+         call. = FALSE)
+  }
   mu <- as.double(object$fitted)
   if (!length(mu)) {
-    stop("residuals are unavailable: the fit did not converge, so fitted() is empty",
+    stop("residuals are unavailable: the fit did not converge, so no fitted values are available",
          call. = FALSE)
   }
   r <- as.double(object$y) - mu
@@ -568,11 +631,11 @@ logLik.fastglmm <- function(object, ...) {
 }
 
 # -- broom-shaped accessors. Registered on `generics::tidy`/`generics::glance`
-# (not a package-local generic like fixef/VarCorr above): modelsummary,
-# texreg, gt and kableExtra call `broom::tidy(fit)`, which IS generics::tidy
-# re-exported, so a local generic would never be found. `generics` is the
-# import, never `broom` (21 non-base recursive dependencies; nothing here
-# calls a broom function). ------------------------------------------------
+# (re-exported the same way as fixef/ranef/VarCorr above, off nlme instead of
+# generics): modelsummary, texreg, gt and kableExtra call `broom::tidy(fit)`,
+# which IS generics::tidy re-exported, so a local generic would never be
+# found. `generics` is the import, never `broom` (21 non-base recursive
+# dependencies; nothing here calls a broom function). ---------------------
 
 #' @importFrom generics tidy
 #' @export
@@ -651,7 +714,7 @@ glance.fastglmm <- function(x, ...) {
 #' @export
 terms.fastglmm <- function(x, ...) {
   stop("terms() is not implemented: the formula machinery is Rust-side (one ",
-       "parser shared with the Python port, R-port spec section 3), and a ",
+       "parser shared with the Python port), and a ",
        "synthesized R terms object could disagree with how the model was ",
        "actually built. formula() returns the formula string.", call. = FALSE)
 }

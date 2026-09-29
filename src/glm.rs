@@ -8,23 +8,37 @@
 //! and returns a borrowed `GlmFitView<'a>`. No owned result struct.
 //!
 //! Algorithm — guards and tolerances:
-//!   - Adaptive convergence: `|Δdeviance| < DEVIANCE_TOL = 1e-8`
+//!   - Adaptive convergence: `|Δdeviance| / (|deviance| + f) < DEVIANCE_TOL = 1e-12`
+//!     (R's `glm.fit` rule, `src/library/stats/R/glm.R`, where `f = 0.1`).
+//!     The rule is relative while `|deviance| ≫ f`; the floor `f` makes it
+//!     absolute once the deviance itself is tiny (an exact fit). On Gamma and
+//!     inverse-Gaussian `f` is 0.1 in the deviance's own units: times the
+//!     precision weights' scale, and over ȳ on inverse-Gaussian, whose
+//!     deviance scales as 1/y. So their stopping point does not depend on the
+//!     overall scale of the weights or on the response's units (see
+//!     `dev_floor`). The other families keep `f = 0.1`.
 //!   - Safety cap: `MAX_IRLS_ITERS = 50`
-//!   - ETA_DIVERGENCE_CAP divergence guard: `iter ≥ 3 ∧ ‖η‖_∞ > 30 →
-//!     non-converged` (skipped under the Gamma inverse and inverse-Gaussian
-//!     1/μ² links)
+//!   - ETA_DIVERGENCE_CAP divergence guard: `iter ≥ 3 ∧ ‖η − η₀‖_∞ > 30 →
+//!     non-converged`, η₀ = 0 on the binomial links and the null model
+//!     η₀ᵢ = oᵢ + ln(Σwy / Σw·e^o) on the log links (skipped under the Gamma
+//!     inverse and inverse-Gaussian 1/μ² links)
 //!   - All-0 / all-1 short circuit
-//!   - Post-fit saturation guard (50% of weights < 1e-5 ⇒ non-converged)
-//!   - No step-halving: β_new is accepted directly
+//!   - Post-fit saturation guard, binomial only (more than half the rows with
+//!     `p(1−p)` weight < 1e-5 ⇒ non-converged)
+//!   - No step-halving on a deviance increase (R's `glm.fit` has none); on a
+//!     link whose observed curvature differs from the Fisher weight, steps are
+//!     halved once β has stepped back and forth three times running
+//!     (period-2 damping, see the accept step)
 //!
 //! Two `beta_start` modes: `None` seeds β = 0 with a family-specific η seed
-//! (η = 0 for logit; R's `initialize` μ-start for Gamma-inverse; the null-model
-//! μ₀ = ȳ + 0.1 for the log-link count families — see the cold-start arm), a
+//! (η = 0 for logit; R's `initialize` μ-start for Gamma-inverse; the null
+//! model η₀ᵢ = oᵢ + ln(Σwy / Σw·e^o) for the log links — see the cold-start
+//! arm), a
 //! fixed reproducible cold
 //! start; `Some(spec.effect_sizes)` — what the shipped hot loop passes — seeds
 //! the spec-derived truth-start (Y is synthetic, so the true β on the logit
 //! scale is known; mirrors `lmm::fit_lmm`'s `theta_start`). Either way the
-//! accept rule and the |Δdev| < 1e-8 fixpoint are unchanged — only the path
+//! accept rule and the relative-|Δdev| fixpoint are unchanged — only the path
 //! to it shortens.
 //!
 //! Working-response IRLS form and the canonical-link weights follow McCullagh &
@@ -41,27 +55,68 @@ use crate::FLOAT_NEAR_ZERO;
 
 /// IRLS safety cap.
 pub const MAX_IRLS_ITERS: u32 = 50;
-/// Adaptive convergence tolerance on `|Δdeviance|`.
-pub const DEVIANCE_TOL: f64 = 1e-8;
-/// Divergence guard: any |η_i| > ETA_DIVERGENCE_CAP at iter ≥ 3 marks
-/// non-converged. The bound is on the LINEAR PREDICTOR, not on β: η = Xβ is
-/// unchanged when a predictor column is rescaled (the compensating change in β̂
-/// is exact), so the accept/reject decision does not depend on the caller's
-/// choice of units — height in metres and height in kilometres give the same
-/// verdict. 30 is the number the physical argument actually supports: on the
-/// logit scale |η| = 30 is already p ≈ 1 − 1e-13, which is separation, not
-/// signal. Skipped under the two reciprocal links — Gamma `1/μ` and
-/// inverse-Gaussian `1/μ²` — where a large |η| is an honest small-mean fit
-/// (see the guard site).
+/// Adaptive convergence tolerance on the RELATIVE deviance change
+/// `|Δdeviance| / (|deviance| + f)` — R's `glm.fit` rule. The floor `f`
+/// keeps the rule well-behaved as deviance approaches 0 (an exact or
+/// near-exact fit), the same role R's `+ 0.1` plays in its own stopping test;
+/// `f` is that 0.1 carried into the deviance's units (see `dev_floor` in
+/// `glm_irls_fit`).
+///
+/// R's own default is `1e-8`, but Fisher scoring on a NON-canonical link
+/// (probit, cloglog, Gamma/log, inverse-Gaussian/log, NB/log) converges only
+/// LINEARLY, not quadratically — the same mechanism `glmm::PIRLS_TOL_REL_NONCANON`
+/// documents for PIRLS — so a relative tolerance loose enough for a
+/// quadratically-convergent canonical link leaves a visible residual there.
+/// The R/MASS goldens this crate gates against are not immune: they are `stats::glm`
+/// at R's own default `1e-8`, and R's own last IRLS step can overshoot that
+/// tolerance by a wide margin (measured on `cbpp_probit_glm`'s R trace: deviance
+/// 115.6074 → 114.1043 → 114.1017 → 114.1017 over 4 iterations, the golden SEs
+/// still 3.6e-7 to 9.7e-6 away from R at `epsilon = 1e-14`) — so matching R here
+/// means landing at the MLE, not at R's own stopping point. Measured on this
+/// crate's own R/MASS-gated goldens: at `1e-8` the worst observed gap against a
+/// frozen R fit is 1.5e-4 relative (probit SE); at `1e-10` the worst gap left is
+/// 6.7e-6, against a self-pinned `se_rx` value (a 1e-7 band, not an R fit); at
+/// `1e-12` every R/MASS-gated golden is back inside its own band, and going one
+/// decade tighter still (`1e-13`) changes nothing further on ordinary data while
+/// flipping the outcome of `gamma_inverse_double_se_failure_returns_a_failed_fit`
+/// (`src/fit/glmm_tests.rs`), an adversarial fixture whose cluster means span ten
+/// decades. `1e-12` is the tightest of `{1e-8, 1e-10, 1e-12, 1e-13}` that clears
+/// every existing golden without that regression.
+pub const DEVIANCE_TOL: f64 = 1e-12;
+/// Divergence guard: any |η_i − η₀ᵢ| > ETA_DIVERGENCE_CAP at iter ≥ 3 marks
+/// non-converged, η₀ᵢ the link's null-model location (0 on the binomial links,
+/// oᵢ + ln r on the log links, r = Σwy / Σw·e^o the null-model rate, ȳ
+/// without an offset). The bound is on the LINEAR PREDICTOR,
+/// not on β: η = Xβ is unchanged when a predictor column is rescaled (the
+/// compensating change in β̂ is exact), so the accept/reject decision does not
+/// depend on the caller's choice of units — height in metres and height in
+/// kilometres give the same verdict. 30 is the number the physical argument
+/// actually supports: on the logit scale |η| = 30 is already p ≈ 1 − 1e-13,
+/// which is separation, not signal. On a log link the same bound reads
+/// μᵢ/μ₀ᵢ outside `[e^−30, e^30] ≈ [1e-13, 1e13]`: a fitted rate that many
+/// decades off the data's own rate, where a y = 0 row runs when its mean is
+/// driven to 0. Centring on oᵢ + ln r keeps the verdict free of the units of
+/// the response, the weights and the offset too — Gamma/inverse-Gaussian y in
+/// grams or tonnes, Poisson counts near e^30 or near 1e-20, and rows whose
+/// exposure is 1e-15 of the rest all shift η̂ᵢ by the same amount as η₀ᵢ.
+/// Skipped under the two
+/// reciprocal links — Gamma `1/μ` and inverse-Gaussian `1/μ²` — where a large
+/// |η| is an honest small-mean fit (see the guard site).
 pub const ETA_DIVERGENCE_CAP: f64 = 30.0;
 /// Floor on the stored per-row IRLS weight `W_i = p_i (1-p_i)`, keeping it
 /// strictly positive. This keeps the logit fast path's working response
 /// `z = η + (y − p)/w` and the GLM's `X'WX` finite on a row where `p(1 − p)`
 /// rounds to 0. The GLMM kernels never divide by `w`.
 pub const WEIGHT_CLAMP: f64 = 1e-300;
-/// Saturation post-fit guard: rows with `p_i(1-p_i) < SATURATION_W` count as
-/// saturated. If the fraction exceeds `SATURATION_FRAC`, the fit is marked
-/// non-converged.
+/// Saturation post-fit guard, binomial links only: rows whose IRLS weight
+/// (`p_i(1-p_i)` on logit, the Fisher weight on probit and cloglog) is below
+/// `SATURATION_W` count as saturated, their fitted probability pinned at 0
+/// or 1. If the fraction exceeds `SATURATION_FRAC`, the fit is marked
+/// non-converged. The bound is absolute, which is right only where the mean is
+/// a probability: on the other families the IRLS weight carries the response's
+/// units (μ on Poisson, 1/μ on inverse-Gaussian/log, μ² on Gamma/inverse), so
+/// the same bound would refuse honest fits whose means are merely small or
+/// large in the caller's units.
 pub const SATURATION_W: f64 = 1e-5;
 /// Saturation post-fit guard: fraction of rows with `W_i < SATURATION_W`
 /// above which the fit is marked non-converged.
@@ -87,7 +142,7 @@ pub struct GlmFitView<'a> {
     pub l: MatRef<'a, f64>,
     /// Number of IRLS iterations completed (0 on the short-circuit / non-converged paths).
     pub n_iter: u32,
-    /// Whether the deviance fixpoint `|Δdeviance| < DEVIANCE_TOL` was reached before `MAX_IRLS_ITERS`.
+    /// Whether the deviance fixpoint `|Δdeviance| / (|deviance| + f) < DEVIANCE_TOL` was reached before `MAX_IRLS_ITERS`.
     pub converged: bool,
     /// Final-iteration Bernoulli deviance −2·Σ[y log p̂ + (1−y) log(1−p̂)].
     /// `NaN` on every non-converged / short-circuit return.
@@ -186,7 +241,7 @@ pub fn sigmoid_stable(eta: f64) -> f64 {
 /// `simd_transcendental::family_pass`. Unweighted `Family::Binomial { link:
 /// Logit }` reaches the fused kernel `pw_and_log1pexp_sum` there, byte-identical
 /// to the MCPower hot loop's own computation; every other
-/// family/link runs a vectorized arm written against [`crate::family`]'s scalar
+/// family/link runs a vectorized arm written against `family`'s scalar
 /// formulas. Gamma/NB dispersion is handled by the caller (`fit.rs`),
 /// not here — this kernel folds `φ=1`. `nb_theta` is the NB shape θ̂ the caller's
 /// outer-θ loop fixes for this fit (only the NB family reads it via
@@ -213,7 +268,7 @@ pub fn sigmoid_stable(eta: f64) -> f64 {
 ///
 /// IRLS weight: `W = diag(μ(1−μ))` under canonical logit (`Family::Binomial
 /// { link: Logit }`); every other family/link uses the general Fisher-scoring
-/// weight `W_i = 1 / (Var(μ_i) · g'(μ_i)²)` from [`crate::family`].
+/// weight `W_i = 1 / (Var(μ_i) · g'(μ_i)²)` from `family`.
 ///
 /// `deviance_null` matches R's `glm(family=binomial)$null.deviance` (see
 /// `glm_deviance_null_golden_value`). The full β̂/deviance path is pinned
@@ -356,6 +411,74 @@ pub fn glm_irls_fit<'a>(
         }
     };
 
+    // Null-model location of the link, η₀ᵢ = oᵢ + `eta_null`: on the log links
+    // `eta_null` = ln r with r = Σwᵢyᵢ / Σwᵢe^{oᵢ} (ln ȳ without an offset), 0 on
+    // every other link. r is the Poisson intercept-only MLE with that offset, a
+    // weighted mean of the per-row rates yᵢ/e^{oᵢ}, so it moves with the units of
+    // y, of the weights and of the offset exactly as the fitted means do. The
+    // log links' cold start seeds every row at η₀ᵢ, and the divergence guard
+    // measures |ηᵢ − η₀ᵢ| from it. Not floored: y > 0 on Gamma and
+    // inverse-Gaussian, and a floor such as R's `y + 0.1` would put a units limit
+    // back into both the seed and the guard. Only an all-zero count response
+    // (ȳ = 0, ln r = −∞) takes ȳ = 0.1: its maximum sits at μ = 0, and there is
+    // no data scale left to be free of.
+    let log_link = matches!(
+        family,
+        Family::Poisson { .. }
+            | Family::NegativeBinomial { .. }
+            | Family::Gamma {
+                link: crate::spec::GammaLink::Log,
+            }
+            | Family::InverseGaussian {
+                link: crate::spec::InverseGaussianLink::Log,
+            }
+    );
+    let eta_null = if log_link {
+        let mut ln_rate = if y_bar > 0.0 { y_bar } else { 0.1 }.ln();
+        if let Some(o) = offset {
+            // ln r = ln ȳ − ln(Σwᵢe^{oᵢ} / Σwᵢ), ȳ the weighted mean above.
+            let (mut we_sum, mut w_sum) = (0.0, 0.0);
+            for (i, &oi) in o[..n].iter().enumerate() {
+                let pw = prior_w.map_or(1.0, |w| w[i]);
+                we_sum += pw * oi.exp();
+                w_sum += pw;
+            }
+            ln_rate -= (we_sum / w_sum).ln();
+        }
+        ln_rate
+    } else {
+        0.0
+    };
+
+    // Floor of the relative deviance rule: R's 0.1, carried into the
+    // deviance's units on the two dispersion families. The floor is an
+    // absolute deviance, so a fixed 0.1 stops a fit early whenever the
+    // deviance is small only because of units. On Gamma and inverse-Gaussian
+    // the prior weights are precision weights with no scale of their own, and
+    // D = Σ wᵢdᵢ scales with them; the inverse-Gaussian unit deviance
+    // (y−μ)²/(yμ²) also scales as 1/y. With R's 0.1, an inverse-Gaussian/log
+    // fit with D = 19 stopped with β 1e-6 (relative) short of the maximum at
+    // y × 1e3, and a Gamma/log fit with every weight 1e-9 2e-3 short, both
+    // reported converged.
+    // `weight_scale` is an exact power of two (1 unweighted) and ȳ carries y's
+    // units. The binomial deviance stays on R's 0.1: with φ ≡ 1 it is a
+    // likelihood-ratio statistic of counts, whose weights count cases. Poisson
+    // and NB do too while ȳ ≥ 1, but a non-integer y in tiny units (a rate
+    // without exposure weights) has D ∝ ȳ, and R's 0.1 stopped such a fit
+    // 1.7e-2 short in β at y × 1e-13, reported converged; so below ȳ = 1 the
+    // floor carries ȳ's units. Not a plain 0.1·ȳ: an NB deviance with θ ≪ ȳ
+    // does not grow with ȳ, and at ȳ = 1e6 that floor would ask |ΔD| < 1e-7 of
+    // a linearly converging fit. An all-zero count response (ȳ = 0) keeps 0.1.
+    // Unweighted, off inverse-Gaussian and ȳ < 1 counts, the floor is exactly 0.1.
+    let dev_floor = match family {
+        Family::Gamma { .. } => 0.1 * crate::family::weight_scale(prior_w, n),
+        Family::InverseGaussian { .. } => 0.1 * crate::family::weight_scale(prior_w, n) / y_bar,
+        Family::Poisson { .. } | Family::NegativeBinomial { .. } if y_bar > 0.0 => {
+            0.1 * y_bar.min(1.0)
+        }
+        _ => 0.1,
+    };
+
     // Seed β and η here; the IRLS loop carries η forward from each
     // iteration's post-accept recompute (the β-accept step) instead of
     // recomputing X·β at the top of every iteration.
@@ -383,12 +506,15 @@ pub fn glm_irls_fit<'a>(
         // Cold start: β ← 0 with a family-specific η seed. Logit keeps η = 0
         // (μ=0.5, bit-identical to the pre-warm-start behavior). The Gamma
         // **inverse** link cannot start at η=0 (μ=1/0): seed η = 1/y per row
-        // (R's `mustart=y`, `etastart=1/y`). Log-link count families
-        // (Poisson/NB) seed the null model, μ₀ = ȳ + 0.1 ⇒ η = ln(ȳ+0.1) on
-        // every row: from η = 0 (μ=1) on data with ȳ ≳ ~25–30 the first WLS
-        // step overshoots and IRLS runs away (β → ~9e304) — there is
-        // deliberately no step-halving to catch it (see the accept step).
-        // NOT R's per-row μ₀ = y + 0.1 `initialize`: on
+        // (R's `mustart=y`, `etastart=1/y`). Log-link families (Poisson/NB,
+        // Gamma, inverse-Gaussian) seed the null model, η₀ᵢ = oᵢ + ln r
+        // (`eta_null`): from
+        // η = 0 (μ=1) the first WLS step overshoots on data whose mean is far
+        // from 1 and IRLS runs away (β → ~9e304) — there is deliberately no
+        // step-halving to catch it (see the accept step). The seed carries the
+        // offset for the same reason: rows whose exposure is 1e-6 of the rest,
+        // seeded at the data's mean, send a Gamma/log fit off to ~1e304. NOT
+        // R's per-row μ₀ = y + 0.1 `initialize`: on
         // zero-heavy small-θ NB data the per-row seed's first step fits the
         // log-count mean (intercept ≈ ln 0.1), the second explodes past
         // the divergence cap, and recovery crawls at ~1 unit/iter past the iteration
@@ -411,8 +537,7 @@ pub fn glm_irls_fit<'a>(
                 // η = 1/μ² with μ₀ = y (R's `mustart = y` for
                 // inverse.gaussian): η = 0 would put μ at ∞ for this link, and
                 // η ≤ 0 is outside its domain entirely. Mirrors the
-                // Gamma-inverse seed above. The IG **log** link needs no seed —
-                // η = 0 gives μ = 1, the same treatment Gamma-log gets.
+                // Gamma-inverse seed above.
                 Family::InverseGaussian {
                     link: crate::spec::InverseGaussianLink::InverseSquared,
                 } => {
@@ -421,11 +546,22 @@ pub fn glm_irls_fit<'a>(
                         irls_eta[i] = 1.0 / (mu0 * mu0);
                     }
                 }
-                Family::Poisson { .. } | Family::NegativeBinomial { .. } => {
-                    let ybar = y[..n].iter().sum::<f64>() / n.max(1) as f64;
-                    irls_eta[..n].fill((ybar + 0.1).ln());
+                // The log links seed the null model η₀ᵢ = oᵢ + ln r (`eta_null`),
+                // the binomial links η₀ = 0 with no offset. From η = 0 (μ = 1) the Fisher
+                // weight is 1 on Gamma-log, so the first step is ordinary least
+                // squares of y − 1 on X; at a mean of ~150 that puts the intercept
+                // near 150, the rows with the smallest η then carry working
+                // responses of order y·e^{−η}, and IRLS runs off to ~1e306. R
+                // starts both families at μ₀ = y (`Gamma()$initialize`,
+                // `inverse.gaussian()$initialize`).
+                _ => {
+                    irls_eta[..n].fill(eta_null);
+                    if let (true, Some(o)) = (log_link, offset) {
+                        for i in 0..n {
+                            irls_eta[i] += o[i];
+                        }
+                    }
                 }
-                _ => irls_eta[..n].fill(0.0),
             }
         }
     }
@@ -441,6 +577,18 @@ pub fn glm_irls_fit<'a>(
     let mut converged = false;
     let mut had_pd_failure = false;
     let mut n_iter: u32 = 0;
+    // Period-2 damping state; see the detector at the accept step. It runs
+    // only where the observed curvature differs from the Fisher weight: on the
+    // other links Fisher scoring is Newton's method, whose map has a zero
+    // Jacobian at the MLE. `irls_u_scratch` holds the last accepted β step; it
+    // is free until the post-loop SE solve.
+    let osc_guard_active = crate::family::exact_curvature_differs(family);
+    let mut step_sq_prev = f64::NAN;
+    let mut osc_flips = 0usize;
+    let mut damp = false;
+    if osc_guard_active {
+        irls_u_scratch[..p].fill(0.0);
+    }
 
     // IRLS: each pass is a weighted least squares solve
     // β_new = (X'WX)⁻¹ X'Wz on the working response z = η + (y − μ)/W, μ = σ(η).
@@ -454,14 +602,13 @@ pub fn glm_irls_fit<'a>(
     // `log1pexp` sweep — so `deviance_final` is always one pass behind the β
     // that produced it, by construction, not by an accident of ordering.
     //
-    // The divergence guard bounds |η|, which the two reciprocal links invert:
+    // The divergence guard bounds |η − η₀|, which the two reciprocal links invert:
     // η = 1/μ under the Gamma inverse link, η = 1/μ² under the inverse-Gaussian
     // 1/μ² link. On both, η grows without bound as μ → 0, so a legitimate
     // small-mean fit sits far above the threshold (μ = 0.18 already gives
-    // η = 30 under 1/μ²). Those two family/link pairs — the same pair
-    // `family::eta_infeasible` names — fall through to the other exits instead:
-    // clamp_eta's upper 700 (src/family.rs), the non-finite guard on β_new, and
-    // MAX_IRLS_ITERS. Loop-invariant, so it is evaluated once.
+    // η = 30 under 1/μ²). Those two family/link pairs fall through to the
+    // other exits instead: clamp_eta's bounds `[1e-75, 1e75]` (src/family.rs),
+    // the non-finite guard on β_new, and MAX_IRLS_ITERS. Loop-invariant, so it is evaluated once.
     let eta_guard_active = !matches!(
         family,
         Family::Gamma {
@@ -511,13 +658,13 @@ pub fn glm_irls_fit<'a>(
             }
         }
 
-        // Adaptive early exit on |Δdeviance| at the CURRENT β — the one the
-        // previous pass's solve accepted. Pass 0 sees the seed β, which has no
-        // prior deviance to compare against: skip the check and the tracker so
-        // the first real comparison is β₂-vs-β₁.
+        // Adaptive early exit on the RELATIVE |Δdeviance| at the CURRENT β —
+        // the one the previous pass's solve accepted. Pass 0 sees the seed β,
+        // which has no prior deviance to compare against: skip the check and
+        // the tracker so the first real comparison is β₂-vs-β₁.
         if iter > 0 {
             deviance_final = deviance;
-            if (deviance - deviance_prev).abs() < DEVIANCE_TOL {
+            if (deviance - deviance_prev).abs() / (deviance.abs() + dev_floor) < DEVIANCE_TOL {
                 converged = true;
                 break;
             }
@@ -604,12 +751,47 @@ pub fn glm_irls_fit<'a>(
             break;
         }
 
-        // Accept β_new unconditionally and compute new deviance.
-        //
-        // β_new is accepted unconditionally — no step-halving. The
-        // DEVIANCE_TOL early-exit and MAX_IRLS_ITERS cap are sufficient
-        // divergence guards.
-        irls_betas[..p].copy_from_slice(&irls_betas_new[..p]);
+        // Period-2 detector on the β step, with the PIRLS constants
+        // (`crate::glmm::PIRLS_OSC_RATIO`): after `PIRLS_OSC_TRIGGER` passes in
+        // a row whose step reverses the one before (negative dot product) at no
+        // less than `PIRLS_OSC_RATIO` of its length, every later step is halved.
+        // Fisher scoring's map has Jacobian I − F⁻¹H at the MLE (F expected, H
+        // observed information), so where H exceeds 2F in some direction the
+        // MLE repels and the iterates step back and forth across it with
+        // growing amplitude (NB/log: per row H/F = (y + θ)/(μ + θ)); the
+        // deviance then rises on every pass instead of alternating, which is
+        // why the step, not the deviance, is watched. At very large counts the
+        // iterates can also two-cycle between neighbouring floats at the MLE,
+        // the deviance's round-off (NB rows cancel terms of order y) sitting
+        // above `DEVIANCE_TOL`. Halving maps an eigenvalue λ of the undamped map
+        // to (1 + λ)/2. A fit the detector never fires on is bit-identical.
+        if osc_guard_active && !damp {
+            let (mut dot, mut step_sq) = (0.0, 0.0);
+            for j in 0..p {
+                let step = irls_betas_new[j] - irls_betas[j];
+                dot += step * irls_u_scratch[j];
+                step_sq += step * step;
+                irls_u_scratch[j] = step;
+            }
+            let ratio = crate::glmm::PIRLS_OSC_RATIO;
+            if dot < 0.0 && step_sq > ratio * ratio * step_sq_prev {
+                osc_flips += 1;
+            } else {
+                osc_flips = 0;
+            }
+            damp = osc_flips >= crate::glmm::PIRLS_OSC_TRIGGER;
+            step_sq_prev = step_sq;
+        }
+        // Accept β_new: no step-halving on a deviance increase (R's `glm.fit`
+        // halves only on a non-finite deviance or an invalid η/μ). Once the
+        // detector has fired, every step moves half way from the current β.
+        if damp {
+            for j in 0..p {
+                irls_betas[j] += 0.5 * (irls_betas_new[j] - irls_betas[j]);
+            }
+        } else {
+            irls_betas[..p].copy_from_slice(&irls_betas_new[..p]);
+        }
         // η = X·β as a column sweep (axpy over x columns) — each η_i still
         // accumulates in the same j order from 0.0, bit-identical to the
         // strided per-row form. Mirrors the truth-start seed loop above —
@@ -621,9 +803,10 @@ pub fn glm_irls_fit<'a>(
                 irls_eta[i] += x[(i, j)] * b_j;
             }
         }
-        // η = o + Xβ — mirrors the truth-start seed; change together. (Cold
-        // seeds deliberately omit o, like R's η₀ = link(mustart): the seed is
-        // a start, not a fixpoint constraint; consistency begins at iter 1.)
+        // η = o + Xβ — mirrors the truth-start seed; change together. (The
+        // binomial and reciprocal-link cold seeds omit o, like R's
+        // η₀ = link(mustart): the seed is a start, not a fixpoint constraint;
+        // consistency begins at iter 1.)
         if let Some(o) = offset {
             for i in 0..n {
                 irls_eta[i] += o[i];
@@ -640,8 +823,11 @@ pub fn glm_irls_fit<'a>(
         // each iteration.
         if eta_guard_active && iter >= 3 {
             let mut max_abs: f64 = 0.0;
-            for &e in &irls_eta[..n] {
-                let ae = e.abs();
+            for (i, &e) in irls_eta[..n].iter().enumerate() {
+                let ae = match offset {
+                    Some(o) if log_link => (e - o[i] - eta_null).abs(),
+                    _ => (e - eta_null).abs(),
+                };
                 // `ae > max_abs` is false for NaN, so a NaN η needs its own arm;
                 // once `max_abs` is NaN no later finite `ae` can overwrite it.
                 if ae.is_nan() || ae > max_abs {
@@ -660,8 +846,10 @@ pub fn glm_irls_fit<'a>(
 
     // Post-fit saturation guard. Evaluate p_i = σ(η_i) from the final irls_eta
     // to catch the case where the loop early-exits but β has drifted into a
-    // saturated region.
-    if converged {
+    // saturated region. Binomial only: see `SATURATION_W`. On Poisson and NB
+    // the analogue, a y = 0 row whose mean runs to 0, is left to the
+    // divergence guard, whose bound is relative to the data's mean.
+    if converged && matches!(family, Family::Binomial { .. }) {
         // irls_w already holds the FINAL η's weights: convergence only breaks
         // right after the top-of-pass fused kernel refilled p/W from the carried
         // η — no recompute needed. The clamp floor sits far below anything this

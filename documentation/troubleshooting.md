@@ -1,7 +1,7 @@
 # Troubleshooting
 
-See [`warnings.md`](warnings.md) for every warning a fit raises and what to
-do about it.
+See [`warnings.md`](warnings.md) for every warning and error a fit can raise
+and what to do about it.
 
 ## The fit is singular (isSingular is TRUE)
 
@@ -26,8 +26,9 @@ exactly redundant and is dropped, with `beta`/`se` reported as `NaN`).
 The warning names one column — the one the pivot search happened to reach —
 but its entangled partners are **not** named; the search finds the
 worst-conditioned column, not the full set it is confounded with. To fix it:
-rescale predictors onto comparable magnitudes, or drop or combine the
-predictors that are actually measuring the same thing. See
+center predictors (the check is scale-invariant, so rescaling does not change
+it), or drop or combine the predictors that are actually measuring the same
+thing. See
 [`conventions.md#flags-on-the-result`](conventions.md#flags-on-the-result) for
 where this sits in the `diagnostics` channel.
 

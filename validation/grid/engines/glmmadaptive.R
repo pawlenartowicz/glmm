@@ -78,14 +78,39 @@ fam_obj <- function(family, link) {
 # convergence or numerical-quality warning from mixed_model() would otherwise
 # go to the console where nothing records it, so it is captured here and
 # routed into `message` by record_glmmadaptive.
+#
+# mixed_model() (GLMMadaptive 0.9-7 source, read 2026-09-27) takes a Gamma
+# family's starting beta from `glm.fit(X, y, family = Gamma())`, the INVERSE
+# link, although Gamma.fam() is log-link. Where that GLM has no valid fit the
+# call stops with "no valid set of coefficients has been found: please supply
+# starting values", and `initial_values` cannot help: it is applied only after
+# that glm.fit has run. Only then is the fit retried under a copy of
+# Gamma.fam() renamed out of mixed_model()'s known families, the one route on
+# which `initial_values$betas` may be a family object; the start is then the
+# log-link GLM's beta. The log-density, the dispersion (`n_phis = 1`, the
+# count mixed_model() gives Gamma) and every control are unchanged, so the
+# objective is the same one. A cell that starts from the default is unaffected
+# by this branch. The retry is recorded in `message`.
 make_fit <- function(cell, df) {
   ff <- stats::as.formula(cell[["ma_fixed"]])
   rf <- stats::as.formula(cell[["ma_random"]])
   nagq <- if (is.null(cell[["nagq"]])) 1L else as.integer(cell[["nagq"]])
   fam <- fam_obj(cell[["family"]], cell[["link"]])
-  function() with_warnings(
+  function() with_warnings(tryCatch(
     GLMMadaptive::mixed_model(fixed = ff, random = rf, data = df,
-                              family = fam, nAGQ = nagq, control = MA_CTRL))
+                              family = fam, nAGQ = nagq, control = MA_CTRL),
+    error = function(e) {
+      msg <- conditionMessage(e)
+      if (cell[["family"]] != "gamma" ||
+          !grepl("no valid set of coefficients has been found", msg, fixed = TRUE)) stop(e)
+      fam_log_start <- fam
+      fam_log_start$family <- "Gamma, log-link start"
+      warning("default start failed (", msg, "); refitted from the log-link GLM beta")
+      GLMMadaptive::mixed_model(fixed = ff, random = rf, data = df,
+                                family = fam_log_start, nAGQ = nagq, control = MA_CTRL,
+                                n_phis = 1,
+                                initial_values = list(betas = stats::Gamma(link = "log")))
+    }))
 }
 
 # Runs `expr` and returns its value together with every warning it raised,

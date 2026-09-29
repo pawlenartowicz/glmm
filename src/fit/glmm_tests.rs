@@ -392,18 +392,21 @@ fn fit_glmm_cbpp_matches_lme4() {
 }
 
 /// The presence half of the `PirlsExhausted` contract `fit_glmm_cbpp_matches_lme4`
-/// above asserts the absence of: a real solve whose opening trial points run the
+/// above asserts the absence of: a real solve one of whose trial points runs the
 /// full `PIRLS_MAX_ITERS` cap, so the note's payload is produced by the fit path
 /// rather than by a hand-built `FitDiagnostics` carrier.
 ///
-/// The design itself is benign — a 4-cluster Gamma-log GLMM that cold-fits with
-/// no note at all — and the pathology is the warm start alone. θ₀ = 1e5 puts
-/// BOBYQA's opening trial points at a random-effect scale where the penalized
-/// deviance has no mode reachable inside the cap; each such eval scores
-/// `+INFINITY` and is rejected, and the search walks back to the cold optimum.
-/// So `final_eval` stays false and the reported estimates are the cold ones
-/// (measured: worst β gap 7.9e-6 relative, deviance 2.4e-12) — this is exactly
-/// the "a note with `final_eval == false` costs nothing observable" case.
+/// The design itself is benign — a crossed negative-binomial GLMM that
+/// cold-fits with no note at all — and the pathology is one trial point the
+/// warm start's search passes through. From θ₀ = 50 (seed 17, crossed), one
+/// PIRLS solve at a trial point of the search runs out the iteration cap
+/// (with the start guard in place, the guard's own single-point check at θ₀
+/// still finds the warm start worth entering the search from, so this trial
+/// point is one the search finds on its own, not the entry point itself).
+/// That eval scores `+INFINITY` and is rejected, and the search goes on to
+/// the cold optimum. So `final_eval` stays false and the reported estimates
+/// are the cold ones — this is exactly the "a note with `final_eval == false`
+/// costs nothing observable" case.
 ///
 /// The second arm re-fits the same warm start under the RX/Schur SE denominator
 /// instead of the FD joint Hessian. Both arms share one fit path and differ only
@@ -412,36 +415,8 @@ fn fit_glmm_cbpp_matches_lme4() {
 /// counter that the note is defined over.
 #[test]
 fn pirls_exhausted_note_counts_fit_path_evals_only() {
-    let (n, n_clusters, p) = (24usize, 4usize, 2usize);
-    // Cluster offsets live on the log-mean scale and span ±3, which is what
-    // makes the far-out θ trial points unsolvable rather than merely slow;
-    // y is Gamma(shape 1) about exp(η), so the cold fit is ordinary.
-    let mut st = 7u64;
-    let u: Vec<f64> = (0..n_clusters).map(|_| 3.0 * lcg(&mut st)).collect();
-    let mut x = vec![0.0f64; n * p];
-    let mut y = vec![0.0f64; n];
-    for i in 0..n {
-        let x1 = lcg(&mut st);
-        x[i * p] = 1.0;
-        x[i * p + 1] = x1;
-        y[i] = (0.5 + 0.8 * x1 + u[i % n_clusters]).exp() * inf_plateau_exp1(&mut st);
-    }
-    let model = ModelSpec {
-        family: Family::Gamma {
-            link: crate::GammaLink::Log,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_clusters as u32,
-            },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds {
-        primary: (0..n).map(|i| (i % n_clusters) as u32).collect(),
-        extra: vec![],
-    };
+    let (x, y, model, ids) = nb_log_four_cluster_design(17, 36, 3);
+    let (n, p) = (y.len(), 2usize);
     let opts = FitOptions {
         target_indices: vec![0, 1],
         ..FitOptions::default()
@@ -460,12 +435,12 @@ fn pirls_exhausted_note_counts_fit_path_evals_only() {
 
     let start = StartValues {
         beta: vec![],
-        theta: vec![1e5],
+        theta: vec![50.0, 1.0],
     };
     let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
     assert!(
         warm.converged(),
-        "the search must still reach the optimum from the absurd start"
+        "the search must still reach the optimum past the degenerate probe"
     );
     let [note] = &warm.diagnostics.notes[..] else {
         panic!(
@@ -476,8 +451,8 @@ fn pirls_exhausted_note_counts_fit_path_evals_only() {
     let Note::PirlsExhausted { evals, final_eval } = note else {
         panic!("expected PirlsExhausted, got {note:?}");
     };
-    // Not pinned to the observed 17: how many of BOBYQA's trial points land in
-    // the unsolvable region moves with the optimizer. What is pinned is that
+    // Not pinned to the observed 1: how many of BOBYQA's trial points land
+    // where the cap runs out moves with the optimizer. What is pinned is that
     // fit-path evals are counted at all, and that the solve behind the reported
     // estimates is not one of them.
     assert!(*evals > 0, "the exhausted trial evals must be counted");
@@ -527,6 +502,291 @@ fn pirls_exhausted_note_counts_fit_path_evals_only() {
     assert_eq!(
         rx_evals, evals,
         "the FD-Hessian SE pass must not add to the fit-path eval count"
+    );
+}
+
+/// A small negative-binomial (log link) GLMM design: `n` rows over 4 primary
+/// clusters whose log-mean offsets span ±3, optionally crossed with
+/// `n_crossed` levels of a second grouping (offsets ±0.5), an intercept and one
+/// covariate; y is exp(η) times an Exp(1) draw, rounded to a count, so a cold
+/// fit is ordinary. Row `i` sits in primary cluster `i % 4` and crossed level
+/// `(i / 4) % n_crossed`. Returns `(x, y, model, ids)`, `x` row-major `n × 2`.
+fn nb_log_four_cluster_design(
+    seed: u64,
+    n: usize,
+    n_crossed: usize,
+) -> (Vec<f64>, Vec<f64>, ModelSpec, GroupIds) {
+    let (n_clusters, p) = (4usize, 2usize);
+    let mut st = seed;
+    let u: Vec<f64> = (0..n_clusters).map(|_| 3.0 * lcg(&mut st)).collect();
+    let v: Vec<f64> = (0..n_crossed).map(|_| 0.5 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        let mut eta = 0.5 + 0.8 * x1 + u[i % n_clusters];
+        if n_crossed > 0 {
+            eta += v[(i / n_clusters) % n_crossed];
+        }
+        y[i] = (eta.exp() * inf_plateau_exp1(&mut st)).round();
+    }
+    let extra_groupings = if n_crossed > 0 {
+        vec![Grouping {
+            relation: GroupingRelation::Crossed {
+                n_clusters: n_crossed as u32,
+            },
+            slopes: vec![],
+        }]
+    } else {
+        vec![]
+    };
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings,
+        }),
+    };
+    let extra = if n_crossed > 0 {
+        vec![(0..n)
+            .map(|i| ((i / n_clusters) % n_crossed) as u32)
+            .collect()]
+    } else {
+        vec![]
+    };
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % n_clusters) as u32).collect(),
+        extra,
+    };
+    (x, y, model, ids)
+}
+
+/// Warm-starts `design` from each primary θ₀ in `theta0s` (every other θ
+/// component at 1) and requires the cold optimum back: converged, the same
+/// deviance to 1e-9 relative, β to 1e-4 relative — the warm/cold bands of
+/// `pirls_exhausted_note_counts_fit_path_evals_only`.
+fn assert_warm_starts_reach_cold_optimum(
+    (x, y, model, ids): (Vec<f64>, Vec<f64>, ModelSpec, GroupIds),
+    theta0s: &[f64],
+    label: &str,
+) {
+    let (n, p) = (y.len(), 2usize);
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(cold.converged(), "{label}: the cold fit must converge");
+    let n_theta = cold.tau2.len();
+    for &theta0 in theta0s {
+        let mut theta = vec![1.0; n_theta];
+        theta[0] = theta0;
+        let start = StartValues {
+            beta: vec![],
+            theta,
+        };
+        let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+        assert!(
+            warm.converged(),
+            "{label}, θ₀ = {theta0}: warm fit did not converge ({:?})",
+            warm.diagnostics
+        );
+        let dev_rel = (warm.deviance - cold.deviance).abs() / cold.deviance.abs();
+        assert!(
+            dev_rel < 1e-9,
+            "{label}, θ₀ = {theta0}: deviance warm {} vs cold {} (rel {dev_rel})",
+            warm.deviance,
+            cold.deviance
+        );
+        for j in 0..p {
+            let rel = (warm.beta[j] - cold.beta[j]).abs() / cold.beta[j].abs();
+            assert!(
+                rel < 1e-4,
+                "{label}, θ₀ = {theta0}: β[{j}] warm {} vs cold {} (rel {rel})",
+                warm.beta[j],
+                cold.beta[j]
+            );
+        }
+    }
+}
+
+/// NB-log warm starts far from the mode reach the cold optimum on the exact
+/// β-profile route (`pirls_solve_blocked`). With 4 clusters and θ₀ ≥ 10–20 the
+/// border's S_β is tiny in the intercept direction, and the joint (u, β) step
+/// used to overshoot and have its rises let through by the merit's
+/// first-order slack, so every opening trial point exhausted PIRLS and the fit
+/// ended `NoOptimum`. Seed 3 failed from θ₀ = 20, seed 7 from θ₀ = 50, and
+/// seed 15 failed from θ₀ = 10 and converged 0.045 deviance above the cold
+/// optimum from θ₀ = 5.
+#[test]
+fn nb_log_warm_start_far_from_mode_reaches_cold_optimum() {
+    for seed in [3u64, 7, 15] {
+        assert_warm_starts_reach_cold_optimum(
+            nb_log_four_cluster_design(seed, 24, 0),
+            &[5.0, 10.0, 20.0, 50.0],
+            &format!("seed {seed}"),
+        );
+    }
+}
+
+/// The structured crossed/nested twin (`pirls_solve_blocked_extras`) of
+/// `nb_log_warm_start_far_from_mode_reaches_cold_optimum`: the same 4 primary
+/// clusters crossed with a 3-level factor. Seeds 3 and 9 failed from θ₀ = 20.
+#[test]
+fn nb_log_warm_start_far_from_mode_reaches_cold_optimum_crossed() {
+    for seed in [3u64, 9] {
+        assert_warm_starts_reach_cold_optimum(
+            nb_log_four_cluster_design(seed, 36, 3),
+            &[5.0, 10.0, 20.0, 50.0],
+            &format!("crossed seed {seed}"),
+        );
+    }
+}
+
+/// NB-log warm starts from θ₀ = 200 reach the cold optimum on both exact
+/// β-profile routes. Each of these designs has an all-zero cluster, so at a
+/// large θ the Laplace profile is nearly flat in the intercept, and there
+/// log|A|'s curvature in β is most of the profile's: half the profile's
+/// curvature in the intercept is 22 times `S_β` on seed 19 at θ ≈ 198. A
+/// border step on `S_β` alone overshot on every
+/// iteration, a few halvings brought the trial back inside the accept band on
+/// alternating sides of the mode, and the cycle ran out every iteration cap.
+/// With the curvature in the step (`pirls::logdet_beta_curvature`) the solves
+/// converge.
+#[test]
+fn nb_log_warm_start_from_theta_200_reaches_cold_optimum() {
+    for seed in [17u64, 19, 21] {
+        assert_warm_starts_reach_cold_optimum(
+            nb_log_four_cluster_design(seed, 24, 0),
+            &[200.0],
+            &format!("seed {seed}"),
+        );
+    }
+    for seed in [9u64, 10, 17, 19, 23] {
+        assert_warm_starts_reach_cold_optimum(
+            nb_log_four_cluster_design(seed, 36, 3),
+            &[200.0],
+            &format!("crossed seed {seed}"),
+        );
+    }
+}
+
+/// Far warm starts that need the exact border's trust region
+/// (`pirls::BorderTrust`): the 4-cluster design as Poisson-log (blocked seed
+/// 3, crossed seed 10) and as binary cloglog (blocked seed 27), from
+/// θ₀ = 1000. Measured with the curvature step and a border-step length that
+/// could only shrink: careful mode started in every opening PIRLS solve of the
+/// search and every one failed, so the fit reported no convergence. With a
+/// radius that grows back when a trial agrees with its model, the solves
+/// converge and each start reaches the cold optimum.
+#[test]
+fn far_warm_starts_reach_cold_optimum_with_the_border_trust_region() {
+    let binary = |(x, y, mut model, ids): (Vec<f64>, Vec<f64>, ModelSpec, GroupIds), link| {
+        model.family = Family::Binomial { link };
+        let y = y.iter().map(|&v| if v > 1.0 { 1.0 } else { 0.0 }).collect();
+        (x, y, model, ids)
+    };
+    let poisson = |(x, y, mut model, ids): (Vec<f64>, Vec<f64>, ModelSpec, GroupIds)| {
+        model.family = Family::Poisson {
+            link: PoissonLink::Log,
+        };
+        (x, y, model, ids)
+    };
+    assert_warm_starts_reach_cold_optimum(
+        poisson(nb_log_four_cluster_design(3, 24, 0)),
+        &[1000.0],
+        "Poisson seed 3",
+    );
+    assert_warm_starts_reach_cold_optimum(
+        poisson(nb_log_four_cluster_design(10, 36, 3)),
+        &[1000.0],
+        "Poisson crossed seed 10",
+    );
+    assert_warm_starts_reach_cold_optimum(
+        binary(nb_log_four_cluster_design(27, 24, 0), BinomialLink::Cloglog),
+        &[1000.0],
+        "cloglog seed 27",
+    );
+}
+
+/// A far binary-link warm start where every PIRLS evaluation fails: logit,
+/// the 4-cluster design, seed 2, from θ₀ = 1000. Even with the border trust
+/// region (the test above), this class of start still fails outright — every
+/// evaluation is `+INFINITY`, so there is no trial point for a trust region to
+/// judge. The start guard recovers it a different way: it compares the outer
+/// objective at this θ₀ against the blind cold start before the search ever
+/// runs, and begins from the cold point instead, since the far θ₀'s own
+/// objective cannot even be evaluated.
+#[test]
+fn far_warm_start_recovers_via_the_cold_guard() {
+    let (x, mut y, mut model, ids) = nb_log_four_cluster_design(2, 24, 0);
+    model.family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    for v in y.iter_mut() {
+        *v = if *v > 1.0 { 1.0 } else { 0.0 };
+    }
+    assert_warm_starts_reach_cold_optimum((x, y, model, ids), &[1000.0], "logit seed 2");
+}
+
+/// A far warm start where `ExactProfile` itself ends not converged (not the
+/// all-`+INFINITY` case the guard test above covers) and the `PqlThenJoint`
+/// fallback reaches the cold optimum instead: binary cloglog, the 4-cluster
+/// design, seed 37, from θ₀ = 3000. Found by scanning the same family of
+/// far-start fixtures the guard and trust-region tests use for a fit whose
+/// diagnostics carry `Note::ExactProfileFallback`.
+#[test]
+fn exact_profile_fallback_reruns_on_pql_then_joint() {
+    let (x, mut y, mut model, ids) = nb_log_four_cluster_design(37, 24, 0);
+    model.family = Family::Binomial {
+        link: BinomialLink::Cloglog,
+    };
+    for v in y.iter_mut() {
+        *v = if *v > 1.0 { 1.0 } else { 0.0 };
+    }
+    let (n, p) = (y.len(), 2usize);
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(
+        cold.converged(),
+        "the cold fit of this design must converge"
+    );
+
+    let start = StartValues {
+        beta: vec![],
+        theta: vec![3000.0],
+    };
+    let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+    assert!(
+        warm.converged(),
+        "cloglog seed 37, θ₀ = 3000: expected the PqlThenJoint fallback to \
+         converge, got {:?}",
+        warm.diagnostics
+    );
+    assert!(
+        warm.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::ExactProfileFallback)),
+        "expected an ExactProfileFallback note, got {:?}",
+        warm.diagnostics.notes
+    );
+    let dev_rel = (warm.deviance - cold.deviance).abs() / cold.deviance.abs();
+    assert!(
+        dev_rel < 1e-6,
+        "deviance warm {} vs cold {} (rel {dev_rel})",
+        warm.deviance,
+        cold.deviance
     );
 }
 
@@ -2367,10 +2627,9 @@ fn fit_glmm_poisson_agq_matches_lme4() {
 /// (Fisher) weight, a different objective from the Laplace approximation glmm and
 /// glmmTMB maximise. The oracle is sacred.
 // FD-Hessian SE (use.hessian=TRUE) for this non-canonical link needs a
-// smooth deviance: probit is Fisher-scoring (linear convergence), so PIRLS at
-// the canonical 1e-6 tolerance left the deviance noisy to ~1e-4 and the FD
-// second differences amplified it into a 7–41%-wrong SE. `pirls_tol` gives
-// non-canonical links the tight `PIRLS_TOL_REL_NONCANON` (1e-8). (The Φ accuracy — `phi_hp`, Cody erfc —
+// smooth deviance: PIRLS at a 1e-6 tolerance left the deviance noisy to ~1e-4
+// and the FD second differences amplified it into a 7–41%-wrong SE. `pirls_tol`
+// gives non-canonical links the tight `PIRLS_TOL_REL_NONCANON` (1e-8). (The Φ accuracy — `phi_hp`, Cody erfc —
 // is a separate genuine fix but was NOT the SE cause; verified by spike.)
 #[test]
 fn fit_glmm_probit_cbpp_matches_glmmtmb() {
@@ -2708,7 +2967,7 @@ fn fit_glmm_gamma_dispersion_is_the_laplace_ml_value() {
 
 /// Gamma log-link GLMM `y ~ 1 + x + grp + (1|cluster)` on sim_gamma, gated
 /// against the accuracy grid's glmmTMB record for cell `sim_gamma`:
-/// `validation/grid/runs/glmmtmb/2026-09-23_1.1.14_centrum-zarzdzania-swiatem_oracle-pin/results.jsonl`
+/// `validation/grid/runs/glmmtmb/2026-09-23_1.1.14_dell-fedora_oracle-pin/results.jsonl`
 /// (the same fit as `validation/goldens/sim_gamma_glmm_tmb.json`).
 ///
 /// WHY glmmTMB. glmm and glmmTMB maximise the same objective on this cell: the
@@ -2813,8 +3072,20 @@ fn fit_glmm_gamma_sim_matches_grid_reference() {
     assert_eq!(f.df, 5); // 3 β + cluster θ + φ
 
     // Rx arm on the same design, pinned to glmm's own values (see the doc
-    // comment): x86_64 anchor, frozen 2026-09-24.
-    const REF_SE_RX_PIN: [f64; 3] = [0.1307916663745053, 0.04409104106247911, 0.0910721253315148];
+    // comment): x86_64 anchor, frozen 2026-09-26, PIRLS taking the Newton step
+    // and exiting at `PIRLS_TOL_REL_NONCANON`. Re-pinned 2026-09-26: the no-RE
+    // GLM fit that seeds this fit stops on R's relative deviance rule
+    // (`glm::DEVIANCE_TOL`), which moves the cold start. se_rx moves 1.1e-7
+    // relative at most (se_rx[2]); logLik rises by 3.8e-11 to
+    // −449.5149682645562. Re-pinned 2026-09-28: the joint search steps β in
+    // whitened coordinates (`glmm::workspace::BetaScale`), which moves where it stops
+    // inside `GLMM_RHO_END`. se_rx moves 2.6e-7 relative at most (se_rx[0]);
+    // logLik moves by −5.6e-11 to −449.5149682646123.
+    const REF_SE_RX_PIN: [f64; 3] = [
+        0.13079279332473975,
+        0.04409115704502719,
+        0.09107232438342171,
+    ];
     let f_rx = fit_cold(
         &x,
         &y,
@@ -2833,6 +3104,80 @@ fn fit_glmm_gamma_sim_matches_grid_reference() {
     );
     assert!(f_rx.converged(), "gamma GLMM (Rx) must converge");
     assert_pinned(&f_rx.se, &REF_SE_RX_PIN, 1e-7, "sim_gamma pinned se_rx");
+}
+
+/// The units of a predictor do not move a GLMM on the joint `[θ | β]` search.
+/// `x·s` is the same model with `β̂₁` divided by `s`, and `x + a` the same
+/// model with `β̂₀` moved by `−a·β̂₁`; τ̂² and the log-likelihood are
+/// unchanged. The search steps β in whitened coordinates
+/// (`glmm::workspace::BetaScale`), so its trust radius and its stopping rule
+/// mean the same in every unit of X. Gamma/log on `sim_gamma`: nAGQ 1 and 5
+/// both take the joint search (Gamma never takes `ExactProfile`).
+#[test]
+fn fit_glmm_gamma_column_units_do_not_move_the_fit() {
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    for nagq in [1u8, 5] {
+        // Column 1 of the design becomes `x·s + a`.
+        let fit_at = |s: f64, a: f64| {
+            let mut xs = x.clone();
+            for row in xs.chunks_exact_mut(p) {
+                row[1] = row[1] * s + a;
+            }
+            let opts = FitOptions {
+                target_indices: vec![0, 1, 2],
+                nagq,
+                ..FitOptions::default()
+            };
+            fit_cold(&xs, &y, n, p, &model, &ids, &opts)
+        };
+        let base = fit_at(1.0, 0.0);
+        assert!(base.converged(), "nagq={nagq}: unscaled fit must converge");
+        for (s, a) in [(1e-3, 0.0), (1e3, 0.0), (1e6, 0.0), (1.0, 1e3)] {
+            let f = fit_at(s, a);
+            assert!(f.converged(), "nagq={nagq} s={s:e} a={a}: must converge");
+            // Measured on x86_64: β moves by at most 3.5e-8 (β₀ at a = 1000),
+            // τ² by 2.3e-8 relative, the loglik by 2.7e-12: where the search
+            // stops inside `GLMM_RHO_END`.
+            let b = [f.beta[0] + a * f.beta[1], f.beta[1] * s, f.beta[2]];
+            for (j, (&bj, &b0)) in b.iter().zip(&base.beta).enumerate() {
+                assert!(
+                    (bj - b0).abs() < 2e-7,
+                    "nagq={nagq} s={s:e} a={a}: β[{j}] back in the unscaled units {bj} vs {b0}"
+                );
+            }
+            assert!(
+                (f.tau2[0] / base.tau2[0] - 1.0).abs() < 2e-7,
+                "nagq={nagq} s={s:e} a={a}: τ² {} vs unscaled {}",
+                f.tau2[0],
+                base.tau2[0]
+            );
+            assert!(
+                (f.loglik - base.loglik).abs() < 1e-9,
+                "nagq={nagq} s={s:e} a={a}: loglik {} vs unscaled {}",
+                f.loglik,
+                base.loglik
+            );
+        }
+    }
 }
 
 /// The `dispersion: Some(v)` directive on the GLMM route: the fit runs at the
@@ -3190,14 +3535,13 @@ fn fit_glmm_nb_sim_matches_glmmtmb() {
     // 8.8e-3 relative and θ̂ 8.5e-5. The new point meets the glmmTMB bands
     // (all 1e-3) at β 3.2e-6 absolute, se 2.9e-6 relative, cluster SD 3.7e-6
     // and θ̂ 4.9e-6.
-    const REF_BETA_PIN: [f64; 3] = [-0.00542556317435893, 0.5991738626203386, 0.6047083055233853];
-    const REF_SE_PIN: [f64; 3] = [
-        0.16385897795746307,
-        0.07293864100078178,
-        0.14289815989169855,
-    ];
-    const REF_TAU2_PIN: [f64; 1] = [0.3306632055798684];
-    const REF_THETA_PIN: f64 = 1.7834763601710588;
+    // Frozen 2026-09-26 with PIRLS taking the Newton step on the NB log link
+    // and exiting at `PIRLS_TOL_REL_NONCANON`; logLik sits 6.1e-10 above
+    // glmmTMB's.
+    const REF_BETA_PIN: [f64; 3] = [-0.005425229737856703, 0.5991738183649328, 0.604708249198719];
+    const REF_SE_PIN: [f64; 3] = [0.1638587151788523, 0.07293864894039388, 0.14289817493094034];
+    const REF_TAU2_PIN: [f64; 1] = [0.33066110478018695];
+    const REF_THETA_PIN: f64 = 1.7834744653358208;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb pinned tau2");
@@ -3521,10 +3865,9 @@ fn fit_glmm_nb_nested_unbalanced_matches_glmmtmb() {
     // endpoint was the less converged one on the flat ln θ_NB direction.
     // θ̂ moved 3.6e-5 relative, β[0] 2.3e-4, and β̂ sits closer to lme4's
     // (`REF_BETA`) than before. Fourth (2026-09-13): the structured-extras
-    // kernel carries an observed-information twin of its factor, so this
-    // shape's exact Laplace β-profile is available and the outer search is
-    // θ-only on that profile instead of the joint `[θ | β]` search — this
-    // fixture moves from `OuterSearch::Joint` to `OuterSearch::ExactProfile`.
+    // kernel's exact Laplace β-profile became available for this shape, so
+    // the outer search is θ-only on that profile instead of the joint
+    // `[θ | β]` search — this fixture moves from `OuterSearch::Joint` to `OuterSearch::ExactProfile`.
     // The deviance moved UP by 4.686e-3 (605.659188 → 605.663874, 110 → 53
     // evaluations, both converged), a smaller swing than the Third re-pin's
     // own 8.6e-3 move on this fixture's flat ln θ_NB direction. The relative
@@ -3545,10 +3888,27 @@ fn fit_glmm_nb_nested_unbalanced_matches_glmmtmb() {
     // `ln θ_NB` row, as for `sim_nb`. The new point meets the glmmTMB bands
     // (all 1e-3) at β 3.9e-6 absolute, se 3.5e-6 relative, the two SDs 2.7e-7
     // and 9.8e-6, and θ̂ 9.4e-6.
-    const REF_BETA_PIN: [f64; 2] = [0.6092435208733774, 0.5099937383261581];
-    const REF_SE_PIN: [f64; 2] = [0.20467127964816154, 0.0542772956412828];
-    const REF_TAU2_PIN: [f64; 2] = [0.3945100839007431, 0.12629785909449445];
-    const REF_THETA_PIN: f64 = 1.4291025393485826;
+    // Frozen 2026-09-26 with PIRLS taking the Newton step on the NB log link
+    // and exiting at `PIRLS_TOL_REL_NONCANON`, and with the no-RE GLM-NB cold
+    // start stopping on R's relative deviance rule (`glm::DEVIANCE_TOL`). The
+    // two together land 2.5e-12 below the Newton-step point alone on logLik
+    // (−976.7919162692931, round-off on the same objective from a moved cold
+    // start); θ̂ moved 1.1e-7 relative, τ̂² 6.0e-8, the SEs 3.3e-8, β 7.3e-9.
+    // Re-pinned 2026-09-27: the exact β-profile's border step carries
+    // log|A|'s curvature in β (`pirls::logdet_beta_curvature`), so every
+    // stage-1 PIRLS solve takes a different path to the same profile. logLik
+    // moved up by 7e-13 (−976.7919162692924); τ̂² moved 1.5e-6 and 2.6e-7
+    // relative, θ̂ 3.0e-7, the SEs 5.7e-7 and 7.9e-8, β 7.3e-8 — the outer
+    // search stopping at another point of this fixture's flat directions.
+    // Re-pinned 2026-09-28: the no-RE GLM-NB cold start seeds at ln ȳ, not
+    // ln(ȳ + 0.1), so the β̂ that seeds the GLMM moves at round-off. logLik
+    // moved up by 9.8e-12 (−976.7919162692826, 50 evaluations); τ̂² moved
+    // 1.2e-6 and 1.9e-7 relative, θ̂ 2.6e-7, the SEs 4.6e-7 and 6.9e-8, β
+    // 6.1e-8 — the same flat directions as the re-pin above.
+    const REF_BETA_PIN: [f64; 2] = [0.6092438768811675, 0.5099937808391549];
+    const REF_SE_PIN: [f64; 2] = [0.20467113062786807, 0.05427740469504234];
+    const REF_TAU2_PIN: [f64; 2] = [0.39450938995746554, 0.12629714276699427];
+    const REF_THETA_PIN: f64 = 1.4290923579008143;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb_nested pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb_nested pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb_nested pinned tau2");
@@ -4082,6 +4442,12 @@ fn fit_glmm_poisson_slope1_vector_agq_is_pinned() {
 /// The θ-step move is ~15x smaller than that cross-arch spread, so BAND is
 /// unchanged and still sized by `beta[2]`'s 3.60e-6 — both re-pins are
 /// bookkeeping, not a tolerance question.
+///
+/// **Every value re-pinned 2026-09-28** on the anchor: the joint search steps β
+/// in whitened coordinates (`glmm::workspace::BetaScale`), which moves where it
+/// stops inside `GLMM_RHO_END`. Largest move 6.8e-5 relative (k=7 `corr[2]`, a
+/// correlation of −0.031, so 2.1e-6 absolute); logLik −1.5e-10 (k=7) and
+/// +3e-12 (k=11).
 #[test]
 fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
     const BAND: f64 = 5e-5;
@@ -4095,17 +4461,21 @@ fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
         7,
         2,
         family,
-        &[0.3730517271148301, 0.538098978038483, -0.3654854470965549],
         &[
-            0.13111388966197157,
-            0.10465309428546639,
-            0.10556860947993794,
+            0.37305225736640635,
+            0.5380986060306936,
+            -0.36548551996845663,
         ],
-        &[1.0640265640371298, 0.6217295819798455, 0.6420938363939653],
         &[
-            0.21906654236295983,
-            0.13220156109374376,
-            -0.030986539519051545,
+            0.13111372934782572,
+            0.10465283205170359,
+            0.10556883703857627,
+        ],
+        &[1.0640253150082413, 0.6217277675727563, 0.6420932184139935],
+        &[
+            0.21906535582439046,
+            0.13220039394328156,
+            -0.03098444898089794,
         ],
         BAND,
     );
@@ -4115,17 +4485,13 @@ fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
         11,
         2,
         family,
-        &[0.3730629587832013, 0.5381087834502509, -0.3654883076141031],
+        &[0.3730621309644322, 0.5381094614248145, -0.3654897859420569],
+        &[0.13112090533814835, 0.1046566478846126, 0.105572460888112],
+        &[1.064097720832643, 0.6217680934114852, 0.642136792602007],
         &[
-            0.13112093692608306,
-            0.10465668422853727,
-            0.10557213027825517,
-        ],
-        &[1.0640974804776098, 0.6217673168423941, 0.6421365960857665],
-        &[
-            0.21910550941911974,
-            0.13222240391317389,
-            -0.03101919706448947,
+            0.21910468191206503,
+            0.1322221463873123,
+            -0.031020080603484254,
         ],
         BAND,
     );
@@ -4792,13 +5158,12 @@ fn loop_tier_honours_extra_grouping_slope() {
 // (β is recovered in closed form at each θ), so scaling a column that is also
 // a fixed effect leaves the θ-search's internal problem bit-identical between
 // the two fits. The GLMM solver optimizes the JOINT vector `[θ | β]` with one
-// shared BOBYQA trust radius and a `BETA_BOX` of ±30 on the raw (unrescaled)
-// β coordinates. Column-scaling shifts β's position inside that fixed box
-// differently in the two fits (β̂ᵪ ≈ β̂/C sits closer to 0 than β̂ does), so the
-// two fits' internal trust-region paths genuinely differ — they are two
-// separate optimizations of equivalent objectives, not one bit-identical
-// search read twice. A small `C` keeps both fits' β inside the same box
-// region; a loose band absorbs the resulting path difference.
+// shared BOBYQA trust radius on the raw (unrescaled) β coordinates.
+// Column-scaling changes β's step length against that shared radius
+// differently in the two fits (β̂ᵪ ≈ β̂/C), so the two fits' internal
+// trust-region paths genuinely differ — they are two separate optimizations of
+// equivalent objectives, not one bit-identical search read twice. A small `C`
+// keeps the two paths close; a loose band absorbs the resulting difference.
 // ---------------------------------------------------------------------------
 
 /// Parses `validation/data/simulated/sim_binomial_slope1.csv` into the q=2
@@ -5381,13 +5746,14 @@ fn sim_nb_inf_plateau_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
 }
 
 /// 30 NB counts in 6 clusters, all in `0..=4`, with an offset of 800 on one
-/// row (cluster 2). No fixed effect inside `BETA_BOX` and no random intercept
-/// can bring that row's linear predictor back from 800, so at every candidate θ
-/// the PIRLS step overflows `exp(η)` and the NB variance `μ + μ²/θ` on it, the
-/// trial deviance is non-finite, and the step halves until
-/// `PIRLS_MAX_HALVINGS` runs out: every evaluation of the outer search is
-/// `+∞`, a hard failure rather than an iteration-cap exhaustion. Measured: at
-/// an offset of 400 the same happens, at 200 the fit converges.
+/// row (cluster 2). No fixed-effect step PIRLS takes from its start and no
+/// random intercept can bring that row's linear predictor back from 800, so at
+/// every candidate θ every PIRLS trial puts that row's raw η past `family::ETA_MAX`
+/// (`family::eta_infeasible`), and the step halves until `PIRLS_MAX_HALVINGS`
+/// runs out: every evaluation of the outer search is `+∞`, a hard failure
+/// rather than an iteration-cap exhaustion. Measured: at offsets of 200, 400
+/// and 650 the fit converges, the row sitting in the NB tail
+/// (`family::in_tail`), where its deviance stays finite.
 fn nb_overflow_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<f64>) {
     let n = 30;
     let mut x = Vec::with_capacity(2 * n);
@@ -5417,8 +5783,9 @@ fn nb_intercept_model(n_clusters: u32) -> ModelSpec {
     }
 }
 
-/// A non-finite PIRLS trial is an overshoot and halves toward the last
-/// accepted iterate; it is never accepted. Before 2026-09-24 the retrospective
+/// A PIRLS trial the family pass refuses — a non-finite deviance, or here a
+/// raw η past the link's clamp bound — is an overshoot and halves toward the
+/// last accepted iterate; it is never accepted. Before 2026-09-24 the retrospective
 /// halving test compared a NaN deviance against the band, every comparison with
 /// NaN was false, the NaN iterate was accepted, and the solve then ran its
 /// whole `PIRLS_MAX_ITERS` on a poisoned state: on [`nb_overflow_dataset`] the
@@ -6029,27 +6396,22 @@ fn rung_table(r: &DenseLaplaceRung) -> (crate::formula::Table, Option<Vec<f64>>,
     (Table { columns, n }, weights, offset)
 }
 
-/// Rows the kernel's own clamps hold at the workspace's current point:
-/// `(μ at `family::clamp_mu`'s bound, η at the link's `clamp_eta` bound)`.
-///
-/// The μ count comes from `assembled::mu_clamped_rows`, which is what the
-/// assembled engine itself refuses on, so this census and that refusal cannot
-/// drift apart; `weighted` is what tells the two routes apart on the
-/// unweighted-logit exemption. The η count reads `family::clamp_eta_bounds`,
-/// the same table `clamp_eta` holds η inside, for the same reason. No corpus
-/// rung reaches an η clamp at γ̂, and one appearing is a regime change worth
-/// failing on.
+/// Rows at the workspace's current point that are tail rows
+/// (`family::in_tail`, whose deviance, score and weights come from η), and
+/// rows on the link's η clamp (`family::clamp_eta_bounds`, the table
+/// `clamp_eta` holds η inside): `(tail, η-clamped)`. No corpus rung reaches an
+/// η clamp at γ̂, and one appearing is a regime change worth failing on.
 #[cfg(feature = "formula")]
-fn clamp_census(ws: &GlmmWorkspace, family: Family, weighted: bool, n: usize) -> (usize, usize) {
+fn tail_census(ws: &GlmmWorkspace, family: Family, n: usize) -> (usize, usize) {
     let (lo_eta, hi_eta) = crate::family::clamp_eta_bounds(family);
-    let mu_clamped = crate::glmm::mu_clamped_rows(family, weighted, &ws.pirls.prob[..n]);
+    let mut tail = 0usize;
     let mut eta_clamped = 0usize;
     for i in 0..n {
-        if ws.pirls.eta[i] <= lo_eta || ws.pirls.eta[i] >= hi_eta {
-            eta_clamped += 1;
-        }
+        let (e, mu) = (ws.pirls.eta[i], ws.pirls.prob[i]);
+        tail += usize::from(crate::family::in_tail(family, e, mu));
+        eta_clamped += usize::from(e <= lo_eta || e >= hi_eta);
     }
-    (mu_clamped, eta_clamped)
+    (tail, eta_clamped)
 }
 
 /// One rung lowered, fitted to its own γ̂ with `WaldSe::Rx` (so the fit runs
@@ -6163,8 +6525,8 @@ struct RungReport {
     /// Each pass's exit `‖u − u_prev‖`.
     step_asm: f64,
     step_hd: f64,
-    /// Rows on the μ clamp at γ̂.
-    mu_clamped: usize,
+    /// Tail rows (`family::in_tail`) at γ̂.
+    tail_rows: usize,
 }
 
 /// Richardson-extrapolated central second difference of the f64 Laplace
@@ -6242,8 +6604,8 @@ fn richardson_fd_hessian(
 /// the same converged γ̂, on every dense Laplace GLMM rung of the validation
 /// corpus — the real datasets, lowered from the manifest's own formula through
 /// the crate's formula frontend, not a stand-in — plus [`CLOGLOG_LARGE`], the
-/// 9,600-row cloglog fixture whose mode state carries a μ-clamped row, run at
-/// the same bands as everything else.
+/// 9,600-row cloglog fixture whose mode state carries tail rows, run at the
+/// same bands as everything else.
 ///
 /// Two independent exact routes to the same matrix: one differentiates the
 /// objective twice through packed second-order lanes, the other differentiates
@@ -6255,11 +6617,9 @@ fn richardson_fd_hessian(
 /// asymmetry (`max|H_ij − H_ji|` relative, over columns built by different
 /// chunks — a consistency check the packed pass cannot offer, its triangle
 /// being symmetric by construction), and each pass's exit `‖u − u_prev‖`, which
-/// is the size of the iterate mix each one differentiates. `mu_clamped` is a
-/// reported count now, not a switch: every rung is compared the same way
-/// whether or not any row is pinned, since a pinned row reads its deviance
-/// slope, observed weight and `dw/dη` off closed forms instead of breaking
-/// the comparison.
+/// is the size of the iterate mix each one differentiates. `tail_rows` is a
+/// reported count, not a switch: a tail row's quantities are the η forms of
+/// one smooth deviance, so every rung is compared the same way.
 #[cfg(feature = "formula")]
 #[test]
 fn assembled_hessian_matches_hyperdual_per_entry() {
@@ -6278,7 +6638,7 @@ fn assembled_hessian_matches_hyperdual_per_entry() {
     {
         let (mut ws, x, y, ids, extra_ids, p, n, dev) = rung_at_gamma_hat(r);
         let m = ws.n_theta + p;
-        let (mu_clamped, eta_clamped) = clamp_census(&ws, r.family, ws.weighted, n);
+        let (tail_rows, eta_clamped) = tail_census(&ws, r.family, n);
         assert_eq!(
             eta_clamped, 0,
             "rung {}: a clamped η at γ̂ is a new regime, not a band",
@@ -6420,18 +6780,15 @@ fn assembled_hessian_matches_hyperdual_per_entry() {
         // Hessian is checked against something other than the hyper-dual
         // pass too. `FD_BAND` is the arbiter's own reproducibility between
         // those two base steps, not a statement about either engine: nothing
-        // tighter than the arbiter's own drift would be. Measured on this
-        // tree: reproducibility (base 4e-3 vs 8e-3) 2.08e-7 over all entries,
-        // 3.95e-8 on the diagonal; assembled vs the base-4e-3 estimate
-        // 3.20e-7 worst entry — `FD_BAND` sits above that measured worst and
-        // below twice it. Re-measured 2026-09-24 when `log|A|` moved to the
-        // exact curvature (`pirls::evaluate_at_mode`), which changes the
-        // objective's higher derivatives on cloglog: reproducibility 4.24e-7
-        // over all entries, 9.62e-8 on the diagonal; assembled vs the
-        // base-4e-3 estimate 4.12e-7, below the arbiter's own drift. Same rule,
-        // new measurement: 6e-7.
+        // tighter than the arbiter's own drift would be. It sits above the
+        // measured worst and below twice it, and is re-measured whenever γ̂
+        // moves. Measured at the γ̂ PIRLS reaches with the Newton step on
+        // cloglog (`pirls::observed_weights_in_place`): reproducibility (base
+        // 4e-3 vs 8e-3) 1.08e-6 over all entries, 1.95e-8 on the diagonal;
+        // assembled vs the base-4e-3 estimate 8.40e-7 worst entry, below the
+        // arbiter's own drift. Band: 1.5e-6.
         if std::ptr::eq(r, &CLOGLOG_LARGE) {
-            const FD_BAND: f64 = 6e-7;
+            const FD_BAND: f64 = 1.5e-6;
             let n_theta = ws.n_theta;
             ws.fd.pirls_tol_override = Some(1e-12);
             let gamma_hat: Vec<f64> = ws.params[..m].to_vec();
@@ -6501,7 +6858,7 @@ fn assembled_hessian_matches_hyperdual_per_entry() {
             asym,
             step_asm,
             step_hd,
-            mu_clamped,
+            tail_rows,
         });
     }
     assert_eq!(
@@ -6512,15 +6869,14 @@ fn assembled_hessian_matches_hyperdual_per_entry() {
     for r in &rows {
         println!(
             "rung {}: m {}, gradient {:e}, worst entry {:e}, asymmetry {:e}, \
-             exit |u-u_prev| assembled {:e} hyper-dual {:e}, clamped rows {}",
-            r.rung, r.m, r.worst_grad, r.worst, r.asym, r.step_asm, r.step_hd, r.mu_clamped
+             exit |u-u_prev| assembled {:e} hyper-dual {:e}, tail rows {}",
+            r.rung, r.m, r.worst_grad, r.worst, r.asym, r.step_asm, r.step_hd, r.tail_rows
         );
     }
 }
 
-/// A small unweighted Bernoulli-logit design whose raw sigmoid sits at (or
-/// past) `family::clamp_mu`'s upper bound on a few rows at γ̂, without any
-/// kernel ever calling `clamp_mu` there — one primary grouping, no extras, so
+/// A small unweighted Bernoulli-logit design whose sigmoid sits past
+/// `1 − PROB_EPS` on a few rows at γ̂ — one primary grouping, no extras, so
 /// the fit is dense (the blocked route), not packed. `y = 1` and a `+30`
 /// offset on three rows out of eighty forces `σ(η) ≥ 1 − PROB_EPS` there while
 /// leaving the rest of the design an ordinary random-intercept logit fit.
@@ -6547,7 +6903,9 @@ fn unweighted_logit_saturated_fixture() -> (
         x[i * p] = 1.0;
         x[i * p + 1] = x1;
         let eta = 0.3 + 0.5 * x1 + 0.2 * (g[i] as f64 - 3.5);
-        y[i] = if eta.exp() / (1.0 + eta.exp()) > 0.5 {
+        // A Bernoulli draw, not a threshold on η: thresholding separates the
+        // data, which has no finite optimum.
+        y[i] = if 0.5 * (lcg(&mut st) + 1.0) < eta.exp() / (1.0 + eta.exp()) {
             1.0
         } else {
             0.0
@@ -6577,17 +6935,15 @@ fn unweighted_logit_saturated_fixture() -> (
     (x, y, offset, n, p, model, ids)
 }
 
-/// The unweighted-logit exemption, end to end. On [`unweighted_logit_saturated_fixture`]
-/// the raw sigmoid sits at `family::clamp_mu`'s bound on a few rows while no
-/// kernel ever calls `clamp_mu` there — `family::pinned_mu_bounds` (what
-/// `assembled::mu_clamped_rows`, `pirls::clamped_row_present`, and the
-/// per-row pinned test in `assemble`/`packed_assemble` all read) must report
-/// those rows as ordinary, not pinned, so the assembled engine takes the fit
-/// and its Hessian/gradient agree with the hyper-dual pass at the per-entry
-/// gate's own bands — the one end-to-end check of that route.
+/// Unweighted logit with saturated rows, end to end. On
+/// [`unweighted_logit_saturated_fixture`] the sigmoid sits past `PROB_EPS` on
+/// a few rows at γ̂, so those rows are tail rows (`family::in_tail`) wherever
+/// a deviance is folded outside the fused kernel; the assembled engine takes
+/// the fit, and its gradient and Hessian agree with the hyper-dual pass at
+/// the per-entry gate's own bands — the one end-to-end check of that route.
 #[cfg(feature = "formula")]
 #[test]
-fn unweighted_logit_saturated_rows_are_not_pinned() {
+fn unweighted_logit_saturated_rows_assemble() {
     const GRAD_BAND: f64 = 1e-7;
     const BAND: f64 = 1e-10;
 
@@ -6606,20 +6962,8 @@ fn unweighted_logit_saturated_rows_are_not_pinned() {
     let family = Family::Binomial {
         link: BinomialLink::Logit,
     };
-    let (mu_lo, mu_hi) = crate::family::clamp_mu_bounds(family);
-    let raw_saturated = ws.pirls.prob[..n]
-        .iter()
-        .filter(|&&mu| mu <= mu_lo || mu >= mu_hi)
-        .count();
-    assert!(
-        raw_saturated > 0,
-        "fixture must reach the raw clamp_mu bound"
-    );
-    assert_eq!(
-        crate::glmm::mu_clamped_rows(family, false, &ws.pirls.prob[..n]),
-        0,
-        "unweighted logit's census must stay 0 despite the raw-bound rows"
-    );
+    let (tail, _eta) = tail_census(&ws, family, n);
+    assert!(tail > 0, "fixture must reach the tail");
 
     let m = ws.n_theta + p;
     let mut g_dual = vec![0.0; m];
@@ -6734,46 +7078,41 @@ fn rung_by_number(rung: u32) -> &'static DenseLaplaceRung {
         .unwrap_or_else(|| panic!("rung {rung} is in the corpus"))
 }
 
-/// One fixture of [`laplace_gradient_lanes_settle_on_a_clamped_mode_state`]:
-/// the point to drive, how many clamped rows its mode state is expected to
-/// carry, whether the dual kernel should still be reporting one-call
-/// exactness there, and the band the lanes must meet.
+/// One fixture of [`laplace_gradient_lanes_match_fd_in_one_call`]: the point
+/// to drive, how many tail rows its mode state is expected to carry, and the
+/// band the lanes must meet.
 #[cfg(feature = "formula")]
 struct LaneFixture {
     what: &'static str,
     rung: &'static DenseLaplaceRung,
-    mu_clamped: usize,
-    exact: bool,
+    tail_rows: usize,
     band: f64,
 }
 
 /// The dual Laplace gradient's lanes against a Richardson-extrapolated central
-/// difference of the very objective they claim to differentiate, on the one
-/// point whose mode state carries a clamped row and on three that do not.
+/// difference of the very objective they claim to differentiate, on one point
+/// whose mode state carries tail rows (`family::in_tail`) and on three that do
+/// not.
 ///
 /// **What can go wrong here.** The dual PIRLS kernels take the Hessian step
-/// (`pirls::DualStep`), so the lanes normally reach the implicit-function
-/// answer in one kernel call and the kernels say so through `DualStep::exact`;
-/// the caller then skips its refinement loop. On a row sitting on one of the
-/// kernel's clamps the step matrix is no longer the Jacobian of the map the
-/// iteration walks (`pirls::clamped_row_present` carries the derivation), the
-/// contraction is not zero, and lanes read after one call are part-converged —
-/// wrong in a way nothing downstream can see, because they are smooth,
-/// plausible, and only a few digits short.
+/// (`pirls::DualStep`), so the lanes reach the implicit-function answer in one
+/// kernel call and the kernels say so through `DualStep::exact`; the caller
+/// then skips its refinement loop. That claim holds only when the kernel's
+/// score is the exact η-slope of the deviance on every row, tail rows
+/// included. If a tail form's score or weight were not the derivative of its
+/// deviance, the lanes read after one call would be part-converged — smooth,
+/// plausible, and only a few digits short — with `exact` still reporting
+/// true.
 ///
-/// So both halves are asserted. On the clamped point the lanes must meet the
-/// band a settled kernel reaches, which is far tighter than a single call
-/// gets there. On the three clean points `exact` must still be true, so the
-/// refinement loop stays off where it costs and buys nothing.
-///
-/// The arbiter is the `f64` objective's own central difference, Richardson
-/// extrapolated from base `h` and `h/2`, with `ws.pirls.u` zeroed before every
-/// evaluation so each one is the same cold function of γ. It is an independent
-/// route to the gradient — no dual arithmetic, no adjoint — and its own
-/// resolution is what sets the bands, not taste.
+/// So both are asserted on every point: `exact` is true, and the lanes meet
+/// the band. The arbiter is the `f64` objective's own central difference,
+/// Richardson extrapolated from base `h` and `h/2`, with `ws.pirls.u` zeroed
+/// before every evaluation so each one is the same cold function of γ. It is
+/// an independent route to the gradient — no dual arithmetic, no adjoint —
+/// and its own resolution is what sets the bands, not taste.
 #[cfg(feature = "formula")]
 #[test]
-fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
+fn laplace_gradient_lanes_match_fd_in_one_call() {
     // Tight enough that the mode solve's last step is at round-off, so the
     // differentiated objective and the differenced one are the same function
     // rather than two nearby ones.
@@ -6787,8 +7126,7 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
     // 9,600-row ones, where the arbiter's own drift between base steps is up
     // to 6.4e-8 — nothing tighter than the arbiter's resolution is a
     // statement about the lanes. There the lanes land at 1.8e-9 to 5.5e-8 on
-    // rung 48 and, settled by the refinement loop, at 9.5e-9 to 1.3e-7 on the
-    // clamped cloglog fixture.
+    // rung 48 and at 4.8e-9 to 1.4e-7 on the cloglog fixture.
     const SMALL_BAND: f64 = 1e-8;
     const BIG_BAND: f64 = 2e-7;
 
@@ -6796,29 +7134,25 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
         LaneFixture {
             what: "rung 49 sim_cloglog_nested_crossed",
             rung: rung_by_number(49),
-            mu_clamped: 0,
-            exact: true,
+            tail_rows: 0,
             band: SMALL_BAND,
         },
         LaneFixture {
             what: "cloglog 9,600-row fixture",
             rung: &CLOGLOG_LARGE,
-            mu_clamped: 3,
-            exact: false,
+            tail_rows: 3,
             band: BIG_BAND,
         },
         LaneFixture {
             what: "rung 22 cbpp_probit",
             rung: rung_by_number(22),
-            mu_clamped: 0,
-            exact: true,
+            tail_rows: 0,
             band: SMALL_BAND,
         },
         LaneFixture {
             what: "rung 48 sim_probit_large",
             rung: rung_by_number(48),
-            mu_clamped: 0,
-            exact: true,
+            tail_rows: 0,
             band: BIG_BAND,
         },
     ];
@@ -6827,11 +7161,11 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
         let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(f.rung);
         let m = ws.n_theta + p;
         let n_theta = ws.n_theta;
-        let (mu_clamped, eta_clamped) = clamp_census(&ws, f.rung.family, ws.weighted, n);
+        let (tail_rows, eta_clamped) = tail_census(&ws, f.rung.family, n);
         assert_eq!(
-            (mu_clamped, eta_clamped),
-            (f.mu_clamped, 0),
-            "{}: the clamp census at γ̂ moved — this fixture is here for its clamp state",
+            (tail_rows, eta_clamped),
+            (f.tail_rows, 0),
+            "{}: the tail census at γ̂ moved — this fixture is here for its tail state",
             f.what
         );
 
@@ -6852,13 +7186,12 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
             "{}: the dual gradient declined",
             f.what
         );
-        assert_eq!(
+        assert!(
             ws.dual_scratch
                 .as_deref()
                 .expect("the dual gradient sizes the dual scratch")
                 .exit_exact(),
-            f.exact,
-            "{}: one-call exactness is not what this mode state supports",
+            "{}: the kernel must report one-call exactness here",
             f.what
         );
 
@@ -6887,9 +7220,9 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
             worst = worst.max(gaps[k]);
         }
         println!(
-            "{}: m {}, clamped rows (μ {mu_clamped}), exact {}, \
+            "{}: m {}, tail rows {tail_rows}, \
              per-coordinate |lane − FD| {:?}, worst {:e}",
-            f.what, m, f.exact, gaps, worst
+            f.what, m, gaps, worst
         );
         for k in 0..m {
             assert!(
@@ -6904,12 +7237,12 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
     }
 }
 
-/// The dense assembled path on a clamped mode state, end to end: on a rung
-/// whose mode state carries a clamped row the assembled engine takes the
-/// fit, and `joint_hessian_cov` ships its covariance for it.
+/// The dense assembled path on a mode state with tail rows (`family::in_tail`),
+/// end to end: the assembled engine takes the fit, and `joint_hessian_cov`
+/// ships its covariance for it.
 ///
 /// `CLOGLOG_LARGE`, the cloglog fixture on the 9,600-row `sim_probit_large`
-/// dataset, is that rung — three μ-clamped rows — and the corpus gate above
+/// dataset, is that rung — three tail rows — and the corpus gate above
 /// already holds the per-entry agreement with the hyper-dual pass. What is
 /// unexercised without this test is the RESULT through the production entry
 /// point: that `joint_hessian_cov` reports `FdHessianStatus::Ok`, and that
@@ -6927,17 +7260,17 @@ fn laplace_gradient_lanes_settle_on_a_clamped_mode_state() {
 /// cannot say this call in particular is what advanced it.
 #[cfg(feature = "formula")]
 #[test]
-fn clamped_dense_rung_ships_the_assembled_covariance() {
+fn tail_dense_rung_ships_the_assembled_covariance() {
     use faer::linalg::solvers::Solve;
 
     let r = &CLOGLOG_LARGE;
     let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
     let n_theta = ws.n_theta;
     let m = n_theta + p;
-    let (mu_clamped, _eta) = clamp_census(&ws, r.family, ws.weighted, n);
+    let (tail_rows, _eta) = tail_census(&ws, r.family, n);
     assert!(
-        mu_clamped > 0,
-        "rung {}: this fixture is here for its clamped mode state (μ {mu_clamped})",
+        tail_rows > 0,
+        "rung {}: this fixture is here for its tail rows ({tail_rows})",
         r.rung
     );
 
@@ -6956,7 +7289,7 @@ fn clamped_dense_rung_ships_the_assembled_covariance() {
     );
     assert!(
         matches!(st, crate::glmm::DerivStatus::Ok(_)),
-        "rung {}: the assembled engine must take a clamped mode state now",
+        "rung {}: the assembled engine must take a mode state with tail rows",
         r.rung
     );
 
@@ -7564,7 +7897,7 @@ fn packed_assembled_gradient_matches_richardson_fd() {
 ///
 /// ```text
 ///   mode tol \ h_rel      1e-2      1e-3      1e-4      1e-5
-///   pirls_tol_fd (1e-8)  5.35e-2   2.59e-1   8.21e-1   2.73e0
+///   1e-8                 5.35e-2   2.59e-1   8.21e-1   2.73e0
 ///   1e-12                3.35e-6   1.49e-4   9.97e-4   3.02e-3
 ///   1e-14                3.32e-6   4.03e-8   5.06e-5   5.39e-5
 /// ```
@@ -8052,33 +8385,32 @@ fn assembled_hessian_covers_an_m_above_the_dual_lane_cap() {
     );
 }
 
-/// Family of [`packed_clamped_fixture`], named once so the fixture, its γ̂
+/// Family of [`packed_tail_fixture`], named once so the fixture, its γ̂
 /// driver and the fit that reads its diagnostics cannot drift apart.
 #[cfg(feature = "formula")]
-const PACKED_CLAMPED_FAMILY: Family = Family::Poisson {
-    link: PoissonLink::Log,
+const PACKED_TAIL_FAMILY: Family = Family::Binomial {
+    link: BinomialLink::Cloglog,
 };
 
-/// A packed-row design whose converged mode state carries a μ-clamped row:
-/// `(x, y, offset, n, p, model, ids)`. No corpus rung is in that state on
-/// this layout, so the refusal path needs a constructed cell.
+/// A packed-row design whose converged mode state carries a tail row
+/// (`family::in_tail`): `(x, y, offset, n, p, model, ids)`. No corpus rung is
+/// in that state on this layout, so it needs a constructed cell.
 ///
 /// Packed by construction: a random slope on an EXTRA grouping is a shape
 /// `classify_design` answers `Solver::Sparse` for, so `GlmmLayout::for_design`
-/// takes the packed-row layout whatever the row count. The draw is the
-/// extra-grouping-slope Poisson design `loop_tier_honours_extra_grouping_slope`
-/// fits.
+/// takes the packed-row layout whatever the row count. The design is the
+/// extra-grouping-slope shape `loop_tier_honours_extra_grouping_slope` fits,
+/// with a Bernoulli cloglog response drawn from it.
 ///
-/// The clamp comes from a large negative offset on row 0 and nothing else — no
-/// edited response, no outlying covariate. On the log link μ = exp(η), so an
-/// offset of −30 against an η of order 1 leaves exp(η) ≈ 1e-13, under
-/// `family::MU_FLOOR` (1e-10), and μ is held at that bound — which is what
-/// makes the census read one μ-clamped row. That row's own deviance
-/// contribution is `2(μ − y·…) ≈ 2e-10` at `y = 0`, so it moves the census
+/// The tail row comes from a large negative offset on row 0 and nothing else —
+/// no edited covariate. On cloglog μ ≈ e^η for small μ, so an offset of −30
+/// against an η of order 1 puts μ near 1e-13, past `family::PROB_EPS`
+/// (1e-12), which is what makes the census read one tail row. At `y = 0` that
+/// row's deviance contribution is `2e^η ≈ 2e-13`, so it moves the census
 /// without moving the optimum.
 #[cfg(feature = "formula")]
 #[allow(clippy::type_complexity)]
-fn packed_clamped_fixture() -> (
+fn packed_tail_fixture() -> (
     Vec<f64>,
     Vec<f64>,
     Vec<f64>,
@@ -8087,7 +8419,7 @@ fn packed_clamped_fixture() -> (
     ModelSpec,
     GroupIds,
 ) {
-    let (n_g1, n_g2, per) = (8usize, 6usize, 10usize);
+    let (n_g1, n_g2, per) = (8usize, 6usize, 20usize);
     let n = n_g1 * per;
     let p = 2;
     let mut st = 7u64;
@@ -8099,14 +8431,21 @@ fn packed_clamped_fixture() -> (
         let x1 = lcg(&mut st);
         x[i * p] = 1.0;
         x[i * p + 1] = x1;
-        let eta = 0.5 + 0.4 * x1 + 0.25 * (g1[i] as f64 - 4.0) + 0.6 * x1 * (g2[i] as f64 - 3.0);
-        y[i] = eta.exp().round();
+        let eta = -0.3 + 0.4 * x1 + 0.2 * (g1[i] as f64 - 4.0) + 0.4 * x1 * (g2[i] as f64 - 3.0);
+        // A Bernoulli draw, not a threshold on η: thresholding separates the
+        // data, which has no finite optimum.
+        let mu = 1.0 - (-eta.exp()).exp();
+        y[i] = if 0.5 * (lcg(&mut st) + 1.0) < mu {
+            1.0
+        } else {
+            0.0
+        };
     }
     let mut offset = vec![0.0f64; n];
     offset[0] = -30.0;
     y[0] = 0.0;
     let model = ModelSpec {
-        family: PACKED_CLAMPED_FAMILY,
+        family: PACKED_TAIL_FAMILY,
         re: Some(ReStructure {
             sizing: Sizing::FixedClusters {
                 n_clusters: n_g1 as u32,
@@ -8179,10 +8518,9 @@ fn ws_at_gamma_hat(
     (ws, x_mat, sized_ids.primary, sized_ids.extra)
 }
 
-/// The packed assembled path on a clamped mode state, end to end: on a
-/// packed-row fit whose mode state carries a μ-clamped row the assembled
-/// engine takes the fit, and `joint_hessian_cov` ships its
-/// covariance for it.
+/// The packed assembled path on a mode state with a tail row
+/// (`family::in_tail`), end to end: the assembled engine takes the fit, and
+/// `joint_hessian_cov` ships its covariance for it.
 ///
 /// The reference side drives `joint_hessian` directly at the same γ̂ and
 /// inverts its matrix the way `joint_hessian_cov` inverts it — `cov = 2·H⁻¹`
@@ -8198,10 +8536,10 @@ fn ws_at_gamma_hat(
 /// cannot say this call in particular is what advanced it.
 #[cfg(feature = "formula")]
 #[test]
-fn clamped_packed_fit_ships_the_assembled_covariance() {
+fn tail_packed_fit_ships_the_assembled_covariance() {
     use faer::linalg::solvers::Solve;
 
-    let (xf, y, offset, n, p, model, ids) = packed_clamped_fixture();
+    let (xf, y, offset, n, p, model, ids) = packed_tail_fixture();
     let (mut ws, x, ids_p, extra_ids) = ws_at_gamma_hat(
         &xf,
         &y,
@@ -8210,7 +8548,7 @@ fn clamped_packed_fit_ships_the_assembled_covariance() {
         p,
         &model,
         &ids,
-        "the packed clamped fixture",
+        "the packed tail fixture",
     );
     let ids = ids_p;
     assert_eq!(
@@ -8220,14 +8558,14 @@ fn clamped_packed_fit_ships_the_assembled_covariance() {
     );
     let n_theta = ws.n_theta;
     let m = n_theta + p;
-    let (mu_clamped, eta_clamped) = clamp_census(&ws, PACKED_CLAMPED_FAMILY, ws.weighted, n);
+    let (tail_rows, eta_clamped) = tail_census(&ws, PACKED_TAIL_FAMILY, n);
     println!(
-        "packed clamped fixture: n {n}, m {m}, k {}, census (μ {mu_clamped}, η {eta_clamped})",
+        "packed tail fixture: n {n}, m {m}, k {}, census (tail {tail_rows}, η {eta_clamped})",
         ws.k
     );
     assert!(
-        mu_clamped > 0,
-        "this fixture is here for its clamped mode state (μ {mu_clamped})"
+        tail_rows > 0,
+        "this fixture is here for its tail row ({tail_rows})"
     );
     assert!(
         crate::glmm::assembly_routes(&ws, n),
@@ -8249,7 +8587,7 @@ fn clamped_packed_fit_ships_the_assembled_covariance() {
     );
     assert!(
         matches!(st, crate::glmm::DerivStatus::Ok(_)),
-        "the packed assembled engine must take a clamped mode state now"
+        "the packed assembled engine must take a mode state with a tail row"
     );
 
     // The assembled arm on its own, symmetrized, at the same γ̂ — the
@@ -8351,13 +8689,11 @@ fn clamped_packed_fit_ships_the_assembled_covariance() {
     }
     ws.params[..m].copy_from_slice(&saved);
     ws.fd.pirls_tol_override = None;
-    println!(
-        "packed clamped fixture gradient: worst relative gap vs Richardson FD {worst_grad_fd:e}"
-    );
+    println!("packed tail fixture gradient: worst relative gap vs Richardson FD {worst_grad_fd:e}");
 
     // The same fixture through the shipped dispatch — a converged fit with
     // every target SE finite.
-    let (_, _, offset, _, _, _, ids) = packed_clamped_fixture();
+    let (_, _, offset, _, _, _, ids) = packed_tail_fixture();
     let opts = FitOptions {
         target_indices: vec![0, 1],
         wald_se: WaldSe::Hessian,
@@ -8365,7 +8701,7 @@ fn clamped_packed_fit_ships_the_assembled_covariance() {
         ..FitOptions::default()
     };
     let f = fit_cold(&xf, &y, n, p, &model, &ids, &opts);
-    assert!(f.converged(), "the packed clamped fit must converge");
+    assert!(f.converged(), "the packed tail fit must converge");
     assert!(
         f.se.iter().all(|v| v.is_finite()),
         "every target SE is finite: {:?}",
@@ -8379,7 +8715,10 @@ fn clamped_packed_fit_ships_the_assembled_covariance() {
         ..opts
     };
     let fc = fit_cold(&xf, &y, n, p, &model, &ids, &clean);
-    assert!(fc.converged(), "the unclamped control fit must converge");
+    assert!(
+        fc.converged(),
+        "the control fit without the offset must converge"
+    );
 }
 
 /// Gamma-inverse design that drives `joint_hessian_cov` off its main path: 12
@@ -9229,5 +9568,255 @@ fn nb_hessian_se_matches_fd_of_the_full_objective() {
             (theta_se0 - fd_theta).abs() <= 1e-3 * fd_theta,
             "nagq={nagq}: θ SE = {theta_se0} vs FD of the full objective {fd_theta}"
         );
+    }
+}
+
+/// GLMM twin of `lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular`:
+/// the identical gate at `src/fit/glmm.rs` (`fit.diagnostics.singular =
+/// fit.diagnostics.singular || (converged &&
+/// fit.has_negligible_component(...))`) needs its own fixture, since PIRLS
+/// nesting and the Laplace/exact-profile route make the GLMM search behave
+/// differently from the LMM one.
+///
+/// Two SEPARATE crossed groupings, each intercept-only (`(1 | g) + (1 | h)`
+/// in formula terms) — two independent scalar variance components, no
+/// correlation coordinate between them. A single q=2 block (intercept +
+/// slope on one grouping, the LMM fixture's shape) does not work here: probed
+/// with the slope's true effect tiny but nonzero, tied to the same per-cluster
+/// draw as the intercept's and then drawn independently, at every scale from
+/// 60 to 15000 rows the search resolved the weak slope signal by pinning the
+/// CORRELATION near ±1 (a live off-diagonal, boundary_hit fires) rather than
+/// reporting a small independent variance — so on that shape `singular`
+/// always came from the pin, never from the ratio check, whatever the budget.
+/// Splitting the two components into separate groupings removes the
+/// correlation coordinate entirely: nothing to pin them together, so a weak
+/// second-grouping signal is free to land as a genuinely small variance.
+///
+/// Binomial logit, 30×30 crossed grouping, 5 reps/cell (4500 rows). The
+/// primary grouping's true effect is sizeable; the extra grouping's is small
+/// (scaled 0.002 against the primary's 0.9, both from the SAME `lcg` stream
+/// but statistically independent draws — no shared per-row term ties them).
+/// The unlimited-budget optimum (found while writing this test, not asserted
+/// below): `varcorr = [[0.31568505136015795], [0.0]]`, `singular = true` —
+/// the extra grouping's variance is pinned to exactly 0 there. 13 evals short
+/// of that endpoint (`extra = 13` below) BOBYQA has already reached
+/// `varcorr = [[0.31567964584120646], [4.926675807359726e-8]]` — not yet
+/// pinned (`4.93e-8 > 0`, an interior point) but already negligible by the
+/// ratio check (stddev ratio ≈ 3.95e-4, under `SINGULAR_REL_TOL`), and one
+/// eval short of `Converged`.
+#[test]
+fn glmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
+    use bobyqa::{Bobyqa, Config};
+
+    let n_prim = 30usize;
+    let n_extra = 30usize;
+    let reps = 5usize;
+    let n = n_prim * n_extra * reps;
+    let p = 2usize;
+    let mut st = 11u64;
+    let prim_eff: Vec<f64> = (0..n_prim).map(|_| 0.9 * lcg(&mut st)).collect();
+    let extra_eff: Vec<f64> = (0..n_extra).map(|_| 0.002 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut cl = vec![0u32; n];
+    let mut cr = vec![0u32; n];
+    let mut i = 0;
+    for (pi, &pe) in prim_eff.iter().enumerate() {
+        for (ei, &ee) in extra_eff.iter().enumerate() {
+            for _ in 0..reps {
+                let cov = lcg(&mut st);
+                let eta = 0.2 + 0.5 * cov + pe + ee;
+                let prob = 1.0 / (1.0 + (-eta).exp());
+                let draw = (lcg(&mut st) + 1.0) / 2.0;
+                x[i * p] = 1.0;
+                x[i * p + 1] = cov;
+                cl[i] = pi as u32;
+                cr[i] = ei as u32;
+                y[i] = if draw < prob { 1.0 } else { 0.0 };
+                i += 1;
+            }
+        }
+    }
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_prim as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed {
+                    n_clusters: n_extra as u32,
+                },
+                slopes: vec![],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cl,
+        extra: vec![cr],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (sized_model, sized_ids, _perm) = super::spec_sized_from_ids(&model, &ids);
+    let (mut ws, x_mat) = super::glmm::fit_glmm_build(
+        &x,
+        n,
+        p,
+        &sized_model,
+        &sized_ids.primary,
+        &sized_ids.extra,
+        &opts,
+    )
+    .unwrap_or_else(|_| panic!("degenerate design"));
+    assert_eq!(
+        ws.outer_search,
+        OuterSearch::ExactProfile,
+        "this fixture's convergence status must come from solver_stage1 alone"
+    );
+    let n_stage1 = ws.n_theta; // binomial: no dispersion coordinate
+    let npt = 2 * n_stage1 + 1; // PRIMA's minimum npt (n_stage1 == 2 here)
+    let config = {
+        let mut c = Config::new(n_stage1);
+        c.npt = npt;
+        // 13 evals short of the unlimited-budget optimum — chosen by probing
+        // (see the doc comment above): the reported point already carries a
+        // negligible extra-grouping-to-primary stddev ratio.
+        c.max_fun = npt + 1 + 13;
+        c
+    };
+    ws.solver_stage1 = Bobyqa::new(n_stage1, config).expect("legal minimal config");
+    // The `PqlThenJoint` fallback (`Note::ExactProfileFallback`) reruns any
+    // not-converged `ExactProfile` attempt — including a capped one — once on
+    // `PqlThenJoint`, whose joint stage 2 runs on `ws.solver` with its own,
+    // otherwise uncapped, budget. Left alone that rerun would converge for
+    // real and defeat this fixture's whole point, so it gets the same
+    // eval-starved cap as stage 1.
+    let n_joint = n_stage1 + p;
+    let npt_joint = 2 * n_joint + 1;
+    let joint_config = {
+        let mut c = Config::new(n_joint);
+        c.npt = npt_joint;
+        c.max_fun = npt_joint + 1;
+        c
+    };
+    ws.solver = Bobyqa::new(n_joint, joint_config).expect("legal minimal config");
+
+    let view = super::glmm::run_glmm_on(
+        &mut ws,
+        x_mat.as_ref(),
+        &y,
+        n,
+        p,
+        &sized_model,
+        &sized_ids.primary,
+        &sized_ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+    );
+    let fit = super::glmm::glmm_view_to_fit(&view, &y, n, p, &sized_model, &opts).0;
+
+    assert!(!fit.converged(), "a capped fit must not report converged");
+    assert!(
+        !fit.varcorr.is_empty() && fit.varcorr.iter().flatten().all(|v| v.is_finite()),
+        "plateau policy: capped endpoint must report varcorr, got {:?}",
+        fit.varcorr
+    );
+    let sd_prim = fit.varcorr[0][0].sqrt();
+    let sd_extra = fit.varcorr[1][0].sqrt();
+    let ratio = sd_extra / sd_prim;
+    assert!(
+        ratio <= 1e-3,
+        "fixture must be genuinely negligible by SINGULAR_REL_TOL, ratio {ratio}"
+    );
+    assert!(
+        !fit.singular(),
+        "a capped endpoint reports singular = false, even though its varcorr \
+         ratio ({ratio}) is negligible — has_negligible_component must stay \
+         gated on `converged`"
+    );
+}
+
+/// The fixed-β Laplace objective keeps rising as the intercept runs into a
+/// tail, on every family whose μ carries a bound or a tail: no stretch where
+/// it goes flat. Four clusters, θ = 1, β₁ = 0; a fit's whole η column moves
+/// with β₀, so past `ln MU_FLOOR ≈ −23` (log links) or `PROB_EPS` (binomial)
+/// every row is a tail row (`family::in_tail`). A constant objective there
+/// would let PIRLS stop at a point that is not a mode and report converged.
+/// Logit is here as the control that never had a μ bound on its fused route.
+#[test]
+fn fixed_beta_objective_rises_into_the_tail() {
+    let (n, p, s) = (40usize, 2usize, 4usize);
+    let mut x = vec![0.0f64; n * p];
+    let mut st = 7u64;
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = lcg(&mut st);
+    }
+    let xm = Mat::<f64>::from_fn(n, p, |i, j| x[i * p + j]);
+    let ids: Vec<u32> = (0..n).map(|i| (i % s) as u32).collect();
+    let fams = [
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+    ];
+    for fam in fams {
+        let y: Vec<f64> = (0..n)
+            .map(|i| match fam {
+                Family::Binomial { .. } => (i % 2) as f64,
+                Family::Gamma { .. } => 0.5 + (i % 5) as f64,
+                _ => 1.0 + (i % 5) as f64,
+            })
+            .collect();
+        let model = ModelSpec {
+            family: fam,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: s as u32,
+                },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+        ws.nb_theta = 1.0;
+        let mut at = |b0: f64| {
+            glmm_laplace_deviance(&[1.0, b0, 0.0], &mut ws, xm.as_ref(), &y, &ids, &[], n)
+        };
+        let mut sides: Vec<&[f64]> = vec![&[-10.0, -30.0, -60.0, -100.0]];
+        if matches!(fam, Family::Binomial { .. }) {
+            sides.push(&[10.0, 30.0, 60.0, 100.0]);
+        } else {
+            sides.push(&[10.0, 30.0, 100.0]);
+        }
+        for side in sides {
+            let d: Vec<f64> = side.iter().map(|&b0| at(b0)).collect();
+            for k in 1..d.len() {
+                assert!(
+                    d[k].is_finite() && d[k] > d[k - 1] * (1.0 + 1e-6),
+                    "{fam:?}: objective {d:?} at β₀ {side:?} does not keep rising"
+                );
+            }
+        }
     }
 }

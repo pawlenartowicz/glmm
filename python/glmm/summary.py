@@ -108,6 +108,25 @@ def method_line(fit):
     return "Generalized linear mixed model fit by maximum likelihood (Laplace Approximation) [glmm]"
 
 
+def _unused_level_counts(notes):
+    """Grouping name -> count of declared levels with no rows, read off the
+    kernel's `unused_grouping_levels` notes.
+
+    Mirrors the detail-string split in `glmm.__init__._note_warning`:
+    `"<group>: <level>, <level>"`, partitioned on the first ": " only, since a
+    level label may itself contain one. The level list is then split on ", " —
+    the same separator `orchestrate::note_infos` joins it with (Rust
+    `src/orchestrate.rs`), so a level label containing ", " would overcount;
+    no such label exists in any fixture this port ships with."""
+    counts = {}
+    for note in notes:
+        if note["kind"] != "unused_grouping_levels":
+            continue
+        group, _, levels = note["detail"].partition(": ")
+        counts[group] = len(levels.split(", "))
+    return counts
+
+
 def pearson_residuals(fit):
     mu = np.asarray(fit.fitted, dtype=float)
     y = np.asarray(fit.y, dtype=float)
@@ -192,7 +211,16 @@ def build_summary(fit):
 
     groups = []
     if len(fit.ranef_levels) == len(fit.re_groups):
-        groups = [(name, int(n)) for (name, _), n in zip(fit.re_groups, fit.ranef_levels)]
+        # `ranef_levels` is the kernel's slot count, which still includes a
+        # declared level with no rows (a block is sized by the highest
+        # observed code, so a gap level between two used ones still occupies
+        # a slot). lme4 counts groups after `droplevels()`, so those slots
+        # are subtracted back out here.
+        unused = _unused_level_counts(fit.diagnostics["notes"])
+        groups = [
+            (name, int(n) - unused.get(name, 0))
+            for (name, _), n in zip(fit.re_groups, fit.ranef_levels)
+        ]
 
     corr_fixed = None
     if len(beta) >= 2:

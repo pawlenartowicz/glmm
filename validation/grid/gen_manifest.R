@@ -333,6 +333,32 @@ FIXTURE_NO_TRUTH <- list(
   path_near_zero = "tools/prep/gen_weights_data.R draws the near-zero-weight block from a different slope (y = 5.0 - 2.0*x) than the rest, so the fixture has no single parameter vector"
 )
 
+# Cells whose data admit NO maximum-likelihood estimate, with the reason. On
+# these the only correct result is a refusal, so the cell carries `no_mle` and
+# compare.R gates the other way round: glmm's refusal passes, and a converged
+# glmm fit FAILS. Membership is a property of the data, proven when the entry is
+# added, never a way to excuse a fit glmm got wrong; a cell that has an optimum
+# does not belong here however badly an engine does on it.
+NO_MLE <- list(
+  # max x over y = 0 is -0.0177 and min x over y = 1 is 0.0033, so the
+  # Bernoulli deviance is positive at every finite beta and tends to 0 along
+  # beta = c * (-m, 1), m in the gap, as c -> infinity. Albert, A. & Anderson,
+  # J. A. (1984), On the existence of maximum likelihood estimates in logistic
+  # regression models, Biometrika 71, 1-10.
+  sim_scale_sep_glm = "complete separation (y = 1[x > 0]): the deviance has no minimum at any finite beta, so the only correct result is a refusal"
+)
+
+# Cells whose reference engines cannot gate gate 1's deviance because their OWN
+# round-off on this data is larger than dev_eps, with the reason. compare.R
+# reads validation/grid/dev_ref.json for these instead of the oracle records --
+# a frozen high-precision value, not a registry escape: gate 1 keeps the normal
+# dev_eps and the normal sign rule, just against a different reference.
+# Membership is a property of the data (proven when the entry is added), never
+# a way to excuse a fit glmm got wrong.
+DEV_REF <- list(
+  sim_entangled_pair_lmm = "t and v are entangled to 3e-6 (tools/prep/gen_illcond_data.R), so lme4, glmmTMB and glmm each converge to a slightly different theta and their own reported REML criterion carries round-off of 1e-4 to 7e-4 against the true optimum -- above dev_eps even though all three theta agree with each other to 1e-10 on the true objective"
+)
+
 FIXTURE_SKIPPED <- list(
   # data/simulated/ or data/empirical/ CSV stems that become no cell at all,
   # with the reason. The self-checks below assert this list plus the cells
@@ -458,7 +484,7 @@ FIELD_ORDER <- c("cell", "family", "link", "form", "structure", "n_theta",
                  "factors", "n_x", "response", "r_formula", "jl_formula",
                  "glmm_formula", "ma_fixed", "ma_random", "weights",
                  "weights_col", "offset_col", "nagq", "reml", "oracles",
-                 "tags", "truth", "truth_why")
+                 "tags", "truth", "truth_why", "no_mle", "dev_ref")
 
 cells <- list()
 emit_cell <- function(c0) {
@@ -648,6 +674,8 @@ add_readin <- function(entry, subdir, name = entry[["name"]]) {
   } else {
     c0$truth_why <- FIXTURE_NO_TRUTH[[name]]
   }
+  if (!is.null(NO_MLE[[name]])) c0$no_mle <- NO_MLE[[name]]
+  if (!is.null(DEV_REF[[name]])) c0$dev_ref <- DEV_REF[[name]]
   emit_cell(c0)
 }
 
@@ -894,6 +922,16 @@ stopifnot("a fixture cell is in neither FIXTURE_TRUTH nor FIXTURE_NO_TRUTH" = al
 stopifnot("a fixture cell is in BOTH truth lists" = !any(in_truth & in_none))
 stopifnot("FIXTURE_TRUTH/FIXTURE_NO_TRUTH name a cell that does not exist" =
   all(c(names(FIXTURE_TRUTH), names(FIXTURE_NO_TRUTH)) %in% ids))
+# A cell with no MLE has no parameter vector to be the truth of, and NO_MLE is
+# only ever applied to read-in fixtures, so a stray name would vanish silently.
+stopifnot("NO_MLE names a cell that is not a no-truth fixture" =
+  all(names(NO_MLE) %in% intersect(fx_ids, names(FIXTURE_NO_TRUTH))))
+# Same shape of check for DEV_REF: a cell with a frozen deviance reference is
+# by construction a no-truth fixture too -- its data property is what breaks
+# the oracle deviances, not what the fixture is FOR -- so a stray name here
+# would otherwise vanish silently the same way.
+stopifnot("DEV_REF names a cell that is not a no-truth fixture" =
+  all(names(DEV_REF) %in% intersect(fx_ids, names(FIXTURE_NO_TRUTH))))
 for (sub in c("simulated", "empirical")) {
   stems <- sub("\\.csv$", "", list.files(file.path(here, "..", "data", sub), pattern = "\\.csv$"))
   used  <- unique(sub("\\.csv$", "", basename(vapply(cells, `[[`, "", "data"))))

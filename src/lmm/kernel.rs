@@ -5,6 +5,161 @@ use crate::dual::{Dual, HyperDual};
 use crate::glmm::{unpack_hessian, DerivStatus};
 
 // ---------------------------------------------------------------------------
+// DesignQr — the triangular factor both LMM kernels orthogonalize X by.
+// ---------------------------------------------------------------------------
+
+/// Unit upper-triangular `U` (`p×p`) from a QR factorisation `√W·X = Q·R`:
+/// `U = D⁻¹R` with `D = diag(R)`. Both LMM kernels accumulate their Grams on
+/// `X̃ = X·U⁻¹` instead of `X`; `X̃`'s columns are orthogonal in the `W` metric.
+///
+/// Why: the kernels work from Gram matrices (`X'X`, `Z'X`), and a Gram squares
+/// the condition number of `X`. On a nearly collinear `X` that loses about half
+/// the digits of `log|X'V⁻¹X|` and of β̂. `X̃'WX̃` is diagonal, so its Cholesky
+/// is as accurate as a diagonal scaling allows (van der Sluis), and `X`'s
+/// conditioning enters only through `R`, which a QR computes to working
+/// accuracy (Golub & Van Loan, *Matrix Computations*, 4th ed., §5.3).
+///
+/// Why `U` and not `R`: `det U = 1`, so the REML criterion needs no correction
+/// term, and a leading intercept column stays exactly 1. With `R` itself the
+/// intercept becomes `1/√N`, whose Gram entry `Σ 1/N` picks up a rounding error
+/// of order `N·ε` that the fitted mean then multiplies into the RSS (measured on
+/// InstEval, `N = 73421`: 3e-7 on the deviance, against 8e-9 on the raw `X`
+/// and on `X·U⁻¹`).
+///
+/// The substitution `X = X̃·U` is exact, so the criterion is unchanged and the
+/// augmented `[X y]` factor maps back as `L_XX = Uᵀ·L̃_XX` with the `y` row
+/// unchanged (so `β̂ = U⁻¹·β̃` and `Var(β̂) = U⁻¹·Var(β̃)·U⁻ᵀ` come off it).
+/// Random-slope covariates are Z entries, not fixed effects: they are always
+/// read from the raw `X`.
+///
+/// `R` is built one row at a time by Givens rotations, so it needs `p×p`
+/// storage and one extra pass over the rows, not a copy of `X`. When `R` has a
+/// zero or non-finite diagonal (an all-zero weighted column, fewer rows than
+/// columns) `U` stays the identity and the kernels see the raw `X`.
+#[derive(Clone)]
+pub(crate) struct DesignQr {
+    /// `p×p` strict upper triangle of `U`; the diagonal is 1 and the strict
+    /// lower triangle 0.
+    u: Mat<f64>,
+}
+
+impl DesignQr {
+    pub(crate) fn identity(p: usize) -> Self {
+        DesignQr {
+            u: Mat::identity(p, p),
+        }
+    }
+
+    /// Reset to the identity (no orthogonalization).
+    pub(crate) fn set_identity(&mut self) {
+        let p = self.u.nrows();
+        for j in 0..p {
+            for i in 0..p {
+                self.u[(i, j)] = if i == j { 1.0 } else { 0.0 };
+            }
+        }
+    }
+
+    /// `U` of `diag(row_scale)·X` over `x`'s rows. `v` is a `p`-long scratch.
+    pub(crate) fn set_from_rows(
+        &mut self,
+        x: MatRef<'_, f64>,
+        row_scale: impl Fn(usize) -> f64,
+        v: &mut [f64],
+    ) {
+        let p = self.u.nrows();
+        debug_assert_eq!(x.ncols(), p);
+        // `u` holds R while the rows are rotated in.
+        let r = &mut self.u;
+        for j in 0..p {
+            for i in 0..p {
+                r[(i, j)] = 0.0;
+            }
+        }
+        for row in 0..x.nrows() {
+            let sc = row_scale(row);
+            for (j, vj) in v[..p].iter_mut().enumerate() {
+                *vj = sc * x[(row, j)];
+            }
+            // Rotation j zeroes v[j] against R_jj.
+            for j in 0..p {
+                let b = v[j];
+                if b == 0.0 {
+                    continue;
+                }
+                let a = r[(j, j)];
+                let h = (a * a + b * b).sqrt();
+                let (c, s) = (a / h, b / h);
+                r[(j, j)] = h;
+                for k in (j + 1)..p {
+                    let rk = r[(j, k)];
+                    let vk = v[k];
+                    r[(j, k)] = c * rk + s * vk;
+                    v[k] = c * vk - s * rk;
+                }
+            }
+        }
+        for j in 0..p {
+            let rjj = r[(j, j)];
+            if !(rjj.is_finite() && rjj > 0.0) {
+                self.set_identity();
+                return;
+            }
+        }
+        for i in 0..p {
+            let rii = r[(i, i)];
+            for j in (i + 1)..p {
+                r[(i, j)] /= rii;
+            }
+            r[(i, i)] = 1.0;
+        }
+    }
+
+    /// One design row `x` to `x·U⁻¹` in place (forward substitution on `Uᵀ`).
+    #[allow(clippy::needless_range_loop)] // triangular solve over one slice
+    pub(crate) fn solve_row(&self, x: &mut [f64]) {
+        let p = self.u.nrows();
+        for j in 0..p {
+            let mut acc = x[j];
+            for k in 0..j {
+                acc -= x[k] * self.u[(k, j)];
+            }
+            x[j] = acc;
+        }
+    }
+
+    /// The augmented `[X̃ y]` factor (lower, `y` row at index `p`) to the `[X y]`
+    /// one: the leading block becomes `Uᵀ·L̃_XX`, the `y` row is unchanged.
+    /// Row `i` of the product reads rows `≤ i` of `L̃`, so rows are rewritten
+    /// bottom-up in place.
+    pub(crate) fn map_factor(&self, mut factor: MatMut<'_, f64>) {
+        let p = self.u.nrows();
+        for i in (0..p).rev() {
+            for j in 0..=i {
+                let mut acc = factor[(i, j)];
+                for k in j..i {
+                    acc += self.u[(k, i)] * factor[(k, j)];
+                }
+                factor[(i, j)] = acc;
+            }
+        }
+    }
+
+    /// `β̃` (coefficients on `X̃`) to `β = U⁻¹·β̃` in place (back substitution).
+    #[allow(clippy::needless_range_loop)] // triangular solve over one slice
+    pub(crate) fn map_beta(&self, beta: &mut [f64]) {
+        let p = self.u.nrows();
+        for j in (0..p).rev() {
+            let mut acc = beta[j];
+            for k in (j + 1)..p {
+                acc -= self.u[(j, k)] * beta[k];
+            }
+            beta[j] = acc;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LmmSuffStats — augmented per-RE-column sufficient statistics.
 // ---------------------------------------------------------------------------
 
@@ -53,8 +208,22 @@ pub struct LmmSuffStats {
     pub zx_slope: Mat<f64>,
     /// Per-row widened [X y] (len m) — filled once per row so the c-triangle
     /// and s scatter read contiguous f64 instead of re-indexing the f32 data
-    /// plane per (i, j). Scratch, not a statistic: reset leaves it alone.
+    /// plane per (i, j). Holds the RAW `x`: every random-slope read comes from
+    /// here. Scratch, not a statistic: reset leaves it alone.
     pub w_buf: Vec<f64>,
+    /// The same row as `w_buf` with its `x` part mapped to `x·U⁻¹`
+    /// (`DesignQr`): what `c` and `s` accumulate. Scratch, like `w_buf`.
+    pub wt_buf: Vec<f64>,
+    /// `p × k_total` twin of `s`'s `x` rows on the RAW `x`: `s_raw[(j, a)] =
+    /// Σ_{i in RE column a} z_a·x_j`. `s` holds `Z'X̃`, whose rows are no longer
+    /// design columns, so every slope-covariate Gram entry (`Σ z_slope` and
+    /// `Σ z_slope·z_other` over a level) is read from here instead. 0×0 when no
+    /// grouping carries a random slope.
+    pub s_raw: Mat<f64>,
+    /// The fixed-effect factor `U` the `x` part of `c`/`s` is accumulated
+    /// through. Identity until [`Self::set_design_qr`] runs, so a caller that
+    /// only calls `reset` + [`Self::add_rows_multi`] accumulates the raw `x`.
+    pub(crate) design_qr: DesignQr,
 }
 
 impl LmmSuffStats {
@@ -80,6 +249,13 @@ impl LmmSuffStats {
             zx: Mat::zeros(if kx > 0 { k } else { 0 }, kx),
             zx_slope: Mat::zeros(if kx > 0 { k } else { 0 }, kx),
             w_buf: vec![0.0; m],
+            wt_buf: vec![0.0; m],
+            s_raw: if groupings.primary_q > 1 || groupings.extra_slopes_any {
+                Mat::zeros(p, k)
+            } else {
+                Mat::zeros(0, 0)
+            },
+            design_qr: DesignQr::identity(p),
             groupings,
         }
     }
@@ -98,6 +274,13 @@ impl LmmSuffStats {
             }
             self.counts[a] = 0.0;
         }
+        let (sr, sc) = (self.s_raw.nrows(), self.s_raw.ncols());
+        for a in 0..sc {
+            for j in 0..sr {
+                self.s_raw[(j, a)] = 0.0;
+            }
+        }
+        self.design_qr.set_identity();
         let (zr, zc) = (self.zx.nrows(), self.zx.ncols());
         for j in 0..zc {
             for i in 0..zr {
@@ -107,6 +290,18 @@ impl LmmSuffStats {
         }
         self.n_rows = 0;
         self.n_clusters = 0;
+    }
+
+    /// Compute the fixed-effect factor `U` (`DesignQr`) of `x` under the row
+    /// weights `weights` (`None` is unit weight). Call after [`Self::reset`] and
+    /// before the first [`Self::add_rows_multi`], with the same `x` and weights
+    /// that call will get: `U` must be known before any row is accumulated.
+    pub fn set_design_qr(&mut self, x: MatRef<'_, f64>, weights: Option<&[f64]>) {
+        self.design_qr.set_from_rows(
+            x,
+            |i| weights.map_or(1.0, |w| w[i].sqrt()),
+            &mut self.wt_buf,
+        );
     }
 
     /// Primary-only convenience — the primary-only shape.
@@ -125,6 +320,9 @@ impl LmmSuffStats {
     /// every `[X y]` and slope-`z` read) and every bare intercept-`z=1.0` site
     /// takes one more explicit `zw` (or `wi` where both intercept sides already
     /// collapsed to a single literal — `zw·zw = wi`).
+    /// The `x` part of `c` and `s` is accumulated as `x·U⁻¹` (`DesignQr`, the
+    /// identity unless [`Self::set_design_qr`] ran); slope reads and `s_raw` use
+    /// the raw `x`.
     pub fn add_rows_multi(
         &mut self,
         x: MatRef<'_, f64>,
@@ -159,15 +357,24 @@ impl LmmSuffStats {
                 self.counts[a] += wi;
             }
             // Load this row's [X y] into w_buf, then fold in one `zw` per side:
-            // downstream reads of `w_buf` (the c Gram, slope-z reads) each carry
-            // exactly one `zw`, so a product of two reads carries `zw² = wᵢ`.
+            // downstream reads of `w_buf`/`wt_buf` (the c Gram, slope-z reads)
+            // each carry exactly one `zw`, so a product of two reads carries
+            // `zw² = wᵢ`.
             for j in 0..p {
                 self.w_buf[j] = x[(row, j)];
             }
             self.w_buf[p] = y[row];
+            // The fixed-effect copy: `x·U⁻¹` before the weight, the same order
+            // the sparse kernel's constructor applies.
+            self.wt_buf[..self.m].copy_from_slice(&self.w_buf[..self.m]);
+            self.design_qr.solve_row(&mut self.wt_buf[..p]);
             for wj in &mut self.w_buf[..self.m] {
                 *wj *= zw;
             }
+            for wj in &mut self.wt_buf[..self.m] {
+                *wj *= zw;
+            }
+            let raw = self.s_raw.nrows() > 0;
             for &a in &gid[..n_g] {
                 let scol = self
                     .s
@@ -175,15 +382,20 @@ impl LmmSuffStats {
                     .try_as_col_major_mut()
                     .unwrap()
                     .as_slice_mut();
-                // Intercept z = 1 becomes `zw`; `w_buf` already carries one `zw`,
-                // so the product carries `zw² = wᵢ` — total wᵢ·[X y] per row.
+                // Intercept z = 1 becomes `zw`; `wt_buf` already carries one `zw`,
+                // so the product carries `zw² = wᵢ` — total wᵢ·[X̃ y] per row.
                 #[allow(clippy::needless_range_loop)]
                 for j in 0..self.m {
-                    scol[j] += zw * self.w_buf[j];
+                    scol[j] += zw * self.wt_buf[j];
+                }
+                if raw {
+                    for j in 0..p {
+                        self.s_raw[(j, a)] += zw * self.w_buf[j];
+                    }
                 }
             }
             for j in 0..self.m {
-                let wj = self.w_buf[j];
+                let wj = self.wt_buf[j];
                 let ccol = self
                     .c
                     .col_mut(j)
@@ -192,7 +404,7 @@ impl LmmSuffStats {
                     .as_slice_mut();
                 #[allow(clippy::needless_range_loop)]
                 for i in j..self.m {
-                    ccol[i] += self.w_buf[i] * wj;
+                    ccol[i] += self.wt_buf[i] * wj;
                 }
             }
             if self.groupings.k_crossed() > 0 && !self.groupings.extra_slopes_any {
@@ -302,9 +514,10 @@ impl LmmSuffStats {
             }
             // Primary slopes: each slope k's RE column at level gid[0] (offset
             // (k+1)·n_primary + gid[0]) accumulates z = x_{slope_k} weighted sums
-            // into `s`; the intercept subcol (gid[0]) is already filled with z=1
-            // above. counts is NOT incremented for slope subcols (the Gram reads
-            // `s`, not counts). z and the [X y] weights widen f32→f64.
+            // into `s` (on `[X̃ y]`) and `s_raw` (on the raw `x`); the intercept
+            // subcol (gid[0]) is already filled with z=1 above. counts is NOT
+            // incremented for slope subcols (the Gram reads `s_raw`, not counts).
+            // z and the [X y] weights widen f32→f64.
             if self.groupings.primary_q > 1 {
                 let n_prim = self.groupings.n_primary;
                 for (k, &sc) in self.groupings.primary_slope_cols.iter().enumerate() {
@@ -319,7 +532,10 @@ impl LmmSuffStats {
                         .as_slice_mut();
                     #[allow(clippy::needless_range_loop)]
                     for j in 0..self.m {
-                        scol_mut[j] += z * self.w_buf[j];
+                        scol_mut[j] += z * self.wt_buf[j];
+                    }
+                    for j in 0..p {
+                        self.s_raw[(j, scol)] += z * self.w_buf[j];
                     }
                 }
             }
@@ -327,7 +543,7 @@ impl LmmSuffStats {
             // weighted [X y] into its RE column `gid[1+e] + 1 + d` (the q_g-wide level
             // block is [intercept | slope_0 | …]). The intercept subcol gid[1+e] is
             // already filled with z=1 by the `s` scatter above; counts is NOT
-            // incremented for slope subcols (the Gram reads `s`). Same covariate-
+            // incremented for slope subcols (the Gram reads `s_raw`). Same covariate-
             // weighted recipe as the primary; intercept-only extras scatter nothing.
             if self.groupings.extra_slopes_any {
                 for e in 0..self.groupings.extra_slope_cols.len() {
@@ -346,7 +562,10 @@ impl LmmSuffStats {
                             .as_slice_mut();
                         #[allow(clippy::needless_range_loop)]
                         for j in 0..self.m {
-                            scol_mut[j] += z * self.w_buf[j];
+                            scol_mut[j] += z * self.wt_buf[j];
+                        }
+                        for j in 0..p {
+                            self.s_raw[(j, scol)] += z * self.w_buf[j];
                         }
                     }
                 }
@@ -457,7 +676,7 @@ pub(crate) fn precompute_balanced_collapse<T: Scalar>(
 /// a FixedClusters primary), so `k = k_total` is independent of N. The block-
 /// diagonal `Λ` carries each grouping's `q_g×q_g` relative-covariance factor; the
 /// raw RE Gram `ZᵀZ` is recovered from the suff stats (per-level diagonal blocks
-/// from `s`/`counts`, cross-factor blocks from the weighted `zx`). Same deviance
+/// from `s_raw`/`counts`, cross-factor blocks from the weighted `zx`). Same deviance
 /// normalization as [`reml_deviance`] (`log|L_ZZ|² + log|L_XX|² + (N−P)·log σ̂²`),
 /// so it reduces to the scalar value (to FP reassociation) when every `q_g == 1`.
 ///
@@ -536,7 +755,7 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
             fit.blocked_g[a * k + b] = v;
         }
     }
-    // Step C: per-level diagonal blocks from `s`/`counts`.
+    // Step C: per-level diagonal blocks from `s_raw`/`counts`.
     // Primary family blocks G_f (component-major scatter).
     for f in 0..n_prim {
         primary_gram(suff, g, f, q_p, &mut fit.prim_gram);
@@ -549,17 +768,18 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
     }
     // Nested children: per-child q_n×q_n diagonal Gram block + the primary↔child
     // cross-Gram. The diagonal block is a level's covariate-weighted scatter from
-    // `s`/`counts`, identical in form to a crossed level's block (below). The cross
+    // `s_raw`/`counts`, identical in form to a crossed level's block (below). The cross
     // block is the within-family coupling — a nested child shares its rows with its
     // parent, so this q_p×q_n Σ_{child} z^{prim}·z^{child} is NOT in `zx` (which is
     // crossed-only). Entry (prim da, child dc): z=1 for an intercept component,
-    // x_slope for a slope component; the four cases pick the matching `s`/`counts`
-    // scatter. q_n==1 collapses to the prior n_c diagonal + the dc==0 cross column.
+    // x_slope for a slope component; the four cases pick the matching
+    // `s_raw`/`counts` scatter. q_n==1 collapses to the prior n_c diagonal + the dc==0 cross column.
     if let Some(nf) = g.nested {
         let q_n = nf.q;
         let nscols = &g.extra_slope_cols[nf.decl];
-        // `s`-ROW reads of a slope covariate below take the internal scale of the
-        // row's own column; the `s`-COLUMN already carries its own (`primary_gram`).
+        // `s_raw`-ROW reads of a slope covariate below take the internal scale of
+        // the row's own column; the `s_raw`-COLUMN already carries its own
+        // (`primary_gram`).
         let nssc = &g.extra_slope_scales[nf.decl];
         for f in 0..n_prim {
             for c in 0..np {
@@ -570,11 +790,12 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
                         let v = if dr == 0 && dc == 0 {
                             n_c
                         } else if dr == 0 {
-                            suff.s[(nscols[dc - 1], ic)] / nssc[dc - 1] // Σ z_{dc-1}
+                            suff.s_raw[(nscols[dc - 1], ic)] / nssc[dc - 1] // Σ z_{dc-1}
                         } else if dc == 0 {
-                            suff.s[(nscols[dr - 1], ic)] / nssc[dr - 1] // Σ z_{dr-1}
+                            suff.s_raw[(nscols[dr - 1], ic)] / nssc[dr - 1] // Σ z_{dr-1}
                         } else {
-                            suff.s[(nscols[dr - 1], ic + dc)] / nssc[dr - 1] // Σ z_{dr-1} z_{dc-1}
+                            suff.s_raw[(nscols[dr - 1], ic + dc)] / nssc[dr - 1]
+                            // Σ z_{dr-1} z_{dc-1}
                         };
                         fit.blocked_g[(ic + dc) * k + (ic + dr)] = v;
                     }
@@ -586,12 +807,12 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
                         let v = if da == 0 && dc == 0 {
                             n_c
                         } else if dc == 0 {
-                            suff.s[(g.primary_slope_cols[da - 1], ic)]
+                            suff.s_raw[(g.primary_slope_cols[da - 1], ic)]
                                 / g.primary_slope_scales[da - 1] // Σ z^p_{da-1}
                         } else if da == 0 {
-                            suff.s[(nscols[dc - 1], ic)] / nssc[dc - 1] // Σ z^n_{dc-1}
+                            suff.s_raw[(nscols[dc - 1], ic)] / nssc[dc - 1] // Σ z^n_{dc-1}
                         } else {
-                            suff.s[(g.primary_slope_cols[da - 1], ic + dc)]
+                            suff.s_raw[(g.primary_slope_cols[da - 1], ic + dc)]
                                 / g.primary_slope_scales[da - 1] // Σ z^p_{da-1} z^n_{dc-1}
                         };
                         fit.blocked_g[ccol * k + prow] = v;
@@ -606,7 +827,7 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
         let q = cf.q;
         let off = g.extra_offsets[cf.decl];
         let scols = &g.extra_slope_cols[cf.decl];
-        // `s`-ROW side of the internal scale, as in the nested block above.
+        // `s_raw`-ROW side of the internal scale, as in the nested block above.
         let ssc = &g.extra_slope_scales[cf.decl];
         for c in 0..cf.n_levels {
             let ic = off + c * q;
@@ -616,11 +837,11 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
                     let v = if dr == 0 && dc == 0 {
                         n_c
                     } else if dr == 0 {
-                        suff.s[(scols[dc - 1], ic)] / ssc[dc - 1] // Σ z_{dc-1}
+                        suff.s_raw[(scols[dc - 1], ic)] / ssc[dc - 1] // Σ z_{dc-1}
                     } else if dc == 0 {
-                        suff.s[(scols[dr - 1], ic)] / ssc[dr - 1] // Σ z_{dr-1}
+                        suff.s_raw[(scols[dr - 1], ic)] / ssc[dr - 1] // Σ z_{dr-1}
                     } else {
-                        suff.s[(scols[dr - 1], ic + dc)] / ssc[dr - 1] // Σ z_{dr-1} z_{dc-1}
+                        suff.s_raw[(scols[dr - 1], ic + dc)] / ssc[dr - 1] // Σ z_{dr-1} z_{dc-1}
                     };
                     fit.blocked_g[(ic + dc) * k + (ic + dr)] = v;
                 }
@@ -759,13 +980,13 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
 ///
 /// θ is vech-packed per grouping — [primary, extras in declaration order]. The
 /// primary block is width-general: `Λ_p` is the column-major vech θ prefix
-/// (`q_p(q_p+1)/2` entries), and the per-level Gram `G_f` is recovered from `s`
-/// with no new accumulator.
+/// (`q_p(q_p+1)/2` entries), and the per-level Gram `G_f` is recovered from
+/// `s_raw`.
 ///
 /// The composition: the q_p primary block coexists with the intercept-only
 /// crossed/nested extra tail in one family-blocked elimination. The family block
 /// is `q_p + nested_per_parent` wide; the new primary-slope↔nested-child
-/// off-diagonal falls out of `s` (free), and the primary-slope↔crossed-factor
+/// off-diagonal falls out of `s_raw` (free), and the primary-slope↔crossed-factor
 /// coupling reads the slope-weighted `zx_slope` twin (each slope row d at level f
 /// is `zx_slope[(d·n_primary+f, b)]`, vs the intercept's unweighted `zx[(f, b)]`).
 /// The extra-grouping scalars keep q_g = 1.

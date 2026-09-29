@@ -22,6 +22,42 @@ severe warning.
 
 ### Changed
 
+- **Fixed-effect columns come in R's order, with R's interaction names.**
+  The formula frontend used to lay the terms out as written and to name an
+  interaction's parts as the term spells them. It now follows R's
+  `terms.formula` and `model.matrix`: the intercept, then the main effects,
+  then the two-way interactions, and so on, each degree in written order.
+  An interaction's parts are named in the order their variables first appear
+  in the fixed part of the formula. `y ~ x*z + f` gave `x z x:z fb fc` and now
+  gives `x z fb fc x:z`; `y ~ x + f:x` gave `x fb:x fc:x` and now gives
+  `x x:fb x:fc`. `a*b*c*d` lists its interactions in R's order
+  (`a:b a:c b:c a:d …`). A variable repeated inside a term counts once, as in
+  R: `x:x` is `x`, where it used to be a column of `x²`. Otherwise the model
+  is the same and only the columns move, except when two columns are exactly
+  collinear: the later one is dropped, so `y ~ x:z + xz` (with `xz = x * z`)
+  now reports `x:z` as aliased, as lme4 does, where it used to report `xz`.
+
+  **Semver note (0.4.1).** The formula frontend is outside the
+  semver-covered surface (`fit_cold`/`fit_warm`, `ModelSpec`, `GroupIds`),
+  so this ships in a patch release, but callers see it:
+  `Lowered::col_names`, the column order of `Lowered::x` (and so
+  `target_indices` positions), and the coefficient order in the Python and R
+  packages (`fit.beta`, `fit.names`, `fixef()`, `coef()`, `vcov()`, the
+  summary table) change for every formula whose terms were not already
+  written main effects first, and interaction names change wherever a term
+  spells its variables in another order than their first appearance. Code
+  that reads coefficients by position must switch to names, and a β saved
+  from an earlier version and passed back as a warm start must be reordered.
+  Formulas already written in degree order with consistently ordered
+  interactions (`y ~ x*z`, `y ~ f + x + f:x`) are unchanged.
+
+  The bit-identity dumps are re-pinned. Rung 47 (InstEval,
+  `y ~ service * dept + studage + lectage`) is the only record that moves,
+  in all three configs: `studage` and `lectage` now come before the
+  `service:dept` block, and the permuted X changes the rounding. Matched by
+  name, β moves by at most 1.6e-7 relative (1.6e-9 absolute), the Hessian
+  SEs by 9.1e-9, τ² by 2.3e-8; the REML criterion drops by 5.5e-10 and the
+  search takes 32 evaluations instead of 33.
 - **The Laplace log-determinant uses the observed curvature on non-canonical
   links** (probit, cloglog, negative binomial, Gamma with the log link). It used
   the expected (Fisher) weight, as lme4 does, which is not the curvature of the
@@ -85,6 +121,49 @@ severe warning.
 - **A negative-binomial GLM whose shape search hits its 25-round cap** now
   reports β and SEs refit at the reported θ; before, they came from the
   previous θ.
+- **PIRLS takes a full Newton step on every non-canonical link** (probit,
+  cloglog, negative-binomial with the log link, Gamma with the log link),
+  instead of the linearly-converging Fisher weight. The 30000-row Gamma
+  false convergence and the 17 wide/30000-row cells that stopped short are
+  fixed: every non-canonical GLMM now lands inside the deviance band against
+  glmmTMB. The two-cycle damping stays as a guard, and fires far less often
+  now that the step itself is Newton's.
+- **The GLM IRLS loop stops on R's relative rule,**
+  `|Δdeviance| / (|deviance| + 0.1) < 1e-12`, not an absolute change in the
+  deviance. Every GLM fit moves at round-off level. A weighted GLM fit no
+  longer depends on the scale of the weights, and a fit whose deviance
+  alternates between two points is now reported as not converged instead of
+  stopping early.
+- **The negative-binomial profile log-likelihood uses `lnΓ` above a count of
+  100000,** instead of summing every term one by one, so a fit with huge
+  counts no longer costs seconds per row.
+
+- **A fixed-effect factor with only one level is an error.** A text, logical
+  or bool column with a single value used to be dropped from the design
+  without a message, in both ports. It now fails with "column 'f': contrasts
+  can be applied only to factors with 2 or more levels", as lme4 does, both
+  as a main effect and inside an interaction.
+- **A grouping with only one level is dropped with a warning.** A term like
+  `(1 | g)` where g has one value used to be fitted, with a variance the data
+  cannot determine. The term is now dropped and the rest of the model is
+  fitted, with the new `single_level_grouping_dropped` warning (Python
+  `SingleLevelGroupingDroppedWarning`, R class
+  `fastglmm_single_level_grouping_dropped`). lme4 stops with an error here.
+  When every random-effect term is dropped, the model is fitted as the same
+  formula without random effects: OLS for Gaussian, a GLM otherwise. The
+  `nagq` fallback and non-convergence messages in both ports now check
+  whether the fitted model has random effects, not whether the formula
+  asked for them.
+- **Python and R give the same error and warning text for the same problem.**
+  Only argument names keep each language's spelling (`nagq`/`nAGQ`,
+  `warm_start`/`start`, `wald_se`/`wald.se`, `init_theta`/`init.theta`). Both
+  ports run their argument checks in the same order, so the same bad input
+  fails with the same message. A missing formula column now reads
+  `column(s) not found in data: <names>` in both, listing every missing
+  column. Python now refuses `(x || g)` and a bare `.` term with the same
+  message as R. R shows the kernel's own message for an intercept-free
+  random-effect term, as Python does. `documentation/warnings.md` now also
+  lists every error.
 
 ### Added
 
@@ -108,6 +187,257 @@ severe warning.
   `dispersion=`/`dispersion` argument the caller held φ at, `None`/`NULL`
   when it was estimated. `summary()`'s dispersion label reads it to print
   `(phi, fixed)` instead of `(phi, ML)`/`(phi, Pearson)`.
+- **`Note::NonIntegerResponse`** (Rust, additive) and its caution
+  `non_integer_response` in both ports: a response that misses the nearest
+  integer by more than R's own tolerance still fits, with this caution
+  instead of fitting silently.
+- **`rows_dropped_na` caution (both ports):** a row with a missing value in
+  a column the formula uses is dropped and reported, the same rule as R's
+  `na.omit`. Python raises `glmm.RowsDroppedWarning`; R raises the matching
+  `fastglmm_rows_dropped_na` condition.
+- **`glmm::formula::referenced_columns`** (the `formula` feature, on by
+  default): the names a formula actually reads as data, so a caller can
+  filter its columns down before conversion instead of touching one the
+  formula never uses. The Python port's `fit()` calls it through
+  `_native.formula_columns`.
+
+### Fixed
+
+- **A Gaussian mixed model with nearly collinear predictors keeps its
+  digits.** The LMM worked from `X'X` built on the raw predictors, which
+  squares how badly conditioned X is. With two predictors collinear to 3e-6
+  (`sim_entangled_pair_lmm`), the REML criterion was 6.5e-4 too high and β
+  was 4e-4 off. Both LMM kernels (dense and sparse) now make the fixed-effect
+  columns orthogonal once per fit, using a QR factorisation of X, and map β̂
+  and its covariance back. On that design the criterion is now within 2e-10
+  of a 60-digit reference and β within 1e-11. Every LMM with more than one
+  fixed-effect column moves in its last digits: the deviance by at most 3e-9
+  on the validation rungs, the variance parameters within the optimizer's
+  stopping tolerance. Models with only an intercept are unchanged.
+  `LmmSuffStats` (`loop_advanced`) gains `set_design_qr`. A caller that
+  accumulates rows by hand without calling it gets the old behaviour.
+- **R: an inverse-Gaussian model with random effects gives an error message.**
+  It used to stop with a raw kernel panic. It now says `family
+  'inversegaussian' is GLM-only: random-effect terms are not supported`, as
+  Python does.
+- **An interaction written twice in a different order is one term.**
+  `y ~ f*g + g:f` built the `f:g` columns twice and reported the copies as
+  aliased. R treats `f:g` and `g:f` as the same term, and so does glmm now;
+  the first spelling keeps its place and its column names.
+- **A non-ASCII column name parses everywhere a bare one does.** `y ~ café`
+  already fitted, but the same kind of name failed as a grouping factor
+  (`(1 | grupa_ł)`, `(1 | a/b)`, `(1 | a:b)`), as the argument of `log()`,
+  `sqrt()`, `exp()` or `I(x^k)`, and inside `cbind()`.
+- **A held inverse-Gaussian dispersion (`dispersion=`) now enters the
+  log-likelihood and AIC.** It only scaled the standard errors before; the
+  log-likelihood and AIC were still computed at the profiled dispersion, so
+  holding φ silently had no effect on them.
+- **Gamma and inverse-Gaussian GLMs on the log link start at the null model,
+  `μ₀ = ȳ`.** They used to start at `η = 0` (`μ = 1`), and on data whose mean
+  sits far from 1 the first IRLS step overshot and the fit diverged. Poisson
+  and negative binomial already started this way. Every Gamma-log fit that
+  converged before reaches the same optimum; the inverse-Gaussian-log
+  deviance is not convex, so a few of its fits now end at a different local
+  optimum, better on some data and worse on other.
+- **A vector AGQ fit on the boundary reports the deviance at its own θ.**
+  When a fit with `nagq > 1` and a random slope ends with a variance
+  component at 0, it used to rotate the covariance factor into a canonical
+  form with the same covariance matrix and recompute the deviance there.
+  Under AGQ that gives a slightly different value, because the quadrature
+  grid depends on the factor and not only on the covariance matrix. The fit
+  now keeps the factor the optimizer reached, so θ, the deviance and the
+  standard errors all come from one point. Which components are reported as
+  on the boundary does not change, and fits off the boundary are unchanged.
+- **The Gaussian LMM is weight-scale invariant at extreme scales.**
+  Multiplying every weight by the same huge or tiny constant used to push
+  the internal search variable into its boundary and corrupt the standard
+  errors, variance components and deviance.
+- **A formula with a bare factor inside an interaction is coded the same way
+  as R's `model.matrix`.** `y ~ x:f`, `y ~ f:g`, `y ~ f + f:g` and similar
+  formulas used to drop the factor's base level even where R keeps it,
+  fitting a different model with no warning.
+- **A grouping column of whole numbers, including a logical 0/1 column, is
+  accepted as a factor,** ordered by value, the way R's `factor()` treats an
+  integer column. It was refused before.
+- **The response is checked against the family's domain, and
+  `dispersion=`/`dispersion` is checked before fitting.** A negative Poisson
+  or negative-binomial count, a binomial value outside `[0, 1]`, a
+  non-positive Gamma or inverse-Gaussian value, and a negative, zero or
+  non-finite dispersion are refused, instead of fitting to a wrong or
+  undefined answer.
+- **Python's `fit()` reads only the columns the formula uses, and drops a
+  row with a missing value in one of them,** the same rule as R's
+  `na.omit`. It used to try to convert every column in the data, which could
+  crash on an unrelated column it could not convert, and could turn a
+  missing value in a plain column into a literal factor level `"nan"`.
+- **R: `fixef`, `ranef` and `VarCorr` no longer mask lme4's own generics in
+  either load order, and `isSingular` works whether lme4 is loaded or not.**
+  Loading both packages used to break whichever one lost the masking fight,
+  most visibly `isSingular` raising "no applicable method."
+- **R: a non-default `contrasts=`, an ordered factor, or a factor carrying
+  its own `contrasts` attribute, used as a fixed effect, is now refused**
+  instead of fitting silently with the wrong coding. A factor used only as a
+  grouping variable is unaffected.
+- **Python: a summary's group count no longer counts a declared grouping
+  level that has no rows.** It used to read the kernel's raw per-grouping
+  slot count, one too many per such level; R's summary already excluded
+  them.
+- **Python: `weights=` and `offset=` are checked before fitting, the way the
+  R port checks them.** A wrong length, a NaN, inf or missing entry, or a
+  non-positive weight is now a plain `ValueError` naming the argument. It
+  used to reach the kernel's entry check and come back as the text of a
+  Rust panic, printed to stderr as well.
+- **Python: a pyarrow Table's dictionary column keeps its declared level
+  order.** `Table.column()` returns a `ChunkedArray`, which was read as plain
+  strings and sorted, so the base level could change. A column whose chunks
+  carry different dictionaries is unified first, and a null entry drops its
+  row.
+- **A GLMM whose search stops next to a failed inner solve is no longer
+  reported as converged.** When the PIRLS solves around a point fail, the outer
+  search can shrink onto the edge of that region and report convergence there.
+  Warm-started negative-binomial fits from a far start (θ₀ = 200) did this
+  21 to 26 deviance above the optimum. Such a fit now reports
+  `converged = false` with no estimates (`fit_failed`). Fits whose failed
+  evaluations lie farther away, and fits with none, are unchanged.
+- **R: a logical predictor or grouping column is a factor, as in lme4.**
+  It used to cross as a 0/1 number, so grouping levels printed as `0`/`1`
+  instead of `FALSE`/`TRUE` and a fixed effect was named `b` instead of
+  `bTRUE`. In `y ~ 0 + b`, `y ~ x:b` and `b*f + b:x` the design itself
+  differed from lme4's; it now matches. A logical response or `offset()`
+  variable stays 0/1.
+- **A GLM whose Fisher-scoring steps oscillate around the MLE is damped.**
+  On links where Fisher scoring is not Newton (probit, cloglog, Gamma/log,
+  negative-binomial/log, inverse-Gaussian/log) the IRLS step could jump back
+  and forth across the MLE with growing amplitude and end not converged. The
+  kernel now watches the β step for sign reversals and halves later steps,
+  with the same constants as the PIRLS period-2 damping. Logit, Poisson/log,
+  Gamma/inverse and inverse-Gaussian/1/μ² fits run the old code unchanged.
+- **Negative-binomial and other log-link GLMM warm starts far from the mode
+  reach the optimum.** On small designs a `fit_warm` from a large θ₀ ended
+  `NoOptimum` or converged above the cold optimum: the joint (u, β) step was
+  too long where the β curvature is small, and the merit test accepted
+  trials that raised the objective. Once that happens the solve now takes
+  u-only steps at fixed β and accepts a trial only on a real decrease, as
+  lme4's `pwrssUpdate` and MixedModels.jl's `pirls!` do, halving the β step
+  after each rejection. Cold fits and fits that never reach this path are
+  unchanged.
+- **Python: a bool column is a factor with levels `FALSE` and `TRUE`,** as in
+  lme4 and the R port. It used to be passed as a 0/1 number, so a bool
+  predictor was named `b` instead of `bTRUE`, a bool grouping had levels
+  `0`/`1`, and `y ~ 0 + b` and `y ~ x:b` fitted a different design from lme4's.
+  This covers Python `bool`, `numpy.bool_`, pandas `bool` and `boolean`, and
+  pyarrow `bool_`. The response and an `offset()` column stay 0/1.
+- **Python: a missing formula column is reported before a `weights=` or
+  `offset=` length error.** With a formula column missing from `data` and
+  `weights=` of the wrong length, the weights error used to hide the real
+  problem. The fit now raises `unknown column: z` first, as the R port
+  already did.
+- **No more flat objective past the μ clamps.** A row whose μ sat on its
+  clamp (`1e-10` on the log links, `1e-12` from 0 or 1 on binomial) had a
+  deviance that stopped changing with η and a score near 0, so PIRLS could
+  report converged at a point that is not a mode, and a Gamma or NB fit on
+  small-scale y could land on the clamp and report success. Such rows are now
+  tail rows: their deviance, score and weights are computed from η in a form
+  that stays finite, as exact derivatives of one deviance. Log-link μ carries
+  no floor and logit μ no bound; probit and cloglog keep the bound on the
+  stored μ only. Cloglog η is bounded at ±700 (was ln 700 above), the Gamma
+  inverse and inverse-Gaussian `1/μ²` links at `[1e-75, 1e75]` (was
+  `[1e-10, 700]`), and a PIRLS step that puts a row past such a bound against
+  its data is refused. A Gamma/log GLM with y scaled by 1e-12 now gives the
+  unscaled slopes.
+- **The exact β-profile's border step is Newton on the whole Laplace profile, inside a trust
+  region.** The step used to leave out the curvature of log|A| in β. Where that curvature
+  dominates (a few clusters at a large θ), every full step overshot, and PIRLS could cycle
+  until its iteration cap. The step now includes it. Far from the mode even the exact
+  model can be wrong, so each step's result is compared with what the model predicted, and
+  the step length shrinks or grows back by the standard trust-region rule. Where the
+  curvature is not positive definite, the step is damped (Levenberg–Marquardt) instead of
+  dropping the curvature. Negative-binomial warm starts from θ₀ = 200 to 3000 now reach the
+  cold optimum on all 24 small test designs, blocked and crossed (before: 12 to 21 of 24). In
+  a scan of 1200 far warm starts over five families, 1089 reach the cold optimum (before:
+  768). Over the accuracy grid's exact-profile cells, PIRLS takes 12 % fewer iterations.
+  Converged results move by round-off to tolerance: deviance by at most 1.8e-6, β by at most
+  1.7e-5 relative.
+- **Log-link GLMs are no longer refused because of the response's units.** The divergence
+  guard stopped a fit once any |η| passed 30. On a log link η = ln μ, so a Poisson fit with
+  counts near e^30, or a Gamma or inverse-Gaussian fit with y in very small or very large
+  units, was refused. A Gamma/log fit with y scaled by 1e-14 ended at β₀ = −30.53, not
+  converged; R gives −31.10. The guard now measures η from the null-model value ln ȳ on
+  log links, so it still stops a fitted mean that runs 1e13 times away from the data, but
+  not a fit in other units. The Gamma and inverse-Gaussian log-link start no longer floors
+  ȳ at 1e-10. Binomial fits are unchanged. A Poisson or NB fit with an all-zero group is
+  now refused whenever the zero rows' mean passes 1e-13 of the data mean; before, that
+  depended on the count scale.
+- **A Gamma fit with a very small dispersion reports the right log-likelihood.** The
+  dispersion term cancelled badly for φ below about 0.05: 1e-10 relative error at
+  φ = 1e-6, and no correct digit near φ = 1e-16. A Gamma GLM that fits the data almost
+  exactly reported a log-likelihood below its value at a fixed φ. The term now uses
+  Stirling's series there. A fit whose deviance rounds to zero still reports `+∞`: the
+  likelihood has no finite maximum, and R's finite value there comes from rounding.
+- **GLMM fixed effects are no longer held inside ±30.** The joint search over θ and β used a
+  fixed box of ±30 on every β. That box is in the units of y and of the X columns. A
+  Gamma/log GLMM with y in very small or very large units needs an intercept past ±30. The
+  fit then stopped on the box and still said `converged = true`. With y·1e-14 on
+  `sim_gamma` it gave τ² = 3.85 instead of 0.32, and a log-likelihood 28.4 too low. A
+  predictor in large units (x·1e-3) was held the same way on AGQ and Gamma fits. The box is
+  gone: β is now unbounded, as it already was on the Laplace exact-profile route. Scaled
+  fits now match the unscaled fit. Under complete separation, an AGQ or Gamma fit used to
+  stop at β = 30 and report convergence. It now uses its evaluation budget and reports
+  `converged = false`. Fits that did not touch the box are unchanged, bit for bit.
+- **GLMs are no longer refused or stopped early because of the units of y or of the
+  weights.** Two checks in the GLM fit used absolute numbers. The saturation check refused
+  a fit when more than half the rows had an IRLS weight below 1e-5. That means "fitted
+  probability pinned at 0 or 1" only on binomial. On other families the weight is μ, 1/μ or
+  μ², so honest fits were refused: a Poisson fit with exposure 1e-7 on most rows, an
+  inverse-Gaussian/log fit with y above about 1e5, a Gamma/inverse fit with y below about
+  1e-3. The check now runs on binomial fits only. The stopping rule
+  `|ΔD| / (|D| + 0.1)` has an absolute floor. On Gamma and inverse-Gaussian the deviance
+  scales with the precision weights, and on inverse-Gaussian also with 1/y. So small
+  weights or large y stopped the fit early while it reported converged: with every Gamma
+  weight 1e-9, β was 2e-3 off. On these two families the floor now scales the same way.
+  On Poisson and negative-binomial the floor is `0.1·min(1, ȳ)`: R's rule while
+  ȳ ≥ 1, and scaled with y below that, so a Poisson fit of non-integer y in tiny units
+  (y × 1e-13 was 1.7e-2 off in β, reported converged) now gives the unscaled fit.
+  Binomial fits, unweighted Gamma fits and count fits with ȳ ≥ 1 are unchanged.
+- **A warm GLMM fit now checks whether its own starting point is worth
+  starting from.** Before searching, the fit compares the objective at the
+  caller's θ₀ against the blind cold start and begins from whichever is
+  lower — a tie or a non-finite warm value goes to cold. This costs two extra
+  evaluations on a warm fit, outside the reported count. Separately, when the
+  `ExactProfile` route (binomial, Poisson, and some negative-binomial shapes
+  at the default Laplace approximation) ends not converged, the fit reruns
+  once on the `PqlThenJoint` route from the same start; the rerun's result is
+  reported when it converges, and a new note (`exact_profile_fallback`) says
+  so. In a scan of 1200 far warm starts, both fixes together bring warm fits
+  that reach the cold optimum from 1089 to 1173 (of 1200) and eliminate every
+  remaining outright failure (52 to 0); negative-binomial warm starts from
+  θ₀=1000 now reach the cold optimum on 80 of 80 small test designs (was 79).
+  Cold fits are unaffected.
+- **A GLMM's answer no longer depends on the units of its predictors.** The
+  joint search over θ and β, used by every AGQ fit, every Gamma GLMM and every
+  model on the packed layout, stepped β in the units of the X columns. A
+  predictor in large units, or one far from zero, left the fit short of the
+  optimum while it still reported `converged`. On `sim_gamma`, x·1000 gave a
+  log-likelihood 0.37 too low, x + 1000 0.04 too low, and x·10⁶ failed. The
+  search now steps the fixed effects in coordinates where the design is centred
+  and scaled, the way it already scaled the random-effect columns, so rescaled
+  and shifted predictors give the same fit to the optimizer's tolerance. Other
+  fits move only by that tolerance (deviance by at most 1.3e-7 on the accuracy
+  grid, same convergence). The Laplace fits that profile β (binomial, Poisson
+  and negative binomial at `nagq = 1` on the dense layouts) are unchanged.
+- **A log-link GLM with very different exposures between rows is no longer
+  refused.** The divergence guard measured the linear predictor with the offset
+  inside, from ln ȳ, so a row whose exposure is 1e-14 of the others tripped it:
+  a Poisson fit with exposure 1e-14 on 30 of 40 rows ended at β₀ = 4.02, not
+  converged, where R gives 1.084. The guard now measures from the null model
+  with the offset, oᵢ + ln(Σwy / Σw·e^o), and the log-link start uses the same
+  value; before, the start ignored the offset, and a Gamma/log fit with exposure
+  1e-8 on most rows ran off to β ≈ 1e304. The count families' start and guard
+  centre also drop R's `ȳ + 0.1` for ln ȳ, so Poisson and negative-binomial
+  fits of a mean below about 1e-14 are no longer refused; only an all-zero
+  response keeps 0.1. Other count fits move by round-off (deviance at most
+  1e-9, β at most 1.5e-6 relative on the validation rungs), and a weighted Gamma
+  or inverse-Gaussian GLM now starts at the weighted mean.
 
 ## [0.4.0] — Unreleased
 

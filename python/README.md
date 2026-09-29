@@ -8,7 +8,7 @@ Fits fixed-effect and mixed (random-intercept / random-slope) models for
 Gaussian, Binomial (logit/probit), Poisson, Gamma, and Negative-Binomial
 outcomes. The numerics are the [`glmm`](https://crates.io/crates/glmm) Rust
 crate — no BLAS/LAPACK system dependency, no `unsafe`, validated against
-R/lme4 and Julia/MixedModels.jl goldens.
+R/lme4, glmmTMB, and Julia/MixedModels.jl goldens.
 
 ## Install
 

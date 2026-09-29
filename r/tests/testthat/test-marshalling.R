@@ -51,11 +51,22 @@ test_that("subset= filters rows before fitting", {
 test_that("na.omit drops NA rows; na.pass-style leftovers error", {
   d <- ols_data()
   d$y[3] <- NA
-  fit <- fastglmm(y ~ x, d, na.action = na.omit)
+  expect_warning(fit <- fastglmm(y ~ x, d, na.action = na.omit),
+                 "Dropped 1 of 10 row")
   expect_equal(nobs(fit), 9L)
   expect_error(fastglmm(y ~ x, d, na.action = na.pass),
                "missing values remain")
   expect_error(fastglmm(y ~ x, d, na.action = na.fail), "missing values")
+})
+
+test_that("every row missing in a used column gives the same message as the Python port", {
+  # Mirrors python/tests/test_validation.py's
+  # test_all_rows_missing_in_a_used_column_is_a_plain_error.
+  d <- data.frame(y = c(1, 2, 3), x = c(NA_real_, NA_real_, NA_real_))
+  expect_error(
+    fastglmm(y ~ x, d),
+    "every row has a missing value in a column the formula uses; no rows left to fit"
+  )
 })
 
 test_that("weights are honored; zero/short/negative weights are clean errors", {
@@ -102,11 +113,40 @@ test_that("missing and unsupported columns are clean errors", {
   expect_error(fastglmm(y ~ z, d), "unsupported type")
 })
 
-test_that("logical columns fit as 0/1 numerics", {
-  d <- ols_data()
-  d$b <- rep(c(TRUE, FALSE), 5)
-  fit <- fastglmm(y ~ b, d)
-  expect_named(fixef(fit), c("(Intercept)", "b"))
+test_that("logical columns are factors with FALSE/TRUE levels, as in lme4", {
+  set.seed(31)
+  d <- data.frame(g = rep(c(FALSE, TRUE), each = 30), h = factor(rep(1:6, 10)),
+                  b = rep(c(TRUE, FALSE), 30), x = rnorm(60))
+  d$y <- d$x + 0.5 * d$b + rnorm(6)[d$h] + ifelse(d$g, 0.4, -0.4) + rnorm(60)
+  d01 <- transform(d, g = as.integer(g), b = as.integer(b))
+
+  # Grouping: lme4 labels the levels "FALSE"/"TRUE"; the 0/1 coding it
+  # replaces fits bit-identically, only the labels change.
+  fit <- fastglmm(y ~ x + (1 | g) + (1 | h), d)
+  fit01 <- fastglmm(y ~ x + (1 | g) + (1 | h), d01)
+  expect_equal(rownames(ranef(fit)$g), c("FALSE", "TRUE"))
+  expect_identical(fixef(fit), fixef(fit01))
+  expect_identical(unname(unlist(ranef(fit))), unname(unlist(ranef(fit01))))
+  expect_identical(as.numeric(logLik(fit)), as.numeric(logLik(fit01)))
+
+  # Fixed effect: the dummy is bTRUE, same numbers as the 0/1 column.
+  fit <- fastglmm(y ~ b * x + (1 | h), d)
+  fit01 <- fastglmm(y ~ b * x + (1 | h), d01)
+  expect_named(fixef(fit), c("(Intercept)", "bTRUE", "x", "bTRUE:x"))
+  expect_identical(unname(fixef(fit)), unname(fixef(fit01)))
+
+  # Where R's marginality rule codes the logical by indicators, the design
+  # is model.matrix()'s, not a single 0/1 column.
+  expect_named(fixef(fastglmm(y ~ x:b + (1 | h), d)),
+               colnames(model.matrix(y ~ x:b, d)))
+  expect_named(fixef(fastglmm(y ~ 0 + b + (1 | h), d)),
+               colnames(model.matrix(y ~ 0 + b, d)))
+
+  # A logical response stays 0/1, as glm() reads it.
+  d$yb <- d$y > 0
+  fit <- fastglmm(yb ~ x, d, family = binomial())
+  ref <- glm(yb ~ x, binomial(), d)
+  expect_equal(unname(fixef(fit)), unname(coef(ref)), tolerance = 1e-8)
 })
 
 test_that("unused data columns are never marshalled", {

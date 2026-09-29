@@ -273,7 +273,9 @@ pub(crate) fn glm_view_to_fit(
     // `ln(φ̂/s)`. A held φ (`opts.dispersion
     // = Some(v)`) is used as-is for `D/φ`, with `Gₚ` still read on `ŵ` at
     // `ln(v/s)` — the same internal coordinate the mixed path's held-φ arm
-    // uses (`fit::glmm::run_glmm_on`).
+    // uses (`fit::glmm::run_glmm_on`). Inverse-Gaussian: `opts.dispersion`
+    // passes straight through to `inv_gaussian_aic`'s own `held_phi` arm —
+    // `None` profiles φ at `D/n`, `Some(v)` holds it at `v`.
     let (fitted, loglik) = if converged {
         let mu = view.mu.to_vec();
         let ll = match family {
@@ -313,6 +315,7 @@ pub(crate) fn glm_view_to_fit(
                     irls_deviance,
                     n,
                     opts.weights.as_deref(),
+                    opts.dispersion,
                 ) - 2.0)
             }
             _ => {
@@ -367,11 +370,31 @@ const NB_THETA_TOL: f64 = 1e-6;
 pub(crate) const NB_THETA_LO: f64 = 1e-3;
 pub(crate) const NB_THETA_HI: f64 = 1e4;
 
+/// Above this count, [`nb_profile_loglik`] switches from the finite sum
+/// `Σ_{k=0}^{y−1} ln(θ+k)` to `lnΓ(y+θ) − lnΓ(θ)` (`simd_transcendental::ln_gamma`,
+/// full double precision). Measured on the crate's own `ln_gamma`: comparing the
+/// two forms at `y ∈ {10, …, 2×10^8}` across `θ ∈ [10⁻³, 10³]` (30 log-spaced
+/// points), their relative disagreement is a random walk in `y`, not a
+/// monotonically growing bias — 2.0e-15 at `y = 10³`, about 7e-14 at
+/// `y = 10⁶`–`2×10⁶`, and only occasionally crossing 1e-13 from `y ≈ 5×10⁶`
+/// on (1.1e-13 at `5×10⁶`, 1.5e-13 at `10⁷`). `1e5` sits comfortably below any
+/// observed excursion above 1e-13, and below the largest NB count in this
+/// repo: `validation/data/simulated/*nb*.csv` tops out at 657,
+/// `validation/grid/data/nb_nest2s_g30000p20_bal_base.csv` at 28,906 — both
+/// under the cap, so nothing in the corpus reaches the switch. Cost: one call
+/// to `nb_profile_loglik` on a single row of `y = 1e10` (the lgamma path)
+/// takes about 14 µs; a row exactly at the cap (the finite sum's own worst
+/// case) takes about 0.48 ms.
+pub(crate) const Y_SUM_MAX: u64 = 100_000;
+
 /// NB profile log-likelihood in θ at fixed μ̂, up to the θ-independent `−ln(yᵢ!)`:
 /// `Σ[ lnΓ(yᵢ+θ) − lnΓ(θ) + θ·ln(θ/(θ+μ̂ᵢ)) + yᵢ·ln(μ̂ᵢ/(θ+μ̂ᵢ)) ]`. Counts are
-/// integers, so `lnΓ(y+θ)−lnΓ(θ) = Σ_{k=0}^{y−1} ln(θ+k)` exactly — no lgamma,
-/// and identical to `MASS::theta.ml`'s objective. (`Σ_{k}` is `O(Σy)`; fine at
-/// validation scale.)
+/// integers, so `lnΓ(y+θ)−lnΓ(θ) = Σ_{k=0}^{y−1} ln(θ+k)` exactly. Below
+/// [`Y_SUM_MAX`] this runs as that finite sum — no lgamma, identical to
+/// `MASS::theta.ml`'s objective; above it, a row's cost would scale with its
+/// count (`MASS::theta.ml` itself evaluates `lgamma`, so switching there loses
+/// nothing against the reference), so it runs as `ln_gamma(y+θ) − ln_gamma(θ)`
+/// instead, `O(1)` per row.
 ///
 /// The `μᵢ==0` guard makes this finite when evaluated at the **saturated** mean
 /// `μ=y` (so `nb_profile_loglik(y, y, θ)` = the NB saturated log-likelihood, the
@@ -387,10 +410,17 @@ pub(crate) const NB_THETA_HI: f64 = 1e4;
 pub(crate) fn nb_profile_loglik(y: &[f64], mu: &[f64], theta: f64, weights: Option<&[f64]>) -> f64 {
     let mut ll = 0.0;
     for (i, (&yi, &mi)) in y.iter().zip(mu.iter()).enumerate() {
-        let mut s = 0.0;
-        for k in 0..(yi.round() as u64) {
-            s += (theta + k as f64).ln();
-        }
+        let yc = yi.round() as u64;
+        let mut s = if yc <= Y_SUM_MAX {
+            let mut acc = 0.0;
+            for k in 0..yc {
+                acc += (theta + k as f64).ln();
+            }
+            acc
+        } else {
+            crate::simd_transcendental::ln_gamma(theta + yi)
+                - crate::simd_transcendental::ln_gamma(theta)
+        };
         if mi > 0.0 {
             s += theta * (theta / (theta + mi)).ln() + yi * (mi / (theta + mi)).ln();
         }

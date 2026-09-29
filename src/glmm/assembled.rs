@@ -23,16 +23,11 @@
 //! (`se::joint_hessian_cov` puts those weights in place); the dispersion's own
 //! row of the joint Hessian is appended there.
 //!
-//! On a row where μ sits on one of `family::clamp_mu`'s bounds, `D`'s
-//! dependence on η stops while the kernel's score keeps forming from the
-//! unclamped `dμ/dη`; this module reads that row's deviance slope as 0 and its
-//! observed weight and `dw/dη` off `family::clamped_observed_weight`/
-//! `clamped_weight_eta_deriv` rather than the general closed forms, so `G = 0`
-//! still holds there. Two shapes still break it and are refused: a row on the
-//! link's own η bound, where the score has stopped moving to first order
-//! relative to what this engine assumes, and a μ-clamped row on the weighted
-//! logit link, whose kernel writes a different score than the general form
-//! here does — the mechanism for both is spelled out at the census in
+//! Every row's deviance, score and weights are smooth functions of η, a tail
+//! row's included (`family::in_tail`), so the kernel's score is the deviance's
+//! exact slope on every row. One shape still breaks `G = 0` and is refused: a
+//! row on the link's own η bound, where the score has stopped moving to first
+//! order relative to what this engine assumes — spelled out at the census in
 //! [`joint_hessian_columns`].
 //!
 //! **Evaluation point.** Every PIRLS variant leaves `eta`, `prob`, `w`, the
@@ -173,8 +168,7 @@ pub(crate) struct PackedAsmBufs<T: Scalar> {
     /// `k×k` row-major `A⁻¹`, from `k` unit-vector solves against `a`.
     pub(super) a_inv: Vec<T>,
     /// `k×k` row-major `A_obs = M'W_obs M + I`, factored in place. Read on a
-    /// non-canonical link, or a canonical one with a μ-clamped row, where it
-    /// is the adjoint equation's `G_u/2`.
+    /// non-canonical link, where it is the adjoint equation's `G_u/2`.
     pub(super) obs: Vec<T>,
     /// `k` scratch for the unit-vector solves that build `a_inv`.
     pub(super) col: Vec<T>,
@@ -208,9 +202,7 @@ impl<T: Scalar> PackedAsmBufs<T> {
 
     /// Sized for a packed shape; `width == 0` means a non-packed layout and
     /// yields [`PackedAsmBufs::empty`]. `obs` is sized on every shape,
-    /// canonical or not: a canonical fit with a μ-clamped row still
-    /// needs `A_obs` built and factored, and whether any row is pinned is not
-    /// known this early.
+    /// canonical or not, though only a non-canonical fit builds `A_obs` in it.
     fn for_shape(k: usize, rows: usize, width: usize) -> PackedAsmBufs<T> {
         if width == 0 {
             return PackedAsmBufs::empty();
@@ -540,9 +532,8 @@ fn mode_solve_f64(
 /// half's own `U` (`m·k`, `û`'s first-order response), gradient (`m`),
 /// `∂m/∂θ` row scratch (`width`) and two mode snapshots (`2k`).
 /// [`packed_peak_bytes`] is that expression. `A_obs` is sized on every shape,
-/// canonical or not (a canonical fit with a μ-clamped row needs it too,
-/// and whether a row will be pinned is not known at sizing time), so the
-/// `set` term is a flat `3·k²` rather than `(2 + obs)·k²`. What it leaves out
+/// canonical or not, so the `set` term is a flat `3·k²` rather than
+/// `(2 + obs)·k²`. What it leaves out
 /// is the crossed-tail reducer and the blocked/structured observed twin,
 /// which a packed shape sizes at their `.max(1)` minimum — six elements, not
 /// a term.
@@ -592,52 +583,14 @@ pub(crate) fn assembly_routes(ws: &GlmmWorkspace, n: usize) -> bool {
     layout_ok && (extras || !agq_eligible(ws.family, ws.nagq, ws.groupings.primary_q))
 }
 
-/// Rows where μ sits on one of `family::clamp_mu`'s bounds at the mode state
-/// held in `prob`, counted over the `n` fitted rows — `family::pinned_mu_bounds`
-/// is zero on any row for unweighted Bernoulli logit, whatever `prob` holds:
-/// that route's family pass is the fused `log1pexp` identity and calls
-/// `family::clamp_mu` on no row, so a saturated row there is an ordinary row
-/// whose deviance slope is the exact `−2(y − σ(η))` the assembly already
-/// writes.
-///
-/// A non-zero count refuses a fit only on the weighted binomial logit link
-/// ([`logit_clamp_refused`], this count's only reader); on every other link a
-/// clamped row is handled in place. The reason is written at the census in
-/// [`joint_hessian_columns`].
-pub(crate) fn mu_clamped_rows(family: Family, weighted: bool, prob: &[f64]) -> usize {
-    let (mu_lo, mu_hi) = crate::family::pinned_mu_bounds(family, weighted);
-    prob.iter()
-        .filter(|&&mu| mu <= mu_lo || mu >= mu_hi)
-        .count()
-}
-
 /// Rows where η sits on one of `family::clamp_eta`'s bounds at the mode state
-/// held in `eta`, counted over the `n` fitted rows — the η twin of
-/// [`mu_clamped_rows`]. On such a row the clamped η is a constant, so μ, the
-/// score and the weight stop depending on `u` and γ there, which the
-/// assembly's per-row derivatives do not model. Every entry point here
-/// refuses a fit with a non-zero count.
+/// held in `eta`, counted over the `n` fitted rows. On such a row the clamped
+/// η is a constant, so μ, the score and the weight stop depending on `u` and
+/// γ there, which the assembly's per-row derivatives do not model. Every entry
+/// point here refuses a fit with a non-zero count.
 pub(crate) fn eta_clamped_rows(family: Family, eta: &[f64]) -> usize {
     let (eta_lo, eta_hi) = crate::family::clamp_eta_bounds(family);
     eta.iter().filter(|&&e| e <= eta_lo || e >= eta_hi).count()
-}
-
-/// True on a μ-clamped row on the binomial logit link, whatever the
-/// weighting. `assemble` and `packed_assemble` write the logit score as
-/// `prior_w·(y − μ)` on both routes, while the structured kernel writes the
-/// general form when weighted and the packed kernel always does; on a
-/// clamped row those are different numbers, so the assembly's mode equation
-/// is not the one PIRLS solved there and the adjoint would be wrong. Zero for
-/// unweighted logit: [`mu_clamped_rows`] already returns `0` for that route,
-/// so this refuses exactly the weighted-logit case.
-pub(crate) fn logit_clamp_refused(family: Family, weighted: bool, prob: &[f64]) -> bool {
-    mu_clamped_rows(family, weighted, prob) > 0
-        && matches!(
-            family,
-            Family::Binomial {
-                link: BinomialLink::Logit
-            }
-        )
 }
 
 /// Shared body of [`gradient_f64`] and [`gradient_f64_mode_residual`]: solves
@@ -708,7 +661,6 @@ fn gradient_f64_impl(
     let k = ws.k;
     let kk = k.max(1);
     let family = ws.family;
-    let weighted = ws.weighted;
     let nb_theta = ws.nb_theta;
     let extras = !ws.groupings.extra_offsets.is_empty();
     // Never the fit's own exit tolerance: the caller's override if it set one,
@@ -723,10 +675,8 @@ fn gradient_f64_impl(
         return None;
     }
     // The clamped mode state `joint_hessian_columns` refuses, refused here for
-    // the same reasons and stated there.
-    if logit_clamp_refused(family, weighted, &ws.pirls.prob[..n])
-        || eta_clamped_rows(family, &ws.pirls.eta[..n]) > 0
-    {
+    // the same reason and stated there.
+    if eta_clamped_rows(family, &ws.pirls.eta[..n]) > 0 {
         ws.pirls.u[..kk].copy_from_slice(&saved_u);
         return None;
     }
@@ -778,7 +728,6 @@ fn gradient_f64_impl(
     let out = assemble(
         g,
         family,
-        weighted,
         nb_theta,
         x,
         y,
@@ -1061,20 +1010,12 @@ pub(crate) fn joint_hessian_columns(
     // The census of the mode state, once, before any chunk. PIRLS iterates
     // `u ← A⁻¹[(A − I)u + M'ρ]` with `ρ` the kernel's own row score, so its
     // fixed point is `u = M'ρ`, the mode equation `G = D_u + 2u = 0` the
-    // adjoint below differentiates. Two things break that on a mode state
+    // adjoint below differentiates. One thing breaks that on a mode state
     // PIRLS can actually reach: a row on the link's η bound has a score that
-    // has stopped moving to first order relative to what this engine assumes,
-    // and a μ-clamped row on the weighted logit link has the kernel writing a
-    // different score than the general form `assemble` writes there
-    // (`logit_clamp_refused`, unweighted logit exempt — its fused kernel
-    // applies no μ clamp). A μ-clamped row on any other link keeps `ρ`'s own
-    // expression, unchanged, at the pinned μ; only its deviance slope (0
-    // there, μ being a constant) and its observed weight and `dw/dη`
-    // (`family::clamped_observed_weight`/`clamped_weight_eta_deriv`, in place
-    // of the general closed forms) read differently.
-    if logit_clamp_refused(family, weighted, &ws.pirls.prob[..n])
-        || eta_clamped_rows(family, &ws.pirls.eta[..n]) > 0
-    {
+    // has stopped moving to first order relative to what this engine assumes.
+    // A tail row (`family::in_tail`) does not: its score, weights and their
+    // η-derivatives are the η forms of one smooth deviance.
+    if eta_clamped_rows(family, &ws.pirls.eta[..n]) > 0 {
         ws.dual_scratch = Some(scratch);
         return DerivStatus::Unsupported;
     }
@@ -1144,9 +1085,9 @@ pub(crate) fn joint_hessian_columns(
 /// The chunked seed-call-assemble body [`joint_hessian_columns`]'s per-`N`
 /// match arms hand a typed buffer set to. A call that comes back `!exact`
 /// means the step matrix that call took was not the Jacobian of the map PIRLS
-/// walks — a row on the kernel's μ clamp, or a non-PD observed factor inside
-/// the kernel (`pirls::DualStep::exact`'s own doc comment has the two
-/// causes) — so the assembled columns from that call are not yet the answer.
+/// walks — a non-PD observed factor inside the kernel
+/// (`pirls::DualStep::exact`'s own doc comment) — so the assembled columns
+/// from that call are not yet the answer.
 /// The settle loop below re-enters the kernel from the same `u`, which it
 /// carries forward by the kernel's own mutation of `bufs.pirls.u` rather than
 /// reseeding, until the columns it writes into `hess` for this chunk stop
@@ -1305,7 +1246,6 @@ fn run_assembled_hessian<T: Seed>(
             let assembled = assemble(
                 g,
                 family,
-                weighted,
                 nb_theta,
                 x,
                 y,
@@ -1412,7 +1352,6 @@ fn run_assembled_hessian<T: Seed>(
 fn assemble<T: TailKernel>(
     g: &LmmGroupings,
     family: Family,
-    weighted: bool,
     nb_theta: f64,
     x: MatRef<f64>,
     y: &[f64],
@@ -1515,16 +1454,13 @@ fn assemble<T: TailKernel>(
     }
 
     let canonical = crate::family::is_canonical(family);
-    let (mu_lo, mu_hi) = crate::family::pinned_mu_bounds(family, weighted);
     let exact_obj = crate::family::exact_curvature_differs(family);
-    let mut pinned_rows = 0usize;
     let mut t = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
     let mut yb = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
 
     // --- pass 1, per row:
-    //   ρᵢ = prior_wᵢ·(dμ/dη)(yᵢ−μᵢ)/V,  ∂(prior_wᵢ·devᵢ)/∂ηᵢ = −2ρᵢ on an
-    //   unpinned row and 0 on a row whose μ sits on a `family::clamp_mu`
-    //   bound (μ is a constant there); ∂²/∂η² = 2·w_obs,ᵢ, hᵢ = mᵢ'A⁻¹mᵢ
+    //   ρᵢ = prior_wᵢ·(dμ/dη)(yᵢ−μᵢ)/V (`family::row_score`),
+    //   ∂(prior_wᵢ·devᵢ)/∂ηᵢ = −2ρᵢ, ∂²/∂η² = 2·w_obs,ᵢ, hᵢ = mᵢ'A⁻¹mᵢ
     //   D_βj  += (∂devᵢ/∂ηᵢ)·xᵢⱼ            D_uc  += (∂devᵢ/∂ηᵢ)·M_ic
     //   ℓ_βj  += w'ᵢ·xᵢⱼ·hᵢ                ℓ_uc  += w'ᵢ·M_ic·hᵢ
     //   (G_βj)_c += 2·w_obs,ᵢ·xᵢⱼ·M_ic     (∂M/∂β = 0, so this is all of G_β)
@@ -1579,29 +1515,17 @@ fn assemble<T: TailKernel>(
             Family::Binomial {
                 link: BinomialLink::Logit,
             } => T::from_f64(prior_w[i]) * (T::from_f64(y[i]) - prob[i]),
-            other => {
-                let dmu = crate::family::mu_eta(other, eta[i]);
-                let v = crate::family::variance(other, nb_theta, prob[i]);
-                T::from_f64(prior_w[i]) * dmu * (T::from_f64(y[i]) - prob[i]) / v
-            }
+            other => crate::family::row_score(other, nb_theta, y[i], prior_w[i], eta[i], prob[i]),
         };
         rho[i] = r;
-        let pinned = prob[i].value() <= mu_lo || prob[i].value() >= mu_hi;
-        pinned_rows += usize::from(pinned);
         lev[i] = h;
-        // On a pinned row μ is the constant `prob[i]`, so only `dμ/dη` still
-        // moves with η — the clamped closed forms read that directly instead
-        // of the general ones, which assume μ is still a function of η.
-        //
         // The kernel's stored `w` is the weight the objective's `A = M'WM + I`
         // is built from (`pirls::evaluate_at_mode`): the raw Fisher weight
-        // `prior_w·(dμ/dη)²/V` on a link whose exact curvature is Fisher, and
-        // on a pinned row everywhere, the observed `W_obs` on an interior row
-        // where the two differ. `w_eta` is that same weight's `dw/dη`. `w_obs`
-        // is the mode equation's Jacobian: `w` itself on an interior row of an
-        // exact-curvature link rather than formed a second time, the clamped
-        // observed weight on a pinned row whatever the link.
-        w_eta[i] = if exact_obj && !pinned {
+        // `prior_w·(dμ/dη)²/V` on a link whose exact curvature is Fisher, the
+        // observed `W_obs` where the two differ. `w_eta` is that same weight's
+        // `dw/dη`. `w_obs` is the mode equation's Jacobian: `w` itself on an
+        // exact-curvature link rather than formed a second time.
+        w_eta[i] = if exact_obj {
             crate::family::observed_weight_eta_deriv(
                 family,
                 nb_theta,
@@ -1611,27 +1535,17 @@ fn assemble<T: TailKernel>(
                 prob[i],
                 T::ZERO,
             )
-        } else if pinned {
-            crate::family::clamped_weight_eta_deriv(family, nb_theta, prior_w[i], eta[i], prob[i])
         } else {
             crate::family::weight_eta_deriv(family, nb_theta, eta[i], prob[i], w[i])
         };
-        w_obs[i] = if exact_obj && !pinned {
+        w_obs[i] = if exact_obj {
             w[i]
-        } else if pinned {
-            crate::family::clamped_observed_weight(
-                family, nb_theta, y[i], prior_w[i], eta[i], prob[i],
-            )
         } else {
             crate::family::observed_weight(
                 family, nb_theta, y[i], prior_w[i], eta[i], prob[i], w[i],
             )
         };
-        let dr = T::from_f64(-2.0) * r;
-        // `dr` unsplit is still the score `G` differentiates — pass 2's
-        // θ columns of `G_γ` keep it. `D_γ`/`D_u` take the deviance's own
-        // slope, which is 0 on a pinned row.
-        let dev_eta = if pinned { T::ZERO } else { dr };
+        let dev_eta = T::from_f64(-2.0) * r;
         let a = w_eta[i] * h;
         let two_wo = T::from_f64(2.0) * w_obs[i];
         for j in 0..p {
@@ -1705,10 +1619,6 @@ fn assemble<T: TailKernel>(
             );
         }
         let dr = T::from_f64(-2.0) * rho[i];
-        // `dev_eta` is `D_γ`'s slope, 0 on a pinned row; `G_γ`'s θ columns
-        // below keep the unsplit `dr`, mirroring pass 1's split.
-        let pinned = prob[i].value() <= mu_lo || prob[i].value() >= mu_hi;
-        let dev_eta = if pinned { T::ZERO } else { dr };
         for a in 0..n_theta {
             packed_m_theta_deriv(
                 g,
@@ -1775,7 +1685,7 @@ fn assemble<T: TailKernel>(
                 }
                 core_acc + tail_acc
             };
-            d_gamma[a] += dev_eta * deta;
+            d_gamma[a] += dr * deta;
             l_gamma[a] += T::from_f64(2.0) * w[i] * cross + w_eta[i] * deta * lev[i];
             let tw = T::from_f64(2.0) * w_obs[i] * deta;
             for local in 0..qc {
@@ -1803,16 +1713,13 @@ fn assemble<T: TailKernel>(
         let c = k_family + b;
         adj[c] = d_u[c] + T::from_f64(2.0) * u[c] + l_u[c];
     }
-    // `A_obs = M'W_obs M + I`. On a canonical link with every row's μ off its
-    // `family::clamp_mu` bound, `A_obs` IS the Fisher `A` the mode solve
-    // already factored; a pinned row makes the canonical link's own observed
-    // weight something other than `V(μ)` there (`clamped_observed_weight`),
-    // so on such a row the factor is built and factored here regardless of
-    // canonicity, and a non-PD factor is the refusal. Built here rather than
-    // taken from the dual kernel's own observed twin because a
-    // `BetaStep::Fixed` `f64` call leaves no twin at all, so this arm has to
-    // exist for the `f64` instantiation regardless — one body serves both.
-    if canonical && pinned_rows == 0 {
+    // `A_obs = M'W_obs M + I`. On a canonical link `A_obs` IS the Fisher `A`
+    // the mode solve already factored; otherwise it is built and factored
+    // here, and a non-PD factor is the refusal. Built here rather than taken
+    // from the dual kernel's own observed twin because a `BetaStep::Fixed`
+    // `f64` call leaves no twin at all, so this arm has to exist for the `f64`
+    // instantiation regardless — one body serves both.
+    if canonical {
         if e == 0 {
             solve_core_blocks(core_fac, qc, s, adj);
         } else {
@@ -2048,7 +1955,7 @@ fn take_packed_bufs(ws: &mut GlmmWorkspace, p: usize, n: usize) -> Box<PackedGra
 /// compares its columns against.
 ///
 /// Same statuses, and the same meanings, as the other routes'
-/// [`joint_hessian_columns`]: `Unsupported` on a mode state where the μ clamp
+/// [`joint_hessian_columns`]: `Unsupported` on a mode state where the η clamp
 /// binds — the reason is stated there — or on a non-positive-definite
 /// observed factor, `NotConverged` on a mode solve that fails.
 ///
@@ -2114,11 +2021,9 @@ fn packed_gradient_into(
         ws.pirls.u[..kk].copy_from_slice(&bufs.saved_u[..kk]);
         return DerivStatus::NotConverged;
     };
-    // The same census, for the same reasons, as `joint_hessian_columns` —
+    // The same census, for the same reason, as `joint_hessian_columns` —
     // stated there.
-    if logit_clamp_refused(family, ws.weighted, &ws.pirls.prob[..n])
-        || eta_clamped_rows(family, &ws.pirls.eta[..n]) > 0
-    {
+    if eta_clamped_rows(family, &ws.pirls.eta[..n]) > 0 {
         ws.pirls.u[..kk].copy_from_slice(&bufs.saved_u[..kk]);
         return DerivStatus::Unsupported;
     }
@@ -2137,7 +2042,6 @@ fn packed_gradient_into(
     let out = packed_assemble(
         &ws.groupings,
         family,
-        ws.weighted,
         nb_theta,
         x,
         y,
@@ -2152,19 +2056,18 @@ fn packed_gradient_into(
         &mut bufs.grad,
     );
     ws.pirls.u[..kk].copy_from_slice(&bufs.saved_u[..kk]); // restore — leave ws.pirls.u as found
-    let Some(pinned) = out else {
+    if out.is_none() {
         return DerivStatus::Unsupported;
-    };
+    }
     // `û(γ)` solves `G(γ, û) = 0`, so `dû/dγ = −G_u⁻¹G_γ` — `m` right-hand
     // sides against the SAME factor the assembly's own pass 3 just used for
-    // its adjoint (`A` on a canonical link with no pinned row, `A_obs`
-    // otherwise — `pinned` says which), and `G_u = 2·A_obs` puts the ½ in
-    // front.
+    // its adjoint (`A` on a canonical link, `A_obs` otherwise), and
+    // `G_u = 2·A_obs` puts the ½ in front.
     let fac_len = k * k;
     for a in 0..m {
         let col = &mut bufs.u_lanes[a * k..a * k + k];
         col.copy_from_slice(&bufs.asm.g_gamma[a * k..a * k + k]);
-        let fac = if canonical && !pinned {
+        let fac = if canonical {
             &bufs.asm.packed.a[..fac_len]
         } else {
             &bufs.asm.packed.obs[..fac_len]
@@ -2196,15 +2099,11 @@ fn packed_gradient_into(
 ///
 /// `None` on a non-positive-definite `A` or `A_obs`: the adjoint equation
 /// `G_u·adj = F_u` has no Cholesky then, and the Fisher factor is never
-/// silently put in the observed one's place. `Some(pinned)` otherwise, with
-/// `pinned` true when this call's pass 3 built and factored `A_obs` because
-/// some row's μ sat on a `family::pinned_mu_bounds` bound — the caller needs
-/// it to pick the same factor `A`/`A_obs` for `dû/dγ`.
+/// silently put in the observed one's place.
 #[allow(clippy::too_many_arguments)]
 fn packed_assemble<T: Scalar>(
     g: &LmmGroupings,
     family: Family,
-    weighted: bool,
     nb_theta: f64,
     x: MatRef<f64>,
     y: &[f64],
@@ -2218,12 +2117,10 @@ fn packed_assemble<T: Scalar>(
     n: usize,
     asm: &mut AssemblyBufs<T>,
     grad: &mut [T],
-) -> Option<bool> {
+) -> Option<()> {
     let m = n_theta + p;
     let canonical = crate::family::is_canonical(family);
-    let (mu_lo, mu_hi) = crate::family::pinned_mu_bounds(family, weighted);
     let exact_obj = crate::family::exact_curvature_differs(family);
-    let mut pinned_rows = 0usize;
     let AssemblyBufs {
         rho,
         w_eta,
@@ -2309,19 +2206,13 @@ fn packed_assemble<T: Scalar>(
             Family::Binomial {
                 link: BinomialLink::Logit,
             } => T::from_f64(prior_w[i]) * (T::from_f64(y[i]) - prob[i]),
-            other => {
-                let dmu = crate::family::mu_eta(other, eta[i]);
-                let v = crate::family::variance(other, nb_theta, prob[i]);
-                T::from_f64(prior_w[i]) * dmu * (T::from_f64(y[i]) - prob[i]) / v
-            }
+            other => crate::family::row_score(other, nb_theta, y[i], prior_w[i], eta[i], prob[i]),
         };
         rho[i] = r;
-        let pinned = prob[i].value() <= mu_lo || prob[i].value() >= mu_hi;
-        pinned_rows += usize::from(pinned);
         lev[i] = h;
         // Mirrors `assemble` — change together, including the stored-weight rule
         // on a link whose exact curvature differs from Fisher (`exact_obj`).
-        w_eta[i] = if exact_obj && !pinned {
+        w_eta[i] = if exact_obj {
             crate::family::observed_weight_eta_deriv(
                 family,
                 nb_theta,
@@ -2331,24 +2222,17 @@ fn packed_assemble<T: Scalar>(
                 prob[i],
                 T::ZERO,
             )
-        } else if pinned {
-            crate::family::clamped_weight_eta_deriv(family, nb_theta, prior_w[i], eta[i], prob[i])
         } else {
             crate::family::weight_eta_deriv(family, nb_theta, eta[i], prob[i], w[i])
         };
-        w_obs[i] = if exact_obj && !pinned {
+        w_obs[i] = if exact_obj {
             w[i]
-        } else if pinned {
-            crate::family::clamped_observed_weight(
-                family, nb_theta, y[i], prior_w[i], eta[i], prob[i],
-            )
         } else {
             crate::family::observed_weight(
                 family, nb_theta, y[i], prior_w[i], eta[i], prob[i], w[i],
             )
         };
-        let dr = T::from_f64(-2.0) * r;
-        let dev_eta = if pinned { T::ZERO } else { dr };
+        let dev_eta = T::from_f64(-2.0) * r;
         let av = w_eta[i] * h;
         let two_wo = T::from_f64(2.0) * w_obs[i];
         for j in 0..p {
@@ -2372,8 +2256,6 @@ fn packed_assemble<T: Scalar>(
     for i in 0..n {
         let base = i * width;
         let dr = T::from_f64(-2.0) * rho[i];
-        let pinned = prob[i].value() <= mu_lo || prob[i].value() >= mu_hi;
-        let dev_eta = if pinned { T::ZERO } else { dr };
         for a_idx in 0..n_theta {
             packed_m_vals_theta_deriv(g, a_idx, x, i, m_deriv);
             // `∂η_i/∂θ_a = m_{a,i}'u`, read at the iterate `η`, `w` and the
@@ -2393,7 +2275,7 @@ fn packed_assemble<T: Scalar>(
                 }
                 cross += m_vals[ta] * inner;
             }
-            d_gamma[a_idx] += dev_eta * deta;
+            d_gamma[a_idx] += dr * deta;
             l_gamma[a_idx] += T::from_f64(2.0) * w[i] * cross + w_eta[i] * deta * lev[i];
             let tw = T::from_f64(2.0) * w_obs[i] * deta;
             for t in 0..width {
@@ -2409,10 +2291,9 @@ fn packed_assemble<T: Scalar>(
     for c in 0..k {
         adj[c] = d_u[c] + T::from_f64(2.0) * u[c] + l_u[c];
     }
-    // `A_obs` IS the Fisher `A` only on a canonical link with every row's μ
-    // off its `clamp_mu` bound; a pinned row builds and factors it here
-    // regardless of canonicity — mirrors `assemble`'s pass 3.
-    if canonical && pinned_rows == 0 {
+    // `A_obs` IS the Fisher `A` only on a canonical link; otherwise it is
+    // built and factored here — mirrors `assemble`'s pass 3.
+    if canonical {
         glmm_block_solve(&a[..k * k], k, &mut adj[..k]);
     } else {
         obs[..k * k].fill(T::ZERO);
@@ -2447,7 +2328,7 @@ fn packed_assemble<T: Scalar>(
         }
         grad[a_idx] = acc;
     }
-    Some(pinned_rows > 0)
+    Some(())
 }
 
 /// The packed-row layout's chunked Hessian driver, the twin of
@@ -2674,14 +2555,11 @@ fn packed_hessian_chunks<T: Seed>(
             );
             // The objective's curvature weight, as the mode solve's exit
             // refresh stores it (`pirls::evaluate_at_mode`).
-            super::pirls::observed_weights_in_place(
-                family, nb_theta, y, prior_w, weighted, eta, prob, w, n,
-            );
+            super::pirls::observed_weights_in_place(family, nb_theta, y, prior_w, eta, prob, w, n);
         }
         let assembled = packed_assemble(
             g,
             family,
-            weighted,
             nb_theta,
             x,
             y,

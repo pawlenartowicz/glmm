@@ -11,8 +11,6 @@ use faer::{Mat, MatRef, Par, Side, Spec};
 use crate::lmm::{LmmGroupings, GLMM_RHO_END, RHO_BEGIN, THETA_TRUTH_FLOOR};
 use crate::scalar::Scalar;
 
-use super::BETA_BOX;
-
 /// Outer search over the variance components, fixed per shape at construction.
 /// `Joint`: one `[θ | β]` BOBYQA on the Laplace deviance, β held fixed inside PIRLS —
 /// the A/B reference every other route is checked against. `PqlThenJoint`: a θ-only
@@ -406,6 +404,100 @@ pub(crate) struct BorderScratch {
     pub beta_prev: Vec<f64>,
 }
 
+/// The β coordinates of the joint `[θ | β]` BOBYQA, the fixed-effect twin of
+/// the internally scaled θ̃ (`LmmGroupings::set_slope_scales`). The search runs
+/// on `β̃ = Lᵀβ`, with `L` the lower Cholesky factor of the prior-weighted Gram
+/// matrix `G = Σᵢ wᵢ xᵢxᵢᵀ / Σᵢ wᵢ` of this fit's design. Then `η = Xβ = X̃β̃`
+/// with `X̃ = XL⁻ᵀ`, whose weighted Gram is the identity: a unit step along any
+/// β̃ axis moves η by 1 in weighted root mean square, the scale θ̃ is searched
+/// on. So `rho_begin`, `rho_end` and the non-finite-point radius mean the same
+/// in every unit of X, and a column `x + a` next to the intercept is searched
+/// as the centred column (for `X = [1, x]`, `Lᵀβ = (β₀ + x̄β₁, sd(x)·β₁)`).
+/// Reduced to its diagonal, this is `rms_column_scale`, the θ side's statistic.
+/// The map is linear, so the objective, its optimum and the reported β are the
+/// same model in either coordinate; only the path BOBYQA takes changes.
+pub(crate) struct BetaScale {
+    /// p × p row-major; lower triangle holds `L` when `active`.
+    chol: Vec<f64>,
+    /// False when `G` has no Cholesky factor (a zero or exactly collinear
+    /// column): the search then runs on β itself.
+    active: bool,
+    /// The joint point in the caller's β units handed to the objective, length
+    /// `n_theta + p` (+1 on NB and Gamma).
+    point: Vec<f64>,
+}
+
+impl BetaScale {
+    pub(crate) fn new(p: usize, len: usize) -> Self {
+        BetaScale {
+            chol: vec![0.0; p * p],
+            active: false,
+            point: vec![0.0; len],
+        }
+    }
+
+    /// Factor `G` for this fit's design (`n` live rows, prior weights `w`).
+    pub(crate) fn set(&mut self, x: MatRef<f64>, w: &[f64], n: usize) {
+        let p = x.ncols();
+        debug_assert_eq!(self.chol.len(), p * p);
+        let sw: f64 = w[..n].iter().sum();
+        for a in 0..p {
+            for b in 0..=a {
+                let mut acc = 0.0;
+                for i in 0..n {
+                    acc += w[i] * x[(i, a)] * x[(i, b)];
+                }
+                self.chol[a * p + b] = acc / sw;
+            }
+        }
+        self.active = sw > 0.0 && crate::linalg::block_chol(&mut self.chol, p);
+    }
+
+    /// β → β̃ = Lᵀβ, in place (row i reads only β_j, j ≥ i).
+    pub(crate) fn to_search(&self, beta: &mut [f64]) {
+        if !self.active {
+            return;
+        }
+        let p = beta.len();
+        for i in 0..p {
+            let mut v = 0.0;
+            for (j, &b) in beta.iter().enumerate().skip(i) {
+                v += self.chol[j * p + i] * b;
+            }
+            beta[i] = v;
+        }
+    }
+
+    /// β̃ → β, in place.
+    pub(crate) fn to_caller(&self, beta: &mut [f64]) {
+        if self.active {
+            solve_lt(&self.chol, beta);
+        }
+    }
+
+    /// The search point `gamma = [θ̃ | β̃ | …]` with its β block in the caller's
+    /// units, for the objective.
+    pub(crate) fn caller_point(&mut self, gamma: &[f64], n_theta: usize, p: usize) -> &[f64] {
+        self.point.copy_from_slice(gamma);
+        if self.active {
+            solve_lt(&self.chol, &mut self.point[n_theta..n_theta + p]);
+        }
+        &self.point
+    }
+}
+
+/// Back substitution `Lᵀβ = b` in place, `L` row-major lower `p × p`.
+fn solve_lt(chol: &[f64], b: &mut [f64]) {
+    let p = b.len();
+    for i in (0..p).rev() {
+        let mut v = b[i];
+        for j in (i + 1)..p {
+            v -= chol[j * p + i] * b[j];
+        }
+        b[i] = v / chol[i * p + i];
+    }
+}
+
 /// The finite-difference pass's seed state, set by `joint_hessian_cov` before
 /// its grid and restored on every exit; every field is `m`-sized or scalar,
 /// so a worker workspace takes it by `clone`. `m = n_theta + p`, the `[θ | β]`
@@ -586,7 +678,9 @@ pub struct GlmmWorkspace {
     /// Joint (θ,β) BOBYQA solver, dimension `n_theta + p` (+1 on NB: the trailing
     /// `ln θ_NB` coordinate).
     pub solver: Bobyqa, // sized n_theta + p
-    /// Joint solver's live iterate: `[θ (n_theta) | β (p)]`. STABLE READ-BACK
+    /// Joint solver's live iterate: `[θ (n_theta) | β (p)]`; while the joint
+    /// search runs, the β block holds its coordinates β̃ (see [`BetaScale`]),
+    /// mapped back to β before `fit_glmm` reads it. STABLE READ-BACK
     /// CONVENTION: after `fit_glmm` returns with `converged == true`, this
     /// holds the pinned optimum — `params[..n_theta]` is θ̂ (boundary
     /// components zeroed) and `params[n_theta..n_theta + p]` is β̂ (on `Joint`
@@ -604,6 +698,12 @@ pub struct GlmmWorkspace {
     pub lower: Vec<f64>,
     /// Joint solver box upper bounds, length `n_theta + p` (+1 on NB and Gamma).
     pub upper: Vec<f64>,
+    /// The joint solver's β coordinates — see [`BetaScale`]. Set per fit.
+    pub(crate) beta_scale: BetaScale,
+    /// Scratch the length of `params`: first the start guard's `[θ | β₀]`
+    /// trial point, then the point the `PqlThenJoint` fallback restarts
+    /// `params` from. Held here so a warm fit allocates neither.
+    pub(crate) start_point: Vec<f64>,
     /// θ-only BOBYQA solver for the θ-only outer search shared by
     /// `PqlThenJoint` (a warm-start accelerant) and `ExactProfile` (the search
     /// itself — see `OuterSearch`): sized `n_theta` (+1 on NB and Gamma), configured with
@@ -680,6 +780,20 @@ pub struct GlmmWorkspace {
     /// Whether the FINAL re-evaluation at the pinned γ̂ itself exhausted the
     /// PIRLS cap. Reset to `false` at the top of every `fit_glmm`.
     pub(crate) final_pirls_exhausted: bool,
+    /// `ExactProfile` ended not converged and the fit reran once on
+    /// `PqlThenJoint` — see [`crate::Note::ExactProfileFallback`]. Always
+    /// `false` on a shape that does not route `ExactProfile`. Reset to
+    /// `false` at the top of every `fit_glmm`.
+    pub(crate) exact_profile_fallback: bool,
+    /// Initial trust radius of both BOBYQA searches (`rho_begin`), kept for the
+    /// convergence check in `fit_glmm` that measures non-finite evaluations
+    /// against it.
+    pub(crate) rho_begin: f64,
+    /// The points of the convergence-gating search whose objective came back
+    /// non-finite, flattened (one search-vector length each). Cleared at the top
+    /// of every `fit_glmm`; empty, and never allocated, on a fit whose every
+    /// evaluation is finite.
+    pub(crate) non_finite_points: Vec<f64>,
     /// Observation-only optimizer counters for the fit in progress — the stage
     /// split, the shrink phase, the PIRLS histogram and the AGQ node cost.
     /// Never read by any numeric path. Reset to `new()` at the top of every
@@ -860,16 +974,19 @@ impl GlmmWorkspace {
         } else {
             groupings.k_crossed()
         };
-        // Whether this family's PIRLS takes the observed-information step, and
-        // so whether the exact profile's observed twins carry storage at all.
-        let observed = !packed_layout && !crate::family::is_canonical(family);
 
-        // Bounds: θ part from blind_theta_and_bounds; β part = [−BETA_BOX, BETA_BOX].
+        // Bounds: θ part from blind_theta_and_bounds; β unbounded (the bobyqa
+        // crate reads an infinite bound as none). Any finite box on β is in the
+        // units of y and of the X columns: on a log link y·c moves β̂₀ by ln c, and
+        // x·s moves β̂ⱼ by 1/s, so a fixed box clamps fits that are large only
+        // in the caller's units. A β that runs off under separation is left to
+        // the search's own stops, as on the `ExactProfile` route, whose θ-only
+        // search never bounds β.
         let (theta0, mut lower, mut upper) = groupings.blind_theta_and_bounds();
         let mut params = theta0;
         params.extend(std::iter::repeat_n(0.0, p)); // β cold default; overwritten at fit
-        lower.extend(std::iter::repeat_n(-BETA_BOX, p));
-        upper.extend(std::iter::repeat_n(BETA_BOX, p));
+        lower.extend(std::iter::repeat_n(f64::NEG_INFINITY, p));
+        upper.extend(std::iter::repeat_n(f64::INFINITY, p));
         if n_disp == 1 {
             // ln θ_NB / ln φ start; written by `fit_glmm` from `nb_theta` / the
             // Gamma seed.
@@ -990,7 +1107,12 @@ impl GlmmWorkspace {
         // is Gamma, non-canonical structured extras, and packed-layout extras — a
         // population this sweep never measured. The threshold stands because nothing
         // has re-measured it, not because these numbers still cover it.
-        let outer_search = if super::exact_profile_shape(family, nagq, layout) {
+        // The exact border's curvature buffers (`ExactProfileBufs::curv_*`,
+        // `rows`/`rows_ptr`) are read only by an exact-profile solve, so they
+        // are sized only on the shapes whose stage 1 is one.
+        let exact_shape = super::exact_profile_shape(family, nagq, layout);
+        let curv = |len: usize| if exact_shape { len.max(1) } else { 1 };
+        let outer_search = if exact_shape {
             OuterSearch::ExactProfile
         } else if nagq > 1 || (n_theta <= 2 && p <= 4) {
             OuterSearch::Joint
@@ -1021,6 +1143,8 @@ impl GlmmWorkspace {
             packed,
             solver: Bobyqa::new(n_theta + p + n_disp, config)
                 .expect("BOBYQA config constants are valid by construction"),
+            beta_scale: BetaScale::new(p, params.len()),
+            start_point: vec![0.0; params.len()],
             params,
             lower,
             upper,
@@ -1068,35 +1192,26 @@ impl GlmmWorkspace {
                 // path's `k_family + e` as well as the blocked path's `q·s`.
                 logdet_u: vec![0.0; k.max(1)],
                 logdet_beta: vec![0.0; p],
-                // Twins of the four buffers above, sized only where the exact
-                // profile reads them — the `observed` flag above, which the
-                // `DualStep` twins mirror through `derivative::DenseTwinShape`.
-                obs_blocks: vec![0.0; super::pirls::obs_len(observed, (q * q * n_primary).max(1))],
-                obs_core_blocks: vec![
-                    0.0;
-                    super::pirls::obs_len(
-                        observed,
-                        (q_core * q_core * n_primary).max(1)
-                    )
-                ],
-                obs_coupling: vec![
-                    0.0;
-                    super::pirls::obs_len(
-                        observed,
-                        (q_core * n_primary * e_crossed).max(1)
-                    )
-                ],
-                obs_schur_blk: vec![
-                    0.0;
-                    super::pirls::obs_len(observed, (e_crossed * e_crossed).max(1))
-                ],
-                obs_schur: None,
                 u_acc: vec![0.0; k.max(1)],
                 tail_inv: vec![0.0; (e_crossed * e_crossed).max(1)],
                 tail_r: vec![0.0; e_crossed.max(1)],
                 tail_g: vec![0.0; (q_core * q_core * n_primary).max(1)],
                 tail_h: vec![0.0; (q_core * n_primary * e_crossed).max(1)],
                 fac_f64: vec![0.0; (q_core * q_core * n_primary).max(1)],
+                logdet_hess: Mat::zeros(p, p),
+                schur_plain: Mat::zeros(p, p),
+                xt_row: vec![0.0; p],
+                trust_g: vec![0.0; p],
+                trust_q: vec![0.0; p],
+                rows_ptr: vec![0u32; curv(n_primary + 1)],
+                rows: vec![0u32; curv(max_n)],
+                curv_cc: vec![0.0; curv(p * q_core * (q_core + 1) / 2)],
+                curv_chat: vec![0.0; curv(q_core * e_crossed)],
+                curv_ct: vec![0.0; curv(p * q_core * e_crossed)],
+                curv_v: vec![0.0; curv(p * q_core * e_crossed)],
+                curv_vs: vec![0.0; curv(q_core * e_crossed)],
+                curv_u: vec![0.0; curv(p * e_crossed * e_crossed)],
+                curv_tmp: vec![0.0; curv(e_crossed * e_crossed)],
             },
             inference: InferenceScratch {
                 hess_scratch: Mat::zeros((n_theta + p).max(1), (n_theta + p).max(1)),
@@ -1122,6 +1237,9 @@ impl GlmmWorkspace {
             offset: None,
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
+            exact_profile_fallback: false,
+            rho_begin,
+            non_finite_points: Vec::new(),
             counters: crate::counters::EvalCounters::new(),
             dual_scratch: None,
             hyper_scratch: None,
@@ -1191,13 +1309,6 @@ pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
         .as_ref()
         .map(|ss| ss.clone_scratch());
     w.pattern.force_dense_schur = src.pattern.force_dense_schur;
-    // Mirrors the Fisher factor above so the two cannot drift, but FD workers
-    // evaluate `BetaMode::Fixed` and never read the exact-profile twin.
-    w.exact_prof.obs_schur = src
-        .exact_prof
-        .obs_schur
-        .as_ref()
-        .map(|ss| ss.clone_scratch());
     w.nb_theta = src.nb_theta;
     w.gamma_phi = src.gamma_phi;
     w.gamma_phi_held = src.gamma_phi_held;

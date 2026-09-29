@@ -201,7 +201,10 @@ esac
 
 # ---- run directory: never overwritten --------------------------------------
 slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g; s/^-//; s/-$//'; }
-MACHINE="$(slug "$(uname -n)")"
+# GRID_MACHINE names the machine in run_meta and the directory name; the hostname
+# is the fallback. Keep it fixed per machine: summarize_timing.R refuses to mix
+# seconds from runs whose names differ.
+MACHINE="$(slug "${GRID_MACHINE:-$(uname -n)}")"
 BASE="$(date +%F)_${ENGINE_VERSION}_${MACHINE}"
 [[ -n "$LABEL" ]] && BASE="${BASE}_$(slug "$LABEL")"
 RUN_ROOT="$GRID/runs/$ENGINE"

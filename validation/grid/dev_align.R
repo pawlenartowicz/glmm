@@ -177,26 +177,26 @@ reml_gaussian_const <- function(rec, df, cell) {
 # likelihood reported two ways. R's weighted normal log-likelihood (stats::lm's
 # logLik, and lme4's) counts the N rows and carries a 0.5*sum(log w) term,
 #   0.5*sum(log w) - N/2 * (log(2*pi*D/N) + 1),      D = sum(w * resid^2),
-# while GLM.jl's Normal log-likelihood -- what MixedModels.jl and glmmTMB both
-# report on a fixed-effects gaussian cell -- puts n = sum(w) in place of N and
-# has no sum(log w) term at all,
+# while GLM.jl's Normal log-likelihood -- what MixedModels.jl reports on a
+# fixed-effects gaussian cell -- puts n = sum(w) in place of N and has no
+# sum(log w) term at all,
 #   -sum(w)/2 * (log(2*pi*D/sum(w)) + 1).
 # The two differ by a SCALE on the log-likelihood, so no additive constant
 # aligns them and nothing closed-form can be written here. These records are
 # excluded from the deviance gate instead, which is what returning NA does.
 #
 # MEASURED 2026-09-22 on wls_basic (N = 200, sum(w) = 223.285466,
-# sum(log w) = -2.973678, unlocked box): MixedModels and glmmTMB both report
-# -258.98477623 where stats::lm and glmm report -244.47659409. The two formulas
-# above reproduce that 14.50818213 gap to eight decimals and the coefficients
-# agree on all four engines, so it is a reporting scale and not a different fit.
-# lme4 is an oracle on every prior-weight gaussian cell in the manifest, so gate
-# 1 keeps a reference on each one.
+# sum(log w) = -2.973678, unlocked box): MixedModels reports -258.98477623
+# where stats::lm and glmm report -244.47659409. The two formulas above
+# reproduce that 14.50818213 gap to eight decimals and the coefficients agree on
+# all four engines, so it is a reporting scale and not a different fit. lme4 and
+# glmmTMB are oracles on every prior-weight gaussian cell in the manifest and
+# both report stats::lm's scale there (glmmTMB through the dispersion offset in
+# engines/glmmtmb.R), so gate 1 keeps a reference on each one.
 #
-# WHY THE EXCLUSION HAS TO BE HERE rather than left to the gate's own outlier
-# test: that test drops the oracle furthest from the MEDIAN of the candidates,
-# and on these cells two of the three oracles share the sum(w) convention. The
-# majority would expel lme4, the one oracle on glmm's own scale.
+# The exclusion is written here rather than left to the gate's own outlier
+# test, which drops the oracle furthest from the MEDIAN of the candidates and so
+# depends on how many oracles converged on the cell.
 #
 # `n_theta == 0` is the fixed-effects test, not `structure == "glm"`: the
 # committed-fixture cells carry no `structure` field.
@@ -205,47 +205,22 @@ mixedmodels_gaussian <- function(rec, df, cell) {
   0
 }
 
-# glmmTMB excludes every prior-weight cell, mixed as well as fixed-effects,
-# because there it does not merely report a different scale -- it fits a
-# REPLICATION-weight likelihood, multiplying each row's log-density by w_i, where
-# lme4, MixedModels' mixed path and glmm fit R's prior-weight likelihood
-# Var(y_i) = sigma^2 / w_i. A different objective has no alignment constant.
-#
-# The family does not enter it, so the exclusion is not gaussian-only. MEASURED
-# on the unlocked box: 2026-09-22 on lmm_int1_g3000p20_bal_base_wts, glmmTMB's
-# residual sd 0.3425203 against the 0.6033462 lme4, MixedModels and glmm all
-# return, logLik 1905.56 away; 2026-09-23 on gaml_int1_g3000p20_bal_base_wts,
-# glmmTMB's sigma 0.401 against lme4's 0.710 -- a relative gap of 0.43, the same
-# 0.43 the gaussian cell gives, which is the replication-weight convention and
-# not a Gamma effect.
-#
-# WEIGHTS THAT ARE ALL 1 ARE NOT EXCLUDED. The two likelihoods coincide when
-# every w_i is 1, and they are measured to: on `all_ones` the three engines agree
-# to 3e-06 (2026-09-23). Testing for the PRESENCE of a weights column would throw
-# away a usable reference on a cell that has no weighting in it.
-#
-# WHY THE EXCLUSION HAS TO BE HERE rather than left to the gate's own outlier
-# test: that test needs three candidates, and on a weighted cell it often has
-# two.
-glmmtmb_prior_weights <- function(rec, df, cell) {
-  if (is.null(cell[["weights_col"]])) return(0)
-  if (all(df[[cell[["weights_col"]]]] == 1)) return(0)
-  NA_real_
-}
-
 # --- engines that maximise a different objective: excluded, not aligned ------
 # glmm's Laplace log-likelihood builds log|A| from the OBSERVED curvature of the
 # integrand at the mode, and on Gamma it maximises over the dispersion on
-# fixed-effects and mixed cells alike, with the weights multiplying each row's
-# log-density. That is glmmTMB's objective, and three reference engines report
+# fixed-effects and mixed cells alike, with each prior weight dividing its row's
+# dispersion. That is glmmTMB's objective (on prior-weight cells through the
+# dispersion offset in engines/glmmtmb.R), and three reference engines report
 # a different one on some cells. A different objective has no alignment
-# constant, so those records return NA and are excluded from gate 1 loudly;
-# gate 2 still puts their parameters to glmm, against the nearest oracle.
+# constant, so those records return NA and are excluded from gate 1 loudly.
+# Gate 2 reads the same exclusions through objective_differs below, per
+# quantity.
 #
 #   * lme4's glmer and glmer.nb build log|A| from the expected (Fisher) weight,
 #     which differs from the observed one on every non-canonical link: probit
 #     and cloglog binomial, and negative binomial's log. On a mixed Gamma cell
-#     glmer also plugs in its pwrss/n scale instead of maximising over phi.
+#     glmer also plugs in D/Σw for phi instead of maximising over it (pwrss/n
+#     is only what sigma() reports downstream).
 #   * On a fixed-effects Gamma cell lme4's record is stats::glm, whose logLik
 #     evaluates the density at the plug-in dispersion deviance/n, not at the
 #     maximum over it. MEASURED 2026-09-23 on gaml_glm_g3000 (3000 rows, log
@@ -255,10 +230,10 @@ glmmtmb_prior_weights <- function(rec, df, cell) {
 #   * MixedModels.jl's GLMM Laplace uses the Fisher weight as glmer's does, so
 #     its mixed probit and cloglog cells are excluded the same way.
 #
-# glmmTMB's Gamma entry, which until 2026-09-24 excluded the fixed-effects
-# Gamma cells (then glmm reported stats::glm's plug-in value) and the
-# prior-weight Gamma cells (then glmm fitted the prior-weight likelihood), now
-# excludes neither: glmm fits both of glmmTMB's likelihoods on Gamma.
+# glmmTMB's Gamma entry excludes no cell: glmmTMB maximises over the
+# dispersion on fixed-effects cells as glmm does, and on prior-weight cells the
+# dispersion offset in engines/glmmtmb.R gives it glmm's precision-weight
+# likelihood.
 fisher_laplace <- function(cell) {
   cell[["n_theta"]] > 0 &&
     (cell[["family"]] %in% c("negativebinomial") ||
@@ -324,7 +299,7 @@ ALIGN <- list(
     # MASS::glm.nb, stats::glm and glmer all reach logLik the same way; the
     # family changes the density, not the reporting.
     gamma            = align(lme4_objective, "derived",
-      note = "same reporting mechanism as the confirmed gaussian, binomial and poisson entries for this engine, but every gamma record returns NA and is excluded: stats::glm's plug-in dispersion on the fixed-effects cells and glmer's Fisher-weight, pwrss/n objective on the mixed ones are not glmm's objective (see lme4_objective above)"),
+      note = "same reporting mechanism as the confirmed gaussian, binomial and poisson entries for this engine, but every gamma record returns NA and is excluded: stats::glm's plug-in dispersion on the fixed-effects cells, and glmer's D/Σw plug-in dispersion (with the Fisher-weight Laplace on the log link) on the mixed ones, are not glmm's objective (see lme4_objective above)"),
     negativebinomial = align(lme4_objective, "derived",
       note = "same reporting mechanism as the confirmed gaussian, binomial and poisson entries for this engine: R's logLik is one generic over lm, glm and merMod and the family enters only the density it sums. Mixed cells return NA and are excluded: glmer.nb's Fisher-weight Laplace is not glmm's objective (see lme4_objective above)"),
     inversegaussian  = align("none", "derived",
@@ -338,11 +313,10 @@ ALIGN <- list(
     agq = align(saturated_loglik, "confirmed", "2026-08-24",
                 "closed-form saturated logLik; verified against the frozen cbpp and grouseticks nAGQ goldens, and again 2026-09-22 on pois_int1_g3000p20_bal_base_agq7, where lme4's reported logLik plus the term lands 5.2e-08 from GLMMadaptive's")),
   glmmTMB = list(
-    # Prior-weight gaussian cells are excluded rather than aligned -- see
-    # glmmtmb_prior_weights above for the measurement. Everything else on this
-    # family matches lme4.
-    gaussian         = align(glmmtmb_prior_weights, "confirmed", "2026-09-22",
-      "5 gaussian cells without prior weights (stats::lm, REML mixed to 30000 rows, sleepstudy, sim_slope_lmm): max |diff| 1.12e-06 against a 2e-06 band. Prior-weight gaussian cells whose weights are not all 1 return NA and are excluded"),
+    # On prior-weight cells glmmTMB fits the dispersion offset
+    # (engines/glmmtmb.R), which reports lme4's and stats::lm's logLik.
+    gaussian         = align("none", "confirmed", "2026-09-22",
+      "5 gaussian cells without prior weights (stats::lm, REML mixed to 30000 rows, sleepstudy, sim_slope_lmm): max |diff| 1.12e-06 against a 2e-06 band. 10 prior-weight gaussian cells with the dispersion offset (wls_basic, path_*, lmm_intercept, lmm_slope, lmm_crossed, lmm_*_wts), glmmTMB run of 2026-09-27: max |diff| 2.19e-08 against lme4's logLik"),
     # The probit and cloglog cells are a different OPTIMUM, not a different
     # report, so they say nothing about the mechanism: glmmTMB's logLik there is
     # 0.13 to 1.55 ABOVE lme4's while its beta is up to 1.3e-01 from lme4's and
@@ -352,7 +326,7 @@ ALIGN <- list(
     poisson          = align("none", "confirmed", "2026-09-22",
       "4 poisson cells (stats::glm, mixed, offset, prior weights): max |diff| 4.3e-09 against a 1e-03 band"),
     gamma            = align("none", "derived",
-      note = "same reporting mechanism as the confirmed binomial and poisson entries for this engine: glmmTMB reports the same marginal Laplace log-likelihood whatever the family, and the family enters only the density TMB integrates. Since 2026-09-24 no gamma cell is excluded: glmm maximises over the dispersion on fixed-effects cells as glmmTMB does, and fits the same replication-weight likelihood on prior-weight cells"),
+      note = "same reporting mechanism as the confirmed binomial and poisson entries for this engine: glmmTMB reports the same marginal Laplace log-likelihood whatever the family, and the family enters only the density TMB integrates. Since 2026-09-24 no gamma cell is excluded: glmm maximises over the dispersion on fixed-effects cells as glmmTMB does, and on prior-weight cells the dispersion offset in engines/glmmtmb.R gives glmm's precision-weight likelihood"),
     negativebinomial = align("none", "derived",
       note = "same reporting mechanism as the confirmed binomial and poisson entries for this engine: glmmTMB reports the same marginal Laplace log-likelihood whatever the family, and the family enters only the density TMB integrates")),
     # no inversegaussian key: the manifest never sends glmmTMB such a cell
@@ -382,6 +356,15 @@ ALIGN$glmm_python <- ALIGN$glmm
 ALIGN$glmm_r <- ALIGN$glmm
 
 # --- the resolver -----------------------------------------------------------
+# The ALIGN entry for this record's engine on this cell, or NULL when the engine
+# has no row or no entry for the family.
+align_entry <- function(rec, cell) {
+  tbl <- ALIGN[[rec$engine]]
+  if (is.null(tbl)) return(NULL)
+  nagq <- if (is.null(cell[["nagq"]])) 1L else as.integer(cell[["nagq"]])
+  if (nagq > 1L && !is.null(tbl$agq)) tbl$agq else tbl[[cell[["family"]]]]
+}
+
 # NEVER stop()s. Every failure mode returns NA_real_ with a `why` attribute, and
 # compare.R prints it as a LOUD exclusion. A comparator that can crash on one
 # unexpected cell cannot be run overnight.
@@ -391,10 +374,10 @@ aligned_dev <- function(rec, cell) {
   if (is.null(ll) || !is.numeric(ll) || length(ll) != 1L || !is.finite(ll)) {
     return(fail(sprintf("%s reported no finite loglik", rec$engine)))
   }
-  tbl <- ALIGN[[rec$engine]]
-  if (is.null(tbl)) return(fail(sprintf("no alignment row for engine %s", rec$engine)))
-  nagq <- if (is.null(cell[["nagq"]])) 1L else as.integer(cell[["nagq"]])
-  entry <- if (nagq > 1L && !is.null(tbl$agq)) tbl$agq else tbl[[cell[["family"]]]]
+  if (is.null(ALIGN[[rec$engine]])) {
+    return(fail(sprintf("no alignment row for engine %s", rec$engine)))
+  }
+  entry <- align_entry(rec, cell)
   if (is.null(entry)) {
     return(fail(sprintf("%s/%s: no alignment entry (this engine does not fit this family)",
                         rec$engine, cell[["family"]])))
@@ -417,6 +400,19 @@ aligned_dev <- function(rec, cell) {
   -2 * (ll + addend)
 }
 
+# TRUE when this record is one of the exclusions above: its entry is a closed
+# form that returns NA on this cell by design (lme4_objective,
+# mixedmodels_binomial, mixedmodels_gaussian, or
+# saturated_loglik on a family it has no closed form for). This is narrower than
+# is.na(aligned_dev(...)): a record with no finite loglik, or an engine with no
+# entry for the family, is not on a different objective. compare.R's gate 2
+# reads it, per quantity.
+objective_differs <- function(rec, cell) {
+  entry <- align_entry(rec, cell)
+  if (is.null(entry) || !is.function(entry$addend)) return(FALSE)
+  is.na(entry$addend(rec, grid_read_data(cell), cell))
+}
+
 # Which entries are asserted rather than measured -- printed by compare.R's
 # header so a run always says what its deviance scale rests on.
 align_status <- function() {
@@ -424,4 +420,178 @@ align_status <- function() {
     do.call(rbind, lapply(names(ALIGN[[e]]), function(f) data.frame(
       engine = e, family = f, status = ALIGN[[e]][[f]]$status,
       confirmed = ALIGN[[e]][[f]]$confirmed, stringsAsFactors = FALSE)))))
+}
+
+# --- GLMMadaptive's vector-AGQ rule, evaluated at glmm's point ---------------
+# With q >= 2 random effects per group, nAGQ > 1 is a tensor-product
+# Gauss-Hermite grid, and a product grid is not rotation-invariant: the value
+# depends on which square root of the mode's posterior covariance places it.
+# glmm (src/glmm/agq.rs, agq_deviance_vec) places the nodes in u-space
+# (b = Lambda u) at u_hat + sqrt(2) L_A^{-T} z, with A = Lambda' Z'WZ Lambda + I =
+# L_A L_A'. GLMMadaptive 0.9-7 (GHfun) places them in b-space at
+# b_hat + sqrt(2) R^{-1} z, with R = chol(H_b) upper and H_b = Z'WZ + D^{-1}. Both
+# are valid adaptive rules for the same integral, but at one point they differ by
+# 2.6e-4 (binb_q2s) and 7.4e-5 (pois_q2s), above dev_eps. There is no closed-form
+# constant between them, so gate 1 compares like for like instead: GLMMadaptive's
+# rule at glmm's point against GLMMadaptive's rule at GLMMadaptive's point (its
+# reported deviance).
+#
+# Written in u-space so it needs no D^{-1}. GLMMadaptive's node matrix in u-space
+# is M = L_A^{-T} Q, where F = Lambda L_A^{-T} = U Q' is the RQ factorization of F
+# (U upper triangular, Q orthogonal), because Lambda M = U is then the unique
+# upper-triangular root of H_b^{-1}. Nothing here divides by an entry of Lambda
+# or D. Off the boundary the value depends only on D = Lambda Lambda', so Lambda
+# is rebuilt as chol(D) from the record's stddev and corr (written round-trip
+# exact); glmm's own Lambda is never needed.
+# On a singular D the rule has no limit -- its value depends on the direction of
+# approach -- so there is nothing to evaluate and the function returns NA.
+#
+# GLMMadaptive's H_b is a central difference of the score, the OBSERVED
+# information, so the negative-binomial and Gamma weights below are the observed
+# ones; on the canonical logit and log links the two coincide.
+#
+# Families: binomial/logit, poisson/log, negativebinomial/log, gamma/log.
+# Anything else returns NA with a `why`, never a guess.
+
+# Cells where gate 1 scores GLMMadaptive's comparison under its own rule: AGQ
+# with more than one random effect per group. GLMMadaptive fits exactly one
+# grouping factor, so n_theta > 1 is q >= 2. The two rules coincide at q = 1.
+ga_rule_cell <- function(cell) {
+  !is.null(cell[["nagq"]]) && cell[["nagq"]] > 1 && cell[["n_theta"]] > 1
+}
+
+# Gauss-Hermite nodes and weights for weight exp(-x^2), by Golub-Welsch.
+gh_nodes <- function(k) {
+  J <- matrix(0, k, k)
+  off <- sqrt(seq_len(k - 1L) / 2)
+  J[cbind(seq_len(k - 1L), 2:k)] <- off
+  J[cbind(2:k, seq_len(k - 1L))] <- off
+  e <- eigen(J, symmetric = TRUE)
+  list(x = e$values, w = sqrt(pi) * e$vectors[1, ]^2)
+}
+
+# Householder RQ of a square F: F = U Q' with U upper triangular. Rows are
+# reduced from the bottom (LAPACK dgerqf order); a zero row takes the identity
+# reflector, as LAPACK does. Column signs of Q do not matter: the product grid is
+# symmetric in every coordinate.
+rq_q <- function(F) {
+  q <- nrow(F); Q <- diag(q); U <- F
+  if (q < 2L) return(Q)
+  for (i in q:2) {
+    x <- U[i, 1:i]; nx <- sqrt(sum(x^2))
+    if (nx == 0) next
+    v <- x; v[i] <- v[i] + (if (x[i] >= 0) 1 else -1) * nx
+    H <- diag(i) - 2 * tcrossprod(v) / sum(v^2)
+    U[, 1:i] <- U[, 1:i] %*% H
+    Q[, 1:i] <- Q[, 1:i] %*% H
+  }
+  Q
+}
+
+# Per-row log density, score d/d eta and observed weight -d^2/d eta^2, or NULL
+# for a family/link with no evaluator.
+ga_rule_family <- function(cell, df, rec) {
+  fam <- cell[["family"]]; link <- cell[["link"]]
+  if (identical(fam, "binomial") && identical(link, "logit")) {
+    r <- binomial_response(cell, df); y <- r$y; n <- r$n
+    return(list(
+      ll = function(eta) y * eta - n * (pmax(eta, 0) + log1p(exp(-abs(eta)))) + lchoose(n, y),
+      score = function(eta) y - n * plogis(eta),
+      w = function(eta) { p <- plogis(eta); n * p * (1 - p) }))
+  }
+  y <- df[[cell[["response"]]]]
+  if (identical(fam, "poisson") && identical(link, "log")) {
+    return(list(ll = function(eta) y * eta - exp(eta) - lgamma(y + 1),
+                score = function(eta) y - exp(eta),
+                w = function(eta) exp(eta)))
+  }
+  if (identical(fam, "negativebinomial") && identical(link, "log")) {
+    th <- as.numeric(rec$nb_theta)
+    return(list(
+      ll = function(eta) lgamma(y + th) - lgamma(th) - lgamma(y + 1) + th * log(th) +
+        y * eta - (th + y) * log(exp(eta) + th),
+      score = function(eta) { mu <- exp(eta); th * (y - mu) / (mu + th) },
+      w = function(eta) { mu <- exp(eta); th * mu * (th + y) / (mu + th)^2 }))
+  }
+  # GLMMadaptive's Gamma.fam(): dgamma(y, shape = nu, scale = mu / nu), with the
+  # dispersion 1/nu. Every record's `sigma` is that dispersion's square root, so
+  # nu = 1 / sigma^2.
+  if (identical(fam, "gamma") && identical(link, "log")) {
+    nu <- 1 / as.numeric(rec$sigma)^2
+    return(list(ll = function(eta) stats::dgamma(y, shape = nu, scale = exp(eta) / nu, log = TRUE),
+                score = function(eta) nu * (y * exp(-eta) - 1),
+                w = function(eta) nu * y * exp(-eta)))
+  }
+  NULL
+}
+
+# -2 x GLMMadaptive's nAGQ log-likelihood at the point `rec` reports, on the
+# cell's data, or NA with a `why`. `rec` is any engine's record: glmm's for the
+# gate, GLMMadaptive's own for a self-check.
+ga_rule_dev <- function(rec, cell) {
+  fail <- function(why) { out <- NA_real_; attr(out, "why") <- why; out }
+  df <- grid_read_data(cell)
+  fm <- ga_rule_family(cell, df, rec)
+  if (is.null(fm)) return(fail(sprintf("no GLMMadaptive-rule evaluator for %s/%s",
+                                       cell[["family"]], cell[["link"]])))
+  mf <- stats::model.frame(stats::as.formula(cell[["ma_fixed"]]), df)
+  X <- stats::model.matrix(stats::as.formula(cell[["ma_fixed"]]), mf)
+  off0 <- stats::model.offset(mf); if (is.null(off0)) off0 <- 0
+  rparts <- strsplit(cell[["ma_random"]], "|", fixed = TRUE)[[1]]
+  Z <- stats::model.matrix(stats::as.formula(rparts[1]), df)
+  gid <- as.integer(factor(df[[trimws(rparts[2])]]))
+  G <- max(gid); q <- ncol(Z)
+  beta <- as.numeric(rec$beta)[match(colnames(X), rec$coef_names)]
+  if (anyNA(beta) || length(beta) != ncol(X)) return(fail("coefficient names do not match ma_fixed"))
+  vc <- rec$varcomp
+  if (is.data.frame(vc)) vc <- lapply(seq_len(nrow(vc)), function(i) as.list(vc[i, ]))
+  if (length(vc) != 1L || !identical(as.character(unlist(vc[[1]]$terms)), colnames(Z)))
+    return(fail("random-effect terms do not match ma_random"))
+  sd <- stddevs_of(rec)
+  R <- diag(q); R[upper.tri(R)] <- corrs_of(rec); R[lower.tri(R)] <- t(R)[lower.tri(R)]
+  Lam <- tryCatch(t(chol(diag(sd, q) %*% R %*% diag(sd, q))), error = function(e) NULL)
+  if (is.null(Lam)) return(fail("singular random-effect covariance: GLMMadaptive's rule has no limit there"))
+
+  # Per-group u-space mode by Newton; every family above has a positive weight,
+  # so A is positive definite at every step.
+  eta0 <- off0 + drop(X %*% beta); ZL <- Z %*% Lam
+  pairs <- expand.grid(a = seq_len(q), b = seq_len(q))
+  A_of <- function(w) {
+    S <- vapply(seq_len(nrow(pairs)), function(k)
+      rowsum(ZL[, pairs$a[k]] * ZL[, pairs$b[k]] * w, gid, reorder = TRUE)[, 1], numeric(G))
+    lapply(seq_len(G), function(c) matrix(S[c, ], q, q) + diag(q))
+  }
+  U <- matrix(0, G, q); done <- FALSE
+  for (it in 1:100) {
+    eta <- eta0 + rowSums(ZL * U[gid, , drop = FALSE])
+    grad <- rowsum(ZL * fm$score(eta), gid, reorder = TRUE) - U
+    A <- A_of(fm$w(eta))
+    step <- matrix(vapply(seq_len(G), function(c) solve(A[[c]], grad[c, ]), numeric(q)),
+                   G, q, byrow = TRUE)
+    U <- U + step
+    if (max(abs(step)) < 1e-12) { done <- TRUE; break }
+  }
+  if (!done) return(fail("GLMMadaptive-rule evaluator: mode search did not converge"))
+  A <- A_of(fm$w(eta0 + rowSums(ZL * U[gid, , drop = FALSE])))
+
+  gh <- gh_nodes(as.integer(cell[["nagq"]]))
+  z <- as.matrix(expand.grid(rep(list(gh$x), q)))
+  lw <- log(apply(as.matrix(expand.grid(rep(list(gh$w), q))), 1, prod)) + rowSums(z^2)
+  Ms <- vector("list", G); ldM <- numeric(G)
+  for (c in seq_len(G)) {
+    LA <- t(chol(A[[c]]))
+    M <- backsolve(t(LA), diag(q))            # L_A^{-T}
+    Ms[[c]] <- M %*% rq_q(Lam %*% M)
+    ldM[c] <- -sum(log(diag(LA)))
+  }
+  vals <- matrix(0, G, nrow(z))
+  for (j in seq_len(nrow(z))) {
+    Uj <- U + sqrt(2) * matrix(vapply(Ms, function(M) drop(M %*% z[j, ]), numeric(q)),
+                               G, q, byrow = TRUE)
+    eta <- eta0 + rowSums(ZL * Uj[gid, , drop = FALSE])
+    vals[, j] <- rowsum(fm$ll(eta), gid, reorder = TRUE)[, 1] - 0.5 * rowSums(Uj^2) -
+      (q / 2) * log(2 * pi) + lw[j]
+  }
+  m <- apply(vals, 1, max)
+  -2 * sum((q / 2) * log(2) + ldM + m + log(rowSums(exp(vals - m))))
 }

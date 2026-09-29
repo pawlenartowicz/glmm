@@ -70,9 +70,10 @@ Points worth knowing at this layer:
 - `data` is a `data.frame` (or anything `as.data.frame()` accepts). Response and
   fixed-effect columns are read as `double`; grouping columns (the `g` in
   `(1 + x | g)`) may be factor, character, integer, or logical and are
-  factorized to level ids. A character column becomes a factor with
-  **lexicographic** level order (exactly what `factor()` does); a factor's
-  declared level order is honored.
+  factorized to level ids. A character or logical predictor becomes a factor
+  with **lexicographic** level order (exactly what `factor()` does, so a
+  logical `x` has levels `FALSE`/`TRUE` and fits a coefficient `xTRUE`, as in
+  lme4); a factor's declared level order is honored.
 - The default `family = gaussian()` with no `(… | g)` term fits **OLS**; adding a
   random-effect term makes it an **LMM** (REML). The same split holds for every
   family: fixed-only ⇒ GLM, `(… | g)` present ⇒ GLMM.
@@ -185,7 +186,7 @@ shaped like lme4's. These **work**:
 | `summary(fit)` | coefficient table (estimate, std. error, Wald **z**, `Pr(>|z|)`), plus the RE block and a dispersion/shape footer. When the fit raised any warnings, the printed summary ends with a `Warnings:` section listing each one's tier, title and message. **No** `AIC`/`BIC`/`logLik`/`deviance` line: the kernel surfaces no comparable log-likelihood, and a fake one would be worse than none. |
 | `fixef(fit)` | named fixed-effect estimates; aliased (rank-deficient) columns are `NA`, as in `lm`/lme4. |
 | `vcov(fit)` | full `p × p` Wald covariance of β̂. |
-| `VarCorr(fit)` | variance components on the **SD/correlation** scale, one covariance per grouping, lme4-shaped; a `Residual` row (= `sigma()`) is printed for a gaussian mixed fit. |
+| `VarCorr(fit)` | variance components on the **SD/correlation** scale, one covariance per grouping, lme4-shaped; a `Residual` row (= `sigma()`) is printed for a gaussian mixed fit. Groups are listed in the order they appear in the formula — lme4's own `VarCorr` instead sorts by decreasing number of levels. |
 | `confint(fit)` | Wald intervals off `vcov()`. `method = "profile"`/`"boot"` are not available and say so. |
 | `isSingular(fit)` | boundary-fit flag — lme4's condition, computed by the kernel. |
 | `sigma(fit)` | residual SD for gaussian fits, `sqrt(phi)` for Gamma/inverse-Gaussian; `1` for binomial/Poisson/negative-binomial (fixed scale, as in lme4). |

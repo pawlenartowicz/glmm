@@ -356,10 +356,8 @@ const _: () = assert!(MAX_DUAL_H == MAX_DUAL_N * (MAX_DUAL_N + 1) / 2);
 /// exact-Hessian step (`pirls::DualStep`: canonical `A`, or the
 /// observed-information `A_obs` on a non-canonical link), so the IFT lanes are
 /// reached in one step and the loop is skipped. It is entered on
-/// `DualStep::exact == false`, which is either a row on the kernel's μ clamp
-/// (`pirls::clamped_row_present`) or a non-PD observed factor — one
-/// block on the blocked path, the whole crossed-tail Schur on the
-/// structured-extras path. There the lanes contract by
+/// `DualStep::exact == false`, a non-PD observed factor — one block on the
+/// blocked path, the whole crossed-tail Schur on the structured-extras path. There the lanes contract by
 /// `‖I − A⁻¹h_uu‖` per step; a Fisher-only fallback needed 5–7
 /// calls on the FD gates' draws and 9–10 on `sim_gamma` at its converged fit
 /// (each call two steps), so 12 keeps two calls of headroom above the worst
@@ -565,8 +563,7 @@ fn bufs_match_shape<T: Scalar>(
             b.asm.g_gamma.len() == (m * k).max(1)
                 && b.asm.packed_len() == rows * packed_width
                 // `PackedAsmBufs::for_shape` sizes `obs` to `k²` on every
-                // packed shape, canonical or not — a canonical fit with a
-                // μ-clamped row needs `A_obs` too. `packed_width > 0` mirrors
+                // packed shape, canonical or not. `packed_width > 0` mirrors
                 // that function, which allocates nothing when `width == 0` —
                 // change together.
                 && b.asm.packed_obs_len() == if packed_width > 0 { k * k } else { 0 }

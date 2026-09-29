@@ -29,7 +29,7 @@
 //! unstable dev-only surface re-exported through `crate::loop_advanced`.
 
 use crate::consts::{MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q, MAX_PRIMARY_Q};
-use crate::{GroupIds, GroupingRelation, ModelSpec, StartValues, WaldSe};
+use crate::{Family, GroupIds, GroupingRelation, ModelSpec, StartValues, WaldSe};
 
 mod common;
 mod core;
@@ -189,7 +189,9 @@ pub struct Fit {
     ///   inverse-Gaussian). The two agree only at unit weights; a weighted
     ///   Gamma GLM's `loglik` is the maximised precision value, not R's
     ///   `logLik(fg)` (measured: −47.27 vs −118.21 on
-    ///   `fit_glm_gamma_weighted_matches_r`'s data).
+    ///   `fit_glm_gamma_weighted_matches_r`'s data). On a fit that reproduces
+    ///   the data exactly the likelihood rises without bound as φ → 0, so a
+    ///   deviance that rounds to zero gives `+∞`.
     /// - **LMM** — the **REML criterion** `−REMLcrit/2` (this path is
     ///   REML-only): `−½(deviance + (n−p)·(1 + ln 2π))`. REML criteria are
     ///   comparable only between models with IDENTICAL fixed effects — an
@@ -296,7 +298,7 @@ pub struct Diagnostics {
     /// `true` iff the fit converged onto the θ boundary (≥ 1 diagonal variance
     /// component pinned at 0 — `boundary == AtBoundary`, OR a converged
     /// diagonal stddev negligible next to its fit's largest — see
-    /// [`Fit::has_negligible_component`]), the same condition lme4's
+    /// `Fit::has_negligible_component`), the same condition lme4's
     /// `isSingular` reports. `false` for OLS/GLM and for an LMM or GLMM
     /// `MaxFunReached` cap-out — a capped endpoint is reported as a point,
     /// not accepted onto the boundary, so the post-hoc negligible-component
@@ -333,6 +335,17 @@ pub struct Diagnostics {
     /// into a trailing diagonal. Without that, a zero θ diagonal on a `q ≥ 2`
     /// block could sit above a live off-diagonal and name a component whose
     /// standard deviation is not zero.
+    ///
+    /// **Exception: AGQ (`nagq > 1`).** The flags come from the same canonical
+    /// form, but the fit reports the search's own Λ, because the vector AGQ
+    /// deviance depends on Λ and not only on Σ. So a pinned diagonal of the
+    /// fitted θ̂ can sit above a live entry. The flags still describe Σ̂, as
+    /// `varcorr` does.
+    ///
+    /// **Exception: the sparse route.** `canonicalize_pinned_blocks` skips a
+    /// block with `q` past `MAX_PRIMARY_Q` (`crate::lmm::canonicalize_pinned_blocks`),
+    /// which only the sparse route ever builds, so on that route a pinned
+    /// diagonal can sit above a live off-diagonal after all.
     ///
     /// **Empty means nothing was pinned** — every route with variance
     /// components to pin fills this field on every converged fit: each view
@@ -475,6 +488,47 @@ pub enum Note {
     /// a Schur inverse. Never fires under `WaldSe::Rx`, which never attempts
     /// the joint Hessian.
     HessianSeFallback,
+    /// The GLMM's `ExactProfile` route (the exact β-profile outer search,
+    /// `src/glmm/mod.rs`) ended not converged, so the fit reran once on the
+    /// `PqlThenJoint` route instead, from the same start. The reported
+    /// estimates come from that rerun when it converged; when it also failed
+    /// to converge, they come from whichever of the two attempts reached the
+    /// lower deviance — `converged` stays `false` either way, and `n_eval`
+    /// counts both attempts. Never raised for a shape that does not route
+    /// `ExactProfile` (`Joint` and `PqlThenJoint` have no fallback of their
+    /// own).
+    ExactProfileFallback,
+    /// The response is not within `1e-3` of an integer count — the raw value
+    /// for Poisson/negative-binomial, the derived successes `y·wᵢ` for
+    /// binomial. The fit still runs (the deviance and score are continuous in
+    /// `y`), but the reported numbers describe a distribution that assumes
+    /// integer counts. The `1e-3` tolerance matches R's
+    /// `binomial()$initialize` non-integer-count check; R's Poisson/NB
+    /// warning is unrelated (it comes from `dpois`/`dnbinom` inside
+    /// `poisson()$aic`/`negative.binomial()$aic`, at a much tighter
+    /// `1e-7·max(1,|y|)`, so R warns on e.g. `y = 2.0005` where glmm stays
+    /// silent). Never raised for Gaussian, Gamma or inverse-Gaussian, whose
+    /// response is continuous.
+    NonIntegerResponse {
+        /// Rows whose response (successes, for binomial) misses the nearest
+        /// integer by more than the tolerance.
+        rows: u32,
+    },
+    /// A random-effect term's grouping factor has only one observed level, so
+    /// no between-group variance is identifiable from it — lme4 errors here
+    /// ("grouping factors must have > 1 sampled level"); this crate instead
+    /// drops the term and fits the rest of the model. When every random-effect
+    /// term is dropped this way, the model fits with `re: None`, the same as a
+    /// formula that declared no random effects at all.
+    ///
+    /// Raised by the formula frontend, not by a solver, for the same reason
+    /// [`Note::UnusedGroupingLevels`] is: the level count is a property of the
+    /// lowering, not of any fitted model. Reached through
+    /// [`crate::formula::Lowered::notes`].
+    SingleLevelGroupingDropped {
+        /// The grouping factor, as the formula spells it.
+        grouping: String,
+    },
 }
 
 impl Diagnostics {
@@ -655,9 +709,9 @@ pub struct FitOptions {
     /// 1989 §2.2), not glmmTMB's `wᵢ` multiplying the log-density. Rescaling
     /// every weight by one constant `c` changes nothing about the fitted mean
     /// model or the SEs, and moves `dispersion` by exactly `c` — the fit
-    /// depends on the RELATIVE weights only, up to the GLM IRLS's own
-    /// absolute stopping tolerance (`glm::DEVIANCE_TOL`), which is not itself
-    /// scale-free. Moment estimates (σ̂²,
+    /// depends on the RELATIVE weights only (the GLM IRLS's own stopping
+    /// tolerance, `glm::DEVIANCE_TOL`, is a relative rule on the deviance, so
+    /// it is scale-free too for `|deviance| ≫ 0.1`). Moment estimates (σ̂²,
     /// inverse-Gaussian and Gamma-GLM's Pearson φ̂) divide by the raw row count
     /// `n−p`, never `Σwᵢ−p`. Binomial weights are trial counts (no dispersion
     /// to divide); Poisson's fit is identical either way (the two conventions
@@ -800,13 +854,16 @@ impl Default for FitOptions {
 /// # Panics
 ///
 /// Panics only on engine invariant violations (`x.len() != n*p`, malformed
-/// [`GroupIds`], over-envelope model). Numerical failures signal via
-/// `Fit { converged: false, .. }` with NaN-filled estimates — including the
-/// degenerate-data cases: a rank-deficient design has its aliased columns
-/// dropped and the reduced model fit (`Fit::aliased` flags them, their β/se are
-/// NaN), and a design whose aliased column is ALSO an RE slope — unfittable,
-/// since the slope has no column left to point at — returns all-NaN with
-/// `converged: false` rather than faulting.
+/// [`GroupIds`], over-envelope model), plus two input-domain checks run at the
+/// entry: a response outside the family's support (Poisson/NB `y < 0`,
+/// binomial `y` outside `[0, 1]`, Gamma/inverse-Gaussian `y <= 0`), and a
+/// [`FitOptions::dispersion`] value that is not finite and positive. Numerical
+/// failures signal via `Fit { converged: false, .. }` with NaN-filled
+/// estimates — including the degenerate-data cases: a rank-deficient design
+/// has its aliased columns dropped and the reduced model fit (`Fit::aliased`
+/// flags them, their β/se are NaN), and a design whose aliased column is ALSO
+/// an RE slope — unfittable, since the slope has no column left to point at —
+/// returns all-NaN with `converged: false` rather than faulting.
 ///
 /// # Examples
 ///
@@ -926,6 +983,61 @@ pub fn fit_warm(
             "FitOptions.offset must be finite"
         );
     }
+    // Response domain: refuse a response outside the family's support before
+    // fitting, rather than let the kernel converge on numbers a valid model
+    // could never have produced (a Poisson y < 0 reaching the kernel gives
+    // `converged = true` with logLik −∞). Binomial's `y` is always the
+    // success PROPORTION (`crate::family`'s aggregated convention: row `i` is
+    // `wᵢ` trials with `wᵢ·yᵢ` successes, unit weights ⇒ Bernoulli), so
+    // `0..=1` covers both the raw 0/1 case and "successes above trials".
+    match model.family {
+        Family::Gaussian => {}
+        Family::Poisson { .. } => {
+            assert!(y.iter().all(|&v| v >= 0.0), "Poisson response must be >= 0");
+        }
+        Family::NegativeBinomial { .. } => {
+            assert!(
+                y.iter().all(|&v| v >= 0.0),
+                "negative-binomial response must be >= 0"
+            );
+        }
+        Family::Binomial { .. } => {
+            assert!(
+                y.iter().all(|&v| (0.0..=1.0).contains(&v)),
+                "binomial response (the success proportion) must be in [0, 1]"
+            );
+        }
+        Family::Gamma { .. } => {
+            assert!(y.iter().all(|&v| v > 0.0), "Gamma response must be > 0");
+        }
+        Family::InverseGaussian { .. } => {
+            assert!(
+                y.iter().all(|&v| v > 0.0),
+                "inverse-Gaussian response must be > 0"
+            );
+        }
+    }
+    // Non-integer counts: still fittable (the deviance and score are
+    // continuous in y), but the reported numbers describe a distribution that
+    // assumes integer counts, so R's `glm` warns instead of refusing —
+    // matched here rather than refused. Binomial's count is the derived
+    // successes `y·wᵢ`, not `y` itself. Computed before dispatch so it applies
+    // whether the design later aliases columns or not; attached to the
+    // returned `Fit` below (and, on the aliased path, by the recursive
+    // `fit_warm` call inside `fit_rank_deficient`, which sees the same `y`).
+    let non_integer_response_rows =
+        count_non_integer_response(y, model.family, opts.weights.as_deref());
+    // Dispersion: refuse a value no family could ever use (a held φ is a
+    // variance-family scale, so it must be a finite positive number). A
+    // family with no φ to hold (Gaussian, Poisson, binomial, NB) just ignores
+    // the field, as the doc above says — the ports already clear it with an
+    // `argument_ignored` warning before it gets here.
+    if let Some(d) = opts.dispersion {
+        assert!(
+            d.is_finite() && d > 0.0,
+            "FitOptions.dispersion must be finite and > 0"
+        );
+    }
     // Rank-deficiency salvage: drop fixed-effect columns aliased on earlier
     // columns and fit the reduced model (lme4 behavior — NA coefficient, still
     // converges). Path-agnostic: preprocesses the fixed design X before the
@@ -965,7 +1077,36 @@ pub fn fit_warm(
     };
     let mut ws = core::build_workspace(&sized, perm, n, p, opts);
     let view = core::fit_on(&mut ws, x, y, &ids, start, opts);
-    view.into_fit(x, y, &ids, n, p, model, opts)
+    let mut fit = view.into_fit(x, y, &ids, n, p, model, opts);
+    if non_integer_response_rows > 0 {
+        fit.diagnostics.notes.push(Note::NonIntegerResponse {
+            rows: non_integer_response_rows,
+        });
+    }
+    fit
+}
+
+/// Rows whose response is not within [`NON_INTEGER_TOL`] of an integer —
+/// the raw count for Poisson/negative-binomial, or the derived successes
+/// `y·wᵢ` for binomial (unit weights ⇒ Bernoulli, always integer). `0` for
+/// Gaussian, Gamma and inverse-Gaussian, whose response is continuous.
+/// [`NON_INTEGER_TOL`] matches R's `binomial()$initialize` tolerance; R's
+/// Poisson/NB non-integer warning uses a different, tighter check (see
+/// [`Note::NonIntegerResponse`]).
+fn count_non_integer_response(y: &[f64], family: Family, weights: Option<&[f64]>) -> u32 {
+    const NON_INTEGER_TOL: f64 = 1e-3;
+    let off = |v: f64| (v - v.round()).abs() > NON_INTEGER_TOL;
+    match family {
+        Family::Poisson { .. } | Family::NegativeBinomial { .. } => {
+            y.iter().filter(|&&v| off(v)).count() as u32
+        }
+        Family::Binomial { .. } => y
+            .iter()
+            .enumerate()
+            .filter(|&(i, &v)| off(v * weights.map_or(1.0, |w| w[i])))
+            .count() as u32,
+        Family::Gaussian | Family::Gamma { .. } | Family::InverseGaussian { .. } => 0,
+    }
 }
 /// Which LMM/GLMM solver a design routes to. `NoZ` is the dense
 /// no-Z fast path with bounded stack scratch (the `MAX_*` envelope), kept

@@ -1,3 +1,4 @@
+import datetime
 import warnings
 
 import numpy as _np
@@ -47,9 +48,53 @@ def test_unknown_family_raises():
         glmm.fit(DATA, "y ~ x", "logistic")
 
 
+def test_unknown_family_message_matches_the_r_port():
+    # Exact text, including the family list order: mirrors the R port's
+    # equivalent case (r/tests/testthat/test-errors.R has no separate test
+    # for this since .normalize_family's string branch shares the same
+    # ordering by construction from .FAMILIES).
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"^unknown family 'logistic'; expected one of gaussian, binomial, poisson, "
+            r"gamma, negativebinomial, inversegaussian$"
+        ),
+    ):
+        glmm.fit(DATA, "y ~ x", "logistic")
+
+
 def test_link_not_offered_raises():
     with pytest.raises(ValueError, match="does not support link"):
         glmm.fit(DATA, "y ~ x", "poisson", link="identity")
+
+
+def test_link_not_offered_message_matches_the_r_port():
+    with pytest.raises(
+        ValueError,
+        match=r"^family 'binomial' does not support link 'identity'; expected one of logit, probit, cloglog$",
+    ):
+        glmm.fit(DATA, "y ~ x", "binomial", link="identity")
+
+
+def test_double_bar_formula_raises():
+    # Mirrors the R port's equivalent case (r/tests/testthat/test-errors.R):
+    # both ports give the same message for this formula shape.
+    with pytest.raises(ValueError, match="full RE correlation structure"):
+        glmm.fit(DATA, "y ~ x + (x || g)")
+
+
+@pytest.mark.parametrize("formula", ["y ~ .", "y ~ . - x", "y ~ x * ."])
+def test_dot_formula_raises(formula):
+    with pytest.raises(ValueError, match="'.' is not supported"):
+        glmm.fit(DATA, formula)
+
+
+def test_intercept_suppressed_re_term_raises():
+    # Not pre-checked client-side: the shared Rust parser already raises a
+    # specific message for this (RandomInterceptSuppressionUnsupported), and
+    # it reaches both ports unchanged.
+    with pytest.raises(ValueError, match="intercept suppression"):
+        glmm.fit(DATA, "y ~ x + (0 + x | g)")
 
 
 def test_cloglog_glm_fits():
@@ -214,6 +259,14 @@ def test_dispersion_bad_value_raises():
         glmm.fit(DATA, "y ~ x", "gamma", dispersion="pearson")
 
 
+def test_dispersion_bad_value_message_matches_the_r_port():
+    with pytest.raises(
+        ValueError,
+        match=r"^dispersion must be None, 'estimate', or a number, got 'pearson'$",
+    ):
+        glmm.fit(DATA, "y ~ x", "gamma", dispersion="pearson")
+
+
 def test_dispersion_bool_raises():
     # bool is an int subclass — must not pass as a numeric dispersion.
     with pytest.raises(ValueError, match="dispersion"):
@@ -263,6 +316,18 @@ def test_warm_start_not_dict_raises():
         glmm.fit(DATA, "y ~ x", warm_start=[0.0, 0.0])
 
 
+def test_warm_start_not_dict_message_matches_the_r_port():
+    with pytest.raises(
+        TypeError,
+        match=(
+            r"^warm_start must be a dict with keys 'beta' and/or 'theta' \(theta is the "
+            r"random-effect Cholesky vector, not the negative-binomial shape - that is "
+            r"init_theta\), got list$"
+        ),
+    ):
+        glmm.fit(DATA, "y ~ x", warm_start=[0.0, 0.0])
+
+
 def test_clean_call_emits_no_warnings_and_fits():
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # any warning becomes an error
@@ -275,24 +340,224 @@ def test_clean_call_emits_no_warnings_and_fits():
     assert result.converged
 
 
-def test_wrong_length_weights_is_an_ffi_level_valueerror():
-    # `fit()` does no length check of its own on `weights=`/`offset=` — it
-    # hands the list straight to the kernel (glmm/__init__.py's `_native.fit`
-    # call), which asserts the length and surfaces the assertion as a
-    # ValueError through catch_unwind, not as a wrapper-level message.
-    with pytest.raises(ValueError, match="weights"):
+def test_wrong_length_weights_is_a_plain_valueerror():
+    with pytest.raises(
+        ValueError, match=r"^weights must be a numeric array with one entry per row"
+    ):
         glmm.fit(DATA, "y ~ x", weights=[1.0, 2.0])
 
 
-def test_wrong_length_offset_is_an_ffi_level_valueerror():
-    with pytest.raises(ValueError, match="offset"):
+def test_wrong_length_offset_is_a_plain_valueerror():
+    with pytest.raises(ValueError, match=r"^offset must be a numeric array with one entry per row"):
         glmm.fit(DATA, "y ~ x", offset=[1.0, 2.0])
 
 
-def test_nan_in_numeric_column_is_rejected_by_the_kernel_entry_check():
-    # `float(v)` in the numeric-column pass converts a NaN through with no
-    # finiteness check of its own; the kernel's entry check on `x` is what
-    # rejects it, and that fault surfaces here as a ValueError.
+def test_missing_formula_column_is_reported_before_weights_length():
+    # "z" is not in `data` at all. `_formula_columns` silently drops it from
+    # `used_names`, so without the missing-column check `used_names` would
+    # hold only "y"/"x", `weights=` of the wrong length for THAT would fail
+    # first, and the real problem (an unknown column) would never be named.
+    data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
+    with pytest.raises(ValueError, match=r"^column\(s\) not found in data: z$"):
+        glmm.fit(data, "y ~ x + z", weights=[1.0, 2.0, 3.0])
+
+
+def test_missing_formula_column_is_reported_even_with_wrong_length_weights():
+    data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
+    with pytest.raises(ValueError, match=r"^column\(s\) not found in data: z$"):
+        glmm.fit(data, "y ~ x + z", weights=[1.0, 2.0])
+
+
+def test_missing_formula_column_with_no_weights_is_still_reported():
+    data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
+    with pytest.raises(ValueError, match=r"^column\(s\) not found in data: z$"):
+        glmm.fit(data, "y ~ x + z")
+
+
+def test_missing_column_through_a_transform_names_the_underlying_column():
+    # log(z): "z" is missing, not the literal spelling "log(z)".
+    data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
+    with pytest.raises(ValueError, match=r"^column\(s\) not found in data: z$"):
+        glmm.fit(data, "y ~ x + log(z)")
+
+
+def test_one_level_character_factor_in_the_fixed_part_raises():
+    data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0], "f": ["z", "z", "z"]}
+    with pytest.raises(
+        ValueError, match=r"contrasts can be applied only to factors with 2 or more levels"
+    ):
+        glmm.fit(data, "y ~ f + x")
+
+
+def test_one_level_bool_factor_in_the_fixed_part_raises():
+    # A bool column crosses as a FALSE/TRUE factor (item 1); with every value
+    # the same, that factor has one level, same as a one-level character one.
+    data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0], "b": [True, True, True]}
+    with pytest.raises(
+        ValueError, match=r"contrasts can be applied only to factors with 2 or more levels"
+    ):
+        glmm.fit(data, "y ~ b + x")
+
+
+def test_one_level_factor_inside_an_interaction_raises():
+    data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0], "f": ["z", "z", "z"]}
+    with pytest.raises(
+        ValueError, match=r"contrasts can be applied only to factors with 2 or more levels"
+    ):
+        glmm.fit(data, "y ~ f * x")
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), None])
+@pytest.mark.parametrize("arg", ["weights", "offset"])
+def test_non_finite_weights_or_offset_is_a_plain_valueerror(arg, bad, capfd):
+    # Checked before the native call, the way the R port checks them, so the
+    # kernel's entry assert never fires and prints a Rust panic to stderr.
+    kwargs = {arg: [1.0, bad, 1.0]}
+    with pytest.raises(ValueError, match=rf"^{arg} must be finite"):
+        glmm.fit(DATA, "y ~ x", **kwargs)
+    assert "panicked" not in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0])
+def test_non_positive_weights_is_a_plain_valueerror(bad):
+    with pytest.raises(ValueError, match=r"^weights must be positive"):
+        glmm.fit(DATA, "y ~ x", weights=[1.0, bad, 1.0])
+
+
+def test_nan_weight_on_a_row_dropped_for_na_is_still_rejected():
+    # Validated against data's original rows, before the NA row drop, as R's
+    # fastglmm() does: a NaN weight is a bad argument, not a missing value.
     data = {"y": [1.0, 2.0, 3.0, 4.0], "x": [0.0, 1.0, float("nan"), 3.0]}
-    with pytest.raises(ValueError, match="x must be finite"):
+    with pytest.raises(ValueError, match=r"^weights must be finite"):
+        glmm.fit(data, "y ~ x", weights=[1.0, 2.0, float("nan"), 4.0])
+
+
+def test_nan_in_numeric_column_drops_its_row_and_warns():
+    # A used column's NaN row is dropped before conversion (R's default
+    # na.action = na.omit), not handed to the kernel's entry check.
+    data = {"y": [1.0, 2.0, 3.0, 4.0], "x": [0.0, 1.0, float("nan"), 3.0]}
+    with pytest.warns(glmm.RowsDroppedWarning, match=r"Dropped 1 of 4 row"):
+        result = glmm.fit(data, "y ~ x")
+    assert result.converged
+    assert result.nobs == 3
+
+
+def test_unused_column_with_an_unconvertible_dtype_is_never_touched():
+    # A column the formula does not name must not even be read: a value that
+    # crashes both the numeric and factor conversions (float() and str()
+    # both "work" on it, but a real datetime/object column with no sane
+    # scalar form would not) is fine to leave in `data` as long as the
+    # formula never mentions it.
+    class Unconvertible:
+        def __iter__(self):
+            raise AssertionError("an unused column must never be iterated")
+
+    data = {"y": [1.0, 2.0, 3.0, 4.0], "x": [0.0, 1.0, 2.0, 3.0], "stamp": Unconvertible()}
+    result = glmm.fit(data, "y ~ x")
+    assert result.converged
+
+
+def test_column_named_like_a_transform_function_is_not_treated_as_used():
+    # `y ~ log(x)` reads "x" through the log transform; a data column
+    # literally named "log" must not be pulled in just because that word
+    # appears in the formula text (it would crash if it ever reached the
+    # numeric/factor conversion).
+    data = {
+        "y": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "log": [datetime.date(2020, 1, 1)] * 6,
+    }
+    result = glmm.fit(data, "y ~ log(x)")
+    assert result.converged
+    assert result.names == ["(Intercept)", "log(x)"]
+
+
+def test_column_named_like_a_transform_function_keeps_its_own_missing_values():
+    # Same name collision, but the unused "log" column has missing values of
+    # its own — a false positive here would drop rows the formula has no
+    # reason to drop.
+    data = {
+        "y": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "log": ["a", "b", None, "d", "e", "f"],
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = glmm.fit(data, "y ~ log(x)")
+    assert result.nobs == 6
+
+
+def test_non_ascii_column_name_is_used():
+    # `_formula_columns` asks the Rust parser's own (Unicode-aware)
+    # identifier grammar, so a column name outside ASCII keeps working.
+    data = {"y": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "café": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]}
+    result = glmm.fit(data, "y ~ café")
+    assert result.converged
+    assert result.names == ["(Intercept)", "café"]
+
+
+def test_all_rows_missing_in_a_used_column_is_a_plain_error():
+    data = {"y": [1.0, 2.0, 3.0], "x": [float("nan"), float("nan"), float("nan")]}
+    with pytest.raises(ValueError, match="no rows left to fit"):
         glmm.fit(data, "y ~ x")
+
+
+def test_bad_formula_syntax_surfaces_the_parse_error_not_an_unrelated_column_error():
+    # `glmm`'s `||` uncorrelated-random-effects syntax is not supported, and is
+    # caught by fit()'s own formula-shape check before anything else runs. An
+    # unrelated column the formula never uses (a date, which crashes both the
+    # numeric and factor conversions) must not get a chance to raise first
+    # with an error that has nothing to do with the formula.
+    data = {
+        "y": [1.0, 2.0, 3.0, 4.0],
+        "x": [0.0, 1.0, 2.0, 3.0],
+        "g": [0, 0, 1, 1],
+        "stamp": [datetime.date(2020, 1, 1)] * 4,
+    }
+    with pytest.raises(ValueError, match="full RE correlation structure"):
+        glmm.fit(data, "y ~ (x || g)")
+
+
+def test_weights_and_offset_are_dropped_in_lockstep_with_na_rows():
+    # weights=/offset= are separate arrays aligned to data's original rows;
+    # dropping a row for a missing `x` must drop the same position from both,
+    # or they silently misalign against the surviving rows.
+    data = {"y": [1.0, 2.0, 3.0, 4.0], "x": [0.0, 1.0, float("nan"), 3.0]}
+    with pytest.warns(glmm.RowsDroppedWarning):
+        result = glmm.fit(data, "y ~ x", weights=[1.0, 2.0, 3.0, 4.0], offset=[0.0, 0.0, 5.0, 0.0])
+    assert result.converged
+    assert result.nobs == 3
+    assert list(result.weights) == [1.0, 2.0, 4.0]  # row index 2 (weight 3.0) is the one dropped
+
+
+def test_pyarrow_null_in_a_used_numeric_column_drops_its_row():
+    # A pyarrow Array/ChunkedArray iterates as Scalar wrappers, not bare
+    # None/float; `float()` on a null Scalar raises TypeError instead of
+    # comparing as missing, so `_is_na` needs the column read through
+    # `.to_pylist()` first to see a real `None`.
+    pa = pytest.importorskip("pyarrow")
+    t = pa.table({"y": [1.0, 2.0, 3.0, 4.0], "x": pa.array([0.0, 1.0, None, 3.0])})
+    with pytest.warns(glmm.RowsDroppedWarning, match=r"Dropped 1 of 4 row"):
+        result = glmm.fit(t, "y ~ x")
+    assert result.converged
+    assert result.nobs == 3
+
+
+def test_pyarrow_null_in_a_used_string_column_drops_its_row():
+    pa = pytest.importorskip("pyarrow")
+    t = pa.table(
+        {"y": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "f": pa.array(["a", "b", None, "a", "b", "a"])}
+    )
+    with pytest.warns(glmm.RowsDroppedWarning, match=r"Dropped 1 of 6 row"):
+        result = glmm.fit(t, "y ~ f")
+    assert result.converged
+    assert result.nobs == 5
+
+
+def test_polars_null_in_a_used_column_drops_its_row():
+    pl = pytest.importorskip("polars")
+    df = pl.DataFrame({"y": [1.0, 2.0, 3.0, 4.0], "x": [0.0, 1.0, None, 3.0]})
+    with pytest.warns(glmm.RowsDroppedWarning, match=r"Dropped 1 of 4 row"):
+        result = glmm.fit(df, "y ~ x")
+    assert result.converged
+    assert result.nobs == 3

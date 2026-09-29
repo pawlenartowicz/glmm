@@ -118,8 +118,41 @@ fn fit<'py>(
     fit_dict(py, result)
 }
 
+/// What `formula` reads from a dataset whose column names are `available`, from
+/// one parse: `(used, missing, numeric_only)`.
+///
+/// - `used`: the names in `available` the formula reads as data columns
+///   (`glmm::formula::referenced_columns`), so `glmm/__init__.py` never has to
+///   re-implement the identifier grammar or the transform/`cbind()`/`offset()`
+///   spellings to filter `data` down to the columns a fit needs.
+/// - `missing`: names the formula references that resolve against neither
+///   `available` nor a transform of one of its members
+///   (`glmm::formula::unresolved_columns`) — what `glmm.fit` would fail on as
+///   an unknown column. Lets `glmm/__init__.py` raise that error before it
+///   checks `weights=`/`offset=` against the row count.
+/// - `numeric_only`: names among `available` that always stay plain numbers,
+///   the response and the `offset()` column (`glmm::formula::numeric_only_columns`)
+///   — a bool predictor or grouping column crosses as a `FALSE`/`TRUE` factor,
+///   but these never do.
+///
+/// A formula that fails to parse raises here exactly as `fit()` itself would,
+/// through the same error conversion.
+#[pyfunction]
+fn formula_columns(
+    formula: &str,
+    available: Vec<String>,
+) -> PyResult<(Vec<String>, Vec<String>, Vec<String>)> {
+    let ast = glmm::formula::parse(formula).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((
+        glmm::formula::referenced_columns(&ast, &available),
+        glmm::formula::unresolved_columns(&ast, &available),
+        glmm::formula::numeric_only_columns(&ast, &available),
+    ))
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit, m)?)?;
+    m.add_function(wrap_pyfunction!(formula_columns, m)?)?;
     Ok(())
 }

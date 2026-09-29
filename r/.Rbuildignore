@@ -5,3 +5,4 @@
 ^src/Makevars\.win$
 ^tools/cran-tarball\.sh$
 ^tools/acceptance-vs-lme4\.R$
+^tools/generic-load-order\.R$

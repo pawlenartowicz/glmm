@@ -7,8 +7,8 @@
 
 use super::*;
 use crate::{
-    BinomialLink, Family, GroupIds, Grouping, GroupingRelation, ModelSpec, NegBinomialLink,
-    ReStructure, Sizing, StartValues,
+    BinomialLink, Family, GammaLink, GroupIds, Grouping, GroupingRelation, InverseGaussianLink,
+    ModelSpec, NegBinomialLink, PoissonLink, ReStructure, Sizing, StartValues,
 };
 
 /// Band for pins on the closed-form paths — OLS and GLM/IRLS.
@@ -318,6 +318,264 @@ fn nonfinite_y_nan_is_rejected() {
         &GroupIds::default(),
         &FitOptions::default(),
     );
+}
+
+/// A negative Poisson response is out of the family's domain and faults at
+/// the entry, before the kernel can converge on a meaningless answer (an
+/// unrefused negative count reaches the kernel as `converged = true` with
+/// logLik = −∞).
+#[test]
+#[should_panic(expected = "Poisson response must be >= 0")]
+fn poisson_negative_response_is_rejected() {
+    let (x, mut y, mut model) = shape_check_fixture();
+    model.family = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    y[1] = -1.0;
+    let _ = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// Same domain check as Poisson above, on the negative-binomial GLM route.
+#[test]
+#[should_panic(expected = "negative-binomial response must be >= 0")]
+fn nb_negative_response_is_rejected() {
+    let (x, mut y, mut model) = shape_check_fixture();
+    model.family = Family::NegativeBinomial {
+        link: NegBinomialLink::Log,
+    };
+    y[1] = -1.0;
+    let _ = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// A binomial response above 1 is out of the success-proportion domain and
+/// faults at the entry — an unrefused one fits with `converged = true` and a
+/// NaN logLik.
+#[test]
+#[should_panic(expected = "binomial response (the success proportion) must be in [0, 1]")]
+fn binomial_response_above_one_is_rejected() {
+    let (x, _, mut model) = shape_check_fixture();
+    model.family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let y = vec![0.0, 1.0, 2.0, 0.0];
+    let _ = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// The same binomial domain check, on the negative side.
+#[test]
+#[should_panic(expected = "binomial response (the success proportion) must be in [0, 1]")]
+fn binomial_response_below_zero_is_rejected() {
+    let (x, mut y, mut model) = shape_check_fixture();
+    model.family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    y[1] = -0.1;
+    let _ = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// A non-positive Gamma response is out of domain and faults at the entry —
+/// an unrefused one gives "Fit failed … simpler random effects / rescale
+/// predictors", advice that has nothing to do with the actual problem.
+#[test]
+#[should_panic(expected = "Gamma response must be > 0")]
+fn gamma_nonpositive_response_is_rejected() {
+    let (x, mut y, mut model) = shape_check_fixture();
+    model.family = Family::Gamma {
+        link: GammaLink::Log,
+    };
+    y[1] = 0.0;
+    let _ = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// Same domain check as Gamma above, on the inverse-Gaussian GLM route.
+#[test]
+#[should_panic(expected = "inverse-Gaussian response must be > 0")]
+fn inverse_gaussian_nonpositive_response_is_rejected() {
+    let (x, mut y, mut model) = shape_check_fixture();
+    model.family = Family::InverseGaussian {
+        link: InverseGaussianLink::Log,
+    };
+    y[1] = -3.0;
+    let _ = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+}
+
+/// A negative held dispersion is not a variance-family scale and faults at
+/// the entry — an unrefused one gives `converged = TRUE` with NaN SEs and
+/// logLik.
+#[test]
+#[should_panic(expected = "FitOptions.dispersion must be finite and > 0")]
+fn negative_dispersion_is_rejected() {
+    let (x, y, mut model) = shape_check_fixture();
+    model.family = Family::Gamma {
+        link: GammaLink::Log,
+    };
+    let opts = FitOptions {
+        dispersion: Some(-1.0),
+        ..FitOptions::default()
+    };
+    let _ = fit_cold(&x, &y, 4, 1, &model, &GroupIds::default(), &opts);
+}
+
+/// A non-finite held dispersion faults the same way as a negative one above
+/// — the unrefused path gives logLik +Inf for a held dispersion of exactly 0;
+/// NaN is the same class of bad input.
+#[test]
+#[should_panic(expected = "FitOptions.dispersion must be finite and > 0")]
+fn nonfinite_dispersion_is_rejected() {
+    let (x, y, mut model) = shape_check_fixture();
+    model.family = Family::Gamma {
+        link: GammaLink::Log,
+    };
+    let opts = FitOptions {
+        dispersion: Some(f64::NAN),
+        ..FitOptions::default()
+    };
+    let _ = fit_cold(&x, &y, 4, 1, &model, &GroupIds::default(), &opts);
+}
+
+/// A held dispersion on a family that has none (Poisson's φ ≡ 1) is ignored,
+/// per the field's own doc — the fit comes out identical to the same call
+/// with `dispersion: None`.
+#[test]
+fn dispersion_on_a_family_without_one_is_ignored() {
+    let (x, y, mut model) = shape_check_fixture();
+    model.family = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let without = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+    let opts = FitOptions {
+        dispersion: Some(2.0),
+        ..FitOptions::default()
+    };
+    let with = fit_cold(&x, &y, 4, 1, &model, &GroupIds::default(), &opts);
+    assert!(without.converged() && with.converged());
+    assert_eq!(without.beta, with.beta);
+    // `deviance` is NaN on every GLM fit by design (see `Fit::deviance`'s
+    // doc); `loglik` is this route's real fitted criterion.
+    assert_eq!(without.loglik, with.loglik);
+}
+
+/// A non-integer Poisson count still fits (the deviance and score are
+/// continuous in `y`), but is reported through `Note::NonIntegerResponse`,
+/// matching R's `poisson()$initialize` warning.
+#[test]
+fn poisson_non_integer_response_is_noted() {
+    let (x, _, mut model) = shape_check_fixture();
+    model.family = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let y = vec![1.0, 2.5, 3.0, 4.0];
+    let f = fit_cold(
+        &x,
+        &y,
+        4,
+        1,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+    assert!(f.converged(), "expected a converged Poisson GLM fit");
+    let notes: Vec<_> = f
+        .diagnostics
+        .notes
+        .iter()
+        .filter(|n| matches!(n, Note::NonIntegerResponse { .. }))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "expected one note, got {:?}",
+        f.diagnostics.notes
+    );
+    assert!(matches!(notes[0], Note::NonIntegerResponse { rows: 1 }));
+}
+
+/// A binomial aggregated fit whose derived successes `y·wᵢ` are not integers
+/// (rounding trial weights against a proportion) is noted the same way as a
+/// non-integer Poisson count above, matching R's `binomial()$initialize`
+/// warning.
+#[test]
+fn binomial_non_integer_successes_is_noted() {
+    let (x, _y, mut model) = shape_check_fixture();
+    model.family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let y = vec![0.5, 0.5, 0.5, 0.6];
+    let opts = FitOptions {
+        weights: Some(vec![2.0, 2.0, 2.0, 3.0]),
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, 4, 1, &model, &GroupIds::default(), &opts);
+    assert!(f.converged(), "expected a converged binomial GLM fit");
+    let notes: Vec<_> = f
+        .diagnostics
+        .notes
+        .iter()
+        .filter(|n| matches!(n, Note::NonIntegerResponse { .. }))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "expected one note, got {:?}",
+        f.diagnostics.notes
+    );
+    assert!(matches!(notes[0], Note::NonIntegerResponse { rows: 1 }));
 }
 
 /// A `StartValues.beta` neither empty nor exactly `p`-wide faults through
@@ -2146,25 +2404,27 @@ fn diagnostics_ill_conditioned_note_through_fit_cold() {
     assert!(clean.diagnostics.pinned.is_empty(), "no RE, nothing to pin");
 }
 
-/// The two GLMM-only carrier flags each become their own `Note`, through
+/// The three GLMM-only carrier flags each become their own `Note`, through
 /// `materialize_diagnostics` directly rather than a real GLMM fit: this pins the
 /// mapping itself, one flag at a time, without depending on a fixture that
 /// happens to trip both. The payloads a real solve produces are asserted
-/// separately — `pirls_exhausted_note_counts_fit_path_evals_only` and
-/// `gamma_inverse_non_pd_hessian_falls_back_to_rx_se` in `glmm_tests`.
+/// separately — `pirls_exhausted_note_counts_fit_path_evals_only`,
+/// `gamma_inverse_non_pd_hessian_falls_back_to_rx_se` and
+/// `exact_profile_fallback_reruns_on_pql_then_joint` in `glmm_tests`.
 #[test]
 fn carrier_flags_become_pirls_and_hessian_notes() {
     let d = super::common::FitDiagnostics {
         pirls_exhausted: 3,
         final_pirls_exhausted: true,
         hessian_fallback: true,
+        exact_profile_fallback: true,
         ..super::common::FitDiagnostics::fixed_only(true)
     };
     let diag = super::common::materialize_diagnostics(&d, 0, &[]);
     assert_eq!(
         diag.notes.len(),
-        2,
-        "expected one PirlsExhausted and one HessianSeFallback, got {:?}",
+        3,
+        "expected one PirlsExhausted, one HessianSeFallback and one ExactProfileFallback, got {:?}",
         diag.notes
     );
     let Note::PirlsExhausted { evals, final_eval } = &diag.notes[0] else {
@@ -2176,6 +2436,11 @@ fn carrier_flags_become_pirls_and_hessian_notes() {
         matches!(diag.notes[1], Note::HessianSeFallback),
         "expected HessianSeFallback, got {:?}",
         diag.notes[1]
+    );
+    assert!(
+        matches!(diag.notes[2], Note::ExactProfileFallback),
+        "expected ExactProfileFallback, got {:?}",
+        diag.notes[2]
     );
 }
 

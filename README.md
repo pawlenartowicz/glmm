@@ -13,7 +13,7 @@
 Fits fixed-effect and mixed (random-intercept/random-slope) models for
 Gaussian, Binomial (logit/probit/cloglog), Poisson, Gamma, Negative-Binomial,
 and (fixed-effect GLM only) Inverse-Gaussian outcomes, validated against
-R/lme4 and Julia/MixedModels.jl goldens.
+R/lme4, glmmTMB, and Julia/MixedModels.jl goldens.
 
 **Beta.** Handles the usual mixed models, supports AGQ more widely than lme4,
 and is typically several times faster on them. Some lme4 features are still

@@ -359,7 +359,7 @@ fn lmm_sweep_search(
 /// [`build_lmm_seam_ws`]) under a caller-configured BOBYQA schedule — the
 /// warm-restart seam: call this any number of times on the same `ws` at
 /// different θ₀/schedules without re-accumulating the design. See
-/// [`lmm_sweep_search`] for the schedule/replay contract; `ws` and `g` are
+/// `lmm_sweep_search` for the schedule/replay contract; `ws` and `g` are
 /// exactly the pair `build_lmm_seam_ws` returns.
 #[cfg(feature = "loop_advanced")]
 #[allow(clippy::too_many_arguments)] // dev seam, marshals the fit_mle surface + schedule

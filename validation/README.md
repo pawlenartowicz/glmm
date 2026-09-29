@@ -71,6 +71,17 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
   with no entry fails; one that outgrows its entry fails; an entry that stops
   firing fails as stale. A real `glmm` defect is never registered — it stays red
   and is tracked as a bug.
+- **Cells with no MLE**: a cell whose manifest entry carries `no_mle` (from
+  `NO_MLE` in `gen_manifest.R`, with its reason) has data that admit no
+  maximum-likelihood estimate. `compare.R` passes glmm's clean refusal there,
+  fails anything else (a converged fit, a panic, a timeout) and lists the cell
+  in its own `no-MLE` block. It is a property of the data, never a way to
+  excuse a fit glmm got wrong.
+- **AGQ cells with two or more random effects per group**: glmm and GLMMadaptive
+  place the quadrature grid differently there, so their deviances are two
+  different approximations. Gate 1 therefore evaluates GLMMadaptive's rule at
+  glmm's fitted point (`ga_rule_dev` in `grid/dev_align.R`) and compares that
+  with GLMMadaptive's own deviance; the cell's line says so.
 - **In-crate references** — `goldens/` and `results/lme4_simulated/`, frozen, read
   by `cargo test --features oracle-tests`.
 

@@ -72,6 +72,7 @@ fn lmm_run_on_view_maps_to_same_fit_as_fit_cold() {
         }
     }
     ws.suff_mut().reset();
+    ws.suff_mut().set_design_qr(x_mat.as_ref(), None);
     ws.suff_mut()
         .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], None);
     let via = {
@@ -448,47 +449,30 @@ fn build_gap_a_salvage_design(
 ///
 /// It is NOT registered in `validation/manifest.json` as a cross-engine golden,
 /// and the reason is worth stating rather than leaving to be rediscovered. Every
-/// quantity below agrees inside its band, but the REML criterion does not:
-/// glmm reports −239.09477 against lme4's −239.09437, a gap of 4.0e-4 where
-/// `grid/tol.R`'s `loglik_abs_lmm` is an absolute 2e-6. That band assumes
-/// well-conditioned designs.
-///
-/// The cause was measured rather than inferred, by re-evaluating this design's
-/// REML criterion in 60-digit arithmetic from its closed form for one balanced
-/// intercept RE — V_j = σ²I_m + τ²11', so V_j⁻¹ = (I − c·11')/σ² with
-/// c = τ²/(σ² + mτ²) and log|V_j| = (m−1)log σ² + log(σ² + mτ²) — and comparing
-/// term by term against the same evaluation carried out at reduced precision:
-///
-///   * the two θ̂ are not what separates the engines. The exact criterion at
-///     glmm's θ̂ and at lme4's differs by 5.1e-11; the objective really is flat
-///     here. (Two supporting controls agree: on the reduced design the two
-///     engines match the criterion to 1.0e-10, and lme4 returns the identical
-///     full-design value under a 1e-14-tightened optimizer, so neither side is
-///     merely under-converged.)
-///   * `log|X'V⁻¹X|` is where the digits go, and "loses digits" understates it:
-///     at float64 working precision this design's 4×4 X'V⁻¹X is numerically
-///     singular, and its log-determinant does not stabilise until roughly 25
-///     decimal digits. Neither engine can evaluate that term to the 2e-6 an
-///     absolute band assumes.
-///   * so both engines miss the criterion's exact value, −239.0944407: lme4 by
-///     +7.0e-5, glmm by −3.3e-4. glmm is the further of the two, by 4.7×. That
-///     is recorded as a finding, not argued away — but it is a shared
-///     consequence of the conditioning, not a difference of method.
-///
-/// Registering the rung therefore needs the band question settled first, which
-/// is a calibration decision, not a test edit.
+/// quantity below agrees inside its band, but lme4's REML criterion does not
+/// match the true one: lme4 reports −239.09437 against the exact −239.0944407
+/// (the design's closed form for one balanced intercept RE evaluated in
+/// 60-digit arithmetic), off by +7.0e-5 where `grid/tol.R`'s `loglik_abs_lmm`
+/// is an absolute 2e-6. The θ̂ are not what separates them — the exact
+/// criterion is flat to 1e-10 across both engines' θ̂ — so the gap is lme4's
+/// round-off in evaluating the criterion on this nearly collinear X. glmm
+/// evaluates `log|X'V⁻¹X|` on X·U⁻¹ (`lmm::DesignQr`) and lands on the exact
+/// value, which
+/// `lmm_entangled_pair_reml_is_exact_and_invariant` pins. The reference is the
+/// side a cross-engine band would have to absorb, so registering the rung needs
+/// the band question settled first, which is a calibration decision, not a test
+/// edit.
 #[test]
 fn lmm_entangled_pair_fits_in_full_with_honest_ses() {
     // lme4 1.1.38 on the FULL design [1, t, v, z], REML. Written in the shortest
     // decimal form that round-trips to the same f64 as lme4's 17-digit output —
     // the same doubles, not truncated ones; padding them back out is a clippy
     // `excessive_precision` error and changes nothing. Measured agreement with
-    // glmm, worst per row: β 5.7e-4 (both entangled columns), SE 2.8e-4 (same
-    // two), stddev 1.4e-6, σ̂ 8.5e-8, β_t + β_v 4.8e-7. The two entangled cells
-    // are the tightest in the crate against a 1e-3 band — 1.8× margin — and that
-    // is the honest size of the disagreement, not a slack to be traded away:
-    // the pair is by construction the least-determined direction in the design,
-    // so it is where two independent implementations differ most.
+    // glmm, worst per row: β 1.4e-4 (both entangled columns), SE 7.0e-5 (same
+    // two), stddev 4.7e-8, σ̂ 1.2e-9, β_t + β_v 1.2e-7. The pair is by
+    // construction the least-determined direction in the design, so it is where
+    // lme4's round-off shows most; glmm's β_t is within 1e-11 of the 60-digit
+    // value (`lmm_entangled_pair_reml_is_exact_and_invariant`).
     const LME4_BETA: [f64; 4] = [
         -0.7054541628205219,
         -38288906.83665362,
@@ -644,6 +628,77 @@ fn lmm_entangled_pair_fits_in_full_with_honest_ses() {
             "flip={flip}: β_t + β_v moved {rel} under a 1-ULP re-rounding of y"
         );
     }
+}
+
+/// The entangled pair's REML criterion and β̂ at the exact values, and unmoved
+/// by an exact reparametrization of the pair.
+///
+/// Replacing `v` by `w = v − t` is `X·A` with `A` unit upper triangular, so the
+/// REML criterion is unchanged (`log|det A| = 0`) and `β_t = β′_t − β′_v`,
+/// `β_v = β′_v`. The subtraction is exact in f64 (Sterbenz: `v/t` is within
+/// `1 ± 3e-6`), so both fits see the same model on the same doubles. `[1, t, w,
+/// z]` is well conditioned and `[1, t, v, z]` is not, which makes the pair a
+/// probe of how the kernel evaluates `log|X'V⁻¹X|` and β̂: a Gram of the raw
+/// `X` squares its condition number and moves the criterion by 6.5e-4 between
+/// the two, while the orthogonalized route (`lmm::DesignQr`) agrees to 3e-10.
+///
+/// References: the exact criterion is `validation/grid/dev_ref.json`'s
+/// 478.188881405005 (60-digit arithmetic on the same doubles, flat to 1e-10
+/// across every engine's θ̂), on the grid's scale, which is `Fit::deviance` plus
+/// the REML constant `(n − p)·(1 + ln 2π)`. The exact β_t, −38283544.440675,
+/// is the same 60-digit evaluation
+/// (`validation/tools/prep/entangled_reml_reference.py`'s method) at this fit's
+/// θ̂ = 15.0260270.
+#[test]
+fn lmm_entangled_pair_reml_is_exact_and_invariant() {
+    const EXACT_REML_CRIT: f64 = 478.188881405005;
+    const EXACT_BETA_T: f64 = -38283544.440675;
+
+    let (x, y, ids, n, p) = build_gap_a_salvage_design(false);
+    let mut x_w = x.clone();
+    for r in 0..n {
+        x_w[r * p + 2] = x[r * p + 2] - x[r * p + 1];
+    }
+    let opts = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        ..FitOptions::default()
+    };
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let f = fit_cold(&x, &y, n, p, &intercept_only_lmm(), &ids, &opts);
+    let g = fit_cold(&x_w, &y, n, p, &intercept_only_lmm(), &ids, &opts);
+    assert!(
+        f.converged() && g.converged(),
+        "both parametrizations must fit"
+    );
+
+    // Measured: 2.4e-10 between the two, 1.9e-10 against the 60-digit criterion
+    // at this θ̂. The Gram route missed both by 6.5e-4.
+    assert!(
+        (f.deviance - g.deviance).abs() < 1e-8,
+        "REML deviance moved under an exact reparametrization: {} vs {}",
+        f.deviance,
+        g.deviance
+    );
+    let reml_const = (n - p) as f64 * (1.0 + (2.0 * std::f64::consts::PI).ln());
+    assert!(
+        (f.deviance + reml_const - EXACT_REML_CRIT).abs() < 1e-8,
+        "REML criterion {} vs exact {EXACT_REML_CRIT}",
+        f.deviance + reml_const
+    );
+    // Measured: 8.7e-12 against the 60-digit β_t; 7.5e-10 between the two
+    // parametrizations, whose θ̂ differ by 5e-7 relative (β̂ follows θ̂). The
+    // Gram route was 4.2e-4 off. 1e-6 leaves room for θ̂ to land elsewhere in
+    // BOBYQA's stopping radius on another CPU.
+    assert_pinned(&[f.beta[1]], &[EXACT_BETA_T], 1e-6, "β_t vs 60-digit value");
+    assert_pinned(
+        &[f.beta[1], f.beta[2]],
+        &[g.beta[1] - g.beta[2], g.beta[2]],
+        1e-6,
+        "β_t, β_v under v → v − t",
+    );
 }
 
 /// REDUNDANCY AND ENTANGLEMENT IN ONE DESIGN — the two must be told apart.
@@ -1605,6 +1660,131 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
     }
 }
 
+/// Weight-SCALE invariance (not just constant-weight invariance, which
+/// `fit_lmm_constant_weights_invariant` already covers): varying base weights
+/// `w`, rescaled by `c ∈ {2^20, 2^-20, 1e8, 1e-8}`, must reproduce the `c = 1`
+/// fit's β, SE and τ² (both routes forced via `fit_mle_noz_pub`/
+/// `fit_mle_sparse_pub`, the same forced entries the crossed-slope test above
+/// uses), move `dispersion` by exactly `c` (up to solver noise), and leave
+/// `loglik` unchanged. BOBYQA searches `ŵ = w/family::weight_scale(w)`, not
+/// raw `w`: searching raw `w` would move the internal θ at `c = 2^20`/`2^-20`
+/// far enough to hit `THETA_HI`/`PIN_THETA` (`lmm::mod::THETA_HI`,
+/// `PIN_THETA`) and both SE and dispersion would come out wrong; `2^20`/`2^-20`
+/// are exact powers of two, so `ŵ` is bit-identical to the `c = 1` case and the
+/// tolerance can be as tight as `fit_lmm_constant_weights_invariant`'s.
+/// `1e8`/`1e-8` are not powers of two, so `s` differs by one ULP-scale factor
+/// from a clean rescale and gets a looser band (still far tighter than a
+/// raw-`w` search's error, which would be off by orders of magnitude).
+#[test]
+fn fit_lmm_weight_scale_invariant_dense_and_sparse() {
+    let n_clusters = 8usize;
+    let per = 6usize;
+    let n = n_clusters * per;
+    let p = 2usize;
+    let mut st = 409u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    let mut w = vec![0.0f64; n];
+    for i in 0..n {
+        ids_v[i] = (i % n_clusters) as u32;
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        let re = 0.3 * ((ids_v[i] as f64) - (n_clusters as f64) / 2.0);
+        y[i] = 0.5 + 0.4 * x1 + re + 0.2 * lcg(&mut st);
+        // Varying, O(1), strictly positive base weights (`lcg` ranges over
+        // [-1, 1]) — a constant weight cannot show the per-row `ŵ` division
+        // landing on the wrong factor.
+        w[i] = 1.5 + 1.3 * lcg(&mut st);
+    }
+    let cluster = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let (sized, ids, _perm) = spec_sized_from_ids(&cluster, &ids);
+
+    let fit_at = |c: f64| {
+        let opts = FitOptions {
+            target_indices: vec![0, 1],
+            weights: Some(w.iter().map(|&wi| wi * c).collect()),
+            ..FitOptions::default()
+        };
+        let dense = fit_mle_noz_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
+        let sparse =
+            fit_mle_sparse_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
+        (dense, sparse)
+    };
+
+    let (base_dense, base_sparse) = fit_at(1.0);
+    assert!(
+        base_dense.converged() && base_sparse.converged(),
+        "c=1 baseline must converge (dense={} sparse={})",
+        base_dense.converged(),
+        base_sparse.converged()
+    );
+
+    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
+    for &(c, tol) in &[
+        (2f64.powi(20), 1e-6),
+        (2f64.powi(-20), 1e-6),
+        (1e8, 1e-4),
+        (1e-8, 1e-4),
+    ] {
+        let (dense, sparse) = fit_at(c);
+        for (name, base, scaled) in [
+            ("dense", &base_dense, &dense),
+            ("sparse", &base_sparse, &sparse),
+        ] {
+            assert!(scaled.converged(), "{name} c={c} must converge");
+            for j in 0..p {
+                assert!(
+                    rel(scaled.beta[j], base.beta[j]) < tol,
+                    "{name} c={c} β[{j}] {} vs base {}",
+                    scaled.beta[j],
+                    base.beta[j]
+                );
+                assert!(
+                    rel(scaled.se[j], base.se[j]) < tol,
+                    "{name} c={c} se[{j}] {} vs base {}",
+                    scaled.se[j],
+                    base.se[j]
+                );
+            }
+            assert_eq!(scaled.tau2.len(), base.tau2.len());
+            for k in 0..base.tau2.len() {
+                assert!(
+                    rel(scaled.tau2[k], base.tau2[k]) < tol,
+                    "{name} c={c} tau2[{k}] {} vs base {}",
+                    scaled.tau2[k],
+                    base.tau2[k]
+                );
+            }
+            // σ̂² is NOT invariant — it moves with the weight scale itself.
+            assert!(
+                rel(scaled.dispersion, c * base.dispersion) < tol,
+                "{name} c={c} dispersion {} vs c*base {}",
+                scaled.dispersion,
+                c * base.dispersion
+            );
+            assert!(
+                rel(scaled.loglik, base.loglik) < tol,
+                "{name} c={c} loglik {} vs base {}",
+                scaled.loglik,
+                base.loglik
+            );
+        }
+    }
+}
+
 /// Task 5 Step 6: the dense-LMM boundary (τ̂ ≈ 0, pinned exactly per the
 /// Q7 deterministic-pin policy — mirrors
 /// `lmm::tests::zero_between_cluster_variance_pins_at_exactly_zero`) must
@@ -2475,20 +2655,24 @@ fn sleepstudy_slope_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, Gr
 /// moves by the same `+2·ln(C)` and `loglik = -deviance/2 + const` by `-ln(C)`.
 ///
 /// `BAND` is margin over the worst relative spread measured between the two
-/// independent BOBYQA fits' actual vs predicted ratios on 2026-08-23 (this
+/// independent BOBYQA fits' actual vs predicted ratios on 2026-09-28 (this
 /// crate's x86_64-unknown-linux-gnu Arrow Lake-H anchor, see `assert_pinned`'s
-/// doc comment for what that anchor means): 1.39e-6 on `ranef[16]`. That is
+/// doc comment for what that anchor means): 3.2e-5 on a `ranef` entry. The
+/// spread is where two BOBYQA paths happen to stop, so any change to the
+/// objective's last bits re-draws it: it was 1.39e-6 before the fixed-effect
+/// orthogonalization (`lmm::DesignQr`), which scales exactly with `C` here and
+/// so is not itself a source of the gap. That is
 /// three orders looser than `PIN_REL_ITER` (1e-7, this file's usual BOBYQA
 /// pin) because this test's "pin" is not one fit read twice but TWO
 /// INDEPENDENT optimizer runs landing on two different points in the same
 /// θ-space (θ and C·θ never coincide as floats), so the two runs' BOBYQA
 /// stopping tolerances compound instead of cancelling. `DEV_ABS` covers the
-/// measured deviance/loglik shift error (7.3e-12 on `deviance`), two orders of
-/// margin over that.
+/// measured deviance/loglik shift error (3.4e-12 on `deviance`), over an order
+/// of margin over that.
 #[test]
 fn lmm_rescaling_slope_column_moves_every_quantity_by_the_predicted_power_of_c() {
     const C: f64 = 1024.0;
-    const BAND: f64 = 3e-6;
+    const BAND: f64 = 7e-5;
     const DEV_ABS: f64 = 1e-10;
 
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
@@ -2612,8 +2796,6 @@ fn lmm_rescaling_slope_column_moves_every_quantity_by_the_predicted_power_of_c()
 /// same workspace serves both the cold and the warm call.
 #[test]
 fn lmm_warm_start_theta_is_a_fixed_point_of_the_forward_map() {
-    const BAND: f64 = 1e-9;
-
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let opts = FitOptions {
         target_indices: vec![0, 1],
@@ -2641,7 +2823,17 @@ fn lmm_warm_start_theta_is_a_fixed_point_of_the_forward_map() {
     let warm_fit = warm_view.into_fit(&x, &y, &sized_ids, n, p, &model, &opts);
     assert!(warm_fit.converged(), "warm-started fit must converge");
 
-    assert_pinned(&warm_theta, &cold_theta, BAND, "theta fixed point");
+    // BOBYQA resolves θ̂ only to its stopping radius `RHO_END` on the internal θ,
+    // so a restart planted at θ̂ may settle anywhere within that radius on a flat
+    // valley (measured: worst move 1.9e-7 on θ[2], deviance 4.8e-12 lower). A
+    // dropped forward map moves θ̂ by O(1): `Days` has a column scale of about
+    // 5.3.
+    for (k, (w, c)) in warm_theta.iter().zip(&cold_theta).enumerate() {
+        assert!(
+            (w - c).abs() <= crate::lmm::RHO_END,
+            "theta fixed point[{k}]: warm {w} vs cold {c}"
+        );
+    }
     assert!(
         (warm_fit.deviance - cold_fit.deviance).abs() < 1e-10,
         "deviance moved under a fixed-point warm start: {} vs {}",
@@ -2816,6 +3008,128 @@ fn fit_lmm_p_zero_weighted_reaches_nan_fill() {
         f.diagnostics.boundary,
         Boundary::NoOptimum,
         "the p==0 refusal reports NoOptimum, not a silent zero-width fit"
+    );
+}
+
+/// Twin of `lmm_maxfun_cap_reports_honest_endpoint_and_not_singular` above,
+/// but with TWO variance components (intercept + a slope on column 1) instead
+/// of one, and built so the negligible-ratio check
+/// (`Fit::has_negligible_component`) — not the boundary pin — is what would
+/// flag it: the slope's TRUE random effect is nonzero but tiny relative to
+/// the intercept's, so the genuine REML optimum is an INTERIOR point (no θ
+/// diagonal ever reaches `PIN_THETA`; `boundary_hit` stays 0 even at full
+/// convergence) whose reported standard-deviation ratio is still under
+/// `SINGULAR_REL_TOL`. The unlimited-budget optimum at this data (not
+/// asserted here, found while writing this test): `varcorr = [0.01278,
+/// 6.40e-6, 3.20e-9]`, `singular = true` — confirming the ratio-based check,
+/// not a pin, is what marks it singular. A budget short of that endpoint
+/// lands on the SAME point (BOBYQA needs one more confirming pass to call it
+/// `Converged`), so a single variance component can never exercise this half
+/// of the gate — with the gate in place `singular` stays `false` on this
+/// `MaxFunReached` point; deleting the `lmm_fit.converged &&` clause below
+/// (`fit.diagnostics.singular = fit.diagnostics.singular ||
+/// (lmm_fit.converged && fit.has_negligible_component(...))`) flips it to
+/// `true` and fails this test — checked by hand while writing it, then
+/// restored; not re-checked by CI.
+#[test]
+fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
+    use bobyqa::{Bobyqa, Config};
+
+    let n_clusters = 40usize;
+    let per = 10usize;
+    let n = n_clusters * per;
+    let p = 2usize;
+    let mut st = 13u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    for i in 0..n {
+        ids_v[i] = (i % n_clusters) as u32;
+        let x1 = lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        // The intercept's true random effect is sizeable; the slope's is
+        // nonzero but tiny, so the genuine REML optimum sits at a small
+        // but INTERIOR variance — no boundary pin ever fires, and any
+        // "singular" report has to come from the negligible-ratio check.
+        let c = (ids_v[i] as f64) - (n_clusters as f64) / 2.0;
+        let re0 = 0.4 * c / (n_clusters as f64);
+        let re1 = 0.0002 * c / (n_clusters as f64);
+        y[i] = 0.5 + 0.4 * x1 + re0 + re1 * x1 + 0.0002 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+
+    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
+    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[1], &[], false);
+    let mut x_mat = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        for j in 0..p {
+            x_mat[(i, j)] = x[i * p + j];
+        }
+    }
+    ws.suff_mut().reset();
+    ws.suff_mut()
+        .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], None);
+
+    let n_theta = ws.theta.len();
+    let npt = 2 * n_theta + 1; // PRIMA's minimum npt (n_theta == 3 here)
+    let config = {
+        let mut c = Config::new(n_theta);
+        c.npt = npt;
+        // 200 evals short of the unlimited-budget optimum — chosen by probing
+        // (see the doc comment above): the reported point already carries a
+        // negligible slope-to-intercept stddev ratio well before BOBYQA's own
+        // Converged confirmation fires.
+        c.max_fun = npt + 1 + 200;
+        c
+    };
+    ws.solver = Bobyqa::new(n_theta, config).expect("legal minimal config");
+
+    let fit = {
+        let v = lmm_run_on(&mut ws, &opts.target_indices, None);
+        lmm_view_to_fit(&v, &x, &ids, n, p, &opts)
+    };
+
+    assert!(!fit.converged(), "a capped fit must not report converged");
+    assert!(
+        !fit.varcorr.is_empty() && fit.varcorr.iter().flatten().all(|v| v.is_finite()),
+        "plateau policy: capped endpoint must report varcorr, got {:?}",
+        fit.varcorr
+    );
+    // The point IS negligible by the ratio check's own rule — this is what
+    // makes the gate load-bearing here, unlike a single-component fixture
+    // whose one variance is never small enough to trip it either way.
+    let sd: Vec<f64> = fit.varcorr[0]
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| [0, 2].contains(i)) // q=2 vech diagonals: [Σ00, Σ10, Σ11]
+        .map(|(_, &v)| v.sqrt())
+        .collect();
+    let ratio = sd[1] / sd[0];
+    assert!(
+        ratio <= 1e-3,
+        "fixture must be genuinely negligible by SINGULAR_REL_TOL, ratio {ratio}"
+    );
+    assert!(
+        !fit.singular(),
+        "a capped endpoint reports singular = false, even though its varcorr \
+         ratio ({ratio}) is negligible — has_negligible_component must stay \
+         gated on `converged`"
     );
 }
 

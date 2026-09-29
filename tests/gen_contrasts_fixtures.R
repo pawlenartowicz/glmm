@@ -16,17 +16,17 @@ dat <- data.frame(
   h = factor(c("a", "b", "c", "a", "b", "c"), levels = c("c", "a", "b")),
   # Strictly positive — x/z carry negatives, and log(w) on a non-positive
   # value would make model.frame silently drop the row via na.omit.
-  w = c(1.5, 2.0, 0.5, 4.0, 3.0, 2.5)
+  w = c(1.5, 2.0, 0.5, 4.0, 3.0, 2.5),
+  # x * z as its own column: `y ~ x:z + xz` is rank deficient, and R's term
+  # order decides which of the two columns is the aliased one.
+  xz = c(0.5, -5.0, -1.5, 0.0, -1.5, 2.0),
+  # Four more numerics for the term-order cases with three and more variables.
+  a = c(0.3, -1.0, 2.0, 1.5, 0.0, -0.7),
+  b = c(1.1, 0.4, -0.2, 2.2, -1.3, 0.9),
+  c = c(-0.5, 1.7, 0.8, -2.0, 1.0, 0.2),
+  d = c(2.5, -0.6, 0.1, 1.3, -1.8, 0.7)
 )
 
-# The formula frontend supports interactions in the marginal-present form:
-# treatment dummies (base dropped), which matches R model.matrix only when the
-# interacting factors' main effects are also in the model (exactly what
-# `*`/factorial produces — the only interaction form any caller uses). R's
-# marginal-term contrast promotion for
-# a BARE factor interaction (e.g. `y ~ f:g` with no `f`/`g` main effect keeps the
-# base level: `fa:gp`) is deliberately out of scope, so those formulas are not in
-# the oracle.
 formulas <- c(
   "y ~ x + z",
   "y ~ f",
@@ -48,7 +48,50 @@ formulas <- c(
   "y ~ I(z^3)",
   "y ~ log(w)*f",
   "y ~ I(x^2):z",
-  "y ~ log(w) - 1"
+  "y ~ log(w) - 1",
+  "y ~ x:f",
+  "y ~ f:g",
+  "y ~ f + f:g",
+  "y ~ x + x:f",
+  "y ~ 0 + f:g",
+  # glmm has no `-` term removal, so contrasts_oracle.rs lowers this one as
+  # `y ~ f:g + g` (f first, as in `f*g`), which glmm codes and names the same way.
+  "y ~ f*g - f",
+  "y ~ 0 + x + x:f",
+  "y ~ x:f + x:g",
+  # Term order and interaction names. R numbers the variables by first
+  # appearance, names a term's parts in that order, and sorts the terms by
+  # degree (main effects first), keeping the written order within a degree.
+  "y ~ f:g + f",
+  "y ~ x*z + f",
+  "y ~ f*x + g*x",
+  "y ~ x + f:x",
+  "y ~ x:z + xz",
+  "y ~ x + c:b:a + a*b*c",
+  "y ~ a*b*c*d",
+  "y ~ a*b*c*d*z",
+  "y ~ b*a + a:c",
+  "y ~ a:b + b:c + c:a + a + b + c",
+  "y ~ f*g*x",
+  "y ~ x*f*g",
+  "y ~ g:f + f:x + x",
+  "y ~ z:f + x:g + f + g",
+  "y ~ z + x:z:f + f:x",
+  "y ~ h:x + x",
+  "y ~ f*g + x:f - 1",
+  "y ~ 0 + x:f + g",
+  "y ~ 0 + g:f + x",
+  "y ~ 0 + x:f:g + f",
+  "y ~ log(w)*x + f",
+  "y ~ x:log(w) + log(w)",
+  "y ~ I(x^2) + x + I(x^2):f",
+  "y ~ offset(log(w)) + g:x + x",
+  # A variable repeated within a term or across spellings counts once.
+  "y ~ x:x",
+  "y ~ x + x:x",
+  "y ~ x*x",
+  "y ~ f:g:f",
+  "y ~ x + z + x:z + z:x"
 )
 
 # A dedicated frame for the 3-way numeric interaction case.

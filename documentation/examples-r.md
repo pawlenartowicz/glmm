@@ -19,11 +19,18 @@ under [`validation/data/simulated/`](../validation/data/simulated/),
 generated for the validation harness, with a comment at the point each script
 does it.
 
-**Loading both packages.** `lme4` and `fastglmm` both export `fixef`,
-`VarCorr`, `isSingular`, and `ranef` as generics. Load `lme4` first (for its
-bundled datasets) and `fastglmm` second, so `fastglmm`'s methods are the ones
-in scope — R warns about the masking either way, but only that order gives
-you the right dispatch:
+**Loading both packages.** `fixef`, `VarCorr`, and `ranef` are nlme's
+generics; `fastglmm` and `lme4` both add methods to them rather than
+declaring their own, so either load order dispatches to the right method on
+either package's fit. `isSingular` is lme4's own generic, and `fastglmm`
+handles both load orders for it too (a method registered directly on
+lme4's generic, plus a default method that forwards to lme4's generic for
+a `merMod` object). Loading both packages does print a masking message for
+`isSingular` — naming whichever package was attached first as the one now
+masked — but dispatch still reaches the right method either way; `fixef`,
+`ranef`, and `VarCorr` are the ones that print no such message, because
+they are the same generic (identical objects) in both packages.
+Load `lme4` first here regardless, for its bundled datasets:
 
 ```r
 library(lme4)

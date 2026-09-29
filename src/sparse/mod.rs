@@ -339,6 +339,10 @@ pub(crate) struct SparseLmmWorkspace {
     /// `Some` only for the one post-fit evaluation that feeds
     /// [`sparse_recover_u`]; see [`SparseRecovery`].
     pub(crate) rec: Option<SparseRecovery>,
+    /// The fixed-effect factor `U` `ztxy`/`cxy`'s `x` part is accumulated
+    /// through (`x·U⁻¹`), the same one the dense kernel uses
+    /// (`crate::lmm::DesignQr`).
+    pub(crate) design_qr: crate::lmm::DesignQr,
 }
 
 /// Per-family factor state that [`sparse_schur_factor`] otherwise throws away,
@@ -584,6 +588,11 @@ impl SparseLmmWorkspace {
         let mut cxy = Mat::<f64>::zeros(m, m);
         let mut row: Vec<(usize, f64)> =
             Vec::with_capacity(g.primary_q + g.extra_q.iter().sum::<usize>());
+        // The fixed-effect design enters every Gram below as `x·U⁻¹`; the
+        // z entries (slopes included) stay on the raw `x`.
+        let mut design_qr = crate::lmm::DesignQr::identity(p);
+        let mut xt = vec![0.0f64; p];
+        design_qr.set_from_rows(x.subrows(0, n), |i| sqrt_w.map_or(1.0, |w| w[i]), &mut xt);
         for i in 0..n {
             // One √wᵢ per row factor: `row`'s z entries already carry it
             // (`for_each_z_entry`), so the raw x/y reads below must carry a
@@ -595,16 +604,20 @@ impl SparseLmmWorkspace {
             for_each_z_entry(g, x, cluster_ids, extra_ids, i, sqrt_w, |col, v| {
                 row.push((col, v))
             });
+            for (j, xj) in xt.iter_mut().enumerate() {
+                *xj = x[(i, j)];
+            }
+            design_qr.solve_row(&mut xt);
             for &(ca, va) in &row {
                 for j in 0..p {
-                    ztxy[ca * m + j] += va * (sw * x[(i, j)]);
+                    ztxy[ca * m + j] += va * (sw * xt[j]);
                 }
                 ztxy[ca * m + p] += va * (sw * y[i]);
             }
             for a in 0..m {
-                let wa = if a < p { sw * x[(i, a)] } else { sw * y[i] };
+                let wa = if a < p { sw * xt[a] } else { sw * y[i] };
                 for b in 0..m {
-                    let wb = if b < p { sw * x[(i, b)] } else { sw * y[i] };
+                    let wb = if b < p { sw * xt[b] } else { sw * y[i] };
                     cxy[(a, b)] += wa * wb;
                 }
             }
@@ -751,6 +764,7 @@ impl SparseLmmWorkspace {
             p,
             n,
             rec: None,
+            design_qr,
         }
     }
 

@@ -1229,7 +1229,7 @@ fn reordered_crossed_case() -> (
 fn fit_on_theta_marshalling_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    // Measured exactly 8000 on this machine, under this test's own
+    // Measured exactly 9400 on this machine, under this test's own
     // `RAYON_NUM_THREADS=1` + `--test-threads=1` protocol: ~40 blocks per
     // arm-draw of faer `llt` internals plus the one per-call
     // `theta_row_scales` vector, and nothing else. Pinned at the measurement
@@ -1249,7 +1249,13 @@ fn fit_on_theta_marshalling_bounded_alloc() {
     // before reaching `rho_end` and pays more faer `llt` allocations per
     // call. The per-call block count moved with it; this is the algorithm
     // doing more evaluations to reach a correct endpoint, not a leak.
-    const BOUND: u64 = 8000;
+    //
+    // The LMM fixed-effect orthogonalization (`lmm::DesignQr`) allocates
+    // nothing per call, but it changes the objective's last bits, and the warm
+    // restarts take 62 + 18 evaluations per iteration where they took 50 + 16
+    // before it: one faer `llt` block each, 14 × 100 = 1400 over the 8000 it
+    // replaced.
+    const BOUND: u64 = 9400;
 
     let (xs, ys, ns, ps, ms, ids_s, os) = lmm_slope_case();
     let (sized_s, ids_s, perm_s) = spec_sized_from_ids_pub(&ms, &ids_s);

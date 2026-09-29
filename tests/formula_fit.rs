@@ -696,6 +696,145 @@ fn cbind_rejects_zero_trials_and_non_binomial() {
     );
 }
 
+// ── Integer grouping columns ─────────────────────────────────────────────────
+
+/// Lower `formula` against both tables and assert they give the same design,
+/// the same grouping ids and level labels, and the same fit.
+fn assert_same_lowering(formula: &str, a: &Table, b: &Table, family: Family, ctx: &str) {
+    let lo_a = lower(formula, a, family).unwrap();
+    let lo_b = lower(formula, b, family).unwrap_or_else(|e| panic!("{ctx}: lower failed: {e}"));
+    assert_eq!(lo_b.x, lo_a.x, "{ctx}: design matrix");
+    assert_eq!(lo_b.ids.primary, lo_a.ids.primary, "{ctx}: primary ids");
+    let labels = |lo: &glmm::formula::Lowered| -> Vec<Vec<Option<String>>> {
+        lo.re_groups.iter().map(|g| g.slot_labels.clone()).collect()
+    };
+    assert_eq!(labels(&lo_b), labels(&lo_a), "{ctx}: level labels");
+    let fit_a = fit_cold(
+        &lo_a.x,
+        &lo_a.y,
+        lo_a.n,
+        lo_a.p,
+        &lo_a.model,
+        &lo_a.ids,
+        &lo_a.opts,
+    );
+    let fit_b = fit_cold(
+        &lo_b.x,
+        &lo_b.y,
+        lo_b.n,
+        lo_b.p,
+        &lo_b.model,
+        &lo_b.ids,
+        &lo_b.opts,
+    );
+    assert!(fit_b.converged(), "{ctx}: fit did not converge");
+    assert_same_fit(&fit_b, &fit_a, ctx);
+}
+
+/// `read.csv` and `pd.read_csv` load sleepstudy's `Subject` and cbpp's `herd`
+/// as integers, and both ports pass an integer column on as numeric. It must
+/// lower to the grouping lme4 builds with `factor()`: levels in ascending
+/// numeric order, labelled as integers. cbpp's herds `1..15` are the case where
+/// that order differs from the lexicographic one.
+#[test]
+fn integer_grouping_column_lowers_like_its_factor() {
+    let data = rows(include_str!("../validation/data/empirical/sleepstudy.csv"));
+    let sleep = |subject: Column| Table {
+        columns: vec![
+            ("Reaction".into(), numeric(&data, 0)),
+            ("Days".into(), numeric(&data, 1)),
+            ("Subject".into(), subject),
+        ],
+        n: data.len(),
+    };
+    assert_same_lowering(
+        "Reaction ~ Days + (1 + Days | Subject)",
+        &sleep(factor(&data, 2)),
+        &sleep(numeric(&data, 2)),
+        Family::Gaussian,
+        "sleepstudy",
+    );
+
+    let data = rows(include_str!("../validation/data/empirical/cbpp.csv"));
+    let herd = nums(&data, 0);
+    let inc = nums(&data, 1);
+    let fail: Vec<f64> = inc.iter().zip(nums(&data, 2)).map(|(i, s)| s - i).collect();
+    let cbpp = |herd: Column| Table {
+        columns: vec![
+            ("inc".into(), Column::Numeric(inc.clone())),
+            ("fail".into(), Column::Numeric(fail.clone())),
+            ("period".into(), factor(&data, 3)),
+            ("herd".into(), herd),
+        ],
+        n: data.len(),
+    };
+    let numeric_order = Column::Factor {
+        levels: (1..=15).map(|k: u32| k.to_string()).collect(),
+        codes: herd.iter().map(|&h| h as u32 - 1).collect(),
+    };
+    assert_same_lowering(
+        "cbind(inc, fail) ~ period + (1|herd)",
+        &cbpp(numeric_order),
+        &cbpp(Column::Numeric(herd.clone())),
+        Family::Binomial {
+            link: glmm::BinomialLink::Logit,
+        },
+        "cbpp",
+    );
+}
+
+/// Column names are Unicode wherever the formula reads them: a non-ASCII
+/// grouping factor, transform argument and slope lower to the same inputs as
+/// the ASCII spelling of the same model.
+#[test]
+fn non_ascii_column_names_lower_like_ascii_ones() {
+    let data = rows(include_str!("../validation/data/empirical/sleepstudy.csv"));
+    let sleep = |[y, x, g]: [&str; 3]| Table {
+        columns: vec![
+            (y.into(), numeric(&data, 0)),
+            (x.into(), numeric(&data, 1)),
+            (g.into(), factor(&data, 2)),
+        ],
+        n: data.len(),
+    };
+    let ascii = lower(
+        "Reaction ~ sqrt(Days) + (1 + sqrt(Days) | Subject)",
+        &sleep(["Reaction", "Days", "Subject"]),
+        Family::Gaussian,
+    )
+    .unwrap();
+    let polish = lower(
+        "czas_reakcji ~ sqrt(dzień) + (1 + sqrt(dzień) | osoba_ż)",
+        &sleep(["czas_reakcji", "dzień", "osoba_ż"]),
+        Family::Gaussian,
+    )
+    .unwrap();
+    assert_eq!(polish.col_names, ["(Intercept)", "sqrt(dzień)"]);
+    assert_eq!(polish.x, ascii.x);
+    assert_eq!(polish.y, ascii.y);
+    assert_eq!(polish.ids.primary, ascii.ids.primary);
+    assert_eq!(polish.re_groups[0].name, "osoba_ż");
+    assert_eq!(polish.re_groups[0].terms, ["(Intercept)", "sqrt(dzień)"]);
+}
+
+/// A grouping column with a fractional value is not an id column; it is
+/// refused rather than cut into one level per distinct value.
+#[test]
+fn fractional_grouping_column_is_refused() {
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+            ("g".into(), Column::Numeric(vec![1.0, 1.5, 2.0, 2.0])),
+        ],
+        n: 4,
+    };
+    match lower("y ~ (1|g)", &table, Family::Gaussian) {
+        Err(glmm::formula::Error::WrongColumnKind { name, .. }) => assert_eq!(name, "g"),
+        Err(e) => panic!("wrong error: {e}"),
+        Ok(_) => panic!("a fractional grouping column must be refused"),
+    }
+}
+
 #[test]
 fn grouseticks_poisson_matches_hand_built_spec() {
     let data = rows(include_str!("../validation/data/empirical/grouseticks.csv"));
@@ -1188,6 +1327,51 @@ fn declared_factor_level_order_picks_the_reference_level() {
         "base high: {}",
         f2.beta[0]
     );
+}
+
+/// `y ~ x:z + xz` with `xz = x * z` is rank deficient. R sorts terms by degree,
+/// so the design is `(Intercept) xz x:z` and the later column, `x:z`, is the
+/// aliased one: lme4 2.0.6 drops it ("dropping 1 column", `col.dropped` 3) and
+/// reports `(Intercept) xz`, as `lm` reports `x:z` as NA. The kept coefficients
+/// are the fit of `y ~ xz`.
+#[test]
+fn rank_deficient_interaction_drops_the_column_r_drops() {
+    let n = 60;
+    let x: Vec<f64> = (0..n).map(|i| (i as f64 * 0.7).sin()).collect();
+    let z: Vec<f64> = (0..n).map(|i| (i as f64 * 0.3).cos() + 0.5).collect();
+    let xz: Vec<f64> = x.iter().zip(&z).map(|(a, b)| a * b).collect();
+    let g: Vec<f64> = (0..n).map(|i| (i / 6) as f64).collect();
+    let y: Vec<f64> = (0..n)
+        .map(|i| 1.0 + 0.8 * xz[i] + 0.3 * (g[i] - 4.5) + (i as f64 * 1.3).sin())
+        .collect();
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(y)),
+            ("x".into(), Column::Numeric(x)),
+            ("z".into(), Column::Numeric(z)),
+            ("xz".into(), Column::Numeric(xz)),
+            ("g".into(), Column::Numeric(g)),
+        ],
+        n,
+    };
+    let lo = lower("y ~ x:z + xz + (1|g)", &table, Family::Gaussian).unwrap();
+    assert_eq!(lo.col_names, vec!["(Intercept)", "xz", "x:z"]);
+    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    assert_eq!(fit.aliased(), &[false, false, true]);
+    assert!(fit.beta[2].is_nan());
+
+    let reduced = lower("y ~ xz + (1|g)", &table, Family::Gaussian).unwrap();
+    let want = fit_cold(
+        &reduced.x,
+        &reduced.y,
+        reduced.n,
+        reduced.p,
+        &reduced.model,
+        &reduced.ids,
+        &reduced.opts,
+    );
+    assert!(fit.converged() && want.converged());
+    assert_vec_close(&fit.beta[..2], &want.beta, "kept coefficients");
 }
 
 /// `offset(log(e))` in the formula must produce the same fit as passing the

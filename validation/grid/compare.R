@@ -11,7 +11,12 @@
 # oracle, and gate 3 scores every engine against the generating truth. That is
 # what keeps one oracle's defect in one family from reddening the whole grid
 # while still making the defect visible -- it shows up in gate 3, where it is a
-# statement about that oracle rather than about glmm.
+# statement about that oracle rather than about glmm. On the few cells where
+# every oracle's OWN deviance round-off is above dev_eps (manifest `dev_ref`),
+# gate 1 uses the frozen high-precision value in dev_ref.json instead. On an AGQ
+# cell with q >= 2 random effects scored against GLMMadaptive, the two engines'
+# quadrature grids differ (dev_align.R, ga_rule_dev), so gate 1 compares glmm's
+# point under GLMMadaptive's rule with GLMMadaptive's own deviance.
 #
 # Oracle-versus-oracle disagreement is never resolved by picking the oracle
 # closest to glmm. It is reported and written up outside the gates.
@@ -114,9 +119,98 @@ div_mark <- function(m, diff, cell_id, quantity, scope) {
   "DOC"
 }
 
+# ── frozen high-precision deviance references ───────────────────────────────
+# A handful of cells carry a manifest `dev_ref` (gen_manifest.R's DEV_REF):
+# their data make every reference engine's OWN f64 deviance round off by more
+# than dev_eps, so no oracle can gate them. Gate 1 falls back to the
+# high-precision value pinned here instead of best_oracle_dev's oracle
+# comparison; dev_verdict's dev_eps/dev_big and its sign rule are unchanged.
+# Unlike divergences.json this is not a registry with a staleness check --
+# there is no band to grow past, only a fixed reference value with its own
+# provenance in dev_ref.json.
+DEV_REF <- fromJSON(file.path(script_dir, "dev_ref.json"),
+                    simplifyVector = TRUE, simplifyDataFrame = FALSE)$entries
+
+# best_oracle_dev()-shaped result for a `dev_ref` cell, so the caller needs no
+# separate code path for printing or for dev_verdict.
+dev_ref_dev <- function(cell_id) {
+  for (e in DEV_REF) if (identical(e$cell, cell_id)) {
+    return(list(best = as.numeric(e$value), who = "frozen-ref",
+               excluded = "dev_ref.json", gap = NA_real_, why = NA_character_))
+  }
+  stop(sprintf("cell %s carries manifest `dev_ref` but has no entry in dev_ref.json",
+              cell_id), call. = FALSE)
+}
+
+# Gate 1's glmm deviance against the reference `b` picked. On a ga_rule_cell
+# (dev_align.R) where that reference is GLMMadaptive, it is -2 x GLMMadaptive's
+# AGQ log-likelihood at glmm's reported point, carrying a `rule` attribute so every
+# line that prints the comparison names the rule; everywhere else it is
+# aligned_dev. A glmm record that is not a converged fit keeps aligned_dev: it has
+# no point to evaluate, and gate 2 already fails it by name.
+gate1_glmm_dev <- function(g, cl, b) {
+  if (!isTRUE(g$converged) || !identical(b$who, "GLMMadaptive") || !ga_rule_cell(cl))
+    return(aligned_dev(g, cl))
+  d <- ga_rule_dev(g, cl)
+  attr(d, "rule") <- "GLMMadaptive's AGQ rule"
+  d
+}
+
 # The quantities gate 2 compares, in print order. `has_quantity` (runs.R) decides
 # which of them a record actually carries.
 GATE2_QUANTITIES <- c("beta", "se_rx", "se_hessian", "stddev", "corr")
+
+# Whether oracle record `r` is left out of gate 2's reference set for quantity
+# `q` on this cell. The records gate 1 drops for a different objective
+# (dev_align.R's objective_differs -- lme4 on Gamma and on mixed
+# probit/cloglog/NB cells, MixedModels.jl on mixed probit/cloglog and on
+# prior-weight fixed-effects gaussian cells) are the candidates; the lists live
+# only in dev_align.R.
+#
+# On a mixed cell a different objective puts every parameter at a different
+# optimum, so the record is out for every quantity. On a fixed-effects cell the
+# objectives differ only in how the dispersion enters: stats::glm reports its
+# Gamma logLik at a plug-in dispersion, and GLM.jl reports the normal
+# log-likelihood on a sum(w) scale on a prior-weight cell. None of that moves beta
+# -- every engine solves the same weighted score equations for it (measured
+# 2026-09-26 on gaml_glm_g3000, glm_gamma, wls_basic and the path_* cells: at
+# most 1.3e-05 apart). The standard errors do move with the dispersion
+# estimate, and only lme4's record, which is stats::lm / stats::glm there, uses
+# glmm's dispersion: lm's residual variance, and summary(glm)'s Pearson moment
+# on Gamma. MixedModels.jl reports SEs 5e-02 to 0.99 away on the prior-weight
+# fixed-effects gaussian cells, so it stays out.
+gate2_excluded <- function(r, cl, q) {
+  if (!objective_differs(r, cl)) return(FALSE)
+  if (cl[["n_theta"]] > 0) return(TRUE)
+  if (identical(q, "beta")) return(FALSE)
+  !identical(r$engine, "lme4")
+}
+
+# The numbers a record holds for one gate-2 quantity.
+quantity_values <- function(r, q) switch(q,
+  beta = r$beta, se_rx = r$se_rx, se_hessian = r$se_hessian,
+  stddev = stddevs_of(r), corr = corrs_of(r),
+  stop("no such quantity ", q))
+
+# A record that carries the quantity but not one finite value of it -- glmmTMB
+# writes its Hessian SEs as nulls when it cannot invert the Hessian -- reports
+# nothing to compare against.
+reports_finite <- function(r, q) {
+  has_quantity(r, q) && any(is.finite(as.numeric(unlist(quantity_values(r, q)))))
+}
+
+# se_rx has no oracle in glmm's convention on these cells: glmm's Rx is the
+# Schur complement of the OBSERVED information, and the only oracles that
+# report se_rx at all (lme4, MixedModels.jl) use the EXPECTED information at
+# their own optimum -- the same non-canonical split
+# `fisher_laplace` (dev_align.R) already names for the deviance gate, plus
+# mixed Gamma, which that helper does not cover because lme4_objective excludes
+# Gamma by family alone rather than through fisher_laplace. glmm's own Rx stays
+# covered by the in-crate identity test
+# (rx_se_is_the_penalized_deviance_curvature_in_beta), not by this gate.
+se_rx_no_convention_oracle <- function(cl) {
+  fisher_laplace(cl) || (cl[["n_theta"]] > 0 && identical(cl[["family"]], "gamma"))
+}
 
 any_fail <- FALSE
 
@@ -173,10 +267,17 @@ port_gate <- function(grid_dir, rust, engine, known) {
 
     d_beta <- port_rel_max(a$beta, b$beta)
     m_beta <- gate(d_beta)
-    no_rx <- is.null(a$se_rx) || is.null(b$se_rx)
+    # A refused fit (both sides agree there is no estimate) reports its SE
+    # slot as a same-length vector of NA, not an absent field -- caught here
+    # so it reads as "nothing to compare" like the absent-field case above it,
+    # not as a length mismatch (`rel_max`'s own both-NA collapse already
+    # drops it to NA_real_, which `mark()` would otherwise print FAIL(len)).
+    no_rx <- is.null(a$se_rx) || is.null(b$se_rx) ||
+      (all(is.na(a$se_rx)) && all(is.na(b$se_rx)))
     d_se_rx <- if (no_rx) NA_real_ else port_rel_max(a$se_rx, b$se_rx)
     m_se_rx <- gate(d_se_rx, no_rx)
-    no_h <- is.null(a$se_hessian) || is.null(b$se_hessian)
+    no_h <- is.null(a$se_hessian) || is.null(b$se_hessian) ||
+      (all(is.na(a$se_hessian)) && all(is.na(b$se_hessian)))
     d_se_h <- if (no_h) NA_real_ else port_rel_max(a$se_hessian, b$se_hessian)
     m_se_h <- gate(d_se_h, no_h)
     no_sd <- length(stddevs_of(a)) == 0 && length(stddevs_of(b)) == 0
@@ -313,7 +414,7 @@ dev_floor_report <- function(cells, glmm_recs, orec_by_cell) {
     if (is.null(g)) next
     orec <- orec_by_cell[[cid]]
     b <- best_oracle_dev(cl, orec, E_BIG_PROBE)
-    dg <- aligned_dev(g, cl)
+    dg <- gate1_glmm_dev(g, cl, b)
     delta <- if (is.na(dg) || is.na(b$best)) NA_real_ else as.numeric(dg) - b$best
     benign <- TRUE
     for (q in c("beta", "se_rx", "se_hessian", "stddev")) {
@@ -569,7 +670,9 @@ run_gates <- function() {
   dev_win <- character(0)   # DEV-WIN cells (Delta <= 0), informational
   dev_na <- character(0)    # DEV-NA cells -- the loud exclusion list
   dev_conv <- character(0)  # FAIL(conv?) cells, both deviances printed
-  no_ref <- character(0)    # gate-2 cells with no converged oracle at all
+  no_ref <- character(0)    # gate-2 cells with a quantity that had no reference
+  se_rx_excluded <- character(0)  # cells where se_rx is n/a (Rx convention)
+  no_mle <- character(0)    # no-MLE cells, and whether glmm refused them
   # Cells where glmm produced no fit to compare -- a timeout, an engine-fail, or
   # no record at all. These FAIL: "glmm did not fit this cell" is a result about
   # glmm, and the one thing it must not do is read as a pass.
@@ -578,33 +681,65 @@ run_gates <- function() {
   if (length(glmm_fail)) any_fail <<- TRUE
 
   cat("\n=== gates 1 and 2: per cell ===\n")
-  cat(sprintf("%-34s %-17s %-8s %-18s %-10s %-10s %-10s %-10s %-10s %-14s %s\n",
+  cat(sprintf("%-34s %-17s %-8s %-18s %-10s %-20s %-10s %-10s %-10s %-14s %s\n",
               "cell", "family", "arm", "dev", "beta", "se_rx", "se_hess",
               "stddev", "corr", "best", "excluded / note"))
   for (cid in names(cells)) {
     cl <- cells[[cid]]; g <- glmm_run$recs[[cid]]; orec <- orec_by_cell[[cid]]
 
+    # A cell whose data admit no maximum-likelihood estimate (manifest `no_mle`,
+    # set by gen_manifest.R) has no optimum for gates 1 and 2 to compare, so it is
+    # gated the other way round: the only correct result is glmm's own refusal,
+    # the record engines/common.rs writes for a fit that returned unconverged.
+    # A converged glmm fit FAILS here, and so do a panic, a timeout or a declined
+    # launch, since none of them is that refusal. The oracle records are printed,
+    # not consulted: GLM.jl reports "converged" on separated data once the
+    # deviance stops moving, at a finite point on the path to infinity.
+    if (!is.null(cl[["no_mle"]])) {
+      refused <- !isTRUE(g$converged) && identical(g$status, "engine-fail") &&
+                 startsWith(if (is.null(g$message)) "" else g$message, "not converged:")
+      m <- if (refused) "no-MLE" else "FAIL(no-MLE)"
+      if (!refused) any_fail <<- TRUE
+      ostat <- vapply(names(orec), function(o)
+        sprintf("%s=%s", o, if (isTRUE(orec[[o]]$converged)) "converged" else orec[[o]]$status), "")
+      no_mle <- c(no_mle, sprintf("%s: %s, glmm status=%s message=%s; oracles %s; %s",
+                                  cid, if (refused) "glmm refused as required"
+                                       else "glmm did NOT refuse",
+                                  if (is.null(g$status)) "-" else g$status,
+                                  if (is.null(g$message)) "-" else g$message,
+                                  paste(ostat, collapse = ", "), cl[["no_mle"]]))
+      cat(sprintf("%-34s %-17s %-8s %-18s see the no-MLE block\n",
+                  cid, cl[["family"]], cell_arm(cl), m))
+      next
+    }
+
     # Gate 1. eps and big are read through tol_for, never off TOL directly: that
-    # is where the unmeasured-constant guard lives.
+    # is where the unmeasured-constant guard lives. A `dev_ref` cell has no
+    # usable oracle deviance (dev_ref.json's `method` field says why), so `b`
+    # comes from the frozen high-precision value instead of the cell's oracles.
     eps <- tol_for(cid, "dev_eps"); big <- tol_for(cid, "dev_big")
-    b <- best_oracle_dev(cl, orec, big)
-    dg <- aligned_dev(g, cl)
+    b <- if (!is.null(cl[["dev_ref"]])) dev_ref_dev(cid) else best_oracle_dev(cl, orec, big)
+    dg <- gate1_glmm_dev(g, cl, b)
+    rule <- attr(dg, "rule")
+    who_dev <- if (is.null(rule)) b$who else sprintf("%s under %s", b$who, rule)
     delta <- if (is.na(dg) || is.na(b$best)) NA_real_ else as.numeric(dg) - b$best
     m_dev <- dev_verdict(delta, eps, big)
     why_dev <- if (!identical(m_dev, "DEV-NA")) NA_character_
                else if (is.na(dg)) attr(dg, "why") else b$why
 
     # Gate 2. Only CONVERGED oracle records are a reference; an oracle that ran
-    # and did not converge has no estimate to be near. A cell where no oracle
-    # converged therefore has no reference at all, which is `no-ref`: a loud
-    # exclusion like DEV-NA, never a FAIL. Charging it to glmm as FAIL(len) would
-    # read as "glmm disagrees" when the true statement is "nothing to compare
-    # against". `n/a` stays the narrower case -- a converged oracle exists, but
-    # nobody on either side reports that particular quantity.
+    # and did not converge has no estimate to be near. Of those, a record on a
+    # different objective is left out per quantity (gate2_excluded above). A
+    # quantity with no converged reference left, or whose references carry no
+    # finite value of it, is `no-ref`: a loud exclusion like DEV-NA, never a
+    # FAIL. Charging it to glmm as FAIL(len) would read as "glmm disagrees" when
+    # the true statement is "nothing to compare against". `n/a` stays the
+    # narrower case -- a usable oracle exists, but nobody on either side reports
+    # that particular quantity.
     orec_conv <- Filter(function(r) isTRUE(r$converged), orec)
     diffs <- setNames(rep(NA_real_, length(GATE2_QUANTITIES)), GATE2_QUANTITIES)
-    marks <- setNames(rep(if (!length(orec_conv)) "no-ref" else "n/a",
-                         length(GATE2_QUANTITIES)), GATE2_QUANTITIES)
+    marks <- setNames(rep("n/a", length(GATE2_QUANTITIES)), GATE2_QUANTITIES)
+    no_ref_q <- character(0)
     # A glmm record that is not a converged fit has nothing to compare, so no
     # quantity of it is put to an oracle and the cell is failed by name below.
     # Reading the numbers of such a record instead says the wrong thing twice
@@ -619,10 +754,30 @@ run_gates <- function() {
       any_fail <<- TRUE
     } else {
       for (q in GATE2_QUANTITIES) {
-        if (!length(orec_conv)) next
+        # se_rx has no oracle in glmm's Rx convention on a mixed probit,
+        # cloglog, NB or Gamma cell (se_rx_no_convention_oracle above) --
+        # excluded outright, not merely left without a reference, so it is
+        # reported here rather than falling into `no-ref`/`n/a` below.
+        # Canonical-link cells are unaffected.
+        if (identical(q, "se_rx") && se_rx_no_convention_oracle(cl)) {
+          marks[[q]] <- "n/a (Rx convention)"
+          se_rx_excluded <- c(se_rx_excluded, cid)
+          next
+        }
+        orec_ref <- Filter(function(r) !gate2_excluded(r, cl, q), orec_conv)
+        if (!length(orec_ref)) {
+          marks[[q]] <- "no-ref"
+          no_ref_q <- c(no_ref_q, sprintf("%s (no converged oracle on glmm's objective)", q))
+          next
+        }
         if (!has_quantity(g, q)) { marks[[q]] <- "n/a"; next }
-        if (!any(vapply(orec_conv, has_quantity, TRUE, q))) { marks[[q]] <- "n/a"; next }
-        nd <- nearest_oracle_diff(g, orec_conv, cl, q)
+        if (!any(vapply(orec_ref, has_quantity, TRUE, q))) { marks[[q]] <- "n/a"; next }
+        if (!any(vapply(orec_ref, reports_finite, TRUE, q))) {
+          marks[[q]] <- "no-ref"
+          no_ref_q <- c(no_ref_q, sprintf("%s (no oracle reports a finite value)", q))
+          next
+        }
+        nd <- nearest_oracle_diff(g, orec_ref, cl, q)
         diffs[[q]] <- nd$diff
         # Recorded as compared only HERE, on the branch that reaches the registry:
         # the stale check may only call an entry dead on a quantity this run put to
@@ -632,9 +787,10 @@ run_gates <- function() {
                                "glmm-vs-oracle")
       }
     }
-    if (!length(orec_conv))
-      no_ref <- c(no_ref, sprintf("%s: %d oracle record(s), none converged", cid,
-                                  length(orec)))
+    if (length(no_ref_q))
+      no_ref <- c(no_ref, sprintf("%s: %d oracle record(s), %d converged; %s",
+                                  cid, length(orec), length(orec_conv),
+                                  paste(no_ref_q, collapse = ", ")))
 
     # The deviance mark is a HARD gate with no registry escape; DEV-NA never
     # fails but is collected below for the loud-exclusion summary.
@@ -642,28 +798,32 @@ run_gates <- function() {
               startsWith(m_dev, "FAIL")
     any_fail <<- any_fail || failed
     if (identical(m_dev, "DEV-WIN"))
-      dev_win <- c(dev_win, sprintf("%s: Delta=%.6g vs %s", cid, delta, b$who))
+      dev_win <- c(dev_win, sprintf("%s: Delta=%.6g vs %s", cid, delta, who_dev))
     if (identical(m_dev, "DEV-NA"))
       dev_na <- c(dev_na, sprintf("%s: %s", cid, why_dev))
     if (identical(m_dev, "FAIL(conv?)"))
       dev_conv <- c(dev_conv, sprintf("%s: dev_glmm=%.6g dev_%s=%.6g Delta=%.6g",
-                                      cid, as.numeric(dg), b$who, b$best, delta))
+                                      cid, as.numeric(dg), who_dev, b$best, delta))
 
     cat(sprintf("%-34s %-17s %-8s %s %s %s %s %s %s %-14s %s\n",
                 cid, cl[["family"]], cell_arm(cl),
                 cell(delta, m_dev, 18),
                 cell(diffs[["beta"]], marks[["beta"]]),
-                cell(diffs[["se_rx"]], marks[["se_rx"]]),
+                cell(diffs[["se_rx"]], marks[["se_rx"]], 20),
                 cell(diffs[["se_hessian"]], marks[["se_hessian"]]),
                 cell(diffs[["stddev"]], marks[["stddev"]]),
                 cell(diffs[["corr"]], marks[["corr"]]),
                 if (is.na(b$who)) "-" else b$who,
                 # The same column carries both things the best-oracle selection
                 # has to say, and it can only ever say one of them: exclusion
-                # needs three candidates, the gap is printed at exactly two.
-                if (length(b$excluded)) paste(b$excluded, collapse = ",")
-                else if (!is.na(b$gap)) sprintf("2-oracle gap=%.3g", b$gap)
-                else "-"))
+                # needs three candidates, the gap is printed at exactly two. The
+                # quadrature rule gate 1 used, when it is not glmm's own, goes
+                # after it.
+                paste(c(if (length(b$excluded)) paste(b$excluded, collapse = ",")
+                        else if (!is.na(b$gap)) sprintf("2-oracle gap=%.3g", b$gap)
+                        else if (is.null(rule)) "-",
+                        if (!is.null(rule)) sprintf("dev: %s at glmm's point", rule)),
+                      collapse = "; ")))
   }
 
   # Three blocks, always printed, never conditional on any_fail: DEV-WIN is
@@ -681,9 +841,17 @@ run_gates <- function() {
   cat("\n=== FAIL(conv?) (|Delta dev| > dev_big -- convention mismatch, not a fit disagreement) ===\n")
   if (length(dev_conv)) for (line in dev_conv) cat(sprintf("  %s\n", line)) else cat("  none\n")
 
-  cat(sprintf("\n=== no-ref (%d cell(s): no oracle converged, so gate 2 had no reference) ===\n",
-              length(no_ref)))
+  cat(sprintf(paste0("\n=== no-ref (%d cell(s): gate 2 had no reference for the quantities ",
+                     "named -- no converged oracle on glmm's objective, or none that ",
+                     "reports a finite value) ===\n"), length(no_ref)))
   if (length(no_ref)) for (line in no_ref) cat(sprintf("  %s\n", line)) else cat("  none\n")
+
+  cat(sprintf(paste0("\n=== se_rx: not gated on %d mixed probit/cloglog/negativebinomial/",
+                     "gamma cell(s) -- printed n/a (Rx convention). glmm's Rx is the Schur ",
+                     "complement of the OBSERVED information; the ",
+                     "only oracles that report se_rx (lme4, MixedModels.jl) use the EXPECTED ",
+                     "information at their own optimum. Canonical-link cells stay gated. ===\n"),
+              length(se_rx_excluded)))
 
   # The mirror image of no-ref, and unlike it a FAILURE: there the reference is
   # missing, here glmm's own fit is. Printed even when empty, for the same reason
@@ -691,6 +859,13 @@ run_gates <- function() {
   cat(sprintf("\n=== glmm-fail (%d cell(s): glmm produced no fit, so nothing was compared) ===\n",
               length(glmm_fail)))
   if (length(glmm_fail)) for (line in glmm_fail) cat(sprintf("  %s\n", line)) else cat("  none\n")
+
+  # Printed even when empty: a cell gated on its refusal must never read as one
+  # that was compared, nor disappear.
+  cat(sprintf(paste0("\n=== no-MLE (%d cell(s): the data admit no maximum-likelihood ",
+                     "estimate, so glmm must refuse; a converged glmm fit fails) ===\n"),
+              length(no_mle)))
+  if (length(no_mle)) for (line in no_mle) cat(sprintf("  %s\n", line)) else cat("  none\n")
 
   # Printed unconditionally when anything fired, so a DOC cell above always has a
   # named reason next to it in the same output.

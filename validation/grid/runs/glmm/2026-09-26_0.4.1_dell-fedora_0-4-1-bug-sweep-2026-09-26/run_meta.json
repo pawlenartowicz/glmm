@@ -1,0 +1,20 @@
+{
+  "engine": "glmm",
+  "engine_version": "0.4.1",
+  "machine": "dell-fedora",
+  "date": "2026-09-26T18:53:00+02:00",
+  "glmm_crate_version": "0.4.1",
+  "glmm_git_rev": "c0893ab58f3d7db9ff0ef224e2d0e598fac12e6a",
+  "subset": "full",
+  "timed": null,
+  "timed_unlocked": false,
+  "no_turbo": "1",
+  "pin_cores": "0-5",
+  "jobs": 6,
+  "loadavg_start": "2.66 3.64 3.84",
+  "r_version": "4.5.3",
+  "julia_version": "1.12.6",
+  "label": "0.4.1 bug sweep 2026-09-26",
+  "cells": 773,
+  "cell_list": []
+}

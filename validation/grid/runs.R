@@ -10,8 +10,9 @@
 # The three files below are sourced HERE rather than by each consumer, so a
 # consumer that wants the grid's comparison vocabulary takes one source() line
 # and cannot end up with half of it. rel_max, port_rel_max, read_jsonl,
-# stddevs_of, corrs_of, tol_for come from tol.R; aligned_dev and align_status
-# from dev_align.R; grid_versions and norm_version from engines/versions.R.
+# stddevs_of, corrs_of, tol_for come from tol.R; aligned_dev, align_status and
+# ga_rule_dev from dev_align.R; grid_versions and norm_version from
+# engines/versions.R.
 # None of them is redefined here -- one definition each, repo-wide.
 
 # This file's own directory, resolved WHILE THE source() THAT READS IT IS STILL
@@ -540,12 +541,14 @@ near_zero_truth_coords <- function(cells) {
 
 # The one dispersion-scale number a cell has a true value for. `sigma` and
 # `dispersion` are mutually exclusive in the manifest (a gaussian/LMM cell has
-# the residual SD, a Gamma cell the dispersion) and both engines report theirs in
-# the record's `sigma` slot; `nb_theta` is its own field on both sides.
+# the residual SD, a Gamma cell the dispersion φ). Every engine's record `sigma`
+# slot holds an SD, √φ on Gamma, so a dispersion truth is compared as √φ;
+# `nb_theta` is its own field on both sides.
 truth_scale_pairs <- function(cell, rec) {
   tru <- cell[["truth"]]
   out <- list()
-  s <- if (!is.null(tru[["sigma"]])) tru[["sigma"]] else tru[["dispersion"]]
+  s <- if (!is.null(tru[["sigma"]])) tru[["sigma"]]
+       else if (!is.null(tru[["dispersion"]])) sqrt(tru[["dispersion"]])
   if (!is.null(s) && !is.null(rec$sigma)) out$sigma <- c(as.numeric(rec$sigma), as.numeric(s))
   if (!is.null(tru[["nb_theta"]]) && !is.null(rec$nb_theta))
     out$nb_theta <- c(as.numeric(rec$nb_theta), as.numeric(tru[["nb_theta"]]))

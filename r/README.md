@@ -2,9 +2,10 @@
 
 R bindings for the [`glmm`](https://github.com/pawlenartowicz/glmm) Rust
 kernel: OLS, GLM (binomial, Poisson, Gamma, negative binomial), REML linear
-mixed models, and binomial/Poisson GLMMs with Laplace or adaptive
-Gauss-Hermite quadrature. lme4-style formulas, estimates validated against
-lme4 and MixedModels.jl (see [`validation.md`](../documentation/validation.md)).
+mixed models, and binomial/Poisson/Gamma/negative-binomial GLMMs with Laplace
+or adaptive Gauss-Hermite quadrature. lme4-style formulas, estimates validated
+against lme4, glmmTMB, and MixedModels.jl (see
+[`validation.md`](../documentation/validation.md)).
 
 Deliberately scoped to **fast fitting**: fixed effects, Wald standard errors,
 variance components on the SD/correlation scale, conditional modes, fitted

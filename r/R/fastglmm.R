@@ -6,6 +6,14 @@
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
+# A bad argument value, formatted for an error message the same way the
+# Python port's `{value!r}` does: a single string quoted, anything else
+# deparsed. Mirrors python/glmm/__init__.py's use of `!r` in its argument
+# checks - change together.
+.arg_repr <- function(x) {
+  if (is.character(x) && length(x) == 1L) sprintf("'%s'", x) else deparse(x)[1]
+}
+
 # Family/link table - mirrors python/glmm/__init__.py::_FAMILIES and
 # GLMM/src/family.rs; change together. Links are the port vocabulary, not R's
 # (R's Gamma "inverse" maps to "inverse", "1/mu^2" to "inverse_squared").
@@ -46,9 +54,17 @@
 #' RE terms are not fittable by the kernel and raise an error. Contrasts are
 #' always treatment coding with the **first factor level** as base; to change
 #' the base, `relevel()` the factor (a `contrasts` argument is deliberately
-#' absent). Character columns are converted to factors with lexicographic
-#' level order (as `factor()` does); a factor's declared level order is
-#' honored.
+#' absent). Anything that would silently mean something else - an ordered
+#' factor, a factor with its own `contrasts` attribute, or the unordered slot
+#' of `options(contrasts = )` set away from `"contr.treatment"` - is a clear
+#' error when the column is used in the fixed-effects part of the formula
+#' (random-effect grouping and slope columns are not checked); character and
+#' logical columns are checked the same way as an unordered factor, since
+#' `model.matrix()` codes them the same way. Character and logical columns
+#' are converted to factors with lexicographic level order (as `factor()`
+#' does, so a logical `x` gives levels `FALSE`/`TRUE` and a coefficient
+#' `xTRUE`, as in lme4); a factor's declared level order is honored. A
+#' logical response or `offset()` variable stays a 0/1 numeric.
 #'
 #' **`Gamma()` link trap:** R's `Gamma()` family object defaults to
 #' `link = "inverse"`, and a family *object* is honored as given - R semantics
@@ -68,10 +84,12 @@
 #' as a warning of class `"fastglmm_diagnostic"` with a per-kind subclass
 #' (`"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`,
 #' `"fastglmm_unused_grouping_levels"`, `"fastglmm_re_design_scale_spread"`,
-#' `"fastglmm_hessian_se_fallback"`; a note from a newer kernel than this
-#' package arrives as `"fastglmm_unknown_note"`), so `withCallingHandlers()`
-#' and `suppressWarnings(classes = )` can select them without matching message
-#' text.
+#' `"fastglmm_single_level_grouping_dropped"`, `"fastglmm_hessian_se_fallback"`,
+#' `"fastglmm_exact_profile_fallback"`,
+#' `"fastglmm_non_integer_response"`, `"fastglmm_rows_dropped_na"`; a note from
+#' a newer kernel than this package arrives as `"fastglmm_unknown_note"`),
+#' so `withCallingHandlers()` and `suppressWarnings(classes = )` can select
+#' them without matching message text.
 #'
 #' Anything the engine cannot do is an error naming the reason - never a
 #' silently different model. That includes `REML = FALSE` (the LMM path is
@@ -163,7 +181,7 @@ fastglmm <- function(formula, data, family = gaussian(),
                      offset = NULL,
                      nAGQ = 1L,
                      start = NULL,
-                     wald.se = c("hessian", "rx"),
+                     wald.se = "hessian",
                      dispersion = NULL,
                      init.theta = NULL,
                      ...) {
@@ -171,7 +189,6 @@ fastglmm <- function(formula, data, family = gaussian(),
   # Captured before `data` is touched: the header's `Data:` line, as lme4
   # deparses it.
   data_name <- paste(deparse(substitute(data), width.cutoff = 500L), collapse = " ")
-  wald.se <- match.arg(wald.se)
 
   if (is.character(formula)) formula <- stats::as.formula(formula)
   if (!inherits(formula, "formula")) {
@@ -183,6 +200,23 @@ fastglmm <- function(formula, data, family = gaussian(),
   fam <- .normalize_family(family)
 
   mixed <- grepl("|", f_str, fixed = TRUE)
+  if (identical(fam$name, "inversegaussian") && mixed) {
+    stop("family 'inversegaussian' is GLM-only: random-effect terms are not supported",
+         call. = FALSE)
+  }
+
+  if (!(is.character(wald.se) && length(wald.se) == 1L && wald.se %in% c("hessian", "rx"))) {
+    stop(sprintf("wald.se must be 'hessian' or 'rx', got %s", .arg_repr(wald.se)),
+         call. = FALSE)
+  }
+
+  if (!(is.numeric(nAGQ) && length(nAGQ) == 1L && !is.na(nAGQ) &&
+        nAGQ == as.integer(nAGQ) && nAGQ >= 1L && nAGQ <= .MAX_NAGQ &&
+        nAGQ %% 2L == 1L)) {
+    stop(sprintf("nAGQ must be an odd integer in 1..=%d, got %s", .MAX_NAGQ, .arg_repr(nAGQ)),
+         call. = FALSE)
+  }
+  nAGQ <- as.integer(nAGQ)
 
   store <- new.env(parent = emptyenv())
   store$rows <- list()
@@ -199,7 +233,8 @@ fastglmm <- function(formula, data, family = gaussian(),
     ok <- identical(dispersion, "estimate") ||
       (is.numeric(dispersion) && length(dispersion) == 1L && is.finite(dispersion))
     if (!ok) {
-      stop("dispersion must be NULL, \"estimate\", or a single number",
+      stop(sprintf("dispersion must be NULL, 'estimate', or a number, got %s",
+                    .arg_repr(dispersion)),
            call. = FALSE)
     }
     if (fam$name %in% c("binomial", "poisson") && mixed) {
@@ -226,26 +261,20 @@ fastglmm <- function(formula, data, family = gaussian(),
   }
   if (!is.null(init.theta)) {
     stop("init.theta= (negative-binomial shape seed) has no kernel hook yet; ",
-         "only the default cold-start shape search is supported", call. = FALSE)
+         "only the default cold-start search is supported", call. = FALSE)
   }
-
-  if (!(is.numeric(nAGQ) && length(nAGQ) == 1L && !is.na(nAGQ) &&
-        nAGQ == as.integer(nAGQ) && nAGQ >= 1L && nAGQ <= .MAX_NAGQ &&
-        nAGQ %% 2L == 1L)) {
-    stop("nAGQ must be an odd integer in 1..=", .MAX_NAGQ, call. = FALSE)
-  }
-  nAGQ <- as.integer(nAGQ)
 
   if (!is.null(start)) {
     if (!is.list(start)) {
-      stop("start must be a list with elements 'beta' and/or 'theta' ",
-           "(lme4's shape; 'theta' is the RE Cholesky vector, NOT the ",
-           "negative-binomial shape - that is init.theta)", call. = FALSE)
+      stop(sprintf(paste(
+        "start must be a list with elements 'beta' and/or 'theta' (theta is the",
+        "random-effect Cholesky vector, not the negative-binomial shape - that is",
+        "init.theta), got %s"), class(start)[1L]), call. = FALSE)
     }
     unknown <- setdiff(names(start), c("beta", "theta"))
     if (length(unknown)) {
       .warn_keep(store, "argument_ignored", paste0(
-        "start accepts only 'beta' and 'theta'; these elements were ignored: ",
+        "start accepts only 'beta' and 'theta'; these entries were ignored: ",
         paste(unknown, collapse = ", "), "."), ignored)
     }
   }
@@ -260,18 +289,22 @@ fastglmm <- function(formula, data, family = gaussian(),
          call. = FALSE)
   }
   frame <- data[vars]
+  .check_contrasts(formula, frame)
 
   w <- eval(substitute(weights), data, parent.frame())
   if (!is.null(w)) {
     if (!is.numeric(w) || length(w) != nrow(data) || anyNA(w)) {
-      stop("weights must be a numeric vector with one entry per row of data",
+      stop("weights must be a numeric array with one entry per row of data",
            call. = FALSE)
+    }
+    if (!all(is.finite(w))) {
+      stop("weights must be finite: no NaN, inf, or missing entries", call. = FALSE)
     }
     if (any(w <= 0)) {
       # The kernel requires strictly positive weights; a zero weight is a row
       # that should not be in the fit at all.
-      stop("weights must be positive; drop zero-weight rows with subset= ",
-           "instead", call. = FALSE)
+      stop("weights must be positive; drop zero-weight rows from data instead",
+           call. = FALSE)
     }
     frame[["(weights)"]] <- as.double(w)
   }
@@ -284,8 +317,11 @@ fastglmm <- function(formula, data, family = gaussian(),
   o <- eval(substitute(offset), data, parent.frame())
   if (!is.null(o)) {
     if (!is.numeric(o) || length(o) != nrow(data) || anyNA(o)) {
-      stop("offset must be a numeric vector with one entry per row of data",
+      stop("offset must be a numeric array with one entry per row of data",
            call. = FALSE)
+    }
+    if (!all(is.finite(o))) {
+      stop("offset must be finite: no NaN, inf, or missing entries", call. = FALSE)
     }
     frame[["(offset)"]] <- as.double(o)
   }
@@ -299,25 +335,54 @@ fastglmm <- function(formula, data, family = gaussian(),
     na.action
   }
   if (!is.function(naf)) stop("invalid na.action", call. = FALSE)
+  n_before_na <- nrow(frame)
   frame <- naf(frame)
   if (anyNA(frame[vars])) {
     stop("missing values remain in the model columns after na.action; ",
          "the kernel cannot fit NA - use na.action = na.omit or complete ",
          "the data", call. = FALSE)
   }
-  if (nrow(frame) == 0L) stop("no rows left to fit", call. = FALSE)
+  if (nrow(frame) == 0L) {
+    # Mirrors the Python port's fit(), which raises the same text when its own
+    # missing-value row drop empties the data - change together
+    # (python/glmm/__init__.py, the na_mask block). A subset= or an
+    # already-empty data.frame reaching this point instead (n_before_na == 0)
+    # has no Python counterpart, so it keeps the plain message.
+    if (n_before_na > 0L) {
+      stop("every row has a missing value in a column the formula uses; no rows left to fit",
+           call. = FALSE)
+    }
+    stop("no rows left to fit", call. = FALSE)
+  }
+  if (nrow(frame) < n_before_na) {
+    # Mirrors the Python port's fit(), which does its own row-drop bookkeeping
+    # since it has no model.frame/na.action to do this for free - change
+    # together (python/glmm/__init__.py, the na_mask block).
+    .warn_keep(store, "rows_dropped_na", sprintf(
+      "Dropped %d of %d row(s): a column the formula uses had a missing value there.",
+      n_before_na - nrow(frame), n_before_na),
+      c("fastglmm_rows_dropped_na", "fastglmm_diagnostic"))
+  }
   w <- frame[["(weights)"]]
   o <- frame[["(offset)"]]
 
   # --- marshalling: factors cross as (levels, 0-based codes) so the caller's
   # declared level order (the treatment base) survives into Rust's
   # Column::Factor - the declared-order path. ---
+  # A logical predictor or grouping column is a factor, as lme4 builds it
+  # (model.matrix() and mkReTrms() both go through factor()): levels
+  # "FALSE"/"TRUE", a dummy named xTRUE, and indicator columns (xFALSE:z,
+  # xTRUE:z) wherever R's marginality rule codes it without a contrast. The
+  # response and offset() stay 0/1 numerics, as glm() reads them.
+  numeric_only <- c(all.vars(formula[[2L]]), .offset_vars(formula))
   numeric_cols <- list()
   factor_levels <- list()
   factor_codes <- list()
   for (nm in vars) {
     col <- frame[[nm]]
-    if (is.character(col)) col <- factor(col) # lexicographic, as factor() does
+    if (is.character(col) || (is.logical(col) && !(nm %in% numeric_only))) {
+      col <- factor(col) # lexicographic (FALSE < TRUE), as factor() does
+    }
     if (is.factor(col)) {
       factor_levels[[nm]] <- as.character(levels(col))
       factor_codes[[nm]] <- as.integer(col) - 1L
@@ -340,7 +405,14 @@ fastglmm <- function(formula, data, family = gaussian(),
     as.double(start$theta %||% double())
   )
 
-  if (!is.null(r$agq_warning) && (identical(fam$name, "gaussian") || !mixed)) {
+  # Whether the FITTED model actually has random effects - not `mixed`, which
+  # only says the formula asked for some: a single-level grouping is dropped
+  # after lowering ("single_level_grouping_dropped"), and once every
+  # random-effect term is dropped this way, `r$re_group_names` comes back
+  # empty even though `mixed` (read off the formula text before fitting)
+  # still says TRUE.
+  fitted_mixed <- length(r$re_group_names) > 0L
+  if (!is.null(r$agq_warning) && (identical(fam$name, "gaussian") || !fitted_mixed)) {
     # nAGQ changes nothing here; see the Python port's fit() for why.
     reason <- if (identical(fam$name, "gaussian")) {
       "a Gaussian model"
@@ -376,7 +448,7 @@ fastglmm <- function(formula, data, family = gaussian(),
     if (!is.null(out)) .warn_keep(store, note$kind, out$msg, out$cls)
   }
   if (!isTRUE(r$converged)) {
-    out <- .nonconvergence(fam$name, mixed, r$notes, r$beta, r$aliased, r$deviance, r$y)
+    out <- .nonconvergence(fam$name, fitted_mixed, r$notes, r$beta, r$aliased, r$deviance, r$y)
     .warn_keep(store, out$kind, out$msg, out$cls)
   }
 
@@ -496,10 +568,14 @@ fastglmm <- function(formula, data, family = gaussian(),
   singular = c("caution", "Singular fit"),
   ill_conditioned = c("caution", "Nearly collinear columns"),
   hessian_se_fallback = c("caution", "Simpler standard errors used"),
+  exact_profile_fallback = c("caution", "Search retried with a different method"),
   agq_fallback = c("caution", "Adaptive quadrature not used"),
+  non_integer_response = c("caution", "Non-integer response"),
+  rows_dropped_na = c("caution", "Rows dropped for missing values"),
   argument_ignored = c("note", "Argument ignored"),
   unused_grouping_levels = c("note", "Unused grouping levels"),
-  re_design_scale_spread = c("note", "Random-effect predictors on very different scales")
+  re_design_scale_spread = c("note", "Random-effect predictors on very different scales"),
+  single_level_grouping_dropped = c("note", "Random effect dropped (single level)")
 )
 # A kernel note this wrapper has no entry for keeps its own kind string.
 .UNKNOWN_KIND <- c("caution", "Unrecognized solver message")
@@ -565,11 +641,13 @@ fastglmm <- function(formula, data, family = gaussian(),
 #
 # Classes: "fastglmm_ill_conditioned", "fastglmm_pirls_exhausted",
 # "fastglmm_unused_grouping_levels", "fastglmm_re_design_scale_spread",
-# "fastglmm_hessian_se_fallback", "fastglmm_nb_shape_unsettled",
-# "fastglmm_unknown_note" - all inheriting "fastglmm_diagnostic", so one
-# handler catches the whole channel. Not every note comes from the solver:
-# "unused_grouping_levels" and "re_design_scale_spread" are raised by the
-# formula lowering, which is the only layer that sees both the declared
+# "fastglmm_single_level_grouping_dropped", "fastglmm_hessian_se_fallback",
+# "fastglmm_exact_profile_fallback",
+# "fastglmm_nb_shape_unsettled", "fastglmm_unknown_note" - all inheriting
+# "fastglmm_diagnostic", so one handler catches the whole channel. Not every
+# note comes from the solver: "unused_grouping_levels",
+# "re_design_scale_spread" and "single_level_grouping_dropped" are raised by
+# the formula lowering, which is the only layer that sees both the declared
 # levels/design and the per-row codes.
 .note_warning <- function(note, coef_names, converged) {
   if (identical(note$kind, "ill_conditioned")) {
@@ -600,8 +678,8 @@ fastglmm <- function(formula, data, family = gaussian(),
     levels <- if (cut > 0L) substring(note$detail, cut + 2L) else ""
     msg <- sprintf(paste(
       "Grouping factor '%s' has levels with no rows (%s). They stay in the model with",
-      "random effects of exactly zero and are counted in the number of groups. Use",
-      "droplevels() before fitting to remove them."), group, levels)
+      "random effects of exactly zero, but they are not counted in the number of groups.",
+      "Remove unused categories before fitting."), group, levels)
     cls <- c("fastglmm_unused_grouping_levels", "fastglmm_diagnostic")
   } else if (identical(note$kind, "pirls_exhausted")) {
     # Raised only when the final re-evaluation of a converged fit hit the cap; see
@@ -625,6 +703,12 @@ fastglmm <- function(formula, data, family = gaussian(),
       "are hard to compare. Rescaling these predictors makes them easier to read."),
       note$detail, note$ratio)
     cls <- c("fastglmm_re_design_scale_spread", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "single_level_grouping_dropped")) {
+    msg <- sprintf(paste(
+      "Grouping factor '%s' has only one level, so no variance between groups can be",
+      "estimated from it. Its random effect was dropped; the rest of the model was",
+      "fitted without it."), note$detail)
+    cls <- c("fastglmm_single_level_grouping_dropped", "fastglmm_diagnostic")
   } else if (identical(note$kind, "hessian_se_fallback")) {
     msg <- paste(
       "The usual standard errors could not be computed, so a simpler method was used.",
@@ -632,9 +716,24 @@ fastglmm <- function(formula, data, family = gaussian(),
       "may look more precise than they are. Standard errors for the random-effect",
       "standard deviations are not available.")
     cls <- c("fastglmm_hessian_se_fallback", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "exact_profile_fallback")) {
+    msg <- paste(
+      "The default search method for this model did not settle on an answer, so the fit",
+      "tried a different search method from the same starting point. The reported",
+      "estimates come from whichever method reached the better answer.")
+    cls <- c("fastglmm_exact_profile_fallback", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "non_integer_response")) {
+    # The kernel's Note::NonIntegerResponse (src/fit/mod.rs); `evals` carries the
+    # affected row count (src/orchestrate.rs reuses the same NoteInfo slot as
+    # nb_shape_unsettled's `rounds`).
+    msg <- sprintf(paste(
+      "The response is not a whole number in %s. This family expects integer counts",
+      "(binomial: the number of successes, y * weights). The fit still ran, but check",
+      "whether this is the right family for the data."), .count(note$evals, "row"))
+    cls <- c("fastglmm_non_integer_response", "fastglmm_diagnostic")
   } else {
     msg <- sprintf(paste(
-      "The solver reported something ('%s') that this version of fastglmm does not",
+      "The solver reported something ('%s') that this installed version does not",
       "recognize. Please report it at https://github.com/pawlenartowicz/glmm/issues."),
       note$kind)
     cls <- c("fastglmm_unknown_note", "fastglmm_diagnostic")
@@ -688,9 +787,8 @@ fastglmm <- function(formula, data, family = gaussian(),
       cls = diag_cls("too_few_rows")))
   }
   if (length(y) && isTRUE(all(y == y[[1L]]))) {
-    return(list(kind = "constant_response", msg = sprintf(paste(
-      "Every value of the response is %s, so there is nothing to estimate. Check the",
-      "response column and the rows kept by subset= and na.action."),
+    return(list(kind = "constant_response", msg = sprintf(
+      "Every value of the response is %s, so there is nothing to estimate. Check the response column.",
       sprintf("%g", y[[1L]])), cls = diag_cls("constant_response")))
   }
   if (!mixed) {
@@ -764,23 +862,98 @@ fastglmm <- function(formula, data, family = gaussian(),
 # Anything not caught here falls through to the parser, whose own message
 # (e.g. term removal for `y ~ x - 1`) is surfaced verbatim.
 .check_formula <- function(formula, f_str) {
+  # Both checks below catch formula shapes the shared Rust parser has no
+  # dedicated message for (it falls through to a generic syntax error), with
+  # the same wording the Python port uses (python/glmm/__init__.py's `fit`) -
+  # change together. Intercept-free random-effect terms ((0+x|g), (-1+x|g))
+  # are NOT pre-checked here: the parser already raises
+  # RandomInterceptSuppressionUnsupported with a specific message, and that
+  # message reaches both ports unchanged.
   if (grepl("||", f_str, fixed = TRUE)) {
-    stop("(x || g) double-bar terms are not supported: the glmm kernel ",
-         "always fits the full RE correlation structure (a kernel property, ",
-         "not a parser gap - see src/spec.rs)", call. = FALSE)
+    stop("(x || g) double-bar terms are not supported: the glmm kernel always ",
+         "fits the full RE correlation structure", call. = FALSE)
   }
   if ("." %in% all.vars(formula)) {
-    stop("'.' is not supported by the shared formula parser; ",
-         "list the columns explicitly", call. = FALSE)
-  }
-  # Intercept-free RE terms: scan each (lhs | rhs) chunk's lhs for 0 / -1.
-  re_lhs <- regmatches(f_str, gregexpr("\\(([^|()]*)\\|", f_str))[[1]]
-  if (any(grepl("(^|[^[:alnum:]._])0([^[:alnum:]._]|$)|-\\s*1",
-                sub("\\|$", "", re_lhs)))) {
-    stop("intercept-free random-effect terms ((0 + x | g), (-1 + x | g)) are ",
-         "not supported: the RE correlation structure is always full and ",
-         "includes the intercept (a kernel property - see src/spec.rs)",
+    stop("'.' is not supported by the formula parser; list the columns explicitly",
          call. = FALSE)
+  }
+  invisible()
+}
+
+# Drops every "(... | ...)" random-effect term from a formula's right-hand
+# side, working on the parsed call tree rather than the deparsed string, so
+# it survives nested +/- and parenthesized terms the same way the shared
+# parser will see them. What is left is the fixed-effects part alone.
+# Independent, minimal reimplementation of lme4::nobars: fastglmm must not
+# depend on lme4.
+.strip_bars <- function(term) {
+  if (!is.call(term)) return(term)
+  op <- as.character(term[[1L]])
+  if (op == "|") return(NULL)
+  if (op == "(" && length(term) == 2L) {
+    inner <- .strip_bars(term[[2L]])
+    if (is.null(inner)) return(NULL)
+    term[[2L]] <- inner
+    return(term)
+  }
+  if (op %in% c("+", "-") && length(term) == 3L) {
+    l <- .strip_bars(term[[2L]])
+    r <- .strip_bars(term[[3L]])
+    if (is.null(l)) return(r)
+    if (is.null(r)) return(l)
+    term[[2L]] <- l
+    term[[3L]] <- r
+    return(term)
+  }
+  term
+}
+
+# The variables read inside offset() calls anywhere in `term`.
+.offset_vars <- function(term) {
+  if (!is.call(term)) return(character())
+  if (identical(term[[1L]], as.name("offset"))) return(all.vars(term))
+  unlist(lapply(as.list(term)[-1L], .offset_vars))
+}
+
+# Refuses a formula whose fixed-effects factors would fit a different model
+# from what the coefficients say, mirroring the explicit contrasts= error
+# above: the shared parser is always treatment-coded, base = first level, and
+# has no hook to honor anything else. Character and logical columns go
+# through model.matrix() as unordered factors too (R >= 4.0's string default,
+# and 0/1 coding for logical), so they are checked the same way. Only the
+# UNORDERED slot of options(contrasts) matters here - model.matrix() only
+# reaches the ordered slot through an ordered factor, which is refused
+# outright regardless of that option. Random-effect grouping and slope
+# variables are out of scope on purpose - only fixed-effects factors are
+# contrast-coded here.
+.check_contrasts <- function(formula, frame) {
+  fixed_rhs <- .strip_bars(formula[[3L]])
+  if (is.null(fixed_rhs)) return(invisible())
+  has_unordered_factor <- FALSE
+  for (nm in all.vars(fixed_rhs)) {
+    col <- frame[[nm]]
+    if (is.null(col)) next
+    if (is.ordered(col)) {
+      stop("column '", nm, "' is an ordered factor: glmm codes factors ",
+           "with treatment contrasts; convert with ",
+           "factor(x, ordered = FALSE)", call. = FALSE)
+    }
+    if (!(is.factor(col) || is.character(col) || is.logical(col))) next
+    has_unordered_factor <- TRUE
+    if (!is.null(attr(col, "contrasts"))) {
+      stop("column '", nm, "' has a contrasts attribute set (contrasts(x) ",
+           "<- ...): the shared formula parser is treatment-coded with ",
+           "base = first level and offers no hook; remove the attribute or ",
+           "relevel() the factor to change the base level", call. = FALSE)
+    }
+  }
+  if (has_unordered_factor &&
+      !identical(getOption("contrasts")[[1L]], "contr.treatment")) {
+    stop("options(contrasts = ) sets the unordered-factor contrast away from ",
+         "the default \"contr.treatment\": the shared formula parser is ",
+         "always treatment-coded and offers no hook; reset ",
+         "options(contrasts = c(\"contr.treatment\", ...)) or relevel() the ",
+         "factor to change the base level", call. = FALSE)
   }
   invisible()
 }
@@ -822,7 +995,7 @@ fastglmm <- function(formula, data, family = gaussian(),
       gamma = "gamma",
       negativebinomial = , `negative.binomial` = "negativebinomial",
       inversegaussian = , `inverse.gaussian` = "inversegaussian",
-      stop("unknown family \"", family, "\"; expected one of ",
+      stop("unknown family '", family, "'; expected one of ",
            paste(names(.FAMILIES), collapse = ", "), call. = FALSE)
     )
     link <- .FAMILIES[[name]]$default_link

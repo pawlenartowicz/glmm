@@ -182,6 +182,60 @@ the back-maps in `varcorr_block` / `assemble_ranef_sparse` /
 design alone and warns on badly scaled predictors instead (`checkScaleX`);
 `glmm` scales internally and reports the fit in the caller's units.
 
+## Fixed-effect orthogonalization
+
+Both kernels work from Gram matrices of the fixed-effect design (`X'X`, `Z'X`),
+and a Gram squares the condition number of `X`. On a nearly collinear `X` that
+costs about half the digits of `log|X'V⁻¹X|`, of the RSS and of β̂. So before
+any row is accumulated, each fit orthogonalizes `X` once:
+
+```
+√W·X = Q·R          (QR, Givens rotations one row at a time)
+U = D⁻¹·R           (D = diag(R); U unit upper triangular)
+X̃ = X·U⁻¹           (columns orthogonal in the W metric)
+```
+
+The kernels then accumulate `[X̃ y]` wherever they accumulated `[X y]`:
+`c`, `s`, the sparse kernel's `Z'[X y]` and `[X y]'[X y]`. The substitution
+`X = X̃·U` is an exact reparametrization, and `det U = 1`, so the REML criterion
+needs no correction term. The augmented factor maps back after the fit:
+
+```
+L_XX = Uᵀ·L̃_XX      (y row unchanged)
+β̂ = U⁻¹·β̃
+```
+
+so β̂, `Var(β̂)`, the joint Wald statistic and the ill-conditioning pivot are all
+read off the `[X y]` factor as before. The conditional modes are recovered on
+`X̃` with `β̃`, since that is what the Grams hold. Random-slope covariates are
+Z entries, not fixed effects, so they are always read from the raw `X`; the
+dense accumulator keeps a raw-`X` twin of `s` (`s_raw`) for the slope-covariate
+Gram entries it reads.
+
+Why `U` and not `R`: with `R` the intercept column becomes `1/√N`, and its Gram
+entry `Σ 1/N` carries a rounding error of order `N·ε` that the fitted mean then
+multiplies into the RSS (on InstEval, `N = 73421`, that is 3e-7 on the
+deviance). With `U` a leading intercept column stays exactly 1 and the large-`N`
+error matches the raw-`X` Gram (8e-9 there, against a long-double reference).
+
+The step costs one extra pass over the rows and `O(N·p²)` flops, and no copy of
+`X`. It is always on. When `R` has a zero or non-finite diagonal (an all-zero
+weighted column, fewer rows than columns) `U` stays the identity and the
+kernels see the raw `X`. Exactly redundant columns never get here: the
+pre-dispatch alias gate (`detect_aliased`) drops them first.
+
+**Code**: `DesignQr` (`set_from_rows`, `solve_row`, `map_factor`, `map_beta`),
+`LmmSuffStats::set_design_qr` / `add_rows_multi` (`src/lmm/kernel.rs`);
+`accumulate_lmm_rows` (`src/fit/lmm.rs`); `SparseLmmWorkspace::new`
+(`src/sparse/mod.rs`); the back-map in `fit_lmm` (`src/lmm/mod.rs`).
+**Convention**: lme4 and MixedModels.jl factor crossproducts of the raw `X`
+(lme4's `RX` comes from `X'X`). On `sim_entangled_pair_lmm` the reported REML
+criteria of lme4 and glmmTMB are off the 60-digit value by −1.4e-4 and
+−6.0e-4; glmm's is off by 2e-10. **Validation**: `lmm_entangled_pair_reml_is_exact_and_invariant`
+(`src/fit/lmm_tests.rs`) fits the `sim_entangled_pair_lmm` design (`t` and `v`
+collinear to 3e-6) and pins its REML criterion to the 60-digit value in
+`validation/grid/dev_ref.json` and β_t to its 60-digit value.
+
 ## Profiled REML objective
 
 Given θ, β̂ and σ̂² are their closed-form REML solutions, so the objective is a
@@ -193,7 +247,10 @@ dev(θ) = log|V| + log|X'V⁻¹X| + (N − P)·log(σ̂²)
 
 read directly off an augmented Cholesky rather than by forming the `N×N` marginal
 covariance V. The kernel factors Ω_θ over the stacked
-`[primary | nested children | crossed | X y]` system: `log|V|` comes from the
+`[primary | nested children | crossed | X̃ y]` system (`X̃` is the
+orthogonalized design of
+[the section above](#fixed-effect-orthogonalization); `log|X̃'V⁻¹X̃| =
+log|X'V⁻¹X|` because `det U = 1`): `log|V|` comes from the
 random-effect pivots (family blocks plus the crossed-tail diagonal),
 `log|X'V⁻¹X|` from the trailing fixed-effect factor `L_XX`, and `(N − P)·log σ̂²`
 from the residual entry `L[p,p]²` — no per-evaluation β backsolve. `N − P` is
@@ -348,8 +405,13 @@ changes is θ itself (and `tau2`, which is per-θ). A block with no pinned diago
 is skipped untouched, so a non-singular fit is bit-identical.
 
 `Diagnostics::pinned` depends on this canonical form: a zero θ diagonal is now a
-zero standard deviation, which on a non-canonical Λ it need not be. The sparse
-and GLMM paths run the same step.
+zero standard deviation, which on a non-canonical Λ it need not be. The GLMM
+path runs the same step, except on its AGQ route, where only the pin flags use
+the canonical form ([`algorithms-glmm.md`](algorithms-glmm.md) has the reason).
+`canonicalize_pinned_blocks` itself skips a block
+whose `q` is past `MAX_PRIMARY_Q` (`src/lmm/mod.rs`), which only the sparse
+route ever builds, so on that route a pinned diagonal can sit above a live
+off-diagonal after all.
 
 A truth-seeded warm start is clamped to `THETA_TRUTH_FLOOR = 0.01` first, so a
 near-zero true θ never begins the search on the boundary itself.
@@ -423,7 +485,9 @@ The LMM standard error is the profiled REML SE — one method, not the
 Hessian/Rx split that the GLMM path carries (`Fit.stddev_se` is empty for an LMM,
 and `FitOptions::wald_se` is ignored here). At θ̂, `Var(β̂_j) = σ̂²·‖L_XX⁻¹ e_j‖²`
 from a forward solve against the fixed-effect Cholesky factor, and the squared
-Wald statistic is `t² = β̂_j² / Var(β̂_j)`. SEs are computed only for the columns in
+Wald statistic is `t² = β̂_j² / Var(β̂_j)`. `L_XX` here is the factor already
+mapped back to `X` (`Uᵀ·L̃_XX`, see
+[Fixed-effect orthogonalization](#fixed-effect-orthogonalization)). SEs are computed only for the columns in
 `FitOptions::target_indices`. A joint Wald χ² over the target set is available via
 the shared `joint_wald_chi_sq` helper (re-Choleskying `X'V⁻¹X = L_XX·L_XXᵀ`).
 

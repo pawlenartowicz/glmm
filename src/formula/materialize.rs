@@ -7,15 +7,24 @@
 //! - **Treatment contrasts**, base = first level — the caller's [`Column::Factor`]
 //!   level order picks the reference level. [`Column::factor_from_labels`] supplies
 //!   the lexicographic order R's `factor()` defaults to when the caller has none.
-//!   Dummy names follow `paste0(var, level)`, e.g. `period2`.
+//!   Dummy names follow `paste0(var, level)`, e.g. `period2`. A factor keeps its
+//!   base level (full indicator set) where R's `model.matrix` keeps it — see
+//!   [`full_indicator_flags`].
+//! - **Column order** is R's (`terms.formula`, then `model.matrix`): the
+//!   intercept, then the terms sorted by degree (main effects, then two-way
+//!   interactions, and so on), keeping the written order within a degree.
+//!   [`Lowered::col_names`] and the columns of [`Lowered::x`] follow it.
 //! - **Interaction columns** are the elementwise product of their components'
-//!   expanded columns, with the earliest component's contrasts varying fastest
-//!   (R's `model.matrix` order); names are the component names joined by `:`.
+//!   expanded columns. The components are taken in the order their variables
+//!   first appear in the fixed part of the formula, not as the term spells them
+//!   (`y ~ x + f:x` gives `x:fb`); names are those components joined by `:`,
+//!   and the first component's contrasts vary fastest (R's `model.matrix`).
 //! - **Random effects**: the first grouping in the AST is primary (its width/
 //!   sizing live in `ReStructure`); the rest are `extra_groupings`. All count
 //!   fields are placeholders — the kernel re-derives real level counts from
 //!   `GroupIds`.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
 use super::error::Error;
@@ -90,9 +99,9 @@ pub struct ReGroupInfo {
     pub terms: Vec<String>,
     /// Level label per slot of this grouping's RE block, in kernel block order,
     /// `None` for a padded nested slot that belongs to no level. Emitted by the
-    /// same layer that CHOOSES the layout ([`grouping_ids`]), because that
+    /// same layer that CHOOSES the layout (`grouping_ids`), because that
     /// choice is data-dependent: a flat `(1|A) + (1|B)` routes nested or crossed
-    /// depending on how balanced the data is (see [`detect_flat_nesting`]), so a
+    /// depending on how balanced the data is (see `detect_flat_nesting`), so a
     /// consumer that inferred the layout would be wrong on a dataset nobody
     /// tested. [`label_ranef`] is the only reader.
     pub slot_labels: Vec<Option<String>>,
@@ -123,10 +132,11 @@ pub struct Lowered {
     pub re_groups: Vec<ReGroupInfo>,
     /// Observations the LOWERING made about the data, which no solver can make
     /// because no solver sees the labels or the un-scaled design —
-    /// [`crate::Note::UnusedGroupingLevels`] and
-    /// [`crate::Note::ReDesignScaleSpread`]. Empty on a clean lowering. Carried
-    /// here rather than on `Fit` because it is decided before any fit runs; the
-    /// ports fold it into the same warning channel as `Fit`'s own notes.
+    /// [`crate::Note::UnusedGroupingLevels`], [`crate::Note::ReDesignScaleSpread`]
+    /// and [`crate::Note::SingleLevelGroupingDropped`]. Empty on a clean
+    /// lowering. Carried here rather than on `Fit` because it is decided
+    /// before any fit runs; the ports fold it into the same warning channel as
+    /// `Fit`'s own notes.
     pub notes: Vec<crate::Note>,
     /// `target_indices = 0..p`; `offset` set from an `offset()` formula term
     /// when present, else `None`; other knobs defaulted. Caller may override.
@@ -145,7 +155,7 @@ pub struct Lowered {
 /// Returns [`Error::Parse`] for a malformed formula (see [`super::ParseError`]), or
 /// one of the data-dependent variants ([`Error::UnknownColumn`],
 /// [`Error::ResponseNotNumeric`], [`Error::WrongColumnKind`],
-/// [`Error::SlopeVarNotInDesign`], [`Error::EmptyDesign`],
+/// [`Error::SlopeVarNotInDesign`], [`Error::SingleLevelFactor`], [`Error::EmptyDesign`],
 /// [`Error::TransformNotFinite`], [`Error::CbindNeedsBinomial`],
 /// [`Error::ZeroTrials`], [`Error::NegativeCount`]) when `data` doesn't match
 /// what the formula requires.
@@ -178,7 +188,7 @@ pub fn lower(formula: &str, data: &Table, family: Family) -> Result<Lowered, Err
 /// # Errors
 /// Returns the same data-dependent error variants as [`lower`]: [`Error::UnknownColumn`],
 /// [`Error::ResponseNotNumeric`], [`Error::WrongColumnKind`],
-/// [`Error::SlopeVarNotInDesign`], [`Error::EmptyDesign`],
+/// [`Error::SlopeVarNotInDesign`], [`Error::SingleLevelFactor`], [`Error::EmptyDesign`],
 /// [`Error::TransformNotFinite`], [`Error::CbindNeedsBinomial`],
 /// [`Error::ZeroTrials`], and [`Error::NegativeCount`].
 pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<Lowered, Error> {
@@ -216,18 +226,15 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
     };
 
     // 2. Fixed design — intercept first (when the formula has one), then each
-    // term's expanded columns.
+    // term's expanded columns, in R's term order.
     let mut col_names: Vec<String> = Vec::new();
     let mut cols: Vec<Vec<f64>> = Vec::new();
     if ast.has_intercept {
         col_names.push("(Intercept)".to_string());
         cols.push(vec![1.0; n]);
     }
-    // R's contrast promotion: without an intercept the FIRST factor main
-    // effect (in term order, numeric terms before it do not count) is coded
-    // with all its levels; every later factor keeps treatment contrasts.
-    // Mirrors `model.matrix(y ~ x + f - 1)` → `x, fa, fb, fc`.
-    let mut promote_next_factor = !ast.has_intercept;
+    let terms = r_terms(ast);
+    let full = full_indicator_flags(&terms, ast.has_intercept, data);
     // name → ColumnId for numeric main effects — the resolution map for
     // numeric random-slope variables.
     let mut numeric_main_col: HashMap<String, ColumnId> = HashMap::new();
@@ -237,19 +244,17 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
     // contrasts the fixed-effect side already computed).
     let mut factor_main_cols: HashMap<String, Vec<(String, ColumnId)>> = HashMap::new();
 
-    for term in &ast.terms {
-        use super::parse::Term;
-        match term {
-            Term::Main { name } => match data.get(name) {
+    for (vars, keep_base) in terms.iter().zip(&full) {
+        match vars[..] {
+            [name] => match data.get(name) {
                 Some(Column::Factor { levels, codes }) => {
-                    let promoted = promote_next_factor;
+                    let promoted = keep_base[0];
                     let mut dummies = Vec::new();
-                    for (suffix, col) in factor_dummies(name, levels, codes, promoted) {
+                    for (suffix, col) in factor_dummies(name, levels, codes, promoted)? {
                         dummies.push((suffix.clone(), cols.len() as ColumnId));
                         col_names.push(suffix);
                         cols.push(col);
                     }
-                    promote_next_factor = false;
                     // The promotion (`keep_base`) is a FIXED-DESIGN coding
                     // convention only: R's contrast promotion recodes the
                     // bare factor term to a full indicator set on the fixed
@@ -265,21 +270,17 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
                     } else {
                         dummies
                     };
-                    factor_main_cols.insert(name.clone(), re_dummies);
+                    factor_main_cols.insert(name.to_string(), re_dummies);
                 }
                 _ => {
                     let col = numeric_column(name, data)?;
-                    numeric_main_col.insert(name.clone(), cols.len() as ColumnId);
-                    col_names.push(name.clone());
+                    numeric_main_col.insert(name.to_string(), cols.len() as ColumnId);
+                    col_names.push(name.to_string());
                     cols.push(col);
                 }
             },
-            Term::Interaction { vars } => {
-                // Interaction columns keep treatment coding even in an
-                // intercept-free design — R never promotes an interaction's
-                // contrasts, only a bare factor main effect (checked by the
-                // `f*g - 1` oracle fixture).
-                for (name, col) in interaction_columns(vars, data)? {
+            _ => {
+                for (name, col) in interaction_columns(vars, keep_base, data)? {
                     col_names.push(name);
                     cols.push(col);
                 }
@@ -362,16 +363,26 @@ fn sorted_levels_and_codes(labels: &[String]) -> (Vec<String>, Vec<u32>) {
 
 /// Treatment-coded dummy columns for a factor (base = level 0, `levels-1`
 /// columns), or with `keep_base` the full indicator set (`levels` columns,
-/// base included) — R's contrast promotion for the first factor main effect
-/// of an intercept-free design. Names follow the module-header
-/// treatment-contrasts convention.
+/// base included) wherever [`full_indicator_flags`] says R keeps the base.
+/// Names follow the module-header treatment-contrasts convention.
+///
+/// # Errors
+/// [`Error::SingleLevelFactor`] when `levels` has fewer than 2 entries — R's
+/// `contrasts<-` refuses the same thing, regardless of `keep_base`: a
+/// single-level factor never carries information for the fixed part, whether
+/// it would be treatment-coded or given a full indicator.
 fn factor_dummies(
     var: &str,
     levels: &[String],
     codes: &[u32],
     keep_base: bool,
-) -> Vec<(String, Vec<f64>)> {
-    levels
+) -> Result<Vec<(String, Vec<f64>)>, Error> {
+    if levels.len() < 2 {
+        return Err(Error::SingleLevelFactor {
+            name: var.to_string(),
+        });
+    }
+    Ok(levels
         .iter()
         .enumerate()
         .skip(if keep_base { 0 } else { 1 })
@@ -382,7 +393,7 @@ fn factor_dummies(
                 .collect();
             (format!("{var}{lvl}"), col)
         })
-        .collect()
+        .collect())
 }
 
 /// A numeric design column by spelling: a bare column, or a whitelisted
@@ -437,22 +448,100 @@ fn numeric_column(name: &str, data: &Table) -> Result<Vec<f64>, Error> {
     Ok(out)
 }
 
+/// The fixed terms as R lays them out (`TermsForm` in R's `model.c`, behind
+/// `terms.formula`), one variable list per term. Variables are numbered by
+/// their first appearance in the fixed part (`ast.predictors`; lme4 builds its
+/// fixed design from `nobars(formula)`, so a variable seen only in a random
+/// term takes no place), and each term lists its variables in that order.
+/// Terms are then stably sorted by degree: main effects as written, then the
+/// two-way interactions as written, and so on. `y ~ x + c:b:a + a*b*c` thus
+/// becomes `x a b c b:a c:a c:b c:b:a`.
+fn r_terms(ast: &ParsedFormula) -> Vec<Vec<&str>> {
+    use super::parse::Term;
+    let rank = |v: &str| {
+        ast.predictors
+            .iter()
+            .position(|p| p == v)
+            .unwrap_or(usize::MAX)
+    };
+    let mut terms: Vec<Vec<&str>> = ast
+        .terms
+        .iter()
+        .map(|t| {
+            let mut vars: Vec<&str> = match t {
+                Term::Main { name } => vec![name.as_str()],
+                Term::Interaction { vars } => vars.iter().map(String::as_str).collect(),
+            };
+            vars.sort_by_key(|v| rank(v));
+            vars
+        })
+        .collect();
+    terms.sort_by_key(Vec::len);
+    terms
+}
+
+/// Per fixed term of [`r_terms`], one flag per variable: `true` where a factor
+/// is coded with its full indicator set, `false` where it gets treatment
+/// contrasts. Flags on numeric variables are never read.
+///
+/// This is R's rule (`TermCode` in R's `model.c`; Chambers & Hastie 1992,
+/// *Statistical Models in S*): a factor in a term gets contrasts when the
+/// term with that factor removed is empty (the intercept's place) or is
+/// contained in a term placed before it. Without an intercept, R's
+/// `model.matrix` also gives full indicators to the first factor, in variable
+/// order, of the first term that has one. `y ~ f + f:g` thus codes `g` with
+/// contrasts and `f` with indicators inside `f:g` (`fa:gq fb:gq`), and
+/// `y ~ x:f` keeps every level of `f` (`x:fa x:fb`).
+fn full_indicator_flags(terms: &[Vec<&str>], has_intercept: bool, data: &Table) -> Vec<Vec<bool>> {
+    let is_factor = |v: &str| matches!(data.get(v), Some(Column::Factor { .. }));
+    let mut full: Vec<Vec<bool>> = terms.iter().map(|v| vec![false; v.len()]).collect();
+    for (t, vars) in terms.iter().enumerate() {
+        for (k, &v) in vars.iter().enumerate() {
+            if !is_factor(v) {
+                continue;
+            }
+            let rest: Vec<&str> = vars.iter().copied().filter(|&u| u != v).collect();
+            let covered = rest.is_empty()
+                || terms[..t]
+                    .iter()
+                    .any(|e| rest.iter().all(|u| e.contains(u)));
+            full[t][k] = !covered;
+        }
+    }
+    if !has_intercept {
+        if let Some((t, k)) = terms
+            .iter()
+            .enumerate()
+            .find_map(|(t, vars)| vars.iter().position(|v| is_factor(v)).map(|k| (t, k)))
+        {
+            full[t][k] = true;
+        }
+    }
+    full
+}
+
 /// Expand one variable to its design columns: a numeric (or transform) → one
-/// column named after the variable; a factor → its treatment dummies.
-fn expand_var(name: &str, data: &Table) -> Result<Vec<(String, Vec<f64>)>, Error> {
+/// column named after the variable; a factor → its treatment dummies, or all
+/// its indicators with `keep_base`.
+fn expand_var(name: &str, keep_base: bool, data: &Table) -> Result<Vec<(String, Vec<f64>)>, Error> {
     match data.get(name) {
-        Some(Column::Factor { levels, codes }) => Ok(factor_dummies(name, levels, codes, false)),
+        Some(Column::Factor { levels, codes }) => factor_dummies(name, levels, codes, keep_base),
         _ => Ok(vec![(name.to_string(), numeric_column(name, data)?)]),
     }
 }
 
 /// Interaction columns formed from the module-header conventions: elementwise
 /// product across the vars' expanded sets, earliest var varying fastest, names
-/// joined by `:`.
-fn interaction_columns(vars: &[String], data: &Table) -> Result<Vec<(String, Vec<f64>)>, Error> {
-    let mut acc = expand_var(&vars[0], data)?;
-    for var in &vars[1..] {
-        let next = expand_var(var, data)?;
+/// joined by `:`. `vars` is one term of [`r_terms`] (variable order) and
+/// `keep_base` its row of [`full_indicator_flags`].
+fn interaction_columns(
+    vars: &[&str],
+    keep_base: &[bool],
+    data: &Table,
+) -> Result<Vec<(String, Vec<f64>)>, Error> {
+    let mut acc = expand_var(vars[0], keep_base[0], data)?;
+    for (var, &kb) in vars[1..].iter().zip(&keep_base[1..]) {
+        let next = expand_var(var, kb, data)?;
         let mut out = Vec::with_capacity(acc.len() * next.len());
         // Later var outer, earlier var inner → earliest contrasts vary fastest.
         for (n2, c2) in &next {
@@ -466,17 +555,44 @@ fn interaction_columns(vars: &[String], data: &Table) -> Result<Vec<(String, Vec
     Ok(acc)
 }
 
-/// A grouping column's `(levels, codes)` (grouping vars must be factors). The
-/// codes ARE the dense per-row ids: a grouping's level order is arbitrary as far
-/// as the fit is concerned (its RE levels are exchangeable), so the caller's
-/// order is taken as-is rather than re-derived.
-fn grouping_factor<'a>(name: &str, data: &'a Table) -> Result<(&'a [String], &'a [u32]), Error> {
+/// A grouping column's levels and per-row codes: borrowed from a factor column,
+/// built for a whole-number one (see [`grouping_factor`]).
+type LevelsAndCodes<'a> = (Cow<'a, [String]>, Cow<'a, [u32]>);
+
+/// A grouping column's `(levels, codes)`. The codes ARE the dense per-row ids:
+/// a grouping's level order is arbitrary as far as the fit is concerned (its RE
+/// levels are exchangeable), so a factor's own order is taken as-is rather than
+/// re-derived.
+///
+/// A numeric column whose values are all whole numbers (an integer column, as
+/// `read.csv` and `pd.read_csv` load an id) is taken as a factor of its distinct
+/// values in ascending order, labelled as integers — the levels lme4 gets from
+/// `factor()` on that column. Any other numeric column is refused.
+fn grouping_factor<'a>(name: &str, data: &'a Table) -> Result<LevelsAndCodes<'a>, Error> {
     match data.get(name) {
-        Some(Column::Factor { levels, codes }) => Ok((levels, codes)),
-        Some(Column::Numeric(_)) => Err(Error::WrongColumnKind {
-            name: name.to_string(),
-            expected: "a factor (grouping variable)",
-        }),
+        Some(Column::Factor { levels, codes }) => Ok((Cow::Borrowed(levels), Cow::Borrowed(codes))),
+        Some(Column::Numeric(v)) => {
+            if !v.iter().all(|x| x.is_finite() && x.fract() == 0.0) {
+                return Err(Error::WrongColumnKind {
+                    name: name.to_string(),
+                    expected: "a factor or a column of whole numbers (grouping variable)",
+                });
+            }
+            // `+ 0.0` folds -0.0 into 0.0, which `total_cmp` would keep apart.
+            let mut values: Vec<f64> = v.iter().map(|x| x + 0.0).collect();
+            values.sort_by(f64::total_cmp);
+            values.dedup();
+            let codes = v
+                .iter()
+                .map(|x| {
+                    values
+                        .binary_search_by(|u| u.total_cmp(&(x + 0.0)))
+                        .unwrap() as u32
+                })
+                .collect();
+            let levels = values.iter().map(|u| format!("{u}")).collect();
+            Ok((Cow::Owned(levels), Cow::Owned(codes)))
+        }
         None => Err(Error::UnknownColumn(name.to_string())),
     }
 }
@@ -627,6 +743,40 @@ impl GroupingLayout {
     }
 }
 
+/// A random-effect term's own grouping factor's distinct OBSERVED level
+/// count — what lme4 checks against `> 1` ("grouping factors must have > 1
+/// sampled level"). This is independent of how [`grouping_ids`] will end up
+/// routing the term (nested, crossed, or plain): a plain grouping's count is
+/// its own column's distinct observed code, and an explicit `parent:child`
+/// or crossed `A:B` grouping's is the distinct observed `(A, B)` pair
+/// count — the same composite factor lme4 builds via `interaction()` before
+/// counting its levels, not the padded rectangle a nested layout later sizes
+/// its RE block to.
+fn grouping_level_count(re: &RandomEffect, data: &Table) -> Result<usize, Error> {
+    let group = re_group_name(re);
+    if let RandomEffect::Intercept {
+        parent: Some(parent),
+        ..
+    } = re
+    {
+        let child = group.strip_prefix(&format!("{parent}:")).unwrap_or(&group);
+        let a = grouping_row_labels(parent, data)?;
+        let b = grouping_row_labels(child, data)?;
+        let distinct: BTreeSet<String> =
+            a.iter().zip(&b).map(|(x, y)| format!("{x}:{y}")).collect();
+        return Ok(distinct.len());
+    }
+    if let Some((lhs, rhs)) = group.split_once(':') {
+        let a = grouping_row_labels(lhs, data)?;
+        let b = grouping_row_labels(rhs, data)?;
+        let distinct: BTreeSet<String> =
+            a.iter().zip(&b).map(|(x, y)| format!("{x}:{y}")).collect();
+        return Ok(distinct.len());
+    }
+    let (_, codes) = grouping_factor(&group, data)?;
+    Ok(codes.iter().collect::<BTreeSet<_>>().len())
+}
+
 /// Dense per-row ids for one grouping, plus the label of every slot of its RE
 /// block. A nested inner factor `A:B` (explicit parent `A`) routes through
 /// [`nested_padded_ids`]; a crossed interaction and a plain grouping use a flat
@@ -644,7 +794,7 @@ fn grouping_ids(re: &RandomEffect, data: &Table) -> Result<GroupingLayout, Error
             // exactly when `parent` names the primary grouping.
             let (parent_levels, parent_ids) = grouping_factor(parent, data)?;
             let (ids, child_labels) =
-                nested_padded_ids(parent_ids, &grouping_row_labels(child, data)?);
+                nested_padded_ids(&parent_ids, &grouping_row_labels(child, data)?);
             // Explicit `parent:child` syntax: the user named the parent, so the
             // level is spelled with it. PARENT-FIRST — lme4 spells the same level
             // child-first (`b1:a1`); both label the same thing, and this order
@@ -708,7 +858,7 @@ fn grouping_ids(re: &RandomEffect, data: &Table) -> Result<GroupingLayout, Error
                 .map(|m| m as usize + 1)
                 .unwrap_or(0);
             let mut observed = vec![false; width];
-            for &c in codes {
+            for &c in codes.iter() {
                 observed[c as usize] = true;
             }
             Ok(GroupingLayout {
@@ -854,7 +1004,38 @@ fn lower_random_effects(
             Vec::new(),
         ));
     }
-    let re0 = &ast.random_effects[0];
+
+    // A grouping with only one observed level carries no information about a
+    // between-group variance (lme4: "grouping factors must have > 1 sampled
+    // level"). Checked up front, independent of the nested/crossed routing
+    // decided below (see `grouping_level_count`), and dropped with a warning
+    // rather than an error — the rest of the model, including any OTHER
+    // random-effect term, still fits. Filtering the term list before anything
+    // below picks a primary means a dropped primary correctly promotes the
+    // next surviving term, exactly as if the formula had never declared the
+    // dropped one.
+    let mut notes: Vec<crate::Note> = Vec::new();
+    let mut terms: Vec<&RandomEffect> = Vec::with_capacity(ast.random_effects.len());
+    for re in &ast.random_effects {
+        if grouping_level_count(re, data)? < 2 {
+            notes.push(crate::Note::SingleLevelGroupingDropped {
+                grouping: re_group_name(re),
+            });
+        } else {
+            terms.push(re);
+        }
+    }
+    let Some((&re0, rest)) = terms.split_first() else {
+        // Every random-effect term was dropped: fit as though the formula had
+        // declared none, keeping the warnings raised above.
+        return Ok((
+            ModelSpec { family, re: None },
+            GroupIds::default(),
+            Vec::new(),
+            notes,
+        ));
+    };
+
     let primary_slopes = slope_cols(re0, numeric_main_col, factor_main_cols)?;
     let primary_layout = grouping_ids(re0, data)?;
     let primary_ids = primary_layout.ids;
@@ -862,11 +1043,11 @@ fn lower_random_effects(
 
     let mut extra_groupings = Vec::new();
     let mut extra_ids = Vec::new();
-    let mut notes: Vec<crate::Note> =
-        unused_levels_note(&re_group_name(re0), primary_layout.unused)
-            .into_iter()
-            .chain(scale_spread_note(&re_group_name(re0), xm, &primary_slopes))
-            .collect();
+    notes.extend(unused_levels_note(
+        &re_group_name(re0),
+        primary_layout.unused,
+    ));
+    notes.extend(scale_spread_note(&re_group_name(re0), xm, &primary_slopes));
     let mut re_groups = vec![re_group_info(
         re0,
         factor_main_cols,
@@ -879,7 +1060,7 @@ fn lower_random_effects(
     // lever). Explicit `parent:child` syntax is not gated here; a second explicit
     // nested extra trips the engine's `assert_model_shape` instead.
     let mut have_nested = false;
-    for re in &ast.random_effects[1..] {
+    for &re in rest {
         let slopes = slope_cols(re, numeric_main_col, factor_main_cols)?;
         // Explicit `parent:child` syntax → nested. A flat scalar-intercept
         // grouping with no `:` may STILL nest within the primary (the lme4 idiom
@@ -978,7 +1159,7 @@ pub struct RanefBlock {
 /// This is the whole of the RE block-layout knowledge, written once. Every
 /// consumer — the Python and R packages, a Rust caller — goes through here
 /// rather than re-deriving the slicing, because the layout is a data-dependent
-/// SPEED decision (see [`detect_flat_nesting`]) that no consumer can infer from
+/// SPEED decision (see `detect_flat_nesting`) that no consumer can infer from
 /// the formula.
 ///
 /// A fit with no conditional modes (fixed-only, or non-converged, where
@@ -1045,6 +1226,190 @@ pub fn label_ranef(fit: &crate::Fit, re_groups: &[ReGroupInfo]) -> Result<Vec<Ra
         base += n_levels * q;
     }
     Ok(out)
+}
+
+/// One term's raw spelling (`"x"`, `"log(x)"`, a grouping factor's own name,
+/// …) resolved to the real column name lowering would read for it, or `None`
+/// when it resolves against neither. Mirrors `numeric_column`'s own
+/// tie-break: a literal column by that exact spelling wins over reading it as
+/// a transform, so a caller who already has a column named `"log(x)"` gets
+/// that column, never `"x"`. `available` stands in for `data` here — this
+/// runs before any data column is actually read, in [`referenced_columns`].
+fn resolve_available<'a>(raw: &'a str, available: &[String]) -> Option<&'a str> {
+    if available.iter().any(|a| a == raw) {
+        return Some(raw);
+    }
+    let (_, col) = parse_transform(raw)?;
+    available.iter().any(|a| a == col).then_some(col)
+}
+
+fn push_resolved(out: &mut Vec<String>, raw: &str, available: &[String]) {
+    if let Some(col) = resolve_available(raw, available) {
+        out.push(col.to_string());
+    }
+}
+
+/// Grouping factor names are never a transform spelling — the RE grammar
+/// admits no parens around a group name — so a `parent:child` or `lhs:rhs`
+/// composite (`grouping_ids`'s nested and crossed arms) is always exactly its
+/// two literal column names joined by `:`; splitting on it recovers them with
+/// no tie-break needed. A plain group with no `:` is that single literal
+/// name, the split's only piece.
+fn push_group(out: &mut Vec<String>, group: &str, available: &[String]) {
+    for part in group.split(':') {
+        if available.iter().any(|a| a == part) {
+            out.push(part.to_string());
+        }
+    }
+}
+
+/// The names in `available` that `materialize` would actually read off `data`
+/// to lower `ast` — a caller with its own columns to fetch (the Python port;
+/// `Table` itself expects every column already in hand) can filter down to
+/// just these before paying for a conversion, instead of touching a column
+/// the formula never uses.
+///
+/// A name that resolves against neither `available` nor a transform of one of
+/// its members (an unknown column, or a transform spelling nothing in
+/// `available` answers to) is left out — the same name will still surface
+/// from [`materialize`] itself, with its own precise error, once the caller
+/// tries to lower against data that is really missing it. This function never
+/// errors; it is a filter, not a validator.
+pub fn referenced_columns(ast: &ParsedFormula, available: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for_each_formula_name(ast, |raw, is_group| {
+        if is_group {
+            push_group(&mut out, raw, available)
+        } else {
+            push_resolved(&mut out, raw, available)
+        }
+    });
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every name the formula spells, in formula order: the response (both
+/// `cbind()` columns), fixed terms, each random effect's grouping (with
+/// `is_group` set) and slope variables, then the `offset()` term. The one walk
+/// behind [`referenced_columns`] and [`unresolved_columns`].
+fn for_each_formula_name(ast: &ParsedFormula, mut visit: impl FnMut(&str, bool)) {
+    use super::parse::Term;
+
+    match &ast.cbind {
+        Some((s, f)) => {
+            visit(s, false);
+            visit(f, false);
+        }
+        None => visit(&ast.dependent, false),
+    }
+    for term in &ast.terms {
+        match term {
+            Term::Main { name } => visit(name, false),
+            Term::Interaction { vars } => vars.iter().for_each(|v| visit(v, false)),
+        }
+    }
+    for re in &ast.random_effects {
+        match re {
+            RandomEffect::Intercept { group, .. } => visit(group, true),
+            RandomEffect::Slope { group, vars } => {
+                visit(group, true);
+                vars.iter().for_each(|v| visit(v, false));
+            }
+        }
+    }
+    if let Some(expr) = &ast.offset {
+        visit(expr, false);
+    }
+}
+
+/// The other side of [`referenced_columns`]'s filter: names the formula
+/// references that resolve against NEITHER `available` nor a transform of one
+/// of its members — what [`materialize`] itself would raise
+/// [`Error::UnknownColumn`] on, for the first one it reaches. A `log(x)`
+/// spelling is reported as a missing `x` (matching `numeric_column`'s own
+/// error) rather than as the literal call text.
+///
+/// A caller with `available` = its data's column names can raise the same
+/// "unknown column" error [`materialize`] would, before doing anything else
+/// with the formula (the Python port needs this: unlike `materialize`, it
+/// validates `weights=`/`offset=` against the data's row count before ever
+/// calling into Rust, and a formula's genuinely missing column must be
+/// reported ahead of an unrelated length mismatch on those arguments).
+pub fn unresolved_columns(ast: &ParsedFormula, available: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for_each_formula_name(ast, |raw, is_group| {
+        if is_group {
+            push_missing_group(&mut out, raw, available)
+        } else {
+            push_missing(&mut out, raw, available)
+        }
+    });
+    let mut unique: Vec<String> = Vec::with_capacity(out.len());
+    for name in out {
+        if !unique.contains(&name) {
+            unique.push(name);
+        }
+    }
+    unique
+}
+
+/// `raw`'s [`resolve_available`] miss, reworded to the name an `UnknownColumn`
+/// error would name: `raw` itself when it resolves against neither `available`
+/// nor a transform spelling, else the transform's underlying column when THAT
+/// is what is missing. `None` when `raw` resolves.
+fn missing_name(raw: &str, available: &[String]) -> Option<String> {
+    if available.iter().any(|a| a == raw) {
+        return None;
+    }
+    match parse_transform(raw) {
+        Some((_, col)) => (!available.iter().any(|a| a == col)).then(|| col.to_string()),
+        None => Some(raw.to_string()),
+    }
+}
+
+fn push_missing(out: &mut Vec<String>, raw: &str, available: &[String]) {
+    if let Some(name) = missing_name(raw, available) {
+        out.push(name);
+    }
+}
+
+/// [`push_group`]'s miss side: a grouping's literal parts (never a transform
+/// spelling) that are not in `available`.
+fn push_missing_group(out: &mut Vec<String>, group: &str, available: &[String]) {
+    for part in group.split(':') {
+        if !available.iter().any(|a| a == part) {
+            out.push(part.to_string());
+        }
+    }
+}
+
+/// Names the formula always reads as plain numbers: the response (both count
+/// columns of a `cbind()` response), and the `offset()` term's own column, if
+/// any — the R port's `all.vars(formula[[2L]])` plus its own `offset()` walk,
+/// which read R's formula AST directly (`r/R/fastglmm.R`). A caller with no
+/// such AST of its own (the Python port) asks here instead, to know which
+/// columns must stay numeric even when their VALUES look boolean — a bool
+/// predictor or grouping column crosses as a `FALSE`/`TRUE` factor, but the
+/// response and the offset never do.
+///
+/// Resolved against `available` the same way [`referenced_columns`] resolves
+/// every other name, so a transform spelling (`offset(log(exposure))`) names
+/// its underlying column, matching what actually appears in that filtered
+/// list.
+pub fn numeric_only_columns(ast: &ParsedFormula, available: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    match &ast.cbind {
+        Some((s, f)) => {
+            push_resolved(&mut out, s, available);
+            push_resolved(&mut out, f, available);
+        }
+        None => push_resolved(&mut out, &ast.dependent, available),
+    }
+    if let Some(expr) = &ast.offset {
+        push_resolved(&mut out, expr, available);
+    }
+    out
 }
 
 /// The grouping factor a random effect is written against — the name
@@ -1333,5 +1698,155 @@ mod tests {
             label_ranef(&fit, &re_groups),
             Err(Error::RanefShapeMismatch(_))
         ));
+    }
+
+    /// A fixed-part factor with a single declared level errors, naming the
+    /// column — lme4's own "contrasts can be applied only to factors with 2
+    /// or more levels", with the offending column named.
+    #[test]
+    fn one_level_factor_in_fixed_part_errors() {
+        let table = Table {
+            columns: vec![
+                ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0])),
+                ("x".into(), Column::Numeric(vec![0.1, 0.2, 0.3])),
+                (
+                    "f".into(),
+                    Column::factor_from_labels(&strs(&["z", "z", "z"])),
+                ),
+            ],
+            n: 3,
+        };
+        assert_eq!(
+            super::lower("y ~ f + x", &table, Family::Gaussian)
+                .err()
+                .unwrap(),
+            Error::SingleLevelFactor {
+                name: "f".to_string()
+            }
+        );
+    }
+
+    /// The same one-level factor inside an interaction term also errors —
+    /// `factor_dummies` is the one call site the main-effect and interaction
+    /// paths both go through.
+    #[test]
+    fn one_level_factor_inside_interaction_errors() {
+        let table = Table {
+            columns: vec![
+                ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0])),
+                ("x".into(), Column::Numeric(vec![0.1, 0.2, 0.3])),
+                (
+                    "f".into(),
+                    Column::factor_from_labels(&strs(&["z", "z", "z"])),
+                ),
+            ],
+            n: 3,
+        };
+        assert_eq!(
+            super::lower("y ~ f * x", &table, Family::Gaussian)
+                .err()
+                .unwrap(),
+            Error::SingleLevelFactor {
+                name: "f".to_string()
+            }
+        );
+    }
+
+    /// A grouping with a single observed level is dropped with a
+    /// `SingleLevelGroupingDropped` note rather than fitted, and the other
+    /// random-effect term is promoted to primary and still fits.
+    #[test]
+    fn single_level_grouping_dropped_with_note_keeps_other_groupings() {
+        let table = Table {
+            columns: vec![
+                ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+                ("x".into(), Column::Numeric(vec![0.1, 0.2, 0.3, 0.4])),
+                (
+                    "onegroup".into(),
+                    Column::factor_from_labels(&strs(&["only", "only", "only", "only"])),
+                ),
+                (
+                    "h".into(),
+                    Column::factor_from_labels(&strs(&["a", "a", "b", "b"])),
+                ),
+            ],
+            n: 4,
+        };
+        let lo =
+            super::lower("y ~ x + (1 | onegroup) + (1 | h)", &table, Family::Gaussian).unwrap();
+        assert!(matches!(
+            lo.notes.as_slice(),
+            [crate::Note::SingleLevelGroupingDropped { grouping }] if grouping == "onegroup"
+        ));
+        assert_eq!(lo.re_groups.len(), 1);
+        assert_eq!(lo.re_groups[0].name, "h");
+    }
+
+    /// Every random-effect term is single-level: the fit routes exactly like a
+    /// formula that declared no random effects, keeping both warnings.
+    #[test]
+    fn every_grouping_single_level_drops_to_no_random_effects() {
+        let table = Table {
+            columns: vec![
+                ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+                ("x".into(), Column::Numeric(vec![0.1, 0.2, 0.3, 0.4])),
+                (
+                    "g1".into(),
+                    Column::factor_from_labels(&strs(&["only", "only", "only", "only"])),
+                ),
+                (
+                    "g2".into(),
+                    Column::factor_from_labels(&strs(&["one", "one", "one", "one"])),
+                ),
+            ],
+            n: 4,
+        };
+        let lo = super::lower("y ~ x + (1 | g1) + (1 | g2)", &table, Family::Gaussian).unwrap();
+        assert!(lo.model.re.is_none());
+        assert!(lo.re_groups.is_empty());
+        assert_eq!(lo.notes.len(), 2);
+        assert!(lo
+            .notes
+            .iter()
+            .all(|n| matches!(n, crate::Note::SingleLevelGroupingDropped { .. })));
+    }
+
+    /// [`unresolved_columns`] names a bare missing column and a transform's
+    /// missing underlying column (`log(z)` reports `z`, not the call text),
+    /// and stays empty once everything resolves.
+    #[test]
+    fn unresolved_columns_reports_missing_names_including_transform_targets() {
+        let ast = parse("y ~ log(z) + (1 | g) + offset(o)").unwrap();
+        let available = strs(&["y", "g"]);
+        assert_eq!(
+            unresolved_columns(&ast, &available),
+            vec!["z".to_string(), "o".to_string()]
+        );
+
+        let complete = strs(&["y", "z", "g", "o"]);
+        assert!(unresolved_columns(&ast, &complete).is_empty());
+
+        // A name spelled in several terms is reported once, in formula order.
+        assert_eq!(
+            unresolved_columns(&parse("y ~ z + w + z:w").unwrap(), &strs(&["y"])),
+            strs(&["z", "w"])
+        );
+    }
+
+    /// [`numeric_only_columns`] names the response and the offset column, and
+    /// both sides of a `cbind()` response.
+    #[test]
+    fn numeric_only_columns_names_response_and_offset() {
+        let ast = parse("y ~ x + (1 | g) + offset(o)").unwrap();
+        let available = strs(&["y", "x", "g", "o"]);
+        let mut names = numeric_only_columns(&ast, &available);
+        names.sort();
+        assert_eq!(names, vec!["o".to_string(), "y".to_string()]);
+
+        let cbind_ast = parse("cbind(s, f) ~ x").unwrap();
+        let cbind_available = strs(&["s", "f", "x"]);
+        let mut cbind_names = numeric_only_columns(&cbind_ast, &cbind_available);
+        cbind_names.sort();
+        assert_eq!(cbind_names, vec!["f".to_string(), "s".to_string()]);
     }
 }

@@ -14,7 +14,7 @@ fastglmm(
   offset = NULL,
   nAGQ = 1L,
   start = NULL,
-  wald.se = c("hessian", "rx"),
+  wald.se = "hessian",
   dispersion = NULL,
   init.theta = NULL,
   ...
@@ -121,9 +121,17 @@ terms with a \strong{full} correlation structure - \code{(x || g)} and intercept
 RE terms are not fittable by the kernel and raise an error. Contrasts are
 always treatment coding with the \strong{first factor level} as base; to change
 the base, \code{relevel()} the factor (a \code{contrasts} argument is deliberately
-absent). Character columns are converted to factors with lexicographic
-level order (as \code{factor()} does); a factor's declared level order is
-honored.
+absent). Anything that would silently mean something else - an ordered
+factor, a factor with its own \code{contrasts} attribute, or the unordered slot
+of \code{options(contrasts = )} set away from \code{"contr.treatment"} - is a clear
+error when the column is used in the fixed-effects part of the formula
+(random-effect grouping and slope columns are not checked); character and
+logical columns are checked the same way as an unordered factor, since
+\code{model.matrix()} codes them the same way. Character and logical columns
+are converted to factors with lexicographic level order (as \code{factor()}
+does, so a logical \code{x} gives levels \code{FALSE}/\code{TRUE} and a coefficient
+\code{xTRUE}, as in lme4); a factor's declared level order is honored. A
+logical response or \code{offset()} variable stays a 0/1 numeric.
 
 \strong{\code{Gamma()} link trap:} R's \code{Gamma()} family object defaults to
 \code{link = "inverse"}, and a family \emph{object} is honored as given - R semantics
@@ -143,10 +151,12 @@ Python port so the two ports agree.
 as a warning of class \code{"fastglmm_diagnostic"} with a per-kind subclass
 (\code{"fastglmm_ill_conditioned"}, \code{"fastglmm_pirls_exhausted"},
 \code{"fastglmm_unused_grouping_levels"}, \code{"fastglmm_re_design_scale_spread"},
-\code{"fastglmm_hessian_se_fallback"}; a note from a newer kernel than this
-package arrives as \code{"fastglmm_unknown_note"}), so \code{withCallingHandlers()}
-and \code{suppressWarnings(classes = )} can select them without matching message
-text.
+\code{"fastglmm_single_level_grouping_dropped"}, \code{"fastglmm_hessian_se_fallback"},
+\code{"fastglmm_exact_profile_fallback"},
+\code{"fastglmm_non_integer_response"}, \code{"fastglmm_rows_dropped_na"}; a note from
+a newer kernel than this package arrives as \code{"fastglmm_unknown_note"}),
+so \code{withCallingHandlers()} and \code{suppressWarnings(classes = )} can select
+them without matching message text.
 
 Anything the engine cannot do is an error naming the reason - never a
 silently different model. That includes \code{REML = FALSE} (the LMM path is

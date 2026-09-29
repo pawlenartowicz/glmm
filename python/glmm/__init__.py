@@ -11,13 +11,16 @@ search — only the default `init_theta=None` cold-start is supported).
 Public surface is `fit`, `Fit`, and the warning categories the diagnostics
 channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
 `ArgumentIgnoredWarning`, `ConstantResponseWarning`, `DesignUnsolvableWarning`,
+`ExactProfileFallbackWarning`,
 `FitFailedWarning`, `GlmDivergedWarning`, `HessianSeFallbackWarning`,
 `IllConditionedWarning`, `NbShapeUnsettledWarning`, `NoCoefficientsWarning`,
-`PirlsExhaustedWarning`, `ReDesignScaleWarning`, `SearchLimitWarning`,
+`NonIntegerResponseWarning`, `PirlsExhaustedWarning`, `ReDesignScaleWarning`,
+`RowsDroppedWarning`, `SearchLimitWarning`, `SingleLevelGroupingDroppedWarning`,
 `SingularFitWarning`, `TooFewRowsWarning`, `UnusedGroupingLevelsWarning`).
 """
 
 import math
+import re
 import warnings
 from dataclasses import dataclass, field
 
@@ -31,6 +34,7 @@ __all__ = [
     "ConstantResponseWarning",
     "DesignUnsolvableWarning",
     "DiagnosticWarning",
+    "ExactProfileFallbackWarning",
     "Fit",
     "FitFailedWarning",
     "GlmDivergedWarning",
@@ -38,9 +42,12 @@ __all__ = [
     "IllConditionedWarning",
     "NbShapeUnsettledWarning",
     "NoCoefficientsWarning",
+    "NonIntegerResponseWarning",
     "PirlsExhaustedWarning",
     "ReDesignScaleWarning",
+    "RowsDroppedWarning",
     "SearchLimitWarning",
+    "SingleLevelGroupingDroppedWarning",
     "SingularFitWarning",
     "TooFewRowsWarning",
     "UnusedGroupingLevelsWarning",
@@ -94,6 +101,17 @@ class UnusedGroupingLevelsWarning(DiagnosticWarning):
     """
 
 
+class SingleLevelGroupingDroppedWarning(DiagnosticWarning):
+    """A random-effect term's grouping factor has only one observed level, so
+    no between-group variance is identifiable from it.
+
+    lme4 errors here ("grouping factors must have > 1 sampled level"); this
+    port drops the term instead and fits the rest of the model. When every
+    random-effect term is dropped this way, the model fits as though the
+    formula had declared none.
+    """
+
+
 class ReDesignScaleWarning(DiagnosticWarning):
     """A grouping's random-effect design columns sit on very different scales.
 
@@ -113,6 +131,20 @@ class HessianSeFallbackWarning(DiagnosticWarning):
     The standard errors reported are the RX/Schur ones instead, and
     `Fit.stddev_se` (the random-effect standard deviations' own standard
     errors) comes back `NaN` — only the joint Hessian route fills it.
+    """
+
+
+class ExactProfileFallbackWarning(DiagnosticWarning):
+    """A GLMM's exact-profile outer search did not converge, so the fit reran
+    once with a different search strategy (`PqlThenJoint`) from the same
+    start.
+
+    The reported estimates come from that rerun when it converged. When the
+    rerun also failed, they come from whichever of the two attempts reached
+    the lower deviance, and `converged` stays `False` either way. Only
+    affects binomial, Poisson and (on some shapes) negative-binomial mixed
+    models fitted with the default Laplace approximation; never raised for
+    Gamma, which does not take this route.
     """
 
 
@@ -151,6 +183,13 @@ class ArgumentIgnoredWarning(DiagnosticWarning):
     """An argument that does not apply to this model was cleared before fitting."""
 
 
+class RowsDroppedWarning(DiagnosticWarning):
+    """A column the formula uses was missing a value on some rows, and those
+    rows were dropped before fitting (R's default na.action = na.omit,
+    applied the same way in Python since there is no `model.frame` here to do
+    it for free)."""
+
+
 class ConstantResponseWarning(DiagnosticWarning):
     """The fit did not converge and every row of the response has the same value."""
 
@@ -169,14 +208,30 @@ class NbShapeUnsettledWarning(DiagnosticWarning):
     standard errors refit there."""
 
 
-# Family table — mirrors the kernel's own table in src/family.rs.
+class NonIntegerResponseWarning(DiagnosticWarning):
+    """A Poisson, negative-binomial or binomial response is not within 1e-3 of an
+    integer count (binomial: the derived number of successes, `y * weights`).
+
+    The fit still runs — the deviance and score are continuous in `y` — but the
+    reported numbers describe a distribution that assumes integer counts. The 1e-3
+    tolerance matches R's `binomial()$initialize` non-integer-count check. R's
+    Poisson/NB warning is unrelated and much tighter (it comes from `dpois`/`dnbinom`
+    inside `poisson()$aic`, at `1e-7 * max(1, abs(y))`), so R warns on e.g.
+    `y = 2.0005` where glmm stays silent.
+    """
+
+
+# Family table — mirrors the kernel's own table in src/family.rs. `links` is
+# an ordered tuple, not a set: its order is what the "expected one of" error
+# text lists, and it must read the same as the R port's .FAMILIES
+# (r/R/fastglmm.R) — change together.
 _FAMILIES = {
-    "gaussian": {"default_link": "identity", "links": {"identity"}},
-    "binomial": {"default_link": "logit", "links": {"logit", "probit", "cloglog"}},
-    "poisson": {"default_link": "log", "links": {"log"}},
-    "gamma": {"default_link": "log", "links": {"log", "inverse"}},
-    "negativebinomial": {"default_link": "log", "links": {"log"}},
-    "inversegaussian": {"default_link": "log", "links": {"log", "inverse_squared"}},
+    "gaussian": {"default_link": "identity", "links": ("identity",)},
+    "binomial": {"default_link": "logit", "links": ("logit", "probit", "cloglog")},
+    "poisson": {"default_link": "log", "links": ("log",)},
+    "gamma": {"default_link": "log", "links": ("log", "inverse")},
+    "negativebinomial": {"default_link": "log", "links": ("log",)},
+    "inversegaussian": {"default_link": "log", "links": ("log", "inverse_squared")},
 }
 
 # Families where `dispersion=` is meaningful: phi families (gamma,
@@ -220,24 +275,94 @@ def _levels_and_codes(col):
 
     Duck-typed on `.categories`/`.codes` — no hard pandas dependency, matching
     `_columns`' `hasattr(data, "column_names")` style. Covers pandas
-    `Categorical`/`Series[category]` (via `.cat`) and pyarrow `DictionaryArray`.
-    A plain string column has no declared order and is handled by the caller."""
+    `Categorical`/`Series[category]` (via `.cat`) and pyarrow dictionary
+    columns, bare `DictionaryArray` or the `ChunkedArray` a Table's `.column()`
+    returns. A plain string column has no declared order and is handled by the
+    caller."""
     cat = getattr(col, "cat", col)  # pandas Series[category] -> .cat accessor
     if hasattr(cat, "categories") and hasattr(cat, "codes"):
         levels = [str(v) for v in cat.categories]
-        codes = [int(c) for c in cat.codes]
         # pandas marks a missing value as code -1; there is no level to fit it
-        # against, and silently dropping the row would change the model.
-        if any(c < 0 for c in codes):
-            raise ValueError("categorical column has missing values (code -1); drop or fill them")
+        # against, so the caller drops that row the same way it drops a plain
+        # column's missing value, rather than raising here.
+        codes = [int(c) for c in cat.codes]
         return levels, codes
+    # A pyarrow ChunkedArray has no `.dictionary`/`.indices` of its own, and
+    # each chunk may carry a different dictionary. `unify_dictionaries()`
+    # rewrites every chunk against one shared dictionary (first chunk's values
+    # first, so the declared order survives), after which `combine_chunks()`
+    # yields a single `DictionaryArray`. Keyed on the dictionary type's
+    # `index_type`, not an import, so pyarrow stays optional.
+    if hasattr(col, "unify_dictionaries") and hasattr(getattr(col, "type", None), "index_type"):
+        col = col.unify_dictionaries().combine_chunks()
     if hasattr(col, "dictionary") and hasattr(col, "indices"):  # pyarrow DictionaryArray
-        levels = [str(v) for v in col.dictionary.to_pylist()]
-        codes = col.indices.to_pylist()
-        if any(c is None for c in codes):
-            raise ValueError("categorical column has missing values; drop or fill them")
-        return levels, [int(c) for c in codes]
+        dictionary = col.dictionary.to_pylist()
+        # A null index comes back as None; -1 makes it the same missing
+        # sentinel pandas uses, for one row-dropping rule below. A null can
+        # also be a dictionary value of its own (`null_encoding="encode"`):
+        # that is a missing row too, not a level, so it is dropped from the
+        # levels and the codes after it shift down.
+        remap, levels = {}, []
+        for i, v in enumerate(dictionary):
+            if v is not None:
+                remap[i] = len(levels)
+                levels.append(str(v))
+        codes = [-1 if c is None else remap.get(c, -1) for c in col.indices.to_pylist()]
+        return levels, codes
     return None
+
+
+def _values(col):
+    """`col`'s scalars as plain Python values.
+
+    `.to_pylist()` first: a pyarrow `Array`/`ChunkedArray` iterates as
+    `pyarrow.Scalar` wrappers, not bare `None`/`float`, so `list(col)` on one
+    holds a null as a `Scalar` that `_is_na` doesn't recognize and `float()`
+    rejects outright (`TypeError`, not the missing-value path). `.to_pylist()`
+    unwraps every element, null included, the same way `_levels_and_codes`
+    already does for a pyarrow `DictionaryArray`'s own pieces."""
+    if hasattr(col, "to_pylist"):
+        return col.to_pylist()
+    return list(col)
+
+
+def _is_bool_column(col):
+    """True for a bool column: `numpy.bool_`, pandas `bool` or the nullable
+    `boolean` extension dtype, pyarrow `bool_`, or a plain list/tuple of
+    Python `bool` (an `object`-dtype array unwraps to the same check).
+
+    Checked on the column object, the way `_levels_and_codes` inspects it
+    before `_values` flattens it into scalars that no longer carry a dtype."""
+    dtype = getattr(col, "dtype", None)
+    if dtype is not None:
+        if str(dtype) in ("bool", "boolean"):
+            return True
+        if str(dtype) != "object":
+            return False
+        col = list(col)  # object-dtype array — fall through to the element check
+    arrow_type = getattr(col, "type", None)  # pyarrow Array/ChunkedArray
+    if arrow_type is not None:
+        return str(arrow_type) == "bool"
+    if isinstance(col, (list, tuple)):
+        present = [v for v in col if v is not None]
+        return bool(present) and all(isinstance(v, (bool, np.bool_)) for v in present)
+    return False
+
+
+def _bool_values(col):
+    """A bool column's scalars as `"FALSE"`/`"TRUE"` strings, missing values
+    kept as `None` — lme4's and the R port's own spelling for a logical
+    predictor or grouping column (`factor()`'s lexicographic order puts
+    `FALSE` before `TRUE`, so `False` is level 0, the treatment-contrast
+    base).
+
+    Returned as plain strings, not `(levels, codes)`, so the result flows
+    through the SAME "values" path a plain string column does: levels are
+    computed once from what the data actually has, after missing rows are
+    dropped (`_sorted_levels_and_codes`, called lower in `fit`) — not fixed
+    to both `FALSE` and `TRUE` regardless of the data, the way R's own
+    `factor(rep(TRUE, n))` gives one level ("TRUE"), not two."""
+    return [None if _is_na(v) else ("TRUE" if v else "FALSE") for v in _values(col)]
 
 
 def _sorted_levels_and_codes(labels):
@@ -250,6 +375,76 @@ def _sorted_levels_and_codes(labels):
     levels = sorted(set(labels))
     index = {lvl: i for i, lvl in enumerate(levels)}
     return levels, [index[v] for v in labels]
+
+
+def _formula_columns(formula, names):
+    """`(used, missing, numeric_only)` for `formula` against the column names
+    `names`, from one parse in the Rust formula frontend
+    (`_native.formula_columns`).
+
+    - `used`: `names` restricted to the ones the formula reads as data,
+      mirroring R's own `data[all.vars(formula)]` (`r/R/fastglmm.R`) so a
+      column the formula never uses — a datetime, or anything the
+      numeric/factor branches below cannot convert — is never read at all.
+      It is a filter: a name it cannot resolve is silently dropped.
+    - `missing`: names the formula references that are not among `names` at
+      all — not even as a transform's underlying column (`log(x)` when `x` is
+      absent), so a missing formula column is reported before an unrelated
+      `weights=`/`offset=` length happens to fail first.
+    - `numeric_only`: names the formula always reads as plain numbers — the
+      response (both count columns of a `cbind()` response) and the offset()
+      term's column. A bool column crosses as a `FALSE`/`TRUE` factor
+      everywhere else (`_is_bool_column`/`_bool_values` below); the R port
+      keeps the same columns numeric off its own formula AST
+      (`all.vars(formula[[2L]])` plus a small `offset()` walk).
+
+    The Rust frontend answers rather than a scan of the formula text: it
+    already knows its own identifier grammar (Unicode-aware, unlike an
+    ASCII-only regex) and how to tell `log(x)` (reads `x`) apart from a column
+    literally named `log`, which a bare-token scan cannot. `list(names)`:
+    `_native` takes a plain list, and `names` here is often a `dict_keys` view.
+
+    A bad formula raises here with the same message `_native.fit` would give
+    for it: letting the error through here, rather than falling back to every
+    name in `names`, keeps a parse error a parse error instead of routing an
+    unrelated column (a datetime, say) into the numeric/factor branches below,
+    where it fails to convert and raises a `TypeError` that has nothing to do
+    with the formula."""
+    return _native.formula_columns(formula, list(names))
+
+
+def _row_array(values, name, n):
+    """`weights=`/`offset=` as a float array of one finite entry per data row.
+
+    Mirrors the R port's checks in `fastglmm()` (`r/R/fastglmm.R`): a wrong
+    length or a missing entry is refused as R refuses it, here rather than by
+    the kernel's entry assert, which reaches Python as a Rust panic. Inf is
+    refused too, as that assert would. `n` is None when no data column was
+    read; the kernel then reports the missing column first."""
+    try:
+        arr = np.asarray(values, dtype=float)
+    except (TypeError, ValueError):
+        arr = None
+    if arr is None or arr.ndim != 1 or (n is not None and len(arr) != n):
+        raise ValueError(f"{name} must be a numeric array with one entry per row of data")
+    # `np.asarray(..., dtype=float)` turns a None entry into NaN, so this also
+    # catches a missing value, which R's anyNA() rejects the same way.
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must be finite: no NaN, inf, or missing entries")
+    return arr
+
+
+def _is_na(v):
+    """True for a missing scalar: `None`, or NaN (float, numpy) — the only
+    ordinary value that compares unequal to itself. A sentinel whose `!=`
+    raises on the ambiguous truth value (pandas' `pd.NA`) is missing too,
+    which is what that ambiguity itself means."""
+    if v is None:
+        return True
+    try:
+        return bool(v != v)  # noqa: PLR0124 -- NaN is the value unequal to itself
+    except TypeError:
+        return True
 
 
 @dataclass
@@ -265,7 +460,7 @@ class Fit:
     se: np.ndarray  # (p,) standard errors; NaN where unavailable
     vcov: np.ndarray  # (p, p) full Cov(beta-hat); se is sqrt of its diagonal
     tau2: np.ndarray  # legacy per-element RE variances (q=1 only) — prefer varcorr
-    varcorr: list  # per grouping: vech-packed (column-major lower-tri) RE covariance
+    varcorr: list  # per grouping, in formula order (lme4 sorts by decreasing level count): vech-packed (column-major lower-tri) RE covariance
     stddev_se: (
         np.ndarray
     )  # SE of each RE stddev, theta layout (not beta-aligned); NaN where unavailable
@@ -412,7 +607,7 @@ class Fit:
         m = len(vech)
         q = (math.isqrt(1 + 8 * m) - 1) // 2
         if q * (q + 1) // 2 != m:
-            raise ValueError(f"varcorr[{group_idx}] is not a valid vech (len {m})")
+            raise ValueError(f"varcorr[{group_idx}] is not a valid vech (length {m})")
 
         def idx(r, c):
             return c * q - (c * c - c) // 2 + (r - c)
@@ -451,7 +646,8 @@ class Fit:
             raise ValueError(f"type must be 'response' or 'pearson', got {type!r}")
         if len(self.fitted) != len(self.y) or len(self.fitted) == 0:
             raise ValueError(
-                "residuals are unavailable: the fit did not converge, so `fitted` is empty"
+                "residuals are unavailable: the fit did not converge, so no fitted "
+                "values are available"
             )
         if type == "response":
             return np.asarray(self.y, dtype=float) - np.asarray(self.fitted, dtype=float)
@@ -476,10 +672,14 @@ _WARNING_KINDS = {
     "singular": ("caution", "Singular fit"),
     "ill_conditioned": ("caution", "Nearly collinear columns"),
     "hessian_se_fallback": ("caution", "Simpler standard errors used"),
+    "exact_profile_fallback": ("caution", "Search retried with a different method"),
     "agq_fallback": ("caution", "Adaptive quadrature not used"),
+    "non_integer_response": ("caution", "Non-integer response"),
+    "rows_dropped_na": ("caution", "Rows dropped for missing values"),
     "argument_ignored": ("note", "Argument ignored"),
     "unused_grouping_levels": ("note", "Unused grouping levels"),
     "re_design_scale_spread": ("note", "Random-effect predictors on very different scales"),
+    "single_level_grouping_dropped": ("note", "Random effect dropped (single level)"),
 }
 # A kernel note this wrapper has no entry for keeps its own kind string.
 _UNKNOWN_KIND = ("caution", "Unrecognized solver message")
@@ -552,8 +752,8 @@ def _note_warning(note, names, converged):
         return (
             (
                 f"Grouping factor '{group}' has levels with no rows ({levels}). They stay in "
-                "the model with random effects of exactly zero and are counted in the number "
-                "of groups. Remove unused categories before fitting."
+                "the model with random effects of exactly zero, but they are not counted in "
+                "the number of groups. Remove unused categories before fitting."
             ),
             UnusedGroupingLevelsWarning,
         )
@@ -592,6 +792,15 @@ def _note_warning(note, names, converged):
             ),
             ReDesignScaleWarning,
         )
+    if kind == "single_level_grouping_dropped":
+        return (
+            (
+                f"Grouping factor '{note['detail']}' has only one level, so no variance "
+                "between groups can be estimated from it. Its random effect was dropped; "
+                "the rest of the model was fitted without it."
+            ),
+            SingleLevelGroupingDroppedWarning,
+        )
     if kind == "hessian_se_fallback":
         return (
             (
@@ -602,9 +811,31 @@ def _note_warning(note, names, converged):
             ),
             HessianSeFallbackWarning,
         )
+    if kind == "exact_profile_fallback":
+        return (
+            (
+                "The default search method for this model did not settle on an answer, so "
+                "the fit tried a different search method from the same starting point. The "
+                "reported estimates come from whichever method reached the better answer."
+            ),
+            ExactProfileFallbackWarning,
+        )
+    if kind == "non_integer_response":
+        # The kernel's Note::NonIntegerResponse (src/fit/mod.rs); `evals` carries the
+        # affected row count (src/orchestrate.rs reuses the same NoteInfo slot as
+        # nb_shape_unsettled's `rounds`).
+        return (
+            (
+                f"The response is not a whole number in {_count(note['evals'], 'row')}. This "
+                "family expects integer counts (binomial: the number of successes, "
+                "y * weights). The fit still ran, but check whether this is the right family "
+                "for the data."
+            ),
+            NonIntegerResponseWarning,
+        )
     return (
         (
-            f"The solver reported something ('{kind}') that this version of glmm does not "
+            f"The solver reported something ('{kind}') that this installed version does not "
             "recognize. Please report it at https://github.com/pawlenartowicz/glmm/issues."
         ),
         DiagnosticWarning,
@@ -754,19 +985,35 @@ def fit(
     A categorical column's level order is honored: level 0 is the
     treatment-contrast base, so `pd.Categorical(x, categories=[…])` fits against
     the first category you list. A plain string column has no declared order and
-    is sorted lexicographically (R's `factor()` default).
+    is sorted lexicographically (R's `factor()` default). A bool column (Python
+    `bool`, `numpy.bool_`, pandas `bool`/nullable `boolean`, pyarrow `bool_`) is
+    treated the same way, with levels `FALSE`/`TRUE` — so a bool `x` gives a
+    coefficient `xTRUE`, as in lme4 — except as the response or the `offset()`
+    column, which stay 0/1 numbers.
 
     See the API spec for the remaining knobs.
     """
+    # Formula-shape checks the shared Rust parser has no dedicated message for
+    # (it would fall through to a generic syntax error): caught here with the
+    # same wording the R port uses (r/R/fastglmm.R's .check_formula) — change
+    # together.
+    if "||" in formula:
+        raise ValueError(
+            "(x || g) double-bar terms are not supported: the glmm kernel always "
+            "fits the full RE correlation structure"
+        )
+    if re.search(r"(?<![\w.])\.(?![\w.])", formula):
+        raise ValueError("'.' is not supported by the formula parser; list the columns explicitly")
+
     if family not in _FAMILIES:
-        raise ValueError(f"unknown family {family!r}; expected one of {sorted(_FAMILIES)}")
+        raise ValueError(f"unknown family {family!r}; expected one of {', '.join(_FAMILIES)}")
     fam = _FAMILIES[family]
     if link is None:
         link = fam["default_link"]
     elif link not in fam["links"]:
         raise ValueError(
             f"family {family!r} does not support link {link!r}; "
-            f"expected one of {sorted(fam['links'])}"
+            f"expected one of {', '.join(fam['links'])}"
         )
 
     # `|` marks a random-effect term, so its presence is the mixed/GLM split
@@ -775,8 +1022,7 @@ def fit(
 
     if family == "inversegaussian" and mixed:
         raise ValueError(
-            "family 'inversegaussian' is GLM-only: random-effect terms "
-            "(`(... | g)`) are not supported"
+            "family 'inversegaussian' is GLM-only: random-effect terms are not supported"
         )
 
     if wald_se not in ("hessian", "rx"):
@@ -808,7 +1054,9 @@ def fit(
             dispersion == "estimate"
             or (isinstance(dispersion, (int, float)) and not isinstance(dispersion, bool))
         ):
-            raise ValueError(f"dispersion must be None, 'estimate', or a float, got {dispersion!r}")
+            raise ValueError(
+                f"dispersion must be None, 'estimate', or a number, got {dispersion!r}"
+            )
         if family in ("binomial", "poisson") and mixed:
             _warn(
                 store,
@@ -829,15 +1077,16 @@ def fit(
     if warm_start is not None:
         if not isinstance(warm_start, dict):
             raise TypeError(
-                "warm_start must be a dict with keys 'beta'/'theta', "
-                f"got {type(warm_start).__name__}"
+                "warm_start must be a dict with keys 'beta' and/or 'theta' (theta is the "
+                "random-effect Cholesky vector, not the negative-binomial shape - that is "
+                f"init_theta), got {type(warm_start).__name__}"
             )
         unknown = [k for k in warm_start if k not in ("beta", "theta")]
         if unknown:
             _warn(
                 store,
                 "argument_ignored",
-                "warm_start accepts only 'beta' and 'theta'; these keys were ignored: "
+                "warm_start accepts only 'beta' and 'theta'; these entries were ignored: "
                 + ", ".join(map(str, unknown))
                 + ".",
                 ArgumentIgnoredWarning,
@@ -856,22 +1105,113 @@ def fit(
     if init_theta is not None:
         raise NotImplementedError(
             "init_theta= (negative-binomial shape seed) has no kernel hook yet; "
-            "only init_theta=None (cold-start search) is supported"
+            "only the default cold-start search is supported"
         )
 
-    # Classify each column numeric vs factor, and hand factors across as
-    # (levels, codes) so the caller's reference level survives into Rust.
-    # A declared categorical is checked FIRST: dtype beats value-sniffing, or a
-    # categorical of non-strings (pd.Categorical([1, 2, 3])) would land in the
-    # numeric branch and be fit as a continuous predictor.
+    # Only the columns the formula actually uses are read from here on — see
+    # `_formula_columns`.
+    used_columns = _columns(data)
+    used_names, missing, numeric_only = _formula_columns(formula, used_columns.keys())
+
+    # A name the formula references but `data` does not have resolves to
+    # nothing in `used_names` above (it is a filter, not a validator), so it
+    # must be caught here — before the weights=/offset= checks below, which
+    # are the same length regardless of a missing column and would otherwise
+    # fail first with an unrelated message.
+    if missing:
+        raise ValueError(f"column(s) not found in data: {', '.join(missing)}")
+
+    # The response and the offset() column, if any, always stay numeric —
+    # everything else gets the bool check below.
+    numeric_only = set(numeric_only)
+
+    # Classify each used column bool vs numeric vs factor, and hand factors
+    # across as (levels, codes) so the caller's reference level survives into
+    # Rust. Bool is checked FIRST, ahead of the declared-categorical check: a
+    # bool column crosses as "FALSE"/"TRUE" strings (`_bool_values`), which
+    # fall into the plain-string branch below and so get lme4's own coding —
+    # not as numeric 0/1, except in the response/offset positions
+    # `numeric_only` names. A declared categorical is checked next: dtype
+    # beats value-sniffing, or a categorical of non-strings
+    # (pd.Categorical([1, 2, 3])) would land in the numeric branch and be fit
+    # as a continuous predictor.
+    #
+    # A kept row is one where every used column has a value, mirroring R's
+    # default na.action = na.omit (`r/R/fastglmm.R`) — there is no
+    # `model.frame` here to do that filtering for free. A declared
+    # categorical's missing rows (pandas code -1, pyarrow null) feed the same
+    # `na_mask` as a plain column's missing values: `_levels_and_codes` never
+    # raises on them, it just leaves the sentinel in `codes` for this loop to
+    # find. `na_mask` stays None until a missing value is seen anywhere.
+    parsed = {}
+    na_mask = None
+    for name in used_names:
+        if name not in numeric_only and _is_bool_column(used_columns[name]):
+            values = _bool_values(used_columns[name])
+            parsed[name] = ("values", values)
+            keep = [not _is_na(v) for v in values]
+            na_mask = keep if na_mask is None else [a and b for a, b in zip(na_mask, keep)]
+            continue
+        declared = _levels_and_codes(used_columns[name])
+        if declared is not None:
+            levels, codes = declared
+            parsed[name] = ("factor", levels, codes)
+            keep = [c != -1 for c in codes]
+            na_mask = keep if na_mask is None else [a and b for a, b in zip(na_mask, keep)]
+            continue
+        values = _values(used_columns[name])
+        parsed[name] = ("values", values)
+        keep = [not _is_na(v) for v in values]
+        na_mask = keep if na_mask is None else [a and b for a, b in zip(na_mask, keep)]
+
+    # Checked against data's original rows, before the NA row drop below, as
+    # R's fastglmm() checks them before na.action: a NaN weight is a bad
+    # argument, not a missing value.
+    n_rows = len(na_mask) if na_mask is not None else None
+    if weights is not None:
+        weights = _row_array(weights, "weights", n_rows)
+        if np.any(weights <= 0):
+            # The kernel requires strictly positive weights; a zero weight is a
+            # row that should not be in the fit at all.
+            raise ValueError("weights must be positive; drop zero-weight rows from data instead")
+    if offset is not None:
+        offset = _row_array(offset, "offset", n_rows)
+
+    if na_mask is not None and not all(na_mask):
+        n_kept = sum(na_mask)
+        if n_kept == 0:
+            raise ValueError(
+                "every row has a missing value in a column the formula uses; no rows left to fit"
+            )
+        _warn(
+            store,
+            "rows_dropped_na",
+            f"Dropped {len(na_mask) - n_kept} of {len(na_mask)} row(s): a column "
+            "the formula uses had a missing value there.",
+            RowsDroppedWarning,
+        )
+        for name, entry in parsed.items():
+            if entry[0] == "factor":
+                _, levels, codes = entry
+                parsed[name] = ("factor", levels, [c for c, k in zip(codes, na_mask) if k])
+            else:
+                _, values = entry
+                parsed[name] = ("values", [v for v, k in zip(values, na_mask) if k])
+        # weights=/offset= are caller-supplied arrays aligned to data's original
+        # rows, not columns of `data` itself, so the row drop above must repeat
+        # here.
+        if weights is not None:
+            weights = weights[na_mask]
+        if offset is not None:
+            offset = offset[na_mask]
+
     numeric_columns = {}
     factor_columns = {}
-    for name, col in _columns(data).items():
-        declared = _levels_and_codes(col)
-        if declared is not None:
-            factor_columns[name] = declared
+    for name, entry in parsed.items():
+        if entry[0] == "factor":
+            factor_columns[name] = (entry[1], entry[2])
             continue
-        values = list(col)
+        values = entry[1]
         if values and isinstance(values[0], str):
             factor_columns[name] = _sorted_levels_and_codes([str(v) for v in values])
         else:
@@ -901,12 +1241,19 @@ def fit(
     # q <= 3) is only decidable after the Rust-side formula lowering, so the
     # warn-and-strip for it lives in the shared glmm::orchestrate module
     # (src/orchestrate.rs).
+    # Whether the FITTED model actually has random effects — not `mixed`,
+    # which only says the formula asked for some: a single-level grouping is
+    # dropped after lowering (`single_level_grouping_dropped`), and once every
+    # random-effect term is dropped this way, `r["re_groups"]` comes back
+    # empty even though `mixed` (read off the formula text before fitting)
+    # still says True.
+    fitted_mixed = bool(r["re_groups"])
     if r["agq_warning"] is not None:
         # Built here, not taken from `agq_warning`: that string spells the R port's
         # argument differently. A Gaussian model is fitted exactly and a model without
         # random effects has no integral, so there nagq changes nothing and is an
         # ignored argument, not a fallback worth a caution.
-        if family == "gaussian" or not mixed:
+        if family == "gaussian" or not fitted_mixed:
             reason = (
                 "a Gaussian model" if family == "gaussian" else "a model without random effects"
             )
@@ -997,7 +1344,7 @@ def fit(
             store,
             *_nonconvergence(
                 family,
-                mixed,
+                fitted_mixed,
                 res.diagnostics["notes"],
                 res.beta,
                 res.aliased,

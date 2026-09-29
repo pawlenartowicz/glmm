@@ -168,6 +168,7 @@ pub(crate) fn agq_deviance<T: Scalar>(
     let PirlsScratch {
         lam,
         prob,
+        eta,
         u,
         eta_fixed,
         a_blocks,
@@ -188,7 +189,7 @@ pub(crate) fn agq_deviance<T: Scalar>(
     let (acc, sum) = rest.split_at_mut(s);
 
     // ctr_c = ℓ_c(ũ_c): RE prior −½ũ_c², then Σ_{i∈c} −½·dev_resid at the converged
-    // mode (prob[i] already holds g⁻¹(η_fix,i + λ·ũ_c)).
+    // mode (eta[i]/prob[i] already hold η_fix,i + λ·ũ_c and its g⁻¹).
     for c in 0..s {
         ctr[c] = T::from_f64(-0.5) * u[c] * u[c];
         sum[c] = T::ZERO;
@@ -198,7 +199,7 @@ pub(crate) fn agq_deviance<T: Scalar>(
         // w_i·dev_resid: prior_w[i] is exactly 1.0 on the unweighted path (workspace
         // init), and x·1.0 is bit-exact, so unweighted stays byte-identical.
         ctr[c] -= T::from_f64(0.5 * prior_w[i])
-            * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
+            * crate::family::dev_resid_at(family, nb_theta, y[i], eta[i], prob[i]);
     }
 
     // GH sum over nodes. σ_c = 1/√A_c = 1/a_blocks[c] (the 1×1 Cholesky factor).
@@ -244,9 +245,13 @@ pub(crate) fn agq_deviance<T: Scalar>(
                     let mut acc_c = T::from_f64(-0.5) * u_cj * u_cj;
                     for &i in rows {
                         let i = i as usize;
-                        let mu = crate::family::link_inv(family, eta_fixed_ro[i] + lambda * u_cj);
                         acc_c -= T::from_f64(0.5 * prior_w[i])
-                            * crate::family::dev_resid(family, nb_theta, y[i], mu);
+                            * crate::family::dev_resid_eta(
+                                family,
+                                nb_theta,
+                                y[i],
+                                eta_fixed_ro[i] + lambda * u_cj,
+                            );
                     }
                     acc_sum += (ln_wj + acc_c - ctr_ro[c]).exp();
                 }
@@ -277,9 +282,13 @@ pub(crate) fn agq_deviance<T: Scalar>(
                 }
                 for i in 0..n {
                     let c = cluster_ids[i] as usize;
-                    let mu = crate::family::link_inv(family, eta_fixed[i] + lambda * ucj[c]);
                     acc[c] -= T::from_f64(0.5 * prior_w[i])
-                        * crate::family::dev_resid(family, nb_theta, y[i], mu);
+                        * crate::family::dev_resid_eta(
+                            family,
+                            nb_theta,
+                            y[i],
+                            eta_fixed[i] + lambda * ucj[c],
+                        );
                 }
                 for c in 0..s {
                     sum[c] += (ln_wj + acc[c] - ctr[c]).exp();
@@ -394,6 +403,7 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
     let PirlsScratch {
         lam,
         prob,
+        eta,
         u,
         eta_fixed,
         a_blocks,
@@ -433,7 +443,7 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
     }
 
     // ctr_c = ℓ_c(ũ_c): RE prior −½‖ũ_c‖², then Σ_{i∈c} −½·dev_resid at the mode
-    // (prob[i] already holds g⁻¹ at the converged η).
+    // (eta[i]/prob[i] already hold the converged η and its g⁻¹).
     for c in 0..s {
         let ubase = c * q;
         let mut acc = T::ZERO;
@@ -447,7 +457,7 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
         let c = cluster_ids[i] as usize;
         // w_i·dev_resid; prior_w[i]==1.0 exactly on the unweighted path ⇒ byte-identical.
         ctr[c] -= T::from_f64(0.5 * prior_w[i])
-            * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
+            * crate::family::dev_resid_at(family, nb_theta, y[i], eta[i], prob[i]);
     }
 
     // Shared read-only reborrows for the parallel closure (rayon needs Sync
@@ -503,9 +513,8 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
                 for d in 0..q - 1 {
                     eta_i += T::from_f64(z_buf[i * (q - 1) + d]) * v_cj[d + 1];
                 }
-                let mu = crate::family::link_inv(family, eta_i);
                 acc_c -= T::from_f64(0.5 * prior_w[i])
-                    * crate::family::dev_resid(family, nb_theta, y[i], mu);
+                    * crate::family::dev_resid_eta(family, nb_theta, y[i], eta_i);
             }
             acc_sum += (ln_wj + acc_c - ctr_ro[c]).exp();
         }

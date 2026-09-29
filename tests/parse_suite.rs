@@ -661,3 +661,104 @@ fn cbind_rejections() {
         assert!(msg.contains("formula syntax error"), "{f}: {msg}");
     }
 }
+
+// ── Repeated terms ──────────────────────────────────────────────────────────
+
+#[test]
+fn an_interaction_repeated_in_another_order_is_one_term() {
+    // R's `terms.formula` keys a term by its set of variables: `g:f` is the
+    // term `f:g`, and the first spelling keeps its place.
+    for (f, want) in [
+        ("y ~ f*g + g:f", &["f", "g", "f:g"][..]),
+        ("y ~ f*g + g*f", &["f", "g", "f:g"]),
+        ("y ~ f:g + g:f", &["f:g"]),
+        ("y ~ g:f + f:g", &["g:f"]),
+        (
+            "y ~ x + c:b:a + a*b*c",
+            &["x", "c:b:a", "a", "b", "c", "a:b", "a:c", "b:c"],
+        ),
+    ] {
+        let (_, fixed, _) = canonical(&parse(f).unwrap());
+        assert_eq!(fixed, want, "{f}");
+    }
+}
+
+#[test]
+fn a_variable_repeated_within_a_term_counts_once() {
+    // R codes a term as its set of variables: `x:x` is `x`, `f:g:f` is `f:g`.
+    for (f, want) in [
+        ("y ~ x:x", &["x"][..]),
+        ("y ~ x + x:x", &["x"]),
+        ("y ~ x*x", &["x"]),
+        ("y ~ f:g:f", &["f:g"]),
+        ("y ~ x*z*x", &["x", "z", "x:z"]),
+    ] {
+        let p = parse(f).unwrap();
+        let (_, fixed, _) = canonical(&p);
+        assert_eq!(fixed, want, "{f}");
+    }
+    assert_eq!(
+        parse("y ~ x:x").unwrap().terms,
+        [Term::Main { name: "x".into() }]
+    );
+}
+
+#[test]
+fn a_random_slope_variable_repeated_counts_once() {
+    // Mirrors `a_variable_repeated_within_a_term_counts_once` on the
+    // random-effects side: lme4's `lFormula` also collapses `(1+x+x|g)` to a
+    // single `x` slope.
+    for (f, want) in [
+        ("y ~ x + (1 + x + x | g)", "slope(x)|g"),
+        ("y ~ x + (x + x | g)", "slope(x)|g"),
+    ] {
+        let p = parse(f).unwrap();
+        let (_, _, re) = canonical(&p);
+        assert_eq!(re, [want], "{f}");
+    }
+}
+
+#[test]
+fn star_lists_interactions_in_r_order() {
+    // R expands `a*b*c*d` as `((a*b)*c)*d`, so within a degree the
+    // interactions come ordered by their last variable (`CrossTerms`, R's
+    // `model.c`); `model.matrix` gives `a:b a:c b:c a:d b:d c:d`.
+    let (_, fixed, _) = canonical(&parse("y ~ a*b*c*d").unwrap());
+    assert_eq!(
+        fixed,
+        [
+            "a", "b", "c", "d", "a:b", "a:c", "b:c", "a:d", "b:d", "c:d", "a:b:c", "a:b:d",
+            "a:c:d", "b:c:d", "a:b:c:d"
+        ]
+        .map(String::from)
+    );
+}
+
+// ── Non-ASCII names ─────────────────────────────────────────────────────────
+
+#[test]
+fn non_ascii_names_parse_wherever_a_bare_name_does() {
+    let p = parse("y ~ log(café) + I(ł^2) + ł + (1 + ł | grupa_ł) + (ź | g)").unwrap();
+    let (_, fixed, re) = canonical(&p);
+    assert_eq!(fixed, ["log(café)", "I(ł^2)", "ł"].map(String::from));
+    assert_eq!(re, ["slope(ł)|grupa_ł", "slope(ź)|g"].map(String::from));
+
+    let (_, _, re) = canonical(&parse("y ~ x + (1 | szkoła) + (1 | pień:gałąź)").unwrap());
+    assert_eq!(
+        re,
+        ["intercept|szkoła", "intercept|pień:gałąź"].map(String::from)
+    );
+
+    let p = parse("y ~ x + (1 | szkoła/klasa_ę)").unwrap();
+    assert_eq!(
+        p.random_effects[1],
+        RandomEffect::Intercept {
+            group: "szkoła:klasa_ę".into(),
+            parent: Some("szkoła".into())
+        }
+    );
+
+    let p = parse("cbind(sukces, porażka) ~ x + offset(log(ekspozycja_ś))").unwrap();
+    assert_eq!(p.cbind, Some(("sukces".into(), "porażka".into())));
+    assert_eq!(p.offset.as_deref(), Some("log(ekspozycja_ś)"));
+}

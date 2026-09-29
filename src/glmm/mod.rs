@@ -32,7 +32,8 @@
 //! densely. Designs over `classify_design`'s NoZ envelope take the packed-row
 //! backend through this same entry point.
 //! All scratch for the three backends lives in `GlmmWorkspace`, allocated once
-//! per (spec, max_n) shape — the warm path is zero-alloc (Bobyqa::new once).
+//! per (spec, max_n) shape — the warm path is zero-alloc (Bobyqa::new once),
+//! except that the record of non-finite evaluations grows on a fit that has one.
 //!
 //! No σ² scale: binomial dispersion is fixed at 1, so D̂ = Λ̂Λ̂′ directly.
 //!
@@ -58,7 +59,7 @@ use workspace::{fill_z_f64, FitData};
 /// fits that exhaust the cap can change.
 pub const PIRLS_MAX_ITERS: usize = 200;
 /// Backtracking cap for PIRLS step-halving, mirroring lme4 `pwrssUpdate`'s
-/// 10-halving discipline: when a full Fisher step raises the penalized deviance
+/// 10-halving discipline: when a full step raises the penalized deviance
 /// above the last accepted value, the u-step is halved and re-evaluated up to
 /// this many times before the solve is declared failed. Exhausting it surfaces as
 /// the module's `(NaN, NaN, NaN, false)` failure — the same terminal state a raw
@@ -73,20 +74,21 @@ pub const PIRLS_MAX_ITERS: usize = 200;
 /// floor, not tuned to the exact minimum. The blocked and structured solve steps
 /// don't hit this regime and converge well inside the cap.
 pub const PIRLS_MAX_HALVINGS: usize = 16;
-/// Period-2 detector for the PIRLS iteration. Fisher scoring on a
-/// non-canonical link steps with the expected weight, while the curvature of
-/// the conditional log-density is the observed one. Where the observed
-/// curvature is more than twice the expected one along some direction, the
-/// undamped step overshoots, the iteration map has an eigenvalue at or below
-/// −1, and the iterates settle into a 2-cycle around the mode. The same-point
-/// penalized deviance then rises by less than the halving band per step, while
-/// the mixed stopping value keeps alternating by more than its band, so the
-/// solve would run out `PIRLS_MAX_ITERS`. After `PIRLS_OSC_TRIGGER`
+/// Period-2 detector for the PIRLS iteration. An undamped step that
+/// overshoots so that the iteration map has an eigenvalue at or below −1
+/// settles into a 2-cycle around the mode. The same-point penalized deviance
+/// then rises by less than the halving band per step, while the mixed stopping
+/// value keeps alternating by more than its band, so the solve would run out
+/// `PIRLS_MAX_ITERS`. Fisher scoring does this on a non-canonical link wherever
+/// the observed curvature is more than twice the expected one; PIRLS takes the
+/// Newton step there, which removes that cause, and the detector stays as a
+/// guard for any step that cycles. After `PIRLS_OSC_TRIGGER`
 /// consecutive sign flips of the mixed step, each at least `PIRLS_OSC_RATIO`
 /// times the size of the one before, every later step of that solve is
 /// halved (relaxation ω = ½), which maps an eigenvalue λ of the undamped step
 /// to (1 + λ)/2. A solve that converges before the detector fires is
-/// bit-identical.
+/// bit-identical. The GLM IRLS (`glm::glm_irls_fit`) runs the same detector,
+/// with both constants, on its β step.
 pub const PIRLS_OSC_RATIO: f64 = 0.8;
 /// See [`PIRLS_OSC_RATIO`].
 pub const PIRLS_OSC_TRIGGER: usize = 3;
@@ -94,13 +96,12 @@ pub const PIRLS_OSC_TRIGGER: usize = 3;
 /// outer search is therefore θ-only (`OuterSearch::ExactProfile`): Laplace, a data
 /// term that is the plain deviance, and a PIRLS variant carrying the exact border —
 /// the blocked path (`pirls_solve_blocked`, either link class), plus the structured
-/// crossed/nested path (`pirls_solve_blocked_extras`), which carries an observed-
-/// information twin of its factor (core blocks, coupling, Schur) on both canonical
-/// and non-canonical links. Gamma's objective carries the `ln φ` coordinate and its
+/// crossed/nested path (`pirls_solve_blocked_extras`); both step with the exact
+/// curvature, so their factor is the one the border differentiates on either link
+/// class. Gamma's objective carries the `ln φ` coordinate and its
 /// dispersion term, so it has a different β score and keeps the joint search; AGQ
 /// keeps theirs too. So does the packed-row layout
-/// (`GlmmLayout::Packed`, `workspace.rs`), whose PIRLS carries no observed twin and
-/// therefore no exact border — `pirls_solve_packed` refuses a `ProfileExact` step
+/// (`GlmmLayout::Packed`, `workspace.rs`), whose PIRLS carries no exact border — `pirls_solve_packed` refuses a `ProfileExact` step
 /// outright. Read by the workspace constructor and by the driver's
 /// `debug_assert!` — the tests choose the route through `outer_search`, never
 /// through this.
@@ -121,7 +122,7 @@ pub(crate) fn exact_profile_shape(
 /// for VerbAgg (n=7584, the largest individual-Bernoulli binomial rung): at
 /// a looser 1e-6 tolerance the absolute slack would be ~8e-3 in deviance, one Newton step
 /// short of the quadratic-convergence cliff canonical links otherwise reach
-/// "for free" (see `PIRLS_TOL_REL_NONCANON`'s doc comment) — BOBYQA's stage-2
+/// "for free" — BOBYQA's stage-2
 /// objective then carried that ~1 iteration of leftover curvature noise into
 /// β̂, landing 4e-3 relative off both lme4 and MixedModels.jl (which agree
 /// with each other to 8e-5) instead of the ~1e-4 every other binomial/poisson
@@ -133,22 +134,19 @@ pub(crate) fn exact_profile_shape(
 /// negligible on every rung's fit time (verified via `validation/grid/compare.R`
 /// full-suite pass, no rung regressed).
 pub const PIRLS_TOL_REL: f64 = 1e-9;
-/// PIRLS exit for NON-canonical links (probit, Gamma-log/inverse, NB-log) — a
-/// decade looser than `PIRLS_TOL_REL`, tight enough to stay well clear of the
-/// 1e-6 accuracy cliff described below. Canonical links (logit, Poisson-log) are Newton ⇒ quadratic
-/// convergence, so PIRLS overshoots `PIRLS_TOL_REL` to ~machine precision on its
-/// own and their deviance is already smooth enough for both the outer BOBYQA β
-/// and the FD-Hessian SE. Non-canonical links are Fisher-scoring ⇒ only LINEAR
-/// convergence, so the deviance is smooth only to the exit tolerance; at the
-/// canonical 1e-6 that ~1e-4 floor leaves β ~3e-3 off and the FD second
-/// differences (÷ step²) amplify the noise into a 7–41%-wrong `se_hessian`.
-/// Tightening removes that, but the accuracy PLATEAUS: a cbpp-probit tolerance
-/// sweep (see `fit::tests::fit_glmm_probit_cbpp_matches_glmmtmb`) shows β pinned at
-/// ~5e-5 (40× inside its 2e-3 golden limit) flat across 1e-8…1e-10, with a sharp
-/// cliff only at 1e-6→1e-7. 1e-8 sits one decade above the cliff: same β margin
-/// as 1e-10 (tighter buys no β safety, only iterations), `se_hessian` 34× inside
-/// limit, ~1.5× inner iters vs canonical — paid only on non-canonical fits, and
-/// only when SEs go through the FD-Hessian (`se_rx` skips it entirely).
+/// PIRLS exit for NON-canonical links (probit, cloglog, Gamma-log/inverse,
+/// NB-log) — a decade looser than `PIRLS_TOL_REL`. PIRLS takes the Newton step
+/// on these links too (`pirls::observed_weights_in_place`). The value rests on
+/// the accuracy grid, not on a convergence argument: the outer objective is
+/// only as smooth in (θ, β) as the inner solve is converged, and with
+/// Fisher-scoring steps at this band the grid's wide probit, cloglog, Gamma/log
+/// and NB/log cells (6–8 covariance parameters, or 30000 rows with a shallow
+/// likelihood) stop 5e-5 to 5e-3 deviance units above glmmTMB's optimum, where
+/// BOBYQA stalls on the leftover noise. With the Newton step at this band all
+/// of them, the 30000-row Gamma/log cell that stalled at its start, and every
+/// other non-canonical mixed cell of the grid land within dev_eps (4e-5) of
+/// glmmTMB's deviance; a 1e-10 band measured no better there and cost 0–60%
+/// more wall.
 pub const PIRLS_TOL_REL_NONCANON: f64 = 1e-8;
 /// CEILING on the PIRLS exit tolerance under the FD-Hessian SE evals ONLY
 /// (`joint_hessian_cov`, either stencil arm). Never applied on its own —
@@ -170,13 +168,13 @@ pub const PIRLS_TOL_REL_NONCANON: f64 = 1e-8;
 /// why this is a ceiling and not a value that tracks `PIRLS_TOL_REL` downward.
 ///
 /// The fit path never pays it — BOBYQA objective evals keep `pirls_tol`; the
-/// cost lands only on the ~m² SE evals that already dominate `WaldSe::Hessian`
-/// timing (the same ~1.5×-inner-iteration precedent as
-/// `PIRLS_TOL_REL_NONCANON`, whose value this matches).
+/// cost lands only on the SE passes. It equals `PIRLS_TOL_REL_NONCANON`, so
+/// non-canonical links run their SE passes at their fit tolerance and canonical
+/// links keep their tighter 1e-9. The exact-Hessian passes' mode re-solves read
+/// `pirls_tol_fd` as well (`derivative.rs`, `assembled.rs`).
 pub const PIRLS_TOL_REL_FD: f64 = 1e-8;
-/// PIRLS exit tolerance for `family`: the standard value for canonical (Newton,
-/// quadratic) links, the tight value for non-canonical (Fisher-scoring, linear)
-/// links (canonical links overshoot to machine precision, non-canonical don't).
+/// PIRLS exit tolerance for `family`: `PIRLS_TOL_REL` on the canonical links,
+/// `PIRLS_TOL_REL_NONCANON` on the others — see those two for why they differ.
 pub(crate) fn pirls_tol(family: crate::spec::Family) -> f64 {
     if crate::family::is_canonical(family) {
         PIRLS_TOL_REL
@@ -186,24 +184,13 @@ pub(crate) fn pirls_tol(family: crate::spec::Family) -> f64 {
 }
 /// PIRLS exit tolerance for the FD-Hessian SE evals: the tighter of the FD
 /// ceiling and the family's own fit tolerance, so the stencil can only ever be
-/// more converged than the fit, never less. Canonical links take
-/// `PIRLS_TOL_REL` (1e-9); non-canonical links fit at 1e-8 and so take the
-/// ceiling. `glmm::se::joint_hessian_cov` writes it into `pirls_tol_override` on
-/// both of its stencil arms.
+/// more converged than the fit, never less: 1e-9 on canonical links, 1e-8
+/// otherwise.
+/// `glmm::se::joint_hessian_cov` writes it into `pirls_tol_override` on both of
+/// its stencil arms.
 pub(crate) fn pirls_tol_fd(family: crate::spec::Family) -> f64 {
     PIRLS_TOL_REL_FD.min(pirls_tol(family))
 }
-/// Wide finite β box for the joint BOBYQA — the bounds handed to the optimizer
-/// for the β block, and the clamp applied to a warm-start β.
-///
-/// Deliberately NOT tied to the GLM route's divergence cap any more. That cap
-/// bounds the linear predictor and refuses a fit; this is a box that keeps a
-/// derivative-free optimizer inside a finite region. They are different objects
-/// that happen to share the magnitude 30, and aliasing them made a change to one
-/// silently a change to the other. Like any absolute bound on β this box is
-/// itself unit-dependent; that is a known, separate question.
-pub const BETA_BOX: f64 = 30.0;
-
 /// Box of the Gamma `ln φ` outer-search coordinate (`φ` the dispersion, shape
 /// `1/φ`). Wide on purpose: φ is a free maximum-likelihood parameter, and the
 /// box only keeps a probe away from overflow in `lnΓ(1/φ)` and from weights
@@ -284,7 +271,7 @@ pub struct GlmmFit {
     /// off, that tier's surface must be unchanged.
     #[cfg(feature = "counters")]
     pub counters: crate::counters::EvalCounters,
-    /// Estimated random-intercept variance D̂[0][0] (NaN on non-converged).
+    /// Estimated random-intercept variance `D̂[0][0]` (NaN on non-converged).
     pub tau_squared_hat: f64,
     /// Joint Wald-χ² over `target_indices` (NaN when empty / non-converged).
     pub joint_t_sq: f64,
@@ -292,6 +279,11 @@ pub struct GlmmFit {
     /// RX/Schur block (non-PD joint Hessian / non-finite perturbed deviance) — its
     /// `NonPdFellBackToRx` status. Always `false` under `WaldSe::Rx`.
     pub hessian_fallback: bool,
+    /// Set iff this fit's shape routes `ExactProfile`, that route ended not
+    /// converged, and the fit reran once on `PqlThenJoint` — see
+    /// [`crate::Note::ExactProfileFallback`]. Always `false` on `Joint` and
+    /// `PqlThenJoint` shapes, which have no fallback of their own.
+    pub exact_profile_fallback: bool,
     /// Minimized marginal Laplace deviance at the pinned γ̂ (`d(y,ũ)+‖ũ‖²+log|A|`,
     /// or the AGQ deviance when `nagq>1`), reported as `Fit::deviance`.
     /// `f64::INFINITY` on non-convergence. On an NB fit it carries
@@ -323,8 +315,7 @@ pub(crate) use derivative::{unpack_hessian, DerivStatus};
 // on an import nothing left standing can use.
 #[cfg(all(test, feature = "formula"))]
 pub(crate) use assembled::{
-    assembly_routes, gradient_f64, gradient_f64_mode_residual, joint_hessian, mu_clamped_rows,
-    packed_gradient,
+    assembly_routes, gradient_f64, gradient_f64_mode_residual, joint_hessian, packed_gradient,
 };
 // The unsymmetrized column pass, read by the corpus drivers in
 // `fit::glmm_tests` and by the both-layouts cross-check in `sparse::tests`,
@@ -398,12 +389,10 @@ pub enum FdHessianStatus {
 ///
 /// Read-back: on `converged == true`, `ws.params[..n_theta + p]` holds the
 /// pinned optimum `[θ̂ | β̂]` — the stable convention documented on
-/// `GlmmWorkspace::params`. On `ExactProfile` this β̂ itself is never
-/// BETA_BOX-projected (see the `n_eval` write-back below); callers may still
-/// feed it back as `theta_start`/`beta_start` for a subsequent fit of related
-/// data, and that fed-back start passes through the same
-/// `THETA_TRUTH_FLOOR`/`BETA_BOX` clamps as any other start, regardless of
-/// which route produced it.
+/// `GlmmWorkspace::params`. Callers may feed it back as
+/// `theta_start`/`beta_start` for a subsequent fit of related data: the fed-back
+/// θ passes through the same `THETA_TRUTH_FLOOR` floor as any other start, and
+/// β is taken as given.
 ///
 /// Errors: no `Result`. An outer search that exhausts its evaluation budget
 /// (`Status::MaxFunReached`) still reports its incumbent through `GlmmFit`:
@@ -438,7 +427,11 @@ pub fn fit_glmm(
     );
     let (k, p, n_theta) = (ws.k, ws.p, ws.n_theta);
 
-    // γ₀ = [θ₀ | β₀].
+    // γ₀ = [θ₀ | β₀]. `guard_warm` is set only on a warm start (the `Some` arm
+    // below) — the start guard further down then decides whether the search
+    // should begin at the caller's θ₀ or at the blind cold start instead. A
+    // cold fit skips the guard entirely.
+    let mut guard_warm = false;
     match theta_start {
         Some(ts) => {
             // Floor is diagonal-only: a caller's θ is a Cholesky factor, so its
@@ -470,6 +463,10 @@ pub fn fit_glmm(
             for &i in ws.groupings.diagonal_theta() {
                 ws.params[i] = ws.params[i].max(THETA_TRUTH_FLOOR);
             }
+            // The start guard further down compares a warm caller's θ₀ with
+            // the blind cold θ this data would start from otherwise, and the
+            // search begins from whichever the outer objective is lower at.
+            guard_warm = true;
         }
         None => {
             // Blind start: diagonals THETA0, off-diagonals 0 — the structure-only
@@ -486,7 +483,7 @@ pub fn fit_glmm(
         }
     }
     for (j, &b) in beta_start.iter().enumerate().take(p) {
-        ws.params[n_theta + j] = b.clamp(-BETA_BOX, BETA_BOX);
+        ws.params[n_theta + j] = b;
     }
 
     // NB and Gamma: the trailing outer-search coordinate. NB's starts at ln of
@@ -511,11 +508,7 @@ pub fn fit_glmm(
             for j in 0..p {
                 eta += x[(i, j)] * ws.params[n_theta + j];
             }
-            let mu = crate::family::clamp_mu(
-                fam,
-                crate::family::link_inv(fam, crate::family::clamp_eta(fam, eta)),
-            );
-            d += ws.prior_w[i] * crate::family::dev_resid(fam, f64::NAN, y[i], mu);
+            d += ws.prior_w[i] * crate::family::dev_resid_eta(fam, f64::NAN, y[i], eta);
             sw += ws.prior_w[i];
         }
         // Data the fixed effects reproduce exactly give `D = 0`, which rounds to
@@ -546,6 +539,8 @@ pub fn fit_glmm(
     // draw's count into the next (see `Note::PirlsExhausted`).
     ws.pirls_exhausted = 0;
     ws.final_pirls_exhausted = false;
+    ws.exact_profile_fallback = false;
+    ws.non_finite_points.clear();
     ws.counters.reset();
     ws.pattern.coup_mask = None; // CSR validity is per (fit, pinning mask): ids/z may differ across fits
                                  // Cluster-outer AGQ substrate: built once per fit (cluster_ids is fit-fixed),
@@ -580,8 +575,12 @@ pub fn fit_glmm(
     let nagq = ws.nagq;
     // Outer search route for this shape (`OuterSearch`). Read before the
     // destructure moves `ws`'s fields out by mutable reference; the enum is Copy
-    // so this is a plain read.
-    let route = ws.outer_search;
+    // so this is a plain read. `mut`: the `PqlThenJoint` fallback further down
+    // rebinds this once, after an `ExactProfile` attempt ends not converged, to
+    // rerun the search on the fallback route — the shape's OWN route, read
+    // here, is what the fallback gate checks, and rebinding a route that is
+    // never `ExactProfile` again self-limits the retry to one.
+    let mut route = ws.outer_search;
     debug_assert!(
         route != OuterSearch::ExactProfile || exact_profile_shape(family, nagq, ws.layout),
         "ExactProfile requested on a shape without an exact profile"
@@ -589,13 +588,15 @@ pub fn fit_glmm(
     // Which `BetaMode` stage 1 profiles β with, or `None` to skip stage 1 entirely
     // (the `Joint` route). `stage1_mode` alone decides whether stage 1 runs; the
     // route decides what happens AFTER it — see the `route ==` split below.
-    let stage1_mode = match route {
+    // `mut`: rebound alongside `route` by the fallback.
+    let mut stage1_mode = match route {
         OuterSearch::Joint => None,
         OuterSearch::PqlThenJoint => Some(BetaMode::ProfilePql),
         OuterSearch::ExactProfile => Some(BetaMode::ProfileExact),
     };
     let weighted = ws.weighted;
     let offset = ws.offset.as_deref();
+    let rho_begin = ws.rho_begin;
     let GlmmWorkspace {
         solver,
         solver_stage1,
@@ -606,6 +607,8 @@ pub fn fit_glmm(
         beta_rhs,
         lower,
         upper,
+        beta_scale,
+        start_point,
         groupings,
         cluster_rows,
         layout,
@@ -624,6 +627,7 @@ pub fn fit_glmm(
         exact_prof,
         p: pf,
         pirls_exhausted,
+        non_finite_points,
         counters,
         ..
     } = ws;
@@ -703,177 +707,186 @@ pub fn fit_glmm(
         }
     };
 
-    // STAGE 1 — θ-only BOBYQA profiling β out of PIRLS at each candidate θ. On
-    // `PqlThenJoint` this is an accelerant that warm-starts the `Joint` polish below
-    // and never gates convergence; on `ExactProfile` this IS the search — its
-    // status alone gates convergence (the `route ==` split after this block).
-    // Skipped bit-identically when `stage1_mode` is `None` (the `Joint` route; the
-    // A/B tests pin this as the single-stage reference) and when `nagq > 1` —
-    // Profile deviance is undefined on the AGQ early-return path
-    // (`debug_assert!(beta_mode == BetaMode::Fixed || nagq == 1)`), and AGQ fits must bypass stage 1
-    // unchanged. A Laplace-pass warm start for AGQ was measured on the 33 diligent
-    // AGQ cells (2026-07-14) and reverted: total eval count was a wash (−0.3%),
-    // not worth the added code path for that little a gain.
-    let mut n_eval_stage1 = 0usize;
-    let mut stage1_out = None;
-    // Hoisted out of the `if let` below (rather than left local to it) so it is
-    // still in scope at the `ExactProfile` status read further down: a search
-    // whose incumbent never left `+INFINITY` (every PIRLS call on this θ start
-    // diverges) can still exhaust its rho ladder and report `Status::Converged`,
-    // so `converged` must also check that a finite objective was ever seen.
-    let mut best1 = f64::INFINITY;
-    // PRIMA's `moderatef` maps both `NaN` and `+inf` to `FUNCMAX = 1e30` (bobyqa's
-    // objective-value contract), so a run where every PIRLS call diverges is a flat
-    // *finite* surface to BOBYQA: it shrinks the trust region to `rho_end` and exits
-    // `Status::Converged` having learned nothing. `best1.is_finite()` only catches the
-    // all-`+INF` case — it turns finite on the very first finite evaluation, so a run
-    // with exactly one genuine evaluation (start included) still passes. Count how many
-    // evaluations were actually finite and require at least 2: the smallest bar for "the
-    // search compared two real points".
-    let mut finite_evals1 = 0usize;
-    if let Some(mode) = stage1_mode.filter(|_| nagq == 1) {
-        params_stage1[..n_theta].copy_from_slice(&params[..n_theta]); // θ₀ unchanged from the caller's params
-        if n_disp == 1 {
-            params_stage1[n_theta] = params[nb_col]; // ln θ_NB / ln φ start, set before the search
-        }
-        beta_prof[..p].copy_from_slice(&params[n_theta..n_theta + p]); // β₀ (GLM warm start)
-        beta_seed[..p].copy_from_slice(&beta_prof[..p]);
-        // The incumbent state — best value, finite-evaluation count and the
-        // û/β̂ snapshots — is passed in rather than captured so the closure
-        // borrows only the PIRLS buffers.
-        let mut stage1_obj = |theta: &[f64],
-                              best: &mut f64,
-                              finite: &mut usize,
-                              u_seed: &mut [f64],
-                              beta_seed: &mut [f64]|
-         -> f64 {
-            // Re-seed BOTH latent states from the INCUMBENT (best point so far),
-            // not the last-evaluated: BOBYQA's final call is not its best.
-            // û is point-determined given θ, and β is likewise point-determined
-            // (the PQL β̂(θ)); the incumbent seed only shifts the stopping iterate
-            // within tol — the same argument that justifies the u_seed warm start.
-            pirls.u[..k].copy_from_slice(&u_seed[..k]);
-            beta_prof[..p].copy_from_slice(&beta_seed[..p]);
-            // Profile mode SWAPS the β buffers vs the Fixed stage-2 call below:
-            // `beta = beta_prof` (in/out profiled β), `beta_step_rhs = beta_rhs`
-            // (the δβ border scratch). See deviance.rs's buffer-role comment.
+    // Start guard (warm fits only): compare the outer objective at the
+    // caller's θ₀ against the blind cold start, on the objective this fit's
+    // own route runs FIRST (the route's Profile mode when stage 1 runs, i.e.
+    // `nagq == 1`; `BetaMode::Fixed` — the `Joint` route's own objective —
+    // otherwise), and begin the search from whichever is lower. A tie or a
+    // non-finite warm value goes to cold: a warm start earns no benefit of the
+    // doubt over the point a cold fit of the same data would use anyway. Cold
+    // fits (`guard_warm` false) skip this block, so their evaluation
+    // count and result are unchanged. Costs two extra Laplace-deviance
+    // evaluations on a warm fit, each with its own discarded
+    // `pirls_exhausted`/`counters` scratch so neither diagnostic sees them —
+    // this is a one-shot comparison, not part of the search the solver below
+    // runs, and it seeds PIRLS from û = 0 for both candidates rather than
+    // reading `u_seed` (still all-zero at this point — see the per-fit reset
+    // above).
+    if guard_warm {
+        let disp_coord = if n_disp == 1 { params[nb_col] } else { 0.0 };
+        let guard_mode = stage1_mode.filter(|_| nagq == 1).unwrap_or(BetaMode::Fixed);
+        // `laplace_deviance`'s Fixed mode reads β off `params[n_theta..n_theta
+        // + p]` itself (see its doc), not off the `beta` argument's incoming
+        // value, so the point passed in must carry β at that offset — `combined`
+        // is `[θ | β₀]`, θ written per candidate, β₀ fixed across both.
+        let combined = &mut start_point[..n_theta + p];
+        combined.copy_from_slice(&params[..n_theta + p]);
+        let mut eval_guard = |combined: &mut [f64]| -> f64 {
+            for v in pirls.u[..k].iter_mut() {
+                *v = 0.0;
+            }
+            // Same buffer routing `laplace_deviance`'s doc requires: Fixed
+            // reads β off `beta_rhs` (spare `beta_prof`), Profile profiles
+            // `beta_prof` from the β0 seed (spare `beta_rhs`) — one tuple-typed
+            // `if` (mirrors `laplace_deviance_ws`), so the borrow checker sees
+            // one reborrow of each buffer, not two competing ones.
+            let (beta, beta_step_rhs): (&mut [f64], &mut [f64]) = if guard_mode == BetaMode::Fixed {
+                (beta_rhs, beta_prof)
+            } else {
+                beta_prof[..p].copy_from_slice(&combined[n_theta..]);
+                (beta_prof, beta_rhs)
+            };
             let ((nb, phi), coord) = if n_disp == 1 {
-                disp_at(theta[n_theta])
+                disp_at(disp_coord)
             } else {
                 ((nb_theta, 1.0), None)
             };
+            let mut guard_exhausted = 0u32;
+            let mut guard_counters = crate::counters::EvalCounters::new();
             let dev = laplace_deviance(
                 &data,
                 nb,
                 phi,
                 nagq,
-                &theta[..n_theta],
-                beta_prof,
+                combined,
+                beta,
                 wx,
                 pirls,
                 structured,
                 pattern,
                 packed,
-                // Stage 1 writes ws.border.schur via the Profile S_β border; the post-fit
-                // SE path runs AFTER stage 2 and its blocked/structured/packed
-                // schur_fill rebuilds ws.border.schur from scratch, so this transient use
-                // is safe (no read survives into inference).
                 border,
                 prior_w_phi,
-                beta_rhs,
+                beta_step_rhs,
                 exact_prof,
-                // `mode` is `ProfilePql` on `PqlThenJoint`, `ProfileExact` on
-                // `ExactProfile` — the two routes that reach this block.
-                mode,
-                // Never the FD-pass tol here — stage-1 objective evals stay at
-                // `pirls_tol` (the field is None outside `joint_hessian_cov`).
+                guard_mode,
                 None,
                 cluster_rows.as_ref(),
-                pirls_exhausted,
-                counters,
+                &mut guard_exhausted,
+                &mut guard_counters,
             );
-            let obj = match coord {
+            match coord {
                 Some(c) => dev + nb_term(c),
                 None => dev,
-            };
-            if obj.is_finite() {
-                *finite += 1;
             }
-            if obj < *best {
-                *best = obj;
-                // INCUMBENT-gated snapshot — snapshot only on strict
-                // improvement, NOT every eval.
-                u_seed[..k].copy_from_slice(&pirls.u[..k]);
-                beta_seed[..p].copy_from_slice(&beta_prof[..p]);
-            }
-            counters.record_eval(crate::counters::Stage::One, obj);
-            obj
         };
-        let out1 = solver_stage1.minimize(
-            |theta| {
-                stage1_obj(
-                    theta,
-                    &mut best1,
-                    &mut finite_evals1,
-                    &mut u_seed[..],
-                    &mut beta_seed[..],
-                )
-            },
-            params_stage1,
-            lower_stage1,
-            upper_stage1,
-        );
-        // On `PqlThenJoint`, non-convergence does NOT fail the fit — stage 1 is an
-        // accelerant, and the joint polish below proceeds from wherever the
-        // incumbent landed (worst case = the cold start). On `ExactProfile`
-        // this status IS the fit's convergence status — read below.
-        n_eval_stage1 = out1.n_eval;
-        // Warm-start / final θ̂,β̂: θ̂₁ (BOBYQA leaves the incumbent in `params_stage1`)
-        // and β̂₁ (the incumbent snapshot, NOT `beta_prof`'s last-evaluated value).
-        // On `ExactProfile` this write IS the reported optimum, not a warm start.
-        params[..n_theta].copy_from_slice(&params_stage1[..n_theta]);
-        // β̂₁ is not re-clamped to ±BETA_BOX here: the bobyqa crate itself projects
-        // an out-of-box start onto the bounds (PRIMA moderatex-style preproc), so
-        // a subsequent joint solve's init already lands in-box without a redundant
-        // clamp — and `ExactProfile` never re-clamps at all.
-        params[n_theta..nb_col].copy_from_slice(&beta_seed[..p]);
-        if n_disp == 1 {
-            params[nb_col] = params_stage1[n_theta];
+        let warm_obj = eval_guard(combined);
+        // The blind cold θ: the same point the `None` arm above builds.
+        combined[..n_theta].fill(0.0);
+        for &i in groupings.diagonal_theta() {
+            combined[i] = THETA0;
         }
-        stage1_out = Some(out1);
+        let cold_obj = eval_guard(combined);
+        if !warm_obj.is_finite() || cold_obj <= warm_obj {
+            params[..n_theta].copy_from_slice(&combined[..n_theta]);
+        }
     }
 
-    // `budget_exhausted` drives the plateau policy mirrored from `fit_lmm`
-    // (`src/lmm/mod.rs`): a
-    // `Status::MaxFunReached` exit reports its finite incumbent below with
-    // `converged == false` and `boundary_hit == 2` rather than NaN-filling.
-    let budget_exhausted;
-    let (ok, n_eval) = if route == OuterSearch::ExactProfile {
-        // ExactProfile: stage 1 IS the search — θ-only BOBYQA on the exact Laplace profile.
-        // `params` already holds [θ̂ | β̂] (the incumbent snapshot written above);
-        // no joint polish follows, so `ws.u_seed` written by stage 1's own
-        // incumbent-gated snapshot is already the final conditional mode.
-        let o = stage1_out.as_ref().expect("ExactProfile runs stage 1");
-        debug_assert!(o.status != Status::InvalidArgs);
-        budget_exhausted = matches!(o.status, Status::MaxFunReached);
-        (
-            matches!(o.status, Status::Converged | Status::MaxFunReached)
-                && best1.is_finite()
-                && finite_evals1 >= 2,
-            o.n_eval,
-        )
-    } else {
-        let mut best_obj = f64::INFINITY;
-        // mirrors the stage-1 read above — change together.
-        let mut finite_evals2 = 0usize;
-        let out = solver.minimize(
-            |gamma| {
-                // Within-fit û warm-start: seed PIRLS from the incumbent (best point so
-                // far), not from 0. The conditional mode is point-determined, so the seed
-                // only shifts the stopping iterate within the PIRLS exit band.
+    // The point the search below begins from (after the start guard above).
+    // The `PqlThenJoint` fallback restarts here rather than from wherever a
+    // failed `ExactProfile` attempt left `params`: the scan behind the
+    // fallback found `PqlThenJoint` reaches the same optimum from every start
+    // it was tried from, so restarting from the ORIGINAL point is exactly as
+    // good as any other and never rewards the failed attempt's own excursion.
+    let total_dim = n_theta + p + n_disp;
+    start_point[..total_dim].copy_from_slice(&params[..total_dim]);
+
+    // `PqlThenJoint` fallback (`Note::ExactProfileFallback`): an `ExactProfile`
+    // attempt that ends not converged reruns once on `PqlThenJoint`, from the
+    // same restart point. The loop below runs the search body once (the common
+    // case) or twice (one retry — `fallback_used` latches so a second failure
+    // never retries again). `attempt1` holds the first attempt's full state
+    // (params/û, snapshotted before the restart resets them for the retry) so
+    // it can be restored if the retry does no better.
+    let mut fallback_used = false;
+    #[allow(clippy::type_complexity)]
+    let mut attempt1: Option<(Vec<f64>, Vec<f64>, bool, usize, bool, f64)> = None;
+    let (ok, n_eval, budget_exhausted) = loop {
+        // Reset the search's starting point on every pass — a no-op on the
+        // first (nothing has run yet) and what lets the fallback restart clean
+        // rather than from the failed `ExactProfile` attempt's own incumbent.
+        params[..total_dim].copy_from_slice(&start_point[..total_dim]);
+        for v in u_seed[..k].iter_mut() {
+            *v = 0.0;
+        }
+
+        // STAGE 1 — θ-only BOBYQA profiling β out of PIRLS at each candidate θ. On
+        // `PqlThenJoint` this is an accelerant that warm-starts the `Joint` polish below
+        // and never gates convergence; on `ExactProfile` this IS the search — its
+        // status alone gates convergence (the `route ==` split after this block).
+        // Skipped bit-identically when `stage1_mode` is `None` (the `Joint` route; the
+        // A/B tests pin this as the single-stage reference) and when `nagq > 1` —
+        // Profile deviance is undefined on the AGQ early-return path
+        // (`debug_assert!(beta_mode == BetaMode::Fixed || nagq == 1)`), and AGQ fits must bypass stage 1
+        // unchanged. A Laplace-pass warm start for AGQ was measured on the 33 diligent
+        // AGQ cells (2026-07-14) and reverted: total eval count was a wash (−0.3%),
+        // not worth the added code path for that little a gain.
+        let mut n_eval_stage1 = 0usize;
+        let mut stage1_out = None;
+        // Hoisted out of the `if let` below (rather than left local to it) so it is
+        // still in scope at the `ExactProfile` status read further down: a search
+        // whose incumbent never left `+INFINITY` (every PIRLS call on this θ start
+        // diverges) can still exhaust its rho ladder and report `Status::Converged`,
+        // so `converged` must also check that a finite objective was ever seen.
+        let mut best1 = f64::INFINITY;
+        // PRIMA's `moderatef` maps both `NaN` and `+inf` to `FUNCMAX = 1e30` (bobyqa's
+        // objective-value contract), so a run where every PIRLS call diverges is a flat
+        // *finite* surface to BOBYQA: it shrinks the trust region to `rho_end` and exits
+        // `Status::Converged` having learned nothing. `best1.is_finite()` only catches the
+        // all-`+INF` case — it turns finite on the very first finite evaluation, so a run
+        // with exactly one genuine evaluation (start included) still passes. Count how many
+        // evaluations were actually finite and require at least 2: the smallest bar for "the
+        // search compared two real points".
+        //
+        // A finite incumbent can still be an artefact of the +∞ points. A trust-region
+        // step that lands on one fails, so BOBYQA shrinks its radius (Powell 2009)
+        // until it reaches `rho_end` at the edge of the region where PIRLS fails, and
+        // reports `Converged` at a point that is only a minimum of the moderated
+        // surface. `Converged` is therefore also refused when a non-finite
+        // evaluation lies within `rho_begin`, the initial trust radius, of the
+        // returned point: the search could not compare that point with its
+        // neighbours on the scale it started at. Evaluations the search walked away
+        // from (a far warm start, a failed first step) leave the check silent.
+        let mut finite_evals1 = 0usize;
+        if let Some(mode) = stage1_mode.filter(|_| nagq == 1) {
+            params_stage1[..n_theta].copy_from_slice(&params[..n_theta]); // θ₀ unchanged from the caller's params
+            if n_disp == 1 {
+                params_stage1[n_theta] = params[nb_col]; // ln θ_NB / ln φ start, set before the search
+            }
+            beta_prof[..p].copy_from_slice(&params[n_theta..n_theta + p]); // β₀ (GLM warm start)
+            beta_seed[..p].copy_from_slice(&beta_prof[..p]);
+            // The incumbent state — best value, finite-evaluation count and the
+            // û/β̂ snapshots — is passed in rather than captured so the closure
+            // borrows only the PIRLS buffers.
+            let mut stage1_obj = |theta: &[f64],
+                                  best: &mut f64,
+                                  finite: &mut usize,
+                                  non_finite: &mut Vec<f64>,
+                                  u_seed: &mut [f64],
+                                  beta_seed: &mut [f64]|
+             -> f64 {
+                // Re-seed BOTH latent states from the INCUMBENT (best point so far),
+                // not the last-evaluated: BOBYQA's final call is not its best.
+                // û is point-determined given θ, and β is likewise point-determined
+                // (the PQL β̂(θ)); the incumbent seed only shifts the stopping iterate
+                // within tol — the same argument that justifies the u_seed warm start.
                 pirls.u[..k].copy_from_slice(&u_seed[..k]);
+                beta_prof[..p].copy_from_slice(&beta_seed[..p]);
+                // Profile mode SWAPS the β buffers vs the Fixed stage-2 call below:
+                // `beta = beta_prof` (in/out profiled β), `beta_step_rhs = beta_rhs`
+                // (the δβ border scratch). See deviance.rs's buffer-role comment.
                 let ((nb, phi), coord) = if n_disp == 1 {
-                    disp_at(gamma[nb_col])
+                    disp_at(theta[n_theta])
                 } else {
                     ((nb_theta, 1.0), None)
                 };
@@ -882,23 +895,25 @@ pub fn fit_glmm(
                     nb,
                     phi,
                     nagq,
-                    gamma,
-                    beta_rhs,
+                    &theta[..n_theta],
+                    beta_prof,
                     wx,
                     pirls,
                     structured,
                     pattern,
                     packed,
-                    // The `Joint` polish's objective is β-FIXED; the Profile border
-                    // scratch is inert. `beta_prof` is the spare distinct buffer
-                    // (`beta_rhs` is `beta` above). Stage 1 above flips this to Profile
-                    // (`ProfilePql` or `ProfileExact`, by `stage1_mode`).
+                    // Stage 1 writes ws.border.schur via the Profile S_β border; the post-fit
+                    // SE path runs AFTER stage 2 and its blocked/structured/packed
+                    // schur_fill rebuilds ws.border.schur from scratch, so this transient use
+                    // is safe (no read survives into inference).
                     border,
                     prior_w_phi,
-                    beta_prof,
+                    beta_rhs,
                     exact_prof,
-                    BetaMode::Fixed,
-                    // Never the FD-pass tol here — BOBYQA objective evals stay at
+                    // `mode` is `ProfilePql` on `PqlThenJoint`, `ProfileExact` on
+                    // `ExactProfile` — the two routes that reach this block.
+                    mode,
+                    // Never the FD-pass tol here — stage-1 objective evals stay at
                     // `pirls_tol` (the field is None outside `joint_hessian_cov`).
                     None,
                     cluster_rows.as_ref(),
@@ -910,30 +925,203 @@ pub fn fit_glmm(
                     None => dev,
                 };
                 if obj.is_finite() {
-                    finite_evals2 += 1;
+                    *finite += 1;
+                } else {
+                    non_finite.extend_from_slice(theta);
                 }
-                if obj < best_obj {
-                    best_obj = obj;
+                if obj < *best {
+                    *best = obj;
+                    // INCUMBENT-gated snapshot — snapshot only on strict
+                    // improvement, NOT every eval.
                     u_seed[..k].copy_from_slice(&pirls.u[..k]);
+                    beta_seed[..p].copy_from_slice(&beta_prof[..p]);
                 }
-                counters.record_eval(crate::counters::Stage::Two, obj);
+                counters.record_eval(crate::counters::Stage::One, obj);
                 obj
-            },
-            params,
-            lower,
-            upper,
-        );
+            };
+            let out1 = solver_stage1.minimize(
+                |theta| {
+                    stage1_obj(
+                        theta,
+                        &mut best1,
+                        &mut finite_evals1,
+                        non_finite_points,
+                        &mut u_seed[..],
+                        &mut beta_seed[..],
+                    )
+                },
+                params_stage1,
+                lower_stage1,
+                upper_stage1,
+            );
+            // On `PqlThenJoint`, non-convergence does NOT fail the fit — stage 1 is an
+            // accelerant, and the joint polish below proceeds from wherever the
+            // incumbent landed (worst case = the cold start). On `ExactProfile`
+            // this status IS the fit's convergence status — read below.
+            n_eval_stage1 = out1.n_eval;
+            // Warm-start / final θ̂,β̂: θ̂₁ (BOBYQA leaves the incumbent in `params_stage1`)
+            // and β̂₁ (the incumbent snapshot, NOT `beta_prof`'s last-evaluated value).
+            // On `ExactProfile` this write IS the reported optimum, not a warm start.
+            params[..n_theta].copy_from_slice(&params_stage1[..n_theta]);
+            params[n_theta..nb_col].copy_from_slice(&beta_seed[..p]);
+            if n_disp == 1 {
+                params[nb_col] = params_stage1[n_theta];
+            }
+            stage1_out = Some(out1);
+        }
 
-        debug_assert!(out.status != Status::InvalidArgs);
-        budget_exhausted = matches!(out.status, Status::MaxFunReached);
-        // Reported eval count is stage 1 + stage 2 (0 + stage 2 on the `Joint` route,
-        // so byte-identical to a single-stage run). Only stage 2's status feeds `converged`.
-        (
-            matches!(out.status, Status::Converged | Status::MaxFunReached)
-                && best_obj.is_finite()
-                && finite_evals2 >= 2,
-            n_eval_stage1 + out.n_eval,
-        )
+        // `budget_exhausted` drives the plateau policy mirrored from `fit_lmm`
+        // (`src/lmm/mod.rs`): a
+        // `Status::MaxFunReached` exit reports its finite incumbent below with
+        // `converged == false` and `boundary_hit == 2` rather than NaN-filling.
+        let budget_exhausted;
+        let (ok, n_eval, final_obj) = if route == OuterSearch::ExactProfile {
+            // ExactProfile: stage 1 IS the search — θ-only BOBYQA on the exact Laplace profile.
+            // `params` already holds [θ̂ | β̂] (the incumbent snapshot written above);
+            // no joint polish follows, so `ws.u_seed` written by stage 1's own
+            // incumbent-gated snapshot is already the final conditional mode.
+            let o = stage1_out.as_ref().expect("ExactProfile runs stage 1");
+            debug_assert!(o.status != Status::InvalidArgs);
+            budget_exhausted = matches!(o.status, Status::MaxFunReached);
+            (
+                matches!(o.status, Status::Converged | Status::MaxFunReached)
+                    && best1.is_finite()
+                    && finite_evals1 >= 2
+                    && !(o.status == Status::Converged
+                        && any_within(non_finite_points, params_stage1, rho_begin)),
+                o.n_eval,
+                best1,
+            )
+        } else {
+            let mut best_obj = f64::INFINITY;
+            // mirrors the stage-1 read above — change together.
+            let mut finite_evals2 = 0usize;
+            // Stage 1 recorded its own points; on this route it never gates
+            // convergence, so only this search's non-finite points are checked.
+            non_finite_points.clear();
+            // The search runs on β̃ (`BetaScale`): the start maps forward here, the
+            // incumbent back once the convergence read below has measured its
+            // distances in the search's own coordinates.
+            beta_scale.set(x, &prior_w[..n], n);
+            beta_scale.to_search(&mut params[n_theta..nb_col]);
+            let out = solver.minimize(
+                |gamma| {
+                    // Within-fit û warm-start: seed PIRLS from the incumbent (best point so
+                    // far), not from 0. The conditional mode is point-determined, so the seed
+                    // only shifts the stopping iterate within the PIRLS exit band.
+                    pirls.u[..k].copy_from_slice(&u_seed[..k]);
+                    let ((nb, phi), coord) = if n_disp == 1 {
+                        disp_at(gamma[nb_col])
+                    } else {
+                        ((nb_theta, 1.0), None)
+                    };
+                    let dev = laplace_deviance(
+                        &data,
+                        nb,
+                        phi,
+                        nagq,
+                        beta_scale.caller_point(gamma, n_theta, p),
+                        beta_rhs,
+                        wx,
+                        pirls,
+                        structured,
+                        pattern,
+                        packed,
+                        // The `Joint` polish's objective is β-FIXED; the Profile border
+                        // scratch is inert. `beta_prof` is the spare distinct buffer
+                        // (`beta_rhs` is `beta` above). Stage 1 above flips this to Profile
+                        // (`ProfilePql` or `ProfileExact`, by `stage1_mode`).
+                        border,
+                        prior_w_phi,
+                        beta_prof,
+                        exact_prof,
+                        BetaMode::Fixed,
+                        // Never the FD-pass tol here — BOBYQA objective evals stay at
+                        // `pirls_tol` (the field is None outside `joint_hessian_cov`).
+                        None,
+                        cluster_rows.as_ref(),
+                        pirls_exhausted,
+                        counters,
+                    );
+                    let obj = match coord {
+                        Some(c) => dev + nb_term(c),
+                        None => dev,
+                    };
+                    if obj.is_finite() {
+                        finite_evals2 += 1;
+                    } else {
+                        non_finite_points.extend_from_slice(gamma);
+                    }
+                    if obj < best_obj {
+                        best_obj = obj;
+                        u_seed[..k].copy_from_slice(&pirls.u[..k]);
+                    }
+                    counters.record_eval(crate::counters::Stage::Two, obj);
+                    obj
+                },
+                params,
+                lower,
+                upper,
+            );
+
+            debug_assert!(out.status != Status::InvalidArgs);
+            budget_exhausted = matches!(out.status, Status::MaxFunReached);
+            // Reported eval count is stage 1 + stage 2 (0 + stage 2 on the `Joint` route,
+            // so byte-identical to a single-stage run). Only stage 2's status feeds `converged`.
+            let read = (
+                matches!(out.status, Status::Converged | Status::MaxFunReached)
+                    && best_obj.is_finite()
+                    && finite_evals2 >= 2
+                    && !(out.status == Status::Converged
+                        && any_within(non_finite_points, params, rho_begin)),
+                n_eval_stage1 + out.n_eval,
+                best_obj,
+            );
+            beta_scale.to_caller(&mut params[n_theta..nb_col]);
+            read
+        };
+
+        // `ExactProfile` not converged, on its first (non-retry) pass: rerun
+        // once on `PqlThenJoint` from the restart point rather than report
+        // this failure — see `Note::ExactProfileFallback`. `route`/
+        // `stage1_mode` rebind to `PqlThenJoint` for the retry, so this arm
+        // cannot fire twice. "Not converged" is `!ok` (a hard failure) or
+        // `budget_exhausted` (a reported incumbent that never met tolerance)
+        // — both count, since both are "ExactProfile ended not converged".
+        if route == OuterSearch::ExactProfile && (!ok || budget_exhausted) && !fallback_used {
+            fallback_used = true;
+            attempt1 = Some((
+                params[..total_dim].to_vec(),
+                u_seed[..k].to_vec(),
+                ok,
+                n_eval,
+                budget_exhausted,
+                final_obj,
+            ));
+            route = OuterSearch::PqlThenJoint;
+            stage1_mode = Some(BetaMode::ProfilePql);
+            continue;
+        }
+
+        // The fallback ran: report its own result when it converged; when it
+        // also failed, keep whichever of the two attempts reached the lower
+        // objective (still not converged either way) and restore that
+        // attempt's params/û if it is the first one. `n_eval` always sums
+        // both attempts — both spent real evaluations on this fit.
+        if let Some((p1_params, p1_u, p1_ok, p1_n_eval, p1_budget, p1_obj)) = attempt1.take() {
+            ws.exact_profile_fallback = true;
+            let total_n_eval = p1_n_eval + n_eval;
+            if ok && !budget_exhausted {
+                break (true, total_n_eval, false);
+            } else if p1_obj <= final_obj {
+                params[..p1_params.len()].copy_from_slice(&p1_params);
+                u_seed[..k].copy_from_slice(&p1_u);
+                break (p1_ok, total_n_eval, p1_budget);
+            } else {
+                break (ok, total_n_eval, budget_exhausted);
+            }
+        }
+        break (ok, n_eval, budget_exhausted);
     };
 
     // NB / Gamma: the incumbent's dispersion becomes the workspace's fixed θ_NB
@@ -1020,12 +1208,30 @@ pub fn fit_glmm(
         // component that pinned only as a degenerate coordinate. Nothing moves
         // unless a diagonal pinned, so an interior fit stays bit-identical, and
         // the pinned re-eval below sees the canonicalized θ.
-        if crate::lmm::canonicalize_pinned_blocks(&ws.groupings, &mut ws.params[..n_theta]) {
+        //
+        // AGQ is the exception. Its product Gauss–Hermite grid sits in the
+        // u = Λ⁻¹b coordinates (`agq::agq_deviance_vec`), so two Λ with the same
+        // Σ can give different AGQ deviances. Rotating Λ here would report a
+        // point the search did not choose, at a deviance it never saw. On the
+        // AGQ route (the gate `deviance::laplace_deviance` uses) the fold runs
+        // on a copy that only decides the pin flags, and θ, the re-eval below
+        // and the SE pass keep the search's own Λ. The dense AGQ envelope has no
+        // extras and `q_p ≤ 3`, so `MAX_THETA` covers the copy.
+        let agq_route = derivative::agq_eligible(family, nagq, ws.groupings.primary_q)
+            && ws.groupings.extra_offsets.is_empty();
+        let mut canon_copy = [0.0_f64; crate::consts::MAX_THETA];
+        let theta_c: &mut [f64] = if agq_route {
+            canon_copy[..n_theta].copy_from_slice(&ws.params[..n_theta]);
+            &mut canon_copy[..n_theta]
+        } else {
+            &mut ws.params[..n_theta]
+        };
+        if crate::lmm::canonicalize_pinned_blocks(&ws.groupings, theta_c) {
             pinned = false;
             pinned_components = 0;
             for (kk, &ti) in diag.iter().enumerate() {
-                if ws.params[ti] <= PIN_THETA {
-                    ws.params[ti] = 0.0;
+                if theta_c[ti] <= PIN_THETA {
+                    theta_c[ti] = 0.0;
                     pinned = true;
                     if kk < u64::BITS as usize {
                         pinned_components |= 1u64 << kk;
@@ -1362,8 +1568,21 @@ pub fn fit_glmm(
         tau_squared_hat: d00,
         joint_t_sq,
         hessian_fallback,
+        exact_profile_fallback: ws.exact_profile_fallback,
         deviance: final_deviance + nb_dev_term,
     }
+}
+
+/// Whether any of `points` (flattened, `x.len()` coordinates each) lies within
+/// Euclidean distance `radius` of `x`.
+fn any_within(points: &[f64], x: &[f64], radius: f64) -> bool {
+    points.chunks_exact(x.len()).any(|pt| {
+        pt.iter()
+            .zip(x)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum::<f64>()
+            <= radius * radius
+    })
 }
 
 /// NaN-fill `ws.inference.vcov` — the workspace is reused across fits, so every SE arm
@@ -1399,6 +1618,12 @@ fn nan_fit(ws: &mut GlmmWorkspace, targets: &[u32], n_eval: usize) -> GlmmFit {
         tau_squared_hat: f64::NAN,
         joint_t_sq: f64::NAN,
         hessian_fallback: false,
+        // Unlike `hessian_fallback` (decided only past every `nan_fit` call
+        // site), the start-search fallback runs before the degenerate-fit
+        // guard that can still route here, so a retry that reran and still
+        // ended non-finite is read straight off the workspace rather than
+        // hardcoded false.
+        exact_profile_fallback: ws.exact_profile_fallback,
         deviance: f64::INFINITY,
     }
 }

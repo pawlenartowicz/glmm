@@ -10,6 +10,17 @@ use super::error::ParseError;
 use regex::Regex;
 use std::sync::LazyLock;
 
+// A column name inside a regex, the same class `is_identifier` accepts: a
+// letter or `_`, then letters, digits or `_`, Unicode-aware on both sides.
+// `\p{Alphabetic}` is `char::is_alphabetic`, and `\p{Alphabetic}` plus `\p{N}`
+// is `char::is_alphanumeric`, so a name that parses as a bare term also
+// parses inside a grouping term, a transform, or `cbind()`.
+macro_rules! ident {
+    () => {
+        r"[_\p{Alphabetic}][_\p{Alphabetic}\p{N}]*"
+    };
+}
+
 // Random-effect regex tower — applied in this order so `(0|g)` suppression is
 // caught before `(1|g)`, slopes before plain intercepts, and the `A:B`
 // crossed-interaction grouping (`RE_INTERACTION`) before the plain intercept
@@ -17,28 +28,36 @@ use std::sync::LazyLock;
 // interaction grouping, but the interaction step still runs first for clarity.
 static RE_SUPPRESS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\((?:0|-1)(?:\+[^|]*)?\|[^)]*\)").unwrap());
-static RE_NESTED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\(1\|([_A-Za-z][_A-Za-z0-9]*)/([_A-Za-z][_A-Za-z0-9]*)\)").unwrap()
-});
+static RE_NESTED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(concat!(r"\(1\|(", ident!(), ")/(", ident!(), r")\)")).unwrap());
 // The slope-list class admits one paren level so `(1 + log(x) | g)` matches,
 // and refuses to cross a `)` so a fixed transform term followed by an RE term
 // (`log(x)+(1|g)`) cannot be swallowed as `(x)+(1|g)`.
 static RE_SLOPE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\(1\+((?:[^|()]|\([^|()]*\))+?)\|([_A-Za-z][_A-Za-z0-9]*)\)").unwrap()
+    Regex::new(concat!(
+        r"\(1\+((?:[^|()]|\([^|()]*\))+?)\|(",
+        ident!(),
+        r")\)"
+    ))
+    .unwrap()
 });
 static RE_ISLOPE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\(([_A-Za-z](?:[^|()]|\([^|()]*\))*?)\|([_A-Za-z][_A-Za-z0-9]*)\)").unwrap()
+    Regex::new(concat!(
+        r"\(([_\p{Alphabetic}](?:[^|()]|\([^|()]*\))*?)\|(",
+        ident!(),
+        r")\)"
+    ))
+    .unwrap()
 });
 static RE_INT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\(1\|([_A-Za-z][_A-Za-z0-9]*)\)").unwrap());
-static RE_INTERACTION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\(1\|([_A-Za-z][_A-Za-z0-9]*):([_A-Za-z][_A-Za-z0-9]*)\)").unwrap()
-});
+    LazyLock::new(|| Regex::new(concat!(r"\(1\|(", ident!(), r")\)")).unwrap());
+static RE_INTERACTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(concat!(r"\(1\|(", ident!(), "):(", ident!(), r")\)")).unwrap());
 
 // `cbind(successes, failures)` LHS — a data-free syntax check only; the
 // two names are resolved against `data` in `materialize`.
 static CBIND_LHS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^cbind\(([_A-Za-z][_A-Za-z0-9]*),([_A-Za-z][_A-Za-z0-9]*)\)$").unwrap()
+    Regex::new(concat!(r"^cbind\((", ident!(), "),(", ident!(), r")\)$")).unwrap()
 });
 
 // `offset(...)` term, anchored to a term boundary (start of the RHS or right
@@ -81,6 +100,8 @@ pub struct ParsedFormula {
     pub predictors: Vec<String>,
     /// Effect terms in formula order. Main effects appear as `Term::Main`;
     /// interactions (from `:` or the `*` expansion) as `Term::Interaction`.
+    /// `materialize` emits their columns in R's order instead (by degree, see
+    /// its module header).
     pub terms: Vec<Term>,
     /// Random effects in formula order, with one exception: a nested `(1|A/B)`
     /// pair always sorts first (parent immediately before child), because the
@@ -390,11 +411,13 @@ fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), Pars
         if raw_tokens.is_empty() {
             return Err(ParseError::EmptySlopeTerm { group });
         }
-        let vars: Vec<String> = raw_tokens
-            .iter()
-            .filter(|s| **s != "1")
-            .map(|s| String::from(*s))
-            .collect();
+        let vars: Vec<String> = distinct(
+            raw_tokens
+                .iter()
+                .filter(|s| **s != "1")
+                .map(|s| String::from(*s))
+                .collect(),
+        );
         let effect = if vars.is_empty() {
             RandomEffect::Intercept {
                 group: group.clone(),
@@ -412,7 +435,7 @@ fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), Pars
     // 2.5. Implicit-intercept slope: (x|g), (x+z|g) — equivalent to (1+x|g).
     // Unlike stage 2, always yields a Slope (never falls back to Intercept):
     // an empty `vars` here means the term was `(1|g)`, which RE_ISLOPE's
-    // `[_A-Za-z]`-starting group excludes from matching in the first place.
+    // letter-or-`_`-starting group excludes from matching in the first place.
     extract_stage(
         rhs,
         1,
@@ -423,12 +446,14 @@ fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), Pars
         |m| {
             let var_list_raw = m.get(1).unwrap().as_str();
             let group = m.get(2).unwrap().as_str().to_string();
-            let vars: Vec<String> = var_list_raw
-                .split('+')
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && *s != "1")
-                .map(String::from)
-                .collect();
+            let vars: Vec<String> = distinct(
+                var_list_raw
+                    .split('+')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "1")
+                    .map(String::from)
+                    .collect(),
+            );
             Ok(vec![(group.clone(), RandomEffect::Slope { group, vars })])
         },
     )?;
@@ -545,7 +570,7 @@ fn parse_rhs(rhs: &str) -> Result<(Vec<String>, Vec<Term>), ParseError> {
         }
 
         if term.contains('*') {
-            let vars = parse_identifier_list(term, &['*'])?;
+            let vars = distinct(parse_identifier_list(term, &['*'])?);
             register_vars(&vars, &mut predictors, &mut seen_pred);
             for v in &vars {
                 if seen_term.insert(v.clone()) {
@@ -554,17 +579,19 @@ fn parse_rhs(rhs: &str) -> Result<(Vec<String>, Vec<Term>), ParseError> {
             }
             for r in 2..=vars.len() {
                 for combo in combinations(&vars, r) {
-                    let key = combo.join(":");
-                    if seen_term.insert(key) {
+                    if seen_term.insert(interaction_key(&combo)) {
                         terms.push(Term::Interaction { vars: combo });
                     }
                 }
             }
         } else if term.contains(':') {
-            let vars = parse_identifier_list(term, &[':'])?;
+            let vars = distinct(parse_identifier_list(term, &[':'])?);
             register_vars(&vars, &mut predictors, &mut seen_pred);
-            let key = vars.join(":");
-            if seen_term.insert(key) {
+            if let [name] = &vars[..] {
+                if seen_term.insert(name.clone()) {
+                    terms.push(Term::Main { name: name.clone() });
+                }
+            } else if seen_term.insert(interaction_key(&vars)) {
                 terms.push(Term::Interaction { vars });
             }
         } else {
@@ -579,6 +606,27 @@ fn parse_rhs(rhs: &str) -> Result<(Vec<String>, Vec<Term>), ParseError> {
     }
 
     Ok((predictors, terms))
+}
+
+/// An interaction's identity for deduplication. R's `terms.formula` codes a
+/// term as the set of variables it contains, so `g:f` is the term `f:g`
+/// already written and is dropped, keeping the first spelling and its
+/// position. Sorting the names makes the key independent of written order;
+/// no identifier contains `:`, so the joined key cannot collide with a main
+/// effect's.
+fn interaction_key(vars: &[String]) -> String {
+    let mut sorted: Vec<&str> = vars.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.join(":")
+}
+
+/// A term's variables with repeats dropped, first occurrence kept. R codes a
+/// term as a set of variables, so `x:x` is the main effect `x`, `f:g:f` is
+/// `f:g`, and `x*z*x` is `x*z`.
+fn distinct(mut vars: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    vars.retain(|v| seen.insert(v.clone()));
+    vars
 }
 
 fn parse_single_identifier(s: &str) -> Result<String, ParseError> {
@@ -607,9 +655,9 @@ pub(super) enum Transform {
 }
 
 static TRANSFORM_CALL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(log|sqrt|exp)\(([_A-Za-z][_A-Za-z0-9]*)\)$").unwrap());
+    LazyLock::new(|| Regex::new(concat!(r"^(log|sqrt|exp)\((", ident!(), r")\)$")).unwrap());
 static TRANSFORM_POW: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^I\(([_A-Za-z][_A-Za-z0-9]*)\^([2-9]|[1-9][0-9])\)$").unwrap());
+    LazyLock::new(|| Regex::new(concat!(r"^I\((", ident!(), r")\^([2-9]|[1-9][0-9])\)$")).unwrap());
 
 /// `log(x)` / `sqrt(x)` / `exp(x)` / `I(x^k)` with a single bare column name
 /// inside → the transform and that name. The spelling is used verbatim as the
@@ -663,15 +711,21 @@ fn register_vars(
     }
 }
 
+/// The `r`-element combinations of `items`, in the order R's `*` lists them
+/// (`CrossTerms` in R's `model.c`): `a*b*c*d` is built as `((a*b)*c)*d`, each
+/// step appending the new variable's products after everything before it, so
+/// within one degree a combination sorts by its last element, then the one
+/// before it, and so on (`a:b a:c b:c a:d b:d c:d`). Up to three variables
+/// this is also the lexicographic order.
 fn combinations<T: Clone>(items: &[T], r: usize) -> Vec<Vec<T>> {
     let n = items.len();
     if r == 0 || r > n {
         return vec![];
     }
     let mut idx: Vec<usize> = (0..r).collect();
-    let mut out: Vec<Vec<T>> = Vec::new();
+    let mut all: Vec<Vec<usize>> = Vec::new();
     loop {
-        out.push(idx.iter().map(|&i| items[i].clone()).collect());
+        all.push(idx.clone());
         let mut i = r;
         while i > 0 && idx[i - 1] == n - r + (i - 1) {
             i -= 1;
@@ -684,5 +738,8 @@ fn combinations<T: Clone>(items: &[T], r: usize) -> Vec<Vec<T>> {
             idx[j] = idx[j - 1] + 1;
         }
     }
-    out
+    all.sort_by(|a, b| a.iter().rev().cmp(b.iter().rev()));
+    all.into_iter()
+        .map(|c| c.iter().map(|&i| items[i].clone()).collect())
+        .collect()
 }

@@ -612,17 +612,6 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     } else {
         None
     };
-    // Observed twin of the crossed-Schur symbolic factor, so the exact β-profile's
-    // adjoint solve can run on `A_obs` without overwriting the Fisher factor every
-    // later pass reads. Built only where the exact profile can read it: a
-    // non-canonical link on the structured layout — canonical links never read
-    // it, so building it here would be pure cost.
-    ws.exact_prof.obs_schur =
-        if ws.layout == GlmmLayout::Structured && !crate::family::is_canonical(sized.family) {
-            StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
-        } else {
-            None
-        };
     let beta_start = crate::fit::glm_warm_start_beta(
         sized.family,
         f64::NAN,
@@ -652,7 +641,33 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
         WaldSe::Hessian,
     );
     assert!(fit.converged, "{}: fit must converge", r.name);
-    let se_shipped: Vec<f64> = (0..p).map(|j| ws.inference.var_diag[j].sqrt()).collect();
+    let mut se_shipped: Vec<f64> = (0..p).map(|j| ws.inference.var_diag[j].sqrt()).collect();
+    // Mixed Gamma: the shipped β SE inverts the (θ, β) stencil with a trailing
+    // `ln φ` row appended (`DispRow::Gamma` in `glmm/se.rs`), which this probe
+    // does not build — it measures the (θ, β) stencil alone. The self-check
+    // reference is therefore the shipped pass re-run with φ held at φ̂, which
+    // drops that row and nothing else.
+    if matches!(r.family, Family::Gamma { .. }) {
+        let mut cov = Mat::<f64>::zeros(p, p);
+        ws.gamma_phi_held = Some(ws.gamma_phi);
+        let status = crate::glmm::joint_hessian_cov(
+            &mut ws,
+            x_mat.as_ref(),
+            &r.y,
+            &ids.primary,
+            &ids.extra,
+            p,
+            n,
+            &mut cov,
+        );
+        ws.gamma_phi_held = None;
+        assert!(
+            matches!(status, crate::glmm::FdHessianStatus::Ok),
+            "{}: φ-held FD Hessian fell back",
+            r.name
+        );
+        se_shipped = (0..p).map(|j| cov[(j, j)].sqrt()).collect();
+    }
 
     // Freeze the FD grid on the fit's own converged mode, as `joint_hessian_cov`
     // does: every eval below warm-starts from this one seed, so each f(γ) is a

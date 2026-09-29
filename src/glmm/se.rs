@@ -398,8 +398,11 @@ pub(crate) fn rx_cov_into(
 /// lowers them, a sign artifact of the lagged weights.
 ///
 /// `m = n_theta + p`; the β block is rows/cols `n_theta..m`. On NB `ws.params`
-/// carries one more trailing entry (`ln θ_NB`), which the grid never perturbs —
-/// the SE conditions on θ̂ (lme4/MASS convention).
+/// carries one more trailing entry (`ln θ_NB`), which this (θ, β) FD grid never
+/// perturbs — its row and column are appended separately, by central
+/// differences of the full objective (the `DispRow::Nb` arm below), so the
+/// reported β SE carries θ_NB's uncertainty; unlike the GLM route's
+/// `fit_glm_nb`, which conditions on θ̂.
 /// Precondition: `ws` is at a CONVERGED fit and `ws.z_buf`-eligible scratch is
 /// valid for (x, ids, n) (the deviance evals re-solve PIRLS).
 #[allow(clippy::too_many_arguments)]
@@ -603,19 +606,14 @@ fn joint_hessian_cov_at(
     // Three rungs, in order, and what sends a cell down to the next:
     //
     //   1. the assembled pass (`assembled::joint_hessian`), first-order lanes
-    //      over an explicit `F`/`G` adjoint. A μ-clamped row reads its
-    //      deviance slope, observed weight and `dw/dη` off closed forms
-    //      instead of breaking the mode equation this pass's adjoint
-    //      differentiates, so most such fits go through it. It
-    //      declines on an AGQ-routed shape; wherever the observed factor
-    //      `A_obs` its adjoint equation needs is not positive definite —
-    //      either inside the kernel (the returned lanes would then be a
-    //      Fisher approximation with no detector) or in its own build; on a
-    //      row on the link's own η bound, where the score has stopped moving
-    //      to first order (`assembled::eta_clamped_rows`); on a μ-clamped row
-    //      on the weighted logit link, whose kernel writes a different score
-    //      than this pass does there (`assembled::logit_clamp_refused`); and
-    //      on a packed-row shape over its own memory guard
+    //      over an explicit `F`/`G` adjoint. It declines on an AGQ-routed
+    //      shape; wherever the observed factor `A_obs` its adjoint equation
+    //      needs is not positive definite — either inside the kernel (the
+    //      returned lanes would then be a Fisher approximation with no
+    //      detector) or in its own build; on a row on the link's own η bound,
+    //      where the score has stopped moving to first order
+    //      (`assembled::eta_clamped_rows`); and on a packed-row shape over its
+    //      own memory guard
     //      (`assembled::PACKED_ASSEMBLY_MAX_BYTES`). It chunks, so no `m`
     //      refuses it.
     //   2. the hyper-dual pass (`derivative::laplace_hessian`), a packed
@@ -987,11 +985,17 @@ const GAMMA_PEN_GRAD_STEP: f64 = 1e-4;
 /// workspace, `wᵢ` the prior weights in place (`prior_wᵢ/φ̂` inside
 /// `joint_hessian_cov`'s Gamma arm).
 fn penalized_deviance_at_mode(ws: &GlmmWorkspace, y: &[f64], n: usize) -> f64 {
-    let d: f64 = y[..n]
-        .iter()
-        .zip(&ws.prior_w[..n])
-        .zip(&ws.pirls.prob[..n])
-        .map(|((&yi, &wi), &mu)| wi * crate::family::dev_resid(ws.family, ws.nb_theta, yi, mu))
+    let d: f64 = (0..n)
+        .map(|i| {
+            ws.prior_w[i]
+                * crate::family::dev_resid_at(
+                    ws.family,
+                    ws.nb_theta,
+                    y[i],
+                    ws.pirls.eta[i],
+                    ws.pirls.prob[i],
+                )
+        })
         .sum();
     let kk = ws.k.max(1);
     d + ws.pirls.u[..kk].iter().map(|v| v * v).sum::<f64>()

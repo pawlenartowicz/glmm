@@ -200,7 +200,7 @@ impl FitView<'_> {
         }
     }
 
-    /// Estimator dispersion: LMM σ̂², GLMM D̂[0][0], `Prebuilt` `Fit.dispersion`.
+    /// Estimator dispersion: LMM σ̂², GLMM `D̂[0][0]`, `Prebuilt` `Fit.dispersion`.
     /// OLS/GLM (never read here) report NaN.
     pub fn dispersion(&self) -> f64 {
         match &self.kind {

@@ -164,8 +164,9 @@ and are not user-facing.
 | `SINGULAR_REL_TOL` | `1e-3` — post-hoc relative check: any RE stddev `≤ 1e-3 ×` the largest ⇒ `singular`, on the internal (scaled) stddevs | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/fit/mod.rs`) |
 | RE design column scale | per random-slope column, `√(Σ wᵢxᵢ²/Σ wᵢ)`; intercept subcolumns exactly `1.0`; always on, no trigger | [`algorithms-lmm.md`](algorithms-lmm.md#random-effect-design-column-scaling) (`src/lmm/mod.rs`) |
 | `outer_search` route | `ExactProfile` on the `exact_profile_shape` shapes (nAGQ=1, non-Gamma, no extras or structured extras eligible, canonical or not); else `Joint` when `nAGQ>1 \|\| (n_θ ≤ 2 && p ≤ 4)`; else `PqlThenJoint` | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/workspace.rs`, `src/glmm/mod.rs`) |
-| `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: any `|η_i| > 30` at IRLS iter ≥ 3 → non-converged; skipped under the Gamma inverse and inverse-Gaussian `1/μ²` links | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
-| `SATURATION_W` / `SATURATION_FRAC` | `1e-5` / `0.5` — post-fit separation guard: > half the (weighted) rows saturated → non-converged | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
+| `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: any `|η_i − η₀| > 30` at IRLS iter ≥ 3 → non-converged, `η₀ = 0` on the binomial links and `ln μ₀` (the null-model seed) on the log links; skipped under the Gamma inverse and inverse-Gaussian `1/μ²` links | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
+| `PROB_EPS` / `LOG_TAIL_ETA` | `1e-12` / `230` — tail-row switch: binomial μ within `1e-12` of 0 or 1, NB/Gamma/IG-log `\|η\| > 230` → deviance, score and weights from their η forms | [GLM](#generalised-linear-models-glm) (`src/family.rs`) |
+| `SATURATION_W` / `SATURATION_FRAC` | `1e-5` / `0.5` — post-fit separation guard, binomial links only: > half the rows with IRLS weight below `1e-5 × wᵢ` → non-converged | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `MAX_PRIMARY_Q` | `8` — primary width cap (over → Sparse) | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
 | `MAX_EXTRA_Q` | `4` — per-extra-grouping width cap | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
 | `MAX_EXTRA_GROUPINGS` | `6` — extra-grouping count cap | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
@@ -228,7 +229,7 @@ scaling; they are deliberately never mapped into `Fit`.
 **Code:** `fit_glm_prebuilt` + `glm_view_to_fit` and (for negative binomial)
 `fit_glm_nb` (`src/fit/glm.rs`);
 the IRLS kernel `glm_irls_fit` with its constants `MAX_IRLS_ITERS = 50`,
-`DEVIANCE_TOL = 1e-8`, `WEIGHT_CLAMP = 1e-300`, `ETA_DIVERGENCE_CAP = 30`,
+`DEVIANCE_TOL = 1e-12`, `WEIGHT_CLAMP = 1e-300`, `ETA_DIVERGENCE_CAP = 30`,
 `SATURATION_W = 1e-5`, `SATURATION_FRAC = 0.5` (`src/glm.rs`); the SIMD
 transcendental fast paths in `src/simd_transcendental.rs`; per-family link,
 variance and deviance in `src/family.rs`. **Convention:** McCullagh & Nelder
@@ -243,8 +244,16 @@ validation rung of its own; the cbpp/grouseticks rungs exercise the same family
 math through the GLMM cold-start GLM fit.
 
 `fit_glm_prebuilt` runs adaptive IRLS cold-started at β = 0, converging on
-`|Δ deviance| < DEVIANCE_TOL` with a `MAX_IRLS_ITERS` safety cap. The η seed at
-that β = 0 start is **family-specific** — a plain η = 0 start is wrong for two
+R's `glm.fit` rule `|Δ deviance| / (|deviance| + 0.1) < DEVIANCE_TOL` with a
+`MAX_IRLS_ITERS` safety cap. On Gamma and inverse-Gaussian the `0.1` floor is
+carried into the deviance's units (`dev_floor`): it is multiplied by the
+precision weights' scale (`family::weight_scale`), and on inverse-Gaussian
+divided by the weighted ȳ, since that deviance scales as `1/y`. So on these two
+families the stopping point is the same whatever the units of y or the overall
+scale of the weights. The binomial rule is R's own. On Poisson and NB the floor
+is `0.1·min(1, ȳ)`: R's own rule while ȳ ≥ 1, and scaled with y below that, where
+a non-integer y in tiny units makes the deviance small. The η seed at
+that β = 0 start is **family-specific** — a plain η = 0 start is wrong for most
 of the regimes:
 
 - **Logit/probit/cloglog binomial:** η = 0 (μ = ½), the standard start.
@@ -254,15 +263,16 @@ of the regimes:
   cannot produce an infinite or negative seed.
 - **Inverse-Gaussian with the `InverseSquared` link:** η = 0 puts μ at ∞ under
   `g(μ) = 1/μ²`, so each row seeds `η = 1/clamp(yᵢ)²` (R's `mustart = y`
-  convention), the same shape of fix as the Gamma-inverse seed above. The
-  Inverse-Gaussian **log** link needs no special seed — η = 0 gives μ = 1, the
-  same treatment Gamma-log gets.
-- **Log-link count families (Poisson, NB):** each row seeds the null model,
-  `η = ln(ȳ + 0.1)`. A plain η = 0 start (μ = 1) overshoots so badly on
-  high-mean counts (`ȳ ≳ 25–30`) that IRLS diverges past the
-  `ETA_DIVERGENCE_CAP` guard.
+  convention), the same shape of fix as the Gamma-inverse seed above.
+- **Log-link families (Poisson, NB, Gamma, inverse-Gaussian):** each row seeds
+  the null model with the offset, `η₀ᵢ = oᵢ + ln r` with `r = Σwy / Σw·e^o`
+  (`r = ȳ` without an offset; R starts every row at `μ₀ = y`, or `y + 0.1` for
+  the counts, instead). A plain η = 0 start (μ = 1) overshoots so badly once
+  the mean sits far from 1 that IRLS diverges, and a start that ignores the
+  offset does the same once the exposures differ by a few decades between
+  rows. `r` is not floored; only an all-zero count response takes `ȳ = 0.1`.
 
-The per-iteration row pass — clamps, inverse link, Fisher weight with its prior
+The per-iteration row pass — η clamps, inverse link, Fisher weight with its prior
 weight and `WEIGHT_CLAMP` floor, working response `z = η + r`, and the `Σ wᵢdᵢ`
 fold — is one batched call, `simd_transcendental::family_pass`, shared with the
 three GLMM PIRLS variants. It dispatches once on `family` to a vectorised arm
@@ -300,9 +310,50 @@ polynomials (Cody–Waite range reduction, degree-11 `exp`, degree-9 `log1p`; �
 ULP against libm). On native targets they fuse with hardware FMA; on `wasm32`
 they compile to plain mul/add, because wasm SIMD has no FMA and the soft-float
 libcall fallback measured 9–41× slower. The deviance itself stays on
-`family::dev_resid` outside the unweighted-logit arm: its `ln` arguments run
+`family::dev_resid_at` outside the unweighted-logit arm: its `ln` arguments run
 over the whole positive line, outside the restricted domain of this module's
 owned `ln`.
+
+**Tail rows.** The fitted μ carries no floor that flattens the objective. A
+row where the μ-form formulas lose precision or overflow is a tail row
+(`family::in_tail`), and its unit deviance (`family::dev_resid_at`), score
+`ρ = −½·∂d/∂η` (`family::row_score`), Fisher weight
+(`family::tail_weight_and_resid`), observed weight and their η-derivatives
+(the tail branches of `observed_weight`, `observed_weight_eta_deriv`,
+`weight_eta_deriv`) are computed from η in a form that stays finite.
+`family_pass` refills a tail row's weight and working residual after its
+SIMD arm, in scalar code:
+
+- **Binomial** (all three links), μ at or past `PROB_EPS = 1e-12` from 0 or 1.
+  With `a = (ln μ)'` and `b = −(ln(1−μ))'`: score `y·a − (1−y)·b`, Fisher
+  weight `a·b`, deviance on `ln μ` and `ln(1−μ)` taken from η — logit
+  `−log1pexp(∓η)`; probit `ln Φ` and the Mills ratio `φ/Φ` from Cody's third
+  `erfc` region (`simd_transcendental::erfc_region3_r`), whose derivatives are
+  taken off that same approximant; cloglog `ln(−expm1(−e^η))` and `−e^η`.
+  Probit and cloglog still store μ inside `[PROB_EPS, 1−PROB_EPS]` so no
+  μ-form formula divides by `V = 0`; logit stores `σ(η)` unbounded, on both
+  the weighted and the fused unweighted route.
+- **NB, Gamma-log, inverse-Gaussian-log**, `|η| > LOG_TAIL_ETA = 230`, where
+  `V(μ)` (`μ + μ²/θ`, `μ²`, `μ³`) nears overflow or underflow: the ratio forms
+  `θ/(θ+μ)`, `1/μ`, `1/μ²` replace `μ'/V`.
+- **Poisson** and the inverse links have no tail: their μ forms stay finite
+  over the whole clamped η range. Log-link μ is `e^η` on `|η| ≤ ETA_MAX = 700`,
+  never 0 or `inf`; the Gamma inverse and inverse-Gaussian `InverseSquared`
+  links clamp η to `[1e-75, 1e75]`, where their μ-form weights stay finite.
+
+The tail forms are the same functions of η as the μ forms, so the deviance
+keeps growing past the old clamp points (`MU_FLOOR = 1e-10` on log-link μ,
+`PROB_EPS` on binomial μ) and the score and weights stay its exact
+derivatives: a PIRLS exit with tail rows is a real mode. The two forms meet
+at the switch to round-off, except on the binomial upper side, where the μ
+form's own `1 − μ` near `1 − PROB_EPS` carries about four digits. Past the η
+clamps (`|η| > 700` on the log links and cloglog, `[1e-75, 1e75]` on the two
+inverse links) the deviance does stop moving, so a PIRLS trial with a raw η
+there is a failed step and the exit refresh refuses it
+(`family::eta_infeasible`), unless the row's data agree with the bound — a
+y = 0 row below the log links' lower bound sits at its deviance's own limit,
+where the true objective is flat too. `MU_FLOOR` floors only data values used
+as starting or null means (`family::clamp_mu`).
 
 **Offset.** With `FitOptions::offset`, the linear predictor is `η = o + Xβ`
 throughout; each IRLS iteration solves the weighted normal equations against
@@ -311,33 +362,59 @@ the shifted working response `z − o`, so β never absorbs the offset.
 **Guards beyond the deviance fixpoint.** Four additional exits protect the
 loop, all in `glm_irls_fit`:
 
-- A **divergence guard**: any `|η_i| > ETA_DIVERGENCE_CAP (30)` at iteration ≥ 3
-  marks the fit non-converged immediately. The bound is on the linear predictor,
-  where |η| = 30 is already probability ≈ 1 − 1e-13 — out there is separation,
-  not signal. Bounding η rather than β is what makes the decision independent of
-  the caller's units: rescaling a predictor column divides its coefficient by
-  the same factor and leaves η, the fitted values and the deviance untouched, so
-  a bound on `|β_j|` would accept or reject the same model depending on whether
-  a height column is in metres or kilometres. The guard is skipped for the two
+- A **divergence guard**: any `|η_i − η₀| > ETA_DIVERGENCE_CAP (30)` at
+  iteration ≥ 3 marks the fit non-converged immediately. `η₀` is the link's
+  null-model location: 0 on the binomial links, where |η| = 30 is already
+  probability ≈ 1 − 1e-13 — out there is separation, not signal — and on the
+  log links `oᵢ + ln r`, the same value the cold start seeds (`r = Σwy / Σw·e^o`,
+  the null-model rate). There the bound reads "a fitted rate more than
+  e³⁰ ≈ 1e13 times off the data's own rate", which is where a y = 0 row runs
+  when its mean is driven to 0, while counts near e³⁰ or near 1e-20, a Gamma
+  response in tiny units, or rows whose exposure is 1e-15 of the rest shift
+  η by the same amount as η₀ and pass. Bounding η rather than β is what makes the decision
+  independent of the caller's units: rescaling a predictor column divides its
+  coefficient by the same factor and leaves η, the fitted values and the
+  deviance untouched, so a bound on `|β_j|` would accept or reject the same
+  model depending on whether a height column is in metres or kilometres;
+  centring on `oᵢ + ln r` does the same for the units of the response, the
+  weights and the offset on a log link.
+  The guard is skipped for the two
   reciprocal links, `Family::Gamma { link: Inverse }` (η = 1/μ) and
   `Family::InverseGaussian { link: InverseSquared }` (η = 1/μ²), where a
   small-mean fit carries a large |η| honestly — under 1/μ² already at μ = 0.18;
-  those arms exit through `clamp_eta`'s upper 700, the non-finite guard, or
-  `MAX_IRLS_ITERS` instead.
+  those arms exit through `clamp_eta`'s bounds (`[1e-75, 1e75]`), the
+  non-finite guard, or `MAX_IRLS_ITERS` instead.
 - A **degenerate-response short-circuit**: an all-0 or all-1 (weighted)
   Bernoulli response returns early rather than dividing by zero in the working
   response.
-- A **post-fit saturation guard**: after the deviance fixpoint is reached, if
-  more than `SATURATION_FRAC` (half) of the prior-weight mass sits on rows
-  with working weight below `SATURATION_W = 1e-5` (fitted probabilities pinned
-  at 0/1 — quasi-separation), the fit is flipped to non-converged even though
-  the deviance converged.
+- A **post-fit saturation guard**, binomial links only: after the deviance
+  fixpoint is reached, if more than `SATURATION_FRAC` (half) of the rows have
+  a working weight below `SATURATION_W = 1e-5` times their prior weight
+  (fitted probabilities pinned at 0/1 — quasi-separation), the fit is flipped
+  to non-converged even though the deviance converged. The bound is absolute,
+  and on the other families the working weight carries the response's units
+  (μ on Poisson, 1/μ on inverse-Gaussian/log, μ² on Gamma/inverse), so the
+  guard does not run there.
 - A **Cholesky failure** on `XᵀWX` (non-PD) → non-converged.
 
-There is deliberately **no step-halving** on this path: the trial β is accepted
-unconditionally each iteration, matching R's un-halved IRLS trajectory. (The
+There is deliberately **no step-halving on a deviance increase** on this path:
+the trial β is accepted each iteration, matching R's un-halved IRLS trajectory
+(R's `glm.fit` halves only on a non-finite deviance or an invalid η/μ). (The
 mixed PIRLS loop *does* step-halve, because there it mirrors lme4 — see
-[`algorithms-glmm.md`](algorithms-glmm.md#pirls-inner-loop).)
+[`algorithms-glmm.md`](algorithms-glmm.md#pirls-inner-loop).) The one
+relaxation is **period-2 damping**, with the PIRLS constants
+`PIRLS_OSC_TRIGGER = 3` and `PIRLS_OSC_RATIO = 0.8`: on a link whose observed
+curvature differs from the Fisher weight (probit, cloglog, Gamma/log, NB/log,
+inverse-Gaussian/log), once the β step has reversed the one before it three
+passes in a row, each at no less than 0.8 of its length, every later step is
+halved. Fisher scoring's map has Jacobian `I − F⁻¹H` at the MLE, so where the
+observed information `H` exceeds twice the expected `F` in some direction the
+MLE repels and plain IRLS steps back and forth across it with growing amplitude
+(R's `glm.fit` does not converge there either); at very large counts the
+iterates can also two-cycle between neighbouring floats. Halving maps an
+eigenvalue λ of the map to `(1 + λ)/2`. The links on which Fisher scoring is
+Newton's method (logit, Poisson/log, Gamma/inverse, inverse-Gaussian/`1/μ²`)
+never run the detector, and a fit it does not fire on is bit-identical.
 
 **Dispersion.** Binomial and Poisson hold `φ ≡ 1`, so `(XᵀWX)⁻¹` is the full
 covariance. **Gamma** recovers `φ` post-fit: the mean model is φ-independent,
@@ -369,7 +446,10 @@ normalised `ŵ` at `ln(φ/w̄)` rather than on raw `w` at `ln φ`; the two give
 the same value (`aᵢ = wᵢ/φ = ŵᵢ/(φ/w̄)`), so this is only the solver staying
 on the one numerically stable scale it already searched on. `Fit::loglik` is
 thus the maximised log-likelihood of the precision model, so a Gamma GLM and
-a Gamma GLMM report comparable log-likelihoods. β is `stats::glm`'s.
+a Gamma GLMM report comparable log-likelihoods. On a fit that reproduces the
+data exactly, `D` is rounding noise and the likelihood rises without bound as
+φ → 0: the maximum sits at the tiny φ̂ that noise gives, and a `D` that rounds
+to zero or below gives `+∞`. β is `stats::glm`'s.
 `logLik(glm)` still differs from `Fit::loglik`: R's
 `logLik.glm` treats `weights` as case weights — it multiplies each row's
 log-density by `wᵢ` — and plugs in `D/Σwᵢ` for φ, which is neither the

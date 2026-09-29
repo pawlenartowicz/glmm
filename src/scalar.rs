@@ -84,7 +84,8 @@ pub trait Scalar:
     /// The batched per-family η-pass: reads the raw `eta` in place and leaves
     /// it holding `family::clamp_eta`'s projection, fills `prob` with μ and `w`
     /// with the floored IRLS weight, fills `z` with the working response when
-    /// non-empty. Returns `(Σ wᵢdᵢ, any-η-outside-the-link's-open-domain)`.
+    /// non-empty. Returns `(Σ wᵢdᵢ, any raw η the link does not evaluate)`
+    /// (`family::eta_infeasible`).
     /// `y`, `prior_w` and `nb_theta` are data and stay `f64`.
     ///
     /// The default body is the scalar statement in `crate::family`, row by row.
@@ -175,7 +176,7 @@ pub(crate) fn generic_family_pass<T: Scalar>(
     let mut dev = T::ZERO;
     let mut infeasible = false;
     for i in 0..n {
-        infeasible |= crate::family::eta_infeasible(family, eta[i]);
+        infeasible |= crate::family::eta_infeasible(family, y[i], eta[i]);
         eta[i] = crate::family::clamp_eta(family, eta[i]);
         let (mu, w_raw, r) = crate::family::irls_weight_and_resid(family, nb_theta, y[i], eta[i]);
         let pw = if prior_w.is_empty() { 1.0 } else { prior_w[i] };
@@ -184,7 +185,7 @@ pub(crate) fn generic_family_pass<T: Scalar>(
         if !z.is_empty() {
             z[i] = eta[i] + r;
         }
-        dev += T::from_f64(pw) * crate::family::dev_resid(family, nb_theta, y[i], mu);
+        dev += T::from_f64(pw) * crate::family::dev_resid_at(family, nb_theta, y[i], eta[i], mu);
     }
     (dev, infeasible)
 }

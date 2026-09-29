@@ -75,13 +75,26 @@ pub enum Error {
     WrongColumnKind {
         /// The column name whose kind doesn't match its use.
         name: String,
-        /// The kind the column was expected to be (`"numeric"` or `"factor"`).
+        /// The kind the column was expected to be, phrased to complete
+        /// "column … is not …": `"numeric"` for a column read as numbers
+        /// (a transform argument, an offset, a `cbind()` count), or `"a factor
+        /// or a column of whole numbers (grouping variable)"` for a grouping
+        /// column.
         expected: &'static str,
     },
     /// A random-slope variable is not present as a (numeric) fixed term, so it
     /// has no `ColumnId` in the design. A future version may allow
     /// random-slope variables with no corresponding fixed-effect term.
     SlopeVarNotInDesign(String),
+    /// A factor in the fixed part of the formula (character, or logical with a
+    /// single observed value) has fewer than 2 levels, so no treatment
+    /// contrast can be built for it. R's `contrasts<-` refuses the same thing;
+    /// a one-level grouping factor in the random part is not this — it is
+    /// dropped with a warning instead ([`crate::Note::SingleLevelGroupingDropped`]).
+    SingleLevelFactor {
+        /// The factor column name.
+        name: String,
+    },
     /// [`super::label_ranef`] was handed a `Fit` and a `re_groups` that do not
     /// describe the same model. The payload says which count disagreed.
     RanefShapeMismatch(String),
@@ -129,6 +142,10 @@ impl fmt::Display for Error {
             Error::SlopeVarNotInDesign(name) => write!(
                 f,
                 "random-slope variable '{name}' is not a numeric fixed term in the design"
+            ),
+            Error::SingleLevelFactor { name } => write!(
+                f,
+                "column '{name}': contrasts can be applied only to factors with 2 or more levels"
             ),
             Error::RanefShapeMismatch(detail) => write!(
                 f,

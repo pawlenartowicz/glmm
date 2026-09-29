@@ -30,9 +30,9 @@
 //!
 //! `2^k` is built with an FP magic-add + `u64` transmute/mask/mul rather than the
 //! textbook `(k+1023)<<52`: pulp 0.22's `Simd` trait exposes no integer
-//! shift/convert. Valid for `k ≥ -1023` (i.e. `x ⪆ -709`), always true on the
-//! fit path where `η` is bounded by `ETA_DIVERGENCE_CAP` — a bound on η
-//! directly, so this is exact rather than approximate.
+//! shift/convert. Valid for `k ≥ -1023` (i.e. `x ⪆ -709`), always true: every
+//! call site clamps its argument into `[−700, 700]` first (`EXP_ARG_FLOOR` /
+//! `EXP_ARG_CEIL` here, `family::ETA_MAX` on η in the family kernel).
 //!
 //! **fma policy.** wasm simd128 has no FMA instruction, so a guaranteed-fused
 //! `mul_add` lowers to the soft-float compiler-builtins libcall there (measured
@@ -700,6 +700,40 @@ fn erfc_cody(x: f64) -> f64 {
     }
 }
 
+/// [`erfc_cody`]'s third region (`y > 4`) as a rational in `s = 1/y²`:
+/// `erfc(y) = e^{−y²}·(SQRPI − s·R(s))/y`, `R = Pn/Qd`. Returns
+/// `(R, dR/ds, d²R/ds²)`, generic over the kernel scalar, so the probit tail
+/// (`family::in_tail`) can take `ln Φ` and the Mills ratio and its
+/// derivatives past where `erfc` itself underflows (`y ≈ 26.5`), as exact
+/// derivatives of this one approximant. `Pn` and `Qd` are Cody's
+/// `xnum + P₄` and `xden + Q₄`.
+pub(crate) fn erfc_region3_r<T: crate::scalar::Scalar>(s: T) -> (T, T, T) {
+    // Ascending coefficients, read off Cody's Horner loop.
+    const PN: [f64; 6] = [
+        ERFC_P[4], ERFC_P[3], ERFC_P[2], ERFC_P[1], ERFC_P[0], ERFC_P[5],
+    ];
+    const QD: [f64; 6] = [ERFC_Q[4], ERFC_Q[3], ERFC_Q[2], ERFC_Q[1], ERFC_Q[0], 1.0];
+    // (value, first, second derivative) by Horner.
+    let horner = |c: &[f64; 6]| {
+        let (mut v, mut d1, mut d2) = (T::from_f64(c[5]), T::ZERO, T::ZERO);
+        for &ck in c[..5].iter().rev() {
+            d2 = d2 * s + T::from_f64(2.0) * d1;
+            d1 = d1 * s + v;
+            v = v * s + T::from_f64(ck);
+        }
+        (v, d1, d2)
+    };
+    let (p, p1, p2) = horner(&PN);
+    let (q, q1, q2) = horner(&QD);
+    let r = p / q;
+    let r1 = (p1 - r * q1) / q;
+    let r2 = (p2 - T::from_f64(2.0) * r1 * q1 - r * q2) / q;
+    (r, r1, r2)
+}
+
+/// `√π`.
+pub(crate) const SQRT_PI: f64 = 1.772_453_850_905_516;
+
 /// `ln Γ(x)` for `x > 0`, accurate to ~1e-15 (full double). Lanczos
 /// approximation, `g = 7`, 9-coefficient series (Lanczos 1964; coefficients the
 /// widely-used Godfrey/Boost set) — relative error < 2e-16 on `x ∈ (0, ∞)`.
@@ -998,7 +1032,8 @@ fn scalar_sigmoid_owned<const FUSED: bool>(eta: f64) -> f64 {
 /// holding `family::clamp_eta`'s projection; fills `prob` with μ and `w` with the
 /// floored IRLS working weight `(wᵢ·W_raw).max(WEIGHT_CLAMP)`; fills `z` with the
 /// working response `η + r` when non-empty (the GLM IRLS site needs it, the three
-/// PIRLS sites do not). Returns `(Σ wᵢ·dᵢ, any-η-outside-the-link's-open-domain)`.
+/// PIRLS sites do not). Returns `(Σ wᵢ·dᵢ, any raw η the link does not evaluate)`
+/// (`family::eta_infeasible`).
 ///
 /// - `prior_w` empty ⇒ unit prior weights.
 /// - `weighted` selects between the two logit forms: unweighted
@@ -1064,6 +1099,18 @@ pub(crate) fn family_pass(
         return (dev, false);
     }
 
+    // Raw η past the link's clamp bounds (`family::eta_infeasible`), read
+    // before the arms overwrite η with its projection. The two inverse-link
+    // arms also count their `η ≤ 0` rows lane-wise; this covers them too.
+    let out_of_range = !matches!(
+        family,
+        Family::Binomial {
+            link: BinomialLink::Logit | BinomialLink::Probit
+        }
+    ) && eta
+        .iter()
+        .zip(y)
+        .any(|(&e, &yi)| crate::family::eta_infeasible(family, yi, e));
     let infeasible = pulp::Arch::new().dispatch(FamilyMuWOp::<{ FUSED_DEFAULT }> {
         family,
         nb_theta,
@@ -1074,16 +1121,43 @@ pub(crate) fn family_pass(
         w,
         z,
     });
-    // Deviance fold off the filled μ. Kept scalar and in `family::dev_resid`'s
-    // exact form: its `ln`s are outside this module's restricted-domain `ln`
-    // (arguments run over `y/μ` on the whole positive line), and holding the
-    // deviance arithmetic fixed keeps this change's movement confined to μ.
+    // Tail rows (`family::in_tail`): the arms' μ-form weight and working
+    // residual lose these, so they are refilled from the η forms, scalar —
+    // tail rows are rare, and the arms stay untouched off them.
+    if matches!(
+        family,
+        Family::Binomial { .. }
+            | Family::NegativeBinomial { .. }
+            | Family::Gamma {
+                link: GammaLink::Log
+            }
+            | Family::InverseGaussian {
+                link: InverseGaussianLink::Log
+            }
+    ) {
+        for i in 0..n {
+            if crate::family::in_tail(family, eta[i], prob[i]) {
+                let (w_raw, r) =
+                    crate::family::tail_weight_and_resid(family, nb_theta, y[i], eta[i], prob[i]);
+                let pw = if prior_w.is_empty() { 1.0 } else { prior_w[i] };
+                w[i] = (pw * w_raw).max(crate::glm::WEIGHT_CLAMP);
+                if !z.is_empty() {
+                    z[i] = eta[i] + r;
+                }
+            }
+        }
+    }
+    // Deviance fold off the filled μ (and η on a tail row). Kept scalar and in
+    // `family::dev_resid_at`'s exact form: its `ln`s are outside this module's
+    // restricted-domain `ln` (arguments run over `y/μ` on the whole positive
+    // line), and holding the deviance arithmetic fixed keeps this kernel's
+    // movement confined to μ.
     let mut dev = 0.0;
     for i in 0..n {
         let pw = if prior_w.is_empty() { 1.0 } else { prior_w[i] };
-        dev += pw * crate::family::dev_resid(family, nb_theta, y[i], prob[i]);
+        dev += pw * crate::family::dev_resid_at(family, nb_theta, y[i], eta[i], prob[i]);
     }
-    (dev, infeasible)
+    (dev, infeasible || out_of_range)
 }
 
 /// In-place `buf[i] = erfc(buf[i])` through the blend kernel — SIMD head +
@@ -1123,7 +1197,7 @@ struct FamilyMuWOp<'a, const FUSED: bool> {
 }
 
 impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
-    type Output = bool; // any raw η outside the link's open domain
+    type Output = bool; // any raw η ≤ 0 on the two inverse links
     #[inline(always)]
     fn with_simd<S: Simd>(self, simd: S) -> bool {
         let (eh, et) = S::as_mut_simd_f64s(self.eta);
@@ -1183,7 +1257,9 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
         }
 
         match self.family {
-            // μ = Φ(η), dμ/dη = φ(η); general Fisher weight (dμ/dη)²/V(μ).
+            // μ = Φ(η), dμ/dη = φ(η); general Fisher weight (dμ/dη)²/V(μ). A
+            // row whose μ lands on the `PROB_EPS` bound is a tail row, refilled
+            // after the arm.
             Family::Binomial {
                 link: BinomialLink::Probit,
             } => {
@@ -1210,8 +1286,11 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
             }
             // μ = 1 − exp(−exp η), dμ/dη = exp(η)·exp(−exp η); general Fisher
             // weight (dμ/dη)²/V(μ). Two `exp`s, both reused: `t = exp η` is the
-            // derivative's first factor and `s = exp(−t)` is 1−μ. η carries a real
-            // upper clamp here (ln ETA_MAX) — without it exp(exp η) overflows.
+            // derivative's first factor and `s = exp(−t)` is 1−μ. η is clamped
+            // at ±ETA_MAX so `t` stays finite, and `−t` is floored at
+            // `EXP_ARG_FLOOR`, the owned `exp`'s domain edge: past it `s` is
+            // below 1e-304, μ is on its `PROB_EPS` bound, and the row is a tail
+            // row whose weight and residual are refilled after the arm.
             // μ is `1 − s`, not `−expm1(−t)` as in `family::link_inv`: no owned
             // SIMD expm1 exists, so μ below ~1e-8 differs from the scalar
             // statement in relative terms (same class of gap as the owned `exp`,
@@ -1220,14 +1299,18 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                 link: BinomialLink::Cloglog,
             } => {
                 let elo = simd.splat_f64s(-crate::family::ETA_MAX);
-                let ehi = simd.splat_f64s(crate::family::ETA_MAX.ln());
+                let ehi = simd.splat_f64s(crate::family::ETA_MAX);
                 let lo = simd.splat_f64s(crate::family::PROB_EPS);
                 let hi = simd.splat_f64s(1.0 - crate::family::PROB_EPS);
+                let afl = simd.splat_f64s(EXP_ARG_FLOOR);
                 run_arm!(
                     |e, yi| {
                         let ec = simd.min_f64s(simd.max_f64s(e, elo), ehi);
                         let t = simd_exp_reduced::<S, FUSED>(simd, ec);
-                        let s = simd_exp_reduced::<S, FUSED>(simd, simd.neg_f64s(t));
+                        let s = simd_exp_reduced::<S, FUSED>(
+                            simd,
+                            simd.max_f64s(simd.neg_f64s(t), afl),
+                        );
                         let mu = simd.min_f64s(simd.max_f64s(simd.sub_f64s(one, s), lo), hi);
                         let dmu = simd.mul_f64s(t, s);
                         let v = simd.mul_f64s(mu, simd.sub_f64s(one, mu));
@@ -1235,9 +1318,9 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                         (ec, mu, w_raw, simd.div_f64s(simd.sub_f64s(yi, mu), dmu))
                     },
                     |e, yi| {
-                        let ec = e.clamp(-crate::family::ETA_MAX, crate::family::ETA_MAX.ln());
+                        let ec = e.clamp(-crate::family::ETA_MAX, crate::family::ETA_MAX);
                         let t = scalar_exp_reduced::<FUSED>(ec);
-                        let s = scalar_exp_reduced::<FUSED>(-t);
+                        let s = scalar_exp_reduced::<FUSED>((-t).max(EXP_ARG_FLOOR));
                         let mu =
                             (1.0 - s).clamp(crate::family::PROB_EPS, 1.0 - crate::family::PROB_EPS);
                         let dmu = t * s;
@@ -1247,51 +1330,50 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                 );
             }
             // Weighted binomial logit — the canonical shortcut W_raw = V(μ),
-            // matching `family::irls_weight_and_resid`. Unweighted Bernoulli
-            // logit never reaches here (`family_pass` routes it to the fused
-            // `pw_and_log1pexp_sum` kernel).
+            // matching `family::irls_weight_and_resid`. μ is unbounded, as on the
+            // unweighted route; a row past `PROB_EPS` is a tail row whose weight
+            // and residual (`V` may round to 0 there) are refilled after the arm.
+            // Unweighted Bernoulli logit never reaches here (`family_pass`
+            // routes it to the fused `pw_and_log1pexp_sum` kernel).
             Family::Binomial {
                 link: BinomialLink::Logit,
             } => {
-                let lo = simd.splat_f64s(crate::family::PROB_EPS);
-                let hi = simd.splat_f64s(1.0 - crate::family::PROB_EPS);
                 run_arm!(
                     |e, yi| {
-                        let mu_raw = simd_sigmoid::<S, FUSED>(simd, e);
-                        let mu = simd.min_f64s(simd.max_f64s(mu_raw, lo), hi);
+                        let mu = simd_sigmoid::<S, FUSED>(simd, e);
                         let v = simd.mul_f64s(mu, simd.sub_f64s(one, mu));
                         (e, mu, v, simd.div_f64s(simd.sub_f64s(yi, mu), v))
                     },
                     |e, yi| {
-                        let mu_raw = scalar_sigmoid_owned::<FUSED>(e);
-                        let mu =
-                            mu_raw.clamp(crate::family::PROB_EPS, 1.0 - crate::family::PROB_EPS);
+                        let mu = scalar_sigmoid_owned::<FUSED>(e);
                         let v = mu * (1.0 - mu);
                         (e, mu, v, (yi - mu) / v)
                     }
                 );
             }
-            // Canonical Poisson-log: one `exp`, and W_raw = V(μ) = μ.
+            // Canonical Poisson-log: one `exp`, and W_raw = V(μ) = μ. No tail:
+            // every term stays finite on |η| ≤ ETA_MAX.
             Family::Poisson { .. } => {
                 let elo = simd.splat_f64s(-crate::family::ETA_MAX);
                 let ehi = simd.splat_f64s(crate::family::ETA_MAX);
-                let mfl = simd.splat_f64s(crate::family::MU_FLOOR);
                 run_arm!(
                     |e, yi| {
                         let ec = simd.min_f64s(simd.max_f64s(e, elo), ehi);
-                        let mu = simd.max_f64s(simd_exp_reduced::<S, FUSED>(simd, ec), mfl);
+                        let mu = simd_exp_reduced::<S, FUSED>(simd, ec);
                         (ec, mu, mu, simd.div_f64s(simd.sub_f64s(yi, mu), mu))
                     },
                     |e, yi| {
                         let ec = e.clamp(-crate::family::ETA_MAX, crate::family::ETA_MAX);
-                        let mu = scalar_exp_reduced::<FUSED>(ec).max(crate::family::MU_FLOOR);
+                        let mu = scalar_exp_reduced::<FUSED>(ec);
                         (ec, mu, mu, (yi - mu) / mu)
                     }
                 );
             }
             // Non-canonical log links: `exp(η)` computed once and reused for both
             // μ and dμ/dη — the duplicate `link_inv`/`mu_eta` call this kernel
-            // exists to remove. V(μ) is μ² (Gamma) or μ + μ²/θ (NB).
+            // exists to remove. V(μ) is μ² (Gamma) or μ + μ²/θ (NB); past
+            // |η| = LOG_TAIL_ETA it nears overflow, and those tail rows are
+            // refilled after the arm.
             Family::Gamma {
                 link: GammaLink::Log,
             }
@@ -1299,13 +1381,12 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                 let is_nb = matches!(self.family, Family::NegativeBinomial { .. });
                 let elo = simd.splat_f64s(-crate::family::ETA_MAX);
                 let ehi = simd.splat_f64s(crate::family::ETA_MAX);
-                let mfl = simd.splat_f64s(crate::family::MU_FLOOR);
                 let th = simd.splat_f64s(nb_theta);
                 run_arm!(
                     |e, yi| {
                         let ec = simd.min_f64s(simd.max_f64s(e, elo), ehi);
                         let ex = simd_exp_reduced::<S, FUSED>(simd, ec);
-                        let mu = simd.max_f64s(ex, mfl);
+                        let mu = ex;
                         let msq = simd.mul_f64s(mu, mu);
                         let v = if is_nb {
                             simd.add_f64s(mu, simd.div_f64s(msq, th))
@@ -1318,7 +1399,7 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                     |e, yi| {
                         let ec = e.clamp(-crate::family::ETA_MAX, crate::family::ETA_MAX);
                         let ex = scalar_exp_reduced::<FUSED>(ec);
-                        let mu = ex.max(crate::family::MU_FLOOR);
+                        let mu = ex;
                         let v = if is_nb {
                             mu + mu * mu / nb_theta
                         } else {
@@ -1334,8 +1415,8 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
             Family::Gamma {
                 link: GammaLink::Inverse,
             } => {
-                let elo = simd.splat_f64s(crate::family::MU_FLOOR);
-                let ehi = simd.splat_f64s(crate::family::ETA_MAX);
+                let elo = simd.splat_f64s(crate::family::INV_ETA_MIN);
+                let ehi = simd.splat_f64s(crate::family::INV_ETA_MAX);
                 for i in 0..eh.len() {
                     let raw = eh[i];
                     // `family::eta_infeasible` is `raw <= 0.0`, which is FALSE on
@@ -1347,9 +1428,8 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                         simd.select_f64s(simd.less_than_or_equal_f64s(raw, zero), one, zero),
                     );
                     let ec = simd.min_f64s(simd.max_f64s(raw, elo), ehi);
-                    let mu_raw = simd.div_f64s(one, ec);
-                    let mu = simd.max_f64s(mu_raw, elo);
-                    let dmu = simd.neg_f64s(simd.mul_f64s(mu_raw, mu_raw));
+                    let mu = simd.div_f64s(one, ec);
+                    let dmu = simd.neg_f64s(simd.mul_f64s(mu, mu));
                     let v = simd.mul_f64s(mu, mu);
                     let w_raw = simd.div_f64s(simd.mul_f64s(dmu, dmu), v);
                     eh[i] = ec;
@@ -1363,10 +1443,9 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                 for i in 0..et.len() {
                     let raw = et[i];
                     bad_tail |= raw <= 0.0;
-                    let ec = raw.clamp(crate::family::MU_FLOOR, crate::family::ETA_MAX);
-                    let mu_raw = 1.0 / ec;
-                    let mu = mu_raw.max(crate::family::MU_FLOOR);
-                    let dmu = -(mu_raw * mu_raw);
+                    let ec = raw.clamp(crate::family::INV_ETA_MIN, crate::family::INV_ETA_MAX);
+                    let mu = 1.0 / ec;
+                    let dmu = -(mu * mu);
                     let v = mu * mu;
                     et[i] = ec;
                     pt[i] = mu;
@@ -1378,18 +1457,18 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                 }
             }
             // IG log link: `exp(η)` once, reused for μ and dμ/dη. V(μ) = μ³, so
-            // the general Fisher weight is exp(η)²/μ³.
+            // the general Fisher weight is exp(η)²/μ³; tail rows (|η| past
+            // LOG_TAIL_ETA) are refilled after the arm.
             Family::InverseGaussian {
                 link: InverseGaussianLink::Log,
             } => {
                 let elo = simd.splat_f64s(-crate::family::ETA_MAX);
                 let ehi = simd.splat_f64s(crate::family::ETA_MAX);
-                let mfl = simd.splat_f64s(crate::family::MU_FLOOR);
                 run_arm!(
                     |e, yi| {
                         let ec = simd.min_f64s(simd.max_f64s(e, elo), ehi);
                         let ex = simd_exp_reduced::<S, FUSED>(simd, ec);
-                        let mu = simd.max_f64s(ex, mfl);
+                        let mu = ex;
                         let v = simd.mul_f64s(simd.mul_f64s(mu, mu), mu);
                         let w_raw = simd.div_f64s(simd.mul_f64s(ex, ex), v);
                         (ec, mu, w_raw, simd.div_f64s(simd.sub_f64s(yi, mu), ex))
@@ -1397,7 +1476,7 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                     |e, yi| {
                         let ec = e.clamp(-crate::family::ETA_MAX, crate::family::ETA_MAX);
                         let ex = scalar_exp_reduced::<FUSED>(ec);
-                        let mu = ex.max(crate::family::MU_FLOOR);
+                        let mu = ex;
                         let v = mu * mu * mu;
                         (ec, mu, ex * ex / v, (yi - mu) / ex)
                     }
@@ -1413,8 +1492,8 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
             Family::InverseGaussian {
                 link: InverseGaussianLink::InverseSquared,
             } => {
-                let elo = simd.splat_f64s(crate::family::MU_FLOOR);
-                let ehi = simd.splat_f64s(crate::family::ETA_MAX);
+                let elo = simd.splat_f64s(crate::family::INV_ETA_MIN);
+                let ehi = simd.splat_f64s(crate::family::INV_ETA_MAX);
                 let half = simd.splat_f64s(0.5);
                 for i in 0..eh.len() {
                     let raw = eh[i];
@@ -1423,7 +1502,7 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                         simd.select_f64s(simd.less_than_or_equal_f64s(raw, zero), one, zero),
                     );
                     let ec = simd.min_f64s(simd.max_f64s(raw, elo), ehi);
-                    let mu = simd.max_f64s(simd.div_f64s(one, simd.sqrt_f64s(ec)), elo);
+                    let mu = simd.div_f64s(one, simd.sqrt_f64s(ec));
                     let mu3 = simd.mul_f64s(simd.mul_f64s(mu, mu), mu);
                     let dmu = simd.neg_f64s(simd.mul_f64s(half, mu3));
                     let w_raw = simd.div_f64s(simd.mul_f64s(dmu, dmu), mu3);
@@ -1438,8 +1517,8 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                 for i in 0..et.len() {
                     let raw = et[i];
                     bad_tail |= raw <= 0.0;
-                    let ec = raw.clamp(crate::family::MU_FLOOR, crate::family::ETA_MAX);
-                    let mu = (1.0 / ec.sqrt()).max(crate::family::MU_FLOOR);
+                    let ec = raw.clamp(crate::family::INV_ETA_MIN, crate::family::INV_ETA_MAX);
+                    let mu = 1.0 / ec.sqrt();
                     let mu3 = mu * mu * mu;
                     let dmu = -0.5 * mu3;
                     let w_raw = dmu * dmu / mu3;

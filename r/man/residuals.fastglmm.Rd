@@ -4,7 +4,7 @@
 \alias{residuals.fastglmm}
 \title{Residuals}
 \usage{
-\method{residuals}{fastglmm}(object, type = c("response", "pearson"), ...)
+\method{residuals}{fastglmm}(object, type = "response", ...)
 }
 \arguments{
 \item{object}{a \link{fastglmm} fit.}

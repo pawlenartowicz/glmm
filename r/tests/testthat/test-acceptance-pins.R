@@ -26,12 +26,22 @@ test_that("binomial random intercept is pinned, Laplace and nAGQ = 7", {
   expect_equal(unname(attr(VarCorr(fit1)$g, "stddev")),
                c(0.861924739905157), tolerance = CI_REF_REL)
 
+  # Re-recorded 2026-09-26, when the no-RE GLM fit that seeds this fit began
+  # to stop on R's relative deviance rule: the cold start moved, and the fit
+  # lands at logLik -393.542896593029, within 6.3e-13 of the previous point.
+  # The fixed effects moved by at most 8e-7 absolute (the last one, 1.6e-4
+  # relative on a value near 0.005).
+  #
+  # Re-recorded 2026-09-28, when the joint search over theta and beta began to
+  # step the fixed effects in centred, scaled coordinates: logLik
+  # -393.542896593027, 2e-12 higher. The fixed effects moved by at most 5.5e-7
+  # absolute (the last one 6.5e-5 relative), the SD by 9e-8 relative.
   fit7 <- fastglmm(f, d, family = binomial(), nAGQ = 7)
   expect_true(fit7$converged)
-  expect_equal(unname(fixef(fit7)), c(-0.625829018638988, 0.893716432457535, 0.244015519350444, 0.00516534124410457),
+  expect_equal(unname(fixef(fit7)), c(-0.62582891071147, 0.893716403487087, 0.244015538480626, 0.00516485243902018),
                tolerance = CI_REF_REL)
   expect_equal(unname(attr(VarCorr(fit7)$g, "stddev")),
-               c(0.882844883191443), tolerance = CI_REF_REL)
+               c(0.882844802317575), tolerance = CI_REF_REL)
 })
 
 test_that("poisson random intercept is pinned, Laplace and nAGQ = 7", {
@@ -46,27 +56,35 @@ test_that("poisson random intercept is pinned, Laplace and nAGQ = 7", {
   expect_equal(unname(attr(VarCorr(fit1)$g, "stddev")),
                c(0.583345352507545), tolerance = CI_REF_REL)
 
+  # Re-recorded 2026-09-28, when the joint search over theta and beta began to
+  # step the fixed effects in centred, scaled coordinates (logLik
+  # -923.041795291571). The fixed effects moved by at most 7.3e-7 absolute,
+  # the SD by 2.3e-7 relative.
   fit7 <- fastglmm(f, d, family = poisson(), nAGQ = 7)
   expect_true(fit7$converged)
-  expect_equal(unname(fixef(fit7)), c(-0.20355106814039, 0.72589349782474, 0.29184692395272, -0.198680382346346),
+  expect_equal(unname(fixef(fit7)), c(-0.203551164425076, 0.725894230553309, 0.291846747816096, -0.198680230560223),
                tolerance = CI_REF_REL)
   expect_equal(unname(attr(VarCorr(fit7)$g, "stddev")),
-               c(0.58547094722065), tolerance = CI_REF_REL)
+               c(0.585471084582996), tolerance = CI_REF_REL)
 })
 
 test_that("binomial random slope (tau0, tau1, rho01) is pinned", {
   # m/tau1 chosen so the slope variance is identified (an interior fit, not a
   # boundary one -- a singular fit would weaken the tau1/rho pin).
+  #
+  # Re-recorded 2026-09-28, when PIRLS's exact beta-profile step gained a trust
+  # region (logLik -923.756172968025): the correlation moved by 6e-8 absolute,
+  # the other values by at most 1.1e-8.
   d <- benchmark_data(seed = 203, family = "binomial", n_g = 100L, m = 15L,
                       tau0 = 0.8, tau1 = 0.8, rho = 0.3)
   fit <- fastglmm(y ~ t + d + t:d + (1 + t | g), d, family = binomial())
   expect_true(fit$converged)
   vc <- VarCorr(fit)$g
-  expect_equal(unname(fixef(fit)), c(-0.792588774256419, 1.07410694961377, 0.694132964295869, -0.129934518298598),
+  expect_equal(unname(fixef(fit)), c(-0.792588775368404, 1.07410695106387, 0.694132964548954, -0.129934513910262),
                tolerance = CI_REF_REL)
-  expect_equal(unname(attr(vc, "stddev")), c(1.04201267969287, 0.871286201276444),
+  expect_equal(unname(attr(vc, "stddev")), c(1.04201268635762, 0.871286208159484),
                tolerance = CI_REF_REL)
-  expect_equal(attr(vc, "correlation")[2, 1], 0.106174638142076,
+  expect_equal(attr(vc, "correlation")[2, 1], 0.106174698372109,
                tolerance = CI_REF_REL)
 })
 
@@ -91,10 +109,21 @@ test_that("gamma GLMM is pinned", {
   #
   # Re-recorded 2026-09-24, when the mixed-Gamma fit became the maximum of the
   # Laplace likelihood with phi estimated by ML: glmmTMB 1.1.14 on the same data
-  # reaches logLik -807.967379848965 (this fit: -807.967379870621), the same
+  # reaches logLik -807.967379848965 (this fit then: -807.967379870621), the same
   # SD to 2e-6 and fixed effects to 3e-5 relative. The pin still gates only
   # the wrapper and the kernel; that agreement is the cross-engine check,
   # made by hand.
+  #
+  # Re-recorded 2026-09-26, when PIRLS began to take the Newton step on the
+  # log link: this fit now reaches logLik -807.967379832934, 3.8e-8 higher
+  # than before and 1.6e-8 above glmmTMB's. The fixed effects moved by up to
+  # 1.4e-4 relative, the SD 1.2e-6 and sigma 6.7e-6.
+  #
+  # Re-recorded 2026-09-28, after the trust region on PIRLS's beta step and the
+  # centred, scaled fixed-effect coordinates of the joint search: logLik
+  # -807.967379830268, 2.7e-12 higher. The fixed effects moved by at most
+  # 1.3e-4 relative (the last one, 6.3e-6 absolute), the SD 3.4e-6 and sigma
+  # 7.2e-7.
   set.seed(208)
   n_g <- 60L
   m <- 10L
@@ -110,11 +139,11 @@ test_that("gamma GLMM is pinned", {
   d <- data.frame(y = y, t = t, d = dtrt, g = g)
   fit <- fastglmm(y ~ t + d + t:d + (1 | g), d, family = Gamma(link = "log"))
   expect_true(fit$converged)
-  expect_equal(unname(fixef(fit)), c(0.4885792356687608, 0.2112947287513839, 0.1567059342545184, 0.0491456628104056),
+  expect_equal(unname(fixef(fit)), c(0.4885683550922643, 0.2113069197054022, 0.156708904999734, 0.0491449551112931),
                tolerance = CI_REF_REL)
   expect_equal(unname(attr(VarCorr(fit)$g, "stddev")),
-               c(0.258718996469143), tolerance = CI_REF_REL)
-  expect_equal(sigma(fit), 0.492147539449984, tolerance = CI_REF_REL)
+               c(0.258718428847095), tolerance = CI_REF_REL)
+  expect_equal(sigma(fit), 0.492144615806503, tolerance = CI_REF_REL)
 })
 
 test_that("logLik and AIC are pinned, and the LMM value is the REML criterion", {

@@ -152,11 +152,11 @@ them). It is returned by `fit`, never constructed by callers.
 | `vcov` | `(p, p)` full Cov(β̂) — `se` is the sqrt of its diagonal; use it for contrasts/confidence intervals, where the off-diagonals matter |
 | `names` | coefficient names, aligned with `beta` |
 | `aliased` | `(p,)` bool — rank-deficient columns dropped (lme4's `NA` coefficients) |
-| `varcorr` | per grouping: vech-packed lower-triangular RE covariance D̂ |
+| `varcorr` | per grouping, in the order the groupings appear in the formula (lme4 instead sorts by decreasing number of levels): vech-packed lower-triangular RE covariance D̂ |
 | `tau2` | legacy per-element RE variances (q=1 only) — prefer `varcorr` |
 | `stddev_se` | SE of each RE stddev, θ layout (not beta-aligned); `NaN` where unavailable |
 | `dispersion` | φ (gamma / inverse-gaussian) / θ (negbin) / 1.0 otherwise |
-| `re_groups` | per grouping, in `varcorr` order: `(name, [term names])` — what `summary()` labels the RE block with |
+| `re_groups` | per grouping, in `varcorr` order (formula order): `(name, [term names])` — what `summary()` labels the RE block with |
 | `n_eval` | optimizer objective evaluations (0 on the closed-form/IRLS paths) |
 | `deviance` | minimized optimizer criterion — **not** comparable across models, and not an AIC input (see below) |
 | `loglik` | log-likelihood on `logLik()`'s scale (R/lme4); the REML criterion for an LMM (see `reml`), the ordinary log-likelihood for OLS/GLM/GLMM; `NaN` wherever `deviance`'s failure modes apply |

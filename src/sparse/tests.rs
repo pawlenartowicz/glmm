@@ -2511,6 +2511,12 @@ fn noz_sparse_crossover_heavy_timed() {
 /// −433.5431481822, 796 → 610 evaluations), worst move 4.0e-6 absolute on
 /// the `ge` off-diagonal covariance −0.02568 — 1.6e-4 relative, over `BAND`
 /// only because that entry is small.
+/// Re-pinned 2026-09-28 with the fixed-effect orthogonalization
+/// (`lmm::DesignQr`): the objective's last bits change, so BOBYQA stops at a
+/// neighbouring point of the same optimum. The deviance improved by 1.7e-9
+/// (−433.5431481822 → −433.5431481840, 610 → 569 evaluations); worst move
+/// 2.9e-6 absolute on the same `ge` off-diagonal covariance (1.1e-4 relative),
+/// then 5.1e-5 on the smallest `ge` entry, everything else ≤ 1.6e-5.
 ///
 /// Relative-tolerance, not bit-equal. These values reproduce BIT-EXACTLY on the
 /// anchor machine (see `fit::common_tests::assert_pinned`, "which machine the
@@ -2522,39 +2528,39 @@ fn noz_sparse_crossover_heavy_timed() {
 fn fit_wide_slopes_sparse_is_pinned() {
     const BAND: f64 = 5e-5;
     const REF_BETA: [f64; 5] = [
-        1.7059457411838472,
-        0.6799307274818567,
-        -0.5337786807640252,
-        0.39615954749070753,
-        -0.23725707491665174,
+        1.705945746018679,
+        0.6799307257661724,
+        -0.5337786829358694,
+        0.39615954101321865,
+        -0.2372570918066561,
     ];
     const REF_SE: [f64; 5] = [
-        0.26358070314864507,
-        0.13544534462542981,
-        0.1123693535774618,
-        0.06849217986854006,
-        0.04723934077034158,
+        0.2635802831619073,
+        0.1354455906504179,
+        0.11236942222577838,
+        0.06849205342475609,
+        0.04723926114935896,
     ];
     // gp: scalar block. ge: q=5, column-major lower-triangle vech of D̂.
-    const REF_VC_GP: f64 = 0.8317227715961614;
+    const REF_VC_GP: f64 = 0.8317203715935936;
     const REF_VC_GE: [f64; 15] = [
-        1.099888069751484,
-        -0.02567959907663154,
-        0.2242207764039021,
-        0.09681474324321798,
-        0.08265963768802698,
-        0.7159741381765924,
-        0.29795672945857005,
-        0.025044406241823698,
-        0.007684940206366342,
-        0.4882181388643109,
-        0.07347579753851738,
-        0.04159226366357781,
-        0.17210532731318395,
-        0.008381340235342889,
-        0.0726357030084376,
+        1.0998840091740958,
+        -0.025676742893674834,
+        0.22421993844829255,
+        0.0968132841125087,
+        0.0826593635743033,
+        0.7159767989569717,
+        0.29795963668526426,
+        0.02504474472441964,
+        0.00768505940813278,
+        0.48821875116744395,
+        0.07347506670416443,
+        0.041592273947964796,
+        0.17210463031486298,
+        0.00838091047253779,
+        0.07263539851037769,
     ];
-    const REF_SIGMA2: f64 = 0.3764413144985405;
+    const REF_SIGMA2: f64 = 0.37644144671286883;
 
     let csv = include_str!("../../validation/data/simulated/sim_wide_slopes.csv");
     // Columns: y, x1, x2, x3, x4, gp, ge (indices 0..7).
@@ -6433,7 +6439,7 @@ fn sparse_glmm_slope_crossed_design() -> (
 /// Sparse GLMM rescale identity, `C = 4.0`, `WaldSe::Hessian` (the crate
 /// default) — the sparse-route twin of `crate::fit::glmm_tests`'s dense GLMM
 /// rescale test, same predicted moves and the same reason for the smaller `C`
-/// and looser band (the joint `[θ | β]` BOBYQA search with a `BETA_BOX` on
+/// and looser band (the joint `[θ | β]` BOBYQA search with one trust radius on
 /// raw β makes the two fits' internal paths genuinely different, not one
 /// bit-identical search read twice — see that test's doc comment). Both
 /// groupings here (primary g1, extra g2) carry a random slope on the SAME

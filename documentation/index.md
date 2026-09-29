@@ -43,7 +43,7 @@ a zero-allocation, warm-startable workspace.
 | Reference | [`formula.md`](formula.md) | What the formula parser accepts and rejects, with workarounds |
 | Reference | [`conventions.md`](conventions.md) | Estimation, standard-error, dispersion, and variance-component conventions, and the flags on a fit result |
 | Reference | [`troubleshooting.md`](troubleshooting.md) | Fixes for singular fits, non-convergence, `NotImplementedError`, and rejected formulas |
-| Reference | [`warnings.md`](warnings.md) | Every warning a fit raises: tier, title, message, and the stored `m.warnings` / `m$warnings` entry |
+| Reference | [`warnings.md`](warnings.md) | Every warning a fit raises (tier, title, message, and the stored `m.warnings` / `m$warnings` entry) and every error a call can raise |
 | Reference | [`validation.md`](validation.md) | How glmm is validated against lme4 and MixedModels.jl, what's covered, and known tolerances/exemptions |
 | Internals | [`algorithms.md`](algorithms.md) | Algorithm map entry point: full dispatch graph, knob index, OLS/GLM paths |
 | Internals | [`algorithms-lmm.md`](algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML, closed-form shortcut, BOBYQA, boundary handling |

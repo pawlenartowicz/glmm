@@ -1742,11 +1742,13 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
 /// unreachable with well-posed data).
 #[test]
 fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
-    let (n, nc) = (80usize, 8usize);
+    let (n, nc) = (320usize, 8usize);
     let per = n / nc;
-    // Strong between-cluster intercept offsets (SD ≈ 2.5) ⇒ high ICC ⇒ the fit
-    // converges to a LARGE τ̂² (θ̂ ≳ 2), the concave region where the joint
+    // Strong between-cluster intercept offsets (SD ≈ 5.2) ⇒ high ICC ⇒ the fit
+    // converges to a LARGE τ̂² (θ̂ ≳ 5), the concave region where the joint
     // Hessian goes non-PD. Noisy (logistic-sampled) labels — no separation.
+    // Much larger offsets, or fewer rows a cluster, make the outer clusters all
+    // 0 or all 1: the deviance then keeps falling as θ grows and has no minimum.
     let mut st = 4242u64;
     let mut xf64 = Mat::<f64>::zeros(n, 2);
     let mut y = vec![0.0f64; n];
@@ -1754,7 +1756,7 @@ fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
     for i in 0..n {
         let c = i / per; // block layout
         ids[i] = c as u32;
-        let u_c = 10.0 * (2.0 * (c as f64) / ((nc - 1) as f64) - 1.0); // ∈ [-10, 10]
+        let u_c = 8.0 * (2.0 * (c as f64) / ((nc - 1) as f64) - 1.0); // ∈ [-8, 8]
         let x1 = lcg(&mut st); // within-cluster-varying ⇒ β slope identified
         xf64[(i, 0)] = 1.0;
         xf64[(i, 1)] = x1;
@@ -1782,7 +1784,7 @@ fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
         WaldSe::Rx,
     );
     assert!(fit.converged, "fixture fit must converge");
-    // High-ICC data converges to a large θ̂ (≈ 30 here) — the flank whose
+    // High-ICC data converges to a large θ̂ (≈ 7.6 here) — the flank whose
     // far side is the concave region.
     assert!(
         ws.params[0] > 5.0,
@@ -4757,6 +4759,129 @@ fn assert_structured_exact_profile_is_beta_minimum(family: Family, label: &str) 
     assert_exact_profile_is_beta_minimum_ws(&mut ws, x.as_ref(), &y, &ids, &extra, n, p, label);
 }
 
+/// The exact border steps with `S_β + ½·d²log|A|/dβ²`, which must be half the
+/// Hessian of the Laplace β-profile. At the profiled β̂ (θ = `theta`) that
+/// matrix is compared with a central difference, step 3e-4, of the
+/// Fixed-mode objective, whose PIRLS solves run at a 1e-13 band; the band is
+/// 1e-5 of the largest entry. Measured: at most 5.5e-7 (grouseticks, the
+/// difference's own truncation error: it falls as the step squared), 2e-8 on
+/// the other fixtures, while `S_β` alone misses by 2.1e-4 (grouseticks) to
+/// 3.0e-2.
+#[allow(clippy::too_many_arguments)]
+fn assert_border_curvature_matches_fd(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    extra: &[Vec<u32>],
+    n: usize,
+    p: usize,
+    theta: f64,
+    label: &str,
+) {
+    let mut ctrs = EvalCounters::new();
+    let nt = ws.n_theta;
+    ws.params[..nt].fill(theta);
+    ws.beta_prof[..p].fill(0.0);
+    ws.pirls.u.fill(0.0);
+    let prof = laplace_deviance_ws(ws, x, y, ids, extra, n, BetaMode::ProfileExact, &mut ctrs);
+    assert!(
+        prof.is_finite(),
+        "{label}: exact profile solve must converge"
+    );
+    let beta_hat = ws.beta_prof[..p].to_vec();
+    let curv = Mat::<f64>::from_fn(p, p, |j, k| {
+        2.0 * (ws.exact_prof.schur_plain[(j, k)] + ws.exact_prof.logdet_hess[(j, k)])
+    });
+    ws.fd.pirls_tol_override = Some(1e-13);
+    let h = 3e-4;
+    let mut f = |dj: (usize, f64), dk: (usize, f64)| {
+        ws.params[nt..nt + p].copy_from_slice(&beta_hat);
+        ws.params[nt + dj.0] += dj.1;
+        ws.params[nt + dk.0] += dk.1;
+        ws.pirls.u.fill(0.0);
+        laplace_deviance_ws(ws, x, y, ids, extra, n, BetaMode::Fixed, &mut ctrs)
+    };
+    let mut fd = Mat::<f64>::zeros(p, p);
+    for j in 0..p {
+        for k in 0..=j {
+            let v = (f((j, h), (k, h)) - f((j, h), (k, -h)) - f((j, -h), (k, h))
+                + f((j, -h), (k, -h)))
+                / (4.0 * h * h);
+            fd[(j, k)] = v;
+            fd[(k, j)] = v;
+        }
+    }
+    ws.fd.pirls_tol_override = None;
+    let scale = (0..p)
+        .flat_map(|j| (0..p).map(move |k| (j, k)))
+        .map(|(j, k)| fd[(j, k)].abs())
+        .fold(0.0_f64, f64::max);
+    for j in 0..p {
+        for k in 0..p {
+            assert!(
+                (curv[(j, k)] - fd[(j, k)]).abs() <= 1e-5 * scale,
+                "{label}: border curvature [{j},{k}] {} vs FD of the profile {} (scale {scale})",
+                curv[(j, k)],
+                fd[(j, k)]
+            );
+        }
+    }
+}
+
+#[test]
+fn exact_border_curvature_matches_fd_of_the_profile() {
+    let blocked = [
+        (
+            logit_intercept_fixture as fn() -> ExactProfileFixture,
+            "logit",
+            f64::NAN,
+        ),
+        (probit_intercept_fixture, "probit", f64::NAN),
+        (sim_nb_intercept_fixture, "sim_nb", 3.0),
+    ];
+    for (fixture, label, nb_theta) in blocked {
+        let (model, ids, extra, x, y, n, p) = fixture();
+        let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+        ws.nb_theta = nb_theta;
+        assert_border_curvature_matches_fd(&mut ws, x.as_ref(), &y, &ids, &extra, n, p, 0.8, label);
+    }
+    let (x, y, ids) = glmm_slope2_noextra_dataset();
+    let mut ws = GlmmWorkspace::for_cluster_spec(3, &slope2_spec(), 120, &[1, 2], 1);
+    assert_border_curvature_matches_fd(&mut ws, x.as_ref(), &y, &ids, &[], 120, 3, 0.5, "slope2");
+    for (family, label) in [
+        (
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            "structured nb",
+        ),
+        (
+            Family::Binomial {
+                link: BinomialLink::Probit,
+            },
+            "structured probit",
+        ),
+    ] {
+        let (mut ws, x, y, ids, extra, p, n) = extras_fixture(family, 2, 6);
+        assert_border_curvature_matches_fd(&mut ws, x.as_ref(), &y, &ids, &extra, n, p, 0.6, label);
+    }
+    let (model, ids, extra, x, y, n, p) = grouseticks_exact_fixture();
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+    ws.pattern.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra, n);
+    assert_border_curvature_matches_fd(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra,
+        n,
+        p,
+        0.7,
+        "grouseticks",
+    );
+}
+
 /// The exact-Profile solve must converge when PIRLS is warm-started from the
 /// converged (ũ, β̂) of a LOWER θ — the directional warm start the θ-only outer
 /// search does on every uphill probe. A cold start at the same θ converges, so a
@@ -6252,10 +6377,14 @@ fn two_stage_adversarial_bad_theta_start() {
 /// Adversarial: a near-collinear design (col 2 = col 1 + 1e-8·noise, condition
 /// number ~1e8) makes the β-Schur near-singular — the stress the β-profiling step's
 /// dense solve must survive. `fit_glmm` runs no rank-deficiency salvage (that lives
-/// in `fit_warm`), so this hits the ill-conditioned kernel directly. This is the one
-/// adversarial cell that lands on the clean-failure surface — both stages exhaust
-/// halving on the singular Schur — so its expected outcome is pinned to keep the
-/// NaN-fill assertions in `assert_two_stage_adversarial` exercised.
+/// in `fit_warm`), so this hits the ill-conditioned kernel directly. The
+/// `ExactProfile` attempt fails and the `PqlThenJoint` fallback's search
+/// converges to the `Joint` optimum (deviance equal to ~1e-11, β₁ ≈ −β₂ ≈
+/// 1.45e7: the near-duplicate column's own coefficient). Whether the fit then
+/// reports it depends on the Wald SE step: the β Schur complement is singular
+/// to rounding, and its Cholesky succeeds or fails on round-off between points
+/// a few 1e-6 apart in β (a failure NaN-fills the fit). So the outcome is not
+/// pinned; either surface the helper accepts is a pass.
 #[test]
 fn two_stage_adversarial_near_collinear_x() {
     let (n, nc) = (80usize, 8usize);
@@ -6288,7 +6417,7 @@ fn two_stage_adversarial_near_collinear_x() {
         n,
         3,
         None,
-        Some(false),
+        None,
     );
 }
 
@@ -7615,10 +7744,7 @@ fn dual_hessian_matches_central_fd_of_gradient_padded_to_n12() {
 /// reassociation of the same Cholesky, orders of magnitude inside the 1e-6
 /// band. On the nested-only cell `StructuredSchur::new` returns `None`
 /// (`e == 0`) and both sides take the dense arm, which is the whole tail
-/// story there. `ws.exact_prof.obs_schur` is built alongside it, gated the
-/// same way production gates it (structured-eligible and non-canonical), so
-/// the structured exact-profile unit gate's non-canonical cells run the
-/// twin's cached sparse arm too, not only its dense fallback.
+/// story there.
 #[allow(clippy::type_complexity)]
 fn extras_fixture(
     family: Family,
@@ -7662,17 +7788,92 @@ fn extras_fixture(
         ws.nb_theta = 4.0;
     }
     ws.pattern.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
-    // Observed twin of the crossed-Schur factor, gated the same way production
-    // builds it: only where the exact profile can read it, a non-canonical
-    // link on a structured-eligible shape. Same pattern, same arguments as
-    // the Fisher cache above — change together.
-    ws.exact_prof.obs_schur =
-        if ws.groupings.structured_extras_eligible() && !crate::family::is_canonical(family) {
-            StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n)
-        } else {
-            None
-        };
     (ws, x, y, ids, extra_ids, p, n)
+}
+
+/// Newton PIRLS on the four links whose exact curvature differs from Fisher
+/// (probit, cloglog, Gamma/log, NB/log): the step weight is the observed one,
+/// so the solve converges quadratically and a solve that stops at a loose exit
+/// band already sits on the mode. Fisher scoring converges only linearly and
+/// stops short of the mode by about the square root of its band, which leaves
+/// the objective noisy at that level. The Laplace deviance at a fixed
+/// `(θ, β)`, solved from `û = 0` at a loose band (1e-6) and at a tight one
+/// (1e-13), must agree to 1e-12 relative, on the blocked, structured and
+/// packed layouts. Measured: Newton ≤ 2.1e-16 on every cell; Fisher scoring
+/// 3e-11 to 1.4e-9 on these fixtures.
+#[test]
+fn newton_pirls_lands_on_the_mode_at_a_loose_band() {
+    let families = [
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+    ];
+    let loose_and_tight = |ws: &mut GlmmWorkspace,
+                           params: &[f64],
+                           x: faer::MatRef<f64>,
+                           y: &[f64],
+                           ids: &[u32],
+                           extra_ids: &[Vec<u32>],
+                           n: usize| {
+        let mut out = [0.0; 2];
+        for (slot, tol) in out.iter_mut().zip([1e-6, 1e-13]) {
+            ws.fd.pirls_tol_override = Some(tol);
+            *slot = glmm_laplace_deviance(params, ws, x, y, ids, extra_ids, n);
+        }
+        ws.fd.pirls_tol_override = None;
+        out
+    };
+    for family in families {
+        let mut cells: Vec<(&str, [f64; 2])> = Vec::new();
+        // Blocked: one grouping, random intercept and slope.
+        let (mut ws, x, y, ids, _p, n) = fixture(family, "q2s");
+        assert_eq!(ws.layout, GlmmLayout::Blocked);
+        let params = [0.8, 0.3, 0.6, 0.2, 0.8];
+        cells.push((
+            "blocked",
+            loose_and_tight(&mut ws, &params, x.as_ref(), &y, &ids, &[], n),
+        ));
+        // Structured: nested children plus a crossed grouping.
+        let (mut ws, x, y, ids, extra_ids, _p, n) = extras_fixture(family, 2, 6);
+        assert_eq!(ws.layout, GlmmLayout::Structured);
+        let params = [0.5, 0.4, 0.45, 0.2, 0.8];
+        cells.push((
+            "structured",
+            loose_and_tight(&mut ws, &params, x.as_ref(), &y, &ids, &extra_ids, n),
+        ));
+        // Packed: the same design and response on the packed-row layout.
+        let (_, _, _, _, mut spec) = glmm_extras_q1_dataset(2, 6);
+        spec.family = family;
+        let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &spec, n, &[], 1);
+        if matches!(family, Family::NegativeBinomial { .. }) {
+            ws.nb_theta = 4.0;
+        }
+        fill_packed_cols(&mut ws, &ids, &extra_ids, n);
+        cells.push((
+            "packed",
+            loose_and_tight(&mut ws, &params, x.as_ref(), &y, &ids, &extra_ids, n),
+        ));
+        for (layout, [loose, tight]) in cells {
+            assert!(
+                loose.is_finite() && tight.is_finite(),
+                "{family:?} {layout}: loose {loose}, tight {tight}"
+            );
+            let rel = (loose - tight).abs() / (1.0 + tight.abs());
+            assert!(
+                rel < 1e-12,
+                "{family:?} {layout}: the 1e-6 solve is {rel:.3e} relative off the 1e-13 one"
+            );
+        }
+    }
 }
 
 /// `{Binomial-logit, Binomial-probit, Binomial-cloglog, Poisson-log,
@@ -7686,10 +7887,9 @@ fn extras_fixture(
 /// `e = 6`, whose `f64` route is the panel downdate while the dual route takes
 /// the scalar default). Logit and Poisson-log are canonical controls; probit,
 /// cloglog, Gamma-log and NegativeBinomial-log are the four non-canonical
-/// links the observed-information twin (`DualStep::observed` on the dual
-/// side, `ExactProfileBufs::obs_schur` on the `f64` side) actually serves on
-/// this route, so between them this gate checks the twin's chain rule family
-/// by family, not just once.
+/// links the observed-information twin (`DualStep::observed`) actually serves
+/// on this route, so between them this gate checks the twin's chain rule
+/// family by family, not just once.
 ///
 /// Remaining gap: `GammaLink::Inverse` and `InverseGaussian` (both links) are
 /// also non-canonical and structured-extras-eligible, so they build and read
@@ -7941,8 +8141,9 @@ const AGQ_GATE_CELLS: &[(Family, &str, u8)] = &[
         5,
     ),
     // Non-canonical binomial link: `agq_eligible` admits `Binomial { .. }` at
-    // any link, so this cell exercises the general Fisher-scoring PIRLS mode
-    // inside the AGQ node loop, not just the logit fast path the other cells cover.
+    // any link, so this cell exercises the non-canonical (Newton-weight) PIRLS
+    // path inside the AGQ node loop, not just the logit fast path the other
+    // cells cover.
     (
         Family::Binomial {
             link: BinomialLink::Probit,
@@ -8827,51 +9028,186 @@ fn agq_nb_ladder_converges_and_one_node_is_laplace() {
     }
 }
 
-/// A row whose μ sits on its `family::clamp_mu` bound keeps the Fisher weight
-/// in the Laplace `A`: there the clamped observed weight `−w·μ''(y−μ)/V`
-/// divides by `V` at the pin and turns strongly negative (cloglog's upper pin
-/// with y = 0 at η = 3.32 gives about −734·w), which would make `A` non-PD and
-/// the objective +∞. Off the clamps `W_obs ≥ 0` on every link this applies
-/// to (each log-likelihood is log-concave in η), so the rule only moves
-/// pinned rows.
+/// A tail row (`family::in_tail`) takes the η-form observed weight in the
+/// Laplace `A`. On cloglog's upper side with y = 0 the row's deviance is
+/// `2e^η`, so its observed weight is `e^η` — positive, where the μ-form
+/// `W_obs` evaluated at the stored `1 − PROB_EPS` would divide by `V` at the
+/// bound and turn strongly negative, making `A` non-PD.
 #[test]
-fn a_pinned_row_keeps_the_fisher_weight_in_the_laplace_curvature() {
+fn a_tail_row_takes_the_eta_form_observed_weight() {
     let family = crate::Family::Binomial {
         link: crate::BinomialLink::Cloglog,
     };
-    let (_, mu_hi) = crate::family::pinned_mu_bounds(family, false);
     let eta = [3.32_f64, 0.3];
-    let prob = [mu_hi, crate::family::link_inv(family, 0.3)];
+    let prob = [
+        crate::family::link_inv(family, eta[0]),
+        crate::family::link_inv(family, eta[1]),
+    ];
+    assert!(crate::family::in_tail(family, eta[0], prob[0]));
+    assert!(!crate::family::in_tail(family, eta[1], prob[1]));
     let y = [0.0, 1.0];
     let prior_w = [1.0, 1.0];
-    let (dmu0, dmu1) = (
-        crate::family::mu_eta(family, eta[0]),
-        crate::family::mu_eta(family, eta[1]),
-    );
     let fisher = [
-        dmu0 * dmu0 / crate::family::variance(family, f64::NAN, prob[0]),
-        dmu1 * dmu1 / crate::family::variance(family, f64::NAN, prob[1]),
+        crate::family::irls_weight_and_resid(family, f64::NAN, y[0], eta[0]).1,
+        crate::family::irls_weight_and_resid(family, f64::NAN, y[1], eta[1]).1,
     ];
     let mut w = fisher;
-    observed_weights_in_place(
-        family,
-        f64::NAN,
-        &y,
-        &prior_w,
-        false,
-        &eta,
-        &prob,
-        &mut w,
-        2,
+    observed_weights_in_place(family, f64::NAN, &y, &prior_w, &eta, &prob, &mut w, 2);
+    let t = eta[0].exp();
+    assert!(
+        (w[0] - t).abs() <= 1e-12 * t,
+        "tail row: observed weight {} vs e^η {t}",
+        w[0]
     );
-    assert_eq!(w[0], fisher[0], "pinned row: Fisher weight kept");
-    assert!(w[0] >= 0.0);
     let obs1 =
         crate::family::observed_weight(family, f64::NAN, y[1], 1.0, eta[1], prob[1], fisher[1]);
     assert_eq!(w[1], obs1, "interior row: observed weight");
+}
+
+/// On the AGQ route the fit keeps the search's own Λ at a pinned diagonal, and
+/// the reported deviance is the AGQ objective at that Λ. The data carry a
+/// random slope and no random intercept (x in (1, 3), 20 clusters), so the fit
+/// pins the intercept diagonal and the search stops with a small live entry
+/// below it. The vector AGQ deviance is not a function of Σ alone: the first
+/// check rotates that column at fixed Σ and sees the deviance move. Folding
+/// the entry into the slope diagonal would therefore report a Λ the search did
+/// not choose, at a deviance it never reached. The pin flags still come from
+/// the canonical form, which names the intercept alone.
+#[test]
+fn fit_glmm_vector_agq_keeps_search_lambda_at_pinned_diagonal() {
+    let (n, nc, nagq) = (400usize, 20usize, 7u8);
+    // This design has two boundary basins, the intercept diagonal pinned or the
+    // slope diagonal pinned under a rank-one Λ, and which one the search reaches
+    // depends on its path. Seed 278 lands on the intercept-pinned face on both
+    // β parameterisations of the joint search, at the same deviance.
+    let mut st = 278u64;
+    let u1: Vec<f64> = (0..nc).map(|_| 2.0 * lcg(&mut st)).collect();
+    let mut x = Mat::<f64>::zeros(n, 2);
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        let c = i % nc;
+        ids[i] = c as u32;
+        let x1 = 2.0 + 2.0 * lcg(&mut st);
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = x1;
+        let eta = 0.2 + 0.5 * x1 + u1[c] * x1;
+        let p = 1.0 / (1.0 + (-eta).exp());
+        y[i] = if lcg(&mut st) + 0.5 < p { 1.0 } else { 0.0 };
+    }
+    let spec = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: nc as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let mut ws = GlmmWorkspace::for_cluster_spec(2, &spec, n, &[1], nagq);
+    let fit = fit_glmm(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &[],
+        &[1],
+        None,
+        &[0.0, 0.0],
+        n,
+        WaldSe::Hessian,
+    );
+    assert!(fit.converged);
+    assert_eq!(fit.pinned_components, 0b01, "intercept pinned, slope live");
+    let params = ws.params[..5].to_vec();
+    assert_eq!(params[0], 0.0, "intercept diagonal pinned");
     assert!(
-        crate::family::clamped_observed_weight(family, f64::NAN, y[0], 1.0, eta[0], prob[0])
-            < -100.0,
-        "the fixture must sit where the clamped observed weight is strongly negative"
+        params[1] != 0.0,
+        "the search's entry below the pinned diagonal is kept, got θ = {:?}",
+        &params[..3]
+    );
+
+    let mut ws_eval = GlmmWorkspace::for_cluster_spec(2, &spec, n, &[1], nagq);
+    let dev_at = |ws_eval: &mut GlmmWorkspace, lambda: [f64; 3]| {
+        let mut pr = params.clone();
+        pr[..3].copy_from_slice(&lambda);
+        glmm_agq_deviance(&pr, ws_eval, x.as_ref(), &y, &ids, n, nagq)
+    };
+    // Same Σ, two Λ: the column below the pinned diagonal rotated by a visible
+    // angle against the canonical Λ.
+    let r = (params[1] * params[1] + params[2] * params[2]).sqrt();
+    let canonical = dev_at(&mut ws_eval, [0.0, 0.0, r]);
+    let rotated = dev_at(&mut ws_eval, [0.0, 0.6 * r, 0.8 * r]);
+    assert!(
+        (rotated - canonical).abs() > 1e-4,
+        "AGQ deviance must depend on Λ at fixed Σ here: {rotated} vs {canonical}"
+    );
+
+    let at_fit = dev_at(&mut ws_eval, [params[0], params[1], params[2]]);
+    assert!(
+        (fit.deviance - at_fit).abs() <= 1e-9 * at_fit.abs(),
+        "reported deviance {} vs AGQ deviance at the reported θ̂, β̂ {at_fit}",
+        fit.deviance
+    );
+}
+
+/// Below the fit level: the same check `fit_glmm` runs on its own BOBYQA
+/// outcome (`!(status == Converged && any_within(non_finite_points, x,
+/// rho_begin))`, `glmm::mod.rs`) exercised directly on a plain 1-D `Bobyqa`
+/// run, with no GLMM machinery involved. `f` is a smooth quadratic with its
+/// true minimum at 5.5, except a narrow `+INFINITY` band around 5.0 — not at
+/// the minimum, but close enough (0.5 away) to sit inside `rho_begin` (1.0)
+/// of it. The infeasible band moderates to BOBYQA's finite ceiling
+/// (`FUNCMAX`), so the search still finds and reports the true minimum as
+/// `Converged`; `non_finite_points` (collected the same way `fit_glmm` collects
+/// them) records the evaluations that landed in the band. `any_within` catches
+/// that the reported optimum sits next to one of them, on the same scale the
+/// search started at — the fixture `warm_fit_stalled_next_to_non_finite_evals_
+/// is_not_converged` used to exercise this at the full fit level, until the
+/// PIRLS trust region (`src/glmm/pirls/mod.rs`) made its far warm start
+/// converge honestly and left no fit-level fixture that still triggers this
+/// path (see the bug tracker and `trust-REPORT.md`, "Tests").
+#[test]
+fn non_finite_neighbor_defeats_a_converged_status() {
+    let mut config = bobyqa::Config::new(1);
+    config.rho_begin = 1.0;
+    config.rho_end = 1e-8;
+    let mut solver = bobyqa::Bobyqa::new(1, config).expect("valid 1-D config");
+    let mut non_finite_points = Vec::new();
+    let mut x = [5.0];
+    let out = solver.minimize(
+        |p| {
+            let v = p[0];
+            if (v - 5.0).abs() < 0.02 {
+                non_finite_points.push(v);
+                f64::INFINITY
+            } else {
+                (v - 5.5) * (v - 5.5)
+            }
+        },
+        &mut x,
+        &[-10.0],
+        &[10.0],
+    );
+    assert_eq!(out.status, bobyqa::Status::Converged);
+    assert!(
+        (x[0] - 5.5).abs() < 1e-3,
+        "expected the search to reach the true minimum 5.5, got {}",
+        x[0]
+    );
+    assert!(
+        !non_finite_points.is_empty(),
+        "the search must have crossed the +INFINITY band at least once"
+    );
+    // The exact condition `fit_glmm` checks before trusting a `Converged`
+    // status: this is the case it must catch.
+    assert!(
+        any_within(&non_finite_points, &x, config.rho_begin),
+        "the reported optimum {} must sit within rho_begin of a failed \
+         evaluation for this fixture to test anything",
+        x[0]
     );
 }

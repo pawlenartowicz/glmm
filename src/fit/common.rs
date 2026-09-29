@@ -30,11 +30,11 @@ use super::{Boundary, Diagnostics, Fit, FitOptions, Note};
 /// **What is deliberately NOT here.**
 /// - `aliased`: no fitting arm decides it. Dropping a redundant column is the
 ///   pre-dispatch alias gate's job (`detect_aliased` in `fit_warm`, scattered
-///   back by [`fit_rank_deficient`]), which sits ABOVE the view — every arm's
+///   back by `fit_rank_deficient`), which sits ABOVE the view — every arm's
 ///   own mask is unconditionally all-false, so a field here would always be
 ///   empty and would suggest a per-route decision that does not exist.
 /// - `singular`: it is `boundary_hit == 1` on every route, ORed at
-///   materialization with [`Fit::has_negligible_component`] — which reads the
+///   materialization with `Fit::has_negligible_component` — which reads the
 ///   assembled `varcorr` and so cannot be decided at view level. Both sides of
 ///   that OR are only ever set on a converged fit: `boundary_hit == 1` latches
 ///   only when the fit converged (a capped endpoint stays at `boundary_hit ==
@@ -59,7 +59,7 @@ pub struct FitDiagnostics {
     /// and holds no `Vec`, cannot carry the mask.
     pub pinned_components: u64,
     /// Scale-invariant per-column pivot ratio of the route's own Gram
-    /// ([`crate::ols::min_pivot_ratio`]), and the column attaining it. NaN on
+    /// (`min_pivot_ratio`), and the column attaining it. NaN on
     /// every route and every return that formed no factor to measure — the GLMM
     /// and NB routes record none at all.
     pub pivot: f64,
@@ -88,6 +88,11 @@ pub struct FitDiagnostics {
     /// [`crate::Note::HessianSeFallback`]. `false` on every non-GLMM route and
     /// under `WaldSe::Rx`.
     pub hessian_fallback: bool,
+    /// GLMM-only: the `ExactProfile` route ended not converged and the fit
+    /// reran once on `PqlThenJoint` — see
+    /// [`crate::Note::ExactProfileFallback`]. `false` on every non-GLMM route
+    /// and on every shape that does not route `ExactProfile`.
+    pub exact_profile_fallback: bool,
 }
 
 impl FitDiagnostics {
@@ -105,6 +110,7 @@ impl FitDiagnostics {
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
             hessian_fallback: false,
+            exact_profile_fallback: false,
         }
     }
 }
@@ -137,6 +143,9 @@ pub(super) fn materialize_diagnostics(
     }
     if d.hessian_fallback {
         notes.push(Note::HessianSeFallback);
+    }
+    if d.exact_profile_fallback {
+        notes.push(Note::ExactProfileFallback);
     }
     Diagnostics {
         converged: d.converged,
@@ -591,7 +600,7 @@ pub(crate) fn lmm_fitted(
 /// extra — the layout of both the `ModelSpec` and the `GroupIds` the kernels
 /// see, and of every grouping-indexed result they emit.
 ///
-/// [`spec_sized_from_ids`] is the only producer. Its size rule exchanges the
+/// `spec_sized_from_ids` is the only producer. Its size rule exchanges the
 /// primary with exactly one extra, and only when every grouping is
 /// intercept-only, so each grouping then owns exactly one θ coordinate, one
 /// `varcorr` block, one `pinned` row and one `ranef` block. Undoing the reorder
@@ -1061,7 +1070,10 @@ pub(super) fn fit_rank_deficient(
             | Note::UnusedGroupingLevels { .. }
             | Note::ReDesignScaleSpread { .. }
             | Note::HessianSeFallback
-            | Note::NbShapeUnsettled { .. } => {}
+            | Note::NbShapeUnsettled { .. }
+            | Note::NonIntegerResponse { .. }
+            | Note::SingleLevelGroupingDropped { .. }
+            | Note::ExactProfileFallback => {}
         }
     }
     // Same scatter in two dimensions: an aliased column has no coefficient, so
@@ -1234,11 +1246,11 @@ pub(crate) fn assert_model_shape_pub(model: &ModelSpec, p: usize, nagq: u8) {
     assert_model_shape(model, p, nagq);
 }
 
-/// Crate-internal re-export of [`spec_sized_from_ids`]: the sparse-Z path's
+/// Crate-internal re-export of `spec_sized_from_ids`: the sparse-Z path's
 /// equivalence test (`sparse::tests`) sizes a spec from ids exactly as the stable
 /// `fit_warm` entry does, and the `loop_advanced` surface hands it to loop-tier
 /// consumers (MCPower) so they normalize RE level counts the same validated way
-/// before [`build_workspace`] rather than reimplementing the count derivation.
+/// before [`crate::fit::build_workspace`] rather than reimplementing the count derivation.
 /// Feed all three returned values onward: the ids belong to the sized spec, and
 /// the [`Perm`] is what maps the kernel's grouping-indexed results (θ̂ above all)
 /// back to the order the caller declared.

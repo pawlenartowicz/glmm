@@ -40,7 +40,7 @@ mod kernel;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use kernel::precompute_balanced_collapse;
+pub(crate) use kernel::{precompute_balanced_collapse, DesignQr};
 pub use kernel::{reml_deviance, LmmSuffStats};
 
 /// θ start — DIAGONAL vech entries only; off-diagonals cold-start at 0
@@ -274,7 +274,7 @@ pub struct LmmGroupings {
     pub primary_q: usize,
     /// `[X y]` row indices of the slope covariates (their x_full design columns),
     /// one per slope in declaration order, used to recover the per-level `q_p×q_p`
-    /// Gram from `s`. Empty iff `primary_q == 1`.
+    /// Gram from `s_raw`. Empty iff `primary_q == 1`.
     pub primary_slope_cols: Vec<usize>,
     /// θ-indices of the diagonal variance components (pinnable), in
     /// `boundary_rate_per_component` order: the `q_p` primary vech diagonals
@@ -311,7 +311,7 @@ pub struct LmmGroupings {
     /// to `primary_slope_cols`. Every site that reads that column as a
     /// RANDOM-EFFECT covariate divides by it; the fixed-effect design keeps the
     /// raw column. See [`LmmGroupings::set_slope_scales`] for the identity and
-    /// [`rms_column_scale`] for the statistic. All `1.0` until `set_slope_scales`
+    /// `rms_column_scale` for the statistic. All `1.0` until `set_slope_scales`
     /// runs, and `1.0` divides exactly, so an unset grouping takes the unscaled
     /// arithmetic bit-for-bit.
     pub primary_slope_scales: Vec<f64>,
@@ -427,7 +427,7 @@ impl LmmGroupings {
         Self::from_cluster_spec_ext(cluster, max_n, slope_cols, &[])
     }
 
-    /// As [`from_cluster_spec`], plus the resolved `[X y]` column indices of each
+    /// As [`Self::from_cluster_spec`], plus the resolved `[X y]` column indices of each
     /// extra grouping's slope covariates (`extra_slope_cols[e]`, declaration order;
     /// pass `&[]` for intercept-only extras). The RE *widths* still come from the
     /// `ModelSpec` (`1 + gs.slopes.len()`); these only supply the x-columns the
@@ -680,7 +680,7 @@ impl LmmGroupings {
     /// Blind θ₀ and per-component boxes. Diagonal vech entries (the q_p primary
     /// variances + extra scalars) start at THETA0; off-diagonal vech entries
     /// start at 0. Every entry, diagonal included, gets the signed box
-    /// [−HI, HI]. q_p=1 ⇒ the all-diagonal shape (θ₀ = [THETA0;n]).
+    /// [−HI, HI]. q_p=1 ⇒ the all-diagonal shape (θ₀ = `[THETA0;n]`).
     ///
     /// The diagonals are deliberately NOT boxed at 0. Σ = ΛΛᵀ is unchanged when
     /// a whole column of Λ is negated, so the deviance is even in each block
@@ -900,6 +900,10 @@ impl<T: Scalar> LmmFitScratch<T> {
 pub struct LmmRecovery {
     /// Fixed-effect estimates β̂, predictor-indexed.
     pub betas: Vec<f64>,
+    /// The same estimates on the orthogonalized design `X̃ = X·U⁻¹` the kernels
+    /// accumulate (`DesignQr`): `β̃ = U·β̂`. The conditional-mode recovery reads
+    /// these, since its Grams are on `X̃`.
+    pub beta_tilde: Vec<f64>,
     /// Per-target `Var(β̂_j)`; non-target slots are never written.
     pub var_diag: Vec<f64>,
     /// Per-target `t² = β̂_j²/Var(β̂_j)`; non-target slots are never written.
@@ -918,6 +922,7 @@ impl LmmRecovery {
     pub fn new(p: usize) -> Self {
         LmmRecovery {
             betas: vec![0.0; p],
+            beta_tilde: vec![0.0; p],
             var_diag: vec![0.0; p],
             t_sq: vec![0.0; p],
             u: vec![0.0; p],
@@ -977,6 +982,26 @@ impl LmmKernel {
         match self {
             LmmKernel::Dense { fit, .. } => fit.factor.as_ref(),
             LmmKernel::Sparse { ws, .. } => Self::sparse_ws(ws).factor.as_ref(),
+        }
+    }
+
+    /// The fixed-effect factor `U` the kernel accumulated `X` through.
+    pub(crate) fn design_qr(&self) -> &DesignQr {
+        match self {
+            LmmKernel::Dense { suff, .. } => &suff.design_qr,
+            LmmKernel::Sparse { ws, .. } => &Self::sparse_ws(ws).design_qr,
+        }
+    }
+
+    /// Map the last evaluation's `[X̃ y]` factor to the `[X y]` one in place
+    /// ([`DesignQr::map_factor`]).
+    pub(crate) fn map_factor_to_design(&mut self) {
+        match self {
+            LmmKernel::Dense { suff, fit } => suff.design_qr.map_factor(fit.factor.as_mut()),
+            LmmKernel::Sparse { ws, .. } => {
+                let ws = Self::sparse_ws_mut(ws);
+                ws.design_qr.map_factor(ws.factor.as_mut());
+            }
         }
     }
 
@@ -1092,6 +1117,10 @@ pub struct LmmWorkspace {
     pub lower: Vec<f64>,
     /// Upper box bound, THETA_HI on every entry.
     pub upper: Vec<f64>,
+    /// `family::weight_scale` of the rows `fit::lmm::accumulate_lmm_rows` last
+    /// accumulated (`1.0` unweighted): the kernel runs on ŵ = w/s, so its σ̂²
+    /// is the raw-scale σ̂² divided by s.
+    pub(crate) weight_scale: f64,
 }
 
 impl LmmWorkspace {
@@ -1192,6 +1221,7 @@ impl LmmWorkspace {
             theta,
             lower,
             upper,
+            weight_scale: 1.0,
         }
     }
 
@@ -1217,6 +1247,7 @@ impl LmmWorkspace {
             theta,
             lower,
             upper,
+            weight_scale: 1.0,
         }
     }
 
@@ -1267,13 +1298,20 @@ pub fn primary_lambda<T: Scalar>(theta: &[T], q: usize, lam: &mut [T]) {
 /// to exactly 0, and re-run the pin test on the result.
 ///
 /// At a pinned diagonal `Λ_jj = 0` the entries BELOW it in column `j` are not
-/// identified: rotating that column leaves `Σ = ΛΛ′` — and so the deviance, β̂,
-/// û, `varcorr` and `ranef` — unchanged, so BOBYQA can stop anywhere on that
-/// flat circle. Re-factoring Σ with a semidefinite-tolerant lower Cholesky
-/// picks the one representative whose redundant column is exactly zero: the
-/// mass below a pinned diagonal folds into the trailing diagonals, where it is
-/// a variance component the caller can read. Σ is preserved by construction, so
-/// this changes the coordinate, not the fit.
+/// identified by Σ: rotating that column leaves `Σ = ΛΛ′` unchanged, and with
+/// it the REML and Laplace deviances, β̂, `varcorr` and `ranef` — so BOBYQA can
+/// stop anywhere on that flat circle. Re-factoring Σ with a
+/// semidefinite-tolerant lower Cholesky picks the one representative whose
+/// redundant column is exactly zero: the mass below a pinned diagonal folds
+/// into the trailing diagonals, where it is a variance component the caller
+/// can read. Σ is preserved by construction, so under those objectives this
+/// changes the coordinate, not the fit.
+///
+/// The vector AGQ deviance is NOT a function of Σ alone: its product
+/// Gauss–Hermite grid sits in the `u = Λ⁻¹b` coordinates, so the same Σ under
+/// a rotated Λ integrates to a different value. `glmm::fit_glmm` therefore
+/// canonicalizes only a copy on its AGQ route, for the pin flags, and keeps the
+/// search's own Λ.
 ///
 /// `Diagnostics::pinned` depends on it: without this fold, a column with a
 /// live off-diagonal would be called a zero variance component.
@@ -1472,8 +1510,8 @@ fn canonicalize_block(vech: &mut [f64], q: usize) -> bool {
 
 /// Per-level primary Gram G_f (q×q, row-major) recovered from suff stats into
 /// `gram`, no new accumulator: G[0][0]=n_f; G[0][a]=G[a][0]=Σ x_{a-1} over f;
-/// G[a][b]=Σ x_{a-1} x_{b-1} over f. The slope covariates are [X y] rows, so
-/// every entry sits in `s`. Component d's RE col at level f is `d·n_primary + f`
+/// G[a][b]=Σ x_{a-1} x_{b-1} over f. The slope covariates are raw-`x` rows, so
+/// every entry sits in `s_raw`. Component d's RE col at level f is `d·n_primary + f`
 /// (mirrors `from_cluster_spec`'s RE-column layout — change together).
 fn primary_gram<T: Scalar>(
     suff: &LmmSuffStats,
@@ -1488,17 +1526,17 @@ fn primary_gram<T: Scalar>(
     }
     gram[0] = T::from_f64(suff.counts[f]); // G[0][0]
     for a in 1..q {
-        // `s`'s COLUMN carries the RE column's own internal scale (divided in at
-        // accumulation), but its ROW is the raw `[X y]` entry — so a Gram between
+        // `s_raw`'s COLUMN carries the RE column's own internal scale (divided in
+        // at accumulation), but its ROW is the raw `x` entry — so a Gram between
         // two RE columns picks up only one of the two divisions here and needs the
         // row side applied explicitly. Intercept rows have scale 1 by construction.
         let s_a = g.primary_slope_scales[a - 1];
-        let sa = T::from_f64(suff.s[(g.primary_slope_cols[a - 1], f)] / s_a); // Σ z_{a-1} over f
+        let sa = T::from_f64(suff.s_raw[(g.primary_slope_cols[a - 1], f)] / s_a); // Σ z_{a-1} over f
         gram[a] = sa;
         gram[a * q] = sa;
         for b in 1..=a {
             // Σ z_{a-1} z_{b-1} over f — slope_{a-1}'s subcol against slope_{b-1}'s level.
-            let v = T::from_f64(suff.s[(g.primary_slope_cols[a - 1], b * n_prim + f)] / s_a);
+            let v = T::from_f64(suff.s_raw[(g.primary_slope_cols[a - 1], b * n_prim + f)] / s_a);
             gram[a * q + b] = v;
             gram[b * q + a] = v;
         }
@@ -1563,7 +1601,7 @@ fn assemble_fam_a<T: Scalar>(
                                                               // Composed nested children (rows/cols q..q+np). Scalar child λ = θ_n;
                                                               // child–child off-diagonals are 0 (children never
                                                               // co-occur). The primary↔child off-diagonal A[(q+c, e)] folds the raw
-                                                              // cross-Gram (intercept = counts[child]; slope d = s[(slope_col_d,
+                                                              // cross-Gram (intercept = counts[child]; slope d = s_raw[(slope_col_d,
                                                               // child_re_col)]) through Λ_p, mirroring how the scalar path reads counts for the
                                                               // intercept↔child term. n_primary = primary level count (slope RE
                                                               // stride); np = children per parent (nested width) — kept distinct.
@@ -1580,14 +1618,14 @@ fn assemble_fam_a<T: Scalar>(
             for e in 0..q {
                 let mut acc = T::ZERO;
                 for d in e..q {
-                    // `s`-ROW read of a slope covariate ⇒ apply the internal scale
+                    // `s_raw`-ROW read of a slope covariate ⇒ apply the internal scale
                     // (the column here is the child's intercept, scale 1); see
                     // `primary_gram` for why the row side is not already divided.
                     let graw_d = if d == 0 {
                         n_c
                     } else {
                         T::from_f64(
-                            suff.s[(g.primary_slope_cols[d - 1], gcol)]
+                            suff.s_raw[(g.primary_slope_cols[d - 1], gcol)]
                                 / g.primary_slope_scales[d - 1],
                         )
                     };
@@ -2027,10 +2065,10 @@ pub struct LmmFit {
     /// optimizer/numerical failure — finite on a `MaxFunReached` endpoint.
     pub deviance: f64,
     /// Scale-invariant per-column pivot ratio of X'V⁻¹X at θ̂
-    /// ([`crate::ols::min_pivot_ratio`]), with `pivot_col` the column attaining
+    /// (`min_pivot_ratio`), with `pivot_col` the column attaining
     /// it. **Detection only** — no branch in this route reads it, and none may
     /// start to; see the measurement recorded at the computation site. Below
-    /// [`PIVOT_MIN`] the coefficients are barely identified and the diagnostics
+    /// `PIVOT_MIN` the coefficients are barely identified and the diagnostics
     /// channel says so. NaN when the deviance re-eval left no trustworthy
     /// factor to measure.
     pub pivot: f64,
@@ -2296,7 +2334,8 @@ pub fn fit_lmm(
         // degenerate coordinate, and can expose a trailing diagonal that pins.
         // The flags are rebuilt from scratch rather than OR'd. Nothing moves
         // unless a diagonal pinned, so an interior fit stays bit-identical, and
-        // the pinned re-eval below runs on the canonicalized θ.
+        // the pinned re-eval below runs on the canonicalized θ. The GLMM pin
+        // site departs from this on its AGQ route; the reason is written there.
         if canonicalize_pinned_blocks(kernel.groupings(), theta) {
             pinned = false;
             pinned_components = 0;
@@ -2324,6 +2363,23 @@ pub fn fit_lmm(
     } else {
         f64::INFINITY
     };
+
+    // The kernel factored `[X̃ y]`, X̃ = X·U⁻¹ (`DesignQr`). β̃ comes off that
+    // factor first, by the backward solve L̃_XXᵀ β̃ = l_yX̃ (the y row of the
+    // augmented factor is index p): the conditional-mode recovery works on X̃.
+    // Then the factor maps to `[X y]`, which is what the pivot, Var(β̂) and the
+    // joint Wald below read.
+    if dev.is_finite() {
+        let factor = kernel.factor();
+        for j in (0..p).rev() {
+            let mut acc = factor[(p, j)];
+            for k in (j + 1)..p {
+                acc -= factor[(k, j)] * recovery.beta_tilde[k];
+            }
+            recovery.beta_tilde[j] = acc / factor[(j, j)];
+        }
+        kernel.map_factor_to_design();
+    }
 
     // Ill-conditioning DETECTION on the leading p×p block of the augmented
     // factor, i.e. on X'V⁻¹X at θ̂. This route does not refuse at any pivot
@@ -2372,16 +2428,11 @@ pub fn fit_lmm(
         };
     }
 
-    // β̂: backward solve L_XXᵀ β̂ = l_yX, where l_yX[j] = factor[(p, j)] (the
-    // y-row of the augmented factor) — the once-at-θ̂ backsolve.
+    // β̂ = U⁻¹β̃ — two triangular solves (L̃_XXᵀ above, U here) rather than
+    // one against the mapped factor Uᵀ·L̃_XX, which would round the product.
+    recovery.betas.copy_from_slice(&recovery.beta_tilde);
+    kernel.design_qr().map_beta(&mut recovery.betas);
     let factor = kernel.factor();
-    for j in (0..p).rev() {
-        let mut acc = factor[(p, j)];
-        for k in (j + 1)..p {
-            acc -= factor[(k, j)] * recovery.betas[k];
-        }
-        recovery.betas[j] = acc / factor[(j, j)];
-    }
 
     // Var(β̂_j) = σ̂²·‖L_XX⁻¹e_j‖² per target; t² = β̂²/Var, via a forward
     // solve on this factor.
@@ -2439,7 +2490,7 @@ pub fn fit_lmm(
     // Conditional modes, last: it reads β̂ and reuses the evaluation's own
     // scratch, so it must come after every step that reads the factor state the
     // θ̂ evaluation left.
-    kernel.recover_ranef(theta, &recovery.betas);
+    kernel.recover_ranef(theta, &recovery.beta_tilde);
 
     LmmFit {
         sigma_sq,

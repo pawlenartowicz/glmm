@@ -261,11 +261,12 @@ jobs:
         run: pip install --find-links python/dist glmm
       - name: Install test + lint deps
         # ruff pinned so a new release's rule/formatter changes can't break CI
-        # mid-release (0.16.0 did exactly that); bump deliberately. pandas is
-        # not a package dependency — it is installed here only so the
-        # pandas-categorical `.cat`-accessor branch runs under test instead of
-        # skipping itself.
-        run: pip install pytest pandas ruff==0.16.0
+        # mid-release (0.16.0 did exactly that); bump deliberately. pandas and
+        # pyarrow are not package dependencies — they are installed here only
+        # so the pandas-categorical `.cat`-accessor branch and the pyarrow
+        # Table/ChunkedArray branches run under test instead of skipping
+        # themselves.
+        run: pip install pytest pandas pyarrow ruff==0.16.0
       - name: pytest against the installed wheel, run outside the source tree
         run: |
           cd "$RUNNER_TEMP"

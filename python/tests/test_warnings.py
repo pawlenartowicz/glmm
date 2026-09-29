@@ -2,6 +2,7 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import glmm
@@ -13,6 +14,35 @@ FIXED = {"x": _X, "y": _Y}
 _G = [f"g{i % 5}" for i in range(20)]
 _OFF = {"g0": -3.0, "g1": -1.5, "g2": 0.0, "g3": 1.5, "g4": 3.0}
 MIXED = {"x": _X, "g": _G, "y": [y + _OFF[g] for y, g in zip(_Y, _G)]}
+
+# A single fixture that raises four notes of three kinds from one call: two
+# argument_ignored notes (dispersion=, nagq= — both inapplicable on a
+# Gaussian model) plus the formula lowering's own unused_grouping_levels and
+# re_design_scale_spread, from one declared-but-empty group level ("g_mid",
+# between two used ones) and one random slope on a much larger scale than the
+# implicit intercept. Five groups, eight rows each — same shape as the Rust
+# fixture this mirrors (`re_design_scale_spread_note_fires_on_mismatched_slope_scale`,
+# src/fit/common_tests.rs). All four are lowering-time or argument-clearing
+# checks, not solver convergence, so the fit is deterministic and clean
+# (no singular/ill_conditioned notes to filter out).
+_PARITY_Z_SCALE = 1.0e4
+_PARITY_N_GROUPS = 5
+_PARITY_PER_GROUP = 8
+_parity_z = []
+_parity_y = []
+_parity_g = []
+for _gi in range(_PARITY_N_GROUPS):
+    for _j in range(_PARITY_PER_GROUP):
+        _jitter = _j - (_PARITY_PER_GROUP - 1) / 2.0
+        _zv = _PARITY_Z_SCALE + _jitter
+        _parity_z.append(_zv)
+        _parity_y.append(1.0 + 0.1 * _zv / _PARITY_Z_SCALE + 0.05 * _gi)
+        _parity_g.append(f"g{_gi}")
+PARITY = {
+    "z": _parity_z,
+    "g": pd.Categorical(_parity_g, categories=["g0", "g1", "g2", "g_mid", "g3", "g4"]),
+    "y": _parity_y,
+}
 
 
 def printed(entry):
@@ -45,7 +75,7 @@ def test_clean_fit_stores_an_empty_list():
         ),
         (
             {"formula": "y ~ x", "warm_start": {"beta": [0.0, 0.0], "phi": 1.0, "b": 2}},
-            "warm_start accepts only 'beta' and 'theta'; these keys were ignored: phi, b.",
+            "warm_start accepts only 'beta' and 'theta'; these entries were ignored: phi, b.",
         ),
     ],
 )
@@ -139,8 +169,8 @@ def test_constructed_notes_store_with_their_tier_and_title():
             glmm.UnusedGroupingLevelsWarning,
             (
                 "Grouping factor 'g' has levels with no rows (z, w). They stay in the model with "
-                "random effects of exactly zero and are counted in the number of groups. Remove "
-                "unused categories before fitting."
+                "random effects of exactly zero, but they are not counted in the number of "
+                "groups. Remove unused categories before fitting."
             ),
         ),
         (
@@ -154,6 +184,15 @@ def test_constructed_notes_store_with_their_tier_and_title():
             ),
         ),
         (
+            dict(base, kind="single_level_grouping_dropped", detail="onegroup"),
+            glmm.SingleLevelGroupingDroppedWarning,
+            (
+                "Grouping factor 'onegroup' has only one level, so no variance between "
+                "groups can be estimated from it. Its random effect was dropped; the rest "
+                "of the model was fitted without it."
+            ),
+        ),
+        (
             dict(base, kind="hessian_se_fallback"),
             glmm.HessianSeFallbackWarning,
             (
@@ -161,6 +200,15 @@ def test_constructed_notes_store_with_their_tier_and_title():
                 "Its standard errors tend to be too small, so p-values and confidence intervals "
                 "may look more precise than they are. Standard errors for the random-effect "
                 "standard deviations are not available."
+            ),
+        ),
+        (
+            dict(base, kind="exact_profile_fallback"),
+            glmm.ExactProfileFallbackWarning,
+            (
+                "The default search method for this model did not settle on an answer, so the "
+                "fit tried a different search method from the same starting point. The reported "
+                "estimates come from whichever method reached the better answer."
             ),
         ),
         (
@@ -185,7 +233,7 @@ def test_constructed_notes_store_with_their_tier_and_title():
             dict(base, kind="from_the_future"),
             glmm.DiagnosticWarning,
             (
-                "The solver reported something ('from_the_future') that this version of glmm "
+                "The solver reported something ('from_the_future') that this installed version "
                 "does not recognize. Please report it at "
                 "https://github.com/pawlenartowicz/glmm/issues."
             ),
@@ -201,6 +249,42 @@ def test_constructed_notes_store_with_their_tier_and_title():
         tier, title = glmm._WARNING_KINDS.get(note["kind"], glmm._UNKNOWN_KIND)
         assert entry == {"tier": tier, "kind": note["kind"], "title": title, "message": message}
         assert str(caught[0].message) == printed(entry)
+
+
+def test_single_level_grouping_dropped_and_other_grouping_still_fits():
+    # "onegroup" has one level; "h" has real groups. The random effect for
+    # "onegroup" is dropped with a warning, and "h" is promoted to primary
+    # and still fitted.
+    n = 40
+    h = [f"h{i % 4}" for i in range(n)]
+    x = [float(i) for i in range(n)]
+    y = [1.0 + 0.2 * xv + (0.5 if hv in ("h0", "h1") else -0.5) for xv, hv in zip(x, h)]
+    data = {"y": y, "x": x, "onegroup": ["only"] * n, "h": h}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit(data, "y ~ x + (1 | onegroup) + (1 | h)")
+    entry = only(m, "single_level_grouping_dropped")
+    assert entry["message"].startswith("Grouping factor 'onegroup' has only one level")
+    assert [group for group, _ in m.re_groups] == ["h"]
+    assert len(m.varcorr) == 1
+
+
+def test_every_grouping_single_level_fits_as_a_model_without_random_effects():
+    # Both declared groupings are single-level: the fit routes exactly like
+    # "y ~ x" (OLS here), keeping both warnings.
+    n = 20
+    x = [float(i) for i in range(n)]
+    y = [1.0 + 0.2 * xv for xv in x]
+    data = {"y": y, "x": x, "g1": ["only"] * n, "g2": ["one"] * n}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit(data, "y ~ x + (1 | g1) + (1 | g2)")
+    kinds = [w["kind"] for w in m.warnings]
+    assert kinds.count("single_level_grouping_dropped") == 2
+    assert m.converged
+    assert m.re_groups == []
+    assert m.varcorr == []
+    assert m.ranef.size == 0
 
 
 def test_pirls_exhausted_is_raised_only_on_a_converged_final_eval():
@@ -663,6 +747,10 @@ def test_kind_table_matches_warnings_md():
     for line in _WARNINGS_MD.read_text(encoding="utf-8").splitlines():
         if line.startswith("## Warnings"):
             in_table = True
+        elif line.startswith("## Errors"):
+            # The warnings table ends here; the rest of the page is errors,
+            # which have no `kind` and are not part of this contract.
+            break
         elif in_table and line.startswith("| ") and not line.startswith(("| Kind", "|---")):
             kind, tier, title = (c.strip() for c in line.split("|")[1:4])
             rows.add((kind.strip("`"), tier.lower(), title))
@@ -679,4 +767,397 @@ def test_port_parity_sequence():
     assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
         ("note", "argument_ignored", "Argument ignored"),
         ("note", "argument_ignored", "Argument ignored"),
+    ]
+
+
+def test_port_parity_sequence_adds_three_more_kinds():
+    # Same PARITY fixture and call in r/tests/testthat/test-warnings.R —
+    # change together. Broader than test_port_parity_sequence above: one
+    # fixture, four notes across three kinds not covered there
+    # (argument_ignored fires twice, from two different arguments;
+    # unused_grouping_levels and re_design_scale_spread are new).
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit(PARITY, "y ~ z + (1 + z | g)", dispersion=2.0, nagq=3)
+    assert m.converged
+    assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
+        ("note", "argument_ignored", "Argument ignored"),
+        ("note", "argument_ignored", "Argument ignored"),
+        ("note", "unused_grouping_levels", "Unused grouping levels"),
+        ("note", "re_design_scale_spread", "Random-effect predictors on very different scales"),
+    ]
+
+
+def test_port_parity_non_integer_response():
+    # Same fixture and call in r/tests/testthat/test-warnings.R — change
+    # together. Intercept-only Poisson, mirrors the Rust unit test
+    # poisson_non_integer_response_is_noted (src/fit/common_tests.rs).
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit({"y": [1.0, 2.5, 3.0, 4.0]}, "y ~ 1", "poisson")
+    assert m.converged
+    assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
+        ("caution", "non_integer_response", "Non-integer response"),
+    ]
+
+
+def test_port_parity_ill_conditioned():
+    # Same fixture and call in r/tests/testthat/test-warnings.R — change
+    # together. Same data as test_ill_conditioned_is_stored_and_printed above.
+    n, split = 60, 40
+    a = [((i * 13) % 17) - 8.0 for i in range(n)]
+    b = [a[i] + (0.0 if i < split else 1.0) for i in range(n)]
+    y = [0.5 + 1.3 * a[i] + 0.477 * b[i] + ((i % 3) - 1.0) for i in range(n)]
+    w = [1.0 if i < split else 1e-11 for i in range(n)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit({"y": y, "a": a, "b": b}, "y ~ a + b", weights=w)
+    assert m.converged
+    assert [(w2["tier"], w2["kind"], w2["title"]) for w2 in m.warnings] == [
+        ("caution", "ill_conditioned", "Nearly collinear columns"),
+    ]
+
+
+def test_port_parity_rows_dropped_na():
+    # Same fixture and call in r/tests/testthat/test-warnings.R — change
+    # together. One NaN in x drops one of four rows.
+    data = {"x": [1.0, 2.0, float("nan"), 4.0], "y": [2.1, 3.9, 8.2, 8.1]}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit(data, "y ~ x")
+    assert m.converged
+    assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
+        ("caution", "rows_dropped_na", "Rows dropped for missing values"),
+    ]
+    (entry,) = m.warnings
+    assert entry["message"] == (
+        "Dropped 1 of 4 row(s): a column the formula uses had a missing value there."
+    )
+
+
+def test_port_parity_agq_fallback():
+    # Same fixture and call in r/tests/testthat/test-warnings.R — change
+    # together. Same data as test_agq_fallback_is_stored_and_printed above:
+    # a binomial model with two grouping factors, outside what AGQ covers.
+    data = dict(MIXED, y=[float(v > 0) for v in MIXED["y"]], h=[f"h{i % 4}" for i in range(20)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit(data, "y ~ x + (1 | g) + (1 | h)", "binomial", nagq=3)
+    assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
+        ("caution", "agq_fallback", "Adaptive quadrature not used"),
+    ]
+
+
+# Same 120-row binomial GLMM fixture as test_singular_is_stored_and_printed
+# above, and the same literal data in r/tests/testthat/test-warnings.R (R and
+# numpy RNGs do not agree, so the fixture is generated once and both files
+# carry the resulting numbers, not the generator) — change together.
+_SINGULAR_X = [
+    0.34558419206478602,
+    0.82161814350115836,
+    0.33043707618338714,
+    -1.3031572316043609,
+    0.90535586667311774,
+    0.44637457236401129,
+    -0.53695323536028516,
+    0.58111810419635312,
+    0.36457239618607573,
+    0.29413249665552599,
+    0.028422241315796789,
+    0.54671298661244694,
+    -0.73645408700166692,
+    -0.16290994799305278,
+    -0.48211931267997826,
+    0.59884621263462756,
+    0.03972210748165899,
+    -0.29245675096508861,
+    -0.78190846235684208,
+    -0.25719224061887069,
+    0.0081421805183435076,
+    -0.27560290529937043,
+    1.2940638143982073,
+    1.0067243153057943,
+    -2.7111624789659685,
+    -1.8890132459676727,
+    -0.17477209205516195,
+    -0.42219041157635356,
+    0.2136429974986111,
+    0.21732193102256359,
+    2.1178387550510482,
+    -1.1120207626922813,
+    -0.37760500712699807,
+    2.0427716074923303,
+    0.6467029962018469,
+    0.66306337237626167,
+    -0.51400637168746288,
+    -1.6480751708556527,
+    0.16746474422274113,
+    0.10901408782154753,
+    -1.2273520542445742,
+    -0.68322666178056224,
+    -0.07204367972722743,
+    -0.94475162306077742,
+    -0.098269967852217269,
+    0.095483027469454335,
+    0.035586237055485713,
+    -0.50629165831431477,
+    0.59374807178582278,
+    0.89116695428232839,
+    0.32084830456656371,
+    -0.81823022739030704,
+    0.73165228378544078,
+    -0.50144001846705233,
+    0.87916061828798531,
+    -1.0717874168774442,
+    0.91446720312878116,
+    -0.020063454615480422,
+    -1.2487488903344155,
+    -0.31389947196684775,
+    0.054102278771543888,
+    0.27279133916445375,
+    -0.98218812494097774,
+    -1.107373047165193,
+    0.19958453284708083,
+    -0.46674961687980204,
+    0.23550561173022522,
+    0.75951952247837917,
+    -1.6487873663509485,
+    0.25438811651761728,
+    1.2246469675357323,
+    -0.29752684437047322,
+    -0.81081458323756994,
+    0.75224382717959282,
+    0.25344651620814146,
+    0.89588307077756035,
+    -0.34521571005127971,
+    -1.4818182737222112,
+    -0.11001076471125099,
+    -0.44582815301123219,
+    0.77532382204757411,
+    0.1936328483771538,
+    -1.6308492324351012,
+    -1.1951630801031998,
+    0.88378903658725527,
+    0.67976501741784656,
+    -0.64024336590848874,
+    -0.001048796567280681,
+    0.44557355377618613,
+    0.46840433584727792,
+    0.87624219611435006,
+    0.25648562722156198,
+    -0.094828338968498169,
+    -0.25884806478784556,
+    1.0557428005332512,
+    -2.2508542750785376,
+    -0.13865532509133732,
+    0.033000103984060107,
+    -1.4253489608701877,
+    0.33281361313804664,
+    -0.65128101244339398,
+    0.86244479631574678,
+    -0.1255920840343272,
+    0.66915324078945282,
+    1.2188436051712233,
+    0.38292958271347238,
+    -0.87572114342284546,
+    -1.5143186317046384,
+    1.7533841175163727,
+    -0.11129219318751944,
+    -0.68856494763432163,
+    0.14425708806082496,
+    -0.19141133048264922,
+    0.85214226421268768,
+    0.033928182437100288,
+    0.013749583618419497,
+    -0.71457972103296408,
+    0.46956809874749339,
+    -1.0338667223549824,
+    0.66588943976396708,
+]
+_SINGULAR_Y = [
+    0,
+    0,
+    1,
+    0,
+    1,
+    1,
+    0,
+    1,
+    1,
+    1,
+    0,
+    0,
+    1,
+    0,
+    1,
+    1,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    1,
+    0,
+    1,
+    0,
+    0,
+    0,
+    1,
+    1,
+    1,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    0,
+    1,
+    1,
+    1,
+    1,
+    0,
+    1,
+    1,
+    1,
+    0,
+    0,
+    0,
+    1,
+    0,
+    1,
+    1,
+    1,
+    1,
+    0,
+    0,
+    1,
+    1,
+    1,
+    0,
+    0,
+    1,
+    0,
+    1,
+    0,
+    0,
+    1,
+    1,
+    0,
+    1,
+    0,
+    1,
+    1,
+    0,
+    1,
+    0,
+    0,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    0,
+    0,
+    1,
+    1,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+]
+
+
+def test_port_parity_singular():
+    data = {
+        "x": _SINGULAR_X,
+        "g": [f"g{i}" for i in np.repeat(np.arange(30), 4).tolist()],
+        "y": [float(v) for v in _SINGULAR_Y],
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit(data, "y ~ x + (1 | g)", "binomial")
+    assert m.converged
+    assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
+        ("caution", "singular", "Singular fit"),
+    ]
+
+
+# 12-row Gamma-inverse GLMM, 4 clusters of 3 — the exact fixture
+# `gamma_inverse_adversarial(1e-2)` builds in src/fit/glmm_tests.rs, with the
+# same literal data in r/tests/testthat/test-warnings.R — change together.
+# Rows 3..6 (the second cluster) are scaled by 1e-2, spreading the 12 means
+# over about ten decades, which is what makes the joint Hessian non-PD.
+_HSE_X1 = [
+    -0.2884326052962697,
+    0.15675840297260962,
+    -0.29990566105127503,
+    0.3053648563367106,
+    -0.608001199771249,
+    1.451281361998219,
+    -0.12817918698856592,
+    0.2873778743945057,
+    1.2188666482896826,
+    -1.2520230368147756,
+    -0.01938374443978608,
+    1.0354827975218956,
+]
+_HSE_Y = [
+    0.013147681629338537,
+    0.022571111060908807,
+    0.009380481267257667,
+    13915684.733974772 * 1e-2,
+    16148934.63843452 * 1e-2,
+    47449285.58840935 * 1e-2,
+    0.03659612272549357,
+    0.03340213953300986,
+    0.16526466878896995,
+    2288.1399088594685,
+    5963.477254271042,
+    19049.155692047607,
+]
+
+
+def test_port_parity_hessian_se_fallback():
+    data = {
+        "x": _HSE_X1,
+        "g": [f"g{i // 3}" for i in range(12)],
+        "y": _HSE_Y,
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit(data, "y ~ x + (1 | g)", "gamma", link="inverse")
+    assert m.converged
+    assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
+        ("caution", "hessian_se_fallback", "Simpler standard errors used"),
     ]
