@@ -675,21 +675,31 @@ mod tests {
         g
     }
 
-    /// col2 = col0 + col1 exactly → column 2 is aliased (dropped), 0 and 1 kept.
+    /// A dependent column is dropped and the earlier ones kept: col2 = col0 +
+    /// col1 exactly → column 2 aliased; an exact duplicate (col1 == col0) → the
+    /// LATER column (1) aliased.
     #[test]
-    fn aliased_columns_flags_dependent_last() {
-        let n = 4;
-        let p = 3;
-        // rows: [1, days, 1+days]
-        let x = vec![
-            1.0, 0.0, 1.0, //
-            1.0, 1.0, 2.0, //
-            1.0, 2.0, 3.0, //
-            1.0, 3.0, 4.0, //
+    fn aliased_columns_flags_the_later_dependent_column() {
+        let cases: [(Vec<f64>, usize, usize, Vec<bool>); 2] = [
+            // rows: [1, days, 1+days]
+            (
+                vec![
+                    1.0, 0.0, 1.0, //
+                    1.0, 1.0, 2.0, //
+                    1.0, 2.0, 3.0, //
+                    1.0, 3.0, 4.0, //
+                ],
+                4,
+                3,
+                vec![false, false, true],
+            ),
+            (vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0], 3, 2, vec![false, true]),
         ];
-        let g = gram_of(&x, n, p);
-        let a = super::aliased_columns(g.as_ref(), p, super::ALIAS_EPS);
-        assert_eq!(a, vec![false, false, true]);
+        for (x, n, p, want) in cases {
+            let g = gram_of(&x, n, p);
+            let a = super::aliased_columns(g.as_ref(), p, super::ALIAS_EPS);
+            assert_eq!(a, want, "n={n} p={p}");
+        }
     }
 
     /// Full-rank design → no column aliased.
@@ -701,17 +711,6 @@ mod tests {
         let g = gram_of(&x, n, p);
         let a = super::aliased_columns(g.as_ref(), p, super::ALIAS_EPS);
         assert_eq!(a, vec![false, false]);
-    }
-
-    /// Exact duplicate (col1 == col0) → the LATER column (1) is dropped.
-    #[test]
-    fn aliased_columns_drops_later_duplicate() {
-        let n = 3;
-        let p = 2;
-        let x = vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
-        let g = gram_of(&x, n, p);
-        let a = super::aliased_columns(g.as_ref(), p, super::ALIAS_EPS);
-        assert_eq!(a, vec![false, true]);
     }
 
     // ---------------------------------------------------------------------
@@ -971,54 +970,7 @@ mod tests {
     // ols_contrast_t_sq unit tests
     // -----------------------------------------------------------------------
 
-    /// `ols_contrast_t_sq` is symmetric under swapping `p_col` and
-    /// `n_col` — the beta difference is negated but squared away, and ‖L⁻¹c‖²
-    /// is identical for c and −c. A broken kernel that forgot to square the
-    /// numerator (or used a one-sided statistic) would fail. The result must
-    /// also be a positive finite value, not a pinned number.
-    #[test]
-    fn ols_contrast_t_sq_is_symmetric() {
-        let p = 3;
-        let mut factor = Mat::<f64>::zeros(p, p);
-        factor[(0, 0)] = 2.0;
-        factor[(1, 0)] = 1.0;
-        factor[(1, 1)] = 3.0;
-        factor[(2, 1)] = 1.0;
-        factor[(2, 2)] = 4.0;
-
-        let betas = [0.5_f64, 1.2, -0.7];
-        let var_diag = [0.0_f64; 3];
-        let t_sq_dummy = [0.0_f64; 3];
-
-        let fit = OlsFitView {
-            betas: &betas,
-            var_diag: &var_diag,
-            t_sq: &t_sq_dummy,
-            factor: factor.as_ref(),
-            sigma_sq: 0.4,
-            df_resid: 10,
-            converged: true,
-            rss: 0.0,
-            sst: 0.0,
-            pivot: 1.0,
-            pivot_col: 0,
-        };
-
-        let mut scratch = vec![0.0_f64; p];
-        let forward = ols_contrast_t_sq(&fit, 1, 2, &mut scratch);
-        let reversed = ols_contrast_t_sq(&fit, 2, 1, &mut scratch);
-
-        assert!(
-            forward.is_finite() && forward > 0.0,
-            "contrast t² must be positive finite"
-        );
-        assert!(
-            (forward - reversed).abs() / forward.abs().max(1.0) < 1e-12,
-            "contrast t² must be symmetric under p/n swap: {forward} vs {reversed}"
-        );
-    }
-
-    /// Golden contrast t² — the symmetry test above is blind to a `−`→`+` swap in
+    /// Golden contrast t² — a symmetry check alone is blind to a `−`→`+` swap in
     /// the β-difference and to `*`↔`/` in `(β_p−β_n)²/var` (both survive because the
     /// p/n swap cancels the operator change). Pin an exact value to close that gap.
     ///
@@ -1073,36 +1025,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn contrast_t_sq_returns_nan_on_non_converged() {
-        let p = 2;
-        let factor = Mat::<f64>::zeros(p, p);
-        let betas = [0.0_f64, 1.0];
-        let var_diag = [0.0_f64; 2];
-        let t_sq_dummy = [0.0_f64; 2];
-        let fit = OlsFitView {
-            betas: &betas,
-            var_diag: &var_diag,
-            t_sq: &t_sq_dummy,
-            factor: factor.as_ref(),
-            sigma_sq: 1.0,
-            df_resid: 10,
-            converged: false,
-            rss: f64::NAN,
-            sst: f64::NAN,
-            pivot: f64::NAN,
-            pivot_col: 0,
-        };
-        let mut scratch = vec![0.0_f64; p];
-        let got = ols_contrast_t_sq(&fit, 0, 1, &mut scratch);
-        assert!(got.is_nan(), "non-converged fit must return NaN, got={got}");
-    }
-
     /// `ols_contrast_t_sq`'s bounds guard — `p_col >= p`, `n_col >= p`, or
     /// `scratch.len() < p` — on a fit that otherwise converges and would
     /// return a real value, so the guard itself is what is under test, not
-    /// the earlier `!converged` short-circuit. Reuses the symmetry test's
-    /// fixture (p=3) to confirm in-range indices still compute normally.
+    /// the earlier `!converged` short-circuit. A p=3 factor confirms in-range
+    /// indices still compute normally; the last assertion flips `converged` on
+    /// the same otherwise-valid fit and must get NaN.
     #[test]
     fn contrast_t_sq_bounds_checks_return_nan() {
         let p = 3;
@@ -1147,6 +1075,12 @@ mod tests {
             ols_contrast_t_sq(&fit, 1, 2, &mut scratch).is_finite(),
             "the same indices, in range with full-length scratch, must compute normally"
         );
+        let not_converged = OlsFitView {
+            converged: false,
+            ..fit
+        };
+        let got = ols_contrast_t_sq(&not_converged, 1, 2, &mut scratch);
+        assert!(got.is_nan(), "non-converged fit must return NaN, got={got}");
     }
 
     /// `triangular_solve_norm_sq`'s near-zero-diagonal guard has never run:

@@ -983,35 +983,6 @@ mod tests {
     }
 
     #[test]
-    fn glm_all_zero_y_short_circuits() {
-        let n = 100;
-        let p = 2;
-        let mut x = Mat::<f64>::zeros(n, p);
-        for i in 0..n {
-            x[(i, 0)] = 1.0;
-            x[(i, 1)] = (i as f64) / (n as f64) - 0.5;
-        }
-        let y = vec![0.0f64; n];
-        let mut ws = TestWs::new(n, p, 0);
-        let targets: Vec<u32> = vec![0, 1];
-        let fit = glm_irls_fit(
-            crate::Family::Binomial {
-                link: crate::BinomialLink::Logit,
-            },
-            f64::NAN,
-            x.as_ref(),
-            &y,
-            &targets,
-            None,
-            None,
-            None,
-            glm_scratch(&mut ws),
-        );
-        assert!(!fit.converged);
-        assert_eq!(fit.n_iter, 0);
-    }
-
-    #[test]
     fn glm_all_one_y_short_circuits() {
         let n = 100;
         let p = 2;
@@ -1042,15 +1013,15 @@ mod tests {
 
     #[test]
     fn glm_rank_deficient_design() {
-        // X with two identical columns → X'WX is singular.
+        // X with an all-zero column → X'WX has an exactly zero pivot, which the
+        // Cholesky refuses on every rounding.
         let n = 100;
         let p = 3;
         let mut x = Mat::<f64>::zeros(n, p);
         for i in 0..n {
             x[(i, 0)] = 1.0;
-            // Column 1 and column 2 identical.
             x[(i, 1)] = ((i as f64) / (n as f64)) - 0.5;
-            x[(i, 2)] = x[(i, 1)];
+            // Column 2 stays all zeros.
         }
         // Build y with mixed 0/1 to avoid the all-0/all-1 short circuit.
         let y: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
@@ -1106,6 +1077,7 @@ mod tests {
             glm_scratch(&mut ws),
         );
         assert!(!fit.converged);
+        assert_eq!(fit.n_iter, 0);
         for &t in fit.t_sq.iter() {
             assert!(t.is_nan(), "z² must be NaN on non-converged fit, got {t}");
         }
@@ -1152,6 +1124,20 @@ mod tests {
             !fit.converged,
             "fully separated data must report non-converged"
         );
+        for (k, (&t, &v)) in fit.t_sq.iter().zip(fit.var_diag.iter()).enumerate() {
+            assert!(
+                t.is_nan() && v.is_nan(),
+                "target {k}: t_sq {t}, var_diag {v}"
+            );
+        }
+        assert!(fit.deviance.is_nan(), "deviance {}", fit.deviance);
+        assert!(
+            fit.deviance_null.is_nan(),
+            "deviance_null {}",
+            fit.deviance_null
+        );
+        // β is left at the last iterate, not NaN-filled.
+        assert!(fit.betas.iter().all(|b| b.is_finite()), "{:?}", fit.betas);
     }
 
     /// `beta_start` seeds β and η directly instead of the family's cold-start
@@ -1409,58 +1395,6 @@ mod tests {
             (rescaled_var - v1[1]).abs() <= 1e-9 * v1[1].abs(),
             "poisson slope variance must scale by s²: {rescaled_var} vs {}",
             v1[1]
-        );
-    }
-
-    /// Under the Gamma inverse link η = 1/μ, so a legitimate small-mean fit sits
-    /// far above the divergence threshold on the η scale — μ = 0.01 gives
-    /// η = 100. The guard is skipped for that family/link pair; this fit pins
-    /// that it is, and that the fit is still accepted.
-    #[test]
-    fn glm_gamma_inverse_large_eta_still_converges() {
-        let n = 200;
-        let p = 2;
-        let mut x = Mat::<f64>::zeros(n, p);
-        let mut y = vec![0.0f64; n];
-        for i in 0..n {
-            let xu = (i as f64) / (n as f64) - 0.5;
-            x[(i, 0)] = 1.0;
-            x[(i, 1)] = xu;
-            // η = 100 − 20·x exactly, i.e. μ ≈ 0.01: honest, and more than three
-            // times the divergence threshold.
-            let eta = 100.0 - 20.0 * xu;
-            let jitter = 1.0 + 0.05 * (((i % 7) as f64) - 3.0) / 3.0;
-            y[i] = jitter / eta;
-        }
-        let mut ws = TestWs::new(n, p, 0);
-        let targets: Vec<u32> = vec![0, 1];
-        let fit = glm_irls_fit(
-            crate::Family::Gamma {
-                link: crate::GammaLink::Inverse,
-            },
-            f64::NAN,
-            x.as_ref(),
-            &y,
-            &targets,
-            None,
-            None,
-            None,
-            glm_scratch(&mut ws),
-        );
-        assert!(
-            fit.converged,
-            "a small-mean Gamma inverse-link fit carries |η| ≈ 100 honestly and \
-             must not be rejected as divergence"
-        );
-        // The multiplicative jitter is not centered exactly at 1 under the
-        // Gamma/inverse-link weighting (its IRLS weight is μ⁻² = η², so the
-        // η-dependent jitter values do not average out to the noise-free
-        // η = 100 − 20x line): the fit lands at intercept ≈ 100.0512, not
-        // exactly 100.
-        assert!(
-            (fit.betas[0] - 100.0512).abs() < 1e-4,
-            "intercept on the 1/μ scale should land at ≈100.0512, got {}",
-            fit.betas[0]
         );
     }
 

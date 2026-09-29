@@ -307,10 +307,17 @@ fn fitview_accessors_match_fit_for_ols() {
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
     let mut ws = build_workspace(&model, Perm::IDENTITY, n, p, &opts);
     let v = fit_on(&mut ws, &x, &y, &ids, None, &opts);
+    assert!(v.converged());
     assert_eq!(v.converged(), cold.converged());
-    // OLS t_sq is target-compact.
+    // OLS t_sq is target-compact: slot k is target_indices[k]'s (β/se)².
     assert_eq!(v.t_sq().len(), opts.target_indices.len());
     assert_eq!(v.betas().len(), p);
+    assert_near(v.betas(), &cold.beta, "betas vs fit_cold");
+    for (k, &t) in opts.target_indices.iter().enumerate() {
+        let t = t as usize;
+        let want = (cold.beta[t] / cold.se[t]).powi(2);
+        assert_near(&[v.t_sq()[k]], &[want], &format!("t_sq[{k}] (target {t})"));
+    }
 }
 
 /// The one diagnostics carrier agrees with what `into_fit` materializes into
@@ -573,31 +580,7 @@ fn build_workspace_routes_fixed_only_to_ols_and_mixed_to_lmm() {
 
 // --- pin the absence of the scalar-Brent route ---
 
-/// The scalar-Brent kernel in `lme.rs` is deliberately not wired: every tier
-/// routes the single-random-intercept Gaussian LMM to `FitKind::Lmm`/BOBYQA (the
-/// reasoning is in `lmm.rs`'s module header). If someone adds a `prefer_scalar`
-/// branch to `build_workspace` later, this fails loudly.
-#[test]
-fn single_intercept_gaussian_routes_to_bobyqa_not_brent() {
-    let (_x, _y, n, p, model, ids, opts) = lmm_intercept_case();
-    let (sized, _ids, perm) = spec_sized_from_ids_pub(&model, &ids);
-    let ws = build_workspace(&sized, perm, n, p, &opts);
-    assert!(ws.is_lmm());
-}
-
 // --- reuse gate + shape pin ---
-
-#[test]
-fn fit_on_ols_reused_ws_near_identical_to_fit_cold() {
-    let (x, y, n, p, model, ids, opts) = ols_case();
-    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    let mut ws = build_workspace(&model, Perm::IDENTITY, n, p, &opts);
-    let f1 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
-    let f2 = fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
-    assert_near(&cold.beta, &f1.beta, "beta vs fit_cold");
-    assert_near(&cold.se, &f1.se, "se vs fit_cold");
-    assert_near(&f1.beta, &f2.beta, "beta first vs second reuse");
-}
 
 #[test]
 fn fit_on_reused_ws_near_identical_to_fit_cold_lmm() {
@@ -902,6 +885,7 @@ fn fit_on_weighted_reuse_matches_fit_cold() {
     let via_w =
         fit_on(&mut ws, &x, &y, &ids, None, &opts_w).into_fit(&x, &y, &ids, n, p, &model, &opts_w);
     assert_near(&cold_w.beta, &via_w.beta, "weighted beta");
+    assert_near(&cold_w.se, &via_w.se, "weighted se");
 
     let cold_u = fit_cold(&x, &y, n, p, &model, &ids, &opts_unit);
     let via_u = fit_on(&mut ws, &x, &y, &ids, None, &opts_unit)
@@ -917,25 +901,10 @@ fn fit_on_weighted_reuse_matches_fit_cold() {
 // `x_mat` reuse across different n must equal fresh single-shot fits. Rows
 // past the CURRENT call's `n` keep the PREVIOUS call's values and are never
 // read — the tests above already
-// cover ascending n for OLS; the pairs below add the direction most likely to
+// cover ascending n for OLS; the tests below add the direction most likely to
 // surface a stale-row bug (shrinking n leaves more of the buffer stale than
-// growing it does), for every arm that gained a buffer.
-
-#[test]
-fn fit_on_ols_smaller_then_larger_matches_fit_cold() {
-    let (full_x, full_y, n_max, p, model, _ids, opts) = ols_case();
-    let mut ws = build_workspace(&model, Perm::IDENTITY, n_max, p, &opts);
-    for &n in &[12usize, n_max] {
-        let x = &full_x[..n * p];
-        let y = &full_y[..n];
-        let ids = GroupIds::default();
-        let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via =
-            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
-        assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
-        assert_near(&cold.se, &via.se, &format!("n={n} se"));
-    }
-}
+// growing it does), for every arm that gained a buffer (the LMM's is the
+// offset round trip at the end of this block).
 
 #[test]
 fn fit_on_ols_larger_then_smaller_matches_fit_cold() {
@@ -986,116 +955,49 @@ fn fit_on_glm_larger_then_smaller_matches_fit_cold() {
     }
 }
 
-/// LMM sub-slices must still cover every primary cluster level (`fit_on`'s
-/// shape pin is an EQUALITY check on level count, not a capacity check like the
-/// extra groupings) — `n_clusters` divides every `n` used here.
+/// Dense-LMM `x_mat` reuse across varying n (grow then shrink), without and
+/// with an offset. The shrink leaves trailing `x_mat` rows stale from the larger
+/// call, which must never be read. The offset path fills the preallocated
+/// `y_shifted` (a build-once `n_max`-sized sibling buffer) fresh from
+/// `y - offset` every call, so a stale trailing entry from a larger previous call
+/// would show up as a wrong shift on the smaller one. Offset presence is frozen
+/// at build, so each pass builds its own workspace. `fit_on`'s primary-level pin
+/// is an equality check on level count, not a capacity check, so `n_clusters`
+/// (6) divides every n used here.
 #[test]
-fn fit_on_lmm_dense_smaller_then_larger_matches_fit_cold() {
-    let (full_x, full_y, n_max, p, model, ids_full, opts) = lmm_intercept_case();
-    let (sized, ids_full, perm) = spec_sized_from_ids_pub(&model, &ids_full);
-    let mut ws = build_workspace(&sized, perm, n_max, p, &opts);
-    assert!(ws.is_lmm());
-    for &n in &[24usize, n_max] {
-        let x = &full_x[..n * p];
-        let y = &full_y[..n];
-        let ids = GroupIds {
-            primary: ids_full.primary[..n].to_vec(),
-            extra: vec![],
-        };
-        let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via =
-            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
-        assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
-        assert_near(&cold.tau2, &via.tau2, &format!("n={n} tau2"));
-    }
-}
-
-#[test]
-fn fit_on_lmm_dense_larger_then_smaller_matches_fit_cold() {
-    let (full_x, full_y, n_max, p, model, ids_full, opts) = lmm_intercept_case();
-    let (sized, ids_full, perm) = spec_sized_from_ids_pub(&model, &ids_full);
-    let mut ws = build_workspace(&sized, perm, n_max, p, &opts);
-    for &n in &[n_max, 24usize] {
-        let x = &full_x[..n * p];
-        let y = &full_y[..n];
-        let ids = GroupIds {
-            primary: ids_full.primary[..n].to_vec(),
-            extra: vec![],
-        };
-        let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via =
-            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
-        assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
-        assert_near(&cold.tau2, &via.tau2, &format!("n={n} tau2"));
-    }
-}
-
-/// `scaled_x` is allocated only for weighted builds — an unweighted
-/// workspace must never read it. `has_weights` is frozen at build, so
-/// `OlsWorkspace::scaled_x` is sized 0×0 on an unweighted build (never read)
-/// and `n_max×p` on a weighted one (read every call). Fitting both routes to
-/// completion — instead of panicking on the 0×0 bounds check — proves the
-/// gate reads the right flag.
-#[test]
-fn fit_on_ols_scaled_x_gate_matches_has_weights() {
-    let (x, y, n, p, model, ids, opts) = ols_case();
-    assert!(opts.weights.is_none());
-    let w: Vec<f64> = (0..n).map(|i| 1.0 + (i % 3) as f64).collect();
-    let opts_w = FitOptions {
-        weights: Some(w),
-        ..opts.clone()
-    };
-
-    // Unweighted build: has_weights=false ⇒ scaled_x is 0×0, must never be read.
-    let cold_u = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    let mut ws_u = build_workspace(&model, Perm::IDENTITY, n, p, &opts);
-    let via_u =
-        fit_on(&mut ws_u, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
-    assert_near(&cold_u.beta, &via_u.beta, "unweighted beta");
-    assert_near(&cold_u.se, &via_u.se, "unweighted se");
-
-    // Weighted build: has_weights=true ⇒ scaled_x is n_max×p, read every call.
-    let cold_w = fit_cold(&x, &y, n, p, &model, &ids, &opts_w);
-    let mut ws_w = build_workspace(&model, Perm::IDENTITY, n, p, &opts_w);
-    let via_w = fit_on(&mut ws_w, &x, &y, &ids, None, &opts_w)
-        .into_fit(&x, &y, &ids, n, p, &model, &opts_w);
-    assert_near(&cold_w.beta, &via_w.beta, "weighted beta");
-    assert_near(&cold_w.se, &via_w.se, "weighted se");
-}
-
-/// The offset path fills the preallocated `y_shifted` instead of collecting:
-/// a build-once `n_max`-sized sibling buffer, filled fresh from `y - offset`
-/// every call. Round-trips the offset path across varying n (grow then
-/// shrink) so a stale trailing entry — left over from a larger previous call
-/// — would show up as a wrong shift on the smaller one.
-#[test]
-fn fit_on_lmm_dense_offset_round_trip_varying_n() {
+fn fit_on_lmm_dense_varying_n_with_and_without_offset_matches_fit_cold() {
     // `fit_cold`'s own boundary check requires `offset.len() == n` exactly
     // (`fit_warm`'s shape gate), so each iteration gets its own n-sliced opts
     // for the fit_cold reference; `opts` (full n_max-length offset) is what
     // `fit_on`'s frozen-presence build actually uses, matching how a real
     // build-once/fit-many caller would hold one offset buffer across calls.
-    let (full_x, full_y, n_max, p, model, ids_full, mut opts) = lmm_intercept_case();
+    let (full_x, full_y, n_max, p, model, ids_full, base_opts) = lmm_intercept_case();
     let offset: Vec<f64> = (0..n_max).map(|i| 0.05 * ((i % 4) as f64 - 1.5)).collect();
-    opts.offset = Some(offset.clone());
     let (sized, ids_full, perm) = spec_sized_from_ids_pub(&model, &ids_full);
-    let mut ws = build_workspace(&sized, perm, n_max, p, &opts);
-    for &n in &[24usize, n_max, 24usize] {
-        let x = &full_x[..n * p];
-        let y = &full_y[..n];
-        let ids = GroupIds {
-            primary: ids_full.primary[..n].to_vec(),
-            extra: vec![],
+    for offset_full in [None, Some(offset)] {
+        let opts = FitOptions {
+            offset: offset_full.clone(),
+            ..base_opts.clone()
         };
-        let opts_n = FitOptions {
-            offset: Some(offset[..n].to_vec()),
-            ..opts.clone()
-        };
-        let cold = fit_cold(x, y, n, p, &model, &ids, &opts_n);
-        let via =
-            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts_n);
-        assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
-        assert_near(&cold.tau2, &via.tau2, &format!("n={n} tau2"));
+        let mut ws = build_workspace(&sized, perm, n_max, p, &opts);
+        for &n in &[24usize, n_max, 24usize] {
+            let x = &full_x[..n * p];
+            let y = &full_y[..n];
+            let ids = GroupIds {
+                primary: ids_full.primary[..n].to_vec(),
+                extra: vec![],
+            };
+            let opts_n = FitOptions {
+                offset: offset_full.as_ref().map(|o| o[..n].to_vec()),
+                ..opts.clone()
+            };
+            let cold = fit_cold(x, y, n, p, &model, &ids, &opts_n);
+            let via = fit_on(&mut ws, x, y, &ids, None, &opts)
+                .into_fit(x, y, &ids, n, p, &model, &opts_n);
+            let tag = format!("offset={} n={n}", offset_full.is_some());
+            assert_near(&cold.beta, &via.beta, &format!("{tag} beta"));
+            assert_near(&cold.tau2, &via.tau2, &format!("{tag} tau2"));
+        }
     }
 }
 
@@ -1348,32 +1250,44 @@ fn eval_counters_bucket_pirls_iterations_per_eval() {
     assert_eq!(c.pirls_hist.iter().sum::<u32>(), 3);
 }
 
-/// AGQ records one evaluation and its node count per call; the node total is
-/// evaluations x nodes — counter 4 in `crate::counters`' module header.
-#[cfg(feature = "counters")]
-#[test]
-fn eval_counters_accumulate_agq_nodes() {
-    use crate::counters::EvalCounters;
-    let mut c = EvalCounters::new();
-    c.record_agq_eval(8 * 7);
-    c.record_agq_eval(8 * 7);
-    assert_eq!(c.agq_evals, 2);
-    assert_eq!(c.agq_node_evals, 112);
-}
-
 /// Every route must carry the counters field, and a route with no
-/// derivative-free search must report zeros rather than garbage.
+/// derivative-free search must report zeros rather than garbage. Run on the
+/// OLS route, the fixed-θ GLM route (`FitKind::Glm`), and the negative-binomial
+/// route (`FitKind::Prebuilt`), which alternates β and θ without BOBYQA.
 #[cfg(feature = "counters")]
 #[test]
 fn fit_carries_zeroed_counters_on_closed_form_routes() {
     use crate::counters::Stage;
     let (x, y, n, p, model, ids, opts) = ols_case();
-    let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert_eq!(f.n_eval, 0, "OLS runs no optimizer");
-    assert_eq!(f.counters.stage_evals, [0, 0]);
-    assert_eq!(f.counters.evals_after_last_improve(Stage::Two), 0);
-    assert_eq!(f.counters.agq_evals, 0);
-    assert_eq!(f.counters.pirls_hist.iter().sum::<u32>(), 0);
+    let (gx, gy, gn, gp, glm_model, gids, gopts) = glm_case();
+    let nb_model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: None,
+    };
+    let cases = [
+        ("OLS", fit_cold(&x, &y, n, p, &model, &ids, &opts)),
+        (
+            "Poisson GLM",
+            fit_cold(&gx, &gy, gn, gp, &glm_model, &gids, &gopts),
+        ),
+        (
+            "NB GLM",
+            fit_cold(&gx, &gy, gn, gp, &nb_model, &gids, &gopts),
+        ),
+    ];
+    for (route, f) in cases {
+        assert_eq!(f.n_eval, 0, "{route} runs no optimizer");
+        assert_eq!(f.counters.stage_evals, [0, 0], "{route}");
+        assert_eq!(
+            f.counters.evals_after_last_improve(Stage::Two),
+            0,
+            "{route}"
+        );
+        assert_eq!(f.counters.agq_evals, 0, "{route}");
+        assert_eq!(f.counters.pirls_hist.iter().sum::<u32>(), 0, "{route}");
+    }
 }
 
 /// The GLMM outer-search route splits which BOBYQA stage runs
@@ -1505,7 +1419,7 @@ fn over_envelope_vech_fits_through_the_theta_rescale() {
         ..FitOptions::default()
     };
     assert_eq!(
-        crate::fit::classify_design_pub(&model, 1),
+        crate::fit::classify_design(&model, 1),
         crate::fit::Solver::Sparse,
         "q_p past MAX_PRIMARY_Q must route to the sparse solver, not refuse"
     );

@@ -1618,19 +1618,30 @@ mod tests {
         );
     }
 
-    /// A formula with the intercept removed and no other fixed term (`y ~ 0`)
-    /// leaves the design with zero columns — `materialize` refuses this
-    /// outright rather than handing `fit_cold` a `p == 0` design.
+    /// A formula with the intercept removed and no other fixed term (`y ~ 0`,
+    /// or `y ~ 0 + (1|g)` with only a random intercept) leaves the design with
+    /// zero columns — `materialize` refuses this outright rather than handing
+    /// `fit_cold` a `p == 0` design.
     #[test]
     fn empty_fixed_design_is_refused() {
         let table = Table {
-            columns: vec![("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0]))],
-            n: 3,
+            columns: vec![
+                ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+                (
+                    "g".into(),
+                    Column::factor_from_labels(&strs(&["a", "a", "b", "b"])),
+                ),
+            ],
+            n: 4,
         };
-        assert!(matches!(
-            super::lower("y ~ 0", &table, Family::Gaussian),
-            Err(Error::EmptyDesign)
-        ));
+        for formula in ["y ~ 0", "y ~ 0 + (1|g)"] {
+            let err = match super::lower(formula, &table, Family::Gaussian) {
+                Ok(_) => panic!("{formula}: expected an empty fixed design to be refused"),
+                Err(e) => e,
+            };
+            assert_eq!(err, Error::EmptyDesign, "{formula}");
+            assert!(err.to_string().contains("no columns"), "{formula}: {err}");
+        }
     }
 
     /// Fixture for the `label_ranef` mismatch tests below: 3 groups of 4 rows
@@ -1726,9 +1737,9 @@ mod tests {
         );
     }
 
-    /// The same one-level factor inside an interaction term also errors —
-    /// `factor_dummies` is the one call site the main-effect and interaction
-    /// paths both go through.
+    /// The same one-level factor reached only through an interaction term (no
+    /// main effect, so `f` is not lowered first) also errors — the
+    /// `interaction_columns` → `expand_var` → `factor_dummies` route.
     #[test]
     fn one_level_factor_inside_interaction_errors() {
         let table = Table {
@@ -1743,7 +1754,7 @@ mod tests {
             n: 3,
         };
         assert_eq!(
-            super::lower("y ~ f * x", &table, Family::Gaussian)
+            super::lower("y ~ f:x", &table, Family::Gaussian)
                 .err()
                 .unwrap(),
             Error::SingleLevelFactor {

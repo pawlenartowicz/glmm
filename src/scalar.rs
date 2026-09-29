@@ -52,18 +52,12 @@ pub trait Scalar:
     /// The value part. `f64`'s implementation is the identity.
     fn value(self) -> f64;
 
-    /// `|x|`. No kernel site yet — see `mul_add` for why it ships anyway.
-    fn abs(self) -> Self;
     /// `√x`.
     fn sqrt(self) -> Self;
     /// `x.max(other)`, selected on the value part.
     fn max_f64(self, other: f64) -> Self;
     /// `x.clamp(lo, hi)`, selected on the value part.
     fn clamp_f64(self, lo: f64, hi: f64) -> Self;
-    /// Fused `self·a + b` where the platform has it. The trait surface is
-    /// final ahead of the dual-number work: methods the dual kernel and the
-    /// penalties will need (this one, `abs`) ship before their callers.
-    fn mul_add(self, a: Self, b: Self) -> Self;
 
     /// `exp(x)`.
     fn exp(self) -> Self;
@@ -205,10 +199,6 @@ impl Scalar for f64 {
     }
 
     #[inline(always)]
-    fn abs(self) -> f64 {
-        f64::abs(self)
-    }
-    #[inline(always)]
     fn sqrt(self) -> f64 {
         f64::sqrt(self)
     }
@@ -219,10 +209,6 @@ impl Scalar for f64 {
     #[inline(always)]
     fn clamp_f64(self, lo: f64, hi: f64) -> f64 {
         f64::clamp(self, lo, hi)
-    }
-    #[inline(always)]
-    fn mul_add(self, a: f64, b: f64) -> f64 {
-        f64::mul_add(self, a, b)
     }
 
     #[inline(always)]
@@ -415,8 +401,10 @@ mod tests {
             assert_eq!(Scalar::probit_cdf(v), crate::simd_transcendental::phi_hp(v));
             assert_eq!(Scalar::value(v), v);
             assert_eq!(<f64 as Scalar>::from_f64(v), v);
-            assert_eq!(Scalar::abs(v), v.abs());
-            assert_eq!(Scalar::mul_add(v, 2.0, -1.0), v.mul_add(2.0, -1.0));
+            assert_eq!(
+                Scalar::log1pexp(v),
+                crate::simd_transcendental::scalar_log1pexp(v)
+            );
         }
         for &v in &[1e-8_f64, 0.5, 1.0, 12.0] {
             assert_eq!(Scalar::ln(v), v.ln());
@@ -574,18 +562,5 @@ mod tests {
         for (pa, pb) in a.3.iter().zip(&b.3) {
             assert!((pa - pb).abs() < 1e-15, "gamma-log mu drifted beyond 1 ULP");
         }
-    }
-
-    /// Every implementor of the sealed trait must stay `Send + Sync` (both
-    /// are supertraits already; this pins that no method smuggled in a
-    /// `!Send`/`!Sync` associated type). Sealing itself is a property of
-    /// `mod sealed` staying private; nothing further to assert here beyond
-    /// these three types still implementing `Scalar` at all.
-    #[test]
-    fn scalar_trait_is_still_sealed_and_send_sync() {
-        fn assert_send_sync<T: Scalar + Send + Sync>() {}
-        assert_send_sync::<f64>();
-        assert_send_sync::<crate::dual::Dual<4>>();
-        assert_send_sync::<crate::dual::HyperDual<4, 10>>();
     }
 }

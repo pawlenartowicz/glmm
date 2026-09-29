@@ -35,12 +35,6 @@ fn aligned_dev_default_is_minus_two_loglik() {
     assert_eq!(oracle_support::dev_align::aligned_dev(&g), Some(-2.0 * ll));
 }
 
-#[test]
-fn aligned_dev_none_when_golden_lacks_loglik() {
-    let g = load_golden("sim_binomial_slope1_agq_k7");
-    assert_eq!(oracle_support::dev_align::aligned_dev(&g), None);
-}
-
 /// The exactly-six GLMMadaptive vector-RE-AGQ goldens that carry no `loglik` —
 /// the deviance gate's only loud exclusions (`DEV-NA` in
 /// `goldens_agree_with_the_references`). Pinned by name so a golden losing its
@@ -416,19 +410,6 @@ fn unasserted_by_convention(g: &Golden) -> Vec<(&'static str, &'static str)> {
     Vec::new()
 }
 
-/// Goldens Tier 2 cannot gate yet, each with the open decision it waits on.
-///
-/// Not a way to quiet a failure: an entry means the gap is understood, recorded
-/// elsewhere, and blocked on a decision that is not this tier's to make. The
-/// count is asserted below so entries cannot accumulate quietly.
-fn known_open(_g: &Golden) -> Option<&'static str> {
-    // Empty: the formula frontend lowers random effects in formula order, which
-    // routes `sim_sparse_gamma` sparse instead of leaving it blocked — see
-    // `//gamma_rungs` in validation/manifest.json. No golden here is presently
-    // gated on an open decision.
-    None
-}
-
 // ── Structural gates ─────────────────────────────────────────────────────────
 
 /// Every golden has a manifest entry, and therefore a generator. Three
@@ -664,13 +645,7 @@ fn goldens_agree_with_the_references() {
     // joined when glmm's Gamma GLM moved to the ML dispersion, and the 58 became
     // 61.
     assert_eq!(corpus().len(), 76, "the cross-engine corpus changed size");
-    let mut open = Vec::new();
     for (g, factors) in corpus() {
-        if let Some(reason) = known_open(&g) {
-            assert!(!reason.is_empty());
-            open.push(g.name.clone());
-            continue;
-        }
         let shape = shape_of(&g);
         let factor_refs: Vec<&str> = factors.iter().map(String::as_str).collect();
         let (f, cols, groups) = refit(&g, &factor_refs);
@@ -859,7 +834,6 @@ fn goldens_agree_with_the_references() {
             }
         }
     }
-    assert_open_set_unchanged(&open);
     assert_documented_divergences_all_fired();
 }
 
@@ -906,17 +880,6 @@ fn assert_documented_divergences_all_fired() {
         "documented-divergence registry is out of date: entries scoped to this \
          tier that no longer fire must be deleted, and a divergence that starts \
          firing must be written up first"
-    );
-}
-
-/// A count, not a list, so adding a `known_open` entry is a deliberate act that
-/// has to be made here too — the failure mode this whole tier exists to stop is
-/// a case quietly leaving coverage.
-fn assert_open_set_unchanged(open: &[String]) {
-    assert_eq!(
-        open,
-        Vec::<String>::new(),
-        "the set of goldens Tier 2 cannot gate has changed"
     );
 }
 

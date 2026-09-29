@@ -770,7 +770,7 @@ pub struct FitOptions {
     ///   usual stripped-constant convention, matching lme4's weighted
     ///   `lmer(weights=)` REMLcrit up to that same stripped constant.
     ///   Validated against `fit_lmm_weighted_matches_lme4` (lme4 `lmer`, dense),
-    ///   `fit_lmm_constant_weights_invariant`, and
+    ///   `fit_lmm_weight_scale_invariant_dense_and_sparse`, and
     ///   `fit_lmm_weighted_boundary_matches_wls`.
     /// - Sparse (`Solver::Sparse`) Gaussian LMM: identical √wᵢ scaling threaded
     ///   through the sparse-Z accumulator instead — `for_each_z_entry`'s
@@ -780,7 +780,7 @@ pub struct FitOptions {
     ///   `wᵢ`. Deviance/df stay raw (`n − p`); the `−Σlog wᵢ` constant is added
     ///   in `lmm_view_to_fit`, the one site both kernels reach. Validated against
     ///   `fit_sparse_lmm_weighted_matches_lme4` (lme4 `lmer`, sparse) and
-    ///   `sparse_lmm_constant_weights_invariant`.
+    ///   `fit_lmm_weight_scale_invariant_dense_and_sparse`.
     pub weights: Option<Vec<f64>>,
     /// Per-row additive offset `oᵢ` on the linear-predictor scale — R's
     /// `offset=`: `η = o + Xβ (+ Zb)`, every family, every solver path. A fixed
@@ -1172,22 +1172,13 @@ pub(crate) fn classify_design(model: &ModelSpec, _nagq: u8) -> Solver {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn classify_design_pub(model: &ModelSpec, nagq: u8) -> Solver {
-    classify_design(model, nagq)
-}
-
 // ---------------------------------------------------------------------------
 // Re-exports for consumers outside `fit` (mirrors `src/glmm/mod.rs`'s
 // mod+re-export convention): `sparse.rs` reaches these as `crate::fit::X`,
-// `spec.rs` reaches `assert_model_shape_pub`, and the `loop_advanced` cargo
-// feature's `crate::loop_advanced` re-exports the dev seam from here.
+// and the `loop_advanced` cargo feature's `crate::loop_advanced` re-exports the
+// dev seam from here.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-pub(crate) use common::assemble_varcorr;
-#[cfg(test)]
-pub(crate) use common::assert_model_shape_pub;
 #[cfg(any(test, feature = "loop_advanced"))]
 pub use common::spec_sized_from_ids_pub;
 // The one diagnostics carrier. Always `pub` (it is `FitView::diagnostics`'s

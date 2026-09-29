@@ -56,7 +56,6 @@ def make_fit(**kw):
 
 def test_stddev_corr_q2_hand_math():
     # D=[[4,1],[1,1.25]] -> vech(col-major lower-tri)=[4,1,1.25]
-    # (mirrors the Rust test stddev_corr_q2_hand_math in GLMM/src/fit.rs).
     f = make_fit(varcorr=[np.array([4.0, 1.0, 1.25])])
     sd, corr = f.stddev_corr(0)
     sd1 = math.sqrt(1.25)

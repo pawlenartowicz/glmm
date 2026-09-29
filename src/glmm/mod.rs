@@ -303,10 +303,10 @@ mod workspace;
 
 #[cfg(test)]
 pub(crate) use deviance::glmm_laplace_deviance;
-// Re-exported so `lmm::kernel`'s REML dual entry points can reuse
-// these instead of duplicating them — `derivative` itself is private to
-// `glmm`, so a sibling module needs the items re-exported one level up.
-pub(crate) use derivative::{unpack_hessian, DerivStatus};
+// `derivative` is private to `glmm`; the fit-module tests read the status
+// through this re-export.
+#[cfg(test)]
+pub(crate) use derivative::DerivStatus;
 // Both exact Hessian engines, reachable from the test module that drives the
 // validation corpus's own datasets through them side by side. Production
 // reaches them through `se::joint_hessian_cov` alone. Every caller of these
@@ -314,20 +314,13 @@ pub(crate) use derivative::{unpack_hessian, DerivStatus};
 // re-export carries that gate too — otherwise `--no-default-features` warns
 // on an import nothing left standing can use.
 #[cfg(all(test, feature = "formula"))]
-pub(crate) use assembled::{
-    assembly_routes, gradient_f64, gradient_f64_mode_residual, joint_hessian, packed_gradient,
-};
+pub(crate) use assembled::{assembly_routes, gradient_f64, joint_hessian, packed_gradient};
 // The unsymmetrized column pass, read by the corpus drivers in
 // `fit::glmm_tests` and by the both-layouts cross-check in `sparse::tests`,
 // which carries no `formula` gate.
 #[cfg(test)]
 pub(crate) use assembled::joint_hessian_columns;
-// The paired-timing driver's forcing switch and success counter — see their
-// doc comments in `assembled.rs`. Same formula-only callers as the block
-// above.
-#[cfg(all(test, feature = "formula"))]
-pub(crate) use assembled::{ASSEMBLED_OK_COUNT, FORCE_DECLINE};
-// Same formula-only caller as the two blocks above.
+// Same formula-only caller as the blocks above.
 #[cfg(all(test, feature = "formula"))]
 pub(crate) use derivative::{
     laplace_gradient, laplace_hessian, supports_shape as supports_exact_shape, MAX_DUAL_N,

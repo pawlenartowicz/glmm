@@ -442,7 +442,7 @@ fn fit_mle(
     let mut ws =
         LmmWorkspace::for_cluster_spec_ext(p, model, n, &slope_cols, &extra_slope_cols, sparse);
     // Identity-link offset is an exact y-shift before accumulation (the Grams
-    // are the only place raw y enters) — the same convention `fit_ols` applies.
+    // are the only place raw y enters) — the same convention `fit_ols_prebuilt` applies.
     // Mirrored by `fit::core`'s `Lmm` arm and `loop_advanced_seam.rs`'s
     // `refit_lmm` — change together.
     let y_shifted: Vec<f64>;

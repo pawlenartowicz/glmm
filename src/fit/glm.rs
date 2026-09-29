@@ -123,7 +123,7 @@ impl GlmScratchBuf {
 }
 
 /// GLM dispatch adapter. Owns the `irls_*` scratch inline (the analog of
-/// `fit_ols`'s `OlsScratch` allocation; on the simulation path these live in
+/// `OlsWorkspace::new`'s `OlsScratch` allocation; on the simulation path these live in
 /// `SimWorkspace`), converts the row-major input to a column-major faer `Mat`,
 /// runs the `family`-selected IRLS kernel cold-started at β=0, and maps the view
 /// to `Fit`. No random effects ⇒ `tau2` empty. Binomial/Poisson keep

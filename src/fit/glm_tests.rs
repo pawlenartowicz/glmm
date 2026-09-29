@@ -1,9 +1,8 @@
 //! GLM estimator tests (fixed-effects binomial/Poisson/Gamma/negative-binomial,
 //! `re: None`).
 
-use super::glm::{fit_glm, fit_glm_prebuilt, glm_view_to_fit, GlmScratchBuf};
+use super::glm::fit_glm;
 use super::*;
-use crate::test_support::assert_near;
 use crate::{
     BinomialLink, Family, GroupIds, ModelSpec, NegBinomialLink, Note, ReStructure, Sizing,
 };
@@ -28,56 +27,6 @@ const SE_REL_PHI1: f64 = 3e-5;
 /// gap (`fit_glm_nb_theta_low_edge_matches_mass`, the heavily-overdispersed
 /// θ-bracket edge).
 const SE_REL_DISPERSION: f64 = 7e-5;
-
-/// A small non-separable binomial(logit) dataset (n=30, p=2) for the view-mapper
-/// equivalence gate. Deterministic, no RNG.
-fn glm_logit_hand_dataset() -> (Vec<f64>, Vec<f64>, usize, usize) {
-    let n = 30;
-    let p = 2;
-    let mut x = Vec::with_capacity(n * p);
-    let mut y = Vec::with_capacity(n);
-    for i in 0..n {
-        let xi = (i as f64) / 10.0 - 1.5;
-        x.extend_from_slice(&[1.0, xi]);
-        y.push(if (i * 3 + 1) % 5 < 3 { 1.0 } else { 0.0 });
-    }
-    (x, y, n, p)
-}
-
-/// `fit_glm_prebuilt` + `glm_view_to_fit` must reproduce the `Fit` that the
-/// throwaway `fit_glm` path produces — pins the view/assembly split as
-/// behavior-preserving for a non-Gaussian family.
-#[test]
-fn fit_glm_prebuilt_view_maps_to_same_fit() {
-    let (x, y, n, p) = glm_logit_hand_dataset();
-    let opts = FitOptions {
-        target_indices: vec![1],
-        ..FitOptions::default()
-    };
-    let family = Family::Binomial {
-        link: BinomialLink::Logit,
-    };
-
-    let direct = fit_glm(family, f64::NAN, &x, &y, n, p, &opts);
-
-    let mut buf = GlmScratchBuf::new(n, p, opts.target_indices.len());
-    let x_mat = super::common::to_col_major(&x, n, p);
-    let via_view = {
-        let v = fit_glm_prebuilt(
-            family,
-            f64::NAN,
-            x_mat.as_ref().subrows(0, n),
-            &y,
-            &opts,
-            &mut buf,
-        );
-        glm_view_to_fit(&v, &y, family, f64::NAN, n, p, &opts)
-    };
-    assert!(direct.converged() && via_view.converged());
-    assert_near(&direct.beta, &via_view.beta, "beta");
-    assert_near(&direct.se, &via_view.se, "se");
-    assert_near(&[direct.loglik], &[via_view.loglik], "loglik");
-}
 
 /// Weighted Gamma(log) GLM vs R glm(weights=). Precision weights: row `i` has
 /// variance `φ·V(μᵢ)/wᵢ`. β is the same either way (the mean model doesn't
@@ -953,8 +902,8 @@ fn fit_glm_probit_weighted_matches_r() {
 }
 
 /// Cloglog GLM through stable `fit` (re: None): the fitted means must reproduce
-/// the link's own inverse at the converged η, and the deviance must be the
-/// binomial `dev_resid` sum at those means. Non-canonical → general
+/// the link's own inverse at the converged η, and the log-likelihood (−½ the
+/// binomial `dev_resid` sum for 0/1 y) must be the Bernoulli sum at those means. Non-canonical → general
 /// Fisher-scoring branch. The R-gated version is
 /// `fit_glm_cloglog_matches_r` (validation golden `sim_cloglog_glm`).
 #[test]
@@ -997,6 +946,18 @@ fn fit_glm_cloglog_is_self_consistent() {
         assert!((mu - want).abs() < 1e-9, "μ[{i}] = {mu} vs {want}");
         assert!(mu > 0.0 && mu < 1.0);
     }
+    // y is 0/1, so the saturated log-likelihood is 0 and logLik is the Bernoulli
+    // sum at the fitted means (`Fit.deviance` is NaN on the GLM route).
+    let want_ll: f64 = y
+        .iter()
+        .zip(&f.fitted)
+        .map(|(&yi, &mu)| yi * mu.ln() + (1.0 - yi) * (1.0 - mu).ln())
+        .sum();
+    assert!(
+        (f.loglik - want_ll).abs() <= 1e-9 * want_ll.abs(),
+        "logLik {} vs Bernoulli sum at the fitted means {want_ll}",
+        f.loglik
+    );
 }
 
 /// Cloglog binomial GLM through stable `fit` (re: None), gated against frozen R
@@ -1784,6 +1745,12 @@ fn fit_glm_igauss_matches_r() {
         },
     );
     assert!(f.converged(), "igauss-log GLM must converge");
+    // The fitted means are the log link's inverse at the converged η.
+    for (i, &mu) in f.fitted.iter().enumerate() {
+        let eta: f64 = (0..p).map(|j| f.beta[j] * x[i * p + j]).sum();
+        let want = eta.exp();
+        assert!((mu - want).abs() / want < 1e-9, "μ[{i}] = {mu} vs {want}");
+    }
     let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
     assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
     for j in 0..p {
@@ -2881,7 +2848,10 @@ fn fit_glm_separated_rejected_like_r() {
 /// 1.6e-07, coefficients stuck at ±999957.9 — a real non-convergent fit, not
 /// an artifact of one solver's cold start). `dispersion` must be NaN, not the
 /// Gamma exponential special case `φ=1`, which a caller cannot tell from a
-/// real estimate.
+/// real estimate. Also with a caller-held φ (`FitOptions::dispersion =
+/// Some(2.0)`): the held value is neither an estimate off this fit nor honored
+/// when the fit never reached an endpoint, so `2.0` would be as dishonest here
+/// as the unheld case's `1.0`.
 #[test]
 fn fit_glm_gamma_failed_fit_dispersion_is_nan() {
     let n = 24;
@@ -2893,76 +2863,36 @@ fn fit_glm_gamma_failed_fit_dispersion_is_nan() {
         x[i * p + 1] = if i < 12 { 0.0 } else { 1.0 };
         y[i] = if i < 12 { 1e-6 } else { 1e6 };
     }
-    let f = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &ModelSpec {
-            family: Family::Gamma {
-                link: crate::GammaLink::Inverse,
+    for held in [None, Some(2.0)] {
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &ModelSpec {
+                family: Family::Gamma {
+                    link: crate::GammaLink::Inverse,
+                },
+                re: None,
             },
-            re: None,
-        },
-        &GroupIds::default(),
-        &FitOptions {
-            target_indices: vec![0, 1],
-            ..FitOptions::default()
-        },
-    );
-    assert!(
-        !f.converged(),
-        "perfectly separated Gamma(inverse) GLM must not converge"
-    );
-    assert!(
-        f.dispersion.is_nan(),
-        "dispersion must be NaN on a failed fit, not the Gamma exponential special case 1.0: {}",
-        f.dispersion
-    );
-}
-
-/// Same reproducer with a caller-held φ: `FitOptions::dispersion = Some(2.0)`
-/// on a failed fit must report NaN. The held value is neither an estimate
-/// off this fit nor honored when the fit never reached an endpoint, so `2.0`
-/// would be as dishonest here as the unheld case's `1.0`.
-#[test]
-fn fit_glm_gamma_held_dispersion_failed_fit_is_nan() {
-    let n = 24;
-    let p = 2;
-    let mut x = vec![0.0f64; n * p];
-    let mut y = vec![0.0f64; n];
-    for i in 0..n {
-        x[i * p] = 1.0;
-        x[i * p + 1] = if i < 12 { 0.0 } else { 1.0 };
-        y[i] = if i < 12 { 1e-6 } else { 1e6 };
+            &GroupIds::default(),
+            &FitOptions {
+                target_indices: vec![0, 1],
+                dispersion: held,
+                ..FitOptions::default()
+            },
+        );
+        assert!(
+            !f.converged(),
+            "perfectly separated Gamma(inverse) GLM must not converge (held φ {held:?})"
+        );
+        assert!(
+            f.dispersion.is_nan(),
+            "dispersion must be NaN on a failed fit, not the Gamma exponential special case 1.0 \
+         or a held φ (held φ {held:?}): {}",
+            f.dispersion
+        );
     }
-    let f = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &ModelSpec {
-            family: Family::Gamma {
-                link: crate::GammaLink::Inverse,
-            },
-            re: None,
-        },
-        &GroupIds::default(),
-        &FitOptions {
-            target_indices: vec![0, 1],
-            dispersion: Some(2.0),
-            ..FitOptions::default()
-        },
-    );
-    assert!(
-        !f.converged(),
-        "perfectly separated Gamma(inverse) GLM must not converge"
-    );
-    assert!(
-        f.dispersion.is_nan(),
-        "a held φ must not be reported off a failed fit: {}",
-        f.dispersion
-    );
 }
 
 /// Gamma inverse link with a small mean, gated against frozen R
@@ -3021,53 +2951,6 @@ fn fit_glm_gamma_inverse_small_mean_matches_r() {
     }
 }
 
-/// Inverse-Gaussian GLM, log link, through stable `fit` (re: None):
-/// self-consistency of the fitted means and the Pearson dispersion. The R-gated
-/// version is `fit_glm_igauss_matches_r` (validation golden `sim_igauss_glm`).
-#[test]
-fn fit_glm_inverse_gaussian_log_is_self_consistent() {
-    // 300 rows, y > 0 by construction, one continuous predictor.
-    let n = 300usize;
-    let p = 2usize;
-    let mut x = Vec::<f64>::with_capacity(n * p);
-    let mut y = Vec::<f64>::with_capacity(n);
-    for i in 0..n {
-        let xi = (i as f64) / (n as f64);
-        x.push(1.0);
-        x.push(xi);
-        y.push(1.0 + 0.5 * xi + 0.05 * ((i % 7) as f64));
-    }
-    let model = ModelSpec {
-        family: Family::InverseGaussian {
-            link: crate::InverseGaussianLink::Log,
-        },
-        re: None,
-    };
-    let f = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &model,
-        &GroupIds::default(),
-        &FitOptions {
-            target_indices: vec![0, 1],
-            ..FitOptions::default()
-        },
-    );
-    assert!(f.converged(), "inverse-Gaussian GLM must converge");
-    assert!(
-        f.dispersion > 0.0 && f.dispersion.is_finite(),
-        "φ̂ = {}",
-        f.dispersion
-    );
-    assert!(f.loglik.is_finite(), "logLik must be finite");
-    for (i, &mu) in f.fitted.iter().enumerate() {
-        let want = (f.beta[0] + f.beta[1] * x[i * p + 1]).exp();
-        assert!((mu - want).abs() / want < 1e-9, "μ[{i}] = {mu} vs {want}");
-    }
-}
-
 /// Inverse-Gaussian precision weights: `wᵢ → c·wᵢ` leaves `loglik` invariant.
 /// `D` scales by `c` (the mean-model IRLS fit doesn't move under an overall
 /// weight rescale, so `D` is unchanged in shape and only inherits `c` from
@@ -3079,8 +2962,8 @@ fn fit_glm_inverse_gaussian_log_is_self_consistent() {
 /// targets. `glm::DEVIANCE_TOL`'s relative stopping rule is scale-free for
 /// `|deviance| ≫ 0.1` (true at every tested `c` here), so all three agree to
 /// 1e-9 relative at every tested `c` (see
-/// `fit_glm_gamma_weight_scale_invariant`'s doc for the mechanism). Same
-/// dataset as `fit_glm_inverse_gaussian_log_is_self_consistent`, with a
+/// `fit_glm_gamma_weight_scale_invariant`'s doc for the mechanism). The
+/// data are 300 rows of `y = 1 + 0.5·x + 0.05·(i mod 7)`, `x = i/300`, with a
 /// row-varying `w`.
 #[test]
 fn fit_glm_inverse_gaussian_weight_scale_invariant() {

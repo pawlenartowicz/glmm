@@ -62,16 +62,6 @@ def test_dictionary_array_sets_the_reference_level():
     assert result.beta[0] == pytest.approx(1.05, abs=1e-6)  # mean of "low"
 
 
-def test_dictionary_array_missing_index_drops_the_row_like_r_na_omit():
-    # A null dictionary index drops that row instead of raising, the same
-    # rule pandas' code -1 follows above.
-    data = {"y": _Y, "f": _FakeDictionaryArray(["low", "med"], [0, 1, None, 0, 1, 0])}
-    with pytest.warns(glmm.RowsDroppedWarning, match=r"Dropped 1 of 6 row"):
-        result = glmm.fit(data, "y ~ f")
-    assert result.names == ["(Intercept)", "fmed"]
-    assert result.nobs == 5
-
-
 def test_pyarrow_table_dictionary_column_keeps_its_declared_level_order():
     pa = pytest.importorskip("pyarrow")
     f = pa.DictionaryArray.from_arrays(

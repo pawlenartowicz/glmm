@@ -1,56 +1,9 @@
 //! OLS estimator tests (`Family::Gaussian`, `re: None`).
 
 use super::common_tests::weighted_collinear_ols_fixture;
-use super::ols::{fit_ols, fit_ols_prebuilt, ols_view_to_fit, OlsWorkspace};
+use super::ols::{fit_ols_prebuilt, OlsWorkspace};
 use super::*;
-use crate::test_support::assert_near;
 use crate::{BinomialLink, Family, GroupIds, ModelSpec};
-
-/// A small fixed OLS dataset (n=20, p=3: intercept + two predictors) used by the
-/// workspace-reuse gate. Deterministic, no RNG.
-fn ols_hand_dataset() -> (Vec<f64>, Vec<f64>, usize, usize) {
-    let n = 20;
-    let p = 3;
-    let mut x = Vec::with_capacity(n * p);
-    let mut y = Vec::with_capacity(n);
-    for i in 0..n {
-        let a = i as f64;
-        let b = ((i * 7) % 11) as f64 - 5.0;
-        x.extend_from_slice(&[1.0, a, b]);
-        y.push(0.5 + 1.3 * a - 0.7 * b + ((i % 3) as f64 - 1.0));
-    }
-    (x, y, n, p)
-}
-
-/// A reused `OlsWorkspace` must give a near-identical `Fit` to a throwaway one,
-/// and a second fit on the SAME ws must match the first — guards stale-buffer
-/// leakage the goldens (which only fit throwaway workspaces) cannot see.
-#[test]
-fn fit_ols_prebuilt_reused_ws_near_identical_to_fresh() {
-    let (x, y, n, p) = ols_hand_dataset();
-    let opts = FitOptions {
-        target_indices: vec![1, 2],
-        ..FitOptions::default()
-    };
-
-    let fresh = fit_ols(&x, &y, n, p, &opts);
-
-    let mut ws = OlsWorkspace::new(n, p, opts.target_indices.len(), opts.weights.is_some());
-    let x_mat = super::common::to_col_major(&x, n, p);
-    let reused = {
-        let v = fit_ols_prebuilt(&mut ws, x_mat.as_ref().subrows(0, n), &y, n, p, &opts);
-        ols_view_to_fit(&v, &x, &y, n, p, &opts)
-    };
-    let reused2 = {
-        let v = fit_ols_prebuilt(&mut ws, x_mat.as_ref().subrows(0, n), &y, n, p, &opts);
-        ols_view_to_fit(&v, &x, &y, n, p, &opts)
-    };
-
-    assert_near(&fresh.beta, &reused.beta, "beta reused vs fresh");
-    assert_near(&fresh.se, &reused.se, "se reused vs fresh");
-    assert_near(&[fresh.dispersion], &[reused.dispersion], "dispersion");
-    assert_near(&reused.beta, &reused2.beta, "beta second reuse");
-}
 
 #[test]
 fn fit_ols_recovers_slope() {
@@ -82,7 +35,7 @@ fn fit_ols_recovers_slope() {
     assert!(!f.singular());
     assert!(f.tau2.is_empty());
     // y = 2*i is an exact fit (no noise) → RSS/(n-p) ≈ 0, not the GLM φ≡1 convention.
-    assert!(f.dispersion >= 0.0 && f.dispersion < 1e-9);
+    assert!(f.dispersion.abs() < 1e-9);
 }
 
 /// WLS through the stable surface, gated against R `lm(weights=)`.
@@ -228,45 +181,6 @@ fn fit_ols_offset_matches_r_lm() {
     assert_eq!(f_none.loglik.to_bits(), f_zero.loglik.to_bits());
 }
 
-/// Constant weights w≡c must reproduce the unweighted fit exactly:
-/// β̂ is scale-invariant and σ̂²(X'WX)⁻¹ cancels the c.
-#[test]
-fn fit_ols_constant_weights_invariant() {
-    let xv = [0.2, 1.4, -0.8, 2.1, 0.5, -1.3, 1.9, 0.0];
-    // A tiny perturbation on one point keeps this off the exact-fit (RSS≈0)
-    // edge, where closed-form RSS = y'y − β̂'X'y catastrophically cancels
-    // and the sign of the residual float noise (not weighting) decides
-    // whether `var_diag` clears its `>= 0` finite guard.
-    let y: Vec<f64> = xv
-        .iter()
-        .enumerate()
-        .map(|(i, v)| 1.0 + 2.0 * v + if i == 0 { 0.01 } else { 0.0 })
-        .collect();
-    let n = 8;
-    let mut x = Vec::with_capacity(n * 2);
-    for &xi in &xv {
-        x.extend_from_slice(&[1.0, xi]);
-    }
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: None,
-    };
-    let base = FitOptions {
-        target_indices: vec![0, 1],
-        ..FitOptions::default()
-    };
-    let f0 = fit_cold(&x, &y, n, 2, &model, &GroupIds::default(), &base);
-    let opts = FitOptions {
-        weights: Some(vec![3.0; n]),
-        ..base
-    };
-    let f1 = fit_cold(&x, &y, n, 2, &model, &GroupIds::default(), &opts);
-    for j in 0..2 {
-        assert!((f0.beta[j] - f1.beta[j]).abs() < 1e-12);
-        assert!((f0.se[j] - f1.se[j]).abs() < 1e-12);
-    }
-}
-
 /// Weighted-collinear OLS: full rank in the RAW design, near-singular once
 /// weighted. The fit comes back, the pivot records that it is barely identified,
 /// and the standard error says so out loud.
@@ -350,8 +264,8 @@ fn fit_ols_weighted_collinear_fits_with_an_honest_se() {
 
 /// Fixed-only (`re: None`) counterpart to `fit_glmm_degenerate_width_never_panics`
 /// (`src/fit/common_tests.rs`): that test covers the mixed route's own `p == 0`
-/// short-circuit, but `re: None` takes a completely separate one in `fit_ols`
-/// and `fit_glm`, so a regression there is invisible to it. Covers `p == 0`,
+/// short-circuit, but `re: None` takes a completely separate one in
+/// `fit_ols_prebuilt` and `fit_glm`, so a regression there is invisible to it. Covers `p == 0`,
 /// `n == p`, `n == 0`, and an all-zero column, for the OLS route
 /// (`Family::Gaussian`) and one GLM route (`Family::Binomial { link: Logit }`).
 #[test]

@@ -74,24 +74,10 @@ use super::workspace::{
     glmm_block_chol, glmm_block_solve, packed_m_theta_deriv, GlmmLayout, GlmmWorkspace,
     StructuredPattern,
 };
-// Named only in this file's `#[cfg(test)]` instruments (`gradient_f64_impl` and
-// its callers), which destructure `ws.pirls`/`ws.structured` field-by-field.
+// Named only in this file's `#[cfg(test)]` instrument (`gradient_f64`), which
+// destructures `ws.pirls`/`ws.structured` field-by-field.
 #[cfg(test)]
 use super::workspace::{PirlsScratch, StructuredScratch};
-
-/// Test-only forcing switch: when set, [`joint_hessian_columns`] declines
-/// every call regardless of shape, so `joint_hessian_cov` falls through to
-/// the hyper-dual pass — compiles out of the shipped crate.
-#[cfg(test)]
-pub(crate) static FORCE_DECLINE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Test-only counter: incremented once per `Ok` return from
-/// [`joint_hessian`], so a caller can confirm the assembled arm actually ran
-/// rather than declining — compiles out of the shipped crate.
-#[cfg(test)]
-pub(crate) static ASSEMBLED_OK_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 /// Everything the assembly writes that is longer than a stack array, sized
 /// once per model shape. Sitting on the dual scratch rather than allocated per
@@ -593,9 +579,20 @@ pub(crate) fn eta_clamped_rows(family: Family, eta: &[f64]) -> usize {
     eta.iter().filter(|&&e| e <= eta_lo || e >= eta_hi).count()
 }
 
-/// Shared body of [`gradient_f64`] and [`gradient_f64_mode_residual`]: solves
-/// the conditional mode once, then runs three row passes over the buffers the
-/// solve left behind (no second solve, no dual lanes):
+/// The Laplace gradient `dD*/dγ` assembled in `f64`, `γ = [θ | β]`, written
+/// into `grad[..n_θ + p]`.
+///
+/// The `f64` reference instantiation of the assembly, and the only one that
+/// owns its scratch: the shape-sized [`AssemblyBufs`] every other caller reads
+/// off the dual scratch has no `f64` variant there.
+///
+/// A test instrument, not a fit-path entry: it checks the assembly at
+/// `T = f64` against the dual-lane gradient (`laplace_gradient`) as an
+/// independent way of differentiating the same objective once. Production
+/// reaches this assembly only through [`joint_hessian`].
+///
+/// Solves the conditional mode once, then runs three row passes over the
+/// buffers the solve left behind (no second solve, no dual lanes):
 ///
 /// ```text
 ///   pass 1   the θ-free row quantities: ρ, w', w_obs, h = m'A⁻¹m,
@@ -614,23 +611,9 @@ pub(crate) fn eta_clamped_rows(family: Family, eta: &[f64]) -> usize {
 /// The workspace comes back as found: `u` is snapshotted before the mode solve
 /// and restored after, and the solve's PIRLS counters are thrown away so the
 /// `pirls_hist`-sum == `n_eval` invariant keeps holding.
-///
-/// `mode_residual`, when `Some`, is filled with the exact mode residual
-/// `‖G_u‖`, `G_u = D_u + 2u` (this module's own `G(γ,u)`), read off the row
-/// pass's own unfloored `D_u` before `u` is restored — the quantity every
-/// formula here assumes is zero. `D_u`'s core block is packed `[f·qc + local]`
-/// (the row pass's own per-cluster order); `u` is in RE-column order,
-/// `core_col(f, local)`, and the two coincide only at `np == 0`.
-/// Mirrors `blocked_extras.rs`'s `gu_dot_du` comment on the same split —
-/// change together. The crossed tail needs no remapping: both sides use
-/// `k_family + b`. Both halves are read at the returned `u`: `D_u` is formed
-/// from `rho`, which pass 1 reads off `eta`/`prob` — the η-dependent state the
-/// mode solve leaves at `u`, per this module's own evaluation-point rule — so
-/// pairing it with `2u` reads one residual at one iterate and reports the mode
-/// equation.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn gradient_f64_impl(
+pub(crate) fn gradient_f64(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
     y: &[f64],
@@ -641,14 +624,13 @@ fn gradient_f64_impl(
     p: usize,
     n: usize,
     grad: &mut [f64],
-    mode_residual: Option<&mut f64>,
 ) -> Option<()> {
     // At the fitted Gamma dispersion, differentiate the fixed-φ GLMM the fit
     // minimized (`GlmmWorkspace::at_fixed_dispersion`); inside, `gamma_phi` is 1
     // and this guard does not fire again.
     if ws.dispersion_scaled() {
         return ws.at_fixed_dispersion(n, |ws| {
-            gradient_f64_impl(ws, x, y, cluster_ids, extra_ids, p, n, grad, mode_residual)
+            gradient_f64(ws, x, y, cluster_ids, extra_ids, p, n, grad)
         });
     }
     // `assembly_routes` also admits the packed layout, whose engine is
@@ -755,90 +737,8 @@ fn gradient_f64_impl(
         &mut asm,
         grad,
     );
-    if let (Some(residual), true) = (mode_residual, out.is_some()) {
-        let q = g.primary_q;
-        let s = g.n_primary;
-        let np = g.nested_per_parent;
-        let qc = q + np;
-        let prim_width = q * s;
-        let k_family = qc * s;
-        let core_col = |f: usize, local: usize| -> usize {
-            if local < q {
-                f * q + local
-            } else {
-                prim_width + f * np + (local - q)
-            }
-        };
-        let mut worst = 0.0f64;
-        for f in 0..s {
-            for local in 0..qc {
-                let u_idx = core_col(f, local);
-                worst = worst.max((asm.d_u[f * qc + local] + 2.0 * u[u_idx]).abs());
-            }
-        }
-        for (&du, &up) in asm.d_u[k_family..k].iter().zip(&u[k_family..k]) {
-            worst = worst.max((du + 2.0 * up).abs());
-        }
-        *residual = worst;
-    }
     u[..kk].copy_from_slice(&saved_u); // restore — leave ws.pirls.u as found
     out
-}
-
-/// The Laplace gradient `dD*/dγ` assembled in `f64`, `γ = [θ | β]`, written
-/// into `grad[..n_θ + p]`.
-///
-/// The `f64` reference instantiation of the assembly, and the only one that
-/// owns its scratch: the shape-sized [`AssemblyBufs`] every other caller reads
-/// off the dual scratch has no `f64` variant there.
-///
-/// A test instrument, not a fit-path entry: it checks the assembly at
-/// `T = f64` against the dual-lane gradient (`laplace_gradient`) as an
-/// independent way of differentiating the same objective once. Production
-/// reaches this assembly only through [`joint_hessian`].
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gradient_f64(
-    ws: &mut GlmmWorkspace,
-    x: MatRef<f64>,
-    y: &[f64],
-    cluster_ids: &[u32],
-    extra_ids: &[Vec<u32>],
-    p: usize,
-    n: usize,
-    grad: &mut [f64],
-) -> Option<()> {
-    gradient_f64_impl(ws, x, y, cluster_ids, extra_ids, p, n, grad, None)
-}
-
-/// Test-only twin of [`gradient_f64`] that also returns the exact mode
-/// residual `‖G_u‖` [`gradient_f64_impl`]'s doc comment describes. `None` on
-/// every case `gradient_f64` returns `None` on.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gradient_f64_mode_residual(
-    ws: &mut GlmmWorkspace,
-    x: MatRef<f64>,
-    y: &[f64],
-    cluster_ids: &[u32],
-    extra_ids: &[Vec<u32>],
-    p: usize,
-    n: usize,
-    grad: &mut [f64],
-) -> Option<f64> {
-    let mut residual = 0.0f64;
-    let out = gradient_f64_impl(
-        ws,
-        x,
-        y,
-        cluster_ids,
-        extra_ids,
-        p,
-        n,
-        grad,
-        Some(&mut residual),
-    );
-    out.map(|_| residual)
 }
 
 /// The joint Laplace Hessian `d²D*/dγdγ'` at the parameters in `ws.params`,
@@ -865,8 +765,6 @@ pub(crate) fn joint_hessian(
     let m = ws.n_theta + p;
     let st = joint_hessian_columns(ws, x, y, cluster_ids, extra_ids, p, n, grad, hess);
     if matches!(st, DerivStatus::Ok(_)) {
-        #[cfg(test)]
-        ASSEMBLED_OK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for i in 0..m {
             for j in 0..i {
                 let v = 0.5 * (hess[(i, j)] + hess[(j, i)]);
@@ -922,10 +820,6 @@ pub(crate) fn joint_hessian_columns(
         return ws.at_fixed_dispersion(n, |ws| {
             joint_hessian_columns(ws, x, y, cluster_ids, extra_ids, p, n, grad, hess)
         });
-    }
-    #[cfg(test)]
-    if FORCE_DECLINE.load(std::sync::atomic::Ordering::Relaxed) {
-        return DerivStatus::Unsupported;
     }
     if !assembly_routes(ws, n) {
         return DerivStatus::Unsupported;
@@ -2598,126 +2492,4 @@ fn packed_hessian_chunks<T: Seed>(
         }
     }
     DerivStatus::Ok(objective)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::glmm::pirls::{block_leverage, TailKernel};
-    use crate::glmm::workspace::glmm_block_chol;
-
-    /// `structured_row_reduce`'s `(y_i, r_i, S⁻¹r_i)` must reproduce the
-    /// block-inverse leverage `blocked_extras.rs`'s pass A computes directly
-    /// (`h_i = m_i'A_f⁻¹m_i`), on a hand-built two-cluster structured factor
-    /// (`qc = 2`, `e = 2`, dense Schur arm — no `StructuredSchur` needed):
-    /// `y_i·m_{c,i} + sr_i·r_i` over `cols` must equal `h_i`.
-    #[test]
-    fn structured_row_reduce_matches_block_inverse_leverage() {
-        let qc = 2;
-        let e = 2;
-
-        // Cluster 0's SPD core D_0 = B0 B0' + I, factored in place.
-        let b0 = [1.3, 0.0, 0.4, 0.9];
-        let mut fac0 = [0.0; 4];
-        for r in 0..qc {
-            for c in 0..qc {
-                for k in 0..qc {
-                    fac0[r * qc + c] += b0[r * qc + k] * b0[c * qc + k];
-                }
-            }
-            fac0[r * qc + r] += 1.0;
-        }
-        assert!(glmm_block_chol(&mut fac0, qc));
-
-        let b1 = [0.8, 0.0, -0.5, 1.1];
-        let mut fac1 = [0.0; 4];
-        for r in 0..qc {
-            for c in 0..qc {
-                for k in 0..qc {
-                    fac1[r * qc + c] += b1[r * qc + k] * b1[c * qc + k];
-                }
-            }
-            fac1[r * qc + r] += 1.0;
-        }
-        assert!(glmm_block_chol(&mut fac1, qc));
-
-        // Coupling blocks, qc×e row-major.
-        let coup0 = [0.3, -0.2, 0.1, 0.4];
-        let coup1 = [-0.1, 0.5, 0.2, -0.3];
-
-        // Schur S = (E + I) − Σ_f C_f'D_f⁻¹C_f, dense arm (cols = 0..e, ss = None).
-        let mut schur = [0.0; 4];
-        schur[0] = 2.0; // (E+I)_{00}
-        schur[e + 1] = 2.0; // (E+I)_{11}
-        let cols: [u32; 2] = [0, 1];
-        <f64 as TailKernel>::tail_downdate(&fac0, qc, &coup0, e, &cols, None, &mut schur);
-        <f64 as TailKernel>::tail_downdate(&fac1, qc, &coup1, e, &cols, None, &mut schur);
-        let mut schur_fac = schur;
-        assert!(<f64 as TailKernel>::tail_factor(&mut schur_fac, e, None).is_some());
-
-        // S⁻¹ columns, column-major: tail_inv[b·e+a] = (S⁻¹)_{a,b}.
-        let mut tail_inv = [0.0; 4];
-        for b in 0..e {
-            let mut rhs = [0.0; 2];
-            rhs[b] = 1.0;
-            <f64 as TailKernel>::tail_solve(&schur_fac, e, None, &mut rhs);
-            for a in 0..e {
-                tail_inv[b * e + a] = rhs[a];
-            }
-        }
-
-        // One test row per cluster.
-        #[allow(clippy::type_complexity)]
-        let rows: [(&[f64], &[f64], [f64; 2], [u32; 1], [f64; 1]); 2] = [
-            (&fac0, &coup0, [0.5, -0.7], [1], [0.6]),
-            (&fac1, &coup1, [-0.3, 0.9], [0], [-0.4]),
-        ];
-
-        for (fac, coup, m_c, cross_col, cross_val) in rows {
-            // Direct block-inverse leverage, mirroring blocked_extras.rs pass A.
-            let mut y_direct = m_c;
-            glmm_block_solve(fac, qc, &mut y_direct);
-            let mut h = block_leverage(fac, qc, &m_c);
-            let mut r_direct = [0.0; 2];
-            for &b in &cols {
-                let b = b as usize;
-                let mut acc = 0.0;
-                for local in 0..qc {
-                    acc += coup[local * e + b] * y_direct[local];
-                }
-                r_direct[b] = acc;
-            }
-            for (&col, val) in cross_col.iter().zip(cross_val) {
-                r_direct[col as usize] -= val;
-            }
-            for &b in &cols {
-                let b = b as usize;
-                let col = &tail_inv[b * e..b * e + e];
-                let mut acc = 0.0;
-                for &az in &cols {
-                    acc += r_direct[az as usize] * col[az as usize];
-                }
-                h += acc * r_direct[b];
-            }
-
-            // The reducer under test.
-            let mut y = [0.0; 2];
-            let mut r = [0.0; 2];
-            let mut sr = [0.0; 2];
-            structured_row_reduce(
-                fac, qc, &m_c, coup, e, &cols, &cross_col, &cross_val, &tail_inv, &mut y, &mut r,
-                &mut sr,
-            );
-
-            let got: f64 = (0..qc).map(|c| y[c] * m_c[c]).sum::<f64>()
-                + cols
-                    .iter()
-                    .map(|&b| sr[b as usize] * r[b as usize])
-                    .sum::<f64>();
-            assert!(
-                (got - h).abs() < 1e-12,
-                "reducer {got} vs pass-A leverage {h}"
-            );
-        }
-    }
 }

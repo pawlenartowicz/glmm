@@ -1,6 +1,6 @@
 #!/usr/bin/env Rscript
 # Generator for glmm_hessian_vcov.json -- the n=96 / 12-cluster `y ~ x1 + (1|grp)`
-# glmer fixture behind `fd_hessian_cov_matches_glmer_use_hessian_true` (and the
+# glmer fixture behind `joint_hessian_cov_matches_glmer_use_hessian_true` (and the
 # pipeline test that cites its band). Reads the committed JSON's data block
 # (x / y / cluster_ids are the fixture's identity and never change), refits, and
 # rewrites the derived fields: theta, beta, vcov_hessian, vcov_rx.

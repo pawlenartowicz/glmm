@@ -202,11 +202,6 @@ impl<const N: usize> crate::scalar::Scalar for Dual<N> {
     }
 
     #[inline]
-    fn abs(self) -> Self {
-        let fp = if self.v == 0.0 { 0.0 } else { self.v.signum() };
-        chain1(self, f64::abs(self.v), fp)
-    }
-    #[inline]
     fn sqrt(self) -> Self {
         let s = f64::sqrt(self.v);
         chain1(self, s, 0.5 / s)
@@ -231,10 +226,6 @@ impl<const N: usize> crate::scalar::Scalar for Dual<N> {
         } else {
             self
         }
-    }
-    #[inline]
-    fn mul_add(self, a: Self, b: Self) -> Self {
-        self * a + b
     }
 
     #[inline]
@@ -606,11 +597,6 @@ impl<const N: usize, const H: usize> crate::scalar::Scalar for HyperDual<N, H> {
     }
 
     #[inline]
-    fn abs(self) -> Self {
-        let fp = if self.v == 0.0 { 0.0 } else { self.v.signum() };
-        chain2(self, f64::abs(self.v), fp, 0.0)
-    }
-    #[inline]
     fn sqrt(self) -> Self {
         let s = f64::sqrt(self.v);
         chain2(self, s, 0.5 / s, -0.25 / (s * self.v))
@@ -635,10 +621,6 @@ impl<const N: usize, const H: usize> crate::scalar::Scalar for HyperDual<N, H> {
         } else {
             self
         }
-    }
-    #[inline]
-    fn mul_add(self, a: Self, b: Self) -> Self {
-        self * a + b
     }
 
     #[inline]
@@ -707,8 +689,9 @@ mod tests {
     /// Closed forms, not a reimplementation: ψ(1) = −γ, ψ(½) = −γ − 2ln2,
     /// ψ(2) = 1 − γ (A&S 6.3.2–6.3.4); ψ′(1) = π²/6, ψ′(½) = π²/2,
     /// ψ′(2) = π²/6 − 1 (A&S 6.4.3–6.4.5). Every point here goes through the
-    /// recurrence to `x ≥ 14`; `digamma_is_the_derivative_of_ln_gamma`'s
-    /// `x = 30` reaches the series directly.
+    /// recurrence to `x ≥ 14`; the `x = 30` point of
+    /// `dual_chain_rules_match_central_fd_of_the_f64_twin` reaches the series
+    /// directly.
     #[test]
     fn digamma_trigamma_match_closed_forms() {
         const EULER: f64 = 0.577_215_664_901_532_9;
@@ -755,22 +738,6 @@ mod tests {
         }
     }
 
-    /// ψ is the derivative of the crate's own `ln_gamma` — central FD against
-    /// the shipped Lanczos series, so the two agree as a pair and not just
-    /// against a table. Band is the FD floor at h = 1e-5, not the series'.
-    #[test]
-    fn digamma_is_the_derivative_of_ln_gamma() {
-        use crate::simd_transcendental::ln_gamma;
-        for &x in &[0.3_f64, 1.0, 2.5, 7.0, 30.0] {
-            let h = 1e-5 * x;
-            let fd = (ln_gamma(x + h) - ln_gamma(x - h)) / (2.0 * h);
-            assert!(
-                (digamma(x) - fd).abs() <= 1e-8 * fd.abs().max(1.0),
-                "x = {x}"
-            );
-        }
-    }
-
     /// f(a, b) = (a·b + a) / (b − a) at (a, b) = (2, 5), lanes seeded on a and b.
     /// ∂f/∂a = ((b + 1)(b − a) + (ab + a)) / (b − a)² = (6·3 + 12)/9 = 10/3
     /// ∂f/∂b = (a(b − a) − (ab + a)) / (b − a)² = (6 − 12)/9 = −2/3
@@ -788,52 +755,6 @@ mod tests {
         assert!((f.v - 4.0).abs() < 1e-15);
         assert!((f.d[0] - 10.0 / 3.0).abs() < 1e-14);
         assert!((f.d[1] + 2.0 / 3.0).abs() < 1e-14);
-    }
-
-    /// `AddAssign`/`SubAssign`/`MulAssign`/`DivAssign` are written as
-    /// `*self = *self <op> rhs`; check each agrees with its non-assigning
-    /// twin on the same operands.
-    #[test]
-    fn assign_ops_match_non_assign_twins() {
-        let a = Dual::<2> {
-            v: 2.0,
-            d: [1.0, 0.3],
-        };
-        let b = Dual::<2> {
-            v: 5.0,
-            d: [0.7, 1.0],
-        };
-
-        let mut add = a;
-        add += b;
-        assert_eq!(add.v, (a + b).v);
-        assert_eq!(add.d, (a + b).d);
-
-        let mut sub = a;
-        sub -= b;
-        assert_eq!(sub.v, (a - b).v);
-        assert_eq!(sub.d, (a - b).d);
-
-        let mut mul = a;
-        mul *= b;
-        assert_eq!(mul.v, (a * b).v);
-        assert_eq!(mul.d, (a * b).d);
-
-        let mut div = a;
-        div /= b;
-        assert_eq!(div.v, (a / b).v);
-        assert_eq!(div.d, (a / b).d);
-    }
-
-    /// A constant lifted with `from_f64` has all-zero derivative lanes.
-    #[test]
-    fn from_f64_gives_all_zero_lanes() {
-        fn from_f64<const N: usize>(v: f64) -> Dual<N> {
-            Dual { v, d: [0.0; N] }
-        }
-        let x: Dual<3> = from_f64(7.0);
-        assert_eq!(x.v, 7.0);
-        assert_eq!(x.d, [0.0, 0.0, 0.0]);
     }
 
     /// Every `Scalar` method's derivative lane against a central difference of the
@@ -854,7 +775,7 @@ mod tests {
             (f(x + h) - f(x - h)) / (2.0 * h)
         }
         let pts_all = [-3.5_f64, -0.7, 0.0, 0.4, 1.0, 4.0];
-        let pts_pos = [0.25_f64, 1.0, 3.0, 12.0];
+        let pts_pos = [0.25_f64, 0.3, 1.0, 3.0, 12.0, 30.0];
 
         for &x in &pts_all {
             let a = Dual::<1> { v: x, d: [1.0] };
@@ -930,66 +851,6 @@ mod tests {
         let c = Scalar::clamp_f64(a, 0.0, 4.0);
         assert_eq!(c.v, f64::clamp(5.0, 0.0, 4.0));
         assert_eq!(c.d, [0.0, 0.0]);
-    }
-
-    /// `Scalar::abs`/`mul_add` have no caller in the kernel yet, so nothing
-    /// else in the suite exercises them — call the trait methods directly.
-    /// `abs`'s derivative is `sign(x)`, chosen `0.0` at `x = 0` (the
-    /// sub-differential convention this crate picks for the kink); `mul_add`
-    /// on `f64` binds to the real fused primitive, and on `Dual` is `self·a+b`
-    /// through the ordinary operators — checked against both a hand partial
-    /// and the operator expression, so a swapped argument or a dropped `+b`
-    /// would show up here.
-    #[test]
-    fn abs_and_mul_add_match_hand_partials() {
-        assert_eq!(Scalar::abs(3.5f64), 3.5);
-        assert_eq!(Scalar::abs(-3.5f64), 3.5);
-        assert_eq!(Scalar::mul_add(2.5f64, 4.0, 1.5), 2.5f64.mul_add(4.0, 1.5));
-
-        let pos = Dual::<2> {
-            v: 5.0,
-            d: [1.0, -2.0],
-        };
-        let abs_pos = Scalar::abs(pos);
-        assert_eq!(abs_pos.v, 5.0);
-        assert_eq!(abs_pos.d, [1.0, -2.0]); // sign(5) = 1, chain rule passes lanes through
-
-        let neg = Dual::<2> {
-            v: -5.0,
-            d: [1.0, -2.0],
-        };
-        let abs_neg = Scalar::abs(neg);
-        assert_eq!(abs_neg.v, 5.0);
-        assert_eq!(abs_neg.d, [-1.0, 2.0]); // sign(-5) = -1, lanes flip
-
-        let zero = Dual::<2> {
-            v: 0.0,
-            d: [1.0, -2.0],
-        };
-        let abs_zero = Scalar::abs(zero);
-        assert_eq!(abs_zero.v, 0.0);
-        assert_eq!(abs_zero.d, [0.0, 0.0]); // the chosen sign-at-zero: both lanes zero
-
-        // a·b + c, lanes seeded on a=3 (lane 0), b=2 (lane 1); c carries its own
-        // lane-1 gradient so the `+c` half is exercised, not just the product.
-        let a = Dual::<2> {
-            v: 3.0,
-            d: [1.0, 0.0],
-        };
-        let b = Dual::<2> {
-            v: 2.0,
-            d: [0.0, 1.0],
-        };
-        let c = Dual::<2> {
-            v: 5.0,
-            d: [0.0, 2.0],
-        };
-        let got = Scalar::mul_add(a, b, c);
-        assert_eq!(got.v, 11.0);
-        assert_eq!(got.d, [2.0, 5.0]); // d/d0 = b·1 = 2; d/d1 = a·1 + c's own 2 = 5
-        let want = a * b + c;
-        assert_eq!(got.v, want.v);
-        assert_eq!(got.d, want.d);
     }
 
     /// `chol_lower_generic` at `T = f64`: factor a small SPD matrix and check
@@ -1247,28 +1108,6 @@ mod tests {
         assert!(f.h[2].abs() < 1e-14);
     }
 
-    /// `1/b` as a hyper-dual: `f(x) = 1/x`, `f' = −1/x²`, `f'' = 2/x³`, fed through
-    /// the general unary chain rule above. The hand-checked reference the recip
-    /// test below pins.
-    fn recip<const N: usize, const H: usize>(b: super::HyperDual<N, H>) -> super::HyperDual<N, H> {
-        let r = 1.0 / b.v;
-        super::chain2(b, r, -r * r, 2.0 * r * r * r)
-    }
-
-    /// `recip`, `f = 1/x` at `x = 4`: value `0.25`, first `−1/16`, second `2/64`.
-    #[test]
-    fn hyperdual_recip_matches_hand_second_partials() {
-        let x = super::HyperDual::<1, 1> {
-            v: 4.0,
-            d: [1.0],
-            h: [0.0],
-        };
-        let r = recip(x);
-        assert!((r.v - 0.25).abs() < 1e-14);
-        assert!((r.d[0] - (-1.0 / 16.0)).abs() < 1e-14);
-        assert!((r.h[0] - 2.0 / 64.0).abs() < 1e-14);
-    }
-
     /// `a / b * b == a` to `1e-13` in every lane (value, first, second),
     /// checking division round-trips.
     #[test]
@@ -1293,8 +1132,8 @@ mod tests {
         }
     }
 
-    /// f'' from HyperDual against a central difference of f' from Dual, at the same
-    /// points the chain-rule FD test above uses. Differencing the analytic first
+    /// f'' from HyperDual against a central difference of f' from Dual, at points like
+    /// those the chain-rule FD test above uses. Differencing the analytic first
     /// derivative, not the value, so the FD floor is ~1e-10 rather than ~1e-5.
     // `Scalar::$m(t)` inside `fd1`'s closure reads `Scalar::method` as a plain
     // function reference and clippy flags it as a redundant closure —
@@ -1381,71 +1220,6 @@ mod tests {
         assert_eq!(c.v, f64::clamp(5.0, 0.0, 4.0));
         assert_eq!(c.d, [0.0, 0.0]);
         assert_eq!(c.h, [0.0, 0.0, 0.0]);
-    }
-
-    /// `HyperDual` twin of `abs_and_mul_add_match_hand_partials`. `abs`'s
-    /// second derivative is `0.0` everywhere (the kink at `x = 0` aside, `|x|`
-    /// is linear), so its Hessian contribution is `sign(x)` times the input
-    /// Hessian, with no curvature term added.
-    #[test]
-    fn hyperdual_abs_and_mul_add_match_hand_second_partials() {
-        let pos = HyperDual::<2, 3> {
-            v: 5.0,
-            d: [1.0, -2.0],
-            h: [0.5, -0.25, 0.1],
-        };
-        let abs_pos = Scalar::abs(pos);
-        assert_eq!(abs_pos.v, 5.0);
-        assert_eq!(abs_pos.d, [1.0, -2.0]);
-        assert_eq!(abs_pos.h, [0.5, -0.25, 0.1]); // sign(5) = 1: both lane arrays pass through
-
-        let neg = HyperDual::<2, 3> {
-            v: -5.0,
-            d: [1.0, -2.0],
-            h: [0.5, -0.25, 0.1],
-        };
-        let abs_neg = Scalar::abs(neg);
-        assert_eq!(abs_neg.v, 5.0);
-        assert_eq!(abs_neg.d, [-1.0, 2.0]);
-        assert_eq!(abs_neg.h, [-0.5, 0.25, -0.1]); // sign(-5) = -1: both lane arrays flip
-
-        let zero = HyperDual::<2, 3> {
-            v: 0.0,
-            d: [1.0, -2.0],
-            h: [0.5, -0.25, 0.1],
-        };
-        let abs_zero = Scalar::abs(zero);
-        assert_eq!(abs_zero.v, 0.0);
-        assert_eq!(abs_zero.d, [0.0, 0.0]);
-        assert_eq!(abs_zero.h, [0.0, 0.0, 0.0]); // the chosen sign-at-zero: everything zero
-
-        // a·b + c, a and b pure variables (zero Hessian) seeded on lanes 0
-        // and 1; c carries its own lane-1 gradient, zero Hessian.
-        let a = HyperDual::<2, 3> {
-            v: 3.0,
-            d: [1.0, 0.0],
-            h: [0.0; 3],
-        };
-        let b = HyperDual::<2, 3> {
-            v: 2.0,
-            d: [0.0, 1.0],
-            h: [0.0; 3],
-        };
-        let c = HyperDual::<2, 3> {
-            v: 5.0,
-            d: [0.0, 2.0],
-            h: [0.0; 3],
-        };
-        let got = Scalar::mul_add(a, b, c);
-        assert_eq!(got.v, 11.0);
-        assert_eq!(got.d, [2.0, 5.0]);
-        // packed idx(0,0)=0, idx(1,0)=1, idx(1,1)=2: H(ab)_ij = a_i·b_j + a_j·b_i
-        // for zero-Hessian a, b, plus c's own (zero) Hessian.
-        assert_eq!(got.h, [0.0, 1.0, 0.0]);
-        let want = a * b + c;
-        assert_eq!(got.v, want.v);
-        assert_eq!(got.d, want.d);
-        assert_eq!(got.h, want.h);
     }
 
     /// `chol_lower_generic` at `HyperDual<2, 3>`: same SPD matrix and lane

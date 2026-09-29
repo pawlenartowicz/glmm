@@ -958,40 +958,21 @@ fn fit_with_varcorr(vech: Vec<f64>) -> Fit {
     }
 }
 
-/// q=1: a scalar block has no off-diagonal — stddev is just sqrt(variance)
-/// and the 1x1 "correlation matrix" is the trivial [[1.0]].
-#[test]
-fn stddev_corr_q1_trivial() {
-    let f = fit_with_varcorr(vec![9.0]);
-    let (sd, corr) = f.stddev_corr(0);
-    assert_eq!(sd, vec![3.0]);
-    assert_eq!(corr, vec![vec![1.0]]);
-}
-
-/// q=2 hand math, mirroring `varcorr_block_is_scaled_lambda_gram`'s D:
-/// D=[[4,1],[1,1.25]] → vech(col-major lower-tri)=[4,1,1.25].
-/// stddev=[2, sqrt(1.25)]; corr01 = 1/(2*sqrt(1.25)).
-#[test]
-fn stddev_corr_q2_hand_math() {
-    let f = fit_with_varcorr(vec![4.0, 1.0, 1.25]);
-    let (sd, corr) = f.stddev_corr(0);
-    let sd1 = 1.25_f64.sqrt();
-    assert!((sd[0] - 2.0).abs() < 1e-12);
-    assert!((sd[1] - sd1).abs() < 1e-12);
-    assert_eq!(corr[0][0], 1.0);
-    assert_eq!(corr[1][1], 1.0);
-    let rho = 1.0 / (2.0 * sd1);
-    assert!((corr[0][1] - rho).abs() < 1e-12);
-    assert!((corr[1][0] - rho).abs() < 1e-12);
-}
-
 /// q=3 hand-computed, chosen specifically to catch a vech-indexing bug:
 /// D = [[4,1,2],[1,9,3],[2,3,16]] (sd = [2,3,4], all off-diagonal terms
 /// distinct so a transposed/misindexed vech would mismatch). Column-major
 /// lower-tri vech walk: c=0 → (D00,D10,D20)=(4,1,2); c=1 → (D11,D21)=(9,3);
 /// c=2 → (D22)=(16). vech = [4,1,2,9,3,16], len=6 ⇒ q=3.
+///
+/// Also covers q=1, the common random-intercept case and the only length-1
+/// vech: a scalar block has no off-diagonal, stddev is sqrt(variance) and the
+/// 1x1 correlation matrix is [[1.0]].
 #[test]
 fn stddev_corr_q3_hand_math() {
+    let (sd1, corr1) = fit_with_varcorr(vec![9.0]).stddev_corr(0);
+    assert_eq!(sd1, vec![3.0]);
+    assert_eq!(corr1, vec![vec![1.0]]);
+
     let f = fit_with_varcorr(vec![4.0, 1.0, 2.0, 9.0, 3.0, 16.0]);
     let (sd, corr) = f.stddev_corr(0);
     assert_eq!(sd, vec![2.0, 3.0, 4.0]);
@@ -1031,7 +1012,7 @@ fn assemble_varcorr_one_block_per_grouping() {
         &[],
     );
     let theta = [2.0, 0.5, 1.0, 0.7];
-    let vc = super::assemble_varcorr(&theta, &g, 1.0);
+    let vc = super::common::assemble_varcorr(&theta, &g, 1.0);
     assert_eq!(vc.len(), 2);
     assert_eq!(vc[0], vec![4.0, 1.0, 1.25]);
     assert!((vc[1][0] - 0.49).abs() < 1e-12, "extra D {}", vc[1][0]);
@@ -1473,43 +1454,17 @@ fn fit_glmm_degenerate_width_never_panics() {
     }
 }
 
-/// Warm-path wrapper equivalence: `fit_cold(..)` and `fit_warm(.., None, ..)`
-/// return a byte-identical `Fit` — locks "one implementation, two names".
-/// Uses the intercept-only 6-cluster LMM.
-#[test]
-fn fit_cold_equals_fit_warm_none() {
-    let (x, y, n, p) = lmm_hand_dataset();
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 6 },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds::from_sizing(model.re.as_ref().unwrap(), n);
-    let opts = FitOptions {
-        target_indices: vec![1, 2],
-        ..FitOptions::default()
-    };
-    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    let warm_none = fit_warm(&x, &y, n, p, &model, &ids, None, &opts);
-    // Bitwise equality (not PartialEq): non-target SE slots are NaN, and
-    // NaN != NaN under `==` — but the two Fits share one code path, so their
-    // bit patterns (NaNs included) must match exactly.
-    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-    assert_eq!(bits(&cold.beta), bits(&warm_none.beta));
-    assert_eq!(bits(&cold.se), bits(&warm_none.se));
-    assert_eq!(bits(&cold.tau2), bits(&warm_none.tau2));
-    assert_eq!(cold.dispersion.to_bits(), warm_none.dispersion.to_bits());
-    assert_eq!(cold.converged(), warm_none.converged());
-}
-
 /// Warm-path start-independence: on an LMM the MLE is start-independent, so a
 /// warm fit from a perturbed `StartValues.theta` reaches the same β̂ as the cold
 /// fit to optimizer tolerance — a good start shortens the path without moving the
 /// MLE. n_theta=1 (intercept-only 6-cluster), so theta=[5.0] is
 /// well off the THETA0 blind start.
+///
+/// Run once with a full β start and once from a θ-only start (`beta` empty —
+/// the per-component cold marker the ports need for lme4's
+/// `start = list(theta = …)`). The LMM ignores a β start anyway (β is solved
+/// exactly given θ), so the empty row pins that an empty β is accepted rather
+/// than faulting the entry assert, and that θ still threads through.
 #[test]
 fn fit_warm_start_reaches_cold_beta() {
     let (x, y, n, p) = lmm_hand_dataset();
@@ -1527,63 +1482,26 @@ fn fit_warm_start_reaches_cold_beta() {
         ..FitOptions::default()
     };
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    let start = StartValues {
-        beta: vec![0.0; p],
-        theta: vec![5.0],
-    };
-    let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
-    assert!(
-        cold.converged() && warm.converged(),
-        "both fits must converge"
-    );
-    for j in [1usize, 2] {
-        let (a, b) = (cold.beta[j], warm.beta[j]);
-        let d = (a - b).abs();
+    for beta in [vec![0.0; p], vec![]] {
+        let start = StartValues {
+            beta,
+            theta: vec![5.0],
+        };
+        let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
         assert!(
-            d <= 1e-7 || d <= 1e-6 * a.abs().max(b.abs()),
-            "LMM MLE must be start-independent: β[{j}] cold {a} vs warm {b}"
+            cold.converged() && warm.converged(),
+            "both fits must converge (start beta {:?})",
+            start.beta
         );
-    }
-}
-
-/// Same start-independence on the LMM, but from a θ-only start (`beta` empty —
-/// the per-component cold marker the ports need for lme4's
-/// `start = list(theta = …)`). The LMM ignores a β start anyway (β is solved
-/// exactly given θ), so this pins that an empty β is accepted rather than
-/// faulting the entry assert, and that θ still threads through.
-#[test]
-fn fit_warm_theta_only_start_reaches_cold_beta() {
-    let (x, y, n, p) = lmm_hand_dataset();
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 6 },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds::from_sizing(model.re.as_ref().unwrap(), n);
-    let opts = FitOptions {
-        target_indices: vec![1, 2],
-        ..FitOptions::default()
-    };
-    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    let start = StartValues {
-        beta: vec![],
-        theta: vec![5.0],
-    };
-    let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
-    assert!(
-        cold.converged() && warm.converged(),
-        "both fits must converge"
-    );
-    for j in [1usize, 2] {
-        let (a, b) = (cold.beta[j], warm.beta[j]);
-        let d = (a - b).abs();
-        assert!(
-            d <= 1e-7 || d <= 1e-6 * a.abs().max(b.abs()),
-            "LMM MLE must be start-independent: β[{j}] cold {a} vs warm {b}"
-        );
+        for j in [1usize, 2] {
+            let (a, b) = (cold.beta[j], warm.beta[j]);
+            let d = (a - b).abs();
+            assert!(
+                d <= 1e-7 || d <= 1e-6 * a.abs().max(b.abs()),
+                "LMM MLE must be start-independent: β[{j}] cold {a} vs warm {b} (start beta {:?})",
+                start.beta
+            );
+        }
     }
 }
 
@@ -1637,7 +1555,7 @@ fn classify_routes_at_the_cap_edge() {
         }),
     };
     assert!(matches!(
-        super::classify_design_pub(&in_env, 1),
+        super::classify_design(&in_env, 1),
         super::Solver::NoZ
     ));
 
@@ -1656,7 +1574,7 @@ fn classify_routes_at_the_cap_edge() {
         }),
     };
     assert!(matches!(
-        super::classify_design_pub(&over, 1),
+        super::classify_design(&over, 1),
         super::Solver::Sparse
     ));
 
@@ -1670,7 +1588,7 @@ fn classify_routes_at_the_cap_edge() {
         }),
     };
     assert!(matches!(
-        super::classify_design_pub(&wide, 1),
+        super::classify_design(&wide, 1),
         super::Solver::Sparse
     ));
 }
@@ -1698,19 +1616,19 @@ fn classify_routes_many_crossed_levels_to_sparse() {
     // One factor over the cap ⇒ Sparse.
     let over = spec(vec![crossed(cap + 1)]);
     assert!(matches!(
-        super::classify_design_pub(&over, 1),
+        super::classify_design(&over, 1),
         super::Solver::Sparse
     ));
     // Sum over factors trips the cap even when each is under it.
     let sum_over = spec(vec![crossed(cap / 2 + 1), crossed(cap / 2 + 1)]);
     assert!(matches!(
-        super::classify_design_pub(&sum_over, 1),
+        super::classify_design(&sum_over, 1),
         super::Solver::Sparse
     ));
     // Exactly at the cap ⇒ NoZ unchanged.
     let at_cap = spec(vec![crossed(cap)]);
     assert!(matches!(
-        super::classify_design_pub(&at_cap, 1),
+        super::classify_design(&at_cap, 1),
         super::Solver::NoZ
     ));
     // A many-level NESTED extra doesn't count toward the crossed sum.
@@ -1721,7 +1639,7 @@ fn classify_routes_many_crossed_levels_to_sparse() {
         slopes: vec![],
     }]);
     assert!(matches!(
-        super::classify_design_pub(&nested, 1),
+        super::classify_design(&nested, 1),
         super::Solver::NoZ
     ));
 }
@@ -1748,13 +1666,13 @@ fn classify_routes_slope_extras_to_sparse_all_families() {
     // Gaussian, slope-carrying extra (q_g = 2, in-envelope) ⇒ Sparse.
     let g_slope = spec(Family::Gaussian, vec![1]);
     assert!(matches!(
-        super::classify_design_pub(&g_slope, 1),
+        super::classify_design(&g_slope, 1),
         super::Solver::Sparse
     ));
     // Gaussian, intercept-only extra ⇒ NoZ.
     let g_int = spec(Family::Gaussian, vec![]);
     assert!(matches!(
-        super::classify_design_pub(&g_int, 1),
+        super::classify_design(&g_int, 1),
         super::Solver::NoZ
     ));
     // Non-Gaussian, slope-carrying extra ⇒ Sparse (the only kernel that fits it).
@@ -1765,21 +1683,8 @@ fn classify_routes_slope_extras_to_sparse_all_families() {
         vec![1],
     );
     assert!(matches!(
-        super::classify_design_pub(&p_slope, 1),
+        super::classify_design(&p_slope, 1),
         super::Solver::Sparse
-    ));
-}
-
-/// A fixed-only model always routes NoZ (no RE to make sparse).
-#[test]
-fn classify_fixed_only_is_noz() {
-    let ols = ModelSpec {
-        family: Family::Gaussian,
-        re: None,
-    };
-    assert!(matches!(
-        super::classify_design_pub(&ols, 1),
-        super::Solver::NoZ
     ));
 }
 
@@ -1844,10 +1749,80 @@ fn out_of_range_extra_slope_column_is_rejected() {
     );
 }
 
+/// A binomial-logit GLMM with a single intercept-only grouping (4
+/// clusters) — the nagq-rejection tests below each override exactly the
+/// field that trips their own check.
+fn nagq_check_spec() -> ModelSpec {
+    ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 4 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    }
+}
+
+#[test]
+#[should_panic(expected = "must be odd in 1..=")]
+fn nagq_even_rejected() {
+    // nagq=4 is even, in range, on an otherwise legal model: only the parity check fires.
+    assert_model_shape(&nagq_check_spec(), 2, 4);
+}
+
+#[test]
+#[should_panic(expected = "must be odd in 1..=")]
+fn nagq_above_max_rejected() {
+    // nagq=27 is odd but past MAX_NAGQ (25).
+    assert_model_shape(&nagq_check_spec(), 2, 27);
+}
+
+#[test]
+#[should_panic(expected = "requires a mixed model")]
+fn nagq_on_a_fixed_only_model_is_rejected() {
+    let mut model = nagq_check_spec();
+    model.re = None;
+    assert_model_shape(&model, 2, 3);
+}
+
+/// `nagq>1` is legal only on a binomial/Poisson/negative-binomial/Gamma
+/// single-grouping-factor GLMM. A Gaussian mixed model has no quadrature
+/// to do (its marginal likelihood is exact), so it is rejected the same way
+/// a multi-grouping one is.
+#[test]
+#[should_panic(expected = "binomial, Poisson, negative-binomial and Gamma GLMMs")]
+fn nagq_on_a_gaussian_lmm_is_rejected() {
+    let mut model = nagq_check_spec();
+    model.family = Family::Gaussian;
+    assert_model_shape(&model, 2, 3);
+}
+
+/// The negative-binomial dispersion θ sits outside the integral (a
+/// per-row constant in u), so the binomial/Poisson AGQ kernels serve NB.
+#[test]
+fn nagq_on_a_negative_binomial_glmm_is_accepted() {
+    let mut model = nagq_check_spec();
+    model.family = Family::NegativeBinomial {
+        link: NegBinomialLink::Log,
+    };
+    assert_model_shape(&model, 2, 3);
+}
+
+#[test]
+#[should_panic(expected = "exceeds the temporary")]
+fn nagq_over_the_q_cap_is_rejected() {
+    let mut model = nagq_check_spec();
+    // q_p = 4, past the temporary q_p<=3 cap.
+    model.re.as_mut().unwrap().slopes = vec![0, 1, 2];
+    assert_model_shape(&model, 3, 3);
+}
+
 /// Tier-0 short-circuit: a fixed-only
 /// fit (no random effects, no θ to search) must run the direct GLM/OLS path and
 /// enter the BOBYQA search ZERO times. `fit_cold`'s `(family, None)` dispatch arms
-/// route straight to `fit_ols`/`fit_glm`/`fit_glm_nb`, each of which hard-sets
+/// route straight to `fit_ols_prebuilt`/`fit_glm`/`fit_glm_nb`, each of which hard-sets
 /// `n_eval: 0`; this pins that invariant end-to-end (through the whole cold path,
 /// not just `classify_design`) across every wired fixed-only family, so a future
 /// change that accidentally sent a no-Z model through the optimizer would trip it.
@@ -2134,52 +2109,6 @@ fn vcov_rows_are_nan_for_aliased_columns() {
 // The public `Diagnostics` surface: the three moved fields, the two
 // reshaped ones, and the notes channel.
 // ---------------------------------------------------------------------------
-
-/// A clean OLS design and a rank-deficient one, each read through BOTH paths —
-/// `fit.diagnostics.<field>` and the forwarding accessor. The point is not the
-/// values (other tests pin those) but that the two paths are the same storage:
-/// if a future change ever re-adds a top-level copy of one of these, one of the
-/// four `assert_eq!`s below stops holding.
-#[test]
-fn diagnostics_moved_fields_agree_through_both_paths() {
-    let (n, p) = (12usize, 3usize);
-    let mut st = 11u64;
-    let mut x = Vec::with_capacity(n * p);
-    let mut y = Vec::with_capacity(n);
-    for i in 0..n {
-        let a = lcg(&mut st);
-        let b = lcg(&mut st);
-        x.extend_from_slice(&[1.0, a, b]);
-        y.push(0.3 + 1.1 * a - 0.7 * b + 0.05 * ((i % 3) as f64 - 1.0));
-    }
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: None,
-    };
-    let opts = FitOptions {
-        target_indices: (0..p as u32).collect(),
-        ..FitOptions::default()
-    };
-    let fit = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
-    assert_eq!(fit.diagnostics.converged, fit.converged());
-    assert_eq!(fit.diagnostics.singular, fit.singular());
-    assert_eq!(fit.diagnostics.aliased, fit.aliased());
-    assert!(fit.converged() && !fit.singular());
-    assert_eq!(fit.aliased(), vec![false; p]);
-
-    // Column 2 duplicated onto column 1 ⇒ the alias gate drops it. `aliased` is
-    // the one moved field the alias gate fills from ABOVE the fitting routes,
-    // so it needs its own true-valued case.
-    let mut xd = Vec::with_capacity(n * p);
-    for i in 0..n {
-        let a = x[i * p + 1];
-        xd.extend_from_slice(&[1.0, a, a]);
-    }
-    let dup = fit_cold(&xd, &y, n, p, &model, &GroupIds::default(), &opts);
-    assert_eq!(dup.diagnostics.aliased, dup.aliased());
-    assert_eq!(dup.aliased(), vec![false, false, true]);
-    assert!(dup.converged(), "the reduced model fits");
-}
 
 /// `Boundary` at both ends of the range the dense LMM route can report:
 /// the deterministic τ̂=0 pin fixture (`fit_lmm_weighted_boundary_matches_wls`'s

@@ -12,7 +12,7 @@ use crate::ols::PANEL_ROWS;
 use faer::Mat;
 
 /// Near-identity slice comparison shared by the fit-core equivalence tests
-/// (`fit_on`-on-reused-ws vs `fit_cold`, view-mapper vs direct). Tolerance is
+/// (`fit_on`-on-reused-ws vs `fit_cold`). Tolerance is
 /// `1e-12 + 1e-9·|want|` — tight enough to catch every failure these gates
 /// exist for (stale buffers, `n_max` over-reads, option-reset misses shift
 /// results materially, not by an ULP) without demanding bit-identity across a
@@ -205,9 +205,13 @@ pub(crate) fn block_levels(rel: &crate::GroupingRelation) -> usize {
 /// `engine_contract::ClusterSpec::atom` (test-only DGP layout).
 pub(crate) fn model_atom(spec: &crate::ModelSpec) -> usize {
     let re = spec.re.as_ref().expect("model_atom requires re: Some");
+    let base = match &re.sizing {
+        crate::Sizing::FixedClusters { n_clusters } => (*n_clusters).max(1) as usize,
+        crate::Sizing::FixedSize { cluster_size } => (*cluster_size).max(1) as usize,
+    };
     re.extra_groupings
         .iter()
-        .fold(re.sizing.atom(), |a, g| a * block_levels(&g.relation))
+        .fold(base, |a, g| a * block_levels(&g.relation))
 }
 
 /// Level of extra grouping `g` that row `i` belongs to. `ModelSpec`-shaped
@@ -219,4 +223,15 @@ pub(crate) fn extra_level_of_row(spec: &crate::ModelSpec, g: usize, i: usize) ->
         .as_ref()
         .expect("extra_level_of_row requires re: Some");
     crate::ids::extra_level_of_row(re, g, i) as usize
+}
+
+/// Primary cluster owning row `i` under the positional layout: rows dealt
+/// round-robin (`i % n_clusters`) under `FixedClusters`, contiguous blocks
+/// (`i / cluster_size`) under `FixedSize`. Mirrors
+/// `engine_contract::ClusterSizing::cluster_of_row` (test-only DGP layout).
+pub(crate) fn cluster_of_row(sizing: &crate::Sizing, i: usize) -> usize {
+    match sizing {
+        crate::Sizing::FixedClusters { n_clusters } => i % (*n_clusters).max(1) as usize,
+        crate::Sizing::FixedSize { cluster_size } => i / (*cluster_size).max(1) as usize,
+    }
 }

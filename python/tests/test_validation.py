@@ -43,11 +43,6 @@ FIT_DATA = {
 }
 
 
-def test_unknown_family_raises():
-    with pytest.raises(ValueError, match="unknown family"):
-        glmm.fit(DATA, "y ~ x", "logistic")
-
-
 def test_unknown_family_message_matches_the_r_port():
     # Exact text, including the family list order: mirrors the R port's
     # equivalent case (r/tests/testthat/test-errors.R has no separate test
@@ -63,24 +58,12 @@ def test_unknown_family_message_matches_the_r_port():
         glmm.fit(DATA, "y ~ x", "logistic")
 
 
-def test_link_not_offered_raises():
-    with pytest.raises(ValueError, match="does not support link"):
-        glmm.fit(DATA, "y ~ x", "poisson", link="identity")
-
-
 def test_link_not_offered_message_matches_the_r_port():
     with pytest.raises(
         ValueError,
         match=r"^family 'binomial' does not support link 'identity'; expected one of logit, probit, cloglog$",
     ):
         glmm.fit(DATA, "y ~ x", "binomial", link="identity")
-
-
-def test_double_bar_formula_raises():
-    # Mirrors the R port's equivalent case (r/tests/testthat/test-errors.R):
-    # both ports give the same message for this formula shape.
-    with pytest.raises(ValueError, match="full RE correlation structure"):
-        glmm.fit(DATA, "y ~ x + (x || g)")
 
 
 @pytest.mark.parametrize("formula", ["y ~ .", "y ~ . - x", "y ~ x * ."])
@@ -97,15 +80,9 @@ def test_intercept_suppressed_re_term_raises():
         glmm.fit(DATA, "y ~ x + (0 + x | g)")
 
 
-def test_cloglog_glm_fits():
-    result = glmm.fit(FIT_DATA, "y_bin ~ x", "binomial", link="cloglog")
-    assert result.converged
-    assert len(result.beta) == 2
-    assert result.dispersion == 1.0
-
-
-def test_probit_glm_fits():
-    result = glmm.fit(FIT_DATA, "y_bin ~ x", "binomial", link="probit")
+@pytest.mark.parametrize("link", ["cloglog", "probit"])
+def test_binomial_glm_link_fits(link):
+    result = glmm.fit(FIT_DATA, "y_bin ~ x", "binomial", link=link)
     assert result.converged
     assert len(result.beta) == 2
     assert result.dispersion == 1.0
@@ -178,72 +155,10 @@ def test_nagq_on_negbin_and_gamma_fits_quadrature(family, response):
     assert result.converged
 
 
-# Ineligible-shape nagq>1 is valid-but-inapplicable: warn and strip
-# to nagq=1, never surface the kernel's shape panic as a ValueError. Eligibility
-# mirrors src/fit/common.rs::assert_model_shape — single grouping factor,
-# binomial/Poisson/negative-binomial/Gamma, q ≤ 3.
-
-
-def test_nagq_on_gaussian_mixed_warns_and_strips_to_laplace():
-    with pytest.warns(glmm.ArgumentIgnoredWarning, match="nagq"):
-        result = glmm.fit(FIT_DATA, "y_gauss ~ x + (1 | g)", "gaussian", nagq=3)
-    assert result.converged
-    # The stripped fit IS the Laplace fit — same answer as an explicit nagq=1 call.
-    base = glmm.fit(FIT_DATA, "y_gauss ~ x + (1 | g)", "gaussian")
-    assert _np.allclose(result.beta, base.beta)
-
-
-def test_nagq_on_crossed_re_warns_and_strips():
-    data = {**FIT_DATA, "h": [f"h{i % 5}" for i in range(_N)]}
-    with pytest.warns(glmm.AgqFallbackWarning, match="nagq"):
-        result = glmm.fit(data, "y_bin ~ x + (1 | g) + (1 | h)", "binomial", nagq=3)
-    assert result.converged
-
-
-def test_nagq_over_q_cap_warns_and_strips():
-    # q_p = 4 (intercept + 3 slopes) exceeds the temporary q ≤ 3 AGQ cap.
-    data = {
-        **FIT_DATA,
-        "x1": _rng.normal(size=_N).tolist(),
-        "x2": _rng.normal(size=_N).tolist(),
-        "x3": _rng.normal(size=_N).tolist(),
-    }
-    with pytest.warns(glmm.AgqFallbackWarning, match="nagq"):
-        result = glmm.fit(
-            data,
-            "y_bin ~ x + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g)",
-            "binomial",
-            nagq=3,
-        )
-    assert result.converged
-
-
-def test_nagq_on_fixed_only_warns_and_strips():
-    with pytest.warns(glmm.ArgumentIgnoredWarning, match="nagq"):
-        result = glmm.fit(FIT_DATA, "y_bin ~ x", "binomial", nagq=3)
-    assert result.converged
-
-
-def test_dispersion_on_gaussian_warns_and_strips_then_fits():
-    with pytest.warns(glmm.ArgumentIgnoredWarning, match="dispersion"):
-        result = glmm.fit(FIT_DATA, "y_gauss ~ x", "gaussian", dispersion="estimate")
-    assert result.converged
-
-
 def test_dispersion_on_negativebinomial_warns_then_fits():
     # negbin's distribution param is theta, not phi.
     with pytest.warns(glmm.ArgumentIgnoredWarning, match="dispersion"):
         result = glmm.fit(FIT_DATA, "y_pois ~ x", "negativebinomial", dispersion=1.5)
-    assert result.converged
-
-
-def test_quasi_on_mixed_binomial_warns_then_fits():
-    # "estimate" on binomial/poisson is quasi-likelihood, GLM only —
-    # on a MIXED formula it is stripped (warn), not a kernel gap.
-    with pytest.warns(
-        glmm.ArgumentIgnoredWarning, match="Quasi-likelihood dispersion= is not supported yet"
-    ):
-        result = glmm.fit(FIT_DATA, "y_bin ~ x + (1 | g)", "binomial", dispersion="estimate")
     assert result.converged
 
 
@@ -252,11 +167,6 @@ def test_quasi_on_glm_poisson_is_a_kernel_gap():
     # quasi-Poisson has no kernel implementation yet.
     with pytest.raises(NotImplementedError, match="quasi-likelihood"):
         glmm.fit(FIT_DATA, "y_pois ~ x", "poisson", dispersion="estimate")
-
-
-def test_dispersion_bad_value_raises():
-    with pytest.raises(ValueError, match="dispersion"):
-        glmm.fit(DATA, "y ~ x", "gamma", dispersion="pearson")
 
 
 def test_dispersion_bad_value_message_matches_the_r_port():
@@ -271,12 +181,6 @@ def test_dispersion_bool_raises():
     # bool is an int subclass — must not pass as a numeric dispersion.
     with pytest.raises(ValueError, match="dispersion"):
         glmm.fit(DATA, "y ~ x", "gamma", dispersion=True)
-
-
-def test_init_theta_off_negbin_warns_then_fits():
-    with pytest.warns(glmm.ArgumentIgnoredWarning, match="init_theta"):
-        result = glmm.fit(FIT_DATA, "y_gamma ~ x", "gamma", init_theta=1.5)
-    assert result.converged
 
 
 def test_init_theta_on_negbin_is_a_kernel_gap():
@@ -299,21 +203,6 @@ def test_init_theta_and_warm_start_theta_are_independent(recwarn):
     )
     assert result.converged
     assert any("init_theta" in str(w.message) for w in recwarn)
-
-
-def test_warm_start_unknown_key_warns_then_fits():
-    with pytest.warns(glmm.ArgumentIgnoredWarning, match="warm_start"):
-        result = glmm.fit(
-            FIT_DATA,
-            "y_gauss ~ x",
-            warm_start={"beta": [0.0, 0.0], "phi": 1.0},
-        )
-    assert result.converged
-
-
-def test_warm_start_not_dict_raises():
-    with pytest.raises(TypeError, match="warm_start"):
-        glmm.fit(DATA, "y ~ x", warm_start=[0.0, 0.0])
 
 
 def test_warm_start_not_dict_message_matches_the_r_port():
@@ -340,26 +229,10 @@ def test_clean_call_emits_no_warnings_and_fits():
     assert result.converged
 
 
-def test_wrong_length_weights_is_a_plain_valueerror():
-    with pytest.raises(
-        ValueError, match=r"^weights must be a numeric array with one entry per row"
-    ):
-        glmm.fit(DATA, "y ~ x", weights=[1.0, 2.0])
-
-
-def test_wrong_length_offset_is_a_plain_valueerror():
-    with pytest.raises(ValueError, match=r"^offset must be a numeric array with one entry per row"):
-        glmm.fit(DATA, "y ~ x", offset=[1.0, 2.0])
-
-
-def test_missing_formula_column_is_reported_before_weights_length():
-    # "z" is not in `data` at all. `_formula_columns` silently drops it from
-    # `used_names`, so without the missing-column check `used_names` would
-    # hold only "y"/"x", `weights=` of the wrong length for THAT would fail
-    # first, and the real problem (an unknown column) would never be named.
-    data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
-    with pytest.raises(ValueError, match=r"^column\(s\) not found in data: z$"):
-        glmm.fit(data, "y ~ x + z", weights=[1.0, 2.0, 3.0])
+@pytest.mark.parametrize("arg", ["weights", "offset"])
+def test_wrong_length_weights_or_offset_is_a_plain_valueerror(arg):
+    with pytest.raises(ValueError, match=rf"^{arg} must be a numeric array with one entry per row"):
+        glmm.fit(DATA, "y ~ x", **{arg: [1.0, 2.0]})
 
 
 def test_missing_formula_column_is_reported_even_with_wrong_length_weights():
@@ -399,14 +272,6 @@ def test_one_level_bool_factor_in_the_fixed_part_raises():
         glmm.fit(data, "y ~ b + x")
 
 
-def test_one_level_factor_inside_an_interaction_raises():
-    data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0], "f": ["z", "z", "z"]}
-    with pytest.raises(
-        ValueError, match=r"contrasts can be applied only to factors with 2 or more levels"
-    ):
-        glmm.fit(data, "y ~ f * x")
-
-
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), None])
 @pytest.mark.parametrize("arg", ["weights", "offset"])
 def test_non_finite_weights_or_offset_is_a_plain_valueerror(arg, bad, capfd):
@@ -430,16 +295,6 @@ def test_nan_weight_on_a_row_dropped_for_na_is_still_rejected():
     data = {"y": [1.0, 2.0, 3.0, 4.0], "x": [0.0, 1.0, float("nan"), 3.0]}
     with pytest.raises(ValueError, match=r"^weights must be finite"):
         glmm.fit(data, "y ~ x", weights=[1.0, 2.0, float("nan"), 4.0])
-
-
-def test_nan_in_numeric_column_drops_its_row_and_warns():
-    # A used column's NaN row is dropped before conversion (R's default
-    # na.action = na.omit), not handed to the kernel's entry check.
-    data = {"y": [1.0, 2.0, 3.0, 4.0], "x": [0.0, 1.0, float("nan"), 3.0]}
-    with pytest.warns(glmm.RowsDroppedWarning, match=r"Dropped 1 of 4 row"):
-        result = glmm.fit(data, "y ~ x")
-    assert result.converged
-    assert result.nobs == 3
 
 
 def test_unused_column_with_an_unconvertible_dtype_is_never_touched():

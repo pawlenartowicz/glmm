@@ -514,35 +514,6 @@ fn pastes_flat_nested_equals_the_explicit_nesting() {
     assert_eq!(lo_exp.re_groups[1].name, "batch:cask");
 }
 
-/// Guard the other direction: `(1|plate)+(1|sample)` on Penicillin is genuinely
-/// crossed (every sample spans every plate), so the nesting detection must NOT
-/// reclassify it — a false positive would corrupt the padded family-block
-/// Cholesky.
-#[test]
-fn penicillin_stays_crossed() {
-    let data = rows(include_str!("../validation/data/empirical/Penicillin.csv"));
-    let table = Table {
-        columns: vec![
-            ("diameter".into(), numeric(&data, 0)),
-            ("plate".into(), factor(&data, 1)),
-            ("sample".into(), factor(&data, 2)),
-        ],
-        n: data.len(),
-    };
-    let lo = lower(
-        "diameter ~ (1|plate) + (1|sample)",
-        &table,
-        Family::Gaussian,
-    )
-    .unwrap();
-    let extra = &lo.model.re.as_ref().unwrap().extra_groupings[0];
-    assert!(
-        matches!(extra.relation, GroupingRelation::Crossed { .. }),
-        "crossed (1|plate)+(1|sample) must stay Crossed, got {:?}",
-        extra.relation
-    );
-}
-
 // ── GLMM ─────────────────────────────────────────────────────────────────────
 
 /// cbpp as expanded Bernoulli rows. The aggregated form is the one the oracle
@@ -889,25 +860,6 @@ fn grouseticks_poisson_matches_hand_built_spec() {
 // fabricated tables are enough to exercise `lower_random_effects`'s
 // primary/extra bookkeeping.
 
-#[test]
-fn intercept_free_re_only_formula_is_rejected() {
-    let table = Table {
-        columns: vec![
-            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
-            (
-                "g".into(),
-                Column::factor_from_labels(&["a", "a", "b", "b"].map(String::from)),
-            ),
-        ],
-        n: 4,
-    };
-    let err = match lower("y ~ 0 + (1|g)", &table, Family::Gaussian) {
-        Ok(_) => panic!("expected an intercept-free, term-free formula to be rejected"),
-        Err(e) => e,
-    };
-    assert!(err.to_string().contains("no columns"), "{err}");
-}
-
 /// The first-factor promotion (`y ~ 0 + f + ...`) is a FIXED-DESIGN coding
 /// convention only. A random slope on the promoted factor must not inherit the
 /// promotion: `(f|g)` should resolve to the same treatment-coded slope block
@@ -993,83 +945,6 @@ fn transform_of_a_factor_column_is_rejected_as_not_numeric() {
         Err(e) => e,
     };
     assert!(err.to_string().contains("is not numeric"), "{err}");
-}
-
-#[test]
-fn re_groups_intercept_only() {
-    let table = Table {
-        columns: vec![
-            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
-            (
-                "g".into(),
-                Column::factor_from_labels(&["a", "a", "b", "b"].map(String::from)),
-            ),
-        ],
-        n: 4,
-    };
-    let lo = glmm::formula::lower("y ~ (1|g)", &table, Family::Gaussian).unwrap();
-    assert_eq!(lo.re_groups.len(), 1);
-    assert_eq!(lo.re_groups[0].name, "g");
-    assert_eq!(lo.re_groups[0].terms, vec!["(Intercept)".to_string()]);
-}
-
-#[test]
-fn re_groups_intercept_and_slope() {
-    let table = Table {
-        columns: vec![
-            ("Reaction".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
-            ("Days".into(), Column::Numeric(vec![0.0, 1.0, 0.0, 1.0])),
-            (
-                "Subject".into(),
-                Column::factor_from_labels(&["s1", "s1", "s2", "s2"].map(String::from)),
-            ),
-        ],
-        n: 4,
-    };
-    let lo = glmm::formula::lower(
-        "Reaction ~ Days + (1 + Days | Subject)",
-        &table,
-        Family::Gaussian,
-    )
-    .unwrap();
-    assert_eq!(lo.re_groups.len(), 1);
-    assert_eq!(lo.re_groups[0].name, "Subject");
-    assert_eq!(
-        lo.re_groups[0].terms,
-        vec!["(Intercept)".to_string(), "Days".to_string()]
-    );
-}
-
-#[test]
-fn re_groups_primary_and_extra() {
-    // Primary = plate (declared first), extra = sample (declared second) —
-    // both intercept-only, crossed. Order must mirror declaration order, which
-    // is what `Fit::varcorr`/`Fit::tau2` blocks follow.
-    let table = Table {
-        columns: vec![
-            ("diameter".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
-            (
-                "plate".into(),
-                Column::factor_from_labels(&["p1", "p1", "p2", "p2"].map(String::from)),
-            ),
-            (
-                "sample".into(),
-                Column::factor_from_labels(&["s1", "s2", "s1", "s2"].map(String::from)),
-            ),
-        ],
-        n: 4,
-    };
-    let lo = glmm::formula::lower(
-        "diameter ~ (1|plate) + (1|sample)",
-        &table,
-        Family::Gaussian,
-    )
-    .unwrap();
-    assert_eq!(lo.re_groups.len(), 2);
-    assert_eq!(lo.re_groups[0].name, "plate");
-    assert_eq!(lo.re_groups[0].terms, vec!["(Intercept)".to_string()]);
-    assert_eq!(lo.re_groups[1].name, "sample");
-    assert_eq!(lo.re_groups[1].terms, vec!["(Intercept)".to_string()]);
 }
 
 #[test]

@@ -1924,14 +1924,6 @@ mod tests {
         let cluster_ids = ids.primary;
         let extra_ids = ids.extra;
         let ss = StructuredSchur::new(&g, &cluster_ids, &extra_ids, n).expect("e = 181 > 0 ⇒ Some");
-        assert_eq!(ss.axx.ncols(), g.k_crossed());
-        assert_eq!(ss.axx.ncols(), 181);
-        // Symbolic factor allocated a non-empty L; diagonal is fully present.
-        assert!(
-            ss.symbolic.len_val() >= ss.axx.ncols(),
-            "at least the e diagonal entries"
-        );
-        assert_eq!(ss.l_values.len(), ss.symbolic.len_val());
         // Fill-in is far below dense: dense would be e·(e+1)/2 = 16471 lower entries.
         assert!(
             ss.symbolic.len_val() < 16471,

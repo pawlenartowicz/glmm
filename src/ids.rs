@@ -37,7 +37,9 @@ impl GroupIds {
     /// consumer wraps `fit_cold` with balanced generation.
     #[cfg(test)]
     pub(crate) fn from_sizing(re: &ReStructure, n: usize) -> Self {
-        let primary: Vec<u32> = (0..n).map(|i| re.sizing.cluster_of_row(i) as u32).collect();
+        let primary: Vec<u32> = (0..n)
+            .map(|i| crate::test_support::cluster_of_row(&re.sizing, i) as u32)
+            .collect();
         let extra: Vec<Vec<u32>> = (0..re.extra_groupings.len())
             .map(|g| (0..n).map(|i| extra_level_of_row(re, g, i)).collect())
             .collect();

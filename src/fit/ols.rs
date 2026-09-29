@@ -28,8 +28,8 @@ impl OlsFitView<'_> {
 // OLS dispatch
 // ---------------------------------------------------------------------------
 
-/// Owned OLS scratch for [`fit_ols`], sized off n/p/t. Hoistable across repeated
-/// fixed-shape fits (the loop tier): [`fit_ols_prebuilt`] re-seeds every
+/// Owned OLS scratch for [`fit_ols_prebuilt`], sized off n/p/t. Hoistable across
+/// repeated fixed-shape fits (the loop tier): `fit_ols_prebuilt` re-seeds every
 /// populated slot at entry, so a reused buffer is near-identical to a fresh
 /// allocation (mirrors [`super::glm`]'s `GlmScratchBuf` contract). Unlike the
 /// OLS *kernel*, which takes no weights, the √wᵢ row scaling + identity offset
@@ -86,7 +86,7 @@ impl OlsWorkspace {
     }
 }
 
-/// [`fit_ols`]'s accumulate + solve half over a prebuilt column-major (raw,
+/// The accumulate + solve half of an OLS fit over a prebuilt column-major (raw,
 /// unscaled) `x_mat` and reusable scratch. Applies WLS by √wᵢ row scaling and
 /// the identity-link offset y-shift internally (the OLS kernel takes neither),
 /// then accumulates X'WX / X'Wy / y'Wy and runs the sufficient-statistics solve.
@@ -172,19 +172,6 @@ pub(crate) fn fit_ols_prebuilt<'a>(
         ws.suff_xtx_work.as_mut(),
         scratch,
     )
-}
-
-/// OLS dispatch adapter. Builds a throwaway [`OlsWorkspace`], converts the
-/// row-major input to a column-major faer `Mat`, runs the sufficient-statistics
-/// solve, and maps the view to `Fit`. Test-only baseline since the stable path
-/// dispatches through the unified core ([`super::core::fit_on`]) over
-/// `fit_ols_prebuilt`/`ols_view_to_fit`.
-#[cfg(test)]
-pub(super) fn fit_ols(x: &[f64], y: &[f64], n: usize, p: usize, opts: &FitOptions) -> Fit {
-    let mut ws = OlsWorkspace::new(n, p, opts.target_indices.len(), opts.weights.is_some());
-    let x_mat = super::common::to_col_major(x, n, p);
-    let view = fit_ols_prebuilt(&mut ws, x_mat.as_ref().subrows(0, n), y, n, p, opts);
-    ols_view_to_fit(&view, x, y, n, p, opts)
 }
 
 /// Maps an [`OlsFitView`] to the full stable `Fit`. Needs the raw `x`/`y`/`n`

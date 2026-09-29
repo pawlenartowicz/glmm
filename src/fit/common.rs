@@ -542,7 +542,7 @@ pub(crate) fn assemble_ranef_sparse(
 /// `ranef` is [`Fit::ranef`]'s public layout (per grouping, level-major), so this
 /// runs after [`assemble_ranef_sparse`]. The identity link makes μ̂ = η̂, and the
 /// offset is added back here because the LMM applies it as an exact `y − o` shift
-/// BEFORE accumulation and never sees it again — the same caveat `fit_ols`
+/// BEFORE accumulation and never sees it again — the same caveat `fit_ols_prebuilt`
 /// documents, and the same fix.
 #[allow(clippy::too_many_arguments)] // marshals (x, n, p, beta, ranef, groupings, ids…)
 pub(crate) fn lmm_fitted(
@@ -1239,12 +1239,6 @@ pub(super) fn assert_model_shape(model: &ModelSpec, p: usize, nagq: u8) {
         "at most one NestedWithin extra grouping is supported (got {n_nested})"
     );
 }
-/// Test-only re-export of [`assert_model_shape`] so `spec.rs` can exercise the
-/// `nagq` shape-check without routing through a full `fit` call.
-#[cfg(test)]
-pub(crate) fn assert_model_shape_pub(model: &ModelSpec, p: usize, nagq: u8) {
-    assert_model_shape(model, p, nagq);
-}
 
 /// Crate-internal re-export of `spec_sized_from_ids`: the sparse-Z path's
 /// equivalence test (`sparse::tests`) sizes a spec from ids exactly as the stable
@@ -1276,7 +1270,7 @@ pub(super) fn fill_col_major(dst: &mut Mat<f64>, x: &[f64], n: usize, p: usize) 
 }
 
 /// Converts row-major `x` (n·p, unweighted) into a column-major faer matrix.
-/// Shared by every unweighted site; `fit_ols`'s √wᵢ-scaled loop is a distinct
+/// Shared by every unweighted site; `fit_ols_prebuilt`'s √wᵢ-scaled loop is a distinct
 /// variant and is not routed through this helper. Thin wrapper over
 /// [`fill_col_major`] for the call sites that build a throwaway `Mat` once per
 /// call regardless (test-only paths, `fit_glm`, `fit_glm_nb`, `fit_glmm_build`)

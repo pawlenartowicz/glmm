@@ -1400,59 +1400,6 @@ mod tests {
         }
     }
 
-    /// The working-weight derivative `dw/dη` read off a `Dual<1>` pass through
-    /// `irls_weight_and_resid` must match a central difference of the f64 weight
-    /// on every link the blocked GLMM path serves, and the two hand forms the
-    /// design doc names (logit `w(1−2μ)`, Poisson-log `μ`).
-    #[test]
-    fn working_weight_dual_derivative_matches_fd() {
-        use crate::dual::Dual;
-        let fams = [
-            Family::Binomial {
-                link: BinomialLink::Logit,
-            },
-            Family::Binomial {
-                link: BinomialLink::Probit,
-            },
-            Family::Binomial {
-                link: BinomialLink::Cloglog,
-            },
-            Family::Poisson {
-                link: PoissonLink::Log,
-            },
-            Family::NegativeBinomial {
-                link: NegBinomialLink::Log,
-            },
-        ];
-        let nb_theta = 2.5;
-        for f in fams {
-            for eta in [-1.3_f64, 0.2, 1.7] {
-                let h = 1e-5;
-                let wf = |e: f64| irls_weight_and_resid(f, nb_theta, 1.0, e).1;
-                let fd = (wf(eta + h) - wf(eta - h)) / (2.0 * h);
-                let e = Dual::<1> { v: eta, d: [1.0] };
-                let (mu, w, _) = irls_weight_and_resid(f, nb_theta, 1.0, e);
-                let got = w.d[0];
-                assert!(
-                    (got - fd).abs() < 1e-7,
-                    "{f:?} eta={eta}: dw/deta {got} vs fd {fd}"
-                );
-                match f {
-                    Family::Binomial {
-                        link: BinomialLink::Logit,
-                    } => {
-                        let hand = w.v * (1.0 - 2.0 * mu.v);
-                        assert!((got - hand).abs() < 1e-12, "logit hand form");
-                    }
-                    Family::Poisson { .. } => {
-                        assert!((got - mu.v).abs() < 1e-12, "poisson hand form")
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
     /// The ten `(family, link)` cells `weight_eta_deriv` and D4's table cover,
     /// paired with the η domain each needs (Gamma-inverse and IG-inverse-squared
     /// need `η > 0`).
@@ -1916,18 +1863,6 @@ mod tests {
     }
 
     #[test]
-    fn poisson_deviance_resid_zero_at_fit() {
-        let f = Family::Poisson {
-            link: PoissonLink::Log,
-        };
-        // d_i = 2[ y log(y/μ) − (y−μ) ]; at y=μ → 0
-        assert!(dev_resid(f, f64::NAN, 4.0, 4.0).abs() < 1e-10);
-        assert!(dev_resid(f, f64::NAN, 4.0, 2.0) > 0.0);
-        // y=0, μ=1: t=0 (0·ln0→0 limit), so d = 2[0 − (0−1)] = 2.0 exactly.
-        assert!((dev_resid(f, f64::NAN, 0.0, 1.0) - 2.0).abs() < 1e-10);
-    }
-
-    #[test]
     fn nb_variance_uses_theta() {
         let f = Family::NegativeBinomial {
             link: NegBinomialLink::Log,
@@ -2105,21 +2040,6 @@ mod tests {
     }
 
     #[test]
-    fn inverse_gaussian_deviance_resid() {
-        let f = Family::InverseGaussian {
-            link: InverseGaussianLink::Log,
-        };
-        // dᵢ = (y−μ)²/(μ² y); zero at y=μ, positive otherwise.
-        assert!(dev_resid(f, f64::NAN, 2.0, 2.0).abs() < 1e-14);
-        let d = dev_resid(f, f64::NAN, 4.0, 2.0);
-        assert!(
-            (d - (4.0 - 2.0f64).powi(2) / (4.0 * 4.0)).abs() < 1e-14,
-            "d={d}"
-        );
-        assert!(d > 0.0);
-    }
-
-    #[test]
     fn inverse_gaussian_saturated_loglik_is_nan() {
         // Like Gamma: the objective substitutes `inv_gaussian_aic`, which already
         // carries the profiled dispersion, so there is no saturated constant to
@@ -2130,55 +2050,20 @@ mod tests {
         assert!(saturated_loglik(f, f64::NAN, &[1.0, 2.0], None).is_nan());
     }
 
-    /// The links whose exact (observed) curvature of the row log-likelihood in
-    /// η differs from the Fisher weight: every non-canonical link except
-    /// Gamma/inverse, whose `η = 1/μ` is canonical up to sign.
-    #[test]
-    fn exact_curvature_differs_names_the_non_canonical_links() {
-        let differs = [
-            Family::Binomial {
-                link: BinomialLink::Probit,
-            },
-            Family::Binomial {
-                link: BinomialLink::Cloglog,
-            },
-            Family::Gamma {
-                link: GammaLink::Log,
-            },
-            Family::NegativeBinomial {
-                link: NegBinomialLink::Log,
-            },
-            Family::InverseGaussian {
-                link: InverseGaussianLink::Log,
-            },
-        ];
-        let same = [
-            Family::Gaussian,
-            Family::Binomial {
-                link: BinomialLink::Logit,
-            },
-            Family::Poisson {
-                link: PoissonLink::Log,
-            },
-            Family::Gamma {
-                link: GammaLink::Inverse,
-            },
-            Family::InverseGaussian {
-                link: InverseGaussianLink::InverseSquared,
-            },
-        ];
-        for f in differs {
-            assert!(exact_curvature_differs(f), "{f:?}");
-        }
-        for f in same {
-            assert!(!exact_curvature_differs(f), "{f:?}");
-        }
-    }
-
     /// Links and interior η points for the observed-weight derivative checks
-    /// (positive η for the inverse links, whose domain is η > 0).
+    /// (positive η for the inverse links, whose domain is η > 0). Covers every
+    /// link, so a link wrongly classified by `exact_curvature_differs` in
+    /// either direction is caught: wrongly true reaches the `unreachable!`,
+    /// wrongly false returns the Fisher `dw/dη` and misses the `Dual<1>` lane.
     fn observed_weight_cells() -> Vec<(Family, Vec<f64>)> {
         vec![
+            (Family::Gaussian, vec![-1.0, 0.3]),
+            (
+                Family::InverseGaussian {
+                    link: InverseGaussianLink::InverseSquared,
+                },
+                vec![0.4, 1.5],
+            ),
             (
                 Family::Binomial {
                     link: BinomialLink::Probit,

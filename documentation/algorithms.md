@@ -189,10 +189,9 @@ the box on its outer BOBYQA's `ln θ` coordinate
 `fit_suff_stats_t_sq`, `PANEL_ROWS` (`src/ols.rs`). **Convention:** the textbook
 Gaussian OLS normal equations, with R `lm()`'s residual-df and dispersion
 conventions. **Validation:** `fit_ols_recovers_slope`, and for the weighted path
-`fit_ols_weighted_matches_r_lm` / `fit_ols_constant_weights_invariant`
-(`src/fit/ols_tests.rs`). OLS is the fixed-only Gaussian leaf and is not a
-dedicated mixed-model validation rung; it is exercised implicitly as the `q_p = 1`
-degenerate of the LMM kernels.
+`fit_ols_weighted_matches_r_lm` (`src/fit/ols_tests.rs`). OLS is the fixed-only
+Gaussian leaf and is not a dedicated mixed-model validation rung; it is exercised
+implicitly as the `q_p = 1` degenerate of the LMM kernels.
 
 `fit_ols_prebuilt` accumulates the sufficient statistics `XᵀX` (lower triangle), `Xᵀy`,
 and `yᵀy` in a single panel-blocked pass (`OlsSuffStats::add_rows`, repacking

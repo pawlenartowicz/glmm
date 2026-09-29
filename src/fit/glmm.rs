@@ -266,43 +266,6 @@ pub(super) fn prep_glmm_design(
     };
 }
 
-/// Test-only baseline (fixed-θ dense GLMM as a single call). The stable path
-/// dispatches through the unified core ([`super::core::fit_on`]) over
-/// `run_glmm_on`/`glmm_view_to_fit`; the NB route (`fit_glmm_nb`) composes
-/// `fit_glmm_build`/`fit_glmm_prebuilt` directly.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)] // marshals the kernel's (x, y, n, p, spec, ids…) surface
-pub(super) fn fit_glmm(
-    x: &[f64],
-    y: &[f64],
-    n: usize,
-    p: usize,
-    model: &ModelSpec,
-    cluster_ids: &[u32],
-    extra_ids: &[Vec<u32>],
-    nb_theta: f64,
-    start: Option<&StartValues>,
-    opts: &FitOptions,
-) -> (Fit, Vec<f64>, f64) {
-    let (mut ws, x_mat) = match fit_glmm_build(x, n, p, model, cluster_ids, extra_ids, opts) {
-        Ok(built) => built,
-        Err(degenerate) => return *degenerate,
-    };
-    fit_glmm_prebuilt(
-        &mut ws,
-        x_mat.as_ref().subrows(0, n),
-        y,
-        n,
-        p,
-        model,
-        cluster_ids,
-        extra_ids,
-        nb_theta,
-        start,
-        opts,
-    )
-}
-
 /// Test-only: the same fit on a workspace forced onto the packed-row layout,
 /// whatever layout [`crate::glmm::GlmmLayout::for_design`] would pick for this
 /// design. Lets an in-envelope design be fit both ways so the packed kernel can

@@ -112,6 +112,7 @@ def test_agq_fallback_is_stored_and_printed():
         "This model was fitted without adaptive quadrature."
     )
     assert printed(entry) in [str(w.message) for w in caught]
+    assert [w["kind"] for w in m.warnings] == ["agq_fallback"]
     assert m.nagq == 1
 
 
@@ -137,19 +138,6 @@ def test_nagq_that_changes_nothing_is_an_ignored_argument(data, formula, family,
     assert printed(entry) in [str(w.message) for w in caught]
     assert not any(w["kind"] == "agq_fallback" for w in m.warnings)
     assert m.nagq == 1
-
-
-def test_ill_conditioned_is_stored_and_printed():
-    n, split = 60, 40
-    a = [((i * 13) % 17) - 8.0 for i in range(n)]
-    b = [a[i] + (0.0 if i < split else 1.0) for i in range(n)]
-    y = [0.5 + 1.3 * a[i] + 0.477 * b[i] + ((i % 3) - 1.0) for i in range(n)]
-    w = [1.0 if i < split else 1e-11 for i in range(n)]
-    with pytest.warns(glmm.IllConditionedWarning) as caught:
-        m = glmm.fit({"y": y, "a": a, "b": b}, "y ~ a + b", weights=w)
-    entry = only(m, "ill_conditioned")
-    assert entry["message"].startswith("b is almost a combination of other columns")
-    assert printed(entry) in [str(w.message) for w in caught]
 
 
 def test_constructed_notes_store_with_their_tier_and_title():
@@ -363,7 +351,6 @@ def test_argument_order_is_the_documented_one():
 
 
 def test_singular_is_stored_and_printed():
-    # The fixture of test_fit_wiring.py::test_singular_fit_warning_names_component.
     rng = np.random.default_rng(1)
     x = rng.normal(size=120)
     p = 1.0 / (1.0 + np.exp(-(0.2 + 0.8 * x)))
@@ -374,6 +361,9 @@ def test_singular_is_stored_and_printed():
     }
     with pytest.warns(glmm.SingularFitWarning) as caught:
         m = glmm.fit(data, "y ~ x + (1 | g)", "binomial")
+    assert m.converged
+    assert m.singular
+    assert [w["kind"] for w in m.warnings] == ["singular"]
     entry = only(m, "singular")
     assert entry["message"] == (
         "The random effects are too complex for the data: a variance is estimated at or "
@@ -759,23 +749,11 @@ def test_kind_table_matches_warnings_md():
     assert rows == expected
 
 
-def test_port_parity_sequence():
-    # Same data and call in r/tests/testthat/test-warnings.R - change together.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        m = glmm.fit(MIXED, "y ~ x + (1 | g)", dispersion=2.0, nagq=3)
-    assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
-        ("note", "argument_ignored", "Argument ignored"),
-        ("note", "argument_ignored", "Argument ignored"),
-    ]
-
-
 def test_port_parity_sequence_adds_three_more_kinds():
     # Same PARITY fixture and call in r/tests/testthat/test-warnings.R —
-    # change together. Broader than test_port_parity_sequence above: one
-    # fixture, four notes across three kinds not covered there
+    # change together. One fixture, four notes across three kinds
     # (argument_ignored fires twice, from two different arguments;
-    # unused_grouping_levels and re_design_scale_spread are new).
+    # unused_grouping_levels and re_design_scale_spread).
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         m = glmm.fit(PARITY, "y ~ z + (1 + z | g)", dispersion=2.0, nagq=3)
@@ -792,8 +770,7 @@ def test_port_parity_non_integer_response():
     # Same fixture and call in r/tests/testthat/test-warnings.R — change
     # together. Intercept-only Poisson, mirrors the Rust unit test
     # poisson_non_integer_response_is_noted (src/fit/common_tests.rs).
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    with pytest.warns(glmm.NonIntegerResponseWarning, match="not a whole number"):
         m = glmm.fit({"y": [1.0, 2.5, 3.0, 4.0]}, "y ~ 1", "poisson")
     assert m.converged
     assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
@@ -803,29 +780,31 @@ def test_port_parity_non_integer_response():
 
 def test_port_parity_ill_conditioned():
     # Same fixture and call in r/tests/testthat/test-warnings.R — change
-    # together. Same data as test_ill_conditioned_is_stored_and_printed above.
+    # together.
     n, split = 60, 40
     a = [((i * 13) % 17) - 8.0 for i in range(n)]
     b = [a[i] + (0.0 if i < split else 1.0) for i in range(n)]
     y = [0.5 + 1.3 * a[i] + 0.477 * b[i] + ((i % 3) - 1.0) for i in range(n)]
     w = [1.0 if i < split else 1e-11 for i in range(n)]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    with pytest.warns(glmm.IllConditionedWarning) as caught:
         m = glmm.fit({"y": y, "a": a, "b": b}, "y ~ a + b", weights=w)
     assert m.converged
     assert [(w2["tier"], w2["kind"], w2["title"]) for w2 in m.warnings] == [
         ("caution", "ill_conditioned", "Nearly collinear columns"),
     ]
+    (entry,) = m.warnings
+    assert entry["message"].startswith("b is almost a combination of other columns")
+    assert printed(entry) in [str(w.message) for w in caught]
 
 
 def test_port_parity_rows_dropped_na():
     # Same fixture and call in r/tests/testthat/test-warnings.R — change
     # together. One NaN in x drops one of four rows.
     data = {"x": [1.0, 2.0, float("nan"), 4.0], "y": [2.1, 3.9, 8.2, 8.1]}
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    with pytest.warns(glmm.RowsDroppedWarning):
         m = glmm.fit(data, "y ~ x")
     assert m.converged
+    assert m.nobs == 3
     assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
         ("caution", "rows_dropped_na", "Rows dropped for missing values"),
     ]
@@ -833,284 +812,6 @@ def test_port_parity_rows_dropped_na():
     assert entry["message"] == (
         "Dropped 1 of 4 row(s): a column the formula uses had a missing value there."
     )
-
-
-def test_port_parity_agq_fallback():
-    # Same fixture and call in r/tests/testthat/test-warnings.R — change
-    # together. Same data as test_agq_fallback_is_stored_and_printed above:
-    # a binomial model with two grouping factors, outside what AGQ covers.
-    data = dict(MIXED, y=[float(v > 0) for v in MIXED["y"]], h=[f"h{i % 4}" for i in range(20)])
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        m = glmm.fit(data, "y ~ x + (1 | g) + (1 | h)", "binomial", nagq=3)
-    assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
-        ("caution", "agq_fallback", "Adaptive quadrature not used"),
-    ]
-
-
-# Same 120-row binomial GLMM fixture as test_singular_is_stored_and_printed
-# above, and the same literal data in r/tests/testthat/test-warnings.R (R and
-# numpy RNGs do not agree, so the fixture is generated once and both files
-# carry the resulting numbers, not the generator) — change together.
-_SINGULAR_X = [
-    0.34558419206478602,
-    0.82161814350115836,
-    0.33043707618338714,
-    -1.3031572316043609,
-    0.90535586667311774,
-    0.44637457236401129,
-    -0.53695323536028516,
-    0.58111810419635312,
-    0.36457239618607573,
-    0.29413249665552599,
-    0.028422241315796789,
-    0.54671298661244694,
-    -0.73645408700166692,
-    -0.16290994799305278,
-    -0.48211931267997826,
-    0.59884621263462756,
-    0.03972210748165899,
-    -0.29245675096508861,
-    -0.78190846235684208,
-    -0.25719224061887069,
-    0.0081421805183435076,
-    -0.27560290529937043,
-    1.2940638143982073,
-    1.0067243153057943,
-    -2.7111624789659685,
-    -1.8890132459676727,
-    -0.17477209205516195,
-    -0.42219041157635356,
-    0.2136429974986111,
-    0.21732193102256359,
-    2.1178387550510482,
-    -1.1120207626922813,
-    -0.37760500712699807,
-    2.0427716074923303,
-    0.6467029962018469,
-    0.66306337237626167,
-    -0.51400637168746288,
-    -1.6480751708556527,
-    0.16746474422274113,
-    0.10901408782154753,
-    -1.2273520542445742,
-    -0.68322666178056224,
-    -0.07204367972722743,
-    -0.94475162306077742,
-    -0.098269967852217269,
-    0.095483027469454335,
-    0.035586237055485713,
-    -0.50629165831431477,
-    0.59374807178582278,
-    0.89116695428232839,
-    0.32084830456656371,
-    -0.81823022739030704,
-    0.73165228378544078,
-    -0.50144001846705233,
-    0.87916061828798531,
-    -1.0717874168774442,
-    0.91446720312878116,
-    -0.020063454615480422,
-    -1.2487488903344155,
-    -0.31389947196684775,
-    0.054102278771543888,
-    0.27279133916445375,
-    -0.98218812494097774,
-    -1.107373047165193,
-    0.19958453284708083,
-    -0.46674961687980204,
-    0.23550561173022522,
-    0.75951952247837917,
-    -1.6487873663509485,
-    0.25438811651761728,
-    1.2246469675357323,
-    -0.29752684437047322,
-    -0.81081458323756994,
-    0.75224382717959282,
-    0.25344651620814146,
-    0.89588307077756035,
-    -0.34521571005127971,
-    -1.4818182737222112,
-    -0.11001076471125099,
-    -0.44582815301123219,
-    0.77532382204757411,
-    0.1936328483771538,
-    -1.6308492324351012,
-    -1.1951630801031998,
-    0.88378903658725527,
-    0.67976501741784656,
-    -0.64024336590848874,
-    -0.001048796567280681,
-    0.44557355377618613,
-    0.46840433584727792,
-    0.87624219611435006,
-    0.25648562722156198,
-    -0.094828338968498169,
-    -0.25884806478784556,
-    1.0557428005332512,
-    -2.2508542750785376,
-    -0.13865532509133732,
-    0.033000103984060107,
-    -1.4253489608701877,
-    0.33281361313804664,
-    -0.65128101244339398,
-    0.86244479631574678,
-    -0.1255920840343272,
-    0.66915324078945282,
-    1.2188436051712233,
-    0.38292958271347238,
-    -0.87572114342284546,
-    -1.5143186317046384,
-    1.7533841175163727,
-    -0.11129219318751944,
-    -0.68856494763432163,
-    0.14425708806082496,
-    -0.19141133048264922,
-    0.85214226421268768,
-    0.033928182437100288,
-    0.013749583618419497,
-    -0.71457972103296408,
-    0.46956809874749339,
-    -1.0338667223549824,
-    0.66588943976396708,
-]
-_SINGULAR_Y = [
-    0,
-    0,
-    1,
-    0,
-    1,
-    1,
-    0,
-    1,
-    1,
-    1,
-    0,
-    0,
-    1,
-    0,
-    1,
-    1,
-    0,
-    1,
-    0,
-    0,
-    1,
-    0,
-    1,
-    1,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    1,
-    0,
-    1,
-    1,
-    0,
-    1,
-    0,
-    0,
-    0,
-    1,
-    1,
-    1,
-    0,
-    0,
-    1,
-    1,
-    0,
-    0,
-    0,
-    0,
-    1,
-    1,
-    1,
-    0,
-    1,
-    0,
-    1,
-    0,
-    0,
-    1,
-    1,
-    1,
-    1,
-    0,
-    1,
-    1,
-    1,
-    0,
-    0,
-    0,
-    1,
-    0,
-    1,
-    1,
-    1,
-    1,
-    0,
-    0,
-    1,
-    1,
-    1,
-    0,
-    0,
-    1,
-    0,
-    1,
-    0,
-    0,
-    1,
-    1,
-    0,
-    1,
-    0,
-    1,
-    1,
-    0,
-    1,
-    0,
-    0,
-    1,
-    1,
-    1,
-    1,
-    1,
-    1,
-    1,
-    0,
-    0,
-    1,
-    1,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    0,
-    1,
-]
-
-
-def test_port_parity_singular():
-    data = {
-        "x": _SINGULAR_X,
-        "g": [f"g{i}" for i in np.repeat(np.arange(30), 4).tolist()],
-        "y": [float(v) for v in _SINGULAR_Y],
-    }
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        m = glmm.fit(data, "y ~ x + (1 | g)", "binomial")
-    assert m.converged
-    assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
-        ("caution", "singular", "Singular fit"),
-    ]
 
 
 # 12-row Gamma-inverse GLMM, 4 clusters of 3 — the exact fixture

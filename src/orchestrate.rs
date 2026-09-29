@@ -556,89 +556,80 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn gaussian_maps() {
-        assert_eq!(
-            family_from_str("gaussian", "identity"),
-            Ok(Family::Gaussian)
-        );
-    }
-
-    #[test]
-    fn binomial_logit_and_probit_map() {
-        assert_eq!(
-            family_from_str("binomial", "logit"),
-            Ok(Family::Binomial {
-                link: BinomialLink::Logit
-            })
-        );
-        assert_eq!(
-            family_from_str("binomial", "probit"),
-            Ok(Family::Binomial {
-                link: BinomialLink::Probit
-            })
-        );
-    }
-
-    #[test]
-    fn binomial_cloglog_maps() {
-        assert_eq!(
-            family_from_str("binomial", "cloglog").unwrap(),
-            Family::Binomial {
-                link: BinomialLink::Cloglog
-            }
-        );
-    }
-
-    #[test]
-    fn poisson_maps() {
-        assert_eq!(
-            family_from_str("poisson", "log"),
-            Ok(Family::Poisson {
-                link: PoissonLink::Log
-            })
-        );
-    }
-
-    #[test]
-    fn gamma_log_and_inverse_map() {
-        assert_eq!(
-            family_from_str("gamma", "log"),
-            Ok(Family::Gamma {
-                link: GammaLink::Log
-            })
-        );
-        assert_eq!(
-            family_from_str("gamma", "inverse"),
-            Ok(Family::Gamma {
-                link: GammaLink::Inverse
-            })
-        );
-    }
-
-    #[test]
-    fn negativebinomial_maps() {
-        assert_eq!(
-            family_from_str("negativebinomial", "log"),
-            Ok(Family::NegativeBinomial {
-                link: NegBinomialLink::Log
-            })
-        );
-    }
-
-    #[test]
-    fn inversegaussian_maps_both_links() {
-        assert_eq!(
-            family_from_str("inversegaussian", "log").unwrap(),
-            Family::InverseGaussian {
-                link: InverseGaussianLink::Log
-            }
-        );
-        assert_eq!(
-            family_from_str("inversegaussian", "inverse_squared").unwrap(),
-            Family::InverseGaussian {
-                link: InverseGaussianLink::InverseSquared
-            }
-        );
+    fn family_and_link_strings_map_to_kernel_families() {
+        let ok = [
+            ("gaussian", "identity", Family::Gaussian),
+            (
+                "binomial",
+                "logit",
+                Family::Binomial {
+                    link: BinomialLink::Logit,
+                },
+            ),
+            (
+                "binomial",
+                "probit",
+                Family::Binomial {
+                    link: BinomialLink::Probit,
+                },
+            ),
+            (
+                "binomial",
+                "cloglog",
+                Family::Binomial {
+                    link: BinomialLink::Cloglog,
+                },
+            ),
+            (
+                "poisson",
+                "log",
+                Family::Poisson {
+                    link: PoissonLink::Log,
+                },
+            ),
+            (
+                "gamma",
+                "log",
+                Family::Gamma {
+                    link: GammaLink::Log,
+                },
+            ),
+            (
+                "gamma",
+                "inverse",
+                Family::Gamma {
+                    link: GammaLink::Inverse,
+                },
+            ),
+            (
+                "negativebinomial",
+                "log",
+                Family::NegativeBinomial {
+                    link: NegBinomialLink::Log,
+                },
+            ),
+            (
+                "inversegaussian",
+                "log",
+                Family::InverseGaussian {
+                    link: InverseGaussianLink::Log,
+                },
+            ),
+            (
+                "inversegaussian",
+                "inverse_squared",
+                Family::InverseGaussian {
+                    link: InverseGaussianLink::InverseSquared,
+                },
+            ),
+        ];
+        for (family, link, expected) in ok {
+            assert_eq!(
+                family_from_str(family, link),
+                Ok(expected),
+                "{family}/{link}"
+            );
+        }
         let err = family_from_str("inversegaussian", "identity").unwrap_err();
         assert!(err.contains("unsupported inversegaussian link"), "{err}");
     }
@@ -667,20 +658,15 @@ mod tests {
     }
 
     #[test]
-    fn nb_shape_unsettled_payload_survives_flattening() {
-        let notes = note_infos(vec![Note::NbShapeUnsettled { rounds: 25 }]);
-        assert_eq!(notes[0].kind, "nb_shape_unsettled");
-        assert_eq!(notes[0].evals, 25);
-    }
-
-    #[test]
-    fn re_design_scale_spread_and_hessian_fallback_payloads_survive_flattening() {
+    fn note_payloads_survive_flattening() {
         let notes = note_infos(vec![
             Note::ReDesignScaleSpread {
                 grouping: "Subject".to_string(),
                 ratio: 4200.0,
             },
             Note::HessianSeFallback,
+            Note::NbShapeUnsettled { rounds: 25 },
+            Note::ExactProfileFallback,
         ]);
         assert_eq!(notes[0].kind, "re_design_scale_spread");
         assert_eq!(notes[0].detail, "Subject");
@@ -688,14 +674,11 @@ mod tests {
         assert_eq!(notes[1].kind, "hessian_se_fallback");
         assert_eq!(notes[1].detail, "");
         assert!(notes[1].ratio.is_nan());
-    }
-
-    #[test]
-    fn exact_profile_fallback_survives_flattening() {
-        let notes = note_infos(vec![Note::ExactProfileFallback]);
-        assert_eq!(notes[0].kind, "exact_profile_fallback");
-        assert_eq!(notes[0].detail, "");
-        assert!(notes[0].ratio.is_nan());
+        assert_eq!(notes[2].kind, "nb_shape_unsettled");
+        assert_eq!(notes[2].evals, 25);
+        assert_eq!(notes[3].kind, "exact_profile_fallback");
+        assert_eq!(notes[3].detail, "");
+        assert!(notes[3].ratio.is_nan());
     }
 
     /// A factor column in the `(levels, codes)` form `run_fit` takes, with the
@@ -754,7 +737,7 @@ mod tests {
             "y ~ z", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
         )
         .unwrap_err();
-        assert!(err.contains("z"), "{err}");
+        assert_eq!(err, "unknown column: z");
     }
 
     #[test]
@@ -804,9 +787,8 @@ mod tests {
 
     #[test]
     fn ineligible_nagq_is_stripped_with_a_warning_not_an_error() {
-        // Gaussian LMM with nagq=3: ineligible family — must strip to Laplace
-        // and report the warn-and-strip message, never surface the kernel's
-        // shape panic.
+        // Each shape must strip to Laplace and report the warn-and-strip
+        // message, never surface the kernel's shape panic.
         let (numeric, mut factor) = toy_ols();
         let g: Vec<&str> = ["a", "b", "c", "d", "e"]
             .iter()
@@ -815,6 +797,7 @@ mod tests {
             .take(10)
             .collect();
         factor.insert("g".to_string(), factor_col(&g));
+        // Gaussian: ineligible family.
         let result = run_fit(
             "y ~ x + (1 | g)",
             numeric,
@@ -831,6 +814,45 @@ mod tests {
         .expect("ineligible nagq must be stripped, not an error");
         let msg = result.agq_warning.as_deref().expect("warning expected");
         assert!(msg.contains("nagq=3"), "{msg}");
+
+        // Binomial with q_p = 1 + 3 slopes = 4 > 3: over the random-effect cap.
+        let n = 40;
+        let mut numeric = HashMap::new();
+        let mut y = Vec::new();
+        for i in 0..n {
+            y.push(if (i * 7 + i / 3) % 3 == 0 { 1.0 } else { 0.0 });
+        }
+        numeric.insert("y".to_string(), y);
+        for (k, name) in ["x1", "x2", "x3"].iter().enumerate() {
+            let col: Vec<f64> = (0..n)
+                .map(|i| (((i * (k + 3) + k) % 11) as f64) / 11.0 - 0.5)
+                .collect();
+            numeric.insert(name.to_string(), col);
+        }
+        let mut factor = HashMap::new();
+        let labels: Vec<&str> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .copied()
+            .cycle()
+            .take(n)
+            .collect();
+        factor.insert("g".to_string(), factor_col(&labels));
+        let result = run_fit(
+            "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g)",
+            numeric,
+            factor,
+            "binomial",
+            "logit",
+            "hessian",
+            3,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("over-cap nagq must be stripped, not an error");
+        let msg = result.agq_warning.as_deref().expect("warning expected");
+        assert!(msg.contains("nagq=3"), "{msg}");
     }
 
     #[test]
@@ -843,6 +865,16 @@ mod tests {
         // lower()'s panic (an unguarded index in the formula frontend's interaction-term
         // handling) must become a clean Err via catch_unwind, not abort the process.
         assert!(!err.is_empty());
+
+        // A panic inside the kernel fit (a negative Poisson count) takes the
+        // second catch_unwind, around fit_warm.
+        let (mut numeric, factor) = toy_ols();
+        numeric.get_mut("y").unwrap()[3] = -1.0;
+        let err = run_fit(
+            "y ~ x", numeric, factor, "poisson", "log", "hessian", 1, None, None, None, None,
+        )
+        .unwrap_err();
+        assert!(err.contains("Poisson response must be >= 0"), "{err}");
     }
 
     #[test]
@@ -866,12 +898,10 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("x"), "{err}");
         assert!(err.contains('5') && err.contains('2'), "{err}");
-    }
 
-    #[test]
-    fn unused_longer_column_does_not_silently_inflate_n() {
+        // A column the formula never references still counts toward the row count.
         let (mut numeric, factor) = toy_ols();
-        numeric.insert("junk".to_string(), vec![0.0; 1000]); // not referenced by the formula
+        numeric.insert("junk".to_string(), vec![0.0; 1000]);
         let err = run_fit(
             "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
         )
@@ -879,43 +909,26 @@ mod tests {
         assert!(err.contains("junk"), "{err}");
     }
 
-    /// Deterministic fixed-effects-only Poisson fixture: `y = round(exp(0.3 +
-    /// 0.8·x))` on a centered `x`, so the log-link mean model fits the counts
-    /// almost exactly and both a cold and a warm-started IRLS converge.
-    #[allow(clippy::type_complexity)] // test fixture: the numeric+factor column maps run_fit takes
-    fn toy_poisson() -> (
-        HashMap<String, Vec<f64>>,
-        HashMap<String, (Vec<String>, Vec<u32>)>,
-    ) {
-        let n = 100;
-        let mut x = vec![0.0f64; n];
-        let mut y = vec![0.0f64; n];
-        for i in 0..n {
-            let xi = (i as f64) / (n as f64) - 0.5;
-            x[i] = xi;
-            y[i] = (0.3 + 0.8 * xi).exp().round();
-        }
-        let mut numeric = HashMap::new();
-        numeric.insert("y".to_string(), y);
-        numeric.insert("x".to_string(), x);
-        (numeric, HashMap::new())
-    }
-
-    /// This is the layer the Python and R packages call, and the only prior
-    /// converged-and-inspected test here (`gaussian_ols_end_to_end`) is
-    /// Gaussian. A Poisson fit exercises the family/link string hand-off into
-    /// the kernel end to end, and warm-starting from the converged β must
-    /// reach the same optimum in no more evaluations than the cold start —
-    /// the warm-start branch it drives is otherwise dead under test.
+    /// Warm-start values reach the mixed-model fit: a start far from the
+    /// optimum takes a different number of evaluations than a cold start yet
+    /// lands on the same estimates. Fixed-only fits ignore `StartValues`, so
+    /// this needs a random effect.
     #[test]
-    fn poisson_end_to_end_warm_start_reaches_same_optimum() {
-        let (numeric, factor) = toy_poisson();
+    fn mixed_warm_start_reaches_same_optimum_with_different_evals() {
+        let (numeric, mut factor) = toy_ols();
+        let g: Vec<&str> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .copied()
+            .cycle()
+            .take(10)
+            .collect();
+        factor.insert("g".to_string(), factor_col(&g));
         let cold = run_fit(
-            "y ~ x",
+            "y ~ x + (1 | g)",
             numeric.clone(),
             factor.clone(),
-            "poisson",
-            "log",
+            "gaussian",
+            "identity",
             "hessian",
             1,
             None,
@@ -923,37 +936,30 @@ mod tests {
             None,
             None,
         )
-        .expect("cold poisson fit should converge");
+        .expect("cold mixed fit should converge");
         assert!(cold.converged);
-        assert_eq!(cold.beta.len(), 2);
 
         let warm = run_fit(
-            "y ~ x",
+            "y ~ x + (1 | g)",
             numeric,
             factor,
-            "poisson",
-            "log",
+            "gaussian",
+            "identity",
             "hessian",
             1,
             None,
             None,
             None,
-            Some((cold.beta.clone(), Vec::new())),
+            Some((cold.beta.clone(), vec![0.05])),
         )
-        .expect("warm-started poisson fit should converge");
+        .expect("warm-started mixed fit should converge");
         assert!(warm.converged);
         for (c, w) in cold.beta.iter().zip(warm.beta.iter()) {
-            assert!(
-                (c - w).abs() < 1e-9,
-                "warm start from the optimum must not move it: {c} vs {w}"
-            );
+            assert!((c - w).abs() < 1e-6, "beta moved: {c} vs {w}");
         }
-        assert!(
-            warm.n_eval <= cold.n_eval,
-            "warm start from the optimum must not need more evaluations than \
-             a cold start: warm={} cold={}",
-            warm.n_eval,
-            cold.n_eval
+        assert_ne!(
+            warm.n_eval, cold.n_eval,
+            "a far-off warm start must change the evaluation count"
         );
     }
 

@@ -165,14 +165,3 @@ test_that("logLik and AIC are pinned, and the LMM value is the REML criterion", 
                tolerance = CI_REF_REL)
   expect_true(attr(logLik(fl), "REML"))
 })
-
-test_that("the harness's remaining requirements hold: timeable, flagged", {
-  # A system.time()-able fit and a convergence flag -- assert both survive the
-  # API.
-  d <- benchmark_data(seed = 205, family = "binomial")
-  elapsed <- system.time(
-    fit <- fastglmm(y ~ t + d + t:d + (1 | g), d, family = binomial())
-  )[["elapsed"]]
-  expect_true(is.finite(elapsed))
-  expect_type(fit$converged, "logical")
-})

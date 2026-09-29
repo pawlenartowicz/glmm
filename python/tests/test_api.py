@@ -1,10 +1,6 @@
 import inspect
 
-import pytest
-
 import glmm
-
-DATA = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
 
 
 def test_module_surface():
@@ -72,50 +68,3 @@ def test_fit_signature_matches_spec():
     assert p["link"].default is None
     assert p["wald_se"].default == "hessian"
     assert p["nagq"].default == 1
-
-
-def test_typo_kwarg_is_typeerror():
-    with pytest.raises(TypeError):
-        glmm.fit(DATA, "y ~ x", nagk=3)  # misspelled nagq
-
-
-def test_valid_call_returns_fit():
-    result = glmm.fit(DATA, "y ~ x")
-    assert isinstance(result, glmm.Fit)
-    assert result.names == ["(Intercept)", "x"]
-    assert result.converged
-
-
-def test_fit_fields():
-    assert list(glmm.Fit.__dataclass_fields__) == [
-        "beta",
-        "se",
-        "vcov",
-        "tau2",
-        "varcorr",
-        "stddev_se",
-        # converged / singular / aliased live in here and are re-exposed as
-        # properties, so they are deliberately absent from the field list.
-        "diagnostics",
-        "dispersion",
-        "names",
-        "re_groups",
-        "n_eval",
-        "deviance",
-        "loglik",
-        "df",
-        "reml",
-        "fitted",
-        "ranef",
-        "ranef_levels",
-        "ranef_blocks",
-        "formula",
-        "family",
-        "link",
-        "nagq",
-        "nobs",
-        "y",
-        "weights",
-        "warnings",
-        "dispersion_held",
-    ]

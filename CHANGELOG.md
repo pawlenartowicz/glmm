@@ -201,6 +201,17 @@ severe warning.
   formula never uses. The Python port's `fit()` calls it through
   `_native.formula_columns`.
 
+### Removed
+
+Breaking. Nothing in the crate, the ports or MCPower calls these.
+
+- **`Sizing::atom` and `Sizing::cluster_of_row`.** The row layout they
+  describe belongs to the caller's data generator, not to the fit.
+- **`Scalar::abs` and `Scalar::mul_add`** on the doc-hidden
+  `glmm::scalar::Scalar` trait.
+- **`loop_advanced`: `LmmGroupings::single` and `LmmSuffStats::new`.** Use
+  `LmmGroupings::from_cluster_spec` and `LmmSuffStats::with_groupings`.
+
 ### Fixed
 
 - **A Gaussian mixed model with nearly collinear predictors keeps its

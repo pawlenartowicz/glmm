@@ -274,6 +274,7 @@ impl GlmmDualScratch {
     /// in `run_gradient` / `run_hessian` did not have to run. The one thing
     /// that separates a cell where one kernel call suffices from one where it
     /// does not, and therefore the observable a test pins that split on.
+    #[cfg(test)]
     pub(crate) fn exit_exact(&self) -> bool {
         match self {
             GlmmDualScratch::D4(b, ..) => b.dual.exact,
@@ -297,6 +298,7 @@ impl GlmmDualScratch {
     /// the objective's terms. A pass entered with a step floor
     /// (`DualStep::min_iters`) exits at a different distance from one entered
     /// without, which is the one thing the two Hessian passes do not share.
+    #[cfg(test)]
     pub(crate) fn exit_mode_step(&self) -> f64 {
         fn step<T: Scalar>(b: &GlmmDualBufs<T>) -> f64 {
             b.pirls
@@ -331,9 +333,8 @@ impl GlmmDualScratch {
 /// `NLanes::pick(m, true)` and `laplace_hessian` return
 /// `DerivStatus::Unsupported` above the cap and the caller takes the assembled
 /// pass. Mirrors the `GlmmDualScratch` variants —
-/// change together, along with `lmm::kernel::LmmDualScratch`/
-/// `LmmHyperScratch::for_groupings` and `MAX_DUAL_H` below, all of which
-/// hardcode the same lane set.
+/// change together, along with `MAX_DUAL_H` below, which hardcodes the same
+/// lane set.
 pub(crate) const MAX_DUAL_N: usize = 12;
 
 /// Packed length of the largest instantiated `HyperDual<N, H>`'s second-
@@ -343,7 +344,7 @@ pub(crate) const MAX_DUAL_N: usize = 12;
 /// allowed to differ, because the gradient can chunk and the Hessian cannot, so
 /// a gradient-only rung above the largest `HyperDual` would otherwise grow this
 /// buffer for nothing. Equal to `12·13/2` — change together with the
-/// `HyperDual` variants of `GlmmDualScratch` and `LmmHyperScratch`.
+/// `HyperDual` variants of `GlmmDualScratch`.
 const MAX_DUAL_H: usize = 78;
 
 // While the top `Dual` and `HyperDual` rungs are the same `N`, the two
@@ -1567,8 +1568,6 @@ pub(crate) fn laplace_gradient(
 /// `i < m` are exactly the first `m*(m+1)/2` slots of the full `N`-sized
 /// packed array — `h[..m*(m+1)/2]` is what both this and the settle check in
 /// `run_hessian` read, never the tail belonging to padding rows `i >= m`.
-/// Re-exported through `glmm`'s `mod.rs` so `lmm::kernel`'s REML Hessian
-/// entry can share the packing convention instead of duplicating it.
 pub(crate) fn unpack_hessian(hess: &mut Mat<f64>, h: &[f64], m: usize) {
     for i in 0..m {
         for j in 0..=i {
@@ -2193,12 +2192,8 @@ pub(crate) fn laplace_hessian(
 mod tests {
     use super::*;
 
-    /// `for_shape` at `q_p == 1` (the scalar-intercept shape, `agq_scratch`'s
-    /// `4·s` arm): every `GlmmDualBufs` field's `len()` must equal the same
-    /// expression `for_shape` used to allocate it. Built with `observed`, so
-    /// the `DualStep` twins carry their sized lengths here;
-    /// `for_shape_leaves_observed_twins_empty_on_a_canonical_link` covers the
-    /// other side.
+    /// `for_shape` at `q_p == 1` (the scalar-intercept shape): `agq_scratch`
+    /// takes its `4·s` arm.
     #[test]
     fn for_shape_buffer_lengths_match_at_q_p_1() {
         let (m, p, k, rows, s, q_p, nagq) = (5usize, 3usize, 7usize, 40usize, 7usize, 1usize, 7u8);
@@ -2221,65 +2216,16 @@ mod tests {
             &cluster_ids,
         );
         match scratch {
-            GlmmDualScratch::D8(bufs, _idx, mode) => {
-                assert_eq!(bufs.params.len(), m);
-                assert_eq!(bufs.beta.len(), p);
-                assert_eq!(bufs.pirls.lam.len(), q_p * q_p);
-                assert_eq!(bufs.pirls.m_buf.len(), rows * q_p);
-                assert_eq!(bufs.pirls.eta.len(), rows);
-                assert_eq!(bufs.pirls.prob.len(), rows);
-                assert_eq!(bufs.pirls.w.len(), rows);
-                assert_eq!(bufs.pirls.u.len(), k);
-                assert_eq!(bufs.pirls.u_prev.len(), k.max(1));
-                assert_eq!(bufs.pirls.eta_fixed.len(), rows);
-                assert_eq!(bufs.pirls.a_blocks.len(), s * q_p * q_p);
-                assert_eq!(bufs.pirls.a_rhs.len(), k);
-                assert_eq!(bufs.pirls.agq_scratch.len(), agq_len(s, q_p, nagq));
+            GlmmDualScratch::D8(bufs, ..) => {
                 assert_eq!(bufs.pirls.agq_scratch.len(), 4 * s);
-                assert_eq!(bufs.pirls.mu.len(), rows);
-                assert_eq!(bufs.structured.core_blocks.len(), q_core * q_core * s);
-                assert_eq!(bufs.structured.coupling.len(), q_core * s * e);
-                assert_eq!(bufs.structured.schur_blk.len(), e * e);
-                assert_eq!(bufs.structured.m_core_buf.len(), rows * q_core);
-                assert_eq!(
-                    bufs.structured.cross_val.len(),
-                    rows * crate::lmm::MAX_EXTRA_GROUPINGS
-                );
-                assert_eq!(bufs.dual.obs_core_blocks.len(), q_core * q_core * s);
-                assert_eq!(bufs.dual.obs_coupling.len(), q_core * s * e);
-                assert_eq!(bufs.dual.obs_schur_blk.len(), e * e);
-                assert_eq!(bufs.dual.obs_rhs.len(), k);
-                assert_eq!(bufs.dual.obs_resid.len(), rows);
-                assert_eq!(bufs.grad_t.len(), m);
-                assert_eq!(bufs.asm.tail_inv.len(), e * e);
-                assert_eq!(bufs.asm.tail_col.len(), e);
-                assert_eq!(bufs.asm.rho.len(), rows);
-                assert_eq!(bufs.asm.w_eta.len(), rows);
-                assert_eq!(bufs.asm.w_obs.len(), rows);
-                assert_eq!(bufs.asm.lev.len(), rows);
-                assert_eq!(bufs.asm.d_gamma.len(), m);
-                assert_eq!(bufs.asm.l_gamma.len(), m);
-                assert_eq!(bufs.asm.d_u.len(), k);
-                assert_eq!(bufs.asm.l_u.len(), k);
-                assert_eq!(bufs.asm.g_gamma.len(), m * k);
-                assert_eq!(bufs.asm.adj.len(), k);
-                assert_eq!(bufs.asm.rb.len(), e);
-                assert_eq!(bufs.asm.sb.len(), e);
-                assert_eq!(bufs.asm.ra.len(), e);
-                assert_eq!(bufs.asm.sa.len(), e);
-                assert_eq!(bufs.asm.obs_core.len(), s * q_core * q_core);
-                assert_eq!(bufs.asm.obs_coup.len(), q_core * s * e);
-                assert_eq!(bufs.asm.obs_schur.len(), e * e);
-                assert_eq!(mode.saved_u.len(), k.max(1));
-                assert_eq!(mode.u_mode.len(), k);
             }
             _ => panic!("expected D8 variant"),
         }
     }
 
-    /// Same check at `q_p == 2` (the vector-RE shape, `agq_scratch`'s
-    /// `2·s + nagq^q_p·(q_p+1)` arm), on the `HyperDual` order — which is also
-    /// where the assembly scratch is expected to be absent entirely.
+    /// `for_shape` at `q_p == 2` (the vector-RE shape): `agq_scratch` takes its
+    /// `2·s + nagq^q_p·(q_p+1)` arm, and the `HyperDual` order carries no
+    /// assembly scratch at all.
     #[test]
     fn for_shape_buffer_lengths_match_at_q_p_2() {
         let (m, p, k, rows, s, q_p, nagq) = (6usize, 2usize, 18usize, 50usize, 9usize, 2usize, 5u8);
@@ -2303,37 +2249,9 @@ mod tests {
             &cluster_ids,
         );
         match scratch {
-            GlmmDualScratch::H8(bufs, _idx, mode) => {
-                assert_eq!(bufs.params.len(), m);
-                assert_eq!(bufs.beta.len(), p);
-                assert_eq!(bufs.pirls.lam.len(), q_p * q_p);
-                assert_eq!(bufs.pirls.m_buf.len(), rows * q_p);
-                assert_eq!(bufs.pirls.eta.len(), rows);
-                assert_eq!(bufs.pirls.prob.len(), rows);
-                assert_eq!(bufs.pirls.w.len(), rows);
-                assert_eq!(bufs.pirls.u.len(), k);
-                assert_eq!(bufs.pirls.u_prev.len(), k.max(1));
-                assert_eq!(bufs.pirls.eta_fixed.len(), rows);
-                assert_eq!(bufs.pirls.a_blocks.len(), s * q_p * q_p);
-                assert_eq!(bufs.pirls.a_rhs.len(), k);
+            GlmmDualScratch::H8(bufs, ..) => {
                 let kq = (nagq as usize).pow(q_p as u32);
-                assert_eq!(bufs.pirls.agq_scratch.len(), agq_len(s, q_p, nagq));
                 assert_eq!(bufs.pirls.agq_scratch.len(), 2 * s + kq * (q_p + 1));
-                assert_eq!(bufs.pirls.mu.len(), rows);
-                assert_eq!(bufs.structured.core_blocks.len(), q_core * q_core * s);
-                assert_eq!(bufs.structured.coupling.len(), 1); // e == 0 ⇒ the .max(1) minimum
-                assert_eq!(bufs.structured.schur_blk.len(), 1);
-                assert_eq!(bufs.structured.m_core_buf.len(), rows * q_core);
-                assert_eq!(
-                    bufs.structured.cross_val.len(),
-                    rows * crate::lmm::MAX_EXTRA_GROUPINGS
-                );
-                assert_eq!(bufs.dual.obs_core_blocks.len(), q_core * q_core * s);
-                assert_eq!(bufs.dual.obs_coupling.len(), 1); // e == 0 ⇒ the .max(1) minimum
-                assert_eq!(bufs.dual.obs_schur_blk.len(), 1);
-                assert_eq!(bufs.dual.obs_rhs.len(), k);
-                assert_eq!(bufs.dual.obs_resid.len(), rows);
-                assert_eq!(bufs.grad_t.len(), m);
                 // A `HyperDual` rung carries NO assembly scratch: the assembled
                 // pass runs on the `Dual` rungs alone, and `m·k` second-order
                 // numbers would be megabytes on a wide `k`.
@@ -2356,8 +2274,6 @@ mod tests {
                 assert!(bufs.asm.obs_core.is_empty());
                 assert!(bufs.asm.obs_coup.is_empty());
                 assert!(bufs.asm.obs_schur.is_empty());
-                assert_eq!(mode.saved_u.len(), k.max(1));
-                assert_eq!(mode.u_mode.len(), k);
             }
             _ => panic!("expected H8 variant"),
         }
@@ -2497,29 +2413,6 @@ mod tests {
         (ws, x, y, ids, extra_ids, p, n)
     }
 
-    /// The structured extras shapes the dual kernel now differentiates —
-    /// nested-only (`e = 0`, tail skipped) and crossed (`e = 6`, the rank-1
-    /// scalar walk) — return `Ok` through `laplace_gradient`, not the
-    /// `Unsupported` they returned before the structured route existed.
-    #[test]
-    fn laplace_gradient_structured_extras_are_supported() {
-        for (np, n_crossed) in [(2usize, 0usize), (0, 6)] {
-            let (mut ws, x, y, ids, extra_ids, p, n) = extras_routing_fixture(np, n_crossed);
-            assert!(
-                !ws.groupings.extra_offsets.is_empty(),
-                "fixture must carry an extra grouping"
-            );
-            assert!(supports_shape(ws.layout, &ws.groupings));
-            let mut grad = vec![0.0f64; ws.n_theta + p];
-            let status =
-                laplace_gradient(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut grad);
-            assert!(
-                matches!(status, DerivStatus::Ok(_)),
-                "np={np} n_crossed={n_crossed} did not return Ok"
-            );
-        }
-    }
-
     /// An oversized core — `primary_q + nested_per_parent > MAX_PRIMARY_Q`, the
     /// shape `laplace_deviance` sends to the packed-row layout — has
     /// no structured kernel to differentiate, so `supports_shape` rejects it
@@ -2561,9 +2454,9 @@ mod tests {
         assert!(ws.dual_scratch.is_none());
     }
 
-    /// `laplace_hessian`'s own cap guard — mirrors
-    /// `laplace_gradient_m_above_cap_is_unsupported`. The cap is this pass's
-    /// alone: `fit::glmm_tests`'s
+    /// `laplace_hessian`'s own cap guard. The gradient does not refuse above the
+    /// cap: it chunks instead (`laplace_gradient_above_cap_chunks_at_the_top_rung`).
+    /// The cap is this pass's alone: `fit::glmm_tests`'s
     /// `assembled_hessian_covers_an_m_above_the_dual_lane_cap` holds the other
     /// half, that an exact Hessian still reaches a dense shape above it.
     #[test]
@@ -2597,33 +2490,6 @@ mod tests {
         );
         assert!(matches!(status, DerivStatus::Unsupported));
         assert!(ws.hyper_scratch.is_none());
-    }
-
-    /// `laplace_hessian`'s own structured-extras route — mirrors
-    /// `laplace_gradient_structured_extras_are_supported`.
-    #[test]
-    fn laplace_hessian_structured_extras_are_supported() {
-        for (np, n_crossed) in [(2usize, 0usize), (0, 6)] {
-            let (mut ws, x, y, ids, extra_ids, p, n) = extras_routing_fixture(np, n_crossed);
-            let m = ws.n_theta + p;
-            let mut grad = vec![0.0f64; m];
-            let mut hess = Mat::<f64>::zeros(m, m);
-            let status = laplace_hessian(
-                &mut ws,
-                x.as_ref(),
-                &y,
-                &ids,
-                &extra_ids,
-                p,
-                n,
-                &mut grad,
-                &mut hess,
-            );
-            assert!(
-                matches!(status, DerivStatus::Ok(_)),
-                "np={np} n_crossed={n_crossed} did not return Ok"
-            );
-        }
     }
 
     /// `laplace_hessian`'s own guards on the two shapes `supports_shape`

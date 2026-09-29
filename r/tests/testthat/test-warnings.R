@@ -81,6 +81,7 @@ test_that("agq_fallback is stored and printed with nAGQ=", {
     "This model was fitted without adaptive quadrature."))
   expect_identical(conditionMessage(got$cond), printed(row))
   expect_equal(got$fit$nAGQ, 1L)
+  expect_identical(got$fit$warnings$kind, "agq_fallback")
 })
 
 test_that("constructed notes store with their tier and title", {
@@ -150,7 +151,7 @@ test_that("constructed notes store with their tier and title", {
 })
 
 test_that("singular is stored and printed", {
-  # The fixture of test-methods.R's boundary-fit test (helper-benchmark.R).
+  # tau0 = 0 data: the RE variance pins to the boundary.
   d <- benchmark_data(seed = 107, family = "binomial", tau0 = 1e-8)
   got <- fit_catching(fastglmm(y ~ t + (1 | g), d, family = binomial()),
                       "fastglmm_singular")
@@ -160,6 +161,8 @@ test_that("singular is stored and printed", {
     "near zero, or a correlation at or near −1 or 1. Consider removing the ",
     "affected random effect. Affected: (Intercept) in g."))
   expect_identical(conditionMessage(got$cond), printed(row))
+  expect_identical(got$fit$warnings$kind, "singular")
+  expect_true(isSingular(got$fit))
 })
 
 test_that("pirls_exhausted is raised only on a converged final evaluation", {
@@ -412,15 +415,7 @@ test_that("the kind table matches the Python port", {
   expect_identical(fastglmm:::.UNKNOWN_KIND, c("caution", "Unrecognized solver message"))
 })
 
-test_that("port parity sequence", {
-  # Same data and call in python/tests/test_warnings.py - change together.
-  fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), MIXED, dispersion = 2, nAGQ = 3))
-  expect_identical(fit$warnings$tier, c("note", "note"))
-  expect_identical(fit$warnings$kind, c("argument_ignored", "argument_ignored"))
-  expect_identical(fit$warnings$title, c("Argument ignored", "Argument ignored"))
-})
-
-# One fixture, four notes across three kinds not covered above:
+# One fixture, four notes across three kinds:
 # argument_ignored fires twice (dispersion=/nAGQ=, both inapplicable on a
 # Gaussian model, from two different arguments) plus the formula lowering's
 # own unused_grouping_levels and re_design_scale_spread, from one
@@ -467,103 +462,11 @@ test_that("port parity non_integer_response", {
   # Intercept-only Poisson, mirrors the Rust unit test
   # poisson_non_integer_response_is_noted (src/fit/common_tests.rs).
   d <- data.frame(y = c(1, 2.5, 3, 4))
-  fit <- suppressWarnings(fastglmm(y ~ 1, d, family = "poisson"))
+  expect_warning(fit <- fastglmm(y ~ 1, d, family = "poisson"), "not a whole number")
   expect_true(fit$converged)
   expect_identical(fit$warnings$tier, "caution")
   expect_identical(fit$warnings$kind, "non_integer_response")
   expect_identical(fit$warnings$title, "Non-integer response")
-})
-
-test_that("port parity ill_conditioned", {
-  # Same fixture and call in python/tests/test_warnings.py - change together.
-  # Same data as the R port's own single-kind fixture in test-methods.R.
-  n <- 60L; split <- 40L
-  a <- ((seq_len(n) - 1L) * 13L) %% 17L - 8.0
-  b <- a + ifelse(seq_len(n) <= split, 0.0, 1.0)
-  y <- 0.5 + 1.3 * a + 0.477 * b + (((seq_len(n) - 1L) %% 3L) - 1.0)
-  w <- ifelse(seq_len(n) <= split, 1.0, 1e-11)
-  fit <- suppressWarnings(fastglmm(y ~ a + b, data.frame(y = y, a = a, b = b), weights = w))
-  expect_true(fit$converged)
-  expect_identical(fit$warnings$tier, "caution")
-  expect_identical(fit$warnings$kind, "ill_conditioned")
-  expect_identical(fit$warnings$title, "Nearly collinear columns")
-})
-
-test_that("port parity rows_dropped_na", {
-  # Same fixture and call in python/tests/test_warnings.py - change together.
-  # One NA in x drops one of four rows.
-  d <- data.frame(x = c(1, 2, NA, 4), y = c(2.1, 3.9, 8.2, 8.1))
-  fit <- suppressWarnings(fastglmm(y ~ x, d))
-  expect_true(fit$converged)
-  expect_identical(fit$warnings$tier, "caution")
-  expect_identical(fit$warnings$kind, "rows_dropped_na")
-  expect_identical(fit$warnings$title, "Rows dropped for missing values")
-  expect_identical(fit$warnings$message,
-    "Dropped 1 of 4 row(s): a column the formula uses had a missing value there.")
-})
-
-test_that("port parity agq_fallback", {
-  # Same fixture and call in python/tests/test_warnings.py - change together.
-  # Same data as the "agq_fallback is stored and printed" test above.
-  d <- transform(MIXED, y = as.numeric(y > 0),
-                 h = factor(sprintf("h%d", (seq_along(x) - 1L) %% 4L)))
-  fit <- suppressWarnings(fastglmm(y ~ x + (1 | g) + (1 | h), d, family = binomial(), nAGQ = 3))
-  expect_identical(fit$warnings$tier, "caution")
-  expect_identical(fit$warnings$kind, "agq_fallback")
-  expect_identical(fit$warnings$title, "Adaptive quadrature not used")
-})
-
-# Same 120-row binomial GLMM fixture as python/tests/test_warnings.py's
-# test_port_parity_singular (R and numpy RNGs do not agree, so the fixture is
-# generated once and both files carry the resulting numbers, not the
-# generator) — change together.
-.SINGULAR_X <- c(
-  0.34558419206478602, 0.82161814350115836, 0.33043707618338714, -1.3031572316043609,
-  0.90535586667311774, 0.44637457236401129, -0.53695323536028516, 0.58111810419635312,
-  0.36457239618607573, 0.29413249665552599, 0.028422241315796789, 0.54671298661244694,
-  -0.73645408700166692, -0.16290994799305278, -0.48211931267997826, 0.59884621263462756,
-  0.03972210748165899, -0.29245675096508861, -0.78190846235684208, -0.25719224061887069,
-  0.0081421805183435076, -0.27560290529937043, 1.2940638143982073, 1.0067243153057943,
-  -2.7111624789659685, -1.8890132459676727, -0.17477209205516195, -0.42219041157635356,
-  0.2136429974986111, 0.21732193102256359, 2.1178387550510482, -1.1120207626922813,
-  -0.37760500712699807, 2.0427716074923303, 0.6467029962018469, 0.66306337237626167,
-  -0.51400637168746288, -1.6480751708556527, 0.16746474422274113, 0.10901408782154753,
-  -1.2273520542445742, -0.68322666178056224, -0.07204367972722743, -0.94475162306077742,
-  -0.098269967852217269, 0.095483027469454335, 0.035586237055485713, -0.50629165831431477,
-  0.59374807178582278, 0.89116695428232839, 0.32084830456656371, -0.81823022739030704,
-  0.73165228378544078, -0.50144001846705233, 0.87916061828798531, -1.0717874168774442,
-  0.91446720312878116, -0.020063454615480422, -1.2487488903344155, -0.31389947196684775,
-  0.054102278771543888, 0.27279133916445375, -0.98218812494097774, -1.107373047165193,
-  0.19958453284708083, -0.46674961687980204, 0.23550561173022522, 0.75951952247837917,
-  -1.6487873663509485, 0.25438811651761728, 1.2246469675357323, -0.29752684437047322,
-  -0.81081458323756994, 0.75224382717959282, 0.25344651620814146, 0.89588307077756035,
-  -0.34521571005127971, -1.4818182737222112, -0.11001076471125099, -0.44582815301123219,
-  0.77532382204757411, 0.1936328483771538, -1.6308492324351012, -1.1951630801031998,
-  0.88378903658725527, 0.67976501741784656, -0.64024336590848874, -0.001048796567280681,
-  0.44557355377618613, 0.46840433584727792, 0.87624219611435006, 0.25648562722156198,
-  -0.094828338968498169, -0.25884806478784556, 1.0557428005332512, -2.2508542750785376,
-  -0.13865532509133732, 0.033000103984060107, -1.4253489608701877, 0.33281361313804664,
-  -0.65128101244339398, 0.86244479631574678, -0.1255920840343272, 0.66915324078945282,
-  1.2188436051712233, 0.38292958271347238, -0.87572114342284546, -1.5143186317046384,
-  1.7533841175163727, -0.11129219318751944, -0.68856494763432163, 0.14425708806082496,
-  -0.19141133048264922, 0.85214226421268768, 0.033928182437100288, 0.013749583618419497,
-  -0.71457972103296408, 0.46956809874749339, -1.0338667223549824, 0.66588943976396708
-)
-.SINGULAR_Y <- c(
-  0, 0, 1, 0, 1, 1, 0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 1, 0,
-  1, 0, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 1,
-  1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1, 0, 0, 1, 1,
-  0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1
-)
-
-test_that("port parity singular", {
-  d <- data.frame(x = .SINGULAR_X, y = .SINGULAR_Y,
-                   g = factor(sprintf("g%d", rep(0:29, each = 4))))
-  fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), d, family = binomial()))
-  expect_true(fit$converged)
-  expect_identical(fit$warnings$tier, "caution")
-  expect_identical(fit$warnings$kind, "singular")
-  expect_identical(fit$warnings$title, "Singular fit")
 })
 
 # 12-row Gamma-inverse GLMM, 4 clusters of 3 — the exact fixture

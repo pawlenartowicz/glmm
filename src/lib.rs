@@ -36,7 +36,7 @@
 // regardless of this feature — see `documentation/algorithms.md` for the full
 // dispatch. What goes dead with the feature OFF is mainly the narrower
 // `loop_advanced` surface: the `FitView` hot-loop accessors and the
-// gradient/Hessian kernels in `src/lmm/kernel.rs` and `src/glmm/derivative.rs`,
+// gradient/Hessian kernels in `src/glmm/derivative.rs`,
 // plus a few other loop-only helpers scattered through `src/lmm/mod.rs`,
 // `src/glmm/assembled.rs`, and `src/ols.rs`. So suppress dead_code only in
 // that build. The `loop_advanced` build uses all of it, so genuinely dead

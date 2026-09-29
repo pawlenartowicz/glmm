@@ -393,27 +393,6 @@ fn compute_diagonal_run_len(primary_q: usize, extra_qs: &[usize]) -> Vec<usize> 
 }
 
 impl LmmGroupings {
-    /// Single q=1 grouping shape.
-    pub fn single(max_clusters: usize) -> Self {
-        LmmGroupings {
-            n_primary: max_clusters,
-            nested_per_parent: 0,
-            nested: None,
-            crossed: vec![],
-            extra_offsets: vec![],
-            k_total: max_clusters,
-            primary_q: 1,
-            primary_slope_cols: vec![],
-            diagonal_theta: compute_diagonal_theta(1, &[]), // [0]
-            diagonal_run_len: compute_diagonal_run_len(1, &[]), // [1]
-            extra_slopes_any: false,
-            extra_q: vec![],
-            extra_slope_cols: vec![],
-            primary_slope_scales: vec![],
-            extra_slope_scales: vec![],
-        }
-    }
-
     /// Structure for a (validated) ClusterSpec at workspace size max_n.
     /// validate() guarantees ≤ 1 nested entry and crossed ⇒ FixedClusters.
     /// `slope_cols` are the x_full column indices for the primary slopes
@@ -818,10 +797,6 @@ pub struct LmmFitScratch<T = f64> {
 }
 
 impl<T: Scalar> LmmFitScratch<T> {
-    pub fn new(p: usize, max_clusters: usize) -> Self {
-        Self::with_groupings(p, &LmmGroupings::single(max_clusters))
-    }
-
     pub fn with_groupings(p: usize, g: &LmmGroupings) -> Self {
         let m = p + 1;
         let w = g.primary_q + g.nested_per_parent; // q_p primary cols + nested children
@@ -1129,7 +1104,10 @@ impl LmmWorkspace {
     /// the live core path builds through [`Self::for_cluster_spec_ext`].
     #[cfg(test)]
     pub fn new(p: usize, max_clusters: usize) -> Self {
-        Self::with_groupings(p, LmmGroupings::single(max_clusters))
+        let spec = crate::test_support::intercept_only_spec(crate::Sizing::FixedClusters {
+            n_clusters: max_clusters as u32,
+        });
+        Self::with_groupings(p, LmmGroupings::from_cluster_spec(&spec, max_clusters, &[]))
     }
 
     /// Workspace for a validated non-degenerate ClusterSpec at max_n. Carries

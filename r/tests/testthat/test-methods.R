@@ -11,13 +11,26 @@ test_that("VarCorr returns SD/correlation-scale components for a slope model", {
   v <- vc$g
   expect_equal(dim(v), c(2L, 2L))
   expect_equal(rownames(v), c("(Intercept)", "t"))
+  # The matrix itself is the covariance its attributes describe.
   sd <- attr(v, "stddev")
   corr <- attr(v, "correlation")
-  # The attributes must be exactly the sqrt-diagonal / normalized off-diagonal
-  # of the covariance block (take sqrt(diag), normalize).
   expect_equal(unname(sd), unname(sqrt(diag(v))), tolerance = 1e-12)
   expect_equal(corr[2, 1], v[2, 1] / (sd[[1]] * sd[[2]]), tolerance = 1e-12)
-  expect_true(abs(corr[2, 1]) <= 1)
+  # The vech -> SD/correlation math, against hand-computed values. A q = 2
+  # block is symmetric in (row, column), so q = 3 is the case that can see a
+  # transposed index.
+  sc <- fastglmm:::.stddev_corr(c(4, 1, 1.25))
+  expect_equal(sc$stddev, c(2, sqrt(1.25)), tolerance = 1e-12)
+  expect_equal(sc$correlation[2, 1], 1 / (2 * sqrt(1.25)), tolerance = 1e-12)
+  expect_equal(sc$correlation[1, 2], sc$correlation[2, 1])
+  # vech is column-major lower-triangular: (v00, v10, v20, v11, v21, v22),
+  # here sd = (1, 2, 3) with correlations r10 = 0.5, r20 = -0.25, r21 = 0.1.
+  sc3 <- fastglmm:::.stddev_corr(c(1, 1, -0.75, 4, 0.6, 9))
+  expect_equal(sc3$stddev, c(1, 2, 3), tolerance = 1e-12)
+  expect_equal(sc3$correlation,
+               rbind(c(1, 0.5, -0.25), c(0.5, 1, 0.1), c(-0.25, 0.1, 1)),
+               tolerance = 1e-12)
+  expect_error(fastglmm:::.stddev_corr(c(1, 2)), "is not a valid vech")
 })
 
 test_that("vcov is the full symmetric matrix and se its sqrt-diagonal", {
@@ -351,15 +364,6 @@ test_that("ranef and fitted return lme4-shaped values on a Gaussian LMM", {
   expect_lt(sum((y - fv)^2), sum((y - fixed_only)^2))
 })
 
-test_that("boundary fits warn with lme4's text plus the pinned component", {
-  # tau0 = 0 data: the RE variance pins to the boundary.
-  d <- benchmark_data(seed = 107, family = "binomial", tau0 = 1e-8)
-  expect_pinned_boundary_fit(
-    function() fastglmm(y ~ t + (1 | g), d, family = binomial()),
-    "\\(Intercept\\) in g"
-  )
-})
-
 test_that("diagnostics is additive: the top-level names keep working", {
   d <- benchmark_data(seed = 111, family = "binomial")
   fit <- fastglmm(y ~ t + (1 | g), d, family = binomial())
@@ -481,6 +485,10 @@ test_that("an ill-conditioned design warns with its own condition class", {
   expect_s3_class(cond, "fastglmm_diagnostic")
   expect_match(conditionMessage(cond), "b is almost a combination of other columns")
 
+  expect_identical(fit$warnings$tier, "caution")
+  expect_identical(fit$warnings$kind, "ill_conditioned")
+  expect_identical(fit$warnings$title, "Nearly collinear columns")
+
   expect_true(fit$converged)
   expect_false(any(fit$aliased)) # flagged, not dropped
   expect_length(fit$diagnostics$notes, 1L)
@@ -509,11 +517,6 @@ test_that("the fit keeps the lowered response and the data name", {
   fit <- fastglmm(y ~ t + (1 | g), d, family = binomial())
   expect_equal(unname(fit$y), as.double(d$y))
   expect_equal(fit$data_name, "d")
-  # cbind(): y is the proportion the kernel fitted, not either column.
-  d$s <- d$y
-  d$f <- 1L - d$y + 1L
-  fit2 <- fastglmm(cbind(s, f) ~ t + (1 | g), d, family = binomial())
-  expect_equal(unname(fit2$y), d$s / (d$s + d$f))
 })
 
 test_that("residuals: response and pearson, nothing else", {
@@ -560,17 +563,13 @@ test_that("glance() returns AIC/BIC on a REML fit and says so", {
   expect_equal(gl$deviance, -2 * fit$loglik)
 })
 
-test_that("warm start (lme4's start=) is accepted and unknown parts warn", {
+test_that("warm start (lme4's start=) reaches the kernel", {
   d <- benchmark_data(seed = 109, family = "binomial")
   cold <- fastglmm(y ~ t + (1 | g), d, family = binomial())
   warm <- fastglmm(y ~ t + (1 | g), d, family = binomial(),
-                   start = list(beta = unname(fixef(cold)), theta = 0.7))
+                   start = list(beta = unname(fixef(cold)), theta = 0.05))
   expect_equal(unname(fixef(warm)), unname(fixef(cold)), tolerance = 1e-4)
-  expect_warning(
-    fastglmm(y ~ t + (1 | g), d, family = binomial(),
-             start = list(beta = unname(fixef(cold)), theta = 0.7, bogus = 1)),
-    "start accepts only 'beta' and 'theta'; these entries were ignored: bogus"
-  )
+  expect_false(warm$n_eval == cold$n_eval)
 })
 
 test_that("wald.se = \"rx\" is marshalled through to the kernel", {

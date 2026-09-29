@@ -595,9 +595,9 @@ fn nested_padding_is_dropped_at_the_hand_computed_slots() {
 fn flat_nesting_labels_the_padded_layout_it_silently_routed_to() {
     let cells: [(&str, &str); 6] = [
         ("A", "s1"),
-        ("A", "s2"),
+        ("B", "s2"),
         ("B", "s3"),
-        ("B", "s4"),
+        ("C", "s4"),
         ("C", "s5"),
         ("C", "s6"),
     ];
@@ -622,14 +622,24 @@ fn flat_nesting_labels_the_padded_layout_it_silently_routed_to() {
         n,
     };
     let (fit, blocks, _, _, _) = run("y ~ x1 + (1 | ga) + (1 | gb)", &table);
-    // Balanced 2-per-parent nesting: 3 parents × 2 children, no padding at all,
-    // and the block is named for the child alone.
-    assert_eq!(fit.ranef_levels[1], 6);
+    // Parents A/B/C hold 1/2/3 children, so the layout is a 3-wide rectangle
+    // per parent: 3 × 3 = 9 slots, inside the padding bound (9 <= 2 · 6), with
+    // slots 1, 2 (A's) and 5 (B's) padding. The block is named for the child
+    // alone, and the padding is dropped from the labelled form.
+    assert_eq!(fit.ranef_levels[1], 9, "padded rectangle width");
     assert_eq!(blocks[1].group, "gb");
     assert_eq!(
         blocks[1].levels,
         strs(&["s1", "s2", "s3", "s4", "s5", "s6"])
     );
+    assert_eq!(blocks[1].values.len(), 6);
+    for slot in [1usize, 2, 5] {
+        assert_eq!(
+            fit.ranef[fit.ranef_levels[0] + slot],
+            0.0,
+            "padded slot {slot} should hold a zero mode"
+        );
+    }
 }
 
 /// A declared grouping level between two observed ones costs random-effect

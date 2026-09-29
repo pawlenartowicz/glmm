@@ -876,10 +876,9 @@ mod tests {
         let y = vec![1.0; n];
         let prior_w = vec![1.0; n];
         let u = vec![0.0; k];
-        // u = 0, so η is η_fixed: every row feasible but one sitting past the
+        // u = 0, so η is η_fixed. The refused case has one row past the
         // boundary, the shape a post-step iterate takes when the step overshoots.
         let mut eta_fixed = vec![1.0; n];
-        eta_fixed[2] = -0.25;
         let mut eta = vec![0.0; n];
         let mut prob = vec![0.0; n];
         let mut w = vec![0.0; n];
@@ -899,7 +898,7 @@ mod tests {
             k,
             sp: None,
         };
-        assert!(
+        let mut evaluates = |eta_fixed: &[f64]| {
             evaluate_at_mode(
                 &mut layout,
                 spec.family,
@@ -907,14 +906,24 @@ mod tests {
                 &y,
                 &prior_w,
                 false,
-                &eta_fixed,
+                eta_fixed,
                 &u,
                 &mut eta,
                 &mut prob,
                 &mut w,
                 n,
             )
-            .is_none(),
+            .is_some()
+        };
+        // Positive control: the same call on an all-feasible η evaluates, so the
+        // refusal below is the infeasible row and nothing else.
+        assert!(
+            evaluates(&eta_fixed),
+            "an all-feasible iterate must be evaluated"
+        );
+        eta_fixed[2] = -0.25;
+        assert!(
+            !evaluates(&eta_fixed),
             "a refreshed iterate with η outside the link's domain must not be reported as an evaluation"
         );
     }

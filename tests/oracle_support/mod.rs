@@ -164,7 +164,8 @@ impl Est {
 
 /// Read and parse a single golden by name, setting `source` the same way
 /// `m3_corpus`/`weights_corpus` do. For tests that need one named golden rather
-/// than the whole corpus (e.g. `dev_align`'s self-checks) — the multi-golden
+/// than the whole corpus (the twin check in
+/// `objective_differs_matches_the_pinned_goldens`) — the multi-golden
 /// readers stay in `validation_oracle.rs` since they also carry manifest/factor
 /// logic this single-file read has no use for.
 pub fn load_golden(name: &str) -> Golden {

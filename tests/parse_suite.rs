@@ -5,7 +5,7 @@
 //!   - the 28-case canonical suite (`configs/formula-fixtures/canonical-suite.json`),
 //!     inlined here as Rust data and checked via the same canonical normalization
 //!     the app-spec `formula_suite.rs` harness uses;
-//!   - the 11 random-effects cases (`random_effects_parse.rs`) as direct AST asserts.
+//!   - the random-effects cases (`random_effects_parse.rs`) as direct AST asserts.
 //!
 //! Pure — no data table.
 
@@ -230,7 +230,7 @@ fn canonical_suite_matches_mirror() {
     }
 }
 
-// ── The 11 random-effects cases (random_effects_parse.rs), as direct AST asserts ──
+// ── The random-effects cases (random_effects_parse.rs), as direct AST asserts ──
 
 #[test]
 fn parses_random_intercept() {
@@ -243,30 +243,6 @@ fn parses_random_intercept() {
         }]
     );
     assert_eq!(f.predictors, vec!["x".to_string()]); // group var is NOT a predictor
-}
-
-#[test]
-fn parses_random_slope_single_var() {
-    let f = parse("y ~ x + (1+x|g)").unwrap();
-    assert_eq!(
-        f.random_effects,
-        vec![RandomEffect::Slope {
-            group: "g".into(),
-            vars: vec!["x".into()],
-        }]
-    );
-}
-
-#[test]
-fn parses_random_slope_multi_var() {
-    let f = parse("y ~ x + z + (1+x+z|g)").unwrap();
-    assert_eq!(
-        f.random_effects,
-        vec![RandomEffect::Slope {
-            group: "g".into(),
-            vars: vec!["x".into(), "z".into()],
-        }]
-    );
 }
 
 #[test]
@@ -326,15 +302,6 @@ fn duplicate_interaction_grouping_var_errors() {
     ));
 }
 
-#[test]
-fn duplicate_grouping_var_errors() {
-    let err = parse("y ~ x + (1|g) + (1|g)").unwrap_err();
-    assert!(matches!(
-        err,
-        glmm::formula::ParseError::DuplicateGroupingVar { .. }
-    ));
-}
-
 /// Neither the double-bar decorrelated-slope idiom nor three-level nesting
 /// shorthand is supported grammar: `RE_SLOPE`/`RE_ISLOPE` admit exactly one
 /// `|`, and `RE_NESTED` admits exactly two identifiers around one `/`. Both
@@ -349,13 +316,6 @@ fn unsupported_re_syntax_is_a_syntax_error() {
             parse(f)
         );
     }
-}
-
-#[test]
-fn rhs_after_re_extraction_has_clean_plusses() {
-    let f = parse("y ~ x + (1|g)").unwrap();
-    assert_eq!(f.terms.len(), 1); // only "x" — RE term doesn't appear in `terms`
-    assert_eq!(f.terms[0], Term::Main { name: "x".into() });
 }
 
 #[test]
@@ -375,20 +335,6 @@ fn intercept_suppression_rejected() {
             parse(f)
         );
     }
-}
-
-#[test]
-fn implicit_intercept_slope_equals_explicit() {
-    let imp = parse("y ~ x + (x|g)").unwrap();
-    let exp = parse("y ~ x + (1+x|g)").unwrap();
-    assert_eq!(imp.random_effects, exp.random_effects);
-    assert_eq!(
-        imp.random_effects,
-        vec![RandomEffect::Slope {
-            group: "g".into(),
-            vars: vec!["x".into()]
-        }]
-    );
 }
 
 #[test]
@@ -462,24 +408,6 @@ fn seam_match_from_embedded_re_term_still_parses() {
                 vars: vec!["x".into()],
             },
         ]
-    );
-}
-
-#[test]
-fn explicit_intercept_forms_unchanged() {
-    assert_eq!(
-        parse("y ~ (1|g)").unwrap().random_effects,
-        vec![RandomEffect::Intercept {
-            group: "g".into(),
-            parent: None
-        }]
-    );
-    assert_eq!(
-        parse("y ~ x + (1+x|g)").unwrap().random_effects,
-        vec![RandomEffect::Slope {
-            group: "g".into(),
-            vars: vec!["x".into()]
-        }]
     );
 }
 

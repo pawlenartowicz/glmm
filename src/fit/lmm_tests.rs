@@ -21,69 +21,7 @@ use super::common_tests::{assert_pinned, dense_str, lcg, PIN_REL_ITER};
 use super::loop_advanced_seam::{build_lmm_workspace, refit_lmm};
 
 use super::lmm::{lmm_run_on, lmm_view_to_fit};
-use crate::test_support::{assert_near, extra_level_of_row, intercept_only_spec};
-
-/// `lmm_run_on` + `lmm_view_to_fit` on a hand-accumulated workspace must
-/// reproduce the `Fit` that `fit_cold` produces for the same single-random-
-/// intercept Gaussian LMM — pins the view/mapper split as behavior-preserving.
-#[test]
-fn lmm_run_on_view_maps_to_same_fit_as_fit_cold() {
-    let n_clusters = 6usize;
-    let per = 8usize;
-    let n = n_clusters * per;
-    let p = 2usize;
-    let mut st = 13u64;
-    let mut x = vec![0.0f64; n * p];
-    let mut y = vec![0.0f64; n];
-    let mut ids_v = vec![0u32; n];
-    for i in 0..n {
-        ids_v[i] = (i % n_clusters) as u32;
-        let x1 = lcg(&mut st);
-        x[i * 2] = 1.0;
-        x[i * 2 + 1] = x1;
-        let re = 0.3 * ((ids_v[i] as f64) - (n_clusters as f64) / 2.0);
-        y[i] = 0.5 + 0.4 * x1 + re + 0.2 * lcg(&mut st);
-    }
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds {
-        primary: ids_v,
-        extra: vec![],
-    };
-    let opts = FitOptions {
-        target_indices: vec![0, 1],
-        ..FitOptions::default()
-    };
-
-    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-
-    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[], &[], false);
-    let mut x_mat = Mat::<f64>::zeros(n, p);
-    for i in 0..n {
-        for j in 0..p {
-            x_mat[(i, j)] = x[i * p + j];
-        }
-    }
-    ws.suff_mut().reset();
-    ws.suff_mut().set_design_qr(x_mat.as_ref(), None);
-    ws.suff_mut()
-        .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], None);
-    let via = {
-        let v = lmm_run_on(&mut ws, &opts.target_indices, None);
-        lmm_view_to_fit(&v, &x, &ids, n, p, &opts)
-    };
-    assert_near(&cold.beta, &via.beta, "beta");
-    assert_near(&cold.tau2, &via.tau2, "tau2");
-    assert_near(&[cold.dispersion], &[via.dispersion], "dispersion");
-    assert_near(&cold.se, &via.se, "se");
-}
+use crate::test_support::{cluster_of_row, extra_level_of_row, intercept_only_spec};
 
 /// Aliased fixed column on a MIXED design: `y ~ 1 + x1 + x2 + x3 + (1|g)` on
 /// sim_collinear_lmm (x3 ≈ x1 + x2). glmm keeps full width with `NaN` in the
@@ -825,36 +763,7 @@ fn exact_alias_is_dropped_and_the_entangled_pair_is_kept() {
 #[test]
 fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
     // Parsing mirrors `fit_sleepstudy_slope_varcorr_matches_lme4`.
-    let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
-    let mut y = Vec::<f64>::new();
-    let mut days = Vec::<f64>::new();
-    let mut subj_raw = Vec::<String>::new();
-    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
-        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
-        y.push(f[0].parse().unwrap()); // Reaction
-        days.push(f[1].parse().unwrap()); // Days
-        subj_raw.push(f[2].to_string()); // Subject
-    }
-    let n = y.len();
-    let p = 2;
-    let mut x = vec![0.0f64; n * p];
-    for i in 0..n {
-        x[i * p] = 1.0;
-        x[i * p + 1] = days[i];
-    }
-    let (subject, _n_subj) = dense_str(&subj_raw);
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — data path derives it
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds {
-        primary: subject,
-        extra: vec![],
-    };
+    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let opts = FitOptions {
         target_indices: vec![0, 1],
         ..FitOptions::default()
@@ -934,6 +843,12 @@ fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
 /// (`validation/goldens/sleepstudy_lmm.json`, REML). Checks the full 2×2 RE
 /// covariance (variances AND the off-diagonal covariance) via `Fit::varcorr`,
 /// which `tau2` cannot represent at q≥2. The oracle is sacred.
+///
+/// The same fit must also surface the optimizer eval count, the minimized
+/// criterion, and boundary/singular status. Oracle: lme4's frozen REML fit —
+/// REMLcrit = glmm deviance + df·(1 + ln 2π), df = n − p (glmm's reml_deviance
+/// omits the df·(1+ln 2π) constant lme4's REMLcrit carries; loglik =
+/// −REMLcrit/2 is what `validation/goldens/sleepstudy_lmm.json` stores).
 #[test]
 fn fit_sleepstudy_slope_varcorr_matches_lme4() {
     const REF_B0: f64 = 251.405104848485;
@@ -945,37 +860,8 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
     const REF_CORR: f64 = 0.0655512382381282;
     const REF_SIGMA: f64 = 25.5917957216753; // residual sd, lme4 sigma()
 
-    let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
-    let mut y = Vec::<f64>::new();
-    let mut days = Vec::<f64>::new();
-    let mut subj_raw = Vec::<String>::new();
-    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
-        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
-        y.push(f[0].parse().unwrap()); // Reaction
-        days.push(f[1].parse().unwrap()); // Days
-        subj_raw.push(f[2].to_string()); // Subject
-    }
-    let n = y.len();
-    let p = 2;
-    let mut x = vec![0.0f64; n * p];
-    for i in 0..n {
-        x[i * p] = 1.0; // intercept
-        x[i * p + 1] = days[i]; // Days
-    }
-    let (subject, _n_subj) = dense_str(&subj_raw);
+    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
 
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — data path derives it
-            slopes: vec![1],                                 // random slope on Days (col 1)
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds {
-        primary: subject,
-        extra: vec![],
-    };
     let f = fit_cold(
         &x,
         &y,
@@ -1052,65 +938,11 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
         "D10 {} vs {d10}",
         vc[1]
     );
-}
-
-/// Campaign instrumentation: `fit` must surface the optimizer eval count, the
-/// minimized criterion, and boundary/singular status. Oracle: lme4's frozen
-/// sleepstudy REML fit — REMLcrit = glmm deviance + df·(1 + ln 2π), df = n − p
-/// (glmm's reml_deviance omits the df·(1+ln 2π) constant lme4's REMLcrit
-/// carries; loglik = −REMLcrit/2 is what validation/goldens/sleepstudy_lmm.json stores).
-#[test]
-fn fit_exposes_n_eval_deviance_singular() {
-    let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
-    let mut y = Vec::<f64>::new();
-    let mut days = Vec::<f64>::new();
-    let mut subj_raw = Vec::<String>::new();
-    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
-        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
-        y.push(f[0].parse().unwrap()); // Reaction
-        days.push(f[1].parse().unwrap()); // Days
-        subj_raw.push(f[2].to_string()); // Subject
-    }
-    let n = y.len();
-    let p = 2;
-    let mut x = vec![0.0f64; n * p];
-    for i in 0..n {
-        x[i * p] = 1.0; // intercept
-        x[i * p + 1] = days[i]; // Days
-    }
-    let (subject, _n_subj) = dense_str(&subj_raw);
-
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — data path derives it
-            slopes: vec![1],                                 // random slope on Days (col 1)
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds {
-        primary: subject,
-        extra: vec![],
-    };
-    let f = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &model,
-        &ids,
-        &FitOptions {
-            target_indices: vec![0, 1],
-            ..FitOptions::default()
-        },
-    );
 
     assert!(f.n_eval > 0, "BOBYQA ran, evals must be counted");
     assert!(f.deviance.is_finite());
     assert!(!f.singular(), "sleepstudy is an interior optimum");
-    let n = 180.0_f64;
-    let p = 2.0_f64; // intercept + Days
-    let df = n - p;
+    let df = (n - p) as f64;
     let lme4_loglik = -871.814135979976; // validation/goldens/sleepstudy_lmm.json .estimates.loglik
     let remlcrit = -2.0 * lme4_loglik;
     let expected = remlcrit - df * (1.0 + (2.0 * std::f64::consts::PI).ln());
@@ -1141,44 +973,16 @@ fn fit_lmm_offset_matches_lme4() {
     const REF_BETA: [f64; 2] = [244.5869230303025, 10.3157708080802];
     const REF_REMLCRIT: f64 = 1756.8758930064;
     const REF_LOGLIK: f64 = -878.437946503201;
-    let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
-    let mut y = Vec::<f64>::new();
-    let mut days = Vec::<f64>::new();
-    let mut subj_raw = Vec::<String>::new();
-    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
-        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
-        y.push(f[0].parse().unwrap()); // Reaction
-        days.push(f[1].parse().unwrap()); // Days
-        subj_raw.push(f[2].to_string()); // Subject
-    }
-    let n = y.len();
-    let p = 2;
-    let mut x = vec![0.0f64; n * p];
-    for i in 0..n {
-        x[i * p] = 1.0;
-        x[i * p + 1] = days[i];
-    }
-    let (subject, _n_subj) = dense_str(&subj_raw);
+    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let o: Vec<f64> = (0..n).map(|i| 5.0 * (i % 4) as f64).collect();
 
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — data path derives it
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
-    };
     let f = fit_cold(
         &x,
         &y,
         n,
         p,
         &model,
-        &GroupIds {
-            primary: subject,
-            extra: vec![],
-        },
+        &ids,
         &FitOptions {
             target_indices: vec![0, 1],
             offset: Some(o),
@@ -1232,38 +1036,9 @@ fn fit_lmm_weighted_matches_lme4() {
     const REF_SIGMA: f64 = 38.62892535113247;
     const REF_REMLCRIT: f64 = 1778.29146275691;
 
-    let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
-    let mut y = Vec::<f64>::new();
-    let mut days = Vec::<f64>::new();
-    let mut subj_raw = Vec::<String>::new();
-    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
-        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
-        y.push(f[0].parse().unwrap()); // Reaction
-        days.push(f[1].parse().unwrap()); // Days
-        subj_raw.push(f[2].to_string()); // Subject
-    }
-    let n = y.len();
-    let p = 2;
-    let mut x = vec![0.0f64; n * p];
-    for i in 0..n {
-        x[i * p] = 1.0; // intercept
-        x[i * p + 1] = days[i]; // Days
-    }
-    let (subject, _n_subj) = dense_str(&subj_raw);
+    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let w: Vec<f64> = (0..n).map(|i| 1.0 + (i % 3) as f64).collect();
 
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — data path derives it
-            slopes: vec![1],                                 // random slope on Days (col 1)
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds {
-        primary: subject,
-        extra: vec![],
-    };
     let f = fit_cold(
         &x,
         &y,
@@ -1365,109 +1140,19 @@ fn fit_lmm_weighted_matches_lme4() {
     );
 }
 
-/// Task 5: constant weights (w ≡ 2) must reproduce the unweighted fit's β,
-/// SE, AND tau2 exactly (1e-10) — under w ≡ c, the substitution θ̃ = √c·θ
-/// maps the weighted profiled deviance onto the unweighted one 1:1, so θ̂
-/// scales by 1/√c while σ̂² scales by c, and tau2 = θ²σ̂² is invariant.
-/// Verified against lme4 separately: sleepstudy with w ≡ 2 leaves the
-/// VarCorr group variances unchanged and exactly doubles the residual
-/// variance (not re-asserted here — this test only needs internal
-/// consistency on a small synthetic LMM, cheaper than another R golden).
+/// Varying prior weights on a CROSSED random-slope design
+/// (`y ~ 1 + x + (1 + x | g1) + (1 | g2)`, the `sim_slope` fixture): the dense
+/// kernel must give the sparse kernel's β/SE/varcorr. A q_p = 2 primary slope
+/// plus a crossed intercept extra takes the dense kernel's scalar crossed
+/// branch, whose weight sites in `add_rows_multi` are the intercept×intercept
+/// `zx += wᵢ` and the slope↔crossed `zx_slope += z·zw`. Unit weights cannot
+/// tell those from a wrong-power bug, and a constant weight is rescaled away
+/// before the kernel runs (`accumulate_lmm_rows` divides by
+/// `family::weight_scale`), so the weights vary by row. The dense side is
+/// forced through `fit_mle_noz_pub`, as in
+/// `fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse`.
 #[test]
-fn fit_lmm_constant_weights_invariant() {
-    let n_clusters = 6usize;
-    let per = 8usize;
-    let n = n_clusters * per;
-    let mut st = 13u64;
-    let mut x = vec![0.0f64; n * 2];
-    let mut y = vec![0.0f64; n];
-    let mut ids_v = vec![0u32; n];
-    for i in 0..n {
-        ids_v[i] = (i % n_clusters) as u32;
-        let x1 = lcg(&mut st);
-        x[i * 2] = 1.0;
-        x[i * 2 + 1] = x1;
-        let re = 0.3 * ((ids_v[i] as f64) - (n_clusters as f64) / 2.0);
-        y[i] = 0.5 + 0.4 * x1 + re + 0.2 * lcg(&mut st);
-    }
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds {
-        primary: ids_v,
-        extra: vec![],
-    };
-    let unweighted = fit_cold(
-        &x,
-        &y,
-        n,
-        2,
-        &model,
-        &ids,
-        &FitOptions {
-            target_indices: vec![0, 1],
-            ..FitOptions::default()
-        },
-    );
-    let weighted = fit_cold(
-        &x,
-        &y,
-        n,
-        2,
-        &model,
-        &ids,
-        &FitOptions {
-            target_indices: vec![0, 1],
-            weights: Some(vec![2.0; n]),
-            ..FitOptions::default()
-        },
-    );
-    assert!(unweighted.converged() && weighted.converged());
-    // The θ̃=√c·θ substitution is exact algebra; the achieved match is
-    // bounded by BOBYQA's rho_end floor (2 independently-converged fits,
-    // not a shared trajectory), not by 1e-10 — 1e-6 relative is the tight
-    // bound this floor actually supports (measured ~2e-8 on this fixture).
-    for j in 0..2 {
-        assert!(
-            (unweighted.beta[j] - weighted.beta[j]).abs() / unweighted.beta[j].abs() < 1e-6,
-            "β[{j}] unweighted {} vs w≡2 {}",
-            unweighted.beta[j],
-            weighted.beta[j]
-        );
-        assert!(
-            (unweighted.se[j] - weighted.se[j]).abs() / unweighted.se[j] < 1e-6,
-            "se[{j}] unweighted {} vs w≡2 {}",
-            unweighted.se[j],
-            weighted.se[j]
-        );
-    }
-    assert_eq!(unweighted.tau2.len(), weighted.tau2.len());
-    for k in 0..unweighted.tau2.len() {
-        assert!(
-            (unweighted.tau2[k] - weighted.tau2[k]).abs() / unweighted.tau2[k] < 1e-6,
-            "tau2[{k}] unweighted {} vs w≡2 {}",
-            unweighted.tau2[k],
-            weighted.tau2[k]
-        );
-    }
-}
-
-/// Constant-weights invariance on a CROSSED random-slope design
-/// (`y ~ 1 + x + (1 + x | g1) + (1 | g2)`, the `sim_slope` fixture):
-/// w ≡ 2 must reproduce the unweighted β/SE/varcorr. This is the numeric
-/// check for the crossed-path weight sites in `add_rows_multi` — the
-/// intercept×intercept `zx += wᵢ` and the slope↔crossed `zx_slope += z·zw`
-/// (q_p = 2 primary slope + crossed intercept extra takes the scalar
-/// crossed branch, which unit-weight tests cannot distinguish from a
-/// wrong-power bug). Same θ̃ = √c·θ rationale and BOBYQA-floor tolerance as
-/// `fit_lmm_constant_weights_invariant`.
-#[test]
-fn fit_lmm_crossed_constant_weights_invariant() {
+fn fit_lmm_scalar_crossed_varying_weights_noz_matches_sparse() {
     let csv = include_str!("../../validation/data/simulated/sim_slope.csv");
     let mut y = Vec::<f64>::new();
     let mut xcol = Vec::<f64>::new();
@@ -1489,6 +1174,9 @@ fn fit_lmm_crossed_constant_weights_invariant() {
     }
     let (g1, _n1) = dense_str(&g1_raw);
     let (g2, _n2) = dense_str(&g2_raw);
+    // Varying, O(1), strictly positive (`lcg` ranges over [-1, 1]).
+    let mut st = 1301u64;
+    let w: Vec<f64> = (0..n).map(|_| 1.5 + 1.3 * lcg(&mut st)).collect();
 
     let model = ModelSpec {
         family: Family::Gaussian,
@@ -1505,58 +1193,41 @@ fn fit_lmm_crossed_constant_weights_invariant() {
         primary: g1,
         extra: vec![g2],
     };
-    let base_opts = FitOptions {
+    let opts = FitOptions {
         target_indices: vec![0, 1],
+        weights: Some(w),
         ..FitOptions::default()
     };
-    let unweighted = fit_cold(&x, &y, n, p, &model, &ids, &base_opts);
-    let weighted = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &model,
-        &ids,
-        &FitOptions {
-            weights: Some(vec![2.0; n]),
-            ..base_opts
-        },
+    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
+    let noz = fit_mle_noz_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
+    let sp = fit_mle_sparse_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
+    assert!(
+        noz.converged() && sp.converged(),
+        "both routes must converge"
     );
-    assert!(unweighted.converged() && weighted.converged());
+    // Two independent BOBYQA solves, bounded by the solver's rho_end floor.
+    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
     for j in 0..p {
         assert!(
-            (unweighted.beta[j] - weighted.beta[j]).abs() / unweighted.beta[j].abs() < 1e-6,
-            "β[{j}] unweighted {} vs w≡2 {}",
-            unweighted.beta[j],
-            weighted.beta[j]
+            rel(sp.beta[j], noz.beta[j]) < 1e-4,
+            "β[{j}] sparse={} noz={}",
+            sp.beta[j],
+            noz.beta[j]
         );
         assert!(
-            (unweighted.se[j] - weighted.se[j]).abs() / unweighted.se[j] < 1e-6,
-            "se[{j}] unweighted {} vs w≡2 {}",
-            unweighted.se[j],
-            weighted.se[j]
+            rel(sp.se[j], noz.se[j]) < 1e-4,
+            "se[{j}] sparse={} noz={}",
+            sp.se[j],
+            noz.se[j]
         );
     }
     // varcorr covers BOTH groupings' D̂ blocks (tau2 only reproduces the
-    // (0,0) diagonal for the q=2 primary). Relative bound on the diagonals;
-    // the small q=2 off-diagonal takes the same bound scaled to its own
-    // magnitude floor.
-    assert_eq!(unweighted.varcorr.len(), weighted.varcorr.len());
-    for (gi, (vu, vw)) in unweighted
-        .varcorr
-        .iter()
-        .zip(weighted.varcorr.iter())
-        .enumerate()
-    {
-        assert_eq!(vu.len(), vw.len());
-        for k in 0..vu.len() {
-            let scale = vu[k].abs().max(1e-3);
-            assert!(
-                (vu[k] - vw[k]).abs() / scale < 1e-5,
-                "varcorr[{gi}][{k}] unweighted {} vs w≡2 {}",
-                vu[k],
-                vw[k]
-            );
+    // (0,0) diagonal for the q=2 primary).
+    assert_eq!(sp.varcorr.len(), noz.varcorr.len(), "varcorr block count");
+    for (bi, (sb, nb)) in sp.varcorr.iter().zip(noz.varcorr.iter()).enumerate() {
+        assert_eq!(sb.len(), nb.len(), "varcorr[{bi}] len");
+        for (ei, (a, b)) in sb.iter().zip(nb.iter()).enumerate() {
+            assert!(rel(*a, *b) < 1e-4, "varcorr[{bi}][{ei}] sparse={a} noz={b}");
         }
     }
 }
@@ -1598,7 +1269,7 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
     let mut eid = vec![0u32; n];
     let mut w = vec![0.0f64; n];
     for i in 0..n {
-        let par = cluster.re.as_ref().unwrap().sizing.cluster_of_row(i);
+        let par = cluster_of_row(&cluster.re.as_ref().unwrap().sizing, i);
         let item = extra_level_of_row(&cluster, 0, i) as usize;
         pid[i] = par as u32;
         eid[i] = item as u32;
@@ -1612,9 +1283,9 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
             + u0e[item]
             + u1e[item] * x1
             + 0.8 * lcg(&mut st);
-        // Varies by row, unlike the w≡2 crossed test above — a weight folded
-        // into the wrong RE column shows up as a β/varcorr mismatch here,
-        // where a constant factor would only rescale both routes alike.
+        // Varies by row — a weight folded into the wrong RE column shows up
+        // as a β/varcorr mismatch here, where a constant factor would only
+        // rescale both routes alike.
         w[i] = 1.0 + (i % 3) as f64;
     }
     let ids = GroupIds {
@@ -1660,8 +1331,7 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
     }
 }
 
-/// Weight-SCALE invariance (not just constant-weight invariance, which
-/// `fit_lmm_constant_weights_invariant` already covers): varying base weights
+/// Weight-SCALE invariance: varying base weights
 /// `w`, rescaled by `c ∈ {2^20, 2^-20, 1e8, 1e-8}`, must reproduce the `c = 1`
 /// fit's β, SE and τ² (both routes forced via `fit_mle_noz_pub`/
 /// `fit_mle_sparse_pub`, the same forced entries the crossed-slope test above
@@ -1671,7 +1341,7 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
 /// far enough to hit `THETA_HI`/`PIN_THETA` (`lmm::mod::THETA_HI`,
 /// `PIN_THETA`) and both SE and dispersion would come out wrong; `2^20`/`2^-20`
 /// are exact powers of two, so `ŵ` is bit-identical to the `c = 1` case and the
-/// tolerance can be as tight as `fit_lmm_constant_weights_invariant`'s.
+/// tolerance can be tight (1e-6).
 /// `1e8`/`1e-8` are not powers of two, so `s` differs by one ULP-scale factor
 /// from a clean rescale and gets a looser band (still far tighter than a
 /// raw-`w` search's error, which would be off by orders of magnitude).
@@ -1785,12 +1455,11 @@ fn fit_lmm_weight_scale_invariant_dense_and_sparse() {
     }
 }
 
-/// Task 5 Step 6: the dense-LMM boundary (τ̂ ≈ 0, pinned exactly per the
-/// Q7 deterministic-pin policy — mirrors
+/// The dense-LMM boundary (τ̂ ≈ 0, pinned exactly — mirrors
 /// `lmm::tests::zero_between_cluster_variance_pins_at_exactly_zero`) must
-/// reproduce the weighted fixed-only WLS fit (Task 1, `fit_ols`) on the
+/// reproduce the weighted fixed-only WLS fit on the
 /// same rows: at θ̂=0 the mixed kernel's weighted Grams (`c`/`s`/`counts`,
-/// all Σwᵢ-scaled per Task 5's accumulator) collapse to the same weighted
+/// all Σwᵢ-scaled) collapse to the same weighted
 /// normal equations WLS solves directly, so the two paths must agree.
 #[test]
 fn fit_lmm_weighted_boundary_matches_wls() {
@@ -2594,8 +2263,8 @@ fn refit_lmm_matches_fresh_fit_cold() {
 /// Parses `validation/data/empirical/sleepstudy.csv` into the q=2 random-slope
 /// design `Reaction ~ 1 + Days + (1 + Days | Subject)` — shared by the rescale
 /// tests below, which need the raw `x`/`y`/`ids` to build a second design with
-/// column 1 (`Days`) multiplied by a power of two. Parsing mirrors
-/// `fit_sleepstudy_slope_varcorr_matches_lme4`.
+/// column 1 (`Days`) multiplied by a power of two, and by the lme4 sleepstudy
+/// pins above (warm start, varcorr, offset, weights).
 fn sleepstudy_slope_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
     let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
     let mut y = Vec::<f64>::new();
@@ -3011,9 +2680,12 @@ fn fit_lmm_p_zero_weighted_reaches_nan_fill() {
     );
 }
 
-/// Twin of `lmm_maxfun_cap_reports_honest_endpoint_and_not_singular` above,
-/// but with TWO variance components (intercept + a slope on column 1) instead
-/// of one, and built so the negligible-ratio check
+/// Fit-level twin of `lmm::tests::maxfun_cap_reports_honest_endpoint`, through
+/// `lmm_run_on` + `lmm_view_to_fit`: a `MaxFunReached` cap-out must report
+/// finite `tau2`/`varcorr`/`dispersion` (the plateau policy) WITHOUT setting
+/// `diagnostics.singular`. It uses TWO variance components (intercept + a
+/// slope on column 1), because a single one can never trip the negligible-ratio
+/// check. It is built so that the negligible-ratio check
 /// (`Fit::has_negligible_component`) — not the boundary pin — is what would
 /// flag it: the slope's TRUE random effect is nonzero but tiny relative to
 /// the intercept's, so the genuine REML optimum is an INTERIOR point (no θ
@@ -3107,9 +2779,18 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
 
     assert!(!fit.converged(), "a capped fit must not report converged");
     assert!(
+        !fit.tau2.is_empty() && fit.tau2.iter().all(|v| v.is_finite()),
+        "plateau policy: capped endpoint must report tau2, got {:?}",
+        fit.tau2
+    );
+    assert!(
         !fit.varcorr.is_empty() && fit.varcorr.iter().flatten().all(|v| v.is_finite()),
         "plateau policy: capped endpoint must report varcorr, got {:?}",
         fit.varcorr
+    );
+    assert!(
+        fit.dispersion.is_finite(),
+        "plateau policy: capped endpoint must report a finite dispersion"
     );
     // The point IS negligible by the ratio check's own rule — this is what
     // makes the gate load-bearing here, unlike a single-component fixture
@@ -3130,99 +2811,5 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
         "a capped endpoint reports singular = false, even though its varcorr \
          ratio ({ratio}) is negligible — has_negligible_component must stay \
          gated on `converged`"
-    );
-}
-
-/// Fit-level twin of `lmm::tests::maxfun_cap_reports_honest_endpoint`, through
-/// `lmm_run_on` + `lmm_view_to_fit`: a `MaxFunReached` cap-out must report
-/// finite `tau2`/`varcorr`/`dispersion` (the plateau policy) WITHOUT ever
-/// setting `diagnostics.singular` — the post-hoc negligible-component check
-/// (`Fit::has_negligible_component`) is gated on `converged` for exactly this
-/// reason (a capped endpoint is a point, not an accepted boundary). Same
-/// dataset/cap construction as `lmm_run_on_view_maps_to_same_fit_as_fit_cold`
-/// above; the cap forces the legal-minimum `max_fun` the way
-/// `lmm::tests::maxfun_cap_reports_honest_endpoint` does.
-#[test]
-fn lmm_maxfun_cap_reports_honest_endpoint_and_not_singular() {
-    use bobyqa::{Bobyqa, Config};
-
-    let n_clusters = 6usize;
-    let per = 8usize;
-    let n = n_clusters * per;
-    let p = 2usize;
-    let mut st = 13u64;
-    let mut x = vec![0.0f64; n * p];
-    let mut y = vec![0.0f64; n];
-    let mut ids_v = vec![0u32; n];
-    for i in 0..n {
-        ids_v[i] = (i % n_clusters) as u32;
-        let x1 = lcg(&mut st);
-        x[i * 2] = 1.0;
-        x[i * 2 + 1] = x1;
-        let re = 0.3 * ((ids_v[i] as f64) - (n_clusters as f64) / 2.0);
-        y[i] = 0.5 + 0.4 * x1 + re + 0.2 * lcg(&mut st);
-    }
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds {
-        primary: ids_v,
-        extra: vec![],
-    };
-    let opts = FitOptions {
-        target_indices: vec![0, 1],
-        ..FitOptions::default()
-    };
-
-    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[], &[], false);
-    let mut x_mat = Mat::<f64>::zeros(n, p);
-    for i in 0..n {
-        for j in 0..p {
-            x_mat[(i, j)] = x[i * p + j];
-        }
-    }
-    ws.suff_mut().reset();
-    ws.suff_mut()
-        .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], None);
-
-    let n_theta = ws.theta.len();
-    let npt = 2 * n_theta + 1; // PRIMA's minimum npt (n_theta == 1 here)
-    let config = {
-        let mut c = Config::new(n_theta);
-        c.npt = npt;
-        c.max_fun = npt + 1;
-        c
-    };
-    ws.solver = Bobyqa::new(n_theta, config).expect("legal minimal config");
-
-    let fit = {
-        let v = lmm_run_on(&mut ws, &opts.target_indices, None);
-        lmm_view_to_fit(&v, &x, &ids, n, p, &opts)
-    };
-
-    assert!(!fit.converged(), "a capped fit must not report converged");
-    assert!(
-        !fit.tau2.is_empty() && fit.tau2.iter().all(|v| v.is_finite()),
-        "plateau policy: capped endpoint must report tau2, got {:?}",
-        fit.tau2
-    );
-    assert!(
-        !fit.varcorr.is_empty() && fit.varcorr.iter().flatten().all(|v| v.is_finite()),
-        "plateau policy: capped endpoint must report varcorr, got {:?}",
-        fit.varcorr
-    );
-    assert!(
-        fit.dispersion.is_finite(),
-        "plateau policy: capped endpoint must report a finite dispersion"
-    );
-    assert!(
-        !fit.singular(),
-        "a capped endpoint reports singular = false"
     );
 }

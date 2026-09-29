@@ -333,7 +333,7 @@ point it never compared with its neighbours. A far warm start whose first
 evaluations fail and are walked away from is unaffected. lme4 has no such rule
 because its `pwrssUpdate` raises an error on any PIRLS solve that does not
 converge, which ends the fit. **Validation:**
-`non_finite_neighbor_defeats_a_converged_status` (`src/glmm/tests.rs`) drives
+`any_within_flags_an_optimum_next_to_a_non_finite_eval` (`src/glmm/tests.rs`) drives
 this check directly, below the fit level: a plain 1-D `Bobyqa` run on a
 synthetic objective with a `+INFINITY` region next to (but not at) its true
 minimum, checked with `any_within` exactly as `fit_glmm` does.
@@ -361,10 +361,9 @@ start matters less. **Validation:**
 
 **Validation:** `two_stage_matches_single_stage_on_grouseticks` (in
 `src/glmm/tests.rs`) pins `ExactProfile` against `Joint` — grouseticks
-(Poisson-log, canonical, structured) now routes `ExactProfile`, not
-`PqlThenJoint`; `assert_two_stage_matches_single_local` and
-`two_stage_matches_single_stage_cbpp_probit_and_gamma` (`src/fit/glmm_tests.rs`)
-pin the `Joint`/`PqlThenJoint` A/B on shapes that still take `PqlThenJoint`.
+(Poisson-log, canonical, structured) routes `ExactProfile`, not
+`PqlThenJoint`. No test compares `Joint` against `PqlThenJoint` on the shapes
+that still take `PqlThenJoint`.
 The `exact_profile_*` tests in `src/glmm/tests.rs` pin `ExactProfile` against a
 β-only-BOBYQA minimum and against warm-started re-solves; cbpp and grouseticks
 pin the fitted optimum. `exact_border_curvature_matches_fd_of_the_profile`

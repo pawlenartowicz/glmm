@@ -42,18 +42,17 @@ test_that("character columns get lexicographic levels (factor() default)", {
   expect_named(fixef(fit), c("(Intercept)", "fb", "fc"))
 })
 
-test_that("subset= filters rows before fitting", {
-  d <- ols_data()
-  fit <- fastglmm(y ~ x, d, subset = x < 5)
-  expect_equal(nobs(fit), 5L)
-})
-
 test_that("na.omit drops NA rows; na.pass-style leftovers error", {
   d <- ols_data()
   d$y[3] <- NA
   expect_warning(fit <- fastglmm(y ~ x, d, na.action = na.omit),
                  "Dropped 1 of 10 row")
   expect_equal(nobs(fit), 9L)
+  expect_identical(fit$warnings$tier, "caution")
+  expect_identical(fit$warnings$kind, "rows_dropped_na")
+  expect_identical(fit$warnings$title, "Rows dropped for missing values")
+  expect_identical(fit$warnings$message,
+    "Dropped 1 of 10 row(s): a column the formula uses had a missing value there.")
   expect_error(fastglmm(y ~ x, d, na.action = na.pass),
                "missing values remain")
   expect_error(fastglmm(y ~ x, d, na.action = na.fail), "missing values")

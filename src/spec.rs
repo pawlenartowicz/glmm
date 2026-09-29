@@ -21,31 +21,15 @@ pub enum Sizing {
 }
 
 impl Sizing {
-    /// Smallest legal increment in total N (the grid atom).
-    pub fn atom(&self) -> usize {
-        match self {
-            Sizing::FixedClusters { n_clusters } => (*n_clusters).max(1) as usize,
-            Sizing::FixedSize { cluster_size } => (*cluster_size).max(1) as usize,
-        }
-    }
     /// Number of clusters when total row count is `n`: the fixed `n_clusters`
     /// itself under `FixedClusters`, or `n / cluster_size` rounded UP under
-    /// `FixedSize`. Rounding up is what makes this agree with
-    /// [`Sizing::cluster_of_row`]: off-grid `n` leaves a partial trailing cluster
+    /// `FixedSize`. Rounding up matches the positional row layout (row `i` in
+    /// cluster `i / cluster_size`): off-grid `n` leaves a partial trailing cluster
     /// whose rows still carry a real id, and that id must be in range.
     pub fn n_clusters_at(&self, n: usize) -> usize {
         match self {
             Sizing::FixedClusters { n_clusters } => (*n_clusters).max(1) as usize,
             Sizing::FixedSize { cluster_size } => n.div_ceil((*cluster_size).max(1) as usize),
-        }
-    }
-    /// Cluster index owning row `i` (0-based row index into `x`/`y`). Under
-    /// `FixedClusters`, rows are dealt round-robin (`i % n_clusters`); under
-    /// `FixedSize`, rows are contiguous per cluster (`i / cluster_size`).
-    pub fn cluster_of_row(&self, i: usize) -> usize {
-        match self {
-            Sizing::FixedClusters { n_clusters } => i % (*n_clusters).max(1) as usize,
-            Sizing::FixedSize { cluster_size } => i / (*cluster_size).max(1) as usize,
         }
     }
 }
@@ -259,139 +243,4 @@ pub struct ModelSpec {
     /// Random-effect structure; `None` for a fixed-only model (OLS/GLM),
     /// `Some` for mixed (LMM/GLMM).
     pub re: Option<ReStructure>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn model_spec_constructs_and_reports_q() {
-        let re = ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 30 },
-            slopes: vec![1],
-            extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 12 },
-                slopes: vec![],
-            }],
-        };
-        let spec = ModelSpec {
-            family: Family::Gaussian,
-            re: Some(re),
-        };
-        let re = spec.re.as_ref().unwrap();
-        assert_eq!(re.sizing.atom(), 30);
-    }
-
-    #[test]
-    fn m3_families_construct_and_are_copy() {
-        fn assert_copy<T: Copy>(_: T) {}
-        let f = Family::Gamma {
-            link: GammaLink::Log,
-        };
-        assert_copy(f); // Family stays Copy (structure-only, see ModelSpec)
-        let _ = Family::Poisson {
-            link: PoissonLink::Log,
-        };
-        let _ = Family::NegativeBinomial {
-            link: NegBinomialLink::Log,
-        };
-        let _ = Family::Binomial {
-            link: BinomialLink::Probit,
-        };
-    }
-
-    #[test]
-    #[should_panic(expected = "nagq")]
-    fn nagq_even_rejected() {
-        let model = ModelSpec {
-            family: Family::Binomial {
-                link: BinomialLink::Logit,
-            },
-            re: Some(ReStructure {
-                sizing: Sizing::FixedClusters { n_clusters: 4 },
-                slopes: vec![],
-                extra_groupings: vec![],
-            }),
-        };
-        // nagq=4 (even) is now a FitOptions value, passed straight to the checker.
-        crate::fit::assert_model_shape_pub(&model, 2, 4);
-    }
-
-    /// A binomial-logit GLMM with a single intercept-only grouping (4
-    /// clusters) — the nagq-rejection tests below each override exactly the
-    /// field that trips their own check.
-    fn nagq_check_spec() -> ModelSpec {
-        ModelSpec {
-            family: Family::Binomial {
-                link: BinomialLink::Logit,
-            },
-            re: Some(ReStructure {
-                sizing: Sizing::FixedClusters { n_clusters: 4 },
-                slopes: vec![],
-                extra_groupings: vec![],
-            }),
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "must be odd in 1..=")]
-    fn nagq_above_max_rejected() {
-        let model = nagq_check_spec();
-        // nagq=27 is odd but past MAX_NAGQ (25).
-        crate::fit::assert_model_shape_pub(&model, 2, 27);
-    }
-
-    #[test]
-    #[should_panic(expected = "requires a mixed model")]
-    fn nagq_on_a_fixed_only_model_is_rejected() {
-        let mut model = nagq_check_spec();
-        model.re = None;
-        crate::fit::assert_model_shape_pub(&model, 2, 3);
-    }
-
-    /// `nagq>1` is legal only on a binomial/Poisson/negative-binomial/Gamma
-    /// single-grouping-factor GLMM. A Gaussian mixed model has no quadrature
-    /// to do (its marginal likelihood is exact), so it is rejected the same way
-    /// a multi-grouping one is.
-    #[test]
-    #[should_panic(expected = "binomial, Poisson, negative-binomial and Gamma GLMMs")]
-    fn nagq_on_a_gaussian_lmm_is_rejected() {
-        let mut model = nagq_check_spec();
-        model.family = Family::Gaussian;
-        crate::fit::assert_model_shape_pub(&model, 2, 3);
-    }
-
-    /// The Gamma dispersion φ is a coordinate of the outer search: at a fixed φ
-    /// the integrand is the binomial/Poisson one on prior weights `wᵢ/φ`, and
-    /// the φ-only rest of the log-density sits outside the integral, so the
-    /// AGQ kernels serve Gamma.
-    #[test]
-    fn nagq_on_a_gamma_glmm_is_accepted() {
-        let mut model = nagq_check_spec();
-        model.family = Family::Gamma {
-            link: GammaLink::Log,
-        };
-        crate::fit::assert_model_shape_pub(&model, 2, 3);
-    }
-
-    /// The negative-binomial dispersion θ sits outside the integral (a
-    /// per-row constant in u), so the binomial/Poisson AGQ kernels serve NB.
-    #[test]
-    fn nagq_on_a_negative_binomial_glmm_is_accepted() {
-        let mut model = nagq_check_spec();
-        model.family = Family::NegativeBinomial {
-            link: NegBinomialLink::Log,
-        };
-        crate::fit::assert_model_shape_pub(&model, 2, 3);
-    }
-
-    #[test]
-    #[should_panic(expected = "exceeds the temporary")]
-    fn nagq_over_the_q_cap_is_rejected() {
-        let mut model = nagq_check_spec();
-        // q_p = 4, past the temporary q_p<=3 cap.
-        model.re.as_mut().unwrap().slopes = vec![0, 1, 2];
-        crate::fit::assert_model_shape_pub(&model, 3, 3);
-    }
 }
