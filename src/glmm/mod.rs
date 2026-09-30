@@ -533,6 +533,7 @@ pub fn fit_glmm(
     ws.pirls_exhausted = 0;
     ws.final_pirls_exhausted = false;
     ws.exact_profile_fallback = false;
+    ws.exact_prof.curv_memory = false;
     ws.non_finite_points.clear();
     ws.counters.reset();
     ws.pattern.coup_mask = None; // CSR validity is per (fit, pinning mask): ids/z may differ across fits

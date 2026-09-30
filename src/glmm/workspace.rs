@@ -1107,9 +1107,9 @@ impl GlmmWorkspace {
         // is Gamma, non-canonical structured extras, and packed-layout extras — a
         // population this sweep never measured. The threshold stands because nothing
         // has re-measured it, not because these numbers still cover it.
-        // The exact border's curvature buffers (`ExactProfileBufs::curv_*`,
-        // `rows`/`rows_ptr`) are read only by an exact-profile solve, so they
-        // are sized only on the shapes whose stage 1 is one.
+        // The exact border's curvature buffers (`ExactProfileBufs::curv_*`)
+        // are read only by an exact-profile solve, so they are sized only on
+        // the shapes whose stage 1 is one.
         let exact_shape = super::exact_profile_shape(family, nagq, layout);
         let curv = |len: usize| if exact_shape { len.max(1) } else { 1 };
         let outer_search = if exact_shape {
@@ -1200,18 +1200,19 @@ impl GlmmWorkspace {
                 fac_f64: vec![0.0; (q_core * q_core * n_primary).max(1)],
                 logdet_hess: Mat::zeros(p, p),
                 schur_plain: Mat::zeros(p, p),
-                xt_row: vec![0.0; p],
                 trust_g: vec![0.0; p],
                 trust_q: vec![0.0; p],
-                rows_ptr: vec![0u32; curv(n_primary + 1)],
-                rows: vec![0u32; curv(max_n)],
-                curv_cc: vec![0.0; curv(p * q_core * (q_core + 1) / 2)],
-                curv_chat: vec![0.0; curv(q_core * e_crossed)],
-                curv_ct: vec![0.0; curv(p * q_core * e_crossed)],
-                curv_v: vec![0.0; curv(p * q_core * e_crossed)],
-                curv_vs: vec![0.0; curv(q_core * e_crossed)],
-                curv_u: vec![0.0; curv(p * e_crossed * e_crossed)],
-                curv_tmp: vec![0.0; curv(e_crossed * e_crossed)],
+                curv_h: vec![0.0; curv(max_n)],
+                curv_wp: vec![0.0; curv(max_n)],
+                curv_wpp: vec![0.0; curv(max_n)],
+                curv_sdot: vec![0.0; curv(max_n)],
+                curv_tt: vec![0.0; curv(k * p)],
+                curv_acc: vec![0.0; curv(p * p)],
+                curv_a: vec![0.0; curv(p)],
+                curv_cc: vec![0.0; curv(n_primary * p * q_core * (q_core + 1) / 2)],
+                curv_memory: false,
+                plain_fac: Mat::zeros(p, p),
+                plain_step: vec![0.0; p],
             },
             inference: InferenceScratch {
                 hess_scratch: Mat::zeros((n_theta + p).max(1), (n_theta + p).max(1)),
@@ -1351,6 +1352,117 @@ pub(crate) fn glmm_block_solve<T: crate::scalar::Scalar>(l: &[T], q: usize, b: &
     }
 }
 
+/// `glmm_block_solve` on the principal submatrix of the `e×e` factor `l` at
+/// the ascending indices `idx`: `b` holds the right-hand side's entries at
+/// `idx` on entry and the solution's on return. When the matrix `l` factors
+/// is block-diagonal and `idx` is one of its blocks, `l` is block-diagonal
+/// too, and this is the full `glmm_block_solve` of a vector supported on
+/// `idx` with every term that multiplies an exact zero dropped: the same
+/// operations in the same order on everything else, so the same bits up to
+/// the sign of an exact zero.
+pub(crate) fn glmm_block_solve_sub<T: crate::scalar::Scalar>(
+    l: &[T],
+    e: usize,
+    idx: &[u32],
+    b: &mut [T],
+) {
+    let m = idx.len();
+    for r in 0..m {
+        let ir = idx[r] as usize;
+        let mut v = b[r];
+        for c in 0..r {
+            v -= l[ir * e + idx[c] as usize] * b[c];
+        }
+        b[r] = v / l[ir * e + ir];
+    }
+    for r in (0..m).rev() {
+        let ir = idx[r] as usize;
+        let mut v = b[r];
+        for c in (r + 1)..m {
+            v -= l[idx[c] as usize * e + ir] * b[c];
+        }
+        b[r] = v / l[ir * e + ir];
+    }
+}
+
+/// Connected components of the crossed tail: columns `a` and `b` are joined
+/// when one primary cluster couples to both (`coup_cols`/`coup_ptr`, the
+/// per-cluster CSR of `C_f`'s nonzero columns). `S = (E+I) − Σ_f C_f'A_f⁻¹C_f`
+/// has no entry between two components, so `S`, its factor and `S⁻¹` are
+/// block-diagonal over them. Writes `comp_cols[comp_ptr[c]..comp_ptr[c+1]]`,
+/// the columns of component `c` ascending, components ordered by their first
+/// column, and returns the component count. `parent` (len `e`) is union-find
+/// scratch; `comp_ptr` needs `e + 1` slots and `comp_cols` `e`. Nested extras
+/// give one small component per top-level unit (grouseticks: 63 components of
+/// 181 columns); crossed extras give one component spanning the whole tail.
+pub(crate) fn tail_components(
+    coup_cols: &[u32],
+    coup_ptr: &[u32],
+    e: usize,
+    parent: &mut [u32],
+    comp_ptr: &mut [u32],
+    comp_cols: &mut [u32],
+) -> usize {
+    fn root(parent: &mut [u32], mut x: usize) -> usize {
+        while parent[x] as usize != x {
+            let up = parent[parent[x] as usize];
+            parent[x] = up;
+            x = up as usize;
+        }
+        x
+    }
+    for (b, slot) in parent[..e].iter_mut().enumerate() {
+        *slot = b as u32;
+    }
+    for f in 0..coup_ptr.len().saturating_sub(1) {
+        let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
+        if let Some((&first, rest)) = cols.split_first() {
+            for &b in rest {
+                let (ra, rb) = (root(parent, first as usize), root(parent, b as usize));
+                if ra != rb {
+                    parent[ra.max(rb)] = ra.min(rb) as u32;
+                }
+            }
+        }
+    }
+    // Point every column straight at its root first: the labelling pass
+    // below overwrites slots, after which `root` could no longer walk them.
+    for b in 0..e {
+        parent[b] = root(parent, b) as u32;
+    }
+    // Every union keeps the smaller root, so a root is its component's first
+    // column and the ascending pass meets it before any member: roots take
+    // the next label, members copy their root's (already relabelled) slot.
+    // `parent[b]` ends as `b`'s component label.
+    let mut nc = 0usize;
+    for b in 0..e {
+        let r = parent[b] as usize;
+        if r == b {
+            parent[b] = nc as u32;
+            nc += 1;
+        } else {
+            parent[b] = parent[r];
+        }
+    }
+    comp_ptr[..=nc].fill(0);
+    for &l in &parent[..e] {
+        comp_ptr[l as usize + 1] += 1;
+    }
+    for c in 0..nc {
+        comp_ptr[c + 1] += comp_ptr[c];
+    }
+    for (b, &l) in parent[..e].iter().enumerate() {
+        let l = l as usize;
+        comp_cols[comp_ptr[l] as usize] = b as u32;
+        comp_ptr[l] += 1;
+    }
+    for c in (1..=nc).rev() {
+        comp_ptr[c] = comp_ptr[c - 1];
+    }
+    comp_ptr[0] = 0;
+    nc
+}
+
 /// Panel variant of `glmm_block_solve`: solve `L Lᵀ X = B` in place for a
 /// row-major `q×nc` RHS panel (`panel[r·nc..(r+1)·nc]` = row r) against the same
 /// row-major factor. Identical substitution with the column loop hoisted inside:
@@ -1434,6 +1546,27 @@ pub struct StructuredSchur {
     pub(crate) c_panel: Vec<f64>,
     pub(crate) y_panel: Vec<f64>,
     pub(crate) dd_temp: Vec<f64>,
+    /// The tail's connected components over the FULL incidence
+    /// ([`tail_components`]), fixed per fit: every θ-masked `coup_cols` CSR the
+    /// fit visits has the same or finer components, so `S` stays
+    /// block-diagonal over these. Read by `TailKernel::tail_inverse`.
+    pub(crate) comp_ptr: Vec<u32>,
+    pub(crate) comp_cols: Vec<u32>,
+    /// `tail_inverse` scratch for one component of width `m`: the gathered
+    /// block of `S` and then its dense factor (`m²`, column-major), its
+    /// inverse (`m²`), and faer's stack. Sized to the widest component.
+    pub(crate) inv_blk: Vec<f64>,
+    pub(crate) inv_out: Vec<f64>,
+    pub(crate) inv_mem: MemBuffer,
+}
+
+/// faer stack for `tail_inverse`'s dense factor and inverse of a `maxc`-wide
+/// component. Mirrors the two calls in that method — change together.
+fn tail_inverse_mem(maxc: usize) -> MemBuffer {
+    MemBuffer::new(faer::dyn_stack::StackReq::any_of(&[
+        cholesky_in_place_scratch::<f64>(maxc, Par::Seq, Spec::default()),
+        faer::linalg::cholesky::llt::inverse::inverse_scratch::<f64>(maxc, Par::Seq),
+    ]))
 }
 
 impl StructuredSchur {
@@ -1513,6 +1646,28 @@ impl StructuredSchur {
         // slices zero-length buffers and panics. `clone_scratch` follows
         // automatically (it mirrors these lengths).
         let panel_ef = if qc == 1 { 0 } else { max_ef };
+        let mut cols_ptr = vec![0u32; s + 1];
+        for (f, v) in cols_of.iter().enumerate() {
+            cols_ptr[f + 1] = cols_ptr[f] + v.len() as u32;
+        }
+        let cols_flat: Vec<u32> = cols_of.concat();
+        let mut parent = vec![0u32; e];
+        let mut comp_ptr = vec![0u32; e + 1];
+        let mut comp_cols = vec![0u32; e];
+        let nc = tail_components(
+            &cols_flat,
+            &cols_ptr,
+            e,
+            &mut parent,
+            &mut comp_ptr,
+            &mut comp_cols,
+        );
+        comp_ptr.truncate(nc + 1);
+        let maxc = comp_ptr
+            .windows(2)
+            .map(|w| (w[1] - w[0]) as usize)
+            .max()
+            .unwrap_or(0);
         Some(StructuredSchur {
             symbolic,
             axx,
@@ -1522,6 +1677,11 @@ impl StructuredSchur {
             c_panel: vec![0.0f64; qc * panel_ef],
             y_panel: vec![0.0f64; qc * panel_ef],
             dd_temp: vec![0.0f64; panel_ef * panel_ef],
+            comp_ptr,
+            comp_cols,
+            inv_blk: vec![0.0f64; maxc * maxc],
+            inv_out: vec![0.0f64; maxc * maxc],
+            inv_mem: tail_inverse_mem(maxc),
         })
     }
 
@@ -1561,6 +1721,11 @@ impl StructuredSchur {
             c_panel: vec![0.0f64; self.c_panel.len()],
             y_panel: vec![0.0f64; self.y_panel.len()],
             dd_temp: vec![0.0f64; self.dd_temp.len()],
+            comp_ptr: self.comp_ptr.clone(),
+            comp_cols: self.comp_cols.clone(),
+            inv_blk: vec![0.0f64; self.inv_blk.len()],
+            inv_out: vec![0.0f64; self.inv_out.len()],
+            inv_mem: tail_inverse_mem(self.inv_blk.len().isqrt()),
         }
     }
 }

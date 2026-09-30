@@ -368,7 +368,10 @@ Breaking. Nothing in the crate, the ports or MCPower calls these.
   a scan of 1200 far warm starts over five families, 1089 reach the cold optimum (before:
   768). Over the accuracy grid's exact-profile cells, PIRLS takes 12 % fewer iterations.
   Converged results move by round-off to tolerance: deviance by at most 1.8e-6, β by at most
-  1.7e-5 relative.
+  1.7e-5 relative. The curvature is computed only in solves where the plain step shows trouble
+  (a shrunk trust radius, careful mode, period-2 damping or eight iterations), and on designs
+  with crossed random effects it leaves out the crossed tail's terms, which gives an upper
+  bound on the curvature and so a step no longer than the Newton step.
 - **Log-link GLMs are no longer refused because of the response's units.** The divergence
   guard stopped a fit once any |η| passed 30. On a log link η = ln μ, so a Poisson fit with
   counts near e^30, or a Gamma or inverse-Gaussian fit with y in very small or very large
