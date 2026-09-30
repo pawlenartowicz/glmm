@@ -333,11 +333,8 @@ pub(crate) struct ExactProfileBufs {
     pub(crate) trust_g: Vec<f64>,
     pub(crate) trust_q: Vec<f64>,
     /// len `n` each, written by pass A and pass C of the exact block for
-    /// [`logdet_beta_curvature`]: the leverage `hᵢ`, `W'ᵢ` and `W''ᵢ` of the
-    /// step weight, and `mᵢ'v`.
+    /// [`logdet_beta_curvature`]: the leverage `hᵢ` and `mᵢ'v`.
     pub(crate) curv_h: Vec<f64>,
-    pub(crate) curv_wp: Vec<f64>,
-    pub(crate) curv_wpp: Vec<f64>,
     pub(crate) curv_sdot: Vec<f64>,
     /// The scratch of [`logdet_beta_curvature`], laid out there: `k·p` rows
     /// of `A⁻¹M'WX` (`curv_tt`), one `p×p` sum (`curv_acc`), one `p` row
@@ -391,18 +388,20 @@ pub(crate) fn observed_weights_in_place<T: Scalar>(
     }
 }
 
-/// Pass A's `dW/dη` for `c_β`, and `(dW/dη, d²W/dη²)` for the border's
-/// curvature, at one row, for the weight `W` the exact border's `A` is built
-/// from: `W_obs` where `exact_obj` (its η form on a tail row, as
-/// [`observed_weights_in_place`] leaves it), the Fisher weight otherwise. One
-/// `Dual<1>` pass through the closed forms of `dW/dη`, so `d²W/dη²` needs no
-/// closed form of its own. On `W_obs` it runs at this row's `prob` with
-/// `dμ/dη` as μ's derivative lane, so its value lane is the plain `f64`
-/// evaluation and serves `c_β` too. On the Fisher weight `c_β` keeps the
-/// derivative lane of `irls_weight_and_resid` (held equal to
-/// `family::weight_eta_deriv` by `weight_eta_deriv_matches_dual1_of_irls_weight`
-/// up to the last bits), and the curvature takes `weight_eta_deriv`'s lanes.
-pub(crate) fn row_weight_eta_derivs(
+/// Pass A's `dW/dη` for `c_β` at one row, for the weight `W` the exact
+/// border's `A` is built from: `W_obs` where `exact_obj` (its η form on a tail
+/// row, as [`observed_weights_in_place`] leaves it), the Fisher weight
+/// otherwise. Plain `f64` closed forms at the row's `prob`, the μ the family
+/// pass already holds, and at `w`, pass A's prior-weighted step weight, so the
+/// row pays no second inverse link — on logit that would be a scalar `exp`
+/// per row per iteration beside the family pass's SIMD `sigmoid`, about a
+/// quarter of an exact-profile logit fit. A Fisher tail row keeps the
+/// `Dual<1>` derivative of `irls_weight_and_resid`, whose η-form tail weight
+/// `weight_eta_deriv` does not reproduce on the canonical links.
+/// [`row_weight_eta_curv`] forms the curvature's `W′`, `W″` of this same
+/// weight — change together.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn row_weight_eta_deriv(
     family: Family,
     nb_theta: f64,
     exact_obj: bool,
@@ -410,30 +409,55 @@ pub(crate) fn row_weight_eta_derivs(
     prior_w: f64,
     eta: f64,
     prob: f64,
-) -> (f64, f64, f64) {
+    w: f64,
+) -> f64 {
+    use crate::family::{in_tail, weight_eta_deriv};
+    if exact_obj {
+        // `w_eta` is read only where `W_obs` equals the Fisher weight, which
+        // `exact_obj` excludes.
+        return crate::family::observed_weight_eta_deriv(
+            family, nb_theta, y, prior_w, eta, prob, 0.0,
+        );
+    }
+    if in_tail(family, eta, prob) {
+        use crate::dual::Dual;
+        let e = Dual::<1> { v: eta, d: [1.0] };
+        let (_, wd, _) = crate::family::irls_weight_and_resid(family, nb_theta, y, e);
+        return prior_w * wd.d[0];
+    }
+    // `w` already carries the prior weight, and `weight_eta_deriv` is linear
+    // in `w` on every arm.
+    weight_eta_deriv(family, nb_theta, eta, prob, w)
+}
+
+/// `(dW/dη, d²W/dη²)` at one row, for [`logdet_beta_curvature`], of the same
+/// weight as [`row_weight_eta_deriv`]. One `Dual<1>` pass through the closed
+/// forms of `dW/dη`, so `d²W/dη²` needs no closed form of its own: on `W_obs`
+/// at this row's `prob` with `dμ/dη` as μ's derivative lane, on the Fisher
+/// weight through `weight_eta_deriv` at the `Dual<1>` μ and `w` of
+/// `irls_weight_and_resid`.
+pub(crate) fn row_weight_eta_curv(
+    family: Family,
+    nb_theta: f64,
+    exact_obj: bool,
+    y: f64,
+    prior_w: f64,
+    eta: f64,
+    prob: f64,
+) -> (f64, f64) {
     use crate::dual::Dual;
     let e = Dual::<1> { v: eta, d: [1.0] };
-    if exact_obj {
+    let c = if exact_obj {
         let m = Dual::<1> {
             v: prob,
             d: [crate::family::mu_eta(family, eta)],
         };
-        let c = crate::family::observed_weight_eta_deriv(
-            family,
-            nb_theta,
-            y,
-            prior_w,
-            e,
-            m,
-            Dual::ZERO,
-        );
-        (c.v, c.v, c.d[0])
+        crate::family::observed_weight_eta_deriv(family, nb_theta, y, prior_w, e, m, Dual::ZERO)
     } else {
         let (m, w, _) = crate::family::irls_weight_and_resid(family, nb_theta, y, e);
-        let c = Dual::<1>::from_f64(prior_w)
-            * crate::family::weight_eta_deriv(family, nb_theta, e, m, w);
-        (prior_w * w.d[0], c.v, c.d[0])
-    }
+        Dual::<1>::from_f64(prior_w) * crate::family::weight_eta_deriv(family, nb_theta, e, m, w)
+    };
+    (c.v, c.d[0])
 }
 
 /// The three terms of a structured row's crossed-tail leverage
@@ -535,10 +559,11 @@ pub(crate) struct CrossedTail<'a, T> {
 /// where log|A| dominates, the bound needs no more PIRLS iterations than the
 /// exact form.
 ///
-/// `W'`, `W''` are those of the step weight (`exact_obj` picks `W_obs`,
-/// [`row_weight_eta_derivs`]); they, `hᵢ` (with its crossed-tail part) and
-/// `mᵢ'v` come per row from pass A and pass C of the border's exact block
-/// (`ex.curv_h`, `curv_wp`, `curv_wpp`, `curv_sdot`), and the per-cluster
+/// `W'`, `W''` are those of the step weight (`exact_obj` picks `W_obs`),
+/// formed here per row by [`row_weight_eta_curv`] at the `eta`/`prob` pass A
+/// read, so an iteration that skips the curvature never pays for them. `hᵢ`
+/// (with its crossed-tail part) and `mᵢ'v` come per row from pass A and pass C
+/// of the border's exact block (`ex.curv_h`, `curv_sdot`), and the per-cluster
 /// factors `L_f` (`ex.fac_f64`) are this iteration's, left by the same block.
 /// Exact at the mode; off it, it is the same linearization the rest of the
 /// border step makes.
@@ -560,6 +585,13 @@ pub(crate) fn logdet_beta_curvature<T: Scalar>(
     cluster_ids: &[u32],
     g: &crate::lmm::LmmGroupings,
     tail: Option<&CrossedTail<T>>,
+    family: Family,
+    nb_theta: f64,
+    exact_obj: bool,
+    y: &[f64],
+    prior_w: &[f64],
+    eta: &[T],
+    prob: &[T],
     n: usize,
     p: usize,
 ) {
@@ -587,8 +619,6 @@ pub(crate) fn logdet_beta_curvature<T: Scalar>(
         fac_f64: fac,
         logdet_hess: hess,
         curv_h: hrow,
-        curv_wp: wprow,
-        curv_wpp: wpprow,
         curv_sdot: sdrow,
         curv_tt: tt,
         curv_acc: acc,
@@ -650,8 +680,16 @@ pub(crate) fn logdet_beta_curvature<T: Scalar>(
                 }
             }
         }
-        let wp = wprow[i];
-        let d = wpprow[i] * hrow[i] - wp * sdrow[i];
+        let (wp, wpp) = row_weight_eta_curv(
+            family,
+            nb_theta,
+            exact_obj,
+            y[i],
+            prior_w[i],
+            eta[i].value(),
+            prob[i].value(),
+        );
+        let d = wpp * hrow[i] - wp * sdrow[i];
         for j in 0..p {
             let dj = d * av[j];
             for (h, xl) in acc[j * p..j * p + j + 1].iter_mut().zip(&av[..=j]) {

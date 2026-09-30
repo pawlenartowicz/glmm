@@ -4295,7 +4295,10 @@ fn assert_structured_exact_profile_is_beta_minimum(family: Family, label: &str) 
 /// Laplace β-profile. At the profiled β̂ (θ = `theta`) the curvature is
 /// computed by `logdet_beta_curvature` on the solve's final state, since the
 /// trigger rule (`BorderTrust::wants_curvature`) may never compute it in the
-/// solve, and compared with a central difference, step 3e-4, of the
+/// solve. Its `W′`, `W″` are formed at the returned η and μ
+/// (`evaluate_at_mode`'s), one converged step past where the last iteration
+/// formed `hᵢ` (pass A), `mᵢ′v` (pass C) and `A⁻¹M′WX` (the border). It is
+/// compared with a central difference, step 3e-4, of the
 /// Fixed-mode objective, whose PIRLS solves run at a 1e-13 band; the band is
 /// 1e-5 of the largest entry. Without a crossed tail the two must agree
 /// within the band. With one, the curvature leaves out the tail's Gram terms
@@ -4338,6 +4341,9 @@ fn assert_border_curvature_matches_fd(
             pattern,
             border,
             exact_prof,
+            family,
+            nb_theta,
+            prior_w,
             ..
         } = &mut *ws;
         let tail = CrossedTail {
@@ -4359,6 +4365,13 @@ fn assert_border_curvature_matches_fd(
             ids,
             groupings,
             tail,
+            *family,
+            *nb_theta,
+            crate::family::exact_curvature_differs(*family),
+            y,
+            prior_w,
+            &pirls.eta[..],
+            &pirls.prob[..],
             n,
             p,
         );

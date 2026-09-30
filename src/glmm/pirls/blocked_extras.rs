@@ -1562,6 +1562,9 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         // above, just on the merit that actually matters; the first trial always
         // accepts (`l_acc = ∞`). Mirrors `pirls_solve_blocked`'s exact block —
         // change together.
+        // `exact_obj` picks `dW_obs/dη` over the Fisher `dw/dη`, in pass A and
+        // in the border's curvature.
+        let exact_obj = crate::family::exact_curvature_differs(family);
         if let BetaStep::Profile {
             exact: Some(ex),
             beta_prev,
@@ -1571,9 +1574,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
             // `Ã = A` and `W̃ = W`: the step weight is the exact curvature on
             // every link (`observed_weights_in_place` above), so the factor just
             // taken, the leverage hᵢ and the `S⁻¹` columns below are the
-            // objective's own quantities. `exact_obj` still picks `dW_obs/dη`
-            // over the Fisher `dw/dη` in pass A.
-            let exact_obj = crate::family::exact_curvature_differs(family);
+            // objective's own quantities.
             let gu_dot_du = {
                 let StructuredFactor {
                     core_blocks,
@@ -1596,8 +1597,6 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     fac_f64,
                     curv_h,
                     curv_sdot,
-                    curv_wp,
-                    curv_wpp,
                     ..
                 } = &mut **ex;
                 #[cfg(test)]
@@ -1759,9 +1758,9 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                             );
                         }
                     }
-                    // `hᵢ`, `W'ᵢ` and `W''ᵢ` are kept for the border's
-                    // curvature (`logdet_beta_curvature`).
-                    let (wp, cwp, cwpp) = super::row_weight_eta_derivs(
+                    // `hᵢ` is kept for the border's curvature
+                    // (`logdet_beta_curvature`).
+                    let wp = super::row_weight_eta_deriv(
                         family,
                         nb_theta,
                         exact_obj,
@@ -1769,10 +1768,9 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                         prior_w[i],
                         eta[i].value(),
                         prob[i].value(),
+                        w[i].value(),
                     );
                     curv_h[i] = h;
-                    curv_wp[i] = cwp;
-                    curv_wpp[i] = cwpp;
                     let a = wp * h;
                     for j in 0..p {
                         logdet_beta[j] += a * x[(i, j)];
@@ -2077,6 +2075,13 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                             n_cross: &n_cross[..],
                             e,
                         }),
+                        family,
+                        nb_theta,
+                        exact_obj,
+                        y,
+                        prior_w,
+                        &eta[..],
+                        &prob[..],
                         n,
                         p,
                     );

@@ -1203,8 +1203,6 @@ impl GlmmWorkspace {
                 trust_g: vec![0.0; p],
                 trust_q: vec![0.0; p],
                 curv_h: vec![0.0; curv(max_n)],
-                curv_wp: vec![0.0; curv(max_n)],
-                curv_wpp: vec![0.0; curv(max_n)],
                 curv_sdot: vec![0.0; curv(max_n)],
                 curv_tt: vec![0.0; curv(k * p)],
                 curv_acc: vec![0.0; curv(p * p)],

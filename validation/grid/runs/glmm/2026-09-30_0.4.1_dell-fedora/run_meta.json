@@ -1,0 +1,20 @@
+{
+  "engine": "glmm",
+  "engine_version": "0.4.1",
+  "machine": "dell-fedora",
+  "date": "2026-09-30T22:18:32+02:00",
+  "glmm_crate_version": "0.4.1",
+  "glmm_git_rev": "4048c23eec24eb4c5871d7127c8b271b23e94841",
+  "subset": "full",
+  "timed": null,
+  "timed_unlocked": false,
+  "no_turbo": "1",
+  "pin_cores": "0-0",
+  "jobs": 1,
+  "loadavg_start": "0.95 0.96 1.75",
+  "r_version": "4.5.3",
+  "julia_version": "1.12.6",
+  "label": "",
+  "cells": 795,
+  "cell_list": []
+}

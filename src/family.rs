@@ -1262,12 +1262,12 @@ pub(crate) fn observed_weight_eta_deriv<T: Scalar>(
 /// - InvGaussian inverse-squared (`μ'=−μ³/2`, `V=μ³`, `w=μ'²/V=μ³/4`):
 ///   `dw/dη = (3μ²/4)μ' = −3μ⁵/8 = −1.5wμ²`.
 ///
-/// The exact β-profile's `c_β` (`pirls::row_weight_eta_derivs`) reads the
-/// `Dual<1>` derivative of `irls_weight_and_resid`, equal to this function
-/// rather than calling it: replacing that `Dual<1>` line with a call here
-/// would move `f64` bits, so a test
+/// The exact β-profile's `c_β` (`pirls::row_weight_eta_deriv`) calls this
+/// on every non-tail row of a link whose observed and Fisher weights
+/// coincide, and reads the `Dual<1>` derivative of `irls_weight_and_resid` on
+/// that link's tail rows. Off the tail a test
 /// (`weight_eta_deriv_matches_dual1_of_irls_weight`) holds the two forms
-/// equal instead.
+/// equal.
 ///
 /// A tail row ([`in_tail`]) of a link whose exact curvature differs from
 /// Fisher reads `w·(ln w)'` off [`TailRow`] (probit `(ln w)' = λ(−η) − λ(η) −
@@ -1470,11 +1470,10 @@ mod tests {
     }
 
     /// `weight_eta_deriv` against the `Dual<1>` derivative of the Fisher weight
-    /// `irls_weight_and_resid` returns — the quantity the exact β-profile's
-    /// pass A reads off a nested dual at an `f64` base. The two must agree to
-    /// round-off: pass A keeps its `Dual<1>` line because replacing it would
-    /// move `f64` bits, so this test is what holds the closed form and the
-    /// nested dual together.
+    /// `irls_weight_and_resid` returns. The two must agree to round-off: the
+    /// exact β-profile's pass A calls the closed form off the tail and the
+    /// `Dual<1>` line on it, and the border's curvature differentiates the
+    /// closed form again.
     #[test]
     fn weight_eta_deriv_matches_dual1_of_irls_weight() {
         use crate::dual::Dual;

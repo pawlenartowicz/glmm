@@ -684,8 +684,6 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     fac_f64,
                     curv_h,
                     curv_sdot,
-                    curv_wp,
-                    curv_wpp,
                     ..
                 } = &mut **ex;
                 let logdet_u = &mut logdet_u[..k];
@@ -713,9 +711,9 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     // `dW_obs/dη` where the objective is `log|A_obs|`
                     // (`exact_obj`), the Fisher one otherwise.
                     let h = block_leverage(&fac_f64[ablk..ablk + q * q], q, &mrow[..q]);
-                    // `hᵢ`, `W'ᵢ` and `W''ᵢ` are kept for the border's
-                    // curvature (`logdet_beta_curvature`).
-                    let (wp, cwp, cwpp) = super::row_weight_eta_derivs(
+                    // `hᵢ` is kept for the border's curvature
+                    // (`logdet_beta_curvature`).
+                    let wp = super::row_weight_eta_deriv(
                         family,
                         nb_theta,
                         exact_obj,
@@ -723,10 +721,9 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                         prior_w[i],
                         eta[i].value(),
                         prob[i].value(),
+                        w[i].value(),
                     );
                     curv_h[i] = h;
-                    curv_wp[i] = cwp;
-                    curv_wpp[i] = cwpp;
                     let a = wp * h;
                     for j in 0..p {
                         logdet_beta[j] += a * x[(i, j)];
@@ -997,6 +994,13 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                         cluster_ids,
                         g,
                         None,
+                        family,
+                        nb_theta,
+                        exact_obj,
+                        y,
+                        prior_w,
+                        &eta[..],
+                        &prob[..],
                         n,
                         p,
                     );
