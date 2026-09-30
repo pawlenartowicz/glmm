@@ -682,6 +682,10 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     logdet_u,
                     logdet_beta,
                     fac_f64,
+                    curv_h,
+                    curv_sdot,
+                    curv_wp,
+                    curv_wpp,
                     ..
                 } = &mut **ex;
                 let logdet_u = &mut logdet_u[..k];
@@ -709,29 +713,20 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     // `dW_obs/dη` where the objective is `log|A_obs|`
                     // (`exact_obj`), the Fisher one otherwise.
                     let h = block_leverage(&fac_f64[ablk..ablk + q * q], q, &mrow[..q]);
-                    // `family::weight_eta_deriv` is the closed form of this same
-                    // `dw/dη`, held equal to this `Dual<1>` line by
-                    // `weight_eta_deriv_matches_dual1_of_irls_weight`
-                    // (`src/family.rs`); changing either alone moves `f64` bits.
-                    let wp = if exact_obj {
-                        crate::family::observed_weight_eta_deriv(
-                            family,
-                            nb_theta,
-                            y[i],
-                            prior_w[i],
-                            eta[i].value(),
-                            prob[i].value(),
-                            0.0,
-                        )
-                    } else {
-                        let e = crate::dual::Dual::<1> {
-                            v: eta[i].value(),
-                            d: [1.0],
-                        };
-                        let (_, w_raw, _) =
-                            crate::family::irls_weight_and_resid(family, nb_theta, y[i], e);
-                        prior_w[i] * w_raw.d[0]
-                    };
+                    // `hᵢ`, `W'ᵢ` and `W''ᵢ` are kept for the border's
+                    // curvature (`logdet_beta_curvature`).
+                    let (wp, cwp, cwpp) = super::row_weight_eta_derivs(
+                        family,
+                        nb_theta,
+                        exact_obj,
+                        y[i],
+                        prior_w[i],
+                        eta[i].value(),
+                        prob[i].value(),
+                    );
+                    curv_h[i] = h;
+                    curv_wp[i] = cwp;
+                    curv_wpp[i] = cwpp;
                     let a = wp * h;
                     for j in 0..p {
                         logdet_beta[j] += a * x[(i, j)];
@@ -764,6 +759,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     for c in 0..q {
                         sdot += m_buf[i * q + c].value() * logdet_u[f * q + c];
                     }
+                    curv_sdot[i] = sdot;
                     let a = w[i].value() * sdot;
                     for j in 0..p {
                         logdet_beta[j] -= a * x[(i, j)];
@@ -992,23 +988,21 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 for r in 0..p {
                     beta_rhs[r] -= 0.5 * ex.logdet_beta[r];
                 }
-                logdet_beta_curvature(
-                    ex,
-                    family,
-                    nb_theta,
-                    exact_obj,
-                    y,
-                    prior_w,
-                    &eta[..n],
-                    x,
-                    ainv_mtwx.as_ref(),
-                    &m_buf[..],
-                    cluster_ids,
-                    g,
-                    None,
-                    n,
-                    p,
-                );
+                if trust.wants_curvature(it, careful, damp, &mut ex.curv_memory) {
+                    logdet_beta_curvature(
+                        ex,
+                        x,
+                        ainv_mtwx.as_ref(),
+                        &m_buf[..],
+                        cluster_ids,
+                        g,
+                        None,
+                        n,
+                        p,
+                    );
+                } else {
+                    ex.logdet_hess.fill(0.0);
+                }
             }
             // δβ in place, inside the trust region on the exact border. Non-PD
             // S_β ⇒ the (NaN,…,false) failure surface.

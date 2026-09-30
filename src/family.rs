@@ -1262,10 +1262,10 @@ pub(crate) fn observed_weight_eta_deriv<T: Scalar>(
 /// - InvGaussian inverse-squared (`μ'=−μ³/2`, `V=μ³`, `w=μ'²/V=μ³/4`):
 ///   `dw/dη = (3μ²/4)μ' = −3μ⁵/8 = −1.5wμ²`.
 ///
-/// The exact β-profile's pass A in `pirls/blocked.rs` and
-/// `pirls/blocked_extras.rs` holds a `Dual<1>` of `irls_weight_and_resid`
-/// equal to this function rather than calling it: replacing either `Dual<1>`
-/// line with a call here would move `f64` bits, so a test
+/// The exact β-profile's `c_β` (`pirls::row_weight_eta_derivs`) reads the
+/// `Dual<1>` derivative of `irls_weight_and_resid`, equal to this function
+/// rather than calling it: replacing that `Dual<1>` line with a call here
+/// would move `f64` bits, so a test
 /// (`weight_eta_deriv_matches_dual1_of_irls_weight`) holds the two forms
 /// equal instead.
 ///

@@ -264,6 +264,11 @@ pub(super) fn prep_glmm_design(
     } else {
         None
     };
+    // `TailKernel::tail_inverse` writes `S⁻¹` one tail component at a time and
+    // leaves the entries between components alone, which is right only while
+    // they hold zeros. This design's components can differ from the last
+    // design's on a reused workspace, so clear them once per fit.
+    ws.exact_prof.tail_inv.fill(0.0);
 }
 
 /// Test-only: the same fit on a workspace forced onto the packed-row layout,

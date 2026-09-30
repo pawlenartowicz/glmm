@@ -262,7 +262,21 @@ never mixed within a fit:
   `src/glmm/pirls/mod.rs` carries the derivation and the per-iteration cost).
   Without that curvature the step overshoots wherever log|A| dominates it — a
   few clusters at a large θ, where the profile is nearly flat in the intercept
-  — and the solve can cycle. Far from the mode even the exact quadratic model
+  — and the solve can cycle. On a structured shape with a crossed tail the
+  curvature leaves out the tail's two trace terms: both are positive
+  semidefinite and enter with a minus sign, so what is added is an upper bound
+  on the exact curvature (exact on the blocked layout and wherever no cluster
+  couples to the tail), which keeps the step no longer than the exact Newton
+  step. The curvature is computed only where the plain `S_β` step shows
+  trouble (`BorderTrust::wants_curvature`): once a solve's trust radius
+  shrinks, careful mode starts, the period-2 damping fires or the solve
+  reaches `CURV_SLOW_ITERS` = 8 iterations, the curvature is on for the rest
+  of that solve, and a per-fit memory (`ExactProfileBufs::curv_memory`, reset
+  per fit) starts the next solve with it on. That solve's first step measures
+  `‖δ_H − δ_S‖/‖δ_H‖`, the relative change the curvature makes to the step;
+  below `CURV_RELEASE` = 0.1 it drops the curvature and clears the memory.
+  Otherwise `logdet_hess` is zero and the step is the plain `S_β` step. Far
+  from the mode even the exact quadratic model
   can be far off, so the border step runs inside a trust region
   (`BorderTrust`, `border_solve`; Nocedal & Wright, *Numerical Optimization*,
   2nd ed., ch. 4). Each trial a border step produced is judged by `ρ` = actual
@@ -367,8 +381,10 @@ that still take `PqlThenJoint`.
 The `exact_profile_*` tests in `src/glmm/tests.rs` pin `ExactProfile` against a
 β-only-BOBYQA minimum and against warm-started re-solves; cbpp and grouseticks
 pin the fitted optimum. `exact_border_curvature_matches_fd_of_the_profile`
-(`src/glmm/tests.rs`) holds the border's `S_β + ½·d²log|A|/dβ²` against a
-central difference of the profile on blocked and structured fixtures,
+(`src/glmm/tests.rs`) computes the border's `S_β + ½·d²log|A|/dβ²` at the
+profiled β̂ and holds it against a central difference of the profile: equal on
+the blocked fixtures, bound minus difference positive semidefinite on the
+structured ones with a crossed tail,
 `nb_log_warm_start_from_theta_200_reaches_cold_optimum`
 (`src/fit/glmm_tests.rs`) the far warm starts that cycled without it, and
 `far_warm_starts_reach_cold_optimum_with_the_border_trust_region` the far

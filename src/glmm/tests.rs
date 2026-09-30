@@ -4291,14 +4291,20 @@ fn assert_structured_exact_profile_is_beta_minimum(family: Family, label: &str) 
     assert_exact_profile_is_beta_minimum_ws(&mut ws, x.as_ref(), &y, &ids, &extra, n, p, label);
 }
 
-/// The exact border steps with `S_β + ½·d²log|A|/dβ²`, which must be half the
-/// Hessian of the Laplace β-profile. At the profiled β̂ (θ = `theta`) that
-/// matrix is compared with a central difference, step 3e-4, of the
+/// The exact border's `S_β + ½·d²log|A|/dβ²` against half the Hessian of the
+/// Laplace β-profile. At the profiled β̂ (θ = `theta`) the curvature is
+/// computed by `logdet_beta_curvature` on the solve's final state, since the
+/// trigger rule (`BorderTrust::wants_curvature`) may never compute it in the
+/// solve, and compared with a central difference, step 3e-4, of the
 /// Fixed-mode objective, whose PIRLS solves run at a 1e-13 band; the band is
-/// 1e-5 of the largest entry. Measured: at most 5.5e-7 (grouseticks, the
-/// difference's own truncation error: it falls as the step squared), 2e-8 on
-/// the other fixtures, while `S_β` alone misses by 2.1e-4 (grouseticks) to
-/// 3.0e-2.
+/// 1e-5 of the largest entry. Without a crossed tail the two must agree
+/// within the band. With one, the curvature leaves out the tail's Gram terms
+/// and is an upper bound, so bound minus difference must be positive
+/// semidefinite within the band. Measured, relative to the largest entry:
+/// without a tail the two agree to 1.3e-8; with one, the smallest eigenvalue
+/// of bound minus difference is +1.6e-6 (grouseticks) to +1.7e-4, and the
+/// bound exceeds the difference by up to 1.3e-2 (grouseticks). `S_β` alone
+/// misses by 2.1e-4 (grouseticks) to 3.0e-2.
 #[allow(clippy::too_many_arguments)]
 fn assert_border_curvature_matches_fd(
     ws: &mut GlmmWorkspace,
@@ -4322,6 +4328,41 @@ fn assert_border_curvature_matches_fd(
         "{label}: exact profile solve must converge"
     );
     let beta_hat = ws.beta_prof[..p].to_vec();
+    let structured = ws.layout == GlmmLayout::Structured;
+    let e = ws.groupings.k_crossed();
+    {
+        let GlmmWorkspace {
+            groupings,
+            pirls,
+            structured: st,
+            pattern,
+            border,
+            exact_prof,
+            ..
+        } = &mut *ws;
+        let tail = CrossedTail {
+            cross_col: &pattern.cross_col[..],
+            cross_val: &st.cross_val[..],
+            n_cross: &pattern.n_cross[..],
+            e,
+        };
+        let (m, tail) = if structured {
+            (&st.m_core_buf[..], Some(&tail))
+        } else {
+            (&pirls.m_buf[..], None)
+        };
+        logdet_beta_curvature(
+            exact_prof,
+            x,
+            border.ainv_mtwx.as_ref(),
+            m,
+            ids,
+            groupings,
+            tail,
+            n,
+            p,
+        );
+    }
     let curv = Mat::<f64>::from_fn(p, p, |j, k| {
         2.0 * (ws.exact_prof.schur_plain[(j, k)] + ws.exact_prof.logdet_hess[(j, k)])
     });
@@ -4349,6 +4390,19 @@ fn assert_border_curvature_matches_fd(
         .flat_map(|j| (0..p).map(move |k| (j, k)))
         .map(|(j, k)| fd[(j, k)].abs())
         .fold(0.0_f64, f64::max);
+    if structured && e > 0 {
+        // Smallest eigenvalue of bound − FD at least −band ⇔ bound − FD +
+        // band·I is positive definite.
+        let d = Mat::<f64>::from_fn(p, p, |j, k| {
+            curv[(j, k)] - fd[(j, k)] + if j == k { 1e-5 * scale } else { 0.0 }
+        });
+        assert!(
+            d.as_ref().llt(faer::Side::Lower).is_ok(),
+            "{label}: border curvature bound {curv:?} minus FD of the profile {fd:?} is not \
+             positive semidefinite (scale {scale})"
+        );
+        return;
+    }
     for j in 0..p {
         for k in 0..p {
             assert!(

@@ -75,16 +75,20 @@ test_that("binomial random slope (tau0, tau1, rho01) is pinned", {
   # Re-recorded 2026-09-28, when PIRLS's exact beta-profile step gained a trust
   # region (logLik -923.756172968025): the correlation moved by 6e-8 absolute,
   # the other values by at most 1.1e-8.
+  # Re-recorded 2026-09-30, when that step began to compute the curvature of
+  # log|A| in beta only on solves where the plain step shows trouble (logLik
+  # -923.756172968027): the correlation moved by 6.0e-8 absolute, the other
+  # values by at most 6.9e-9.
   d <- benchmark_data(seed = 203, family = "binomial", n_g = 100L, m = 15L,
                       tau0 = 0.8, tau1 = 0.8, rho = 0.3)
   fit <- fastglmm(y ~ t + d + t:d + (1 + t | g), d, family = binomial())
   expect_true(fit$converged)
   vc <- VarCorr(fit)$g
-  expect_equal(unname(fixef(fit)), c(-0.792588775368404, 1.07410695106387, 0.694132964548954, -0.129934513910262),
+  expect_equal(unname(fixef(fit)), c(-0.792588774256419, 1.074106949613768, 0.694132964295869, -0.129934518298598),
                tolerance = CI_REF_REL)
-  expect_equal(unname(attr(vc, "stddev")), c(1.04201268635762, 0.871286208159484),
+  expect_equal(unname(attr(vc, "stddev")), c(1.042012679692871, 0.871286201276444),
                tolerance = CI_REF_REL)
-  expect_equal(attr(vc, "correlation")[2, 1], 0.106174698372109,
+  expect_equal(attr(vc, "correlation")[2, 1], 0.106174638142076,
                tolerance = CI_REF_REL)
 })
 

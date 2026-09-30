@@ -58,6 +58,26 @@ pub(crate) trait TailKernel: Scalar {
         let _ = ss;
         tail_solve_generic(schur, e, rhs)
     }
+
+    /// `S⁻¹` into `out` (`e×e` column-major, `out[b·e + a] = (S⁻¹)_{a,b}`)
+    /// after `tail_factor`, for the exact-profile leverage and curvature.
+    /// `stage` is an `e`-long scratch column. Entries between two tail
+    /// components ([`tail_components`](crate::glmm::workspace::tail_components))
+    /// are exactly zero and are left as they are; the caller keeps them zero.
+    ///
+    /// The default body is `e` unit solves through `tail_solve`'s dense arm.
+    /// `f64` overrides it with the per-component dense inverse when `ss` is
+    /// `Some`.
+    fn tail_inverse(
+        schur: &[Self],
+        e: usize,
+        ss: Option<&mut StructuredSchur>,
+        stage: &mut [Self],
+        out: &mut [f64],
+    ) {
+        let _ = ss;
+        tail_inverse_generic(schur, e, stage, out)
+    }
 }
 
 impl<const N: usize> TailKernel for crate::dual::Dual<N> {}
@@ -210,6 +230,104 @@ impl TailKernel for f64 {
         }
     }
 
+    fn tail_inverse(
+        schur: &[f64],
+        e: usize,
+        ss: Option<&mut StructuredSchur>,
+        stage: &mut [f64],
+        out: &mut [f64],
+    ) {
+        use faer::linalg::cholesky::llt;
+        // Widest component inverted by the crate's own Crout on stack arrays;
+        // wider ones go to faer's blocked dense factor and inverse. Measured
+        // 2026-09-29 on grouseticks (63 components of 1-8 columns): 33 µs per
+        // PIRLS iteration through faer, 10 µs this way.
+        const SMALL: usize = 8;
+        let Some(ss) = ss else {
+            return tail_inverse_generic(schur, e, stage, out);
+        };
+        // Per component rather than `e` unit solves through the sparse factor:
+        // `S` is block-diagonal over the components, so each block of `S⁻¹` is
+        // the inverse of the matching block of `S`, and every solve through
+        // the whole factor spent most of its work on other components' exact
+        // zeros (nested tails) or ran scalar column walks over a dense factor
+        // (crossed tails, one component). `schur` still holds the unfactored
+        // `S` here: the sparse `tail_factor` arm only gathers from it. The
+        // blocks are factored anew, so `S⁻¹` moves at round-off against the
+        // unit solves (≤ 5e-13 relative on the tail cells measured).
+        let factored = 'blocks: {
+            let StructuredSchur {
+                comp_ptr,
+                comp_cols,
+                inv_blk,
+                inv_out,
+                inv_mem,
+                ..
+            } = &mut *ss;
+            for c in 0..comp_ptr.len() - 1 {
+                let cols = &comp_cols[comp_ptr[c] as usize..comp_ptr[c + 1] as usize];
+                let m = cols.len();
+                if m <= SMALL {
+                    // Row-major lower triangle, the layout `block_chol` factors.
+                    let mut blk = [0.0f64; SMALL * SMALL];
+                    for (i, &a) in cols.iter().enumerate() {
+                        for (j, &b) in cols.iter().enumerate().take(i + 1) {
+                            blk[i * m + j] = schur[a as usize * e + b as usize];
+                        }
+                    }
+                    if !glmm_block_chol(&mut blk[..m * m], m) {
+                        break 'blocks false;
+                    }
+                    for (j, &b) in cols.iter().enumerate() {
+                        let mut col = [0.0f64; SMALL];
+                        col[j] = 1.0;
+                        glmm_block_solve(&blk[..m * m], m, &mut col[..m]);
+                        for (i, &a) in cols.iter().enumerate() {
+                            out[b as usize * e + a as usize] = col[i];
+                        }
+                    }
+                    continue;
+                }
+                let blk = &mut inv_blk[..m * m];
+                for (j, &b) in cols.iter().enumerate() {
+                    for (i, &a) in cols.iter().enumerate().skip(j) {
+                        blk[j * m + i] = schur[a as usize * e + b as usize];
+                    }
+                }
+                if llt::factor::cholesky_in_place(
+                    faer::MatMut::from_column_major_slice_mut(blk, m, m),
+                    Default::default(),
+                    faer::Par::Seq,
+                    faer::dyn_stack::MemStack::new(inv_mem),
+                    Default::default(),
+                )
+                .is_err()
+                {
+                    break 'blocks false;
+                }
+                // `inverse` fills the lower triangle only; mirrored on scatter.
+                let inv = &mut inv_out[..m * m];
+                llt::inverse::inverse(
+                    faer::MatMut::from_column_major_slice_mut(inv, m, m),
+                    faer::MatRef::from_column_major_slice(&inv_blk[..m * m], m, m),
+                    faer::Par::Seq,
+                    faer::dyn_stack::MemStack::new(inv_mem),
+                );
+                for (j, &b) in cols.iter().enumerate() {
+                    for (i, &a) in cols.iter().enumerate().skip(j) {
+                        let v = inv[j * m + i];
+                        out[b as usize * e + a as usize] = v;
+                        out[a as usize * e + b as usize] = v;
+                    }
+                }
+            }
+            true
+        };
+        if !factored {
+            tail_inverse_sparse(ss, e, stage, out);
+        }
+    }
+
     fn tail_solve(schur: &[f64], e: usize, ss: Option<&mut StructuredSchur>, rhs: &mut [f64]) {
         match ss {
             Some(ss) => {
@@ -232,6 +350,37 @@ impl TailKernel for f64 {
                 glmm_block_solve(&schur[..e * e], e, &mut rhs[..e]);
             }
         }
+    }
+}
+
+/// The default body of [`TailKernel::tail_inverse`]: `e` unit solves through
+/// the dense `L` that `tail_factor`'s dense arm left in `schur`.
+pub(crate) fn tail_inverse_generic<T: Scalar>(
+    schur: &[T],
+    e: usize,
+    stage: &mut [T],
+    out: &mut [f64],
+) {
+    for b in 0..e {
+        stage[..e].fill(T::ZERO);
+        stage[b] = T::ONE;
+        tail_solve_generic(schur, e, &mut stage[..e]);
+        for a in 0..e {
+            out[b * e + a] = stage[a].value();
+        }
+    }
+}
+
+/// `e` unit solves through the cached sparse factor: the fallback of `f64`'s
+/// [`TailKernel::tail_inverse`] when a component block fails to factor, which
+/// `S` being positive definite (its sparse factor succeeded) rules out short
+/// of round-off at the edge of definiteness.
+fn tail_inverse_sparse(ss: &mut StructuredSchur, e: usize, stage: &mut [f64], out: &mut [f64]) {
+    for b in 0..e {
+        stage[..e].fill(0.0);
+        stage[b] = 1.0;
+        <f64 as TailKernel>::tail_solve(&[], e, Some(&mut *ss), &mut stage[..e]);
+        out[b * e..b * e + e].copy_from_slice(&stage[..e]);
     }
 }
 
@@ -1445,6 +1594,10 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     tail_g,
                     tail_h,
                     fac_f64,
+                    curv_h,
+                    curv_sdot,
+                    curv_wp,
+                    curv_wpp,
                     ..
                 } = &mut **ex;
                 #[cfg(test)]
@@ -1463,31 +1616,22 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 for (o, v) in fac_f64.iter_mut().zip(core_blocks[..qc * qc * s].iter()) {
                     *o = v.value();
                 }
-                // S⁻¹ column by column, through the same tail solve the u-step
-                // uses, so it inherits whichever factor `structured_factor` left
-                // (cached sparse LLT, or the dense L in `schur_blk`). `a_rhs`'s
-                // crossed tail is the T-typed staging slot — free now, its u-solve
-                // was scattered to `u` just above. Column-major:
+                // S⁻¹ off the factor `structured_factor` left (cached sparse LLT,
+                // or the dense L in `schur_blk`), through `TailKernel::tail_inverse`.
+                // `a_rhs`'s crossed tail is the T-typed staging slot — free now,
+                // its u-solve was scattered to `u` just above. Column-major:
                 // `tail_inv[b·e + a] = (S⁻¹)_{a,b}`.
-                for b in 0..e {
-                    for slot in a_rhs[k_family..k_family + e].iter_mut() {
-                        *slot = T::ZERO;
-                    }
-                    a_rhs[k_family + b] = T::ONE;
-                    T::tail_solve(
-                        schur_blk,
-                        e,
-                        if force_dense {
-                            None
-                        } else {
-                            structured_schur.as_deref_mut()
-                        },
-                        &mut a_rhs[k_family..k_family + e],
-                    );
-                    for a in 0..e {
-                        tail_inv[b * e + a] = a_rhs[k_family + a].value();
-                    }
-                }
+                T::tail_inverse(
+                    schur_blk,
+                    e,
+                    if force_dense {
+                        None
+                    } else {
+                        structured_schur.as_deref_mut()
+                    },
+                    &mut a_rhs[k_family..k_family + e],
+                    tail_inv,
+                );
                 // The coupling `C_f` of the factor the leverage is read off.
                 let cpl = |idx: usize| -> f64 { coupling[idx].value() };
                 // The two per-cluster forms pass A's row loop reads in place of
@@ -1615,29 +1759,20 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                             );
                         }
                     }
-                    // `family::weight_eta_deriv` is the closed form of this same
-                    // `dw/dη`, held equal to this `Dual<1>` line by
-                    // `weight_eta_deriv_matches_dual1_of_irls_weight`
-                    // (`src/family.rs`); changing either alone moves `f64` bits.
-                    let wp = if exact_obj {
-                        crate::family::observed_weight_eta_deriv(
-                            family,
-                            nb_theta,
-                            y[i],
-                            prior_w[i],
-                            eta[i].value(),
-                            prob[i].value(),
-                            0.0,
-                        )
-                    } else {
-                        let et = crate::dual::Dual::<1> {
-                            v: eta[i].value(),
-                            d: [1.0],
-                        };
-                        let (_, w_raw, _) =
-                            crate::family::irls_weight_and_resid(family, nb_theta, y[i], et);
-                        prior_w[i] * w_raw.d[0]
-                    };
+                    // `hᵢ`, `W'ᵢ` and `W''ᵢ` are kept for the border's
+                    // curvature (`logdet_beta_curvature`).
+                    let (wp, cwp, cwpp) = super::row_weight_eta_derivs(
+                        family,
+                        nb_theta,
+                        exact_obj,
+                        y[i],
+                        prior_w[i],
+                        eta[i].value(),
+                        prob[i].value(),
+                    );
+                    curv_h[i] = h;
+                    curv_wp[i] = cwp;
+                    curv_wpp[i] = cwpp;
                     let a = wp * h;
                     for j in 0..p {
                         logdet_beta[j] += a * x[(i, j)];
@@ -1705,6 +1840,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                         let b = cross_col[cbase + z] as usize;
                         sdot += cross_val[cbase + z].value() * logdet_u[k_family + b];
                     }
+                    curv_sdot[i] = sdot;
                     let a = w[i].value() * sdot;
                     for j in 0..p {
                         logdet_beta[j] -= a * x[(i, j)];
@@ -1927,31 +2063,26 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 for r in 0..p {
                     beta_rhs[r] -= 0.5 * ex.logdet_beta[r];
                 }
-                logdet_beta_curvature(
-                    ex,
-                    family,
-                    nb_theta,
-                    crate::family::exact_curvature_differs(family),
-                    y,
-                    prior_w,
-                    &eta[..n],
-                    x,
-                    ainv_mtwx.as_ref(),
-                    &m_core_buf[..],
-                    cluster_ids,
-                    g,
-                    Some(&CrossedTail {
-                        cross_col: &cross_col[..],
-                        cross_val: &cross_val[..],
-                        n_cross: &n_cross[..],
-                        coupling: &coupling[..],
-                        coup_cols: &coup_cols[..],
-                        coup_ptr: &coup_ptr[..],
-                        e,
-                    }),
-                    n,
-                    p,
-                );
+                if trust.wants_curvature(it, careful, damp, &mut ex.curv_memory) {
+                    logdet_beta_curvature(
+                        ex,
+                        x,
+                        ainv_mtwx.as_ref(),
+                        &m_core_buf[..],
+                        cluster_ids,
+                        g,
+                        Some(&CrossedTail {
+                            cross_col: &cross_col[..],
+                            cross_val: &cross_val[..],
+                            n_cross: &n_cross[..],
+                            e,
+                        }),
+                        n,
+                        p,
+                    );
+                } else {
+                    ex.logdet_hess.fill(0.0);
+                }
             }
             // δβ in place, inside the trust region on the exact border. Non-PD
             // S_β ⇒ the (NaN,…,false) failure surface.

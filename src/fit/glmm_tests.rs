@@ -726,15 +726,20 @@ fn far_warm_start_recovers_via_the_cold_guard() {
 
 /// A far warm start where `ExactProfile` itself ends not converged (not the
 /// all-`+INFINITY` case the guard test above covers) and the `PqlThenJoint`
-/// fallback reaches the cold optimum instead: binary cloglog, the 4-cluster
-/// design, seed 37, from θ₀ = 3000. Found by scanning the same family of
+/// fallback reaches the cold optimum instead: binary probit, the 4-cluster
+/// design, seed 28, from θ₀ = 300. Found by scanning the same family of
 /// far-start fixtures the guard and trust-region tests use for a fit whose
-/// diagnostics carry `Note::ExactProfileFallback`.
+/// diagnostics carry `Note::ExactProfileFallback` (5 families, blocked and
+/// crossed, seeds 1-80, θ₀ 300 to 10000). The previous fixture, cloglog seed
+/// 37 from θ₀ = 3000, stopped needing the fallback once the border computes
+/// log|A|'s curvature only on solves that show trouble
+/// (`pirls::BorderTrust::wants_curvature`): `ExactProfile` then converges to
+/// the cold optimum by itself.
 #[test]
 fn exact_profile_fallback_reruns_on_pql_then_joint() {
-    let (x, mut y, mut model, ids) = nb_log_four_cluster_design(37, 24, 0);
+    let (x, mut y, mut model, ids) = nb_log_four_cluster_design(28, 24, 0);
     model.family = Family::Binomial {
-        link: BinomialLink::Cloglog,
+        link: BinomialLink::Probit,
     };
     for v in y.iter_mut() {
         *v = if *v > 1.0 { 1.0 } else { 0.0 };
@@ -752,12 +757,12 @@ fn exact_profile_fallback_reruns_on_pql_then_joint() {
 
     let start = StartValues {
         beta: vec![],
-        theta: vec![3000.0],
+        theta: vec![300.0],
     };
     let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
     assert!(
         warm.converged(),
-        "cloglog seed 37, θ₀ = 3000: expected the PqlThenJoint fallback to \
+        "probit seed 28, θ₀ = 300: expected the PqlThenJoint fallback to \
          converge, got {:?}",
         warm.diagnostics
     );
@@ -3438,10 +3443,24 @@ fn fit_glmm_nb_sim_matches_glmmtmb() {
     // Frozen 2026-09-26 with PIRLS taking the Newton step on the NB log link
     // and exiting at `PIRLS_TOL_REL_NONCANON`; logLik sits 6.1e-10 above
     // glmmTMB's.
-    const REF_BETA_PIN: [f64; 3] = [-0.005425229737856703, 0.5991738183649328, 0.604708249198719];
-    const REF_SE_PIN: [f64; 3] = [0.1638587151788523, 0.07293864894039388, 0.14289817493094034];
-    const REF_TAU2_PIN: [f64; 1] = [0.33066110478018695];
-    const REF_THETA_PIN: f64 = 1.7834744653358208;
+    // Re-pinned 2026-09-30: the exact β-profile's border step computes log|A|'s
+    // curvature in β only on solves where the plain `S_β` step shows trouble
+    // (`pirls::BorderTrust::wants_curvature`), so the stage-1 PIRLS solves take
+    // another path to the same profile. logLik unchanged to 1e-12
+    // (−481.46758427564356); β[0] moved 8.3e-10 absolute (1.5e-7 relative, β[0]
+    // being near zero), the other β, the SEs, τ̂² and θ̂ at most 1.4e-8 relative.
+    const REF_BETA_PIN: [f64; 3] = [
+        -0.005425230566464979,
+        0.5991738183930423,
+        0.6047082494140693,
+    ];
+    const REF_SE_PIN: [f64; 3] = [
+        0.16385871570994695,
+        0.07293864886949229,
+        0.14289817480464892,
+    ];
+    const REF_TAU2_PIN: [f64; 1] = [0.3306611093627454];
+    const REF_THETA_PIN: f64 = 1.78347447449742;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb pinned tau2");
@@ -3751,10 +3770,18 @@ fn fit_glmm_nb_nested_unbalanced_matches_glmmtmb() {
     // moved up by 9.8e-12 (−976.7919162692826, 50 evaluations); τ̂² moved
     // 1.2e-6 and 1.9e-7 relative, θ̂ 2.6e-7, the SEs 4.6e-7 and 6.9e-8, β
     // 6.1e-8 — the same flat directions as the re-pin above.
-    const REF_BETA_PIN: [f64; 2] = [0.6092438768811675, 0.5099937808391549];
-    const REF_SE_PIN: [f64; 2] = [0.20467113062786807, 0.05427740469504234];
-    const REF_TAU2_PIN: [f64; 2] = [0.39450938995746554, 0.12629714276699427];
-    const REF_THETA_PIN: f64 = 1.4290923579008143;
+    // Re-pinned 2026-09-30: the border step's curvature reads `W''` and the
+    // leverage from the border's own pass A (round-off; this fixture has no
+    // crossed tail, so the curvature stays exact), and is computed only on
+    // solves where the plain `S_β` step shows trouble
+    // (`pirls::BorderTrust::wants_curvature`). logLik moved down by 9.8e-12
+    // (−976.7919162692924, 50 evaluations); τ̂² moved 1.8e-7 and 1.3e-7
+    // relative, θ̂ 1.7e-7, the SEs 6.1e-8 and 5.1e-8, β 1.3e-8, along the same
+    // flat directions as the re-pins above.
+    const REF_BETA_PIN: [f64; 2] = [0.6092438849978777, 0.5099937804373104];
+    const REF_SE_PIN: [f64; 2] = [0.2046711180416813, 0.05427740745020058];
+    const REF_TAU2_PIN: [f64; 2] = [0.39450931761099334, 0.1262971597542459];
+    const REF_THETA_PIN: f64 = 1.4290921115954247;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb_nested pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb_nested pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb_nested pinned tau2");

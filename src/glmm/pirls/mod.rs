@@ -284,9 +284,10 @@ pub(crate) struct ExactProfileBufs {
     pub(crate) u_acc: Vec<f64>,
     /// `e×e` column-major `S⁻¹` (`tail_inv[b·e + a] = (S⁻¹)_{a,b}`), the dense
     /// inverse of the structured path's crossed-tail Schur complement. Rebuilt
-    /// every exact-mode structured iteration by `e` `TailKernel::tail_solve`
-    /// calls on unit vectors; length 1 (unread) when `e == 0` and on the
-    /// blocked path.
+    /// every exact-mode structured iteration by `TailKernel::tail_inverse`,
+    /// which writes only the blocks of the tail's components; the entries
+    /// between components are zeroed once per fit (`prep_glmm_design`) and
+    /// stay zero. Length 1 (unread) when `e == 0` and on the blocked path.
     pub(crate) tail_inv: Vec<f64>,
     /// len `e`. Per-row crossed residual `r_i = C_f'(A_f⁻¹ m_c) − m_x`, indexed
     /// by crossed column. Filled and read only under `cfg(test)`, by the row
@@ -319,39 +320,43 @@ pub(crate) struct ExactProfileBufs {
     /// cannot be hoisted by a last-seen-cluster check.
     pub(crate) fac_f64: Vec<f64>,
     /// p×p. `½·d²log|A|/dβ²` along the mode path ũ(β), written by
-    /// [`logdet_beta_curvature`] and added to the border's `S_β`.
+    /// [`logdet_beta_curvature`] and added to the border's `S_β`; zero on a
+    /// border step that does not compute it ([`BorderTrust::wants_curvature`]).
     pub(crate) logdet_hess: Mat<f64>,
     /// p×p. The border's `S_β` before that curvature is added, for the trust
     /// region's damped step and, where the sum is not positive definite
     /// before any radius is set, the first radius ([`border_solve`]).
     pub(crate) schur_plain: Mat<f64>,
-    /// len p. One row of `X̃ = X − M·A⁻¹M'WX`.
-    pub(crate) xt_row: Vec<f64>,
     /// len p each: the border's right-hand side `g`, kept for the trust
     /// region's predicted change and its damped re-solves, and the damped
     /// solve's scratch ([`border_solve`]).
     pub(crate) trust_g: Vec<f64>,
     pub(crate) trust_q: Vec<f64>,
-    /// len `s + 1` and `n`: the rows of each primary cluster, grouped by
-    /// [`group_rows_by_cluster`], so the curvature pass finishes one cluster's
-    /// per-cluster sums before starting the next.
-    pub(crate) rows_ptr: Vec<u32>,
-    pub(crate) rows: Vec<u32>,
-    /// `p·q_core(q_core+1)/2`: one cluster's `Σᵢ aᵢⱼ·cᵢcᵢ'` per β column `j`,
-    /// packed lower triangles (see [`logdet_beta_curvature`]).
+    /// len `n` each, written by pass A and pass C of the exact block for
+    /// [`logdet_beta_curvature`]: the leverage `hᵢ`, `W'ᵢ` and `W''ᵢ` of the
+    /// step weight, and `mᵢ'v`.
+    pub(crate) curv_h: Vec<f64>,
+    pub(crate) curv_wp: Vec<f64>,
+    pub(crate) curv_wpp: Vec<f64>,
+    pub(crate) curv_sdot: Vec<f64>,
+    /// The scratch of [`logdet_beta_curvature`], laid out there: `k·p` rows
+    /// of `A⁻¹M'WX` (`curv_tt`), one `p×p` sum (`curv_acc`), one `p` row
+    /// (`curv_a`) and `s·p·q_core(q_core+1)/2` cluster sums `P_f`
+    /// (`curv_cc`).
+    pub(crate) curv_tt: Vec<f64>,
+    pub(crate) curv_acc: Vec<f64>,
+    pub(crate) curv_a: Vec<f64>,
     pub(crate) curv_cc: Vec<f64>,
-    /// Structured path only (length 1 elsewhere), all indexed by crossed
-    /// column `b` and live only on the current cluster's coupling columns:
-    /// `q_core·e` `Ĉ_f = L_f⁻¹C_f` at `local·e + b`; `p·q_core·e` `Σᵢ aᵢⱼ·cᵢtᵢ'`
-    /// and then `V_fj` at `(j·q_core + local)·e + b`; `q_core·e` `V_fj·S⁻¹`.
-    pub(crate) curv_chat: Vec<f64>,
-    pub(crate) curv_ct: Vec<f64>,
-    pub(crate) curv_v: Vec<f64>,
-    pub(crate) curv_vs: Vec<f64>,
-    /// Structured path only: `p·e²`, the crossed-tail sums `U_j`, then
-    /// `S⁻¹U_j` in place (column-major `e×e` each); `e²` GEMM scratch.
-    pub(crate) curv_u: Vec<f64>,
-    pub(crate) curv_tmp: Vec<f64>,
+    /// The fit's memory of whether the border needs [`logdet_beta_curvature`]:
+    /// set when a solve's trouble switched it on, cleared when a later solve
+    /// measures that it barely changes the step ([`BorderTrust::wants_curvature`]).
+    /// Reset per fit, so a fit's path never depends on an earlier fit that used
+    /// the same workspace.
+    pub(crate) curv_memory: bool,
+    /// p×p factor and len-p step of the plain `S_β` step, for that measurement
+    /// ([`border_solve`]).
+    pub(crate) plain_fac: Mat<f64>,
+    pub(crate) plain_step: Vec<f64>,
 }
 
 /// On a link where the exact curvature differs from Fisher
@@ -386,13 +391,17 @@ pub(crate) fn observed_weights_in_place<T: Scalar>(
     }
 }
 
-/// `(dW/dη, d²W/dη²)` at one row for the weight `W` the exact border's `A` is
-/// built from: `W_obs` where `exact_obj` (its η form on a tail row, as
-/// [`observed_weights_in_place`] leaves it), the Fisher weight otherwise.
-/// One `Dual<1>` pass through the closed forms of `dW/dη` that pass A of the
-/// border reads, so `d²W/dη²` needs no closed form of its own. The value lane
-/// may differ from pass A's `f64` `dW/dη` in the last bits; it only enters the
-/// border's curvature, never the objective.
+/// Pass A's `dW/dη` for `c_β`, and `(dW/dη, d²W/dη²)` for the border's
+/// curvature, at one row, for the weight `W` the exact border's `A` is built
+/// from: `W_obs` where `exact_obj` (its η form on a tail row, as
+/// [`observed_weights_in_place`] leaves it), the Fisher weight otherwise. One
+/// `Dual<1>` pass through the closed forms of `dW/dη`, so `d²W/dη²` needs no
+/// closed form of its own. On `W_obs` it runs at this row's `prob` with
+/// `dμ/dη` as μ's derivative lane, so its value lane is the plain `f64`
+/// evaluation and serves `c_β` too. On the Fisher weight `c_β` keeps the
+/// derivative lane of `irls_weight_and_resid` (held equal to
+/// `family::weight_eta_deriv` by `weight_eta_deriv_matches_dual1_of_irls_weight`
+/// up to the last bits), and the curvature takes `weight_eta_deriv`'s lanes.
 pub(crate) fn row_weight_eta_derivs(
     family: Family,
     nb_theta: f64,
@@ -400,17 +409,31 @@ pub(crate) fn row_weight_eta_derivs(
     y: f64,
     prior_w: f64,
     eta: f64,
-) -> (f64, f64) {
+    prob: f64,
+) -> (f64, f64, f64) {
     use crate::dual::Dual;
     let e = Dual::<1> { v: eta, d: [1.0] };
-    let wp = if !exact_obj {
-        let (m, w, _) = crate::family::irls_weight_and_resid(family, nb_theta, y, e);
-        Dual::<1>::from_f64(prior_w) * crate::family::weight_eta_deriv(family, nb_theta, e, m, w)
+    if exact_obj {
+        let m = Dual::<1> {
+            v: prob,
+            d: [crate::family::mu_eta(family, eta)],
+        };
+        let c = crate::family::observed_weight_eta_deriv(
+            family,
+            nb_theta,
+            y,
+            prior_w,
+            e,
+            m,
+            Dual::ZERO,
+        );
+        (c.v, c.v, c.d[0])
     } else {
-        let m = crate::family::link_inv(family, e);
-        crate::family::observed_weight_eta_deriv(family, nb_theta, y, prior_w, e, m, Dual::ZERO)
-    };
-    (wp.v, wp.d[0])
+        let (m, w, _) = crate::family::irls_weight_and_resid(family, nb_theta, y, e);
+        let c = Dual::<1>::from_f64(prior_w)
+            * crate::family::weight_eta_deriv(family, nb_theta, e, m, w);
+        (prior_w * w.d[0], c.v, c.d[0])
+    }
 }
 
 /// The three terms of a structured row's crossed-tail leverage
@@ -419,7 +442,7 @@ pub(crate) fn row_weight_eta_derivs(
 /// `f`'s `G_f` (`q_core×q_core`), `tail_h` the `H_f` buffer with `coup` its
 /// cluster offset, `cols`/`vals` the row's own crossed entries `tᵢ`. The
 /// derivation and the index conventions are at pass A of
-/// `pirls_solve_blocked_extras`; shared with [`logdet_beta_curvature`].
+/// `pirls_solve_blocked_extras`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn row_tail_terms<T: Scalar>(
     yc: &[f64],
@@ -461,43 +484,13 @@ pub(crate) fn row_tail_terms<T: Scalar>(
     (t_gg, t_ght, t_tst)
 }
 
-/// Rows grouped by primary cluster: `rows[ptr[f]..ptr[f+1]]` are cluster
-/// `f`'s rows, ascending. The counting sort of `agq::ClusterRowIndex::build`,
-/// into caller-owned buffers so a PIRLS iteration allocates nothing.
-pub(crate) fn group_rows_by_cluster(
-    cluster_ids: &[u32],
-    s: usize,
-    ptr: &mut [u32],
-    rows: &mut [u32],
-) {
-    ptr[..s + 1].fill(0);
-    for &c in cluster_ids {
-        ptr[c as usize + 1] += 1;
-    }
-    for c in 0..s {
-        ptr[c + 1] += ptr[c];
-    }
-    // `ptr[c]` doubles as cluster `c`'s write cursor, then shifts back.
-    for (i, &c) in cluster_ids.iter().enumerate() {
-        rows[ptr[c as usize] as usize] = i as u32;
-        ptr[c as usize] += 1;
-    }
-    for c in (1..=s).rev() {
-        ptr[c] = ptr[c - 1];
-    }
-    ptr[0] = 0;
-}
-
 /// The crossed tail of the structured layout as [`logdet_beta_curvature`]
 /// reads it: the packed crossed nonzeros of `M` (`cross_col`/`cross_val`,
-/// `n_cross` live per row), the coupling `C` and its per-cluster column CSR.
+/// `n_cross` live per row).
 pub(crate) struct CrossedTail<'a, T> {
     pub(crate) cross_col: &'a [u32],
     pub(crate) cross_val: &'a [T],
     pub(crate) n_cross: &'a [u8],
-    pub(crate) coupling: &'a [T],
-    pub(crate) coup_cols: &'a [u32],
-    pub(crate) coup_ptr: &'a [u32],
     /// Crossed width.
     pub(crate) e: usize,
 }
@@ -524,36 +517,43 @@ pub(crate) struct CrossedTail<'a, T> {
 /// solve), the trace from the change of `A⁻¹` inside `c_β`. With `zᵢ = L⁻¹mᵢ`
 /// (`LL' = A`) and `aᵢⱼ = W'ᵢX̃ᵢⱼ`, `tr(A⁻¹PⱼA⁻¹Pₖ) = ⟨Rⱼ, Rₖ⟩_F`,
 /// `Rⱼ = Σᵢ aᵢⱼzᵢzᵢ'`. On the blocked layout `L` is block-diagonal and
-/// `Rⱼ` splits into per-cluster `q×q` blocks `Σ_{i∈f} aᵢⱼcᵢcᵢ'`,
-/// `cᵢ = L_f⁻¹mᵢ`. On the structured layout `zᵢ = [cᵢ; −L_S⁻¹rᵢ]` with
-/// `rᵢ = C_f'A_f⁻¹m_c − tᵢ = Ĉ_f'cᵢ − tᵢ`, `Ĉ_f = L_f⁻¹C_f` and `S` the
-/// crossed-tail Schur complement, and the Frobenius product splits into
-/// ```text
-///   Σ_f ⟨CC_fj, CC_fk⟩ + 2·Σ_f tr(V_fj S⁻¹ V_fk') + tr(S⁻¹UⱼS⁻¹Uₖ),
-///   CC_fj = Σ_{i∈f} aᵢⱼcᵢcᵢ',  CT_fj = Σ_{i∈f} aᵢⱼcᵢtᵢ',  V_fj = CC_fjĈ_f − CT_fj,
-///   Uⱼ = Σᵢ aᵢⱼrᵢrᵢ' = Σ_f (Ĉ_f'V_fj − CT_fj'Ĉ_f) + Σᵢ aᵢⱼtᵢtᵢ',
-/// ```
-/// so every term is a per-cluster sum or an `e×e` product, and no `rᵢ` is
-/// formed. `W`, `W'`, `W''` are those of the step weight (`exact_obj` picks
-/// `W_obs`, [`row_weight_eta_derivs`]); `A`'s factors, `v` (in
-/// `ex.logdet_u`) and `S⁻¹` (`ex.tail_inv`) are this iteration's, left by the
-/// border's exact block. Exact at the mode; off it, it is the same
-/// linearization the rest of the border step makes.
+/// `Rⱼ` splits into per-cluster `q×q` blocks `CC_fj = Σ_{i∈f} aᵢⱼcᵢcᵢ'`,
+/// `cᵢ = L_f⁻¹mᵢ`, so the trace is `Σ_f ⟨CC_fj, CC_fk⟩` and the result is
+/// exact. On the structured layout `zᵢ = [cᵢ; −L_S⁻¹rᵢ]` (`S` the
+/// crossed-tail Schur complement) and the product gains two crossed-tail
+/// terms, `2·Σ_f tr(V_fj S⁻¹ V_fk')` and `tr(S⁻¹UⱼS⁻¹Uₖ)` (`V_fj`, `Uⱼ` the
+/// coupling and tail blocks of `Rⱼ`). They are left out. Each is a Gram
+/// matrix over `j`, so positive semidefinite, and it enters with a minus
+/// sign: without them the result is an upper bound on the exact curvature
+/// (in the Loewner order), exact where no cluster couples to the tail. An
+/// upper bound keeps the step no longer than the exact Newton step, which
+/// is the side that matters: an overstated curvature only slows the
+/// iteration (its rate is `1 − H_true/H_model`), while one below half the
+/// true curvature makes plain Newton diverge. Their cost was `p·e³ + p²·e²`
+/// per iteration for the dense `S⁻¹Uⱼ` products plus `p·Σ_f q·e_f²` for the
+/// `V` blocks, several times the solve's own tail work; measured on the fits
+/// where log|A| dominates, the bound needs no more PIRLS iterations than the
+/// exact form.
 ///
-/// Cost per iteration, rows over `n`, `q = q_core`, `e_f` cluster `f`'s
-/// coupling width: `n·(q² + p·q + p² + p·q²)` for the row pass, `s·p²·q²` for
-/// the blocked trace; the structured tail adds `p·Σ_f q·e_f²` (the order of
-/// the Schur downdate, `p` times) and `p·e³ + p²·e²` for `S⁻¹Uⱼ` and its
-/// traces.
+/// `W'`, `W''` are those of the step weight (`exact_obj` picks `W_obs`,
+/// [`row_weight_eta_derivs`]); they, `hᵢ` (with its crossed-tail part) and
+/// `mᵢ'v` come per row from pass A and pass C of the border's exact block
+/// (`ex.curv_h`, `curv_wp`, `curv_wpp`, `curv_sdot`), and the per-cluster
+/// factors `L_f` (`ex.fac_f64`) are this iteration's, left by the same block.
+/// Exact at the mode; off it, it is the same linearization the rest of the
+/// border step makes.
+///
+/// Order of work. The row pass runs in the rows' own order, so every per-row
+/// read streams, and forms no `cᵢ`: it adds `aᵢⱼ·m_cᵢm_cᵢ'` (`m_cᵢ` the
+/// core part of `mᵢ`) into per-cluster sums `P_fj`, and one pass over the
+/// clusters turns them into `CC_fj = L_f⁻¹P_fjL_f⁻ᵀ`.
+///
+/// Cost per iteration, `q = q_core`: `n·(p·q + p²/2 + p·q²/2)` for the row
+/// pass, plus `p` per crossed nonzero, and `s·(p·q³ + p²·q²/2)` for the
+/// cluster pass.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn logdet_beta_curvature<T: Scalar>(
     ex: &mut ExactProfileBufs,
-    family: Family,
-    nb_theta: f64,
-    exact_obj: bool,
-    y: &[f64],
-    prior_w: &[f64],
-    eta: &[T],
     x: MatRef<f64>,
     ainv_mtwx: MatRef<f64>,
     m_core: &[T],
@@ -584,254 +584,149 @@ pub(crate) fn logdet_beta_curvature<T: Scalar>(
         }
     };
     let ExactProfileBufs {
-        logdet_u: v,
         fac_f64: fac,
-        tail_inv,
-        tail_g,
-        tail_h,
         logdet_hess: hess,
-        xt_row,
-        rows_ptr,
-        rows,
-        curv_cc: cc,
-        curv_chat: chat,
-        curv_ct: ct,
-        curv_v: vv,
-        curv_vs: vs,
-        curv_u: uu,
-        curv_tmp: tmp,
+        curv_h: hrow,
+        curv_wp: wprow,
+        curv_wpp: wpprow,
+        curv_sdot: sdrow,
+        curv_tt: tt,
+        curv_acc: acc,
+        curv_a: av,
+        curv_cc: pall,
         ..
     } = ex;
-    let xt = &mut xt_row[..p];
-    // `hess` accumulates d²log|A|/dβ² on its lower triangle.
-    for c in 0..p {
-        for r in c..p {
-            hess[(r, c)] = 0.0;
+    // Rows of `T = A⁻¹M'WX` in the `a_rhs` packing, each `p` long and
+    // contiguous, so a row's `X̃ᵢ = xᵢ − T'mᵢ` is a few axpys.
+    for j in 0..p {
+        for f in 0..s {
+            for local in 0..qc {
+                tt[(f * qc + local) * p + j] = ainv_mtwx[(core_col(f, local), j)];
+            }
+        }
+        for b in 0..e {
+            tt[(k_family + b) * p + j] = ainv_mtwx[(k_family + b, j)];
         }
     }
-    group_rows_by_cluster(&cluster_ids[..n], s, rows_ptr, rows);
-    if e > 0 {
-        uu[..p * e * e].fill(0.0);
-    }
+    // `acc` accumulates d²log|A|/dβ² on its lower triangle, row-major.
+    let acc = &mut acc[..p * p];
+    acc.fill(0.0);
+    // `P_fj` at `pall[(f·qq + ix)·p + j]`, `ix` packed lower, so one row's
+    // update is contiguous in `j`.
+    let pall = &mut pall[..s * qq * p];
+    pall.fill(0.0);
+    let av = &mut av[..p];
     let mut mc = [0.0_f64; MAX_PRIMARY_Q];
-    let mut c = [0.0_f64; MAX_PRIMARY_Q];
-    let mut yc = [0.0_f64; MAX_PRIMARY_Q];
+    let mut nzl = [0usize; MAX_PRIMARY_Q];
+    for i in 0..n {
+        let f = cluster_ids[i] as usize;
+        let mut nnz = 0;
+        for local in 0..qc {
+            let v = m_core[i * qc + local].value();
+            mc[local] = v;
+            if v != 0.0 {
+                nzl[nnz] = local;
+                nnz += 1;
+            }
+        }
+        for (a, xv) in av.iter_mut().zip(x.row(i).iter()) {
+            *a = *xv;
+        }
+        for &local in &nzl[..nnz] {
+            let w = mc[local];
+            let tr = &tt[(f * qc + local) * p..(f * qc + local + 1) * p];
+            for (a, tv) in av.iter_mut().zip(tr) {
+                *a -= w * tv;
+            }
+        }
+        if let Some(t) = tail {
+            let base = i * g_cap;
+            for z in 0..t.n_cross[i] as usize {
+                let w = t.cross_val[base + z].value();
+                let b = t.cross_col[base + z] as usize;
+                let tr = &tt[(k_family + b) * p..(k_family + b + 1) * p];
+                for (a, tv) in av.iter_mut().zip(tr) {
+                    *a -= w * tv;
+                }
+            }
+        }
+        let wp = wprow[i];
+        let d = wpprow[i] * hrow[i] - wp * sdrow[i];
+        for j in 0..p {
+            let dj = d * av[j];
+            for (h, xl) in acc[j * p..j * p + j + 1].iter_mut().zip(&av[..=j]) {
+                *h += dj * xl;
+            }
+        }
+        // `aᵢ = W'ᵢX̃ᵢ` in place of `X̃ᵢ`.
+        for a in av.iter_mut() {
+            *a *= wp;
+        }
+        let pf = &mut pall[f * qq * p..(f + 1) * qq * p];
+        for a1 in 0..nnz {
+            let r = nzl[a1];
+            for &cl in &nzl[..=a1] {
+                let coef = mc[r] * mc[cl];
+                let ix = r * (r + 1) / 2 + cl;
+                for (o, aj) in pf[ix * p..(ix + 1) * p].iter_mut().zip(av.iter()) {
+                    *o += coef * aj;
+                }
+            }
+        }
+    }
+    let mut w1 = [0.0_f64; MAX_PRIMARY_Q * MAX_PRIMARY_Q];
+    let mut colv = [0.0_f64; MAX_PRIMARY_Q];
+    let mut colo = [0.0_f64; MAX_PRIMARY_Q];
     for f in 0..s {
         let fl = &fac[f * qc * qc..(f + 1) * qc * qc];
-        let coup = f * qc * e;
-        let cols: &[u32] = match tail {
-            Some(t) => &t.coup_cols[t.coup_ptr[f] as usize..t.coup_ptr[f + 1] as usize],
-            None => &[],
-        };
-        cc[..p * qq].fill(0.0);
-        if let Some(t) = tail.filter(|_| !cols.is_empty()) {
-            for &b in cols {
-                let b = b as usize;
-                for (local, m) in mc.iter_mut().enumerate().take(qc) {
-                    *m = t.coupling[coup + local * e + b].value();
-                }
-                block_forward_solve(fl, qc, &mc[..qc], &mut c[..qc]);
-                for local in 0..qc {
-                    chat[local * e + b] = c[local];
-                    for j in 0..p {
-                        ct[(j * qc + local) * e + b] = 0.0;
-                    }
-                }
+        // CC_fj = L_f⁻¹P_fjL_f⁻ᵀ, packed lower in place of P_fj.
+        let cc = &mut pall[f * qq * p..(f + 1) * qq * p];
+        if qc == 1 {
+            let r2 = 1.0 / (fl[0] * fl[0]);
+            for v in cc.iter_mut() {
+                *v *= r2;
             }
-        }
-        for &i in &rows[rows_ptr[f] as usize..rows_ptr[f + 1] as usize] {
-            let i = i as usize;
-            for local in 0..qc {
-                mc[local] = m_core[i * qc + local].value();
-            }
-            block_forward_solve(fl, qc, &mc[..qc], &mut c[..qc]);
-            let mut h: f64 = c[..qc].iter().map(|z| z * z).sum();
-            let mut sdot = 0.0;
-            for local in 0..qc {
-                sdot += mc[local] * v[f * qc + local];
-            }
-            for (j, xj) in xt.iter_mut().enumerate() {
-                let mut acc = x[(i, j)];
-                for local in 0..qc {
-                    acc -= mc[local] * ainv_mtwx[(core_col(f, local), j)];
-                }
-                *xj = acc;
-            }
-            let (tcols, tvals): (&[u32], &[T]) = match tail {
-                Some(t) => {
-                    let ncz = t.n_cross[i] as usize;
-                    (
-                        &t.cross_col[i * g_cap..i * g_cap + ncz],
-                        &t.cross_val[i * g_cap..i * g_cap + ncz],
-                    )
-                }
-                None => (&[], &[]),
-            };
-            if !cols.is_empty() {
-                yc[..qc].copy_from_slice(&mc[..qc]);
-                glmm_block_solve(fl, qc, &mut yc[..qc]);
-                let (t_gg, t_ght, t_tst) = row_tail_terms(
-                    &yc[..qc],
-                    qc,
-                    &tail_g[f * qc * qc..(f + 1) * qc * qc],
-                    tail_h,
-                    coup,
-                    e,
-                    tcols,
-                    tvals,
-                    tail_inv,
-                );
-                h += t_gg - 2.0 * t_ght + t_tst;
-            }
-            for (&b, tv) in tcols.iter().zip(tvals) {
-                let b = b as usize;
-                let val = tv.value();
-                sdot += val * v[k_family + b];
-                for (j, xj) in xt.iter_mut().enumerate() {
-                    *xj -= val * ainv_mtwx[(k_family + b, j)];
-                }
-            }
-            let (wp, wpp) = row_weight_eta_derivs(
-                family,
-                nb_theta,
-                exact_obj,
-                y[i],
-                prior_w[i],
-                eta[i].value(),
-            );
-            let d = wpp * h - wp * sdot;
+        } else {
             for j in 0..p {
-                let dj = d * xt[j];
-                for l in 0..=j {
-                    hess[(j, l)] += dj * xt[l];
+                // W = L⁻¹P column by column (`w1[r·qc + c] = W[r,c]`), then
+                // row r of CC = W L⁻ᵀ is L⁻¹ applied to row r of W.
+                for cl in 0..qc {
+                    for (r, cv) in colv.iter_mut().enumerate().take(qc) {
+                        let (hi, lo) = if r >= cl { (r, cl) } else { (cl, r) };
+                        *cv = cc[(hi * (hi + 1) / 2 + lo) * p + j];
+                    }
+                    block_forward_solve(fl, qc, &colv[..qc], &mut colo[..qc]);
+                    for r in 0..qc {
+                        w1[r * qc + cl] = colo[r];
+                    }
                 }
-                let a = wp * xt[j];
-                let ccj = &mut cc[j * qq..(j + 1) * qq];
-                let mut idx = 0;
                 for r in 0..qc {
+                    block_forward_solve(fl, qc, &w1[r * qc..(r + 1) * qc], &mut colo[..qc]);
                     for cl in 0..=r {
-                        ccj[idx] += a * c[r] * c[cl];
-                        idx += 1;
-                    }
-                }
-                for (&b, tv) in tcols.iter().zip(tvals) {
-                    let at = a * tv.value();
-                    for local in 0..qc {
-                        ct[(j * qc + local) * e + b as usize] += at * c[local];
-                    }
-                    let ub = &mut uu[j * e * e + b as usize * e..];
-                    for (&b2, tv2) in tcols.iter().zip(tvals) {
-                        ub[b2 as usize] += at * tv2.value();
+                        cc[(r * (r + 1) / 2 + cl) * p + j] = colo[cl];
                     }
                 }
             }
         }
         // −Σ_f ⟨CC_fj, CC_fk⟩: off-diagonal packed entries count twice.
-        for j in 0..p {
-            for l in 0..=j {
-                let mut acc = 0.0;
-                let mut idx = 0;
-                for r in 0..qc {
-                    for cl in 0..=r {
-                        let wgt = if cl == r { 1.0 } else { 2.0 };
-                        acc += wgt * cc[j * qq + idx] * cc[l * qq + idx];
-                        idx += 1;
+        let mut ix = 0;
+        for r in 0..qc {
+            for cl in 0..=r {
+                let wgt = if cl == r { 1.0 } else { 2.0 };
+                let row = &cc[ix * p..(ix + 1) * p];
+                for j in 0..p {
+                    let cj = wgt * row[j];
+                    for (h, rl) in acc[j * p..j * p + j + 1].iter_mut().zip(&row[..=j]) {
+                        *h -= cj * rl;
                     }
                 }
-                hess[(j, l)] -= acc;
-            }
-        }
-        if cols.is_empty() {
-            continue;
-        }
-        // V_fj = CC_fj·Ĉ_f − CT_fj on cluster f's coupling columns.
-        for j in 0..p {
-            let ccj = &cc[j * qq..(j + 1) * qq];
-            for r in 0..qc {
-                for &b in cols {
-                    let b = b as usize;
-                    let mut acc = 0.0;
-                    for m in 0..qc {
-                        let (hi, lo) = if r >= m { (r, m) } else { (m, r) };
-                        acc += ccj[hi * (hi + 1) / 2 + lo] * chat[m * e + b];
-                    }
-                    let at = (j * qc + r) * e + b;
-                    vv[at] = acc - ct[at];
-                }
-            }
-        }
-        for j in 0..p {
-            // V_fj·S⁻¹ on the coupling columns (`tail_inv` symmetric).
-            for r in 0..qc {
-                for &b in cols {
-                    let b = b as usize;
-                    let mut acc = 0.0;
-                    for &a in cols {
-                        let a = a as usize;
-                        acc += vv[(j * qc + r) * e + a] * tail_inv[b * e + a];
-                    }
-                    vs[r * e + b] = acc;
-                }
-            }
-            for l in 0..=j {
-                let mut acc = 0.0;
-                for r in 0..qc {
-                    for &b in cols {
-                        let b = b as usize;
-                        acc += vs[r * e + b] * vv[(l * qc + r) * e + b];
-                    }
-                }
-                hess[(j, l)] -= 2.0 * acc;
-            }
-            // Uⱼ += Ĉ_f'V_fj − CT_fj'Ĉ_f.
-            let uj = &mut uu[j * e * e..(j + 1) * e * e];
-            for &b in cols {
-                let b = b as usize;
-                for &a in cols {
-                    let a = a as usize;
-                    let mut acc = 0.0;
-                    for r in 0..qc {
-                        acc += chat[r * e + a] * vv[(j * qc + r) * e + b]
-                            - ct[(j * qc + r) * e + a] * chat[r * e + b];
-                    }
-                    uj[b * e + a] += acc;
-                }
-            }
-        }
-    }
-    if e > 0 {
-        // −tr(S⁻¹UⱼS⁻¹Uₖ): Gⱼ = S⁻¹Uⱼ in place of Uⱼ, then Σ Gⱼ[a,b]·Gₖ[b,a].
-        let sinv = MatRef::from_column_major_slice(&tail_inv[..e * e], e, e);
-        for j in 0..p {
-            faer::linalg::matmul::matmul(
-                MatMut::from_column_major_slice_mut(&mut tmp[..e * e], e, e),
-                faer::Accum::Replace,
-                sinv,
-                MatRef::from_column_major_slice(&uu[j * e * e..(j + 1) * e * e], e, e),
-                1.0,
-                Par::Seq,
-            );
-            uu[j * e * e..(j + 1) * e * e].copy_from_slice(&tmp[..e * e]);
-        }
-        for j in 0..p {
-            for l in 0..=j {
-                let (gj, gl) = (
-                    &uu[j * e * e..(j + 1) * e * e],
-                    &uu[l * e * e..(l + 1) * e * e],
-                );
-                let mut acc = 0.0;
-                for b in 0..e {
-                    for a in 0..e {
-                        acc += gj[b * e + a] * gl[a * e + b];
-                    }
-                }
-                hess[(j, l)] -= acc;
+                ix += 1;
             }
         }
     }
     for j in 0..p {
         for l in 0..=j {
-            let h = 0.5 * hess[(j, l)];
+            let h = 0.5 * acc[j * p + l];
             hess[(j, l)] = h;
             hess[(l, j)] = h;
         }
@@ -873,7 +768,36 @@ pub(crate) struct BorderTrust {
     /// The fraction of `δ` the iterate took: `1`, less where the damped solve
     /// ended past the radius, halved by the period-2 relaxed step.
     frac: f64,
+    /// This solve's border steps carry the log|A| curvature, and how many
+    /// border steps it has taken ([`BorderTrust::wants_curvature`]).
+    curv: bool,
+    steps: u32,
+    /// The radius shrank in this solve: a judged trial disagreed with its model
+    /// or could not be evaluated.
+    shrunk: bool,
+    /// The curvature came from the fit's memory, so the solve's first step
+    /// measures its effect `‖δ_H − δ_S‖/‖δ_H‖` ([`border_solve`]) into `effect`.
+    check: bool,
+    effect: f64,
 }
+
+/// The border computes the log|A| curvature only where it changes the step
+/// ([`BorderTrust::wants_curvature`]). Its row pass is about one more pass
+/// over the rows per call, and on most solves it moves the step by a few
+/// percent. Without it the plain `S_β` step contracts the β error by about
+/// `‖S_β⁻¹·½d²log|A|‖` per iteration, so it matters only where that factor is
+/// near or above one (a few clusters at a large θ, most binary fits with few
+/// clusters), where the plain step overshoots and cycles. A solve still running
+/// after this many iterations is slow for some reason, and the curvature is
+/// then cheap next to the iterations it can save; converged exact-profile solves
+/// take four to five.
+const CURV_SLOW_ITERS: usize = 8;
+/// A solve whose curvature came from the fit's memory drops it (and clears the
+/// memory) when its first step changes by less than this fraction with it. At
+/// that size the plain step converges at least tenfold per iteration, so the
+/// curvature saves about one iteration per solve, and one call costs at most
+/// about that.
+const CURV_RELEASE: f64 = 0.1;
 
 /// The trust-region constants of Nocedal & Wright's Algorithm 4.1 (shrink
 /// below `¼`, grow above `¾`, by `¼` and `2`) and Moré & Sorensen's stopping
@@ -894,7 +818,51 @@ impl BorderTrust {
             len: 0.0,
             cut: false,
             frac: 1.0,
+            curv: false,
+            steps: 0,
+            shrunk: false,
+            check: false,
+            effect: f64::INFINITY,
         }
+    }
+
+    /// Whether this border step computes [`logdet_beta_curvature`]; called once
+    /// per border step, before it. The curvature switches on for the rest of the
+    /// solve at the first sign that the plain `S_β` model is wrong: the radius
+    /// shrank (a judged trial fell short of its model), careful mode (the merit
+    /// could not be trusted), the period-2 damping (the step overshoots by about
+    /// a factor two), or `CURV_SLOW_ITERS` iterations without converging. Each
+    /// switch sets the fit's `memory`, so the next solve starts with the
+    /// curvature on: at nearby θ the next solve needs it too, and waiting for
+    /// trouble again would cost iterations on every solve of a hard fit. That
+    /// solve's first step measures what the curvature does to the step
+    /// ([`border_solve`]); below `CURV_RELEASE` the solve drops it and clears
+    /// the memory, so a fit that had trouble at one θ pays nothing once it
+    /// moves where the plain step is good. A rejected trial is not a trigger of
+    /// its own: a judged one always shrinks the radius, and an unjudged one is
+    /// the u half of a first step overshooting, which the β model cannot help
+    /// (see [`BorderTrust::judge`]).
+    pub(crate) fn wants_curvature(
+        &mut self,
+        it: usize,
+        careful: bool,
+        damp: bool,
+        memory: &mut bool,
+    ) -> bool {
+        self.steps += 1;
+        if self.curv {
+            if self.check && self.steps == 2 && self.effect < CURV_RELEASE {
+                self.curv = false;
+                *memory = false;
+            }
+        } else if *memory {
+            self.curv = true;
+            self.check = true;
+        } else if self.shrunk || careful || damp || it >= CURV_SLOW_ITERS {
+            self.curv = true;
+            *memory = true;
+        }
+        self.curv
     }
 
     fn set_step(&mut self, gd: f64, lam: f64, len: f64, cut: bool, frac: f64) {
@@ -946,6 +914,7 @@ impl BorderTrust {
     fn shrink_to(&mut self, r: f64) {
         if r > 0.0 && r.is_finite() {
             self.radius = r;
+            self.shrunk = true;
         }
     }
 
@@ -1008,6 +977,21 @@ pub(crate) fn border_solve(
         llt_solve(schur, rhs, llt_mem);
         return true;
     };
+    // The curvature's effect on the step, measured on a solve's first step
+    // when that solve took the curvature from the fit's memory
+    // (`BorderTrust::wants_curvature`). A plain step that cannot be formed
+    // counts as a large effect.
+    let measure = tr.check && tr.steps == 1;
+    if measure {
+        ex.plain_fac.copy_from(&*schur);
+        let d = &mut ex.plain_step[..p];
+        d.copy_from_slice(rhs);
+        if llt_factor(&mut ex.plain_fac, llt_mem) {
+            llt_solve(&ex.plain_fac, d, llt_mem);
+        } else {
+            d.fill(f64::NAN);
+        }
+    }
     ex.schur_plain.copy_from(&*schur);
     for c in 0..p {
         for r in 0..p {
@@ -1018,6 +1002,21 @@ pub(crate) fn border_solve(
     g.copy_from_slice(rhs);
     if llt_factor(schur, llt_mem) {
         llt_solve(schur, rhs, llt_mem);
+        if measure {
+            let diff: f64 = rhs
+                .iter()
+                .zip(&ex.plain_step[..p])
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            let effect = diff.sqrt() / dot(rhs, rhs).sqrt();
+            // NaN (a plain step that could not be formed, or a zero step)
+            // keeps the curvature.
+            tr.effect = if effect.is_nan() {
+                f64::INFINITY
+            } else {
+                effect
+            };
+        }
         let len = dot(rhs, rhs).sqrt();
         // A non-finite step is taken as it is: its trial fails, and
         // `BorderTrust::fail` has nothing finite to shrink to.
