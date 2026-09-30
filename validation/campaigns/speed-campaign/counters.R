@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 # Counter aggregation over the two counter passes. Usage:
 #   Rscript counters.R <laplace.jsonl> <agq.jsonl> <out.csv> [baseline.csv]
-# Laplace/LMM pass: campaigns/speed-grid, no nagq key, counters 1-3
+# Laplace/LMM pass: campaigns/speed-campaign, no nagq key, counters 1-3
 # (stage1_evals, stage2_evals, stage1_shrink_evals, stage2_shrink_evals,
 # pirls_hist). AGQ pass: the 33 nagq cells of estimate-grid-manifest.json,
 # counter 4 (agq_evals, agq_node_evals). family/structure/n_theta/p

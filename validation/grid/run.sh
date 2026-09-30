@@ -3,7 +3,9 @@
 #
 #   ./run.sh <engine> [--fast] [--timed[=N]] [--jobs N] [--label TEXT] [--keep] [cell ...]
 #
-#   engine   glmm | glmm_python | glmm_r | lme4 | glmmtmb | glmmadaptive | mixedmodels
+#   engine   glmm | glmm_wasm | glmm_python | glmm_r | lme4 | glmmtmb | glmmadaptive | mixedmodels
+#            (glmm_wasm: the glmm engine built for wasm32-wasip1 with simd128, run
+#            under wasmtime)
 #   --fast   restrict to the cells tagged `fast` in manifest.json
 #   --timed[=N]  time every fit: N samples (default 4), first discarded, median of
 #            the rest. IMPLIES --fast and --jobs=1. Records no_turbo and REFUSES to
@@ -14,7 +16,7 @@
 #            with `taskset -c i`. P-cores on this box are 0-5, so N > 6 is refused.
 #   --label  free text purpose of the run ("release 0.4.0 baseline"), stored in
 #            run_meta and slugged into the directory name.
-#   --keep   a glmm / glmm_python / glmm_r run lands in runs/<engine>/ instead of
+#   --keep   a glmm / glmm_wasm / glmm_python / glmm_r run lands in runs/<engine>/ instead of
 #            runs/<engine>/scratch/. Oracle runs are always kept.
 #   cell ... restrict to the named cells; validated against manifest.json, so an
 #            unknown name fails loudly before anything is fit.
@@ -51,7 +53,7 @@ JOBS=1
 LABEL=""
 KEEP=0
 # Per-cell watchdog budget in seconds. Used ONLY by the watchdog below and never
-# exported: no engine caps its own fits. 600 rather than the speed-grid
+# exported: no engine caps its own fits. 600 rather than the speed
 # campaign's 240 because the grid's 30000-row wide cells are the slowest fits in
 # the corpus and a 240 s kill would record every one of them as a timeout.
 BUDGET="${GRID_WATCHDOG:-600}"
@@ -119,7 +121,7 @@ case "$ENGINE" in
   glmmtmb)      ENGINE_MANIFEST_NAME=glmmTMB ;;
   glmmadaptive) ENGINE_MANIFEST_NAME=GLMMadaptive ;;
   mixedmodels)  ENGINE_MANIFEST_NAME=MixedModels ;;
-  glmm|glmm_python|glmm_r) ENGINE_MANIFEST_NAME="" ;;
+  glmm|glmm_wasm|glmm_python|glmm_r) ENGINE_MANIFEST_NAME="" ;;
   *) echo "unknown engine: $ENGINE" >&2; exit 2 ;;
 esac
 
@@ -194,7 +196,7 @@ case "$ENGINE" in
   # would put two spellings of one version in one results.jsonl. run_meta's
   # glmm_git_rev is the commit the run started from; run_meta does not record
   # whether the tree was dirty.
-  glmm)        ENGINE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)" ;;
+  glmm|glmm_wasm) ENGINE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)" ;;
   glmm_python) ENGINE_VERSION="$("$ROOT/python/venv/bin/python" -c 'from importlib.metadata import version; print(version("glmm"))')" ;;
   glmm_r)      ENGINE_VERSION="$(Rscript -e 'cat(as.character(packageVersion("fastglmm")))')" ;;
 esac
@@ -211,7 +213,7 @@ RUN_ROOT="$GRID/runs/$ENGINE"
 # A glmm / port run is committed only when started with --keep; otherwise it lands
 # in scratch/, which .gitignore drops. Oracle runs are always committed.
 case "$ENGINE" in
-  glmm|glmm_python|glmm_r) [[ "$KEEP" == 1 ]] || RUN_ROOT="$RUN_ROOT/scratch" ;;
+  glmm|glmm_wasm|glmm_python|glmm_r) [[ "$KEEP" == 1 ]] || RUN_ROOT="$RUN_ROOT/scratch" ;;
 esac
 RUN_DIR="$RUN_ROOT/$BASE"
 # Rerunning the same engine on the same day appends a counter rather than
@@ -272,6 +274,12 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 # Mirrors the engine list of the ENGINE_MANIFEST_NAME case above.
 case "$ENGINE" in
   glmm)         CMD=(cargo run --quiet --release --manifest-path "$ROOT/Cargo.toml" -p validation --example grid_glmm) ;;
+  # WASI passes no host environment unless named: forward the engine contract's
+  # variables (GRID_DIR, GRID_MANIFEST, GRID_TIMED, the worker's GRID_OUT and
+  # GRID_CELLS) and the thread count.
+  glmm_wasm)    CMD=(wasmtime run --dir /::/ --env GRID_DIR --env GRID_MANIFEST --env GRID_TIMED
+                     --env GRID_OUT --env GRID_CELLS --env RAYON_NUM_THREADS
+                     "$ROOT/target/wasm32-wasip1/release/examples/grid_glmm.wasm") ;;
   glmm_python)  CMD=("$ROOT/python/venv/bin/python" "$GRID/engines/glmm_python.py") ;;
   glmm_r)       CMD=(Rscript "$GRID/engines/glmm_r.R") ;;
   lme4)         CMD=(Rscript "$GRID/engines/lme4.R") ;;
@@ -283,6 +291,9 @@ esac
 # writes, which the mtime test would read as a hung cell and kill the compiler.
 [[ "$ENGINE" == glmm ]] && cargo build --quiet --release \
   --manifest-path "$ROOT/Cargo.toml" -p validation --example grid_glmm
+[[ "$ENGINE" == glmm_wasm ]] && RUSTFLAGS="-C target-feature=+simd128" cargo build --quiet \
+  --release --target wasm32-wasip1 --manifest-path "$ROOT/Cargo.toml" -p validation \
+  --example grid_glmm
 
 # Per-launch startup grace: loading the engine writes nothing (a Julia package
 # load plus the first fit's JIT can exceed a whole cell budget), so until this
@@ -348,7 +359,7 @@ run_worker() {   # $1 = part index
     RC=0; wait "$ENGPID" 2>/dev/null || RC=$?
     # The engine exited on its own with cells remaining. Its exit code decides
     # what that means, and conflating the two writes fabricated failures for
-    # cells nothing tried: in campaigns/speed-grid 24 consecutive cells, one of
+    # cells nothing tried: in campaigns/speed-campaign 24 consecutive cells, one of
     # them a 4 ms 300-row fit, came out engine-fail with n_eval=0 because the
     # launches never ran.
     #   RC != 0 -- the LAUNCH failed before reaching the cell: build error, OOM

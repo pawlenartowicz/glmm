@@ -2234,7 +2234,7 @@ pub fn fit_lmm(
             // lme4/MixedModels unit-diagonal convention — and on the wide-slope
             // grid stratum that start funnels BOBYQA into a second-best optimum
             // in 8/9 cells (regression goldens at
-            // validation/campaigns/speed-grid/optima/ pin
+            // validation/campaigns/speed-campaign/optima/ pin
             // the correct optimum). Mirrors the GLMM joint seed
             // (`glmm::fit_glmm`'s θ cold start), which carries the same rule.
             for t in theta.iter_mut() {

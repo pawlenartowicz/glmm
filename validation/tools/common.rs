@@ -1,6 +1,6 @@
 //! Shared helpers for the dev-only examples that lower a manifest entry or a bare
 //! CSV + formula pair into a `Lowered`: `bit_identity/dump.rs`, `memory/memory_fit.rs`,
-//! and the speed-grid campaign's `fit.rs`, `theta_eval.rs` and `agq_par_probe.rs`.
+//! and the speed campaign's `fit.rs`, `theta_eval.rs` and `agq_par_probe.rs`.
 //! Included via `#[path = ...]` rather than a library module — every example here is
 //! dev-only, so this stays a plain shared source file rather than adding a crate for
 //! five consumers. `validation/grid/engines/common.rs` is a separate file for the
@@ -84,13 +84,13 @@ pub fn nums(xs: &[f64]) -> Value {
 /// is the `validation/` crate dir (`CARGO_MANIFEST_DIR`, shared by every bin
 /// target regardless of which campaign subdir the source file sits in); grid
 /// data is campaign-local (`prep.R`'s output), under
-/// `campaigns/speed-grid/data/`. Used by the grid drivers (`grid_fit`,
+/// `campaigns/speed-campaign/data/`. Used by the grid drivers (`grid_fit`,
 /// `theta_eval`) — allow(dead_code) because `bit_identity` includes this file
 /// without calling it.
 #[allow(dead_code)]
 pub fn lower_grid_cell(cell: &Value, manifest_dir: &str) -> (Lowered, bool, usize) {
     let case_id = cell["case_id"].as_str().unwrap();
-    let path = format!("{manifest_dir}/campaigns/speed-grid/data/{case_id}.csv");
+    let path = format!("{manifest_dir}/campaigns/speed-campaign/data/{case_id}.csv");
     let (header, rows) = read_csv_path(&path);
     let factors: Vec<String> = cell["factors"]
         .as_array()

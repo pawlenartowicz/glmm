@@ -5989,7 +5989,7 @@ fn fixture_with_nagq_sized(
 /// `fixture`, widened by `extra_p` synthetic zero-truth predictor columns
 /// (small noise, no signal) so `m` crosses into the `Dual<12>` band — one
 /// gate cell needs to exercise `N = 12` numerically, not only via
-/// the speed-grid's padded timing run.
+/// the speed campaign's padded timing run.
 fn fixture_padded(
     family: Family,
     shape: &str,
@@ -6129,7 +6129,7 @@ fn fixed_seed_theta_padded(shape: &str, extra_p: usize) -> FixedSeedTheta {
 /// `{Binomial-logit, Binomial-probit, Binomial-cloglog, Poisson-log,
 /// Gamma-log, NegativeBinomial}` × `{int1, q2s}` — the family/shape product
 /// the gradient FD gate runs. `int1` (n_θ=1) and `q2s` (n_θ=3) are the only
-/// GLMM-reachable blocked shapes among the speed-grid catalogue's four:
+/// GLMM-reachable blocked shapes among the speed campaign catalogue's four:
 /// `nest2` is nested (extras non-empty, routes to `pirls_solve_blocked_extras`
 /// — `Unsupported` by the routing gate, nothing for an FD gate to compare) and
 /// `q3s` carries `glmm = FALSE` in the same catalogue (never fit as a GLMM, no
@@ -6815,7 +6815,7 @@ fn assert_assembled_hessian_columns_match_fd(
 }
 
 /// One gate cell padded past `m = 8` so `Dual<12>` is exercised by a numerical
-/// gradient check, not only by the speed-grid's padded timing run. `q2s`
+/// gradient check, not only by the speed campaign's padded timing run. `q2s`
 /// (n_θ=3) padded by 7 zero-truth columns (`p = 2 + 7 = 9`) lands exactly on
 /// `m = 12`.
 #[test]
@@ -7185,7 +7185,7 @@ fn newton_pirls_lands_on_the_mode_at_a_loose_band() {
 /// Gamma-log, NegativeBinomial-log}` × the three structured extras shapes, as
 /// `(family, shape label, nested children per parent, crossed levels)`.
 ///
-/// The shapes are the speed-grid catalogue's `nest2` and `int2x` classes plus
+/// The shapes are the speed campaign catalogue's `nest2` and `int2x` classes plus
 /// their combination: nested-only (`q_core = 3`, `e = 0`, the tail is skipped
 /// entirely), crossed-only (`q_core = 1`, `e = 6`, the rank-1 scalar downdate
 /// that is the production route at `q_core == 1`), and both (`q_core = 3`,
@@ -7408,7 +7408,7 @@ fn structured_dual_hessian_matches_central_fd_of_the_gradient() {
 // --- The AGQ branch inside `laplace_gradient`/`laplace_hessian` ---
 
 /// `{Binomial-logit, Poisson-log} × {int1, q2s}`, each paired with the `nagq`
-/// the speed-grid's AGQ-eligible cells use (`validation/campaigns/speed-grid/prep.R:297`,
+/// the speed campaign's AGQ-eligible cells use (`validation/campaigns/speed-campaign/prep.R:297`,
 /// `:309`) — `int1` at `k=7`, `q2s` at `k=5`. Both families/shapes satisfy the
 /// AGQ gate mirrored in `derivative.rs` (`nagq > 1 && extra_offsets.is_empty()
 /// && (1..=3).contains(&primary_q) && Binomial|Poisson`) and are canonical

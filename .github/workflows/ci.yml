@@ -284,7 +284,7 @@ jobs:
   # transposed — which is exactly the class of bug no single-language test can
   # see.
   #
-  # It runs the accuracy grid's `fast` subset (58 cells) through all three, then
+  # It runs the accuracy grid's `fast` subset (83 cells) through all three, then
   # compares with the grid's own comparator. No statistics package is installed:
   # --ports-only skips every oracle lookup, and jsonlite and Rcpp (compiler
   # glue, not a statistics engine) are the only R dependencies it has.

@@ -9,7 +9,7 @@
 # CLOCK: the user locks/unlocks (bench-l / bench-u) — this script only RECORDS
 # the state (no_turbo) into run_meta so unlocked timings can be excluded later.
 #
-#   ./run.sh glmm|mixedmodels|lme4 <pass-tag> [budget-seconds]
+#   ./run.sh glmm|glmm_wasm|mixedmodels|lme4 <pass-tag> [budget-seconds]
 # Budget is per-cell (not per-fit), 240 s by default for all three engines,
 # and is not scaled by fits-per-cell. glmm treats it as a soft budget:
 # fit_cell (fit.rs) decides predictively whether to start another fit and
@@ -51,6 +51,17 @@ case "$ENGINE" in
                # in-process protocol — their per-launch startup/JIT cost
                # dwarfs a per-fit budget.
                export GRID_ONE_CELL=1 ;;
+  glmm_wasm)   # The glmm driver built for wasm32-wasip1 with simd128 (the
+               # build MCPower ships), run under wasmtime. Same soft budget and
+               # one-cell-per-launch protocol as glmm above — change together.
+               # WASI passes no host environment unless named, so every GRID_*
+               # variable fit.rs reads is forwarded.
+               WASM="$ROOT/../target/wasm32-wasip1/release/examples/grid_fit.wasm"
+               TIMEOUT=$((BUDGET + 60))
+               export GRID_CELL_BUDGET="$BUDGET" GRID_ONE_CELL=1 GRID_ONLY="${GRID_ONLY:-}"
+               CMD=(wasmtime run --dir /::/ --env GRID_OUT --env GRID_MANIFEST
+                    --env GRID_CONFIG_TAG --env GRID_ONLY --env GRID_ONE_CELL
+                    --env GRID_CELL_BUDGET "$WASM") ;;
   mixedmodels) CMD=(julia --project="$ROOT" "$HERE/fit.jl")
                # Hard kill: fit.jl's JIT warm-up wall means nothing as a
                # partial result, so the watchdog IS the enforcement.
@@ -73,6 +84,9 @@ GRACE="${GRID_STARTUP_GRACE:-$((TIMEOUT + 180))}"
 # output writes, which would read as a per-fit timeout and kill the compiler.
 [ "$ENGINE" = "glmm" ] && cargo build --quiet --release \
   --manifest-path "$ROOT/../Cargo.toml" -p validation --example grid_fit "${FEATFLAGS[@]}"
+[ "$ENGINE" = "glmm_wasm" ] && RUSTFLAGS="-C target-feature=+simd128" cargo build --quiet \
+  --release --target wasm32-wasip1 --manifest-path "$ROOT/../Cargo.toml" -p validation \
+  --example grid_fit
 
 # clock state into run meta (recorded, never set — user's bench-l/bench-u)
 NO_TURBO=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo "?")

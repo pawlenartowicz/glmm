@@ -40,7 +40,7 @@ V <- grid_versions(env$grid_dir)
 # two compare equal in assert_pkg_version.
 ENGINE_VERSION <- assert_pkg_version("GLMMadaptive", V[["GLMMadaptive"]])
 
-# Tightened controls (speed-grid campaign precedent): mixed_model's DEFAULTS
+# Tightened controls (speed campaign precedent): mixed_model's DEFAULTS
 # under-converge on low-information cells. update_GH_every = 1 re-adapts the
 # quadrature grid every iteration, the like-for-like convention with glmm,
 # which re-adapts at every deviance evaluation. No eval cap: mixed_model has no

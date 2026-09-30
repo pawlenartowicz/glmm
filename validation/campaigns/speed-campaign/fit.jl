@@ -2,7 +2,7 @@
 # MixedModels side of the optimizer-grid campaign -> one JSONL line per cell.
 # Resume-safe (skips case_ids already in GRID_OUT); eval cap set per cell from
 # the manifest's pre-registered max_fun via optsum.maxfeval. Run inside the
-# pinned env: julia --project=GLMM/validation GLMM/validation/campaigns/speed-grid/fit.jl
+# pinned env: julia --project=GLMM/validation GLMM/validation/campaigns/speed-campaign/fit.jl
 using MixedModels, CSV, DataFrames, JSON3, LinearAlgebra
 
 # Per-cell hard timeout, enforced from inside Julia: run.sh's watchdog only

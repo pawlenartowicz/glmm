@@ -29,7 +29,7 @@ glmm = { path = "..", features = ["formula", "loop_advanced"] }
 counters = ["glmm/counters"]
 
 # No `parallel` passthrough: every example here fits serial. The one that wants
-# inner parallelism, campaigns/speed-grid/agq_par_probe.rs, asks for it on the
+# inner parallelism, campaigns/speed-campaign/agq_par_probe.rs, asks for it on the
 # dependency directly (`--features glmm/parallel`, see its header).
 
 [dev-dependencies]
@@ -39,18 +39,18 @@ serde_json = "1"
 [lints]
 workspace = true
 
-# The glmm side of the optimizer-grid campaign (campaigns/speed-grid/manifest.json,
+# The glmm side of the optimizer-grid campaign (campaigns/speed-campaign/manifest.json,
 # 585 cells): one JSONL record per cell, appended to $GRID_OUT. Shares
 # tools/common.rs with the examples below.
 [[example]]
 name = "grid_fit"
-path = "campaigns/speed-grid/fit.rs"
+path = "campaigns/speed-campaign/fit.rs"
 
 # Mismatch-adjudication driver: evaluates/minimizes the LMM profiled-REML objective
 # at caller-chosen θ/schedules through the dev-only loop_advanced seam.
 [[example]]
 name = "theta_eval"
-path = "campaigns/speed-grid/theta_eval.rs"
+path = "campaigns/speed-campaign/theta_eval.rs"
 
 # Fits one memory-measurement model (tools/memory/models.json + gen_models.py) from a
 # CSV path + formula string, for the memory harness (tools/memory/memory.sh) to wrap
@@ -63,7 +63,7 @@ path = "tools/memory/memory_fit.rs"
 # AGQ parallel_inner probe (see its header).
 [[example]]
 name = "agq_par_probe"
-path = "campaigns/speed-grid/agq_par_probe.rs"
+path = "campaigns/speed-campaign/agq_par_probe.rs"
 
 # Machine-local bit-identity baseline for refactors that must not change any
 # fitted number: fits all 49 manifest rungs and writes

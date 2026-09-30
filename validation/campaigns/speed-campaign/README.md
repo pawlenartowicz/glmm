@@ -1,4 +1,4 @@
-# speed-grid campaign
+# speed campaign
 
 ## What this is
 

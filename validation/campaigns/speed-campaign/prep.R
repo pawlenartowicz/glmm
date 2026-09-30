@@ -264,7 +264,7 @@ for (i in seq_along(cells))
 
 # ---- generate data + finalize manifest ----------------------------------------
 manifest <- list(schema = "glmm-grid-manifest/1",
-                 generated_by = "campaigns/speed-grid/prep.R",
+                 generated_by = "campaigns/speed-campaign/prep.R",
                  b1_seed_suffixes = paste0("s", 1:5),
                  cells = list())
 for (cell in cells) {

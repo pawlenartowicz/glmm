@@ -12,8 +12,8 @@ python/glmm/_native*.pyd
 # committed. All input CSVs under validation/data/ ARE committed (empirical from lme4/nlme
 # byte-for-byte; simulated frozen by bytes -- cargo test include_str! reads them,
 # incl. in CI).
-/validation/campaigns/speed-grid/data/
-/validation/campaigns/speed-grid/results/
+/validation/campaigns/speed-campaign/data/
+/validation/campaigns/speed-campaign/results/
 # measurement tools: per-run probe/test output and generated model data, regenerated
 # every run.
 /validation/tools/lanewidth/results/
@@ -30,5 +30,6 @@ python/glmm/_native*.pyd
 /validation/grid/runs/glmm/scratch/
 /validation/grid/runs/glmm_python/scratch/
 /validation/grid/runs/glmm_r/scratch/
+/validation/grid/runs/glmm_wasm/scratch/
 # run.sh launch logs for the long oracle passes.
 /validation/grid/*.log

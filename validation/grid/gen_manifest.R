@@ -447,7 +447,7 @@ oracles_of <- function(cell) {
 
   # GLMMadaptive: the AGQ oracle, and only that. It takes an AGQ cell with
   # EXACTLY ONE grouping factor, at the cell's nagq, which makes it the oracle
-  # for the vector-RE AGQ cells lme4 refuses. Four exclusions:
+  # for the vector-RE AGQ cells lme4 refuses. Five exclusions:
   #   - LAPLACE cells. Driven to nAGQ = 1 mixed_model does not land on a
   #     reliable optimum: measured on a Bernoulli pilot cell it returned a
   #     random-effect sd of 4.6e-16 and a log-likelihood 58 units worse than
@@ -460,8 +460,11 @@ oracles_of <- function(cell) {
   #     per-row prior weights, so a `weights_col` cell cannot be fitted here on
   #     the same convention as every other engine. Excluded rather than fitted
   #     on a different objective.
+  #   - a non-log Gamma link: GLMMadaptive::Gamma.fam() is log-link only, so
+  #     an inverse-link cell would be fitted as a different model.
   ma_ok <- !is.null(cell$nagq) &&
            cell$family != "gaussian" && cell$family != "inversegaussian" &&
+           !(cell$family == "gamma" && cell$link != "log") &&
            n_groups == 1L && is.null(cell$weights_col)
   if (ma_ok) o <- c(o, "GLMMadaptive")
   o
@@ -815,7 +818,7 @@ for (i in seq_along(cells))
   if (cells[[i]]$cell %in% PILOT_IDS) cells[[i]]$tags <- I("pilot")
 
 # ---- the fast set ------------------------------------------------------------
-# About 60 cells spanning family x structure x size, the subset CI can afford to
+# About 85 cells spanning family x structure x size, the subset CI can afford to
 # fit on every push and the only subset a timed run is allowed to use. Every
 # family and every structure class appears at least once, every empirical cell is
 # in, and a serial glmm pass over the set stays under a minute -- which is met by
@@ -871,10 +874,39 @@ FAST_IDS <- unique(c(
   #     boundary of the parameter space stay under test.
   vapply(c("boundary", "nearzero"), function(r) need(paste("binomial", r),
     pick(function(c) identical(c$structure, "int1") && identical(c$family, "binomial") &&
-      identical(c$regime, r))), ""),
-  # (7) one AGQ cell -> the nAGQ > 1 path.
-  need("scalar AGQ", pick(function(c) !is.null(c$nagq) && identical(c$structure, "int1")))
+      identical(c$regime, r))), "")
 ))
+# (7) the nAGQ = AGQ_K copy of every fast cell adaptive quadrature can fit, so a
+# timed run times each such cell under both Laplace and AGQ. The shape rule
+# mirrors the kernel's nagq > 1 gate (src/fit/common.rs, assert_model_shape):
+# binomial / Poisson / NB / Gamma, one grouping factor, at most 3 random effects
+# per group -- change together. A generated copy is a generated cell of its own
+# (own id, seed and CSV), built exactly as the section-5 AGQ cells are, and
+# reuses one of them when it already exists. A read-in copy reads the same CSV
+# under the id <name>_agq<K>.
+agq_ok <- function(c) {
+  s <- re_shape(c)
+  is.null(c$nagq) && s$n_groups == 1L && s$q1 <= 3L &&
+    c$family %in% c("binomial", "poisson", "negativebinomial", "gamma")
+}
+for (c in Filter(function(c) c$cell %in% FAST_IDS && agq_ok(c), cells)) {
+  if (!is.null(c$seed)) {
+    arm <- Find(function(a) identical(a$family, c$family) &&
+                  identical(a$link, c$link) && same_form(c, a), ARMS)
+    id <- cell_id_of(modifyList(c, list(nagq = AGQ_K)), arm$tag)
+    if (!(id %in% vapply(cells, `[[`, "", "cell")))
+      add_generated(arm, c$structure, c$n_obs, c$per_group, c$balance, c$regime,
+                    nagq = AGQ_K, offset_col = c$offset_col, weights_col = c$weights_col)
+  } else {
+    id <- sprintf("%s_agq%d", c$cell, AGQ_K)
+    c0 <- c
+    c0[c("tags", "oracles", "ma_fixed", "ma_random")] <- NULL
+    c0$cell <- id
+    c0$nagq <- AGQ_K
+    emit_cell(c0)
+  }
+  FAST_IDS <- c(FAST_IDS, id)
+}
 stopifnot("FAST_IDS names a cell that does not exist" =
   all(FAST_IDS %in% vapply(cells, `[[`, "", "cell")))
 # A `fast` generated cell's CSV lives in data/fast/, which is committed because
@@ -913,7 +945,8 @@ stopifnot("no cell carries a max_fun field" =
 # every committed CSV is either read by a cell or named in FIXTURE_SKIPPED.
 # Without this, a fixture drops out of the grid silently and the only symptom is
 # a smaller cell count nobody was counting.
-fixture_cells <- Filter(function(c) is.null(c$seed) &&
+# A read-in AGQ copy carries its parent's truth, so only the parents are checked.
+fixture_cells <- Filter(function(c) is.null(c$seed) && is.null(c$nagq) &&
                           startsWith(c$data, "../data/simulated/"), cells)
 fx_ids <- vapply(fixture_cells, `[[`, "", "cell")
 in_truth <- fx_ids %in% names(FIXTURE_TRUTH)
@@ -953,7 +986,7 @@ stopifnot("pilot misses an oracle" =
 # The fast set: size, the empirical members the subset is required to carry, and
 # the two spans it is chosen for.
 fast <- Filter(function(c) "fast" %in% c$tags, cells)
-stopifnot("fast set is not ~60 cells" = { n <- length(fast); n >= 50 && n <= 80 })
+stopifnot("fast set is not ~85 cells" = { n <- length(fast); n >= 50 && n <= 90 })
 stopifnot("fast is missing an empirical cell" =
   all(EMPIRICAL_IDS %in% vapply(fast, `[[`, "", "cell")))
 stopifnot("fast misses a family" =

@@ -4,7 +4,7 @@ Two finished studies. Their **conclusions** are frozen in each campaign's
 committed `reports/`; their raw run output is gitignored (regenerable). The
 scripts stay maintained so each can be rerun after major solver work.
 
-## speed-grid — optimizer cost across the grid
+## speed-campaign — optimizer cost across the grid
 
 **Question:** where does glmm's BOBYQA spend evaluations, and how does wall
 time compare to MixedModels.jl (and lme4 where feasible) across structure ×

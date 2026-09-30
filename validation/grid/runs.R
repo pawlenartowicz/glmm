@@ -123,7 +123,7 @@ newest_oracle_run <- function(grid_dir, oracle, want_version, required_cells) {
 # PREFERRED, newest first; anything else is a fallback used only when no full run
 # exists. Without that preference, a `--fast` port-gate run made minutes after
 # the full baseline would be "the newest run under runs/glmm/" and the campaign's
-# final adjudication would silently gate 60 cells against four full oracle
+# final adjudication would silently gate only the fast cells against four full oracle
 # references. Whatever it picks, it PRINTS -- directory, subset and label -- so
 # the choice is never invisible.
 newest_glmm_run <- function(grid_dir, engine = "glmm", override = NULL) {

@@ -1,7 +1,7 @@
 {
   "schema": "glmm-accuracy-grid/1",
   "generated_by": "grid/gen_manifest.R",
-  "generated": "2026-09-27",
+  "generated": "2026-09-29",
   "cells": [
     {
       "cell": "lmm_int1_g3000p20_bal_base",
@@ -35965,7 +35965,7 @@
       "balance": "bal",
       "regime": "base",
       "seed": 1043491,
-      "data": "data/pois_int1_g3000p20_bal_base_agq7.csv",
+      "data": "data/fast/pois_int1_g3000p20_bal_base_agq7.csv",
       "factors": ["g1"],
       "n_x": 1,
       "response": "y",
@@ -35977,7 +35977,7 @@
       "nagq": 7,
       "reml": false,
       "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
-      "tags": [],
+      "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
         "beta": [0.4, 0.8],
@@ -36050,7 +36050,7 @@
       "balance": "bal",
       "regime": "base",
       "seed": 1043350,
-      "data": "data/gaml_int1_g3000p20_bal_base_agq7.csv",
+      "data": "data/fast/gaml_int1_g3000p20_bal_base_agq7.csv",
       "factors": ["g1"],
       "n_x": 1,
       "response": "y",
@@ -36062,7 +36062,7 @@
       "nagq": 7,
       "reml": false,
       "oracles": ["glmmTMB", "GLMMadaptive"],
-      "tags": [],
+      "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
         "beta": [0.4, 0.8],
@@ -36135,7 +36135,7 @@
       "balance": "bal",
       "regime": "base",
       "seed": 865856,
-      "data": "data/nb_int1_g3000p20_bal_base_agq7.csv",
+      "data": "data/fast/nb_int1_g3000p20_bal_base_agq7.csv",
       "factors": ["g1"],
       "n_x": 1,
       "response": "y",
@@ -36147,7 +36147,7 @@
       "nagq": 7,
       "reml": false,
       "oracles": ["glmmTMB", "GLMMadaptive"],
-      "tags": [],
+      "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
         "beta": [0.4, 0.8],
@@ -39312,6 +39312,892 @@
       "tags": [],
       "truth_why": "tools/prep/gen_illcond_data.R: the same LCG uniform draws as sim_dynrange_lmm, and t and v are entangled to 3e-6 so neither slope is separately identified",
       "dev_ref": "t and v are entangled to 3e-6 (tools/prep/gen_illcond_data.R), so lme4, glmmTMB and glmm each converge to a slightly different theta and their own reported REML criterion carries round-off of 1e-4 to 7e-4 against the true optimum -- above dev_eps even though all three theta agree with each other to 1e-10 on the true objective"
+    },
+    {
+      "cell": "bina_int1_g3000p20_bal_base_agq7",
+      "family": "binomial",
+      "link": "logit",
+      "form": "trials",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 1043210,
+      "data": "data/fast/bina_int1_g3000p20_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(prop ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "prop ~ x1 + (1 | g1)",
+      "ma_fixed": "cbind(incidence, size - incidence) ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "weights": "size",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "prbb_int1_g3000p20_bal_base_agq7",
+      "family": "binomial",
+      "link": "probit",
+      "form": "bernoulli",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 1043168,
+      "data": "data/fast/prbb_int1_g3000p20_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "prba_int1_g3000p20_bal_base_agq7",
+      "family": "binomial",
+      "link": "probit",
+      "form": "trials",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 1043152,
+      "data": "data/fast/prba_int1_g3000p20_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(prop ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "prop ~ x1 + (1 | g1)",
+      "ma_fixed": "cbind(incidence, size - incidence) ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "weights": "size",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "cllb_int1_g3000p20_bal_base_agq7",
+      "family": "binomial",
+      "link": "cloglog",
+      "form": "bernoulli",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 1043221,
+      "data": "data/fast/cllb_int1_g3000p20_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "clla_int1_g3000p20_bal_base_agq7",
+      "family": "binomial",
+      "link": "cloglog",
+      "form": "trials",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 1043205,
+      "data": "data/fast/clla_int1_g3000p20_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(prop ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "prop ~ x1 + (1 | g1)",
+      "ma_fixed": "cbind(incidence, size - incidence) ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "weights": "size",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "gami_int1_g3000p20_bal_base_agq7",
+      "family": "gamma",
+      "link": "inverse",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 1043302,
+      "data": "data/fast/gami_int1_g3000p20_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["glmmTMB"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [20, 0.4],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": 0.5,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "binb_int1_g60p5_bal_base_agq7",
+      "family": "binomial",
+      "link": "logit",
+      "form": "bernoulli",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 802858,
+      "data": "data/fast/binb_int1_g60p5_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "binb_int1_g300p5_bal_base_agq7",
+      "family": "binomial",
+      "link": "logit",
+      "form": "bernoulli",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 300,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 879256,
+      "data": "data/fast/binb_int1_g300p5_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "binb_int1_g300p20_bal_base_agq7",
+      "family": "binomial",
+      "link": "logit",
+      "form": "bernoulli",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 300,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 957625,
+      "data": "data/fast/binb_int1_g300p20_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "binb_q2s_g60p5_bal_base_agq7",
+      "family": "binomial",
+      "link": "logit",
+      "form": "bernoulli",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 725405,
+      "data": "data/fast/binb_q2s_g60p5_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 + x1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "pois_int1_g60p5_bal_base_agq7",
+      "family": "poisson",
+      "link": "log",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 803123,
+      "data": "data/fast/pois_int1_g60p5_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "pois_q2s_g60p5_bal_base_agq7",
+      "family": "poisson",
+      "link": "log",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 725670,
+      "data": "data/fast/pois_q2s_g60p5_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 + x1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "gaml_int1_g60p5_bal_base_agq7",
+      "family": "gamma",
+      "link": "log",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 802982,
+      "data": "data/fast/gaml_int1_g60p5_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": 0.5,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "gaml_q2s_g60p5_bal_base_agq7",
+      "family": "gamma",
+      "link": "log",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 725529,
+      "data": "data/fast/gaml_q2s_g60p5_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 + x1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": 0.5,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "nb_int1_g60p5_bal_base_agq7",
+      "family": "negativebinomial",
+      "link": "log",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 651336,
+      "data": "data/fast/nb_int1_g60p5_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": 1.5
+      }
+    },
+    {
+      "cell": "nb_q2s_g60p5_bal_base_agq7",
+      "family": "negativebinomial",
+      "link": "log",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 584087,
+      "data": "data/fast/nb_q2s_g60p5_bal_base_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 + x1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": 1.5
+      }
+    },
+    {
+      "cell": "binb_int1_g3000p20_bal_nearzero_agq7",
+      "family": "binomial",
+      "link": "logit",
+      "form": "bernoulli",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "nearzero",
+      "seed": 1557823,
+      "data": "data/fast/binb_int1_g3000p20_bal_nearzero_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.02],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "binb_int1_g3000p20_bal_boundary_agq7",
+      "family": "binomial",
+      "link": "logit",
+      "form": "bernoulli",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "boundary",
+      "seed": 1556763,
+      "data": "data/fast/binb_int1_g3000p20_bal_boundary_agq7.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "ma_fixed": "y ~ 1 + x1",
+      "ma_random": "~ 1 | g1",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "cbpp_agq7",
+      "family": "binomial",
+      "link": "logit",
+      "n_theta": 1,
+      "n_obs": 56,
+      "data": "../data/empirical/cbpp.csv",
+      "factors": ["herd", "period"],
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)",
+      "jl_formula": "@formula(prop ~ 1 + period + (1 | herd))",
+      "glmm_formula": "prop ~ period + (1 | herd)",
+      "ma_fixed": "cbind(incidence, size - incidence) ~ 1 + period",
+      "ma_random": "~ 1 | herd",
+      "weights": "size",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth_why": "empirical data; no generating parameter vector"
+    },
+    {
+      "cell": "cbpp_probit_agq7",
+      "family": "binomial",
+      "link": "probit",
+      "n_theta": 1,
+      "n_obs": 56,
+      "data": "../data/empirical/cbpp.csv",
+      "factors": ["herd", "period"],
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + period + (1 | herd)",
+      "jl_formula": "@formula(prop ~ 1 + period + (1 | herd))",
+      "glmm_formula": "prop ~ period + (1 | herd)",
+      "ma_fixed": "cbind(incidence, size - incidence) ~ 1 + period",
+      "ma_random": "~ 1 | herd",
+      "weights": "size",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth_why": "empirical data; no generating parameter vector"
+    },
+    {
+      "cell": "glmm_poisson_agq7",
+      "family": "poisson",
+      "link": "log",
+      "n_theta": 1,
+      "n_obs": 300,
+      "data": "../data/simulated/glmm_poisson.csv",
+      "factors": ["g"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g))",
+      "glmm_formula": "y ~ x + (1 | g)",
+      "weights_col": "w",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [0.4, 0.4],
+        "varcomp": [
+          {
+            "group": "g",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "sim_binomial_zerosd_agq7",
+      "family": "binomial",
+      "link": "logit",
+      "n_theta": 1,
+      "n_obs": 160,
+      "data": "../data/simulated/sim_binomial_zerosd.csv",
+      "factors": ["g"],
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x + z + (1 | g)",
+      "jl_formula": "@formula(prop ~ 1 + x + z + (1 | g))",
+      "glmm_formula": "prop ~ x + z + (1 | g)",
+      "ma_fixed": "cbind(incidence, size - incidence) ~ 1 + x + z",
+      "ma_random": "~ 1 | g",
+      "weights": "size",
+      "nagq": 7,
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "GLMMadaptive"],
+      "tags": ["fast"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x", "z"],
+        "beta": [0.3, 0.5, -0.4],
+        "varcomp": [
+          {
+            "group": "g",
+            "terms": ["(Intercept)"],
+            "stddev": [0],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
     }
   ]
 }

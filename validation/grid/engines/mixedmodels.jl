@@ -5,7 +5,7 @@
 # message/coef_names/beta/se_rx/varcomp/sigma/nb_theta/loglik/deviance/n_eval/
 # wall_seconds/fits_per_sample), plus se_hessian on a non-gaussian GLM cell, where
 # GLM.jl's one SE method fills both slots. Adapted from
-# validation/campaigns/speed-grid/fit.jl, which is where the manifest read, the
+# validation/campaigns/speed-campaign/fit.jl, which is where the manifest read, the
 # resume scan, the construct-then-fit! shape, varcomp_of, the has_nonfinite guard,
 # the per-cell try/catch and the append-and-flush writer come from.
 #

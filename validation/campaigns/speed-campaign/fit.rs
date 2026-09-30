@@ -17,9 +17,9 @@ const DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 fn main() {
     let manifest_path = std::env::var("GRID_MANIFEST")
-        .unwrap_or_else(|_| format!("{DIR}/campaigns/speed-grid/manifest.json"));
+        .unwrap_or_else(|_| format!("{DIR}/campaigns/speed-campaign/manifest.json"));
     let out_path = std::env::var("GRID_OUT")
-        .unwrap_or_else(|_| format!("{DIR}/campaigns/speed-grid/results/glmm_shipped.jsonl"));
+        .unwrap_or_else(|_| format!("{DIR}/campaigns/speed-campaign/results/glmm_shipped.jsonl"));
     let tag = std::env::var("GRID_CONFIG_TAG").unwrap_or_default();
     let only = std::env::var("GRID_ONLY").unwrap_or_default();
     // One cell per process (run.sh sets this for the glmm engine only — the

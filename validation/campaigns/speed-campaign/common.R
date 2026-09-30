@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-# Shared readers and the one agreement band the speed-grid analysis scripts use.
+# Shared readers and the one agreement band the speed campaign analysis scripts use.
 # Sourced by analyze.R and counters.R; nothing else reads it.
 #
 # JSONL records and manifest cells are keyed on `case_id`, which is this
