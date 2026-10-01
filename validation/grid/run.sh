@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The one runner for every accuracy-grid engine.
 #
-#   ./run.sh <engine> [--fast] [--timed[=N]] [--jobs N] [--label TEXT] [--keep] [cell ...]
+#   ./run.sh <engine> [--fast] [--timed[=N]] [--jobs N] [--label TEXT] [--keep]
+#            [--complete-from DIR] [cell ...]
 #
 #   engine   glmm | glmm_wasm | glmm_python | glmm_r | lme4 | glmmtmb | glmmadaptive | mixedmodels
 #            (glmm_wasm: the glmm engine built for wasm32-wasip1 with simd128, run
@@ -18,6 +19,12 @@
 #            run_meta and slugged into the directory name.
 #   --keep   a glmm / glmm_wasm / glmm_python / glmm_r run lands in runs/<engine>/ instead of
 #            runs/<engine>/scratch/. Oracle runs are always kept.
+#   --complete-from DIR  oracle engines, full runs only: seed the new run with
+#            DIR's records and fit only the manifest cells DIR has no record for,
+#            so cells added to the manifest do not cost a whole-grid rerun. DIR
+#            must be a full, untimed run of the same engine at the same version;
+#            the new run is a full run and records DIR as `completed_from`. The
+#            copied records are only valid while those cells' data are unchanged.
 #   cell ... restrict to the named cells; validated against manifest.json, so an
 #            unknown name fails loudly before anything is fit.
 #
@@ -52,6 +59,7 @@ TIMED_UNLOCKED=0
 JOBS=1
 LABEL=""
 KEEP=0
+COMPLETE_FROM=""
 # Per-cell watchdog budget in seconds. Used ONLY by the watchdog below and never
 # exported: no engine caps its own fits. 600 rather than the speed
 # campaign's 240 because the grid's 30000-row wide cells are the slowest fits in
@@ -68,6 +76,8 @@ while [[ $# -gt 0 ]]; do
     --label) LABEL="${2:?--label needs text}"; shift 2 ;;
     --label=*) LABEL="${1#*=}"; shift ;;
     --keep) KEEP=1; shift ;;
+    --complete-from) COMPLETE_FROM="${2:?--complete-from needs a run directory}"; shift 2 ;;
+    --complete-from=*) COMPLETE_FROM="${1#*=}"; shift ;;
     --) shift; break ;;
     -*) echo "unknown flag: $1" >&2; exit 2 ;;
     *) break ;;
@@ -201,6 +211,23 @@ case "$ENGINE" in
   glmm_r)      ENGINE_VERSION="$(Rscript -e 'cat(as.character(packageVersion("fastglmm")))')" ;;
 esac
 
+# ---- --complete-from: the seed run must be what a full run of this engine is --
+# Checked before the run directory exists, so a refused seed leaves nothing behind.
+if [[ -n "$COMPLETE_FROM" ]]; then
+  [[ "$SUBSET" == full ]] \
+    || { echo "--complete-from completes a full run: drop --fast, --timed and cell names" >&2; exit 2; }
+  [[ -n "$ENGINE_MANIFEST_NAME" ]] \
+    || { echo "--complete-from is for oracle engines; glmm and its ports always fit every cell" >&2; exit 2; }
+  COMPLETE_FROM="$(cd "$COMPLETE_FROM" 2>/dev/null && pwd)" \
+    || { echo "--complete-from: no such directory" >&2; exit 2; }
+  [[ -f "$COMPLETE_FROM/run_meta.json" && -f "$COMPLETE_FROM/results.jsonl" ]] \
+    || { echo "--complete-from: $COMPLETE_FROM is not a run directory" >&2; exit 2; }
+  jq -e --arg eng "$ENGINE" --arg ver "$ENGINE_VERSION" \
+    '.engine == $eng and .engine_version == $ver and .subset == "full" and .timed == null' \
+    "$COMPLETE_FROM/run_meta.json" >/dev/null \
+    || { echo "--complete-from: $COMPLETE_FROM is not a full, untimed $ENGINE $ENGINE_VERSION run" >&2; exit 2; }
+fi
+
 # ---- run directory: never overwritten --------------------------------------
 slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g; s/^-//; s/-$//'; }
 # GRID_MACHINE names the machine in run_meta and the directory name. It comes
@@ -251,7 +278,7 @@ write_run_meta() {   # $1 = the cell_list JSON array
     --arg crate "$crate" --arg rev "$rev" --arg subset "$SUBSET" \
     --arg no_turbo "$no_turbo" --arg pin "$PIN_CORES" \
     --arg loadavg "$loadavg" --arg r "$r_ver" --arg jl "$jl_ver" \
-    --arg label "$LABEL" \
+    --arg label "$LABEL" --arg completed_from "${COMPLETE_FROM#"$GRID"/}" \
     --argjson timed "${TIMED_N:-null}" \
     --argjson unlocked "$([[ "$TIMED_UNLOCKED" == 1 ]] && echo true || echo false)" \
     --argjson jobs "$JOBS" --argjson cells "${#SELECTED[@]}" \
@@ -261,7 +288,8 @@ write_run_meta() {   # $1 = the cell_list JSON array
       timed: $timed, timed_unlocked: $unlocked, no_turbo: $no_turbo,
       pin_cores: $pin, jobs: $jobs, loadavg_start: $loadavg,
       r_version: $r, julia_version: $jl, label: $label, cells: $cells,
-      cell_list: $cell_list}' \
+      cell_list: $cell_list,
+      completed_from: (if $completed_from == "" then null else $completed_from end)}' \
     > "$RUN_DIR/run_meta.json"
   [[ -z "$TIMED_N" || "$no_turbo" == "1" ]] || echo \
     "   WARNING: clock NOT locked (no_turbo=$no_turbo) -- this timed run is marked unlocked" >&2
@@ -395,6 +423,19 @@ run_worker() {   # $1 = part index
     fi
   done
 }
+
+# --complete-from: each worker's part file starts with the seed run's records for
+# that worker's cells, so the resume test (next_missing, and the engines' own
+# skip) leaves exactly the cells the seed lacks. Seed records for cells no longer
+# in the manifest are dropped here.
+if [[ -n "$COMPLETE_FROM" ]]; then
+  for ((i = 0; i < JOBS; i++)); do
+    jq -cR --argjson want "$(part_cells "$i" | jq -R . | jq -sc .)" \
+      'fromjson? | select(.cell as $c | $want | index($c))' \
+      "$COMPLETE_FROM/results.jsonl" > "$RUN_DIR/results.part$i.jsonl"
+  done
+  echo ">> seeded $(cat "$RUN_DIR"/results.part*.jsonl | wc -l) of ${#SELECTED[@]} cells from $COMPLETE_FROM"
+fi
 
 PIDS=()
 for ((i = 0; i < JOBS; i++)); do

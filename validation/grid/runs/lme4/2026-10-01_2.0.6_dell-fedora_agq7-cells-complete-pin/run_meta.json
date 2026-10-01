@@ -1,0 +1,21 @@
+{
+  "engine": "lme4",
+  "engine_version": "2.0.6",
+  "machine": "dell-fedora",
+  "date": "2026-10-01T14:09:07+02:00",
+  "glmm_crate_version": "0.4.1",
+  "glmm_git_rev": "27318ef3235d2597bae4ce73008e1b8c5222e900",
+  "subset": "full",
+  "timed": null,
+  "timed_unlocked": false,
+  "no_turbo": "0",
+  "pin_cores": "0-3",
+  "jobs": 4,
+  "loadavg_start": "3.48 2.65 2.40",
+  "r_version": "4.5.3",
+  "julia_version": "1.12.6",
+  "label": "agq7 cells complete pin",
+  "cells": 782,
+  "cell_list": [],
+  "completed_from": "runs/lme4/2026-09-23_2.0.6_dell-fedora_oracle-pin"
+}
