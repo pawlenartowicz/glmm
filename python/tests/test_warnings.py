@@ -15,16 +15,16 @@ _G = [f"g{i % 5}" for i in range(20)]
 _OFF = {"g0": -3.0, "g1": -1.5, "g2": 0.0, "g3": 1.5, "g4": 3.0}
 MIXED = {"x": _X, "g": _G, "y": [y + _OFF[g] for y, g in zip(_Y, _G)]}
 
-# A single fixture that raises four notes of three kinds from one call: two
-# argument_ignored notes (dispersion=, nagq= — both inapplicable on a
-# Gaussian model) plus the formula lowering's own unused_grouping_levels and
-# re_design_scale_spread, from one declared-but-empty group level ("g_mid",
-# between two used ones) and one random slope on a much larger scale than the
-# implicit intercept. Five groups, eight rows each — same shape as the Rust
-# fixture this mirrors (`re_design_scale_spread_note_fires_on_mismatched_slope_scale`,
-# src/fit/common_tests.rs). All four are lowering-time or argument-clearing
-# checks, not solver convergence, so the fit is deterministic and clean
-# (no singular/ill_conditioned notes to filter out).
+# A single fixture that raises three notes of two kinds from one call: two
+# argument_ignored notes (dispersion=, nagq=, both inapplicable on a Gaussian
+# model) plus the formula lowering's own unused_grouping_levels, from one
+# declared-but-empty group level ("g_mid", between two used ones). Five
+# groups, eight rows each, with a random slope on z, whose values sit far from
+# zero. All three are lowering-time or argument-clearing checks, not solver
+# convergence. The fit adds one caution of its own: y has no random slope, so
+# the slope's variance comes out at zero, and glmm compares standard
+# deviations on its internally standardized design, where that is a singular
+# fit (on the raw design z's distance from zero hid it).
 _PARITY_Z_SCALE = 1.0e4
 _PARITY_N_GROUPS = 5
 _PARITY_PER_GROUP = 8
@@ -149,7 +149,6 @@ def test_constructed_notes_store_with_their_tier_and_title():
         "evals": 0,
         "final_eval": False,
         "detail": "",
-        "ratio": float("nan"),
     }
     cases = [
         (
@@ -159,16 +158,6 @@ def test_constructed_notes_store_with_their_tier_and_title():
                 "Grouping factor 'g' has levels with no rows (z, w). They stay in the model with "
                 "random effects of exactly zero, but they are not counted in the number of "
                 "groups. Remove unused categories before fitting."
-            ),
-        ),
-        (
-            dict(base, kind="re_design_scale_spread", detail="g", ratio=4200.0),
-            glmm.ReDesignScaleWarning,
-            (
-                "The predictors with random slopes for 'g' are on very different scales (ratio "
-                "4.2e+03). The fit is not affected, but the reported random-effect standard "
-                "deviations are hard to compare. Rescaling these predictors makes them easier "
-                "to read."
             ),
         ),
         (
@@ -205,7 +194,7 @@ def test_constructed_notes_store_with_their_tier_and_title():
             (
                 "The final step that computes the reported results ran out of iterations. The "
                 "estimates and their standard errors may be less accurate than usual. "
-                "Try simplifying the random effects or rescaling the predictors."
+                "Try simplifying the random effects."
             ),
         ),
         (
@@ -388,7 +377,7 @@ _FIN = np.array([1.5, -2.0])
 _NAN = np.array([np.nan, np.nan])
 _NONE = np.zeros(2, dtype=bool)
 _Y = np.array(_Y)  # the varying 20-row response from the top of this file
-_ADVICE = "Try a simpler random-effects structure or rescale the predictors."
+_ADVICE = "Try a simpler random-effects structure or check for nearly collinear predictors."
 _SEARCH = (
     "The search for the variance estimates reached its step limit before it settled. "
     "{inner}The estimates shown are the best point found; they are often close, but this is "
@@ -751,9 +740,9 @@ def test_kind_table_matches_warnings_md():
 
 def test_port_parity_sequence_adds_three_more_kinds():
     # Same PARITY fixture and call in r/tests/testthat/test-warnings.R —
-    # change together. One fixture, four notes across three kinds
+    # change together. One fixture, three notes across two kinds
     # (argument_ignored fires twice, from two different arguments;
-    # unused_grouping_levels and re_design_scale_spread).
+    # unused_grouping_levels), plus the fit's own singular caution.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         m = glmm.fit(PARITY, "y ~ z + (1 + z | g)", dispersion=2.0, nagq=3)
@@ -761,8 +750,8 @@ def test_port_parity_sequence_adds_three_more_kinds():
     assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
         ("note", "argument_ignored", "Argument ignored"),
         ("note", "argument_ignored", "Argument ignored"),
+        ("caution", "singular", "Singular fit"),
         ("note", "unused_grouping_levels", "Unused grouping levels"),
-        ("note", "re_design_scale_spread", "Random-effect predictors on very different scales"),
     ]
 
 

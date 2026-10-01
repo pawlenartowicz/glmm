@@ -577,8 +577,8 @@ fn probe(
 
 /// Fit through the GLMM kernel, then difference its own deviance evaluator at
 /// exactly the point and seed the shipped FD pass differences. Mirrors
-/// `fit_glmm_build`'s workspace construction — the FD grid is only the shipped
-/// one if the design, scales and the built `M` columns come out the same way.
+/// `build_glmm`'s workspace construction — the FD grid is only the shipped
+/// one if the design and the built `M` columns come out the same way.
 fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     let (n, p) = (r.n, r.p);
     let re = sized.re.as_ref().expect("mixed rung");
@@ -604,8 +604,6 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     }
     ws.offset = r.opts.offset.clone();
     let x_mat = Mat::<f64>::from_fn(n, p, |i, j| r.x[i * p + j]);
-    ws.groupings
-        .set_slope_scales(x_mat.as_ref(), r.opts.weights.as_deref());
     fill_packed_cols(&mut ws, &ids.primary, &ids.extra, n);
     ws.pattern.structured_schur = if ws.layout == GlmmLayout::Structured {
         StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
@@ -639,6 +637,7 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
         &beta_start,
         n,
         WaldSe::Hessian,
+        crate::standardize::ColumnScaling::IDENTITY,
     );
     assert!(fit.converged, "{}: fit must converge", r.name);
     let mut se_shipped: Vec<f64> = (0..p).map(|j| ws.inference.var_diag[j].sqrt()).collect();

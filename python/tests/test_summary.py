@@ -129,7 +129,6 @@ def test_groups_count_excludes_unused_grouping_levels():
                     "evals": 0,
                     "final_eval": False,
                     "detail": "Subject: s9, s10",
-                    "ratio": math.nan,
                 }
             ],
         },

@@ -83,7 +83,7 @@
 #' **Diagnostic warnings carry a condition class.** Each solver note is raised
 #' as a warning of class `"fastglmm_diagnostic"` with a per-kind subclass
 #' (`"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`,
-#' `"fastglmm_unused_grouping_levels"`, `"fastglmm_re_design_scale_spread"`,
+#' `"fastglmm_unused_grouping_levels"`,
 #' `"fastglmm_single_level_grouping_dropped"`, `"fastglmm_hessian_se_fallback"`,
 #' `"fastglmm_exact_profile_fallback"`,
 #' `"fastglmm_non_integer_response"`, `"fastglmm_rows_dropped_na"`; a note from
@@ -497,7 +497,7 @@ fastglmm <- function(formula, data, family = gaussian(),
     #             stopped at its evaluation budget, where nothing is pinned at
     #             the capped endpoint.
     #   notes     list of list(kind=, columns=, pivot=, evals=, final_eval=,
-    #             detail=, ratio=); `columns` is
+    #             detail=); `columns` is
     #             1-based into `names`. Each is raised as a classed warning by
     #             the call above. An absent note means "not detected", never
     #             "checked and clean": the GLMM routes record no pivot, and
@@ -574,7 +574,6 @@ fastglmm <- function(formula, data, family = gaussian(),
   rows_dropped_na = c("caution", "Rows dropped for missing values"),
   argument_ignored = c("note", "Argument ignored"),
   unused_grouping_levels = c("note", "Unused grouping levels"),
-  re_design_scale_spread = c("note", "Random-effect predictors on very different scales"),
   single_level_grouping_dropped = c("note", "Random effect dropped (single level)")
 )
 # A kernel note this wrapper has no entry for keeps its own kind string.
@@ -640,15 +639,14 @@ fastglmm <- function(formula, data, family = gaussian(),
 # together.
 #
 # Classes: "fastglmm_ill_conditioned", "fastglmm_pirls_exhausted",
-# "fastglmm_unused_grouping_levels", "fastglmm_re_design_scale_spread",
+# "fastglmm_unused_grouping_levels",
 # "fastglmm_single_level_grouping_dropped", "fastglmm_hessian_se_fallback",
 # "fastglmm_exact_profile_fallback",
 # "fastglmm_nb_shape_unsettled", "fastglmm_unknown_note" - all inheriting
 # "fastglmm_diagnostic", so one handler catches the whole channel. Not every
-# note comes from the solver: "unused_grouping_levels",
-# "re_design_scale_spread" and "single_level_grouping_dropped" are raised by
-# the formula lowering, which is the only layer that sees both the declared
-# levels/design and the per-row codes.
+# note comes from the solver: "unused_grouping_levels" and
+# "single_level_grouping_dropped" are raised by the formula lowering, which is
+# the only layer that sees both the declared levels and the per-row codes.
 .note_warning <- function(note, coef_names, converged) {
   if (identical(note$kind, "ill_conditioned")) {
     # `columns` arrives 1-based from the shim, so it indexes `coef_names`
@@ -688,7 +686,7 @@ fastglmm <- function(formula, data, family = gaussian(),
     msg <- paste(
       "The final step that computes the reported results ran out of iterations. The",
       "estimates and their standard errors may be less accurate than usual.",
-      "Try simplifying the random effects or rescaling the predictors.")
+      "Try simplifying the random effects.")
     cls <- c("fastglmm_pirls_exhausted", "fastglmm_diagnostic")
   } else if (identical(note$kind, "nb_shape_unsettled")) {
     msg <- sprintf(paste(
@@ -696,13 +694,6 @@ fastglmm <- function(formula, data, family = gaussian(),
       "rounds before it settled. The coefficients and standard errors are computed at the",
       "last value it reached, which may not be the best one."), as.integer(note$evals))
     cls <- c("fastglmm_nb_shape_unsettled", "fastglmm_diagnostic")
-  } else if (identical(note$kind, "re_design_scale_spread")) {
-    msg <- sprintf(paste(
-      "The predictors with random slopes for '%s' are on very different scales (ratio",
-      "%.3g). The fit is not affected, but the reported random-effect standard deviations",
-      "are hard to compare. Rescaling these predictors makes them easier to read."),
-      note$detail, note$ratio)
-    cls <- c("fastglmm_re_design_scale_spread", "fastglmm_diagnostic")
   } else if (identical(note$kind, "single_level_grouping_dropped")) {
     msg <- sprintf(paste(
       "Grouping factor '%s' has only one level, so no variance between groups can be",
@@ -809,7 +800,7 @@ fastglmm <- function(formula, data, family = gaussian(),
   }
   pirls <- vapply(notes, function(n) identical(n$kind, "pirls_exhausted"), logical(1))
   inner <- if (any(pirls)) .INNER_STEPS else character()
-  advice <- "Try a simpler random-effects structure or rescale the predictors."
+  advice <- "Try a simpler random-effects structure or check for nearly collinear predictors."
   if (is.finite(deviance) && all(is.finite(beta[!aliased]))) {
     return(list(kind = "search_limit", msg = paste(c(
       "The search for the variance estimates reached its step limit before it settled.",

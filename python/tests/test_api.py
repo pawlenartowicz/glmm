@@ -22,7 +22,6 @@ def test_module_surface():
         "NoCoefficientsWarning",
         "NonIntegerResponseWarning",
         "PirlsExhaustedWarning",
-        "ReDesignScaleWarning",
         "RowsDroppedWarning",
         "SearchLimitWarning",
         "SingleLevelGroupingDroppedWarning",

@@ -2,7 +2,7 @@
 //! `loop_advanced` hot path, so a change to glmm's model/routing lands in every
 //! caller identically and no caller can re-implement the routing and drift.
 //!
-//! Two reusable pieces, mirroring the existing `fit_glmm_build`/`_prebuilt`
+//! Two reusable pieces, mirroring the existing `build_glmm`/`fit_glmm_prebuilt`
 //! split: [`build_workspace`] classifies the design once (family × RE × solver)
 //! and allocates the per-shape [`FitWorkspace`]; [`fit_on`] accumulates + solves
 //! on that workspace and returns a lean borrowed [`FitView`]. `fit_warm` is
@@ -15,12 +15,13 @@
 use faer::Mat;
 
 use crate::glmm::GlmmWorkspace;
-use crate::lmm::LmmWorkspace;
+use crate::lmm::{LmmGroupings, LmmWorkspace};
+use crate::standardize::ColumnScaling;
 use crate::{BinomialLink, Family, GroupIds, GroupingRelation, ModelSpec, StartValues};
 
 use super::common::{
-    assert_group_ids, assert_model_shape, fill_col_major, unpermute_fit, warm_theta,
-    FitDiagnostics, Perm,
+    assert_group_ids, assert_model_shape, fill_col_major_std, start_to_design, theta_width,
+    unpermute_fit, warm_theta, FitDiagnostics, Perm,
 };
 use super::glm::GlmScratchBuf;
 use super::lmm::LmmResultView;
@@ -39,17 +40,25 @@ pub struct FitView<'a> {
     kind: FitViewKind<'a>,
     /// Grouping reorder the workspace was built under ([`FitWorkspace::perm`]).
     perm: Perm,
-    /// θ̂ mapped back to the caller's declaration order AND out of the solver's
-    /// internal RE column scaling. Filled only when `perm` reorders something or
-    /// some RE design column carries a scale other than exactly 1 — empty
-    /// otherwise, and then [`FitView::theta`] hands back the kernel's own slice
-    /// with no copy.
+    /// θ̂ mapped back to the caller's declaration order AND out of the column
+    /// standardization. Filled only when `perm` reorders something or a slope
+    /// column is standardized; empty otherwise, and then [`FitView::theta`]
+    /// hands back the kernel's own slice with no copy.
     ///
     /// Borrowed from [`FitWorkspace::theta_declared_buf`] rather than owned: the
-    /// scales are a function of the DRAW's design (`set_slope_scales` recomputes
-    /// them per call), so they cannot be frozen at build — but the storage can,
-    /// and that is what keeps a warm random-slope loop off the heap.
+    /// maps are a function of the DRAW's design (recomputed per call), so they
+    /// cannot be frozen at build — but the storage can, and that is what keeps a
+    /// warm random-slope loop off the heap.
     theta_declared: &'a [f64],
+    /// The caller's β̂ on the OLS/GLM routes, whose kernels keep β̃ on the
+    /// fitted design; borrowed from [`FitWorkspace::beta_caller`]. Empty on
+    /// the other routes, whose kernels report the caller's β̂ themselves.
+    betas_caller: &'a [f64],
+    /// `pinned` in the caller's coordinates, when a centered slope moved the
+    /// zero pattern of Λ away from the kernel's.
+    pinned_override: Option<u64>,
+    /// The fitted design's column map (`β = B·β̃`), for `into_fit`.
+    map: &'a ColumnScaling,
 }
 
 // The `Prebuilt` arm is ~2× the next-largest variant because it owns a whole
@@ -124,6 +133,15 @@ impl FitView<'_> {
     /// returned number is not evidence of a good fit, and counting only
     /// non-converged draws misses every draw that fit through badly conditioned.
     pub fn diagnostics(&self) -> FitDiagnostics {
+        let mut diag = self.kernel_diagnostics();
+        if let Some(mask) = self.pinned_override {
+            diag.pinned_components = mask;
+        }
+        diag
+    }
+
+    /// [`Self::diagnostics`] as the kernel reported them, in its coordinates.
+    fn kernel_diagnostics(&self) -> FitDiagnostics {
         match &self.kind {
             FitViewKind::Ols(v) => v.diagnostics(),
             FitViewKind::Glm(v) => v.diagnostics(),
@@ -155,8 +173,7 @@ impl FitView<'_> {
     /// Fixed-effect estimates β̂ (length `p`).
     pub fn betas(&self) -> &[f64] {
         match &self.kind {
-            FitViewKind::Ols(v) => v.betas,
-            FitViewKind::Glm(v) => v.betas,
+            FitViewKind::Ols(_) | FitViewKind::Glm(_) => self.betas_caller,
             FitViewKind::Lmm(v) => v.betas(),
             FitViewKind::Glmm(v) => v.betas(),
             FitViewKind::Prebuilt { fit, .. } => &fit.beta,
@@ -202,11 +219,18 @@ impl FitView<'_> {
 
     /// Estimator dispersion: LMM σ̂², GLMM `D̂[0][0]`, `Prebuilt` `Fit.dispersion`.
     /// OLS/GLM (never read here) report NaN.
+    ///
+    /// The GLMM's `D̂[0][0]` is the primary grouping's random-intercept
+    /// variance in the caller's units, `Λ₀₀²` of the caller's lower factor `Λ`
+    /// ([`Self::theta`]'s first entry): with a centered slope the kernel's own
+    /// `Λ₀₀` is the intercept at the column mean, not at `x = 0`. NaN when the
+    /// search ended without an endpoint.
     pub fn dispersion(&self) -> f64 {
         match &self.kind {
             FitViewKind::Ols(_) | FitViewKind::Glm(_) => f64::NAN,
             FitViewKind::Lmm(v) => v.dispersion(),
-            FitViewKind::Glmm(v) => v.dispersion(),
+            FitViewKind::Glmm(v) if v.has_endpoint() => self.theta()[0].powi(2),
+            FitViewKind::Glmm(_) => f64::NAN,
             FitViewKind::Prebuilt { fit, .. } => fit.dispersion,
         }
     }
@@ -263,10 +287,13 @@ impl FitView<'_> {
         opts: &FitOptions,
     ) -> Fit {
         let perm = self.perm;
+        let map = self.map;
+        // OLS / GLM: the caller's β̂ `FitView::new` already mapped.
+        let beta = self.betas_caller.to_vec();
         let mut fit = match self.kind {
-            FitViewKind::Ols(v) => super::ols::ols_view_to_fit(&v, x, y, n, p, opts),
+            FitViewKind::Ols(v) => super::ols::ols_view_to_fit(&v, beta, x, y, n, p, opts, map),
             FitViewKind::Glm(v) => {
-                super::glm::glm_view_to_fit(&v, y, model.family, f64::NAN, n, p, opts)
+                super::glm::glm_view_to_fit(&v, beta, y, model.family, f64::NAN, n, p, opts, map)
             }
             FitViewKind::Lmm(v) => super::lmm::lmm_view_to_fit(&v, x, ids, n, p, opts),
             FitViewKind::Glmm(v) => super::glmm::glmm_view_to_fit(&v, y, n, p, model, opts).0,
@@ -282,54 +309,77 @@ impl FitView<'_> {
 }
 
 impl<'a> FitView<'a> {
-    /// Wrap a solver's borrowed result under the workspace's grouping reorder,
-    /// materializing the declaration-order θ̂ once here so the hot-path accessor
-    /// stays a plain slice read.
-    fn new(kind: FitViewKind<'a>, perm: Perm, buf: &'a mut [f64]) -> Self {
+    /// Wrap a solver's borrowed result under the workspace's grouping reorder
+    /// and the draw's column map, materializing the caller's β̂ and the
+    /// declaration-order θ̂ once here so the hot-path accessors stay plain slice
+    /// reads.
+    fn new(
+        kind: FitViewKind<'a>,
+        perm: Perm,
+        theta_buf: &'a mut [f64],
+        beta_buf: &'a mut [f64],
+        re_scratch: &mut [f64],
+        map: &'a ColumnScaling,
+    ) -> Self {
         let mut view = FitView {
             kind,
             perm,
             theta_declared: &[],
+            betas_caller: &[],
+            pinned_override: None,
+            map,
         };
-        // The kernels minimize over the internally scaled θ̃ = s·θ
-        // (`LmmGroupings::set_slope_scales`); a caller carries θ̂ forward as a warm
-        // start, which is read in the design's own units, so the carry has to come
-        // out divided. Nothing is materialized when every scale is exactly 1 and
-        // the reorder is the identity — the intercept-only case, which is most of
-        // them — and then `theta()` hands back the kernel's own slice.
-        let scaled = view
+        // OLS / GLM kernels keep β̃ (the NB alternation and the GLMM seed reuse
+        // it on the fitted design); the caller's β goes into a workspace buffer.
+        let kernel_betas = match &view.kind {
+            FitViewKind::Ols(v) => Some(v.betas),
+            FitViewKind::Glm(v) => Some(v.betas),
+            _ => None,
+        };
+        if let Some(bt) = kernel_betas {
+            let p = bt.len();
+            beta_buf[..p].copy_from_slice(bt);
+            map.beta_to_caller(&mut beta_buf[..p]);
+            view.betas_caller = &beta_buf[..p];
+        }
+        // θ̂ out of the column standardization, then into declaration order: a
+        // caller carries θ̂ forward as a warm start, which is read in the
+        // design's own units. Nothing is materialized when no slope column is
+        // standardized and the reorder is the identity — the intercept-only
+        // case, which is most of them — and then `theta()` hands back the
+        // kernel's own slice.
+        let mapped = view
             .kernel_groupings()
-            .is_some_and(|g| g.any_slope_scaled());
-        if scaled || !perm.is_identity() {
+            .is_some_and(|g| g.any_column_std(map));
+        if mapped || !perm.is_identity() {
             let n_theta = view.kernel_theta().len();
-            // `buf` is two `n_theta` halves: θ̂ in declaration order, then the
-            // row scales to divide it by. Sized off this workspace's own θ
-            // width, so an over-envelope vech (a primary block past
-            // `MAX_PRIMARY_Q`, say) is as bounded as an intercept-only one, and
-            // the divide still costs the warm loop no heap block.
-            let (theta, scales) = buf.split_at_mut(n_theta);
-            theta.copy_from_slice(view.kernel_theta());
-            if scaled {
-                let scales = &mut scales[..n_theta];
-                view.kernel_groupings()
-                    .expect("scaled implies a θ-carrying route")
-                    .fill_theta_row_scales(scales);
-                for (t, &sc) in theta.iter_mut().zip(scales.iter()) {
-                    *t /= sc;
+            // Sized off this workspace's own θ width, so an over-envelope vech (a
+            // primary block past `MAX_PRIMARY_Q`, say) is as bounded as an
+            // intercept-only one, and the map costs the warm loop no heap block.
+            let theta = &mut theta_buf[..n_theta];
+            view.pinned_override = match view.kernel_groupings() {
+                // The mask is read in slot order, before the reorder below.
+                Some(g) if mapped => {
+                    let converged = view.kernel_diagnostics().converged;
+                    g.theta_to_caller(view.kernel_theta(), converged, theta, re_scratch, map)
                 }
-            }
-            // Scales are in kernel slot order, so they apply before the reorder.
+                _ => {
+                    theta.copy_from_slice(view.kernel_theta());
+                    None
+                }
+            };
+            // The maps are in kernel slot order, so they apply before the reorder.
             perm.swap_slots(theta);
-            view.theta_declared = &buf[..n_theta];
+            view.theta_declared = &theta_buf[..n_theta];
         }
         view
     }
 }
 
-/// Predictor-indexed Wald t² and Var(β̂_j) reconstructed from an assembled `Fit`
-/// for the [`FitViewKind::Prebuilt`] accessor surface. Slots whose `se` is not
-/// finite (non-target, non-converged) stay NaN.
-fn prebuilt_stats(fit: &Fit) -> (Vec<f64>, Vec<f64>) {
+/// An assembled `Fit` as a [`FitViewKind::Prebuilt`], with the predictor-indexed
+/// Wald t² and Var(β̂_j) of its accessor surface reconstructed from it. Slots
+/// whose `se` is not finite (non-target, non-converged) stay NaN.
+fn prebuilt_kind(fit: Fit) -> FitViewKind<'static> {
     let p = fit.beta.len();
     let mut t_sq = vec![f64::NAN; p];
     let mut var_diag = vec![f64::NAN; p];
@@ -340,7 +390,11 @@ fn prebuilt_stats(fit: &Fit) -> (Vec<f64>, Vec<f64>) {
             t_sq[j] = (fit.beta[j] / se).powi(2);
         }
     }
-    (t_sq, var_diag)
+    FitViewKind::Prebuilt {
+        fit,
+        t_sq,
+        var_diag,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -382,13 +436,29 @@ pub struct FitWorkspace {
     has_weights: bool,
     has_offset: bool,
     parallel_inner: bool,
-    /// Storage for [`FitView::theta_declared`] and the row scales it divides by,
-    /// `2 * n_theta` long: the first half is the θ̂ the view hands out, the second
-    /// half `FitView::new`'s scratch. Sized once at build off the built kernel's
-    /// own θ width, so the widest vech a design can carry is the widest this
-    /// holds. Sibling of `kind` for the same borrow reason `x_mat` is (a slice of
-    /// the solver workspace could not also be handed out alongside `&mut` to it).
+    /// Storage for [`FitView::theta_declared`], `n_theta` long. Sized once at
+    /// build off the built kernel's own θ width, so the widest vech a design can
+    /// carry is the widest this holds. Sibling of `kind` for the same borrow
+    /// reason `x_mat` is (a slice of the solver workspace could not also be
+    /// handed out alongside `&mut` to it).
     theta_declared_buf: Vec<f64>,
+    /// This draw's column statistics (`x̃ = (x − m)/s`), recomputed by every
+    /// `fit_on` call; sized `p` at build.
+    scaling: ColumnScaling,
+    /// Skip the per-draw standardization ([`FitWorkspace::set_prestandardized`]).
+    prestandardized: bool,
+    /// Storage for [`FitView::betas_caller`], as long as the OLS/GLM kernels'
+    /// β slices (`p.max(1)`).
+    beta_caller: Vec<f64>,
+    /// Scratch of the random-effect maps (`LmmGroupings::re_map_scratch_len`;
+    /// empty without θ): the start's forward map and `FitView::new`'s back-map.
+    re_map_scratch: Vec<f64>,
+    /// Column-major `x̃`, `n_max × p`, refilled by every `fit_on` call and read
+    /// by every route. A sibling of `kind`, not a field of a route's workspace:
+    /// `fit_ols_prebuilt`/`fit_glm_prebuilt` take `&mut Ols/GlmScratchBuf` and
+    /// return a view borrowing from it, so a `MatRef` sourced from a field of
+    /// that same workspace would be a second mutable borrow for the whole call.
+    x_mat: Mat<f64>,
     /// Slot-order copy of a caller's warm start, refilled per call on a
     /// reordering workspace. Its capacities are the only reason permuting a
     /// start costs no heap block, so never shrink or reallocate them.
@@ -402,33 +472,23 @@ pub struct FitWorkspace {
 // memory win.
 #[allow(clippy::large_enum_variant)]
 enum FitKind {
-    // `x_mat` is a sibling of the workspace, not a field of it: both
-    // `fit_ols_prebuilt`/`fit_glm_prebuilt` take `&mut Ols/GlmScratchBuf` and
-    // return a view borrowing from it, so a `MatRef` sourced from a field of
-    // that same workspace would be a second mutable borrow for the whole call
-    // — a hard error, not a lifetime puzzle. Sibling fields give `fit_on`
-    // disjoint borrows instead, exactly as `Glmm` already does below.
     Ols {
         ws: OlsWorkspace,
-        x_mat: Mat<f64>,
     },
     Glm {
         buf: GlmScratchBuf,
-        x_mat: Mat<f64>,
     },
     Lmm {
         ws: LmmWorkspace,
-        x_mat: Mat<f64>,
         // Offset-shifted y, filled only when `opts.offset` is set (per-call,
         // not frozen at build — unlike `x_mat` this buffer sits unused and
         // untouched on every offset-less call). Sibling of `ws` for the same
-        // borrow reason as `x_mat`: `accumulate_lmm_rows` takes `ws` mutably,
-        // so a slice of `ws` cannot also be its `y` argument.
+        // borrow reason as `FitWorkspace::x_mat`: `accumulate_lmm_rows` takes
+        // `ws` mutably, so a slice of `ws` cannot also be its `y` argument.
         y_shifted: Vec<f64>,
     },
     Glmm {
         ws: GlmmWorkspace,
-        x_mat: Mat<f64>,
     },
     /// Routes whose kernel allocates per call and returns a fully-assembled
     /// `Fit`: the NB routes (GLM-NB, GLMM-NB), which search `ln θ_NB` as an
@@ -442,6 +502,30 @@ enum FitKind {
 enum PrebuiltRoute {
     GlmNb,
     GlmmNb,
+}
+
+impl FitKind {
+    /// The θ routes' grouping structure, where the random-effect maps live.
+    fn groupings(&self) -> Option<&LmmGroupings> {
+        match self {
+            FitKind::Lmm { ws, .. } => Some(ws.kernel.groupings()),
+            FitKind::Glmm { ws, .. } => Some(&ws.groupings),
+            FitKind::Ols { .. } | FitKind::Glm { .. } | FitKind::Prebuilt(_) => None,
+        }
+    }
+}
+
+impl FitWorkspace {
+    /// Skip the per-draw column standardization: the design is fitted as given,
+    /// except that a random-slope column is divided by its prior-weighted root
+    /// mean square (as a 0/1 slope column is when standardizing), so the
+    /// random-effect search is not sensitive to its units. Same model; on
+    /// data far from standardized the fit is otherwise as sensitive to units
+    /// as the raw design makes it. Default `false`. Loop tier only;
+    /// `fit_cold`/`fit_warm` always standardize.
+    pub fn set_prestandardized(&mut self, on: bool) {
+        self.prestandardized = on;
+    }
 }
 
 #[cfg(test)]
@@ -490,6 +574,19 @@ impl FitWorkspace {
     }
 }
 
+/// Every column a random-effect block of `model` reads as a slope (none on a
+/// fixed-only spec), for [`ColumnScaling::with_re_slopes`].
+fn re_slope_columns(model: &ModelSpec) -> impl Iterator<Item = usize> + '_ {
+    model
+        .re
+        .iter()
+        .flat_map(|re| {
+            let extra = re.extra_groupings.iter().flat_map(|g| g.slopes.iter());
+            re.slopes.iter().chain(extra)
+        })
+        .map(|&c| c as usize)
+}
+
 /// Classify the (already level-count-sized) design once and allocate its
 /// workspace. `sized` and `perm` must be the first and third values
 /// `spec_sized_from_ids(model, ids)` returned together (or, for a spec whose RE
@@ -513,7 +610,6 @@ pub fn build_workspace(
     let kind = match (&sized.family, sized.re.as_ref()) {
         (Family::Gaussian, None) => FitKind::Ols {
             ws: OlsWorkspace::new(n_max, p, t, opts.weights.is_some()),
-            x_mat: Mat::<f64>::zeros(n_max.max(1), p.max(1)),
         },
         (Family::NegativeBinomial { .. }, None) => FitKind::Prebuilt(PrebuiltRoute::GlmNb),
         // Spelled out rather than `(_, None)` so adding a family (or a binomial
@@ -528,7 +624,6 @@ pub fn build_workspace(
             None,
         ) => FitKind::Glm {
             buf: GlmScratchBuf::new(n_max, p, t),
-            x_mat: Mat::<f64>::zeros(n_max.max(1), p.max(1)),
         },
         (family, Some(_)) => {
             let (slope_cols, extra_slope_cols) = super::glmm::re_slope_cols(sized);
@@ -546,7 +641,6 @@ pub fn build_workspace(
                         &extra_slope_cols,
                         solver == Solver::Sparse,
                     ),
-                    x_mat: Mat::<f64>::zeros(n_max.max(1), p.max(1)),
                     y_shifted: vec![0.0f64; n_max.max(1)],
                 },
                 Family::NegativeBinomial { .. } => FitKind::Prebuilt(PrebuiltRoute::GlmmNb),
@@ -559,8 +653,7 @@ pub fn build_workspace(
                         &extra_slope_cols,
                         opts.nagq,
                     );
-                    let x_mat = Mat::<f64>::zeros(n_max.max(1), p.max(1));
-                    FitKind::Glmm { ws, x_mat }
+                    FitKind::Glmm { ws }
                 }
             }
         }
@@ -605,6 +698,7 @@ pub fn build_workspace(
         FitKind::Glmm { ws, .. } => ws.n_theta,
         FitKind::Ols { .. } | FitKind::Glm { .. } | FitKind::Prebuilt(_) => 0,
     };
+    let re_len = kind.groupings().map_or(0, |g| g.re_map_scratch_len());
     FitWorkspace {
         n_max,
         p,
@@ -617,7 +711,12 @@ pub fn build_workspace(
         has_weights: opts.weights.is_some(),
         has_offset: opts.offset.is_some(),
         parallel_inner: opts.parallel_inner,
-        theta_declared_buf: vec![0.0; 2 * n_theta],
+        theta_declared_buf: vec![0.0; n_theta],
+        scaling: ColumnScaling::with_re_slopes(p, re_slope_columns(sized)),
+        prestandardized: false,
+        beta_caller: vec![0.0; p.max(1)],
+        re_map_scratch: vec![0.0; re_len],
+        x_mat: Mat::<f64>::zeros(n_max.max(1), p.max(1)),
         start_permuted: StartValues {
             beta: Vec::with_capacity(p),
             theta: Vec::with_capacity(crate::consts::MAX_THETA),
@@ -638,11 +737,8 @@ pub fn build_workspace(
 ///
 /// The data, however, is the caller's responsibility — `fit_warm` validates and
 /// salvages where `fit_on` trusts:
-/// - **Start values.** A short `start.theta` is zipped against θ and stops at the
-///   shorter, so the trailing entries keep the PREVIOUS fit's θ̂ (`ws.theta` is the
-///   in/out buffer) where a fresh workspace would hold the blind `THETA0`. Same
-///   for a short β start on the GLMM route. The call then answers differently
-///   depending on the workspace's age, through a different BOBYQA start.
+/// - **Start values.** A `start.beta` or `start.theta` of the wrong width is
+///   dropped: that component cold-starts.
 /// - **Weights and offsets.** A weights vector longer than `n` is accepted, but
 ///   `lmm_view_to_fit`'s `−Σ log wᵢ` correction sums the whole vector, so the LMM
 ///   deviance and loglik come out wrong. Non-finite weights or offsets propagate
@@ -729,57 +825,86 @@ pub fn fit_on<'a>(
         }
     }
 
-    // A `StartValues.theta` arrives in the caller's DECLARATION order — the
-    // order `FitView::theta` reports θ̂ in, so a warm-start carry round-trips —
-    // while the kernels index θ by slot. This is the input side of that pair;
-    // `unpermute_fit`/`FitView::theta` are the output side.
-    let perm = ws.perm;
+    let FitWorkspace {
+        kind,
+        scaling,
+        prestandardized,
+        theta_declared_buf,
+        beta_caller,
+        re_map_scratch,
+        x_mat,
+        start_permuted,
+        perm,
+        sized,
+        ..
+    } = ws;
+    let perm = *perm;
+    let sized: &ModelSpec = sized;
+
+    // Column statistics for this draw, once, before any route reads X: the fit
+    // runs on x̃ = (x − m)/s and reports through B and N (`standardize`).
+    scaling.compute(x, n, p, opts.weights.as_deref(), !*prestandardized);
+    let scaling: &'a ColumnScaling = scaling;
+    fill_col_major_std(x_mat, x, n, p, scaling);
+    let x_mat = x_mat.as_ref().subrows(0, n);
+
+    // Starts arrive in the caller's units and DECLARATION order — the order
+    // `FitView::theta` reports θ̂ in, so a warm-start carry round-trips — while
+    // the kernels index θ by slot and fit the standardized design. A component
+    // of the wrong width is dropped (a cold start for it), θ is moved to slot
+    // order, and on the θ routes both are mapped onto the standardized design
+    // (`start_to_design`; the GLMM-NB route maps inside `fit_glmm_nb`). This is
+    // the input side of the pair; `unpermute_fit`/`FitView::theta` are the
+    // output side.
+    let n_theta = theta_width(sized.re.as_ref());
+    let maps_start = kind.groupings().filter(|_| !scaling.is_identity());
+    let as_given = |s: &StartValues| {
+        (s.beta.is_empty() || s.beta.len() == p)
+            && (s.theta.is_empty() || (s.theta.len() == n_theta && perm.is_identity()))
+    };
     let start = match start {
-        Some(s) if !perm.is_identity() && !s.theta.is_empty() => {
-            // Refilled in place rather than cloned: on a reordering workspace
-            // this runs on every draw of a warm loop.
-            let dst = &mut ws.start_permuted;
+        Some(s) if maps_start.is_some() || !as_given(s) => {
+            // Refilled in place rather than cloned: on a reordering or
+            // standardizing workspace this runs on every draw of a warm loop.
+            let dst = start_permuted;
             dst.beta.clear();
-            dst.beta.extend_from_slice(&s.beta);
+            if s.beta.len() == p {
+                dst.beta.extend_from_slice(&s.beta);
+            }
             dst.theta.clear();
-            dst.theta.extend_from_slice(&s.theta);
-            perm.swap_slots(&mut dst.theta);
+            if s.theta.len() == n_theta {
+                dst.theta.extend_from_slice(&s.theta);
+                perm.swap_slots(&mut dst.theta);
+            }
+            if let Some(g) = maps_start {
+                start_to_design(dst, scaling, g, re_map_scratch);
+            }
             Some(&*dst)
         }
         unchanged => unchanged,
     };
 
-    let theta_buf: &mut [f64] = &mut ws.theta_declared_buf;
-    match &mut ws.kind {
-        FitKind::Ols { ws: ols_ws, x_mat } => {
-            fill_col_major(x_mat, x, n, p);
-            let v =
-                super::ols::fit_ols_prebuilt(ols_ws, x_mat.as_ref().subrows(0, n), y, n, p, opts);
-            FitView::new(FitViewKind::Ols(v), perm, theta_buf)
-        }
-        FitKind::Glm { buf, x_mat } => {
-            fill_col_major(x_mat, x, n, p);
-            let v = super::glm::fit_glm_prebuilt(
-                ws.sized.family,
-                f64::NAN,
-                x_mat.as_ref().subrows(0, n),
-                y,
-                opts,
-                buf,
-            );
-            FitView::new(FitViewKind::Glm(v), perm, theta_buf)
-        }
+    let kind = match kind {
+        FitKind::Ols { ws: ols_ws } => FitViewKind::Ols(super::ols::fit_ols_prebuilt(
+            ols_ws, x_mat, y, n, p, opts, scaling,
+        )),
+        FitKind::Glm { buf } => FitViewKind::Glm(super::glm::fit_glm_prebuilt(
+            sized.family,
+            f64::NAN,
+            x_mat,
+            y,
+            opts,
+            buf,
+            scaling,
+        )),
         FitKind::Lmm {
             ws: lmm_ws,
-            x_mat,
             y_shifted,
         } => {
-            fill_col_major(x_mat, x, n, p);
             // Identity-link offset as the exact y-shift before accumulation
             // (mirrors `fit_mle`); weights fold into the Gram accumulators.
-            // The identical collect lives at `fit/lmm.rs`'s `fit_mle` and
-            // `loop_advanced_seam.rs`'s `refit_lmm`, each carrying a "change
-            // together" comment — what those comments pin is the numerics
+            // The identical collect lives at `fit/lmm.rs`'s `fit_mle`, carrying a
+            // "change together" comment — what that comment pins is the numerics
             // (offset as an exact y-shift applied before accumulation), which is
             // unchanged here; this site only stops allocating, filling the
             // build-once `y_shifted` buffer with a plain loop instead of a fresh
@@ -795,7 +920,7 @@ pub fn fit_on<'a>(
             };
             super::lmm::accumulate_lmm_rows(
                 lmm_ws,
-                x_mat.as_ref().subrows(0, n),
+                x_mat,
                 y_eff,
                 n,
                 p,
@@ -803,82 +928,65 @@ pub fn fit_on<'a>(
                 &ids.extra,
                 opts.weights.as_deref(),
             );
-            let v = super::lmm::lmm_run_on(lmm_ws, &opts.target_indices, warm_theta(start));
-            FitView::new(FitViewKind::Lmm(v), perm, theta_buf)
+            FitViewKind::Lmm(super::lmm::lmm_run_on(
+                lmm_ws,
+                &opts.target_indices,
+                warm_theta(start),
+                scaling,
+            ))
         }
-        FitKind::Glmm { ws: glmm_ws, x_mat } => {
-            // Degenerate guard, the twin of `build_on_workspace`'s: the PIRLS
-            // kernels take no width-0 fixed block, and at `n <= p` the fixed
-            // effects are not estimable.
-            if n <= p || p == 0 {
-                let fit = super::glmm::degenerate_glmm_fit(p, glmm_ws.n_theta);
-                let (t_sq, var_diag) = prebuilt_stats(&fit);
-                return FitView::new(
-                    FitViewKind::Prebuilt {
-                        fit,
-                        t_sq,
-                        var_diag,
-                    },
-                    perm,
-                    theta_buf,
-                );
-            }
-            fill_col_major(x_mat, x, n, p);
-            // Per-draw option state, RE column scales, packed M columns and
-            // crossed-Schur symbolic factors — what `accumulate_lmm_rows` does
+        // Degenerate guard, the twin of `build_on_workspace`'s: the PIRLS
+        // kernels take no width-0 fixed block, and at `n <= p` the fixed
+        // effects are not estimable.
+        FitKind::Glmm { ws: glmm_ws } if n <= p || p == 0 => {
+            prebuilt_kind(super::glmm::degenerate_glmm_fit(p, glmm_ws.n_theta))
+        }
+        FitKind::Glmm { ws: glmm_ws } => {
+            // Per-draw option state, packed M columns and crossed-Schur
+            // symbolic factors — what `accumulate_lmm_rows` does
             // for the LMM arm above.
-            super::glmm::prep_glmm_design(
+            super::glmm::prep_glmm_design(glmm_ws, &ids.primary, &ids.extra, n, opts);
+            FitViewKind::Glmm(super::glmm::run_glmm_on(
                 glmm_ws,
-                x_mat.as_ref(),
-                &ids.primary,
-                &ids.extra,
-                n,
-                opts,
-            );
-            let v = super::glmm::run_glmm_on(
-                glmm_ws,
-                x_mat.as_ref().subrows(0, n),
+                x_mat,
                 y,
                 n,
                 p,
-                &ws.sized,
+                sized,
                 &ids.primary,
                 &ids.extra,
                 f64::NAN,
                 start,
                 opts,
-            );
-            FitView::new(FitViewKind::Glmm(v), perm, theta_buf)
+                scaling,
+            ))
         }
-        FitKind::Prebuilt(route) => {
-            let route = *route;
-            let sized = &ws.sized;
-            let fit = match route {
-                PrebuiltRoute::GlmNb => super::glm::fit_glm_nb(x, y, n, p, None, opts).0,
-                PrebuiltRoute::GlmmNb => super::glmm::fit_glmm_nb(
-                    x,
-                    y,
-                    n,
-                    p,
-                    sized,
-                    &ids.primary,
-                    &ids.extra,
-                    start,
-                    opts,
-                ),
-            };
-            let (t_sq, var_diag) = prebuilt_stats(&fit);
-            FitView::new(
-                FitViewKind::Prebuilt {
-                    fit,
-                    t_sq,
-                    var_diag,
-                },
-                perm,
-                theta_buf,
-            )
-        }
-    }
+        // `start` is in the caller's units here: this route has no groupings
+        // on the `FitWorkspace`, and `fit_glmm_nb` maps it.
+        FitKind::Prebuilt(route) => prebuilt_kind(match route {
+            PrebuiltRoute::GlmNb => super::glm::fit_glm_nb(x_mat, y, n, p, None, opts, scaling).0,
+            PrebuiltRoute::GlmmNb => super::glmm::fit_glmm_nb(
+                x_mat,
+                y,
+                n,
+                p,
+                sized,
+                &ids.primary,
+                &ids.extra,
+                start,
+                opts,
+                scaling,
+            ),
+        }),
+    };
+    FitView::new(
+        kind,
+        perm,
+        theta_declared_buf,
+        beta_caller,
+        re_map_scratch,
+        scaling,
+    )
 }
 
 #[cfg(test)]

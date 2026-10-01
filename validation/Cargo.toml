@@ -15,12 +15,11 @@ publish = false
 # No lib/bin — this package exists only to own the example targets below (examples
 # satisfy Cargo's at-least-one-target requirement).
 
-# `formula` — the drivers lower R-style formulas; `loop_advanced` — theta_eval
-# drives the dev-only seam. Enabled here on the dep rather than per-example
-# `required-features` so every example always builds (and stays under the
+# `formula`: the drivers lower R-style formulas. Enabled here on the dep rather
+# than per-example `required-features` so every example always builds (and stays under the
 # workspace clippy deny gate) in `cargo clippy --workspace --all-targets`.
 [dependencies]
-glmm = { path = "..", features = ["formula", "loop_advanced"] }
+glmm = { path = "..", features = ["formula"] }
 
 # Dev-only pass-through of the kernel's optimizer counters, for the speed
 # grid's counter pass. OFF by default: the counters perturb wall time
@@ -46,12 +45,6 @@ workspace = true
 name = "grid_fit"
 path = "campaigns/speed-campaign/fit.rs"
 
-# Mismatch-adjudication driver: evaluates/minimizes the LMM profiled-REML objective
-# at caller-chosen θ/schedules through the dev-only loop_advanced seam.
-[[example]]
-name = "theta_eval"
-path = "campaigns/speed-campaign/theta_eval.rs"
-
 # Fits one memory-measurement model (tools/memory/models.json + gen_models.py) from a
 # CSV path + formula string, for the memory harness (tools/memory/memory.sh) to wrap
 # in `/usr/bin/time -f '%M'`. Not a validation gate -- see tools/memory/models.json's
@@ -65,11 +58,10 @@ path = "tools/memory/memory_fit.rs"
 name = "agq_par_probe"
 path = "campaigns/speed-campaign/agq_par_probe.rs"
 
-# Machine-local bit-identity baseline for refactors that must not change any
-# fitted number: fits all 49 manifest rungs and writes
+# Machine-local "what moved" report: fits all 49 manifest rungs and writes
 # tools/bit_identity/<config>.json (rung, deviance, theta, beta, se_hessian, se_rx,
-# n_eval, converged, singular). See tools/bit_identity/dump.rs's header for the
-# four config commands.
+# n_eval, converged, singular), not committed. See tools/bit_identity/dump.rs's
+# header for the config commands.
 [[example]]
 name = "bit_identity"
 path = "tools/bit_identity/dump.rs"

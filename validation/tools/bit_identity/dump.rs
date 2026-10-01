@@ -1,60 +1,48 @@
-//! Machine-local bit-identity baseline for refactors that must not change any
-//! fitted number: fits all 49 `manifest.json` rungs, appends two more nAGQ=1
-//! twin records (see `NAGQ1_TWIN_RUNGS` below), and writes one JSON array
-//! — `{rung, config, deviance, theta, beta, se_hessian, se_rx, n_eval,
-//! converged, singular}` per record, manifest rungs first in manifest order
-//! then the twins — to `tools/bit_identity/<config>.json`. Diffing that file before
-//! and after a refactor is the fast check its cuts are measured against; the
-//! full accuracy grid (`grid/run.sh`) is minutes, this is under a second. Not
-//! expected to reproduce across CPU microarchitectures — regenerate locally
-//! before diffing, never compare a checked-in dump against a different
-//! machine's.
+//! Machine-local "what moved" report: fits all 49 `manifest.json` rungs,
+//! appends two more nAGQ=1 twin records (see `NAGQ1_TWIN_RUNGS` below), and
+//! writes one JSON array, `{rung, config, deviance, theta, beta, se_hessian,
+//! se_rx, n_eval, converged, singular}` per record (manifest rungs first in
+//! manifest order, then the twins), to `tools/bit_identity/<config>.json`. Dump
+//! before and after a change and diff the two files to see which rungs moved and
+//! by how much; this is under a second, the full accuracy grid (`grid/run.sh`)
+//! is minutes. It is a report, not a gate. The dumps are not committed
+//! (`.gitignore`) and do not reproduce across CPU microarchitectures, so both
+//! sides of a diff come from the same machine.
 //!
 //! `theta` is `Fit::tau2` (`theta[k]^2 * sigma_sq`, `sigma_sq` ≡ 1 off the
-//! Gaussian path, declaration order) — the
-//! stable API's only public per-component θ-scale quantity; `Fit` itself has
-//! no raw-θ accessor. `se_hessian`/`se_rx` follow the cross-engine schema's own
+//! Gaussian path, declaration order), one value per θ coordinate; `Fit` has no
+//! raw-θ accessor. (`Fit::stddev_se` shares that layout but is the SE of the
+//! reported standard deviation, not a θ-scale quantity, and is not dumped.)
+//! `se_hessian`/`se_rx` follow the cross-engine schema's own
 //! convention: a gaussian rung's single SE lands in `se_hessian` (`se_rx`
 //! null), a fixed-only GLM's lands in `se_rx` (`se_hessian` null, matching
 //! that schema's labeling there), and a GLMM rung gets both, from two
 //! separate `fit_cold` calls (`WaldSe::Hessian` / `WaldSe::Rx`).
 //!
 //! `nagq` is 1 (Laplace) except on the manifest's `agq`-marked rungs, which
-//! fit at the manifest's stated order (`harness_common::rung_agq`) — the only
-//! run in this validation harness that puts `src/glmm/agq.rs` on a bit-identity
-//! tripwire without an opt-in env var. Two of those rungs (26, 44) also get a
-//! twin record fit at nAGQ=1 instead — see `NAGQ1_TWIN_RUNGS`.
+//! fit at the manifest's stated order (`harness_common::rung_agq`), so a move
+//! in `src/glmm/agq.rs` shows up here without an opt-in env var. Two of those
+//! rungs (26, 44) also get a twin record fit at nAGQ=1 instead (see
+//! `NAGQ1_TWIN_RUNGS`).
 //!
 //! `config` is a required CLI arg, used only to label the JSON `config` field
-//! and the output filename — the crate feature set that actually produced the
-//! binary comes from how it was built (see the four commands below), not from
+//! and the output filename; the crate feature set that actually produced the
+//! binary comes from how it was built (see the commands below), not from
 //! anything this binary reads at runtime.
 //!
-//! `validation/Cargo.toml` pins the `glmm` dependency to
-//! `features = ["formula", "loop_advanced"]` unconditionally (no
-//! `default-features = false`), so a `-p validation` build always has both on
-//! — `--features`/`--no-default-features` passed to `cargo run -p validation`
-//! cannot remove a feature the crate's own manifest already requires. Every
-//! run is `--release`: the dump is the baseline any refactor's diffs get
-//! compared against, and those diffs run release builds too, so a debug-build baseline would be
-//! the wrong reference (and needlessly slow — debug is dominated by the
-//! double-fit GLMM/grouseticks rungs). The four configs this reaches:
+//! `validation/Cargo.toml` enables `formula` on the `glmm` dependency, so a
+//! `-p validation` build always has it. Every run is `--release`, like the
+//! builds whose results it reports (debug is also needlessly slow, dominated by
+//! the double-fit GLMM/grouseticks rungs). The configs:
 //!
-//!   default        — temporarily drop `"loop_advanced"` from the
-//!                    `glmm` dependency's `features` list in
-//!                    `validation/Cargo.toml`, then:
-//!                    cargo run --release -p validation --example bit_identity -- default
-//!                    (revert the Cargo.toml edit after)
-//!   loop_advanced  — cargo run --release -p validation --example bit_identity -- loop_advanced
-//!                    (identical build to `default` as committed:
-//!                    `loop_advanced` only adds re-exports, no behavior
-//!                    change, so the two dumps are expected to be
-//!                    byte-identical)
-//!   parallel       — cargo run --release -p validation --example bit_identity --features glmm/parallel -- parallel
-//!   no-default-features — NOT reachable from this crate: `tools/common.rs`
-//!                    and this file both call `glmm::formula::lower`, so
-//!                    dropping `formula` breaks the build the harness needs
-//!                    to read the manifest at all. Skipped.
+//!   default        cargo run --release -p validation --example bit_identity -- default
+//!   parallel       cargo run --release -p validation --example bit_identity --features glmm/parallel -- parallel
+//!   loop_advanced  not dumped: the feature only adds re-exports, so its dump
+//!                  would be the default one.
+//!   no-default-features  not reachable from this crate: `tools/common.rs`
+//!                  and this file both call `glmm::formula::lower`, so
+//!                  dropping `formula` breaks the build the harness needs
+//!                  to read the manifest at all.
 
 use glmm::fit_cold;
 use serde_json::Value;
@@ -135,10 +123,10 @@ fn rung_record(spec: &Value, config: &str, rung: u64, nagq: Option<u8>) -> Strin
     let (mut lo, _table, _family, _formula_str) = lower_rung(spec, DIR);
     // A no-op on a serial build (`FitOptions::parallel_inner` is only live
     // under the `parallel` Cargo feature; see its doc), so this line is safe
-    // to run unconditionally across all three buildable configs.
+    // to run unconditionally in both configs.
     lo.opts.parallel_inner = config == "parallel";
-    // The dump applies the manifest's per-rung AGQ order unconditionally: this is
-    // the only run that puts `src/glmm/agq.rs` on the bit-identity tripwire.
+    // The dump applies the manifest's per-rung AGQ order unconditionally, so a
+    // move in `src/glmm/agq.rs` shows up in it.
     if let Some(k) = nagq {
         lo.opts.nagq = k;
     }

@@ -9,6 +9,8 @@ use std::borrow::Cow;
 
 use faer::Mat;
 
+use crate::standardize::ColumnScaling;
+
 use crate::{
     Family, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing, StartValues,
 };
@@ -34,8 +36,8 @@ use super::{Boundary, Diagnostics, Fit, FitOptions, Note};
 ///   own mask is unconditionally all-false, so a field here would always be
 ///   empty and would suggest a per-route decision that does not exist.
 /// - `singular`: it is `boundary_hit == 1` on every route, ORed at
-///   materialization with `Fit::has_negligible_component` — which reads the
-///   assembled `varcorr` and so cannot be decided at view level. Both sides of
+///   materialization with `Fit::has_negligible_component` — which runs on the
+///   assembled `Fit` and so is not decided at view level. Both sides of
 ///   that OR are only ever set on a converged fit: `boundary_hit == 1` latches
 ///   only when the fit converged (a capped endpoint stays at `boundary_hit ==
 ///   2`, "no optimum"), and `has_negligible_component` is checked only when
@@ -235,30 +237,48 @@ pub(super) fn warm_theta(start: Option<&StartValues>) -> Option<&[f64]> {
     start.map(|s| s.theta.as_slice()).filter(|t| !t.is_empty())
 }
 
-/// vech(column-major lower-tri) of `D̂ = scale·Λ̂Λ̂'` for one `q×q` grouping.
-/// `theta_block` is that grouping's column-major lower-tri `vech(Λ)` prefix
-/// (as `primary_lambda` reads it). `D[r][c] = Σ_{k≤min(r,c)} Λ[r][k]·Λ[c][k]`.
-///
-/// `row_scales[r]` is row `r`'s internal RE design-column scale
-/// (`LmmGroupings::block_row_scale`). θ̂ arrives in the solver's internal units,
-/// where row `r` of Λ carries a factor `s_r`; dividing it out here is the whole
-/// back-map, and it is what makes the reported covariance
-/// `D[i][j] = D̃[i][j]/(sᵢ·s_j)` as the scaling identity requires. All-`1.0`
-/// scales divide exactly, so an unscaled design is untouched.
+/// A warm start in the caller's units (θ in slot order, each component empty
+/// or of its full width) onto the design `cs` standardized, in place:
+/// `β̃ = B⁻¹β`, and θ through the random-effect maps
+/// (`LmmGroupings::theta_caller_to_design`). An empty component stays empty.
+pub(super) fn start_to_design(
+    s: &mut StartValues,
+    cs: &ColumnScaling,
+    g: &crate::lmm::LmmGroupings,
+    scratch: &mut [f64],
+) {
+    if !s.beta.is_empty() {
+        cs.beta_to_internal(&mut s.beta);
+    }
+    if !s.theta.is_empty() {
+        g.theta_caller_to_design(&mut s.theta, scratch, cs);
+    }
+}
+
+/// vech(column-major lower-tri) of `D̂ = scale·M·Mᵀ` for block `b` of `g`, with
+/// `M = N·Λ̃` (`LmmGroupings::kernel_rows_to_caller`). `theta_block` is that
+/// block's column-major lower-tri `vech(Λ̃)` prefix (as `primary_lambda` reads
+/// it), on the fitted design; `N` maps the block's effects to the caller's
+/// columns (`b = N·b̃`). It is read off the covariance, with no factorization, so a
+/// centered slope can leave no false zero here. Once a slope is centered `M` is
+/// not lower triangular, so the sum runs over every `k`. `map` is the fit's
+/// column standardization, which `N` is read from.
 pub(super) fn varcorr_block(
     theta_block: &[f64],
     q: usize,
     scale: f64,
-    row_scales: &[f64],
+    g: &crate::lmm::LmmGroupings,
+    b: usize,
+    map: &ColumnScaling,
 ) -> Vec<f64> {
     let mut lam = vec![0.0f64; q * q];
     crate::lmm::primary_lambda(theta_block, q, &mut lam); // Λ̃ lower-tri, row-major
-    back_map_lambda(&mut lam, q, row_scales);
+    g.kernel_rows_to_caller(b, q, q, &mut lam, map);
     let mut vech = Vec::with_capacity(q * (q + 1) / 2);
     for c in 0..q {
         for r in c..q {
             let mut d = 0.0;
-            for k in 0..=c {
+            for k in 0..q {
                 d += lam[r * q + k] * lam[c * q + k];
             }
             vech.push(scale * d);
@@ -278,6 +298,7 @@ pub(crate) fn assemble_varcorr(
     theta: &[f64],
     groupings: &crate::lmm::LmmGroupings,
     scale: f64,
+    map: &ColumnScaling,
 ) -> Vec<Vec<f64>> {
     let mut out = Vec::with_capacity(1 + groupings.extra_q.len());
     let mut cursor = 0usize;
@@ -286,13 +307,13 @@ pub(crate) fn assemble_varcorr(
         .enumerate()
     {
         let vech = q * (q + 1) / 2;
-        // θ̂ is in the solver's internal units; the row scales back-map it.
-        let row_scales = block_row_scales(groupings, b, q);
         out.push(varcorr_block(
             &theta[cursor..cursor + vech],
             q,
             scale,
-            &row_scales,
+            groupings,
+            b,
+            map,
         ));
         cursor += vech;
     }
@@ -410,24 +431,20 @@ pub(crate) fn assemble_ranef_dense(
     theta: &[f64],
     g: &crate::lmm::LmmGroupings,
     u: &[f64],
+    map: &ColumnScaling,
 ) -> Vec<f64> {
     let q = g.primary_q;
     let mut lam = vec![0.0f64; q * q];
     crate::lmm::primary_lambda(theta, q, &mut lam);
-    // Same back-map, and for the same reason, as `assemble_ranef_sparse` — the
-    // internal `b̃ = Λ̃û` carries the design column's scale on row r. Only the
+    // Same map, and for the same reason, as `assemble_ranef_sparse`. Only the
     // primary block needs it: this path's extras are intercept-only (asserted
-    // below), so their scale is exactly 1.
-    back_map_lambda(&mut lam, q, &block_row_scales(g, 0, q));
+    // below), so their map is the identity.
+    g.kernel_rows_to_caller(0, q, q, &mut lam, map);
     let mut out = Vec::with_capacity(g.k_total);
     for lvl in 0..g.n_primary {
         let base = lvl * q;
         for r in 0..q {
-            let mut b = 0.0;
-            for c in 0..=r {
-                b += lam[r * q + c] * u[base + c];
-            }
-            out.push(b);
+            out.push((0..q).map(|c| lam[r * q + c] * u[base + c]).sum());
         }
     }
     debug_assert!(!g.extra_slopes_any, "dense GLMM extras are intercept-only");
@@ -451,66 +468,28 @@ pub(crate) fn assemble_ranef_dense(
 /// RE-column elimination order is the same layout, so the two share this rather
 /// than each carrying their own walk. What is sparse-specific is the caller, not
 /// the layout.
-/// Divide block `b`'s row-major lower-tri Λ̃ (as `primary_lambda` writes it) by
-/// its rows' internal RE design-column scales, turning the solver's internal
-/// factor into the user's: `Λ[r][c] = Λ̃[r][c]/s_r`. The one back-map every
-/// θ-derived block quantity funnels through. All-`1.0` scales divide exactly.
-fn back_map_lambda(lam: &mut [f64], q: usize, row_scales: &[f64]) {
-    for r in 1..q {
-        let s_r = row_scales[r];
-        if s_r == 1.0 {
-            continue;
-        }
-        for c in 0..=r {
-            lam[r * q + c] /= s_r;
-        }
-    }
-}
-
-/// Block `b`'s per-row internal RE design-column scales (`b == 0` primary,
-/// `b == e+1` extra grouping `e`), length `q` — the argument every back-map takes.
-fn block_row_scales(g: &crate::lmm::LmmGroupings, b: usize, q: usize) -> Vec<f64> {
-    (0..q).map(|r| g.block_row_scale(b, r)).collect()
-}
-
-/// The internal RE design-column scales laid out like [`Fit::varcorr`] — one
-/// row-aligned block per grouping, primary first. Multiplying a reported
-/// standard deviation by its entry puts it back on the internal scale, which is
-/// where the components of one fit are commensurate with each other:
-/// user-scale standard deviations for an intercept and for a slope are in
-/// different units (response, vs response per covariate unit), so their ratio
-/// moves with the covariate's units.
-pub(crate) fn re_scale_grid(g: &crate::lmm::LmmGroupings) -> Vec<Vec<f64>> {
-    std::iter::once(g.primary_q)
-        .chain(g.extra_q.iter().copied())
-        .enumerate()
-        .map(|(b, q)| block_row_scales(g, b, q))
-        .collect()
-}
-
 pub(crate) fn assemble_ranef_sparse(
     theta: &[f64],
     g: &crate::lmm::LmmGroupings,
     u: &[f64],
+    map: &ColumnScaling,
 ) -> Vec<f64> {
     let q = g.primary_q;
     let s = g.n_primary;
     let mut lam = vec![0.0f64; q * q];
     crate::lmm::primary_lambda(theta, q, &mut lam);
-    // `b̃ = Λ̃û` comes out in the solver's internal RE units, where row r carries
-    // the design column's scale s_r; the user's conditional mode is `b = b̃/s_r`.
-    // Back-mapping Λ here rather than the output does it once per row instead of
-    // once per level — and it must happen HERE, not later: `lmm_fitted` weights
-    // `ranef` by the RAW covariate, so it needs a user-scale `ranef`.
-    back_map_lambda(&mut lam, q, &block_row_scales(g, 0, q));
+    // `Λ̃û` is the conditional mode on the fitted design, and the block's
+    // column map `N` takes it to the caller's columns (`b = N·Λ̃û`). Mapping Λ
+    // here rather than the output does it once per block instead of once per
+    // level — and the whole map must happen HERE, not later: `lmm_fitted`
+    // weights `ranef` by the RAW covariate, so it needs a caller-unit `ranef`.
+    // With a centered slope `N·Λ̃` is not lower triangular, so each product
+    // runs over every column.
+    g.kernel_rows_to_caller(0, q, q, &mut lam, map);
     let mut out = Vec::with_capacity(g.k_total);
     for f in 0..s {
         for r in 0..q {
-            let mut b = 0.0;
-            for c in 0..=r {
-                b += lam[r * q + c] * u[c * s + f];
-            }
-            out.push(b);
+            out.push((0..q).map(|c| lam[r * q + c] * u[c * s + f]).sum());
         }
     }
     let counts = ranef_level_counts(g);
@@ -518,15 +497,11 @@ pub(crate) fn assemble_ranef_sparse(
         let q_g = g.extra_q[e];
         let mut lam_g = vec![0.0f64; q_g * q_g];
         crate::lmm::primary_lambda(&theta[extra_vech_start(g, e)..], q_g, &mut lam_g);
-        back_map_lambda(&mut lam_g, q_g, &block_row_scales(g, e + 1, q_g));
+        g.kernel_rows_to_caller(e + 1, q_g, q_g, &mut lam_g, map);
         for l in 0..counts[e + 1] {
             let base = off + l * q_g;
             for r in 0..q_g {
-                let mut b = 0.0;
-                for c in 0..=r {
-                    b += lam_g[r * q_g + c] * u[base + c];
-                }
-                out.push(b);
+                out.push((0..q_g).map(|c| lam_g[r * q_g + c] * u[base + c]).sum());
             }
         }
     }
@@ -1068,7 +1043,6 @@ pub(super) fn fit_rank_deficient(
             // Carry no design-column indices — nothing to translate.
             Note::PirlsExhausted { .. }
             | Note::UnusedGroupingLevels { .. }
-            | Note::ReDesignScaleSpread { .. }
             | Note::HessianSeFallback
             | Note::NbShapeUnsettled { .. }
             | Note::NonIntegerResponse { .. }
@@ -1256,11 +1230,10 @@ pub fn spec_sized_from_ids_pub<'a>(
     spec_sized_from_ids(model, ids)
 }
 /// Fills `dst[0..n, 0..p]` from row-major `x` (n·p, unweighted). Factored out
-/// of `to_col_major` so the `fit_on` hot-path arms (`Ols`/`Glm`/`Lmm`) can
-/// fill an `n_max`-sized buffer allocated once at `build_workspace`, instead of
-/// allocating a fresh `n×p` `Mat` every call — the same buffer-reuse pattern
-/// `FitKind::Glmm`'s `x_mat` already uses. `dst` must be at least `n×p`;
-/// rows/columns past `n`/`p` are left untouched.
+/// of `to_col_major` so `fit_on` can fill the `n_max`-sized `x_mat` allocated
+/// once at `build_workspace`, instead of allocating a fresh `n×p` `Mat` every
+/// call. `dst` must be at least `n×p`; rows/columns past `n`/`p` are left
+/// untouched.
 pub(super) fn fill_col_major(dst: &mut Mat<f64>, x: &[f64], n: usize, p: usize) {
     for i in 0..n {
         for j in 0..p {
@@ -1269,12 +1242,49 @@ pub(super) fn fill_col_major(dst: &mut Mat<f64>, x: &[f64], n: usize, p: usize) 
     }
 }
 
+/// [`fill_col_major`], then each standardized column in place:
+/// `dst[(i, j)] = (x[i·p + j] − mⱼ)/sⱼ`. No extra copy of `x`; a column left
+/// as it is is copied and not touched again.
+pub(super) fn fill_col_major_std(
+    dst: &mut Mat<f64>,
+    x: &[f64],
+    n: usize,
+    p: usize,
+    cs: &ColumnScaling,
+) {
+    fill_col_major(dst, x, n, p);
+    for j in 0..p {
+        cs.standardize_column(j, &mut dst.col_as_slice_mut(j)[..n]);
+    }
+}
+
+/// Row-major `x` → the column map and the column-major `x̃` (`n` rows) of a
+/// route that builds its own workspace and fits the design as given
+/// (`FitWorkspace::set_prestandardized`): only the random-slope columns of `g`
+/// are scaled ([`ColumnScaling::compute`]). For the test baselines.
+#[cfg(test)]
+pub(super) fn as_given_design(
+    x: &[f64],
+    n: usize,
+    p: usize,
+    g: &crate::lmm::LmmGroupings,
+    weights: Option<&[f64]>,
+) -> (ColumnScaling, Mat<f64>) {
+    let slopes = g
+        .primary_slope_cols
+        .iter()
+        .chain(g.extra_slope_cols.iter().flatten());
+    let mut cs = ColumnScaling::with_re_slopes(p, slopes.copied());
+    cs.compute(x, n, p, weights, false);
+    let mut x_mat = Mat::<f64>::zeros(n.max(1), p.max(1));
+    fill_col_major_std(&mut x_mat, x, n, p, &cs);
+    (cs, x_mat)
+}
+
 /// Converts row-major `x` (n·p, unweighted) into a column-major faer matrix.
-/// Shared by every unweighted site; `fit_ols_prebuilt`'s √wᵢ-scaled loop is a distinct
-/// variant and is not routed through this helper. Thin wrapper over
-/// [`fill_col_major`] for the call sites that build a throwaway `Mat` once per
-/// call regardless (test-only paths, `fit_glm`, `fit_glm_nb`, `fit_glmm_build`)
-/// — not on the `fit_on` hot path, so the allocation here is not worth removing.
+/// Thin wrapper over [`fill_col_major`] for the test-only paths that build a
+/// throwaway `Mat` once per call.
+#[cfg(test)]
 pub(super) fn to_col_major(x: &[f64], n: usize, p: usize) -> Mat<f64> {
     let mut x_mat = Mat::<f64>::zeros(n.max(1), p.max(1));
     fill_col_major(&mut x_mat, x, n, p);
@@ -1314,8 +1324,11 @@ pub(crate) fn nan_vcov(p: usize) -> Vec<Vec<f64>> {
 }
 
 /// Full `p×p` [`Fit::vcov`] from `l`, the lower-triangular Cholesky factor of a
-/// precision matrix (`X'X` for OLS, `X'WX` for GLM, `X'V⁻¹X` for LMM), scaled by
-/// `scale`: `vcov = scale · (L L')⁻¹`.
+/// precision matrix (`X'X` for OLS, `X'WX` for GLM, `X'V⁻¹X` for LMM) on the
+/// fitted design, scaled by `scale` and read through the column map `B`
+/// (`β = B·β̃`): `vcov = scale · B (L L')⁻¹ Bᵀ` on the target block. With the
+/// identity map this is `scale · (L L')⁻¹`, and below `eⱼ` reads `bⱼ`, row `j`
+/// of `B`.
 ///
 /// No new numerics — this is the SE forward solve, kept instead of discarded.
 /// `(L L')⁻¹ = L⁻ᵀ L⁻¹`, so `vcov[i][j] = scale · (uᵢ · uⱼ)` where `uⱼ = L⁻¹eⱼ`
@@ -1334,10 +1347,12 @@ pub(crate) fn vcov_from_chol(
     p: usize,
     target_indices: &[u32],
     scale: f64,
+    map: &ColumnScaling,
 ) -> Vec<Vec<f64>> {
     let mut vcov = nan_vcov(p);
-    // Column j of L⁻¹, for each target j: forward-solve L·u = e_j, reading
-    // L[(i,k)] directly (already lower-triangular, no transposed access).
+    // L⁻¹bⱼ for each target j: forward-solve L·u = bⱼ (row j of B, eⱼ when the
+    // design is fitted as given), reading L[(i,k)] directly (already
+    // lower-triangular, no transposed access).
     let mut cols: Vec<(usize, Vec<f64>)> = Vec::with_capacity(target_indices.len());
     for &tj in target_indices {
         let tj = tj as usize;
@@ -1346,7 +1361,7 @@ pub(crate) fn vcov_from_chol(
         }
         let mut u = vec![0.0f64; p];
         for i in 0..p {
-            let mut acc = if i == tj { 1.0 } else { 0.0 };
+            let mut acc = map.rhs(tj, i);
             for k in 0..i {
                 acc -= l[(i, k)] * u[k];
             }

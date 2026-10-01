@@ -18,9 +18,9 @@ not been fitted through it.
 `run.sh <engine> <tag>` (per-cell wall watchdog with kill-and-resume) +
 `fit.{rs,R,jl}` drivers + `analyze.R`/`report.R`/`counters.R` → `reports/`.
 `common.R` holds the readers and the beta band the two analysis scripts share.
-`theta_eval.rs` and `sweep_fit.jl` are the mismatch-adjudication drivers
-(multi-start sweeps re-scored on glmm's objective); their product is the
-best-known optima frozen in `optima/`.
+`sweep_fit.jl` is the mismatch-adjudication driver (multi-start sweeps,
+re-scored on glmm's objective); its product is the best-known optima frozen in
+`optima/`.
 **Second cell list:** `estimate-grid-manifest.json` is the answer-agreement pass over
 the same grid — 477 Laplace cells against glmer/lmer, 15 scalar-AGQ cells against
 glmer(nAGQ=7), 18 vector-AGQ cells against GLMMadaptive(nAGQ=7). Its verdict is in

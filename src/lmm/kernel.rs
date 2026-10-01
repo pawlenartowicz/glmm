@@ -34,17 +34,23 @@ use super::*;
 /// storage and one extra pass over the rows, not a copy of `X`. When `R` has a
 /// zero or non-finite diagonal (an all-zero weighted column, fewer rows than
 /// columns) `U` stays the identity and the kernels see the raw `X`.
+///
+/// The GLMM joint search reads the same factor for its β coordinates
+/// (`glmm::workspace::BetaScale`), with `D` kept alongside `U`.
 #[derive(Clone)]
 pub(crate) struct DesignQr {
     /// `p×p` strict upper triangle of `U`; the diagonal is 1 and the strict
     /// lower triangle 0.
     u: Mat<f64>,
+    /// `D = diag(R)`; all ones while `U` is the identity.
+    d: Vec<f64>,
 }
 
 impl DesignQr {
     pub(crate) fn identity(p: usize) -> Self {
         DesignQr {
             u: Mat::identity(p, p),
+            d: vec![1.0; p],
         }
     }
 
@@ -56,15 +62,18 @@ impl DesignQr {
                 self.u[(i, j)] = if i == j { 1.0 } else { 0.0 };
             }
         }
+        self.d.fill(1.0);
     }
 
-    /// `U` of `diag(row_scale)·X` over `x`'s rows. `v` is a `p`-long scratch.
+    /// `U` and `D` of `diag(row_scale)·X` over `x`'s rows. `v` is a `p`-long
+    /// scratch. False when `R` has a zero or non-finite diagonal, which leaves
+    /// the identity.
     pub(crate) fn set_from_rows(
         &mut self,
         x: MatRef<'_, f64>,
         row_scale: impl Fn(usize) -> f64,
         v: &mut [f64],
-    ) {
+    ) -> bool {
         let p = self.u.nrows();
         debug_assert_eq!(x.ncols(), p);
         // `u` holds R while the rows are rotated in.
@@ -101,7 +110,7 @@ impl DesignQr {
             let rjj = r[(j, j)];
             if !(rjj.is_finite() && rjj > 0.0) {
                 self.set_identity();
-                return;
+                return false;
             }
         }
         for i in 0..p {
@@ -110,6 +119,27 @@ impl DesignQr {
                 r[(i, j)] /= rii;
             }
             r[(i, i)] = 1.0;
+            self.d[i] = rii;
+        }
+        true
+    }
+
+    /// `D = diag(R)` of the last factorisation.
+    pub(crate) fn r_diag(&self) -> &[f64] {
+        &self.d
+    }
+
+    /// `β → U·β` in place, the inverse of [`Self::map_beta`] (row `i` reads
+    /// only `β_j`, `j ≥ i`).
+    #[allow(clippy::needless_range_loop)] // triangular product over one slice
+    pub(crate) fn apply_u(&self, beta: &mut [f64]) {
+        let p = self.u.nrows();
+        for i in 0..p {
+            let mut acc = beta[i];
+            for k in (i + 1)..p {
+                acc += self.u[(i, k)] * beta[k];
+            }
+            beta[i] = acc;
         }
     }
 
@@ -425,11 +455,9 @@ impl LmmSuffStats {
                         // no slope, so they contribute nothing here.
                         if slope {
                             for (d, &sc) in self.groupings.primary_slope_cols.iter().enumerate() {
-                                // Slope covariate read AS A RANDOM-EFFECT column, so it
-                                // takes the internal scale (`LmmGroupings::set_slope_scales`);
-                                // the same x column keeps its raw value in the `c`/`s`
-                                // fixed-effect scatters above. Already carries one zw.
-                                let z = self.w_buf[sc] / self.groupings.primary_slope_scales[d];
+                                // Slope covariate read as a random-effect column;
+                                // already carries one zw.
+                                let z = self.w_buf[sc];
                                 // scol mirrors from_cluster_spec's RE-column layout — change together.
                                 let scol = (d + 1) * n_prim + gid[0];
                                 // b's side is the crossed intercept (z=1 → zw);
@@ -461,16 +489,12 @@ impl LmmSuffStats {
                         g.extra_q[bi - 1]
                     };
                     for db in 0..q_b {
-                        // Every slope read here is a Z entry, so it takes the
-                        // internal scale; the intercept's is exactly 1 by construction.
                         let z_b = if db == 0 {
                             zw // intercept z=1 → zw (one weight side)
                         } else if bi == 0 {
                             self.w_buf[g.primary_slope_cols[db - 1]]
-                                / g.primary_slope_scales[db - 1]
                         } else {
                             self.w_buf[g.extra_slope_cols[bi - 1][db - 1]]
-                                / g.extra_slope_scales[bi - 1][db - 1]
                         };
                         let b_local = bl + db;
                         for ai in 0..n_g {
@@ -488,15 +512,10 @@ impl LmmSuffStats {
                                 } else if ai == 0 {
                                     (
                                         da * n_prim + gid[0],
-                                        self.w_buf[g.primary_slope_cols[da - 1]]
-                                            / g.primary_slope_scales[da - 1],
+                                        self.w_buf[g.primary_slope_cols[da - 1]],
                                     )
                                 } else {
-                                    (
-                                        gid[ai] + da,
-                                        self.w_buf[g.extra_slope_cols[ai - 1][da - 1]]
-                                            / g.extra_slope_scales[ai - 1][da - 1],
-                                    )
+                                    (gid[ai] + da, self.w_buf[g.extra_slope_cols[ai - 1][da - 1]])
                                 };
                                 self.zx[(a_col, b_local)] += z_a * z_b;
                             }
@@ -513,8 +532,7 @@ impl LmmSuffStats {
             if self.groupings.primary_q > 1 {
                 let n_prim = self.groupings.n_primary;
                 for (k, &sc) in self.groupings.primary_slope_cols.iter().enumerate() {
-                    // Z entry ⇒ internal scale (see the zx_slope fill above).
-                    let z = self.w_buf[sc] / self.groupings.primary_slope_scales[k];
+                    let z = self.w_buf[sc];
                     let scol = (k + 1) * n_prim + gid[0];
                     let scol_mut = self
                         .s
@@ -543,8 +561,7 @@ impl LmmSuffStats {
                     let n_d = self.groupings.extra_slope_cols[e].len();
                     for d in 0..n_d {
                         let sc = self.groupings.extra_slope_cols[e][d];
-                        // Z entry ⇒ internal scale (see the zx_slope fill above).
-                        let z = self.w_buf[sc] / self.groupings.extra_slope_scales[e][d];
+                        let z = self.w_buf[sc];
                         let scol = gintercept + 1 + d;
                         let scol_mut = self
                             .s
@@ -673,7 +690,8 @@ pub(crate) fn precompute_balanced_collapse<T: Scalar>(
 /// so it reduces to the scalar value (to FP reassociation) when every `q_g == 1`.
 ///
 /// Zero-alloc warm path: every buffer lives in `LmmFitScratch` (`blocked_*`),
-/// sized once when `extra_slopes_any`. Returns INFINITY on any Cholesky failure.
+/// sized once when `extra_slopes_any`. Returns INFINITY on any Cholesky failure
+/// or a residual r² at the round-off floor (an exact fit).
 fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch<f64>) -> f64 {
     let g = &suff.groupings;
     let m = suff.m;
@@ -769,10 +787,6 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
     if let Some(nf) = g.nested {
         let q_n = nf.q;
         let nscols = &g.extra_slope_cols[nf.decl];
-        // `s_raw`-ROW reads of a slope covariate below take the internal scale of
-        // the row's own column; the `s_raw`-COLUMN already carries its own
-        // (`primary_gram`).
-        let nssc = &g.extra_slope_scales[nf.decl];
         for f in 0..n_prim {
             for c in 0..np {
                 let ic = prim_width + (f * np + c) * q_n;
@@ -782,12 +796,11 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
                         let v = if dr == 0 && dc == 0 {
                             n_c
                         } else if dr == 0 {
-                            suff.s_raw[(nscols[dc - 1], ic)] / nssc[dc - 1] // Σ z_{dc-1}
+                            suff.s_raw[(nscols[dc - 1], ic)] // Σ z_{dc-1}
                         } else if dc == 0 {
-                            suff.s_raw[(nscols[dr - 1], ic)] / nssc[dr - 1] // Σ z_{dr-1}
+                            suff.s_raw[(nscols[dr - 1], ic)] // Σ z_{dr-1}
                         } else {
-                            suff.s_raw[(nscols[dr - 1], ic + dc)] / nssc[dr - 1]
-                            // Σ z_{dr-1} z_{dc-1}
+                            suff.s_raw[(nscols[dr - 1], ic + dc)] // Σ z_{dr-1} z_{dc-1}
                         };
                         fit.blocked_g[(ic + dc) * k + (ic + dr)] = v;
                     }
@@ -799,13 +812,11 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
                         let v = if da == 0 && dc == 0 {
                             n_c
                         } else if dc == 0 {
-                            suff.s_raw[(g.primary_slope_cols[da - 1], ic)]
-                                / g.primary_slope_scales[da - 1] // Σ z^p_{da-1}
+                            suff.s_raw[(g.primary_slope_cols[da - 1], ic)] // Σ z^p_{da-1}
                         } else if da == 0 {
-                            suff.s_raw[(nscols[dc - 1], ic)] / nssc[dc - 1] // Σ z^n_{dc-1}
+                            suff.s_raw[(nscols[dc - 1], ic)] // Σ z^n_{dc-1}
                         } else {
-                            suff.s_raw[(g.primary_slope_cols[da - 1], ic + dc)]
-                                / g.primary_slope_scales[da - 1] // Σ z^p_{da-1} z^n_{dc-1}
+                            suff.s_raw[(g.primary_slope_cols[da - 1], ic + dc)] // Σ z^p_{da-1} z^n_{dc-1}
                         };
                         fit.blocked_g[ccol * k + prow] = v;
                         fit.blocked_g[prow * k + ccol] = v;
@@ -819,8 +830,6 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
         let q = cf.q;
         let off = g.extra_offsets[cf.decl];
         let scols = &g.extra_slope_cols[cf.decl];
-        // `s_raw`-ROW side of the internal scale, as in the nested block above.
-        let ssc = &g.extra_slope_scales[cf.decl];
         for c in 0..cf.n_levels {
             let ic = off + c * q;
             let n_c = suff.counts[ic];
@@ -829,11 +838,11 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
                     let v = if dr == 0 && dc == 0 {
                         n_c
                     } else if dr == 0 {
-                        suff.s_raw[(scols[dc - 1], ic)] / ssc[dc - 1] // Σ z_{dc-1}
+                        suff.s_raw[(scols[dc - 1], ic)] // Σ z_{dc-1}
                     } else if dc == 0 {
-                        suff.s_raw[(scols[dr - 1], ic)] / ssc[dr - 1] // Σ z_{dr-1}
+                        suff.s_raw[(scols[dr - 1], ic)] // Σ z_{dr-1}
                     } else {
-                        suff.s_raw[(scols[dr - 1], ic + dc)] / ssc[dr - 1] // Σ z_{dr-1} z_{dc-1}
+                        suff.s_raw[(scols[dr - 1], ic + dc)] // Σ z_{dr-1} z_{dc-1}
                     };
                     fit.blocked_g[(ic + dc) * k + (ic + dr)] = v;
                 }
@@ -930,7 +939,13 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
     let r_sq = lyy * lyy;
     let df = (suff.n_rows - p) as f64;
     let sigma_sq = r_sq / df;
-    if !(sigma_sq.is_finite() && sigma_sq > 0.0) {
+    // An exact fit (X spans y) leaves r² as pure round-off: the last pivot is
+    // P_yy minus the other squared entries of its row, so it is known only to
+    // about dim·ε·P_yy, and its sign depends on the platform's rounding (native
+    // faer fails the factorization on a negative pivot; wasm32 gets a tiny
+    // positive one). r² at or below that floor is an exact fit.
+    let r_sq_floor = dim as f64 * f64::EPSILON * suff.c[(p, p)];
+    if !(sigma_sq.is_finite() && sigma_sq > 0.0 && r_sq > r_sq_floor) {
         return f64::INFINITY;
     }
     fit.sigma_sq = sigma_sq;
@@ -1086,11 +1101,10 @@ pub fn reml_deviance<T: Scalar + 'static>(
 
     // --- family elimination ---
     // `collapse_n_active` is written only by `precompute_balanced_collapse`,
-    // which every entry point arms once per call (`fit_lmm`, the
-    // `loop_advanced` seam). A scratch that was never armed has it at 0 and
-    // takes the per-family loop below: the same objective mathematically, but
-    // not bit-equal to the collapse route (the collapse reassociates the family
-    // sum into a θ-independent Gram combine).
+    // which `fit_lmm` arms once per call. A scratch that was never armed has
+    // it at 0 and takes the per-family loop below: the same objective
+    // mathematically, but not bit-equal to the collapse route (the collapse
+    // reassociates the family sum into a θ-independent Gram combine).
     let collapse = !slope && fit.collapse_n_active > 0;
     let mut log_lzz_half = T::ZERO; // hoisted — single binding both arms write
     if collapse {

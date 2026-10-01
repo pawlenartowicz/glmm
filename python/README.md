@@ -40,11 +40,11 @@ assert fit.converged
 fit.summary()   # prints the coefficient table (and returns it as a string)
 ```
 
-The public surface is eight names: `glmm.fit`, `glmm.Fit`, and the six warning
-categories the diagnostics channel raises — `glmm.DiagnosticWarning` (the
-base) plus `glmm.IllConditionedWarning`, `glmm.PirlsExhaustedWarning`,
-`glmm.UnusedGroupingLevelsWarning`, `glmm.ReDesignScaleWarning` and
-`glmm.HessianSeFallbackWarning`. Families, links, and knobs are string or
+The public surface is `glmm.fit`, `glmm.Fit`, and the warning categories the
+diagnostics channel raises: `glmm.DiagnosticWarning` (the base) and its
+subclasses, such as `glmm.IllConditionedWarning`, `glmm.PirlsExhaustedWarning`,
+`glmm.UnusedGroupingLevelsWarning` and `glmm.HessianSeFallbackWarning`
+(`glmm.__all__` lists them all). Families, links, and knobs are string or
 scalar arguments, not types.
 
 `data` is documented as a `dict[str, array-like]`, but anything

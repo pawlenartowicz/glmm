@@ -6,6 +6,7 @@
 //! shared by 2+ estimator test files.
 
 use super::*;
+use crate::standardize::ColumnScaling;
 use crate::{
     BinomialLink, Family, GammaLink, GroupIds, Grouping, GroupingRelation, InverseGaussianLink,
     ModelSpec, NegBinomialLink, PoissonLink, ReStructure, Sizing, StartValues,
@@ -39,6 +40,12 @@ pub(crate) const PIN_REL_ITER: f64 = 1e-7;
 /// would report whichever came first in index order rather than the spread the
 /// band has to cover.
 ///
+/// An element passes only if it is within the band, so a NaN in `got` against
+/// a finite pin fails. A NaN pin matches only a NaN (a quantity that is
+/// undefined by construction, such as the SE of a zero stddev), and a pin with
+/// no finite element at all fails: it would assert nothing. Equal values pass
+/// outright, which covers exact-zero pins.
+///
 /// # Which machine the pins are frozen on
 ///
 /// This is the one place that says it; every pin site cites this function rather
@@ -52,9 +59,9 @@ pub(crate) const PIN_REL_ITER: f64 = 1e-7;
 /// `loop_advanced`, `parallel`, `--no-default-features`) in both debug and
 /// release: eight legs, zero non-exact pins. Verified 2026-07-31 by rewriting
 /// every band to `1e-300` and re-running the suite, so a bit-exact pin passes
-/// and one off by a single ULP fails. `1e-300` and not `0.0`: at `0.0` even an
-/// exact pin fails, so each test aborts on its first quantity and a run reports
-/// every test's `beta` and nothing about its `se`. That is the `pin-bands`
+/// and one off by a single ULP fails. (`1e-300` and not `0.0` because the
+/// comparison was strict then; it is `rel <= band` now, so `0.0` does the
+/// same.) That is the `pin-bands`
 /// workflow's procedure, and it rewrites this band list — keep the two in step.
 ///
 /// **The bands are margin for a different CPU, and that cost is now measured.**
@@ -90,16 +97,26 @@ pub(crate) const PIN_REL_ITER: f64 = 1e-7;
 /// supposed to be.
 pub(crate) fn assert_pinned(got: &[f64], want: &[f64], band: f64, what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: length");
-    let mut worst = (f64::NEG_INFINITY, 0usize);
+    assert!(
+        want.iter().any(|w| !w.is_nan()),
+        "{what}: every pinned value is NaN, nothing is asserted"
+    );
+    let mut worst = (0.0f64, 0usize);
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
-        let rel = (g - w).abs() / w.abs();
+        let rel = if g == w || (g.is_nan() && w.is_nan()) {
+            0.0
+        } else {
+            (g - w).abs() / w.abs()
+        };
+        // NaN (one side NaN, or an infinite pin) ranks as the worst possible.
+        let rel = if rel.is_nan() { f64::INFINITY } else { rel };
         if rel > worst.0 {
             worst = (rel, i);
         }
     }
     let (rel, i) = worst;
     assert!(
-        rel < band,
+        rel <= band,
         "{what}[{i}] = {} vs pinned {} (rel {rel:.2e}, worst of {})",
         got[i],
         want[i],
@@ -925,12 +942,23 @@ fn theta_width_counts_vech_blocks() {
 /// D=ΛΛ'=[[4,1],[1,1.25]], vech col-major = [4, 1, 1.25]; ×scale.
 #[test]
 fn varcorr_block_is_scaled_lambda_gram() {
-    let vech = super::common::varcorr_block(&[2.0, 0.5, 1.0], 2, 1.0, &[1.0, 1.0]);
+    let spec = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 2 },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&spec, 8, &[1], &[]);
+    let vech =
+        super::common::varcorr_block(&[2.0, 0.5, 1.0], 2, 1.0, &g, 0, ColumnScaling::IDENTITY);
     assert_eq!(vech.len(), 3);
     assert!((vech[0] - 4.0).abs() < 1e-12, "D00 {}", vech[0]);
     assert!((vech[1] - 1.0).abs() < 1e-12, "D10 {}", vech[1]);
     assert!((vech[2] - 1.25).abs() < 1e-12, "D11 {}", vech[2]);
-    let scaled = super::common::varcorr_block(&[2.0, 0.5, 1.0], 2, 3.0, &[1.0, 1.0]);
+    let scaled =
+        super::common::varcorr_block(&[2.0, 0.5, 1.0], 2, 3.0, &g, 0, ColumnScaling::IDENTITY);
     assert!((scaled[0] - 12.0).abs() < 1e-12);
     assert!((scaled[2] - 3.75).abs() < 1e-12);
 }
@@ -1012,7 +1040,7 @@ fn assemble_varcorr_one_block_per_grouping() {
         &[],
     );
     let theta = [2.0, 0.5, 1.0, 0.7];
-    let vc = super::common::assemble_varcorr(&theta, &g, 1.0);
+    let vc = super::common::assemble_varcorr(&theta, &g, 1.0, ColumnScaling::IDENTITY);
     assert_eq!(vc.len(), 2);
     assert_eq!(vc[0], vec![4.0, 1.0, 1.25]);
     assert!((vc[1][0] - 0.49).abs() < 1e-12, "extra D {}", vc[1][0]);
@@ -2370,90 +2398,6 @@ fn carrier_flags_become_pirls_and_hessian_notes() {
         matches!(diag.notes[2], Note::ExactProfileFallback),
         "expected ExactProfileFallback, got {:?}",
         diag.notes[2]
-    );
-}
-
-/// A grouping `g` with a random slope on `x`, `x` built at the requested RMS
-/// scale (constant across groups; the note only reads the column, not the
-/// fit). Mirrors `sparse::tests::sparse_binomial_bigsd_formula_routes_sparse`'s
-/// `formula::lower` setup — the smallest fixture that exercises the real
-/// lowering path rather than a hand-built `ModelSpec`.
-#[cfg(feature = "formula")]
-fn scale_spread_table(x_scale: f64) -> (crate::formula::Table, usize) {
-    use crate::formula::{Column, Table};
-
-    let n_groups = 5;
-    let per_group = 8;
-    let n = n_groups * per_group;
-    let mut y = Vec::with_capacity(n);
-    let mut x = Vec::with_capacity(n);
-    let mut g_labels = Vec::with_capacity(n);
-    for gi in 0..n_groups {
-        for j in 0..per_group {
-            let jitter = j as f64 - (per_group as f64 - 1.0) / 2.0;
-            let xv = x_scale + jitter;
-            x.push(xv);
-            y.push(1.0 + 0.1 * xv / x_scale + 0.05 * gi as f64);
-            g_labels.push(format!("g{gi}"));
-        }
-    }
-    let table = Table {
-        n,
-        columns: vec![
-            ("y".to_string(), Column::Numeric(y)),
-            ("x".to_string(), Column::Numeric(x)),
-            ("g".to_string(), Column::factor_from_labels(&g_labels)),
-        ],
-    };
-    (table, n)
-}
-
-#[cfg(feature = "formula")]
-#[test]
-fn re_design_scale_spread_note_fires_on_mismatched_slope_scale() {
-    let (table, _n) = scale_spread_table(1.0e4);
-    let lo = crate::formula::lower("y ~ x + (1 + x | g)", &table, Family::Gaussian).unwrap();
-
-    let spread: Vec<&Note> = lo
-        .notes
-        .iter()
-        .filter(|n| matches!(n, Note::ReDesignScaleSpread { .. }))
-        .collect();
-    assert_eq!(
-        spread.len(),
-        1,
-        "expected exactly one note, got {:?}",
-        lo.notes
-    );
-    match spread[0] {
-        Note::ReDesignScaleSpread { grouping, ratio } => {
-            assert_eq!(grouping, "g");
-            // RMS(x) ~ 1e4 against the implicit intercept's 1.0 — same decade.
-            assert!(
-                (1.0e3..1.0e5).contains(ratio),
-                "ratio {ratio} not in the expected decade"
-            );
-        }
-        other => panic!("expected ReDesignScaleSpread, got {other:?}"),
-    }
-
-    // The note is a lowering-time observation, independent of whether the
-    // solver converges — the pipeline still runs end to end through fit_cold.
-    let _ = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-}
-
-#[cfg(feature = "formula")]
-#[test]
-fn re_design_scale_spread_note_absent_on_well_scaled_design() {
-    let (table, _n) = scale_spread_table(4.0);
-    let lo = crate::formula::lower("y ~ x + (1 + x | g)", &table, Family::Gaussian).unwrap();
-
-    assert!(
-        !lo.notes
-            .iter()
-            .any(|n| matches!(n, Note::ReDesignScaleSpread { .. })),
-        "well-scaled design should not warn, got {:?}",
-        lo.notes
     );
 }
 

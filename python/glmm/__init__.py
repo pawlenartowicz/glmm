@@ -14,9 +14,9 @@ channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
 `ExactProfileFallbackWarning`,
 `FitFailedWarning`, `GlmDivergedWarning`, `HessianSeFallbackWarning`,
 `IllConditionedWarning`, `NbShapeUnsettledWarning`, `NoCoefficientsWarning`,
-`NonIntegerResponseWarning`, `PirlsExhaustedWarning`, `ReDesignScaleWarning`,
-`RowsDroppedWarning`, `SearchLimitWarning`, `SingleLevelGroupingDroppedWarning`,
-`SingularFitWarning`, `TooFewRowsWarning`, `UnusedGroupingLevelsWarning`).
+`NonIntegerResponseWarning`, `PirlsExhaustedWarning`, `RowsDroppedWarning`,
+`SearchLimitWarning`, `SingleLevelGroupingDroppedWarning`, `SingularFitWarning`,
+`TooFewRowsWarning`, `UnusedGroupingLevelsWarning`).
 """
 
 import math
@@ -44,7 +44,6 @@ __all__ = [
     "NoCoefficientsWarning",
     "NonIntegerResponseWarning",
     "PirlsExhaustedWarning",
-    "ReDesignScaleWarning",
     "RowsDroppedWarning",
     "SearchLimitWarning",
     "SingleLevelGroupingDroppedWarning",
@@ -109,17 +108,6 @@ class SingleLevelGroupingDroppedWarning(DiagnosticWarning):
     port drops the term instead and fits the rest of the model. When every
     random-effect term is dropped this way, the model fits as though the
     formula had declared none.
-    """
-
-
-class ReDesignScaleWarning(DiagnosticWarning):
-    """A grouping's random-effect design columns sit on very different scales.
-
-    The fit is unaffected — `glmm` scales the columns internally before
-    solving — but the reported random-effect standard deviations stay on each
-    raw variable's own scale, so a large spread between them makes the numbers
-    hard to compare by eye. Rescale the offending variable(s) to bring the
-    reported stddevs onto comparable magnitudes.
     """
 
 
@@ -461,9 +449,7 @@ class Fit:
     vcov: np.ndarray  # (p, p) full Cov(beta-hat); se is sqrt of its diagonal
     tau2: np.ndarray  # legacy per-element RE variances (q=1 only) — prefer varcorr
     varcorr: list  # per grouping, in formula order (lme4 sorts by decreasing level count): vech-packed (column-major lower-tri) RE covariance
-    stddev_se: (
-        np.ndarray
-    )  # SE of each RE stddev, theta layout (not beta-aligned); NaN where unavailable
+    stddev_se: np.ndarray  # SE of each RE stddev at its diagonal slot of the theta layout (not beta-aligned); NaN off the diagonal and where unavailable
     # Everything the solver reports about the fit itself, mirroring the Rust
     # `Diagnostics` (src/fit/mod.rs) as a plain dict:
     #   converged  bool
@@ -491,14 +477,12 @@ class Fit:
     #                     budget, where nothing is pinned at the capped
     #                     endpoint.
     #   notes      list of {"kind": str, "columns": [int], "pivot": float,
-    #                     "evals": int, "final_eval": bool, "detail": str,
-    #                     "ratio": float} — observations with no dedicated
-    #                     field, each raised as a `DiagnosticWarning` subclass
-    #                     by `fit`. Mostly the solver's; the formula lowering
-    #                     contributes "unused_grouping_levels" (grouping and
-    #                     level names ride in `detail`) and
-    #                     "re_design_scale_spread" (grouping name in `detail`,
-    #                     the measured max/min column-RMS ratio in `ratio`).
+    #                     "evals": int, "final_eval": bool, "detail": str}
+    #                     — observations with no dedicated field, each raised
+    #                     as a `DiagnosticWarning` subclass by `fit`. Mostly
+    #                     the solver's; the formula lowering contributes
+    #                     "unused_grouping_levels" (grouping and level names
+    #                     ride in `detail`).
     #                     `columns` are 0-based indices into `names` (the R
     #                     package reports the same thing 1-based, per R's own
     #                     convention). An absent note means "not detected",
@@ -678,7 +662,6 @@ _WARNING_KINDS = {
     "rows_dropped_na": ("caution", "Rows dropped for missing values"),
     "argument_ignored": ("note", "Argument ignored"),
     "unused_grouping_levels": ("note", "Unused grouping levels"),
-    "re_design_scale_spread": ("note", "Random-effect predictors on very different scales"),
     "single_level_grouping_dropped": ("note", "Random effect dropped (single level)"),
 }
 # A kernel note this wrapper has no entry for keeps its own kind string.
@@ -767,7 +750,7 @@ def _note_warning(note, names, converged):
                 (
                     "The final step that computes the reported results ran out of iterations. "
                     "The estimates and their standard errors may be less accurate than usual. "
-                    "Try simplifying the random effects or rescaling the predictors."
+                    "Try simplifying the random effects."
                 ),
                 PirlsExhaustedWarning,
             )
@@ -781,16 +764,6 @@ def _note_warning(note, names, converged):
                 "are computed at the last value it reached, which may not be the best one."
             ),
             NbShapeUnsettledWarning,
-        )
-    if kind == "re_design_scale_spread":
-        return (
-            (
-                f"The predictors with random slopes for '{note['detail']}' are on very "
-                f"different scales (ratio {note['ratio']:.3g}). The fit is not affected, but "
-                "the reported random-effect standard deviations are hard to compare. "
-                "Rescaling these predictors makes them easier to read."
-            ),
-            ReDesignScaleWarning,
         )
     if kind == "single_level_grouping_dropped":
         return (
@@ -929,7 +902,7 @@ def _nonconvergence(family, mixed, notes, beta, aliased, deviance, y):
             message = _DIVERGED_CONTINUOUS
         return "glm_diverged", message, GlmDivergedWarning
     inner = [_INNER_STEPS] if any(n["kind"] == "pirls_exhausted" for n in notes) else []
-    advice = "Try a simpler random-effects structure or rescale the predictors."
+    advice = "Try a simpler random-effects structure or check for nearly collinear predictors."
     if math.isfinite(deviance) and np.all(np.isfinite(beta[~aliased])):
         sentences = [
             "The search for the variance estimates reached its step limit before it settled.",

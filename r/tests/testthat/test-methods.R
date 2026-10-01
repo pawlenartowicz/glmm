@@ -564,12 +564,17 @@ test_that("glance() returns AIC/BIC on a REML fit and says so", {
 })
 
 test_that("warm start (lme4's start=) reaches the kernel", {
+  # A start near the optimum takes visibly fewer evaluations than the cold
+  # search (10 against 16, measured 2026-10-01). theta = 0.05 was used before
+  # and took one more evaluation than the cold fit; once the design is
+  # standardized internally it happens to take the same number, so an
+  # unequal count no longer showed that the start arrived.
   d <- benchmark_data(seed = 109, family = "binomial")
   cold <- fastglmm(y ~ t + (1 | g), d, family = binomial())
   warm <- fastglmm(y ~ t + (1 | g), d, family = binomial(),
-                   start = list(beta = unname(fixef(cold)), theta = 0.05))
+                   start = list(beta = unname(fixef(cold)), theta = 0.5))
   expect_equal(unname(fixef(warm)), unname(fixef(cold)), tolerance = 1e-4)
-  expect_false(warm$n_eval == cold$n_eval)
+  expect_lt(warm$n_eval, cold$n_eval)
 })
 
 test_that("wald.se = \"rx\" is marshalled through to the kernel", {

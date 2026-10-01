@@ -86,20 +86,13 @@ test_that("agq_fallback is stored and printed with nAGQ=", {
 
 test_that("constructed notes store with their tier and title", {
   base <- list(columns = integer(0), pivot = NaN, evals = 0L, final_eval = FALSE,
-               detail = "", ratio = NaN)
+               detail = "")
   cases <- list(
     list(note = modifyList(base, list(kind = "unused_grouping_levels", detail = "g: z, w")),
          cls = "fastglmm_unused_grouping_levels",
          msg = paste("Grouping factor 'g' has levels with no rows (z, w). They stay in the",
                      "model with random effects of exactly zero, but they are not counted in",
                      "the number of groups. Remove unused categories before fitting.")),
-    list(note = modifyList(base, list(kind = "re_design_scale_spread", detail = "g",
-                                      ratio = 4200)),
-         cls = "fastglmm_re_design_scale_spread",
-         msg = paste("The predictors with random slopes for 'g' are on very different",
-                     "scales (ratio 4.2e+03). The fit is not affected, but the reported",
-                     "random-effect standard deviations are hard to compare. Rescaling",
-                     "these predictors makes them easier to read.")),
     list(note = modifyList(base, list(kind = "single_level_grouping_dropped", detail = "onegroup")),
          cls = "fastglmm_single_level_grouping_dropped",
          msg = paste("Grouping factor 'onegroup' has only one level, so no variance between",
@@ -121,8 +114,7 @@ test_that("constructed notes store with their tier and title", {
          cls = "fastglmm_pirls_exhausted",
          msg = paste("The final step that computes the reported results ran out of",
                      "iterations. The estimates and their standard errors may be",
-                     "less accurate than usual. Try simplifying the random effects or",
-                     "rescaling the predictors.")),
+                     "less accurate than usual. Try simplifying the random effects.")),
     list(note = modifyList(base, list(kind = "nb_shape_unsettled", evals = 25L)),
          cls = "fastglmm_nb_shape_unsettled",
          msg = paste("The search for the negative binomial shape parameter stopped at its",
@@ -251,7 +243,7 @@ test_that("argument notes come in the documented order", {
 INNER <- "Some of its inner steps ran out of iterations."
 PIRLS <- list(list(kind = "pirls_exhausted", columns = integer(0), pivot = NaN,
                    evals = 3L, final_eval = FALSE, detail = ""))
-ADVICE <- "Try a simpler random-effects structure or rescale the predictors."
+ADVICE <- "Try a simpler random-effects structure or check for nearly collinear predictors."
 SEARCH <- function(inner) paste(c(
   "The search for the variance estimates reached its step limit before it settled.",
   inner, "The estimates shown are the best point found; they are often close, but this is",
@@ -409,22 +401,22 @@ test_that("the kind table matches the Python port", {
     rows_dropped_na = c("caution", "Rows dropped for missing values"),
     argument_ignored = c("note", "Argument ignored"),
     unused_grouping_levels = c("note", "Unused grouping levels"),
-    re_design_scale_spread = c("note", "Random-effect predictors on very different scales"),
     single_level_grouping_dropped = c("note", "Random effect dropped (single level)")
   ))
   expect_identical(fastglmm:::.UNKNOWN_KIND, c("caution", "Unrecognized solver message"))
 })
 
-# One fixture, four notes across three kinds:
+# One fixture, three notes across two kinds:
 # argument_ignored fires twice (dispersion=/nAGQ=, both inapplicable on a
 # Gaussian model, from two different arguments) plus the formula lowering's
-# own unused_grouping_levels and re_design_scale_spread, from one
-# declared-but-empty group level ("g_mid", between two used ones) and one
-# random slope on a much larger scale than the implicit intercept. Five
-# groups, eight rows each — same shape as the Rust fixture this mirrors
-# (re_design_scale_spread_note_fires_on_mismatched_slope_scale,
-# src/fit/common_tests.rs). Same fixture and call in
-# python/tests/test_warnings.py - change together.
+# own unused_grouping_levels, from one declared-but-empty group level
+# ("g_mid", between two used ones). Five groups, eight rows each, with a
+# random slope on z, whose values sit far from zero. The fit adds one caution
+# of its own: y has no random slope, so the slope's variance comes out at
+# zero, and glmm compares standard deviations on its internally standardized
+# design, where that is a singular fit (on the raw design z's distance from
+# zero hid it). Same fixture and call in python/tests/test_warnings.py -
+# change together.
 PARITY <- local({
   n_groups <- 5L
   per_group <- 8L
@@ -446,14 +438,14 @@ PARITY <- local({
 test_that("port parity sequence adds three more kinds", {
   fit <- suppressWarnings(fastglmm(y ~ z + (1 + z | g), PARITY, dispersion = 2, nAGQ = 3))
   expect_true(fit$converged)
-  expect_identical(fit$warnings$tier, c("note", "note", "note", "note"))
+  expect_identical(fit$warnings$tier, c("note", "note", "caution", "note"))
   expect_identical(fit$warnings$kind, c(
-    "argument_ignored", "argument_ignored",
-    "unused_grouping_levels", "re_design_scale_spread"
+    "argument_ignored", "argument_ignored", "singular",
+    "unused_grouping_levels"
   ))
   expect_identical(fit$warnings$title, c(
-    "Argument ignored", "Argument ignored",
-    "Unused grouping levels", "Random-effect predictors on very different scales"
+    "Argument ignored", "Argument ignored", "Singular fit",
+    "Unused grouping levels"
   ))
 })
 

@@ -203,10 +203,21 @@ esac
 
 # ---- run directory: never overwritten --------------------------------------
 slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g; s/^-//; s/-$//'; }
-# GRID_MACHINE names the machine in run_meta and the directory name; the hostname
-# is the fallback. Keep it fixed per machine: summarize_timing.R refuses to mix
-# seconds from runs whose names differ.
-MACHINE="$(slug "${GRID_MACHINE:-$(uname -n)}")"
+# GRID_MACHINE names the machine in run_meta and the directory name. It comes
+# from the environment, else from the first line of
+# ${XDG_CONFIG_HOME:-$HOME/.config}/glmm-grid/machine; with neither, the run
+# refuses to start. There is deliberately no hostname fallback: the name is
+# committed with every kept run. Keep it fixed per machine: summarize_timing.R
+# refuses to mix seconds from runs whose names differ.
+MACHINE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/glmm-grid/machine"
+if [[ -z "${GRID_MACHINE:-}" && -r "$MACHINE_FILE" ]]; then
+  GRID_MACHINE="$(head -n 1 "$MACHINE_FILE")"
+fi
+if [[ -z "${GRID_MACHINE:-}" ]]; then
+  echo "run.sh: no machine name; set GRID_MACHINE or write one to $MACHINE_FILE" >&2
+  exit 2
+fi
+MACHINE="$(slug "$GRID_MACHINE")"
 BASE="$(date +%F)_${ENGINE_VERSION}_${MACHINE}"
 [[ -n "$LABEL" ]] && BASE="${BASE}_$(slug "$LABEL")"
 RUN_ROOT="$GRID/runs/$ENGINE"

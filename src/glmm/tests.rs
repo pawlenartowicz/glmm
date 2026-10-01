@@ -13,6 +13,19 @@ use crate::{
 };
 use faer::linalg::solvers::Solve;
 
+/// SE of each θ coordinate: the square roots of the θ-block covariance's
+/// diagonal (on a scalar block, the `stddev_se` that
+/// `stddev_se_kernel_to_caller` reports).
+fn theta_se(ws: &GlmmWorkspace) -> Vec<f64> {
+    let cov = &ws.inference.theta_cov;
+    (0..cov.nrows())
+        .map(|k| match cov[(k, k)] {
+            v if v < 0.0 => 0.0,
+            v => v.sqrt(),
+        })
+        .collect()
+}
+
 /// Fold the packed `M` values at `params` into a workspace already built on the
 /// packed layout with its columns filled (`fill_packed_cols`) — the oracle fill
 /// the blocked and structured kernels are checked against below. The packed
@@ -968,6 +981,7 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
         &vec![0.0; p],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit.converged, "fit_glmm must converge on the fixture");
     // Our solver vs lme4: θ̂ to ~0.07%, β̂ to ~0.1% (measured). Proves the two
@@ -1061,6 +1075,7 @@ fn exact_hessian_matches_fd_on_fixture() {
         &vec![0.0; p],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit.converged);
     // Cleared first so the guard below has teeth: each exact arm sizes its own
@@ -1074,13 +1089,13 @@ fn exact_hessian_matches_fd_on_fixture() {
         ws.hyper_scratch.is_some() || ws.dual_scratch.is_some(),
         "joint_hessian_cov fell through to the FD stencil"
     );
-    let tse_exact = ws.inference.theta_se.clone();
+    let tse_exact = theta_se(&ws);
 
     let mut cov_fd = Mat::<f64>::zeros(p, p);
     ws.fd.force_fd_hessian = true;
     let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
     assert_eq!(st, FdHessianStatus::Ok);
-    let tse_fd = ws.inference.theta_se.clone();
+    let tse_fd = theta_se(&ws);
 
     // Band = grid/tol.R's `se_hessian_rel` default (1e-3), applied to the SEs the
     // caller sees, not to the raw covariance entries.
@@ -1140,6 +1155,7 @@ fn exact_hessian_matches_fd_on_fixture_agq() {
         &vec![0.0; p],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit.converged);
     // Cleared first so the guard below has teeth (see the sibling test). On an
@@ -1153,13 +1169,13 @@ fn exact_hessian_matches_fd_on_fixture_agq() {
         ws.hyper_scratch.is_some(),
         "joint_hessian_cov fell through to the FD stencil on an AGQ shape"
     );
-    let tse_exact = ws.inference.theta_se.clone();
+    let tse_exact = theta_se(&ws);
 
     let mut cov_fd = Mat::<f64>::zeros(p, p);
     ws.fd.force_fd_hessian = true;
     let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
     assert_eq!(st, FdHessianStatus::Ok);
-    let tse_fd = ws.inference.theta_se.clone();
+    let tse_fd = theta_se(&ws);
 
     // Band = `AGQ_SE_HESSIAN_REL` (2e-2, `tests/oracle_support/mod.rs`),
     // applied to the SEs the caller sees, not to the raw covariance entries.
@@ -1230,6 +1246,7 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
             &vec![0.0; p],
             n,
             WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
         assert!(fit.converged, "{label}: fixture must converge");
         assert!(
@@ -1262,7 +1279,7 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
             ws.hyper_scratch.is_some() || ws.dual_scratch.is_some(),
             "{label}: joint_hessian_cov fell through to the FD stencil"
         );
-        let tse_exact = ws.inference.theta_se.clone();
+        let tse_exact = theta_se(&ws);
 
         let mut cov_fd = Mat::<f64>::zeros(p, p);
         ws.fd.force_fd_hessian = true;
@@ -1277,7 +1294,7 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
             &mut cov_fd,
         );
         assert_eq!(st, FdHessianStatus::Ok, "{label}");
-        let tse_fd = ws.inference.theta_se.clone();
+        let tse_fd = theta_se(&ws);
         ws.fd.force_fd_hessian = false;
 
         // Band = grid/tol.R's `se_hessian_rel` default (1e-3), applied to the SEs the
@@ -1335,6 +1352,7 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
         &vec![0.0; p],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit.converged, "pinned-crossed fixture must converge");
     let ti = ws.groupings.crossed[0].vech_start;
@@ -1473,12 +1491,12 @@ fn assert_fd_hessian_serial_eq_parallel(
     let mut cov_s = Mat::<f64>::zeros(p, p);
     ws.parallel_inner = false;
     let st_s = joint_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_s);
-    let tse_s = ws.inference.theta_se.clone();
+    let tse_s = theta_se(ws);
 
     let mut cov_p = Mat::<f64>::zeros(p, p);
     ws.parallel_inner = true;
     let st_p = joint_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_p);
-    let tse_p = ws.inference.theta_se.clone();
+    let tse_p = theta_se(ws);
 
     assert_eq!(st_s, st_p, "FdHessianStatus differs serial vs parallel");
     assert_eq!(
@@ -1549,6 +1567,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             &vec![0.0; p],
             n,
             WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
         assert!(fit.converged, "no-extras fixture must converge");
         ws.fd.force_fd_hessian = true;
@@ -1583,6 +1602,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             &vec![0.0; p],
             n,
             WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
         assert!(fit.converged, "packed fixture must converge");
         assert_eq!(ws.layout, GlmmLayout::Packed);
@@ -1611,6 +1631,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             &vec![0.0; p],
             n,
             WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
         assert!(
             fit.converged,
@@ -1664,6 +1685,7 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
         &vec![0.0; p],
         n,
         WaldSe::Hessian,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit_h.converged, "hessian-mode fit must converge");
     let se_h = ws_h.inference.var_diag[t1].sqrt();
@@ -1680,6 +1702,7 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
         &vec![0.0; p],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit_rx.converged, "rx-mode fit must converge");
     let se_rx = ws_rx.inference.var_diag[t1].sqrt();
@@ -1769,6 +1792,7 @@ fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
         &[0.0, 0.8],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit.converged, "fixture fit must converge");
     // High-ICC data converges to a large θ̂ (≈ 7.6 here) — the flank whose
@@ -1908,6 +1932,7 @@ fn fit_glmm_collapses_to_plain_irls_when_tau_negligible() {
         &[0.1, 0.7],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit.converged);
     assert!(
@@ -1944,6 +1969,7 @@ fn fit_glmm_width_general_slope_and_crossed() {
         &[0.2, 0.8],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit.converged);
     // Planted slope 0.8; small balanced binary GLMM (n=96) inflates β̂₁ to ≈3.2 with
@@ -1960,11 +1986,9 @@ fn fit_glmm_width_general_slope_and_crossed() {
         "z² must clear the α=0.05 bar (3.84), got {}",
         ws.inference.t_sq[1]
     );
-    assert!(
-        fit.tau_squared_hat.is_finite() && (0.0..5.0).contains(&fit.tau_squared_hat),
-        "τ̂² {}",
-        fit.tau_squared_hat
-    );
+    // τ̂² = Λ̂₀₀², the design fitted as given.
+    let tau2 = ws.params[0].powi(2);
+    assert!(tau2.is_finite() && (0.0..5.0).contains(&tau2), "τ̂² {tau2}");
 
     // Cross-layout agreement. On the draw above every θ̂ pins at 0, where the
     // crossed coupling C_f vanishes and the Schur downdate S −= C_f'A_f⁻¹C_f
@@ -1987,6 +2011,7 @@ fn fit_glmm_width_general_slope_and_crossed() {
         &[0.2, 0.8],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit.converged, "structured layout must converge");
     assert_eq!(
@@ -2006,6 +2031,7 @@ fn fit_glmm_width_general_slope_and_crossed() {
         &[0.2, 0.8],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fitp.converged, "packed layout must converge");
     assert!(
@@ -2057,6 +2083,7 @@ fn fit_glmm_warm_path_bounded_alloc() {
         &[0.2, 0.8],
         80,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     ); // warmup
     let profiler = dhat::Profiler::builder().testing().build();
     for _ in 0..20 {
@@ -2071,6 +2098,7 @@ fn fit_glmm_warm_path_bounded_alloc() {
             &[0.2, 0.8],
             80,
             WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
     }
     let stats = dhat::HeapStats::get();
@@ -2135,6 +2163,7 @@ fn fit_glmm_structured_warm_path_bounded_alloc() {
         &[0.2, 0.8],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     ); // warmup
     let profiler = dhat::Profiler::builder().testing().build();
     for _ in 0..20 {
@@ -2149,6 +2178,7 @@ fn fit_glmm_structured_warm_path_bounded_alloc() {
             &[0.2, 0.8],
             n,
             WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
     }
     let stats = dhat::HeapStats::get();
@@ -2713,6 +2743,7 @@ fn blocked_inference_matches_packed_slope_noextra() {
         &[0.2, 0.8],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit.converged);
     // Recompute Var(β̂) densely from the converged ws.pirls.w and ws.params via a
@@ -2842,6 +2873,7 @@ fn packed_fit_mode_seed_survives_sign_canonicalization() {
         &[0.2, 0.8],
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit.converged, "fixture must converge");
     let (worst, at) = (0..ws.k)
@@ -2879,6 +2911,7 @@ fn warm_start_is_per_fit_deterministic() {
         &[0.2, 0.8],
         80,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     let ref_beta = ws_ref.betas[1].to_bits();
     // Reused workspace: a throwaway fit pollutes u_seed, then the measured fit
@@ -2895,6 +2928,7 @@ fn warm_start_is_per_fit_deterministic() {
         &[0.2, 0.8],
         80,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     let _ = fit_glmm(
         &mut ws,
@@ -2907,6 +2941,7 @@ fn warm_start_is_per_fit_deterministic() {
         &[0.2, 0.8],
         80,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert_eq!(
         ws.betas[1].to_bits(),
@@ -4015,6 +4050,7 @@ fn assert_two_stage_matches_single(
         &beta_start,
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit1.converged, "{label}: single-stage fit must converge");
 
@@ -4032,6 +4068,7 @@ fn assert_two_stage_matches_single(
         &beta_start,
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit2.converged, "{label}: two-stage fit must converge");
 
@@ -4053,7 +4090,7 @@ fn assert_two_stage_matches_single(
             "{label}: θ[{t}] single {a} vs two-stage {b}"
         );
     }
-    let (ta, tb) = (fit1.tau_squared_hat, fit2.tau_squared_hat);
+    let (ta, tb) = (ws1.params[0].powi(2), ws2.params[0].powi(2));
     let trel = (ta - tb).abs() / ta.abs().max(1e-6);
     assert!(
         trel < 1e-3,
@@ -4675,6 +4712,7 @@ fn structured_inference_matches_packed() {
             &[0.2, 0.8],
             n,
             WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
         assert!(fit.converged, "{label}: fit must converge");
         let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
@@ -5723,6 +5761,7 @@ fn assert_two_stage_adversarial(
         &beta_start,
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
 
     // Second workspace keeps the constructor's default route — the A/B is
@@ -5739,6 +5778,7 @@ fn assert_two_stage_adversarial(
         &beta_start,
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
 
     if let Some(expected) = expect_converged {
@@ -5752,10 +5792,6 @@ fn assert_two_stage_adversarial(
         // Clean NaN failure surface (nan_fit): every inference output NaN — never
         // a finite value smuggled out under converged == false.
         assert!(
-            fit2.tau_squared_hat.is_nan(),
-            "{label}: failed two-stage fit must NaN τ̂²"
-        );
-        assert!(
             ws2.betas[..p].iter().all(|b| b.is_nan()),
             "{label}: failed two-stage fit must NaN β̂, got {:?}",
             &ws2.betas[..p]
@@ -5764,10 +5800,10 @@ fn assert_two_stage_adversarial(
     }
     // Two-stage converged: outputs must be genuinely finite (not NaN under a
     // converged flag), the sanity floor when single-stage supplies no reference.
+    let tau2 = ws2.params[0].powi(2);
     assert!(
-        fit2.tau_squared_hat.is_finite() && fit2.tau_squared_hat >= 0.0,
-        "{label}: converged two-stage fit must have finite τ̂² ≥ 0, got {}",
-        fit2.tau_squared_hat
+        tau2.is_finite(),
+        "{label}: converged two-stage fit must have finite τ̂², got {tau2}"
     );
     assert!(
         ws2.betas[..p].iter().all(|b| b.is_finite()),
@@ -5793,7 +5829,7 @@ fn assert_two_stage_adversarial(
                 "{label}: θ[{t}] single {a} vs two-stage {b}"
             );
         }
-        let (ta, tb) = (fit1.tau_squared_hat, fit2.tau_squared_hat);
+        let (ta, tb) = (ws1.params[0].powi(2), ws2.params[0].powi(2));
         let trel = (ta - tb).abs() / ta.abs().max(1e-6);
         assert!(
             trel < 1e-3,
@@ -7745,6 +7781,7 @@ fn packed_sparse_factor_matches_the_dense_one() {
             &[0.0, 0.0],
             n,
             WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
         assert!(fit.converged, "sparse = {sparse}: must converge");
         (
@@ -8027,21 +8064,8 @@ fn fit_glmm_vector_agq_keeps_search_lambda_at_pinned_diagonal() {
     // slope diagonal pinned under a rank-one Λ, and which one the search reaches
     // depends on its path. Seed 278 lands on the intercept-pinned face on both
     // β parameterisations of the joint search, at the same deviance.
-    let mut st = 278u64;
-    let u1: Vec<f64> = (0..nc).map(|_| 2.0 * lcg(&mut st)).collect();
-    let mut x = Mat::<f64>::zeros(n, 2);
-    let mut y = vec![0.0f64; n];
-    let mut ids = vec![0u32; n];
-    for i in 0..n {
-        let c = i % nc;
-        ids[i] = c as u32;
-        let x1 = 2.0 + 2.0 * lcg(&mut st);
-        x[(i, 0)] = 1.0;
-        x[(i, 1)] = x1;
-        let eta = 0.2 + 0.5 * x1 + u1[c] * x1;
-        let p = 1.0 / (1.0 + (-eta).exp());
-        y[i] = if lcg(&mut st) + 0.5 < p { 1.0 } else { 0.0 };
-    }
+    let (x_rows, y, ids) = pinned_diagonal_fixture(278, 0.0);
+    let x = Mat::from_fn(n, 2, |i, j| x_rows[i * 2 + j]);
     let spec = ModelSpec {
         family: Family::Binomial {
             link: BinomialLink::Logit,
@@ -8066,6 +8090,7 @@ fn fit_glmm_vector_agq_keeps_search_lambda_at_pinned_diagonal() {
         &[0.0, 0.0],
         n,
         WaldSe::Hessian,
+        ColumnScaling::IDENTITY,
     );
     assert!(fit.converged);
     assert_eq!(fit.pinned_components, 0b01, "intercept pinned, slope live");
@@ -8153,4 +8178,27 @@ fn any_within_flags_an_optimum_next_to_a_non_finite_eval() {
     // Negative control: a failed evaluation farther than `rho_begin` away is not
     // a neighbor.
     assert!(!any_within(&[3.0], &[5.5], config.rho_begin));
+}
+
+/// The data of `fit_glmm_vector_agq_keeps_search_lambda_at_pinned_diagonal`
+/// for any seed, row-major `[1, x1 + shift]`: binary logit, 400 rows in 20
+/// clusters, a random slope on `x1` drawn per cluster.
+pub(crate) fn pinned_diagonal_fixture(seed: u64, shift: f64) -> (Vec<f64>, Vec<f64>, Vec<u32>) {
+    let (n, nc) = (400usize, 20usize);
+    let mut st = seed;
+    let u1: Vec<f64> = (0..nc).map(|_| 2.0 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * 2];
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        let c = i % nc;
+        ids[i] = c as u32;
+        let x1 = 2.0 + 2.0 * lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1 + shift;
+        let eta = 0.2 + 0.5 * x1 + u1[c] * x1;
+        let p = 1.0 / (1.0 + (-eta).exp());
+        y[i] = if lcg(&mut st) + 0.5 < p { 1.0 } else { 0.0 };
+    }
+    (x, y, ids)
 }

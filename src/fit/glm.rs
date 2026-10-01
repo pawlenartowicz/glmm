@@ -5,10 +5,11 @@
 
 use faer::Mat;
 
-use crate::glm::{glm_irls_fit, GlmFitView, GlmScratch};
+use crate::glm::{glm_irls_fit_mapped, GlmFitView, GlmScratch};
+use crate::standardize::ColumnScaling;
 use crate::{Family, NegBinomialLink};
 
-use super::common::{fill_se_compact, nan_vcov, to_col_major, vcov_from_chol, FitDiagnostics};
+use super::common::{fill_se_compact, nan_vcov, vcov_from_chol, FitDiagnostics};
 use super::{Diagnostics, Fit, FitOptions};
 
 impl GlmFitView<'_> {
@@ -61,7 +62,7 @@ fn fit_unsupported_family(p: usize) -> Fit {
 
 /// Owned IRLS scratch for [`fit_glm`], sized off n/p/t exactly as [`GlmScratch`]
 /// documents. Hoistable across repeated fixed-θ GLM fits (the NB outer-θ
-/// alternation in [`fit_glm_nb_capped`]): [`glm_irls_fit`] re-seeds or NaN-fills
+/// alternation in [`fit_glm_nb_capped`]): [`crate::glm::glm_irls_fit`] re-seeds or NaN-fills
 /// every populated slot at entry, so a reused buffer is bit-identical to a fresh
 /// allocation — except `mu` (`irls_p`) on the two pre-loop early returns (n ≤ p
 /// short-circuit, Binomial all-0/all-1 short-circuit), where `irls_p` is left
@@ -141,7 +142,7 @@ pub(super) fn fit_glm(
     opts: &FitOptions,
 ) -> Fit {
     let mut buf = GlmScratchBuf::new(n, p, opts.target_indices.len());
-    let x_mat = to_col_major(x, n, p);
+    let x_mat = super::common::to_col_major(x, n, p);
     let view = fit_glm_prebuilt(
         family,
         nb_theta,
@@ -149,15 +150,29 @@ pub(super) fn fit_glm(
         y,
         opts,
         &mut buf,
+        ColumnScaling::IDENTITY,
     );
-    glm_view_to_fit(&view, y, family, nb_theta, n, p, opts)
+    glm_view_to_fit(
+        &view,
+        view.betas.to_vec(),
+        y,
+        family,
+        nb_theta,
+        n,
+        p,
+        opts,
+        ColumnScaling::IDENTITY,
+    )
 }
 
 /// [`fit_glm`]'s solve half over a prebuilt column-major `x_mat` and reusable
 /// IRLS scratch, returning the borrowed [`GlmFitView`]. Hoisted so the NB
-/// outer-θ loop ([`fit_glm_nb_capped`]) converts `x` and allocates the scratch
-/// ONCE, re-running IRLS per fixed-θ fit; the unified fit core drives it per
-/// draw. [`glm_view_to_fit`] maps the returned view to the full `Fit`.
+/// outer-θ loop ([`fit_glm_nb_capped`]) allocates the scratch ONCE, re-running
+/// IRLS per fixed-θ fit; the unified fit core drives it per draw. [`glm_view_to_fit`] maps the returned view to the full `Fit`.
+///
+/// `map` is the column map `x_mat` was fitted through: the view's `betas` stay
+/// on `x_mat`'s design, its `var_diag`/`t_sq` are the caller's
+/// (`crate::glm::glm_irls_fit_mapped`).
 pub(crate) fn fit_glm_prebuilt<'a>(
     family: Family,
     nb_theta: f64,
@@ -165,9 +180,10 @@ pub(crate) fn fit_glm_prebuilt<'a>(
     y: &[f64],
     opts: &FitOptions,
     buf: &'a mut GlmScratchBuf,
+    map: &ColumnScaling,
 ) -> GlmFitView<'a> {
     // None = β=0 cold start (no spec-derived truth on the standalone path).
-    glm_irls_fit(
+    glm_irls_fit_mapped(
         family,
         nb_theta,
         x_mat,
@@ -177,6 +193,7 @@ pub(crate) fn fit_glm_prebuilt<'a>(
         opts.weights.as_deref(),
         opts.offset.as_deref(),
         buf.as_scratch(),
+        map,
     )
 }
 
@@ -184,20 +201,22 @@ pub(crate) fn fit_glm_prebuilt<'a>(
 /// the cached Cholesky factor, Gamma dispersion + √φ SE scaling, fitted means μ̂,
 /// and the family log-likelihood. Needs raw `y` (Gamma dispersion + saturated
 /// loglik read it) and `nb_theta` (the NB shape θ̂; only NB/Gamma read it, pass
-/// `f64::NAN` otherwise).
+/// `f64::NAN` otherwise). `beta` is the caller's β̂, `B·β̃` of the view's, with
+/// `map` the column map the view was fitted through.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glm_view_to_fit(
     view: &GlmFitView<'_>,
+    beta: Vec<f64>,
     y: &[f64],
     family: Family,
     nb_theta: f64,
     n: usize,
     p: usize,
     opts: &FitOptions,
+    map: &ColumnScaling,
 ) -> Fit {
     // --- map GlmFitView → Fit ---
-    // view.betas is full [0..p]; view.var_diag is target-compact [0..t] (like OLS).
-    let beta = view.betas.to_vec();
+    // view.var_diag is target-compact [0..t] (like OLS).
     let diag = view.diagnostics();
     let converged = diag.converged;
     // Weighted Σwᵢdᵢ at the accepted iterate (NaN unless converged).
@@ -207,7 +226,7 @@ pub(crate) fn glm_view_to_fit(
     // Unscaled (X'WX)⁻¹; Gamma's φ multiplies it afterwards, exactly as √φ scales
     // `se`. `view.l` is stale-or-zero unless `converged` (its documented contract).
     let mut vcov = if converged {
-        vcov_from_chol(view.l, p, &opts.target_indices, 1.0)
+        vcov_from_chol(view.l, p, &opts.target_indices, 1.0, map)
     } else {
         nan_vcov(p)
     };
@@ -512,15 +531,20 @@ pub(crate) fn nb_theta_moment_seed(y: &[f64], n: usize) -> f64 {
 /// `Fit`'s own `dispersion` is NaN unless the fit converged, but the second
 /// element is always the last θ the alternation stood on, for callers that
 /// need a seed regardless of convergence (`fit_glmm_nb`'s outer-BOBYQA seed).
+///
+/// `x` is the column-major design the kernel fits (`n` rows) and `map` the
+/// column map it was standardized through (`β = B·β̃`); the returned `Fit` is
+/// the caller's.
 pub(super) fn fit_glm_nb(
-    x: &[f64],
+    x: faer::MatRef<'_, f64>,
     y: &[f64],
     n: usize,
     p: usize,
     theta_seed: Option<f64>,
     opts: &FitOptions,
+    map: &ColumnScaling,
 ) -> (Fit, f64) {
-    fit_glm_nb_capped(x, y, n, p, theta_seed, opts, NB_MAX_OUTER)
+    fit_glm_nb_capped(x, y, n, p, theta_seed, opts, NB_MAX_OUTER, map)
 }
 
 /// [`fit_glm_nb`]'s loop body with the outer-iteration cap as a parameter —
@@ -538,13 +562,14 @@ pub(super) fn fit_glm_nb(
 /// the second return value carries the newer θ unconditionally.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fit_glm_nb_capped(
-    x: &[f64],
+    x: faer::MatRef<'_, f64>,
     y: &[f64],
     n: usize,
     p: usize,
     theta_seed: Option<f64>,
     opts: &FitOptions,
     max_outer: usize,
+    map: &ColumnScaling,
 ) -> (Fit, f64) {
     let mut theta = theta_seed.unwrap_or_else(|| nb_theta_moment_seed(y, n));
 
@@ -552,26 +577,32 @@ pub(super) fn fit_glm_nb_capped(
         link: NegBinomialLink::Log,
     };
     // θ-invariant state, built once and reused across the θ↔β alternation: the
-    // column-major design, the IRLS scratch, and the μ̂ buffer.
-    let x_mat = to_col_major(x, n, p);
-    let x_ref = x_mat.as_ref().subrows(0, n);
+    // IRLS scratch and the μ̂ buffer.
     let mut buf = GlmScratchBuf::new(n, p, opts.target_indices.len());
     let mut mu = vec![0.0f64; n];
 
+    // The caller's β̂ of a view, `B·β̃`.
+    let caller_beta = |view: &GlmFitView<'_>| {
+        let mut beta = view.betas.to_vec();
+        map.beta_to_caller(&mut beta);
+        beta
+    };
     let mut fit_result = fit_unsupported_family(p);
     let mut settled = false;
     let mut rounds: u32 = 0;
     for _ in 0..max_outer {
         rounds += 1;
         // θ is fixed for this β fit and threaded explicitly (the spec is θ-free).
-        let view = fit_glm_prebuilt(family, theta, x_ref, y, opts, &mut buf);
-        fit_result = glm_view_to_fit(&view, y, family, theta, n, p, opts);
+        let view = fit_glm_prebuilt(family, theta, x, y, opts, &mut buf, map);
+        fit_result = glm_view_to_fit(&view, caller_beta(&view), y, family, theta, n, p, opts, map);
         if !fit_result.converged() {
             break;
         }
-        // μ̂ = exp(o + Xβ̂) for the θ optimisation.
+        // μ̂ = exp(o + Xβ̂) for the θ optimisation. `x` is the design the
+        // kernel fitted and `view.betas` its β̃, so `x·β̃ = x_caller·β` with no
+        // map (`fit_result.beta` is the caller's β, for the caller's design).
         for (i, mi) in mu.iter_mut().enumerate() {
-            let mut eta: f64 = (0..p).map(|j| x[i * p + j] * fit_result.beta[j]).sum();
+            let mut eta: f64 = (0..p).map(|j| x[(i, j)] * view.betas[j]).sum();
             if let Some(o) = &opts.offset {
                 eta += o[i];
             }
@@ -583,16 +614,17 @@ pub(super) fn fit_glm_nb_capped(
         if converged {
             settled = true;
             // Final β/SE at the converged θ for consistency.
-            let view = fit_glm_prebuilt(family, theta, x_ref, y, opts, &mut buf);
-            fit_result = glm_view_to_fit(&view, y, family, theta, n, p, opts);
+            let view = fit_glm_prebuilt(family, theta, x, y, opts, &mut buf, map);
+            fit_result =
+                glm_view_to_fit(&view, caller_beta(&view), y, family, theta, n, p, opts, map);
             break;
         }
     }
     if !settled && rounds == max_outer as u32 && fit_result.converged() {
         // Cap exit: refit β̂/SE at the θ this fit reports, so the returned Fit is
         // one model, and say that θ never settled (`Note::NbShapeUnsettled`).
-        let view = fit_glm_prebuilt(family, theta, x_ref, y, opts, &mut buf);
-        fit_result = glm_view_to_fit(&view, y, family, theta, n, p, opts);
+        let view = fit_glm_prebuilt(family, theta, x, y, opts, &mut buf, map);
+        fit_result = glm_view_to_fit(&view, caller_beta(&view), y, family, theta, n, p, opts, map);
         if fit_result.converged() {
             fit_result
                 .diagnostics

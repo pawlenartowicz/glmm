@@ -13,7 +13,7 @@ Everything under `validation/` is dev-only and never shipped: the nested
 | `manifest.json` | the per-rung model list for the in-crate tiers: one entry per dataset with its formula, family, link, factors and tier. Read by `tests/validation_oracle.rs`, `tools/bit_identity/dump.rs` and `tools/goldens_agq.R`. |
 | `goldens/` | frozen single-engine reference results for the shapes one engine covers (AGQ tiers, Gamma/NB families, probit). Read at run time by the `oracle-tests` tier. Regenerated only by `tools/goldens_agq.R`. |
 | `results/lme4_simulated/` | the frozen `lme4` results for the weights tier, read by the `oracle-tests` tier. |
-| `tools/` | tools and generators, no gates: `bit_identity/` (the byte-identity dump), `lanewidth/` (SIMD lane-width sensitivity), `memory/` (peak RSS), `goldens_agq.R` (the goldens generator), `prep/` (the fixed-seed generators of `data/`, plus `gamma_agq_reference.R`, a from-scratch Gamma AGQ reference run unweighted at the console and with `--weights` to freeze `gamma_agq_reference_wts.json`), `common.rs` (the shared reader the manifest-shaped examples include). A bare run of `goldens_agq.R` or of a `prep/` script overwrites committed artifacts, so both are deliberate acts, not routine steps. |
+| `tools/` | tools and generators, no gates: `bit_identity/` (a "what moved" report: dump the per-rung results before and after a change and diff them; the dumps are machine-local and not committed), `lanewidth/` (SIMD lane-width sensitivity), `memory/` (peak RSS), `goldens_agq.R` (the goldens generator), `prep/` (the fixed-seed generators of `data/`, plus `gamma_agq_reference.R`, a from-scratch Gamma AGQ reference run unweighted at the console and with `--weights` to freeze `gamma_agq_reference_wts.json`), `common.rs` (the shared reader the manifest-shaped examples include). A bare run of `goldens_agq.R` or of a `prep/` script overwrites committed artifacts, so both are deliberate acts, not routine steps. |
 | `campaigns/` | two finished studies, kept rerunnable: `speed-campaign/` (optimizer cost and wall time) and `monte_carlo/` (accuracy against known truth). See `campaigns/README.md`. |
 
 ## Running the grid
@@ -81,7 +81,10 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
   place the quadrature grid differently there, so their deviances are two
   different approximations. Gate 1 therefore evaluates GLMMadaptive's rule at
   glmm's fitted point (`ga_rule_dev` in `grid/dev_align.R`) and compares that
-  with GLMMadaptive's own deviance; the cell's line says so.
+  with GLMMadaptive's own deviance; the cell's line says so. glmm's own deviance
+  on these cells also moves with how the design is standardized, so a glmm run
+  compared cell by cell with an earlier glmm run reads them against
+  `dev_eps_agq_vec` in `grid/tol.R`, not `dev_eps`.
 - **In-crate references** — `goldens/` and `results/lme4_simulated/`, frozen, read
   by `cargo test --features oracle-tests`.
 

@@ -34,14 +34,17 @@ use faer::{Mat, MatMut, MatRef};
 use std::sync::OnceLock;
 
 use crate::scalar::Scalar;
+use crate::standardize::ColumnScaling;
 use crate::FLOAT_NEAR_ZERO;
 
 mod kernel;
+mod re_map;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use kernel::{precompute_balanced_collapse, DesignQr};
 pub use kernel::{reml_deviance, LmmSuffStats};
+use re_map::{pack_vech, refactor, PivotFloor};
 
 /// θ start — DIAGONAL vech entries only; off-diagonals cold-start at 0
 /// (unit diagonal, the lme4/MixedModels.jl default — the
@@ -85,8 +88,8 @@ pub const THETA_TRUTH_FLOOR: f64 = 0.01;
 /// with the shipped τ̂≈0 detection, which pins `boundary_hit=1` fits at
 /// θ = 1e-4.
 ///
-/// **Tested on the INTERNAL θ** — the scaled coordinate the solver minimizes over
-/// ([`LmmGroupings::set_slope_scales`]), not on θ in the design's own units.
+/// **Tested on the INTERNAL θ**, the coordinate the solver minimizes over on
+/// the fitted design (`crate::standardize`), not on θ in the design's own units.
 /// Internal θ is what the optimizer's own stopping geometry lives on, and it is
 /// the only version of the test that does not change its verdict when a
 /// random-slope column is re-expressed in different units. The cost is that a
@@ -307,50 +310,6 @@ pub struct LmmGroupings {
     /// Empty (or empty inner) for intercept-only extras. Used by `add_rows_multi`
     /// (covariate-weighted scatter) and the blocked tail Gram recovery.
     pub extra_slope_cols: Vec<Vec<usize>>,
-    /// Internal scale `s_d` of each primary random-slope design column, parallel
-    /// to `primary_slope_cols`. Every site that reads that column as a
-    /// RANDOM-EFFECT covariate divides by it; the fixed-effect design keeps the
-    /// raw column. See [`LmmGroupings::set_slope_scales`] for the identity and
-    /// `rms_column_scale` for the statistic. All `1.0` until `set_slope_scales`
-    /// runs, and `1.0` divides exactly, so an unset grouping takes the unscaled
-    /// arithmetic bit-for-bit.
-    pub primary_slope_scales: Vec<f64>,
-    /// Per-extra-grouping twin of `primary_slope_scales`, parallel to
-    /// `extra_slope_cols` (declaration order).
-    pub extra_slope_scales: Vec<Vec<f64>>,
-}
-
-/// Weighted root-mean-square of design column `col`: `√(Σᵢ wᵢ xᵢ² / Σᵢ wᵢ)`.
-///
-/// This is the internal scale a random-effect design column is divided by. It is
-/// the weighted second moment about ZERO, not a centered sd, for one reason: it
-/// returns EXACTLY `1.0` on a constant-1 column under any weights, because
-/// `Σw/Σw` is `1.0` in IEEE-754 and `√1 = 1`. That exactness is what makes an
-/// implicit intercept subcolumn's factor exact and keeps an intercept-only
-/// design bit-identical to the unscaled path. A centered sd returns `0` there
-/// and would need a special case.
-///
-/// A degenerate column — zero total weight, zero weighted second moment, or a
-/// non-finite one — returns `1.0`: the scaling map has to stay invertible, and a
-/// column with no spread has no conditioning to fix.
-pub fn rms_column_scale(x: MatRef<'_, f64>, col: usize, weights: Option<&[f64]>) -> f64 {
-    let mut num = 0.0f64;
-    let mut den = 0.0f64;
-    for i in 0..x.nrows() {
-        let w = weights.map_or(1.0, |w| w[i]);
-        let v = x[(i, col)];
-        num += w * v * v;
-        den += w;
-    }
-    if den <= 0.0 {
-        return 1.0;
-    }
-    let s = (num / den).sqrt();
-    if s.is_finite() && s > 0.0 {
-        s
-    } else {
-        1.0
-    }
 }
 
 /// The vech-diagonal θ-index walk, single source of truth for
@@ -524,96 +483,8 @@ impl LmmGroupings {
             diagonal_run_len: compute_diagonal_run_len(q_p, &extra_qs),
             extra_slopes_any,
             extra_q: extra_qs,
-            primary_slope_scales: vec![1.0; slope_cols.len()],
-            extra_slope_scales: extra_slope_cols
-                .iter()
-                .map(|v| vec![1.0; v.len()])
-                .collect(),
             extra_slope_cols,
         }
-    }
-
-    /// Recompute the internal RE design-column scales from this fit's design and
-    /// prior weights. Every route calls this once, after the grouping structure
-    /// is built and before anything reads a design column as a random-effect
-    /// covariate.
-    ///
-    /// The identity being installed: for a `q`-column RE block with per-column
-    /// scales `s₁…s_q`, replacing the block's design `Z` by `Z̃ = Z·diag(1/sᵢ)`
-    /// and its relative Cholesky factor `Λ` by `Λ̃[i][j] = sᵢ·Λ[i][j]` leaves
-    /// `Z̃Λ̃ = ZΛ` — the same model, the same likelihood, the same REML criterion.
-    /// Only the path BOBYQA takes through that criterion changes: θ̃ = s·θ puts
-    /// every component on a comparable scale, so the solver's single trust radius
-    /// can resolve them all (Bates et al. 2015 §3 for the `Λ_θ` parametrization
-    /// this rides on). The covariance block back-maps as
-    /// `D[i][j] = D̃[i][j]/(sᵢ·s_j)`, and a conditional mode as `b = b̃/sᵢ`;
-    /// neither direction puts a Jacobian into the criterion.
-    ///
-    /// The implicit intercept subcolumn is exactly `1.0` and is not stored, so an
-    /// intercept-only grouping is untouched by construction.
-    pub fn set_slope_scales(&mut self, x: MatRef<'_, f64>, weights: Option<&[f64]>) {
-        for d in 0..self.primary_slope_cols.len() {
-            self.primary_slope_scales[d] = rms_column_scale(x, self.primary_slope_cols[d], weights);
-        }
-        for e in 0..self.extra_slope_cols.len() {
-            for d in 0..self.extra_slope_cols[e].len() {
-                self.extra_slope_scales[e][d] =
-                    rms_column_scale(x, self.extra_slope_cols[e][d], weights);
-            }
-        }
-    }
-
-    /// Λ-row scale factor for row `r` of block `b` (`b == 0` the primary, `b == e+1`
-    /// extra grouping `e`). Row 0 is the intercept subcolumn — exactly `1.0`.
-    pub fn block_row_scale(&self, b: usize, r: usize) -> f64 {
-        if r == 0 {
-            return 1.0;
-        }
-        if b == 0 {
-            self.primary_slope_scales[r - 1]
-        } else {
-            self.extra_slope_scales[b - 1][r - 1]
-        }
-    }
-
-    /// Per-θ-index Λ-row scale, in θ order (primary vech, then each extra's vech in
-    /// declaration order — the layout `n_theta`/`vech_start` assign). The solver's
-    /// internal θ̃ relates to θ in the user's design units by `θ̃ = s·θ`
-    /// entry-wise, so this vector is the forward map for a user warm start and the
-    /// divisor for anything read back off θ̂ (see [`Self::set_slope_scales`]).
-    pub fn theta_row_scales(&self) -> Vec<f64> {
-        let mut out = vec![0.0; self.n_theta()];
-        self.fill_theta_row_scales(&mut out);
-        out
-    }
-
-    /// [`Self::theta_row_scales`] into caller-owned storage, so a per-draw caller
-    /// can read the scales without a heap block. `out.len()` must be `n_theta()`.
-    pub fn fill_theta_row_scales(&self, out: &mut [f64]) {
-        debug_assert_eq!(out.len(), self.n_theta());
-        let mut i = 0;
-        for (b, &q) in std::iter::once(&self.primary_q)
-            .chain(self.extra_q.iter())
-            .enumerate()
-        {
-            // Column-major vech: column c contributes rows c..q.
-            for c in 0..q {
-                for r in c..q {
-                    out[i] = self.block_row_scale(b, r);
-                    i += 1;
-                }
-            }
-        }
-    }
-
-    /// True iff any random-effect design column carries a scale other than exactly
-    /// `1.0` — i.e. iff this fit's arithmetic differs from the unscaled path at all.
-    pub fn any_slope_scaled(&self) -> bool {
-        self.primary_slope_scales.iter().any(|&s| s != 1.0)
-            || self
-                .extra_slope_scales
-                .iter()
-                .any(|v| v.iter().any(|&s| s != 1.0))
     }
 
     /// Primary vech (`q_p(q_p+1)/2`) + a `vech(Λ_g)` block per extra grouping
@@ -1294,17 +1165,15 @@ pub fn primary_lambda<T: Scalar>(theta: &[T], q: usize, lam: &mut [T]) {
 /// `Diagnostics::pinned` depends on it: without this fold, a column with a
 /// live off-diagonal would be called a zero variance component.
 ///
-/// `theta` is the INTERNAL row-scaled θ̃ = S·θ. No scale map is needed here:
-/// `S·chol(Σ)` is lower triangular with the same zero pattern and squares to
-/// `SΣS`, so it IS the lower Cholesky of the scaled Σ — row scaling commutes
-/// with this factorization, and canonicalizing the internal θ̃ is the same
-/// operation as canonicalizing θ in the design's own units.
+/// `theta` is the kernel's θ, on the fitted design. Row scaling commutes with
+/// this factorization (`S·chol(Σ)` is lower triangular with the same zero
+/// pattern and squares to `SΣS`), so a column's scale does not change what is
+/// folded.
 pub(crate) fn canonicalize_pinned_blocks(g: &LmmGroupings, theta: &mut [f64]) -> bool {
     let mut changed = false;
     let mut start = 0usize;
-    // Same factor walk as `compute_diagonal_theta` / `fill_theta_row_scales` /
-    // `fix_column_signs` (primary, then each extra in declaration order) —
-    // change together.
+    // Same factor walk as `compute_diagonal_theta` / `fix_column_signs`
+    // (primary, then each extra in declaration order) — change together.
     for &q in std::iter::once(&g.primary_q).chain(g.extra_q.iter()) {
         let len = q * (q + 1) / 2;
         // q == 1 has nothing below a diagonal to fold. Past MAX_PRIMARY_Q the
@@ -1433,56 +1302,21 @@ fn canonicalize_block(vech: &mut [f64], q: usize) -> bool {
         return false;
     }
 
+    // Semidefinite factor of ΛΛᵀ with the `q·eps·tr Σ` pivot floor: a pinned
+    // column stays exactly zero (`PivotFloor::Trace` carries the floor's
+    // argument).
     let mut lam = [0.0_f64; MAX_PRIMARY_Q * MAX_PRIMARY_Q];
     primary_lambda(vech, q, &mut lam); // Λ lower-tri, row-major
-    let mut sig = [0.0_f64; MAX_PRIMARY_Q * MAX_PRIMARY_Q];
-    let mut trace = 0.0;
-    for r in 0..q {
-        for c in 0..=r {
-            let mut s = 0.0;
-            for k in 0..=c {
-                s += lam[r * q + k] * lam[c * q + k];
-            }
-            sig[r * q + c] = s;
-        }
-        trace += sig[r * q + r];
-    }
-
-    // Pivot floor. Round-off in forming Σ and in the factorization is
-    // O(q·eps·‖Σ‖₂) and ‖Σ‖₂ ≤ tr Σ for a PSD Σ, so a pivot at or below this is
-    // the rank the pin removed, not a direction. A rank-deficient pivot can
-    // come out slightly NEGATIVE, and the NaN arm catches a non-finite θ̂ —
-    // between them nothing unsound reaches `sqrt`.
-    let tol = q as f64 * f64::EPSILON * trace;
-    let mut l = [0.0_f64; MAX_PRIMARY_Q * MAX_PRIMARY_Q];
-    for c in 0..q {
-        let mut d = sig[c * q + c];
-        for k in 0..c {
-            d -= l[c * q + k] * l[c * q + k];
-        }
-        if d <= tol || d.is_nan() {
-            continue; // column c stays exactly zero
-        }
-        let lcc = d.sqrt();
-        l[c * q + c] = lcc;
-        for r in (c + 1)..q {
-            let mut s = sig[r * q + c];
-            for k in 0..c {
-                s -= l[r * q + k] * l[c * q + k];
-            }
-            l[r * q + c] = s / lcc;
-        }
-    }
-
-    let mut changed = false;
-    let mut t = 0usize;
-    for c in 0..q {
-        for r in c..q {
-            changed |= l[r * q + c].to_bits() != vech[t].to_bits();
-            vech[t] = l[r * q + c];
-            t += 1;
-        }
-    }
+    let mut scratch = [0.0_f64; 2 * MAX_PRIMARY_Q * MAX_PRIMARY_Q];
+    refactor(q, &mut lam, &mut scratch, PivotFloor::Trace);
+    let mut packed = [0.0_f64; MAX_PRIMARY_Q * (MAX_PRIMARY_Q + 1) / 2];
+    let packed = &mut packed[..vech.len()];
+    pack_vech(&lam, q, packed);
+    let changed = vech
+        .iter()
+        .zip(packed.iter())
+        .any(|(a, b)| a.to_bits() != b.to_bits());
+    vech.copy_from_slice(packed);
     changed
 }
 
@@ -1504,17 +1338,12 @@ fn primary_gram<T: Scalar>(
     }
     gram[0] = T::from_f64(suff.counts[f]); // G[0][0]
     for a in 1..q {
-        // `s_raw`'s COLUMN carries the RE column's own internal scale (divided in
-        // at accumulation), but its ROW is the raw `x` entry — so a Gram between
-        // two RE columns picks up only one of the two divisions here and needs the
-        // row side applied explicitly. Intercept rows have scale 1 by construction.
-        let s_a = g.primary_slope_scales[a - 1];
-        let sa = T::from_f64(suff.s_raw[(g.primary_slope_cols[a - 1], f)] / s_a); // Σ z_{a-1} over f
+        let sa = T::from_f64(suff.s_raw[(g.primary_slope_cols[a - 1], f)]); // Σ z_{a-1} over f
         gram[a] = sa;
         gram[a * q] = sa;
         for b in 1..=a {
             // Σ z_{a-1} z_{b-1} over f — slope_{a-1}'s subcol against slope_{b-1}'s level.
-            let v = T::from_f64(suff.s_raw[(g.primary_slope_cols[a - 1], b * n_prim + f)] / s_a);
+            let v = T::from_f64(suff.s_raw[(g.primary_slope_cols[a - 1], b * n_prim + f)]);
             gram[a * q + b] = v;
             gram[b * q + a] = v;
         }
@@ -1596,16 +1425,10 @@ fn assemble_fam_a<T: Scalar>(
             for e in 0..q {
                 let mut acc = T::ZERO;
                 for d in e..q {
-                    // `s_raw`-ROW read of a slope covariate ⇒ apply the internal scale
-                    // (the column here is the child's intercept, scale 1); see
-                    // `primary_gram` for why the row side is not already divided.
                     let graw_d = if d == 0 {
                         n_c
                     } else {
-                        T::from_f64(
-                            suff.s_raw[(g.primary_slope_cols[d - 1], gcol)]
-                                / g.primary_slope_scales[d - 1],
-                        )
+                        T::from_f64(suff.s_raw[(g.primary_slope_cols[d - 1], gcol)])
                     };
                     acc += prim_lam[d * q + e] * graw_d;
                 }
@@ -2078,7 +1901,11 @@ pub struct LmmFit {
 ///      is negligible at p ≤ 20).
 ///   2. `solve_in_place(I_p)` against the new Cholesky → `joint_k_inv` becomes
 ///      `K⁻¹`. The function refills the identity internally before solving, so
-///      the caller need not pre-initialize `joint_k_inv`.
+///      the caller need not pre-initialize `joint_k_inv`. Then
+///      `joint_k_inv ← B·K⁻¹·Bᵀ`, with `B` the column map `map` (`β = B·β̃`
+///      from the design `K` was formed on to the caller's): the caller's
+///      `Var(β̂)/σ̂²`. The identity map leaves `K⁻¹` untouched. `betas` are the
+///      caller's.
 ///   3. Gather `(K⁻¹)_TT` into the top-left k×k block of `joint_sigma_t_chol`.
 ///   4. In-place Cholesky on that k×k block.
 ///   5. Solve `Σ_T x = β̂_T` via the new k×k Cholesky factor (`solve_in_place`
@@ -2087,6 +1914,7 @@ pub struct LmmFit {
 ///   7. Divide by `σ̂²` and return; on any numerical failure return `NaN`.
 ///
 /// Returns `NaN` if `k == 0`, `σ̂² ≤ 0`, or any of the Cholesky steps fail.
+#[allow(clippy::too_many_arguments)] // the K / β̂ / target inputs, three scratch slots, the map
 pub(crate) fn joint_wald_chi_sq(
     xtvix: MatRef<'_, f64>,
     betas: &[f64],
@@ -2095,6 +1923,7 @@ pub(crate) fn joint_wald_chi_sq(
     mut joint_k_inv: MatMut<'_, f64>,
     mut joint_sigma_t_chol: MatMut<'_, f64>,
     joint_rhs: &mut [f64],
+    map: &ColumnScaling,
 ) -> f64 {
     use faer::linalg::solvers::Solve;
     use faer::reborrow::Reborrow;
@@ -2120,6 +1949,9 @@ pub(crate) fn joint_wald_chi_sq(
         }
     }
     chol.solve_in_place(joint_k_inv.rb_mut());
+    // K⁻¹ is the fitted design's Var(β̃)/σ²; the target block is read
+    // in the caller's coordinates, (B·K⁻¹·Bᵀ)_TT, against the caller's β̂_T.
+    map.congruence(joint_k_inv.rb_mut());
 
     // Step 3: gather Σ_T = (K⁻¹)_TT into the top-left k×k of `joint_sigma_t_chol`.
     for (a, &ti) in target_indices.iter().enumerate() {
@@ -2177,10 +2009,15 @@ pub(crate) fn joint_wald_chi_sq(
 /// per-scenario constant — determinism and chunk merging are unaffected. The
 /// DGP-derived hint is a deliberate, recorded exception to the
 /// generation↔estimation split.
+///
+/// `map` is the column standardization the rows were accumulated under:
+/// β̂, `var_diag`, `t_sq` and the joint Wald are reported through it
+/// (`ColumnScaling::IDENTITY` for a design fitted as given).
 pub fn fit_lmm(
     ws: &mut LmmWorkspace,
     target_indices: &[u32],
     theta_start: Option<&[f64]>,
+    map: &ColumnScaling,
 ) -> LmmFit {
     let LmmWorkspace {
         kernel,
@@ -2214,14 +2051,11 @@ pub fn fit_lmm(
     match theta_start {
         Some(ts) => {
             debug_assert_eq!(ts.len(), theta.len());
-            // A caller's θ is in the design's own units; the solver works on the
-            // internally scaled θ̃ = s·θ (`LmmGroupings::set_slope_scales`), so the
-            // warm start takes the forward map before anything else touches it.
-            // THETA_TRUTH_FLOOR then floors the INTERNAL diagonals — the same scale
-            // `PIN_THETA` tests, so the two absolute thresholds stay on one axis.
-            let s = kernel.groupings().theta_row_scales();
-            for ((t, &v), &sc) in theta.iter_mut().zip(ts).zip(s.iter()) {
-                *t = v * sc;
+            // `ts` is already on the fitted design (`fit::common::start_to_design`),
+            // so THETA_TRUTH_FLOOR floors the same θ `PIN_THETA` tests and the two
+            // absolute thresholds stay on one axis.
+            for (t, &v) in theta.iter_mut().zip(ts) {
+                *t = v;
             }
             for &i in kernel.groupings().diagonal_theta() {
                 theta[i] = theta[i].max(THETA_TRUTH_FLOOR);
@@ -2410,10 +2244,15 @@ pub fn fit_lmm(
     // one against the mapped factor Uᵀ·L̃_XX, which would round the product.
     recovery.betas.copy_from_slice(&recovery.beta_tilde);
     kernel.design_qr().map_beta(&mut recovery.betas);
+    // β̂ on the caller's columns: β = B·β̂(standardized), `map` the column
+    // standardization the rows were accumulated under. `beta_tilde` stays on
+    // the kernel's design for the conditional-mode recovery below.
+    map.beta_to_caller(&mut recovery.betas);
     let factor = kernel.factor();
 
-    // Var(β̂_j) = σ̂²·‖L_XX⁻¹e_j‖² per target; t² = β̂²/Var, via a forward
-    // solve on this factor.
+    // Var(β̂ₜ) = σ̂²·‖L_XX⁻¹bₜ‖² per target, bₜ row t of the column map B (eₜ
+    // when the design is fitted as given); t² = β̂²/Var, via a forward solve on
+    // this factor.
     let sigma_sq = kernel.sigma_sq();
     for &tj in target_indices {
         let tj = tj as usize;
@@ -2421,7 +2260,7 @@ pub fn fit_lmm(
             *v = 0.0;
         }
         for i in 0..p {
-            let b_i = if i == tj { 1.0 } else { 0.0 };
+            let b_i = map.rhs(tj, i);
             let mut acc = b_i;
             for k in 0..i {
                 acc -= factor[(i, k)] * recovery.u[k];
@@ -2462,6 +2301,7 @@ pub fn fit_lmm(
             recovery.joint_k_inv.as_mut(),
             recovery.joint_sigma_t_chol.as_mut(),
             &mut recovery.joint_rhs,
+            map,
         )
     };
 

@@ -105,12 +105,9 @@ pub struct NoteInfo {
     pub final_eval: bool,
     /// Free text a variant needs and the fields above cannot carry (the
     /// grouping and level names of `UnusedGroupingLevels`, the grouping name
-    /// of `ReDesignScaleSpread` and of `SingleLevelGroupingDropped`). Empty
-    /// otherwise; the `kind`, not this string, stays the stable identifier.
+    /// of `SingleLevelGroupingDropped`). Empty otherwise; the `kind`, not this
+    /// string, stays the stable identifier.
     pub detail: String,
-    /// `ReDesignScaleSpread` payload: the measured max/min column-RMS ratio
-    /// (that variant's `ratio`). `NaN` for every other variant.
-    pub ratio: f64,
 }
 
 /// One `crate::formula::RanefBlock` flattened for the ports:
@@ -138,7 +135,6 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals: 0,
                 final_eval: false,
                 detail: String::new(),
-                ratio: f64::NAN,
             },
             Note::PirlsExhausted { evals, final_eval } => NoteInfo {
                 kind: "pirls_exhausted",
@@ -147,7 +143,6 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals,
                 final_eval,
                 detail: String::new(),
-                ratio: f64::NAN,
             },
             Note::UnusedGroupingLevels { grouping, levels } => NoteInfo {
                 kind: "unused_grouping_levels",
@@ -156,16 +151,6 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals: 0,
                 final_eval: false,
                 detail: format!("{grouping}: {}", levels.join(", ")),
-                ratio: f64::NAN,
-            },
-            Note::ReDesignScaleSpread { grouping, ratio } => NoteInfo {
-                kind: "re_design_scale_spread",
-                columns: Vec::new(),
-                pivot: f64::NAN,
-                evals: 0,
-                final_eval: false,
-                detail: grouping,
-                ratio,
             },
             Note::HessianSeFallback => NoteInfo {
                 kind: "hessian_se_fallback",
@@ -174,7 +159,6 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals: 0,
                 final_eval: false,
                 detail: String::new(),
-                ratio: f64::NAN,
             },
             Note::NbShapeUnsettled { rounds } => NoteInfo {
                 kind: "nb_shape_unsettled",
@@ -183,7 +167,6 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals: rounds,
                 final_eval: false,
                 detail: String::new(),
-                ratio: f64::NAN,
             },
             Note::NonIntegerResponse { rows } => NoteInfo {
                 kind: "non_integer_response",
@@ -192,7 +175,6 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals: rows,
                 final_eval: false,
                 detail: String::new(),
-                ratio: f64::NAN,
             },
             Note::SingleLevelGroupingDropped { grouping } => NoteInfo {
                 kind: "single_level_grouping_dropped",
@@ -201,7 +183,6 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals: 0,
                 final_eval: false,
                 detail: grouping,
-                ratio: f64::NAN,
             },
             Note::ExactProfileFallback => NoteInfo {
                 kind: "exact_profile_fallback",
@@ -210,7 +191,6 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals: 0,
                 final_eval: false,
                 detail: String::new(),
-                ratio: f64::NAN,
             },
         })
         .collect()
@@ -660,25 +640,21 @@ mod tests {
     #[test]
     fn note_payloads_survive_flattening() {
         let notes = note_infos(vec![
-            Note::ReDesignScaleSpread {
+            Note::SingleLevelGroupingDropped {
                 grouping: "Subject".to_string(),
-                ratio: 4200.0,
             },
             Note::HessianSeFallback,
             Note::NbShapeUnsettled { rounds: 25 },
             Note::ExactProfileFallback,
         ]);
-        assert_eq!(notes[0].kind, "re_design_scale_spread");
+        assert_eq!(notes[0].kind, "single_level_grouping_dropped");
         assert_eq!(notes[0].detail, "Subject");
-        assert_eq!(notes[0].ratio, 4200.0);
         assert_eq!(notes[1].kind, "hessian_se_fallback");
         assert_eq!(notes[1].detail, "");
-        assert!(notes[1].ratio.is_nan());
         assert_eq!(notes[2].kind, "nb_shape_unsettled");
         assert_eq!(notes[2].evals, 25);
         assert_eq!(notes[3].kind, "exact_profile_fallback");
         assert_eq!(notes[3].detail, "");
-        assert!(notes[3].ratio.is_nan());
     }
 
     /// A factor column in the `(levels, codes)` form `run_fit` takes, with the

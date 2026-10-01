@@ -405,7 +405,7 @@ pub(crate) struct BorderScratch {
 }
 
 /// The β coordinates of the joint `[θ | β]` BOBYQA, the fixed-effect twin of
-/// the internally scaled θ̃ (`LmmGroupings::set_slope_scales`). The search runs
+/// the slope scaling θ̃ is searched on (`crate::standardize`). The search runs
 /// on `β̃ = Lᵀβ`, with `L` the lower Cholesky factor of the prior-weighted Gram
 /// matrix `G = Σᵢ wᵢ xᵢxᵢᵀ / Σᵢ wᵢ` of this fit's design. Then `η = Xβ = X̃β̃`
 /// with `X̃ = XL⁻ᵀ`, whose weighted Gram is the identity: a unit step along any
@@ -413,13 +413,20 @@ pub(crate) struct BorderScratch {
 /// on. So `rho_begin`, `rho_end` and the non-finite-point radius mean the same
 /// in every unit of X, and a column `x + a` next to the intercept is searched
 /// as the centred column (for `X = [1, x]`, `Lᵀβ = (β₀ + x̄β₁, sd(x)·β₁)`).
-/// Reduced to its diagonal, this is `rms_column_scale`, the θ side's statistic.
+/// Reduced to its diagonal, this is the root mean square about zero, the
+/// statistic a 0/1 slope column is scaled by.
 /// The map is linear, so the objective, its optimum and the reported β are the
 /// same model in either coordinate; only the path BOBYQA takes changes.
+/// `G` is never formed: with `√W·X = Q·R = Q·D·U` the factor the LMM kernels
+/// orthogonalize by (`lmm::DesignQr`), `Lᵀ = R/√Σw = diag(D/√Σw)·U`.
 pub(crate) struct BetaScale {
-    /// p × p row-major; lower triangle holds `L` when `active`.
-    chol: Vec<f64>,
-    /// False when `G` has no Cholesky factor (a zero or exactly collinear
+    /// `U` and `D` of this fit's design.
+    qr: crate::lmm::DesignQr,
+    /// length p: `Dᵢᵢ/√Σw`, so `Lᵀ = diag(scale)·U`.
+    scale: Vec<f64>,
+    /// length p: the Givens row scratch of `DesignQr::set_from_rows`.
+    row: Vec<f64>,
+    /// False when `R` has a zero diagonal (a zero or exactly collinear
     /// column): the search then runs on β itself.
     active: bool,
     /// The joint point in the caller's β units handed to the objective, length
@@ -430,48 +437,43 @@ pub(crate) struct BetaScale {
 impl BetaScale {
     pub(crate) fn new(p: usize, len: usize) -> Self {
         BetaScale {
-            chol: vec![0.0; p * p],
+            qr: crate::lmm::DesignQr::identity(p),
+            scale: vec![1.0; p],
+            row: vec![0.0; p],
             active: false,
             point: vec![0.0; len],
         }
     }
 
-    /// Factor `G` for this fit's design (`n` live rows, prior weights `w`).
+    /// Factor this fit's design (`n` live rows, prior weights `w`).
     pub(crate) fn set(&mut self, x: MatRef<f64>, w: &[f64], n: usize) {
-        let p = x.ncols();
-        debug_assert_eq!(self.chol.len(), p * p);
         let sw: f64 = w[..n].iter().sum();
-        for a in 0..p {
-            for b in 0..=a {
-                let mut acc = 0.0;
-                for i in 0..n {
-                    acc += w[i] * x[(i, a)] * x[(i, b)];
-                }
-                self.chol[a * p + b] = acc / sw;
+        self.active = sw > 0.0
+            && self
+                .qr
+                .set_from_rows(x.subrows(0, n), |i| w[i].sqrt(), &mut self.row);
+        if self.active {
+            let r = sw.sqrt();
+            for (s, &d) in self.scale.iter_mut().zip(self.qr.r_diag()) {
+                *s = d / r;
             }
         }
-        self.active = sw > 0.0 && crate::linalg::block_chol(&mut self.chol, p);
     }
 
-    /// β → β̃ = Lᵀβ, in place (row i reads only β_j, j ≥ i).
+    /// β → β̃ = Lᵀβ, in place.
     pub(crate) fn to_search(&self, beta: &mut [f64]) {
-        if !self.active {
-            return;
-        }
-        let p = beta.len();
-        for i in 0..p {
-            let mut v = 0.0;
-            for (j, &b) in beta.iter().enumerate().skip(i) {
-                v += self.chol[j * p + i] * b;
+        if self.active {
+            self.qr.apply_u(beta);
+            for (b, &s) in beta.iter_mut().zip(&self.scale) {
+                *b *= s;
             }
-            beta[i] = v;
         }
     }
 
     /// β̃ → β, in place.
     pub(crate) fn to_caller(&self, beta: &mut [f64]) {
         if self.active {
-            solve_lt(&self.chol, beta);
+            unscale(&self.qr, &self.scale, beta);
         }
     }
 
@@ -480,22 +482,18 @@ impl BetaScale {
     pub(crate) fn caller_point(&mut self, gamma: &[f64], n_theta: usize, p: usize) -> &[f64] {
         self.point.copy_from_slice(gamma);
         if self.active {
-            solve_lt(&self.chol, &mut self.point[n_theta..n_theta + p]);
+            unscale(&self.qr, &self.scale, &mut self.point[n_theta..n_theta + p]);
         }
         &self.point
     }
 }
 
-/// Back substitution `Lᵀβ = b` in place, `L` row-major lower `p × p`.
-fn solve_lt(chol: &[f64], b: &mut [f64]) {
-    let p = b.len();
-    for i in (0..p).rev() {
-        let mut v = b[i];
-        for j in (i + 1)..p {
-            v -= chol[j * p + i] * b[j];
-        }
-        b[i] = v / chol[i * p + i];
+/// `β̃ → β = U⁻¹·(β̃ / scale)` in place.
+fn unscale(qr: &crate::lmm::DesignQr, scale: &[f64], beta: &mut [f64]) {
+    for (b, &s) in beta.iter_mut().zip(scale) {
+        *b /= s;
     }
+    qr.map_beta(beta);
 }
 
 /// The finite-difference pass's seed state, set by `joint_hessian_cov` before
@@ -569,15 +567,14 @@ pub(crate) struct InferenceScratch {
     pub var_diag: Vec<f64>,
     /// length p
     pub t_sq: Vec<f64>,
-    // SE of each θ coordinate = sqrt of the θ-block diagonal of the joint (θ,β)
-    // Hessian covariance (length n_theta). Filled ONLY on the `WaldSe::Hessian`
-    // GLMM path from the θ block `joint_hessian_cov` already inverts (it otherwise
-    // discards it); NaN under `WaldSe::Rx`, on the Hessian RX fallback, and on a
-    // non-converged fit. For a SCALAR grouping (q=1, dispersion≡1) the RE stddev
-    // equals its θ, so this is that stddev's SE directly (identity delta map); the
-    // only reachable GLMM groupings are scalar (intercept-only).
-    /// length n_theta
-    pub theta_se: Vec<f64>,
+    /// The θ block of the joint (θ,β) Hessian covariance, `n_theta × n_theta`.
+    /// Filled ONLY on the `WaldSe::Hessian` GLMM path from the θ block
+    /// `joint_hessian_cov` already inverts (it otherwise discards it); NaN under
+    /// `WaldSe::Rx`, on the Hessian RX fallback, and on a non-converged fit. The
+    /// SE of θₖ is `√cov_kk`; the delta method that maps it to the SEs of the
+    /// caller's stddevs needs the off-diagonals too
+    /// (`LmmGroupings::stddev_se_kernel_to_caller`).
+    pub theta_cov: Mat<f64>,
     /// length p; Var(β̂)_jj forward-solve scratch (per-target)
     pub fwd_solve: Vec<f64>,
     // joint Wald scratch (reuse lmm::joint_wald_chi_sq):
@@ -740,6 +737,10 @@ pub struct GlmmWorkspace {
     /// the two logit arms of `simd_transcendental::family_pass`: the fused
     /// `Σ log1pexp` deviance identity holds only for unweighted Bernoulli rows.
     pub(crate) weighted: bool,
+    /// `s` of the `ŵ = w/s` a weighted Gamma fit stores in `prior_w`
+    /// (`family::weight_scale`, set per fit by `fit::glmm::prep_glmm_design`);
+    /// 1 on every other fit. A raw-scale φ is `s` times the internal one.
+    pub(crate) weight_scale: f64,
     /// within-fit û warm-start incumbent; RESET to 0 each fit_glmm — never carried across fits
     pub u_seed: Vec<f64>,
     /// max_n × p = W∘X scratch for the X'WX GEMM (rebuilt per PIRLS iteration,
@@ -1159,6 +1160,7 @@ impl GlmmWorkspace {
             prior_w: vec![1.0; max_n],
             prior_w_phi: vec![1.0; max_n],
             weighted: false,
+            weight_scale: 1.0,
             u_seed: vec![0.0; k.max(1)],
             wx: Mat::zeros(max_n, p),
             structured: StructuredScratch::for_shape(max_n, n_primary, q_core, e_crossed),
@@ -1220,7 +1222,7 @@ impl GlmmWorkspace {
                 vcov_cols: Mat::zeros(p, p),
                 var_diag: vec![0.0; p],
                 t_sq: vec![0.0; p],
-                theta_se: vec![f64::NAN; n_theta],
+                theta_cov: Mat::from_fn(n_theta, n_theta, |_, _| f64::NAN),
                 fwd_solve: vec![0.0; p],
                 joint_k_inv: Mat::zeros(p, p),
                 joint_sigma_t_chol: Mat::zeros(p, p),
@@ -1812,16 +1814,15 @@ pub(crate) fn fill_packed_cols_with(
 }
 
 /// Per-fit hoist of the primary-slope Z columns: `z_buf[i·(q−1)+d] =
-/// x[i, slope_cols[d]] / s_d`. θ/β change per BOBYQA eval but `x` and the scales
-/// are fixed per fit, so this lifts the MatRef load and the scale division out of
-/// the per-solve M fill — the fill becomes a pure contiguous-f64 product. `s_d`
-/// is the RE column's internal scale (`LmmGroupings::set_slope_scales`); mirrored
-/// by the Rx M row in `se::blocked_schur_fill` — change together. No-op at q_p = 1 (no slope columns).
+/// x[i, slope_cols[d]]`. θ/β change per BOBYQA eval but `x` is fixed per fit, so
+/// this lifts the MatRef load out of the per-solve M fill — the fill becomes a
+/// pure contiguous-f64 product. Mirrored by the Rx M row in
+/// `se::blocked_schur_fill` — change together. No-op at q_p = 1 (no slope columns).
 pub(crate) fn fill_z_f64(g: &LmmGroupings, x: MatRef<f64>, z_buf: &mut [f64], n: usize) {
     let q = g.primary_q;
     for i in 0..n {
         for d in 0..q - 1 {
-            z_buf[i * (q - 1) + d] = x[(i, g.primary_slope_cols[d])] / g.primary_slope_scales[d];
+            z_buf[i * (q - 1) + d] = x[(i, g.primary_slope_cols[d])];
         }
     }
 }

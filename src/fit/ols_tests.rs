@@ -231,7 +231,15 @@ fn fit_ols_weighted_collinear_fits_with_an_honest_se() {
     // point of measuring the matrix the fit actually used.
     let mut ws = OlsWorkspace::new(n, p, opts.target_indices.len(), true);
     let x_mat = super::common::to_col_major(&x, n, p);
-    let view = fit_ols_prebuilt(&mut ws, x_mat.as_ref().subrows(0, n), &y, n, p, &opts);
+    let view = fit_ols_prebuilt(
+        &mut ws,
+        x_mat.as_ref().subrows(0, n),
+        &y,
+        n,
+        p,
+        &opts,
+        crate::standardize::ColumnScaling::IDENTITY,
+    );
     assert!(
         view.converged,
         "the fit is computable and must be returned, not refused"

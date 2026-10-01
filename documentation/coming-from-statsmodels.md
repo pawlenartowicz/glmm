@@ -42,10 +42,10 @@ See [`formula.md`](formula.md) for the full accepted/rejected grammar.
 
 `glmm`'s Python surface is small on purpose: `glmm.fit`, `glmm.Fit` (the
 result type — returned by `fit`, never constructed by the caller), and the
-six warning categories the diagnostics channel raises
-(`DiagnosticWarning`, `IllConditionedWarning`, `PirlsExhaustedWarning`,
-`UnusedGroupingLevelsWarning`, `ReDesignScaleWarning`,
-`HessianSeFallbackWarning`).
+warning categories the diagnostics channel raises (`DiagnosticWarning` and
+its subclasses, such as `IllConditionedWarning`, `PirlsExhaustedWarning`,
+`UnusedGroupingLevelsWarning` and `HessianSeFallbackWarning`; `glmm.__all__`
+lists them all).
 
 ## `MixedLM` is REML by default too — but it *can* switch to ML, and glmm can't
 

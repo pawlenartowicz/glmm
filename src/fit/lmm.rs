@@ -4,6 +4,7 @@
 //! the workspace, accumulates the design, and maps `LmmFit` back to `Fit`.
 
 use crate::lmm::{fit_lmm, LmmFit, LmmGroupings, LmmKernel, LmmWorkspace};
+use crate::standardize::ColumnScaling;
 // Used only by the test-only `fit_mle`/`fit_lmm_into` baselines. The stable core
 // reaches the LMM path via `accumulate_lmm_rows`/`lmm_run_on`, which take neither.
 #[cfg(test)]
@@ -16,7 +17,7 @@ use super::common::{
 // `Mat` — the stable core reaches the LMM path via `accumulate_lmm_rows`, which
 // takes a caller-filled `x_mat` directly.
 #[cfg(test)]
-use super::common::{to_col_major, warm_theta};
+use super::common::{as_given_design, start_to_design, warm_theta};
 use super::{Fit, FitOptions};
 
 // ---------------------------------------------------------------------------
@@ -27,9 +28,8 @@ use super::{Fit, FitOptions};
 /// workspace holds: the dense sufficient statistics (reset + add_rows_multi),
 /// or a freshly built sparse-Z Gram workspace. Takes `x_mat` rather than row-major `x` so the `fit_on` hot
 /// path can fill a build-once `n_max`-sized buffer and pass a `subrows(0, n)`
-/// view in, instead of allocating a fresh `Mat` every call; the three other
-/// callers (`fit_mle`, `build_lmm_seam_ws`, `refit_lmm`) each build their own
-/// throwaway `Mat` via `to_col_major` at the call site.
+/// view in, instead of allocating a fresh `Mat` every call; the test-only
+/// `fit_mle` baseline builds its own throwaway `Mat` via `as_given_design`.
 #[allow(clippy::too_many_arguments)] // marshals the kernel's (x_mat, y, n, p, ids…) surface
 pub(super) fn accumulate_lmm_rows(
     ws: &mut LmmWorkspace,
@@ -62,15 +62,6 @@ pub(super) fn accumulate_lmm_rows(
     match &mut ws.kernel {
         LmmKernel::Dense { suff, .. } => {
             suff.reset();
-            // Before any row is accumulated: the RE design-column scales are per dataset, and
-            // every slope value the accumulator stores is already divided by them. The
-            // workspace is reused across draws with different `x`, so this is refreshed per
-            // call, not cached at construction — and outside the `n > 0 && p > 0` guard,
-            // because `SuffStats::reset` does not clear the scales and an empty draw would
-            // otherwise leave the previous draw's in place. `rms_column_scale` is a weighted
-            // ratio, invariant to a uniform rescale of the weights, so the raw `weights` (not
-            // `w_for_rows`) is fine here — it is what `fit::glmm::prep_glmm_design` passes too.
-            suff.groupings.set_slope_scales(x_mat, weights);
             if n > 0 && p > 0 {
                 // The fixed-effect factor U must be known before any row is
                 // accumulated (`lmm::DesignQr`); the sparse arm computes the same
@@ -80,10 +71,6 @@ pub(super) fn accumulate_lmm_rows(
             }
         }
         LmmKernel::Sparse { g, ws: sparse_ws } => {
-            // Before any Z entry is emitted: `for_each_z_entry` divides every
-            // slope value by its RE column's internal scale, so the scales must
-            // be current for THIS design first.
-            g.set_slope_scales(x_mat, weights);
             // WLS-style √ŵᵢ pre-scaling, the same convention `add_rows_multi`
             // applies on the dense arm: threaded through every z-emission and
             // raw x/y read in the constructor, so every packed Gram carries
@@ -126,6 +113,10 @@ pub(crate) struct LmmResultView<'a> {
     ranef_u: &'a [f64],
     /// The workspace's `weight_scale` s: `fit.sigma_sq` is σ̂²/s.
     weight_scale: f64,
+    /// The column standardization the rows were accumulated under
+    /// (`β = B·β̃`): `factor` is on the standardized design, so `vcov` is read
+    /// through it, and so are θ̂, `varcorr` and the conditional modes.
+    map: &'a ColumnScaling,
 }
 
 // Loop-tier read accessors (via the `FitView`/`loop_advanced` surface); the
@@ -188,12 +179,13 @@ impl LmmResultView<'_> {
         self.fit.sigma_sq * self.weight_scale
     }
     /// Fitted θ̂ vech (primary block then extras, column-major lower-triangular),
-    /// in the solver's INTERNAL RE column scale — `FitView::theta` divides it back
-    /// into the design's own units for the warm-start carry.
+    /// in the kernel's coordinates: the internal RE column scale on the
+    /// standardized design. `FitView::theta` maps it to the caller's units for
+    /// the warm-start carry (`LmmGroupings::theta_kernel_to_caller`).
     pub(crate) fn theta(&self) -> &[f64] {
         self.theta
     }
-    /// Grouping structure, for the internal RE column scales θ̂ carries.
+    /// Grouping structure, for the random-effect maps θ̂ is read through.
     pub(crate) fn groupings(&self) -> &LmmGroupings {
         self.groupings
     }
@@ -201,18 +193,20 @@ impl LmmResultView<'_> {
 
 /// Runs the θ-solve on a pre-accumulated workspace and returns a borrowed view
 /// of the results. Caller contract: `ws.suff` holds the accumulated rows
-/// ([`accumulate_lmm_rows`]). Warm start threads `theta` only — the LMM β is
-/// solved exactly given θ, so a β start is irrelevant; `None` (cold) uses the
-/// kernel's THETA0 blind start.
+/// ([`accumulate_lmm_rows`]), on the design `map` standardized. Warm start
+/// threads `theta` only — the LMM β is solved exactly given θ, so a β start is
+/// irrelevant; `None` (cold) uses the kernel's THETA0 blind start.
 pub(crate) fn lmm_run_on<'a>(
     ws: &'a mut LmmWorkspace,
     target_indices: &[u32],
     theta_start: Option<&[f64]>,
+    map: &'a ColumnScaling,
 ) -> LmmResultView<'a> {
-    let fit = fit_lmm(ws, target_indices, theta_start);
+    let fit = fit_lmm(ws, target_indices, theta_start, map);
 
     LmmResultView {
         weight_scale: ws.weight_scale,
+        map,
         ranef_u: ws.kernel.ranef_u(),
         fit,
         betas: &ws.recovery.betas,
@@ -257,16 +251,14 @@ pub(crate) fn lmm_view_to_fit(
     // policy: a `MaxFunReached` cap-out reports an honest θ̂ (its finite
     // endpoint) with `converged == false` rather than NaN-filling.
     let has_endpoint = lmm_fit.deviance.is_finite();
-    // θ̂ is in the solver's internal RE units (`LmmGroupings::set_slope_scales`);
-    // `theta_row_scales` divides each entry back into the design's own units
-    // before it is squared, so `tau2` is a variance in the user's scale.
-    let theta_scales = view.groupings.theta_row_scales();
+    // θ̂ in the caller's coordinates (slot order): the column standardization
+    // mapped out (`LmmGroupings::theta_kernel_to_caller`), so `tau2` is a
+    // variance in the user's scale.
+    let (theta_caller, caller_pins) =
+        view.groupings
+            .theta_to_caller_vec(view.theta, diag.converged, view.map);
     let tau2: Vec<f64> = if has_endpoint {
-        view.theta
-            .iter()
-            .zip(theta_scales.iter())
-            .map(|(&t, &s)| (t / s) * (t / s) * sigma_sq)
-            .collect()
+        theta_caller.iter().map(|&t| t * t * sigma_sq).collect()
     } else {
         view.theta.iter().map(|_| f64::NAN).collect()
     };
@@ -274,18 +266,19 @@ pub(crate) fn lmm_view_to_fit(
     // varcorr[g] = vech(σ̂²·Λ̂_gΛ̂_g') per grouping — the q≥2-valid
     // covariance; equals tau2's diagonal only at the (0,0) primary entry.
     let varcorr = if has_endpoint {
-        assemble_varcorr(view.theta, view.groupings, sigma_sq)
+        assemble_varcorr(view.theta, view.groupings, sigma_sq, view.map)
     } else {
         vec![]
     };
 
-    // Var(β̂) = σ̂²·(X'V⁻¹X)⁻¹ from the top-left p×p block of the augmented
-    // factor — the same `L_XX` and the same σ̂² the `var_diag` forward solve
-    // above uses, so `vcov`'s diagonal is `var_diag`. Gated on the finite
+    // Var(β̂) = σ̂²·B(X̃'V⁻¹X̃)⁻¹Bᵀ from the top-left p×p block of the
+    // augmented factor, read through the column map B — the same `L_XX`, the
+    // same σ̂² and the same right-hand sides the `var_diag` forward solve uses,
+    // so `vcov`'s diagonal is `var_diag`. Gated on the finite
     // endpoint like `tau2`/`varcorr`: the degenerate return NaN-fills
     // `var_diag` and `sigma_sq` together, so `se` and `vcov` go NaN together.
     let vcov = if has_endpoint {
-        vcov_from_chol(view.factor, p, &opts.target_indices, sigma_sq)
+        vcov_from_chol(view.factor, p, &opts.target_indices, sigma_sq, view.map)
     } else {
         nan_vcov(p)
     };
@@ -304,7 +297,12 @@ pub(crate) fn lmm_view_to_fit(
     // paths apply). `ranef_u` is empty when the recovery did not run.
     let ranef_levels = super::common::ranef_level_counts(view.groupings);
     let (fitted, ranef) = if lmm_fit.converged && !view.ranef_u.is_empty() {
-        let ranef = super::common::assemble_ranef_sparse(view.theta, view.groupings, view.ranef_u);
+        let ranef = super::common::assemble_ranef_sparse(
+            view.theta,
+            view.groupings,
+            view.ranef_u,
+            view.map,
+        );
         let fitted = super::common::lmm_fitted(
             x,
             n,
@@ -321,7 +319,15 @@ pub(crate) fn lmm_view_to_fit(
         (vec![], vec![])
     };
 
+    // `pinned` in the caller's coordinates, where they differ from the kernel's.
+    let mut diag = diag;
+    if let Some(mask) = caller_pins {
+        diag.pinned_components = mask;
+    }
     let diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
+    // `2·Σⱼ ln sⱼ` of the column standardization: what the REML criterion of
+    // the fitted design is short of the caller's.
+    let reml_shift = view.map.reml_deviance_shift();
     let mut fit = Fit {
         beta,
         se,
@@ -336,11 +342,15 @@ pub(crate) fn lmm_view_to_fit(
         n_eval: lmm_fit.n_eval,
         #[cfg(feature = "counters")]
         counters: lmm_fit.counters,
-        deviance: lmm_fit.deviance,
+        // The kernel's REML criterion contains ln|X̃ᵀV⁻¹X̃| on the standardized
+        // design, which is the caller's ln|XᵀV⁻¹X| minus 2·Σ ln sⱼ (a shift has
+        // determinant 1); the shift puts it back. The weighted correction below
+        // then applies to the caller's value.
+        deviance: lmm_fit.deviance + reml_shift,
         // REML criterion on the logLik scale, from the base (unweighted) deviance;
         // the weighted correction below rewrites both together (using `n`, not
         // `n_rows` — see note above `n_rows`).
-        loglik: super::common::lmm_loglik(lmm_fit.deviance, n_rows, p),
+        loglik: super::common::lmm_loglik(lmm_fit.deviance + reml_shift, n_rows, p),
         df: if has_endpoint { p + n_theta + 1 } else { 0 },
         reml: true,
         fitted,
@@ -353,7 +363,7 @@ pub(crate) fn lmm_view_to_fit(
     // (mirrors `fit/glmm.rs`, same gate).
     fit.diagnostics.singular = fit.diagnostics.singular
         || (lmm_fit.converged
-            && fit.has_negligible_component(&super::common::re_scale_grid(view.groupings)));
+            && fit.has_negligible_component(&view.groupings.kernel_stddevs(view.theta)));
 
     // Weighted Gaussian log-density carries +½Σlog wᵢ per row; on the −2ℓ scale
     // the REML deviance gains −Σlog wᵢ (θ-independent — added post-optimization,
@@ -385,12 +395,13 @@ pub(crate) fn lmm_view_to_fit(
 /// θ-solve + `Fit` assembly from a pre-built, already-accumulated workspace.
 /// Composes [`lmm_run_on`] + [`lmm_view_to_fit`]. Caller contract: `ws.suff`
 /// holds the accumulated rows (`accumulate_lmm_rows`, reset + add_rows_multi per
-/// dataset). The weighted-deviance correction is inside `lmm_view_to_fit`, so
-/// callers must NOT re-apply it. Only the test-gated `fit_mle` and `refit_lmm`
-/// baselines compose through this; the core calls `lmm_run_on`/`lmm_view_to_fit`
-/// directly.
+/// dataset) of the design `map` scaled; `start` is in the caller's units. The
+/// weighted-deviance correction is inside `lmm_view_to_fit`, so callers must
+/// NOT re-apply it. Only the test-gated `fit_mle` baseline composes through
+/// this; the core calls `lmm_run_on`/`lmm_view_to_fit` directly.
 #[cfg(test)]
-pub(super) fn fit_lmm_into(
+#[allow(clippy::too_many_arguments)] // marshals the kernel's (ws, x, ids, n, p, opts, start, map) surface
+fn fit_lmm_into(
     ws: &mut LmmWorkspace,
     x: &[f64],
     ids: &crate::GroupIds,
@@ -398,8 +409,15 @@ pub(super) fn fit_lmm_into(
     p: usize,
     opts: &FitOptions,
     start: Option<&StartValues>,
+    map: &ColumnScaling,
 ) -> Fit {
-    let view = lmm_run_on(ws, &opts.target_indices, warm_theta(start));
+    let start = start.map(|s| {
+        let mut s = s.clone();
+        let g = ws.kernel.groupings();
+        start_to_design(&mut s, map, g, &mut vec![0.0; g.re_map_scratch_len()]);
+        s
+    });
+    let view = lmm_run_on(ws, &opts.target_indices, warm_theta(start.as_ref()), map);
     lmm_view_to_fit(&view, x, ids, n, p, opts)
 }
 /// LMM dispatch adapter. `cluster_ids`/`extra_ids` are the per-row level ids from
@@ -443,8 +461,7 @@ fn fit_mle(
         LmmWorkspace::for_cluster_spec_ext(p, model, n, &slope_cols, &extra_slope_cols, sparse);
     // Identity-link offset is an exact y-shift before accumulation (the Grams
     // are the only place raw y enters) — the same convention `fit_ols_prebuilt` applies.
-    // Mirrored by `fit::core`'s `Lmm` arm and `loop_advanced_seam.rs`'s
-    // `refit_lmm` — change together.
+    // Mirrored by `fit::core`'s `Lmm` arm; change together.
     let y_shifted: Vec<f64>;
     let y_eff: &[f64] = match &opts.offset {
         Some(o) => {
@@ -453,7 +470,7 @@ fn fit_mle(
         }
         None => y,
     };
-    let x_mat = to_col_major(x, n, p);
+    let (map, x_mat) = as_given_design(x, n, p, ws.kernel.groupings(), opts.weights.as_deref());
     accumulate_lmm_rows(
         &mut ws,
         x_mat.as_ref().subrows(0, n),
@@ -469,7 +486,7 @@ fn fit_mle(
         primary: cluster_ids.to_vec(),
         extra: extra_ids.to_vec(),
     };
-    fit_lmm_into(&mut ws, x, &ids, n, p, opts, start)
+    fit_lmm_into(&mut ws, x, &ids, n, p, opts, start, &map)
 }
 /// Test-only forced-NoZ entry: the NoZ↔Sparse cross-checks and timed sweeps
 /// must reach the dense kernel regardless of where `classify_design`'s

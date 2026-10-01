@@ -79,31 +79,48 @@ test_that("binomial random slope (tau0, tau1, rho01) is pinned", {
   # log|A| in beta only on solves where the plain step shows trouble (logLik
   # -923.756172968027): the correlation moved by 6.0e-8 absolute, the other
   # values by at most 6.9e-9.
+  # Re-recorded 2026-10-01, when every fit began to standardize its design
+  # internally (x' = (x - m)/s, results mapped back), which moves the search
+  # path (logLik -923.756172968005, 2.7e-11 above the 27318ef tree, whose
+  # values were not recorded here): against the values above the correlation
+  # moved by 8.2e-7 absolute, the SDs by 1.0e-6 relative, the fixed effects by
+  # at most 1.8e-7 absolute.
+  # Re-recorded 2026-10-01, after the follow-up simplification of that
+  # standardization (logLik -923.756172968005, unchanged): the correlation moved
+  # by 1.3e-8 absolute, the SDs by at most 4.5e-9 relative, the fixed effects by
+  # at most 6.2e-10 absolute.
   d <- benchmark_data(seed = 203, family = "binomial", n_g = 100L, m = 15L,
                       tau0 = 0.8, tau1 = 0.8, rho = 0.3)
   fit <- fastglmm(y ~ t + d + t:d + (1 + t | g), d, family = binomial())
   expect_true(fit$converged)
   vc <- VarCorr(fit)$g
-  expect_equal(unname(fixef(fit)), c(-0.792588774256419, 1.074106949613768, 0.694132964295869, -0.129934518298598),
+  expect_equal(unname(fixef(fit)), c(-0.792588914474131, 1.07410712543171, 0.694133080240422, -0.129934596757035),
                tolerance = CI_REF_REL)
-  expect_equal(unname(attr(vc, "stddev")), c(1.042012679692871, 0.871286201276444),
+  expect_equal(unname(attr(vc, "stddev")), c(1.04201375790699, 0.871286639125827),
                tolerance = CI_REF_REL)
-  expect_equal(attr(vc, "correlation")[2, 1], 0.106174638142076,
+  expect_equal(attr(vc, "correlation")[2, 1], 0.106173806123228,
                tolerance = CI_REF_REL)
 })
 
 test_that("poisson random slope (tau0, tau1, rho01) is pinned", {
+  # Re-recorded 2026-10-01, when every fit began to standardize its design
+  # internally (x' = (x - m)/s, results mapped back), which moves the search
+  # path (logLik -1711.44098430111, 1.0e-9 below the 27318ef tree's
+  # -1711.44098430006, whose values were not recorded here): against the
+  # values above the correlation moved by 2.0e-5 absolute along a flat
+  # direction, the SDs by 8.2e-6 relative, the fixed effects by at most 5.4e-7
+  # absolute.
   d <- benchmark_data(seed = 204, family = "poisson", n_g = 100L,
                       beta = c(0, 0.5, 0.3, 0.1), tau0 = 0.5, tau1 = 0.4,
                       rho = 0.3)
   fit <- fastglmm(y ~ t + d + t:d + (1 + t | g), d, family = poisson())
   expect_true(fit$converged)
   vc <- VarCorr(fit)$g
-  expect_equal(unname(fixef(fit)), c(0.207518881588951, 0.43021623995375, 0.119056414540409, 0.338551938152971),
+  expect_equal(unname(fixef(fit)), c(0.207518487106018, 0.43021677704981, 0.119056489133238, 0.338551610590158),
                tolerance = CI_REF_REL)
-  expect_equal(unname(attr(vc, "stddev")), c(0.312862312451542, 0.507728342122289),
+  expect_equal(unname(attr(vc, "stddev")), c(0.312864379568631, 0.507732506267579),
                tolerance = CI_REF_REL)
-  expect_equal(attr(vc, "correlation")[2, 1], 0.349341452882515,
+  expect_equal(attr(vc, "correlation")[2, 1], 0.349321125271447,
                tolerance = CI_REF_REL)
 })
 

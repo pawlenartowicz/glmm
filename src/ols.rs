@@ -16,6 +16,7 @@ use faer::linalg::matmul::{matmul, triangular};
 use faer::reborrow::{IntoConst, Reborrow, ReborrowMut};
 use faer::{Accum, MatMut, MatRef, Par};
 
+use crate::standardize::ColumnScaling;
 use crate::FLOAT_NEAR_ZERO;
 
 /// Rows per widened f64 panel in the suff-stats GEMM accumulate
@@ -51,9 +52,12 @@ pub struct OlsScratch<'w> {
 /// Lifetime ties back to the workspace that owns
 /// the storage.
 pub struct OlsFitView<'a> {
-    /// `β̂ = (X'X)⁻¹X'y`, length `p`, x-matrix column order.
+    /// `β̂ = (X'X)⁻¹X'y`, length `p`, x-matrix column order, on the design the
+    /// statistics were accumulated from (β̃ when the fit ran through a column
+    /// map, see `fit_suff_stats_t_sq_mapped`).
     pub betas: &'a [f64],
-    /// Length `t` — only the first `n_targets` entries are populated.
+    /// Length `t` — only the first `n_targets` entries are populated. In the
+    /// caller's units under a column map, like `t_sq`.
     pub var_diag: &'a [f64],
     /// Length `t`.
     pub t_sq: &'a [f64],
@@ -416,8 +420,40 @@ pub fn fit_suff_stats_t_sq<'a>(
     sum_y: f64,
     n_rows: usize,
     target_indices: &[u32],
+    xtx_work: MatMut<'_, f64>,
+    scratch: OlsScratch<'a>,
+) -> OlsFitView<'a> {
+    fit_suff_stats_t_sq_mapped(
+        xtx_lower,
+        xty,
+        yty,
+        sum_y,
+        n_rows,
+        target_indices,
+        xtx_work,
+        scratch,
+        ColumnScaling::IDENTITY,
+    )
+}
+
+/// [`fit_suff_stats_t_sq`] on a design fitted through a column map `B`
+/// (`x̃ = X·B`, `β = B·β̃`). The returned `betas` are β̃, on the design the
+/// statistics were accumulated from; `var_diag` and `t_sq` are the caller's:
+/// `Var(βₜ) = σ̂²·‖L⁻¹bₜ‖²` with `bₜ` row `t` of `B`, `t² = βₜ²/Var(βₜ)`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "sufficient-statistics kernel; each arg is a distinct precomputed input"
+)]
+pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
+    xtx_lower: MatRef<'_, f64>,
+    xty: &[f64],
+    yty: f64,
+    sum_y: f64,
+    n_rows: usize,
+    target_indices: &[u32],
     mut xtx_work: MatMut<'_, f64>,
     scratch: OlsScratch<'a>,
+    map: &ColumnScaling,
 ) -> OlsFitView<'a> {
     let p = xty.len();
     let t = target_indices.len();
@@ -528,10 +564,10 @@ pub fn fit_suff_stats_t_sq<'a>(
     let sigma_sq = rss / df_resid as f64;
     let sst = yty - (sum_y * sum_y) / n as f64;
 
-    // For each target: forward-solve L · u = e_{tj} (read L[i, k] directly —
-    // no transposed access — since L is already lower-triangular). Then
-    // var_diag = σ̂² · ‖u‖² because (X'X)⁻¹ = L⁻ᵀ L⁻¹ and the diagonal entries
-    // are ‖L⁻¹ e_j‖².
+    // For each target: forward-solve L · u = bₜ, row t of the column map B
+    // (eₜ on an unmapped design; read L[i, k] directly — no transposed access —
+    // since L is already lower-triangular). Then var_diag = σ̂² · ‖u‖² because
+    // B(X̃'X̃)⁻¹Bᵀ = (L⁻¹Bᵀ)ᵀ(L⁻¹Bᵀ) and its diagonal entries are ‖L⁻¹bₜ‖².
     for (out_idx, &tj) in target_indices.iter().enumerate() {
         let tj = tj as usize;
         if tj >= p {
@@ -539,7 +575,7 @@ pub fn fit_suff_stats_t_sq<'a>(
         }
         let norm_sq = triangular_solve_norm_sq(
             fit_factor.rb(),
-            |i| if i == tj { 1.0 } else { 0.0 },
+            |i| map.rhs(tj, i),
             fit_u_scratch,
             p,
             false, // lower-triangular L: row access factor[(i, k)]
@@ -547,7 +583,7 @@ pub fn fit_suff_stats_t_sq<'a>(
         let vd = sigma_sq * norm_sq;
         fit_var_diag[out_idx] = vd;
         if vd > FLOAT_NEAR_ZERO && vd.is_finite() {
-            let beta_j = fit_betas[tj];
+            let beta_j = map.beta_coef(tj, &fit_betas[..p]);
             fit_t_sq[out_idx] = (beta_j * beta_j) / vd;
         } else {
             fit_t_sq[out_idx] = f64::NAN;
@@ -587,6 +623,9 @@ pub fn fit_suff_stats_t_sq<'a>(
 ///
 /// Returns `NaN` on any numerical failure (non-converged fit, out-of-range
 /// indices, near-zero variance).
+///
+/// Valid only on a view fitted without a column map (`fit_suff_stats_t_sq`):
+/// it reads `betas` and `factor` as the caller's own coefficients and Gram.
 ///
 /// `scratch` must be length ≥ `p`; it is overwritten and not read on output.
 pub fn ols_contrast_t_sq(fit: &OlsFitView<'_>, p_col: u32, n_col: u32, scratch: &mut [f64]) -> f64 {

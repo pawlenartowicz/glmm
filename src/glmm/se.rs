@@ -550,9 +550,7 @@ fn joint_hessian_cov_at(
                 }
             }
             // No joint Hessian on the RX fallback ⇒ no θ-block SE to report.
-            for k in 0..n_theta {
-                ws.inference.theta_se[k] = f64::NAN;
-            }
+            ws.inference.theta_cov.fill(f64::NAN);
             ws.params[..m].copy_from_slice(&ws.fd.fd_saved[..m]);
             restore_fd_mode!();
             ws.fd.warm_seed_active = false; // never leak the FD seed into a later fit / BOBYQA
@@ -909,23 +907,25 @@ fn joint_hessian_cov_at(
             out_cov[(a, b)] = 2.0 * inv[(n_theta + a, n_theta + b)];
         }
     }
-    // θ-block SE: the same cov = 2·H_dev⁻¹, restricted to the θ diagonal. The β
-    // block above discards it; expose it here (the whole point of paying for the
-    // joint Hessian). For a scalar grouping the RE stddev equals θ, so this is the
-    // stddev's SE directly. A rounding-negative diagonal (never seen at a PD point,
-    // but the LLT solve can leave a tiny negative) clamps to 0 before the sqrt.
-    // On mixed Gamma the inverse is in `(ξ, β, t)`, and `θ = ξ·e^{t/2}` maps it
-    // back by the delta method: `dθ = dξ + ½·θ̂·dt`, so
-    // `Var θ̂ = C_ξξ + θ̂·C_ξt + ¼·θ̂²·C_tt` with `C = 2·H⁻¹`. The NB row is in
-    // absolute coordinates already.
+    // θ block: the same cov = 2·H_dev⁻¹. The β block above discards it; expose
+    // it here (the whole point of paying for the joint Hessian). For a scalar
+    // grouping the RE stddev equals θ, so the diagonal's square root is the
+    // stddev's SE directly. On mixed Gamma the inverse is in `(ξ, β, t)`, and
+    // `θ = ξ·e^{t/2}` maps it back by the delta method: `dθ = dξ + ½·θ̂·dt`, so
+    // `Cov(θₖ, θₗ) = C_kl + ½θₗ·C_km + ½θₖ·C_lm + ¼θₖθₗ·C_mm` with `C = 2·H⁻¹`.
+    // The NB row is in absolute coordinates already.
     for k in 0..n_theta {
-        let var = if matches!(disp, Some(DispRow::Gamma { .. })) {
-            let th = ws.fd.fd_saved[k];
-            2.0 * (inv[(k, k)] + th * inv[(k, m)] + 0.25 * th * th * inv[(m, m)])
-        } else {
-            2.0 * inv[(k, k)]
-        };
-        ws.inference.theta_se[k] = var.max(0.0).sqrt();
+        for l in 0..n_theta {
+            ws.inference.theta_cov[(k, l)] = if matches!(disp, Some(DispRow::Gamma { .. })) {
+                let (tk, tl) = (ws.fd.fd_saved[k], ws.fd.fd_saved[l]);
+                2.0 * (inv[(k, l)]
+                    + 0.5 * tl * inv[(k, m)]
+                    + 0.5 * tk * inv[(l, m)]
+                    + 0.25 * tk * tl * inv[(m, m)])
+            } else {
+                2.0 * inv[(k, l)]
+            };
+        }
     }
 
     // Restore the converged PIRLS state at γ̂ (W̃/û/μ̂/factors): the stencil leaves
@@ -1106,15 +1106,13 @@ pub(crate) fn blocked_schur_fill(
         for c in 0..q {
             let mut acc = 0.0;
             for rr in c..q {
-                // The one Z read on this path that does not come from `ws.z_buf`,
-                // so it applies the RE column's internal scale itself — mirrors
-                // `workspace::fill_z_f64`, change together. Indexed by
-                // the Λ ROW `rr`, not the column `c`.
+                // The one Z read on this path that does not come from `ws.z_buf`
+                // (`workspace::fill_z_f64`, change together). Indexed by the Λ
+                // ROW `rr`, not the column `c`.
                 let zr = if rr == 0 {
                     1.0
                 } else {
                     x[(i, ws.groupings.primary_slope_cols[rr - 1])]
-                        / ws.groupings.primary_slope_scales[rr - 1]
                 };
                 acc += zr * ws.pirls.lam[rr * q + c];
             }

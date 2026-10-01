@@ -139,15 +139,19 @@ Penicillin, and Pastes.
 ## Random-effect design column scaling
 
 The θ search is made independent of the units of the random-effect columns.
-Before any sufficient statistic is accumulated, each random-slope design column
-gets a scale `s = √(Σ wᵢxᵢ² / Σ wᵢ)` — its weighted root-mean-square. Every site
-that reads that column as a random-effect covariate divides by `s`; the same
-column keeps its raw value everywhere the fixed-effect design reads it, and an
-implicit intercept subcolumn takes `s = 1` exactly.
+A random slope is a column of the fixed-effect design, and every route fits the
+standardized design
+([internal standardization](algorithms.md#internal-standardization-of-the-design)),
+so the slope's block reads the same transformed column `x̃` the fixed effects
+do. A continuous slope is centered and scaled. A 0/1 (or constant) slope
+column, which the standardization would otherwise leave as it is, is scaled
+without being centered, by `s = √(Σ wᵢxᵢ² / Σ wᵢ)`, its prior-weighted
+root-mean-square about zero, so its zeros stay exact zeros. The implicit
+intercept subcolumn is never scaled.
 
-This is an exact model identity, not an approximation. Scaling a block's design
-`Z` by `diag(1/sᵢ)` and the matching rows of its relative Cholesky factor by
-`sᵢ` leaves `ZΛ` — and so the whole REML criterion — unchanged:
+The scaling part is an exact model identity, not an approximation. Scaling a
+block's design `Z` by `diag(1/sᵢ)` and the matching rows of its relative
+Cholesky factor by `sᵢ` leaves `ZΛ`, and so the whole criterion, unchanged:
 
 ```
 Z̃ = Z·diag(1/sᵢ)      Λ̃[i][j] = sᵢ·Λ[i][j]      Z̃Λ̃ = ZΛ
@@ -158,36 +162,40 @@ a slope whose column is in the thousands and an intercept no longer sit decades
 apart in θ, and one global trust radius can resolve both. Without it a column of
 sd ~10³ against an intercept of 1 puts the two fitting θ components four decades
 apart, and the search freezes the intercept directions before the slope
-direction becomes resolvable at all.
+direction becomes resolvable at all. The fixed-effect side of the same column
+is mapped back by `B` (`βⱼ = β̃ⱼ/sⱼ`), and the LMM's REML deviance adds back
+`2·ln sⱼ` for it as for every scaled column.
 
-Everything derived from θ̂ is mapped back on the way out — `varcorr` as
-`D[i][j] = D̃[i][j]/(sᵢ·s_j)`, conditional modes as `b = b̃/sᵢ`, `tau2` and the
-GLMM `stddev_se` by the same row-wise division (the map is a fixed diagonal
-linear reparametrization, so the SE needs no delta-method term). A caller's
-warm-start θ is in the design's own units and is forward-mapped before the
-solve. `Fit` exposes no θ, so nothing else needs the map; the loop tier's
-`FitView::theta` divides it back for the warm-start carry.
+Everything derived from θ̂ is mapped back on the way out by the block's column
+map `N`: for a slope that is only scaled, `varcorr` as
+`D[i][j] = D̃[i][j]/(sᵢ·s_j)`, conditional modes as `b = b̃/sᵢ`, `tau2` by
+the same row-wise division; a centered slope adds the shift onto the
+intercept row. The GLMM `stddev_se` is the SE of each reported stddev
+`√Σ_kk` (`Σ = N·Λ̃Λ̃ᵀ·Nᵀ`), by the delta method on θ̃ on every block. A caller's warm-start θ is in the
+design's own units and is forward-mapped before the solve. `Fit` exposes no θ,
+so nothing else needs the map; the loop tier's `FitView::theta` maps it back
+for the warm-start carry.
 
-The scale is a property of the data, not of the model shape, so it is recomputed
-per dataset — on the dense path in `accumulate_lmm_rows`, on the sparse path
-before the workspace is built.
+The scale is a property of the data, not of the model shape, so it is
+recomputed per draw with the rest of the column statistics, at the start of
+`fit_on`.
 
-**Code**: `rms_column_scale`, `LmmGroupings::set_slope_scales` /
-`theta_row_scales` / `block_row_scale` (`src/lmm/mod.rs`); the Z-read sites in
-`LmmSuffStats::add_rows_multi` / `reml_deviance_blocked` (`src/lmm/kernel.rs`),
-`primary_gram` (`src/lmm/mod.rs`), `for_each_z_entry` (`src/sparse/mod.rs`),
-`fill_z_f64` (`src/glmm/workspace.rs`), `fill_m_vals` (`src/glmm/pirls/packed.rs`);
-the back-maps in `varcorr_block` / `assemble_ranef_sparse` /
-`assemble_ranef_dense` (`src/fit/common.rs`). **Convention**: lme4 leaves the RE
-design alone and warns on badly scaled predictors instead (`checkScaleX`);
-`glmm` scales internally and reports the fit in the caller's units.
+**Code**: `ColumnScaling::with_re_slopes` / `compute` (`src/standardize.rs`);
+the random-effect maps (`src/lmm/re_map.rs`); the back-maps in `varcorr_block` /
+`assemble_ranef_sparse` / `assemble_ranef_dense` (`src/fit/common.rs`).
+**Convention**: lme4 leaves the RE design alone and warns on badly scaled
+predictors instead (`checkScaleX`); `glmm` scales internally and reports the
+fit in the caller's units.
 
 ## Fixed-effect orthogonalization
 
 Both kernels work from Gram matrices of the fixed-effect design (`X'X`, `Z'X`),
 and a Gram squares the condition number of `X`. On a nearly collinear `X` that
 costs about half the digits of `log|X'V⁻¹X|`, of the RSS and of β̂. So before
-any row is accumulated, each fit orthogonalizes `X` once:
+any row is accumulated, each fit orthogonalizes its design once. That design is
+the standardized `X`
+([internal standardization](algorithms.md#internal-standardization-of-the-design)),
+written `X` in the rest of this section:
 
 ```
 √W·X = Q·R          (QR, Givens rotations one row at a time)
@@ -208,9 +216,9 @@ L_XX = Uᵀ·L̃_XX      (y row unchanged)
 so β̂, `Var(β̂)`, the joint Wald statistic and the ill-conditioning pivot are all
 read off the `[X y]` factor as before. The conditional modes are recovered on
 `X̃` with `β̃`, since that is what the Grams hold. Random-slope covariates are
-Z entries, not fixed effects, so they are always read from the raw `X`; the
-dense accumulator keeps a raw-`X` twin of `s` (`s_raw`) for the slope-covariate
-Gram entries it reads.
+Z entries, not fixed effects, so they are always read from `X` (standardized,
+not orthogonalized); the dense accumulator keeps an `X` twin of `s` (`s_raw`)
+for the slope-covariate Gram entries it reads.
 
 Why `U` and not `R`: with `R` the intercept column becomes `1/√N`, and its Gram
 entry `Σ 1/N` carries a rounding error of order `N·ε` that the fitted mean then
@@ -221,7 +229,7 @@ error matches the raw-`X` Gram (8e-9 there, against a long-double reference).
 The step costs one extra pass over the rows and `O(N·p²)` flops, and no copy of
 `X`. It is always on. When `R` has a zero or non-finite diagonal (an all-zero
 weighted column, fewer rows than columns) `U` stays the identity and the
-kernels see the raw `X`. Exactly redundant columns never get here: the
+kernels see the standardized `X` unorthogonalized. Exactly redundant columns never get here: the
 pre-dispatch alias gate (`detect_aliased`) drops them first.
 
 **Code**: `DesignQr` (`set_from_rows`, `solve_row`, `map_factor`, `map_beta`),
@@ -256,6 +264,12 @@ random-effect pivots (family blocks plus the crossed-tail diagonal),
 from the residual entry `L[p,p]²` — no per-evaluation β backsolve. `N − P` is
 the raw-row residual degrees of freedom.
 
+The design the kernel fits is the standardized one, and
+`log|X̃'V⁻¹X̃| = log|X'V⁻¹X| − 2·Σⱼ ln sⱼ` against the caller's `X` (a shift has
+determinant 1). The criterion is reported for the caller's design:
+`lmm_view_to_fit` adds `2·Σⱼ ln sⱼ` to the deviance and the loglik
+([internal standardization](algorithms.md#internal-standardization-of-the-design)).
+
 **Prior weights.** With `FitOptions::weights`, the sufficient-statistics
 accumulator (`LmmSuffStats::add_rows_multi`, `src/lmm/kernel.rs`) folds `√wᵢ` into
 every accumulated quantity exactly once per side, so every Gram product carries
@@ -271,7 +285,8 @@ identity link: the core's `Lmm` arm accumulates `y − o` and nothing
 downstream needs to know (same convention as the OLS path).
 
 The objective returns `f64::INFINITY` on any Cholesky failure or non-positive σ̂²
-— that value is the deviance failure surface BOBYQA is driven over.
+(the blocked path also on a residual r² ≤ dim·ε·yᵀy, an exact fit whose last
+pivot is round-off of either sign) — that value is the deviance failure surface BOBYQA is driven over.
 
 **Code**: `reml_deviance`, `reml_deviance_blocked`, `LmmSuffStats::add_rows_multi`
 (`src/lmm/kernel.rs`); `accumulate_lmm_rows` (`src/fit/lmm.rs`); `sparse_reml_deviance`

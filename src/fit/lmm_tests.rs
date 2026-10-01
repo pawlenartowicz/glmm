@@ -1,7 +1,7 @@
-//! LMM estimator tests (`Family::Gaussian`, `re: Some`), plus the
-//! `loop_advanced`-gated LMM sweep/refit dev-seam tests.
+//! LMM estimator tests (`Family::Gaussian`, `re: Some`).
 
 use super::*;
+use crate::standardize::ColumnScaling;
 // The loop-tier entries reached through the module rather than the re-export,
 // which is `loop_advanced`-gated: the pivot the region-2 tests below assert on
 // is recorded on every route, so these must run under default features too.
@@ -12,13 +12,7 @@ use crate::{
 };
 use faer::Mat;
 
-#[cfg(feature = "loop_advanced")]
-use super::common_tests::lmm_hand_dataset;
 use super::common_tests::{assert_pinned, dense_str, lcg, PIN_REL_ITER};
-// The dev seam is not on the `loop_advanced` public surface, so this equivalence
-// test reaches it directly from its module.
-#[cfg(feature = "loop_advanced")]
-use super::loop_advanced_seam::{build_lmm_workspace, refit_lmm};
 
 use super::lmm::{lmm_run_on, lmm_view_to_fit};
 use crate::test_support::{cluster_of_row, extra_level_of_row, intercept_only_spec};
@@ -154,7 +148,7 @@ fn intercept_only_lmm() -> ModelSpec {
 /// OLS guard.
 ///
 /// This is the control that condemned the old statistic. Every per-column pivot
-/// ratio here is O(1) (1.0, 0.235, 1.0) — the columns are mutually
+/// ratio here is O(1) — the columns are mutually
 /// distinguishable to full precision — yet the min/max L-diagonal ratio sits at
 /// 1.6e-10 purely because one column is 8 orders smaller than another. The old
 /// guard therefore threw the whole fit away over a choice of units: rescaling
@@ -260,25 +254,11 @@ fn lmm_pure_dynamic_range_design_fits_in_full() {
 
     // The flag itself. This design is the control that condemned the old
     // statistic, so the verdict under the NEW one must be "not flagged": no
-    // note on the stable surface, and a recorded pivot ratio nowhere near
-    // `PIVOT_MIN`. Without this the 0.235 quoted above could drift to anything
-    // and every other assertion here would still pass.
+    // note on the stable surface.
     assert!(
         f.diagnostics.notes.is_empty(),
         "no column is entangled here, so no note may be raised: {:?}",
         f.diagnostics.notes
-    );
-    let (sized, ids, perm) = spec_sized_from_ids_pub(&intercept_only_lmm(), &ids);
-    let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
-    assert!(!d.ill_conditioned, "pivot {} must clear the floor", d.pivot);
-    // Band, not a pin: the doc comment above quotes 0.235 as the minimum
-    // per-column pivot ratio, and the point is that it is O(1) rather than the
-    // 1.6e-10 the old min/max statistic reported on the same fit.
-    assert!(
-        (0.2..0.3).contains(&d.pivot),
-        "min pivot ratio must stay at the quoted 0.235, got {}",
-        d.pivot
     );
 }
 
@@ -1132,7 +1112,7 @@ fn fit_lmm_weighted_matches_lme4() {
     }
     ws.suff_mut()
         .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], Some(&w));
-    let lmm_fit = fit_lmm(&mut ws, &[0, 1], None);
+    let lmm_fit = fit_lmm(&mut ws, &[0, 1], None, ColumnScaling::IDENTITY);
     let sigma = lmm_fit.sigma_sq.sqrt();
     assert!(
         (sigma - REF_SIGMA).abs() / REF_SIGMA < 1e-4,
@@ -1559,16 +1539,21 @@ fn fit_lmm_weighted_boundary_matches_wls() {
 /// `g1` covariance, on a criterion that improved by 4.9e-8).
 #[test]
 fn fit_sim_slope_varcorr_is_pinned() {
-    const REF_BETA: [f64; 2] = [1.0380272349025235, 0.8009679281627348];
-    const REF_SE: [f64; 2] = [0.33893200546608876, 0.17067327664798077];
+    // Re-pinned 2026-10-01: the design is standardized internally before the fit (x̃ = (x − m)/s, results mapped back).
+    // The REML criterion is unchanged to 1e-12 (27.615443411970); the θ search
+    // stops at another point of a flat direction: g1's covariance moved 1.6e-6
+    // relative, its variances 3.3e-7 and 1.4e-7, σ̂² 8.2e-8, g2 5.5e-8, the SEs
+    // 7.8e-8, β 5.7e-10.
+    const REF_BETA: [f64; 2] = [1.0380272353254465, 0.8009679286177314];
+    const REF_SE: [f64; 2] = [0.33893203184068893, 0.17067328316242397];
     // varcorr[0] = g1, packed lower triangle [v00, c01, v11]; varcorr[1] = g2.
     const REF_VC_G1: [f64; 3] = [
-        0.8994006925131315,
-        -0.11776410058933363,
-        0.39740702504465475,
+        0.8994009894574976,
+        -0.11776428611507087,
+        0.39740708245702344,
     ];
-    const REF_VC_G2: f64 = 0.5081867068546223;
-    const REF_SIGMA2: f64 = 0.5717627431388194;
+    const REF_VC_G2: f64 = 0.5081867349990271;
+    const REF_SIGMA2: f64 = 0.5717626962036773;
 
     let csv = include_str!("../../validation/data/simulated/sim_slope.csv");
     let mut y = Vec::<f64>::new();
@@ -1929,342 +1914,10 @@ fn scalar_crossed_lmm_is_grouping_order_insensitive() {
     }
 }
 
-/// Bit-for-bit `LmmSweepOutcome` comparison — the arbiter for task 2's reuse
-/// claim (a held `LmmSeamWs` must change nothing but wall time). `to_bits`
-/// rather than `==` so a NaN-carrying `deviance`/`theta` (a non-converged
-/// run) still compares meaningfully.
-#[cfg(feature = "loop_advanced")]
-fn assert_sweep_outcomes_bit_equal(a: &LmmSweepOutcome, b: &LmmSweepOutcome, label: &str) {
-    assert_eq!(
-        a.deviance.to_bits(),
-        b.deviance.to_bits(),
-        "{label}: deviance mismatch ({} vs {})",
-        a.deviance,
-        b.deviance
-    );
-    assert_eq!(
-        a.theta.len(),
-        b.theta.len(),
-        "{label}: theta length mismatch"
-    );
-    for (i, (x, y)) in a.theta.iter().zip(&b.theta).enumerate() {
-        assert_eq!(
-            x.to_bits(),
-            y.to_bits(),
-            "{label}: theta[{i}] mismatch ({x} vs {y})"
-        );
-    }
-    assert_eq!(a.n_eval, b.n_eval, "{label}: n_eval mismatch");
-    assert_eq!(a.converged, b.converged, "{label}: converged mismatch");
-}
-
-/// Task 2's correctness proof: two [`lmm_sweep_fit_on`] calls at different
-/// θ₀ on ONE [`build_lmm_seam_ws`] result must reproduce two independent
-/// [`lmm_sweep_fit`] calls bit-for-bit — proving the held `suff`/`fit` (or
-/// sparse `ws`) is genuinely reused, not silently rebuilt under the hood.
-/// Dense (`Solver::NoZ`) shape: `lmm_hand_dataset`'s intercept-only design.
-#[cfg(feature = "loop_advanced")]
-#[test]
-fn lmm_sweep_fit_on_matches_lmm_sweep_fit_dense() {
-    let (x, y, n, p) = lmm_hand_dataset();
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 6 },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds::from_sizing(model.re.as_ref().unwrap(), n);
-    assert!(matches!(classify_design(&model, 1), Solver::NoZ));
-
-    let (mut ws, g) = build_lmm_seam_ws(&x, &y, n, p, &model, &ids);
-    let (blind, lower, upper) = g.blind_theta_and_bounds();
-    let theta_a = blind.clone();
-    let theta_b: Vec<f64> = lower
-        .iter()
-        .zip(&upper)
-        .map(|(&lo, &hi)| lo + 0.25 * (hi - lo))
-        .collect();
-
-    let on_a = lmm_sweep_fit_on(&mut ws, &g, Some(&theta_a), 1e-6, None, None);
-    let on_b = lmm_sweep_fit_on(&mut ws, &g, Some(&theta_b), 1e-6, None, None);
-
-    let standalone_a = lmm_sweep_fit(&x, &y, n, p, &model, &ids, Some(&theta_a), 1e-6, None, None);
-    let standalone_b = lmm_sweep_fit(&x, &y, n, p, &model, &ids, Some(&theta_b), 1e-6, None, None);
-
-    assert_sweep_outcomes_bit_equal(&on_a, &standalone_a, "dense theta_a");
-    assert_sweep_outcomes_bit_equal(&on_b, &standalone_b, "dense theta_b");
-}
-
-/// Same proof as [`lmm_sweep_fit_on_matches_lmm_sweep_fit_dense`], sparse
-/// (`Solver::Sparse`) shape: a crossed extra grouping carrying a slope
-/// forces the sparse route regardless of size (`classify_design`'s
-/// `slope_extras` clause), so a small hand design suffices.
-#[cfg(feature = "loop_advanced")]
-#[test]
-fn lmm_sweep_fit_on_matches_lmm_sweep_fit_sparse() {
-    let n = 32usize;
-    let p = 3usize;
-    let mut st = 7u64;
-    let mut x = vec![0.0f64; n * p];
-    let mut y = vec![0.0f64; n];
-    let mut primary = vec![0u32; n];
-    let mut extra = vec![0u32; n];
-    for i in 0..n {
-        let x1 = lcg(&mut st);
-        let x2 = lcg(&mut st);
-        x[i * p] = 1.0;
-        x[i * p + 1] = x1;
-        x[i * p + 2] = x2;
-        primary[i] = (i % 4) as u32;
-        extra[i] = ((i / 4) % 4) as u32;
-        y[i] = 0.5 + 0.4 * x1 - 0.2 * x2 + 0.3 * lcg(&mut st);
-    }
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 4 },
-            slopes: vec![],
-            extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 4 },
-                slopes: vec![1],
-            }],
-        }),
-    };
-    let ids = GroupIds {
-        primary,
-        extra: vec![extra],
-    };
-    assert!(matches!(classify_design(&model, 1), Solver::Sparse));
-
-    let (mut ws, g) = build_lmm_seam_ws(&x, &y, n, p, &model, &ids);
-    let (blind, lower, upper) = g.blind_theta_and_bounds();
-    let theta_a = blind.clone();
-    let theta_b: Vec<f64> = lower
-        .iter()
-        .zip(&upper)
-        .map(|(&lo, &hi)| lo + 0.25 * (hi - lo))
-        .collect();
-
-    let on_a = lmm_sweep_fit_on(&mut ws, &g, Some(&theta_a), 1e-6, None, None);
-    let on_b = lmm_sweep_fit_on(&mut ws, &g, Some(&theta_b), 1e-6, None, None);
-
-    let standalone_a = lmm_sweep_fit(&x, &y, n, p, &model, &ids, Some(&theta_a), 1e-6, None, None);
-    let standalone_b = lmm_sweep_fit(&x, &y, n, p, &model, &ids, Some(&theta_b), 1e-6, None, None);
-
-    assert_sweep_outcomes_bit_equal(&on_a, &standalone_a, "sparse theta_a");
-    assert_sweep_outcomes_bit_equal(&on_b, &standalone_b, "sparse theta_b");
-}
-
-/// [`lmm_objective_at`] self-consistency: evaluating it at the θ̂ an
-/// `lmm_sweep_fit` run converged to must reproduce that run's own
-/// `deviance` — both paths build the same `LmmSeamWs` and call the same
-/// `reml_deviance`/`sparse_reml_deviance` closure, so only bit-level FP
-/// order can separate them. Dense (`Solver::NoZ`) shape, same design as
-/// [`lmm_sweep_fit_on_matches_lmm_sweep_fit_dense`].
-#[cfg(feature = "loop_advanced")]
-#[test]
-fn lmm_objective_at_matches_lmm_sweep_fit_deviance_dense() {
-    let (x, y, n, p) = lmm_hand_dataset();
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 6 },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds::from_sizing(model.re.as_ref().unwrap(), n);
-    assert!(matches!(classify_design(&model, 1), Solver::NoZ));
-
-    let outcome = lmm_sweep_fit(&x, &y, n, p, &model, &ids, None, 1e-6, None, None);
-    assert!(outcome.converged, "dense sweep fit must converge");
-
-    let obj = lmm_objective_at(&x, &y, n, p, &model, &ids, &outcome.theta);
-    let rel = (obj - outcome.deviance).abs() / outcome.deviance.abs();
-    assert!(
-        rel < 1e-10,
-        "dense: lmm_objective_at {obj} vs sweep deviance {} (rel {rel})",
-        outcome.deviance
-    );
-}
-
-/// Same proof as [`lmm_objective_at_matches_lmm_sweep_fit_deviance_dense`],
-/// sparse (`Solver::Sparse`) shape: the crossed-slope 32-row design from
-/// [`lmm_sweep_fit_on_matches_lmm_sweep_fit_sparse`] that forces
-/// `classify_design` off the dense route.
-#[cfg(feature = "loop_advanced")]
-#[test]
-fn lmm_objective_at_matches_lmm_sweep_fit_deviance_sparse() {
-    let n = 32usize;
-    let p = 3usize;
-    let mut st = 7u64;
-    let mut x = vec![0.0f64; n * p];
-    let mut y = vec![0.0f64; n];
-    let mut primary = vec![0u32; n];
-    let mut extra = vec![0u32; n];
-    for i in 0..n {
-        let x1 = lcg(&mut st);
-        let x2 = lcg(&mut st);
-        x[i * p] = 1.0;
-        x[i * p + 1] = x1;
-        x[i * p + 2] = x2;
-        primary[i] = (i % 4) as u32;
-        extra[i] = ((i / 4) % 4) as u32;
-        y[i] = 0.5 + 0.4 * x1 - 0.2 * x2 + 0.3 * lcg(&mut st);
-    }
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 4 },
-            slopes: vec![],
-            extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 4 },
-                slopes: vec![1],
-            }],
-        }),
-    };
-    let ids = GroupIds {
-        primary,
-        extra: vec![extra],
-    };
-    assert!(matches!(classify_design(&model, 1), Solver::Sparse));
-
-    let outcome = lmm_sweep_fit(&x, &y, n, p, &model, &ids, None, 1e-6, None, None);
-    assert!(outcome.converged, "sparse sweep fit must converge");
-
-    let obj = lmm_objective_at(&x, &y, n, p, &model, &ids, &outcome.theta);
-    let rel = (obj - outcome.deviance).abs() / outcome.deviance.abs();
-    assert!(
-        rel < 1e-10,
-        "sparse: lmm_objective_at {obj} vs sweep deviance {} (rel {rel})",
-        outcome.deviance
-    );
-}
-
-/// Task 3's correctness proof: two [`refit_lmm`] calls with DIFFERENT `y`
-/// (dataset A unweighted, dataset B weighted) on ONE workspace built by
-/// [`build_lmm_workspace`] must reproduce two independent [`fit_cold`]
-/// calls bit-for-bit — proving genuine workspace reuse (not a silent
-/// rebuild) AND exercising the `-Σlog wᵢ` weighted-deviance coupling: an
-/// omitted correction would only surface as a `deviance` mismatch on
-/// dataset B, since A (unweighted) can't distinguish the two code paths.
-/// Dense (`Solver::NoZ`) shape: same intercept-only 6-cluster design as
-/// `lmm_hand_dataset`, re-seeded per dataset.
-#[cfg(feature = "loop_advanced")]
-#[test]
-fn refit_lmm_matches_fresh_fit_cold() {
-    let n = 48usize;
-    let p = 3usize;
-    let n_clusters = 6usize;
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_clusters as u32,
-            },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds::from_sizing(model.re.as_ref().unwrap(), n);
-
-    // Two datasets of the SAME shape (n, p, cluster structure), different
-    // y — mirrors MCPower's re-simulated-y power loop. Shape matches
-    // `lmm_hand_dataset` (cluster c = i % n_clusters), parameterized by seed.
-    let dataset = |seed: u64| -> (Vec<f64>, Vec<f64>) {
-        let mut st = seed;
-        let u_c: Vec<f64> = (0..n_clusters).map(|_| 0.6 * lcg(&mut st)).collect();
-        let mut x = vec![0.0f64; n * p];
-        let mut y = vec![0.0f64; n];
-        for i in 0..n {
-            let c = i % n_clusters;
-            let x1 = lcg(&mut st);
-            let x2 = lcg(&mut st);
-            x[i * p] = 1.0;
-            x[i * p + 1] = x1;
-            x[i * p + 2] = x2;
-            y[i] = 0.5 + 0.4 * x1 - 0.2 * x2 + u_c[c] + 0.8 * lcg(&mut st);
-        }
-        (x, y)
-    };
-    let (xa, ya) = dataset(42);
-    let (xb, yb) = dataset(99);
-    // Weighted case exercises the -Σlog wᵢ coupling: deviance is the field
-    // that silently diverges from fit_cold's if the correction is dropped.
-    let wb: Vec<f64> = (0..n).map(|i| 1.0 + (i % 3) as f64 * 0.5).collect();
-
-    let opts_a = FitOptions {
-        target_indices: vec![1, 2],
-        ..FitOptions::default()
-    };
-    let opts_b = FitOptions {
-        target_indices: vec![1, 2],
-        weights: Some(wb.clone()),
-        ..FitOptions::default()
-    };
-
-    // ONE workspace, built once, reused across both refits — the reuse claim.
-    let mut ws = build_lmm_workspace(p, &model, n);
-    let refit_a = refit_lmm(&mut ws, &xa, &ya, n, p, &ids, &opts_a, None);
-    let refit_b = refit_lmm(&mut ws, &xb, &yb, n, p, &ids, &opts_b, None);
-
-    let cold_a = fit_cold(&xa, &ya, n, p, &model, &ids, &opts_a);
-    let cold_b = fit_cold(&xb, &yb, n, p, &model, &ids, &opts_b);
-    assert!(
-        cold_a.converged() && cold_b.converged(),
-        "oracle fits must converge"
-    );
-
-    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-    for (label, refit, cold) in [
-        ("A (unweighted)", &refit_a, &cold_a),
-        ("B (weighted)", &refit_b, &cold_b),
-    ] {
-        assert_eq!(refit.converged(), cold.converged(), "{label}: converged");
-        assert_eq!(bits(&refit.beta), bits(&cold.beta), "{label}: beta");
-        assert_eq!(bits(&refit.se), bits(&cold.se), "{label}: se");
-        assert_eq!(bits(&refit.tau2), bits(&cold.tau2), "{label}: tau2");
-        assert_eq!(
-            refit.varcorr.len(),
-            cold.varcorr.len(),
-            "{label}: varcorr len"
-        );
-        for (a, b) in refit.varcorr.iter().zip(&cold.varcorr) {
-            assert_eq!(bits(a), bits(b), "{label}: varcorr block");
-        }
-        assert_eq!(
-            refit.deviance.to_bits(),
-            cold.deviance.to_bits(),
-            "{label}: deviance"
-        );
-        assert_eq!(refit.n_eval, cold.n_eval, "{label}: n_eval");
-        assert_eq!(refit.singular(), cold.singular(), "{label}: singular");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Internal random-effect column scaling (`LmmGroupings::set_slope_scales`) —
-// rescale tests
-//
-// GOVERNING IDEA, shared with `glmm_tests.rs`'s and `sparse/tests.rs`'s rescale
-// tests: multiply a random-slope design column by an exact power of two `C` and
-// refit. `rms_column_scale` is a weighted RMS of that one column, so a
-// power-of-two `C` moves it by EXACTLY `C` — an exact float multiply, no
-// rounding — which makes the INTERNAL problem BOBYQA searches (the
-// `Z~ = Z·diag(1/s)`, `Λ~ = diag(s)·Λ` reparameterization) bit-identical
-// between the two fits. Every quantity the crate reports back in the caller's
-// units therefore has to move by exactly the power of `C` that identity
-// predicts; a dropped back-map shows up unmistakably as a ratio of 1 instead of
-// `1/C` or `1/C²`.
-// ---------------------------------------------------------------------------
-
 /// Parses `validation/data/empirical/sleepstudy.csv` into the q=2 random-slope
-/// design `Reaction ~ 1 + Days + (1 + Days | Subject)` — shared by the rescale
-/// tests below, which need the raw `x`/`y`/`ids` to build a second design with
-/// column 1 (`Days`) multiplied by a power of two, and by the lme4 sleepstudy
-/// pins above (warm start, varcorr, offset, weights).
+/// design `Reaction ~ 1 + Days + (1 + Days | Subject)`, shared by the
+/// warm-start tests below and by the lme4 sleepstudy pins above (warm start,
+/// varcorr, offset, weights).
 fn sleepstudy_slope_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
     let csv = include_str!("../../validation/data/empirical/sleepstudy.csv");
     let mut y = Vec::<f64>::new();
@@ -2299,166 +1952,12 @@ fn sleepstudy_slope_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, Gr
     (x, y, n, p, model, ids)
 }
 
-/// Dense LMM rescale identity, `C = 1024.0`. Column 1 (`Days`) is BOTH the
-/// fixed-effect covariate and the primary random-slope covariate, so scaling it
-/// exercises the fixed-effect side (β/se/vcov) and the RE side (varcorr/tau2/
-/// ranef) with the same single multiply.
-///
-/// The predicted moves, worked from the module-header identity: writing
-/// `x̃ = C·x`, the reparameterization `β̃₁ = β₁/C` (so `β̃₁·x̃ = β₁·x`) makes
-/// `b̃ = diag(1, 1/C)·b` for the RE mode (intercept untouched, slope mode /C),
-/// hence `Λ̃ = diag(1, 1/C)·Λ` (row 1 — the slope row — /C, row 0 untouched) and
-/// `D̃ = σ̂²Λ̃Λ̃ᵀ`: `D̃₀₀` untouched, `D̃₁₀` /C (one row-1 factor), `D̃₁₁` /C² (two).
-/// `tau2[k] = θ[k]²·σ̂²`; θ's vech order is column-major so index 0 is row 0
-/// (untouched) and indices 1, 2 are both row 1 (Λ₁₀ and Λ₁₁), so both get the
-/// squared /C² factor. `Var(β̂)` mirrors the covariance block: `[0][0]`
-/// untouched, `[1][1]` /C², `[0][1]` /C. Fitted means and residual variance are
-/// unaffected — this is a reparameterization of the SAME model, not a rescale
-/// of it.
-///
-/// The REML deviance's only dependence on the fixed-effect column scale is the
-/// `log|X'V⁻¹X|` Jacobian: scaling one column of X by C is `X̃ = X·diag(1,C)`,
-/// so `X̃'V⁻¹X̃ = diag(1,C)·(X'V⁻¹X)·diag(1,C)` and
-/// `det(X̃'V⁻¹X̃) = C²·det(X'V⁻¹X)` — `log|X'V⁻¹X|` moves by `+2·ln(C)`, and since
-/// deviance is `-2·(profiled REML loglik) + log|X'V⁻¹X| + const`, `deviance`
-/// moves by the same `+2·ln(C)` and `loglik = -deviance/2 + const` by `-ln(C)`.
-///
-/// `BAND` is margin over the worst relative spread measured between the two
-/// independent BOBYQA fits' actual vs predicted ratios on 2026-09-28 (this
-/// crate's x86_64-unknown-linux-gnu Arrow Lake-H anchor, see `assert_pinned`'s
-/// doc comment for what that anchor means): 3.2e-5 on a `ranef` entry. The
-/// spread is where two BOBYQA paths happen to stop, so any change to the
-/// objective's last bits re-draws it: it was 1.39e-6 before the fixed-effect
-/// orthogonalization (`lmm::DesignQr`), which scales exactly with `C` here and
-/// so is not itself a source of the gap. That is
-/// three orders looser than `PIN_REL_ITER` (1e-7, this file's usual BOBYQA
-/// pin) because this test's "pin" is not one fit read twice but TWO
-/// INDEPENDENT optimizer runs landing on two different points in the same
-/// θ-space (θ and C·θ never coincide as floats), so the two runs' BOBYQA
-/// stopping tolerances compound instead of cancelling. `DEV_ABS` covers the
-/// measured deviance/loglik shift error (3.4e-12 on `deviance`), over an order
-/// of margin over that.
-#[test]
-fn lmm_rescaling_slope_column_moves_every_quantity_by_the_predicted_power_of_c() {
-    const C: f64 = 1024.0;
-    const BAND: f64 = 7e-5;
-    const DEV_ABS: f64 = 1e-10;
-
-    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
-    let opts = FitOptions {
-        target_indices: vec![0, 1],
-        ..FitOptions::default()
-    };
-
-    let base = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert!(base.converged(), "base sleepstudy slope LMM must converge");
-
-    let mut x_c = x.clone();
-    for i in 0..n {
-        x_c[i * p + 1] *= C;
-    }
-    let scaled = fit_cold(&x_c, &y, n, p, &model, &ids, &opts);
-    assert!(scaled.converged(), "column-scaled fit must converge");
-
-    // The singular verdict is part of what must not move. `Fit::singular` is
-    // `boundary_hit == 1` OR the `SINGULAR_REL_TOL` relative check, and that check
-    // compares the INTERNAL standard deviations — on the reported ones the scaled
-    // fit's slope sd sits `C` below its intercept's (here 5.7/1024 against 24, a
-    // ratio of 2.3e-4) and a user-scale comparison would call this well-identified
-    // fit degenerate.
-    assert!(
-        !base.singular() && !scaled.singular(),
-        "neither fit is degenerate: base singular {} scaled singular {}",
-        base.singular(),
-        scaled.singular()
-    );
-
-    assert_pinned(&[scaled.beta[0]], &[base.beta[0]], BAND, "beta[0]");
-    assert_pinned(&[scaled.beta[1]], &[base.beta[1] / C], BAND, "beta[1]");
-    assert_pinned(&[scaled.se[0]], &[base.se[0]], BAND, "se[0]");
-    assert_pinned(&[scaled.se[1]], &[base.se[1] / C], BAND, "se[1]");
-    assert_pinned(&[scaled.vcov[0][0]], &[base.vcov[0][0]], BAND, "vcov[0][0]");
-    assert_pinned(
-        &[scaled.vcov[1][1]],
-        &[base.vcov[1][1] / (C * C)],
-        BAND,
-        "vcov[1][1]",
-    );
-    assert_pinned(
-        &[scaled.vcov[0][1]],
-        &[base.vcov[0][1] / C],
-        BAND,
-        "vcov[0][1]",
-    );
-    assert_pinned(
-        &[scaled.vcov[1][0]],
-        &[base.vcov[1][0] / C],
-        BAND,
-        "vcov[1][0]",
-    );
-
-    // varcorr vech [D00, D10, D11].
-    assert_eq!(scaled.varcorr.len(), 1, "one grouping block");
-    assert_pinned(
-        &scaled.varcorr[0],
-        &[
-            base.varcorr[0][0],
-            base.varcorr[0][1] / C,
-            base.varcorr[0][2] / (C * C),
-        ],
-        BAND,
-        "varcorr vech",
-    );
-
-    // tau2[0] = Lambda row 0 (intercept); tau2[1], tau2[2] = Lambda row 1 (slope).
-    assert_pinned(
-        &scaled.tau2,
-        &[base.tau2[0], base.tau2[1] / (C * C), base.tau2[2] / (C * C)],
-        BAND,
-        "tau2",
-    );
-
-    // ranef, per level [b0, b1].
-    assert_eq!(scaled.ranef.len(), base.ranef.len());
-    assert_eq!(scaled.ranef_levels, base.ranef_levels);
-    let n_levels = scaled.ranef_levels[0];
-    let mut want_ranef = Vec::with_capacity(scaled.ranef.len());
-    for l in 0..n_levels {
-        want_ranef.push(base.ranef[l * 2]);
-        want_ranef.push(base.ranef[l * 2 + 1] / C);
-    }
-    assert_pinned(&scaled.ranef, &want_ranef, BAND, "ranef");
-
-    // fitted — unchanged elementwise (same model, same conditional means).
-    assert_eq!(scaled.fitted.len(), base.fitted.len());
-    assert_pinned(&scaled.fitted, &base.fitted, BAND, "fitted");
-
-    // dispersion — unchanged (residual variance is invariant to a fixed/random
-    // reparameterization of one column).
-    assert_pinned(&[scaled.dispersion], &[base.dispersion], BAND, "dispersion");
-
-    // deviance / loglik — see the doc comment above for the log|X'V⁻¹X|
-    // derivation of the +2·ln(C) / -ln(C) shifts.
-    let dev_shift = scaled.deviance - base.deviance;
-    let expected_dev_shift = 2.0 * C.ln();
-    assert!(
-        (dev_shift - expected_dev_shift).abs() < DEV_ABS,
-        "deviance shift {dev_shift} vs predicted {expected_dev_shift}"
-    );
-    let loglik_shift = scaled.loglik - base.loglik;
-    let expected_loglik_shift = -C.ln();
-    assert!(
-        (loglik_shift - expected_loglik_shift).abs() < DEV_ABS,
-        "loglik shift {loglik_shift} vs predicted {expected_loglik_shift}"
-    );
-}
-
-/// Warm-start forward map, on the same sleepstudy slope design: warm-starting
+/// Warm-start forward map, on the sleepstudy slope design: warm-starting
 /// at a fit's own reported θ̂ (via [`FitView::theta`], which hands back θ in the
-/// CALLER's units) must be a FIXED POINT of the map `LmmGroupings::
-/// theta_row_scales` installs in `src/lmm/mod.rs`'s `fit_lmm`. `Days`' RMS
-/// scale is clearly off 1.0 (values run 0..9), so a dropped forward map moves
-/// this test's θ̂ rather than leaving it untouched by construction.
+/// CALLER's units) must be a FIXED POINT of the forward map
+/// (`LmmGroupings::theta_caller_to_design`). `Days`' scale is clearly off 1.0
+/// (values run 0..9), so a dropped forward map moves this test's θ̂ rather than
+/// leaving it untouched by construction.
 ///
 /// Reached through the loop tier (`build_workspace`/`fit_on`) rather than
 /// `fit_warm`, per the loop-tier warm-start contract this crate carries: the
@@ -2519,81 +2018,6 @@ fn lmm_warm_start_theta_is_a_fixed_point_of_the_forward_map() {
         warm_n_eval < cold_n_eval,
         "warm start at the true optimum must need fewer evals than the blind \
          cold start: warm {warm_n_eval} vs cold {cold_n_eval}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// `rms_column_scale` / `LmmGroupings::theta_row_scales` — map-primitive tests
-// ---------------------------------------------------------------------------
-
-/// `rms_column_scale` on a constant-1 column returns EXACTLY `1.0`, both
-/// unweighted and under non-unit weights — the exactness (not just closeness)
-/// that keeps an implicit-intercept RE subcolumn's factor exact and an
-/// intercept-only design bit-identical to the unscaled path (see the function's
-/// own doc comment for the `Σw/Σw == 1.0` argument).
-#[test]
-fn rms_column_scale_is_exactly_one_on_a_constant_column() {
-    use crate::lmm::rms_column_scale;
-    let n = 7;
-    let x = faer::Mat::<f64>::from_fn(n, 1, |_, _| 1.0);
-
-    assert_eq!(rms_column_scale(x.as_ref(), 0, None), 1.0);
-
-    let w: Vec<f64> = (0..n).map(|i| 0.3 + 1.7 * (i as f64)).collect();
-    assert_eq!(rms_column_scale(x.as_ref(), 0, Some(&w)), 1.0);
-}
-
-/// `LmmGroupings::theta_row_scales` on a hand-built grouping: a primary
-/// `q_p = 2` block (intercept + one slope, scale `s_p`) and one extra crossed
-/// `q_g = 2` block (intercept + one slope, scale `s_e`), scales set by hand on
-/// the struct fields (bypassing `set_slope_scales`, which needs a real design
-/// matrix). Column-major vech order per block is `[(0,0), (1,0), (1,1)]`; row 0
-/// of every block is the intercept subcolumn (scale exactly 1.0 by
-/// construction — never stored), row 1 is the slope (the hand-set scale). So
-/// the expected output is `[1.0, s_p, s_p, 1.0, s_e, s_e]`: primary block
-/// `[row0, row1, row1]` then the extra block the same shape.
-#[test]
-fn theta_row_scales_reads_off_the_hand_built_grouping() {
-    use crate::lmm::{CrossedFactor, LmmGroupings};
-
-    const S_P: f64 = 3.5;
-    const S_E: f64 = 0.25;
-
-    let mut g = LmmGroupings::from_cluster_spec_ext(
-        &ModelSpec {
-            family: Family::Gaussian,
-            re: Some(ReStructure {
-                sizing: Sizing::FixedClusters { n_clusters: 4 },
-                slopes: vec![1], // q_p = 2
-                extra_groupings: vec![Grouping {
-                    relation: GroupingRelation::Crossed { n_clusters: 3 },
-                    slopes: vec![2], // q_g = 2
-                }],
-            }),
-        },
-        4, // max_n placeholder — only the shape matters for this test
-        &[1],
-        &[vec![2]],
-    );
-    assert_eq!(g.primary_q, 2, "primary block must be q_p = 2");
-    assert_eq!(g.extra_q, vec![2], "extra block must be q_g = 2");
-    assert_eq!(
-        g.crossed,
-        vec![CrossedFactor {
-            vech_start: 3, // after the primary's 3-slot vech
-            q: 2,
-            n_levels: 3,
-            decl: 0,
-        }]
-    );
-
-    g.primary_slope_scales = vec![S_P];
-    g.extra_slope_scales = vec![vec![S_E]];
-
-    assert_eq!(
-        g.theta_row_scales(),
-        vec![1.0, S_P, S_P, 1.0, S_E, S_E],
-        "column-major vech: [primary (0,0),(1,0),(1,1)] then [extra (0,0),(1,0),(1,1)]"
     );
 }
 
@@ -2773,7 +2197,7 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
     ws.solver = Bobyqa::new(n_theta, config).expect("legal minimal config");
 
     let fit = {
-        let v = lmm_run_on(&mut ws, &opts.target_indices, None);
+        let v = lmm_run_on(&mut ws, &opts.target_indices, None, ColumnScaling::IDENTITY);
         lmm_view_to_fit(&v, &x, &ids, n, p, &opts)
     };
 

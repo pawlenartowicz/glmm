@@ -25,8 +25,7 @@
 //! binomial/Poisson/Gamma/NB), `glmm` (mixed non-Gaussian, plus GLMM-NB) —
 //! each of which marshals into the matching numerical kernel
 //! (`src/ols.rs`/`src/lmm/mod.rs`/`src/glm.rs`/`src/glmm/`). `common` holds
-//! helpers shared by 2+ of those modules; `loop_advanced_seam` holds the
-//! unstable dev-only surface re-exported through `crate::loop_advanced`.
+//! helpers shared by 2+ of those modules.
 
 use crate::consts::{MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q, MAX_PRIMARY_Q};
 use crate::{Family, GroupIds, GroupingRelation, ModelSpec, StartValues, WaldSe};
@@ -36,7 +35,6 @@ mod core;
 mod glm;
 mod glmm;
 mod lmm;
-mod loop_advanced_seam;
 mod ols;
 
 use common::{
@@ -132,15 +130,21 @@ pub struct Fit {
     /// per-component variances; `tau2` is retained for back-compat.
     pub varcorr: Vec<Vec<f64>>,
     /// SE of each RE standard deviation, laid out like `tau2` (per θ coordinate,
-    /// length `n_theta`; primary block then each extra, in declaration order).
-    /// Populated ONLY on a converged GLMM `WaldSe::Hessian` fit, from the θ block
+    /// length `n_theta`; primary block then each extra, in declaration order):
+    /// the SE of row k's stddev `√D̂_kk` (the stddev `varcorr` reports) sits at
+    /// that row's diagonal slot, and the off-diagonal slots of a q≥2 block are
+    /// NaN. Populated ONLY on a converged GLMM `WaldSe::Hessian` fit, from the θ block
     /// of the joint (θ,β) Hessian covariance that `joint_hessian_cov` inverts and
     /// otherwise discards (exact Hessian on every shape
     /// `derivative::supports_shape` accepts, finite-difference elsewhere).
     /// NaN under `WaldSe::Rx`, on the Hessian RX fallback, and
-    /// for OLS/LMM (no Hessian machinery). Correct for SCALAR groupings only (the
-    /// reachable GLMM case), where the RE stddev equals its θ so the θ-scale SE is
-    /// the stddev SE directly; a q≥2 block would need a delta-method Jacobian.
+    /// for OLS/LMM (no Hessian machinery). The joint Hessian is taken in the
+    /// fit's internal coordinates and the SE is the delta method's on them
+    /// (the stddev's square is a polynomial in the internal θ). A stddev of
+    /// exactly 0 has no derivative and reports NaN, except where it reads a
+    /// single θ coordinate (a SCALAR grouping, or the intercept of a block
+    /// whose slopes are not centered): there the SE is that coordinate's,
+    /// as at every other value.
     ///
     /// Scale caveat for dispersion families (Gamma): this SE stays on the
     /// **θ scale** — lme4's θ-Hessian convention — while `varcorr`/`tau2` carry
@@ -460,26 +464,6 @@ pub enum Note {
         /// The declared level labels with a slot but no row.
         levels: Vec<String>,
     },
-    /// One grouping's random-effect design columns sit on very different
-    /// scales — the ratio of the largest to the smallest column RMS (the
-    /// implicit intercept counted at 1.0) exceeds the formula frontend's
-    /// `RE_SCALE_SPREAD_WARN` threshold (1e3). Fitting is unaffected (the
-    /// kernel scales internally), but the reported random-effect standard
-    /// deviations sit on the raw variable's scale, so a large spread makes
-    /// them hard to compare by eye. Mirrors lme4's
-    /// `lme4:::checkScaleX(tol = 1000)`.
-    ///
-    /// Raised by the formula frontend, not by a solver, for the same reason
-    /// [`Note::UnusedGroupingLevels`] is: the ratio is measured over the
-    /// lowered design, and a caller building `x`/`ModelSpec` by hand never
-    /// sees it. Reached through [`crate::formula::Lowered::notes`].
-    ReDesignScaleSpread {
-        /// The grouping factor, as the formula spells it.
-        grouping: String,
-        /// max column RMS / min column RMS over the grouping's random-effect
-        /// design columns (intercept included at 1.0).
-        ratio: f64,
-    },
     /// `FitOptions::wald_se == WaldSe::Hessian` was requested, but the
     /// finite-difference joint Hessian came back non-positive-definite (or a
     /// perturbed deviance evaluation was non-finite), so the SE pass fell back
@@ -638,38 +622,29 @@ impl Fit {
     /// Post-hoc singular check beyond the optimizer's exact-pin decision
     /// ([`Diagnostics::boundary`], unchanged by this — see
     /// [`SINGULAR_REL_TOL`]).
-    /// Read-only over the already-assembled `varcorr`; changes no returned
-    /// estimate. `false` when `varcorr` is empty (non-mixed-model fit, or a
-    /// non-converged fit that left it unassembled).
+    /// Changes no returned estimate. `false` when `varcorr` is empty
+    /// (non-mixed-model fit, or a non-converged fit that left it unassembled).
     ///
-    /// `re_scales` is [`common::re_scale_grid`] — the internal RE design-column
-    /// scale of each reported standard deviation. The comparison runs on the
-    /// INTERNAL standard deviations `sd·s` because the reported ones are not
-    /// commensurate with each other: an intercept's is in response units and a
-    /// slope's is in response per covariate unit, so their raw ratio moves when
-    /// the covariate is re-expressed and the verdict would follow it. On the
-    /// internal scale every component is "how much variation this term
-    /// contributes", and the check means what it says. All-`1.0` scales — every
-    /// intercept-only model — multiply exactly and leave this as it was.
-    pub(crate) fn has_negligible_component(&self, re_scales: &[Vec<f64>]) -> bool {
+    /// The comparison runs on the fit's internal standard deviations
+    /// `kernel_sd` (`LmmGroupings::kernel_stddevs`): the row norms of the
+    /// kernel's Λ, one block per grouping, primary first. σ cancels in the
+    /// ratio, so they stand in for `σ·‖row‖`. The reported standard deviations
+    /// are not commensurate with each other: an intercept's is in response units
+    /// and a slope's is in response per covariate unit, so their raw ratio moves
+    /// when the covariate is re-expressed and the verdict would follow it. In
+    /// the kernel's coordinates every component is "how much variation this
+    /// term contributes" on the standardized design, and the check means what
+    /// it says. On a predictor whose mean is far from zero the intercept's is
+    /// therefore taken at the mean, not at x = 0.
+    pub(crate) fn has_negligible_component(&self, kernel_sd: &[Vec<f64>]) -> bool {
         if self.varcorr.is_empty() {
             return false;
         }
-        let stddevs: Vec<Vec<f64>> = (0..self.varcorr.len())
-            .map(|g| {
-                let sd = self.stddev_corr(g).0;
-                let sc = re_scales.get(g);
-                sd.iter()
-                    .enumerate()
-                    .map(|(i, &v)| v * sc.and_then(|s| s.get(i)).copied().unwrap_or(1.0))
-                    .collect()
-            })
-            .collect();
-        let max_sd = stddevs.iter().flatten().cloned().fold(0.0_f64, f64::max);
+        let max_sd = kernel_sd.iter().flatten().cloned().fold(0.0_f64, f64::max);
         if max_sd <= 0.0 {
             return false;
         }
-        stddevs
+        kernel_sd
             .iter()
             .flatten()
             .any(|&s| s <= SINGULAR_REL_TOL * max_sd)
@@ -1176,7 +1151,7 @@ pub(crate) fn classify_design(model: &ModelSpec, _nagq: u8) -> Solver {
 // Re-exports for consumers outside `fit` (mirrors `src/glmm/mod.rs`'s
 // mod+re-export convention): `sparse.rs` reaches these as `crate::fit::X`,
 // and the `loop_advanced` cargo feature's `crate::loop_advanced` re-exports the
-// dev seam from here.
+// loop tier from here.
 // ---------------------------------------------------------------------------
 
 #[cfg(any(test, feature = "loop_advanced"))]
@@ -1205,11 +1180,6 @@ pub(crate) use lmm::{fit_mle_noz_pub, fit_mle_sparse_pub};
 // Unified fit-core surface for the loop tier.
 #[cfg(feature = "loop_advanced")]
 pub use core::{build_workspace, fit_on, FitView, FitWorkspace};
-#[cfg(feature = "loop_advanced")]
-pub use loop_advanced_seam::{
-    build_lmm_seam_ws, lmm_objective_at, lmm_sweep_fit, lmm_sweep_fit_on, LmmSeamWs,
-    LmmSweepOutcome,
-};
 
 // `pub(crate)` only so `src/sparse/tests.rs` can reach the shared Tier 1 pin
 // bands; the module is `cfg(test)` either way.
@@ -1223,3 +1193,5 @@ mod glmm_tests;
 mod lmm_tests;
 #[cfg(test)]
 mod ols_tests;
+#[cfg(test)]
+mod standardize_tests;

@@ -1,9 +1,9 @@
 //! Shared helpers for the dev-only examples that lower a manifest entry or a bare
 //! CSV + formula pair into a `Lowered`: `bit_identity/dump.rs`, `memory/memory_fit.rs`,
-//! and the speed campaign's `fit.rs`, `theta_eval.rs` and `agq_par_probe.rs`.
+//! and the speed campaign's `fit.rs` and `agq_par_probe.rs`.
 //! Included via `#[path = ...]` rather than a library module — every example here is
 //! dev-only, so this stays a plain shared source file rather than adding a crate for
-//! five consumers. `validation/grid/engines/common.rs` is a separate file for the
+//! four consumers. `validation/grid/engines/common.rs` is a separate file for the
 //! accuracy grid's per-cell manifest shape; neither is a drop-in for the other.
 
 use glmm::formula::{lower, Column, Lowered, Table};
@@ -85,7 +85,7 @@ pub fn nums(xs: &[f64]) -> Value {
 /// target regardless of which campaign subdir the source file sits in); grid
 /// data is campaign-local (`prep.R`'s output), under
 /// `campaigns/speed-campaign/data/`. Used by the grid drivers (`grid_fit`,
-/// `theta_eval`) — allow(dead_code) because `bit_identity` includes this file
+/// `agq_par_probe`) — allow(dead_code) because `bit_identity` includes this file
 /// without calling it.
 #[allow(dead_code)]
 pub fn lower_grid_cell(cell: &Value, manifest_dir: &str) -> (Lowered, bool, usize) {
@@ -183,7 +183,7 @@ pub fn lower_dataset_generic(
 /// `Table` (kept for a caller that re-lowers it for a construction-inclusive timing), the
 /// resolved `Family`, and the formula string lowering used (a re-lower needs the same
 /// string, not just the `Family`). Used by `bit_identity` — allow(dead_code) because
-/// `grid_fit`/`theta_eval`/`memory_fit`/`agq_par_probe` include this file without calling
+/// `grid_fit`/`memory_fit`/`agq_par_probe` include this file without calling
 /// it (they lower grid cells or a bare CSV+formula pair instead of a manifest rung).
 #[allow(dead_code)]
 pub fn lower_rung(spec: &Value, manifest_dir: &str) -> (Lowered, Table, Family, String) {
@@ -322,8 +322,8 @@ pub fn rx_options(opts: &FitOptions) -> FitOptions {
 
 /// Manifest's per-rung AGQ order (`spec["agq"]`), present only on the
 /// binomial/Poisson single-grouping-factor (q ≤ 3) rungs glmm's AGQ gate
-/// accepts. `bit_identity/dump.rs` applies it unconditionally so the AGQ solve
-/// path (`src/glmm/agq.rs`) stays on the bit-identity tripwire without a
+/// accepts. `bit_identity/dump.rs` applies it unconditionally so a move in the
+/// AGQ solve path (`src/glmm/agq.rs`) shows up in its report without a
 /// separate env var.
 #[allow(dead_code)]
 pub fn rung_agq(spec: &Value) -> Option<u8> {

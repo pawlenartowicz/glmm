@@ -154,7 +154,7 @@ them). It is returned by `fit`, never constructed by callers.
 | `aliased` | `(p,)` bool — rank-deficient columns dropped (lme4's `NA` coefficients) |
 | `varcorr` | per grouping, in the order the groupings appear in the formula (lme4 instead sorts by decreasing number of levels): vech-packed lower-triangular RE covariance D̂ |
 | `tau2` | legacy per-element RE variances (q=1 only) — prefer `varcorr` |
-| `stddev_se` | SE of each RE stddev, θ layout (not beta-aligned); `NaN` where unavailable |
+| `stddev_se` | SE of each RE stddev, θ layout (not beta-aligned): at the stddev's diagonal slot, `NaN` at the off-diagonal slots and where unavailable |
 | `dispersion` | φ (gamma / inverse-gaussian) / θ (negbin) / 1.0 otherwise |
 | `re_groups` | per grouping, in `varcorr` order (formula order): `(name, [term names])` — what `summary()` labels the RE block with |
 | `n_eval` | optimizer objective evaluations (0 on the closed-form/IRLS paths) |

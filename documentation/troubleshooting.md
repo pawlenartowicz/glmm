@@ -25,25 +25,14 @@ exactly redundant and is dropped, with `beta`/`se` reported as `NaN`).
 
 The warning names one column — the one the pivot search happened to reach —
 but its entangled partners are **not** named; the search finds the
-worst-conditioned column, not the full set it is confounded with. To fix it:
-center predictors (the check is scale-invariant, so rescaling does not change
-it), or drop or combine the predictors that are actually measuring the same
-thing. See
+worst-conditioned column, not the full set it is confounded with. To fix it,
+drop or combine the predictors that are actually measuring the same thing.
+The check runs on the design glmm fits internally, whose columns are already
+centered and scaled, so rescaling or centering a column on its own does not
+change it; centering a variable before it enters an interaction or polynomial
+term changes those columns and can. See
 [`conventions.md#flags-on-the-result`](conventions.md#flags-on-the-result) for
 where this sits in the `diagnostics` channel.
-
-## Warning: random-effect design columns on very different scales
-
-A grouping's random-effect design columns span very different magnitudes —
-the ratio between the largest and smallest column RMS (the implicit
-intercept counted as 1.0) exceeds 1000, the same threshold lme4's
-`checkScaleX` warns on. Fitting itself is unaffected: the kernel scales the
-columns internally before solving. What the warning is telling you is that
-the reported random-effect standard deviation for that grouping sits on the
-raw variable's own scale, so a large spread between components makes them
-hard to compare by eye. Rescale the offending variable (e.g. divide a
-day-of-experiment slope by 100, or convert a raw count to thousands) so the
-reported stddevs land on comparable magnitudes.
 
 ## Warning: Simpler standard errors used
 
@@ -80,10 +69,11 @@ that always comes with it (exactly one is raised on every non-converged fit):
   a degenerate configuration and reports no estimates: every relevant field
   is NaN or empty.
 
-First things to check: the scale of your predictors (wildly different
-magnitudes across columns make the optimizer's job harder), and whether the
-model is too rich for the data — too many random-effect parameters for the
-number of clusters/groups you have. There is no multistart or retry knob to
+First thing to check: whether the model is too rich for the data, with too
+many random-effect parameters for the number of clusters or groups you have.
+The units of the predictors do not matter: glmm centers and scales the design
+internally before it fits, so rescaling a predictor does not change the
+search. Nearly collinear predictors still do. There is no multistart or retry knob to
 reach for here; `fit` runs one optimization from one starting point and
 reports honestly if it didn't converge.
 

@@ -115,6 +115,93 @@ the LMM and GLMM pages for the per-kernel rungs (Dyestuff, sleepstudy,
 Penicillin, Pastes, sim_slope_extra on the Gaussian side; cbpp, grouseticks,
 `sim_sparse_binomial`, `sim_sparse_poisson` on the non-Gaussian side).
 
+## Internal standardization of the design
+
+Every fit runs on a transformed fixed-effect design and reports in the caller's
+units. At the start of `fit_on`, before any route reads `X`, each column `j`
+gets two statistics from this draw's data and prior weights `wᵢ` (1 when
+absent; binomial trial counts as they are):
+
+```
+mⱼ = Σwᵢxᵢⱼ / Σwᵢ          if X has an intercept, else 0
+sⱼ = √(Σwᵢ(xᵢⱼ − mⱼ)² / Σwᵢ)
+x̃ᵢⱼ = (xᵢⱼ − mⱼ) / sⱼ
+```
+
+Left as they are (`mⱼ = 0`, `sⱼ = 1`): the intercept (the first column whose
+entries are all exactly 1), every 0/1 column (factor dummies, binary
+covariates), and every column whose `sⱼ` is zero or not finite. Without an
+intercept nothing is centered and `sⱼ` is the weighted RMS about zero. One
+exception: a 0/1 (or constant) column that a random-effect block reads as a
+slope is scaled without being centered, `mⱼ = 0` and `sⱼ` its weighted RMS
+about zero, so its zeros stay exact zeros and the random-effect search sees
+the slope in units of its root mean square
+([random-effect design column scaling](algorithms-lmm.md#random-effect-design-column-scaling)). The
+response, the offset and the weights are not transformed. The statistics are
+applied inside the column-major fill every route already does, so no extra
+copy of `X` is made: every route, the NB ones included, reads the same
+column-major `x̃` buffer of the workspace.
+
+Centering is exact only where an intercept absorbs the constant `−mⱼβⱼ` it
+adds. In `X` that is the intercept column. A random slope is a column of `X`
+too, so its block reads the same `x̃ⱼ`, and there the block's own random
+intercept absorbs the shift: every random-effect block has one, in the same
+unrestricted covariance. `y ~ 0 + x + (1 + x | g)` therefore scales `x` without
+centering it.
+
+The transform is a preconditioner, not a model change. The fit is the same
+model in other coordinates, nothing downstream assumes `x̃` has mean 0 or
+standard deviation 1, and the results map back exactly:
+
+- **Fixed effects.** `β = Bβ̃`, with `B` the identity except `Bⱼⱼ = 1/sⱼ`
+  and, on the intercept row, `B₀ⱼ = −mⱼ/sⱼ`. Every SE path forward-solves
+  against row `t` of `B` where it solved against `eₜ` (one solve per target,
+  as before), so `se`, `vcov`, the per-target `t²` and the joint Wald
+  statistic come out in the caller's units. The GLMM Hessian arm maps its
+  covariance as `B·Ṽ·Bᵀ`.
+- **Random effects.** Per block `b = N·b̃`, where `N` has the shape of `B` on
+  the block's coordinates. `varcorr` is `N·Σ̃·Nᵀ` and `ranef` is `N·b̃`. The
+  caller's relative factor `Λ` (`tau2`, and the loop tier's `FitView::theta`)
+  is the lower Cholesky factor of `N·Λ̃Λ̃ᵀ·Nᵀ`, taken with the semidefinite
+  factorization that canonicalizes pinned blocks, so a rank-deficient `Λ̃`
+  maps to a `Λ` of the same rank with exact zeros: the factorization is capped
+  at Λ̃'s rank, so a dependent column's rounding residual is not taken for a
+  direction. With no centered slope `N` is diagonal and no factorization runs.
+  `stddev_se` is the SE of each reported stddev `√Σ_kk`, by the delta method
+  on θ̃: `Σ_kk` is a polynomial in θ̃, so one formula serves every block and
+  no factorization is differentiated.
+- **REML deviance.** `ln|X̃ᵀV⁻¹X̃| = ln|XᵀV⁻¹X| − 2·Σⱼ ln sⱼ` (a shift has
+  determinant 1), so the LMM adds `2·Σⱼ ln sⱼ` back to its deviance and
+  log-likelihood. No other deviance contains an `X` term.
+- **Warm starts.** A `StartValues` is in the caller's units and is mapped
+  forward per draw: `β̃ = B⁻¹β`, and `Λ̃` the lower factor of
+  `N⁻¹·ΛΛᵀ·N⁻ᵀ`. On the loop tier a θ̂ carried from one draw is mapped forward
+  with the next draw's statistics. A start component of the wrong width is
+  dropped, a cold start for that component (`fit_on`).
+
+Three diagnostics read the fit's own coordinates. `pinned` is reported in the
+caller's: under a centered slope a zero can move from the intercept diagonal
+to the slope diagonal. `singular` compares the kernel's internal standard
+deviations, so on a predictor whose mean is far from zero the intercept's is
+taken at the mean, not at `x = 0`. `ill_conditioned` is measured on the
+standardized design, so a column that is ill-conditioned only through its
+distance from zero is not flagged. Vector AGQ (`nagq > 1` on a block
+with a slope) takes its quadrature in the centered coordinates: the model is
+the same, and the reported AGQ deviance differs from the uncentered one by the
+quadrature error. Laplace, the Gaussian LMM and scalar AGQ are exact under
+centering.
+
+On the loop tier, `FitWorkspace::set_prestandardized(true)` skips the
+transform: the design is fitted as given, except that every random-slope
+column is scaled by its weighted RMS about zero, as a 0/1 slope is above, and
+every other map is the identity.
+
+**Code**: `ColumnScaling` (`src/standardize.rs`); the
+random-effect maps (`src/lmm/re_map.rs`); `fit_on`, `FitView::new`
+(`src/fit/core.rs`); `fill_col_major_std`, `vcov_from_chol`, `varcorr_block`
+and the ranef assemblers (`src/fit/common.rs`). **Convention**: lme4 fits the
+design as given and warns on badly scaled predictors (`checkScaleX`).
+
 ## Legend
 
 - **Node** = a named function the dispatch actually calls; the terminal leaves
@@ -153,6 +240,12 @@ and are not user-facing.
 | `offset` | per-row offset `oᵢ` added to the linear predictor | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages |
 | `parallel_inner` | experimental opt-in to parallel inner kernels | GLMM only — AGQ/FD-Hessian, [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (off by default, bit-identical to serial) |
 
+### Loop-tier settings (`loop_advanced`, no semver guarantee)
+
+| Knob | Meaning | Owned by |
+|---|---|---|
+| `FitWorkspace::set_prestandardized` | `true` fits the design as given, skipping the per-draw standardization except the random-slope scale; default `false`. `fit_cold`/`fit_warm` always standardize | [internal standardization](#internal-standardization-of-the-design) |
+
 ### Internal tuning constants
 
 | Knob | Value / formula | Owned by |
@@ -162,7 +255,7 @@ and are not user-facing.
 | `rho_end` | `RHO_END = 1e-6` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm/mod.rs`) |
 | `PIN_THETA` | `1e-4` — diagonal variance component pinned to `0`, tested on the internal (scaled) θ | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm/mod.rs`) |
 | `SINGULAR_REL_TOL` | `1e-3` — post-hoc relative check: any RE stddev `≤ 1e-3 ×` the largest ⇒ `singular`, on the internal (scaled) stddevs | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/fit/mod.rs`) |
-| RE design column scale | per random-slope column, `√(Σ wᵢxᵢ²/Σ wᵢ)`; intercept subcolumns exactly `1.0`; always on, no trigger | [`algorithms-lmm.md`](algorithms-lmm.md#random-effect-design-column-scaling) (`src/lmm/mod.rs`) |
+| RE design column scale | per random-slope column of the standardized design, `√(Σ wᵢx̃ᵢ²/Σ wᵢ)`; intercept subcolumns exactly `1.0`; always on, no trigger | [`algorithms-lmm.md`](algorithms-lmm.md#random-effect-design-column-scaling) (`src/lmm/mod.rs`) |
 | `outer_search` route | `ExactProfile` on the `exact_profile_shape` shapes (nAGQ=1, non-Gamma, no extras or structured extras eligible, canonical or not); else `Joint` when `nAGQ>1 \|\| (n_θ ≤ 2 && p ≤ 4)`; else `PqlThenJoint` | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/workspace.rs`, `src/glmm/mod.rs`) |
 | `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: any `|η_i − η₀| > 30` at IRLS iter ≥ 3 → non-converged, `η₀ = 0` on the binomial links and `ln μ₀` (the null-model seed) on the log links; skipped under the Gamma inverse and inverse-Gaussian `1/μ²` links | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `PROB_EPS` / `LOG_TAIL_ETA` | `1e-12` / `230` — tail-row switch: binomial μ within `1e-12` of 0 or 1, NB/Gamma/IG-log `\|η\| > 230` → deviance, score and weights from their η forms | [GLM](#generalised-linear-models-glm) (`src/family.rs`) |

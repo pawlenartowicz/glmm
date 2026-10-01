@@ -68,6 +68,7 @@ mod lmm;
 mod ols;
 mod sparse;
 mod spec;
+mod standardize;
 mod start;
 #[cfg(feature = "counters")]
 pub use counters::{EvalCounters, Stage};

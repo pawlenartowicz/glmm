@@ -642,9 +642,7 @@ pub(crate) fn pirls_solve_packed(
 /// filled for this θ): entry `c` of a row's block is the lower-tri fold
 /// `Σ_{r≥c} z[r]·Λ[r,c]` with `z = [1, x[slope cols…]]`, the same `ZΛ` sandwich
 /// every other layout writes. The Z-side factor is indexed by the Λ ROW `r`,
-/// not the column `c`: it takes the RE column's internal scale
-/// (`LmmGroupings::set_slope_scales`) while `lam_small` is the θ side and takes
-/// none. The intercept's scale is exactly 1.
+/// not the column `c`.
 pub(crate) fn fill_m_vals(
     packed: &mut PackedScratch,
     g: &crate::lmm::LmmGroupings,
@@ -661,7 +659,7 @@ pub(crate) fn fill_m_vals(
                 let z = if r == 0 {
                     1.0
                 } else {
-                    x[(i, g.primary_slope_cols[r - 1])] / g.primary_slope_scales[r - 1]
+                    x[(i, g.primary_slope_cols[r - 1])]
                 };
                 acc += z * packed.lam_small[r * q_p + c];
             }
@@ -677,7 +675,7 @@ pub(crate) fn fill_m_vals(
                     let z = if r == 0 {
                         1.0
                     } else {
-                        x[(i, g.extra_slope_cols[e][r - 1])] / g.extra_slope_scales[e][r - 1]
+                        x[(i, g.extra_slope_cols[e][r - 1])]
                     };
                     acc += z * packed.lam_small[lo + r * q_g + c];
                 }
@@ -695,9 +693,7 @@ pub(crate) fn fill_m_vals(
 /// anything: θ_a is exactly one `(r, c)` vech slot of exactly one grouping's
 /// `Λ`, so the fold can carry it into exactly one slot of the row — that
 /// grouping's slot `c`, holding the `z_r` the fill multiplies it by. `z` is
-/// indexed by the Λ ROW, as in the fill, so it carries that RE column's
-/// internal scale (`LmmGroupings::set_slope_scales`) while the θ side takes
-/// none. Every other slot is zero.
+/// indexed by the Λ ROW, as in the fill. Every other slot is zero.
 ///
 /// One walk finds both the owning grouping and its slot base because the three
 /// orders agree: θ is the primary vech then each extra grouping's vech in
@@ -731,7 +727,7 @@ pub(crate) fn packed_m_vals_theta_deriv(
                     out[c] = if r == 0 {
                         1.0
                     } else {
-                        x[(i, g.primary_slope_cols[r - 1])] / g.primary_slope_scales[r - 1]
+                        x[(i, g.primary_slope_cols[r - 1])]
                     };
                     return;
                 }
@@ -753,7 +749,7 @@ pub(crate) fn packed_m_vals_theta_deriv(
                         out[slot + c] = if r == 0 {
                             1.0
                         } else {
-                            x[(i, g.extra_slope_cols[e][r - 1])] / g.extra_slope_scales[e][r - 1]
+                            x[(i, g.extra_slope_cols[e][r - 1])]
                         };
                         return;
                     }
@@ -776,10 +772,7 @@ mod tests {
     /// [`fill_m_vals`] in every θ coordinate and every slot of every row, on
     /// a packed shape carrying a random slope on the PRIMARY grouping and a
     /// random slope on an EXTRA one — the two blocks whose vech walks, `Λ`
-    /// offsets and `z` columns the selection has to keep apart. The slope
-    /// scales are set from the design (`set_slope_scales`), so both columns
-    /// carry a scale other than 1 and the `z_r / s_r` division is visible
-    /// rather than an identity.
+    /// offsets and `z` columns the selection has to keep apart.
     #[test]
     fn packed_m_vals_theta_deriv_matches_fill_m_vals_difference() {
         let n = 16;
@@ -802,12 +795,7 @@ mod tests {
                 }],
             }),
         };
-        let mut g = LmmGroupings::from_cluster_spec_ext(&spec, n, &[1], &[vec![2]]);
-        g.set_slope_scales(x.as_ref(), None);
-        assert!(
-            g.primary_slope_scales[0] != 1.0 && g.extra_slope_scales[0][0] != 1.0,
-            "both slope columns must carry a non-unit scale for this test to see it"
-        );
+        let g = LmmGroupings::from_cluster_spec_ext(&spec, n, &[1], &[vec![2]]);
         let mut packed = PackedScratch::for_shape(&g, n, g.k_total);
         let width = packed.width;
         let n_theta = g.n_theta();

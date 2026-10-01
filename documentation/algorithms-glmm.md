@@ -315,27 +315,43 @@ G = Σᵢ wᵢ xᵢxᵢᵀ / Σᵢ wᵢ = L Lᵀ      β̃ = Lᵀβ      η = X�
 ```
 
 with `wᵢ` the prior weights and `L` the lower Cholesky factor of the
-design's weighted Gram matrix. `X L⁻ᵀ` has the identity as its weighted Gram,
+design's weighted Gram matrix. That design is the standardized one
+([internal standardization](algorithms.md#internal-standardization-of-the-design)),
+whose continuous columns are centered and scaled, so on those `L` is close to
+the identity except for the correlations between columns. A 0/1 column only
+the fixed effects read (a factor dummy, a binary covariate) is left as it is,
+so its row of `L` is not:
+for `X = [1, d]` with `d`'s weighted share of ones `π`,
+`G = [[1, π], [π, π]]` and `L = [[1, 0], [π, √(π(1−π))]]`. What follows holds
+for any design `L` is built from. `X L⁻ᵀ` has the identity as its weighted Gram,
 so a unit step along any β̃ axis moves η by 1 in weighted root mean square,
 the scale θ̃ is searched on. The trust radii (`rho_begin`, `GLMM_RHO_END`) and
 the non-finite-point radius below then mean the same thing in every unit of X:
 a column `x·s` gives the same search for any `s`, and a column `x + a` next
 to the intercept is searched as the centred column (for `X = [1, x]`,
-`Lᵀβ = (β₀ + x̄β₁, sd(x)·β₁)`). On the diagonal this is the θ side's
-`rms_column_scale`. The start maps forward (`β̃₀ = Lᵀβ₀`), every objective
+`Lᵀβ = (β₀ + x̄β₁, sd(x)·β₁)`). On the diagonal this is the root mean square
+about zero, the scale a 0/1 random-slope column is fitted at. The start maps forward (`β̃₀ = Lᵀβ₀`), every objective
 evaluation maps its point back (`BetaScale::caller_point`), and the incumbent
 maps back once the convergence read has measured its distances; `ws.params`
-and everything after the search hold β in the caller's units. The map is
+and everything after the search hold β on the fitted (standardized) design, and
+the SE block maps them to the caller's units. The map is
 linear, so it changes the path of the search and not the model or its optimum.
-If `G` has no Cholesky factor (a zero or exactly collinear column) the search
-runs on β itself. `L` is rebuilt every fit (`BetaScale::set`, `n·p²/2`
-multiply-adds). `ExactProfile` has no β coordinate in its search, so this
-does not apply there.
-Without it, a Gamma GLMM with x·10³ (β̂₁ ≈ 6·10⁻⁴) stops with a
-log-likelihood 0.37 short and reports `converged`, and x + 1000 leaves it 0.04
-short. **Code:** `BetaScale` (`src/glmm/workspace.rs`), its three call sites in
-`fit_glmm`. **Validation:** `fit_glmm_gamma_column_units_do_not_move_the_fit`
-(`src/fit/glmm_tests.rs`).
+`G` is never formed: `L` is rebuilt every fit (`BetaScale::set`) from the
+Givens QR `√W·X = Q·D·U` the LMM kernels orthogonalize by (`DesignQr`,
+[`algorithms-lmm.md`](algorithms-lmm.md)), as `Lᵀ = diag(D/√Σw)·U`. If `R`
+has a zero diagonal (a zero or exactly collinear column) the search runs on β
+itself. `ExactProfile` has no β coordinate in its search, so this does not
+apply there.
+On the standardized design what it still buys is on the 0/1 columns and the
+correlations: measured 2026-10-01 over five start nudges of 1e-9, `cbpp_agq7`
+(the `period` dummies) takes 61 evaluations with it and 93 to 97 without,
+`cbpp_probit_agq7` 68 against 86 to 93, at the same deviance to 6e-12; on the
+eleven other joint-search cells measured the median counts agree to 5%, but
+for one wide Gamma cell on the singular boundary (+22%), whose own count spans
+16802 to 23113 across six nudges.
+**Code:** `BetaScale` (`src/glmm/workspace.rs`), its three call sites in
+`fit_glmm`. **Validation:** the Gamma GLMM cases of
+`unit_invariance_on_every_route` (`src/fit/standardize_tests.rs`).
 
 Whichever search gates convergence, its `Converged` status counts only when the
 search saw a finite incumbent, at least two finite evaluations, and no
@@ -712,6 +728,14 @@ in `k`, `n_theta`, the groupings, the family, or `nAGQ`). At the stable
 Two seeding mechanisms feed the optimizer. Across fits, a caller-supplied
 `StartValues` threads β and θ into the search (`fit_warm`; `fit_glmm`
 warm-starts both, on every layout, unlike the LMM kernel which seeds θ only).
+The start is in the caller's units and the search runs on the standardized
+design, so `fit_on` maps it forward with this draw's column statistics first:
+`β̃ = B⁻¹β` and `Λ̃` the lower factor of `N⁻¹·ΛΛᵀ·N⁻ᵀ`
+([internal standardization](algorithms.md#internal-standardization-of-the-design)).
+A θ̂ a loop-tier caller carries from one draw to the next comes out of
+`FitView::theta` in the caller's units and is mapped forward with the next
+draw's statistics. When the draw's scaling is not the identity, a start of the
+wrong width is dropped to a cold start for that component.
 A cold start seeds
 β from a full no-RE GLM fit — `glm_warm_start_beta` runs the actual IRLS GLM of
 [`algorithms.md`](algorithms.md#generalised-linear-models-glm) once (with its
@@ -803,23 +827,36 @@ runs on a copy that only sets the pin flags; θ, the re-evaluation and the SE
 pass keep the search's own Λ, so the reported deviance is the value the search
 reached, not a second quadrature of the same Σ.
 
+`pinned` is reported in the caller's coordinates. The pin acts on the kernel's
+θ̃, on the standardized design; when a slope of the block is centered, the
+caller's Λ is the lower factor of `N·Λ̃Λ̃ᵀ·Nᵀ`, and its exact zeros, which
+`pinned` reads, can sit on another diagonal than the kernel's: an intercept
+diagonal pinned in centered coordinates becomes a zero slope diagonal of the
+caller's factor. With no centered slope the zero pattern is the kernel's. The
+same centering makes vector AGQ on a block with a slope integrate in the
+centered `u` coordinates, so its deviance differs from an uncentered fit's by
+the quadrature error ([internal standardization](algorithms.md#internal-standardization-of-the-design)).
+
 `Fit::diagnostics.singular` is `boundary_hit == 1` **or** the post-hoc
 `has_negligible_component()` check at `Fit` assembly (`src/fit/glmm.rs`,
 identical in `src/fit/lmm.rs`): any RE standard deviation
 `≤ SINGULAR_REL_TOL (1e-3) ×` the largest RE standard deviation. The relative
 check catches scale-degenerate fits the absolute θ pin cannot see.
 
-Both tests read the **internal** (scaled) θ and standard deviations, which is
-what keeps their verdicts independent of the units a random-slope covariate is
-expressed in — the owning description is
+Both tests read the **internal** θ and standard deviations: the pin the kernel's
+θ̃, the negligible-component check the row norms of the kernel's Λ (σ cancels in
+the ratio). Those are taken on the standardized design, so on a predictor whose
+mean is far from zero the intercept's standard deviation is the one at the
+mean, not at `x = 0`. This is what keeps their verdicts independent of the
+units a random-slope covariate is expressed in — the owning description is
 [`algorithms-lmm.md` §Random-effect design column scaling](algorithms-lmm.md#random-effect-design-column-scaling).
-The GLMM path scales its RE design the same way and by the same code: the
-per-column scales live on the shared grouping structure and are applied where Z
-is built (`fill_z_f64` in `src/glmm/workspace.rs`, `fill_m_vals` in
-`src/glmm/pirls/packed.rs`, and the Rx M row in `src/glmm/se.rs`). The joint Hessian
+The GLMM path fits the same standardized design, its fixed and random parts
+alike, so it scales its RE design the same way and by the same code. The joint Hessian
 is taken in the internal θ̃ on every arm (the FD stencils perturb it, the
 assembled and hyper-dual passes differentiate with respect to it), so
-`stddev_se` is divided by the same scales before it is reported.
+`stddev_se` is mapped before it is reported: the SE of each reported stddev
+`√Σ_kk`, `Σ = N·Λ̃Λ̃ᵀ·Nᵀ`, by the delta method on θ̃ with that covariance
+([internal standardization](algorithms.md#internal-standardization-of-the-design)).
 
 **Convention/reference:** lme4 searches the same linear-scale Cholesky with
 the diagonals boxed at `≥ 0` (`glmer`'s θ lower bounds) and flags the same

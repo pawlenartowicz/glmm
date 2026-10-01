@@ -22,6 +22,52 @@ severe warning.
 
 ### Changed
 
+- **`stddev_se` on a random-slope block (q ≥ 2) is the SE of the reported
+  stddev `√Σ_kk`**, at each stddev's diagonal slot of the θ layout, where it
+  was the SE of that Cholesky entry; the off-diagonal slots, and a stddev of
+  exactly 0, are `NaN`. Scalar groupings and the intercept of a block with no
+  centered slope are unchanged.
+- **Every fit standardizes its design internally, so a predictor's units and
+  location no longer move the answer.** At the start of each fit, every column of
+  the fixed-effect design is centered and scaled, `x̃ = (x − m)/s`, with the
+  prior-weighted mean and standard deviation of that draw's data. The intercept
+  and every 0/1 column (factor dummies, binary covariates) are left as they
+  are, and without an intercept nothing is centered, only scaled. A 0/1 column
+  used as a random slope is scaled by its prior-weighted root mean square but
+  not centered, so its zeros stay exact zeros. A random
+  slope reads the same transformed column, and its block's own random
+  intercept absorbs the shift. The response, the offset and the weights are
+  not transformed. Every result is mapped back exactly: β = Bβ̃ and its SEs,
+  `vcov`, t² and the joint Wald statistic through the rows of B; `varcorr` as
+  N·Σ̃·Nᵀ, `ranef` as N·b̃ and θ (`tau2`, the loop tier's `FitView::theta`) as
+  the lower Cholesky factor of N·Λ̃Λ̃ᵀ·Nᵀ; `stddev_se` by the delta method on
+  θ̃; the REML deviance and
+  log-likelihood add back 2·Σ ln sⱼ. Measured on the fits that motivated it:
+  `sim_gamma` at x·1e6 reports se(β₁) 3.7e-11 relative off where it was 7e-4;
+  the Gamma random-slope fit on x + 1000 takes 122 evaluations, as on x,
+  where it took 3300; sparse Gamma with x1 + 1000 converges in 731
+  evaluations to within 7.1e-9 of the unshifted log-likelihood, where it ran
+  out of its 39000-evaluation budget 3.67e-4 short; and over 399 seeds of the
+  pinned-diagonal vector-AGQ fixture no seed changes boundary basin between x
+  and x + 1000 (largest deviance difference 3.1e-10), where 12 did when the β
+  coordinates changed, by up to 0.298.
+
+  Behaviour that changes with it. Vector AGQ (`nagq > 1` on a block with a
+  slope) takes its product Gauss–Hermite grid in the standardized coordinates: the
+  same model, a different quadrature approximation of it, so its deviance
+  differs from an uncentered fit's by the quadrature error. `singular`
+  compares the fit's internal standard deviations, on the standardized
+  design: on a predictor whose mean is far from zero the intercept's is taken
+  at the mean, and a slope variance that was hidden by the predictor's distance
+  from zero is now flagged. `pinned` is reported in the caller's coordinates,
+  and under a centered slope a zero can move from the intercept diagonal to
+  the slope diagonal. `ill_conditioned` is measured on the standardized design,
+  so a column that is ill-conditioned only through its distance from zero is no
+  longer flagged. On the loop tier, a warm-start β or θ of the wrong width is
+  dropped, a cold start for that component, on every workspace: it can no
+  longer be mapped, and a short θ used to be zipped against the previous
+  fit's θ̂ left in the workspace.
+
 - **Fixed-effect columns come in R's order, with R's interaction names.**
   The formula frontend used to lay the terms out as written and to name an
   interaction's parts as the term spells them. It now follows R's
@@ -50,14 +96,6 @@ severe warning.
   from an earlier version and passed back as a warm start must be reordered.
   Formulas already written in degree order with consistently ordered
   interactions (`y ~ x*z`, `y ~ f + x + f:x`) are unchanged.
-
-  The bit-identity dumps are re-pinned. Rung 47 (InstEval,
-  `y ~ service * dept + studage + lectage`) is the only record that moves,
-  in all three configs: `studage` and `lectage` now come before the
-  `service:dept` block, and the permuted X changes the rounding. Matched by
-  name, β moves by at most 1.6e-7 relative (1.6e-9 absolute), the Hessian
-  SEs by 9.1e-9, τ² by 2.3e-8; the REML criterion drops by 5.5e-10 and the
-  search takes 32 evaluations instead of 33.
 - **The Laplace log-determinant uses the observed curvature on non-canonical
   links** (probit, cloglog, negative binomial, Gamma with the log link). It used
   the expected (Fisher) weight, as lme4 does, which is not the curvature of the
@@ -108,7 +146,8 @@ severe warning.
   a GLM and `Dispersion (phi, ML)` on a GLMM,** and `Dispersion (phi, fixed)`
   when `dispersion=`/`dispersion` holds φ, on any family that takes one.
 - **Every warning text was rewritten** in plain words, as
-  `<Tier>: <title>. <message>`. Code that matches on message text (for example
+  `<Tier>: <title>. <message>`; none advises rescaling predictors any more,
+  since the fit no longer depends on their scale. Code that matches on message text (for example
   "boundary (singular) fit") must match on `kind` or the class instead.
 - **The singular, AGQ-fallback and ignored-argument warnings now have classes**
   under `DiagnosticWarning` / `fastglmm_diagnostic`, so filtering that channel
@@ -203,7 +242,7 @@ severe warning.
 
 ### Removed
 
-Breaking. Nothing in the crate, the ports or MCPower calls these.
+Breaking. MCPower calls none of these, and the crate and the ports no longer do.
 
 - **`Sizing::atom` and `Sizing::cluster_of_row`.** The row layout they
   describe belongs to the caller's data generator, not to the fit.
@@ -211,9 +250,36 @@ Breaking. Nothing in the crate, the ports or MCPower calls these.
   `glmm::scalar::Scalar` trait.
 - **`loop_advanced`: `LmmGroupings::single` and `LmmSuffStats::new`.** Use
   `LmmGroupings::from_cluster_spec` and `LmmSuffStats::with_groupings`.
+- **`loop_advanced`: `GlmmFit::tau_squared_hat`.** `FitView::dispersion()` on
+  a GLMM reports the same random-intercept variance, in the caller's units.
+- **`loop_advanced`: the LMM objective seam** (`lmm_objective_at`,
+  `lmm_sweep_fit`, `lmm_sweep_fit_on`, `build_lmm_seam_ws`, `LmmSeamWs`,
+  `LmmSweepOutcome`), a dev surface for adjudicating θ-searches.
+- **`Note::ReDesignScaleSpread`** (kind `re_design_scale_spread`, Python
+  `glmm.ReDesignScaleWarning`, R class `fastglmm_re_design_scale_spread`) and
+  `orchestrate::NoteInfo::ratio`. Since every fit standardizes its design
+  internally, the fit no longer depends on predictor scale; to make the
+  reported random-effect stddevs easier to read, center or rescale the
+  predictor before fitting.
+
+### Added — `loop_advanced` (no semver guarantee)
+
+- **`FitWorkspace::set_prestandardized(bool)`**, default `false`: `true`
+  skips the per-draw standardization and fits the design as given, with every
+  map the identity except the random-slope columns, which are scaled by their
+  prior-weighted root mean square. The same model; on data far from standardized the search
+  is as sensitive to units as the raw design makes it. `fit_cold` and
+  `fit_warm` always standardize.
 
 ### Fixed
 
+- **An exact-fit Gaussian mixed model reports an infinite REML criterion on
+  every platform.** When the response is an exact linear function of the
+  predictors, the last pivot of the blocked factorization is pure round-off, and
+  its sign differs between platforms: on wasm32 it came out slightly positive and
+  the fit reported a finite criterion (−345.2 on the test fixture) instead of
+  `+inf`. A residual at or below the round-off floor (dim·ε·yᵀy) now counts as an
+  exact fit everywhere. No other fit is affected.
 - **A Gaussian mixed model with nearly collinear predictors keeps its
   digits.** The LMM worked from `X'X` built on the raw predictors, which
   squares how badly conditioned X is. With two predictors collinear to 3e-6

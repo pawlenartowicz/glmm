@@ -113,6 +113,31 @@ TOL <- list(
   #          a floor set from it would be 200 deviance units wide and would
   #          swallow every real deviance loss the gate exists to report.
   dev_eps     = 4e-05,
+  # dev_eps_agq_vec  glmm's OWN deviance on a vector-AGQ cell (nagq > 1 with more
+  #          than one random effect per group; every such grid cell has a centered
+  #          continuous slope), against a reference whose quadrature grid sits
+  #          elsewhere. A product Gauss-Hermite grid is not rotation-invariant
+  #          (dev_align.R, ga_rule_dev) and glmm places it in the coordinates of
+  #          the standardized design, so a change in how the design is
+  #          standardized moves this deviance by the quadrature difference at the
+  #          same optimum. It is the band for comparing a glmm run cell by cell
+  #          with an earlier glmm run on these cells; every other cell keeps
+  #          dev_eps there. Gate 1 does not read it: against GLMMadaptive it scores
+  #          glmm's point under GLMMadaptive's own rule, and on the cells where
+  #          that rule evaluates, glmm sits 2.0e-07 to 7.1e-07 below GLMMadaptive
+  #          on both kept runs named below, inside dev_eps.
+  #          Rule: ceil1(10 x max benign |Delta dev|) over the 8 vector-AGQ
+  #          cells, benign = beta/se/stddev in band against GLMMadaptive.
+  #          Measured 2026-10-01 on the P45 kept run
+  #          (runs/glmm/2026-10-01_0.4.1_dell-fedora_p45, which centered the
+  #          slopes) against the run before it (2026-09-30_0.4.1_dell-fedora):
+  #          4.307e-05 on binb_q2s_g3000p20_bal_base_agq7 (beta 1.3e-05,
+  #          se_hessian 2.1e-04, stddev 5.3e-05 from GLMMadaptive); the other
+  #          seven gaml_q2s_g60p5 +8.0e-06, nb_q2s_g3000p20 -3.2e-06,
+  #          pois_q2s_g3000p20 +3.5e-07, the rest below 6e-08. The P45 follow-up
+  #          kept run (2026-10-01_0.4.1_dell-fedora_p45-followup, same
+  #          standardization) against the P45 run: at most 6.3e-10 on these cells.
+  dev_eps_agq_vec = 5e-04,
   # dev_big  a convention-mismatch constant, not a fit difference. It must sit
   #          far above the benign |Delta dev| spread and far below the smallest
   #          real convention constant. Both edges measured 2026-09-22: the

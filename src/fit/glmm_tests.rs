@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::glmm::{glmm_laplace_deviance, GlmmWorkspace, OuterSearch, StructuredSchur};
+use crate::standardize::ColumnScaling;
 use crate::{
     BinomialLink, Family, GroupIds, Grouping, GroupingRelation, ModelSpec, PoissonLink,
     ReStructure, Sizing, StartValues, WaldSe,
@@ -13,6 +14,19 @@ use super::common_tests::{
     assert_pinned, dense_ids, dense_str, inf_plateau_exp1, inf_plateau_lcg_next,
     inf_plateau_normal, inf_plateau_poisson, lcg, sim_clustered,
 };
+
+/// SE of each θ coordinate: the square roots of the θ-block covariance's
+/// diagonal (on a scalar block, the `stddev_se` that
+/// `stddev_se_kernel_to_caller` reports).
+fn theta_se(ws: &GlmmWorkspace) -> Vec<f64> {
+    let cov = &ws.inference.theta_cov;
+    (0..cov.nrows())
+        .map(|k| match cov[(k, k)] {
+            v if v < 0.0 => 0.0,
+            v => v.sqrt(),
+        })
+        .collect()
+}
 
 /// Warm-start A/B on the realistic cbpp binomial GLMM (dense joint-BOBYQA
 /// path, scalar herd intercept): warm from the cold fit's own solution
@@ -734,7 +748,14 @@ fn far_warm_start_recovers_via_the_cold_guard() {
 /// 37 from θ₀ = 3000, stopped needing the fallback once the border computes
 /// log|A|'s curvature only on solves that show trouble
 /// (`pirls::BorderTrust::wants_curvature`): `ExactProfile` then converges to
-/// the cold optimum by itself.
+/// the cold optimum by itself. Since 2026-10-01 every fit standardizes its
+/// design internally, which moves this search's path too and the fallback no
+/// longer fires on it, so both fits run on the design as given, on the loop
+/// tier (`FitWorkspace::set_prestandardized(true)`), where the old paths, and
+/// the fallback, are reproduced bit for bit. Measured that day: on the raw
+/// design both stop at deviance 9.0839 (τ̂² 165); the standardized cold fit
+/// runs on to 8.0340 (τ̂² 1152), a separation-type surface with no interior
+/// optimum, where the stopping point depends on the search's path.
 #[test]
 fn exact_profile_fallback_reruns_on_pql_then_joint() {
     let (x, mut y, mut model, ids) = nb_log_four_cluster_design(28, 24, 0);
@@ -749,7 +770,14 @@ fn exact_profile_fallback_reruns_on_pql_then_joint() {
         target_indices: vec![0, 1],
         ..FitOptions::default()
     };
-    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let raw_fit = |start: Option<&StartValues>| {
+        use super::core::{build_workspace, fit_on};
+        let (sized, ids_s, perm) = spec_sized_from_ids_pub(&model, &ids);
+        let mut ws = build_workspace(&sized, perm, n, p, &opts);
+        ws.set_prestandardized(true);
+        fit_on(&mut ws, &x, &y, &ids_s, start, &opts).into_fit(&x, &y, &ids_s, n, p, &model, &opts)
+    };
+    let cold = raw_fit(None);
     assert!(
         cold.converged(),
         "the cold fit of this design must converge"
@@ -759,7 +787,7 @@ fn exact_profile_fallback_reruns_on_pql_then_joint() {
         beta: vec![],
         theta: vec![300.0],
     };
-    let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+    let warm = raw_fit(Some(&start));
     assert!(
         warm.converged(),
         "probit seed 28, θ₀ = 300: expected the PqlThenJoint fallback to \
@@ -2083,6 +2111,7 @@ fn sparse_schur_se_equals_dense_grouseticks() {
             &beta_start,
             n,
             WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
         (ws.inference.var_diag[..p].to_vec(), fit.converged)
     };
@@ -2198,6 +2227,7 @@ fn sparse_schur_small_e_matches_dense() {
             &beta_start,
             n,
             WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
         (
             ws.betas.clone(),
@@ -3000,15 +3030,16 @@ fn fit_glmm_gamma_sim_matches_grid_reference() {
     assert_pinned(&f_rx.se, &REF_SE_RX_PIN, 1e-7, "sim_gamma pinned se_rx");
 }
 
-/// The units of a predictor do not move a GLMM on the joint `[θ | β]` search.
-/// `x·s` is the same model with `β̂₁` divided by `s`, and `x + a` the same
-/// model with `β̂₀` moved by `−a·β̂₁`; τ̂² and the log-likelihood are
-/// unchanged. The search steps β in whitened coordinates
-/// (`glmm::workspace::BetaScale`), so its trust radius and its stopping rule
-/// mean the same in every unit of X. Gamma/log on `sim_gamma`: nAGQ 1 and 5
-/// both take the joint search (Gamma never takes `ExactProfile`).
+/// A random slope on a column far from zero, dense Gamma: `sim_gamma`
+/// with a random slope on column 1, fitted on `x` and on `x + 1000`. Before the
+/// design was standardized internally, the shifted design took about 3300
+/// evaluations, the random intercept and slope being nearly collinear on it.
+/// Now both designs reach the search as the same centered column. Measured on
+/// dell-fedora (2026-10-01): 122 evaluations on both, logLik equal to 2e-13.
+/// Eval counts move with every search change, so the assertion is the loose
+/// ratio, not the count.
 #[test]
-fn fit_glmm_gamma_column_units_do_not_move_the_fit() {
+fn fit_glmm_gamma_slope_on_a_shifted_column_costs_no_more_evals() {
     let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
         "../../validation/data/simulated/sim_gamma.csv"
     ));
@@ -3021,7 +3052,7 @@ fn fit_glmm_gamma_column_units_do_not_move_the_fit() {
             sizing: Sizing::FixedClusters {
                 n_clusters: n_clusters as u32,
             },
-            slopes: vec![],
+            slopes: vec![1],
             extra_groupings: vec![],
         }),
     };
@@ -3029,49 +3060,27 @@ fn fit_glmm_gamma_column_units_do_not_move_the_fit() {
         primary: cluster_ids,
         extra: vec![],
     };
-    for nagq in [1u8, 5] {
-        // Column 1 of the design becomes `x·s + a`.
-        let fit_at = |s: f64, a: f64| {
-            let mut xs = x.clone();
-            for row in xs.chunks_exact_mut(p) {
-                row[1] = row[1] * s + a;
-            }
-            let opts = FitOptions {
-                target_indices: vec![0, 1, 2],
-                nagq,
-                ..FitOptions::default()
-            };
-            fit_cold(&xs, &y, n, p, &model, &ids, &opts)
-        };
-        let base = fit_at(1.0, 0.0);
-        assert!(base.converged(), "nagq={nagq}: unscaled fit must converge");
-        for (s, a) in [(1e-3, 0.0), (1e3, 0.0), (1e6, 0.0), (1.0, 1e3)] {
-            let f = fit_at(s, a);
-            assert!(f.converged(), "nagq={nagq} s={s:e} a={a}: must converge");
-            // Measured on x86_64: β moves by at most 3.5e-8 (β₀ at a = 1000),
-            // τ² by 2.3e-8 relative, the loglik by 2.7e-12: where the search
-            // stops inside `GLMM_RHO_END`.
-            let b = [f.beta[0] + a * f.beta[1], f.beta[1] * s, f.beta[2]];
-            for (j, (&bj, &b0)) in b.iter().zip(&base.beta).enumerate() {
-                assert!(
-                    (bj - b0).abs() < 2e-7,
-                    "nagq={nagq} s={s:e} a={a}: β[{j}] back in the unscaled units {bj} vs {b0}"
-                );
-            }
-            assert!(
-                (f.tau2[0] / base.tau2[0] - 1.0).abs() < 2e-7,
-                "nagq={nagq} s={s:e} a={a}: τ² {} vs unscaled {}",
-                f.tau2[0],
-                base.tau2[0]
-            );
-            assert!(
-                (f.loglik - base.loglik).abs() < 1e-9,
-                "nagq={nagq} s={s:e} a={a}: loglik {} vs unscaled {}",
-                f.loglik,
-                base.loglik
-            );
-        }
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        ..FitOptions::default()
+    };
+    let base = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let mut xs = x.clone();
+    for row in xs.chunks_exact_mut(p) {
+        row[1] += 1000.0;
     }
+    let f = fit_cold(&xs, &y, n, p, &model, &ids, &opts);
+    eprintln!(
+        "GAMMA_SLOPE_EVALS unshifted {} shifted {} | loglik {} vs {}",
+        base.n_eval, f.n_eval, base.loglik, f.loglik
+    );
+    assert!(base.converged() && f.converged());
+    assert!(
+        f.n_eval < 2 * base.n_eval,
+        "shifted {} evals vs unshifted {}",
+        f.n_eval,
+        base.n_eval
+    );
 }
 
 /// The `dispersion: Some(v)` directive on the GLMM route: the fit runs at the
@@ -3778,10 +3787,14 @@ fn fit_glmm_nb_nested_unbalanced_matches_glmmtmb() {
     // (−976.7919162692924, 50 evaluations); τ̂² moved 1.8e-7 and 1.3e-7
     // relative, θ̂ 1.7e-7, the SEs 6.1e-8 and 5.1e-8, β 1.3e-8, along the same
     // flat directions as the re-pins above.
-    const REF_BETA_PIN: [f64; 2] = [0.6092438849978777, 0.5099937804373104];
-    const REF_SE_PIN: [f64; 2] = [0.2046711180416813, 0.05427740745020058];
-    const REF_TAU2_PIN: [f64; 2] = [0.39450931761099334, 0.1262971597542459];
-    const REF_THETA_PIN: f64 = 1.4290921115954247;
+    // Re-pinned 2026-10-01: the design is standardized internally before the fit (x̃ = (x − m)/s, results mapped back).
+    // logLik moved up by 1.8e-11 (−976.7919162692747, 50 evaluations); τ̂²
+    // moved 4.4e-7 and 6.4e-8 relative, the SEs 1.8e-7 and 1.7e-8, θ̂ 4.1e-8,
+    // β 1.9e-8, along the same flat directions.
+    const REF_BETA_PIN: [f64; 2] = [0.609243896513824, 0.5099937796740183];
+    const REF_SE_PIN: [f64; 2] = [0.20467108133263737, 0.054277406543781936];
+    const REF_TAU2_PIN: [f64; 2] = [0.39450914444278856, 0.1262971516363502];
+    const REF_THETA_PIN: f64 = 1.4290921700772967;
     assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb_nested pinned beta");
     assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb_nested pinned se");
     assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb_nested pinned tau2");
@@ -3878,6 +3891,7 @@ fn two_stage_agq_bypass_is_bit_identical() {
             &beta_start,
             n,
             WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
         assert!(
             fit.converged,
@@ -3886,7 +3900,7 @@ fn two_stage_agq_bypass_is_bit_identical() {
         (
             ws.betas[..p].to_vec(),
             ws.params[..ws.n_theta].to_vec(),
-            fit.tau_squared_hat,
+            ws.params[0].powi(2),
             fit.n_eval,
         )
     };
@@ -4096,6 +4110,16 @@ fn fit_glmm_binomial_slope1_vector_agq_is_pinned() {
 /// arithmetic and both sit far inside BAND — the point of preferring the anchor
 /// is corpus-wide, not local (`assert_pinned`, "re-freezing rule"). β/stddev/corr
 /// keep their original anchor constants and remain what sizes BAND.
+///
+/// **k=7 re-pinned 2026-10-01**: the design is standardized internally before
+/// the fit (x̃ = (x − m)/s, results mapped back), and vector AGQ on a centered
+/// slope takes its product Gauss–Hermite grid in the centered `u`
+/// coordinates: the same model, a different quadrature approximation of it.
+/// `corr[0]` moved 1.8e-3 relative (0.036892 → 0.036960, 6.8e-5 absolute),
+/// `se[1]` 9.2e-5, `stddev[1]` 4.2e-5, `beta[1]` 3.3e-5; −2·logLik is 2.1e-4
+/// lower (412.49286 → 412.49265). The design fitted as given
+/// (`FitWorkspace::set_prestandardized(true)`) reproduces the old values.
+/// k=11 moves inside BAND (its quadrature error is smaller) and keeps its pins.
 #[test]
 fn fit_glmm_poisson_slope1_vector_agq_is_pinned() {
     const BAND: f64 = 1e-3;
@@ -4109,10 +4133,10 @@ fn fit_glmm_poisson_slope1_vector_agq_is_pinned() {
         7,
         1,
         family,
-        &[-1.3538764484761825, 0.49328234955414413],
-        &[0.21833927439261516, 0.1854441204256203],
-        &[1.0117923068022499, 0.33570973669422155],
-        &[0.03689193891989874],
+        &[-1.3538764775013254, 0.49326592477324127],
+        &[0.2183317905167993, 0.18546115299801458],
+        &[1.011790888288728, 0.3357237524091434],
+        &[0.03695983907845937],
         BAND,
     );
     check_vector_agq_pin(
@@ -4158,6 +4182,12 @@ fn fit_glmm_poisson_slope1_vector_agq_is_pinned() {
 /// stops inside `GLMM_RHO_END`. Largest move 6.8e-5 relative (k=7 `corr[2]`, a
 /// correlation of −0.031, so 2.1e-6 absolute); logLik −1.5e-10 (k=7) and
 /// +3e-12 (k=11).
+///
+/// k=7 re-pinned 2026-10-01, P45 follow-up simplification: `BetaScale` builds
+/// its factor from `DesignQr`'s Givens QR instead of a Gram Cholesky, which
+/// moves where the search stops inside `GLMM_RHO_END`. Largest move `corr[2]`,
+/// 4.4e-5 relative to the tree before (6.6e-5 from the old pin, 2.0e-6
+/// absolute); logLik −9.0e-11, same eval count, no flag change.
 #[test]
 fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
     const BAND: f64 = 5e-5;
@@ -4172,20 +4202,20 @@ fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
         2,
         family,
         &[
-            0.37305225736640635,
-            0.5380986060306936,
-            -0.36548551996845663,
+            0.37305197573821963,
+            0.5380993880639474,
+            -0.36548481616287226,
         ],
         &[
-            0.13111372934782572,
-            0.10465283205170359,
-            0.10556883703857627,
+            0.13111393893084353,
+            0.10465296633791675,
+            0.10556896621321694,
         ],
-        &[1.0640253150082413, 0.6217277675727563, 0.6420932184139935],
+        &[1.0640278819582274, 0.6217295949123355, 0.642095477131382],
         &[
-            0.21906535582439046,
-            0.13220039394328156,
-            -0.03098444898089794,
+            0.21907149617403102,
+            0.13220594700564986,
+            -0.030982406638480186,
         ],
         BAND,
     );
@@ -4467,6 +4497,11 @@ fn fit_glmm_sign_trap_dense_exact_profile() {
 /// 270 evaluations; the signed box
 /// reaches 387.2703 in 316. lme4 refuses nAGQ > 1 on a vector random effect,
 /// so this shape has no external reference — the two basins are glmm's own.
+/// Re-pinned 2026-10-01: the design is standardized internally before the fit,
+/// and vector AGQ on the centered slopes integrates in the centered `u`
+/// coordinates, a different quadrature approximation of the same model; the
+/// escaped basin now reads 387.2639 (244 evaluations). The design fitted as
+/// given (`FitWorkspace::set_prestandardized(true)`) still reaches 387.2703.
 #[cfg(feature = "formula")]
 #[test]
 fn fit_glmm_sign_trap_dense_joint_agq() {
@@ -4479,7 +4514,7 @@ fn fit_glmm_sign_trap_dense_joint_agq() {
         },
         3,
         387.3084738547,
-        387.2702811551,
+        387.2638828427,
     );
 }
 
@@ -4852,30 +4887,6 @@ fn loop_tier_honours_extra_grouping_slope() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Internal random-effect column scaling (`LmmGroupings::set_slope_scales`) —
-// dense GLMM rescale test
-//
-// GOVERNING IDEA, shared with `lmm_tests.rs`'s and `sparse/tests.rs`'s rescale
-// tests: multiply a random-slope design column by an exact power of two `C`
-// and refit. A dropped back-map shows up unmistakably as a ratio of 1 instead
-// of the predicted `1/C` or `1/C²` (see `lmm_tests.rs`'s rescale test for the
-// full `Z~ = Z·diag(1/s)`, `Λ~ = diag(s)·Λ` derivation, which applies
-// unchanged here).
-//
-// `C` is smaller here (4.0, not the LMM tests' 1024.0) and the band looser,
-// for a reason specific to the GLMM route: the LMM solver optimizes θ ALONE
-// (β is recovered in closed form at each θ), so scaling a column that is also
-// a fixed effect leaves the θ-search's internal problem bit-identical between
-// the two fits. The GLMM solver optimizes the JOINT vector `[θ | β]` with one
-// shared BOBYQA trust radius on the raw (unrescaled) β coordinates.
-// Column-scaling changes β's step length against that shared radius
-// differently in the two fits (β̂ᵪ ≈ β̂/C), so the two fits' internal
-// trust-region paths genuinely differ — they are two separate optimizations of
-// equivalent objectives, not one bit-identical search read twice. A small `C`
-// keeps the two paths close; a loose band absorbs the resulting difference.
-// ---------------------------------------------------------------------------
-
 /// Parses `validation/data/simulated/sim_binomial_slope1.csv` into the q=2
 /// random-slope design `y ~ 1 + x + (1 + x | g)` — the same fixture
 /// `check_vector_agq_pin` uses for the AGQ pins above, reused here because it
@@ -4919,119 +4930,79 @@ fn sim_binomial_slope1_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec,
     (x, y, n, p, model, ids)
 }
 
-/// Dense GLMM rescale identity, `C = 4.0`, `WaldSe::Hessian`. Same predicted
-/// moves as the LMM rescale test for `beta`/`se`/`varcorr`/`tau2` (see that
-/// test's doc comment for the derivation), EXCEPT:
-///
-/// - **No REML Jacobian.** The GLMM criterion is the marginal Laplace
-///   deviance, which carries no `log|X'V⁻¹X|` term (that term is a Gaussian-
-///   REML-only artifact of profiling β out of a linear-Gaussian likelihood).
-///   So unlike the LMM test, `deviance` here must be UNCHANGED — a genuine
-///   reparameterization, not a rescale, of the same marginal likelihood.
-/// - **`stddev_se` moves by the Lambda-row scales, not their squares.**
-///   `stddev_se` is the SE of θ itself (the θ-Hessian block of the joint
-///   covariance), not of `θ²`, so it carries exactly ONE power of the row
-///   scale — `[se0, se1/C, se2/C]` — unlike `tau2`, which is `θ²·σ̂²` and so
-///   carries the row scale SQUARED.
-///
-/// `BAND` is margin over the worst relative spread measured between the two
-/// independent joint-BOBYQA fits on 2026-08-23 (the anchor machine — see
-/// `assert_pinned`'s doc comment). Looser than the LMM test's band for the
-/// reason in this section's header comment: these are two genuinely different
-/// internal optimizations, not the same search read twice.
+/// `stddev_se` is the delta method of the reported stddev `√varcorr_kk` on the
+/// fit's own θ̃ covariance, with the Jacobian taken by central differences of
+/// the map that reports `varcorr` (`assemble_varcorr`) at the fit's θ̃: on a
+/// block with a centered slope, and on one whose 0/1 slope is only scaled.
 #[test]
-fn glmm_rescaling_slope_column_moves_stddev_se_by_the_predicted_power_of_c() {
-    const C: f64 = 4.0;
-    const BAND: f64 = 3e-4;
-    const DEV_ABS: f64 = 1e-9;
-
+fn stddev_se_is_the_delta_method_of_the_reported_stddev() {
     let (x, y, n, p, model, ids) = sim_binomial_slope1_design();
     let opts = FitOptions {
         target_indices: vec![0, 1],
         wald_se: WaldSe::Hessian,
         ..FitOptions::default()
     };
-
-    let base = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert!(base.converged(), "base binomial slope GLMM must converge");
-    assert!(
-        base.stddev_se.iter().all(|v| v.is_finite()),
-        "base stddev_se must be finite on a converged Hessian fit: {:?}",
-        base.stddev_se
-    );
-
-    let mut x_c = x.clone();
+    let mut x01 = x.clone();
     for i in 0..n {
-        x_c[i * p + 1] *= C;
+        x01[i * p + 1] = if x[i * p + 1] > 0.0 { 1.0 } else { 0.0 };
     }
-    let scaled = fit_cold(&x_c, &y, n, p, &model, &ids, &opts);
-    assert!(scaled.converged(), "column-scaled fit must converge");
-    assert!(
-        scaled.stddev_se.iter().all(|v| v.is_finite()),
-        "scaled stddev_se must be finite on a converged Hessian fit: {:?}",
-        scaled.stddev_se
-    );
-
-    assert_pinned(&[scaled.beta[0]], &[base.beta[0]], BAND, "beta[0]");
-    assert_pinned(&[scaled.beta[1]], &[base.beta[1] / C], BAND, "beta[1]");
-    assert_pinned(&[scaled.se[0]], &[base.se[0]], BAND, "se[0]");
-    assert_pinned(&[scaled.se[1]], &[base.se[1] / C], BAND, "se[1]");
-
-    // varcorr vech [D00, D10, D11].
-    assert_eq!(scaled.varcorr.len(), 1, "one grouping block");
-    assert_pinned(
-        &scaled.varcorr[0],
-        &[
-            base.varcorr[0][0],
-            base.varcorr[0][1] / C,
-            base.varcorr[0][2] / (C * C),
-        ],
-        BAND,
-        "varcorr vech",
-    );
-
-    // tau2[0] = Lambda row 0 (intercept); tau2[1], tau2[2] = Lambda row 1 (slope).
-    assert_pinned(
-        &scaled.tau2,
-        &[base.tau2[0], base.tau2[1] / (C * C), base.tau2[2] / (C * C)],
-        BAND,
-        "tau2",
-    );
-
-    // ranef, per level [b0, b1] — the assertion that caught `assemble_ranef_dense`
-    // reporting its slope modes on the internal scale (ratio 1 instead of 1/C).
-    assert_eq!(scaled.ranef.len(), base.ranef.len());
-    assert_eq!(scaled.ranef_levels, base.ranef_levels);
-    let n_levels = scaled.ranef_levels[0];
-    let mut want_ranef = Vec::with_capacity(scaled.ranef.len());
-    for l in 0..n_levels {
-        want_ranef.push(base.ranef[l * 2]);
-        want_ranef.push(base.ranef[l * 2 + 1] / C);
+    for (centered, xx) in [(true, &x), (false, &x01)] {
+        let mut cs = ColumnScaling::with_re_slopes(p, [1]);
+        cs.compute(xx, n, p, None, true);
+        assert_eq!(cs.shift(1) != 0.0, centered);
+        let (mut ws, mut x_mat) =
+            super::glmm::fit_glmm_build(xx, n, p, &model, &ids.primary, &ids.extra, &opts)
+                .unwrap_or_else(|_| panic!("design must build"));
+        super::common::fill_col_major_std(&mut x_mat, xx, n, p, &cs);
+        let view = super::glmm::run_glmm_on(
+            &mut ws,
+            x_mat.as_ref(),
+            &y,
+            n,
+            p,
+            &model,
+            &ids.primary,
+            &ids.extra,
+            f64::NAN,
+            None,
+            &opts,
+            &cs,
+        );
+        let fit = super::glmm::glmm_view_to_fit(&view, &y, n, p, &model, &opts).0;
+        assert!(fit.converged(), "centered {centered}: must converge");
+        let theta: Vec<f64> = ws.params[..3].to_vec();
+        let sd = |t: &[f64]| {
+            let vc = super::common::assemble_varcorr(t, &ws.groupings, 1.0, &cs);
+            [vc[0][0].sqrt(), vc[0][2].sqrt()]
+        };
+        let at = sd(&theta);
+        assert_eq!(at, [fit.varcorr[0][0].sqrt(), fit.varcorr[0][2].sqrt()]);
+        let mut jac = [[0.0f64; 3]; 2];
+        for a in 0..3 {
+            let h = 1e-6;
+            let (mut tp, mut tm) = (theta.clone(), theta.clone());
+            tp[a] += h;
+            tm[a] -= h;
+            let (fp, fm) = (sd(&tp), sd(&tm));
+            for k in 0..2 {
+                jac[k][a] = (fp[k] - fm[k]) / (2.0 * h);
+            }
+        }
+        let cov = &ws.inference.theta_cov;
+        for (k, slot) in [(0, 0), (1, 2)] {
+            let v: f64 = (0..3)
+                .flat_map(|a| (0..3).map(move |c| (a, c)))
+                .map(|(a, c)| jac[k][a] * cov[(a, c)] * jac[k][c])
+                .sum();
+            assert!(
+                (fit.stddev_se[slot] - v.sqrt()).abs() <= 1e-6 * v.sqrt(),
+                "centered {centered}: sd[{k}] SE {} vs {}",
+                fit.stddev_se[slot],
+                v.sqrt()
+            );
+        }
+        assert!(fit.stddev_se[1].is_nan());
     }
-    assert_pinned(&scaled.ranef, &want_ranef, BAND, "ranef");
-
-    // stddev_se — the item this test exists for: ONE power of the row scale
-    // (θ-scale SE), not squared like tau2. Length 3: [row0, row1, row1].
-    assert_eq!(scaled.stddev_se.len(), 3, "one grouping, q=2 vech");
-    assert_pinned(
-        &scaled.stddev_se,
-        &[
-            base.stddev_se[0],
-            base.stddev_se[1] / C,
-            base.stddev_se[2] / C,
-        ],
-        BAND,
-        "stddev_se",
-    );
-
-    // deviance — no REML Jacobian on the GLMM route, so this is a genuine
-    // reparameterization: the marginal criterion is invariant.
-    assert!(
-        (scaled.deviance - base.deviance).abs() < DEV_ABS,
-        "deviance moved under a column reparameterization: {} vs {}",
-        scaled.deviance,
-        base.deviance
-    );
 }
 
 /// The stage split must add up to the reported eval count, and the shrink
@@ -5090,6 +5061,7 @@ fn dense_glmm_counters_split_stages_and_count_shrink_evals() {
         &beta_start,
         n,
         WaldSe::Rx,
+        ColumnScaling::IDENTITY,
     );
     assert!(f.converged, "cbpp (two-stage forced) must converge");
     let c = f.counters;
@@ -5686,6 +5658,7 @@ fn nb_budget_exhausted_fit(
         },
         None,
         &opts,
+        ColumnScaling::IDENTITY,
     );
     (
         super::glmm::glmm_view_to_fit(&view, y, n, p, model, &opts).0,
@@ -6160,6 +6133,7 @@ fn rung_at_gamma_hat(
             f64::NAN,
             None,
             &opts,
+            ColumnScaling::IDENTITY,
         );
         let (converged, deviance) = view.converged_deviance();
         assert!(converged, "rung {}: fit must converge", r.rung);
@@ -7038,11 +7012,11 @@ fn tail_dense_rung_ships_the_assembled_covariance() {
     }
     for (k, &want) in want_theta_se.iter().enumerate() {
         assert_eq!(
-            ws.inference.theta_se[k].to_bits(),
+            theta_se(&ws)[k].to_bits(),
             want.to_bits(),
             "rung {}: theta_se[{k}] {} is not the assembled arm's {want}",
             r.rung,
-            ws.inference.theta_se[k]
+            theta_se(&ws)[k]
         );
     }
 }
@@ -7414,9 +7388,9 @@ fn packed_assembled_hessian_columns_match_fd_of_f64_gradient() {
 /// The packed assembled engine's shipped covariance against the packed FD
 /// stencil's, at every packed rung's γ̂: the `p` fixed-effect standard errors
 /// off `joint_hessian_cov`'s own `out_cov`, and the `n_θ` θ-block standard
-/// errors off `ws.inference.theta_se` (which `stddev_se` is, divided by the
-/// fixed positive Λ-row scales, so a relative gap here is a relative gap
-/// there).
+/// errors off the θ-block covariance's diagonal (which `stddev_se` is the
+/// square root of, divided by the fixed positive Λ-row scales, so a relative
+/// gap here is a relative gap there).
 ///
 /// The stencil is reached through `ws.fd.force_fd_hessian`, the workspace
 /// switch the other layouts' FD tests already use, so no global state moves
@@ -7490,7 +7464,7 @@ fn packed_assembled_se_matches_the_packed_stencil() {
             r.rung
         );
         let se_exact: Vec<f64> = (0..p).map(|j| cov_exact[(j, j)].sqrt()).collect();
-        let th_exact: Vec<f64> = ws.inference.theta_se[..n_theta].to_vec();
+        let th_exact: Vec<f64> = theta_se(&ws);
 
         ws.fd.force_fd_hessian = true;
         let mut cov_fd = Mat::<f64>::zeros(p, p);
@@ -7511,7 +7485,7 @@ fn packed_assembled_se_matches_the_packed_stencil() {
             r.rung
         );
         let se_fd: Vec<f64> = (0..p).map(|j| cov_fd[(j, j)].sqrt()).collect();
-        let th_fd: Vec<f64> = ws.inference.theta_se[..n_theta].to_vec();
+        let th_fd: Vec<f64> = theta_se(&ws);
 
         let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-300);
         let worst_se = (0..p)
@@ -7885,6 +7859,7 @@ fn ws_at_gamma_hat(
         f64::NAN,
         None,
         &opts,
+        ColumnScaling::IDENTITY,
     );
     assert!(view.converged_deviance().0, "{what}: fit must converge");
     let sized_ids = sized_ids.into_owned();
@@ -8017,10 +7992,10 @@ fn tail_packed_fit_ships_the_assembled_covariance() {
     }
     for (k, &want) in want_theta_se.iter().enumerate() {
         assert_eq!(
-            ws.inference.theta_se[k].to_bits(),
+            theta_se(&ws)[k].to_bits(),
             want.to_bits(),
             "theta_se[{k}] {} is not the assembled arm's {want}",
-            ws.inference.theta_se[k]
+            theta_se(&ws)[k]
         );
     }
 
@@ -8194,8 +8169,10 @@ fn gamma_inverse_double_se_failure_returns_a_failed_fit() {
 /// under `Note::HessianSeFallback` instead of failing.
 ///
 /// That the SEs come from RX is asserted against a `WaldSe::Rx` fit of the same
-/// design: same kernel, same converged point, so `se` must match bit for bit
-/// and `vcov` to a few ULP. A band any wider would hide a scale slip — the
+/// design: same kernel, same converged point, so `se` and `vcov` must match to
+/// a few ULP. Not bit for bit: both report through the design's column map
+/// (`β = B·β̃`), the `Rx` arm by solving against the rows of `B`, the fallback
+/// by `B·cov·Bᵀ` on its inverse, two roundings of the same quantity. A band any wider would hide a scale slip — the
 /// Gamma σ̂² factor the fallback reapplies by hand is exactly what this pins.
 /// `stddev_se` must be NaN: the fallback never assembles a joint Hessian, so
 /// there is no θ-block SE to report, and a stale value from an earlier fit on
@@ -8223,12 +8200,16 @@ fn gamma_inverse_non_pd_hessian_falls_back_to_rx_se() {
         "expected HessianSeFallback, got {:?}",
         fit.diagnostics.notes
     );
-    assert_eq!(fit.se, rx.se, "fallback se must BE the RX se");
-    // The covariance only meets to a few ULP off the diagonal: the production
-    // Rx arm accumulates the off-diagonal from `vcov_cols` products while the
-    // fallback reads it off `rx_cov_into`'s LLT inverse, a different
-    // reassociation of the same quantity. The diagonal IS bit-identical — that
-    // is the `se` assertion above.
+    for (j, (&got, &want)) in fit.se.iter().zip(&rx.se).enumerate() {
+        assert!(
+            (got - want).abs() <= 8.0 * f64::EPSILON * want.abs(),
+            "fallback se[{j}] = {got} must BE the RX se {want}"
+        );
+    }
+    // The covariance meets to a few ULP too: the production Rx arm accumulates
+    // the off-diagonal from `vcov_cols` products while the fallback reads it off
+    // `rx_cov_into`'s LLT inverse, a different reassociation of the same
+    // quantity.
     for i in 0..p {
         for j in 0..p {
             let (got, want) = (fit.vcov[i][j], rx.vcov[i][j]);
@@ -8304,6 +8285,7 @@ fn glmm_maxfun_cap_reports_honest_endpoint() {
         f64::NAN,
         None,
         &opts,
+        ColumnScaling::IDENTITY,
     );
     let (fit, _mu, _dev) = super::glmm::glmm_view_to_fit(&view, &y, n, p, &model, &opts);
 
@@ -8426,6 +8408,7 @@ fn gamma_hessian_se_matches_fd_of_the_full_objective() {
             f64::NAN,
             None,
             &opts,
+            ColumnScaling::IDENTITY,
         );
         let diag = view.diagnostics();
         assert!(diag.converged, "{link:?} nagq={nagq}: must converge");
@@ -8435,7 +8418,7 @@ fn gamma_hessian_se_matches_fd_of_the_full_objective() {
         );
         let se: Vec<f64> = view.var_diag()[..p].iter().map(|v| v.sqrt()).collect();
         let n_theta = ws.n_theta;
-        let theta_se0 = ws.inference.theta_se[0];
+        let theta_se0 = theta_se(&ws)[0];
         let m = n_theta + p;
         let mut q0: Vec<f64> = ws.params[..m].to_vec();
         q0.push(ws.gamma_phi.ln());
@@ -8755,6 +8738,7 @@ fn rx_se_is_the_penalized_deviance_curvature_in_beta() {
             1.0,
             None,
             &opts,
+            ColumnScaling::IDENTITY,
         );
         assert!(view.diagnostics().converged, "{family:?}: must converge");
         let se: Vec<f64> = view.var_diag()[..p].iter().map(|v| v.sqrt()).collect();
@@ -8871,6 +8855,7 @@ fn nb_hessian_se_matches_fd_of_the_full_objective() {
             1.0,
             None,
             &opts,
+            ColumnScaling::IDENTITY,
         );
         let diag = view.diagnostics();
         assert!(diag.converged, "nagq={nagq}: must converge");
@@ -8880,7 +8865,7 @@ fn nb_hessian_se_matches_fd_of_the_full_objective() {
         );
         let se: Vec<f64> = view.var_diag()[..p].iter().map(|v| v.sqrt()).collect();
         let n_theta = ws.n_theta;
-        let theta_se0 = ws.inference.theta_se[0];
+        let theta_se0 = theta_se(&ws)[0];
         let m = n_theta + p;
         let mut q0: Vec<f64> = ws.params[..m].to_vec();
         q0.push(ws.nb_theta.ln());
@@ -9089,6 +9074,7 @@ fn glmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
         f64::NAN,
         None,
         &opts,
+        ColumnScaling::IDENTITY,
     );
     let fit = super::glmm::glmm_view_to_fit(&view, &y, n, p, &sized_model, &opts).0;
 

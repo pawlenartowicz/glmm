@@ -34,7 +34,7 @@ use faer::{Conj, Mat, MatRef, Par, Side, Spec};
 #[cfg(all(test, feature = "formula"))]
 mod fd_margin;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// `log det(A) = 2·Σ_j log L[j,j]` for the LLT factor, reading the diagonal
 /// straight out of `l_values` per symbolic arm (faer 0.24 exposes no diagonal
@@ -1034,16 +1034,9 @@ fn for_each_z_entry(
     let sw = sqrt_w.map_or(1.0, |w| w[i]);
     let f = cluster_ids[i] as usize;
     // Slope-major primary layout — mirrors add_rows_multi's scatter (change together).
-    // Every slope value is read AS A RANDOM-EFFECT column and so takes the RE
-    // column's internal scale (`LmmGroupings::set_slope_scales`); the same x column
-    // keeps its raw value where the fixed-effect design reads it (`Z'X`, `[X y]'[X y]`).
-    // The intercept subcolumn's scale is exactly 1 by construction.
     emit(f, sw);
     for (k, &col) in g.primary_slope_cols.iter().enumerate() {
-        emit(
-            (k + 1) * g.n_primary + f,
-            sw * (x[(i, col)] / g.primary_slope_scales[k]),
-        );
+        emit((k + 1) * g.n_primary + f, sw * x[(i, col)]);
     }
     // Extra groupings: intercept at off, slope c at off+1+c.
     for (e, ids_e) in extra_ids.iter().enumerate() {
@@ -1051,7 +1044,7 @@ fn for_each_z_entry(
         let off = g.extra_offsets[e] + ids_e[i] as usize * q_g;
         emit(off, sw);
         for (c, &col) in g.extra_slope_cols[e].iter().enumerate() {
-            emit(off + 1 + c, sw * (x[(i, col)] / g.extra_slope_scales[e][c]));
+            emit(off + 1 + c, sw * x[(i, col)]);
         }
     }
 }

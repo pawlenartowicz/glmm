@@ -1813,7 +1813,8 @@ fn grid_agreement_cells() -> Vec<GridCell> {
 /// cell 20 split the same way, 1.9 deviance units apart); under the signed
 /// box (`blind_theta_and_bounds`) both routes reach the lower basin cold
 /// (cell 12: −207.553008931 / −207.553008925; cell 20: −737.059439657 /
-/// −737.059439629, measured 2026-09-10) and no cell splits.
+/// −737.059439629, measured 2026-09-10). Cell 12 splits again since the
+/// P45 standardization (see `noz_sparse_grid_agrees`); cell 20 does not.
 ///
 /// The per-quantity checks below only run when the two routes' deviances
 /// agree (same basin, `DEV_TOL`); on a split, β/se/varcorr comparison would
@@ -1845,8 +1846,8 @@ fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
     const TOL: f64 = 1e-4;
     // The agreeing cells' deviances match to ~1e-9 relative (see the four
     // reseeded probes in the doc comment above), so 1e-6 leaves three orders
-    // of margin before "same basin" tips into "different basin" — nowhere
-    // near the ~2e-2 relative gap the actual split cell shows.
+    // of margin before "same basin" tips into "different basin". The one
+    // split cell (cell 12) sits at 2.4e-6 relative, above it.
     const DEV_TOL: f64 = 1e-6;
     let mut max_rel = 0f64;
     let mut worst = String::new();
@@ -1954,11 +1955,19 @@ fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
 
 /// The always-on half of the accuracy gate: the 15 cheap cells, ~4s release.
 /// Spans every axis endpoint except q_g=4 — see `is_heavy_cell` for what
-/// covers that width instead. No cell splits; the frozen list is empty so
-/// that a new split fails loudly (see `run_grid_agreement`'s doc comment).
+/// covers that width instead. Any other split fails loudly (see
+/// `run_grid_agreement`'s doc comment).
+///
+/// Cell 12 (n_primary=10, q_p=8) splits: sparse stops at a saddle,
+/// −207.552516350 (finite-difference Hessian minimum eigenvalue −0.053),
+/// while NoZ reaches −207.553008933, rel 2.4e-6 > `DEV_TOL`. A restart from
+/// the sparse endpoint reaches the NoZ value, and both routes reach it from
+/// 1e-9 start nudges, before and after the slope-scale fold into
+/// `ColumnScaling` (measured 2026-10-01): a flat-surface stopping point, not
+/// a path disagreement.
 #[test]
 fn noz_sparse_grid_agrees() {
-    run_grid_agreement(false, "noz_sparse_grid_agrees", &[]);
+    run_grid_agreement(false, "noz_sparse_grid_agrees", &[12]);
 }
 
 /// The other half: the 8 cells of `is_heavy_cell`, 27–242s each in release.
@@ -2310,7 +2319,7 @@ fn dense_ids(raw: &[String]) -> Vec<u32> {
 /// x1..x4 | ge)`, gamma/log. `ge` carries q_g = 5 > `MAX_EXTRA_Q`, which routes
 /// the design to the sparse solver. Returns `(x, y, n, p, model, ids)`, `x`
 /// row-major with an intercept column.
-fn sparse_gamma_design() -> (
+pub(crate) fn sparse_gamma_design() -> (
     Vec<f64>,
     Vec<f64>,
     usize,
@@ -2359,6 +2368,43 @@ fn sparse_gamma_design() -> (
         extra: vec![dense_ids(&ge_raw)],
     };
     (x, y, n, p, model, ids)
+}
+
+/// A random slope on a column far from zero, sparse route: the
+/// `sim_sparse_gamma` design with `x1` (a slope of the crossed q = 5 block)
+/// shifted by 1000. Before the design was standardized internally that fit
+/// ran out of budget (`converged = false`, 39000 evaluations) 3.67e-4 short of
+/// the optimum. Now both designs reach the search as the same centered column,
+/// so the shifted fit reaches the unshifted optimum. Rx SEs: the case is about
+/// the search, and the FD-Hessian would only add minutes.
+/// Measured on dell-fedora (2026-10-01): converged in 731 evaluations (643
+/// unshifted), logLik 7.1e-9 above the unshifted fit's.
+#[test]
+fn fit_sparse_gamma_shifted_x1_reaches_the_optimum() {
+    let (x, y, n, p, model, ids) = sparse_gamma_design();
+    let opts = crate::FitOptions {
+        target_indices: (0..p as u32).collect(),
+        wald_se: crate::WaldSe::Rx,
+        ..crate::FitOptions::default()
+    };
+    let base = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let mut xs = x.clone();
+    for row in xs.chunks_exact_mut(p) {
+        row[1] += 1000.0;
+    }
+    let f = crate::fit_cold(&xs, &y, n, p, &model, &ids, &opts);
+    eprintln!(
+        "SPARSE_SHIFT conv {} / {} | evals {} / {} | loglik {} vs {} | d = {:e}",
+        base.converged(),
+        f.converged(),
+        base.n_eval,
+        f.n_eval,
+        base.loglik,
+        f.loglik,
+        f.loglik - base.loglik
+    );
+    assert!(base.converged() && f.converged());
+    assert!((f.loglik - base.loglik).abs() < 1e-6);
 }
 
 /// OVER-WIDTH gamma GLMM golden: `y ~ 1 + x1..x4 + (1|gp) + (1 + x1..x4 | ge)`,
@@ -2650,29 +2696,27 @@ fn fit_sparse_gamma_hessian_is_pinned() {
     // Re-anchored 2026-08-05 on x86_64-unknown-linux-gnu; was aarch64-apple-darwin.
     // Re-pinned 2026-09-16 with `REF_SE_HESSIAN` above — same mechanism, same
     // measurement.
-    // θ-scale SE, 16 coordinates: gp's 1 (scalar intercept) then ge's 15
-    // (vech of the 5×5 slope block).
+    // 16 θ slots: gp's 1 (scalar intercept) then ge's 15 (vech of the 5×5
+    // slope block); a stddev's SE sits at its diagonal slot, NaN elsewhere.
     // Re-pinned 2026-09-24 on x86_64-unknown-linux-gnu: the mixed-Gamma
     // objective became the ML one (φ a coordinate of the outer search, the
     // joint Hessian gaining its `ln φ` row, observed curvature in the
     // log-determinant), which moves every coordinate.
-    const REF_STDDEV_SE: [f64; 16] = [
+    // Re-pinned 2026-10-01, P45 follow-up simplification: `stddev_se` on a
+    // q ≥ 2 block became the SE of the reported stddev, so the four slope
+    // rows (slots 6, 10, 13, 15) took the new quantity's values and the
+    // off-diagonal slots are NaN. Slots 0 and 1 (the scalar and ge's
+    // intercept, whose map did not change) keep their 2026-09-24 pins: they
+    // sit 3.6e-4 and 8.2e-5 from them, the drift of the earlier batches of
+    // this round, inside `BAND_HESSIAN`.
+    const STDDEV_SLOTS: [usize; 6] = [0, 1, 6, 10, 13, 15];
+    const REF_STDDEV_SE: [f64; 6] = [
         0.09644560433696432,
         0.08904244712864588,
-        0.08532986360458358,
-        0.07782432287567798,
-        0.053495413085183456,
-        0.042384229246024016,
-        0.06220694022515241,
-        0.07627763303494038,
-        0.050441667445798186,
-        0.042875760800618216,
-        0.05363638186338207,
-        0.04773724410439788,
-        0.042902711257789126,
-        0.037018421070407946,
-        0.04771503357069792,
-        0.035278669051269584,
+        0.0632881668034065,
+        0.05816734059657484,
+        0.04244031520216771,
+        0.03565671357806628,
     ];
 
     let (x, y, n, p, model, ids) = sparse_gamma_design();
@@ -2687,7 +2731,15 @@ fn fit_sparse_gamma_hessian_is_pinned() {
     let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert!(f.converged(), "sparse gamma GLMM (Hessian) must converge");
     assert_pinned(&f.se, &REF_SE_HESSIAN, SE_REL, "se_hessian vs glmmTMB");
-    assert_pinned(&f.stddev_se, &REF_STDDEV_SE, BAND_HESSIAN, "stddev_se");
+    assert_eq!(f.stddev_se.len(), 16);
+    let (sd_slots, off): (Vec<_>, Vec<_>) = (0..16).partition(|k| STDDEV_SLOTS.contains(k));
+    assert!(
+        off.iter().all(|&k| f.stddev_se[k].is_nan()),
+        "{:?}",
+        f.stddev_se
+    );
+    let got: Vec<f64> = sd_slots.iter().map(|&k| f.stddev_se[k]).collect();
+    assert_pinned(&got, &REF_STDDEV_SE, BAND_HESSIAN, "stddev_se");
 }
 
 /// Pins rung 46's (`sim_sparse_binomial_bigsd`) `se`/`stddev_se` under the
@@ -5525,189 +5577,17 @@ fn sparse_glmm_pinned_names_the_collapsed_component() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Internal random-effect column scaling (`LmmGroupings::set_slope_scales`) —
-// sparse LMM/GLMM rescale tests
-//
-// GOVERNING IDEA, shared with `crate::fit::lmm_tests`'s and `crate::fit::
-// glmm_tests`'s rescale tests: multiply a random-slope design column by an
-// exact power of two `C` and refit. A dropped back-map shows up unmistakably
-// as a ratio of 1 instead of the predicted `1/C` or `1/C²` (see `lmm_tests.
-// rs`'s rescale test for the full `Z~ = Z·diag(1/s)`, `Λ~ = diag(s)·Λ`
-// derivation). Here the random slope sits on an EXTRA (crossed) grouping
-// rather than the primary — `classify_design` sends any design with a slope
-// on an extra grouping to `Solver::Sparse` regardless of level counts, which
-// is what forces both tests below onto the sparse route.
-// ---------------------------------------------------------------------------
-
-/// Primary intercept-only grouping (12 levels) + one CROSSED extra grouping
-/// (20 levels) carrying a genuine random slope on column 1 — the
-/// `slope_extras` shape `classify_design` always routes `Solver::Sparse`.
-/// Column 1 is both the fixed-effect covariate and the extra grouping's slope
-/// covariate, mirroring the dense rescale tests' single-column double-duty
-/// design. `x1`'s ±1-by-primary-level-parity shape is
-/// `sparse_lmm_pinned_names_the_second_groupings_slope`'s proven-convergent
-/// design; UNLIKE that fixture, `v1` here carries real per-level signal so the
-/// extra block's slope variance converges away from the boundary — this test
-/// needs a genuinely nonzero D10/D11 to exercise the rescale identity on.
-fn sparse_lmm_slope_extra_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, crate::GroupIds)
-{
-    let n = 240;
-    let p = 2;
-    let mut x = vec![0.0f64; n * p];
-    let mut y = vec![0.0f64; n];
-    let g: Vec<u32> = (0..n).map(|i| (i % 12) as u32).collect();
-    let h: Vec<u32> = (0..n).map(|i| (i / 12) as u32).collect();
-
-    let mut st = 71u64;
-    let u0: Vec<f64> = (0..12).map(|_| 0.6 * lcg(&mut st)).collect();
-    let v0: Vec<f64> = (0..20).map(|_| 0.6 * lcg(&mut st)).collect();
-    let v1: Vec<f64> = (0..20).map(|_| 0.3 * lcg(&mut st)).collect();
-    for i in 0..n {
-        let gi = g[i] as usize;
-        let hi = h[i] as usize;
-        let x1 = if gi % 2 == 0 { 1.0 } else { -1.0 };
-        x[i * p] = 1.0;
-        x[i * p + 1] = x1;
-        y[i] = 1.0 + 0.75 * x1 + u0[gi] + v0[hi] + v1[hi] * x1 + 0.3 * lcg(&mut st);
-    }
-
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 12 },
-            slopes: vec![],
-            extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 20 },
-                slopes: vec![1],
-            }],
-        }),
-    };
-    let ids = crate::GroupIds {
-        primary: g,
-        extra: vec![h],
-    };
-    (x, y, n, p, model, ids)
-}
-
-/// Sparse LMM rescale identity, `C = 1024.0` — the sparse-route twin of
-/// `crate::fit::lmm_tests`'s dense rescale test, same predicted moves (see
-/// that test's doc comment for the derivation): the primary block here is
-/// intercept-only (q_p=1, `block_row_scale` always 1.0 on it) so it is
-/// untouched by construction; the extra grouping's q_g=2 block carries the
-/// same `[untouched, /C, /C²]` vech pattern the dense test's primary block
-/// does.
-#[test]
-fn sparse_lmm_rescaling_slope_column_moves_every_quantity_by_the_predicted_power_of_c() {
-    const C: f64 = 1024.0;
-    const BAND: f64 = 1e-5;
-    const DEV_ABS: f64 = 1e-9;
-
-    let (x, y, n, p, model, ids) = sparse_lmm_slope_extra_design();
-    assert!(
-        matches!(
-            crate::fit::classify_design(&model, 1),
-            crate::fit::Solver::Sparse
-        ),
-        "extra-grouping slope must route Sparse"
-    );
-    let opts = crate::FitOptions {
-        target_indices: vec![0, 1],
-        ..crate::FitOptions::default()
-    };
-
-    let base = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert!(base.converged(), "base sparse LMM must converge");
-
-    let mut x_c = x.clone();
-    for i in 0..n {
-        x_c[i * p + 1] *= C;
-    }
-    let scaled = crate::fit_cold(&x_c, &y, n, p, &model, &ids, &opts);
-    assert!(scaled.converged(), "column-scaled sparse LMM must converge");
-
-    assert_pinned(&[scaled.beta[0]], &[base.beta[0]], BAND, "beta[0]");
-    assert_pinned(&[scaled.beta[1]], &[base.beta[1] / C], BAND, "beta[1]");
-    assert_pinned(&[scaled.se[0]], &[base.se[0]], BAND, "se[0]");
-    assert_pinned(&[scaled.se[1]], &[base.se[1] / C], BAND, "se[1]");
-
-    // varcorr: block 0 primary (q=1, untouched — no slope on it), block 1
-    // extra vech [D00, D10, D11].
-    assert_eq!(scaled.varcorr.len(), 2, "primary + one extra block");
-    assert_pinned(
-        &scaled.varcorr[0],
-        &base.varcorr[0],
-        BAND,
-        "varcorr primary",
-    );
-    assert_pinned(
-        &scaled.varcorr[1],
-        &[
-            base.varcorr[1][0],
-            base.varcorr[1][1] / C,
-            base.varcorr[1][2] / (C * C),
-        ],
-        BAND,
-        "varcorr extra vech",
-    );
-
-    // tau2: primary contributes 1 entry (untouched), the extra's q=2 vech
-    // contributes 3 more — indices 2, 3 are both the extra's slope ROW (row
-    // 1), so both carry the squared /C² factor; index 1 (row 0) is untouched.
-    assert_eq!(scaled.tau2.len(), 4);
-    assert_pinned(
-        &scaled.tau2,
-        &[
-            base.tau2[0],
-            base.tau2[1],
-            base.tau2[2] / (C * C),
-            base.tau2[3] / (C * C),
-        ],
-        BAND,
-        "tau2",
-    );
-
-    // ranef: primary block (12 levels × q=1, untouched) then extra block (20
-    // levels × q=2: [b0, b1/C] per level).
-    assert_eq!(scaled.ranef_levels, vec![12, 20]);
-    let mut want_ranef = Vec::with_capacity(scaled.ranef.len());
-    want_ranef.extend_from_slice(&base.ranef[..12]);
-    for l in 0..20 {
-        want_ranef.push(base.ranef[12 + l * 2]);
-        want_ranef.push(base.ranef[12 + l * 2 + 1] / C);
-    }
-    assert_pinned(&scaled.ranef, &want_ranef, BAND, "ranef");
-
-    // fitted — unchanged elementwise (same model, same conditional means).
-    assert_pinned(&scaled.fitted, &base.fitted, BAND, "fitted");
-
-    // deviance / loglik — same log|X'V⁻¹X| Jacobian argument as the dense LMM
-    // test: one column of a 2-column X scaled by C moves the REML deviance by
-    // +2·ln(C) and loglik by -ln(C).
-    let dev_shift = scaled.deviance - base.deviance;
-    let expected_dev_shift = 2.0 * C.ln();
-    assert!(
-        (dev_shift - expected_dev_shift).abs() < DEV_ABS,
-        "deviance shift {dev_shift} vs predicted {expected_dev_shift}"
-    );
-    let loglik_shift = scaled.loglik - base.loglik;
-    let expected_loglik_shift = -C.ln();
-    assert!(
-        (loglik_shift - expected_loglik_shift).abs() < DEV_ABS,
-        "loglik shift {loglik_shift} vs predicted {expected_loglik_shift}"
-    );
-}
-
 /// Parses `validation/data/simulated/sim_binomial_slope_crossed.csv` — the
 /// same aggregated-binomial fixture `fit_sparse_binomial_slope_crossed_is_
-/// pinned` gates against a frozen pin, reused here because it is already
-/// known to converge with BOTH its q=2 blocks (primary g1, extra g2) away
+/// pinned` gates against a frozen pin, reused (here and by the sparse GLMM
+/// case of `fit::standardize_tests`) because it is known to converge with
+/// BOTH its q=2 blocks (primary g1, extra g2) away
 /// from the boundary (that pin's `REF_VC_G1`/`REF_VC_G2` are real, nonzero
 /// vechs). Column 2 (`x`) is the fixed-effect covariate and the random-slope
 /// covariate on BOTH groupings; column 1 (`size`) is the prior weight, not a
 /// design column. Returns `(x, y, n, p, model, ids, weights)`.
 #[allow(clippy::type_complexity)]
-fn sparse_glmm_slope_crossed_design() -> (
+pub(crate) fn sparse_glmm_slope_crossed_design() -> (
     Vec<f64>,
     Vec<f64>,
     usize,
@@ -5756,133 +5636,6 @@ fn sparse_glmm_slope_crossed_design() -> (
         extra: vec![dense_ids(&g2_raw)],
     };
     (x, y, n, p, model, ids, size_col)
-}
-
-/// Sparse GLMM rescale identity, `C = 4.0`, `WaldSe::Hessian` (the crate
-/// default) — the sparse-route twin of `crate::fit::glmm_tests`'s dense GLMM
-/// rescale test, same predicted moves and the same reason for the smaller `C`
-/// and looser band (the joint `[θ | β]` BOBYQA search with one trust radius on
-/// raw β makes the two fits' internal paths genuinely different, not one
-/// bit-identical search read twice — see that test's doc comment). Both
-/// groupings here (primary g1, extra g2) carry a random slope on the SAME
-/// column, so both blocks' vechs move by the identity at once.
-#[test]
-fn sparse_glmm_rescaling_slope_column_moves_stddev_se_by_the_predicted_power_of_c() {
-    const C: f64 = 4.0;
-    const BAND: f64 = 3e-4;
-    const DEV_ABS: f64 = 1e-9;
-
-    let (x, y, n, p, model, ids, weights) = sparse_glmm_slope_crossed_design();
-    assert!(
-        matches!(
-            crate::fit::classify_design(&model, 1),
-            crate::fit::Solver::Sparse
-        ),
-        "extra-grouping slope must route Sparse"
-    );
-    let opts = crate::FitOptions {
-        target_indices: vec![0, 1],
-        weights: Some(weights.clone()),
-        ..crate::FitOptions::default() // WaldSe::Hessian
-    };
-
-    let base = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert!(base.converged(), "base sparse GLMM must converge");
-    assert!(
-        base.stddev_se.iter().all(|v| v.is_finite()),
-        "base stddev_se must be finite on a converged Hessian fit: {:?}",
-        base.stddev_se
-    );
-
-    let mut x_c = x.clone();
-    for i in 0..n {
-        x_c[i * p + 1] *= C;
-    }
-    let scaled = crate::fit_cold(&x_c, &y, n, p, &model, &ids, &opts);
-    assert!(
-        scaled.converged(),
-        "column-scaled sparse GLMM must converge"
-    );
-    assert!(
-        scaled.stddev_se.iter().all(|v| v.is_finite()),
-        "scaled stddev_se must be finite on a converged Hessian fit: {:?}",
-        scaled.stddev_se
-    );
-
-    assert_pinned(&[scaled.beta[0]], &[base.beta[0]], BAND, "beta[0]");
-    assert_pinned(&[scaled.beta[1]], &[base.beta[1] / C], BAND, "beta[1]");
-    assert_pinned(&[scaled.se[0]], &[base.se[0]], BAND, "se[0]");
-    assert_pinned(&[scaled.se[1]], &[base.se[1] / C], BAND, "se[1]");
-
-    // varcorr: both g1 (primary) and g2 (extra) are q=2 blocks with a real
-    // slope, so both vechs carry the [untouched, /C, /C²] pattern.
-    assert_eq!(scaled.varcorr.len(), 2, "g1 + g2, both q=2");
-    for blk in 0..2 {
-        let want = [
-            base.varcorr[blk][0],
-            base.varcorr[blk][1] / C,
-            base.varcorr[blk][2] / (C * C),
-        ];
-        assert_pinned(
-            &scaled.varcorr[blk],
-            &want,
-            BAND,
-            &format!("varcorr[{blk}]"),
-        );
-    }
-
-    // tau2: two q=2 vechs back to back — same [untouched, /C², /C²] pattern
-    // in each 3-entry block.
-    assert_eq!(scaled.tau2.len(), 6);
-    let want_tau2: Vec<f64> = (0..2)
-        .flat_map(|blk| {
-            let b = blk * 3;
-            [
-                base.tau2[b],
-                base.tau2[b + 1] / (C * C),
-                base.tau2[b + 2] / (C * C),
-            ]
-        })
-        .collect();
-    assert_pinned(&scaled.tau2, &want_tau2, BAND, "tau2");
-
-    // ranef: g1's block (n_g1 levels × q=2) then g2's block (n_g2 levels ×
-    // q=2), each level [b0, b1/C].
-    assert_eq!(scaled.ranef_levels.len(), 2);
-    let mut want_ranef = Vec::with_capacity(scaled.ranef.len());
-    let mut off = 0usize;
-    for &levels in &scaled.ranef_levels {
-        for l in 0..levels {
-            want_ranef.push(base.ranef[off + l * 2]);
-            want_ranef.push(base.ranef[off + l * 2 + 1] / C);
-        }
-        off += levels * 2;
-    }
-    assert_pinned(&scaled.ranef, &want_ranef, BAND, "ranef");
-
-    // stddev_se — the item this test exists for: ONE power of the row scale
-    // per block (θ-scale SE, not squared like tau2).
-    assert_eq!(scaled.stddev_se.len(), 6);
-    let want_stddev_se: Vec<f64> = (0..2)
-        .flat_map(|blk| {
-            let b = blk * 3;
-            [
-                base.stddev_se[b],
-                base.stddev_se[b + 1] / C,
-                base.stddev_se[b + 2] / C,
-            ]
-        })
-        .collect();
-    assert_pinned(&scaled.stddev_se, &want_stddev_se, BAND, "stddev_se");
-
-    // deviance — no REML Jacobian on the GLMM route: a genuine
-    // reparameterization, so the marginal criterion is invariant.
-    assert!(
-        (scaled.deviance - base.deviance).abs() < DEV_ABS,
-        "deviance moved under a column reparameterization: {} vs {}",
-        scaled.deviance,
-        base.deviance
-    );
 }
 
 /// The packed-row layout runs the same two-stage search the other layouts do,
@@ -6008,8 +5761,7 @@ fn sparse_glmm_sign_trap_escaped() {
 /// `q_p = 1`, `q_g = 1`, unweighted; the same design again with a random
 /// slope on the PRIMARY grouping (`q_p = 2`, `q_g = 1`, `m = 6`, binomial-logit
 /// and Gamma-log), which is what puts the packed `∂M/∂θ` selection's slope arm
-/// — the `r > 0` branch and its `z_r / s_r` division, live because
-/// `set_slope_scales` runs on both sides — against an exact reference; and a
+/// (the `r > 0` branch) against an exact reference; and a
 /// WEIGHTED Gamma-log cell, which is the one combination where prior weights
 /// and the `aic` substitution's `Φ'`/`Φ''` meet.
 ///
@@ -6114,7 +5866,6 @@ fn packed_and_dense_assembled_hessians_agree() {
         // uses, for the same reason: large integer weights make the reference
         // engine's Hessian ill-conditioned on this design class.
         let weights: Vec<f64> = (0..n).map(|i| 1.0 + 0.2 * ((i % 3) as f64 - 1.0)).collect();
-        let wopt = case.weighted.then_some(&weights[..]);
         let tag = format!(
             "{family:?}/slope={}/weighted={}",
             case.primary_slope, case.weighted
@@ -6138,11 +5889,8 @@ fn packed_and_dense_assembled_hessians_agree() {
         let mut sws =
             crate::glmm::GlmmWorkspace::for_cluster_spec_packed(p, &model, n, slope_cols, 1);
         sws.nb_theta = nb_theta;
-        // Both sides get the design's own RE column scales and the same prior
-        // weights, exactly as the production adapter sets them, so θ means the
-        // same thing on each.
-        dws.groupings.set_slope_scales(x.as_ref(), wopt);
-        sws.groupings.set_slope_scales(x.as_ref(), wopt);
+        // Both sides get the same prior weights, exactly as the production
+        // adapter sets them.
         if case.weighted {
             dws.prior_w[..n].copy_from_slice(&weights);
             sws.prior_w[..n].copy_from_slice(&weights);

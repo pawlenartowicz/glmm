@@ -40,6 +40,7 @@
 //! BOBYQA is Powell, M.J.D. (2009), *The BOBYQA algorithm for bound constrained
 //! optimization without derivatives*, Cambridge report DAMTP 2009/NA06.
 
+use crate::standardize::ColumnScaling;
 use crate::WaldSe;
 use bobyqa::Status;
 use faer::{Mat, MatRef};
@@ -271,8 +272,6 @@ pub struct GlmmFit {
     /// off, that tier's surface must be unchanged.
     #[cfg(feature = "counters")]
     pub counters: crate::counters::EvalCounters,
-    /// Estimated random-intercept variance `D̂[0][0]` (NaN on non-converged).
-    pub tau_squared_hat: f64,
     /// Joint Wald-χ² over `target_indices` (NaN when empty / non-converged).
     pub joint_t_sq: f64,
     /// Set iff the fit ran `WaldSe::Hessian` and `joint_hessian_cov` fell back to the
@@ -394,6 +393,10 @@ pub enum FdHessianStatus {
 /// non-convergence (BOBYQA failure, a non-PD Schur, or the degenerate-fit
 /// guard tripping on an all-infeasible BOBYQA simplex) NaN-fills every
 /// β̂/SE/deviance field instead (`f64::NAN` or `f64::INFINITY`; see `nan_fit`).
+///
+/// `map` is the column standardization `x` carries: β̂ and every SE output
+/// are reported through it (`ColumnScaling::IDENTITY` for a design fitted
+/// as given).
 #[allow(clippy::too_many_arguments)]
 pub fn fit_glmm(
     ws: &mut GlmmWorkspace,
@@ -406,6 +409,7 @@ pub fn fit_glmm(
     beta_start: &[f64],
     n: usize,
     wald_se: WaldSe,
+    map: &ColumnScaling,
 ) -> GlmmFit {
     // Backstop for a hand-built workspace: the blocked and structured layouts
     // build intercept-only extras (`build_packed_m` carries the per-eval
@@ -431,27 +435,11 @@ pub fn fit_glmm(
             // diagonals are non-negative and the floor only keeps them off the
             // pin threshold; off-diagonals are signed, so flooring them would
             // silently rewrite a negative correlation start. lme4 passes
-            // `start$theta` through verbatim.
-            // A caller's θ is in the design's own units; the solver works on the
-            // internally scaled θ̃ = s·θ (`LmmGroupings::set_slope_scales`), so the
-            // forward map runs before the floor — which then floors the INTERNAL
-            // diagonals, the same scale `PIN_THETA` tests.
-            // `MAX_THETA` is the dense envelope's vech ceiling, so the stack
-            // block covers every in-envelope shape and a warm loop pays no heap
-            // block for the forward map. The packed layout also takes designs
-            // past that ceiling (an over-envelope primary block, say), and those
-            // — off the warm-loop envelope by construction — take the `Vec`.
-            let mut stack = [0.0_f64; crate::consts::MAX_THETA];
-            let mut heap: Vec<f64>;
-            let s: &mut [f64] = if n_theta <= crate::consts::MAX_THETA {
-                &mut stack[..n_theta]
-            } else {
-                heap = vec![0.0; n_theta];
-                &mut heap
-            };
-            ws.groupings.fill_theta_row_scales(s);
-            for ((t, &v), &sc) in ws.params[..n_theta].iter_mut().zip(ts).zip(s.iter()) {
-                *t = v * sc;
+            // `start$theta` through verbatim. `ts` is already on the fitted
+            // design (`fit::common::start_to_design`), the scale `PIN_THETA`
+            // tests.
+            for (t, &v) in ws.params[..n_theta].iter_mut().zip(ts) {
+                *t = v;
             }
             for &i in ws.groupings.diagonal_theta() {
                 ws.params[i] = ws.params[i].max(THETA_TRUTH_FLOOR);
@@ -1353,6 +1341,9 @@ pub fn fit_glmm(
     for j in 0..p {
         ws.betas[j] = ws.params[n_theta + j];
     }
+    // β̂ on the caller's columns (β = B·β̂ on the fitted design); every SE arm
+    // below reports Var, vcov, t² and the joint Wald in the same units.
+    map.beta_to_caller(&mut ws.betas);
 
     // Var(β̂): `Rx` inverts the β-information (Schur) directly — fast, but the
     // Schur complement of the information at the mode assumes β–θ orthogonality (exact for
@@ -1362,11 +1353,10 @@ pub fn fit_glmm(
     // exact on every shape `derivative::supports_shape` accepts,
     // finite-difference elsewhere.
     let mut hessian_fallback = false;
-    // Reset the θ-block SE each fit (the workspace is reused across fits). Only the
-    // Hessian arm's `joint_hessian_cov` refills it; the Rx arm leaves it NaN.
-    for v in ws.inference.theta_se[..n_theta].iter_mut() {
-        *v = f64::NAN;
-    }
+    // Reset the θ-block covariance each fit (the workspace is reused across
+    // fits). Only the Hessian arm's `joint_hessian_cov` refills it; the Rx arm
+    // leaves it NaN.
+    ws.inference.theta_cov.fill(f64::NAN);
     let joint_t_sq = match wald_se {
         WaldSe::Rx => {
             // Schur fill. The blocked layout reuses the per-block factors the
@@ -1393,13 +1383,16 @@ pub fn fit_glmm(
             };
             let lschur = sc.L();
             nan_fill_vcov(ws, p);
+            // Right-hand side row t of the column map B (eₜ when the design is
+            // fitted as given): Var(βₜ) = ‖L⁻¹bₜ‖², and the Gram of these
+            // columns below is B·Schur⁻¹·Bᵀ.
             for &tj in target_indices {
                 let tj = tj as usize;
                 // Forward-solve into reusable scratch; fwd_solve[i] is written before
                 // it is read as fwd_solve[kk] (kk < i), so no per-target zero-fill is
                 // needed.
                 for i in 0..p {
-                    let mut acc = if i == tj { 1.0 } else { 0.0 };
+                    let mut acc = map.rhs(tj, i);
                     for kk in 0..i {
                         acc -= lschur[(i, kk)] * ws.inference.fwd_solve[kk];
                     }
@@ -1440,6 +1433,7 @@ pub fn fit_glmm(
             if target_indices.is_empty() {
                 f64::NAN
             } else {
+                // The Schur is the fitted design's information: mapped inside.
                 crate::lmm::joint_wald_chi_sq(
                     ws.border.schur.as_ref(),
                     &ws.betas,
@@ -1448,6 +1442,7 @@ pub fn fit_glmm(
                     ws.inference.joint_k_inv.as_mut(),
                     ws.inference.joint_sigma_t_chol.as_mut(),
                     &mut ws.inference.joint_rhs,
+                    map,
                 )
             }
         }
@@ -1464,6 +1459,8 @@ pub fn fit_glmm(
             if !cov[(0, 0)].is_finite() {
                 return nan_fit(ws, target_indices, n_eval);
             }
+            // `cov` is Var(β̃) on the fitted design; the caller's is B·cov·Bᵀ.
+            map.congruence(cov.as_mut());
             hessian_fallback = matches!(status, FdHessianStatus::NonPdFellBackToRx);
             // Marginal var/t² straight off the covariance diagonal.
             for &tj in target_indices {
@@ -1515,6 +1512,7 @@ pub fn fit_glmm(
                                 ws.border.schur[(a, b)] = inv[(a, b)];
                             }
                         }
+                        // `inv` is the information of the already mapped `cov`.
                         crate::lmm::joint_wald_chi_sq(
                             ws.border.schur.as_ref(),
                             &ws.betas,
@@ -1523,6 +1521,7 @@ pub fn fit_glmm(
                             ws.inference.joint_k_inv.as_mut(),
                             ws.inference.joint_sigma_t_chol.as_mut(),
                             &mut ws.inference.joint_rhs,
+                            ColumnScaling::IDENTITY,
                         )
                     }
                     Err(_) => f64::NAN,
@@ -1531,19 +1530,6 @@ pub fn fit_glmm(
         }
     };
 
-    // τ̂² = D̂[0][0] = (Λ̂Λ̂')[0][0]. No σ² (binomial). For lower-tri Λ_p stored
-    // row-major (lam[r*q + c]), row 0 has only the (0,0) entry nonzero, so
-    // D̂[0][0] = Σ_c Λ[0,c]² = Λ[0,0]² — the random-INTERCEPT variance.
-    crate::lmm::primary_lambda(
-        &ws.params[..n_theta],
-        ws.groupings.primary_q,
-        &mut ws.pirls.lam,
-    );
-    let q = ws.groupings.primary_q;
-    let mut d00 = 0.0;
-    for r in 0..q {
-        d00 += ws.pirls.lam[r] * ws.pirls.lam[r];
-    }
     GlmmFit {
         converged: !budget_exhausted,
         boundary_hit: if budget_exhausted {
@@ -1559,7 +1545,6 @@ pub fn fit_glmm(
         n_eval,
         #[cfg(feature = "counters")]
         counters: ws.counters,
-        tau_squared_hat: d00,
         joint_t_sq,
         hessian_fallback,
         exact_profile_fallback: ws.exact_profile_fallback,
@@ -1609,7 +1594,6 @@ fn nan_fit(ws: &mut GlmmWorkspace, targets: &[u32], n_eval: usize) -> GlmmFit {
         n_eval,
         #[cfg(feature = "counters")]
         counters: ws.counters,
-        tau_squared_hat: f64::NAN,
         joint_t_sq: f64::NAN,
         hessian_fallback: false,
         // Unlike `hessian_fallback` (decided only past every `nan_fit` call

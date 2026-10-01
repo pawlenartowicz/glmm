@@ -207,12 +207,6 @@ R), but they are three of six: the full report is `diagnostics.converged`,
     random-effect columns but no row. Raised by the formula frontend, not a
     solver — the only layer that sees both the declared levels and the
     per-row codes.
-  - `ReDesignScaleSpread`: a grouping's random-effect design columns sit on
-    very different scales (mirrors lme4's `checkScaleX`). Fitting is
-    unaffected — the kernel scales internally — but the reported
-    random-effect standard deviations stay on the raw variable's own scale.
-    Also raised by the formula frontend, for the same reason
-    `UnusedGroupingLevels` is.
   - `HessianSeFallback`: `wald_se`/`WaldSe::Hessian` was requested, but the
     joint Hessian was not usable: it was not positive definite, or the fit
     took the finite-difference Hessian and a perturbed deviance evaluation was

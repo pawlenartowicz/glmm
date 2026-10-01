@@ -1002,8 +1002,8 @@ fn fit_on_lmm_dense_varying_n_with_and_without_offset_matches_fit_cold() {
 }
 
 /// Dense random-slope LMM whose slope column is deliberately far off unit RMS,
-/// so `LmmGroupings::set_slope_scales` installs a scale != 1 and the θ̂ read-back
-/// in `FitView::new` has real work to do.
+/// so the standardization scales it and the θ̂ read-back in `FitView::new` has
+/// real work to do.
 #[cfg(feature = "alloc-tests")]
 fn lmm_slope_case() -> (
     Vec<f64>,
@@ -1133,8 +1133,9 @@ fn fit_on_theta_marshalling_bounded_alloc() {
     const N_CALLS: usize = 100;
     // Measured exactly 9400 on this machine, under this test's own
     // `RAYON_NUM_THREADS=1` + `--test-threads=1` protocol: ~40 blocks per
-    // arm-draw of faer `llt` internals plus the one per-call
-    // `theta_row_scales` vector, and nothing else. Pinned at the measurement
+    // arm-draw of faer `llt` internals plus one per-call vector of the
+    // warm start's slope scales (since removed, see the last re-pin), and
+    // nothing else. Pinned at the measurement
     // with no slack — if faer's Cholesky internals change, re-measure and
     // update, do not relax.
     //
@@ -1157,7 +1158,19 @@ fn fit_on_theta_marshalling_bounded_alloc() {
     // restarts take 62 + 18 evaluations per iteration where they took 50 + 16
     // before it: one faer `llt` block each, 14 × 100 = 1400 over the 8000 it
     // replaced.
-    const BOUND: u64 = 9400;
+    //
+    // Re-pinned 2026-10-01 at 9600: the design is standardized internally
+    // before the fit, which allocates nothing per call (its buffers live in the
+    // workspace) but moves the scaled arm's search path. Its warm restart takes
+    // 64 evaluations where it took 62 (the reordered arm stays at 18):
+    // 2 × 100 = 200 more `llt` blocks.
+    //
+    // Re-pinned 2026-10-01, P45 follow-up simplification: 9600 → 8200. The
+    // warm start no longer allocates its per-call slope-scale vector (100
+    // blocks), and with the slope scale folded into the standardization the
+    // warm restarts take 13 fewer evaluations per iteration between the two
+    // arms (1300 `llt` blocks).
+    const BOUND: u64 = 8200;
 
     let (xs, ys, ns, ps, ms, ids_s, os) = lmm_slope_case();
     let (sized_s, ids_s, perm_s) = spec_sized_from_ids_pub(&ms, &ids_s);
@@ -1371,8 +1384,8 @@ fn counters_show_the_outer_search_stage_split() {
 const OVER_ENVELOPE_N_THETA: usize = 14 * 15 / 2;
 
 /// Gaussian `(1 + x1..x13 | g)` on one grouping level × 14 rows. Column 1 is
-/// pushed far off unit RMS, so `set_slope_scales` installs a scale != 1 and the
-/// θ̂ read-back in `FitView::new` has the divide to do.
+/// pushed far off unit RMS, so the standardization scales it and the θ̂
+/// read-back in `FitView::new` has the divide to do.
 fn over_envelope_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
     let q_p = 14usize; // intercept + 13 slopes
     let n = 14usize;
@@ -1406,7 +1419,7 @@ fn over_envelope_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, Group
 
 /// A vech wider than `MAX_THETA` fits through `fit_cold` instead of panicking.
 ///
-/// `FitView::new` divides θ̂ back out of the internal RE column scales in the
+/// `FitView::new` maps θ̂ back out of the internal RE column scales in the
 /// workspace's own θ buffer. Sized off the `MAX_THETA` constant that buffer
 /// bounds-checks on this design, so the second half of the test pins the sizing
 /// rule directly — off the built kernel's θ width — and pins that the divide
@@ -1431,7 +1444,7 @@ fn over_envelope_vech_fits_through_the_theta_rescale() {
     let mut ws = build_workspace(&sized, perm, n, p, &opts);
     assert_eq!(
         ws.theta_declared_buf.len(),
-        2 * OVER_ENVELOPE_N_THETA,
+        OVER_ENVELOPE_N_THETA,
         "the θ buffer is sized off the built kernel's own θ width, not a constant"
     );
     let view = fit_on(&mut ws, &x, &y, &ids_s, None, &opts);

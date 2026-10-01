@@ -150,7 +150,7 @@ Python port so the two ports agree.
 \strong{Diagnostic warnings carry a condition class.} Each solver note is raised
 as a warning of class \code{"fastglmm_diagnostic"} with a per-kind subclass
 (\code{"fastglmm_ill_conditioned"}, \code{"fastglmm_pirls_exhausted"},
-\code{"fastglmm_unused_grouping_levels"}, \code{"fastglmm_re_design_scale_spread"},
+\code{"fastglmm_unused_grouping_levels"},
 \code{"fastglmm_single_level_grouping_dropped"}, \code{"fastglmm_hessian_se_fallback"},
 \code{"fastglmm_exact_profile_fallback"},
 \code{"fastglmm_non_integer_response"}, \code{"fastglmm_rows_dropped_na"}; a note from

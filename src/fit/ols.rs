@@ -5,6 +5,7 @@
 use faer::Mat;
 
 use crate::ols::{OlsFitView, OlsScratch, OlsSuffStats, PANEL_ROWS};
+use crate::standardize::ColumnScaling;
 
 use super::common::{fill_se_compact, nan_vcov, vcov_from_chol, FitDiagnostics};
 use super::{Fit, FitOptions};
@@ -91,7 +92,9 @@ impl OlsWorkspace {
 /// the identity-link offset y-shift internally (the OLS kernel takes neither),
 /// then accumulates X'WX / X'Wy / y'Wy and runs the sufficient-statistics solve.
 /// `sum_y`/`sst` are NOT weight-consistent under this scaling but are never
-/// mapped into `Fit` (see [`ols_view_to_fit`]).
+/// mapped into `Fit` (see [`ols_view_to_fit`]). `map` is the column map `x_mat`
+/// was fitted through: the view's `betas` stay on `x_mat`'s design, its
+/// `var_diag`/`t_sq` are the caller's (`crate::ols::fit_suff_stats_t_sq_mapped`).
 pub(crate) fn fit_ols_prebuilt<'a>(
     ws: &'a mut OlsWorkspace,
     x_mat: faer::MatRef<'_, f64>,
@@ -99,6 +102,7 @@ pub(crate) fn fit_ols_prebuilt<'a>(
     n: usize,
     p: usize,
     opts: &FitOptions,
+    map: &ColumnScaling,
 ) -> OlsFitView<'a> {
     // Reset accumulators — a reused ws must not carry the prior fit's sums.
     ws.suff_xtx.fill(0.0);
@@ -162,7 +166,7 @@ pub(crate) fn fit_ols_prebuilt<'a>(
         fit_factor: ws.fit_factor.as_mut(),
         fit_rhs: ws.fit_rhs.as_mut(),
     };
-    crate::ols::fit_suff_stats_t_sq(
+    crate::ols::fit_suff_stats_t_sq_mapped(
         ws.suff_xtx.as_ref(),
         &ws.suff_xty,
         suff_yty,
@@ -171,23 +175,29 @@ pub(crate) fn fit_ols_prebuilt<'a>(
         &opts.target_indices,
         ws.suff_xtx_work.as_mut(),
         scratch,
+        map,
     )
 }
 
 /// Maps an [`OlsFitView`] to the full stable `Fit`. Needs the raw `x`/`y`/`n`
 /// because `fitted = o + Xβ̂` (raw rows) and the weighted ML Gaussian loglik are
 /// recomputed from the original-scale data, not the √wᵢ-scaled accumulators.
+/// `beta` is the caller's β̂, `B·β̃` of the view's, with `map` the column map
+/// the view was fitted through: `x` is the caller's design, so `fitted` is
+/// formed with the caller's β.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ols_view_to_fit(
     view: &OlsFitView<'_>,
+    beta: Vec<f64>,
     x: &[f64],
     y: &[f64],
     n: usize,
     p: usize,
     opts: &FitOptions,
+    map: &ColumnScaling,
 ) -> Fit {
-    // view.betas is compact [0..p]; view.var_diag is compact [0..t] at target rank
-    // (OLS/GLM are target-compact; LME/LMM are predictor-indexed)
-    let beta = view.betas.to_vec();
+    // view.var_diag is compact [0..t] at target rank (OLS/GLM are
+    // target-compact; LME/LMM are predictor-indexed)
     let diag = view.diagnostics();
     let converged = diag.converged;
     let mut se = vec![f64::NAN; p];
@@ -195,7 +205,7 @@ pub(crate) fn ols_view_to_fit(
     // `view.factor` is stale-or-zero unless `converged` (its documented
     // contract) — a non-converged fit reports an all-NaN vcov, as `se` does.
     let vcov = if converged {
-        vcov_from_chol(view.factor, p, &opts.target_indices, view.sigma_sq)
+        vcov_from_chol(view.factor, p, &opts.target_indices, view.sigma_sq, map)
     } else {
         nan_vcov(p)
     };

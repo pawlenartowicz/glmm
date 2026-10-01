@@ -2653,8 +2653,19 @@ fn fit_glm_nb_outer_cap_semantics() {
         ..FitOptions::default()
     };
     let seed = Some(super::glm::NB_THETA_LO);
+    let x_mat = super::common::to_col_major(&x, n, p);
 
-    let f0 = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, 0).0;
+    let f0 = super::glm::fit_glm_nb_capped(
+        x_mat.as_ref(),
+        &y,
+        n,
+        p,
+        seed,
+        &opts,
+        0,
+        crate::standardize::ColumnScaling::IDENTITY,
+    )
+    .0;
     assert!(
         !f0.converged(),
         "cap 0: never-ran placeholder is converged=false"
@@ -2662,8 +2673,28 @@ fn fit_glm_nb_outer_cap_semantics() {
     assert!(f0.beta.iter().all(|b| b.is_nan()), "cap 0: β all NaN");
     assert!(f0.dispersion.is_nan(), "cap 0: dispersion NaN, never ran");
 
-    let f1 = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, 1).0;
-    let full = super::glm::fit_glm_nb_capped(&x, &y, n, p, seed, &opts, super::glm::NB_MAX_OUTER).0;
+    let f1 = super::glm::fit_glm_nb_capped(
+        x_mat.as_ref(),
+        &y,
+        n,
+        p,
+        seed,
+        &opts,
+        1,
+        crate::standardize::ColumnScaling::IDENTITY,
+    )
+    .0;
+    let full = super::glm::fit_glm_nb_capped(
+        x_mat.as_ref(),
+        &y,
+        n,
+        p,
+        seed,
+        &opts,
+        super::glm::NB_MAX_OUTER,
+        crate::standardize::ColumnScaling::IDENTITY,
+    )
+    .0;
     // Cap exhaustion is reported, not silent: the inner IRLS converged, so the
     // fit keeps `converged = true`, but it carries a NbShapeUnsettled note with
     // the number of rounds it ran.

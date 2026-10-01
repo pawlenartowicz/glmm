@@ -51,6 +51,7 @@ use faer::{Accum, MatMut, MatRef, Par};
 
 use crate::ols::{nan_fill_ols_scratch, triangular_solve_norm_sq};
 use crate::spec::{BinomialLink, Family};
+use crate::standardize::ColumnScaling;
 use crate::FLOAT_NEAR_ZERO;
 
 /// IRLS safety cap.
@@ -129,9 +130,12 @@ pub const SATURATION_FRAC: f64 = 0.5;
 /// Logit (Wald-z²); the threshold comparison `stat_sq > crit_sq` is family-
 /// agnostic so writeback code in `batch.rs` stays uniform.
 pub struct GlmFitView<'a> {
-    /// length P — fitted coefficients (NaN-filled on non-converged paths).
+    /// length P — fitted coefficients (NaN-filled on non-converged paths), on
+    /// the design `x` held (β̃ when the fit ran through a column map, see
+    /// `glm_irls_fit_mapped`).
     pub betas: &'a [f64],
-    /// length T — `((X'WX)⁻¹)_jj` for each target.
+    /// length T — `((X'WX)⁻¹)_jj` for each target, in the caller's units
+    /// under a column map: `(B(X̃'WX̃)⁻¹Bᵀ)ₜₜ`.
     pub var_diag: &'a [f64],
     /// length T — Wald z² for each target. Compared against `z_crit²` from
     /// `CritValueTable`.
@@ -296,6 +300,37 @@ pub fn glm_irls_fit<'a>(
     // unchanged — byte-identity for offset-free fits.
     offset: Option<&[f64]>,
     scratch: GlmScratch<'a>,
+) -> GlmFitView<'a> {
+    glm_irls_fit_mapped(
+        family,
+        nb_theta,
+        x,
+        y,
+        target_indices,
+        beta_start,
+        prior_w,
+        offset,
+        scratch,
+        ColumnScaling::IDENTITY,
+    )
+}
+
+/// [`glm_irls_fit`] on a design fitted through a column map `B`
+/// (`x̃ = X·B`, `β = B·β̃`). The returned `betas` are β̃, on the design `x`
+/// holds; `var_diag` and `t_sq` are the caller's: `Var(βₜ) = ‖L⁻¹bₜ‖²` with
+/// `bₜ` row `t` of `B`, `t² = βₜ²/Var(βₜ)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn glm_irls_fit_mapped<'a>(
+    family: Family,
+    nb_theta: f64,
+    x: MatRef<'_, f64>,
+    y: &[f64],
+    target_indices: &[u32],
+    beta_start: Option<&[f64]>,
+    prior_w: Option<&[f64]>,
+    offset: Option<&[f64]>,
+    scratch: GlmScratch<'a>,
+    map: &ColumnScaling,
 ) -> GlmFitView<'a> {
     let n = x.nrows();
     let p = x.ncols();
@@ -907,7 +942,8 @@ pub fn glm_irls_fit<'a>(
         }
     }
 
-    // Per-target Var(β̂_j) = ((X'WX)⁻¹)_jj — see `ols::triangular_solve_norm_sq`
+    // Per-target Var(β̂ₜ) = (B(X̃'WX̃)⁻¹Bᵀ)ₜₜ = ‖L⁻¹bₜ‖², bₜ row t of the column
+    // map B (eₜ on an unmapped design) — see `ols::triangular_solve_norm_sq`
     // for the forward-solve identity (no σ̂² scaling here: under Bernoulli the
     // score covariance is (X'WX)⁻¹ directly).
     for (out_idx, &tj) in target_indices.iter().enumerate() {
@@ -917,14 +953,14 @@ pub fn glm_irls_fit<'a>(
         }
         let norm_sq = triangular_solve_norm_sq(
             irls_l.rb(),
-            |i| if i == tj { 1.0 } else { 0.0 },
+            |i| map.rhs(tj, i),
             irls_u_scratch,
             p,
             false, // lower-triangular L: row access factor[(i, k)]
         );
         irls_var_diag[out_idx] = norm_sq;
         if norm_sq > FLOAT_NEAR_ZERO && norm_sq.is_finite() {
-            let beta_j = irls_betas[tj];
+            let beta_j = map.beta_coef(tj, &irls_betas[..p]);
             irls_t_sq[out_idx] = (beta_j * beta_j) / norm_sq;
         } else {
             irls_t_sq[out_idx] = f64::NAN;
