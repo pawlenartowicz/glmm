@@ -45,7 +45,6 @@ pub(crate) enum BetaStep<'a> {
         // `Some` = exact Laplace profile (`BetaMode::ProfileExact`); `None` = the PQL
         // border, verbatim. Set only by `laplace_deviance`.
         exact: Option<&'a mut ExactProfileBufs>,
-        xtwx: &'a mut Mat<f64>,      // p×p  C = X'WX          (ws.border.xtwx)
         xtwm: &'a mut Mat<f64>,      // p×k  B' = X'WM         (ws.border.xtwm)
         ainv_mtwx: &'a mut Mat<f64>, // k×p  T = A⁻¹B          (ws.border.ainv_mtwx)
         schur: &'a mut Mat<f64>,     // p×p  S_β               (ws.border.schur)
@@ -63,7 +62,7 @@ pub(crate) enum BetaStep<'a> {
 /// of a [`DualStep`] twin sits behind `dual.observed`, the same condition
 /// `observed` carries here, so a canonical link never touches one. On a large
 /// crossed shape the twins are the biggest buffers in the scratch
-/// (`obs_coupling` is `q_core·s·e` elements, 45 `f64` each at
+/// (`obs_schur_blk` is `e²` elements, 45 `f64` each at
 /// `HyperDual<8, 36>`), and sizing them off the fit keeps that allocation and
 /// its first-touch page faults off every canonical fit.
 pub(crate) fn obs_len(observed: bool, len: usize) -> usize {
@@ -120,23 +119,20 @@ pub(crate) struct DualStep<T> {
     /// same per-cluster lower-triangle layout, scattered from `W_obs`.
     /// Untouched when `observed` is false and on the blocked path.
     pub(crate) obs_core_blocks: Vec<T>,
-    /// `(q_core · s · e).max(1)` twin of `coupling`, `C_obs[f·q_core·e + local·e + b]`.
-    /// Shares the `coup_cols`/`coup_ptr` CSR pattern with the Fisher coupling:
-    /// the pattern is a function of the design and the θ-pin mask, not of `W`.
+    /// Twin of `coupling`, same compact layout and length
+    /// ([`coupling_len`](crate::glmm::workspace::coupling_len)). Shares the
+    /// `coup_cols`/`coup_ptr`/`coup_pos` pattern with the Fisher coupling: the
+    /// pattern is a function of the design and the θ-pin mask, not of `W`.
     pub(crate) obs_coupling: Vec<T>,
     /// `(e²).max(1)` twin of `schur_blk`, lower triangle.
     pub(crate) obs_schur_blk: Vec<T>,
-    /// len `k_total`. The observed right-hand side in the `a_rhs` packing —
-    /// `[f·q_core + local | k_family + b]` on the structured-extras path,
-    /// `f·q_p + local` on the blocked one — then `u_obs = A_obs⁻¹ rhs` in
-    /// place. Both paths stage the twin's right-hand side here so the Fisher
-    /// `a_rhs` is free to carry its own fold.
+    /// len `k_total`. The observed step's right-hand side in the `a_rhs`
+    /// packing — `[f·q_core + local | k_family + b]` on the structured-extras
+    /// path, `f·q_p + local` on the blocked one — then `δu_obs = A_obs⁻¹ rhs`
+    /// in place. The increment right-hand side `M'ρ − u` does not depend on
+    /// the weight, so this is a copy of the Fisher one, kept apart because
+    /// the Fisher solve overwrites `a_rhs`.
     pub(crate) obs_rhs: Vec<T>,
-    /// len `n`. Per-row observed IRLS residual `w_obs,i·(Mu)ᵢ + W·working_residᵢ`.
-    /// The structured kernel folds `(A − I)u` into its residual before the
-    /// scatter, so the observed right-hand side cannot be recovered from
-    /// `a_rhs` and needs its own residual, formed while `mu` still holds `(Mu)ᵢ`.
-    pub(crate) obs_resid: Vec<T>,
     /// Do not exit before this many steps have run.
     pub(crate) min_iters: usize,
     /// Written by the solve: true iff every step of every block was an
@@ -304,10 +300,11 @@ pub(crate) struct ExactProfileBufs {
     /// triangle would cost the row loop a branch). Rebuilt with `tail_inv`,
     /// every exact-mode structured iteration.
     pub(crate) tail_g: Vec<f64>,
-    /// `s·q_core·e`, `H_f[local][b]` at `f·q_core·e + local·e + b` — the same
-    /// indexing as the structured kernel's `coupling`, so the row site reuses
-    /// that arithmetic verbatim: `H_f = C_f S⁻¹`, written and read only on
-    /// cluster `f`'s coupling columns. Rebuilt with `tail_inv`.
+    /// `H_f = C_f S⁻¹` on cluster `f`'s coupling columns only, in `coupling`'s
+    /// compact layout: `H_f[local][cols_f[j]]` at
+    /// `q_core·coup_ptr[f] + local·|cols_f| + j`, length
+    /// [`coupling_len`](crate::glmm::workspace::coupling_len). Rebuilt with
+    /// `tail_inv`.
     pub(crate) tail_h: Vec<f64>,
     /// f64 mirror of THIS iterate's per-cluster factor, filled once per exact
     /// block and read by every pass below it: `s·q²` in `a_blocks` layout on the
@@ -348,7 +345,9 @@ pub(crate) struct ExactProfileBufs {
     /// set when a solve's trouble switched it on, cleared when a later solve
     /// measures that it barely changes the step ([`BorderTrust::wants_curvature`]).
     /// Reset per fit, so a fit's path never depends on an earlier fit that used
-    /// the same workspace.
+    /// the same workspace. The warm-start guard clears it before each of its
+    /// two solves and leaves the search the memory of the solve it picked
+    /// (`fit_glmm`), so the guard's other candidate never reaches the search.
     pub(crate) curv_memory: bool,
     /// p×p factor and len-p step of the plain `S_β` step, for that measurement
     /// ([`border_solve`]).
@@ -463,17 +462,18 @@ pub(crate) fn row_weight_eta_curv(
 /// The three terms of a structured row's crossed-tail leverage
 /// `rᵢ'S⁻¹rᵢ = yᵢ'G_f yᵢ − 2·yᵢ'(H_f tᵢ) + tᵢ'S⁻¹tᵢ`, returned as
 /// `(yᵢ'G_f yᵢ, yᵢ'(H_f tᵢ), tᵢ'S⁻¹tᵢ)`: `yc = A_f⁻¹m_c`, `tail_g_f` cluster
-/// `f`'s `G_f` (`q_core×q_core`), `tail_h` the `H_f` buffer with `coup` its
-/// cluster offset, `cols`/`vals` the row's own crossed entries `tᵢ`. The
-/// derivation and the index conventions are at pass A of
+/// `f`'s `G_f` (`q_core×q_core`), `tail_h_f` cluster `f`'s compact `H_f`
+/// (`q_core × |cols_f|`, row-major over `cols_f`, the cluster's sorted coupling
+/// columns), `cols`/`vals` the row's own crossed entries `tᵢ`, each one of
+/// `cols_f`. The derivation and the index conventions are at pass A of
 /// `pirls_solve_blocked_extras`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn row_tail_terms<T: Scalar>(
     yc: &[f64],
     qc: usize,
     tail_g_f: &[f64],
-    tail_h: &[f64],
-    coup: usize,
+    tail_h_f: &[f64],
+    cols_f: &[u32],
     e: usize,
     cols: &[u32],
     vals: &[T],
@@ -488,11 +488,15 @@ pub(crate) fn row_tail_terms<T: Scalar>(
         t_gg += yc[l1] * inner;
     }
     let mut t_ght = 0.0;
+    let nc = cols_f.len();
     for (&b, v) in cols.iter().zip(vals) {
-        let b = b as usize;
+        // support(tᵢ) ⊆ cols_f: see the row loop in pass A.
+        let Ok(j) = cols_f.binary_search(&b) else {
+            continue;
+        };
         let mut inner = 0.0;
         for l in 0..qc {
-            inner += yc[l] * tail_h[coup + l * e + b];
+            inner += yc[l] * tail_h_f[l * nc + j];
         }
         t_ght += v.value() * inner;
     }
@@ -971,6 +975,100 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// `schur = Σᵢ wᵢ·rᵢrᵢᵀ + TᵀT`: the β information
+/// `S = X'W̃X − X'W̃M·T`, with `T = A⁻¹M'W̃X` (`t`, `k×p`) and
+/// `rᵢ = xᵢ − Tᵀmᵢ`, the residual of design row `i`, in row `i` of `r` (`n×p`,
+/// each layout fills it). The two forms are equal (`A = M'W̃M + I`,
+/// `AT = M'W̃X`), but the subtraction cancels when a column of `X` lies nearly
+/// in the span of `M` at large `θ²·wᵢ` (a cluster-level covariate under huge
+/// counts or trial weights): its error is `ε·θ²·Σwᵢ` relative, measured 4e-5
+/// on the Rx SEs at `θ²·Σwᵢ ≈ 1e11`, tens of percent at 1e15, and a non-PD `S`
+/// beyond. In this form an error `δT` in the solve moves `S` by `δTᵀAδT`
+/// only (`M'W̃r = T` cancels the first-order terms), and rounding in `rᵢ`
+/// costs `ε·|xᵢ|·|rᵢ|`, small exactly where the subtraction loses its digits.
+/// The `p×p` loop fills the lower triangle and mirrors it: `w` may hold
+/// negative observed-information entries (non-canonical links), which rules
+/// out a `√w`-scaled GEMM. Shared by the Rx Schur fills (`se.rs`) and the
+/// Profile border ([`residual_border`]).
+pub(crate) fn schur_from_residuals(
+    w: impl Fn(usize) -> f64,
+    r: MatRef<f64>,
+    t: MatRef<f64>,
+    schur: &mut Mat<f64>,
+) {
+    let (n, p, k) = (r.nrows(), r.ncols(), t.nrows());
+    for a in 0..p {
+        for b in 0..=a {
+            let mut s = 0.0;
+            for i in 0..n {
+                s += w(i) * r[(i, a)] * r[(i, b)];
+            }
+            for j in 0..k {
+                s += t[(j, a)] * t[(j, b)];
+            }
+            schur[(a, b)] = s;
+            schur[(b, a)] = s;
+        }
+    }
+}
+
+/// The Profile β-border's `S_β` ([`schur_from_residuals`]) and right-hand side
+/// `rhs = Σᵢ ρᵢ·rᵢ + Tᵀu`, from the residual rows `r` and `T = A⁻¹M'WX` the
+/// layout formed this iteration, the row scores `ρᵢ` and the iterate `u` the
+/// u-step started from. `rhs` is `X'ρ − B'δu₀` for that step,
+/// `δu₀ = A⁻¹(M'ρ − u)`, without the subtraction: where a column of `X` lies
+/// nearly in the span of `M` at large `θ²·Σwᵢ`, `X'ρ` and `B'δu₀` agree to
+/// all but their last `ε·Σwᵢ`, which is then the whole remainder. Measured on
+/// a Poisson `y ~ z + (1|g)` with a cluster-level `z` at counts near `e³³`:
+/// the subtraction form leaves `S_β` and `rhs` as rounding noise (a non-PD
+/// `S_β`, every exact-profile solve fails); with only `S_β` in this form the
+/// fit still falls back; with both it converges at the optimum up to `e⁴⁰`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn residual_border(
+    w: impl Fn(usize) -> f64,
+    rho: impl Fn(usize) -> f64,
+    r: MatRef<f64>,
+    t: MatRef<f64>,
+    u: impl Fn(usize) -> f64,
+    schur: &mut Mat<f64>,
+    rhs: &mut [f64],
+) {
+    schur_from_residuals(w, r, t, schur);
+    let (n, p, k) = (r.nrows(), r.ncols(), t.nrows());
+    rhs[..p].fill(0.0);
+    for i in 0..n {
+        let ri = rho(i);
+        for a in 0..p {
+            rhs[a] += ri * r[(i, a)];
+        }
+    }
+    for j in 0..k {
+        let uj = u(j);
+        for a in 0..p {
+            rhs[a] += t[(j, a)] * uj;
+        }
+    }
+}
+
+/// Row `i`'s score `ρᵢ` on the Profile border's right-hand side: logit's
+/// `wᵢ(yᵢ − μᵢ)`, `row_score` with the prior weight otherwise — the residual
+/// the u-step's right-hand side scatters.
+pub(crate) fn profile_row_score(
+    family: Family,
+    nb_theta: f64,
+    y: f64,
+    prior_w: f64,
+    eta: f64,
+    prob: f64,
+) -> f64 {
+    match family {
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        } => prior_w * (y - prob),
+        other => crate::family::row_score(other, nb_theta, y, prior_w, eta, prob),
+    }
+}
+
 fn llt_factor(m: &mut Mat<f64>, mem: &mut MemBuffer) -> bool {
     cholesky_in_place(
         m.as_mut(),
@@ -1226,8 +1324,7 @@ pub(crate) fn block_forward_solve<T: Scalar>(l: &[T], q: usize, m: &[T], t: &mut
 /// predictor). Called once at entry of each PIRLS solve and, in `BetaStep::Profile`,
 /// after every β update (the accepted δβ step and each β halving) — the trial
 /// evaluation at the top of the loop reads `eta_fixed`, so it must track the
-/// current β. `offset` is `FitOptions::offset` (`None` ⇒ this function is
-/// byte-identical to the pre-offset version).
+/// current β. `offset` is `FitOptions::offset` (`None` ⇒ no offset).
 fn refresh_eta_fixed<T: crate::scalar::Scalar>(
     x: MatRef<f64>,
     beta: &[T],
@@ -1251,7 +1348,9 @@ fn refresh_eta_fixed<T: crate::scalar::Scalar>(
 }
 
 /// Per-cluster crossed-column pattern (CSR over f): the union of cluster f's
-/// rows' cross_col entries — exactly the nonzero-column support of C_f.
+/// rows' cross_col entries — exactly the nonzero-column support of C_f — and
+/// `coup_pos`, each row entry's position in its cluster's columns (the slot
+/// the scatter writes in the compact `coupling`).
 /// Counting-sort CSR: counts → prefix → fill (coup_ptr doubles as the write
 /// cursors) → shift cursors back → per-cluster sort + dedup-compact (a
 /// cluster's rows repeat the same crossed level; a duplicate in the list
@@ -1265,6 +1364,7 @@ fn refresh_eta_fixed<T: crate::scalar::Scalar>(
 /// (deviance.rs structured branch) caches it keyed on that mask — which is
 /// `f64`-only for the same reason — and rebuilds on transitions, not per
 /// eval and not blindly per fit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_coupling_csr(
     cluster_ids: &[u32],
     cross_col: &[u32],
@@ -1273,6 +1373,7 @@ pub(crate) fn build_coupling_csr(
     n: usize,
     coup_cols: &mut [u32],
     coup_ptr: &mut [u32],
+    coup_pos: &mut [u32],
 ) {
     let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
     for v in coup_ptr[..s + 1].iter_mut() {
@@ -1315,5 +1416,16 @@ pub(crate) fn build_coupling_csr(
             start = end;
         }
         coup_ptr[s] = write as u32;
+    }
+    for i in 0..n {
+        let f = cluster_ids[i] as usize;
+        let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
+        let cbase = i * g_cap;
+        for z in 0..n_cross[i] as usize {
+            coup_pos[cbase + z] = cols
+                .binary_search(&cross_col[cbase + z])
+                .expect("a row's crossed column is in its cluster's CSR")
+                as u32;
+        }
     }
 }

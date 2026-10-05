@@ -1,0 +1,26 @@
+{
+  "engine": "glmmadaptive",
+  "engine_version": "0.9.7",
+  "machine": "dell-fedora",
+  "date": "2026-10-05T09:19:42+02:00",
+  "glmm_crate_version": "0.4.1",
+  "glmm_git_rev": "e02e7fd897921a6634448ad11a641a8060edb5b9-dirty",
+  "subset": "cells",
+  "timed": 4,
+  "timed_unlocked": false,
+  "no_turbo": "1",
+  "pin_cores": "0-0",
+  "jobs": 1,
+  "loadavg_start": "2.19 2.10 1.73",
+  "r_version": "4.5.3",
+  "julia_version": "1.12.6",
+  "label": "timed-2026-10-05",
+  "cells": 4,
+  "cell_list": [
+    "binb_q2s_g3000p20_bal_base_agq7",
+    "pois_q2s_g3000p20_bal_base_agq7",
+    "gaml_q2s_g3000p20_bal_base_agq7",
+    "nb_q2s_g3000p20_bal_base_agq7"
+  ],
+  "completed_from": null
+}

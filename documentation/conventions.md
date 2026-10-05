@@ -25,9 +25,8 @@ AGQ gate.
 Negative binomial fits carry an extra **outer loop for the shape parameter**
 θ (not to be confused with the covariance θ above): the GLM path alternates a
 fixed-θ inner fit with a profile-θ update, and the GLMM path maximizes the same
-marginal log-likelihood over `ln θ` — as one more coordinate of its outer search
-on the dense route, and by golden-section search around a full inner GLMM fit at
-each candidate on the sparse one. Either way, θ̂ is reported as the fit's
+marginal log-likelihood over `ln θ` as one more coordinate of its outer search,
+on the dense and the sparse route alike. Either way, θ̂ is reported as the fit's
 `dispersion`.
 
 ## Offset
@@ -195,8 +194,7 @@ R), but they are three of six: the full report is `diagnostics.converged`,
     (large, because the data genuinely cannot separate the columns), where an
     older version of this kernel returned `NaN` for the whole fit. Contrast
     `aliased`, which is the genuinely-redundant case — an exactly aliased
-    column is still dropped and reported as `NaN`, matching R. Dense GLMM
-    records no pivot at all.
+    column is still dropped and reported as `NaN`, matching R.
   - `PirlsExhausted`: a GLMM's inner PIRLS solve ran its full iteration cap
     without converging. Observation-only unless it hit the final
     re-evaluation at the converged fit's variance parameters: that is the one
@@ -214,7 +212,8 @@ R), but they are three of six: the full report is `diagnostics.converged`,
     the random-effect stddev SEs (`stddev_se`) stay `NaN`.
 
   `notes` is empty on a clean fit, and an absent note means "not detected,"
-  never "checked and clean": dense GLMM records no pivot at all.
+  never "checked and clean": a fit that formed no factor (most failed fits)
+  records no pivot.
 
 If a fit comes back with `converged == false` or `singular == true`, see
 [`troubleshooting.md`](troubleshooting.md) for what each flag implies and what

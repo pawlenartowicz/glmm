@@ -13,9 +13,26 @@
 //!   builds `GroupIds`.
 //!
 //! [`lower`] runs both in one call:
-//! ```ignore
+//! ```
+//! # use glmm::formula::{Column, Table};
+//! # use glmm::Family;
+//! # fn main() -> Result<(), glmm::formula::Error> {
+//! # let num = |v: &[f64]| Column::Numeric(v.to_vec());
+//! # let g: Vec<String> = ["a", "a", "b", "b", "c", "c", "d", "d"].map(String::from).into();
+//! # let table = Table {
+//! #     columns: vec![
+//! #         ("y".into(), num(&[1.2, 0.7, 2.3, 1.9, 0.4, 1.1, 2.8, 2.0])),
+//! #         ("x".into(), num(&[0.1, 0.5, 0.9, 0.2, 0.7, 0.3, 0.8, 0.4])),
+//! #         ("z".into(), num(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0])),
+//! #         ("g".into(), Column::factor_from_labels(&g)),
+//! #     ],
+//! #     n: 8,
+//! # };
 //! let lo = glmm::formula::lower("y ~ x*z + (1|g)", &table, Family::Gaussian)?;
 //! let fit = glmm::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+//! # let _ = fit;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Gated by the `formula` cargo feature (on by default). Consumers that need the

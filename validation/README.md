@@ -26,13 +26,15 @@ From `grid/`:
 
 - `engine` is one of `glmm`, `glmm_python`, `glmm_r`, `lme4`, `glmmtmb`,
   `glmmadaptive`, `mixedmodels`.
-- `--fast` restricts the run to the cells tagged `fast` in `manifest.json` (58 of
-  773).
+- `--fast` restricts the run to the cells tagged `fast` in `manifest.json` (117 of
+  795).
 - `--timed[=N]` times every fit: N samples, the first discarded, median of the
   rest. It implies `--fast` and `--jobs 1`, records `no_turbo`, and **refuses to
   start on an unlocked clock** unless `--timed-unlocked` is given, in which case
   the run is marked unlocked. Locking the machine is the user's job; the script
-  only records the state.
+  only records the state. It also refuses to start without `taskset`, which pins
+  the one worker to core 0, unless `--timed-unlocked` is given: the worker then
+  runs unpinned (macOS) and the run is marked unlocked.
 - `--jobs N` splits the cell list into N chunks and pins worker *i* with
   `taskset -c i`. The P-cores on this box are 0–5, so N above 6 is refused.
 - `--label TEXT` is the free-text purpose of the run; it goes into

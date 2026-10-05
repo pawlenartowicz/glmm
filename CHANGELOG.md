@@ -22,6 +22,16 @@ severe warning.
 
 ### Changed
 
+- **A Gamma GLMM with the Laplace approximation now profiles the fixed effects
+  out exactly**, as binomial, Poisson and negative-binomial GLMMs already did:
+  the outer search runs over the variance parameters and `ln φ` only. On the
+  accuracy grid's Gamma cells the deviance moves by at most 2.6e-7 and the
+  search takes about a third fewer evaluations. On a Gamma-inverse design whose
+  cluster means span several decades, the joint search over the fixed effects
+  reported `converged` 21 to 30 deviance units above the optimum; the profiled
+  search reaches the optimum on the milder of these designs and reports
+  `converged = false` on the others. AGQ and packed-layout Gamma fits keep the
+  joint search.
 - **`stddev_se` on a random-slope block (q ≥ 2) is the SE of the reported
   stddev `√Σ_kk`**, at each stddev's diagonal slot of the θ layout, where it
   was the SE of that Cholesky entry; the off-diagonal slots, and a stddev of
@@ -203,9 +213,166 @@ severe warning.
   message as R. R shows the kernel's own message for an intercept-free
   random-effect term, as Python does. `documentation/warnings.md` now also
   lists every error.
+- **The per-draw column statistics and design fill take fewer instructions**, with
+  every result bit-identical. The 0/1, all-ones and constant tests of each column
+  stop at the first row that fails them, the 0/1 test is one comparison without a
+  branch, and the two summation passes keep every column's row order. On the loop
+  tier (`fit_on`, warm start, instructions per fit on x86, Mac M4 in brackets):
+  OLS at n = 5000 −28% (−37%), a logit GLM at n = 5000 −15% (−19%), a
+  random-intercept LMM at n = 4000 −11% (−10%), random-slope and crossed LMMs
+  −5% and −7% (−5%).
+- **Each outer search starts at a radius chosen for its kind of start**, where
+  every search started at 0.1: the LMM from the blind start at 0.5, GLMM stage 1
+  and the `Joint` route at 0.2, the joint polish after stage 1 at 0.03 (0.1 when
+  stage 1 ends with a variance component near zero), and a θ-only search from a
+  caller's start at 0.1 as before. Fits reach the same optimum in fewer
+  evaluations: on x86, 0.81 of them in total on 244 cold fits of the accuracy
+  grid (LMM cells 0.86, GLMM families 0.46 to 0.93) and 0.85 on its fast
+  subset, with no convergence status changed. Results move within the
+  optimizer's stopping tolerance, and the pinned tests that moved are re-pinned.
+  The radius of the non-finite-evaluation convergence check stays 0.1.
+- **The negative-binomial GLMM route reuses its workspace on the loop tier,
+  and a serial blocked or structured GLMM fit no longer starts a rayon thread
+  pool.** `fit_on` on an NB GLMM keeps one kernel workspace across draws, as
+  the other GLMM families do; serial vector AGQ builds its per-cluster row
+  index once per fit; the Cholesky factorizations of the GLMM post-fit step on
+  the blocked and structured layouts, the GLM IRLS and OLS β solves and the
+  LMM joint Wald test run serially with stack scratch, where they read faer's
+  global parallelism setting and so started rayon's pool in every process.
+  Every result is bit-identical.
+- **The GLMM PIRLS solve takes about 17 to 46% fewer instructions per fit
+  (x86) on binomial, Poisson and negative-binomial random-intercept and
+  random-slope fits that take the exact β-profile route**, with every result
+  bit-identical. Gamma fits and adaptive-quadrature fits do not take this
+  route and do not change. The β-profiled solve reads a row-major copy of the
+  design and forms the random-effect blocks, the β gradient and the border's
+  `M'WX` in one pass over the rows, with the per-row work unrolled for up to 8
+  fixed effects. Measured on the loop tier (x86, instructions per warm fit):
+  logistic random intercept −46%, Poisson −39%, random slope −27%, negative
+  binomial −17%, nested −13%.
+- **The GLMM PIRLS border forms `X'WX` in its row pass instead of a matrix
+  product**, a further 5.6 points of instructions on logistic
+  random-intercept fits and 3.8 on random-slope fits (2.7 on Poisson; x86).
+  The products are associated and summed in another order, so results move
+  by round-off (objectives by at most 5.0e-10 on the loop-tier shapes,
+  standard errors by 1.2e-6 relative).
+- **The exact Hessian of a crossed GLMM forms its crossed-effect terms once
+  per cluster instead of once per row**, through the per-cluster products
+  the PIRLS solve already uses. On a 50 × 40 crossed logistic fit a warm fit
+  takes about 36% fewer instructions (x86). Standard errors move by round-off
+  (4.4e-16 relative).
+- **The negative-binomial GLMM's `ln θ_NB` row of the Hessian takes its mixed
+  entries from the exact gradient**: a central difference in `ln θ_NB` of the
+  Laplace gradient replaces the four-point difference of the objective, so the
+  row costs two mode solves and two gradient passes instead of `4m` solves
+  (about 24% of a warm NB GLMM fit's instructions, x86), and its round-off
+  error is divided by the step rather than by its square. The diagonal entry
+  and the fallback where the exact gradient is not available (AGQ and the
+  packed layout) are unchanged. Standard errors move by at most 2.1e-7
+  relative on the loop-tier shapes (x86).
+- **On log links the PIRLS score and curvature read `dμ/dη = μ` from the
+  fitted mean** instead of a second exponential per row (Poisson, negative
+  binomial, Gamma and inverse-Gaussian with a log link): Poisson GLMMs take
+  about 13% fewer instructions per fit, Gamma about 14% (x86). The mean comes
+  from the vectorized exponential, so results move by round-off (objectives by
+  at most 2.8e-8 on the loop-tier shapes, a Gamma fit, where the search stops
+  elsewhere inside its tolerance).
+- **The negative-binomial GLMM evaluates its saturated log-likelihood once per
+  distinct count**, carrying the finite sum `Σ ln(θ+k)` up the sorted counts,
+  instead of once per row: each count's term is unchanged to the last bit and
+  only the sum over rows is regrouped, so objectives move by round-off.
+- **The negative-binomial deviance takes its logarithms from a vectorized
+  `ln`** (within 2 ULP of the system `ln`, on the normal range), three
+  per row, so an NB GLMM fit takes about 15% fewer instructions (x86).
+  Results move by round-off. A NaN mean still gives a NaN deviance.
+- **A dense LMM fit spends far fewer instructions orthogonalizing and
+  accumulating its design**, with every result bit-identical. The Givens pass
+  and the sufficient-statistics accumulation read the rows through a small
+  row-major tile, keep the hot state on the stack, and have fixed-width
+  instances for the common design widths and a unit-weight instance; every
+  rotation and every sum keeps its order. On the loop tier at n = 4000 (x86,
+  instructions per redraw fit): a random-intercept LMM about −55% (0.448×),
+  random-slope LMMs about −30% (0.695×), crossed LMMs about −33% (0.672×); at
+  the small sizes 0.69× to 0.93×. On a Mac M4: a random-intercept LMM about
+  −60 to −65%, random-slope and crossed LMMs about −35%.
+- **A dense LMM fit on a well-conditioned design reads its fixed-effect factor
+  off the Gram it accumulates anyway**, instead of a separate Givens pass over
+  the rows. In exact arithmetic the two give the same factor; results move by
+  round-off (at most 6.0e-10 in deviance on the accuracy grid's fast cells, no
+  flag changes). A design with a pivot ratio under `GRAM_PIVOT_MIN` = 1e-3
+  keeps the Givens pass and its results bit for bit. Loop tier at n = 4000
+  (x86, instructions per redraw fit): about −27% more on a random-intercept
+  LMM, −8% on a random-slope LMM, −10% on a crossed LMM. On a Mac M4: about
+  −25% on a random-intercept LMM, −6% on random-slope and crossed LMMs.
+- **A warm GLMM fit continues from the start guard's own solve.** The guard
+  solves the caller's θ₀ and the blind start each the way a fit's first
+  evaluation is solved, and the search now takes the winning solve, with the
+  curvature state that solve left, as its first evaluation instead of solving
+  the point again. A warm fit with a stage 1 does one Laplace evaluation less
+  (x86: 3 to 9% of the instructions of a warm loop-tier fit on the exact-route
+  shapes), and a warm fit the guard sends to the blind start now runs the
+  cold fit's own search. Warm results move by round-off; on the
+  far-warm-start scan two of 1200 far starts end at another converged point,
+  documented next to the scan (`src/fit/glmm_tests.rs`). Cold fits are
+  unchanged.
+- **A warm GLMM fit whose θ is the blind start skips the start guard.** The
+  guard compares the caller's θ₀ with the blind θ₀ at the same β₀, so when the
+  two are the same point there is nothing to compare; the fit now runs as a
+  cold fit from the caller's β₀ (for example a random-intercept fit started at
+  `[1; n_θ]`). The check reads θ on the fitted design, after random-slope
+  columns are rescaled, so on a random-slope model a start of ones is in
+  general not the blind start. x86: 2.5 to 8% fewer instructions on such
+  loop-tier fits (logit RI 7 to 8%, probit 7%, Poisson 7 to 8%, crossed and
+  nested 5%, NB 3%, Gamma 2.5%), the same answers bit for bit on every
+  loop-tier draw. Starts at any other θ are unchanged.
+- **The `ExactProfile` search solves its early evaluations to a looser PIRLS
+  tolerance, tied to the optimizer's trust radius**: `clamp(1e-2·ρ², pirls_tol,
+  1e-5)` while the radius ρ is large, full tolerance on the first evaluation and
+  once ρ is within 10× of its end value, and the incumbent re-solved at full
+  tolerance before it is reported. x86: 5 to 22% fewer instructions per
+  loop-tier fit on the exact route from a cold start, 4 to 21% from a warm
+  one, about the same number of outer evaluations (0.98 to 1.02 on the loop
+  shapes, x86), results moved by round-off. Needs `bobyqa` 0.3.1
+  (`Bobyqa::minimize_with_radius`), now the floor.
+- **Separation is reported the same way everywhere.** A GLM whose deviance
+  stops changing while its last step still moves some row's linear predictor by
+  more than 0.01 now reports `converged = false`: the data are separated, or a
+  category has only zero counts. The coefficients of the last step are kept and
+  the standard errors are NaN. A GLMM whose fixed effects alone separate the data
+  now stops before its search with the same outcome, and the Python and R
+  packages give it the `glm_diverged` message. Before, depending on `nagq`, such
+  a GLMM could report `converged = true` with a huge coefficient, or use its
+  whole evaluation budget.
+- **Strong but ordinary binomial fits are no longer refused.** The check that
+  refused a binomial GLM when more than half its rows had a Fisher weight below
+  1e-5 is removed. It refused ordinary cloglog fits, and logit or probit fits
+  with a strong predictor, that R fits without trouble.
+- **An exact-profile GLMM search that ends next to a zero random-effect column
+  checks for a saddle there.** The column is doubled while the deviance falls,
+  and the search restarts from the better point. On the accuracy grid one cell
+  moves (`pois_q2sx2_g3000p20_bal_boundary`, 4.0e-6 lower deviance) and 50
+  near-singular cells take 1 to 4 more evaluations; no flags change.
+- **A GLMM whose standard errors cannot be computed keeps its estimates.**
+  When the information matrix of the fixed effects is not positive definite
+  to rounding at the search's end point (the RX Schur
+  complement fails, and under `WaldSe::Hessian` the joint Hessian before it),
+  the fit used to be thrown away whole: β̂, θ̂ and the deviance were NaN and
+  `converged` was false. Now only `se`, `vcov`, `stddev_se` and the Wald
+  statistics are NaN; the estimates, the deviance and `converged` are the
+  search's own, and the new `Note::SeUnavailable` says why (`kind`
+  `se_unavailable`; Python `glmm.SeUnavailableWarning`, R class
+  `fastglmm_se_unavailable`). `GlmmFit::se_unavailable` and
+  `FitDiagnostics::se_unavailable` (`loop_advanced`) carry it.
 
 ### Added
 
+- **GLMM fits raise `Note::IllConditioned`** (kind `ill_conditioned`, the
+  "Nearly collinear columns" caution in both ports), as OLS, GLM and LMM fits
+  already did. The pivot is that of the fixed-effect information the standard
+  errors come from: the Rx Schur complement under `WaldSe::Rx`, the
+  fixed-effect block of the joint Hessian under `WaldSe::Hessian`. The floor is
+  the LMM's 1e-12. On the loop tier, `FitDiagnostics::pivot`, `pivot_col` and
+  `ill_conditioned` now carry real values on the GLMM route.
 - **`nagq > 1` on negative-binomial and Gamma GLMMs.** Adaptive quadrature was
   refused for both before.
 - **`m.warnings` / `m$warnings`:** every warning a fit raised, with `tier`,
@@ -239,6 +406,23 @@ severe warning.
   filter its columns down before conversion instead of touching one the
   formula never uses. The Python port's `fit()` calls it through
   `_native.formula_columns`.
+- **GLMM fits raise `Note::PrecisionLimited`** (kind `precision_limited`, the
+  "Numbers too large for full precision" caution; Python
+  `glmm.PrecisionLimitedWarning`, R class `fastglmm_precision_limited`) when
+  the deviance is too large for f64 to resolve the optimum. The rounding error
+  of the deviance is estimated as `ε·(|D| + tr_x)`, where `tr_x` is the trace
+  of `M'WM` over the extra grouping factors' columns and bounds the rounding of
+  `log|A|`. The note is raised above 0.01 deviance units, about a tenth of a
+  standard error in θ̂. That happens when the deviance is near 1e13 or more (a
+  model that misses a large effect at counts in the billions), and on crossed
+  or nested intercepts at counts near e³⁰. Estimates and `converged` are
+  unchanged. On the loop tier, `GlmmFit::precision_limited` and
+  `FitDiagnostics::precision_limited` carry it.
+- **GLM and GLMM fits raise `Note::Separated`** (kind `separated`) when the
+  fixed-effects IRLS stops on separation. On a GLMM that is the GLM the search
+  starts from, so the search never runs. The ports raise no warning of their
+  own for it: they read it to choose the non-convergence message. On the loop
+  tier, `GlmmFit::separated` and `FitDiagnostics::separated` carry it.
 
 ### Removed
 
@@ -270,9 +454,228 @@ Breaking. MCPower calls none of these, and the crate and the ports no longer do.
   prior-weighted root mean square. The same model; on data far from standardized the search
   is as sensitive to units as the raw design makes it. `fit_cold` and
   `fit_warm` always standardize.
+- **`FitWorkspace::set_fixed_design(bool)`**, default `false`: a promise that
+  the following `fit_on` calls pass the same design, group ids and weights,
+  with only the response (and offset) changing. The design-only setup is then
+  computed once: on a random-intercept LMM at n = 4000 a draw takes about a
+  quarter fewer instructions than without the promise (x86). Results are
+  bit-identical; a debug build panics if the design changes under the promise.
+- **`GlmFitView::separated`**: true when a binomial, Poisson or
+  negative-binomial GLM ended on the separation stop, or ended without settling
+  with a linear predictor more than 30 from its null-model value that was still
+  moving.
 
 ### Fixed
 
+- **GLMs at very large counts now converge.** Above means of about 1e5,
+  rounding error in the deviance kept the stopping rule from firing, so Poisson
+  and negative-binomial fits reported not converged at the right answer. The fit
+  now also stops when the last step moved no linear predictor by more than
+  rounding error.
+- **Poisson, negative-binomial, binomial and Gamma GLMMs keep converging at very
+  large counts or trial weights.** The unit deviance took its logs as
+  `ln y − ln μ`, whose round-off, times a count near 1e10, was larger than the
+  inner solve's stopping band and made the outer search's objective noisy. It now
+  takes them as `ln(1 + (y − μ)/μ)`. Poisson GLMMs at means near e²³ to e²⁸ that
+  failed now converge; other fits move by round-off.
+- **Negative-binomial GLMMs at counts near 1e10 now converge, and NB fits keep
+  their digits at large counts.** The NB unit deviance was the difference of
+  two terms, each about the size of `y − μ`, and at counts near 1e10 their
+  round-off was larger than the inner solve's stopping band: 2 of 3 test fits
+  failed. The deviance is now written so that neither term is larger than
+  needed. The NB log-likelihood's `lnΓ(y + θ) − lnΓ(θ) − lnΓ(y + 1)` was built
+  from parts the size of `y·ln y`, which left the outer search's objective no
+  finer than 1.6e-2 on 200 counts near 1e10; it now comes from Stirling's
+  series, with every part the size of `ln y`. Every NB fit moves by round-off.
+  A non-integer NB response now enters `lnΓ` as it is, as in `MASS`; it was
+  rounded to a count there before.
+- **Binomial offsets near ±30 no longer trip the divergence check.** It now
+  measures the linear predictor from the offset, as on the log links.
+- **A GLM whose linear predictor passes ±30 at extreme predictor values now
+  fits.** The check used to stop any fit once some row's linear predictor
+  moved more than 30 from its null-model value, which also stopped good fits
+  over a wide predictor range (logit β = 1.6 over x in ±25), and the GLMMs
+  seeded from them. Crossing 30 now stops nothing. A fit that ends without
+  settling, with a linear predictor past 30 that is still moving, is reported as
+  separated, as before.
+- **A GLM on nearly collinear predictors converges and keeps its digits.** Each
+  IRLS pass solved for β from the Gram `X'WX`, which squares how badly
+  conditioned X is: with two predictors entangled to about 1e-6 (condition
+  number 2e6 after standardization), logit and Poisson fits ended not converged
+  with NaN SEs, and a probit fit converged 4e-4 off. When the Gram's pivot ratio
+  is below 1e-3, each pass now solves for the step instead, and the SEs come
+  from a QR of the weighted design, as on the OLS route: the same fits match a
+  well-conditioned reparameterization to about 1e-10. Better-conditioned
+  designs take the old path unchanged, bit for bit.
+- **A negative-binomial GLM at very large counts settles its θ.** Each
+  alternation round restarted the β fit from scratch and, at counts near 1e5,
+  stopped up to one Fisher step short of the maximum at a point that differed
+  between two nearby θ, so θ̂ alternated between two values until the round cap
+  and the fit carried an `NbShapeUnsettled` note (8 of 400 simulated fits).
+  Each round now starts from the last β, as `MASS::glm.nb` does. NB fits move
+  within the stopping tolerance.
+- **Gamma 1/μ and inverse-Gaussian 1/μ² GLMs with an intercept start at the
+  null-model β.** They started from a per-row linear predictor with no matching
+  β, so a first step that left the link's domain could not be halved back and
+  the fit ended not converged, although the maximum lies inside the domain. The
+  fit now starts with the intercept at link(ȳ) and every slope 0, as R's
+  `glm` does when given that start, and reaches R's maximum. Without an
+  intercept the per-row start stays.
+- **Standard errors and test statistics no longer turn NaN in small units.** A
+  Cholesky pivot below 1e-30, or a variance or σ̂² below 1e-30, was treated as
+  zero. Those numbers carry the units of the data: an inverse-Gaussian/log GLM
+  at y·1e120 had the right β and φ̂ but NaN SEs, as did a Gamma/log GLM with
+  every weight 1e-70; the OLS and GLM loop-tier t² and contrast t², and the
+  LMM joint Wald statistic, were NaN with y in units of 1e-20. Only an exact
+  zero now counts as zero. Other fits are unchanged.
+- **A GLM halves a step that makes the deviance worse**, up to 16 times per
+  iteration, as R package glm2 does. Before, a Fisher step could run off, and
+  an inverse-Gaussian or Gamma fit on the log link ended not converged although
+  a finite maximum exists. Logit and Poisson fits are unchanged; probit,
+  cloglog, Gamma, inverse-Gaussian and negative-binomial fits that converged
+  before move by round-off.
+- **An inverse-Gaussian GLM on the 1/μ² link no longer reports converged at the
+  edge of the link's domain.** A pass whose linear predictor the link cannot
+  evaluate now ends the fit not converged.
+- **Gamma and inverse-Gaussian GLMs no longer depend on the response's units
+  below 1e-10.** The null deviance and the reciprocal-link starting values no
+  longer floor the mean at 1e-10, and the Pearson dispersion no longer over- or
+  underflows at extreme means.
+- **Poisson and aggregated-binomial `logLik` (and AIC/BIC) keep their digits
+  at very large counts.** The saturated constant was built from terms the size of
+  `y·ln y`, about 1e-5 off per row at y = 1e10. It is now accurate to round-off
+  at any count; on ordinary data the value moves by round-off only. Deviance and
+  the fit are unchanged.
+- **`loop_advanced`: `FitView::diagnostics()` on the negative-binomial routes
+  reports the fit's notes.** `ill_conditioned`, `pivot`, `pivot_col`,
+  `pirls_exhausted`, `final_pirls_exhausted`, `hessian_fallback`,
+  `exact_profile_fallback` and `se_unavailable` are now read back from the
+  assembled fit; before, they were always unset there.
+- **Gamma-inverse GLMMs no longer depend on the units of y, and the joint
+  search no longer stops early when the working weights span decades.** A
+  Gamma-inverse fit whose cluster means are far out of scale is searched on a
+  rescaled response. A fit that fails, or ends no lower than the Gamma GLM, is
+  retried in the units of each of the two possible optima (σ = 0 and
+  interior), and reports `converged = false` when a lower point was seen but
+  not reached. After a joint (AGQ or packed) search, one PQL re-solve of β
+  checks the end point; when it is lower, the search runs again with the fixed
+  effects scaled by their information. Before, such fits could report
+  converged several to hundreds of deviance units above the optimum (Gamma
+  inverse with y in other units, Poisson with cluster means 8 to 12 decades
+  apart), or fail. On the accuracy grid's Gamma, AGQ and packed cells, results
+  and evaluation counts are unchanged.
+- **A GLMM whose pinned variance sits in a narrow trough gets one more search.**
+  When pinning a variance component to 0 lowers the deviance by more than
+  1e-7, the fit runs one more joint search from the pinned point with that
+  component held at 0, and keeps it when its deviance is lower. That search
+  scales the fixed effects by their information at the pinned point (one PQL
+  solve). With very precise data (for example Poisson counts near e¹² or
+  higher with a crossed grouping that has no variance, or a random slope whose
+  intercept has no variance), the search could stop with the other variances
+  off their optimum by up to several deviance units (10.6 on the worst
+  simulated random-slope fit, now 0.06), reported as converged. Fits whose pin
+  does not lower the deviance that much, which includes every accuracy-grid
+  cell, are unchanged.
+- **A GLMM variance left at or below 1e-4 is set to 0 only when that does not
+  make the fit worse.** If pinning it raises the deviance more than 1e-6 above
+  the search's best point, the fit is reported at the search's point,
+  converged and not singular. Before, very precise data (for example Poisson
+  counts near e¹⁶ with a true SD of 9e-5) could report a converged, singular
+  fit tens of deviance units worse than the optimum, and worse than the GLM
+  without random effects.
+- **Negative-binomial GLMs resolve θ̂ more closely.** The profile search over
+  `ln θ` now stops at width 1e-7 instead of 1e-4, so θ̂ lands within about 3e-7
+  of the joint maximum-likelihood estimate (up to 3e-5 before). Every NB GLM
+  result moves slightly, and so does every NB GLMM, whose θ search starts from
+  that θ̂. No convergence or singular flag changes on the accuracy grid.
+- **A Gamma 1/μ or inverse-Gaussian 1/μ² GLM without an intercept starts from
+  a column whose values all share one sign**, so a first step that leaves the
+  link's domain is halved back instead of ending the fit. On 400 simulated fits
+  with an interior maximum, the 60 that ended not converged now converge. Fits
+  with an intercept are unchanged.
+- **Python/R: a Gamma 1/μ or inverse-Gaussian 1/μ² fit with response values
+  outside the link's range says so.** When 1/y or 1/y² falls outside 1e-75 to
+  1e75, the `glm_diverged` and `fit_failed` warnings name that cause and suggest
+  rescaling the response or using the log link.
+- **GLMMs at huge counts or trial weights keep their digits in PIRLS.** The
+  conditional-mode step is solved as an increment (`A·δu = M'ρ − u`), and the
+  β-profile border builds `S_β` and its right-hand side from design residual
+  rows instead of subtracting terms of order Σw. Crossed `(1|g)+(1|h)` fits no
+  longer fail with an infinite deviance at counts near e³³, and fits with a
+  cluster-level covariate at such counts converge on the exact profile instead
+  of falling back or ending not converged. Every GLMM result moves by round-off;
+  no convergence or singular flag changes on the accuracy grid.
+- **Binomial rows near μ = 1 keep their digits.** Probit, cloglog and
+  weighted-logit rows with 1 − μ below 1e-4 now take their deviance, score and
+  weights from η. Above μ ≈ 1 − 1e-8 the old μ form lost up to four digits,
+  enough to leave probit and cloglog fits converged up to 6e-5 off the maximum
+  in β.
+- **GLMs on probit, cloglog, Gamma/log, negative-binomial/log and
+  inverse-Gaussian/log take Newton steps** (observed weights), with a Fisher
+  fallback. Fits that Fisher scoring left slow or overflowing now reach the
+  maximum; on simulated sets the not-converged count fell from 19 to 0 of 200
+  (Gamma/log), 21 to 0 (NB/log), 17 to 1 (IG/log) and 15 to 1 (cloglog with
+  high-leverage rows), with no fit going from converged to not converged.
+- **The negative-binomial θ starting value takes the offset into account.**
+  With exposures that differ by decades it used to fall to the lower bound.
+  Results move only by round-off.
+- **A negative-binomial GLMM fitted to data with no overdispersion reaches the
+  upper bound of θ** (the Poisson limit) instead of stopping short of it at θ̂
+  in the thousands with a slightly lower log-likelihood. No accuracy-grid result
+  moves; exact-profile NB fits take one more evaluation.
+- **An exact-fit Gamma GLMM whose search stops just above the dispersion floor
+  is refused** like one that reaches the floor. It used to report
+  `converged = true` with a log-likelihood up to 3.6 below the value at the floor.
+- **Clearer errors for bad input.** A formula with an empty name in an
+  interaction (`y ~ :`, `y ~ *`, `y ~ x:`) is a syntax error; `y ~ :` used to
+  crash with an index error, and the others were fitted as a smaller model.
+  `dispersion`, warm-start values of the wrong length and a non-finite
+  `offset()` term are refused with a message that names the argument, not an
+  internal struct. Python refuses dict columns of different lengths (they were
+  cut to the shortest one when it held a missing value), and R refuses a list
+  column that `as.data.frame` would recycle.
+
+- **OLS and the GLMM Rx standard errors keep their digits on nearly collinear
+  predictors.** Both built their solve from the Gram `X'WX`, which squares how
+  badly conditioned X is: with two predictors entangled to about 1e-6 (condition
+  number 2e6 after standardization), an OLS coefficient and its SE were about
+  3e-4 off and a GLMM Rx variance 9e-5 off a high-precision reference. When the
+  Gram's pivot ratio is below 1e-3, both now refactor on `X·U⁻¹` from a QR of the
+  (prior-weighted) design, as the LMM kernels do, and map back: the same designs
+  are now within 5e-12 (OLS SE) and 2e-12 (Rx variance). Better-conditioned
+  designs take the old path unchanged, bit for bit.
+- **The GLMM Rx standard errors keep their digits at very large counts or
+  trial weights.** The Rx covariance formed the Schur complement
+  `X'WX − X'WZ(Z'WZ+I)⁻¹Z'WX` by subtraction, which cancels when a
+  cluster-level covariate meets a large random-effect variance times a large
+  weight: at counts near e³³ the Rx SEs were about 50% off with no note, and
+  above that the complement could stop being positive definite. It is now
+  summed from the residual rows `x − T'm`, and the same fits match a 60-digit
+  reference to 1e-13. Other fits move by round-off.
+- **The GLMM Hessian standard errors keep their digits on nearly collinear
+  predictors**, on every family and both exact and finite-difference Hessians.
+  The β block of the joint Hessian is a Gram in X: at a condition number of 1e6
+  the Hessian variances were about 5e-4 off, and a finite-difference Hessian
+  (the last fallback) was off by its whole value. When `X'WX` has a pivot ratio
+  below 1e-3, the Hessian is now taken in the fit's own orthogonalized β
+  coordinates and mapped back: the same designs are within 3e-11.
+  Better-conditioned designs take the old path unchanged, bit for bit.
+- **The joint Wald statistic keeps its digits on nearly collinear
+  predictors.** It re-formed the information matrix from its factor, factored
+  it again, inverted it and factored the target block of that inverse: at a
+  condition number of 2e6 it was 2e-4 off for two targets. It is now read from a
+  QR of the per-target columns the standard errors are computed from, on the
+  LMM and on both GLMM SE methods, including the Hessian method's fallback to
+  the Rx covariance: 3e-11 on the same design. On every design the statistic
+  moves by round-off.
+- **A weighted dense LMM fit on a reused loop-tier workspace no longer
+  allocates an n-sized vector of rescaled weights per call**; the workspace
+  keeps it. Results are bit-identical.
+- **A GLMM on a reused loop-tier workspace no longer rebuilds its sparse
+  structures on every draw** when the grouping ids are unchanged (packed and
+  structured layouts, and the negative-binomial route). Allocations per draw on
+  a 40×30 crossed Poisson fit drop from 222 to 23 blocks. Results are
+  bit-identical.
 - **An exact-fit Gaussian mixed model reports an infinite REML criterion on
   every platform.** When the response is an exact linear function of the
   predictors, the last pivot of the blocked factorization is pure round-off, and

@@ -226,14 +226,29 @@ multiplies into the RSS (on InstEval, `N = 73421`, that is 3e-7 on the
 deviance). With `U` a leading intercept column stays exactly 1 and the large-`N`
 error matches the raw-`X` Gram (8e-9 there, against a long-double reference).
 
-The step costs one extra pass over the rows and `O(N·p²)` flops, and no copy of
-`X`. It is always on. When `R` has a zero or non-finite diagonal (an all-zero
-weighted column, fewer rows than columns) `U` stays the identity and the
-kernels see the standardized `X` unorthogonalized. Exactly redundant columns never get here: the
-pre-dispatch alias gate (`detect_aliased`) drops them first.
+The dense kernel reaches `U` in one of two ways. It accumulates its rows once
+on the unorthogonalized `X` and takes the Cholesky factor of the accumulated
+`X'WX`, which in exact arithmetic is the QR's `R` (`X'WX = RᵀQᵀQR = RᵀR`).
+When every pivot ratio `R_jj²/(X'WX)_jj`, the share of column j's weighted
+squared length that the earlier columns do not explain, is at least
+`GRAM_PIVOT_MIN` = 1e-3, it keeps that `U` and maps what it accumulated:
+`X̃'X̃ = D²` exactly, `X̃'y = U⁻ᵀX'y`, each `s` column's `x` part `U⁻ᵀ·Σx`.
+The Gram squares the condition number of `X`, so a pivot at ratio `τ` carries
+the Gram's round-off amplified by about `1/τ`: three digits at the threshold.
+Under it the kernel runs the Givens pass and accumulates again through it, so a
+collinear design gets exactly the `U` of the QR. The sparse kernel always runs
+the Givens pass first and then scatters its rows once through it. A
+well-conditioned design thus costs no extra pass over the rows, and the step
+costs no copy of `X`. It is always on. When `R` has a zero or non-finite
+diagonal (an all-zero weighted column, fewer rows than columns) `U` stays the
+identity and the kernels see the standardized `X` unorthogonalized. On
+`fit_cold` / `fit_warm` the pre-dispatch alias gate (`detect_aliased`) drops
+exactly redundant columns first. On the loop tier they reach the kernel: their
+pivot ratio is at round-off level, so they take the Givens pass.
 
 **Code**: `DesignQr` (`set_from_rows`, `solve_row`, `map_factor`, `map_beta`),
-`LmmSuffStats::set_design_qr` / `add_rows_multi` (`src/lmm/kernel.rs`);
+`LmmSuffStats::set_design_qr` / `add_rows_multi`,
+`LmmSuffStats::orthogonalize_from_gram`, `GRAM_PIVOT_MIN` (`src/lmm/kernel.rs`);
 `accumulate_lmm_rows` (`src/fit/lmm.rs`); `SparseLmmWorkspace::new`
 (`src/sparse/mod.rs`); the back-map in `fit_lmm` (`src/lmm/mod.rs`).
 **Convention**: lme4 and MixedModels.jl factor crossproducts of the raw `X`
@@ -334,17 +349,18 @@ route) is:
 
 | Parameter | Value | Source |
 |---|---|---|
-| `rho_begin` (initial trust radius) | `(0.1 · min diagonal θ₀).min(RHO_BEGIN)` → `0.1` at the cold blind start | `for_cluster_spec_ext` |
-| `RHO_BEGIN` (cap) | `0.5` | `src/lmm/mod.rs` |
+| `rho_begin` (initial trust radius) | `RHO_BEGIN = 0.5` from the blind start; `RHO_BEGIN_WARM = 0.1` from a caller's θ₀, on a second solver built at the first warm fit | `for_cluster_spec_ext`, `fit_lmm` |
 | `rho_end` (final trust radius) | `RHO_END = 1e-6` | `src/lmm/mod.rs` |
 | `npt` (interpolation points) | `2·n_θ + 1` for `n_θ < 3`, else `⌈3·n_θ/2⌉ + 1` (`(3·n_θ).div_ceil(2) + 1`) | `for_cluster_spec_ext` |
 | `max_fun` | `1000·n_θ` (twice PRIMA's default; with the restart trigger at 1/8 of the remaining budget, the first cycle restarts at 750 evaluations for n_θ = 6) | `apply_campaign_overrides` |
 
-`rho_begin` is scaled to `0.1·θ₀` because the eval count is dominated by
-trust-radius shrinkage, not travel distance. It is then capped at `0.5`, the
-value the schedule was measured under; PRIMA nudges any start that lands within
-`rho_begin` of a bound, and the box is `2·THETA_HI` wide on every coordinate, so
-no start is near one. `RHO_END = 1e-6` was measured equivalent to
+The blind start's radius is 0.5 and a warm start's 0.1: a search from far
+needs a wide first model, one from near the optimum spends evaluations on it.
+Measured on aarch64 against 0.1 everywhere, 0.5 takes 0.78 to 0.95 of the
+evaluations per n_θ band on a stratified sample of the Gaussian grid cells and
+0.66 to 0.88 on the widest cells, at the same optimum; from a warm start, 0.1
+is the best of 0.03 to 0.2. PRIMA nudges any start that lands within `rho_begin` of a bound, and
+the box is `2·THETA_HI` wide on every coordinate, so no start is near one. `RHO_END = 1e-6` was measured equivalent to
 `1e-8` on every validation check under the crate's absolute floors, at ~25% fewer
 evals. (The neighbouring constant `GLMM_RHO_END` in the same file is the GLMM
 outer loop's own, separately-swept schedule — it never applies here.)
@@ -353,16 +369,15 @@ The `npt` mid-size (`⌈1.5n⌉+1`, used from `n ≥ 3`) beats Powell's `2n+1` o
 measured dimension ≥ 3; below that it *is* `2n+1`. PRIMA requires
 `n+2 ≤ npt ≤ (n+1)(n+2)/2`, which the formula respects.
 
-One alternate seed exists alongside the shipped schedule: `bobyqa_config`, a
-generic default without the scaled schedule (`RHO_BEGIN`, PRIMA default
-`npt = 2n+1`).
+One alternate seed exists alongside the shipped schedule: `bobyqa_config`
+(tests only), `RHO_BEGIN` with PRIMA's default `npt = 2n+1`.
 
 The dev-only env campaign hooks are no-ops unless set, and are not part of the
 shipped behaviour. `LMM_NPT_FORMULA` and `LMM_MAX_FUN_FORMULA` override single
 numeric knobs.
 
 **Code**: `fit_lmm`, `LmmWorkspace::for_cluster_spec_ext`,
-`bobyqa_config`, constants `RHO_BEGIN`/`RHO_END`/`THETA0`
+`bobyqa_config`, constants `RHO_BEGIN`/`RHO_BEGIN_WARM`/`RHO_END`/`THETA0`
 (`src/lmm/mod.rs`); the external `bobyqa` crate supplies the solver.
 **Convention**: derivative-free BOBYQA over relative-Cholesky θ, as in lme4's
 default `nloptwrap`/`bobyqa` optimiser for `lmer`. **Validation**: sleepstudy
@@ -504,7 +519,8 @@ Wald statistic is `t² = β̂_j² / Var(β̂_j)`. `L_XX` here is the factor alre
 mapped back to `X` (`Uᵀ·L̃_XX`, see
 [Fixed-effect orthogonalization](#fixed-effect-orthogonalization)). SEs are computed only for the columns in
 `FitOptions::target_indices`. A joint Wald χ² over the target set is available via
-the shared `joint_wald_chi_sq` helper (re-Choleskying `X'V⁻¹X = L_XX·L_XXᵀ`).
+the shared `joint_wald_chi_sq` helper, `W = ‖R⁻ᵀβ̂_T‖²/σ̂²` from a QR `C_T = Q·R` of
+the same forward-solve columns `C_T = [L_XX⁻¹bₜ]`, so no Gram is formed.
 
 **Code**: the recovery block in `fit_lmm`, `joint_wald_chi_sq`
 (`src/lmm/mod.rs`). **Convention**:

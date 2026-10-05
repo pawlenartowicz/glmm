@@ -66,6 +66,8 @@ pub trait Scalar:
     fn exp_m1(self) -> Self;
     /// `ln(x)`, `x > 0`.
     fn ln(self) -> Self;
+    /// `ln(1 + x)`, `x > −1`, accurate near zero.
+    fn ln_1p(self) -> Self;
     /// `log(1 + exp(x))`, overflow-safe on both tails.
     fn log1pexp(self) -> Self;
     /// Logistic `1/(1+exp(−x))`, overflow-safe on both tails.
@@ -224,6 +226,10 @@ impl Scalar for f64 {
         f64::ln(self)
     }
     #[inline(always)]
+    fn ln_1p(self) -> f64 {
+        f64::ln_1p(self)
+    }
+    #[inline(always)]
     fn log1pexp(self) -> f64 {
         crate::simd_transcendental::scalar_log1pexp(self)
     }
@@ -279,20 +285,34 @@ impl Scalar for f64 {
             let col = j * dim;
             l_out[col + j..col + dim].copy_from_slice(&a[col + j..col + dim]);
         }
-        let mut mem = MemBuffer::new(cholesky_in_place_scratch::<f64>(
-            dim,
-            Par::Seq,
-            Spec::default(),
-        ));
+        // The factor's scratch comes off a stack buffer when it fits (it does
+        // on every LMM kernel's `q`-sized block: 132 B at the loop shapes'
+        // dims), so a per-eval call does not allocate. A larger request falls
+        // back to a heap `MemBuffer`; the factor is the same either way.
+        let req = cholesky_in_place_scratch::<f64>(dim, Par::Seq, Spec::default());
         let l = faer::MatMut::from_column_major_slice_mut(&mut l_out[..dim * dim], dim, dim);
-        cholesky_in_place(
-            l,
-            LltRegularization::default(),
-            Par::Seq,
-            MemStack::new(&mut mem),
-            Spec::default(),
-        )
-        .is_ok()
+        const STACK_SCRATCH: usize = 1024;
+        if req.unaligned_bytes_required() <= STACK_SCRATCH {
+            let mut buf = [core::mem::MaybeUninit::<u8>::uninit(); STACK_SCRATCH];
+            cholesky_in_place(
+                l,
+                LltRegularization::default(),
+                Par::Seq,
+                MemStack::new(&mut buf),
+                Spec::default(),
+            )
+            .is_ok()
+        } else {
+            let mut mem = MemBuffer::new(req);
+            cholesky_in_place(
+                l,
+                LltRegularization::default(),
+                Par::Seq,
+                MemStack::new(&mut mem),
+                Spec::default(),
+            )
+            .is_ok()
+        }
     }
 
     fn syrk_lower_sub(
@@ -313,7 +333,7 @@ impl Scalar for f64 {
 ///
 /// This is what a non-`f64` scalar uses in place of faer's blocked kernel.
 /// It is NOT bit-identical to faer and is not meant to be: `impl Scalar for f64`
-/// keeps the faer override, which is what holds the bit-identity dump.
+/// keeps the faer override, which is what every `f64` fit runs.
 pub(crate) fn chol_lower_generic<T: Scalar>(a: &[T], dim: usize, l_out: &mut [T]) -> bool {
     for j in 0..dim {
         let mut d = a[j * dim + j];

@@ -632,6 +632,24 @@ fn a_variable_repeated_within_a_term_counts_once() {
 }
 
 #[test]
+fn an_empty_name_in_an_interaction_is_a_syntax_error() {
+    for f in [
+        "y ~ :",
+        "y ~ *",
+        "y ~ x:",
+        "y ~ :x",
+        "y ~ x::z",
+        "y ~ x + * + z",
+    ] {
+        assert!(
+            matches!(parse(f), Err(glmm::formula::ParseError::Syntax { .. })),
+            "expected a syntax error for {f}, got {:?}",
+            parse(f)
+        );
+    }
+}
+
+#[test]
 fn a_random_slope_variable_repeated_counts_once() {
     // Mirrors `a_variable_repeated_within_a_term_counts_once` on the
     // random-effects side: lme4's `lFormula` also collapses `(1+x+x|g)` to a

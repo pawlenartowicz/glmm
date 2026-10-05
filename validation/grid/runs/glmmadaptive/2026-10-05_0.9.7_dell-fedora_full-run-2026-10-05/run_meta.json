@@ -1,0 +1,21 @@
+{
+  "engine": "glmmadaptive",
+  "engine_version": "0.9.7",
+  "machine": "dell-fedora",
+  "date": "2026-10-05T10:48:43+02:00",
+  "glmm_crate_version": "0.4.1",
+  "glmm_git_rev": "e02e7fd897921a6634448ad11a641a8060edb5b9-dirty",
+  "subset": "full",
+  "timed": null,
+  "timed_unlocked": false,
+  "no_turbo": "0",
+  "pin_cores": "0-3",
+  "jobs": 4,
+  "loadavg_start": "2.53 1.83 1.81",
+  "r_version": "4.5.3",
+  "julia_version": "1.12.6",
+  "label": "full run 2026-10-05",
+  "cells": 28,
+  "cell_list": [],
+  "completed_from": "runs/glmmadaptive/2026-09-29_0.9.7_dell-fedora_agq7-fast-copies-reference"
+}

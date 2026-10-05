@@ -36,12 +36,16 @@ test_that("binomial random intercept is pinned, Laplace and nAGQ = 7", {
   # step the fixed effects in centred, scaled coordinates: logLik
   # -393.542896593027, 2e-12 higher. The fixed effects moved by at most 5.5e-7
   # absolute (the last one 6.5e-5 relative), the SD by 9e-8 relative.
+  #
+  # Re-recorded 2026-10-03, after the fit moved along a flat direction: logLik
+  # -393.542896593028, 1e-12 lower. The fixed effects moved by at most 3.6e-7
+  # absolute (the last one 6.9e-5 relative), the SD by 4.1e-7 relative.
   fit7 <- fastglmm(f, d, family = binomial(), nAGQ = 7)
   expect_true(fit7$converged)
-  expect_equal(unname(fixef(fit7)), c(-0.62582891071147, 0.893716403487087, 0.244015538480626, 0.00516485243902018),
+  expect_equal(unname(fixef(fit7)), c(-0.625828963562665, 0.893716351595673, 0.244015699679902, 0.00516449500668084),
                tolerance = CI_REF_REL)
   expect_equal(unname(attr(VarCorr(fit7)$g, "stddev")),
-               c(0.882844802317575), tolerance = CI_REF_REL)
+               c(0.882845161119728), tolerance = CI_REF_REL)
 })
 
 test_that("poisson random intercept is pinned, Laplace and nAGQ = 7", {
@@ -60,12 +64,16 @@ test_that("poisson random intercept is pinned, Laplace and nAGQ = 7", {
   # step the fixed effects in centred, scaled coordinates (logLik
   # -923.041795291571). The fixed effects moved by at most 7.3e-7 absolute,
   # the SD by 2.3e-7 relative.
+  #
+  # Re-recorded 2026-10-03, after the fit moved along a flat direction: logLik
+  # -923.04179529159, 1.9e-11 lower. The fixed effects moved by at most 6.4e-7
+  # absolute, the SD by 1.1e-6 relative.
   fit7 <- fastglmm(f, d, family = poisson(), nAGQ = 7)
   expect_true(fit7$converged)
-  expect_equal(unname(fixef(fit7)), c(-0.203551164425076, 0.725894230553309, 0.291846747816096, -0.198680230560223),
+  expect_equal(unname(fixef(fit7)), c(-0.203551156723678, 0.725893988688593, 0.291847067610744, -0.198680866701111),
                tolerance = CI_REF_REL)
   expect_equal(unname(attr(VarCorr(fit7)$g, "stddev")),
-               c(0.585471084582996), tolerance = CI_REF_REL)
+               c(0.585470423243987), tolerance = CI_REF_REL)
 })
 
 test_that("binomial random slope (tau0, tau1, rho01) is pinned", {
@@ -89,16 +97,20 @@ test_that("binomial random slope (tau0, tau1, rho01) is pinned", {
   # standardization (logLik -923.756172968005, unchanged): the correlation moved
   # by 1.3e-8 absolute, the SDs by at most 4.5e-9 relative, the fixed effects by
   # at most 6.2e-10 absolute.
+  # Re-recorded 2026-10-03, after the fit moved along a flat direction (logLik
+  # -923.756172968026, 2.1e-11 lower): the correlation moved by 2.6e-6
+  # absolute, the SDs by at most 2.6e-6 relative, the fixed effects by at most
+  # 1e-7 absolute.
   d <- benchmark_data(seed = 203, family = "binomial", n_g = 100L, m = 15L,
                       tau0 = 0.8, tau1 = 0.8, rho = 0.3)
   fit <- fastglmm(y ~ t + d + t:d + (1 + t | g), d, family = binomial())
   expect_true(fit$converged)
   vc <- VarCorr(fit)$g
-  expect_equal(unname(fixef(fit)), c(-0.792588914474131, 1.07410712543171, 0.694133080240422, -0.129934596757035),
+  expect_equal(unname(fixef(fit)), c(-0.792589014698087, 1.07410722961413, 0.694133145065697, -0.129934553885488),
                tolerance = CI_REF_REL)
-  expect_equal(unname(attr(vc, "stddev")), c(1.04201375790699, 0.871286639125827),
+  expect_equal(unname(attr(vc, "stddev")), c(1.04201462288758, 0.871288941191661),
                tolerance = CI_REF_REL)
-  expect_equal(attr(vc, "correlation")[2, 1], 0.106173806123228,
+  expect_equal(attr(vc, "correlation")[2, 1], 0.106171192629761,
                tolerance = CI_REF_REL)
 })
 
@@ -110,17 +122,21 @@ test_that("poisson random slope (tau0, tau1, rho01) is pinned", {
   # values above the correlation moved by 2.0e-5 absolute along a flat
   # direction, the SDs by 8.2e-6 relative, the fixed effects by at most 5.4e-7
   # absolute.
+  # Re-recorded 2026-10-03, after the fit moved along a flat direction again
+  # (logLik -1711.44098430039, 7.2e-10 higher): the correlation moved by
+  # 1.5e-5 absolute, the SDs by at most 8.9e-6 relative, the fixed effects by
+  # at most 1.2e-6 absolute.
   d <- benchmark_data(seed = 204, family = "poisson", n_g = 100L,
                       beta = c(0, 0.5, 0.3, 0.1), tau0 = 0.5, tau1 = 0.4,
                       rho = 0.3)
   fit <- fastglmm(y ~ t + d + t:d + (1 + t | g), d, family = poisson())
   expect_true(fit$converged)
   vc <- VarCorr(fit)$g
-  expect_equal(unname(fixef(fit)), c(0.207518487106018, 0.43021677704981, 0.119056489133238, 0.338551610590158),
+  expect_equal(unname(fixef(fit)), c(0.207519207061406, 0.430215546625061, 0.119056503207913, 0.338551773355772),
                tolerance = CI_REF_REL)
-  expect_equal(unname(attr(vc, "stddev")), c(0.312864379568631, 0.507732506267579),
+  expect_equal(unname(attr(vc, "stddev")), c(0.312861595749485, 0.507731499360452),
                tolerance = CI_REF_REL)
-  expect_equal(attr(vc, "correlation")[2, 1], 0.349321125271447,
+  expect_equal(attr(vc, "correlation")[2, 1], 0.349335746574947,
                tolerance = CI_REF_REL)
 })
 
@@ -145,6 +161,17 @@ test_that("gamma GLMM is pinned", {
   # -807.967379830268, 2.7e-12 higher. The fixed effects moved by at most
   # 1.3e-4 relative (the last one, 6.3e-6 absolute), the SD 3.4e-6 and sigma
   # 7.2e-7.
+  #
+  # Re-recorded 2026-10-03, after the fit moved along a flat direction: logLik
+  # -807.967379830196, 7.2e-11 higher. The fixed effects moved by at most
+  # 1.3e-5 relative (the last one, 6.3e-7 absolute), the SD 3.2e-7 and sigma
+  # 1.8e-7.
+  #
+  # Re-recorded 2026-10-03, when the Laplace Gamma fit began to profile the
+  # fixed effects out exactly, so the outer search runs over the SD and ln phi
+  # only: logLik -807.967379830144, 5.2e-11 higher. The fixed effects moved by
+  # at most 1.8e-5 relative (the last one, 9.1e-7 absolute), the SD 1.6e-7 and
+  # sigma 5.1e-8.
   set.seed(208)
   n_g <- 60L
   m <- 10L
@@ -160,11 +187,11 @@ test_that("gamma GLMM is pinned", {
   d <- data.frame(y = y, t = t, d = dtrt, g = g)
   fit <- fastglmm(y ~ t + d + t:d + (1 | g), d, family = Gamma(link = "log"))
   expect_true(fit$converged)
-  expect_equal(unname(fixef(fit)), c(0.4885683550922643, 0.2113069197054022, 0.156708904999734, 0.0491449551112931),
+  expect_equal(unname(fixef(fit)), c(0.488568932131092, 0.211306871120591, 0.156708303087554, 0.0491452312382566),
                tolerance = CI_REF_REL)
   expect_equal(unname(attr(VarCorr(fit)$g, "stddev")),
-               c(0.258718428847095), tolerance = CI_REF_REL)
-  expect_equal(sigma(fit), 0.492144615806503, tolerance = CI_REF_REL)
+               c(0.258718388099389), tolerance = CI_REF_REL)
+  expect_equal(sigma(fit), 0.492144681049152, tolerance = CI_REF_REL)
 })
 
 test_that("logLik and AIC are pinned, and the LMM value is the REML criterion", {

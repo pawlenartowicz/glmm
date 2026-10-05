@@ -610,7 +610,7 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     } else {
         None
     };
-    let beta_start = crate::fit::glm_warm_start_beta(
+    let (beta_start, _) = crate::fit::glm_warm_start_beta(
         sized.family,
         f64::NAN,
         x_mat.as_ref(),

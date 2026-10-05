@@ -109,8 +109,13 @@ At a fixed θ the conditional modes ũ are found by penalized IRLS — Newton's
 method on the penalized likelihood. The RE design is the scaled `M = ZΛ_θ`, and
 the penalty adds a `+I` ridge; this is the standard `nAGQ=1` reparameterization,
 under which the prior is `u ~ N(0, I)`. Each iteration forms `A = MᵀWM + I` and
-the IRLS right-hand side `Mᵀ(W·Mu + (y − μ))`, then takes the next `u` from a
-Cholesky solve of `A`. `log|A|` is read off that same factor, so the
+the right-hand side `Mᵀρ − u` (ρ the row scores, `y − μ` on the canonical
+links), solves `A·δu = Mᵀρ − u` by Cholesky and takes `u + δu`. This is the
+IRLS step `u_new = A⁻¹(Mᵀ(W·Mu) + Mᵀρ)` written as an increment: that form
+carries `(A − I)u`, of size `θ²·Σwᵢ·|u|`, whose rounding lands in `u` along
+any direction `M` nearly annihilates (crossed intercepts, a slope constant
+within a cluster) and stalled the solve at counts near `e³³`; in the increment
+form the rounding shrinks with `δu`. `log|A|` is read off that same factor, so the
 deviance term needs no re-factorization. The factor is built from W at the
 iterate the last step started from, not at the returned `u` — see
 [§Laplace approximation](#laplace-approximation). Three variants handle the RE
@@ -122,9 +127,10 @@ structure:
   block-diagonal core plus a Schur complement on the crossed width. Concretely
   (`structured_factor` / `structured_ainv_solve`): per-cluster core blocks of
   width `q_core = q_p + nested-children-per-parent` (`core_blocks`), the
-  cluster↔crossed coupling `C_f` (`coupling`, with a per-cluster CSR
-  `coup_cols`/`coup_ptr` that skips exact-zero columns and is rebuilt only when
-  the θ-pinning mask changes), and the crossed-width Schur complement
+  cluster↔crossed coupling `C_f` (`coupling`, stored on a per-cluster CSR
+  `coup_cols`/`coup_ptr` of its nonzero columns only, with each row entry's
+  slot in `coup_pos`; the CSR is rebuilt only when the θ-pinning mask
+  changes), and the crossed-width Schur complement
   `S = (E + I) − Σ_f C_fᵀA_f⁻¹C_f` (`schur_blk`). The determinant splits by
   the Schur identity, `log|A| = Σ_f log|A_f| + log|S|`.
 - **Packed** (everything else — a slope-carrying extra, over the envelope
@@ -178,6 +184,22 @@ deviance units above glmmTMB), the 30000-row Gamma/log cell that stalled at its
 start, and every other non-canonical mixed cell land within `dev_eps` (4e-5) of
 glmmTMB's deviance; a 1e-10 band measured no better there and cost 0–60% more
 wall.
+
+**Stage-1 tolerance on the `ExactProfile` route.** Every evaluation of the
+`ExactProfile` search is a PIRLS solve, and BOBYQA needs its value only to an
+accuracy small next to what its model resolves at the current trust radius,
+of order ρ² (inexact derivative-free optimization: Ehrhardt & Roberts 2021,
+*J. Math. Imaging Vis.*, doi:10.1007/s10851-021-01020-8). So the search runs
+on `Bobyqa::minimize_with_radius`, which hands each evaluation BOBYQA's ρ,
+and solves at `clamp(RHO_TOL_C·ρ², pirls_tol, RHO_TOL_MAX)` (`RHO_TOL_C` =
+1e-2, `RHO_TOL_MAX` = 1e-5, relative as `pirls_tol` is), at `pirls_tol` once
+ρ ≤ `RHO_TOL_FULL_FACTOR`·`GLMM_RHO_END` = 3e-5, and at `pirls_tol` on the
+search's first evaluation, the point the warm-start guard solves and hands
+over. An incumbent found at a loose tolerance is re-solved at `pirls_tol`
+before β̂ and the deviance are read, so the reported fit never rests on a
+loose solve; the re-solve is not counted in `n_eval`, and a solve that runs
+out its iterations counts in `Note::PirlsExhausted` as the search's own do.
+`PqlThenJoint` stage 1 and the joint searches keep `pirls_tol`.
 
 **Step-halving** mirrors lme4 `pwrssUpdate`'s 10-halving discipline, in its
 retrospective form. The trial `u` is evaluated first. Only if its same-point
@@ -256,7 +278,12 @@ never mixed within a fit:
 - **`ExactProfile`** instead profiles β out EXACTLY at each candidate θ
   (`BetaMode::ProfileExact`): the PIRLS inner loop adds a δβ Schur-border step
   that is Newton on the Laplace profile `L(β) = dev + ‖ũ‖² + log|A|` along the
-  mode ũ(β). The PQL border solves `S_β·δβ = X'ρ − B'δu₀`; the exact one takes
+  mode ũ(β). The PQL border solves `S_β·δβ = X'ρ − B'δu₀`, with `S_β` and the
+  right-hand side formed from the design residual rows `rᵢ = xᵢ − Tᵀmᵢ`
+  (`T = A⁻¹MᵀWX`) as `Σᵢ wᵢrᵢrᵢᵀ + TᵀT` and `Σᵢ ρᵢrᵢ + Tᵀu`
+  (`pirls::residual_border`): the forms `XᵀWX − BᵀT` and `Xᵀρ − Bᵀδu₀` are
+  differences of terms of order `Σwᵢ` and lose all their digits when a column
+  of X lies in the span of M at huge counts; the exact one takes
   log|A|'s gradient `½c_β` off the right-hand side and adds its curvature
   `½·d²log|A|/dβ²` to `S_β` (`logdet_beta_curvature` in
   `src/glmm/pirls/mod.rs` carries the derivation and the per-iteration cost).
@@ -275,9 +302,10 @@ never mixed within a fit:
   per fit) starts the next solve with it on. That solve's first step measures
   `‖δ_H − δ_S‖/‖δ_H‖`, the relative change the curvature makes to the step;
   below `CURV_RELEASE` = 0.1 it drops the curvature and clears the memory.
-  Otherwise `logdet_hess` is zero and the step is the plain `S_β` step. Far
-  from the mode even the exact quadratic model
-  can be far off, so the border step runs inside a trust region
+  Otherwise `logdet_hess` is zero and the step is the plain `S_β` step. The
+  warm-start guard (below) solves each of its candidates from a cleared memory
+  and hands the search the memory of the one it picks. Far from the mode even
+  the exact quadratic model can be far off, so the border step runs inside a trust region
   (`BorderTrust`, `border_solve`; Nocedal & Wright, *Numerical Optimization*,
   2nd ed., ch. 4). Each trial a border step produced is judged by `ρ` = actual
   merit change / the change the model predicts; `ρ < ¼` shrinks the radius to
@@ -299,10 +327,35 @@ never mixed within a fit:
   `src/glmm/pirls/blocked_extras.rs`). Because this θ-only pass already
   reaches the Laplace optimum, no joint polish follows — its status alone
   gates convergence, on the shapes `exact_profile_shape` selects (nAGQ=1,
-  non-Gamma, and either no extra groupings or a structured-extras shape within
-  `structured_extras_eligible`): the kernel steps with the exact curvature, so
+  and either no extra groupings or a structured-extras shape within
+  `structured_extras_eligible`; Gamma included, its `ln φ` searched beside θ
+  as NB's `ln θ_NB` is, see [Gamma dispersion](#gamma-dispersion)): the kernel steps with the exact curvature, so
   its own factor gives the û-path adjoint solve its `Ã = A_obs` on every link,
   and the route carries no canonical-link restriction on either shape.
+
+**Start radii.** Each search starts at the radius measured best for its kind
+of start (`src/lmm/mod.rs`): stage 1 and the `Joint` route from the blind θ₀
+at `GLMM_RHO_BEGIN` = 0.2, stage 1 from a caller's θ₀ that the start guard
+kept at `RHO_BEGIN_WARM` = 0.1, and the joint polish after stage 1 at
+`GLMM_RHO_POLISH` = 0.03, because it starts next to the optimum. The polish
+starts at 0.1 instead when the stage-1 optimum has a diagonal |θ̃| below
+`POLISH_NEAR_SINGULAR` = 1e-2: from a block near the singular boundary the
+small radius can stop on the flat boundary surface short of the optimum.
+`bobyqa` fixes the radius when a solver is built, so the warm stage-1 and the
+near-singular polish searches run on their own solvers, built on first use.
+
+**Saddle check after `ExactProfile`.** The deviance is even in each column of
+a block's Λ (Σ = ΛΛᵀ sums `l_d·l_dᵀ` over the columns), so a zero column is a
+stationary point, and a saddle where a small nonzero variance fits better.
+Near it the deviance changes as ‖l_d‖⁴ along the column, too flat for BOBYQA
+to see at its last radii, and a search that reaches it stops there. So when
+the `ExactProfile` search converges, each nonzero column with norm below
+`POLISH_NEAR_SINGULAR` is doubled while that lowers the deviance (its own
+iterate points along the escape direction); if any column moved, the stage-1
+search restarts from there at `GLMM_RHO_POLISH` on its own solver, built on
+first use. Each tried point is a full-tolerance evaluation counted in
+`n_eval`. On the grid's `pois_q2sx2_g3000p20_bal_boundary` the search had
+stopped at 0.15 of the optimal column, 4.0e-6 deviance above the optimum.
 
 **The β coordinates of the joint search.** The joint BOBYQA (`Joint`, and the
 polish of `PqlThenJoint`) does not step β in the caller's units. Like θ, which
@@ -353,10 +406,36 @@ for one wide Gamma cell on the singular boundary (+22%), whose own count spans
 `fit_glmm`. **Validation:** the Gamma GLMM cases of
 `unit_invariance_on_every_route` (`src/fit/standardize_tests.rs`).
 
+The design Gram leaves out the working weights `W`. Where they span decades
+(`W = μ` on Poisson log, `W = μ²/φ` on the Gamma inverse link, with cluster
+means decades apart) the deviance rises by tens of units over 1e-4 along one
+β̃ axis while it barely moves along the others, and BOBYQA can stop converged
+in that valley, units above the optimum. So after a converged joint search one
+check runs at the incumbent: a Laplace solve at its θ and dispersion with β
+re-solved jointly with the modes (PQL), and on AGQ one solve of the AGQ
+objective at that β. At an optimum this is no lower than the incumbent, since
+the PQL β is not the Laplace or AGQ one. When it is lower by more than
+`JOINT_RECHECK_TOL` (1e-9 relative), the search runs a second time from that
+point, on β̃ scaled by the β information there instead of the design
+(`BetaScale::set_info`: `L·Lᵀ = S_β/Σw`, `S_β = X'WX − X'WM·A⁻¹·M'WX` the
+factor the PQL solve leaves in `border.schur`), so the deviance is isotropic in
+β̃ to second order. The check's solves are not search evaluations; when it does
+not fire the fit is the one-pass fit bit for bit. Measured 2026-10-04 on six
+Poisson-log clusters with log-means spread over eight decades: the packed
+layout's search had stopped 1.05 units above the exact-profile optimum and now
+reaches it to 2e-8; over twelve decades packed and 7-node AGQ had stopped 800 to
+1050 units above it and now end within the PIRLS exit band of it. On the
+grid's AGQ and packed cells the check never fired (largest value 2e-14
+relative). **Validation:**
+`joint_search_reaches_the_optimum_when_working_weights_span_decades`
+(`src/fit/glmm_tests.rs`).
+
 Whichever search gates convergence, its `Converged` status counts only when the
 search saw a finite incumbent, at least two finite evaluations, and no
-non-finite evaluation within `rho_begin` (its initial trust radius, 0.1) of the
-point it returned, measured in the search's own coordinates `[θ̃ | β̃]`. A failed PIRLS solve scores `+∞`, which BOBYQA moderates to
+non-finite evaluation within `NON_FINITE_RADIUS` (0.1, a constant of its own
+and not a start radius, so the check's radius does not move with the start
+radii) of the point it returned, measured in the search's own coordinates
+`[θ̃ | β̃]`. A failed PIRLS solve scores `+∞`, which BOBYQA moderates to
 `1e30`; a search whose steps keep landing on such points shrinks its radius to
 `rho_end` at the edge of the failing region and reports `Converged` there, at a
 point it never compared with its neighbours. A far warm start whose first
@@ -373,21 +452,54 @@ minimum, checked with `any_within` exactly as `fit_glmm` does.
 own Profile mode when stage 1 runs, `BetaMode::Fixed` otherwise — at both the
 caller's θ₀ and the blind cold start `GlmmWorkspace::new` would have used, and
 begins the search from whichever is lower; a tie or a non-finite warm value
-goes to cold. This costs two extra Laplace-deviance evaluations on every warm
-fit, outside the reported `n_eval`. Separately, when the `ExactProfile` route
-ends not converged (a hard failure or a budget-exhausted plateau), the fit
-reruns once on `PqlThenJoint` from the same (possibly guard-picked) start,
-reusing the same stage-1/stage-2 code with the route rebound — never twice.
-The rerun's result is reported when it converges; when both attempts end not
-converged, the one with the lower objective is reported, still not converged
-(`Note::ExactProfileFallback`, `src/fit/mod.rs`). Both fixes address the same
-failure mode: on a scan of far binary-link warm starts, most failures are a θ₀
-where every PIRLS evaluation fails, which no border-step change can recover —
-the guard sidesteps it by not starting there when the cold point is better,
-and the fallback recovers what the guard cannot by trying a route whose warm
-start matters less. **Validation:**
-`far_warm_start_recovers_via_the_cold_guard` and
-`exact_profile_fallback_reruns_on_pql_then_joint` (`src/fit/glmm_tests.rs`).
+goes to cold. A start whose θ is the blind θ₀ bit for bit skips the guard on
+every route: both candidates would be the same point `[θ₀ | β₀]`, so the
+comparison is empty, and the fit runs as a cold fit from the caller's β₀. Each
+candidate is solved as a fit's first evaluation is (û = 0, β₀, a cleared
+curvature memory). When stage 1 runs and its first call lands on the picked
+point bit for bit, the winning solve is the search's first evaluation: the
+search takes its objective, û, β̂ and the curvature memory it left instead of
+solving the point again. BOBYQA moves a start that lies within its initial
+radius of a bound (an NB `ln θ_NB` just under its upper bound, a θ₀ above the
+θ box); that first call misses the guard's point and solves its own from
+û = 0, β₀ and a cleared memory, as a cold fit's first call does. So the guard
+costs one extra Laplace-deviance evaluation on a warm fit when the hand-over
+hits, two when it misses and two on the `Joint` route, all outside the
+reported `n_eval`, and a warm fit the guard sends to the blind start runs the
+cold fit's search from the same first state. Measured on the far-warm-start
+scan (x86_64): all 1009 such fits are the cold fit bit for bit.
+Separately, when the `ExactProfile` route ends not converged (a hard failure
+or a budget-exhausted plateau), the fit reruns once on `PqlThenJoint` from the
+same (possibly guard-picked) start, reusing the same stage-1/stage-2 code with
+the route rebound — never twice. The rerun's result is reported when it
+converges; when both attempts end not converged, the one with the lower
+objective is reported, still not converged (`Note::ExactProfileFallback`,
+`src/fit/mod.rs`). Both fixes address the same failure mode: on a scan of far
+binary-link warm starts, most failures are a θ₀ where every PIRLS evaluation
+fails, which no border-step change can recover — the guard sidesteps it by not
+starting there when the cold point is better, and the fallback recovers what
+the guard cannot by trying a route whose warm start matters less.
+**Validation:** `far_warm_start_recovers_via_the_cold_guard`,
+`warm_start_the_guard_rejects_is_the_cold_fit` and
+`exact_profile_fallback_reruns_on_pql_then_joint`; the far-warm-start scan
+`far_warm_start_scan` and `far_warm_start_nb_sweep` (`#[ignore]`, run by hand
+in release after a change to the GLMM search; all in `src/fit/glmm_tests.rs`).
+
+**Measured and not taken.** Three variants of the guard and of the stage-1
+tolerance were measured on the loop-tier benchmark shapes and the
+far-warm-start scan (aarch64) and dropped. Solving both guard candidates at a
+loose PIRLS tolerance (1e-6, with a full-tolerance repeat when the two values
+come within ten exit bands) saved 0 to 3% of a warm fit, nothing where the two
+starts are close, because the repeat fires there. Seeding the blind candidate
+from the warm candidate's mode saved 0.5 to 4% but makes the blind value
+depend on the warm start, and on far starts with several β branches it lands
+on another branch than the cold fit's own first solve. Both change the
+curvature memory the search inherits, so both would break what the hand-over
+gives a rejected warm start: the cold fit's own search. Tying the stage-1
+tolerance to the distance from the incumbent, instead of BOBYQA's ρ, was a
+noisy stand-in for the radius: at the setting where the radius rule saves most
+(C = 1e-2) it ended a far start at a false convergence that the radius rule
+avoids.
 
 **Validation:** `two_stage_matches_single_stage_on_grouseticks` (in
 `src/glmm/tests.rs`) pins `ExactProfile` against `Joint` — grouseticks
@@ -507,6 +619,24 @@ cost/oracle-coverage boundary, not a code limit on the `k^q_p` product grid
 itself (the grid cost is the user's to pay: `k=25` at `q_p=3` is already
 15,625 nodes per cluster per evaluation).
 
+`agq_deviance_vec` lays the grid at `u_cj = ũ_c + √2·L_c⁻ᵀ·z_j`, in the
+standardized `u` coordinates (`b = Λ_p·u`), with `L_c` the lower Cholesky
+factor of `A_c`. Any matrix `M` with `M·Mᵀ = A_c⁻¹` gives a valid adaptive
+grid, but a product Gauss–Hermite grid is not rotation-invariant, so the value
+at `k > 1` depends on which `M` is used. GLMMadaptive 0.9-7 (`GHfun`) uses the
+upper Cholesky root of the posterior covariance in `b` instead; at one
+parameter point the two rules differ by 2.6e-4 on `binb_q2s_g3000p20_bal_base`
+and 7.4e-5 on `pois_q2s_g3000p20_bal_base` (see `ga_rule_dev` in
+`validation/grid/dev_align.R`, which scores glmm's point under GLMMadaptive's
+rule). The gap shrinks as `k` grows. It is largest near a singular `Σ`: at
+`k = 7` the same point evaluated in centered and in uncentered slope
+coordinates differs by up to 0.23 deviance units, against at most 3.2e-3 at
+`k = 25`. The caller's centering or scaling of a slope column does not reach
+the result, because the design is standardized internally before the fit and
+the grid is laid in that fixed internal design. GLMMadaptive's rule does not
+move with centering, but it has no limit at a singular `Σ`, where the pin
+policy needs the objective; the `u`-space rule is continuous there.
+
 **Convention/reference:** `glmer(nAGQ=k)` with Liu–Pierce adaptive centering at
 each cluster's PIRLS mode/curvature. **Validation:** in-crate goldens
 `fit_glmm_binomial_agq_matches_lme4` and `fit_glmm_poisson_agq_matches_lme4`
@@ -585,11 +715,13 @@ The reported `Fit::deviance` on an NB GLMM is the search's own objective,
 exactly, since the saturated term the marginal Laplace deviance drops is
 restored here rather than inside `Fit::loglik` (`fit::common::glmm_loglik`).
 
-For integer
-counts that term needs no `lgamma` at all: the profile uses the exact identity
-`lnΓ(y+θ) − lnΓ(θ) = Σ_{k=0}^{y−1} ln(θ+k)`, a finite sum, which is what makes
-the match to `MASS::theta.ml` exact rather than approximate. θ̂ is reported as the
-fit's `dispersion`. (This differs from the *GLM* NB path `fit_glm_nb`, which
+Each row of
+that term, `lnΓ(y+θ) − lnΓ(θ) − lnΓ(y+1) + θ·ln(θ/(θ+y)) + y·ln(y/(θ+y))`, is
+formed as `½·(E(θ+y) − E(θ) − E(y)) − ln y` with `E(a) = 2a − 2a·ln a +
+2·lnΓ(a)` (`family::ln_gamma_excess2`, Stirling's series above `a = 20`): the
+same value, but every term stays of order `ln y`, so the objective keeps its
+resolution at any count (formed directly, 200 counts near 1e10 leave it
+nothing finer than 1.6e-2). θ̂ is reported as the fit's `dispersion`. (This differs from the *GLM* NB path `fit_glm_nb`, which
 uses an alternating fixed-θ / profile-θ outer loop capped at
 `NB_MAX_OUTER = 25` with `|Δθ|/θ < NB_THETA_TOL = 1e-6`. The GLMM coordinate
 seeds from it, so a cap-exhausted prefit gives it a stale start — a start only,
@@ -599,9 +731,12 @@ which the coordinate then moves.)
 marginal-θ maximization is glmmTMB's `nbinom2` objective (lme4's `glmer.nb`
 builds its log-determinant from the Fisher weight, a different objective on this
 non-canonical link; see [Laplace approximation](#laplace-approximation)). The joint
-Hessian of `WaldSe::Hessian` carries the `ln θ_NB` coordinate, as glmmTMB's does,
-by central differences of the full objective in `(θ, β, ln θ_NB)`
-(`glmm::se::joint_hessian_cov`), so the β SE includes θ_NB's uncertainty; lme4's
+Hessian of `WaldSe::Hessian` carries the `ln θ_NB` coordinate, as glmmTMB's does
+(`glmm::se::joint_hessian_cov`): its diagonal entry by a central second
+difference of the full objective in `ln θ_NB`, its mixed entries by a central
+difference in `ln θ_NB` of the exact Laplace gradient (`assembled::gradient_f64`;
+the four-point difference of the full objective where that gradient declines,
+as on AGQ), so the β SE includes θ_NB's uncertainty; lme4's
 conditions on θ̂. `WaldSe::Rx` conditions on θ̂ by construction. **Validation:**
 `fit_glmm_nb_sim_matches_glmmtmb` against `goldens/sim_nb_glmm_tmb.json`,
 `nb_hessian_se_matches_fd_of_the_full_objective`; the packed-row layout by
@@ -691,6 +826,67 @@ satisfies the stationarity condition on both links),
 a central-difference Hessian of `F` over `[θ | β | ln φ]`), and
 `family::tests::gamma_dispersion_term_*`.
 
+### Response units on the Gamma inverse link
+
+**Code:** `fit::glmm::run_glmm_on`, `gamma_inverse_units`,
+`gamma_inverse_retry` (`src/fit/glmm.rs`).
+
+On the inverse link `η = 1/μ` is in the reciprocal of y's units, and so are
+β, the random effects and θ, while every θ constant of the search is absolute,
+as on the other links, where η has no units: the blind start `THETA0` = 1, the
+box, the trust radii, `PIN_THETA` and the finite-difference step. A search on
+`y/c` (`c` a power of two) is the same model with η, β, θ and the offset
+multiplied by `c`; the unit deviance, φ and the weights do not move, and
+`Σ ln y` drops by `n·ln c`. After the search β̂, θ̂ and the covariances are
+divided back (variances by `c²`), μ̂ is multiplied by `c` and the deviance gains
+`2n·ln c`.
+
+The likelihood can have two basins whose θ live on scales decades apart:
+σ = 0 near the GLM fit, with its structure on the scale of the smallest start
+η (the rows that weigh most, `1/(φη²)`, and that a random effect pushes out of
+`η > 0` first), and an interior one whose SD is on the scale of the largest
+cluster η (`Σw/Σwy` over a primary-grouping level). Read off the data and the
+GLM start, before any search:
+
+- **The first search** runs on y as given while the largest cluster η lies in
+  `[1/64, 64]`, and on y rescaled to bring it into `[4, 8]` outside. Measured
+  on y·k, k over 2⁻²⁰ to 2²⁰, for a 12-row design whose four cluster means
+  span up to nine decades and for 15-row corpus fits: on y as given the
+  interior optimum is reached with that η from about 2 to 12, and the search
+  ends converged short of it, with no sign the retry reads, mostly outside
+  `[1/64, 64]`.
+- **The GLM point**: the objective at θ = 0, the β start and its best φ (the
+  held φ when there is one), a point every search could reach.
+
+A first search that fails, or ends no lower than the GLM point (within
+`UNITS_RETRY_TOL`, 1e-6 relative), is retried in each basin's units it did not
+use: the smallest start η in `[1/2, 64]` (σ = 0; there an η of order 1e-4 is
+resolved) and the largest cluster η in `[4, 8]` and in `[8, 16]` (the interior;
+on the 12-row design and the corpus it is reached in one of these octaves and
+missed in the next). The converged search of lowest deviance is kept. When a
+lower point was seen (the GLM point, or the incumbent of a search that failed)
+and a search failed, the failed search with the lowest incumbent is reported
+instead, not converged: a converged σ = 0 fit is then not the optimum. Each
+search but the last saves the workspace slots read after the fit
+(`SearchState`), and the kept search's are put back when it did not run last;
+`n_eval` counts every search. A first search that ends below
+the GLM point, the case of every Gamma-inverse cell of the accuracy grid, is the
+fit, at no extra cost.
+
+On the 800-case Gamma-inverse corpus (measured 2026-10-04) no fit ends at a
+lower log-likelihood than before at y·k for k = 1, 1024 and 1e6, and 75, 559
+and 742 end at a higher one;
+evaluations drop by 17%, 46% and 68%. Left open: on the 12-row design with the
+cluster means spread to the power 0.7, the interior optimum puts two clusters'
+η at 1e-5 to 2e-3, next to points where PIRLS fails. The exact profile ends
+not converged there, but the joint search (AGQ, packed) never reaches a point
+below σ = 0 in any units tried, and reports the σ = 0 point converged, 0.46
+units above the optimum.
+**Validation:** `gamma_inverse_adversarial_reaches_the_glm_optimum`,
+`gamma_inverse_span_reaches_the_optimum_in_any_units` and
+`gamma_inverse_singular_fit_is_equivariant_in_the_units_of_y`
+(`src/fit/glmm_tests.rs`).
+
 ## Warm starts and workspace reuse
 
 **Code:** `GlmmWorkspace::for_cluster_spec` / `from_groupings` in
@@ -718,7 +914,7 @@ layout — the blocked and structured routes never read them and get 0-length st
 so the workspace's footprint stays cluster-sized rather than data-sized on
 the common shapes. A single workspace is reused across every BOBYQA
 evaluation and PIRLS iteration of one fit with no reallocation; the warm path
-is zero-alloc (BOBYQA is constructed once). The shape-compatibility rule is a **contract, not a runtime check**: the
+is zero-alloc (each BOBYQA solver is constructed once: the cold ones with the workspace, the warm stage-1, the near-singular polish and the saddle-check restart solvers on first use). The shape-compatibility rule is a **contract, not a runtime check**: the
 buffers are fixed at construction, and nothing in the crate detects a mismatch
 — a `loop_advanced` caller must construct a fresh workspace whenever the row
 count would exceed `max_n`, `p` changes, or the RE topology changes (any shift
@@ -740,7 +936,13 @@ A cold start seeds
 β from a full no-RE GLM fit — `glm_warm_start_beta` runs the actual IRLS GLM of
 [`algorithms.md`](algorithms.md#generalised-linear-models-glm) once (with its
 own scratch) before the RE structure is even considered, which is
-lme4/`glmer`'s own initialization — and θ from the blind `THETA0`. Within a
+lme4/`glmer`'s own initialization — and θ from the blind `THETA0`. When that
+GLM reports `separated` (no finite maximum: separation or a category with only
+zero counts), the GLMM has none either — along the direction the GLM runs off
+in, every row's conditional likelihood is non-decreasing for any random
+effects — so the fit stops there, before any outer search
+(`glmm::separated_fit`): `converged = false`, `n_eval = 0`, β the GLM's last
+iterate, every other estimate NaN. Within a
 fit, `u_seed` holds the conditional-mode warm start incumbent, but it is
 **reset to 0 at the start of every `fit_glmm`** and never carried across fits — a
 cross-fit carry is deliberately rejected (it would break same-seed
@@ -827,6 +1029,35 @@ runs on a copy that only sets the pin flags; θ, the re-evaluation and the SE
 pass keep the search's own Λ, so the reported deviance is the value the search
 reached, not a second quadrature of the same Σ.
 
+Unlike the LMM path, the GLMM path then checks the pinned re-evaluation
+against the search's own best objective. `PIN_THETA` is absolute on θ, but
+what a θ that small is worth depends on the working weights: under very
+precise data (Poisson counts near e¹⁶, working weights about 9e6) a θ̂ of 7e-5
+is a real variance, and zeroing it with β held can raise the deviance by tens
+of units. When the pinned deviance (with the dispersion term the search
+carried) is more than `PIN_DEVIANCE_SLACK = 1e-6` above that best objective,
+the pin is undone: θ goes back to the search's point, the flags are cleared,
+and the fit is re-evaluated and reported there, still `converged`. On the
+grid's pinned cells a pin costs at most 2.6e-8, so no pin there is undone.
+
+A pin that *lowers* the objective by more than `PIN_POLISH_DROP = 1e-7` runs
+one more joint search instead (the trough polish). A variance whose optimum
+is 0 puts a trough `log(1 + θ²·Σw)` in its θ, and under very precise data
+(Σw near 1e7) it is so narrow that the search's trust radius shrinks to its
+end inside it while the other coordinates are still off: on crossed Poisson
+fits near e¹⁴, σ_g ended up to 0.08 short of the `(1 | g)` optimum. Such an
+endpoint sits on the trough's wall, which is why pinning lowers its
+objective. The polish is the joint `[θ | β̃]` search (`ws.solver`) from the
+pinned point, with the pinned coordinates read as 0 and the dispersion held,
+so the trough is gone; its point is kept only when its deviance is lower, and
+then re-evaluated like the pin. β̃ is scaled by the β information at the
+pinned θ, from one PQL solve there, as in the second pass above (the design
+scale when that solve fails). Its evaluations count in `n_eval`; the PQL
+solve does not. On 614 simulated pinned fits it ran on 190, helped 184 of
+them, and left 5 of 100 crossed fits more than 1e-3 above the `(1 | g)`
+optimum against 35 without it; those 5 are fits the polish does not run on.
+No pinned grid cell runs it.
+
 `pinned` is reported in the caller's coordinates. The pin acts on the kernel's
 θ̃, on the standardized design; when a slope of the block is centered, the
 caller's Λ is the lower factor of `N·Λ̃Λ̃ᵀ·Nᵀ`, and its exact zeros, which
@@ -836,6 +1067,17 @@ caller's factor. With no centered slope the zero pattern is the kernel's. The
 same centering makes vector AGQ on a block with a slope integrate in the
 centered `u` coordinates, so its deviance differs from an uncentered fit's by
 the quadrature error ([internal standardization](algorithms.md#internal-standardization-of-the-design)).
+
+Right after that re-evaluation, and before the SE pass overwrites its weights,
+the fit estimates the rounding error of the reported deviance as
+`ε·(|D| + tr_x)` (`fit_glmm`, `extra_ztwz_trace`): `ε·|D|` for the deviance sum,
+and `tr_x`, the trace of `M'WM` over the columns of the extra grouping factors,
+for `log|A|`, whose eigenvalue of exactly 1 (two factors' intercept columns
+both add up to the all-ones column) the factor finds as a difference of
+entries of that size. Above `DEVIANCE_FLOOR_MAX` (1e-2 deviance units, about a
+tenth of a standard error in θ̂) the fit carries `Note::PrecisionLimited`;
+nothing else changes. The read costs one pass over the rows and no
+evaluation; `tr_x` is 0 on the blocked layout and for a pinned extra factor.
 
 `Fit::diagnostics.singular` is `boundary_hit == 1` **or** the post-hoc
 `has_negligible_component()` check at `Fit` assembly (`src/fit/glmm.rs`,
@@ -975,7 +1217,14 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   family's own fit tolerance, so the stencil is never looser than the fit that
   produced the point it differences — and the second differences are
   step-invariant by construction rather than by luck. Whichever rung produced
-  it, if the joint Hessian is non-PD, or a perturbed deviance is non-finite
+  it, the β block of `H_dev` is a Gram in `X` (its leading term is `2·X'W̃X`).
+  When `X'W̃X` has a pivot ratio below `lmm::GRAM_PIVOT_MIN`, every rung runs
+  in the joint search's own β coordinates (`BetaScale`, `β̃ = Lᵀβ` on
+  `X̃ = XL⁻ᵀ`, whose weighted Gram is the identity) and
+  `Cov(β̂) = L⁻ᵀ·Cov(β̃)·L⁻¹` maps back, so a nearly collinear `X` keeps its
+  digits and the stencil's β steps follow the design's own scale; random-effect
+  slopes are still read from `X`, through `z_buf` on every layout.
+  If the joint Hessian is non-PD, or a perturbed deviance is non-finite
   (the few-cluster failure mode), the covariance falls back to the Rx/Schur one
   and reports `FdHessianStatus::NonPdFellBackToRx`.
 
@@ -983,11 +1232,32 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   block of the information at the mode — the observed information on the links
   where it differs from Fisher, as in `log|A|` — directly (`rx_cov_into`, via `blocked_` /
   `structured_` / `packed_schur_fill`). This is fast — one closed-form Schur
-  solve, reusing the factors PIRLS left behind. Its cost is an assumption of
+  solve, reusing the factors PIRLS left behind. The Schur is a Gram in `X`;
+  when its factor shows a pivot ratio below `lmm::GRAM_PIVOT_MIN`, it is
+  rebuilt on `X·U⁻¹`, `U` from a QR of the prior-weighted design
+  (`rx_schur_llt`), so a nearly collinear `X` keeps its digits. Its cost is an assumption of
   β–θ orthogonality: exact for the Gaussian LMM, but anticonservative for a
   GLMM, where the IRLS weights couple β and θ. No scale factor on any family:
   on Gamma the Schur is built from weights that already carry `1/φ̂`, so its
   inverse is `φ̂·RX⁻¹` (see [Gamma dispersion](#gamma-dispersion)).
+
+When the Rx Schur is not positive definite either (under `WaldSe::Hessian`,
+after the joint Hessian failed), no covariance is reported: β̂, θ̂, the
+deviance and `converged` stay as the search left them, the SE outputs are
+`NaN`, and the fit carries `Note::SeUnavailable`. The curvature is read after
+the search and cannot change its optimum, so a failure there does not discard
+it.
+
+Each arm also records the scale-invariant pivot ratio (`min_pivot_ratio`) of
+the β information it factored, on the fitted design's own columns, and the fit
+carries `Note::IllConditioned` when it is below `lmm::PIVOT_MIN` (1e-12, the
+LMM's floor; its doc has the GLMM sweep). Under `WaldSe::Rx`, and on the
+Hessian arm's Rx fallback, that is the Rx Schur complement: the ratio its
+routing test already read where the direct factor is kept, `Uᵀ·L̃` (the rebuilt
+factor mapped back) where it was rebuilt. Under `WaldSe::Hessian` it is rows and
+columns `n_theta..n_theta + p` of the joint Hessian's Cholesky factor, the β
+block with θ profiled out, mapped back through `BetaScale` (`L·F`) when the
+rungs ran in its coordinates. No arm refuses a design over it.
 
 Both are computed on the deviance/log-odds scale (the fit's linear-predictor
 scale), and both are emitted on every layout. The packed-row stencil's step is

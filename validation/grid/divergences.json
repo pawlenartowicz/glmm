@@ -1,6 +1,6 @@
 {
-  "//": "Documented divergences from the reference engines, read by validation/grid/compare.R when it compares parameters against an oracle, and by the in-crate goldens tier (tests/oracle_support) for entries scoped to it. The rules: a difference over band with no entry here FAILS; a difference over band that an entry covers is reported as DOC and passes; a difference that has grown past its entry's max_rel FAILS, so a divergence is never silently absorbed; and an entry whose cell was compared but whose divergence did not fire FAILS as stale, so this file lists only what is still true. `summary` is the standalone short form, so an entry means something without the long form.",
-  "//fields": "id: stable key. cell: which fixture -- a grid cell id for the grid's own consumers, a golden's name for an 'oracle-tier' entry. comparison: 'glmm-vs-oracle' for a glmm-against-an-oracle difference, 'oracle-vs-oracle' for a difference between two oracles, 'oracle-tier' for the in-crate goldens tier; an entry may list several. quantities: the comparison labels each consumer uses. max_rel: the largest relative difference the entry covers — an observation exceeding it FAILS, so a divergence that grows is not silently absorbed. direction: which way the criterion moved.",
+  "//": "Documented divergences from the reference engines, read by validation/grid/compare.R when it compares parameters against an oracle (gate 2) and when it scores truth error (gate 3), and by the in-crate goldens tier (tests/oracle_support) for entries scoped to it. Gate 3 judges a group of cells -- one family, estimator arm and quantity -- so there an entry on any cell of the group covers the whole group, and is stale when the group was scored and did not need it. The rules: a difference over band with no entry here FAILS; a difference over band that an entry covers is reported as DOC and passes; a difference that has grown past its entry's max_rel FAILS, so a divergence is never silently absorbed; and an entry whose cell was compared but whose divergence did not fire FAILS as stale, so this file lists only what is still true. `summary` is the standalone short form, so an entry means something without the long form.",
+  "//fields": "id: stable key. cell: which fixture -- a grid cell id for the grid's own consumers, a golden's name for an 'oracle-tier' entry. comparison: 'glmm-vs-oracle' for a glmm-against-an-oracle difference, 'glmm-vs-truth' for a truth-gate group where glmm's mean error against the generating truth is above the best oracle's by more than the band, 'oracle-vs-oracle' for a difference between two oracles, 'oracle-tier' for the in-crate goldens tier; an entry may list several. quantities: the comparison labels each consumer uses. max_rel: the largest relative difference the entry covers (for 'glmm-vs-truth', the largest amount by which glmm's mean truth error may sit above the best oracle's plus the band) — an observation exceeding it FAILS, so a divergence that grows is not silently absorbed. direction: which way the criterion moved.",
   "//scope": "Every entry here is an oracle defect, a parameter the data does not determine, or (oracle-tier only) an oracle that maximises a different objective from glmm's; an entry of that third kind is admitted only for a golden whose twin on glmm's own objective (a glmmTMB `_tmb` golden) is gated at the ordinary bands in the same tier. A real glmm defect is never registered — it stays red and is tracked as a bug — because an entry would let it pass.",
   "entries": [
     {
@@ -194,9 +194,9 @@
       "quantities": [
         "stddev"
       ],
-      "max_rel": 0.0715,
-      "direction": "glmm's second random-effect SD is above MixedModels'; the deviances agree to 4e-08 relative",
-      "summary": "The boundary regime draws this random-effect SD as exactly 0. glmm reports 2.011e-03, MixedModels 1.925e-03, lme4 1.984e-03 and glmmTMB 9.7e-05 — four engines reporting four different residues of a component that is not there, against deviances that agree to 4.1e-07 absolute. The data does not determine it. Measured 2026-09-23 on the accuracy grid; re-measured 2026-09-28 at 7.14e-02 after that day's outer-search changes, which moved glmm's two g1 SDs to 8.15e-04 and 2.073e-03 (MixedModels 7.73e-04 and 1.925e-03) at a deviance 6.6e-08 above glmm's 2026-09-26 value and still 3.4e-07 below MixedModels'."
+      "max_rel": 0.029,
+      "direction": "glmm's second g1 SD is 2.9e-02 relative (5.7e-05 absolute) above MixedModels'; glmm holds the lower deviance by 4.2e-07",
+      "summary": "The boundary regime draws both g1 SDs as exactly 0, but the data put a shallow dip in the deviance at small nonzero values: setting the two g1 SDs to 0 costs 4.2e-06 deviance units. glmm (7.77e-04 and 1.983e-03), MixedModels (7.73e-04 and 1.925e-03) and lme4 (7.79e-04 and 1.984e-03) all find that dip and agree on it to about 3%. lme4 is not counted as converged because it reports a singular fit, and glmmTMB does not converge. The dip is so shallow that the 2.9e-02 relative difference in the second SD (1.983e-03 against 1.925e-03, 5.7e-05 absolute) costs about 2e-08 deviance units, below what the optimizers resolve. glmm holds the lowest deviance, 4.2e-07 below MixedModels'. Measured 2026-09-23 on the accuracy grid; re-measured on the 2026-10-03 full grid run at 2.893e-02, after the exact-profile search started checking for a saddle at a zero random-effect column (the 2026-10-02 grid run stopped on that saddle at 1.2e-04 and 3.0e-04, 4.0e-06 deviance units above the dip)."
     },
     {
       "id": "grid-binb-q8-boundary-varcorr-not-determined",
@@ -252,6 +252,47 @@
       "max_rel": 0.0038,
       "direction": "glmm's intercept is 8.2e-06 above glmmTMB's; glmm holds the lower deviance by 5.7e-09",
       "summary": "The estimated intercept is 0.0022 and its standard error is 0.13, sixty times larger, so the data do not determine it to the 1e-03 relative band: that band asks for agreement to 2.2e-06, which is 1.7e-05 standard errors. glmm and glmmTMB differ by 8.2e-06, which is 6.2e-05 standard errors. On a quadratic surface that costs 3.9e-09 deviance units, which matches the measured 5.7e-09 gap and is below what either optimizer resolves. The slope agrees to 3.2e-07. lme4 and MixedModels fit a different objective on this cloglog cell and are not references. Measured 2026-09-26 on the accuracy grid."
+    },
+    {
+      "id": "grid-binb-int1-boundary-agq7-stddev-glmmadaptive-residue",
+      "cell": "binb_int1_g3000p20_bal_boundary_agq7",
+      "comparison": [
+        "glmm-vs-oracle"
+      ],
+      "quantities": [
+        "stddev"
+      ],
+      "max_rel": 1.0,
+      "direction": "glmm pins the g1 SD to exactly 0 where GLMMadaptive leaves a residue, so the relative difference is exactly 1 and cannot be larger; glmm holds the lower deviance by 1.16e-02",
+      "summary": "The boundary regime draws the g1 SD as exactly 0. glmm reports it as exactly 0. GLMMadaptive works on log(SD), so it cannot reach 0, and it stops at 1.2e-02, 1.16e-02 deviance units above glmm. lme4 reaches glmm's deviance to 3e-12 with an SD of exactly 0, but it is not counted as converged because it reports a singular fit, so GLMMadaptive is the only converged reference on this AGQ cell (glmmTMB fits Laplace only). Measured 2026-10-05 against the 2026-10-05 grid run, GLMMadaptive run of 2026-10-05."
+    },
+    {
+      "id": "grid-sim-binomial-zerosd-agq7-stddev-glmmadaptive-residue",
+      "cell": "sim_binomial_zerosd_agq7",
+      "comparison": [
+        "glmm-vs-oracle"
+      ],
+      "quantities": [
+        "stddev"
+      ],
+      "max_rel": 1.0,
+      "direction": "glmm pins the g SD to exactly 0 where GLMMadaptive leaves a residue, so the relative difference is exactly 1 and cannot be larger; glmm holds the lower deviance by 3.0e-03",
+      "summary": "Same kind as binb_int1_g3000p20_bal_boundary_agq7. The data are drawn with a zero random-effect SD. glmm and lme4 both report the SD as exactly 0 and agree on the deviance to 3e-12. GLMMadaptive, on log(SD), stops at 5.5e-03, 3.0e-03 deviance units above them. lme4 is not counted as converged because it reports a singular fit, so GLMMadaptive is the only converged reference on this AGQ cell (glmmTMB fits Laplace only). Measured 2026-10-03 against the 2026-10-02 grid run, GLMMadaptive run of 2026-09-29."
+    },
+    {
+      "id": "grid-binb-q2s-g60p5-agq7-glmmadaptive-short-of-boundary",
+      "cell": "binb_q2s_g60p5_bal_base_agq7",
+      "comparison": [
+        "glmm-vs-oracle"
+      ],
+      "quantities": [
+        "beta",
+        "se_hessian",
+        "stddev"
+      ],
+      "max_rel": 0.075,
+      "direction": "glmm's correlation is exactly 1 and GLMMadaptive's 0.999995; under GLMMadaptive's own quadrature rule glmm's estimates hold the lower deviance by 1.2e-04",
+      "summary": "On this cell glmm puts the two-term g1 block on the boundary, with correlation exactly 1. GLMMadaptive stops at 0.999995 and warns that its Hessian at convergence is not positive definite. Evaluated under GLMMadaptive's own quadrature rule at glmm's estimates, with the correlation taken toward 1, the deviance is 78.59599802: 1.2e-04 below GLMMadaptive's reported optimum (78.59611657) and equal to glmm's own deviance to 4e-12. So GLMMadaptive stops short of its own optimum. The differences are 3.2e-03 on beta, 5.0e-02 on se_hessian and 7.5e-02 on the intercept SD (0.0589 against 0.0545); the slope SD agrees to 8e-04. GLMMadaptive is the only oracle on the AGQ arm for this cell. Measured 2026-10-05 against the 2026-10-05 grid run, GLMMadaptive run of 2026-10-05."
     },
     {
       "id": "oracle-cbpp-probit-glmm-beta-lme4-objective",

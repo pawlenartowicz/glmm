@@ -27,8 +27,8 @@ pub const MAX_EXTRA_GROUPINGS: usize = 6;
 pub const MAX_EXTRA_Q: usize = 4;
 
 /// Max θ length: full primary `vech(Λ_p)` plus a `vech(Λ_g)` block per extra
-/// grouping. For `MAX_EXTRA_Q = 1` this collapses to one scalar per extra — the
-/// pre-slope bound `… + MAX_EXTRA_GROUPINGS`.
+/// grouping. For `MAX_EXTRA_Q = 1` this collapses to one scalar per extra:
+/// `… + MAX_EXTRA_GROUPINGS`.
 pub const MAX_THETA: usize = MAX_PRIMARY_Q * (MAX_PRIMARY_Q + 1) / 2
     + MAX_EXTRA_GROUPINGS * (MAX_EXTRA_Q * (MAX_EXTRA_Q + 1) / 2);
 

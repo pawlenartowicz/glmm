@@ -16,8 +16,9 @@
 # Uncorrelated slopes have no structure code here.
 #
 # THE ENUMERATION ORDER IS COSMETIC: each cell's seed is seed_of(cell$cell), a
-# hash of its own id, so inserting or removing a cell anywhere leaves every
-# other cell's data byte-identical. Trimming REPRESENTATIVE after the pilot has
+# hash of its own id (an AGQ cell takes its Laplace parent's id, seed and CSV),
+# so inserting or removing a cell anywhere leaves every other cell's data
+# byte-identical. Trimming REPRESENTATIVE after the pilot has
 # already measured is what makes that property required rather than nice.
 #
 # No cell carries an evaluation cap. A truncated oracle fit is not an oracle;
@@ -431,11 +432,13 @@ oracles_of <- function(cell) {
              !(agq && !(cell$family %in% c("binomial", "poisson")))
   if (lme4_ok) o <- c(o, "lme4")
 
-  # glmmTMB: every cell EXCEPT inverse-Gaussian. Checked against the pinned
-  # glmmTMB: its family list has no inverse-Gaussian entry, so the two
+  # glmmTMB: every cell EXCEPT inverse-Gaussian and AGQ. Checked against the
+  # pinned glmmTMB: its family list has no inverse-Gaussian entry, so the two
   # inverse-Gaussian GLM fixture cells would be an error, not a missing number.
-  # Laplace only; REML = TRUE on gaussian cells; fits GLM cells with no RE term.
-  if (cell$family != "inversegaussian") o <- c(o, "glmmTMB")
+  # Laplace only, so it is dropped on an AGQ cell for the same reason as
+  # MixedModels.jl below; REML = TRUE on gaussian cells; fits GLM cells with no
+  # RE term.
+  if (cell$family != "inversegaussian" && !agq) o <- c(o, "glmmTMB")
 
   # MixedModels.jl: gaussian, binomial logit and probit, poisson. No cloglog, no
   # Gamma, no NB, no inverse-Gaussian, no AGQ arm -- so it is dropped on an AGQ
@@ -522,8 +525,11 @@ add_generated <- function(arm, structure, n_obs, per, balance, regime,
   if (!is.null(offset_col)) c0$offset_col <- offset_col
   if (!is.null(weights_col)) c0$weights_col <- weights_col
   c0$cell <- cell_id_of(c0, arm$tag)
-  c0$seed <- seed_of(c0$cell)
-  c0$data <- sprintf("data/%s.csv", c0$cell)
+  # An AGQ cell fits its Laplace parent's data: same seed, same CSV, so the two
+  # arms differ only in nAGQ.
+  data_id <- if (is.null(nagq)) c0$cell else cell_id_of(modifyList(c0, list(nagq = NULL)), arm$tag)
+  c0$seed <- seed_of(data_id)
+  c0$data <- sprintf("data/%s.csv", data_id)
   c0$factors <- I(if (is.null(st)) character(0) else group_names(st))
   c0$response <- if (identical(c0$form, "trials")) "incidence" else "y"
   if (identical(c0$form, "trials")) c0$weights <- "size"
@@ -818,7 +824,7 @@ for (i in seq_along(cells))
   if (cells[[i]]$cell %in% PILOT_IDS) cells[[i]]$tags <- I("pilot")
 
 # ---- the fast set ------------------------------------------------------------
-# About 85 cells spanning family x structure x size, the subset CI can afford to
+# About 120 cells spanning family x structure x size, the subset CI can afford to
 # fit on every push and the only subset a timed run is allowed to use. Every
 # family and every structure class appears at least once, every empirical cell is
 # in, and a serial glmm pass over the set stays under a minute -- which is met by
@@ -833,12 +839,30 @@ EMPIRICAL_IDS <- vapply(Filter(function(c)
 # convention on four families, the crossed-grouping level cap, the widest single
 # slope block in the corpus, both ends of the negative-binomial theta range, an
 # exactly-zero variance component, and the only inverse-Gaussian data in the
-# grid -- without that last one `fast` would miss a whole family.
+# grid, one cell per link -- without those `fast` would miss a whole family.
 FAST_FIXTURES <- c(
   "wls_basic", "glm_gamma", "glm_nb", "glmm_poisson",
   "sim_crossed_at_cap", "sim_max_q_slope",
   "sim_nb_hightheta_glm", "sim_nb_lowtheta_glm",
-  "sim_binomial_zerosd", "sim_igauss_glm")
+  "sim_binomial_zerosd", "sim_igauss_glm", "sim_igauss_inv_sq_glm")
+
+# Generated cells that carry the timing weight of the set: the small cells above
+# fit in a few seconds altogether, so speed changes on realistic sizes would not
+# show. Nested and 4-way crossed at the core point on every family/link, one
+# slope at the core point, eight random effects per group, and 30000-row crossed
+# fits. Chosen from locked-clock times to keep the whole set under a minute.
+# Two shapes are left out on purpose: a one-grouping cell with at most three
+# random effects gets an AGQ copy in step (8) below, so `q2s` is listed only for
+# the arms whose AGQ copy already exists (no new cell without oracle fits), and
+# no 30000-row `int1` cell is listed for a non-gaussian family.
+FAST_SIZED <- c(
+  sprintf("%s_%s_g3000p20_bal_base",
+          rep(c("lmm", "binb", "prbb", "cllb", "pois", "gaml", "gami", "nb"), 2),
+          rep(c("nest2", "cross4"), each = 8L)),
+  sprintf("%s_q2s_g3000p20_bal_base", c("lmm", "binb", "pois", "gaml", "nb")),
+  "lmm_q8_g3000p20_bal_base", "binb_q8_g3000p20_bal_base",
+  "lmm_int1_g30000p20_bal_base", "lmm_cross4_g30000p20_bal_base",
+  sprintf("%s_cross4_g30000p20_bal_base", c("binb", "pois", "gaml", "nb")))
 
 FAST_IDS <- unique(c(
   # (1) every family/link/form arm at the core point.
@@ -859,7 +883,7 @@ FAST_IDS <- unique(c(
     }, "")
   })),
   # (3) four size points on one arm, all at the small end -> the size axis is a
-  #     ladder in `fast` too, without paying for a 30000-row cell.
+  #     ladder in `fast` too; the 30000-row cells come in through (7).
   vapply(list(c(60L, 5L), c(300L, 5L), c(300L, 20L), c(3000L, 20L)),
     function(sz) need(sprintf("binomial int1 g%dp%d", sz[1], sz[2]),
       pick(function(c) identical(c$structure, "int1") && identical(c$family, "binomial") &&
@@ -874,20 +898,26 @@ FAST_IDS <- unique(c(
   #     boundary of the parameter space stay under test.
   vapply(c("boundary", "nearzero"), function(r) need(paste("binomial", r),
     pick(function(c) identical(c$structure, "int1") && identical(c$family, "binomial") &&
-      identical(c$regime, r))), "")
+      identical(c$regime, r))), ""),
+  # (7) the sized cells above.
+  FAST_SIZED
 ))
-# (7) the nAGQ = AGQ_K copy of every fast cell adaptive quadrature can fit, so a
+# (8) the nAGQ = AGQ_K copy of every fast cell adaptive quadrature can fit, so a
 # timed run times each such cell under both Laplace and AGQ. The shape rule
 # mirrors the kernel's nagq > 1 gate (src/fit/common.rs, assert_model_shape):
 # binomial / Poisson / NB / Gamma, one grouping factor, at most 3 random effects
 # per group -- change together. A generated copy is a generated cell of its own
-# (own id, seed and CSV), built exactly as the section-5 AGQ cells are, and
-# reuses one of them when it already exists. A read-in copy reads the same CSV
-# under the id <name>_agq<K>.
+# id that reads its parent's seed and CSV, built exactly as the section-5 AGQ
+# cells are, and reuses one of them when it already exists. A read-in copy reads
+# the same CSV under the id <name>_agq<K>.
+# A non-log Gamma link is left out: no pinned oracle fits it under AGQ (lme4's
+# Gamma AGQ deviance has no saturated-term alignment, GLMMadaptive's Gamma is
+# log-link only), so its copy would have no reference.
 agq_ok <- function(c) {
   s <- re_shape(c)
   is.null(c$nagq) && s$n_groups == 1L && s$q1 <= 3L &&
-    c$family %in% c("binomial", "poisson", "negativebinomial", "gamma")
+    c$family %in% c("binomial", "poisson", "negativebinomial", "gamma") &&
+    !(c$family == "gamma" && c$link != "log")
 }
 for (c in Filter(function(c) c$cell %in% FAST_IDS && agq_ok(c), cells)) {
   if (!is.null(c$seed)) {
@@ -916,7 +946,7 @@ for (i in seq_along(cells))
   if (cells[[i]]$cell %in% FAST_IDS) {
     cells[[i]]$tags <- I(c(cells[[i]]$tags, "fast"))
     if (!is.null(cells[[i]]$seed))
-      cells[[i]]$data <- sprintf("data/fast/%s.csv", cells[[i]]$cell)
+      cells[[i]]$data <- sprintf("data/fast/%s", basename(cells[[i]]$data))
   }
 
 # ---- self-checks -------------------------------------------------------------
@@ -986,7 +1016,7 @@ stopifnot("pilot misses an oracle" =
 # The fast set: size, the empirical members the subset is required to carry, and
 # the two spans it is chosen for.
 fast <- Filter(function(c) "fast" %in% c$tags, cells)
-stopifnot("fast set is not ~85 cells" = { n <- length(fast); n >= 50 && n <= 90 })
+stopifnot("fast set is not ~120 cells" = { n <- length(fast); n >= 100 && n <= 135 })
 stopifnot("fast is missing an empirical cell" =
   all(EMPIRICAL_IDS %in% vapply(fast, `[[`, "", "cell")))
 stopifnot("fast misses a family" =
@@ -1002,7 +1032,7 @@ stopifnot("fast misses a structure class" =
 # regenerated.
 stopifnot("a fast generated cell does not read data/fast/" =
   all(vapply(fast, function(c) is.null(c$seed) ||
-    identical(c$data, sprintf("data/fast/%s.csv", c$cell)), TRUE)))
+    identical(c$data, sprintf("data/fast/%s.csv", sub("_agq[0-9]+", "", c$cell))), TRUE)))
 stopifnot("a cell outside the fast set reads data/fast/" =
   all(vapply(cells, function(c) "fast" %in% c$tags ||
     !startsWith(c$data, "data/fast/"), TRUE)))

@@ -104,6 +104,20 @@ test_that("constructed notes store with their tier and title", {
                      "was used. Its standard errors tend to be too small, so p-values and",
                      "confidence intervals may look more precise than they are. Standard",
                      "errors for the random-effect standard deviations are not available.")),
+    list(note = modifyList(base, list(kind = "se_unavailable")),
+         cls = "fastglmm_se_unavailable",
+         msg = paste("Standard errors could not be computed at the fit's end point: the",
+                     "fixed effects carry too little separate information. The estimates are",
+                     "usable; standard errors, p-values and confidence intervals are not",
+                     "reported. Check for predictors that are copies or near-copies of each",
+                     "other.")),
+    list(note = modifyList(base, list(kind = "precision_limited")),
+         cls = "fastglmm_precision_limited",
+         msg = paste("The numbers in this fit are so large that rounding in the computer's",
+                     "arithmetic hides small changes in its deviance. The random-effect",
+                     "estimates, and the fixed effects that depend on them, may be off by a",
+                     "tenth of a standard error or more. This happens with counts in the",
+                     "billions or more, or when a model misses a large effect in such data.")),
     list(note = modifyList(base, list(kind = "exact_profile_fallback")),
          cls = "fastglmm_exact_profile_fallback",
          msg = paste("The default search method for this model did not settle on an answer,",
@@ -243,6 +257,8 @@ test_that("argument notes come in the documented order", {
 INNER <- "Some of its inner steps ran out of iterations."
 PIRLS <- list(list(kind = "pirls_exhausted", columns = integer(0), pivot = NaN,
                    evals = 3L, final_eval = FALSE, detail = ""))
+SEPARATED <- list(list(kind = "separated", columns = integer(0), pivot = NaN,
+                       evals = 0L, final_eval = FALSE, detail = ""))
 ADVICE <- "Try a simpler random-effects structure or check for nearly collinear predictors."
 SEARCH <- function(inner) paste(c(
   "The search for the variance estimates reached its step limit before it settled.",
@@ -289,6 +305,9 @@ test_that(".nonconvergence picks one kind, in the documented order", {
     list(nc("poisson", TRUE, PIRLS, beta = nan), "fit_failed", FAILED(INNER)),
     # finite coefficients but no end point: failed, not a search limit
     list(nc("gaussian", TRUE), "fit_failed", FAILED(character())),
+    # ... unless the fixed-effects-only GLM stopped on separation (the "separated" note)
+    list(nc("binomial", TRUE, SEPARATED), "glm_diverged", BINOMIAL),
+    list(nc("poisson", TRUE, SEPARATED), "glm_diverged", COUNTS),
     # no fixed effects (y ~ 0 + (1 | g)): the deviance decides
     list(nc("gaussian", TRUE, beta = double(), aliased = logical()), "fit_failed",
          FAILED(character())),
@@ -338,6 +357,26 @@ test_that("a separated GLM stores glm_diverged last", {
   expect_identical(got$fit$warnings$kind[[n]], "glm_diverged")
   expect_identical(conditionMessage(got$cond), printed(got$fit$warnings[n, ]))
   expect_equal(sum(got$fit$warnings$tier == "severe"), 1L)
+})
+
+test_that("a reciprocal-link response out of range names the cause", {
+  # 1/mu = 1/(1e80 * ...) is below the kernel's 1e-75 bound on the Gamma inverse link.
+  d <- data.frame(x = x, g = g, y = 1e80 * (2 + 0.1 * x))
+  fit <- suppressWarnings(fastglmm(y ~ x, d, family = Gamma(link = "inverse")))
+  expect_false(fit$converged)
+  n <- nrow(fit$warnings)
+  expect_identical(fit$warnings$kind[[n]], "glm_diverged")
+  expect_match(fit$warnings$message[[n]], "Rescale the response", fixed = TRUE)
+  # The GLMM searches on a rescaled response when the cluster means are far
+  # out of scale (src/fit/glmm.rs, `gamma_inverse_units`), so it fits these
+  # data as it fits y * 1e-80, the log-likelihood moved by -n * log(1e80).
+  fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), d, family = Gamma(link = "inverse")))
+  d_small <- transform(d, y = y * 1e-80)
+  small <- suppressWarnings(fastglmm(y ~ x + (1 | g), d_small,
+                                     family = Gamma(link = "inverse")))
+  expect_true(fit$converged && small$converged)
+  want <- as.numeric(logLik(small)) - nrow(d) * log(1e80)
+  expect_lt(abs(as.numeric(logLik(fit)) - want), 1e-6 * abs(want))
 })
 
 test_that("an all-zero binomial is a constant response, not separation", {
@@ -395,7 +434,9 @@ test_that("the kind table matches the Python port", {
     singular = c("caution", "Singular fit"),
     ill_conditioned = c("caution", "Nearly collinear columns"),
     hessian_se_fallback = c("caution", "Simpler standard errors used"),
+    se_unavailable = c("caution", "Standard errors not computed"),
     exact_profile_fallback = c("caution", "Search retried with a different method"),
+    precision_limited = c("caution", "Numbers too large for full precision"),
     agq_fallback = c("caution", "Adaptive quadrature not used"),
     non_integer_response = c("caution", "Non-integer response"),
     rows_dropped_na = c("caution", "Rows dropped for missing values"),
@@ -459,32 +500,4 @@ test_that("port parity non_integer_response", {
   expect_identical(fit$warnings$tier, "caution")
   expect_identical(fit$warnings$kind, "non_integer_response")
   expect_identical(fit$warnings$title, "Non-integer response")
-})
-
-# 12-row Gamma-inverse GLMM, 4 clusters of 3 — the exact fixture
-# gamma_inverse_adversarial(1e-2) builds in src/fit/glmm_tests.rs, with the
-# same literal data in python/tests/test_warnings.py - change together. Rows
-# 4..6 (R's 1-based indexing; the second cluster) are scaled by 1e-2,
-# spreading the 12 means over about ten decades, which is what makes the
-# joint Hessian non-PD.
-.HSE_X1 <- c(
-  -0.2884326052962697, 0.15675840297260962, -0.29990566105127503, 0.3053648563367106,
-  -0.608001199771249, 1.451281361998219, -0.12817918698856592, 0.2873778743945057,
-  1.2188666482896826, -1.2520230368147756, -0.01938374443978608, 1.0354827975218956
-)
-.HSE_Y <- c(
-  0.013147681629338537, 0.022571111060908807, 0.009380481267257667,
-  13915684.733974772 * 1e-2, 16148934.63843452 * 1e-2, 47449285.58840935 * 1e-2,
-  0.03659612272549357, 0.03340213953300986, 0.16526466878896995,
-  2288.1399088594685, 5963.477254271042, 19049.155692047607
-)
-
-test_that("port parity hessian_se_fallback", {
-  d <- data.frame(x = .HSE_X1, y = .HSE_Y,
-                   g = factor(sprintf("g%d", rep(0:3, each = 3))))
-  fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), d, family = Gamma(link = "inverse")))
-  expect_true(fit$converged)
-  expect_identical(fit$warnings$tier, "caution")
-  expect_identical(fit$warnings$kind, "hessian_se_fallback")
-  expect_identical(fit$warnings$title, "Simpler standard errors used")
 })

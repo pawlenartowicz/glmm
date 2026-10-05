@@ -108,7 +108,8 @@ main <- function() {
   for (e in names(runs)) for (m in runs[[e]]$metas) {
     cat(sprintf("  %-6s %-30s no_turbo=%-2s pin=%-8s load=%-16s %s  %s  timed=%s  %s\n",
                 LABEL[[e]], m$machine, m$no_turbo, m$pin_cores, m$loadavg_start,
-                substr(m$glmm_git_rev, 1, 8), m$date, m$timed, m$label))
+                sub("^([0-9a-f]{8})[0-9a-f]*", "\\1", m$glmm_git_rev), m$date, m$timed,
+                m$label))
     if (is_unlocked(m)) {
       cat(sprintf("  WARNING: clock NOT locked on %s (no_turbo=%s) -- its numbers below are noise, not measurements\n",
                   LABEL[[e]], m$no_turbo))

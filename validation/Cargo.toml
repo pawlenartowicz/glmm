@@ -26,6 +26,16 @@ glmm = { path = "..", features = ["formula"] }
 # slightly, and every other pass of this campaign reads wall time.
 [features]
 counters = ["glmm/counters"]
+# The loop tier (`glmm::loop_advanced`), for the speed campaign's loop_bench
+# example only (its `required-features`). A passthrough, not enabled on the
+# dependency, so a workspace build never turns the unstable surface on.
+loop_advanced = ["glmm/loop_advanced"]
+# loop_bench's OS counters: per-fit thread CPU time, instructions and cycles
+# (macOS), the block's getrusage CPU and peak RSS. Three libc calls in a
+# cfg-gated module, the only `unsafe` in this package; off by default, so a
+# default build has no direct libc dependency and no `unsafe`, and the records
+# carry wall time with the counter fields null. Speed runs turn it on.
+os_counters = ["dep:libc"]
 
 # No `parallel` passthrough: every example here fits serial. The one that wants
 # inner parallelism, campaigns/speed-campaign/agq_par_probe.rs, asks for it on the
@@ -34,6 +44,13 @@ counters = ["glmm/counters"]
 [dev-dependencies]
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# loop_bench's per-fit CPU time, instructions and cycles (getrusage,
+# clock_gettime, proc_pid_rusage), only with the `os_counters` feature.
+# Already in Cargo.lock through the crate's own dependency tree; never a
+# dependency of glmm itself.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [lints]
 workspace = true
@@ -73,3 +90,11 @@ path = "tools/bit_identity/dump.rs"
 [[example]]
 name = "grid_glmm"
 path = "grid/engines/glmm.rs"
+
+# Loop-tier benchmark: one workspace per shape, D simulated draws refitted on
+# it, one JSONL record per fit (campaigns/speed-campaign/README.md, "loop_bench").
+# Build with `--features loop_advanced` (and `counters` for the count runs).
+[[example]]
+name = "loop_bench"
+path = "campaigns/speed-campaign/loop_bench.rs"
+required-features = ["loop_advanced"]

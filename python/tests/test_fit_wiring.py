@@ -227,12 +227,17 @@ def test_offset_shifts_poisson_intercept_by_minus_constant():
 
 
 def test_warm_start_reaches_same_answer_as_cold():
-    y = 1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)
+    # Own generator, so the data do not depend on which tests drew from `_rng`
+    # first. theta = 5 sits far from this fit's optimum, so the warm search runs
+    # well past the cold one's count (27 evaluations against 12, x86_64). A
+    # nearer start can tie the cold count by chance, and a tie says nothing
+    # about whether the start reached the fit.
+    y = 1.0 + 2.0 * _X + np.random.default_rng(4).normal(scale=0.5, size=_N)
     cold = glmm.fit(_data(y.tolist()), "y ~ x + (1 | g)")
     warm = glmm.fit(
         _data(y.tolist()),
         "y ~ x + (1 | g)",
-        warm_start={"beta": cold.beta.tolist(), "theta": [0.05]},
+        warm_start={"beta": cold.beta.tolist(), "theta": [5.0]},
     )
     assert warm.converged
     assert np.allclose(warm.beta, cold.beta, atol=1e-6)

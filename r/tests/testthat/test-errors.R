@@ -348,6 +348,31 @@ test_that("start must be a list - message matches the Python port's warm_start c
   )
 })
 
+test_that("a ragged list is refused, not recycled", {
+  # glm() and lmer() refuse it in model.frame(); as.data.frame() would recycle
+  # the length-3 column to 6 rows.
+  expect_error(
+    fastglmm(y ~ x, list(y = c(1.1, 2.3, 2.9, 4.2, 5.1, 5.8), x = c(0, 1, 2))),
+    'columns have mismatched lengths ("x": 3, "y": 6)', fixed = TRUE
+  )
+})
+
+test_that("a wrong-width start names the argument, not a kernel struct", {
+  d <- err_data()
+  expect_error(fastglmm(y ~ x + (1 | g), d, start = list(beta = 0)),
+               "warm-start beta has 1 entries but the model has 2 fixed-effect", fixed = TRUE)
+  expect_error(fastglmm(y ~ x + (1 | g), d, start = list(theta = c(1, 0))),
+               "warm-start theta has 2 entries but the model has 1 random-effect", fixed = TRUE)
+})
+
+test_that("an infinite offset() term names the term, not a kernel struct", {
+  d <- err_data()
+  d$o <- 0
+  d$o[2] <- Inf
+  expect_error(fastglmm(y ~ x + offset(o), d), "term 'offset(o)' is not finite at row 1",
+               fixed = TRUE)
+})
+
 test_that("wald.se must be 'hessian' or 'rx' - mirrors the Python port's wald_se check", {
   d <- err_data()
   expect_error(fastglmm(y ~ x, d, wald.se = "observed"),

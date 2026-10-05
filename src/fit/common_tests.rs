@@ -78,9 +78,8 @@ pub(crate) const PIN_REL_ITER: f64 = 1e-7;
 ///
 /// That four-order spread is not noise in the measurement — it tracks how much
 /// ITERATION sits downstream of the reduction that rounds differently. A single
-/// solve lands at ~1e-7; the NB fit's marginal golden-section θ search compounds
-/// the same last-bit difference into 7.9e-4. So a band is sized per test against
-/// its own measured drift, never corpus-wide.
+/// solve lands at ~1e-7; the sparse NB GLMM fit drifts by 7.9e-4. So a band is
+/// sized per test against its own measured drift, never corpus-wide.
 ///
 /// **Re-freezing rule: re-pin on the anchor.** A value harvested on the second
 /// machine is as arithmetically valid as the anchor's, but mixing the two splits
@@ -858,6 +857,28 @@ fn fit_sim_collinear_drops_the_aliased_column() {
     assert!(f.se[3].is_nan(), "aliased se = NaN");
     assert_pinned(&f.beta[..3], &REF_BETA, PIN_REL_OLS, "beta");
     assert_pinned(&f.se[..3], &REF_SE, PIN_REL_OLS, "se");
+}
+
+/// A design with two columns entangled to `δ = 2⁻²⁰`, `[1, a, a + δ·b]`, and
+/// the same model on well-conditioned columns, `[1, a, b]` (row-major, `n`
+/// rows, `p = 3`). `a` and `b` are small integers, so `a + δ·b` is exact in
+/// f64 and the two designs span exactly the same space: the coefficient of
+/// `a + δ·b` is the `[1, a, b]` fit's `b` coefficient divided by `δ`, and so
+/// is its SE, with no rounding in the map. `cond(X)` after standardization is
+/// about 2e6, so a Gram of `X` loses about 1e-4 relative where the reparameterized
+/// fit is exact to round-off; the pivot ratio stays near 1e-12, above the alias
+/// gate's `ALIAS_EPS`, so nothing is dropped.
+pub(crate) fn entangled_dyadic_designs(n: usize) -> (Vec<f64>, Vec<f64>, f64) {
+    let delta = 2f64.powi(-20);
+    let mut x = Vec::with_capacity(3 * n);
+    let mut xr = Vec::with_capacity(3 * n);
+    for i in 0..n {
+        let a = ((i * 37) % 101) as f64 - 50.0;
+        let b = ((i * 53) % 97) as f64 - 48.0;
+        x.extend([1.0, a, a + delta * b]);
+        xr.extend([1.0, a, b]);
+    }
+    (x, xr, delta)
 }
 
 /// Deterministic pseudo-data (NR LCG), uniform in (−1, 1). The shared LCG
@@ -2365,8 +2386,7 @@ fn diagnostics_ill_conditioned_note_through_fit_cold() {
 /// `materialize_diagnostics` directly rather than a real GLMM fit: this pins the
 /// mapping itself, one flag at a time, without depending on a fixture that
 /// happens to trip both. The payloads a real solve produces are asserted
-/// separately — `pirls_exhausted_note_counts_fit_path_evals_only`,
-/// `gamma_inverse_non_pd_hessian_falls_back_to_rx_se` and
+/// separately — `pirls_exhausted_note_counts_fit_path_evals_only` and
 /// `exact_profile_fallback_reruns_on_pql_then_joint` in `glmm_tests`.
 #[test]
 fn carrier_flags_become_pirls_and_hessian_notes() {

@@ -226,6 +226,41 @@ pub(crate) enum FamDowndate {
     },
 }
 
+/// Copy the rows' levels into `ids` as one flat run, the `n` primary ids then
+/// each extra grouping's `n` ids, for [`same_rows`]. Reuses `ids`'s capacity.
+pub(crate) fn record_rows(
+    ids: &mut Vec<u32>,
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    n: usize,
+) {
+    ids.clear();
+    ids.extend_from_slice(&cluster_ids[..n]);
+    for e in extra_ids {
+        ids.extend_from_slice(&e[..n]);
+    }
+}
+
+/// True when `cluster_ids`/`extra_ids` over `n` rows are the levels
+/// [`record_rows`] stored in `ids`. A workspace whose symbolic structures were
+/// built from those levels can keep them for a new draw: the patterns (blocks,
+/// co-occurrence, packed offsets, symbolic factors) depend on the rows' levels
+/// and the groupings only, while x, y and the weights enter the values. The
+/// grouping count is fixed per workspace, so equal lengths mean equal `n`.
+pub(crate) fn same_rows(
+    ids: &[u32],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    n: usize,
+) -> bool {
+    n > 0
+        && ids.len() == n * (1 + extra_ids.len())
+        && std::iter::once(cluster_ids)
+            .chain(extra_ids.iter().map(Vec::as_slice))
+            .zip(ids.chunks_exact(n))
+            .all(|(a, b)| a[..n] == *b)
+}
+
 /// Per-fit workspace for the sparse-Z LMM path. Everything θ-independent —
 /// `Z'Z`, `Z'[X y]`, `[X y]'[X y]`, the Λ block map — is built once in `new`;
 /// every per-eval buffer of the blocked kernel (`sparse_schur_factor`) is
@@ -343,6 +378,20 @@ pub(crate) struct SparseLmmWorkspace {
     /// through (`x·U⁻¹`), the same one the dense kernel uses
     /// (`crate::lmm::DesignQr`).
     pub(crate) design_qr: crate::lmm::DesignQr,
+    /// The rows' levels the pattern was built from ([`record_rows`]).
+    pub(crate) ids: Vec<u32>,
+    /// Pass-2 offsets, fixed with the pattern: each extra declaration's start
+    /// in a row's z-entry list (`seg_off`), each crossed factor's first block
+    /// in `lam_blocks` (`cf_base`), each `a21_blk` block's slab in `pk_a21`
+    /// (`a21_slab_off`) and each `a22_pairs` pair's block in `pk_a22`
+    /// (`a22_off`).
+    pub(crate) seg_off: Vec<usize>,
+    pub(crate) cf_base: Vec<usize>,
+    pub(crate) a21_slab_off: Vec<usize>,
+    pub(crate) a22_off: Vec<usize>,
+    /// Pass-2 row scratch: one row of `x·U⁻¹` (`p`) and one row's z entries.
+    pub(crate) xt: Vec<f64>,
+    pub(crate) row: Vec<(usize, f64)>,
 }
 
 /// Per-family factor state that [`sparse_schur_factor`] otherwise throws away,
@@ -511,7 +560,6 @@ impl SparseLmmWorkspace {
                 o += g.extra_q[ei];
             }
         }
-        let nested_decl = g.nested.map(|nf| nf.decl);
         let mut decl_base = vec![usize::MAX; n_extras];
         for (ci, cf) in g.crossed.iter().enumerate() {
             decl_base[cf.decl] = cf_base[ci];
@@ -548,7 +596,7 @@ impl SparseLmmWorkspace {
 
         // Packed-stream allocation + scatter offsets, sized from the pattern.
         let fam_len = q_p * q_p + np * (q_n * q_p + q_n * q_n);
-        let mut pk_fam = vec![0.0f64; n_prim * fam_len];
+        let pk_fam = vec![0.0f64; n_prim * fam_len];
         let mut a21_blk: Vec<u32> = Vec::new();
         let mut a21_off = Vec::with_capacity(n_prim + 1);
         let mut pk_a21_off = Vec::with_capacity(n_prim + 1);
@@ -567,15 +615,138 @@ impl SparseLmmWorkspace {
         }
         a21_off.push(a21_blk.len());
         pk_a21_off.push(pk_a21_len);
-        let mut pk_a21 = vec![0.0f64; pk_a21_len];
-        let mut a22_off_map = std::collections::HashMap::<(u32, u32), usize>::new();
+        let pk_a21 = vec![0.0f64; pk_a21_len];
+        // Start of each pair's block in pk_a22 (parallel to a22_pairs).
+        let mut a22_off: Vec<usize> = Vec::with_capacity(a22_pairs.len());
         let mut pk_a22_len = 0usize;
         for pr in &a22_pairs {
-            a22_off_map.insert((pr[0], pr[1]), pk_a22_len);
+            a22_off.push(pk_a22_len);
             pk_a22_len += lam_blocks[pr[0] as usize].q * lam_blocks[pr[1] as usize].q;
         }
-        let mut pk_a22 = vec![0.0f64; pk_a22_len];
+        let pk_a22 = vec![0.0f64; pk_a22_len];
 
+        let tail = if sparse_tail {
+            Some(build_sparse_tail(
+                &lam_blocks,
+                &fam_crossed,
+                &a22_pairs,
+                kf,
+                e,
+                m,
+                fam_w,
+            ))
+        } else {
+            None
+        };
+
+        let mut ids = Vec::with_capacity(n * (1 + n_extras));
+        record_rows(&mut ids, cluster_ids, extra_ids, n);
+        let mut ws = Self {
+            g: g.clone(),
+            ztxy: vec![0.0f64; g.k_total * m],
+            cxy: Mat::zeros(m, m),
+            pk_fam,
+            pk_a21,
+            pk_a22,
+            a21_blk,
+            a21_off,
+            pk_a21_off,
+            a22_pairs,
+            lam_blocks,
+            lam_small,
+            fam_w,
+            fam_a: vec![0.0f64; fam_w * fam_w],
+            l21: if sparse_tail {
+                Vec::new()
+            } else {
+                vec![0.0f64; e * kf]
+            },
+            u1: vec![0.0f64; kf * m],
+            s22: if sparse_tail {
+                Mat::zeros(0, 0)
+            } else {
+                Mat::zeros(e, e)
+            },
+            u2: vec![0.0f64; e * m],
+            tail,
+            factor: Mat::zeros(m, m),
+            tail_llt_mem,
+            factor_llt_mem: MemBuffer::new(cholesky_in_place_scratch::<f64>(
+                m,
+                Par::Seq,
+                Spec::default(),
+            )),
+            sigma_sq: f64::NAN,
+            ranef_u: Vec::new(),
+            m,
+            p,
+            n,
+            rec: None,
+            design_qr: crate::lmm::DesignQr::identity(p),
+            ids,
+            seg_off,
+            cf_base,
+            a21_slab_off,
+            a22_off,
+            xt: vec![0.0f64; p],
+            row: Vec::with_capacity(q_p + g.extra_q.iter().sum::<usize>()),
+        };
+        ws.fill_values(x, cluster_ids, extra_ids, y, sqrt_w);
+        ws
+    }
+
+    /// Pass 2 of [`Self::new`], into the buffers the pattern sized: `Z'[X y]`,
+    /// `[X y]'[X y]`, the fixed-effect factor `U` and every packed raw-Gram
+    /// block, from the rows. Every value buffer is cleared first and the
+    /// per-fit state is reset, so a workspace refilled for a draw on the same
+    /// rows ([`same_rows`]) holds exactly what a new one would, with no
+    /// allocation.
+    pub(crate) fn fill_values(
+        &mut self,
+        x: MatRef<f64>,
+        cluster_ids: &[u32],
+        extra_ids: &[Vec<u32>],
+        y: &[f64],
+        sqrt_w: Option<&[f64]>,
+    ) {
+        let SparseLmmWorkspace {
+            g,
+            ztxy,
+            cxy,
+            pk_fam,
+            pk_a21,
+            pk_a22,
+            a21_blk,
+            a21_off,
+            a22_pairs,
+            design_qr,
+            seg_off,
+            cf_base,
+            a21_slab_off,
+            a22_off,
+            xt,
+            row,
+            sigma_sq,
+            ranef_u,
+            rec,
+            m,
+            p,
+            n,
+            ..
+        } = self;
+        let (m, p, n) = (*m, *p, *n);
+        let q_p = g.primary_q;
+        let np = g.nested_per_parent;
+        let q_n = g.nested.map(|nf| nf.q).unwrap_or(0);
+        let nested_decl = g.nested.map(|nf| nf.decl);
+        let fam_len = q_p * q_p + np * (q_n * q_p + q_n * q_n);
+        // `a22_pairs` is sorted by (col block, row block), unique.
+        let a22_at = |bh: u32, bl: u32| -> usize {
+            let at = a22_pairs
+                .binary_search_by_key(&(bl, bh), |pr| (pr[1], pr[0]))
+                .expect("row's crossed block pair is in the A22 pattern");
+            a22_off[at]
+        };
         // ---- Pass 2 (values): Z'[X y], [X y]'[X y], and every packed raw-Gram
         // block, scattered per row over Z's ≤ q_p + Σq_e nonzeros — O(n·(Σq)²)
         // total, same accumulation the dense Gram + `pack` copy produced,
@@ -584,15 +755,14 @@ impl SparseLmmWorkspace {
         // a fixed `[usize; 1 + MAX_EXTRA_GROUPINGS]` stack array (`src/lmm/kernel.rs`)
         // and would index out of bounds for over-envelope-by-count designs —
         // the sparse route must stay cap-free.
-        let mut ztxy = vec![0.0f64; g.k_total * m];
-        let mut cxy = Mat::<f64>::zeros(m, m);
-        let mut row: Vec<(usize, f64)> =
-            Vec::with_capacity(g.primary_q + g.extra_q.iter().sum::<usize>());
+        ztxy.fill(0.0);
+        cxy.fill(0.0);
+        pk_fam.fill(0.0);
+        pk_a21.fill(0.0);
+        pk_a22.fill(0.0);
         // The fixed-effect design enters every Gram below as `x·U⁻¹`; the
         // z entries (slopes included) stay on the raw `x`.
-        let mut design_qr = crate::lmm::DesignQr::identity(p);
-        let mut xt = vec![0.0f64; p];
-        design_qr.set_from_rows(x.subrows(0, n), |i| sqrt_w.map_or(1.0, |w| w[i]), &mut xt);
+        design_qr.set_from_rows(x.subrows(0, n), |i| sqrt_w.map_or(1.0, |w| w[i]), xt);
         for i in 0..n {
             // One √wᵢ per row factor: `row`'s z entries already carry it
             // (`for_each_z_entry`), so the raw x/y reads below must carry a
@@ -607,8 +777,8 @@ impl SparseLmmWorkspace {
             for (j, xj) in xt.iter_mut().enumerate() {
                 *xj = x[(i, j)];
             }
-            design_qr.solve_row(&mut xt);
-            for &(ca, va) in &row {
+            design_qr.solve_row(xt);
+            for &(ca, va) in row.iter() {
                 for j in 0..p {
                     ztxy[ca * m + j] += va * (sw * xt[j]);
                 }
@@ -655,7 +825,7 @@ impl SparseLmmWorkspace {
                     }
                 }
             }
-            let fam_list = &fam_crossed[f];
+            let fam_list = &a21_blk[a21_off[f]..a21_off[f + 1]];
             for (ci, cf) in g.crossed.iter().enumerate() {
                 let bi = (cf_base[ci] + extra_ids[cf.decl][i] as usize) as u32;
                 let q = cf.q;
@@ -681,7 +851,7 @@ impl SparseLmmWorkspace {
                 }
                 // A22 diagonal block (bi, bi), full q×q — the fold reads both
                 // triangles of the raw block, as the dense Gram stored them.
-                let off = a22_off_map[&(bi, bi)];
+                let off = a22_at(bi, bi);
                 for a in 0..q {
                     for b in 0..q {
                         pk_a22[off + a * q + b] += vx[a].1 * vx[b].1;
@@ -698,7 +868,7 @@ impl SparseLmmWorkspace {
                     } else {
                         (bj, vx2, cf2.q, bi, vx, q)
                     };
-                    let off = a22_off_map[&(bh, bl)];
+                    let off = a22_at(bh, bl);
                     for a in 0..qh {
                         for b in 0..ql {
                             pk_a22[off + a * ql + b] += vh[a].1 * vl[b].1;
@@ -707,65 +877,9 @@ impl SparseLmmWorkspace {
                 }
             }
         }
-        drop(a22_off_map);
-
-        let tail = if sparse_tail {
-            Some(build_sparse_tail(
-                &lam_blocks,
-                &fam_crossed,
-                &a22_pairs,
-                kf,
-                e,
-                m,
-                fam_w,
-            ))
-        } else {
-            None
-        };
-
-        Self {
-            g: g.clone(),
-            ztxy,
-            cxy,
-            pk_fam,
-            pk_a21,
-            pk_a22,
-            a21_blk,
-            a21_off,
-            pk_a21_off,
-            a22_pairs,
-            lam_blocks,
-            lam_small,
-            fam_w,
-            fam_a: vec![0.0f64; fam_w * fam_w],
-            l21: if sparse_tail {
-                Vec::new()
-            } else {
-                vec![0.0f64; e * kf]
-            },
-            u1: vec![0.0f64; kf * m],
-            s22: if sparse_tail {
-                Mat::zeros(0, 0)
-            } else {
-                Mat::zeros(e, e)
-            },
-            u2: vec![0.0f64; e * m],
-            tail,
-            factor: Mat::zeros(m, m),
-            tail_llt_mem,
-            factor_llt_mem: MemBuffer::new(cholesky_in_place_scratch::<f64>(
-                m,
-                Par::Seq,
-                Spec::default(),
-            )),
-            sigma_sq: f64::NAN,
-            ranef_u: Vec::new(),
-            m,
-            p,
-            n,
-            rec: None,
-            design_qr,
-        }
+        *sigma_sq = f64::NAN;
+        ranef_u.clear();
+        *rec = None;
     }
 
     /// Arm [`SparseRecovery`] for the NEXT evaluation. Sized here, once, from
@@ -1156,8 +1270,12 @@ pub(crate) fn sparse_reml_deviance(theta: &[f64], ws: &mut SparseLmmWorkspace) -
 
     let lyy = l[(p, p)];
     let df = (ws.n - p) as f64;
-    let sigma_sq = lyy * lyy / df;
-    if !(sigma_sq.is_finite() && sigma_sq > 0.0) {
+    let r_sq = lyy * lyy;
+    let sigma_sq = r_sq / df;
+    // Exact-fit floor: mirrors `reml_deviance_blocked`'s (`src/lmm/kernel.rs`,
+    // see the reason there) — change together.
+    let r_sq_floor = (ws.g.k_total + p + 1) as f64 * f64::EPSILON * ws.cxy[(p, p)];
+    if !(sigma_sq.is_finite() && sigma_sq > 0.0 && r_sq > r_sq_floor) {
         return f64::INFINITY;
     }
     ws.sigma_sq = sigma_sq;
@@ -1286,7 +1404,7 @@ fn sparse_schur_factor(theta: &[f64], ws: &mut SparseLmmWorkspace) -> Option<f64
         // B2 tail rows: fill per crossed block (stride 1), same Λ'-fold as the
         // U1 rows below. Runs BEFORE the family loop so the sparse branch can
         // downdate `B̃₂ = B2 − L21·U1` per family off its compact panel; the
-        // dense branch downdates after the loop with one GEMM as before (the
+        // dense branch downdates after the loop with one GEMM (the
         // fill only reads lam_small/ztxy, so its position is irrelevant to it).
         for br in &lam_blocks[cb0..] {
             let (q, t0) = (br.q, br.start - kf);

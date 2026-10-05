@@ -267,6 +267,27 @@ def test_residuals_response_and_pearson():
         make_fit(fitted=np.array([])).residuals()
 
 
+def test_pearson_residuals_stay_finite_at_extreme_means():
+    # V = mu^2 (Gamma) and mu^3 (inverse Gaussian) leave the double range here;
+    # sqrt(V) does not. Expected: (y - mu) / sqrt(phi * V).
+    gamma = make_fit(
+        family="gamma",
+        link="log",
+        dispersion=0.5,
+        y=np.array([1.5e200, 1e-200]),
+        fitted=np.array([1e200, 2e-200]),
+    )
+    np.testing.assert_allclose(gamma.residuals(type="pearson"), [0.5**0.5, -(0.5**0.5)])
+    ig = make_fit(
+        family="inversegaussian",
+        link="log",
+        dispersion=0.25,
+        y=np.array([2e150, 2e-150]),
+        fitted=np.array([1e150, 1e-150]),
+    )
+    np.testing.assert_allclose(ig.residuals(type="pearson"), [2e-75, 2e75])
+
+
 _NUM = re.compile(r"-?\d+\.\d+(?:e[-+]?\d+)?")
 
 

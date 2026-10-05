@@ -929,6 +929,25 @@ fn log_of_a_nonpositive_value_is_reported_not_finite_at_its_row() {
 }
 
 #[test]
+fn a_non_finite_offset_term_is_reported_at_its_row() {
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+            (
+                "o".into(),
+                Column::Numeric(vec![0.0, f64::INFINITY, 0.0, 0.0]),
+            ),
+        ],
+        n: 4,
+    };
+    let err = match lower("y ~ 1 + offset(o)", &table, Family::Gaussian) {
+        Ok(_) => panic!("expected an infinite offset() entry to be rejected"),
+        Err(e) => e,
+    };
+    assert_eq!(err.to_string(), "term 'offset(o)' is not finite at row 1");
+}
+
+#[test]
 fn transform_of_a_factor_column_is_rejected_as_not_numeric() {
     let table = Table {
         columns: vec![
@@ -1092,8 +1111,12 @@ fn interaction_grouping_produces_dense_composite_ids() {
 #[test]
 fn re_groups_align_with_varcorr_blocks() {
     // Pinned from glmm; validated by the `penicillin_lmm` oracle cell.
-    const PLATE_SD: f64 = 0.846704431738483;
-    const SAMPLE_SD: f64 = 1.9315583121903848;
+    // Re-pinned 2026-10-02 with the per-search BOBYQA start radii (LMM blind
+    // start 0.5): the search takes another path to the same optimum, plate sd
+    // 1.2e-7 and sample sd 1.9e-7 relative, REML criterion 1.5e-12 lower, no
+    // converged, singular or pinned flag changed.
+    const PLATE_SD: f64 = 0.846704534225002;
+    const SAMPLE_SD: f64 = 1.9315579384727732;
 
     let data = rows(include_str!("../validation/data/empirical/Penicillin.csv"));
     let table = Table {

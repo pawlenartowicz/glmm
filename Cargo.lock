@@ -65,9 +65,9 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bobyqa"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29652fc14c962e886cb95080521404983d791286b465baf11ee6decb2842b490"
+checksum = "2f3df91f7beeb19919190c7543bd69374f262176274d5e917b0efafc4b36573b"
 
 [[package]]
 name = "bytemuck"
@@ -1476,6 +1476,7 @@ name = "validation"
 version = "0.4.1"
 dependencies = [
  "glmm",
+ "libc",
  "serde",
  "serde_json",
 ]

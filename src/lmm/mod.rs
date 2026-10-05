@@ -29,20 +29,18 @@
 //! optimization without derivatives*, Cambridge report DAMTP 2009/NA06.
 
 use bobyqa::{Bobyqa, Config, RestartConfig, Status};
-use faer::reborrow::ReborrowMut;
 use faer::{Mat, MatMut, MatRef};
 use std::sync::OnceLock;
 
 use crate::scalar::Scalar;
 use crate::standardize::ColumnScaling;
-use crate::FLOAT_NEAR_ZERO;
 
 mod kernel;
 mod re_map;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use kernel::{precompute_balanced_collapse, DesignQr};
+pub(crate) use kernel::{precompute_balanced_collapse, DesignQr, GRAM_PIVOT_MIN};
 pub use kernel::{reml_deviance, LmmSuffStats};
 use re_map::{pack_vech, refactor, PivotFloor};
 
@@ -53,13 +51,33 @@ use re_map::{pack_vech, refactor, PivotFloor};
 pub const THETA0: f64 = 1.0;
 /// Per-component θ upper box (θ ≤ 1e3).
 pub const THETA_HI: f64 = 1e3;
-/// Initial trust radius. Must be ≤ 1.0: PRIMA start-projection silently moves
-/// an x₀ within rho_begin of a bound, and the box is [−THETA_HI, THETA_HI] on
-/// every coordinate (`blind_theta_and_bounds`), so θ₀ = 1.0 stays clear of
-/// both bounds at any rho_begin ≤ 1.0. Box width 2e3 ≥ 2·rho_begin is the
-/// crate's up-front validity requirement. 0.5 is the value the eval schedule
-/// was measured under.
+/// Initial trust radius of the LMM θ search from the blind start (diagonals
+/// `THETA0`). Must be ≤ 1.0: PRIMA's start projection moves an x₀ that lies
+/// within rho_begin of a bound, and the box is [−THETA_HI, THETA_HI] on every
+/// coordinate (`blind_theta_and_bounds`), so θ₀ = 1.0 stays clear of both
+/// bounds at any rho_begin ≤ 1.0. Box width 2e3 ≥ 2·rho_begin is the crate's
+/// up-front validity requirement.
+///
+/// Measured 2026-10-02 (aarch64, evaluation counts) on a stratified sample of
+/// the Gaussian cells of the accuracy grid (46 cells, one cold fit each),
+/// against a start radius of 0.1: the evaluation total is 0.88, 0.81, 0.83,
+/// 0.95 and 0.78 of it at n_θ 1, 2–3, 4–8, 9–17 and 18+, and 0.66 to 0.88 on
+/// the four widest LMM cells (n_θ 21 to 40, four start nudges each), with no
+/// deviance worse by more than 1e-6 and no convergence or singular flag
+/// changed. 0.2 gains less, 1.0 gains less at n_θ 18+. A single cell's count
+/// moves by up to ±15% under a start nudge of 1e-9, so only totals over many
+/// cells carry the choice.
 pub const RHO_BEGIN: f64 = 0.5;
+/// Initial trust radius of a θ-only search that starts from a caller's θ₀
+/// (`fit_warm`, the `loop_advanced` truth and carry starts): the LMM search and
+/// GLMM stage 1 after the start guard kept the caller's θ₀. Such a start sits
+/// near the optimum, where a wide first model only re-explores. On aarch64, on
+/// parametric replicates of the grid cells started at the generating θ or at
+/// the previous replicate's estimate, 0.05 takes 4 to 6% more LMM and 1 to 2%
+/// more stage-1 evaluations than 0.1, and 0.2 takes 4% more on stage 1 (0.98 to
+/// 1.00 of 0.1 on the LMM); on the loop-tier benchmark shapes, 0.03 to 0.2 move
+/// the warm total by −1% to +4%.
+pub const RHO_BEGIN_WARM: f64 = 0.1;
 /// Final trust radius = θ̂ target accuracy. 1e-6 measured equivalent to 1e-8
 /// on every validation check under the amended abs floors (stat 1e-4 /
 /// β̂ 1e-5), at 15.1–15.7 vs 19.5–20.7 evals/fit — a ~25% eval cut for free.
@@ -78,10 +96,36 @@ pub const RHO_END: f64 = 1e-6;
 /// it. Original timing rationale (vs 1e-6): 0.265–0.269s vs 0.288s on
 /// `grouseticks` (n=403, 7 free params), a ~7–8% wall-time cut for free.
 pub const GLMM_RHO_END: f64 = 3e-6;
+/// Initial trust radius of a GLMM search from the blind θ₀: the θ-only stage-1
+/// search (`PqlThenJoint` and `ExactProfile`) and the joint search on the
+/// `Joint` route (which includes nAGQ > 1). Measured 2026-10-02 (aarch64,
+/// evaluation counts) against 0.1 on a stratified sample of the accuracy grid
+/// (one cold fit per cell): the exact-profile evaluation total is 0.97, 1.01,
+/// 0.96, 0.88 and 0.71 of it at n_θ 1, 2–3, 4–8, 9–17 and 18+, the PQL stage-1
+/// total 1.03, 1.07, 0.84 and 0.86 at n_θ 2–3, 4–8, 9–17 and 18+, the `Joint`
+/// route 0.98. 0.5 does as well on the widest exact-profile cells but loses at
+/// n_θ 9–17. No fit ends at a worse deviance.
+pub const GLMM_RHO_BEGIN: f64 = 0.2;
+/// Initial trust radius of the joint `[θ | β̃ | ln φ]` search when it polishes
+/// a stage-1 optimum (`PqlThenJoint`, and the `ExactProfile` fallback onto it).
+/// The start is already close, so a wide first model only re-explores: on
+/// aarch64, on the 58 `PqlThenJoint` cells of the same sample the polish takes
+/// 0.83 of the evaluations it takes at 0.1, and a radius of 0.2 takes 1.53
+/// times those at 0.03. Not used when stage 1 ends near a singular block: see
+/// [`POLISH_NEAR_SINGULAR`].
+pub const GLMM_RHO_POLISH: f64 = 0.03;
+/// A stage-1 optimum with a diagonal |θ̃| below this (the search's own
+/// coordinates) hands the joint polish a block near the singular boundary.
+/// From such a start the 0.03 polish can stop on the flat boundary surface
+/// short of the optimum: measured on the singular gamma-inverse grid cells,
+/// one start nudge in eight ended 2.3e-3 deviance units above every other
+/// fit, which a polish at `RHO_BEGIN_WARM` reaches. So that polish starts at
+/// `RHO_BEGIN_WARM` instead. On the non-singular cells the rule never fires.
+pub const POLISH_NEAR_SINGULAR: f64 = 1e-2;
 /// Truth-start floor: a `Some(θ₀)` start is clamped to max(θ₀, this) so a
 /// zero/near-zero true θ never starts the search on the boundary itself.
-/// Keep ≥ 10·RHO_END: the future scaled schedule derives
-/// rho_begin = 0.1·θ₀, and the crate requires rho_end ≤ rho_begin.
+/// It sits above `PIN_THETA`, so a floored start never begins at a pinned
+/// component.
 pub const THETA_TRUTH_FLOOR: f64 = 0.01;
 /// Pin threshold: a Converged diagonal component ≤ this is deterministically
 /// pinned at exactly 0 and counted converged. 1e-4 aligns the class boundary
@@ -96,12 +140,13 @@ pub const THETA_TRUTH_FLOOR: f64 = 0.01;
 /// badly scaled design can be flagged differently from lme4's `isSingular`,
 /// which applies the same 1e-4 to user-scale θ.
 pub const PIN_THETA: f64 = 1e-4;
-/// Ill-conditioning DETECTION floor for the LMM route, on the
-/// scale-invariant per-column pivot ratio of X'V⁻¹X at θ̂
-/// ([`crate::ols::min_pivot_ratio`]). Below it the fixed-effect coefficients are
+/// Ill-conditioning DETECTION floor for the LMM and GLMM routes, on the
+/// scale-invariant per-column pivot ratio ([`crate::ols::min_pivot_ratio`]) of
+/// X'V⁻¹X at θ̂ on the LMM, and of the β information its SE arm factors on the
+/// GLMM. Below it the fixed-effect coefficients are
 /// barely identified and the diagnostics channel says so — it is **not** a
-/// refuse threshold, and this route refuses no design on conditioning grounds
-/// (see the guard site for the two measured reasons).
+/// refuse threshold, and neither route refuses a design on conditioning grounds
+/// (see the LMM guard site for the two measured reasons).
 ///
 /// Calibrated 2026-07-31 against a 1-ULP perturbation sweep of `y`. `1e-12` sits
 /// about two decades above where the statistic stops tracking conditioning on
@@ -115,8 +160,25 @@ pub const PIN_THETA: f64 = 1e-4;
 /// pivot 9.7e-11 — above the floor, so unflagged — is 4.3e-5 on the dense kernel
 /// and 1.1e-4 on the sparse one, against 9.4e-10 without it.
 ///
-/// No SOLVER path reads it: the kernel records the raw pivot and the comparison
-/// happens once, in `LmmResultView::diagnostics`, which is what fills
+/// The GLMM route was swept the same way on 2026-10-03 (worst of 16 ±1-ULP
+/// sign patterns on `y`; a count or a success proportion re-rounded by one ULP
+/// is still a valid response), on `x = [1, a, a + δ·b]`, `δ = 2⁻ᵏ`, Poisson-log
+/// and binomial logit and probit with 10 trials, under one random intercept,
+/// with a crossed one added, and with a crossed random slope. The pivot is the
+/// one that route records: the Rx Schur complement, or the β block of the joint
+/// Hessian, which agree to within 21% on every design swept. Where β is
+/// profiled out exactly (the first two shapes), β̂ moves by 2.8e-8 to 2.6e-6 at
+/// pivot 9e-13 to 1e-12, by at most 3.1e-6 down to pivot 1.4e-14, and by 1.6e-5
+/// to 1.4e-4 at pivot 3.4e-15: `1e-12` sits about two decades above that knee,
+/// conservative as on the LMM. On the joint `[θ | β]` search (the crossed
+/// slope, packed layout) the search's own stopping width hides the
+/// conditioning: β̂ moves by 9e-6 to 3.2e-4 at every pivot from 0.6 down to
+/// 5e-15, so there the floor is the profiled routes' value, not one measured on
+/// it.
+///
+/// No SOLVER path reads it: the kernels record the raw pivot and the comparison
+/// happens once per route, in `LmmResultView::diagnostics` and
+/// `GlmmResultView::diagnostics`, which is what fills
 /// `FitDiagnostics::ill_conditioned`.
 pub const PIVOT_MIN: f64 = 1e-12;
 
@@ -228,8 +290,8 @@ pub use crate::consts::{MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q, MAX_PRIMARY_Q};
 /// A crossed extra grouping factor's θ-layout descriptor. `vech_start` is the
 /// θ index where its `vech(Λ_g)` block begins (`q·(q+1)/2` entries, column-major
 /// lower-tri); `q = 1 + #slopes` is its RE width; `n_levels` is its crossed level
-/// count. For `q == 1` (intercept only) `vech_start` is the old scalar θ index and
-/// the block is a single variance — byte-identical to the pre-slope layout.
+/// count. For `q == 1` (intercept only) `vech_start` is the scalar θ index and
+/// the block is a single variance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossedFactor {
     pub vech_start: usize,
@@ -302,7 +364,7 @@ pub struct LmmGroupings {
     pub extra_slopes_any: bool,
     /// Per-extra-grouping RE width `q_g = 1 + #slopes`, DECLARATION order (parallel
     /// to `extra_offsets`). Sizes each grouping's RE-column block (`level·q_g + d`)
-    /// and its `vech(Λ_g)`. All `1` for intercept-only extras (pre-slope shape).
+    /// and its `vech(Λ_g)`. All `1` for intercept-only extras.
     pub extra_q: Vec<usize>,
     /// Per-extra-grouping `[X y]` row indices of that grouping's slope covariates
     /// (resolved x columns), DECLARATION order — the crossed/nested analogue of
@@ -317,8 +379,7 @@ pub struct LmmGroupings {
 /// declaration order) contributes its `q` diagonal entries (column-major: the
 /// diagonal of column d sits at offset `Σ_{j<d}(q−j)` within the factor's vech
 /// block), and the next factor's block starts `q(q+1)/2` θ-slots later. With
-/// every extra `q == 1` this is `[primary diagonals, base+0, base+1, …]` — the
-/// pre-slope layout.
+/// every extra `q == 1` this is `[primary diagonals, base+0, base+1, …]`.
 fn compute_diagonal_theta(primary_q: usize, extra_qs: &[usize]) -> Vec<usize> {
     let mut idx = Vec::with_capacity(primary_q + extra_qs.len());
     let mut start = 0usize;
@@ -390,9 +451,8 @@ impl LmmGroupings {
         let q_p = 1 + slope_cols.len();
         // Width-general layout: the primary block is `q_p · n_primary` wide
         // ([intercept 0..S | slope_0 S..2S | … | slope_{q-2}]), and the
-        // nested children + crossed tail follow exactly as before, shifted up by
-        // the (q_p−1)·n_primary slope columns. q_p=1 ⇒ `prim_width == n_primary`,
-        // so every offset (and k_total) is byte-identical to the pre-slope path.
+        // nested children + crossed tail follow, shifted up by the
+        // (q_p−1)·n_primary slope columns. q_p=1 ⇒ `prim_width == n_primary`.
         // OWNING site for the RE-column layout: `add_rows_multi`'s zx_slope/s fills
         // and `primary_gram`/`reml_deviance`'s reads use the same `d·n_primary + f`
         // (slope) / `prim_width + f·np + c` (nested-child) convention — change together.
@@ -408,8 +468,7 @@ impl LmmGroupings {
         // handed an over-envelope design.
         // θ order is declaration order: each extra owns a vech(Λ_g) block of
         // q_g(q_g+1)/2 slots starting at `vech_start`, packed after the primary
-        // vech. For all q_g == 1, `vech_start == base_theta + g` — the pre-slope
-        // scalar layout, bit-identical.
+        // vech. For all q_g == 1, `vech_start == base_theta + g`.
         let base_theta = q_p * (q_p + 1) / 2;
         let extra_qs: Vec<usize> = re
             .extra_groupings
@@ -437,8 +496,8 @@ impl LmmGroupings {
                 extra_offsets[g] = prim_width; // nested children begin after the primary block
             }
         }
-        // Nested children are q_nested RE columns each (q_nested == 1 ⇒ the
-        // pre-slope single-indicator width).
+        // Nested children are q_nested RE columns each (q_nested == 1 ⇒ a
+        // single indicator column).
         let q_nested = nested.map(|nf| nf.q).unwrap_or(0);
         // Nested block width mirrored by `fit::core`'s capacity pin — change together.
         let mut off = prim_width + n_primary * nested_per_parent * q_nested;
@@ -489,7 +548,7 @@ impl LmmGroupings {
 
     /// Primary vech (`q_p(q_p+1)/2`) + a `vech(Λ_g)` block per extra grouping
     /// (`q_g(q_g+1)/2` each). With every `q_g == 1` this is
-    /// `primary vech + #extras` — the pre-slope shape.
+    /// `primary vech + #extras`.
     pub fn n_theta(&self) -> usize {
         let prim = self.primary_q * (self.primary_q + 1) / 2;
         let nested = self.nested.map(|nf| nf.q * (nf.q + 1) / 2).unwrap_or(0);
@@ -498,7 +557,7 @@ impl LmmGroupings {
     }
     /// Columns eliminated family-by-family: the `q_p` primary RE cols per level
     /// plus nested children (`q_nested` cols each). (`k_crossed = k_total −
-    /// k_family` is the dense tail.) `q_nested == 1` ⇒ the pre-slope width.
+    /// k_family` is the dense tail.)
     pub fn k_family(&self) -> usize {
         let q_nested = self.nested.map(|nf| nf.q).unwrap_or(0);
         self.n_primary * self.primary_q + self.n_primary * self.nested_per_parent * q_nested
@@ -546,9 +605,8 @@ impl LmmGroupings {
     /// calls `fix_column_signs` on the endpoint, so a negative diagonal never
     /// leaves the crate.
     ///
-    /// The box changes BOBYQA's interpolation set and trust-region steps on
-    /// every fit, boundary or not, so the bit-identity dumps
-    /// (`validation/tools/bit_identity/`) were re-pinned with it.
+    /// The box shapes BOBYQA's interpolation set and trust-region steps on
+    /// every fit, boundary or not.
     pub fn blind_theta_and_bounds(&self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let n = self.n_theta();
         let mut theta = vec![THETA0; n];
@@ -572,8 +630,9 @@ impl LmmGroupings {
 // ---------------------------------------------------------------------------
 
 /// Per-fit scratch, allocated once per (p, max_clusters). `T` is the kernel
-/// scalar (`f64` by default; the dual-number type once the derivative work lands);
-/// fields that stay `f64` say why at their own doc.
+/// scalar. Every fit runs at `f64`; the scratch and [`reml_deviance`] stay
+/// generic so the deviance can also be evaluated at a dual-number `T` for exact
+/// θ-derivatives. Fields that stay `f64` say why at their own doc.
 pub struct LmmFitScratch<T = f64> {
     /// Row-major w×w family block (w = q_p + n_per) — assembled and
     /// Crout-factored in place per family; rows contiguous for the Crout.
@@ -756,12 +815,12 @@ pub struct LmmRecovery {
     pub t_sq: Vec<f64>,
     /// `L_XX⁻¹e_j` forward-solve scratch for `var_diag` (first `p` slots).
     pub u: Vec<f64>,
-    /// p×p X'V⁻¹X rebuild (L_XX·L_XXᵀ) + the shared joint-Wald scratch
-    /// (mirrors the lme workspace triple the promoted helper expects).
-    pub joint_xtvix: Mat<f64>,
-    pub joint_k_inv: Mat<f64>,
-    pub joint_sigma_t_chol: Mat<f64>,
-    pub joint_rhs: Vec<f64>,
+    /// p×p; column `j` holds `u` as solved for target `j` — the columns
+    /// [`joint_wald_chi_sq`] reads.
+    pub joint_cols: Mat<f64>,
+    /// p×p and length-p scratch of [`joint_wald_chi_sq`].
+    pub joint_qr: Mat<f64>,
+    pub joint_z: Vec<f64>,
 }
 
 impl LmmRecovery {
@@ -772,10 +831,9 @@ impl LmmRecovery {
             var_diag: vec![0.0; p],
             t_sq: vec![0.0; p],
             u: vec![0.0; p],
-            joint_xtvix: Mat::zeros(p, p),
-            joint_k_inv: Mat::zeros(p, p),
-            joint_sigma_t_chol: Mat::zeros(p, p),
-            joint_rhs: vec![0.0; p],
+            joint_cols: Mat::zeros(p, p),
+            joint_qr: Mat::zeros(p, p),
+            joint_z: vec![0.0; p],
         }
     }
 }
@@ -954,9 +1012,16 @@ pub struct LmmWorkspace {
     pub(crate) kernel: LmmKernel,
     /// β̂ and the standard-error/Wald buffers, filled once at θ̂.
     pub recovery: LmmRecovery,
-    /// BOBYQA solver state — `Bobyqa::new` is the crate's only allocation
-    /// site; `minimize` is zero-alloc on the warm path.
+    /// BOBYQA solver state for the blind start (`RHO_BEGIN`). `Bobyqa::new` is
+    /// the crate's only allocation site; `minimize` is zero-alloc on the warm
+    /// path.
     pub solver: Bobyqa,
+    /// Solver for a caller-supplied θ₀: `config` at `RHO_BEGIN_WARM`. Built on
+    /// the first such fit, so a workspace that only fits cold never pays for
+    /// it and a warm loop allocates it once.
+    pub(crate) solver_warm: Option<Bobyqa>,
+    /// The blind-start solver's config, kept to build `solver_warm`.
+    pub(crate) config: Config,
     /// θ in/out buffer for `minimize`; holds θ̂ (post-pin) after `fit_lmm`.
     pub theta: Vec<f64>,
     /// Lower box bound, −THETA_HI on every entry (`blind_theta_and_bounds`).
@@ -967,6 +1032,11 @@ pub struct LmmWorkspace {
     /// accumulated (`1.0` unweighted): the kernel runs on ŵ = w/s, so its σ̂²
     /// is the raw-scale σ̂² divided by s.
     pub(crate) weight_scale: f64,
+    /// The scaled prior weights ŵ = w/s that `fit::lmm::accumulate_lmm_rows`
+    /// hands the kernel (√ŵ once the sparse kernel has taken them). Empty
+    /// until the first weighted draw, then refilled in place, so a weighted
+    /// loop allocates it once.
+    pub(crate) w_scaled: Vec<f64>,
 }
 
 impl LmmWorkspace {
@@ -982,7 +1052,7 @@ impl LmmWorkspace {
     }
 
     /// Workspace for a validated non-degenerate ClusterSpec at max_n. Carries
-    /// the spec-derived truth start and a scaled BOBYQA schedule.
+    /// the blind θ start and its BOBYQA schedule (`RHO_BEGIN`, `RHO_END`).
     /// `slope_cols` are the x_full column indices for the primary slopes
     /// (`spec.cluster_slope_design_cols` as usize); pass `&[]` for callers without slopes.
     /// Test-only convenience over [`Self::for_cluster_spec_ext`] (the live path);
@@ -1017,19 +1087,6 @@ impl LmmWorkspace {
         let groupings =
             LmmGroupings::from_cluster_spec_ext(cluster, max_n, slope_cols, extra_slope_cols);
         let n_theta = groupings.n_theta();
-        // Scaled schedule: rho_begin = 0.1·min θ₀ — the eval count is
-        // dominated by rho shrinkage, not travel distance. The start is now the cold
-        // blind θ₀ (ModelSpec is structure-only), so every diagonal entry is
-        // THETA0 and the fold collapses to it. Fold over DIAGONAL entries only — a
-        // signed off-diagonal λ_{d,j} near 0 must not drive the start radius.
-        let blind_theta = vec![THETA0; n_theta];
-        let rho_begin = (0.1
-            * groupings
-                .diagonal_theta()
-                .iter()
-                .map(|&i| blind_theta[i])
-                .fold(f64::INFINITY, f64::min))
-        .min(RHO_BEGIN);
         // npt: ⌈1.5n⌉+1 from n_theta = 3 up, Powell's 2n+1 below: the mid model
         // wins on every measured dim ≥ 3
         // (n=3 lmm_slope 1.06x / crossed_nested 1.05x, n=6 multislope 1.10x —
@@ -1042,7 +1099,7 @@ impl LmmWorkspace {
             2 * n_theta + 1
         };
         let mut config = Config::new(n_theta);
-        config.rho_begin = rho_begin;
+        config.rho_begin = RHO_BEGIN;
         config.rho_end = RHO_END;
         config.npt = npt;
         apply_campaign_overrides(&mut config, n_theta);
@@ -1067,10 +1124,13 @@ impl LmmWorkspace {
             recovery: LmmRecovery::new(p),
             solver: Bobyqa::new(n_theta, config)
                 .expect("BOBYQA config constants are valid by construction"),
+            solver_warm: None,
+            config,
             theta,
             lower,
             upper,
             weight_scale: 1.0,
+            w_scaled: Vec::new(),
         }
     }
 
@@ -1093,10 +1153,13 @@ impl LmmWorkspace {
             // failure here is an engine bug, not a runtime branch.
             solver: Bobyqa::new(n_theta, bobyqa_config(n_theta))
                 .expect("BOBYQA config constants are valid by construction"),
+            solver_warm: None,
+            config: bobyqa_config(n_theta),
             theta,
             lower,
             upper,
             weight_scale: 1.0,
+            w_scaled: Vec::new(),
         }
     }
 
@@ -1290,8 +1353,8 @@ pub(crate) fn fix_mode_signs(
 fn canonicalize_block(vech: &mut [f64], q: usize) -> bool {
     // With no diagonal at the pin threshold Λ is already the unique Cholesky
     // factor of its own Σ and the factorization below would only reproduce it
-    // up to round-off. Returning early instead keeps every non-singular fit
-    // BIT-identical, which is what the bit-identity dumps check.
+    // up to round-off. Returning early instead leaves every non-singular fit's
+    // Λ bit-for-bit as the optimizer returned it.
     let mut off = 0usize;
     let mut any_pinned = false;
     for d in 0..q {
@@ -1382,11 +1445,10 @@ fn assemble_primary_a<T: Scalar>(fam_a: &mut [T], stride: usize, lam: &[T], gram
 /// the row-major `fam_a` (`w = q_p + n_per`): the primary `q_p×q_p` block, then
 /// the nested children's diagonals and their coupling to the primary.
 ///
-/// Lifted out of [`reml_deviance`]'s family loop so [`recover_ranef`] rebuilds
-/// the same `L_f` the deviance factored rather than restating the assembly —
-/// the deviance keeps only the LAST family's factor, and recovery needs all of
-/// them. Pure extraction: same operations in the same order, so the deviance is
-/// bit-identical to the pre-extraction path.
+/// Shared by [`reml_deviance`]'s family loop and [`recover_ranef`], so recovery
+/// rebuilds the same `L_f` the deviance factored rather than restating the
+/// assembly — the deviance keeps only the LAST family's factor, and recovery
+/// needs all of them.
 #[allow(clippy::too_many_arguments)] // one call site each; the alternative is a struct of borrows
 fn assemble_fam_a<T: Scalar>(
     fam_a: &mut [T],
@@ -1454,9 +1516,8 @@ fn assemble_fam_a<T: Scalar>(
 
 /// Family `f`'s coupling `B_f` to the `[crossed | X y]` tail, written as `w`
 /// contiguous `t_dim`-long columns (`bt_fam[r·t_dim + t]`) — the same slice
-/// [`reml_deviance`] writes at `fit.bt`'s columns `f·w .. f·w+w`. Extracted
-/// alongside [`assemble_fam_a`], for the same reason and with the same
-/// bit-identity claim.
+/// [`reml_deviance`] writes at `fit.bt`'s columns `f·w .. f·w+w`. Shared for
+/// the same reason as [`assemble_fam_a`].
 #[allow(clippy::too_many_arguments)] // as `assemble_fam_a`
 fn assemble_fam_b<T: Scalar>(
     bt_fam: &mut [T],
@@ -1631,7 +1692,7 @@ pub(crate) fn recover_ranef(
 }
 
 /// Recovery on the crossed/nested-slopes blocked path. `fit.blocked_p` still
-/// holds the UNFACTORED penalized augmented matrix at θ̂ (faer's `llt` builds a
+/// holds the UNFACTORED penalized augmented matrix at θ̂ (`SeqLlt` builds a
 /// fresh factor rather than working in place), so one re-factorization hands
 /// back both halves at once: `L_ZZ` is its leading `k×k` block and `U` its
 /// `[X y]` rows, `U[a][j] = L[(k+j), a]`.
@@ -1648,7 +1709,7 @@ fn recover_ranef_blocked(
     let k = g.k_total;
     let dim = k + m;
     let pref = faer::MatRef::from_column_major_slice(&fit.blocked_p[..dim * dim], dim, dim);
-    let Ok(chol) = pref.llt(faer::Side::Lower) else {
+    let Some(chol) = crate::linalg::SeqLlt::new(pref) else {
         return false;
     };
     let l = chol.L();
@@ -1728,7 +1789,7 @@ fn recover_ranef_family(
     if kx > 0 {
         let tail_ref =
             faer::MatRef::from_column_major_slice(&fit.tail[..t_dim * t_dim], t_dim, t_dim);
-        let Ok(chol) = tail_ref.llt(faer::Side::Lower) else {
+        let Some(chol) = crate::linalg::SeqLlt::new(tail_ref) else {
             return false;
         };
         let l = chol.L();
@@ -1877,130 +1938,87 @@ pub struct LmmFit {
     pub pivot_col: u32,
 }
 
+/// Joint Wald-χ² statistic over the target set `T`,
+///
+/// ```text
+/// W = β̂_T' Σ_T⁻¹ β̂_T / σ̂²
+/// ```
+///
+/// with `Σ_T` the targets' block of `Var(β̂)/σ̂²`, read from a square root of
+/// it: column `t` of `cols` (for each target `t`; the other columns are not
+/// read) holds `c_t` with `Var(β̂_a, β̂_b) = σ̂²·c_aᵀc_b`, so `Σ_T = C_TᵀC_T`.
+/// The fit routes hold these columns already, the per-target forward solves
+/// `L⁻¹bₜ` their variances are the norms of. Under H₀: β_T = 0,
+/// `W ~ χ²(k)` asymptotically.
+///
+/// `W = ‖R⁻ᵀβ̂_T‖²/σ̂²` with `C_T = Q·R` by modified Gram–Schmidt, which yields
+/// the same `R` as Householder QR in floating point (Björck & Paige 1992,
+/// *SIAM J. Matrix Anal. Appl.* 13(1)), so `W` carries `cond(C_T)·ε`. Forming
+/// `Σ_T` and factoring it, or factoring the information re-formed from its
+/// factor and inverting that, would square it: measured on `[1, x, x + δz]`
+/// at cond(X) ≈ 2e6, 2e-4 relative on a two-target `W` against 3e-11 here.
+///
+/// `qr` (`p×p`) and `z` (length `p`) are scratch. `NaN` when `k == 0`,
+/// `σ̂² ≤ 0`, a target is out of range, or `C_T` is rank deficient.
+pub(crate) fn joint_wald_chi_sq(
+    cols: MatRef<'_, f64>,
+    betas: &[f64],
+    sigma_sq: f64,
+    target_indices: &[u32],
+    mut qr: MatMut<'_, f64>,
+    z: &mut [f64],
+) -> f64 {
+    let p = betas.len();
+    let k = target_indices.len();
+    if k == 0 || p == 0 || !(sigma_sq.is_finite() && sigma_sq > 0.0) {
+        return f64::NAN;
+    }
+    let r = cols.nrows();
+    for (a, &t) in target_indices.iter().enumerate() {
+        let t = t as usize;
+        if t >= p {
+            return f64::NAN;
+        }
+        for i in 0..r {
+            qr[(i, a)] = cols[(i, t)];
+        }
+        z[a] = betas[t];
+    }
+    // Step j takes column j's norm `R_jj` and removes its direction from the
+    // later columns (`R_jl`), and forward-substitutes `Rᵀz = β̂_T` along:
+    // `z[l]` holds `β̂_l − Σ_{j<l} R_jl·z_j` until step `l` divides it by `R_ll`.
+    let mut w = 0.0_f64;
+    for j in 0..k {
+        let rjj = (0..r).map(|i| qr[(i, j)] * qr[(i, j)]).sum::<f64>().sqrt();
+        if !(rjj.is_finite() && rjj > 0.0) {
+            return f64::NAN;
+        }
+        for i in 0..r {
+            qr[(i, j)] /= rjj;
+        }
+        let zj = z[j] / rjj;
+        w += zj * zj;
+        for l in (j + 1)..k {
+            let rjl: f64 = (0..r).map(|i| qr[(i, j)] * qr[(i, l)]).sum();
+            for i in 0..r {
+                let qij = qr[(i, j)];
+                qr[(i, l)] -= rjl * qij;
+            }
+            z[l] -= rjl * zj;
+        }
+    }
+    if !w.is_finite() {
+        return f64::NAN;
+    }
+    w / sigma_sq
+}
+
 /// Fit by BOBYQA minimisation of the REML profiled deviance over the box-
 /// bounded θ, with β̂ / σ̂² / Var(β̂_target) recovered once at θ̂.
 ///
 /// Caller contract: `ws.suff` holds the accumulated rows (reset + add_rows
 /// per dataset); `target_indices` index design columns.
 ///
-/// Compute the joint Wald-χ² statistic
-///
-/// ```text
-/// W = β̂_T' [(K⁻¹)_TT]⁻¹ β̂_T / σ̂²
-/// ```
-///
-/// where `K = X' V(θ̂)⁻¹ X` (or `X'X` on the τ̂≈0 path; the formula is the
-/// same — the caller passes whichever `xtvix` was just used) and `T` is the
-/// configured target subset. Under H₀: β_T = 0, `W ~ χ²(k)` asymptotically.
-///
-/// **Algorithm (bounded-alloc; all explicit storage from `LmmFitScratch` —
-/// the two faer `llt` calls below allocate internally):**
-///   1. Re-Cholesky `xtvix` (idempotent — same factorisation already cached in
-///      `xtvix_factor`; faer doesn't expose a `LltRef` reconstructed from a
-///      pre-computed L without recomputation, and the cost is O(p³/3) which
-///      is negligible at p ≤ 20).
-///   2. `solve_in_place(I_p)` against the new Cholesky → `joint_k_inv` becomes
-///      `K⁻¹`. The function refills the identity internally before solving, so
-///      the caller need not pre-initialize `joint_k_inv`. Then
-///      `joint_k_inv ← B·K⁻¹·Bᵀ`, with `B` the column map `map` (`β = B·β̃`
-///      from the design `K` was formed on to the caller's): the caller's
-///      `Var(β̂)/σ̂²`. The identity map leaves `K⁻¹` untouched. `betas` are the
-///      caller's.
-///   3. Gather `(K⁻¹)_TT` into the top-left k×k block of `joint_sigma_t_chol`.
-///   4. In-place Cholesky on that k×k block.
-///   5. Solve `Σ_T x = β̂_T` via the new k×k Cholesky factor (`solve_in_place`
-///      on a length-`k` column view of `joint_rhs`).
-///   6. `W_raw = β̂_T · x`.
-///   7. Divide by `σ̂²` and return; on any numerical failure return `NaN`.
-///
-/// Returns `NaN` if `k == 0`, `σ̂² ≤ 0`, or any of the Cholesky steps fail.
-#[allow(clippy::too_many_arguments)] // the K / β̂ / target inputs, three scratch slots, the map
-pub(crate) fn joint_wald_chi_sq(
-    xtvix: MatRef<'_, f64>,
-    betas: &[f64],
-    sigma_sq: f64,
-    target_indices: &[u32],
-    mut joint_k_inv: MatMut<'_, f64>,
-    mut joint_sigma_t_chol: MatMut<'_, f64>,
-    joint_rhs: &mut [f64],
-    map: &ColumnScaling,
-) -> f64 {
-    use faer::linalg::solvers::Solve;
-    use faer::reborrow::Reborrow;
-
-    let p = betas.len();
-    let k = target_indices.len();
-    if k == 0 || p == 0 || !(sigma_sq.is_finite() && sigma_sq > FLOAT_NEAR_ZERO) {
-        return f64::NAN;
-    }
-
-    // Step 1: re-Cholesky K = X'V⁻¹X (lower).
-    let chol = match xtvix.llt(faer::Side::Lower) {
-        Ok(c) => c,
-        Err(_) => return f64::NAN,
-    };
-
-    // Step 2: K⁻¹ via `solve_in_place(I_p)`. Refill identity here so the
-    // helper is safe to call repeatedly without depending on `LmmSuffStats::reset`
-    // to have just run (cost: p² writes, p ≤ 20).
-    for j in 0..p {
-        for i in 0..p {
-            joint_k_inv[(i, j)] = if i == j { 1.0 } else { 0.0 };
-        }
-    }
-    chol.solve_in_place(joint_k_inv.rb_mut());
-    // K⁻¹ is the fitted design's Var(β̃)/σ²; the target block is read
-    // in the caller's coordinates, (B·K⁻¹·Bᵀ)_TT, against the caller's β̂_T.
-    map.congruence(joint_k_inv.rb_mut());
-
-    // Step 3: gather Σ_T = (K⁻¹)_TT into the top-left k×k of `joint_sigma_t_chol`.
-    for (a, &ti) in target_indices.iter().enumerate() {
-        let ti = ti as usize;
-        if ti >= p {
-            return f64::NAN;
-        }
-        for (b, &tj) in target_indices.iter().enumerate() {
-            let tj = tj as usize;
-            if tj >= p {
-                return f64::NAN;
-            }
-            joint_sigma_t_chol[(a, b)] = joint_k_inv[(ti, tj)];
-        }
-    }
-
-    // Step 4: in-place Cholesky on the k×k block. We pass the full p×p view's
-    // top-left k×k submatrix to faer.
-    let sigma_t_view = joint_sigma_t_chol.rb().submatrix(0, 0, k, k);
-    let chol_t = match sigma_t_view.llt(faer::Side::Lower) {
-        Ok(c) => c,
-        Err(_) => return f64::NAN,
-    };
-
-    // Step 5: copy β̂_T into the first k slots of joint_rhs and solve in
-    // place via a k×1 column view over that prefix (the same
-    // `from_column_major_slice_mut` idiom as the β solve) — no owned Mat,
-    // no copy-out.
-    for (a, &ti) in target_indices.iter().enumerate() {
-        joint_rhs[a] = betas[ti as usize];
-    }
-    {
-        let mut rhs = MatMut::from_column_major_slice_mut(&mut joint_rhs[..k], k, 1usize);
-        chol_t.solve_in_place(rhs.rb_mut());
-    }
-
-    // Step 6: W_raw = β̂_T · x.
-    let mut w_raw = 0.0_f64;
-    for (a, &ti) in target_indices.iter().enumerate() {
-        w_raw += betas[ti as usize] * joint_rhs[a];
-    }
-    if !w_raw.is_finite() {
-        return f64::NAN;
-    }
-
-    // Step 7: divide by σ̂².
-    w_raw / sigma_sq
-}
-
 /// `theta_start`: `None` → blind start (diagonals THETA0, off-diagonals 0,
 /// the default for arbitrary provided bytes); `Some(θ₀)` → per-component spec-derived truth
 /// start, `[primary, extras in declaration order]` (Y is always synthetic, so
@@ -2023,6 +2041,8 @@ pub fn fit_lmm(
         kernel,
         recovery,
         solver,
+        solver_warm,
+        config,
         theta,
         lower,
         upper,
@@ -2039,15 +2059,17 @@ pub fn fit_lmm(
         precompute_balanced_collapse(suff, fit);
     }
 
-    // Cold start per fit (no warm-start across sims — would re-import
-    // cross-grid-point path dependence). A Some-start is clamped to the
-    // floor on its diagonal coordinates only (off-diagonals pass through
-    // verbatim); under the fixed RHO_BEGIN, PRIMA's start-projection may still
-    // move a small start to rho_begin off the 0 bound — benign and
-    // deterministic. The scaled schedule (rho_begin = 0.1·θ₀) that makes
-    // small starts pay off is activation at workspace-construction time: rho
-    // lives in the solver's construction-time Config and θ₀ is per-scenario,
-    // so it belongs where the workspace is built per workload.
+    // A Some-start is clamped to the floor on its diagonal coordinates only
+    // (off-diagonals pass through verbatim) and searched by `solver_warm`, at
+    // `RHO_BEGIN_WARM`; the blind start by `solver`, at `RHO_BEGIN`.
+    let solver: &mut Bobyqa = match theta_start {
+        Some(_) => solver_warm.get_or_insert_with(|| {
+            let mut c = *config;
+            c.rho_begin = RHO_BEGIN_WARM;
+            Bobyqa::new(theta.len(), c).expect("warm BOBYQA config is valid by construction")
+        }),
+        None => solver,
+    };
     match theta_start {
         Some(ts) => {
             debug_assert_eq!(ts.len(), theta.len());
@@ -2147,7 +2169,8 @@ pub fn fit_lmm(
         // The flags are rebuilt from scratch rather than OR'd. Nothing moves
         // unless a diagonal pinned, so an interior fit stays bit-identical, and
         // the pinned re-eval below runs on the canonicalized θ. The GLMM pin
-        // site departs from this on its AGQ route; the reason is written there.
+        // site departs from this on its AGQ route, and undoes a pin that
+        // raises the deviance; the reasons are written there.
         if canonicalize_pinned_blocks(kernel.groupings(), theta) {
             pinned = false;
             pinned_components = 0;
@@ -2268,6 +2291,9 @@ pub fn fit_lmm(
             recovery.u[i] = acc / factor[(i, i)];
         }
         let norm_sq: f64 = recovery.u[..p].iter().map(|v| v * v).sum();
+        for i in 0..p {
+            recovery.joint_cols[(i, tj)] = recovery.u[i];
+        }
         let vd = sigma_sq * norm_sq;
         recovery.var_diag[tj] = vd;
         recovery.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
@@ -2277,33 +2303,16 @@ pub fn fit_lmm(
         };
     }
 
-    // Joint Wald-χ² over the target set — the shared `joint_wald_chi_sq` helper
-    // (`pub(crate)`). It re-Choleskys X'V⁻¹X internally, so hand it the product
-    // the augmented factor already encodes: X'V⁻¹X = L_XX·L_XXᵀ (leading p×p
-    // of the augmented factor; the y row is index p).
-    let joint_t_sq = if target_indices.is_empty() {
-        f64::NAN
-    } else {
-        for j in 0..p {
-            for i in 0..p {
-                let mut acc = 0.0;
-                for k in 0..=i.min(j) {
-                    acc += factor[(i, k)] * factor[(j, k)];
-                }
-                recovery.joint_xtvix[(i, j)] = acc;
-            }
-        }
-        joint_wald_chi_sq(
-            recovery.joint_xtvix.as_ref(),
-            &recovery.betas,
-            sigma_sq,
-            target_indices,
-            recovery.joint_k_inv.as_mut(),
-            recovery.joint_sigma_t_chol.as_mut(),
-            &mut recovery.joint_rhs,
-            map,
-        )
-    };
+    // Joint Wald-χ² over the target set, from the forward-solve columns kept
+    // above (`Var(β̂_a, β̂_b) = σ̂²·c_aᵀc_b`).
+    let joint_t_sq = joint_wald_chi_sq(
+        recovery.joint_cols.as_ref(),
+        &recovery.betas,
+        sigma_sq,
+        target_indices,
+        recovery.joint_qr.as_mut(),
+        &mut recovery.joint_z,
+    );
 
     // Conditional modes, last: it reads β̂ and reuses the evaluation's own
     // scratch, so it must come after every step that reads the factor state the

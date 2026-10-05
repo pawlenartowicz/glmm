@@ -1119,7 +1119,10 @@ fn fit_glm_gamma_log_matches_r() {
 /// the Gamma φ̂ stays and the inverse-Gaussian φ̂ scales by `1/c`. So the frozen
 /// R fits of `fit_glm_gamma_log_matches_r` and `fit_glm_igauss_matches_r` are
 /// the reference, and a divergence guard on |η| itself refuses these honest
-/// fits.
+/// fits. At y·1e±250 (Gamma) and y·1e-120 (inverse-Gaussian) the variance
+/// μ² or μ³ itself leaves the f64 range, which the Pearson φ̂ must survive. At
+/// y·1e120 the inverse-Gaussian Fisher weight 1/μ puts the factor of X'WX near
+/// 1e-59, which an absolute floor on its diagonal turned into NaN SEs.
 #[test]
 fn fit_glm_log_link_converges_in_any_response_units() {
     const GAMMA_BETA: [f64; 3] = [0.449945830683142, 0.565796931228723, 0.526238083012209];
@@ -1137,8 +1140,12 @@ fn fit_glm_log_link_converges_in_any_response_units() {
     let cases = [
         (gamma, 1e-14, GAMMA_BETA, GAMMA_SE, GAMMA_DISP),
         (gamma, 1e14, GAMMA_BETA, GAMMA_SE, GAMMA_DISP),
+        (gamma, 1e-250, GAMMA_BETA, GAMMA_SE, GAMMA_DISP),
+        (gamma, 1e250, GAMMA_BETA, GAMMA_SE, GAMMA_DISP),
         (ig, 1e-14, IG_BETA, IG_SE, IG_DISP),
         (ig, 1e14, IG_BETA, IG_SE, IG_DISP),
+        (ig, 1e-120, IG_BETA, IG_SE, IG_DISP),
+        (ig, 1e120, IG_BETA, IG_SE, IG_DISP),
     ];
     for (family, c, ref_beta, ref_se, ref_disp) in cases {
         let (x, y, n) = match family {
@@ -1308,10 +1315,9 @@ fn fit_glm_poisson_small_mean_stop_rule_is_scale_free() {
     }
 }
 
-/// The post-fit saturation guard is a binomial test: a fitted probability
-/// pinned at 0 or 1. Its bound on the IRLS weight is absolute, and on the
-/// other families that weight carries the response's units, so these honest
-/// fits were refused:
+/// No stop rule may read an absolute bound off the IRLS weight: on the
+/// non-binomial families that weight carries the response's units, and a
+/// bound on it refuses these honest fits:
 /// - Poisson with exposure 1e-7 on 30 of 40 rows: the fitted means there are
 ///   about 3e-7, below the bound on the Poisson weight μ. Frozen R 4.5.3 fit:
 ///   `glm(y ~ x1 + offset(log(e)), poisson, epsilon = 1e-15)` on the fixture
@@ -1322,7 +1328,7 @@ fn fit_glm_poisson_small_mean_stop_rule_is_scale_free() {
 ///   `fit_glm_gamma_inverse_matches_r` and
 ///   `fit_glm_igauss_inverse_squared_matches_r`.
 #[test]
-fn fit_glm_saturation_guard_is_binomial_only() {
+fn fit_glm_small_unit_weights_converge() {
     const POIS_BETA: [f64; 2] = [1.68065523018842, -0.602386665393579];
     const POIS_SE: [f64; 2] = [0.352733819647417, 0.61603058055554];
     let n = 40;
@@ -1421,7 +1427,7 @@ fn fit_glm_saturation_guard_is_binomial_only() {
 /// divergence guard and the cold seed are centred on the null model with the
 /// offset, oᵢ + ln(Σy / Σe^o); centred on ln ȳ alone, rows with exposure
 /// 1e-16 of the rest sit about 37 from it and the fit was refused.
-/// - Poisson on the `fit_glm_saturation_guard_is_binomial_only` fixture with
+/// - Poisson on the `fit_glm_small_unit_weights_converge` fixture with
 ///   exposure 1e-16 and 1e16 on its 30 zero rows. Frozen R 4.5.3 fits:
 ///   `glm(y ~ x1 + offset(log(e)), poisson, epsilon = 1e-14)`.
 /// - Gamma/log on `sim_gamma.csv` with exposure `e` on the odd rows and their
@@ -1877,6 +1883,355 @@ fn fit_glm_igauss_inverse_squared_converges_at_small_mu() {
     }
 }
 
+/// Inverse-Gaussian `1/μ²` on data where the first Fisher step from μ₀ = y,
+/// and from μ₀ = ȳ, leaves the link's domain (η ≤ 0 on some rows), while the
+/// maximum is interior: R `glm(family = inverse.gaussian("1/mu^2"), start =
+/// c(1/mean(y)^2, 0, 0))` (R 4.5, epsilon 1e-14) halves that step back and
+/// reaches β = (0.2392333125521, −0.1373814088293, −0.0947347805051),
+/// D = 30.8397405316672, logLik −26.7889036403615. R's own start stops with
+/// "no valid set of coefficients". Past the domain the next solve puts every
+/// row near η = 0 (μ ≈ 1e37), where each row's deviance flattens to its
+/// μ → ∞ limit 1/y and the relative rule stops: D = Σ1/y = 37.752, loglik
+/// −28.306. Without the intercept no β has η > 0 on every row (the (x1, x2)
+/// points lie in no open half-plane), so there is no maximum and the fit must
+/// end not converged rather than on that plateau.
+#[test]
+fn fit_glm_igauss_inverse_squared_halves_a_first_step_out_of_the_domain() {
+    const REF_LOGLIK: f64 = -26.7889036403615;
+    #[rustfmt::skip]
+    let rows: [[f64; 3]; 15] = [
+        [0.3095537303348967, 0.8687804976199135, -0.32317601149642583],
+        [1.5529871986030834, -0.4461780504566485, -0.11730968542633523],
+        [10.671851710752538, 0.26473722195439203, -0.42267566056577516],
+        [0.27190082467780996, -0.5399930195861862, -0.8346894198665697],
+        [0.9007735937101707, 0.3344480940007739, -0.8146650585036675],
+        [0.14778593771202003, 0.012593421693861868, 0.7935840844039588],
+        [10.066068557801453, 0.14399917831711317, 0.17827761268560355],
+        [0.5055862674274353, 0.9530147005768258, -0.6200204603655389],
+        [0.9731234272011066, 0.5350384350591046, -1.2618962983624538],
+        [2.424899952383786, -0.5836362013270329, 0.8439132619092109],
+        [0.08521642353406056, -2.1614605415171764, -0.7960604804439994],
+        [0.48870250895340867, -1.3202131690920387, 2.4688166543785464],
+        [39.74593304512802, 0.8104089350797599, 1.3434481753593115],
+        [0.2466893663649183, 1.3416651756290772, -0.7573556726460948],
+        [1.173227132745872, 0.6925524519570874, -0.5837819433310407],
+    ];
+    let n = rows.len();
+    let y: Vec<f64> = rows.iter().map(|r| r[0]).collect();
+    let fit = |x: &[f64], p: usize| {
+        fit_cold(
+            x,
+            &y,
+            n,
+            p,
+            &ModelSpec {
+                family: Family::InverseGaussian {
+                    link: crate::InverseGaussianLink::InverseSquared,
+                },
+                re: None,
+            },
+            &GroupIds::default(),
+            &FitOptions {
+                target_indices: (0..p as u32).collect(),
+                ..FitOptions::default()
+            },
+        )
+    };
+    let x: Vec<f64> = rows.iter().flat_map(|r| [1.0, r[1], r[2]]).collect();
+    let f = fit(&x, 3);
+    assert!(
+        f.converged() && (f.loglik - REF_LOGLIK).abs() < 1e-6,
+        "converged = {}, loglik {} (β = {:?}); the maximum is {REF_LOGLIK}",
+        f.converged(),
+        f.loglik,
+        f.beta
+    );
+    let x: Vec<f64> = rows.iter().flat_map(|r| [r[1], r[2]]).collect();
+    let f = fit(&x, 2);
+    assert!(
+        !f.converged(),
+        "no intercept: converged at loglik {} (β = {:?}) with no β in the domain",
+        f.loglik,
+        f.beta
+    );
+}
+
+/// The two reciprocal links with the response in tiny units, `y → c·y`,
+/// c = 1e-30. Both are exactly equivariant (Gamma `1/μ`: β scales by `c⁻¹`;
+/// inverse-Gaussian `1/μ²`: by `c⁻²`), so the reference is the same fit at
+/// c = 1. A cold seed that floors y at `MU_FLOOR = 1e-10` starts every row at
+/// one constant η: the Gamma fit then ends not converged and the
+/// inverse-Gaussian one reports converged at a β 1e-39 of the right one.
+#[test]
+fn fit_glm_reciprocal_links_converge_in_tiny_response_units() {
+    let gamma = Family::Gamma {
+        link: crate::GammaLink::Inverse,
+    };
+    let ig = Family::InverseGaussian {
+        link: crate::InverseGaussianLink::InverseSquared,
+    };
+    let c = 1e-30f64;
+    for (family, k) in [(gamma, 1), (ig, 2)] {
+        let (x, y, n) = match family {
+            Family::Gamma { .. } => sim_gamma_xy(),
+            _ => sim_igauss_xy(),
+        };
+        let fit_at = |c: f64| {
+            let y: Vec<f64> = y.iter().map(|v| v * c).collect();
+            fit_cold(
+                &x,
+                &y,
+                n,
+                3,
+                &ModelSpec { family, re: None },
+                &GroupIds::default(),
+                &FitOptions {
+                    target_indices: vec![0, 1, 2],
+                    ..FitOptions::default()
+                },
+            )
+        };
+        let base = fit_at(1.0);
+        let f = fit_at(c);
+        assert!(f.converged(), "{family:?}, y·{c:e}: must converge");
+        for j in 0..3 {
+            let b = f.beta[j] * c.powi(k);
+            assert!(
+                (b - base.beta[j]).abs() / base.beta[j].abs() < 1e-10,
+                "{family:?}, y·{c:e}: β[{j}]·c^{k} = {b} vs {}",
+                base.beta[j]
+            );
+        }
+    }
+}
+
+/// Inverse-Gaussian/log from the null-model start, where plain Fisher scoring
+/// raises the deviance pass after pass (32.3 to 37.2 to 79.5 to 1575) and runs
+/// off to β ≈ (−40, 39, 16). A finite maximum exists, and R's `glm.fit` leaves
+/// it even when started there. Reference: R 4.5 `optim(c(0, 0, 0), D, gradient,
+/// method = "BFGS", reltol = 1e-16)` on the deviance
+/// D(β) = Σ(y − μ)²/(yμ²), μ = exp(Xβ): β = (0.784738482748214,
+/// −0.467923937773258, 0.757967061041968), D = 26.5962284160061, gradient norm
+/// 2.3e-7, Hessian eigenvalues 38.2, 20.6, 3.78. Step-halving on a deviance
+/// increase reaches it.
+#[test]
+fn fit_glm_igauss_log_halves_a_runaway_step_to_the_maximum() {
+    const REF_BETA: [f64; 3] = [0.784738482748214, -0.467923937773258, 0.757967061041968];
+    const REF_DEV: f64 = 26.5962284160061;
+    #[rustfmt::skip]
+    let rows: [[f64; 3]; 15] = [
+        [0.1072685435450277, -0.04004220944155259, 0.31539082666872664],
+        [32.49942887435223, -1.487839027111811, 0.8363577554179107],
+        [0.885410307418063, -0.7590754804256854, 0.7995821347429151],
+        [0.26878390990110285, 0.1847405698951531, 0.5165786842335072],
+        [0.6353014676613092, 0.6009161398391771, -0.7775915878947153],
+        [0.3614714547050839, -0.1263749883281301, -0.41306552470359775],
+        [0.2723397960535744, 1.4335770451992067, 0.007954841470723673],
+        [0.2675589413965528, 1.3102942032959664, 0.42199888180296014],
+        [4.18316910240552, 0.170465146469467, -0.8652676198792681],
+        [0.3614071236245068, 0.9872575947704155, -1.158929188481361],
+        [5.418932899944644, 1.7360685155204458, 0.5863910533109519],
+        [0.49597104774358175, 1.077799139013101, -0.5493358608905152],
+        [0.5444358783969505, 0.0816438494638823, -1.1176865514337173],
+        [0.5632558709572125, 0.04262648933403258, 1.178266191859444],
+        [0.4473874157161135, -0.05347260660707793, -0.027017212078836356],
+    ];
+    let n = rows.len();
+    let y: Vec<f64> = rows.iter().map(|r| r[0]).collect();
+    let x: Vec<f64> = rows.iter().flat_map(|r| [1.0, r[1], r[2]]).collect();
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        3,
+        &ModelSpec {
+            family: Family::InverseGaussian {
+                link: crate::InverseGaussianLink::Log,
+            },
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "must converge; β = {:?}", f.beta);
+    let dev: f64 = y
+        .iter()
+        .zip(&f.fitted)
+        .map(|(&yi, &mu)| (yi - mu) * (yi - mu) / (yi * mu * mu))
+        .sum();
+    assert!(
+        (dev - REF_DEV).abs() / REF_DEV < 1e-9,
+        "deviance {dev} vs optim {REF_DEV}"
+    );
+    for (j, &r) in REF_BETA.iter().enumerate() {
+        let rel = (f.beta[j] - r).abs() / r.abs();
+        assert!(rel < 1e-5, "β[{j}] = {} vs optim {r}", f.beta[j]);
+    }
+}
+
+/// Gamma `1/μ` and inverse-Gaussian `1/μ²` with no intercept but a column
+/// whose entries are all positive, so a β in the link's domain exists. From
+/// the per-row μ₀ = y seed the first Fisher step leaves the domain and, with
+/// no β to halve back to, the fit ended not converged (R's `glm.fit` stops
+/// there too: "no valid set of coefficients has been found"). Seeding β on the
+/// positive column gives the halving a β to return to. Reference: R 4.5
+/// `optim(..., method = "BFGS", reltol = 1e-16)` on the deviance, restarted at
+/// its own optimum until it stops moving: Gamma D = 33.8408990329962,
+/// inverse-Gaussian D = 0.976768213544751 (gradient norms 7e-7, 1.3e-5).
+#[test]
+fn fit_glm_reciprocal_links_without_intercept_seed_on_a_positive_column() {
+    #[rustfmt::skip]
+    let gamma_rows: [[f64; 3]; 15] = [
+        [1.459979091642087, 1.4296499434189325, 1.2345416975615455],
+        [7.7536303773552495, 0.20068348879766085, 1.4840631362343064],
+        [8.422650816069995, 0.5813329529971732, 0.40373820977334085],
+        [10.261491817532074, 0.2974961196108044, 0.9264836193111639],
+        [1.1202145294618422, 1.8063935849899753, 0.31926279934053503],
+        [0.8454857280794912, 1.1121666843959928, 1.6568145149255162],
+        [7.057394131024399, 0.6847102003492842, 0.26965391847132514],
+        [0.08771744704138074, 1.3188593272563018, 1.1255081149041062],
+        [1.5476169936902562, 2.8601506531903897, 1.8910026082853355],
+        [63.057592793616095, 0.3568791295751389, 0.4226335503458942],
+        [13.113563664919027, 0.512664481468512, 1.4580204457067774],
+        [0.920324931262954, 2.6547045210023086, 0.9873530336103082],
+        [0.993818517199063, 0.8096477900887609, 1.721607684798358],
+        [0.12571091483219232, 2.06526945623807, 1.72840163540899],
+        [136.19814865274006, 0.446149198556676, 0.9986725711326832],
+    ];
+    #[rustfmt::skip]
+    let ig_rows: [[f64; 3]; 15] = [
+        [5.195814919228284, 16.584297242973037, 1.8596751377322427],
+        [3.0825421228735603, 15.39789363913443, 0.8660690383667884],
+        [9.915469065292179, 10.102944537584374, 0.8515949321766396],
+        [8.905624169661154, 6.18953150484127, 0.5765596798756396],
+        [3.7726462263314153, 11.87258370659411, 1.5285341681959943],
+        [20.191794111707367, 13.360573089051105, 0.35839020114634534],
+        [4.851545208685984, 15.337871278899847, 1.7226698002660088],
+        [5.013121511663131, 29.950710715908254, 1.1623268309992707],
+        [2.3001580353975717, 26.95479282012578, 0.06705496874673722],
+        [6.32391006523882, 26.79312493378574, 0.6571649014935781],
+        [11.563388553546703, 4.406095953928581, 1.7684440202946683],
+        [3.990356334497829, 24.519932296150465, 0.5529814501944113],
+        [20.455263385306274, 26.46201633040169, 1.2276833568675058],
+        [3.3728202206976032, 14.110072320968158, 1.940384022606585],
+        [16.3802922740325, 19.76657814090696, 1.3272912600864357],
+    ];
+    let cases = [
+        (
+            Family::Gamma {
+                link: crate::GammaLink::Inverse,
+            },
+            gamma_rows,
+            [0.138367807491431, -0.0057393791568972],
+        ),
+        (
+            Family::InverseGaussian {
+                link: crate::InverseGaussianLink::InverseSquared,
+            },
+            ig_rows,
+            [0.000480743397934214, 0.00592067564396268],
+        ),
+    ];
+    for (family, rows, ref_beta) in cases {
+        let n = rows.len();
+        let y: Vec<f64> = rows.iter().map(|r| r[0]).collect();
+        let x: Vec<f64> = rows.iter().flat_map(|r| [r[1], r[2]]).collect();
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            2,
+            &ModelSpec { family, re: None },
+            &GroupIds::default(),
+            &FitOptions {
+                target_indices: vec![0, 1],
+                ..FitOptions::default()
+            },
+        );
+        assert!(f.converged(), "{family:?}: must converge; β = {:?}", f.beta);
+        for (j, &r) in ref_beta.iter().enumerate() {
+            let rel = (f.beta[j] - r).abs() / r.abs();
+            assert!(
+                rel < 1e-6,
+                "{family:?}: β[{j}] = {} vs optim {r}",
+                f.beta[j]
+            );
+        }
+    }
+}
+
+/// Inverse-Gaussian/log on a flat surface where Fisher scoring converges
+/// linearly and slowly: from the null-model start it runs out the 50-pass
+/// budget still short of the maximum. The Newton step reaches it. Reference:
+/// R 4.5 `optim(c(log(mean(y)), 0, 0), D, gradient, method = "BFGS",
+/// reltol = 1e-16)`, restarted at its own optimum until it stops moving, on
+/// D(β) = Σ(y − μ)²/(yμ²), μ = exp(Xβ): gradient norm 2.3e-8.
+#[test]
+fn fit_glm_igauss_log_slow_fisher_surface_reaches_the_maximum() {
+    const REF_BETA: [f64; 3] = [1.501669198002, 0.0753283194990145, 0.25230614491463];
+    const REF_DEV: f64 = 4.27328711452527;
+    #[rustfmt::skip]
+    let rows: [[f64; 3]; 20] = [
+        [4.731995644728599, 1.8574835897686595, 0.34187901439995355],
+        [3.1695764751853135, 0.7614962778968826, 0.12904588681627244],
+        [9.816345375254189, 0.09740383191478372, -0.6476221343809986],
+        [1.6689985157888008, -0.8886204052452649, 1.0663823092963904],
+        [2.9611005643365753, -0.8634540792815437, 0.13710014825294398],
+        [4.7636741614228315, -2.83734527321359, -1.1809797559319481],
+        [9.598580668712414, 0.9544931700731414, -0.7298098649829042],
+        [6.6809365040037445, 1.6304527329525482, 0.5608177398082913],
+        [1.1160199495447747, -0.6377831978383558, -0.8869146928205444],
+        [1.9058451870135136, 0.06580511560220847, -1.472914182639202],
+        [1.655396114875963, 0.272767610272512, 0.30054553244057947],
+        [1.7410237454418578, 0.8528663693571422, -1.0538424460308184],
+        [4.502744228713342, -1.3245803187148355, 0.19038050358008743],
+        [2.4081811652296414, 0.19029579982486178, -0.44453398392397836],
+        [7.594739722133059, -0.7756177557516355, 0.2641612681550008],
+        [1.3967268603890393, -1.6989023489656083, 0.8079925736125012],
+        [1.477554617280714, -0.33640996111267024, 0.8780845901423401],
+        [3.0034345882607654, -0.6839666444028296, 0.015153229146690294],
+        [0.5474826895315416, 0.5349470844989396, -1.3769226603061258],
+        [19.579851391272186, 0.848293198586441, 0.8954089187832829],
+    ];
+    let n = rows.len();
+    let y: Vec<f64> = rows.iter().map(|r| r[0]).collect();
+    let x: Vec<f64> = rows.iter().flat_map(|r| [1.0, r[1], r[2]]).collect();
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        3,
+        &ModelSpec {
+            family: Family::InverseGaussian {
+                link: crate::InverseGaussianLink::Log,
+            },
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "must converge; β = {:?}", f.beta);
+    let dev: f64 = y
+        .iter()
+        .zip(&f.fitted)
+        .map(|(&yi, &mu)| (yi - mu) * (yi - mu) / (yi * mu * mu))
+        .sum();
+    assert!(
+        (dev - REF_DEV).abs() / REF_DEV < 1e-9,
+        "deviance {dev} vs optim {REF_DEV}"
+    );
+    for (j, &r) in REF_BETA.iter().enumerate() {
+        let rel = (f.beta[j] - r).abs() / r.abs();
+        assert!(rel < 1e-6, "β[{j}] = {} vs optim {r}", f.beta[j]);
+    }
+}
+
 /// Inverse-Gaussian(log) GLM with a per-row offset, vs R
 /// `glm(inverse.gaussian("log"), offset=)` on `sim_igauss.csv`, the same
 /// `o_i = 0.1·(i mod 7)` offset shape as the Poisson/Gamma offset goldens. Log
@@ -2258,9 +2613,10 @@ fn fit_glm_nb_weighted_matches_mass() {
 /// information exceeds twice the expected one along one direction (largest
 /// eigenvalue of F⁻¹H is 2.18), so undamped IRLS steps back and forth across
 /// β̂ with growing amplitude and runs out `MAX_IRLS_ITERS`, as R's `glm.fit`
-/// does on the same call. The period-2 damping in `glm_irls_fit` halves the
-/// steps once they reverse, which maps that eigenvalue of the iteration map to
-/// (1 + (1 − 2.18))/2 ≈ −0.09, and the fit converges to the MLE.
+/// does on the same call. `glm_irls_fit` halves a step that raises the
+/// deviance, and its period-2 damping halves the steps once they reverse, which
+/// maps that eigenvalue of the iteration map to (1 + (1 − 2.18))/2 ≈ −0.09; the
+/// fit converges to the MLE.
 #[test]
 fn fit_glm_nb_two_cycle_is_damped_to_the_mle() {
     // R 4.5.3, MASS 7.3-65:
@@ -2305,13 +2661,16 @@ fn fit_glm_nb_two_cycle_is_damped_to_the_mle() {
     };
     let f = fit_glm(family, 0.5, &x, &y, n, p, &opts);
     assert!(f.converged(), "damped IRLS must converge");
-    // Bands are 2 × the measured gap (β 9.6e-8, loglik 3.3e-12 relative). The
+    // Bands are 2 × the measured gap (β 1.14e-5, loglik 3.3e-12 relative). The
     // halved steps converge linearly, so the relative-deviance stopping rule
-    // leaves more β residual than on an undamped fit. The SEs sit 2.2e-10 away.
+    // leaves more β residual than on an undamped fit: the deviance is flat to
+    // 1e-12 over that β gap (β₁ = 0.08 against an SE of 0.40). The step-halving
+    // on a deviance increase catches the rising two-cycle before the period-2
+    // detector does. The SEs sit 6e-11 away.
     for j in 0..p {
         let rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
         assert!(
-            rel < 2e-7,
+            rel < 2.3e-5,
             "β[{j}] = {} vs R {} (rel {rel:e})",
             f.beta[j],
             REF_BETA[j]
@@ -2541,36 +2900,81 @@ fn fit_glm_nb_theta_high_edge_matches_mass() {
     );
 }
 
-/// [`super::glm::nb_profile_loglik`]'s two forms, evaluated one row past
-/// [`super::glm::Y_SUM_MAX`] where the function itself takes the `ln_gamma`
-/// branch, against the finite sum computed independently right here — the
-/// same statement the function makes below the switch, done by hand above it.
+/// The NB saturated log-likelihood of one count,
+/// `lnΓ(y+θ) − lnΓ(θ) − lnΓ(y+1) + θ·ln(θ/(θ+y)) + y·ln(y/(θ+y))`, against
+/// 50-digit values (mpmath `loggamma`) across the θ box and out to counts
+/// near 1e15. Its terms are of order `y·ln y` while the value is of order
+/// `ln y`, so formed term by term it keeps about 1e-5 absolute at `y = 1e10`;
+/// the band is 1e-12 absolute, the precision the NB marginal objective needs
+/// from each row.
 #[test]
-fn nb_profile_loglik_matches_finite_sum_at_the_switch() {
-    let y = (super::glm::Y_SUM_MAX + 1) as f64;
-    for &theta in &[1e-3, 1.0, 1e2, 1e3] {
-        let mut want = 0.0;
-        for k in 0..(y.round() as u64) {
-            want += (theta + k as f64).ln();
-        }
-        // `mu = 0.0` takes the saturated-mean guard, isolating the switched
-        // term from the mean-model piece `nb_profile_loglik` adds on top.
-        let got = super::glm::nb_profile_loglik(&[y], &[0.0], theta, None);
-        let rel = (got - want).abs() / want.abs();
-        // 1e-13 is `Y_SUM_MAX`'s own switch criterion (see its doc); measured
-        // worst case right at the switch is ~1.55e-14.
+fn nb_saturated_loglik_is_accurate_at_any_count() {
+    let nb = Family::NegativeBinomial {
+        link: crate::NegBinomialLink::Log,
+    };
+    let refs = [
+        (1.0, 1e-3, -6.915_663_534_094_536),
+        (7.0, 1.3, -2.883_695_866_047_211_4),
+        (1e3, 50.0, -5.896_748_004_258_026),
+        (1e5, 1e4, -7.874_357_311_179_878),
+        (1e10, 50.0, -21.990_444_607_378_04),
+        (1e10, 1e-3, -29.940_937_570_603_343),
+        (1e15, 1e4, -30.852_553_075_465_597),
+    ];
+    for (y, theta, want) in refs {
+        let got = crate::family::saturated_loglik(nb, theta, &[y], None);
         assert!(
-            rel < 1e-13,
-            "theta={theta}: got {got} want {want} rel {rel}"
+            (got - want).abs() <= 1e-12,
+            "y = {y:e}, θ = {theta}: {got} vs 50-digit {want}"
         );
     }
 }
 
-/// `nb_profile_loglik` on a single row of `y = 1e10` costs `O(1)` above
-/// `Y_SUM_MAX`. Below the cap this same call is the finite sum, `O(y)`
-/// unconditionally, so on `y = 1e10` it does not return in any bounded time —
-/// this is the direct check the cap exists for. `50 ms` is generous (measured
-/// cost of the lgamma path is around 14 µs).
+/// [`super::glm::nb_saturated_loglik_grouped`] off [`super::glm::nb_count_groups`]
+/// is `nb_profile_loglik(y, y, θ, w)`: each distinct count's term is that
+/// function's row term bit for bit, and the total differs only by the
+/// reassociated outer sum. Zeros, repeats, a non-integer count, a count near
+/// 1e10, and prior weights.
+#[test]
+fn nb_saturated_loglik_grouped_matches_the_row_sum() {
+    let big = 1e10 + 7.0;
+    let y = [3.0, 0.0, 1.0, 3.0, 7.0, 0.0, 1.0, big, 3.0, 2.5, 12.0];
+    let w = [1.0, 2.0, 0.5, 1.0, 1.5, 1.0, 1.0, 0.25, 3.0, 1.0, 2.0];
+    for &theta in &[0.05, 1.3, 40.0] {
+        for weights in [None, Some(&w[..])] {
+            let mut groups = Vec::new();
+            super::glm::nb_count_groups(&y, weights, &mut groups);
+            assert_eq!(groups.len(), 7, "distinct counts");
+            assert!(groups.windows(2).all(|g| g[0].0 < g[1].0), "ascending");
+            let got = super::glm::nb_saturated_loglik_grouped(&groups, theta);
+            let want = super::glm::nb_profile_loglik(&y, &y, theta, weights);
+            assert!(
+                (got - want).abs() <= 1e-13 * want.abs(),
+                "theta={theta}, weighted={}: grouped {got} vs rows {want}",
+                weights.is_some()
+            );
+        }
+        // One group at weight 1, every other at 0: the grouped sum is that
+        // count's own term, which must be the row term bit for bit.
+        let mut groups = Vec::new();
+        super::glm::nb_count_groups(&y, None, &mut groups);
+        for g in 0..groups.len() {
+            let one: Vec<(f64, f64)> = groups
+                .iter()
+                .enumerate()
+                .map(|(h, &(v, _))| (v, if h == g { 1.0 } else { 0.0 }))
+                .collect();
+            let yv = groups[g].0;
+            let got = super::glm::nb_saturated_loglik_grouped(&one, theta);
+            let want = super::glm::nb_profile_loglik(&[yv], &[yv], theta, None);
+            assert_eq!(got.to_bits(), want.to_bits(), "theta={theta}, y={yv}");
+        }
+    }
+}
+
+/// `nb_profile_loglik` on a single row of `y = 1e10` costs `O(1)`: a form
+/// that sums `Σ_{k<y} ln(θ+k)` does not return in any bounded time there.
+/// `50 ms` is generous.
 #[test]
 fn nb_profile_loglik_on_a_huge_count_is_fast() {
     let start = std::time::Instant::now();
@@ -2582,10 +2986,9 @@ fn nb_profile_loglik_on_a_huge_count_is_fast() {
 
 /// A fit whose IRLS actually converges (unlike a single `y = 1e10` outlier,
 /// which trips IRLS's own divergence guards before any θ-profile evaluation
-/// runs) but whose counts are ALL above `Y_SUM_MAX`, so the θ golden-section
-/// search's every evaluation touches the switched code on every row, not just
-/// one outlier row among many small ones. Below the cap this fit costs `O(y)`
-/// per row per evaluation — see the measured comparison at the bound below.
+/// runs) with every count near 2e5, so the θ golden-section search's every
+/// evaluation runs the profile on large counts on every row, not just one
+/// outlier row among many small ones.
 #[test]
 fn fit_glm_nb_with_large_counts_converges_and_is_fast() {
     let n = 30;
@@ -2597,18 +3000,14 @@ fn fit_glm_nb_with_large_counts_converges_and_is_fast() {
         let xi = lcg(&mut st);
         x.push(1.0);
         x.push(xi);
-        // An exact log-linear mean, no added noise: every count clears
-        // `Y_SUM_MAX` (mu ranges from about 148,000 to 270,000), and the
+        // An exact log-linear mean, no added noise: mu ranges from about
+        // 148,000 to 270,000, and the
         // outer θ alternation settles in two rounds (round 1 at the
         // method-of-moments seed, round 2 at the golden-section optimum),
         // running the θ search's evaluations on every row each round.
         let mu = 2.0e5 * (0.3 * xi).exp();
         y.push(mu.round());
     }
-    assert!(
-        y.iter().all(|&yi| yi > super::glm::Y_SUM_MAX as f64),
-        "every count must clear Y_SUM_MAX for this test to exercise the switch"
-    );
     let model = ModelSpec {
         family: Family::NegativeBinomial {
             link: crate::NegBinomialLink::Log,
@@ -2628,20 +3027,18 @@ fn fit_glm_nb_with_large_counts_converges_and_is_fast() {
         "θ̂ must be finite, got {}",
         f.dispersion
     );
-    // Measured: ~7 ms. Measured with `Y_SUM_MAX` raised above every count here
-    // (forcing the finite-sum branch unconditionally): ~1.7 s, since every one
-    // of this fixture's ~50 evaluations then sums a ~200,000-term series on
-    // every row.
+    // A profile that sums `Σ_{k<y} ln(θ+k)` per row took about 1.7 s on
+    // this fixture's ~50 evaluations; the closed form takes milliseconds.
     assert!(elapsed.as_secs_f64() < 0.5, "took {elapsed:?}");
 }
 
 /// `NB_MAX_OUTER` cap semantics via the `fit_glm_nb_capped` seam, seeded at
 /// `NB_THETA_LO` (far from θ̂ ≈ 1.01 on sim_nb) so one alternation cannot
-/// meet `NB_THETA_TOL`. Pins that cap exhaustion is SILENT: the capped fit
-/// reports `converged = true` (the flag reflects only the last inner IRLS
-/// fit, not the θ alternation), β/se stay at the stale pre-update θ, and
-/// `dispersion` carries the newer θ. `max_outer = 0` is the degenerate
-/// never-ran case: the all-NaN `converged = false` placeholder.
+/// meet `NB_THETA_TOL`. Pins that cap exhaustion is reported: the capped fit
+/// keeps `converged = true` (the last inner IRLS fit converged), carries a
+/// `NbShapeUnsettled` note, and β/SE are refit at the θ in `dispersion`.
+/// `max_outer = 0` is the degenerate never-ran case: the all-NaN
+/// `converged = false` placeholder.
 #[test]
 fn fit_glm_nb_outer_cap_semantics() {
     // Fixed-only fit; sim_clustered's cluster ids are unused here.
@@ -2726,18 +3123,29 @@ fn fit_glm_nb_outer_cap_semantics() {
         "a settled alternation raises nothing"
     );
     // One model, not two: β̂/SE are refit at the θ the fit reports, so a single
-    // fixed-θ GLM at `f1.dispersion` (the test-only `fit_glm`, cold IRLS at β = 0,
-    // as every alternation round is) reproduces them.
+    // fixed-θ GLM at `f1.dispersion` (the test-only `fit_glm`, cold IRLS at
+    // β = 0) reproduces them. The refit starts from the last round's β, so the
+    // two stop at different iterates of the same fit: 5e-7 apart here, against
+    // a fit left at the stale θ = `NB_THETA_LO`, whose β is far off.
     assert!(f1.dispersion.is_finite());
     let family = Family::NegativeBinomial {
         link: NegBinomialLink::Log,
     };
     let at_theta = super::glm::fit_glm(family, f1.dispersion, &x, &y, n, p, &opts);
-    assert_eq!(
-        f1.beta, at_theta.beta,
-        "β̂ must be the fit at the reported θ"
-    );
-    assert_eq!(f1.se, at_theta.se, "SE must be the fit at the reported θ");
+    for j in 0..p {
+        assert!(
+            (f1.beta[j] - at_theta.beta[j]).abs() <= 1e-5 * at_theta.beta[j].abs(),
+            "β̂[{j}] {} must be the fit at the reported θ, {}",
+            f1.beta[j],
+            at_theta.beta[j]
+        );
+        assert!(
+            (f1.se[j] - at_theta.se[j]).abs() <= 1e-5 * at_theta.se[j],
+            "SE[{j}] {} must be the fit at the reported θ, {}",
+            f1.se[j],
+            at_theta.se[j]
+        );
+    }
     // Sanity: the uncapped path from the same seed reaches the MASS optimum
     // (`fit_glm_nb_matches_mass`'s reference θ̂).
     assert!(
@@ -3097,4 +3505,239 @@ fn fit_inverse_gaussian_mixed_faults() {
         }),
     };
     let _ = fit_cold(&x, &y, n, p, &model, &ids, &FitOptions::default());
+}
+
+/// A cloglog fit whose rows mostly sit where μ is 1 to machine precision is an
+/// ordinary fit, not a failed one: the data overlap (rows 8 to 16 mix 0 and
+/// 1), so the maximum is finite. 35 of the 60 rows have a Fisher weight below
+/// 1e-5 at the MLE. Frozen R 4.5.3 fit:
+/// `glm(y ~ x, binomial("cloglog"), control = glm.control(epsilon = 1e-15))`,
+/// converged in 14 iterations.
+#[test]
+fn fit_glm_cloglog_with_most_rows_at_mu_one_converges() {
+    const BETA: [f64; 2] = [-4.08011154318365, 1.68568129039407];
+    const SE: [f64; 2] = [1.506222962011659, 0.613481687178966];
+    let y: [f64; 60] = [
+        0., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 1., 0., 0., 1., 1., 0., 1., 1., 1., 1., 1., 1.,
+        1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.,
+        1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.,
+    ];
+    let n = y.len();
+    let x: Vec<f64> = (0..n).flat_map(|i| [1.0, i as f64 / 6.0]).collect();
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        2,
+        &ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Cloglog,
+            },
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(
+        f.converged(),
+        "cloglog with most rows at μ = 1 must converge"
+    );
+    for j in 0..2 {
+        assert!(
+            (f.beta[j] - BETA[j]).abs() / BETA[j].abs() < 1e-6,
+            "β[{j}] = {} vs R {}",
+            f.beta[j],
+            BETA[j]
+        );
+        assert!(
+            (f.se[j] - SE[j]).abs() / SE[j] < SE_REL_PHI1,
+            "se[{j}] = {} vs R {}",
+            f.se[j],
+            SE[j]
+        );
+    }
+}
+
+/// Poisson counts near 1e8: the deviance at float β carries round-off above
+/// `glm::DEVIANCE_TOL`, so the relative deviance rule alone never fires and
+/// the fit would run to the iteration cap at the MLE. The round-off stop
+/// (`glm::STEP_ULPS`) ends it there. Reference: a 50-digit Newton solve
+/// (mpmath, 50 decimal digits) of the Poisson score equations on this data.
+#[test]
+fn fit_glm_poisson_large_counts_converge_at_the_mle() {
+    const MLE: [f64; 2] = [17.999877394146257, 0.5001649603379403];
+    let y: [f64; 30] = [
+        65594309., 74038033., 83568674., 94326143., 106468363., 71643028., 80687662., 91074292.,
+        102797939., 69173200., 78077577., 87934515., 99254014., 66788493., 75385915., 85090037.,
+        96043315., 108168384., 72787020., 82156616., 92732309., 104669353., 70277695., 79324294.,
+        89535415., 101060961., 68004374., 76758287., 86448701., 97576929.,
+    ];
+    let n = y.len();
+    let x: Vec<f64> = (0..n)
+        .flat_map(|i| [1.0, ((i * 7) % 30) as f64 / 29.0])
+        .collect();
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        2,
+        &ModelSpec {
+            family: Family::Poisson {
+                link: crate::PoissonLink::Log,
+            },
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "Poisson at counts near 1e8 must converge");
+    for (j, (&b, &m)) in f.beta.iter().zip(&MLE).enumerate() {
+        assert!(
+            (b - m).abs() / m.abs() < 1e-12,
+            "β[{j}] = {b} vs 50-digit MLE {m}"
+        );
+    }
+}
+
+/// A GLM on a nearly collinear design keeps its digits: on
+/// `entangled_dyadic_designs` (`[1, a, a + δb]`, cond(X) ≈ 2e6 after
+/// standardization) the entangled coefficient and its SE equal the `[1, a, b]`
+/// fit's mapped through the exact `1/δ`, on logit and on Poisson. Solving for
+/// β from the Gram each pass put an error of about 1e-3 into η every pass, so
+/// the deviance never settled and both fits ended not converged. The two fits
+/// stop at their own last iterate, and the SEs read that iterate's weights;
+/// measured agreement is about 1e-10.
+#[test]
+fn fit_glm_entangled_columns_keep_their_digits() {
+    let n = 400;
+    let (x, xr, delta) = super::common_tests::entangled_dyadic_designs(n);
+    let families = [
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+    ];
+    for family in families {
+        let mut st = 7u64;
+        let y: Vec<f64> = (0..n)
+            .map(|i| {
+                let eta = 0.2 + 0.02 * xr[3 * i + 1] + 0.02 * xr[3 * i + 2];
+                let u = 0.5 * (lcg(&mut st) + 1.0);
+                match family {
+                    // Inverse-CDF Poisson draw.
+                    Family::Poisson { .. } => {
+                        let mu = eta.exp();
+                        let (mut k, mut pk) = (0.0, (-mu).exp());
+                        let mut cdf = pk;
+                        while u > cdf {
+                            k += 1.0;
+                            pk *= mu / k;
+                            cdf += pk;
+                        }
+                        k
+                    }
+                    _ => f64::from(u8::from(u < 1.0 / (1.0 + (-eta).exp()))),
+                }
+            })
+            .collect();
+        let model = ModelSpec { family, re: None };
+        let opts = FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        };
+        let f = fit_cold(&x, &y, n, 3, &model, &GroupIds::default(), &opts);
+        let r = fit_cold(&xr, &y, n, 3, &model, &GroupIds::default(), &opts);
+        assert!(f.converged() && r.converged(), "{family:?}: must converge");
+        let (beta, se) = (r.beta[2] / delta, r.se[2] / delta);
+        assert!(
+            (f.beta[2] - beta).abs() <= 1e-8 * beta.abs(),
+            "{family:?}: β₂ {} against {beta}",
+            f.beta[2]
+        );
+        assert!(
+            (f.se[2] - se).abs() <= 1e-8 * se,
+            "{family:?}: se₂ {} against {se}",
+            f.se[2]
+        );
+    }
+}
+
+/// A negative-binomial GLM at counts near 1.6e5 settles its θ. Each fixed-θ
+/// fit from a cold start stopped on the round-off stop up to a Fisher step
+/// short of its maximum, at a point that differs between two nearby θ, so θ̂
+/// alternated between 0.65804 and 0.65809 for every round and the fit ended
+/// with `NbShapeUnsettled`, β 1.2e-5 off. Starting each round from the last
+/// β, the alternation settles. Reference: the joint maximum of the NB
+/// log-likelihood over (β, θ), Newton's method at 60 digits (mpmath), β =
+/// (11.75102880807161, 0.4993818526636170, 0.6966203544243210), θ =
+/// 0.6580493939868556. θ̂ is not resolved to round-off: measured here, it
+/// ends 5.4e-8 relative off that maximum, and β at most 1.1e-8.
+#[test]
+fn fit_glm_nb_large_counts_settle_theta() {
+    const MLE: [f64; 3] = [11.75102880807161, 0.499381852663617, 0.696620354424321];
+    #[rustfmt::skip]
+    const DATA: [[f64; 3]; 20] = [
+        [7298.0, -2.1959459459837256, 0.39464087530682435],
+        [57024.0, 1.6938091381136118, 1.097954535903859],
+        [7952.0, -0.553457729308293, -2.203476299634204],
+        [148103.0, -1.1590583625324684, 0.9715510979126515],
+        [24970.0, -0.14906726539278387, 0.24755533182210415],
+        [226298.0, 1.0409122683484042, -0.4896108581623681],
+        [34492.0, 0.1857656388356393, -0.1422880765108002],
+        [13561.0, -0.4382266613862661, 0.8991084785258946],
+        [606512.0, -0.04981715220439015, 0.245546611432049],
+        [154068.0, 0.4687263723597755, 0.6819456484750636],
+        [78714.0, -0.3843800735278585, 0.2014666313606447],
+        [74728.0, -0.042581044455858356, -0.9047552039429292],
+        [43996.0, -2.139080546109463, -0.0037908080029658746],
+        [71182.0, -0.2581399714284804, 0.3047852495424635],
+        [7817.0, -0.44633022971591396, -0.18771919100998857],
+        [289.0, -0.8330330818069256, -0.8256130031325585],
+        [257093.0, 0.36389551916773344, 0.08967930911975892],
+        [2808.0, -1.2615464987307057, -0.43344842797519373],
+        [54534.0, -1.5730040019287097, -0.7711810060243814],
+        [419411.0, -0.7891532268041925, -0.009277830709705054],
+    ];
+    let y: Vec<f64> = DATA.iter().map(|r| r[0]).collect();
+    let x: Vec<f64> = DATA.iter().flat_map(|r| [1.0, r[1], r[2]]).collect();
+    let f = fit_cold(
+        &x,
+        &y,
+        DATA.len(),
+        3,
+        &ModelSpec {
+            family: Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "NB at counts near 1.6e5 must converge");
+    assert!(
+        !f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::NbShapeUnsettled { .. })),
+        "θ must settle: {:?}",
+        f.diagnostics.notes
+    );
+    for (j, (&b, &m)) in f.beta.iter().zip(&MLE).enumerate() {
+        assert!(
+            (b - m).abs() / m.abs() < 2e-6,
+            "β[{j}] = {b} vs the joint maximum {m}"
+        );
+    }
 }

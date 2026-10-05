@@ -152,8 +152,8 @@ as a warning of class \code{"fastglmm_diagnostic"} with a per-kind subclass
 (\code{"fastglmm_ill_conditioned"}, \code{"fastglmm_pirls_exhausted"},
 \code{"fastglmm_unused_grouping_levels"},
 \code{"fastglmm_single_level_grouping_dropped"}, \code{"fastglmm_hessian_se_fallback"},
-\code{"fastglmm_exact_profile_fallback"},
-\code{"fastglmm_non_integer_response"}, \code{"fastglmm_rows_dropped_na"}; a note from
+\code{"fastglmm_se_unavailable"}, \code{"fastglmm_exact_profile_fallback"},
+\code{"fastglmm_precision_limited"}, \code{"fastglmm_non_integer_response"}, \code{"fastglmm_rows_dropped_na"}; a note from
 a newer kernel than this package arrives as \code{"fastglmm_unknown_note"}),
 so \code{withCallingHandlers()} and \code{suppressWarnings(classes = )} can select
 them without matching message text.

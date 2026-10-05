@@ -129,8 +129,14 @@ binomial_response <- function(cell, df) {
 # keep lme4 off gamma/NB AGQ cells, so this arm should be unreachable; returning
 # NA rather than throwing means a manifest change cannot turn compare.R into a
 # crash.
+# Prior weights (`weights_col`) multiply each row's term: lme4's constant is
+# aic() - sum(devResid()), and poisson()$aic and its dev.resids both weight every
+# row by its prior weight. binomial()$aic divides by the trial count only on an
+# aggregated response, so a prior-weight binomial cell has no single closed form
+# here and returns NA.
 saturated_loglik <- function(rec, df, cell) {
   if (identical(cell[["family"]], "binomial")) {
+    if (!is.null(cell[["weights_col"]])) return(NA_real_)
     r <- binomial_response(cell, df)
     y <- r$y; n <- r$n; p <- y / n
     sat <- -2 * sum(lchoose(n, y) + ifelse(y > 0, y * log(p), 0) +
@@ -139,7 +145,8 @@ saturated_loglik <- function(rec, df, cell) {
   }
   if (identical(cell[["family"]], "poisson")) {
     y <- df[[cell[["response"]]]]
-    sat <- -2 * sum(ifelse(y > 0, y * log(y), 0) - y - lfactorial(y))
+    w <- if (is.null(cell[["weights_col"]])) 1 else df[[cell[["weights_col"]]]]
+    sat <- -2 * sum(w * (ifelse(y > 0, y * log(y), 0) - y - lfactorial(y)))
     return(-sat / 2)
   }
   NA_real_
@@ -311,7 +318,7 @@ ALIGN <- list(
     # keep lme4 off gamma and NB AGQ cells, where saturated_loglik has no closed
     # form.
     agq = align(saturated_loglik, "confirmed", "2026-08-24",
-                "closed-form saturated logLik; verified against the frozen cbpp and grouseticks nAGQ goldens, and again 2026-09-22 on pois_int1_g3000p20_bal_base_agq7, where lme4's reported logLik plus the term lands 5.2e-08 from GLMMadaptive's")),
+                "closed-form saturated logLik; verified against the frozen cbpp and grouseticks nAGQ goldens, and again 2026-09-22 on pois_int1_g3000p20_bal_base_agq7, where lme4's reported logLik plus the term lands 5.2e-08 from GLMMadaptive's. Prior weights confirmed 2026-10-03 on glmm_poisson_agq7: the weighted term lands lme4 2e-09 from glmm, the unweighted one 90.35 off")),
   glmmTMB = list(
     # On prior-weight cells glmmTMB fits the dispersion offset
     # (engines/glmmtmb.R), which reports lme4's and stats::lm's logLik.
@@ -444,7 +451,11 @@ align_status <- function() {
 # is rebuilt as chol(D) from the record's stddev and corr (written round-trip
 # exact); glmm's own Lambda is never needed.
 # On a singular D the rule has no limit -- its value depends on the direction of
-# approach -- so there is nothing to evaluate and the function returns NA.
+# approach -- so there is nothing to evaluate and the function returns NA. A
+# pinned block is recorded as an SD of exactly 0 or a correlation of exactly +-1,
+# and that is tested on the record's values before chol: diag(sd) R diag(sd) at
+# |rho| = 1 is rank-deficient only in exact arithmetic, and whether chol accepts
+# its rounded form decides NA or a number by the last bit of the SDs.
 #
 # GLMMadaptive's H_b is a central difference of the score, the OBSERVED
 # information, so the negative-binomial and Gamma weights below are the observed
@@ -548,7 +559,10 @@ ga_rule_dev <- function(rec, cell) {
   if (length(vc) != 1L || !identical(as.character(unlist(vc[[1]]$terms)), colnames(Z)))
     return(fail("random-effect terms do not match ma_random"))
   sd <- stddevs_of(rec)
-  R <- diag(q); R[upper.tri(R)] <- corrs_of(rec); R[lower.tri(R)] <- t(R)[lower.tri(R)]
+  rho <- corrs_of(rec)
+  if (isTRUE(any(sd == 0) || any(abs(rho) >= 1)))
+    return(fail("singular random-effect covariance: GLMMadaptive's rule has no limit there"))
+  R <- diag(q); R[upper.tri(R)] <- rho; R[lower.tri(R)] <- t(R)[lower.tri(R)]
   Lam <- tryCatch(t(chol(diag(sd, q) %*% R %*% diag(sd, q))), error = function(e) NULL)
   if (is.null(Lam)) return(fail("singular random-effect covariance: GLMMadaptive's rule has no limit there"))
 

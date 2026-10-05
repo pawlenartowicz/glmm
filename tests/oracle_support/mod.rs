@@ -434,6 +434,14 @@ pub mod dev_align {
 
         match g.family.as_str() {
             "binomial" => {
+                // lme4's binomial aic() divides a prior weight by the trial count
+                // only on an aggregated response, so there is no one closed form
+                // for a prior-weight binomial golden.
+                assert!(
+                    g.weights_col.is_none(),
+                    "{}: no verified saturated correction for a prior-weight binomial golden",
+                    g.name
+                );
                 // Aggregated `cbind(s, n-s) ~ ...` carries n per row; the bare
                 // `y ~ ...` Bernoulli form is n=1 everywhere, which zeroes every
                 // term of the sum below (a Bernoulli fit is always saturated) —
@@ -464,11 +472,15 @@ pub mod dev_align {
             }
             "poisson" => {
                 let ri = col_index(&header, &spec.response);
+                // Prior weights multiply each row's term: lme4's deficit is
+                // aic() - sum(devResid()), and both weight every row.
+                let wi = g.weights_col.as_deref().map(|c| col_index(&header, c));
                 let mut s = 0.0;
                 for r in &rows {
                     let y: f64 = r[ri].parse().expect("response parse");
+                    let w: f64 = wi.map_or(1.0, |i| r[i].parse().expect("weight parse"));
                     let t = if y > 0.0 { y * y.ln() } else { 0.0 };
-                    s += t - y - ln_gamma(y + 1.0);
+                    s += w * (t - y - ln_gamma(y + 1.0));
                 }
                 s
             }

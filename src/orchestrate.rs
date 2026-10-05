@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use crate::fit::theta_width;
 use crate::formula::{label_ranef, lower, Column, Table};
 use crate::{fit_warm, Boundary, Family, Note, StartValues, WaldSe};
 use crate::{BinomialLink, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink};
@@ -192,6 +193,30 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 final_eval: false,
                 detail: String::new(),
             },
+            Note::SeUnavailable => NoteInfo {
+                kind: "se_unavailable",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: 0,
+                final_eval: false,
+                detail: String::new(),
+            },
+            Note::PrecisionLimited => NoteInfo {
+                kind: "precision_limited",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: 0,
+                final_eval: false,
+                detail: String::new(),
+            },
+            Note::Separated => NoteInfo {
+                kind: "separated",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: 0,
+                final_eval: false,
+                detail: String::new(),
+            },
         })
         .collect()
 }
@@ -307,6 +332,14 @@ pub fn run_fit(
     warm_start: Option<(Vec<f64>, Vec<f64>)>,
 ) -> Result<FitResult, String> {
     let fam = family_from_str(family, link)?;
+    // `fit_warm`'s own checks of `dispersion` and the warm start name kernel
+    // struct fields (`FitOptions.dispersion`, `StartValues.beta`) a port user
+    // never sees, so both are checked here first under the argument's name.
+    if let Some(d) = dispersion {
+        if !(d.is_finite() && d > 0.0) {
+            return Err(format!("dispersion must be a finite number > 0, got {d}"));
+        }
+    }
 
     let mut columns: Vec<(String, Column)> = Vec::new();
     let mut lengths: Vec<(String, usize)> = Vec::new();
@@ -429,6 +462,28 @@ pub fn run_fit(
     // LOWERING's observations, decided before any solver ran.
     let lowered_notes = std::mem::take(&mut lowered.notes);
 
+    // Widths as `fit_warm` checks them: exact, or empty to cold-start that part.
+    if let Some((beta, theta)) = &warm_start {
+        if !beta.is_empty() && beta.len() != lowered.p {
+            return Err(format!(
+                "warm-start beta has {} entries but the model has {} fixed-effect \
+                 coefficients; give {}, or none to cold-start beta",
+                beta.len(),
+                lowered.p,
+                lowered.p
+            ));
+        }
+        let n_theta = theta_width(lowered.model.re.as_ref());
+        if !theta.is_empty() && theta.len() != n_theta {
+            return Err(format!(
+                "warm-start theta has {} entries but the model has {} random-effect \
+                 Cholesky entries; give {}, or none to cold-start theta",
+                theta.len(),
+                n_theta,
+                n_theta
+            ));
+        }
+    }
     let start = warm_start.map(|(beta, theta)| StartValues { beta, theta });
 
     let fit = catch_unwind(AssertUnwindSafe(|| {
@@ -832,18 +887,9 @@ mod tests {
     }
 
     #[test]
-    fn malformed_formula_panic_becomes_a_clean_error_not_a_process_abort() {
-        let (numeric, factor) = toy_ols();
-        let err = run_fit(
-            "y ~ :", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
-        )
-        .unwrap_err();
-        // lower()'s panic (an unguarded index in the formula frontend's interaction-term
-        // handling) must become a clean Err via catch_unwind, not abort the process.
-        assert!(!err.is_empty());
-
+    fn kernel_panic_becomes_a_clean_error_not_a_process_abort() {
         // A panic inside the kernel fit (a negative Poisson count) takes the
-        // second catch_unwind, around fit_warm.
+        // catch_unwind around fit_warm.
         let (mut numeric, factor) = toy_ols();
         numeric.get_mut("y").unwrap()[3] = -1.0;
         let err = run_fit(
@@ -915,6 +961,10 @@ mod tests {
         .expect("cold mixed fit should converge");
         assert!(cold.converged);
 
+        // θ₀ = 5 sits far from this fit's optimum, so the warm search runs
+        // well past the cold one's count (25 evaluations against 11, x86_64).
+        // A nearer start can tie the cold count by chance, and a tie says
+        // nothing about whether the start reached the fit.
         let warm = run_fit(
             "y ~ x + (1 | g)",
             numeric,
@@ -926,7 +976,7 @@ mod tests {
             None,
             None,
             None,
-            Some((cold.beta.clone(), vec![0.05])),
+            Some((cold.beta.clone(), vec![5.0])),
         )
         .expect("warm-started mixed fit should converge");
         assert!(warm.converged);

@@ -346,3 +346,44 @@ fn fit_fixed_degenerate_width_never_panics() {
         );
     }
 }
+
+/// OLS on a nearly collinear design keeps its digits: on
+/// `entangled_dyadic_designs` the entangled coefficient and its SE equal the
+/// well-conditioned fit's mapped through the exact `1/δ`. A solve from the
+/// Gram of `X` squares `cond(X) ≈ 2e6` and misses by about 1e-4; the
+/// `DesignQr` route in `fit_ols_prebuilt` is accurate to round-off times
+/// `cond(X)`.
+#[test]
+fn fit_ols_entangled_columns_keep_their_digits() {
+    let n = 200;
+    let (x, xr, delta) = super::common_tests::entangled_dyadic_designs(n);
+    let mut st = 5u64;
+    let y: Vec<f64> = (0..n)
+        .map(|i| {
+            0.5 + 0.3 * xr[3 * i + 1] + 0.2 * xr[3 * i + 2] + super::common_tests::lcg(&mut st)
+        })
+        .collect();
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, n, 3, &model, &GroupIds::default(), &opts);
+    let r = fit_cold(&xr, &y, n, 3, &model, &GroupIds::default(), &opts);
+    assert!(f.converged() && r.converged());
+    assert!(!f.aliased().iter().any(|&a| a), "nothing is dropped");
+    let (beta, se) = (r.beta[2] / delta, r.se[2] / delta);
+    assert!(
+        (f.beta[2] - beta).abs() <= 1e-9 * beta.abs(),
+        "β₂ {} against {beta}",
+        f.beta[2]
+    );
+    assert!(
+        (f.se[2] - se).abs() <= 1e-9 * se,
+        "se₂ {} against {se}",
+        f.se[2]
+    );
+}

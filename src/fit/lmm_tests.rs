@@ -14,7 +14,7 @@ use faer::Mat;
 
 use super::common_tests::{assert_pinned, dense_str, lcg, PIN_REL_ITER};
 
-use super::lmm::{lmm_run_on, lmm_view_to_fit};
+use super::lmm::{accumulate_lmm_rows, lmm_run_on, lmm_view_to_fit};
 use crate::test_support::{cluster_of_row, extra_level_of_row, intercept_only_spec};
 
 /// Aliased fixed column on a MIXED design: `y ~ 1 + x1 + x2 + x3 + (1|g)` on
@@ -1544,16 +1544,21 @@ fn fit_sim_slope_varcorr_is_pinned() {
     // stops at another point of a flat direction: g1's covariance moved 1.6e-6
     // relative, its variances 3.3e-7 and 1.4e-7, σ̂² 8.2e-8, g2 5.5e-8, the SEs
     // 7.8e-8, β 5.7e-10.
-    const REF_BETA: [f64; 2] = [1.0380272353254465, 0.8009679286177314];
-    const REF_SE: [f64; 2] = [0.33893203184068893, 0.17067328316242397];
+    // Re-pinned 2026-10-02 with the per-search BOBYQA start radii (LMM blind
+    // start 0.5): the search takes another path to the same optimum, worst move
+    // here 1.4e-6 on the g1 covariance (variances 5.8e-7 and 4.5e-7, σ̂² 1.9e-7,
+    // g2 1.6e-7, the SEs 1.5e-7, β 3.8e-9), REML criterion 1.1e-13 lower, no
+    // converged, singular or pinned flag changed.
+    const REF_BETA: [f64; 2] = [1.0380272315443226, 0.8009679255408596];
+    const REF_SE: [f64; 2] = [0.33893198001615327, 0.17067326068596858];
     // varcorr[0] = g1, packed lower triangle [v00, c01, v11]; varcorr[1] = g2.
     const REF_VC_G1: [f64; 3] = [
-        0.8994009894574976,
-        -0.11776428611507087,
-        0.39740708245702344,
+        0.8994004671804791,
+        -0.11776411602334781,
+        0.39740690350927466,
     ];
-    const REF_VC_G2: f64 = 0.5081867349990271;
-    const REF_SIGMA2: f64 = 0.5717626962036773;
+    const REF_VC_G2: f64 = 0.508186655377839;
+    const REF_SIGMA2: f64 = 0.5717628048921557;
 
     let csv = include_str!("../../validation/data/simulated/sim_slope.csv");
     let mut y = Vec::<f64>::new();
@@ -1991,23 +1996,33 @@ fn lmm_warm_start_theta_is_a_fixed_point_of_the_forward_map() {
     let warm_fit = warm_view.into_fit(&x, &y, &sized_ids, n, p, &model, &opts);
     assert!(warm_fit.converged(), "warm-started fit must converge");
 
-    // BOBYQA resolves θ̂ only to its stopping radius `RHO_END` on the internal θ,
-    // so a restart planted at θ̂ may settle anywhere within that radius on a flat
-    // valley (measured: worst move 1.9e-7 on θ[2], deviance 4.8e-12 lower). A
-    // dropped forward map moves θ̂ by O(1): `Days` has a column scale of about
-    // 5.3.
-    for (k, (w, c)) in warm_theta.iter().zip(&cold_theta).enumerate() {
-        assert!(
-            (w - c).abs() <= crate::lmm::RHO_END,
-            "theta fixed point[{k}]: warm {w} vs cold {c}"
-        );
-    }
+    // The contract: a warm start planted at the cold fit's θ̂ (through the
+    // forward map) must not end worse than the cold fit; it may end better.
+    // BOBYQA stops once its trust radius has shrunk to `RHO_END`, the smallest
+    // step it tries, which is not a bound on the distance from its stopping
+    // point to the optimum: on a flat valley the incumbent is known only to
+    // about √(Δdeviance / curvature), which can be several `RHO_END`, and a
+    // restart from it may walk on along the valley.
     assert!(
-        (warm_fit.deviance - cold_fit.deviance).abs() < 1e-10,
-        "deviance moved under a fixed-point warm start: {} vs {}",
+        warm_fit.deviance <= cold_fit.deviance + 1e-10,
+        "the warm restart ended worse than the cold fit: {} vs {}",
         warm_fit.deviance,
         cold_fit.deviance
     );
+    // θ̂ stays put, measured against the failure this test exists for: a
+    // dropped forward map moves θ̂ by O(1) (`Days` has a column scale of about
+    // 5.3), so a band of 1e-4 keeps four orders of magnitude below it.
+    // Provenance: with the per-search start radii (cold search at 0.5, warm at
+    // 0.1) the restart moved θ[0] by 1.3e-6 with the deviance 5.8e-11 lower
+    // (x86_64, 2026-10-02); at 0.1 for both, the worst move was 3.7e-7 on
+    // θ[0] with the deviance 2.2e-11 lower.
+    const THETA_BAND: f64 = 1e-4;
+    for (k, (w, c)) in warm_theta.iter().zip(&cold_theta).enumerate() {
+        assert!(
+            (w - c).abs() <= THETA_BAND,
+            "theta fixed point[{k}]: warm {w} vs cold {c}"
+        );
+    }
     // Teeth: a warm start planted exactly at θ̂ needs strictly fewer BOBYQA
     // evals than the blind cold start (THETA0 diagonals, 0 off-diagonals) to
     // reach the same point — this is what a dropped forward map (which would
@@ -2235,5 +2250,298 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
         "a capped endpoint reports singular = false, even though its varcorr \
          ratio ({ratio}) is negligible — has_negligible_component must stay \
          gated on `converged`"
+    );
+}
+
+/// What `dense_accumulation_case` returns: a dense workspace, the
+/// column-major design, `y`, the primary ids and the prior weights.
+type DenseCase = (LmmWorkspace, Mat<f64>, Vec<f64>, Vec<u32>, Option<Vec<f64>>);
+
+/// A random-intercept design for the dense accumulation tests: `n` rows in 10
+/// clusters, columns `[1, x1, x2]`; `x2` is independent of `x1`, or with
+/// `collinear` equal to it up to noise of size 1e-4 (pivot ratio about 1e-7,
+/// far under `GRAM_PIVOT_MIN`). With `weighted`, prior weights in
+/// [0.75, 1.25], whose `weight_scale` is exactly 1, so the kernel sees them as
+/// they are.
+fn dense_accumulation_case(n: usize, collinear: bool, weighted: bool) -> DenseCase {
+    let (p, k) = (3usize, 10usize);
+    let mut st = 46u64;
+    let x = Mat::<f64>::from_fn(n, p, |_, j| if j == 0 { 1.0 } else { lcg(&mut st) });
+    let x = if collinear {
+        let noise: Vec<f64> = (0..n).map(|_| 1e-4 * lcg(&mut st)).collect();
+        Mat::<f64>::from_fn(n, p, |i, j| {
+            if j == 2 {
+                x[(i, 1)] + noise[i]
+            } else {
+                x[(i, j)]
+            }
+        })
+    } else {
+        x
+    };
+    let ids: Vec<u32> = (0..n).map(|i| (i % k) as u32).collect();
+    let y: Vec<f64> = (0..n)
+        .map(|i| 0.5 + x[(i, 1)] - 0.3 * x[(i, 2)] + 0.2 * ids[i] as f64 + 0.1 * lcg(&mut st))
+        .collect();
+    let w = weighted.then(|| {
+        (0..n)
+            .map(|_| 1.0 + 0.25 * lcg(&mut st))
+            .collect::<Vec<f64>>()
+    });
+    if let Some(w) = &w {
+        assert_eq!(crate::family::weight_scale(Some(w), n), 1.0);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: k as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let gids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let (sized, gids, _perm) = spec_sized_from_ids(&model, &gids);
+    let ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[], &[], false);
+    (ws, x, y, gids.primary.clone(), w)
+}
+
+/// The dense route's two ways to the fixed-effect factor `U`
+/// (`lmm::DesignQr`). On a well-conditioned design it is read off the
+/// accumulated Gram: `X̃'X̃` is then exactly diagonal and every statistic
+/// matches the Givens route's to round-off. On a design under
+/// `GRAM_PIVOT_MIN` the route is the Givens pass itself, bit for bit.
+#[test]
+fn accumulate_lmm_rows_gram_route_matches_the_givens_route() {
+    let (n, p) = (300usize, 3usize);
+    for (collinear, weighted) in [(false, false), (false, true), (true, false), (true, true)] {
+        let tag = format!("collinear={collinear} weighted={weighted}");
+        let (mut ws, x, y, ids, w) = dense_accumulation_case(n, collinear, weighted);
+        let (mut givens, ..) = dense_accumulation_case(n, collinear, weighted);
+        accumulate_lmm_rows(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            n,
+            p,
+            &ids,
+            &[],
+            w.as_deref(),
+            false,
+        );
+        let b = givens.suff_mut();
+        b.reset();
+        b.set_design_qr(x.as_ref(), w.as_deref());
+        b.add_rows_multi(x.as_ref(), &y, &ids, &[], w.as_deref());
+        let a = ws.suff_mut();
+        let m = p + 1;
+        if collinear {
+            let bits = |s: &[f64]| s.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(a.design_qr.r_diag()),
+                bits(b.design_qr.r_diag()),
+                "{tag}: D"
+            );
+            for j in 0..m {
+                assert_eq!(
+                    bits(a.c.col_as_slice(j)),
+                    bits(b.c.col_as_slice(j)),
+                    "{tag}: c col {j}"
+                );
+            }
+            for col in 0..a.s.ncols() {
+                assert_eq!(
+                    bits(a.s.col_as_slice(col)),
+                    bits(b.s.col_as_slice(col)),
+                    "{tag}: s col {col}"
+                );
+            }
+            continue;
+        }
+        for j in 0..p {
+            for i in (j + 1)..p {
+                assert_eq!(a.c[(i, j)], 0.0, "{tag}: X̃'X̃ off the diagonal");
+            }
+        }
+        for (j, (&da, &db)) in a
+            .design_qr
+            .r_diag()
+            .iter()
+            .zip(b.design_qr.r_diag())
+            .enumerate()
+        {
+            assert!(
+                (da - db).abs() <= 1e-12 * db.abs(),
+                "{tag}: D[{j}] {da} vs {db}"
+            );
+        }
+        for j in 0..m {
+            for i in j..m {
+                let scale = (b.c[(i, i)] * b.c[(j, j)]).sqrt();
+                let d = (a.c[(i, j)] - b.c[(i, j)]).abs();
+                assert!(
+                    d <= 1e-10 * scale,
+                    "{tag}: c[{i},{j}] {} vs {}",
+                    a.c[(i, j)],
+                    b.c[(i, j)]
+                );
+            }
+        }
+        for col in 0..a.s.ncols() {
+            for j in 0..m {
+                let scale = (b.c[(j, j)] * b.counts[col]).sqrt();
+                let d = (a.s[(j, col)] - b.s[(j, col)]).abs();
+                assert!(
+                    d <= 1e-10 * scale,
+                    "{tag}: s[{j},{col}] {} vs {}",
+                    a.s[(j, col)],
+                    b.s[(j, col)]
+                );
+            }
+        }
+    }
+}
+
+/// A weighted dense LMM draw on a reused workspace allocates nothing in the
+/// accumulation: the scaled weights ŵ = w/s live in the workspace, not in a
+/// per-call vector.
+///
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// accumulate_lmm_rows_weighted_reuse_allocates_nothing -- --ignored --test-threads=1`
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn accumulate_lmm_rows_weighted_reuse_allocates_nothing() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: u64 = 10;
+    let (n, p) = (300usize, 3usize);
+    let (mut ws, x, y, ids, w) = dense_accumulation_case(n, false, true);
+    let w = w.unwrap();
+    let run = |ws: &mut LmmWorkspace| {
+        accumulate_lmm_rows(ws, x.as_ref(), &y, n, p, &ids, &[], Some(&w), false);
+    };
+    run(&mut ws);
+    crate::test_support::settle_background_allocs();
+    let profiler = dhat::Profiler::builder().testing().build();
+    for _ in 0..N_CALLS {
+        run(&mut ws);
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    assert_eq!(
+        stats.total_blocks, 0,
+        "{N_CALLS} weighted accumulations allocated {} blocks",
+        stats.total_blocks
+    );
+}
+
+/// What `sparse_accumulation_draw` returns: the column-major design, `y`, the
+/// primary ids, the extra ids and the prior weights.
+type SparseDraw = (Mat<f64>, Vec<f64>, Vec<u32>, Vec<Vec<u32>>, Vec<f64>);
+
+/// One draw of a primary-plus-crossed random-intercept design: `n` rows,
+/// primary level `i % 8`, crossed level `(i / shift) % 5`, columns
+/// `[1, x1, x2]` and prior weights in [0.75, 1.25], all drawn from `seed`.
+/// Draws with the same `shift` share their rows' levels.
+fn sparse_accumulation_draw(n: usize, shift: usize, seed: u64) -> SparseDraw {
+    let mut st = seed;
+    let x = Mat::<f64>::from_fn(n, 3, |_, j| if j == 0 { 1.0 } else { lcg(&mut st) });
+    let ids: Vec<u32> = (0..n).map(|i| (i % 8) as u32).collect();
+    let extra = vec![(0..n)
+        .map(|i| ((i / shift) % 5) as u32)
+        .collect::<Vec<u32>>()];
+    let y: Vec<f64> = (0..n)
+        .map(|i| {
+            0.5 + x[(i, 1)] - 0.3 * x[(i, 2)] + 0.2 * ids[i] as f64 - 0.1 * extra[0][i] as f64
+                + 0.1 * lcg(&mut st)
+        })
+        .collect();
+    let w: Vec<f64> = (0..n).map(|_| 1.0 + 0.25 * lcg(&mut st)).collect();
+    (x, y, ids, extra, w)
+}
+
+/// A sparse-kernel workspace for [`sparse_accumulation_draw`]'s design.
+fn sparse_accumulation_workspace(n: usize, ids: &[u32], extra: &[Vec<u32>]) -> LmmWorkspace {
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 5 },
+                slopes: vec![],
+            }],
+        }),
+    };
+    let gids = GroupIds {
+        primary: ids.to_vec(),
+        extra: extra.to_vec(),
+    };
+    let (sized, gids, perm) = spec_sized_from_ids(&model, &gids);
+    assert!(perm.is_identity() && gids.primary == ids && gids.extra == extra);
+    LmmWorkspace::for_cluster_spec_ext(3, &sized, n, &[], &[], true)
+}
+
+/// A sparse-kernel workspace that is refilled in place for a new draw on the
+/// rows its pattern was built from, and rebuilt for a draw on other rows,
+/// holds what a workspace built fresh for that draw holds: the deviance at a
+/// fixed θ, which reads every accumulated Gram, agrees bit for bit. The draws
+/// change x, y and the weights, and one is unweighted.
+#[test]
+fn accumulate_lmm_rows_sparse_reuse_matches_a_fresh_workspace() {
+    let (n, p) = (240usize, 3usize);
+    let theta = [0.7, 0.4];
+    let mut reused: Option<LmmWorkspace> = None;
+    for (shift, seed, weighted) in [(3, 1u64, true), (3, 2, true), (3, 3, false), (7, 4, true)] {
+        let (x, y, ids, extra, w) = sparse_accumulation_draw(n, shift, seed);
+        let w = weighted.then_some(&w[..]);
+        let ws = reused.get_or_insert_with(|| sparse_accumulation_workspace(n, &ids, &extra));
+        accumulate_lmm_rows(ws, x.as_ref(), &y, n, p, &ids, &extra, w, false);
+        let mut fresh = sparse_accumulation_workspace(n, &ids, &extra);
+        accumulate_lmm_rows(&mut fresh, x.as_ref(), &y, n, p, &ids, &extra, w, false);
+        let (a, b) = (ws.kernel.deviance(&theta), fresh.kernel.deviance(&theta));
+        assert!(a.is_finite(), "shift={shift} seed={seed}: deviance {a}");
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "shift={shift} seed={seed}: {a} vs {b}"
+        );
+    }
+}
+
+/// A weighted draw on a reused sparse-kernel workspace, on the rows its
+/// pattern was built from, allocates nothing in the accumulation: the Grams
+/// are refilled in the workspace's own buffers, not rebuilt.
+///
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// accumulate_lmm_rows_sparse_weighted_reuse_allocates_nothing -- --ignored --test-threads=1`
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn accumulate_lmm_rows_sparse_weighted_reuse_allocates_nothing() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: u64 = 10;
+    let (n, p) = (240usize, 3usize);
+    let (x, y, ids, extra, w) = sparse_accumulation_draw(n, 3, 1);
+    let mut ws = sparse_accumulation_workspace(n, &ids, &extra);
+    let run = |ws: &mut LmmWorkspace| {
+        accumulate_lmm_rows(ws, x.as_ref(), &y, n, p, &ids, &extra, Some(&w), false);
+    };
+    run(&mut ws);
+    crate::test_support::settle_background_allocs();
+    let profiler = dhat::Profiler::builder().testing().build();
+    for _ in 0..N_CALLS {
+        run(&mut ws);
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    assert_eq!(
+        stats.total_blocks, 0,
+        "{N_CALLS} weighted sparse accumulations allocated {} blocks",
+        stats.total_blocks
     );
 }

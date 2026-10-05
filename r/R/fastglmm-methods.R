@@ -569,28 +569,30 @@ residuals.fastglmm <- function(object, type = "response", ...) {
          call. = FALSE)
   }
   r <- as.double(object$y) - mu
-  if (type == "pearson") r <- r / sqrt(.pearson_scale(object, mu))
+  if (type == "pearson") r <- r / .pearson_sd(object, mu)
   names(r) <- rownames(object$frame)
   r
 }
 
-# phi * V(mu) / w for Pearson residuals. Mirrors the kernel's family table
-# (src/family.rs) and the Python port's `summary._VARIANCE` - change together.
-.pearson_scale <- function(object, mu) {
+# sqrt(phi * V(mu) / w) for Pearson residuals. Mirrors the kernel's family
+# table (src/family.rs) and the Python port's `summary._SQRT_VARIANCE` - change
+# together. sqrt(V) is taken without forming V: mu^2 or mu^3 leaves the double
+# range at extreme means where sqrt(V) does not.
+.pearson_sd <- function(object, mu) {
   fam <- object$family_name
   theta <- object$dispersion
-  v <- switch(fam,
+  sd <- switch(fam,
     gaussian = rep(1, length(mu)),
-    binomial = mu * (1 - mu),
-    poisson = mu,
-    gamma = mu^2,
-    negativebinomial = mu + mu^2 / theta,
-    inversegaussian = mu^3
+    binomial = sqrt(mu * (1 - mu)),
+    poisson = sqrt(mu),
+    gamma = mu,
+    negativebinomial = sqrt(mu) * sqrt(1 + mu / theta),
+    inversegaussian = mu * sqrt(mu)
   )
   phi <- if (fam %in% c("gaussian", "gamma", "inversegaussian")) object$dispersion else 1
   w <- object$weights
   if (is.null(w)) w <- rep(1, length(mu))
-  phi * v / w
+  sd * sqrt(phi / w)
 }
 
 #' @export

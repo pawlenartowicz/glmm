@@ -29,10 +29,11 @@
 //! agree only to the last bits, by design (not gated on byte-identity).
 //!
 //! `2^k` is built with an FP magic-add + `u64` transmute/mask/mul rather than the
-//! textbook `(k+1023)<<52`: pulp 0.22's `Simd` trait exposes no integer
-//! shift/convert. Valid for `k ≥ -1023` (i.e. `x ⪆ -709`), always true: every
-//! call site clamps its argument into `[−700, 700]` first (`EXP_ARG_FLOOR` /
-//! `EXP_ARG_CEIL` here, `family::ETA_MAX` on η in the family kernel).
+//! textbook `(k+1023)<<52`: pulp 0.22's `Simd` trait exposes no 64-bit
+//! integer shift and no int→float convert. Valid for `k ≥ -1023` (i.e.
+//! `x ⪆ -709`), always true: every call site clamps its argument into
+//! `[−700, 700]` first (`EXP_ARG_FLOOR` / `EXP_ARG_CEIL` here,
+//! `family::ETA_MAX` on η in the family kernel).
 //!
 //! **fma policy.** wasm simd128 has no FMA instruction, so a guaranteed-fused
 //! `mul_add` lowers to the soft-float compiler-builtins libcall there (measured
@@ -405,7 +406,7 @@ pub fn exp_fill(buf: &mut [f64]) {
 // forcing the exponent field to 1023 (AND mantissa, OR bits(1.0)), then a
 // halving select for the m ≥ √2 half. LOG1P_H stays valid: its w = s² domain
 // only shrinks (|s| ≤ 0.172 → w ≤ 0.0295 ⊂ [0, 1/9]). pulp 0.22 exposes no
-// integer shift or u64→f64 convert, so k is recovered with an 11-step
+// 64-bit integer shift or u64→f64 convert, so k is recovered with an 11-step
 // compare-ladder kf = −Σ_{j=1..11} [u < √2·2^−j] (exactly consistent with the
 // m ≥ √2 select — the thresholds are exact 2^−j scalings of the same √2). The
 // two-sided clamp makes the ladder total on the skewed-marginal call site:
@@ -488,6 +489,108 @@ pub fn ln_owned(u: f64) -> f64 {
 #[inline]
 pub fn ln_fill(buf: &mut [f64]) {
     pulp::Arch::new().dispatch(LnInplaceOp::<{ FUSED_DEFAULT }> { buf });
+}
+
+// ln(x) on the whole positive normal range, for the NB deviance fold
+// (`family_pass`): the same √2-normalized reduction as `scalar_ln_unit`,
+// ln(x) = k·ln2 + log1p(m − 1), m ∈ [√2/2, √2), on the same `LOG1P_H`
+// polynomial, but with k read off the exponent field instead of a compare
+// ladder (whose 11 rungs only cover [2⁻¹¹, 1)). The exponent is moved down
+// by a 32-bit lane shift of the high word (`wrapping_dyn_shr_u32s`; pulp 0.22
+// has no 64-bit shift or int→float convert) and converted with the
+// 2⁵²-magic: bits `0x4330_0000 | E` in the high word read as `2⁵² + E·2³²`.
+// Arguments below `f64::MIN_POSITIVE` (zero, subnormals) are raised to it:
+// the fold never depends on such a value. It guards `y = 0` itself, and a
+// subnormal y is floored harmlessly because its term is multiplied by y.
+// μ = e^η with |η| ≤ 700 stays normal, and so does the ratio
+// (y+θ)/(μ+θ) ≥ θ/(μ+θ), since θ ≥ `NB_THETA_LO` = 1e-3.
+const LN_POS_FLOOR: f64 = f64::MIN_POSITIVE;
+const EXP_FIELD_MASK: u64 = 0x7FF0_0000_0000_0000;
+
+#[inline]
+fn scalar_ln_pos<const FUSED: bool>(x: f64) -> f64 {
+    let x = x.max(LN_POS_FLOOR);
+    let b = x.to_bits();
+    let e = ((b & EXP_FIELD_MASK) >> 52) as f64 - 1023.0;
+    let m = f64::from_bits((b & MANT_MASK) | ONE_BITS);
+    let (m, kf) = if m < std::f64::consts::SQRT_2 {
+        (m, e)
+    } else {
+        (0.5 * m, e + 1.0)
+    };
+    let l = scalar_log1p_unit::<FUSED>(m - 1.0);
+    fmadd_scalar::<FUSED>(kf, LN2HI, fmadd_scalar::<FUSED>(kf, LN2LO, l))
+}
+
+struct LnPosInplaceOp<'a, const FUSED: bool> {
+    buf: &'a mut [f64],
+}
+impl<const FUSED: bool> pulp::WithSimd for LnPosInplaceOp<'_, FUSED> {
+    type Output = ();
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) {
+        // The exponent shift reinterprets a 64-bit lane as two 32-bit ones;
+        // a backend whose `u32s` is not the same width as its `u64s` (pulp's
+        // scalar fallback) runs the scalar twin on every element.
+        if core::mem::size_of::<S::u32s>() != core::mem::size_of::<S::u64s>() {
+            for v in self.buf.iter_mut() {
+                *v = scalar_ln_pos::<FUSED>(*v);
+            }
+            return;
+        }
+        let one = simd.splat_f64s(1.0);
+        let (head, tail) = S::as_mut_simd_f64s(self.buf);
+        for v in head.iter_mut() {
+            let x = simd.max_f64s(*v, simd.splat_f64s(LN_POS_FLOOR));
+            let b = simd.transmute_u64s_f64s(x);
+            let hi: S::u32s = pulp::bytemuck::cast(b);
+            let hi = simd.wrapping_dyn_shr_u32s(hi, simd.splat_u32s(20));
+            let hi: S::u64s = pulp::bytemuck::cast(hi);
+            let ebits = simd.or_u64s(
+                simd.and_u64s(hi, simd.splat_u64s(0x0000_07FF_0000_0000)),
+                simd.splat_u64s(0x4330_0000_0000_0000),
+            );
+            // 2⁵² + E·2³² → E − 1023, exact.
+            let e = simd.sub_f64s(
+                simd.mul_f64s(
+                    simd.sub_f64s(
+                        simd.transmute_f64s_u64s(ebits),
+                        simd.splat_f64s(4_503_599_627_370_496.0),
+                    ),
+                    simd.splat_f64s(1.0 / 4_294_967_296.0),
+                ),
+                simd.splat_f64s(1023.0),
+            );
+            let m = simd.transmute_f64s_u64s(simd.or_u64s(
+                simd.and_u64s(b, simd.splat_u64s(MANT_MASK)),
+                simd.splat_u64s(ONE_BITS),
+            ));
+            let lt = simd.less_than_f64s(m, simd.splat_f64s(std::f64::consts::SQRT_2));
+            let m = simd.select_f64s(lt, m, simd.mul_f64s(simd.splat_f64s(0.5), m));
+            let kf = simd.select_f64s(lt, e, simd.add_f64s(e, one));
+            let l = simd_log1p_unit::<S, FUSED>(simd, simd.sub_f64s(m, one));
+            let inner = fmadd::<S, FUSED>(simd, kf, simd.splat_f64s(LN2LO), l);
+            *v = fmadd::<S, FUSED>(simd, kf, simd.splat_f64s(LN2HI), inner);
+        }
+        for v in tail.iter_mut() {
+            *v = scalar_ln_pos::<FUSED>(*v);
+        }
+    }
+}
+
+/// In-place `buf[i] = ln(buf[i])` for finite positive arguments (anything
+/// below `f64::MIN_POSITIVE`, zero included, is read as it): SIMD head +
+/// bit-identical scalar tail, within 2 ULP of libm. Not the censored-Φ
+/// `ln_fill`: this one covers the whole positive range. Outside the domain
+/// the output is finite but not a logarithm: `+∞` reads as `2¹⁰²⁴` (exponent
+/// field 2047), and a NaN is floored to `MIN_POSITIVE` on the scalar tail and
+/// on backends whose `max` returns the non-NaN operand (x86), while on those
+/// whose `max` propagates it (aarch64 NEON, wasm `f64x2.max`) its bit pattern
+/// goes through the exponent read. A caller that can see a NaN checks for it
+/// itself, as the NB deviance fold does.
+#[inline]
+pub(crate) fn ln_pos_fill(buf: &mut [f64]) {
+    pulp::Arch::new().dispatch(LnPosInplaceOp::<{ FUSED_DEFAULT }> { buf });
 }
 
 // A&S 7.1.26 constants — shared by the SIMD Φ kernel below and its scalar
@@ -1147,12 +1250,83 @@ pub(crate) fn family_pass(
             }
         }
     }
-    // Deviance fold off the filled μ (and η on a tail row). Kept scalar and in
-    // `family::dev_resid_at`'s exact form: its `ln`s are outside this module's
-    // restricted-domain `ln` (arguments run over `y/μ` on the whole positive
-    // line), and holding the deviance arithmetic fixed keeps this kernel's
-    // movement confined to μ.
+    // Deviance fold off the filled μ (and η on a tail row). For every family
+    // but NB (below), kept scalar and in `family::dev_resid_at`'s exact form:
+    // its `ln`s are outside this module's restricted-domain `ln` (arguments
+    // run over `y/μ` on the whole positive line), and holding the deviance
+    // arithmetic fixed keeps this kernel's movement confined to μ.
     let mut dev = 0.0;
+    if let Family::NegativeBinomial { .. } = family {
+        // NB: `family::dev_resid`'s expression
+        // `2·[y·ln(a/b) − θ·ln((y+θ)/(μ+θ))]`, a = y/(y+θ), b = μ/(μ+θ),
+        // `y·ln(a/b) → 0` at y = 0, with both logs taken as `family::ln_ratio`
+        // takes them (mirrors it — change together): `ln_1p(r)` with
+        // r = θ(y − μ)/(μ(y+θ)) or (y − μ)/(μ + θ), unless the ratio is under
+        // ½, where it is the difference of two logs. The
+        // `ln_1p`s are batched through the SIMD `ln_pos_fill` a chunk of rows
+        // at a time (stack buffers, no heap) as `ln(u)·r/(u − 1)`, u = 1 + r
+        // rounded, which is `ln_1p(r)` to the precision of `ln(u)` (Goldberg
+        // 1991, "What every computer scientist should know about
+        // floating-point arithmetic", Theorem 4), then folded in row order.
+        // An NB row has no tail form of its own (`family::tail_dev` returns
+        // `dev_resid`), so every row takes this path. The `ln`s differ from
+        // libm's in the last bits only. `ln_pos_fill` maps a NaN to a finite
+        // value, so a NaN μ (a NaN η on the scalar tail of the arm above) is
+        // caught here and gives the NaN deviance `dev_resid` gives.
+        const CH: usize = 64;
+        let mut r1 = [0.0f64; CH];
+        let mut r2 = [0.0f64; CH];
+        let mut l1 = [0.0f64; CH];
+        let mut l2 = [0.0f64; CH];
+        let mut nan_mu = false;
+        let mut start = 0;
+        while start < n {
+            let end = (start + CH).min(n);
+            let len = end - start;
+            for j in 0..len {
+                let i = start + j;
+                nan_mu |= prob[i].is_nan();
+                let d = y[i] - prob[i];
+                let mu_th = prob[i] + nb_theta;
+                r1[j] = (nb_theta * d / (mu_th * (y[i] + nb_theta))) / (prob[i] / mu_th);
+                r2[j] = d / mu_th;
+                l1[j] = 1.0 + r1[j];
+                l2[j] = 1.0 + r2[j];
+            }
+            ln_pos_fill(&mut l1[..len]);
+            ln_pos_fill(&mut l2[..len]);
+            let ln_1p = |r: f64, ln_u: f64| {
+                let u = 1.0 + r;
+                if u == 1.0 {
+                    r
+                } else {
+                    ln_u * r / (u - 1.0)
+                }
+            };
+            for j in 0..len {
+                let i = start + j;
+                let pw = if prior_w.is_empty() { 1.0 } else { prior_w[i] };
+                let (yi, mu) = (y[i], prob[i]);
+                let (a, b) = (yi / (yi + nb_theta), mu / (mu + nb_theta));
+                let t = if yi <= 0.0 {
+                    0.0
+                } else if a >= 0.5 * b {
+                    yi * ln_1p(r1[j], l1[j])
+                } else {
+                    yi * (a.ln() - b.ln())
+                };
+                let s = if yi + nb_theta >= 0.5 * (mu + nb_theta) {
+                    ln_1p(r2[j], l2[j])
+                } else {
+                    (yi + nb_theta).ln() - (mu + nb_theta).ln()
+                };
+                dev += pw * (2.0 * (t - nb_theta * s));
+            }
+            start = end;
+        }
+        let dev = if nan_mu { f64::NAN } else { dev };
+        return (dev, infeasible || out_of_range);
+    }
     for i in 0..n {
         let pw = if prior_w.is_empty() { 1.0 } else { prior_w[i] };
         dev += pw * crate::family::dev_resid_at(family, nb_theta, y[i], eta[i], prob[i]);
@@ -1258,8 +1432,8 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
 
         match self.family {
             // μ = Φ(η), dμ/dη = φ(η); general Fisher weight (dμ/dη)²/V(μ). A
-            // row whose μ lands on the `PROB_EPS` bound is a tail row, refilled
-            // after the arm.
+            // row whose μ lands on the lower `PROB_EPS` bound or within
+            // `UPPER_TAIL_Q` of 1 is a tail row, refilled after the arm.
             Family::Binomial {
                 link: BinomialLink::Probit,
             } => {
@@ -1290,7 +1464,8 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
             // at ±ETA_MAX so `t` stays finite, and `−t` is floored at
             // `EXP_ARG_FLOOR`, the owned `exp`'s domain edge: past it `s` is
             // below 1e-304, μ is on its `PROB_EPS` bound, and the row is a tail
-            // row whose weight and residual are refilled after the arm.
+            // row whose weight and residual are refilled after the arm, as is
+            // every row with `s ≤ UPPER_TAIL_Q`, where `1 − μ` has lost digits.
             // μ is `1 − s`, not `−expm1(−t)` as in `family::link_inv`: no owned
             // SIMD expm1 exists, so μ below ~1e-8 differs from the scalar
             // statement in relative terms (same class of gap as the owned `exp`,
@@ -1331,8 +1506,9 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
             }
             // Weighted binomial logit — the canonical shortcut W_raw = V(μ),
             // matching `family::irls_weight_and_resid`. μ is unbounded, as on the
-            // unweighted route; a row past `PROB_EPS` is a tail row whose weight
-            // and residual (`V` may round to 0 there) are refilled after the arm.
+            // unweighted route; a row past `PROB_EPS` from 0 or within
+            // `UPPER_TAIL_Q` of 1 is a tail row whose weight and residual
+            // (`V` may round to 0 there) are refilled after the arm.
             // Unweighted Bernoulli logit never reaches here (`family_pass`
             // routes it to the fused `pw_and_log1pexp_sum` kernel).
             Family::Binomial {
@@ -1589,14 +1765,19 @@ mod tests {
             // `w` is only clamp/finite-checked above, which a wrong-but-in-range
             // weight formula would still pass — recompute p(1-p) from the libm
             // reference p, floored the same way, and ULP-check against it.
-            // Measured 1 ULP over this grid; pinned at measured+1.
+            // `w = p(1-p)`'s derivative `1-2p` amplifies the p gap at interior
+            // η (see the unfused twin below): measured 1 ULP against glibc,
+            // 6 ULP against wasm32's libm (η ≈ 1.68, where the kernel and libm
+            // p sit 1 ULP either side of the true value). Each target is pinned
+            // at its own measurement + 1.
             let w_ref = (libp * (1.0 - libp)).max(crate::glm::WEIGHT_CLAMP);
             wmax = wmax.max(ulp(w, w_ref));
         }
         assert!(pmax <= 2, "sigmoid p drifted {pmax} ULP from libm");
         assert!(lpmax <= 2, "log1pexp drifted {lpmax} ULP from libm");
+        let w_bound = if cfg!(target_arch = "wasm32") { 7 } else { 2 };
         assert!(
-            wmax <= 2,
+            wmax <= w_bound,
             "IRLS weight w drifted {wmax} ULP from libm p(1-p)"
         );
 
@@ -2038,26 +2219,26 @@ mod tests {
         assert_eq!(long[1].to_bits(), exp_clamped(EXP_ARG_CEIL).to_bits());
     }
 
+    /// A NaN comes out of `exp_fill` as NaN or as exp(−700), never as any
+    /// other value. Which one depends on where it lands and on the backend:
+    /// the scalar tail's `f64::clamp` keeps NaN; a SIMD lane clamps with the
+    /// backend's `min`/`max`, which drop the NaN on x86_64 (AVX2/AVX-512) and
+    /// on pulp's scalar backend (lane width 1: plain wasm32, x86_64 without
+    /// AVX2) but propagate it on wasm32 `+simd128`.
     #[test]
-    fn exp_fill_nan_diverges_between_simd_head_and_scalar_tail() {
-        // Scalar tail: `f64::clamp` leaves a NaN `self` unclamped, so the
-        // reduction runs on NaN and NaN survives to the output — no silent
-        // finite value here.
-        let mut tail_only = vec![f64::NAN];
-        exp_fill(&mut tail_only);
-        assert!(tail_only[0].is_nan());
-
-        // SIMD head: `min_f64s`/`max_f64s` lower to hardware min/max, which
-        // return the non-NaN operand instead of propagating NaN. A NaN landing
-        // in a full lane is floored to EXP_ARG_FLOOR before the polynomial runs,
-        // so it comes out as exp(-700), not NaN — head and tail disagree.
-        let mut head_nan = vec![0.0; 16];
-        head_nan[0] = f64::NAN;
-        for (i, x) in head_nan.iter_mut().enumerate().skip(1) {
+    fn exp_fill_nan_comes_out_nan_or_floored() {
+        let floor = exp_clamped(EXP_ARG_FLOOR);
+        let mut short = vec![f64::NAN];
+        exp_fill(&mut short);
+        let mut long = vec![0.0; 16];
+        long[0] = f64::NAN;
+        for (i, x) in long.iter_mut().enumerate().skip(1) {
             *x = -4.0 + i as f64;
         }
-        exp_fill(&mut head_nan);
-        assert_eq!(head_nan[0].to_bits(), exp_clamped(EXP_ARG_FLOOR).to_bits());
+        exp_fill(&mut long);
+        for v in [short[0], long[0]] {
+            assert!(v.is_nan() || v.to_bits() == floor.to_bits(), "{v}");
+        }
     }
 
     #[test]
@@ -2075,41 +2256,132 @@ mod tests {
         assert_eq!(long[1].to_bits(), ln_owned(LN_U_CEIL).to_bits());
     }
 
+    /// A NaN comes out of `ln_fill` finite, not NaN: the mantissa/exponent bit
+    /// trick turns whatever bits reach it into a plausible-looking ln value.
+    /// The bits depend on where the NaN lands and on the backend's `min`/`max`
+    /// (see `exp_fill_nan_comes_out_nan_or_floored`), so only finiteness is
+    /// pinned.
     #[test]
     fn ln_fill_nan_is_laundered_not_propagated() {
-        // Scalar tail: `f64::clamp` leaves NaN unclamped, so `to_bits()` feeds
-        // the mantissa/exponent bit trick NaN's own bit pattern as if it were a
-        // real `u` in the domain. The output is finite and reproducible, not
-        // NaN — a NaN can silently turn into a plausible-looking ln value here.
-        let mut tail_only = vec![f64::NAN];
-        ln_fill(&mut tail_only);
-        assert!(tail_only[0].is_finite());
-        assert_eq!(tail_only[0].to_bits(), ln_owned(f64::NAN).to_bits());
+        let mut short = vec![f64::NAN];
+        ln_fill(&mut short);
+        let mut long = vec![0.5; 16];
+        long[0] = f64::NAN;
+        ln_fill(&mut long);
+        assert!(short[0].is_finite(), "{}", short[0]);
+        assert!(long[0].is_finite(), "{}", long[0]);
+    }
 
-        // SIMD head: the hardware clamp floors NaN to LN_U_FLOOR before the bit
-        // trick runs, landing on the same value as a legitimate out-of-domain
-        // low input — a different finite number from the tail's NaN-bits value.
-        let mut head_nan = vec![0.5; 16];
-        head_nan[0] = f64::NAN;
-        ln_fill(&mut head_nan);
-        assert_eq!(head_nan[0].to_bits(), ln_owned(LN_U_FLOOR).to_bits());
+    /// `ln_pos_fill` against libm over the whole positive normal range
+    /// (log-spaced from `f64::MIN_POSITIVE` to `1e300`, plus values next to 1,
+    /// the NB deviance's ratio near the mode): within 2 ULP everywhere, and the
+    /// SIMD head equals its scalar tail element by element.
+    #[test]
+    fn ln_pos_fill_matches_libm_within_2ulp() {
+        let mut xs: Vec<f64> = (0..20_000)
+            .map(|k| 10f64.powf(-307.0 + 607.0 * k as f64 / 19_999.0))
+            .collect();
+        for k in 1..2000 {
+            xs.push(1.0 + (k as f64 - 1000.0) * 1e-6);
+            xs.push(1.0 + (k as f64 - 1000.0) * 1e-14);
+        }
+        xs.push(f64::MIN_POSITIVE);
+        xs.push(1.0);
+        xs.push(2.0);
+        xs.push(std::f64::consts::SQRT_2);
+        let mut got = xs.clone();
+        ln_pos_fill(&mut got);
+        for (&x, &g) in xs.iter().zip(&got) {
+            let r = x.ln();
+            let ulp = if r == 0.0 {
+                f64::MIN_POSITIVE
+            } else {
+                (f64::from_bits(r.abs().to_bits() + 1) - r.abs()).abs()
+            };
+            assert!((g - r).abs() <= 2.0 * ulp, "ln({x}) = {g}, libm {r}");
+            assert_eq!(
+                g.to_bits(),
+                scalar_ln_pos::<{ FUSED_DEFAULT }>(x).to_bits(),
+                "x={x}"
+            );
+        }
+    }
+
+    /// `ln_pos_fill` outside its domain: no NaN or infinity comes out on any
+    /// backend. The scalar tail floors a NaN to `MIN_POSITIVE` and reads `+∞`
+    /// as `2¹⁰²⁴`; a SIMD lane gives a finite value whose bits depend on the
+    /// backend's `max` (see the function's doc), so only finiteness is pinned
+    /// there.
+    #[test]
+    fn ln_pos_fill_non_finite_input_comes_out_finite() {
+        let mut tail_only = vec![f64::NAN];
+        ln_pos_fill(&mut tail_only);
+        assert_eq!(tail_only[0].to_bits(), f64::MIN_POSITIVE.ln().to_bits());
+        let mut tail_inf = vec![f64::INFINITY];
+        ln_pos_fill(&mut tail_inf);
+        assert!((tail_inf[0] - 1024.0 * std::f64::consts::LN_2).abs() < 1e-12);
+
+        let mut head = vec![0.5; 16];
+        head[0] = f64::NAN;
+        head[1] = f64::INFINITY;
+        ln_pos_fill(&mut head);
+        assert!(head.iter().all(|v| v.is_finite()), "{head:?}");
+    }
+
+    /// The NB arm of `family_pass` reads its `ln`s through `ln_pos_fill`,
+    /// which maps a NaN to a finite value; a NaN μ must still give the NaN
+    /// deviance `family::dev_resid` gives. A NaN η reaches μ as NaN on the
+    /// scalar tail (`f64::clamp` keeps NaN), which a 1-row call and the last
+    /// row of a 17-row call are on the lane-width 2, 4 and 8 backends. Pulp's
+    /// scalar backend (lane width 1) has no tail and floors the NaN η, giving a
+    /// finite μ; the deviance must then be finite too.
+    #[test]
+    fn family_pass_nb_nan_mu_gives_nan_deviance() {
+        let fam = Family::NegativeBinomial {
+            link: crate::spec::NegBinomialLink::Log,
+        };
+        for len in [1usize, 17] {
+            let mut eta = vec![0.3; len];
+            eta[len - 1] = f64::NAN;
+            let y = vec![2.0; len];
+            let (mut prob, mut w) = (vec![0.0; len], vec![0.0; len]);
+            let (dev, _) = family_pass(
+                fam,
+                5.0,
+                &mut eta,
+                &y,
+                &[],
+                false,
+                0.0,
+                &mut prob,
+                &mut w,
+                &mut [],
+            );
+            assert_eq!(
+                dev.is_nan(),
+                prob[len - 1].is_nan(),
+                "len {len}: deviance {dev}, μ {}",
+                prob[len - 1]
+            );
+        }
     }
 
     #[test]
     fn sigmoid_fill_nonfinite_input() {
-        // +inf saturates to 1.0 (the η ≥ 0 branch). -inf and NaN both fall
-        // through the same path as a very negative η: `z = exp(-|η|)` clamps to
-        // exp(-700) either way (NaN's `.abs()` is NaN, and `.max(EXP_ARG_FLOOR)`
-        // returns the non-NaN operand — the same NaN-eating `simd_z_mask`/
-        // `scalar_z` rely on), and `η >= 0.0` is false for both, selecting the
-        // tiny-p branch. So NaN is silently treated as η → -∞ here, and head and
-        // tail agree because this kernel does no bit-pattern trick on `z`.
+        // +inf saturates to 1.0 (the η ≥ 0 branch). -inf falls through the
+        // same path as a very negative η: `z = exp(-|η|)` clamps to exp(-700)
+        // and `η >= 0.0` is false, selecting the tiny-p branch. NaN takes that
+        // branch too, as tiny p where the clamp's `max` drops the NaN, as NaN
+        // where it propagates it (wasm32 `+simd128` lanes; see
+        // `exp_fill_nan_comes_out_nan_or_floored`).
         let floor_z = exp_clamped(EXP_ARG_FLOOR);
         let expect_tiny = floor_z / (1.0 + floor_z);
 
+        let nan_ok = |v: f64| v.is_nan() || v.to_bits() == expect_tiny.to_bits();
+
         let mut short = vec![f64::NAN, f64::NEG_INFINITY, f64::INFINITY];
         sigmoid_fill(&mut short);
-        assert_eq!(short[0].to_bits(), expect_tiny.to_bits());
+        assert!(nan_ok(short[0]), "{}", short[0]);
         assert_eq!(short[1].to_bits(), expect_tiny.to_bits());
         assert_eq!(short[2], 1.0);
 
@@ -2121,7 +2393,7 @@ mod tests {
             *x = -4.0 + i as f64;
         }
         sigmoid_fill(&mut long);
-        assert_eq!(long[0].to_bits(), expect_tiny.to_bits());
+        assert!(nan_ok(long[0]), "{}", long[0]);
         assert_eq!(long[1].to_bits(), expect_tiny.to_bits());
         assert_eq!(long[2], 1.0);
     }

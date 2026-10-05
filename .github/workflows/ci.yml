@@ -40,6 +40,14 @@ jobs:
         # The crate's workspace lints set clippy::all = deny, so a plain clippy
         # run is the correctness gate — no extra `-- -D warnings` needed.
         run: cargo clippy --all-targets
+      - name: clippy (loop_bench, with and without its OS counters)
+        # The root clippy run above does not build the validation examples, and
+        # loop_bench's libc module is compiled only under `os_counters`: build
+        # both arms so neither rots. On this Linux runner the macOS-only
+        # proc_pid_rusage call is cfg'd out; the Mac speed runs build it.
+        run: |
+          cargo clippy -p validation --example loop_bench --features loop_advanced
+          cargo clippy -p validation --example loop_bench --features "loop_advanced os_counters"
       - name: guard — the default-off kernel links no regex
         # `formula` is on by default (semver-covered surface), so the kernel's
         # regex-free property is no longer structural — this assertion IS the
@@ -127,6 +135,44 @@ jobs:
         # rayon is target-dep-excluded on wasm32, so the feature must compile to
         # a no-op here, never pull rayon in or break the build.
         run: cargo check --target wasm32-unknown-unknown --features parallel
+
+  # ── wasm-test: run the lib tests on wasm32 under wasmtime ─────────────────
+  # The check above only compiles. Fits on wasm32 round differently (no FMA
+  # contraction, other `exp`/`ln`, the simd128 kernels), so the lib suite runs
+  # there too: plain wasm32 and the simd128 build the grid's glmm_wasm engine
+  # uses. wasip1 builds with panic=abort, so libtest reports every should_panic
+  # test as ignored. The runner preopens the crate root twice: as `.` and at
+  # its own path, which the fixtures read through CARGO_MANIFEST_DIR. The grid
+  # data the lib tests include are the committed `validation/grid/data/fast/`
+  # and `_wts` files.
+  wasm-test:
+    name: wasm-test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: plain, rustflags: "" }
+          - { name: simd128, rustflags: "-C target-feature=+simd128" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+        with:
+          # Pinned like ruff below, so a new release cannot break CI mid-release.
+          version: "45.0.0"
+      - name: lib tests on wasm32-wasip1 (${{ matrix.name }})
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime --dir=. --dir=$PWD" \
+            cargo test --lib --target wasm32-wasip1
 
   # ── package: gate the publishable state on every push ─────────────────────
   package:
@@ -284,7 +330,7 @@ jobs:
   # transposed — which is exactly the class of bug no single-language test can
   # see.
   #
-  # It runs the accuracy grid's `fast` subset (83 cells) through all three, then
+  # It runs the accuracy grid's `fast` subset (117 cells) through all three, then
   # compares with the grid's own comparator. No statistics package is installed:
   # --ports-only skips every oracle lookup, and jsonlite and Rcpp (compiler
   # glue, not a statistics engine) are the only R dependencies it has.
@@ -335,7 +381,7 @@ jobs:
         run: cargo build --release -p validation --example grid_glmm
       - name: Fit the fast subset through all three front ends
         # --jobs=1: one worker, pinned to core 0. The runner has no P-core/E-core
-        # split to respect and the fast subset is a couple of seconds of fitting.
+        # split to respect and the fast subset is under a minute of fitting.
         run: |
           validation/grid/run.sh glmm        --fast --jobs=1 --label ci
           validation/grid/run.sh glmm_python --fast --jobs=1 --label ci

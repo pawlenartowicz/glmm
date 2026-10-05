@@ -3,7 +3,8 @@
 #
 #   1. deviance vs the BEST oracle on the cell's estimator arm (hard)
 #   2. parameters vs the NEAREST oracle, backed by divergences.json
-#   3. truth error per family and arm (hard)
+#   3. truth error per family and arm, backed by divergences.json (reported
+#      only under --fast)
 #   4. the two port gates, glmm vs glmm_python and glmm vs glmm_r (round-off)
 #
 # No engine is "the" reference. Gate 1 takes the best converged oracle on the
@@ -72,10 +73,11 @@ cell <- function(d, m, w = 10) sprintf(sprintf("%%-%ds", w),
                                        if (is.na(d)) m else sprintf("%.0e/%s", d, m))
 
 # ── documented-divergence registry ───────────────────────────────────────────
-# Gate 2 is a reference check, not a pass/fail gate. The four outcomes (no entry
-# / covered / past max_rel / stale) are written out once in the "//" string of
-# divergences.json -- read them there rather than from a copy here that can drift
-# out of step.
+# Gates 2 and 3 read the registry, each in its own scope: "glmm-vs-oracle" for
+# gate 2, "glmm-vs-truth" for gate 3, so an entry for one never covers the other.
+# The four outcomes (no entry / covered / past max_rel / stale) are written out
+# once in the "//" string of divergences.json -- read them there rather than from
+# a copy here that can drift out of step.
 #
 # The deviance gate has NO registry escape and the port gates do not consult the
 # registry either: both ports call the same kernel, so their bands are round-off
@@ -83,9 +85,10 @@ cell <- function(d, m, w = 10) sprintf(sprintf("%%-%ds", w),
 DIV <- fromJSON(file.path(script_dir, "divergences.json"),
                 simplifyVector = TRUE, simplifyDataFrame = FALSE)$entries
 div_fired <- character(0)
-# "<cell> <quantity>" pairs this run actually COMPARED -- not merely reached. A
-# cell whose quantity came out `n/a` or `no-ref` was never put to the registry, so
-# an entry on it cannot be called stale on the strength of this run.
+# "<scope> <cell> <quantity>" triples this run actually COMPARED -- not merely
+# reached. A cell whose quantity came out `n/a` or `no-ref`, or whose truth-gate
+# group was never scored, was never put to the registry, so an entry on it cannot
+# be called stale on the strength of this run.
 div_seen <- character(0)
 
 # The registry entry covering (cell, quantity) in `scope`, or NULL.
@@ -117,6 +120,33 @@ div_mark <- function(m, diff, cell_id, quantity, scope) {
     return("FAIL")
   }
   "DOC"
+}
+
+# A covered divergence is printed with its entry, so a DOC mark always has a
+# named reason next to it in the same output.
+div_print <- function(e) {
+  cat(sprintf("%-34s %-22s <= %.1e  %s\n", e$cell,
+              paste(e$quantities, collapse = ","), e$max_rel, e$id))
+  cat(sprintf("  direction: %s\n", e$direction))
+  cat(sprintf("  summary: %s\n", e$summary))
+}
+
+# A registry entry in `scope` whose (cell, quantity) WAS compared and did not
+# fire is stale: the divergence it excuses is gone, and leaving it would turn the
+# entry into a standing exemption for whatever drifts there next. Scoped to what
+# this run actually compared, so neither a subset run nor a quantity that came
+# out `n/a` trips it.
+div_stale <- function(scope) {
+  stale <- Filter(function(e) scope %in% e$comparison &&
+                              any(paste(scope, e$cell, e$quantities) %in% div_seen) &&
+                              !(e$id %in% div_fired), DIV)
+  if (!length(stale)) return(invisible(NULL))
+  cat("\n")
+  for (e in stale) {
+    cat(sprintf("STALE registry entry: %s (%s) no longer fires -- delete it\n",
+                e$id, e$cell))
+  }
+  any_fail <<- TRUE
 }
 
 # ── frozen high-precision deviance references ───────────────────────────────
@@ -179,7 +209,12 @@ GATE2_QUANTITIES <- c("beta", "se_rx", "se_hessian", "stddev", "corr")
 # glmm's dispersion: lm's residual variance, and summary(glm)'s Pearson moment
 # on Gamma. MixedModels.jl reports SEs 5e-02 to 0.99 away on the prior-weight
 # fixed-effects gaussian cells, so it stays out.
+#
+# A record from another estimator arm is out for every quantity, by the rule
+# gates 1 and 3 use: a Laplace-only oracle on an AGQ cell sits at the Laplace
+# optimum, which is not glmm's objective there.
 gate2_excluded <- function(r, cl, q) {
+  if (!identical(engine_arm(r$engine, cl), cell_arm(cl))) return(TRUE)
   if (!objective_differs(r, cl)) return(FALSE)
   if (cl[["n_theta"]] > 0) return(TRUE)
   if (identical(q, "beta")) return(FALSE)
@@ -328,7 +363,12 @@ port_gate <- function(grid_dir, rust, engine, known) {
 # off is visible rather than merely not chosen. paired_2sem is the run's own
 # measurement of the quantity the band was pinned from; it is printed, never
 # gated, and it is how a later re-pin gets its number.
-truth_table_block <- function(label, pt, family, gated) {
+#
+# A registry entry names one cell, and this verdict is about a group of them, so
+# a FAIL(truth) is covered by an entry in the "glmm-vs-truth" scope on ANY cell of
+# the group (`cell_ids`). That entry's max_rel caps the overshoot -- how far
+# err_glmm sits above err_best + band, in the band's own units.
+truth_table_block <- function(label, pt, family, gated, cell_ids, q) {
   cat(sprintf("\n--- %s ---\n", label))
   if (pt$n_undefined > 0) {
     cat(sprintf("  %d cell(s) excluded: correlation undefined on a pinned block\n",
@@ -344,7 +384,7 @@ truth_table_block <- function(label, pt, family, gated) {
       cat("  no cell in this group carries a scoreable truth vector for this quantity -- nothing to score\n")
       return(invisible(NULL))
     }
-    # `--dev-floor` runs this table with gated = FALSE and carries no verdict, so
+    # `--dev-floor` and `--fast` run this table with gated = FALSE and carry no verdict, so
     # there the same state is a note about what could not be measured, not a
     # failure label the mode is in no position to hand out.
     cat(sprintf(paste0("  %s %d cell(s) carry a scoreable truth vector for this ",
@@ -367,10 +407,15 @@ truth_table_block <- function(label, pt, family, gated) {
   best <- pt$rows[[which.min(vapply(pt$rows, `[[`, 0, "err_oracle"))]]
   band <- truth_band(family)
   fail <- best$err_glmm > best$err_oracle + band
+  div_seen <<- union(div_seen, paste("glmm-vs-truth", cell_ids, q))
+  hit <- Find(function(cid) !is.null(div_lookup(cid, q, "glmm-vs-truth")), cell_ids)
+  m <- div_mark(if (fail) "FAIL" else "ok", best$err_glmm - best$err_oracle - band,
+                hit, q, "glmm-vs-truth")
   cat(sprintf("  VERDICT: best=%s  err_glmm %.4e vs err_best %.4e + band %.1e  -> %s\n",
               best$oracle, best$err_glmm, best$err_oracle, band,
-              if (fail) "FAIL(truth)" else "ok"))
-  if (fail) any_fail <<- TRUE
+              if (identical(m, "FAIL")) "FAIL(truth)" else m))
+  if (identical(m, "DOC")) div_print(div_lookup(hit, q, "glmm-vs-truth"))
+  if (identical(m, "FAIL")) any_fail <<- TRUE
 }
 
 # ── --dev-floor: MEASUREMENT, not a gate ─────────────────────────────────────
@@ -528,7 +573,8 @@ truth_gate <- function(cells, glmm_recs, orec_by_cell, gated = TRUE, floor_ = NU
       pt <- paired_truth_table(grp, glmm_recs, orec_by_cell,
                                truth_extract[[q]], truth_vector[[q]], floor_)
       mismatches <- c(mismatches, pt$mismatches)
-      truth_table_block(sprintf("%s / %s", key, q), pt, family, gated)
+      truth_table_block(sprintf("%s / %s", key, q), pt, family, gated,
+                        vapply(grp, `[[`, "", "cell"), q)
     }
   }
 
@@ -782,7 +828,7 @@ run_gates <- function() {
         # Recorded as compared only HERE, on the branch that reaches the registry:
         # the stale check may only call an entry dead on a quantity this run put to
         # it, never on one that came out `n/a` or `no-ref`.
-        div_seen <<- union(div_seen, paste(cid, q))
+        div_seen <<- union(div_seen, paste("glmm-vs-oracle", cid, q))
         marks[[q]] <- div_mark(mark(nd$diff, band_for(cl, q)), nd$diff, cid, q,
                                "glmm-vs-oracle")
       }
@@ -871,33 +917,16 @@ run_gates <- function() {
   # named reason next to it in the same output.
   if (length(div_fired)) {
     cat("\n=== documented divergences (reference check, not a gate) ===\n")
-    for (e in DIV) {
-      if (!(e$id %in% div_fired)) next
-      cat(sprintf("%-34s %-22s <= %.1e  %s\n", e$cell,
-                  paste(e$quantities, collapse = ","), e$max_rel, e$id))
-      cat(sprintf("  direction: %s\n", e$direction))
-      cat(sprintf("  summary: %s\n", e$summary))
-    }
+    for (e in DIV) if (e$id %in% div_fired) div_print(e)
   }
-  # A registry entry whose (cell, quantity) WAS compared and did not fire is
-  # stale: the divergence it excuses is gone, and leaving it would turn the entry
-  # into a standing exemption for whatever drifts there next. Scoped to what this
-  # run actually compared, so neither a subset run nor a quantity that came out
-  # `n/a` trips it.
-  stale <- Filter(function(e) "glmm-vs-oracle" %in% e$comparison &&
-                              any(paste(e$cell, e$quantities) %in% div_seen) &&
-                              !(e$id %in% div_fired), DIV)
-  if (length(stale)) {
-    cat("\n")
-    for (e in stale) {
-      cat(sprintf("STALE registry entry: %s (%s) no longer fires -- delete it\n",
-                  e$id, e$cell))
-    }
-    any_fail <<- TRUE
-  }
+  div_stale("glmm-vs-oracle")
 
-  cat("\n=== gate 3: truth error ===\n")
-  truth_gate(cells, glmm_run$recs, orec_by_cell)
+  # Under --fast a family x arm group holds two to five cells, and an oracle that
+  # lands nearer the truth on those few cells by chance would fail the group. The
+  # verdict needs the full grid's group sizes, so --fast prints the tables only.
+  cat(sprintf("\n=== gate 3: truth error%s ===\n", if (opt_fast) " (reported only under --fast)" else ""))
+  truth_gate(cells, glmm_run$recs, orec_by_cell, gated = !opt_fast)
+  div_stale("glmm-vs-truth")
 
   port_gate(grid_dir, glmm_run, "glmm_python", character(0))
   port_gate(grid_dir, glmm_run, "glmm_r", KNOWN_R_PARSE)

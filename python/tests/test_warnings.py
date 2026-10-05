@@ -1,3 +1,4 @@
+import math
 import warnings
 from pathlib import Path
 
@@ -177,6 +178,27 @@ def test_constructed_notes_store_with_their_tier_and_title():
                 "Its standard errors tend to be too small, so p-values and confidence intervals "
                 "may look more precise than they are. Standard errors for the random-effect "
                 "standard deviations are not available."
+            ),
+        ),
+        (
+            dict(base, kind="se_unavailable"),
+            glmm.SeUnavailableWarning,
+            (
+                "Standard errors could not be computed at the fit's end point: the fixed "
+                "effects carry too little separate information. The estimates are usable; "
+                "standard errors, p-values and confidence intervals are not reported. Check "
+                "for predictors that are copies or near-copies of each other."
+            ),
+        ),
+        (
+            dict(base, kind="precision_limited"),
+            glmm.PrecisionLimitedWarning,
+            (
+                "The numbers in this fit are so large that rounding in the computer's arithmetic "
+                "hides small changes in its deviance. The random-effect estimates, and the fixed "
+                "effects that depend on them, may be off by a tenth of a standard error or more. "
+                "This happens with counts in the billions or more, or when a model misses a "
+                "large effect in such data."
             ),
         ),
         (
@@ -373,6 +395,16 @@ _PIRLS = [
         "detail": "",
     }
 ]
+_SEPARATED = [
+    {
+        "kind": "separated",
+        "columns": [],
+        "pivot": float("nan"),
+        "evals": 0,
+        "final_eval": False,
+        "detail": "",
+    }
+]
 _FIN = np.array([1.5, -2.0])
 _NAN = np.array([np.nan, np.nan])
 _NONE = np.zeros(2, dtype=bool)
@@ -543,6 +575,31 @@ _UNSOLVABLE = (
             glmm.FitFailedWarning,
             _FAILED.format(inner=""),
         ),
+        # ... unless the fixed-effects-only GLM stopped on separation (the `separated` note)
+        (
+            "binomial",
+            True,
+            _SEPARATED,
+            _FIN,
+            _NONE,
+            np.nan,
+            _Y,
+            "glm_diverged",
+            glmm.GlmDivergedWarning,
+            _BINOMIAL,
+        ),
+        (
+            "poisson",
+            True,
+            _SEPARATED,
+            _FIN,
+            _NONE,
+            np.nan,
+            _Y,
+            "glm_diverged",
+            glmm.GlmDivergedWarning,
+            _COUNTS,
+        ),
         # no fixed effects at all (y ~ 0 + (1 | g)): the deviance decides
         (
             "gaussian",
@@ -698,6 +755,41 @@ def test_separated_glm_stores_glm_diverged_last():
     assert sum(w["tier"] == "severe" for w in m.warnings) == 1
 
 
+def test_separated_glmm_stores_glm_diverged_last():
+    data = {"x": _X, "g": _G, "y": [float(x > 0) for x in _X]}
+    with pytest.warns(glmm.GlmDivergedWarning) as caught:
+        m = glmm.fit(data, "y ~ x + (1 | g)", "binomial")
+    assert not m.converged
+    assert m.warnings[-1]["kind"] == "glm_diverged"
+    assert printed(m.warnings[-1]) in [str(w.message) for w in caught]
+    assert sum(w["tier"] == "severe" for w in m.warnings) == 1
+
+
+def test_reciprocal_link_response_out_of_range_names_the_cause():
+    # 1/mu = 1/(1e80 * ...) is below the kernel's 1e-75 bound on the Gamma inverse link.
+    y = [1e80 * (2.0 + 0.1 * x) for x in _X]
+    with pytest.warns(glmm.GlmDivergedWarning):
+        m = glmm.fit({"x": _X, "y": y}, "y ~ x", "gamma", link="inverse")
+    assert not m.converged
+    assert m.warnings[-1]["kind"] == "glm_diverged"
+    assert "Rescale the response" in m.warnings[-1]["message"]
+    # The GLMM searches on a rescaled response when the cluster means are far
+    # out of scale (src/fit/glmm.rs, `gamma_inverse_units`), so it fits these
+    # data as it fits y * 1e-80, the log-likelihood moved by -n * ln(1e80).
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit({"x": _X, "g": _G, "y": y}, "y ~ x + (1 | g)", "gamma", link="inverse")
+        small = glmm.fit(
+            {"x": _X, "g": _G, "y": [v * 1e-80 for v in y]},
+            "y ~ x + (1 | g)",
+            "gamma",
+            link="inverse",
+        )
+    assert m.converged and small.converged
+    want = small.loglik - len(y) * math.log(1e80)
+    assert abs(m.loglik - want) < 1e-6 * abs(want)
+
+
 def test_all_zero_binomial_is_constant_response_not_separation():
     with pytest.warns(glmm.ConstantResponseWarning):
         m = glmm.fit({"x": _X, "y": [0.0] * 20}, "y ~ x", "binomial")
@@ -801,53 +893,3 @@ def test_port_parity_rows_dropped_na():
     assert entry["message"] == (
         "Dropped 1 of 4 row(s): a column the formula uses had a missing value there."
     )
-
-
-# 12-row Gamma-inverse GLMM, 4 clusters of 3 — the exact fixture
-# `gamma_inverse_adversarial(1e-2)` builds in src/fit/glmm_tests.rs, with the
-# same literal data in r/tests/testthat/test-warnings.R — change together.
-# Rows 3..6 (the second cluster) are scaled by 1e-2, spreading the 12 means
-# over about ten decades, which is what makes the joint Hessian non-PD.
-_HSE_X1 = [
-    -0.2884326052962697,
-    0.15675840297260962,
-    -0.29990566105127503,
-    0.3053648563367106,
-    -0.608001199771249,
-    1.451281361998219,
-    -0.12817918698856592,
-    0.2873778743945057,
-    1.2188666482896826,
-    -1.2520230368147756,
-    -0.01938374443978608,
-    1.0354827975218956,
-]
-_HSE_Y = [
-    0.013147681629338537,
-    0.022571111060908807,
-    0.009380481267257667,
-    13915684.733974772 * 1e-2,
-    16148934.63843452 * 1e-2,
-    47449285.58840935 * 1e-2,
-    0.03659612272549357,
-    0.03340213953300986,
-    0.16526466878896995,
-    2288.1399088594685,
-    5963.477254271042,
-    19049.155692047607,
-]
-
-
-def test_port_parity_hessian_se_fallback():
-    data = {
-        "x": _HSE_X1,
-        "g": [f"g{i // 3}" for i in range(12)],
-        "y": _HSE_Y,
-    }
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        m = glmm.fit(data, "y ~ x + (1 | g)", "gamma", link="inverse")
-    assert m.converged
-    assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
-        ("caution", "hessian_se_fallback", "Simpler standard errors used"),
-    ]

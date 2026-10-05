@@ -57,6 +57,9 @@ pub(crate) struct OlsWorkspace {
     // return a zero.
     scaled_x: Mat<f64>,
     scaled_y: Vec<f64>,
+    /// The fixed-effect factor `U` of an ill-conditioned design
+    /// ([`fit_ols_prebuilt`]); unread on a well-conditioned one.
+    design_qr: crate::lmm::DesignQr,
 }
 
 impl OlsWorkspace {
@@ -83,6 +86,7 @@ impl OlsWorkspace {
                 Mat::<f64>::zeros(0, 0)
             },
             scaled_y: vec![0.0f64; n1],
+            design_qr: crate::lmm::DesignQr::identity(p1),
         }
     }
 }
@@ -95,6 +99,13 @@ impl OlsWorkspace {
 /// mapped into `Fit` (see [`ols_view_to_fit`]). `map` is the column map `x_mat`
 /// was fitted through: the view's `betas` stay on `x_mat`'s design, its
 /// `var_diag`/`t_sq` are the caller's (`crate::ols::fit_suff_stats_t_sq_mapped`).
+///
+/// The Gram `X'WX` squares `X`'s condition number. When it is too ill
+/// conditioned to factor directly (a pivot ratio below
+/// `lmm::GRAM_PIVOT_MIN`, the test `DesignQr::set_from_gram` makes), the
+/// statistics are accumulated again on `X·U⁻¹` (`lmm::DesignQr`, a QR of
+/// `√W·X`), as the LMM kernels do; a well-conditioned design keeps the direct
+/// path.
 pub(crate) fn fit_ols_prebuilt<'a>(
     ws: &'a mut OlsWorkspace,
     x_mat: faer::MatRef<'_, f64>,
@@ -158,6 +169,44 @@ pub(crate) fn fit_ols_prebuilt<'a>(
         }
     }
 
+    let mut qr = None;
+    if n > p && p > 0 && !ws.design_qr.set_from_gram(ws.suff_xtx.as_ref()) {
+        let ok = ws
+            .design_qr
+            .set_from_rows(x_eff, |_| 1.0, &mut ws.fit_u_scratch);
+        if ok {
+            // X̃ = X·U⁻¹, one row at a time. Allocated here only: a design
+            // this ill-conditioned is rare, and the direct path stays as lean.
+            let mut xt = Mat::<f64>::zeros(n, p);
+            for i in 0..n {
+                let row = &mut ws.fit_u_scratch[..p];
+                for (j, v) in row.iter_mut().enumerate() {
+                    *v = x_eff[(i, j)];
+                }
+                ws.design_qr.solve_row(row);
+                for (j, &v) in row.iter().enumerate() {
+                    xt[(i, j)] = v;
+                }
+            }
+            ws.suff_xtx.fill(0.0);
+            ws.suff_xty.iter_mut().for_each(|z| *z = 0.0);
+            suff_yty = 0.0;
+            suff_sum_y = 0.0;
+            suff_n_rows = 0;
+            OlsSuffStats {
+                xtx: ws.suff_xtx.as_mut(),
+                xty: &mut ws.suff_xty,
+                yty: &mut suff_yty,
+                sum_y: &mut suff_sum_y,
+                n_rows: &mut suff_n_rows,
+                panel_x: &mut ws.panel_x,
+                panel_y: &mut ws.panel_y,
+            }
+            .add_rows(xt.as_ref(), y_eff);
+            qr = Some(&ws.design_qr);
+        }
+    }
+
     let scratch = OlsScratch {
         fit_betas: &mut ws.fit_betas,
         fit_var_diag: &mut ws.fit_var_diag,
@@ -176,6 +225,7 @@ pub(crate) fn fit_ols_prebuilt<'a>(
         ws.suff_xtx_work.as_mut(),
         scratch,
         map,
+        qr,
     )
 }
 

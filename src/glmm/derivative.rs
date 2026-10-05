@@ -111,8 +111,8 @@ pub(crate) struct GlmmDualBufs<T: Scalar> {
     // Per-solve controls handed to every dual kernel call; see `pirls::DualStep`.
     // Carries the blocked twin's scratch (`obs_blocks`, `s · q_p²`) and the
     // structured twin's (`obs_core_blocks` `(q_core² · s).max(1)`,
-    // `obs_coupling` `(q_core · s · e).max(1)`, `obs_schur_blk` `(e²).max(1)`,
-    // `obs_rhs` `k`, `obs_resid` `rows`) — same sizes `for_shape` allocates.
+    // `obs_coupling` `coupling_len`, `obs_schur_blk` `(e²).max(1)`,
+    // `obs_rhs` `k`) — same sizes `for_shape` allocates.
     pub(super) dual: DualStep<T>,
     /// The assembled gradient at `T`, one entry per `γ` coordinate: the value
     /// part is the gradient, the lanes of a seeded pass are that pass's
@@ -230,9 +230,9 @@ impl GlmmDualScratch {
     /// to `agq_deviance`/`agq_deviance_vec` as `Some(idx)` EXPLICITLY, and the
     /// f64 mode solve reads the same index so it runs the identical
     /// cluster-outer arm before the dual kernel ever sees the mode — never
-    /// `ws.cluster_rows`, which is populated only under the `parallel`
-    /// feature (`mod.rs:376`) and would silently drop to the node-outer arm
-    /// on a serial build.
+    /// `ws.cluster_rows`, which `fit_glmm` fills only under the `parallel`
+    /// feature or for serial vector AGQ without extra groupings, so a serial
+    /// scalar-AGQ fit would silently drop to the node-outer arm.
     fn cluster_rows(&self) -> &ClusterRowIndex {
         match self {
             GlmmDualScratch::D4(_, idx, _)
@@ -505,8 +505,8 @@ pub(super) fn agq_eligible(family: Family, nagq: u8, primary_q: usize) -> bool {
 /// `GlmmModeBufs`; `core_blocks` pins `q_core` and with it `m_core_buf`, and
 /// `schur_blk` pins `e` — the pair together pins `coupling`). The
 /// `DualStep` twins mirror the same pinning: `obs_core_blocks` re-checks
-/// `q_core`, `obs_schur_blk` re-checks `e`, and `obs_rhs`/`obs_resid` need no
-/// separate check because `u`'s `k` and `eta`'s `rows` already cover them.
+/// `q_core`, `obs_schur_blk` re-checks `e`, and `obs_rhs` needs no
+/// separate check because `u`'s `k` already covers it.
 /// Both twin checks also pin `observed`: an empty twin matches only an
 /// `observed == false` request, so a scratch sized without the twins is never
 /// handed to a call that reads them.
@@ -553,9 +553,8 @@ fn bufs_match_shape<T: Scalar>(
         && b.structured.core_blocks.len() == (d.q_core * d.q_core * d.s).max(1)
         && b.structured.schur_blk.len() == (d.e * d.e).max(1)
         // `obs_core_blocks` pins `q_core` (and with it `obs_coupling`),
-        // `obs_schur_blk` pins `e`; `u`'s `k` and `eta`'s `rows`, already
-        // checked above, pin `obs_rhs` and `obs_resid` — no separate check
-        // needed for either.
+        // `obs_schur_blk` pins `e`; `u`'s `k`, already checked above, pins
+        // `obs_rhs` — no separate check needed.
         && b.dual.obs_core_blocks.len()
             == obs_len(d.observed, (d.q_core * d.q_core * d.s).max(1))
         && b.dual.obs_schur_blk.len() == obs_len(d.observed, (d.e * d.e).max(1))
@@ -651,9 +650,8 @@ impl GlmmDualScratch {
     ///
     /// Builds its own `ClusterRowIndex` from `cluster_ids` unconditionally
     /// (`ClusterRowIndex::build`), rather than reusing `ws.cluster_rows` when
-    /// the `parallel` feature has already populated it for this fit — that
-    /// reuse would need `ClusterRowIndex: Clone`, a change to `agq.rs`, which
-    /// is out of scope here. `for_shape` only runs on the first
+    /// `fit_glmm` has already built it for this fit — that
+    /// reuse would need `ClusterRowIndex: Clone`. `for_shape` only runs on the first
     /// derivative request for a shape or on a shape change (the reuse
     /// policy skips it on repeat calls), so this is a bounded, not a
     /// per-call, allocation — the zero-alloc-on-repeat gate is
@@ -700,14 +698,16 @@ impl GlmmDualScratch {
                             ],
                             obs_coupling: vec![
                                 <$T as Scalar>::ZERO;
-                                obs_len(d.observed, (d.q_core * d.s * d.e).max(1))
+                                obs_len(
+                                    d.observed,
+                                    super::workspace::coupling_len(d.rows, d.s, d.q_core, d.e)
+                                )
                             ],
                             obs_schur_blk: vec![
                                 <$T as Scalar>::ZERO;
                                 obs_len(d.observed, (d.e * d.e).max(1))
                             ],
                             obs_rhs: vec![<$T as Scalar>::ZERO; obs_len(d.observed, d.k)],
-                            obs_resid: vec![<$T as Scalar>::ZERO; obs_len(d.observed, d.rows)],
                             min_iters: 0,
                             exact: false,
                         },
@@ -2267,10 +2267,8 @@ mod tests {
                 assert!(bufs.asm.l_u.is_empty());
                 assert!(bufs.asm.g_gamma.is_empty());
                 assert!(bufs.asm.adj.is_empty());
-                assert!(bufs.asm.rb.is_empty());
-                assert!(bufs.asm.sb.is_empty());
-                assert!(bufs.asm.ra.is_empty());
-                assert!(bufs.asm.sa.is_empty());
+                assert!(bufs.asm.tail_h.is_empty());
+                assert!(bufs.asm.tail_g.is_empty());
                 assert!(bufs.asm.obs_core.is_empty());
                 assert!(bufs.asm.obs_coup.is_empty());
                 assert!(bufs.asm.obs_schur.is_empty());
@@ -2280,8 +2278,8 @@ mod tests {
     }
 
     /// A canonical link never reads an observed twin, so `for_shape` gives it
-    /// none — on a wide crossed shape `obs_coupling` alone is the largest
-    /// buffer in the scratch. The reuse check must pin the same thing, or a
+    /// none — on a wide crossed shape `obs_schur_blk` (`e²`) alone is
+    /// megabytes. The reuse check must pin the same thing, or a
     /// canonical-sized scratch could be handed to a call that indexes them.
     #[test]
     fn for_shape_leaves_observed_twins_empty_on_a_canonical_link() {
@@ -2310,9 +2308,11 @@ mod tests {
                 assert!(bufs.dual.obs_coupling.is_empty());
                 assert!(bufs.dual.obs_schur_blk.is_empty());
                 assert!(bufs.dual.obs_rhs.is_empty());
-                assert!(bufs.dual.obs_resid.is_empty());
                 // The Fisher buffers are untouched by the twin sizing.
-                assert_eq!(bufs.structured.coupling.len(), q_core * s * e);
+                assert_eq!(
+                    bufs.structured.coupling.len(),
+                    crate::glmm::workspace::coupling_len(rows, s, q_core, e)
+                );
                 assert_eq!(bufs.structured.schur_blk.len(), e * e);
             }
             _ => panic!("expected D8 variant"),

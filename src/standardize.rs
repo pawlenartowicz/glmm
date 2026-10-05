@@ -102,9 +102,13 @@ impl ColumnScaling {
     /// scaled as a 0/1 slope column is (the design fitted as given,
     /// `FitWorkspace::set_prestandardized`).
     ///
-    /// Two passes over the rows, each accumulating every column in ascending row
-    /// order: the flags and `Σwᵢxᵢⱼ` first, then `Σwᵢ(xᵢⱼ − mⱼ)²`. `center` and
-    /// `shift` hold the two sums until the last loop turns them into `mⱼ`, `sⱼ`.
+    /// The flags first, one column at a time: each test stops at the first row
+    /// that fails it. Then two passes over the rows, each accumulating every
+    /// column in ascending row order: `Σwᵢxᵢⱼ` first, then `Σwᵢ(xᵢⱼ − mⱼ)²`.
+    /// Without prior weights the passes add `xᵢⱼ` and `(xᵢⱼ − mⱼ)²` and take
+    /// `Σwᵢ = n`: the same values, since `1·v` is exact and `n < 2⁵³`.
+    /// `center` and `shift` hold the two sums until the last loop turns them
+    /// into `mⱼ`, `sⱼ`.
     pub(crate) fn compute(
         &mut self,
         x: &[f64],
@@ -118,31 +122,47 @@ impl ColumnScaling {
         if n == 0 || p == 0 || !(standardize || self.re_slope.contains(&true)) {
             return;
         }
-        let w = |i: usize| weights.map_or(1.0, |w| w[i]);
-        let rows = || x[..n * p].chunks_exact(p).enumerate();
-        let first = &x[..p];
-        self.flags.fill(FLAG_BINARY | FLAG_ONES | FLAG_CONSTANT);
-        let mut sw = 0.0;
-        for (i, row) in rows() {
-            let wi = w(i);
-            sw += wi;
-            for (j, &v) in row.iter().enumerate() {
-                let mut f = 0;
-                if v == 0.0 || v == 1.0 {
-                    f |= FLAG_BINARY;
-                }
-                if v == 1.0 {
-                    f |= FLAG_ONES;
-                }
-                if v == first[j] {
-                    f |= FLAG_CONSTANT;
-                }
-                self.flags[j] &= f;
-                self.center[j] += wi * v;
-            }
+        let x = &x[..n * p];
+        let weights = weights.map(|w| &w[..n]);
+        for (j, flag) in self.flags.iter_mut().enumerate() {
+            let col = || x[j..].iter().step_by(p);
+            let first = x[j];
+            *flag = if col().all(|&v| v == 1.0) {
+                FLAG_BINARY | FLAG_ONES | FLAG_CONSTANT
+            } else {
+                // `v·(v − 1)` is exactly 0 for `v` = ±0 and 1 and for no other
+                // double: a tiny `v` gives `−v` exactly, and near 1 `v − 1` is
+                // exact and at least 2⁻⁵³ in size; NaN and ±∞ fail. It is one
+                // comparison per row without a branch. `v == 0.0 || v == 1.0`
+                // compiles to two branches, which mispredict on random 0/1 data.
+                let binary = col().all(|&v| v * (v - 1.0) == 0.0);
+                let constant = col().all(|&v| v == first);
+                (u8::from(binary) * FLAG_BINARY) | (u8::from(constant) * FLAG_CONSTANT)
+            };
         }
+        let (center, shift) = (&mut self.center[..p], &mut self.shift[..p]);
+        let sw = match weights {
+            None => {
+                for row in x.chunks_exact(p) {
+                    for (c, &v) in center.iter_mut().zip(row) {
+                        *c += v;
+                    }
+                }
+                n as f64
+            }
+            Some(w) => {
+                let mut sw = 0.0;
+                for (row, &wi) in x.chunks_exact(p).zip(w) {
+                    sw += wi;
+                    for (c, &v) in center.iter_mut().zip(row) {
+                        *c += wi * v;
+                    }
+                }
+                sw
+            }
+        };
         self.intercept = self.flags.iter().position(|&f| f & FLAG_ONES != 0);
-        for j in 0..p {
+        for (j, c) in center.iter_mut().enumerate() {
             // Intercept, 0/1 columns and any further all-ones column: as they
             // are. A constant column next to an intercept has no spread to
             // scale; its computed `sⱼ` would be the round-off of `mⱼ` alone.
@@ -152,17 +172,28 @@ impl ColumnScaling {
                 || (self.intercept.is_some() && self.flags[j] & FLAG_CONSTANT != 0);
             let scaled = !kept || (self.re_slope[j] && Some(j) != self.intercept);
             self.flags[j] = u8::from(scaled);
-            self.center[j] = if kept || self.intercept.is_none() {
+            *c = if kept || self.intercept.is_none() {
                 0.0
             } else {
-                self.center[j] / sw
+                *c / sw
             };
         }
-        for (i, row) in rows() {
-            let wi = w(i);
-            for (j, &v) in row.iter().enumerate() {
-                let d = v - self.center[j];
-                self.shift[j] += wi * d * d;
+        match weights {
+            None => {
+                for row in x.chunks_exact(p) {
+                    for ((s, &m), &v) in shift.iter_mut().zip(&*center).zip(row) {
+                        let d = v - m;
+                        *s += d * d;
+                    }
+                }
+            }
+            Some(w) => {
+                for (row, &wi) in x.chunks_exact(p).zip(w) {
+                    for ((s, &m), &v) in shift.iter_mut().zip(&*center).zip(row) {
+                        let d = v - m;
+                        *s += wi * d * d;
+                    }
+                }
             }
         }
         for j in 0..p {

@@ -6,9 +6,9 @@ use faer::sparse::linalg::cholesky::{
 };
 use faer::sparse::linalg::SupernodalThreshold;
 use faer::sparse::{SparseColMat, Triplet};
-use faer::{Mat, MatRef, Par, Side, Spec};
+use faer::{Mat, MatMut, MatRef, Par, Side, Spec};
 
-use crate::lmm::{LmmGroupings, GLMM_RHO_END, RHO_BEGIN, THETA_TRUTH_FLOOR};
+use crate::lmm::{LmmGroupings, GLMM_RHO_BEGIN, GLMM_RHO_END, GLMM_RHO_POLISH};
 use crate::scalar::Scalar;
 
 /// Outer search over the variance components, fixed per shape at construction.
@@ -87,6 +87,17 @@ pub(crate) struct PirlsScratch<T: Scalar> {
     /// (center loglik | running log-sum | product-grid node table). See the
     /// sizing at construction.
     pub agq_scratch: Vec<T>,
+    /// Row-major `n×p` copy of the fitted design `X`, refilled at the start of
+    /// every `f64` β-Profile solve of the blocked and structured kernels
+    /// (`pirls_solve_blocked`, `pirls_solve_blocked_extras`) so their row
+    /// passes read one contiguous row per observation instead of `p`
+    /// bounds-checked `MatRef` lookups. Empty on the packed layout and on the
+    /// derivative scratch, whose `BetaStep::Fixed` solves never read it.
+    pub x_rows: Vec<f64>,
+    /// `k×p` row-major `B = M'WX` accumulator of those kernels' row passes,
+    /// copied into the border's `xtwm` (`B'`) once per iteration. Empty where
+    /// `x_rows` is.
+    pub bt_rows: Vec<f64>,
 }
 
 impl<T: Scalar> PirlsScratch<T> {
@@ -107,19 +118,34 @@ impl<T: Scalar> PirlsScratch<T> {
             a_rhs: vec![T::ZERO; k.max(1)],
             a_blocks: vec![T::ZERO; (q_p * q_p * s).max(1)],
             agq_scratch: vec![T::ZERO; super::derivative::agq_len(s, q_p, nagq)],
+            x_rows: Vec::new(),
+            bt_rows: Vec::new(),
         }
+    }
+
+    /// Size the `f64` row-pass buffers of the blocked and structured
+    /// β-Profile solves (`x_rows`, `bt_rows`) for `rows`
+    /// observations, `p` fixed effects and `k` RE columns. Called on the fit
+    /// workspace only.
+    pub(crate) fn with_profile_rows(mut self, rows: usize, p: usize, k: usize) -> Self {
+        self.x_rows = vec![0.0; rows * p];
+        self.bt_rows = vec![0.0; k * p];
+        self
     }
 }
 
 /// θ-dependent values of the structured crossed/nested route, left FACTORED
 /// after a converged solve for the Schur fill: core blocks `(q_core²·s).max(1)`,
-/// coupling `(q_core·s·e).max(1)`, Schur `(e²).max(1)`, packed core `M`
+/// coupling [`coupling_len`], Schur `(e²).max(1)`, packed core `M`
 /// `(rows·q_core).max(1)`, crossed values `(rows·G_cap).max(1)`. Same two
 /// instantiations as `PirlsScratch`.
 pub(crate) struct StructuredScratch<T: Scalar> {
     /// s · q_core² packed per-cluster core blocks (D_f+I then Crout L)
     pub core_blocks: Vec<T>,
-    /// s · q_core · e core↔crossed coupling C_f (row-major per cluster)
+    /// Core↔crossed coupling `C_f` on cluster `f`'s coupling columns only,
+    /// compact: `C_f[local][cols_f[j]]` at `q_core·coup_ptr[f] + local·|cols_f| + j`,
+    /// `j` the column's position in `cols_f = coup_cols[coup_ptr[f]..coup_ptr[f + 1]]`
+    /// (a row's `j` is `StructuredPattern::coup_pos`). Length [`coupling_len`].
     pub coupling: Vec<T>,
     /// e × e Schur S = (E+I) − Σ_f C_f'A_f⁻¹C_f (row-major; Crout L in place)
     pub schur_blk: Vec<T>,
@@ -140,12 +166,22 @@ impl<T: Scalar> StructuredScratch<T> {
     pub(crate) fn for_shape(rows: usize, s: usize, q_core: usize, e: usize) -> Self {
         Self {
             core_blocks: vec![T::ZERO; (q_core * q_core * s).max(1)],
-            coupling: vec![T::ZERO; (q_core * s * e).max(1)],
+            coupling: vec![T::ZERO; coupling_len(rows, s, q_core, e)],
             schur_blk: vec![T::ZERO; (e * e).max(1)],
             m_core_buf: vec![T::ZERO; (rows * q_core).max(1)],
             cross_val: vec![T::ZERO; (rows * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
         }
     }
+}
+
+/// Length of a compact per-cluster coupling buffer (`coupling`, its observed
+/// twins and the `tail_h` forms): `q_core` values per `coup_cols` entry. The
+/// CSR holds at most one entry per row per extra grouping and at most `e` per
+/// cluster, so it is never longer than `min(s·e, rows·MAX_EXTRA_GROUPINGS)`;
+/// a dense `q_core·s·e` layout would be mostly unread on an
+/// observation-level primary (grouseticks: 806 of 72,943).
+pub(crate) fn coupling_len(rows: usize, s: usize, q_core: usize, e: usize) -> usize {
+    (q_core * (s * e).min(rows * crate::lmm::MAX_EXTRA_GROUPINGS)).max(1)
 }
 
 /// θ-independent index pattern of the structured route — which crossed column
@@ -166,6 +202,11 @@ pub(crate) struct StructuredPattern {
     pub coup_cols: Vec<u32>,
     /// n_primary + 1 offsets
     pub coup_ptr: Vec<u32>,
+    /// max_n · G_cap, parallel to `cross_col`: the position `j` of
+    /// `cross_col[i·G_cap + z]` in row `i`'s cluster's `cols_f`, which is where
+    /// the scatter writes `C_f` in the compact `coupling` layout. Rebuilt with
+    /// the CSR.
+    pub coup_pos: Vec<u32>,
     /// θ-pinning mask (bit g = crossed grouping g has θ == 0.0) the current
     /// coup_cols/coup_ptr CSR was built for; `None` ⇒ not built this fit. The
     /// CSR pattern depends on the design AND this mask (build_packed_m drops
@@ -173,9 +214,9 @@ pub(crate) struct StructuredPattern {
     /// transitions. Reset to None at each fit_glmm start (mirrors u_seed).
     pub coup_mask: Option<u32>,
     /// Cached sparse factor of the crossed Schur `S`. `Some` only on the
-    /// structured crossed path with `e > 0`; built per fit by `StructuredSchur::new`
-    /// per fit by `StructuredSchur::new`. `None` ⇒ the packed/blocked/e=0 paths,
-    /// which never touch it.
+    /// structured crossed path with `e > 0`; built by `StructuredSchur::new`
+    /// when a fit's level ids differ from the last fit's. `None` ⇒ the
+    /// packed/blocked/e=0 paths, which never touch it.
     pub(crate) structured_schur: Option<StructuredSchur>,
     /// Test-only: force the dense `glmm_block_chol` Schur factor instead of the
     /// cached sparse one, so the both-paths cross-check runs both at one θ. Always
@@ -385,8 +426,9 @@ impl PackedScratch {
 }
 
 /// β-border scratch shared by the Profile-mode PIRLS step and the three
-/// Schur fillers in `se.rs`: `X'WX` (p×p), `X'WM` (p×k), `A⁻¹M'WX` (k×p), the
-/// Schur complement (p×p) with its factor memory, and the β backtrack buffer.
+/// Schur fillers in `se.rs`: `X'WX` (p×p, read by `se.rs` alone), `X'WM`
+/// (p×k), `A⁻¹M'WX` (k×p), the Schur complement (p×p) with its factor memory,
+/// and the β backtrack buffer.
 pub(crate) struct BorderScratch {
     /// p × p
     pub xtwx: Mat<f64>,
@@ -410,7 +452,7 @@ pub(crate) struct BorderScratch {
 /// matrix `G = Σᵢ wᵢ xᵢxᵢᵀ / Σᵢ wᵢ` of this fit's design. Then `η = Xβ = X̃β̃`
 /// with `X̃ = XL⁻ᵀ`, whose weighted Gram is the identity: a unit step along any
 /// β̃ axis moves η by 1 in weighted root mean square, the scale θ̃ is searched
-/// on. So `rho_begin`, `rho_end` and the non-finite-point radius mean the same
+/// on. So the trust radii and the non-finite-point radius mean the same
 /// in every unit of X, and a column `x + a` next to the intercept is searched
 /// as the centred column (for `X = [1, x]`, `Lᵀβ = (β₀ + x̄β₁, sd(x)·β₁)`).
 /// Reduced to its diagonal, this is the root mean square about zero, the
@@ -419,6 +461,9 @@ pub(crate) struct BorderScratch {
 /// same model in either coordinate; only the path BOBYQA takes changes.
 /// `G` is never formed: with `√W·X = Q·R = Q·D·U` the factor the LMM kernels
 /// orthogonalize by (`lmm::DesignQr`), `Lᵀ = R/√Σw = diag(D/√Σw)·U`.
+/// [`Self::set_info`] builds `L` from a β information instead, for the joint
+/// search's second pass (`glmm::JOINT_RECHECK_TOL`) and the trough polish
+/// (`glmm::PIN_POLISH_DROP`).
 pub(crate) struct BetaScale {
     /// `U` and `D` of this fit's design.
     qr: crate::lmm::DesignQr,
@@ -427,7 +472,7 @@ pub(crate) struct BetaScale {
     /// length p: the Givens row scratch of `DesignQr::set_from_rows`.
     row: Vec<f64>,
     /// False when `R` has a zero diagonal (a zero or exactly collinear
-    /// column): the search then runs on β itself.
+    /// column, or a singular information): the search then runs on β itself.
     active: bool,
     /// The joint point in the caller's β units handed to the objective, length
     /// `n_theta + p` (+1 on NB and Gamma).
@@ -460,6 +505,34 @@ impl BetaScale {
         }
     }
 
+    /// Factor a β information `S = F·Fᵀ` (the half-Hessian of the deviance
+    /// in β) instead of the design, so that `L·Lᵀ = S/Σw`: the deviance then
+    /// rises by about `Σw·δ²` over a step `δ` along any β̃ axis, whatever the
+    /// spread of the working weights. `f` holds the lower Cholesky factor `F`
+    /// in its lower triangle (its strict upper triangle is cleared here) and
+    /// `sw` is `Σᵢ wᵢ` over the prior weights, the normalizer [`Self::set`]
+    /// divides by. False, with the identity map, on a zero or non-finite
+    /// pivot.
+    pub(crate) fn set_info(&mut self, mut f: MatMut<f64>, sw: f64) -> bool {
+        let p = f.nrows();
+        for j in 1..p {
+            for i in 0..j {
+                f[(i, j)] = 0.0;
+            }
+        }
+        self.active = sw > 0.0
+            && self
+                .qr
+                .set_from_rows(f.as_ref().transpose(), |_| 1.0, &mut self.row);
+        if self.active {
+            let r = sw.sqrt();
+            for (s, &d) in self.scale.iter_mut().zip(self.qr.r_diag()) {
+                *s = d / r;
+            }
+        }
+        self.active
+    }
+
     /// β → β̃ = Lᵀβ, in place.
     pub(crate) fn to_search(&self, beta: &mut [f64]) {
         if self.active {
@@ -474,6 +547,36 @@ impl BetaScale {
     pub(crate) fn to_caller(&self, beta: &mut [f64]) {
         if self.active {
             unscale(&self.qr, &self.scale, beta);
+        }
+    }
+
+    /// A lower factor `F` of an information matrix in β̃ to one of the same
+    /// information in β, `L·F` (`L = Uᵀ·diag(scale)`, lower), in place: β̃ = Lᵀβ
+    /// makes the information in β `L·(FFᵀ)·Lᵀ`.
+    pub(crate) fn map_factor(&self, mut f: MatMut<f64>) {
+        if self.active {
+            for (i, &s) in self.scale.iter().enumerate() {
+                for j in 0..=i {
+                    f[(i, j)] *= s;
+                }
+            }
+            self.qr.map_factor(f);
+        }
+    }
+
+    /// False when the last [`Self::set`] left the identity map.
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// One design row `x` to its row of `X̃ = XL⁻ᵀ`, in place, so that
+    /// `x̃·β̃ = x·β`.
+    pub(crate) fn to_search_row(&self, x: &mut [f64]) {
+        if self.active {
+            self.qr.solve_row(x);
+            for (v, &s) in x.iter_mut().zip(&self.scale) {
+                *v /= s;
+            }
         }
     }
 
@@ -546,11 +649,6 @@ pub(crate) struct InferenceScratch {
     /// verbatim — so without this the workspace exits carrying a (`u`, `prob`) pair from two
     /// different converged solves, and `Fit::fitted` and `Fit::ranef` (read in
     /// `fit/glmm.rs`) would describe two different points. Length max_n.
-    /// Adding the restore (2026-09-05) moved the bit-identity dump's `theta`
-    /// on the dense Gamma rung (`sim_gamma`, rung 23) from 0.23550934106996388
-    /// to 0.23550934100844045 — a 2.6e-10 relative shift, the Hessian arm now
-    /// reporting the same σ̂² as the Rx arm; every other record stayed
-    /// byte-identical.
     pub(crate) fd_saved_prob: Vec<f64>,
     /// p×p Cov(β̂) — `var_diag` is its diagonal, and both are filled together at
     /// the same target indices (NaN elsewhere). Workspace-owned, not returned on
@@ -559,9 +657,11 @@ pub(crate) struct InferenceScratch {
     /// already forms: `Rx` from the Schur forward-solve columns, `Hessian` from
     /// `joint_hessian_cov`'s β block. Mapped to `Fit::vcov` by `fit/glmm.rs`.
     pub vcov: Mat<f64>,
-    /// p×p scratch holding column `j` of `L⁻¹` at each target `j` — the `Rx`
-    /// arm's per-target forward solves, kept so their pairwise dots can fill
-    /// `vcov`'s off-diagonals instead of only `‖·‖²` on its diagonal.
+    /// p×p scratch holding, at each target `j`, a column `c_j` with
+    /// `Cov(β̂_a, β̂_b) = c_aᵀc_b`: on `Rx` the per-target forward solves, kept
+    /// so their pairwise dots can fill `vcov`'s off-diagonals instead of only
+    /// `‖·‖²` on its diagonal; on `Hessian` `cov_root·bⱼ`. The joint Wald reads
+    /// them on both arms (`lmm::joint_wald_chi_sq`).
     pub vcov_cols: Mat<f64>,
     /// length p
     pub var_diag: Vec<f64>,
@@ -577,13 +677,20 @@ pub(crate) struct InferenceScratch {
     pub theta_cov: Mat<f64>,
     /// length p; Var(β̂)_jj forward-solve scratch (per-target)
     pub fwd_solve: Vec<f64>,
-    // joint Wald scratch (reuse lmm::joint_wald_chi_sq):
-    /// Inverse of the joint Wald K matrix, p×p (see `lmm::joint_wald_chi_sq`).
-    pub joint_k_inv: Mat<f64>,
-    /// Cholesky factor of the joint Wald Σ_t, p×p.
-    pub joint_sigma_t_chol: Mat<f64>,
-    /// Joint Wald right-hand side, length p.
-    pub joint_rhs: Vec<f64>,
+    /// p×p `R` with `RᵀR` the fixed-effect covariance `joint_hessian_cov`
+    /// returned, on the fitted design; NaN where it has none.
+    pub cov_root: Mat<f64>,
+    /// p×p and length-p scratch of `lmm::joint_wald_chi_sq`.
+    pub joint_qr: Mat<f64>,
+    pub joint_z: Vec<f64>,
+    /// Scale-invariant per-column pivot ratio (`ols::min_pivot_ratio`) of the
+    /// β information the SE arm factored, on the fitted design: the Rx Schur
+    /// complement ([`super::se::rx_schur_llt`], also the Hessian arm's Rx
+    /// fallback), or the β block of the joint Hessian's factor
+    /// ([`super::se::joint_hessian_cov`]). NaN when no SE arm formed a factor.
+    pub pivot: f64,
+    /// Column attaining `pivot`. Meaningless when `pivot` is NaN.
+    pub pivot_col: u32,
 }
 
 /// The per-fit design every GLMM kernel reads and none writes: the outcome
@@ -642,6 +749,9 @@ pub struct GlmmWorkspace {
     /// does not read it), so the search is over `(θ, β)` alone; the SE takes no
     /// `ln φ` row. `None` on every other family and when φ is estimated.
     pub(crate) gamma_phi_held: Option<f64>,
+    /// NB: the response's count groups `(yᵥ, Σw)` for the saturated term
+    /// (`fit::glm::nb_count_groups`), refilled per fit; empty otherwise.
+    pub(crate) nb_groups: Vec<(f64, f64)>,
     /// adaptive GH node count; 1 = Laplace. >1 only fires on the single-grouping-factor
     /// binomial/Poisson/negative-binomial/Gamma AGQ paths — scalar intercept (`agq::agq_deviance`) or vector RE
     /// with `q_p ∈ 2..=3` (`agq::agq_deviance_vec`); ignored otherwise.
@@ -673,8 +783,16 @@ pub struct GlmmWorkspace {
     /// Packed-row layout scratch — see [`PackedScratch`].
     pub(crate) packed: PackedScratch,
     /// Joint (θ,β) BOBYQA solver, dimension `n_theta + p` (+1 on NB: the trailing
-    /// `ln θ_NB` coordinate).
+    /// `ln θ_NB` coordinate). Starts at `GLMM_RHO_BEGIN` on the `Joint` route,
+    /// where it is the whole search, and at `GLMM_RHO_POLISH` on the others,
+    /// where it polishes a stage-1 optimum.
     pub solver: Bobyqa, // sized n_theta + p
+    /// `solver`'s config, kept to build `solver_polish_wide`.
+    pub(crate) config: Config,
+    /// The polish solver for a stage-1 optimum near a singular block
+    /// (`crate::lmm::POLISH_NEAR_SINGULAR`): `config` at `RHO_BEGIN_WARM`.
+    /// Built on the first such fit; never on the `Joint` route.
+    pub(crate) solver_polish_wide: Option<Bobyqa>,
     /// Joint solver's live iterate: `[θ (n_theta) | β (p)]`; while the joint
     /// search runs, the β block holds its coordinates β̃ (see [`BetaScale`]),
     /// mapped back to β before `fit_glmm` reads it. STABLE READ-BACK
@@ -704,11 +822,21 @@ pub struct GlmmWorkspace {
     /// θ-only BOBYQA solver for the θ-only outer search shared by
     /// `PqlThenJoint` (a warm-start accelerant) and `ExactProfile` (the search
     /// itself — see `OuterSearch`): sized `n_theta` (+1 on NB and Gamma), configured with
-    /// the same `rho_begin`/`GLMM_RHO_END` schedule as `solver` and the LMM
+    /// `GLMM_RHO_BEGIN`/`GLMM_RHO_END` and the LMM
     /// mid-model `npt` rule (`ceil(1.5·n_theta) + 1` at
     /// `n_theta ≥ 3`, else `2·n_theta + 1`) — not
     /// the joint solver's `npt`, which differs. See `fit_glmm`.
     pub solver_stage1: Bobyqa,
+    /// Stage-1 solver for a start that keeps a caller's θ₀ (`fit_glmm`'s start
+    /// guard): `config_stage1` at `RHO_BEGIN_WARM`. Built on the first such fit.
+    pub(crate) solver_stage1_warm: Option<Bobyqa>,
+    /// Stage-1 solver for the restart after `fit_glmm`'s saddle check moved an
+    /// `ExactProfile` endpoint: `config_stage1` at `GLMM_RHO_POLISH`. Built on
+    /// the first such fit.
+    pub(crate) solver_stage1_polish: Option<Bobyqa>,
+    /// `solver_stage1`'s config, kept to build `solver_stage1_warm` and
+    /// `solver_stage1_polish`.
+    pub(crate) config_stage1: Config,
     /// θ-only candidate/incumbent buffer for stage 1, length `n_theta` (+1 on
     /// NB and Gamma); seeded from `params`'s θ prefix at construction.
     pub params_stage1: Vec<f64>,
@@ -716,11 +844,16 @@ pub struct GlmmWorkspace {
     /// plus the `ln θ_NB` or `ln φ` bound — see `params_stage1`.
     pub lower_stage1: Vec<f64>,
     pub upper_stage1: Vec<f64>,
-    /// Outer search route for this shape — see `OuterSearch`.
+    /// Outer search route for this shape — see `OuterSearch`. The constructor
+    /// sets `solver`'s start radius from it, so a test that overrides this
+    /// field keeps the constructor's radius.
     pub outer_search: OuterSearch,
     /// PIRLS scratch (sized max_n / k) — see [`PirlsScratch`].
     pub(crate) pirls: PirlsScratch<f64>,
-    /// n×(q_p−1) row-major f64 copy of x[:, slope_cols] — filled once per fit
+    /// Row-major f64 copy of every random-slope column of x, filled once per
+    /// fit by [`fill_z_f64`]: row `i` holds the primary slopes, then each extra
+    /// grouping's in declaration order. Only the packed-row layout has extra
+    /// slopes, so on the other two the stride is `q_p − 1`.
     pub z_buf: Vec<f64>,
     /// Per-row prior weights `wᵢ` (`FitOptions::weights`; all-1 when absent —
     /// zero behavioral change). `wᵢ·W̃ᵢ` on the working weight,
@@ -744,12 +877,17 @@ pub struct GlmmWorkspace {
     /// within-fit û warm-start incumbent; RESET to 0 each fit_glmm — never carried across fits
     pub u_seed: Vec<f64>,
     /// max_n × p = W∘X scratch for the X'WX GEMM (rebuilt per PIRLS iteration,
-    /// all three pirls variants and the three se.rs schur-fill twins)
+    /// all three pirls variants), and the design-row residuals the three se.rs
+    /// Schur fills hand to `schur_from_residuals`
     pub wx: Mat<f64>,
     /// Structured crossed/nested route scratch — see [`StructuredScratch`].
     pub(crate) structured: StructuredScratch<f64>,
     /// Structured route's θ-independent index pattern — see [`StructuredPattern`].
     pub(crate) pattern: StructuredPattern,
+    /// The rows' levels `fit::glmm::prep_glmm_design` last built the packed
+    /// columns and the crossed-Schur symbolic factor from
+    /// (`sparse::record_rows`); empty until the first fit.
+    pub(crate) design_ids: Vec<u32>,
     /// β-border scratch shared by the Profile-mode PIRLS step and `se.rs` —
     /// see [`BorderScratch`].
     pub(crate) border: BorderScratch,
@@ -762,6 +900,11 @@ pub struct GlmmWorkspace {
     pub beta_prof: Vec<f64>,
     /// len p: stage-1 incumbent β snapshot (mirrors u_seed)
     pub beta_seed: Vec<f64>,
+    /// len `k` and `p`: the warm-start guard's winning solve (û, β̂), handed to
+    /// the stage-1 search as its first evaluation instead of re-solving it
+    /// (`fit_glmm`, the start guard). Written and read within one fit.
+    pub(crate) guard_u: Vec<f64>,
+    pub(crate) guard_beta: Vec<f64>,
     /// Exact-profile scratch (`pirls::ExactProfileBufs`), sized once here.
     pub(crate) exact_prof: super::pirls::ExactProfileBufs,
     /// Post-search inference outputs and their scratch — see [`InferenceScratch`].
@@ -769,10 +912,9 @@ pub struct GlmmWorkspace {
     /// The finite-difference pass's seed state — see [`FdState`].
     pub(crate) fd: FdState,
     /// Per-row linear-predictor offset (`FitOptions::offset`), read by every
-    /// `eta_fixed` refresh (`pirls::refresh_eta_fixed`). `None` ⇒ no offset,
-    /// byte-identical to the pre-offset code.
+    /// `eta_fixed` refresh (`pirls::refresh_eta_fixed`). `None` ⇒ no offset.
     pub(crate) offset: Option<Vec<f64>>,
-    /// Count of fit-path (`pirls_tol_override.is_none()`) PIRLS solves that ran
+    /// Count of fit-path PIRLS solves (every solve but the FD-Hessian SE evals') that ran
     /// the full `PIRLS_MAX_ITERS` cap without converging — observation-only,
     /// bookkeeping read back by `FitDiagnostics`/`Note::PirlsExhausted`, never by
     /// any numeric path. Reset to 0 at the top of every `fit_glmm` (mirrors
@@ -786,10 +928,10 @@ pub struct GlmmWorkspace {
     /// `false` on a shape that does not route `ExactProfile`. Reset to
     /// `false` at the top of every `fit_glmm`.
     pub(crate) exact_profile_fallback: bool,
-    /// Initial trust radius of both BOBYQA searches (`rho_begin`), kept for the
-    /// convergence check in `fit_glmm` that measures non-finite evaluations
-    /// against it.
-    pub(crate) rho_begin: f64,
+    /// The lowest objective the last `fit_glmm` search reached, on the scale
+    /// of `GlmmFit::deviance`; set on a failed fit too, whose `deviance` is
+    /// `+∞`. `+∞` when no evaluation was finite.
+    pub(crate) best_objective: f64,
     /// The points of the convergence-gating search whose objective came back
     /// non-finite, flattened (one search-vector length each). Cleared at the top
     /// of every `fit_glmm`; empty, and never allocated, on a fit whose every
@@ -956,6 +1098,12 @@ impl GlmmWorkspace {
             crate::Family::NegativeBinomial { .. } | crate::Family::Gamma { .. }
         ));
         let q = groupings.primary_q;
+        let n_slopes = q - 1
+            + groupings
+                .extra_slope_cols
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>();
         let n_primary = groupings.n_primary;
         // Structured-path block sizes: core width q_core = q_p + nested children,
         // crossed width e. Buffers stay 1-sized minima when the shape has no
@@ -1001,26 +1149,28 @@ impl GlmmWorkspace {
             }
         }
 
-        // ρ_begin ≤ RHO_BEGIN and ≤ 0.1·min diagonal θ₀ (mirror for_cluster_spec_ext)
-        // so the cold blind start is not projected onto a bound. The start is the
-        // structure-only blind θ₀, so each diagonal entry is THETA0.
-        let blind_theta = vec![crate::lmm::THETA0; n_theta];
-        let min_diag = groupings
-            .diagonal_theta()
-            .iter()
-            .map(|&i| blind_theta[i].max(THETA_TRUTH_FLOOR))
-            .fold(f64::INFINITY, f64::min);
-        // Hoisted so the joint solver below and `solver_stage1` (the θ-only stage-1
-        // solver) share the exact same computed θ-portion rho_begin — a pure
-        // extraction, not a new derivation.
-        let rho_begin = (0.1 * min_diag).min(RHO_BEGIN);
+        // Route per shape (see `OuterSearch` and the `Joint` threshold's
+        // measurement further down). The joint solver's start radius follows
+        // it: the whole search on `Joint`, a polish of stage 1's optimum otherwise.
+        let exact_shape = super::exact_profile_shape(nagq, layout);
+        let outer_search = if exact_shape {
+            OuterSearch::ExactProfile
+        } else if nagq > 1 || (n_theta <= 2 && p <= 4) {
+            OuterSearch::Joint
+        } else {
+            OuterSearch::PqlThenJoint
+        };
         // Feeds through the shared `apply_campaign_overrides` tail.
         let mut config = Config::new(n_theta + p + n_disp);
-        config.rho_begin = rho_begin;
+        config.rho_begin = if outer_search == OuterSearch::Joint {
+            GLMM_RHO_BEGIN
+        } else {
+            GLMM_RHO_POLISH
+        };
         config.rho_end = GLMM_RHO_END;
         crate::lmm::apply_campaign_overrides(&mut config, n_theta + p + n_disp);
-        // Stage-1 θ-only BOBYQA config: same rho_begin/rho_end schedule as the
-        // joint solver above, but `npt` mirrors the LMM's mid-model rule
+        // Stage-1 θ-only BOBYQA config: `rho_end` as the joint solver above,
+        // `GLMM_RHO_BEGIN` from the blind start, but `npt` mirrors the LMM's mid-model rule
         // (`LmmWorkspace::for_cluster_spec_ext`, `src/lmm/mod.rs`), NOT the
         // joint solver's — the two are sized for different-dimension searches
         // and this crate's precedent for a
@@ -1034,7 +1184,7 @@ impl GlmmWorkspace {
             2 * n_stage1 + 1
         };
         let mut config_stage1 = Config::new(n_stage1);
-        config_stage1.rho_begin = rho_begin;
+        config_stage1.rho_begin = GLMM_RHO_BEGIN;
         config_stage1.rho_end = GLMM_RHO_END;
         config_stage1.npt = npt_stage1;
         crate::lmm::apply_campaign_overrides(&mut config_stage1, n_stage1);
@@ -1051,8 +1201,7 @@ impl GlmmWorkspace {
             upper_stage1.push(upper[m]);
         }
 
-        // Route per shape — see `OuterSearch`. Computed here, before `groupings`
-        // moves into the struct literal below.
+        // The `Joint` route above, measured.
         //
         // The `n_theta <= 2 && p <= 4` skip (to `Joint`, only where the PQL route
         // is still the one taken) is dimension-gated: for small (n_theta, p)
@@ -1103,23 +1252,15 @@ impl GlmmWorkspace {
         // miscategorized).
         //
         // With the `ExactProfile` route in place, none of the rows above reach
-        // this branch: every dataset in the table is an nAGQ=1 non-Gamma shape
+        // this branch: every dataset in the table is an nAGQ=1 shape
         // and routes `ExactProfile` first. What still reaches `n_theta <= 2 && p <= 4`
-        // is Gamma, non-canonical structured extras, and packed-layout extras — a
+        // is AGQ, structured extras outside the eligible set, and packed-layout extras — a
         // population this sweep never measured. The threshold stands because nothing
         // has re-measured it, not because these numbers still cover it.
         // The exact border's curvature buffers (`ExactProfileBufs::curv_*`)
         // are read only by an exact-profile solve, so they are sized only on
         // the shapes whose stage 1 is one.
-        let exact_shape = super::exact_profile_shape(family, nagq, layout);
         let curv = |len: usize| if exact_shape { len.max(1) } else { 1 };
-        let outer_search = if exact_shape {
-            OuterSearch::ExactProfile
-        } else if nagq > 1 || (n_theta <= 2 && p <= 4) {
-            OuterSearch::Joint
-        } else {
-            OuterSearch::PqlThenJoint
-        };
 
         // Sized only on the layout that reads it — see [`PackedScratch`].
         let packed = if layout == GlmmLayout::Packed {
@@ -1134,6 +1275,7 @@ impl GlmmWorkspace {
             nb_theta: f64::NAN,
             gamma_phi: 1.0,
             gamma_phi_held: None,
+            nb_groups: Vec::new(),
             nagq,
             parallel_inner: false,
             cluster_rows: None,
@@ -1144,6 +1286,8 @@ impl GlmmWorkspace {
             packed,
             solver: Bobyqa::new(n_theta + p + n_disp, config)
                 .expect("BOBYQA config constants are valid by construction"),
+            config,
+            solver_polish_wide: None,
             beta_scale: BetaScale::new(p, params.len()),
             start_point: vec![0.0; params.len()],
             params,
@@ -1151,12 +1295,23 @@ impl GlmmWorkspace {
             upper,
             solver_stage1: Bobyqa::new(n_stage1, config_stage1)
                 .expect("BOBYQA config constants are valid by construction"),
+            solver_stage1_warm: None,
+            solver_stage1_polish: None,
+            config_stage1,
             params_stage1,
             lower_stage1,
             upper_stage1,
             outer_search,
-            pirls: PirlsScratch::for_shape(max_n, k, q, n_primary, nagq),
-            z_buf: vec![0.0; max_n * (q - 1)],
+            pirls: PirlsScratch::for_shape(max_n, k, q, n_primary, nagq).with_profile_rows(
+                if layout == GlmmLayout::Packed {
+                    0
+                } else {
+                    max_n
+                },
+                p,
+                if layout == GlmmLayout::Packed { 0 } else { k },
+            ),
+            z_buf: vec![0.0; max_n * n_slopes],
             prior_w: vec![1.0; max_n],
             prior_w_phi: vec![1.0; max_n],
             weighted: false,
@@ -1169,10 +1324,12 @@ impl GlmmWorkspace {
                 n_cross: vec![0u8; max_n.max(1)],
                 coup_cols: vec![0u32; (max_n * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
                 coup_ptr: vec![0u32; n_primary + 1],
+                coup_pos: vec![0u32; (max_n * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
                 coup_mask: None,
                 structured_schur: None,
                 force_dense_schur: false,
             },
+            design_ids: Vec::new(),
             border: BorderScratch {
                 xtwx: Mat::zeros(p, p),
                 xtwm: Mat::zeros(p, k.max(1)),
@@ -1189,6 +1346,8 @@ impl GlmmWorkspace {
             beta_rhs: vec![0.0; p],
             beta_prof: vec![0.0; p],
             beta_seed: vec![0.0; p],
+            guard_u: vec![0.0; k.max(1)],
+            guard_beta: vec![0.0; p],
             exact_prof: super::pirls::ExactProfileBufs {
                 // `k` is `groupings.k_total`, so these span the structured
                 // path's `k_family + e` as well as the blocked path's `q·s`.
@@ -1198,7 +1357,7 @@ impl GlmmWorkspace {
                 tail_inv: vec![0.0; (e_crossed * e_crossed).max(1)],
                 tail_r: vec![0.0; e_crossed.max(1)],
                 tail_g: vec![0.0; (q_core * q_core * n_primary).max(1)],
-                tail_h: vec![0.0; (q_core * n_primary * e_crossed).max(1)],
+                tail_h: vec![0.0; coupling_len(max_n, n_primary, q_core, e_crossed)],
                 fac_f64: vec![0.0; (q_core * q_core * n_primary).max(1)],
                 logdet_hess: Mat::zeros(p, p),
                 schur_plain: Mat::zeros(p, p),
@@ -1224,9 +1383,11 @@ impl GlmmWorkspace {
                 t_sq: vec![0.0; p],
                 theta_cov: Mat::from_fn(n_theta, n_theta, |_, _| f64::NAN),
                 fwd_solve: vec![0.0; p],
-                joint_k_inv: Mat::zeros(p, p),
-                joint_sigma_t_chol: Mat::zeros(p, p),
-                joint_rhs: vec![0.0; p],
+                cov_root: Mat::zeros(p, p),
+                joint_qr: Mat::zeros(p, p),
+                joint_z: vec![0.0; p],
+                pivot: f64::NAN,
+                pivot_col: 0,
             },
             fd: FdState {
                 fd_saved: vec![0.0; n_theta + p],
@@ -1239,7 +1400,7 @@ impl GlmmWorkspace {
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
             exact_profile_fallback: false,
-            rho_begin,
+            best_objective: f64::INFINITY,
             non_finite_points: Vec::new(),
             counters: crate::counters::EvalCounters::new(),
             dual_scratch: None,
@@ -1507,7 +1668,7 @@ pub(crate) fn glmm_block_solve_panel<T: crate::scalar::Scalar>(
 
 /// Cached sparse factor of the `e`-wide crossed Schur complement `S`.
 /// `S`'s sparsity pattern is fixed by the crossed incidence (θ-independent), so the
-/// symbolic factor is built ONCE per fit here and numeric-refactored every PIRLS
+/// symbolic factor is built here once per set of level ids and numeric-refactored every PIRLS
 /// iteration / BOBYQA eval into `l_values`. Mirrors `SparseLmmWorkspace`
 /// (`sparse.rs`), one factor narrower — only the crossed tail, not the whole system.
 /// `None` for nested-only shapes (`e = 0`, no Schur).
@@ -1533,9 +1694,9 @@ pub struct StructuredSchur {
     /// back-solve (PIRLS and each SE column) is always a single RHS column.
     pub(crate) solve_mem: MemBuffer,
     /// Downdate panels for `structured_factor`'s per-cluster `S −= C_f'A_f⁻¹C_f`
-    /// (the LMM sparse-tail kernels A–D port): `c_panel` the gathered nonzero
-    /// coupling columns (row-major `qc×e_f`), `y_panel` its `A_f⁻¹`-solved copy,
-    /// `dd_temp` the `C_f'·Y` product (col-major `e_f×e_f`, lower). Sized once
+    /// (the LMM sparse-tail kernels A–D port): `y_panel` the `A_f⁻¹`-solved copy
+    /// of cluster `f`'s compact coupling block (row-major `qc×e_f`), `dd_temp`
+    /// the `C_f'·Y` product (col-major `e_f×e_f`, lower). Sized once
     /// to `max_f e_f` off the FULL θ-independent incidence (`cols_of` in `new` —
     /// a superset of every θ-masked `coup_cols` CSR the fit visits), overwritten
     /// per cluster. Used only at `qc > 1`: at `qc == 1` `TailKernel::tail_downdate`'s
@@ -1543,7 +1704,6 @@ pub struct StructuredSchur {
     /// 0 (change together — that override's doc carries the qc=1 panel-vs-scalar
     /// measurement behind the split). It stays for qc>1, the only case that has
     /// real qc×e_f batched work to amortize the staging.
-    pub(crate) c_panel: Vec<f64>,
     pub(crate) y_panel: Vec<f64>,
     pub(crate) dd_temp: Vec<f64>,
     /// The tail's connected components over the FULL incidence
@@ -1674,7 +1834,6 @@ impl StructuredSchur {
             l_values,
             fac_mem,
             solve_mem,
-            c_panel: vec![0.0f64; qc * panel_ef],
             y_panel: vec![0.0f64; qc * panel_ef],
             dd_temp: vec![0.0f64; panel_ef * panel_ef],
             comp_ptr,
@@ -1718,7 +1877,6 @@ impl StructuredSchur {
             l_values,
             fac_mem,
             solve_mem,
-            c_panel: vec![0.0f64; self.c_panel.len()],
             y_panel: vec![0.0f64; self.y_panel.len()],
             dd_temp: vec![0.0f64; self.dd_temp.len()],
             comp_ptr: self.comp_ptr.clone(),
@@ -1813,16 +1971,24 @@ pub(crate) fn fill_packed_cols_with(
     };
 }
 
-/// Per-fit hoist of the primary-slope Z columns: `z_buf[i·(q−1)+d] =
+/// Per-fit hoist of the random-slope Z columns into `z_buf` (layout on the
+/// field): on the blocked and structured layouts `z_buf[i·(q−1)+d] =
 /// x[i, slope_cols[d]]`. θ/β change per BOBYQA eval but `x` is fixed per fit, so
 /// this lifts the MatRef load out of the per-solve M fill — the fill becomes a
-/// pure contiguous-f64 product. Mirrored by the Rx M row in
-/// `se::blocked_schur_fill` — change together. No-op at q_p = 1 (no slope columns).
+/// pure contiguous-f64 product. It also keeps Z apart from the fixed-effect
+/// design, which `se::joint_hessian_cov` swaps for an orthogonalized one.
+/// Mirrored by the Rx M row in `se::blocked_m_row` — change together.
+/// No-op when no grouping has a slope.
 pub(crate) fn fill_z_f64(g: &LmmGroupings, x: MatRef<f64>, z_buf: &mut [f64], n: usize) {
-    let q = g.primary_q;
+    let mut t = 0;
     for i in 0..n {
-        for d in 0..q - 1 {
-            z_buf[i * (q - 1) + d] = x[(i, g.primary_slope_cols[d])];
+        for &c in g
+            .primary_slope_cols
+            .iter()
+            .chain(g.extra_slope_cols.iter().flatten())
+        {
+            z_buf[t] = x[(i, c)];
+            t += 1;
         }
     }
 }
@@ -1952,9 +2118,9 @@ pub(crate) fn build_packed_m<T: crate::scalar::Scalar>(
             // answer, not a no-op: this would write the wide
             // `cross_col`/`n_cross` while the CSR cache key stayed narrow,
             // `build_coupling_csr` would not rerun, and the newly retained
-            // column would be scattered into `coupling` but never read back —
-            // `structured_factor` and `structured_ainv_solve` walk `coup_cols`
-            // only.
+            // column would have no slot in the compact `coupling` (its
+            // `coup_pos` would be stale) — `structured_factor` and
+            // `structured_ainv_solve` walk `coup_cols` only.
             if T::IS_F64 && theta.value() == 0.0 {
                 continue;
             }

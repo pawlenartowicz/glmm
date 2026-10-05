@@ -23,6 +23,7 @@ impl GlmFitView<'_> {
             pivot: self.pivot,
             pivot_col: self.pivot_col,
             ill_conditioned: self.pivot < crate::ols::PIVOT_MIN,
+            separated: self.separated,
             ..FitDiagnostics::fixed_only(self.converged)
         }
     }
@@ -151,6 +152,7 @@ pub(super) fn fit_glm(
         opts,
         &mut buf,
         ColumnScaling::IDENTITY,
+        None,
     );
     glm_view_to_fit(
         &view,
@@ -172,7 +174,9 @@ pub(super) fn fit_glm(
 ///
 /// `map` is the column map `x_mat` was fitted through: the view's `betas` stay
 /// on `x_mat`'s design, its `var_diag`/`t_sq` are the caller's
-/// (`crate::glm::glm_irls_fit_mapped`).
+/// (`crate::glm::glm_irls_fit_mapped`). `beta_start` is `glm_irls_fit`'s: `None`
+/// is the cold start, `Some(β)` (on `x_mat`'s design) starts from β.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_glm_prebuilt<'a>(
     family: Family,
     nb_theta: f64,
@@ -181,15 +185,15 @@ pub(crate) fn fit_glm_prebuilt<'a>(
     opts: &FitOptions,
     buf: &'a mut GlmScratchBuf,
     map: &ColumnScaling,
+    beta_start: Option<&[f64]>,
 ) -> GlmFitView<'a> {
-    // None = β=0 cold start (no spec-derived truth on the standalone path).
     glm_irls_fit_mapped(
         family,
         nb_theta,
         x_mat,
         y,
         &opts.target_indices,
-        None,
+        beta_start,
         opts.weights.as_deref(),
         opts.offset.as_deref(),
         buf.as_scratch(),
@@ -389,61 +393,86 @@ const NB_THETA_TOL: f64 = 1e-6;
 pub(crate) const NB_THETA_LO: f64 = 1e-3;
 pub(crate) const NB_THETA_HI: f64 = 1e4;
 
-/// Above this count, [`nb_profile_loglik`] switches from the finite sum
-/// `Σ_{k=0}^{y−1} ln(θ+k)` to `lnΓ(y+θ) − lnΓ(θ)` (`simd_transcendental::ln_gamma`,
-/// full double precision). Measured on the crate's own `ln_gamma`: comparing the
-/// two forms at `y ∈ {10, …, 2×10^8}` across `θ ∈ [10⁻³, 10³]` (30 log-spaced
-/// points), their relative disagreement is a random walk in `y`, not a
-/// monotonically growing bias — 2.0e-15 at `y = 10³`, about 7e-14 at
-/// `y = 10⁶`–`2×10⁶`, and only occasionally crossing 1e-13 from `y ≈ 5×10⁶`
-/// on (1.1e-13 at `5×10⁶`, 1.5e-13 at `10⁷`). `1e5` sits comfortably below any
-/// observed excursion above 1e-13, and below the largest NB count in this
-/// repo: `validation/data/simulated/*nb*.csv` tops out at 657,
-/// `validation/grid/data/nb_nest2s_g30000p20_bal_base.csv` at 28,906 — both
-/// under the cap, so nothing in the corpus reaches the switch. Cost: one call
-/// to `nb_profile_loglik` on a single row of `y = 1e10` (the lgamma path)
-/// takes about 14 µs; a row exactly at the cap (the finite sum's own worst
-/// case) takes about 0.48 ms.
-pub(crate) const Y_SUM_MAX: u64 = 100_000;
+/// NB saturated log-likelihood of one count, `log f(y; μ = y, θ)`:
+/// `lnΓ(y+θ) − lnΓ(θ) − lnΓ(y+1) + θ·ln(θ/(θ+y)) + y·ln(y/(θ+y))`, 0 at
+/// `y = 0` (and at a NaN `y`, which only the loop tier lets through).
+/// `excess_theta` is [`crate::family::ln_gamma_excess2`]`(θ)`, shared by every
+/// row. With `E = ln_gamma_excess2` the row is exactly
+/// `½·(E(θ+y) − E(θ) − E(y)) − ln y`: the `lnΓ` terms and the `y·ln y`-sized
+/// parts cancel inside each `E` in closed form, so every term stays of order
+/// `ln y` and the row keeps absolute round-off at any count. Formed directly,
+/// the row's terms are of order `y·ln y` (2.2e11 at `y = 1e10`), and the
+/// NB GLMM objective, which carries `−2·Σ` of the rows, then resolves nothing
+/// finer than that sum's ulp (1.6e-2 on 200 such rows).
+fn nb_saturated_row(y: f64, theta: f64, excess_theta: f64) -> f64 {
+    if y > 0.0 {
+        let e = crate::family::ln_gamma_excess2;
+        0.5 * (e(theta + y) - excess_theta - e(y)) - y.ln()
+    } else {
+        0.0
+    }
+}
 
-/// NB profile log-likelihood in θ at fixed μ̂, up to the θ-independent `−ln(yᵢ!)`:
-/// `Σ[ lnΓ(yᵢ+θ) − lnΓ(θ) + θ·ln(θ/(θ+μ̂ᵢ)) + yᵢ·ln(μ̂ᵢ/(θ+μ̂ᵢ)) ]`. Counts are
-/// integers, so `lnΓ(y+θ)−lnΓ(θ) = Σ_{k=0}^{y−1} ln(θ+k)` exactly. Below
-/// [`Y_SUM_MAX`] this runs as that finite sum — no lgamma, identical to
-/// `MASS::theta.ml`'s objective; above it, a row's cost would scale with its
-/// count (`MASS::theta.ml` itself evaluates `lgamma`, so switching there loses
-/// nothing against the reference), so it runs as `ln_gamma(y+θ) − ln_gamma(θ)`
-/// instead, `O(1)` per row.
-///
-/// The `μᵢ==0` guard makes this finite when evaluated at the **saturated** mean
-/// `μ=y` (so `nb_profile_loglik(y, y, θ)` = the NB saturated log-likelihood, the
-/// term the NB GLMM marginal-θ objective adds back to the Laplace deviance): at a
-/// zero count `μ=y=0`, both mean terms vanish in the limit, but `0·ln(0)` would
-/// otherwise produce a `NaN`. For the GLM caller `μ̂>0` always, so the guard never
-/// fires there.
+/// NB log-likelihood of `y` at means `μ` and shape θ,
+/// `Σ wᵢ·log f(yᵢ; μᵢ, θ)`: each row is its saturated log-likelihood
+/// ([`nb_saturated_row`]) less half its unit deviance
+/// (`family::dev_resid`), both free of cancellation at large counts.
+/// `MASS::theta.ml` maximises the same function of θ at fixed μ̂ (it drops
+/// the θ-free `−lnΓ(yᵢ+1)`; this keeps it, so `nb_profile_loglik(y, y, θ, w)`
+/// is the NB saturated log-likelihood, the term the NB GLMM marginal-θ
+/// objective adds back to the Laplace deviance).
 ///
 /// `weights: Some(w)` multiplies each row's contribution by the prior weight
 /// `wᵢ` (matches `MASS::glm.nb(weights=)`'s profile — `theta.ml` weights the
 /// per-row deviance terms the same way `glm.fit` weights IRLS); `None` is unit
 /// weights.
 pub(crate) fn nb_profile_loglik(y: &[f64], mu: &[f64], theta: f64, weights: Option<&[f64]>) -> f64 {
+    let family = Family::NegativeBinomial {
+        link: NegBinomialLink::Log,
+    };
+    let excess_theta = crate::family::ln_gamma_excess2(theta);
     let mut ll = 0.0;
     for (i, (&yi, &mi)) in y.iter().zip(mu.iter()).enumerate() {
-        let yc = yi.round() as u64;
-        let mut s = if yc <= Y_SUM_MAX {
-            let mut acc = 0.0;
-            for k in 0..yc {
-                acc += (theta + k as f64).ln();
-            }
-            acc
-        } else {
-            crate::simd_transcendental::ln_gamma(theta + yi)
-                - crate::simd_transcendental::ln_gamma(theta)
-        };
-        if mi > 0.0 {
-            s += theta * (theta / (theta + mi)).ln() + yi * (mi / (theta + mi)).ln();
-        }
+        let s = nb_saturated_row(yi, theta, excess_theta)
+            - 0.5 * crate::family::dev_resid(family, theta, yi, mi);
         ll += weights.map_or(1.0, |w| w[i]) * s;
+    }
+    ll
+}
+
+/// The rows of `y` grouped by count for [`nb_saturated_loglik_grouped`]:
+/// `(yᵥ, Σ wᵢ over the rows with yᵢ = yᵥ)`, ascending in `yᵥ`, written into
+/// `out` (cleared first; its capacity is reused across fits). `y` is fixed
+/// for a fit, so this runs once per fit.
+pub(crate) fn nb_count_groups(y: &[f64], weights: Option<&[f64]>, out: &mut Vec<(f64, f64)>) {
+    out.clear();
+    for (i, &yi) in y.iter().enumerate() {
+        let wi = weights.map_or(1.0, |w| w[i]);
+        out.push((yi, wi));
+    }
+    out.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    let mut k = 0;
+    for j in 0..out.len() {
+        if k > 0 && out[k - 1].0.to_bits() == out[j].0.to_bits() {
+            out[k - 1].1 += out[j].1;
+        } else {
+            out[k] = out[j];
+            k += 1;
+        }
+    }
+    out.truncate(k);
+}
+
+/// `nb_profile_loglik(y, y, θ, w)` (the NB saturated log-likelihood) off
+/// the count groups of [`nb_count_groups`]: each distinct count's row term
+/// is formed once and weighted by its group's total weight. A group's term is
+/// that function's row term bit for bit (its unit deviance at `μ = y` is 0);
+/// only the outer sum over rows is reassociated (into one product per count).
+pub(crate) fn nb_saturated_loglik_grouped(groups: &[(f64, f64)], theta: f64) -> f64 {
+    let excess_theta = crate::family::ln_gamma_excess2(theta);
+    let mut ll = 0.0;
+    for &(yi, wsum) in groups {
+        ll += wsum * nb_saturated_row(yi, theta, excess_theta);
     }
     ll
 }
@@ -455,24 +484,19 @@ pub(crate) fn nb_profile_loglik(y: &[f64], mu: &[f64], theta: f64, weights: Opti
 /// coordinate of its outer BOBYQA instead; `g` is the log-likelihood to maximise
 /// as a function of `ln θ`.
 ///
-/// Stopping width `1e-4` on `ln θ` (2026-08-06, was `1e-8`): for the GLMM route,
-/// `g` is a full inner GLMM refit at fixed θ, and that refit's own inner
-/// two-stage BOBYQA is converged only to `GLMM_RHO_END = 3e-6` (`src/lmm/mod.rs`) —
-/// no evaluation of `g` resolves θ differences finer than that on its own. Below
-/// that radius the inner refit exhibits a knife-edge: two nearby θ values can
-/// land the refit in different local optima of its own objective, with the same
-/// `g(ln θ)` shape otherwise unchanged, so a search still iterating there is not
-/// resolving curvature — it is picking a side of that knife-edge by whatever
-/// rounding happens to be present in the inputs. Measured on the dense NB GLMM
-/// fixture: the old `1e-8` width let a 1-ULP input perturbation flip the
-/// reported β by ~9.5e-5 relative through exactly this mechanism (branch flip at
-/// golden-section iteration 40 of 45, interval width 4.35e-8, ~69x tighter than
-/// the noise floor); at `1e-4` the same perturbation pair converges to a
-/// bit-identical β. `1e-4` was chosen as the loosest of {1e-8, 1e-7, 1e-6, 1e-5,
-/// 1e-4, 1e-3} that both removes the flip and keeps every cross-engine NB golden
-/// (`cargo test --features oracle-tests -- goldens_agree_with_the_references`)
-/// inside `validation/grid/tol.R`'s bands (`1e-3` also held; `1e-4` is one decade
-/// tighter for margin).
+/// Stopping width `1e-7` on `ln θ`, so the returned `θ̂` is the maximum of `g`
+/// to within `5e-8` relative. That is finer than the outer alternation's own
+/// stop (`NB_THETA_TOL = 1e-6` on `|Δθ|/θ` between rounds), so the alternation,
+/// not this bracket, sets how far `θ̂` ends from the joint maximum over `(β, θ)`.
+/// A width near or above `NB_THETA_TOL` leaves `θ̂` up to half the width off
+/// that maximum with nothing in the loop to see it. A narrower width does not
+/// help: `θ̂` is then already limited by `NB_THETA_TOL` (on 400 simulated NB
+/// GLMs checked against the joint maximum computed at 50 digits, the worst `θ̂`
+/// is 3.4e-7 relative off at this width and 3.6e-7 at `1e-8`), and each further
+/// decade costs about five more evaluations of `g` per round. `g` is the
+/// closed-form profile at fixed `μ̂`, smooth in `ln θ` with no inner fit: in a
+/// 128-draw sweep of 1-ULP changes to `x` and `y` on the NB GLM fixtures, `θ̂`
+/// moved by at most 5e-7 relative and never jumped to another branch.
 pub(crate) fn golden_max_ln_theta(mut g: impl FnMut(f64) -> f64) -> f64 {
     const INV_PHI: f64 = 0.618_033_988_749_894_9; // 1/golden ratio
     let (mut a, mut b) = (NB_THETA_LO.ln(), NB_THETA_HI.ln());
@@ -493,7 +517,7 @@ pub(crate) fn golden_max_ln_theta(mut g: impl FnMut(f64) -> f64) -> f64 {
             d = a + (b - a) * INV_PHI;
             fd = g(d);
         }
-        if (b - a).abs() < 1e-4 {
+        if (b - a).abs() < 1e-7 {
             break;
         }
     }
@@ -513,10 +537,27 @@ fn optimize_nb_theta(y: &[f64], mu: &[f64], weights: Option<&[f64]>) -> f64 {
 /// reaches this only as that fit's own start. On a GLMM the random effects
 /// inflate `s²`, so this seed sits one to two orders of magnitude below θ̂,
 /// which is why the GLMM route does not take it.
-pub(crate) fn nb_theta_moment_seed(y: &[f64], n: usize) -> f64 {
-    let ybar = y.iter().sum::<f64>() / n as f64;
-    let var = y.iter().map(|&yi| (yi - ybar).powi(2)).sum::<f64>() / (n.max(2) - 1) as f64;
-    (ybar * ybar / (var - ybar).max(1e-6)).clamp(NB_THETA_LO, NB_THETA_HI)
+///
+/// With an offset `oᵢ` the rows have different means, and `s²` of the raw y
+/// would charge the spread of the exposures `e^{oᵢ}` to overdispersion (θ₀ at
+/// the box floor when they differ by decades). So the moments are taken
+/// around the null-model means `μ̂ᵢ = r·eᵢ`, `eᵢ = e^{oᵢ}` (1 without an
+/// offset), `r = Σy/Σe`: from `E(y−μ)² = μ + μ²/θ`,
+/// `θ₀ = mean(μ̂²)/max(Σ(yᵢ−μ̂ᵢ)²/(n−1) − mean(μ̂), ε)`, which is the formula
+/// above when every `oᵢ` is equal.
+pub(crate) fn nb_theta_moment_seed(y: &[f64], n: usize, offset: Option<&[f64]>) -> f64 {
+    let df = (n.max(2) - 1) as f64;
+    let e = |i: usize| offset.map_or(1.0, |o| o[i].exp());
+    let rate = y[..n].iter().sum::<f64>() / (0..n).map(e).sum::<f64>();
+    let (mut m1, mut m2, mut ss) = (0.0, 0.0, 0.0);
+    for (i, &yi) in y[..n].iter().enumerate() {
+        let mu = rate * e(i);
+        m1 += mu;
+        m2 += mu * mu;
+        ss += (yi - mu) * (yi - mu);
+    }
+    let theta = (m2 / n as f64) / (ss / df - m1 / n as f64).max(1e-6);
+    theta.clamp(NB_THETA_LO, NB_THETA_HI)
 }
 
 /// Negative-binomial GLM via the alternating outer-θ loop (`MASS::glm.nb`):
@@ -571,7 +612,8 @@ pub(super) fn fit_glm_nb_capped(
     max_outer: usize,
     map: &ColumnScaling,
 ) -> (Fit, f64) {
-    let mut theta = theta_seed.unwrap_or_else(|| nb_theta_moment_seed(y, n));
+    let mut theta =
+        theta_seed.unwrap_or_else(|| nb_theta_moment_seed(y, n, opts.offset.as_deref()));
 
     let family = Family::NegativeBinomial {
         link: NegBinomialLink::Log,
@@ -587,17 +629,28 @@ pub(super) fn fit_glm_nb_capped(
         map.beta_to_caller(&mut beta);
         beta
     };
+    // Every fit after the first starts from the last fit's β, as `MASS::glm.nb`
+    // passes `etastart`. From a cold start each round walks the same path and
+    // stops wherever its stop rule first fires. At large counts that is the
+    // round-off stop, up to a Fisher step short of the maximum, at a point that
+    // jumps between two nearby θ; θ̂ read off those μ̂ then alternates between
+    // two values (5e-5 apart on a 20-row fit at μ ≈ 1.6e5) and never settles.
+    // From the last β the rounds continue one iteration instead.
+    let mut beta_start: Vec<f64> = Vec::with_capacity(p);
     let mut fit_result = fit_unsupported_family(p);
     let mut settled = false;
     let mut rounds: u32 = 0;
     for _ in 0..max_outer {
         rounds += 1;
         // θ is fixed for this β fit and threaded explicitly (the spec is θ-free).
-        let view = fit_glm_prebuilt(family, theta, x, y, opts, &mut buf, map);
+        let start = (!beta_start.is_empty()).then_some(&beta_start[..]);
+        let view = fit_glm_prebuilt(family, theta, x, y, opts, &mut buf, map, start);
         fit_result = glm_view_to_fit(&view, caller_beta(&view), y, family, theta, n, p, opts, map);
         if !fit_result.converged() {
             break;
         }
+        beta_start.clear();
+        beta_start.extend_from_slice(view.betas);
         // μ̂ = exp(o + Xβ̂) for the θ optimisation. `x` is the design the
         // kernel fitted and `view.betas` its β̃, so `x·β̃ = x_caller·β` with no
         // map (`fit_result.beta` is the caller's β, for the caller's design).
@@ -614,7 +667,8 @@ pub(super) fn fit_glm_nb_capped(
         if converged {
             settled = true;
             // Final β/SE at the converged θ for consistency.
-            let view = fit_glm_prebuilt(family, theta, x, y, opts, &mut buf, map);
+            let view =
+                fit_glm_prebuilt(family, theta, x, y, opts, &mut buf, map, Some(&beta_start));
             fit_result =
                 glm_view_to_fit(&view, caller_beta(&view), y, family, theta, n, p, opts, map);
             break;
@@ -623,7 +677,7 @@ pub(super) fn fit_glm_nb_capped(
     if !settled && rounds == max_outer as u32 && fit_result.converged() {
         // Cap exit: refit β̂/SE at the θ this fit reports, so the returned Fit is
         // one model, and say that θ never settled (`Note::NbShapeUnsettled`).
-        let view = fit_glm_prebuilt(family, theta, x, y, opts, &mut buf, map);
+        let view = fit_glm_prebuilt(family, theta, x, y, opts, &mut buf, map, Some(&beta_start));
         fit_result = glm_view_to_fit(&view, caller_beta(&view), y, family, theta, n, p, opts, map);
         if fit_result.converged() {
             fit_result

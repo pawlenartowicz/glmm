@@ -27,12 +27,9 @@ pub(crate) struct PackedFactor<'a> {
     pub(crate) a_chol: &'a mut Mat<f64>,
     /// Scratch for `a_chol`'s in-place factor and back-solve.
     pub(crate) a_llt_mem: &'a mut MemBuffer,
-    /// len `k`: `M'r`, then `A⁻¹M'r` in place.
+    /// len `k`: `M'ρ`, then the increment right-hand side `M'ρ − u`, then
+    /// `A⁻¹(M'ρ − u)` in place.
     pub(crate) a_rhs: &'a mut [f64],
-    /// len `n`: `(Mu)ᵢ` at the current iterate, written by `eta_from_mode` and
-    /// read by `scatter`'s IRLS right-hand side. It is NOT overwritten by the
-    /// working residual — the scatter folds `w·Mu + ρ` per row as it goes.
-    pub(crate) mu: &'a mut [f64],
     pub(crate) family: Family,
     pub(crate) nb_theta: f64,
     /// Nonzeros per packed row.
@@ -63,7 +60,6 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
             for t in base..base + width {
                 acc += m_vals[t] * u[m_cols[t] as usize];
             }
-            self.mu[i] = acc;
             eta[i] = eta_fixed[i] + acc;
             yeta += y[i] * eta[i];
         }
@@ -97,7 +93,6 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
                 let wi = w[i];
                 let rho =
                     crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i]);
-                let q_i = wi * self.mu[i] + rho;
                 let base = i * width;
                 for ta in base..base + width {
                     let ca = m_cols[ta] as usize;
@@ -109,7 +104,7 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
                             vals[s as usize] += wva * m_vals[tb];
                         }
                     }
-                    a_rhs[ca] += va * q_i;
+                    a_rhs[ca] += va * rho;
                 }
             }
             return;
@@ -122,7 +117,7 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
             }
             a_rhs[c] = 0.0;
         }
-        // `wᵢmᵢmᵢ'` into A and `mᵢ·(wᵢ(Mu)ᵢ + ρᵢ)` into the RHS, from each row's
+        // `wᵢmᵢmᵢ'` into A and `mᵢ·ρᵢ` into the RHS, from each row's
         // `width` nonzeros. This pass is scalar per row for every family — no
         // logit shortcut and no batched kernel: the effective residual
         // `ρ = w·(dμ/dη)·(y−μ)/V` is formed here beside the gather. The exit
@@ -131,7 +126,6 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
         for i in 0..n {
             let wi = w[i];
             let rho = crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i]);
-            let q_i = wi * self.mu[i] + rho;
             let base = i * width;
             for ta in base..base + width {
                 let ca = m_cols[ta] as usize;
@@ -141,7 +135,7 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
                     let cb = m_cols[tb] as usize;
                     a[(ca, cb)] += wva * m_vals[tb];
                 }
-                a_rhs[ca] += va * q_i;
+                a_rhs[ca] += va * rho;
             }
         }
     }
@@ -217,9 +211,10 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
 /// penalized likelihood (the step weight is the exact curvature, see
 /// `pirls_solve_blocked`), with `M = ZΛ` the scaled RE design and a `+I` ridge
 /// (the nAGQ=1 reparameterization, `u ~ N(0, I)`). Each step assembles
-/// `A = M'WM + I` and the right-hand side `M'(W·Mu + ρ)`, with the score
+/// `A = M'WM + I` and the right-hand side `M'ρ − u`, with the score
 /// `ρ = prior_w·μ'(y−μ)/V`, from the `width` nonzeros per row and takes
-/// `u ← A⁻¹M'(W·Mu + ρ)` through a dense `k×k` (or sparse) Cholesky. Returns `(deviance, ‖ũ‖², log|L|` at the returned iterate,
+/// `u ← u + A⁻¹(M'ρ − u)` through a dense `k×k` (or sparse) Cholesky (the
+/// increment form, see `pirls_solve_blocked`). Returns `(deviance, ‖ũ‖², log|L|` at the returned iterate,
 /// converged`)`; a Cholesky failure surfaces as `(NaN, NaN, NaN, false)`.
 /// A converged solve ends by re-evaluating η/μ/W at the returned `u` and
 /// rebuilding and refactoring `A` there ([`evaluate_at_mode`]), so `log|L|`
@@ -292,7 +287,6 @@ pub(crate) fn pirls_solve_packed(
         u,
         u_prev,
         eta_fixed,
-        mu,
         a_rhs,
         ..
     } = scratch;
@@ -304,7 +298,6 @@ pub(crate) fn pirls_solve_packed(
         a_chol: &mut packed.a_chol,
         a_llt_mem: &mut packed.a_llt_mem,
         a_rhs: &mut a_rhs[..],
-        mu: &mut mu[..],
         family,
         nb_theta,
         width,
@@ -410,20 +403,10 @@ pub(crate) fn pirls_solve_packed(
             n,
         );
         layout.scatter(&w[..], &prob[..], &eta[..], y, prior_w, weighted, n, None);
-        // Profile mode: accumulate the β-gradient X'ρ (ρ = effective residual)
-        // into `beta_rhs` — the joint system's bottom-block RHS. Its own pass off
-        // the fresh prob/eta, so the Fixed path never pays for it.
-        if let BetaStep::Profile { beta_rhs, .. } = &mut beta_step {
-            for v in beta_rhs[..p].iter_mut() {
-                *v = 0.0;
-            }
-            for i in 0..n {
-                let rho =
-                    crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i]);
-                for j in 0..p {
-                    beta_rhs[j] += x[(i, j)] * rho;
-                }
-            }
+        // The increment right-hand side M'ρ − u (see `pirls_solve_blocked`,
+        // change together).
+        for (r, &uc) in layout.a_rhs[..k].iter_mut().zip(&u[..k]) {
+            *r -= uc;
         }
         // `+I`, factor, `log|A|` off the factor that produces this step's u_new.
         // The exit refresh below replaces both with their values at the
@@ -435,14 +418,12 @@ pub(crate) fn pirls_solve_packed(
         layout.solve_in_place();
         pen = 0.0;
         for (uc, &a) in u[..k].iter_mut().zip(layout.a_rhs.iter()) {
-            *uc = a;
-            pen += a * a;
+            *uc += a;
+            pen += *uc * *uc;
         }
         // --- Profile-mode joint δβ step (β-Schur border), taken while the LLT of
-        // A is still alive. `u` currently holds u_new = u_prev + δu₀, so
-        // δu₀ = u − u_prev. ---
+        // A is still alive. `u` currently holds u_new = u_prev + δu₀. ---
         if let BetaStep::Profile {
-            xtwx,
             xtwm,
             ainv_mtwx,
             schur,
@@ -467,22 +448,6 @@ pub(crate) fn pirls_solve_packed(
                     }
                 }
             }
-            // C = X'WX (p×p) via the W∘X GEMM scratch `wx`, recomputed each
-            // iteration because W changes with the working weights. Kept
-            // full-symmetric — the border below reads the whole matrix.
-            for r in 0..p {
-                for i in 0..n {
-                    wx[(i, r)] = w[i] * x[(i, r)];
-                }
-            }
-            faer::linalg::matmul::matmul(
-                xtwx.as_mut(),
-                faer::Accum::Replace,
-                x.transpose(),
-                wx.as_ref(),
-                1.0,
-                Par::Seq,
-            );
             // T = A⁻¹B = A⁻¹(M'WX): transpose-gather B' then solve with this
             // iteration's factor.
             for r in 0..k {
@@ -506,24 +471,28 @@ pub(crate) fn pirls_solve_packed(
                     MemStack::new(layout.a_llt_mem),
                 );
             }
-            // S_β = C − B'·T.
-            for r in 0..p {
+            // Residual rows rᵢ = xᵢ − Tᵀmᵢ into `wx` over the row's packed
+            // nonzeros, then S_β and the right-hand side X'ρ − B'·δu₀ off them
+            // (`residual_border`).
+            for i in 0..n {
+                let base = i * width;
                 for c in 0..p {
-                    let mut s = xtwx[(r, c)];
-                    for j in 0..k {
-                        s -= xtwm[(r, j)] * ainv_mtwx[(j, c)];
+                    let mut r = x[(i, c)];
+                    for t in base..base + width {
+                        r -= layout.m_vals[t] * ainv_mtwx[(layout.m_cols[t] as usize, c)];
                     }
-                    schur[(r, c)] = s;
+                    wx[(i, c)] = r;
                 }
             }
-            // rhs = X'ρ − B'·δu₀ (beta_rhs holds X'ρ; δu₀ = u − u_prev).
-            for r in 0..p {
-                let mut acc = 0.0;
-                for c in 0..k {
-                    acc += xtwm[(r, c)] * (u[c] - u_prev[c]);
-                }
-                beta_rhs[r] -= acc;
-            }
+            residual_border(
+                |i| w[i],
+                |i| crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i]),
+                wx.as_ref().subrows(0, n),
+                ainv_mtwx.as_ref().subrows(0, k),
+                |j| u_prev[j],
+                schur,
+                &mut beta_rhs[..p],
+            );
             // δβ = S_β⁻¹·rhs in place. Non-PD S_β ⇒ the (NaN,…,false) failure surface.
             if cholesky_in_place(
                 schur.as_mut(),
@@ -640,48 +609,44 @@ pub(crate) fn pirls_solve_packed(
 
 /// Refill the packed `M` values at the current Λ (`packed.lam_small` must be
 /// filled for this θ): entry `c` of a row's block is the lower-tri fold
-/// `Σ_{r≥c} z[r]·Λ[r,c]` with `z = [1, x[slope cols…]]`, the same `ZΛ` sandwich
+/// `Σ_{r≥c} z[r]·Λ[r,c]` with `z = [1, slopes…]`, the same `ZΛ` sandwich
 /// every other layout writes. The Z-side factor is indexed by the Λ ROW `r`,
-/// not the column `c`.
+/// not the column `c`. The slopes come from `z_buf` (`workspace::fill_z_f64`,
+/// whose row order this walk shares), never from the fixed-effect design.
 pub(crate) fn fill_m_vals(
     packed: &mut PackedScratch,
     g: &crate::lmm::LmmGroupings,
-    x: MatRef<f64>,
+    z_buf: &[f64],
     n: usize,
 ) {
     let q_p = g.primary_q;
     let width = packed.width;
+    let mut zt = 0;
     for i in 0..n {
         let mut t = i * width;
         for c in 0..q_p {
             let mut acc = 0.0;
             for r in c..q_p {
-                let z = if r == 0 {
-                    1.0
-                } else {
-                    x[(i, g.primary_slope_cols[r - 1])]
-                };
+                let z = if r == 0 { 1.0 } else { z_buf[zt + r - 1] };
                 acc += z * packed.lam_small[r * q_p + c];
             }
             packed.m_vals[t] = acc;
             t += 1;
         }
+        zt += q_p - 1;
         for e in 0..g.extra_offsets.len() {
             let q_g = g.extra_q[e];
             let lo = packed.lam_off_decl[e];
             for c in 0..q_g {
                 let mut acc = 0.0;
                 for r in c..q_g {
-                    let z = if r == 0 {
-                        1.0
-                    } else {
-                        x[(i, g.extra_slope_cols[e][r - 1])]
-                    };
+                    let z = if r == 0 { 1.0 } else { z_buf[zt + r - 1] };
                     acc += z * packed.lam_small[lo + r * q_g + c];
                 }
                 packed.m_vals[t] = acc;
                 t += 1;
             }
+            zt += q_g - 1;
         }
     }
 }
@@ -709,13 +674,15 @@ pub(crate) fn fill_m_vals(
 pub(crate) fn packed_m_vals_theta_deriv(
     g: &crate::lmm::LmmGroupings,
     a: usize,
-    x: MatRef<f64>,
+    z_buf: &[f64],
     i: usize,
     out: &mut [f64],
 ) {
     out.fill(0.0);
     let q_p = g.primary_q;
     let base_theta = q_p * (q_p + 1) / 2;
+    // Row `i`'s slopes in `z_buf`, and the running offset of a grouping's own.
+    let mut zt = i * (q_p - 1 + g.extra_q.iter().map(|&q| q - 1).sum::<usize>());
     if a < base_theta {
         // Invert the column-major vech enumeration `lmm::primary_lambda`
         // writes (`c` outer, `r` inner from `r == c`).
@@ -724,11 +691,7 @@ pub(crate) fn packed_m_vals_theta_deriv(
         for c in 0..q_p {
             for r in c..q_p {
                 if t == a {
-                    out[c] = if r == 0 {
-                        1.0
-                    } else {
-                        x[(i, g.primary_slope_cols[r - 1])]
-                    };
+                    out[c] = if r == 0 { 1.0 } else { z_buf[zt + r - 1] };
                     return;
                 }
                 t += 1;
@@ -738,7 +701,8 @@ pub(crate) fn packed_m_vals_theta_deriv(
     }
     let mut slot = q_p;
     let mut vech = base_theta;
-    for (e, &q_g) in g.extra_q.iter().enumerate() {
+    zt += q_p - 1;
+    for &q_g in &g.extra_q {
         let len = q_g * (q_g + 1) / 2;
         if a < vech + len {
             let local = a - vech;
@@ -746,11 +710,7 @@ pub(crate) fn packed_m_vals_theta_deriv(
             for c in 0..q_g {
                 for r in c..q_g {
                     if t == local {
-                        out[slot + c] = if r == 0 {
-                            1.0
-                        } else {
-                            x[(i, g.extra_slope_cols[e][r - 1])]
-                        };
+                        out[slot + c] = if r == 0 { 1.0 } else { z_buf[zt + r - 1] };
                         return;
                     }
                     t += 1;
@@ -760,6 +720,7 @@ pub(crate) fn packed_m_vals_theta_deriv(
         }
         slot += q_g;
         vech += len;
+        zt += q_g - 1;
     }
 }
 
@@ -801,22 +762,24 @@ mod tests {
         let n_theta = g.n_theta();
         let mut theta: Vec<f64> = (0..n_theta).map(|k| 0.4 + 0.11 * k as f64).collect();
         let eps = 1e-6;
+        let mut z = vec![0.0; n * 2];
+        crate::glmm::workspace::fill_z_f64(&g, x.as_ref(), &mut z, n);
 
         for a in 0..n_theta {
             let base = theta[a];
             theta[a] = base + eps;
             crate::sparse::fill_lambda_small(&theta, &g, &mut packed.lam_small);
-            fill_m_vals(&mut packed, &g, x.as_ref(), n);
+            fill_m_vals(&mut packed, &g, &z, n);
             let plus = packed.m_vals[..n * width].to_vec();
             theta[a] = base - eps;
             crate::sparse::fill_lambda_small(&theta, &g, &mut packed.lam_small);
-            fill_m_vals(&mut packed, &g, x.as_ref(), n);
+            fill_m_vals(&mut packed, &g, &z, n);
             let minus = packed.m_vals[..n * width].to_vec();
             theta[a] = base;
 
             let mut d = vec![0.0; width];
             for i in 0..n {
-                packed_m_vals_theta_deriv(&g, a, x.as_ref(), i, &mut d);
+                packed_m_vals_theta_deriv(&g, a, &z, i, &mut d);
                 for t in 0..width {
                     let want = (plus[i * width + t] - minus[i * width + t]) / (2.0 * eps);
                     assert!(
@@ -838,7 +801,6 @@ mod tests {
     #[test]
     fn evaluate_at_mode_refuses_an_infeasible_eta() {
         let (n, s) = (6usize, 2usize);
-        let x = Mat::<f64>::from_fn(n, 1, |_, _| 1.0);
         let spec = crate::ModelSpec {
             family: Family::Gamma {
                 link: crate::GammaLink::Inverse,
@@ -855,7 +817,7 @@ mod tests {
         let k = g.k_total;
         let mut packed = PackedScratch::for_shape(&g, n, k);
         crate::sparse::fill_lambda_small(&[0.5], &g, &mut packed.lam_small);
-        fill_m_vals(&mut packed, &g, x.as_ref(), n);
+        fill_m_vals(&mut packed, &g, &[], n);
         // Intercept-only primary: one nonzero per row, at that row's cluster.
         for i in 0..n {
             packed.m_cols[i] = (i % s) as u32;
@@ -871,7 +833,6 @@ mod tests {
         let mut prob = vec![0.0; n];
         let mut w = vec![0.0; n];
         let mut a_rhs = vec![0.0; k];
-        let mut mu = vec![0.0; n];
         let mut layout = PackedFactor {
             m_cols: &packed.m_cols[..n * width],
             m_vals: &packed.m_vals[..n * width],
@@ -879,7 +840,6 @@ mod tests {
             a_chol: &mut packed.a_chol,
             a_llt_mem: &mut packed.a_llt_mem,
             a_rhs: &mut a_rhs[..],
-            mu: &mut mu[..],
             family: spec.family,
             nb_theta: f64::NAN,
             width,

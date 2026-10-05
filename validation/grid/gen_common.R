@@ -342,7 +342,7 @@ sim_cell <- function(cell) {
   # matching branch; the two must agree, which is why both read
   # eta0_of/betas_of.
   if (identical(cell$structure, "glm")) {
-    set.seed(seed_of(cell$cell))
+    set.seed(cell$seed)
     n  <- cell$n_obs
     nx <- cell$n_x
     X <- matrix(rnorm(n * nx), n, nx,
@@ -354,7 +354,7 @@ sim_cell <- function(cell) {
     return(draw_response(cell, df, eta, n, factors = character(0), n_x = nx))
   }
 
-  set.seed(seed_of(cell$cell))
+  set.seed(cell$seed)
   st <- STRUCTURES[[cell$structure]]
   n <- cell$n_obs; per <- cell$per_group; G <- n %/% per
   nx <- nx_of(st)   # covariates: enough for the widest slope block

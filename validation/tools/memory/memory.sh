@@ -99,7 +99,9 @@ fi
 # Build once, release, and invoke the binary directly (never `cargo run`) --
 # see header. Shared by every engine selection: the "rust" engine below reads
 # it, and it costs nothing extra when only py/glmm_r are selected.
-RUST_BIN="$ROOT/../target/release/examples/memory_fit"
+# Cargo builds into $CARGO_TARGET_DIR when it is set, so look for the binary there.
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/../target}"
+RUST_BIN="$TARGET_DIR/release/examples/memory_fit"
 build_rust() {
   [[ -x "$RUST_BIN" ]] && return
   cargo build --quiet --release --manifest-path "$ROOT/../Cargo.toml" \
@@ -206,11 +208,15 @@ emit() {
 # file fed by both "child stderr appended during the run" and "-o's report
 # written after" loses the child's stderr -- on a real failure you'd see only
 # time's "Command exited with non-zero status N" and nothing about why.
+#
+# macOS: BSD time has no -f; -l prints the rusage block, whose "maximum
+# resident set size" line is in BYTES there, so it is converted to KB.
+if [[ "$(uname -s)" == Darwin ]]; then TIME_ARGS=(-l); else TIME_ARGS=(-f '%M'); fi
 measure() {
   local errfile timefile
   errfile="$(mktemp)"
   timefile="$(mktemp)"
-  /usr/bin/time -f '%M' -o "$timefile" "$@" >/dev/null 2>"$errfile" || {
+  /usr/bin/time "${TIME_ARGS[@]}" -o "$timefile" "$@" >/dev/null 2>"$errfile" || {
     echo "   FIT FAILED: $*" >&2
     echo "   --- child stderr ---" >&2
     cat "$errfile" >&2
@@ -219,13 +225,17 @@ measure() {
     trash-put "$errfile" "$timefile" 2>/dev/null || rm -f "$errfile" "$timefile"
     return 1
   }
-  tail -n1 "$timefile"
+  if [[ "$(uname -s)" == Darwin ]]; then
+    awk '/maximum resident set size/ { printf "%d\n", $1 / 1024 }' "$timefile"
+  else
+    tail -n1 "$timefile"
+  fi
   trash-put "$errfile" "$timefile" 2>/dev/null || true
 }
 
 # The glmm binary for the accuracy grid's cells. Built once, release, and invoked
 # directly rather than through `cargo run` -- see the header.
-GRID_BIN="$ROOT/../target/release/examples/grid_glmm"
+GRID_BIN="$TARGET_DIR/release/examples/grid_glmm"
 build_grid() {
   [[ -x "$GRID_BIN" ]] && return
   cargo build --quiet --release --manifest-path "$ROOT/../Cargo.toml" \
@@ -423,7 +433,9 @@ run_baselines() {
 write_run_meta() {
   local out_tsv="$1"
   local meta="${out_tsv%.tsv}_run_meta.json"
+  # Same `-dirty` rule as grid/run.sh's write_run_meta -- change together.
   local rev; rev="$(git -C "$ROOT/.." rev-parse HEAD 2>/dev/null || echo unknown)"
+  [[ "$rev" == unknown ]] || git -C "$ROOT/.." diff --quiet HEAD -- || rev="$rev-dirty"
   python3 -c "
 import json, platform, sys
 meta = {

@@ -1813,8 +1813,8 @@ fn grid_agreement_cells() -> Vec<GridCell> {
 /// cell 20 split the same way, 1.9 deviance units apart); under the signed
 /// box (`blind_theta_and_bounds`) both routes reach the lower basin cold
 /// (cell 12: −207.553008931 / −207.553008925; cell 20: −737.059439657 /
-/// −737.059439629, measured 2026-09-10). Cell 12 splits again since the
-/// P45 standardization (see `noz_sparse_grid_agrees`); cell 20 does not.
+/// −737.059439629, measured 2026-09-10). Cell 12 has a saddle a sparse
+/// search can stop on (see `noz_sparse_grid_agrees`); cell 20 does not.
 ///
 /// The per-quantity checks below only run when the two routes' deviances
 /// agree (same basin, `DEV_TOL`); on a split, β/se/varcorr comparison would
@@ -1846,8 +1846,8 @@ fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
     const TOL: f64 = 1e-4;
     // The agreeing cells' deviances match to ~1e-9 relative (see the four
     // reseeded probes in the doc comment above), so 1e-6 leaves three orders
-    // of margin before "same basin" tips into "different basin". The one
-    // split cell (cell 12) sits at 2.4e-6 relative, above it.
+    // of margin before "same basin" tips into "different basin". A sparse
+    // stop on cell 12's saddle sits at 2.4e-6 relative, above it.
     const DEV_TOL: f64 = 1e-6;
     let mut max_rel = 0f64;
     let mut worst = String::new();
@@ -1958,16 +1958,22 @@ fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
 /// covers that width instead. Any other split fails loudly (see
 /// `run_grid_agreement`'s doc comment).
 ///
-/// Cell 12 (n_primary=10, q_p=8) splits: sparse stops at a saddle,
-/// −207.552516350 (finite-difference Hessian minimum eigenvalue −0.053),
-/// while NoZ reaches −207.553008933, rel 2.4e-6 > `DEV_TOL`. A restart from
-/// the sparse endpoint reaches the NoZ value, and both routes reach it from
-/// 1e-9 start nudges, before and after the slope-scale fold into
-/// `ColumnScaling` (measured 2026-10-01): a flat-surface stopping point, not
-/// a path disagreement.
+/// No cell splits. Cell 12 (n_primary=10, q_p=8) has a saddle at
+/// −207.552516350 (finite-difference Hessian minimum eigenvalue −0.053) next
+/// to the minimum at −207.553008933, rel 2.4e-6 > `DEV_TOL` apart, and a
+/// sparse search can stop on it: a flat-surface stopping point, not a path
+/// disagreement (a restart from the saddle reaches the minimum). From the
+/// blind start at `RHO_BEGIN` = 0.5 both routes reach the minimum.
+/// Re-pinned 2026-10-02 (x86_64) with the per-search BOBYQA start radii:
+/// cell 12's sparse deviance moved from −207.552516350 to −207.553008921
+/// (Δdev −4.9e-4) and NoZ's by +3.9e-9, both converged and singular with the
+/// same pinned component, so cell 12 left the frozen split list.
+/// Measured 2026-10-02 on x86_64, with the dense route reading `U` off the
+/// Gram (`GRAM_PIVOT_MIN`) and the sparse route through its Givens pass:
+/// 15 cells, splits [], max rel |Δ| = 2.091e-6 at cell 9 (varcorr).
 #[test]
 fn noz_sparse_grid_agrees() {
-    run_grid_agreement(false, "noz_sparse_grid_agrees", &[12]);
+    run_grid_agreement(false, "noz_sparse_grid_agrees", &[]);
 }
 
 /// The other half: the 8 cells of `is_heavy_cell`, 27–242s each in release.
@@ -2978,17 +2984,13 @@ fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
 /// single-ULP input nudge moves `beta[0]` 4.8e-4 median / 1.5e-3 worst
 /// (~1e12–1e13 amplification), so a bit-exact pin here needs a 3e-3 band —
 /// ~3.8x the drift, the thinnest margin any pin in the crate would carry —
-/// just to survive normal cross-machine rounding. The amplification traces to
-/// a golden-section stopping width three
-/// decades tighter than the per-evaluation noise floor (`glm.rs:372`'s
-/// provenance comment has the trace). The bit-exact NB gate is pinned instead on
-/// `sim_nb`/`sim_nb_nested` (`fit_glmm_nb_sim_matches_glmmtmb`,
+/// just to survive normal cross-machine rounding. The bit-exact NB gate is
+/// pinned instead on `sim_nb`/`sim_nb_nested` (`fit_glmm_nb_sim_matches_glmmtmb`,
 /// `fit_glmm_nb_nested_unbalanced_matches_glmmtmb`, `src/fit/glmm_tests.rs`) —
 /// those fixtures are well-conditioned, so a pin there can actually tell a
-/// regression from rounding, which a pin on THIS fixture never could, even
-/// with the width fixed, because its conditioning is a property of the
-/// design, not the θ-search. A second copy of that same gate here, on the
-/// crate's worst-conditioned NB fit, would buy nothing beyond what those
+/// regression from rounding, which a pin on THIS fixture cannot. A second
+/// copy of that same gate here, on the crate's worst-conditioned NB fit,
+/// would buy nothing beyond what those
 /// well-conditioned fixtures already gate. What replaces the bit-exact
 /// pin below is oracle agreement: the fixture converges and its `Rx` arm's
 /// β, SDs and θ̂ agree with frozen `glmmTMB(family = nbinom2)`
@@ -3187,7 +3189,7 @@ fn fit_sparse_nb_glmm_is_pinned() {
     );
 }
 
-/// Weighted twin of `fit_sparse_gamma_glmm_matches_glmmtmb` (Task 7): same
+/// Weighted twin of `fit_sparse_gamma_glmm_matches_glmmtmb`: same
 /// over-width design and data. Uses `wᵢ = 1 + 0.2·((i mod 3) − 1)`
 /// (0-based row index, cycling 0.8/1.0/1.2), NOT the integer `1 + (i mod
 /// 3)` scheme the Poisson/NB replication tests use: on THIS wide design
@@ -3287,7 +3289,7 @@ fn fit_sparse_gamma_glmm_weighted_matches_glmmtmb() {
     );
 }
 
-/// Weighted sparse NB has NO lme4 golden (Task 7): the over-count
+/// Weighted sparse NB has NO lme4 golden: the over-count
 /// `sim_sparse_nb` design (7 crossed extras, several small clusters) is
 /// already fragile for `glmer.nb`'s marginal-θ profile unweighted (see
 /// `fit_sparse_nb_glmm_matches_lme4`'s doc — interim-refit convergence
@@ -3298,10 +3300,7 @@ fn fit_sparse_gamma_glmm_weighted_matches_glmmtmb() {
 /// converges (`isSingular` false) but θ̂ jumps 17% off the unweighted
 /// value; `wᵢ = 1 + 0.05·((i mod 3) − 1)` (0.95/1.0/1.05, i.e. a mere ±5%
 /// perturbation) STILL prints "Model failed to converge" and moves θ̂ 4%.
-/// glmm's θ golden-section search, by contrast, stays within <1% of its
-/// unweighted value under the SAME ±5%/±20% perturbations — evidence
-/// glmm's path is the more numerically stable one here, not that it is
-/// ignoring the weights. Rather than pick a weight scheme until lme4
+/// Rather than pick a weight scheme until lme4
 /// happens to land somewhere assertable (`p`-hacking the oracle — the
 /// oracle is sacred, so it is not tuned to pass), this design is
 /// covered instead by the mathematically exact replication-equivalence
@@ -3315,8 +3314,8 @@ fn fit_sparse_gamma_glmm_weighted_matches_glmmtmb() {
 /// β/SE/θ equality (NB's dispersion IS θ̂ itself, driven by the SAME
 /// weighted profile on both sides — nothing here depends on the raw row
 /// count). Tolerances mirror the
-/// dense-vs-sparse cross-check (sparse.rs:5735-5752): β 2e-3 rel, SE 2e-2
-/// rel, θ 2e-2 rel.
+/// dense-vs-sparse cross-check (`sparse_glmm_fit_matches_dense_in_envelope`):
+/// β 2e-3 rel, SE 2e-2 rel, θ 2e-2 rel.
 #[test]
 fn sparse_weighted_nb_matches_replicated() {
     let family = Family::NegativeBinomial {
@@ -4085,7 +4084,7 @@ fn build_sparse_weighted_replication_case(
 /// two sparse PIRLS objectives share an argmin. Full β/SE/τ² equality
 /// (Poisson has no estimated dispersion, so nothing else differs between
 /// the two row counts). Tolerances mirror the dense-vs-sparse cross-check
-/// (sparse_glmm_matches_dense_glmm, sparse.rs:5735-5752): β 2e-3 rel, SE
+/// (`sparse_glmm_fit_matches_dense_in_envelope`): β 2e-3 rel, SE
 /// 2e-2 rel, τ² 2e-2 rel — two independent BOBYQA runs of same-argmin
 /// objectives, so the bound is optimizer-scatter-sized.
 #[test]

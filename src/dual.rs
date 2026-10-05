@@ -243,6 +243,10 @@ impl<const N: usize> crate::scalar::Scalar for Dual<N> {
         chain1(self, f64::ln(self.v), 1.0 / self.v)
     }
     #[inline]
+    fn ln_1p(self) -> Self {
+        chain1(self, f64::ln_1p(self.v), 1.0 / (1.0 + self.v))
+    }
+    #[inline]
     fn log1pexp(self) -> Self {
         let value = crate::simd_transcendental::scalar_log1pexp(self.v);
         let s = crate::glm::sigmoid_stable(self.v);
@@ -642,6 +646,11 @@ impl<const N: usize, const H: usize> crate::scalar::Scalar for HyperDual<N, H> {
             1.0 / self.v,
             -1.0 / (self.v * self.v),
         )
+    }
+    #[inline]
+    fn ln_1p(self) -> Self {
+        let d = 1.0 / (1.0 + self.v);
+        chain2(self, f64::ln_1p(self.v), d, -d * d)
     }
     #[inline]
     fn log1pexp(self) -> Self {

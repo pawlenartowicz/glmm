@@ -14,8 +14,10 @@ channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
 `ExactProfileFallbackWarning`,
 `FitFailedWarning`, `GlmDivergedWarning`, `HessianSeFallbackWarning`,
 `IllConditionedWarning`, `NbShapeUnsettledWarning`, `NoCoefficientsWarning`,
-`NonIntegerResponseWarning`, `PirlsExhaustedWarning`, `RowsDroppedWarning`,
-`SearchLimitWarning`, `SingleLevelGroupingDroppedWarning`, `SingularFitWarning`,
+`NonIntegerResponseWarning`, `PirlsExhaustedWarning`, `PrecisionLimitedWarning`,
+`RowsDroppedWarning`,
+`SearchLimitWarning`, `SeUnavailableWarning`, `SingleLevelGroupingDroppedWarning`,
+`SingularFitWarning`,
 `TooFewRowsWarning`, `UnusedGroupingLevelsWarning`).
 """
 
@@ -44,7 +46,9 @@ __all__ = [
     "NoCoefficientsWarning",
     "NonIntegerResponseWarning",
     "PirlsExhaustedWarning",
+    "PrecisionLimitedWarning",
     "RowsDroppedWarning",
+    "SeUnavailableWarning",
     "SearchLimitWarning",
     "SingleLevelGroupingDroppedWarning",
     "SingularFitWarning",
@@ -130,9 +134,34 @@ class ExactProfileFallbackWarning(DiagnosticWarning):
     The reported estimates come from that rerun when it converged. When the
     rerun also failed, they come from whichever of the two attempts reached
     the lower deviance, and `converged` stays `False` either way. Only
-    affects binomial, Poisson and (on some shapes) negative-binomial mixed
-    models fitted with the default Laplace approximation; never raised for
-    Gamma, which does not take this route.
+    affects mixed models fitted with the default Laplace approximation, and
+    not those with a random slope on a second grouping or too large for the
+    dense layout, which take another route.
+    """
+
+
+class SeUnavailableWarning(DiagnosticWarning):
+    """No covariance of a mixed model's fixed effects could be formed at the
+    search's end point: the information matrix is not
+    positive definite to rounding (under `wald_se="hessian"`, after the joint
+    Hessian failed too).
+
+    The estimates, the variance components and the deviance are the search's
+    own and `converged` is unchanged; `Fit.se`, `Fit.vcov` and
+    `Fit.stddev_se` are `NaN`.
+    """
+
+
+class PrecisionLimitedWarning(DiagnosticWarning):
+    """A mixed model's deviance is too large for double precision to resolve
+    its optimum: the estimated rounding error of the deviance at the end point
+    is above 0.01, so the variance estimates may be off by about a tenth of a
+    standard error or more.
+
+    Every estimate and `converged` are the search's own. Raised on counts in
+    the billions or more, either through the deviance itself (a model that
+    misses a large effect) or, with more than one grouping factor, through the
+    log-determinant of the random-effect system.
     """
 
 
@@ -486,9 +515,9 @@ class Fit:
     #                     `columns` are 0-based indices into `names` (the R
     #                     package reports the same thing 1-based, per R's own
     #                     convention). An absent note means "not detected",
-    #                     never "checked and clean": the GLMM routes record no
-    #                     pivot, and the LMM routes flag `IllConditioned`
-    #                     rather than refuse.
+    #                     never "checked and clean": a fit that formed no
+    #                     factor records no pivot, and every route flags
+    #                     `IllConditioned` rather than refuse.
     # `converged`, `singular` and `aliased` also stay readable straight off the
     # Fit (properties below) — one storage location, unchanged ergonomics.
     diagnostics: dict
@@ -656,7 +685,9 @@ _WARNING_KINDS = {
     "singular": ("caution", "Singular fit"),
     "ill_conditioned": ("caution", "Nearly collinear columns"),
     "hessian_se_fallback": ("caution", "Simpler standard errors used"),
+    "se_unavailable": ("caution", "Standard errors not computed"),
     "exact_profile_fallback": ("caution", "Search retried with a different method"),
+    "precision_limited": ("caution", "Numbers too large for full precision"),
     "agq_fallback": ("caution", "Adaptive quadrature not used"),
     "non_integer_response": ("caution", "Non-integer response"),
     "rows_dropped_na": ("caution", "Rows dropped for missing values"),
@@ -717,6 +748,9 @@ def _note_warning(note, names, converged):
     category. The R port maps the same kinds to condition classes
     (r/R/fastglmm.R) — change together."""
     kind = note["kind"]
+    if kind == "separated":
+        # Only on a non-converged fit, whose one warning (`_nonconvergence`) names it.
+        return None
     if kind == "ill_conditioned":
         named = ", ".join(names[i] if i < len(names) else f"column {i}" for i in note["columns"])
         return (
@@ -784,6 +818,16 @@ def _note_warning(note, names, converged):
             ),
             HessianSeFallbackWarning,
         )
+    if kind == "se_unavailable":
+        return (
+            (
+                "Standard errors could not be computed at the fit's end point: the fixed "
+                "effects carry too little separate information. The estimates are usable; "
+                "standard errors, p-values and confidence intervals are not reported. Check "
+                "for predictors that are copies or near-copies of each other."
+            ),
+            SeUnavailableWarning,
+        )
     if kind == "exact_profile_fallback":
         return (
             (
@@ -792,6 +836,17 @@ def _note_warning(note, names, converged):
                 "reported estimates come from whichever method reached the better answer."
             ),
             ExactProfileFallbackWarning,
+        )
+    if kind == "precision_limited":
+        return (
+            (
+                "The numbers in this fit are so large that rounding in the computer's "
+                "arithmetic hides small changes in its deviance. The random-effect estimates, "
+                "and the fixed effects that depend on them, may be off by a tenth of a "
+                "standard error or more. This happens with counts in the billions or more, "
+                "or when a model misses a large effect in such data."
+            ),
+            PrecisionLimitedWarning,
         )
     if kind == "non_integer_response":
         # The kernel's Note::NonIntegerResponse (src/fit/mod.rs); `evals` carries the
@@ -838,22 +893,50 @@ _DIVERGED_CONTINUOUS = (
     "with extreme values; with a link other than log, the log link is usually more stable."
 )
 
+# A response far outside the reciprocal links' range: the kernel holds the Gamma 1/mu and
+# inverse-Gaussian 1/mu^2 linear predictor inside [1e-75, 1e75] (`INV_ETA_MIN` /
+# `INV_ETA_MAX` in src/family.rs - change together), and a fit whose means must sit
+# outside it cannot converge.
+_ETA_RANGE = (
+    "Some response values are so large or so small that the linear predictor of this link "
+    "(1/mu for gamma, 1/mu^2 for inverse Gaussian) leaves the range the solver supports, "
+    "1e-75 to 1e75. Rescale the response, for example divide it by a power of ten, or use "
+    "the log link."
+)
+
+
+def _eta_out_of_range(family, link, y):
+    """Whether some positive response value puts the reciprocal link's eta = 1/y (gamma)
+    or 1/y^2 (inverse Gaussian) outside [1e-75, 1e75]."""
+    power = {("gamma", "inverse"): 1, ("inversegaussian", "inverse_squared"): 2}.get((family, link))
+    if power is None:
+        return False
+    y = y[y > 0]
+    with np.errstate(over="ignore", divide="ignore"):
+        eta = 1.0 / y**power
+    return bool(np.any((eta < 1e-75) | (eta > 1e75)))
+
 
 def _count(n, word):
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def _nonconvergence(family, mixed, notes, beta, aliased, deviance, y):
+def _nonconvergence(family, mixed, notes, beta, aliased, deviance, y, link=None):
     """The one severe warning of a fit with `converged` False, as (kind, message,
     category). The kernel does not say which stopping rule fired, so the port reads the
     cause off what the fit reports, most specific first: no coefficient, too few rows
     (a one-row response is trivially constant, so this comes first), a constant
-    response, then the model. With random effects, a finite deviance
+    response, then the model. A model with random effects whose fixed-effects-only GLM
+    stopped on separation (the kernel's `separated` note) never ran its search; the
+    coefficients are that GLM's last step, so it gets the GLM's message. Otherwise, with
+    random effects, a finite deviance
     means the kernel reached an end point (the budget stop, reported at its best point),
     and finite estimated coefficients (aliased slots are NaN by contract) confirm it;
     anything else failed. The deviance is what decides a model with no fixed effects. A
     GLMM inner cap-out during the search is one extra sentence rather than a second
-    warning. Mirrors the R port's .nonconvergence - change together."""
+    warning. On the reciprocal links a response outside their range (`_eta_out_of_range`)
+    names that cause instead of the general advice. Mirrors the R port's .nonconvergence -
+    change together."""
     y = np.asarray(y, dtype=float)
     n_est = int(np.count_nonzero(~aliased))
     if not mixed and n_est == 0:
@@ -884,7 +967,9 @@ def _nonconvergence(family, mixed, notes, beta, aliased, deviance, y):
             ),
             ConstantResponseWarning,
         )
-    if not mixed:
+    glm_stopped = any(n["kind"] == "separated" for n in notes)
+    eta_range = _eta_out_of_range(family, link, y)
+    if not mixed or glm_stopped:
         if family == "gaussian":
             return (
                 "design_unsolvable",
@@ -898,6 +983,11 @@ def _nonconvergence(family, mixed, notes, beta, aliased, deviance, y):
             message = _DIVERGED_BINOMIAL
         elif family in ("poisson", "negativebinomial"):
             message = _DIVERGED_COUNTS
+        elif eta_range:
+            message = (
+                "The fit did not converge. The coefficients are from the last step; standard "
+                "errors are not reported. " + _ETA_RANGE
+            )
         else:
             message = _DIVERGED_CONTINUOUS
         return "glm_diverged", message, GlmDivergedWarning
@@ -915,7 +1005,11 @@ def _nonconvergence(family, mixed, notes, beta, aliased, deviance, y):
             advice,
         ]
         return "search_limit", " ".join(sentences), SearchLimitWarning
-    sentences = ["The fitting algorithm failed and returned no estimates.", *inner, advice]
+    sentences = [
+        "The fitting algorithm failed and returned no estimates.",
+        *inner,
+        _ETA_RANGE if eta_range else advice,
+    ]
     return "fit_failed", " ".join(sentences), FitFailedWarning
 
 
@@ -1137,6 +1231,17 @@ def fit(
         keep = [not _is_na(v) for v in values]
         na_mask = keep if na_mask is None else [a and b for a, b in zip(na_mask, keep)]
 
+    # A dict's columns can differ in length, and the `zip`s above stop at the
+    # shortest one, so a ragged dict is refused here, before `na_mask` is used.
+    # Same message as `run_fit`'s length check in `src/orchestrate.rs` — change
+    # together.
+    lengths = sorted((name, len(entry[-1])) for name, entry in parsed.items())
+    if len({n for _, n in lengths}) > 1:
+        detail = ", ".join(f'"{name}": {n}' for name, n in lengths)
+        raise ValueError(
+            f"columns have mismatched lengths ({detail}); all columns must have the same length"
+        )
+
     # Checked against data's original rows, before the NA row drop below, as
     # R's fastglmm() checks them before na.action: a NaN weight is a bad
     # argument, not a missing value.
@@ -1323,6 +1428,7 @@ def fit(
                 res.aliased,
                 res.deviance,
                 res.y,
+                link,
             ),
         )
     return res

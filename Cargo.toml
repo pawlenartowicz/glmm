@@ -72,8 +72,8 @@ oracle-tests = []
 parallel = ["dep:rayon"]
 
 [dependencies]
-# Mirror engine-core's pins exactly — validation-stable numerics depend on them.
-bobyqa = "0.3"
+# Validation-stable numerics depend on these pins.
+bobyqa = "0.3.1"   # `Bobyqa::minimize_with_radius` (the radius-tied stage-1 tolerance)
 pulp = "=0.22.2"
 # Formula-parser only (`src/formula/parse.rs`); optional so the default-off kernel
 # never links it. Its MSRV (1.65) clears this crate's 1.85 floor.

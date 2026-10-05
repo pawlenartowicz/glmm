@@ -35,7 +35,8 @@ fn theta_se(ws: &GlmmWorkspace) -> Vec<f64> {
 fn packed_oracle_fill(ws: &mut GlmmWorkspace, x: faer::MatRef<f64>, params: &[f64], n: usize) {
     let nt = ws.n_theta;
     crate::sparse::fill_lambda_small(&params[..nt], &ws.groupings, &mut ws.packed.lam_small);
-    fill_m_vals(&mut ws.packed, &ws.groupings, x, n);
+    fill_z_f64(&ws.groupings, x, &mut ws.z_buf, n);
+    fill_m_vals(&mut ws.packed, &ws.groupings, &ws.z_buf, n);
 }
 
 /// Level-major RE index (`f·q_p + c`, the blocked and structured layouts) → the
@@ -1061,9 +1062,8 @@ fn exact_hessian_matches_fd_on_fixture() {
 
     let mut cov_exact = Mat::<f64>::zeros(p, p);
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
-    // Rx: mirrors the sibling test — an in-fit SE fallback under Hessian would
-    // return nan_fit and fail the wrong assertion; the explicit joint_hessian_cov
-    // calls below are the comparison.
+    // Rx: mirrors the sibling test — the fit itself runs no joint Hessian; the
+    // explicit joint_hessian_cov calls below are the comparison.
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
@@ -1141,9 +1141,8 @@ fn exact_hessian_matches_fd_on_fixture_agq() {
 
     let mut cov_exact = Mat::<f64>::zeros(p, p);
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 7);
-    // Rx: mirrors the sibling test — an in-fit SE fallback under Hessian would
-    // return nan_fit and fail the wrong assertion; the explicit joint_hessian_cov
-    // calls below are the comparison.
+    // Rx: mirrors the sibling test — the fit itself runs no joint Hessian; the
+    // explicit joint_hessian_cov calls below are the comparison.
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
@@ -1232,9 +1231,9 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
         // Built so the f64 FD side runs the production cached tail (`None` on the
         // nested-only cell, where `e == 0` skips the tail altogether).
         ws.pattern.structured_schur = StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
-        // Rx: mirrors `exact_hessian_matches_fd_on_fixture` — an in-fit SE
-        // fallback under Hessian would return nan_fit and fail the wrong
-        // assertion; the explicit joint_hessian_cov calls below are the comparison.
+        // Rx: mirrors `exact_hessian_matches_fd_on_fixture` — the fit itself
+        // runs no joint Hessian; the explicit joint_hessian_cov calls below are
+        // the comparison.
         let fit = fit_glmm(
             &mut ws,
             xf64.as_ref(),
@@ -3282,35 +3281,32 @@ fn structured_extras_laplace_matches_brute_force() {
     }
 }
 
+/// A structured PIRLS return `(dev, pen, logdet, converged)` against its pin:
+/// the flag exactly, each float to 4ε relative. Not `==`: the same build gives
+/// the same bits, but libm's `exp`/`ln` and the SIMD backend differ across
+/// platforms, and on wasm32 (plain and `+simd128`) these returns land 1-2 ULP
+/// from the x86_64 pins.
+fn assert_pinned_return(got: (f64, f64, f64, bool), pin: (f64, f64, f64, bool), ctx: &str) {
+    let close = |a: f64, b: f64| (a - b).abs() <= 4.0 * f64::EPSILON * b.abs();
+    assert!(
+        got.3 == pin.3 && close(got.0, pin.0) && close(got.1, pin.1) && close(got.2, pin.2),
+        "{ctx}: structured return moved: got {got:?}, pin {pin:?}"
+    );
+}
+
 /// Structured == packed on all three Group-G shapes, to FP error: drives
 /// `pirls_solve_packed` and `pirls_solve_blocked_extras` on the same design at
 /// the same θ / β from fresh scratch. The Schur reassociation is the same
 /// estimator. Bands mirror the no-extras blocked parity
 /// (`blocked_pirls_matches_packed_slope_noextra`): dev/pen/logdet 1e-9, u 1e-7.
 ///
-/// Each shape also carries a bit-exact `pin` on the structured return. A band
-/// against the packed path is blind to anything that moves both sides, and to
-/// anything smaller than the band; the pin is not. `==`, not a band: the
-/// structured kernel is generic over `crate::scalar::Scalar` and its `f64`
-/// instantiation must reproduce the pre-generic arithmetic exactly.
-///
-/// Every `(dev, pen, logdet, converged)` pin in this file — here, the
-/// `slope_q2_crossed` case below, `structured_panel_downdate_matches_scalar`,
-/// and the two Profile-mode fixtures that cite this comment — was recorded
-/// 2026-09-02 from the pre-generic `f64` run, bit-exact by construction at
-/// `T = f64`. Regenerate by running the test and reading the reported value.
-/// Re-pinned 2026-09-15: PIRLS returns the data term, `log|A|` and the factor
-/// at the returned iterate, where before the factor and `log|A|` were one
-/// Newton step behind. Four pins move, by 1 to 2 ULP (1.2e-16 to 4.4e-16
-/// relative): the `crossed` shape here and the same shape in
-/// `structured_panel_downdate_matches_scalar` (`dev` 2 ULP, `logdet` 1 ULP),
-/// `pirls_structured_profile_beta_reaches_pql_stationarity` (`dev` 2 ULP,
-/// `logdet` 2 ULP) and `structured_profile_beta_matches_packed_profile`
-/// (`logdet` 1 ULP, `dev` unchanged). `pen` moves on none of them, and the
-/// other shapes are unchanged. A move of a couple of ULP is what a converged
-/// mode that is already stationary in `u` can show when the same quantities
-/// are re-formed at it, so the pins are re-taken rather than banded — they
-/// stay `==` pins.
+/// Each shape also carries a `pin` on the structured return, checked by
+/// [`assert_pinned_return`]. A band against the packed path is blind to
+/// anything that moves both sides, and to anything smaller than the band; the
+/// pin is not. Every `(dev, pen, logdet, converged)` pin in this file — here,
+/// the `slope_q2_crossed` case below, `structured_panel_downdate_matches_scalar`,
+/// and the two Profile-mode fixtures that cite this comment — follows this
+/// contract. Regenerate by running the test and reading the reported value.
 #[test]
 fn structured_extras_matches_packed() {
     for (np, ncr, label, pin) in [
@@ -3454,6 +3450,7 @@ fn structured_extras_matches_packed() {
                 n,
                 &mut pattern.coup_cols,
                 &mut pattern.coup_ptr,
+                &mut pattern.coup_pos,
             );
             let mut wx_scratch = faer::Mat::<f64>::zeros(n, p);
             pirls_solve_blocked_extras(
@@ -3481,7 +3478,7 @@ fn structured_extras_matches_packed() {
             )
         };
 
-        assert_eq!(structured, pin, "{label}: structured return moved");
+        assert_pinned_return(structured, pin, label);
         // 1e-9 on the three objective terms and 1e-7 on `u`: the structured
         // path (`pirls_solve_blocked_extras`) shares the packed loop's
         // step-halving backtrack, and when no halving fires both walk the same
@@ -3635,6 +3632,7 @@ fn structured_extras_matches_packed() {
                 n,
                 &mut pattern.coup_cols,
                 &mut pattern.coup_ptr,
+                &mut pattern.coup_pos,
             );
             let mut wx_scratch = faer::Mat::<f64>::zeros(n, p);
             pirls_solve_blocked_extras(
@@ -3662,16 +3660,16 @@ fn structured_extras_matches_packed() {
             )
         };
 
-        // Bit-exact pin, same contract as the three shapes above.
-        assert_eq!(
+        // Pinned, same contract as the three shapes above.
+        assert_pinned_return(
             structured,
             (
                 118.0785725377299,
                 1.4514364377459454,
                 3.307542873021056,
-                true
+                true,
             ),
-            "{label}: structured return moved"
+            label,
         );
         assert_eq!(oracle.3, structured.3, "{label}: convergence flag");
         assert!(
@@ -3806,6 +3804,7 @@ fn structured_panel_downdate_matches_scalar() {
                 n,
                 &mut pattern.coup_cols,
                 &mut pattern.coup_ptr,
+                &mut pattern.coup_pos,
             );
             let mut wx_scratch = faer::Mat::<f64>::zeros(n, 2);
             let out = pirls_solve_blocked_extras(
@@ -3835,10 +3834,10 @@ fn structured_panel_downdate_matches_scalar() {
         };
         let (scalar, u_scalar) = run(false);
         let (panel, u_panel) = run(true);
-        // Bit-exact pin on the scalar-arm return (`structured_extras_matches_packed`
+        // Pin on the scalar-arm return (`structured_extras_matches_packed`
         // states the contract). The panel arm rides the same generic kernel and is
         // held to `scalar` by the bands below.
-        assert_eq!(scalar, pin, "{label}: structured return moved");
+        assert_pinned_return(scalar, pin, label);
         assert_eq!(scalar.3, panel.3, "{label}: convergence flag");
         assert!(
             (scalar.0 - panel.0).abs() <= tol,
@@ -4528,11 +4527,11 @@ fn exact_profile_converges_from_lower_theta_warm_start() {
     const WIDE: [(f64, f64); 4] = [(0.7, 0.9), (1.0, 1.1), (0.5, 0.6), (0.45, 0.65)];
     assert_exact_profile_warm_start(logit_intercept_fixture, "logit", f64::NAN, &WIDE);
     assert_exact_profile_warm_start(probit_intercept_fixture, "probit", f64::NAN, &WIDE);
-    // `sim_nb` at a FIXED θ_NB near the optimum — one of the values the outer
-    // NB-θ bracket visits, not the fixture's own θ̂_NB — on the θ steps the θ-only
-    // search takes there (θ̂ ≈ 0.5742). Every one of these returned a non-finite
-    // value while the accept band charged neither endpoint's mode-consistency
-    // correction: the outer search read them as `inf`, stopped at θ = 0.5567 and
+    // `sim_nb` at a FIXED θ_NB near the optimum, not the fixture's own θ̂_NB,
+    // on the θ steps the θ-only search takes there (θ̂ ≈ 0.5742). Every one of
+    // these returned a non-finite value while the accept band charged neither
+    // endpoint's mode-consistency correction: the outer search read them as
+    // `inf`, stopped at θ = 0.5567 and
     // put β₀ 15% off lme4. The steps are deliberately small — the failure needs a
     // warm start already close to the mode, so a coarse pair like (0.5, 0.6) can
     // miss it.
@@ -4918,7 +4917,7 @@ fn pirls_packed_profile_beta_reaches_pql_stationarity() {
         packed,
         border:
             BorderScratch {
-                xtwx,
+                xtwx: _,
                 xtwm,
                 ainv_mtwx,
                 schur,
@@ -4941,7 +4940,6 @@ fn pirls_packed_profile_beta_reaches_pql_stationarity() {
         &mut beta,
         BetaStep::Profile {
             exact: None,
-            xtwx,
             xtwm,
             ainv_mtwx,
             schur,
@@ -5031,7 +5029,7 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         pirls,
         border:
             BorderScratch {
-                xtwx,
+                xtwx: _,
                 xtwm,
                 ainv_mtwx,
                 schur,
@@ -5054,7 +5052,6 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         &mut beta,
         BetaStep::Profile {
             exact: None,
-            xtwx,
             xtwm,
             ainv_mtwx,
             schur,
@@ -5112,6 +5109,11 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
 /// the packed `m_core_buf`/`cross_*` nonzeros) and bound ‖X'ρ‖∞ by 1e-6·n.
 /// Poisson-log is non-canonical, so the bound is deliberately loosened relative
 /// to the tight logit gates — tied to `pirls_tol`, never the PIRLS tolerance.
+/// Re-pinned 2026-10-02: `X'WX` is summed in row order in the β-Profile row
+/// pass instead of by a GEMM, and log links read `dμ/dη = μ` from the stored
+/// mean; the return moved by 1 to 3 ULP (`dev` by −5.7e-14, 1 ULP lower,
+/// `pen` and `logdet` 3 ULP each), `converged` unchanged, the stationarity
+/// bound above still met.
 #[test]
 fn pirls_structured_profile_beta_reaches_pql_stationarity() {
     let (model, ids, x, y, n, p) = grouseticks_3crossed_fixture();
@@ -5168,7 +5170,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             pattern,
             border:
                 BorderScratch {
-                    xtwx,
+                    xtwx: _,
                     xtwm,
                     ainv_mtwx,
                     schur,
@@ -5185,6 +5187,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             n,
             &mut pattern.coup_cols,
             &mut pattern.coup_ptr,
+            &mut pattern.coup_pos,
         );
         pirls_solve_blocked_extras(
             Family::Poisson {
@@ -5200,7 +5203,6 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             &mut beta,
             BetaStep::Profile {
                 exact: None,
-                xtwx,
                 xtwm,
                 ainv_mtwx,
                 schur,
@@ -5220,17 +5222,17 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
         )
     };
     assert!(out.3, "Profile-mode structured solve must converge");
-    // Bit-exact pin (`structured_extras_matches_packed` states the contract); the
+    // Pinned (`structured_extras_matches_packed` states the contract); the
     // stationarity bound below is a 1e-6·n band and cannot see a small move.
-    assert_eq!(
+    assert_pinned_return(
         out,
         (
-            259.1091786447751,
-            224.4136716318005,
-            189.17876051534208,
-            true
+            259.10917864477506,
+            224.41367163180058,
+            189.17876051534216,
+            true,
         ),
-        "structured return moved"
+        "Profile structured",
     );
     // Recompute ρ at the RETURNED (u, β): η = Xβ + Mu over the packed M nonzeros.
     // The eta/prob left in the workspace are the pre-step trial values, NOT the
@@ -5293,6 +5295,10 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
 /// BOTH in `BetaStep::Profile` from β = 0 and require the converged β to agree
 /// to ≤1e-8 rel. Guards a sign/transpose slip in exactly one variant — the
 /// structured Schur-border apply is the intricate one this catches.
+/// Re-pinned 2026-10-02: `X'WX` is summed in row order in the structured
+/// β-Profile row pass instead of by a GEMM; `dev` moved by 1 ULP (−1.4e-14),
+/// `pen` by 2 ULP, `logdet` unchanged, `converged` unchanged, the β agreement
+/// below still met.
 #[test]
 fn structured_profile_beta_matches_packed_profile() {
     let (xf64, y, ids, extra_ids, cluster) = glmm_extras_q1_dataset(0, 6);
@@ -5317,7 +5323,7 @@ fn structured_profile_beta_matches_packed_profile() {
             packed,
             border:
                 BorderScratch {
-                    xtwx,
+                    xtwx: _,
                     xtwm,
                     ainv_mtwx,
                     schur,
@@ -5340,7 +5346,6 @@ fn structured_profile_beta_matches_packed_profile() {
             &mut beta_packed,
             BetaStep::Profile {
                 exact: None,
-                xtwx,
                 xtwm,
                 ainv_mtwx,
                 schur,
@@ -5405,7 +5410,7 @@ fn structured_profile_beta_matches_packed_profile() {
             pattern,
             border:
                 BorderScratch {
-                    xtwx,
+                    xtwx: _,
                     xtwm,
                     ainv_mtwx,
                     schur,
@@ -5422,6 +5427,7 @@ fn structured_profile_beta_matches_packed_profile() {
             n,
             &mut pattern.coup_cols,
             &mut pattern.coup_ptr,
+            &mut pattern.coup_pos,
         );
         pirls_solve_blocked_extras(
             Family::Binomial {
@@ -5437,7 +5443,6 @@ fn structured_profile_beta_matches_packed_profile() {
             &mut beta_str,
             BetaStep::Profile {
                 exact: None,
-                xtwx,
                 xtwm,
                 ainv_mtwx,
                 schur,
@@ -5457,17 +5462,12 @@ fn structured_profile_beta_matches_packed_profile() {
         )
     };
     assert!(structured.3, "structured Profile solve must converge");
-    // Bit-exact pin (`structured_extras_matches_packed` states the contract); the
+    // Pinned (`structured_extras_matches_packed` states the contract); the
     // β comparison below is a 1e-8 relative band and cannot see a small move.
-    assert_eq!(
+    assert_pinned_return(
         structured,
-        (
-            124.69314344477421,
-            2.7692222052497977,
-            3.7225226795925,
-            true
-        ),
-        "structured return moved"
+        (124.6931434447742, 2.7692222052497986, 3.7225226795925, true),
+        "Profile structured vs packed",
     );
 
     for j in 0..p {
@@ -5721,6 +5721,273 @@ fn nb_workspace_carries_the_theta_nb_coordinate() {
     assert_eq!(&pois.upper_stage1[..], &pois.upper[..pois.n_theta]);
 }
 
+/// A converged search whose fixed-effect covariance cannot be formed keeps its
+/// estimates. An all-zero third column (`fit_glmm` runs no alias gate; the
+/// loop tier's `fit_on` reaches it the same way) leaves the β information with
+/// an exactly zero row, so the Rx Schur Cholesky fails, and under
+/// `WaldSe::Hessian` the joint Hessian fails before it: a deterministic double
+/// SE failure. The search on `Joint` (no β profile, which would need that
+/// Schur) converges regardless, to the optimum of the same data without the
+/// column. This is the note's only deterministic fixture: `fit_cold` drops an
+/// all-zero column at its alias gate, and the public inputs that do reach the
+/// note (Poisson counts near e³⁸, constant within each cluster, a
+/// cluster-level covariate, `WaldSe::Rx`) reach it only through cancellation
+/// in the Rx Schur, which comes out non-PD on some draws and PD on others.
+#[test]
+fn fit_glmm_se_failure_keeps_the_estimates() {
+    let (x2, y, ids) = glmm_intercept_dataset();
+    let n = x2.nrows();
+    let mut x3 = Mat::<f64>::zeros(n, 3);
+    for i in 0..n {
+        x3[(i, 0)] = x2[(i, 0)];
+        x3[(i, 1)] = x2[(i, 1)];
+    }
+    let spec = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+    let fit_on = |x: faer::MatRef<f64>, p: usize, wald: WaldSe| {
+        let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
+        ws.outer_search = OuterSearch::Joint;
+        let targets: Vec<u32> = (0..p as u32).collect();
+        let fit = fit_glmm(
+            &mut ws,
+            x,
+            &y,
+            &ids,
+            &[],
+            &targets,
+            None,
+            &vec![0.0; p],
+            n,
+            wald,
+            ColumnScaling::IDENTITY,
+        );
+        (fit, ws)
+    };
+    let (reference, ref_ws) = fit_on(x2.as_ref(), 2, WaldSe::Rx);
+    assert!(reference.converged && !reference.se_unavailable);
+    for wald in [WaldSe::Rx, WaldSe::Hessian] {
+        let (fit, ws) = fit_on(x3.as_ref(), 3, wald);
+        assert!(fit.converged, "{wald:?}: the search converged");
+        assert!(
+            fit.se_unavailable,
+            "{wald:?}: no covariance at the endpoint"
+        );
+        assert!(
+            !fit.hessian_fallback,
+            "{wald:?}: no fallback covariance either"
+        );
+        assert!(fit.joint_t_sq.is_nan());
+        for j in 0..3 {
+            assert!(
+                ws.inference.var_diag[j].is_nan() && ws.inference.t_sq[j].is_nan(),
+                "{wald:?}: var[{j}] {} t²[{j}] {}",
+                ws.inference.var_diag[j],
+                ws.inference.t_sq[j]
+            );
+        }
+        for a in 0..3 {
+            for b in 0..3 {
+                assert!(
+                    ws.inference.vcov[(a, b)].is_nan(),
+                    "{wald:?}: vcov[{a},{b}]"
+                );
+            }
+        }
+        assert!(
+            (fit.deviance - reference.deviance).abs() < 1e-8 * reference.deviance,
+            "{wald:?}: deviance {} against {}",
+            fit.deviance,
+            reference.deviance
+        );
+        for j in 0..2 {
+            let (a, b) = (ws.betas[j], ref_ws.betas[j]);
+            assert!(
+                (a - b).abs() < 1e-3 * b.abs(),
+                "{wald:?}: β[{j}] {a} against {b}"
+            );
+        }
+    }
+}
+
+/// The binomial random-intercept fit on `entangled_dyadic_designs` (20
+/// clusters): `X = [1, a, a + δb]`, `[1, a, b]` the same model with
+/// `β' = (β₀, β₁ + β₂, δβ₂)`.
+fn entangled_logit_fixture() -> (Mat<f64>, Mat<f64>, Vec<f64>, Vec<u32>, f64, ModelSpec) {
+    let n = 400;
+    let nc = 20usize;
+    let (xv, xrv, delta) = crate::fit::common_tests::entangled_dyadic_designs(n);
+    let mut st = 11u64;
+    let u: Vec<f64> = (0..nc)
+        .map(|_| crate::fit::common_tests::lcg(&mut st))
+        .collect();
+    let ids: Vec<u32> = (0..n as u32).map(|i| i % nc as u32).collect();
+    let mut x = Mat::<f64>::zeros(n, 3);
+    let mut xr = Mat::<f64>::zeros(n, 3);
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        for j in 0..3 {
+            x[(i, j)] = xv[3 * i + j];
+            xr[(i, j)] = xrv[3 * i + j];
+        }
+        let eta = 0.2 + 0.02 * xr[(i, 1)] + 0.02 * xr[(i, 2)] + u[ids[i] as usize];
+        let pr = 1.0 / (1.0 + (-eta).exp());
+        y[i] = if 0.5 * (crate::fit::common_tests::lcg(&mut st) + 1.0) < pr {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let spec = logit_intercept_spec(Sizing::FixedClusters {
+        n_clusters: nc as u32,
+    });
+    (x, xr, y, ids, delta, spec)
+}
+
+/// The joint Wald over all three coefficients, `β'·Cov⁻¹·β`, does not depend
+/// on the parametrization, so on [`entangled_logit_fixture`] it is computed on
+/// the well-conditioned design from `cov` there and `beta` mapped to it.
+fn entangled_wald_reference(cov: &Mat<f64>, beta: [f64; 3], delta: f64) -> f64 {
+    let b = [beta[0], beta[1] + beta[2], delta * beta[2]];
+    let mut sol = Mat::<f64>::from_fn(3, 1, |i, _| b[i]);
+    crate::linalg::SeqLlt::new(cov.as_ref())
+        .expect("a positive definite covariance")
+        .solve_in_place(sol.as_mut());
+    (0..3).map(|i| b[i] * sol[(i, 0)]).sum()
+}
+
+/// The Rx Schur on a nearly collinear design keeps its digits. On
+/// [`entangled_logit_fixture`] the fit's own Rx variance of the entangled
+/// coefficient must equal the variance read off the well-conditioned design
+/// `[1, a, b]` at the SAME fitted mode (`rx_cov_into` with only the
+/// fixed-effect design swapped: `η`, `W` and the random-effect factors are
+/// unchanged), mapped through the exact `1/δ²`; so must the joint Wald.
+/// Comparing at one point keeps the optimizer out of it. A Schur formed from
+/// the Gram of `X` misses by about `cond(X)²·ε`; `rx_schur_llt` rebuilds it on
+/// `X·U⁻¹`, and `joint_wald_chi_sq` reads the factor's columns without
+/// forming a Gram again.
+#[test]
+fn rx_schur_on_entangled_columns_keeps_its_digits() {
+    let (x, xr, y, ids, delta, spec) = entangled_logit_fixture();
+    let n = y.len();
+    let mut ws = GlmmWorkspace::for_cluster_spec(3, &spec, n, &[], 1);
+    let fit = fit_glmm(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &[],
+        &[0, 1, 2],
+        None,
+        &[0.0; 3],
+        n,
+        WaldSe::Rx,
+        ColumnScaling::IDENTITY,
+    );
+    assert!(fit.converged && !fit.se_unavailable);
+    assert!(
+        ws.params[0] > 0.1,
+        "an interior variance, θ = {}",
+        ws.params[0]
+    );
+    let var = ws.inference.var_diag[2];
+    let mut cov = Mat::<f64>::zeros(3, 3);
+    assert!(rx_cov_into(&mut ws, xr.as_ref(), &ids, 3, n, &mut cov));
+    let reference = cov[(2, 2)] / (delta * delta);
+    assert!(
+        (var - reference).abs() <= 1e-9 * reference,
+        "Var(β₂) {var} against {reference} (rel {:e})",
+        (var - reference).abs() / reference
+    );
+    let beta = [ws.betas[0], ws.betas[1], ws.betas[2]];
+    let w = entangled_wald_reference(&cov, beta, delta);
+    assert!(
+        (fit.joint_t_sq - w).abs() <= 1e-9 * w,
+        "joint Wald {} against {w}",
+        fit.joint_t_sq
+    );
+    // The Hessian arm's Rx fallback reads its joint Wald off the root
+    // `rx_cov_into` leaves in `cov_root`; a Cholesky of the covariance itself
+    // misses by about `cond(X)²·ε` (1e-5 here).
+    let mut raw = Mat::<f64>::zeros(3, 3);
+    assert!(rx_cov_into(&mut ws, x.as_ref(), &ids, 3, n, &mut raw));
+    let mut qr = Mat::<f64>::zeros(3, 3);
+    let mut z = [0.0; 3];
+    let w_root = crate::lmm::joint_wald_chi_sq(
+        ws.inference.cov_root.as_ref(),
+        &beta,
+        1.0,
+        &[0, 1, 2],
+        qr.as_mut(),
+        &mut z,
+    );
+    assert!(
+        (w_root - w).abs() <= 1e-9 * w,
+        "Rx-fallback joint Wald {w_root} against {w}"
+    );
+}
+
+/// The joint-Hessian standard errors on a nearly collinear design keep their
+/// digits. On [`entangled_logit_fixture`] the fit's Hessian variances and
+/// joint Wald must equal those of the well-conditioned design `[1, a, b]` at
+/// the same point (`joint_hessian_cov` on that design with β mapped to it).
+/// The Hessian's β block is a Gram in `X`, so on `X` itself it misses by
+/// about `cond(X)²·ε` (5e-4 here); `joint_hessian_cov` takes it in the
+/// search's own coordinates `β̃ = Lᵀβ` instead. Twice: on the blocked layout,
+/// and on the packed-row one with a random slope on `a` (column 1 of both
+/// designs), whose kernels must read that slope from `z_buf`, never from the
+/// orthogonalized design the Hessian differentiates.
+#[test]
+fn hessian_se_on_entangled_columns_keeps_its_digits() {
+    let (x, xr, y, ids, delta, spec) = entangled_logit_fixture();
+    let n = y.len();
+    for mut ws in [
+        GlmmWorkspace::for_cluster_spec(3, &spec, n, &[], 1),
+        GlmmWorkspace::for_cluster_spec_packed(3, &spec, n, &[1], 1),
+    ] {
+        fill_packed_cols(&mut ws, &ids, &[], n);
+        let fit = fit_glmm(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &[],
+            &[0, 1, 2],
+            None,
+            &[0.0; 3],
+            n,
+            WaldSe::Hessian,
+            ColumnScaling::IDENTITY,
+        );
+        let layout = ws.layout;
+        assert!(fit.converged && !fit.hessian_fallback, "{layout:?}");
+        let nt = ws.n_theta;
+        let beta = [ws.params[nt], ws.params[nt + 1], ws.params[nt + 2]];
+        ws.params[nt + 1] = beta[1] + beta[2];
+        ws.params[nt + 2] = delta * beta[2];
+        let mut cov = Mat::<f64>::zeros(3, 3);
+        let status = joint_hessian_cov(&mut ws, xr.as_ref(), &y, &ids, &[], 3, n, &mut cov);
+        assert_eq!(status, FdHessianStatus::Ok);
+        let reference = [
+            cov[(0, 0)],
+            cov[(1, 1)] - 2.0 * cov[(1, 2)] / delta + cov[(2, 2)] / (delta * delta),
+            cov[(2, 2)] / (delta * delta),
+        ];
+        for (j, &r) in reference.iter().enumerate() {
+            let v = ws.inference.var_diag[j];
+            assert!(
+                (v - r).abs() <= 1e-9 * r,
+                "{layout:?}: Var(β{j}) {v} against {r} (rel {:e})",
+                (v - r).abs() / r
+            );
+        }
+        let w = entangled_wald_reference(&cov, beta, delta);
+        assert!(
+            (fit.joint_t_sq - w).abs() <= 1e-9 * w,
+            "{layout:?}: joint Wald {} against {w}",
+            fit.joint_t_sq
+        );
+    }
+}
+
 /// Adversarial halving coverage. Runs a
 /// deliberately hostile fit both ways — single-stage (`outer_search =
 /// OuterSearch::Joint`, the trusted reference) and the shape's default route —
@@ -5730,6 +5997,8 @@ fn nb_workspace_carries_the_theta_nb_coordinate() {
 /// converged, agrees with it at ORACLE tolerances, or
 /// (b) it fails cleanly — `converged == false` with the whole inference output
 /// NaN (`nan_fit`), the terminal state an exhausted-halving PIRLS reaches.
+/// Only a failed search lands on (b): a covariance that cannot be formed at a
+/// converged endpoint NaNs the SEs and keeps the estimates, which is (a).
 /// A finite-but-wrong two-stage fit (converged, disagreeing with single-stage) is
 /// precisely the failure this gate exists to catch.
 #[allow(clippy::too_many_arguments)]
@@ -5743,6 +6012,7 @@ fn assert_two_stage_adversarial(
     n: usize,
     p: usize,
     theta_start: Option<&[f64]>,
+    offset: Option<&[f64]>,
     expect_converged: Option<bool>,
 ) {
     let targets = [if p >= 2 { 1u32 } else { 0u32 }];
@@ -5750,6 +6020,7 @@ fn assert_two_stage_adversarial(
 
     let mut ws1 = GlmmWorkspace::for_cluster_spec(p, spec, n, &[], 1);
     ws1.outer_search = OuterSearch::Joint; // pin the single-stage reference
+    ws1.offset = offset.map(<[f64]>::to_vec);
     let fit1 = fit_glmm(
         &mut ws1,
         x,
@@ -5767,6 +6038,7 @@ fn assert_two_stage_adversarial(
     // Second workspace keeps the constructor's default route — the A/B is
     // "default route vs `Joint`", not "PQL warm start vs `Joint`" specifically.
     let mut ws2 = GlmmWorkspace::for_cluster_spec(p, spec, n, &[], 1);
+    ws2.offset = offset.map(<[f64]>::to_vec);
     let fit2 = fit_glmm(
         &mut ws2,
         x,
@@ -5856,6 +6128,7 @@ fn two_stage_adversarial_bad_theta_start() {
         2,
         Some(&[100.0]),
         None,
+        None,
     );
 }
 
@@ -5865,11 +6138,10 @@ fn two_stage_adversarial_bad_theta_start() {
 /// in `fit_warm`), so this hits the ill-conditioned kernel directly. The
 /// `ExactProfile` attempt fails and the `PqlThenJoint` fallback's search
 /// converges to the `Joint` optimum (deviance equal to ~1e-11, β₁ ≈ −β₂ ≈
-/// 1.45e7: the near-duplicate column's own coefficient). Whether the fit then
-/// reports it depends on the Wald SE step: the β Schur complement is singular
-/// to rounding, and its Cholesky succeeds or fails on round-off between points
-/// a few 1e-6 apart in β (a failure NaN-fills the fit). So the outcome is not
-/// pinned; either surface the helper accepts is a pass.
+/// 1.45e7: the near-duplicate column's own coefficient). The β Schur
+/// complement is singular to rounding there, so whether its Cholesky succeeds
+/// is round-off between points a few 1e-6 apart in β; a failure NaNs the SEs
+/// alone, so the fit converges on both routes either way.
 #[test]
 fn two_stage_adversarial_near_collinear_x() {
     let (n, nc) = (80usize, 8usize);
@@ -5903,6 +6175,7 @@ fn two_stage_adversarial_near_collinear_x() {
         3,
         None,
         None,
+        Some(true),
     );
 }
 
@@ -5942,6 +6215,46 @@ fn two_stage_adversarial_tiny_clusters() {
         2,
         None,
         None,
+        None,
+    );
+}
+
+/// Adversarial: a Poisson random intercept with a one-row offset of 800, past
+/// the log link's η bound, so every PIRLS trial on that row is infeasible and
+/// each solve fails through the halving cap. The search fails on every route —
+/// the default `ExactProfile`, its `PqlThenJoint` fallback and the `Joint`
+/// reference alike — so this is the fixture that pins the helper's clean
+/// failure surface (`nan_fit`), independent of round-off.
+#[test]
+fn two_stage_adversarial_overflow_offset() {
+    let n = 30;
+    let mut x = Mat::<f64>::zeros(n, 2);
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = ((i * 7) % 11) as f64 / 10.0 - 0.5;
+        ids[i] = (i / 5) as u32;
+        y[i] = ((i * 3) % 5) as f64;
+    }
+    let mut offset = vec![0.0f64; n];
+    offset[10] = 800.0;
+    let mut spec = intercept_only_spec(Sizing::FixedClusters { n_clusters: 6 });
+    spec.family = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    assert_two_stage_adversarial(
+        "overflow_offset",
+        &spec,
+        x.as_ref(),
+        &y,
+        &ids,
+        &[],
+        n,
+        2,
+        None,
+        Some(&offset),
+        Some(false),
     );
 }
 
@@ -8127,13 +8440,14 @@ fn fit_glmm_vector_agq_keeps_search_lambda_at_pinned_diagonal() {
 }
 
 /// The predicate `fit_glmm` applies to its own BOBYQA outcome
-/// (`!(status == Converged && any_within(non_finite_points, x, rho_begin))`,
+/// (`!(status == Converged && any_within(non_finite_points, x, NON_FINITE_RADIUS))`,
 /// `glmm/mod.rs`), exercised on a plain 1-D `Bobyqa` run with no GLMM
-/// machinery. `f` is a smooth quadratic with its true minimum at 5.5, except a
-/// narrow `+INFINITY` band around 5.0 that sits inside `rho_begin` (1.0) of the
-/// minimum. The search still reports the true minimum as `Converged`, and
-/// `any_within` flags that the optimum sits next to a failed evaluation. A
-/// point outside `rho_begin` is not flagged. Only the predicate is tested here:
+/// machinery, at this test's own radius `config.rho_begin` (1.0). `f` is a
+/// smooth quadratic with its true minimum at 5.5, except a narrow `+INFINITY`
+/// band around 5.0 that sits inside that radius of the minimum. The search
+/// still reports the true minimum as `Converged`, and `any_within` flags that
+/// the optimum sits next to a failed evaluation. A point outside the radius is
+/// not flagged. Only the predicate is tested here:
 /// the fit-level status downgrade that consumes it has no test.
 #[test]
 fn any_within_flags_an_optimum_next_to_a_non_finite_eval() {
@@ -8201,4 +8515,162 @@ pub(crate) fn pinned_diagonal_fixture(seed: u64, shift: f64) -> (Vec<f64>, Vec<f
         y[i] = if lcg(&mut st) + 0.5 < p { 1.0 } else { 0.0 };
     }
     (x, y, ids)
+}
+
+/// Poisson counts near `e^c` with a cluster-level covariate `z` (`X = [1, z]`),
+/// 12 clusters `g` crossed with 5 levels `h`, and every layout that fits them
+/// with its `(θ, β)`: blocked `(1|g)`, and `(1|g) + (1|h)` on the structured
+/// and the packed layouts. Both columns of `X` lie almost in the span of `ZΛ`,
+/// and the crossed intercepts are confounded with the `g` intercepts, so `A`
+/// has an eigenvalue of exactly 1 next to ones of order `θ²·Σwᵢ` (1e11 at
+/// `c = 24`, 1e15 at `c = 33`).
+#[allow(clippy::type_complexity)]
+fn huge_count_cells(
+    c: f64,
+) -> (
+    Mat<f64>,
+    Vec<f64>,
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    [(&'static str, GlmmWorkspace, GlmmLayout, bool, [f64; 4]); 3],
+) {
+    let (n, n_g, n_h, p) = (120usize, 12usize, 5usize, 2usize);
+    let mut st = 9u64;
+    let b: Vec<f64> = (0..n_g).map(|_| lcg(&mut st)).collect();
+    let z: Vec<f64> = (0..n_g).map(|_| lcg(&mut st)).collect();
+    let d: Vec<f64> = (0..n_h).map(|_| 0.3 * lcg(&mut st)).collect();
+    let (mut g, mut h) = (vec![0u32; n], vec![0u32; n]);
+    let mut x = Mat::<f64>::zeros(n, p);
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        let k = i % n_g;
+        g[i] = k as u32;
+        h[i] = ((i / n_g) % n_h) as u32;
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = z[k];
+        y[i] = (c + 0.5 * z[k] + b[k] + d[h[i] as usize]).exp().round();
+    }
+    let spec = |crossed: bool| ModelSpec {
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g as u32,
+            },
+            slopes: vec![],
+            extra_groupings: if crossed {
+                vec![Grouping {
+                    relation: GroupingRelation::Crossed {
+                        n_clusters: n_h as u32,
+                    },
+                    slopes: vec![],
+                }]
+            } else {
+                vec![]
+            },
+        }),
+    };
+    let extra = vec![h];
+    let blocked = GlmmWorkspace::for_cluster_spec(p, &spec(false), n, &[], 1);
+    let mut structured = GlmmWorkspace::for_cluster_spec(p, &spec(true), n, &[], 1);
+    structured.pattern.structured_schur =
+        StructuredSchur::new(&structured.groupings, &g, &extra, n);
+    let mut packed = GlmmWorkspace::for_cluster_spec_packed(p, &spec(true), n, &[], 1);
+    fill_packed_cols(&mut packed, &g, &extra, n);
+    // Blocked params are `[θ_g, β₀, β₁]`, the fourth slot unread.
+    let cells = [
+        (
+            "blocked",
+            blocked,
+            GlmmLayout::Blocked,
+            false,
+            [1.0, c, 0.5, 0.0],
+        ),
+        (
+            "structured",
+            structured,
+            GlmmLayout::Structured,
+            true,
+            [1.0, 0.3, c, 0.5],
+        ),
+        (
+            "packed",
+            packed,
+            GlmmLayout::Packed,
+            true,
+            [1.0, 0.3, c, 0.5],
+        ),
+    ];
+    (x, y, g, extra, cells)
+}
+
+/// The Rx β information keeps its digits where it is a small remainder of
+/// `X'W̃X`: [`huge_count_cells`] at `c = 24`, `θ²·Σwᵢ` of order 1e11, where
+/// `S = X'W̃X − X'W̃M·A⁻¹M'W̃X` is a remainder of that order. Evaluated at a
+/// fixed `(θ, β)`, so no search is involved, on every Schur fill.
+/// Reference: the same covariance with the modes and `S` in 60-digit mpmath
+/// from this fixture's `y`. Measured: 2e-16 blocked, 4e-11 structured, 3e-10
+/// packed; forming `S` by the subtraction is 4.4e-5 to 4.7e-5 off on all
+/// three. On the crossed layouts the remaining error is the inner solve's:
+/// `A` itself has condition about `θ²·Σwᵢ` there, which `S` feels only to
+/// second order.
+#[test]
+fn rx_cov_keeps_its_digits_for_a_cluster_level_covariate_at_huge_counts() {
+    // mpmath 1.3.0, dps 60, at the f64 values of the (θ, β) below.
+    const BLOCKED: [f64; 2] = [0.291_336_336_505_089_3, 0.903_514_010_119_972_8];
+    const CROSSED: [f64; 2] = [0.320_744_229_828_393_9, 0.903_514_010_119_972_8];
+    let p = 2usize;
+    let (x, y, g, extra, cells) = huge_count_cells(24.0);
+    let n = y.len();
+    for (label, mut ws, layout, crossed, params) in cells {
+        assert_eq!(ws.layout, layout, "{label}");
+        let (extra_ids, params, want) = if crossed {
+            (&extra[..], &params[..], CROSSED)
+        } else {
+            (&[][..], &params[..3], BLOCKED)
+        };
+        let dev = glmm_laplace_deviance(params, &mut ws, x.as_ref(), &y, &g, extra_ids, n);
+        assert!(dev.is_finite(), "{label}: deviance {dev}");
+        let mut cov = Mat::<f64>::zeros(p, p);
+        let ok = rx_cov_into(&mut ws, x.as_ref(), &g, p, n, &mut cov);
+        assert!(ok, "{label}: the Rx Schur must stay positive definite");
+        for j in 0..p {
+            let se = cov[(j, j)].sqrt();
+            let rel = (se / want[j] - 1.0).abs();
+            assert!(
+                rel < 1e-8,
+                "{label}: SE[{j}] {se} vs {} (rel {rel:.2e})",
+                want[j]
+            );
+        }
+    }
+}
+
+/// PIRLS from `û = 0` converges on the crossed layouts at `θ²·Σwᵢ ≈ 1e15`
+/// ([`huge_count_cells`] at `c = 33`): with the u-step taken as
+/// `u_new = A⁻¹((A − I)·u + M'ρ)`, the rounding of `(A − I)·u` moved `‖u‖²` by
+/// 3e-3 between iterates along `A`'s unit eigenvector, the solve ran out its
+/// halvings and the deviance came back `inf`. What is left is `log|A|`'s own
+/// rounding on that eigenvalue: the two layouts measured 560.7352 and 560.6791.
+#[test]
+fn crossed_pirls_converges_at_huge_counts() {
+    let (x, y, g, extra, cells) = huge_count_cells(33.0);
+    let n = y.len();
+    let mut devs = Vec::new();
+    for (label, mut ws, layout, crossed, params) in cells {
+        if !crossed {
+            continue;
+        }
+        assert_eq!(ws.layout, layout, "{label}");
+        let dev = glmm_laplace_deviance(&params, &mut ws, x.as_ref(), &y, &g, &extra, n);
+        assert!(dev.is_finite(), "{label}: deviance {dev}");
+        devs.push(dev);
+    }
+    assert!(
+        (devs[0] - devs[1]).abs() < 0.1,
+        "structured {} vs packed {}",
+        devs[0],
+        devs[1]
+    );
 }

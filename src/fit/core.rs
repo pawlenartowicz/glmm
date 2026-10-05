@@ -17,7 +17,7 @@ use faer::Mat;
 use crate::glmm::GlmmWorkspace;
 use crate::lmm::{LmmGroupings, LmmWorkspace};
 use crate::standardize::ColumnScaling;
-use crate::{BinomialLink, Family, GroupIds, GroupingRelation, ModelSpec, StartValues};
+use crate::{BinomialLink, Family, GroupIds, GroupingRelation, ModelSpec, Note, StartValues};
 
 use super::common::{
     assert_group_ids, assert_model_shape, fill_col_major_std, start_to_design, theta_width,
@@ -156,10 +156,40 @@ impl FitView<'_> {
             // `singular` also carries the negligible-component check `into_fit`
             // applies to the other arms afterwards, so it is at least as
             // inclusive.
-            FitViewKind::Prebuilt { fit, .. } => FitDiagnostics {
-                boundary_hit: fit.singular() as u8,
-                ..FitDiagnostics::fixed_only(fit.converged())
-            },
+            FitViewKind::Prebuilt { fit, .. } => {
+                let mut d = FitDiagnostics {
+                    boundary_hit: fit.singular() as u8,
+                    ..FitDiagnostics::fixed_only(fit.converged())
+                };
+                // The inverse of `common::materialize_diagnostics`: every note it
+                // raises off a carrier field sets that field back — change
+                // together. Walking the notes reads the `Vec`, it allocates
+                // nothing.
+                for note in &fit.diagnostics.notes {
+                    match note {
+                        Note::IllConditioned { columns, pivot } => {
+                            d.ill_conditioned = true;
+                            d.pivot = *pivot;
+                            d.pivot_col = columns[0];
+                        }
+                        Note::PirlsExhausted { evals, final_eval } => {
+                            d.pirls_exhausted = *evals;
+                            d.final_pirls_exhausted = *final_eval;
+                        }
+                        Note::HessianSeFallback => d.hessian_fallback = true,
+                        Note::ExactProfileFallback => d.exact_profile_fallback = true,
+                        Note::SeUnavailable => d.se_unavailable = true,
+                        Note::PrecisionLimited => d.precision_limited = true,
+                        Note::Separated => d.separated = true,
+                        // No carrier field.
+                        Note::NbShapeUnsettled { .. }
+                        | Note::UnusedGroupingLevels { .. }
+                        | Note::NonIntegerResponse { .. }
+                        | Note::SingleLevelGroupingDropped { .. } => {}
+                    }
+                }
+                d
+            }
         }
     }
 
@@ -447,6 +477,16 @@ pub struct FitWorkspace {
     scaling: ColumnScaling,
     /// Skip the per-draw standardization ([`FitWorkspace::set_prestandardized`]).
     prestandardized: bool,
+    /// The caller's fixed-design promise ([`FitWorkspace::set_fixed_design`]).
+    fixed_design: bool,
+    /// Row count of the design the workspace holds the setup of (column
+    /// statistics, `x_mat`, the LMM design statistics), set by a full setup
+    /// while `fixed_design` is on; `None` when there is none to reuse.
+    design_rows: Option<usize>,
+    /// Debug builds: a hash of the `x`, ids and weights of the last full setup
+    /// under the fixed-design promise ([`FitWorkspace::check_fixed_design`]).
+    #[cfg(debug_assertions)]
+    design_hash: u64,
     /// Storage for [`FitView::betas_caller`], as long as the OLS/GLM kernels'
     /// β slices (`p.max(1)`).
     beta_caller: Vec<f64>,
@@ -490,18 +530,20 @@ enum FitKind {
     Glmm {
         ws: GlmmWorkspace,
     },
-    /// Routes whose kernel allocates per call and returns a fully-assembled
-    /// `Fit`: the NB routes (GLM-NB, GLMM-NB), which search `ln θ_NB` as an
-    /// outer coordinate. `build_workspace` pins the exact kernel here (classify
-    /// once), but the buffers are still allocated per call inside `fit_on` —
-    /// these routes get the routing guarantee without the workspace-reuse win.
+    /// Routes whose kernel returns a fully-assembled `Fit`: the NB routes
+    /// (GLM-NB, GLMM-NB), which search `ln θ_NB` as an outer coordinate.
+    /// `build_workspace` pins the exact kernel here (classify once). The
+    /// GLMM-NB route also keeps its `GlmmWorkspace` here, built once; the
+    /// GLM-NB route still allocates its buffers per call inside `fit_on`.
     Prebuilt(PrebuiltRoute),
 }
 
-#[derive(Clone, Copy)]
 enum PrebuiltRoute {
     GlmNb,
-    GlmmNb,
+    /// The GLMM-NB kernel's `GlmmWorkspace`, built once here and reused by
+    /// every draw (`fit::glmm::fit_glmm_nb`), as the `Glmm` arm reuses its
+    /// own; the fit still comes back as an assembled `Fit`.
+    GlmmNb(Box<GlmmWorkspace>),
 }
 
 impl FitKind {
@@ -525,6 +567,52 @@ impl FitWorkspace {
     /// `fit_cold`/`fit_warm` always standardize.
     pub fn set_prestandardized(&mut self, on: bool) {
         self.prestandardized = on;
+        self.design_rows = None;
+    }
+
+    /// Promise that every following [`fit_on`] call passes the same design
+    /// `x`, the same group ids and the same weights as the call that ran the
+    /// last full setup, with only `y` (and an offset) changing: the per-draw
+    /// setup that depends on the design alone (column statistics, the
+    /// standardized copy of `x`, and on the dense LMM route the fixed-effect
+    /// factor and the design part of the sufficient statistics) is then
+    /// computed once and reused. The first call after this one runs the full
+    /// setup, and so does a call with another row count `n`, which then
+    /// becomes the new reference. The answer is bit-identical to a fit
+    /// without the promise. A release build does not check it: a caller that
+    /// changes `x`, the ids or the weights at the same `n` while it is on gets
+    /// a wrong fit (the old column statistics and design factor mixed with the
+    /// new rows). A debug build hashes them on every call and panics on a
+    /// change. `false` (the default) drops the cached setup. Loop tier only.
+    pub fn set_fixed_design(&mut self, on: bool) {
+        self.fixed_design = on;
+        self.design_rows = None;
+    }
+
+    /// Debug builds: under the fixed-design promise, panics when this call's
+    /// `x`, ids or weights differ from those of the last full setup, compared
+    /// by a hash (no copy of the design is kept).
+    #[cfg(debug_assertions)]
+    fn check_fixed_design(&mut self, x: &[f64], ids: &GroupIds, weights: Option<&[f64]>, n: usize) {
+        use std::hash::{Hash, Hasher};
+        if !self.fixed_design {
+            return;
+        }
+        let mut h = std::hash::DefaultHasher::new();
+        x.iter().for_each(|v| v.to_bits().hash(&mut h));
+        ids.primary.hash(&mut h);
+        ids.extra.hash(&mut h);
+        if let Some(w) = weights {
+            w.iter().for_each(|v| v.to_bits().hash(&mut h));
+        }
+        let h = h.finish();
+        if self.design_rows == Some(n) {
+            assert_eq!(
+                h, self.design_hash,
+                "fit_on: set_fixed_design(true) promises the x, ids and weights of the last full setup, and this call's differ"
+            );
+        }
+        self.design_hash = h;
     }
 }
 
@@ -571,6 +659,17 @@ impl FitWorkspace {
     }
     pub(crate) fn is_prebuilt(&self) -> bool {
         matches!(self.kind, FitKind::Prebuilt(_))
+    }
+    /// Whether a GLMM fit on this workspace had its warm θ₀ kept by the start
+    /// guard: only then does `fit_glmm` build the warm stage-1 solver
+    /// (`GlmmWorkspace::solver_stage1_warm`). `false` on every non-GLMM
+    /// workspace.
+    pub(crate) fn glmm_guard_kept_warm_start(&self) -> bool {
+        match &self.kind {
+            FitKind::Glmm { ws } => ws.solver_stage1_warm.is_some(),
+            FitKind::Prebuilt(PrebuiltRoute::GlmmNb(ws)) => ws.solver_stage1_warm.is_some(),
+            _ => false,
+        }
     }
 }
 
@@ -643,7 +742,16 @@ pub fn build_workspace(
                     ),
                     y_shifted: vec![0.0f64; n_max.max(1)],
                 },
-                Family::NegativeBinomial { .. } => FitKind::Prebuilt(PrebuiltRoute::GlmmNb),
+                Family::NegativeBinomial { .. } => FitKind::Prebuilt(PrebuiltRoute::GlmmNb(
+                    Box::new(GlmmWorkspace::for_cluster_spec_ext(
+                        p,
+                        &super::glmm::nb_spec(sized),
+                        n_max,
+                        &slope_cols,
+                        &extra_slope_cols,
+                        opts.nagq,
+                    )),
+                )),
                 _ => {
                     let ws = GlmmWorkspace::for_cluster_spec_ext(
                         p,
@@ -672,9 +780,10 @@ pub fn build_workspace(
     // level count, a nested one owns parents × children-per-parent. The `.max(1)`
     // mirrors the builders' own clamps (`LmmGroupings::from_cluster_spec_ext`), so
     // a hand-built spec declaring 0 does not get a capacity below its real width.
-    // The pin is route-agnostic even though only the dense routes preallocate: the
-    // sparse/NB `Prebuilt` routes build per call, but from `ws.sized` — the BUILD
-    // shape — so an over-capacity draw is undersized there too.
+    // The pin is route-agnostic even though only the dense routes and the GLMM-NB
+    // route preallocate: the sparse and GLM-NB routes build per call, but from
+    // `ws.sized` (the BUILD shape), so an over-capacity draw is undersized there
+    // too.
     let build_extra_capacity: Vec<usize> = sized
         .re
         .as_ref()
@@ -714,6 +823,10 @@ pub fn build_workspace(
         theta_declared_buf: vec![0.0; n_theta],
         scaling: ColumnScaling::with_re_slopes(p, re_slope_columns(sized)),
         prestandardized: false,
+        fixed_design: false,
+        design_rows: None,
+        #[cfg(debug_assertions)]
+        design_hash: 0,
         beta_caller: vec![0.0; p.max(1)],
         re_map_scratch: vec![0.0; re_len],
         x_mat: Mat::<f64>::zeros(n_max.max(1), p.max(1)),
@@ -825,10 +938,14 @@ pub fn fit_on<'a>(
         }
     }
 
+    #[cfg(debug_assertions)]
+    ws.check_fixed_design(x, ids, opts.weights.as_deref(), n);
     let FitWorkspace {
         kind,
         scaling,
         prestandardized,
+        fixed_design,
+        design_rows,
         theta_declared_buf,
         beta_caller,
         re_map_scratch,
@@ -843,9 +960,15 @@ pub fn fit_on<'a>(
 
     // Column statistics for this draw, once, before any route reads X: the fit
     // runs on x̃ = (x − m)/s and reports through B and N (`standardize`).
-    scaling.compute(x, n, p, opts.weights.as_deref(), !*prestandardized);
+    // Under the fixed-design promise both, and the LMM design statistics
+    // below, are the previous call's.
+    let same_design = *fixed_design && *design_rows == Some(n);
+    if !same_design {
+        scaling.compute(x, n, p, opts.weights.as_deref(), !*prestandardized);
+        fill_col_major_std(x_mat, x, n, p, scaling);
+        *design_rows = fixed_design.then_some(n);
+    }
     let scaling: &'a ColumnScaling = scaling;
-    fill_col_major_std(x_mat, x, n, p, scaling);
     let x_mat = x_mat.as_ref().subrows(0, n);
 
     // Starts arrive in the caller's units and DECLARATION order — the order
@@ -896,6 +1019,7 @@ pub fn fit_on<'a>(
             opts,
             buf,
             scaling,
+            None,
         )),
         FitKind::Lmm {
             ws: lmm_ws,
@@ -927,6 +1051,7 @@ pub fn fit_on<'a>(
                 &ids.primary,
                 &ids.extra,
                 opts.weights.as_deref(),
+                same_design,
             );
             FitViewKind::Lmm(super::lmm::lmm_run_on(
                 lmm_ws,
@@ -965,7 +1090,8 @@ pub fn fit_on<'a>(
         // on the `FitWorkspace`, and `fit_glmm_nb` maps it.
         FitKind::Prebuilt(route) => prebuilt_kind(match route {
             PrebuiltRoute::GlmNb => super::glm::fit_glm_nb(x_mat, y, n, p, None, opts, scaling).0,
-            PrebuiltRoute::GlmmNb => super::glmm::fit_glmm_nb(
+            PrebuiltRoute::GlmmNb(nb_ws) => super::glmm::fit_glmm_nb(
+                nb_ws,
                 x_mat,
                 y,
                 n,

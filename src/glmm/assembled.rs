@@ -74,9 +74,8 @@ use super::workspace::{
     glmm_block_chol, glmm_block_solve, glmm_block_solve_sub, packed_m_theta_deriv, tail_components,
     GlmmLayout, GlmmWorkspace, StructuredPattern,
 };
-// Named only in this file's `#[cfg(test)]` instrument (`gradient_f64`), which
-// destructures `ws.pirls`/`ws.structured` field-by-field.
-#[cfg(test)]
+// Named only in `gradient_f64`, which destructures `ws.pirls`/`ws.structured`
+// field-by-field.
 use super::workspace::{PirlsScratch, StructuredScratch};
 
 /// Everything the assembly writes that is longer than a stack array, sized
@@ -95,13 +94,14 @@ use super::workspace::{PirlsScratch, StructuredScratch};
 /// `tail_inv` `(e²).max(1)`, `tail_col` `e.max(1)`, the tail-component
 /// scratch `comp_parent`/`comp_cols` `e` and `comp_ptr` `e + 1`, the four row vectors
 /// `rows`, `d_gamma`/`l_gamma` `m`, `d_u`/`l_u`/`adj` `k.max(1)`, `g_gamma`
-/// `(m·k).max(1)`, the four crossed-tail reducer temporaries `e.max(1)`, and
-/// the observed factor `(s·q_core²).max(1)` / `(q_core·s·e).max(1)` /
-/// `(e²).max(1)` on every shape, canonical or not — the same three shapes `DualStep`'s own
-/// twin carries, which stays sized to zero on canonical links through
-/// `pirls::obs_len`: that twin serves the kernel's own inexact step on a
-/// clamped canonical fit, which the settle loop in `run_assembled_hessian`
-/// resolves, not this buffer.
+/// `(m·k).max(1)`, the crossed-tail forms `tail_h`
+/// ([`coupling_len`](super::workspace::coupling_len)) and
+/// `tail_g` `(s·q_core²).max(1)`, and the observed factor `(s·q_core²).max(1)` /
+/// `coupling_len` / `(e²).max(1)` on every shape, canonical or not — the
+/// same three shapes `DualStep`'s own twin carries, which stays sized to zero on
+/// canonical links through `pirls::obs_len`: that twin serves the kernel's own
+/// inexact step on a clamped canonical fit, which the settle loop in
+/// `run_assembled_hessian` resolves, not this buffer.
 pub(crate) struct AssemblyBufs<T: Scalar> {
     pub(super) tail_inv: Vec<T>,
     pub(super) tail_col: Vec<T>,
@@ -118,10 +118,13 @@ pub(crate) struct AssemblyBufs<T: Scalar> {
     pub(super) l_u: Vec<T>,
     pub(super) g_gamma: Vec<T>,
     pub(super) adj: Vec<T>,
-    pub(super) rb: Vec<T>,
-    pub(super) sb: Vec<T>,
-    pub(super) ra: Vec<T>,
-    pub(super) sa: Vec<T>,
+    /// `H_f = C_f S⁻¹` on cluster `f`'s coupling columns only, in `coupling`'s
+    /// compact layout: `H_f[l][j]` at `q_core·coup_ptr[f] + l·|cols_f| + j`,
+    /// `j` the column's position in `cols_f = coup_cols[coup_ptr[f]..coup_ptr[f + 1]]`;
+    /// and `s·q_core²`, `G_f = C_f S⁻¹ C_f'` per cluster: the per-cluster forms
+    /// the row passes read the crossed-tail bilinear forms off (see `assemble`).
+    pub(super) tail_h: Vec<T>,
+    pub(super) tail_g: Vec<T>,
     pub(super) obs_core: Vec<T>,
     pub(super) obs_coup: Vec<T>,
     pub(super) obs_schur: Vec<T>,
@@ -137,7 +140,8 @@ pub(crate) struct AssemblyBufs<T: Scalar> {
 /// alone — and `A⁻¹` is therefore formed ONCE per assembly rather than applied
 /// per row: `k³` for the inverse against `width²` per row per bilinear pair,
 /// where the blocked and structured routes pay `q²/2` per row per vector
-/// instead (see [`structured_row_reduce`]). At `k ≤ 356` and `width ≤ 8`
+/// instead (`block_forward_solve`, and [`assemble`]'s per-cluster tail forms).
+/// At `k ≤ 356` and `width ≤ 8`
 /// across the corpus that trade is the cheap side by orders of magnitude.
 ///
 /// The evaluation state (`m_vals`, `eta`, `prob`, `w`, `u`) is held here on
@@ -236,10 +240,8 @@ impl<T: Scalar> AssemblyBufs<T> {
             l_u: Vec::new(),
             g_gamma: Vec::new(),
             adj: Vec::new(),
-            rb: Vec::new(),
-            sb: Vec::new(),
-            ra: Vec::new(),
-            sa: Vec::new(),
+            tail_h: Vec::new(),
+            tail_g: Vec::new(),
             obs_core: Vec::new(),
             obs_coup: Vec::new(),
             obs_schur: Vec::new(),
@@ -300,12 +302,10 @@ impl<T: Scalar> AssemblyBufs<T> {
             l_u: vec![T::ZERO; kk],
             g_gamma: vec![T::ZERO; (m * k).max(1)],
             adj: vec![T::ZERO; kk],
-            rb: vec![T::ZERO; ee],
-            sb: vec![T::ZERO; ee],
-            ra: vec![T::ZERO; ee],
-            sa: vec![T::ZERO; ee],
+            tail_h: vec![T::ZERO; super::workspace::coupling_len(rows, s, q_core, e)],
+            tail_g: vec![T::ZERO; (s * q_core * q_core).max(1)],
             obs_core: vec![T::ZERO; (s * q_core * q_core).max(1)],
-            obs_coup: vec![T::ZERO; (q_core * s * e).max(1)],
+            obs_coup: vec![T::ZERO; super::workspace::coupling_len(rows, s, q_core, e)],
             obs_schur: vec![T::ZERO; (e * e).max(1)],
             packed,
         }
@@ -323,79 +323,6 @@ impl<T: Scalar> AssemblyBufs<T> {
     /// beside [`AssemblyBufs::packed_len`].
     pub(crate) fn packed_obs_len(&self) -> usize {
         self.packed.obs.len()
-    }
-}
-
-/// Applies the structured-extras cluster factor `A_f⁻¹` to one row's
-/// `m_i = (m_{c,i}, m_{x,i})` through the block-inverse identity for
-/// `A_f = [[D_f, C_f], [C_f', S]]` (Harville, D.A. (1997), *Matrix Algebra
-/// From a Statistician's Perspective*, Springer, ch. 8):
-///
-/// ```text
-///   A_f⁻¹ m_i = ( D_f⁻¹m_{c,i} − D_f⁻¹C_f·S⁻¹r_i ,  S⁻¹r_i ),
-///   r_i = C_f'(D_f⁻¹m_{c,i}) − m_{x,i}
-/// ```
-///
-/// so any bilinear form `m_i'A_f⁻¹m_j` over rows of the SAME cluster reduces
-/// to two dots once each row has run through here once: `m_{c,i}'D_f⁻¹m_{c,j}
-/// + r_i'S⁻¹r_j = y_i·m_{c,j} + sr_i·r_j`, using either row's own `y`/`sr` and
-/// the other row's raw `m_c`/`r`. This function produces one row's
-/// `(y_i, r_i, S⁻¹r_i)`: `y_i = D_f⁻¹m_{c,i}` (the full solve `glmm_block_solve`
-/// runs against the cluster's factored core `fac`), and `r_i`/`S⁻¹r_i`
-/// (`r`/`sr` out params) written only at `cols`, cluster `f`'s crossed
-/// coupling columns (a strict superset of row `i`'s own crossed columns as
-/// soon as `f` spans more than one crossed level).
-///
-/// Every entry of `r`/`sr` outside `cols` is left untouched and must not be
-/// read. `cross_col`/`cross_val` are row `i`'s own nonzero crossed entries:
-/// the packed builder's first `n_cross[i]` columns for this row, not the
-/// `g_cap`-wide per-row block it packs them into.
-///
-/// `S` is supplied pre-inverted as `tail_inv` (column-major, `tail_inv[b·e+a]
-/// = (S⁻¹)_{a,b}`) — the caller runs `e` `TailKernel::tail_solve` calls once
-/// per cluster factor, not once per row, exactly as `blocked_extras.rs`'s pass
-/// A does. Mirrors the blocked reducer (`block_forward_solve`) — change
-/// together on the shared block-inverse identity.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn structured_row_reduce<T: Scalar>(
-    fac: &[T],
-    qc: usize,
-    m_c: &[T],
-    coupling: &[T],
-    e: usize,
-    cols: &[u32],
-    cross_col: &[u32],
-    cross_val: &[T],
-    tail_inv: &[T],
-    y: &mut [T],
-    r: &mut [T],
-    sr: &mut [T],
-) {
-    y[..qc].copy_from_slice(&m_c[..qc]);
-    glmm_block_solve(fac, qc, &mut y[..qc]);
-    if cols.is_empty() {
-        return;
-    }
-    for &b in cols {
-        let b = b as usize;
-        let mut acc = T::ZERO;
-        for local in 0..qc {
-            acc += coupling[local * e + b] * y[local];
-        }
-        r[b] = acc;
-    }
-    for (&col, &val) in cross_col.iter().zip(cross_val) {
-        r[col as usize] -= val;
-    }
-    for &b in cols {
-        let b = b as usize;
-        let col = &tail_inv[b * e..b * e + e];
-        let mut acc = T::ZERO;
-        for &az in cols {
-            let az = az as usize;
-            acc += r[az] * col[az];
-        }
-        sr[b] = acc;
     }
 }
 
@@ -596,10 +523,12 @@ pub(crate) fn eta_clamped_rows(family: Family, eta: &[f64]) -> usize {
 /// owns its scratch: the shape-sized [`AssemblyBufs`] every other caller reads
 /// off the dual scratch has no `f64` variant there.
 ///
-/// A test instrument, not a fit-path entry: it checks the assembly at
+/// Two callers: the NB dispersion row of the joint Hessian
+/// (`se::joint_hessian_cov_at`, `DispRow::Nb`), which differences this exact
+/// gradient in `ln θ_NB`, and the tests, which check the assembly at
 /// `T = f64` against the dual-lane gradient (`laplace_gradient`) as an
-/// independent way of differentiating the same objective once. Production
-/// reaches this assembly only through [`joint_hessian`].
+/// independent way of differentiating the same objective once. The rest of
+/// production reaches this assembly through [`joint_hessian`].
 ///
 /// Solves the conditional mode once, then runs three row passes over the
 /// buffers the solve left behind (no second solve, no dual lanes):
@@ -621,7 +550,6 @@ pub(crate) fn eta_clamped_rows(family: Family, eta: &[f64]) -> usize {
 /// The workspace comes back as found: `u` is snapshotted before the mode solve
 /// and restored after, and the solve's PIRLS counters are thrown away so the
 /// `pirls_hist`-sum == `n_eval` invariant keeps holding.
-#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gradient_f64(
     ws: &mut GlmmWorkspace,
@@ -702,6 +630,7 @@ pub(crate) fn gradient_f64(
                 n_cross,
                 coup_cols,
                 coup_ptr,
+                coup_pos,
                 ..
             },
         ..
@@ -741,6 +670,7 @@ pub(crate) fn gradient_f64(
         n_cross,
         coup_cols,
         coup_ptr,
+        coup_pos,
         n_theta,
         p,
         n,
@@ -1179,6 +1109,7 @@ fn run_assembled_hessian<T: Seed>(
                 &pattern.n_cross,
                 &pattern.coup_cols,
                 &pattern.coup_ptr,
+                &pattern.coup_pos,
                 n_theta,
                 p,
                 n,
@@ -1282,6 +1213,7 @@ fn assemble<T: TailKernel>(
     n_cross: &[u8],
     coup_cols: &[u32],
     coup_ptr: &[u32],
+    coup_pos: &[u32],
     n_theta: usize,
     p: usize,
     n: usize,
@@ -1330,10 +1262,8 @@ fn assemble<T: TailKernel>(
         // `G_γ` row-major, `g_gamma[a·k + c] = ∂G_c/∂γ_a`.
         g_gamma,
         adj,
-        rb,
-        sb,
-        ra,
-        sa,
+        tail_h,
+        tail_g,
         obs_core,
         obs_coup,
         obs_schur,
@@ -1374,6 +1304,111 @@ fn assemble<T: TailKernel>(
         }
     }
 
+    // The structured-extras system is `A = [[D, C], [C', E+I]]`: `D` block
+    // diagonal over the clusters (cluster `f`'s core block `D_f`, identity
+    // included), `C_f` cluster `f`'s coupling to the crossed tail, `E+I` the
+    // tail's own block. `S = (E+I) − Σ_f C_f'D_f⁻¹C_f` is the tail's Schur
+    // complement (`schur_blk`), handed in pre-inverted (`tail_inv`,
+    // column-major, `tail_inv[b·e + a] = (S⁻¹)_{a,b}`). By the block-inverse
+    // identity (Harville, D.A. (1997), *Matrix Algebra From a Statistician's
+    // Perspective*, Springer, ch. 8), a bilinear form over two rows `i`, `j` of
+    // the same cluster `f` is
+    //
+    //   mᵢ'A⁻¹mⱼ = yᵢ'm_{c,j} + rᵢ'S⁻¹rⱼ,
+    //   yᵢ = D_f⁻¹m_{c,i},   rᵢ = C_f'yᵢ − tᵢ,
+    //
+    // `tᵢ` the row's own crossed entries. Expanding the tail term with
+    // `H_f = C_f S⁻¹` (`q_core × e`) and `G_f = H_f C_f' = C_f S⁻¹ C_f'`
+    // (`q_core × q_core`), `S⁻¹` symmetric:
+    //
+    //   rᵢ'S⁻¹rⱼ = yᵢ'G_f yⱼ − yᵢ'(H_f tⱼ) − yⱼ'(H_f tᵢ) + tᵢ'S⁻¹tⱼ.
+    //
+    // `H_f` and `G_f` are formed once per cluster per assembly (`tail_h` on
+    // cluster `f`'s coupling columns only, compact — see `AssemblyBufs`;
+    // `tail_g` per cluster), so a row pays `q_core² + 2·q_core·ncz + ncz²`
+    // instead of a walk over every coupling column of its cluster (`|cols_f|²`).
+    // Every sum runs over cluster `f`'s coupling columns (`cols`) only. The
+    // forms reassociate the per-row sums over those columns, so the two agree
+    // to round-off.
+    if e > 0 {
+        for f in 0..s {
+            let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
+            if cols.is_empty() {
+                continue;
+            }
+            let (hb, nc) = (qc * coup_ptr[f] as usize, cols.len());
+            for l in 0..qc {
+                for (j, &b) in cols.iter().enumerate() {
+                    let col = &tail_inv[b as usize * e..b as usize * e + e];
+                    let mut acc = T::ZERO;
+                    for (ja, &a) in cols.iter().enumerate() {
+                        acc += coupling[hb + l * nc + ja] * col[a as usize];
+                    }
+                    tail_h[hb + l * nc + j] = acc;
+                }
+            }
+            let gb = f * qc * qc;
+            for l1 in 0..qc {
+                for l2 in 0..qc {
+                    let mut acc = T::ZERO;
+                    for j in 0..nc {
+                        acc += tail_h[hb + l1 * nc + j] * coupling[hb + l2 * nc + j];
+                    }
+                    tail_g[gb + l1 * qc + l2] = acc;
+                }
+            }
+        }
+    }
+    // `rᵢ'S⁻¹rⱼ` off the forms above: `yi`/`yj` the two rows' core solves,
+    // `ti`/`tj` their crossed values on the shared columns `tc` (one row's own
+    // crossed entries: both bilinear partners of a row here are that row and a
+    // θ-derivative of it, which share its crossed columns). Only the columns
+    // in `cols` (cluster `f`'s coupling columns, sorted) enter: a column
+    // outside them (a θ-pinned crossed grouping the `f64` pattern dropped and
+    // a dual packer kept) is skipped.
+    let tail_form =
+        |f: usize, cols: &[u32], yi: &[T], yj: &[T], tc: &[u32], ti: &[T], tj: &[T]| -> T {
+            let (hb, nc) = (qc * coup_ptr[f] as usize, cols.len());
+            let gb = f * qc * qc;
+            let mut t_gg = T::ZERO;
+            for l1 in 0..qc {
+                let mut inner = T::ZERO;
+                for l2 in 0..qc {
+                    inner += tail_g[gb + l1 * qc + l2] * yj[l2];
+                }
+                t_gg += yi[l1] * inner;
+            }
+            let mut t_cross = T::ZERO;
+            for (z, &b) in tc.iter().enumerate() {
+                let Ok(j) = cols.binary_search(&b) else {
+                    continue;
+                };
+                let mut hi = T::ZERO;
+                let mut hj = T::ZERO;
+                for l in 0..qc {
+                    hi += yi[l] * tail_h[hb + l * nc + j];
+                    hj += yj[l] * tail_h[hb + l * nc + j];
+                }
+                t_cross += hi * tj[z] + hj * ti[z];
+            }
+            let mut t_tt = T::ZERO;
+            for (z1, &b1) in tc.iter().enumerate() {
+                if cols.binary_search(&b1).is_err() {
+                    continue;
+                }
+                let col = &tail_inv[b1 as usize * e..b1 as usize * e + e];
+                let mut inner = T::ZERO;
+                for (z2, &b2) in tc.iter().enumerate() {
+                    if cols.binary_search(&b2).is_err() {
+                        continue;
+                    }
+                    inner += tj[z2] * col[b2 as usize];
+                }
+                t_tt += ti[z1] * inner;
+            }
+            t_gg - t_cross + t_tt
+        };
+
     let canonical = crate::family::is_canonical(family);
     let exact_obj = crate::family::exact_curvature_differs(family);
     let mut t = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
@@ -1406,30 +1441,20 @@ fn assemble<T: TailKernel>(
             }
             acc
         } else {
-            structured_row_reduce(
-                fac,
-                qc,
-                mc,
-                &coupling[f * qc * e..],
-                e,
-                cols,
-                &cross_col[cbase..cbase + ncz],
-                &cross_val[cbase..cbase + ncz],
-                tail_inv,
-                &mut yb[..qc],
-                rb,
-                sb,
-            );
-            // Two separate folds, then one add — the association the `f64`
-            // instantiation has to keep bit for bit.
+            yb[..qc].copy_from_slice(&mc[..qc]);
+            glmm_block_solve(fac, qc, &mut yb[..qc]);
+            // Core and tail folded apart, then one add.
             let mut core_acc = T::ZERO;
             for c in 0..qc {
                 core_acc += yb[c] * mc[c];
             }
-            let mut tail_acc = T::ZERO;
-            for &b in cols {
-                tail_acc += sb[b as usize] * rb[b as usize];
-            }
+            let tail_acc = if cols.is_empty() {
+                T::ZERO
+            } else {
+                let tc = &cross_col[cbase..cbase + ncz];
+                let tv = &cross_val[cbase..cbase + ncz];
+                tail_form(f, cols, &yb[..qc], &yb[..qc], tc, tv, tv)
+            };
             core_acc + tail_acc
         };
         let r = match family {
@@ -1524,20 +1549,8 @@ fn assemble<T: TailKernel>(
         if e == 0 {
             block_forward_solve(fac, qc, mc, &mut t[..qc]);
         } else {
-            structured_row_reduce(
-                fac,
-                qc,
-                mc,
-                &coupling[f * qc * e..],
-                e,
-                cols,
-                &cross_col[cbase..cbase + ncz],
-                &cross_val[cbase..cbase + ncz],
-                tail_inv,
-                &mut yb[..qc],
-                rb,
-                sb,
-            );
+            yb[..qc].copy_from_slice(&mc[..qc]);
+            glmm_block_solve(fac, qc, &mut yb[..qc]);
         }
         let dr = T::from_f64(-2.0) * rho[i];
         for a in 0..n_theta {
@@ -1581,29 +1594,27 @@ fn assemble<T: TailKernel>(
                 }
                 acc
             } else {
-                structured_row_reduce(
-                    fac,
-                    qc,
-                    &mad[..qc],
-                    &coupling[f * qc * e..],
-                    e,
-                    cols,
-                    &cross_col[cbase..cbase + ncz],
-                    &cvd[..ncz],
-                    tail_inv,
-                    &mut ya[..qc],
-                    ra,
-                    sa,
-                );
+                ya[..qc].copy_from_slice(&mad[..qc]);
+                glmm_block_solve(fac, qc, &mut ya[..qc]);
                 // Same two-fold association as pass 1's own leverage.
                 let mut core_acc = T::ZERO;
                 for c in 0..qc {
                     core_acc += yb[c] * mad[c];
                 }
-                let mut tail_acc = T::ZERO;
-                for &b in cols {
-                    tail_acc += sb[b as usize] * ra[b as usize];
-                }
+                let tail_acc = if cols.is_empty() {
+                    T::ZERO
+                } else {
+                    let tc = &cross_col[cbase..cbase + ncz];
+                    tail_form(
+                        f,
+                        cols,
+                        &yb[..qc],
+                        &ya[..qc],
+                        tc,
+                        &cross_val[cbase..cbase + ncz],
+                        &cvd[..ncz],
+                    )
+                };
                 core_acc + tail_acc
             };
             d_gamma[a] += dr * deta;
@@ -1655,7 +1666,14 @@ fn assemble<T: TailKernel>(
         for i in 0..n {
             let f = cluster_ids[i] as usize;
             let cb = f * qc * qc;
-            let coup = f * qc * e;
+            // Same `e > 0` guard as the passes above: the CSR is only built
+            // on a structured shape.
+            let (coup, nc) = if e > 0 {
+                let (lo, hi) = (coup_ptr[f] as usize, coup_ptr[f + 1] as usize);
+                (qc * lo, hi - lo)
+            } else {
+                (0, 0)
+            };
             let mc = &core_m[i * qc..i * qc + qc];
             let cbase = i * g_cap;
             let ncz = if extras { n_cross[i] as usize } else { 0 };
@@ -1666,7 +1684,7 @@ fn assemble<T: TailKernel>(
                     obs_core[cb + r * qc + c] += wmr * mc[c];
                 }
                 for z in 0..ncz {
-                    obs_coup[coup + r * e + cross_col[cbase + z] as usize] +=
+                    obs_coup[coup + r * nc + coup_pos[cbase + z] as usize] +=
                         wmr * cross_val[cbase + z];
                 }
             }
@@ -1769,12 +1787,13 @@ fn packed_mode_solve_f64(
         pirls,
         prior_w,
         wx,
+        z_buf,
         offset: offset_field,
         ..
     } = ws;
     let offset = offset_field.as_deref();
     crate::sparse::fill_lambda_small(&prm[..n_theta], groupings, &mut packed.lam_small);
-    fill_m_vals(packed, groupings, x, n);
+    fill_m_vals(packed, groupings, z_buf, n);
     let mut mode_counters = crate::counters::EvalCounters::new();
     let (dev, pen, logdet, conv) = pirls_solve_packed(
         family,
@@ -1965,6 +1984,7 @@ fn packed_gradient_into(
         family,
         nb_theta,
         x,
+        &ws.z_buf,
         y,
         &ws.prior_w[..n],
         &ws.packed.m_cols[..n * width],
@@ -2005,9 +2025,9 @@ fn packed_gradient_into(
 /// evaluation state in `asm.packed` — the same `F`/`G` pair and the same
 /// adjoint identity, differing only in how `A⁻¹` is applied.
 ///
-/// Mirrors the blocked and structured reducers (`block_forward_solve`,
-/// [`structured_row_reduce`]) on the shared block-inverse identity — change
-/// together. Where those reduce each row against a per-cluster factor, this
+/// Mirrors the blocked and structured reducers (`block_forward_solve`, and
+/// [`assemble`]'s per-cluster tail forms) on the shared block-inverse identity;
+/// change together. Where those reduce each row against a per-cluster factor, this
 /// layout's `A` is dense `k×k` (every row loads one level of every grouping,
 /// so there is no cluster block to solve alone), so `A⁻¹` is formed once, off
 /// the factor, and every bilinear form `m_i'A⁻¹m_j` is a `width²` double loop
@@ -2027,6 +2047,8 @@ fn packed_assemble<T: Scalar>(
     family: Family,
     nb_theta: f64,
     x: MatRef<f64>,
+    // The random-slope values `fill_m_vals` read (`workspace::fill_z_f64`).
+    z_buf: &[f64],
     y: &[f64],
     prior_w: &[f64],
     // Design-fixed RE column of each packed nonzero, row `i` at `i·width`.
@@ -2178,7 +2200,7 @@ fn packed_assemble<T: Scalar>(
         let base = i * width;
         let dr = T::from_f64(-2.0) * rho[i];
         for a_idx in 0..n_theta {
-            packed_m_vals_theta_deriv(g, a_idx, x, i, m_deriv);
+            packed_m_vals_theta_deriv(g, a_idx, z_buf, i, m_deriv);
             // `∂η_i/∂θ_a = m_{a,i}'u`, read at the iterate `η`, `w` and the
             // factor were built at.
             let mut deta = T::ZERO;
@@ -2432,7 +2454,7 @@ fn packed_hessian_chunks<T: Seed>(
                     continue;
                 }
                 for i in 0..n {
-                    packed_m_vals_theta_deriv(g, a_idx, x, i, m_deriv);
+                    packed_m_vals_theta_deriv(g, a_idx, &ws.z_buf, i, m_deriv);
                     for t in 0..width {
                         m_vals[i * width + t] += T::unit(0.0, j) * T::from_f64(m_deriv[t]);
                     }
@@ -2483,6 +2505,7 @@ fn packed_hessian_chunks<T: Seed>(
             family,
             nb_theta,
             x,
+            &ws.z_buf,
             y,
             prior_w,
             m_cols,

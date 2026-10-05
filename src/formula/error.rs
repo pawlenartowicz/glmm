@@ -102,8 +102,8 @@ pub enum Error {
     /// design would have zero columns.
     EmptyDesign,
     /// A transform term evaluated to a non-finite value (e.g. `log(x)` on a
-    /// non-positive `x`). R would silently drop the row via `na.omit`; here it
-    /// is an error naming the row.
+    /// non-positive `x`, which R would silently drop via `na.omit`), or an
+    /// `offset()` term holds one. Either is an error naming the row.
     TransformNotFinite {
         /// The term as spelled, e.g. `log(x)`.
         term: String,

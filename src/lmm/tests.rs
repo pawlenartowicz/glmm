@@ -2138,12 +2138,16 @@ fn nested_slope_fit_converges() {
     // nested-child vech (λ00,λ10,λ11)] — the defect this test guards against is a
     // corrupted θ̂ that a finiteness check alone would not catch (β̂ locks below
     // catch it only indirectly).
+    // Re-pinned 2026-10-02 with the per-search BOBYQA start radii (LMM blind
+    // start 0.5): the search takes another path to the same optimum, worst move
+    // 1.9e-6 relative on θ̂[1], REML criterion 6e-13 lower, the same boundary
+    // code and pinned components.
     const PINNED_THETA: [f64; 6] = [
-        0.17956992444424705,
-        0.043694448493027414,
+        0.1795697879542531,
+        0.043694366760916495,
         0.0,
-        0.5406149250057827,
-        0.13052687983935188,
+        0.5406150077859789,
+        0.13052692349786316,
         0.0,
     ];
     for (j, (&got, &want)) in ws.theta.iter().zip(&PINNED_THETA).enumerate() {
@@ -2841,9 +2845,9 @@ fn fit_lmm_nan_fills_on_model_degenerate_search() {
 
 /// The cheap `+INFINITY` guards of `reml_deviance` (`kernel.rs`): too few
 /// rows for the design (`n_rows <= p`), no fixed effects at all (`p == 0`),
-/// and a non-positive residual variance. All three return the deviance
-/// failure sentinel rather than a garbage finite value BOBYQA could accept
-/// as an optimum.
+/// and an exact fit. All three return the deviance failure sentinel rather
+/// than a garbage finite value BOBYQA could accept as an optimum. The exact
+/// fit also runs through `sparse_reml_deviance`, which shares the guard.
 #[test]
 fn reml_deviance_infinity_guards() {
     // n_rows <= p: nothing accumulated, p = 2.
@@ -2862,23 +2866,43 @@ fn reml_deviance_infinity_guards() {
     let mut fit_p0 = LmmFitScratch::with_groupings(0, &single_grouping(4));
     assert_eq!(reml_deviance(&[1.0], &suff_p0, &mut fit_p0), f64::INFINITY);
 
-    // Non-positive σ̂²: a constant y through an intercept-only design at
-    // θ = 0 (Λ = 0, plain OLS) has an exact-zero residual — 16.0 / 4.0 is
-    // exact in f64, so the residual sum of squares rounds to exactly 0.0,
-    // not merely small.
-    let mut suff_perfect = LmmSuffStats::with_groupings(1, single_grouping(4));
-    let mut x1 = Mat::<f64>::zeros(4, 1);
-    for i in 0..4 {
-        x1[(i, 0)] = 1.0;
+    // Exact fit: y = 2 + 3·x on x = 0.1·i, so r² is round-off. On x86_64 it
+    // comes out as a positive ~1e-14 at every θ below (σ̂² ~ 2e-15, deviance
+    // ~ −200 without the floor); the floor on r² is what refuses it.
+    let n = 8;
+    let mut x2 = Mat::<f64>::zeros(n, 2);
+    let mut y_exact = vec![0.0; n];
+    for i in 0..n {
+        x2[(i, 0)] = 1.0;
+        x2[(i, 1)] = 0.1 * i as f64;
+        y_exact[i] = 2.0 + 3.0 * x2[(i, 1)];
     }
-    let y_perfect = [4.0; 4];
-    let ids_perfect: Vec<u32> = (0..4).collect();
-    suff_perfect.add_rows(x1.as_ref(), &y_perfect, &ids_perfect);
-    let mut fit_perfect = LmmFitScratch::with_groupings(1, &single_grouping(4));
-    assert_eq!(
-        reml_deviance(&[0.0], &suff_perfect, &mut fit_perfect),
-        f64::INFINITY
+    let ids_exact: Vec<u32> = (0..n).map(|i| (i % 4) as u32).collect();
+    let mut suff_exact = LmmSuffStats::with_groupings(2, single_grouping(4));
+    suff_exact.add_rows(x2.as_ref(), &y_exact, &ids_exact);
+    let mut fit_exact = LmmFitScratch::with_groupings(2, &single_grouping(4));
+    let mut ws_sparse = crate::sparse::SparseLmmWorkspace::new(
+        &single_grouping(4),
+        x2.as_ref(),
+        &ids_exact,
+        &[],
+        &y_exact,
+        n,
+        2,
+        None,
     );
+    for th in [0.0, 0.5, 1.0] {
+        assert_eq!(
+            reml_deviance(&[th], &suff_exact, &mut fit_exact),
+            f64::INFINITY,
+            "dense, θ = {th}"
+        );
+        assert_eq!(
+            crate::sparse::sparse_reml_deviance(&[th], &mut ws_sparse),
+            f64::INFINITY,
+            "sparse, θ = {th}"
+        );
+    }
 }
 
 /// The blocked twin (`reml_deviance_blocked`, crossed/nested random slopes)
@@ -3026,4 +3050,32 @@ fn converged_status_with_one_finite_eval_is_not_reported_converged() {
     );
     assert!(f.sigma_sq.is_finite());
     assert!(ws2.recovery.betas.iter().all(|b| b.is_finite()));
+}
+
+/// `DesignQr` reads its rows through a row-major tile (`load_tile`), which
+/// copies contiguous columns by slice and any other view element by element.
+/// Both copies must give the same factor, bit for bit: a strided view (the
+/// transpose of a `p×n` matrix) against the contiguous `n×p` one, at a width
+/// with a fixed-width instance (p = 3) and one without (p = 7), over more rows
+/// than one tile holds.
+#[test]
+fn design_qr_reads_a_strided_design_like_a_contiguous_one() {
+    for p in [3usize, 7] {
+        let n = 150;
+        let mut st = 46u64;
+        let x = faer::Mat::<f64>::from_fn(n, p, |_, j| if j == 0 { 1.0 } else { lcg(&mut st) });
+        let xt = x.transpose().to_owned();
+        let mut v = vec![0.0; p];
+        let mut a = DesignQr::identity(p);
+        let mut b = DesignQr::identity(p);
+        assert!(a.set_from_rows(x.as_ref(), |i| 1.0 + 0.01 * i as f64, &mut v));
+        assert!(b.set_from_rows(xt.as_ref().transpose(), |i| 1.0 + 0.01 * i as f64, &mut v));
+        let bits = |s: &[f64]| s.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(a.r_diag()), bits(b.r_diag()), "p = {p}: D");
+        let mut ra: Vec<f64> = (0..p).map(|j| 1.0 + j as f64).collect();
+        let mut rb = ra.clone();
+        a.solve_row(&mut ra);
+        b.solve_row(&mut rb);
+        assert_eq!(bits(&ra), bits(&rb), "p = {p}: x·U⁻¹");
+    }
 }

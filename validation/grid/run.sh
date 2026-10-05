@@ -12,6 +12,8 @@
 #            the rest. IMPLIES --fast and --jobs=1. Records no_turbo and REFUSES to
 #            start when it reads 0 unless --timed-unlocked is given, in which case
 #            the run is marked unlocked in run_meta and summarize_timing.R warns.
+#            Also REFUSES to start without `taskset`, which pins the one worker,
+#            unless --timed-unlocked is given (the worker then runs unpinned).
 #            The user locks the machine (bench-l); this script only records the state.
 #   --jobs N split the cell list into N chunks and run N workers, worker i pinned
 #            with `taskset -c i`. P-cores on this box are 0-5, so N > 6 is refused.
@@ -119,6 +121,13 @@ if [[ -n "$TIMED_N" ]]; then
     echo "or pass --timed-unlocked to record the run as unlocked." >&2
     exit 2
   fi
+  # Unpinned seconds are not comparable with any pinned run, so without taskset
+  # (macOS) a timed run needs the same --timed-unlocked mark as an unlocked clock.
+  if ! command -v taskset >/dev/null && [[ "$TIMED_UNLOCKED" != 1 ]]; then
+    echo "REFUSING a timed run: taskset not found, so the worker cannot be pinned to one core." >&2
+    echo "Pass --timed-unlocked to run unpinned and record the run as unlocked." >&2
+    exit 2
+  fi
 fi
 
 # The spelling the manifest's `oracles` array uses. The empty string means "no
@@ -203,9 +212,8 @@ case "$ENGINE" in
     ENGINE_VERSION="$(julia --project="$GRID" -e 'using MixedModels; print(pkgversion(MixedModels))')" ;;
   # The plain crate version, no build-provenance suffix: the engines stamp each
   # record with the version their own build reports, and a suffix added here
-  # would put two spellings of one version in one results.jsonl. run_meta's
-  # glmm_git_rev is the commit the run started from; run_meta does not record
-  # whether the tree was dirty.
+  # would put two spellings of one version in one results.jsonl. The build's
+  # provenance is run_meta's glmm_git_rev (write_run_meta below).
   glmm|glmm_wasm) ENGINE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)" ;;
   glmm_python) ENGINE_VERSION="$("$ROOT/python/venv/bin/python" -c 'from importlib.metadata import version; print(version("glmm"))')" ;;
   glmm_r)      ENGINE_VERSION="$(Rscript -e 'cat(as.character(packageVersion("fastglmm")))')" ;;
@@ -229,7 +237,8 @@ if [[ -n "$COMPLETE_FROM" ]]; then
 fi
 
 # ---- run directory: never overwritten --------------------------------------
-slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g; s/^-//; s/-$//'; }
+# sed -E: BSD sed has no `\+` in basic regexps; ERE `+` means the same on both.
+slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-//; s/-$//'; }
 # GRID_MACHINE names the machine in run_meta and the directory name. It comes
 # from the environment, else from the first line of
 # ${XDG_CONFIG_HOME:-$HOME/.config}/glmm-grid/machine; with neither, the run
@@ -267,14 +276,20 @@ write_run_meta() {   # $1 = the cell_list JSON array
   no_turbo="$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo '?')"
   # The 1/5/15-minute load averages as the run starts: foreign load is invisible
   # to no_turbo and to the pin, and it is what makes two locked runs disagree.
-  loadavg="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '?')"
+  # No /proc on macOS: sysctl vm.loadavg prints "{ 1.0 2.0 3.0 }".
+  loadavg="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null \
+    || sysctl -n vm.loadavg 2>/dev/null | awk '{print $2, $3, $4}' || echo '?')"
+  # The commit the run started from, suffixed `-dirty` (git describe's spelling)
+  # when tracked files differ from it: a bare hash would claim that commit's
+  # code built the run. Untracked files are not counted.
   rev="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+  [[ "$rev" == unknown ]] || git -C "$ROOT" diff --quiet HEAD -- || rev="$rev-dirty"
   crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)"
   r_ver="$(Rscript -e 'cat(as.character(getRversion()))' 2>/dev/null || echo '?')"
   jl_ver="$(julia --version 2>/dev/null | awk '{print $3}' || echo '?')"
   jq -n \
     --arg engine "$ENGINE" --arg engine_version "$ENGINE_VERSION" \
-    --arg machine "$MACHINE" --arg date "$(date -Is)" \
+    --arg machine "$MACHINE" --arg date "$(date -Iseconds)" \
     --arg crate "$crate" --arg rev "$rev" --arg subset "$SUBSET" \
     --arg no_turbo "$no_turbo" --arg pin "$PIN_CORES" \
     --arg loadavg "$loadavg" --arg r "$r_ver" --arg jl "$jl_ver" \
@@ -306,7 +321,8 @@ export GRID_DIR="$GRID" GRID_MANIFEST="$GRID/manifest.json" \
        GRID_TIMED="${TIMED_N:-}"
 # Thread counts: every engine fits SERIAL so six workers do not oversubscribe the
 # machine. Exported here rather than set in seven scripts. RAYON_NUM_THREADS is
-# in the list because faer's default features pull rayon in.
+# in the list because faer's default features pull rayon in. Mirrored in
+# campaigns/speed-campaign/run.sh -- change together.
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
        VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 JULIA_NUM_THREADS=1 \
        RAYON_NUM_THREADS=1
@@ -366,7 +382,7 @@ run_worker() {   # $1 = part index
   mapfile -t cells < <(part_cells "$part")
   (( ${#cells[@]} )) || return 0
   out="$RUN_DIR/results.part$part.jsonl"
-  export GRID_OUT="$out" GRID_CELLS="$(printf '%s\n' "${cells[@]}" | paste -sd,)"
+  export GRID_OUT="$out" GRID_CELLS="$(printf '%s\n' "${cells[@]}" | paste -sd, -)"
   [[ "$PIN_CORES" == none ]] || pin=(taskset -c "$part")
   touch "$out"
 
@@ -379,7 +395,7 @@ run_worker() {   # $1 = part index
     while kill -0 "$ENGPID" 2>/dev/null; do
       sleep 1
       if (( $(wc -l < "$out") == LINES0 )); then EFF=$GRACE; else EFF=$BUDGET; fi
-      NOW=$(date +%s); MT=$(stat -c %Y "$out")
+      NOW=$(date +%s); MT=$(stat -c %Y "$out" 2>/dev/null || stat -f %m "$out")   # GNU || BSD
       if (( NOW - MT > EFF )); then
         echo ">> part $part: timeout on $(next_missing || echo '?') -- killing $ENGINE" >&2
         kill -9 "$ENGPID" 2>/dev/null || true

@@ -40,6 +40,7 @@ pub(super) fn accumulate_lmm_rows(
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
     weights: Option<&[f64]>,
+    same_design: bool,
 ) {
     // The θ-search runs on ŵ = w/s (s = `family::weight_scale`), the same
     // precision-weight renormalisation the Gamma dispersion path applies
@@ -56,39 +57,74 @@ pub(super) fn accumulate_lmm_rows(
     // (θ̂² · σ̂² = τ², σ̂² · (X'ŴX)⁻¹ = Var(β̂), …).
     let s = crate::family::weight_scale(weights, n);
     ws.weight_scale = s;
-    let scaled_w: Option<Vec<f64>> = weights.map(|w| w[..n].iter().map(|&wi| wi / s).collect());
-    let w_for_rows = scaled_w.as_deref();
+    // ŵ goes into the workspace's buffer, refilled in place: a weighted draw
+    // allocates here only while the buffer grows to the largest `n` it sees.
+    let w_for_rows: Option<&[f64]> = match weights {
+        Some(w) => {
+            ws.w_scaled.clear();
+            ws.w_scaled.extend(w[..n].iter().map(|&wi| wi / s));
+            Some(ws.w_scaled.as_slice())
+        }
+        None => None,
+    };
 
     match &mut ws.kernel {
+        // Fixed-design opt-in: the design part of the statistics is the last
+        // call's (same x, ids, weights), only the response part is rebuilt.
+        LmmKernel::Dense { suff, .. } if same_design && n > 0 && p > 0 => {
+            suff.update_response(x_mat, y, cluster_ids, extra_ids, w_for_rows);
+        }
         LmmKernel::Dense { suff, .. } => {
             suff.reset();
             if n > 0 && p > 0 {
-                // The fixed-effect factor U must be known before any row is
-                // accumulated (`lmm::DesignQr`); the sparse arm computes the same
-                // one inside its constructor.
-                suff.set_design_qr(x_mat, w_for_rows);
+                // The fixed-effect factor U (`lmm::DesignQr`): on a
+                // well-conditioned design read off the Gram of this one pass
+                // and mapped onto what it accumulated
+                // (`orthogonalize_from_gram`); otherwise the Givens pass, which
+                // must run before any row is accumulated, and a second
+                // accumulation through it.
+                // The sparse arm computes its U inside its constructor.
                 suff.add_rows_multi(x_mat, y, cluster_ids, extra_ids, w_for_rows);
+                if !suff.orthogonalize_from_gram() {
+                    suff.reset();
+                    suff.set_design_qr(x_mat, w_for_rows);
+                    suff.add_rows_multi(x_mat, y, cluster_ids, extra_ids, w_for_rows);
+                }
             }
         }
         LmmKernel::Sparse { g, ws: sparse_ws } => {
             // WLS-style √ŵᵢ pre-scaling, the same convention `add_rows_multi`
             // applies on the dense arm: threaded through every z-emission and
             // raw x/y read in the constructor, so every packed Gram carries
-            // exactly `ŵᵢ` per row.
-            let sqrt_w: Option<Vec<f64>> = w_for_rows.map(|w| w.iter().map(|v| v.sqrt()).collect());
+            // exactly `ŵᵢ` per row. Taken in place: nothing on this kernel
+            // reads ŵ itself after the constructor.
+            if weights.is_some() {
+                for v in ws.w_scaled.iter_mut() {
+                    *v = v.sqrt();
+                }
+            }
+            let sqrt_w = weights.map(|_| ws.w_scaled.as_slice());
             // The Gram scatter IS the constructor on this kernel: one pass over
             // the rows builds `Z'Z`, `Z'[X y]` and `[X y]'[X y]` and sizes every
-            // per-eval buffer.
-            *sparse_ws = Some(Box::new(crate::sparse::SparseLmmWorkspace::new(
-                g,
-                x_mat,
-                cluster_ids,
-                extra_ids,
-                y,
-                n,
-                p,
-                sqrt_w.as_deref(),
-            )));
+            // per-eval buffer. A draw on the rows the workspace was built from
+            // has the same pattern, so it refills the values in place.
+            match sparse_ws {
+                Some(sw) if crate::sparse::same_rows(&sw.ids, cluster_ids, extra_ids, n) => {
+                    sw.fill_values(x_mat, cluster_ids, extra_ids, y, sqrt_w);
+                }
+                _ => {
+                    *sparse_ws = Some(Box::new(crate::sparse::SparseLmmWorkspace::new(
+                        g,
+                        x_mat,
+                        cluster_ids,
+                        extra_ids,
+                        y,
+                        n,
+                        p,
+                        sqrt_w,
+                    )));
+                }
+            }
         }
     }
 }
@@ -139,12 +175,11 @@ impl LmmResultView<'_> {
     pub(crate) fn var_diag(&self) -> &[f64] {
         self.var_diag
     }
-    /// This route's [`FitDiagnostics`] — every field is real here: the LMM is
-    /// the one route that reports θ boundary state, per-component pins, AND a
-    /// recorded pivot, on both of its kernels. The pivot floor is this route's
-    /// own ([`crate::lmm::PIVOT_MIN`]), which sits at the same 1e-12 as OLS/GLM
-    /// but was calibrated separately and stays a separate constant for that
-    /// reason.
+    /// This route's [`FitDiagnostics`] — every field is real here: θ boundary
+    /// state, per-component pins and a recorded pivot, on both of its kernels.
+    /// The pivot floor is [`crate::lmm::PIVOT_MIN`], shared with the GLMM,
+    /// which sits at the same 1e-12 as OLS/GLM but was calibrated separately
+    /// and stays a separate constant for that reason.
     pub(crate) fn diagnostics(&self) -> FitDiagnostics {
         FitDiagnostics {
             converged: self.fit.converged,
@@ -163,6 +198,13 @@ impl LmmResultView<'_> {
             // No ExactProfile route on the Gaussian LMM path (GLMM-only) —
             // always false.
             exact_profile_fallback: false,
+            // The LMM's SEs come off the factor its criterion is evaluated on,
+            // so an endpoint always has them.
+            se_unavailable: false,
+            // The LMM's profiled criterion is scale-free in the response.
+            precision_limited: false,
+            // No IRLS on the Gaussian LMM path.
+            separated: false,
         }
     }
     /// Joint Wald-χ² over the target set (the omnibus significance read).
@@ -480,6 +522,7 @@ fn fit_mle(
         cluster_ids,
         extra_ids,
         opts.weights.as_deref(),
+        false,
     );
 
     let ids = crate::GroupIds {

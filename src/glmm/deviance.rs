@@ -160,6 +160,7 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
             n,
             &mut pattern.coup_cols,
             &mut pattern.coup_ptr,
+            &mut pattern.coup_pos,
         );
         pattern.coup_mask = Some(pin_mask);
     }
@@ -208,10 +209,10 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
 /// returns `log|L|` off its converged factor (L the Cholesky factor of A, so
 /// `log|A| = 2 log|L|`) — the caller below doubles it to get `log|A|`, so there
 /// is no re-factor here.
-/// The blocked AND structured branches require `data.z_buf` pre-filled for
-/// this fit's `x` (`fill_z_f64`) — `build_packed_m`'s primary-core reduction
-/// reads it the same way `pirls_solve_blocked`'s does; the packed branch reads
-/// `x` directly through `fill_m_vals`.
+/// Every branch requires `data.z_buf` pre-filled for this fit's `x`
+/// (`fill_z_f64`) — `build_packed_m`'s primary-core reduction reads it the same
+/// way `pirls_solve_blocked`'s does, and the packed branch through
+/// `fill_m_vals`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn laplace_deviance(
     data: &FitData,
@@ -254,9 +255,10 @@ pub(crate) fn laplace_deviance(
     // every call site chooses.
     beta_mode: BetaMode,
     // PIRLS exit-tol override, forwarded verbatim to whichever PIRLS variant (or
-    // `agq_deviance`) runs. `Some(pirls_tol_fd(family))` only under the FD-Hessian
-    // SE evals (`ws.fd.pirls_tol_override`, set by `joint_hessian_cov`); `None` on the fit
-    // path, which therefore stays bit-identical.
+    // `agq_deviance`) runs. `Some(pirls_tol_fd(family))` under the FD-Hessian SE
+    // evals (`ws.fd.pirls_tol_override`, set by `joint_hessian_cov`); on the fit
+    // path `None`, except the `ExactProfile` search's radius-tied tolerance
+    // (`RHO_TOL_C` in `glmm/mod.rs`), which is always looser than `pirls_tol`.
     pirls_tol_override: Option<f64>,
     // Cluster-outer AGQ substrate (`agq::ClusterRowIndex`), forwarded verbatim to
     // `agq_deviance`'s early return below; `None` on every non-AGQ path (unread).
@@ -287,7 +289,7 @@ pub(crate) fn laplace_deviance(
         p,
     } = *data;
     let BorderScratch {
-        xtwx,
+        xtwx: _,
         xtwm,
         ainv_mtwx,
         schur,
@@ -394,8 +396,9 @@ pub(crate) fn laplace_deviance(
     // Packed layout only: Λ and the packed `M` values at this θ.
     if layout == GlmmLayout::Packed {
         crate::sparse::fill_lambda_small(&params[..n_theta], groupings, &mut packed.lam_small);
-        fill_m_vals(packed, groupings, x, n);
-        // Fit-path evals (`pirls_tol_override == None`) carry the previous call's
+        fill_m_vals(packed, groupings, z_buf, n);
+        // Fit-path evals (`pirls_tol_override == None`; packed layout only,
+        // which `ExactProfile` never uses) carry the previous call's
         // converged û forward as the starting point — fewer iterations to
         // reconverge, same fixed point. Tight-tol evals (the FD-Hessian stencil)
         // cold-seed û = 0, overriding the `u_seed` that `laplace_deviance_at` copied
@@ -416,7 +419,6 @@ pub(crate) fn laplace_deviance(
         BetaMode::Fixed => BetaStep::Fixed,
         BetaMode::ProfilePql | BetaMode::ProfileExact => BetaStep::Profile {
             exact: (beta_mode == BetaMode::ProfileExact).then_some(&mut *exact_prof),
-            xtwx: &mut *xtwx,
             xtwm: &mut *xtwm,
             ainv_mtwx: &mut *ainv_mtwx,
             schur: &mut *schur,
@@ -512,10 +514,11 @@ pub(crate) fn laplace_deviance(
     // every OTHER failure path (halving exhausted, non-PD Cholesky), so a
     // finite deviance alongside `!conv` can only mean the `for` loop ran out its
     // `PIRLS_MAX_ITERS` iterations still inside a rising/falling accepted
-    // sequence. Gated on `pirls_tol_override.is_none()` — the FD-Hessian SE
-    // evals run their own tight tolerance and must not count — the same
-    // fit-path-vs-FD-eval discriminator the packed cold seed above uses.
-    if !conv && raw_dev_finite && pirls_tol_override.is_none() {
+    // sequence. Counted on fit-path solves only: the FD-Hessian SE evals run
+    // their own tolerance (`pirls_tol_fd`, never looser than `pirls_tol`) and
+    // must not count, while the `ExactProfile` search's radius-tied solves
+    // (`RHO_TOL_C`, always looser than `pirls_tol`) are fit-path solves and do.
+    if !conv && raw_dev_finite && pirls_tol_override.is_none_or(|t| t > super::pirls_tol(family)) {
         *pirls_exhausted += 1;
     }
     counters.commit_pirls_iters();

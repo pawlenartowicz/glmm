@@ -85,8 +85,8 @@
 #' (`"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`,
 #' `"fastglmm_unused_grouping_levels"`,
 #' `"fastglmm_single_level_grouping_dropped"`, `"fastglmm_hessian_se_fallback"`,
-#' `"fastglmm_exact_profile_fallback"`,
-#' `"fastglmm_non_integer_response"`, `"fastglmm_rows_dropped_na"`; a note from
+#' `"fastglmm_se_unavailable"`, `"fastglmm_exact_profile_fallback"`,
+#' `"fastglmm_precision_limited"`, `"fastglmm_non_integer_response"`, `"fastglmm_rows_dropped_na"`; a note from
 #' a newer kernel than this package arrives as `"fastglmm_unknown_note"`),
 #' so `withCallingHandlers()` and `suppressWarnings(classes = )` can select
 #' them without matching message text.
@@ -281,7 +281,23 @@ fastglmm <- function(formula, data, family = gaussian(),
 
   # --- data prep: row filtering (subset, na.action) happens HERE, on the
   # data.frame, before marshalling - data prep, not parsing (spec section 3.1). ---
-  if (!is.data.frame(data)) data <- as.data.frame(data)
+  if (!is.data.frame(data)) {
+    # as.data.frame() recycles a short list column whose length divides the
+    # longest one; model.frame() (glm, lme4) refuses that, and so does this.
+    # Same message as run_fit's length check in src/orchestrate.rs - change
+    # together.
+    if (is.list(data)) {
+      len <- vapply(data[intersect(all.vars(formula), names(data))], NROW, integer(1))
+      if (length(unique(len)) > 1L) {
+        len <- len[order(names(len), method = "radix")]
+        stop(sprintf(
+          "columns have mismatched lengths (%s); all columns must have the same length",
+          paste(sprintf('"%s": %d', names(len), len), collapse = ", ")
+        ), call. = FALSE)
+      }
+    }
+    data <- as.data.frame(data)
+  }
   vars <- all.vars(formula)
   missing_cols <- setdiff(vars, names(data))
   if (length(missing_cols)) {
@@ -448,7 +464,8 @@ fastglmm <- function(formula, data, family = gaussian(),
     if (!is.null(out)) .warn_keep(store, note$kind, out$msg, out$cls)
   }
   if (!isTRUE(r$converged)) {
-    out <- .nonconvergence(fam$name, fitted_mixed, r$notes, r$beta, r$aliased, r$deviance, r$y)
+    out <- .nonconvergence(fam$name, fitted_mixed, r$notes, r$beta, r$aliased, r$deviance, r$y,
+                           fam$link)
     .warn_keep(store, out$kind, out$msg, out$cls)
   }
 
@@ -500,8 +517,9 @@ fastglmm <- function(formula, data, family = gaussian(),
     #             detail=); `columns` is
     #             1-based into `names`. Each is raised as a classed warning by
     #             the call above. An absent note means "not detected", never
-    #             "checked and clean": the GLMM routes record no pivot, and
-    #             the LMM routes flag `IllConditioned` rather than refuse.
+    #             "checked and clean": a fit that formed no factor records no
+    #             pivot, and every route flags `IllConditioned` rather than
+    #             refuse.
     diagnostics = list(
       converged = r$converged,
       singular = r$singular,
@@ -568,7 +586,9 @@ fastglmm <- function(formula, data, family = gaussian(),
   singular = c("caution", "Singular fit"),
   ill_conditioned = c("caution", "Nearly collinear columns"),
   hessian_se_fallback = c("caution", "Simpler standard errors used"),
+  se_unavailable = c("caution", "Standard errors not computed"),
   exact_profile_fallback = c("caution", "Search retried with a different method"),
+  precision_limited = c("caution", "Numbers too large for full precision"),
   agq_fallback = c("caution", "Adaptive quadrature not used"),
   non_integer_response = c("caution", "Non-integer response"),
   rows_dropped_na = c("caution", "Rows dropped for missing values"),
@@ -641,13 +661,16 @@ fastglmm <- function(formula, data, family = gaussian(),
 # Classes: "fastglmm_ill_conditioned", "fastglmm_pirls_exhausted",
 # "fastglmm_unused_grouping_levels",
 # "fastglmm_single_level_grouping_dropped", "fastglmm_hessian_se_fallback",
-# "fastglmm_exact_profile_fallback",
-# "fastglmm_nb_shape_unsettled", "fastglmm_unknown_note" - all inheriting
+# "fastglmm_se_unavailable", "fastglmm_exact_profile_fallback",
+# "fastglmm_precision_limited", "fastglmm_nb_shape_unsettled",
+# "fastglmm_unknown_note" - all inheriting
 # "fastglmm_diagnostic", so one handler catches the whole channel. Not every
 # note comes from the solver: "unused_grouping_levels" and
 # "single_level_grouping_dropped" are raised by the formula lowering, which is
 # the only layer that sees both the declared levels and the per-row codes.
 .note_warning <- function(note, coef_names, converged) {
+  # Only on a non-converged fit, whose one warning (.nonconvergence) names it.
+  if (identical(note$kind, "separated")) return(NULL)
   if (identical(note$kind, "ill_conditioned")) {
     # `columns` arrives 1-based from the shim, so it indexes `coef_names`
     # directly. Out of range falls back to the index rather than printing NA,
@@ -707,12 +730,27 @@ fastglmm <- function(formula, data, family = gaussian(),
       "may look more precise than they are. Standard errors for the random-effect",
       "standard deviations are not available.")
     cls <- c("fastglmm_hessian_se_fallback", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "se_unavailable")) {
+    msg <- paste(
+      "Standard errors could not be computed at the fit's end point: the fixed",
+      "effects carry too little separate information. The estimates are usable;",
+      "standard errors, p-values and confidence intervals are not reported. Check",
+      "for predictors that are copies or near-copies of each other.")
+    cls <- c("fastglmm_se_unavailable", "fastglmm_diagnostic")
   } else if (identical(note$kind, "exact_profile_fallback")) {
     msg <- paste(
       "The default search method for this model did not settle on an answer, so the fit",
       "tried a different search method from the same starting point. The reported",
       "estimates come from whichever method reached the better answer.")
     cls <- c("fastglmm_exact_profile_fallback", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "precision_limited")) {
+    msg <- paste(
+      "The numbers in this fit are so large that rounding in the computer's",
+      "arithmetic hides small changes in its deviance. The random-effect estimates,",
+      "and the fixed effects that depend on them, may be off by a tenth of a",
+      "standard error or more. This happens with counts in the billions or more, or",
+      "when a model misses a large effect in such data.")
+    cls <- c("fastglmm_precision_limited", "fastglmm_diagnostic")
   } else if (identical(note$kind, "non_integer_response")) {
     # The kernel's Note::NonIntegerResponse (src/fit/mod.rs); `evals` carries the
     # affected row count (src/orchestrate.rs reuses the same NoteInfo slot as
@@ -752,18 +790,48 @@ fastglmm <- function(formula, data, family = gaussian(),
   "coefficients are from the last step; standard errors are not reported. Check predictors",
   "with extreme values; with a link other than log, the log link is usually more stable.")
 
+# A response far outside the reciprocal links' range: the kernel holds the Gamma 1/mu and
+# inverse-Gaussian 1/mu^2 linear predictor inside [1e-75, 1e75] (`INV_ETA_MIN` /
+# `INV_ETA_MAX` in src/family.rs - change together), and a fit whose means must sit
+# outside it cannot converge.
+.ETA_RANGE <- paste(
+  "Some response values are so large or so small that the linear predictor of this link",
+  "(1/mu for gamma, 1/mu^2 for inverse Gaussian) leaves the range the solver supports,",
+  "1e-75 to 1e75. Rescale the response, for example divide it by a power of ten, or use",
+  "the log link.")
+
+# Whether some positive response value puts the reciprocal link's eta = 1/y (gamma) or
+# 1/y^2 (inverse Gaussian) outside [1e-75, 1e75]. Mirrors the Python port's
+# _eta_out_of_range - change together.
+.eta_out_of_range <- function(family, link, y) {
+  power <- if (identical(family, "gamma") && identical(link, "inverse")) {
+    1
+  } else if (identical(family, "inversegaussian") && identical(link, "inverse_squared")) {
+    2
+  } else {
+    return(FALSE)
+  }
+  eta <- 1 / y[y > 0]^power
+  any(eta < 1e-75 | eta > 1e75)
+}
+
 .count <- function(n, word) sprintf("%d %s%s", as.integer(n), word, if (n == 1) "" else "s")
 
 # The one severe warning of a fit with converged = FALSE. The kernel does not say which
 # stopping rule fired, so the port reads the cause off what the fit reports, most specific
 # first: no coefficient, too few rows (a one-row response is trivially constant, so this
-# comes first), a constant response, then the model. With random effects, a finite deviance
+# comes first), a constant response, then the model. A model with random effects whose
+# fixed-effects-only GLM stopped on separation (the kernel's "separated" note) never ran its
+# search; the coefficients are that GLM's last step, so it gets the GLM's message.
+# Otherwise, with random effects, a finite deviance
 # means the kernel reached an end point (the budget stop, reported at its best point), and
 # finite estimated coefficients (aliased slots are NaN by contract) confirm it; anything
 # else failed. The deviance is what decides a model with no fixed effects. A GLMM inner
-# cap-out during the search is one extra sentence rather than a second warning. Mirrors the
-# Python port's _nonconvergence (python/glmm/__init__.py) - change together.
-.nonconvergence <- function(family, mixed, notes, beta, aliased, deviance, y) {
+# cap-out during the search is one extra sentence rather than a second warning. On the
+# reciprocal links a response outside their range (.eta_out_of_range) names that cause
+# instead of the general advice. Mirrors the Python port's _nonconvergence
+# (python/glmm/__init__.py) - change together.
+.nonconvergence <- function(family, mixed, notes, beta, aliased, deviance, y, link = NULL) {
   diag_cls <- function(kind) c(paste0("fastglmm_", kind), "fastglmm_diagnostic")
   n_est <- sum(!aliased)
   if (!mixed && n_est == 0L) {
@@ -782,7 +850,9 @@ fastglmm <- function(formula, data, family = gaussian(),
       "Every value of the response is %s, so there is nothing to estimate. Check the response column.",
       sprintf("%g", y[[1L]])), cls = diag_cls("constant_response")))
   }
-  if (!mixed) {
+  glm_stopped <- any(vapply(notes, function(n) identical(n$kind, "separated"), logical(1)))
+  eta_range <- .eta_out_of_range(family, link, y)
+  if (!mixed || glm_stopped) {
     if (identical(family, "gaussian")) {
       return(list(kind = "design_unsolvable", msg = paste(
         "The predictors could not be separated numerically, so no estimates were",
@@ -793,6 +863,9 @@ fastglmm <- function(formula, data, family = gaussian(),
       .DIVERGED_BINOMIAL
     } else if (family %in% c("poisson", "negativebinomial")) {
       .DIVERGED_COUNTS
+    } else if (eta_range) {
+      paste("The fit did not converge. The coefficients are from the last step; standard",
+            "errors are not reported.", .ETA_RANGE)
     } else {
       .DIVERGED_CONTINUOUS
     }
@@ -810,7 +883,8 @@ fastglmm <- function(formula, data, family = gaussian(),
       cls = diag_cls("search_limit")))
   }
   list(kind = "fit_failed", msg = paste(c(
-    "The fitting algorithm failed and returned no estimates.", inner, advice),
+    "The fitting algorithm failed and returned no estimates.", inner,
+    if (eta_range) .ETA_RANGE else advice),
     collapse = " "), cls = diag_cls("fit_failed"))
 }
 

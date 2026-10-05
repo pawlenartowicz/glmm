@@ -1,8 +1,8 @@
-"""Response-domain and dispersion-value validation (GLMM/src/fit/mod.rs).
+"""Response-domain and dispersion-value validation (GLMM/src/fit/mod.rs, and
+GLMM/src/orchestrate.rs for the dispersion value).
 
-These checks live in the Rust kernel; `fit()` does no pre-check of its own, so
-every case here surfaces as a `ValueError` through the same `catch_unwind` path
-as a bad `weights=`/`offset=` (see `test_validation.py`'s FFI-level tests).
+These checks live in Rust; `fit()` does no pre-check of its own, so every case
+here surfaces as a `ValueError` from `_native.fit`.
 Mirrored in r/tests/testthat/test-response-domain.R - change together.
 """
 
@@ -21,6 +21,7 @@ def test_poisson_negative_response_raises():
         glmm.fit(data, "y ~ x", "poisson")
 
 
-def test_dispersion_zero_raises():
-    with pytest.raises(ValueError, match="dispersion"):
-        glmm.fit(DATA, "y ~ x", "gamma", dispersion=0.0)
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_dispersion_not_finite_and_positive_raises(bad):
+    with pytest.raises(ValueError, match=r"^dispersion must be a finite number > 0, got "):
+        glmm.fit(DATA, "y ~ x", "gamma", dispersion=bad)

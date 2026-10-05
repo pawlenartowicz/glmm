@@ -529,6 +529,21 @@ test_that("residuals: response and pearson, nothing else", {
   expect_error(residuals(fit, type = "deviance"), "response.*pearson")
 })
 
+test_that("pearson residuals stay finite at extreme means", {
+  # V = mu^2 (Gamma) and mu^3 (inverse Gaussian) leave the double range here;
+  # sqrt(V) does not. Expected: (y - mu) / sqrt(phi * V).
+  fit <- structure(list(family_name = "gamma", dispersion = 0.5, weights = NULL,
+                        y = c(1.5e200, 1e-200), fitted = c(1e200, 2e-200),
+                        frame = data.frame(i = 1:2)),
+                   class = "fastglmm")
+  expect_equal(unname(residuals(fit, type = "pearson")), c(sqrt(0.5), -sqrt(0.5)))
+  fit$family_name <- "inversegaussian"
+  fit$dispersion <- 0.25
+  fit$y <- c(2e150, 2e-150)
+  fit$fitted <- c(1e150, 1e-150)
+  expect_equal(unname(residuals(fit, type = "pearson")), c(2e-75, 2e75))
+})
+
 test_that("tidy() and glance() dispatch through generics/broom", {
   d <- benchmark_data(seed = 112, family = "binomial")
   fit <- fastglmm(y ~ t + d + (1 | g), d, family = binomial())

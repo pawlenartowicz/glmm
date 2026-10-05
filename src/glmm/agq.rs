@@ -32,10 +32,12 @@ use crate::spec::Family;
 /// sort+dedup because a row can repeat across a cluster's crossed columns; here a row
 /// belongs to exactly one cluster, so no duplicates are possible.
 ///
-/// Wired into [`agq_deviance`]'s `cluster_rows` parameter, gated by
-/// `FitOptions::parallel_inner`.
+/// Wired into [`agq_deviance`]'s `cluster_rows` parameter: `fit_glmm` builds it
+/// in a `parallel` build when `FitOptions::parallel_inner` is set, and in a
+/// serial build for vector AGQ (`q_p ≥ 2`, no extra groupings).
 /// Built ONCE per fit in `fit_glmm` (`cluster_ids` doesn't change across BOBYQA
 /// evals), not once per eval.
+#[derive(Default)]
 pub(crate) struct ClusterRowIndex {
     /// Length `s+1`.
     ptr: Vec<u32>,
@@ -64,6 +66,34 @@ impl ClusterRowIndex {
             cursor[c as usize] += 1;
         }
         ClusterRowIndex { ptr, rows }
+    }
+
+    /// [`ClusterRowIndex::build`] into this index's own buffers, reusing their
+    /// capacity: the same counting sort, so the same `ptr`/`rows`.
+    pub(crate) fn rebuild(&mut self, cluster_ids: &[u32], s: usize) {
+        let n = cluster_ids.len();
+        self.ptr.clear();
+        self.ptr.resize(s + 1, 0);
+        for &c in cluster_ids {
+            self.ptr[c as usize + 1] += 1;
+        }
+        for c in 0..s {
+            self.ptr[c + 1] += self.ptr[c];
+        }
+        self.rows.clear();
+        self.rows.resize(n, 0);
+        // The per-cluster write cursor runs in `ptr` itself (`ptr[c]` ends at
+        // the start of cluster `c + 1`) and is shifted back one slot after the
+        // pass, so no second buffer.
+        for (i, &c) in cluster_ids.iter().enumerate() {
+            let cur = &mut self.ptr[c as usize];
+            self.rows[*cur as usize] = i as u32;
+            *cur += 1;
+        }
+        for c in (1..=s).rev() {
+            self.ptr[c] = self.ptr[c - 1];
+        }
+        self.ptr[0] = 0;
     }
 
     /// Cluster `c`'s row indices, ascending original-row order.
@@ -521,7 +551,9 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
         *sum_c = acc_sum;
     };
     match cluster_rows {
-        // Prebuilt CSR (parallel_inner): rayon-parallel under the feature, serial
+        // Prebuilt CSR (`fit_glmm` builds it once per fit: in a `parallel` build
+        // when `parallel_inner` is set, in a serial build always; a derivative
+        // scratch hands in its own): rayon-parallel under the feature, serial
         // otherwise. Cluster-outer either way.
         Some(idx) => {
             #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
@@ -537,7 +569,8 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
                 per_cluster(idx, c, sc);
             }
         }
-        // Serial fallback (no prebuilt CSR — FD-Hessian workers, serial builds).
+        // Fallback with no prebuilt CSR (FD-Hessian workers, a `parallel` build
+        // with `parallel_inner` off).
         // The vector kernel is cluster-outer only (no node-outer variant: at
         // 49–729 nodes/cluster it is the sole sensible shape), so build a
         // transient index here — O(n), negligible against the k^q·n node sweeps.

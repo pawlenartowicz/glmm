@@ -72,19 +72,20 @@ the loop — no single-fit benchmark claim is made.
 ## 4. Measured optimizer schedule
 
 **What.** The BOBYQA configuration is tuned, not default: interpolation-set
-size `⌈1.5n⌉+1` instead of Powell's `2n+1` (from `n_θ ≥ 3`), a trust-radius
-schedule scaled to the start point, a stopping radius relaxed from `1e-8` to
-`1e-6`, and for GLMMs one of three outer routes, fixed per shape and never
-mixed within a fit: `Joint` runs a single θ-and-β BOBYQA; `PqlThenJoint` runs a
-θ-only warm-start pass first (β profiled by PQL inside PIRLS), then a joint
-`[θ|β]` polish whose status alone decides convergence — skipping the warm-start
-pass is bit-identical, just slower; `ExactProfile` profiles β out exactly at
-each candidate θ, so that single θ-only search already reaches the Laplace
-optimum and its status alone decides convergence, with no joint polish after
-it. The routing is a three-way chain: `ExactProfile` takes every nAGQ=1
-non-Gamma shape on the blocked or structured layout; of what is left, `Joint`
-takes `nAGQ > 1` and the small `n_θ ≤ 2 && p ≤ 4` shapes; `PqlThenJoint` takes
-the rest — the wider Gamma and packed-row shapes.
+size `⌈1.5n⌉+1` instead of Powell's `2n+1` (from `n_θ ≥ 3`), a start radius per
+kind of search (wide from the blind start, narrow from a warm start or for the
+polish), a stopping radius relaxed from `1e-8` to `1e-6`, and for GLMMs one of
+three outer routes, fixed per shape and never mixed within a fit: `Joint` runs
+a single θ-and-β BOBYQA; `PqlThenJoint` runs a θ-only warm-start pass first (β
+profiled by PQL inside PIRLS), then a joint `[θ|β]` polish whose status alone
+decides convergence — skipping the warm-start pass is bit-identical, just
+slower; `ExactProfile` profiles β out exactly at each candidate θ, so that
+single θ-only search already reaches the Laplace optimum and its status alone
+decides convergence, with no joint polish after it. The routing is a three-way
+chain: `ExactProfile` takes every nAGQ=1 shape on the blocked or
+structured layout; of what is left, `Joint` takes `nAGQ > 1` and the small
+`n_θ ≤ 2 && p ≤ 4` shapes; `PqlThenJoint` takes the rest — the wider
+packed-row shapes.
 
 **Why it is faster.** Every choice was swept against the validation corpus and
 kept only where it cut evaluations without moving any gated result: the `npt`
@@ -136,7 +137,8 @@ warning or an exception:
   case above, which is exact aliasing.
 - Variance component at zero: pinned to exactly `0.0` (every diagonal
   component ≤ 1e-4), fit still counted converged, reported through
-  `Diagnostics::singular`/`Diagnostics::pinned`.
+  `Diagnostics::singular`/`Diagnostics::pinned`. On a GLMM the pin is kept only
+  when it leaves the deviance within 1e-6 of the search's best point.
 - Optimizer cap-out on a flat plateau: the best finite point is returned with
   `converged: false`, not a NaN fill.
 - Genuine numerical failure: NaN-filled, non-converged — never a crash.

@@ -17,7 +17,6 @@ use faer::reborrow::{IntoConst, Reborrow, ReborrowMut};
 use faer::{Accum, MatMut, MatRef, Par};
 
 use crate::standardize::ColumnScaling;
-use crate::FLOAT_NEAR_ZERO;
 
 /// Rows per widened f64 panel in the suff-stats GEMM accumulate
 /// (`OlsSuffStats::add_rows`). Bounds the f64
@@ -125,7 +124,7 @@ impl<'w> OlsSuffStats<'w> {
     /// rayon loop). GEMM's blocked accumulation keeps the FP-add chain off the
     /// critical path, unlike a per-row rank-1 triangle update, which serializes
     /// one add per row (mirrors glm.rs's X'WX conversion). `yty`/`sum_y` stay
-    /// scalar in row order — bit-identical to the pre-panel loop.
+    /// scalar in row order.
     ///
     /// Caller's responsibility: `x_block.nrows() == y_block.len()` and the
     /// column count matches the workspace's predictor count.
@@ -188,7 +187,11 @@ impl<'w> OlsSuffStats<'w> {
 /// - `upper=false`: lower-triangular factor; row access `factor[(i, k)]`.
 /// - `upper=true`:  upper-triangular factor; column access `factor[(k, i)]`.
 ///
-/// Returns `f64::NAN` immediately on any near-zero diagonal element.
+/// Returns `f64::NAN` immediately on a zero diagonal element. Only exact zero:
+/// the factor carries the units of the matrix it factors (`X'WX` those of the
+/// IRLS weight, 1/μ on inverse-Gaussian/log), so an absolute floor on its
+/// diagonal turns small units into a refusal, and a non-positive-definite
+/// matrix never reaches here (its Cholesky already fails).
 /// The `b` closure supplies the right-hand side: `b(i)` is called once per row.
 ///
 /// This de-duplicates the forward-substitution + norm-squared accumulation
@@ -217,7 +220,7 @@ pub(crate) fn triangular_solve_norm_sq(
             } * scratch[k];
         }
         let diag = factor[(i, i)];
-        if diag.abs() < FLOAT_NEAR_ZERO {
+        if diag == 0.0 {
             return f64::NAN;
         }
         scratch[i] = acc / diag;
@@ -433,6 +436,7 @@ pub fn fit_suff_stats_t_sq<'a>(
         xtx_work,
         scratch,
         ColumnScaling::IDENTITY,
+        None,
     )
 }
 
@@ -440,6 +444,11 @@ pub fn fit_suff_stats_t_sq<'a>(
 /// (`x̃ = X·B`, `β = B·β̃`). The returned `betas` are β̃, on the design the
 /// statistics were accumulated from; `var_diag` and `t_sq` are the caller's:
 /// `Var(βₜ) = σ̂²·‖L⁻¹bₜ‖²` with `bₜ` row `t` of `B`, `t² = βₜ²/Var(βₜ)`.
+///
+/// `qr`: the statistics were accumulated on `X·U⁻¹` (`lmm::DesignQr`), whose
+/// Gram is well conditioned where `X`'s is not. The factor and β come back
+/// mapped to `X` — `L = Uᵀ·L̃`, `β = U⁻¹·β̃` — so the view reads as if `X`
+/// itself had been factored, with `X`'s digits kept.
 #[expect(
     clippy::too_many_arguments,
     reason = "sufficient-statistics kernel; each arg is a distinct precomputed input"
@@ -454,6 +463,7 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
     mut xtx_work: MatMut<'_, f64>,
     scratch: OlsScratch<'a>,
     map: &ColumnScaling,
+    qr: Option<&crate::lmm::DesignQr>,
 ) -> OlsFitView<'a> {
     let p = xty.len();
     let t = target_indices.len();
@@ -501,9 +511,9 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
         }
     }
 
-    let chol = match xtx_work.rb().llt(faer::Side::Lower) {
-        Ok(c) => c,
-        Err(_) => {
+    let chol = match crate::linalg::SeqLlt::new(xtx_work.rb()) {
+        Some(c) => c,
+        None => {
             return nonconverged_view(
                 &fit_betas[..p],
                 &fit_var_diag[..t],
@@ -533,7 +543,6 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
     // pre-dispatch alias gate tests the raw `x` and cannot see a design that
     // only goes singular under `W`.
     let l = chol.L();
-    let (pivot, pivot_col) = min_pivot_ratio(l, p);
 
     // Copy L into the caller-owned `fit_factor` so the returned view borrows
     // workspace storage rather than the locally-owned `l` Mat.
@@ -548,7 +557,6 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
     for j in 0..p {
         fit_rhs[(j, 0)] = xty[j];
     }
-    use faer::linalg::solvers::Solve;
     chol.solve_in_place(fit_rhs.rb_mut().subrows_mut(0, p));
     for j in 0..p {
         fit_betas[j] = fit_rhs[(j, 0)];
@@ -560,6 +568,12 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
         bty += fit_betas[j] * xty[j];
     }
     let rss = yty - bty;
+    // β̃'X̃'y = β'X'y, so the RSS above needs no mapping; β and the factor do.
+    if let Some(qr) = qr {
+        qr.map_beta(&mut fit_betas[..p]);
+        qr.map_factor(fit_factor.rb_mut().submatrix_mut(0, 0, p, p));
+    }
+    let (pivot, pivot_col) = min_pivot_ratio(fit_factor.rb(), p);
     let df_resid = (n - p) as u32;
     let sigma_sq = rss / df_resid as f64;
     let sst = yty - (sum_y * sum_y) / n as f64;
@@ -582,7 +596,7 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
         );
         let vd = sigma_sq * norm_sq;
         fit_var_diag[out_idx] = vd;
-        if vd > FLOAT_NEAR_ZERO && vd.is_finite() {
+        if vd > 0.0 && vd.is_finite() {
             let beta_j = map.beta_coef(tj, &fit_betas[..p]);
             fit_t_sq[out_idx] = (beta_j * beta_j) / vd;
         } else {
@@ -622,7 +636,7 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
 /// ```
 ///
 /// Returns `NaN` on any numerical failure (non-converged fit, out-of-range
-/// indices, near-zero variance).
+/// indices, a variance that is not positive).
 ///
 /// Valid only on a view fitted without a column map (`fit_suff_stats_t_sq`):
 /// it reads `betas` and `factor` as the caller's own coefficients and Gram.
@@ -656,7 +670,7 @@ pub fn ols_contrast_t_sq(fit: &OlsFitView<'_>, p_col: u32, n_col: u32, scratch: 
         false, // lower-triangular L: row access factor[(i, k)]
     );
     let var = fit.sigma_sq * norm_sq;
-    if var <= FLOAT_NEAR_ZERO || !var.is_finite() {
+    if var <= 0.0 || !var.is_finite() {
         return f64::NAN;
     }
 
@@ -811,10 +825,9 @@ mod tests {
         assert_eq!(ws_split.suff_n_rows, n);
     }
 
-    /// Regression net for the panel-GEMM rewrite: `add_rows` must match
-    /// the pre-panel per-row rank-1 triangle (inlined verbatim below as the
-    /// oracle). X'X / X'y reassociate under the GEMM — band 1e-12 relative,
-    /// measured max 2.0e-15 (first post-rewrite run); yty / sum_y stay scalar in
+    /// `add_rows`'s panel GEMM must match a per-row rank-1 triangle
+    /// (inlined below as the oracle). X'X / X'y reassociate under the GEMM —
+    /// band 1e-12 relative, measured max 2.0e-15; yty / sum_y stay scalar in
     /// the original row order and must be bit-identical. n = 611 crosses two
     /// PANEL_ROWS=256 boundaries plus a 99-row tail.
     #[test]
@@ -828,7 +841,7 @@ mod tests {
             .map(|i| ((((i * 31 + 7) % 53) as f64) / 9.0 - 2.5).cos())
             .collect();
 
-        // Oracle: the pre-panel scalar accumulation, verbatim.
+        // Oracle: per-row scalar accumulation.
         let mut ref_xtx = Mat::<f64>::zeros(p, p);
         let mut ref_xty = vec![0.0f64; p];
         let (mut ref_yty, mut ref_sum_y) = (0.0f64, 0.0f64);
@@ -1122,14 +1135,13 @@ mod tests {
         assert!(got.is_nan(), "non-converged fit must return NaN, got={got}");
     }
 
-    /// `triangular_solve_norm_sq`'s near-zero-diagonal guard has never run:
-    /// every production caller only ever hands it a Cholesky factor `llt`
-    /// already accepted (diagonal strictly positive by construction). Drive
-    /// it directly to pin both sides of the `FLOAT_NEAR_ZERO` (1e-30) band —
-    /// a pivot inside it must come back NaN, and an ordinary small pivot just
-    /// above it must still solve.
+    /// `triangular_solve_norm_sq`'s zero-diagonal guard never runs in
+    /// production: every caller hands it a factor whose Cholesky was accepted
+    /// (diagonal strictly positive by construction). Drive it directly: an
+    /// exact zero pivot comes back NaN, and a pivot of 1e-35, a factor in small
+    /// units, solves like any other.
     #[test]
-    fn triangular_solve_norm_sq_near_zero_diagonal_returns_nan() {
+    fn triangular_solve_norm_sq_zero_diagonal_returns_nan() {
         let p = 2;
         let mut factor = Mat::<f64>::zeros(p, p);
         factor[(0, 0)] = 2.0;
@@ -1137,18 +1149,16 @@ mod tests {
         let mut scratch = vec![0.0_f64; p];
         let b = |i: usize| if i == 0 { 1.0 } else { 0.0 };
 
-        factor[(1, 1)] = 1e-35; // inside the 1e-30 band, not exactly zero
+        factor[(1, 1)] = 0.0;
         let got = triangular_solve_norm_sq(factor.as_ref(), b, &mut scratch, p, false);
-        assert!(
-            got.is_nan(),
-            "diagonal inside FLOAT_NEAR_ZERO must return NaN, got {got}"
-        );
+        assert!(got.is_nan(), "a zero diagonal must return NaN, got {got}");
 
-        factor[(1, 1)] = 1e-6; // small but outside the band
+        factor[(1, 1)] = 1e-35;
         let got = triangular_solve_norm_sq(factor.as_ref(), b, &mut scratch, p, false);
+        // u = (1/2, −(1/2)/1e-35): the second entry dominates ‖u‖².
         assert!(
-            got.is_finite() && got > 0.0,
-            "a pivot above the band must solve normally, got {got}"
+            (got - 0.25e70).abs() <= 1e-15 * 0.25e70,
+            "a 1e-35 pivot must solve normally, got {got}"
         );
     }
 

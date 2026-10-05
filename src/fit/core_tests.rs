@@ -487,6 +487,63 @@ fn fitview_diagnostics_flag_a_weighted_collinear_ols_fit() {
     assert!(cold.converged() && cold.aliased() == vec![false; p]);
 }
 
+/// [`glmm_nb_intercept_case`] plus a near-duplicate of its slope column (the
+/// construction of `fitview_diagnostics_flag_a_rank_deficient_lmm_draw`).
+fn ill_conditioned_nb_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    const D: f64 = 1e-7;
+    let (x2, y, n, p2, model, ids, opts) = glmm_nb_intercept_case();
+    let p = p2 + 1;
+    let mut x = vec![0.0f64; n * p];
+    for i in 0..n {
+        x[i * p..i * p + p2].copy_from_slice(&x2[i * p2..(i + 1) * p2]);
+        x[i * p + p2] = 0.1 * x2[i * p2 + 1] * (1.0 + D * if i % 2 == 0 { 1.0 } else { -1.0 });
+    }
+    (x, y, n, p, model, ids, opts)
+}
+
+/// The NB routes assemble their `Fit` inside the kernel, so the loop-tier
+/// carrier is read back off it. An ill-conditioned draw must reach the carrier
+/// with the pivot and column the assembled `Fit`'s `Note::IllConditioned`
+/// carries, on both NB routes. `fit_on` skips the alias gate, so the
+/// near-duplicate column of [`ill_conditioned_nb_case`] reaches the solver.
+#[test]
+fn fitview_diagnostics_flag_an_ill_conditioned_nb_draw() {
+    let (x, y, n, p, mixed, ids, opts) = ill_conditioned_nb_case();
+    let glm = ModelSpec {
+        family: mixed.family,
+        re: None,
+    };
+    for model in [glm, mixed] {
+        let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+        let mut ws = build_workspace(&sized, perm, n, p, &opts);
+        assert!(ws.is_prebuilt());
+        let view = fit_on(&mut ws, &x, &y, &ids, None, &opts);
+        let d = view.diagnostics();
+        let fit = view.into_fit(&x, &y, &ids, n, p, &model, &opts);
+        let mixed = model.re.is_some();
+        let (columns, pivot) = fit
+            .diagnostics
+            .notes
+            .iter()
+            .find_map(|note| match note {
+                crate::Note::IllConditioned { columns, pivot } => Some((columns.clone(), *pivot)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("mixed={mixed}: no IllConditioned note on the Fit"));
+        assert!(d.ill_conditioned, "mixed={mixed}: carrier misses the note");
+        assert_eq!(d.pivot.to_bits(), pivot.to_bits(), "mixed={mixed}: pivot");
+        assert_eq!(vec![d.pivot_col], columns, "mixed={mixed}: column");
+    }
+}
+
 /// The carrier must cost the warm loop NOTHING. Not a bound like the kernel
 /// gates elsewhere — an exact zero: `FitDiagnostics` is `Copy` scalars only, so
 /// reading it per draw may not touch the heap on ANY route. The `Prebuilt` arm
@@ -520,6 +577,13 @@ fn fitview_diagnostics_zero_alloc() {
     let v_ols = fit_on(&mut ws_ols, &xo, &yo, &ido, None, &oo);
     let v_lmm = fit_on(&mut ws_lmm, &xl, &yl, &idl, None, &ol);
     let v_sparse = fit_on(&mut ws_sparse, &xs, &ys, &ids_s, None, &os);
+    // An NB GLM draw carrying `Note::IllConditioned`, so the `Prebuilt` arm's
+    // walk over the assembled `Fit`'s notes is exercised.
+    let (xn, yn, nn, pn, mn, idn, on) = ill_conditioned_nb_case();
+    let mn = ModelSpec { re: None, ..mn };
+    let mut ws_nb = build_workspace(&mn, Perm::IDENTITY, nn, pn, &on);
+    let v_nb = fit_on(&mut ws_nb, &xn, &yn, &idn, None, &on);
+    assert!(v_nb.diagnostics().ill_conditioned);
 
     let profiler = dhat::Profiler::builder().testing().build();
     // `diagnostics()` is pure and its input (`v_*`) does not change across
@@ -529,11 +593,12 @@ fn fitview_diagnostics_zero_alloc() {
     // this measuring one real call plus 999 no-op reads of the cached value
     // instead of N_CALLS calls. Black-boxing the reference too — an opaque
     // input each iteration — blocks that hoist, so the assertion below is
-    // actually over N_CALLS × 3 real `diagnostics()` calls.
+    // actually over N_CALLS × 4 real `diagnostics()` calls.
     for _ in 0..N_CALLS {
         std::hint::black_box(std::hint::black_box(&v_ols).diagnostics());
         std::hint::black_box(std::hint::black_box(&v_lmm).diagnostics());
         std::hint::black_box(std::hint::black_box(&v_sparse).diagnostics());
+        std::hint::black_box(std::hint::black_box(&v_nb).diagnostics());
     }
     let stats = dhat::HeapStats::get();
     drop(profiler);
@@ -642,6 +707,102 @@ fn fit_on_glmm_dense_matches_fit_cold() {
         fit_on(&mut ws, &x, &y2, &ids, None, &opts).into_fit(&x, &y2, &ids, n, p, &model, &opts);
     assert_near(&cold2.beta, &f2.beta, "draw-2 beta vs fit_cold");
     assert_near(&cold2.se, &f2.se, "draw-2 se vs fit_cold");
+}
+
+/// GLMM-NB random intercept: 8 clusters (`i % 8`, so every prefix of
+/// whole rounds keeps all 8 levels), a log-mean with a slope and a cluster
+/// shift, and a deterministic overdispersed count drawn off [`lcg`].
+fn glmm_nb_intercept_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let (n_clusters, n, p) = (8usize, 160usize, 2usize);
+    let mut state = 46u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    for i in 0..n {
+        let c = i % n_clusters;
+        ids_v[i] = c as u32;
+        let x1 = lcg(&mut state);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        let mu = (1.2 + 0.5 * x1 + 0.6 * (c as f64 - 3.5) / 3.5).exp();
+        // A log-scale spread around μ, then rounded: counts with more spread
+        // than a Poisson's, so θ_NB is finite and inside its box.
+        y[i] = (mu * (1.1 * lcg(&mut state)).exp()).round();
+    }
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![1],
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// The GLMM-NB route keeps one `GlmmWorkspace` across `fit_on` calls. Each
+/// call must give the fit a fresh workspace gives (`fit_cold`): a second
+/// draw with other counts, then a smaller `n` that leaves the trailing rows
+/// of the `n_max`-sized buffers stale.
+#[test]
+fn fit_on_glmm_nb_reused_ws_matches_fit_cold() {
+    let (x, y, n_max, p, model, ids, opts) = glmm_nb_intercept_case();
+    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n_max, p, &opts);
+    assert!(ws.is_prebuilt());
+    let y2: Vec<f64> = y
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| if i % 3 == 0 { v + 2.0 } else { v })
+        .collect();
+    let n_small = 96usize;
+    let draws: [(&[f64], usize); 3] = [(&y, n_max), (&y2, n_max), (&y2, n_small)];
+    let mut first_beta = None;
+    for (yd, n) in draws {
+        let (xd, yd) = (&x[..n * p], &yd[..n]);
+        let ids_n = GroupIds {
+            primary: sized_ids.primary[..n].to_vec(),
+            extra: vec![],
+        };
+        let cold = fit_cold(xd, yd, n, p, &model, &ids_n, &opts);
+        assert!(cold.converged(), "n={n}: the fixture must converge");
+        let via = fit_on(&mut ws, xd, yd, &ids_n, None, &opts)
+            .into_fit(xd, yd, &ids_n, n, p, &model, &opts);
+        assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
+        assert_near(&cold.se, &via.se, &format!("n={n} se"));
+        assert_near(&cold.tau2, &via.tau2, &format!("n={n} tau2"));
+        assert_near(
+            &[cold.dispersion],
+            &[via.dispersion],
+            &format!("n={n} theta_nb"),
+        );
+        first_beta.get_or_insert(via.beta[1]);
+    }
+    // The draws must differ, or the reuse check above proves nothing.
+    let (x2, y2n) = (&x[..n_max * p], &y2[..n_max]);
+    let f2 = fit_cold(x2, y2n, n_max, p, &model, &ids, &opts);
+    assert!(
+        (f2.beta[1] - first_beta.unwrap()).abs() > 1e-6,
+        "draws are degenerate"
+    );
 }
 
 #[test]
@@ -1004,7 +1165,6 @@ fn fit_on_lmm_dense_varying_n_with_and_without_offset_matches_fit_cold() {
 /// Dense random-slope LMM whose slope column is deliberately far off unit RMS,
 /// so the standardization scales it and the θ̂ read-back in `FitView::new` has
 /// real work to do.
-#[cfg(feature = "alloc-tests")]
 fn lmm_slope_case() -> (
     Vec<f64>,
     Vec<f64>,
@@ -1114,11 +1274,11 @@ fn reordered_crossed_case() -> (
 /// all-intercept design, which is exactly the design that carries no RE column
 /// scale.
 ///
-/// `fit_on` as a whole cannot be measured at zero — the dense LMM solver
-/// allocates faer `llt` internals per BOBYQA eval, the same acceptance class as
-/// `lmm.rs`'s bounded twins — so the gate is a pin on the TOTAL over a fixed
-/// call count. Re-materializing θ̂ or re-cloning a start costs 2 blocks per draw,
-/// so a regression overshoots by `2 * N_CALLS`, well outside the pin.
+/// `fit_on` as a whole cannot be measured at zero — the post-fit Cholesky
+/// factors and the first warm call's BOBYQA instance allocate — so the gate is
+/// a pin on the TOTAL over a fixed call count. Re-materializing θ̂ or
+/// re-cloning a start costs 2 blocks per draw, so a regression overshoots by
+/// `2 * N_CALLS`, well outside the pin.
 ///
 /// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
 /// fit_on_theta_marshalling_bounded_alloc -- --ignored --test-threads=1`
@@ -1131,46 +1291,24 @@ fn reordered_crossed_case() -> (
 fn fit_on_theta_marshalling_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    // Measured exactly 9400 on this machine, under this test's own
-    // `RAYON_NUM_THREADS=1` + `--test-threads=1` protocol: ~40 blocks per
-    // arm-draw of faer `llt` internals plus one per-call vector of the
-    // warm start's slope scales (since removed, see the last re-pin), and
-    // nothing else. Pinned at the measurement
-    // with no slack — if faer's Cholesky internals change, re-measure and
-    // update, do not relax.
+    // Measured exactly 850 (2026-10-02) under this test's own `RAYON_NUM_THREADS=1` +
+    // `--test-threads=1` protocol, and the same at any `RAYON_NUM_THREADS`:
+    // 350 blocks for the two arms' warm BOBYQA instances (built on the first
+    // warm call, inside the window), then per iteration the `L` of each
+    // `linalg::SeqLlt` — two in each arm's Wald χ², one in the reordered arm's
+    // crossed-tail RE recovery — 5 × 100 = 500. Pinned at the measurement with
+    // no slack: if the count moves, re-measure and update, do not relax.
+    //
+    // dhat counts every thread, so the window must not race a thread that
+    // starts on its own: a faer call that reads the global parallelism
+    // (`Mat::llt`) spawns rayon's pool, and its worker's startup allocations
+    // (4 blocks) land inside or before the window depending on scheduling.
     //
     // The blocks this test exists to keep at ZERO are the marshalling ones — 5
     // per iteration in the code that motivated the gate (scaled arm: scale
     // vector + θ̂ copy; reordered arm: θ̂ copy + a two-`Vec` start clone). They
     // are still zero.
-    //
-    // `LmmGroupings::blind_theta_and_bounds`'s diagonal box is unbounded
-    // (`[-THETA_HI, THETA_HI]` on every θ coordinate, not `[0, THETA_HI]`) and
-    // `apply_campaign_overrides` doubles `max_fun` to `1000·n` — both change
-    // BOBYQA's interpolation set and trust-region path on every fit, warm
-    // start included, so a warm refit now runs more objective evaluations
-    // before reaching `rho_end` and pays more faer `llt` allocations per
-    // call. The per-call block count moved with it; this is the algorithm
-    // doing more evaluations to reach a correct endpoint, not a leak.
-    //
-    // The LMM fixed-effect orthogonalization (`lmm::DesignQr`) allocates
-    // nothing per call, but it changes the objective's last bits, and the warm
-    // restarts take 62 + 18 evaluations per iteration where they took 50 + 16
-    // before it: one faer `llt` block each, 14 × 100 = 1400 over the 8000 it
-    // replaced.
-    //
-    // Re-pinned 2026-10-01 at 9600: the design is standardized internally
-    // before the fit, which allocates nothing per call (its buffers live in the
-    // workspace) but moves the scaled arm's search path. Its warm restart takes
-    // 64 evaluations where it took 62 (the reordered arm stays at 18):
-    // 2 × 100 = 200 more `llt` blocks.
-    //
-    // Re-pinned 2026-10-01, P45 follow-up simplification: 9600 → 8200. The
-    // warm start no longer allocates its per-call slope-scale vector (100
-    // blocks), and with the slope scale folded into the standardization the
-    // warm restarts take 13 fewer evaluations per iteration between the two
-    // arms (1300 `llt` blocks).
-    const BOUND: u64 = 8200;
+    const BOUND: u64 = 850;
 
     let (xs, ys, ns, ps, ms, ids_s, os) = lmm_slope_case();
     let (sized_s, ids_s, perm_s) = spec_sized_from_ids_pub(&ms, &ids_s);
@@ -1224,6 +1362,168 @@ fn fit_on_theta_marshalling_bounded_alloc() {
         N_CALLS,
         BOUND
     );
+}
+
+/// A Poisson GLMM with one crossed grouping, on the structured layout
+/// (`packed = false`: 12 × 6 intercept levels, 240 rows) or the packed layout
+/// with the sparse factor of `A` (`packed = true`: a slope on the crossed
+/// grouping, 256 + 4·2 = 264 RE columns, past `PACKED_SPARSE_MIN_K`, 512
+/// rows). Row `i` sits in primary level `i % g1` and crossed level
+/// `(i / shift) % g2`; draws with the same `shift` share their rows' levels.
+/// The response and the offset are drawn from `seed`.
+fn glmm_pattern_draw(
+    packed: bool,
+    shift: usize,
+    seed: u64,
+) -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let (g1, g2, n, p) = if packed {
+        (256usize, 4usize, 512usize, 2usize)
+    } else {
+        (12, 6, 240, 2)
+    };
+    let mut st = seed;
+    let u1: Vec<f64> = (0..g1).map(|_| 0.5 * lcg(&mut st)).collect();
+    let u2: Vec<f64> = (0..g2).map(|_| 0.5 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut offset = vec![0.0f64; n];
+    let (mut pid, mut eid) = (vec![0u32; n], vec![0u32; n]);
+    for i in 0..n {
+        let (c1, c2) = (i % g1, (i / shift) % g2);
+        pid[i] = c1 as u32;
+        eid[i] = c2 as u32;
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        offset[i] = 0.1 * lcg(&mut st);
+        let eta = 0.5 + 0.3 * x1 + u1[c1] + u2[c2] * (1.0 + 0.5 * x1) + offset[i];
+        // Poisson draw by Knuth's product of uniforms.
+        let (floor, mut count, mut prod) = ((-eta.exp()).exp(), 0.0f64, 1.0f64);
+        loop {
+            prod *= 0.5 * (lcg(&mut st) + 1.0);
+            if prod <= floor {
+                break;
+            }
+            count += 1.0;
+        }
+        y[i] = count;
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 1 },
+                slopes: if packed { vec![1] } else { vec![] },
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: pid,
+        extra: vec![eid],
+    };
+    let opts = FitOptions {
+        target_indices: vec![1],
+        offset: Some(offset),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// The GLMM workspace keeps the packed columns, the sparse factor of `A` and
+/// the crossed-Schur symbolic factor across `fit_on` draws on the same level
+/// ids, and rebuilds them for new ids at the same `n`. Either way each draw
+/// must give, bit for bit, the fit a fresh workspace gives: draws 1 → 2 keep
+/// the ids and change the response and offset, draw 3 moves every row's
+/// crossed level, draw 4 returns to the first ids.
+#[test]
+fn fit_on_glmm_reused_pattern_matches_a_fresh_workspace() {
+    for packed in [false, true] {
+        let mut reused = None;
+        for (shift, seed) in [(7usize, 1u64), (7, 2), (3, 3), (7, 4)] {
+            let (x, y, n, p, model, ids, opts) = glmm_pattern_draw(packed, shift, seed);
+            let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+            let ws = reused.get_or_insert_with(|| build_workspace(&sized, perm, n, p, &opts));
+            let a = fit_on(ws, &x, &y, &ids, None, &opts);
+            let mut fresh = build_workspace(&sized, perm, n, p, &opts);
+            let b = fit_on(&mut fresh, &x, &y, &ids, None, &opts);
+            let tag = format!("packed={packed} shift={shift} seed={seed}");
+            assert!(a.converged(), "{tag}: the fixture must converge");
+            let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(a.betas()), bits(b.betas()), "{tag}: β");
+            assert_eq!(bits(a.theta()), bits(b.theta()), "{tag}: θ");
+            assert_eq!(bits(a.var_diag()), bits(b.var_diag()), "{tag}: Var(β)");
+            assert_eq!(a.n_eval(), b.n_eval(), "{tag}: evaluations");
+        }
+        let Some(super::FitWorkspace {
+            kind: super::FitKind::Glmm { ws },
+            ..
+        }) = &reused
+        else {
+            panic!("packed={packed}: the fixture must build a GLMM workspace");
+        };
+        let layout = if packed {
+            crate::glmm::GlmmLayout::Packed
+        } else {
+            crate::glmm::GlmmLayout::Structured
+        };
+        assert_eq!(ws.layout, layout);
+        assert_eq!(ws.packed.sparse.is_some(), packed);
+        assert_eq!(ws.pattern.structured_schur.is_some(), !packed);
+    }
+}
+
+/// [`super::super::glmm::prep_glmm_design`] on the level ids the workspace
+/// was last prepared from allocates nothing, on the structured layout (the
+/// crossed-Schur symbolic factor) and on the packed one (the sparse factor of
+/// `A`): the symbolic structures are kept and the offset is copied into the
+/// workspace's own buffer.
+///
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// prep_glmm_design_on_the_same_ids_allocates_nothing -- --ignored --test-threads=1`
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn prep_glmm_design_on_the_same_ids_allocates_nothing() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: u64 = 10;
+    for packed in [false, true] {
+        let (_x, _y, n, p, model, ids, opts) = glmm_pattern_draw(packed, 7, 1);
+        let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+        let mut fws = build_workspace(&sized, perm, n, p, &opts);
+        let super::FitKind::Glmm { ws } = &mut fws.kind else {
+            panic!("packed={packed}: the fixture must build a GLMM workspace");
+        };
+        let prep = |ws: &mut crate::glmm::GlmmWorkspace| {
+            super::super::glmm::prep_glmm_design(ws, &ids.primary, &ids.extra, n, &opts);
+        };
+        prep(ws);
+        assert_eq!(ws.packed.sparse.is_some(), packed);
+        assert_eq!(ws.pattern.structured_schur.is_some(), !packed);
+        crate::test_support::settle_background_allocs();
+        let profiler = dhat::Profiler::builder().testing().build();
+        for _ in 0..N_CALLS {
+            prep(ws);
+        }
+        let stats = dhat::HeapStats::get();
+        drop(profiler);
+        assert_eq!(
+            stats.total_blocks, 0,
+            "packed={packed}: {N_CALLS} preps on the same ids allocated {} blocks",
+            stats.total_blocks
+        );
+    }
 }
 
 /// Semantics pin for the shrink counter: `evals_after_last_improve` is the
@@ -1306,10 +1606,10 @@ fn fit_carries_zeroed_counters_on_closed_form_routes() {
 /// The GLMM outer-search route splits which BOBYQA stage runs
 /// (`documentation/algorithms-glmm.md`'s "β profiling — the three outer
 /// routes" section): `ExactProfile` (cbpp, binomial-logit, single intercept
-/// grouping) runs stage 1 only; `Joint` (the Gamma fixture below, `n_theta =
-/// 1`, `p = 3`, which `exact_profile_shape` excludes but `n_theta <= 2 && p
-/// <= 4` still selects) runs stage 2 only. The pair separates the route
-/// without reading the in-crate-only `GlmmWorkspace.outer_search` field.
+/// grouping) runs stage 1 only; `Joint` (the Gamma fixture below at `nagq = 7`,
+/// which `exact_profile_shape` excludes as AGQ) runs stage 2 only. The pair
+/// separates the route without reading the in-crate-only
+/// `GlmmWorkspace.outer_search` field.
 #[cfg(feature = "counters")]
 #[test]
 fn counters_show_the_outer_search_stage_split() {
@@ -1362,6 +1662,7 @@ fn counters_show_the_outer_search_stage_split() {
         },
         &FitOptions {
             target_indices: (0..p as u32).collect(),
+            nagq: 7,
             ..FitOptions::default()
         },
     );
@@ -1488,4 +1789,64 @@ fn over_envelope_vech_fits_through_a_warm_theta_start() {
     let fit = crate::fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
     assert_eq!(fit.tau2.len(), OVER_ENVELOPE_N_THETA);
     assert_eq!(fit.beta.len(), p);
+}
+
+/// `set_fixed_design(true)` reuses the design-only setup across draws (column
+/// statistics, the standardized `x_mat`, and on the dense LMM route `U` and the
+/// design part of the sufficient statistics). Every draw's fit must be
+/// bit-identical to the same draw on a workspace without the promise:
+/// unweighted, and weighted with an offset (the response-only rebuild reads
+/// both).
+#[test]
+fn fit_on_fixed_design_matches_a_plain_workspace() {
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let weighted = FitOptions {
+        weights: Some((0..n).map(|i| 0.5 + (i % 3) as f64 * 0.5).collect()),
+        offset: Some((0..n).map(|i| 0.1 * (i % 5) as f64).collect()),
+        ..opts.clone()
+    };
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for o in [&opts, &weighted] {
+        let mut fixed = build_workspace(&sized, perm, n, p, o);
+        let mut plain = build_workspace(&sized, perm, n, p, o);
+        fixed.set_fixed_design(true);
+        for draw in 0..3 {
+            let yd: Vec<f64> = y
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| v + 0.2 * draw as f64 * ((i % 7) as f64 - 3.0))
+                .collect();
+            let a = fit_on(&mut fixed, &x, &yd, &ids, None, o);
+            let ra = (
+                bits(a.betas()),
+                bits(a.theta()),
+                bits(a.var_diag()),
+                a.n_eval(),
+            );
+            let b = fit_on(&mut plain, &x, &yd, &ids, None, o);
+            let rb = (
+                bits(b.betas()),
+                bits(b.theta()),
+                bits(b.var_diag()),
+                b.n_eval(),
+            );
+            assert_eq!(ra, rb, "weighted={} draw {draw}", o.weights.is_some());
+        }
+    }
+}
+
+/// The fixed-design promise is checked in debug builds: a changed `x` under
+/// `set_fixed_design(true)` panics instead of fitting the old design.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "set_fixed_design(true) promises")]
+fn fit_on_fixed_design_panics_in_debug_when_x_changes() {
+    let (mut x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    ws.set_fixed_design(true);
+    let _ = fit_on(&mut ws, &x, &y, &ids, None, &opts);
+    x[p + 1] += 1.0;
+    let _ = fit_on(&mut ws, &x, &y, &ids, None, &opts);
 }

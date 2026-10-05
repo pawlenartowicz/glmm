@@ -221,14 +221,40 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         lam,
         a_blocks,
         a_rhs,
+        x_rows,
+        bt_rows,
         ..
     } = scratch;
     let q = g.primary_q;
     let s = g.n_primary;
     let k = q * s;
     let p = beta.len();
+    // The `f64` β-Profile solve reads `X` row by row in its hot passes
+    // (`B' = X'WM`, the exact `c_β` passes, `η_fixed`), so it takes a
+    // row-major copy once per solve (`PirlsScratch::x_rows`): one contiguous
+    // row per observation instead of `p` bounds-checked `MatRef` lookups. Every
+    // accumulator sums in the same row order as on the `MatRef` path.
+    let rows_ok = T::IS_F64
+        && dual.is_none()
+        && p > 0
+        && matches!(beta_step, BetaStep::Profile { .. })
+        && x_rows.len() >= n * p
+        && bt_rows.len() >= k * p;
+    if rows_ok {
+        fill_x_rows(x, &mut x_rows[..n * p], n, p);
+    }
+    let xr_all: &[f64] = if rows_ok { &x_rows[..n * p] } else { &[] };
+    macro_rules! refresh {
+        () => {
+            if rows_ok {
+                refresh_eta_fixed_rows(xr_all, p, beta, eta_fixed, n, offset)
+            } else {
+                refresh_eta_fixed(x, beta, eta_fixed, n, p, offset)
+            }
+        };
+    }
     // η_fixed,ᵢ = Σ_j x·β, hoisted out of the iteration (β fixed within the solve).
-    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+    refresh!();
     // M = ZΛ_p (mᵢ = Λ_p'·zᵢ, zᵢ = [1, x[i, slope_cols]] pre-widened into z_buf
     // per fit) is invariant within one solve — Λ and x are fixed; the iteration
     // only mutates u/η/prob/w/blocks. Fill it once per solve. Measured on the
@@ -435,7 +461,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     for j in 0..p {
                         beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
                     }
-                    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+                    refresh!();
                 }
                 continue;
             }
@@ -485,98 +511,70 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         }
         // --- pass 3: the scatter — wᵢmᵢmᵢ' into cluster i's block, rᵢ·mᵢ into
         // its RHS — with the dual kernels' observed twin filled in the same row
-        // pass. ---
-        layout.scatter(
-            &w[..],
-            &prob[..],
-            &eta[..],
-            y,
-            prior_w,
-            weighted,
-            n,
-            dual.as_deref_mut(),
-        );
-        // Profile mode: accumulate the β-gradient X'ρ (ρ = effective residual) into
-        // `beta_rhs` — the joint system's bottom-block RHS. A dedicated pass off the
-        // fresh prob/eta/w (NOT folded into the scatter loop above), so the Fixed
-        // path stays byte-identical. Mirrors `pirls_solve_packed`'s Profile X'ρ fold.
-        if let BetaStep::Profile { beta_rhs, .. } = &mut beta_step {
-            for v in beta_rhs[..p].iter_mut() {
-                *v = 0.0;
+        // pass. On the `f64` β-Profile solve the same row pass also forms the
+        // border's `B = M'WX` (`fused_profile_rows`), summed in the same row
+        // order with the same expressions as the separate pass. ---
+        if rows_ok {
+            if let BetaStep::Profile { .. } = &mut beta_step {
+                fused_profile_rows(
+                    family,
+                    nb_theta,
+                    y,
+                    prior_w,
+                    &eta[..],
+                    &prob[..],
+                    &w[..],
+                    &m_buf[..],
+                    cluster_ids,
+                    xr_all,
+                    q,
+                    s,
+                    p,
+                    n,
+                    &mut layout.a_blocks[..],
+                    &mut layout.a_rhs[..],
+                    &mut bt_rows[..k * p],
+                );
             }
-            match family {
-                Family::Binomial {
-                    link: BinomialLink::Logit,
-                } => {
-                    for i in 0..n {
-                        let rho = prior_w[i] * (y[i] - prob[i].value());
-                        for j in 0..p {
-                            beta_rhs[j] += x[(i, j)] * rho;
-                        }
-                    }
-                }
-                other => {
-                    for i in 0..n {
-                        let rho = crate::family::row_score(
-                            other,
-                            nb_theta,
-                            y[i],
-                            prior_w[i],
-                            eta[i].value(),
-                            prob[i].value(),
-                        );
-                        for j in 0..p {
-                            beta_rhs[j] += x[(i, j)] * rho;
-                        }
-                    }
-                }
-            }
+        } else {
+            layout.scatter(
+                &w[..],
+                &prob[..],
+                &eta[..],
+                y,
+                prior_w,
+                weighted,
+                n,
+                dual.as_deref_mut(),
+            );
         }
-        // --- per block: rhs_f = (A_f−I)·u_old_f + g_f ; +I ; factor ; solve u_new.
+        // --- per block: rhs_f = g_f − u_old_f ; +I ; factor ; solve δu_f ;
+        // u_new_f = u_old_f + δu_f.
+        // The step is solved as the increment `A·δu = M'ρ − u_old`, not as the
+        // equal `A·u_new = (A − I)·u_old + M'ρ`. That form carries
+        // `(A − I)·u_old`, of size θ²·Σwᵢ·|u|, through the right-hand side and
+        // the solve, and its rounding lands in u_new undamped along any
+        // direction where A's eigenvalue is near 1 — a direction M (nearly)
+        // annihilates: crossed intercepts, a slope constant within a cluster.
+        // In the increment form the same rounding scales with |δu| and dies out
+        // as the solve converges. Measured on a Poisson `(1|g) + (1|h)` at
+        // counts near e³³ (θ²·Σwᵢ ≈ 1e15): ‖u‖² moved by 3e-3 between iterates,
+        // far outside the 1e-9 band, and the solve ran out its halvings; the
+        // increment form converges in 7 iterations. Mirrors
+        // `pirls_solve_blocked_extras` and `pirls_solve_packed` — change
+        // together.
         // `log|A|` comes off the factor that produces this step's u; the exit
         // refresh below replaces it and a_blocks with their values at the
         // returned u (a step may be re-taken after a halving, so every
-        // iteration re-factors).
-        // Three phases, in this order because of what each one reads. The fold
-        // below needs the UNFACTORED blocks and the pre-step `u`, and the
-        // observed twin needs `a_rhs`'s bare `g_f` before the fold overwrites
-        // it — so the whole fold runs first. Then the factor (`+I`, Crout,
-        // `log|A|` off the pivots) and the `A⁻¹` solve, both over the whole
-        // block-diagonal `A`. Then, per cluster, the main solution into `u`,
-        // the observed twin's own factor and solve over it, and `‖u‖²`.
-        for f in 0..s {
-            let ablk = f * q * q;
-            let ubase = f * q;
-            // Observed right-hand side: rhs_obs = (A_obs,f − I)·u_old_f + g_f,
-            // staged in `obs_rhs` (the `a_rhs` packing) for the twin factor and
-            // solve below. The main block is formed and factored on every
-            // route — it is what `log|A|` and the returned factor come from.
-            if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
-                let DualStep {
-                    obs_blocks,
-                    obs_rhs,
-                    ..
-                } = &mut *d;
-                let ob = &obs_blocks[ablk..ablk + q * q];
-                for r in 0..q {
-                    let mut acc = layout.a_rhs[ubase + r];
-                    for c in 0..q {
-                        let (hi, lo) = if r >= c { (r, c) } else { (c, r) };
-                        acc += ob[hi * q + lo] * u[ubase + c];
-                    }
-                    obs_rhs[ubase + r] = acc;
-                }
-            }
-            // (A_f − I)·u_old_f added to g_f (in a_rhs), using the still-unfactored
-            // symmetric lower triangle.
-            for r in 0..q {
-                let mut acc = layout.a_rhs[ubase + r];
-                for c in 0..q {
-                    let (hi, lo) = if r >= c { (r, c) } else { (c, r) };
-                    acc += layout.a_blocks[ablk + hi * q + lo] * u[ubase + c];
-                }
-                layout.a_rhs[ubase + r] = acc;
-            }
+        // iteration re-factors). The observed twin solves the same right-hand
+        // side on its own factor, staged in `obs_rhs` (the `a_rhs` packing);
+        // the main block is formed and factored on every route — it is what
+        // `log|A|` and the returned factor come from.
+        for (r, &uc) in layout.a_rhs[..k].iter_mut().zip(&u[..k]) {
+            *r -= uc;
+        }
+        if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
+            d.obs_rhs[..k].copy_from_slice(&layout.a_rhs[..k]);
         }
         logdet = match layout.factor_logdet() {
             Some(ld) => ld,
@@ -602,7 +600,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                         for j in 0..p {
                             beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
                         }
-                        refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+                        refresh!();
                         continue 'iters;
                     }
                 }
@@ -619,8 +617,10 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         for f in 0..s {
             let ablk = f * q * q;
             let ubase = f * q;
-            // u_new_f = A_f⁻¹ rhs_f, solved above in `a_rhs`.
-            u[ubase..ubase + q].copy_from_slice(&layout.a_rhs[ubase..ubase + q]);
+            // u_new_f = u_old_f + A_f⁻¹ rhs_f, solved above in `a_rhs`.
+            for r in 0..q {
+                u[ubase + r] += layout.a_rhs[ubase + r];
+            }
             // Observed step: +I, factor, solve the staged right-hand side. A
             // non-PD observed block leaves this cluster on its Fisher solve.
             if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
@@ -636,7 +636,9 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 }
                 if glmm_block_chol(ob, q) {
                     glmm_block_solve(ob, q, &mut obs_rhs[ubase..ubase + q]);
-                    u[ubase..ubase + q].copy_from_slice(&obs_rhs[ubase..ubase + q]);
+                    for r in 0..q {
+                        u[ubase + r] = u_prev[ubase + r] + obs_rhs[ubase + r];
+                    }
                 } else {
                     *exact = false;
                 }
@@ -700,36 +702,55 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     *o = v.value();
                 }
                 // pass A: hᵢ, w'ᵢ → direct part into c_β, and gᵤ = ∂log|A|/∂u.
-                let mut mrow = [0.0_f64; crate::consts::MAX_PRIMARY_Q];
-                for i in 0..n {
-                    let f = cluster_ids[i] as usize;
-                    let ablk = f * q * q;
-                    for c in 0..q {
-                        mrow[c] = m_buf[i * q + c].value();
-                    }
-                    // The `dw/dη` of the curvature `log|A|` is built from:
-                    // `dW_obs/dη` where the objective is `log|A_obs|`
-                    // (`exact_obj`), the Fisher one otherwise.
-                    let h = block_leverage(&fac_f64[ablk..ablk + q * q], q, &mrow[..q]);
-                    // `hᵢ` is kept for the border's curvature
-                    // (`logdet_beta_curvature`).
-                    let wp = super::row_weight_eta_deriv(
-                        family,
-                        nb_theta,
-                        exact_obj,
-                        y[i],
-                        prior_w[i],
-                        eta[i].value(),
-                        prob[i].value(),
-                        w[i].value(),
-                    );
-                    curv_h[i] = h;
-                    let a = wp * h;
-                    for j in 0..p {
-                        logdet_beta[j] += a * x[(i, j)];
-                    }
-                    for c in 0..q {
-                        logdet_u[f * q + c] += a * mrow[c];
+                // The `dw/dη` of the curvature `log|A|` is built from
+                // `dW_obs/dη` where the objective is `log|A_obs|` (`exact_obj`),
+                // the Fisher one otherwise (`row_weight_eta_deriv`). Its per-row
+                // family dispatch is hoisted out of the row loop on the two
+                // canonical links, with `row_weight_eta_deriv`'s own closed form
+                // (logit `w(1−2μ)` off the tail, Poisson `w`), so the same
+                // value; `hᵢ` is kept for the border's curvature
+                // (`logdet_beta_curvature`).
+                {
+                    let pa = ExactPassA {
+                        fac: &fac_f64[..],
+                        m_buf: &m_buf[..],
+                        cluster_ids,
+                        x,
+                        xr_all,
+                        q,
+                        p,
+                        n,
+                    };
+                    let general = |i: usize| {
+                        super::row_weight_eta_deriv(
+                            family,
+                            nb_theta,
+                            exact_obj,
+                            y[i],
+                            prior_w[i],
+                            eta[i].value(),
+                            prob[i].value(),
+                            w[i].value(),
+                        )
+                    };
+                    match family {
+                        Family::Binomial {
+                            link: BinomialLink::Logit,
+                        } if !exact_obj => pa.run(curv_h, logdet_beta, logdet_u, |i| {
+                            let pr = prob[i].value();
+                            // `family::in_tail` on a binomial link.
+                            if pr <= crate::family::PROB_EPS
+                                || pr >= 1.0 - crate::family::UPPER_TAIL_Q
+                            {
+                                general(i)
+                            } else {
+                                w[i].value() * (1.0 - 2.0 * pr)
+                            }
+                        }),
+                        Family::Poisson { .. } if !exact_obj => {
+                            pa.run(curv_h, logdet_beta, logdet_u, |i| w[i].value())
+                        }
+                        _ => pa.run(curv_h, logdet_beta, logdet_u, general),
                     }
                 }
                 // Mode-consistency term for the merit below, formed here because
@@ -750,16 +771,31 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     );
                 }
                 // pass C: û path, c_β_j −= Σᵢ w̃ᵢ·(mᵢ·v_f)·xᵢⱼ.
-                for i in 0..n {
-                    let f = cluster_ids[i] as usize;
-                    let mut sdot = 0.0;
-                    for c in 0..q {
-                        sdot += m_buf[i * q + c].value() * logdet_u[f * q + c];
-                    }
-                    curv_sdot[i] = sdot;
-                    let a = w[i].value() * sdot;
-                    for j in 0..p {
-                        logdet_beta[j] -= a * x[(i, j)];
+                if rows_ok {
+                    with_const_p!(p, P => exact_pass_c_rows::<T, P>(
+                        &m_buf[..],
+                        &w[..],
+                        logdet_u,
+                        cluster_ids,
+                        xr_all,
+                        q,
+                        p,
+                        n,
+                        curv_sdot,
+                        logdet_beta,
+                    ));
+                } else {
+                    for i in 0..n {
+                        let f = cluster_ids[i] as usize;
+                        let mut sdot = 0.0;
+                        for c in 0..q {
+                            sdot += m_buf[i * q + c].value() * logdet_u[f * q + c];
+                        }
+                        curv_sdot[i] = sdot;
+                        let a = w[i].value() * sdot;
+                        for j in 0..p {
+                            logdet_beta[j] -= a * x[(i, j)];
+                        }
                     }
                 }
                 gu_dot_du
@@ -863,7 +899,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     for j in 0..p {
                         beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
                     }
-                    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+                    refresh!();
                     continue;
                 }
                 return (
@@ -892,13 +928,13 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         // this iteration's per-block factors: T = A⁻¹B, S_β = C − B'T,
         // δβ = S_β⁻¹·(X'ρ − B'δu₀), then u_joint = u_new − T·δβ (see
         // `se::packed_schur_fill`'s doc comment for the shared β-Schur Newton step
-        // this mirrors). Exact mode steps with S_β + ½·d²log|A|/dβ² on
-        // X'ρ − B'δu₀ − ½c_β (`logdet_beta_curvature`, `border_solve`). `m_buf`
-        // already holds mᵢ = Λ'zᵢ, so B's scatter reads it directly (cheaper than
-        // se.rs's per-row reconstruction). ---
+        // this mirrors), with S_β and the right-hand side formed from the design
+        // residual rows (`residual_border`). Exact mode steps with
+        // S_β + ½·d²log|A|/dβ² on X'ρ − B'δu₀ − ½c_β (`logdet_beta_curvature`,
+        // `border_solve`). `m_buf` already holds mᵢ = Λ'zᵢ, so B's scatter reads
+        // it directly (cheaper than se.rs's per-row reconstruction). ---
         if let BetaStep::Profile {
             exact,
-            xtwx,
             xtwm,
             ainv_mtwx,
             schur,
@@ -907,38 +943,30 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             ..
         } = &mut beta_step
         {
-            // C = X'WX (p×p) via the W∘X GEMM scratch `wx` — blocked_schur_fill's
-            // xtwx block, same product. GEMM fills the full p×p (the old scalar
-            // loop only filled+mirrored the lower triangle); every downstream read
-            // below is over the full matrix (`schur[(r,c)]` for `c in 0..p`), so
-            // this is exact.
-            for c in 0..p {
-                for i in 0..n {
-                    wx[(i, c)] = w[i].value() * x[(i, c)];
-                }
-            }
-            faer::linalg::matmul::matmul(
-                xtwx.as_mut(),
-                faer::Accum::Replace,
-                x.subrows(0, n).transpose(),
-                wx.as_ref().subrows(0, n),
-                1.0,
-                Par::Seq,
-            );
             // B' = X'WM (p×k), blocked: zero, then scatter the q_p coupling columns
             // per row into cluster f's column band. Uses the live `m_buf[i·q+c] = mᵢ`.
-            for r in 0..p {
+            if rows_ok {
+                // Accumulated by the fused row pass (`fused_profile_rows`).
                 for c in 0..k {
-                    xtwm[(r, c)] = 0.0;
+                    let src = &bt_rows[c * p..c * p + p];
+                    for r in 0..p {
+                        xtwm[(r, c)] = src[r];
+                    }
                 }
-            }
-            for i in 0..n {
-                let f = cluster_ids[i] as usize;
-                let wi = w[i].value();
+            } else {
                 for r in 0..p {
-                    let xw = x[(i, r)] * wi;
-                    for c in 0..q {
-                        xtwm[(r, f * q + c)] += xw * m_buf[i * q + c].value();
+                    for c in 0..k {
+                        xtwm[(r, c)] = 0.0;
+                    }
+                }
+                for i in 0..n {
+                    let f = cluster_ids[i] as usize;
+                    let wi = w[i].value();
+                    for r in 0..p {
+                        let xw = x[(i, r)] * wi;
+                        for c in 0..q {
+                            xtwm[(r, f * q + c)] += xw * m_buf[i * q + c].value();
+                        }
                     }
                 }
             }
@@ -958,25 +986,38 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                     }
                 }
             }
-            // S_β = C − B'·T (blocked_schur_fill:378-386). A block-diagonal, so the
-            // per-block solves equal the full A⁻¹M'WX and the Σ over k is exact.
-            for r in 0..p {
-                for c in 0..p {
-                    let mut sm = xtwx[(r, c)];
-                    for j in 0..k {
-                        sm -= xtwm[(r, j)] * ainv_mtwx[(j, c)];
+            // Residual rows rᵢ = xᵢ − T_fᵀmᵢ into `wx`, then S_β and the
+            // right-hand side off them. A block-diagonal, so the per-block
+            // solves equal the full A⁻¹M'WX and row i couples to its cluster's
+            // q columns only.
+            for i in 0..n {
+                let f = cluster_ids[i] as usize;
+                for col in 0..p {
+                    let mut r = x[(i, col)];
+                    for c in 0..q {
+                        r -= m_buf[i * q + c].value() * ainv_mtwx[(f * q + c, col)];
                     }
-                    schur[(r, c)] = sm;
+                    wx[(i, col)] = r;
                 }
             }
-            // rhs = X'ρ − B'·δu₀ (beta_rhs holds X'ρ; δu₀ = u_new − u_prev).
-            for r in 0..p {
-                let mut acc = 0.0;
-                for c in 0..k {
-                    acc += xtwm[(r, c)] * (u[c] - u_prev[c]).value();
-                }
-                beta_rhs[r] -= acc;
-            }
+            residual_border(
+                |i| w[i].value(),
+                |i| {
+                    profile_row_score(
+                        family,
+                        nb_theta,
+                        y[i],
+                        prior_w[i],
+                        eta[i].value(),
+                        prob[i].value(),
+                    )
+                },
+                wx.as_ref().subrows(0, n),
+                ainv_mtwx.as_ref().subrows(0, k),
+                |j| u_prev[j].value(),
+                schur,
+                &mut beta_rhs[..p],
+            );
             // Exact mode: the step is Newton on the Laplace profile, so it also
             // carries log|A|'s gradient `c_β` and curvature in β
             // (`logdet_beta_curvature`), with the same ½ as the objective's
@@ -1037,7 +1078,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             }
             // η_fixed depends on β; refresh for the next trial. `pen` must track the
             // moved u (‖u_joint‖²), so recompute it.
-            refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+            refresh!();
             pen = T::ZERO;
             #[allow(clippy::needless_range_loop)]
             for c in 0..k {
@@ -1056,7 +1097,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 for j in 0..p {
                     beta[j] = T::from_f64(beta_prev[j] + 0.5 * (beta[j].value() - beta_prev[j]));
                 }
-                refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+                refresh!();
             }
             pen = T::ZERO;
             #[allow(clippy::needless_range_loop)]
@@ -1133,4 +1174,452 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         }
     }
     (dev, pen, logdet, converged)
+}
+
+/// Row-major copy of the first `n` rows of `x` (`n×p`) into `out`
+/// (`out[i·p + j] = x[i, j]`), column by column off the contiguous columns the
+/// fit path's design always has. See `PirlsScratch::x_rows`.
+pub(super) fn fill_x_rows(x: MatRef<f64>, out: &mut [f64], n: usize, p: usize) {
+    for j in 0..p {
+        match x.col(j).try_as_col_major() {
+            Some(col) => {
+                let col = &col.as_slice()[..n];
+                for (i, &v) in col.iter().enumerate() {
+                    out[i * p + j] = v;
+                }
+            }
+            None => {
+                for i in 0..n {
+                    out[i * p + j] = x[(i, j)];
+                }
+            }
+        }
+    }
+}
+
+/// `refresh_eta_fixed` off the row-major `X` copy: the same `Σ_j x·β` per
+/// row, in the same `j` order, with the offset added afterwards.
+pub(super) fn refresh_eta_fixed_rows<T: Scalar>(
+    xr: &[f64],
+    p: usize,
+    beta: &[T],
+    eta_fixed: &mut [T],
+    n: usize,
+    offset: Option<&[f64]>,
+) {
+    with_const_p!(p, P => refresh_rows_p::<T, P>(xr, p, beta, eta_fixed, n));
+    if let Some(o) = offset {
+        for i in 0..n {
+            eta_fixed[i] += T::from_f64(o[i]);
+        }
+    }
+}
+
+/// Run `$body` with `const $P: usize` equal to the runtime `p` for
+/// `p ∈ 1..=8` (the row kernels below keep their `p`-long accumulators in
+/// registers then), and with the `DYN` sentinel otherwise.
+macro_rules! with_const_p {
+    ($p:expr, $P:ident => $body:expr) => {
+        match $p {
+            1 => {
+                const $P: usize = 1;
+                $body
+            }
+            2 => {
+                const $P: usize = 2;
+                $body
+            }
+            3 => {
+                const $P: usize = 3;
+                $body
+            }
+            4 => {
+                const $P: usize = 4;
+                $body
+            }
+            5 => {
+                const $P: usize = 5;
+                $body
+            }
+            6 => {
+                const $P: usize = 6;
+                $body
+            }
+            7 => {
+                const $P: usize = 7;
+                $body
+            }
+            8 => {
+                const $P: usize = 8;
+                $body
+            }
+            _ => {
+                const $P: usize = DYN;
+                $body
+            }
+        }
+    };
+}
+use with_const_p;
+
+/// `const P` sentinel of [`with_const_p`]: the kernels read the runtime `p`.
+const DYN: usize = 0;
+/// Largest `p` the fixed-size accumulators hold.
+const P_CAP: usize = 8;
+
+/// The `f64` β-Profile solve's row pass: the blocked scatter (`wᵢmᵢmᵢ'` into
+/// cluster `i`'s block, `rᵢ·mᵢ` into its right-hand side) and the border's
+/// `B = M'WX` into `bt` (`k×p` row-major, `bt[(f·q + c)·p + r]`), in one
+/// sweep. The scatter and `B'` accumulators get the same terms, in the same
+/// row order, as `BlockedFactor::scatter` and the border's `B'` scatter
+/// compute them.
+#[allow(clippy::too_many_arguments)]
+fn fused_profile_rows<T: Scalar>(
+    family: Family,
+    nb_theta: f64,
+    y: &[f64],
+    prior_w: &[f64],
+    eta: &[T],
+    prob: &[T],
+    w: &[T],
+    m_buf: &[T],
+    cluster_ids: &[u32],
+    xr_all: &[f64],
+    q: usize,
+    s: usize,
+    p: usize,
+    n: usize,
+    a_blocks: &mut [T],
+    a_rhs: &mut [T],
+    bt: &mut [f64],
+) {
+    with_const_p!(p, P => fused_profile_rows_p::<T, P>(
+        family, nb_theta, y, prior_w, eta, prob, w, m_buf, cluster_ids, xr_all, q, s, p, n,
+        a_blocks, a_rhs, bt,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn fused_profile_rows_p<T: Scalar, const P: usize>(
+    family: Family,
+    nb_theta: f64,
+    y: &[f64],
+    prior_w: &[f64],
+    eta: &[T],
+    prob: &[T],
+    w: &[T],
+    m_buf: &[T],
+    cluster_ids: &[u32],
+    xr_all: &[f64],
+    q: usize,
+    s: usize,
+    p_rt: usize,
+    n: usize,
+    a_blocks: &mut [T],
+    a_rhs: &mut [T],
+    bt: &mut [f64],
+) {
+    let p = if P == DYN { p_rt } else { P };
+    let k = q * s;
+    a_blocks[..s * q * q].fill(T::ZERO);
+    a_rhs[..k].fill(T::ZERO);
+    bt[..k * p].fill(0.0);
+    let logit = matches!(
+        family,
+        Family::Binomial {
+            link: BinomialLink::Logit
+        }
+    );
+    for i in 0..n {
+        let xr = &xr_all[i * p..i * p + p];
+        let f = cluster_ids[i] as usize;
+        let ubase = f * q;
+        let wi = w[i];
+        let pw = prior_w[i];
+        let resid = T::from_f64(pw)
+            * if logit {
+                T::from_f64(y[i]) - prob[i]
+            } else {
+                crate::family::row_score(family, nb_theta, y[i], 1.0, eta[i], prob[i])
+            };
+        let wf = wi.value();
+        if q == 1 {
+            let m0 = m_buf[i];
+            a_rhs[f] += m0 * resid;
+            a_blocks[f] += wi * m0 * m0;
+            let m0f = m0.value();
+            let bt_f = &mut bt[f * p..f * p + p];
+            for r in 0..p {
+                bt_f[r] += xr[r] * wf * m0f;
+            }
+        } else {
+            let m_row = &m_buf[i * q..i * q + q];
+            let ablk = f * q * q;
+            for r in 0..q {
+                a_rhs[ubase + r] += m_row[r] * resid;
+                let wr = wi * m_row[r];
+                for c in 0..=r {
+                    a_blocks[ablk + r * q + c] += wr * m_row[c];
+                }
+            }
+            let bt_f = &mut bt[ubase * p..(ubase + q) * p];
+            for r in 0..p {
+                let xw = xr[r] * wf;
+                for c in 0..q {
+                    bt_f[c * p + r] += xw * m_row[c].value();
+                }
+            }
+        }
+    }
+}
+
+/// Pass A of the exact block (see the call site): per row, the leverage
+/// `hᵢ = mᵢ'A⁻¹mᵢ` off the iterate's factor, `aᵢ = w'ᵢ·hᵢ` into `c_β`
+/// (`logdet_beta`) and `g_u` (`logdet_u`), `hᵢ` into `curv_h`. Generic over the
+/// row's `dw/dη` so the caller can hoist the family dispatch out of the loop.
+struct ExactPassA<'b, T> {
+    fac: &'b [f64],
+    m_buf: &'b [T],
+    cluster_ids: &'b [u32],
+    x: MatRef<'b, f64>,
+    xr_all: &'b [f64],
+    q: usize,
+    p: usize,
+    n: usize,
+}
+
+impl<T: Scalar> ExactPassA<'_, T> {
+    #[inline(always)]
+    fn run(
+        &self,
+        curv_h: &mut [f64],
+        logdet_beta: &mut [f64],
+        logdet_u: &mut [f64],
+        wp_row: impl Fn(usize) -> f64,
+    ) {
+        if self.xr_all.is_empty() {
+            self.run_p::<DYN>(curv_h, logdet_beta, logdet_u, wp_row)
+        } else {
+            with_const_p!(self.p, P => self.run_p::<P>(curv_h, logdet_beta, logdet_u, &wp_row))
+        }
+    }
+
+    /// The row loop at `const P` (`DYN`: the runtime `p`, and the `MatRef`
+    /// when there is no row-major copy). `c_β` accumulates in registers on a
+    /// fixed `P`, in the same row order; `q == 1` reads the leverage as
+    /// `(m/L₀₀)²`, `block_leverage`'s own arithmetic at `q = 1`.
+    #[allow(clippy::needless_range_loop)]
+    #[inline(always)]
+    fn run_p<const P: usize>(
+        &self,
+        curv_h: &mut [f64],
+        logdet_beta: &mut [f64],
+        logdet_u: &mut [f64],
+        wp_row: impl Fn(usize) -> f64,
+    ) {
+        let (q, p) = (self.q, if P == DYN { self.p } else { P });
+        let rows = !self.xr_all.is_empty();
+        let mut lb = [0.0_f64; P_CAP];
+        if P != DYN {
+            lb[..P].copy_from_slice(&logdet_beta[..P]);
+        }
+        let mut mrow = [0.0_f64; crate::consts::MAX_PRIMARY_Q];
+        for i in 0..self.n {
+            let f = self.cluster_ids[i] as usize;
+            let h = if q == 1 {
+                mrow[0] = self.m_buf[i].value();
+                let t = mrow[0] / self.fac[f];
+                t * t
+            } else {
+                let ablk = f * q * q;
+                for c in 0..q {
+                    mrow[c] = self.m_buf[i * q + c].value();
+                }
+                super::block_leverage(&self.fac[ablk..ablk + q * q], q, &mrow[..q])
+            };
+            let wp = wp_row(i);
+            curv_h[i] = h;
+            let a = wp * h;
+            if P != DYN {
+                let xr = &self.xr_all[i * P..i * P + P];
+                for j in 0..P {
+                    lb[j] += a * xr[j];
+                }
+            } else if rows {
+                let xr = &self.xr_all[i * p..i * p + p];
+                for (l, &xv) in logdet_beta[..p].iter_mut().zip(xr) {
+                    *l += a * xv;
+                }
+            } else {
+                for j in 0..p {
+                    logdet_beta[j] += a * self.x[(i, j)];
+                }
+            }
+            if q == 1 {
+                logdet_u[f] += a * mrow[0];
+            } else {
+                for c in 0..q {
+                    logdet_u[f * q + c] += a * mrow[c];
+                }
+            }
+        }
+        if P != DYN {
+            logdet_beta[..P].copy_from_slice(&lb[..P]);
+        }
+    }
+}
+
+/// Pass C of the exact block: `c_β −= Σᵢ w̃ᵢ·(mᵢ·v_f)·xᵢ` off the row-major
+/// `X`, `mᵢ·v_f` into `curv_sdot`; `c_β` accumulated in registers at a fixed
+/// `P`, in row order.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn exact_pass_c_rows<T: Scalar, const P: usize>(
+    m_buf: &[T],
+    w: &[T],
+    v: &[f64],
+    cluster_ids: &[u32],
+    xr_all: &[f64],
+    q: usize,
+    p_rt: usize,
+    n: usize,
+    curv_sdot: &mut [f64],
+    logdet_beta: &mut [f64],
+) {
+    let p = if P == DYN { p_rt } else { P };
+    let mut lb = [0.0_f64; P_CAP];
+    if P != DYN {
+        lb[..P].copy_from_slice(&logdet_beta[..P]);
+    }
+    for i in 0..n {
+        let f = cluster_ids[i] as usize;
+        // `q == 1` keeps the q-loop's `0.0 + m·v` (it differs from `m·v`
+        // only in the sign of a zero), so the sums stay the loop's.
+        let sdot = if q == 1 {
+            let mut sdot = 0.0;
+            sdot += m_buf[i].value() * v[f];
+            sdot
+        } else {
+            let mut sdot = 0.0;
+            for c in 0..q {
+                sdot += m_buf[i * q + c].value() * v[f * q + c];
+            }
+            sdot
+        };
+        curv_sdot[i] = sdot;
+        let a = w[i].value() * sdot;
+        let xr = &xr_all[i * p..i * p + p];
+        if P != DYN {
+            for j in 0..P {
+                lb[j] -= a * xr[j];
+            }
+        } else {
+            for (l, &xv) in logdet_beta[..p].iter_mut().zip(xr) {
+                *l -= a * xv;
+            }
+        }
+    }
+    if P != DYN {
+        logdet_beta[..P].copy_from_slice(&lb[..P]);
+    }
+}
+
+/// `refresh_eta_fixed` off the row-major `X` copy at `const P`: the same
+/// `Σ_j x·β` per row, in the same `j` order, from zero, offset added after.
+#[inline(always)]
+fn refresh_rows_p<T: Scalar, const P: usize>(
+    xr: &[f64],
+    p_rt: usize,
+    beta: &[T],
+    eta_fixed: &mut [T],
+    n: usize,
+) {
+    let p = if P == DYN { p_rt } else { P };
+    let beta = &beta[..p];
+    for (e_out, row) in eta_fixed[..n].iter_mut().zip(xr.chunks_exact(p)) {
+        let mut e = T::ZERO;
+        for j in 0..p {
+            e += T::from_f64(row[j]) * beta[j];
+        }
+        *e_out = e;
+    }
+}
+
+/// The structured kernel's border rows: `B = M'WX` (`k×p` row-major, RE column
+/// `c` at `bt[c·p..]`: a row's core columns `core_col(f, local)` and crossed
+/// columns `k_family + b`), with the same terms in the same row order as the
+/// kernel's own `B'` scatter.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn structured_border_rows<T: Scalar>(
+    w: &[T],
+    m_core_buf: &[T],
+    cross_val: &[T],
+    cross_col: &[u32],
+    n_cross: &[u8],
+    cluster_ids: &[u32],
+    xr_all: &[f64],
+    q: usize,
+    np: usize,
+    s: usize,
+    e: usize,
+    p: usize,
+    n: usize,
+    bt: &mut [f64],
+) {
+    let k = (q + np) * s + e;
+    bt[..k * p].fill(0.0);
+    with_const_p!(p, P => structured_border_rows_p::<T, P>(
+        w, m_core_buf, cross_val, cross_col, n_cross, cluster_ids, xr_all, q, np, s, p, n, bt,
+    ))
+}
+
+/// [`structured_border_rows`]'s row loop at `const P` (`DYN`: the runtime `p`).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn structured_border_rows_p<T: Scalar, const P: usize>(
+    w: &[T],
+    m_core_buf: &[T],
+    cross_val: &[T],
+    cross_col: &[u32],
+    n_cross: &[u8],
+    cluster_ids: &[u32],
+    xr_all: &[f64],
+    q: usize,
+    np: usize,
+    s: usize,
+    p_rt: usize,
+    n: usize,
+    bt: &mut [f64],
+) {
+    let p = if P == DYN { p_rt } else { P };
+    let qc = q + np;
+    let prim_width = q * s;
+    let k_family = qc * s;
+    let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
+    for i in 0..n {
+        let f = cluster_ids[i] as usize;
+        let wi = w[i].value();
+        let xr = &xr_all[i * p..i * p + p];
+        let cbase = i * g_cap;
+        let ncz = n_cross[i] as usize;
+        for local in 0..qc {
+            let col = if local < q {
+                f * q + local
+            } else {
+                prim_width + f * np + (local - q)
+            };
+            let mv = m_core_buf[i * qc + local].value();
+            for (b, &xv) in bt[col * p..col * p + p].iter_mut().zip(xr) {
+                *b += xv * wi * mv;
+            }
+        }
+        for z in 0..ncz {
+            let col = k_family + cross_col[cbase + z] as usize;
+            let cv = cross_val[cbase + z].value();
+            for (b, &xv) in bt[col * p..col * p + p].iter_mut().zip(xr) {
+                *b += xv * wi * cv;
+            }
+        }
+    }
 }

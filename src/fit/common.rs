@@ -62,15 +62,17 @@ pub struct FitDiagnostics {
     pub pinned_components: u64,
     /// Scale-invariant per-column pivot ratio of the route's own Gram
     /// (`min_pivot_ratio`), and the column attaining it. NaN on
-    /// every route and every return that formed no factor to measure — the GLMM
-    /// and NB routes record none at all.
+    /// every route and every return that formed no factor to measure. The NB
+    /// (`Prebuilt`) routes read it back off their assembled `Fit`'s
+    /// [`crate::Note::IllConditioned`], so there it is NaN unless
+    /// `ill_conditioned` is set.
     pub pivot: f64,
     /// Column attaining `pivot`. Meaningless when `pivot` is NaN.
     pub pivot_col: u32,
     /// `pivot` fell below the recording route's own detection floor: the design
     /// is computable but its coefficients are barely identified. Each route
     /// compares against its own constant (`ols::PIVOT_MIN` for OLS and GLM,
-    /// `lmm::PIVOT_MIN` for the LMM) because the routes were calibrated
+    /// `lmm::PIVOT_MIN` for the LMM and GLMM) because the routes were calibrated
     /// separately. NaN pivots compare false, so a route that records none never
     /// flags.
     pub ill_conditioned: bool,
@@ -95,6 +97,17 @@ pub struct FitDiagnostics {
     /// [`crate::Note::ExactProfileFallback`]. `false` on every non-GLMM route
     /// and on every shape that does not route `ExactProfile`.
     pub exact_profile_fallback: bool,
+    /// GLMM-only: the fit has an endpoint but no fixed-effect covariance could
+    /// be formed there, so its SE outputs are NaN — see
+    /// [`crate::Note::SeUnavailable`]. `false` on every non-GLMM route.
+    pub se_unavailable: bool,
+    /// GLMM-only: the estimated rounding error of the reported deviance is
+    /// past what resolves θ̂ — see [`crate::Note::PrecisionLimited`]. `false`
+    /// on every non-GLMM route.
+    pub precision_limited: bool,
+    /// GLM and GLMM: the fixed-effects IRLS stopped on separation — see
+    /// [`crate::Note::Separated`]. `false` on OLS and LMM routes.
+    pub separated: bool,
 }
 
 impl FitDiagnostics {
@@ -113,6 +126,9 @@ impl FitDiagnostics {
             final_pirls_exhausted: false,
             hessian_fallback: false,
             exact_profile_fallback: false,
+            se_unavailable: false,
+            precision_limited: false,
+            separated: false,
         }
     }
 }
@@ -124,6 +140,9 @@ impl FitDiagnostics {
 ///
 /// `varcorr` is the block layout the caller has already assembled — see
 /// [`pinned_flags`] for why it is the only thing that can place the bits.
+///
+/// `FitView::kernel_diagnostics`'s `Prebuilt` arm reads these notes back into
+/// the carrier — change together.
 pub(super) fn materialize_diagnostics(
     d: &FitDiagnostics,
     p: usize,
@@ -148,6 +167,15 @@ pub(super) fn materialize_diagnostics(
     }
     if d.exact_profile_fallback {
         notes.push(Note::ExactProfileFallback);
+    }
+    if d.se_unavailable {
+        notes.push(Note::SeUnavailable);
+    }
+    if d.precision_limited {
+        notes.push(Note::PrecisionLimited);
+    }
+    if d.separated {
+        notes.push(Note::Separated);
     }
     Diagnostics {
         converged: d.converged,
@@ -218,7 +246,7 @@ pub(crate) fn pinned_flags(mask: u64, varcorr: &[Vec<f64>]) -> Vec<Vec<bool>> {
 /// validate a `StartValues.theta` at the stable boundary before the workspace
 /// (which is where `n_theta` otherwise first materializes) is built. `None`
 /// (fixed-only) → 0.
-pub(super) fn theta_width(re: Option<&ReStructure>) -> usize {
+pub(crate) fn theta_width(re: Option<&ReStructure>) -> usize {
     let Some(re) = re else { return 0 };
     let q_p = 1 + re.slopes.len();
     let mut w = q_p * (q_p + 1) / 2;
@@ -1047,7 +1075,10 @@ pub(super) fn fit_rank_deficient(
             | Note::NbShapeUnsettled { .. }
             | Note::NonIntegerResponse { .. }
             | Note::SingleLevelGroupingDropped { .. }
-            | Note::ExactProfileFallback => {}
+            | Note::ExactProfileFallback
+            | Note::SeUnavailable
+            | Note::PrecisionLimited
+            | Note::Separated => {}
         }
     }
     // Same scatter in two dimensions: an aliased column has no coefficient, so
@@ -1233,11 +1264,13 @@ pub fn spec_sized_from_ids_pub<'a>(
 /// of `to_col_major` so `fit_on` can fill the `n_max`-sized `x_mat` allocated
 /// once at `build_workspace`, instead of allocating a fresh `n×p` `Mat` every
 /// call. `dst` must be at least `n×p`; rows/columns past `n`/`p` are left
-/// untouched.
+/// untouched. One column at a time: a strided read, a contiguous write.
 pub(super) fn fill_col_major(dst: &mut Mat<f64>, x: &[f64], n: usize, p: usize) {
-    for i in 0..n {
-        for j in 0..p {
-            dst[(i, j)] = x[i * p + j];
+    let x = &x[..n * p];
+    for j in 0..p {
+        let col = &mut dst.col_as_slice_mut(j)[..n];
+        for (d, &v) in col.iter_mut().zip(x.iter().skip(j).step_by(p)) {
+            *d = v;
         }
     }
 }

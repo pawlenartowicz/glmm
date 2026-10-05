@@ -309,7 +309,19 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
     // them (`cbind()` response, `offset()` term). `orchestrate::run_fit` is
     // the double-specification check site for both — change together.
     let offset = match &ast.offset {
-        Some(expr) => Some(numeric_column(expr, data)?),
+        Some(expr) => {
+            let o = numeric_column(expr, data)?;
+            // Refused here, by term, rather than by `fit_warm`'s
+            // `FitOptions.offset` assert, which names a field the formula
+            // user never set.
+            if let Some(row) = o.iter().position(|v| !v.is_finite()) {
+                return Err(Error::TransformNotFinite {
+                    term: format!("offset({expr})"),
+                    row,
+                });
+            }
+            Some(o)
+        }
         None => None,
     };
     let opts = FitOptions {

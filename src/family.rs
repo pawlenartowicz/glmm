@@ -28,16 +28,25 @@ use crate::spec::{BinomialLink, Family, GammaLink, InverseGaussianLink};
 /// `exp(η)` stays finite up to η≈709; the log links and cloglog clamp η short of
 /// it so `e^η` never overflows to `inf` mid-IRLS.
 pub(crate) const ETA_MAX: f64 = 700.0;
-/// Floor for a data value used as a starting or null mean on a positive-mean
-/// family ([`clamp_mu`]), so a zero response cannot seed `ln 0` or `1/0`. The
-/// fitted μ itself carries no floor: every row quantity stays finite without
-/// one (see [`in_tail`]).
+/// Floor for a data value used as a null mean on a count family
+/// ([`clamp_mu`]), so an all-zero response cannot seed `ln 0`. The fitted μ
+/// itself carries no floor: every row quantity stays finite without one (see
+/// [`in_tail`]).
 pub(crate) const MU_FLOOR: f64 = 1e-10;
 /// Binomial μ bound: probit and cloglog store μ inside `[PROB_EPS, 1−PROB_EPS]`
 /// so `V(μ) = μ(1−μ)` is never 0 in a μ-form formula, and on every binomial link
 /// a row with μ at or past it is a tail row ([`in_tail`]) whose deviance,
 /// score and weights are computed from η instead.
 pub(crate) const PROB_EPS: f64 = 1e-12;
+/// Binomial upper-side tail switch: a row with `1 − μ` at or below this is a
+/// tail row ([`in_tail`]). The μ forms take `1 − μ` by subtraction from the
+/// stored μ, which keeps only μ's absolute precision, `ε/(1 − μ)` relative:
+/// 1e-12 at this switch, but 1e-4 near `PROB_EPS`, where on a y = 0 row it
+/// goes straight into the score `−μ'/(1 − μ)` and moves the fit's maximum.
+/// The switch is not at μ = ½, where the subtraction is still exact, because
+/// the probit η form needs an `erfc` per row: over the whole upper half of
+/// the rows that costs a probit GLMM fit 1.9 to 2.6 times its instructions.
+pub(crate) const UPPER_TAIL_Q: f64 = 1e-4;
 /// Log-link tail: past `|η| = 230` (`μ` outside `[1.3e-100, 7.7e99]`) the
 /// μ-form variance of the inverse-Gaussian (`μ³`), Gamma (`μ²`) and NB
 /// (`μ + μ²/θ`) links is near its overflow or underflow, so the NB,
@@ -124,8 +133,8 @@ pub(crate) fn clamp_eta_bounds(family: Family) -> (f64, f64) {
 ///   the same reading.
 ///
 /// Constant-false on logit, probit and Gaussian, which have no bounds, and
-/// false on a NaN η. GLM IRLS reads its own guards instead
-/// (`glm::ETA_DIVERGENCE_CAP` and the non-finite checks).
+/// false on a NaN η. GLM IRLS halves such a step too, and ends the fit
+/// non-converged when its seed is infeasible or halving cannot recover.
 pub(crate) fn eta_infeasible<T: Scalar>(family: Family, y: f64, eta: T) -> bool {
     let (lo, hi) = clamp_eta_bounds(family);
     let e = eta.value();
@@ -146,19 +155,18 @@ pub(crate) fn eta_infeasible<T: Scalar>(family: Family, y: f64, eta: T) -> bool 
     }
 }
 
-/// Floor a data value used as a starting or null mean into its family's μ
-/// domain: `≥ MU_FLOOR` for Poisson/Gamma/NB/inverse-Gaussian (positive mean),
-/// `[PROB_EPS, 1−PROB_EPS]` for binomial. Gaussian passes through. The fit's
-/// own μ never goes through this: [`link_inv`] bounds only the probit and
-/// cloglog μ, at `PROB_EPS`.
+/// Floor a data value used as a null mean into its family's μ domain:
+/// `≥ MU_FLOOR` for Poisson/NB, whose mean of y can be 0, and
+/// `[PROB_EPS, 1−PROB_EPS]` for binomial. Gamma and inverse-Gaussian y are
+/// positive, so their mean passes through, as does Gaussian: a floor there
+/// would put a units limit on the null deviance. The fit's own μ never goes
+/// through this: [`link_inv`] bounds only the probit and cloglog μ, at
+/// `PROB_EPS`.
 pub(crate) fn clamp_mu<T: Scalar>(family: Family, mu: T) -> T {
     match family {
         Family::Binomial { .. } => mu.clamp_f64(PROB_EPS, 1.0 - PROB_EPS),
-        Family::Poisson { .. }
-        | Family::Gamma { .. }
-        | Family::NegativeBinomial { .. }
-        | Family::InverseGaussian { .. } => mu.max_f64(MU_FLOOR),
-        Family::Gaussian => mu,
+        Family::Poisson { .. } | Family::NegativeBinomial { .. } => mu.max_f64(MU_FLOOR),
+        Family::Gamma { .. } | Family::InverseGaussian { .. } | Family::Gaussian => mu,
     }
 }
 
@@ -322,9 +330,30 @@ pub(crate) fn variance<T: Scalar>(family: Family, nb_theta: f64, mu: T) -> T {
     }
 }
 
+/// `ln(a/b)` for `a, b > 0`, given `d = a − b`. A unit deviance multiplies
+/// this log by the row's scale (`y` on Poisson and NB, the prior weight on
+/// binomial and Gamma) and subtracts a term of nearly the same size, so near
+/// `a = b` the log's absolute error is what survives. From a quotient or a
+/// difference of two logs that error is `ε`-sized, `ε·y` in the deviance:
+/// from counts (or trial counts) near 1e9 it outgrows the PIRLS exit band and
+/// the fit stops converging. `ln_1p(d/b)` keeps the log's relative precision
+/// instead, because the callers form `d` from `y − μ`, which carries no
+/// cancellation error. Below `a = b/2` it takes the difference of the two
+/// logs, as precise there, which stays finite for a subnormal `a`, where
+/// `d/b` would round to −1 (and a quotient `a/b` to 0).
+fn ln_ratio<T: Scalar>(a: f64, b: T, d: T) -> T {
+    if a >= 0.5 * b.value() {
+        (d / b).ln_1p()
+    } else {
+        T::from_f64(a.ln()) - b.ln()
+    }
+}
+
 /// Per-observation deviance contribution `dᵢ ≥ 0` (`Σ dᵢ` is the GLM deviance,
-/// −2·log-likelihood up to the saturated constant). Zero at `y=μ`.
+/// −2·log-likelihood up to the saturated constant). Zero at `y=μ`. Every log
+/// of a ratio goes through [`ln_ratio`].
 pub(crate) fn dev_resid<T: Scalar>(family: Family, nb_theta: f64, y: f64, mu: T) -> T {
+    let y_minus_mu = T::from_f64(y) - mu;
     match family {
         Family::Gaussian => {
             let r = T::from_f64(y) - mu;
@@ -333,43 +362,50 @@ pub(crate) fn dev_resid<T: Scalar>(family: Family, nb_theta: f64, y: f64, mu: T)
         // 2[ y ln(y/μ) + (1−y) ln((1−y)/(1−μ)) ], with the 0·ln0→0 limits.
         Family::Binomial { .. } => {
             let a = if y > 0.0 {
-                T::from_f64(y) * (T::from_f64(y) / mu).ln()
+                T::from_f64(y) * ln_ratio(y, mu, y_minus_mu)
             } else {
                 T::ZERO
             };
             let b = if y < 1.0 {
-                T::from_f64(1.0 - y) * (T::from_f64(1.0 - y) / (T::ONE - mu)).ln()
+                T::from_f64(1.0 - y) * ln_ratio(1.0 - y, T::ONE - mu, -y_minus_mu)
             } else {
                 T::ZERO
             };
             T::from_f64(2.0) * (a + b)
         }
-        // 2[ y ln(y/μ) − (y−μ) ], y·ln(y/μ)→0 at y=0. Written y·(ln y − ln μ), not
-        // y·ln(y/μ): for subnormal y and μ ≥ 2 the quotient y/μ underflows to exactly
-        // 0.0 before the log, punching a −inf hole in the objective.
+        // 2[ y ln(y/μ) − (y−μ) ], y·ln(y/μ)→0 at y=0.
         Family::Poisson { .. } => {
             let t = if y > 0.0 {
-                T::from_f64(y) * (T::from_f64(y.ln()) - mu.ln())
+                T::from_f64(y) * ln_ratio(y, mu, y_minus_mu)
             } else {
                 T::ZERO
             };
-            T::from_f64(2.0) * (t - (T::from_f64(y) - mu))
+            T::from_f64(2.0) * (t - y_minus_mu)
         }
         // 2[ −ln(y/μ) + (y−μ)/μ ]; same form for log and inverse links.
-        Family::Gamma { .. } => {
-            T::from_f64(2.0) * (-(T::from_f64(y) / mu).ln() + (T::from_f64(y) - mu) / mu)
-        }
-        // 2[ y ln(y/μ) − (y+θ) ln((y+θ)/(μ+θ)) ], y·ln(y/μ)→0 at y=0; θ = nb_theta.
-        // Same subtraction form as Poisson — see the subnormal-underflow note above.
+        Family::Gamma { .. } => T::from_f64(2.0) * (-ln_ratio(y, mu, y_minus_mu) + y_minus_mu / mu),
+        // 2[ y ln(y/μ) − (y+θ) ln((y+θ)/(μ+θ)) ], θ = nb_theta, rearranged to
+        // 2[ y ln(a/b) − θ ln((y+θ)/(μ+θ)) ], a = y/(y+θ), b = μ/(μ+θ),
+        // y·ln(a/b)→0 at y=0. The two forms are equal, but in the first both
+        // terms are of order |y−μ| and cancel to a deviance of order θ when
+        // μ ≫ θ: from counts near 1e10 that leaves about 2e-7 of round-off
+        // per row, 6e-6 on 200 rows, past the PIRLS exit band. In the second
+        // neither term is larger than in the first, and when μ ≫ θ both are
+        // of order θ. The first log's `a − b` is θ(y−μ)/((y+θ)(μ+θ)) and the
+        // second's is `y − μ`, so `ln_ratio` gets both without cancellation.
+        // Mirrored by the NB arm of `simd_transcendental::family_pass` —
+        // change together.
         Family::NegativeBinomial { .. } => {
+            let th = T::from_f64(nb_theta);
+            let mu_th = mu + th;
             let t = if y > 0.0 {
-                T::from_f64(y) * (T::from_f64(y.ln()) - mu.ln())
+                let y_th = y + nb_theta;
+                let a_minus_b = th * y_minus_mu / (mu_th * T::from_f64(y_th));
+                T::from_f64(y) * ln_ratio(y / y_th, mu / mu_th, a_minus_b)
             } else {
                 T::ZERO
             };
-            T::from_f64(2.0)
-                * (t - (T::from_f64(y + nb_theta))
-                    * (T::from_f64(y + nb_theta) / (mu + T::from_f64(nb_theta))).ln())
+            T::from_f64(2.0) * (t - th * ln_ratio(y + nb_theta, mu_th, y_minus_mu))
         }
         // dᵢ = (yᵢ−μᵢ)²/(μᵢ²·yᵢ) (McCullagh–Nelder 1989 §2.2.4; R
         // inverse.gaussian()$dev.resids). Requires y>0.
@@ -384,10 +420,11 @@ pub(crate) fn dev_resid<T: Scalar>(family: Family, nb_theta: f64, y: f64, mu: T)
 /// instead of the μ-form formulas above. A row is in the tail where the μ
 /// form loses it:
 ///
-/// - **Binomial**, μ at or past `PROB_EPS` from 0 or 1: `1 − μ` is no longer
-///   representable near 1, and probit's `φ(η)` and `Φ(η)` underflow together
-///   near 0. `μ` here is the stored value, so probit and cloglog (bounded by
-///   [`link_inv`]) enter at the bound and logit (unbounded) past it.
+/// - **Binomial**, μ at or past `PROB_EPS` from 0, where probit's `φ(η)` and
+///   `Φ(η)` underflow together, or `1 − μ` at or below `UPPER_TAIL_Q`, where
+///   the μ forms' `1 − μ` has lost digits. `μ` here is the stored value, so
+///   probit and cloglog (bounded by [`link_inv`]) enter the lower side at the
+///   bound and logit (unbounded) past it.
 /// - **NB, Gamma-log, inverse-Gaussian-log**, `|η| > LOG_TAIL_ETA`: `V(μ)`
 ///   nears overflow or underflow, and with it the μ-form score and weight.
 ///
@@ -395,12 +432,11 @@ pub(crate) fn dev_resid<T: Scalar>(family: Family, nb_theta: f64, y: f64, mu: T)
 /// finite on the whole clamped η range. The tail forms are the same functions
 /// of η as the μ forms, written to stay finite, so the objective keeps growing
 /// on a tail row and the score and weights stay its exact derivatives; the
-/// two meet at the switch to round-off (to the μ form's own precision on the
-/// binomial upper side, where `1 − μ` near `PROB_EPS` carries ~4 digits).
-/// Branches on values only.
+/// two meet at the switch to round-off (to the μ form's own 1e-12 on the
+/// binomial upper side). Branches on values only.
 pub(crate) fn in_tail(family: Family, eta: f64, mu: f64) -> bool {
     match family {
-        Family::Binomial { .. } => mu <= PROB_EPS || mu >= 1.0 - PROB_EPS,
+        Family::Binomial { .. } => mu <= PROB_EPS || mu >= 1.0 - UPPER_TAIL_Q,
         Family::NegativeBinomial { .. }
         | Family::Gamma {
             link: GammaLink::Log,
@@ -412,10 +448,9 @@ pub(crate) fn in_tail(family: Family, eta: f64, mu: f64) -> bool {
     }
 }
 
-/// `(ln Φ(x), λ, λ', λ'')` with `λ = φ/Φ` the inverse Mills ratio, for
-/// `|x| ≥ 4√2`, the range a probit tail row reaches (`|η| ≥ 7.03`).
+/// `(ln Φ(x), λ, λ', λ'')` with `λ = φ/Φ` the inverse Mills ratio, at any `x`.
 ///
-/// Small side, `x = −t < 0`: Cody's third `erfc` region
+/// Far small side, `x = −t < −4√2`: Cody's third `erfc` region
 /// (`simd_transcendental::erfc_region3_r`, `s = 2/t²`) gives
 /// `erfc(t/√2) = e^{−t²/2}(1 − c)/(√π·t/√2)` with `c = √π·s·R(s)`, so
 /// `ln Φ(x) = −t²/2 + ln((1 − c)/(√(2π)·t))` and `λ = t/(1 − c)`, finite for
@@ -426,13 +461,16 @@ pub(crate) fn in_tail(family: Family, eta: f64, mu: f64) -> bool {
 /// `D = (1 − c)²`, and `λ'' = (2s/t)(N_s·D − N·D_s)/D²`, no term of which
 /// cancels.
 ///
-/// Large side, `x > 0`: `p = Φ(−x) ≤ 8e-9` from the small side,
-/// `ln Φ(x) = ln(1 − p) = −p(1 + p/2)` to below round-off,
-/// `λ = φ(x)/(1 − p)`, and `λ'`, `λ''` from the Mills-ratio equation, which
-/// does not cancel there.
+/// Elsewhere Φ comes from `erfc` ([`Scalar::probit_cdf`]): directly on the
+/// small side, where it keeps its relative precision, and on the large side
+/// `x ≥ 0` as `1 − p` with `p = Φ(−x)`, so that `ln Φ(x) = ln_1p(−p)` keeps
+/// it too. Then `λ = φ(x)/Φ(x)`, and `λ'`, `λ''` from the Mills-ratio
+/// equation, whose cancellation grows toward `x = −4√2`: there `λ'` is off
+/// by up to 1e-13 and `λ''` by up to 1e-10 relative (against 50-digit
+/// values), and on `x ≥ 0` neither cancels.
 fn probit_side<T: Scalar>(x: T) -> (T, T, T, T) {
     use crate::simd_transcendental::{erfc_region3_r, SQRT_PI};
-    if x.value() < 0.0 {
+    if x.value() < -4.0 * std::f64::consts::SQRT_2 {
         let t = -x;
         let s = T::from_f64(2.0) / (t * t);
         let (r, r1, r2) = erfc_region3_r(s);
@@ -449,14 +487,19 @@ fn probit_side<T: Scalar>(x: T) -> (T, T, T, T) {
         let dd1 = -(two * omc * c1);
         let d1 = nn / dd - T::ONE;
         let d2 = two * s / t * (nn1 * dd - nn * dd1) / (dd * dd);
-        (ln_phi, lam, d1, d2)
-    } else {
-        let p = probit_side(-x).0.exp();
-        let lam = T::from_f64(FRAC_1_SQRT_2PI) * (T::from_f64(-0.5) * x * x).exp() / (T::ONE - p);
-        let d1 = -(lam * (x + lam));
-        let d2 = -(d1 * (x + lam)) - lam * (T::ONE + d1);
-        (-(p * (T::ONE + T::from_f64(0.5) * p)), lam, d1, d2)
+        return (ln_phi, lam, d1, d2);
     }
+    let (ln_phi, cdf) = if x.value() < 0.0 {
+        let c = x.probit_cdf();
+        (c.ln(), c)
+    } else {
+        let p = (-x).probit_cdf();
+        ((-p).ln_1p(), T::ONE - p)
+    };
+    let lam = T::from_f64(FRAC_1_SQRT_2PI) * (T::from_f64(-0.5) * x * x).exp() / cdf;
+    let d1 = -(lam * (x + lam));
+    let d2 = -(d1 * (x + lam)) - lam * (T::ONE + d1);
+    (ln_phi, lam, d1, d2)
 }
 
 /// The per-row quantities of a tail row ([`in_tail`]), per unit prior
@@ -659,9 +702,39 @@ pub(crate) fn row_score<T: Scalar>(
     if in_tail(family, eta.value(), mu.value()) {
         return T::from_f64(prior_w) * tail_row(family, nb_theta, y, eta, mu).score;
     }
-    let dmu = mu_eta(family, eta);
+    let dmu = mu_eta_at(family, eta, mu);
     let v = variance(family, nb_theta, mu);
     T::from_f64(prior_w) * dmu * (T::from_f64(y) - mu) / v
+}
+
+/// Whether `μ = e^η` is the link inverse: then `dμ/dη = d²μ/dη² = μ`.
+#[inline]
+fn is_log_link(family: Family) -> bool {
+    matches!(
+        family,
+        Family::Poisson { .. }
+            | Family::NegativeBinomial { .. }
+            | Family::Gamma {
+                link: GammaLink::Log,
+            }
+            | Family::InverseGaussian {
+                link: InverseGaussianLink::Log,
+            }
+    )
+}
+
+/// [`mu_eta`] at a row whose stored μ belongs to η: on a log link that is μ
+/// itself (`dμ/dη = e^η = μ`), read rather than recomputed through a second
+/// `exp`; every other link goes to [`mu_eta`]. The stored μ comes from the
+/// family pass's own `exp` (the SIMD kernel on the `f64` path), so the value
+/// differs from `mu_eta`'s libm `exp` in the last bits at most.
+#[inline]
+pub(crate) fn mu_eta_at<T: Scalar>(family: Family, eta: T, mu: T) -> T {
+    if is_log_link(family) {
+        mu
+    } else {
+        mu_eta(family, eta)
+    }
 }
 
 /// The unit Fisher weight and working residual `(w, r)` of a tail row
@@ -710,6 +783,29 @@ pub(crate) fn weight_scale(w: Option<&[f64]>, n: usize) -> f64 {
     }
 }
 
+/// `2a − 2a·ln a + 2·lnΓ(a)`, that is `2·(lnΓ(a) − a·ln a + a)`, for `a > 0`,
+/// to absolute round-off at every `a`. The Gamma dispersion term
+/// ([`gamma_dispersion_term`]), the Poisson and binomial rows of
+/// [`saturated_loglik`] and the NB saturated log-likelihood
+/// (`fit::glm::nb_saturated_loglik_grouped`) are sums of it.
+pub(crate) fn ln_gamma_excess2(a: f64) -> f64 {
+    if a < 20.0 {
+        return 2.0 * a - 2.0 * a * a.ln() + 2.0 * crate::simd_transcendental::ln_gamma(a);
+    }
+    // Above a = 20 the three terms, each of order a·ln a, cancel to a
+    // value of order ln a: measured against 60-digit values, the direct
+    // form is 1e-10 relative off at a = 1e6, 2e-6 at 1e10, and keeps no
+    // correct digit at 1e16 (a near-exact fit's φ̂). So the value comes from
+    // Stirling's series instead, 2a − 2a·ln a + 2·lnΓ(a) = ln 2π − ln a +
+    // 2·R(a), R(a) = 1/(12a) − 1/(360a³) + 1/(1260a⁵) − 1/(1680a⁷)
+    // (Abramowitz & Stegun 6.1.41), truncated where the next term, 1/(1188a⁹),
+    // is 1.6e-15 at a = 20. Same switch point as `ln_minus_digamma`.
+    let r = 1.0 / a;
+    let r2 = r * r;
+    let stirling = r * (1.0 / 12.0 + r2 * (-1.0 / 360.0 + r2 * (1.0 / 1260.0 - r2 / 1680.0)));
+    (2.0 * std::f64::consts::PI).ln() - a.ln() + 2.0 * stirling
+}
+
 /// The dispersion-only part of the Gamma Laplace/GLM objective, as a function of
 /// `ψ = ln φ` (row shape `aᵢ = ŵᵢ/φ`, `ŵᵢ = 1` unweighted). With the Gamma unit
 /// deviance `dᵢ = 2[(yᵢ−μᵢ)/μᵢ − ln(yᵢ/μᵢ)]`, the log-density rearranges to
@@ -731,26 +827,9 @@ pub(crate) fn gamma_dispersion_term(
     sum_ln_y: f64,
 ) -> f64 {
     let a = (-ln_phi).exp();
-    let row = |ai: f64| {
-        if ai < 20.0 {
-            return 2.0 * ai - 2.0 * ai * ai.ln() + 2.0 * crate::simd_transcendental::ln_gamma(ai);
-        }
-        // Above a = 20 the three terms, each of order a·ln a, cancel to a
-        // value of order ln a: measured against 60-digit values, the direct
-        // form is 1e-10 relative off at a = 1e6, 2e-6 at 1e10, and keeps no
-        // correct digit at 1e16 (a near-exact fit's φ̂). So the row comes from
-        // Stirling's series instead, 2a − 2a·ln a + 2·lnΓ(a) = ln 2π − ln a +
-        // 2·R(a), R(a) = 1/(12a) − 1/(360a³) + 1/(1260a⁵) − 1/(1680a⁷)
-        // (Abramowitz & Stegun 6.1.41), truncated where the next term, 1/(1188a⁹),
-        // is 1.6e-15 at a = 20. Same switch point as `ln_minus_digamma`.
-        let r = 1.0 / ai;
-        let r2 = r * r;
-        let stirling = r * (1.0 / 12.0 + r2 * (-1.0 / 360.0 + r2 * (1.0 / 1260.0 - r2 / 1680.0)));
-        (2.0 * std::f64::consts::PI).ln() - ai.ln() + 2.0 * stirling
-    };
     let term = match weights {
-        None => n as f64 * row(a),
-        Some(w) => w[..n].iter().map(|&wi| row(wi * a)).sum(),
+        None => n as f64 * ln_gamma_excess2(a),
+        Some(w) => w[..n].iter().map(|&wi| ln_gamma_excess2(wi * a)).sum(),
     };
     term + 2.0 * sum_ln_y
 }
@@ -947,9 +1026,7 @@ pub(crate) fn inv_gaussian_aic<T: Scalar>(
 ///   `wᵢ`; R's `dbinom` rounds — identical on the integer trial counts the
 ///   aggregated convention carries).
 /// - **Poisson** — `wᵢ·(yᵢ·ln yᵢ − yᵢ − lnΓ(yᵢ+1))` (0 at `yᵢ=0`).
-/// - **NegativeBinomial** — `nb_profile_loglik(y, y, θ, w) − Σᵢ wᵢ·lnΓ(yᵢ+1)`
-///   (the θ-dependent saturated normalizer plus the count term that profile
-///   deliberately omits).
+/// - **NegativeBinomial** — `nb_profile_loglik(y, y, θ, w)`.
 /// - **Gaussian** — 0 (its `dev_resid` is the bare RSS; the Gaussian paths
 ///   build their log-likelihood directly and never call this).
 /// - **Gamma** — NaN on purpose: both Gamma paths carry the whole log-density
@@ -964,21 +1041,26 @@ pub(crate) fn saturated_loglik(
     y: &[f64],
     prior_w: Option<&[f64]>,
 ) -> f64 {
-    let lgamma = crate::simd_transcendental::ln_gamma;
+    // Both rows are written through `E = ln_gamma_excess2`, with
+    // `lnΓ(a+1) = ½·E(a) − a + a·ln a + ln a`: the `lnΓ` terms and the
+    // `a·ln a`-sized parts then cancel in closed form, so every term stays of
+    // order `ln a`. Formed directly, the terms are of order `y·ln y` and the
+    // row keeps only that sum's ulp (1e-5 absolute at `y = 1e10`).
+    let e = ln_gamma_excess2;
     match family {
         Family::Gaussian => 0.0,
         Family::Gamma { .. } | Family::InverseGaussian { .. } => f64::NAN,
         Family::Binomial { .. } => {
+            // `s = m·y` successes and `f = m − s` failures; the row is 0 when
+            // either is 0, and otherwise `½·(E(m) − E(s) − E(f)) + ln m − ln s
+            // − ln f` (the `y = s/m` logs cancel the `a·ln a` parts exactly).
             let mut s = 0.0;
             for (i, &yi) in y.iter().enumerate() {
                 let m = prior_w.map_or(1.0, |w| w[i]);
                 let succ = m * yi;
-                s += lgamma(m + 1.0) - lgamma(succ + 1.0) - lgamma(m - succ + 1.0);
-                if yi > 0.0 {
-                    s += succ * yi.ln();
-                }
-                if yi < 1.0 {
-                    s += (m - succ) * (1.0 - yi).ln();
+                let fail = m - succ;
+                if succ > 0.0 && fail > 0.0 {
+                    s += 0.5 * (e(m) - e(succ) - e(fail)) + m.ln() - succ.ln() - fail.ln();
                 }
             }
             s
@@ -986,20 +1068,13 @@ pub(crate) fn saturated_loglik(
         Family::Poisson { .. } => {
             let mut s = 0.0;
             for (i, &yi) in y.iter().enumerate() {
-                let t = if yi > 0.0 { yi * yi.ln() } else { 0.0 };
-                s += prior_w.map_or(1.0, |w| w[i]) * (t - yi - lgamma(yi + 1.0));
+                if yi > 0.0 {
+                    s += prior_w.map_or(1.0, |w| w[i]) * (-0.5 * e(yi) - yi.ln());
+                }
             }
             s
         }
-        Family::NegativeBinomial { .. } => {
-            let profile = crate::fit::nb_profile_loglik(y, y, nb_theta, prior_w);
-            let counts: f64 = y
-                .iter()
-                .enumerate()
-                .map(|(i, &yi)| prior_w.map_or(1.0, |w| w[i]) * lgamma(yi + 1.0))
-                .sum();
-            profile - counts
-        }
+        Family::NegativeBinomial { .. } => crate::fit::nb_profile_loglik(y, y, nb_theta, prior_w),
     }
 }
 
@@ -1017,7 +1092,14 @@ pub(crate) fn pearson_dispersion(
 ) -> f64 {
     let mut s = 0.0;
     for i in 0..n {
-        let r = (y[i] - mu[i]) / variance(family, nb_theta, mu[i]).sqrt();
+        // √V without forming V: on the log links μ² (Gamma) and μ³
+        // (inverse-Gaussian) leave the f64 range at |ln μ| ≈ 354 and ≈ 236,
+        // where √V would round to 0 or inf and φ̂ to inf or 0.
+        let r = match family {
+            Family::Gamma { .. } => (y[i] - mu[i]) / mu[i],
+            Family::InverseGaussian { .. } => (y[i] - mu[i]) / mu[i] / mu[i].sqrt(),
+            _ => (y[i] - mu[i]) / variance(family, nb_theta, mu[i]).sqrt(),
+        };
         let pw = prior_w.map_or(1.0, |w| w[i]);
         s += pw * r * r;
     }
@@ -1196,8 +1278,12 @@ pub(crate) fn observed_weight_eta_deriv<T: Scalar>(
         return T::from_f64(prior_w) * tail_row(family, nb_theta, y, eta, mu).w_obs_eta;
     }
     let two = T::from_f64(2.0);
-    let d1 = mu_eta(family, eta);
-    let d2 = mu_eta_eta(family, eta);
+    // Log links: `μ' = μ'' = μ` (see `mu_eta_at`).
+    let (d1, d2) = if is_log_link(family) {
+        (mu, mu)
+    } else {
+        (mu_eta(family, eta), mu_eta_eta(family, eta))
+    };
     let v = variance(family, nb_theta, mu);
     let g = d1 / v;
     let (g1, g2) = match family {
@@ -1272,8 +1358,8 @@ pub(crate) fn observed_weight_eta_deriv<T: Scalar>(
 /// A tail row ([`in_tail`]) of a link whose exact curvature differs from
 /// Fisher reads `w·(ln w)'` off [`TailRow`] (probit `(ln w)' = λ(−η) − λ(η) −
 /// 2η`, cloglog `2 − t/μ` at the unbounded `μ = −expm1(−t)`), since the stored
-/// probit/cloglog μ sits on its `PROB_EPS` bound there. Logit keeps
-/// `w(1−2μ)`: its μ is never bounded.
+/// probit/cloglog μ sits on its `PROB_EPS` bound there or carries a `1 − μ`
+/// short of digits. Logit keeps `w(1−2μ)`, which forms no `1 − μ`.
 pub(crate) fn weight_eta_deriv<T: Scalar>(family: Family, nb_theta: f64, eta: T, mu: T, w: T) -> T {
     if exact_curvature_differs(family) && in_tail(family, eta.value(), mu.value()) {
         // `(ln w)'` reads neither y nor the prior weight.
@@ -1320,6 +1406,92 @@ mod tests {
     use crate::{
         BinomialLink, Family, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink,
     };
+
+    /// The unit deviance keeps its digits where `y` is near `μ` at a large
+    /// scale: counts near 1e10, and the near-equal proportions or means a
+    /// huge prior weight or a tiny dispersion multiplies. References are
+    /// 50-digit evaluations (mpmath) of the same expressions at these exact
+    /// `f64` inputs. A log taken as a quotient or as a difference of two logs
+    /// misses each by 5e-6 to 7e-5 relative, which, times the row's scale,
+    /// sits above the PIRLS exit band; so does an NB form whose two terms are
+    /// each near `y·(y − μ)/μ` (4e-7 relative here). The NB arm of
+    /// `simd_transcendental::family_pass`, the one the `f64` fits run, must
+    /// agree with `dev_resid` at its own μ to the same band.
+    #[test]
+    fn unit_deviance_is_accurate_near_y_equal_mu() {
+        let nb = Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        };
+        let cases = [
+            (
+                Family::Poisson {
+                    link: PoissonLink::Log,
+                },
+                10_000_070_000.0,
+                1e10,
+                f64::NAN,
+                0.489_998_856_670_668_3,
+                1e-9,
+            ),
+            (
+                nb,
+                11_000_000_000.0,
+                1e10,
+                50.0,
+                0.468_982_017_294_786_7,
+                1e-9,
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Logit,
+                },
+                0.3 + 2f64.powi(-20),
+                0.3,
+                f64::NAN,
+                4.330_924_528_896_284e-12,
+                1e-9,
+            ),
+            (
+                Family::Gamma {
+                    link: GammaLink::Log,
+                },
+                0.7 + 2f64.powi(-20),
+                0.7,
+                f64::NAN,
+                1.856_109_950_438_723e-12,
+                1e-9,
+            ),
+        ];
+        for (family, y, mu, nb_theta, reference, band) in cases {
+            let d: f64 = dev_resid(family, nb_theta, y, mu);
+            let rel = (d - reference).abs() / reference;
+            assert!(
+                rel < band,
+                "{family:?}: {d} vs 50-digit {reference} (rel {rel:.1e})"
+            );
+        }
+        let (y, theta) = (vec![11_000_000_000.0; 9], 50.0);
+        let mut eta = vec![1e10f64.ln(); 9];
+        let (mut prob, mut w) = (vec![0.0; 9], vec![0.0; 9]);
+        let (simd, _) = crate::simd_transcendental::family_pass(
+            nb,
+            theta,
+            &mut eta,
+            &y,
+            &[],
+            false,
+            0.0,
+            &mut prob,
+            &mut w,
+            &mut [],
+        );
+        let scalar: f64 = (0..9).map(|i| dev_resid(nb, theta, y[i], prob[i])).sum();
+        let rel = (simd - scalar).abs() / scalar;
+        assert!(
+            rel < 1e-9,
+            "NB family_pass {simd} vs dev_resid {scalar} (rel {rel:.1e})"
+        );
+    }
 
     /// Past cloglog's e^{−t} underflow (η > ln 745) and probit's Φ underflow
     /// (|η| > 38) the tail weight is exactly 0; the working residual must still
@@ -1613,17 +1785,17 @@ mod tests {
             (
                 probit,
                 &[0.0, 0.3, 1.0],
-                &[-7.1, -12.0, -40.0, -300.0, 7.1, 12.0, 40.0],
+                &[-7.1, -12.0, -40.0, -300.0, 3.8, 5.0, 6.0, 7.1, 12.0, 40.0],
             ),
             (
                 cloglog,
                 &[0.0, 0.3, 1.0],
-                &[-27.7, -60.0, -600.0, 3.4, 6.0, 30.0, 650.0],
+                &[-27.7, -60.0, -600.0, 2.3, 3.4, 6.0, 30.0, 650.0],
             ),
             (
                 logit,
                 &[0.0, 0.3, 1.0],
-                &[-27.7, -60.0, -600.0, 27.7, 60.0, 600.0],
+                &[-27.7, -60.0, -600.0, 9.3, 27.7, 60.0, 600.0],
             ),
             (nb, &[0.0, 3.0], &[-231.0, -600.0, 231.0, 600.0]),
             (gamma, &[0.5, 3.0], &[-231.0, -600.0, 231.0, 600.0]),
@@ -1675,9 +1847,9 @@ mod tests {
     /// or a tail, walking η further out against the data (a y > 0 row toward
     /// μ → 0, a y < 1 or y < μ row toward the upper side) strictly raises
     /// `dev_resid_at`, finite at every step, with no constant stretch past
-    /// `MU_FLOOR` or `PROB_EPS`. And at the switch from the μ form to the tail
-    /// form the two agree to round-off on the side where μ is exactly
-    /// representable.
+    /// `MU_FLOOR` or `PROB_EPS`. And at each switch from the μ form to the
+    /// tail form the two agree to round-off (to the μ form's 1e-12 at the
+    /// binomial upper switch).
     #[test]
     fn tail_deviance_grows_and_meets_the_mu_form() {
         let nb_theta = 2.5;
@@ -1791,6 +1963,81 @@ mod tests {
         ] {
             meet(f, 2.0, -LOG_TAIL_ETA + 1e-9, -LOG_TAIL_ETA - 1e-9);
             meet(f, 2.0, LOG_TAIL_ETA - 1e-9, LOG_TAIL_ETA + 1e-9);
+        }
+        // The binomial upper switch, `1 − μ = UPPER_TAIL_Q`, where the μ
+        // form's `1 − μ` still carries 12 digits.
+        for (link, eta) in [
+            (BinomialLink::Logit, 9.210_240_366_975_85),
+            (BinomialLink::Probit, 3.719_016_485_455_68),
+            (BinomialLink::Cloglog, 2.220_326_806_367_846),
+        ] {
+            meet(Family::Binomial { link }, 0.0, eta - 1e-8, eta + 1e-8);
+        }
+    }
+
+    /// A y = 0 row with `1 − μ` near 1e-10, inside the `(PROB_EPS,
+    /// UPPER_TAIL_Q)` band, keeps every digit of its deviance and score on
+    /// each binomial link: through `row_score` and `dev_resid_eta` (PIRLS and
+    /// AGQ) and through the family pass's deviance and `w·(z − η)` (GLM IRLS
+    /// and the PIRLS refresh). References are 50-digit values (mpmath) of
+    /// `−2·ln(1 − μ)` and `−(−ln(1 − μ))'`. A μ form taking `1 − μ` from the
+    /// stored μ misses the probit and cloglog scores here by about 1e-7
+    /// relative and the logit deviance by 5e-9.
+    #[test]
+    fn binomial_upper_rows_keep_their_digits() {
+        let cases = [
+            (
+                BinomialLink::Logit,
+                22.5,
+                45.000_000_000_338_38,
+                -0.999_999_999_830_810_2,
+            ),
+            (
+                BinomialLink::Probit,
+                6.3,
+                45.256_529_260_900_02,
+                -6.451_586_678_649_745,
+            ),
+            (
+                BinomialLink::Cloglog,
+                3.1,
+                44.395_902_562_883_27,
+                -22.197_951_281_441_64,
+            ),
+        ];
+        let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
+        for (link, eta, dev_ref, score_ref) in cases {
+            let f = Family::Binomial { link };
+            let dev = dev_resid_eta(f, f64::NAN, 0.0, eta);
+            let score = row_score(f, f64::NAN, 0.0, 1.0, eta, link_inv(f, eta));
+            // Weighted, so logit takes the general arm rather than the fused
+            // unweighted kernel, whose deviance never forms `1 − μ`.
+            let (mut e, mut prob, mut w, mut z) =
+                (vec![eta; 5], vec![0.0; 5], vec![0.0; 5], vec![0.0; 5]);
+            let (pass_dev, _) = crate::simd_transcendental::family_pass(
+                f,
+                f64::NAN,
+                &mut e,
+                &[0.0; 5],
+                &[1.0; 5],
+                true,
+                0.0,
+                &mut prob,
+                &mut w,
+                &mut z,
+            );
+            for (what, got, want) in [
+                ("dev_resid_eta", dev, dev_ref),
+                ("row_score", score, score_ref),
+                ("family_pass deviance", pass_dev / 5.0, dev_ref),
+                ("family_pass w·(z − η)", w[0] * (z[0] - e[0]), score_ref),
+            ] {
+                assert!(
+                    rel(got, want) < 1e-13,
+                    "{link:?} η = {eta}: {what} {got} vs 50-digit {want} (rel {:.1e})",
+                    rel(got, want)
+                );
+            }
         }
     }
 
@@ -1937,6 +2184,54 @@ mod tests {
             (restored - direct).abs() < 1e-10,
             "binomial {restored} vs {direct}"
         );
+    }
+
+    /// The Poisson row `y·ln y − y − lnΓ(y+1)` and the aggregated binomial row
+    /// `ln C(m,s) + s·ln y + (m−s)·ln(1−y)`, against 60-digit values (mpmath
+    /// `loggamma`, at the f64 inputs) out to counts near 1e15. Their terms are
+    /// of order `y·ln y` while the value is of order `ln y`, so formed term by
+    /// term they keep about 1e-5 absolute at `y = 1e10`; the band is 1e-12.
+    #[test]
+    fn saturated_loglik_is_accurate_at_any_count() {
+        let fp = Family::Poisson {
+            link: PoissonLink::Log,
+        };
+        let pois = [
+            (1.0, -1.0),
+            (2.5, -1.410_246_772_661_686_6),
+            (7.0, -1.903_790_317_678_221_2),
+            (1e3, -4.372_899_506_026_297),
+            (1e7, -8.977_986_367_017_166),
+            (1e10, -12.431_863_998_183_234),
+            (1e15, -18.188_326_730_660_015),
+        ];
+        for (y, want) in pois {
+            let got = saturated_loglik(fp, f64::NAN, &[y], None);
+            assert!(
+                (got - want).abs() <= 1e-12,
+                "poisson y = {y:e}: {got} vs {want}"
+            );
+        }
+        let fb = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        // (trials m, proportion y, 60-digit row value)
+        let binom = [
+            (2.0, 0.5, -std::f64::consts::LN_2),
+            (3.0, 2.0 / 3.0, -0.810_930_216_216_328_8),
+            (2.5, 0.4, -0.766_238_435_648_986),
+            (1e3, 0.375, -3.647_671_953_727_958),
+            (1e10, 0.25, -11.594_875_781_425_177),
+            (2f64.powi(40), 2f64.powi(-40), -0.999_999_999_999_545_3),
+            (1e15, 0.5, -17.495_179_550_100_07),
+        ];
+        for (m, y, want) in binom {
+            let got = saturated_loglik(fb, f64::NAN, &[y], Some(&[m]));
+            assert!(
+                (got - want).abs() <= 1e-12,
+                "binomial m = {m:e}, y = {y}: {got} vs {want}"
+            );
+        }
     }
 
     #[test]

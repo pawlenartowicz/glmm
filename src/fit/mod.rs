@@ -39,8 +39,10 @@ mod ols;
 
 use common::{
     assert_group_ids, assert_model_shape, detect_aliased, fit_rank_deficient, spec_sized_from_ids,
-    theta_width,
 };
+// `pub(crate)` so `orchestrate::run_fit` can check a port's warm-start θ width
+// before the fit, the way `fit_warm` checks it.
+pub(crate) use common::theta_width;
 // The grouping reorder `spec_sized_from_ids` may apply. Always `pub` (it is a
 // `build_workspace` parameter and one of `spec_sized_from_ids_pub`'s returns)
 // but the `fit` module itself is private, so the stable crate surface is
@@ -75,7 +77,9 @@ pub struct Fit {
     /// covariance to report for a coefficient whose variance was never
     /// computed), and a non-converged fit is all-NaN — except an LMM or GLMM
     /// fit that hit `MaxFunReached`: that budget-exhausted exit reports its
-    /// finite covariance at the capped endpoint here instead.
+    /// finite covariance at the capped endpoint here instead. A GLMM fit under
+    /// [`Note::SeUnavailable`] is all-NaN here and in `se` whatever its
+    /// `converged`.
     ///
     /// Sources, by path: OLS/GLM/LMM invert the same Cholesky factor `se`'s
     /// forward solve already walks; GLMM `WaldSe::Hessian` takes the β block of
@@ -85,9 +89,8 @@ pub struct Fit {
     /// inverse — both already formed in full and previously discarded down to a
     /// diagonal. Unlike `stddev_se`, this is populated on the Hessian's RX
     /// fallback too (that fallback inverts a full p×p covariance; only a
-    /// double failure, where the Hessian AND the fallback both fail, NaN-fills
-    /// — as any other non-converged fit does, other than the LMM/GLMM
-    /// `MaxFunReached` endpoint above).
+    /// double failure, where the Hessian AND the fallback both fail, leaves it
+    /// NaN, under [`Note::SeUnavailable`]).
     pub vcov: Vec<Vec<f64>>,
     /// Per-element Cholesky-scaled values `theta[k]^2 * sigma_sq`. These equal
     /// the random-effect variance components only for diagonal/scalar RE
@@ -482,6 +485,15 @@ pub enum Note {
     /// `ExactProfile` (`Joint` and `PqlThenJoint` have no fallback of their
     /// own).
     ExactProfileFallback,
+    /// A GLMM search reached its endpoint, but no fixed-effect covariance could
+    /// be formed there: the β information (the Rx Schur complement, and under
+    /// `WaldSe::Hessian` the joint Hessian before it) is not positive definite
+    /// to rounding. The estimates, the variance components, the deviance and
+    /// `converged` are the search's own; `Fit::se`, `Fit::vcov` and
+    /// `Fit::stddev_se` are NaN. Reached on a near-duplicate fixed-effect
+    /// column the alias gate keeps, and on fits whose working weights span
+    /// many decades.
+    SeUnavailable,
     /// The response is not within `1e-3` of an integer count — the raw value
     /// for Poisson/negative-binomial, the derived successes `y·wᵢ` for
     /// binomial. The fit still runs (the deviance and score are continuous in
@@ -513,6 +525,26 @@ pub enum Note {
         /// The grouping factor, as the formula spells it.
         grouping: String,
     },
+    /// A GLMM's deviance is too large for `f64` to resolve its optimum: its
+    /// estimated rounding error at the endpoint exceeds 1e-2 deviance units,
+    /// which moves θ̂ by about a tenth of its standard error, and the search
+    /// sees a noise several times that. β̂, θ̂ and the deviance may sit off the
+    /// optimum; `converged` and every estimate are the search's own. Two
+    /// sources add up in the estimate: the deviance itself, about 1e13 or more
+    /// (a model that misses a large effect at counts in the billions), and,
+    /// with more than one grouping factor, `log|A|`, whose rounding grows with
+    /// the extra factors' `θ²·Σwᵢ` (crossed or nested intercepts at counts in
+    /// the trillions). A model that captures the missing effect removes the
+    /// first source.
+    PrecisionLimited,
+    /// The fixed-effects IRLS stopped on separation: the deviance settled
+    /// while the last step still moved some linear predictor by a large
+    /// amount, so at least one coefficient runs off to ±∞ (binomial, Poisson,
+    /// negative binomial). `converged` is `false` and `beta` holds the last
+    /// step. On a GLM fit that is the fit itself; on a GLMM fit it is the GLM
+    /// the search starts from, so the search never ran: the random-effect
+    /// outputs, the SEs and the deviance are NaN.
+    Separated,
 }
 
 impl Diagnostics {
@@ -761,8 +793,7 @@ pub struct FitOptions {
     /// `offset=`: `η = o + Xβ (+ Zb)`, every family, every solver path. A fixed
     /// known contribution, NOT a parameter: it adds no column to `X` and never
     /// appears in `beta`/`se`/`vcov`/`df`. The canonical use is a Poisson
-    /// exposure, `offset = ln(exposure)`. `None` = no offset (byte-identical to
-    /// the pre-offset paths). Gaussian identity-link paths (OLS/LMM) implement
+    /// exposure, `offset = ln(exposure)`. `None` = no offset. Gaussian identity-link paths (OLS/LMM) implement
     /// it as the exact `y − o` shift before the sufficient-statistics
     /// accumulation; `Fit::fitted` still reports means on the original `y`
     /// scale (μ̂ = o + Xβ̂ + Zb̂ through the link). Oracle: `glm(offset=)` /
@@ -789,9 +820,11 @@ pub struct FitOptions {
     /// cores.
     ///
     /// Wired to the AGQ cluster-outer restructuring (`agq::agq_deviance`'s
-    /// `cluster_rows` path): `false` skips the per-fit `ClusterRowIndex` build and
-    /// runs the original node-outer loop. Also gates the FD-Hessian grids (dense and
-    /// sparse): `false` keeps the serial cell-by-cell loop. See the design doc above
+    /// `cluster_rows` path): `false` runs scalar AGQ's original node-outer loop
+    /// with no per-fit `ClusterRowIndex` build (vector AGQ is cluster-outer on
+    /// every build, and a serial build gives it the index once per fit). Also
+    /// gates the FD-Hessian grids (dense and sparse): `false` keeps the serial
+    /// cell-by-cell loop. See the design doc above
     /// for the full rationale, including why nesting this under an outer `rayon`
     /// batch loop is safe (one shared work-stealing pool) in a way naive OS-thread
     /// or BLAS-thread nesting is not.
@@ -1161,7 +1194,9 @@ pub use common::spec_sized_from_ids_pub;
 // through `Fit`, never directly.
 #[cfg(feature = "loop_advanced")]
 pub use common::FitDiagnostics;
-pub(crate) use glm::{nb_profile_loglik, NB_THETA_HI, NB_THETA_LO};
+pub(crate) use glm::{
+    nb_count_groups, nb_profile_loglik, nb_saturated_loglik_grouped, NB_THETA_HI, NB_THETA_LO,
+};
 // Test-only since the GLMM NB coordinate stopped seeding from it (it seeds from
 // `fit_glm_nb`'s θ̂ instead): `fit_glm_nb_capped` calls it inside `glm.rs`, so the
 // only cross-module readers left are the tests that pin it.

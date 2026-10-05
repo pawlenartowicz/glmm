@@ -158,6 +158,59 @@ fn compute_finds_the_statistics_the_module_doc_states() {
             tol: 0.0,
             identity: true,
         },
+        // The 0/1 rule at its edges: -0.0 is 0, so column 1 stays 0/1 and is
+        // left as it is; one ULP above 1 (column 2), one ULP below 1
+        // (column 3), the smallest subnormal (column 4), +inf (column 5) and
+        // -inf (column 6) are not 0/1. Columns 2 to 4 are centered and
+        // scaled; columns 5 and 6 are not finite and left as they are.
+        ComputeCase {
+            name: "-0.0 is a 0, a value one ULP off 0 or 1 is not",
+            x: rows(&[
+                &[
+                    1.0,
+                    -0.0,
+                    1.0 + f64::EPSILON,
+                    1.0 - f64::EPSILON / 2.0,
+                    5e-324,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                ],
+                &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                &[1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            ]),
+            weights: None,
+            re_slopes: vec![],
+            standardize: true,
+            intercept: Some(0),
+            stats: vec![
+                (0.0, 1.0),
+                (0.0, 1.0),
+                (
+                    (2.0 + f64::EPSILON) / 3.0,
+                    spread(
+                        &[1.0 + f64::EPSILON, 0.0, 1.0],
+                        &ones[..3],
+                        (2.0 + f64::EPSILON) / 3.0,
+                    ),
+                ),
+                (
+                    (2.0 - f64::EPSILON / 2.0) / 3.0,
+                    spread(
+                        &[1.0 - f64::EPSILON / 2.0, 0.0, 1.0],
+                        &ones[..3],
+                        (2.0 - f64::EPSILON / 2.0) / 3.0,
+                    ),
+                ),
+                (
+                    (1.0 + 5e-324) / 3.0,
+                    spread(&[5e-324, 0.0, 1.0], &ones[..3], (1.0 + 5e-324) / 3.0),
+                ),
+                (0.0, 1.0),
+                (0.0, 1.0),
+            ],
+            tol: 1e-15,
+            identity: false,
+        },
         ComputeCase {
             name: "an empty design is the identity",
             x: (vec![], 0, 2),

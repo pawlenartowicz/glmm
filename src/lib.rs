@@ -80,11 +80,6 @@ pub use ids::GroupIds;
 pub use lmm::THETA0;
 pub use spec::*;
 
-/// Tiny float guard — magnitudes below this are treated as zero (rank /
-/// division-by-zero sentinel): comparing `β̂²/var_diag` against thresholds with
-/// NaN propagates as "fail" downstream.
-pub(crate) const FLOAT_NEAR_ZERO: f64 = 1e-30;
-
 #[cfg(feature = "loop_advanced")]
 pub mod loop_advanced;
 

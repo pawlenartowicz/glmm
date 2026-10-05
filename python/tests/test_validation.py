@@ -217,6 +217,28 @@ def test_warm_start_not_dict_message_matches_the_r_port():
         glmm.fit(DATA, "y ~ x", warm_start=[0.0, 0.0])
 
 
+@pytest.mark.parametrize(
+    ("warm_start", "message"),
+    [
+        ({"beta": [0.0]}, r"^warm-start beta has 1 entries but the model has 2 fixed-effect"),
+        (
+            {"theta": [1.0, 0.0]},
+            r"^warm-start theta has 2 entries but the model has 1 random-effect",
+        ),
+    ],
+)
+def test_wrong_width_warm_start_names_the_argument(warm_start, message, capfd):
+    with pytest.raises(ValueError, match=message):
+        glmm.fit(FIT_DATA, "y_gauss ~ x + (1 | g)", warm_start=warm_start)
+    assert "panicked" not in capfd.readouterr().err
+
+
+def test_non_finite_offset_term_names_the_term():
+    data = dict(DATA, o=[0.0, float("inf"), 0.0])
+    with pytest.raises(ValueError, match=r"^term 'offset\(o\)' is not finite at row 1$"):
+        glmm.fit(data, "y ~ x + offset(o)")
+
+
 def test_clean_call_emits_no_warnings_and_fits():
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # any warning becomes an error
@@ -383,6 +405,14 @@ def test_weights_and_offset_are_dropped_in_lockstep_with_na_rows():
     assert result.converged
     assert result.nobs == 3
     assert list(result.weights) == [1.0, 2.0, 4.0]  # row index 2 (weight 3.0) is the one dropped
+
+
+def test_ragged_dict_with_a_missing_value_in_the_short_column_is_refused():
+    # The per-column missing-value masks are combined row by row; a short
+    # column must not shrink the fit to its own length.
+    data = {"y": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], "x": [0.0, 1.0, float("nan"), 3.0, 4.0, 5.0]}
+    with pytest.raises(ValueError, match=r'^columns have mismatched lengths \("x": 6, "y": 7\)'):
+        glmm.fit(data, "y ~ x")
 
 
 def test_pyarrow_null_in_a_used_numeric_column_drops_its_row():

@@ -11,10 +11,11 @@ use super::*;
 /// the production route.
 pub(crate) trait TailKernel: Scalar {
     /// One cluster's Schur downdate `S[cols][cols] −= C_f' A_f⁻¹ C_f`, lower
-    /// triangle. `core_l` is cluster `f`'s `qc×qc` Crout factor, `coup` its
-    /// `qc×e` row-major coupling block, `cols` its ascending nonzero crossed
-    /// columns, `schur` the dense row-major `e×e` accumulator (lower at
-    /// `[a·e + b]`, `a ≥ b`).
+    /// triangle. `core_l` is cluster `f`'s `qc×qc` Crout factor, `cols` its
+    /// ascending nonzero crossed columns, `coup` its compact `qc×|cols|`
+    /// row-major coupling block (`C_f[local][cols[j]]` at `local·|cols| + j`),
+    /// `schur` the dense row-major `e×e` accumulator (lower at `[a·e + b]`,
+    /// `a ≥ b`).
     ///
     /// The default body is the rank-1 scalar column walk. `f64` overrides it
     /// with the panel route (`glmm_block_solve_panel` + one triangular faer
@@ -42,9 +43,8 @@ pub(crate) trait TailKernel: Scalar {
     ///
     /// The default body is the crate-own dense Crout factor, in place, leaving
     /// `schur` holding `L` for `tail_solve`. `f64` overrides it with the cached
-    /// sparse LLT when `ss` is `Some`, which is what the production path runs
-    /// and what the bit-identity dump pins; `ss = None` selects the dense arm on
-    /// both.
+    /// sparse LLT when `ss` is `Some`, which is what the production path runs;
+    /// `ss = None` selects the dense arm on both.
     fn tail_factor(schur: &mut [Self], e: usize, ss: Option<&mut StructuredSchur>) -> Option<Self> {
         let _ = ss;
         tail_factor_generic(schur, e)
@@ -102,10 +102,7 @@ impl TailKernel for f64 {
         // per-cluster loop) never reuses `ss` afterward, so this consumes it
         // directly rather than reborrowing via `as_deref_mut`.
         let Some(StructuredSchur {
-            c_panel,
-            y_panel,
-            dd_temp,
-            ..
+            y_panel, dd_temp, ..
         }) = ss.filter(|_| qc != 1)
         else {
             // Production route for qc == 1 (and the ss = None oracle). At
@@ -119,33 +116,27 @@ impl TailKernel for f64 {
             // the grid. Sizing of the panel buffers mirrors this condition in
             // `StructuredSchur::new` — change together.
             let mut ycol = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
-            for &b in cols {
+            for (jb, &b) in cols.iter().enumerate() {
                 let b = b as usize;
                 for local in 0..qc {
-                    ycol[local] = coup[local * e + b];
+                    ycol[local] = coup[local * e_f + jb];
                 }
                 glmm_block_solve(&core_l[..qc * qc], qc, &mut ycol[..qc]);
-                for &a in cols {
+                for (ja, &a) in cols.iter().enumerate() {
                     let a = a as usize;
                     if a < b {
                         continue;
                     }
                     let mut acc = 0.0;
                     for local in 0..qc {
-                        acc += coup[local * e + a] * ycol[local];
+                        acc += coup[local * e_f + ja] * ycol[local];
                     }
                     schur[a * e + b] -= acc;
                 }
             }
             return;
         };
-        let cpan = &mut c_panel[..qc * e_f];
-        for local in 0..qc {
-            let crow = &coup[local * e..];
-            for (dst, &b) in cpan[local * e_f..(local + 1) * e_f].iter_mut().zip(cols) {
-                *dst = crow[b as usize];
-            }
-        }
+        let cpan = &coup[..qc * e_f];
         let ypan = &mut y_panel[..qc * e_f];
         ypan.copy_from_slice(cpan);
         glmm_block_solve_panel(&core_l[..qc * qc], qc, ypan, e_f);
@@ -398,21 +389,22 @@ pub(crate) fn tail_downdate_generic<T: Scalar>(
     cols: &[u32],
     schur: &mut [T],
 ) {
+    let e_f = cols.len();
     let mut ycol = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
-    for &b in cols {
+    for (jb, &b) in cols.iter().enumerate() {
         let b = b as usize;
         for local in 0..qc {
-            ycol[local] = coup[local * e + b];
+            ycol[local] = coup[local * e_f + jb];
         }
         glmm_block_solve(&core_l[..qc * qc], qc, &mut ycol[..qc]);
-        for &a in cols {
+        for (ja, &a) in cols.iter().enumerate() {
             let a = a as usize;
             if a < b {
                 continue;
             }
             let mut acc = T::ZERO;
             for local in 0..qc {
-                acc += coup[local * e + a] * ycol[local];
+                acc += coup[local * e_f + ja] * ycol[local];
             }
             schur[a * e + b] -= acc;
         }
@@ -475,8 +467,9 @@ fn tail_quadratic_form(h: f64, tail_inv: &[f64], e: usize, cols: &[u32], tail_r:
 /// on a non-PD core block / Schur. The Schur factor itself routes through
 /// `TailKernel::tail_factor`: the cached sparse LLT when `ss` is `Some` at `T = f64`
 /// (the production route), the crate-own dense Crout — `tail_factor`'s default
-/// body — at any non-`f64` `T` or when `ss` is `None`. `coupling[f]` holds `C_f`
-/// (q_core×e row-major), unchanged. Shared by `pirls_solve_blocked_extras` (per iteration) and
+/// body — at any non-`f64` `T` or when `ss` is `None`. `coupling` holds `C_f`
+/// in the compact per-cluster layout (`StructuredScratch::coupling`),
+/// unchanged. Shared by `pirls_solve_blocked_extras` (per iteration) and
 /// `structured_schur_fill` (reusing the converged factors). `q_core ≤ MAX_PRIMARY_Q`.
 /// `coup_cols`/`coup_ptr` is the per-cluster CSR of C_f's nonzero crossed columns
 /// (built once per solve by `pirls_solve_blocked_extras`): the Schur build walks
@@ -522,7 +515,7 @@ pub(crate) fn structured_factor<T: TailKernel>(
         // S −= C_f' A_f⁻¹ C_f (lower triangle) over cluster f's NONZERO crossed
         // columns, via TailKernel::tail_downdate (panel-vs-scalar routing documented
         // there and on structured_factor's own doc comment above).
-        let coup = f * qc * e;
+        let coup = qc * coup_ptr[f] as usize;
         let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
         let e_f = cols.len();
         if e_f == 0 {
@@ -531,7 +524,7 @@ pub(crate) fn structured_factor<T: TailKernel>(
         T::tail_downdate(
             &core_blocks[cb..cb + qc * qc],
             qc,
-            &coupling[coup..],
+            &coupling[coup..coup + qc * e_f],
             e,
             cols,
             ss.as_deref_mut(),
@@ -588,18 +581,19 @@ pub(crate) fn structured_ainv_solve<T: TailKernel>(
     for f in 0..s {
         let cb = f * qc * qc;
         let gcb = f * qc;
-        let coup = f * qc * e;
+        let coup = qc * coup_ptr[f] as usize;
         glmm_block_solve(
             &core_blocks[cb..cb + qc * qc],
             qc,
             &mut a_rhs[gcb..gcb + qc],
         );
         let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
-        for &b in cols {
+        let nc = cols.len();
+        for (j, &b) in cols.iter().enumerate() {
             let b = b as usize;
             let mut acc = T::ZERO;
             for local in 0..qc {
-                acc += coupling[coup + local * e + b] * a_rhs[gcb + local];
+                acc += coupling[coup + local * nc + j] * a_rhs[gcb + local];
             }
             a_rhs[k_family + b] -= acc;
         }
@@ -612,15 +606,16 @@ pub(crate) fn structured_ainv_solve<T: TailKernel>(
     for f in 0..s {
         let cb = f * qc * qc;
         let gcb = f * qc;
-        let coup = f * qc * e;
+        let coup = qc * coup_ptr[f] as usize;
         let mut v = [T::ZERO; MAX_PRIMARY_Q];
         let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
+        let nc = cols.len();
         #[allow(clippy::needless_range_loop)]
         for local in 0..qc {
             let mut acc = T::ZERO;
-            for &b in cols {
+            for (j, &b) in cols.iter().enumerate() {
                 let b = b as usize;
-                acc += coupling[coup + local * e + b] * a_rhs[k_family + b];
+                acc += coupling[coup + local * nc + j] * a_rhs[k_family + b];
             }
             v[local] = acc;
         }
@@ -642,7 +637,8 @@ pub(crate) struct StructuredFactor<'a, T> {
     /// `s·q_core²`, cluster `f` at `f·q_core²`, row-major lower triangle. Left
     /// FACTORED (per-cluster Crout `L`) by `factor_logdet`.
     pub(crate) core_blocks: &'a mut [T],
-    /// `s·q_core·e`: cluster `f`'s `C_f`, `q_core×e` row-major, at `f·q_core·e`.
+    /// Cluster `f`'s `C_f` on its coupling columns, `q_core×|cols_f|`
+    /// row-major, at `q_core·coup_ptr[f]` (`StructuredScratch::coupling`).
     pub(crate) coupling: &'a mut [T],
     /// `e×e` row-major lower triangle: the crossed `E`, then the Schur
     /// complement `S = (E+I) − Σ_f C_f'A_f⁻¹C_f`, then its factor.
@@ -650,8 +646,8 @@ pub(crate) struct StructuredFactor<'a, T> {
     /// len `k_total`, packed `[g_core in (f,local) order | g_e]`: `M'r`, then
     /// `A⁻¹M'r` in place.
     pub(crate) a_rhs: &'a mut [T],
-    /// len `n`: `(Mu)ᵢ` after `eta_from_mode`, then the IRLS effective residual
-    /// `rᵢ = wᵢ·(Mu)ᵢ + W·working_residᵢ` after `scatter`'s fold.
+    /// len `n`: the row scores `ρᵢ` the u-step's right-hand side scatters,
+    /// written by `scatter`'s fold.
     pub(crate) mu: &'a mut [T],
     /// Row-major `n×q_core`: `M`'s core slice per row.
     pub(crate) m_core_buf: &'a [T],
@@ -664,6 +660,9 @@ pub(crate) struct StructuredFactor<'a, T> {
     /// Per-cluster CSR of `C_f`'s nonzero crossed columns.
     pub(crate) coup_cols: &'a [u32],
     pub(crate) coup_ptr: &'a [u32],
+    /// Each crossed entry's position in its cluster's columns, same indexing
+    /// as `cross_col` (`StructuredPattern::coup_pos`).
+    pub(crate) coup_pos: &'a [u32],
     /// The cached sparse tail factor; `None` on nested-only shapes (`e = 0`).
     pub(crate) structured_schur: Option<&'a mut StructuredSchur>,
     /// Route the tail through the dense Crout arm rather than the cached sparse LLT.
@@ -711,7 +710,6 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
                 mui += cross_val[cbase + z] * u[k_family + b];
             }
             eta[i] = eta_fixed[i] + mui;
-            self.mu[i] = mui; // keep (Mu)ᵢ for the IRLS residual
             yeta += T::from_f64(y[i]) * eta[i];
         }
         yeta
@@ -738,8 +736,8 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
             cross_val,
             cross_col,
             n_cross,
-            coup_cols,
             coup_ptr,
+            coup_pos,
             g,
             cluster_ids,
             family,
@@ -753,54 +751,22 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
         let e = g.k_crossed();
         let k_family = qc * s;
         let k = k_family + e;
-        // Observed twin of the IRLS effective residual, formed BEFORE the Fisher
-        // fold below overwrites `mu`: rᵢ_obs = w_obs,ᵢ·(Mu)ᵢ + W·working_residᵢ.
-        // `blocked.rs` instead re-reads `a_rhs` before its own fold, because there
-        // the scattered RHS is the bare `g`; here `(A − I)u` rides inside the
-        // residual, so the observed right-hand side needs its own. The two arms
-        // mirror the Fisher fold below — change together.
-        if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
-            match family {
-                Family::Binomial {
-                    link: BinomialLink::Logit,
-                } if !weighted => {
-                    for i in 0..n {
-                        let wo = crate::family::observed_weight(
-                            family, nb_theta, y[i], prior_w[i], eta[i], prob[i], w[i],
-                        );
-                        d.obs_resid[i] = wo * mu[i] + (T::from_f64(y[i]) - prob[i]);
-                    }
-                }
-                other => {
-                    for i in 0..n {
-                        let wo = crate::family::observed_weight(
-                            family, nb_theta, y[i], prior_w[i], eta[i], prob[i], w[i],
-                        );
-                        d.obs_resid[i] = wo * mu[i]
-                            + crate::family::row_score(
-                                other, nb_theta, y[i], prior_w[i], eta[i], prob[i],
-                            );
-                    }
-                }
-            }
-        }
-        // IRLS effective residual rᵢ = wᵢ·(Mu)ᵢ + W·working_resid, so the
-        // scattered RHS is M'(W·Mu + W·r) = (A−I)u + M'(W·r). Logit's W·r=(y−p);
-        // the general branch's is (dμ/dη)·(y−μ)/V.
+        // Row score ρᵢ, so the scattered RHS is M'ρ, the u-step's increment
+        // right-hand side before its `− u` (see `pirls_solve_blocked`). Logit's
+        // ρ = (y−p); the general branch's is (dμ/dη)·(y−μ)/V.
         match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
             } if !weighted => {
                 for i in 0..n {
-                    mu[i] = w[i] * mu[i] + (T::from_f64(y[i]) - prob[i]);
+                    mu[i] = T::from_f64(y[i]) - prob[i];
                 }
             }
             other => {
                 for i in 0..n {
-                    mu[i] = w[i] * mu[i]
-                        + crate::family::row_score(
-                            other, nb_theta, y[i], prior_w[i], eta[i], prob[i],
-                        );
+                    mu[i] = crate::family::row_score(
+                        other, nb_theta, y[i], prior_w[i], eta[i], prob[i],
+                    );
                 }
             }
         }
@@ -808,19 +774,11 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
         for v in core_blocks[..s * qc * qc].iter_mut() {
             *v = T::ZERO;
         }
-        // coupling is only ever WRITTEN by this scatter (structured_factor and
-        // structured_ainv_solve treat it as read-only), so zeroing exactly the
-        // coup_cols/coup_ptr pattern the scatter can write is sufficient — nothing
-        // else ever touches an out-of-pattern coupling entry between passes.
-        for f in 0..s {
-            let coup = f * qc * e;
-            let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
-            for &b in cols {
-                let b = b as usize;
-                for r in 0..qc {
-                    coupling[coup + r * e + b] = T::ZERO;
-                }
-            }
+        // The compact coupling holds the pattern's entries only, all of which
+        // the scatter can write.
+        let coup_end = qc * coup_ptr[s] as usize;
+        for v in coupling[..coup_end].iter_mut() {
+            *v = T::ZERO;
         }
         // schur_blk stays a dense clear (unlike coupling above): the dense-fallback
         // branch of structured_factor (TailKernel::tail_factor's `ss = None` arm)
@@ -834,29 +792,18 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
             *v = T::ZERO;
         }
         // Twin zeroing, mirroring the Fisher zeroing above buffer-for-buffer:
-        // `obs_core_blocks`/`obs_rhs` clear in full, `obs_coupling` clears only
-        // the `coup_cols`/`coup_ptr` pattern the twin scatter below can write,
-        // and `obs_schur_blk` stays a dense clear for the same fill-in reason
-        // `schur_blk` is above. `obs_resid` needs no clearing here — the pass
-        // above already wrote every row before this scatter reads it.
+        // `obs_core_blocks`/`obs_coupling` clear in full, and `obs_schur_blk`
+        // stays a dense clear for the same fill-in reason `schur_blk` is
+        // above. The twin's right-hand side is the Fisher one, copied in by the
+        // solve.
         if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
             for v in d.obs_core_blocks[..s * qc * qc].iter_mut() {
                 *v = T::ZERO;
             }
-            for f in 0..s {
-                let coup = f * qc * e;
-                let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
-                for &b in cols {
-                    let b = b as usize;
-                    for r in 0..qc {
-                        d.obs_coupling[coup + r * e + b] = T::ZERO;
-                    }
-                }
-            }
-            for v in d.obs_schur_blk[..e * e].iter_mut() {
+            for v in d.obs_coupling[..coup_end].iter_mut() {
                 *v = T::ZERO;
             }
-            for v in d.obs_rhs[..k].iter_mut() {
+            for v in d.obs_schur_blk[..e * e].iter_mut() {
                 *v = T::ZERO;
             }
         }
@@ -871,7 +818,8 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
             let ncz = n_cross[i] as usize;
             let cb = f * qc * qc;
             let gcb = f * qc;
-            let coup = f * qc * e;
+            let coup = qc * coup_ptr[f] as usize;
+            let nc = (coup_ptr[f + 1] - coup_ptr[f]) as usize;
             for r in 0..qc {
                 let mr = m_core[r];
                 a_rhs[gcb + r] += mr * ri;
@@ -880,7 +828,7 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
                     core_blocks[cb + r * qc + c] += wmr * m_core[c];
                 }
                 for z in 0..ncz {
-                    coupling[coup + r * e + cross_col[cbase + z] as usize] +=
+                    coupling[coup + r * nc + coup_pos[cbase + z] as usize] +=
                         wmr * cross_val[cbase + z];
                 }
             }
@@ -896,31 +844,27 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
                     }
                 }
             }
-            // Twin scatter, mirroring the Fisher scatter above buffer-for-buffer,
-            // off the observed weight and the twin residual pass already formed
-            // (`d.obs_resid`, filled before this scatter, above).
+            // Twin scatter, mirroring the Fisher matrix scatter above
+            // buffer-for-buffer, off the observed weight.
             if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
                 let wo = crate::family::observed_weight(
                     family, nb_theta, y[i], prior_w[i], eta[i], prob[i], wi,
                 );
-                let ri_obs = d.obs_resid[i];
                 for r in 0..qc {
                     let mr = m_core[r];
-                    d.obs_rhs[gcb + r] += mr * ri_obs;
                     let wmr = wo * mr;
                     #[allow(clippy::needless_range_loop)]
                     for c in 0..=r {
                         d.obs_core_blocks[cb + r * qc + c] += wmr * m_core[c];
                     }
                     for z in 0..ncz {
-                        d.obs_coupling[coup + r * e + cross_col[cbase + z] as usize] +=
+                        d.obs_coupling[coup + r * nc + coup_pos[cbase + z] as usize] +=
                             wmr * cross_val[cbase + z];
                     }
                 }
                 for z in 0..ncz {
                     let b = cross_col[cbase + z] as usize;
                     let vb = cross_val[cbase + z];
-                    d.obs_rhs[k_family + b] += vb * ri_obs;
                     let wvb = wo * vb;
                     for z2 in 0..ncz {
                         let b2 = cross_col[cbase + z2] as usize;
@@ -1014,10 +958,12 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
 /// crossed width `e`. A per-row scatter (each row touches ONE primary cluster's
 /// core columns + one crossed level per crossed grouping — `M = ZΛ` sparsity, NOT
 /// row contiguity, so this is layout-independent) assembles the core blocks, the
-/// coupling `C_f`, the crossed `E`, and the RHS `g = M'(W·Mu + (y−p))`; then a
+/// coupling `C_f`, the crossed `E`, and the RHS `g = M'ρ − u` of the increment
+/// step (see `pirls_solve_blocked`); then a
 /// Schur complement on `e` solves it: factor each `A_f = chol(D_f+I)`, form
-/// `S = (E+I) − Σ_f C_f' A_f⁻¹ C_f`, back-substitute `u_e = S⁻¹(g_e − Σ_f C_f'
-/// A_f⁻¹ g_{core,f})` then `u_{core,f} = A_f⁻¹ g_{core,f} − A_f⁻¹ C_f u_e`, and
+/// `S = (E+I) − Σ_f C_f' A_f⁻¹ C_f`, back-substitute `δu_e = S⁻¹(g_e − Σ_f C_f'
+/// A_f⁻¹ g_{core,f})` then `δu_{core,f} = A_f⁻¹ g_{core,f} − A_f⁻¹ C_f δu_e`,
+/// `u += δu`, and
 /// `log|A| = Σ_f log|A_f| + log|S|` (Schur determinant identity). `e=0` (nested
 /// only) skips the Schur entirely. Collapses the dense `O(n·k²)` Gram + `O(k³)`
 /// factor to `O(n·q_core²)` scatter + `O(s·q_core³ + e³)` factor. NOT bit-identical
@@ -1106,6 +1052,8 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         eta_fixed,
         mu,
         a_rhs,
+        x_rows,
+        bt_rows,
         ..
     } = scratch;
     let StructuredScratch {
@@ -1120,6 +1068,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         n_cross,
         coup_cols,
         coup_ptr,
+        coup_pos,
         structured_schur,
         force_dense_schur,
         ..
@@ -1162,6 +1111,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         n_cross: &n_cross[..],
         coup_cols: &coup_cols[..],
         coup_ptr: &coup_ptr[..],
+        coup_pos: &coup_pos[..],
         structured_schur,
         force_dense,
         g,
@@ -1169,8 +1119,30 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         family,
         nb_theta,
     };
+    // Row-major `X` for the `f64` β-Profile row passes, as in
+    // `pirls_solve_blocked` (`PirlsScratch::x_rows`): same values, and every
+    // accumulator in the same row order as the `MatRef` path.
+    let rows_ok = T::IS_F64
+        && dual.is_none()
+        && p > 0
+        && matches!(beta_step, BetaStep::Profile { .. })
+        && x_rows.len() >= n * p
+        && bt_rows.len() >= k * p;
+    if rows_ok {
+        super::blocked::fill_x_rows(x, &mut x_rows[..n * p], n, p);
+    }
+    let xr_all: &[f64] = if rows_ok { &x_rows[..n * p] } else { &[] };
+    macro_rules! refresh {
+        () => {
+            if rows_ok {
+                super::blocked::refresh_eta_fixed_rows(xr_all, p, beta, eta_fixed, n, offset)
+            } else {
+                refresh_eta_fixed(x, beta, eta_fixed, n, p, offset)
+            }
+        };
+    }
     // η_fixed,ᵢ = Σ_j x·β, hoisted out of the iteration (β fixed within the solve).
-    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+    refresh!();
     // First-trial backtrack seeds (u_prev = 0, beta_prev = caller's β) — only
     // the domain-infeasibility trigger can read them; see `pirls_solve_packed`.
     u_prev[..k].fill(T::ZERO);
@@ -1337,7 +1309,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     for j in 0..p {
                         beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
                     }
-                    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+                    refresh!();
                 }
                 continue;
             }
@@ -1392,42 +1364,19 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
             n,
             dual.as_deref_mut(),
         );
-        // Profile mode: accumulate the β-gradient X'ρ (ρ = effective residual) into
-        // `beta_rhs` — the joint system's bottom-block RHS. A dedicated pass off the
-        // fresh prob/eta/w (NOT folded into the scatter loop above, which overwrote
-        // `mu` with the IRLS working vector), so the Fixed path stays byte-identical.
-        // Mirrors `pirls_solve_blocked`'s Profile X'ρ fold.
-        if let BetaStep::Profile { beta_rhs, .. } = &mut beta_step {
-            for v in beta_rhs[..p].iter_mut() {
-                *v = 0.0;
+        // The increment right-hand side M'ρ − u (see `pirls_solve_blocked`,
+        // change together), in the `a_rhs` packing; the observed twin solves
+        // the same one on its own factor.
+        for f in 0..s {
+            for local in 0..qc {
+                layout.a_rhs[f * qc + local] -= u[core_col(f, local)];
             }
-            match family {
-                Family::Binomial {
-                    link: BinomialLink::Logit,
-                } => {
-                    for i in 0..n {
-                        let rho = prior_w[i] * (y[i] - prob[i].value());
-                        for j in 0..p {
-                            beta_rhs[j] += x[(i, j)] * rho;
-                        }
-                    }
-                }
-                other => {
-                    for i in 0..n {
-                        let rho = crate::family::row_score(
-                            other,
-                            nb_theta,
-                            y[i],
-                            prior_w[i],
-                            eta[i].value(),
-                            prob[i].value(),
-                        );
-                        for j in 0..p {
-                            beta_rhs[j] += x[(i, j)] * rho;
-                        }
-                    }
-                }
-            }
+        }
+        for b in 0..e {
+            layout.a_rhs[k_family + b] -= u[k_family + b];
+        }
+        if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
+            d.obs_rhs[..k].copy_from_slice(&layout.a_rhs[..k]);
         }
         // Twin +I, same ridge on the observed factor's diagonals as the Fisher
         // `+I` the factor below applies.
@@ -1476,7 +1425,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                         for j in 0..p {
                             beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
                         }
-                        refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+                        refresh!();
                         continue;
                     }
                 }
@@ -1524,8 +1473,8 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 d.exact = false;
             }
         }
-        // `a_rhs[gcb..]` holds `u_{core,f}`; `a_rhs[k_family+b]` holds `u_e` — the
-        // same packing `d.obs_rhs` uses. Scatter to `u` (RE-column order) and
+        // `a_rhs[gcb..]` holds `δu_{core,f}`; `a_rhs[k_family+b]` holds `δu_e` —
+        // the same packing `d.obs_rhs` uses. Add to `u` (RE-column order) and
         // accumulate `‖u‖²`, off the observed solution when the twin factor was
         // PD (`have_obs`) and off the Fisher one otherwise — identical arithmetic
         // and evaluation order either way, only the source slice differs; `log|A|`
@@ -1542,13 +1491,13 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         for f in 0..s {
             let gcb = f * qc;
             for local in 0..qc {
-                let val = src[gcb + local];
+                let val = u[core_col(f, local)] + src[gcb + local];
                 u[core_col(f, local)] = val;
                 pen += val * val;
             }
         }
         for b in 0..e {
-            let val = src[k_family + b];
+            let val = u[k_family + b] + src[k_family + b];
             u[k_family + b] = val;
             pen += val * val;
         }
@@ -1635,12 +1584,13 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 let cpl = |idx: usize| -> f64 { coupling[idx].value() };
                 // The two per-cluster forms pass A's row loop reads in place of
                 // a walk over cluster `f`'s coupling columns: `H_f = C_f S⁻¹`
-                // into `tail_h` (`q_core × e`, written only on `cols_f`) and
-                // `G_f = C_f S⁻¹ C_f'` into `tail_g` (`q_core × q_core`, full).
-                // Index conventions are the kernel's own:
-                // `coupling[f·q_core·e + local·e + b] = C_f[local][b]`,
-                // `tail_inv[b·e + a] = (S⁻¹)_{a,b}`, and `tail_h` shares
-                // `coupling`'s offsets exactly. Both are per-ITERATION objects,
+                // into `tail_h` (`q_core × |cols_f|`, compact, see
+                // `ExactProfileBufs::tail_h`) and `G_f = C_f S⁻¹ C_f'` into
+                // `tail_g` (`q_core × q_core`, full). Index conventions are the
+                // kernel's own: `coupling` and `tail_h` share the compact layout,
+                // `coupling[q_core·coup_ptr[f] + local·|cols_f| + j] =
+                // C_f[local][cols_f[j]]` and likewise `H_f` in `tail_h`, and
+                // `tail_inv[b·e + a] = (S⁻¹)_{a,b}`. Both are per-ITERATION objects,
                 // not per-fit: `S` is a function of `W`, so `tail_inv` above is
                 // rebuilt every exact-mode iteration and these follow it.
                 for f in 0..s {
@@ -1648,25 +1598,24 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     if cols.is_empty() {
                         continue;
                     }
-                    let coup = f * qc * e;
+                    let (hb, nc) = (qc * coup_ptr[f] as usize, cols.len());
                     for l in 0..qc {
-                        for &b in cols {
+                        for (j, &b) in cols.iter().enumerate() {
                             let b = b as usize;
                             let mut acc = 0.0;
-                            for &a in cols {
+                            for (ja, &a) in cols.iter().enumerate() {
                                 let a = a as usize;
-                                acc += cpl(coup + l * e + a) * tail_inv[b * e + a];
+                                acc += cpl(hb + l * nc + ja) * tail_inv[b * e + a];
                             }
-                            tail_h[coup + l * e + b] = acc;
+                            tail_h[hb + l * nc + j] = acc;
                         }
                     }
                     let gb = f * qc * qc;
                     for l1 in 0..qc {
                         for l2 in 0..qc {
                             let mut acc = 0.0;
-                            for &b in cols {
-                                let b = b as usize;
-                                acc += tail_h[coup + l1 * e + b] * cpl(coup + l2 * e + b);
+                            for j in 0..nc {
+                                acc += tail_h[hb + l1 * nc + j] * cpl(hb + l2 * nc + j);
                             }
                             tail_g[gb + l1 * qc + l2] = acc;
                         }
@@ -1704,23 +1653,24 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     // z < n_cross[i], over EVERY row i of cluster f, from the
                     // same two arrays and the same θ-pin mask this loop reads.
                     // The invariant is load-bearing rather than cosmetic —
-                    // `S⁻¹` is dense, so H_f's entries outside `cols_f` are in
-                    // general nonzero and are simply never written, unlike the
-                    // Schur build's skipped columns, which are exactly zero.
+                    // `tail_h` stores H_f on `cols_f` only, and `S⁻¹` is dense,
+                    // so H_f's entries outside `cols_f` are in general nonzero,
+                    // unlike the Schur build's skipped columns, which are
+                    // exactly zero.
                     let h_core = block_leverage(fac, qc, &mc[..qc]);
                     let mut h = h_core;
                     let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
                     if !cols.is_empty() {
-                        let coup = f * qc * e;
                         yc[..qc].copy_from_slice(&mc[..qc]);
                         glmm_block_solve(fac, qc, &mut yc[..qc]);
                         let gb = f * qc * qc;
+                        let hb = qc * coup_ptr[f] as usize;
                         let (t_gg, t_ght, t_tst) = row_tail_terms(
                             &yc[..qc],
                             qc,
                             &tail_g[gb..gb + qc * qc],
-                            &tail_h[..],
-                            coup,
+                            &tail_h[hb..hb + qc * cols.len()],
+                            cols,
                             e,
                             &cross_col[cbase..cbase + ncz],
                             &cross_val[cbase..cbase + ncz],
@@ -1732,11 +1682,12 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                         h += acc;
                         #[cfg(test)]
                         {
-                            for &b in cols {
+                            let nc = cols.len();
+                            for (j, &b) in cols.iter().enumerate() {
                                 let b = b as usize;
                                 let mut acc = 0.0;
                                 for (local, &yl) in yc.iter().enumerate().take(qc) {
-                                    acc += cpl(coup + local * e + b) * yl;
+                                    acc += cpl(hb + local * nc + j) * yl;
                                 }
                                 tail_r[b] = acc;
                             }
@@ -1773,7 +1724,11 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     curv_h[i] = h;
                     let a = wp * h;
                     for j in 0..p {
-                        logdet_beta[j] += a * x[(i, j)];
+                        logdet_beta[j] += a * if rows_ok {
+                            xr_all[i * p + j]
+                        } else {
+                            x[(i, j)]
+                        };
                     }
                     for local in 0..qc {
                         logdet_u[f * qc + local] += a * mc[local];
@@ -1841,7 +1796,11 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     curv_sdot[i] = sdot;
                     let a = w[i].value() * sdot;
                     for j in 0..p {
-                        logdet_beta[j] -= a * x[(i, j)];
+                        logdet_beta[j] -= a * if rows_ok {
+                            xr_all[i * p + j]
+                        } else {
+                            x[(i, j)]
+                        };
                     }
                 }
                 gu_dot_du
@@ -1902,7 +1861,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     for j in 0..p {
                         beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
                     }
-                    refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+                    refresh!();
                     continue;
                 }
                 return (
@@ -1932,12 +1891,13 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         // calls, the design's stated per-eval cost rise), S_β = C − B'T,
         // δβ = S_β⁻¹·(X'ρ − B'δu₀), then u_joint = u_new − T·δβ (see
         // `se::packed_schur_fill`'s doc comment for the shared β-Schur Newton step
-        // this mirrors); exact mode as in `pirls_solve_blocked`. `a_rhs` is reused
+        // this mirrors), S_β and the right-hand side formed from the design
+        // residual rows (`residual_border`); exact mode as in
+        // `pirls_solve_blocked`. `a_rhs` is reused
         // as the per-column A⁻¹ in/out scratch — safe now, its u-solve was
         // scattered to `u` just above (the borrow note). ---
         if let BetaStep::Profile {
             exact,
-            xtwx,
             xtwm,
             ainv_mtwx,
             schur,
@@ -1954,44 +1914,54 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 structured_schur,
                 ..
             } = &mut layout;
-            // C = X'WX (p×p) via the W∘X GEMM scratch `wx` — structured_schur_fill's
-            // X'W̃X block, same product. GEMM fills the full p×p (the old scalar
-            // loop only filled+mirrored the lower triangle); every downstream read
-            // below is over the full matrix (`schur[(r,c)]` for `c in 0..p`), so
-            // this is exact.
-            for c in 0..p {
-                for i in 0..n {
-                    wx[(i, c)] = w[i].value() * x[(i, c)];
-                }
-            }
-            faer::linalg::matmul::matmul(
-                xtwx.as_mut(),
-                faer::Accum::Replace,
-                x.subrows(0, n).transpose(),
-                wx.as_ref().subrows(0, n),
-                1.0,
-                Par::Seq,
-            );
-            // B' = X'WM (p×k): zero, then scatter each row's core + crossed columns
-            // from the packed `m_core_buf`/`cross_*` nonzeros (structured_schur_fill:436-456).
-            for r in 0..p {
+            if rows_ok {
+                // `B'` (same terms, same row order as the scatter below), off
+                // the row-major `X` (`super::blocked::structured_border_rows`).
+                super::blocked::structured_border_rows(
+                    &w[..],
+                    &m_core_buf[..],
+                    &cross_val[..],
+                    &cross_col[..],
+                    &n_cross[..],
+                    cluster_ids,
+                    xr_all,
+                    q,
+                    np,
+                    s,
+                    e,
+                    p,
+                    n,
+                    &mut bt_rows[..k * p],
+                );
                 for c in 0..k {
-                    xtwm[(r, c)] = 0.0;
-                }
-            }
-            for i in 0..n {
-                let f = cluster_ids[i] as usize;
-                let wi = w[i].value();
-                let cbase = i * g_cap;
-                let ncz = n_cross[i] as usize;
-                for r in 0..p {
-                    let xw = x[(i, r)] * wi;
-                    for local in 0..qc {
-                        xtwm[(r, core_col(f, local))] += xw * m_core_buf[i * qc + local].value();
+                    let src = &bt_rows[c * p..c * p + p];
+                    for r in 0..p {
+                        xtwm[(r, c)] = src[r];
                     }
-                    for z in 0..ncz {
-                        let b = cross_col[cbase + z] as usize;
-                        xtwm[(r, k_family + b)] += xw * cross_val[cbase + z].value();
+                }
+            } else {
+                // B' = X'WM (p×k): zero, then scatter each row's core + crossed columns
+                // from the packed `m_core_buf`/`cross_*` nonzeros (structured_schur_fill:436-456).
+                for r in 0..p {
+                    for c in 0..k {
+                        xtwm[(r, c)] = 0.0;
+                    }
+                }
+                for i in 0..n {
+                    let f = cluster_ids[i] as usize;
+                    let wi = w[i].value();
+                    let cbase = i * g_cap;
+                    let ncz = n_cross[i] as usize;
+                    for r in 0..p {
+                        let xw = x[(i, r)] * wi;
+                        for local in 0..qc {
+                            xtwm[(r, core_col(f, local))] +=
+                                xw * m_core_buf[i * qc + local].value();
+                        }
+                        for z in 0..ncz {
+                            let b = cross_col[cbase + z] as usize;
+                            xtwm[(r, k_family + b)] += xw * cross_val[cbase + z].value();
+                        }
                     }
                 }
             }
@@ -2035,26 +2005,44 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     ainv_mtwx[(k_family + b, c)] = a_rhs[k_family + b].value();
                 }
             }
-            // S_β = C − B'·T (structured_schur_fill:487-497). Every RE column belongs
-            // to a core block or the crossed tail and is populated, so Σ_j over k is exact.
-            for r in 0..p {
-                for c in 0..p {
-                    let mut sm = xtwx[(r, c)];
-                    for j in 0..k {
-                        sm -= xtwm[(r, j)] * ainv_mtwx[(j, c)];
+            // Residual rows rᵢ = xᵢ − Tᵀmᵢ into `wx`, over the row's core and
+            // crossed nonzeros (T in the u RE-column|crossed layout), then S_β
+            // and the right-hand side off them.
+            for i in 0..n {
+                let f = cluster_ids[i] as usize;
+                let cbase = i * g_cap;
+                let ncz = n_cross[i] as usize;
+                for col in 0..p {
+                    let mut r = x[(i, col)];
+                    for local in 0..qc {
+                        r -= m_core_buf[i * qc + local].value()
+                            * ainv_mtwx[(core_col(f, local), col)];
                     }
-                    schur[(r, c)] = sm;
+                    for z in 0..ncz {
+                        r -= cross_val[cbase + z].value()
+                            * ainv_mtwx[(k_family + cross_col[cbase + z] as usize, col)];
+                    }
+                    wx[(i, col)] = r;
                 }
             }
-            // rhs = X'ρ − B'·δu₀ (beta_rhs holds X'ρ; δu₀ = u_new − u_prev, both in
-            // the u RE-column|crossed layout).
-            for r in 0..p {
-                let mut acc = 0.0;
-                for c in 0..k {
-                    acc += xtwm[(r, c)] * (u[c] - u_prev[c]).value();
-                }
-                beta_rhs[r] -= acc;
-            }
+            residual_border(
+                |i| w[i].value(),
+                |i| {
+                    profile_row_score(
+                        family,
+                        nb_theta,
+                        y[i],
+                        prior_w[i],
+                        eta[i].value(),
+                        prob[i].value(),
+                    )
+                },
+                wx.as_ref().subrows(0, n),
+                ainv_mtwx.as_ref().subrows(0, k),
+                |j| u_prev[j].value(),
+                schur,
+                &mut beta_rhs[..p],
+            );
             // Exact mode: log|A|'s gradient and curvature in β, as in
             // `pirls_solve_blocked` (change together).
             if let Some(ex) = exact.as_deref_mut() {
@@ -2118,7 +2106,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
             }
             // η_fixed depends on β; refresh for the next trial. `pen` must track the
             // moved u (‖u_joint‖²), so recompute it.
-            refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+            refresh!();
             pen = T::ZERO;
             #[allow(clippy::needless_range_loop)]
             for c in 0..k {
@@ -2137,7 +2125,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 for j in 0..p {
                     beta[j] = T::from_f64(beta_prev[j] + 0.5 * (beta[j].value() - beta_prev[j]));
                 }
-                refresh_eta_fixed(x, beta, eta_fixed, n, p, offset);
+                refresh!();
             }
             pen = T::ZERO;
             #[allow(clippy::needless_range_loop)]
@@ -2279,14 +2267,14 @@ mod tests {
                 Family::Gamma { .. } => (0..n)
                     .map(|i| {
                         let eta: f64 = 0.2 + 0.8 * x[(i, 1)];
-                        let noise = 0.4 + 1.6 * (((i * 2654435761) % 1000) as f64 / 1000.0);
+                        let noise = 0.4 + 1.6 * (((i as u64 * 2654435761) % 1000) as f64 / 1000.0);
                         eta.exp() * noise
                     })
                     .collect(),
                 Family::NegativeBinomial { .. } => (0..n)
                     .map(|i| {
                         let eta: f64 = 0.2 + 0.8 * x[(i, 1)];
-                        let noise = 0.4 + 1.6 * (((i * 2654435761) % 1000) as f64 / 1000.0);
+                        let noise = 0.4 + 1.6 * (((i as u64 * 2654435761) % 1000) as f64 / 1000.0);
                         (eta.exp().min(20.0) * noise).round().max(0.0)
                     })
                     .collect(),
@@ -2349,6 +2337,7 @@ mod tests {
                 n,
                 &mut ws.pattern.coup_cols,
                 &mut ws.pattern.coup_ptr,
+                &mut ws.pattern.coup_pos,
             );
             // `params`/`lam`/`m_core_buf`/`cross_val` stay fixed for every
             // call below — only `u` moves between calls, the same invariant
@@ -2362,7 +2351,6 @@ mod tests {
                 obs_coupling: vec![D4::ZERO; (qc * s * e).max(1)],
                 obs_schur_blk: vec![D4::ZERO; (e * e).max(1)],
                 obs_rhs: vec![D4::ZERO; k],
-                obs_resid: vec![D4::ZERO; n],
                 min_iters: 0,
                 exact: false,
             };
@@ -2386,6 +2374,8 @@ mod tests {
                     a_rhs: vec![D4::ZERO; k],
                     a_blocks: vec![D4::ZERO; 1], // unused on the extras path
                     agq_scratch: vec![D4::ZERO; 1], // unused on the extras path
+                    x_rows: Vec::new(),
+                    bt_rows: Vec::new(),
                 };
                 let mut structured = StructuredScratch {
                     core_blocks: vec![D4::ZERO; (qc * qc * s).max(1)],
@@ -2505,9 +2495,8 @@ mod tests {
         }
     }
 
-    /// The `f64` override IS the extras path's tail code — moved, not
-    /// copied — so there is no second copy left to `==` it against; the
-    /// bit-identity dump is the instrument for that identity. What this test can
+    /// The `f64` override IS the extras path's tail code, so there is no
+    /// second copy left to `==` it against. What this test can
     /// check is the other arm: the generic default body against the `f64`
     /// override on the same `S`. They are NOT expected to match to bits: the
     /// sparse arm factors under an AMD ordering and the dense default in the

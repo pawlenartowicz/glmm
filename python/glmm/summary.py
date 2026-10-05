@@ -16,16 +16,18 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-# Variance functions V(mu) per family, for Pearson residuals. Mirrors the
-# kernel's family table (src/family.rs); theta is the negative-binomial shape
-# the kernel reports as `dispersion`.
-_VARIANCE = {
+# sqrt(V(mu)) per family, for Pearson residuals, taken without forming V: mu^2
+# or mu^3 leaves the double range at extreme means where sqrt(V) does not.
+# Mirrors the kernel's family table (src/family.rs) and the R port's
+# `.pearson_sd` - change together. theta is the negative-binomial shape the
+# kernel reports as `dispersion`.
+_SQRT_VARIANCE = {
     "gaussian": lambda mu, theta: np.ones_like(mu),
-    "binomial": lambda mu, theta: mu * (1.0 - mu),
-    "poisson": lambda mu, theta: mu,
-    "gamma": lambda mu, theta: mu * mu,
-    "negativebinomial": lambda mu, theta: mu + mu * mu / theta,
-    "inversegaussian": lambda mu, theta: mu**3,
+    "binomial": lambda mu, theta: np.sqrt(mu * (1.0 - mu)),
+    "poisson": lambda mu, theta: np.sqrt(mu),
+    "gamma": lambda mu, theta: mu,
+    "negativebinomial": lambda mu, theta: np.sqrt(mu) * np.sqrt(1.0 + mu / theta),
+    "inversegaussian": lambda mu, theta: mu * np.sqrt(mu),
 }
 # Families whose `dispersion` is a free scale phi multiplying V(mu). For the
 # others phi == 1 (negbin's `dispersion` is theta, already inside V).
@@ -132,8 +134,8 @@ def pearson_residuals(fit):
     y = np.asarray(fit.y, dtype=float)
     w = np.ones_like(mu) if fit.weights is None else np.asarray(fit.weights, dtype=float)
     phi = fit.dispersion if fit.family in _PHI_FAMILIES else 1.0
-    v = _VARIANCE[fit.family](mu, fit.dispersion)
-    return (y - mu) * np.sqrt(w) / np.sqrt(phi * v)
+    sd = _SQRT_VARIANCE[fit.family](mu, fit.dispersion)
+    return (y - mu) / sd * np.sqrt(w / phi)
 
 
 def _tex_escape(s):

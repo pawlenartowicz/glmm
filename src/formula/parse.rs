@@ -682,11 +682,21 @@ fn parse_identifier_list(s: &str, seps: &[char]) -> Result<Vec<String>, ParseErr
     for sep in seps {
         parts = parts.into_iter().flat_map(|p| p.split(*sep)).collect();
     }
+    // An empty piece (`:`, `x:`, `x**z`) is refused as R refuses it; skipping
+    // it would turn `y ~ :` into an interaction of no variables.
     parts
         .into_iter()
         .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(parse_single_identifier)
+        .map(|p| {
+            if p.is_empty() {
+                Err(ParseError::Syntax {
+                    pos: 0,
+                    msg: format!("missing variable name in term '{s}'"),
+                })
+            } else {
+                parse_single_identifier(p)
+            }
+        })
         .collect()
 }
 

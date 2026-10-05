@@ -73,6 +73,12 @@ case "$ENGINE" in
   *) echo "unknown engine: $ENGINE" >&2; exit 2 ;;
 esac
 PIN=""; command -v taskset >/dev/null && PIN="taskset -c ${GRID_PIN_CORE:-1}"
+# Every engine fits on ONE thread: a threaded BLAS in R or Julia would otherwise
+# start one thread per machine core and run them all on the single pinned core.
+# Mirrors the thread exports in grid/run.sh -- change together.
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+       VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 JULIA_NUM_THREADS=1 \
+       RAYON_NUM_THREADS=1
 
 # per-launch startup grace: engine load writes nothing (Julia pkg load +
 # first-fit JIT can exceed the per-cell budget) — until this launch appends
@@ -91,7 +97,7 @@ GRACE="${GRID_STARTUP_GRACE:-$((TIMEOUT + 180))}"
 # clock state into run meta (recorded, never set — user's bench-l/bench-u)
 NO_TURBO=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo "?")
 printf '{"engine":"%s","tag":"%s","timeout_s":%s,"no_turbo":"%s","started":"%s"}\n' \
-  "$ENGINE" "$TAG" "$TIMEOUT" "$NO_TURBO" "$(date -Is)" \
+  "$ENGINE" "$TAG" "$TIMEOUT" "$NO_TURBO" "$(date -Iseconds)" \
   > "$(dirname "$OUT")/run_meta_${ENGINE}_${TAG}.json"
 [ "$NO_TURBO" = "1" ] || echo "WARNING: clock NOT locked (no_turbo=$NO_TURBO) — timings from this pass must be excluded from timing aggregates" >&2
 
@@ -136,7 +142,7 @@ while MISSING=$(next_missing); do
     if [ -n "${GRID_ONE_CELL:-}" ]; then EFF=$TIMEOUT
     elif (( $(wc -l < "$OUT") == LINES0 )); then EFF=$GRACE
     else EFF=$TIMEOUT; fi
-    NOW=$(date +%s); MT=$(stat -c %Y "$OUT")
+    NOW=$(date +%s); MT=$(stat -c %Y "$OUT" 2>/dev/null || stat -f %m "$OUT")   # GNU || BSD
     if (( NOW - MT > EFF )); then
       echo ">> timeout on $(next_missing || echo '?') — killing $ENGINE" >&2
       kill -9 "$ENGPID" 2>/dev/null || true
