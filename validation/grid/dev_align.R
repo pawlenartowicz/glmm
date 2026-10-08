@@ -252,6 +252,20 @@ lme4_objective <- function(rec, df, cell) {
   if (fisher_laplace(cell)) return(NA_real_)
   0
 }
+# lme4's nAGQ > 1 fits place and scale the quadrature nodes from the same
+# Fisher-weight curvature, so on a non-canonical link its AGQ value is a
+# different approximation of the integral than glmm's and GLMMadaptive's, which
+# both use the observed curvature. Found 2026-10-06 on a cloglog cell with
+# 3-row clusters (stress set): lme4's aligned deviance sat 7.4e-4 below glmm's
+# while glmm sat 1e-8 below GLMMadaptive's at the same point. On the committed
+# grid's non-canonical AGQ cells (prbb/prba/cllb/clla_int1_g3000p20_bal_base_agq7,
+# cbpp_probit_agq7, 20 rows per cluster) the lme4-GLMMadaptive gap is 1e-6 to
+# 5e-5. Those records return NA and are excluded, as lme4_objective excludes the
+# Laplace ones; the saturated term is unchanged on every other AGQ cell.
+lme4_agq <- function(rec, df, cell) {
+  if (fisher_laplace(cell)) return(NA_real_)
+  saturated_loglik(rec, df, cell)
+}
 mixedmodels_binomial <- function(rec, df, cell) {
   if (fisher_laplace(cell)) return(NA_real_)
   0
@@ -317,8 +331,8 @@ ALIGN <- list(
     # that date, because the measurement is on file. The manifest's oracle lists
     # keep lme4 off gamma and NB AGQ cells, where saturated_loglik has no closed
     # form.
-    agq = align(saturated_loglik, "confirmed", "2026-08-24",
-                "closed-form saturated logLik; verified against the frozen cbpp and grouseticks nAGQ goldens, and again 2026-09-22 on pois_int1_g3000p20_bal_base_agq7, where lme4's reported logLik plus the term lands 5.2e-08 from GLMMadaptive's. Prior weights confirmed 2026-10-03 on glmm_poisson_agq7: the weighted term lands lme4 2e-09 from glmm, the unweighted one 90.35 off")),
+    agq = align(lme4_agq, "confirmed", "2026-08-24",
+                "closed-form saturated logLik; verified against the frozen cbpp and grouseticks nAGQ goldens, and again 2026-09-22 on pois_int1_g3000p20_bal_base_agq7, where lme4's reported logLik plus the term lands 5.2e-08 from GLMMadaptive's. Prior weights confirmed 2026-10-03 on glmm_poisson_agq7: the weighted term lands lme4 2e-09 from glmm, the unweighted one 90.35 off. Mixed probit and cloglog AGQ cells return NA and are excluded since 2026-10-07 (see lme4_agq above)")),
   glmmTMB = list(
     # On prior-weight cells glmmTMB fits the dispersion offset
     # (engines/glmmtmb.R), which reports lme4's and stats::lm's logLik.
@@ -408,7 +422,7 @@ aligned_dev <- function(rec, cell) {
 }
 
 # TRUE when this record is one of the exclusions above: its entry is a closed
-# form that returns NA on this cell by design (lme4_objective,
+# form that returns NA on this cell by design (lme4_objective, lme4_agq,
 # mixedmodels_binomial, mixedmodels_gaussian, or
 # saturated_loglik on a family it has no closed form for). This is narrower than
 # is.na(aligned_dev(...)): a record with no finite loglik, or an engine with no

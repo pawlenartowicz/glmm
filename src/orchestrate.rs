@@ -15,7 +15,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::fit::theta_width;
 use crate::formula::{label_ranef, lower, Column, Table};
-use crate::{fit_warm, Boundary, Family, Note, StartValues, WaldSe};
+use crate::{fit_warm, Boundary, Family, Note, OuterStop, StartValues, WaldSe};
 use crate::{BinomialLink, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink};
 
 /// Maps the ports' `family`/`link` strings to [`Family`]. `family` and `link`
@@ -125,6 +125,20 @@ fn boundary_name(boundary: Boundary) -> &'static str {
     }
 }
 
+/// [`OuterStop`] as the string the ports publish, exhaustive like
+/// `boundary_name`.
+fn outer_stop_name(stop: OuterStop) -> &'static str {
+    match stop {
+        OuterStop::Fdelta => "fdelta",
+        OuterStop::Pgrad => "pgrad",
+        OuterStop::NoiseFloor => "noise_floor",
+        OuterStop::LineSearch => "line_search",
+        OuterStop::MaxIter => "max_iter",
+        OuterStop::GradUnavailable => "grad_unavailable",
+        OuterStop::NonFinite => "non_finite",
+    }
+}
+
 fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
     notes
         .into_iter()
@@ -193,6 +207,14 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 final_eval: false,
                 detail: String::new(),
             },
+            Note::GradientSearchFallback => NoteInfo {
+                kind: "gradient_search_fallback",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: 0,
+                final_eval: false,
+                detail: String::new(),
+            },
             Note::SeUnavailable => NoteInfo {
                 kind: "se_unavailable",
                 columns: Vec::new(),
@@ -248,6 +270,15 @@ pub struct FitResult {
     pub converged: bool,
     /// Optimizer evaluation count (`crate::Fit::n_eval`).
     pub n_eval: usize,
+    /// Gradient evaluations of the BFGS θ search (`crate::Diagnostics::n_grad`).
+    pub n_grad: usize,
+    /// Why the BFGS θ search stopped, `None` when none ran
+    /// (`crate::Diagnostics::outer_stop`); see `outer_stop_name` for the
+    /// vocabulary.
+    pub outer_stop: Option<&'static str>,
+    /// BFGS decrement at the search's endpoint
+    /// (`crate::Diagnostics::outer_decrement`).
+    pub outer_decrement: f64,
     /// Minimized optimizer criterion (`crate::Fit::deviance`) — carries that
     /// field's not-comparable-across-models caveat.
     pub deviance: f64,
@@ -329,7 +360,7 @@ pub fn run_fit(
     dispersion: Option<f64>,
     weights: Option<Vec<f64>>,
     offset: Option<Vec<f64>>,
-    warm_start: Option<(Vec<f64>, Vec<f64>)>,
+    warm_start: Option<(Vec<f64>, Vec<f64>, Option<f64>)>,
 ) -> Result<FitResult, String> {
     let fam = family_from_str(family, link)?;
     // `fit_warm`'s own checks of `dispersion` and the warm start name kernel
@@ -463,7 +494,14 @@ pub fn run_fit(
     let lowered_notes = std::mem::take(&mut lowered.notes);
 
     // Widths as `fit_warm` checks them: exact, or empty to cold-start that part.
-    if let Some((beta, theta)) = &warm_start {
+    if let Some((beta, theta, disp)) = &warm_start {
+        if let Some(d) = disp {
+            if !(d.is_finite() && *d > 0.0) {
+                return Err(format!(
+                    "warm-start dispersion must be a finite number > 0, got {d}"
+                ));
+            }
+        }
         if !beta.is_empty() && beta.len() != lowered.p {
             return Err(format!(
                 "warm-start beta has {} entries but the model has {} fixed-effect \
@@ -484,7 +522,11 @@ pub fn run_fit(
             ));
         }
     }
-    let start = warm_start.map(|(beta, theta)| StartValues { beta, theta });
+    let start = warm_start.map(|(beta, theta, dispersion)| StartValues {
+        beta,
+        theta,
+        dispersion,
+    });
 
     let fit = catch_unwind(AssertUnwindSafe(|| {
         fit_warm(
@@ -552,6 +594,9 @@ pub fn run_fit(
         dispersion: fit.dispersion,
         converged: diagnostics.converged,
         n_eval: fit.n_eval,
+        n_grad: diagnostics.n_grad,
+        outer_stop: diagnostics.outer_stop.map(outer_stop_name),
+        outer_decrement: diagnostics.outer_decrement,
         deviance: fit.deviance,
         singular: diagnostics.singular,
         names: lowered.col_names,
@@ -976,7 +1021,7 @@ mod tests {
             None,
             None,
             None,
-            Some((cold.beta.clone(), vec![5.0])),
+            Some((cold.beta.clone(), vec![5.0], None)),
         )
         .expect("warm-started mixed fit should converge");
         assert!(warm.converged);

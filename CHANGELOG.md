@@ -6,7 +6,7 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
-## [0.4.1] — Unreleased
+## [0.5.0] — Unreleased
 
 GLMMs on non-canonical links and Gamma GLMMs now reach the maximum of the
 Laplace likelihood itself, which is glmmTMB's objective and not lme4's. A
@@ -93,9 +93,9 @@ severe warning.
   collinear: the later one is dropped, so `y ~ x:z + xz` (with `xz = x * z`)
   now reports `x:z` as aliased, as lme4 does, where it used to report `xz`.
 
-  **Semver note (0.4.1).** The formula frontend is outside the
-  semver-covered surface (`fit_cold`/`fit_warm`, `ModelSpec`, `GroupIds`),
-  so this ships in a patch release, but callers see it:
+  **Semver note.** The formula frontend is outside the semver-covered
+  surface (`fit_cold`/`fit_warm`, `ModelSpec`, `GroupIds`), so semver alone
+  would allow this in a patch release, but callers see it:
   `Lowered::col_names`, the column order of `Lowered::x` (and so
   `target_indices` positions), and the coefficient order in the Python and R
   packages (`fit.beta`, `fit.names`, `fixef()`, `coef()`, `vcov()`, the
@@ -151,6 +151,16 @@ severe warning.
 - **The packed layout factors its PIRLS matrix sparsely** when it is large and
   sparse enough. The switch point is provisional until it is measured on a
   locked machine.
+- **A sparse-factored packed GLMM no longer holds a dense `k×k` matrix.** The
+  dense `A` and its Cholesky target are allocated only once the packed layout
+  settles on the dense factor, and the Rx Schur fill solves through the sparse
+  factor the converged PIRLS left instead of expanding `A` into a dense buffer
+  and factoring it again. On a binomial design with two crossed intercepts and
+  k = 2,000 (k = 5,000) random-effect columns the fit's peak RSS falls from
+  94 MB to 29 MB (485 MB to 84 MB) with Hessian standard errors and from
+  128 MB to 30 MB (690 MB to 85 MB) with Rx standard errors. The saving is
+  about 16k² bytes, not 8k²: `Mat::zeros` wrote the pages of the never-read
+  Cholesky target as well. Deviances are unchanged.
 - **A negative-binomial GLMM whose no-RE prefit failed seeds θ_NB at 1.**
 - **Python and R print Gamma's dispersion as `Dispersion (phi, Pearson)` on
   a GLM and `Dispersion (phi, ML)` on a GLMM,** and `Dispersion (phi, fixed)`
@@ -333,7 +343,13 @@ severe warning.
   loop-tier fit on the exact route from a cold start, 4 to 21% from a warm
   one, about the same number of outer evaluations (0.98 to 1.02 on the loop
   shapes, x86), results moved by round-off. Needs `bobyqa` 0.3.1
-  (`Bobyqa::minimize_with_radius`), now the floor.
+  (`Bobyqa::minimize_with_radius`).
+- **One-dimensional BOBYQA searches use Powell's original RESCUE test**
+  (`bobyqa` 0.3.2, `Config::prima_parity = false`), not PRIMA's, which at a
+  fully determined model is decided by rounding alone. On the accuracy grid this
+  moves only the cells with one variance parameter (65 of 794): about 15% fewer
+  evaluations, deviance equal to round-off, no flag flipped. `bobyqa` 0.3.2 is
+  now the floor.
 - **Separation is reported the same way everywhere.** A GLM whose deviance
   stops changing while its last step still moves some row's linear predictor by
   more than 0.01 now reports `converged = false`: the data are separated, or a
@@ -364,7 +380,263 @@ severe warning.
   `fastglmm_se_unavailable`). `GlmmFit::se_unavailable` and
   `FitDiagnostics::se_unavailable` (`loop_advanced`) carry it.
 
+- **AGQ fits are 2–3.6× faster on the log links and the logit.** Both AGQ
+  kernels now sum each row's change in deviance from its cluster's mode in
+  closed form, in SIMD tiles, instead of evaluating the unit deviance afresh
+  at every node; with a scalar intercept, Poisson-log and Gamma-log clusters
+  reduce to two sums per cluster. On the grid's `nAGQ = 7` cells a fit takes
+  0.28–0.48 of its former time on x86 and 0.48–0.55 under WASM, with the same
+  `n_eval`. The results move at round-off level. Probit has its own form (next
+  entry); cloglog keeps the generic node loop.
+- **AGQ probit fits with a scalar intercept take about three quarters of their
+  former time on x86.** The scalar AGQ kernel now takes each row's `ln Φ` from
+  one SIMD `erfc` and one SIMD `ln` and sums its change from the cluster's
+  mode, instead of running the inverse link, `erfc` and μ-form deviance per row
+  at every node. On the clock-locked machine below a fit takes 0.73–0.75 of its
+  former time on the grid's `prbb` and `prba` `nAGQ = 7` cells and at 30k to
+  300k rows (7.94 s to 5.85 s at 300k), and 0.82 on `cbpp_probit_agq7`; on an
+  Apple M4, 0.87–0.96 (1.04 on cbpp's 56 rows, a 1.7 ms fit). `n_eval` is
+  unchanged; the deviance moves by at most 3.6e-12 on the grid cells and 1e-9
+  at 300k rows, with no `converged` or `singular` change, native and WASM.
+  Vector random effects keep the generic node loop.
+- **Probit GLMM fits take 0.64–0.86 of their former time on the blocked
+  layout, and the binomial deviance takes a SIMD `ln`.** On a probit fit the
+  PIRLS loops of every layout now take `φ(η) = dμ/dη` for the row score, the
+  observed weight and the exact profile's `dW_obs/dη` from the SIMD `exp`, 64
+  rows at a time, instead of one libm `exp` per row and per function. The
+  family pass's binomial deviance takes its two logs through the SIMD `ln` a
+  chunk of rows at a time, for probit, cloglog and weighted logit. On the
+  clock-locked machine below a probit Laplace fit takes 0.64–0.79 of its former
+  time on the grid's blocked cells (`int1`, `q2s`, `q3s`, `q4`; 0.86 on `q8`),
+  0.82–0.84 on two-level nested ones, 0.93–0.98 on the deeper nested and crossed
+  ones, and 0.69–0.74 at 30k to 300k rows; the probit GLM 0.81, AGQ probit 0.80–0.91.
+  Cloglog fits take 0.93–0.96 (1.005 on `cllb_cross4`). On an Apple M4 probit
+  fits take 0.82–0.97 (1.06 on cbpp's 56 rows, three more evaluations on a
+  0.3 ms fit) and cloglog fits 0.96–1.12. The results move at round-off level:
+  over the grid's 96 probit and cloglog cells the deviance moves by at most
+  2.6e-7 (in both directions; 18 cells take more evaluations, 25 fewer), with
+  no `converged` or `singular` change, serial and parallel identical. Logit
+  without weights, the dual derivative kernels and the SE path keep their
+  arithmetic.
+- **A Gamma GLMM whose dispersion seed is already close searches `ln φ` on a
+  matched scale.** Two probe solves at the start measure the curvature of
+  `ln φ`; when its conditional optimum lies within one cold start radius of
+  the seed, the search runs on `ln φ` divided by a fixed power of two, so the
+  coordinate is about as stiff as θ. On the grid this holds on every
+  Gamma-inverse cell and on no Gamma-log cell: on
+  `gami_cross4_g3000p20_bal_base` the search takes 97 evaluations, was 365,
+  and the fit 0.23 of its former time. Every other Gamma GLMM pays the two
+  probes (a later call at a probed point reuses its solve) and searches
+  unscaled. The search path changes, so the last digits of the estimates can
+  move. The test is the cold fit's on a warm start too: the seed's distance is
+  measured against the cold radius, and a carried dispersion (below) is judged
+  by where the cold seed lies, not by its own distance. Measured against the
+  warm radius, a warm start from the optimum perturbed by 5% took 1578
+  evaluations on `gami_q4_g3000p20_bal_base` (cold 364); it takes 368. Over
+  the grid's 35 Gamma cells warm starts without a dispersion take 1.04 of the
+  cold fit's evaluations on Gamma-inverse (geometric mean, 18 starts; 1.62
+  with the warm radius) and 0.98 on Gamma-log (87 starts; 0.97 with the warm
+  radius). Cold fits are unchanged.
+- **Crossed GLMMs on the structured layout are 21–24 % faster per
+  evaluation**, with bit-identical results: the crossed tail's Schur downdate
+  walks contiguous rows, and its `tail_h`/`tail_g` build reads `S⁻¹` by column
+  when `S⁻¹` is exactly symmetric.
+- **The exact-profile β border is about 1.6× faster per evaluation on wide
+  random-effect blocks.** On the blocked layout the residual rows are built a
+  tile at a time and summed into the border while in cache, and the block
+  solve takes all fixed-effect columns at once. On the grid's `q8` cells
+  (eight random effects per group) an evaluation takes 0.61 of its former
+  time. The sums associate differently, so the results move at round-off
+  level and `n_eval` follows a different search path, in either direction:
+  over 73 wide cells the evaluation-count ratio is 1.008 (95 % CI
+  0.992–1.024).
+
+  Timings above are on a clock-locked Intel Core Ultra 7 265H; an Apple M4
+  gives ratios within about 0.1 of them, and WASM fits stay bit-identical
+  across hosts. Over the 794 cells of the accuracy grid the four changes
+  together move the deviance by at most 4.6e-7 (worse by more than 1e-9 on 60
+  cells, better on 77; 362 identical or at round-off), change no `converged`
+  or `singular` flag, and take 11 % fewer evaluations in total.
+
+- **An LMM with random slopes on its only grouping evaluates the REML
+  criterion per group in closed form,** 2.5 to 2.7× faster per evaluation on
+  the grid's 36-parameter cells. Two Woodbury steps (Henderson & Searle 1981)
+  split each group's contribution into a part fixed for the whole fit and a
+  small `q×q` solve per evaluation, read from the existing sufficient
+  statistics. The route applies to any random-slopes block on the only
+  grouping, weighted or not, when every level's random-effect Gram is well
+  conditioned; otherwise the fit runs the former loop with identical results.
+  A fit on `lmm_q8_g3000p20_bal_base` takes 0.48 of its former time and on
+  `sim_max_q_slope` 0.63. Every grid cell that takes the route is faster
+  except Machines, which takes 15 % more evaluations and 10 % more time. The
+  route is also more accurate at large variance parameters: against an
+  80-bit reference at `THETA_HI` its deviance is off by 3e-11, the former
+  loop's by 1e-7. On the cells that take it the deviance moves by at most
+  7.3e-9 (8e-13 relative), with no `converged`, `singular` or `pinned` flag
+  change. Same clock-locked machine as above.
+
+- **LMMs on that route search their variance parameters with a gradient
+  method (BFGS): a fit takes about a quarter of its former time, and 0.03 to
+  0.06 of it on 36-parameter designs.** The route's criterion has an
+  analytic gradient, read off the state of the evaluation it follows (no
+  second solve), so `fit_lmm` searches θ there with a projected BFGS
+  instead of BOBYQA; every other LMM keeps BOBYQA. An endpoint is accepted
+  when its predicted remaining decrease is below 1e-8 and no variance sits
+  near zero; otherwise BOBYQA polishes it, and a search that fails (a failed
+  line search, an unavailable gradient, the iteration cap) hands its best
+  point to BOBYQA and raises `Note::GradientSearchFallback`. Measured on the
+  grid's 23 route cells, whole `fit_on` calls (cold and warm from the truth,
+  5% and 20% away), on one clock-locked core: cold fits take 0.23 of their
+  former time (geometric mean; summed 0.11), warm fits 0.31 to 0.33; the
+  36-parameter cells 0.03 to 0.06. The slowest case is
+  `lmm_q2s_g3000p20_bal_boundary` from a warm start, 1.03 to 1.16×, where a
+  variance at its boundary sends the endpoint to the BOBYQA polish. The
+  deviance is worse by at most 9.6e-10 and better by up to 7.6e-9, BOBYQA
+  started from every BFGS endpoint gains at most 9.1e-10, and no
+  `converged`, `singular` or `pinned` flag changes; on the stress set's 20
+  LMM cells every fit is equal to or below the best oracle. `n_eval` counts
+  value evaluations only (a gradient reuses its evaluation), so it falls
+  with the time.
+
+- **Binomial and Poisson GLMMs search with BFGS: about half the time of a
+  whole fit.** A Laplace fit (`nAGQ = 1`) of a binomial (any link) or Poisson
+  GLMM with at least two variance parameters on the blocked or structured
+  layout now searches `[θ | β]` with projected BFGS on the analytic gradient,
+  instead of BOBYQA on the exact β profile. The gradient at each accepted
+  point is assembled from that point's own mode solve, so a gradient costs
+  about one more value evaluation, not a second mode solve. A search that
+  does not certify its endpoint is polished by BOBYQA, and one that fails
+  hands over to the BOBYQA route (`Note::GradientSearchFallback`). NB, Gamma,
+  AGQ, the packed layout, one-θ fits, and warm starts far out (a θ above 10,
+  or no random slope at 50 rows per level or more) keep BOBYQA.
+  - On the grid's fast subset, routed fits take 0.48 of their former time
+    (geometric mean, whole fits with Hessian SEs, clock-locked x86), and none
+    is slower. The crossed binomial `binb_cross4_g3000p20` goes from 286 to
+    116 ms.
+  - Over 263 routed grid cells the deviance moves by at most 5.0e-7 and is
+    nowhere worse by more than 1e-6, with no `converged` or `singular` flag
+    change. Evaluations fall to 0.33 (median).
+  - A 3M-row binomial fit with four random effects per group takes 57 s
+    instead of 216 s, at the same peak memory.
+  - The search path changes, so results on routed fits move at the
+    optimizer's tolerance. Two R acceptance pins were re-recorded at higher
+    log-likelihood.
+
+- **Hessian standard errors on large GLMMs take a fraction of the memory
+  and less time.** The dual-number scratch of the exact Hessian no longer
+  holds buffers its shape never reads: the structured layout's row buffers
+  exist only on that layout, the crossed values of `M` are kept once per
+  grouping instead of once per row, the observed-information factors only on
+  a non-canonical link, the crossed layout's coupling buffers hold the
+  design's own coupling pattern instead of a bound six times the row count,
+  and the assembled pass forms its per-row values in one walk over the rows
+  instead of storing them for three. On a single grouping above 4,096 rows
+  the assembled Hessian then runs one block of whole clusters at a time, so
+  its scratch stays the same size whatever the number of rows; on crossed
+  designs above 4,096 rows it forms its per-row values one block of rows at a
+  time and keeps only the per-cluster and per-pair sums whole. It also picks
+  its lane width from a measured table: two passes of 8 lanes at 13 to 16
+  parameters and three of 6 at 17 or 18, instead of two of 12, and two of 5
+  at 9 or 10 instead of one of 12 (54% less scratch there; faster on x86, up
+  to 12% slower on an Apple M4). On a binomial fit with four random effects
+  per group (14 parameters) the fit with Hessian SEs peaks at 1.33 GB of
+  allocations at 3M rows (formerly 10.7 GB; the same fit with `WaldSe::Rx`
+  peaks at 1.31 GB) and 210 MB at 300k (formerly 1.14 GB); its SE step takes
+  15 s instead of 47 s and 1.5 s instead of 3.3 s. A crossed binomial with
+  four groupings at 3M rows peaks at 2.1 GB (formerly 6.4 GB; 1.25 GB with
+  `WaldSe::Rx`) and 280 MB at 300k (formerly 714 MB). On an Apple M4
+  with 16 GB the 3M-row single-grouping fit peaks at 1.25 GB and no longer
+  swaps. Estimates are bit-identical, native and WASM, over the stress cells
+  and the grid's fast subset; the Hessian standard errors of a single-grouping
+  fit above 4,096 rows move at round-off (at most 3e-13 relative), because
+  each block sums its own share, and every other standard error is
+  bit-identical. Timings on the clock-locked machine above.
+- **A Gamma GLMM's Hessian standard errors take one assembled gradient for the
+  dispersion row instead of a central difference over every coordinate.**
+  The `ln φ` row of the joint Hessian is built from the exact gradient the
+  assembled pass already forms, where it used to take 2m + 1 further PIRLS
+  solves; the central difference stays as the fallback. On a Gamma fit with a
+  scalar intercept the whole fit with Hessian SEs takes 3.78 s instead of
+  4.08 s at 300k rows and 12.7 s instead of 13.9 s at 1M. Estimates,
+  deviance and `n_eval` are unchanged; the standard errors of the grid's
+  Gamma cells move by at most 2.8e-9 relative.
+- **Finite-difference Hessians under `parallel_inner` keep one worker
+  workspace per thread**, instead of one per rayon split. With 12 SE
+  parameters a fit builds 6 workers instead of 67 and its SE step takes 8% to
+  11% less time; on a packed shape with `k = 2,000` the peak falls from 549 MB
+  to 471 MB. Results are bit-identical.
+
+- **AGQ standard errors on a scalar random intercept are faster and use a
+  fraction of the memory.** On binomial logit and probit and Poisson-log AGQ
+  fits with one scalar random intercept, the joint Hessian is now built from
+  central differences of an exact gradient of the AGQ deviance, instead of a
+  hyper-dual pass that carried second-derivative lanes on every row. A fit
+  with Hessian SEs takes 0.83 to 0.95 of its former time at 1,200 to 300,000
+  rows (`nAGQ = 7`), and at 300,000 rows it peaks at 63 to 84 MB instead of
+  296 to 464 MB. With more than 12 parameters, where the hyper-dual pass could
+  not run and a finite-difference stencil of the deviance took its place, a
+  fit takes 0.25 to 0.36 of its former time and the SEs move by about 3e-6
+  relative, the stencil's own error. Everywhere else the SEs agree with the
+  former ones to about 1e-11 relative. Other AGQ shapes (cloglog, negative
+  binomial, Gamma, vector random effects) keep the hyper-dual pass. Timings on
+  the clock-locked machine above.
+
 ### Added
+
+- **Warm starts carry the dispersion: `StartValues::dispersion`.** A
+  negative-binomial shape θ or a Gamma φ, in the units `Fit::dispersion`
+  reports, starts the search's dispersion coordinate on a GLMM and the shape
+  search on a negative-binomial GLM, so a previous fit's value carries over
+  as is. A carried NB shape also skips the no-random-effect GLM-NB prefit
+  that only produced a seed. Over the grid's Gamma and NB cells, warm fits
+  from the truth or from the cold optimum perturbed by 5% and 20%, with the
+  dispersion carried, take 0.73 of the cold fit's evaluations on Gamma-log
+  (geometric mean over 87 starts; 0.98 from β and θ alone), 0.76 on negative
+  binomial (90 starts; 0.88) and 0.98 on Gamma-inverse (18 starts; 1.04), with
+  no `converged` or `singular` flag change and deviances within 2.2e-7 of the
+  cold fit's. Python takes it as `warm_start["dispersion"]` and R as
+  `start = list(dispersion = …)`; `init_theta=` / `init.theta=`, which raised
+  for want of a kernel hook, now seed the negative-binomial shape through the
+  same slot (give one of the two).
+
+  **Semver note.** `StartValues` is a struct with public fields, so code that
+  builds it with a struct literal must add `dispersion: None`, or end the
+  literal with `..StartValues::default()` (the struct now derives `Default`).
+- **`Note::GradientSearchFallback`** (Rust, additive; `Note` is
+  `#[non_exhaustive]`), the caution `gradient_search_fallback` in both ports
+  (Python `GradientSearchFallbackWarning`, R class
+  `fastglmm_gradient_search_fallback`), and
+  `FitDiagnostics::gradient_search_fallback` on the loop tier: an LMM's or
+  GLMM's gradient search did not converge and BOBYQA finished from its best
+  point.
+  **Semver note:** `FitDiagnostics` is a plain struct of the unstable loop
+  tier (`loop_advanced`); code that builds one with a struct literal adds the
+  new field.
+- **`Diagnostics::n_grad`, `outer_stop` and `outer_decrement`** (Rust,
+  additive; `Diagnostics` is `#[non_exhaustive]`), with the new enum
+  `OuterStop`: on LMM and GLMM fits that search with BFGS, the search's
+  gradient count, why it stopped, and its estimate of the deviance decrease
+  left at the endpoint. Python `Fit.n_grad` / `outer_stop` /
+  `outer_decrement` and R `$n_grad` / `$outer_stop` / `$outer_decrement`
+  carry them, and so does `FitDiagnostics` on the loop tier.
+- **Curvature hints for simulation loops** (`loop_advanced`, no semver
+  guarantee): `curvature_hint(&mut ws)` takes a `CurvatureHint` after a pilot
+  fit (the inverse of a finite-difference Hessian of the gradient at its θ̂),
+  and `fit_on_hinted` passes it with each later draw so the gradient search
+  starts from that curvature instead of the identity. The fit only reads the
+  hint: results are a function of the data, the start and the hint, the same
+  in any call order. A hint of another θ dimension panics; on a draw that
+  searches with BOBYQA it is ignored. On 20-draw loops from the truth warm
+  start (10 route cells, whole `fit_on` calls), the gradient search takes
+  0.33 of BOBYQA's time without a hint and 0.25 with it (0.75 of the
+  unhinted time), and no draw is more than 1.25× slower with the hint.
+  `fit_on` is `fit_on_hinted` with no hint. On a routed GLMM workspace,
+  `curvature_hint` after a pilot fit returns the pilot search's own final
+  inverse-Hessian estimate, at no cost, and a hint's dimension is `n_θ + p`;
+  a hint of another dimension panics, as on an LMM workspace.
+  **Semver note:** all of it is on
+  the unstable loop tier (`loop_advanced`, outside the semver-covered
+  surface); `fit_on`, `fit_cold` and `fit_warm` keep their signatures.
 
 - **GLMM fits raise `Note::IllConditioned`** (kind `ill_conditioned`, the
   "Nearly collinear columns" caution in both ports), as OLS, GLM and LMM fits
@@ -448,6 +720,12 @@ Breaking. MCPower calls none of these, and the crate and the ports no longer do.
 
 ### Added — `loop_advanced` (no semver guarantee)
 
+- **`FitView::dispersion_start()`**: the estimated dispersion to carry into
+  the next draw's `StartValues::dispersion`, θ̂_NB on the negative-binomial
+  routes and φ̂ on a Gamma GLMM (where `FitView::dispersion` is the
+  random-intercept variance `D̂[0][0]`), `None` where no dispersion is
+  estimated.
+
 - **`FitWorkspace::set_prestandardized(bool)`**, default `false`: `true`
   skips the per-draw standardization and fits the design as given, with every
   map the identity except the random-slope columns, which are scaled by their
@@ -467,6 +745,33 @@ Breaking. MCPower calls none of these, and the crate and the ports no longer do.
 
 ### Fixed
 
+- **R: `REML =` is checked against the model.** `REML = TRUE` on a model with
+  no REML objective (OLS, a GLM, a GLMM) was silently accepted; it is now an
+  error saying the model is fitted by maximum likelihood. `REML = FALSE` on
+  those models was refused as "REML-only by design"; it now fits the default
+  model. On a Gaussian mixed model nothing changes, unless every grouping has
+  a single level and is dropped: the model is then fitted by maximum likelihood
+  and `REML = TRUE` errors. A `REML` that is not one `TRUE` or `FALSE` is an
+  error.
+
+- **A GLMM whose pinned variance starved the search no longer reports a
+  converged fit above its nested model's optimum.** A variance whose optimum
+  is 0 puts a trough `log(1 + θ²·Σw)` in its parameter, and under very
+  precise data the search's trust radius shrinks to its end inside it with
+  the other variance parameters still off. The trough polish that re-searches
+  them from the pinned point ran only when the pin itself lowered the
+  objective, which an endpoint at the trough's bottom does not do, and where
+  the endpoint lands inside the trough is round-off: one crossed Poisson fit
+  at counts near e¹⁴ ended 2.6 deviance units above its `(1 | g)` submodel on
+  aarch64 and at the optimum on x86. Every kept pin now also probes its free
+  variance parameters at the pinned point (two evaluations each) and runs the
+  polish when the probe predicts a gain, and a polish that finds nothing
+  lower re-evaluates the pinned point so the reported modes are its own.
+  On the grid's fast subset every deviance is unchanged bit for bit (116
+  cells, no `converged` or `singular` change) and its 12 pinned GLMM cells
+  take the probe's two evaluations per free variance parameter (4 to 6 on
+  most; 70 on the 36-parameter `binb_q8_g3000p20_bal_base`, 226 to 296);
+  none of them runs the polish.
 - **GLMs at very large counts now converge.** Above means of about 1e5,
   rounding error in the deviance kept the stopping rule from firing, so Poisson
   and negative-binomial fits reported not converged at the right answer. The fit

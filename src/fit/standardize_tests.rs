@@ -543,6 +543,12 @@ fn warm_theta_carry_across_draws_matches_cold() {
     {
         let (sized, ids, perm) = spec_sized_from_ids_pub(&c.model, &c.ids);
         let mut ws = build_workspace(&sized, perm, c.n, c.p, &c.opts);
+        // The evaluation-count check below is a property of the BOBYQA route,
+        // whose search length follows its start. The gradient search
+        // restarts its curvature from the identity on every fit, so a start
+        // at θ̂ with the GLM β₀ is not reliably shorter there (16 against 10
+        // on this fixture, 2026-10-07).
+        super::core::force_bobyqa_route(&mut ws);
         let x1 = with_column(&c, 1.0, 1000.0);
         let theta = fit_on(&mut ws, &c.x, &c.y, &ids, None, &c.opts)
             .theta()
@@ -550,10 +556,17 @@ fn warm_theta_carry_across_draws_matches_cold() {
         let start = StartValues {
             beta: vec![],
             theta,
+            dispersion: None,
         };
         let warm = fit_on(&mut ws, &x1, &c.y, &ids, Some(&start), &c.opts)
             .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts);
-        let cold = fit(&c, &x1);
+        // The cold reference on the same route as the warm fits above.
+        let cold = {
+            let mut wc = build_workspace(&sized, perm, c.n, c.p, &c.opts);
+            super::core::force_bobyqa_route(&mut wc);
+            fit_on(&mut wc, &x1, &c.y, &ids, None, &c.opts)
+                .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts)
+        };
         assert!(
             close(warm.deviance, cold.deviance, 1e-7),
             "{}: warm {} vs cold {}",
@@ -576,6 +589,7 @@ fn warm_theta_carry_across_draws_matches_cold() {
             Some(&StartValues {
                 beta: vec![],
                 theta: theta1,
+                dispersion: None,
             }),
             &c.opts,
         )
@@ -603,10 +617,12 @@ fn warm_theta_carry_across_draws_matches_cold() {
         let short = StartValues {
             beta: vec![],
             theta: vec![0.5],
+            dispersion: None,
         };
         let s = fit_on(&mut ws, &x1, &c.y, &ids, Some(&short), &c.opts)
             .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts);
         let mut fresh = build_workspace(&sized, perm, c.n, c.p, &c.opts);
+        super::core::force_bobyqa_route(&mut fresh);
         let f0 = fit_on(&mut fresh, &x1, &c.y, &ids, None, &c.opts)
             .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts);
         let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -626,6 +642,7 @@ fn warm_theta_carry_across_draws_matches_cold() {
         let short = StartValues {
             beta: vec![0.1],
             theta: vec![0.5],
+            dispersion: None,
         };
         let s = fit_on(&mut ws, &x1, &c.y, &ids, Some(&short), &c.opts)
             .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts);

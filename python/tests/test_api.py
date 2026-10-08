@@ -16,6 +16,7 @@ def test_module_surface():
         "Fit",
         "FitFailedWarning",
         "GlmDivergedWarning",
+        "GradientSearchFallbackWarning",
         "HessianSeFallbackWarning",
         "IllConditionedWarning",
         "NbShapeUnsettledWarning",

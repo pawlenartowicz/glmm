@@ -142,9 +142,12 @@ structure:
   is taken when `k ≥ PACKED_SPARSE_MIN_K` (256) and the symbolic fill
   `nnz(L)/(k(k+1)/2) ≤ PACKED_SPARSE_MAX_FILL` (0.5); both thresholds are
   provisional until a locked native and WASM timing sets them. The per-row
-  scatter writes straight into whichever storage is in use, and a converged
-  solve expands the final `A` into the dense buffer once, for the Rx Schur
-  fill. Measured on the grid's wide cells (`k` = 810–1835, `A` 0.3–17 % full),
+  scatter writes straight into whichever storage is in use, and the Rx Schur
+  fill solves through that same storage: the dense `a`, re-factored, or the
+  sparse factor the converged solve left in `l_values`. The dense `k×k` pair
+  `a`/`a_chol` is sized only when the dense factor is chosen
+  (`PackedScratch::set_factor`, called from `fill_packed_cols`), so a
+  sparse-factored fit never holds a dense `k×k`. Measured on the grid's wide cells (`k` = 810–1835, `A` 0.3–17 % full),
   the dense factor was 70–91 % of the wall; the sparse one makes an evaluation
   10–30× cheaper. A real numerical change against the dense factor (another
   elimination order), agreeing to round-off
@@ -173,6 +176,24 @@ observed weight of its η form, positive too. The mode is the same either way;
 only the path to it changes. The dual derivative kernels keep the Fisher
 weight in their own `A` and take the same Newton step through their observed
 twin (`DualStep::observed`, see [Standard errors](#standard-errors)).
+
+**Probit rows and the binomial deviance fold.** On a probit fit the `f64`
+loops of every layout read `φ(η) = dμ/dη` for the row score, `W_obs` and pass
+A's `dW_obs/dη` from `family::ProbitRows`, which fills it 64 rows at a time
+through the SIMD `exp` (`simd_transcendental::exp_fill`) instead of one libm
+`exp` per row and per function. Each row function keeps its generic form term
+for term, a tail row calls the generic function, and the rows keep their order,
+so only the `exp`'s last bits move: within 2e-15 relative on the score, 5e-14
+on `W_obs` and 1.5e-12 on `dW_obs/dη` (scaled by `max(1, |value|)`),
+`probit_rows_match_the_generic_row_functions`. The family pass's binomial
+deviance (probit, cloglog and weighted logit; unweighted logit has its own
+fused kernel) is `family::dev_resid`'s form with its two `ln_1p`s taken through
+the SIMD `ln` a chunk of rows at a time (`simd_transcendental::binomial_dev_fold`),
+as the NB fold already was; a tail row keeps `dev_resid_at`'s η form. A probit
+deviance read off `ln Φ(±η)` instead would need a second `erfc` per row, which
+the μ the family pass has already formed spares, and would leave the μ form
+that `dev_resid_at` defines off the tail. The dual kernels and the SE path keep
+the generic functions.
 
 The tolerance is link-dependent. Canonical links — exactly the two
 `family::is_canonical` cases, logit and Poisson-log — use
@@ -281,7 +302,9 @@ never mixed within a fit:
   mode ũ(β). The PQL border solves `S_β·δβ = X'ρ − B'δu₀`, with `S_β` and the
   right-hand side formed from the design residual rows `rᵢ = xᵢ − Tᵀmᵢ`
   (`T = A⁻¹MᵀWX`) as `Σᵢ wᵢrᵢrᵢᵀ + TᵀT` and `Σᵢ ρᵢrᵢ + Tᵀu`
-  (`pirls::residual_border`): the forms `XᵀWX − BᵀT` and `Xᵀρ − Bᵀδu₀` are
+  (`pirls::residual_border`; on the blocked layout the residual rows are built
+  a tile at a time and summed into both while in cache): the forms
+  `XᵀWX − BᵀT` and `Xᵀρ − Bᵀδu₀` are
   differences of terms of order `Σwᵢ` and lose all their digits when a column
   of X lies in the span of M at huge counts; the exact one takes
   log|A|'s gradient `½c_β` off the right-hand side and adds its curvature
@@ -518,6 +541,92 @@ structured ones with a crossed tail,
 `far_warm_starts_reach_cold_optimum_with_the_border_trust_region` the far
 starts that fail without the trust region.
 
+### Gradient search (BFGS) on binomial and Poisson Laplace fits
+
+**Code:** `gradient_route_plan`, `GradSearch` and the gradient-route block of
+`fit_glmm` (`src/glmm/mod.rs`); `assembled::gradient_at_mode`
+(`src/glmm/assembled.rs`); the driver `optim::bfgs::bfgs_minimize`
+(`src/optim/bfgs.rs`), shared with the LMM's per-group route
+([`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs)).
+
+**When.** A Laplace fit (`nAGQ = 1`) of a binomial (any link) or Poisson GLMM
+with at least two θ on the blocked or the structured layout searches with
+projected BFGS instead of the `ExactProfile` BOBYQA search. A warm fit (a
+caller's θ start the start guard keeps or compares) does too, except one with
+no random-slope block whose primary grouping averages 50 rows per level or
+more (`GRAD_WARM_SCALAR_ROWS_MAX`), which stays on BOBYQA. NB, Gamma, AGQ,
+the packed layout and one-θ fits keep their BOBYQA routes. The rule reads the
+shape and the start kind only.
+
+**The objective** is the fixed-β Laplace deviance over `γ̃ = [θ | β̃]`, θ on
+the symmetric box `±THETA_HI`, β whitened as the joint BOBYQA search's
+(`BetaScale`, `β̃ = Lᵀβ`). Every evaluation runs PIRLS at `pirls_tol` from the
+incumbent's mode. A value whose PIRLS solve runs its iteration cap is a
+failed trial, so an accepted point always rests on a converged mode.
+
+**One mode solve per point.** The gradient at an accepted point is assembled
+off the state that point's value evaluation left (`gradient_at_mode`): the
+mode, the weights, the per-cluster factors and, on a structured shape, the
+cached sparse Schur factor, from which `S⁻¹` is formed per tail component.
+`gradient_f64`, which re-solves the mode, stays for the NB dispersion SE row.
+Measured on 94 grid cells (2026-10-07): the two agree to 6e-13 absolute and
+2.6e-10 relative, and a gradient costs 1.12 value evaluations (median) where
+the re-solve one cost 1.83.
+
+**Stops, certificate and fallback ladder.** The driver stops on a projected
+gradient below `1e-6`, an accepted decrease below
+`max(FDELTA_ABS = 1e-9, 16·ε·|f|)` (deviance units: a relative stop grows
+with n and ended a 300k-row fit 4.7e-4 above its optimum), or at the deviance's
+noise floor. Then:
+
+1. the saddle walk of the `ExactProfile` endpoint runs on the BFGS endpoint's
+   θ (β held): each nonzero `Λ` column below `POLISH_NEAR_SINGULAR` is doubled
+   while the deviance falls;
+2. an endpoint is **certified** when the search stopped on a convergence test,
+   the decrement `½·gᵀHg ≤ 1e-8`, no diagonal θ is below `1e-3` and the saddle
+   walk kept nothing. A certified endpoint is the fit's optimum;
+3. a search that stopped on a convergence test but is not certified is
+   polished by the joint BOBYQA search at `GLMM_RHO_POLISH`, from the
+   endpoint; the polish's status is the fit's;
+4. any other stop (the gradient unavailable at a clamped η row or a non-PD
+   observed factor, the line search, the iteration cap of 200), and an endpoint
+   with a diagonal θ at or above `GRAD_THETA_FAR = 100` (the plateau toward the
+   box), hands over to the shape's BOBYQA route at `RHO_BEGIN_WARM` with its
+   unchanged budget: from the incumbent, or from the search's start off the
+   plateau. Only a failed line search or the iteration cap raise
+   `Note::GradientSearchFallback`; where the gradient is not defined the BOBYQA
+   route is the designed handler.
+
+A warm fit whose θ start has a diagonal above `GRAD_WARM_THETA_MAX = 10` takes
+the BOBYQA route: from such far starts the joint search ended in a worse local
+minimum than `ExactProfile` on 2 of 600 cloglog crossed starts
+(`far_warm_start_scan`). A warm fit keeps the shape's own start guard (on the
+exact profile) and starts the search from the guard's profiled β̂.
+
+`converged` is the status of whichever optimizer finished, and `n_eval` counts
+every value evaluation of both. The search's state is reset per fit, so a refit
+on a reused workspace matches a fresh one bit for bit
+(`gradient_route_refit_on_a_reused_workspace_is_bit_identical`).
+
+**Curvature hint.** `loop_advanced::curvature_hint` after a routed pilot fit
+returns the pilot search's own final BFGS inverse-Hessian estimate over
+`[θ | β̃]`, at no cost. `fit_on_hinted` starts each draw's search from it; the
+fit only reads it, so results do not depend on the order of the draws.
+
+**Memory.** The `f64` assembly scratch (`G_γ`, `m·k`) is sized on a fit's first
+gradient and kept for the next fit up to `GRAD_ASM_KEEP_BYTES = 4 MiB`;
+beyond that it is released before the SE step.
+
+**Validation:** `gradient_at_mode_matches_the_re_solve_gradient` and
+`gradient_at_mode_matches_finite_differences_across_theta_regimes` (the
+gradient, every routed family × link × layout, the sparse Schur arm included),
+`gradient_route_matches_or_beats_the_bobyqa_route` (every routed gate cell,
+cold and warm, at or below the BOBYQA route's deviance within `1e-6`),
+`gradient_route_hands_over_on_the_iteration_cap`,
+`gradient_route_is_unit_invariant_in_beta` and
+`gradient_route_curvature_hint_is_read_only_and_order_free`, all in
+`src/glmm/tests.rs`.
+
 ## Laplace approximation
 
 **Code:** `laplace_deviance` in `src/glmm/deviance.rs`.
@@ -578,7 +687,8 @@ the white-box k=1 ≡ Laplace reduction asserted in `src/glmm/tests.rs`.
 
 ## Adaptive Gauss–Hermite quadrature (AGQ)
 
-**Code:** `agq_deviance` and `agq_deviance_vec` in `src/glmm/agq.rs`; the gate
+**Code:** `agq_deviance` and `agq_deviance_vec` in `src/glmm/agq.rs`, their
+node sums in `src/glmm/agq_fast.rs`; the gate
 in `laplace_deviance` (`src/glmm/deviance.rs`); GH tables
 `GH_NODES`/`GH_WEIGHTS`/`GH_OFFSETS` and `MAX_NAGQ = 25` in `src/consts.rs`.
 
@@ -637,6 +747,33 @@ the grid is laid in that fixed internal design. GLMMadaptive's rule does not
 move with centering, but it has no limit at a singular `Σ`, where the pin
 policy needs the objective; the `u`-space rule is continuous there.
 
+**Node sums.** For the log links (Poisson, negative binomial, Gamma-log) and
+the logit, both kernels sum each row's change in deviance from its cluster's
+center `(η₀, μ₀)` as a function of the node shift `δ = η − η₀`, instead of
+evaluating the unit deviance afresh at every node and subtracting the center
+loglik afterwards (`src/glmm/agq_fast.rs` derives the four forms). Every row
+term is `a·expm1(s·δ) + h·δ` or `a·log1p(p·expm1(s·δ)) + h·δ`, with the
+constants computed once per call and the transcendentals taken in SIMD tiles.
+No `y·ln y` constant appears, so the term is small where the change is small.
+A row whose node predictors could reach the link's clamp or the log-link tail,
+or whose two parts exceed `TERM_MAG_MAX = 2²⁰` (their cancellation would lose
+absolute precision on large counts), takes the generic unit-deviance form.
+With a scalar intercept on Poisson-log or Gamma-log, `δ` is the same for every
+row of a cluster, so the cluster's terms collapse to
+`expm1(s·δ)·Σaᵢ + δ·Σhᵢ`: two per-cluster sums replace a pass over its rows at
+each node. A cluster takes this compression only when every row is a fast row
+and both sums are finite. On the scalar kernel, probit takes its own form
+(`probit_sums`): `ln Φ` has no `expm1` identity, so each row adds its loglik
+change `w·[y·(ln Φ(η) − ln Φ(η₀)) + (1−y)·(ln Φ(−η) − ln Φ(−η₀))]` directly,
+with every `ln Φ` from one branch-free SIMD `erfc` and one SIMD `ln`
+(`simd_transcendental::ln_phi_fill`, relative-accurate on both sides: within
+1.5e-15 of `family::probit_side`, measured 6.5e-16), the center values once per
+call, and the second side only on aggregated rows. A row whose node predictors
+could pass `|η| = 37` (inside the `erfc` kernel's certified range) takes the
+generic form. Other families and links, and probit on the vector kernel, keep
+the generic node loop. The node sums agree with the generic loop at round-off
+level.
+
 **Convention/reference:** `glmer(nAGQ=k)` with Liu–Pierce adaptive centering at
 each cluster's PIRLS mode/curvature. **Validation:** in-crate goldens
 `fit_glmm_binomial_agq_matches_lme4` and `fit_glmm_poisson_agq_matches_lme4`
@@ -661,7 +798,7 @@ No layout materializes a dense `Z`. `GlmmLayout::for_design` reads
 |---|---|---|---|---|---|
 | blocked | block-diagonal, `q ≤ MAX_PRIMARY_Q` | `pirls_solve_blocked<T>` | yes | yes | no extras |
 | structured | `[[A_cc, C], [C', S]]` | `pirls_solve_blocked_extras<T: TailKernel>` | yes | yes | extras, `q_core ≤ MAX_PRIMARY_Q`, crossed levels ≤ 500 |
-| packed | one dense `k×k` | `pirls_solve_packed` (`f64`) | no | no | everything `classify_design` sends to `Solver::Sparse`, plus an extras design whose core is too wide for the structured route |
+| packed | one `k×k`, dense (`a`/`a_chol`) or sparse-factored (`PackedSparse`), never both | `pirls_solve_packed` (`f64`) | no | no | everything `classify_design` sends to `Solver::Sparse`, plus an extras design whose core is too wide for the structured route |
 
 The outer search, the NB coordinate search, the SE dispatch and the
 diagnostics are one code path over all three layouts: `fit_glmm` and
@@ -702,8 +839,9 @@ joint one — minimizing `deviance − 2·nb_profile_loglik(y, y, θ_NB, w)`, wh
 `logL_marginal` times −2 and so has the same optimum. β, θ_RE and θ_NB come out
 of one fit: there is no bracketing search and no re-fit at θ̂, the incumbent IS
 the answer. The same `[ln 1e-3, ln 1e4]` bounds serve as the coordinate's box.
-It cold-starts from the no-RE GLM-NB's own θ̂ (one extra fixed-effects-only
-`fit_glm_nb`); the method-of-moments seed charges the RE variance to the
+A carried shape (`StartValues::dispersion`) starts the coordinate directly and
+the prefit is skipped. Otherwise it cold-starts from the no-RE GLM-NB's own θ̂
+(one extra fixed-effects-only `fit_glm_nb`); the method-of-moments seed charges the RE variance to the
 dispersion and lands one to two orders of magnitude low, where PIRLS does not
 converge on random-slope shapes. When that prefit fails, or lands within a
 factor of 10 of the box floor, the coordinate starts from θ = 1 instead
@@ -786,12 +924,43 @@ also keeps rescaling every weight by a power of two exact. `ln φ_int` is
 boxed to `[ln GAMMA_PHI_LO, ln GAMMA_PHI_HI] = [ln 1e-6, ln 1e6]` and seeded
 from the plug-in dispersion `D/Σŵ` (`ŵᵢ = wᵢ/w̄`) of the no-RE β start — a
 fixed box and a fixed seed regardless of the weights' own scale. A held
-dispersion (`FitOptions::dispersion = Some(v)`) enters the search as `v/w̄`.
+dispersion (`FitOptions::dispersion = Some(v)`) enters the search as `v/w̄`,
+and so does a carried one (`StartValues::dispersion = Some(v)`), which only
+moves the start of the coordinate.
 One PIRLS solve per evaluation; there
 is no inner fixed point on φ. `φ_int` is the maximum-likelihood value of the
 Laplace objective on `ŵ`, and `φ̂ = w̄·φ_int` is reported as
 `Fit::dispersion`; the reported `Fit::deviance` is `F` at the optimum (on the
 raw weights) and `Fit::loglik = −½·F` exactly.
+
+**Scale of the `ln φ` coordinate.** On the exact-profile route with a free
+dispersion, two probe solves at `ln φ_int ± h` (`h` the search's start radius)
+give the coordinate's curvature `c` and slope `g` at the start. When the
+conditional optimum of `ln φ`, `x₀ − g/c`, lies within one cold radius `h₀` of
+the plug-in seed (`|g|/c ≤ DISP_SCALE_GATE·h₀` when the coordinate starts at
+the seed, gate 1), BOBYQA searches `ln φ` divided by a
+fixed `s`, the power of two nearest `sqrt(DISP_SCALE_C_REF/c)`
+(`DISP_SCALE_C_REF = 16`) within `[DISP_SCALE_MIN, 1] = [1/64, 1]`: the
+coordinate then has about the curvature θ has, instead of a stiff direction
+that holds the trust region small. Otherwise the search runs unscaled from the
+original seed. The probes count as evaluations either way, and a later call at
+a probed point reuses its solve. At the grid's starts the gate measures
+0.40–0.48 radii on every Gamma-inverse cell and 3.0–9.5 on every Gamma-log
+cell; on `gami_cross4_g3000p20_bal_base` the scaled search takes 97
+evaluations against 365 unscaled.
+
+The gate is the cold fit's question on every fit, whatever point the
+coordinate starts from. The plug-in seed charges the random-effect variance
+to φ, so its distance from the conditional optimum says how strongly φ is
+coupled to θ, and the scaling pays only where it is weak. Two other readings
+fail on warm starts. With `h` in place of `h₀` a warm θ (`h` is then
+`RHO_BEGIN_WARM`) halves the gate and rejects a seed the cold fit accepts:
+`gami_q4_g3000p20_bal_base` from a 5% perturbed optimum took 1578 evaluations
+against 364 cold, and takes 368. Measuring a carried φ by its own distance
+passes it whenever it is close, which it is by construction, also on
+Gamma-log, where the scaled search is the slower one: from a carried φ̂,
+`gaml_q2s_g3000p20_bal_base` takes 94 evaluations scaled and 44 unscaled,
+against 52 cold.
 
 At the scaled coordinates `ξ = θ/√φ` (Λ is linear in θ, and `u = v/√φ` maps
 the mode problem at φ onto the φ = 1 one), `log|A|` does not depend on φ and
@@ -912,7 +1081,11 @@ route-dependent exception: the packed `M` rows (`m_cols`, `m_vals`) and their
 `k × k` products `a`, `a_chol` exist only on the packed-row
 layout — the blocked and structured routes never read them and get 0-length stubs,
 so the workspace's footprint stays cluster-sized rather than data-sized on
-the common shapes. A single workspace is reused across every BOBYQA
+the common shapes. On the packed layout itself `a`/`a_chol` are sized `k × k`
+only once `fill_packed_cols` settles on the dense factor; a sparse-factored
+packed fit keeps them `0 × 0` and holds `A` in CSC form with its sparse
+Cholesky (`PackedSparse`), so its footprint is the fill of `L`, not `8k²`
+bytes. A single workspace is reused across every BOBYQA
 evaluation and PIRLS iteration of one fit with no reallocation; the warm path
 is zero-alloc (each BOBYQA solver is constructed once: the cold ones with the workspace, the warm stage-1, the near-singular polish and the saddle-check restart solvers on first use). The shape-compatibility rule is a **contract, not a runtime check**: the
 buffers are fixed at construction, and nothing in the crate detects a mismatch
@@ -923,7 +1096,10 @@ in `k`, `n_theta`, the groupings, the family, or `nAGQ`). At the stable
 
 Two seeding mechanisms feed the optimizer. Across fits, a caller-supplied
 `StartValues` threads β and θ into the search (`fit_warm`; `fit_glmm`
-warm-starts both, on every layout, unlike the LMM kernel which seeds θ only).
+warm-starts both, on every layout, unlike the LMM kernel which seeds θ only),
+and on NB and Gamma the dispersion coordinate too (`StartValues::dispersion`,
+in `Fit::dispersion`'s units; a loop-tier caller reads it off
+`FitView::dispersion_start`).
 The start is in the caller's units and the search runs on the standardized
 design, so `fit_on` maps it forward with this draw's column statistics first:
 `β̃ = B⁻¹β` and `Λ̃` the lower factor of `N⁻¹·ΛΛᵀ·N⁻ᵀ`
@@ -1040,23 +1216,43 @@ the pin is undone: θ goes back to the search's point, the flags are cleared,
 and the fit is re-evaluated and reported there, still `converged`. On the
 grid's pinned cells a pin costs at most 2.6e-8, so no pin there is undone.
 
-A pin that *lowers* the objective by more than `PIN_POLISH_DROP = 1e-7` runs
-one more joint search instead (the trough polish). A variance whose optimum
-is 0 puts a trough `log(1 + θ²·Σw)` in its θ, and under very precise data
-(Σw near 1e7) it is so narrow that the search's trust radius shrinks to its
-end inside it while the other coordinates are still off: on crossed Poisson
-fits near e¹⁴, σ_g ended up to 0.08 short of the `(1 | g)` optimum. Such an
-endpoint sits on the trough's wall, which is why pinning lowers its
-objective. The polish is the joint `[θ | β̃]` search (`ws.solver`) from the
-pinned point, with the pinned coordinates read as 0 and the dispersion held,
-so the trough is gone; its point is kept only when its deviance is lower, and
-then re-evaluated like the pin. β̃ is scaled by the β information at the
-pinned θ, from one PQL solve there, as in the second pass above (the design
-scale when that solve fails). Its evaluations count in `n_eval`; the PQL
-solve does not. On 614 simulated pinned fits it ran on 190, helped 184 of
-them, and left 5 of 100 crossed fits more than 1e-3 above the `(1 | g)`
-optimum against 35 without it; those 5 are fits the polish does not run on.
-No pinned grid cell runs it.
+A pin that *lowers* the objective by more than `PIN_POLISH_DROP = 1e-7`, or
+whose corner the stationarity probe below finds off the optimum of the free
+coordinates by more than that, runs one more joint search instead (the
+trough polish). A variance whose optimum is 0 puts a trough
+`log(1 + θ²·Σw)` in its θ, and under very precise data (Σw near 1e7) it is
+so narrow that the search's trust radius shrinks to its end inside it while
+the other coordinates are still off: on crossed Poisson fits near e¹⁴, σ_g
+ended up to 0.08 short of the `(1 | g)` optimum, and on the fit of
+`crossed_zero_variance_reaches_the_single_grouping_optimum` 0.24 short (σ_g
+0.77 against 0.53, 2.6 deviance units above). An endpoint on the trough's
+wall is what pinning lowers; one at the trough's bottom it does not, and
+which of the two a search ends at is round-off (that fit ends at θ_h = 5e-7
+on x86, a drop of 4.5e-5, and at θ_h = −1e-8 on aarch64, a drop of 3e-8;
+2026-10-08). So every kept pin is also probed: each free θ coordinate is
+evaluated `PIN_PROBE_STEP = 1e-3` either way on the polish's own objective
+(β held, the pinned coordinates 0), and the larger of the drop to the lower
+probe and the parabola's `g²/(2c)` through the three points is the predicted
+gain along it; above `PIN_POLISH_DROP` the polish runs. The step is small
+enough that the parabola's error (fourth power of the step) stays near 1e-11
+on an endpoint the gradient search certified, where `GLMM_RHO_POLISH` read
+1e-6 and polished for nothing; a starved endpoint is found by extrapolation
+(the parabola predicts about 1 from 0.24 off). The probes run once per fit,
+only when the drop has not already decided, and count in `n_eval` (two per
+free θ coordinate). The polish is the joint `[θ | β̃]` search (`ws.solver`)
+from the pinned point, with the pinned coordinates read as 0 and the
+dispersion held, so the trough is gone; its point is kept only when its
+deviance is lower, and then re-evaluated like the pin. A polish that finds
+nothing lower, and a probe that finds the corner stationary, re-evaluate the
+pinned point once more (not a search evaluation), so the reported ũ, W̃ and
+`M` are the pinned point's own and not the last probed point's. β̃ is scaled
+by the β information at the pinned θ, from one PQL solve there, as in the
+second pass above (the design scale when that solve fails). The polish's
+evaluations count in `n_eval`; the PQL solve does not. On 614 simulated
+pinned fits the drop alone ran it on 190, helped 184 of them, and left 5 of
+100 crossed fits more than 1e-3 above the `(1 | g)` optimum against 35
+without it; those 5 were fits the drop did not run it on, which the probe
+is for. No pinned grid cell runs it on the drop.
 
 `pinned` is reported in the caller's coordinates. The pin acts on the kernel's
 θ̃, on the standardized design; when a slope of the block is centered, the
@@ -1116,8 +1312,12 @@ tests in `src/lmm/tests.rs` pin the shared pin loop; the accuracy study
 `rx_cov_into` in `src/glmm/se.rs`; the assembled exact-Hessian engine
 `assembled::joint_hessian` (body `joint_hessian_columns`, `f64` gradient
 `packed_gradient`, routing gate `assembly_routes`, memory guard
-`PACKED_ASSEMBLY_MAX_BYTES`) in `src/glmm/assembled.rs`; the hyper-dual
-fallback `laplace_hessian` in `src/glmm/derivative.rs`; the packed-row stencil
+`PACKED_ASSEMBLY_MAX_BYTES`) in `src/glmm/assembled.rs`; the AGQ
+gradient-difference Hessian `agq_gradient_difference_hessian`
+(`AGQ_GD_STEP_REL`, `AGQ_GD_ASYM_MAX`) in `src/glmm/se.rs` over the `f64` AGQ
+gradient `agq_gradient::assemble` (gate `agq_gradient::covers`) in
+`src/glmm/agq_gradient.rs`; the hyper-dual fallback `laplace_hessian` in
+`src/glmm/derivative.rs`; the packed-row stencil
 `packed_fd_hessian_cov` and `packed_schur_fill` in `src/glmm/se.rs`;
 `FD_STEP_BASE = 1e-2` and `PIRLS_TOL_REL_FD = 1e-8` in `src/glmm/mod.rs` (both
 scoped to the FD arm only); `SPARSE_FD_STEP_REL = 1e-4` in `src/glmm/se.rs`.
@@ -1128,9 +1328,9 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   TRUE)`): the fixed-effect covariance is the β-block of `2·H_dev⁻¹`. Here
   `H_dev` is the Hessian of the joint `(θ, β)` Laplace deviance at the
   converged point. The factor of 2 arises because the deviance is −2·logL, so
-  the observed information is `H_dev/2`. Three rungs produce `H_dev`, each
-  answering only what the rung above it declines; a decline is a routing
-  answer, not a failure.
+  the observed information is `H_dev/2`. Four rungs produce `H_dev` (1, 2a, 2
+  and 3 below), each answering only what the rung above it declines; a
+  decline is a routing answer, not a failure.
 
   **Rung 1 — the assembled pass** (`assembled::joint_hessian`), the default on
   all three `A`-layouts and at every `m = n_theta + p`. The total derivative of
@@ -1164,8 +1364,8 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   most `MAX_DUAL_REFINEMENTS` calls, a spent cap is `NotConverged`); a clean
   fit takes one call.
 
-  It declines in four cases. An AGQ-routed shape, which is rung 2's: the
-  identity above is the Laplace one. A row on one of `family::clamp_eta`'s
+  It declines in four cases. An AGQ-routed shape, which is rung 2a's or rung
+  2's: the identity above is the Laplace one. A row on one of `family::clamp_eta`'s
   bounds (`assembled::eta_clamped_rows`): η is a constant there, which the
   per-row derivatives do not model. A non-positive-definite
   observed factor `A_obs`, which the adjoint equation needs and which is never
@@ -1173,10 +1373,104 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   a working set over `PACKED_ASSEMBLY_MAX_BYTES` (256 MiB; the widest corpus
   rung, `sim_sparse_binomial_bigsd` at `k = 356`, sits 5.4× under it).
 
+  Its scratch holds per row only what the dual PIRLS kernel reads: `η`, `μ`,
+  `W` and the packed `M` at `Dual<N>`, plus `M`'s core slice on the
+  structured layout alone. The observed factor `A_obs` is sized only on a
+  non-canonical link, the crossed values of `M` once per grouping (every row
+  holds the same `θ` there), and the assembly's own row values (`ρ`, `w'`,
+  `w_obs`, `h`) are formed and dropped in one fused walk over the rows, which
+  sums every term in the same order as three separate passes, so the
+  Hessian is bit-identical. The lane width comes from
+  `NLanes::pick_assembled`, a pinned table measured on x86 and an Apple M4:
+  two `Dual<8>` passes at `m` 13–16 and three `Dual<6>` at 17–18 instead of
+  two `Dual<12>`, two `Dual<5>` at 9–10 instead of one `Dual<12>`, the
+  covering rung everywhere else, with identical Hessians on every rung. On a binomial fit with four random effects per group
+  (`m = 14`) at 3M rows the fit with Hessian SEs peaks at 4.4 GB of live
+  allocations, against 10.7 GB before these changes, and the SE step
+  takes about half its former time. The one memory-for-speed trade is the
+  `m` 9–10 row: `Dual<5>×2` is 0.93–0.96 of the `Dual<12>` pass on x86
+  blocked shapes and 1.006 on `cross4`, but up to 1.12 on the Apple M4, for
+  54% less dual scratch. There is no other slower memory-lean route.
+
+  On the blocked layout (one grouping, no extras) above `SE_ROW_BLOCK` (4096)
+  rows, the pass runs one block of whole primary clusters at a time
+  (`run_assembled_hessian_blocked`). With β fixed, the blocked `A`, the mode
+  equation and the adjoint are block-diagonal over clusters and the
+  objective is a sum over them, so each block's dual PIRLS solve and
+  assembly see only its own rows and RE columns, and the chunk's columns are
+  the sum of the blocks'. Nothing is recomputed: the per-row and per-cluster
+  dual values live only in the block-sized scratch (`RowBlockBufs`, built
+  once with the dual scratch), and the only state shared across blocks is
+  the `k`-length mode `u`, which the settle loop carries forward as before.
+  The SE scratch is then about 150 MB at 3M rows of the `m = 14` binomial
+  fit (3.2 GB whole), its peak within 1% of the same fit with `WaldSe::Rx`,
+  and the SE step 0.61 to 0.79 of the whole-data pass from 30k to 3M rows on
+  a locked clock (same instruction count; the gain is cache residency and the
+  first-touch page faults the scratch no longer takes). Each block's PIRLS
+  exit test reads its own block, and the columns are summed per block, so
+  the Hessian moves at round-off (at most 3e-13 relative on the covariance at
+  3M rows); a fit with `n` at or below the block takes the whole-data pass,
+  bit-identical.
+
+  On the structured layout above `SE_ROW_BLOCK` rows the pass streams instead
+  (`GlmmDualScratch::for_shape_streamed`): the crossed Schur couples every
+  cluster, so the solve cannot be split, but within one PIRLS iteration every
+  per-row value is formed and consumed between the `η` pass and the scatter,
+  and only cluster- and pair-level sums cross the solve. The dual PIRLS
+  (`pirls::structured_stream_deviance`) runs each iteration as one sweep over
+  row blocks (`x'β`, the core `M` slice, `η`, the family pass, `ρ` and the
+  scatter per block, then the accept or halve test and the unchanged factor
+  and solve), and the assembly re-forms each block's `η`, `p`, `W_obs` and
+  core `M` slice at the returned iterate (`pirls::stream_fill`). The dual row
+  buffers and `m_core_buf` are never sized whole; `core_blocks`, `coupling`,
+  `schur_blk` and `asm.tail_h` stay whole. Every per-row value is the same
+  arithmetic and every accumulator takes its rows in ascending order, so the
+  gradient and the Hessian are bit-identical to the whole-data pass; only the
+  PIRLS deviance is summed per block. The recompute (one more `η` and family
+  pass in the assembly, `x'β` and the core slice per sweep) costs what the
+  first-touch page faults it removes save: the SE step is 0.98 to 1.01 of the
+  whole-data pass from 10k to 300k rows of a four-grouping crossed binomial,
+  and its scratch 1.4 to 2.2 times smaller (902 MB instead of 2.0 GB at 3M
+  rows, where the pair-level `coupling` and `tail_h` are most of what is
+  left). Its coupling-shaped twins (`coupling`,
+  `tail_h` and their observed copies) are sized by the design's own coupling
+  pattern (`derivative::dual_coupling_pairs`, one `q_core` run per distinct
+  crossed level a cluster's rows touch) once the fit has built it, rather
+  than by the `rows · MAX_EXTRA_GROUPINGS` bound, with identical results.
+
+  **Rung 2a: the AGQ gradient-difference Hessian**
+  (`agq_gradient_difference_hessian`), on the AGQ shapes the `f64` AGQ
+  gradient covers (`agq_gradient::covers`: the blocked layout with one scalar
+  random intercept and no extra groupings, binomial logit or probit, Poisson
+  log). The gradient of the scalar-intercept AGQ deviance in `[λ | β]` is
+  closed form in the converged modes `û_c` and `η_fix`, including the terms
+  through `û` and the node scale `σ_c` that do not cancel at a finite number
+  of nodes (derivation in the module header; Liu & Pierce 1994). Column `g` of
+  `H_dev` is the central difference of that gradient at
+  `γ̂ ± AGQ_GD_STEP_REL·max(1, |γ̂_g|)·e_g`, each point one PIRLS mode solve
+  seeded from the fit's own mode and one gradient assembly; the matrix is then
+  symmetrized. Every column is a function of `γ` alone, so the result does not
+  depend on evaluation order. The rung holds nothing per row beyond the `f64`
+  fit's own buffers and has no lane cap, so it also takes these shapes above
+  `MAX_DUAL_N`, where rung 2 refuses and the stencil used to answer. It
+  declines to rung 2 on a non-finite value or gradient, on a row at the link's
+  clamp (Poisson-log's `ETA_MAX`), and on an asymmetry above
+  `AGQ_GD_ASYM_MAX = 1e-6` relative to `√(|H_rr·H_cc|)`. SEs agree with rung
+  2's to about 1e-11 (β) and 1e-10 (θ) relative. Measured 2026-10-07 (pawel,
+  locked P-core, `nAGQ = 7`, whole fit with Hessian SEs): faster than rung 2
+  at every size measured, 1,200 to 300,000 rows, on all three families (0.83
+  to 0.95 of the fit at `m` 3 to 8), and at 300,000 rows the fit peaks at 63
+  to 84 MB against 296 to 464 MB. Above `MAX_DUAL_N` it takes 0.25 to 0.36 of
+  the fit the stencil took, and its SEs sit about 3e-6 relative from the
+  stencil's, the stencil's own error. Evidence: pawel scratch
+  `mmjl-rethink/agqse/`.
+
   **Rung 2 — the hyper-dual pass** (`laplace_hessian`), one
   `HyperDual<N, H>` pass that differentiates the deviance twice at once and
-  reads the packed second-derivative block. It is AGQ's own route —
-  differentiating the AGQ deviance where the fit used AGQ — and it is the
+  reads the packed second-derivative block. It is the route of the AGQ shapes
+  rung 2a does not cover (cloglog, NB, Gamma, vector random effects) and of
+  what rung 2a declines (it differentiates the AGQ deviance where the fit used
+  AGQ), and it is the
   per-cell fallback for what rung 1 declines on a layout that has a dual twin
   of its PIRLS kernel (`derivative::supports_shape`: blocked and structured,
   never packed; its `k_crossed ≤ DUAL_TAIL_MAX` clause is unreachable while

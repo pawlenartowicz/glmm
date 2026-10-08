@@ -1336,6 +1336,7 @@ fn fit_on_theta_marshalling_bounded_alloc() {
         crate::StartValues {
             beta: v.betas().to_vec(),
             theta: v.theta().to_vec(),
+            dispersion: None,
         }
     };
     let start_r = {
@@ -1343,6 +1344,7 @@ fn fit_on_theta_marshalling_bounded_alloc() {
         crate::StartValues {
             beta: v.betas().to_vec(),
             theta: v.theta().to_vec(),
+            dispersion: None,
         }
     };
 
@@ -1785,6 +1787,7 @@ fn over_envelope_vech_fits_through_a_warm_theta_start() {
     let start = crate::StartValues {
         beta: vec![],
         theta,
+        dispersion: None,
     };
     let fit = crate::fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
     assert_eq!(fit.tau2.len(), OVER_ENVELOPE_N_THETA);
@@ -1849,4 +1852,51 @@ fn fit_on_fixed_design_panics_in_debug_when_x_changes() {
     let _ = fit_on(&mut ws, &x, &y, &ids, None, &opts);
     x[p + 1] += 1.0;
     let _ = fit_on(&mut ws, &x, &y, &ids, None, &opts);
+}
+
+/// The gradient-search diagnostics: a crossed binomial GLMM with two variance
+/// parameters and a random-slope LMM take the BFGS route and report its
+/// gradient count, its stop and its endpoint decrement, on the loop tier and
+/// on the stable `Diagnostics`; a one-θ GLMM searches with BOBYQA and reports
+/// none of them.
+#[test]
+fn fitview_reports_the_gradient_search() {
+    let (x, y, n, p, model, ids, opts) = crossed_extra_glmm_case();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
+    assert!(d.outer_stop.is_some(), "the crossed GLMM did not route");
+    assert!(d.n_grad > 0, "n_grad {}", d.n_grad);
+    assert!(
+        d.outer_decrement.is_finite(),
+        "decrement {}",
+        d.outer_decrement
+    );
+
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let d = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts).diagnostics();
+    assert!(d.outer_stop.is_some(), "the random-slope LMM did not route");
+    assert!(d.n_grad > 0, "n_grad {}", d.n_grad);
+    assert!(
+        d.outer_decrement.is_finite(),
+        "decrement {}",
+        d.outer_decrement
+    );
+    let pd = fit_cold(&x, &y, n, p, &model, &ids, &opts).diagnostics;
+    assert_eq!(pd.n_grad, d.n_grad as usize);
+    assert_eq!(pd.outer_stop, d.outer_stop);
+    assert_eq!(pd.outer_decrement.to_bits(), d.outer_decrement.to_bits());
+
+    let (x, y, n, p, model, ids, opts) = glmm_binomial_intercept_case();
+    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let d = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts).diagnostics();
+    assert_eq!(d.outer_stop, None, "a one-θ GLMM routed");
+    assert_eq!(d.n_grad, 0);
+    assert!(d.outer_decrement.is_nan());
+    let pd = fit_cold(&x, &y, n, p, &model, &ids, &opts).diagnostics;
+    assert_eq!((pd.n_grad, pd.outer_stop), (0, None));
+    assert!(pd.outer_decrement.is_nan());
 }

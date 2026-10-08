@@ -79,13 +79,9 @@ reports honestly if it didn't converge.
 
 ## NotImplementedError: family/link/knob
 
-Two combinations have an approved design but no kernel support yet, and
-raise a clean `NotImplementedError` rather than silently falling back to
-something close:
-
-- quasi-likelihood `dispersion=` on binomial/Poisson
-- a float `init_theta=` seed (only the default `init_theta=None` cold start
-  is supported)
+One combination has an approved design but no kernel support yet, and
+raises a clean `NotImplementedError` rather than silently falling back to
+something close: quasi-likelihood `dispersion=` on binomial/Poisson.
 
 `family="inversegaussian"` (fixed-effect GLM only — mixed models fault with a
 message naming the deferral) and `link="cloglog"` (GLM and GLMM) are both

@@ -100,6 +100,7 @@ fn fastglmm_fit(
     offset: &[f64],
     start_beta: &[f64],
     start_theta: &[f64],
+    start_dispersion: &[f64],
 ) -> Result<List> {
     let nagq = u8::try_from(nagq)
         .map_err(|_| Error::Other(format!("nagq {nagq} is out of range for u8")))?;
@@ -114,11 +115,13 @@ fn fastglmm_fit(
     } else {
         Some(offset.to_vec())
     };
-    let warm_start = if start_beta.is_empty() && start_theta.is_empty() {
-        None
-    } else {
-        Some((start_beta.to_vec(), start_theta.to_vec()))
-    };
+    let start_dispersion = start_dispersion.first().copied();
+    let warm_start =
+        if start_beta.is_empty() && start_theta.is_empty() && start_dispersion.is_none() {
+            None
+        } else {
+            Some((start_beta.to_vec(), start_theta.to_vec(), start_dispersion))
+        };
 
     let r = orchestrate::run_fit(
         formula,
@@ -190,6 +193,9 @@ fn fastglmm_fit(
         dispersion = r.dispersion,
         converged = r.converged,
         n_eval = r.n_eval as f64,
+        n_grad = r.n_grad as f64,
+        outer_stop = r.outer_stop,
+        outer_decrement = r.outer_decrement,
         deviance = r.deviance,
         singular = r.singular,
         names = r.names,

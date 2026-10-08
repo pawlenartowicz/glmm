@@ -98,6 +98,13 @@ pub(crate) struct PirlsScratch<T: Scalar> {
     /// copied into the border's `xtwm` (`B'`) once per iteration. Empty where
     /// `x_rows` is.
     pub bt_rows: Vec<f64>,
+    /// `f64` AGQ node-sum row constants (`agq_fast`), sized on first use.
+    /// Empty on the derivative scratch, whose dual evaluations take the
+    /// generic node loop.
+    pub agq_rows: Vec<f64>,
+    /// Rows the `f64` AGQ node sums hand back to the generic per-row
+    /// deviance (`agq_fast`'s guard), sized on first use.
+    pub agq_slow: Vec<u32>,
 }
 
 impl<T: Scalar> PirlsScratch<T> {
@@ -120,6 +127,8 @@ impl<T: Scalar> PirlsScratch<T> {
             agq_scratch: vec![T::ZERO; super::derivative::agq_len(s, q_p, nagq)],
             x_rows: Vec::new(),
             bt_rows: Vec::new(),
+            agq_rows: Vec::new(),
+            agq_slow: Vec::new(),
         }
     }
 
@@ -155,21 +164,52 @@ pub(crate) struct StructuredScratch<T: Scalar> {
     // MAX_EXTRA_GROUPINGS`. Sized once at construction — no per-solve alloc.
     /// max_n · q_core row-major; [i·q_core+local] = M[(i, core_col(f,local))]
     pub m_core_buf: Vec<T>,
-    /// max_n · G_cap row-major; nonzero M value (z·θ) per crossed grouping
-    pub cross_val: Vec<T>,
+    /// `G_cap` slots: the crossed nonzero of `M` (`z·θ`, `z ≡ 1.0`) for slot
+    /// `z` of every row's `cross_col[i·G_cap + z]`. One value per grouping,
+    /// not per row: `build_packed_m` walks `g.crossed` in the same order on
+    /// every row, skips a grouping on a predicate of θ alone (`f64`, θ = 0),
+    /// and every row has exactly one level of every crossed grouping with no
+    /// weight in the value, so slot `z` holds the same number on every row.
+    /// Written by the same `build_packed_m` call that writes `cross_col` and
+    /// `n_cross`, so the two can only be read as a matched pair.
+    pub cross_theta: Vec<T>,
 }
 
 impl<T: Scalar> StructuredScratch<T> {
     /// `q_core = primary_q + nested_per_parent`, `e = k_crossed()`,
     /// `G_cap = MAX_EXTRA_GROUPINGS`; every length `.max(1)` so the
     /// no-extras path holds the minimum and the first call allocates nothing.
-    pub(crate) fn for_shape(rows: usize, s: usize, q_core: usize, e: usize) -> Self {
+    ///
+    /// `extras` is true only on the structured layout, the one route that
+    /// fills and reads the row buffer `m_core_buf` (`build_packed_m` is its
+    /// only writer, reached from `structured_laplace_deviance`, and every
+    /// reader is a structured arm). Without extras it sits at its minimum: at
+    /// `binb_q4`'s `Dual<12>` rung it was `rows·q_core` = 4 elements of 104
+    /// bytes per row nobody read. `cross_theta` is `G_cap` slots on every
+    /// shape (it used to be `rows·G_cap`, one copy of the same θ per row).
+    pub(crate) fn for_shape(rows: usize, s: usize, q_core: usize, e: usize, extras: bool) -> Self {
+        Self::for_shape_coup(rows, s, q_core, e, extras, coupling_len(rows, s, q_core, e))
+    }
+
+    /// [`Self::for_shape`] with the compact coupling length given: the dual
+    /// twins size it from the design's own coupling pattern
+    /// ([`derivative::dual_coupling_len`](super::derivative::dual_coupling_len))
+    /// rather than from the [`coupling_len`] bound.
+    pub(crate) fn for_shape_coup(
+        rows: usize,
+        s: usize,
+        q_core: usize,
+        e: usize,
+        extras: bool,
+        coup_len: usize,
+    ) -> Self {
+        let row_cap = if extras { rows } else { 0 };
         Self {
             core_blocks: vec![T::ZERO; (q_core * q_core * s).max(1)],
-            coupling: vec![T::ZERO; coupling_len(rows, s, q_core, e)],
+            coupling: vec![T::ZERO; coup_len],
             schur_blk: vec![T::ZERO; (e * e).max(1)],
-            m_core_buf: vec![T::ZERO; (rows * q_core).max(1)],
-            cross_val: vec![T::ZERO; (rows * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
+            m_core_buf: vec![T::ZERO; (row_cap * q_core).max(1)],
+            cross_theta: vec![T::ZERO; crate::lmm::MAX_EXTRA_GROUPINGS],
         }
     }
 }
@@ -258,20 +298,26 @@ pub(crate) struct PackedScratch {
     /// `fill_m_vals`.
     pub m_vals: Vec<f64>,
     /// k × k `A = M'WM + I`, full symmetric (the per-row scatter writes both
-    /// triangles). Left holding the FINAL iterate's raw `A` after a converged
-    /// solve, which `packed_schur_fill` (se.rs) re-factors — so the PIRLS
-    /// Cholesky must run on `a_chol`, never on this field in place.
+    /// triangles), on the DENSE factor only. Left holding the FINAL iterate's
+    /// raw `A` after a converged solve, which `packed_schur_fill` (se.rs)
+    /// re-factors — so the PIRLS Cholesky must run on `a_chol`, never on this
+    /// field in place. `for_shape` allocates it `0×0`; [`PackedScratch::set_factor`]
+    /// sizes it `k×k` once [`fill_packed_cols`] settles on the dense factor and
+    /// keeps it `0×0` beside a sparse one, where `A` lives in
+    /// `PackedSparse::axx` and the `8k²` bytes are never paid.
     pub a: Mat<f64>,
-    /// Copy-then-factor target for `a`'s Cholesky (k×k): the solve copies `a`'s
-    /// lower triangle in here (mirroring `.llt(Side::Lower)`'s internal copy)
-    /// and runs `cholesky_in_place` on THIS buffer.
+    /// Copy-then-factor target for `a`'s Cholesky (k×k on the dense factor,
+    /// `0×0` beside a sparse one): the solve copies `a`'s lower triangle in
+    /// here (mirroring `.llt(Side::Lower)`'s internal copy) and runs
+    /// `cholesky_in_place` on THIS buffer.
     pub a_chol: Mat<f64>,
     /// Scratch for `a_chol`'s in-place `cholesky_in_place` (k×k, θ-independent
     /// size) — avoids a per-PIRLS-iteration `.llt(Side::Lower)` allocation.
     pub a_llt_mem: MemBuffer,
     /// Sparse Cholesky of `A` on its fixed pattern ([`PackedSparse`]), built by
     /// [`fill_packed_cols`] with the design's level ids when the switch there
-    /// chooses it; `None` means the dense `a_chol` factor.
+    /// chooses it; `None` means the dense `a_chol` factor. Installed through
+    /// [`PackedScratch::set_factor`], which sizes `a`/`a_chol` to match.
     pub sparse: Option<Box<PackedSparse>>,
 }
 
@@ -286,7 +332,16 @@ pub struct PackedSparse {
     pub(crate) symbolic: SymbolicCholesky<usize>,
     /// `A`'s values in the fixed CSC pattern, scattered per PIRLS iteration.
     pub(crate) axx: SparseColMat<usize, f64>,
+    /// `L`'s values on the symbolic pattern: after a successful packed
+    /// `factor_logdet`, the factor of the `A` then in `axx`.
     pub(crate) l_values: Vec<f64>,
+    /// Whether `l_values` holds a COMPLETED factor of the `A` in `axx`. The
+    /// packed `factor_logdet` clears it on entry and sets it once the numeric
+    /// factorization succeeded with a finite `log|L|`. faer stops at a
+    /// non-positive pivot and leaves the columns from there stale, so the
+    /// values alone cannot signal failure; this flag is the signal
+    /// `se::packed_schur_fill` reads before solving through `l_values`.
+    pub(crate) factor_ok: bool,
     pub(crate) fac_mem: MemBuffer,
     /// Solve scratch sized for `p.max(1)` right-hand sides: the β-border's
     /// `A⁻¹M'WX` is the widest solve the packed PIRLS takes.
@@ -361,6 +416,7 @@ impl PackedSparse {
             symbolic,
             axx,
             l_values,
+            factor_ok: false,
             fac_mem,
             solve_mem,
             row_slots,
@@ -372,7 +428,10 @@ impl PackedSparse {
 impl PackedScratch {
     /// Packed-row buffers for a design with `rows` row capacity and `k` RE
     /// columns. `m_cols` is design-fixed but level-id dependent, so it is
-    /// allocated here and filled by [`fill_packed_cols`].
+    /// allocated here and filled by [`fill_packed_cols`]. The dense `k×k` pair
+    /// `a`/`a_chol` is NOT allocated here: whether the fit factors `A` densely
+    /// or sparsely is decided by [`fill_packed_cols`] from the level ids, and
+    /// [`PackedScratch::set_factor`] sizes the pair to that decision.
     pub(crate) fn for_shape(g: &LmmGroupings, rows: usize, k: usize) -> Self {
         let q_p = g.primary_q;
         // lam_small layout mirrors `fill_lambda_small` — primary, nested, crossed.
@@ -393,8 +452,8 @@ impl PackedScratch {
             width,
             m_cols: vec![u32::MAX; rows * width],
             m_vals: vec![0.0; rows * width],
-            a: Mat::zeros(k.max(1), k.max(1)),
-            a_chol: Mat::zeros(k.max(1), k.max(1)),
+            a: Mat::zeros(0, 0),
+            a_chol: Mat::zeros(0, 0),
             a_llt_mem: MemBuffer::new(cholesky_in_place_scratch::<f64>(
                 k.max(1),
                 Par::Seq,
@@ -422,6 +481,22 @@ impl PackedScratch {
             )),
             sparse: None,
         }
+    }
+
+    /// Install the factor [`fill_packed_cols`] chose for `A` and size the dense
+    /// pair to it: `Some` keeps `A` in the sparse `axx`/`l_values` and leaves
+    /// `a`/`a_chol` at `0×0`; `None` sizes both `k.max(1)` square for the dense
+    /// factor, exactly the shape `for_shape` used to allocate unconditionally.
+    /// A refill of a reused workspace (`loop_advanced`, new ids at the same `n`)
+    /// may switch the choice either way, so both directions resize; a refill
+    /// that keeps the choice reallocates nothing.
+    pub(crate) fn set_factor(&mut self, sparse: Option<Box<PackedSparse>>, k: usize) {
+        let side = if sparse.is_some() { 0 } else { k.max(1) };
+        if self.a.nrows() != side {
+            self.a = Mat::zeros(side, side);
+            self.a_chol = Mat::zeros(side, side);
+        }
+        self.sparse = sparse;
     }
 }
 
@@ -633,6 +708,16 @@ pub(crate) struct FdState {
     /// `sparse::fd_margin`'s corpus measurement on the packed one.
     /// Mirrors `force_dense_schur`.
     pub(crate) force_fd_hessian: bool,
+    /// Skip the AGQ gradient-difference rung (`se::agq_gradient_difference_hessian`)
+    /// so a covered AGQ shape takes the hyper-dual rung. Test-and-A/B only,
+    /// like `force_fd_hessian`: it is how the tests compare the two exact
+    /// rungs on the same fit.
+    pub(crate) skip_agq_gradient_difference: bool,
+    /// Rows per block of the row-blocked assembled Hessian on the blocked
+    /// layout (`assembled::SE_ROW_BLOCK`, which every fitting path keeps). Test
+    /// and A/B only: a small value sends the crate's small fixtures through
+    /// the row-blocked pass, `usize::MAX` keeps every fit on the whole-data one.
+    pub(crate) se_row_block: usize,
 }
 
 /// Post-search inference outputs and their scratch: the joint Hessian and
@@ -749,6 +834,11 @@ pub struct GlmmWorkspace {
     /// does not read it), so the search is over `(θ, β)` alone; the SE takes no
     /// `ln φ` row. `None` on every other family and when φ is estimated.
     pub(crate) gamma_phi_held: Option<f64>,
+    /// A carried Gamma φ start (`StartValues::dispersion`, on the internal
+    /// `ŵ = w/s` scale), set by the fit adapter before each `fit_glmm`: the
+    /// `ln φ` coordinate starts at it instead of the no-RE plug-in seed.
+    /// `None` on every other family and on a cold dispersion start.
+    pub(crate) gamma_phi_start: Option<f64>,
     /// NB: the response's count groups `(yᵥ, Σw)` for the saturated term
     /// (`fit::glm::nb_count_groups`), refilled per fit; empty otherwise.
     pub(crate) nb_groups: Vec<(f64, f64)>,
@@ -770,6 +860,10 @@ pub struct GlmmWorkspace {
     /// node-outer: cluster-outer serially regresses many-tiny-cluster shapes
     /// (see the build site in fit_glmm).
     pub(crate) cluster_rows: Option<super::agq::ClusterRowIndex>,
+    /// The AGQ gradient-difference Hessian's row index and buffers
+    /// (`se::agq_gradient_difference_hessian`), built on the first SE call
+    /// that takes that rung. `None` everywhere else.
+    pub(crate) agq_gd: Option<Box<super::agq_gradient::AgqGd>>,
     /// total RE columns (groupings.k_total)
     pub k: usize,
     /// fixed-effect predictors
@@ -848,6 +942,34 @@ pub struct GlmmWorkspace {
     /// sets `solver`'s start radius from it, so a test that overrides this
     /// field keeps the constructor's radius.
     pub outer_search: OuterSearch,
+    /// Which optimizer the outer search runs, per start kind
+    /// ([`gradient_route_plan`](super::gradient_route_plan)): projected BFGS
+    /// over `[θ | β]` on the gradient route's shapes, BOBYQA on `outer_search`
+    /// everywhere else and as every fallback. A test that sets it to
+    /// [`RoutePlan::BOBYQA`](crate::optim::RoutePlan::BOBYQA) gets the BOBYQA
+    /// route's fit bit for bit.
+    pub(crate) route_plan: crate::optim::RoutePlan,
+    /// The gradient search's buffers, reset at the start of every search.
+    pub(crate) bfgs: crate::optim::bfgs::BfgsState,
+    /// The gradient search's settings, [`BfgsConfig::GLMM`](crate::optim::bfgs::BfgsConfig::GLMM)
+    /// (a test lowers the iteration cap to reach the fallback rung).
+    pub(crate) grad_cfg: crate::optim::bfgs::BfgsConfig,
+    /// How the last `fit_glmm`'s gradient search ended, `None` when the fit
+    /// searched with BOBYQA alone: the driver's stop, its gradient count, the
+    /// endpoint decrement `½·gᵀHg`, and the rung the route finished on (0 a
+    /// certified endpoint, 3 the joint polish, 1 the hand-over to BOBYQA).
+    pub(crate) grad_report: Option<(crate::optim::bfgs::BfgsStop, usize, f64, u8)>,
+    /// The gradient search's two `n_θ + p` buffers (its start, for a hand-over
+    /// from the plateau, and the objective's last point), sized on the first
+    /// routed fit so a refit allocates nothing for them.
+    pub(crate) grad_scratch: Vec<f64>,
+    /// The caller's curvature hint for the next `fit_glmm` (`fit_on_hinted`),
+    /// taken (and so cleared) by that fit: a hint never outlives its call.
+    pub(crate) grad_hint_in: Option<crate::optim::CurvatureHint>,
+    /// Whether the last `fit_glmm`'s gradient search updated its inverse
+    /// Hessian at least once, so `bfgs` holds an estimate a curvature hint can
+    /// be taken from. Reset at the top of every `fit_glmm`.
+    pub(crate) grad_hint_ready: bool,
     /// PIRLS scratch (sized max_n / k) — see [`PirlsScratch`].
     pub(crate) pirls: PirlsScratch<f64>,
     /// Row-major f64 copy of every random-slope column of x, filled once per
@@ -928,6 +1050,15 @@ pub struct GlmmWorkspace {
     /// `false` on a shape that does not route `ExactProfile`. Reset to
     /// `false` at the top of every `fit_glmm`.
     pub(crate) exact_profile_fallback: bool,
+    /// The gradient search handed its incumbent to the BOBYQA route — see
+    /// [`crate::Note::GradientSearchFallback`]. Reset at the top of every
+    /// `fit_glmm`.
+    pub(crate) gradient_search_fallback: bool,
+    /// The gradient search's `f64` assembly scratch
+    /// ([`gradient_at_mode`](super::assembled::gradient_at_mode)): sized on a
+    /// fit's first gradient, so a BOBYQA-routed fit never holds it, and reused
+    /// across gradients and fits while the shape matches.
+    pub(crate) grad_asm: Option<super::assembled::AssemblyBufs<f64>>,
     /// The lowest objective the last `fit_glmm` search reached, on the scale
     /// of `GlmmFit::deviance`; set on a failed fit too, whose `deviance` is
     /// `+∞`. `+∞` when no evaluation was finite.
@@ -1123,6 +1254,15 @@ impl GlmmWorkspace {
         } else {
             groupings.k_crossed()
         };
+        // The structured layout is the only one that fills or reads the
+        // per-row structured buffer `m_core_buf` and the
+        // pattern's row arrays (`cross_col`, `n_cross`, `coup_cols`,
+        // `coup_pos`); a packed layout can carry extras but reads none of
+        // them. Elsewhere they sit at their minimum. Natively that saves
+        // address space, not RSS (zeroed `f64`/`u32` vectors are never
+        // touched); under WASM it is linear memory: 456 MB at 3M rows.
+        let structured_layout = layout == GlmmLayout::Structured;
+        let pattern_rows = if structured_layout { max_n } else { 0 };
 
         // Bounds: θ part from blind_theta_and_bounds; β unbounded (the bobyqa
         // crate reads an infinite bound as none). Any finite box on β is in the
@@ -1152,6 +1292,8 @@ impl GlmmWorkspace {
         // Route per shape (see `OuterSearch` and the `Joint` threshold's
         // measurement further down). The joint solver's start radius follows
         // it: the whole search on `Joint`, a polish of stage 1's optimum otherwise.
+        let route_plan =
+            super::gradient_route_plan(family, nagq, layout, &groupings, n_theta, n_disp);
         let exact_shape = super::exact_profile_shape(nagq, layout);
         let outer_search = if exact_shape {
             OuterSearch::ExactProfile
@@ -1275,10 +1417,12 @@ impl GlmmWorkspace {
             nb_theta: f64::NAN,
             gamma_phi: 1.0,
             gamma_phi_held: None,
+            gamma_phi_start: None,
             nb_groups: Vec::new(),
             nagq,
             parallel_inner: false,
             cluster_rows: None,
+            agq_gd: None,
             k,
             p,
             n_theta,
@@ -1302,6 +1446,13 @@ impl GlmmWorkspace {
             lower_stage1,
             upper_stage1,
             outer_search,
+            route_plan,
+            bfgs: crate::optim::bfgs::BfgsState::default(),
+            grad_cfg: crate::optim::bfgs::BfgsConfig::GLMM,
+            grad_report: None,
+            grad_scratch: Vec::new(),
+            grad_hint_in: None,
+            grad_hint_ready: false,
             pirls: PirlsScratch::for_shape(max_n, k, q, n_primary, nagq).with_profile_rows(
                 if layout == GlmmLayout::Packed {
                     0
@@ -1318,13 +1469,19 @@ impl GlmmWorkspace {
             weight_scale: 1.0,
             u_seed: vec![0.0; k.max(1)],
             wx: Mat::zeros(max_n, p),
-            structured: StructuredScratch::for_shape(max_n, n_primary, q_core, e_crossed),
+            structured: StructuredScratch::for_shape(
+                max_n,
+                n_primary,
+                q_core,
+                e_crossed,
+                structured_layout,
+            ),
             pattern: StructuredPattern {
-                cross_col: vec![0u32; (max_n * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
-                n_cross: vec![0u8; max_n.max(1)],
-                coup_cols: vec![0u32; (max_n * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
+                cross_col: vec![0u32; (pattern_rows * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
+                n_cross: vec![0u8; pattern_rows.max(1)],
+                coup_cols: vec![0u32; (pattern_rows * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
                 coup_ptr: vec![0u32; n_primary + 1],
-                coup_pos: vec![0u32; (max_n * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
+                coup_pos: vec![0u32; (pattern_rows * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
                 coup_mask: None,
                 structured_schur: None,
                 force_dense_schur: false,
@@ -1395,11 +1552,15 @@ impl GlmmWorkspace {
                 warm_seed_active: false,
                 pirls_tol_override: None,
                 force_fd_hessian: false,
+                skip_agq_gradient_difference: false,
+                se_row_block: super::assembled::SE_ROW_BLOCK,
             },
             offset: None,
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
             exact_profile_fallback: false,
+            gradient_search_fallback: false,
+            grad_asm: None,
             best_objective: f64::INFINITY,
             non_finite_points: Vec::new(),
             counters: crate::counters::EvalCounters::new(),
@@ -1449,17 +1610,22 @@ pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
     // The sparse factor's pattern is a function of `m_cols`, so the worker
     // rebuilds its own over the copied columns whenever the source uses one;
     // the symbolic analysis is deterministic, so the worker's evaluations are
-    // bit-identical to the source's.
-    if src.packed.sparse.is_some() {
-        let width = w.packed.width;
-        w.packed.sparse = Some(Box::new(PackedSparse::build(
+    // bit-identical to the source's. `set_factor` sizes the worker's dense
+    // `a`/`a_chol` to the same choice as the source's (`from_groupings`
+    // allocates neither), so a dense-factored source gets dense-factored
+    // workers and a sparse-factored one never holds a dense `k×k` per worker.
+    let width = w.packed.width;
+    let sparse = src.packed.sparse.is_some().then(|| {
+        Box::new(PackedSparse::build(
             &w.packed.m_cols[..n * width],
             n,
             width,
             w.k,
             w.p,
-        )));
-    }
+        ))
+    });
+    let k = w.k;
+    w.packed.set_factor(sparse, k);
     let len = w.z_buf.len();
     w.z_buf.copy_from_slice(&src.z_buf[..len]);
     w.prior_w[..n].copy_from_slice(&src.prior_w[..n]);
@@ -1474,6 +1640,7 @@ pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
     w.nb_theta = src.nb_theta;
     w.gamma_phi = src.gamma_phi;
     w.gamma_phi_held = src.gamma_phi_held;
+    w.gamma_phi_start = src.gamma_phi_start;
     // FD seed state (joint_hessian_cov sets these before the grid).
     w.params.copy_from_slice(&src.params);
     w.fd = src.fd.clone();
@@ -1958,7 +2125,7 @@ pub(crate) fn fill_packed_cols_with(
         }
     }
     let (k, p) = (ws.k, ws.p);
-    ws.packed.sparse = match sparse {
+    let chosen = match sparse {
         Some(false) => None,
         None if k < PACKED_SPARSE_MIN_K => None,
         forced => {
@@ -1969,6 +2136,9 @@ pub(crate) fn fill_packed_cols_with(
             keep.then(|| Box::new(sp))
         }
     };
+    // The dense `k×k` pair exists only on the dense factor: sized here, where
+    // the choice is made, never in `for_shape`.
+    ws.packed.set_factor(chosen, k);
 }
 
 /// Per-fit hoist of the random-slope Z columns into `z_buf` (layout on the
@@ -2001,9 +2171,11 @@ pub(crate) fn fill_z_f64(g: &LmmGroupings, x: MatRef<f64>, z_buf: &mut [f64], n:
 /// `Σ_{r≥local} z_r·lam[r·q+local]`, the same reduction the blocked-path fill
 /// runs; nested `local≥q`: the nested indicator scaled by its
 /// θ). For each crossed grouping with `θ≠0`, the row's single active level
-/// contributes one nonzero: `cross_val = z·θ`, `cross_col = b` (the crossed
-/// block-local index, `0..e`), with `n_cross[i]` the count (`≤ G`). A θ-pinned
-/// (θ=0) grouping is skipped — its `z·θ` is 0, so it has no nonzero.
+/// contributes one nonzero: its value `z·θ` in slot `cnt` of `cross_theta`
+/// (`G_cap` slots, the same on every row, see `StructuredScratch`) and its
+/// column `cross_col[i·G_cap + cnt] = b` (the crossed block-local index,
+/// `0..e`), with `n_cross[i]` the count (`≤ G`). A θ-pinned (θ=0) grouping is
+/// skipped — its `z·θ` is 0, so it has no nonzero.
 /// Every RE-design value is reconstructed straight from the ids and `z_buf`:
 /// the primary core from `z_buf` (the pre-widened slope buffer `fill_z_f64`
 /// fills), the nested indicator and the crossed level from `extra_ids`
@@ -2019,7 +2191,7 @@ pub(crate) fn build_packed_m<T: crate::scalar::Scalar>(
     lam: &mut [T],
     cluster_ids: &[u32],
     m_core_buf: &mut [T],
-    cross_val: &mut [T],
+    cross_theta: &mut [T],
     cross_col: &mut [u32],
     n_cross: &mut [u8],
     n: usize,
@@ -2039,58 +2211,68 @@ pub(crate) fn build_packed_m<T: crate::scalar::Scalar>(
     // `None` when there is no nested grouping (`np == 0`, the loop below never
     // reads it then).
     let nested_decl = g.nested.map(|nf| nf.vech_start - base_theta);
+    // A minimal `m_core_buf` (the streamed SE pass, a dual scratch built by
+    // `GlmmDualScratch::for_shape_streamed`) means the caller forms each row
+    // block's core slice itself (`pirls::m_core_row`, the same arithmetic),
+    // so only the crossed nonzeros and the pattern are filled here. The `f64`
+    // workspace always holds the whole buffer, and `T::IS_F64` folds the test
+    // away on the search's own path.
+    let fill_core = T::IS_F64 || m_core_buf.len() >= n * qc;
     for i in 0..n {
         let f = cluster_ids[i] as usize;
-        // Core primary block: the identical `Σ_{r≥c} z_r·lam[r·q+c]` reduction
-        // that `glmm/pirls/blocked.rs`'s `pirls_solve_blocked` per-solve M fill runs
-        // (whose own comment records it as bit-identical to the z-sourced form) — z_r is
-        // 1.0 at r==0 (the RE intercept column) or the pre-widened slope
-        // value `z_buf[i·(q−1)+(r−1)]` otherwise.
-        for c in 0..q {
-            let mut acc = T::ZERO;
-            for r in c..q {
-                let zr = if r == 0 {
-                    T::ONE
-                } else {
-                    T::from_f64(z_buf[i * (q - 1) + (r - 1)])
-                };
-                acc += zr * lam[r * q + c];
+        if fill_core {
+            // Core primary block: the identical `Σ_{r≥c} z_r·lam[r·q+c]` reduction
+            // that `glmm/pirls/blocked.rs`'s `pirls_solve_blocked` per-solve M fill runs
+            // (whose own comment records it as bit-identical to the z-sourced form) — z_r is
+            // 1.0 at r==0 (the RE intercept column) or the pre-widened slope
+            // value `z_buf[i·(q−1)+(r−1)]` otherwise.
+            for c in 0..q {
+                let mut acc = T::ZERO;
+                for r in c..q {
+                    let zr = if r == 0 {
+                        T::ONE
+                    } else {
+                        T::from_f64(z_buf[i * (q - 1) + (r - 1)])
+                    };
+                    acc += zr * lam[r * q + c];
+                }
+                m_core_buf[i * qc + c] = acc;
             }
-            m_core_buf[i * qc + c] = acc;
-        }
-        // Core nested children of parent f: `extra_ids` stores the nested id
-        // GLOBAL (dense over all parents — see `GroupIds`'s doc), while the
-        // packed core slots are LOCAL to this row's own parent block, so the
-        // global id needs `f`'s own `f·np` prefix subtracted back off before
-        // it can be compared against the local `j`. The RE design carries a 1.0
-        // indicator at the row's own (global) nested id and 0.0 at every other
-        // slot, so the packed value is θ_nested at that one local `j` and
-        // `0.0 · theta_nested` everywhere else — kept as the multiply, not a
-        // bare `0.0` literal, so a transient negative θ (an FD-Hessian
-        // perturbation step, or an off-optimum BOBYQA trial — θ is only
-        // guaranteed ≥ 0 at the pinned post-fit point, not at every eval)
-        // still lands on the same `-0.0` the z-sourced form would have.
-        if np > 0 {
-            let global_id = extra_ids[nested_decl.expect("np > 0 ⇒ g.nested is Some")][i] as usize;
-            // Before the ids-based rewrite, a malformed id panicked on the z
-            // bounds check in every build profile; these two asserts keep at
-            // least the debug-profile tripwire now that `z` is never read here.
-            debug_assert!(
-                global_id >= f * np,
-                "row {i}: nested global id {global_id} underflows parent {f}'s block (f*np={})",
-                f * np
-            );
-            let local_id = global_id - f * np;
-            debug_assert!(
-                local_id < np,
-                "row {i}: nested local id {local_id} out of range (np={np})"
-            );
-            for j in 0..np {
-                m_core_buf[i * qc + q + j] = if j == local_id {
-                    theta_nested
-                } else {
-                    T::ZERO * theta_nested
-                };
+            // Core nested children of parent f: `extra_ids` stores the nested id
+            // GLOBAL (dense over all parents — see `GroupIds`'s doc), while the
+            // packed core slots are LOCAL to this row's own parent block, so the
+            // global id needs `f`'s own `f·np` prefix subtracted back off before
+            // it can be compared against the local `j`. The RE design carries a 1.0
+            // indicator at the row's own (global) nested id and 0.0 at every other
+            // slot, so the packed value is θ_nested at that one local `j` and
+            // `0.0 · theta_nested` everywhere else — kept as the multiply, not a
+            // bare `0.0` literal, so a transient negative θ (an FD-Hessian
+            // perturbation step, or an off-optimum BOBYQA trial — θ is only
+            // guaranteed ≥ 0 at the pinned post-fit point, not at every eval)
+            // still lands on the same `-0.0` the z-sourced form would have.
+            if np > 0 {
+                let global_id =
+                    extra_ids[nested_decl.expect("np > 0 ⇒ g.nested is Some")][i] as usize;
+                // Before the ids-based rewrite, a malformed id panicked on the z
+                // bounds check in every build profile; these two asserts keep at
+                // least the debug-profile tripwire now that `z` is never read here.
+                debug_assert!(
+                    global_id >= f * np,
+                    "row {i}: nested global id {global_id} underflows parent {f}'s block (f*np={})",
+                    f * np
+                );
+                let local_id = global_id - f * np;
+                debug_assert!(
+                    local_id < np,
+                    "row {i}: nested local id {local_id} out of range (np={np})"
+                );
+                for j in 0..np {
+                    m_core_buf[i * qc + q + j] = if j == local_id {
+                        theta_nested
+                    } else {
+                        T::ZERO * theta_nested
+                    };
+                }
             }
         }
         // Crossed: one nonzero per crossed grouping (its single active level), θ-pinned
@@ -2139,7 +2321,7 @@ pub(crate) fn build_packed_m<T: crate::scalar::Scalar>(
             let off = g.extra_offsets[e];
             let col = off + extra_ids[e][i] as usize;
             cross_col[i * g_cap + cnt] = (col - k_family) as u32;
-            cross_val[i * g_cap + cnt] = theta; // z·θ where z ≡ 1.0 exactly
+            cross_theta[cnt] = theta; // z·θ where z ≡ 1.0 exactly
             cnt += 1;
         }
         n_cross[i] = cnt as u8;
@@ -2165,7 +2347,7 @@ pub(crate) fn build_packed_m<T: crate::scalar::Scalar>(
 /// and KEEPS it at a dual `T`, so the packed row's width and column order
 /// differ between the two arms. Passing the matching flag makes the walk over
 /// `g.crossed` here reproduce that arm's walk exactly, so `cross_val_d[z]`
-/// pairs with the packed `cross_col[i*g_cap + z]` / `cross_val[i*g_cap + z]`
+/// pairs with the packed `cross_col[i*g_cap + z]` / `cross_theta[z]`
 /// for every `z < n_cross[i]`. Passing the wrong one both leaves the tail
 /// slots of `cross_val_d` unwritten — stale from the previous coordinate — and
 /// pairs every surviving grouping with another grouping's column.
@@ -2226,7 +2408,7 @@ pub(crate) fn packed_m_theta_deriv(
     }
     // The same two-arm pin rule as `build_packed_m`'s crossed loop — change
     // together. At `f64` a pinned (θ=0) crossed grouping gets no
-    // `cross_col`/`cross_val` slot there, so it must not consume one of
+    // `cross_col`/`cross_theta` slot there, so it must not consume one of
     // `cross_val_d`'s `z` positions here; at a dual `T` the column is kept, so
     // it must. Either way every grouping's derivative lands on the slot
     // holding the packed value it pairs with.
@@ -2300,7 +2482,7 @@ mod tests {
         let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
         let mut lam = vec![0.0; q * q];
         let mut m_core = vec![0.0; n * qc];
-        let mut cross_val = vec![0.0; n * g_cap];
+        let mut cross_theta = vec![0.0; g_cap];
         let mut cross_col = vec![0u32; n * g_cap];
         let mut n_cross = vec![0u8; n];
         let mut params: Vec<f64> = (0..n_theta).map(|k| 0.4 + 0.1 * k as f64).collect();
@@ -2317,7 +2499,7 @@ mod tests {
                 &mut lam,
                 &ids,
                 &mut m_core,
-                &mut cross_val,
+                &mut cross_theta,
                 &mut cross_col,
                 &mut n_cross,
                 n,
@@ -2332,7 +2514,7 @@ mod tests {
                 &mut lam,
                 &ids,
                 &mut m_core,
-                &mut cross_val,
+                &mut cross_theta,
                 &mut cross_col,
                 &mut n_cross,
                 n,
@@ -2383,7 +2565,7 @@ mod tests {
         let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
         let mut lam = vec![0.0; q * q];
         let mut m_core = vec![0.0; n * qc];
-        let mut cross_val = vec![0.0; n * g_cap];
+        let mut cross_theta = vec![0.0; g_cap];
         let mut cross_col = vec![0u32; n * g_cap];
         let mut n_cross = vec![0u8; n];
         let mut params: Vec<f64> = (0..n_theta).map(|k| 0.3 + 0.05 * k as f64).collect();
@@ -2400,13 +2582,13 @@ mod tests {
                 &mut lam,
                 &ids,
                 &mut m_core,
-                &mut cross_val,
+                &mut cross_theta,
                 &mut cross_col,
                 &mut n_cross,
                 n,
             );
             let m_plus = m_core.clone();
-            let cv_plus = cross_val.clone();
+            let cv_plus = cross_theta.clone();
             params[a] = base - eps;
             build_packed_m(
                 &g,
@@ -2416,13 +2598,13 @@ mod tests {
                 &mut lam,
                 &ids,
                 &mut m_core,
-                &mut cross_val,
+                &mut cross_theta,
                 &mut cross_col,
                 &mut n_cross,
                 n,
             );
             let m_minus = m_core.clone();
-            let cv_minus = cross_val.clone();
+            let cv_minus = cross_theta.clone();
             params[a] = base;
 
             let mut m_core_d = vec![0.0; qc];
@@ -2454,7 +2636,7 @@ mod tests {
                     "no pinning on this fixture"
                 );
                 for z in 0..g.crossed.len() {
-                    let want = (cv_plus[i * g_cap + z] - cv_minus[i * g_cap + z]) / (2.0 * eps);
+                    let want = (cv_plus[z] - cv_minus[z]) / (2.0 * eps);
                     assert!(
                         (cross_val_d[z] - want).abs() < 1e-8,
                         "a={a} i={i} z={z}: deriv {} vs central diff {want}",
@@ -2525,7 +2707,7 @@ mod tests {
         let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
         let mut lam = vec![0.0; q * q];
         let mut m_core = vec![0.0; n * qc];
-        let mut cross_val = vec![0.0; n * g_cap];
+        let mut cross_theta = vec![0.0; g_cap];
         let mut cross_col = vec![0u32; n * g_cap];
         let mut n_cross = vec![0u8; n];
         let cross1_theta = g.crossed[0].vech_start;
@@ -2544,7 +2726,7 @@ mod tests {
             &mut lam,
             &ids,
             &mut m_core,
-            &mut cross_val,
+            &mut cross_theta,
             &mut cross_col,
             &mut n_cross,
             n,
@@ -2569,12 +2751,12 @@ mod tests {
             &mut lam,
             &ids,
             &mut m_core,
-            &mut cross_val,
+            &mut cross_theta,
             &mut cross_col,
             &mut n_cross,
             n,
         );
-        let cv_plus = cross_val.clone();
+        let cv_plus = cross_theta.clone();
         params[cross2_theta] = 0.7 - eps;
         build_packed_m(
             &g,
@@ -2584,18 +2766,18 @@ mod tests {
             &mut lam,
             &ids,
             &mut m_core,
-            &mut cross_val,
+            &mut cross_theta,
             &mut cross_col,
             &mut n_cross,
             n,
         );
-        let cv_minus = cross_val.clone();
+        let cv_minus = cross_theta.clone();
         params[cross2_theta] = 0.7;
 
         let mut m_core_d = vec![0.0; qc];
         for &i in &[0usize, 1, n - 1] {
             assert_eq!(n_cross[i] as usize, 1);
-            let want = (cv_plus[i * g_cap] - cv_minus[i * g_cap]) / (2.0 * eps);
+            let want = (cv_plus[0] - cv_minus[0]) / (2.0 * eps);
             let mut active_d = vec![0.0; 1];
             packed_m_theta_deriv(
                 &g,
@@ -2643,7 +2825,7 @@ mod tests {
         let params_d: Vec<Dual<1>> = params.iter().map(|&v| Dual::<1> { v, d: [0.0] }).collect();
         let mut lam_d = vec![Dual::<1> { v: 0.0, d: [0.0] }; q * q];
         let mut m_core_dual = vec![Dual::<1> { v: 0.0, d: [0.0] }; n * qc];
-        let mut cross_val_dual = vec![Dual::<1> { v: 0.0, d: [0.0] }; n * g_cap];
+        let mut cross_val_dual = vec![Dual::<1> { v: 0.0, d: [0.0] }; g_cap];
         let mut cross_col_dual = vec![0u32; n * g_cap];
         let mut n_cross_dual = vec![0u8; n];
         build_packed_m(
@@ -2674,8 +2856,8 @@ mod tests {
                     "i={i} slot {decl}: declaration order"
                 );
             }
-            assert_eq!(cross_val_dual[i * g_cap].v, 0.0, "i={i}: pinned θ is 0");
-            assert_eq!(cross_val_dual[i * g_cap + 1].v, 0.7, "i={i}: active θ");
+            assert_eq!(cross_val_dual[0].v, 0.0, "i={i}: pinned θ is 0");
+            assert_eq!(cross_val_dual[1].v, 0.7, "i={i}: active θ");
 
             packed_m_theta_deriv(
                 &g,

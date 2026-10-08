@@ -90,10 +90,13 @@ pub enum Family {
         /// Link function — log only (canonical).
         link: PoissonLink,
     },
-    /// Gamma response (`y>0`) → GLM/GLMM. Variance `V(μ)=μ²`. Dispersion `φ` is
-    /// estimated by maximum likelihood — post-fit on a GLM (`MASS::gamma.shape`'s
-    /// equation), as a coordinate of the Laplace objective on a GLMM — and scales
-    /// the SE by `√φ̂`. Validated against R `glm(family=Gamma(link))` at the ML φ̂
+    /// Gamma response (`y>0`) → GLM/GLMM. Variance `V(μ)=μ²`. On a GLM the
+    /// reported dispersion `φ̂` is the Pearson moment (`summary(glm)$dispersion`),
+    /// and it is the one that scales the SE by `√φ̂`; the maximum-likelihood φ̂
+    /// (`MASS::gamma.shape`'s equation) enters the log-likelihood only. On a GLMM
+    /// `φ` is a coordinate of the Laplace objective, estimated by maximum
+    /// likelihood, reported as `φ̂`, and carried into the SE through the PIRLS
+    /// weights `wᵢ/φ̂`. Validated against R `glm(family=Gamma(link))` at the ML φ̂
     /// and glmmTMB (validation goldens `sim_gamma_*_ml` and `*_tmb`).
     Gamma {
         /// Link function — [`GammaLink::Log`] (safe default) or `Inverse`. The

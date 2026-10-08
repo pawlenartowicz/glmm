@@ -1443,6 +1443,7 @@ fn fit_warm_sparse_wide_crossed_matches_cold_optimum() {
             crate::StartValues {
                 beta: cold.beta.clone(),
                 theta: truth,
+                dispersion: None,
             },
         ),
         // θ̂ spans ≈ [0.7, 1.6]; 3.0 everywhere is well off every coordinate.
@@ -1451,6 +1452,7 @@ fn fit_warm_sparse_wide_crossed_matches_cold_optimum() {
             crate::StartValues {
                 beta: vec![0.0; p],
                 theta: vec![3.0; 8],
+                dispersion: None,
             },
         ),
     ];
@@ -1557,13 +1559,23 @@ fn run_sparse_vs_noz_cross_check_table() {
             noz.varcorr.len(),
             "{label}: varcorr block count"
         );
+        // The dense kernel searches the per-group route's shape with BFGS
+        // (since 0.5.0), the sparse kernel with BOBYQA, so there the two
+        // endpoints agree to the optimizers' tolerance rather than to one
+        // search path: on `primary_random_slope_q2` the deviances differ by
+        // 3.4e-11 (BFGS above) and varcorr by 1.2e-6 (x86, 2026-10-07).
+        let band = if *label == "primary_random_slope_q2" {
+            1e-5
+        } else {
+            1e-6
+        };
         for (a, b) in sp
             .varcorr
             .iter()
             .flatten()
             .zip(noz.varcorr.iter().flatten())
         {
-            assert!((a - b).abs() < 1e-6, "{label} varcorr: sparse={a} noz={b}");
+            assert!((a - b).abs() < band, "{label} varcorr: sparse={a} noz={b}");
         }
     }
 }
@@ -2157,9 +2169,18 @@ fn crossover_worst_cell_deviance_parity() {
 /// 1.38e-6 (`se[1]`) from architecture-dependent SIMD/FMA contraction on this
 /// kernel's long reductions. ~36x that: loose enough to absorb cross-arch
 /// reassociation, tight enough that a real change in the fit still trips it.
+///
+/// Re-measured 2026-10-07 on aarch64-apple-darwin (Apple M4) against the 0.5.0
+/// tree: beta 9.9e-8, se 1.3e-6, gp varcorr 5.0e-6, sigma2 2.3e-7, but the `ge`
+/// block's smallest entry (vech[13], 0.00838) drifts 5.06e-5 relative (4.2e-7
+/// absolute), just over `BAND`. That entry is small, so its relative drift is
+/// large; the `ge` block gets its own band at 4x its measured drift, and every
+/// other quantity keeps `BAND`. The anchor values are unchanged and still
+/// reproduce bit-exactly on the anchor machine.
 #[test]
 fn fit_wide_slopes_sparse_is_pinned() {
     const BAND: f64 = 5e-5;
+    const BAND_VC_GE: f64 = 2e-4;
     const REF_BETA: [f64; 5] = [
         1.705945746018679,
         0.6799307257661724,
@@ -2274,7 +2295,7 @@ fn fit_wide_slopes_sparse_is_pinned() {
     // each block the column-major lower-triangle vech of D̂ = σ̂²Λ̂Λ̂'.
     assert_eq!(f.varcorr.len(), 2, "two varcomp blocks (gp + ge)");
     assert_pinned(&f.varcorr[0], &[REF_VC_GP], BAND, "gp varcorr");
-    assert_pinned(&f.varcorr[1], &REF_VC_GE, BAND, "ge varcorr");
+    assert_pinned(&f.varcorr[1], &REF_VC_GE, BAND_VC_GE, "ge varcorr");
     assert_pinned(&[f.dispersion], &[REF_SIGMA2], BAND, "sigma2");
 }
 
@@ -2926,6 +2947,7 @@ fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
     let both_empty = crate::StartValues {
         beta: vec![],
         theta: vec![],
+        dispersion: None,
     };
     let empty = crate::fit_warm(&x, &y, n, p, &model, &ids, Some(&both_empty), &opts);
     // Bitwise (not PartialEq): non-target SE slots are NaN and NaN != NaN.
@@ -2942,6 +2964,7 @@ fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
             crate::StartValues {
                 beta: vec![],
                 theta: theta_hat,
+                dispersion: None,
             },
         ),
         (
@@ -2949,6 +2972,7 @@ fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
             crate::StartValues {
                 beta: cold.beta.clone(),
                 theta: vec![],
+                dispersion: None,
             },
         ),
     ];

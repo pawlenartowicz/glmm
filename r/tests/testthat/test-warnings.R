@@ -44,7 +44,7 @@ test_that("argument_ignored is stored and printed, one text per case", {
     list(args = list(init.theta = 1.5),
          msg = "init.theta= is not used for family 'gaussian'."),
     list(args = list(start = list(beta = c(0, 0), phi = 1, b = 2)),
-         msg = "start accepts only 'beta' and 'theta'; these entries were ignored: phi, b.")
+         msg = "start accepts only 'beta', 'theta' and 'dispersion'; these entries were ignored: phi, b.")
   )
   for (case in cases) {
     got <- fit_catching(do.call(fastglmm, c(list(y ~ x, FIXED), case$args)),
@@ -118,6 +118,11 @@ test_that("constructed notes store with their tier and title", {
                      "estimates, and the fixed effects that depend on them, may be off by a",
                      "tenth of a standard error or more. This happens with counts in the",
                      "billions or more, or when a model misses a large effect in such data.")),
+    list(note = modifyList(base, list(kind = "gradient_search_fallback")),
+         cls = "fastglmm_gradient_search_fallback",
+         msg = paste("The fast search for this model did not settle on an answer, so the",
+                     "fit finished with the standard search from the best point it had",
+                     "reached. The reported estimates come from that search.")),
     list(note = modifyList(base, list(kind = "exact_profile_fallback")),
          cls = "fastglmm_exact_profile_fallback",
          msg = paste("The default search method for this model did not settle on an answer,",
@@ -436,6 +441,7 @@ test_that("the kind table matches the Python port", {
     hessian_se_fallback = c("caution", "Simpler standard errors used"),
     se_unavailable = c("caution", "Standard errors not computed"),
     exact_profile_fallback = c("caution", "Search retried with a different method"),
+    gradient_search_fallback = c("caution", "Search finished by another method"),
     precision_limited = c("caution", "Numbers too large for full precision"),
     agq_fallback = c("caution", "Adaptive quadrature not used"),
     non_integer_response = c("caution", "Non-integer response"),

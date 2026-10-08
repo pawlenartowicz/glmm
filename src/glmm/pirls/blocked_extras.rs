@@ -115,6 +115,37 @@ impl TailKernel for f64 {
             // only measured boundary; no qc>1 GLMM structured cell exists in
             // the grid. Sizing of the panel buffers mirrors this condition in
             // `StructuredSchur::new` — change together.
+            if qc == 1 {
+                // Rank-1 at qc == 1: S[a,b] −= c_a·y_b with y_b = (c_b/l)/l,
+                // the two divisions `glmm_block_solve` performs on a 1×1
+                // factor. Each entry receives exactly one term per call, so
+                // walking row `a` outer (one contiguous row of `schur`) and
+                // `b ≤ a` inner (cols ascending ⇒ jb ≤ ja) changes no sum:
+                // bit-identical to the column walk below. The `0.0 +` keeps
+                // that walk's `acc = 0.0; acc += …` sign-of-zero behaviour.
+                // `y` is staged in fixed stack chunks so wide clusters need
+                // no heap.
+                const CHUNK: usize = 256;
+                let l = core_l[0];
+                let coup = &coup[..e_f];
+                let mut ybuf = [0.0_f64; CHUNK];
+                for c0 in (0..e_f).step_by(CHUNK) {
+                    let c1 = (c0 + CHUNK).min(e_f);
+                    let yb = &mut ybuf[..c1 - c0];
+                    for (y, &c) in yb.iter_mut().zip(&coup[c0..c1]) {
+                        *y = c / l / l;
+                    }
+                    for (ja, (&a, &ca)) in cols.iter().zip(coup).enumerate().skip(c0) {
+                        let a = a as usize;
+                        let row = &mut schur[a * e..a * e + a + 1];
+                        let hi = (ja + 1).min(c1);
+                        for (&b, &y) in cols[c0..hi].iter().zip(&yb[..hi - c0]) {
+                            row[b as usize] -= 0.0 + ca * y;
+                        }
+                    }
+                }
+                return;
+            }
             let mut ycol = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
             for (jb, &b) in cols.iter().enumerate() {
                 let b = b as usize;
@@ -651,9 +682,11 @@ pub(crate) struct StructuredFactor<'a, T> {
     pub(crate) mu: &'a mut [T],
     /// Row-major `n×q_core`: `M`'s core slice per row.
     pub(crate) m_core_buf: &'a [T],
-    /// `M`'s crossed values, `n×MAX_EXTRA_GROUPINGS`, `n_cross[i]` live per row.
-    pub(crate) cross_val: &'a [T],
-    /// Crossed column of each live `cross_val` entry, same indexing.
+    /// `M`'s crossed values, one per slot (`StructuredScratch::cross_theta`):
+    /// slot `z` of every row holds the same value.
+    pub(crate) cross_theta: &'a [T],
+    /// Crossed column of each row's live slots, `n×MAX_EXTRA_GROUPINGS`,
+    /// `n_cross[i]` live per row.
     pub(crate) cross_col: &'a [u32],
     /// Live crossed entries per row.
     pub(crate) n_cross: &'a [u8],
@@ -676,9 +709,9 @@ pub(crate) struct StructuredFactor<'a, T> {
 
 impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
     fn eta_from_mode(&mut self, u: &[T], eta_fixed: &[T], eta: &mut [T], y: &[f64], n: usize) -> T {
-        let (m_core_buf, cross_val, cross_col, n_cross) = (
+        let (m_core_buf, cross_theta, cross_col, n_cross) = (
             self.m_core_buf,
-            self.cross_val,
+            self.cross_theta,
             self.cross_col,
             self.n_cross,
         );
@@ -707,7 +740,7 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
             let cbase = i * g_cap;
             for z in 0..n_cross[i] as usize {
                 let b = cross_col[cbase + z] as usize;
-                mui += cross_val[cbase + z] * u[k_family + b];
+                mui += cross_theta[z] * u[k_family + b];
             }
             eta[i] = eta_fixed[i] + mui;
             yeta += T::from_f64(y[i]) * eta[i];
@@ -733,7 +766,7 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
             a_rhs,
             mu,
             m_core_buf,
-            cross_val,
+            cross_theta,
             cross_col,
             n_cross,
             coup_ptr,
@@ -753,7 +786,8 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
         let k = k_family + e;
         // Row score ρᵢ, so the scattered RHS is M'ρ, the u-step's increment
         // right-hand side before its `− u` (see `pirls_solve_blocked`). Logit's
-        // ρ = (y−p); the general branch's is (dμ/dη)·(y−μ)/V.
+        // ρ = (y−p); the general branch's is (dμ/dη)·(y−μ)/V (probit's through
+        // `family::ProbitRows`).
         match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
@@ -762,13 +796,20 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
                     mu[i] = T::from_f64(y[i]) - prob[i];
                 }
             }
-            other => {
-                for i in 0..n {
-                    mu[i] = crate::family::row_score(
-                        other, nb_theta, y[i], prior_w[i], eta[i], prob[i],
-                    );
+            other => match crate::family::ProbitRows::new(other, eta, prob) {
+                Some(mut rows) => {
+                    for i in 0..n {
+                        mu[i] = T::from_f64(rows.score(i, y[i], prior_w[i]));
+                    }
                 }
-            }
+                None => {
+                    for i in 0..n {
+                        mu[i] = crate::family::row_score(
+                            other, nb_theta, y[i], prior_w[i], eta[i], prob[i],
+                        );
+                    }
+                }
+            },
         }
         // --- scatter — wᵢmᵢmᵢ' into D_f/C_f/E (lower tri), rᵢmᵢ into g ---
         for v in core_blocks[..s * qc * qc].iter_mut() {
@@ -828,19 +869,18 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
                     core_blocks[cb + r * qc + c] += wmr * m_core[c];
                 }
                 for z in 0..ncz {
-                    coupling[coup + r * nc + coup_pos[cbase + z] as usize] +=
-                        wmr * cross_val[cbase + z];
+                    coupling[coup + r * nc + coup_pos[cbase + z] as usize] += wmr * cross_theta[z];
                 }
             }
             for z in 0..ncz {
                 let b = cross_col[cbase + z] as usize;
-                let vb = cross_val[cbase + z];
+                let vb = cross_theta[z];
                 a_rhs[k_family + b] += vb * ri;
                 let wvb = wi * vb;
                 for z2 in 0..ncz {
                     let b2 = cross_col[cbase + z2] as usize;
                     if b2 <= b {
-                        schur_blk[b * e + b2] += wvb * cross_val[cbase + z2];
+                        schur_blk[b * e + b2] += wvb * cross_theta[z2];
                     }
                 }
             }
@@ -859,17 +899,17 @@ impl<T: TailKernel> LaplaceFactor<T> for StructuredFactor<'_, T> {
                     }
                     for z in 0..ncz {
                         d.obs_coupling[coup + r * nc + coup_pos[cbase + z] as usize] +=
-                            wmr * cross_val[cbase + z];
+                            wmr * cross_theta[z];
                     }
                 }
                 for z in 0..ncz {
                     let b = cross_col[cbase + z] as usize;
-                    let vb = cross_val[cbase + z];
+                    let vb = cross_theta[z];
                     let wvb = wo * vb;
                     for z2 in 0..ncz {
                         let b2 = cross_col[cbase + z2] as usize;
                         if b2 <= b {
-                            d.obs_schur_blk[b * e + b2] += wvb * cross_val[cbase + z2];
+                            d.obs_schur_blk[b * e + b2] += wvb * cross_theta[z2];
                         }
                     }
                 }
@@ -1061,7 +1101,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         coupling,
         schur_blk,
         m_core_buf,
-        cross_val,
+        cross_theta,
     } = structured;
     let StructuredPattern {
         cross_col,
@@ -1106,7 +1146,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         a_rhs: &mut a_rhs[..],
         mu: &mut mu[..],
         m_core_buf: &m_core_buf[..],
-        cross_val: &cross_val[..],
+        cross_theta: &cross_theta[..],
         cross_col: &cross_col[..],
         n_cross: &n_cross[..],
         coup_cols: &coup_cols[..],
@@ -1593,21 +1633,43 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 // `tail_inv[b·e + a] = (S⁻¹)_{a,b}`. Both are per-ITERATION objects,
                 // not per-fit: `S` is a function of `W`, so `tail_inv` above is
                 // rebuilt every exact-mode iteration and these follow it.
+                // Bitwise symmetry of `S⁻¹`: the per-component dense inverse
+                // mirrors one triangle, the unit-solve arms do not. `e²`
+                // compares against the `Σ_f |cols_f|²` build below.
+                let tail_sym = (0..e).all(|a| {
+                    (0..a).all(|b| tail_inv[a * e + b].to_bits() == tail_inv[b * e + a].to_bits())
+                });
                 for f in 0..s {
                     let cols = &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize];
                     if cols.is_empty() {
                         continue;
                     }
                     let (hb, nc) = (qc * coup_ptr[f] as usize, cols.len());
+                    // `H_f[l][j] = Σ_ja C_f[l][ja]·(S⁻¹)_{cols[ja],cols[j]}`,
+                    // `ja` outer so the `nc` outputs of a row are independent
+                    // accumulators instead of one serial chain each. Every
+                    // output still sums the same products from 0.0 in
+                    // ascending `ja`: bit-identical to the `j`-outer dot.
+                    // When `S⁻¹` is bitwise symmetric (`tail_sym`), the factor
+                    // is read as `(S⁻¹)_{cols[j],a}` from column `a` instead,
+                    // the same bits from one contiguous `e`-long column rather
+                    // than a stride-`e` walk.
                     for l in 0..qc {
-                        for (j, &b) in cols.iter().enumerate() {
-                            let b = b as usize;
-                            let mut acc = 0.0;
-                            for (ja, &a) in cols.iter().enumerate() {
-                                let a = a as usize;
-                                acc += cpl(hb + l * nc + ja) * tail_inv[b * e + a];
+                        let crow = &coupling[hb + l * nc..hb + (l + 1) * nc];
+                        let hrow = &mut tail_h[hb + l * nc..hb + (l + 1) * nc];
+                        hrow.fill(0.0);
+                        for (&a, c) in cols.iter().zip(crow) {
+                            let (a, c) = (a as usize, c.value());
+                            if tail_sym {
+                                let col = &tail_inv[a * e..a * e + e];
+                                for (h, &b) in hrow.iter_mut().zip(cols) {
+                                    *h += c * col[b as usize];
+                                }
+                            } else {
+                                for (h, &b) in hrow.iter_mut().zip(cols) {
+                                    *h += c * tail_inv[b as usize * e + a];
+                                }
                             }
-                            tail_h[hb + l * nc + j] = acc;
                         }
                     }
                     let gb = f * qc * qc;
@@ -1630,6 +1692,12 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 // k×p `dũ/dβ`.
                 let mut mc = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
                 let mut yc = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
+                // Probit `dW_obs/dη` off a φ tile (`family::ProbitRows`).
+                let mut probit_rows = if exact_obj {
+                    crate::family::ProbitRows::new(family, eta, prob)
+                } else {
+                    None
+                };
                 for i in 0..n {
                     let f = cluster_ids[i] as usize;
                     let cb = f * qc * qc;
@@ -1670,10 +1738,11 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                             qc,
                             &tail_g[gb..gb + qc * qc],
                             &tail_h[hb..hb + qc * cols.len()],
-                            cols,
+                            cols.len(),
                             e,
                             &cross_col[cbase..cbase + ncz],
-                            &cross_val[cbase..cbase + ncz],
+                            &coup_pos[cbase..cbase + ncz],
+                            &cross_theta[..ncz],
                             &tail_inv[..],
                         );
                         let mut acc = t_gg;
@@ -1692,8 +1761,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                                 tail_r[b] = acc;
                             }
                             for z in 0..ncz {
-                                tail_r[cross_col[cbase + z] as usize] -=
-                                    cross_val[cbase + z].value();
+                                tail_r[cross_col[cbase + z] as usize] -= cross_theta[z].value();
                             }
                             let h_ref =
                                 tail_quadratic_form(h_core, &tail_inv[..], e, cols, &tail_r[..]);
@@ -1711,16 +1779,19 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     }
                     // `hᵢ` is kept for the border's curvature
                     // (`logdet_beta_curvature`).
-                    let wp = super::row_weight_eta_deriv(
-                        family,
-                        nb_theta,
-                        exact_obj,
-                        y[i],
-                        prior_w[i],
-                        eta[i].value(),
-                        prob[i].value(),
-                        w[i].value(),
-                    );
+                    let wp = match probit_rows.as_mut() {
+                        Some(rows) => rows.observed_weight_eta_deriv(i, y[i], prior_w[i]),
+                        None => super::row_weight_eta_deriv(
+                            family,
+                            nb_theta,
+                            exact_obj,
+                            y[i],
+                            prior_w[i],
+                            eta[i].value(),
+                            prob[i].value(),
+                            w[i].value(),
+                        ),
+                    };
                     curv_h[i] = h;
                     let a = wp * h;
                     for j in 0..p {
@@ -1735,7 +1806,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     }
                     for z in 0..ncz {
                         let b = cross_col[cbase + z] as usize;
-                        logdet_u[k_family + b] += a * cross_val[cbase + z].value();
+                        logdet_u[k_family + b] += a * cross_theta[z].value();
                     }
                 }
                 // Mode-consistency term for the merit below, formed here because
@@ -1791,7 +1862,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     }
                     for z in 0..n_cross[i] as usize {
                         let b = cross_col[cbase + z] as usize;
-                        sdot += cross_val[cbase + z].value() * logdet_u[k_family + b];
+                        sdot += cross_theta[z].value() * logdet_u[k_family + b];
                     }
                     curv_sdot[i] = sdot;
                     let a = w[i].value() * sdot;
@@ -1920,7 +1991,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                 super::blocked::structured_border_rows(
                     &w[..],
                     &m_core_buf[..],
-                    &cross_val[..],
+                    &cross_theta[..],
                     &cross_col[..],
                     &n_cross[..],
                     cluster_ids,
@@ -1960,7 +2031,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                         }
                         for z in 0..ncz {
                             let b = cross_col[cbase + z] as usize;
-                            xtwm[(r, k_family + b)] += xw * cross_val[cbase + z].value();
+                            xtwm[(r, k_family + b)] += xw * cross_theta[z].value();
                         }
                     }
                 }
@@ -2019,24 +2090,16 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                             * ainv_mtwx[(core_col(f, local), col)];
                     }
                     for z in 0..ncz {
-                        r -= cross_val[cbase + z].value()
+                        r -= cross_theta[z].value()
                             * ainv_mtwx[(k_family + cross_col[cbase + z] as usize, col)];
                     }
                     wx[(i, col)] = r;
                 }
             }
+            let scores = super::ProfileScores::new(family, nb_theta, y, prior_w, eta, prob);
             residual_border(
                 |i| w[i].value(),
-                |i| {
-                    profile_row_score(
-                        family,
-                        nb_theta,
-                        y[i],
-                        prior_w[i],
-                        eta[i].value(),
-                        prob[i].value(),
-                    )
-                },
+                |i| scores.at(i),
                 wx.as_ref().subrows(0, n),
                 ainv_mtwx.as_ref().subrows(0, k),
                 |j| u_prev[j].value(),
@@ -2059,7 +2122,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                         g,
                         Some(&CrossedTail {
                             cross_col: &cross_col[..],
-                            cross_val: &cross_val[..],
+                            cross_theta: &cross_theta[..],
                             n_cross: &n_cross[..],
                             e,
                         }),
@@ -2204,6 +2267,684 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
     (dev, pen, logdet, converged)
 }
 
+// ===================== Streamed SE pass: streamed structured dual solve =====================
+
+/// Streamed SE pass: block-sized per-row dual buffers for the streamed
+/// structured SE pass. Every per-row value (`η`, `p`, `w`, `ρ`, the core `M`
+/// slice) is formed for one contiguous row block, consumed, and dropped; the
+/// cluster-level and pair-level accumulators stay whole.
+pub(crate) struct StreamRows<T> {
+    pub(crate) block: usize,
+    pub(crate) eta: Vec<T>,
+    pub(crate) prob: Vec<T>,
+    pub(crate) w: Vec<T>,
+    pub(crate) mu: Vec<T>,
+    pub(crate) mc: Vec<T>,
+    pub(crate) lam: Vec<T>,
+}
+
+impl<T: Scalar> StreamRows<T> {
+    pub(crate) fn new(block: usize, qc: usize, q: usize) -> Self {
+        Self {
+            block,
+            eta: vec![T::ZERO; block],
+            prob: vec![T::ZERO; block],
+            w: vec![T::ZERO; block],
+            mu: vec![T::ZERO; block],
+            mc: vec![T::ZERO; block * qc],
+            lam: vec![T::ZERO; q * q],
+        }
+    }
+}
+
+/// `build_packed_m`'s core slice for one row, the same arithmetic.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn m_core_row<T: Scalar>(
+    g: &crate::lmm::LmmGroupings,
+    lam: &[T],
+    theta_nested: T,
+    nested_decl: Option<usize>,
+    z_buf: &[f64],
+    extra_ids: &[Vec<u32>],
+    f: usize,
+    i: usize,
+    out: &mut [T],
+) {
+    let q = g.primary_q;
+    let np = g.nested_per_parent;
+    for c in 0..q {
+        let mut acc = T::ZERO;
+        for r in c..q {
+            let zr = if r == 0 {
+                T::ONE
+            } else {
+                T::from_f64(z_buf[i * (q - 1) + (r - 1)])
+            };
+            acc += zr * lam[r * q + c];
+        }
+        out[c] = acc;
+    }
+    if np > 0 {
+        let global_id = extra_ids[nested_decl.expect("np > 0")][i] as usize;
+        let local_id = global_id - f * np;
+        for j in 0..np {
+            out[q + j] = if j == local_id {
+                theta_nested
+            } else {
+                T::ZERO * theta_nested
+            };
+        }
+    }
+}
+
+/// Rows `[i0, i1)` at the iterate `u`: `η` (the `refresh_eta_fixed` +
+/// `eta_from_mode` arithmetic), the family pass, and on `observed_conv` the
+/// `evaluate_at_mode` conversion of `w` to `W_obs`. Returns the block's
+/// deviance and the infeasible flag.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_fill<T: TailKernel>(
+    sr: &mut StreamRows<T>,
+    g: &crate::lmm::LmmGroupings,
+    theta_nested: T,
+    nested_decl: Option<usize>,
+    z_buf: &[f64],
+    extra_ids: &[Vec<u32>],
+    cluster_ids: &[u32],
+    cross_theta: &[T],
+    cross_col: &[u32],
+    n_cross: &[u8],
+    x: MatRef<f64>,
+    beta: &[T],
+    offset: Option<&[f64]>,
+    u: &[T],
+    family: Family,
+    nb_theta: f64,
+    y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
+    i0: usize,
+    i1: usize,
+    observed_conv: bool,
+) -> (T, bool) {
+    let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
+    let q = g.primary_q;
+    let np = g.nested_per_parent;
+    let qc = q + np;
+    let s = g.n_primary;
+    let prim_width = q * s;
+    let k_family = qc * s;
+    let p = beta.len();
+    let nb = i1 - i0;
+    let StreamRows {
+        eta,
+        prob,
+        w,
+        mc,
+        lam,
+        ..
+    } = sr;
+    let mut yeta = T::ZERO;
+    for t in 0..nb {
+        let i = i0 + t;
+        let f = cluster_ids[i] as usize;
+        let mut ef = T::ZERO;
+        for j in 0..p {
+            ef += T::from_f64(x[(i, j)]) * beta[j];
+        }
+        if let Some(o) = offset {
+            ef += T::from_f64(o[i]);
+        }
+        let mrow = &mut mc[t * qc..t * qc + qc];
+        m_core_row(
+            g,
+            lam,
+            theta_nested,
+            nested_decl,
+            z_buf,
+            extra_ids,
+            f,
+            i,
+            mrow,
+        );
+        let mut mui = T::ZERO;
+        #[allow(clippy::needless_range_loop)]
+        for local in 0..qc {
+            let col = if local < q {
+                f * q + local
+            } else {
+                prim_width + f * np + (local - q)
+            };
+            mui += mrow[local] * u[col];
+        }
+        let cbase = i * g_cap;
+        for z in 0..n_cross[i] as usize {
+            let b = cross_col[cbase + z] as usize;
+            mui += cross_theta[z] * u[k_family + b];
+        }
+        eta[t] = ef + mui;
+        yeta += T::from_f64(y[i]) * eta[t];
+    }
+    let (d, infeasible) = T::family_pass(
+        family,
+        nb_theta,
+        &mut eta[..nb],
+        &y[i0..i1],
+        &prior_w[i0..i1],
+        weighted,
+        yeta,
+        &mut prob[..nb],
+        &mut w[..nb],
+        &mut [],
+    );
+    if observed_conv {
+        observed_weights_in_place(
+            family,
+            nb_theta,
+            &y[i0..i1],
+            &prior_w[i0..i1],
+            &eta[..nb],
+            &prob[..nb],
+            &mut w[..nb],
+            nb,
+        );
+    }
+    (d, infeasible)
+}
+
+/// `StructuredFactor::scatter`'s accumulator clear, split off so the streamed
+/// sweep clears once and scatters block by block.
+#[allow(clippy::too_many_arguments)]
+fn stream_zero<T: Scalar>(
+    qc: usize,
+    s: usize,
+    e: usize,
+    k: usize,
+    coup_ptr: &[u32],
+    core_blocks: &mut [T],
+    coupling: &mut [T],
+    schur_blk: &mut [T],
+    a_rhs: &mut [T],
+    dual: Option<&mut DualStep<T>>,
+) {
+    for v in core_blocks[..s * qc * qc].iter_mut() {
+        *v = T::ZERO;
+    }
+    let coup_end = qc * coup_ptr[s] as usize;
+    for v in coupling[..coup_end].iter_mut() {
+        *v = T::ZERO;
+    }
+    for v in schur_blk[..e * e].iter_mut() {
+        *v = T::ZERO;
+    }
+    for v in a_rhs[..k].iter_mut() {
+        *v = T::ZERO;
+    }
+    if let Some(d) = dual.filter(|d| d.observed) {
+        for v in d.obs_core_blocks[..s * qc * qc].iter_mut() {
+            *v = T::ZERO;
+        }
+        for v in d.obs_coupling[..coup_end].iter_mut() {
+            *v = T::ZERO;
+        }
+        for v in d.obs_schur_blk[..e * e].iter_mut() {
+            *v = T::ZERO;
+        }
+    }
+}
+
+/// `StructuredFactor::scatter`'s row loop for rows `[i0, i1)`, reading the
+/// block's own per-row values; the same arithmetic in the same row order.
+#[allow(clippy::too_many_arguments)]
+fn stream_scatter<T: TailKernel>(
+    sr: &mut StreamRows<T>,
+    g: &crate::lmm::LmmGroupings,
+    family: Family,
+    nb_theta: f64,
+    y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
+    cluster_ids: &[u32],
+    cross_theta: &[T],
+    cross_col: &[u32],
+    n_cross: &[u8],
+    coup_ptr: &[u32],
+    coup_pos: &[u32],
+    core_blocks: &mut [T],
+    coupling: &mut [T],
+    schur_blk: &mut [T],
+    a_rhs: &mut [T],
+    mut dual: Option<&mut DualStep<T>>,
+    i0: usize,
+    i1: usize,
+) {
+    let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
+    let qc = g.primary_q + g.nested_per_parent;
+    let s = g.n_primary;
+    let e = g.k_crossed();
+    let k_family = qc * s;
+    let nb = i1 - i0;
+    let StreamRows {
+        eta,
+        prob,
+        w,
+        mu,
+        mc,
+        ..
+    } = sr;
+    match family {
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        } if !weighted => {
+            for t in 0..nb {
+                mu[t] = T::from_f64(y[i0 + t]) - prob[t];
+            }
+        }
+        other => {
+            for t in 0..nb {
+                let i = i0 + t;
+                mu[t] =
+                    crate::family::row_score(other, nb_theta, y[i], prior_w[i], eta[t], prob[t]);
+            }
+        }
+    }
+    for t in 0..nb {
+        let i = i0 + t;
+        let f = cluster_ids[i] as usize;
+        let wi = w[t];
+        let ri = mu[t];
+        let m_core = &mc[t * qc..t * qc + qc];
+        let cbase = i * g_cap;
+        let ncz = n_cross[i] as usize;
+        let cb = f * qc * qc;
+        let gcb = f * qc;
+        let coup = qc * coup_ptr[f] as usize;
+        let nc = (coup_ptr[f + 1] - coup_ptr[f]) as usize;
+        for r in 0..qc {
+            let mr = m_core[r];
+            a_rhs[gcb + r] += mr * ri;
+            let wmr = wi * mr;
+            for c in 0..=r {
+                core_blocks[cb + r * qc + c] += wmr * m_core[c];
+            }
+            for z in 0..ncz {
+                coupling[coup + r * nc + coup_pos[cbase + z] as usize] += wmr * cross_theta[z];
+            }
+        }
+        for z in 0..ncz {
+            let b = cross_col[cbase + z] as usize;
+            let vb = cross_theta[z];
+            a_rhs[k_family + b] += vb * ri;
+            let wvb = wi * vb;
+            for z2 in 0..ncz {
+                let b2 = cross_col[cbase + z2] as usize;
+                if b2 <= b {
+                    schur_blk[b * e + b2] += wvb * cross_theta[z2];
+                }
+            }
+        }
+        if let Some(d) = dual.as_deref_mut().filter(|d| d.observed) {
+            let wo = crate::family::observed_weight(
+                family, nb_theta, y[i], prior_w[i], eta[t], prob[t], wi,
+            );
+            for r in 0..qc {
+                let mr = m_core[r];
+                let wmr = wo * mr;
+                #[allow(clippy::needless_range_loop)]
+                for c in 0..=r {
+                    d.obs_core_blocks[cb + r * qc + c] += wmr * m_core[c];
+                }
+                for z in 0..ncz {
+                    d.obs_coupling[coup + r * nc + coup_pos[cbase + z] as usize] +=
+                        wmr * cross_theta[z];
+                }
+            }
+            for z in 0..ncz {
+                let b = cross_col[cbase + z] as usize;
+                let vb = cross_theta[z];
+                let wvb = wo * vb;
+                for z2 in 0..ncz {
+                    let b2 = cross_col[cbase + z2] as usize;
+                    if b2 <= b {
+                        d.obs_schur_blk[b * e + b2] += wvb * cross_theta[z2];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Streamed SE pass: [`pirls_solve_blocked_extras`] at `BetaStep::Fixed` with a
+/// dual step (the assembled-Hessian SE call), with every per-row value
+/// streamed in row blocks of `sr.block` rows: one fused sweep per iteration
+/// forms `η`, the family pass and the scatter block by block. The trial's
+/// accept test runs after the sweep (the scatter of a rejected trial is
+/// discarded and redone on the halved `u`). Returns
+/// `(objective, dev, converged)` like `structured_laplace_deviance`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn structured_stream_deviance<T: TailKernel>(
+    family: Family,
+    nb_theta: f64,
+    g: &crate::lmm::LmmGroupings,
+    params: &[T],
+    z_buf: &[f64],
+    extra_ids: &[Vec<u32>],
+    cluster_ids: &[u32],
+    scratch: &mut PirlsScratch<T>,
+    structured: &mut StructuredScratch<T>,
+    pattern: &mut StructuredPattern,
+    x: MatRef<f64>,
+    y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
+    beta: &[T],
+    dual: &mut DualStep<T>,
+    offset: Option<&[f64]>,
+    tol: f64,
+    n: usize,
+    sr: &mut StreamRows<T>,
+) -> (T, T, bool) {
+    let nan = || T::from_f64(f64::NAN);
+    crate::glmm::workspace::build_packed_m(
+        g,
+        params,
+        z_buf,
+        extra_ids,
+        &mut scratch.lam,
+        cluster_ids,
+        &mut structured.m_core_buf,
+        &mut structured.cross_theta,
+        &mut pattern.cross_col,
+        &mut pattern.n_cross,
+        n,
+    );
+    // A dual call keys the CSR cache on the full pattern (mask 0), as
+    // `structured_laplace_deviance` does.
+    if pattern.coup_mask != Some(0) {
+        build_coupling_csr(
+            cluster_ids,
+            &pattern.cross_col,
+            &pattern.n_cross,
+            g.n_primary,
+            n,
+            &mut pattern.coup_cols,
+            &mut pattern.coup_ptr,
+            &mut pattern.coup_pos,
+        );
+        pattern.coup_mask = Some(0);
+    }
+    let q = g.primary_q;
+    sr.lam[..q * q].copy_from_slice(&scratch.lam[..q * q]);
+    let base_theta = q * (q + 1) / 2;
+    let theta_nested = g.nested.map(|nf| params[nf.vech_start]).unwrap_or(T::ZERO);
+    let nested_decl = g.nested.map(|nf| nf.vech_start - base_theta);
+
+    let PirlsScratch {
+        u, u_prev, a_rhs, ..
+    } = scratch;
+    let StructuredScratch {
+        core_blocks,
+        coupling,
+        schur_blk,
+        cross_theta,
+        ..
+    } = structured;
+    let StructuredPattern {
+        cross_col,
+        n_cross,
+        coup_cols,
+        coup_ptr,
+        coup_pos,
+        structured_schur,
+        force_dense_schur,
+        ..
+    } = pattern;
+    let force_dense = *force_dense_schur;
+    let np = g.nested_per_parent;
+    let qc = q + np;
+    let s = g.n_primary;
+    let prim_width = q * s;
+    let k_family = qc * s;
+    let e = g.k_crossed();
+    let k = k_family + e;
+    let core_col = |f: usize, local: usize| -> usize {
+        if local < q {
+            f * q + local
+        } else {
+            prim_width + f * np + (local - q)
+        }
+    };
+    let block = sr.block;
+    // One fused sweep at the current `u`: clear, then per block fill + scatter.
+    // `observed_conv` + `twin` select the evaluate-at-mode variant (W_obs, no
+    // twin) or the in-loop one (Fisher W, twin scattered).
+    macro_rules! sweep {
+        ($observed_conv:expr, $twin:expr) => {{
+            stream_zero(
+                qc,
+                s,
+                e,
+                k,
+                &coup_ptr[..],
+                &mut core_blocks[..],
+                &mut coupling[..],
+                &mut schur_blk[..],
+                &mut a_rhs[..],
+                if $twin { Some(&mut *dual) } else { None },
+            );
+            let mut dev = T::ZERO;
+            let mut infeasible = false;
+            let mut i0 = 0usize;
+            while i0 < n {
+                let i1 = (i0 + block).min(n);
+                let (d, inf) = stream_fill(
+                    sr,
+                    g,
+                    theta_nested,
+                    nested_decl,
+                    z_buf,
+                    extra_ids,
+                    cluster_ids,
+                    &cross_theta[..],
+                    &cross_col[..],
+                    &n_cross[..],
+                    x,
+                    beta,
+                    offset,
+                    &u[..],
+                    family,
+                    nb_theta,
+                    y,
+                    prior_w,
+                    weighted,
+                    i0,
+                    i1,
+                    $observed_conv,
+                );
+                dev += d;
+                infeasible |= inf;
+                stream_scatter(
+                    sr,
+                    g,
+                    family,
+                    nb_theta,
+                    y,
+                    prior_w,
+                    weighted,
+                    cluster_ids,
+                    &cross_theta[..],
+                    &cross_col[..],
+                    &n_cross[..],
+                    &coup_ptr[..],
+                    &coup_pos[..],
+                    &mut core_blocks[..],
+                    &mut coupling[..],
+                    &mut schur_blk[..],
+                    &mut a_rhs[..],
+                    if $twin { Some(&mut *dual) } else { None },
+                    i0,
+                    i1,
+                );
+                i0 = i1;
+            }
+            (dev, infeasible)
+        }};
+    }
+    macro_rules! layout {
+        () => {
+            StructuredFactor {
+                core_blocks: &mut core_blocks[..],
+                coupling: &mut coupling[..],
+                schur_blk: &mut schur_blk[..],
+                a_rhs: &mut a_rhs[..],
+                mu: &mut [],
+                m_core_buf: &[],
+                cross_theta: &cross_theta[..],
+                cross_col: &cross_col[..],
+                n_cross: &n_cross[..],
+                coup_cols: &coup_cols[..],
+                coup_ptr: &coup_ptr[..],
+                coup_pos: &coup_pos[..],
+                structured_schur: structured_schur.as_mut(),
+                force_dense,
+                g,
+                cluster_ids,
+                family,
+                nb_theta,
+            }
+        };
+    }
+
+    u_prev[..k].fill(T::ZERO);
+    let mut pen_accepted = f64::INFINITY;
+    let mut mixed_prev = f64::INFINITY;
+    let mut halvings = 0usize;
+    let mut converged = false;
+    dual.exact = true;
+    let min_iters = dual.min_iters;
+    let mut pen = nan();
+    for it in 0..PIRLS_MAX_ITERS {
+        let (dev, infeasible) = sweep!(false, true);
+        let mut pen_u = T::ZERO;
+        #[allow(clippy::needless_range_loop)]
+        for c in 0..k {
+            pen_u += u[c] * u[c];
+        }
+        let penalized = dev + pen_u;
+        if infeasible
+            || !penalized.value().is_finite()
+            || penalized.value() - pen_accepted > tol * (1.0 + penalized.value().abs())
+        {
+            if halvings < PIRLS_MAX_HALVINGS {
+                halvings += 1;
+                for c in 0..k {
+                    u[c] = T::from_f64(0.5) * (u[c] + u_prev[c]);
+                }
+                continue;
+            }
+            return (nan(), nan(), false);
+        }
+        u_prev[..k].copy_from_slice(&u[..k]);
+        halvings = 0;
+        pen_accepted = penalized.value();
+        for f in 0..s {
+            for local in 0..qc {
+                a_rhs[f * qc + local] -= u[core_col(f, local)];
+            }
+        }
+        for b in 0..e {
+            a_rhs[k_family + b] -= u[k_family + b];
+        }
+        if dual.observed {
+            dual.obs_rhs[..k].copy_from_slice(&a_rhs[..k]);
+            for f in 0..s {
+                let cb = f * qc * qc;
+                for r in 0..qc {
+                    dual.obs_core_blocks[cb + r * qc + r] += T::ONE;
+                }
+            }
+            for b in 0..e {
+                dual.obs_schur_blk[b * e + b] += T::ONE;
+            }
+        }
+        {
+            let mut layout = layout!();
+            if layout.factor_logdet().is_none() {
+                return (nan(), nan(), false);
+            }
+            layout.solve_in_place();
+        }
+        let mut have_obs = false;
+        if dual.observed {
+            if structured_factor(
+                g,
+                &mut dual.obs_core_blocks,
+                &dual.obs_coupling,
+                &mut dual.obs_schur_blk,
+                coup_cols,
+                coup_ptr,
+                None,
+            )
+            .is_some()
+            {
+                structured_ainv_solve(
+                    g,
+                    &dual.obs_core_blocks,
+                    &dual.obs_coupling,
+                    &dual.obs_schur_blk,
+                    coup_cols,
+                    coup_ptr,
+                    None,
+                    &mut dual.obs_rhs,
+                );
+                have_obs = true;
+            } else {
+                dual.exact = false;
+            }
+        }
+        let src: &[T] = if have_obs { &dual.obs_rhs } else { &a_rhs[..] };
+        pen = T::ZERO;
+        for f in 0..s {
+            let gcb = f * qc;
+            for local in 0..qc {
+                let val = u[core_col(f, local)] + src[gcb + local];
+                u[core_col(f, local)] = val;
+                pen += val * val;
+            }
+        }
+        for b in 0..e {
+            let val = u[k_family + b] + src[k_family + b];
+            u[k_family + b] = val;
+            pen += val * val;
+        }
+        let mixed = (dev + pen).value();
+        if it + 1 >= min_iters && (mixed - mixed_prev).abs() < tol * (1.0 + mixed.abs()) {
+            converged = true;
+            break;
+        }
+        mixed_prev = mixed;
+    }
+    if !converged {
+        return (nan(), nan(), false);
+    }
+    // `evaluate_at_mode`, streamed: W_obs, no twin, then the factor.
+    let (dev, infeasible) = sweep!(true, false);
+    if infeasible {
+        return (nan(), nan(), false);
+    }
+    let logdet = {
+        let mut layout = layout!();
+        match layout.factor_logdet() {
+            Some(ld) => ld,
+            None => return (nan(), nan(), false),
+        }
+    };
+    if !dev.value().is_finite() {
+        return (T::from_f64(f64::INFINITY), dev, true);
+    }
+    (dev + pen + T::from_f64(2.0) * logdet, dev, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2315,7 +3056,7 @@ mod tests {
 
             let mut lam = vec![D4::ZERO; q * q];
             let mut m_core_buf = vec![D4::ZERO; (n * qc).max(1)];
-            let mut cross_val = vec![D4::ZERO; (n * g_cap).max(1)];
+            let mut cross_theta = vec![D4::ZERO; g_cap];
             build_packed_m::<D4>(
                 &ws.groupings,
                 &seeded[..n_theta],
@@ -2324,7 +3065,7 @@ mod tests {
                 &mut lam,
                 &ids,
                 &mut m_core_buf,
-                &mut cross_val,
+                &mut cross_theta,
                 &mut ws.pattern.cross_col,
                 &mut ws.pattern.n_cross,
                 n,
@@ -2339,7 +3080,7 @@ mod tests {
                 &mut ws.pattern.coup_ptr,
                 &mut ws.pattern.coup_pos,
             );
-            // `params`/`lam`/`m_core_buf`/`cross_val` stay fixed for every
+            // `params`/`lam`/`m_core_buf`/`cross_theta` stay fixed for every
             // call below — only `u` moves between calls, the same invariant
             // `run_gradient`'s own refinement loop relies on.
             let beta: Vec<D4> = seeded[n_theta..].to_vec();
@@ -2376,13 +3117,15 @@ mod tests {
                     agq_scratch: vec![D4::ZERO; 1], // unused on the extras path
                     x_rows: Vec::new(),
                     bt_rows: Vec::new(),
+                    agq_rows: Vec::new(),
+                    agq_slow: Vec::new(),
                 };
                 let mut structured = StructuredScratch {
                     core_blocks: vec![D4::ZERO; (qc * qc * s).max(1)],
                     coupling: vec![D4::ZERO; (qc * s * e).max(1)],
                     schur_blk: vec![D4::ZERO; (e * e).max(1)],
                     m_core_buf: m_core_buf.clone(),
-                    cross_val: cross_val.clone(),
+                    cross_theta: cross_theta.clone(),
                 };
                 let mut wx = Mat::<f64>::zeros(n, p);
                 let mut counters = crate::counters::EvalCounters::new();

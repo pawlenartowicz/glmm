@@ -183,11 +183,52 @@ def test_dispersion_bool_raises():
         glmm.fit(DATA, "y ~ x", "gamma", dispersion=True)
 
 
-def test_init_theta_on_negbin_is_a_kernel_gap():
-    # init_theta=<float> has no kernel hook (no public theta_seed on fit_warm);
-    # only the default init_theta=None cold-start search is supported.
-    with pytest.raises(NotImplementedError, match="init_theta"):
-        glmm.fit(FIT_DATA, "y_pois ~ x", "negativebinomial", init_theta=1.5)
+def test_init_theta_seeds_the_negbin_shape_search():
+    # init_theta is the starting value of the shape search, the same kernel
+    # slot as warm_start["dispersion"]: both give the same fit, and the
+    # optimum does not depend on the seed.
+    cold = glmm.fit(FIT_DATA, "y_pois ~ x + (1 | g)", "negativebinomial")
+    a = glmm.fit(FIT_DATA, "y_pois ~ x + (1 | g)", "negativebinomial", init_theta=1.5)
+    b = glmm.fit(
+        FIT_DATA, "y_pois ~ x + (1 | g)", "negativebinomial", warm_start={"dispersion": 1.5}
+    )
+    assert a.converged and b.converged
+    assert a.n_eval == b.n_eval
+    assert abs(a.deviance - b.deviance) == 0.0
+    assert abs(a.deviance - cold.deviance) < 1e-6
+    glm = glmm.fit(FIT_DATA, "y_pois ~ x", "negativebinomial", init_theta=1.5)
+    assert glm.converged
+
+
+def test_init_theta_and_warm_start_dispersion_together_raise():
+    with pytest.raises(ValueError, match="once"):
+        glmm.fit(
+            FIT_DATA,
+            "y_pois ~ x + (1 | g)",
+            "negativebinomial",
+            init_theta=1.5,
+            warm_start={"dispersion": 1.5},
+        )
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf"), True, "1"])
+def test_warm_start_dispersion_must_be_a_positive_number(bad):
+    with pytest.raises(ValueError, match="dispersion"):
+        glmm.fit(FIT_DATA, "y_gamma ~ x + (1 | g)", "gamma", warm_start={"dispersion": bad})
+
+
+def test_warm_start_dispersion_reaches_the_cold_gamma_optimum():
+    cold = glmm.fit(FIT_DATA, "y_gamma ~ x + (1 | g)", "gamma", link="log")
+    warm = glmm.fit(
+        FIT_DATA,
+        "y_gamma ~ x + (1 | g)",
+        "gamma",
+        link="log",
+        warm_start={"dispersion": cold.dispersion},
+    )
+    assert warm.converged
+    assert abs(warm.deviance - cold.deviance) < 1e-6
+    assert abs(warm.dispersion / cold.dispersion - 1.0) < 1e-4
 
 
 def test_init_theta_and_warm_start_theta_are_independent(recwarn):
@@ -209,9 +250,9 @@ def test_warm_start_not_dict_message_matches_the_r_port():
     with pytest.raises(
         TypeError,
         match=(
-            r"^warm_start must be a dict with keys 'beta' and/or 'theta' \(theta is the "
-            r"random-effect Cholesky vector, not the negative-binomial shape - that is "
-            r"init_theta\), got list$"
+            r"^warm_start must be a dict with keys 'beta', 'theta' and/or 'dispersion' \(theta "
+            r"is the random-effect Cholesky vector, not the negative-binomial shape - that is "
+            r"init_theta or dispersion\), got list$"
         ),
     ):
         glmm.fit(DATA, "y ~ x", warm_start=[0.0, 0.0])

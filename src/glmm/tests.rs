@@ -512,6 +512,70 @@ fn agq_cluster_outer_bit_identical_to_node_outer() {
     }
 }
 
+/// Compressed Poisson-log / Gamma-log scalar AGQ with some clusters on the row-kernel
+/// fallback: cluster 0 carries a −205 offset (and responses scaled by e^−205 to match,
+/// so Poisson counts round to 0), so its mode η sits past the compressed route's window
+/// and it falls back; the rest compress. The shift is downward because a +205 shift
+/// scales a Poisson cluster's deviance by e^205, and every row kernel then forms its
+/// node sums from differences of ~1e88 terms: finite or not by round-off alone (it
+/// came out `inf` on wasm32). The cluster-outer and node-outer arms must agree bitwise (the compressed
+/// clusters go through the same function in both, the fallback ones keep the same
+/// per-accumulator order), and the result must be finite (a skipped fallback cluster
+/// would leave its sum at 0).
+#[test]
+fn agq_compressed_with_fallback_cluster_outer_matches_node_outer() {
+    for family in [
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        Family::Gamma {
+            link: GammaLink::Log,
+        },
+    ] {
+        for shifted in [false, true] {
+            for nagq in [3u8, 7, 25] {
+                let run = |outer: bool| {
+                    let (mut ws, x, mut y, ids, _p, n) = fixture_with_nagq(family, "int1", nagq);
+                    if shifted {
+                        let mut off = vec![0.0f64; n];
+                        for i in 0..n {
+                            if ids[i] == 0 {
+                                off[i] = -205.0;
+                                y[i] = if matches!(family, Family::Poisson { .. }) {
+                                    (y[i] * (-205f64).exp()).round()
+                                } else {
+                                    y[i] * (-205f64).exp()
+                                };
+                            }
+                        }
+                        ws.offset = Some(off);
+                    }
+                    ws.params[0] = 0.5;
+                    ws.params[1] = 0.2;
+                    ws.params[2] = 0.8;
+                    let params = ws.params.clone();
+                    ws.cluster_rows = if outer {
+                        Some(ClusterRowIndex::build(&ids, ws.groupings.n_primary))
+                    } else {
+                        None
+                    };
+                    glmm_agq_deviance(&params, &mut ws, x.as_ref(), &y, &ids, n, nagq)
+                };
+                let (da, db) = (run(true), run(false));
+                assert!(
+                    da.is_finite(),
+                    "{family:?} shifted={shifted} nagq={nagq}: {da}"
+                );
+                assert_eq!(
+                    da.to_bits(),
+                    db.to_bits(),
+                    "{family:?} shifted={shifted} nagq={nagq}: {da} vs {db}"
+                );
+            }
+        }
+    }
+}
+
 /// Parallel cluster loop must equal the serial cluster-outer loop bitwise —
 /// disjoint sum-slot writes make the result schedule-independent.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
@@ -1159,13 +1223,15 @@ fn exact_hessian_matches_fd_on_fixture_agq() {
     assert!(fit.converged);
     // Cleared first so the guard below has teeth (see the sibling test). On an
     // AGQ shape the assembled pass declines before allocating, so only the
-    // hyper-dual pass can take it.
+    // gradient-difference rung (this logit fixture) or the hyper-dual pass can
+    // take it.
     ws.hyper_scratch = None;
     ws.dual_scratch = None;
+    ws.agq_gd = None;
     let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_exact);
     assert_eq!(st, FdHessianStatus::Ok);
     assert!(
-        ws.hyper_scratch.is_some(),
+        ws.agq_gd.is_some() || ws.hyper_scratch.is_some(),
         "joint_hessian_cov fell through to the FD stencil on an AGQ shape"
     );
     let tse_exact = theta_se(&ws);
@@ -2133,7 +2199,7 @@ fn fit_glmm_warm_path_bounded_alloc() {
 /// path replaces that with `glmm_block_chol`/`glmm_block_solve` on the
 /// pre-allocated `core_blocks`/`schur_blk`/`coupling` + stack-sized per-block
 /// scratch, so the only per-eval blocks left are the joint [θ|β] BOBYQA's own
-/// scratch (M is packed into `ws.structured.m_core_buf`/`cross_val`).
+/// scratch (M is packed into `ws.structured.m_core_buf`/`cross_theta`).
 /// `#[ignore]` + one-thread
 /// for the same reasons as the no-extras gate; `alloc_test_guard` serializes
 /// test bodies, but libtest's own per-test thread spawn still needs
@@ -3408,7 +3474,7 @@ fn structured_extras_matches_packed() {
                 structured:
                     StructuredScratch {
                         m_core_buf,
-                        cross_val,
+                        cross_theta,
                         ..
                     },
                 pattern:
@@ -3427,7 +3493,7 @@ fn structured_extras_matches_packed() {
                 lam,
                 &ids,
                 m_core_buf,
-                cross_val,
+                cross_theta,
                 cross_col,
                 n_cross,
                 n,
@@ -3590,7 +3656,7 @@ fn structured_extras_matches_packed() {
                 structured:
                     StructuredScratch {
                         m_core_buf,
-                        cross_val,
+                        cross_theta,
                         ..
                     },
                 pattern:
@@ -3609,7 +3675,7 @@ fn structured_extras_matches_packed() {
                 lam,
                 &ids,
                 m_core_buf,
-                cross_val,
+                cross_theta,
                 cross_col,
                 n_cross,
                 n,
@@ -3791,7 +3857,7 @@ fn structured_panel_downdate_matches_scalar() {
                 &mut pirls.lam,
                 &ids,
                 &mut structured.m_core_buf,
-                &mut structured.cross_val,
+                &mut structured.cross_theta,
                 &mut pattern.cross_col,
                 &mut pattern.n_cross,
                 n,
@@ -4384,7 +4450,7 @@ fn assert_border_curvature_matches_fd(
         } = &mut *ws;
         let tail = CrossedTail {
             cross_col: &pattern.cross_col[..],
-            cross_val: &st.cross_val[..],
+            cross_theta: &st.cross_theta[..],
             n_cross: &pattern.n_cross[..],
             e,
         };
@@ -5137,7 +5203,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             structured:
                 StructuredScratch {
                     m_core_buf,
-                    cross_val,
+                    cross_theta,
                     ..
                 },
             pattern: StructuredPattern {
@@ -5153,7 +5219,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
             lam,
             &ids.primary,
             m_core_buf,
-            cross_val,
+            cross_theta,
             cross_col,
             n_cross,
             n,
@@ -5266,7 +5332,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
         let cbase = i * g_cap;
         for z in 0..ws.pattern.n_cross[i] as usize {
             let b = ws.pattern.cross_col[cbase + z] as usize;
-            e += ws.structured.cross_val[cbase + z] * ws.pirls.u[k_family + b];
+            e += ws.structured.cross_theta[z] * ws.pirls.u[k_family + b];
         }
         let e = crate::family::clamp_eta(fam, e);
         let mui = crate::family::link_inv(fam, e);
@@ -5376,7 +5442,7 @@ fn structured_profile_beta_matches_packed_profile() {
             structured:
                 StructuredScratch {
                     m_core_buf,
-                    cross_val,
+                    cross_theta,
                     ..
                 },
             pattern: StructuredPattern {
@@ -5393,7 +5459,7 @@ fn structured_profile_beta_matches_packed_profile() {
             lam,
             &ids,
             m_core_buf,
-            cross_val,
+            cross_theta,
             cross_col,
             n_cross,
             n,
@@ -5540,6 +5606,55 @@ fn coupling_csr_rebuilds_on_theta_pinning_transition() {
     );
     assert_eq!(d2, fresh(&pinned), "pinned eval read a stale CSR");
     assert_eq!(d3, d1, "un-pinning must restore the original pattern");
+}
+
+/// The structured layout keeps one crossed value per slot
+/// (`StructuredScratch::cross_theta`), and at `f64` a θ-pinned grouping takes
+/// no slot, so pinning the FIRST of two crossed groupings shifts the second
+/// grouping's θ into slot 0. A value left at its grouping's old slot (or a
+/// stale one from the previous evaluation) would pair the pinned grouping's
+/// θ with the surviving grouping's columns. The packed-row layout builds its own
+/// `M` with every column kept, so it is an independent oracle for the same
+/// objective: on the same workspace, unpinned then middle-pinned then
+/// unpinned, each structured deviance must match the packed one to FP error.
+#[test]
+fn structured_first_pinned_crossed_theta_matches_packed() {
+    let (model, ids, x, y, n, p) = grouseticks_3crossed_fixture();
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+    assert_eq!(ws.layout, GlmmLayout::Structured);
+    assert!(
+        ws.groupings.crossed.len() >= 2,
+        "fixture must have two crossed groupings"
+    );
+    let nt = ws.n_theta;
+    let mut unpinned = vec![0.0; nt + p];
+    for (a, v) in unpinned[..nt].iter_mut().enumerate() {
+        *v = 0.4 + 0.1 * a as f64;
+    }
+    let mut pinned = unpinned.clone();
+    pinned[ws.groupings.crossed[0].vech_start] = 0.0;
+    let packed = |params: &[f64]| {
+        let mut wp = GlmmWorkspace::for_cluster_spec_packed(p, &model, n, &[], 1);
+        fill_packed_cols(&mut wp, &ids.primary, &ids.extra, n);
+        glmm_laplace_deviance(params, &mut wp, x.as_ref(), &y, &ids.primary, &ids.extra, n)
+    };
+    for (label, params) in [
+        ("unpinned", &unpinned),
+        ("first pinned", &pinned),
+        ("unpinned again", &unpinned),
+    ] {
+        let d_str =
+            glmm_laplace_deviance(params, &mut ws, x.as_ref(), &y, &ids.primary, &ids.extra, n);
+        let d_pk = packed(params);
+        assert!(
+            d_str.is_finite() && d_pk.is_finite(),
+            "{label}: {d_str} {d_pk}"
+        );
+        assert!(
+            (d_str - d_pk).abs() <= 1e-9 * d_pk.abs().max(1.0),
+            "{label}: structured {d_str} vs packed {d_pk}"
+        );
+    }
 }
 
 /// No-extras twin of `packed_path_overshoot_fixture`: primary-only grouping
@@ -7060,8 +7175,9 @@ fn assembled_hessian_columns_match_fd_of_f64_gradient() {
         ws.fd.pirls_tol_override = None;
     }
     // One cell above the lane ladder's top rung: `q2s` (n_θ = 3) padded by 12
-    // zero-truth columns gives `m = 17`, so the pass runs in two `Dual<12>`
-    // chunks and the second chunk's five columns land at `base = 12`. Nothing
+    // zero-truth columns gives `m = 17`, so the pass runs in three `Dual<6>`
+    // chunks (`NLanes::pick_assembled`) and the last chunk's five columns land
+    // at `base = 12`. Nothing
     // else in this file compares a chunked Hessian column against anything.
     {
         let family = Family::Poisson {
@@ -7860,6 +7976,16 @@ const AGQ_GATE_CELLS: &[(Family, &str, u8)] = &[
         },
         "q2s",
         5,
+    ),
+    // Gamma-log scalar intercept: the compressed AGQ route's second family
+    // (Poisson-log int1 above is its first), so the dual gradient and Hessian
+    // go through `compressed_cluster_sum` on both.
+    (
+        Family::Gamma {
+            link: GammaLink::Log,
+        },
+        "int1",
+        7,
     ),
     // Non-canonical binomial link: `agq_eligible` admits `Binomial { .. }` at
     // any link, so this cell exercises the non-canonical (Newton-weight) PIRLS
@@ -8673,4 +8799,1317 @@ fn crossed_pirls_converges_at_huge_counts() {
         devs[0],
         devs[1]
     );
+}
+
+// --- row-blocked assembled Hessian (`assembled::run_assembled_hessian_blocked`) ---
+
+/// One assembled Hessian at the workspace's current `params`, from a cold
+/// mode, with the row-block size forced to `block`. Returns
+/// `(objective, gradient, Hessian columns)`.
+fn assembled_hessian_at_block(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    p: usize,
+    n: usize,
+    block: usize,
+) -> (f64, Vec<f64>, Mat<f64>) {
+    let m = ws.n_theta + p;
+    let kk = ws.k.max(1);
+    ws.fd.se_row_block = block;
+    for v in ws.pirls.u[..kk].iter_mut() {
+        *v = 0.0;
+    }
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let mut grad = vec![0.0; m];
+    let st =
+        super::assembled::joint_hessian_columns(ws, x, y, ids, &[], p, n, &mut grad, &mut hess);
+    ws.fd.se_row_block = super::assembled::SE_ROW_BLOCK;
+    let DerivStatus::Ok(v) = st else {
+        panic!("the assembled Hessian declined at block {block}")
+    };
+    (v, grad, hess)
+}
+
+/// The row-blocked pass returns the whole-data pass's objective, gradient and
+/// Hessian to round-off, on every family the assembled Hessian serves on the
+/// blocked layout (canonical and observed-information links, scalar and
+/// slope blocks), with prior weights and an offset, and at block sizes from
+/// one that leaves a single cluster per block to one that leaves two blocks.
+/// The difference is per-block PIRLS exit tests and per-block summation, so
+/// the band is relative 1e-10, against movements of order 1e-14 measured.
+#[test]
+fn row_blocked_hessian_matches_whole_data_pass() {
+    let families = [
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+    ];
+    for family in families {
+        for shape in ["int1", "q2s"] {
+            for weighted in [false, true] {
+                let (mut ws, x, y, ids, p, n) = fixture_with_nagq_sized(family, shape, 1, 600, 40);
+                assert_eq!(ws.layout, GlmmLayout::Blocked, "{family:?}/{shape}");
+                assert!(ws.groupings.extra_offsets.is_empty());
+                if weighted {
+                    for (i, w) in ws.prior_w[..n].iter_mut().enumerate() {
+                        *w = 0.5 + (i % 5) as f64 * 0.25;
+                    }
+                    ws.weighted = true;
+                    ws.offset = Some((0..n).map(|i| 0.05 * ((i % 7) as f64 - 3.0)).collect());
+                }
+                let m = ws.n_theta + p;
+                let mut rng = fixed_seed_theta(shape);
+                ws.params[..m].copy_from_slice(&rng.next_params());
+                let (v0, g0, h0) =
+                    assembled_hessian_at_block(&mut ws, x.as_ref(), &y, &ids, p, n, usize::MAX);
+                // `n` itself takes the whole-data pass: bit-identical.
+                let (vn, gn, hn) =
+                    assembled_hessian_at_block(&mut ws, x.as_ref(), &y, &ids, p, n, n);
+                assert_eq!(v0.to_bits(), vn.to_bits(), "{family:?}/{shape}: block = n");
+                for r in 0..m {
+                    assert_eq!(g0[r].to_bits(), gn[r].to_bits());
+                    for c in 0..m {
+                        assert_eq!(h0[(r, c)].to_bits(), hn[(r, c)].to_bits());
+                    }
+                }
+                for block in [1, 16, 64, n / 2, n - 1] {
+                    let (v, g, h) =
+                        assembled_hessian_at_block(&mut ws, x.as_ref(), &y, &ids, p, n, block);
+                    let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1.0);
+                    assert!(
+                        rel(v, v0) <= 1e-10,
+                        "{family:?}/{shape} w={weighted} block {block}: objective {v} vs {v0}"
+                    );
+                    for r in 0..m {
+                        assert!(
+                            rel(g[r], g0[r]) <= 1e-10,
+                            "{family:?}/{shape} w={weighted} block {block}: grad[{r}] {} vs {}",
+                            g[r],
+                            g0[r]
+                        );
+                        for c in 0..m {
+                            assert!(
+                                rel(h[(r, c)], h0[(r, c)]) <= 1e-10,
+                                "{family:?}/{shape} w={weighted} block {block}: \
+                                 H[{r},{c}] {} vs {}",
+                                h[(r, c)],
+                                h0[(r, c)]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A repeat row-blocked Hessian call at the same shape and data allocates
+/// exactly what a repeat whole-data call does: the block scratch, the block
+/// list and the gathered rows are all built once with the dual scratch.
+/// Measured against the whole-data pass rather than against zero because the
+/// call around both passes (the `f64` mode solve) is not itself gated here.
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests row_blocked_hessian_repeat_calls_allocate_no_more -- --ignored --test-threads=1`
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn row_blocked_hessian_repeat_calls_allocate_no_more() {
+    let _serial = crate::test_support::alloc_test_guard();
+    let mut blocks = [0u64; 2];
+    for (arm, block) in [usize::MAX, 32].into_iter().enumerate() {
+        let (mut ws, x, y, ids, p, n) = fixture_with_nagq_sized(
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            "q2s",
+            1,
+            600,
+            40,
+        );
+        let m = ws.n_theta + p;
+        let mut rng = fixed_seed_theta("q2s");
+        ws.params[..m].copy_from_slice(&rng.next_params());
+        ws.fd.se_row_block = block;
+        let mut hess = Mat::<f64>::zeros(m, m);
+        let mut grad = vec![0.0; m];
+        let _ = super::assembled::joint_hessian_columns(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            &mut grad,
+            &mut hess,
+        );
+        let prof = dhat::Profiler::builder().testing().build();
+        for _ in 0..3 {
+            let _ = super::assembled::joint_hessian_columns(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &[],
+                p,
+                n,
+                &mut grad,
+                &mut hess,
+            );
+        }
+        blocks[arm] = dhat::HeapStats::get().total_blocks;
+        drop(prof);
+    }
+    assert_eq!(
+        blocks[1], blocks[0],
+        "row-blocked repeat Hessian allocated {} blocks, whole-data {}",
+        blocks[1], blocks[0]
+    );
+}
+
+// --- streamed structured assembled Hessian (`pirls::structured_stream_deviance`) ---
+
+/// [`assembled_hessian_at_block`] on the structured layout: the same call with
+/// the extra-grouping ids passed through.
+#[allow(clippy::too_many_arguments)]
+fn structured_hessian_at_block(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    p: usize,
+    n: usize,
+    block: usize,
+) -> (f64, Vec<f64>, Mat<f64>) {
+    let m = ws.n_theta + p;
+    let kk = ws.k.max(1);
+    ws.fd.se_row_block = block;
+    for v in ws.pirls.u[..kk].iter_mut() {
+        *v = 0.0;
+    }
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let mut grad = vec![0.0; m];
+    let st = super::assembled::joint_hessian_columns(
+        ws, x, y, ids, extra_ids, p, n, &mut grad, &mut hess,
+    );
+    ws.fd.se_row_block = super::assembled::SE_ROW_BLOCK;
+    let DerivStatus::Ok(v) = st else {
+        panic!("the assembled Hessian declined at block {block}")
+    };
+    (v, grad, hess)
+}
+
+/// The streamed pass on the structured layout (crossed, nested and crossed +
+/// nested; canonical and observed-information links; with prior weights and
+/// an offset) returns the whole-data pass's gradient and Hessian bit for bit,
+/// at block sizes from a single row to `n − 1`: every per-row value is the
+/// same arithmetic and every accumulator still takes its rows in ascending
+/// order. Only the PIRLS deviance is summed per block, and it enters the
+/// objective, so the objective is held to relative 1e-12 rather than to bits.
+/// The scratch the streamed pass builds keeps no `n`-length dual row buffer.
+#[test]
+fn streamed_structured_hessian_matches_whole_data_pass() {
+    let families = [
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+    ];
+    for family in families {
+        for (np, ncr, shape) in [
+            (0usize, 6usize, "crossed6"),
+            (2, 0, "nested2"),
+            (2, 6, "nested2_crossed6"),
+        ] {
+            for weighted in [false, true] {
+                let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, ncr);
+                assert_eq!(ws.layout, GlmmLayout::Structured, "{family:?}/{shape}");
+                if weighted {
+                    for (i, w) in ws.prior_w[..n].iter_mut().enumerate() {
+                        *w = 0.5 + (i % 5) as f64 * 0.25;
+                    }
+                    ws.weighted = true;
+                    ws.offset = Some((0..n).map(|i| 0.05 * ((i % 7) as f64 - 3.0)).collect());
+                }
+                let m = ws.n_theta + p;
+                let mut rng = fixed_seed_theta(shape);
+                ws.params[..m].copy_from_slice(&rng.next_params());
+                let (v0, g0, h0) = structured_hessian_at_block(
+                    &mut ws,
+                    x.as_ref(),
+                    &y,
+                    &ids,
+                    &extra_ids,
+                    p,
+                    n,
+                    usize::MAX,
+                );
+                for block in [1, 7, 64, n - 1] {
+                    let (v, g, h) = structured_hessian_at_block(
+                        &mut ws,
+                        x.as_ref(),
+                        &y,
+                        &ids,
+                        &extra_ids,
+                        p,
+                        n,
+                        block,
+                    );
+                    let label = format!("{family:?}/{shape} w={weighted} block {block}");
+                    let rows_kept = match ws.dual_scratch.as_deref() {
+                        Some(GlmmDualScratch::D4(b, ..)) => b.pirls.eta.len(),
+                        Some(GlmmDualScratch::D5(b, ..)) => b.pirls.eta.len(),
+                        Some(GlmmDualScratch::D6(b, ..)) => b.pirls.eta.len(),
+                        Some(GlmmDualScratch::D8(b, ..)) => b.pirls.eta.len(),
+                        Some(GlmmDualScratch::D12(b, ..)) => b.pirls.eta.len(),
+                        _ => panic!("{label}: expected a Dual scratch"),
+                    };
+                    assert_eq!(rows_kept, 0, "{label}: dual row buffers not streamed");
+                    assert!(
+                        (v - v0).abs() <= 1e-12 * v0.abs().max(1.0),
+                        "{label}: objective {v} vs {v0}"
+                    );
+                    for r in 0..m {
+                        assert_eq!(g[r].to_bits(), g0[r].to_bits(), "{label}: grad[{r}]");
+                        for c in 0..m {
+                            assert_eq!(
+                                h[(r, c)].to_bits(),
+                                h0[(r, c)].to_bits(),
+                                "{label}: H[{r},{c}] {} vs {}",
+                                h[(r, c)],
+                                h0[(r, c)]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A repeat streamed Hessian call at the same shape and data allocates exactly
+/// what a repeat whole-data call does: the block buffers are built once with
+/// the dual scratch. Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests streamed_structured_hessian_repeat_calls_allocate_no_more -- --ignored --test-threads=1`
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn streamed_structured_hessian_repeat_calls_allocate_no_more() {
+    let _serial = crate::test_support::alloc_test_guard();
+    let mut blocks = [0u64; 2];
+    for (arm, block) in [usize::MAX, 32].into_iter().enumerate() {
+        let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            0,
+            6,
+        );
+        let m = ws.n_theta + p;
+        let mut rng = fixed_seed_theta("crossed6");
+        ws.params[..m].copy_from_slice(&rng.next_params());
+        ws.fd.se_row_block = block;
+        let mut hess = Mat::<f64>::zeros(m, m);
+        let mut grad = vec![0.0; m];
+        let _ = super::assembled::joint_hessian_columns(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut grad,
+            &mut hess,
+        );
+        let prof = dhat::Profiler::builder().testing().build();
+        for _ in 0..3 {
+            let _ = super::assembled::joint_hessian_columns(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &extra_ids,
+                p,
+                n,
+                &mut grad,
+                &mut hess,
+            );
+        }
+        blocks[arm] = dhat::HeapStats::get().total_blocks;
+        drop(prof);
+    }
+    assert_eq!(
+        blocks[1], blocks[0],
+        "streamed repeat Hessian allocated {} blocks, whole-data {}",
+        blocks[1], blocks[0]
+    );
+}
+
+/// The structured dual twins size their coupling-shaped buffers from the
+/// design's own coupling pattern once one is known (`dual_coupling_pairs`),
+/// not from the `coupling_len` bound, and nothing they compute moves: the
+/// gradient and the assembled Hessian from a scratch sized on the pattern are
+/// bit-identical to those from a scratch sized at the bound.
+#[test]
+fn structured_dual_twins_size_coupling_from_the_pattern() {
+    for family in [
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+    ] {
+        let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, 0, 6);
+        let m = ws.n_theta + p;
+        let mut rng = fixed_seed_theta("crossed6");
+        ws.params[..m].copy_from_slice(&rng.next_params());
+        let s = ws.groupings.n_primary;
+        let q_core = ws.groupings.primary_q + ws.groupings.nested_per_parent;
+        let e = ws.groupings.k_crossed();
+        let kk = ws.k.max(1);
+        let coupling_of = |ws: &GlmmWorkspace| match ws.dual_scratch.as_deref() {
+            Some(GlmmDualScratch::D4(b, ..)) => (b.structured.coupling.len(), b.asm.tail_h.len()),
+            Some(GlmmDualScratch::D5(b, ..)) => (b.structured.coupling.len(), b.asm.tail_h.len()),
+            Some(GlmmDualScratch::D6(b, ..)) => (b.structured.coupling.len(), b.asm.tail_h.len()),
+            Some(GlmmDualScratch::D8(b, ..)) => (b.structured.coupling.len(), b.asm.tail_h.len()),
+            Some(GlmmDualScratch::D12(b, ..)) => (b.structured.coupling.len(), b.asm.tail_h.len()),
+            _ => panic!("expected a Dual scratch"),
+        };
+        let run = |ws: &mut GlmmWorkspace| {
+            for v in ws.pirls.u[..kk].iter_mut() {
+                *v = 0.0;
+            }
+            let mut grad = vec![0.0; m];
+            let DerivStatus::Ok(_) =
+                laplace_gradient(ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut grad)
+            else {
+                panic!("{family:?}: dual gradient declined")
+            };
+            for v in ws.pirls.u[..kk].iter_mut() {
+                *v = 0.0;
+            }
+            let mut hess = Mat::<f64>::zeros(m, m);
+            let mut hgrad = vec![0.0; m];
+            let st = super::assembled::joint_hessian_columns(
+                ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &extra_ids,
+                p,
+                n,
+                &mut hgrad,
+                &mut hess,
+            );
+            let DerivStatus::Ok(_) = st else {
+                panic!("{family:?}: assembled Hessian declined")
+            };
+            (grad, hess)
+        };
+        // A fresh fit's pattern is unknown (`coup_mask == None`): bound.
+        ws.pattern.coup_mask = None;
+        ws.dual_scratch = None;
+        let (g_bound, h_bound) = run(&mut ws);
+        // The dual calls just built the full pattern (mask 0); a rebuild now
+        // sizes on it.
+        assert_eq!(ws.pattern.coup_mask, Some(0));
+        let pairs = ws.pattern.coup_ptr[s] as usize;
+        let bound = crate::glmm::workspace::coupling_len(n, s, q_core, e);
+        ws.dual_scratch = None;
+        let (g_pat, h_pat) = run(&mut ws);
+        let (coup, tail) = coupling_of(&ws);
+        assert_eq!(coup, (q_core * pairs).max(1), "{family:?}: twin coupling");
+        assert_eq!(tail, (q_core * pairs).max(1), "{family:?}: tail_h");
+        assert!(
+            coup < bound,
+            "{family:?}: pattern {coup} not below bound {bound}"
+        );
+        for r in 0..m {
+            assert_eq!(
+                g_bound[r].to_bits(),
+                g_pat[r].to_bits(),
+                "{family:?} grad[{r}]"
+            );
+            for c in 0..m {
+                assert_eq!(
+                    h_bound[(r, c)].to_bits(),
+                    h_pat[(r, c)].to_bits(),
+                    "{family:?} H[{r},{c}]"
+                );
+            }
+        }
+    }
+}
+
+// --- AGQ f64 gradient and the gradient-difference Hessian (rung 2a) ---
+
+/// The families `agq_gradient::covers` accepts, each at a scalar intercept
+/// and `nagq = 7`.
+const AGQ_GD_FAMILIES: &[Family] = &[
+    Family::Binomial {
+        link: BinomialLink::Logit,
+    },
+    Family::Binomial {
+        link: BinomialLink::Probit,
+    },
+    Family::Poisson {
+        link: PoissonLink::Log,
+    },
+];
+
+/// The f64 AGQ gradient against `laplace_gradient`'s dual AGQ branch, the
+/// in-tree oracle: both differentiate the same AGQ deviance once, exactly, at
+/// the same `ws.params` and a tightened PIRLS tolerance, so they agree to
+/// round-off (band 1e-9 relative). Clusters of 2, 3 and 5 rows (where AGQ
+/// matters most and the node terms are least Gaussian) and the default
+/// fixture; draws include `λ = 0`, where `dD/dλ` is 0 by symmetry.
+#[test]
+fn agq_f64_gradient_matches_dual_gradient() {
+    for &family in AGQ_GD_FAMILIES {
+        for (n, nc) in [
+            (60usize, 30usize),
+            (60, 20),
+            (60, 12),
+            default_fixture_size("int1"),
+        ] {
+            let (mut ws, x, y, ids, p, n) = fixture_with_nagq_sized(family, "int1", 7, n, nc);
+            assert!(super::agq_gradient::covers(&ws), "{family:?}: not covered");
+            ws.fd.pirls_tol_override = Some(1e-12);
+            let m = ws.n_theta + p;
+            let kk = ws.k.max(1);
+            let mut gd = super::agq_gradient::AgqGd::for_shape(p, ws.nagq);
+            gd.idx.rebuild(&ids[..n], ws.groupings.n_primary);
+            let mut rng = fixed_seed_theta("int1");
+            let mut ctrs = EvalCounters::new();
+            for draw in 0..6 {
+                let mut prm = rng.next_params();
+                if draw == 0 {
+                    prm[0] = 0.0;
+                }
+                ws.params[..m].copy_from_slice(&prm);
+                let mut g_dual = vec![0.0; m];
+                ws.pirls.u[..kk].fill(0.0);
+                let st = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut g_dual);
+                assert!(
+                    matches!(st, DerivStatus::Ok(_)),
+                    "{family:?}: dual gradient"
+                );
+                ws.params[..m].copy_from_slice(&prm);
+                ws.beta_rhs[..p].copy_from_slice(&prm[ws.n_theta..m]);
+                ws.pirls.u[..kk].fill(0.0);
+                let f = laplace_deviance_ws(
+                    &mut ws,
+                    x.as_ref(),
+                    &y,
+                    &ids,
+                    &[],
+                    n,
+                    BetaMode::Fixed,
+                    &mut ctrs,
+                );
+                assert!(f.is_finite());
+                let mut g = vec![0.0; m];
+                assert!(super::agq_gradient::assemble(
+                    &ws,
+                    x.as_ref(),
+                    &y,
+                    &gd.idx,
+                    &prm,
+                    &mut gd.sc,
+                    &mut g
+                ));
+                for k in 0..m {
+                    assert!(
+                        (g[k] - g_dual[k]).abs() <= 1e-9 * g_dual[k].abs().max(1.0),
+                        "{family:?} n={n} nc={nc} draw {draw} coord {k}: f64 {} vs dual {}",
+                        g[k],
+                        g_dual[k]
+                    );
+                }
+                if draw == 0 {
+                    assert!(g[0].abs() <= 1e-9, "{family:?}: dD/dλ at λ = 0 is {}", g[0]);
+                }
+            }
+        }
+    }
+}
+
+/// Fits `fixture_with_nagq_sized`'s data at `nagq = 7` with `WaldSe::Rx`
+/// (the explicit `joint_hessian_cov` calls are the comparison), padded by
+/// `extra_p` zero-truth columns when nonzero.
+fn agq_gd_fit(
+    family: Family,
+    n: usize,
+    nc: usize,
+    extra_p: usize,
+) -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u32>, usize, usize) {
+    let (_ws0, x0, y, ids, p0, n) = fixture_with_nagq_sized(family, "int1", 7, n, nc);
+    let p = p0 + extra_p;
+    let mut x = Mat::<f64>::zeros(n, p);
+    let mut st = 7777u64;
+    for i in 0..n {
+        for c in 0..p0 {
+            x[(i, c)] = x0[(i, c)];
+        }
+        for c in p0..p {
+            x[(i, c)] = 0.3 * lcg(&mut st);
+        }
+    }
+    let model = ModelSpec {
+        family,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: nc as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 7);
+    let fit = fit_glmm(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &[],
+        &[1u32],
+        None,
+        &vec![0.0; p],
+        n,
+        WaldSe::Rx,
+        ColumnScaling::IDENTITY,
+    );
+    assert!(fit.converged, "{family:?}: fit did not converge");
+    (ws, x, y, ids, p, n)
+}
+
+/// Rung 2a against rung 2 on the same fit: the gradient-difference Hessian
+/// and the hyper-dual pass differentiate the same AGQ deviance at the same
+/// point, one exactly and one by a central difference of an exact gradient at
+/// a 1e-5 relative step, so the β and θ SEs agree to well inside 1e-7. Also
+/// pins that rung 2a, not rung 2, takes a covered shape (`ws.agq_gd` built, no
+/// hyper-dual scratch), and that a second call on the same workspace returns
+/// the same covariance bit for bit.
+#[test]
+fn agq_gradient_difference_hessian_matches_hyper_dual() {
+    for &family in AGQ_GD_FAMILIES {
+        for (n, nc) in [(120usize, 40usize), (200, 20)] {
+            let (mut ws, x, y, ids, p, n) = agq_gd_fit(family, n, nc, 0);
+            ws.hyper_scratch = None;
+            ws.agq_gd = None;
+            let mut cov_gd = Mat::<f64>::zeros(p, p);
+            let st = joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_gd);
+            assert_eq!(st, FdHessianStatus::Ok, "{family:?}");
+            assert!(ws.agq_gd.is_some(), "{family:?}: rung 2a did not run");
+            assert!(ws.hyper_scratch.is_none(), "{family:?}: rung 2 ran");
+            let tse_gd = theta_se(&ws);
+
+            let mut cov_again = Mat::<f64>::zeros(p, p);
+            joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_again);
+            for a in 0..p {
+                for b in 0..p {
+                    assert_eq!(
+                        cov_gd[(a, b)].to_bits(),
+                        cov_again[(a, b)].to_bits(),
+                        "{family:?}: second call moved cov[{a},{b}]"
+                    );
+                }
+            }
+
+            ws.fd.skip_agq_gradient_difference = true;
+            let mut cov_hd = Mat::<f64>::zeros(p, p);
+            let st = joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_hd);
+            ws.fd.skip_agq_gradient_difference = false;
+            assert_eq!(st, FdHessianStatus::Ok, "{family:?}");
+            assert!(ws.hyper_scratch.is_some(), "{family:?}: rung 2 did not run");
+            let tse_hd = theta_se(&ws);
+            for j in 0..p {
+                let (a, b) = (cov_gd[(j, j)].sqrt(), cov_hd[(j, j)].sqrt());
+                assert!(
+                    (a - b).abs() <= 1e-7 * b,
+                    "{family:?} n={n}: se[{j}] gd {a} vs hyper-dual {b}"
+                );
+            }
+            for k in 0..ws.n_theta {
+                assert!(
+                    (tse_gd[k] - tse_hd[k]).abs() <= 1e-7 * tse_hd[k],
+                    "{family:?} n={n}: theta_se[{k}] gd {} vs hyper-dual {}",
+                    tse_gd[k],
+                    tse_hd[k]
+                );
+            }
+        }
+    }
+}
+
+/// Past the hyper-dual lane cap (`m = 15 > MAX_DUAL_N`), where rung 2 refuses
+/// and the FD stencil used to take every AGQ fit: rung 2a takes the covered
+/// shapes, and its SEs agree with the stencil's within the stencil's own band
+/// (`AGQ_SE_HESSIAN_REL`, 2e-2; the stencil is the less accurate of the two).
+#[test]
+fn agq_gradient_difference_hessian_covers_past_the_lane_cap() {
+    for &family in AGQ_GD_FAMILIES {
+        let (mut ws, x, y, ids, p, n) = agq_gd_fit(family, 200, 40, 12);
+        assert!(ws.n_theta + p > crate::glmm::derivative::MAX_DUAL_N);
+        ws.agq_gd = None;
+        let mut cov_gd = Mat::<f64>::zeros(p, p);
+        let st = joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_gd);
+        assert_eq!(st, FdHessianStatus::Ok, "{family:?}");
+        assert!(ws.agq_gd.is_some(), "{family:?}: rung 2a did not run");
+        let tse_gd = theta_se(&ws);
+        ws.fd.force_fd_hessian = true;
+        let mut cov_fd = Mat::<f64>::zeros(p, p);
+        let st = joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
+        ws.fd.force_fd_hessian = false;
+        assert_eq!(st, FdHessianStatus::Ok, "{family:?}");
+        let tse_fd = theta_se(&ws);
+        for j in 0..p {
+            let (a, b) = (cov_gd[(j, j)].sqrt(), cov_fd[(j, j)].sqrt());
+            assert!(
+                (a - b).abs() <= 2e-2 * b,
+                "{family:?}: se[{j}] gd {a} vs fd {b}"
+            );
+        }
+        for k in 0..ws.n_theta {
+            assert!(
+                (tse_gd[k] - tse_fd[k]).abs() <= 2e-2 * tse_fd[k],
+                "{family:?}: theta_se[{k}] gd {} vs fd {}",
+                tse_gd[k],
+                tse_fd[k]
+            );
+        }
+    }
+}
+
+// --- B2: the at-mode gradient (one mode solve per point) ---
+
+/// The families the gradient search routes (binomial, any link; Poisson).
+fn b2_routed_family(f: Family) -> bool {
+    matches!(f, Family::Binomial { .. } | Family::Poisson { .. })
+}
+
+/// T1. `gradient_at_mode` after a fixed-β value evaluation at the shipped
+/// PIRLS tolerance against `gradient_f64` (which re-solves the mode at the
+/// derivative tolerance) at the same point, on every routed blocked and
+/// structured gate cell, crossed and nested tails, canonical and
+/// non-canonical links. The two differ only by where the mode solve stopped,
+/// so the band is that tolerance's effect on the gradient: measured at most
+/// 2.6e-10 relative on 94 grid cells (2026-10-07); 1e-8 here.
+#[test]
+fn gradient_at_mode_matches_the_re_solve_gradient() {
+    const BAND: f64 = 1e-8;
+    let mut worst_all = 0.0f64;
+    let mut sparse_cells = 0usize;
+    let mut run = |ws: &mut GlmmWorkspace,
+                   x: MatRef<f64>,
+                   y: &[f64],
+                   ids: &[u32],
+                   extra_ids: &[Vec<u32>],
+                   p: usize,
+                   n: usize,
+                   label: &str,
+                   mut rng: FixedSeedTheta| {
+        let m = ws.n_theta + p;
+        let k = ws.k.max(1);
+        for _ in 0..6 {
+            ws.params[..m].copy_from_slice(&rng.next_params());
+            ws.pirls.u[..k].fill(0.0);
+            let mut c = crate::counters::EvalCounters::new();
+            let dev = super::deviance::laplace_deviance_ws(
+                ws,
+                x,
+                y,
+                ids,
+                extra_ids,
+                n,
+                BetaMode::Fixed,
+                &mut c,
+            );
+            assert!(dev.is_finite(), "{label}: value not finite");
+            let mut got = vec![0.0; m];
+            super::assembled::gradient_at_mode_ws(ws, x, y, ids, extra_ids, p, n, &mut got)
+                .unwrap_or_else(|| panic!("{label}: at-mode gradient declined"));
+            let mut want = vec![0.0; m];
+            super::assembled::gradient_f64(ws, x, y, ids, extra_ids, p, n, &mut want)
+                .unwrap_or_else(|| panic!("{label}: re-solve gradient declined"));
+            for j in 0..m {
+                let gap = (got[j] - want[j]).abs() / want[j].abs().max(1.0);
+                worst_all = worst_all.max(gap);
+                assert!(
+                    gap <= BAND,
+                    "{label} coord {j}: at-mode {} vs re-solve {} (gap {gap:e})",
+                    got[j],
+                    want[j]
+                );
+            }
+        }
+    };
+    for &(family, shape) in GRADIENT_GATE_CELLS {
+        if !b2_routed_family(family) {
+            continue;
+        }
+        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+        let label = format!("{family:?}/{shape}");
+        run(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            &label,
+            fixed_seed_theta(shape),
+        );
+    }
+    for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
+        if !b2_routed_family(family) {
+            continue;
+        }
+        let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
+        let label = format!("{family:?}/{shape}");
+        run(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &label,
+            fixed_seed_theta(shape),
+        );
+        // The production structured path: the value pass on the cached sparse
+        // Schur factor (built per fit by `fit::glmm`), the gradient inverting
+        // `S` off that factor rather than re-solving on the dense one.
+        ws.pattern.structured_schur =
+            super::workspace::StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+        if ws.pattern.structured_schur.is_some() {
+            sparse_cells += 1;
+            run(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &extra_ids,
+                p,
+                n,
+                &format!("{label}/sparse"),
+                fixed_seed_theta(shape),
+            );
+        }
+    }
+    assert!(
+        sparse_cells > 0,
+        "no structured cell on the sparse Schur factor"
+    );
+    println!("at-mode vs re-solve gradient: worst relative gap {worst_all:e}");
+}
+
+/// T2. The at-mode gradient against central differences of the fixed-β
+/// value, in the θ regimes the search crosses: a random draw, one diagonal θ
+/// near a variance collapse (1e-3), and large θ (diagonals 8). PIRLS runs
+/// from û = 0 at 1e-12 for every evaluation, so the differences see the
+/// objective, not the solver's stopping point. Band 1e-5 relative, with an
+/// absolute floor of 1e-6·(1 + |g|∞), as the existing FD gates use.
+#[test]
+fn gradient_at_mode_matches_finite_differences_across_theta_regimes() {
+    let mut cells = 0usize;
+    for &(family, shape) in GRADIENT_GATE_CELLS {
+        if !b2_routed_family(family) {
+            continue;
+        }
+        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+        ws.fd.pirls_tol_override = Some(1e-12);
+        let m = ws.n_theta + p;
+        let k = ws.k.max(1);
+        let diag: Vec<usize> = ws.groupings.diagonal_theta().to_vec();
+        let mut rng = fixed_seed_theta(shape);
+        let base = rng.next_params();
+        let mut regimes = vec![base.clone()];
+        let mut near = base.clone();
+        near[diag[0]] = 1e-3;
+        regimes.push(near);
+        let mut large = base.clone();
+        for &i in &diag {
+            large[i] = 8.0;
+        }
+        regimes.push(large);
+        for (r, point) in regimes.iter().enumerate() {
+            let value = |ws: &mut GlmmWorkspace, pt: &[f64]| -> f64 {
+                ws.params[..m].copy_from_slice(pt);
+                ws.pirls.u[..k].fill(0.0);
+                let mut c = crate::counters::EvalCounters::new();
+                super::deviance::laplace_deviance_ws(
+                    ws,
+                    x.as_ref(),
+                    &y,
+                    &ids,
+                    &[],
+                    n,
+                    BetaMode::Fixed,
+                    &mut c,
+                )
+            };
+            let f0 = value(&mut ws, point);
+            assert!(
+                f0.is_finite(),
+                "{family:?}/{shape} regime {r}: value not finite"
+            );
+            let mut g = vec![0.0; m];
+            super::assembled::gradient_at_mode_ws(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut g)
+                .unwrap_or_else(|| panic!("{family:?}/{shape} regime {r}: gradient declined"));
+            let gmax = g.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+            let mut pt = point.clone();
+            for j in 0..m {
+                let h = 1e-5 * point[j].abs().max(1.0);
+                pt[j] = point[j] + h;
+                let fp = value(&mut ws, &pt);
+                pt[j] = point[j] - h;
+                let fm = value(&mut ws, &pt);
+                pt[j] = point[j];
+                let fd = (fp - fm) / (2.0 * h);
+                let tol = 1e-5 * fd.abs() + 1e-6 * (1.0 + gmax);
+                assert!(
+                    (g[j] - fd).abs() <= tol,
+                    "{family:?}/{shape} regime {r} coord {j}: at-mode {} vs FD {fd} (tol {tol:e})",
+                    g[j]
+                );
+            }
+        }
+        cells += 1;
+    }
+    assert!(cells > 0, "no routed gate cell");
+}
+
+// --- B2: the gradient route ---
+
+/// `fit_glmm` cold (or from `theta_start`) on a gate fixture, target column 1.
+#[allow(clippy::too_many_arguments)]
+fn b2_fit(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    theta_start: Option<&[f64]>,
+    beta0: &[f64],
+    n: usize,
+) -> GlmmFit {
+    fit_glmm(
+        ws,
+        x,
+        y,
+        ids,
+        extra_ids,
+        &[1],
+        theta_start,
+        beta0,
+        n,
+        WaldSe::Rx,
+        ColumnScaling::IDENTITY,
+    )
+}
+
+/// Gate 1 in-crate: on every routed gate cell (binomial or Poisson, blocked
+/// and structured, n_θ ≥ 2) the gradient route's fit is converged and its
+/// deviance is at or below the BOBYQA route's within `1e-6`, cold and from a
+/// warm start at the BOBYQA optimum perturbed by 10%; one-θ cells do not
+/// route.
+#[test]
+fn gradient_route_matches_or_beats_the_bobyqa_route() {
+    let mut routed = 0usize;
+    let mut check = |mut ws: GlmmWorkspace,
+                     x: MatRef<f64>,
+                     y: &[f64],
+                     ids: &[u32],
+                     extra_ids: &[Vec<u32>],
+                     p: usize,
+                     n: usize,
+                     label: &str| {
+        let beta0 = vec![0.0; p];
+        let plan = ws.route_plan;
+        ws.route_plan = crate::optim::RoutePlan::BOBYQA;
+        let bob = b2_fit(&mut ws, x, y, ids, extra_ids, None, &beta0, n);
+        let theta_bob = ws.params[..ws.n_theta].to_vec();
+        assert!(
+            ws.grad_report.is_none(),
+            "{label}: BOBYQA plan ran a gradient search"
+        );
+        ws.route_plan = plan;
+        let cold = b2_fit(&mut ws, x, y, ids, extra_ids, None, &beta0, n);
+        let warm_start: Vec<f64> = theta_bob.iter().map(|t| 1.1 * t).collect();
+        let warm = b2_fit(&mut ws, x, y, ids, extra_ids, Some(&warm_start), &beta0, n);
+        if ws.n_theta < 2 {
+            assert!(ws.grad_report.is_none(), "{label}: a one-θ fit routed");
+            return;
+        }
+        routed += 1;
+        assert!(
+            ws.grad_report.is_some(),
+            "{label}: the warm fit did not route"
+        );
+        for (kind, f) in [("cold", &cold), ("warm", &warm)] {
+            assert!(f.converged, "{label} {kind}: not converged");
+            assert!(
+                f.deviance <= bob.deviance + 1e-6,
+                "{label} {kind}: gradient route {} vs BOBYQA {}",
+                f.deviance,
+                bob.deviance
+            );
+        }
+    };
+    for &(family, shape) in GRADIENT_GATE_CELLS {
+        if !b2_routed_family(family) {
+            continue;
+        }
+        let (ws, x, y, ids, p, n) = fixture(family, shape);
+        check(
+            ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            &format!("{family:?}/{shape}"),
+        );
+    }
+    for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
+        if !b2_routed_family(family) {
+            continue;
+        }
+        let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
+        ws.pattern.structured_schur =
+            super::workspace::StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+        check(
+            ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &format!("{family:?}/{shape}"),
+        );
+    }
+    assert!(routed > 0, "no gate cell took the gradient route");
+}
+
+/// T5. The rule's table: in scope only binomial/Poisson Laplace with
+/// n_θ ≥ 2 on the blocked or structured layout; AGQ, NB, Gamma and one-θ
+/// shapes keep BOBYQA on both start kinds.
+#[test]
+fn gradient_route_plan_follows_the_rule() {
+    use crate::optim::{OuterOptimizer, RoutePlan};
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let (ws, ..) = fixture(logit, "q2s");
+    assert_eq!(ws.route_plan.cold, OuterOptimizer::Bfgs, "q2s logit cold");
+    assert_eq!(ws.route_plan.warm, OuterOptimizer::Bfgs, "q2s logit warm");
+    let (ws, ..) = fixture(logit, "int1");
+    assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "one θ");
+    let (ws, ..) = fixture_with_nagq(logit, "q2s", 7);
+    assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "AGQ");
+    for family in [
+        Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+    ] {
+        let (ws, ..) = fixture(family, "q2s");
+        assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "{family:?}");
+    }
+}
+
+/// T4. The hand-over rung: an iteration cap of 2 ends the gradient search on
+/// `MaxIter`, the BOBYQA route finishes from its incumbent, the fit converges
+/// at the BOBYQA route's optimum within `1e-6`, and the fallback is recorded
+/// for `Note::GradientSearchFallback`.
+#[test]
+fn gradient_route_hands_over_on_the_iteration_cap() {
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let (mut ws, x, y, ids, p, n) = fixture(logit, "q2s");
+    let beta0 = vec![0.0; p];
+    let plan = ws.route_plan;
+    ws.route_plan = crate::optim::RoutePlan::BOBYQA;
+    let bob = b2_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    ws.route_plan = plan;
+    ws.grad_cfg.max_iter = 2;
+    let f = b2_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    let (stop, _, _, rung) = ws.grad_report.expect("routed");
+    assert_eq!(stop, crate::optim::bfgs::BfgsStop::MaxIter);
+    assert_eq!(rung, 1);
+    assert!(f.gradient_search_fallback, "fallback not recorded");
+    assert!(f.converged, "the BOBYQA finish did not converge");
+    assert!(
+        (f.deviance - bob.deviance).abs() <= 1e-6,
+        "fallback {} vs BOBYQA {}",
+        f.deviance,
+        bob.deviance
+    );
+    // The search's own evaluations are counted on top of BOBYQA's.
+    assert!(f.n_eval > bob.n_eval.min(f.n_eval - 1));
+}
+
+/// T9. The gradient route keeps per-fit determinism: a routed fit on a
+/// workspace that has fitted other data first (another response, and a warm
+/// start) matches a fresh workspace's fit of the same data bit for bit,
+/// because the search's state (`BfgsState`, the incumbent mode, the assembly
+/// scratch) is reset or rewritten per fit.
+#[test]
+fn gradient_route_refit_on_a_reused_workspace_is_bit_identical() {
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let (mut fresh, x, y, ids, p, n) = fixture(logit, "q2s");
+    let beta0 = vec![0.0; p];
+    let want = b2_fit(&mut fresh, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    assert!(fresh.grad_report.is_some(), "q2s did not route");
+    let (mut ws, ..) = fixture(logit, "q2s");
+    let y2: Vec<f64> = y.iter().map(|v| 1.0 - v).collect();
+    let _ = b2_fit(&mut ws, x.as_ref(), &y2, &ids, &[], None, &beta0, n);
+    let _ = b2_fit(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &[],
+        Some(&[0.4, 0.1, 0.3]),
+        &beta0,
+        n,
+    );
+    let got = b2_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    assert_eq!(got.deviance.to_bits(), want.deviance.to_bits(), "deviance");
+    assert_eq!(got.n_eval, want.n_eval, "n_eval");
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&ws.params), bits(&fresh.params), "params");
+    assert_eq!(bits(&ws.betas), bits(&fresh.betas), "betas");
+}
+
+/// T6. Units of X: the routed fit with the slope column multiplied by 1e3
+/// and by 1e-3 (`fit_glmm` directly, so no standardization upstream) ends at
+/// or below the BOBYQA route's deviance on the same scaled data within `1e-6`,
+/// and the logit fit at the unscaled optimum within `1e-7`. This is what
+/// decided the whitened β coordinates (`BetaScale`): in the caller's units
+/// the logit fit at 1e-3 stopped 5.5e-4 above the optimum. The column also
+/// carries the random slope, so its θ rescales by the inverse factor and the
+/// Poisson fixture's boundary optimum (every variance at 0) is hard for both
+/// routes there: at 1e-3 BOBYQA ends 1.8e-5 above it, BFGS 1.8e-6
+/// (2026-10-07).
+#[test]
+fn gradient_route_is_unit_invariant_in_beta() {
+    for family in [
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+    ] {
+        let (mut ws, x, y, ids, p, n) = fixture(family, "q2s");
+        let beta0 = vec![0.0; p];
+        let base = b2_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+        for scale in [1e3, 1e-3] {
+            let mut xs = x.clone();
+            for i in 0..n {
+                xs[(i, 1)] *= scale;
+            }
+            let (mut w2, ..) = fixture(family, "q2s");
+            let f = b2_fit(&mut w2, xs.as_ref(), &y, &ids, &[], None, &beta0, n);
+            assert!(w2.grad_report.is_some(), "{family:?} x{scale}: not routed");
+            let (mut wb, ..) = fixture(family, "q2s");
+            wb.route_plan = crate::optim::RoutePlan::BOBYQA;
+            let b = b2_fit(&mut wb, xs.as_ref(), &y, &ids, &[], None, &beta0, n);
+            assert!(f.converged, "{family:?} x{scale}: not converged");
+            assert!(
+                f.deviance <= b.deviance + 1e-6,
+                "{family:?} x{scale}: gradient route {} vs BOBYQA {}",
+                f.deviance,
+                b.deviance
+            );
+            if matches!(family, Family::Binomial { .. }) {
+                assert!(
+                    (f.deviance - base.deviance).abs() <= 1e-7,
+                    "{family:?} x{scale}: {} vs unscaled {}",
+                    f.deviance,
+                    base.deviance
+                );
+            }
+        }
+    }
+}
+
+/// B2.4. The GLMM curvature hint: a pilot fit's own final BFGS estimate is
+/// offered (`glmm_curvature_hint`), a hinted fit reads it without writing it,
+/// results do not depend on the order of hinted draws, and a hinted draw ends
+/// at or below the unhinted one's deviance within `1e-6`.
+#[test]
+fn gradient_route_curvature_hint_is_read_only_and_order_free() {
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let (mut pilot, x, y, ids, p, n) = fixture(logit, "q2s");
+    let beta0 = vec![0.0; p];
+    let _ = b2_fit(&mut pilot, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    let hint = super::glmm_curvature_hint(&pilot).expect("a routed pilot offers a hint");
+    assert_eq!(hint.dim(), pilot.n_theta + p);
+    let hint_bits: Vec<u64> = hint.inv_hessian().iter().map(|v| v.to_bits()).collect();
+    let draws: Vec<Vec<f64>> = (0..3)
+        .map(|d| {
+            y.iter()
+                .enumerate()
+                .map(|(i, &v)| if (i + d) % 11 == 0 { 1.0 - v } else { v })
+                .collect()
+        })
+        .collect();
+    let run = |order: &[usize]| -> Vec<(u64, usize)> {
+        let (mut ws, ..) = fixture(logit, "q2s");
+        let mut out = vec![(0u64, 0usize); draws.len()];
+        for &d in order {
+            ws.grad_hint_in = Some(hint.clone());
+            let f = b2_fit(&mut ws, x.as_ref(), &draws[d], &ids, &[], None, &beta0, n);
+            assert!(ws.grad_hint_in.is_none(), "the hint outlived its call");
+            out[d] = (f.deviance.to_bits(), f.n_eval);
+        }
+        out
+    };
+    let a = run(&[0, 1, 2]);
+    let b = run(&[2, 0, 1]);
+    assert_eq!(a, b, "hinted results depend on the order of the draws");
+    let after: Vec<u64> = hint.inv_hessian().iter().map(|v| v.to_bits()).collect();
+    assert_eq!(hint_bits, after, "the fit wrote the hint");
+    let (mut plain, ..) = fixture(logit, "q2s");
+    for (d, yd) in draws.iter().enumerate() {
+        let f = b2_fit(&mut plain, x.as_ref(), yd, &ids, &[], None, &beta0, n);
+        assert!(
+            f64::from_bits(a[d].0) <= f.deviance + 1e-6,
+            "draw {d}: hinted {} vs unhinted {}",
+            f64::from_bits(a[d].0),
+            f.deviance
+        );
+        println!(
+            "hint draw {d}: n_eval hinted {} unhinted {}",
+            a[d].1, f.n_eval
+        );
+    }
+}
+
+/// T7. Quasi-separation: the `q2s` logit fixture with its response replaced by
+/// a near-step in the slope covariate (`y = 1` where `x₁ > 0`, every 13th row
+/// flipped), so β₁ runs off along a flat direction. The gradient route must
+/// either end converged at a deviance no worse than the BOBYQA route's by
+/// more than `dev_eps` (4e-5), or hand over to BOBYQA; it must never accept an
+/// endpoint that stopped on its iteration cap (rung 0 only on a convergence
+/// stop).
+#[test]
+fn gradient_route_handles_quasi_separation() {
+    use crate::optim::bfgs::BfgsStop;
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let (mut ws, x, _y, ids, p, n) = fixture(logit, "q2s");
+    let y: Vec<f64> = (0..n)
+        .map(|i| {
+            let step = if x[(i, 1)] > 0.0 { 1.0 } else { 0.0 };
+            if i % 13 == 0 {
+                1.0 - step
+            } else {
+                step
+            }
+        })
+        .collect();
+    let beta0 = vec![0.0; p];
+    let f = b2_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    let report = ws.grad_report;
+    assert!(report.is_some(), "the quasi-separated fit did not route");
+    let (mut wb, ..) = fixture(logit, "q2s");
+    wb.route_plan = crate::optim::RoutePlan::BOBYQA;
+    let b = b2_fit(&mut wb, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    assert!(f.deviance.is_finite(), "routed deviance {}", f.deviance);
+    if let Some((stop, _, _, rung)) = report {
+        if rung == 0 {
+            assert!(
+                matches!(
+                    stop,
+                    BfgsStop::Fdelta | BfgsStop::Pgrad | BfgsStop::NoiseFloor
+                ),
+                "an endpoint stopped on {stop:?} was accepted"
+            );
+        }
+    }
+    if f.converged && !f.gradient_search_fallback {
+        assert!(
+            f.deviance <= b.deviance + 4e-5,
+            "gradient route {} vs BOBYQA {}",
+            f.deviance,
+            b.deviance
+        );
+    }
+    assert!(
+        f.converged || f.gradient_search_fallback || !b.converged,
+        "the routed fit failed where BOBYQA converged, with no Note"
+    );
+}
+
+/// The second and third routed fits on a reused workspace allocate the same
+/// and no more than the same fits on the BOBYQA plan: the gradient search
+/// (its `BfgsState`, the assembly scratch kept under `GRAD_ASM_KEEP_BYTES`)
+/// allocates nothing per fit once the workspace has fitted once.
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests gradient_route_repeat_fits_allocate_no_more -- --ignored --test-threads=1`
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn gradient_route_repeat_fits_allocate_no_more() {
+    let _serial = crate::test_support::alloc_test_guard();
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let (mut wr, x, y, ids, p, n) = fixture(logit, "q2s");
+    let (mut wb, ..) = fixture(logit, "q2s");
+    wb.route_plan = crate::optim::RoutePlan::BOBYQA;
+    let beta0 = vec![0.0; p];
+    let mut blocks = |ws: &mut GlmmWorkspace| {
+        let prof = dhat::Profiler::builder().testing().build();
+        let _ = b2_fit(ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+        let stats = dhat::HeapStats::get();
+        drop(prof);
+        stats.total_blocks
+    };
+    let _ = b2_fit(&mut wr, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    assert!(wr.grad_report.is_some(), "q2s did not route");
+    let _ = b2_fit(&mut wb, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    let r2 = blocks(&mut wr);
+    let r3 = blocks(&mut wr);
+    let b2 = blocks(&mut wb);
+    assert_eq!(r2, r3, "routed refits allocate a growing amount");
+    assert!(r2 <= b2, "routed refit {r2} blocks vs BOBYQA refit {b2}");
 }

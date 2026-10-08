@@ -129,7 +129,7 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
         &mut scratch.lam,
         cluster_ids,
         &mut structured.m_core_buf,
-        &mut structured.cross_val,
+        &mut structured.cross_theta,
         &mut pattern.cross_col,
         &mut pattern.n_cross,
         n,

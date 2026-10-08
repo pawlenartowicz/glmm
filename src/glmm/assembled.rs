@@ -67,12 +67,13 @@ use super::derivative::{
 };
 use super::deviance::{blocked_laplace_deviance, structured_laplace_deviance};
 use super::pirls::{
-    block_forward_solve, fill_m_vals, packed_m_vals_theta_deriv, pirls_solve_packed,
-    structured_ainv_solve, structured_factor, BetaStep, TailKernel,
+    block_forward_solve, fill_m_vals, obs_len, packed_m_vals_theta_deriv, pirls_solve_packed,
+    stream_fill, structured_ainv_solve, structured_factor, structured_stream_deviance, BetaStep,
+    StreamRows, TailKernel,
 };
 use super::workspace::{
     glmm_block_chol, glmm_block_solve, glmm_block_solve_sub, packed_m_theta_deriv, tail_components,
-    GlmmLayout, GlmmWorkspace, StructuredPattern,
+    GlmmLayout, GlmmWorkspace, StructuredPattern, StructuredSchur,
 };
 // Named only in `gradient_f64`, which destructures `ws.pirls`/`ws.structured`
 // field-by-field.
@@ -92,26 +93,25 @@ use super::workspace::{PirlsScratch, StructuredScratch};
 ///
 /// Lengths, with `k = q_core·s + e` the packed RE dimension:
 /// `tail_inv` `(e²).max(1)`, `tail_col` `e.max(1)`, the tail-component
-/// scratch `comp_parent`/`comp_cols` `e` and `comp_ptr` `e + 1`, the four row vectors
-/// `rows`, `d_gamma`/`l_gamma` `m`, `d_u`/`l_u`/`adj` `k.max(1)`, `g_gamma`
+/// scratch `comp_parent`/`comp_cols` `e` and `comp_ptr` `e + 1`,
+/// `d_gamma`/`l_gamma` `m`, `d_u`/`l_u`/`adj` `k.max(1)`, `g_gamma`
 /// `(m·k).max(1)`, the crossed-tail forms `tail_h`
 /// ([`coupling_len`](super::workspace::coupling_len)) and
 /// `tail_g` `(s·q_core²).max(1)`, and the observed factor `(s·q_core²).max(1)` /
-/// `coupling_len` / `(e²).max(1)` on every shape, canonical or not — the
-/// same three shapes `DualStep`'s own twin carries, which stays sized to zero on
-/// canonical links through `pirls::obs_len`: that twin serves the kernel's own
-/// inexact step on a clamped canonical fit, which the settle loop in
-/// `run_assembled_hessian` resolves, not this buffer.
+/// `coupling_len` / `(e²).max(1)` through `pirls::obs_len`: sized on a
+/// non-canonical link, empty on a canonical one. Every reader branches on the
+/// static `is_canonical(family)`, never on row state, and the canonical arm
+/// solves against the Fisher factor the mode solve already built, so a
+/// canonical fit never reads them. (`DualStep`'s own observed twin, sized the
+/// same way, serves the dual kernel's inexact step on a clamped canonical fit,
+/// which the settle loop in `run_assembled_hessian` resolves; it is not this
+/// buffer.)
 pub(crate) struct AssemblyBufs<T: Scalar> {
     pub(super) tail_inv: Vec<T>,
     pub(super) tail_col: Vec<T>,
     pub(super) comp_parent: Vec<u32>,
     pub(super) comp_ptr: Vec<u32>,
     pub(super) comp_cols: Vec<u32>,
-    pub(super) rho: Vec<T>,
-    pub(super) w_eta: Vec<T>,
-    pub(super) w_obs: Vec<T>,
-    pub(super) lev: Vec<T>,
     pub(super) d_gamma: Vec<T>,
     pub(super) l_gamma: Vec<T>,
     pub(super) d_u: Vec<T>,
@@ -150,9 +150,8 @@ pub(crate) struct AssemblyBufs<T: Scalar> {
 /// assembly the same slices and there is no second code path.
 ///
 /// Lengths, with `width` the packed row width and `rows` the row capacity:
-/// `a`/`a_inv`/`obs` `k²` each — `obs` is sized on every shape, canonical or
-/// not, because whether a fit's μ pins a row is not known at sizing time
-/// — `col` `k.max(1)`, `m_vals` `rows·width`, `eta`/`prob`/`w` `rows`, `u`
+/// `a`/`a_inv` `k²` each, `obs` `k²` on a non-canonical link and empty on a
+/// canonical one (every reader is a non-canonical arm), `col` `k.max(1)`, `m_vals` `rows·width`, `eta`/`prob`/`w` `rows`, `u`
 /// `k.max(1)`, `m_deriv` `width`. Every one of them is empty on a non-packed
 /// layout, which never reads them.
 pub(crate) struct PackedAsmBufs<T: Scalar> {
@@ -195,16 +194,16 @@ impl<T: Scalar> PackedAsmBufs<T> {
     }
 
     /// Sized for a packed shape; `width == 0` means a non-packed layout and
-    /// yields [`PackedAsmBufs::empty`]. `obs` is sized on every shape,
-    /// canonical or not, though only a non-canonical fit builds `A_obs` in it.
-    fn for_shape(k: usize, rows: usize, width: usize) -> PackedAsmBufs<T> {
+    /// yields [`PackedAsmBufs::empty`]. `obs` is sized only when `observed`
+    /// (`!is_canonical`): only a non-canonical fit builds `A_obs` in it.
+    fn for_shape(k: usize, rows: usize, width: usize, observed: bool) -> PackedAsmBufs<T> {
         if width == 0 {
             return PackedAsmBufs::empty();
         }
         PackedAsmBufs {
             a: vec![T::ZERO; k * k],
             a_inv: vec![T::ZERO; k * k],
-            obs: vec![T::ZERO; k * k],
+            obs: vec![T::ZERO; obs_len(observed, k * k)],
             col: vec![T::ZERO; k.max(1)],
             m_vals: vec![T::ZERO; rows * width],
             eta: vec![T::ZERO; rows],
@@ -230,10 +229,6 @@ impl<T: Scalar> AssemblyBufs<T> {
             comp_parent: Vec::new(),
             comp_ptr: Vec::new(),
             comp_cols: Vec::new(),
-            rho: Vec::new(),
-            w_eta: Vec::new(),
-            w_obs: Vec::new(),
-            lev: Vec::new(),
             d_gamma: Vec::new(),
             l_gamma: Vec::new(),
             d_u: Vec::new(),
@@ -254,9 +249,9 @@ impl<T: Scalar> AssemblyBufs<T> {
     /// assembly on a shape whose crossed tail is empty still holds the
     /// `.max(1)` minimum, so the first call on any shape allocates nothing.
     /// The observed factor (`obs_core`/`obs_coup`/`obs_schur`,
-    /// `packed.obs`) is sized on every shape, canonical or not: whether
-    /// a fit's μ pins a row, which needs `A_obs` even on a canonical link, is
-    /// not known this early.
+    /// `packed.obs`) is sized only when `observed` (`!is_canonical(family)`):
+    /// every reader branches on that static flag, so a canonical fit never
+    /// reads it (`binb_q4` at `Dual<12>`: 83 B/row saved).
     ///
     /// `packed_width` is the packed-row width on `GlmmLayout::Packed` and 0 on
     /// every other layout, which allocates none of [`PackedAsmBufs`].
@@ -268,7 +263,27 @@ impl<T: Scalar> AssemblyBufs<T> {
         s: usize,
         q_core: usize,
         e: usize,
+        observed: bool,
         packed_width: usize,
+    ) -> AssemblyBufs<T> {
+        Self::for_shape_coup(m, k, rows, s, q_core, e, observed, packed_width, None)
+    }
+
+    /// [`Self::for_shape`] with the compact coupling length of `tail_h` and
+    /// `obs_coup` given (`Some`), as the dual scratch sizes it from the
+    /// design's coupling pattern; `None` takes the
+    /// [`coupling_len`](super::workspace::coupling_len) bound.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_shape_coup(
+        m: usize,
+        k: usize,
+        rows: usize,
+        s: usize,
+        q_core: usize,
+        e: usize,
+        observed: bool,
+        packed_width: usize,
+        coup_len: Option<usize>,
     ) -> AssemblyBufs<T> {
         let kk = k.max(1);
         // The crossed-tail reducer and the blocked/structured observed twin
@@ -279,36 +294,49 @@ impl<T: Scalar> AssemblyBufs<T> {
         // megabytes of unread `Dual` elements). Mirrors the same reduction
         // `derivative::DenseTwinShape` applies to the dual PIRLS twins —
         // change together.
-        let packed = PackedAsmBufs::for_shape(k, rows, packed_width);
+        let packed = PackedAsmBufs::for_shape(k, rows, packed_width, observed);
         let (s, q_core, e) = if packed_width > 0 {
             (0, 1, 0)
         } else {
             (s, q_core, e)
         };
         let ee = e.max(1);
+        let coup_len = match coup_len {
+            Some(len) if packed_width == 0 => len,
+            _ => super::workspace::coupling_len(rows, s, q_core, e),
+        };
         AssemblyBufs {
             tail_inv: vec![T::ZERO; (e * e).max(1)],
             tail_col: vec![T::ZERO; ee],
             comp_parent: vec![0; e],
             comp_ptr: vec![0; e + 1],
             comp_cols: vec![0; e],
-            rho: vec![T::ZERO; rows],
-            w_eta: vec![T::ZERO; rows],
-            w_obs: vec![T::ZERO; rows],
-            lev: vec![T::ZERO; rows],
             d_gamma: vec![T::ZERO; m],
             l_gamma: vec![T::ZERO; m],
             d_u: vec![T::ZERO; kk],
             l_u: vec![T::ZERO; kk],
             g_gamma: vec![T::ZERO; (m * k).max(1)],
             adj: vec![T::ZERO; kk],
-            tail_h: vec![T::ZERO; super::workspace::coupling_len(rows, s, q_core, e)],
+            tail_h: vec![T::ZERO; coup_len],
             tail_g: vec![T::ZERO; (s * q_core * q_core).max(1)],
-            obs_core: vec![T::ZERO; (s * q_core * q_core).max(1)],
-            obs_coup: vec![T::ZERO; super::workspace::coupling_len(rows, s, q_core, e)],
-            obs_schur: vec![T::ZERO; (e * e).max(1)],
+            obs_core: vec![T::ZERO; obs_len(observed, (s * q_core * q_core).max(1))],
+            obs_coup: vec![T::ZERO; obs_len(observed, coup_len)],
+            obs_schur: vec![T::ZERO; obs_len(observed, (e * e).max(1))],
             packed,
         }
+    }
+
+    /// Bytes held at `T = f64` by the buffers that scale with the design
+    /// (`G_γ` and the crossed tail's), for the gradient search's keep-or-release
+    /// decision after a fit.
+    pub(crate) fn f64_bytes(&self) -> usize {
+        8 * (self.g_gamma.len()
+            + self.tail_inv.len()
+            + self.tail_h.len()
+            + self.tail_g.len()
+            + self.obs_core.len()
+            + self.obs_coup.len()
+            + self.obs_schur.len())
     }
 
     /// The packed state's `rows·width`, 0 on every non-packed shape — the one
@@ -454,9 +482,13 @@ fn mode_solve_f64(
 /// — one `Dual` set and one `f64` set of the same shape terms, plus the `f64`
 /// half's own `U` (`m·k`, `û`'s first-order response), gradient (`m`),
 /// `∂m/∂θ` row scratch (`width`) and two mode snapshots (`2k`).
-/// [`packed_peak_bytes`] is that expression. `A_obs` is sized on every shape,
-/// canonical or not, so the `set` term is a flat `3·k²` rather than
-/// `(2 + obs)·k²`. What it leaves out
+/// [`packed_peak_bytes`] is that expression, and it is now an upper bound in
+/// two terms: `A_obs` is sized only on a non-canonical link (`k²` less on a
+/// canonical one), and the assembly no longer stores `ρ`, `w'`, `w_obs`, `h`
+/// per row (its row passes are fused, so `4n` less). Both stay in the
+/// expression on purpose: a smaller figure would let more packed shapes pass
+/// this ceiling and so change which SE path they take, a routing change left
+/// to its own study. What it leaves out
 /// is the crossed-tail reducer and the blocked/structured observed twin,
 /// which a packed shape sizes at their `.max(1)` minimum — six elements, not
 /// a term.
@@ -563,12 +595,34 @@ pub(crate) fn gradient_f64(
     n: usize,
     grad: &mut [f64],
 ) -> Option<()> {
+    gradient_f64_with_dev(ws, x, y, cluster_ids, extra_ids, p, n, grad, None)
+}
+
+/// [`gradient_f64`], also writing `D_γ` into `dev_grad[..n_θ + p]` when it is
+/// given: the partial of the data deviance `D(η(γ, û))` at the fixed mode,
+/// which pass 1 and 2 form on the way to `D*_γ`. The penalty `‖u‖²` does not
+/// depend on `γ` and `û` minimizes the penalized deviance `P = D + ‖u‖²`, so
+/// `D_γ` is the total derivative `∇P̂` of the penalized deviance at the mode
+/// (envelope theorem). The mixed-Gamma `ln φ` row of the joint Hessian reads it
+/// (`se::joint_hessian_cov_at`, `DispRow::Gamma`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gradient_f64_with_dev(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    p: usize,
+    n: usize,
+    grad: &mut [f64],
+    dev_grad: Option<&mut [f64]>,
+) -> Option<()> {
     // At the fitted Gamma dispersion, differentiate the fixed-φ GLMM the fit
     // minimized (`GlmmWorkspace::at_fixed_dispersion`); inside, `gamma_phi` is 1
     // and this guard does not fire again.
     if ws.dispersion_scaled() {
         return ws.at_fixed_dispersion(n, |ws| {
-            gradient_f64(ws, x, y, cluster_ids, extra_ids, p, n, grad)
+            gradient_f64_with_dev(ws, x, y, cluster_ids, extra_ids, p, n, grad, dev_grad)
         });
     }
     // `assembly_routes` also admits the packed layout, whose engine is
@@ -622,7 +676,7 @@ pub(crate) fn gradient_f64(
                 coupling,
                 schur_blk,
                 m_core_buf,
-                cross_val,
+                cross_theta,
             },
         pattern:
             StructuredPattern {
@@ -643,6 +697,7 @@ pub(crate) fn gradient_f64(
         g.n_primary,
         g.primary_q + g.nested_per_parent,
         g.k_crossed(),
+        !crate::family::is_canonical(family),
         0,
     );
 
@@ -665,7 +720,7 @@ pub(crate) fn gradient_f64(
         if extras { core_blocks } else { a_blocks },
         coupling,
         schur_blk,
-        cross_val,
+        cross_theta,
         cross_col,
         n_cross,
         coup_cols,
@@ -676,9 +731,234 @@ pub(crate) fn gradient_f64(
         n,
         &mut asm,
         grad,
+        None,
+        false,
+        None,
     );
+    if let (Some(()), Some(dg)) = (out, dev_grad) {
+        dg[..m].copy_from_slice(&asm.d_gamma[..m]);
+    }
     u[..kk].copy_from_slice(&saved_u); // restore — leave ws.pirls.u as found
     out
+}
+
+/// The Laplace gradient `dD*/dγ`, `γ = [θ | β]`, at the mode state the LAST
+/// value evaluation left, with no mode solve: the gradient search's half of
+/// "one mode solve per point" (B2, 2026-10-07). Written into `grad[..n_θ + p]`.
+///
+/// `laplace_deviance` with `BetaMode::Fixed` at full PIRLS tolerance at the
+/// point `params` leaves `pirls.{eta, prob, w, u}`, the per-cluster factors
+/// (`a_blocks`; `core_blocks` and `coupling` on the structured layout) and the
+/// packed `M` rows at the returned iterate û, which is exactly what
+/// [`assemble`] reads. The caller vouches that nothing moved them since: the
+/// GLMM gradient objective (`glmm::GradSearch`) calls this only right after the
+/// value evaluation at the point it accepts. Where [`gradient_f64`] re-solves
+/// the mode on the dense tail factor, this reads the value pass's own: on the
+/// structured layout with the cached sparse Schur factor in use, `schur_blk`
+/// still holds the unfactored `S` (the sparse arm only gathers from it), so
+/// `S⁻¹` is inverted off that factor (`TailKernel::tail_inverse`, per tail
+/// component) and the canonical adjoint solve runs through it.
+///
+/// Measured against [`gradient_f64`] at the same points (94 grid cells,
+/// 2026-10-07): at most 6e-13 absolute and 2.6e-10 relative, and a gradient
+/// costs 1.12 value evaluations (median) where the re-solve one cost 1.83.
+///
+/// `None` where [`gradient_f64`] refuses: a clamped η row, a non-PD observed
+/// factor (non-canonical links). The caller has checked the layout (blocked,
+/// or structured within the dual tail bound, never packed) and that the fit
+/// has no dispersion coordinate. `asm` is the per-fit scratch, sized on the
+/// first call from the workspace's row capacity and reused while the shape
+/// matches, so a search allocates nothing per gradient.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gradient_at_mode(
+    g: &LmmGroupings,
+    family: Family,
+    nb_theta: f64,
+    x: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    params: &[f64],
+    z_buf: &[f64],
+    prior_w: &[f64],
+    pirls: &PirlsScratch<f64>,
+    structured: &StructuredScratch<f64>,
+    pattern: &mut StructuredPattern,
+    asm: &mut Option<AssemblyBufs<f64>>,
+    n_theta: usize,
+    p: usize,
+    n: usize,
+    grad: &mut [f64],
+) -> Option<()> {
+    if eta_clamped_rows(family, &pirls.eta[..n]) > 0 {
+        return None;
+    }
+    let m = n_theta + p;
+    let extras = !g.extra_offsets.is_empty();
+    let e = g.k_crossed();
+    let q_core = g.primary_q + g.nested_per_parent;
+    let k = q_core * g.n_primary + e;
+    let observed = !crate::family::is_canonical(family);
+    // Row capacity, not this fit's `n`: the sizing is then the same on every
+    // fit of the workspace and a loop never re-allocates.
+    let rows = pirls.eta.len();
+    let coup = super::workspace::coupling_len(rows, g.n_primary, q_core, e);
+    let fits = |a: &AssemblyBufs<f64>| {
+        a.d_gamma.len() == m
+            && a.g_gamma.len() == (m * k).max(1)
+            && a.adj.len() == k.max(1)
+            && a.tail_inv.len() == (e * e).max(1)
+            && a.tail_h.len() == coup
+            && a.tail_g.len() == (g.n_primary * q_core * q_core).max(1)
+            && a.obs_core.len() == obs_len(observed, (g.n_primary * q_core * q_core).max(1))
+    };
+    if !asm.as_ref().is_some_and(fits) {
+        *asm = Some(AssemblyBufs::<f64>::for_shape(
+            m,
+            k,
+            rows,
+            g.n_primary,
+            q_core,
+            e,
+            observed,
+            0,
+        ));
+    }
+    let asm = asm.as_mut().expect("sized above");
+    let PirlsScratch {
+        m_buf,
+        eta,
+        prob,
+        w,
+        u,
+        a_blocks,
+        ..
+    } = pirls;
+    let StructuredScratch {
+        core_blocks,
+        coupling,
+        schur_blk,
+        m_core_buf,
+        cross_theta,
+    } = structured;
+    let StructuredPattern {
+        cross_col,
+        n_cross,
+        coup_cols,
+        coup_ptr,
+        coup_pos,
+        structured_schur,
+        force_dense_schur,
+        ..
+    } = pattern;
+    // The factor the value pass used: the sparse one exactly when the
+    // structured solve took it (`Some(ss) if !force_dense`, blocked_extras.rs).
+    let mut ss = if extras && e > 0 && !*force_dense_schur {
+        structured_schur.as_mut()
+    } else {
+        None
+    };
+    let tail_ready = if let Some(ss) = ss.as_deref_mut() {
+        <f64 as TailKernel>::tail_inverse(
+            schur_blk,
+            e,
+            Some(ss),
+            &mut asm.tail_col[..e],
+            &mut asm.tail_inv,
+        );
+        true
+    } else {
+        false
+    };
+    assemble(
+        g,
+        family,
+        nb_theta,
+        x,
+        y,
+        cluster_ids,
+        extra_ids,
+        &params[..m],
+        z_buf,
+        &prior_w[..n],
+        eta,
+        prob,
+        w,
+        u,
+        if extras { m_core_buf } else { m_buf },
+        if extras { core_blocks } else { a_blocks },
+        coupling,
+        schur_blk,
+        cross_theta,
+        cross_col,
+        n_cross,
+        coup_cols,
+        coup_ptr,
+        coup_pos,
+        n_theta,
+        p,
+        n,
+        asm,
+        grad,
+        None,
+        tail_ready,
+        ss,
+    )
+}
+
+/// [`gradient_at_mode`] on a whole workspace, at `ws.params`: the tests'
+/// entry. `None` also on a shape the assembly does not route (packed, AGQ,
+/// past the dual tail bound) and on a dispersion-scaled workspace.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gradient_at_mode_ws(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    p: usize,
+    n: usize,
+    grad: &mut [f64],
+) -> Option<()> {
+    if ws.dispersion_scaled() || !assembly_routes(ws, n) || ws.layout == GlmmLayout::Packed {
+        return None;
+    }
+    let GlmmWorkspace {
+        groupings,
+        family,
+        nb_theta,
+        n_theta,
+        params,
+        z_buf,
+        prior_w,
+        pirls,
+        structured,
+        pattern,
+        grad_asm,
+        ..
+    } = ws;
+    let m = *n_theta + p;
+    gradient_at_mode(
+        groupings,
+        *family,
+        *nb_theta,
+        x,
+        y,
+        cluster_ids,
+        extra_ids,
+        &params[..m],
+        z_buf,
+        prior_w,
+        pirls,
+        structured,
+        pattern,
+        grad_asm,
+        *n_theta,
+        p,
+        n,
+        grad,
+    )
 }
 
 /// The joint Laplace Hessian `d²D*/dγdγ'` at the parameters in `ws.params`,
@@ -785,8 +1065,8 @@ pub(crate) fn joint_hessian_columns(
         .unwrap_or_else(|| super::pirls_tol_fd(family));
     // The FIRST-derivative ladder: the assembly reads first-order lanes only,
     // so a Hessian request here resolves to a `Dual` rung and chunks like a
-    // gradient does.
-    let nl = NLanes::pick(m, false).expect("the gradient ladder covers every m");
+    // gradient does, on the rung `pick_assembled`'s measured table gives.
+    let nl = NLanes::pick_assembled(m);
     let (s, q_p, q_core, e, nagq) = (
         ws.groupings.n_primary,
         ws.groupings.primary_q,
@@ -799,26 +1079,86 @@ pub(crate) fn joint_hessian_columns(
     // different one reallocates once.
     // Same twin sizing/pinning `laplace_gradient` uses.
     let observed = !crate::family::is_canonical(family);
+    let extras = !ws.groupings.extra_offsets.is_empty();
+    // Above one block of rows the per-row dual values never exist whole. On
+    // the blocked layout the pass runs block by block of whole clusters (the
+    // row-blocked pass); on the structured layout, whose crossed Schur couples
+    // every cluster, the solve and the assembly stream their row values block
+    // by block while the cluster- and pair-level accumulators stay whole (the
+    // streamed pass). Below one block, the whole-data pass runs unchanged.
+    let block_rows = ws.fd.se_row_block;
+    let coup_pairs = super::derivative::dual_coupling_pairs(&ws.pattern, s);
+    let row_blocked = ws.layout == GlmmLayout::Blocked && !extras && n > block_rows;
+    let streamed = ws.layout == GlmmLayout::Structured && extras && n > block_rows;
     let need_build = ws.dual_scratch.as_deref().is_none_or(|sc| {
-        sc.lanes() != nl || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq, observed, 0)
+        sc.lanes() != nl
+            || !if row_blocked {
+                sc.matches_shape_row_blocked(m, p, k, n, s, q_p, nagq, observed)
+            } else if streamed {
+                sc.matches_shape_streamed(
+                    m, p, k, n, s, q_p, q_core, e, nagq, observed, coup_pairs, block_rows,
+                )
+            } else {
+                sc.matches_shape(
+                    m, p, k, n, s, q_p, q_core, e, extras, nagq, observed, 0, coup_pairs,
+                )
+            }
     });
     if need_build {
-        ws.dual_scratch = Some(Box::new(GlmmDualScratch::for_shape(
-            nl,
-            m,
-            p,
-            k,
-            n,
-            s,
-            q_p,
-            q_core,
-            e,
-            nagq,
-            observed,
-            // The packed layout left through its own driver above.
-            0,
-            cluster_ids,
-        )));
+        // Drop the old scratch before sizing the new one, so the peak is not
+        // old plus new.
+        ws.dual_scratch = None;
+        ws.dual_scratch = Some(Box::new(if row_blocked {
+            GlmmDualScratch::for_shape_row_blocked(
+                nl,
+                m,
+                p,
+                k,
+                n,
+                s,
+                q_p,
+                nagq,
+                observed,
+                cluster_ids,
+                block_rows,
+            )
+        } else if streamed {
+            GlmmDualScratch::for_shape_streamed(
+                nl,
+                m,
+                p,
+                k,
+                n,
+                s,
+                q_p,
+                q_core,
+                e,
+                nagq,
+                observed,
+                cluster_ids,
+                coup_pairs,
+                block_rows,
+            )
+        } else {
+            GlmmDualScratch::for_shape(
+                nl,
+                m,
+                p,
+                k,
+                n,
+                s,
+                q_p,
+                q_core,
+                e,
+                extras,
+                nagq,
+                observed,
+                // The packed layout left through its own driver above.
+                0,
+                cluster_ids,
+                coup_pairs,
+            )
+        }));
     }
 
     // Moved out of the workspace for the duration: the `f64` mode solve below
@@ -870,39 +1210,65 @@ pub(crate) fn joint_hessian_columns(
     // One arm body, five instantiations — the same local-macro shape
     // `laplace_gradient` uses, so the argument list is written once.
     macro_rules! hess_arm {
-        ($bufs:expr, $mode:expr) => {
-            run_assembled_hessian(
-                $bufs,
-                family,
-                nb_theta,
-                g,
-                x,
-                y,
-                &prior_w[..n],
-                weighted,
-                cluster_ids,
-                z_buf,
-                extra_ids,
-                pattern,
-                offset,
-                wx,
-                &prm[..m],
-                &$mode.u_mode[..k],
-                n_theta,
-                p,
-                n,
-                tol,
-                grad,
-                hess,
-            )
+        ($bufs:expr, $idx:expr, $mode:expr) => {
+            if row_blocked {
+                run_assembled_hessian_blocked(
+                    $bufs,
+                    $idx,
+                    block_rows,
+                    family,
+                    nb_theta,
+                    g,
+                    x,
+                    y,
+                    &prior_w[..n],
+                    weighted,
+                    cluster_ids,
+                    z_buf,
+                    pattern,
+                    offset,
+                    &prm[..m],
+                    &$mode.u_mode[..k],
+                    n_theta,
+                    p,
+                    tol,
+                    grad,
+                    hess,
+                )
+            } else {
+                run_assembled_hessian(
+                    $bufs,
+                    family,
+                    nb_theta,
+                    g,
+                    x,
+                    y,
+                    &prior_w[..n],
+                    weighted,
+                    cluster_ids,
+                    z_buf,
+                    extra_ids,
+                    pattern,
+                    offset,
+                    wx,
+                    &prm[..m],
+                    &$mode.u_mode[..k],
+                    n_theta,
+                    p,
+                    n,
+                    tol,
+                    grad,
+                    hess,
+                )
+            }
         };
     }
     let st = match &mut *scratch {
-        GlmmDualScratch::D4(bufs, _, mode) => hess_arm!(bufs, mode),
-        GlmmDualScratch::D5(bufs, _, mode) => hess_arm!(bufs, mode),
-        GlmmDualScratch::D6(bufs, _, mode) => hess_arm!(bufs, mode),
-        GlmmDualScratch::D8(bufs, _, mode) => hess_arm!(bufs, mode),
-        GlmmDualScratch::D12(bufs, _, mode) => hess_arm!(bufs, mode),
+        GlmmDualScratch::D4(bufs, idx, mode) => hess_arm!(bufs, idx, mode),
+        GlmmDualScratch::D5(bufs, idx, mode) => hess_arm!(bufs, idx, mode),
+        GlmmDualScratch::D6(bufs, idx, mode) => hess_arm!(bufs, idx, mode),
+        GlmmDualScratch::D8(bufs, idx, mode) => hess_arm!(bufs, idx, mode),
+        GlmmDualScratch::D12(bufs, idx, mode) => hess_arm!(bufs, idx, mode),
         // Unreachable: this slot is written only from `pick(m, false)`, so it
         // only ever holds a `Dual` variant. The arm exists because the match
         // is exhaustive over the one shared enum; decline rather than panic.
@@ -914,6 +1280,181 @@ pub(crate) fn joint_hessian_columns(
     };
     ws.dual_scratch = Some(scratch);
     st
+}
+
+/// Rows per block of the row-blocked assembled Hessian on the blocked layout
+/// ([`run_assembled_hessian_blocked`]). A block is the run of consecutive
+/// primary clusters that first reaches this many rows, so a block holds at
+/// least this many rows (the last one may hold fewer) and never splits a
+/// cluster. A fit with `n` at or below it takes the whole-data pass
+/// ([`run_assembled_hessian`]) unchanged.
+///
+/// Measured 2026-10-07 (pawel, clock-locked P-core, and an Apple M4): every
+/// size tried from 2048 to 65536 rows is faster than the whole-data pass on
+/// the binomial and Gamma blocked series from 30k to 3M rows, and 4096 is the
+/// fastest or within noise of it on each. The gain is cache residency and the
+/// first-touch page faults the block-sized scratch no longer takes, not less
+/// work: user instructions move by under 2%. Evidence: pawel
+/// `~/.cache/claude-scratch/mmjl-rethink/b3/` and `.../a-impl/`.
+///
+/// A pinned constant, the same on every target, so a fit splits its rows the
+/// same way, and its Hessian moves by the same round-off, on every host and
+/// under WASM. `FdState::se_row_block` overrides it for tests only.
+pub(crate) const SE_ROW_BLOCK: usize = 4096;
+
+/// Block-sized scratch of [`run_assembled_hessian_blocked`]: one block's dual
+/// PIRLS twin, assembly buffers and observed-step twin, its gathered `x`,
+/// `y`, prior weights, `z`, offset and block-local cluster ids, and the block
+/// list. Lives on the dual scratch (`GlmmDualBufs::row_blocks`), built once by
+/// [`GlmmDualScratch::for_shape_row_blocked`], so a repeat call at the same
+/// shape and cluster sizes allocates nothing. A call whose largest block
+/// outgrows the stored capacity (new cluster ids with larger clusters) grows
+/// it once, in [`RowBlockBufs::ensure`].
+pub(crate) struct RowBlockBufs<T: Scalar> {
+    /// `(first, end)` primary-cluster range of each block, rebuilt per call.
+    blocks: Vec<(usize, usize)>,
+    /// Row and cluster capacity the buffers below are sized for.
+    cap_rows: usize,
+    cap_s: usize,
+    q: usize,
+    p: usize,
+    m: usize,
+    nagq: u8,
+    observed: bool,
+    pirls: PirlsScratch<T>,
+    asm: AssemblyBufs<T>,
+    dual: super::pirls::DualStep<T>,
+    /// The block's own `Σ_r ∂/∂γ` of the assembled gradient, at `T`.
+    grad: Vec<T>,
+    x: Mat<f64>,
+    wx: Mat<f64>,
+    y: Vec<f64>,
+    prior_w: Vec<f64>,
+    z: Vec<f64>,
+    /// Empty until a call carries an offset.
+    offset: Vec<f64>,
+    cluster_ids: Vec<u32>,
+    /// The fit's groupings with `n_primary`/`k_total` set per block. Cloned
+    /// from the workspace's on the first call after a (re)build: every other
+    /// field is fixed for the shape this scratch was built for, and a shape
+    /// change rebuilds the scratch.
+    groupings: Option<LmmGroupings>,
+}
+
+impl<T: Scalar> RowBlockBufs<T> {
+    /// Sized for the blocks `idx` gives at `block_rows`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_shape(
+        idx: &super::agq::ClusterRowIndex,
+        s: usize,
+        block_rows: usize,
+        m: usize,
+        p: usize,
+        q: usize,
+        nagq: u8,
+        observed: bool,
+    ) -> RowBlockBufs<T> {
+        let mut blocks = Vec::with_capacity(idx.rows().len() / block_rows.max(1) + 1);
+        let (max_rows, max_s) = plan_row_blocks(idx, s, block_rows, &mut blocks);
+        let mut b = RowBlockBufs {
+            blocks,
+            cap_rows: 0,
+            cap_s: 0,
+            q,
+            p,
+            m,
+            nagq,
+            observed,
+            pirls: PirlsScratch::<T>::for_shape(0, 0, q, 0, nagq),
+            asm: AssemblyBufs::<T>::for_shape(m, 0, 0, 0, q, 0, observed, 0),
+            dual: block_dual_step(0, 0, q, observed),
+            grad: vec![T::ZERO; m],
+            x: Mat::zeros(0, p),
+            wx: Mat::zeros(0, p),
+            y: Vec::new(),
+            prior_w: Vec::new(),
+            z: Vec::new(),
+            offset: Vec::new(),
+            cluster_ids: Vec::new(),
+            groupings: None,
+        };
+        b.ensure(max_rows, max_s);
+        b
+    }
+
+    /// Grow every block-sized buffer to hold `rows` rows and `s` clusters, if
+    /// it does not already. A no-op (no allocation) on a repeat call.
+    fn ensure(&mut self, rows: usize, s: usize) {
+        if rows <= self.cap_rows && s <= self.cap_s {
+            return;
+        }
+        let rows = rows.max(self.cap_rows);
+        let s = s.max(self.cap_s);
+        let (q, p, k) = (self.q, self.p, s * self.q);
+        self.pirls = PirlsScratch::<T>::for_shape(rows, k, q, s, self.nagq);
+        self.asm = AssemblyBufs::<T>::for_shape(self.m, k, rows, s, q, 0, self.observed, 0);
+        self.dual = block_dual_step(rows, s, q, self.observed);
+        self.x = Mat::zeros(rows, p);
+        self.wx = Mat::zeros(rows, p);
+        self.y = vec![0.0; rows];
+        self.prior_w = vec![0.0; rows];
+        self.z = vec![0.0; rows * q.saturating_sub(1)];
+        if !self.offset.is_empty() {
+            self.offset = vec![0.0; rows];
+        }
+        self.cluster_ids = vec![0; rows];
+        self.cap_rows = rows;
+        self.cap_s = s;
+    }
+}
+
+/// The observed-information twin of one block, sized as
+/// `GlmmDualScratch::for_shape` sizes the blocked layout's (`q_core = q`,
+/// no crossed extras).
+fn block_dual_step<T: Scalar>(
+    rows: usize,
+    s: usize,
+    q: usize,
+    observed: bool,
+) -> super::pirls::DualStep<T> {
+    super::pirls::DualStep {
+        observed: false,
+        obs_blocks: vec![T::ZERO; obs_len(observed, s * q * q)],
+        obs_core_blocks: vec![T::ZERO; obs_len(observed, (q * q * s).max(1))],
+        obs_coupling: vec![
+            T::ZERO;
+            obs_len(observed, super::workspace::coupling_len(rows, s, q, 0))
+        ],
+        obs_schur_blk: vec![T::ZERO; obs_len(observed, 1)],
+        obs_rhs: vec![T::ZERO; obs_len(observed, s * q)],
+        min_iters: 0,
+        exact: false,
+    }
+}
+
+/// Splits the `s` primary clusters of `idx` into blocks of consecutive
+/// clusters, each closed once it holds at least `block_rows` rows, into
+/// `blocks` (cleared first). Returns the largest block's row and cluster
+/// counts.
+fn plan_row_blocks(
+    idx: &super::agq::ClusterRowIndex,
+    s: usize,
+    block_rows: usize,
+    blocks: &mut Vec<(usize, usize)>,
+) -> (usize, usize) {
+    blocks.clear();
+    let (mut c0, mut acc, mut max_rows, mut max_s) = (0usize, 0usize, 0usize, 0usize);
+    for c in 0..s {
+        acc += idx.cluster_range(c).len();
+        if acc >= block_rows || c + 1 == s {
+            blocks.push((c0, c + 1));
+            max_rows = max_rows.max(acc);
+            max_s = max_s.max(c + 1 - c0);
+            c0 = c + 1;
+            acc = 0;
+        }
+    }
+    (max_rows, max_s)
 }
 
 /// The chunked seed-call-assemble body [`joint_hessian_columns`]'s per-`N`
@@ -979,6 +1520,12 @@ fn run_assembled_hessian<T: Seed>(
     let canonical = crate::family::is_canonical(family);
     let lanes = T::LANES;
     let n_chunks = m.div_ceil(lanes.max(1));
+    // The streamed pass: a scratch built by
+    // `GlmmDualScratch::for_shape_streamed` (structured layout above one block
+    // of rows) carries the block buffers and no `n`-length dual row buffers.
+    let streamed = bufs.stream_rows.is_some();
+    let base_theta = g.primary_q * (g.primary_q + 1) / 2;
+    let nested_decl = g.nested.map(|nf| nf.vech_start - base_theta);
     // The objective value is the same in every chunk — only the seeded lanes
     // move — so the last chunk's value is the function's answer.
     let mut last_value = f64::NAN;
@@ -1019,7 +1566,31 @@ fn run_assembled_hessian<T: Seed>(
             // Throwaway: a derivative evaluation is not a fit-path PIRLS
             // solve, so it must not reach `ws.counters`.
             let mut counters = crate::counters::EvalCounters::new();
-            let (value, conv) = if extras {
+            let (value, conv) = if streamed {
+                let (obj, _dev, conv) = structured_stream_deviance::<T>(
+                    family,
+                    nb_theta,
+                    g,
+                    &bufs.params[..m],
+                    z_buf,
+                    extra_ids,
+                    cluster_ids,
+                    &mut bufs.pirls,
+                    &mut bufs.structured,
+                    pattern,
+                    x,
+                    y,
+                    prior_w,
+                    weighted,
+                    &bufs.beta[..p],
+                    &mut bufs.dual,
+                    offset,
+                    tol,
+                    n,
+                    bufs.stream_rows.as_deref_mut().expect("streamed"),
+                );
+                (obj.value(), conv)
+            } else if extras {
                 let (obj, _dev_scaled, conv, _raw_finite) = structured_laplace_deviance::<T>(
                     family,
                     nb_theta,
@@ -1104,7 +1675,7 @@ fn run_assembled_hessian<T: Seed>(
                 },
                 &bufs.structured.coupling,
                 &bufs.structured.schur_blk,
-                &bufs.structured.cross_val,
+                &bufs.structured.cross_theta,
                 &pattern.cross_col,
                 &pattern.n_cross,
                 &pattern.coup_cols,
@@ -1115,6 +1686,24 @@ fn run_assembled_hessian<T: Seed>(
                 n,
                 &mut bufs.asm,
                 &mut bufs.grad_t,
+                match bufs.stream_rows.as_deref_mut() {
+                    Some(rows) => Some(StreamCtx {
+                        rows,
+                        beta: &bufs.beta[..p],
+                        theta_nested: g
+                            .nested
+                            .map(|nf| bufs.params[nf.vech_start])
+                            .unwrap_or(T::ZERO),
+                        nested_decl,
+                        offset,
+                        weighted,
+                        i0: 0,
+                        next: 0,
+                    }),
+                    None => None,
+                },
+                false,
+                None,
             );
             if assembled.is_none() {
                 return DerivStatus::Unsupported;
@@ -1166,6 +1755,315 @@ fn run_assembled_hessian<T: Seed>(
     DerivStatus::Ok(last_value)
 }
 
+/// [`run_assembled_hessian`] on the blocked layout (no extra groupings), one
+/// block of consecutive primary clusters ([`SE_ROW_BLOCK`] rows) at a time.
+///
+/// With β fixed, the blocked layout's `A`, its mode equation `G = 0` and the
+/// adjoint `G_u⁻ᵀF_u` are all block-diagonal over primary clusters, and the
+/// objective `D + ‖u‖² + log|A|` is a sum over clusters. So a block of whole
+/// clusters runs the dual PIRLS solve and the assembly on its own rows and RE
+/// columns alone, and the assembled gradient (value and seeded lanes) is the
+/// sum of the blocks'. Nothing is recomputed: each block's per-row and
+/// per-cluster dual values live only while that block runs, in the
+/// block-sized [`RowBlockBufs`]. The only state shared across blocks is the
+/// `k`-length mode `u`, which the settle loop carries forward as the
+/// whole-data pass does (a block's slice of it is copied in before its solve
+/// and back after).
+///
+/// Same seeding, settle loop and band as [`run_assembled_hessian`]; change
+/// together. The results differ from the whole-data pass at round-off only:
+/// each block's PIRLS exit test reads its own block's value, and the gradient
+/// is summed per block (measured at most 2.6e-13 relative on the covariance at
+/// 3M rows).
+#[allow(clippy::too_many_arguments)]
+fn run_assembled_hessian_blocked<T: Seed>(
+    bufs: &mut GlmmDualBufs<T>,
+    idx: &mut super::agq::ClusterRowIndex,
+    block_rows: usize,
+    family: Family,
+    nb_theta: f64,
+    g: &LmmGroupings,
+    x: MatRef<f64>,
+    y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
+    cluster_ids: &[u32],
+    z_buf: &[f64],
+    pattern: &StructuredPattern,
+    offset: Option<&[f64]>,
+    ws_params: &[f64],
+    u_mode: &[f64],
+    n_theta: usize,
+    p: usize,
+    tol: f64,
+    grad: &mut [f64],
+    hess: &mut Mat<f64>,
+) -> DerivStatus {
+    let Some(mut rb) = bufs.row_blocks.take() else {
+        // Unreachable: the caller routes here only on a scratch built by
+        // `for_shape_row_blocked`. Decline rather than panic.
+        return DerivStatus::Unsupported;
+    };
+    let st = blocked_chunks(
+        bufs,
+        &mut rb,
+        idx,
+        block_rows,
+        family,
+        nb_theta,
+        g,
+        x,
+        y,
+        prior_w,
+        weighted,
+        cluster_ids,
+        z_buf,
+        pattern,
+        offset,
+        ws_params,
+        u_mode,
+        n_theta,
+        p,
+        tol,
+        grad,
+        hess,
+    );
+    bufs.row_blocks = Some(rb);
+    st
+}
+
+/// The body of [`run_assembled_hessian_blocked`], with the block scratch moved
+/// out of `bufs` so both can be borrowed at once.
+#[allow(clippy::too_many_arguments)]
+fn blocked_chunks<T: Seed>(
+    bufs: &mut GlmmDualBufs<T>,
+    rb: &mut RowBlockBufs<T>,
+    idx: &mut super::agq::ClusterRowIndex,
+    block_rows: usize,
+    family: Family,
+    nb_theta: f64,
+    g: &LmmGroupings,
+    x: MatRef<f64>,
+    y: &[f64],
+    prior_w: &[f64],
+    weighted: bool,
+    cluster_ids: &[u32],
+    z_buf: &[f64],
+    pattern: &StructuredPattern,
+    offset: Option<&[f64]>,
+    ws_params: &[f64],
+    u_mode: &[f64],
+    n_theta: usize,
+    p: usize,
+    tol: f64,
+    grad: &mut [f64],
+    hess: &mut Mat<f64>,
+) -> DerivStatus {
+    let m = n_theta + p;
+    let k = u_mode.len();
+    let q = g.primary_q;
+    let s = g.n_primary;
+    let zw = q - 1;
+    let canonical = crate::family::is_canonical(family);
+    let lanes = T::LANES;
+    let n_chunks = m.div_ceil(lanes.max(1));
+
+    // The index the scratch was built with belongs to the cluster ids of that
+    // build; a reused workspace can be called with new ones, so rebuild it in
+    // place (no allocation at an unchanged `n` and `s`).
+    idx.rebuild(cluster_ids, s);
+    let (max_rows, max_s) = plan_row_blocks(idx, s, block_rows, &mut rb.blocks);
+    rb.ensure(max_rows, max_s);
+    if offset.is_some() && rb.offset.len() < rb.cap_rows {
+        rb.offset = vec![0.0; rb.cap_rows];
+    }
+    let gb = rb.groupings.get_or_insert_with(|| g.clone());
+    let all_rows = idx.rows();
+
+    let mut last_value = f64::NAN;
+    for chunk in 0..n_chunks {
+        let base = chunk * lanes;
+        let width = lanes.min(m - base);
+        #[allow(clippy::needless_range_loop)]
+        for j in 0..m {
+            bufs.params[j] = if j >= base && j < base + width {
+                T::unit(ws_params[j], j - base)
+            } else {
+                T::from_f64(ws_params[j])
+            };
+        }
+        for i in 0..p {
+            bufs.beta[i] = bufs.params[n_theta + i];
+        }
+        #[allow(clippy::needless_range_loop)]
+        for c in 0..k {
+            bufs.pirls.u[c] = T::from_f64(u_mode[c]);
+        }
+        rb.dual.observed = !canonical;
+
+        let mut have_prev = false;
+        let mut pass_value = None;
+        for pass in 0..MAX_DUAL_REFINEMENTS {
+            let mut value = 0.0f64;
+            let mut all_exact = true;
+            for v in bufs.grad_t[..m].iter_mut() {
+                *v = T::ZERO;
+            }
+            for bi in 0..rb.blocks.len() {
+                let (b0, b1) = rb.blocks[bi];
+                let sb = b1 - b0;
+                let kb = sb * q;
+                let r0 = idx.cluster_range(b0).start;
+                let r1 = idx.cluster_range(b1 - 1).end;
+                let rows = &all_rows[r0..r1];
+                let nb = rows.len();
+                for (t, &ri) in rows.iter().enumerate() {
+                    let i = ri as usize;
+                    for j in 0..p {
+                        rb.x[(t, j)] = x[(i, j)];
+                    }
+                    rb.y[t] = y[i];
+                    rb.prior_w[t] = prior_w[i];
+                    rb.z[t * zw..(t + 1) * zw].copy_from_slice(&z_buf[i * zw..(i + 1) * zw]);
+                    if let Some(o) = offset {
+                        rb.offset[t] = o[i];
+                    }
+                    rb.cluster_ids[t] = cluster_ids[i] - b0 as u32;
+                }
+                gb.n_primary = sb;
+                gb.k_total = kb;
+                rb.pirls.u[..kb].copy_from_slice(&bufs.pirls.u[b0 * q..b1 * q]);
+                rb.dual.min_iters = if pass == 0 { 3 } else { 0 };
+                // Throwaway: a derivative evaluation is not a fit-path PIRLS
+                // solve, so it must not reach `ws.counters`.
+                let mut counters = crate::counters::EvalCounters::new();
+                let off_b = if offset.is_some() {
+                    Some(&rb.offset[..nb])
+                } else {
+                    None
+                };
+                let (obj, _dev_scaled, conv, _raw_finite) = blocked_laplace_deviance::<T>(
+                    family,
+                    nb_theta,
+                    gb,
+                    &bufs.params[..m],
+                    &mut bufs.beta[..p],
+                    &mut rb.pirls,
+                    &rb.z[..nb * zw],
+                    rb.x.as_ref().subrows(0, nb),
+                    &rb.y[..nb],
+                    &rb.prior_w[..nb],
+                    weighted,
+                    &rb.cluster_ids[..nb],
+                    Some(&mut rb.dual),
+                    &mut rb.wx,
+                    BetaStep::Fixed,
+                    off_b,
+                    Some(tol),
+                    p,
+                    nb,
+                    &mut counters,
+                );
+                let v = obj.value();
+                if !conv || !v.is_finite() {
+                    return DerivStatus::NotConverged;
+                }
+                value += v;
+                all_exact &= rb.dual.exact;
+                bufs.pirls.u[b0 * q..b1 * q].copy_from_slice(&rb.pirls.u[..kb]);
+                let assembled = assemble(
+                    gb,
+                    family,
+                    nb_theta,
+                    rb.x.as_ref().subrows(0, nb),
+                    &rb.y[..nb],
+                    &rb.cluster_ids[..nb],
+                    &[],
+                    ws_params,
+                    &rb.z[..nb * zw],
+                    &rb.prior_w[..nb],
+                    &rb.pirls.eta,
+                    &rb.pirls.prob,
+                    &rb.pirls.w,
+                    &rb.pirls.u,
+                    &rb.pirls.m_buf,
+                    &rb.pirls.a_blocks,
+                    &bufs.structured.coupling,
+                    &bufs.structured.schur_blk,
+                    &bufs.structured.cross_theta,
+                    &pattern.cross_col,
+                    &pattern.n_cross,
+                    &pattern.coup_cols,
+                    &pattern.coup_ptr,
+                    &pattern.coup_pos,
+                    n_theta,
+                    p,
+                    nb,
+                    &mut rb.asm,
+                    &mut rb.grad,
+                    None,
+                    false,
+                    None,
+                );
+                if assembled.is_none() {
+                    return DerivStatus::Unsupported;
+                }
+                for r in 0..m {
+                    bufs.grad_t[r] += rb.grad[r];
+                }
+            }
+            // Same band as `run_assembled_hessian`'s settle check.
+            let settled = (pass == 0 && all_exact)
+                || (have_prev
+                    && (0..m).all(|r| {
+                        let d = bufs.grad_t[r].dslice();
+                        (0..width).all(|j| {
+                            (d[j] - hess[(r, base + j)]).abs() < 1e-10 * (1.0 + d[j].abs())
+                        })
+                    }));
+            for r in 0..m {
+                let d = bufs.grad_t[r].dslice();
+                for j in 0..width {
+                    hess[(r, base + j)] = d[j];
+                }
+            }
+            if settled {
+                pass_value = Some(value);
+                break;
+            }
+            have_prev = true;
+        }
+        let Some(value) = pass_value else {
+            return DerivStatus::NotConverged;
+        };
+        if chunk == 0 {
+            for (r, out) in grad.iter_mut().enumerate().take(m) {
+                *out = bufs.grad_t[r].value();
+            }
+        }
+        last_value = value;
+    }
+    DerivStatus::Ok(last_value)
+}
+
+/// What [`assemble`]'s row loop needs on the streamed structured pass
+/// ([`GlmmDualScratch::for_shape_streamed`]): there the dual PIRLS keeps no
+/// `n`-length row buffers, so the loop re-forms each row block's `η`, `p`,
+/// `W_obs` and core `M` slice at the returned iterate (`pirls::stream_fill`,
+/// the same arithmetic as the kernel's own row pass) instead of reading them.
+/// `i0` is the first row of the block in `rows`, `next` the row at which the
+/// next block is formed.
+pub(crate) struct StreamCtx<'a, T> {
+    pub(crate) rows: &'a mut StreamRows<T>,
+    pub(crate) beta: &'a [T],
+    pub(crate) theta_nested: T,
+    pub(crate) nested_decl: Option<usize>,
+    pub(crate) offset: Option<&'a [f64]>,
+    pub(crate) weighted: bool,
+    pub(crate) i0: usize,
+    pub(crate) next: usize,
+}
+
 /// The three row passes, on the buffers the mode solve left: `core_m` the
 /// packed core `M` (`m_core_buf` with extras, `m_buf` without — `q_core == q`
 /// there, so the stride is the same), `core_fac` its per-cluster Crout factor,
@@ -1208,7 +2106,7 @@ fn assemble<T: TailKernel>(
     core_fac: &[T],
     coupling: &[T],
     schur_blk: &[T],
-    cross_val: &[T],
+    cross_theta: &[T],
     cross_col: &[u32],
     n_cross: &[u8],
     coup_cols: &[u32],
@@ -1219,6 +2117,13 @@ fn assemble<T: TailKernel>(
     n: usize,
     asm: &mut AssemblyBufs<T>,
     grad: &mut [T],
+    mut stream: Option<StreamCtx<'_, T>>,
+    // Set by [`gradient_at_mode`] only: `S⁻¹` is already in `asm.tail_inv`,
+    // inverted off the value evaluation's sparse Schur factor, and `ss` is
+    // that factor, for the canonical adjoint solve. Every other caller
+    // passes `false, None` and runs exactly as before.
+    tail_ready: bool,
+    ss: Option<&mut StructuredSchur>,
 ) -> Option<()> {
     let q = g.primary_q;
     let s = g.n_primary;
@@ -1251,10 +2156,6 @@ fn assemble<T: TailKernel>(
         comp_parent,
         comp_ptr,
         comp_cols,
-        rho,
-        w_eta,
-        w_obs,
-        lev,
         d_gamma,
         l_gamma,
         d_u,
@@ -1269,9 +2170,8 @@ fn assemble<T: TailKernel>(
         obs_schur,
         ..
     } = asm;
-    // The accumulators are `+=`d row by row, so they start at zero; `rho`,
-    // `w_eta`, `w_obs`, `lev` and `adj` are assigned outright and need no
-    // clear.
+    // The accumulators are `+=`d row by row, so they start at zero; `adj` is
+    // assigned outright and needs no clear.
     d_gamma[..m].fill(T::ZERO);
     l_gamma[..m].fill(T::ZERO);
     d_u[..k].fill(T::ZERO);
@@ -1288,7 +2188,7 @@ fn assemble<T: TailKernel>(
     // which lie in one component, so the entries between components are
     // never written and never read. On nested tails this is Σ e_c³ instead of
     // e³ (grouseticks: 20 ms to 0.3 ms per assembly, measured 2026-09-29).
-    if e > 0 {
+    if e > 0 && !tail_ready {
         let nc = tail_components(coup_cols, coup_ptr, e, comp_parent, comp_ptr, comp_cols);
         for c in 0..nc {
             let cols = &comp_cols[comp_ptr[c] as usize..comp_ptr[c + 1] as usize];
@@ -1413,19 +2313,92 @@ fn assemble<T: TailKernel>(
     let exact_obj = crate::family::exact_curvature_differs(family);
     let mut t = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
     let mut yb = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
+    let mut mad_f64 = [0.0f64; crate::lmm::MAX_PRIMARY_Q];
+    let mut cvd_f64 = [0.0f64; crate::lmm::MAX_EXTRA_GROUPINGS];
+    let mut mad = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
+    let mut cvd = [T::ZERO; crate::lmm::MAX_EXTRA_GROUPINGS];
+    let mut ta = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
+    let mut ya = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
+    // `A_obs = M'W_obs M + I`, accumulated in the same row loop on a
+    // non-canonical link (pass 3 below says why it is built here at all).
+    if !canonical {
+        obs_core.fill(T::ZERO);
+        obs_coup.fill(T::ZERO);
+        obs_schur.fill(T::ZERO);
+    }
 
-    // --- pass 1, per row:
+    // --- passes 1 and 2 and the `A_obs` scatter, fused into one walk over
+    // the rows. Each row's `ρᵢ`, `w'ᵢ`, `w_obs,ᵢ`, `hᵢ` and core solve (`t` or
+    // `yb`) are formed once and dropped: pass 2 reads only its own row's
+    // pass-1 values, and the three write disjoint accumulators (pass 1 the
+    // β rows `n_θ + j` of `D_γ`/`ℓ_γ`/`G_γ` and all of `D_u`/`ℓ_u`, pass 2
+    // the θ rows `a < n_θ`, the scatter only `obs_*`), each still in
+    // ascending row order. So every sum is the same sequence of operations
+    // as three separate passes, bit for bit, without four `rows`-length
+    // buffers (416 B/row at `Dual<12>`) or pass 2's repeat of the core solve.
+    //
+    // Pass 1, per row:
     //   ρᵢ = prior_wᵢ·(dμ/dη)(yᵢ−μᵢ)/V (`family::row_score`),
     //   ∂(prior_wᵢ·devᵢ)/∂ηᵢ = −2ρᵢ, ∂²/∂η² = 2·w_obs,ᵢ, hᵢ = mᵢ'A⁻¹mᵢ
     //   D_βj  += (∂devᵢ/∂ηᵢ)·xᵢⱼ            D_uc  += (∂devᵢ/∂ηᵢ)·M_ic
     //   ℓ_βj  += w'ᵢ·xᵢⱼ·hᵢ                ℓ_uc  += w'ᵢ·M_ic·hᵢ
     //   (G_βj)_c += 2·w_obs,ᵢ·xᵢⱼ·M_ic     (∂M/∂β = 0, so this is all of G_β)
+    //
+    // Pass 2, per row × per θ coordinate. `Λ` is linear in θ, so
+    // `m_{a,i} = ∂mᵢ/∂θ_a` is a selection; `∂ηᵢ/∂θ_a = m_{a,i}'u`:
+    //   D_θa  += −2ρᵢ·(m_{a,i}'u)
+    //   ℓ_θa  += 2·wᵢ·(mᵢ'A⁻¹m_{a,i}) + w'ᵢ·(m_{a,i}'u)·hᵢ
+    //   (G_θa)_c += 2·w_obs,ᵢ·(m_{a,i}'u)·M_ic + (−2ρᵢ)·(m_{a,i})_c
+    // The cross-leverage `mᵢ'A⁻¹m_{a,i}` is the one object pass 1 does not
+    // already form; it is one dot against the row reduction of `mᵢ`.
     // ---
     for i in 0..n {
+        if let Some(sc) = stream.as_mut() {
+            if i == sc.next {
+                let i1 = (i + sc.rows.block).min(n);
+                let _ = stream_fill(
+                    sc.rows,
+                    g,
+                    sc.theta_nested,
+                    sc.nested_decl,
+                    z_buf,
+                    extra_ids,
+                    cluster_ids,
+                    cross_theta,
+                    cross_col,
+                    n_cross,
+                    x,
+                    sc.beta,
+                    sc.offset,
+                    u,
+                    family,
+                    nb_theta,
+                    y,
+                    prior_w,
+                    sc.weighted,
+                    i,
+                    i1,
+                    true,
+                );
+                sc.i0 = i;
+                sc.next = i1;
+            }
+        }
+        let (eta_i, prob_i, w_i, mc): (T, T, T, &[T]) = match stream.as_ref() {
+            Some(sc) => {
+                let t = i - sc.i0;
+                (
+                    sc.rows.eta[t],
+                    sc.rows.prob[t],
+                    sc.rows.w[t],
+                    &sc.rows.mc[t * qc..t * qc + qc],
+                )
+            }
+            None => (eta[i], prob[i], w[i], &core_m[i * qc..i * qc + qc]),
+        };
         let f = cluster_ids[i] as usize;
         let cb = f * qc * qc;
         let fac = &core_fac[cb..cb + qc * qc];
-        let mc = &core_m[i * qc..i * qc + qc];
         let cbase = i * g_cap;
         let ncz = if extras { n_cross[i] as usize } else { 0 };
         let cols: &[u32] = if e > 0 {
@@ -1433,6 +2406,8 @@ fn assemble<T: TailKernel>(
         } else {
             &[]
         };
+        // Pass 1. The core solve (`t` at `e == 0`, `yb` otherwise) stays
+        // live for pass 2's cross-leverage below.
         let h = if e == 0 {
             block_forward_solve(fac, qc, mc, &mut t[..qc]);
             let mut acc = T::ZERO;
@@ -1452,7 +2427,7 @@ fn assemble<T: TailKernel>(
                 T::ZERO
             } else {
                 let tc = &cross_col[cbase..cbase + ncz];
-                let tv = &cross_val[cbase..cbase + ncz];
+                let tv = &cross_theta[..ncz];
                 tail_form(f, cols, &yb[..qc], &yb[..qc], tc, tv, tv)
             };
             core_acc + tail_acc
@@ -1460,40 +2435,36 @@ fn assemble<T: TailKernel>(
         let r = match family {
             Family::Binomial {
                 link: BinomialLink::Logit,
-            } => T::from_f64(prior_w[i]) * (T::from_f64(y[i]) - prob[i]),
-            other => crate::family::row_score(other, nb_theta, y[i], prior_w[i], eta[i], prob[i]),
+            } => T::from_f64(prior_w[i]) * (T::from_f64(y[i]) - prob_i),
+            other => crate::family::row_score(other, nb_theta, y[i], prior_w[i], eta_i, prob_i),
         };
-        rho[i] = r;
-        lev[i] = h;
         // The kernel's stored `w` is the weight the objective's `A = M'WM + I`
         // is built from (`pirls::evaluate_at_mode`): the raw Fisher weight
         // `prior_w·(dμ/dη)²/V` on a link whose exact curvature is Fisher, the
         // observed `W_obs` where the two differ. `w_eta` is that same weight's
         // `dw/dη`. `w_obs` is the mode equation's Jacobian: `w` itself on an
         // exact-curvature link rather than formed a second time.
-        w_eta[i] = if exact_obj {
+        let w_eta = if exact_obj {
             crate::family::observed_weight_eta_deriv(
                 family,
                 nb_theta,
                 y[i],
                 prior_w[i],
-                eta[i],
-                prob[i],
+                eta_i,
+                prob_i,
                 T::ZERO,
             )
         } else {
-            crate::family::weight_eta_deriv(family, nb_theta, eta[i], prob[i], w[i])
+            crate::family::weight_eta_deriv(family, nb_theta, eta_i, prob_i, w_i)
         };
-        w_obs[i] = if exact_obj {
-            w[i]
+        let w_obs = if exact_obj {
+            w_i
         } else {
-            crate::family::observed_weight(
-                family, nb_theta, y[i], prior_w[i], eta[i], prob[i], w[i],
-            )
+            crate::family::observed_weight(family, nb_theta, y[i], prior_w[i], eta_i, prob_i, w_i)
         };
         let dev_eta = T::from_f64(-2.0) * r;
-        let a = w_eta[i] * h;
-        let two_wo = T::from_f64(2.0) * w_obs[i];
+        let a = w_eta * h;
+        let two_wo = T::from_f64(2.0) * w_obs;
         for j in 0..p {
             let xij = T::from_f64(x[(i, j)]);
             d_gamma[n_theta + j] += dev_eta * xij;
@@ -1510,7 +2481,7 @@ fn assemble<T: TailKernel>(
         }
         for z in 0..ncz {
             let c = k_family + cross_col[cbase + z] as usize;
-            let v = cross_val[cbase + z];
+            let v = cross_theta[z];
             d_u[c] += dev_eta * v;
             l_u[c] += a * v;
             let gb = two_wo * v;
@@ -1518,41 +2489,9 @@ fn assemble<T: TailKernel>(
                 g_gamma[(n_theta + j) * k + c] += gb * T::from_f64(x[(i, j)]);
             }
         }
-    }
 
-    // --- pass 2, per row × per θ coordinate. `Λ` is linear in θ, so
-    // `m_{a,i} = ∂mᵢ/∂θ_a` is a selection; `∂ηᵢ/∂θ_a = m_{a,i}'u`:
-    //   D_θa  += −2ρᵢ·(m_{a,i}'u)
-    //   ℓ_θa  += 2·wᵢ·(mᵢ'A⁻¹m_{a,i}) + w'ᵢ·(m_{a,i}'u)·hᵢ
-    //   (G_θa)_c += 2·w_obs,ᵢ·(m_{a,i}'u)·M_ic + (−2ρᵢ)·(m_{a,i})_c
-    // The cross-leverage `mᵢ'A⁻¹m_{a,i}` is the one object today's row passes
-    // do not already form; it is one dot against the row reduction of `mᵢ`.
-    // ---
-    let mut mad_f64 = [0.0f64; crate::lmm::MAX_PRIMARY_Q];
-    let mut cvd_f64 = [0.0f64; crate::lmm::MAX_EXTRA_GROUPINGS];
-    let mut mad = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
-    let mut cvd = [T::ZERO; crate::lmm::MAX_EXTRA_GROUPINGS];
-    let mut ta = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
-    let mut ya = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
-    for i in 0..n {
-        let f = cluster_ids[i] as usize;
-        let cb = f * qc * qc;
-        let fac = &core_fac[cb..cb + qc * qc];
-        let mc = &core_m[i * qc..i * qc + qc];
-        let cbase = i * g_cap;
-        let ncz = if extras { n_cross[i] as usize } else { 0 };
-        let cols: &[u32] = if e > 0 {
-            &coup_cols[coup_ptr[f] as usize..coup_ptr[f + 1] as usize]
-        } else {
-            &[]
-        };
-        if e == 0 {
-            block_forward_solve(fac, qc, mc, &mut t[..qc]);
-        } else {
-            yb[..qc].copy_from_slice(&mc[..qc]);
-            glmm_block_solve(fac, qc, &mut yb[..qc]);
-        }
-        let dr = T::from_f64(-2.0) * rho[i];
+        // Pass 2.
+        let dr = T::from_f64(-2.0) * r;
         for a in 0..n_theta {
             packed_m_theta_deriv(
                 g,
@@ -1611,21 +2550,53 @@ fn assemble<T: TailKernel>(
                         &yb[..qc],
                         &ya[..qc],
                         tc,
-                        &cross_val[cbase..cbase + ncz],
+                        &cross_theta[..ncz],
                         &cvd[..ncz],
                     )
                 };
                 core_acc + tail_acc
             };
             d_gamma[a] += dr * deta;
-            l_gamma[a] += T::from_f64(2.0) * w[i] * cross + w_eta[i] * deta * lev[i];
-            let tw = T::from_f64(2.0) * w_obs[i] * deta;
+            l_gamma[a] += T::from_f64(2.0) * w_i * cross + w_eta * deta * h;
+            let tw = T::from_f64(2.0) * w_obs * deta;
             for local in 0..qc {
                 g_gamma[a * k + f * qc + local] += tw * mc[local] + dr * mad[local];
             }
             for z in 0..ncz {
                 let c = k_family + cross_col[cbase + z] as usize;
-                g_gamma[a * k + c] += tw * cross_val[cbase + z] + dr * cvd[z];
+                g_gamma[a * k + c] += tw * cross_theta[z] + dr * cvd[z];
+            }
+        }
+
+        // The `A_obs` scatter, non-canonical links only.
+        if !canonical {
+            // Same `e > 0` guard as the passes above: the CSR is only built
+            // on a structured shape.
+            let (coup, nc) = if e > 0 {
+                let (lo, hi) = (coup_ptr[f] as usize, coup_ptr[f + 1] as usize);
+                (qc * lo, hi - lo)
+            } else {
+                (0, 0)
+            };
+            let wo = w_obs;
+            for r in 0..qc {
+                let wmr = wo * mc[r];
+                for c in 0..=r {
+                    obs_core[cb + r * qc + c] += wmr * mc[c];
+                }
+                for z in 0..ncz {
+                    obs_coup[coup + r * nc + coup_pos[cbase + z] as usize] += wmr * cross_theta[z];
+                }
+            }
+            for z in 0..ncz {
+                let b = cross_col[cbase + z] as usize;
+                let wvb = wo * cross_theta[z];
+                for z2 in 0..ncz {
+                    let b2 = cross_col[cbase + z2] as usize;
+                    if b2 <= b {
+                        obs_schur[b * e + b2] += wvb * cross_theta[z2];
+                    }
+                }
             }
         }
     }
@@ -1646,59 +2617,23 @@ fn assemble<T: TailKernel>(
         adj[c] = d_u[c] + T::from_f64(2.0) * u[c] + l_u[c];
     }
     // `A_obs = M'W_obs M + I`. On a canonical link `A_obs` IS the Fisher `A`
-    // the mode solve already factored; otherwise it is built and factored
-    // here, and a non-PD factor is the refusal. Built here rather than taken
-    // from the dual kernel's own observed twin because a `BetaStep::Fixed`
-    // `f64` call leaves no twin at all, so this arm has to exist for the `f64`
+    // the mode solve already factored; otherwise its rows were scattered in
+    // the loop above and it is completed and factored here, and a non-PD
+    // factor is the refusal. Built here rather than taken from the dual
+    // kernel's own observed twin because a `BetaStep::Fixed` `f64` call
+    // leaves no twin at all, so this arm has to exist for the `f64`
     // instantiation regardless — one body serves both.
     if canonical {
         if e == 0 {
             solve_core_blocks(core_fac, qc, s, adj);
         } else {
+            // `ss` is `Some` exactly when the value pass factored `S` sparsely
+            // (`schur_blk` then still holds the unfactored `S`).
             structured_ainv_solve(
-                g, core_fac, coupling, schur_blk, coup_cols, coup_ptr, None, adj,
+                g, core_fac, coupling, schur_blk, coup_cols, coup_ptr, ss, adj,
             );
         }
     } else {
-        obs_core.fill(T::ZERO);
-        obs_coup.fill(T::ZERO);
-        obs_schur.fill(T::ZERO);
-        for i in 0..n {
-            let f = cluster_ids[i] as usize;
-            let cb = f * qc * qc;
-            // Same `e > 0` guard as the passes above: the CSR is only built
-            // on a structured shape.
-            let (coup, nc) = if e > 0 {
-                let (lo, hi) = (coup_ptr[f] as usize, coup_ptr[f + 1] as usize);
-                (qc * lo, hi - lo)
-            } else {
-                (0, 0)
-            };
-            let mc = &core_m[i * qc..i * qc + qc];
-            let cbase = i * g_cap;
-            let ncz = if extras { n_cross[i] as usize } else { 0 };
-            let wo = w_obs[i];
-            for r in 0..qc {
-                let wmr = wo * mc[r];
-                for c in 0..=r {
-                    obs_core[cb + r * qc + c] += wmr * mc[c];
-                }
-                for z in 0..ncz {
-                    obs_coup[coup + r * nc + coup_pos[cbase + z] as usize] +=
-                        wmr * cross_val[cbase + z];
-                }
-            }
-            for z in 0..ncz {
-                let b = cross_col[cbase + z] as usize;
-                let wvb = wo * cross_val[cbase + z];
-                for z2 in 0..ncz {
-                    let b2 = cross_col[cbase + z2] as usize;
-                    if b2 <= b {
-                        obs_schur[b * e + b2] += wvb * cross_val[cbase + z2];
-                    }
-                }
-            }
-        }
         for f in 0..s {
             for r in 0..qc {
                 obs_core[f * qc * qc + r * qc + r] += T::ONE;
@@ -1845,11 +2780,11 @@ pub(crate) struct PackedGradientBufs {
 }
 
 impl PackedGradientBufs {
-    fn for_shape(m: usize, k: usize, rows: usize, width: usize) -> Self {
+    fn for_shape(m: usize, k: usize, rows: usize, width: usize, observed: bool) -> Self {
         PackedGradientBufs {
             // `s`/`q_core`/`e` are the other routes' shape terms and are
             // unread here, so they go in at their minimum.
-            asm: AssemblyBufs::<f64>::for_shape(m, k, rows, 0, 1, 0, width),
+            asm: AssemblyBufs::<f64>::for_shape(m, k, rows, 0, 1, 0, observed, width),
             u_lanes: vec![0.0; (m * k).max(1)],
             grad: vec![0.0; m],
             saved_u: vec![0.0; k.max(1)],
@@ -1860,14 +2795,17 @@ impl PackedGradientBufs {
     /// Shape half of the reuse policy, mirroring
     /// `derivative::GlmmDualScratch::matches_shape`: a request at the same
     /// shape reuses, a different one reallocates once.
-    fn matches_shape(&self, m: usize, k: usize, rows: usize, width: usize) -> bool {
+    fn matches_shape(&self, m: usize, k: usize, rows: usize, width: usize, observed: bool) -> bool {
         self.grad.len() == m
             && self.u_lanes.len() == (m * k).max(1)
             && self.saved_u.len() == k.max(1)
             && self.asm.g_gamma.len() == (m * k).max(1)
             && self.asm.packed.m_vals.len() == rows * width
             && self.asm.packed.a.len() == k * k
-            && self.asm.packed.obs.len() == k * k
+            // Sized by `observed` (`PackedAsmBufs::for_shape`): comparing
+            // against a flat `k²` would fail on every canonical call and
+            // rebuild this scratch each time.
+            && self.asm.packed.obs.len() == obs_len(observed, k * k)
     }
 }
 
@@ -1877,12 +2815,15 @@ impl PackedGradientBufs {
 fn take_packed_bufs(ws: &mut GlmmWorkspace, p: usize, n: usize) -> Box<PackedGradientBufs> {
     let m = ws.n_theta + p;
     let (k, width) = (ws.k, ws.packed.width);
+    let observed = !crate::family::is_canonical(ws.family);
     let need_build = ws
         .packed_asm
         .as_deref()
-        .is_none_or(|b| !b.matches_shape(m, k, n, width));
+        .is_none_or(|b| !b.matches_shape(m, k, n, width, observed));
     if need_build {
-        ws.packed_asm = Some(Box::new(PackedGradientBufs::for_shape(m, k, n, width)));
+        ws.packed_asm = Some(Box::new(PackedGradientBufs::for_shape(
+            m, k, n, width, observed,
+        )));
     }
     ws.packed_asm
         .take()
@@ -2065,10 +3006,6 @@ fn packed_assemble<T: Scalar>(
     let canonical = crate::family::is_canonical(family);
     let exact_obj = crate::family::exact_curvature_differs(family);
     let AssemblyBufs {
-        rho,
-        w_eta,
-        w_obs,
-        lev,
         d_gamma,
         l_gamma,
         d_u,
@@ -2131,7 +3068,14 @@ fn packed_assemble<T: Scalar>(
         }
     }
 
-    // --- pass 1, per row. Identical statement to `assemble`'s pass 1; the
+    // `A_obs = M'W_obs M + I` on a non-canonical link, scattered row by row
+    // in the loop below and completed after it.
+    if !canonical {
+        obs[..k * k].fill(T::ZERO);
+    }
+
+    // --- passes 1 and 2 and the `A_obs` scatter in one walk over the rows,
+    // as in `assemble` (which states why the fusion is bit-identical); the
     // per-row leverage is the only line that differs, and only in how `A⁻¹`
     // is reached. ---
     for i in 0..n {
@@ -2151,11 +3095,9 @@ fn packed_assemble<T: Scalar>(
             } => T::from_f64(prior_w[i]) * (T::from_f64(y[i]) - prob[i]),
             other => crate::family::row_score(other, nb_theta, y[i], prior_w[i], eta[i], prob[i]),
         };
-        rho[i] = r;
-        lev[i] = h;
         // Mirrors `assemble` — change together, including the stored-weight rule
         // on a link whose exact curvature differs from Fisher (`exact_obj`).
-        w_eta[i] = if exact_obj {
+        let w_eta = if exact_obj {
             crate::family::observed_weight_eta_deriv(
                 family,
                 nb_theta,
@@ -2168,7 +3110,7 @@ fn packed_assemble<T: Scalar>(
         } else {
             crate::family::weight_eta_deriv(family, nb_theta, eta[i], prob[i], w[i])
         };
-        w_obs[i] = if exact_obj {
+        let w_obs = if exact_obj {
             w[i]
         } else {
             crate::family::observed_weight(
@@ -2176,8 +3118,8 @@ fn packed_assemble<T: Scalar>(
             )
         };
         let dev_eta = T::from_f64(-2.0) * r;
-        let av = w_eta[i] * h;
-        let two_wo = T::from_f64(2.0) * w_obs[i];
+        let av = w_eta * h;
+        let two_wo = T::from_f64(2.0) * w_obs;
         for j in 0..p {
             let xij = T::from_f64(x[(i, j)]);
             d_gamma[n_theta + j] += dev_eta * xij;
@@ -2193,12 +3135,9 @@ fn packed_assemble<T: Scalar>(
                 g_gamma[(n_theta + j) * k + c] += gb * T::from_f64(x[(i, j)]);
             }
         }
-    }
 
-    // --- pass 2, per row × per θ coordinate, as `assemble`'s pass 2. ---
-    for i in 0..n {
-        let base = i * width;
-        let dr = T::from_f64(-2.0) * rho[i];
+        // Pass 2, per θ coordinate, as `assemble`'s.
+        let dr = T::from_f64(-2.0) * r;
         for a_idx in 0..n_theta {
             packed_m_vals_theta_deriv(g, a_idx, z_buf, i, m_deriv);
             // `∂η_i/∂θ_a = m_{a,i}'u`, read at the iterate `η`, `w` and the
@@ -2219,11 +3158,22 @@ fn packed_assemble<T: Scalar>(
                 cross += m_vals[ta] * inner;
             }
             d_gamma[a_idx] += dr * deta;
-            l_gamma[a_idx] += T::from_f64(2.0) * w[i] * cross + w_eta[i] * deta * lev[i];
-            let tw = T::from_f64(2.0) * w_obs[i] * deta;
+            l_gamma[a_idx] += T::from_f64(2.0) * w[i] * cross + w_eta * deta * h;
+            let tw = T::from_f64(2.0) * w_obs * deta;
             for t in 0..width {
                 let c = m_cols[base + t] as usize;
                 g_gamma[a_idx * k + c] += tw * m_vals[base + t] + dr * T::from_f64(m_deriv[t]);
+            }
+        }
+
+        // The `A_obs` scatter, non-canonical links only.
+        if !canonical {
+            for ta in base..base + width {
+                let ca = m_cols[ta] as usize;
+                let wva = w_obs * m_vals[ta];
+                for tb in base..base + width {
+                    obs[ca * k + m_cols[tb] as usize] += wva * m_vals[tb];
+                }
             }
         }
     }
@@ -2234,24 +3184,12 @@ fn packed_assemble<T: Scalar>(
     for c in 0..k {
         adj[c] = d_u[c] + T::from_f64(2.0) * u[c] + l_u[c];
     }
-    // `A_obs` IS the Fisher `A` only on a canonical link; otherwise it is
-    // built and factored here — mirrors `assemble`'s pass 3.
+    // `A_obs` IS the Fisher `A` only on a canonical link; otherwise its rows
+    // were scattered above and it is completed and factored here — mirrors
+    // `assemble`'s pass 3.
     if canonical {
         glmm_block_solve(&a[..k * k], k, &mut adj[..k]);
     } else {
-        obs[..k * k].fill(T::ZERO);
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..n {
-            let base = i * width;
-            let wo = w_obs[i];
-            for ta in base..base + width {
-                let ca = m_cols[ta] as usize;
-                let wva = wo * m_vals[ta];
-                for tb in base..base + width {
-                    obs[ca * k + m_cols[tb] as usize] += wva * m_vals[tb];
-                }
-            }
-        }
         for r in 0..k {
             obs[r * k + r] += T::ONE;
         }
@@ -2306,8 +3244,8 @@ fn packed_joint_hessian_columns(
     let observed = !crate::family::is_canonical(ws.family);
     // The FIRST-derivative ladder, as on the other routes: the assembly reads
     // first-order lanes only, so a Hessian request resolves to a `Dual` rung
-    // and chunks like a gradient does.
-    let nl = NLanes::pick(m, false).expect("the gradient ladder covers every m");
+    // (`pick_assembled`'s table) and chunks like a gradient does.
+    let nl = NLanes::pick_assembled(m);
     // The shape terms go in as they are; `for_shape` is what knows that a
     // non-zero packed width means the blocked and structured twins they size
     // are unread here, and `matches_shape` reads them the same way.
@@ -2332,7 +3270,10 @@ fn packed_joint_hessian_columns(
     // packed width is what tells `for_shape` to size the packed state and
     // leave the blocked/structured twins at their minimum.
     let need_build = ws.dual_scratch.as_deref().is_none_or(|sc| {
-        sc.lanes() != nl || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq, observed, width)
+        sc.lanes() != nl
+            || !sc.matches_shape(
+                m, p, k, n, s, q_p, q_core, e, false, nagq, observed, width, None,
+            )
     });
     if need_build {
         ws.dual_scratch = Some(Box::new(GlmmDualScratch::for_shape(
@@ -2345,10 +3286,14 @@ fn packed_joint_hessian_columns(
             q_p,
             q_core,
             e,
+            // The packed layout sizes the structured twin at its minimum
+            // whatever its extras (`DenseTwinShape::of`).
+            false,
             nagq,
             observed,
             width,
             cluster_ids,
+            None,
         )));
     }
     let mut scratch = ws

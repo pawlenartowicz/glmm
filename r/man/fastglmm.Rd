@@ -65,8 +65,13 @@ error.}
 but see the fallback note in Details.}
 
 \item{start}{optional warm start, lme4's name and shape:
-\code{list(beta =, theta =)} with \code{theta} the random-effect Cholesky vector.
-Distinct from \code{init.theta}, which is the negative-binomial shape.}
+\code{list(beta =, theta =)} with \code{theta} the random-effect Cholesky vector,
+plus an optional \verb{dispersion =}: the estimated dispersion as a previous
+fit reports it in \code{fit$dispersion} (the shape for negative binomial, phi
+for Gamma), used as the search's starting value. Any element may be left
+out to cold-start that part.
+\code{theta} is distinct from \code{init.theta}, which is the negative-binomial
+shape (the same slot as \code{start$dispersion} there).}
 
 \item{wald.se}{Wald standard-error mode: \code{"hessian"} (default) or \code{"rx"}.}
 
@@ -78,27 +83,32 @@ hold it fixed. Non-\code{NULL} on binomial/poisson would mean
 quasi-likelihood - not implemented, errors.}
 
 \item{init.theta}{negative-binomial shape seed, named for
-\code{MASS::glm.nb(init.theta=)}. No kernel hook exists yet to seed the shape
-search, so any non-\code{NULL} value is an error (the default cold start is
-what runs).}
+\code{MASS::glm.nb(init.theta=)}: the starting value of the shape search
+(the same slot as \code{start$dispersion}; give one of the two). \code{NULL}
+cold-starts it from the no-random-effect negative-binomial fit.}
 
-\item{...}{intercepted, never silently swallowed: known lme4 arguments
-(\code{REML}, \code{control}, \code{verbose}, \code{contrasts}) raise errors saying why they
-cannot be honored; unknown names error as unused arguments.}
+\item{...}{intercepted, never silently swallowed. \code{REML} is checked against
+the model: \code{REML = TRUE} is accepted only on a Gaussian mixed model (the
+one model with a REML objective) and errors elsewhere, \code{REML = FALSE} is
+accepted everywhere else (those models are fitted by maximum likelihood)
+and errors there. The other known lme4 arguments (\code{control}, \code{verbose},
+\code{contrasts}) raise errors saying why they cannot be honored; unknown names
+error as unused arguments.}
 }
 \value{
-An object of class \code{"fastglmm"}: fixed effects (\link{fixef}), Wald
+An object of class \code{"fastglmm"}: fixed effects (\link[nlme:fixed.effects]{nlme::fixef}), Wald
 covariance (\code{vcov()}), variance components on the SD/correlation scale
-(\link{VarCorr}), \code{converged} and \code{singular} flags (\link{isSingular}), a
+(\link[nlme:VarCorr]{nlme::VarCorr}), \code{converged} and \code{singular} flags (\link{isSingular}), a
 \code{diagnostics} list (the solver's own report: \code{boundary}, \code{pinned},
 \code{notes}, plus the three flags above), a \code{warnings} data.frame (one row
 per warning the call raised: \code{tier}, \code{kind}, \code{title}, \code{message}; match on
 \code{kind}), plus
 \code{print()}, \link[=summary.fastglmm]{summary()}, \link[=confint.fastglmm]{confint()}
 (Wald), \code{nobs()}, \link[=formula.fastglmm]{formula()} (returns the formula
-\strong{string}), \code{family()}, and \code{model.frame()}. Engine-blocked accessors
-(\code{ranef}, \code{predict}, \code{fitted}, \code{residuals}, \code{coef}, \code{logLik}/\code{AIC},
-\code{terms}) error with the reason.
+\strong{string}), \code{family()}, \code{model.frame()}, \link[=ranef.fastglmm]{ranef()},
+\code{fitted()}, \code{residuals()}, and \link[=logLik.fastglmm]{logLik()} (so \code{AIC()}
+and \code{BIC()} work). The blocked accessors (\code{predict}, \code{coef}, \code{terms})
+error with the reason.
 }
 \description{
 One entry point for the whole \code{glmm} engine, dispatching on \code{family} the way
@@ -153,14 +163,16 @@ as a warning of class \code{"fastglmm_diagnostic"} with a per-kind subclass
 \code{"fastglmm_unused_grouping_levels"},
 \code{"fastglmm_single_level_grouping_dropped"}, \code{"fastglmm_hessian_se_fallback"},
 \code{"fastglmm_se_unavailable"}, \code{"fastglmm_exact_profile_fallback"},
+\code{"fastglmm_gradient_search_fallback"},
 \code{"fastglmm_precision_limited"}, \code{"fastglmm_non_integer_response"}, \code{"fastglmm_rows_dropped_na"}; a note from
 a newer kernel than this package arrives as \code{"fastglmm_unknown_note"}),
 so \code{withCallingHandlers()} and \code{suppressWarnings(classes = )} can select
 them without matching message text.
 
 Anything the engine cannot do is an error naming the reason - never a
-silently different model. That includes \code{REML = FALSE} (the LMM path is
-REML-only \strong{by design}), \verb{control=}/\verb{verbose=}, and quasi-likelihood
+silently different model. That includes \code{REML = FALSE} on a Gaussian mixed
+model (the LMM path is REML-only \strong{by design}), \code{REML = TRUE} on any other
+model (fitted by maximum likelihood), \verb{control=}/\verb{verbose=}, and quasi-likelihood
 \verb{dispersion=} on binomial/poisson.
 }
 \examples{

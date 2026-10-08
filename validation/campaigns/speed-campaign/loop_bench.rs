@@ -1431,6 +1431,7 @@ mod api {
             start: StartValues {
                 beta: Vec::with_capacity(d.p),
                 theta: Vec::with_capacity(64),
+                dispersion: None,
             },
             n: d.n,
             p: d.p,

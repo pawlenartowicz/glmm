@@ -20,8 +20,9 @@ covariance parameter θ.
 
 The recurring symbols on this page, defined once here before first use:
 
-- **θ** — the relative covariance parameter; the vector BOBYQA optimises. It is
-  the `vech` of Λ stacked across grouping factors.
+- **θ** — the relative covariance parameter; the vector the outer search
+  optimises (BFGS on the per-group route, BOBYQA everywhere else; see
+  `lmm_outer_optimizer`). It is the `vech` of Λ stacked across grouping factors.
 - **Λ = Λ(θ)** — the lower-triangular *relative* Cholesky factor of a grouping
   factor's random-effect covariance; "relative" means scaled by the residual
   variance σ². Each factor's absolute covariance is `σ²·ΛΛ′`.
@@ -60,7 +61,9 @@ Three real routing decisions sit between `fit_cold`/`fit_warm` and a returned
    for why that equivalence is structural, not approximate).
 3. **Deviance sub-path** (inside `fit_lmm`'s `reml_deviance`, `src/lmm/kernel.rs`) —
    an intercept-only primary with a balanced level structure takes the
-   closed-form collapse shortcut; everything else takes the general
+   closed-form collapse shortcut; random slopes on the primary grouping alone
+   take the per-group regression route when every level's random-effect Gram
+   is well conditioned; everything else takes the general
    family-by-family elimination. `reml_deviance` also has a
    `reml_deviance_blocked` branch for extra-grouping random slopes, but
    decision 1 sends every such design to `Sparse`, so from `fit_cold`/`fit_warm`
@@ -73,6 +76,7 @@ flowchart TD
     N -->|"Solver::Sparse: over envelope / slope on extra / >500 crossed levels"| S["sparse kernel: sparse_reml_deviance"]
     N -->|"Solver::NoZ: in envelope"| C{"reml_deviance sub-path"}
     C -->|"intercept-only primary, balanced"| CO["balanced collapse shortcut"]
+    C -->|"slopes on the primary only, every G_g well conditioned"| PG["per-group regressions"]
     C -->|"otherwise"| GP["general family elimination"]
 ```
 
@@ -88,7 +92,7 @@ extras), forms the raw RE Gram `G = ZᵀZ`, and takes **one dense Cholesky** of
 **Code**: `classify_design` (`src/fit/mod.rs`); `build_workspace`/`fit_on`
 (`src/fit/core.rs`); `accumulate_lmm_rows`, `lmm_run_on` (`src/fit/lmm.rs`);
 `fit_lmm` (`src/lmm/mod.rs`); `reml_deviance`, `reml_deviance_blocked`,
-`precompute_balanced_collapse` (`src/lmm/kernel.rs`); `SparseLmmWorkspace`,
+`precompute_balanced_collapse`, `precompute_group_regressions` (`src/lmm/kernel.rs`); `SparseLmmWorkspace`,
 `sparse_reml_deviance` (`src/sparse/mod.rs`); caps in `src/consts.rs`.
 **Convention**: the NoZ/Sparse split is a scratch-capacity boundary, not a model
 limit — lme4 and MixedModels.jl fit any of these designs with one solver; `glmm`
@@ -323,10 +327,11 @@ per-level counts for an equal-count active prefix starting at family 0, and
 additionally requires the *nested-child* counts to match one common template
 across the active families and to be exactly zero outside it — any hole in the
 prefix silently disarms the collapse (`collapse_n_active = 0`) rather than
-producing a wrong answer. The same precompute arms the dual and hyper-dual
-REML scratches, so the exact gradient and Hessian evaluate the collapsed form
-too — the collapse is a reassociation of the same criterion, not a different
-one, so it moves the derivative values only in their last ulps. When armed,
+producing a wrong answer. The collapse is a reassociation of the same
+criterion, not a different one, so it moves the deviance only in its last
+ulps. No derivative reads it: the shortcut needs an intercept-only primary,
+and the per-group gradient route needs slopes, so a collapsed fit always
+searches θ with BOBYQA. When armed,
 it accumulates the θ-independent
 cross-Grams `G_rr′` once; each θ-evaluation then replaces the per-family loop
 with three cheap pieces: a single Crout of the common block `A(θ)`, an
@@ -336,11 +341,116 @@ shrink-downdate arithmetic up to floating-point re-association, so the `q = 1`
 corpus reproduces on this machine. Unbalanced counts, or any slope on the
 primary, fall back to the loop.
 
+## Random slopes on the primary alone: per-group regressions
+
+With random slopes on the primary grouping (`q_p ≥ 2`) and no other grouping,
+each level `g` is its own small regression. Write `G = ZᵀZ` for its `q×q`
+random-effect Gram, `C = Zᵀ[X̃ y]` and `D = ΛΛᵀ`. When `G` is invertible, the
+Woodbury identity (Henderson & Searle 1981) rewrites the level's contribution
+with `K = D + G⁻¹` and `A = G⁻¹C`:
+
+```text
+log|I + ZDZᵀ|                     = log|G| + log|K|
+[X̃ y]ᵀ(I + ZDZᵀ)⁻¹[X̃ y]           = ([X̃ y]ᵀ[X̃ y] − CᵀG⁻¹C) + AᵀK⁻¹A
+```
+
+valid for every positive-semidefinite `D`, zero and rank-deficient included.
+The first bracket is the within-level residual cross-product, free of θ;
+summed over levels it is `P₀`. `precompute_group_regressions` runs once per fit
+and stores `B_g = G_g⁻¹`, `A_g`, `P₀` and `Σ log|G_g|`. Each θ-evaluation then
+forms `D` once, and per level only `K_g = D + B_g`, its Cholesky `L_g` and
+`M_g = L_g⁻¹A_g`; the tail is `P₀ + Σ_g M_gᵀM_g` (one stacked GEMM), which the
+shared tail Cholesky reads exactly as it reads the family loop's tail. The loop
+instead assembles `I + ΛᵀG_gΛ` and `ΛᵀC_g` per level and subtracts `ΣB_fᵀB_f`
+from `[X̃ y]ᵀ[X̃ y]`; the route skips both assemblies and adds positive-semidefinite
+terms, so at large θ it does not cancel where the loop does. Nothing requires
+the random-effect columns to span the fixed ones. When a fixed column does lie
+in every level's span, its row and column of `P₀` are zero in exact arithmetic,
+and the precompute sets them to exactly zero (residual share at most `1e-11`).
+
+The route is armed only when every non-empty level's `G_g` passes the
+pivot-ratio test of the fixed-effect Gram route (`GRAM_PIVOT_MIN`); a level
+with fewer rows than `q_p`, or a slope constant within a level, keeps the loop.
+Weighted fits take it unchanged: the sufficient statistics are already
+`√w`-scaled. The conditional-mode recovery still rebuilds the loop's per-level
+factors at θ̂, so it is shared with the loop.
+
+**Code**: `precompute_group_regressions`, `group_regression_tail`,
+`reml_deviance` (`src/lmm/kernel.rs`). **Validation**:
+`slope_deviance_matches_brute_force` and `multislope_deviance_matches_brute_force`
+check both eliminations against the dense observation-space deviance at fixed
+θ, including `D = 0`, rank-one `D` and θ at `THETA_HI`.
+
+## Gradient search on the per-group route (BFGS)
+
+Where the per-group regression route is armed for the dataset (random slopes
+on the primary grouping only, so `n_θ ≥ 3`, and every level's `G_g` passes the
+pivot test), `fit_lmm` searches θ with a projected BFGS on the analytic
+gradient instead of BOBYQA. Every other LMM shape searches with BOBYQA as
+before. The rule is a function of the shape and the data's level Grams, not of
+the start, so cold and warm fits route alike (`lmm_outer_optimizer`).
+
+**Gradient.** With `K_g = L_gL_gᵀ`, `M_g = L_g⁻¹A_g` (the value pass's `bt`
+block), `L_xx` the leading block of the tail factor, `N_g = M_{g,x}L_xx⁻ᵀ`,
+`m_g = M_g e` with `e = [−β̂; 1]`, `r² = l_yy²` and `ν = n − p`:
+
+```text
+∂f/∂D = Σ_g L_g⁻ᵀ (I − N_g N_gᵀ − (ν/r²) m_g m_gᵀ) L_g⁻¹,    ∂f/∂Λ = 2 (∂f/∂D) Λ
+```
+
+read off the lower triangle in vech order. It is taken from the state the
+last value evaluation left (`L_g` kept in `pg_l`, `bt`, the tail factor): one
+stacked triangular solve for every `N_g`, in blocks of `PG_GRAD_BLOCK = 512`
+groups so its scratch does not grow with the group count, plus a per-group
+kernel monomorphized over `q = 1..8`. A value plus its gradient costs 1.35 to
+2.0 values (`q = 2` to `q = 8`, measured 2026-10-07).
+
+**Search.** The shared optimizer layer (`src/optim/`) runs it: Armijo
+backtracking (`c = 1e-4`, halving, at most 30 trials) on value-only
+evaluations, the gradient once per accepted point; coordinates held on a bound
+the gradient pushes against; Shanno scaling at the first update; the first
+step after a (re)start capped at 0.5 in max norm. Stops: projected gradient
+below `1e-6`; an accepted decrease below `max(FDELTA_ABS = 1e-9,
+16·ε·|f|)` after the second iteration (absolute, because the deviance is O(n)
+and a relative stop grows with it); a line search whose every trial's
+predicted decrease is below that floor with the decrement below `1e-8` (the
+noise floor, where a warm start at the optimum stops after one value and one
+gradient).
+
+**Certificate and fallback.** A BFGS endpoint is accepted when it stopped on a
+convergence test, its decrement `½·gᵀHg ≤ 1e-8` (deviance units), and no
+diagonal θ ended below `1e-3` in absolute value (near a variance collapse the
+decrement can understate the remaining gain). Otherwise BOBYQA runs from the
+endpoint at `RHO_BEGIN_WARM`: as a polish when BFGS had converged, and as a
+fallback (`Note::GradientSearchFallback`) after a failed line search, an
+unavailable gradient or the iteration cap. The status and `converged` are the
+finishing optimizer's; `n_eval` counts the value evaluations of both (the
+gradients reuse them and are not counted). The pin, canonicalization and
+recovery below run unchanged on the endpoint.
+
+**Curvature hint** (`loop_advanced`). `curvature_hint` takes the inverse of a
+forward-difference Hessian of the gradient at a pilot fit's θ̂, and
+`fit_on_hinted` starts each later draw's BFGS from it instead of the identity.
+The fit only reads it, so a loop's results depend on (data, start, hint) and
+not on the order of the calls.
+
+**Code**: `search_theta`, `lmm_outer_optimizer`, `LmmObjective`,
+`lmm_curvature_hint` (`src/lmm/mod.rs`); `pg_gradient` (`src/lmm/pg_grad.rs`);
+`bfgs_minimize`, `BfgsConfig::LMM`, `CurvatureHint` (`src/optim/`).
+**Convention**: lme4 and MixedModels.jl search every LMM with a
+derivative-free optimizer (BOBYQA / NLopt); glmmTMB uses `nlminb` on an
+AD gradient. **Validation**: `pg_gradient_matches_finite_differences` (q = 2,
+3, 4, 8; near-singular, rank-one, small and large θ; weighted; across solve
+blocks), the `optim` unit tests (contract, certificate, state reuse, hints),
+and the grid and stress cells of the route, where every endpoint is equal or
+better than BOBYQA's within `dev_eps`.
+
 ## General path: BOBYQA over θ
 
-For everything the shortcut does not cover — slope primaries, unbalanced designs,
-crossed and nested extras — `fit_lmm` minimises `reml_deviance` over the box-bounded
-θ with **BOBYQA** (Powell 2009), a derivative-free trust-region method over an
+For everything the shortcut and the gradient route do not cover (unbalanced
+designs, slope primaries the per-group route refuses, crossed and nested
+extras), and as the gradient route's polish and fallback, `fit_lmm` minimises
+`reml_deviance` over the box-bounded θ with **BOBYQA** (Powell 2009), a derivative-free trust-region method over an
 interpolation set. `Bobyqa::new` is the only allocation site; `minimize` is
 zero-alloc on the warm path.
 
@@ -353,6 +463,7 @@ route) is:
 | `rho_end` (final trust radius) | `RHO_END = 1e-6` | `src/lmm/mod.rs` |
 | `npt` (interpolation points) | `2·n_θ + 1` for `n_θ < 3`, else `⌈3·n_θ/2⌉ + 1` (`(3·n_θ).div_ceil(2) + 1`) | `for_cluster_spec_ext` |
 | `max_fun` | `1000·n_θ` (twice PRIMA's default; with the restart trigger at 1/8 of the remaining budget, the first cycle restarts at 750 evaluations for n_θ = 6) | `apply_campaign_overrides` |
+| `prima_parity` | `false`: Powell's RESCUE factor `0.5` on a fully determined model (every n_θ = 1 search), where PRIMA's test is decided by rounding; every other `npt` runs PRIMA's path bit for bit | `apply_campaign_overrides` |
 
 The blind start's radius is 0.5 and a warm start's 0.1: a search from far
 needs a wide first model, one from near the optimum spends evaluations on it.
@@ -434,8 +545,12 @@ diagonals. Because Σ is preserved, the reported answer does not move; what
 changes is θ itself (and `tau2`, which is per-θ). A block with no pinned diagonal
 is skipped untouched, so a non-singular fit is bit-identical.
 
-`Diagnostics::pinned` depends on this canonical form: a zero θ diagonal is now a
-zero standard deviation, which on a non-canonical Λ it need not be. The GLMM
+`Diagnostics::pinned` depends on this canonical form: a zero θ diagonal now has
+an exactly zero column, so it marks a rank-deficient direction of Σ̂ (zero
+variance conditional on the earlier components of the block), which on a
+non-canonical Λ it need not. It is not in general a zero standard deviation: at
+a correlation boundary (`|ρ| = 1`) the trailing diagonal pins while that
+component's own variance, the rest of its Λ row, stays positive. The GLMM
 path runs the same step, except on its AGQ route, where only the pin flags use
 the canonical form ([`algorithms-glmm.md`](algorithms-glmm.md) has the reason).
 `canonicalize_pinned_blocks` itself skips a block
@@ -501,8 +616,9 @@ around them is one copy: the seed, the BOBYQA schedule, the pin loop, β̂ and
 whichever kernel evaluates the objective. The ill-conditioning policy is one
 copy too: `min_pivot_ratio` measured off whichever factor the kernel left is
 flagged `IllConditioned` below `lmm::PIVOT_MIN`, never refused. The one thing
-the sparse kernel does not carry is the exact dual REML gradient — it has no
-dual twin at all.
+the sparse kernel does not carry is the per-group analytic gradient
+(`pg_gradient` reads dense-kernel state), so a sparse fit always searches θ
+with BOBYQA.
 
 **Code**: `sparse_reml_deviance`, `sparse_schur_factor`,
 `schur_phase_b`, `TAIL_SPARSE_MIN` (`src/sparse/mod.rs`). **Validation**:
@@ -589,6 +705,9 @@ list of differences from the other engines, with justification, is in
 - Bates, D. et al. *MixedModels.jl* (Julia package). — the second reference
   engine; same profiled objective, ML default; NEWUOA over unconstrained θ
   since v5.0.0 (BOBYQA retained for scalar RE).
+- Henderson, H. V. & Searle, S. R. (1981). On deriving the inverse of a sum
+  of matrices. *SIAM Review*, 23(1), 53–60. — the Woodbury forms behind the
+  per-group regression route.
 - Powell, M. J. D. (2009). *The BOBYQA algorithm for bound constrained
   optimization without derivatives*. Report DAMTP 2009/NA06, University of
   Cambridge. — the θ optimizer; the `npt` bounds cited in the schedule table

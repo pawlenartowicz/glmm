@@ -80,6 +80,30 @@ test_that("intercepted lme4 arguments raise designed errors", {
   expect_error(fastglmm(y ~ x, d, bogus = 1), "unused argument")
 })
 
+test_that("REML is checked against the model, not the engine", {
+  d <- err_data()
+  d$yb <- as.integer(d$y > 0)
+  d$yc <- rep(0:3, 10)
+  # No REML objective outside a Gaussian mixed model: TRUE is refused, not ignored.
+  msg <- "only to Gaussian mixed models"
+  expect_error(fastglmm(y ~ x, d, REML = TRUE), msg)
+  expect_error(fastglmm(yc ~ x, d, family = poisson(), REML = TRUE), msg)
+  expect_error(fastglmm(yb ~ x + (1 | g), d, family = binomial(), REML = TRUE), msg)
+  # Those models are fitted by maximum likelihood, so FALSE is the default fit.
+  f0 <- suppressWarnings(fastglmm(yb ~ x + (1 | g), d, family = binomial()))
+  f1 <- suppressWarnings(fastglmm(yb ~ x + (1 | g), d, family = binomial(), REML = FALSE))
+  expect_identical(fixef(f1), fixef(f0))
+  expect_identical(vcov(f1), vcov(f0))
+  expect_identical(f1$loglik, f0$loglik)
+  # A single-level grouping is dropped after lowering: the formula says mixed,
+  # the fitted model is OLS, and REML = TRUE is decided on the fitted model.
+  d$g1 <- factor(rep("a", 40))
+  expect_error(suppressWarnings(fastglmm(y ~ x + (1 | g1), d, REML = TRUE)),
+               "every random-effect term was dropped")
+  expect_error(fastglmm(y ~ x + (1 | g), d, REML = NA), "TRUE or FALSE")
+  expect_error(fastglmm(y ~ x + (1 | g), d, REML = c(TRUE, FALSE)), "TRUE or FALSE")
+})
+
 test_that("non-treatment contrasts on a fixed-effect factor error instead of fitting silently", {
   set.seed(6)
   n <- 40L
@@ -281,12 +305,24 @@ test_that("inverse-Gaussian accepts dispersion = \"estimate\"", {
   expect_true(f$converged)
 })
 
-test_that("init.theta has no kernel hook", {
+test_that("init.theta seeds the negative-binomial shape search", {
   d <- err_data()
-  d$yc <- rpois(40, 2)
-  expect_error(fastglmm(yc ~ x, d, family = "negativebinomial",
-                        init.theta = 1.5),
-               "no kernel hook")
+  u <- rnorm(8, sd = 0.8)
+  d$yc <- rpois(40, exp(0.7 + u[as.integer(d$g)]))
+  a <- fastglmm(yc ~ x + (1 | g), d, family = "negativebinomial",
+                init.theta = 1.5)
+  b <- fastglmm(yc ~ x + (1 | g), d, family = "negativebinomial",
+                start = list(dispersion = 1.5))
+  expect_identical(a$n_eval, b$n_eval)
+  expect_identical(a$deviance, b$deviance)
+  expect_true(fastglmm(yc ~ x, d, family = "negativebinomial",
+                       init.theta = 1.5)$converged)
+  expect_error(fastglmm(yc ~ x + (1 | g), d, family = "negativebinomial",
+                        init.theta = 1.5, start = list(dispersion = 1.5)),
+               "not both")
+  expect_error(fastglmm(yc ~ x + (1 | g), d, family = "negativebinomial",
+                        start = list(dispersion = -1)),
+               "finite number > 0")
 })
 
 test_that("negative binomial GLM fits to convergence and reports theta as dispersion", {
@@ -340,9 +376,9 @@ test_that("start must be a list - message matches the Python port's warm_start c
   expect_error(
     fastglmm(y ~ x, d, start = c(0, 0)),
     paste(
-      "start must be a list with elements 'beta' and/or 'theta' (theta is the",
-      "random-effect Cholesky vector, not the negative-binomial shape - that is",
-      "init.theta), got numeric"
+      "start must be a list with elements 'beta', 'theta' and/or 'dispersion' (theta",
+      "is the random-effect Cholesky vector, not the negative-binomial shape - that is",
+      "init.theta or dispersion), got numeric"
     ),
     fixed = TRUE
   )

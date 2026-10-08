@@ -2,17 +2,15 @@
 
 `glmm.fit` parses `formula` against `data`'s columns through the Rust
 `glmm::formula` module, fits via the `glmm` kernel (through the `glmm._native`
-PyO3 extension), and returns a `Fit`. Two options are not yet implemented
-in the kernel and raise a clean
-`NotImplementedError`: quasi-likelihood `dispersion=` on binomial/poisson, and
-`init_theta=<float>` (no kernel hook exists yet to seed the negative-binomial
-search — only the default `init_theta=None` cold-start is supported).
+PyO3 extension), and returns a `Fit`. One option is not yet implemented
+in the kernel and raises a clean `NotImplementedError`: quasi-likelihood
+`dispersion=` on binomial/poisson.
 
 Public surface is `fit`, `Fit`, and the warning categories the diagnostics
 channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
 `ArgumentIgnoredWarning`, `ConstantResponseWarning`, `DesignUnsolvableWarning`,
 `ExactProfileFallbackWarning`,
-`FitFailedWarning`, `GlmDivergedWarning`, `HessianSeFallbackWarning`,
+`FitFailedWarning`, `GradientSearchFallbackWarning`, `GlmDivergedWarning`, `HessianSeFallbackWarning`,
 `IllConditionedWarning`, `NbShapeUnsettledWarning`, `NoCoefficientsWarning`,
 `NonIntegerResponseWarning`, `PirlsExhaustedWarning`, `PrecisionLimitedWarning`,
 `RowsDroppedWarning`,
@@ -40,6 +38,7 @@ __all__ = [
     "Fit",
     "FitFailedWarning",
     "GlmDivergedWarning",
+    "GradientSearchFallbackWarning",
     "HessianSeFallbackWarning",
     "IllConditionedWarning",
     "NbShapeUnsettledWarning",
@@ -123,6 +122,17 @@ class HessianSeFallbackWarning(DiagnosticWarning):
     The standard errors reported are the RX/Schur ones instead, and
     `Fit.stddev_se` (the random-effect standard deviations' own standard
     errors) comes back `NaN` — only the joint Hessian route fills it.
+    """
+
+
+class GradientSearchFallbackWarning(DiagnosticWarning):
+    """The gradient search (used on linear mixed models whose random slopes
+    are all on one grouping, and on binomial and Poisson GLMMs fitted by the
+    Laplace approximation) did not converge, so the standard derivative-free
+    search continued from the best point it had reached.
+
+    The reported estimates and `converged` come from that second search,
+    which ran with its own full evaluation budget; `n_eval` counts both.
     """
 
 
@@ -525,6 +535,17 @@ class Fit:
     names: list  # coefficient names, aligned with beta
     re_groups: list  # per grouping, in varcorr order: (name, [term names])
     n_eval: int  # optimizer objective evaluations (0 on the closed-form/IRLS paths)
+    # The gradient (BFGS) theta search, on the models GradientSearchFallbackWarning
+    # names; they describe that search even when the derivative-free search
+    # finished the fit after it. `n_grad` counts its gradient evaluations
+    # (`n_eval` does not); `outer_stop` is why it stopped: "fdelta", "pgrad"
+    # or "noise_floor" (converged), "line_search", "max_iter",
+    # "grad_unavailable" or "non_finite"; `outer_decrement` is its estimate of
+    # the deviance decrease left at the endpoint. 0 / None / NaN on every fit
+    # that ran no gradient search.
+    n_grad: int
+    outer_stop: str | None
+    outer_decrement: float
     # Minimized optimizer criterion. NOT comparable across models and NOT an AIC
     # input — it carries the Rust `Fit::deviance` caveat: for an LMM it is lme4's
     # REMLcrit minus a data-independent constant; for a GLMM it is the marginal
@@ -687,6 +708,7 @@ _WARNING_KINDS = {
     "hessian_se_fallback": ("caution", "Simpler standard errors used"),
     "se_unavailable": ("caution", "Standard errors not computed"),
     "exact_profile_fallback": ("caution", "Search retried with a different method"),
+    "gradient_search_fallback": ("caution", "Search finished by another method"),
     "precision_limited": ("caution", "Numbers too large for full precision"),
     "agq_fallback": ("caution", "Adaptive quadrature not used"),
     "non_integer_response": ("caution", "Non-integer response"),
@@ -827,6 +849,15 @@ def _note_warning(note, names, converged):
                 "for predictors that are copies or near-copies of each other."
             ),
             SeUnavailableWarning,
+        )
+    if kind == "gradient_search_fallback":
+        return (
+            (
+                "The fast search for this model did not settle on an answer, so the fit "
+                "finished with the standard search from the best point it had reached. The "
+                "reported estimates come from that search."
+            ),
+            GradientSearchFallbackWarning,
         )
     if kind == "exact_profile_fallback":
         return (
@@ -1038,16 +1069,21 @@ def fit(
         q <= 3 random effects per
         group (temporary cap); any other shape warns and falls back to Laplace.
     init_theta: negative-binomial shape seed, named for `MASS::glm.nb(init.theta=)`
-        — the same knob, and the name the R port exposes. Distinct from
-        `warm_start["theta"]`, which is the random-effect Cholesky vector
-        (lme4's `start=list(theta=)`); they are unrelated parameters and both
-        may be passed in one call.
+        — the same knob, and the name the R port exposes: the starting value of
+        the shape search (the same slot as `warm_start["dispersion"]`; give one
+        of the two). None cold-starts it from the no-random-effect
+        negative-binomial fit. Distinct from `warm_start["theta"]`, which is the
+        random-effect Cholesky vector (lme4's `start=list(theta=)`); they are
+        unrelated parameters and both may be passed in one call.
     offset: per-row additive offset on the linear-predictor scale, length n
         (R's `offset=`): eta = offset + X*beta (+ Z*b). A fixed known
         contribution, not a parameter — the canonical use is a Poisson
         exposure, offset = log(exposure). None = no offset.
-    warm_start: {"beta": …, "theta": …} optimizer start. See `init_theta` above
-        for why "theta" here is NOT the negative-binomial shape.
+    warm_start: {"beta": …, "theta": …, "dispersion": …} optimizer start; any key
+        may be left out to cold-start that part. "dispersion" is the estimated
+        dispersion as a previous fit reports it (`Fit.dispersion`): the shape
+        for negative binomial, phi for Gamma. See `init_theta` above for why
+        "theta" here is NOT the negative-binomial shape.
 
     A categorical column's level order is honored: level 0 is the
     treatment-contrast base, so `pd.Categorical(x, categories=[…])` fits against
@@ -1144,21 +1180,21 @@ def fit(
     if warm_start is not None:
         if not isinstance(warm_start, dict):
             raise TypeError(
-                "warm_start must be a dict with keys 'beta' and/or 'theta' (theta is the "
-                "random-effect Cholesky vector, not the negative-binomial shape - that is "
-                f"init_theta), got {type(warm_start).__name__}"
+                "warm_start must be a dict with keys 'beta', 'theta' and/or 'dispersion' (theta "
+                "is the random-effect Cholesky vector, not the negative-binomial shape - that is "
+                f"init_theta or dispersion), got {type(warm_start).__name__}"
             )
-        unknown = [k for k in warm_start if k not in ("beta", "theta")]
+        allowed = ("beta", "theta", "dispersion")
+        unknown = [k for k in warm_start if k not in allowed]
         if unknown:
             _warn(
                 store,
                 "argument_ignored",
-                "warm_start accepts only 'beta' and 'theta'; these entries were ignored: "
-                + ", ".join(map(str, unknown))
-                + ".",
+                "warm_start accepts only 'beta', 'theta' and 'dispersion'; these entries were "
+                "ignored: " + ", ".join(map(str, unknown)) + ".",
                 ArgumentIgnoredWarning,
             )
-            warm_start = {k: v for k, v in warm_start.items() if k in ("beta", "theta")}
+            warm_start = {k: v for k, v in warm_start.items() if k in allowed}
 
     if dispersion == "estimate" and family in ("gamma", "inversegaussian"):
         # The phi families' default (dispersion=None) already estimates phi
@@ -1169,11 +1205,25 @@ def fit(
         raise NotImplementedError(
             f"quasi-likelihood dispersion on family {family!r} is not yet implemented in the kernel"
         )
+    # init_theta is the negative-binomial shape seed: the same kernel slot as
+    # warm_start["dispersion"], so giving both is ambiguous.
     if init_theta is not None:
-        raise NotImplementedError(
-            "init_theta= (negative-binomial shape seed) has no kernel hook yet; "
-            "only the default cold-start search is supported"
-        )
+        if warm_start is not None and warm_start.get("dispersion") is not None:
+            raise ValueError(
+                "give the negative-binomial shape seed once: init_theta= or "
+                'warm_start["dispersion"], not both'
+            )
+        warm_start = dict(warm_start or {}, dispersion=init_theta)
+    if warm_start is not None and warm_start.get("dispersion") is not None:
+        d = warm_start["dispersion"]
+        if (
+            isinstance(d, bool)
+            or not isinstance(d, (int, float))
+            or not (math.isfinite(d) and d > 0)
+        ):
+            raise ValueError(
+                f'warm_start["dispersion"] (or init_theta) must be one finite number > 0, got {d!r}'
+            )
 
     # Only the columns the formula actually uses are read from here on — see
     # `_formula_columns`.
@@ -1297,9 +1347,11 @@ def fit(
 
     warm_start_pair = None
     if warm_start is not None:
+        d = warm_start.get("dispersion")
         warm_start_pair = (
             [float(v) for v in warm_start.get("beta", [])],
             [float(v) for v in warm_start.get("theta", [])],
+            None if d is None else float(d),
         )
 
     r = _native.fit(
@@ -1371,6 +1423,9 @@ def fit(
         names=r["names"],
         re_groups=r["re_groups"],
         n_eval=r["n_eval"],
+        n_grad=r["n_grad"],
+        outer_stop=r["outer_stop"],
+        outer_decrement=r["outer_decrement"],
         deviance=r["deviance"],
         loglik=r["loglik"],
         df=r["df"],

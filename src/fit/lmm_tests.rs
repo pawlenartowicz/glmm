@@ -6,7 +6,7 @@ use crate::standardize::ColumnScaling;
 // which is `loop_advanced`-gated: the pivot the region-2 tests below assert on
 // is recorded on every route, so these must run under default features too.
 use super::core::{build_workspace, fit_on};
-use crate::lmm::{fit_lmm, LmmWorkspace};
+use crate::lmm::{fit_lmm_unhinted, LmmWorkspace};
 use crate::{
     Family, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing, StartValues,
 };
@@ -771,6 +771,7 @@ fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
             StartValues {
                 beta: cold.beta.clone(),
                 theta: truth,
+                dispersion: None,
             },
         ),
         // Well off θ̂ ≈ [0.97, 0.015, 0.23] in every coordinate; the LMM
@@ -780,6 +781,7 @@ fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
             StartValues {
                 beta: vec![0.0; p],
                 theta: vec![3.0, 0.5, 1.5],
+                dispersion: None,
             },
         ),
     ];
@@ -1112,7 +1114,7 @@ fn fit_lmm_weighted_matches_lme4() {
     }
     ws.suff_mut()
         .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], Some(&w));
-    let lmm_fit = fit_lmm(&mut ws, &[0, 1], None, ColumnScaling::IDENTITY);
+    let lmm_fit = fit_lmm_unhinted(&mut ws, &[0, 1], None, ColumnScaling::IDENTITY);
     let sigma = lmm_fit.sigma_sq.sqrt();
     assert!(
         (sigma - REF_SIGMA).abs() / REF_SIGMA < 1e-4,
@@ -1989,6 +1991,7 @@ fn lmm_warm_start_theta_is_a_fixed_point_of_the_forward_map() {
     let start = StartValues {
         beta: cold_fit.beta.clone(),
         theta: cold_theta.clone(),
+        dispersion: None,
     };
     let warm_view = fit_on(&mut ws, &x, &y, &sized_ids, Some(&start), &opts);
     let warm_theta = warm_view.theta().to_vec();
@@ -2176,6 +2179,20 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
             extra_groupings: vec![],
         }),
     };
+    // BOBYQA's cap is the behaviour under test, so the fixture stays off the
+    // gradient route: the last cluster keeps a single row (its two-column Z
+    // has a singular Gram), which refuses the per-group regression route that
+    // BFGS needs (`precompute_group_regressions`).
+    let last = (n_clusters - 1) as u32;
+    let mut kept = false;
+    for id in ids_v.iter_mut() {
+        if *id == last {
+            if kept {
+                *id = last - 1;
+            }
+            kept = true;
+        }
+    }
     let ids = GroupIds {
         primary: ids_v,
         extra: vec![],
@@ -2202,17 +2219,24 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
     let config = {
         let mut c = Config::new(n_theta);
         c.npt = npt;
-        // 200 evals short of the unlimited-budget optimum — chosen by probing
-        // (see the doc comment above): the reported point already carries a
-        // negligible slope-to-intercept stddev ratio well before BOBYQA's own
+        // 41 evals short of the unlimited-budget optimum (191 evals on this
+        // fixture, probed 2026-10-07 once the single-row cluster above kept it
+        // on BOBYQA): the reported point already carries a negligible
+        // slope-to-intercept stddev ratio (2.5e-4) well before BOBYQA's own
         // Converged confirmation fires.
-        c.max_fun = npt + 1 + 200;
+        c.max_fun = 150;
         c
     };
     ws.solver = Bobyqa::new(n_theta, config).expect("legal minimal config");
 
     let fit = {
-        let v = lmm_run_on(&mut ws, &opts.target_indices, None, ColumnScaling::IDENTITY);
+        let v = lmm_run_on(
+            &mut ws,
+            &opts.target_indices,
+            None,
+            None,
+            ColumnScaling::IDENTITY,
+        );
         lmm_view_to_fit(&v, &x, &ids, n, p, &opts)
     };
 
@@ -2544,4 +2568,181 @@ fn accumulate_lmm_rows_sparse_weighted_reuse_allocates_nothing() {
         "{N_CALLS} weighted sparse accumulations allocated {} blocks",
         stats.total_blocks
     );
+}
+
+// --- curvature hints (B1.4) ---
+
+/// `y` with a deterministic per-row shift, a second draw of the same design.
+fn shifted(y: &[f64], k: f64) -> Vec<f64> {
+    y.iter()
+        .enumerate()
+        .map(|(i, &v)| v + k * ((i % 7) as f64 - 3.0))
+        .collect()
+}
+
+fn fit_bits(v: &super::core::FitView<'_>) -> (u64, Vec<u64>, usize) {
+    (
+        v.betas()[0].to_bits() ^ v.betas()[1].to_bits(),
+        v.theta().iter().map(|t| t.to_bits()).collect(),
+        v.n_eval(),
+    )
+}
+
+/// A hinted fit is a function of (data, start, hint) only: the same draws in
+/// either order on one workspace, and each on a fresh workspace, agree bit
+/// for bit, and the hint is still the pilot's after the loop.
+#[test]
+fn curvature_hint_results_do_not_depend_on_call_order() {
+    use super::core::{curvature_hint, fit_on_hinted};
+    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let build = || build_workspace(&sized, perm, n, p, &opts);
+    let mut pilot_ws = build();
+    let pilot = fit_on(&mut pilot_ws, &x, &y, &sized_ids, None, &opts);
+    assert!(pilot.diagnostics().converged);
+    let hint = curvature_hint(&mut pilot_ws).expect("sleepstudy takes the gradient route");
+    assert_eq!(hint.dim(), 3);
+    let snapshot = format!("{hint:?}");
+    let (y1, y2) = (shifted(&y, 0.3), shifted(&y, -0.2));
+
+    let mut ab = build();
+    let a1 = fit_bits(&fit_on_hinted(
+        &mut ab,
+        &x,
+        &y1,
+        &sized_ids,
+        None,
+        Some(&hint),
+        &opts,
+    ));
+    let a2 = fit_bits(&fit_on_hinted(
+        &mut ab,
+        &x,
+        &y2,
+        &sized_ids,
+        None,
+        Some(&hint),
+        &opts,
+    ));
+    let mut ba = build();
+    let b2 = fit_bits(&fit_on_hinted(
+        &mut ba,
+        &x,
+        &y2,
+        &sized_ids,
+        None,
+        Some(&hint),
+        &opts,
+    ));
+    let b1 = fit_bits(&fit_on_hinted(
+        &mut ba,
+        &x,
+        &y1,
+        &sized_ids,
+        None,
+        Some(&hint),
+        &opts,
+    ));
+    let f1 = fit_bits(&fit_on_hinted(
+        &mut build(),
+        &x,
+        &y1,
+        &sized_ids,
+        None,
+        Some(&hint),
+        &opts,
+    ));
+    assert_eq!(a1, b1);
+    assert_eq!(a2, b2);
+    assert_eq!(a1, f1);
+    assert_eq!(
+        format!("{hint:?}"),
+        snapshot,
+        "the fit never writes the hint"
+    );
+}
+
+/// The hint only changes the search path: a hinted fit reaches the unhinted
+/// fit's optimum.
+#[test]
+fn curvature_hint_reaches_the_unhinted_optimum() {
+    use super::core::{curvature_hint, fit_on_hinted};
+    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let _ = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts);
+    let hint = curvature_hint(&mut ws).unwrap();
+    let y1 = shifted(&y, 0.3);
+    let plain = fit_on(&mut ws, &x, &y1, &sized_ids, None, &opts)
+        .into_fit(&x, &y1, &sized_ids, n, p, &model, &opts)
+        .deviance;
+    let v = fit_on_hinted(&mut ws, &x, &y1, &sized_ids, None, Some(&hint), &opts);
+    assert!(v.diagnostics().converged);
+    let hinted = v
+        .into_fit(&x, &y1, &sized_ids, n, p, &model, &opts)
+        .deviance;
+    assert!(
+        hinted <= plain + 1e-9,
+        "hinted {hinted} vs unhinted {plain}"
+    );
+}
+
+/// A hint taken at another θ dimension is rejected.
+#[test]
+#[should_panic(expected = "curvature hint dimension")]
+fn curvature_hint_of_another_dimension_is_rejected() {
+    use super::core::{curvature_hint, fit_on_hinted};
+    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let _ = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts);
+    let hint = curvature_hint(&mut ws).unwrap();
+    // The same data as a random-intercept model: n_θ = 1.
+    let intercept = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let (sized1, ids1, perm1) = spec_sized_from_ids_pub(&intercept, &ids);
+    let mut ws1 = build_workspace(&sized1, perm1, n, p, &opts);
+    let _ = fit_on_hinted(&mut ws1, &x, &y, &ids1, None, Some(&hint), &opts);
+}
+
+/// No hint where the fit has no gradient: a random-intercept LMM searches
+/// with BOBYQA.
+#[test]
+fn curvature_hint_is_none_off_the_gradient_route() {
+    use super::core::curvature_hint;
+    let (x, y, n, p, _, ids) = sleepstudy_slope_design();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let intercept = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&intercept, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let _ = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts);
+    assert!(curvature_hint(&mut ws).is_none());
 }

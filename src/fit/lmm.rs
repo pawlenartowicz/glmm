@@ -205,6 +205,10 @@ impl LmmResultView<'_> {
             precision_limited: false,
             // No IRLS on the Gaussian LMM path.
             separated: false,
+            gradient_search_fallback: self.fit.gradient_search_fallback,
+            n_grad: self.fit.grad_report.map_or(0, |r| r.1 as u32),
+            outer_stop: self.fit.grad_report.map(|r| r.0.into()),
+            outer_decrement: self.fit.grad_report.map_or(f64::NAN, |r| r.2),
         }
     }
     /// Joint Wald-χ² over the target set (the omnibus significance read).
@@ -242,9 +246,10 @@ pub(crate) fn lmm_run_on<'a>(
     ws: &'a mut LmmWorkspace,
     target_indices: &[u32],
     theta_start: Option<&[f64]>,
+    hint: Option<&crate::optim::CurvatureHint>,
     map: &'a ColumnScaling,
 ) -> LmmResultView<'a> {
-    let fit = fit_lmm(ws, target_indices, theta_start, map);
+    let fit = fit_lmm(ws, target_indices, theta_start, hint, map);
 
     LmmResultView {
         weight_scale: ws.weight_scale,
@@ -459,7 +464,13 @@ fn fit_lmm_into(
         start_to_design(&mut s, map, g, &mut vec![0.0; g.re_map_scratch_len()]);
         s
     });
-    let view = lmm_run_on(ws, &opts.target_indices, warm_theta(start.as_ref()), map);
+    let view = lmm_run_on(
+        ws,
+        &opts.target_indices,
+        warm_theta(start.as_ref()),
+        None,
+        map,
+    );
     lmm_view_to_fit(&view, x, ids, n, p, opts)
 }
 /// LMM dispatch adapter. `cluster_ids`/`extra_ids` are the per-row level ids from

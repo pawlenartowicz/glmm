@@ -17,9 +17,9 @@ link default (§2).
 > **Status:** this release ships the full API surface — `fastglmm()`, argument
 > validation, every working accessor — wired end to end through the extendr
 > binding: a valid call parses the formula, fits, and returns a real
-> `"fastglmm"` object. Two narrow combinations are open gaps and raise a
+> `"fastglmm"` object. One narrow combination is an open gap and raises a
 > clean error naming the reason instead of fitting: quasi-likelihood
-> `dispersion=` on binomial/poisson, and an `init.theta=` shape seed (see §2).
+> `dispersion=` on binomial/poisson.
 
 The package is not on CRAN yet. Install from a checkout (needs Rust — `cargo`
 and `rustc >= 1.85` on the `PATH`):
@@ -154,8 +154,10 @@ The knobs:
   argument and a formula `offset()` term is an error asking you to use one.
 - `start` — warm start; see §4.
 - `init.theta` — negative-binomial shape seed, named for
-  `MASS::glm.nb(init.theta=)`, and **distinct** from `start$theta` (the
-  random-effect Cholesky start): unrelated knobs sharing a Greek letter.
+  `MASS::glm.nb(init.theta=)`: the starting value of the shape search, the
+  same slot as `start$dispersion` (give one of the two). **Distinct** from
+  `start$theta` (the random-effect Cholesky start): unrelated knobs sharing a
+  Greek letter.
 
 **Error vs. warning.** An *invalid* value — unknown family, a link the family
 doesn't offer, a non-odd or out-of-range `nAGQ`, a `start` that isn't a list —
@@ -170,11 +172,9 @@ model. Known lme4 arguments passed through `...` (`REML = FALSE`, `control=`,
 (`REML = FALSE`, for instance, because the LMM path is REML-only by design). A
 random-effect term on `family = inverse.gaussian()` errors — the kernel is
 GLM-only for that family — and the remaining open gap, quasi-likelihood
-dispersion on binomial/Poisson, errors until the kernel implements it. And
-`init.theta=` with an actual value errors — there is no kernel hook to seed
-the shape search yet, so only the default cold start runs (off
-negative-binomial the same argument is the harmless warn-and-strip case
-above).
+dispersion on binomial/Poisson, errors until the kernel implements it.
+(`init.theta=` off negative-binomial is the harmless warn-and-strip case
+above.)
 
 ## 3. Reading the result
 
@@ -253,7 +253,11 @@ fit2 <- fastglmm(y ~ x1 + (1 | group), data2,
 
 `start` takes lme4's name and shape: a list with `beta` (length `p`) and `theta`
 (the random-effect **Cholesky** vector, `lme4::getME(fit, "theta")`'s layout;
-empty for a fixed-only model, where a warm start is a no-op anyway). Unknown list
-elements warn and are dropped. This is unrelated to `init.theta` (§2), the
-negative-binomial shape seed — the two just share the letter, which is why the RE
-start is `start$theta` and the shape seed is a separate argument.
+empty for a fixed-only model, where a warm start is a no-op anyway), plus an
+optional `dispersion`: a previous fit's `fit$dispersion` (the negative-binomial
+shape or the Gamma φ), a starting value for the search, never a held value
+(`dispersion=` holds φ fixed). Any element may be left out to cold-start that
+part. Unknown list elements warn and are dropped. `start$theta` is unrelated to
+`init.theta` (§2), the negative-binomial shape seed — the two just share the
+letter, which is why the RE start is `start$theta`; the shape seed is
+`init.theta` or `start$dispersion` (give one of the two).

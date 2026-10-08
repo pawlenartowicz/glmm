@@ -41,6 +41,115 @@ fn fd_eval(
     laplace_deviance_at(ws, x, y, cluster_ids, extra_ids, n, &mut fd_counters)
 }
 
+/// Relative step of the AGQ gradient-difference Hessian
+/// ([`agq_gradient_difference_hessian`]): coordinate `g` moves by
+/// `AGQ_GD_STEP_REL·max(1, |γ̂_g|)` each way. A central difference of an exact
+/// gradient has truncation error O(h²) and rounding error O(ε·|g|/h), balanced
+/// near `h ≈ ε^{1/3}` (Nocedal & Wright 2006, §8.1); at 1e-5 the SEs agree
+/// with the hyper-dual rung's to 1e-11 (β) and 1e-10 (θ) relative on the
+/// grid's AGQ cells and at 300k rows, and the same at 1e-4, so the result sits
+/// on the flat part of the step curve (measured 2026-10-07, pawel scratch
+/// `mmjl-rethink/b7/`, `agqse/`).
+const AGQ_GD_STEP_REL: f64 = 1e-5;
+
+/// Largest relative asymmetry `|H_rc − H_cr| / √(|H_rr·H_cc|)` the
+/// differenced Hessian may carry before [`agq_gradient_difference_hessian`]
+/// declines it. An exact gradient differenced at a smooth point is symmetric to
+/// O(h²); a larger gap says a perturbed solve landed in a different mode or a
+/// row sat on a kink, and the hyper-dual rung takes the cell instead.
+const AGQ_GD_ASYM_MAX: f64 = 1e-6;
+
+/// The joint AGQ Hessian by central differences of the exact `f64` AGQ
+/// gradient (`agq_gradient::assemble`), at `γ̂ = ws.fd.fd_saved[..m]`, into
+/// `hess`. Rung 2a of `joint_hessian_cov_at`'s ladder, on the shapes
+/// `agq_gradient::covers` accepts.
+///
+/// Each column costs two PIRLS mode solves at `γ̂ ± h·e_g`
+/// (`agq_gradient::mode_at`, no AGQ node sum: no value is read there), each
+/// seeded from the fit's own mode (`ws.u_seed`), so every column is a function
+/// of `γ` alone and the result does not depend on evaluation order, and one
+/// gradient assembly on the state each solve leaves. Nothing is held per row
+/// beyond the f64 fit's own buffers, which is what this rung buys over the
+/// hyper-dual pass: at 300k rows the SE step's peak falls from about 554 MB to
+/// 71 MB and the step is faster. A final solve at `γ̂` leaves the workspace at
+/// the fitted point, as the hyper-dual rung's own mode solve does.
+///
+/// `Unsupported` (the caller falls through to the hyper-dual rung) when a
+/// mode solve fails, a value or gradient is non-finite, a row reaches the
+/// link's clamp, or the differenced matrix is asymmetric beyond
+/// [`AGQ_GD_ASYM_MAX`].
+#[allow(clippy::too_many_arguments)]
+fn agq_gradient_difference_hessian(
+    ws: &mut GlmmWorkspace,
+    xd: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    p: usize,
+    n: usize,
+    hess: &mut Mat<f64>,
+) -> DerivStatus {
+    let m = ws.n_theta + p;
+    let nagq = ws.nagq;
+    let mut gd = match ws.agq_gd.take() {
+        Some(g) if g.matches_shape(p, nagq) => g,
+        _ => Box::new(super::agq_gradient::AgqGd::for_shape(p, nagq)),
+    };
+    gd.idx.rebuild(&cluster_ids[..n], ws.groupings.n_primary);
+    let saved_tol = ws.fd.pirls_tol_override;
+    ws.fd.pirls_tol_override = Some(super::pirls_tol_fd(ws.family));
+    let mut gp = vec![0.0; m];
+    let mut gm = vec![0.0; m];
+    let mut prm = vec![0.0; m];
+    let mut ok = true;
+    'cols: for g in 0..m {
+        let step = AGQ_GD_STEP_REL * ws.fd.fd_saved[g].abs().max(1.0);
+        for (sgn, out) in [(1.0, &mut gp), (-1.0, &mut gm)] {
+            ws.params[..m].copy_from_slice(&ws.fd.fd_saved[..m]);
+            ws.params[g] += sgn * step;
+            if !super::agq_gradient::mode_at(ws, xd, y, cluster_ids, n) {
+                ok = false;
+                break 'cols;
+            }
+            prm.copy_from_slice(&ws.params[..m]);
+            if !super::agq_gradient::assemble(ws, xd, y, &gd.idx, &prm, &mut gd.sc, out)
+                || !out.iter().all(|v| v.is_finite())
+            {
+                ok = false;
+                break 'cols;
+            }
+        }
+        for r in 0..m {
+            hess[(r, g)] = (gp[r] - gm[r]) / (2.0 * step);
+        }
+    }
+    let f0 = if ok {
+        fd_eval(ws, &[], &[], xd, y, cluster_ids, extra_ids, n)
+    } else {
+        f64::NAN
+    };
+    ws.fd.pirls_tol_override = saved_tol;
+    ws.agq_gd = Some(gd);
+    if !ok || !f0.is_finite() {
+        return DerivStatus::Unsupported;
+    }
+    for r in 0..m {
+        for c in 0..r {
+            let (a, b) = (hess[(r, c)], hess[(c, r)]);
+            // Every entry is finite here (each gradient was checked), so the
+            // comparison is never against a NaN.
+            let scale = (hess[(r, r)] * hess[(c, c)]).abs().sqrt();
+            if (a - b).abs() > AGQ_GD_ASYM_MAX * scale {
+                return DerivStatus::Unsupported;
+            }
+            let v = 0.5 * (a + b);
+            hess[(r, c)] = v;
+            hess[(c, r)] = v;
+        }
+    }
+    DerivStatus::Ok(f0)
+}
+
 /// Central second difference of coordinate `k` at step `s`: `(f(+s) − 2·f0 +
 /// f(−s))/s²`, where `eval(coords, deltas)` evaluates the deviance at the base
 /// point perturbed by `Σ deltaₖ·e_{coordₖ}`. Returns the raw value — non-finite
@@ -166,6 +275,64 @@ fn fd_hess_entry(
     }
 }
 
+/// The parallel arm of both FD-Hessian grids: the `m(m+1)/2` upper-triangle
+/// cells in one contiguous chunk per rayon thread, each chunk evaluated on ONE
+/// worker workspace built for it (`fd_worker_ws`). Rayon's `map_init` builds a
+/// worker per split job instead, several per thread: on a packed `k = 2,000`
+/// fit 8 workers on a 1-thread pool and 10 on 6 threads, each a full workspace
+/// with its own sparse symbolic analysis and dense `k×k` scratch. Chunking
+/// builds exactly one per thread.
+///
+/// It does not lower the peak: a worker is the fit's whole mutable scratch, so
+/// `t` threads still hold `t` of them at once (measured 2026-10-07, packed
+/// `k = 5,000`: 472 MB serial, 3.07 GB on 6 threads). Every cell is a pure
+/// function of the frozen FD seed (`joint_hessian_cov`'s doc), so how the cells
+/// are split over workers changes no value.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[allow(clippy::too_many_arguments)]
+fn fd_grid_par(
+    ws_ro: &GlmmWorkspace,
+    m: usize,
+    f0: f64,
+    x: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    n: usize,
+) -> Vec<(usize, usize, f64)> {
+    use super::workspace::fd_worker_ws;
+    use rayon::prelude::*;
+    let cells: Vec<(usize, usize)> = (0..m).flat_map(|i| (i..m).map(move |j| (i, j))).collect();
+    let chunk = cells
+        .len()
+        .div_ceil(rayon::current_num_threads().max(1))
+        .max(1);
+    cells
+        .par_chunks(chunk)
+        .flat_map_iter(|part| {
+            let mut wws = fd_worker_ws(ws_ro, n);
+            part.iter()
+                .map(|&(i, j)| {
+                    let h = fd_hess_entry(
+                        &mut wws,
+                        i,
+                        j,
+                        ws_ro.fd.fd_steps[i],
+                        ws_ro.fd.fd_steps[j],
+                        f0,
+                        x,
+                        y,
+                        cluster_ids,
+                        extra_ids,
+                        n,
+                    );
+                    (i, j, h)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Joint (θ,β) FD Hessian of the Laplace deviance on the PACKED-ROW layout,
 /// built into `ws.inference.hess_scratch` (symmetric, `m×m`). Same scheme as the
 /// other layouts' stencil — single-step central differences, no Richardson —
@@ -205,33 +372,7 @@ fn packed_fd_hessian_cov(
     if use_par {
         #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
         {
-            use super::workspace::fd_worker_ws;
-            use rayon::prelude::*;
-            let cells: Vec<(usize, usize)> =
-                (0..m).flat_map(|i| (i..m).map(move |j| (i, j))).collect();
-            let ws_ro: &GlmmWorkspace = ws;
-            let results: Vec<(usize, usize, f64)> = cells
-                .par_iter()
-                .map_init(
-                    || fd_worker_ws(ws_ro, n),
-                    |wws, &(i, j)| {
-                        let h = fd_hess_entry(
-                            wws,
-                            i,
-                            j,
-                            ws_ro.fd.fd_steps[i],
-                            ws_ro.fd.fd_steps[j],
-                            f0,
-                            x,
-                            y,
-                            cluster_ids,
-                            extra_ids,
-                            n,
-                        );
-                        (i, j, h)
-                    },
-                )
-                .collect();
+            let results = fd_grid_par(ws, m, f0, x, y, cluster_ids, extra_ids, n);
             // The serial arm bails on the FIRST non-finite eval; here the whole
             // grid ran first, then we check — same destination (RX fallback),
             // extra work only on the already-failing path.
@@ -263,7 +404,8 @@ fn packed_fd_hessian_cov(
 /// The layout's Schur fill: the blocked layout reuses the per-block factors
 /// the blocked PIRLS left in `ws.pirls.a_blocks`; the structured one reuses the
 /// core+Schur factors left in `ws.structured.{core_blocks, schur_blk,
-/// coupling}`; the packed one factors `ws.packed.a`. `xd` is the fixed-effect
+/// coupling}`; the packed one re-factors the dense `ws.packed.a` or solves
+/// through the sparse factor its PIRLS left. `xd` is the fixed-effect
 /// design the Schur is built on, `x` the design the random-effect slopes are
 /// read from; they differ only on [`rx_schur_llt`]'s rebuild.
 fn schur_fill(
@@ -854,7 +996,7 @@ fn joint_hessian_cov_at(
     // the converged mode, so none of them pays a stencil, a step, a per-cell
     // PIRLS re-solve or an FD-pass tolerance.
     //
-    // Three rungs, in order, and what sends a cell down to the next:
+    // Four rungs, in order, and what sends a cell down to the next:
     //
     //   1. the assembled pass (`assembled::joint_hessian`), first-order lanes
     //      over an explicit `F`/`G` adjoint. It declines on an AGQ-routed
@@ -867,19 +1009,28 @@ fn joint_hessian_cov_at(
     //      own memory guard
     //      (`assembled::PACKED_ASSEMBLY_MAX_BYTES`). It chunks, so no `m`
     //      refuses it.
+    //   2a. the AGQ gradient-difference Hessian
+    //      (`agq_gradient_difference_hessian`), central differences of the
+    //      exact f64 AGQ gradient, on the AGQ shapes `agq_gradient::covers`
+    //      accepts (scalar intercept; logit, probit, Poisson-log). It holds
+    //      nothing per row beyond the f64 fit's buffers and has no lane cap,
+    //      so it also takes those shapes above `MAX_DUAL_N`. It declines (to
+    //      rung 2) on a non-finite value, a row on the link's clamp, or an
+    //      asymmetric result.
     //   2. the hyper-dual pass (`derivative::laplace_hessian`), a packed
-    //      second-order pass. It takes the AGQ envelope, and it takes what
-    //      rung 1 declined on a shape with a dual kernel. It refuses
+    //      second-order pass. It takes the rest of the AGQ envelope and what
+    //      rung 2a declined, and it takes what rung 1 declined on a shape
+    //      with a dual kernel. It refuses
     //      `m > MAX_DUAL_N`, which is its lane cap, and it refuses the
     //      packed-row layout outright — there is no dual twin of that
     //      layout's PIRLS kernel.
-    //   3. the FD stencil, for whatever rung 2 refused: the packed-row
+    //   3. the FD stencil, for whatever rungs 2a and 2 refused: the packed-row
     //      layout's own step constant through `packed_fd_hessian_cov`, or the
     //      other layouts' `FD_STEP_BASE` grid below it. It stays because a
     //      refused fit must keep a finite-difference Hessian standard error
     //      rather than drop to Rx.
     //
-    // `Unsupported` is a ROUTING answer at both exact rungs, not an error:
+    // `Unsupported` is a ROUTING answer at every exact rung, not an error:
     // it falls THROUGH. Only `NotConverged` — a real failure at the accepted
     // point — routes to RX.
     //
@@ -914,18 +1065,39 @@ fn joint_hessian_cov_at(
         let st = match st {
             DerivStatus::Ok(v) => DerivStatus::Ok(v),
             DerivStatus::NotConverged => DerivStatus::NotConverged,
-            // Rung 2 on its own terms: the assembled pass declined this cell.
-            DerivStatus::Unsupported => super::derivative::laplace_hessian(
-                ws,
-                xd,
-                y,
-                cluster_ids,
-                extra_ids,
-                p,
-                n,
-                &mut g,
-                &mut hess,
-            ),
+            // The assembled pass declined this cell. Rung 2a on the AGQ shapes
+            // the f64 AGQ gradient covers, then rung 2 on its own terms for
+            // everything else and for what 2a declines.
+            DerivStatus::Unsupported => {
+                let st = if super::agq_gradient::covers(ws) && !ws.fd.skip_agq_gradient_difference {
+                    agq_gradient_difference_hessian(
+                        ws,
+                        xd,
+                        y,
+                        cluster_ids,
+                        extra_ids,
+                        p,
+                        n,
+                        &mut hess,
+                    )
+                } else {
+                    DerivStatus::Unsupported
+                };
+                match st {
+                    DerivStatus::Unsupported => super::derivative::laplace_hessian(
+                        ws,
+                        xd,
+                        y,
+                        cluster_ids,
+                        extra_ids,
+                        p,
+                        n,
+                        &mut g,
+                        &mut hess,
+                    ),
+                    st => st,
+                }
+            }
         };
         ws.inference.grad_scratch = g;
         ws.inference.hess_scratch = hess;
@@ -996,38 +1168,12 @@ fn joint_hessian_cov_at(
         if use_par {
             #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
             {
-                use super::workspace::fd_worker_ws;
-                use rayon::prelude::*;
-                let cells: Vec<(usize, usize)> =
-                    (0..m).flat_map(|i| (i..m).map(move |j| (i, j))).collect();
-                let ws_ro: &GlmmWorkspace = ws; // shared read-only view for map_init
-                let results: Vec<(usize, usize, f64)> = cells
-                    .par_iter()
-                    .map_init(
-                        || fd_worker_ws(ws_ro, n),
-                        |wws, &(i, j)| {
-                            let h = fd_hess_entry(
-                                wws,
-                                i,
-                                j,
-                                ws_ro.fd.fd_steps[i],
-                                ws_ro.fd.fd_steps[j],
-                                f0,
-                                xd,
-                                y,
-                                cluster_ids,
-                                extra_ids,
-                                n,
-                            );
-                            (i, j, h)
-                        },
-                    )
-                    .collect();
+                let results = fd_grid_par(ws, m, f0, xd, y, cluster_ids, extra_ids, n);
                 // The serial arm fallback!()s on the FIRST non-finite eval; here the
                 // whole grid ran first, then we check — same destination (RX fallback),
                 // extra work only on the already-failing path. `results` is collected
-                // before this point, ending map_init's immutable borrow of `ws` so the
-                // fallback (which needs `&mut ws`) is legal.
+                // before this point, ending `fd_grid_par`'s immutable borrow of `ws` so
+                // the fallback (which needs `&mut ws`) is legal.
                 if results.iter().any(|&(_, _, h)| !h.is_finite()) {
                     fallback!();
                 }
@@ -1071,10 +1217,16 @@ fn joint_hessian_cov_at(
     // the new entries are `∂²F/∂γ∂t = −∇P̂` and `∂²F/∂t² = P̂ + G''`. The β
     // block of the inverse does not depend on how the non-β coordinates are
     // parametrized at a stationary point, so it is Cov(β̂) with φ estimated.
-    // `∇P̂` is the partial of the penalized deviance at the mode (`û` is its own
-    // minimizer), taken by central differences over the same fixed-seed
-    // re-solves the stencil uses: it enters only this rank-one cross term, where
-    // a step of 1e-4 is far inside every tolerance the SEs are gated at.
+    // `∇P̂` is the total derivative of the penalized deviance at the mode. `û`
+    // is its own minimizer, so it equals the partial `D_γ` at fixed `û`, which
+    // the assembled gradient forms in its row passes
+    // (`assembled::gradient_f64_with_dev`): one mode solve at the point the
+    // workspace already holds, against `2m` fixed-seed re-solves for central
+    // differences. Where the assembly declines (packed layout, clamped rows, a
+    // non-PD observed factor), the central differences still run: the term
+    // enters only this rank-one cross term, where a step of 1e-4 is far inside
+    // every tolerance the SEs are gated at. Measured 2026-10-07 on `gamq1` at
+    // 300k rows: the row took 0.77 s of a 1.21 s SE step by differences.
     let disp_hess = match disp {
         None => None,
         Some(DispRow::Gamma { d2 }) => {
@@ -1087,13 +1239,32 @@ fn joint_hessian_cov_at(
                     h[(a, b)] = ws.inference.hess_scratch[(a, b)];
                 }
             }
+            let mut grad = vec![0.0; m];
+            let mut dev_grad = vec![0.0; m];
+            let exact = super::assembled::gradient_f64_with_dev(
+                ws,
+                xd,
+                y,
+                cluster_ids,
+                extra_ids,
+                p,
+                n,
+                &mut grad,
+                Some(&mut dev_grad),
+            )
+            .is_some()
+                && dev_grad.iter().all(|g| g.is_finite());
             for k in 0..m {
-                let step = GAMMA_PEN_GRAD_STEP * ws.fd.fd_saved[k].abs().max(1.0);
-                let _ = fd_eval(ws, &[k], &[step], xd, y, cluster_ids, extra_ids, n);
-                let up = penalized_deviance_at_mode(ws, y, n);
-                let _ = fd_eval(ws, &[k], &[-step], xd, y, cluster_ids, extra_ids, n);
-                let dn = penalized_deviance_at_mode(ws, y, n);
-                let g = (up - dn) / (2.0 * step);
+                let g = if exact {
+                    dev_grad[k]
+                } else {
+                    let step = GAMMA_PEN_GRAD_STEP * ws.fd.fd_saved[k].abs().max(1.0);
+                    let _ = fd_eval(ws, &[k], &[step], xd, y, cluster_ids, extra_ids, n);
+                    let up = penalized_deviance_at_mode(ws, y, n);
+                    let _ = fd_eval(ws, &[k], &[-step], xd, y, cluster_ids, extra_ids, n);
+                    let dn = penalized_deviance_at_mode(ws, y, n);
+                    (up - dn) / (2.0 * step)
+                };
                 if !g.is_finite() {
                     fallback!();
                 }
@@ -1335,12 +1506,20 @@ fn xtwx_fill(ws: &mut GlmmWorkspace, x: MatRef<f64>, n: usize) {
     );
 }
 
-/// Packed-row Schur fill: `X'W̃M`, `A⁻¹M'W̃X` via the `k×k` `ws.packed.a`
-/// LLT, and `ws.border.schur = X'W̃X − X'W̃M·A⁻¹M'W̃X` (formed by
+/// Packed-row Schur fill: `X'W̃M`, `A⁻¹M'W̃X` through `A`'s factor, and
+/// `ws.border.schur = X'W̃X − X'W̃M·A⁻¹M'W̃X` (formed by
 /// [`schur_from_residuals`]) — the Rx (closed-form Schur) fixed-effect
-/// information at the converged state. Reads `ws.packed.a`,
-/// the packed `M` rows (`ws.packed.m_cols`/`m_vals`), `ws.pirls.w`, and `x` via
-/// arg. Returns false on a non-PD `ws.packed.a`.
+/// information at the converged state. Reads the packed `M` rows
+/// (`ws.packed.m_cols`/`m_vals`), `ws.pirls.w`, `x` via arg, and `A` as the
+/// converged `pirls_solve_packed` left it: on the dense factor the raw `k×k`
+/// `ws.packed.a`, re-factored here with `SeqLlt`; on the sparse factor
+/// (`ws.packed.sparse`) the completed sparse Cholesky in `l_values`. Both
+/// describe one and the same `A`: the solve's exit refresh
+/// (`evaluate_at_mode`) scatters `A = M'W̃M + I` at the returned iterate into
+/// whichever storage is in use and factors it there, and nothing writes
+/// either storage after that. Returns false on a non-PD `A`: the dense
+/// re-factor's `None`, or the sparse factor's `factor_ok == false`, the same
+/// signal `evaluate_at_mode` returned `None` on.
 ///
 /// PIRLS's `BetaStep::Profile` β-Schur border step builds the same
 /// B' = X'WM, T = A⁻¹B and S_β each iteration (with that iteration's own W and
@@ -1365,16 +1544,31 @@ fn packed_schur_fill(ws: &mut GlmmWorkspace, x: MatRef<f64>, n: usize) -> bool {
             }
         }
     }
-    let ac = match crate::linalg::SeqLlt::new(ws.packed.a.as_ref()) {
-        Some(c) => c,
-        None => return false,
-    };
     for r in 0..k {
         for c in 0..p {
             ws.border.ainv_mtwx[(r, c)] = ws.border.xtwm[(c, r)];
         }
     }
-    ac.solve_in_place(ws.border.ainv_mtwx.as_mut());
+    if let Some(sp) = ws.packed.sparse.as_deref_mut() {
+        if !sp.factor_ok {
+            return false;
+        }
+        // `solve_mem` is sized for `p.max(1)` right-hand sides, this k×p solve
+        // being the widest the packed layout takes (same as the PIRLS β border).
+        faer::sparse::linalg::cholesky::LltRef::new(&sp.symbolic, &sp.l_values)
+            .solve_in_place_with_conj(
+                faer::Conj::No,
+                ws.border.ainv_mtwx.as_mut(),
+                faer::Par::Seq,
+                faer::dyn_stack::MemStack::new(&mut sp.solve_mem),
+            );
+    } else {
+        let ac = match crate::linalg::SeqLlt::new(ws.packed.a.as_ref()) {
+            Some(c) => c,
+            None => return false,
+        };
+        ac.solve_in_place(ws.border.ainv_mtwx.as_mut());
+    }
     for i in 0..n {
         let base = i * width;
         for c in 0..p {
@@ -1530,15 +1724,15 @@ fn structured_schur_fill(
     // converged re-eval's `build_packed_m` left behind — a dense `M` is no
     // longer maintained on the structured path.
     //
-    // This is the one `f64` reader of the `cross_col`/`n_cross`/`cross_val`
+    // This is the one `f64` reader of the `cross_col`/`n_cross`/`cross_theta`
     // triple that does not evaluate the deviance itself, so it depends on its
     // callers having done so — `joint_hessian_cov`'s `fallback!()` central
     // `fd_eval`, or `fit_glmm_ws`'s pinned re-eval. It must, because the
     // pattern half of the triple is shared with the dual kernel while
-    // `cross_val` is dual-private (`derivative::run_gradient`'s `pattern`
+    // `cross_theta` is dual-private (`derivative::run_gradient`'s `pattern`
     // parameter doc comment owns the invariant): at a θ̂ with a pinned crossed
     // grouping a dual call leaves `cross_col`/`n_cross` WIDER than the last
-    // `f64` `cross_val`. Reading it un-refreshed does not panic — it picks up
+    // `f64` `cross_theta`. Reading it un-refreshed does not panic — it picks up
     // a stale θ from an earlier optimizer trial and returns a plausible wrong
     // SE.
     for r in 0..p {
@@ -1559,7 +1753,7 @@ fn structured_schur_fill(
             }
             for z in 0..ncz {
                 let b = ws.pattern.cross_col[cbase + z] as usize;
-                ws.border.xtwm[(r, k_family + b)] += xw * ws.structured.cross_val[cbase + z];
+                ws.border.xtwm[(r, k_family + b)] += xw * ws.structured.cross_theta[z];
             }
         }
     }
@@ -1612,7 +1806,7 @@ fn structured_schur_fill(
             }
             for z in 0..ncz {
                 let b = ws.pattern.cross_col[cbase + z] as usize;
-                r -= ws.structured.cross_val[cbase + z] * ws.border.ainv_mtwx[(k_family + b, c)];
+                r -= ws.structured.cross_theta[z] * ws.border.ainv_mtwx[(k_family + b, c)];
             }
             ws.wx[(i, c)] = r;
         }

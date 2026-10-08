@@ -579,17 +579,38 @@ test_that("glance() returns AIC/BIC on a REML fit and says so", {
 })
 
 test_that("warm start (lme4's start=) reaches the kernel", {
-  # A start near the optimum takes visibly fewer evaluations than the cold
-  # search (10 against 16, measured 2026-10-01). theta = 0.05 was used before
-  # and took one more evaluation than the cold fit; once the design is
-  # standardized internally it happens to take the same number, so an
-  # unequal count no longer showed that the start arrived.
+  # Started at the cold fit's own optimum, the search only has to confirm it:
+  # 7 evaluations against the cold search's 11 or 12 (measured 2026-10-07).
+  # The margin is what makes this a test of the start arriving. A start merely
+  # near the optimum (theta = 0.5 here) takes within one evaluation of the cold
+  # search, and that one evaluation flips with round-off: a 1-ulp change in
+  # the t column or a reassociated PIRLS sum moves either count by one.
   d <- benchmark_data(seed = 109, family = "binomial")
   cold <- fastglmm(y ~ t + (1 | g), d, family = binomial())
+  theta_hat <- sqrt(as.numeric(VarCorr(cold)[[1]]))
   warm <- fastglmm(y ~ t + (1 | g), d, family = binomial(),
-                   start = list(beta = unname(fixef(cold)), theta = 0.5))
+                   start = list(beta = unname(fixef(cold)), theta = theta_hat))
   expect_equal(unname(fixef(warm)), unname(fixef(cold)), tolerance = 1e-4)
-  expect_lt(warm$n_eval, cold$n_eval)
+  expect_lt(warm$n_eval, cold$n_eval - 2L)
+})
+
+test_that("the gradient search fields cross the port", {
+  # A random-slope LMM searches theta with BFGS; OLS runs no theta search.
+  d <- benchmark_data(seed = 115, family = "poisson")
+  u0 <- rnorm(nlevels(d$g))
+  u1 <- rnorm(nlevels(d$g), sd = 2)
+  d$yg <- 1 + d$t + u0[as.integer(d$g)] + u1[as.integer(d$g)] * d$t +
+    rnorm(nrow(d), sd = 0.5)
+  routed <- fastglmm(yg ~ t + (t | g), d)
+  expect_gt(routed$n_grad, 0)
+  expect_true(routed$outer_stop %in% c("fdelta", "pgrad", "noise_floor",
+                                       "line_search", "max_iter",
+                                       "grad_unavailable", "non_finite"))
+  expect_true(is.finite(routed$outer_decrement))
+  plain <- fastglmm(yg ~ t, d)
+  expect_identical(plain$n_grad, 0)
+  expect_identical(plain$outer_stop, NA_character_)
+  expect_true(is.nan(plain$outer_decrement))
 })
 
 test_that("wald.se = \"rx\" is marshalled through to the kernel", {

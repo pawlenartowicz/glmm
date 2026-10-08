@@ -649,7 +649,7 @@ impl LmmSuffStats {
     /// collapsed to a single literal — `zw·zw = wi`).
     /// The `x` part of `c` and `s` is accumulated as `x·U⁻¹` (`DesignQr`, the
     /// identity unless [`Self::set_design_qr`] or
-    /// [`Self::orthogonalize_from_gram`] set it since the last `reset`); slope
+    /// `Self::orthogonalize_from_gram` set it since the last `reset`); slope
     /// reads and `s_raw` use the raw `x`.
     pub fn add_rows_multi(
         &mut self,
@@ -986,14 +986,9 @@ impl LmmSuffStats {
 /// `fit.collapse_stage` is this precompute's own staging buffer — its first
 /// w·t_dim slots stage each family's raw rows.
 ///
-/// Generic over the scratch's scalar: every field it writes is `f64` or
-/// `usize` at any `T` (`fam_gram`, `collapse_stage`, `collapse_n_active`), and
-/// the Grams it accumulates come from the `f64` sufficient statistics, so a
-/// dual scratch arms exactly the same collapse the `f64` scratch does.
-pub(crate) fn precompute_balanced_collapse<T: Scalar>(
-    suff: &LmmSuffStats,
-    fit: &mut LmmFitScratch<T>,
-) -> bool {
+/// Writes only the θ-independent fields (`fam_gram`, `collapse_stage`,
+/// `collapse_n_active`), from the sufficient statistics alone.
+pub(crate) fn precompute_balanced_collapse(suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> bool {
     let g = &suff.groupings;
     fit.collapse_n_active = 0;
     if g.primary_q != 1 || g.n_primary == 0 || suff.n_rows == 0 {
@@ -1065,6 +1060,269 @@ pub(crate) fn precompute_balanced_collapse<T: Scalar>(
 }
 
 // ---------------------------------------------------------------------------
+// Per-group regression route — random slopes on the primary grouping alone.
+// ---------------------------------------------------------------------------
+
+/// Whether a grouping layout can take the per-group regression route: random
+/// slopes on the primary grouping (`q_p ≥ 2`) and no other grouping. Sizes the
+/// route's scratch (`LmmFitScratch::with_groupings`); whether a fit actually
+/// takes it is decided per dataset by [`precompute_group_regressions`].
+pub(crate) fn group_regression_shape(g: &LmmGroupings) -> bool {
+    g.primary_q > 1
+        && g.nested.is_none()
+        && g.crossed.is_empty()
+        && !g.extra_slopes_any
+        && g.n_primary > 0
+}
+
+/// Largest share of a fixed column's squared length that the within-group
+/// residual (`P₀_jj/(X̃′X̃)_jj`) can have and still count as zero: the column
+/// lies in every group's random-effect span, up to the rounding of the
+/// subtraction that forms `P₀`. Measured at about 1e-15, of either sign, on
+/// the spanned columns of the q = p = 8 grid cells; a column outside the span
+/// leaves a share of order one. Taking a residual below this as zero moves
+/// `X̃′V⁻¹X̃` by at most this share of `(X̃′X̃)_jj`.
+const WITHIN_RESIDUAL_MIN: f64 = 1e-11;
+
+/// Arms the per-group regression route for the accumulated dataset, or leaves
+/// it off (`pg_n_active = 0`, the family loop runs) and returns false.
+///
+/// For one group, write `G = Z′Z` (`q×q`, `Z` the group's random-effect
+/// design), `C = Z′[X̃ y]`, `W = [X̃ y]′[X̃ y]` and `D = ΛΛ′`, so that the
+/// group's relative covariance is `V = I + ZDZ′`. With `G` invertible, two
+/// applications of the Woodbury identity (Henderson & Searle 1981, "On
+/// deriving the inverse of a sum of matrices", SIAM Review 23(1), 53–60) give,
+/// with `K = D + G⁻¹` and `A = G⁻¹C`,
+///
+/// ```text
+///   ln|V|                   = ln|G| + ln|K|
+///   [X̃ y]′V⁻¹[X̃ y]          = (W − C′G⁻¹C) + A′K⁻¹A
+/// ```
+///
+/// for every positive-semidefinite `D`, including zero and rank-deficient `D`
+/// (the right-hand sides are continuous in `D` and `K ⪰ G⁻¹ ≻ 0`). The first
+/// term of the second line is the within-group residual cross-product, free of
+/// θ; summed over groups it is `P₀`. So each evaluation needs only
+/// `K_g = D + B_g` (`B_g = G_g⁻¹`, stored), its Cholesky `L_g`, and
+/// `M_g = L_g⁻¹A_g`, and the tail it leaves is `P₀ + Σ_g M_g′M_g`: a sum of
+/// positive-semidefinite terms, where the family loop subtracts `Σ B_f′B_f`
+/// from `[X̃ y]′[X̃ y]`. Nothing requires the random-effect columns to span the
+/// fixed ones; when they do, `P₀`'s `X̃` block is zero up to rounding.
+///
+/// Off when the layout is not [`group_regression_shape`], or when any
+/// non-empty group's `G_g` fails the same pivot-ratio test that guards
+/// [`DesignQr::set_from_gram`] ([`GRAM_PIVOT_MIN`]): `B_g` carries `G_g`'s
+/// condition number into every evaluation, and a group with fewer rows than
+/// `q_p`, or a slope constant within the group, makes `G_g` singular. Empty
+/// levels hold no rows and contribute nothing; they are skipped. Like
+/// [`precompute_balanced_collapse`], it is armed once per fit, from the
+/// sufficient statistics alone.
+pub(crate) fn precompute_group_regressions(suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> bool {
+    fit.pg_n_active = 0;
+    let g = &suff.groupings;
+    if fit.pg_b.is_empty() || suff.n_rows == 0 || !group_regression_shape(g) {
+        return false;
+    }
+    let q = g.primary_q;
+    let qq = q * q;
+    let m = suff.m;
+    let n_prim = g.n_primary;
+    let mut gram = [0.0f64; MAX_PRIMARY_Q * MAX_PRIMARY_Q];
+    let mut l = [0.0f64; MAX_PRIMARY_Q * MAX_PRIMARY_Q];
+    let mut linv = [0.0f64; MAX_PRIMARY_Q * MAX_PRIMARY_Q];
+    // Σ_g C_g′G_g⁻¹C_g, column-major lower, accumulated in `pg_p0`.
+    fit.pg_p0[..m * m].fill(0.0);
+    let mut log_g_half = 0.0f64;
+    let mut n_active = 0usize;
+    for f in 0..n_prim {
+        if suff.counts[f] == 0.0 {
+            continue;
+        }
+        // G = L L′ (row-major lower `l`), with the Gram pivot-ratio guard.
+        primary_gram(suff, g, f, q, &mut gram);
+        for j in 0..q {
+            let gjj = gram[j * q + j];
+            let mut d = gjj;
+            for k in 0..j {
+                d -= l[j * q + k] * l[j * q + k];
+            }
+            if !(d.is_finite() && gjj.is_finite() && d > 0.0 && d >= GRAM_PIVOT_MIN * gjj) {
+                return false;
+            }
+            let ljj = d.sqrt();
+            l[j * q + j] = ljj;
+            log_g_half += ljj.ln();
+            for i in (j + 1)..q {
+                let mut v = gram[i * q + j];
+                for k in 0..j {
+                    v -= l[i * q + k] * l[j * q + k];
+                }
+                l[i * q + j] = v / ljj;
+            }
+        }
+        // L⁻¹ (lower), then B = G⁻¹ = L⁻ᵀL⁻¹ into the lower triangle.
+        for c in 0..q {
+            for r in 0..q {
+                let mut acc = if r == c { 1.0 } else { 0.0 };
+                for k in c..r {
+                    acc -= l[r * q + k] * linv[k * q + c];
+                }
+                linv[r * q + c] = if r < c { 0.0 } else { acc / l[r * q + r] };
+            }
+        }
+        let b = &mut fit.pg_b[n_active * qq..(n_active + 1) * qq];
+        for r in 0..q {
+            for c in 0..=r {
+                let mut acc = 0.0;
+                for k in r..q {
+                    acc += linv[k * q + r] * linv[k * q + c];
+                }
+                b[r * q + c] = acc;
+            }
+        }
+        // C's rows (component d of level f is RE column d·n_primary + f), then
+        // Ĉ = L⁻¹C in place, P₀'s subtrahend Ĉ′Ĉ, and A = L⁻ᵀĈ in place.
+        let a = &mut fit.pg_a[n_active * q * m..(n_active + 1) * q * m];
+        for d in 0..q {
+            let scol = suff
+                .s
+                .col(d * n_prim + f)
+                .try_as_col_major()
+                .unwrap()
+                .as_slice();
+            a[d * m..(d + 1) * m].copy_from_slice(&scol[..m]);
+        }
+        for r in 0..q {
+            let (done, rest) = a.split_at_mut(r * m);
+            let row_r = &mut rest[..m];
+            for k in 0..r {
+                let lrk = l[r * q + k];
+                for (v, &u) in row_r.iter_mut().zip(&done[k * m..(k + 1) * m]) {
+                    *v -= lrk * u;
+                }
+            }
+            let lrr = l[r * q + r];
+            for v in row_r.iter_mut() {
+                *v /= lrr;
+            }
+        }
+        for j in 0..m {
+            for i in j..m {
+                let mut acc = 0.0;
+                for r in 0..q {
+                    acc += a[r * m + i] * a[r * m + j];
+                }
+                fit.pg_p0[j * m + i] += acc;
+            }
+        }
+        for r in (0..q).rev() {
+            let (head, rest) = a.split_at_mut((r + 1) * m);
+            let row_r = &mut head[r * m..];
+            for k in (r + 1)..q {
+                let lkr = l[k * q + r];
+                for (v, &u) in row_r.iter_mut().zip(&rest[(k - r - 1) * m..(k - r) * m]) {
+                    *v -= lkr * u;
+                }
+            }
+            let lrr = l[r * q + r];
+            for v in row_r.iter_mut() {
+                *v /= lrr;
+            }
+        }
+        n_active += 1;
+    }
+    if n_active == 0 {
+        return false;
+    }
+    // P₀ = [X̃ y]′[X̃ y] − Σ_g C_g′G_g⁻¹C_g (lower triangle; `c`'s upper is unread).
+    for j in 0..m {
+        for i in j..m {
+            fit.pg_p0[j * m + i] = suff.c[(i, j)] - fit.pg_p0[j * m + i];
+        }
+    }
+    // A fixed column inside every group's random-effect span has (I − H_g)x̃_j = 0,
+    // so its whole row and column of P₀ are zero; the subtraction above leaves
+    // rounding there instead, which at large θ is the same size as the
+    // A′K⁻¹A it is added to. Such a column is recognized by its residual
+    // share P₀_jj/(X̃′X̃)_jj, and its row and column are set to exactly zero.
+    for j in 0..m - 1 {
+        if fit.pg_p0[j * m + j] <= WITHIN_RESIDUAL_MIN * suff.c[(j, j)] {
+            for k in 0..=j {
+                fit.pg_p0[k * m + j] = 0.0;
+            }
+            for i in j..m {
+                fit.pg_p0[j * m + i] = 0.0;
+            }
+        }
+    }
+    fit.pg_log_g_half = log_g_half;
+    fit.pg_n_active = n_active;
+    true
+}
+
+/// The per-group regression route's elimination (see
+/// [`precompute_group_regressions`] for the identities): fills `fit.tail`
+/// (`m×m`, column-major lower) with `[X̃ y]′V⁻¹[X̃ y] = P₀ + Σ_g M_g′M_g` and
+/// returns `½ ln|V| = ½Σ_g ln|G_g| + Σ_g ln|L_g|`, or `None` on a
+/// non-positive pivot of some `K_g` (the deviance's `+INFINITY` surface).
+/// `fit.prim_lam` must hold Λ_p.
+fn group_regression_tail(fit: &mut LmmFitScratch, q: usize, m: usize) -> Option<f64> {
+    let qq = q * q;
+    // D = ΛΛ′ (lower, row-major), once for every group.
+    for r in 0..q {
+        for c in 0..=r {
+            let mut acc = 0.0;
+            for k in 0..=c {
+                acc += fit.prim_lam[r * q + k] * fit.prim_lam[c * q + k];
+            }
+            fit.pg_d[r * q + c] = acc;
+        }
+    }
+    let mut log_k_half = 0.0;
+    for i in 0..fit.pg_n_active {
+        let b = &fit.pg_b[i * qq..(i + 1) * qq];
+        for r in 0..q {
+            for c in 0..=r {
+                fit.fam_a[r * q + c] = fit.pg_d[r * q + c] + b[r * q + c];
+            }
+        }
+        if !crate::linalg::block_chol(&mut fit.fam_a[..qq], q) {
+            return None;
+        }
+        // Kept for the θ-gradient (`pg_grad`); sized with `pg_b`, so present
+        // whenever the route is armed.
+        fit.pg_l[i * qq..(i + 1) * qq].copy_from_slice(&fit.fam_a[..qq]);
+        // Pivot product per group, logged once: the family loop's scoping
+        // (see there) — never accumulated across groups.
+        let mut prod = 1.0;
+        for j in 0..q {
+            prod *= fit.fam_a[j * q + j];
+        }
+        log_k_half += prod.ln();
+        let bt_g = &mut fit.bt[i * q * m..(i + 1) * q * m];
+        for (dst, &src) in bt_g.iter_mut().zip(&fit.pg_a[i * q * m..(i + 1) * q * m]) {
+            *dst = src;
+        }
+        fam_forward_solve(bt_g, m, q, &fit.fam_a);
+    }
+    // tail = P₀ + Σ M′M, through the one stacked downdate kernel: −tail is
+    // downdated from −P₀ and negated back (both negations exact).
+    for j in 0..m {
+        for i in j..m {
+            fit.tail[j * m + i] = -fit.pg_p0[j * m + i];
+        }
+    }
+    let w_tot = fit.pg_n_active * q;
+    crate::linalg::syrk_lower_sub(&fit.bt[..m * w_tot], m, w_tot, &mut fit.tail[..m * m]);
+    for j in 0..m {
+        for i in j..m {
+            fit.tail[j * m + i] = -fit.tail[j * m + i];
+        }
+    }
+    Some(fit.pg_log_g_half + log_k_half)
+}
+
+// ---------------------------------------------------------------------------
 // reml_deviance — the blocked-Cholesky objective.
 // ---------------------------------------------------------------------------
 
@@ -1082,7 +1340,7 @@ pub(crate) fn precompute_balanced_collapse<T: Scalar>(
 /// Zero-alloc warm path: every buffer lives in `LmmFitScratch` (`blocked_*`),
 /// sized once when `extra_slopes_any`. Returns INFINITY on any Cholesky failure
 /// or a residual r² at the round-off floor (an exact fit).
-fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch<f64>) -> f64 {
+fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> f64 {
     let g = &suff.groupings;
     let m = suff.m;
     let p = m - 1;
@@ -1297,8 +1555,8 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
     // dim 64 it would spawn and use the global rayon pool on every θ-eval even
     // without the `parallel` feature or `FitOptions::parallel_inner` (RULE 1).
     // `blocked_p` itself must stay unfactored: `recover_ranef_blocked` re-reads
-    // it after the fit. Mirrors `<f64 as Scalar>::chol_lower` in scalar.rs.
-    if !<f64 as Scalar>::chol_lower(&fit.blocked_p, dim, &mut fit.blocked_l) {
+    // it after the fit.
+    if !crate::linalg::chol_lower(&fit.blocked_p, dim, &mut fit.blocked_l) {
         return f64::INFINITY;
     }
     let l = faer::MatRef::from_column_major_slice(&fit.blocked_l[..dim * dim], dim, dim);
@@ -1355,10 +1613,16 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
 /// old sequential per-family subtraction).
 /// Crossed factors couple everything (the dense Z_a′Z_b coupling, sanctioned
 /// dense within the stated regime), so they stay in the tail with [X y]: one
-/// dense (k_crossed+m) `Scalar::chol_lower`, out-of-place into `tail_l`, per
+/// dense (k_crossed+m) `linalg::chol_lower`, out-of-place into `tail_l`, per
 /// evaluation. With no extras this is the
 /// per-cluster shrink downdate up to FP reassociation, and with no crossed
 /// factors the tail is just the m×m [X y] block.
+///
+/// Per-group regressions (random slopes on the primary, nothing else): when
+/// `precompute_group_regressions` armed the route for this dataset, the family
+/// loop is replaced by `group_regression_tail`, which never assembles
+/// `I + Λ′G_fΛ` or `Λ′C_f`; the identities and the arming test are on the
+/// precompute. Same tail, same factor, same normalization as the loop.
 ///
 /// Balanced collapse (intercept-only primary): when the per-fit precompute
 /// (`precompute_balanced_collapse`) finds a balanced active prefix — grid
@@ -1389,49 +1653,20 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
 /// is `zx_slope[(d·n_primary+f, b)]`, vs the intercept's unweighted `zx[(f, b)]`).
 /// The extra-grouping scalars keep q_g = 1.
 ///
-/// # Panics
-///
-/// If `suff.groupings.extra_slopes_any` and `T` is not `f64`: crossed/nested
-/// random slopes route to the `f64`-only `reml_deviance_blocked` tail.
-pub fn reml_deviance<T: Scalar + 'static>(
-    theta: &[T],
-    suff: &LmmSuffStats,
-    fit: &mut LmmFitScratch<T>,
-) -> T {
+/// Crossed/nested random slopes (`suff.groupings.extra_slopes_any`) take none
+/// of the paths above: they route to `reml_deviance_blocked`.
+pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> f64 {
     let g = &suff.groupings;
     debug_assert_eq!(theta.len(), g.n_theta());
     let m = suff.m;
     let p = m - 1;
     if suff.n_rows <= p || p == 0 {
-        return T::from_f64(f64::INFINITY);
+        return f64::INFINITY;
     }
     // Crossed/nested random slopes route to the dense blocked path; the scalar
     // tail below stays byte-identical for every current (q_g==1) contract.
-    // `reml_deviance_blocked` is `f64`-only — the crossed/nested-slopes tail
-    // keeps a hand-written f64 route; a generic route is future work, so a
-    // non-`f64` T must not reach it.
     if g.extra_slopes_any {
-        assert!(
-            T::IS_F64,
-            "reml_deviance_blocked (crossed/nested slopes) is f64-only"
-        );
-        // Zero-alloc theta staging: `MAX_THETA` already bounds every fixed
-        // θ-unpack scratch in this module (`lam_n`/`lam_g` above).
-        let mut theta_f64 = [0.0f64; crate::consts::MAX_THETA];
-        for (dst, src) in theta_f64.iter_mut().zip(theta.iter()) {
-            *dst = src.value();
-        }
-        // `T::IS_F64` guarantees `T` and `f64` are the same type here; `Any` is
-        // the safe way to recover that fact since the type system does not
-        // track it structurally. No `unsafe`, no reinterpret cast.
-        let fit64: &mut LmmFitScratch<f64> = (fit as &mut dyn std::any::Any)
-            .downcast_mut()
-            .expect("T::IS_F64 asserted above");
-        return T::from_f64(reml_deviance_blocked(
-            &theta_f64[..theta.len()],
-            suff,
-            fit64,
-        ));
+        return reml_deviance_blocked(theta, suff, fit);
     }
     let kf = g.k_family();
     let kx = g.k_crossed();
@@ -1439,7 +1674,7 @@ pub fn reml_deviance<T: Scalar + 'static>(
     let np = g.nested_per_parent;
     let w = g.primary_q + np; // width-general family width: q_p primary cols + nested children
     let th_p = theta[0];
-    let th_n = g.nested.map(|nf| theta[nf.vech_start]).unwrap_or(T::ZERO);
+    let th_n = g.nested.map(|nf| theta[nf.vech_start]).unwrap_or(0.0);
 
     // Width-general primary factor (q_p ≥ 2 ⇒ slope path; q_p == 1 ⇒ scalar,
     // kept byte-identical). The slope path may now carry a crossed/nested tail
@@ -1464,29 +1699,34 @@ pub fn reml_deviance<T: Scalar + 'static>(
         }
     }
 
+    // The per-group regression route (armed per fit by
+    // `precompute_group_regressions`) builds its own tail.
+    let group_regressions = fit.pg_n_active > 0;
     // --- tail init: [[H, ·],[B_x, C]] (lower triangle, column-major) ---
-    fit.tail[..t_dim * t_dim].fill(T::ZERO);
-    for b in 0..kx {
-        let lam = fit.lam_x[b];
-        let gcol = kf + b;
-        // Cross-factor coupling (row b in earlier columns a < b); same-factor
-        // zx entries are structurally 0.
-        let zxb = suff.zx.col(b).try_as_col_major().unwrap().as_slice();
-        for a in 0..b {
-            fit.tail[a * t_dim + b] = lam * fit.lam_x[a] * T::from_f64(zxb[kf + a]);
+    if !group_regressions {
+        fit.tail[..t_dim * t_dim].fill(0.0);
+        for b in 0..kx {
+            let lam = fit.lam_x[b];
+            let gcol = kf + b;
+            // Cross-factor coupling (row b in earlier columns a < b); same-factor
+            // zx entries are structurally 0.
+            let zxb = suff.zx.col(b).try_as_col_major().unwrap().as_slice();
+            for a in 0..b {
+                fit.tail[a * t_dim + b] = lam * fit.lam_x[a] * zxb[kf + a];
+            }
+            let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
+            let tcol = &mut fit.tail[b * t_dim..(b + 1) * t_dim];
+            tcol[b] = 1.0 + lam * lam * suff.counts[gcol];
+            for j in 0..m {
+                tcol[kx + j] = lam * scol[j];
+            }
         }
-        let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
-        let tcol = &mut fit.tail[b * t_dim..(b + 1) * t_dim];
-        tcol[b] = T::ONE + lam * lam * T::from_f64(suff.counts[gcol]);
         for j in 0..m {
-            tcol[kx + j] = lam * T::from_f64(scol[j]);
-        }
-    }
-    for j in 0..m {
-        let ccol = suff.c.col(j).try_as_col_major().unwrap().as_slice();
-        let tcol = &mut fit.tail[(kx + j) * t_dim..(kx + j + 1) * t_dim];
-        for (dst, &src) in tcol[kx + j..kx + m].iter_mut().zip(&ccol[j..m]) {
-            *dst = T::from_f64(src);
+            let ccol = suff.c.col(j).try_as_col_major().unwrap().as_slice();
+            let tcol = &mut fit.tail[(kx + j) * t_dim..(kx + j + 1) * t_dim];
+            for (dst, &src) in tcol[kx + j..kx + m].iter_mut().zip(&ccol[j..m]) {
+                *dst = src;
+            }
         }
     }
 
@@ -1497,31 +1737,36 @@ pub fn reml_deviance<T: Scalar + 'static>(
     // mathematically, but not bit-equal to the collapse route (the collapse
     // reassociates the family sum into a θ-independent Gram combine).
     let collapse = !slope && fit.collapse_n_active > 0;
-    let mut log_lzz_half = T::ZERO; // hoisted — single binding both arms write
-    if collapse {
+    let mut log_lzz_half = 0.0; // hoisted — single binding every arm writes
+    if group_regressions {
+        match group_regression_tail(fit, g.primary_q, m) {
+            Some(v) => log_lzz_half = v,
+            None => return f64::INFINITY,
+        }
+    } else if collapse {
         let n_active = fit.collapse_n_active;
         // One representative A from the balanced prefix (family 0): balanced
         // families share identical structure, so a single fill serves all of them.
-        let n_f = T::from_f64(suff.counts[0]);
-        fit.fam_a[0] = T::ONE + th_p * th_p * n_f;
+        let n_f = suff.counts[0];
+        fit.fam_a[0] = 1.0 + th_p * th_p * n_f;
         for c in 0..np {
-            let n_c = T::from_f64(suff.counts[g.n_primary + c]);
+            let n_c = suff.counts[g.n_primary + c];
             for c2 in 0..np {
-                fit.fam_a[(1 + c) * w + (1 + c2)] = T::ZERO;
+                fit.fam_a[(1 + c) * w + (1 + c2)] = 0.0;
             }
             fit.fam_a[(1 + c) * w] = th_p * th_n * n_c;
-            fit.fam_a[(1 + c) * w + (1 + c)] = T::ONE + th_n * th_n * n_c;
+            fit.fam_a[(1 + c) * w + (1 + c)] = 1.0 + th_n * th_n * n_c;
         }
         // Crout, in place: one factorization serves all families.
-        let mut log_l_half = T::ZERO;
+        let mut log_l_half = 0.0;
         for j in 0..w {
             let mut d = fit.fam_a[j * w + j];
             for k in 0..j {
                 let v = fit.fam_a[j * w + k];
                 d -= v * v;
             }
-            if !(d.value().is_finite() && d.value() > 0.0) {
-                return T::from_f64(f64::INFINITY);
+            if !(d.is_finite() && d > 0.0) {
+                return f64::INFINITY;
             }
             let l = d.sqrt();
             fit.fam_a[j * w + j] = l;
@@ -1534,12 +1779,12 @@ pub fn reml_deviance<T: Scalar + 'static>(
                 fit.fam_a[i * w + j] = v / l;
             }
         }
-        log_lzz_half = T::from_f64(n_active as f64) * log_l_half;
+        log_lzz_half = (n_active as f64) * log_l_half;
         // A⁻¹ = L⁻ᵀL⁻¹ column by column (w ≤ 1+n_per — hand-rolled). comb's
         // first w slots are the forward-solve temp; comb is refilled below.
         for r in 0..w {
             for i in 0..w {
-                let mut acc = if i == r { T::ONE } else { T::ZERO };
+                let mut acc = if i == r { 1.0 } else { 0.0 };
                 for k in 0..i {
                     acc -= fit.fam_a[i * w + k] * fit.comb[k];
                 }
@@ -1555,7 +1800,7 @@ pub fn reml_deviance<T: Scalar + 'static>(
         }
         // Combine: comb(lower) = Σ_{r≤r′} scale_r·scale_r′·A⁻¹[r,r′]·(G + [r≠r′]Gᵀ).
         let t2 = t_dim * t_dim;
-        fit.comb[..t2].fill(T::ZERO);
+        fit.comb[..t2].fill(0.0);
         let (comb, gram) = (&mut fit.comb, &fit.fam_gram);
         let mut pidx = 0;
         for r in 0..w {
@@ -1564,18 +1809,18 @@ pub fn reml_deviance<T: Scalar + 'static>(
                 let srp = if rp == 0 { th_p } else { th_n };
                 let coeff = sr * srp * fit.a_inv[r * w + rp];
                 let gblk = &gram[pidx * t2..(pidx + 1) * t2];
-                if coeff.value() != 0.0 {
+                if coeff != 0.0 {
                     if r == rp {
                         for j in 0..t_dim {
                             for i in j..t_dim {
-                                comb[j * t_dim + i] += coeff * T::from_f64(gblk[j * t_dim + i]);
+                                comb[j * t_dim + i] += coeff * gblk[j * t_dim + i];
                             }
                         }
                     } else {
                         for j in 0..t_dim {
                             for i in j..t_dim {
                                 comb[j * t_dim + i] +=
-                                    coeff * T::from_f64(gblk[j * t_dim + i] + gblk[i * t_dim + j]);
+                                    coeff * (gblk[j * t_dim + i] + gblk[i * t_dim + j]);
                             }
                         }
                     }
@@ -1585,9 +1830,9 @@ pub fn reml_deviance<T: Scalar + 'static>(
         }
         // Tail −= D·comb·D, D = diag(λ_x | 1_m) — column scaling folded here.
         for j in 0..t_dim {
-            let dj = if j < kx { fit.lam_x[j] } else { T::ONE };
+            let dj = if j < kx { fit.lam_x[j] } else { 1.0 };
             for i in j..t_dim {
-                let di = if i < kx { fit.lam_x[i] } else { T::ONE };
+                let di = if i < kx { fit.lam_x[i] } else { 1.0 };
                 fit.tail[j * t_dim + i] -= di * dj * fit.comb[j * t_dim + i];
             }
         }
@@ -1623,9 +1868,9 @@ pub fn reml_deviance<T: Scalar + 'static>(
             // per-family scoping (bounded product, reset each family) stays
             // finite.
             if !crate::linalg::block_chol(&mut fit.fam_a[..w * w], w) {
-                return T::from_f64(f64::INFINITY);
+                return f64::INFINITY;
             }
-            let mut fam_prod = T::ONE;
+            let mut fam_prod = 1.0;
             for j in 0..w {
                 fam_prod *= fit.fam_a[j * w + j];
             }
@@ -1657,73 +1902,62 @@ pub fn reml_deviance<T: Scalar + 'static>(
         // sanctioned, verified against the brute-force oracle + validation bands which
         // are orders wider than the reorder's last-ulp footprint.
         let w_tot = g.n_primary * w;
-        // Disjoint field borrows: `bt` and `tail` are read/written by the
-        // decomposition, `syrk_scratch` is its lane workspace.
-        let LmmFitScratch {
-            bt,
-            tail,
-            syrk_scratch,
-            ..
-        } = &mut *fit;
-        T::syrk_lower_sub(
-            &bt[..t_dim * w_tot],
+        crate::linalg::syrk_lower_sub(
+            &fit.bt[..t_dim * w_tot],
             t_dim,
             w_tot,
-            &mut tail[..t_dim * t_dim],
-            syrk_scratch,
+            &mut fit.tail[..t_dim * t_dim],
         );
     }
 
     // Out-of-place: `fit.tail` must survive holding the UNFACTORED matrix for
     // `recover_ranef_family`, which re-factors it at θ̂.
-    if !T::chol_lower(
+    if !crate::linalg::chol_lower(
         &fit.tail[..t_dim * t_dim],
         t_dim,
         &mut fit.tail_l[..t_dim * t_dim],
     ) {
-        return T::from_f64(f64::INFINITY);
+        return f64::INFINITY;
     }
     for b in 0..kx {
         let lbb = fit.tail_l[b * t_dim + b];
-        if !(lbb.value().is_finite() && lbb.value() > 0.0) {
-            return T::from_f64(f64::INFINITY);
+        if !(lbb.is_finite() && lbb > 0.0) {
+            return f64::INFINITY;
         }
         log_lzz_half += lbb.ln();
     }
-    let log_lzz_sq = T::from_f64(2.0) * log_lzz_half;
+    let log_lzz_sq = 2.0 * log_lzz_half;
     // Trailing m×m → fit.factor (augmented [X y] semantics; recovery reads only
-    // this). Read off `tail_l`, not `fit.factor` — the copy is exact, so reading
-    // either gives the same f64, but this is what lets `fit.factor` stay
-    // `Mat<f64>` and receive `.value()`.
+    // this): an exact copy of `tail_l`'s trailing block, upper triangle zeroed.
     for j in 0..m {
         for i in 0..m {
             fit.factor[(i, j)] = if i >= j {
-                fit.tail_l[(kx + j) * t_dim + (kx + i)].value()
+                fit.tail_l[(kx + j) * t_dim + (kx + i)]
             } else {
                 0.0
             };
         }
     }
 
-    let mut log_lxx_sq = T::ZERO;
+    let mut log_lxx_sq = 0.0;
     for j in 0..p {
         let ljj = fit.tail_l[(kx + j) * t_dim + (kx + j)];
-        if !(ljj.value().is_finite() && ljj.value() > 0.0) {
-            return T::from_f64(f64::INFINITY);
+        if !(ljj.is_finite() && ljj > 0.0) {
+            return f64::INFINITY;
         }
         log_lxx_sq += ljj.ln();
     }
-    log_lxx_sq *= T::from_f64(2.0);
+    log_lxx_sq *= 2.0;
 
     let lyy = fit.tail_l[(kx + p) * t_dim + (kx + p)];
     let r_sq = lyy * lyy;
-    let df = T::from_f64((suff.n_rows - p) as f64);
+    let df = (suff.n_rows - p) as f64;
     let sigma_sq = r_sq / df;
     // Exact-fit floor: mirrors `reml_deviance_blocked`'s (see the reason there)
     // and `sparse_reml_deviance`'s — change together.
     let r_sq_floor = (g.k_total + m) as f64 * f64::EPSILON * suff.c[(p, p)];
-    if !(sigma_sq.value().is_finite() && sigma_sq.value() > 0.0 && r_sq.value() > r_sq_floor) {
-        return T::from_f64(f64::INFINITY);
+    if !(sigma_sq.is_finite() && sigma_sq > 0.0 && r_sq > r_sq_floor) {
+        return f64::INFINITY;
     }
     fit.sigma_sq = sigma_sq;
 

@@ -66,13 +66,14 @@ mod glmm;
 mod ids;
 mod lmm;
 mod ols;
+mod optim;
 mod sparse;
 mod spec;
 mod standardize;
 mod start;
 #[cfg(feature = "counters")]
 pub use counters::{EvalCounters, Stage};
-pub use fit::{fit_cold, fit_warm, Boundary, Diagnostics, Fit, FitOptions, Note};
+pub use fit::{fit_cold, fit_warm, Boundary, Diagnostics, Fit, FitOptions, Note, OuterStop};
 pub use ids::GroupIds;
 /// The blind θ start. Re-exported because a caller that must supply
 /// [`StartValues`] (β and θ are bundled) cannot reach the `None`-θ blind path,

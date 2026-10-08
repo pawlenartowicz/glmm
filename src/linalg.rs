@@ -42,7 +42,8 @@ const SEQ_LLT_STACK: usize = 2048;
 /// rayon's global pool although this crate's own `parallel` feature is off, and
 /// a dimension past faer's blocking threshold hands the recursion to it. The
 /// kernels' hot Choleskys already take `Par` explicitly
-/// (`scalar::Scalar::chol_lower`, the PIRLS border); `SeqLlt` takes the same
+/// ([`chol_lower`] in the LMM kernel, the β-Schur border in `glmm::pirls`);
+/// `SeqLlt` takes the same
 /// rule to the GLM IRLS and OLS β solves, the GLMM post-fit Choleskys
 /// (`fit_glmm`, `glmm::se::rx_cov_into`, `glmm::se::joint_hessian_cov_at`,
 /// `glmm::se::packed_schur_fill`), `lmm::joint_wald_chi_sq` and the LMM
@@ -112,4 +113,81 @@ impl SeqLlt {
         };
         solve_in_place_with_conj(self.l.as_ref(), faer::Conj::No, rhs, faer::Par::Seq, stack);
     }
+}
+
+/// Lower Cholesky of the symmetric `dim×dim` `a` (column-major, lower
+/// triangle read) into `l_out` (column-major, lower triangle written;
+/// strictly upper untouched), by faer's kernel at `Par::Seq`. `false` on a
+/// non-positive or non-finite pivot. Out-of-place because the LMM kernel
+/// keeps the unfactored matrix for the conditional-mode recovery pass.
+pub(crate) fn chol_lower(a: &[f64], dim: usize, l_out: &mut [f64]) -> bool {
+    use faer::dyn_stack::{MemBuffer, MemStack};
+    use faer::linalg::cholesky::llt::factor::{
+        cholesky_in_place, cholesky_in_place_scratch, LltRegularization,
+    };
+    use faer::{Par, Spec};
+    // Copy A's lower triangle into `l_out` and factor THAT in place instead of calling
+    // `MatRef::llt`. `.llt` reads `faer::get_global_parallelism()` on every call
+    // (faer 0.24.4 `linalg/solvers.rs:789`), which is `Par::rayon(0)` in any build with
+    // faer's default `rayon` feature: the first call spawns rayon's whole global pool
+    // and every later call with dim > 64 hands the blocked recursion to it.
+    // `cholesky_in_place` takes `Par` as an argument — the same rule the PIRLS
+    // Choleskys and [`syrk_lower_sub`]'s GEMM already follow.
+    // The zero-fill mirrors `.llt`'s own `Mat::zeros` + `copy_from_triangular_lower`:
+    // faer's kernel also writes the columns above the diagonal, so the input's upper
+    // triangle must be zero for the factor to match what `.llt` produced.
+    l_out[..dim * dim].fill(0.0);
+    for j in 0..dim {
+        let col = j * dim;
+        l_out[col + j..col + dim].copy_from_slice(&a[col + j..col + dim]);
+    }
+    // The factor's scratch comes off a stack buffer when it fits (it does
+    // on every LMM kernel's `q`-sized block: 132 B at the loop shapes'
+    // dims), so a per-eval call does not allocate. A larger request falls
+    // back to a heap `MemBuffer`; the factor is the same either way.
+    let req = cholesky_in_place_scratch::<f64>(dim, Par::Seq, Spec::default());
+    let l = faer::MatMut::from_column_major_slice_mut(&mut l_out[..dim * dim], dim, dim);
+    const STACK_SCRATCH: usize = 1024;
+    if req.unaligned_bytes_required() <= STACK_SCRATCH {
+        let mut buf = [core::mem::MaybeUninit::<u8>::uninit(); STACK_SCRATCH];
+        cholesky_in_place(
+            l,
+            LltRegularization::default(),
+            Par::Seq,
+            MemStack::new(&mut buf),
+            Spec::default(),
+        )
+        .is_ok()
+    } else {
+        let mut mem = MemBuffer::new(req);
+        cholesky_in_place(
+            l,
+            LltRegularization::default(),
+            Par::Seq,
+            MemStack::new(&mut mem),
+            Spec::default(),
+        )
+        .is_ok()
+    }
+}
+
+/// `tail(lower) -= bt · btᵀ` via faer's blocked triangular `matmul` at
+/// `Par::Seq`. `tail` is column-major `t_dim×t_dim` (lower triangle touched
+/// and written; faer neither reads nor writes its strict upper triangle), `bt`
+/// column-major `t_dim×w_tot`. The LMM kernel's tail downdate.
+pub(crate) fn syrk_lower_sub(bt: &[f64], t_dim: usize, w_tot: usize, tail: &mut [f64]) {
+    use faer::linalg::matmul::triangular::{matmul, BlockStructure};
+    let bt = faer::MatRef::from_column_major_slice(&bt[..t_dim * w_tot], t_dim, w_tot);
+    let tail = faer::MatMut::from_column_major_slice_mut(&mut tail[..t_dim * t_dim], t_dim, t_dim);
+    matmul(
+        tail,
+        BlockStructure::TriangularLower,
+        faer::Accum::Add,
+        bt,
+        BlockStructure::Rectangular,
+        bt.transpose(),
+        BlockStructure::Rectangular,
+        -1.0,
+        faer::Par::Seq,
+    );
 }

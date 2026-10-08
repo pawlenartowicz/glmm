@@ -100,6 +100,89 @@ impl ClusterRowIndex {
     pub(crate) fn cluster_rows(&self, c: usize) -> &[u32] {
         &self.rows[self.ptr[c] as usize..self.ptr[c + 1] as usize]
     }
+
+    /// Cluster `c`'s positions in [`ClusterRowIndex::rows`], the range
+    /// [`ClusterRowIndex::cluster_rows`] slices.
+    pub(crate) fn cluster_range(&self, c: usize) -> std::ops::Range<usize> {
+        self.ptr[c] as usize..self.ptr[c + 1] as usize
+    }
+
+    /// Every row index, grouped by cluster (the CSR column array).
+    pub(crate) fn rows(&self) -> &[u32] {
+        &self.rows
+    }
+}
+
+/// Largest `|η|` (center plus node shift) the compressed AGQ route accepts. It
+/// sits below the Gamma-log tail switch (`family::LOG_TAIL_ETA`, 230) and the
+/// log-link clamp (`family::ETA_MAX`, 700), so no row of a compressed cluster is
+/// clamped or on a tail form at any node, and a margin of 30 covers the round-off
+/// between `η_c + δ` and the row kernel's own `η_fix + λ·u_cj`. At `e^200` the
+/// aggregated sums stay finite for any realistic weight total.
+const COMPRESS_ETA_MAX: f64 = 200.0;
+
+/// The families whose scalar-intercept AGQ node sums compress to two per-cluster
+/// sums: the log-link Poisson and Gamma (`μ = e^η`, `y·ln μ` and `y/μ` linear in
+/// `e^{±δ}`). Every other family keeps the row kernel.
+pub(super) fn compressible(family: Family) -> bool {
+    matches!(
+        family,
+        Family::Poisson { .. }
+            | Family::Gamma {
+                link: crate::spec::GammaLink::Log
+            }
+    )
+}
+
+/// Whether a cluster may take the compressed route: its largest center `|η|`
+/// plus the largest node shift `|λ|·√2·σ_c·max|z_j|` stays at or below
+/// [`COMPRESS_ETA_MAX`] (so no node reaches a clamp or a tail form), and both
+/// sums are finite. False on any NaN, so a broken cluster falls back to the row
+/// kernel and fails there as before.
+pub(super) fn compress_ok(eta_reach: f64, shift_reach: f64, sum_a: f64, sum_b: f64) -> bool {
+    eta_reach + shift_reach <= COMPRESS_ETA_MAX && sum_a.is_finite() && sum_b.is_finite()
+}
+
+/// `Σ_j exp(ln_wj + ℓ_c(u_cj) − ℓ_c(ũ_c))` for one cluster of a scalar-intercept
+/// log-link Poisson or Gamma GLMM, from two per-cluster sums instead of a pass
+/// over the rows per node. With `h_j = √2·σ_c·z_j = u_cj − ũ_c`, `δ_j = λ·h_j`, the
+/// row weights `a_i` (`prior_w`, already `/φ` on Gamma) and `μ0_i = e^{η_i}` at the
+/// mode, the data part of `ℓ_c(u_cj) − ℓ_c(ũ_c)` (`−½·a_i·d_i` summed) is
+/// ```text
+///   Poisson:  Y·δ − M·expm1(δ),        Y = Σ a_i y_i,  M = Σ a_i μ0_i
+///   Gamma:   −R·expm1(−δ) − W·δ,       W = Σ a_i,      R = Σ a_i y_i/μ0_i
+/// ```
+/// (unit deviances `2[y ln(y/μ) − (y−μ)]` and `2[−ln(y/μ) + (y−μ)/μ]` with
+/// `μ = μ0·e^δ`; the `y ln y`, `ln y` and saturated terms cancel in the
+/// difference), and the prior part is `−½(u_cj² − ũ_c²) = −½·h_j·(2ũ_c + h_j)`.
+/// `sum_a` is `Y` or `W`, `sum_b` is `M` or `R`. Exact for the unclamped,
+/// off-tail likelihood; [`compress_ok`] keeps every cluster it is used on there.
+/// This is the generic (dual) route; `f64` evaluations take the same identity
+/// inside `agq_fast::scalar_sums`.
+#[allow(clippy::too_many_arguments)]
+fn compressed_cluster_sum<T: Scalar>(
+    gamma: bool,
+    sum_a: T,
+    sum_b: T,
+    u_c: T,
+    sigma_c: T,
+    lambda: T,
+    nodes: &[f64],
+    ln_wj: &[T],
+) -> T {
+    let mut acc_sum = T::ZERO;
+    for (j, &zj) in nodes.iter().enumerate() {
+        let h = T::from_f64(std::f64::consts::SQRT_2) * sigma_c * T::from_f64(zj);
+        let delta = lambda * h;
+        let data = if gamma {
+            -(sum_b * (-delta).exp_m1()) - sum_a * delta
+        } else {
+            sum_a * delta - sum_b * delta.exp_m1()
+        };
+        let prior = T::from_f64(-0.5) * h * (u_c + u_c + h);
+        acc_sum += (ln_wj[j] + data + prior).exp();
+    }
+    acc_sum
 }
 
 /// AGQ deviance for the scalar-intercept (`q_p==1`, no extras) binomial/Poisson/NB/Gamma
@@ -203,6 +286,8 @@ pub(crate) fn agq_deviance<T: Scalar>(
         eta_fixed,
         a_blocks,
         agq_scratch,
+        agq_rows,
+        agq_slow,
         ..
     } = scratch;
     let lambda = lam[0]; // scalar Λ_p (q_p == 1, gated)
@@ -213,10 +298,15 @@ pub(crate) fn agq_deviance<T: Scalar>(
     let ln_sqrt_pi_f64 = 0.5 * std::f64::consts::PI.ln();
     let ln_sqrt_pi = T::from_f64(ln_sqrt_pi_f64);
 
-    // Per-cluster scratch (size s each): ℓ_c(ũ_c) | node u_cj | ℓ_c(u_cj) | running Σ.
+    // Per-cluster scratch (size s each): ℓ_c(ũ_c) | node u_cj | ℓ_c(u_cj) | running Σ
+    // | the generic compressed route's two sums | its max |η| at the mode.
     let (ctr, rest) = agq_scratch.split_at_mut(s);
     let (ucj, rest) = rest.split_at_mut(s);
-    let (acc, sum) = rest.split_at_mut(s);
+    let (acc, rest) = rest.split_at_mut(s);
+    let (sum, rest) = rest.split_at_mut(s);
+    let (csum_a, rest) = rest.split_at_mut(s);
+    let (csum_b, rest) = rest.split_at_mut(s);
+    let eta_reach = &mut rest[..s];
 
     // ctr_c = ℓ_c(ũ_c): RE prior −½ũ_c², then Σ_{i∈c} −½·dev_resid at the converged
     // mode (eta[i]/prob[i] already hold η_fix,i + λ·ũ_c and its g⁻¹).
@@ -232,6 +322,120 @@ pub(crate) fn agq_deviance<T: Scalar>(
             * crate::family::dev_resid_at(family, nb_theta, y[i], eta[i], prob[i]);
     }
 
+    // `f64` evaluations on the log links, logit and probit take the row-term
+    // node sums of `agq_fast` (same `sum`, every other quantity unchanged).
+    let mut done = false;
+    let fast_kind = super::agq_fast::kind(family);
+    let probit = super::agq_fast::is_probit(family);
+    if fast_kind.is_some() || probit {
+        if let (Some(eta_f), Some(prob_f), Some(ef_f), Some(u_f), Some(ab_f)) = (
+            T::as_f64s(eta),
+            T::as_f64s(prob),
+            T::as_f64s(eta_fixed),
+            T::as_f64s(u),
+            T::as_f64s(a_blocks),
+        ) {
+            if let (Some(dl), Some(acc_f), Some(sum_f)) = (
+                T::as_f64s_mut(ucj),
+                T::as_f64s_mut(acc),
+                T::as_f64s_mut(sum),
+            ) {
+                if let Some(kind) = fast_kind {
+                    super::agq_fast::scalar_sums(
+                        kind,
+                        family,
+                        nb_theta,
+                        y,
+                        prior_w,
+                        cluster_ids,
+                        n,
+                        eta_f,
+                        prob_f,
+                        ef_f,
+                        u_f,
+                        ab_f,
+                        lambda.value(),
+                        nodes,
+                        wts,
+                        agq_rows,
+                        agq_slow,
+                        dl,
+                        acc_f,
+                        sum_f,
+                        cluster_rows,
+                    );
+                } else {
+                    super::agq_fast::probit_sums(
+                        y,
+                        prior_w,
+                        cluster_ids,
+                        n,
+                        eta_f,
+                        prob_f,
+                        ef_f,
+                        u_f,
+                        ab_f,
+                        lambda.value(),
+                        nodes,
+                        wts,
+                        agq_rows,
+                        agq_slow,
+                        dl,
+                        acc_f,
+                        sum_f,
+                        cluster_rows,
+                    );
+                }
+                done = true;
+            }
+        }
+    }
+
+    // Cluster compression on the generic (dual) route, Poisson-log and
+    // Gamma-log: every row of cluster c moves by the same δ = λ·(u − ũ_c), so
+    // ℓ_c(u) − ℓ_c(ũ_c) needs two per-cluster sums (see
+    // `compressed_cluster_sum`), gathered here in one pass over the rows.
+    // `eta_reach[c]` is max |η| at the mode over the cluster's rows (the stored,
+    // clamped η: a clamped row sits at ±ETA_MAX and fails `compress_ok`). The
+    // `f64` route above compresses inside `agq_fast::scalar_sums`.
+    let compress = !done && compressible(family);
+    let gamma = matches!(family, Family::Gamma { .. });
+    if compress {
+        for c in 0..s {
+            csum_a[c] = T::ZERO;
+            csum_b[c] = T::ZERO;
+            eta_reach[c] = T::ZERO;
+        }
+        for i in 0..n {
+            let c = cluster_ids[i] as usize;
+            let a = prior_w[i];
+            if gamma {
+                csum_a[c] += T::from_f64(a); // W_c
+                csum_b[c] += T::from_f64(a * y[i]) / prob[i]; // R_c
+            } else {
+                csum_a[c] += T::from_f64(a * y[i]); // Y_c
+                csum_b[c] += T::from_f64(a) * prob[i]; // M_c
+            }
+            let e = eta[i].value().abs();
+            if e > eta_reach[c].value() {
+                eta_reach[c] = T::from_f64(e);
+            }
+        }
+    }
+    let z_max = nodes.iter().fold(0.0f64, |m, z| m.max(z.abs()));
+    // ln(w_j·e^{z_j²}) per node — the Liu–Pierce reweight, a function of
+    // the GH table only. Filled once (k ≤ MAX_NAGQ, stack buffer — no
+    // alloc on the hot path) and read by the cluster-outer arm and the
+    // compressed route instead of recomputing per (cluster, node): that
+    // recomputation costs s·k ln() calls per eval, the dominant cluster-outer
+    // overhead on many-tiny-cluster shapes. Same operands, deterministic —
+    // bit-identical to the inline form (the uncompressed node-outer `None` arm
+    // below recomputes `ln_wj` per node instead).
+    let mut ln_wj_buf = [T::ZERO; crate::consts::MAX_NAGQ as usize];
+    for (j, (&zj, &wj)) in nodes.iter().zip(wts).enumerate() {
+        ln_wj_buf[j] = T::from_f64(wj.ln() + zj * zj);
+    }
+
     // GH sum over nodes. σ_c = 1/√A_c = 1/a_blocks[c] (the 1×1 Cholesky factor).
     // Shared reborrows for the `Some` arm's closure below: rayon's `par_iter_mut`
     // needs `Sync` captures, and `&mut [T]` isn't `Sync` — downgrade to `&[T]`
@@ -242,86 +446,150 @@ pub(crate) fn agq_deviance<T: Scalar>(
     let u_ro: &[T] = u;
     let a_blocks_ro: &[T] = a_blocks;
     let ctr_ro: &[T] = ctr;
-    match cluster_rows {
-        // Cluster-outer: per cluster, same node order and (via the CSR's
-        // ascending-row guarantee) same per-accumulator operand order as the
-        // node-outer loop below — bit-identical by construction, so the frozen
-        // glmer(nAGQ=k) goldens re-validate nothing. Rows stay cache-hot per
-        // cluster instead of k full n-sweeps.
-        Some(idx) => {
-            // ln(w_j·e^{z_j²}) per node — the Liu–Pierce reweight, a function of
-            // the GH table only. Filled once (k ≤ MAX_NAGQ, stack buffer — no
-            // alloc on the hot path) so this arm reads it instead of
-            // recomputing per (cluster, node): that recomputation costs s·k
-            // ln() calls per eval, the dominant cluster-outer overhead
-            // on many-tiny-cluster shapes. Same operands, deterministic —
-            // bit-identical to the inline form (only reader — the node-outer
-            // `None` arm below recomputes `ln_wj` per node instead).
-            let mut ln_wj_buf = [T::ZERO; crate::consts::MAX_NAGQ as usize];
-            for (j, (&zj, &wj)) in nodes.iter().zip(wts).enumerate() {
-                ln_wj_buf[j] = T::from_f64(wj.ln() + zj * zj);
+    let csum_a_ro: &[T] = csum_a;
+    let csum_b_ro: &[T] = csum_b;
+    let ln_wj_ro: &[T] = &ln_wj_buf[..k];
+    let lambda_abs = lambda.value().abs();
+    // Whether cluster c takes the compressed route (see `compress_ok`).
+    let fast = |c: usize, eta_reach_c: T| {
+        compress
+            && compress_ok(
+                eta_reach_c.value(),
+                lambda_abs * std::f64::consts::SQRT_2 * z_max / a_blocks_ro[c].value(),
+                csum_a_ro[c].value(),
+                csum_b_ro[c].value(),
+            )
+    };
+    let compressed = |c: usize| {
+        compressed_cluster_sum(
+            gamma,
+            csum_a_ro[c],
+            csum_b_ro[c],
+            u_ro[c],
+            T::ONE / a_blocks_ro[c],
+            lambda,
+            nodes,
+            ln_wj_ro,
+        )
+    };
+    if !done {
+        match cluster_rows {
+            // Cluster-outer: per cluster, same node order and (via the CSR's
+            // ascending-row guarantee) same per-accumulator operand order as the
+            // node-outer loop below — bit-identical by construction, so the frozen
+            // glmer(nAGQ=k) goldens re-validate nothing. Rows stay cache-hot per
+            // cluster instead of k full n-sweeps.
+            Some(idx) => {
+                let eta_reach_ro: &[T] = eta_reach;
+                // Per-cluster closure: reads shared slices, writes only its own sum slot —
+                // deterministic under any thread schedule, so parallel == serial bitwise.
+                let per_cluster = |c: usize, sum_c: &mut T| {
+                    if fast(c, eta_reach_ro[c]) {
+                        *sum_c = compressed(c);
+                        return;
+                    }
+                    let rows = idx.cluster_rows(c);
+                    let sigma_c = T::ONE / a_blocks_ro[c];
+                    let mut acc_sum = T::ZERO;
+                    for (j, &zj) in nodes.iter().enumerate() {
+                        let ln_wj = ln_wj_ro[j];
+                        let u_cj = u_ro[c]
+                            + T::from_f64(std::f64::consts::SQRT_2) * sigma_c * T::from_f64(zj);
+                        let mut acc_c = T::from_f64(-0.5) * u_cj * u_cj;
+                        for &i in rows {
+                            let i = i as usize;
+                            acc_c -= T::from_f64(0.5 * prior_w[i])
+                                * crate::family::dev_resid_eta(
+                                    family,
+                                    nb_theta,
+                                    y[i],
+                                    eta_fixed_ro[i] + lambda * u_cj,
+                                );
+                        }
+                        acc_sum += (ln_wj + acc_c - ctr_ro[c]).exp();
+                    }
+                    *sum_c = acc_sum;
+                };
+                #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+                {
+                    use rayon::prelude::*;
+                    sum[..s]
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(c, sc)| per_cluster(c, sc));
+                }
+                #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+                for (c, sc) in sum[..s].iter_mut().enumerate() {
+                    per_cluster(c, sc);
+                }
             }
-            let ln_wj_ro: &[T] = &ln_wj_buf[..k];
-            // Per-cluster closure: reads shared slices, writes only its own sum slot —
-            // deterministic under any thread schedule, so parallel == serial bitwise.
-            let per_cluster = |c: usize, sum_c: &mut T| {
-                let rows = idx.cluster_rows(c);
-                let sigma_c = T::ONE / a_blocks_ro[c];
-                let mut acc_sum = T::ZERO;
-                for (j, &zj) in nodes.iter().enumerate() {
-                    let ln_wj = ln_wj_ro[j];
-                    let u_cj =
-                        u_ro[c] + T::from_f64(std::f64::consts::SQRT_2) * sigma_c * T::from_f64(zj);
-                    let mut acc_c = T::from_f64(-0.5) * u_cj * u_cj;
-                    for &i in rows {
-                        let i = i as usize;
-                        acc_c -= T::from_f64(0.5 * prior_w[i])
+            // Compressed families, node-outer: the compressed clusters first, then the
+            // node-outer row loop over the fallback clusters only (flagged by
+            // `eta_reach[c] = 1`, compressed ones by 0), skipped when there are none.
+            None if compress => {
+                let mut any_fallback = false;
+                for c in 0..s {
+                    if fast(c, eta_reach[c]) {
+                        sum[c] = compressed(c);
+                        eta_reach[c] = T::ZERO;
+                    } else {
+                        eta_reach[c] = T::ONE;
+                        any_fallback = true;
+                    }
+                }
+                if any_fallback {
+                    for (&zj, &wj) in nodes.iter().zip(wts) {
+                        let ln_wj = T::from_f64(wj.ln() + zj * zj);
+                        for c in 0..s {
+                            let sigma_c = T::ONE / a_blocks[c];
+                            ucj[c] = u[c]
+                                + T::from_f64(std::f64::consts::SQRT_2) * sigma_c * T::from_f64(zj);
+                            acc[c] = T::from_f64(-0.5) * ucj[c] * ucj[c];
+                        }
+                        for i in 0..n {
+                            let c = cluster_ids[i] as usize;
+                            if eta_reach[c].value() == 0.0 {
+                                continue;
+                            }
+                            acc[c] -= T::from_f64(0.5 * prior_w[i])
+                                * crate::family::dev_resid_eta(
+                                    family,
+                                    nb_theta,
+                                    y[i],
+                                    eta_fixed[i] + lambda * ucj[c],
+                                );
+                        }
+                        for c in 0..s {
+                            if eta_reach[c].value() != 0.0 {
+                                sum[c] += (ln_wj + acc[c] - ctr[c]).exp();
+                            }
+                        }
+                    }
+                }
+            }
+            // Node-outer original (parallel_inner == false): unchanged, verbatim.
+            None => {
+                for (&zj, &wj) in nodes.iter().zip(wts) {
+                    let ln_wj = T::from_f64(wj.ln() + zj * zj); // log(w_j·e^{z_j²}) — the Liu–Pierce reweight
+                    for c in 0..s {
+                        let sigma_c = T::ONE / a_blocks[c];
+                        ucj[c] = u[c]
+                            + T::from_f64(std::f64::consts::SQRT_2) * sigma_c * T::from_f64(zj);
+                        acc[c] = T::from_f64(-0.5) * ucj[c] * ucj[c]; // RE prior at the node
+                    }
+                    for i in 0..n {
+                        let c = cluster_ids[i] as usize;
+                        acc[c] -= T::from_f64(0.5 * prior_w[i])
                             * crate::family::dev_resid_eta(
                                 family,
                                 nb_theta,
                                 y[i],
-                                eta_fixed_ro[i] + lambda * u_cj,
+                                eta_fixed[i] + lambda * ucj[c],
                             );
                     }
-                    acc_sum += (ln_wj + acc_c - ctr_ro[c]).exp();
-                }
-                *sum_c = acc_sum;
-            };
-            #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-            {
-                use rayon::prelude::*;
-                sum[..s]
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(c, sc)| per_cluster(c, sc));
-            }
-            #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
-            for (c, sc) in sum[..s].iter_mut().enumerate() {
-                per_cluster(c, sc);
-            }
-        }
-        // Node-outer original (parallel_inner == false): unchanged, verbatim.
-        None => {
-            for (&zj, &wj) in nodes.iter().zip(wts) {
-                let ln_wj = T::from_f64(wj.ln() + zj * zj); // log(w_j·e^{z_j²}) — the Liu–Pierce reweight
-                for c in 0..s {
-                    let sigma_c = T::ONE / a_blocks[c];
-                    ucj[c] =
-                        u[c] + T::from_f64(std::f64::consts::SQRT_2) * sigma_c * T::from_f64(zj);
-                    acc[c] = T::from_f64(-0.5) * ucj[c] * ucj[c]; // RE prior at the node
-                }
-                for i in 0..n {
-                    let c = cluster_ids[i] as usize;
-                    acc[c] -= T::from_f64(0.5 * prior_w[i])
-                        * crate::family::dev_resid_eta(
-                            family,
-                            nb_theta,
-                            y[i],
-                            eta_fixed[i] + lambda * ucj[c],
-                        );
-                }
-                for c in 0..s {
-                    sum[c] += (ln_wj + acc[c] - ctr[c]).exp();
+                    for c in 0..s {
+                        sum[c] += (ln_wj + acc[c] - ctr[c]).exp();
+                    }
                 }
             }
         }
@@ -438,6 +706,7 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
         eta_fixed,
         a_blocks,
         agq_scratch,
+        agq_rows,
         ..
     } = scratch;
     let k = nagq as usize;
@@ -488,6 +757,45 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
         // w_i·dev_resid; prior_w[i]==1.0 exactly on the unweighted path ⇒ byte-identical.
         ctr[c] -= T::from_f64(0.5 * prior_w[i])
             * crate::family::dev_resid_at(family, nb_theta, y[i], eta[i], prob[i]);
+    }
+
+    // `f64` evaluations on the log links and logit take the row-term node
+    // sums of `agq_fast` (same `sum`, every other quantity unchanged).
+    let mut done = false;
+    if let Some(kind) = super::agq_fast::kind(family) {
+        if let (
+            Some(eta_f),
+            Some(prob_f),
+            Some(ef_f),
+            Some(u_f),
+            Some(ab_f),
+            Some(lam_f),
+            Some(tbl_f),
+        ) = (
+            T::as_f64s(eta),
+            T::as_f64s(prob),
+            T::as_f64s(eta_fixed),
+            T::as_f64s(u),
+            T::as_f64s(a_blocks),
+            T::as_f64s(lam),
+            T::as_f64s(node_tbl),
+        ) {
+            if let Some(sum_f) = T::as_f64s_mut(sum) {
+                let owned;
+                let idx = match cluster_rows {
+                    Some(idx) => idx,
+                    None => {
+                        owned = ClusterRowIndex::build(cluster_ids, s);
+                        &owned
+                    }
+                };
+                super::agq_fast::vector_sums(
+                    kind, family, nb_theta, y, prior_w, z_buf, q, n, eta_f, prob_f, ef_f, u_f,
+                    ab_f, lam_f, nodes, tbl_f, agq_rows, sum_f, idx,
+                );
+                done = true;
+            }
+        }
     }
 
     // Shared read-only reborrows for the parallel closure (rayon needs Sync
@@ -550,36 +858,38 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
         }
         *sum_c = acc_sum;
     };
-    match cluster_rows {
-        // Prebuilt CSR (`fit_glmm` builds it once per fit: in a `parallel` build
-        // when `parallel_inner` is set, in a serial build always; a derivative
-        // scratch hands in its own): rayon-parallel under the feature, serial
-        // otherwise. Cluster-outer either way.
-        Some(idx) => {
-            #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-            {
-                use rayon::prelude::*;
-                sum[..s]
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(c, sc)| per_cluster(idx, c, sc));
+    if !done {
+        match cluster_rows {
+            // Prebuilt CSR (`fit_glmm` builds it once per fit: in a `parallel` build
+            // when `parallel_inner` is set, in a serial build always; a derivative
+            // scratch hands in its own): rayon-parallel under the feature, serial
+            // otherwise. Cluster-outer either way.
+            Some(idx) => {
+                #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+                {
+                    use rayon::prelude::*;
+                    sum[..s]
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(c, sc)| per_cluster(idx, c, sc));
+                }
+                #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+                for (c, sc) in sum[..s].iter_mut().enumerate() {
+                    per_cluster(idx, c, sc);
+                }
             }
-            #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
-            for (c, sc) in sum[..s].iter_mut().enumerate() {
-                per_cluster(idx, c, sc);
-            }
-        }
-        // Fallback with no prebuilt CSR (FD-Hessian workers, a `parallel` build
-        // with `parallel_inner` off).
-        // The vector kernel is cluster-outer only (no node-outer variant: at
-        // 49–729 nodes/cluster it is the sole sensible shape), so build a
-        // transient index here — O(n), negligible against the k^q·n node sweeps.
-        // Same `build` ⇒ same ascending-row ordering as the `Some` arm, so the
-        // result is bit-identical.
-        None => {
-            let idx = ClusterRowIndex::build(cluster_ids, s);
-            for (c, sc) in sum[..s].iter_mut().enumerate() {
-                per_cluster(&idx, c, sc);
+            // Fallback with no prebuilt CSR (FD-Hessian workers, a `parallel` build
+            // with `parallel_inner` off).
+            // The vector kernel is cluster-outer only (no node-outer variant: at
+            // 49–729 nodes/cluster it is the sole sensible shape), so build a
+            // transient index here — O(n), negligible against the k^q·n node sweeps.
+            // Same `build` ⇒ same ascending-row ordering as the `Some` arm, so the
+            // result is bit-identical.
+            None => {
+                let idx = ClusterRowIndex::build(cluster_ids, s);
+                for (c, sc) in sum[..s].iter_mut().enumerate() {
+                    per_cluster(&idx, c, sc);
+                }
             }
         }
     }
@@ -666,4 +976,126 @@ pub(crate) fn glmm_agq_deviance(
         offset,
         &mut crate::counters::EvalCounters::new(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::family::dev_resid_eta;
+    use crate::spec::{GammaLink, PoissonLink};
+
+    fn unif(s: &mut u64) -> f64 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*s >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+
+    /// The compressed per-cluster node sum against the row kernel it replaces
+    /// (`Σ_j exp(ln_wj + ℓ_c(u_cj) − ℓ_c(ũ_c))` with `ℓ_c` summed row by row through
+    /// `dev_resid_eta`, the node predictor rebuilt as `η_fix + λ·u_cj` as the AGQ loop
+    /// does), on random clusters: 1 to 60 rows, mode η in [−3, 3] from a fixed part plus
+    /// an offset, zero and positive weights, Poisson counts with many zeros, positive
+    /// Gamma responses, either sign of λ, k = 3, 7, 25. Compared on `ln Σ`, the
+    /// quantity that enters the deviance, scaled by `max(1, |a|, |b|)`.
+    #[test]
+    fn compressed_cluster_sum_matches_row_kernel() {
+        let mut st = 20261005u64;
+        for family in [
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            Family::Gamma {
+                link: GammaLink::Log,
+            },
+        ] {
+            assert!(compressible(family));
+            let gamma = matches!(family, Family::Gamma { .. });
+            let mut worst = 0.0f64;
+            for k in [3usize, 7, 25] {
+                let blk = crate::consts::GH_OFFSETS[(k - 1) / 2];
+                let nodes = &crate::consts::GH_NODES[blk..blk + k];
+                let wts = &crate::consts::GH_WEIGHTS[blk..blk + k];
+                let ln_wj: Vec<f64> = nodes
+                    .iter()
+                    .zip(wts)
+                    .map(|(&z, &w)| w.ln() + z * z)
+                    .collect();
+                for _ in 0..400 {
+                    let m = 1 + (unif(&mut st) * 60.0) as usize;
+                    let lambda =
+                        (0.05 + 1.5 * unif(&mut st)) * if unif(&mut st) < 0.2 { -1.0 } else { 1.0 };
+                    let u_c = 3.0 * (unif(&mut st) - 0.5);
+                    let sigma = 0.05 + 0.9 * unif(&mut st);
+                    let (mut sa, mut sb) = (0.0f64, 0.0f64);
+                    let mut ctr = -0.5 * u_c * u_c;
+                    let mut rows = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        let offset = 2.0 * (unif(&mut st) - 0.5);
+                        let eta0_target = 6.0 * (unif(&mut st) - 0.5);
+                        let eta_fix = (eta0_target - offset - lambda * u_c) + offset;
+                        let eta0 = eta_fix + lambda * u_c;
+                        let mu0 = eta0.exp();
+                        let a = if unif(&mut st) < 0.15 {
+                            0.0
+                        } else {
+                            0.2 + 3.0 * unif(&mut st)
+                        };
+                        let y = if gamma {
+                            mu0 * (0.2 + 2.0 * unif(&mut st))
+                        } else if unif(&mut st) < 0.3 {
+                            0.0
+                        } else {
+                            (mu0 * 2.0 * unif(&mut st)).round()
+                        };
+                        if gamma {
+                            sa += a;
+                            sb += a * y / mu0;
+                        } else {
+                            sa += a * y;
+                            sb += a * mu0;
+                        }
+                        ctr -= 0.5 * a * dev_resid_eta(family, 0.0, y, eta0);
+                        rows.push((eta_fix, y, a));
+                    }
+                    let mut row_sum = 0.0f64;
+                    for (j, &zj) in nodes.iter().enumerate() {
+                        let u_cj = u_c + std::f64::consts::SQRT_2 * sigma * zj;
+                        let mut acc = -0.5 * u_cj * u_cj;
+                        for &(eta_fix, y, a) in &rows {
+                            acc -= 0.5 * a * dev_resid_eta(family, 0.0, y, eta_fix + lambda * u_cj);
+                        }
+                        row_sum += (ln_wj[j] + acc - ctr).exp();
+                    }
+                    let comp =
+                        compressed_cluster_sum(gamma, sa, sb, u_c, sigma, lambda, nodes, &ln_wj);
+                    let (a, b) = (row_sum.ln(), comp.ln());
+                    let err = (a - b).abs() / 1f64.max(a.abs()).max(b.abs());
+                    assert!(
+                        err <= 1e-12,
+                        "{family:?} k={k} m={m}: row {a} vs compressed {b} (scaled {err:e})"
+                    );
+                    worst = worst.max(err);
+                }
+            }
+            eprintln!("{family:?}: worst scaled error {worst:e}");
+        }
+    }
+
+    /// The compressed route's eligibility: inside the η window and finite sums only;
+    /// at or past the window, or on a non-finite sum, the cluster keeps the row kernel.
+    #[test]
+    fn compress_ok_window_and_non_finite() {
+        assert!(compress_ok(150.0, 50.0, 1.0, 1.0));
+        assert!(!compress_ok(150.0, 50.5, 1.0, 1.0));
+        assert!(!compress_ok(f64::NAN, 0.0, 1.0, 1.0));
+        assert!(!compress_ok(1.0, 0.0, f64::INFINITY, 1.0));
+        assert!(!compress_ok(1.0, 0.0, 1.0, f64::NAN));
+        assert!(!compressible(Family::Gamma {
+            link: GammaLink::Inverse
+        }));
+        assert!(!compressible(Family::NegativeBinomial {
+            link: crate::spec::NegBinomialLink::Log
+        }));
+    }
 }

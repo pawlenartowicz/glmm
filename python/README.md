@@ -79,10 +79,9 @@ in
 
 ### Not yet implemented
 
-Two combinations have an approved design but no kernel support, and raise a
+One combination has an approved design but no kernel support, and raises a
 clean `NotImplementedError`: quasi-likelihood `dispersion=` on
-binomial/poisson, and a float `init_theta=` seed (only the default
-`init_theta=None` cold start is supported). See
+binomial/poisson. See
 [`troubleshooting.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/troubleshooting.md)
 for fixes to common errors.
 

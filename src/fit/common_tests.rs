@@ -69,8 +69,9 @@ pub(crate) const PIN_REL_ITER: f64 = 1e-7;
 /// dispatches differently and the compiler contracts multiply-adds into FMA at
 /// other points in this kernel's long reductions. Drift off the anchor values,
 /// worst per test: 1.4e-7 (`fit_wide_crossed_sparse_is_pinned`), 1.5e-7
-/// (`fit_glmm_binomial_slope1_vector_agq_is_pinned`), 1.4e-6
-/// (`fit_wide_slopes_sparse_is_pinned`), 3.6e-6
+/// (`fit_glmm_binomial_slope1_vector_agq_is_pinned`), 5.1e-5
+/// (`fit_wide_slopes_sparse_is_pinned`, its smallest `ge` covariance entry;
+/// 1.4e-6 before the 0.5.0 re-pins, everything else in it ≤ 5.0e-6), 3.6e-6
 /// (`fit_glmm_binomial_slope2_vector_agq_is_pinned`), 7.7e-6
 /// (`fit_sparse_binomial_slope_crossed_is_pinned`), 7.1e-5
 /// (`fit_glmm_poisson_slope1_vector_agq_is_pinned`), 7.9e-4
@@ -605,6 +606,7 @@ fn wrong_width_start_beta_is_rejected() {
     let start = StartValues {
         beta: vec![0.0; p + 1],
         theta: vec![],
+        dispersion: None,
     };
     let _ = fit_warm(
         &x,
@@ -1535,6 +1537,7 @@ fn fit_warm_start_reaches_cold_beta() {
         let start = StartValues {
             beta,
             theta: vec![5.0],
+            dispersion: None,
         };
         let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
         assert!(

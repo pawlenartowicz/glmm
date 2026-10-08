@@ -27,6 +27,7 @@ use super::glm::GlmScratchBuf;
 use super::lmm::LmmResultView;
 use super::ols::OlsWorkspace;
 use super::{classify_design, Fit, FitOptions, Solver};
+use crate::optim::CurvatureHint;
 
 // ---------------------------------------------------------------------------
 // FitView — the lean, caller-owned result
@@ -159,6 +160,9 @@ impl FitView<'_> {
             FitViewKind::Prebuilt { fit, .. } => {
                 let mut d = FitDiagnostics {
                     boundary_hit: fit.singular() as u8,
+                    n_grad: fit.diagnostics.n_grad as u32,
+                    outer_stop: fit.diagnostics.outer_stop,
+                    outer_decrement: fit.diagnostics.outer_decrement,
                     ..FitDiagnostics::fixed_only(fit.converged())
                 };
                 // The inverse of `common::materialize_diagnostics`: every note it
@@ -178,6 +182,7 @@ impl FitView<'_> {
                         }
                         Note::HessianSeFallback => d.hessian_fallback = true,
                         Note::ExactProfileFallback => d.exact_profile_fallback = true,
+                        Note::GradientSearchFallback => d.gradient_search_fallback = true,
                         Note::SeUnavailable => d.se_unavailable = true,
                         Note::PrecisionLimited => d.precision_limited = true,
                         Note::Separated => d.separated = true,
@@ -263,6 +268,21 @@ impl FitView<'_> {
             FitViewKind::Glmm(_) => f64::NAN,
             FitViewKind::Prebuilt { fit, .. } => fit.dispersion,
         }
+    }
+
+    /// The estimated dispersion to carry into the next draw's
+    /// [`crate::StartValues::dispersion`]: θ̂_NB on the negative-binomial routes,
+    /// φ̂ on a Gamma GLMM (both in [`Fit::dispersion`]'s units). `None` where
+    /// no dispersion is estimated (every other family, a held Gamma φ) and on a
+    /// fit with no endpoint. Not [`Self::dispersion`], which on the GLMM arm is
+    /// `D̂[0][0]`.
+    pub fn dispersion_start(&self) -> Option<f64> {
+        let d = match &self.kind {
+            FitViewKind::Glmm(v) => v.dispersion_estimate(),
+            FitViewKind::Prebuilt { fit, .. } => Some(fit.dispersion),
+            FitViewKind::Ols(_) | FitViewKind::Glm(_) | FitViewKind::Lmm(_) => None,
+        };
+        d.filter(|v| v.is_finite() && *v > 0.0)
     }
 
     /// Fitted θ̂ vech (primary block then extras, column-major lower-triangular) —
@@ -833,6 +853,7 @@ pub fn build_workspace(
         start_permuted: StartValues {
             beta: Vec::with_capacity(p),
             theta: Vec::with_capacity(crate::consts::MAX_THETA),
+            dispersion: None,
         },
         kind,
     }
@@ -869,6 +890,70 @@ pub fn fit_on<'a>(
     start: Option<&StartValues>,
     opts: &FitOptions,
 ) -> FitView<'a> {
+    fit_on_hinted(ws, x, y, ids, start, None, opts)
+}
+
+/// Test-only: route a GLMM workspace's outer search to BOBYQA on both start
+/// kinds (the gradient route off), so a test of a BOBYQA-route property runs
+/// on that route whatever the shape. A no-op on every other workspace kind.
+#[cfg(test)]
+pub(crate) fn force_bobyqa_route(ws: &mut FitWorkspace) {
+    if let FitKind::Glmm { ws, .. } = &mut ws.kind {
+        ws.route_plan = crate::optim::RoutePlan::BOBYQA;
+    }
+}
+
+/// The [`CurvatureHint`] at the optimum of the last fit on `ws`, for passing
+/// to [`fit_on_hinted`] on later draws. `None` when that fit did not search
+/// with BFGS, or when the curvature there is not positive definite. BFGS
+/// searches LMMs whose random slopes are all on one grouping (the hint then
+/// costs `n_θ + 1` deviance and gradient evaluations), and binomial and
+/// Poisson Laplace GLMMs with at least two θ on the blocked or structured
+/// layout (the hint is the pilot search's own final estimate and costs
+/// nothing). Call it once, on a pilot fit, right after it.
+pub fn curvature_hint(ws: &mut FitWorkspace) -> Option<CurvatureHint> {
+    match &mut ws.kind {
+        FitKind::Lmm { ws, .. } => crate::lmm::lmm_curvature_hint(ws),
+        FitKind::Glmm { ws } => crate::glmm::glmm_curvature_hint(ws),
+        _ => None,
+    }
+}
+
+/// [`fit_on`] with a [`CurvatureHint`] for the gradient search, taken from a
+/// pilot fit by [`curvature_hint`] and passed with every draw. The fit only
+/// reads it, so results depend on (data, start, hint) and not on the order of
+/// the calls. It is used where the fit searches with BFGS (LMMs whose random
+/// slopes are all on one grouping, when the per-group route is armed for the
+/// draw; binomial and Poisson Laplace GLMMs with at least two θ on the blocked
+/// or structured layout) and ignored where it searches with BOBYQA.
+///
+/// # Panics
+///
+/// As [`fit_on`], and when `hint` was taken on a workspace of another kind or
+/// search dimension (a hint applies to LMM workspaces of its own `n_θ`, and
+/// to GLMM workspaces of its own `n_θ + p`).
+pub fn fit_on_hinted<'a>(
+    ws: &'a mut FitWorkspace,
+    x: &[f64],
+    y: &[f64],
+    ids: &GroupIds,
+    start: Option<&StartValues>,
+    hint: Option<&CurvatureHint>,
+    opts: &FitOptions,
+) -> FitView<'a> {
+    if let Some(h) = hint {
+        let dim = match &ws.kind {
+            FitKind::Lmm { ws, .. } => ws.kernel.groupings().n_theta(),
+            FitKind::Glmm { ws } => ws.n_theta + ws.p,
+            _ => panic!("fit_on_hinted: a curvature hint applies to LMM and GLMM workspaces only"),
+        };
+        assert_eq!(
+            h.dim(),
+            dim,
+            "fit_on_hinted: curvature hint dimension {} != the workspace's search dimension {dim}",
+            h.dim()
+        );
+    }
     let n = y.len();
     let p = ws.p;
     assert!(
@@ -999,6 +1084,7 @@ pub fn fit_on<'a>(
                 dst.theta.extend_from_slice(&s.theta);
                 perm.swap_slots(&mut dst.theta);
             }
+            dst.dispersion = s.dispersion;
             if let Some(g) = maps_start {
                 start_to_design(dst, scaling, g, re_map_scratch);
             }
@@ -1057,6 +1143,7 @@ pub fn fit_on<'a>(
                 lmm_ws,
                 &opts.target_indices,
                 warm_theta(start),
+                hint,
                 scaling,
             ))
         }
@@ -1071,6 +1158,7 @@ pub fn fit_on<'a>(
             // symbolic factors — what `accumulate_lmm_rows` does
             // for the LMM arm above.
             super::glmm::prep_glmm_design(glmm_ws, &ids.primary, &ids.extra, n, opts);
+            glmm_ws.grad_hint_in = hint.cloned();
             FitViewKind::Glmm(super::glmm::run_glmm_on(
                 glmm_ws,
                 x_mat,
@@ -1089,7 +1177,10 @@ pub fn fit_on<'a>(
         // `start` is in the caller's units here: this route has no groupings
         // on the `FitWorkspace`, and `fit_glmm_nb` maps it.
         FitKind::Prebuilt(route) => prebuilt_kind(match route {
-            PrebuiltRoute::GlmNb => super::glm::fit_glm_nb(x_mat, y, n, p, None, opts, scaling).0,
+            PrebuiltRoute::GlmNb => {
+                let seed = start.and_then(|s| s.dispersion);
+                super::glm::fit_glm_nb(x_mat, y, n, p, seed, opts, scaling).0
+            }
             PrebuiltRoute::GlmmNb(nb_ws) => super::glmm::fit_glmm_nb(
                 nb_ws,
                 x_mat,

@@ -468,7 +468,7 @@ pub(crate) fn in_tail(family: Family, eta: f64, mu: f64) -> bool {
 /// equation, whose cancellation grows toward `x = −4√2`: there `λ'` is off
 /// by up to 1e-13 and `λ''` by up to 1e-10 relative (against 50-digit
 /// values), and on `x ≥ 0` neither cancels.
-fn probit_side<T: Scalar>(x: T) -> (T, T, T, T) {
+pub(crate) fn probit_side<T: Scalar>(x: T) -> (T, T, T, T) {
     use crate::simd_transcendental::{erfc_region3_r, SQRT_PI};
     if x.value() < -4.0 * std::f64::consts::SQRT_2 {
         let t = -x;
@@ -705,6 +705,132 @@ pub(crate) fn row_score<T: Scalar>(
     let dmu = mu_eta_at(family, eta, mu);
     let v = variance(family, nb_theta, mu);
     T::from_f64(prior_w) * dmu * (T::from_f64(y) - mu) / v
+}
+
+/// Rows per tile of [`ProbitRows`]' `φ(η)`.
+pub(crate) const PROBIT_PHI_TILE: usize = 64;
+
+const PROBIT: Family = Family::Binomial {
+    link: BinomialLink::Probit,
+};
+
+/// The `f64` probit row functions ([`row_score`], [`observed_weight`],
+/// [`observed_weight_eta_deriv`]) over one pass's rows, with `φ(η) = dμ/dη`
+/// filled [`PROBIT_PHI_TILE`] rows at a time through the SIMD `exp`
+/// (`simd_transcendental::exp_fill`) instead of one libm `exp` per row and per
+/// function: on a probit Laplace fit those `exp`s were the largest scalar cost
+/// of the PIRLS iteration after the deviance fold.
+///
+/// Each method is its generic counterpart's off-tail expression, left to right
+/// and term for term, with the tile's `φ` in place of `mu_eta`: the value
+/// differs from it only by the SIMD `exp`'s last bits (`simd_exp_reduced`,
+/// the kernel the family pass's own arms use). A tail row ([`in_tail`]) calls
+/// the generic function itself, so its η form is unchanged, and reads no `φ`.
+/// `φ`'s argument `−½·η²` is `mu_eta`'s `(−½·η)·η` (probit takes no η clamp);
+/// off the tail `−7.04 < η < 3.72`, inside `exp_fill`'s `[−700, 700]`.
+///
+/// A row reads its own tile entry, refilled when the row leaves the tile, so
+/// the callers keep their row loops and row order (and so their sums'
+/// association); a pass that walks the rows in order fills each tile once, and
+/// any other order is still exact, only slower. The tile is the only state,
+/// on the stack: no per-row buffer.
+pub(crate) struct ProbitRows<'a> {
+    eta: &'a [f64],
+    prob: &'a [f64],
+    phi: [f64; PROBIT_PHI_TILE],
+    start: usize,
+    len: usize,
+}
+
+impl<'a> ProbitRows<'a> {
+    /// `Some` on a probit fit whose η and μ are plain `f64` (the PIRLS loops,
+    /// `T = f64`); `None` on every other family and on a dual scalar, whose
+    /// rows keep the generic functions.
+    pub(crate) fn new<T: Scalar>(family: Family, eta: &'a [T], prob: &'a [T]) -> Option<Self> {
+        if !matches!(
+            family,
+            Family::Binomial {
+                link: BinomialLink::Probit
+            }
+        ) {
+            return None;
+        }
+        Some(Self {
+            eta: T::as_f64s(eta)?,
+            prob: T::as_f64s(prob)?,
+            phi: [0.0; PROBIT_PHI_TILE],
+            start: 0,
+            len: 0,
+        })
+    }
+
+    #[inline]
+    fn phi(&mut self, i: usize) -> f64 {
+        if i.wrapping_sub(self.start) >= self.len {
+            self.fill(i);
+        }
+        self.phi[i - self.start]
+    }
+
+    #[inline(never)]
+    fn fill(&mut self, i: usize) {
+        let len = (self.eta.len() - i).min(PROBIT_PHI_TILE);
+        let tile = &mut self.phi[..len];
+        for (o, &e) in tile.iter_mut().zip(&self.eta[i..i + len]) {
+            *o = -0.5 * e * e;
+        }
+        crate::simd_transcendental::exp_fill(tile);
+        for o in tile.iter_mut() {
+            *o *= FRAC_1_SQRT_2PI;
+        }
+        self.start = i;
+        self.len = len;
+    }
+
+    /// [`row_score`] at row `i`.
+    #[inline]
+    pub(crate) fn score(&mut self, i: usize, y: f64, prior_w: f64) -> f64 {
+        let (eta, mu) = (self.eta[i], self.prob[i]);
+        if in_tail(PROBIT, eta, mu) {
+            return row_score(PROBIT, f64::NAN, y, prior_w, eta, mu);
+        }
+        let v = mu * (1.0 - mu);
+        prior_w * self.phi(i) * (y - mu) / v
+    }
+
+    /// [`observed_weight`] at row `i`, from its Fisher weight `w`.
+    #[inline]
+    pub(crate) fn observed_weight(&mut self, i: usize, y: f64, prior_w: f64, w: f64) -> f64 {
+        let (eta, mu) = (self.eta[i], self.prob[i]);
+        if in_tail(PROBIT, eta, mu) {
+            return observed_weight(PROBIT, f64::NAN, y, prior_w, eta, mu, w);
+        }
+        let phi = self.phi(i);
+        let v = mu * (1.0 - mu);
+        let dr = -phi * (eta * v + phi * (1.0 - 2.0 * mu)) / (v * v);
+        w - prior_w * (y - mu) * dr
+    }
+
+    /// [`observed_weight_eta_deriv`] at row `i` (`μ'' = −η·φ`, `mu_eta_eta`'s
+    /// probit arm).
+    #[inline]
+    pub(crate) fn observed_weight_eta_deriv(&mut self, i: usize, y: f64, prior_w: f64) -> f64 {
+        let (eta, mu) = (self.eta[i], self.prob[i]);
+        if in_tail(PROBIT, eta, mu) {
+            return observed_weight_eta_deriv(PROBIT, f64::NAN, y, prior_w, eta, mu, 0.0);
+        }
+        let two = 2.0;
+        let d1 = self.phi(i);
+        let d2 = -eta * d1;
+        let v = mu * (1.0 - mu);
+        let g = d1 / v;
+        let k = eta * v + d1 * (1.0 - two * mu);
+        let nn = -d1 * k;
+        let dv = (1.0 - two * mu) * d1;
+        let dn = eta * d1 * k - d1 * (v - two * d1 * d1);
+        let (g1, g2) = (nn / (v * v), dn / (v * v) - two * nn * dv / (v * v * v));
+        prior_w * (d2 * g + two * d1 * g1 - (y - mu) * g2)
+    }
 }
 
 /// Whether `μ = e^η` is the link inverse: then `dμ/dη = d²μ/dη² = μ`.
@@ -2707,5 +2833,134 @@ mod tests {
             (via_held - via_profiled).abs() < 1e-12,
             "held-at-profiled {via_held} vs profiled {via_profiled}"
         );
+    }
+}
+
+#[cfg(test)]
+mod probit_rows_tests {
+    use super::*;
+
+    const PROBIT_F: Family = Family::Binomial {
+        link: BinomialLink::Probit,
+    };
+
+    /// η over `[−9, 9]` (both tails and the whole off-tail range), the μ the
+    /// family pass stores for it, and its Fisher weight.
+    fn rows() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut eta = Vec::new();
+        let mut e = -9.0;
+        while e <= 9.0 {
+            eta.push(e);
+            e += 0.000_731;
+        }
+        let mu: Vec<f64> = eta.iter().map(|&e| link_inv(PROBIT_F, e)).collect();
+        let w: Vec<f64> = eta
+            .iter()
+            .map(|&e| irls_weight_and_resid(PROBIT_F, f64::NAN, 0.0, e).1)
+            .collect();
+        (eta, mu, w)
+    }
+
+    fn rel(a: f64, b: f64) -> f64 {
+        (a - b).abs() / b.abs().max(1e-300)
+    }
+
+    /// `ProbitRows`' score, observed weight and `dW_obs/dη` against
+    /// `row_score`, `observed_weight` and `observed_weight_eta_deriv` (libm
+    /// `exp` in `mu_eta`) on every row of the sweep, for y on both sides and
+    /// in between and a non-unit prior weight. The bounds are 4x the maxima
+    /// measured 2026-10-07 on x86 (score 4.9e-16, observed weight 1.3e-14, its
+    /// η-derivative 3.4e-13): an `exp` that differs in its last bit moves each by
+    /// a few ULP of its own terms. `dW_obs/dη` crosses 0, so it
+    /// is bounded relative to `max(1, |value|)`. Tail rows go to the generic
+    /// functions and must be equal.
+    #[test]
+    fn probit_rows_match_the_generic_row_functions() {
+        let (eta, mu, w) = rows();
+        let (mut s_rel, mut wo_rel, mut we_abs) = (0.0f64, 0.0f64, 0.0f64);
+        let mut tails = 0;
+        for y in [0.0, 1.0, 0.3] {
+            for pw in [1.0, 3.7] {
+                let mut r = ProbitRows::new(PROBIT_F, &eta, &mu).unwrap();
+                for i in 0..eta.len() {
+                    let (e, m) = (eta[i], mu[i]);
+                    let sa = r.score(i, y, pw);
+                    let sb = row_score(PROBIT_F, f64::NAN, y, pw, e, m);
+                    let wa = r.observed_weight(i, y, pw, pw * w[i]);
+                    let wb = observed_weight(PROBIT_F, f64::NAN, y, pw, e, m, pw * w[i]);
+                    let ea = r.observed_weight_eta_deriv(i, y, pw);
+                    let eb = observed_weight_eta_deriv(PROBIT_F, f64::NAN, y, pw, e, m, 0.0);
+                    if in_tail(PROBIT_F, e, m) {
+                        tails += 1;
+                        assert_eq!(sa.to_bits(), sb.to_bits(), "tail score at η = {e}");
+                        assert_eq!(wa.to_bits(), wb.to_bits(), "tail w_obs at η = {e}");
+                        assert_eq!(ea.to_bits(), eb.to_bits(), "tail w_obs' at η = {e}");
+                        continue;
+                    }
+                    if sb != 0.0 {
+                        s_rel = s_rel.max(rel(sa, sb));
+                    }
+                    wo_rel = wo_rel.max(rel(wa, wb));
+                    we_abs = we_abs.max((ea - eb).abs() / eb.abs().max(1.0));
+                }
+            }
+        }
+        eprintln!("ProbitRows vs generic: score rel {s_rel:.3e}, w_obs rel {wo_rel:.3e}, w_obs' {we_abs:.3e}, tail rows {tails}");
+        assert!(tails > 0);
+        assert!(s_rel <= S_REL_BOUND, "score rel {s_rel:e}");
+        assert!(wo_rel <= WO_REL_BOUND, "w_obs rel {wo_rel:e}");
+        assert!(we_abs <= WE_BOUND, "w_obs' {we_abs:e}");
+    }
+
+    const S_REL_BOUND: f64 = 2e-15;
+    const WO_REL_BOUND: f64 = 5e-14;
+    const WE_BOUND: f64 = 1.5e-12;
+
+    /// A row's value does not depend on how the rows are walked: the tile is
+    /// refilled whenever a row leaves it, and `exp_fill`'s scalar tail is
+    /// bit-identical to its SIMD head, so a reversed walk (a refill per row
+    /// at a different tile offset) gives the same bits as the forward one.
+    #[test]
+    fn probit_rows_are_independent_of_walk_order() {
+        let (eta, mu, w) = rows();
+        let n = eta.len();
+        let mut fwd = ProbitRows::new(PROBIT_F, &eta, &mu).unwrap();
+        let mut rev = ProbitRows::new(PROBIT_F, &eta, &mu).unwrap();
+        let a: Vec<[f64; 3]> = (0..n)
+            .map(|i| {
+                [
+                    fwd.score(i, 0.3, 2.0),
+                    fwd.observed_weight(i, 0.3, 2.0, w[i]),
+                    fwd.observed_weight_eta_deriv(i, 0.3, 2.0),
+                ]
+            })
+            .collect();
+        for i in (0..n).rev() {
+            let b = [
+                rev.score(i, 0.3, 2.0),
+                rev.observed_weight(i, 0.3, 2.0, w[i]),
+                rev.observed_weight_eta_deriv(i, 0.3, 2.0),
+            ];
+            for c in 0..3 {
+                assert_eq!(a[i][c].to_bits(), b[c].to_bits(), "row {i} quantity {c}");
+            }
+        }
+    }
+
+    /// Only a probit `f64` pass takes the tiles.
+    #[test]
+    fn probit_rows_are_probit_and_f64_only() {
+        let (eta, mu, _) = rows();
+        assert!(ProbitRows::new(PROBIT_F, &eta, &mu).is_some());
+        for link in [BinomialLink::Logit, BinomialLink::Cloglog] {
+            assert!(ProbitRows::new(Family::Binomial { link }, &eta, &mu).is_none());
+        }
+        let ed: Vec<crate::dual::Dual<1>> = eta
+            .iter()
+            .map(|&e| crate::dual::Dual::from_f64(e))
+            .collect();
+        let md: Vec<crate::dual::Dual<1>> =
+            mu.iter().map(|&m| crate::dual::Dual::from_f64(m)).collect();
+        assert!(ProbitRows::new(PROBIT_F, &ed, &md).is_none());
     }
 }

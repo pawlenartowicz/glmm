@@ -76,7 +76,7 @@ def test_clean_fit_stores_an_empty_list():
         ),
         (
             {"formula": "y ~ x", "warm_start": {"beta": [0.0, 0.0], "phi": 1.0, "b": 2}},
-            "warm_start accepts only 'beta' and 'theta'; these entries were ignored: phi, b.",
+            "warm_start accepts only 'beta', 'theta' and 'dispersion'; these entries were ignored: phi, b.",
         ),
     ],
 )
@@ -199,6 +199,15 @@ def test_constructed_notes_store_with_their_tier_and_title():
                 "effects that depend on them, may be off by a tenth of a standard error or more. "
                 "This happens with counts in the billions or more, or when a model misses a "
                 "large effect in such data."
+            ),
+        ),
+        (
+            dict(base, kind="gradient_search_fallback"),
+            glmm.GradientSearchFallbackWarning,
+            (
+                "The fast search for this model did not settle on an answer, so the fit "
+                "finished with the standard search from the best point it had reached. The "
+                "reported estimates come from that search."
             ),
         ),
         (

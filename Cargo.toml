@@ -1,6 +1,6 @@
 [package]
 name = "glmm"
-version = "0.4.1"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -73,7 +73,7 @@ parallel = ["dep:rayon"]
 
 [dependencies]
 # Validation-stable numerics depend on these pins.
-bobyqa = "0.3.1"   # `Bobyqa::minimize_with_radius` (the radius-tied stage-1 tolerance)
+bobyqa = "0.3.2"   # `Bobyqa::minimize_with_radius` (the radius-tied stage-1 tolerance), `Config::prima_parity`
 pulp = "=0.22.2"
 # Formula-parser only (`src/formula/parse.rs`); optional so the default-off kernel
 # never links it. Its MSRV (1.65) clears this crate's 1.85 floor.

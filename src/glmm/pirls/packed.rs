@@ -21,9 +21,10 @@ pub(crate) struct PackedFactor<'a> {
     pub(crate) m_vals: &'a [f64],
     /// `k×k`, full symmetric — both triangles are written. `factor_logdet`
     /// leaves it holding `A` itself (`+I` applied, un-factored) and factors the
-    /// separate `a_chol` copy, so `packed_schur_fill` can re-read it.
+    /// separate `a_chol` copy, so `packed_schur_fill` can re-read it. Dense
+    /// factor only: `0×0` and never touched when `sp` is `Some`.
     pub(crate) a: &'a mut Mat<f64>,
-    /// Copy-then-factor target for `a`'s lower triangle.
+    /// Copy-then-factor target for `a`'s lower triangle (dense factor only).
     pub(crate) a_chol: &'a mut Mat<f64>,
     /// Scratch for `a_chol`'s in-place factor and back-solve.
     pub(crate) a_llt_mem: &'a mut MemBuffer,
@@ -38,8 +39,10 @@ pub(crate) struct PackedFactor<'a> {
     pub(crate) k: usize,
     /// When present, `scatter` writes `A` into its CSC values and
     /// `factor_logdet` and the solves run through this sparse Cholesky instead
-    /// of the dense `a`/`a_chol`, which then hold `A` only after a converged
-    /// solve's final expansion.
+    /// of the dense `a`/`a_chol`, which are then `0×0`. After a converged
+    /// solve `axx` holds the final `A` and `l_values` its completed factor
+    /// (`factor_ok`), and `packed_schur_fill` solves through that factor
+    /// directly, with no dense expansion of `A`.
     pub(crate) sp: Option<&'a mut crate::glmm::workspace::PackedSparse>,
 }
 
@@ -89,10 +92,15 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
             let row_slots = &sp.row_slots;
             let vals = sp.axx.val_mut();
             vals.fill(0.0);
+            let mut probit_rows = crate::family::ProbitRows::new(family, eta, prob);
             for i in 0..n {
                 let wi = w[i];
-                let rho =
-                    crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i]);
+                let rho = match probit_rows.as_mut() {
+                    Some(rows) => rows.score(i, y[i], prior_w[i]),
+                    None => crate::family::row_score(
+                        family, nb_theta, y[i], prior_w[i], eta[i], prob[i],
+                    ),
+                };
                 let base = i * width;
                 for ta in base..base + width {
                     let ca = m_cols[ta] as usize;
@@ -119,13 +127,20 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
         }
         // `wᵢmᵢmᵢ'` into A and `mᵢ·ρᵢ` into the RHS, from each row's
         // `width` nonzeros. This pass is scalar per row for every family — no
-        // logit shortcut and no batched kernel: the effective residual
+        // logit shortcut and no batched kernel but probit's `φ`, a tile at a
+        // time (`family::ProbitRows`): the effective residual
         // `ρ = w·(dμ/dη)·(y−μ)/V` is formed here beside the gather. The exit
         // refresh's μ/W/deviance pass is `Scalar::family_pass`, which does take
         // the fused logit and SIMD arms.
+        let mut probit_rows = crate::family::ProbitRows::new(family, eta, prob);
         for i in 0..n {
             let wi = w[i];
-            let rho = crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i]);
+            let rho = match probit_rows.as_mut() {
+                Some(rows) => rows.score(i, y[i], prior_w[i]),
+                None => {
+                    crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i])
+                }
+            };
             let base = i * width;
             for ta in base..base + width {
                 let ca = m_cols[ta] as usize;
@@ -143,6 +158,9 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
     fn factor_logdet(&mut self) -> Option<f64> {
         let k = self.k;
         if let Some(sp) = self.sp.as_deref_mut() {
+            // Cleared before the factorization: a failed one leaves `l_values`
+            // partly stale, and only this flag tells `packed_schur_fill` so.
+            sp.factor_ok = false;
             {
                 let vals = sp.axx.val_mut();
                 for &s in &sp.diag_slots {
@@ -162,7 +180,8 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
                 .ok()?;
             // `logdet_llt` is `log|A| = 2·Σ ln L_ii`; this method returns `Σ ln L_ii`.
             let ld = crate::sparse::logdet_llt(&sp.symbolic, &sp.l_values);
-            return ld.is_finite().then_some(0.5 * ld);
+            sp.factor_ok = ld.is_finite();
+            return sp.factor_ok.then_some(0.5 * ld);
         }
         for r in 0..k {
             self.a[(r, r)] += 1.0;
@@ -218,9 +237,11 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
 /// converged`)`; a Cholesky failure surfaces as `(NaN, NaN, NaN, false)`.
 /// A converged solve ends by re-evaluating η/μ/W at the returned `u` and
 /// rebuilding and refactoring `A` there ([`evaluate_at_mode`]), so `log|L|`
-/// (`log|A| = 2 log|L|`) and the deviance describe that iterate, and
-/// `packed.a` is left holding its raw symmetric `A` for
-/// `se::packed_schur_fill` to re-factor.
+/// (`log|A| = 2 log|L|`) and the deviance describe that iterate, and the
+/// storage `se::packed_schur_fill` reads describes it too: on the dense
+/// factor `packed.a` is left holding its raw symmetric `A` (re-factored
+/// there); on the sparse factor `axx` holds that same `A` and `l_values` its
+/// completed factor, which the Schur fill solves through directly.
 ///
 /// The `beta_step` mode sets what moves: `BetaStep::Fixed` holds β at the
 /// caller's input and solves for the conditional modes ũ(β) alone (the
@@ -257,8 +278,9 @@ pub(crate) fn pirls_solve_packed(
     mut beta_step: BetaStep,
     scratch: &mut PirlsScratch<f64>,
     // Packed-row layout scratch — see [`PackedScratch`]. `m_vals` must be
-    // refilled at this θ before the call; `a` must survive it holding the raw
-    // symmetric `M'WM + I`, so the Cholesky runs on the separate `a_chol`.
+    // refilled at this θ before the call; on the dense factor `a` must survive
+    // it holding the raw symmetric `M'WM + I`, so the Cholesky runs on the
+    // separate `a_chol`.
     packed: &mut PackedScratch,
     // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
     // (rebuilt fresh from this iteration's `w` each Profile step, so no
@@ -484,9 +506,16 @@ pub(crate) fn pirls_solve_packed(
                     wx[(i, c)] = r;
                 }
             }
+            let probit_rows =
+                std::cell::RefCell::new(crate::family::ProbitRows::new(family, eta, prob));
             residual_border(
                 |i| w[i],
-                |i| crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i]),
+                |i| match probit_rows.borrow_mut().as_mut() {
+                    Some(rows) => rows.score(i, y[i], prior_w[i]),
+                    None => crate::family::row_score(
+                        family, nb_theta, y[i], prior_w[i], eta[i], prob[i],
+                    ),
+                },
                 wx.as_ref().subrows(0, n),
                 ainv_mtwx.as_ref().subrows(0, k),
                 |j| u_prev[j],
@@ -588,21 +617,9 @@ pub(crate) fn pirls_solve_packed(
             }
             None => return (f64::NAN, f64::NAN, f64::NAN, false),
         }
-        // The sparse path never wrote the dense `a`; `packed_schur_fill`
-        // re-reads the final `A` from it, so expand the CSC values once here.
-        if let Some(sp) = layout.sp.as_deref() {
-            let a = &mut *layout.a;
-            a.fill(0.0);
-            let (col_ptr, row_idx) = (sp.axx.symbolic().col_ptr(), sp.axx.symbolic().row_idx());
-            let vals = sp.axx.val();
-            for c in 0..k {
-                for s in col_ptr[c]..col_ptr[c + 1] {
-                    let r = row_idx[s];
-                    a[(r, c)] = vals[s];
-                    a[(c, r)] = vals[s];
-                }
-            }
-        }
+        // Nothing more on the sparse factor: `evaluate_at_mode` left the final
+        // `A` in `axx` and its factor in `l_values`, and `packed_schur_fill`
+        // solves through that factor; the dense `a` is `0×0` and stays so.
     }
     (dev, pen, logdet, converged)
 }
@@ -816,6 +833,9 @@ mod tests {
         let g = LmmGroupings::from_cluster_spec_ext(&spec, n, &[], &[]);
         let k = g.k_total;
         let mut packed = PackedScratch::for_shape(&g, n, k);
+        // The test drives `PackedFactor` directly with `sp: None`, so it sizes
+        // the dense pair itself, as `fill_packed_cols` would.
+        packed.set_factor(None, k);
         crate::sparse::fill_lambda_small(&[0.5], &g, &mut packed.lam_small);
         fill_m_vals(&mut packed, &g, &[], n);
         // Intercept-only primary: one nonzero per row, at that row's cluster.

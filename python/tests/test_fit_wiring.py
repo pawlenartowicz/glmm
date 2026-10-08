@@ -244,6 +244,31 @@ def test_warm_start_reaches_same_answer_as_cold():
     assert warm.n_eval != cold.n_eval
 
 
+def test_gradient_search_fields_cross_the_port():
+    # A random-slope LMM searches theta with BFGS; a GLM runs no theta search.
+    rng = np.random.default_rng(8)
+    b0 = rng.normal(scale=1.0, size=30)[_GROUPS]
+    b1 = rng.normal(scale=1.0, size=30)[_GROUPS]
+    y = 1.0 + b0 + (2.0 + b1) * _X + rng.normal(scale=0.5, size=_N)
+    routed = glmm.fit(_data(y.tolist()), "y ~ x + (x | g)")
+    assert routed.n_grad > 0
+    assert routed.outer_stop in {
+        "fdelta",
+        "pgrad",
+        "noise_floor",
+        "line_search",
+        "max_iter",
+        "grad_unavailable",
+        "non_finite",
+    }
+    assert np.isfinite(routed.outer_decrement)
+
+    plain = glmm.fit(_data(y.tolist()), "y ~ x")
+    assert plain.n_grad == 0
+    assert plain.outer_stop is None
+    assert np.isnan(plain.outer_decrement)
+
+
 def test_pinned_detail_is_reported_on_a_sparse_route_fit():
     # A slope-carrying extra grouping routes the fit to the sparse solver, which
     # assembles its Fit outside the dense mappers. Design: `g` carries no

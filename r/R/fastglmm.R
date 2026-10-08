@@ -86,14 +86,16 @@
 #' `"fastglmm_unused_grouping_levels"`,
 #' `"fastglmm_single_level_grouping_dropped"`, `"fastglmm_hessian_se_fallback"`,
 #' `"fastglmm_se_unavailable"`, `"fastglmm_exact_profile_fallback"`,
+#' `"fastglmm_gradient_search_fallback"`,
 #' `"fastglmm_precision_limited"`, `"fastglmm_non_integer_response"`, `"fastglmm_rows_dropped_na"`; a note from
 #' a newer kernel than this package arrives as `"fastglmm_unknown_note"`),
 #' so `withCallingHandlers()` and `suppressWarnings(classes = )` can select
 #' them without matching message text.
 #'
 #' Anything the engine cannot do is an error naming the reason - never a
-#' silently different model. That includes `REML = FALSE` (the LMM path is
-#' REML-only **by design**), `control=`/`verbose=`, and quasi-likelihood
+#' silently different model. That includes `REML = FALSE` on a Gaussian mixed
+#' model (the LMM path is REML-only **by design**), `REML = TRUE` on any other
+#' model (fitted by maximum likelihood), `control=`/`verbose=`, and quasi-likelihood
 #' `dispersion=` on binomial/poisson.
 #'
 #' @param formula an lme4-style model formula (or a string), e.g.
@@ -132,8 +134,13 @@
 #'   `1..=25` (`1` = Laplace, the default). More permissive than lme4 in range
 #'   but see the fallback note in Details.
 #' @param start optional warm start, lme4's name and shape:
-#'   `list(beta =, theta =)` with `theta` the random-effect Cholesky vector.
-#'   Distinct from `init.theta`, which is the negative-binomial shape.
+#'   `list(beta =, theta =)` with `theta` the random-effect Cholesky vector,
+#'   plus an optional `dispersion =`: the estimated dispersion as a previous
+#'   fit reports it in `fit$dispersion` (the shape for negative binomial, phi
+#'   for Gamma), used as the search's starting value. Any element may be left
+#'   out to cold-start that part.
+#'   `theta` is distinct from `init.theta`, which is the negative-binomial
+#'   shape (the same slot as `start$dispersion` there).
 #' @param wald.se Wald standard-error mode: `"hessian"` (default) or `"rx"`.
 #' @param dispersion Gamma/inverse-Gaussian dispersion directive: `NULL`
 #'   (estimate it, the default: the Pearson moment on a Gamma GLM, maximum
@@ -142,12 +149,16 @@
 #'   hold it fixed. Non-`NULL` on binomial/poisson would mean
 #'   quasi-likelihood - not implemented, errors.
 #' @param init.theta negative-binomial shape seed, named for
-#'   `MASS::glm.nb(init.theta=)`. No kernel hook exists yet to seed the shape
-#'   search, so any non-`NULL` value is an error (the default cold start is
-#'   what runs).
-#' @param ... intercepted, never silently swallowed: known lme4 arguments
-#'   (`REML`, `control`, `verbose`, `contrasts`) raise errors saying why they
-#'   cannot be honored; unknown names error as unused arguments.
+#'   `MASS::glm.nb(init.theta=)`: the starting value of the shape search
+#'   (the same slot as `start$dispersion`; give one of the two). `NULL`
+#'   cold-starts it from the no-random-effect negative-binomial fit.
+#' @param ... intercepted, never silently swallowed. `REML` is checked against
+#'   the model: `REML = TRUE` is accepted only on a Gaussian mixed model (the
+#'   one model with a REML objective) and errors elsewhere, `REML = FALSE` is
+#'   accepted everywhere else (those models are fitted by maximum likelihood)
+#'   and errors there. The other known lme4 arguments (`control`, `verbose`,
+#'   `contrasts`) raise errors saying why they cannot be honored; unknown names
+#'   error as unused arguments.
 #'
 #' @return An object of class `"fastglmm"`: fixed effects ([fixef]), Wald
 #'   covariance (`vcov()`), variance components on the SD/correlation scale
@@ -158,9 +169,10 @@
 #'   `kind`), plus
 #'   `print()`, [summary()][summary.fastglmm], [confint()][confint.fastglmm]
 #'   (Wald), `nobs()`, [formula()][formula.fastglmm] (returns the formula
-#'   **string**), `family()`, and `model.frame()`. Engine-blocked accessors
-#'   (`ranef`, `predict`, `fitted`, `residuals`, `coef`, `logLik`/`AIC`,
-#'   `terms`) error with the reason.
+#'   **string**), `family()`, `model.frame()`, [ranef()][ranef.fastglmm],
+#'   `fitted()`, `residuals()`, and [logLik()][logLik.fastglmm] (so `AIC()`
+#'   and `BIC()` work). The blocked accessors (`predict`, `coef`, `terms`)
+#'   error with the reason.
 #'
 #' @examples
 #' set.seed(1)
@@ -200,6 +212,8 @@ fastglmm <- function(formula, data, family = gaussian(),
   fam <- .normalize_family(family)
 
   mixed <- grepl("|", f_str, fixed = TRUE)
+  reml <- list(...)[["REML"]]
+  .check_reml(reml, fam$name, mixed)
   if (identical(fam$name, "inversegaussian") && mixed) {
     stop("family 'inversegaussian' is GLM-only: random-effect terms are not supported",
          call. = FALSE)
@@ -259,24 +273,35 @@ fastglmm <- function(formula, data, family = gaussian(),
                sprintf("init.theta= is not used for family '%s'.", fam$name), ignored)
     init.theta <- NULL
   }
-  if (!is.null(init.theta)) {
-    stop("init.theta= (negative-binomial shape seed) has no kernel hook yet; ",
-         "only the default cold-start search is supported", call. = FALSE)
-  }
-
   if (!is.null(start)) {
     if (!is.list(start)) {
       stop(sprintf(paste(
-        "start must be a list with elements 'beta' and/or 'theta' (theta is the",
-        "random-effect Cholesky vector, not the negative-binomial shape - that is",
-        "init.theta), got %s"), class(start)[1L]), call. = FALSE)
+        "start must be a list with elements 'beta', 'theta' and/or 'dispersion' (theta",
+        "is the random-effect Cholesky vector, not the negative-binomial shape - that is",
+        "init.theta or dispersion), got %s"), class(start)[1L]), call. = FALSE)
     }
-    unknown <- setdiff(names(start), c("beta", "theta"))
+    unknown <- setdiff(names(start), c("beta", "theta", "dispersion"))
     if (length(unknown)) {
       .warn_keep(store, "argument_ignored", paste0(
-        "start accepts only 'beta' and 'theta'; these entries were ignored: ",
-        paste(unknown, collapse = ", "), "."), ignored)
+        "start accepts only 'beta', 'theta' and 'dispersion'; these entries were ",
+        "ignored: ", paste(unknown, collapse = ", "), "."), ignored)
+      start <- start[intersect(names(start), c("beta", "theta", "dispersion"))]
     }
+  }
+  # init.theta is the negative-binomial shape seed: the same kernel slot as
+  # start$dispersion, so giving both is ambiguous.
+  if (!is.null(init.theta)) {
+    if (!is.null(start$dispersion)) {
+      stop("give the negative-binomial shape seed once: init.theta= or ",
+           "start$dispersion, not both", call. = FALSE)
+    }
+    start <- c(start, list(dispersion = init.theta))
+  }
+  if (!is.null(start$dispersion) &&
+      !(is.numeric(start$dispersion) && length(start$dispersion) == 1L &&
+        is.finite(start$dispersion) && start$dispersion > 0)) {
+    stop("start$dispersion (or init.theta) must be one finite number > 0",
+         call. = FALSE)
   }
 
   # --- data prep: row filtering (subset, na.action) happens HERE, on the
@@ -418,7 +443,8 @@ fastglmm <- function(formula, data, family = gaussian(),
     if (is.null(w)) double() else as.double(w),
     if (is.null(o)) double() else as.double(o),
     as.double(start$beta %||% double()),
-    as.double(start$theta %||% double())
+    as.double(start$theta %||% double()),
+    as.double(start$dispersion %||% double())
   )
 
   # Whether the FITTED model actually has random effects - not `mixed`, which
@@ -462,6 +488,13 @@ fastglmm <- function(formula, data, family = gaussian(),
   for (note in r$notes) {
     out <- .note_warning(note, r$names, r$converged)
     if (!is.null(out)) .warn_keep(store, note$kind, out$msg, out$cls)
+  }
+  # .check_reml() let REML = TRUE through on the formula; the fitted model has
+  # the last word (after the notes, so the dropped-grouping warning explains it).
+  if (isTRUE(reml) && !fitted_mixed) {
+    stop("REML = TRUE applies only to Gaussian mixed models; this model is ",
+         "fitted by maximum likelihood (every random-effect term was dropped).",
+         call. = FALSE)
   }
   if (!isTRUE(r$converged)) {
     out <- .nonconvergence(fam$name, fitted_mixed, r$notes, r$beta, r$aliased, r$deviance, r$y,
@@ -534,6 +567,17 @@ fastglmm <- function(formula, data, family = gaussian(),
     # `Fit.warnings` - change together.
     warnings = .warnings_frame(store),
     n_eval = r$n_eval,
+    # The gradient (BFGS) theta search, on the models the
+    # gradient_search_fallback warning names; they describe that search even
+    # when the derivative-free search finished the fit after it. n_grad counts
+    # its gradient evaluations (n_eval does not); outer_stop is why it
+    # stopped: "fdelta", "pgrad" or "noise_floor" (converged), "line_search",
+    # "max_iter", "grad_unavailable" or "non_finite"; outer_decrement is its
+    # estimate of the deviance decrease left at the endpoint. 0 /
+    # NA_character_ / NaN on every fit that ran no gradient search.
+    n_grad = r$n_grad,
+    outer_stop = r$outer_stop,
+    outer_decrement = r$outer_decrement,
     deviance = r$deviance,
     # logLik()/AIC()/BIC() inputs. `reml` marks the LMM paths, whose `loglik`
     # is a REML criterion rather than an ML one - see logLik.fastglmm().
@@ -588,6 +632,7 @@ fastglmm <- function(formula, data, family = gaussian(),
   hessian_se_fallback = c("caution", "Simpler standard errors used"),
   se_unavailable = c("caution", "Standard errors not computed"),
   exact_profile_fallback = c("caution", "Search retried with a different method"),
+  gradient_search_fallback = c("caution", "Search finished by another method"),
   precision_limited = c("caution", "Numbers too large for full precision"),
   agq_fallback = c("caution", "Adaptive quadrature not used"),
   non_integer_response = c("caution", "Non-integer response"),
@@ -662,6 +707,7 @@ fastglmm <- function(formula, data, family = gaussian(),
 # "fastglmm_unused_grouping_levels",
 # "fastglmm_single_level_grouping_dropped", "fastglmm_hessian_se_fallback",
 # "fastglmm_se_unavailable", "fastglmm_exact_profile_fallback",
+# "fastglmm_gradient_search_fallback",
 # "fastglmm_precision_limited", "fastglmm_nb_shape_unsettled",
 # "fastglmm_unknown_note" - all inheriting
 # "fastglmm_diagnostic", so one handler catches the whole channel. Not every
@@ -737,6 +783,12 @@ fastglmm <- function(formula, data, family = gaussian(),
       "standard errors, p-values and confidence intervals are not reported. Check",
       "for predictors that are copies or near-copies of each other.")
     cls <- c("fastglmm_se_unavailable", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "gradient_search_fallback")) {
+    msg <- paste(
+      "The fast search for this model did not settle on an answer, so the fit",
+      "finished with the standard search from the best point it had reached. The",
+      "reported estimates come from that search.")
+    cls <- c("fastglmm_gradient_search_fallback", "fastglmm_diagnostic")
   } else if (identical(note$kind, "exact_profile_fallback")) {
     msg <- paste(
       "The default search method for this model did not settle on an answer, so the fit",
@@ -897,13 +949,8 @@ fastglmm <- function(formula, data, family = gaussian(),
   nms <- names(dots) %||% rep("", length(dots))
   for (nm in nms) {
     switch(nm,
-      REML = {
-        # REML = TRUE matches what the engine does, so only FALSE errors.
-        if (isFALSE(dots$REML)) {
-          stop("REML = FALSE is not supported: the glmm LMM path is REML-only ",
-               "by design, a permanent choice, not a gap", call. = FALSE)
-        }
-      },
+      # Checked by .check_reml() once the family and RE terms are known.
+      REML = NULL,
       control = stop("control= is not supported: the optimizer (BOBYQA) ",
                      "settings are compiled into the glmm kernel; ",
                      "accepting-and-ignoring them is not acceptable",
@@ -918,6 +965,36 @@ fastglmm <- function(formula, data, family = gaussian(),
            " - fastglmm() intercepts rather than swallows unknown arguments",
            call. = FALSE)
     )
+  }
+  invisible()
+}
+
+# lme4's `REML =`, checked against the model: only a Gaussian mixed model has
+# a REML objective, and REML is the only criterion it is fitted by. Every other
+# model is fitted by maximum likelihood, so there `REML = FALSE` is a no-op and
+# `REML = TRUE` an error (Decision 5: error, never silently differ).
+#
+# `mixed` is read off the formula, before lowering. A formula whose every
+# grouping has a single level is dropped to a fixed-effects fit, which only
+# the fitted model shows: fastglmm() re-checks REML = TRUE against it after
+# the fit. REML = FALSE on such a formula is still refused here, before the
+# fit, so asking for ML on a real LMM never pays for a fit to learn it is
+# unsupported; the cost is a spurious (never a silent) error in that rare
+# all-groupings-dropped case.
+.check_reml <- function(reml, fam_name, mixed) {
+  if (is.null(reml)) return(invisible())
+  if (!(is.logical(reml) && length(reml) == 1L && !is.na(reml))) {
+    stop(sprintf("REML must be TRUE or FALSE, got %s", .arg_repr(reml)),
+         call. = FALSE)
+  }
+  lmm <- identical(fam_name, "gaussian") && mixed
+  if (reml && !lmm) {
+    stop("REML = TRUE applies only to Gaussian mixed models; this model is ",
+         "fitted by maximum likelihood.", call. = FALSE)
+  }
+  if (!reml && lmm) {
+    stop("REML = FALSE is not supported: the glmm LMM path is REML-only ",
+         "by design, a permanent choice, not a gap", call. = FALSE)
   }
   invisible()
 }
@@ -1033,8 +1110,8 @@ fastglmm <- function(formula, data, family = gaussian(),
     rname <- family$family
     if (grepl("^Negative Binomial", rname)) {
       stop("MASS::negative.binomial(theta) fixes the shape; fastglmm ",
-           "estimates it - use family = \"negativebinomial\" (and note ",
-           "init.theta seeding has no kernel hook yet)", call. = FALSE)
+           "estimates it - use family = \"negativebinomial\" (init.theta= ",
+           "seeds the shape search)", call. = FALSE)
     }
     name <- switch(rname,
       gaussian = "gaussian",

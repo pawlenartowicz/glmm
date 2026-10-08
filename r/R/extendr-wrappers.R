@@ -20,6 +20,6 @@ NULL
 #'
 #' @usage NULL
 #' @keywords internal
-fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta)
+fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion)
 
 # nolint end

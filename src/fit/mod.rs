@@ -334,14 +334,22 @@ pub struct Diagnostics {
     /// with `stddev_corr(g).0[i]`. That alignment is the point — it is the
     /// layout both wrapper packages already iterate.
     ///
-    /// A pinned θ diagonal is a zero variance component because the pin loop is
-    /// followed by a Σ-preserving re-factorization of each pinned RE block
+    /// A pinned θ diagonal marks a rank-deficient Σ̂, not necessarily a zero
+    /// variance: component `i` has zero variance *conditional on the components
+    /// before it in its block*. It is a zero variance component only when the
+    /// rest of its Λ row is zero too. At a correlation boundary (`|ρ| = 1`) the
+    /// trailing diagonal pins while that component's own variance (row `i` of
+    /// `ΛΛ′`) stays positive, so read variances from `varcorr`, never from this
+    /// flag.
+    ///
+    /// The flag means that because the pin loop is followed by a Σ-preserving
+    /// re-factorization of each pinned RE block
     /// (`crate::lmm::canonicalize_pinned_blocks`): the reported Λ is the
     /// canonical lower Cholesky of Σ̂, so a pinned diagonal's whole column is
     /// exactly zero and the variance that used to sit below it has been folded
     /// into a trailing diagonal. Without that, a zero θ diagonal on a `q ≥ 2`
-    /// block could sit above a live off-diagonal and name a component whose
-    /// standard deviation is not zero.
+    /// block could sit above a live off-diagonal and flag a direction in which
+    /// Σ̂ still varies.
     ///
     /// **Exception: AGQ (`nagq > 1`).** The flags come from the same canonical
     /// form, but the fit reports the search's own Λ, because the vector AGQ
@@ -372,6 +380,20 @@ pub struct Diagnostics {
     /// Solver observations that are not one of the fixed channels above. Empty
     /// on a clean fit, and empty allocates nothing.
     pub notes: Vec<Note>,
+    /// Gradient evaluations the BFGS θ search made, on the LMM and GLMM routes
+    /// that search with it (listed on [`Note::GradientSearchFallback`]).
+    /// [`Fit::n_eval`] does not count them, because a gradient reuses its
+    /// point's value evaluation. 0 on every fit that ran no gradient search.
+    /// This field and the two below describe the BFGS search even when BOBYQA
+    /// finished the fit after it.
+    pub n_grad: usize,
+    /// Why the BFGS θ search stopped; `None` on every fit that ran no gradient
+    /// search.
+    pub outer_stop: Option<OuterStop>,
+    /// The BFGS decrement `½·gᵀHg` at the search's endpoint (deviance units),
+    /// the quasi-Newton estimate of the decrease left. NaN on every fit that
+    /// ran no gradient search.
+    pub outer_decrement: f64,
 }
 
 /// Where the accepted θ sits in its parameter space.
@@ -485,6 +507,13 @@ pub enum Note {
     /// `ExactProfile` (`Joint` and `PqlThenJoint` have no fallback of their
     /// own).
     ExactProfileFallback,
+    /// The gradient search (BFGS: LMMs whose random slopes are all on one
+    /// grouping; binomial and Poisson Laplace GLMMs with at least two θ on the
+    /// blocked or structured layout) did not converge, so BOBYQA, the
+    /// derivative-free search every other model uses, continued from the best
+    /// point it had reached, with its own full evaluation budget. The reported
+    /// estimates and `converged` are that search's. `n_eval` counts both.
+    GradientSearchFallback,
     /// A GLMM search reached its endpoint, but no fixed-effect covariance could
     /// be formed there: the β information (the Rx Schur complement, and under
     /// `WaldSe::Hessian` the joint Hessian before it) is not positive definite
@@ -571,6 +600,9 @@ impl Diagnostics {
             },
             pinned: vec![],
             notes: vec![],
+            n_grad: 0,
+            outer_stop: None,
+            outer_decrement: f64::NAN,
         }
     }
 }
@@ -904,14 +936,16 @@ pub fn fit_cold(
 /// [`StartValues`] warm start. `Some` warm-starts the optimizer;
 /// `None` cold-starts (byte-identical to `fit_cold`). One fit, one answer — the
 /// start only shortens the path. The start threads `beta`+`theta` into the
-/// LMM/GLMM kernels; fixed-only (OLS/GLM) and the NB global-θ search ignore it
-/// (see [`crate::StartValues`]).
+/// LMM/GLMM kernels, and `dispersion` into the negative-binomial shape search
+/// (GLM and GLMM) and the Gamma GLMM's `ln φ` coordinate; the other fixed-only
+/// (OLS/GLM) fits ignore it (see [`crate::StartValues`]).
 ///
 /// # Panics
 ///
 /// As [`fit_cold`], plus: with `start = Some`, `start.beta.len()` outside
-/// `{0, p}` or `start.theta.len()` outside `{0, n_theta}` (the model's RE θ
-/// width) — a malformed stable input faults at the entry, not deep in a kernel.
+/// `{0, p}`, `start.theta.len()` outside `{0, n_theta}` (the model's RE θ
+/// width), or a `start.dispersion` that is not finite and `> 0` — a malformed
+/// stable input faults at the entry, not deep in a kernel.
 /// Either field may be left empty to cold-start that component alone
 /// (see [`crate::StartValues`]).
 ///
@@ -934,7 +968,7 @@ pub fn fit_cold(
 ///     }),
 /// };
 /// let ids = GroupIds { primary: vec![0, 1, 2, 0, 1, 2], extra: vec![] };
-/// let start = StartValues { beta: vec![0.0], theta: vec![1.0] };
+/// let start = StartValues { beta: vec![0.0], theta: vec![1.0], dispersion: None };
 /// let fit = fit_warm(&x, &y, 6, 1, &model, &ids, Some(&start), &FitOptions::default());
 /// assert_eq!(fit.beta.len(), 1);
 /// ```
@@ -973,6 +1007,10 @@ pub fn fit_warm(
             s.theta.is_empty() || s.theta.len() == n_theta,
             "StartValues.theta must have n_theta elements for this RE structure, \
              or be empty to cold-start θ"
+        );
+        assert!(
+            s.dispersion.is_none_or(|d| d.is_finite() && d > 0.0),
+            "StartValues.dispersion must be finite and > 0, or None to cold-start it"
         );
     }
     // Prior weights: shape/finiteness check at the boundary, not deep in a kernel.
@@ -1194,6 +1232,7 @@ pub use common::spec_sized_from_ids_pub;
 // through `Fit`, never directly.
 #[cfg(feature = "loop_advanced")]
 pub use common::FitDiagnostics;
+pub use common::OuterStop;
 pub(crate) use glm::{
     nb_count_groups, nb_profile_loglik, nb_saturated_loglik_grouped, NB_THETA_HI, NB_THETA_LO,
 };
@@ -1214,7 +1253,7 @@ pub(crate) use glmm::fit_glmm_packed;
 pub(crate) use lmm::{fit_mle_noz_pub, fit_mle_sparse_pub};
 // Unified fit-core surface for the loop tier.
 #[cfg(feature = "loop_advanced")]
-pub use core::{build_workspace, fit_on, FitView, FitWorkspace};
+pub use core::{build_workspace, curvature_hint, fit_on, fit_on_hinted, FitView, FitWorkspace};
 
 // `pub(crate)` only so `src/sparse/tests.rs` can reach the shared Tier 1 pin
 // bands; the module is `cfg(test)` either way.

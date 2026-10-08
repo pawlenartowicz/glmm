@@ -61,7 +61,8 @@ Points worth knowing at this layer:
 - `fit.converged() == false` signals a numerical failure (not a panic); check
   it before trusting `beta`/`se`. It reads `fit.diagnostics.converged` —
   everything the fit reports about *itself* (convergence, singularity, the
-  aliased-column mask, the θ boundary state, and any solver notes) lives on
+  aliased-column mask, the θ boundary state, any solver notes, and how the
+  gradient search ended: `n_grad`, `outer_stop`, `outer_decrement`) lives on
   `fit.diagnostics`, with `converged()`/`singular()`/`aliased()` kept as
   forwarding accessors for the three most-read ones.
 - **Experimental: in-fit parallelism.** Building with the `parallel` cargo
@@ -100,7 +101,7 @@ use glmm::{fit_warm, StartValues};
 let fit1 = fit_warm(&x, &y, n, p, &model, &ids, None, &opts);
 
 // ...data changes slightly (new resample, new batch, refit)...
-let start = StartValues { beta: fit1.beta.clone(), theta: vec![/* n_theta values from the model's RE structure */] };
+let start = StartValues { beta: fit1.beta.clone(), theta: vec![/* n_theta values from the model's RE structure */], dispersion: None };
 let fit2 = fit_warm(&x2, &y2, n, p, &model, &ids, Some(&start), &opts);
 ```
 

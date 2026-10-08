@@ -114,7 +114,12 @@ const EXP_ARG_CEIL: f64 = 700.0;
 pub(crate) const FUSED_DEFAULT: bool = cfg!(not(target_arch = "wasm32"));
 
 #[inline(always)]
-fn fmadd<S: Simd, const FUSED: bool>(simd: S, a: S::f64s, b: S::f64s, c: S::f64s) -> S::f64s {
+pub(crate) fn fmadd<S: Simd, const FUSED: bool>(
+    simd: S,
+    a: S::f64s,
+    b: S::f64s,
+    c: S::f64s,
+) -> S::f64s {
     if FUSED {
         simd.mul_add_f64s(a, b, c)
     } else {
@@ -123,7 +128,7 @@ fn fmadd<S: Simd, const FUSED: bool>(simd: S, a: S::f64s, b: S::f64s, c: S::f64s
 }
 
 #[inline(always)]
-fn fmadd_scalar<const FUSED: bool>(a: f64, b: f64, c: f64) -> f64 {
+pub(crate) fn fmadd_scalar<const FUSED: bool>(a: f64, b: f64, c: f64) -> f64 {
     if FUSED {
         a.mul_add(b, c)
     } else {
@@ -1109,6 +1114,94 @@ fn scalar_probit<const FUSED: bool>(eta: f64) -> (f64, f64) {
     (mu, dmu)
 }
 
+/// Largest `|x|` [`ln_phi_fill`] serves: `|x|/√2` stays inside [`simd_erfc`]'s
+/// certified `√700 ≈ 26.45` with margin (at 37, `Φ(−37) ≈ 6e-300`, still a
+/// normal double). Callers send rows that can reach past it to the scalar
+/// `family` path.
+pub(crate) const LN_PHI_X_MAX: f64 = 37.0;
+
+/// Relative error bound of [`ln_phi_fill`] against `family::probit_side`
+/// over `|x| ≤ LN_PHI_X_MAX`, pinned by `ln_phi_fill_matches_probit_side`:
+/// measured 6.5e-16 (about 3 ULP, at x ≈ 8.5) on 2026-10-07, pinned at 1.5e-15.
+#[cfg(test)]
+const LN_PHI_REL_BOUND: f64 = 1.5e-15;
+
+/// First half of [`ln_phi_fill`]: `q = Φ(−|x|) = ½·erfc(|x|/√2)` from one
+/// branch-free [`simd_erfc`], then `buf ← q` where `x ≤ 0` and `buf ← 1 − q`
+/// where `x > 0` (the argument of the `ln`), and `nq ← −q` where `x > 0`, `0`
+/// elsewhere (the `log1p` correction's input). The tail runs the
+/// [`scalar_erfc_blend`] twin op-for-op, so head and tail agree to the bit.
+struct LnPhiArgOp<'a, const FUSED: bool> {
+    buf: &'a mut [f64],
+    nq: &'a mut [f64],
+}
+impl<const FUSED: bool> pulp::WithSimd for LnPhiArgOp<'_, FUSED> {
+    type Output = ();
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) {
+        let n = self.buf.len();
+        let (head, tail) = S::as_mut_simd_f64s(self.buf);
+        let (nq_head, nq_tail) = S::as_mut_simd_f64s(&mut self.nq[..n]);
+        let zero = simd.splat_f64s(0.0);
+        for (v, nqv) in head.iter_mut().zip(nq_head.iter_mut()) {
+            let x = *v;
+            let a = simd.mul_f64s(
+                simd.abs_f64s(x),
+                simd.splat_f64s(std::f64::consts::FRAC_1_SQRT_2),
+            );
+            let q = simd.mul_f64s(simd.splat_f64s(0.5), simd_erfc::<S, FUSED>(simd, a));
+            let pos = simd.less_than_f64s(zero, x);
+            *v = simd.select_f64s(pos, simd.sub_f64s(simd.splat_f64s(1.0), q), q);
+            *nqv = simd.select_f64s(pos, simd.neg_f64s(q), zero);
+        }
+        for (v, nqv) in tail.iter_mut().zip(nq_tail.iter_mut()) {
+            let x = *v;
+            let q = 0.5 * scalar_erfc_blend::<FUSED>(x.abs() * std::f64::consts::FRAC_1_SQRT_2);
+            if 0.0 < x {
+                *v = 1.0 - q;
+                *nqv = -q;
+            } else {
+                *v = q;
+                *nqv = 0.0;
+            }
+        }
+    }
+}
+
+/// In-place `buf[i] = ln Φ(buf[i])` for `|buf[i]| ≤` [`LN_PHI_X_MAX`], with
+/// `nq` (at least `buf.len()` long) as scratch. Relative-accurate on both
+/// sides, as `family::probit_side`'s `ln Φ` is:
+///
+/// - `x ≤ 0`: `ln q` with `q = Φ(x) = ½·erfc(|x|/√2)` from [`simd_erfc`]
+///   (within 5 ULP of Cody, `erfc_blend_accuracy_and_head_tail_identity`)
+///   and [`ln_pos_fill`] (within 2 ULP of libm);
+/// - `x > 0`: `log1p(−q)` with `q = Φ(−x)`, as `ln(u)·(−q)/(u − 1)` on the
+///   rounded `u = 1 − q` (Goldberg 1991, "What every computer scientist should
+///   know about floating-point arithmetic", Theorem 4; `agq_fast`'s
+///   `log1p_tile` takes `log1p` the same way), and `−q` itself where `u`
+///   rounds to 1. So `ln Φ(x) ≈ −q` keeps its relative precision where `Φ`
+///   is near 1, rather than the absolute precision `ln(1 − q)` alone has.
+///
+/// Measured against `probit_side` over the whole range
+/// (`ln_phi_fill_matches_probit_side`): see that test for the pinned bound.
+/// Elementwise, SIMD head and scalar tail bit-identical, so a value does not
+/// depend on its position in the buffer. Past `LN_PHI_X_MAX` the result is
+/// finite but not certified.
+pub(crate) fn ln_phi_fill(buf: &mut [f64], nq: &mut [f64]) {
+    let n = buf.len();
+    pulp::Arch::new().dispatch(LnPhiArgOp::<{ FUSED_DEFAULT }> {
+        buf: &mut *buf,
+        nq: &mut nq[..n],
+    });
+    ln_pos_fill(buf);
+    for (v, &m) in buf.iter_mut().zip(&nq[..n]) {
+        if m < 0.0 {
+            let u = 1.0 + m;
+            *v = if u != 1.0 { *v * m / (u - 1.0) } else { m };
+        }
+    }
+}
+
 /// Sigmoid on the owned `exp`, without the fused `(w, log1pexp)` companions —
 /// the weighted-logit arm needs μ alone (its deviance goes through
 /// `family::dev_resid`, not the `Σ log1pexp − Σ y·η` identity the unweighted
@@ -1251,10 +1344,11 @@ pub(crate) fn family_pass(
         }
     }
     // Deviance fold off the filled μ (and η on a tail row). For every family
-    // but NB (below), kept scalar and in `family::dev_resid_at`'s exact form:
-    // its `ln`s are outside this module's restricted-domain `ln` (arguments
-    // run over `y/μ` on the whole positive line), and holding the deviance
-    // arithmetic fixed keeps this kernel's movement confined to μ.
+    // but NB and the binomial (below), kept scalar and in
+    // `family::dev_resid_at`'s exact form: its `ln`s are outside this module's
+    // restricted-domain `ln` (arguments run over `y/μ` on the whole positive
+    // line), and holding the deviance arithmetic fixed keeps this kernel's
+    // movement confined to μ.
     let mut dev = 0.0;
     if let Family::NegativeBinomial { .. } = family {
         // NB: `family::dev_resid`'s expression
@@ -1327,11 +1421,102 @@ pub(crate) fn family_pass(
         let dev = if nan_mu { f64::NAN } else { dev };
         return (dev, infeasible || out_of_range);
     }
+    if let Family::Binomial { .. } = family {
+        return (
+            binomial_dev_fold(family, eta, y, prior_w, prob),
+            infeasible || out_of_range,
+        );
+    }
     for i in 0..n {
         let pw = if prior_w.is_empty() { 1.0 } else { prior_w[i] };
         dev += pw * crate::family::dev_resid_at(family, nb_theta, y[i], eta[i], prob[i]);
     }
     (dev, infeasible || out_of_range)
+}
+
+/// The binomial deviance fold of [`family_pass`] (probit, cloglog, and
+/// weighted logit; unweighted logit takes the fused kernel): `family::dev_resid`'s
+/// `2[y·ln(y/μ) + (1−y)·ln((1−y)/(1−μ))]` with both logs taken as
+/// `family::ln_ratio` takes them (mirrors it, change together), `ln_1p` of
+/// `(y − μ)/μ` and of `−(y − μ)/(1 − μ)` unless the ratio is under ½, where it
+/// is the difference of two logs. The `ln_1p`s are batched through
+/// [`ln_pos_fill`] a chunk of rows at a time, as `ln(u)·r/(u − 1)` on the
+/// rounded `u = 1 + r`, which is `ln_1p(r)` to the precision of `ln(u)`
+/// (Goldberg 1991, Theorem 4), the NB fold's form above. A tail row
+/// (`family::in_tail`) takes `family::dev_resid_at`'s η form, scalar, and every
+/// row is folded in row order, so only the `ln`s' last bits move. A NaN μ is
+/// caught here, as in the NB fold, since `ln_pos_fill` maps it to a finite
+/// value.
+fn binomial_dev_fold(family: Family, eta: &[f64], y: &[f64], prior_w: &[f64], prob: &[f64]) -> f64 {
+    const CH: usize = 64;
+    let n = y.len();
+    let mut r1 = [0.0f64; CH];
+    let mut r2 = [0.0f64; CH];
+    let mut l1 = [0.0f64; CH];
+    let mut l2 = [0.0f64; CH];
+    let mut dev = 0.0;
+    let mut nan_mu = false;
+    let ln_1p = |r: f64, ln_u: f64| {
+        let u = 1.0 + r;
+        if u == 1.0 {
+            r
+        } else {
+            ln_u * r / (u - 1.0)
+        }
+    };
+    let mut start = 0;
+    while start < n {
+        let end = (start + CH).min(n);
+        let len = end - start;
+        for j in 0..len {
+            let i = start + j;
+            let mu = prob[i];
+            nan_mu |= mu.is_nan();
+            let d = y[i] - mu;
+            r1[j] = d / mu;
+            r2[j] = -d / (1.0 - mu);
+            l1[j] = 1.0 + r1[j];
+            l2[j] = 1.0 + r2[j];
+        }
+        ln_pos_fill(&mut l1[..len]);
+        ln_pos_fill(&mut l2[..len]);
+        for j in 0..len {
+            let i = start + j;
+            let pw = if prior_w.is_empty() { 1.0 } else { prior_w[i] };
+            let (yi, mu) = (y[i], prob[i]);
+            let di = if crate::family::in_tail(family, eta[i], mu) {
+                crate::family::dev_resid_at(family, f64::NAN, yi, eta[i], mu)
+            } else {
+                let a = if yi > 0.0 {
+                    yi * if yi >= 0.5 * mu {
+                        ln_1p(r1[j], l1[j])
+                    } else {
+                        yi.ln() - mu.ln()
+                    }
+                } else {
+                    0.0
+                };
+                let b = if yi < 1.0 {
+                    let (yc, mc) = (1.0 - yi, 1.0 - mu);
+                    yc * if yc >= 0.5 * mc {
+                        ln_1p(r2[j], l2[j])
+                    } else {
+                        yc.ln() - mc.ln()
+                    }
+                } else {
+                    0.0
+                };
+                2.0 * (a + b)
+            };
+            dev += pw * di;
+        }
+        start = end;
+    }
+    if nan_mu {
+        f64::NAN
+    } else {
+        dev
+    }
 }
 
 /// In-place `buf[i] = erfc(buf[i])` through the blend kernel — SIMD head +
@@ -2453,5 +2638,135 @@ mod tests {
         assert_eq!(p[0], 1.0);
         assert_eq!(w[0], crate::glm::WEIGHT_CLAMP);
         assert!(sum.is_infinite() && sum > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod ln_phi_tests {
+    use super::*;
+
+    /// `ln_phi_fill` against `family::probit_side`'s `ln Φ` (Cody `erfc`, the
+    /// asymptotic form past `x = −4√2`, `ln_1p(−Φ(−x))` on `x ≥ 0`) over the
+    /// whole served range `[−37, 37]`, both `erfc` seams (`|x|/√2` = 0.46875
+    /// and 4) and `probit_side`'s own seam at `−4√2`, as relative error; and
+    /// the SIMD head against the scalar tail (one-element calls are all tail)
+    /// to the bit.
+    #[test]
+    fn ln_phi_fill_matches_probit_side() {
+        let n = 200_001usize;
+        let mut xs: Vec<f64> = (0..n)
+            .map(|k| -LN_PHI_X_MAX + 2.0 * LN_PHI_X_MAX * k as f64 / (n - 1) as f64)
+            .collect();
+        let r2 = std::f64::consts::SQRT_2;
+        for c in [0.46875 * r2, 4.0 * r2, 0.0, 1e-300, 1e-17, 1e-8, 36.999] {
+            for d in [-1e-12, 0.0, 1e-12] {
+                xs.push(c + d);
+                xs.push(-(c + d));
+            }
+        }
+        let mut buf = xs.clone();
+        let mut nq = vec![0.0; buf.len()];
+        ln_phi_fill(&mut buf, &mut nq);
+        let mut worst = 0.0f64;
+        let mut worst_x = 0.0;
+        for (&x, &got) in xs.iter().zip(&buf) {
+            let want = crate::family::probit_side(x).0;
+            let rel = (got - want).abs() / want.abs().max(f64::MIN_POSITIVE);
+            if rel > worst {
+                worst = rel;
+                worst_x = x;
+            }
+        }
+        eprintln!("ln_phi_fill: worst relative error {worst:e} at x = {worst_x}");
+        assert!(
+            worst <= LN_PHI_REL_BOUND,
+            "ln_phi_fill off by {worst:e} at x = {worst_x}"
+        );
+        for (k, &x) in xs.iter().enumerate() {
+            let mut one = [x];
+            let mut nq1 = [0.0];
+            ln_phi_fill(&mut one, &mut nq1);
+            assert_eq!(
+                one[0].to_bits(),
+                buf[k].to_bits(),
+                "head and tail differ at x = {x}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod binomial_fold_tests {
+    use crate::spec::{BinomialLink, Family};
+
+    /// The binomial deviance fold against `family::dev_resid_at` row by row
+    /// (probit, cloglog and logit; η over both tails; y = 0, 1 and a
+    /// proportion), its weighted sum against the scalar sum, and a NaN μ. The
+    /// per-row bounds are about 4x the maxima measured 2026-10-07 on x86
+    /// (absolute 1.4e-14; relative 2.1e-13 on rows with d > 1e-6): a row's
+    /// deviance runs to 0 at y = μ, where its error is the `ln`'s ULP times a
+    /// term of order |y − μ|, not of d.
+    #[test]
+    fn binomial_dev_fold_matches_dev_resid_at() {
+        let (mut worst_abs, mut worst_big) = (0.0f64, 0.0f64);
+        for link in [
+            BinomialLink::Probit,
+            BinomialLink::Cloglog,
+            BinomialLink::Logit,
+        ] {
+            let fam = Family::Binomial { link };
+            let mut eta = Vec::new();
+            let mut e = -12.0;
+            while e <= 12.0 {
+                eta.push(crate::family::clamp_eta(fam, e));
+                e += 0.000_917;
+            }
+            let prob: Vec<f64> = eta
+                .iter()
+                .map(|&e| crate::family::link_inv(fam, e))
+                .collect();
+            let n = eta.len();
+            for yv in [0.0, 1.0, 0.3, 0.999] {
+                let y = vec![yv; n];
+                let pw: Vec<f64> = (0..n).map(|i| 1.0 + (i % 7) as f64 * 0.25).collect();
+                for i in 0..n {
+                    let a = super::binomial_dev_fold(
+                        fam,
+                        &eta[i..i + 1],
+                        &y[i..i + 1],
+                        &[],
+                        &prob[i..i + 1],
+                    );
+                    let b = crate::family::dev_resid_at(fam, f64::NAN, yv, eta[i], prob[i]);
+                    if crate::family::in_tail(fam, eta[i], prob[i]) {
+                        assert_eq!(a.to_bits(), b.to_bits(), "{link:?} tail row η = {}", eta[i]);
+                    }
+                    worst_abs = worst_abs.max((a - b).abs());
+                    if b.abs() > 1e-6 {
+                        worst_big = worst_big.max((a - b).abs() / b.abs());
+                    }
+                }
+                let sum = super::binomial_dev_fold(fam, &eta, &y, &pw, &prob);
+                let want: f64 = (0..n)
+                    .map(|i| {
+                        pw[i] * crate::family::dev_resid_at(fam, f64::NAN, yv, eta[i], prob[i])
+                    })
+                    .sum();
+                assert!(
+                    (sum - want).abs() <= 1e-12 * want.abs().max(1.0),
+                    "{link:?} y={yv}: {sum} vs {want}"
+                );
+            }
+        }
+        eprintln!(
+            "binomial fold vs dev_resid_at: abs {worst_abs:.3e}, rel(d > 1e-6) {worst_big:.3e}"
+        );
+        assert!(worst_abs <= 6e-14, "fold abs {worst_abs:e}");
+        assert!(worst_big <= 1e-12, "fold rel {worst_big:e}");
+        let fam = Family::Binomial {
+            link: BinomialLink::Probit,
+        };
+        let d = super::binomial_dev_fold(fam, &[0.0, 0.1], &[1.0, 0.0], &[], &[0.5, f64::NAN]);
+        assert!(d.is_nan());
     }
 }

@@ -101,7 +101,8 @@ main <- function() {
   runs <- setNames(lapply(ORACLES, function(o) {
     if (is.null(V)) return(NULL)
     required <- names(Filter(function(cl) o %in% cl[["oracles"]], manifest_cells))
-    safe(newest_oracle_run(GRID, o, V[[o]], required), o)
+    safe(reclassify_capped_oracle(newest_oracle_run(GRID, o, V[[o]], required),
+                                  o, manifest_cells), o)
   }), ORACLES)
 
   # ── view 1: accuracy vs each oracle ────────────────────────────────────────

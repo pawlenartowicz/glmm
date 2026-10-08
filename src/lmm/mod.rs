@@ -36,11 +36,15 @@ use crate::scalar::Scalar;
 use crate::standardize::ColumnScaling;
 
 mod kernel;
+pub(crate) mod pg_grad;
 mod re_map;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use kernel::{precompute_balanced_collapse, DesignQr, GRAM_PIVOT_MIN};
+pub(crate) use kernel::{
+    group_regression_shape, precompute_balanced_collapse, precompute_group_regressions, DesignQr,
+    GRAM_PIVOT_MIN,
+};
 pub use kernel::{reml_deviance, LmmSuffStats};
 use re_map::{pack_vech, refactor, PivotFloor};
 
@@ -262,6 +266,11 @@ pub(crate) fn max_fun_override(n: usize) -> Option<usize> {
 /// changing its defaults cannot silently move this fit path.
 pub(crate) fn apply_campaign_overrides(config: &mut Config, n: usize) {
     config.max_fun = 1000 * n;
+    // Off: at the full `npt = (n+1)(n+2)/2` (every one-dimensional search) PRIMA's
+    // RESCUE test is decided by rounding alone and spends evaluations; Powell's
+    // original factor does not. On the accuracy grid's one-θ cells: 15% fewer
+    // evaluations, deviance equal to round-off. Other `npt` values are unaffected.
+    config.prima_parity = false;
     if let Some(npt) = npt_override(n) {
         config.npt = npt;
     }
@@ -629,63 +638,85 @@ impl LmmGroupings {
 // LmmFitScratch
 // ---------------------------------------------------------------------------
 
-/// Per-fit scratch, allocated once per (p, max_clusters). `T` is the kernel
-/// scalar. Every fit runs at `f64`; the scratch and [`reml_deviance`] stay
-/// generic so the deviance can also be evaluated at a dual-number `T` for exact
-/// θ-derivatives. Fields that stay `f64` say why at their own doc.
-pub struct LmmFitScratch<T = f64> {
+/// Per-fit scratch, allocated once per (p, max_clusters). All `f64`: the LMM
+/// deviance is evaluated at `f64` only (its θ-gradient on the per-group
+/// regression route is the closed form in [`pg_grad`]); the dual-number
+/// derivatives of the GLMM path live in `src/glmm/`.
+pub struct LmmFitScratch {
     /// Row-major w×w family block (w = q_p + n_per) — assembled and
     /// Crout-factored in place per family; rows contiguous for the Crout.
-    pub fam_a: Vec<T>,
+    pub fam_a: Vec<f64>,
     /// Stacked forward-solved family couplings, t_dim × W_tot column-major
     /// (W_tot = n_primary·w): column f·w+r is family f's L_f⁻¹B_f row r,
     /// contiguous. Filled and solved per family, consumed by ONE triangular
     /// GEMM downdate after the family loop — the per-family tail re-traversals
     /// are gone.
-    pub bt: Vec<T>,
+    pub bt: Vec<f64>,
     /// (k_crossed+m)² tail [[H, B_x],[B_xᵀ, C]] over [crossed | X y],
     /// column-major lower triangle (entry (i,j) at j·t_dim+i); GEMM-downdated
     /// once per eval, then factored out-of-place into `tail_l` below.
-    pub tail: Vec<T>,
+    pub tail: Vec<f64>,
     /// Out-of-place `chol_lower` output for `tail` (`t_dim²`, same layout):
     /// `tail` must survive UNFACTORED for `recover_ranef_family`, which
     /// re-factors it at θ̂ (see that function's doc for the contract).
-    pub tail_l: Vec<T>,
+    pub tail_l: Vec<f64>,
     /// λ per local crossed column (θ of the owning factor), refreshed per eval.
-    pub lam_x: Vec<T>,
+    pub lam_x: Vec<f64>,
     /// q_p×q_p primary-slope scratch (row-major), refreshed per eval/family: the
     /// lower-tri Λ_p and the per-level Gram G_f. Empty on the q_p=1 path. Kept in
     /// scratch so the deviance hot loop stays zero-alloc (the warm-path invariant).
-    pub prim_lam: Vec<T>,
-    pub prim_gram: Vec<T>,
+    pub prim_lam: Vec<f64>,
+    pub prim_gram: Vec<f64>,
     /// Balanced-collapse Grams: pair-major r ≤ r′ blocks, w(w+1)/2 of
     /// them, each a FULL t_dim×t_dim column-major G_rr′ = Σ_f raw_r(f)·raw_r′(f)ᵀ
     /// over the active balanced prefix — θ-independent, refreshed once per fit
     /// by `precompute_balanced_collapse`. Empty on the slope path (collapse
-    /// never applies there). Stays `f64`: θ-independent.
+    /// never applies there).
     pub fam_gram: Vec<f64>,
     /// `w·t_dim` staging buffer for `precompute_balanced_collapse`'s per-family
-    /// raw rows — its own field so that θ-independent precompute stops
-    /// borrowing the now-`T` `bt` (which is per-eval scratch).
+    /// raw rows, its own field so the θ-independent precompute does not borrow
+    /// the per-eval `bt`.
     pub collapse_stage: Vec<f64>,
     /// t_dim² combine scratch for the collapse downdate (lower triangle used);
     /// its first w slots double as the A⁻¹ forward-solve temp.
-    pub comb: Vec<T>,
+    pub comb: Vec<f64>,
     /// w×w row-major A(θ)⁻¹, rebuilt per eval on the collapse path.
-    pub a_inv: Vec<T>,
+    pub a_inv: Vec<f64>,
     /// Active balanced families (prefix length). 0 = collapse off → the
     /// per-family loop runs (the fallback and the pre-F behaviour).
     pub collapse_n_active: usize,
-    /// `Dual<N>`'s `syrk_lower_sub` lane-decomposition buffers, laid out
-    /// `[B0 (t_dim·w_tot) | B_k (t_dim·w_tot) | tail lane (t_dim²)]`. Stays
-    /// `f64` — the decomposition works one lane at a time, on `f64` planes cut
-    /// out of the dual array. EMPTY at `T = f64`, which ignores the argument
-    /// and goes straight to one faer triangular GEMM. `HyperDual` also ignores
-    /// it — it takes the generic triple loop — but is still sized under the
-    /// one `IS_F64` predicate below: 15 MB on the largest LMM hyper-dual shape
-    /// against the 330 MB the rest of this scratch already is, and one
-    /// predicate is worth more than the byte.
-    pub syrk_scratch: Vec<f64>,
+    /// Per-group regression route (`precompute_group_regressions`): for each
+    /// active group, `B_g = G_g⁻¹` as a row-major `q×q` block (lower triangle
+    /// read), `q_p²` per group. Empty unless the shape can take the route
+    /// (random slopes on the primary grouping, nothing else). θ-independent,
+    /// refreshed once per fit.
+    pub pg_b: Vec<f64>,
+    /// Per active group, `A_g = G_g⁻¹ Z_g′[X̃ y]` as `q` contiguous `m`-long
+    /// rows (the layout [`fam_forward_solve`] reads). Same lifetime as `pg_b`.
+    pub pg_a: Vec<f64>,
+    /// `m×m` column-major lower triangle of `P₀ = Σ_g [X̃ y]_g′(I − H_g)[X̃ y]_g`,
+    /// the within-group residual cross-products (`H_g` the hat matrix of
+    /// `Z_g`): the θ-free part of the tail. Same lifetime as `pg_b`.
+    pub pg_p0: Vec<f64>,
+    /// `Σ_g ln|L_g|` over the active groups, `G_g = L_g L_g′`: half of the
+    /// θ-free `Σ_g ln|G_g|` term of `ln|V|`.
+    pub pg_log_g_half: f64,
+    /// Groups the route iterates (non-empty levels). 0 = route off: the
+    /// family loop runs.
+    pub pg_n_active: usize,
+    /// `q×q` row-major `D = ΛΛ′`, rebuilt once per evaluation on the route.
+    pub pg_d: Vec<f64>,
+    /// Per active group, `L_g = chol(D + B_g)` (row-major lower, `q²`), kept by
+    /// the value pass for the θ-gradient ([`pg_grad::pg_gradient`]). Same
+    /// sizing as `pg_b`.
+    pub pg_l: Vec<f64>,
+    /// The gradient's stacked-solve block, `p × q·PG_GRAD_BLOCK` column-major
+    /// (`N_gᵀ` for one block of groups), and its `m_g = M_g e` entries.
+    pub pg_nt: Vec<f64>,
+    /// See `pg_nt`.
+    pub pg_mv: Vec<f64>,
+    /// `β̂` off the border factor, `p` entries, for the gradient.
+    pub pg_beta: Vec<f64>,
     /// m×m trailing block of the tail factor — identical semantics to the
     /// augmented [X y] factor; every recovery step reads only this.
     pub factor: Mat<f64>,
@@ -706,7 +737,7 @@ pub struct LmmFitScratch<T = f64> {
     /// entry is overwritten before it is read, so no per-fit reset is needed.
     pub ranef_ux: Vec<f64>,
     pub ranef_rhs: Vec<f64>,
-    pub sigma_sq: T,
+    pub sigma_sq: f64,
     // --- crossed/nested-slopes blocked path (`reml_deviance_blocked`) ---
     // All empty unless `extra_slopes_any`; sized once here so the blocked warm
     // path stays zero-alloc. `k = k_total`, `dim = k + m`.
@@ -726,7 +757,7 @@ pub struct LmmFitScratch<T = f64> {
     pub blocked_l: Vec<f64>,
 }
 
-impl<T: Scalar> LmmFitScratch<T> {
+impl LmmFitScratch {
     pub fn with_groupings(p: usize, g: &LmmGroupings) -> Self {
         let m = p + 1;
         let w = g.primary_q + g.nested_per_parent; // q_p primary cols + nested children
@@ -749,41 +780,51 @@ impl<T: Scalar> LmmFitScratch<T> {
             0
         };
         let blocked_dim = if g.extra_slopes_any { g.k_total + m } else { 0 };
+        // Per-group regression scratch only on the shape that route admits.
+        let pg_groups = if group_regression_shape(g) {
+            g.n_primary
+        } else {
+            0
+        };
+        let pg_q = if pg_groups > 0 { g.primary_q } else { 0 };
         LmmFitScratch {
-            fam_a: vec![T::ZERO; w * w],
-            bt: vec![T::ZERO; g.n_primary * w * t_dim],
-            tail: vec![T::ZERO; t_dim * t_dim],
-            tail_l: vec![T::ZERO; t_dim * t_dim],
-            lam_x: vec![T::ZERO; g.k_crossed()],
-            prim_lam: vec![T::ZERO; q2],
-            prim_gram: vec![T::ZERO; q2],
+            fam_a: vec![0.0; w * w],
+            bt: vec![0.0; g.n_primary * w * t_dim],
+            tail: vec![0.0; t_dim * t_dim],
+            tail_l: vec![0.0; t_dim * t_dim],
+            lam_x: vec![0.0; g.k_crossed()],
+            prim_lam: vec![0.0; q2],
+            prim_gram: vec![0.0; q2],
             fam_gram: vec![0.0; npairs * t_dim * t_dim],
             collapse_stage: vec![0.0; w * t_dim],
             // max(t_dim², w): the first w slots double as the A⁻¹ forward-solve
             // temp, and deep nesting can push w past t_dim² (tiny p, large n_per).
             comb: vec![
-                T::ZERO;
+                0.0;
                 if npairs > 0 {
                     (t_dim * t_dim).max(w)
                 } else {
                     0
                 }
             ],
-            a_inv: vec![T::ZERO; if npairs > 0 { w * w } else { 0 }],
+            a_inv: vec![0.0; if npairs > 0 { w * w } else { 0 }],
             collapse_n_active: 0,
-            // `Dual`'s syrk route is the only consumer; sizing it at `f64` would
-            // add a 15 MB buffer to every LMM fit for nothing.
-            syrk_scratch: if T::IS_F64 {
-                Vec::new()
-            } else {
-                vec![0.0; 2 * g.n_primary * w * t_dim + t_dim * t_dim]
-            },
+            pg_b: vec![0.0; pg_groups * pg_q * pg_q],
+            pg_a: vec![0.0; pg_groups * pg_q * m],
+            pg_p0: vec![0.0; if pg_groups > 0 { m * m } else { 0 }],
+            pg_log_g_half: 0.0,
+            pg_n_active: 0,
+            pg_d: vec![0.0; pg_q * pg_q],
+            pg_l: vec![0.0; pg_groups * pg_q * pg_q],
+            pg_nt: vec![0.0; p * pg_q * pg_groups.min(pg_grad::PG_GRAD_BLOCK)],
+            pg_mv: vec![0.0; pg_q * pg_groups.min(pg_grad::PG_GRAD_BLOCK)],
+            pg_beta: vec![0.0; if pg_groups > 0 { p } else { 0 }],
             factor: Mat::zeros(m, m),
             ranef_u: vec![0.0; g.k_total],
             ranef_ok: false,
             ranef_ux: vec![0.0; g.k_crossed()],
             ranef_rhs: vec![0.0; w],
-            sigma_sq: T::from_f64(f64::NAN),
+            sigma_sq: f64::NAN,
             blocked_lam: vec![0.0; blocked_kk],
             blocked_g: vec![0.0; blocked_kk],
             blocked_tmp: vec![0.0; blocked_kk],
@@ -1022,6 +1063,9 @@ pub struct LmmWorkspace {
     pub(crate) solver_warm: Option<Bobyqa>,
     /// The blind-start solver's config, kept to build `solver_warm`.
     pub(crate) config: Config,
+    /// BFGS search buffers for the per-group route (sized on first use, reset
+    /// at the start of every search: nothing carries between fits).
+    pub(crate) bfgs: crate::optim::bfgs::BfgsState,
     /// θ in/out buffer for `minimize`; holds θ̂ (post-pin) after `fit_lmm`.
     pub theta: Vec<f64>,
     /// Lower box bound, −THETA_HI on every entry (`blind_theta_and_bounds`).
@@ -1125,6 +1169,7 @@ impl LmmWorkspace {
             solver: Bobyqa::new(n_theta, config)
                 .expect("BOBYQA config constants are valid by construction"),
             solver_warm: None,
+            bfgs: Default::default(),
             config,
             theta,
             lower,
@@ -1154,6 +1199,7 @@ impl LmmWorkspace {
             solver: Bobyqa::new(n_theta, bobyqa_config(n_theta))
                 .expect("BOBYQA config constants are valid by construction"),
             solver_warm: None,
+            bfgs: Default::default(),
             config: bobyqa_config(n_theta),
             theta,
             lower,
@@ -1225,8 +1271,11 @@ pub fn primary_lambda<T: Scalar>(theta: &[T], q: usize, lam: &mut [T]) {
 /// canonicalizes only a copy on its AGQ route, for the pin flags, and keeps the
 /// search's own Λ.
 ///
-/// `Diagnostics::pinned` depends on it: without this fold, a column with a
-/// live off-diagonal would be called a zero variance component.
+/// `Diagnostics::pinned` depends on it: without this fold, a pin flag could
+/// sit on a column with a live off-diagonal, a direction in which Σ still
+/// varies. With it, a pin flags a rank-deficient direction of Σ (zero variance
+/// conditional on the earlier components of the block), which is a zero
+/// variance component only when the rest of its row is zero too.
 ///
 /// `theta` is the kernel's θ, on the fitted design. Row scaling commutes with
 /// this factorization (`S·chol(Σ)` is lower triangular with the same zero
@@ -1388,25 +1437,19 @@ fn canonicalize_block(vech: &mut [f64], q: usize) -> bool {
 /// G[a][b]=Σ x_{a-1} x_{b-1} over f. The slope covariates are raw-`x` rows, so
 /// every entry sits in `s_raw`. Component d's RE col at level f is `d·n_primary + f`
 /// (mirrors `from_cluster_spec`'s RE-column layout — change together).
-fn primary_gram<T: Scalar>(
-    suff: &LmmSuffStats,
-    g: &LmmGroupings,
-    f: usize,
-    q: usize,
-    gram: &mut [T],
-) {
+fn primary_gram(suff: &LmmSuffStats, g: &LmmGroupings, f: usize, q: usize, gram: &mut [f64]) {
     let n_prim = g.n_primary;
     for v in gram[..q * q].iter_mut() {
-        *v = T::ZERO;
+        *v = 0.0;
     }
-    gram[0] = T::from_f64(suff.counts[f]); // G[0][0]
+    gram[0] = suff.counts[f]; // G[0][0]
     for a in 1..q {
-        let sa = T::from_f64(suff.s_raw[(g.primary_slope_cols[a - 1], f)]); // Σ z_{a-1} over f
+        let sa = suff.s_raw[(g.primary_slope_cols[a - 1], f)]; // Σ z_{a-1} over f
         gram[a] = sa;
         gram[a * q] = sa;
         for b in 1..=a {
             // Σ z_{a-1} z_{b-1} over f — slope_{a-1}'s subcol against slope_{b-1}'s level.
-            let v = T::from_f64(suff.s_raw[(g.primary_slope_cols[a - 1], b * n_prim + f)]);
+            let v = suff.s_raw[(g.primary_slope_cols[a - 1], b * n_prim + f)];
             gram[a * q + b] = v;
             gram[b * q + a] = v;
         }
@@ -1421,22 +1464,22 @@ fn primary_gram<T: Scalar>(
 /// loop made this O(q⁴)) — same d/e summation order, so bit-identical.
 /// Measured ~0 wall-clock change even at q=8 (sim_max_q_slope): the
 /// per-eval cost lives elsewhere; kept for the strictly-lower op count.
-fn assemble_primary_a<T: Scalar>(fam_a: &mut [T], stride: usize, lam: &[T], gram: &[T], q: usize) {
-    let mut m_r = [T::ZERO; MAX_PRIMARY_Q];
+fn assemble_primary_a(fam_a: &mut [f64], stride: usize, lam: &[f64], gram: &[f64], q: usize) {
+    let mut m_r = [0.0; MAX_PRIMARY_Q];
     for r in 0..q {
         for (e, m_re) in m_r.iter_mut().enumerate().take(q) {
-            let mut acc = T::ZERO;
+            let mut acc = 0.0;
             for d in r..q {
                 acc += lam[d * q + r] * gram[d * q + e];
             }
             *m_re = acc;
         }
         for c in 0..=r {
-            let mut s = T::ZERO;
+            let mut s = 0.0;
             for e in c..q {
                 s += m_r[e] * lam[e * q + c];
             }
-            fam_a[r * stride + c] = if r == c { T::ONE + s } else { s };
+            fam_a[r * stride + c] = if r == c { 1.0 + s } else { s };
         }
     }
 }
@@ -1450,15 +1493,15 @@ fn assemble_primary_a<T: Scalar>(fam_a: &mut [T], stride: usize, lam: &[T], gram
 /// assembly — the deviance keeps only the LAST family's factor, and recovery
 /// needs all of them.
 #[allow(clippy::too_many_arguments)] // one call site each; the alternative is a struct of borrows
-fn assemble_fam_a<T: Scalar>(
-    fam_a: &mut [T],
-    prim_gram: &mut [T],
-    prim_lam: &[T],
+fn assemble_fam_a(
+    fam_a: &mut [f64],
+    prim_gram: &mut [f64],
+    prim_lam: &[f64],
     suff: &LmmSuffStats,
     f: usize,
     w: usize,
-    th_p: T,
-    th_n: T,
+    th_p: f64,
+    th_n: f64,
     slope: bool,
 ) {
     let g = &suff.groupings;
@@ -1477,20 +1520,20 @@ fn assemble_fam_a<T: Scalar>(
         for c in 0..np {
             // Nested child RE col = prim_width + f·np + c (prim_width = q_p·n_primary).
             let gcol = g.n_primary * g.primary_q + f * np + c;
-            let n_c = T::from_f64(suff.counts[gcol]);
+            let n_c = suff.counts[gcol];
             for c2 in 0..np {
-                fam_a[(q + c) * w + (q + c2)] = T::ZERO;
+                fam_a[(q + c) * w + (q + c2)] = 0.0;
             }
-            fam_a[(q + c) * w + (q + c)] = T::ONE + th_n * th_n * n_c;
+            fam_a[(q + c) * w + (q + c)] = 1.0 + th_n * th_n * n_c;
             // Primary↔child: A[(q+c, e)] = θ_n · Σ_{d≥e} Λ_p[d,e] · Graw_d,
             // Graw_0 = n_c (intercept), Graw_d = Σ_{i∈child} x_{slope_{d-1}}.
             for e in 0..q {
-                let mut acc = T::ZERO;
+                let mut acc = 0.0;
                 for d in e..q {
                     let graw_d = if d == 0 {
                         n_c
                     } else {
-                        T::from_f64(suff.s_raw[(g.primary_slope_cols[d - 1], gcol)])
+                        suff.s_raw[(g.primary_slope_cols[d - 1], gcol)]
                     };
                     acc += prim_lam[d * q + e] * graw_d;
                 }
@@ -1500,16 +1543,16 @@ fn assemble_fam_a<T: Scalar>(
     } else {
         // parent–child counts = child row counts (a child's rows all lie
         // inside its parent).
-        let n_f = T::from_f64(suff.counts[f]);
-        fam_a[0] = T::ONE + th_p * th_p * n_f;
+        let n_f = suff.counts[f];
+        fam_a[0] = 1.0 + th_p * th_p * n_f;
         for c in 0..np {
             let gcol = g.n_primary + f * np + c;
-            let n_c = T::from_f64(suff.counts[gcol]);
+            let n_c = suff.counts[gcol];
             for c2 in 0..np {
-                fam_a[(1 + c) * w + (1 + c2)] = T::ZERO;
+                fam_a[(1 + c) * w + (1 + c2)] = 0.0;
             }
             fam_a[(1 + c) * w] = th_p * th_n * n_c;
-            fam_a[(1 + c) * w + (1 + c)] = T::ONE + th_n * th_n * n_c;
+            fam_a[(1 + c) * w + (1 + c)] = 1.0 + th_n * th_n * n_c;
         }
     }
 }
@@ -1519,17 +1562,17 @@ fn assemble_fam_a<T: Scalar>(
 /// [`reml_deviance`] writes at `fit.bt`'s columns `f·w .. f·w+w`. Shared for
 /// the same reason as [`assemble_fam_a`].
 #[allow(clippy::too_many_arguments)] // as `assemble_fam_a`
-fn assemble_fam_b<T: Scalar>(
-    bt_fam: &mut [T],
-    lam_x: &[T],
-    prim_lam: &[T],
+fn assemble_fam_b(
+    bt_fam: &mut [f64],
+    lam_x: &[f64],
+    prim_lam: &[f64],
     suff: &LmmSuffStats,
     f: usize,
     t_dim: usize,
     kx: usize,
     slope: bool,
-    th_p: T,
-    th_n: T,
+    th_p: f64,
+    th_n: f64,
 ) {
     let g = &suff.groupings;
     let m = suff.m;
@@ -1549,9 +1592,9 @@ fn assemble_fam_b<T: Scalar>(
             let zxb = suff.zx.col(b).try_as_col_major().unwrap().as_slice();
             let zxsb = suff.zx_slope.col(b).try_as_col_major().unwrap().as_slice();
             for r in 0..q {
-                let mut brb = T::ZERO;
+                let mut brb = 0.0;
                 for d in r..q {
-                    let zeta = T::from_f64(if d == 0 { zxb[f] } else { zxsb[d * n_prim + f] });
+                    let zeta = if d == 0 { zxb[f] } else { zxsb[d * n_prim + f] };
                     brb += prim_lam[d * q + r] * zeta;
                 }
                 bt_fam[r * t_dim + b] = lam_b * brb;
@@ -1572,10 +1615,10 @@ fn assemble_fam_b<T: Scalar>(
         for r in 0..q {
             let bcol = &mut bt_fam[r * t_dim + kx..r * t_dim + kx + m];
             for j in 0..m {
-                let mut brj = T::ZERO;
+                let mut brj = 0.0;
                 #[allow(clippy::needless_range_loop)]
                 for d in r..q {
-                    brj += prim_lam[d * q + r] * T::from_f64(s_cols[d][j]);
+                    brj += prim_lam[d * q + r] * s_cols[d][j];
                 }
                 bcol[j] = brj;
             }
@@ -1585,35 +1628,35 @@ fn assemble_fam_b<T: Scalar>(
             let gcol = n_prim * q + f * np + c; // prim_width + f·np + c
             let off = (q + c) * t_dim;
             for b in 0..kx {
-                bt_fam[off + b] = th_n * lam_x[b] * T::from_f64(suff.zx[(gcol, b)]);
+                bt_fam[off + b] = th_n * lam_x[b] * suff.zx[(gcol, b)];
             }
             let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
             let bcol = &mut bt_fam[off + kx..off + kx + m];
             for j in 0..m {
-                bcol[j] = th_n * T::from_f64(scol[j]);
+                bcol[j] = th_n * scol[j];
             }
         }
     } else {
         let s_f = suff.s.col(f).try_as_col_major().unwrap().as_slice();
         for b in 0..kx {
-            bt_fam[b] = th_p * lam_x[b] * T::from_f64(suff.zx[(f, b)]);
+            bt_fam[b] = th_p * lam_x[b] * suff.zx[(f, b)];
         }
         {
             let bcol = &mut bt_fam[kx..kx + m];
             for j in 0..m {
-                bcol[j] = th_p * T::from_f64(s_f[j]);
+                bcol[j] = th_p * s_f[j];
             }
         }
         for c in 0..np {
             let gcol = g.n_primary + f * np + c;
             let off = (1 + c) * t_dim;
             for b in 0..kx {
-                bt_fam[off + b] = th_n * lam_x[b] * T::from_f64(suff.zx[(gcol, b)]);
+                bt_fam[off + b] = th_n * lam_x[b] * suff.zx[(gcol, b)];
             }
             let scol = suff.s.col(gcol).try_as_col_major().unwrap().as_slice();
             let bcol = &mut bt_fam[off + kx..off + kx + m];
             for j in 0..m {
-                bcol[j] = th_n * T::from_f64(scol[j]);
+                bcol[j] = th_n * scol[j];
             }
         }
     }
@@ -1626,7 +1669,7 @@ fn assemble_fam_b<T: Scalar>(
 /// The divide is deliberately NOT hoisted into a reciprocal the way the sparse
 /// path's `schur_phase_b` does it — that is a ≤1-ulp change, and this path's
 /// values are pinned.
-fn fam_forward_solve<T: Scalar>(bt_fam: &mut [T], t_dim: usize, w: usize, fam_a: &[T]) {
+fn fam_forward_solve(bt_fam: &mut [f64], t_dim: usize, w: usize, fam_a: &[f64]) {
     for r in 0..w {
         let (done, rest) = bt_fam.split_at_mut(r * t_dim);
         let col_r = &mut rest[..t_dim];
@@ -1936,6 +1979,14 @@ pub struct LmmFit {
     pub pivot: f64,
     /// Column attaining `pivot`. Meaningless when `pivot` is NaN.
     pub pivot_col: u32,
+    /// The gradient search (the per-group route's BFGS) did not converge and
+    /// handed its incumbent to BOBYQA — see
+    /// [`crate::Note::GradientSearchFallback`].
+    pub gradient_search_fallback: bool,
+    /// How the gradient search ended, `None` when the fit searched with BOBYQA
+    /// alone: the driver's stop, its gradient count and the endpoint decrement
+    /// `½·gᵀHg`. Kept when BOBYQA finished the fit after it.
+    pub(crate) grad_report: Option<(crate::optim::bfgs::BfgsStop, usize, f64)>,
 }
 
 /// Joint Wald-χ² statistic over the target set `T`,
@@ -2013,6 +2064,198 @@ pub(crate) fn joint_wald_chi_sq(
     w / sigma_sq
 }
 
+/// The profiled REML deviance as the optimizer layer's objective
+/// ([`crate::optim::Objective`]): every evaluation is counted, and the finite
+/// ones too (`fit_lmm`'s `converged` needs two). The profiled criterion has
+/// no inner solve, so the optimizer's resolution is not used.
+///
+/// On the per-group regression route it is also a
+/// [`crate::optim::GradObjective`]: the gradient comes off the state the last
+/// evaluation left ([`pg_grad::pg_gradient`]).
+struct LmmObjective<'a> {
+    kernel: &'a mut LmmKernel,
+    counters: &'a mut crate::counters::EvalCounters,
+    finite_evals: &'a mut usize,
+    /// Whether the last evaluation was finite (the gradient needs its state).
+    last_finite: bool,
+}
+
+impl crate::optim::Objective for LmmObjective<'_> {
+    fn value(&mut self, x: &[f64], _resolution: f64) -> Option<f64> {
+        let d = self.kernel.deviance(x);
+        self.last_finite = d.is_finite();
+        if self.last_finite {
+            *self.finite_evals += 1;
+        }
+        self.counters.record_eval(crate::counters::Stage::Two, d);
+        Some(d)
+    }
+}
+
+impl crate::optim::GradObjective for LmmObjective<'_> {
+    fn gradient(&mut self, g: &mut [f64]) -> bool {
+        match &mut *self.kernel {
+            LmmKernel::Dense { suff, fit } if self.last_finite && fit.pg_n_active > 0 => {
+                pg_grad::pg_gradient(suff, fit, g)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The θ search of [`fit_lmm`], from `theta` (the start, already clamped)
+/// within `[lower, upper]`, leaving the endpoint in `theta`. The route's rule
+/// ([`lmm_outer_optimizer`]) picks the optimizer. BOBYQA searches from a warm
+/// start with `solver_warm` (`RHO_BEGIN_WARM`) and from the blind start with
+/// `solver` (`RHO_BEGIN`). BFGS's endpoint is accepted when it passes the
+/// certificate; otherwise the fallback ladder runs:
+///
+/// - a search that stopped on its convergence tests but failed the
+///   certificate is polished by BOBYQA from its endpoint, at
+///   `RHO_BEGIN_WARM` (part of the route, no `Note`);
+/// - any other stop hands the incumbent to BOBYQA with its unchanged budget,
+///   and the second value returned is `true`
+///   ([`crate::Note::GradientSearchFallback`]);
+/// - a start with no finite value runs exactly the search the BOBYQA route
+///   would have run.
+///
+/// The returned `Outcome` is the finishing optimizer's; its `n_eval` counts
+/// every value evaluation of both. `hint`, when its dimension matches, starts
+/// the BFGS search from its inverse Hessian (it is never written). The
+/// gradient evaluations reuse the value
+/// evaluations' state and are not counted. The third value is `true` when a
+/// certified BFGS endpoint was accepted: its convergence rests on the
+/// gradient, so it needs no second finite value (a warm start at the optimum
+/// certifies after one value and one gradient). The fourth value is the BFGS
+/// search's own stop, gradient count and endpoint decrement `½·gᵀHg`, kept
+/// when BOBYQA finished the fit after it; `None` on the BOBYQA route.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_theta(
+    kernel: &mut LmmKernel,
+    solver: &mut Bobyqa,
+    solver_warm: &mut Option<Bobyqa>,
+    config: &Config,
+    bfgs: &mut crate::optim::bfgs::BfgsState,
+    theta: &mut [f64],
+    lower: &[f64],
+    upper: &[f64],
+    warm: bool,
+    hint: Option<&crate::optim::CurvatureHint>,
+    counters: &mut crate::counters::EvalCounters,
+    finite_evals: &mut usize,
+) -> (
+    bobyqa::Outcome,
+    bool,
+    bool,
+    Option<(crate::optim::bfgs::BfgsStop, usize, f64)>,
+) {
+    use crate::optim::bfgs::{bfgs_minimize, BfgsConfig, BfgsStop};
+    use crate::optim::{bobyqa_minimize, OuterOptimizer};
+    let n = theta.len();
+    let route = lmm_outer_optimizer(kernel, n);
+    let mut obj = LmmObjective {
+        kernel,
+        counters,
+        finite_evals,
+        last_finite: false,
+    };
+    match route {
+        OuterOptimizer::Bobyqa => {
+            let s = if warm {
+                warm_bobyqa(solver_warm, config, n)
+            } else {
+                solver
+            };
+            (
+                bobyqa_minimize(s, &mut obj, theta, lower, upper),
+                false,
+                false,
+                None,
+            )
+        }
+        OuterOptimizer::Bfgs => {
+            let h0 = hint.filter(|h| h.dim() == n).map(|h| h.inv_hessian());
+            let bo = bfgs_minimize(&mut obj, theta, lower, upper, &BfgsConfig::LMM, bfgs, h0);
+            let report = Some((bo.stop, bo.n_grad, bo.decrement));
+            if bo.certified(theta, obj.kernel.groupings().diagonal_theta()) {
+                let out = bobyqa::Outcome {
+                    f: bo.f,
+                    n_eval: bo.n_val,
+                    status: Status::Converged,
+                };
+                return (out, false, true, report);
+            }
+            let polish = bo.converged();
+            let s = if bo.stop == BfgsStop::NonFinite && !warm {
+                solver
+            } else {
+                warm_bobyqa(solver_warm, config, n)
+            };
+            let mut out = bobyqa_minimize(s, &mut obj, theta, lower, upper);
+            out.n_eval += bo.n_val;
+            (out, !polish, false, report)
+        }
+    }
+}
+
+/// The curvature hint at the θ̂ the last [`fit_lmm`] on `ws` left in
+/// `ws.theta`, for the per-group route's gradient search; `None` off that
+/// route (no gradient) or when the finite-difference Hessian there is not
+/// positive definite. It re-evaluates the deviance `n_θ + 1` times, so the
+/// kernel's state no longer describes θ̂ afterwards.
+pub(crate) fn lmm_curvature_hint(ws: &mut LmmWorkspace) -> Option<crate::optim::CurvatureHint> {
+    use crate::optim::{GradObjective, Objective};
+    let LmmWorkspace {
+        kernel,
+        theta,
+        lower,
+        upper,
+        ..
+    } = ws;
+    if lmm_outer_optimizer(kernel, theta.len()) != crate::optim::OuterOptimizer::Bfgs {
+        return None;
+    }
+    let mut counters = crate::counters::EvalCounters::new();
+    let mut finite = 0usize;
+    let mut obj = LmmObjective {
+        kernel,
+        counters: &mut counters,
+        finite_evals: &mut finite,
+        last_finite: false,
+    };
+    crate::optim::CurvatureHint::from_gradients(theta, lower, upper, |x, g| {
+        obj.value(x, 0.0);
+        obj.gradient(g)
+    })
+}
+
+/// The `RHO_BEGIN_WARM` solver, built on first use.
+fn warm_bobyqa<'a>(slot: &'a mut Option<Bobyqa>, config: &Config, n: usize) -> &'a mut Bobyqa {
+    slot.get_or_insert_with(|| {
+        let mut c = *config;
+        c.rho_begin = RHO_BEGIN_WARM;
+        Bobyqa::new(n, c).expect("warm BOBYQA config is valid by construction")
+    })
+}
+
+/// The outer optimizer a fit's θ search runs (B1, 2026-10-07): BFGS where
+/// the per-group regression route is armed for this dataset, which admits
+/// random slopes on the primary grouping only (`q_p ≥ 2`, so `n_θ ≥ 3`), and
+/// BOBYQA everywhere else. A function of the shape and the data's level
+/// Grams, not of the start: cold and warm fits route alike.
+///
+/// Measured on the route's cells (pawel, locked P-core, search wall against
+/// BOBYQA from the same start): 3 θ cold geo 0.42 (none slower), warm 0.48;
+/// 36 θ 0.04 cold, 0.05 warm. Evidence: `docs/0.5.0/b1-lmm-bfgs-spec.md`.
+fn lmm_outer_optimizer(kernel: &LmmKernel, n_theta: usize) -> crate::optim::OuterOptimizer {
+    match kernel {
+        LmmKernel::Dense { fit, .. } if fit.pg_n_active > 0 && n_theta >= 3 => {
+            crate::optim::OuterOptimizer::Bfgs
+        }
+        _ => crate::optim::OuterOptimizer::Bobyqa,
+    }
+}
+
 /// Fit by BOBYQA minimisation of the REML profiled deviance over the box-
 /// bounded θ, with β̂ / σ̂² / Var(β̂_target) recovered once at θ̂.
 ///
@@ -2031,10 +2274,15 @@ pub(crate) fn joint_wald_chi_sq(
 /// `map` is the column standardization the rows were accumulated under:
 /// β̂, `var_diag`, `t_sq` and the joint Wald are reported through it
 /// (`ColumnScaling::IDENTITY` for a design fitted as given).
+///
+/// `hint`: a caller's [`crate::optim::CurvatureHint`] for the gradient search
+/// (`loop_advanced::fit_on_hinted`); read only, and ignored on the BOBYQA
+/// route and when its dimension does not match.
 pub fn fit_lmm(
     ws: &mut LmmWorkspace,
     target_indices: &[u32],
     theta_start: Option<&[f64]>,
+    hint: Option<&crate::optim::CurvatureHint>,
     map: &ColumnScaling,
 ) -> LmmFit {
     let LmmWorkspace {
@@ -2043,6 +2291,7 @@ pub fn fit_lmm(
         solver,
         solver_warm,
         config,
+        bfgs,
         theta,
         lower,
         upper,
@@ -2053,23 +2302,19 @@ pub fn fit_lmm(
 
     // Arm the balanced collapse for this dataset's counts (cheap —
     // O(n_primary·w²·t_dim²) once per fit; sets collapse_n_active = 0 on any
-    // unbalanced/slope shape, which keeps the per-family loop). The sparse
-    // kernel has no family loop to collapse.
+    // unbalanced/slope shape, which keeps the per-family loop), and the
+    // per-group regression route for a random-slopes primary (same cost
+    // order; off on any other shape or an ill-conditioned group). The sparse
+    // kernel has neither.
     if let LmmKernel::Dense { suff, fit } = &mut *kernel {
         precompute_balanced_collapse(suff, fit);
+        precompute_group_regressions(suff, fit);
     }
 
     // A Some-start is clamped to the floor on its diagonal coordinates only
     // (off-diagonals pass through verbatim) and searched by `solver_warm`, at
-    // `RHO_BEGIN_WARM`; the blind start by `solver`, at `RHO_BEGIN`.
-    let solver: &mut Bobyqa = match theta_start {
-        Some(_) => solver_warm.get_or_insert_with(|| {
-            let mut c = *config;
-            c.rho_begin = RHO_BEGIN_WARM;
-            Bobyqa::new(theta.len(), c).expect("warm BOBYQA config is valid by construction")
-        }),
-        None => solver,
-    };
+    // `RHO_BEGIN_WARM`; the blind start by `solver`, at `RHO_BEGIN`
+    // (`search_theta`).
     match theta_start {
         Some(ts) => {
             debug_assert_eq!(ts.len(), theta.len());
@@ -2104,18 +2349,19 @@ pub fn fit_lmm(
     let mut counters = crate::counters::EvalCounters::new();
     // mirrors the stage-1 read in glmm/mod.rs — change together.
     let mut finite_evals = 0usize;
-    let out = solver.minimize(
-        |xs| {
-            let d = kernel.deviance(xs);
-            if d.is_finite() {
-                finite_evals += 1;
-            }
-            counters.record_eval(crate::counters::Stage::Two, d);
-            d
-        },
+    let (out, gradient_search_fallback, certified, grad_report) = search_theta(
+        kernel,
+        solver,
+        solver_warm,
+        config,
+        bfgs,
         theta,
         lower,
         upper,
+        theta_start.is_some(),
+        hint,
+        &mut counters,
+        &mut finite_evals,
     );
 
     // Status mapping (the plateau policy): a `MaxFunReached` cap-out reports
@@ -2128,7 +2374,7 @@ pub fn fit_lmm(
     // unreachable (f_target stays -inf); InvalidArgs would be an engine bug —
     // the workspace fixes shapes and bounds.
     debug_assert!(out.status != Status::InvalidArgs);
-    let converged = matches!(out.status, Status::Converged) && finite_evals >= 2;
+    let converged = matches!(out.status, Status::Converged) && (finite_evals >= 2 || certified);
     let has_endpoint = matches!(out.status, Status::Converged | Status::MaxFunReached);
 
     // Per-component deterministic pin: every DIAGONAL variance component ≤
@@ -2260,6 +2506,8 @@ pub fn fit_lmm(
             deviance: f64::NAN,
             pivot,
             pivot_col: pivot_col as u32,
+            gradient_search_fallback,
+            grad_report,
         };
     }
 
@@ -2331,5 +2579,18 @@ pub fn fit_lmm(
         deviance: dev,
         pivot,
         pivot_col: pivot_col as u32,
+        gradient_search_fallback,
+        grad_report,
     }
+}
+
+/// [`fit_lmm`] without a curvature hint, for the tests.
+#[cfg(test)]
+pub(crate) fn fit_lmm_unhinted(
+    ws: &mut LmmWorkspace,
+    target_indices: &[u32],
+    theta_start: Option<&[f64]>,
+    map: &ColumnScaling,
+) -> LmmFit {
+    fit_lmm(ws, target_indices, theta_start, None, map)
 }

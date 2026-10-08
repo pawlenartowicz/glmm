@@ -11,6 +11,7 @@ use super::workspace::{
 };
 use super::{PIRLS_MAX_HALVINGS, PIRLS_MAX_ITERS, PIRLS_OSC_RATIO, PIRLS_OSC_TRIGGER};
 use crate::scalar::Scalar;
+use crate::simd_transcendental::{fmadd, fmadd_scalar};
 use crate::spec::{BinomialLink, Family};
 
 mod blocked;
@@ -19,7 +20,8 @@ mod packed;
 
 pub(crate) use blocked::pirls_solve_blocked;
 pub(crate) use blocked_extras::{
-    pirls_solve_blocked_extras, structured_ainv_solve, structured_factor, TailKernel,
+    pirls_solve_blocked_extras, stream_fill, structured_ainv_solve, structured_factor,
+    structured_stream_deviance, StreamRows, TailKernel,
 };
 pub(crate) use packed::{fill_m_vals, packed_m_vals_theta_deriv, pirls_solve_packed};
 
@@ -380,6 +382,14 @@ pub(crate) fn observed_weights_in_place<T: Scalar>(
     if !crate::family::exact_curvature_differs(family) {
         return;
     }
+    if let Some(mut rows) = crate::family::ProbitRows::new(family, eta, prob) {
+        if let Some(wf) = T::as_f64s_mut(w) {
+            for i in 0..n {
+                wf[i] = rows.observed_weight(i, y[i], prior_w[i], wf[i]);
+            }
+            return;
+        }
+    }
     for i in 0..n {
         w[i] = crate::family::observed_weight(
             family, nb_theta, y[i], prior_w[i], eta[i], prob[i], w[i],
@@ -464,18 +474,20 @@ pub(crate) fn row_weight_eta_curv(
 /// `(yᵢ'G_f yᵢ, yᵢ'(H_f tᵢ), tᵢ'S⁻¹tᵢ)`: `yc = A_f⁻¹m_c`, `tail_g_f` cluster
 /// `f`'s `G_f` (`q_core×q_core`), `tail_h_f` cluster `f`'s compact `H_f`
 /// (`q_core × |cols_f|`, row-major over `cols_f`, the cluster's sorted coupling
-/// columns), `cols`/`vals` the row's own crossed entries `tᵢ`, each one of
-/// `cols_f`. The derivation and the index conventions are at pass A of
-/// `pirls_solve_blocked_extras`.
+/// columns, `nc = |cols_f|` of them), `cols`/`vals` the row's own crossed
+/// entries `tᵢ`, each one of `cols_f`, at the positions `pos` within `cols_f`
+/// (`StructuredPattern::coup_pos`). The derivation and the index conventions
+/// are at pass A of `pirls_solve_blocked_extras`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn row_tail_terms<T: Scalar>(
     yc: &[f64],
     qc: usize,
     tail_g_f: &[f64],
     tail_h_f: &[f64],
-    cols_f: &[u32],
+    nc: usize,
     e: usize,
     cols: &[u32],
+    pos: &[u32],
     vals: &[T],
     tail_inv: &[f64],
 ) -> (f64, f64, f64) {
@@ -488,12 +500,9 @@ pub(crate) fn row_tail_terms<T: Scalar>(
         t_gg += yc[l1] * inner;
     }
     let mut t_ght = 0.0;
-    let nc = cols_f.len();
-    for (&b, v) in cols.iter().zip(vals) {
+    for (&j, v) in pos.iter().zip(vals) {
         // support(tᵢ) ⊆ cols_f: see the row loop in pass A.
-        let Ok(j) = cols_f.binary_search(&b) else {
-            continue;
-        };
+        let j = j as usize;
         let mut inner = 0.0;
         for l in 0..qc {
             inner += yc[l] * tail_h_f[l * nc + j];
@@ -513,11 +522,11 @@ pub(crate) fn row_tail_terms<T: Scalar>(
 }
 
 /// The crossed tail of the structured layout as [`logdet_beta_curvature`]
-/// reads it: the packed crossed nonzeros of `M` (`cross_col`/`cross_val`,
-/// `n_cross` live per row).
+/// reads it: the packed crossed nonzeros of `M` (`cross_col` and `n_cross`
+/// per row, their values `cross_theta` per slot).
 pub(crate) struct CrossedTail<'a, T> {
     pub(crate) cross_col: &'a [u32],
-    pub(crate) cross_val: &'a [T],
+    pub(crate) cross_theta: &'a [T],
     pub(crate) n_cross: &'a [u8],
     /// Crossed width.
     pub(crate) e: usize,
@@ -676,7 +685,7 @@ pub(crate) fn logdet_beta_curvature<T: Scalar>(
         if let Some(t) = tail {
             let base = i * g_cap;
             for z in 0..t.n_cross[i] as usize {
-                let w = t.cross_val[base + z].value();
+                let w = t.cross_theta[z].value();
                 let b = t.cross_col[base + z] as usize;
                 let tr = &tt[(k_family + b) * p..(k_family + b + 1) * p];
                 for (a, tv) in av.iter_mut().zip(tr) {
@@ -975,6 +984,224 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// Row-tile length of the tiled residual-border kernel ([`BorderAcc`]).
+pub(crate) const BORDER_TILE: usize = 128;
+/// Widest `p` [`BorderAcc`] holds; a wider border keeps the pairwise loops.
+pub(crate) const BORDER_PMAX: usize = 16;
+
+/// `cols[a]` = column `a` of `m` as a slice, when `m` has at most
+/// [`BORDER_PMAX`] columns and each is contiguous.
+pub(crate) fn border_cols<'m>(m: MatRef<'m, f64>, cols: &mut [&'m [f64]; BORDER_PMAX]) -> bool {
+    let n = m.nrows();
+    m.ncols() <= BORDER_PMAX
+        && (0..m.ncols()).all(|a| match m.col(a).try_as_col_major() {
+            Some(c) => {
+                cols[a] = &c.as_slice()[..n];
+                true
+            }
+            None => false,
+        })
+}
+
+/// The residual border's sums `Σᵢ wᵢ·rᵢrᵢᵀ` (packed lower triangle, `a`
+/// outer, `b ≤ a`) and `Σᵢ ρᵢ·rᵢ`, accumulated over column-major tiles of
+/// residual rows: each tile is read once for all `p(p+1)/2` pairs, each dot
+/// product with four partial sums. No allocation; `p ≤ BORDER_PMAX`.
+pub(crate) struct BorderAcc {
+    tri: [f64; BORDER_PMAX * (BORDER_PMAX + 1) / 2],
+    rhs: [f64; BORDER_PMAX],
+}
+
+impl BorderAcc {
+    pub(crate) fn new() -> Self {
+        Self {
+            tri: [0.0; BORDER_PMAX * (BORDER_PMAX + 1) / 2],
+            rhs: [0.0; BORDER_PMAX],
+        }
+    }
+
+    /// One tile: `cols[a]` is column `a` of the tile's rows, `wt` their
+    /// weights, `rho` their scores (read only when `with_rho`).
+    #[inline]
+    pub(crate) fn add_tile(&mut self, cols: &[&[f64]], wt: &[f64], rho: &[f64], with_rho: bool) {
+        pulp::Arch::new().dispatch(BorderTileOp::<false> {
+            acc: self,
+            cols,
+            wt,
+            rho,
+            with_rho,
+        });
+    }
+
+    /// All `len` rows of the columns `cols`, tile by tile, with weight
+    /// `w(i)` and score `rho(i)` of row `i`.
+    pub(crate) fn add_rows(
+        &mut self,
+        cols: &[&[f64]],
+        len: usize,
+        w: impl Fn(usize) -> f64,
+        rho: impl Fn(usize) -> f64,
+        with_rho: bool,
+    ) {
+        let p = cols.len();
+        let mut wt = [0.0f64; BORDER_TILE];
+        let mut rt = [0.0f64; BORDER_TILE];
+        let mut sub: [&[f64]; BORDER_PMAX] = [&[]; BORDER_PMAX];
+        let mut i0 = 0;
+        while i0 < len {
+            let m = (len - i0).min(BORDER_TILE);
+            for (ii, o) in wt[..m].iter_mut().enumerate() {
+                *o = w(i0 + ii);
+            }
+            if with_rho {
+                for (ii, o) in rt[..m].iter_mut().enumerate() {
+                    *o = rho(i0 + ii);
+                }
+            }
+            for a in 0..p {
+                sub[a] = &cols[a][i0..i0 + m];
+            }
+            self.add_tile(&sub[..p], &wt[..m], &rt[..m], with_rho);
+            i0 += m;
+        }
+    }
+
+    /// `schur` (both triangles) and, when given, `rhs[..p]` from the sums.
+    pub(crate) fn write(&self, p: usize, schur: &mut Mat<f64>, rhs: Option<&mut [f64]>) {
+        let mut idx = 0;
+        for a in 0..p {
+            for b in 0..=a {
+                schur[(a, b)] = self.tri[idx];
+                schur[(b, a)] = self.tri[idx];
+                idx += 1;
+            }
+        }
+        if let Some(rhs) = rhs {
+            rhs[..p].copy_from_slice(&self.rhs[..p]);
+        }
+    }
+}
+
+/// `Σ x·y` with two vector accumulators, reduced lane-wise, then the
+/// sub-lane tail. A plain `#[inline(always)]` fn rather than a closure, so it
+/// inlines into `with_simd`'s target-feature context (a closure there calls
+/// the x86 intrinsics out of line).
+#[inline(always)]
+fn simd_dot<S: pulp::Simd, const FUSED: bool>(simd: S, x: &[f64], y: &[f64]) -> f64 {
+    let (xh, xt) = S::as_simd_f64s(x);
+    let (yh, yt) = S::as_simd_f64s(&y[..x.len()]);
+    let zero = simd.splat_f64s(0.0);
+    let (mut s0, mut s1) = (zero, zero);
+    let mut i = 0;
+    while i + 2 <= xh.len() {
+        s0 = fmadd::<S, FUSED>(simd, xh[i], yh[i], s0);
+        s1 = fmadd::<S, FUSED>(simd, xh[i + 1], yh[i + 1], s1);
+        i += 2;
+    }
+    if i < xh.len() {
+        s0 = fmadd::<S, FUSED>(simd, xh[i], yh[i], s0);
+    }
+    let mut s = simd.reduce_sum_f64s(simd.add_f64s(s0, s1));
+    for (a, b) in xt.iter().zip(yt) {
+        s = fmadd_scalar::<FUSED>(*a, *b, s);
+    }
+    s
+}
+
+/// [`BorderAcc::add_tile`]'s SIMD body: `wa = w∘r_a` per column, then each
+/// `Σ wa·r_b` (`b ≤ a`) four columns `b` at a time against one load of `wa`,
+/// two vector accumulators per pair, reduced lane-wise at the end of the
+/// tile. Unfused (`FUSED = false`, plain mul/add) on every target: with
+/// hardware fma the sums moved enough to fail
+/// `joint_search_reaches_the_optimum_when_working_weights_span_decades` on
+/// x86 (and, before the pinned corner was probed for stationarity in
+/// `fit_glmm`, `crossed_zero_variance_reaches_the_single_grouping_optimum`).
+struct BorderTileOp<'a, const FUSED: bool> {
+    acc: &'a mut BorderAcc,
+    cols: &'a [&'a [f64]],
+    wt: &'a [f64],
+    rho: &'a [f64],
+    with_rho: bool,
+}
+
+impl<const FUSED: bool> pulp::WithSimd for BorderTileOp<'_, FUSED> {
+    type Output = ();
+    #[inline(always)]
+    fn with_simd<S: pulp::Simd>(self, simd: S) {
+        let Self {
+            acc,
+            cols,
+            wt,
+            rho,
+            with_rho,
+        } = self;
+        let len = wt.len();
+        let zero = simd.splat_f64s(0.0);
+        let mut wa = [0.0f64; BORDER_TILE];
+        let wa = &mut wa[..len];
+        let mut idx = 0;
+        for (a, ca) in cols.iter().enumerate() {
+            let ca = &ca[..len];
+            {
+                let (wh, wtl) = S::as_mut_simd_f64s(wa);
+                let (th, ttl) = S::as_simd_f64s(wt);
+                let (ch, ctl) = S::as_simd_f64s(ca);
+                for ((o, &t), &c) in wh.iter_mut().zip(th).zip(ch) {
+                    *o = simd.mul_f64s(t, c);
+                }
+                for ((o, &t), &c) in wtl.iter_mut().zip(ttl).zip(ctl) {
+                    *o = t * c;
+                }
+            }
+            let mut b = 0;
+            while b + 4 <= a + 1 {
+                let (xh, xt) = S::as_simd_f64s(wa);
+                let (y0, t0) = S::as_simd_f64s(&cols[b][..len]);
+                let (y1, t1) = S::as_simd_f64s(&cols[b + 1][..len]);
+                let (y2, t2) = S::as_simd_f64s(&cols[b + 2][..len]);
+                let (y3, t3) = S::as_simd_f64s(&cols[b + 3][..len]);
+                let mut s = [zero; 8];
+                let mut i = 0;
+                while i + 2 <= xh.len() {
+                    let (x0, x1) = (xh[i], xh[i + 1]);
+                    s[0] = fmadd::<S, FUSED>(simd, x0, y0[i], s[0]);
+                    s[1] = fmadd::<S, FUSED>(simd, x0, y1[i], s[1]);
+                    s[2] = fmadd::<S, FUSED>(simd, x0, y2[i], s[2]);
+                    s[3] = fmadd::<S, FUSED>(simd, x0, y3[i], s[3]);
+                    s[4] = fmadd::<S, FUSED>(simd, x1, y0[i + 1], s[4]);
+                    s[5] = fmadd::<S, FUSED>(simd, x1, y1[i + 1], s[5]);
+                    s[6] = fmadd::<S, FUSED>(simd, x1, y2[i + 1], s[6]);
+                    s[7] = fmadd::<S, FUSED>(simd, x1, y3[i + 1], s[7]);
+                    i += 2;
+                }
+                if i < xh.len() {
+                    let x0 = xh[i];
+                    s[0] = fmadd::<S, FUSED>(simd, x0, y0[i], s[0]);
+                    s[1] = fmadd::<S, FUSED>(simd, x0, y1[i], s[1]);
+                    s[2] = fmadd::<S, FUSED>(simd, x0, y2[i], s[2]);
+                    s[3] = fmadd::<S, FUSED>(simd, x0, y3[i], s[3]);
+                }
+                for (j, tj) in [t0, t1, t2, t3].into_iter().enumerate() {
+                    let mut v = simd.reduce_sum_f64s(simd.add_f64s(s[j], s[j + 4]));
+                    for (x, y) in xt.iter().zip(tj) {
+                        v = fmadd_scalar::<FUSED>(*x, *y, v);
+                    }
+                    acc.tri[idx + j] += v;
+                }
+                idx += 4;
+                b += 4;
+            }
+            for cb in &cols[b..=a] {
+                acc.tri[idx] += simd_dot::<S, FUSED>(simd, wa, &cb[..len]);
+                idx += 1;
+            }
+            if with_rho {
+                acc.rhs[a] += simd_dot::<S, FUSED>(simd, &rho[..len], ca);
+            }
+        }
+    }
+}
+
 /// `schur = Σᵢ wᵢ·rᵢrᵢᵀ + TᵀT`: the β information
 /// `S = X'W̃X − X'W̃M·T`, with `T = A⁻¹M'W̃X` (`t`, `k×p`) and
 /// `rᵢ = xᵢ − Tᵀmᵢ`, the residual of design row `i`, in row `i` of `r` (`n×p`,
@@ -997,6 +1224,15 @@ pub(crate) fn schur_from_residuals(
     schur: &mut Mat<f64>,
 ) {
     let (n, p, k) = (r.nrows(), r.ncols(), t.nrows());
+    let mut rc: [&[f64]; BORDER_PMAX] = [&[]; BORDER_PMAX];
+    let mut tc: [&[f64]; BORDER_PMAX] = [&[]; BORDER_PMAX];
+    if border_cols(r, &mut rc) && border_cols(t, &mut tc) {
+        let mut acc = BorderAcc::new();
+        acc.add_rows(&rc[..p], n, w, |_| 0.0, false);
+        acc.add_rows(&tc[..p], k, |_| 1.0, |_| 0.0, false);
+        acc.write(p, schur, None);
+        return;
+    }
     for a in 0..p {
         for b in 0..=a {
             let mut s = 0.0;
@@ -1033,8 +1269,17 @@ pub(crate) fn residual_border(
     schur: &mut Mat<f64>,
     rhs: &mut [f64],
 ) {
-    schur_from_residuals(w, r, t, schur);
     let (n, p, k) = (r.nrows(), r.ncols(), t.nrows());
+    let mut rc: [&[f64]; BORDER_PMAX] = [&[]; BORDER_PMAX];
+    let mut tc: [&[f64]; BORDER_PMAX] = [&[]; BORDER_PMAX];
+    if border_cols(r, &mut rc) && border_cols(t, &mut tc) {
+        let mut acc = BorderAcc::new();
+        acc.add_rows(&rc[..p], n, w, rho, true);
+        acc.add_rows(&tc[..p], k, |_| 1.0, u, true);
+        acc.write(p, schur, Some(rhs));
+        return;
+    }
+    schur_from_residuals(w, r, t, schur);
     rhs[..p].fill(0.0);
     for i in 0..n {
         let ri = rho(i);
@@ -1066,6 +1311,57 @@ pub(crate) fn profile_row_score(
             link: BinomialLink::Logit,
         } => prior_w * (y - prob),
         other => crate::family::row_score(other, nb_theta, y, prior_w, eta, prob),
+    }
+}
+
+/// [`profile_row_score`] over one pass's rows, by row index: through
+/// [`crate::family::ProbitRows`] on a probit `f64` pass, the generic function
+/// otherwise. The tile sits in a `RefCell` so the `Fn` row closures
+/// ([`residual_border`]) can read it.
+pub(crate) struct ProfileScores<'a, T: Scalar> {
+    family: Family,
+    nb_theta: f64,
+    y: &'a [f64],
+    prior_w: &'a [f64],
+    eta: &'a [T],
+    prob: &'a [T],
+    probit: std::cell::RefCell<Option<crate::family::ProbitRows<'a>>>,
+}
+
+impl<'a, T: Scalar> ProfileScores<'a, T> {
+    pub(crate) fn new(
+        family: Family,
+        nb_theta: f64,
+        y: &'a [f64],
+        prior_w: &'a [f64],
+        eta: &'a [T],
+        prob: &'a [T],
+    ) -> Self {
+        Self {
+            family,
+            nb_theta,
+            y,
+            prior_w,
+            eta,
+            prob,
+            probit: std::cell::RefCell::new(crate::family::ProbitRows::new(family, eta, prob)),
+        }
+    }
+
+    /// Row `i`'s [`profile_row_score`].
+    #[inline]
+    pub(crate) fn at(&self, i: usize) -> f64 {
+        if let Some(rows) = self.probit.borrow_mut().as_mut() {
+            return rows.score(i, self.y[i], self.prior_w[i]);
+        }
+        profile_row_score(
+            self.family,
+            self.nb_theta,
+            self.y[i],
+            self.prior_w[i],
+            self.eta[i].value(),
+            self.prob[i].value(),
+        )
     }
 }
 

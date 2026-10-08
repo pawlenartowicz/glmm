@@ -244,8 +244,18 @@ record_mixed <- function(cell, m, rec) {
   # of hundreds cannot proceed without knowing which one fired, so the text is
   # carried through verbatim.
   msgs <- as.character(unlist(m@optinfo$conv$lme4$messages))
-  rec$converged <- length(msgs) == 0
-  notes <- msgs
+  # lme4 skips its own gradient checks above `check.conv.nobsmax` rows, so on
+  # most grid cells its messages are empty even when the optimizer stopped at its
+  # evaluation budget. The optimizer's return code and warnings (in `optinfo`)
+  # are the only record of that, and either one makes the fit unconverged.
+  opt_code <- m@optinfo$conv$opt
+  opt_warn <- as.character(unlist(m@optinfo$warnings))
+  opt_failed <- (!is.null(opt_code) && !identical(as.numeric(opt_code), 0)) ||
+                length(opt_warn) > 0
+  rec$converged <- length(msgs) == 0 && !opt_failed
+  notes <- c(msgs, opt_warn)
+  if (!is.null(opt_code) && !identical(as.numeric(opt_code), 0) && !length(opt_warn))
+    notes <- c(notes, sprintf("optimizer return code %s", format(opt_code)))
   rec$singular <- lme4::isSingular(m)
   # On a negative-binomial cell this is the FINAL inner glmer's evaluation count,
   # which is the only one the fitted object keeps: glmer.nb's outer profiling over

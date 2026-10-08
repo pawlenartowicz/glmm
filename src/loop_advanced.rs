@@ -7,7 +7,11 @@
 // the same dispatch body `fit_cold`/`fit_warm` run, so a model or routing change
 // lands in every caller identically. Prefer it over the individual kernels below,
 // which do not classify the design for you.
-pub use crate::fit::{build_workspace, fit_on, FitDiagnostics, FitView, FitWorkspace};
+pub use crate::fit::{
+    build_workspace, curvature_hint, fit_on, fit_on_hinted, FitDiagnostics, FitView, FitWorkspace,
+    OuterStop,
+};
+pub use crate::optim::CurvatureHint;
 // The RE-level-count normalizer `build_workspace` expects its `sized` spec to have
 // gone through — exposed so loop-tier consumers size specs the validated way
 // instead of reimplementing the crossed/nested count derivation. It also decides

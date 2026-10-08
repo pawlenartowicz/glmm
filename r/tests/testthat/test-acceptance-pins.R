@@ -101,16 +101,21 @@ test_that("binomial random slope (tau0, tau1, rho01) is pinned", {
   # -923.756172968026, 2.1e-11 lower): the correlation moved by 2.6e-6
   # absolute, the SDs by at most 2.6e-6 relative, the fixed effects by at most
   # 1e-7 absolute.
+  # Re-recorded 2026-10-07, when binomial and Poisson Laplace fits began to
+  # search with BFGS over [theta | beta] (logLik -923.756172968012, 1.4e-11
+  # higher): the correlation moved by 3.4e-6 absolute along a flat direction,
+  # the SDs by at most 3.1e-6 relative, the fixed effects by at most 3.7e-7
+  # absolute.
   d <- benchmark_data(seed = 203, family = "binomial", n_g = 100L, m = 15L,
                       tau0 = 0.8, tau1 = 0.8, rho = 0.3)
   fit <- fastglmm(y ~ t + d + t:d + (1 + t | g), d, family = binomial())
   expect_true(fit$converged)
   vc <- VarCorr(fit)$g
-  expect_equal(unname(fixef(fit)), c(-0.792589014698087, 1.07410722961413, 0.694133145065697, -0.129934553885488),
+  expect_equal(unname(fixef(fit)), c(-0.792589237740252, 1.07410758861618, 0.694133513999853, -0.129934663624406),
                tolerance = CI_REF_REL)
-  expect_equal(unname(attr(vc, "stddev")), c(1.04201462288758, 0.871288941191661),
+  expect_equal(unname(attr(vc, "stddev")), c(1.04201358935076, 0.871286256658628),
                tolerance = CI_REF_REL)
-  expect_equal(attr(vc, "correlation")[2, 1], 0.106171192629761,
+  expect_equal(attr(vc, "correlation")[2, 1], 0.10617456360574,
                tolerance = CI_REF_REL)
 })
 
@@ -126,17 +131,22 @@ test_that("poisson random slope (tau0, tau1, rho01) is pinned", {
   # (logLik -1711.44098430039, 7.2e-10 higher): the correlation moved by
   # 1.5e-5 absolute, the SDs by at most 8.9e-6 relative, the fixed effects by
   # at most 1.2e-6 absolute.
+  # Re-recorded 2026-10-07, when binomial and Poisson Laplace fits began to
+  # search with BFGS over [theta | beta] (logLik -1711.44098430002, 3.7e-10
+  # higher): the correlation moved by 6.7e-6 absolute along a flat direction,
+  # the SDs by at most 6.2e-6 relative, the fixed effects by at most 4.9e-7
+  # absolute.
   d <- benchmark_data(seed = 204, family = "poisson", n_g = 100L,
                       beta = c(0, 0.5, 0.3, 0.1), tau0 = 0.5, tau1 = 0.4,
                       rho = 0.3)
   fit <- fastglmm(y ~ t + d + t:d + (1 + t | g), d, family = poisson())
   expect_true(fit$converged)
   vc <- VarCorr(fit)$g
-  expect_equal(unname(fixef(fit)), c(0.207519207061406, 0.430215546625061, 0.119056503207913, 0.338551773355772),
+  expect_equal(unname(fixef(fit)), c(0.207519185320939, 0.430215661157296, 0.119056280458671, 0.338552268549117),
                tolerance = CI_REF_REL)
-  expect_equal(unname(attr(vc, "stddev")), c(0.312861595749485, 0.507731499360452),
+  expect_equal(unname(attr(vc, "stddev")), c(0.312861677224267, 0.507728333751899),
                tolerance = CI_REF_REL)
-  expect_equal(attr(vc, "correlation")[2, 1], 0.349335746574947,
+  expect_equal(attr(vc, "correlation")[2, 1], 0.349342423281847,
                tolerance = CI_REF_REL)
 })
 

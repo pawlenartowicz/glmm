@@ -672,7 +672,8 @@ load_inputs <- function(grid_dir) {
     # reads a full-grid reference, and a reference judged complete against 20
     # cells would not be one.
     required <- names(Filter(function(cl) o %in% cl[["oracles"]], cells_all))
-    r <- newest_oracle_run(grid_dir, o, V[[o]], required)
+    r <- reclassify_capped_oracle(newest_oracle_run(grid_dir, o, V[[o]], required),
+                                  o, cells_all)
     if (is.null(r)) {
       stop(sprintf(paste0("no run under runs/%s/ is an accuracy reference for %s: it ",
                           "needs subset \"full\", no timing, and a record for all %d ",

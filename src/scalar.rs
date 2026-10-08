@@ -20,7 +20,7 @@ mod sealed {
 }
 
 /// One scalar of the fit kernel: the arithmetic, the elementary functions and
-/// the three batched primitives the likelihood needs.
+/// the batched family pass the likelihood needs.
 #[doc(hidden)]
 pub trait Scalar:
     sealed::Sealed
@@ -105,25 +105,20 @@ pub trait Scalar:
         )
     }
 
-    /// Lower Cholesky of the symmetric `dim×dim` `a` (column-major, lower
-    /// triangle read) into `l_out` (column-major, lower triangle written;
-    /// strictly upper untouched). `false` on a non-positive or non-finite
-    /// pivot. Out-of-place because the caller keeps the unfactored matrix for
-    /// the conditional-mode recovery pass.
-    fn chol_lower(a: &[Self], dim: usize, l_out: &mut [Self]) -> bool;
-
-    /// `tail(lower) -= bt · btᵀ`, `tail` column-major `t_dim×t_dim` (lower
-    /// triangle), `bt` column-major `t_dim×w_tot`. `scratch` is
-    /// `2·t_dim·w_tot + t_dim²` `f64`s for the implementations that decompose
-    /// the product lane by lane (`Dual<N>`); the `f64` and `HyperDual` bodies
-    /// ignore it and accept an empty slice.
-    fn syrk_lower_sub(
-        bt: &[Self],
-        t_dim: usize,
-        w_tot: usize,
-        tail: &mut [Self],
-        scratch: &mut [f64],
-    );
+    /// The slice as `f64`s: `Some` only for the `f64` implementation, `None`
+    /// for the dual types. Lets a generic kernel take an `f64`-only route
+    /// (the AGQ node sums, `glmm::agq_fast`) without a trait bound of its own.
+    #[inline(always)]
+    fn as_f64s(s: &[Self]) -> Option<&[f64]> {
+        let _ = s;
+        None
+    }
+    /// Mutable twin of [`Scalar::as_f64s`].
+    #[inline(always)]
+    fn as_f64s_mut(s: &mut [Self]) -> Option<&mut [f64]> {
+        let _ = s;
+        None
+    }
 }
 
 /// The default body of [`Scalar::family_pass`], the row-by-row scalar
@@ -264,144 +259,13 @@ impl Scalar for f64 {
         )
     }
 
-    fn chol_lower(a: &[f64], dim: usize, l_out: &mut [f64]) -> bool {
-        use faer::dyn_stack::{MemBuffer, MemStack};
-        use faer::linalg::cholesky::llt::factor::{
-            cholesky_in_place, cholesky_in_place_scratch, LltRegularization,
-        };
-        use faer::{Par, Spec};
-        // Copy A's lower triangle into `l_out` and factor THAT in place instead of calling
-        // `MatRef::llt`. `.llt` reads `faer::get_global_parallelism()` on every call
-        // (faer 0.24.4 `linalg/solvers.rs:789`), which is `Par::rayon(0)` in any build with
-        // faer's default `rayon` feature: the first call spawns rayon's whole global pool
-        // and every later call with dim > 64 hands the blocked recursion to it.
-        // `cholesky_in_place` takes `Par` as an argument — the same rule the PIRLS
-        // Choleskys and `tri_lower_sub_gemm`'s GEMM already follow.
-        // The zero-fill mirrors `.llt`'s own `Mat::zeros` + `copy_from_triangular_lower`:
-        // faer's kernel also writes the columns above the diagonal, so the input's upper
-        // triangle must be zero for the factor to match what `.llt` produced.
-        l_out[..dim * dim].fill(0.0);
-        for j in 0..dim {
-            let col = j * dim;
-            l_out[col + j..col + dim].copy_from_slice(&a[col + j..col + dim]);
-        }
-        // The factor's scratch comes off a stack buffer when it fits (it does
-        // on every LMM kernel's `q`-sized block: 132 B at the loop shapes'
-        // dims), so a per-eval call does not allocate. A larger request falls
-        // back to a heap `MemBuffer`; the factor is the same either way.
-        let req = cholesky_in_place_scratch::<f64>(dim, Par::Seq, Spec::default());
-        let l = faer::MatMut::from_column_major_slice_mut(&mut l_out[..dim * dim], dim, dim);
-        const STACK_SCRATCH: usize = 1024;
-        if req.unaligned_bytes_required() <= STACK_SCRATCH {
-            let mut buf = [core::mem::MaybeUninit::<u8>::uninit(); STACK_SCRATCH];
-            cholesky_in_place(
-                l,
-                LltRegularization::default(),
-                Par::Seq,
-                MemStack::new(&mut buf),
-                Spec::default(),
-            )
-            .is_ok()
-        } else {
-            let mut mem = MemBuffer::new(req);
-            cholesky_in_place(
-                l,
-                LltRegularization::default(),
-                Par::Seq,
-                MemStack::new(&mut mem),
-                Spec::default(),
-            )
-            .is_ok()
-        }
+    #[inline(always)]
+    fn as_f64s(s: &[f64]) -> Option<&[f64]> {
+        Some(s)
     }
-
-    fn syrk_lower_sub(
-        bt: &[f64],
-        t_dim: usize,
-        w_tot: usize,
-        tail: &mut [f64],
-        _scratch: &mut [f64],
-    ) {
-        tri_lower_sub_gemm(tail, t_dim, bt, bt, w_tot);
-    }
-}
-
-/// Lower Cholesky by the plain column algorithm, generic over the scalar.
-/// Column-major, element `(i, j)` at `j*dim + i`; only the lower triangle of
-/// `a` is read and only the lower triangle of `l_out` is written. `false` on a
-/// non-positive or non-finite pivot, tested on the value part.
-///
-/// This is what a non-`f64` scalar uses in place of faer's blocked kernel.
-/// It is NOT bit-identical to faer and is not meant to be: `impl Scalar for f64`
-/// keeps the faer override, which is what every `f64` fit runs.
-pub(crate) fn chol_lower_generic<T: Scalar>(a: &[T], dim: usize, l_out: &mut [T]) -> bool {
-    for j in 0..dim {
-        let mut d = a[j * dim + j];
-        for k in 0..j {
-            let l = l_out[k * dim + j];
-            d -= l * l;
-        }
-        if !(d.value().is_finite() && d.value() > 0.0) {
-            return false;
-        }
-        let ljj = d.sqrt();
-        l_out[j * dim + j] = ljj;
-        for i in (j + 1)..dim {
-            let mut s = a[j * dim + i];
-            for k in 0..j {
-                s -= l_out[k * dim + i] * l_out[k * dim + j];
-            }
-            l_out[j * dim + i] = s / ljj;
-        }
-    }
-    true
-}
-
-/// `tail(lower) -= a · bᵀ` via faer's blocked triangular `matmul`. `tail` is
-/// column-major `t_dim×t_dim` (lower triangle touched and written), `a` and
-/// `b` are column-major `t_dim×w_tot`. Pulled out of `<f64 as Scalar>::syrk_lower_sub`
-/// so the dual-number override below can drive the same faer call once per
-/// lane instead of duplicating it.
-pub(crate) fn tri_lower_sub_gemm(
-    tail: &mut [f64],
-    t_dim: usize,
-    a: &[f64],
-    b: &[f64],
-    w_tot: usize,
-) {
-    use faer::linalg::matmul::triangular::{matmul, BlockStructure};
-    let a = faer::MatRef::from_column_major_slice(&a[..t_dim * w_tot], t_dim, w_tot);
-    let b = faer::MatRef::from_column_major_slice(&b[..t_dim * w_tot], t_dim, w_tot);
-    let tail = faer::MatMut::from_column_major_slice_mut(&mut tail[..t_dim * t_dim], t_dim, t_dim);
-    matmul(
-        tail,
-        BlockStructure::TriangularLower,
-        faer::Accum::Add,
-        a,
-        BlockStructure::Rectangular,
-        b.transpose(),
-        BlockStructure::Rectangular,
-        -1.0,
-        faer::Par::Seq,
-    );
-}
-
-/// `tail(lower) -= bt · btᵀ`, generic over the scalar. `tail` is column-major
-/// `t_dim×t_dim` (lower triangle touched), `bt` column-major `t_dim×w_tot`.
-pub(crate) fn syrk_lower_sub_generic<T: Scalar>(
-    bt: &[T],
-    t_dim: usize,
-    w_tot: usize,
-    tail: &mut [T],
-) {
-    for j in 0..t_dim {
-        for i in j..t_dim {
-            let mut s = T::ZERO;
-            for k in 0..w_tot {
-                s += bt[k * t_dim + i] * bt[k * t_dim + j];
-            }
-            tail[j * t_dim + i] -= s;
-        }
+    #[inline(always)]
+    fn as_f64s_mut(s: &mut [f64]) -> Option<&mut [f64]> {
+        Some(s)
     }
 }
 

@@ -69,7 +69,9 @@ impl<T: Scalar> LaplaceFactor<T> for BlockedFactor<'_, T> {
             }
         }
         // --- scatter-pass (scalar): wᵢmᵢmᵢ' and rᵢ·mᵢ into the blocks.
-        // The effective residual rᵢ is logit's (yᵢ−pᵢ) or the general W·working_resid. ---
+        // The effective residual rᵢ is logit's (yᵢ−pᵢ) or the general W·working_resid
+        // (probit's through `family::ProbitRows`). ---
+        let mut probit_rows = crate::family::ProbitRows::new(family, eta, prob);
         for i in 0..n {
             let m_row = &m_buf[i * q..i * q + q];
             let f = cluster_ids[i] as usize;
@@ -81,7 +83,12 @@ impl<T: Scalar> LaplaceFactor<T> for BlockedFactor<'_, T> {
                     Family::Binomial {
                         link: BinomialLink::Logit,
                     } => T::from_f64(y[i]) - prob[i],
-                    other => crate::family::row_score(other, nb_theta, y[i], 1.0, eta[i], prob[i]),
+                    other => match probit_rows.as_mut() {
+                        Some(rows) => T::from_f64(rows.score(i, y[i], 1.0)),
+                        None => {
+                            crate::family::row_score(other, nb_theta, y[i], 1.0, eta[i], prob[i])
+                        }
+                    },
                 };
             for r in 0..q {
                 a_rhs[ubase + r] += m_row[r] * resid;
@@ -750,6 +757,17 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                         Family::Poisson { .. } if !exact_obj => {
                             pa.run(curv_h, logdet_beta, logdet_u, |i| w[i].value())
                         }
+                        // Probit `dW_obs/dη` off a φ tile (`family::ProbitRows`).
+                        _ if exact_obj => match crate::family::ProbitRows::new(family, eta, prob) {
+                            Some(rows) => {
+                                let rows = std::cell::RefCell::new(rows);
+                                pa.run(curv_h, logdet_beta, logdet_u, |i| {
+                                    rows.borrow_mut()
+                                        .observed_weight_eta_deriv(i, y[i], prior_w[i])
+                                })
+                            }
+                            None => pa.run(curv_h, logdet_beta, logdet_u, general),
+                        },
                         _ => pa.run(curv_h, logdet_beta, logdet_u, general),
                     }
                 }
@@ -972,52 +990,96 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             }
             // T_f = A_f⁻¹ (M'WX)_f per block, reusing this iteration's factor left in
             // `a_blocks`; ainv_mtwx rows f·q.. hold T_f. (M'WX)_f[c, col] = xtwm[(col, f·q+c)].
-            // Mirrors blocked_schur_fill:360-374.
-            for f in 0..s {
-                let ablk = f * q * q;
-                for col in 0..p {
-                    let mut rhs = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
+            // Mirrors blocked_schur_fill:360-374. On the row-major path the
+            // solve runs on all p columns at once, in place on `bt_rows`
+            // (which holds (M'WX)_f row-major, `[(f·q + c)·p + col]`, and then
+            // T row-major for the residual-row kernel): the same operations,
+            // in the same order, per column as `glmm_block_solve`.
+            if rows_ok && p <= BORDER_PMAX {
+                for f in 0..s {
+                    let ablk = f * q * q;
+                    let l = &layout.a_blocks[ablk..ablk + q * q];
+                    let blk = &mut bt_rows[f * q * p..(f + 1) * q * p];
+                    with_const_p!(p, P => block_solve_cols_p::<T, P>(l, q, p, blk));
                     for c in 0..q {
-                        rhs[c] = T::from_f64(xtwm[(col, f * q + c)]);
+                        for col in 0..p {
+                            ainv_mtwx[(f * q + c, col)] = blk[c * p + col];
+                        }
                     }
-                    glmm_block_solve(&layout.a_blocks[ablk..ablk + q * q], q, &mut rhs[..q]);
-                    for c in 0..q {
-                        ainv_mtwx[(f * q + c, col)] = rhs[c].value();
+                }
+            } else {
+                for f in 0..s {
+                    let ablk = f * q * q;
+                    for col in 0..p {
+                        let mut rhs = [T::ZERO; crate::lmm::MAX_PRIMARY_Q];
+                        for c in 0..q {
+                            rhs[c] = T::from_f64(xtwm[(col, f * q + c)]);
+                        }
+                        glmm_block_solve(&layout.a_blocks[ablk..ablk + q * q], q, &mut rhs[..q]);
+                        for c in 0..q {
+                            ainv_mtwx[(f * q + c, col)] = rhs[c].value();
+                        }
                     }
                 }
             }
-            // Residual rows rᵢ = xᵢ − T_fᵀmᵢ into `wx`, then S_β and the
-            // right-hand side off them. A block-diagonal, so the per-block
-            // solves equal the full A⁻¹M'WX and row i couples to its cluster's
-            // q columns only.
-            for i in 0..n {
-                let f = cluster_ids[i] as usize;
-                for col in 0..p {
-                    let mut r = x[(i, col)];
-                    for c in 0..q {
-                        r -= m_buf[i * q + c].value() * ainv_mtwx[(f * q + c, col)];
+            // Residual rows rᵢ = xᵢ − T_fᵀmᵢ, then S_β and the right-hand side
+            // off them. A block-diagonal, so the per-block solves equal the
+            // full A⁻¹M'WX and row i couples to its cluster's q columns only.
+            // On the row-major path each tile of residual rows goes straight
+            // into the border sums (`BorderAcc`) while it is in cache, and
+            // `wx` is not written.
+            if rows_ok && p <= BORDER_PMAX {
+                let mut tile = [0.0f64; BORDER_PMAX * BORDER_TILE];
+                let mut wt = [0.0f64; BORDER_TILE];
+                let mut rt = [0.0f64; BORDER_TILE];
+                let mut acc = BorderAcc::new();
+                let scores = super::ProfileScores::new(family, nb_theta, y, prior_w, eta, prob);
+                let mut i0 = 0;
+                while i0 < n {
+                    let len = (n - i0).min(BORDER_TILE);
+                    with_const_p!(p, P => residual_tile_p::<T, P>(
+                        xr_all, &bt_rows[..k * p], &m_buf[..], cluster_ids, q, p, i0, len,
+                        &mut tile,
+                    ));
+                    for ii in 0..len {
+                        let i = i0 + ii;
+                        wt[ii] = w[i].value();
+                        rt[ii] = scores.at(i);
                     }
-                    wx[(i, col)] = r;
+                    let mut cols: [&[f64]; BORDER_PMAX] = [&[]; BORDER_PMAX];
+                    for (col, c) in cols[..p].iter_mut().enumerate() {
+                        *c = &tile[col * BORDER_TILE..col * BORDER_TILE + len];
+                    }
+                    acc.add_tile(&cols[..p], &wt[..len], &rt[..len], true);
+                    i0 += len;
                 }
+                let mut tc: [&[f64]; BORDER_PMAX] = [&[]; BORDER_PMAX];
+                let tm = ainv_mtwx.as_ref().subrows(0, k);
+                assert!(border_cols(tm, &mut tc), "faer Mat columns are contiguous");
+                acc.add_rows(&tc[..p], k, |_| 1.0, |j| u_prev[j].value(), true);
+                acc.write(p, schur, Some(&mut beta_rhs[..p]));
+            } else {
+                for i in 0..n {
+                    let f = cluster_ids[i] as usize;
+                    for col in 0..p {
+                        let mut r = x[(i, col)];
+                        for c in 0..q {
+                            r -= m_buf[i * q + c].value() * ainv_mtwx[(f * q + c, col)];
+                        }
+                        wx[(i, col)] = r;
+                    }
+                }
+                let scores = super::ProfileScores::new(family, nb_theta, y, prior_w, eta, prob);
+                residual_border(
+                    |i| w[i].value(),
+                    |i| scores.at(i),
+                    wx.as_ref().subrows(0, n),
+                    ainv_mtwx.as_ref().subrows(0, k),
+                    |j| u_prev[j].value(),
+                    schur,
+                    &mut beta_rhs[..p],
+                );
             }
-            residual_border(
-                |i| w[i].value(),
-                |i| {
-                    profile_row_score(
-                        family,
-                        nb_theta,
-                        y[i],
-                        prior_w[i],
-                        eta[i].value(),
-                        prob[i].value(),
-                    )
-                },
-                wx.as_ref().subrows(0, n),
-                ainv_mtwx.as_ref().subrows(0, k),
-                |j| u_prev[j].value(),
-                schur,
-                &mut beta_rhs[..p],
-            );
             // Exact mode: the step is Newton on the Laplace profile, so it also
             // carries log|A|'s gradient `c_β` and curvature in β
             // (`logdet_beta_curvature`), with the same ½ as the objective's
@@ -1331,6 +1393,7 @@ fn fused_profile_rows_p<T: Scalar, const P: usize>(
             link: BinomialLink::Logit
         }
     );
+    let mut probit_rows = crate::family::ProbitRows::new(family, eta, prob);
     for i in 0..n {
         let xr = &xr_all[i * p..i * p + p];
         let f = cluster_ids[i] as usize;
@@ -1340,6 +1403,8 @@ fn fused_profile_rows_p<T: Scalar, const P: usize>(
         let resid = T::from_f64(pw)
             * if logit {
                 T::from_f64(y[i]) - prob[i]
+            } else if let Some(rows) = probit_rows.as_mut() {
+                T::from_f64(rows.score(i, y[i], 1.0))
             } else {
                 crate::family::row_score(family, nb_theta, y[i], 1.0, eta[i], prob[i])
             };
@@ -1370,6 +1435,83 @@ fn fused_profile_rows_p<T: Scalar, const P: usize>(
                     bt_f[c * p + r] += xw * m_row[c].value();
                 }
             }
+        }
+    }
+}
+
+/// `glmm_block_solve` on the `q×p` row-major right-hand side `b`
+/// (`b[c·p + col]`), all `p` columns at once: per column the same
+/// subtractions and divisions in the same order, so the same bits.
+#[inline(always)]
+fn block_solve_cols_p<T: Scalar, const P: usize>(l: &[T], q: usize, p_rt: usize, b: &mut [f64]) {
+    let p = if P == DYN { p_rt } else { P };
+    for r in 0..q {
+        let (done, rest) = b.split_at_mut(r * p);
+        let row = &mut rest[..p];
+        for c in 0..r {
+            let lrc = l[r * q + c].value();
+            let bc = &done[c * p..c * p + p];
+            for col in 0..p {
+                row[col] -= lrc * bc[col];
+            }
+        }
+        let d = l[r * q + r].value();
+        for v in row.iter_mut() {
+            *v /= d;
+        }
+    }
+    for r in (0..q).rev() {
+        let (head, tail) = b.split_at_mut((r + 1) * p);
+        let row = &mut head[r * p..r * p + p];
+        for c in (r + 1)..q {
+            let lcr = l[c * q + r].value();
+            let bc = &tail[(c - r - 1) * p..(c - r) * p];
+            for col in 0..p {
+                row[col] -= lcr * bc[col];
+            }
+        }
+        let d = l[r * q + r].value();
+        for v in row.iter_mut() {
+            *v /= d;
+        }
+    }
+}
+
+/// Residual rows `rᵢ = xᵢ − T_fᵀmᵢ` of rows `i0..i0 + len` into the
+/// column-major tile `out` (column `col` at `col·BORDER_TILE`), off the
+/// row-major `X` copy and `T` row-major in `tr` (`[(f·q + c)·p + col]`). Each
+/// entry subtracts the `q` terms in the same order as the `MatRef` loop.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn residual_tile_p<T: Scalar, const P: usize>(
+    xr_all: &[f64],
+    tr: &[f64],
+    m_buf: &[T],
+    cluster_ids: &[u32],
+    q: usize,
+    p_rt: usize,
+    i0: usize,
+    len: usize,
+    out: &mut [f64; BORDER_PMAX * BORDER_TILE],
+) {
+    let p = if P == DYN { p_rt } else { P };
+    for ii in 0..len {
+        let i = i0 + ii;
+        let f = cluster_ids[i] as usize;
+        let mut r = [0.0f64; BORDER_PMAX];
+        let r = &mut r[..p];
+        r.copy_from_slice(&xr_all[i * p..i * p + p]);
+        let tf = &tr[f * q * p..(f + 1) * q * p];
+        let m_row = &m_buf[i * q..i * q + q];
+        for c in 0..q {
+            let mc = m_row[c].value();
+            let t_row = &tf[c * p..c * p + p];
+            for col in 0..p {
+                r[col] -= mc * t_row[col];
+            }
+        }
+        for col in 0..p {
+            out[col * BORDER_TILE + ii] = r[col];
         }
     }
 }
@@ -1554,7 +1696,7 @@ fn refresh_rows_p<T: Scalar, const P: usize>(
 pub(super) fn structured_border_rows<T: Scalar>(
     w: &[T],
     m_core_buf: &[T],
-    cross_val: &[T],
+    cross_theta: &[T],
     cross_col: &[u32],
     n_cross: &[u8],
     cluster_ids: &[u32],
@@ -1570,7 +1712,7 @@ pub(super) fn structured_border_rows<T: Scalar>(
     let k = (q + np) * s + e;
     bt[..k * p].fill(0.0);
     with_const_p!(p, P => structured_border_rows_p::<T, P>(
-        w, m_core_buf, cross_val, cross_col, n_cross, cluster_ids, xr_all, q, np, s, p, n, bt,
+        w, m_core_buf, cross_theta, cross_col, n_cross, cluster_ids, xr_all, q, np, s, p, n, bt,
     ))
 }
 
@@ -1580,7 +1722,7 @@ pub(super) fn structured_border_rows<T: Scalar>(
 fn structured_border_rows_p<T: Scalar, const P: usize>(
     w: &[T],
     m_core_buf: &[T],
-    cross_val: &[T],
+    cross_theta: &[T],
     cross_col: &[u32],
     n_cross: &[u8],
     cluster_ids: &[u32],
@@ -1616,7 +1758,7 @@ fn structured_border_rows_p<T: Scalar, const P: usize>(
         }
         for z in 0..ncz {
             let col = k_family + cross_col[cbase + z] as usize;
-            let cv = cross_val[cbase + z].value();
+            let cv = cross_theta[z].value();
             for (b, &xv) in bt[col * p..col * p + p].iter_mut().zip(xr) {
                 *b += xv * wi * cv;
             }

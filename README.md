@@ -75,7 +75,7 @@ README's own copy of the essentials, not the whole set.
 | [`documentation/coming-from-statsmodels.md`](documentation/coming-from-statsmodels.md) | Migrating from `statsmodels` `MixedLM`/`GLM` to `glmm.fit` (Python only) |
 | [`documentation/troubleshooting.md`](documentation/troubleshooting.md) | Fixes for singular fits, non-convergence, NotImplementedError, and rejected formulas |
 
-## Scope and stability (0.4.x)
+## Scope and stability (0.5.x)
 
 The semver-covered surface is `fit_cold`/`fit_warm` + `ModelSpec` + `GroupIds`.
 
@@ -189,6 +189,7 @@ See the [R README](r/README.md) and
 |----------------|--------------------------------------------------------------------|
 | No `unsafe`    | zero `unsafe` (workspace baseline `unsafe_code = "warn"`)           |
 | Deterministic  | no RNG, no global state, no I/O in the fit path                     |
+| Reproducible   | the same model fitted on Linux (x86-64), macOS (Apple silicon) or in WebAssembly gives the same fit: across the 794 validation models the log-likelihoods differ by at most 3e-7 (typically 1e-11), and estimates typically agree to 8 significant digits. A WebAssembly build gives bit-identical results on both machines tested. |
 | Linear algebra | [`faer`](https://crates.io/crates/faer) 0.24, pinned               |
 | MSRV           | Rust 1.85 (floor set by the `bobyqa` dep)                          |
 

@@ -13,9 +13,9 @@ links, knobs) is a string or scalar argument, not a type.
 > **Status:** this release ships the full API surface — signatures, argument
 > validation, `Fit`, `summary()` — wired end to end through the PyO3 binding:
 > a valid `fit(...)` call parses the formula, fits, and returns a real `Fit`.
-> Two narrow combinations are open gaps and raise a clean `NotImplementedError`
-> instead: quasi-likelihood `dispersion=` on binomial/poisson, and an
-> `init_theta=` float seed (see §2).
+> One narrow combination is an open gap and raises a clean
+> `NotImplementedError` instead: quasi-likelihood `dispersion=` on
+> binomial/poisson.
 
 Install from PyPI:
 
@@ -108,12 +108,13 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
 - `wald_se` — fixed-effect Wald-SE denominator: `"hessian"` (default) or
   `"rx"`.
 - `init_theta` — negative-binomial shape seed, named for
-  `MASS::glm.nb(init.theta=)`. `None` (default, the only value the kernel
-  currently accepts) cold-starts the θ search; a float raises
-  `NotImplementedError` — there is no kernel hook yet to seed it. Estimation
-  always runs. Distinct from `warm_start["theta"]`, the random-effect Cholesky
-  start (§4): unrelated knobs that happen to share a Greek letter, which is why
-  this one is not just called `theta`. Both may be passed in one call.
+  `MASS::glm.nb(init.theta=)`: the starting value of the shape search, the
+  same slot as `warm_start["dispersion"]` (give one of the two). `None`
+  (default) cold-starts it from the no-random-effect negative-binomial fit.
+  Estimation always runs. Distinct from `warm_start["theta"]`, the
+  random-effect Cholesky start (§4): unrelated knobs that happen to share a
+  Greek letter, which is why this one is not just called `theta`. Both may be
+  passed in one call.
 - `weights` — per-row prior weights, lme4's `weights=`. On gaussian, gamma
   and inverse-gaussian these are precision weights: row `i` gets dispersion
   `φ/wᵢ`, the same convention as `lm`, `summary(glm)` and lme4, not
@@ -158,6 +159,7 @@ them). It is returned by `fit`, never constructed by callers.
 | `dispersion` | φ (gamma / inverse-gaussian) / θ (negbin) / 1.0 otherwise |
 | `re_groups` | per grouping, in `varcorr` order (formula order): `(name, [term names])` — what `summary()` labels the RE block with |
 | `n_eval` | optimizer objective evaluations (0 on the closed-form/IRLS paths) |
+| `n_grad`, `outer_stop`, `outer_decrement` | the gradient (BFGS) search, on the models `GradientSearchFallbackWarning` names: its gradient evaluations (not in `n_eval`), why it stopped (`"fdelta"`, `"pgrad"`, `"noise_floor"`, `"line_search"`, `"max_iter"`, `"grad_unavailable"`, `"non_finite"`), and its estimate of the deviance decrease left at the endpoint; `0` / `None` / `NaN` on every other fit |
 | `deviance` | minimized optimizer criterion — **not** comparable across models, and not an AIC input (see below) |
 | `loglik` | log-likelihood on `logLik()`'s scale (R/lme4); the REML criterion for an LMM (see `reml`), the ordinary log-likelihood for OLS/GLM/GLMM; `NaN` wherever `deviance`'s failure modes apply |
 | `df` | parameters counted for AIC/BIC: retained fixed effects + RE parameters + 1 if the family estimates a dispersion/scale; `0` on degenerate NaN-fill paths |
@@ -233,11 +235,14 @@ fit2 = glmm.fit(data2, "y ~ x1 + (1 | group)",
                 warm_start={"beta": list(fit1.beta), "theta": [...]})
 ```
 
-The dict takes exactly two keys, mirroring the Rust `StartValues`: `"beta"`
-(length p) and `"theta"` (Cholesky-scaled RE start; empty for fixed-only
-models, where a warm start is a no-op anyway). Unknown keys warn and are
-dropped. The gamma φ is a post-fit estimate, and the negative-binomial θ seed
-is the `init_theta=` kwarg (§2). `warm_start` is always explicit, caller-owned —
+The dict takes up to three keys, mirroring the Rust `StartValues`: `"beta"`
+(length p), `"theta"` (Cholesky-scaled RE start; empty for fixed-only
+models, where a warm start is a no-op anyway) and `"dispersion"` (a previous
+fit's `Fit.dispersion`: the negative-binomial shape or the Gamma φ, a starting
+value for the search, never a held value; `dispersion=` holds φ fixed).
+Any key may be left out to cold-start that part. Unknown keys warn and are
+dropped. For negative binomial `"dispersion"` and the `init_theta=` kwarg
+(§2) are the same seed; give one of the two. `warm_start` is always explicit, caller-owned —
 a previous fit's state is never threaded forward automatically.
 
 **Batch processing** (many fits with same formula behind one call — bootstrap,

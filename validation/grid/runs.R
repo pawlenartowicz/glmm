@@ -119,6 +119,40 @@ newest_oracle_run <- function(grid_dir, oracle, want_version, required_cells) {
   NULL
 }
 
+# glmer's second optimizer stage (lme4's Nelder_Mead) stops at its `maxfun`
+# (10000 by default, which the grid's lme4 engine never raises) and counts the one
+# evaluation past it, so a record with n_eval > LME4_GLMER_MAXFUN stopped at the
+# cap rather than at an optimum. lme4 itself still calls such a fit converged on
+# every cell above `check.conv.nobsmax` rows (10000): it skips its own gradient
+# checks there, and the optimizer's nonzero return code and its "failure to
+# converge in 10000 evaluations" warning live in `optinfo`, which the engine did
+# not read before 2026-10-07. The frozen references (RULE 0) are not rewritten:
+# the record is reclassified as it is read, from the n_eval it already carries.
+# A Gaussian cell is fitted by lmer (nloptwrap, a different budget) and is left
+# alone.
+LME4_GLMER_MAXFUN <- 10000L
+
+reclassify_capped_oracle <- function(run, oracle, cells) {
+  if (is.null(run) || !identical(oracle, "lme4")) return(run)
+  for (cid in names(run$recs)) {
+    r <- run$recs[[cid]]
+    cl <- cells[[cid]]
+    if (is.null(cl) || identical(cl[["family"]], "gaussian")) next
+    if (is.null(r$n_eval) || is.na(r$n_eval) || r$n_eval <= LME4_GLMER_MAXFUN) next
+    if (!isTRUE(r$converged)) next
+    note <- sprintf(paste0("evaluation cap: n_eval %d > glmer maxfun %d, so the ",
+                           "optimizer stopped at its budget, not at an optimum ",
+                           "(reclassified on read by runs.R)"),
+                    as.integer(r$n_eval), LME4_GLMER_MAXFUN)
+    r$converged <- FALSE
+    r$status <- "engine-fail"
+    r$message <- if (is.null(r$message) || !nzchar(r$message)) note
+                 else paste(note, r$message, sep = "; ")
+    run$recs[[cid]] <- r
+  }
+  run
+}
+
 # The glmm (or port) run to gate or report on. `subset: "full"` runs are
 # PREFERRED, newest first; anything else is a fallback used only when no full run
 # exists. Without that preference, a `--fast` port-gate run made minutes after

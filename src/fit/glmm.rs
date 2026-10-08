@@ -308,10 +308,13 @@ pub(crate) fn fit_glmm_packed(
     // NB seeds its `ln θ_NB` coordinate from the no-RE GLM-NB's own θ̂, exactly
     // as [`fit_glmm_nb`] does, so the two routes start the same search.
     let nb_theta = match model.family {
-        Family::NegativeBinomial { .. } => {
-            let (prefit, theta) = super::glm::fit_glm_nb(x_mat, y, n, p, None, opts, &map);
-            nb_glmm_seed(prefit.converged(), theta)
-        }
+        Family::NegativeBinomial { .. } => match start.as_ref().and_then(|s| s.dispersion) {
+            Some(d) => d,
+            None => {
+                let (prefit, theta) = super::glm::fit_glm_nb(x_mat, y, n, p, None, opts, &map);
+                nb_glmm_seed(prefit.converged(), theta)
+            }
+        },
         _ => nb_theta,
     };
     fit_glmm_prebuilt(
@@ -388,6 +391,15 @@ impl GlmmResultView<'_> {
     pub(crate) fn betas(&self) -> &[f64] {
         &self.ws.betas
     }
+    /// The estimated Gamma φ̂ in the caller's units (`Fit::dispersion`'s
+    /// value), the one to carry into [`crate::StartValues::dispersion`].
+    /// `None` off Gamma, on a held φ and on a fit with no endpoint.
+    pub(crate) fn dispersion_estimate(&self) -> Option<f64> {
+        let estimated = matches!(self.ws.family, Family::Gamma { .. })
+            && self.ws.gamma_phi_held.is_none()
+            && self.has_endpoint();
+        estimated.then_some(self.ws.weight_scale * self.ws.gamma_phi)
+    }
     /// Per-predictor Var(β̂_j), predictor-indexed length p — only the
     /// `target_indices` slots are written; a non-target slot reads 0.0 on a
     /// fresh workspace or a previous fit's value on a reused one.
@@ -413,6 +425,10 @@ impl GlmmResultView<'_> {
             final_pirls_exhausted: self.ws.final_pirls_exhausted,
             hessian_fallback: self.fit.hessian_fallback,
             exact_profile_fallback: self.fit.exact_profile_fallback,
+            gradient_search_fallback: self.fit.gradient_search_fallback,
+            n_grad: self.ws.grad_report.map_or(0, |r| r.1 as u32),
+            outer_stop: self.ws.grad_report.map(|r| r.0.into()),
+            outer_decrement: self.ws.grad_report.map_or(f64::NAN, |r| r.2),
             se_unavailable: self.fit.se_unavailable,
             precision_limited: self.fit.precision_limited,
             separated: self.fit.separated,
@@ -510,6 +526,15 @@ pub(crate) fn run_glmm_on<'a>(
     // so a held raw-scale `v` enters there as `v/s`.
     ws.gamma_phi_held = match model.family {
         Family::Gamma { .. } => opts.dispersion.map(|v| v / ws.weight_scale),
+        _ => None,
+    };
+    // A carried Gamma φ (`StartValues::dispersion`) seeds the `ln φ`
+    // coordinate, on the same internal scale as a held one. Set on every
+    // call, so a reused workspace never keeps a previous draw's.
+    ws.gamma_phi_start = match model.family {
+        Family::Gamma { .. } => start
+            .and_then(|s| s.dispersion)
+            .map(|v| v / ws.weight_scale),
         _ => None,
     };
     // Gamma inverse link: the search runs in units read off the data and is
@@ -1173,8 +1198,15 @@ pub(super) fn fit_glmm_nb(
     // if the first inner IRLS failed, the θ reached so far if a later one did —
     // because the `Fit`'s own `dispersion` field is NaN unless the prefit
     // converged.
-    let (prefit, prefit_theta) = super::glm::fit_glm_nb(x, y, n, p, None, opts, cs);
-    let nb_seed = nb_glmm_seed(prefit.converged(), prefit_theta);
+    // A carried shape (`StartValues::dispersion`) is the seed itself, and the
+    // prefit that exists only to produce one is skipped.
+    let nb_seed = match start.as_ref().and_then(|s| s.dispersion) {
+        Some(d) => d,
+        None => {
+            let (prefit, prefit_theta) = super::glm::fit_glm_nb(x, y, n, p, None, opts, cs);
+            nb_glmm_seed(prefit.converged(), prefit_theta)
+        }
+    };
     fit_glmm_prebuilt(
         ws,
         x,

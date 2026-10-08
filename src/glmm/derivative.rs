@@ -54,10 +54,50 @@
 //!   so the fallback table stays complete against `deviance.rs`'s own
 //!   three-way routing.
 //!
-//! **Memory is never a fallback reason.** There is no byte budget (see
-//! `MAX_DUAL_N`'s own doc comment) — bigger buffers are allowed wherever they
-//! make the code faster or simpler; only compute shape, (a)–(c), routes to
-//! `Unsupported`.
+//! **Memory is never a fallback reason.** Only compute shape, (a)–(c), routes
+//! to `Unsupported`; there is no byte budget on the blocked and structured
+//! layouts. Within that, the scratch follows three rules:
+//!
+//! - **A buffer a shape never reads is not allocated.** The structured row
+//!   buffer (`StructuredScratch::m_core_buf`) exists only on the structured
+//!   layout, the observed factors only on a non-canonical link, the crossed
+//!   values once per grouping rather than once per row, and the assembled
+//!   Hessian keeps no per-row pass values: its row walk forms and drops them
+//!   (`assembled::assemble`). The coupling-shaped twins of the structured
+//!   layout hold the design's own coupling pattern ([`dual_coupling_pairs`])
+//!   once it is known, not the `rows · MAX_EXTRA_GROUPINGS` bound.
+//! - **On the blocked layout the assembled Hessian runs one block of rows at
+//!   a time** (`assembled::run_assembled_hessian_blocked`, above
+//!   `assembled::SE_ROW_BLOCK` rows): every per-row and per-cluster dual
+//!   buffer is block-sized ([`GlmmDualScratch::for_shape_row_blocked`]), so
+//!   the scratch no longer grows with `n`, and the pass is faster for it
+//!   (cache residency and fewer first-touch page faults, the same work).
+//! - **On the structured layout it streams its row values instead**
+//!   (above the same block size): the crossed Schur couples every cluster, so
+//!   the cluster- and pair-level buffers stay whole, but the dual PIRLS
+//!   (`pirls::structured_stream_deviance`) and the assembly form each row
+//!   block's values and drop them ([`GlmmDualScratch::for_shape_streamed`]),
+//!   with a bit-identical Hessian at the same speed.
+//! - **The assembled Hessian's lane width comes from a measured table**
+//!   ([`NLanes::pick_assembled`]). At `m` 13–18 the narrower rung is faster
+//!   on every host and also holds less scratch. At `m` 9–10 it is faster on
+//!   x86 but up to 12% slower on an Apple M4, taken for 54% less scratch.
+//! - **No other speed is traded for memory.** There is no slower memory-lean
+//!   route beyond that table row; one would apply only above a size
+//!   threshold, and none is implemented.
+//!
+//! Measured 2026-10-07 on a binomial fit with four random effects per group
+//! (`m = 14`, pawel, locked P-core): at 300k rows the SE scratch went from
+//! 906 MB to 324 MB with the buffer and lane rules, its first-touch page
+//! faults from 227k to 75k, and the SE step from 3.34 s to 2.15 s; the row
+//! blocks then take the scratch to 19 MB, the faults to about ten and the SE
+//! step to 0.70 of that. At 3M rows the fit's peak went from 10.7 GB to
+//! 4.4 GB with identical results, and with the row blocks to 1.33 GB, within
+//! 1% of the same fit with `WaldSe::Rx` (1.31 GB), with Hessian SEs that
+//! move by at most 3e-13 relative. On a binomial fit with four crossed
+//! groupings (`m = 6`) at 3M rows the streamed pass takes the SE scratch from
+//! 2.0 GB to 0.9 GB and the fit's peak from 3.2 GB to 2.1 GB (1.25 GB with
+//! `WaldSe::Rx`), with identical SEs; what is left is pair-level.
 
 // Every caller (`se.rs`, `glmm/mod.rs`, the tests) only matches
 // `DerivStatus::Ok(_)` as a success discriminant and never reads the wrapped
@@ -99,14 +139,52 @@ pub(crate) enum DerivStatus {
 /// at a non-`f64` scalar: [`PirlsScratch`] and [`StructuredScratch`]
 /// instantiated at `T`, sized by the same two constructors the `f64` workspace
 /// uses (`PirlsScratch::for_shape`, `StructuredScratch::for_shape`).
+/// The `(cluster, crossed column)` pairs of the design's full coupling
+/// pattern, when the workspace's pattern is known to be that full pattern:
+/// `pattern.coup_mask == Some(0)`, the CSR built for this fit's data with no
+/// crossed grouping pinned, which is the pattern every dual kernel call
+/// builds and reads (`deviance::structured_laplace_deviance` keys its CSR
+/// cache on mask 0 at a dual `T`). `None` otherwise (no CSR built yet this
+/// fit, or one built at a pinned θ), and the dual twins then take the
+/// [`coupling_len`](super::workspace::coupling_len) bound.
+///
+/// The bound is `q_core · min(s·e, rows·MAX_EXTRA_GROUPINGS)`; the pattern
+/// holds one pair per distinct crossed level a cluster's rows touch, about
+/// 2.2 per row on a four-way crossed binomial at 3M rows against the bound's
+/// 6, which on `Dual<8>` is about 0.8 GB per coupling-sized buffer.
+pub(crate) fn dual_coupling_pairs(
+    pattern: &super::workspace::StructuredPattern,
+    s: usize,
+) -> Option<usize> {
+    (pattern.coup_mask == Some(0)).then(|| pattern.coup_ptr[s] as usize)
+}
+
+/// Compact coupling length of the dual twins: `q_core` values per pair of
+/// [`dual_coupling_pairs`] when known and the shape has crossed extras, the
+/// [`coupling_len`](super::workspace::coupling_len) bound otherwise.
+pub(crate) fn dual_coupling_len(
+    rows: usize,
+    s: usize,
+    q_core: usize,
+    e: usize,
+    coup_pairs: Option<usize>,
+) -> usize {
+    match coup_pairs {
+        Some(pairs) if e > 0 && s > 0 => (q_core * pairs).max(1),
+        _ => super::workspace::coupling_len(rows, s, q_core, e),
+    }
+}
+
 pub(crate) struct GlmmDualBufs<T: Scalar> {
     pub(super) params: Vec<T>, // m (seeded per call)
     pub(super) beta: Vec<T>,   // p
     pub(super) pirls: PirlsScratch<T>,
     /// Sized via `StructuredScratch::for_shape` even on the no-extras blocked
-    /// path, where every field sits at its `.max(1)` minimum: the zero-alloc
-    /// gate is about repeat calls, and a lazy first-extras-call allocation
-    /// would break it on the very shape it is meant to cover.
+    /// path, where the row buffers (`m_core_buf`, `cross_theta`), the coupling
+    /// and the Schur block sit at their `.max(1)` minimum and only
+    /// `core_blocks` keeps its `s·q_p²`: the zero-alloc gate is about repeat
+    /// calls, and a lazy first-extras-call allocation would break it on the
+    /// very shape it is meant to cover.
     pub(super) structured: StructuredScratch<T>,
     // Per-solve controls handed to every dual kernel call; see `pirls::DualStep`.
     // Carries the blocked twin's scratch (`obs_blocks`, `s · q_p²`) and the
@@ -123,6 +201,23 @@ pub(crate) struct GlmmDualBufs<T: Scalar> {
     /// function of the same shape terms and the assembly reads them as one
     /// group.
     pub(super) asm: super::assembled::AssemblyBufs<T>,
+    /// The row-blocked assembled Hessian's block scratch
+    /// (`assembled::run_assembled_hessian_blocked`), present only on a scratch
+    /// built by [`GlmmDualScratch::for_shape_row_blocked`]. That scratch sizes
+    /// every per-row and per-cluster buffer above (and `asm`) at its minimum:
+    /// the blocked pass keeps them in here, block-sized, and reads only the
+    /// `k`-length mode `pirls.u`, `params`, `beta` and `grad_t` of the twin.
+    pub(super) row_blocks: Option<Box<super::assembled::RowBlockBufs<T>>>,
+    /// The streamed structured pass's block buffers (`pirls::StreamRows`),
+    /// present only on a scratch built by
+    /// [`GlmmDualScratch::for_shape_streamed`]. That scratch sizes the dual
+    /// PIRLS row buffers (`pirls.eta`, `prob`, `w`, `eta_fixed`, `mu`,
+    /// `m_buf`) and `structured.m_core_buf` at their minimum: the streamed
+    /// solve (`pirls::structured_stream_deviance`) and the assembly form every
+    /// per-row value block by block in here. The cluster- and pair-level
+    /// buffers (`core_blocks`, `coupling`, `schur_blk`, `asm.tail_h`) stay
+    /// whole, since the crossed Schur couples every cluster.
+    pub(super) stream_rows: Option<Box<super::pirls::StreamRows<T>>>,
 }
 
 /// `f64` mode-transfer buffers for one dual-scratch variant, sized once in
@@ -334,7 +429,10 @@ impl GlmmDualScratch {
 /// `DerivStatus::Unsupported` above the cap and the caller takes the assembled
 /// pass. Mirrors the `GlmmDualScratch` variants —
 /// change together, along with `MAX_DUAL_H` below, which hardcodes the same
-/// lane set.
+/// lane set. The assembled Hessian does not take the covering rung:
+/// [`NLanes::pick_assembled`] reads its rung off a measured table, because a
+/// pass costs little and padded lanes are the work (two `Dual<8>` passes beat
+/// two `Dual<12>` at `m` 13 to 16).
 pub(crate) const MAX_DUAL_N: usize = 12;
 
 /// Packed length of the largest instantiated `HyperDual<N, H>`'s second-
@@ -464,20 +562,55 @@ impl NLanes {
             (true, _) => NLanes::H12,
         })
     }
+
+    /// The first-order rung the assembled Hessian (`assembled.rs`) runs its
+    /// chunked passes on, chosen for speed from a measured table rather than
+    /// as the smallest rung covering `m`. A pass costs a fixed part (the dual
+    /// PIRLS settle and the assembly's own row walk) plus a part per lane, so
+    /// `⌈m/N⌉` passes of `N` lanes trade the two: two `Dual<8>` passes beat two
+    /// `Dual<12>` at `m` 13 to 16 because the `Dual<12>` pair carries 8 padded
+    /// lanes, and three `Dual<6>` beat two `Dual<12>` at 17 and 18. Where the
+    /// covering rung is as fast, it stays (fewer passes, same numbers).
+    ///
+    /// Measured 2026-10-07 (pawel, locked P-core, and an Apple M4; SE step on
+    /// the binomial blocked `q1`, `q3`, `q4` and structured `cross4` series at
+    /// 30k and 300k rows, geometric mean of the ratio to `pick(m, false)`):
+    /// `m` 13–16 `D8×2` 0.78–0.80, 17–18 `D6×3` 0.92, on both hosts, with
+    /// bit-identical Hessians and 31–46% less dual scratch. At 9–10 `D5×2`
+    /// replaces one `Dual<12>` pass: 0.93–0.96 on the blocked x86 series and
+    /// 1.006 on `cross4`, but 1.00–1.12 on the M4, for 54% less dual scratch
+    /// (accepted 2026-10-07: a slowdown on the M4 alone is acceptable for that
+    /// memory). Every other `m` up to 24 keeps the covering rung, and one table
+    /// serves every target.
+    /// Evidence: pawel `~/.cache/claude-scratch/mmjl-rethink/memspeed/step0/`.
+    ///
+    /// A pinned table, a function of `m` alone: no timing input and no
+    /// per-target branch, so a fit picks the same rung (and moves by the same
+    /// round-off) on every host, WASM included. Above 24 (unmeasured) it is
+    /// `pick(m, false)`'s top rung. The hyper-dual Hessian and the gradient
+    /// keep [`NLanes::pick`].
+    pub(crate) fn pick_assembled(m: usize) -> NLanes {
+        match m {
+            9..=10 => NLanes::D5,
+            13..=16 => NLanes::D8,
+            17..=18 => NLanes::D6,
+            _ => NLanes::pick(m, false).expect("the gradient ladder covers every m"),
+        }
+    }
 }
 
 /// Scratch length for `agq_scratch`, mirroring the f64 `ws.pirls.agq_scratch` field's
 /// shape rule exactly: the vector kernel (`q_p ≥ 2`) needs `2·s` (center loglik |
 /// running log-sum) plus a per-eval product-grid node table of `nagq^q_p · (q_p+1)`;
-/// the scalar kernel (`q_p == 1`) needs `4·s` (center loglik | node u_cj | per-node
-/// loglik | running log-sum). `nagq=1` shapes never reach the vector kernel, so
+/// the scalar kernel (`q_p == 1`) needs `7·s` (center loglik | node u_cj | per-node
+/// loglik | running log-sum | the compressed route's two sums and max |η|). `nagq=1` shapes never reach the vector kernel, so
 /// their `k^q=1` table is a harmless `q+1` slots.
 pub(super) fn agq_len(s: usize, q_p: usize, nagq: u8) -> usize {
     if q_p >= 2 {
         let kq = (nagq as usize).pow(q_p as u32);
         (2 * s + kq * (q_p + 1)).max(1)
     } else {
-        (4 * s).max(1)
+        (7 * s).max(1)
     }
 }
 
@@ -502,8 +635,8 @@ pub(super) fn agq_eligible(family: Family, nagq: u8, primary_q: usize) -> bool {
 /// shape-determining length `for_shape` chose is re-derived and compared
 /// (checking `eta` covers `prob`/`w`/`eta_fixed`/`mu`, allocated together at
 /// the same `rows`; `u` pins `k` and with it `u_prev`, `a_rhs`, and the
-/// `GlmmModeBufs`; `core_blocks` pins `q_core` and with it `m_core_buf`, and
-/// `schur_blk` pins `e` — the pair together pins `coupling`). The
+/// `GlmmModeBufs`; `core_blocks` pins `q_core`, `schur_blk` pins `e` — the
+/// pair together pins `coupling` — and `m_core_buf` pins `extras`). The
 /// `DualStep` twins mirror the same pinning: `obs_core_blocks` re-checks
 /// `q_core`, `obs_schur_blk` re-checks `e`, and `obs_rhs` needs no
 /// separate check because `u`'s `k` already covers it.
@@ -530,6 +663,9 @@ fn bufs_match_shape<T: Scalar>(
     q_p: usize,
     q_core: usize,
     e: usize,
+    // `!extra_offsets.is_empty()`: whether the structured row buffers
+    // (`m_core_buf`, `cross_theta`) carry storage; see `StructuredScratch::for_shape`.
+    extras: bool,
     nagq: u8,
     // Whether this fit takes the observed-information step (`!is_canonical`),
     // which is what decides whether the `DualStep` twins carry storage.
@@ -540,18 +676,67 @@ fn bufs_match_shape<T: Scalar>(
     // True on the `Dual` rungs, where the assembly runs and its scratch is
     // sized; false on the `HyperDual` rungs, which carry none.
     assembly: bool,
+    // Whether the scratch must be the row-blocked one
+    // (`GlmmDualScratch::for_shape_row_blocked`); a scratch of the other kind
+    // never matches, so the two routes rebuild rather than share it.
+    row_blocked: bool,
+    // The design's coupling pairs ([`dual_coupling_pairs`]); the
+    // coupling-shaped twins must hold at least what they give.
+    coup_pairs: Option<usize>,
+    // The streamed structured pass's block size
+    // (`GlmmDualScratch::for_shape_streamed`), `None` on every other scratch;
+    // a scratch of the other kind, or of another block size, never matches.
+    stream_block: Option<usize>,
 ) -> bool {
-    let d = DenseTwinShape::of(packed_width, k, rows, s, q_p, q_core, e, observed);
-    b.params.len() == m
+    let d = DenseTwinShape::of(
+        packed_width,
+        k,
+        rows,
+        s,
+        q_p,
+        q_core,
+        e,
+        extras,
+        observed,
+        row_blocked,
+    );
+    let coup_len = dual_coupling_len(d.rows, d.s, d.q_core, d.e, coup_pairs);
+    let asm_coup = if packed_width > 0 {
+        1
+    } else {
+        dual_coupling_len(rows, s, q_core, e, coup_pairs)
+    };
+    // The streamed pass keeps no `n`-length dual row buffers (see
+    // `GlmmDualBufs::stream_rows`).
+    let prow = if stream_block.is_some() { 0 } else { d.rows };
+    b.row_blocks.is_some() == row_blocked
+        && b.stream_rows.as_ref().map(|r| r.block) == stream_block
+        && b.params.len() == m
+        // At least, not equal: a twin sized at the bound serves a later call
+        // that knows the (smaller) pattern, and the kernels index only the
+        // pattern's `q_core · coup_ptr[s]` prefix.
+        && b.structured.coupling.len() >= coup_len
+        && b.dual.obs_coupling.len() >= obs_len(d.observed, coup_len)
         && b.beta.len() == p
         && b.pirls.lam.len() == d.q_p * d.q_p
-        && b.pirls.m_buf.len() == d.rows * d.q_p
-        && b.pirls.eta.len() == d.rows
+        && b.pirls.m_buf.len() == prow * d.q_p
+        && b.pirls.eta.len() == prow
         && b.pirls.u.len() == d.k.max(1)
         && b.pirls.a_blocks.len() == (d.s * d.q_p * d.q_p).max(1)
         && b.pirls.agq_scratch.len() == agq_len(d.s, d.q_p, nagq)
         && b.structured.core_blocks.len() == (d.q_core * d.q_core * d.s).max(1)
         && b.structured.schur_blk.len() == (d.e * d.e).max(1)
+        // Required, not defensive: a nested-only structured shape (`e = 0`,
+        // `q_core = q_p + np`) and an extras-free shape agree on every other
+        // length here at equal `q_core`, and `build_packed_m` writes
+        // `m_core_buf[i·q_core + …]` on every row.
+        && b.structured.m_core_buf.len()
+            == (if d.extras && stream_block.is_none() {
+                d.rows * d.q_core
+            } else {
+                0
+            })
+            .max(1)
         // `obs_core_blocks` pins `q_core` (and with it `obs_coupling`),
         // `obs_schur_blk` pins `e`; `u`'s `k`, already checked above, pins
         // `obs_rhs` — no separate check needed.
@@ -560,13 +745,16 @@ fn bufs_match_shape<T: Scalar>(
         && b.dual.obs_schur_blk.len() == obs_len(d.observed, (d.e * d.e).max(1))
         && b.grad_t.len() == m
         && if assembly {
-            b.asm.g_gamma.len() == (m * k).max(1)
+            b.asm.g_gamma.len() == (m * if row_blocked { 0 } else { k }).max(1)
+                && (row_blocked || b.asm.tail_h.len() >= asm_coup)
+                && (row_blocked || b.asm.obs_coup.len() >= obs_len(observed, asm_coup))
                 && b.asm.packed_len() == rows * packed_width
-                // `PackedAsmBufs::for_shape` sizes `obs` to `k²` on every
-                // packed shape, canonical or not. `packed_width > 0` mirrors
-                // that function, which allocates nothing when `width == 0` —
-                // change together.
-                && b.asm.packed_obs_len() == if packed_width > 0 { k * k } else { 0 }
+                // `PackedAsmBufs::for_shape` sizes `obs` to `k²` on a
+                // non-canonical packed shape and to nothing otherwise.
+                // `packed_width > 0` mirrors that function, which allocates
+                // nothing when `width == 0` — change together.
+                && b.asm.packed_obs_len()
+                    == obs_len(observed, if packed_width > 0 { k * k } else { 0 })
         } else {
             b.asm.g_gamma.is_empty()
         }
@@ -592,6 +780,7 @@ struct DenseTwinShape {
     q_p: usize,
     q_core: usize,
     e: usize,
+    extras: bool,
     observed: bool,
 }
 
@@ -605,7 +794,12 @@ impl DenseTwinShape {
         q_p: usize,
         q_core: usize,
         e: usize,
+        extras: bool,
         observed: bool,
+        // Built for the row-blocked assembled Hessian: the per-row and
+        // per-cluster twins live in its block scratch, so they sit at their
+        // minimum here; `k` (the shared mode `u`) stays.
+        row_blocked: bool,
     ) -> DenseTwinShape {
         if packed_width > 0 {
             // `q_p`/`q_core` stay 1: `PirlsScratch::for_shape` divides no
@@ -618,16 +812,18 @@ impl DenseTwinShape {
                 q_p: 1,
                 q_core: 1,
                 e: 0,
+                extras: false,
                 observed: false,
             }
         } else {
             DenseTwinShape {
                 k,
-                rows,
-                s,
+                rows: if row_blocked { 0 } else { rows },
+                s: if row_blocked { 0 } else { s },
                 q_p,
                 q_core,
                 e,
+                extras,
                 observed,
             }
         }
@@ -643,7 +839,8 @@ impl GlmmDualScratch {
     /// every route — `rows` is `n`, the global row count: the row passes and
     /// the AGQ kernels both index by global row (see the module doc on
     /// `GlmmDualBufs`'s row buffers). Infallible: there is no size ceiling
-    /// here — memory is not a routing reason. Only a Hessian request is
+    /// here — memory is not a routing reason (the module doc's memory rules
+    /// say what is sized and what is not). Only a Hessian request is
     /// refused above `MAX_DUAL_N`, and that refusal runs before this is
     /// called; a gradient request reaches this at any `m` and chunks on the
     /// top rung instead.
@@ -667,22 +864,191 @@ impl GlmmDualScratch {
         q_p: usize,
         q_core: usize,
         e: usize,
+        extras: bool,
         nagq: u8,
         observed: bool,
         // Packed-row width on `GlmmLayout::Packed`, 0 on every other layout.
         packed_width: usize,
         cluster_ids: &[u32],
+        // The design's coupling pairs ([`dual_coupling_pairs`]) when known;
+        // `None` sizes the coupling-shaped twins at the `coupling_len` bound.
+        coup_pairs: Option<usize>,
     ) -> GlmmDualScratch {
-        let d = DenseTwinShape::of(packed_width, k, rows, s, q_p, q_core, e, observed);
+        Self::build(
+            n,
+            m,
+            p,
+            k,
+            rows,
+            s,
+            q_p,
+            q_core,
+            e,
+            extras,
+            nagq,
+            observed,
+            packed_width,
+            cluster_ids,
+            None,
+            None,
+            coup_pairs,
+        )
+    }
+
+    /// The dual scratch of the row-blocked assembled Hessian on the blocked
+    /// layout (no extra groupings): the twin keeps only its `k`-length mode
+    /// state, `params`, `beta` and `grad_t`, and every per-row and
+    /// per-cluster buffer lives block-sized in its `row_blocks`
+    /// (`assembled::RowBlockBufs`), planned at `block_rows` rows per block.
+    /// At 3M rows of a binomial fit with four random effects per group that
+    /// is about 150 MB of SE scratch instead of 3.2 GB. A `Dual` rung only:
+    /// the assembled Hessian runs on nothing else.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_shape_row_blocked(
+        n: NLanes,
+        m: usize,
+        p: usize,
+        k: usize,
+        rows: usize,
+        s: usize,
+        q_p: usize,
+        nagq: u8,
+        observed: bool,
+        cluster_ids: &[u32],
+        block_rows: usize,
+    ) -> GlmmDualScratch {
+        Self::build(
+            n,
+            m,
+            p,
+            k,
+            rows,
+            s,
+            q_p,
+            q_p,
+            0,
+            false,
+            nagq,
+            observed,
+            0,
+            cluster_ids,
+            Some(block_rows),
+            None,
+            None,
+        )
+    }
+
+    /// The dual scratch of the streamed assembled Hessian on the structured
+    /// layout: the same as [`Self::for_shape`] except that the dual PIRLS row
+    /// buffers and `structured.m_core_buf` sit at their minimum and the
+    /// per-row values live block-sized in `stream_rows`
+    /// (`pirls::StreamRows`, `block_rows` rows). The crossed Schur couples
+    /// every cluster, so unlike [`Self::for_shape_row_blocked`] the cluster-
+    /// and pair-level buffers stay whole; only the per-row ones go. A `Dual`
+    /// rung only.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_shape_streamed(
+        n: NLanes,
+        m: usize,
+        p: usize,
+        k: usize,
+        rows: usize,
+        s: usize,
+        q_p: usize,
+        q_core: usize,
+        e: usize,
+        nagq: u8,
+        observed: bool,
+        cluster_ids: &[u32],
+        coup_pairs: Option<usize>,
+        block_rows: usize,
+    ) -> GlmmDualScratch {
+        Self::build(
+            n,
+            m,
+            p,
+            k,
+            rows,
+            s,
+            q_p,
+            q_core,
+            e,
+            true,
+            nagq,
+            observed,
+            0,
+            cluster_ids,
+            None,
+            Some(block_rows),
+            coup_pairs,
+        )
+    }
+
+    /// [`Self::for_shape`]'s body, with the row-blocked flag
+    /// (`Some(block_rows)`) that [`Self::for_shape_row_blocked`] sets.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        n: NLanes,
+        m: usize,
+        p: usize,
+        k: usize,
+        rows: usize,
+        s: usize,
+        q_p: usize,
+        q_core: usize,
+        e: usize,
+        extras: bool,
+        nagq: u8,
+        observed: bool,
+        packed_width: usize,
+        cluster_ids: &[u32],
+        row_block: Option<usize>,
+        stream_block: Option<usize>,
+        coup_pairs: Option<usize>,
+    ) -> GlmmDualScratch {
+        let row_blocked = row_block.is_some();
+        // The streamed pass forms its per-row values block by block
+        // (`GlmmDualBufs::stream_rows`), so the dual PIRLS row buffers and the
+        // structured core rows sit at their minimum.
+        let streamed = stream_block.is_some();
+        let d = DenseTwinShape::of(
+            packed_width,
+            k,
+            rows,
+            s,
+            q_p,
+            q_core,
+            e,
+            extras,
+            observed,
+            row_blocked,
+        );
+        // The row-blocked pass assembles in its block scratch, so the shared
+        // assembly buffers sit at their minimum.
+        let (k_asm, rows_asm, s_asm) = if row_blocked { (0, 0, 0) } else { (k, rows, s) };
+        let coup_len = dual_coupling_len(d.rows, d.s, d.q_core, d.e, coup_pairs);
         let idx = ClusterRowIndex::build(cluster_ids, s);
         macro_rules! build {
-            ($T:ty, $variant:ident, $asm:expr) => {
+            ($T:ty, $variant:ident, $asm:expr, $rb:expr, $sr:expr) => {
                 GlmmDualScratch::$variant(
                     GlmmDualBufs::<$T> {
                         params: vec![<$T as Scalar>::ZERO; m],
                         beta: vec![<$T as Scalar>::ZERO; p],
-                        pirls: PirlsScratch::<$T>::for_shape(d.rows, d.k, d.q_p, d.s, nagq),
-                        structured: StructuredScratch::<$T>::for_shape(d.rows, d.s, d.q_core, d.e),
+                        pirls: PirlsScratch::<$T>::for_shape(
+                            if streamed { 0 } else { d.rows },
+                            d.k,
+                            d.q_p,
+                            d.s,
+                            nagq,
+                        ),
+                        structured: StructuredScratch::<$T>::for_shape_coup(
+                            d.rows,
+                            d.s,
+                            d.q_core,
+                            d.e,
+                            d.extras && !streamed,
+                            coup_len,
+                        ),
                         dual: DualStep {
                             observed: false,
                             obs_blocks: vec![
@@ -696,13 +1062,7 @@ impl GlmmDualScratch {
                                     (d.q_core * d.q_core * d.s).max(1)
                                 )
                             ],
-                            obs_coupling: vec![
-                                <$T as Scalar>::ZERO;
-                                obs_len(
-                                    d.observed,
-                                    super::workspace::coupling_len(d.rows, d.s, d.q_core, d.e)
-                                )
-                            ],
+                            obs_coupling: vec![<$T as Scalar>::ZERO; obs_len(d.observed, coup_len)],
                             obs_schur_blk: vec![
                                 <$T as Scalar>::ZERO;
                                 obs_len(d.observed, (d.e * d.e).max(1))
@@ -713,6 +1073,8 @@ impl GlmmDualScratch {
                         },
                         grad_t: vec![<$T as Scalar>::ZERO; m],
                         asm: $asm,
+                        row_blocks: $rb,
+                        stream_rows: $sr,
                     },
                     idx,
                     GlmmModeBufs::for_shape(k),
@@ -724,47 +1086,103 @@ impl GlmmDualScratch {
         // `AssemblyBufs::empty`.
         macro_rules! sized_asm {
             ($T:ty) => {
-                super::assembled::AssemblyBufs::<$T>::for_shape(
+                super::assembled::AssemblyBufs::<$T>::for_shape_coup(
                     m,
-                    k,
-                    rows,
-                    s,
+                    k_asm,
+                    rows_asm,
+                    s_asm,
                     q_core,
                     e,
+                    observed,
                     packed_width,
+                    (!row_blocked).then(|| dual_coupling_len(rows, s, q_core, e, coup_pairs)),
                 )
             };
         }
+        macro_rules! row_blocks {
+            ($T:ty) => {
+                row_block.map(|b| {
+                    Box::new(super::assembled::RowBlockBufs::<$T>::for_shape(
+                        &idx, s, b, m, p, q_p, nagq, observed,
+                    ))
+                })
+            };
+        }
+        macro_rules! stream_rows {
+            ($T:ty) => {
+                stream_block.map(|b| Box::new(super::pirls::StreamRows::<$T>::new(b, q_core, q_p)))
+            };
+        }
         match n {
-            NLanes::D4 => build!(Dual<4>, D4, sized_asm!(Dual<4>)),
-            NLanes::D5 => build!(Dual<5>, D5, sized_asm!(Dual<5>)),
-            NLanes::D6 => build!(Dual<6>, D6, sized_asm!(Dual<6>)),
-            NLanes::D8 => build!(Dual<8>, D8, sized_asm!(Dual<8>)),
-            NLanes::D12 => build!(Dual<12>, D12, sized_asm!(Dual<12>)),
+            NLanes::D4 => build!(
+                Dual<4>,
+                D4,
+                sized_asm!(Dual<4>),
+                row_blocks!(Dual<4>),
+                stream_rows!(Dual<4>)
+            ),
+            NLanes::D5 => build!(
+                Dual<5>,
+                D5,
+                sized_asm!(Dual<5>),
+                row_blocks!(Dual<5>),
+                stream_rows!(Dual<5>)
+            ),
+            NLanes::D6 => build!(
+                Dual<6>,
+                D6,
+                sized_asm!(Dual<6>),
+                row_blocks!(Dual<6>),
+                stream_rows!(Dual<6>)
+            ),
+            NLanes::D8 => build!(
+                Dual<8>,
+                D8,
+                sized_asm!(Dual<8>),
+                row_blocks!(Dual<8>),
+                stream_rows!(Dual<8>)
+            ),
+            NLanes::D12 => build!(
+                Dual<12>,
+                D12,
+                sized_asm!(Dual<12>),
+                row_blocks!(Dual<12>),
+                stream_rows!(Dual<12>)
+            ),
             NLanes::H4 => build!(
                 HyperDual<4, 10>,
                 H4,
-                super::assembled::AssemblyBufs::empty()
+                super::assembled::AssemblyBufs::empty(),
+                None,
+                None
             ),
             NLanes::H5 => build!(
                 HyperDual<5, 15>,
                 H5,
-                super::assembled::AssemblyBufs::empty()
+                super::assembled::AssemblyBufs::empty(),
+                None,
+                None
             ),
             NLanes::H6 => build!(
                 HyperDual<6, 21>,
                 H6,
-                super::assembled::AssemblyBufs::empty()
+                super::assembled::AssemblyBufs::empty(),
+                None,
+                None
             ),
             NLanes::H8 => build!(
                 HyperDual<8, 36>,
                 H8,
-                super::assembled::AssemblyBufs::empty()
+                super::assembled::AssemblyBufs::empty(),
+                None,
+                None
             ),
             NLanes::H12 => build!(
                 HyperDual<12, 78>,
                 H12,
-                super::assembled::AssemblyBufs::empty()
+                super::assembled::AssemblyBufs::empty(),
+                None,
+                None
             ),
         }
     }
@@ -782,9 +1200,11 @@ impl GlmmDualScratch {
         q_p: usize,
         q_core: usize,
         e: usize,
+        extras: bool,
         nagq: u8,
         observed: bool,
         packed_width: usize,
+        coup_pairs: Option<usize>,
     ) -> bool {
         macro_rules! check {
             ($b:expr, $asm:expr) => {
@@ -798,10 +1218,14 @@ impl GlmmDualScratch {
                     q_p,
                     q_core,
                     e,
+                    extras,
                     nagq,
                     observed,
                     packed_width,
                     $asm,
+                    false,
+                    coup_pairs,
+                    None,
                 )
             };
         }
@@ -816,6 +1240,97 @@ impl GlmmDualScratch {
             GlmmDualScratch::H6(b, ..) => check!(b, false),
             GlmmDualScratch::H8(b, ..) => check!(b, false),
             GlmmDualScratch::H12(b, ..) => check!(b, false),
+        }
+    }
+
+    /// [`Self::matches_shape`] for a scratch built by
+    /// [`Self::for_shape_streamed`] (a `Dual` rung, structured layout).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn matches_shape_streamed(
+        &self,
+        m: usize,
+        p: usize,
+        k: usize,
+        rows: usize,
+        s: usize,
+        q_p: usize,
+        q_core: usize,
+        e: usize,
+        nagq: u8,
+        observed: bool,
+        coup_pairs: Option<usize>,
+        block_rows: usize,
+    ) -> bool {
+        macro_rules! check {
+            ($b:expr) => {
+                bufs_match_shape(
+                    $b,
+                    m,
+                    p,
+                    k,
+                    rows,
+                    s,
+                    q_p,
+                    q_core,
+                    e,
+                    true,
+                    nagq,
+                    observed,
+                    0,
+                    true,
+                    false,
+                    coup_pairs,
+                    Some(block_rows),
+                )
+            };
+        }
+        match self {
+            GlmmDualScratch::D4(b, ..) => check!(b),
+            GlmmDualScratch::D5(b, ..) => check!(b),
+            GlmmDualScratch::D6(b, ..) => check!(b),
+            GlmmDualScratch::D8(b, ..) => check!(b),
+            GlmmDualScratch::D12(b, ..) => check!(b),
+            GlmmDualScratch::H4(..)
+            | GlmmDualScratch::H5(..)
+            | GlmmDualScratch::H6(..)
+            | GlmmDualScratch::H8(..)
+            | GlmmDualScratch::H12(..) => false,
+        }
+    }
+
+    /// [`Self::matches_shape`] for a scratch built by
+    /// [`Self::for_shape_row_blocked`] (a `Dual` rung, blocked layout).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn matches_shape_row_blocked(
+        &self,
+        m: usize,
+        p: usize,
+        k: usize,
+        rows: usize,
+        s: usize,
+        q_p: usize,
+        nagq: u8,
+        observed: bool,
+    ) -> bool {
+        macro_rules! check {
+            ($b:expr) => {
+                bufs_match_shape(
+                    $b, m, p, k, rows, s, q_p, q_p, 0, false, nagq, observed, 0, true, true, None,
+                    None,
+                )
+            };
+        }
+        match self {
+            GlmmDualScratch::D4(b, ..) => check!(b),
+            GlmmDualScratch::D5(b, ..) => check!(b),
+            GlmmDualScratch::D6(b, ..) => check!(b),
+            GlmmDualScratch::D8(b, ..) => check!(b),
+            GlmmDualScratch::D12(b, ..) => check!(b),
+            GlmmDualScratch::H4(..)
+            | GlmmDualScratch::H5(..)
+            | GlmmDualScratch::H6(..)
+            | GlmmDualScratch::H8(..)
+            | GlmmDualScratch::H12(..) => false,
         }
     }
 }
@@ -910,19 +1425,19 @@ fn run_gradient<T: Seed>(
     // pin skip in `build_packed_m` and the pin mask in
     // `structured_laplace_deviance` are both `f64`-only, so at a θ̂ with a
     // pinned crossed grouping the pattern a DUAL call builds is WIDER than
-    // the one an `f64` call builds — while `cross_val` lives in
+    // the one an `f64` call builds — while `cross_theta` lives in
     // `GlmmDualBufs<T>` and stays dual-private. On return from a derivative
     // call `pattern.cross_col`/`pattern.n_cross` can therefore name slots
-    // `bufs.structured.cross_val` never filled.
+    // `bufs.structured.cross_theta` never filled.
     //
     // The rule that keeps that safe: **every `f64` reader of the
-    // `cross_col`/`n_cross`/`cross_val` triple must run an `f64` deviance
+    // `cross_col`/`n_cross`/`cross_theta` triple must run an `f64` deviance
     // evaluation of its own first.** There is one such reader,
     // `se::structured_schur_fill`, and it is reached only after
     // `joint_hessian_cov`'s `fallback!()` central `fd_eval` or after the
     // pinned re-eval in `glmm/mod.rs` — both of which re-pack the triple at
     // γ̂. Breaking the rule does not panic: the reader would pick up a stale
-    // `cross_val` left by an earlier optimizer trial and return a plausible
+    // `cross_theta` left by an earlier optimizer trial and return a plausible
     // wrong SE.
     pattern: &mut StructuredPattern,
     wx: &mut Mat<f64>,
@@ -1265,11 +1780,15 @@ pub(crate) fn laplace_gradient(
     // Sizes the `DualStep` twins as well as pinning them in the reuse check —
     // same condition `bufs.dual.observed` takes below.
     let observed = !crate::family::is_canonical(ws.family);
+    let extras = !ws.groupings.extra_offsets.is_empty();
+    let coup_pairs = dual_coupling_pairs(&ws.pattern, s);
     let need_build = ws.dual_scratch.as_deref().is_none_or(|sc| {
         sc.lanes() != nl
             // `supports_shape` above refused `GlmmLayout::Packed`, so the
             // packed twin is never sized on this path.
-            || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq, observed, 0)
+            || !sc.matches_shape(
+                m, p, k, n, s, q_p, q_core, e, extras, nagq, observed, 0, coup_pairs,
+            )
     });
     if need_build {
         ws.dual_scratch = Some(Box::new(GlmmDualScratch::for_shape(
@@ -1282,12 +1801,14 @@ pub(crate) fn laplace_gradient(
             q_p,
             q_core,
             e,
+            extras,
             nagq,
             observed,
             // `supports_shape` above refused `GlmmLayout::Packed`, so the
             // packed twin is never sized on this path.
             0,
             cluster_ids,
+            coup_pairs,
         )));
     }
 
@@ -1921,11 +2442,15 @@ pub(crate) fn laplace_hessian(
     );
     // Same twin sizing/pinning `laplace_gradient` uses.
     let observed = !crate::family::is_canonical(ws.family);
+    let extras = !ws.groupings.extra_offsets.is_empty();
+    let coup_pairs = dual_coupling_pairs(&ws.pattern, s);
     let need_build = ws.hyper_scratch.as_deref().is_none_or(|sc| {
         sc.lanes() != nl
             // `supports_shape` above refused `GlmmLayout::Packed`, so the
             // packed twin is never sized on this path.
-            || !sc.matches_shape(m, p, k, n, s, q_p, q_core, e, nagq, observed, 0)
+            || !sc.matches_shape(
+                m, p, k, n, s, q_p, q_core, e, extras, nagq, observed, 0, coup_pairs,
+            )
     });
     if need_build {
         ws.hyper_scratch = Some(Box::new(GlmmDualScratch::for_shape(
@@ -1938,12 +2463,14 @@ pub(crate) fn laplace_hessian(
             q_p,
             q_core,
             e,
+            extras,
             nagq,
             observed,
             // `supports_shape` above refused `GlmmLayout::Packed`, so the
             // packed twin is never sized on this path.
             0,
             cluster_ids,
+            coup_pairs,
         )));
     }
 
@@ -2193,7 +2720,7 @@ mod tests {
     use super::*;
 
     /// `for_shape` at `q_p == 1` (the scalar-intercept shape): `agq_scratch`
-    /// takes its `4·s` arm.
+    /// takes its `7·s` arm.
     #[test]
     fn for_shape_buffer_lengths_match_at_q_p_1() {
         let (m, p, k, rows, s, q_p, nagq) = (5usize, 3usize, 7usize, 40usize, 7usize, 1usize, 7u8);
@@ -2210,14 +2737,23 @@ mod tests {
             q_p,
             q_core,
             e,
+            true,
             nagq,
             true,
             0,
             &cluster_ids,
+            None,
         );
         match scratch {
             GlmmDualScratch::D8(bufs, ..) => {
-                assert_eq!(bufs.pirls.agq_scratch.len(), 4 * s);
+                assert_eq!(bufs.pirls.agq_scratch.len(), 7 * s);
+                // An extras shape carries the structured row buffer; the
+                // crossed values are one per slot on every shape.
+                assert_eq!(bufs.structured.m_core_buf.len(), rows * q_core);
+                assert_eq!(
+                    bufs.structured.cross_theta.len(),
+                    crate::lmm::MAX_EXTRA_GROUPINGS
+                );
             }
             _ => panic!("expected D8 variant"),
         }
@@ -2243,24 +2779,24 @@ mod tests {
             q_p,
             q_core,
             e,
+            false,
             nagq,
             true,
             0,
             &cluster_ids,
+            None,
         );
         match scratch {
             GlmmDualScratch::H8(bufs, ..) => {
                 let kq = (nagq as usize).pow(q_p as u32);
                 assert_eq!(bufs.pirls.agq_scratch.len(), 2 * s + kq * (q_p + 1));
+                // No extras: the structured row buffer sits at its minimum.
+                assert_eq!(bufs.structured.m_core_buf.len(), 1);
                 // A `HyperDual` rung carries NO assembly scratch: the assembled
                 // pass runs on the `Dual` rungs alone, and `m·k` second-order
                 // numbers would be megabytes on a wide `k`.
                 assert!(bufs.asm.tail_inv.is_empty());
                 assert!(bufs.asm.tail_col.is_empty());
-                assert!(bufs.asm.rho.is_empty());
-                assert!(bufs.asm.w_eta.is_empty());
-                assert!(bufs.asm.w_obs.is_empty());
-                assert!(bufs.asm.lev.is_empty());
                 assert!(bufs.asm.d_gamma.is_empty());
                 assert!(bufs.asm.l_gamma.is_empty());
                 assert!(bufs.asm.d_u.is_empty());
@@ -2296,10 +2832,12 @@ mod tests {
             q_p,
             q_core,
             e,
+            true,
             nagq,
             false,
             0,
             &cluster_ids,
+            None,
         );
         match &scratch {
             GlmmDualScratch::D8(bufs, ..) => {
@@ -2314,11 +2852,94 @@ mod tests {
                     crate::glmm::workspace::coupling_len(rows, s, q_core, e)
                 );
                 assert_eq!(bufs.structured.schur_blk.len(), e * e);
+                // The assembly's observed factor follows the same rule.
+                assert!(bufs.asm.obs_core.is_empty());
+                assert!(bufs.asm.obs_coup.is_empty());
+                assert!(bufs.asm.obs_schur.is_empty());
             }
             _ => panic!("expected D8 variant"),
         }
-        assert!(scratch.matches_shape(m, p, k, rows, s, q_p, q_core, e, nagq, false, 0));
-        assert!(!scratch.matches_shape(m, p, k, rows, s, q_p, q_core, e, nagq, true, 0));
+        assert!(scratch.matches_shape(m, p, k, rows, s, q_p, q_core, e, true, nagq, false, 0, None));
+        assert!(!scratch.matches_shape(m, p, k, rows, s, q_p, q_core, e, true, nagq, true, 0, None));
+    }
+
+    /// `for_shape` then `matches_shape` round-trips on every layout × link,
+    /// and a request that differs only in `extras` or only in `observed` is
+    /// refused. The nested-only structured shape (`e = 0`, `q_core = q_p + np`)
+    /// against an extras-free shape at the same `q_core` is the pair the
+    /// `m_core_buf` length check exists for: `build_packed_m` writes
+    /// `m_core_buf[i·q_core + …]` on every row, so handing it the extras-free
+    /// minimum would be an out-of-bounds write.
+    #[test]
+    fn for_shape_round_trips_and_refuses_extras_or_observed_mismatch() {
+        let (m, p, k, rows, s, nagq) = (6usize, 2usize, 30usize, 40usize, 5usize, 1u8);
+        let cluster_ids: Vec<u32> = (0..rows as u32).map(|i| i % s as u32).collect();
+        // (q_p, q_core, e, extras, packed_width)
+        let shapes = [
+            (2usize, 2usize, 0usize, false, 0usize), // blocked, no extras
+            (1, 3, 6, true, 0),                      // structured, nested + crossed
+            (1, 3, 0, true, 0),                      // structured, nested only
+            (3, 3, 0, false, 0),                     // blocked at the nested shape's q_core
+            (1, 1, 0, false, 4),                     // packed
+        ];
+        for &(q_p, q_core, e, extras, width) in &shapes {
+            for observed in [false, true] {
+                let sc = GlmmDualScratch::for_shape(
+                    NLanes::D8,
+                    m,
+                    p,
+                    k,
+                    rows,
+                    s,
+                    q_p,
+                    q_core,
+                    e,
+                    extras,
+                    nagq,
+                    observed,
+                    width,
+                    &cluster_ids,
+                    None,
+                );
+                let same = |x: bool, o: bool| {
+                    sc.matches_shape(m, p, k, rows, s, q_p, q_core, e, x, nagq, o, width, None)
+                };
+                assert!(
+                    same(extras, observed),
+                    "{q_p} {q_core} {e} {extras} {width}"
+                );
+                assert!(
+                    !same(extras, !observed),
+                    "{q_p} {q_core} {e} {extras} {width}"
+                );
+                if width == 0 {
+                    // Packed sizes the structured twin at its minimum whatever
+                    // `extras` says, so only the dense layouts can disagree.
+                    assert!(!same(!extras, observed), "{q_p} {q_core} {e} {extras}");
+                }
+            }
+        }
+        // The pair the `m_core_buf` check exists for: nested-only structured
+        // (q_p = 1, q_core = 3) vs a request at the same q_core, e, without
+        // extras.
+        let nested = GlmmDualScratch::for_shape(
+            NLanes::D8,
+            m,
+            p,
+            k,
+            rows,
+            s,
+            1,
+            3,
+            0,
+            true,
+            nagq,
+            false,
+            0,
+            &cluster_ids,
+            None,
+        );
+        assert!(!nested.matches_shape(m, p, k, rows, s, 1, 3, 0, false, nagq, false, 0, None));
     }
 
     /// Every `m` in `0..=MAX_DUAL_N` resolves to the smallest instantiated rung
@@ -2348,6 +2969,31 @@ mod tests {
                 "gradient m={m}"
             );
             assert_eq!(n(NLanes::pick(m, true).unwrap()), want(m), "hessian m={m}");
+        }
+    }
+
+    /// The assembled Hessian's rung table, pinned for `m` 1 to 24 and spot
+    /// checked above: a change here moves SEs by round-off on every fit at
+    /// that `m`, so it is a deliberate, re-measured edit, never a drive-by.
+    #[test]
+    fn nlanes_pick_assembled_is_the_measured_table() {
+        let lanes = |l: NLanes| match l {
+            NLanes::D4 => 4,
+            NLanes::D5 => 5,
+            NLanes::D6 => 6,
+            NLanes::D8 => 8,
+            NLanes::D12 => 12,
+            other => panic!("first-order rung expected, got {other:?}"),
+        };
+        let want = [
+            4, 4, 4, 4, 5, 6, 8, 8, 5, 5, 12, 12, 8, 8, 8, 8, 6, 6, 12, 12, 12, 12, 12, 12,
+        ];
+        for (i, &w) in want.iter().enumerate() {
+            let m = i + 1;
+            assert_eq!(lanes(NLanes::pick_assembled(m)), w, "m={m}");
+        }
+        for m in [25, 36, 100] {
+            assert_eq!(NLanes::pick_assembled(m), NLanes::D12, "m={m}");
         }
     }
 

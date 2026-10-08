@@ -30,6 +30,9 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     d.set_item("dispersion", r.dispersion)?;
     d.set_item("converged", r.converged)?;
     d.set_item("n_eval", r.n_eval)?;
+    d.set_item("n_grad", r.n_grad)?;
+    d.set_item("outer_stop", r.outer_stop)?;
+    d.set_item("outer_decrement", r.outer_decrement)?;
     d.set_item("deviance", r.deviance)?;
     d.set_item("singular", r.singular)?;
     d.set_item("names", r.names)?;
@@ -98,7 +101,7 @@ fn fit<'py>(
     dispersion: Option<f64>,
     weights: Option<Vec<f64>>,
     offset: Option<Vec<f64>>,
-    warm_start: Option<(Vec<f64>, Vec<f64>)>,
+    warm_start: Option<(Vec<f64>, Vec<f64>, Option<f64>)>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = orchestrate::run_fit(
         formula,

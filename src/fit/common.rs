@@ -108,6 +108,63 @@ pub struct FitDiagnostics {
     /// GLM and GLMM: the fixed-effects IRLS stopped on separation — see
     /// [`crate::Note::Separated`]. `false` on OLS and LMM routes.
     pub separated: bool,
+    /// LMM and GLMM: the gradient search did not converge and BOBYQA
+    /// finished from its incumbent — see
+    /// [`crate::Note::GradientSearchFallback`]. `false` on every route that
+    /// searches with BOBYQA alone.
+    pub gradient_search_fallback: bool,
+    /// LMM and GLMM gradient routes: the number of gradient evaluations the
+    /// BFGS search made (a gradient reuses its point's value evaluation, so
+    /// `n_eval` does not count them). 0 on every fit that ran no gradient
+    /// search. This field and the two below describe the BFGS search even
+    /// when BOBYQA finished the fit after it.
+    pub n_grad: u32,
+    /// LMM and GLMM gradient routes: why the BFGS search stopped. `None` on
+    /// every fit that ran no gradient search.
+    pub outer_stop: Option<OuterStop>,
+    /// LMM and GLMM gradient routes: the BFGS decrement `½·gᵀHg` at the
+    /// search's endpoint (deviance units), the quasi-Newton estimate of the
+    /// decrease left; the certificate accepts an endpoint below 1e-8. NaN on
+    /// every fit that ran no gradient search.
+    pub outer_decrement: f64,
+}
+
+/// Why a gradient (BFGS) outer search stopped, as [`Diagnostics::outer_stop`]
+/// reports it. The first three are convergence stops; the rest hand the
+/// incumbent to BOBYQA.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OuterStop {
+    /// The accepted decrease fell below the search's absolute threshold.
+    Fdelta,
+    /// The projected gradient fell below its tolerance.
+    Pgrad,
+    /// No trial could be accepted, but every trial's predicted decrease was
+    /// below the threshold: the incumbent sits at the deviance's noise floor.
+    NoiseFloor,
+    /// No trial was accepted within the line search's halvings.
+    LineSearch,
+    /// The iteration cap was reached.
+    MaxIter,
+    /// The gradient was unavailable or non-finite at an accepted point.
+    GradUnavailable,
+    /// The value at the start point was not finite.
+    NonFinite,
+}
+
+impl From<crate::optim::bfgs::BfgsStop> for OuterStop {
+    fn from(s: crate::optim::bfgs::BfgsStop) -> Self {
+        use crate::optim::bfgs::BfgsStop as B;
+        match s {
+            B::Fdelta => OuterStop::Fdelta,
+            B::Pgrad => OuterStop::Pgrad,
+            B::NoiseFloor => OuterStop::NoiseFloor,
+            B::LineSearch => OuterStop::LineSearch,
+            B::MaxIter => OuterStop::MaxIter,
+            B::GradUnavailable => OuterStop::GradUnavailable,
+            B::NonFinite => OuterStop::NonFinite,
+        }
+    }
 }
 
 impl FitDiagnostics {
@@ -129,6 +186,10 @@ impl FitDiagnostics {
             se_unavailable: false,
             precision_limited: false,
             separated: false,
+            gradient_search_fallback: false,
+            n_grad: 0,
+            outer_stop: None,
+            outer_decrement: f64::NAN,
         }
     }
 }
@@ -168,6 +229,9 @@ pub(super) fn materialize_diagnostics(
     if d.exact_profile_fallback {
         notes.push(Note::ExactProfileFallback);
     }
+    if d.gradient_search_fallback {
+        notes.push(Note::GradientSearchFallback);
+    }
     if d.se_unavailable {
         notes.push(Note::SeUnavailable);
     }
@@ -199,6 +263,9 @@ pub(super) fn materialize_diagnostics(
         },
         pinned,
         notes,
+        n_grad: d.n_grad as usize,
+        outer_stop: d.outer_stop,
+        outer_decrement: d.outer_decrement,
     }
 }
 
@@ -1022,6 +1089,7 @@ pub(super) fn fit_rank_deficient(
             kept.iter().map(|&o| s.beta[o]).collect()
         },
         theta: s.theta.clone(),
+        dispersion: s.dispersion,
     });
     // Targets: drop aliased targets, reindex survivors into the reduced design.
     let targets_r: Vec<u32> = opts
@@ -1076,6 +1144,7 @@ pub(super) fn fit_rank_deficient(
             | Note::NonIntegerResponse { .. }
             | Note::SingleLevelGroupingDropped { .. }
             | Note::ExactProfileFallback
+            | Note::GradientSearchFallback
             | Note::SeUnavailable
             | Note::PrecisionLimited
             | Note::Separated => {}

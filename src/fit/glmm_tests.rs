@@ -172,6 +172,7 @@ fn fit_warm_glmm_cbpp_matches_cold_optimum() {
             StartValues {
                 beta: cold.beta.clone(),
                 theta: vec![cold.tau2[0].sqrt()],
+                dispersion: None,
             },
         ),
         // Halved β̂ + θ=3 (θ̂ ≈ 0.64): far enough to move the joint
@@ -182,6 +183,7 @@ fn fit_warm_glmm_cbpp_matches_cold_optimum() {
             StartValues {
                 beta: cold.beta.iter().map(|b| 0.5 * b).collect(),
                 theta: vec![3.0],
+                dispersion: None,
             },
         ),
     ];
@@ -244,6 +246,7 @@ fn fit_warm_glmm_partial_start_cold_starts_the_missing_component() {
     let both_empty = StartValues {
         beta: vec![],
         theta: vec![],
+        dispersion: None,
     };
     let empty = fit_warm(&x, &y, n, p, &model, &ids, Some(&both_empty), &opts);
     // Bitwise (not PartialEq): non-target SE slots are NaN and NaN != NaN.
@@ -259,6 +262,7 @@ fn fit_warm_glmm_partial_start_cold_starts_the_missing_component() {
             StartValues {
                 beta: vec![],
                 theta: vec![3.0],
+                dispersion: None,
             },
         ),
         // β only: halved β̂, θ falls back to the THETA0 blind start.
@@ -267,6 +271,7 @@ fn fit_warm_glmm_partial_start_cold_starts_the_missing_component() {
             StartValues {
                 beta: cold.beta.iter().map(|b| 0.5 * b).collect(),
                 theta: vec![],
+                dispersion: None,
             },
         ),
     ];
@@ -554,6 +559,7 @@ fn pirls_exhausted_note_counts_fit_path_evals_only() {
     let start = StartValues {
         beta: vec![],
         theta: vec![2000.0, 1.0],
+        dispersion: None,
     };
     let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
     assert!(
@@ -852,6 +858,7 @@ fn assert_warm_starts_reach_cold_optimum(
         let start = StartValues {
             beta: vec![],
             theta,
+            dispersion: None,
         };
         let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
         assert!(
@@ -1133,6 +1140,7 @@ fn far_warm_start_scan() {
                     let start = StartValues {
                         beta: vec![],
                         theta,
+                        dispersion: None,
                     };
                     let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
                     if ill_posed {
@@ -1222,6 +1230,7 @@ fn far_warm_start_nb_sweep() {
                 let start = StartValues {
                     beta: vec![],
                     theta,
+                    dispersion: None,
                 };
                 let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
                 let rel = (warm.deviance - cold.deviance).abs() / cold.deviance.abs();
@@ -1269,6 +1278,7 @@ fn warm_start_the_guard_rejects_is_the_cold_fit() {
             let start = StartValues {
                 beta: vec![],
                 theta: vec![theta0],
+                dispersion: None,
             };
             // `fit_warm`'s own path, on a workspace the test can read after.
             let (sized, ids_s, perm) = spec_sized_from_ids_pub(&model, &ids);
@@ -1329,6 +1339,7 @@ fn exact_profile_fallback_reruns_on_pql_then_joint() {
     let start = StartValues {
         beta: vec![],
         theta: vec![3000.0],
+        dispersion: None,
     };
     let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
     assert!(
@@ -5134,9 +5145,17 @@ fn glmm_pin_never_ends_above_the_glm() {
 /// where the search's trust radius shrinks to its end with σ_g still off the
 /// `(1 | g)` optimum. The crossed fit's θ_h = 0 corner is the `(1 | g)` model,
 /// so the crossed fit must not end above it: `fit_glmm`'s trough polish moves
-/// σ_g from the pinned point.
+/// σ_g from the pinned point. Both outer routes are checked. The BOBYQA
+/// route is where the search starves (σ_g at 0.77 against 0.53, 2.6
+/// deviance units above the optimum), and where its endpoint lands inside
+/// the trough is round-off: on x86 the pin dropped the objective enough to
+/// run the polish, on aarch64 it did not (2026-10-08), so the polish is
+/// keyed on the stationarity probe of the pinned corner as well. The
+/// gradient route, the cold default on this shape, reaches the optimum by
+/// itself.
 #[test]
 fn crossed_zero_variance_reaches_the_single_grouping_optimum() {
+    use super::core::{build_workspace, fit_on};
     let (n_g, n_h, n) = (12usize, 5usize, 120usize);
     let mut st = 7932u64;
     let b: Vec<f64> = (0..n_g).map(|_| lcg(&mut st)).collect();
@@ -5157,7 +5176,7 @@ fn crossed_zero_variance_reaches_the_single_grouping_optimum() {
     let family = Family::Poisson {
         link: PoissonLink::Log,
     };
-    let fit = |extra: bool| {
+    let fit = |extra: bool, bobyqa: bool| {
         let model = ModelSpec {
             family,
             re: Some(ReStructure {
@@ -5181,17 +5200,27 @@ fn crossed_zero_variance_reaches_the_single_grouping_optimum() {
             primary: gid.clone(),
             extra: if extra { vec![hid.clone()] } else { vec![] },
         };
-        fit_cold(&x, &y, n, 2, &model, &ids, &FitOptions::default())
+        let opts = FitOptions::default();
+        let (sized, sids, perm) = spec_sized_from_ids_pub(&model, &ids);
+        let mut ws = build_workspace(&sized, perm, n, 2, &opts);
+        if bobyqa {
+            super::core::force_bobyqa_route(&mut ws);
+        }
+        fit_on(&mut ws, &x, &y, &sids, None, &opts).into_fit(&x, &y, &sids, n, 2, &model, &opts)
     };
-    let (single, crossed) = (fit(false), fit(true));
-    assert!(single.converged() && crossed.converged());
-    assert!(crossed.singular(), "θ_h must pin");
-    assert!(
-        crossed.deviance <= single.deviance + 1e-6,
-        "crossed deviance {} above the (1 | g) optimum {}",
-        crossed.deviance,
-        single.deviance
-    );
+    let single = fit(false, false);
+    assert!(single.converged() && !single.singular());
+    for (route, bobyqa) in [("gradient", false), ("BOBYQA", true)] {
+        let crossed = fit(true, bobyqa);
+        assert!(crossed.converged(), "{route}: not converged");
+        assert!(crossed.singular(), "{route}: θ_h must pin");
+        assert!(
+            crossed.deviance <= single.deviance + 1e-6,
+            "{route}: crossed deviance {} above the (1 | g) optimum {}",
+            crossed.deviance,
+            single.deviance
+        );
+    }
 }
 
 /// The ρ = −1 trap on a 3-term block, dense GLMM `ExactProfile` route.
@@ -8075,6 +8104,42 @@ const PACKED_LAPLACE_RUNGS: &[DenseLaplaceRung] = &[
 /// both-layouts Hessian cross-check in `sparse::tests`, which puts this
 /// engine within 2.6e-13 of the dense assembled one on the shapes the dense
 /// engine can also fit (`q_p ≤ 2`, `q_g = 1`, weighted and unweighted).
+/// A canonical packed fit sizes no observed factor (`PackedAsmBufs::obs` is
+/// empty there), so the reuse check must compare `obs` against that same
+/// `obs_len`. Comparing it against a flat `k²` would refuse the stored scratch
+/// on every call and rebuild it silently: the second call would hand back a
+/// different allocation. Rung 8 is binomial-logit, rung 9 Poisson-log.
+#[cfg(feature = "formula")]
+#[test]
+fn packed_gradient_reuses_its_scratch_on_a_canonical_link() {
+    for r in &PACKED_LAPLACE_RUNGS[..2] {
+        let (mut ws, x, y, _ids, _extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
+        assert_eq!(ws.layout, crate::glmm::GlmmLayout::Packed);
+        assert!(crate::family::is_canonical(ws.family));
+        let m = ws.n_theta + p;
+        let mut g = vec![0.0; m];
+        let st = crate::glmm::packed_gradient(&mut ws, x.as_ref(), &y, p, n, &mut g);
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "rung {}",
+            r.rung
+        );
+        let first: *const _ = &**ws.packed_asm.as_ref().expect("built on the first call");
+        let st = crate::glmm::packed_gradient(&mut ws, x.as_ref(), &y, p, n, &mut g);
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "rung {}",
+            r.rung
+        );
+        let second: *const _ = &**ws.packed_asm.as_ref().expect("put back");
+        assert!(
+            std::ptr::eq(first, second),
+            "rung {}: the packed scratch was rebuilt on a repeat call",
+            r.rung
+        );
+    }
+}
+
 #[cfg(feature = "formula")]
 #[test]
 fn packed_assembled_gradient_matches_richardson_fd() {
@@ -10484,4 +10549,188 @@ fn joint_search_reaches_the_optimum_when_working_weights_span_decades() {
             exact.deviance
         );
     }
+}
+
+// --- StartValues::dispersion (a carried NB shape / Gamma φ) ---
+
+/// `sim_gamma` on a scalar-intercept Gamma GLMM with `link`.
+fn sim_gamma_glmm(
+    link: crate::GammaLink,
+) -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma { link },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// A carried dispersion seeds the search's trailing coordinate. Started at the
+/// cold optimum's own (β, θ), a Gamma GLMM returns that optimum on both links
+/// with or without the carried φ, and the carried φ takes no more
+/// evaluations than the cold φ seed does (measured 2026-10-07: 19 against 26
+/// on the log link, 19 against 35 on the inverse, the cold fit 28 on both).
+/// Without it the dispersion still starts from the no-RE plug-in seed, the
+/// case the `ln φ` gate's cold radius is for.
+#[test]
+fn carried_gamma_dispersion_reaches_the_cold_optimum() {
+    for link in [crate::GammaLink::Log, crate::GammaLink::Inverse] {
+        let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(link);
+        let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        assert!(cold.converged(), "{link:?}: cold fit");
+        let no_disp = StartValues {
+            beta: cold.beta.clone(),
+            theta: vec![cold.tau2[0].sqrt()],
+            dispersion: None,
+        };
+        let with_disp = StartValues {
+            dispersion: Some(cold.dispersion),
+            ..no_disp.clone()
+        };
+        let a = fit_warm(&x, &y, n, p, &model, &ids, Some(&no_disp), &opts);
+        let b = fit_warm(&x, &y, n, p, &model, &ids, Some(&with_disp), &opts);
+        for (f, label) in [(&a, "cold φ seed"), (&b, "carried φ")] {
+            assert!(f.converged(), "{link:?}, {label}: converged");
+            let rel = (f.deviance - cold.deviance).abs() / cold.deviance.abs();
+            assert!(rel < 1e-9, "{link:?}, {label}: deviance rel {rel}");
+            let d = (f.dispersion / cold.dispersion - 1.0).abs();
+            assert!(d < 1e-4, "{link:?}, {label}: dispersion rel {d}");
+        }
+        assert!(
+            b.n_eval <= a.n_eval,
+            "{link:?}: carried φ took {} evaluations, the cold φ seed {}",
+            b.n_eval,
+            a.n_eval
+        );
+    }
+}
+
+/// A carried NB shape is the seed itself (the no-RE GLM-NB prefit that exists
+/// only to produce one is skipped), and the fit returns the cold optimum from
+/// it, on the GLMM and on the NB GLM (whose shape search takes it as its
+/// `theta_seed`).
+#[test]
+fn carried_nb_shape_reaches_the_cold_optimum() {
+    let (x, y, model, ids) = nb_log_four_cluster_design(3, 24, 0);
+    let (n, p) = (y.len(), 2usize);
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(cold.converged());
+    for theta_nb in [cold.dispersion, 0.5 * cold.dispersion, 4.0] {
+        let start = StartValues {
+            dispersion: Some(theta_nb),
+            ..StartValues::default()
+        };
+        let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+        assert!(warm.converged(), "θ_NB start {theta_nb}");
+        let rel = (warm.deviance - cold.deviance).abs() / cold.deviance.abs();
+        assert!(rel < 1e-9, "θ_NB start {theta_nb}: deviance rel {rel}");
+    }
+    let glm = ModelSpec {
+        family: model.family,
+        re: None,
+    };
+    let none = GroupIds::default();
+    let cold_glm = fit_cold(&x, &y, n, p, &glm, &none, &opts);
+    let start = StartValues {
+        dispersion: Some(2.0 * cold_glm.dispersion),
+        ..StartValues::default()
+    };
+    let warm_glm = fit_warm(&x, &y, n, p, &glm, &none, Some(&start), &opts);
+    assert!(warm_glm.converged());
+    let d = (warm_glm.dispersion / cold_glm.dispersion - 1.0).abs();
+    assert!(d < 1e-6, "NB GLM θ̂ from a carried seed: rel {d}");
+}
+
+/// The carried φ is per call: a reused workspace that fitted one draw from a
+/// carried φ fits the next draw without one bit for bit as a fresh workspace
+/// does (`gamma_phi_start` is set on every call, never left over).
+#[test]
+fn carried_gamma_dispersion_does_not_leak_across_fit_on_calls() {
+    use super::core::{build_workspace, fit_on};
+    let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(crate::GammaLink::Log);
+    let (sized, ids_s, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let start = StartValues {
+        dispersion: Some(0.3),
+        ..StartValues::default()
+    };
+    let mut reused = build_workspace(&sized, perm, n, p, &opts);
+    let _ = fit_on(&mut reused, &x, &y, &ids_s, Some(&start), &opts)
+        .into_fit(&x, &y, &ids_s, n, p, &model, &opts);
+    let second = fit_on(&mut reused, &x, &y, &ids_s, None, &opts)
+        .into_fit(&x, &y, &ids_s, n, p, &model, &opts);
+    let (sized, _, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut fresh = build_workspace(&sized, perm, n, p, &opts);
+    let alone = fit_on(&mut fresh, &x, &y, &ids_s, None, &opts)
+        .into_fit(&x, &y, &ids_s, n, p, &model, &opts);
+    assert_eq!(second.n_eval, alone.n_eval);
+    assert_eq!(second.deviance.to_bits(), alone.deviance.to_bits());
+    assert_eq!(second.dispersion.to_bits(), alone.dispersion.to_bits());
+}
+
+#[test]
+#[should_panic(expected = "StartValues.dispersion must be finite and > 0")]
+fn fit_warm_rejects_a_non_positive_dispersion_start() {
+    let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(crate::GammaLink::Log);
+    let start = StartValues {
+        dispersion: Some(0.0),
+        ..StartValues::default()
+    };
+    let _ = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+}
+
+/// `FitView::dispersion_start` is the value a warm loop carries into the next
+/// draw: φ̂ on a Gamma GLMM (not `FitView::dispersion`, which is `D̂[0][0]`
+/// there) and θ̂_NB on the NB GLMM, each `Fit::dispersion` bit for bit.
+#[test]
+fn fit_view_dispersion_start_is_the_fit_dispersion() {
+    use super::core::{build_workspace, fit_on};
+    let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(crate::GammaLink::Log);
+    let (sized, ids_s, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let view = fit_on(&mut ws, &x, &y, &ids_s, None, &opts);
+    let carried = view.dispersion_start();
+    let fit = view.into_fit(&x, &y, &ids_s, n, p, &model, &opts);
+    assert_eq!(carried.map(f64::to_bits), Some(fit.dispersion.to_bits()));
+
+    let (x, y, model, ids) = nb_log_four_cluster_design(3, 24, 0);
+    let (n, p) = (y.len(), 2usize);
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (sized, ids_s, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let view = fit_on(&mut ws, &x, &y, &ids_s, None, &opts);
+    let carried = view.dispersion_start();
+    let fit = view.into_fit(&x, &y, &ids_s, n, p, &model, &opts);
+    assert_eq!(carried.map(f64::to_bits), Some(fit.dispersion.to_bits()));
 }

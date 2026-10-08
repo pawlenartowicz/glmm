@@ -177,7 +177,8 @@ standard deviation 1, and the results map back exactly:
   log-likelihood. No other deviance contains an `X` term.
 - **Warm starts.** A `StartValues` is in the caller's units and is mapped
   forward per draw: `β̃ = B⁻¹β`, and `Λ̃` the lower factor of
-  `N⁻¹·ΛΛᵀ·N⁻ᵀ`. On the loop tier a θ̂ carried from one draw is mapped forward
+  `N⁻¹·ΛΛᵀ·N⁻ᵀ`. Its `dispersion` (NB shape, Gamma φ) needs no map: neither
+  depends on the design's column scales. On the loop tier a θ̂ carried from one draw is mapped forward
   with the next draw's statistics. A start component of the wrong width is
   dropped, a cold start for that component (`fit_on`).
 
@@ -248,6 +249,7 @@ and are not user-facing.
 |---|---|---|
 | `FitWorkspace::set_prestandardized` | `true` fits the design as given, skipping the per-draw standardization except the random-slope scale; default `false`. `fit_cold`/`fit_warm` always standardize | [internal standardization](#internal-standardization-of-the-design) |
 | `FitWorkspace::set_fixed_design` | `true` promises the same `x`, ids and weights on every following `fit_on` (only `y` and the offset change): the column statistics, the design fill and, on the dense LMM route, the fixed-effect factor and the design part of the sufficient statistics are reused; bit-identical; a debug build checks the promise by a hash; default `false` | [internal standardization](#internal-standardization-of-the-design), [`algorithms-lmm.md`](algorithms-lmm.md#fixed-effect-orthogonalization) |
+| `curvature_hint` / `fit_on_hinted` | a frozen inverse Hessian at a pilot fit's optimum that each later draw's BFGS search starts from (LMMs on the per-group route, over θ; binomial and Poisson Laplace GLMMs on the gradient route, over `[θ \| β̃]`, the pilot search's own estimate); read only, so results do not depend on call order; a hint of another search dimension panics | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs), [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-binomial-and-poisson-laplace-fits) |
 
 ### Internal tuning constants
 
@@ -256,6 +258,11 @@ and are not user-facing.
 | BOBYQA `npt` | `2·n_θ + 1` for `n_θ < 3`, else `(3·n_θ).div_ceil(2) + 1` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm/mod.rs`) |
 | `rho_begin` per search | LMM `RHO_BEGIN = 0.5` blind, `RHO_BEGIN_WARM = 0.1` warm; GLMM stage 1 and the `Joint` route `GLMM_RHO_BEGIN = 0.2` (stage 1 from a kept warm θ₀ 0.1), the polish `GLMM_RHO_POLISH = 0.03` (0.1 after a stage-1 optimum with a diagonal below `POLISH_NEAR_SINGULAR = 1e-2`) | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ), [`algorithms-glmm.md`](algorithms-glmm.md) (`src/lmm/mod.rs`) |
 | `rho_end` | `RHO_END = 1e-6` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm/mod.rs`) |
+| BOBYQA `prima_parity` | `false` on every search: Powell's RESCUE factor at a fully determined model (one-dimensional searches); no effect at any other `npt` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`apply_campaign_overrides`, `src/lmm/mod.rs`) |
+| LMM outer optimizer | BFGS where the per-group regression route is armed (slopes on the primary only, `n_θ ≥ 3`), BOBYQA elsewhere and as its polish/fallback | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs) (`lmm_outer_optimizer`, `src/lmm/mod.rs`) |
+| GLMM outer optimizer | BFGS over `[θ \| β̃]` on binomial (any link) and Poisson Laplace fits with `n_θ ≥ 2` on the blocked or structured layout (a warm fit with no slope block only below 50 rows per primary level); BOBYQA elsewhere and as its polish/fallback; 200 iterations | [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-binomial-and-poisson-laplace-fits) (`gradient_route_plan`, `src/glmm/mod.rs`) |
+| BFGS stops and certificate | projected gradient `< 1e-6`; decrease `< max(FDELTA_ABS = 1e-9, FDELTA_ULPS = 16 · ε·\|f\|)`; accepted when the decrement `½·gᵀHg ≤ CERT_DECREMENT = 1e-8` and no diagonal θ `< CERT_NEAR_ZERO = 1e-3`; Armijo `c = 1e-4`, 30 halvings, first step capped at 0.5, 1000 iterations | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs) (`src/optim/bfgs.rs`) |
+| `PG_GRAD_BLOCK` | 512 groups per stacked solve of the LMM gradient | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs) (`src/lmm/pg_grad.rs`) |
 | `PIN_THETA` | `1e-4` — diagonal variance component pinned to `0`, tested on the internal (scaled) θ | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm/mod.rs`) |
 | `SINGULAR_REL_TOL` | `1e-3` — post-hoc relative check: any RE stddev `≤ 1e-3 ×` the largest ⇒ `singular`, on the internal (scaled) stddevs | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/fit/mod.rs`) |
 | RE design column scale | per random-slope column of the standardized design, `√(Σ wᵢx̃ᵢ²/Σ wᵢ)`; intercept subcolumns exactly `1.0`; always on, no trigger | [`algorithms-lmm.md`](algorithms-lmm.md#random-effect-design-column-scaling) (`src/lmm/mod.rs`) |
@@ -275,6 +282,7 @@ and are not user-facing.
 | `MAX_CROSSED_LEVELS` | `500` — total crossed-level cap (over → Sparse; a performance boundary, not scratch) | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
 | `MAX_NAGQ` | `25` — largest odd AGQ order the GH table stores | [`algorithms-glmm.md`](algorithms-glmm.md#adaptive-gausshermite-quadrature-agq) (`src/consts.rs`) |
 | `MAX_DUAL_N` / `MAX_DUAL_H` | `12` / `78` — the top instantiated dual and hyper-dual rung; lanes are instantiated at `N ∈ {4, 5, 6, 8, 12}`. Above `MAX_DUAL_N` the gradient chunks, and so does the joint Hessian, which the assembled pass reads off first-order lanes; the hyper-dual Hessian cannot chunk and refuses above the cap | [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (`src/glmm/derivative.rs`) |
+| `AGQ_GD_STEP_REL` / `AGQ_GD_ASYM_MAX` | `1e-5` / `1e-6`: the AGQ gradient-difference Hessian (rung 2a: logit, probit and Poisson-log AGQ on a scalar intercept): each coordinate moves by `1e-5·max(1, |γ̂|)` each way, and a result asymmetric beyond `1e-6·√(|H_rr·H_cc|)` falls back to the hyper-dual rung. No lane cap, so these shapes keep an exact-gradient Hessian above `MAX_DUAL_N` | [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (`src/glmm/se.rs`) |
 
 The NB GLM outer-loop constants (`NB_MAX_OUTER = 25`, `NB_THETA_TOL = 1e-6`,
 `NB_THETA_LO = 1e-3`, `NB_THETA_HI = 1e4`) are covered in the

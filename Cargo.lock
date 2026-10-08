@@ -65,9 +65,9 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bobyqa"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f3df91f7beeb19919190c7543bd69374f262176274d5e917b0efafc4b36573b"
+checksum = "36fb1944a8ed2c528a3bf333bdf9189ad5517ff9bd457b29777ae0a834b283a0"
 
 [[package]]
 name = "bytemuck"
@@ -524,7 +524,7 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "glmm"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "bobyqa",
  "dhat",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "glmm-python"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "glmm",
  "pyo3",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "glmm-r"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "extendr-api",
  "glmm",
@@ -1473,7 +1473,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "validation"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "glmm",
  "libc",
