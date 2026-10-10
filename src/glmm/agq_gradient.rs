@@ -1,9 +1,11 @@
 //! Exact `f64` gradient of the scalar-intercept AGQ deviance in
 //! `γ = [λ | β]`, from the state an AGQ value evaluation leaves: the converged
 //! per-cluster modes `û_c` (`pirls.u`) and the fixed part of the predictor
-//! `η_fix = Xβ + offset` (`pirls.eta_fixed`). Its one caller is the SE step's
+//! `η_fix = Xβ + offset` (`pirls.eta_fixed`). Two callers: the gradient
+//! route's search objective (`GradSearch` in `glmm/mod.rs`), which takes it
+//! off each accepted point's value evaluation, and the SE step's
 //! gradient-difference Hessian (`se::agq_gradient_difference_hessian`), which
-//! differences this gradient instead of carrying hyper-dual lanes per row.
+//! differences it instead of carrying hyper-dual lanes per row.
 //!
 //! Per cluster `c`, with `ℓ_c(u) = Σ_i ℓ_i(η_fix,i + λu) − u²/2`, `ℓ_i` the
 //! row log-likelihood, `û` the mode, `A = −ℓ_c''(û)`, `σ = A^{−1/2}`, the
@@ -29,9 +31,10 @@
 //! `pirls::evaluate_at_mode` builds `A` on a non-canonical link, so probit
 //! takes the same assembly with its own row terms.
 //!
-//! Covered ([`covers`]): binomial logit and probit, Poisson log; one scalar
-//! random intercept (`q_p = 1`), no extra groupings, so no dispersion
-//! coordinate. Every other AGQ shape keeps the hyper-dual rung.
+//! Covered ([`covers_shape`]): binomial logit and probit, Poisson log; one
+//! scalar random intercept (`q_p = 1`), no extra groupings, so no dispersion
+//! coordinate. Every other AGQ shape keeps the joint BOBYQA search and the
+//! hyper-dual SE rung.
 //!
 //! Measured 2026-10-07 (pawel scratch `mmjl-rethink/b7/`, `probit/`, `agqse/`):
 //! the gradient matches central differences of the AGQ deviance to their noise
@@ -42,7 +45,8 @@ use faer::MatRef;
 
 use super::agq::ClusterRowIndex;
 use super::pirls::{pirls_solve_blocked, BetaStep};
-use super::workspace::{GlmmLayout, GlmmWorkspace};
+use super::workspace::{GlmmLayout, GlmmWorkspace, PirlsScratch};
+use crate::lmm::LmmGroupings;
 use crate::spec::{BinomialLink, Family, PoissonLink};
 
 #[derive(Clone, Copy)]
@@ -67,15 +71,21 @@ fn row_family(f: Family) -> Option<RowFamily> {
     }
 }
 
-/// Whether this gradient covers the workspace's AGQ shape: `nagq > 1`, the
-/// blocked layout with one scalar random intercept and no extra groupings, and
-/// a family and link [`row_family`] knows.
+/// Whether this gradient covers an AGQ shape: `nagq > 1`, the blocked layout
+/// with one scalar random intercept and no extra groupings, and a family and
+/// link [`row_family`] knows. Needs no workspace, so the route rule
+/// (`gradient_route_plan`) can ask it while one is being built.
+pub(crate) fn covers_shape(family: Family, nagq: u8, layout: GlmmLayout, g: &LmmGroupings) -> bool {
+    nagq > 1
+        && layout == GlmmLayout::Blocked
+        && g.primary_q == 1
+        && g.extra_offsets.is_empty()
+        && row_family(family).is_some()
+}
+
+/// [`covers_shape`] on the workspace's shape.
 pub(crate) fn covers(ws: &GlmmWorkspace) -> bool {
-    ws.nagq > 1
-        && ws.layout == GlmmLayout::Blocked
-        && ws.groupings.primary_q == 1
-        && ws.groupings.extra_offsets.is_empty()
-        && row_family(ws.family).is_some()
+    covers_shape(ws.family, ws.nagq, ws.layout, &ws.groupings)
 }
 
 /// `(ℓ_i, ℓ_i', ℓ_i'', ℓ_i''')` in `η` for prior weight `w`, up to a
@@ -196,18 +206,25 @@ impl AgqGradScratch {
 
 /// The AGQ deviance gradient into `grad[..1 + p]` at `params = [λ | β]`, from
 /// the modes and `η_fix` the last AGQ value evaluation at `params` left in
-/// `ws.pirls`. `x` is the fixed-effect design that evaluation read (the search
-/// design under `BetaScale`). Precondition: [`covers`] holds and `sc` was built
-/// for this `p` and `ws.nagq`.
+/// `pirls`. Takes the workspace parts it reads, so a caller holding the
+/// workspace destructured (the search) can call it: `family`, `nagq` and
+/// `n_primary` are the workspace's, `prior_w` its prior weights, `x` the
+/// fixed-effect design that evaluation read, with `params`' β in its units.
+/// Precondition: [`covers_shape`] holds and `sc` was built for this `p` and
+/// `nagq`.
 ///
 /// `false`, with `grad` unspecified, when a row's predictor at the mode or at a
 /// node reaches the link's clamp (`family::clamp_eta_bounds`; only Poisson-log
 /// has one here). Past it the value kernel's deviance stops moving while these
 /// row terms do not, so the two would describe different objectives.
 // Index loops: each walks several per-node or per-coordinate arrays in step.
-#[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 pub(crate) fn assemble(
-    ws: &GlmmWorkspace,
+    family: Family,
+    nagq: u8,
+    n_primary: usize,
+    pirls: &PirlsScratch<f64>,
+    prior_w: &[f64],
     x: MatRef<f64>,
     y: &[f64],
     idx: &ClusterRowIndex,
@@ -215,22 +232,21 @@ pub(crate) fn assemble(
     sc: &mut AgqGradScratch,
     grad: &mut [f64],
 ) -> bool {
-    let fam = row_family(ws.family).expect("assemble: covers() holds");
-    let (eta_lo, eta_hi) = crate::family::clamp_eta_bounds(ws.family);
+    let fam = row_family(family).expect("assemble: covers_shape() holds");
+    let (eta_lo, eta_hi) = crate::family::clamp_eta_bounds(family);
     let mut clamped = false;
     let (p, k) = (sc.p, sc.k);
-    debug_assert_eq!(p, ws.p);
-    debug_assert_eq!(k, ws.nagq as usize);
+    debug_assert_eq!(k, nagq as usize);
     let m = p + 1;
     let blk = crate::consts::GH_OFFSETS[(k - 1) / 2];
     let nodes = &crate::consts::GH_NODES[blk..blk + k];
     let sq2 = std::f64::consts::SQRT_2;
     let lam = params[0];
-    let ef = &ws.pirls.eta_fixed;
-    let u = &ws.pirls.u;
-    let pw = &ws.prior_w;
+    let ef = &pirls.eta_fixed;
+    let u = &pirls.u;
+    let pw = prior_w;
     grad[..m].fill(0.0);
-    for c in 0..ws.groupings.n_primary {
+    for c in 0..n_primary {
         let rows = idx.cluster_rows(c);
         let uh = u[c];
         // Sums at the mode: Σℓ', Σℓ'', Σℓ''' and their x-weighted forms.

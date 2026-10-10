@@ -3120,69 +3120,93 @@ fn fit_glmm_cbpp_aggregated_agq_matches_lme4() {
 /// result: cluster-outer and node-outer visit the same operands in the same
 /// per-accumulator order (`ClusterRowIndex`'s ascending-row guarantee), so a
 /// full cbpp AGQ fit through the stable `fit_cold` surface is bit-identical
-/// with the knob on vs off. Exact equality, not tolerance — this is the
+/// with the knob on vs off. Exact equality, not tolerance; this is the
 /// end-to-end witness for the same safety argument
 /// `agq_cluster_outer_bit_identical_to_node_outer` (glmm/tests.rs) checks at
-/// the kernel level.
+/// the kernel level. On both outer searches: the Bernoulli rows (842 rows,
+/// about 56 per herd) keep the joint BOBYQA search, and the aggregated rows
+/// (56 rows weighted by the trial counts) search with BFGS on the exact AGQ
+/// gradient.
 #[test]
 fn fit_glmm_binomial_agq_parallel_inner_knob_is_bit_identical() {
     let (x, y, cluster_ids, n) = cbpp_design();
+    let (xa, ya, wa, ids_a, na) = cbpp_design_aggregated();
+    let designs = [
+        (x, y, None, cluster_ids, n, false),
+        (xa, ya, Some(wa), ids_a, na, true),
+    ];
     let p = 4;
     let model = cbpp_model();
-    for nagq in [7u8, 11] {
-        let ids = GroupIds {
-            primary: cluster_ids.clone(),
-            extra: vec![],
-        };
-        let f_on = fit_cold(
-            &x,
-            &y,
-            n,
-            p,
-            &model,
-            &ids,
-            &FitOptions {
-                target_indices: vec![0, 1, 2, 3],
-                nagq,
-                parallel_inner: true,
-                ..FitOptions::default()
-            },
-        );
-        let f_off = fit_cold(
-            &x,
-            &y,
-            n,
-            p,
-            &model,
-            &ids,
-            &FitOptions {
-                target_indices: vec![0, 1, 2, 3],
-                nagq,
-                parallel_inner: false,
-                ..FitOptions::default()
-            },
-        );
-        assert!(f_on.converged() && f_off.converged(), "nagq={nagq}");
-        for (j, (&b_on, &b_off)) in f_on.beta.iter().zip(&f_off.beta).enumerate() {
-            assert_eq!(
-                b_on.to_bits(),
-                b_off.to_bits(),
-                "nagq={nagq} β[{j}]: on={b_on} off={b_off}"
+    for (x, y, weights, cluster_ids, n, bfgs) in &designs {
+        let n = *n;
+        for nagq in [7u8, 11] {
+            let ids = GroupIds {
+                primary: cluster_ids.clone(),
+                extra: vec![],
+            };
+            let f_on = fit_cold(
+                x,
+                y,
+                n,
+                p,
+                &model,
+                &ids,
+                &FitOptions {
+                    target_indices: vec![0, 1, 2, 3],
+                    nagq,
+                    parallel_inner: true,
+                    weights: weights.clone(),
+                    ..FitOptions::default()
+                },
             );
-        }
-        for (j, (&s_on, &s_off)) in f_on.se.iter().zip(&f_off.se).enumerate() {
-            assert_eq!(
-                s_on.to_bits(),
-                s_off.to_bits(),
-                "nagq={nagq} se[{j}]: on={s_on} off={s_off}"
+            let f_off = fit_cold(
+                x,
+                y,
+                n,
+                p,
+                &model,
+                &ids,
+                &FitOptions {
+                    target_indices: vec![0, 1, 2, 3],
+                    nagq,
+                    parallel_inner: false,
+                    weights: weights.clone(),
+                    ..FitOptions::default()
+                },
             );
-        }
-        for (j, (&t_on, &t_off)) in f_on.tau2.iter().zip(&f_off.tau2).enumerate() {
+            assert!(f_on.converged() && f_off.converged(), "nagq={nagq}");
+            // The search each design takes, the same way with the knob on and off.
             assert_eq!(
-                t_on.to_bits(),
-                t_off.to_bits(),
-                "nagq={nagq} tau2[{j}]: on={t_on} off={t_off}"
+                f_on.diagnostics.n_grad > 0,
+                *bfgs,
+                "nagq={nagq} n={n}: gradient search"
             );
+            assert_eq!(
+                (f_on.n_eval, f_on.diagnostics.n_grad),
+                (f_off.n_eval, f_off.diagnostics.n_grad),
+                "nagq={nagq}: n_eval / n_grad"
+            );
+            for (j, (&b_on, &b_off)) in f_on.beta.iter().zip(&f_off.beta).enumerate() {
+                assert_eq!(
+                    b_on.to_bits(),
+                    b_off.to_bits(),
+                    "nagq={nagq} β[{j}]: on={b_on} off={b_off}"
+                );
+            }
+            for (j, (&s_on, &s_off)) in f_on.se.iter().zip(&f_off.se).enumerate() {
+                assert_eq!(
+                    s_on.to_bits(),
+                    s_off.to_bits(),
+                    "nagq={nagq} se[{j}]: on={s_on} off={s_off}"
+                );
+            }
+            for (j, (&t_on, &t_off)) in f_on.tau2.iter().zip(&f_off.tau2).enumerate() {
+                assert_eq!(
+                    t_on.to_bits(),
+                    t_off.to_bits(),
+                    "nagq={nagq} tau2[{j}]: on={t_on} off={t_off}"
+                );
+            }
         }
     }
 }
@@ -10674,17 +10698,25 @@ fn gamma_inverse_gradient_route_matches_bobyqa_in_any_units() {
 /// The joint `[θ | β̃]` search on working weights that span many decades:
 /// six Poisson-log clusters of five rows whose log-means are spread evenly
 /// over `decades`, so `W = μ` runs from about 1 to 10^decades. The blocked
-/// layout fits nAGQ = 1 on the exact profile; the packed layout (Laplace) and
-/// 7-node AGQ fit it on the joint search. On β̃ scaled by the design alone the
-/// joint search stopped converged above the exact-profile optimum: packed by
-/// 1.05 deviance units at 8 decades, and at 12 decades packed and AGQ by 800
-/// to 1050 units (measured 2026-10-04).
+/// layout fits nAGQ = 1 on the exact profile; the packed layout (Laplace) fits
+/// it on the joint search, and 7-node AGQ on the gradient route (BFGS on the
+/// exact AGQ gradient) followed by the joint search's check. On β̃ scaled by the
+/// design alone the joint search stopped converged above the exact-profile
+/// optimum: packed by 1.05 deviance units at 8 decades, and at 12 decades
+/// packed and AGQ by 800 to 1050 units (measured 2026-10-04). On the gradient
+/// route at 8 decades BFGS finishes 4.58 units above the AGQ optimum, certified,
+/// and the check's second pass moves it there; at 12 decades its line search
+/// fails and the fit hands over to the joint search (with
+/// `Note::GradientSearchFallback`), as designed (measured 2026-10-10). The
+/// third design (LCG seed 3, 12 decades) also hands over; there the second
+/// pass alone ended 2.93 above the exact profile, and the hand-over's extra
+/// information-metric pass reaches the optimum (measured 2026-10-11).
 #[test]
 fn joint_search_reaches_the_optimum_when_working_weights_span_decades() {
     let (nc, m) = (6usize, 5usize);
     let n = nc * m;
-    for decades in [8.0, 12.0] {
-        let mut st = 12345u64;
+    for (seed, decades) in [(12345u64, 8.0), (12345, 12.0), (3, 12.0)] {
+        let mut st = seed;
         let mut x = vec![0.0; n * 2];
         let mut y = vec![0.0; n];
         for i in 0..n {
@@ -10734,11 +10766,27 @@ fn joint_search_reaches_the_optimum_when_working_weights_span_decades() {
         .0;
         let agq = fit_cold(&x, &y, n, 2, &model, &ids, &opts(7));
         assert!(exact.converged() && packed.converged() && agq.converged());
+        // The AGQ fit searched with BFGS (the gradient route): the joint
+        // BOBYQA search alone, which this test was written for, no longer
+        // passes it. At 8 decades BFGS finishes; at 12 it hands over.
+        assert!(
+            agq.diagnostics.n_grad > 0,
+            "seed {seed}, {decades}: the AGQ fit did not search with BFGS"
+        );
+        if decades == 8.0 {
+            assert!(
+                !agq.diagnostics
+                    .notes
+                    .iter()
+                    .any(|n| matches!(n, Note::GradientSearchFallback)),
+                "seed {seed}, {decades}: the gradient search handed over"
+            );
+        }
         // The PIRLS exit band, relative 1e-9 (`glmm::PIRLS_TOL_REL`), bounds
         // how closely two routes can agree; 1e-11 is 0.16 units at 12 decades.
         assert!(
             (packed.deviance - exact.deviance).abs() < 1e-11 * exact.deviance,
-            "{decades}: packed {} vs exact profile {}",
+            "seed {seed}, {decades}: packed {} vs exact profile {}",
             packed.deviance,
             exact.deviance
         );
@@ -10746,7 +10794,7 @@ fn joint_search_reaches_the_optimum_when_working_weights_span_decades() {
         // within 0.03 of the Laplace one at the optimum.
         assert!(
             (agq.deviance - exact.deviance).abs() < 0.1,
-            "{decades}: AGQ {} vs exact profile {}",
+            "seed {seed}, {decades}: AGQ {} vs exact profile {}",
             agq.deviance,
             exact.deviance
         );

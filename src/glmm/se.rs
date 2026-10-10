@@ -112,8 +112,19 @@ fn agq_gradient_difference_hessian(
                 break 'cols;
             }
             prm.copy_from_slice(&ws.params[..m]);
-            if !super::agq_gradient::assemble(ws, xd, y, &gd.idx, &prm, &mut gd.sc, out)
-                || !out.iter().all(|v| v.is_finite())
+            if !super::agq_gradient::assemble(
+                ws.family,
+                nagq,
+                ws.groupings.n_primary,
+                &ws.pirls,
+                &ws.prior_w,
+                xd,
+                y,
+                &gd.idx,
+                &prm,
+                &mut gd.sc,
+                out,
+            ) || !out.iter().all(|v| v.is_finite())
             {
                 ok = false;
                 break 'cols;

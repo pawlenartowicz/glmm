@@ -9335,7 +9335,11 @@ fn agq_f64_gradient_matches_dual_gradient() {
                 assert!(f.is_finite());
                 let mut g = vec![0.0; m];
                 assert!(super::agq_gradient::assemble(
-                    &ws,
+                    ws.family,
+                    ws.nagq,
+                    ws.groupings.n_primary,
+                    &ws.pirls,
+                    &ws.prior_w,
                     x.as_ref(),
                     &y,
                     &gd.idx,
@@ -9927,7 +9931,16 @@ fn gate_fit(
 /// both links with and without weights and an offset, blocked and structured,
 /// n_θ ≥ 2) the gradient route's fit is converged and its deviance is at or
 /// below the BOBYQA route's within `1e-6`, cold and from a warm start at the
-/// BOBYQA optimum perturbed by 10%; one-θ cells do not route.
+/// BOBYQA optimum perturbed by 10%; one-θ Laplace cells do not route. The
+/// same on the covered AGQ shapes, where a fit routes with one θ, a warm one
+/// only from a θ₀ of at least `GRAD_WARM_AGQ_THETA_MIN`: logit and probit
+/// random intercepts at 7 nodes and logit at 11, whose warm fits route, and
+/// a Poisson log random intercept at 7 nodes and the aggregated binomial
+/// `sim_binomial_zerosd` at 7 nodes, whose optima are at θ = 0, so their
+/// warm starts near zero keep BOBYQA. There the certificate refuses the cold
+/// endpoint and the joint polish (`solver_polish_wide` on AGQ) finishes the
+/// cold fit (rung 3 on `sim_binomial_zerosd`). A routed AGQ fit never hands
+/// over to BOBYQA here, so a broken gradient or wiring fails.
 #[test]
 fn gradient_route_matches_or_beats_the_bobyqa_route() {
     let mut routed = 0usize;
@@ -9938,7 +9951,8 @@ fn gradient_route_matches_or_beats_the_bobyqa_route() {
                      extra_ids: &[Vec<u32>],
                      beta0: &[f64],
                      n: usize,
-                     label: &str| {
+                     label: &str|
+     -> Option<(u8, bool)> {
         let plan = ws.route_plan;
         ws.route_plan = crate::optim::RoutePlan::BOBYQA;
         let bob = gate_fit(&mut ws, x, y, ids, extra_ids, None, beta0, n);
@@ -9949,17 +9963,43 @@ fn gradient_route_matches_or_beats_the_bobyqa_route() {
         );
         ws.route_plan = plan;
         let cold = gate_fit(&mut ws, x, y, ids, extra_ids, None, beta0, n);
+        let cold_report = (ws.grad_report, ws.gradient_search_fallback);
         let warm_start: Vec<f64> = theta_bob.iter().map(|t| 1.1 * t).collect();
         let warm = gate_fit(&mut ws, x, y, ids, extra_ids, Some(&warm_start), beta0, n);
-        if ws.n_theta < 2 {
+        if ws.n_theta < 2 && ws.nagq == 1 {
             assert!(ws.grad_report.is_none(), "{label}: a one-θ fit routed");
-            return;
+            return None;
         }
         routed += 1;
-        assert!(
-            ws.grad_report.is_some(),
-            "{label}: the warm fit did not route"
-        );
+        let warm_routed = ws.grad_report.is_some();
+        if ws.nagq > 1 {
+            let off_zero = ws
+                .groupings
+                .diagonal_theta()
+                .iter()
+                .all(|&i| warm_start[i] >= GRAD_WARM_AGQ_THETA_MIN);
+            assert_eq!(
+                warm_routed, off_zero,
+                "{label}: warm AGQ routing does not follow its θ₀ {warm_start:?}"
+            );
+            let mut searches = vec![("cold", cold_report)];
+            if off_zero {
+                searches.push(("warm", (ws.grad_report, ws.gradient_search_fallback)));
+            }
+            for (kind, (report, fallback)) in searches {
+                let (_, _, _, rung) =
+                    report.unwrap_or_else(|| panic!("{label} {kind}: did not route"));
+                assert!(
+                    rung != 1 && !fallback,
+                    "{label} {kind}: the gradient search handed over"
+                );
+            }
+        } else {
+            assert!(
+                ws.grad_report.is_some(),
+                "{label}: the warm fit did not route"
+            );
+        }
         for (kind, f) in [("cold", &cold), ("warm", &warm)] {
             assert!(f.converged, "{label} {kind}: not converged");
             assert!(
@@ -9969,6 +10009,7 @@ fn gradient_route_matches_or_beats_the_bobyqa_route() {
                 bob.deviance
             );
         }
+        cold_report.0.map(|r| (r.3, warm_routed))
     };
     for &(family, shape) in GRADIENT_GATE_CELLS {
         if !routed_without_dispersion(family) {
@@ -10024,6 +10065,82 @@ fn gradient_route_matches_or_beats_the_bobyqa_route() {
             }
         }
     }
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    // The third column: whether the warm fit routes. The Poisson cell's
+    // optimum is at θ = 0, so its warm start is too.
+    let agq_cells = [
+        (logit, 7u8, true),
+        (
+            Family::Binomial {
+                link: BinomialLink::Probit,
+            },
+            7,
+            true,
+        ),
+        (
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            7,
+            false,
+        ),
+        (logit, 11, true),
+    ];
+    for (family, nagq, warm_routes) in agq_cells {
+        let (ws, x, y, ids, p, n) = fixture_with_nagq(family, "int1", nagq);
+        let label = format!("{family:?}/int1 nAGQ={nagq}");
+        let report = check(ws, x.as_ref(), &y, &ids, &[], &vec![0.0; p], n, &label);
+        assert_eq!(
+            report.map(|(_, warm_routed)| warm_routed),
+            Some(warm_routes),
+            "{label}: warm routing"
+        );
+    }
+    // `sim_binomial_zerosd`, lowered the way
+    // `glmm_zerosd_boundary_reports_converged_and_singular` (src/fit/glmm_tests.rs)
+    // does: y = incidence/size, the trial counts as prior weights, X = [1, x, z],
+    // 20 groups.
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_zerosd.csv");
+    let (mut xv, mut y, mut w, mut ids) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        let size: f64 = f[1].parse().unwrap();
+        y.push(f[0].parse::<f64>().unwrap() / size);
+        w.push(size);
+        xv.extend_from_slice(&[1.0, f[2].parse().unwrap(), f[3].parse().unwrap()]);
+        ids.push(f[4].parse::<u32>().unwrap() - 1);
+    }
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: logit,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 20 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 7);
+    ws.prior_w[..n].copy_from_slice(&w);
+    ws.weighted = true;
+    let x = Mat::<f64>::from_fn(n, p, |i, j| xv[i * p + j]);
+    let report = check(
+        ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &[],
+        &vec![0.0; p],
+        n,
+        "sim_binomial_zerosd nAGQ=7",
+    );
+    assert_eq!(
+        report,
+        Some((3, false)),
+        "sim_binomial_zerosd nAGQ=7: the cold fit did not end on the polish, or \
+         the warm fit from near θ = 0 routed"
+    );
     assert!(routed > 0, "no gate cell took the gradient route");
 }
 
@@ -10109,9 +10226,12 @@ fn gradient_route_matches_the_bobyqa_route_at_a_held_gamma_dispersion() {
     assert!(polished > 0, "no held-φ cell reached the joint polish");
 }
 
-/// The rule's table: in scope only binomial, Poisson and Gamma (both links)
-/// Laplace, with n_θ ≥ 2 on the blocked or structured layout; AGQ, NB and
-/// one-θ shapes keep BOBYQA on both start kinds.
+/// The rule's table: in scope binomial, Poisson and Gamma (both links)
+/// Laplace, with n_θ ≥ 2 on the blocked or structured layout, on both start
+/// kinds, and AGQ on the shapes the exact AGQ gradient covers (binomial logit
+/// and probit, Poisson log, one scalar random intercept), one θ included, on
+/// both start kinds; vector, NB, Gamma and cloglog AGQ, Laplace NB and one-θ
+/// Laplace shapes keep BOBYQA on both start kinds.
 #[test]
 fn gradient_route_plan_follows_the_rule() {
     use crate::optim::{OuterOptimizer, RoutePlan};
@@ -10124,10 +10244,39 @@ fn gradient_route_plan_follows_the_rule() {
     let (ws, ..) = fixture(logit, "int1");
     assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "one θ");
     let (ws, ..) = fixture_with_nagq(logit, "q2s", 7);
-    assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "AGQ");
+    assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "vector AGQ");
+    let probit = Family::Binomial {
+        link: BinomialLink::Probit,
+    };
+    let poisson = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    for family in [logit, probit, poisson] {
+        let (ws, ..) = fixture_with_nagq(family, "int1", 7);
+        assert_eq!(
+            ws.route_plan.cold,
+            OuterOptimizer::Bfgs,
+            "{family:?} AGQ cold"
+        );
+        assert_eq!(
+            ws.route_plan.warm,
+            OuterOptimizer::Bfgs,
+            "{family:?} AGQ warm"
+        );
+    }
     let nb = Family::NegativeBinomial {
         link: crate::NegBinomialLink::Log,
     };
+    let cloglog = Family::Binomial {
+        link: BinomialLink::Cloglog,
+    };
+    let gamma_log = Family::Gamma {
+        link: GammaLink::Log,
+    };
+    for family in [nb, gamma_log, cloglog] {
+        let (ws, ..) = fixture_with_nagq(family, "int1", 7);
+        assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "{family:?} AGQ");
+    }
     let (ws, ..) = fixture(nb, "q2s");
     assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "NB");
     for link in GAMMA_GATE_LINKS {
@@ -10137,6 +10286,68 @@ fn gradient_route_plan_follows_the_rule() {
         assert_eq!(ws.route_plan.warm, OuterOptimizer::Bfgs, "{gamma:?} warm");
         let (ws, ..) = fixture(gamma, "int1");
         assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "{gamma:?} one θ");
+    }
+}
+
+/// A fit on a covered AGQ shape keeps BOBYQA from `GRAD_WARM_SCALAR_ROWS_MAX`
+/// rows per primary level: on the logit `int1` fixture at 7 nodes with 8
+/// clusters, 49 rows per level route and 50 do not, cold and from a warm
+/// θ₀ = 0.5, the fit then being the BOBYQA plan's bit for bit.
+#[test]
+fn gradient_route_keeps_bobyqa_on_cold_agq_fits_from_50_rows_per_level() {
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let nc = 8usize;
+    for (per, routes) in [
+        (GRAD_WARM_SCALAR_ROWS_MAX - 1, true),
+        (GRAD_WARM_SCALAR_ROWS_MAX, false),
+    ] {
+        for start in [None, Some(&[0.5][..])] {
+            let (mut ws, x, y, ids, p, n) = fixture_with_nagq_sized(logit, "int1", 7, per * nc, nc);
+            let beta0 = vec![0.0; p];
+            let f = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], start, &beta0, n);
+            let label = format!("{per} rows per level, start {start:?}");
+            assert_eq!(ws.grad_report.is_some(), routes, "{label}");
+            if !routes {
+                let (mut wb, ..) = fixture_with_nagq_sized(logit, "int1", 7, per * nc, nc);
+                wb.route_plan = crate::optim::RoutePlan::BOBYQA;
+                let b = gate_fit(&mut wb, x.as_ref(), &y, &ids, &[], start, &beta0, n);
+                assert_eq!(
+                    (f.deviance.to_bits(), f.n_eval),
+                    (b.deviance.to_bits(), b.n_eval),
+                    "{label}: not the BOBYQA fit"
+                );
+            }
+        }
+    }
+}
+
+/// A warm fit on a covered AGQ shape keeps BOBYQA from a start below
+/// `GRAD_WARM_AGQ_THETA_MIN`: on the logit `int1` fixture at 7 nodes, a warm
+/// θ₀ = 0.02 does not route and is the BOBYQA plan's warm fit bit for bit,
+/// and θ₀ = 0.06 routes.
+#[test]
+fn gradient_route_keeps_bobyqa_on_warm_agq_fits_starting_near_zero() {
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    for (theta0, routes) in [(0.02, false), (0.06, true)] {
+        let (mut ws, x, y, ids, p, n) = fixture_with_nagq(logit, "int1", 7);
+        let beta0 = vec![0.0; p];
+        let start = [theta0];
+        let f = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], Some(&start), &beta0, n);
+        assert_eq!(ws.grad_report.is_some(), routes, "θ₀ = {theta0}");
+        if !routes {
+            let (mut wb, ..) = fixture_with_nagq(logit, "int1", 7);
+            wb.route_plan = crate::optim::RoutePlan::BOBYQA;
+            let b = gate_fit(&mut wb, x.as_ref(), &y, &ids, &[], Some(&start), &beta0, n);
+            assert_eq!(
+                (f.deviance.to_bits(), f.n_eval),
+                (b.deviance.to_bits(), b.n_eval),
+                "θ₀ = {theta0}: not the BOBYQA fit"
+            );
+        }
     }
 }
 
@@ -10266,39 +10477,53 @@ fn gradient_route_seeds_ln_phi_on_the_inverse_link_only() {
 /// start) matches a fresh workspace's fit of the same data bit for bit,
 /// because the search's state (`BfgsState`, the incumbent mode, the assembly
 /// scratch) is reset or rewritten per fit. On logit and on Gamma/log, whose
-/// `params` carry the fitted `ln φ`.
+/// `params` carry the fitted `ln φ`, and on a 7-node logit AGQ random
+/// intercept, whose search also keeps the AGQ gradient's index and buffers.
 #[test]
 fn gradient_route_refit_on_a_reused_workspace_is_bit_identical() {
-    for family in [
-        Family::Binomial {
-            link: BinomialLink::Logit,
-        },
-        Family::Gamma {
-            link: GammaLink::Log,
-        },
-    ] {
-        let (mut fresh, x, y, ids, p, n) = fixture(family, "q2s");
+    let cells: [(Family, &str, u8, &[f64]); 3] = [
+        (
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            "q2s",
+            1,
+            &[0.4, 0.1, 0.3],
+        ),
+        (
+            Family::Gamma {
+                link: GammaLink::Log,
+            },
+            "q2s",
+            1,
+            &[0.4, 0.1, 0.3],
+        ),
+        (
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            "int1",
+            7,
+            &[0.4],
+        ),
+    ];
+    for (family, shape, nagq, warm) in cells {
+        let (mut fresh, x, y, ids, p, n) = fixture_with_nagq(family, shape, nagq);
         let beta0 = vec![0.0; p];
         let want = gate_fit(&mut fresh, x.as_ref(), &y, &ids, &[], None, &beta0, n);
-        assert!(fresh.grad_report.is_some(), "{family:?}: q2s did not route");
-        let (mut ws, ..) = fixture(family, "q2s");
+        assert!(
+            fresh.grad_report.is_some(),
+            "{family:?} {shape} nAGQ={nagq}: did not route"
+        );
+        let (mut ws, ..) = fixture_with_nagq(family, shape, nagq);
         let y2: Vec<f64> = match family {
             Family::Gamma { .. } => y.iter().map(|v| 1.0 / v).collect(),
             _ => y.iter().map(|v| 1.0 - v).collect(),
         };
         let _ = gate_fit(&mut ws, x.as_ref(), &y2, &ids, &[], None, &beta0, n);
-        let _ = gate_fit(
-            &mut ws,
-            x.as_ref(),
-            &y,
-            &ids,
-            &[],
-            Some(&[0.4, 0.1, 0.3]),
-            &beta0,
-            n,
-        );
+        let _ = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], Some(warm), &beta0, n);
         let got = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
-        let at = format!("{family:?}");
+        let at = format!("{family:?} {shape} nAGQ={nagq}");
         assert_eq!(
             got.deviance.to_bits(),
             want.deviance.to_bits(),
@@ -10387,55 +10612,62 @@ fn gradient_route_is_unit_invariant_in_beta() {
 /// The GLMM curvature hint: a pilot fit's own final BFGS estimate is
 /// offered (`glmm_curvature_hint`), a hinted fit reads it without writing it,
 /// results do not depend on the order of hinted draws, and a hinted draw ends
-/// at or below the unhinted one's deviance within `1e-6`.
+/// at or below the unhinted one's deviance within `1e-6`. On the logit `q2s`
+/// Laplace fixture and on a 7-node logit AGQ random intercept; every fit here
+/// is cold.
 #[test]
 fn gradient_route_curvature_hint_is_read_only_and_order_free() {
     let logit = Family::Binomial {
         link: BinomialLink::Logit,
     };
-    let (mut pilot, x, y, ids, p, n) = fixture(logit, "q2s");
-    let beta0 = vec![0.0; p];
-    let _ = gate_fit(&mut pilot, x.as_ref(), &y, &ids, &[], None, &beta0, n);
-    let hint = super::glmm_curvature_hint(&pilot).expect("a routed pilot offers a hint");
-    assert_eq!(hint.dim(), pilot.n_theta + p);
-    let hint_bits: Vec<u64> = hint.inv_hessian().iter().map(|v| v.to_bits()).collect();
-    let draws: Vec<Vec<f64>> = (0..3)
-        .map(|d| {
-            y.iter()
-                .enumerate()
-                .map(|(i, &v)| if (i + d) % 11 == 0 { 1.0 - v } else { v })
-                .collect()
-        })
-        .collect();
-    let run = |order: &[usize]| -> Vec<(u64, usize)> {
-        let (mut ws, ..) = fixture(logit, "q2s");
-        let mut out = vec![(0u64, 0usize); draws.len()];
-        for &d in order {
-            ws.grad_hint_in = Some(hint.clone());
-            let f = gate_fit(&mut ws, x.as_ref(), &draws[d], &ids, &[], None, &beta0, n);
-            assert!(ws.grad_hint_in.is_none(), "the hint outlived its call");
-            out[d] = (f.deviance.to_bits(), f.n_eval);
+    for (shape, nagq) in [("q2s", 1u8), ("int1", 7)] {
+        let (mut pilot, x, y, ids, p, n) = fixture_with_nagq(logit, shape, nagq);
+        let beta0 = vec![0.0; p];
+        let _ = gate_fit(&mut pilot, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+        let hint = super::glmm_curvature_hint(&pilot).expect("a routed pilot offers a hint");
+        assert_eq!(hint.dim(), pilot.n_theta + p);
+        let hint_bits: Vec<u64> = hint.inv_hessian().iter().map(|v| v.to_bits()).collect();
+        let draws: Vec<Vec<f64>> = (0..3)
+            .map(|d| {
+                y.iter()
+                    .enumerate()
+                    .map(|(i, &v)| if (i + d) % 11 == 0 { 1.0 - v } else { v })
+                    .collect()
+            })
+            .collect();
+        let run = |order: &[usize]| -> Vec<(u64, usize)> {
+            let (mut ws, ..) = fixture_with_nagq(logit, shape, nagq);
+            let mut out = vec![(0u64, 0usize); draws.len()];
+            for &d in order {
+                ws.grad_hint_in = Some(hint.clone());
+                let f = gate_fit(&mut ws, x.as_ref(), &draws[d], &ids, &[], None, &beta0, n);
+                assert!(ws.grad_hint_in.is_none(), "the hint outlived its call");
+                out[d] = (f.deviance.to_bits(), f.n_eval);
+            }
+            out
+        };
+        let a = run(&[0, 1, 2]);
+        let b = run(&[2, 0, 1]);
+        assert_eq!(
+            a, b,
+            "{shape}: hinted results depend on the order of the draws"
+        );
+        let after: Vec<u64> = hint.inv_hessian().iter().map(|v| v.to_bits()).collect();
+        assert_eq!(hint_bits, after, "{shape}: the fit wrote the hint");
+        let (mut plain, ..) = fixture_with_nagq(logit, shape, nagq);
+        for (d, yd) in draws.iter().enumerate() {
+            let f = gate_fit(&mut plain, x.as_ref(), yd, &ids, &[], None, &beta0, n);
+            assert!(
+                f64::from_bits(a[d].0) <= f.deviance + 1e-6,
+                "{shape} draw {d}: hinted {} vs unhinted {}",
+                f64::from_bits(a[d].0),
+                f.deviance
+            );
+            println!(
+                "hint {shape} nAGQ={nagq} draw {d}: n_eval hinted {} unhinted {}",
+                a[d].1, f.n_eval
+            );
         }
-        out
-    };
-    let a = run(&[0, 1, 2]);
-    let b = run(&[2, 0, 1]);
-    assert_eq!(a, b, "hinted results depend on the order of the draws");
-    let after: Vec<u64> = hint.inv_hessian().iter().map(|v| v.to_bits()).collect();
-    assert_eq!(hint_bits, after, "the fit wrote the hint");
-    let (mut plain, ..) = fixture(logit, "q2s");
-    for (d, yd) in draws.iter().enumerate() {
-        let f = gate_fit(&mut plain, x.as_ref(), yd, &ids, &[], None, &beta0, n);
-        assert!(
-            f64::from_bits(a[d].0) <= f.deviance + 1e-6,
-            "draw {d}: hinted {} vs unhinted {}",
-            f64::from_bits(a[d].0),
-            f.deviance
-        );
-        println!(
-            "hint draw {d}: n_eval hinted {} unhinted {}",
-            a[d].1, f.n_eval
-        );
     }
 }
 
@@ -10500,23 +10732,27 @@ fn gradient_route_handles_quasi_separation() {
 /// and no more than the same fits on the BOBYQA plan: the gradient search
 /// (its `BfgsState`, the assembly scratch kept under `GRAD_ASM_KEEP_BYTES`)
 /// allocates nothing per fit once the workspace has fitted once. On logit and
-/// on Gamma/log with its free `ln φ`.
+/// on Gamma/log with its free `ln φ`, and on a 7-node logit AGQ random
+/// intercept, whose search also keeps the AGQ gradient's index and buffers.
 /// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests gradient_route_repeat_fits_allocate_no_more -- --ignored --test-threads=1`
 #[cfg(feature = "alloc-tests")]
 #[test]
 #[ignore]
 fn gradient_route_repeat_fits_allocate_no_more() {
     let _serial = crate::test_support::alloc_test_guard();
-    for family in [
-        Family::Binomial {
-            link: BinomialLink::Logit,
-        },
-        Family::Gamma {
-            link: GammaLink::Log,
-        },
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let gamma_log = Family::Gamma {
+        link: GammaLink::Log,
+    };
+    for (family, shape, nagq) in [
+        (logit, "q2s", 1u8),
+        (gamma_log, "q2s", 1),
+        (logit, "int1", 7),
     ] {
-        let (mut wr, x, y, ids, p, n) = fixture(family, "q2s");
-        let (mut wb, ..) = fixture(family, "q2s");
+        let (mut wr, x, y, ids, p, n) = fixture_with_nagq(family, shape, nagq);
+        let (mut wb, ..) = fixture_with_nagq(family, shape, nagq);
         wb.route_plan = crate::optim::RoutePlan::BOBYQA;
         let beta0 = vec![0.0; p];
         let blocks = |ws: &mut GlmmWorkspace| {
@@ -10527,18 +10763,21 @@ fn gradient_route_repeat_fits_allocate_no_more() {
             stats.total_blocks
         };
         let _ = gate_fit(&mut wr, x.as_ref(), &y, &ids, &[], None, &beta0, n);
-        assert!(wr.grad_report.is_some(), "{family:?}: q2s did not route");
+        assert!(
+            wr.grad_report.is_some(),
+            "{family:?} {shape} nAGQ={nagq}: did not route"
+        );
         let _ = gate_fit(&mut wb, x.as_ref(), &y, &ids, &[], None, &beta0, n);
         let r2 = blocks(&mut wr);
         let r3 = blocks(&mut wr);
         let b2 = blocks(&mut wb);
         assert_eq!(
             r2, r3,
-            "{family:?}: routed refits allocate a growing amount"
+            "{family:?} {shape} nAGQ={nagq}: routed refits allocate a growing amount"
         );
         assert!(
             r2 <= b2,
-            "{family:?}: routed refit {r2} blocks vs BOBYQA refit {b2}"
+            "{family:?} {shape} nAGQ={nagq}: routed refit {r2} blocks vs BOBYQA refit {b2}"
         );
     }
 }

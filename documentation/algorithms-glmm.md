@@ -443,14 +443,26 @@ the PQL β is not the Laplace or AGQ one. When it is lower by more than
 point, on β̃ scaled by the β information there instead of the design
 (`BetaScale::set_info`: `L·Lᵀ = S_β/Σw`, `S_β = X'WX − X'WM·A⁻¹·M'WX` the
 factor the PQL solve leaves in `border.schur`), so the deviance is isotropic in
-β̃ to second order. The check's solves are not search evaluations; when it does
+β̃ to second order. On AGQ the check and its second pass also run after a
+gradient-route finish (see
+[Gradient search](#gradient-search-bfgs-on-laplace-and-scalar-intercept-agq-fits)).
+The check's solves are not search evaluations; when it does
 not fire the fit is the one-pass fit bit for bit. Measured 2026-10-04 on six
 Poisson-log clusters with log-means spread over eight decades: the packed
 layout's search had stopped 1.05 units above the exact-profile optimum and now
 reaches it to 2e-8; over twelve decades packed and 7-node AGQ had stopped 800 to
-1050 units above it and now end within the PIRLS exit band of it. On the
-grid's AGQ and packed cells the check never fired (largest value 2e-14
-relative). **Validation:**
+1050 units above it and now end within the PIRLS exit band of it. Since
+2026-10-10 the 7-node AGQ fit searches with BFGS first: over eight decades the
+check's second pass takes it from a certified BFGS endpoint 4.58 units above
+the optimum to the optimum, and over twelve the BFGS line search fails, the fit
+hands over to the joint search with `Note::GradientSearchFallback` and, with
+the hand-over's extra pass (see
+[Gradient search](#gradient-search-bfgs-on-laplace-and-scalar-intercept-agq-fits)),
+ends 4.6e-5 units from the joint search's former optimum. On a second
+twelve-decade design the second pass alone ended 2.93 units above the
+exact-profile optimum, and the extra pass reaches it (measured 2026-10-11). On the
+grid's AGQ and packed cells the check never fired after the joint search
+(largest value 2e-14 relative). **Validation:**
 `joint_search_reaches_the_optimum_when_working_weights_span_decades`
 (`src/fit/glmm_tests.rs`).
 
@@ -542,11 +554,12 @@ structured ones with a crossed tail,
 `far_warm_starts_reach_cold_optimum_with_the_border_trust_region` the far
 starts that fail without the trust region.
 
-### Gradient search (BFGS) on binomial, Poisson and Gamma Laplace fits
+### Gradient search (BFGS) on Laplace and scalar-intercept AGQ fits
 
 **Code:** `gradient_route_plan`, `GradSearch` and the gradient-route block of
 `fit_glmm` (`src/glmm/mod.rs`); `assembled::gradient_at_mode`
-(`src/glmm/assembled.rs`); the driver `optim::bfgs::bfgs_minimize`
+(`src/glmm/assembled.rs`); `agq_gradient::{covers_shape, assemble}`
+(`src/glmm/agq_gradient.rs`); the driver `optim::bfgs::bfgs_minimize`
 (`src/optim/bfgs.rs`), shared with the LMM's per-group route
 ([`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs)).
 
@@ -556,15 +569,35 @@ structured layout searches with projected BFGS instead of the `ExactProfile`
 BOBYQA search. A warm fit (a caller's θ start the start guard keeps or
 compares) does too, except one with no random-slope block whose primary
 grouping averages 50 rows per level or more (`GRAD_WARM_SCALAR_ROWS_MAX`),
-which stays on BOBYQA. NB (its `ln θ_NB` changes the variance function, and
-the gradient has no entry for it), AGQ, the packed layout and one-θ fits keep
-their BOBYQA routes. The rule reads the shape and the start kind only.
+which stays on BOBYQA. An AGQ fit (`nAGQ > 1`) of a binomial (logit or probit
+link) or Poisson GLMM with one scalar random intercept and no other grouping,
+the shapes the exact AGQ gradient covers (`agq_gradient::covers_shape`),
+searches with it instead of the joint BOBYQA search when its grouping averages
+fewer than 50 rows per level (the same `GRAD_WARM_SCALAR_ROWS_MAX`, on cold and
+warm AGQ fits alike); one θ is enough there, because the search it replaces is
+the joint one, not `ExactProfile`. A warm AGQ fit routes only when every
+diagonal θ₀ of its start is at least `GRAD_WARM_AGQ_THETA_MIN = 0.05`: a start
+at or near a zero variance ends near θ = 0, where no endpoint is certified, and
+pays the polish (step 3 below). Measured 2026-10-10 against the joint search
+(whole fits, locked clock): warm starts at θ₀ ≤ 0.02 were 0.87 to 1.57 times
+its time, nine of ten above 1.13; those at θ₀ ≥ 0.05 at most 1.22 times; and a
+cold fit at 500 rows per level was 1.27 times. NB (its `ln θ_NB` changes the
+variance function, and the gradient has no entry for it), AGQ on any other
+shape (cloglog, Gamma, a random-effect vector), the packed layout and one-θ
+Laplace fits keep their BOBYQA routes. The rule reads the shape, the start
+kind, the rows per level and, on a warm fit, the start's θ only.
 
 **The objective** is the fixed-β Laplace deviance over `γ̃ = [θ | β̃]`, θ on
 the symmetric box `±THETA_HI`, β whitened as the joint BOBYQA search's
 (`BetaScale`, `β̃ = Lᵀβ`). Every evaluation runs PIRLS at `pirls_tol` from the
 incumbent's mode. A value whose PIRLS solve runs its iteration cap is a
-failed trial, so an accepted point always rests on a converged mode.
+failed trial, so an accepted point always rests on a converged mode. On a
+covered AGQ shape the value is the fixed-β AGQ deviance at `nAGQ` nodes, the
+joint BOBYQA search's own objective, and the gradient is the exact AGQ
+gradient in `[λ | β]` (`agq_gradient::assemble`), assembled off the modes and
+`η_fix` that point's value evaluation left, at about half the cost of a value
+evaluation, then mapped to β̃. A row whose predictor reaches the link's clamp
+leaves it undefined, a silent hand-over (step 4 below).
 
 **The `ln φ` coordinate.** On a Gamma fit with a free dispersion the point is
 `[θ | β̃ | ψ]`, `ψ = ln φ_int` on the internal weights (see
@@ -632,22 +665,45 @@ reaches it. Then:
    the decrement `½·gᵀHg ≤ 1e-8`, no diagonal θ is below `1e-3` and the saddle
    walk kept nothing. A certified endpoint is the fit's optimum;
 3. a search that stopped on a convergence test but is not certified is
-   polished by the joint BOBYQA search at `GLMM_RHO_POLISH`, from the
-   endpoint; the polish's status is the fit's;
+   polished by the joint BOBYQA search from the endpoint, at `GLMM_RHO_POLISH`
+   on a Laplace shape and at `RHO_BEGIN_WARM` on AGQ (`solver_polish_wide`:
+   AGQ has no stage 1, and its joint solver starts at `GLMM_RHO_BEGIN`); the
+   polish's status is the fit's;
 4. any other stop (the gradient unavailable at a clamped η row or a non-PD
    observed factor, the line search, the iteration cap of 200), and an endpoint
    with a diagonal θ at or above `GRAD_THETA_FAR = 100` (the plateau toward the
-   box), hands over to the shape's BOBYQA route at `RHO_BEGIN_WARM` with its
-   unchanged budget: from the incumbent, or from the search's start off the
-   plateau. Only a failed line search or the iteration cap raise
-   `Note::GradientSearchFallback`; where the gradient is not defined the BOBYQA
-   route is the designed handler.
+   box), hands over to the shape's BOBYQA route with its unchanged budget: from
+   the incumbent, or from the search's start off the plateau. On a Laplace
+   shape that route's stage 1 restarts at `RHO_BEGIN_WARM`; on AGQ, which has
+   no stage 1, the joint search restarts at `GLMM_RHO_BEGIN`. Only a failed
+   line search or the iteration cap raise `Note::GradientSearchFallback`; where
+   the gradient is not defined the BOBYQA route is the designed handler.
+
+On AGQ a fit that steps 2 or 3 finish then goes through the joint search's
+check and second pass (`JOINT_RECHECK_TOL`, see
+[β profiling](#β-profiling--the-three-outer-routes)), as a joint BOBYQA pass
+does; on a Laplace shape the finish is the fit's result. Where the working
+weights span decades, the design-metric β̃ that leaves the joint BOBYQA search
+short leaves BFGS short too, with an endpoint its certificate accepts; the
+second pass is what reaches the optimum there. After a hand-over on AGQ, a
+second pass is followed by one more information-metric pass, from the check's
+re-solved β at the second pass's θ and at `GLMM_RHO_BEGIN`, and the lower of
+the two passes is kept. Where the working weights span many decades (|f| near
+1e10) the deviance's rounding noise defeats BOBYQA's local model at small
+radii, so a pass ends where its start leads it, and the fresh pass recovers
+most of those ends: measured 2026-10-11 on 125 such designs, failures fell
+from 31 to 16 on x86_64 and from 30 to 17 on aarch64, none worse, at about 29
+evaluations more per hand-over fit. A fit that did not hand over runs no
+extra pass.
 
 A warm fit whose θ start has a diagonal above `GRAD_WARM_THETA_MAX = 10` takes
 the BOBYQA route: from such far starts the joint search ended in a worse local
 minimum than `ExactProfile` on 2 of 600 cloglog crossed starts
-(`far_warm_start_scan`). A warm fit keeps the shape's own start guard (on the
-exact profile) and starts the search from the guard's profiled β̂.
+(`far_warm_start_scan`). This rule applies to AGQ unchanged. A warm Laplace
+fit keeps the shape's own start guard (on the exact profile) and starts the
+search from the guard's profiled β̂. A warm AGQ fit keeps the AGQ guard, which
+compares the starts on the fixed-β AGQ objective at β₀ (there is no stage 1 to
+profile on), and starts the search from β₀ at the guard's θ.
 
 `converged` is the status of whichever optimizer finished, and `n_eval` counts
 every value evaluation of both. The search's state is reset per fit, so a refit
@@ -656,7 +712,8 @@ on a reused workspace matches a fresh one bit for bit
 
 **Curvature hint.** `loop_advanced::curvature_hint` after a routed pilot fit
 returns the pilot search's own final BFGS inverse-Hessian estimate over
-`[θ | β̃]`, and over `[θ | β̃ | ψ]` on a free Gamma dispersion, at no cost.
+`[θ | β̃]` (a covered AGQ fit included), and over `[θ | β̃ | ψ]` on a free Gamma
+dispersion, at no cost. A draw that searches with BOBYQA ignores it.
 `fit_on_hinted` starts each draw's search from it; the fit only reads it, so
 results do not depend on the order of the draws. After a Gamma-inverse retry
 that ran more than the first search (see
@@ -666,21 +723,39 @@ hinted draw starts in the units of its own first search.
 
 **Memory.** The `f64` assembly scratch (`G_γ`, `m·k`) is sized on a fit's first
 gradient and kept for the next fit up to `GRAD_ASM_KEEP_BYTES = 4 MiB`;
-beyond that it is released before the SE step.
+beyond that it is released before the SE step. On AGQ the gradient's row
+index and buffers (`GlmmWorkspace::agq_gd`) are built on the first covered fit
+and kept, its index rebuilt per fit; the SE step's gradient-difference Hessian
+reuses them.
 
 **Validation:** `gradient_at_mode_matches_the_re_solve_gradient` and
 `gradient_at_mode_matches_finite_differences_across_theta_regimes` (the
 gradient, every routed family × link × layout, the sparse Schur arm included),
 `gradient_route_matches_or_beats_the_bobyqa_route` (every routed gate cell,
-cold and warm, at or below the BOBYQA route's deviance within `1e-6`),
+cold and warm, at or below the BOBYQA route's deviance within `1e-6`; on AGQ
+logit, probit and Poisson random intercepts at 7 nodes, logit at 11, and
+`sim_binomial_zerosd` at 7, whose cold fit the polish finishes; the warm fits
+of the Poisson case and `sim_binomial_zerosd`, whose optima are at θ = 0, keep
+BOBYQA),
+`gradient_route_plan_follows_the_rule`,
+`gradient_route_keeps_bobyqa_on_cold_agq_fits_from_50_rows_per_level` (49 rows
+per level route, 50 give the BOBYQA fit bit for bit, cold and warm),
+`gradient_route_keeps_bobyqa_on_warm_agq_fits_starting_near_zero` (a warm
+θ₀ = 0.02 gives the BOBYQA fit bit for bit, 0.06 routes),
 `gradient_route_matches_the_bobyqa_route_at_a_held_gamma_dispersion`,
 `gradient_route_seeds_ln_phi_on_the_inverse_link_only`,
 `gradient_route_hands_over_on_the_iteration_cap`,
 `gradient_route_is_unit_invariant_in_beta` and
-`gradient_route_curvature_hint_is_read_only_and_order_free`, all in
-`src/glmm/tests.rs`; `gamma_inverse_gradient_route_matches_bobyqa_in_any_units`,
+`gradient_route_curvature_hint_is_read_only_and_order_free` (a cold 7-node
+logit AGQ case among its fixtures, as in the refit test above and the
+alloc-tier `gradient_route_repeat_fits_allocate_no_more`), all in
+`src/glmm/tests.rs`;
+`gamma_inverse_gradient_route_matches_bobyqa_in_any_units`,
 `fit_glmm_gamma_weight_scale_invariant_routed` and
-`fit_on_hinted_takes_a_gamma_hint_with_its_ln_phi_slot`
+`fit_on_hinted_takes_a_gamma_hint_with_its_ln_phi_slot`,
+`fit_glmm_binomial_agq_parallel_inner_knob_is_bit_identical` (cbpp's Bernoulli
+rows, about 56 per herd, on BOBYQA; its aggregated rows on BFGS) and
+`joint_search_reaches_the_optimum_when_working_weights_span_decades`
 (`src/fit/glmm_tests.rs`); `bfgs_start_curvature_seeds_one_coordinate` and
 `bfgs_fdelta_floor_is_finer_on_the_glmm_route` (`src/optim/tests.rs`).
 
@@ -831,6 +906,17 @@ could pass `|η| = 37` (inside the `erfc` kernel's certified range) takes the
 generic form. Other families and links, and probit on the vector kernel, keep
 the generic node loop. The node sums agree with the generic loop at round-off
 level.
+
+**Outer search.** An AGQ fit has no stage 1 (`OuterSearch::Joint`). On the
+shapes the exact AGQ gradient covers (`agq_gradient::covers_shape`: binomial
+logit or probit, or Poisson, with one scalar random intercept) a fit whose
+grouping averages fewer than 50 rows per level searches with projected BFGS on
+that gradient, cold, or warm from a start with every diagonal θ₀ at least
+0.05, with the joint BOBYQA search as its polish and fallback (see
+[Gradient search](#gradient-search-bfgs-on-laplace-and-scalar-intercept-agq-fits)).
+Any other covered fit, and every other AGQ shape (binomial cloglog, NB, Gamma,
+a random-effect vector), keeps the joint BOBYQA search over `[θ | β̃]`, with
+the dispersion coordinate on NB and Gamma.
 
 **Convention/reference:** `glmer(nAGQ=k)` with Liu–Pierce adaptive centering at
 each cluster's PIRLS mode/curvature. **Validation:** in-crate goldens
@@ -1009,7 +1095,7 @@ a probed point reuses its solve. At the grid's starts the gate measures
 cell; on `gami_cross4_g3000p20_bal_base` the scaled search takes 97
 evaluations against 365 unscaled. The probes run on the BOBYQA route only; the gradient
 search seeds ψ's start curvature on the inverse link instead (see
-[Gradient search](#gradient-search-bfgs-on-binomial-poisson-and-gamma-laplace-fits)).
+[Gradient search](#gradient-search-bfgs-on-laplace-and-scalar-intercept-agq-fits)).
 
 The gate is the cold fit's question on every fit, whatever point the
 coordinate starts from. The plug-in seed charges the random-effect variance
@@ -1163,7 +1249,7 @@ packed fit keeps them `0 × 0` and holds `A` in CSC form with its sparse
 Cholesky (`PackedSparse`), so its footprint is the fill of `L`, not `8k²`
 bytes. A single workspace is reused across every BOBYQA
 evaluation and PIRLS iteration of one fit with no reallocation; the warm path
-is zero-alloc (each BOBYQA solver is constructed once: the cold ones with the workspace, the warm stage-1, the near-singular polish and the saddle-check restart solvers on first use). The shape-compatibility rule is a **contract, not a runtime check**: the
+is zero-alloc (each BOBYQA solver is constructed once: the cold ones with the workspace, the warm stage-1, the near-singular polish (also the AGQ gradient route's polish) and the saddle-check restart solvers on first use). The shape-compatibility rule is a **contract, not a runtime check**: the
 buffers are fixed at construction, and nothing in the crate detects a mismatch
 — a `loop_advanced` caller must construct a fresh workspace whenever the row
 count would exceed `max_n`, `p` changes, or the RE topology changes (any shift
@@ -1735,7 +1821,7 @@ GLMMadaptive is quadrature-first.
 | Default objective | Laplace (`nAGQ=1`) | Laplace | **adaptive GH quadrature** (default 11 points for ≤ 2 REs) | Laplace (`nAGQ=1`) |
 | AGQ shapes | single **scalar** RE only | single scalar RE only | vector REs, product grid (its core feature) | single grouping, `q_p ≤ 3` product grid, binomial/Poisson/NB/Gamma (opt-in `nagq`) |
 | Grouping structure | multiple, crossed/nested | multiple, crossed/nested | **single grouping factor only** | multiple, crossed/nested (dense/sparse routing) |
-| Outer optimisation | derivative-free, θ-then-joint two-stage (BOBYQA/Nelder-Mead) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE); `fast=true` θ-only or joint | hybrid: EM first, then quasi-Newton over all parameters | projected BFGS on the analytic gradient over `[θ\|β]` (and Gamma's `ln φ`) on binomial, Poisson and Gamma Laplace fits with `n_θ ≥ 2` on the blocked or structured layout, BOBYQA as its polish and fallback; elsewhere derivative-free BOBYQA, one of three routes fixed per shape: joint `[θ\|β]`, θ-only PQL profile then joint polish, or θ-only EXACT Laplace profile alone |
+| Outer optimisation | derivative-free, θ-then-joint two-stage (BOBYQA/Nelder-Mead) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE); `fast=true` θ-only or joint | hybrid: EM first, then quasi-Newton over all parameters | projected BFGS on the analytic gradient over `[θ\|β]` (and Gamma's `ln φ`) on binomial, Poisson and Gamma Laplace fits with `n_θ ≥ 2` on the blocked or structured layout, and on the exact AGQ gradient on binomial logit/probit and Poisson AGQ fits with one scalar random intercept and fewer than 50 rows per level (a warm one from θ₀ ≥ 0.05), BOBYQA as its polish and fallback; elsewhere derivative-free BOBYQA, one of three routes fixed per shape: joint `[θ\|β]`, θ-only PQL profile then joint polish, or θ-only EXACT Laplace profile alone |
 | Fixed-effect vcov | Hessian (default) or RX | RX-style only | observed information (numeric), sandwich available | both arms: `Hessian` (default, ≡ `use.hessian=TRUE`) and `Rx` (≡ MixedModels) |
 | Families beyond binomial/Poisson | Gamma, NB (`glmer.nb`), … | limited | broad: NB, beta, Student-t, zero-inflated/hurdle, censored, user-defined density | Gamma, NB (marginal-θ as a BOBYQA coordinate) |
 | RE-covariance boundary (singular fits) | bounded linear-scale Cholesky, θ diagonals `≥ 0`: boundary reachable; flagged via `isSingular` (θ `< 1e-4`), raw θ reported | same bounded Cholesky, boundary reachable | **log-Cholesky** (`chol_transf`: Cholesky diagonal on the log scale), unconstrained — the boundary sits at `−∞` and is unreachable | bounded Cholesky as lme4, plus the exact-`0` pin (`PIN_THETA`) and `Diagnostics::singular`/`Diagnostics::boundary`/`Diagnostics::pinned` |

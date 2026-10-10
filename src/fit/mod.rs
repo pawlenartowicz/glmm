@@ -382,8 +382,9 @@ pub struct Diagnostics {
     /// Solver observations that are not one of the fixed channels above. Empty
     /// on a clean fit, and empty allocates nothing.
     pub notes: Vec<Note>,
-    /// Gradient evaluations the BFGS θ search made, on the LMM and GLMM routes
-    /// that search with it (listed on [`Note::GradientSearchFallback`]).
+    /// Gradient evaluations the BFGS outer search made, on the LMM and GLMM
+    /// routes that search with it, Laplace and AGQ (listed on
+    /// [`Note::GradientSearchFallback`]).
     /// [`Fit::n_eval`] does not count them, because a gradient reuses its
     /// point's value evaluation. 0 on every fit that ran no gradient search.
     /// This field and the two below describe the BFGS search even when BOBYQA
@@ -511,7 +512,10 @@ pub enum Note {
     ExactProfileFallback,
     /// The gradient search (BFGS: LMMs whose random slopes are all on one
     /// grouping; binomial, Poisson and Gamma Laplace GLMMs with at least two θ
-    /// on the blocked or structured layout) did not converge, so BOBYQA, the
+    /// on the blocked or structured layout; binomial logit and probit and
+    /// Poisson log AGQ GLMMs with one scalar random intercept, no other
+    /// grouping and under 50 rows per cluster, cold or from a warm θ of at
+    /// least 0.05) did not converge, so BOBYQA, the
     /// derivative-free search every other model uses, continued from the best
     /// point it had reached, with its own full evaluation budget. The reported
     /// estimates and `converged` are that search's. `n_eval` counts both.

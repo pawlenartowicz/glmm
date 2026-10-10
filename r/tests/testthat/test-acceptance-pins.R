@@ -40,12 +40,18 @@ test_that("binomial random intercept is pinned, Laplace and nAGQ = 7", {
   # Re-recorded 2026-10-03, after the fit moved along a flat direction: logLik
   # -393.542896593028, 1e-12 lower. The fixed effects moved by at most 3.6e-7
   # absolute (the last one 6.9e-5 relative), the SD by 4.1e-7 relative.
+  #
+  # Re-recorded 2026-10-10 (PRE2 step 2), when an AGQ fit with one random
+  # intercept began to search with BFGS on the exact AGQ gradient: logLik
+  # -393.542896593047, 1.9e-11 lower (deviance 3.8e-11 higher). The fixed
+  # effects moved by at most 2.0e-6 absolute (the last one 3.8e-4 relative),
+  # the SD by 5.5e-7 relative.
   fit7 <- fastglmm(f, d, family = binomial(), nAGQ = 7)
   expect_true(fit7$converged)
-  expect_equal(unname(fixef(fit7)), c(-0.625828963562665, 0.893716351595673, 0.244015699679902, 0.00516449500668084),
+  expect_equal(unname(fixef(fit7)), c(-0.625828872438666, 0.893717166886789, 0.244014571914524, 0.00516645906027586),
                tolerance = CI_REF_REL)
   expect_equal(unname(attr(VarCorr(fit7)$g, "stddev")),
-               c(0.882845161119728), tolerance = CI_REF_REL)
+               c(0.882844673622627), tolerance = CI_REF_REL)
 })
 
 test_that("poisson random intercept is pinned, Laplace and nAGQ = 7", {
@@ -68,12 +74,17 @@ test_that("poisson random intercept is pinned, Laplace and nAGQ = 7", {
   # Re-recorded 2026-10-03, after the fit moved along a flat direction: logLik
   # -923.04179529159, 1.9e-11 lower. The fixed effects moved by at most 6.4e-7
   # absolute, the SD by 1.1e-6 relative.
+  #
+  # Re-recorded 2026-10-10 (PRE2 step 2), when an AGQ fit with one random
+  # intercept began to search with BFGS on the exact AGQ gradient: logLik
+  # -923.041795291557, 3.2e-11 higher. The fixed effects moved by at most
+  # 6.9e-7 absolute, the SD by 8.4e-7 relative.
   fit7 <- fastglmm(f, d, family = poisson(), nAGQ = 7)
   expect_true(fit7$converged)
-  expect_equal(unname(fixef(fit7)), c(-0.203551156723678, 0.725893988688593, 0.291847067610744, -0.198680866701111),
+  expect_equal(unname(fixef(fit7)), c(-0.203550961611466, 0.725893660498053, 0.291846765106962, -0.19868017699838),
                tolerance = CI_REF_REL)
   expect_equal(unname(attr(VarCorr(fit7)$g, "stddev")),
-               c(0.585470423243987), tolerance = CI_REF_REL)
+               c(0.585470916645149), tolerance = CI_REF_REL)
 })
 
 test_that("binomial random slope (tau0, tau1, rho01) is pinned", {

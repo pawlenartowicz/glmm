@@ -5,7 +5,10 @@
 //! dispersion come out of one fit — see `fit_glmm`'s `nb_term`/`n_disp`
 //! handling. Binomial, Poisson and Gamma Laplace fits with `n_θ ≥ 2` on the
 //! blocked or structured layout search with projected BFGS
-//! ([`gradient_route_plan`]), Gamma's `ψ = ln φ` included, with BOBYQA as the
+//! ([`gradient_route_plan`]), Gamma's `ψ = ln φ` included, and so do AGQ
+//! fits of binomial logit or probit and Poisson log with one scalar random
+//! intercept (the shapes the exact AGQ gradient covers) below 50 rows per
+//! cluster, cold or from a warm θ₀ of at least 0.05, each with BOBYQA as the
 //! polish and the fallback. Every other fit is optimized per
 //! `OuterSearch` (`GlmmWorkspace.outer_search`, fixed per shape at construction),
 //! mirroring lme4's structure (Bates, Mächler, Bolker, Walker, *JSS* 67(1), 2015,
@@ -450,8 +453,21 @@ pub enum FdHessianStatus {
 /// 3. `n_θ ≥ 2`. One-θ fits stay on `ExactProfile`, which needs 11 to 24
 ///    evaluations there; 30 of 46 such cells were slower with BFGS.
 ///
-/// Every other shape keeps its `OuterSearch` route on both start kinds. The
-/// warm member is BFGS too; `fit_glmm` sends a warm fit with no random-slope
+/// And projected BFGS over `[λ | β]` on the fixed-β AGQ objective, with the
+/// exact AGQ gradient off each value evaluation's modes
+/// ([`agq_gradient::assemble`]), when:
+///
+/// 4. `nagq > 1` on a shape [`agq_gradient::covers_shape`] accepts: binomial
+///    logit or probit, or Poisson log, with one scalar random intercept and no
+///    extra grouping on the blocked layout. Its alternative is the joint
+///    BOBYQA search (`OuterSearch::Joint`), not `ExactProfile`, so one θ is
+///    enough here. Both start kinds: `fit_glmm` keeps a fit on BOBYQA when
+///    its clusters average `GRAD_WARM_SCALAR_ROWS_MAX` (50) rows or more, and
+///    a warm fit when a diagonal θ₀ of its start is below
+///    `GRAD_WARM_AGQ_THETA_MIN` (0.05).
+///
+/// Every other shape keeps its `OuterSearch` route on both start kinds. On
+/// the Laplace shapes the warm member is BFGS too; `fit_glmm` sends a warm fit with no random-slope
 /// block back to BOBYQA when its primary grouping averages 50 rows per level
 /// or more (the one cell over the speed gate, `pois_cross6_g3000p100`, at
 /// 1.46x; below 50 rows per level a scalar warm fit is 0.69 of warm BOBYQA's
@@ -463,7 +479,12 @@ pub enum FdHessianStatus {
 /// on 94 grid cells and 0.22 on the stress set, no stress cell slower. Gamma
 /// (locked clock, 2026-10-09): summed fit time 0.29 of it on the 88 routed
 /// log-link grid cells and 0.21 on the 14 inverse-link ones, every cell
-/// faster.
+/// faster. Covered AGQ shapes below 50 rows per level (locked clock,
+/// 2026-10-10, whole fits against the joint BOBYQA search on the grid's and
+/// the stress set's cells): geometric mean 0.783 of its time over 25 cold
+/// rows (0.51 to 1.10) and 0.825 over 38 warm ones from θ₀ ≥ 0.05 (at most
+/// 1.23). A cold cell at 500 rows per level was 1.27x, so 50 rows or more
+/// keep BOBYQA.
 pub(crate) fn gradient_route_plan(
     family: crate::Family,
     nagq: u8,
@@ -472,7 +493,7 @@ pub(crate) fn gradient_route_plan(
     n_theta: usize,
 ) -> crate::optim::RoutePlan {
     use crate::optim::{OuterOptimizer, RoutePlan};
-    let in_scope = nagq == 1
+    let laplace = nagq == 1
         && matches!(
             family,
             crate::Family::Binomial { .. }
@@ -482,7 +503,7 @@ pub(crate) fn gradient_route_plan(
         && matches!(layout, GlmmLayout::Blocked | GlmmLayout::Structured)
         && derivative::supports_shape(layout, g)
         && n_theta >= 2;
-    if in_scope {
+    if laplace || agq_gradient::covers_shape(family, nagq, layout, g) {
         RoutePlan {
             cold: OuterOptimizer::Bfgs,
             warm: OuterOptimizer::Bfgs,
@@ -495,7 +516,8 @@ pub(crate) fn gradient_route_plan(
 /// The curvature hint (`loop_advanced::curvature_hint`) after a `fit_glmm` on
 /// `ws`: the last gradient search's final BFGS inverse-Hessian estimate over
 /// `[θ | β̃]`, and `[θ | β̃ | ln φ]` on a free Gamma dispersion, the search's
-/// own coordinates. `None` when that fit did not search with BFGS, never
+/// own coordinates, on a Laplace fit or a covered AGQ one
+/// ([`gradient_route_plan`]). `None` when that fit did not search with BFGS, never
 /// updated its estimate, or left one that is not positive definite. Free: no
 /// evaluation runs.
 pub(crate) fn glmm_curvature_hint(ws: &GlmmWorkspace) -> Option<crate::optim::CurvatureHint> {
@@ -520,8 +542,8 @@ pub(crate) fn grad_search_dim(
     n_theta + p + usize::from(free_phi)
 }
 
-/// Rows per primary level from which a warm fit with no random-slope block
-/// goes back to BOBYQA (see [`gradient_route_plan`]).
+/// Rows per primary level from which a warm fit with no random-slope block,
+/// and an AGQ fit, go back to BOBYQA (see [`gradient_route_plan`]).
 const GRAD_WARM_SCALAR_ROWS_MAX: usize = 50;
 
 /// A warm fit whose θ start has a diagonal `|θ|` above this takes the BOBYQA
@@ -531,6 +553,15 @@ const GRAD_WARM_SCALAR_ROWS_MAX: usize = 50;
 /// cold optimum, reported converged (`far_warm_start_scan`, 2026-10-07).
 /// Warm starts from a truth or a previous estimate sit far below it.
 const GRAD_WARM_THETA_MAX: f64 = 10.0;
+
+/// A warm AGQ fit whose θ start has a diagonal below this takes the BOBYQA
+/// route. Measured on 48 warm rows (locked clock, 2026-10-10): every start at
+/// θ₀ <= 0.02 was slower than warm BOBYQA (1.13x to 1.57x), every start at
+/// θ₀ >= 0.05 at most 1.22x (geomean 0.826 over 38 rows), no start between
+/// 0.02 and 0.05. A start below it ends near θ = 0, fails the certificate's
+/// near-zero test and pays the rung-3 polish, which costs more than the warm
+/// BOBYQA it replaces.
+const GRAD_WARM_AGQ_THETA_MIN: f64 = 0.05;
 
 /// A gradient-search endpoint with a diagonal `|θ|` at or above this is not
 /// trusted and goes to the BOBYQA route (a tenth of `THETA_HI`; a random-effect
@@ -550,7 +581,11 @@ const GRAD_ASM_KEEP_BYTES: usize = 4 << 20;
 /// The gradient route's objective: the fixed-β Laplace deviance over
 /// `γ̃ = [θ | β̃]`, every evaluation at the family's full PIRLS tolerance from
 /// the incumbent's mode, and its gradient off the state the last evaluation
-/// left ([`assembled::gradient_at_mode`]). On a free Gamma dispersion the
+/// left ([`assembled::gradient_at_mode`]). On a covered AGQ shape
+/// (`nagq > 1`, [`agq_gradient::covers_shape`]) the value is the fixed-β AGQ
+/// deviance at `nagq` nodes, the joint BOBYQA search's own objective, and the
+/// gradient is [`agq_gradient::assemble`] off the modes and `η_fix` it left.
+/// On a free Gamma dispersion the
 /// point is `[θ | β̃ | ψ]`, `ψ = ln φ` (internal units, not whitened), and the
 /// value adds the dispersion term `Gₚ(ψ)`, as the BOBYQA objective does.
 /// Under a held φ the search runs over `[θ | β̃]` at that φ, and a trailing
@@ -571,6 +606,14 @@ const GRAD_ASM_KEEP_BYTES: usize = 4 << 20;
 struct GradSearch<'a, 'd> {
     data: &'a FitData<'d>,
     nb_theta: f64,
+    /// Quadrature nodes: 1 (Laplace) or the AGQ order.
+    nagq: u8,
+    /// The AGQ value kernel's cluster-outer row index, handed to each value
+    /// evaluation as the joint search hands it (`None` at `nagq == 1`).
+    cluster_rows: Option<&'a agq::ClusterRowIndex>,
+    /// The AGQ gradient's own row index and buffers (`ws.agq_gd`); `Some`
+    /// exactly when `nagq > 1`.
+    agq_gd: Option<&'a mut agq_gradient::AgqGd>,
     wx: &'a mut Mat<f64>,
     pirls: &'a mut workspace::PirlsScratch<f64>,
     structured: &'a mut workspace::StructuredScratch<f64>,
@@ -628,7 +671,7 @@ impl crate::optim::Objective for GradSearch<'_, '_> {
             d,
             self.nb_theta,
             self.gamma_phi,
-            1,
+            self.nagq,
             self.x_last,
             self.beta_rhs,
             self.wx,
@@ -642,7 +685,7 @@ impl crate::optim::Objective for GradSearch<'_, '_> {
             self.exact_prof,
             BetaMode::Fixed,
             None,
-            None,
+            self.cluster_rows,
             self.pirls_exhausted,
             self.counters,
         );
@@ -678,6 +721,29 @@ impl crate::optim::GradObjective for GradSearch<'_, '_> {
         self.u_inc[..k].copy_from_slice(&self.pirls.u[..k]);
         let d = self.data;
         let (n_theta, p, n) = (self.n_theta, d.p, d.n);
+        if let Some(gd) = self.agq_gd.as_deref_mut() {
+            // AGQ: `[λ | β]` in the caller's units, so `d.x` is the design.
+            // A row at the link's clamp leaves the gradient undefined: a
+            // silent hand-over, as an undefined Laplace gradient is.
+            let ok = agq_gradient::assemble(
+                d.family,
+                self.nagq,
+                d.groupings.n_primary,
+                self.pirls,
+                d.prior_w,
+                d.x,
+                d.y,
+                &gd.idx,
+                self.x_last,
+                &mut gd.sc,
+                g,
+            );
+            if !ok || !g.iter().all(|v| v.is_finite()) {
+                return false;
+            }
+            self.beta_scale.to_search_row(&mut g[n_theta..n_theta + p]);
+            return true;
+        }
         // The weights the value evaluation handed PIRLS. `laplace_deviance`
         // writes `prior_w_phi` only on Gamma at φ ≠ 1, so at φ = 1 it holds an
         // earlier evaluation's weights (mirrors its `pirls_prior_w` — change
@@ -1069,9 +1135,11 @@ pub fn fit_glmm(
     // never `ExactProfile` again self-limits the retry to one.
     let mut route = ws.outer_search;
     // The gradient route (`gradient_route_plan`): BFGS over `[θ | β]` on this
-    // fit's start kind, a warm fit with no random-slope block only below
-    // `GRAD_WARM_SCALAR_ROWS_MAX` rows per primary level. A warm start at the
-    // blind θ₀ is a cold fit here, as it is for the start guard.
+    // fit's start kind, a warm fit with no random-slope block and an AGQ fit
+    // only below `GRAD_WARM_SCALAR_ROWS_MAX` rows per primary level, and a warm
+    // AGQ fit only from a start with every diagonal θ₀ at or above
+    // `GRAD_WARM_AGQ_THETA_MIN`. A warm start at the blind θ₀ is a cold fit
+    // here, as it is for the start guard.
     let grad_route = {
         use crate::optim::OuterOptimizer;
         let g = &ws.groupings;
@@ -1085,10 +1153,15 @@ pub fn fit_glmm(
             .diagonal_theta()
             .iter()
             .all(|&i| ws.params[i].abs() <= GRAD_WARM_THETA_MAX);
+        let few_rows = n < GRAD_WARM_SCALAR_ROWS_MAX * g.n_primary.max(1);
+        let off_zero = g
+            .diagonal_theta()
+            .iter()
+            .all(|&i| ws.params[i] >= GRAD_WARM_AGQ_THETA_MIN);
         opt == OuterOptimizer::Bfgs
-            && (!guard_warm
-                || (near_start
-                    && (slope_block || n < GRAD_WARM_SCALAR_ROWS_MAX * g.n_primary.max(1))))
+            && (nagq == 1 || few_rows)
+            && (!guard_warm || (near_start && (slope_block || few_rows)))
+            && (nagq == 1 || !guard_warm || off_zero)
     };
     debug_assert!(
         route != OuterSearch::ExactProfile || exact_profile_shape(nagq, ws.layout),
@@ -1156,6 +1229,7 @@ pub fn fit_glmm(
         grad_asm,
         grad_scratch,
         gradient_search_fallback,
+        agq_gd,
         ..
     } = ws;
     // Joint vector's trailing `ln θ_NB` / `ln φ` index.
@@ -1266,7 +1340,9 @@ pub fn fit_glmm(
         // comparing the starts on the fixed-β objective at β₀ kept a θ₀ on
         // the box bound that the profile rejects (`far_warm_start_scan`,
         // logit crossed seed 9, θ₀ = THETA_HI). It then starts from the
-        // guard's profiled β̂ at the chosen θ.
+        // guard's profiled β̂ at the chosen θ. On AGQ (no stage 1) the guard
+        // compares on the fixed-β AGQ objective at β₀ and keeps no
+        // `guard_cache`, so the gradient route starts from β₀ at the guard's θ.
         let guard_mode = stage1_mode.filter(|_| nagq == 1).unwrap_or(BetaMode::Fixed);
         let cacheable = guard_mode != BetaMode::Fixed;
         // `laplace_deviance`'s Fixed mode reads β off `params[n_theta..n_theta
@@ -1368,21 +1444,38 @@ pub fn fit_glmm(
     // - a certified endpoint (`BfgsOutcome::certified`, and the saddle walk
     //   kept no try) is the fit's optimum;
     // - an endpoint that stopped on its convergence tests but is not
-    //   certified is polished by the joint BOBYQA search at
-    //   `GLMM_RHO_POLISH`, β whitened (`BetaScale`), as `PqlThenJoint`'s
-    //   polish runs; the polish's status is the fit's;
+    //   certified is polished by the joint BOBYQA search, β whitened
+    //   (`BetaScale`): at `GLMM_RHO_POLISH` (`solver`), as `PqlThenJoint`'s
+    //   polish runs, on a Laplace shape; at `RHO_BEGIN_WARM`
+    //   (`solver_polish_wide`) on AGQ (no stage 1; `solver` is the whole
+    //   search and starts at `GLMM_RHO_BEGIN`). The polish's status is the
+    //   fit's;
     // - any other stop (the gradient unavailable, the line search or the
     //   iteration cap) hands the incumbent to this shape's BOBYQA route with
-    //   its unchanged budget, at `RHO_BEGIN_WARM`; a failed line search or the
-    //   cap raise `Note::GradientSearchFallback`.
+    //   its unchanged budget: stage 1 at `RHO_BEGIN_WARM` where the route has
+    //   one; where it has no stage 1 (AGQ, Laplace `Joint`) the joint search
+    //   restarts at `GLMM_RHO_BEGIN`. A failed line search or the cap raise
+    //   `Note::GradientSearchFallback`.
+    //
+    // On AGQ a fit this route finishes (a certified endpoint or the polish)
+    // then goes through the joint search's check and second pass
+    // (`JOINT_RECHECK_TOL`), as a joint BOBYQA pass does; a Laplace shape's
+    // finish is the fit's result.
     //
     // `converged` is always the status of whichever optimizer finished.
     let mut grad_done: Option<(bool, usize, bool, f64)> = None;
+    // AGQ fits search with no stage 1, whatever `outer_search` says: the keys
+    // below read the order, not the route field a test may override.
+    let agq_finish = nagq > 1;
     let mut grad_spent = 0usize;
     let mut grad_fell_back = false;
     let total_dim = n_theta + p + n_disp;
     if grad_route {
         use crate::optim::bfgs::{bfgs_minimize, BfgsStop};
+        debug_assert!(
+            nagq == 1 || agq_gradient::covers_shape(family, nagq, *layout, groupings),
+            "gradient route on an AGQ shape the exact AGQ gradient does not cover"
+        );
         // A free Gamma dispersion is searched as the trailing `ψ = ln φ`,
         // from the seed above and on the BOBYQA route's box; on the inverse
         // link with its start curvature (`GradSearch::start_curvature`) unless
@@ -1403,9 +1496,22 @@ pub fn fit_glmm(
         x_last.fill(0.0);
         beta_scale.set(x, &prior_w[..n], n);
         beta_scale.to_search(&mut params[n_theta..nb_col]);
+        // AGQ: the gradient's row index and buffers, built on the first such
+        // fit and kept for the SE step's gradient-difference Hessian; the index
+        // is rebuilt per fit, since a reused workspace may see new ids.
+        if nagq > 1 && !agq_gd.as_ref().is_some_and(|g| g.matches_shape(p, nagq)) {
+            *agq_gd = Some(Box::new(agq_gradient::AgqGd::for_shape(p, nagq)));
+        }
+        let mut agq_gd = agq_gd.as_deref_mut().filter(|_| nagq > 1);
+        if let Some(gd) = agq_gd.as_deref_mut() {
+            gd.idx.rebuild(&cluster_ids[..n], groupings.n_primary);
+        }
         let mut obj = GradSearch {
             data: &data,
             nb_theta,
+            nagq,
+            cluster_rows: cluster_rows.as_ref(),
+            agq_gd,
             wx,
             pirls,
             structured,
@@ -1479,12 +1585,24 @@ pub fn fit_glmm(
             // are judged by the `NON_FINITE_RADIUS` check. The joint solver is
             // sized `total_dim`, so under a held φ it gets the inert `ln φ`
             // slot too (the objective ignores it): on a shorter vector BOBYQA
-            // refuses to start.
+            // refuses to start. On AGQ (no stage 1; `solver` is the whole
+            // search) `solver` would restart it at `GLMM_RHO_BEGIN`, so the
+            // polish takes `solver_polish_wide` there (see the rungs above).
             obj.non_finite_points.clear();
             let mut finite = 0usize;
             let mut pol_best = best;
+            let polish: &mut bobyqa::Bobyqa = if agq_finish {
+                solver_polish_wide.get_or_insert_with(|| {
+                    let mut c = *config;
+                    c.rho_begin = RHO_BEGIN_WARM;
+                    bobyqa::Bobyqa::new(total_dim, c)
+                        .expect("polish BOBYQA config is valid by construction")
+                })
+            } else {
+                &mut *solver
+            };
             let out = crate::optim::bobyqa_minimize(
-                solver,
+                polish,
                 &mut crate::optim::ValueFn(|gamma: &[f64], _rho: f64| {
                     let f = crate::optim::Objective::value(&mut obj, gamma, 0.0)
                         .unwrap_or(f64::INFINITY);
@@ -1567,8 +1685,10 @@ pub fn fit_glmm(
             *grad_asm = None;
         }
     }
-    // A gradient search that handed over restarts BOBYQA near its incumbent,
-    // as a kept warm start does.
+    // A gradient search that handed over restarts stage 1 near its incumbent
+    // (`RHO_BEGIN_WARM`), as a kept warm start does; where the route has no
+    // stage 1 (AGQ, Laplace `Joint`) the joint search restarts from it at
+    // `GLMM_RHO_BEGIN`.
     let solver_stage1: &mut bobyqa::Bobyqa = if warm_kept || grad_fell_back {
         solver_stage1_warm.get_or_insert_with(|| {
             let mut c = *config_stage1;
@@ -1598,16 +1718,26 @@ pub fn fit_glmm(
     let mut fallback_used = false;
     #[allow(clippy::type_complexity)]
     let mut attempt1: Option<(Vec<f64>, Vec<f64>, bool, usize, bool, f64)> = None;
+    // On AGQ (no stage 1; `solver` is the whole search) a gradient-route
+    // finish takes the joint search's first pass: the loop below reads it in
+    // place of running BOBYQA, then runs that search's check and second pass
+    // on it.
+    let mut grad_finish = if agq_finish { grad_done.take() } else { None };
     let (ok, n_eval, budget_exhausted, inc_obj) = if let Some(done) = grad_done {
         done
     } else {
         loop {
-            // Reset the search's starting point on every pass — a no-op on the
-            // first (nothing has run yet) and what lets the fallback restart clean
-            // rather than from the failed `ExactProfile` attempt's own incumbent.
-            params[..total_dim].copy_from_slice(&start_point[..total_dim]);
-            for v in u_seed[..k].iter_mut() {
-                *v = 0.0;
+            // Reset the search's starting point on every pass: on the first,
+            // `params` already holds it and the modes go back to û = 0 (a
+            // gradient search's hand-over included); on a retry it lets the
+            // fallback restart clean rather than from the failed `ExactProfile`
+            // attempt's own incumbent. A gradient-route finish keeps its
+            // endpoint and incumbent modes.
+            if grad_finish.is_none() {
+                params[..total_dim].copy_from_slice(&start_point[..total_dim]);
+                for v in u_seed[..k].iter_mut() {
+                    *v = 0.0;
+                }
             }
 
             // STAGE 1 — θ-only BOBYQA profiling β out of PIRLS at each candidate θ. On
@@ -2181,180 +2311,205 @@ pub fn fit_glmm(
                 // The joint search runs once, or twice when the check after it
                 // finds a lower point (`JOINT_RECHECK_TOL`); the second pass
                 // starts there.
+                //
+                // An AGQ fit the gradient search handed over runs one more
+                // information-metric pass after a second pass, from the check's
+                // re-solved β at the second pass's θ and at `GLMM_RHO_BEGIN`, and
+                // keeps the lower of the two. Where working weights span many
+                // decades (|f| near 1e10) the deviance's rounding noise defeats
+                // BOBYQA's local model at small radii, so a pass ends where its
+                // start leads it; the fresh pass recovers most of those ends.
+                // Measured 2026-10-11 on 125 decade designs: failures 31 to 16
+                // on x86_64 and 30 to 17 on aarch64, none worse, about 29
+                // evaluations more per hand-over fit.
                 let mut info_pass = false;
+                let mut info_passes = 0usize;
+                let max_info_passes = if agq_finish && grad_fell_back { 2 } else { 1 };
                 let mut n_eval_prev = 0usize;
                 let mut first_obj: Option<f64> = None;
                 let (read, exhausted) = loop {
-                    let mut best_obj = f64::INFINITY;
-                    // mirrors the stage-1 read above — change together.
-                    let mut finite_evals2 = 0usize;
-                    // Stage 1 recorded its own points; on this route it never gates
-                    // convergence, so only this search's non-finite points are checked.
-                    non_finite_points.clear();
-                    // The search runs on β̃ (`BetaScale`): the start maps forward here, the
-                    // incumbent back once the convergence read below has measured its
-                    // distances in the search's own coordinates.
-                    if !info_pass {
-                        beta_scale.set(x, &prior_w[..n], n);
-                    }
-                    beta_scale.to_search(&mut params[n_theta..nb_col]);
-                    // A polish whose stage-1 optimum has a block near the singular
-                    // boundary starts wider (`POLISH_NEAR_SINGULAR`).
-                    let near_singular = !info_pass
-                        && stage1_out.is_some()
-                        && groupings
-                            .diagonal_theta()
-                            .iter()
-                            .any(|&i| params[i].abs() < POLISH_NEAR_SINGULAR);
-                    let solver: &mut bobyqa::Bobyqa = if near_singular {
-                        solver_polish_wide.get_or_insert_with(|| {
-                            let mut c = *config;
-                            c.rho_begin = RHO_BEGIN_WARM;
-                            bobyqa::Bobyqa::new(total_dim, c)
-                                .expect("polish BOBYQA config is valid by construction")
-                        })
+                    // A gradient-route finish is the first pass's result as is:
+                    // its endpoint is already in the caller's β units.
+                    let (read, exhausted, pass_n_eval) = if let Some((ok, ne, ex, f)) =
+                        grad_finish.take()
+                    {
+                        ((ok, ne, f), ex, ne)
                     } else {
-                        &mut *solver
-                    };
-                    let out = crate::optim::bobyqa_minimize(
-                        solver,
-                        &mut crate::optim::ValueFn(|gamma: &[f64], _rho: f64| {
-                            // Within-fit û warm-start: seed PIRLS from the incumbent (best point so
-                            // far), not from 0. The conditional mode is point-determined, so the seed
-                            // only shifts the stopping iterate within the PIRLS exit band.
-                            pirls.u[..k].copy_from_slice(&u_seed[..k]);
-                            let ((nb, phi), coord) = if n_disp == 1 {
-                                disp_at(gamma[nb_col])
+                        let mut best_obj = f64::INFINITY;
+                        // mirrors the stage-1 read above; change together.
+                        let mut finite_evals2 = 0usize;
+                        // Stage 1 recorded its own points; on this route it never gates
+                        // convergence, so only this search's non-finite points are checked.
+                        non_finite_points.clear();
+                        // The search runs on β̃ (`BetaScale`): the start maps forward here, the
+                        // incumbent back once the convergence read below has measured its
+                        // distances in the search's own coordinates.
+                        if !info_pass {
+                            beta_scale.set(x, &prior_w[..n], n);
+                        }
+                        beta_scale.to_search(&mut params[n_theta..nb_col]);
+                        // A polish whose stage-1 optimum has a block near the singular
+                        // boundary starts wider (`POLISH_NEAR_SINGULAR`).
+                        let near_singular = !info_pass
+                            && stage1_out.is_some()
+                            && groupings
+                                .diagonal_theta()
+                                .iter()
+                                .any(|&i| params[i].abs() < POLISH_NEAR_SINGULAR);
+                        let solver: &mut bobyqa::Bobyqa = if near_singular {
+                            solver_polish_wide.get_or_insert_with(|| {
+                                let mut c = *config;
+                                c.rho_begin = RHO_BEGIN_WARM;
+                                bobyqa::Bobyqa::new(total_dim, c)
+                                    .expect("polish BOBYQA config is valid by construction")
+                            })
+                        } else {
+                            &mut *solver
+                        };
+                        let out = crate::optim::bobyqa_minimize(
+                            solver,
+                            &mut crate::optim::ValueFn(|gamma: &[f64], _rho: f64| {
+                                // Within-fit û warm-start: seed PIRLS from the incumbent (best point so
+                                // far), not from 0. The conditional mode is point-determined, so the seed
+                                // only shifts the stopping iterate within the PIRLS exit band.
+                                pirls.u[..k].copy_from_slice(&u_seed[..k]);
+                                let ((nb, phi), coord) = if n_disp == 1 {
+                                    disp_at(gamma[nb_col])
+                                } else {
+                                    ((nb_theta, 1.0), None)
+                                };
+                                let dev = laplace_deviance(
+                                    &data,
+                                    nb,
+                                    phi,
+                                    nagq,
+                                    beta_scale.caller_point(gamma, n_theta, p),
+                                    beta_rhs,
+                                    wx,
+                                    pirls,
+                                    structured,
+                                    pattern,
+                                    packed,
+                                    // The `Joint` polish's objective is β-FIXED; the Profile border
+                                    // scratch is inert. `beta_prof` is the spare distinct buffer
+                                    // (`beta_rhs` is `beta` above). Stage 1 above flips this to Profile
+                                    // (`ProfilePql` or `ProfileExact`, by `stage1_mode`).
+                                    border,
+                                    prior_w_phi,
+                                    beta_prof,
+                                    exact_prof,
+                                    BetaMode::Fixed,
+                                    // Never the FD-pass tol here: BOBYQA objective evals stay at
+                                    // `pirls_tol` (the field is None outside `joint_hessian_cov`).
+                                    None,
+                                    cluster_rows.as_ref(),
+                                    pirls_exhausted,
+                                    counters,
+                                );
+                                let obj = match coord {
+                                    Some(c) => dev + nb_term(c),
+                                    None => dev,
+                                };
+                                if obj.is_finite() {
+                                    finite_evals2 += 1;
+                                } else {
+                                    non_finite_points.extend_from_slice(gamma);
+                                }
+                                if obj < best_obj {
+                                    best_obj = obj;
+                                    u_seed[..k].copy_from_slice(&pirls.u[..k]);
+                                }
+                                counters.record_eval(crate::counters::Stage::Two, obj);
+                                obj
+                            }),
+                            params,
+                            lower,
+                            upper,
+                        );
+                        // Dispersion bound check. A likelihood can keep rising toward one
+                        // bound of the dispersion coordinate: Gamma's lower bound of `ln φ`
+                        // (data the mean model reproduces exactly) and NB's upper bound of
+                        // `ln θ_NB` (no overdispersion, the Poisson limit). Toward the other
+                        // bound it falls to −∞ on any data with a positive response, so
+                        // only these two are checked. Near the Gamma bound the curvature in
+                        // β grows as 1/φ, and near the NB bound the slope in `ln θ_NB`
+                        // shrinks as 1/θ_NB, so the trust radius can reach `rho_end` while
+                        // the coordinate is still walking out, and BOBYQA reports
+                        // `Converged` short of the bound. On simulated Poisson data with a
+                        // random intercept and slope, 4 NB fits in 80 on the exact-profile
+                        // search stopped at θ_NB 4.0e3 to 6.4e3, up to 4.7e-5 deviance
+                        // above the bound, and 2 in 40 on this search (an extra crossed
+                        // grouping with a slope) at 7.7e3 and 9.0e3. One solve at the bound, every other coordinate held, tells
+                        // the two apart: when it is lower, the incumbent moves there (for
+                        // Gamma the on-bound refusal below then applies). At an interior
+                        // optimum the bound point is worse and nothing moves. Not a search
+                        // evaluation: own counters, `n_eval` unchanged. The gradient
+                        // route runs the same check on its endpoint; change together.
+                        if n_disp == 1 && held_phi.is_none() && out.status == Status::Converged {
+                            let ln_phi = params[nb_col];
+                            params[nb_col] = if is_gamma {
+                                lower[nb_col]
                             } else {
-                                ((nb_theta, 1.0), None)
+                                upper[nb_col]
                             };
+                            pirls.u[..k].copy_from_slice(&u_seed[..k]);
+                            let ((nb, phi), _) = disp_at(params[nb_col]);
+                            let mut bound_exhausted = 0u32;
+                            let mut bound_counters = crate::counters::EvalCounters::new();
                             let dev = laplace_deviance(
                                 &data,
                                 nb,
                                 phi,
                                 nagq,
-                                beta_scale.caller_point(gamma, n_theta, p),
+                                beta_scale.caller_point(&params[..total_dim], n_theta, p),
                                 beta_rhs,
                                 wx,
                                 pirls,
                                 structured,
                                 pattern,
                                 packed,
-                                // The `Joint` polish's objective is β-FIXED; the Profile border
-                                // scratch is inert. `beta_prof` is the spare distinct buffer
-                                // (`beta_rhs` is `beta` above). Stage 1 above flips this to Profile
-                                // (`ProfilePql` or `ProfileExact`, by `stage1_mode`).
                                 border,
                                 prior_w_phi,
                                 beta_prof,
                                 exact_prof,
                                 BetaMode::Fixed,
-                                // Never the FD-pass tol here — BOBYQA objective evals stay at
-                                // `pirls_tol` (the field is None outside `joint_hessian_cov`).
                                 None,
                                 cluster_rows.as_ref(),
-                                pirls_exhausted,
-                                counters,
+                                &mut bound_exhausted,
+                                &mut bound_counters,
                             );
-                            let obj = match coord {
-                                Some(c) => dev + nb_term(c),
-                                None => dev,
-                            };
-                            if obj.is_finite() {
-                                finite_evals2 += 1;
-                            } else {
-                                non_finite_points.extend_from_slice(gamma);
-                            }
+                            let obj = dev + nb_term(params[nb_col]);
                             if obj < best_obj {
                                 best_obj = obj;
                                 u_seed[..k].copy_from_slice(&pirls.u[..k]);
+                            } else {
+                                params[nb_col] = ln_phi;
                             }
-                            counters.record_eval(crate::counters::Stage::Two, obj);
-                            obj
-                        }),
-                        params,
-                        lower,
-                        upper,
-                    );
-                    // Dispersion bound check. A likelihood can keep rising toward one
-                    // bound of the dispersion coordinate: Gamma's lower bound of `ln φ`
-                    // (data the mean model reproduces exactly) and NB's upper bound of
-                    // `ln θ_NB` (no overdispersion, the Poisson limit). Toward the other
-                    // bound it falls to −∞ on any data with a positive response, so
-                    // only these two are checked. Near the Gamma bound the curvature in
-                    // β grows as 1/φ, and near the NB bound the slope in `ln θ_NB`
-                    // shrinks as 1/θ_NB, so the trust radius can reach `rho_end` while
-                    // the coordinate is still walking out, and BOBYQA reports
-                    // `Converged` short of the bound. On simulated Poisson data with a
-                    // random intercept and slope, 4 NB fits in 80 on the exact-profile
-                    // search stopped at θ_NB 4.0e3 to 6.4e3, up to 4.7e-5 deviance
-                    // above the bound, and 2 in 40 on this search (an extra crossed
-                    // grouping with a slope) at 7.7e3 and 9.0e3. One solve at the bound, every other coordinate held, tells
-                    // the two apart: when it is lower, the incumbent moves there (for
-                    // Gamma the on-bound refusal below then applies). At an interior
-                    // optimum the bound point is worse and nothing moves. Not a search
-                    // evaluation: own counters, `n_eval` unchanged. The gradient
-                    // route runs the same check on its endpoint — change together.
-                    if n_disp == 1 && held_phi.is_none() && out.status == Status::Converged {
-                        let ln_phi = params[nb_col];
-                        params[nb_col] = if is_gamma {
-                            lower[nb_col]
-                        } else {
-                            upper[nb_col]
-                        };
-                        pirls.u[..k].copy_from_slice(&u_seed[..k]);
-                        let ((nb, phi), _) = disp_at(params[nb_col]);
-                        let mut bound_exhausted = 0u32;
-                        let mut bound_counters = crate::counters::EvalCounters::new();
-                        let dev = laplace_deviance(
-                            &data,
-                            nb,
-                            phi,
-                            nagq,
-                            beta_scale.caller_point(&params[..total_dim], n_theta, p),
-                            beta_rhs,
-                            wx,
-                            pirls,
-                            structured,
-                            pattern,
-                            packed,
-                            border,
-                            prior_w_phi,
-                            beta_prof,
-                            exact_prof,
-                            BetaMode::Fixed,
-                            None,
-                            cluster_rows.as_ref(),
-                            &mut bound_exhausted,
-                            &mut bound_counters,
-                        );
-                        let obj = dev + nb_term(params[nb_col]);
-                        if obj < best_obj {
-                            best_obj = obj;
-                            u_seed[..k].copy_from_slice(&pirls.u[..k]);
-                        } else {
-                            params[nb_col] = ln_phi;
                         }
-                    }
 
-                    debug_assert!(out.status != Status::InvalidArgs);
-                    let exhausted = matches!(out.status, Status::MaxFunReached);
-                    // Reported eval count is stage 1 + stage 2 (0 + stage 2 on the `Joint` route,
-                    // so byte-identical to a single-stage run). Only stage 2's status feeds `converged`.
-                    let read = (
-                        matches!(out.status, Status::Converged | Status::MaxFunReached)
-                            && best_obj.is_finite()
-                            && finite_evals2 >= 2
-                            && !(out.status == Status::Converged
-                                && any_within(non_finite_points, params, NON_FINITE_RADIUS)),
-                        n_eval_stage1 + n_eval_prev + out.n_eval,
-                        best_obj,
-                    );
-                    beta_scale.to_caller(&mut params[n_theta..nb_col]);
-                    if info_pass || !read.0 || exhausted {
-                        // A second pass that fails keeps the first pass's fit, with
-                        // both passes' evaluations counted.
-                        if let (Some(obj), false) = (first_obj, read.0) {
+                        debug_assert!(out.status != Status::InvalidArgs);
+                        let exhausted = matches!(out.status, Status::MaxFunReached);
+                        // Reported eval count is stage 1 + stage 2 (0 + stage 2 on the `Joint` route,
+                        // so byte-identical to a single-stage run). Only stage 2's status feeds `converged`.
+                        let read = (
+                            matches!(out.status, Status::Converged | Status::MaxFunReached)
+                                && best_obj.is_finite()
+                                && finite_evals2 >= 2
+                                && !(out.status == Status::Converged
+                                    && any_within(non_finite_points, params, NON_FINITE_RADIUS)),
+                            n_eval_stage1 + n_eval_prev + out.n_eval,
+                            best_obj,
+                        );
+                        beta_scale.to_caller(&mut params[n_theta..nb_col]);
+                        (read, exhausted, out.n_eval)
+                    };
+                    if (info_pass && info_passes >= max_info_passes) || !read.0 || exhausted {
+                        // A second pass that fails keeps the first pass's fit, and a
+                        // third that fails or ends higher keeps the second's, with
+                        // every pass's evaluations counted.
+                        if let Some(obj) =
+                            first_obj.filter(|&o| !read.0 || (info_passes >= 2 && o < read.2))
+                        {
                             params[..total_dim].copy_from_slice(&start_point[..total_dim]);
                             u_seed[..k].copy_from_slice(&guard_u[..k]);
                             break ((true, read.1, obj), false);
@@ -2430,17 +2585,23 @@ pub fn fit_glmm(
                     if let Some(c) = coord {
                         check += nb_term(c);
                     }
-                    if info_ok && check < best_obj - JOINT_RECHECK_TOL * best_obj.abs().max(1.0) {
-                        // The first pass's incumbent, for the restore above:
+                    // After a second pass the check is reached only on a
+                    // hand-over fit (`max_info_passes`), whose third pass runs
+                    // whatever the check found.
+                    if info_ok
+                        && (info_pass || check < read.2 - JOINT_RECHECK_TOL * read.2.abs().max(1.0))
+                    {
+                        // The previous pass's incumbent, for the restore above:
                         // `start_point` and `guard_u` are not read again once the
                         // search has begun. Its β is in `beta_seed`; the check has
                         // already moved `params`' β.
                         start_point[..total_dim].copy_from_slice(&params[..total_dim]);
                         start_point[n_theta..nb_col].copy_from_slice(&beta_seed[..p]);
                         guard_u[..k].copy_from_slice(&u_seed[..k]);
-                        first_obj = Some(best_obj);
+                        first_obj = Some(read.2);
                         info_pass = true;
-                        n_eval_prev += out.n_eval;
+                        info_passes += 1;
+                        n_eval_prev += pass_n_eval;
                         continue;
                     }
                     params[n_theta..nb_col].copy_from_slice(&beta_seed[..p]);

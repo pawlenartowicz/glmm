@@ -9,8 +9,10 @@ four pinned oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive). It searches
 the profiled deviance with BOBYQA, a derivative-free method, and with BFGS on
 an analytic gradient where one is available (LMMs with random slopes on
 their only grouping factor; binomial, Poisson and Gamma GLMMs fitted by the
-Laplace approximation). It is REML-locked for Gaussian mixed models (no ML
-switch), validation-pinned against those frozen oracles, which are never
+Laplace approximation; logit and probit binomial and Poisson GLMMs with a
+random intercept only and fewer than 50 rows per group, fitted by adaptive
+quadrature). It is REML-locked for Gaussian mixed models (no ML switch),
+validation-pinned against those frozen oracles, which are never
 relaxed to match a disagreement, and WASM-ready (the fit
 path carries no `unsafe`, no RNG, no global state, no I/O, and compiles
 unmodified to `wasm32`). It deliberately is **not** a general inference

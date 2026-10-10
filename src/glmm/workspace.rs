@@ -865,9 +865,11 @@ pub struct GlmmWorkspace {
     /// node-outer: cluster-outer serially regresses many-tiny-cluster shapes
     /// (see the build site in fit_glmm).
     pub(crate) cluster_rows: Option<super::agq::ClusterRowIndex>,
-    /// The AGQ gradient-difference Hessian's row index and buffers
-    /// (`se::agq_gradient_difference_hessian`), built on the first SE call
-    /// that takes that rung. `None` everywhere else.
+    /// The exact AGQ gradient's row index and buffers, shared by the gradient
+    /// route's search (`fit_glmm`) and the SE step's gradient-difference
+    /// Hessian (`se::agq_gradient_difference_hessian`), built on the first fit
+    /// or SE call on a covered AGQ shape that needs it, its index rebuilt by
+    /// each. `None` everywhere else.
     pub(crate) agq_gd: Option<Box<super::agq_gradient::AgqGd>>,
     /// total RE columns (groupings.k_total)
     pub k: usize,
@@ -888,9 +890,10 @@ pub struct GlmmWorkspace {
     pub solver: Bobyqa, // sized n_theta + p
     /// `solver`'s config, kept to build `solver_polish_wide`.
     pub(crate) config: Config,
-    /// The polish solver for a stage-1 optimum near a singular block
-    /// (`crate::lmm::POLISH_NEAR_SINGULAR`): `config` at `RHO_BEGIN_WARM`.
-    /// Built on the first such fit; never on the `Joint` route.
+    /// `config` at `RHO_BEGIN_WARM`: the polish solver for a stage-1 optimum
+    /// near a singular block (`crate::lmm::POLISH_NEAR_SINGULAR`), and on AGQ
+    /// (`nagq > 1`) the gradient route's polish of an uncertified endpoint.
+    /// Built on the first such fit.
     pub(crate) solver_polish_wide: Option<Bobyqa>,
     /// Joint solver's live iterate: `[θ (n_theta) | β (p)]`; while the joint
     /// search runs, the β block holds its coordinates β̃ (see [`BetaScale`]),
@@ -949,7 +952,8 @@ pub struct GlmmWorkspace {
     pub outer_search: OuterSearch,
     /// Which optimizer the outer search runs, per start kind
     /// ([`gradient_route_plan`](super::gradient_route_plan)): projected BFGS
-    /// over `[θ | β]` on the gradient route's shapes, BOBYQA on `outer_search`
+    /// over `[θ | β]` on the gradient route's shapes (Laplace ones, and the
+    /// AGQ ones the exact AGQ gradient covers), BOBYQA on `outer_search`
     /// everywhere else and as every fallback. A test that sets it to
     /// [`RoutePlan::BOBYQA`](crate::optim::RoutePlan::BOBYQA) gets the BOBYQA
     /// route's fit bit for bit.

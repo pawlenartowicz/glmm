@@ -11,8 +11,10 @@ All engines minimise the profiled deviance over the relative-Cholesky θ.
 lme4 and MixedModels.jl search it with derivative-free
 methods. `glmm` uses BOBYQA, also derivative-free, on most models, and BFGS on
 an analytic gradient where it has one: LMMs with random slopes on a single
-grouping factor and no other grouping, and binomial, Poisson and Gamma GLMMs
-fitted by the Laplace approximation with at least two variance parameters.
+grouping factor and no other grouping, binomial, Poisson and Gamma GLMMs
+fitted by the Laplace approximation with at least two variance parameters,
+and logit and probit binomial and Poisson GLMMs with a random intercept
+only and fewer than 50 rows per group, fitted by adaptive quadrature.
 On LMMs and on canonical-link binomial and Poisson GLMMs the objective is the
 one lme4 and MixedModels.jl use. On non-canonical links (probit, cloglog,
 negative binomial) and on Gamma GLMMs, `glmm` maximises the Laplace
@@ -100,7 +102,11 @@ structured layout; of what is left, `Joint` takes `nAGQ > 1` and the small
 `n_θ ≤ 2 && p ≤ 4` shapes; `PqlThenJoint` takes the rest — the wider
 packed-row shapes. On the blocked or structured layout, a binomial, Poisson or
 Gamma Laplace fit with `n_θ ≥ 2` replaces the `ExactProfile` BOBYQA search with
-BFGS over `[θ | β̃]`, and BOBYQA stays as its polish and fallback.
+BFGS over `[θ | β̃]`, and an AGQ fit of a logit or probit binomial or Poisson
+GLMM with a scalar random intercept and fewer than 50 rows per group replaces
+the `Joint` search with BFGS on the exact AGQ gradient (a warm one unless its
+start puts a variance at or near zero); BOBYQA stays as the polish and
+fallback of both.
 
 **Why it is faster.** Every choice was swept against the validation corpus and
 kept only where it cut evaluations without moving any gated result: the `npt`

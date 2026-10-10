@@ -6,6 +6,58 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [Unreleased]
+
+### Changed
+
+- **Binomial and Poisson GLMMs with a random intercept only and small groups
+  search with BFGS under adaptive quadrature too: about a fifth less time per
+  fit (0.783 of it cold, 0.825 warm, geometric means).** An AGQ fit
+  (`nAGQ > 1`) of a binomial GLMM on the logit or probit link, or of a Poisson
+  GLMM, with one scalar random intercept, no other grouping and fewer than 50
+  rows per group on average now searches `[θ | β]` with projected BFGS on the
+  exact gradient of the AGQ deviance, instead of the joint BOBYQA search. The
+  gradient is assembled from the modes each value evaluation leaves and costs
+  about half a value evaluation. As on the Laplace route, a search that does
+  not certify its endpoint is polished by BOBYQA, and one that fails hands
+  over to the joint BOBYQA search (`Note::GradientSearchFallback`). The joint
+  search's check for working weights that span decades, with its second pass,
+  also runs after the gradient search. These fits keep the joint BOBYQA
+  search: a warm start with a variance below 0.05 (it ends at or near zero,
+  where the endpoint is always polished, and was up to 1.57x slower), a fit at
+  50 rows per group or more (a 500-row cell was 1.27x slower), and cloglog,
+  NB, Gamma and random-effect vectors under AGQ.
+  - Measured as whole `fit_cold` / `fit_warm` calls on a clock-locked x86
+    core, against 0.5.0, on the covered AGQ cells of the accuracy grid and the
+    stress set below 50 rows per group: 25 cold rows and 38 warm ones (from
+    the truth and from 20 % off). No row is slower by more than 1.25x; the
+    slowest are the probit `prba_int1_g3000p20_bal_base_agq7`, 1.10x cold and
+    1.23x warm from the truth. Cold, the grid's 5-row cells and cbpp take
+    0.58x to 0.73x and the stress set's 5-row Poisson cells 0.51x and 0.52x.
+  - The search path changes, so results on these fits move by round-off of
+    the optimum: on the accuracy grid's 15 covered AGQ cells the deviance
+    moves by −1.3e-10 to +4.9e-11, with no `converged` or `singular` flag
+    change, and `n_eval` (value evaluations only) is 2 to 6 times lower. The nAGQ = 7
+    binomial and Poisson R acceptance pins were re-recorded; their
+    log-likelihoods moved by 1.9e-11 and 3.2e-11.
+  - `Diagnostics::n_grad`, `outer_stop` and `outer_decrement` (Python
+    `Fit.n_grad` / `outer_stop` / `outer_decrement`, R `$n_grad` /
+    `$outer_stop` / `$outer_decrement`) are now filled on these fits, and
+    `loop_advanced::curvature_hint` returns a hint after one.
+  - After an AGQ fit hands over to the joint search, when that search's check
+    starts its second pass, one more pass runs from the check's re-solved point and the lower
+    of the two is kept. Where the working weights span many decades the
+    deviance's rounding noise stops BOBYQA where its start leads it: on 125
+    such designs the fits that ended away from the optimum fell from 31 to 16
+    on x86_64 and from 30 to 17 on aarch64, none ended worse, and a hand-over
+    fit takes about 29 more evaluations. Fits without a hand-over are
+    unchanged by it.
+  - On a Poisson AGQ fit whose working weights span about twelve decades, the
+    gradient search's line search fails, so the fit now raises
+    `Note::GradientSearchFallback` (Python `GradientSearchFallbackWarning`, R
+    `fastglmm_gradient_search_fallback`) where 0.5.0 raised nothing. The fit
+    then ends 4.6e-5 deviance units (3e-15 relative) from 0.5.0's optimum.
+
 ## [0.5.0] — 2026-10-10
 
 GLMMs on non-canonical links and Gamma GLMMs now reach the maximum of the
