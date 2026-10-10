@@ -9,23 +9,28 @@ fixed-only and faults at the model-shape gate for `re: Some`. There are no
 | Family | Links | Canonical | Fixed-only | Mixed | Validated against |
 |---|---|---|---|---|---|
 | `Gaussian` | identity (implicit) | yes | OLS | LMM (REML) | R `lm` / `lme4::lmer` |
-| `Binomial` | `Logit`, `Probit`, `Cloglog` | `Logit` | logistic/probit/cloglog GLM | GLMM | R `glm(binomial)` / `lme4::glmer` (cloglog goldens `sim_cloglog_glm`, `sim_cloglog_glmm`) |
+| `Binomial` | `Logit`, `Probit`, `Cloglog` | `Logit` | logistic/probit/cloglog GLM | GLMM | R `glm(binomial)` / `lme4::glmer`; `glmmTMB` on probit and cloglog GLMMs (cloglog goldens `sim_cloglog_glm`, `sim_cloglog_glmm`) |
 | `Poisson` | `Log` | yes | GLM | GLMM | R `glm(poisson)` / `lme4::glmer` (goldens `grouseticks_glm`, `grouseticks`) |
-| `Gamma` | `Log`, `Inverse` | neither¹ | GLM | GLMM | R `glm(Gamma(link))` / `lme4::glmer(Gamma)` (goldens `sim_gamma_*`) |
-| `NegativeBinomial` | `Log` | no² | GLM (θ estimated) | GLMM | R `MASS::glm.nb` / `lme4::glmer.nb` (goldens `sim_nb_*`) |
+| `Gamma` | `Log`, `Inverse` | neither¹ | GLM | GLMM | R `glm(Gamma(link))` / `lme4::glmer(Gamma)` and `glmmTMB` (goldens `sim_gamma_*`) |
+| `NegativeBinomial` | `Log` | no² | GLM (θ estimated) | GLMM | R `MASS::glm.nb` / `lme4::glmer.nb` and `glmmTMB` (goldens `sim_nb_*`) |
 | `InverseGaussian` | `Log`, `InverseSquared` | neither³ | GLM | **not supported** (faults) | R `glm(inverse.gaussian(link))` (goldens `sim_igauss_glm`, `sim_igauss_inv_sq_glm`) |
 
 ¹ The Gamma canonical link is the *negative* inverse (`θ = −1/μ`); the offered
-`Inverse` link (`g(μ) = 1/μ`) is therefore non-canonical and uses the general
-Fisher-scoring branch. `Log` is the recommended default — `Inverse` can drive
-`μ ≤ 0` mid-IRLS and is domain-clamped (`η > 0`).
+`Inverse` link (`g(μ) = 1/μ`) is therefore non-canonical. It uses the
+Fisher-scoring branch, which equals a Newton step on this link because the
+two links differ only in sign. `Log` takes Newton steps (observed weights),
+with the Fisher step as fallback. `Log` is the recommended default —
+`Inverse` can drive `μ ≤ 0` mid-IRLS and is domain-clamped (η held in
+`[1e-75, 1e75]`).
 
-² The NB canonical link `log(μ/(μ+θ))` is not offered; `Log` uses the general
-Fisher-scoring branch.
+² The NB canonical link `log(μ/(μ+θ))` is not offered; `Log` takes Newton
+steps (observed weights), with the Fisher step as fallback.
 
 ³ The Inverse-Gaussian canonical link is `θ = −1/(2μ²)`; the offered
-`InverseSquared` link (`g(μ) = 1/μ²`) only matches it up to sign and scale, so
-both links use the general Fisher-scoring branch.
+`InverseSquared` link (`g(μ) = 1/μ²`) only matches it up to sign and scale.
+`InverseSquared` uses the Fisher-scoring branch, which equals a Newton step
+on this link, and is domain-clamped like Gamma's `Inverse`. `Log` takes
+Newton steps (observed weights), with the Fisher step as fallback.
 
 **Which algorithm fits your model?** The table's row and column pick the
 path: fixed-only rows go through OLS or IRLS-based GLM (both in
@@ -44,8 +49,8 @@ mixed models go through PIRLS with Laplace/AGQ
   count — lme4's `cbind(s, m−s)` objective). `Logit` runs on the fused-SIMD
   canonical hot path; `Probit` (`μ = Φ(η)` via the high-precision `phi_hp`)
   and `Cloglog` (`μ = 1−exp(−exp(η))`, asymmetric — μ approaches 1 much faster
-  than 0, and η is clamped at `±ETA_MAX` so `exp(η)` stays finite) both take
-  the general Fisher-scoring branch.
+  than 0, and η is clamped at ±700 so `exp(η)` stays finite) both take
+  Newton steps (observed weights), with the Fisher step as fallback.
 - **Gamma**: `Fit::loglik` is always the maximised log-likelihood, at the ML
   φ̂ of the Gamma shape equation (`MASS::gamma.shape`'s equation at unit
   weights; see [`algorithms.md`](algorithms.md)). What `Fit::dispersion`
@@ -73,7 +78,8 @@ mixed models go through PIRLS with Laplace/AGQ
   overdispersion lives in `θ`, not `φ`).
 - **Prior weights** (`FitOptions::weights`) are honored on every family
   above, fixed-only and mixed alike, at any `nagq`, including AGQ (`nagq > 1`)
-  on the binomial/Poisson shapes it covers. They are precision weights on
+  on the binomial, Poisson, negative-binomial and Gamma shapes it covers.
+  They are precision weights on
   Gaussian, Gamma and inverse-Gaussian, trial counts on aggregated Binomial,
   and multiply the log-likelihood on NB — see
   [`conventions.md`](conventions.md#prior-weights) and

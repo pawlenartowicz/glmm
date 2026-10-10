@@ -27,10 +27,6 @@ data = {
     "sample": [r["sample"] for r in rows],
 }
 
-# NOTE: the shared formula parser always carries an intercept implicitly and
-# has no bare "1" fixed-effect term (see documentation/formula.md) -- the
-# manifest's lme4-style "diameter ~ 1 + (1 | plate) + (1 | sample)" drops the
-# leading "1 +" here.
 fit = glmm.fit(data, "diameter ~ (1 | plate) + (1 | sample)")
 
 print("converged:", fit.converged, " singular:", fit.singular)

@@ -4,14 +4,18 @@
 pure Rust on [`faer`](https://crates.io/crates/faer) — fitting fixed-effect and
 mixed (random-intercept/random-slope) models for Gaussian, Binomial
 (logit/probit/cloglog), Poisson, Gamma, Negative-Binomial, and (fixed-effect
-GLM only) Inverse-Gaussian outcomes, validated
-against R/lme4 and Julia/MixedModels.jl goldens. It is derivative-free (BOBYQA
-over the profiled deviance, no autodiff), REML-locked for Gaussian mixed
-models (no ML switch), validation-pinned against a frozen lme4/MixedModels.jl
-oracle that is never relaxed to match a disagreement, and WASM-ready (the fit
+GLM only) Inverse-Gaussian outcomes, validated on an accuracy grid against
+four pinned oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive). It searches
+the profiled deviance with BOBYQA, a derivative-free method, and with BFGS on
+an analytic gradient where one is available (LMMs with random slopes on
+their only grouping factor; binomial, Poisson and Gamma GLMMs fitted by the
+Laplace approximation). It is REML-locked for Gaussian mixed models (no ML
+switch), validation-pinned against those frozen oracles, which are never
+relaxed to match a disagreement, and WASM-ready (the fit
 path carries no `unsafe`, no RNG, no global state, no I/O, and compiles
 unmodified to `wasm32`). It deliberately is **not** a general inference
-toolkit: no BLUPs/`predict`, no profile or bootstrap confidence intervals, no
+toolkit: no `predict`, no conditional variances for the random effects, no
+profile or bootstrap confidence intervals, no
 small-sample degrees-of-freedom corrections, and fewer families than
 glmmTMB/GLMMadaptive — anything the engine cannot compute honestly errors with
 the reason instead of guessing, and for one interactive model on one dataset,
@@ -44,7 +48,7 @@ a zero-allocation, warm-startable workspace.
 | Reference | [`conventions.md`](conventions.md) | Estimation, standard-error, dispersion, and variance-component conventions, and the flags on a fit result |
 | Reference | [`troubleshooting.md`](troubleshooting.md) | Fixes for singular fits, non-convergence, `NotImplementedError`, and rejected formulas |
 | Reference | [`warnings.md`](warnings.md) | Every warning a fit raises (tier, title, message, and the stored `m.warnings` / `m$warnings` entry) and every error a call can raise |
-| Reference | [`validation.md`](validation.md) | How glmm is validated against lme4 and MixedModels.jl, what's covered, and known tolerances/exemptions |
+| Reference | [`validation.md`](validation.md) | How glmm is validated against lme4, glmmTMB, MixedModels.jl and GLMMadaptive, what's covered, and known tolerances/exemptions |
 | Internals | [`algorithms.md`](algorithms.md) | Algorithm map entry point: full dispatch graph, knob index, OLS/GLM paths |
 | Internals | [`algorithms-lmm.md`](algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML, closed-form shortcut, BOBYQA, boundary handling |
 | Internals | [`algorithms-glmm.md`](algorithms-glmm.md) | GLMM: PIRLS, Laplace vs AGQ, dense vs sparse Z, NB outer loop, warm starts |

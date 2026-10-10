@@ -71,9 +71,8 @@ knob to make it match — REML is the only answer `glmm` gives.
 
 One more thing this same check turned up: under its own REML default,
 `MixedLM`'s `.aic` is `nan` (confirmed on the wheel above) — AIC isn't a
-well-posed number under REML in general. The "no AIC line" in item 6 below
-isn't `glmm` being unusually restrictive; it's the same restriction
-`statsmodels` places on itself under the objective the two estimators share.
+well-posed number under REML in general. `glmm`'s summary of an LMM prints the
+REML criterion and no AIC line for the same reason.
 
 ## What you lose
 
@@ -84,8 +83,8 @@ rather than lumping everything into one "blocked" bucket.
 
 | statsmodels | `glmm.Fit` | What actually happens |
 |---|---|---|
-| `.random_effects` (dict of per-group BLUPs) | `.ranef` / `.ranef_levels` | `fit.random_effects` raises `AttributeError: 'Fit' object has no attribute 'random_effects'` (verified) — the name doesn't exist. The conditional modes themselves do, under `.ranef`/`.ranef_levels`, and are populated for GLM/GLMM fits — but come back as an **empty array** on the Gaussian LMM path, which is fit through sufficient statistics and keeps no per-row/per-group closed form. |
-| `.fittedvalues` | `.fitted` | Same story: `AttributeError` on the statsmodels name (verified); `.fitted` holds real in-sample μ̂ per row for GLM/GLMM fits, empty for the Gaussian LMM path. |
+| `.random_effects` (dict of per-group BLUPs) | `.ranef` / `.ranef_levels` | `fit.random_effects` raises `AttributeError: 'Fit' object has no attribute 'random_effects'` (verified) — the name doesn't exist. The conditional modes themselves do, under `.ranef`/`.ranef_levels`. |
+| `.fittedvalues` | `.fitted` | Same story: `AttributeError` on the statsmodels name (verified); `.fitted` holds the in-sample μ̂ per row. |
 | `.predict(new_data)` | — | `AttributeError: 'Fit' object has no attribute 'predict'` (verified) — no method under this or any other name. This is the one clean, total loss in this table: there is no out-of-sample prediction on any path, converged or not. |
 | `.bse` | `.se` | Exists, just renamed — the `(p,)` array of Wald standard errors. |
 | `.pvalues` | — | No stored field. `fit.summary()` computes Wald z/p on the fly (`z = beta/se`, `p = erfc(\|z\|/sqrt(2))`) and prints them, but doesn't save them anywhere on `Fit`; recompute the same two-line formula from `.beta`/`.se` if you need the numbers back. |
@@ -96,43 +95,43 @@ rather than lumping everything into one "blocked" bucket.
 ## What you gain
 
 - **Non-Gaussian mixed models at all.** `MixedLM` is Gaussian-only; `glmm.fit`
-  covers binomial (logit/probit), Poisson, Gamma, and negative-binomial GLMMs
+  covers binomial (logit/probit/cloglog), Poisson, Gamma, and negative-binomial GLMMs
   through the same call, just `family=...`.
 - **Crossed and nested groupings as ordinary formula terms.** `(1 | g1) + (1 | g2)`
   for crossed factors, `(1 | g1/g2)` for nesting — see recipes 2 and 3 in
   [`examples-python.md`](examples-python.md). `statsmodels` has no formula
   shorthand for either shape on `MixedLM`.
 - **Adaptive Gauss–Hermite quadrature.** `nagq=<odd integer, 1..25>` on
-  binomial/Poisson GLMMs with a single grouping factor and up to 3 random
-  effects per group (`nagq=1`, the default, is Laplace) — `statsmodels` has
-  no quadrature option for mixed models.
+  binomial, Poisson, negative-binomial and Gamma GLMMs with a single grouping
+  factor and up to 3 random effects per group (`nagq=1`, the default, is
+  Laplace) — `statsmodels` has no quadrature option for mixed models.
 
 ## Reading `.summary()` against statsmodels'
 
-`fit.summary()`'s coefficient table has the same four columns you'd expect
-from `MixedLMResults.summary()` or `GLMResults.summary()` — name, estimate,
+`fit.summary()` prints an lme4-shaped summary, not a statsmodels one. Its
+coefficient table has the same four columns you'd expect from
+`MixedLMResults.summary()` or `GLMResults.summary()` — name, estimate,
 standard error, and a test statistic with its p-value — but three things are
-different by design, all verified against the printed output in
-[`examples-python.md`](examples-python.md):
+different, all checked against the installed package:
 
-- **No residual-degrees-of-freedom line.** statsmodels' summary reports
-  group/observation counts; `glmm`'s doesn't carry a residual-df concept at
-  all — there's no `t`-based inference to justify one (next point).
-- **The test column is always Wald z, never `t`.** `glmm.fit`'s own docstring
-  is explicit about why: *"Wald-z (not t) matches the GLM/GLMM convention and
-  the absence of a residual-df field on the kernel output."* This applies
-  uniformly, including on the Gaussian LMM path, where `MixedLMResults`
-  already also reports `z`/`P>|z|` (not `t`) — so this one is not actually a
-  difference from `MixedLM`, only from a plain OLS/GLM `t`-table intuition.
-- **No AIC/BIC/log-likelihood line in the printed table.** `fit.loglik` and
-  `fit.df` are on the `Fit` object (see the table above for the caveats on
-  building an AIC from them by hand); they just don't appear in
-  `summary()`'s own output the way `MixedLMResults.summary()` prints
-  `Log-Likelihood`/converged status inline.
-
-The footer line `summary()` does print —
-`dispersion: <value>   converged: <bool>   singular: <bool>` — has no
-statsmodels analogue at all: `dispersion` is φ/θ/σ² depending on family (see
-[`conventions.md`](conventions.md)), and `converged`/`singular` are the two
-flags [`coming-from-lme4.md`](coming-from-lme4.md#behavioral-differences-to-watch)
-covers in more depth.
+- **The test column is always Wald z, never `t`.** Wald z matches the
+  GLM/GLMM convention, and the kernel has no residual degrees of freedom to
+  base a `t` test on. This applies uniformly, including on the Gaussian LMM
+  path, where `MixedLMResults` already also reports `z`/`P>|z|` (not `t`) — so
+  this one is not actually a difference from `MixedLM`, only from a plain
+  OLS/GLM `t`-table intuition.
+- **The criterion line depends on the estimator.** An LMM prints
+  `REML criterion at convergence: <value>` and no AIC/BIC (see the REML
+  section above). Every other fit prints one row with `AIC`, `BIC`, `logLik`,
+  `deviance` and `df.resid`. `df.resid` is the number of observations minus
+  the number of estimated parameters; no test uses it.
+- **The footer is lme4's, not statsmodels'.** After the fixed-effect
+  correlations, `summary()` prints a dispersion line on Gamma,
+  inverse-Gaussian and negative-binomial fits (`Dispersion (phi, ML): <value>`,
+  `Dispersion (phi, Pearson): …`, `Dispersion (phi, fixed): …` or
+  `Shape (theta): …`; see [`conventions.md`](conventions.md)), then
+  `Optimizer evaluations: <n>, converged: <bool>`, and on a singular fit
+  `boundary (singular) fit: see help('isSingular')`. A Gaussian mixed fit
+  shows σ² as the `Residual` row of the random-effects table instead.
+  `converged` and the singular flag are covered in more depth in
+  [`coming-from-lme4.md`](coming-from-lme4.md#behavioral-differences-to-watch).

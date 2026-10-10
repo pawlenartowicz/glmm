@@ -19,14 +19,18 @@
 #            with `taskset -c i`. P-cores on this box are 0-5, so N > 6 is refused.
 #   --label  free text purpose of the run ("release 0.4.0 baseline"), stored in
 #            run_meta and slugged into the directory name.
-#   --keep   a glmm / glmm_wasm / glmm_python / glmm_r run lands in runs/<engine>/ instead of
-#            runs/<engine>/scratch/. Oracle runs are always kept.
+#   --keep   a finished glmm / glmm_wasm / glmm_python / glmm_r run replaces the
+#            engine's kept run (promote.sh: runs/<engine>/last/ for a full run,
+#            last-timed/ for a timed one). Oracle runs are always kept. Every run
+#            is first built in runs/<engine>/scratch/, which git ignores.
 #   --complete-from DIR  oracle engines, full runs only: seed the new run with
 #            DIR's records and fit only the manifest cells DIR has no record for,
 #            so cells added to the manifest do not cost a whole-grid rerun. DIR
 #            must be a full, untimed run of the same engine at the same version;
-#            the new run is a full run and records DIR as `completed_from`. The
-#            copied records are only valid while those cells' data are unchanged.
+#            the new run is a full run and records DIR's run name (or path) as
+#            `completed_from`; a slot path such as runs/lme4/last would name a
+#            different run once the slot moves on. The copied records are only
+#            valid while those cells' data are unchanged.
 #   cell ... restrict to the named cells; validated against manifest.json, so an
 #            unknown name fails loudly before anything is fit.
 #
@@ -234,9 +238,10 @@ if [[ -n "$COMPLETE_FROM" ]]; then
     '.engine == $eng and .engine_version == $ver and .subset == "full" and .timed == null' \
     "$COMPLETE_FROM/run_meta.json" >/dev/null \
     || { echo "--complete-from: $COMPLETE_FROM is not a full, untimed $ENGINE $ENGINE_VERSION run" >&2; exit 2; }
+  COMPLETED_FROM="$(jq -r --arg p "${COMPLETE_FROM#"$GRID"/}" '.run_name // $p' "$COMPLETE_FROM/run_meta.json")"
 fi
 
-# ---- run directory: never overwritten --------------------------------------
+# ---- run directory: a new one in scratch/ every time ------------------------
 # sed -E: BSD sed has no `\+` in basic regexps; ERE `+` means the same on both.
 slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-//; s/-$//'; }
 # GRID_MACHINE names the machine in run_meta and the directory name. It comes
@@ -256,12 +261,9 @@ fi
 MACHINE="$(slug "$GRID_MACHINE")"
 BASE="$(date +%F)_${ENGINE_VERSION}_${MACHINE}"
 [[ -n "$LABEL" ]] && BASE="${BASE}_$(slug "$LABEL")"
-RUN_ROOT="$GRID/runs/$ENGINE"
-# A glmm / port run is committed only when started with --keep; otherwise it lands
-# in scratch/, which .gitignore drops. Oracle runs are always committed.
-case "$ENGINE" in
-  glmm|glmm_wasm|glmm_python|glmm_r) [[ "$KEEP" == 1 ]] || RUN_ROOT="$RUN_ROOT/scratch" ;;
-esac
+# Every run is built in scratch/, which .gitignore drops; a kept one is moved into
+# its slot by promote.sh at the end.
+RUN_ROOT="$GRID/runs/$ENGINE/scratch"
 RUN_DIR="$RUN_ROOT/$BASE"
 # Rerunning the same engine on the same day appends a counter rather than
 # overwriting -- a run directory is an immutable record.
@@ -293,7 +295,7 @@ write_run_meta() {   # $1 = the cell_list JSON array
     --arg crate "$crate" --arg rev "$rev" --arg subset "$SUBSET" \
     --arg no_turbo "$no_turbo" --arg pin "$PIN_CORES" \
     --arg loadavg "$loadavg" --arg r "$r_ver" --arg jl "$jl_ver" \
-    --arg label "$LABEL" --arg completed_from "${COMPLETE_FROM#"$GRID"/}" \
+    --arg label "$LABEL" --arg completed_from "${COMPLETED_FROM:-}" \
     --argjson timed "${TIMED_N:-null}" \
     --argjson unlocked "$([[ "$TIMED_UNLOCKED" == 1 ]] && echo true || echo false)" \
     --argjson jobs "$JOBS" --argjson cells "${#SELECTED[@]}" \
@@ -462,8 +464,9 @@ FAILED=0
 for p in "${PIDS[@]}"; do wait "$p" || FAILED=1; done
 
 cat "$RUN_DIR"/results.part*.jsonl > "$RUN_DIR/results.jsonl"
-# The parts are KEPT, not deleted: they are this run's own scratch inside its own
-# never-overwritten directory, they cost a copy of a few MB, and they are what
-# shows which worker fitted which cell when a run has to be picked apart.
+# The parts stay on disk but out of git (.gitignore): together they are an exact
+# copy of results.jsonl, and they are what shows which worker fitted which cell
+# when a run has to be picked apart.
 echo ">> $ENGINE: ${#SELECTED[@]} cells -> $RUN_DIR/results.jsonl"
 (( FAILED == 0 )) || { echo ">> $ENGINE: at least one worker aborted -- results.jsonl is incomplete" >&2; exit 1; }
+if [[ -n "$ENGINE_MANIFEST_NAME" || "$KEEP" == 1 ]]; then "$GRID/promote.sh" "$RUN_DIR"; fi

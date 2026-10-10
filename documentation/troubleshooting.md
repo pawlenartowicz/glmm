@@ -74,8 +74,10 @@ many random-effect parameters for the number of clusters or groups you have.
 The units of the predictors do not matter: glmm centers and scales the design
 internally before it fits, so rescaling a predictor does not change the
 search. Nearly collinear predictors still do. There is no multistart or retry knob to
-reach for here; `fit` runs one optimization from one starting point and
-reports honestly if it didn't converge.
+reach for here. `fit` starts from one point. On some models it reruns the
+search by itself, with another search method or (a Gamma GLMM with the
+inverse link) on another scale, and it reports honestly if the fit still did
+not converge.
 
 ## NotImplementedError: family/link/knob
 
@@ -87,7 +89,7 @@ something close: quasi-likelihood `dispersion=` on binomial/Poisson.
 message naming the deferral) and `link="cloglog"` (GLM and GLMM) are both
 implemented.
 
-If you hit one of the two remaining gaps, there's nothing to configure around
+If you hit this gap, there's nothing to configure around
 it — wait for the knob to land, or restructure the model to avoid it
 (e.g. drop the `dispersion=` request).
 
@@ -95,10 +97,12 @@ it — wait for the knob to land, or restructure the model to avoid it
 
 `nagq`/`nAGQ` only takes effect on one shape: a binomial, Poisson,
 negative-binomial or Gamma GLMM with a single grouping factor and up to 3
-random effects per group, with an odd node count up to 25. Any other shape —
-multiple grouping factors, more REs per group, a Gaussian model — warns and
+random effects per group, with an odd node count up to 25. Any other mixed
+shape — multiple grouping factors, more REs per group — warns and
 silently falls back to Laplace (`nAGQ = 1`) instead of honoring the
-requested node count.
+requested node count. On a Gaussian model or a model without random effects
+there is nothing to approximate, so `nagq` above 1 raises an
+`argument_ignored` note instead.
 
 lme4 errors on these shapes rather than falling back, so a script that
 worked in lme4 with an ineligible `nAGQ` won't fail the same way here — it
@@ -118,12 +122,12 @@ silent reinterpretation. See
 [`formula.md#not-accepted-and-the-workaround`](formula.md#not-accepted-and-the-workaround)
 for the full list and the workaround for each.
 
-## predict()/residuals()/coef() error
+## predict()/coef() error
 
 These aren't missing by oversight — the ports error, naming the reason, on
 anything the kernel can't compute honestly rather than returning a
 fixed-effects-only or otherwise silently different answer. `ranef()`,
-`fitted()` and `logLik()`/`AIC()`/`BIC()` are implemented and not part of
-this list. See
+`fitted()`, `residuals()` and `logLik()`/`AIC()`/`BIC()` are implemented and
+not part of this list. See
 [`coming-from-lme4.md#what-is-deliberately-missing`](coming-from-lme4.md#what-is-deliberately-missing)
 for what's blocked and why.

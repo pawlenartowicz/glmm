@@ -32,8 +32,6 @@ data = {
     "cask": [r["cask"] for r in rows],
 }
 
-# NOTE: no bare "1" fixed-effect term (the intercept is always implicit) --
-# the manifest's "strength ~ 1 + (1 | batch/cask)" drops the leading "1 +".
 fit = glmm.fit(data, "strength ~ (1 | batch/cask)")
 
 print("converged:", fit.converged, " singular:", fit.singular)

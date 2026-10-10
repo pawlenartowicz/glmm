@@ -1,9 +1,12 @@
 //! GLMM kernel: PIRLS + Laplace/AGQ, glmer-faithful nAGQ=1. Covers
 //! Binomial/Poisson/Gamma/negative-binomial with random effects; on NB and
-//! Gamma the outer BOBYQA searches the dispersion (`ln θ_NB`, `ln φ`) as one
+//! Gamma the outer search carries the dispersion (`ln θ_NB`, `ln φ`) as one
 //! more trailing coordinate alongside `[θ_RE | β]`, so β, θ_RE and the
 //! dispersion come out of one fit — see `fit_glmm`'s `nb_term`/`n_disp`
-//! handling. Optimized per
+//! handling. Binomial, Poisson and Gamma Laplace fits with `n_θ ≥ 2` on the
+//! blocked or structured layout search with projected BFGS
+//! ([`gradient_route_plan`]), Gamma's `ψ = ln φ` included, with BOBYQA as the
+//! polish and the fallback. Every other fit is optimized per
 //! `OuterSearch` (`GlmmWorkspace.outer_search`, fixed per shape at construction),
 //! mirroring lme4's structure (Bates, Mächler, Bolker, Walker, *JSS* 67(1), 2015,
 //! §3) on the two routes that use it: `Joint` runs one BOBYQA over `[θ | β]`
@@ -431,15 +434,17 @@ pub enum FdHessianStatus {
     NonPdFellBackToRx,
 }
 
-/// The gradient route's rule (B2, 2026-10-07): which optimizer `fit_glmm`'s
-/// outer search runs on a cold and on a warm fit, from the shape alone.
+/// The gradient route's rule: which optimizer `fit_glmm`'s outer search runs
+/// on a cold and on a warm fit, from the shape alone.
 ///
 /// Projected BFGS over `[θ | β]` on the fixed-β Laplace objective, with the
 /// gradient assembled off each value evaluation's own mode state
 /// ([`assembled::gradient_at_mode`]), when all of these hold:
 ///
-/// 1. Laplace (`nagq == 1`), binomial (any link) or Poisson, so no dispersion
-///    coordinate;
+/// 1. Laplace (`nagq == 1`), binomial (any link), Poisson or Gamma (log and
+///    inverse link): no dispersion coordinate, or Gamma's `ln φ`, which the
+///    search carries as a trailing coordinate (NB's `ln θ_NB` changes the
+///    variance function, and the gradient has no entry for it);
 /// 2. the blocked layout, or the structured one within the dual tail bound
 ///    (the shapes the assembly serves);
 /// 3. `n_θ ≥ 2`. One-θ fits stay on `ExactProfile`, which needs 11 to 24
@@ -452,24 +457,27 @@ pub enum FdHessianStatus {
 /// 1.46x; below 50 rows per level a scalar warm fit is 0.69 of warm BOBYQA's
 /// search, summed over 32 cells).
 ///
-/// Measured (shadow search against production in one process, 2026-10-06/07):
-/// summed search time 0.46 of production on 94 grid cells and 0.22 on the
-/// stress set, no stress cell slower; every endpoint at or below the BOBYQA
-/// optimum within `dev_eps`. Evidence: `docs/0.5.0/b2-glmm-bfgs-spec.md`.
+/// Measured against the BOBYQA route, every endpoint at or below the BOBYQA
+/// optimum within `dev_eps`. Binomial and Poisson (shadow search against
+/// production in one process, 2026-10-06/07): summed search time 0.46 of it
+/// on 94 grid cells and 0.22 on the stress set, no stress cell slower. Gamma
+/// (locked clock, 2026-10-09): summed fit time 0.29 of it on the 88 routed
+/// log-link grid cells and 0.21 on the 14 inverse-link ones, every cell
+/// faster.
 pub(crate) fn gradient_route_plan(
     family: crate::Family,
     nagq: u8,
     layout: GlmmLayout,
     g: &crate::lmm::LmmGroupings,
     n_theta: usize,
-    n_disp: usize,
 ) -> crate::optim::RoutePlan {
     use crate::optim::{OuterOptimizer, RoutePlan};
     let in_scope = nagq == 1
-        && n_disp == 0
         && matches!(
             family,
-            crate::Family::Binomial { .. } | crate::Family::Poisson { .. }
+            crate::Family::Binomial { .. }
+                | crate::Family::Poisson { .. }
+                | crate::Family::Gamma { .. }
         )
         && matches!(layout, GlmmLayout::Blocked | GlmmLayout::Structured)
         && derivative::supports_shape(layout, g)
@@ -486,15 +494,30 @@ pub(crate) fn gradient_route_plan(
 
 /// The curvature hint (`loop_advanced::curvature_hint`) after a `fit_glmm` on
 /// `ws`: the last gradient search's final BFGS inverse-Hessian estimate over
-/// `[θ | β̃]`, the search's own coordinates. `None` when that fit did not
-/// search with BFGS, never updated its estimate, or left one that is not
-/// positive definite. Free: no evaluation runs.
+/// `[θ | β̃]`, and `[θ | β̃ | ln φ]` on a free Gamma dispersion, the search's
+/// own coordinates. `None` when that fit did not search with BFGS, never
+/// updated its estimate, or left one that is not positive definite. Free: no
+/// evaluation runs.
 pub(crate) fn glmm_curvature_hint(ws: &GlmmWorkspace) -> Option<crate::optim::CurvatureHint> {
     if !ws.grad_hint_ready {
         return None;
     }
-    let m = ws.n_theta + ws.p;
-    crate::optim::CurvatureHint::from_inverse(m, ws.bfgs.inv_hessian())
+    let m = grad_search_dim(ws.family, ws.n_theta, ws.p, ws.gamma_phi_held.is_some());
+    crate::optim::CurvatureHint::from_inverse(m, ws.bfgs.inv_hessian(), ws.search_units)
+}
+
+/// The gradient search's dimension: `[θ | β̃]`, and `[θ | β̃ | ln φ]` on a
+/// Gamma fit whose dispersion is not held. The curvature hint the search
+/// leaves (`glmm_curvature_hint`) and the one `fit::core::fit_on_hinted`
+/// accepts are this size.
+pub(crate) fn grad_search_dim(
+    family: crate::Family,
+    n_theta: usize,
+    p: usize,
+    phi_held: bool,
+) -> usize {
+    let free_phi = matches!(family, crate::Family::Gamma { .. }) && !phi_held;
+    n_theta + p + usize::from(free_phi)
 }
 
 /// Rows per primary level from which a warm fit with no random-slope block
@@ -527,7 +550,11 @@ const GRAD_ASM_KEEP_BYTES: usize = 4 << 20;
 /// The gradient route's objective: the fixed-β Laplace deviance over
 /// `γ̃ = [θ | β̃]`, every evaluation at the family's full PIRLS tolerance from
 /// the incumbent's mode, and its gradient off the state the last evaluation
-/// left ([`assembled::gradient_at_mode`]).
+/// left ([`assembled::gradient_at_mode`]). On a free Gamma dispersion the
+/// point is `[θ | β̃ | ψ]`, `ψ = ln φ` (internal units, not whitened), and the
+/// value adds the dispersion term `Gₚ(ψ)`, as the BOBYQA objective does.
+/// Under a held φ the search runs over `[θ | β̃]` at that φ, and a trailing
+/// slot (the joint polish's inert one) is ignored.
 ///
 /// β is searched whitened, `β̃ = Lᵀβ` (`BetaScale`, the joint BOBYQA search's
 /// map), and the β block of the gradient maps by `L⁻¹`. In the caller's units
@@ -560,12 +587,25 @@ struct GradSearch<'a, 'd> {
     grad_asm: &'a mut Option<assembled::AssemblyBufs<f64>>,
     u_inc: &'a mut [f64],
     beta_scale: &'a mut workspace::BetaScale,
-    /// The last value evaluation's point in the caller's β units, for the
-    /// gradient's `∂M/∂θ` (the second half of `ws.grad_scratch`).
+    /// The last value evaluation's `[θ | β]`, β in the caller's units, for
+    /// the gradient's `∂M/∂θ` (the second part of `ws.grad_scratch`, length
+    /// `n_θ + p`).
     x_last: &'a mut [f64],
     /// Whether the last value evaluation is a gradient point: finite, on a
     /// converged mode.
     last_ok: bool,
+    /// The Gamma dispersion φ (internal units) the last value evaluation ran
+    /// PIRLS at: `e^ψ` on a free dispersion, the held φ under a held one, 1
+    /// on every other family.
+    gamma_phi: f64,
+    /// `ln` of `gamma_phi`: the last point's `ψ` itself on a free dispersion,
+    /// so the `ψ` gradient entry is taken at the point the value was.
+    ln_phi: f64,
+    /// Whether the point carries a free Gamma `ψ = ln φ` after `[θ | β̃]`.
+    free_phi: bool,
+    /// `Σ ln yᵢ`, the dispersion term's data constant (`fit_glmm`'s
+    /// `gamma_sum_ln_y`); read on a free Gamma dispersion only.
+    sum_ln_y: f64,
     k: usize,
     n_theta: usize,
 }
@@ -573,15 +613,21 @@ struct GradSearch<'a, 'd> {
 impl crate::optim::Objective for GradSearch<'_, '_> {
     fn value(&mut self, x: &[f64], _resolution: f64) -> Option<f64> {
         let k = self.k;
-        let p = x.len() - self.n_theta;
-        let pt = self.beta_scale.caller_point(x, self.n_theta, p);
-        self.x_last.copy_from_slice(&pt[..x.len()]);
+        let d = self.data;
+        let q = self.n_theta + d.p;
+        let psi = self.free_phi.then(|| x[q]);
+        if let Some(c) = psi {
+            self.gamma_phi = c.exp();
+            self.ln_phi = c;
+        }
+        self.x_last.copy_from_slice(&x[..q]);
+        self.beta_scale.to_caller(&mut self.x_last[self.n_theta..]);
         self.pirls.u[..k].copy_from_slice(&self.u_inc[..k]);
         let exhausted_before = *self.pirls_exhausted;
         let dev = laplace_deviance(
-            self.data,
+            d,
             self.nb_theta,
-            1.0,
+            self.gamma_phi,
             1,
             self.x_last,
             self.beta_rhs,
@@ -600,6 +646,18 @@ impl crate::optim::Objective for GradSearch<'_, '_> {
             self.pirls_exhausted,
             self.counters,
         );
+        // The Gamma arm of `fit_glmm`'s `nb_term` — change together.
+        let dev = match psi {
+            Some(c) => {
+                dev + crate::family::gamma_dispersion_term(
+                    c,
+                    d.weighted.then_some(d.prior_w),
+                    d.n,
+                    self.sum_ln_y,
+                )
+            }
+            None => dev,
+        };
         self.counters.record_eval(crate::counters::Stage::Two, dev);
         if !dev.is_finite() {
             self.non_finite_points.extend_from_slice(x);
@@ -619,8 +677,18 @@ impl crate::optim::GradObjective for GradSearch<'_, '_> {
         let k = self.k;
         self.u_inc[..k].copy_from_slice(&self.pirls.u[..k]);
         let d = self.data;
-        let p = g.len() - self.n_theta;
-        assembled::gradient_at_mode(
+        let (n_theta, p, n) = (self.n_theta, d.p, d.n);
+        // The weights the value evaluation handed PIRLS. `laplace_deviance`
+        // writes `prior_w_phi` only on Gamma at φ ≠ 1, so at φ = 1 it holds an
+        // earlier evaluation's weights (mirrors its `pirls_prior_w` — change
+        // together).
+        let scaled = matches!(d.family, crate::Family::Gamma { .. }) && self.gamma_phi != 1.0;
+        let prior_w = if scaled {
+            &self.prior_w_phi[..n]
+        } else {
+            d.prior_w
+        };
+        if assembled::gradient_at_mode(
             d.groupings,
             d.family,
             self.nb_theta,
@@ -630,22 +698,62 @@ impl crate::optim::GradObjective for GradSearch<'_, '_> {
             d.extra_ids,
             self.x_last,
             d.z_buf,
-            d.prior_w,
+            prior_w,
             self.pirls,
             self.structured,
             self.pattern,
             self.grad_asm,
-            self.n_theta,
+            n_theta,
             p,
-            d.n,
+            n,
             g,
         )
-        .is_some()
-            && {
-                // ∂/∂β̃ = L⁻¹·∂/∂β, the row map (`x̃ = x·L⁻ᵀ`).
-                self.beta_scale.to_search_row(&mut g[self.n_theta..]);
-                true
+        .is_none()
+        {
+            return false;
+        }
+        // A free Gamma dispersion's `ψ = ln φ` slot trails `[θ | β̃]`; it is
+        // not whitened.
+        if g.len() > n_theta + p {
+            g[n_theta + p] = assembled::gamma_ln_phi_gradient(
+                self.ln_phi,
+                d.weighted.then_some(d.prior_w),
+                n,
+                self.pirls.pen_dev,
+                &self.x_last[..n_theta],
+                &g[..n_theta],
+            );
+        }
+        // ∂/∂β̃ = L⁻¹·∂/∂β, the row map (`x̃ = x·L⁻ᵀ`).
+        self.beta_scale.to_search_row(&mut g[n_theta..n_theta + p]);
+        true
+    }
+
+    /// On a free Gamma dispersion, `ψ`'s curvature at fixed `ξ = θ·e^{−ψ/2}`:
+    /// from `F = e^{−ψ}·P(ξ, β) + log|A| + Gₚ(ψ)`, `∂²F/∂ψ² = P_φ + Gₚ''(ψ)`
+    /// with `P_φ = e^{−ψ}·P` the last value's `dev + pen` (`pirls.pen_dev`).
+    /// The search's start inverse Hessian takes its inverse as `ψ`'s entry:
+    /// the identity's unit entry would treat ψ like θ, while `P_φ` is of
+    /// order n. Inverse link only: on the log link the seed costs warm starts
+    /// more evaluations than it saves cold ones (measured on the grid's routed
+    /// Gamma/log cells), so the search starts from the identity there.
+    fn start_curvature(&self) -> Option<(usize, f64)> {
+        let inverse = matches!(
+            self.data.family,
+            crate::Family::Gamma {
+                link: crate::GammaLink::Inverse
             }
+        );
+        if !self.free_phi || !inverse {
+            return None;
+        }
+        let d = self.data;
+        let c = crate::family::gamma_dispersion_term_d2(
+            self.ln_phi,
+            d.weighted.then_some(d.prior_w),
+            d.n,
+        ) + self.pirls.pen_dev;
+        (c > 0.0 && c.is_finite()).then(|| (self.n_theta + d.p, 1.0 / c))
     }
 }
 
@@ -742,9 +850,15 @@ impl GradSearch<'_, '_> {
 /// formed at the endpoint (a non-PD Schur) NaN-fills the SE outputs alone and
 /// sets `GlmmFit::se_unavailable`.
 ///
-/// `map` is the column standardization `x` carries: β̂ and every SE output
-/// are reported through it (`ColumnScaling::IDENTITY` for a design fitted
-/// as given).
+/// `map` is the column map `x` carries: β̂ and every SE output are reported
+/// through it. The θ search uses one trust radius for all coordinates, so it
+/// assumes every column a random-effect block reads as a slope is in units of
+/// its own spread (standard deviation 1, or root mean square 1 where it is not
+/// centered). `fit_on` provides that: `ColumnScaling::compute` scales those
+/// columns even for a design fitted as given (`standardize` false), so `map`
+/// is the identity only when no random-effect block has a slope. A direct
+/// caller that passes an unscaled slope column searches θ in that column's
+/// units.
 #[allow(clippy::too_many_arguments)]
 pub fn fit_glmm(
     ws: &mut GlmmWorkspace,
@@ -901,6 +1015,7 @@ pub fn fit_glmm(
     ws.gradient_search_fallback = false;
     ws.grad_report = None;
     ws.grad_hint_ready = false;
+    ws.search_units = 1.0;
     // A caller's hint applies to this call only.
     let grad_hint = ws.grad_hint_in.take();
     ws.exact_prof.curv_memory = false;
@@ -1265,23 +1380,29 @@ pub fn fit_glmm(
     let mut grad_done: Option<(bool, usize, bool, f64)> = None;
     let mut grad_spent = 0usize;
     let mut grad_fell_back = false;
+    let total_dim = n_theta + p + n_disp;
     if grad_route {
         use crate::optim::bfgs::{bfgs_minimize, BfgsStop};
-        let m = n_theta + p;
-        debug_assert!(n_disp == 0 && params.len() == m);
+        // A free Gamma dispersion is searched as the trailing `ψ = ln φ`,
+        // from the seed above and on the BOBYQA route's box; on the inverse
+        // link with its start curvature (`GradSearch::start_curvature`) unless
+        // a hint is given. A held one leaves the search on `[θ | β̃]`.
+        let free_phi = is_gamma && held_phi.is_none();
+        let m = grad_search_dim(family, n_theta, p, held_phi.is_some());
+        debug_assert!((n_disp == 0 || is_gamma) && params.len() == total_dim);
         if guard_cache.is_some() {
             // A warm fit: the guard profiled β at the θ it picked.
-            params[n_theta..m].copy_from_slice(&guard_beta[..p]);
+            params[n_theta..nb_col].copy_from_slice(&guard_beta[..p]);
         }
-        // The search's start, for a hand-over from the plateau below, and the
-        // objective's last point: workspace scratch, so a refit allocates
-        // nothing here.
-        grad_scratch.resize(2 * m, 0.0);
+        // The search's start (length m), for a hand-over from the plateau
+        // below, and the objective's last `[θ | β]` (length `n_θ + p`):
+        // workspace scratch, so a refit allocates nothing here.
+        grad_scratch.resize(m + nb_col, 0.0);
         let (grad_start, x_last) = grad_scratch.split_at_mut(m);
         grad_start.copy_from_slice(&params[..m]);
         x_last.fill(0.0);
         beta_scale.set(x, &prior_w[..n], n);
-        beta_scale.to_search(&mut params[n_theta..m]);
+        beta_scale.to_search(&mut params[n_theta..nb_col]);
         let mut obj = GradSearch {
             data: &data,
             nb_theta,
@@ -1303,6 +1424,10 @@ pub fn fit_glmm(
             beta_scale,
             x_last,
             last_ok: false,
+            gamma_phi: held_phi.unwrap_or(1.0),
+            ln_phi: held_phi.map_or(0.0, f64::ln),
+            free_phi,
+            sum_ln_y: gamma_sum_ln_y,
             k,
             n_theta,
         };
@@ -1351,7 +1476,10 @@ pub fn fit_glmm(
             grad_done = Some((true, n_val, false, best));
         } else if rung == 3 {
             // Rung 3: the joint polish from the endpoint. Its own points alone
-            // are judged by the `NON_FINITE_RADIUS` check.
+            // are judged by the `NON_FINITE_RADIUS` check. The joint solver is
+            // sized `total_dim`, so under a held φ it gets the inert `ln φ`
+            // slot too (the objective ignores it): on a shorter vector BOBYQA
+            // refuses to start.
             obj.non_finite_points.clear();
             let mut finite = 0usize;
             let mut pol_best = best;
@@ -1369,15 +1497,19 @@ pub fn fit_glmm(
                     }
                     f
                 }),
-                &mut params[..m],
-                &lower[..m],
-                &upper[..m],
+                &mut params[..total_dim],
+                &lower[..total_dim],
+                &upper[..total_dim],
             );
             let ok = matches!(out.status, Status::Converged | Status::MaxFunReached)
                 && pol_best.is_finite()
                 && finite >= 2
                 && !(out.status == Status::Converged
-                    && any_within(obj.non_finite_points, &params[..m], NON_FINITE_RADIUS));
+                    && any_within(
+                        obj.non_finite_points,
+                        &params[..total_dim],
+                        NON_FINITE_RADIUS,
+                    ));
             grad_done = Some((
                 ok,
                 n_val + out.n_eval,
@@ -1400,7 +1532,26 @@ pub fn fit_glmm(
             *gradient_search_fallback =
                 !far && matches!(bo.stop, BfgsStop::LineSearch | BfgsStop::MaxIter);
         }
-        beta_scale.to_caller(&mut params[n_theta..m]);
+        // The dispersion-bound check of the joint search below (which
+        // explains it), on a converged endpoint with a free Gamma φ: one solve
+        // at ψ's lower bound, every other coordinate held, kept when lower.
+        // Counted as an evaluation, as the saddle walk's tries are; its PIRLS
+        // exhaustion is not counted, as the joint check's is not.
+        if let Some(done) = grad_done.as_mut().filter(|d| free_phi && d.0 && !d.2) {
+            let psi = params[nb_col];
+            params[nb_col] = lower[nb_col];
+            done.1 += 1;
+            let exhausted = *obj.pirls_exhausted;
+            match crate::optim::Objective::value(&mut obj, &params[..m], 0.0) {
+                Some(f) if f < done.3 => {
+                    done.3 = f;
+                    obj.u_inc[..k].copy_from_slice(&obj.pirls.u[..k]);
+                }
+                _ => params[nb_col] = psi,
+            }
+            *obj.pirls_exhausted = exhausted;
+        }
+        beta_scale.to_caller(&mut params[n_theta..nb_col]);
         if far {
             // From the plateau the BOBYQA route restarts where the search
             // started, the guard's pick, not at the endpoint out on it.
@@ -1435,7 +1586,6 @@ pub fn fit_glmm(
     // fallback found `PqlThenJoint` reaches the same optimum from every start
     // it was tried from, so restarting from the ORIGINAL point is exactly as
     // good as any other and never rewards the failed attempt's own excursion.
-    let total_dim = n_theta + p + n_disp;
     start_point[..total_dim].copy_from_slice(&params[..total_dim]);
 
     // `PqlThenJoint` fallback (`Note::ExactProfileFallback`): an `ExactProfile`
@@ -1684,16 +1834,23 @@ pub fn fit_glmm(
                     // plug-in seed lie within one cold radius
                     // (`config_stage1.rho_begin`) of the conditional optimum? From
                     // the plug-in seed (a cold fit, or a warm θ without a carried
-                    // φ) that is `|g|/c`. Two other readings failed. Gating on the
-                    // search's own radius halved the gate on a warm θ and rejected
-                    // a seed the cold fit accepts (`gami_q4` from a 5% perturbed
-                    // optimum: 1578 evaluations against 364 cold, 368 on the cold
-                    // radius). Gating a carried φ (`StartValues::dispersion`) on
-                    // its own distance passes it whenever it is close, which it is
-                    // by construction, also where the dispersion is coupled to θ
+                    // φ) that is `|g|/c`; from any other `ln φ` (a carried φ, or the
+                    // incumbent of a gradient search that handed over) it is the
+                    // distance from `ln_phi_plug`. Two other readings failed.
+                    // Gating on the search's own radius halved the gate on a warm θ
+                    // and rejected a seed the cold fit accepts (`gami_q4` from a 5%
+                    // perturbed optimum: 1578 evaluations against 364 cold, 368 on
+                    // the cold radius). Gating a carried φ (`StartValues::dispersion`)
+                    // on its own distance passes it whenever it is close, which it
+                    // is by construction, also where the dispersion is coupled to θ
                     // and scaling slows the search (`gaml_q2s` from a carried φ̂:
                     // 94 evaluations scaled, 44 unscaled, 52 cold). The probes
-                    // stay at `±h`, so BOBYQA's first design still meets them.
+                    // stay at `±h`, so on a kept warm θ BOBYQA's first design still
+                    // meets them. After a gradient search hands over, BOBYQA starts
+                    // at the warm radius but the probes keep the cold one: on the
+                    // 64 hand-overs of the Gamma gate cells (both links, caps 1 to
+                    // 8 iterations) that took 5673 evaluations, against 5781 with
+                    // probes at the warm radius.
                     let h_cold = config_stage1.rho_begin;
                     let j = n1 - 1;
                     let x0: Vec<f64> = params_stage1.to_vec();
@@ -1729,7 +1886,7 @@ pub fn fit_glmm(
                     let c = (fv[1] + fv[2] - 2.0 * fv[0]) / (h * h);
                     let g = (fv[1] - fv[2]) / (2.0 * h);
                     let mut s = 1.0f64;
-                    let decoupled = if ws.gamma_phi_start.is_some() {
+                    let decoupled = if ws.gamma_phi_start.is_some() || grad_fell_back {
                         (ln_phi_plug - (x0[j] - g / c)).abs() <= DISP_SCALE_GATE * h_cold
                     } else {
                         g.abs() <= DISP_SCALE_GATE * h_cold * c
@@ -2136,7 +2293,8 @@ pub fn fit_glmm(
                     // the two apart: when it is lower, the incumbent moves there (for
                     // Gamma the on-bound refusal below then applies). At an interior
                     // optimum the bound point is worse and nothing moves. Not a search
-                    // evaluation: own counters, `n_eval` unchanged.
+                    // evaluation: own counters, `n_eval` unchanged. The gradient
+                    // route runs the same check on its endpoint — change together.
                     if n_disp == 1 && held_phi.is_none() && out.status == Status::Converged {
                         let ln_phi = params[nb_col];
                         params[nb_col] = if is_gamma {
@@ -3214,6 +3372,9 @@ pub(crate) fn separated_fit(
     ws.pirls_exhausted = 0;
     ws.final_pirls_exhausted = false;
     ws.exact_profile_fallback = false;
+    ws.gradient_search_fallback = false;
+    ws.grad_report = None;
+    ws.grad_hint_ready = false;
     ws.counters.reset();
     let mut fit = nan_fit(ws, targets, 0);
     fit.separated = true;

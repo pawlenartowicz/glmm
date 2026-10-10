@@ -77,6 +77,111 @@ fn bfgs_solves_a_quadratic_and_certifies() {
     assert!(out.certified(&x, &[0, 2]), "{out:?}");
 }
 
+/// The decrease floor (`Fdelta`, `NoiseFloor`) is per route: on a flat
+/// quartic valley, whose decreases shrink geometrically while the gradient
+/// stays above `pgrad_tol`, the GLMM route's 1e-10 searches past the LMM
+/// route's 1e-9.
+#[test]
+fn bfgs_fdelta_floor_is_finer_on_the_glmm_route() {
+    let f = |x: &[f64]| 1e5 * x[0].powi(4);
+    let g = |x: &[f64], g: &mut [f64]| g[0] = 4e5 * x[0].powi(3);
+    let run = |cfg: &BfgsConfig| {
+        let mut obj = closed(f, g);
+        let mut x = [0.05];
+        let out = bfgs_minimize(
+            &mut obj,
+            &mut x,
+            &[-1.0],
+            &[1.0],
+            cfg,
+            &mut BfgsState::default(),
+            None,
+        );
+        (out.stop, out.f)
+    };
+    let (lmm_stop, lmm_f) = run(&BfgsConfig::LMM);
+    let (glmm_stop, glmm_f) = run(&BfgsConfig::GLMM);
+    let floor_stop = |s| matches!(s, BfgsStop::Fdelta | BfgsStop::NoiseFloor);
+    assert!(floor_stop(lmm_stop), "{lmm_stop:?} {lmm_f}");
+    assert!(floor_stop(glmm_stop), "{glmm_stop:?} {glmm_f}");
+    assert!(glmm_f < 0.5 * lmm_f, "GLMM {glmm_f} vs LMM {lmm_f}");
+}
+
+/// The start-curvature seed, on `f = ½·Σ cᵢ(xᵢ − x*ᵢ)²` with `c = (1, 1,
+/// 1e4)` and the stiff coordinate seeded with its exact `1/c₂`. The first step
+/// takes coordinate 2 to its optimum unscaled while the 0.5 first-step cap
+/// shrinks the other two (from `(3, −2)` to `(0.5, −1/3)`). Shanno's scale,
+/// read over coordinates 0 and 1 only, is their own curvature 1, so the
+/// second step is the Newton step to `x*`; read over all three it would be
+/// about 1e-4. A caller's `h0` overrides the seed: the objective is not
+/// asked, and the first trial is the uncapped `x₀ − h0·g`.
+#[test]
+fn bfgs_start_curvature_seeds_one_coordinate() {
+    struct Seeded<F, G> {
+        inner: Closed<F, G>,
+        seed: Option<(usize, f64)>,
+        asked: std::cell::Cell<usize>,
+        points: Vec<Vec<f64>>,
+    }
+    impl<F: FnMut(&[f64]) -> f64, G: FnMut(&[f64], &mut [f64])> Objective for Seeded<F, G> {
+        fn value(&mut self, x: &[f64], resolution: f64) -> Option<f64> {
+            self.points.push(x.to_vec());
+            self.inner.value(x, resolution)
+        }
+    }
+    impl<F: FnMut(&[f64]) -> f64, G: FnMut(&[f64], &mut [f64])> GradObjective for Seeded<F, G> {
+        fn gradient(&mut self, g: &mut [f64]) -> bool {
+            self.inner.gradient(g)
+        }
+        fn start_curvature(&self) -> Option<(usize, f64)> {
+            self.asked.set(self.asked.get() + 1);
+            self.seed
+        }
+    }
+    let (c, xs) = ([1.0, 1.0, 1e4], [3.0, -2.0, 0.5]);
+    let run = |h0: Option<&[f64]>| {
+        let mut obj = Seeded {
+            inner: closed(
+                |x: &[f64]| (0..3).map(|i| 0.5 * c[i] * (x[i] - xs[i]).powi(2)).sum(),
+                |x: &[f64], g: &mut [f64]| (0..3).for_each(|i| g[i] = c[i] * (x[i] - xs[i])),
+            ),
+            seed: Some((2, 1.0 / c[2])),
+            asked: std::cell::Cell::new(0),
+            points: Vec::new(),
+        };
+        let mut x = [0.0; 3];
+        let out = bfgs_minimize(
+            &mut obj,
+            &mut x,
+            &[-1e5; 3],
+            &[1e5; 3],
+            &BfgsConfig::GLMM,
+            &mut BfgsState::default(),
+            h0,
+        );
+        (x, out, obj.asked.get(), obj.points)
+    };
+    let (x, out, asked, points) = run(None);
+    assert_eq!(asked, 1, "the seed is asked for once");
+    let first = &points[1];
+    assert!(
+        (first[0] - 0.5).abs() < 1e-15
+            && (first[1] + 1.0 / 3.0).abs() < 1e-15
+            && (first[2] - 0.5).abs() < 1e-15,
+        "first trial {first:?}"
+    );
+    let second = &points[2];
+    for i in 0..3 {
+        assert!((second[i] - xs[i]).abs() < 1e-12, "second trial {second:?}");
+        assert!((x[i] - xs[i]).abs() < 1e-12, "endpoint {x:?}");
+    }
+    assert_eq!(out.stop, BfgsStop::Pgrad, "{out:?}");
+    let eye = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let (_, _, asked, points) = run(Some(&eye));
+    assert_eq!(asked, 0, "a hint keeps the seed out");
+    assert_eq!(points[1], vec![3.0, -2.0, 5000.0], "hinted first trial");
+}
+
 #[test]
 fn bfgs_reaches_the_rosenbrock_minimum() {
     let f = |x: &[f64]| 100.0 * (x[1] - x[0] * x[0]).powi(2) + (1.0 - x[0]).powi(2);

@@ -127,8 +127,8 @@ class HessianSeFallbackWarning(DiagnosticWarning):
 
 class GradientSearchFallbackWarning(DiagnosticWarning):
     """The gradient search (used on linear mixed models whose random slopes
-    are all on one grouping, and on binomial and Poisson GLMMs fitted by the
-    Laplace approximation) did not converge, so the standard derivative-free
+    are all on one grouping, and on binomial, Poisson and Gamma GLMMs fitted
+    by the Laplace approximation) did not converge, so the standard derivative-free
     search continued from the best point it had reached.
 
     The reported estimates and `converged` come from that second search,

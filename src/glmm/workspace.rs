@@ -105,6 +105,10 @@ pub(crate) struct PirlsScratch<T: Scalar> {
     /// Rows the `f64` AGQ node sums hand back to the generic per-row
     /// deviance (`agq_fast`'s guard), sized on first use.
     pub agq_slow: Vec<u32>,
+    /// The penalized deviance `d(y,ũ) + ‖ũ‖²` of the last Laplace
+    /// `laplace_deviance` solve (on the weights `wᵢ/φ` on Gamma), `log|A|`
+    /// excluded. Written there only; NaN until then.
+    pub pen_dev: f64,
 }
 
 impl<T: Scalar> PirlsScratch<T> {
@@ -129,6 +133,7 @@ impl<T: Scalar> PirlsScratch<T> {
             bt_rows: Vec::new(),
             agq_rows: Vec::new(),
             agq_slow: Vec::new(),
+            pen_dev: f64::NAN,
         }
     }
 
@@ -959,9 +964,10 @@ pub struct GlmmWorkspace {
     /// endpoint decrement `½·gᵀHg`, and the rung the route finished on (0 a
     /// certified endpoint, 3 the joint polish, 1 the hand-over to BOBYQA).
     pub(crate) grad_report: Option<(crate::optim::bfgs::BfgsStop, usize, f64, u8)>,
-    /// The gradient search's two `n_θ + p` buffers (its start, for a hand-over
-    /// from the plateau, and the objective's last point), sized on the first
-    /// routed fit so a refit allocates nothing for them.
+    /// The gradient search's two buffers: its start, for a hand-over from the
+    /// plateau (`n_θ + p`, + 1 on a free Gamma dispersion), and the
+    /// objective's last `[θ | β]` (`n_θ + p`). Sized on the first routed fit
+    /// so a refit allocates nothing for them.
     pub(crate) grad_scratch: Vec<f64>,
     /// The caller's curvature hint for the next `fit_glmm` (`fit_on_hinted`),
     /// taken (and so cleared) by that fit: a hint never outlives its call.
@@ -970,6 +976,9 @@ pub struct GlmmWorkspace {
     /// Hessian at least once, so `bfgs` holds an estimate a curvature hint can
     /// be taken from. Reset at the top of every `fit_glmm`.
     pub(crate) grad_hint_ready: bool,
+    /// The response units `c` the last `fit_glmm` ran in (the kernel fits
+    /// `y/c`), set by `fit::glmm::fit_glmm_in_units`; 1 otherwise.
+    pub(crate) search_units: f64,
     /// PIRLS scratch (sized max_n / k) — see [`PirlsScratch`].
     pub(crate) pirls: PirlsScratch<f64>,
     /// Row-major f64 copy of every random-slope column of x, filled once per
@@ -1292,8 +1301,7 @@ impl GlmmWorkspace {
         // Route per shape (see `OuterSearch` and the `Joint` threshold's
         // measurement further down). The joint solver's start radius follows
         // it: the whole search on `Joint`, a polish of stage 1's optimum otherwise.
-        let route_plan =
-            super::gradient_route_plan(family, nagq, layout, &groupings, n_theta, n_disp);
+        let route_plan = super::gradient_route_plan(family, nagq, layout, &groupings, n_theta);
         let exact_shape = super::exact_profile_shape(nagq, layout);
         let outer_search = if exact_shape {
             OuterSearch::ExactProfile
@@ -1453,6 +1461,7 @@ impl GlmmWorkspace {
             grad_scratch: Vec::new(),
             grad_hint_in: None,
             grad_hint_ready: false,
+            search_units: 1.0,
             pirls: PirlsScratch::for_shape(max_n, k, q, n_primary, nagq).with_profile_rows(
                 if layout == GlmmLayout::Packed {
                     0

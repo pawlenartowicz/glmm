@@ -77,37 +77,58 @@ Full script, plus the goldens cross-check:
 
 ```
 converged: True  singular: False
-name             estimate    std.error          z          p
-(Intercept)         251.4        6.825      36.84 4.497e-297
-Days                10.47        1.546      6.771  1.275e-11
+Linear mixed model fit by REML [glmm]
+Formula: Reaction ~ Days + (1 + Days | Subject)
+ Family: gaussian (identity)
+
+REML criterion at convergence: 1743.6
+
+Scaled residuals:
+    Min      1Q  Median     3Q   Max
+ -3.954 -0.4634 0.02312 0.4634 5.179
 
 Random effects:
-  Subject:
-    (Intercept)  sd      24.74  se        nan  corr    1.000
-    Days         sd      5.922  se        nan  corr    0.066    1.000
+ Groups   Name        Variance Std.Dev. se Corr
+ Subject  (Intercept) 612.1    24.74    NA     
+          Days        35.07    5.922    NA 0.07
+ Residual             654.9    25.59           
+Number of obs: 180, groups:  Subject, 18
 
-dispersion: 654.941   converged: True   singular: False
-Subject stddevs: [24.74043132  5.9221323 ]
-Subject corr: [[1.0, 0.06555162566840655], [0.06555162566840655, 1.0]]
-loglik (REML crit): -871.814135979251  reml: True
-dispersion (residual sigma^2): 654.9411291155503
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)         251.4        6.825      36.84     <2e-16 ***
+Days                10.47        1.546      6.771   1.27e-11 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+             (Intercept)
+Days              -0.138
+
+Optimizer evaluations: 12, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+Subject stddevs: [24.74045614  5.92213187]
+Subject corr: [[1.0, 0.06555150641110637], [0.06555150641110637, 1.0]]
+loglik (REML crit): -871.8141359792539  reml: True
+dispersion (residual sigma^2): 654.9410288970543
 
 oracle cross-check vs goldens/sleepstudy_lmm.json (manifest rung 2):
-  beta[Intercept]              got=251.4051048        ref=251.4051048        rel_err=0  tol=0.001  [PASS]
-  beta[Days]                   got=10.46728596        ref=10.46728596        rel_err=1.26e-14  tol=0.001  [PASS]
-  se[Intercept]                got=6.824552619        ref=6.824596695        rel_err=6.46e-06  tol=0.001  [PASS]
-  se[Days]                     got=1.545788748        ref=1.545789644        rel_err=5.79e-07  tol=0.001  [PASS]
-  Subject sd[Intercept]        got=24.74043132        ref=24.74065799        rel_err=9.16e-06  tol=0.001  [PASS]
-  Subject sd[Days]             got=5.922132304        ref=5.922137659        rel_err=9.04e-07  tol=0.001  [PASS]
-  loglik (REML crit)           got=-871.814136        ref=-871.814136        abs_err=7.25e-10  tol=2e-06  [PASS]
+  beta[Intercept]              got=251.4051048        ref=251.4051048        rel_err=1.36e-15  tol=0.001  [PASS]
+  beta[Days]                   got=10.46728596        ref=10.46728596        rel_err=4.07e-15  tol=0.001  [PASS]
+  se[Intercept]                got=6.824557476        ref=6.824596695        rel_err=5.75e-06  tol=0.001  [PASS]
+  se[Days]                     got=1.545788634        ref=1.545789644        rel_err=6.53e-07  tol=0.001  [PASS]
+  Subject sd[Intercept]        got=24.74045614        ref=24.74065799        rel_err=8.16e-06  tol=0.001  [PASS]
+  Subject sd[Days]             got=5.922131871        ref=5.922137659        rel_err=9.77e-07  tol=0.001  [PASS]
+  loglik (REML crit)           got=-871.814136        ref=-871.814136        abs_err=7.22e-10  tol=2e-06  [PASS]
 ```
 
-The number a newcomer misreads is the `0.066` correlation between the
-intercept and the slope, printed as `corr` on the `Days` row. It says
+The number a newcomer misreads is the `0.07` correlation between the
+intercept and the slope, in the `Corr` column on the `Days` row (`Subject
+corr` below the summary prints it unrounded, 0.0656). It says
 subjects who start slower (`(Intercept)`) barely differ from subjects who
 start faster in *how fast their reaction time then degrades* — a small,
 near-zero correlation, not the two variance components themselves (24.74 and
-5.92, on very different scales already). Reading it as "the slope is 0.066"
+5.92, on very different scales already). Reading it as "the slope is 0.07"
 or as a fraction of variance explained is the mistake; it is a correlation
 coefficient between two random effects, bounded in [-1, 1].
 
@@ -135,7 +156,6 @@ data = {
     "sample": [r["sample"] for r in rows],
 }
 
-# NOTE: no bare "1" fixed-effect term (the intercept is always implicit).
 fit = glmm.fit(data, "diameter ~ (1 | plate) + (1 | sample)")
 
 assert fit.converged
@@ -147,25 +167,40 @@ Full script, plus the goldens cross-check:
 
 ```
 converged: True  singular: False
-name             estimate    std.error          z          p
-(Intercept)         22.97       0.8086      28.41 1.487e-177
+Linear mixed model fit by REML [glmm]
+Formula: diameter ~ (1 | plate) + (1 | sample)
+ Family: gaussian (identity)
+
+REML criterion at convergence: 330.86
+
+Scaled residuals:
+    Min      1Q  Median     3Q  Max
+ -2.079 -0.6714 0.06292 0.5838 2.98
 
 Random effects:
-  plate:
-    (Intercept)  sd     0.8467  se        nan  corr    1.000
-  sample:
-    (Intercept)  sd      1.932  se        nan  corr    1.000
+ Groups   Name        Variance Std.Dev. se Corr
+ plate    (Intercept) 0.7169   0.8467   NA     
+ sample   (Intercept) 3.731    1.932    NA     
+ Residual             0.3024   0.5499          
+Number of obs: 144, groups:  plate, 24; sample, 6
 
-dispersion: 0.302415   converged: True   singular: False
-plate stddev: 0.8467044317
-sample stddev: 1.931558312
-loglik (REML crit): -165.4302944955325  reml: True
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)         22.97       0.8086      28.41     <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Optimizer evaluations: 46, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+plate stddev: 0.8467045342
+sample stddev: 1.931557938
+loglik (REML crit): -165.43029449553177  reml: True
 
 oracle cross-check vs goldens/penicillin_lmm.json (manifest rung 3):
-  beta[Intercept]              got=22.97222222        ref=22.97222222        rel_err=4.55e-14  tol=0.001  [PASS]
-  se[Intercept]                got=0.8085733584       ref=0.8085953614       rel_err=2.72e-05  tol=0.001  [PASS]
-  plate stddev                 got=0.8467044317       ref=0.8467025103       rel_err=2.27e-06  tol=0.001  [PASS]
-  sample stddev                got=1.931558312        ref=1.931613792        rel_err=2.87e-05  tol=0.001  [PASS]
+  beta[Intercept]              got=22.97222222        ref=22.97222222        rel_err=4.76e-14  tol=0.001  [PASS]
+  se[Intercept]                got=0.8085732141       ref=0.8085953614       rel_err=2.74e-05  tol=0.001  [PASS]
+  plate stddev                 got=0.8467045342       ref=0.8467025103       rel_err=2.39e-06  tol=0.001  [PASS]
+  sample stddev                got=1.931557938        ref=1.931613792        rel_err=2.89e-05  tol=0.001  [PASS]
   loglik (REML crit)           got=-165.4302945       ref=-165.4302945       abs_err=4.27e-09  tol=2e-06  [PASS]
 ```
 
@@ -211,24 +246,39 @@ Full script, plus the goldens cross-check:
 
 ```
 converged: True  singular: False
-name             estimate    std.error          z          p
-(Intercept)         60.05       0.6769      88.72          0
+Linear mixed model fit by REML [glmm]
+Formula: strength ~ (1 | batch/cask)
+ Family: gaussian (identity)
+
+REML criterion at convergence: 246.99
+
+Scaled residuals:
+   Min      1Q   Median    3Q  Max
+ -1.48 -0.5156 0.009498 0.472 1.39
 
 Random effects:
-  batch:
-    (Intercept)  sd      1.287  se        nan  corr    1.000
-  batch:cask:
-    (Intercept)  sd      2.904  se        nan  corr    1.000
+ Groups     Name        Variance Std.Dev. se Corr
+ batch      (Intercept) 1.657    1.287    NA     
+ batch:cask (Intercept) 8.434    2.904    NA     
+ Residual               0.678    0.8234          
+Number of obs: 60, groups:  batch, 10; batch:cask, 30
 
-dispersion: 0.678001   converged: True   singular: False
-loglik (REML crit): -123.49537292706944
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)         60.05       0.6769      88.72     <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Optimizer evaluations: 31, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+loglik (REML crit): -123.49537292741952
 
 oracle cross-check vs goldens/pastes_lmm.json (manifest rung 4):
-  beta[Intercept]              got=60.05333333        ref=60.05333333        rel_err=1.61e-14  tol=0.001  [PASS]
-  se[Intercept]                got=0.676868586        ref=0.6768702151       rel_err=2.41e-06  tol=0.001  [PASS]
-  batch stddev                 got=1.287358607        ref=1.287365881        rel_err=5.65e-06  tol=0.001  [PASS]
-  batch:cask stddev            got=2.90407562         ref=2.904077466        rel_err=6.36e-07  tol=0.001  [PASS]
-  loglik (REML crit)           got=-123.4953729       ref=-123.4953729       abs_err=3.25e-10  tol=2e-06  [PASS]
+  beta[Intercept]              got=60.05333333        ref=60.05333333        rel_err=7.58e-14  tol=0.001  [PASS]
+  se[Intercept]                got=0.6768731631       ref=0.6768702151       rel_err=4.36e-06  tol=0.001  [PASS]
+  batch stddev                 got=1.287383546        ref=1.287365881        rel_err=1.37e-05  tol=0.001  [PASS]
+  batch:cask stddev            got=2.904074666        ref=2.904077466        rel_err=9.64e-07  tol=0.001  [PASS]
+  loglik (REML crit)           got=-123.4953729       ref=-123.4953729       abs_err=6.76e-10  tol=2e-06  [PASS]
 ```
 
 The two variance components here are easy to mix up: `batch` (10 levels,
@@ -281,30 +331,52 @@ Full script, plus the goldens cross-check:
 
 ```
 converged: True  singular: False
-name             estimate    std.error          z          p
-(Intercept)        -1.399       0.2325     -6.016  1.789e-09
-period2           -0.9923       0.3066     -3.236   0.001212
-period3            -1.129       0.3266     -3.455  0.0005494
-period4             -1.58       0.4274     -3.697   0.000218
+Generalized linear mixed model fit by maximum likelihood (Laplace Approximation) [glmm]
+Formula: prop ~ period + (1 | herd)
+ Family: binomial (logit)
+
+    AIC    BIC  logLik deviance df.resid
+ 194.05 204.18 -92.026   184.05       51
+
+Scaled residuals:
+    Min      1Q  Median     3Q  Max
+ -2.382 -0.7888 -0.2024 0.5146 2.88
 
 Random effects:
-  herd:
-    (Intercept)  sd     0.6423  se     0.1786  corr    1.000
+ Groups Name        Variance Std.Dev. se     Corr
+ herd   (Intercept) 0.4125   0.6423   0.1786     
+Number of obs: 56, groups:  herd, 15
 
-dispersion: 1   converged: True   singular: False
-herd stddev: 0.6422614366557076
-loglik: -92.02628186475727
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)        -1.399       0.2325     -6.016   1.79e-09 ***
+period2           -0.9923       0.3066     -3.236    0.00121 **
+period3            -1.129       0.3266     -3.455   0.000549 ***
+period4             -1.58       0.4274     -3.697   0.000218 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+             (Intercept)     period2     period3
+period2           -0.364
+period3           -0.340       0.278
+period4           -0.261       0.212       0.196
+
+Optimizer evaluations: 12, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+herd stddev: 0.6422614489970626
+loglik: -92.02628186475712
 
 oracle cross-check vs goldens/cbpp_agq_k1.json (manifest rung 5, nagq=1):
-  beta[(Intercept)]            got=-1.398532067       ref=-1.398532044       rel_err=1.64e-08  tol=0.001  [PASS]
-  beta[period2]                got=-0.9923328153      ref=-0.9923158803      rel_err=1.71e-05  tol=0.001  [PASS]
-  beta[period3]                got=-1.128672188       ref=-1.128664147       rel_err=7.12e-06  tol=0.001  [PASS]
-  beta[period4]                got=-1.580313861       ref=-1.580315598       rel_err=1.1e-06  tol=0.001  [PASS]
-  se_hessian[(Intercept)]      got=0.2324738116       ref=0.2324732548       rel_err=2.4e-06  tol=0.001  [PASS]
-  se_hessian[period2]          got=0.3066431739       ref=0.3066413264       rel_err=6.02e-06  tol=0.001  [PASS]
-  se_hessian[period3]          got=0.3266383584       ref=0.3266372426       rel_err=3.42e-06  tol=0.001  [PASS]
-  se_hessian[period4]          got=0.427436017        ref=0.4274372446       rel_err=2.87e-06  tol=0.001  [PASS]
-  herd stddev                  got=0.6422614367       ref=0.6422698887       rel_err=1.32e-05  tol=0.001  [PASS]
+  beta[(Intercept)]            got=-1.398532142       ref=-1.398532044       rel_err=7.07e-08  tol=0.001  [PASS]
+  beta[period2]                got=-0.9923327348      ref=-0.9923158803      rel_err=1.7e-05  tol=0.001  [PASS]
+  beta[period3]                got=-1.128672084       ref=-1.128664147       rel_err=7.03e-06  tol=0.001  [PASS]
+  beta[period4]                got=-1.580313885       ref=-1.580315598       rel_err=1.08e-06  tol=0.001  [PASS]
+  se_hessian[(Intercept)]      got=0.2324719924       ref=0.2324732548       rel_err=5.43e-06  tol=0.001  [PASS]
+  se_hessian[period2]          got=0.3066424979       ref=0.3066413264       rel_err=3.82e-06  tol=0.001  [PASS]
+  se_hessian[period3]          got=0.3266378505       ref=0.3266372426       rel_err=1.86e-06  tol=0.001  [PASS]
+  se_hessian[period4]          got=0.4274365866       ref=0.4274372446       rel_err=1.54e-06  tol=0.001  [PASS]
+  herd stddev                  got=0.642261449        ref=0.6422698887       rel_err=1.31e-05  tol=0.001  [PASS]
   loglik                       got=-92.02628186       ref=-92.02628187       abs_err=9.75e-09  tol=0.001  [PASS]
 ```
 
@@ -355,26 +427,48 @@ is a run, not an oracle-pinned result.
 
 ```
 converged: True  singular: False
-name             estimate    std.error          z          p
-(Intercept)         11.25         1.39      8.097   5.63e-16
-YEAR96              1.137       0.2397      4.745  2.088e-06
-YEAR97             -1.018        0.269     -3.784  0.0001545
-HEIGHT           -0.02323     0.002985     -7.781   7.21e-15
+Generalized linear mixed model fit by maximum likelihood (Laplace Approximation) [glmm]
+Formula: TICKS ~ YEAR + HEIGHT + (1 | BROOD)
+ Family: poisson (log)
+
+    AIC    BIC  logLik deviance df.resid
+ 1988.1 2008.1 -989.04   1978.1      398
+
+Scaled residuals:
+    Min      1Q  Median     3Q   Max
+ -3.044 -0.7817 -0.4198 0.6507 5.647
 
 Random effects:
-  BROOD:
-    (Intercept)  sd     0.9457  se        nan  corr    1.000
+ Groups Name        Variance Std.Dev. se      Corr
+ BROOD  (Intercept) 0.9019   0.9497   0.08458     
+Number of obs: 403, groups:  BROOD, 118
 
-dispersion: 1   converged: True   singular: False
-BROOD stddev: 0.945727072876557
-loglik: -989.0649432849432
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)         11.54        1.399      8.252     <2e-16 ***
+YEAR96              1.136       0.2424      4.686   2.78e-06 ***
+YEAR97             -1.001       0.2697     -3.712   0.000206 ***
+HEIGHT           -0.02387     0.003011     -7.927   2.24e-15 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+             (Intercept)      YEAR96      YEAR97
+YEAR96            -0.135
+YEAR97            -0.152       0.513
+HEIGHT            -0.991       0.034       0.064
+
+Optimizer evaluations: 11, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+BROOD stddev: 0.9496951397960821
+loglik: -989.0377405264944
 
 (no manifest rung matches this formula -- a run, not an oracle-pinned result)
 ```
 
 The coefficients on `YEAR96` and `YEAR97` are both contrasts against
 `YEAR95` (the first level), not against each other — `YEAR96`'s positive
-1.14 and `YEAR97`'s negative -1.02 do not mean 1996 and 1997 are opposite in
+1.14 and `YEAR97`'s negative -1.00 do not mean 1996 and 1997 are opposite in
 sign relative to *each other*; they mean 1996 had noticeably more ticks than
 1995, and 1997 noticeably fewer, each measured against the same 1995
 baseline.
@@ -385,7 +479,7 @@ Recipe 4's model again, but integrated over the random effect with a
 7-point adaptive Gauss-Hermite quadrature instead of the `nagq=1` Laplace
 default. Eligible here because the model has a single grouping factor
 (`herd`) with one random effect per level (`q=1`) — AGQ's current cap is
-`q<=3` on a single binomial/Poisson grouping factor.
+`q<=3` on a single binomial/Poisson/negative-binomial/Gamma grouping factor.
 
 ```python
 fit_laplace = glmm.fit(data, "prop ~ period + (1 | herd)", family="binomial", weights=size, nagq=1)
@@ -404,51 +498,95 @@ output for this fit (see the reading below).
 
 ```
 === nagq=1 (Laplace) ===
-name             estimate    std.error          z          p
-(Intercept)        -1.399       0.2325     -6.016  1.789e-09
-period2           -0.9923       0.3066     -3.236   0.001212
-period3            -1.129       0.3266     -3.455  0.0005494
-period4             -1.58       0.4274     -3.697   0.000218
+Generalized linear mixed model fit by maximum likelihood (Laplace Approximation) [glmm]
+Formula: prop ~ period + (1 | herd)
+ Family: binomial (logit)
+
+    AIC    BIC  logLik deviance df.resid
+ 194.05 204.18 -92.026   184.05       51
+
+Scaled residuals:
+    Min      1Q  Median     3Q  Max
+ -2.382 -0.7888 -0.2024 0.5146 2.88
 
 Random effects:
-  herd:
-    (Intercept)  sd     0.6423  se     0.1786  corr    1.000
+ Groups Name        Variance Std.Dev. se     Corr
+ herd   (Intercept) 0.4125   0.6423   0.1786     
+Number of obs: 56, groups:  herd, 15
 
-dispersion: 1   converged: True   singular: False
-loglik: -92.02628186475727
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)        -1.399       0.2325     -6.016   1.79e-09 ***
+period2           -0.9923       0.3066     -3.236    0.00121 **
+period3            -1.129       0.3266     -3.455   0.000549 ***
+period4             -1.58       0.4274     -3.697   0.000218 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+             (Intercept)     period2     period3
+period2           -0.364
+period3           -0.340       0.278
+period4           -0.261       0.212       0.196
+
+Optimizer evaluations: 12, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+loglik: -92.02628186475712
 
 === nagq=7 (adaptive Gauss-Hermite) ===
-name             estimate    std.error          z          p
-(Intercept)        -1.399       0.2335     -5.992  2.072e-09
-period2           -0.9914       0.3068     -3.232    0.00123
-period3            -1.128       0.3268     -3.451  0.0005576
-period4            -1.579       0.4276     -3.694  0.0002209
+Generalized linear mixed model fit by maximum likelihood (Adaptive Gauss-Hermite Quadrature, nAGQ = 7) [glmm]
+Formula: prop ~ period + (1 | herd)
+ Family: binomial (logit)
+
+    AIC    BIC  logLik deviance df.resid
+ 193.97 204.09 -91.983   183.97       51
+
+Scaled residuals:
+    Min      1Q  Median     3Q   Max
+ -2.381 -0.7906 -0.2002 0.5112 2.873
 
 Random effects:
-  herd:
-    (Intercept)  sd     0.6475  se     0.1805  corr    1.000
+ Groups Name        Variance Std.Dev. se     Corr
+ herd   (Intercept) 0.4193   0.6475   0.1805     
+Number of obs: 56, groups:  herd, 15
 
-dispersion: 1   converged: True   singular: False
-loglik: -91.98335426918706
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)        -1.399       0.2335     -5.992   2.07e-09 ***
+period2           -0.9914       0.3068     -3.232    0.00123 **
+period3            -1.128       0.3268     -3.451   0.000558 ***
+period4            -1.579       0.4276     -3.694   0.000221 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+             (Intercept)     period2     period3
+period2           -0.362
+period3           -0.339       0.279
+period4           -0.260       0.212       0.197
+
+Optimizer evaluations: 59, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+loglik: -91.98335426919778
 
 Laplace -> AGQ(7) movement on this data:
-  beta[(Intercept)]: laplace=-1.398532067 agq7=-1.399232151 delta=-0.0007 rel=0.000501
-  beta[period2]: laplace=-0.9923328153 agq7=-0.9914028429 delta=0.00093 rel=0.000937
-  beta[period3]: laplace=-1.128672188 agq7=-1.127818208 delta=0.000854 rel=0.000757
-  beta[period4]: laplace=-1.580313861 agq7=-1.579469189 delta=0.000845 rel=0.000534
+  beta[(Intercept)]: laplace=-1.398532142 agq7=-1.399232215 delta=-0.0007 rel=0.000501
+  beta[period2]: laplace=-0.9923327348 agq7=-0.9914025657 delta=0.00093 rel=0.000937
+  beta[period3]: laplace=-1.128672084 agq7=-1.127819278 delta=0.000853 rel=0.000756
+  beta[period4]: laplace=-1.580313885 agq7=-1.579468937 delta=0.000845 rel=0.000535
   loglik: laplace=-92.02628186 agq7=-91.98335427 delta=0.0429
 
 oracle cross-check vs goldens/cbpp_agq_k7.json (manifest rung 5 at nagq=7):
 (beta, se_hessian, herd stddev only -- see module docstring on why loglik is excluded)
-  beta[(Intercept)]            got=-1.399232151       ref=-1.399229755       rel_err=1.71e-06  tol=0.001  [PASS]
-  beta[period2]                got=-0.9914028429      ref=-0.9913961245      rel_err=6.78e-06  tol=0.001  [PASS]
-  beta[period3]                got=-1.127818208       ref=-1.127832892       rel_err=1.3e-05  tol=0.001  [PASS]
-  beta[period4]                got=-1.579469189       ref=-1.579443908       rel_err=1.6e-05  tol=0.001  [PASS]
-  se_hessian[(Intercept)]      got=0.2335141791       ref=0.2335116086       rel_err=1.1e-05  tol=0.001  [PASS]
-  se_hessian[period2]          got=0.30676867         ref=0.3067673681       rel_err=4.24e-06  tol=0.001  [PASS]
-  se_hessian[period3]          got=0.3267688578       ref=0.3267697654       rel_err=2.78e-06  tol=0.001  [PASS]
-  se_hessian[period4]          got=0.42759394         ref=0.4275906557       rel_err=7.68e-06  tol=0.001  [PASS]
-  herd stddev                  got=0.6475205669       ref=0.6475178183       rel_err=4.24e-06  tol=0.001  [PASS]
+  beta[(Intercept)]            got=-1.399232215       ref=-1.399229755       rel_err=1.76e-06  tol=0.001  [PASS]
+  beta[period2]                got=-0.9914025657      ref=-0.9913961245      rel_err=6.5e-06  tol=0.001  [PASS]
+  beta[period3]                got=-1.127819278       ref=-1.127832892       rel_err=1.21e-05  tol=0.001  [PASS]
+  beta[period4]                got=-1.579468937       ref=-1.579443908       rel_err=1.58e-05  tol=0.001  [PASS]
+  se_hessian[(Intercept)]      got=0.2335124545       ref=0.2335116086       rel_err=3.62e-06  tol=0.001  [PASS]
+  se_hessian[period2]          got=0.3067679782       ref=0.3067673681       rel_err=1.99e-06  tol=0.001  [PASS]
+  se_hessian[period3]          got=0.3267684637       ref=0.3267697654       rel_err=3.98e-06  tol=0.001  [PASS]
+  se_hessian[period4]          got=0.4275944626       ref=0.4275906557       rel_err=8.9e-06  tol=0.001  [PASS]
+  herd stddev                  got=0.6475210585       ref=0.6475178183       rel_err=5e-06  tol=0.001  [PASS]
 ```
 
 The thing a newcomer misreads: the answer *does* move relative to Laplace,
@@ -495,36 +633,84 @@ for it. This output is a run, not an oracle-pinned result.
 
 ```
 === base = A (default, no declared order) ===
-name             estimate    std.error          z          p
-(Intercept)         2.379        5.903     0.4031     0.6869
-recipeB            -3.649        8.348    -0.4371      0.662
-recipeC            -1.941        8.348    -0.2325     0.8161
-temp               0.1537      0.02821      5.449  5.054e-08
-recipeB:temp      0.01086      0.03989     0.2722     0.7855
-recipeC:temp     0.002095      0.03989    0.05252     0.9581
+Linear mixed model fit by REML [glmm]
+Formula: angle ~ recipe*temp + (1 | recipe:replicate)
+ Family: gaussian (identity)
+
+REML criterion at convergence: 1703.3
+
+Scaled residuals:
+   Min      1Q  Median     3Q   Max
+ -2.46 -0.5909 -0.0967 0.6103 2.658
 
 Random effects:
-  recipe:replicate:
-    (Intercept)  sd      6.463  se        nan  corr    1.000
+ Groups           Name        Variance Std.Dev. se Corr
+ recipe:replicate (Intercept) 41.77    6.463    NA     
+ Residual                     20.89    4.57            
+Number of obs: 270, groups:  recipe:replicate, 45
 
-dispersion: 20.8861   converged: True   singular: False
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)         2.379        5.903     0.4031      0.687 
+recipeB            -3.649        8.348    -0.4371      0.662 
+recipeC            -1.941        8.348    -0.2325      0.816 
+temp               0.1537      0.02821      5.449   5.05e-08 ***
+recipeB:temp      0.01086      0.03989     0.2722      0.785 
+recipeC:temp     0.002095      0.03989    0.05252      0.958 
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+              (Intercept)      recipeB      recipeC         temp recipeB:temp
+recipeB            -0.707
+recipeC            -0.707        0.500
+temp               -0.956        0.676        0.676
+recipeB:temp        0.676       -0.956       -0.478       -0.707
+recipeC:temp        0.676       -0.478       -0.956       -0.707        0.500
+
+Optimizer evaluations: 12, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
 
 === base = B (pandas.Categorical(categories=['B', 'A', 'C'])) ===
-name             estimate    std.error          z          p
-(Intercept)         -1.27        5.903    -0.2151     0.8297
-recipeA             3.649        8.348     0.4371      0.662
-recipeC             1.708        8.348     0.2046     0.8379
-temp               0.1646      0.02821      5.834  5.401e-09
-recipeA:temp     -0.01086      0.03989    -0.2722     0.7855
-recipeC:temp    -0.008762      0.03989    -0.2196     0.8261
+Linear mixed model fit by REML [glmm]
+Formula: angle ~ recipe*temp + (1 | recipe:replicate)
+ Family: gaussian (identity)
+
+REML criterion at convergence: 1703.3
+
+Scaled residuals:
+   Min      1Q  Median     3Q   Max
+ -2.46 -0.5909 -0.0967 0.6103 2.658
 
 Random effects:
-  recipe:replicate:
-    (Intercept)  sd      6.463  se        nan  corr    1.000
+ Groups           Name        Variance Std.Dev. se Corr
+ recipe:replicate (Intercept) 41.77    6.463    NA     
+ Residual                     20.89    4.57            
+Number of obs: 270, groups:  recipe:replicate, 45
 
-dispersion: 20.8861   converged: True   singular: False
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)         -1.27        5.903    -0.2151       0.83 
+recipeA             3.649        8.348     0.4371      0.662 
+recipeC             1.708        8.348     0.2046      0.838 
+temp               0.1646      0.02821      5.834    5.4e-09 ***
+recipeA:temp     -0.01086      0.03989    -0.2722      0.785 
+recipeC:temp    -0.008762      0.03989    -0.2196      0.826 
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
 
-Same fit, different parameterization: fitted values and loglik agree (loglik A=-851.63374, loglik B=-851.63374, delta=1.02e-12); only which contrasts are directly readable off beta changes.
+Correlation of Fixed Effects:
+              (Intercept)      recipeA      recipeC         temp recipeA:temp
+recipeA            -0.707
+recipeC            -0.707        0.500
+temp               -0.956        0.676        0.676
+recipeA:temp        0.676       -0.956       -0.478       -0.707
+recipeC:temp        0.676       -0.478       -0.956       -0.707        0.500
+
+Optimizer evaluations: 12, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+
+Same fit, different parameterization: fitted values and loglik agree (loglik A=-851.63374, loglik B=-851.63374, delta=-6.82e-13); only which contrasts are directly readable off beta changes.
 
 (cake carries no goldens/ entry -- a run, not an oracle-pinned result)
 ```
@@ -580,24 +766,47 @@ fixture generated for the validation harness.
 
 ```
 converged: True  singular: False
-name             estimate    std.error          z          p
-(Intercept)        0.1442       0.1207      1.195     0.2323
-x                  0.6198      0.07564      8.194  2.527e-16
-grpb               0.6337       0.1557       4.07   4.71e-05
+Generalized linear model fit by IRLS [glmm]
+Formula: y ~ x + grp
+ Family: negativebinomial (log)
 
-dispersion: 1.01052   converged: True   singular: False
-theta (NB shape): 1.0105218893928158
-loglik: -497.32514268667205
+    AIC    BIC  logLik deviance df.resid
+ 1002.7 1017.3 -497.33   994.65      284
+
+Scaled residuals:
+     Min      1Q  Median     3Q   Max
+ -0.9511 -0.6861 -0.3748 0.3193 6.701
+
+Number of obs: 288
+
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)        0.1442       0.1207      1.195      0.232 
+x                  0.6198      0.07564      8.194   2.53e-16 ***
+grpb               0.6337       0.1557       4.07   4.71e-05 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+             (Intercept)           x
+x                 -0.120
+grpb              -0.769       0.043
+
+Shape (theta): 1.01052
+Optimizer evaluations: 0, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+theta (NB shape): 1.010521783381409
+loglik: -497.3251426865909
 
 oracle cross-check vs goldens/sim_nb_glm.json (GLM, no random effects):
-  beta[(Intercept)]            got=0.1441656485       ref=0.1441660779       rel_err=2.98e-06  tol=0.001  [PASS]
-  beta[x]                      got=0.6198259071       ref=0.6198268706       rel_err=1.55e-06  tol=0.001  [PASS]
-  beta[grpb]                   got=0.6336876107       ref=0.6336868995       rel_err=1.12e-06  tol=0.001  [PASS]
-  se[(Intercept)]              got=0.1206905798       ref=0.120690562        rel_err=1.48e-07  tol=0.001  [PASS]
-  se[x]                        got=0.07564414504      ref=0.07564420041      rel_err=7.32e-07  tol=0.001  [PASS]
-  se[grpb]                     got=0.1557142496       ref=0.1557142563       rel_err=4.31e-08  tol=0.001  [PASS]
-  theta                        got=1.010521889        ref=1.010521815        rel_err=7.32e-08  tol=0.001  [PASS]
-  loglik                       got=-497.3251427       ref=-497.3251427       abs_err=8.2e-11  tol=0.001  [PASS]
+  beta[(Intercept)]            got=0.1441660774       ref=0.1441660779       rel_err=3.6e-09  tol=0.001  [PASS]
+  beta[x]                      got=0.6198268694       ref=0.6198268706       rel_err=1.93e-09  tol=0.001  [PASS]
+  beta[grpb]                   got=0.6336869002       ref=0.6336868995       rel_err=1.13e-09  tol=0.001  [PASS]
+  se[(Intercept)]              got=0.1206905628       ref=0.120690562        rel_err=7.2e-09  tol=0.001  [PASS]
+  se[x]                        got=0.07564420094      ref=0.07564420041      rel_err=7.06e-09  tol=0.001  [PASS]
+  se[grpb]                     got=0.1557142575       ref=0.1557142563       rel_err=7.85e-09  tol=0.001  [PASS]
+  theta                        got=1.010521783        ref=1.010521815        rel_err=3.18e-08  tol=0.001  [PASS]
+  loglik                       got=-497.3251427       ref=-497.3251427       abs_err=8.53e-13  tol=0.001  [PASS]
 ```
 
 Note this is a GLM, not a GLMM: `sim_nb.csv` carries a `cluster` column that
@@ -632,28 +841,68 @@ This output is a run, not an oracle-pinned result.
 
 ```
 === with offset = log(exposure) ===
-name             estimate    std.error          z          p
-(Intercept)        0.3269       0.0969      3.373  0.0007435
-x                  0.4935     0.009219      53.53          0
+Generalized linear mixed model fit by maximum likelihood (Laplace Approximation) [glmm]
+Formula: y ~ x + (1 | cluster)
+ Family: poisson (log)
+
+    AIC    BIC logLik deviance df.resid
+ 9478.1 9495.4  -4736   9472.1     2397
+
+Scaled residuals:
+    Min      1Q  Median    3Q   Max
+ -2.533 -0.7337 -0.1417 0.606 5.202
 
 Random effects:
-  cluster:
-    (Intercept)  sd     0.5269  se    0.06913  corr    1.000
+ Groups  Name        Variance Std.Dev. se      Corr
+ cluster (Intercept) 0.2777   0.5269   0.06916     
+Number of obs: 2400, groups:  cluster, 30
 
-dispersion: 1   converged: True   singular: False
-cluster stddev: 0.5269486042406111
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)        0.3269       0.0969      3.373   0.000743 ***
+x                  0.4935     0.009219      53.53     <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+             (Intercept)
+x                 -0.047
+
+Optimizer evaluations: 15, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+cluster stddev: 0.5269484696264434
 
 === without the offset (exposure variation folded into the fit) ===
-name             estimate    std.error          z          p
-(Intercept)         1.323      0.09886      13.38  7.455e-41
-x                  0.5224     0.009289      56.23          0
+Generalized linear mixed model fit by maximum likelihood (Laplace Approximation) [glmm]
+Formula: y ~ x + (1 | cluster)
+ Family: poisson (log)
+
+   AIC   BIC  logLik deviance df.resid
+ 12276 12294 -6135.2    12270     2397
+
+Scaled residuals:
+    Min     1Q  Median     3Q   Max
+ -4.101 -1.057 -0.2177 0.8943 7.854
 
 Random effects:
-  cluster:
-    (Intercept)  sd     0.5377  se    0.07053  corr    1.000
+ Groups  Name        Variance Std.Dev. se      Corr
+ cluster (Intercept) 0.2891   0.5377   0.07056     
+Number of obs: 2400, groups:  cluster, 30
 
-dispersion: 1   converged: True   singular: False
-cluster stddev: 0.5377180043580608
+Fixed effects:
+                 Estimate   Std. Error    z value   Pr(>|z|)
+(Intercept)         1.323      0.09886      13.38     <2e-16 ***
+x                  0.5224     0.009289      56.23     <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+             (Intercept)
+x                 -0.047
+
+Optimizer evaluations: 14, converged: True
+z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+cluster stddev: 0.5377163600555648
 
 Dropping a real offset does not just bias the intercept: here the slope on x moves from 0.4935 (with offset) to 0.5224 (without), and the cluster standard deviation moves from 0.5269 to 0.5377 -- the unexplained exposure variation is absorbed by both the fixed and the random-effect side, not cleanly by either alone.
 

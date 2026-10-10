@@ -10,7 +10,7 @@ own page.
 | lme4 | fastglmm (R) | glmm (Python) |
 |---|---|---|
 | `lmer(f, d)` / `glmer(f, d, family)` | `fastglmm(f, d, family = ...)` | `glmm.fit(d, "f", family)` |
-| `summary(fit)` | `summary(fit)` — Wald z table + variance components; no `logLik`/`AIC`/`BIC`/`deviance` line | `fit.summary()` — coefficient table (name, estimate, std. error, z, p), printed and returned as a string; a footer carries `dispersion` and `converged` |
+| `summary(fit)` | `summary(fit)` — lme4-shaped: the REML criterion (LMM) or the `AIC`/`BIC`/`logLik`/`deviance`/`df.resid` row (ML fits), scaled residuals, variance components, a Wald z table | `fit.summary()` — the same lme4-shaped layout, printed and returned as a string |
 | `fixef(fit)` | `fixef(fit)` — named fixed-effect estimates; aliased columns `NA` | `fit.beta` (estimates) with `fit.names` (aligned coefficient names); `fit.aliased` flags rank-deficient columns |
 | `vcov(fit)` | `vcov(fit)` — full `p × p` Wald covariance | `fit.vcov` — `(p, p)` full Cov(β̂) |
 | `VarCorr(fit)` | `VarCorr(fit)` — SD/correlation-scale variance components, lme4-shaped, with a `Residual` row for a Gaussian mixed fit | `fit.varcorr` (vech-packed per grouping) plus `fit.stddev_corr(group_idx)`, which splits a grouping's block into a stddev vector and a correlation matrix |
@@ -24,11 +24,11 @@ own page.
 `fastglmm` is deliberately scoped to **fast fitting**: fixed effects, Wald
 standard errors, variance components on the SD/correlation scale, and the
 conditional modes with the per-row means they imply. Anything the engine
-cannot compute honestly — `predict`, `residuals`, profiling — is an
+cannot compute honestly — `predict`, profiling — is an
 error naming the reason, never a silently different answer. `predict()` needs
 a design matrix built from rows the fit never saw, and the formula machinery
-is Rust-side; `residuals()` would have to guess which of lme4's four `type=`
-residuals you meant, and guessing wrong is worse than erroring. `coef()`
+is Rust-side. `residuals()` gives response and Pearson residuals; deviance and
+working residuals are not offered. `coef()`
 errors for the same reason it always did — lme4's `coef()` means fixed +
 random effects per group, and returning the fixed part alone would silently
 differ — but you can now build it yourself from `fixef()` and `ranef()`.
@@ -40,7 +40,7 @@ modes come with no uncertainty attached. Read them accordingly.
 This is the same discipline the kernel applies everywhere: it only surfaces
 what it can compute honestly. See
 [`validation.md`](validation.md) for how that claim is checked against the
-lme4/MixedModels.jl oracles.
+four oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive).
 
 ## Behavioral differences to watch
 
@@ -233,7 +233,6 @@ library(fastglmm)
 
 data(Penicillin)
 
-# NOTE: no bare "1" fixed-effect term (the intercept is always implicit).
 fit <- fastglmm(diameter ~ (1 | plate) + (1 | sample), Penicillin)
 
 summary(fit)
@@ -258,7 +257,6 @@ data = {
     "sample": [r["sample"] for r in rows],
 }
 
-# NOTE: no bare "1" fixed-effect term (the intercept is always implicit).
 fit = glmm.fit(data, "diameter ~ (1 | plate) + (1 | sample)")
 
 assert fit.converged

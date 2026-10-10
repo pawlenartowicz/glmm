@@ -123,8 +123,7 @@ may want to own yourself. The `loop_advanced` cargo feature lets you split the
 fit in two: `build_workspace` classifies the design and allocates the solver's
 per-shape buffers **once**, then `fit_on` solves each draw on that workspace.
 (Not everything is hoisted: the GLMM offset vector is copied per call, and the
-sparse and negative-binomial routes still allocate their own buffers per draw —
-they get the shared routing, not the reuse win.)
+fixed-effect negative-binomial route allocates its own buffers per draw.)
 
 ```toml
 [dependencies]
@@ -132,19 +131,21 @@ glmm = { version = "...", features = ["loop_advanced"] }
 ```
 
 ```rust
-use glmm::loop_advanced::{build_workspace, fit_on};
+use glmm::loop_advanced::{build_workspace, fit_on, spec_sized_from_ids_pub};
 
 // The spec you pass to `build_workspace` must carry the REAL random-effect
-// level counts, not the placeholders `fit_cold` accepts — the stable entry
-// derives them from the ids for you, the loop tier does not.
-let mut ws = build_workspace(&sized_model, n_max, p, &opts);
+// level counts, not the placeholders `fit_cold` accepts. `spec_sized_from_ids_pub`
+// derives them from the ids, as the stable entry does. It may also reorder the
+// groupings: `fit_on` takes the ids it returns, and `perm` records the order.
+let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+let mut ws = build_workspace(&sized, perm, n_max, p, &opts);
 
-for resample in resamples {
-    let view = fit_on(&mut ws, &resample.x, &resample.y, &resample.ids, start.as_ref(), &opts);
+for draw in draws {
+    let view = fit_on(&mut ws, &draw.x, &draw.y, &sized_ids, start.as_ref(), &opts);
     // Hot-loop reads, straight off the workspace slots — no `Fit` allocated:
     let significant = view.t_sq()[0] > crit && view.converged();
     // Or pay for the full result when you actually need it:
-    // let fit = view.into_fit(&resample.x, &resample.y, n, p, &model, &opts);
+    // let fit = view.into_fit(&draw.x, &draw.y, &sized_ids, n, p, &model, &opts);
 }
 ```
 
@@ -156,11 +157,10 @@ counts may vary below the `n_max` you built at.
 What it does **not** do is validate your data. `fit_warm` checks start-value
 lengths, weight and offset lengths and finiteness, and it drops rank-deficient
 fixed-effect columns and refits. `fit_on` does none of that — it trusts the
-caller. A short `StartValues.theta` leaves the trailing entries at the *previous*
-fit's θ̂, so the same call can answer differently depending on how old the
-workspace is. A weights vector longer than `n` is accepted and skews the LMM
-deviance and log-likelihood; non-finite weights or offsets turn the fit into
-NaN, and the GLMM route panics on a length mismatch instead. Check these once
+caller. A `StartValues.beta` or `StartValues.theta` of the wrong width is
+dropped without an error, and that part cold-starts. A weights vector longer
+than `n` is accepted and skews the LMM deviance and log-likelihood; non-finite
+weights or offsets turn the fit into NaN, and the GLMM route panics on a length mismatch instead. Check these once
 outside your loop.
 
 This is the **unstable** surface — no semver guarantees, and it changes in any
@@ -220,5 +220,5 @@ contrasts (R's default), and returns everything `fit_cold` needs — including
 several data tables (the parse step is data-free).
 
 If you only need the kernel — the parse-once/fit-many hot path — take
-`glmm = { version = "0.1", default-features = false }`; the formula module
+`glmm = { version = "0.5", default-features = false }`; the formula module
 disappears and the crate links no `regex`.

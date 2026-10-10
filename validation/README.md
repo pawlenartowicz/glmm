@@ -7,11 +7,11 @@ Everything under `validation/` is dev-only and never shipped: the nested
 
 | path | what it is |
 |---|---|
-| `grid/` | the accuracy grid: 773 model cells, four pinned external oracles, the gates. The main reference system. |
+| `grid/` | the accuracy grid: 794 model cells, four pinned external oracles, the gates. The main reference system. |
 | `data/empirical/` | committed CSVs from the datasets `lme4` and `nlme` bundle. Read byte-for-byte by every engine and by `cargo test` through `include_str!`. |
 | `data/simulated/` | committed fixed-seed CSVs, regenerable byte-identically by `tools/prep/`. Also read by `include_str!`, including in CI, so the bytes are the fixture. |
 | `manifest.json` | the per-rung model list for the in-crate tiers: one entry per dataset with its formula, family, link, factors and tier. Read by `tests/validation_oracle.rs`, `tools/bit_identity/dump.rs` and `tools/goldens_agq.R`. |
-| `goldens/` | frozen single-engine reference results for the shapes one engine covers (AGQ tiers, Gamma/NB families, probit). Read at run time by the `oracle-tests` tier. Regenerated only by `tools/goldens_agq.R`. |
+| `goldens/` | frozen reference results, one JSON per fixture, from lme4, R `glm` / `MASS::glm.nb`, glmmTMB (`*_tmb.json`) and GLMMadaptive. Read at run time by the `oracle-tests` tier. Regenerated only by `tools/goldens_agq.R`. |
 | `results/lme4_simulated/` | the frozen `lme4` results for the weights tier, read by the `oracle-tests` tier. |
 | `tools/` | tools and generators, no gates: `bit_identity/` (a "what moved" report: dump the per-rung results before and after a change and diff them; the dumps are machine-local and not committed), `lanewidth/` (SIMD lane-width sensitivity), `memory/` (peak RSS), `goldens_agq.R` (the goldens generator), `prep/` (the fixed-seed generators of `data/`, plus `gamma_agq_reference.R`, a from-scratch Gamma AGQ reference run unweighted at the console and with `--weights` to freeze `gamma_agq_reference_wts.json`), `common.rs` (the shared reader the manifest-shaped examples include). A bare run of `goldens_agq.R` or of a `prep/` script overwrites committed artifacts, so both are deliberate acts, not routine steps. |
 | `campaigns/` | two finished studies, kept rerunnable: `speed-campaign/` (optimizer cost and wall time) and `monte_carlo/` (accuracy against known truth). See `campaigns/README.md`. |
@@ -26,8 +26,8 @@ From `grid/`:
 
 - `engine` is one of `glmm`, `glmm_python`, `glmm_r`, `lme4`, `glmmtmb`,
   `glmmadaptive`, `mixedmodels`.
-- `--fast` restricts the run to the cells tagged `fast` in `manifest.json` (117 of
-  795).
+- `--fast` restricts the run to the cells tagged `fast` in `manifest.json` (116 of
+  794).
 - `--timed[=N]` times every fit: N samples, the first discarded, median of the
   rest. It implies `--fast` and `--jobs 1`, records `no_turbo`, and **refuses to
   start on an unlocked clock** unless `--timed-unlocked` is given, in which case
@@ -39,8 +39,8 @@ From `grid/`:
   `taskset -c i`. The P-cores on this box are 0–5, so N above 6 is refused.
 - `--label TEXT` is the free-text purpose of the run; it goes into
   `run_meta.json` and into the directory name.
-- `--keep` puts a `glmm` / `glmm_python` / `glmm_r` run under `runs/<engine>/`
-  instead of `runs/<engine>/scratch/`. Oracle runs are always kept.
+- `--keep` makes a finished `glmm` / `glmm_python` / `glmm_r` run the engine's kept
+  run (see below). Oracle runs are always kept.
 - Trailing cell names restrict the run to those cells, validated against the
   manifest first.
 
@@ -57,15 +57,23 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
 
 ## Where the references live
 
-- **Oracle runs** — `grid/runs/<oracle>/<date>_<version>_<machine>[_<label>]/`,
-  holding `results.jsonl` and `run_meta.json`. A run never overwrites; a second
-  run on the same day gets a counter. The reference for an oracle is its newest
-  committed run whose `run_meta.json` says `subset: full` and whose
-  `engine_version` matches `grid/versions.json`. A version mismatch is an error,
-  not a fallback, and a `fast` or timed run is never an accuracy reference.
+- **Runs** — every run is built in
+  `grid/runs/<engine>/scratch/<date>_<version>_<machine>[_<label>]/`, holding
+  `results.jsonl` and `run_meta.json`; a second run on the same day gets a
+  counter. `scratch/` is not in git. When a kept run finishes, `grid/promote.sh`
+  moves it into one of two fixed folders, the only ones git tracks:
+  `runs/<engine>/last/` for a full untimed run, `runs/<engine>/last-timed/` for a
+  timed run. A new timed run replaces only the cells it fitted and carries the
+  rest over, listing their runs under `carried` in `run_meta.json`. The run a
+  slot held before moves back to `scratch/`, and git history keeps every
+  committed one: `git log -p -- grid/runs/glmm/last/` is the run history.
+- **Oracle references** — an oracle's reference is `runs/<oracle>/last/`, and
+  its `engine_version` must match `grid/versions.json`. A version mismatch is an
+  error, not a fallback, and a `fast` or timed run is never an accuracy
+  reference.
 - **Pins** — `grid/versions.json`: `lme4` 2.0-6, `glmmTMB` 1.1.14,
   `GLMMadaptive` 0.9-7, `MixedModels` 5.9.0, R 4.5.3, Julia 1.12.6. A bump reruns
-  that oracle into a new directory and edits no old one.
+  that oracle into a new `last/`.
 - **Bands** — `grid/tol.R`, every one with the measurement and the date that set
   it. `grid/dev_align.R` holds the per-engine, per-family deviance constants, each
   a closed form with its source.
@@ -95,7 +103,7 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
 | Check | Reads | Runs in CI? |
 |---|---|---|
 | `cargo test` (six feature configs) | `goldens/`, `data/empirical/`, `data/simulated/` via `include_str!` | **yes** — every push |
-| `cargo test --test grid_reference` | `grid/manifest.json`, `grid/data/fast/`, `data/`, the newest committed run under `grid/runs/glmm/` | **yes** — part of the `cargo test` matrix |
+| `cargo test --test grid_reference` | `grid/manifest.json`, `grid/data/fast/`, `data/`, `grid/runs/glmm/last/` | **yes** — part of the `cargo test` matrix |
 | `port-gate` (Rust vs Python vs R on the `fast` subset) | `grid/manifest.json`, `grid/data/fast/`, `data/`, `grid/compare.R --ports-only` | **yes** — its own job; installs `jsonlite`, no statistics package |
 | `cargo test --features oracle-tests` (the cross-engine tier) | `goldens/`, `results/lme4_simulated/`, `data/`, `grid/divergences.json` | no — local only |
 | `grid/run.sh <oracle>` (an oracle reference run) | everything | no — local only; needs R, Julia and the pinned oracle versions |

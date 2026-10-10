@@ -2570,7 +2570,7 @@ fn accumulate_lmm_rows_sparse_weighted_reuse_allocates_nothing() {
     );
 }
 
-// --- curvature hints (B1.4) ---
+// --- curvature hints ---
 
 /// `y` with a deterministic per-row shift, a second draw of the same design.
 fn shifted(y: &[f64], k: f64) -> Vec<f64> {

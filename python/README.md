@@ -1,14 +1,22 @@
 # glmm
 
-**Linear-regression family — OLS → GLM → LMM → GLMM — in pure Rust, with an eight-name Python API.**
+**`glmm`: mixed models from an R-style formula, with NumPy as the only dependency.**
 
 [![License: LGPL-3.0-or-later](https://img.shields.io/badge/license-LLGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/lgpl-3.0)
 
-Fits fixed-effect and mixed (random-intercept / random-slope) models for
-Gaussian, Binomial (logit/probit), Poisson, Gamma, and Negative-Binomial
-outcomes. The numerics are the [`glmm`](https://crates.io/crates/glmm) Rust
-crate — no BLAS/LAPACK system dependency, no `unsafe`, validated against
-R/lme4, glmmTMB, and Julia/MixedModels.jl goldens.
+**glmm** fits mixed models in Rust, Python and R, and in the browser through WASM. One `fit`
+covers ordinary least squares, generalized linear models, linear mixed models and
+generalized linear mixed models.
+
+- **Accuracy first.** Gives the same or a more accurate result than lme4, glmmTMB,
+  MixedModels.jl and GLMMadaptive, and converges on every model that has a solution.
+- **Multi-solver.** Uses a multi-solver paradigm to get the best result more robustly:
+  closed form for least squares, IRLS for GLMs, and BFGS or BOBYQA
+  for mixed models, all written from scratch in Rust.
+- **Fast.** Faster than every other engine on every model, usually 10 to 100 times,
+  without RAM blowup.
+
+On all tested models: a 794-model validation grid, checked for every release.
 
 ## Install
 
@@ -18,72 +26,26 @@ pip install glmm
 
 Requires Python 3.10+. The only runtime dependency is NumPy.
 
-## One call
+## Quick examples
 
-You hand `fit` a data table and an R-style formula. It parses the formula
-against the table's columns, builds the design matrix, fits, and returns a
-`Fit`. There is no model object to construct.
+`df` is any data table: a dict of columns, or a pandas / polars DataFrame.
 
 ```python
 import glmm
 
-data = {
-    "y":     [1.02, 1.05, 1.11, 1.13, 1.21, 1.24, 1.30, 1.33, 1.42, 1.44, 1.51, 1.53],
-    "x1":    [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1],
-    "group": ["a", "a", "b", "b", "c", "c", "d", "d", "e", "e", "f", "f"],
-}
+# OLS: fixed effects only
+fit = glmm.fit(df, "y ~ x1 * x2")
 
-# y ~ x1 + (1 | group) — Gaussian, random intercept.
-fit = glmm.fit(data, "y ~ x1 + (1 | group)")
+# LMM: correlated random intercept and slope (REML)
+fit = glmm.fit(df, "y ~ x1 + (1 + x1 | subject)")
 
-assert fit.converged
-fit.summary()   # prints the coefficient table (and returns it as a string)
+# GLMM: binomial with a probit link, 7-node adaptive quadrature
+fit = glmm.fit(df, "passed ~ x1 + (1 | school)", "binomial", link="probit", nagq=7)
+
+fit.summary()                     # coefficient table + variance components
+fit.beta, fit.se                  # estimates and standard errors
+fit.converged, fit.singular       # result flags
 ```
-
-The public surface is `glmm.fit`, `glmm.Fit`, and the warning categories the
-diagnostics channel raises: `glmm.DiagnosticWarning` (the base) and its
-subclasses, such as `glmm.IllConditionedWarning`, `glmm.PirlsExhaustedWarning`,
-`glmm.UnusedGroupingLevelsWarning` and `glmm.HessianSeFallbackWarning`
-(`glmm.__all__` lists them all). Families, links, and knobs are string or
-scalar arguments, not types.
-
-`data` is documented as a `dict[str, array-like]`, but anything
-column-addressable works — pandas / polars DataFrame, pyarrow Table — by
-duck-typing, so there is no dataframe dependency.
-
-## Model routing
-
-Routing is inferred from the formula and family — fixed-only means OLS/GLM,
-adding a `(… | g)` term makes it LMM/GLMM.
-
-| `family` | default link | other links | fixed-only | with `(… \| g)` |
-|---|---|---|---|---|
-| `gaussian` | identity | — | OLS | LMM |
-| `binomial` | `logit` | `probit`, `cloglog` | GLM | GLMM |
-| `poisson` | `log` | — | GLM | GLMM |
-| `gamma` | `log` | `inverse` | GLM | GLMM |
-| `negativebinomial` | `log` | — | GLM | GLMM |
-| `inversegaussian` | `log` | `inverse_squared` | GLM | random effects raise |
-
-```python
-fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
-```
-
-The formula follows R conventions: `*` desugars to main effects + interaction,
-`A/B` to nesting, `(1 + x | g)` is a correlated random intercept + slope, and
-additional `(… | g2)` terms add crossed or nested grouping factors. Treatment
-contrasts (R's default) code the factors against the column's first level; the
-full syntax, rejected constructs and workarounds, and factor-coding rules are
-in
-[`formula.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/formula.md).
-
-### Not yet implemented
-
-One combination has an approved design but no kernel support, and raises a
-clean `NotImplementedError`: quasi-likelihood `dispersion=` on
-binomial/poisson. See
-[`troubleshooting.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/troubleshooting.md)
-for fixes to common errors.
 
 ## Documentation
 
@@ -93,6 +55,26 @@ Full walkthrough — every knob, the `Fit` object, and warm starts:
 The algorithm map (dispatch graph, solver paths, tuning knobs) is traced to
 code in
 [`documentation/algorithms.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/algorithms.md).
+
+What the formula accepts:
+[`formula.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/formula.md).
+Fixes for common errors:
+[`troubleshooting.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/troubleshooting.md).
+
+## Citation
+
+If you use glmm in research, please cite:
+
+Lenartowicz, P. (2026). glmm: Mixed-model fitting in Rust, Python and R [Computer software]. https://github.com/pawlenartowicz/glmm
+
+```bibtex
+@software{glmm2026,
+  author = {Lenartowicz, Pawe{\l}},
+  title  = {{glmm}: Mixed-Model Fitting in Rust, Python and R},
+  year   = {2026},
+  url    = {https://github.com/pawlenartowicz/glmm}
+}
+```
 
 ## License
 

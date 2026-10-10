@@ -963,12 +963,12 @@ pub(crate) fn gamma_dispersion_term(
 /// `∂/∂ψ` of [`gamma_dispersion_term`], `ψ = ln φ`: `2·Σᵢ aᵢ·(ln aᵢ − ψ₀(aᵢ))`,
 /// ψ₀ the digamma function, `aᵢ = wᵢ·a`. Setting `∂/∂ψ (D/φ + term) = 0` at unit
 /// weights gives `ln a − ψ₀(a) = D/(2n)`, the Gamma maximum-likelihood shape
-/// equation.
-#[cfg(test)]
+/// equation. Both arms take `ln a − ψ₀(a)` from `ln_minus_digamma`: the direct
+/// difference cancels at large `a`, that is at small φ.
 pub(crate) fn gamma_dispersion_term_d1(ln_phi: f64, weights: Option<&[f64]>, n: usize) -> f64 {
     let a = (-ln_phi).exp();
     let term = match weights {
-        None => n as f64 * a * (a.ln() - crate::dual::digamma(a)),
+        None => n as f64 * a * ln_minus_digamma(a).0,
         Some(w) => w[..n]
             .iter()
             .map(|&wi| {
@@ -983,14 +983,15 @@ pub(crate) fn gamma_dispersion_term_d1(ln_phi: f64, weights: Option<&[f64]>, n: 
 /// `∂²/∂ψ²` of [`gamma_dispersion_term`]:
 /// `−2·Σᵢ aᵢ·(ln aᵢ − ψ₀(aᵢ) + 1 − aᵢ·ψ₁(aᵢ))`, ψ₁ the trigamma function,
 /// `aᵢ = wᵢ·a`. The `ln φ` diagonal of the mixed-Gamma joint Hessian is this
-/// plus `D/φ` (`glmm::se::joint_hessian_cov`). The weighted arm reads
-/// `(g, dg) = ln_minus_digamma(aᵢ)` and uses `1 − aᵢ·ψ₁(aᵢ) = aᵢ·dg`, the same
+/// plus `D/φ` (`glmm::se::joint_hessian_cov`). Both arms read
+/// `(g, dg) = ln_minus_digamma(aᵢ)` and use `1 − aᵢ·ψ₁(aᵢ) = aᵢ·dg`, the same
 /// cancelling difference the ML solver below needs at large `aᵢ`.
 pub(crate) fn gamma_dispersion_term_d2(ln_phi: f64, weights: Option<&[f64]>, n: usize) -> f64 {
     let a = (-ln_phi).exp();
     let term = match weights {
         None => {
-            n as f64 * a * (a.ln() - crate::dual::digamma(a) + 1.0 - a * crate::dual::trigamma(a))
+            let (g, dg) = ln_minus_digamma(a);
+            n as f64 * a * (g + a * dg)
         }
         Some(w) => w[..n]
             .iter()
@@ -1018,7 +1019,7 @@ pub(crate) fn gamma_dispersion_term_d2(ln_phi: f64, weights: Option<&[f64]>, n: 
 /// rescales by `s` to recover the true φ̂. The left
 /// side falls strictly from ∞ to 0 in `a`, so the root is unique; Newton in
 /// `ln a` from MASS's start `(6 + 2d)/(d·(6 + d))`, `d = D/n`, per-row terms
-/// through `ln_minus_digamma` as the weighted `_d2` does — at large per-row
+/// through `ln_minus_digamma` as `_d2` does — at large per-row
 /// `aᵢ` the plain `ln aᵢ − ψ₀(aᵢ)` difference loses enough digits that Newton
 /// never meets the stopping rule. A zero deviance (an exact fit) gives φ = 0,
 /// and so does a negative one: `D ≥ 0` exactly, so a finite negative value is

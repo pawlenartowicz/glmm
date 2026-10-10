@@ -7731,7 +7731,9 @@ fn newton_pirls_lands_on_the_mode_at_a_loose_band() {
 /// Remaining gap: `GammaLink::Inverse` and `InverseGaussian` (both links) are
 /// also non-canonical and structured-extras-eligible, so they build and read
 /// the same twin, but neither is gated here or on the blocked path's
-/// `GRADIENT_GATE_CELLS` — no FD gate anywhere exercises them yet. Each
+/// `GRADIENT_GATE_CELLS` — no FD gate exercises the twin on them yet (the
+/// `f64` assembly on Gamma/inverse is FD-gated by
+/// `gradient_at_mode_matches_finite_differences_across_theta_regimes`). Each
 /// family/link pair above stands in for its own W/μ/dμ-dη formula, which is
 /// where a family or link actually enters the chain rule; the crossed-tail
 /// factoring and scatter code the twin adds is link-agnostic, so the four
@@ -9504,20 +9506,77 @@ fn agq_gradient_difference_hessian_covers_past_the_lane_cap() {
     }
 }
 
-// --- B2: the at-mode gradient (one mode solve per point) ---
+// --- The at-mode gradient (one mode solve per point) ---
 
-/// The families the gradient search routes (binomial, any link; Poisson).
-fn b2_routed_family(f: Family) -> bool {
+/// The routed families with no dispersion coordinate (binomial, any link;
+/// Poisson). The routed Gamma cells run through `GAMMA_GATE_SHAPES` at their
+/// own φ instead.
+fn routed_without_dispersion(f: Family) -> bool {
     matches!(f, Family::Binomial { .. } | Family::Poisson { .. })
 }
 
-/// T1. `gradient_at_mode` after a fixed-β value evaluation at the shipped
+/// The Gamma cells of the at-mode gradient gates, `(shape, nested children
+/// per parent, crossed levels)`: the blocked `q2s` shape and the three
+/// structured ones, each on both links.
+const GAMMA_GATE_SHAPES: [(&str, usize, usize); 4] = [
+    ("q2s", 0, 0),
+    ("nested2", 2, 0),
+    ("crossed6", 0, 6),
+    ("nested2_crossed6", 2, 6),
+];
+const GAMMA_GATE_LINKS: [GammaLink; 2] = [GammaLink::Log, GammaLink::Inverse];
+
+/// A Gamma gate cell: the blocked `fixture` or the structured
+/// `extras_fixture`, with prior weights and an offset when `weighted`, and its
+/// θ draws. On the inverse link β is `[0.8, −0.3]`, so η stays positive on
+/// the fixtures' `x₁ ∈ [−0.5, 0.5]`.
+#[allow(clippy::type_complexity)]
+fn gamma_gate_cell(
+    link: GammaLink,
+    shape: &str,
+    np: usize,
+    n_crossed: usize,
+    weighted: bool,
+) -> (
+    GlmmWorkspace,
+    Mat<f64>,
+    Vec<f64>,
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    usize,
+    usize,
+    FixedSeedTheta,
+) {
+    let family = Family::Gamma { link };
+    let (mut ws, x, y, ids, extra_ids, p, n) = if np == 0 && n_crossed == 0 {
+        let (ws, x, y, ids, p, n) = fixture(family, shape);
+        (ws, x, y, ids, Vec::new(), p, n)
+    } else {
+        extras_fixture(family, np, n_crossed)
+    };
+    if weighted {
+        for (i, w) in ws.prior_w[..n].iter_mut().enumerate() {
+            *w = 0.5 + (i % 5) as f64 * 0.25;
+        }
+        ws.weighted = true;
+        ws.offset = Some((0..n).map(|i| 0.05 * ((i % 7) as f64 - 3.0)).collect());
+    }
+    let mut rng = fixed_seed_theta(shape);
+    if link == GammaLink::Inverse {
+        rng.beta = vec![0.8, -0.3];
+    }
+    (ws, x, y, ids, extra_ids, p, n, rng)
+}
+
+/// `gradient_at_mode` after a fixed-β value evaluation at the shipped
 /// PIRLS tolerance against `gradient_f64` (which re-solves the mode at the
 /// derivative tolerance) at the same point, on every routed blocked and
 /// structured gate cell, crossed and nested tails, canonical and
-/// non-canonical links. The two differ only by where the mode solve stopped,
-/// so the band is that tolerance's effect on the gradient: measured at most
-/// 2.6e-10 relative on 94 grid cells (2026-10-07); 1e-8 here.
+/// non-canonical links, and on the Gamma cells (both links, with and without
+/// weights and an offset) at the same fixed φ. The two differ only by where
+/// the mode solve stopped, so the band is that tolerance's effect on the
+/// gradient: measured at most 2.6e-10 relative on 94 grid cells
+/// (2026-10-07); 1e-8 here.
 #[test]
 fn gradient_at_mode_matches_the_re_solve_gradient() {
     const BAND: f64 = 1e-8;
@@ -9568,7 +9627,7 @@ fn gradient_at_mode_matches_the_re_solve_gradient() {
         }
     };
     for &(family, shape) in GRADIENT_GATE_CELLS {
-        if !b2_routed_family(family) {
+        if !routed_without_dispersion(family) {
             continue;
         }
         let (mut ws, x, y, ids, p, n) = fixture(family, shape);
@@ -9586,7 +9645,7 @@ fn gradient_at_mode_matches_the_re_solve_gradient() {
         );
     }
     for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
-        if !b2_routed_family(family) {
+        if !routed_without_dispersion(family) {
             continue;
         }
         let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
@@ -9622,6 +9681,35 @@ fn gradient_at_mode_matches_the_re_solve_gradient() {
             );
         }
     }
+    // Gamma at a dispersion φ ≠ 1, where the value pass runs PIRLS on
+    // `prior_wᵢ/φ` and `gradient_f64` re-solves at the same φ, then at φ = 1,
+    // where the value pass leaves `prior_w_phi` unwritten: it is NaN-filled
+    // here in place of an earlier evaluation's weights, and must not be read.
+    for link in GAMMA_GATE_LINKS {
+        for (shape, np, n_crossed) in GAMMA_GATE_SHAPES {
+            for weighted in [false, true] {
+                for phi in [0.3, 1.0] {
+                    let (mut ws, x, y, ids, extra_ids, p, n, rng) =
+                        gamma_gate_cell(link, shape, np, n_crossed, weighted);
+                    if phi == 1.0 {
+                        ws.prior_w_phi[..n].fill(f64::NAN);
+                    }
+                    ws.gamma_phi = phi;
+                    run(
+                        &mut ws,
+                        x.as_ref(),
+                        &y,
+                        &ids,
+                        &extra_ids,
+                        p,
+                        n,
+                        &format!("Gamma/{link:?}/{shape} w={weighted} phi={phi}"),
+                        rng,
+                    );
+                }
+            }
+        }
+    }
     assert!(
         sparse_cells > 0,
         "no structured cell on the sparse Schur factor"
@@ -9629,25 +9717,38 @@ fn gradient_at_mode_matches_the_re_solve_gradient() {
     println!("at-mode vs re-solve gradient: worst relative gap {worst_all:e}");
 }
 
-/// T2. The at-mode gradient against central differences of the fixed-β
+/// The at-mode gradient against central differences of the fixed-β
 /// value, in the θ regimes the search crosses: a random draw, one diagonal θ
 /// near a variance collapse (1e-3), and large θ (diagonals 8). PIRLS runs
 /// from û = 0 at 1e-12 for every evaluation, so the differences see the
 /// objective, not the solver's stopping point. Band 1e-5 relative, with an
 /// absolute floor of 1e-6·(1 + |g|∞), as the existing FD gates use.
+///
+/// On Gamma (both links, blocked and structured, with and without weights
+/// and an offset) the objective is the full `F`, dispersion term included,
+/// over `[θ | β | ln φ]`, and the `ln φ` entry is
+/// `assembled::gamma_ln_phi_gradient`'s. It is checked at four `ln φ`: the
+/// plug-in seed `fit_glmm` starts from, the fitted optimum, and the optimum
+/// ± 1.
 #[test]
 fn gradient_at_mode_matches_finite_differences_across_theta_regimes() {
-    let mut cells = 0usize;
-    for &(family, shape) in GRADIENT_GATE_CELLS {
-        if !b2_routed_family(family) {
-            continue;
-        }
-        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+    // One cell: every θ regime at every entry of `ln_phis`. `None` checks
+    // `[θ | β]` at φ = 1; `Some(ψ)` adds the trailing `ln φ` coordinate.
+    let check = |ws: &mut GlmmWorkspace,
+                 x: MatRef<f64>,
+                 y: &[f64],
+                 ids: &[u32],
+                 extra_ids: &[Vec<u32>],
+                 p: usize,
+                 n: usize,
+                 label: &str,
+                 mut rng: FixedSeedTheta,
+                 ln_phis: &[Option<f64>]| {
         ws.fd.pirls_tol_override = Some(1e-12);
-        let m = ws.n_theta + p;
+        let n_theta = ws.n_theta;
+        let m = n_theta + p;
         let k = ws.k.max(1);
         let diag: Vec<usize> = ws.groupings.diagonal_theta().to_vec();
-        let mut rng = fixed_seed_theta(shape);
         let base = rng.next_params();
         let mut regimes = vec![base.clone()];
         let mut near = base.clone();
@@ -9658,58 +9759,146 @@ fn gradient_at_mode_matches_finite_differences_across_theta_regimes() {
             large[i] = 8.0;
         }
         regimes.push(large);
-        for (r, point) in regimes.iter().enumerate() {
-            let value = |ws: &mut GlmmWorkspace, pt: &[f64]| -> f64 {
-                ws.params[..m].copy_from_slice(pt);
-                ws.pirls.u[..k].fill(0.0);
-                let mut c = crate::counters::EvalCounters::new();
-                super::deviance::laplace_deviance_ws(
-                    ws,
-                    x.as_ref(),
-                    &y,
-                    &ids,
-                    &[],
-                    n,
-                    BetaMode::Fixed,
-                    &mut c,
-                )
-            };
-            let f0 = value(&mut ws, point);
-            assert!(
-                f0.is_finite(),
-                "{family:?}/{shape} regime {r}: value not finite"
+        let sum_ln_y: f64 = y[..n].iter().map(|v| v.ln()).sum();
+        let value = |ws: &mut GlmmWorkspace, pt: &[f64]| -> f64 {
+            ws.params[..m].copy_from_slice(&pt[..m]);
+            ws.pirls.u[..k].fill(0.0);
+            if let Some(&psi) = pt.get(m) {
+                ws.gamma_phi = psi.exp();
+            }
+            let mut c = crate::counters::EvalCounters::new();
+            let dev = super::deviance::laplace_deviance_ws(
+                ws,
+                x,
+                y,
+                ids,
+                extra_ids,
+                n,
+                BetaMode::Fixed,
+                &mut c,
             );
-            let mut g = vec![0.0; m];
-            super::assembled::gradient_at_mode_ws(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut g)
-                .unwrap_or_else(|| panic!("{family:?}/{shape} regime {r}: gradient declined"));
-            let gmax = g.iter().fold(0.0f64, |a, v| a.max(v.abs()));
-            let mut pt = point.clone();
-            for j in 0..m {
-                let h = 1e-5 * point[j].abs().max(1.0);
-                pt[j] = point[j] + h;
-                let fp = value(&mut ws, &pt);
-                pt[j] = point[j] - h;
-                let fm = value(&mut ws, &pt);
-                pt[j] = point[j];
-                let fd = (fp - fm) / (2.0 * h);
-                let tol = 1e-5 * fd.abs() + 1e-6 * (1.0 + gmax);
-                assert!(
-                    (g[j] - fd).abs() <= tol,
-                    "{family:?}/{shape} regime {r} coord {j}: at-mode {} vs FD {fd} (tol {tol:e})",
-                    g[j]
-                );
+            match pt.get(m) {
+                Some(&psi) => {
+                    let w = ws.weighted.then_some(&ws.prior_w[..n]);
+                    dev + crate::family::gamma_dispersion_term(psi, w, n, sum_ln_y)
+                }
+                None => dev,
+            }
+        };
+        for ln_phi in ln_phis {
+            for (r, regime) in regimes.iter().enumerate() {
+                let mut point = regime.clone();
+                point.extend(ln_phi);
+                let at = format!("{label} ln_phi {ln_phi:?} regime {r}");
+                let f0 = value(ws, &point);
+                assert!(f0.is_finite(), "{at}: value not finite");
+                let mut g = vec![0.0; point.len()];
+                super::assembled::gradient_at_mode_ws(ws, x, y, ids, extra_ids, p, n, &mut g[..m])
+                    .unwrap_or_else(|| panic!("{at}: gradient declined"));
+                if let Some(psi) = *ln_phi {
+                    g[m] = super::assembled::gamma_ln_phi_gradient(
+                        psi,
+                        ws.weighted.then_some(&ws.prior_w[..n]),
+                        n,
+                        ws.pirls.pen_dev,
+                        &point[..n_theta],
+                        &g[..n_theta],
+                    );
+                }
+                let gmax = g.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+                let mut pt = point.clone();
+                for j in 0..point.len() {
+                    let h = 1e-5 * point[j].abs().max(1.0);
+                    pt[j] = point[j] + h;
+                    let fp = value(ws, &pt);
+                    pt[j] = point[j] - h;
+                    let fm = value(ws, &pt);
+                    pt[j] = point[j];
+                    let fd = (fp - fm) / (2.0 * h);
+                    let tol = 1e-5 * fd.abs() + 1e-6 * (1.0 + gmax);
+                    assert!(
+                        (g[j] - fd).abs() <= tol,
+                        "{at} coord {j}: at-mode {} vs FD {fd} (tol {tol:e})",
+                        g[j]
+                    );
+                }
             }
         }
+    };
+    let mut cells = 0usize;
+    for &(family, shape) in GRADIENT_GATE_CELLS {
+        if !routed_without_dispersion(family) {
+            continue;
+        }
+        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+        check(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            &format!("{family:?}/{shape}"),
+            fixed_seed_theta(shape),
+            &[None],
+        );
         cells += 1;
     }
     assert!(cells > 0, "no routed gate cell");
+    for link in GAMMA_GATE_LINKS {
+        for (shape, np, n_crossed) in GAMMA_GATE_SHAPES {
+            for weighted in [false, true] {
+                let (mut ws, x, y, ids, extra_ids, p, n, rng) =
+                    gamma_gate_cell(link, shape, np, n_crossed, weighted);
+                let label = format!("Gamma/{link:?}/{shape} w={weighted}");
+                // `fit_glmm`'s plug-in seed: `D/Σw` at the β start, no random
+                // effect.
+                let (mut d, mut sw) = (0.0, 0.0);
+                for i in 0..n {
+                    let mut eta = ws.offset.as_ref().map_or(0.0, |o| o[i]);
+                    for j in 0..p {
+                        eta += x[(i, j)] * rng.beta[j];
+                    }
+                    d += ws.prior_w[i]
+                        * crate::family::dev_resid_eta(ws.family, f64::NAN, y[i], eta);
+                    sw += ws.prior_w[i];
+                }
+                let seed = (d / sw).ln();
+                let fit = gate_fit(
+                    &mut ws,
+                    x.as_ref(),
+                    &y,
+                    &ids,
+                    &extra_ids,
+                    None,
+                    &rng.beta,
+                    n,
+                );
+                assert!(fit.converged, "{label}: fit did not converge");
+                let opt = ws.gamma_phi.ln();
+                check(
+                    &mut ws,
+                    x.as_ref(),
+                    &y,
+                    &ids,
+                    &extra_ids,
+                    p,
+                    n,
+                    &label,
+                    rng,
+                    &[Some(seed), Some(opt), Some(opt + 1.0), Some(opt - 1.0)],
+                );
+            }
+        }
+    }
 }
 
-// --- B2: the gradient route ---
+// --- The gradient route ---
 
 /// `fit_glmm` cold (or from `theta_start`) on a gate fixture, target column 1.
 #[allow(clippy::too_many_arguments)]
-fn b2_fit(
+fn gate_fit(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
     y: &[f64],
@@ -9734,11 +9923,11 @@ fn b2_fit(
     )
 }
 
-/// Gate 1 in-crate: on every routed gate cell (binomial or Poisson, blocked
-/// and structured, n_θ ≥ 2) the gradient route's fit is converged and its
-/// deviance is at or below the BOBYQA route's within `1e-6`, cold and from a
-/// warm start at the BOBYQA optimum perturbed by 10%; one-θ cells do not
-/// route.
+/// On every routed gate cell (binomial or Poisson, and the Gamma cells on
+/// both links with and without weights and an offset, blocked and structured,
+/// n_θ ≥ 2) the gradient route's fit is converged and its deviance is at or
+/// below the BOBYQA route's within `1e-6`, cold and from a warm start at the
+/// BOBYQA optimum perturbed by 10%; one-θ cells do not route.
 #[test]
 fn gradient_route_matches_or_beats_the_bobyqa_route() {
     let mut routed = 0usize;
@@ -9747,22 +9936,21 @@ fn gradient_route_matches_or_beats_the_bobyqa_route() {
                      y: &[f64],
                      ids: &[u32],
                      extra_ids: &[Vec<u32>],
-                     p: usize,
+                     beta0: &[f64],
                      n: usize,
                      label: &str| {
-        let beta0 = vec![0.0; p];
         let plan = ws.route_plan;
         ws.route_plan = crate::optim::RoutePlan::BOBYQA;
-        let bob = b2_fit(&mut ws, x, y, ids, extra_ids, None, &beta0, n);
+        let bob = gate_fit(&mut ws, x, y, ids, extra_ids, None, beta0, n);
         let theta_bob = ws.params[..ws.n_theta].to_vec();
         assert!(
             ws.grad_report.is_none(),
             "{label}: BOBYQA plan ran a gradient search"
         );
         ws.route_plan = plan;
-        let cold = b2_fit(&mut ws, x, y, ids, extra_ids, None, &beta0, n);
+        let cold = gate_fit(&mut ws, x, y, ids, extra_ids, None, beta0, n);
         let warm_start: Vec<f64> = theta_bob.iter().map(|t| 1.1 * t).collect();
-        let warm = b2_fit(&mut ws, x, y, ids, extra_ids, Some(&warm_start), &beta0, n);
+        let warm = gate_fit(&mut ws, x, y, ids, extra_ids, Some(&warm_start), beta0, n);
         if ws.n_theta < 2 {
             assert!(ws.grad_report.is_none(), "{label}: a one-θ fit routed");
             return;
@@ -9783,7 +9971,7 @@ fn gradient_route_matches_or_beats_the_bobyqa_route() {
         }
     };
     for &(family, shape) in GRADIENT_GATE_CELLS {
-        if !b2_routed_family(family) {
+        if !routed_without_dispersion(family) {
             continue;
         }
         let (ws, x, y, ids, p, n) = fixture(family, shape);
@@ -9793,13 +9981,13 @@ fn gradient_route_matches_or_beats_the_bobyqa_route() {
             &y,
             &ids,
             &[],
-            p,
+            &vec![0.0; p],
             n,
             &format!("{family:?}/{shape}"),
         );
     }
     for &(family, shape, np, n_crossed) in STRUCTURED_GATE_CELLS {
-        if !b2_routed_family(family) {
+        if !routed_without_dispersion(family) {
             continue;
         }
         let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(family, np, n_crossed);
@@ -9811,17 +9999,119 @@ fn gradient_route_matches_or_beats_the_bobyqa_route() {
             &y,
             &ids,
             &extra_ids,
-            p,
+            &vec![0.0; p],
             n,
             &format!("{family:?}/{shape}"),
         );
     }
+    for link in GAMMA_GATE_LINKS {
+        for (shape, np, n_crossed) in GAMMA_GATE_SHAPES {
+            for weighted in [false, true] {
+                let (mut ws, x, y, ids, extra_ids, _, n, rng) =
+                    gamma_gate_cell(link, shape, np, n_crossed, weighted);
+                ws.pattern.structured_schur =
+                    super::workspace::StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+                check(
+                    ws,
+                    x.as_ref(),
+                    &y,
+                    &ids,
+                    &extra_ids,
+                    &rng.beta,
+                    n,
+                    &format!("Gamma/{link:?}/{shape} w={weighted}"),
+                );
+            }
+        }
+    }
     assert!(routed > 0, "no gate cell took the gradient route");
 }
 
-/// T5. The rule's table: in scope only binomial/Poisson Laplace with
-/// n_θ ≥ 2 on the blocked or structured layout; AGQ, NB, Gamma and one-θ
-/// shapes keep BOBYQA on both start kinds.
+/// A held Gamma φ on the gradient route: the search runs over `[θ | β̃]` at
+/// that φ, and its joint polish carries the inert `ln φ` slot. On every Gamma
+/// gate cell, at twice the BOBYQA route's free φ̂, the routed fit is converged
+/// and its deviance is at or below the BOBYQA route's at the same φ within
+/// `dev_eps` (4e-5), φ stays where it was held, and the search does not hand
+/// over to BOBYQA. The same at a held φ of exactly 1. At least one cell ends on
+/// the joint polish (rung 3), so the inert slot is exercised.
+#[test]
+fn gradient_route_matches_the_bobyqa_route_at_a_held_gamma_dispersion() {
+    let mut polished = 0usize;
+    for link in GAMMA_GATE_LINKS {
+        for (shape, np, n_crossed) in GAMMA_GATE_SHAPES {
+            for weighted in [false, true] {
+                let (mut ws, x, y, ids, extra_ids, _, n, rng) =
+                    gamma_gate_cell(link, shape, np, n_crossed, weighted);
+                ws.pattern.structured_schur =
+                    super::workspace::StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+                let label = format!("Gamma/{link:?}/{shape} w={weighted}");
+                let plan = ws.route_plan;
+                ws.route_plan = crate::optim::RoutePlan::BOBYQA;
+                let free = gate_fit(
+                    &mut ws,
+                    x.as_ref(),
+                    &y,
+                    &ids,
+                    &extra_ids,
+                    None,
+                    &rng.beta,
+                    n,
+                );
+                assert!(free.converged, "{label}: free fit");
+                // Twice the free φ̂, and exactly 1: at φ = 1 the value pass
+                // leaves `prior_w_phi` unwritten, and the gradient must read
+                // the prior weights instead.
+                for held in [2.0 * ws.gamma_phi, 1.0] {
+                    let label = format!("{label} φ={held}");
+                    ws.route_plan = crate::optim::RoutePlan::BOBYQA;
+                    ws.gamma_phi_held = Some(held);
+                    let bob = gate_fit(
+                        &mut ws,
+                        x.as_ref(),
+                        &y,
+                        &ids,
+                        &extra_ids,
+                        None,
+                        &rng.beta,
+                        n,
+                    );
+                    ws.route_plan = plan;
+                    let f = gate_fit(
+                        &mut ws,
+                        x.as_ref(),
+                        &y,
+                        &ids,
+                        &extra_ids,
+                        None,
+                        &rng.beta,
+                        n,
+                    );
+                    let (_, _, _, rung) = ws
+                        .grad_report
+                        .unwrap_or_else(|| panic!("{label}: not routed"));
+                    polished += usize::from(rung == 3);
+                    assert!(
+                        rung != 1 && !f.gradient_search_fallback,
+                        "{label}: the gradient search handed over"
+                    );
+                    assert!(bob.converged && f.converged, "{label}: not converged");
+                    assert_eq!(ws.gamma_phi, held, "{label}: φ moved");
+                    assert!(
+                        f.deviance <= bob.deviance + 4e-5,
+                        "{label}: gradient route {} vs BOBYQA {}",
+                        f.deviance,
+                        bob.deviance
+                    );
+                }
+            }
+        }
+    }
+    assert!(polished > 0, "no held-φ cell reached the joint polish");
+}
+
+/// The rule's table: in scope only binomial, Poisson and Gamma (both links)
+/// Laplace, with n_θ ≥ 2 on the blocked or structured layout; AGQ, NB and
+/// one-θ shapes keep BOBYQA on both start kinds.
 #[test]
 fn gradient_route_plan_follows_the_rule() {
     use crate::optim::{OuterOptimizer, RoutePlan};
@@ -9835,20 +10125,22 @@ fn gradient_route_plan_follows_the_rule() {
     assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "one θ");
     let (ws, ..) = fixture_with_nagq(logit, "q2s", 7);
     assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "AGQ");
-    for family in [
-        Family::NegativeBinomial {
-            link: crate::NegBinomialLink::Log,
-        },
-        Family::Gamma {
-            link: crate::GammaLink::Log,
-        },
-    ] {
-        let (ws, ..) = fixture(family, "q2s");
-        assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "{family:?}");
+    let nb = Family::NegativeBinomial {
+        link: crate::NegBinomialLink::Log,
+    };
+    let (ws, ..) = fixture(nb, "q2s");
+    assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "NB");
+    for link in GAMMA_GATE_LINKS {
+        let gamma = Family::Gamma { link };
+        let (ws, ..) = fixture(gamma, "q2s");
+        assert_eq!(ws.route_plan.cold, OuterOptimizer::Bfgs, "{gamma:?} cold");
+        assert_eq!(ws.route_plan.warm, OuterOptimizer::Bfgs, "{gamma:?} warm");
+        let (ws, ..) = fixture(gamma, "int1");
+        assert_eq!(ws.route_plan, RoutePlan::BOBYQA, "{gamma:?} one θ");
     }
 }
 
-/// T4. The hand-over rung: an iteration cap of 2 ends the gradient search on
+/// The hand-over rung: an iteration cap of 2 ends the gradient search on
 /// `MaxIter`, the BOBYQA route finishes from its incumbent, the fit converges
 /// at the BOBYQA route's optimum within `1e-6`, and the fallback is recorded
 /// for `Note::GradientSearchFallback`.
@@ -9861,10 +10153,10 @@ fn gradient_route_hands_over_on_the_iteration_cap() {
     let beta0 = vec![0.0; p];
     let plan = ws.route_plan;
     ws.route_plan = crate::optim::RoutePlan::BOBYQA;
-    let bob = b2_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    let bob = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
     ws.route_plan = plan;
     ws.grad_cfg.max_iter = 2;
-    let f = b2_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    let f = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
     let (stop, _, _, rung) = ws.grad_report.expect("routed");
     assert_eq!(stop, crate::optim::bfgs::BfgsStop::MaxIter);
     assert_eq!(rung, 1);
@@ -9880,51 +10172,159 @@ fn gradient_route_hands_over_on_the_iteration_cap() {
     assert!(f.n_eval > bob.n_eval.min(f.n_eval - 1));
 }
 
-/// T9. The gradient route keeps per-fit determinism: a routed fit on a
+/// The hand-over rung on Gamma, where the BOBYQA finish runs the `ln φ` scale
+/// probes and their gate from the gradient search's incumbent: the fit
+/// converges at the BOBYQA route's optimum within `1e-6` on both links.
+#[test]
+fn gradient_route_hands_over_on_gamma() {
+    for link in GAMMA_GATE_LINKS {
+        let (mut ws, x, y, ids, extra_ids, _, n, rng) = gamma_gate_cell(link, "q2s", 0, 0, false);
+        let plan = ws.route_plan;
+        ws.route_plan = crate::optim::RoutePlan::BOBYQA;
+        let bob = gate_fit(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            None,
+            &rng.beta,
+            n,
+        );
+        ws.route_plan = plan;
+        ws.grad_cfg.max_iter = 2;
+        let f = gate_fit(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            None,
+            &rng.beta,
+            n,
+        );
+        let (stop, _, _, rung) = ws.grad_report.expect("routed");
+        assert_eq!(stop, crate::optim::bfgs::BfgsStop::MaxIter, "{link:?}");
+        assert_eq!(rung, 1, "{link:?}");
+        assert!(f.converged, "{link:?}: the BOBYQA finish did not converge");
+        assert!(
+            (f.deviance - bob.deviance).abs() <= 1e-6,
+            "{link:?}: fallback {} vs BOBYQA {}",
+            f.deviance,
+            bob.deviance
+        );
+    }
+}
+
+/// `GradSearch::start_curvature` seeds the `ln φ` entry on a free Gamma
+/// inverse-link dispersion only. With an iteration cap of 0 the search ends
+/// at its start, so `ws.bfgs` holds the start inverse Hessian: on Gamma/log
+/// and under a held φ it is the identity, on Gamma/inverse its last diagonal
+/// entry is a positive `1/(Gₚ'' + P_φ)` below 1.
+#[test]
+fn gradient_route_seeds_ln_phi_on_the_inverse_link_only() {
+    for link in GAMMA_GATE_LINKS {
+        for held in [false, true] {
+            let (mut ws, x, y, ids, extra_ids, _, n, rng) =
+                gamma_gate_cell(link, "q2s", 0, 0, false);
+            if held {
+                ws.gamma_phi_held = Some(0.5);
+            }
+            ws.grad_cfg.max_iter = 0;
+            let _ = gate_fit(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &extra_ids,
+                None,
+                &rng.beta,
+                n,
+            );
+            let label = format!("{link:?} held={held}");
+            let (stop, ..) = ws.grad_report.expect("routed");
+            assert_eq!(stop, crate::optim::bfgs::BfgsStop::MaxIter, "{label}");
+            let h = ws.bfgs.inv_hessian();
+            let m = ws.n_theta + ws.p + usize::from(!held);
+            assert_eq!(h.len(), m * m, "{label}");
+            for i in 0..m {
+                for j in 0..m {
+                    let v = h[i * m + j];
+                    if link == GammaLink::Inverse && !held && i == m - 1 && j == i {
+                        assert!(v > 0.0 && v < 1.0, "{label}: ψ entry {v}");
+                    } else {
+                        assert_eq!(v, f64::from(u8::from(i == j)), "{label}: H[{i},{j}]");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The gradient route keeps per-fit determinism: a routed fit on a
 /// workspace that has fitted other data first (another response, and a warm
 /// start) matches a fresh workspace's fit of the same data bit for bit,
 /// because the search's state (`BfgsState`, the incumbent mode, the assembly
-/// scratch) is reset or rewritten per fit.
+/// scratch) is reset or rewritten per fit. On logit and on Gamma/log, whose
+/// `params` carry the fitted `ln φ`.
 #[test]
 fn gradient_route_refit_on_a_reused_workspace_is_bit_identical() {
-    let logit = Family::Binomial {
-        link: BinomialLink::Logit,
-    };
-    let (mut fresh, x, y, ids, p, n) = fixture(logit, "q2s");
-    let beta0 = vec![0.0; p];
-    let want = b2_fit(&mut fresh, x.as_ref(), &y, &ids, &[], None, &beta0, n);
-    assert!(fresh.grad_report.is_some(), "q2s did not route");
-    let (mut ws, ..) = fixture(logit, "q2s");
-    let y2: Vec<f64> = y.iter().map(|v| 1.0 - v).collect();
-    let _ = b2_fit(&mut ws, x.as_ref(), &y2, &ids, &[], None, &beta0, n);
-    let _ = b2_fit(
-        &mut ws,
-        x.as_ref(),
-        &y,
-        &ids,
-        &[],
-        Some(&[0.4, 0.1, 0.3]),
-        &beta0,
-        n,
-    );
-    let got = b2_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
-    assert_eq!(got.deviance.to_bits(), want.deviance.to_bits(), "deviance");
-    assert_eq!(got.n_eval, want.n_eval, "n_eval");
-    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-    assert_eq!(bits(&ws.params), bits(&fresh.params), "params");
-    assert_eq!(bits(&ws.betas), bits(&fresh.betas), "betas");
+    for family in [
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        Family::Gamma {
+            link: GammaLink::Log,
+        },
+    ] {
+        let (mut fresh, x, y, ids, p, n) = fixture(family, "q2s");
+        let beta0 = vec![0.0; p];
+        let want = gate_fit(&mut fresh, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+        assert!(fresh.grad_report.is_some(), "{family:?}: q2s did not route");
+        let (mut ws, ..) = fixture(family, "q2s");
+        let y2: Vec<f64> = match family {
+            Family::Gamma { .. } => y.iter().map(|v| 1.0 / v).collect(),
+            _ => y.iter().map(|v| 1.0 - v).collect(),
+        };
+        let _ = gate_fit(&mut ws, x.as_ref(), &y2, &ids, &[], None, &beta0, n);
+        let _ = gate_fit(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &[],
+            Some(&[0.4, 0.1, 0.3]),
+            &beta0,
+            n,
+        );
+        let got = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+        let at = format!("{family:?}");
+        assert_eq!(
+            got.deviance.to_bits(),
+            want.deviance.to_bits(),
+            "{at}: deviance"
+        );
+        assert_eq!(got.n_eval, want.n_eval, "{at}: n_eval");
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&ws.params), bits(&fresh.params), "{at}: params");
+        assert_eq!(bits(&ws.betas), bits(&fresh.betas), "{at}: betas");
+    }
 }
 
-/// T6. Units of X: the routed fit with the slope column multiplied by 1e3
-/// and by 1e-3 (`fit_glmm` directly, so no standardization upstream) ends at
-/// or below the BOBYQA route's deviance on the same scaled data within `1e-6`,
+/// Units of X: the routed fit with the slope column multiplied by 1e3 and by
+/// 1e-3 (`fit_glmm` directly, so no standardization upstream) ends at or
+/// below the BOBYQA route's deviance on the same scaled data within `1e-6`,
 /// and the logit fit at the unscaled optimum within `1e-7`. This is what
 /// decided the whitened β coordinates (`BetaScale`): in the caller's units
-/// the logit fit at 1e-3 stopped 5.5e-4 above the optimum. The column also
-/// carries the random slope, so its θ rescales by the inverse factor and the
-/// Poisson fixture's boundary optimum (every variance at 0) is hard for both
-/// routes there: at 1e-3 BOBYQA ends 1.8e-5 above it, BFGS 1.8e-6
-/// (2026-10-07).
+/// the logit fit at 1e-3 stopped 5.5e-4 above the optimum. On the `q2s`
+/// fixture the column also carries the random slope, so its θ rescales by the
+/// inverse factor and the Poisson fixture's boundary optimum (every variance
+/// at 0) is hard for both routes there: at 1e-3 BOBYQA ends 1.8e-5 above it,
+/// BFGS 1.8e-6 (2026-10-07). Gamma/log, with its free `ln φ`, runs on the
+/// structured `crossed6` cell instead, whose random effects are intercepts
+/// only, so the scaled column enters β alone: the kernel searches θ in the
+/// units of the slope column it is given, and only `fit_on`'s column scaling
+/// makes those unit-free.
 #[test]
 fn gradient_route_is_unit_invariant_in_beta() {
     for family in [
@@ -9934,21 +10334,37 @@ fn gradient_route_is_unit_invariant_in_beta() {
         Family::Poisson {
             link: PoissonLink::Log,
         },
+        Family::Gamma {
+            link: GammaLink::Log,
+        },
     ] {
-        let (mut ws, x, y, ids, p, n) = fixture(family, "q2s");
+        let cell = || match family {
+            Family::Gamma { link } => {
+                let (mut ws, x, y, ids, extra_ids, p, n, _) =
+                    gamma_gate_cell(link, "crossed6", 0, 6, false);
+                ws.pattern.structured_schur =
+                    super::workspace::StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+                (ws, x, y, ids, extra_ids, p, n)
+            }
+            _ => {
+                let (ws, x, y, ids, p, n) = fixture(family, "q2s");
+                (ws, x, y, ids, Vec::new(), p, n)
+            }
+        };
+        let (mut ws, x, y, ids, extra_ids, p, n) = cell();
         let beta0 = vec![0.0; p];
-        let base = b2_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+        let base = gate_fit(&mut ws, x.as_ref(), &y, &ids, &extra_ids, None, &beta0, n);
         for scale in [1e3, 1e-3] {
             let mut xs = x.clone();
             for i in 0..n {
                 xs[(i, 1)] *= scale;
             }
-            let (mut w2, ..) = fixture(family, "q2s");
-            let f = b2_fit(&mut w2, xs.as_ref(), &y, &ids, &[], None, &beta0, n);
+            let (mut w2, ..) = cell();
+            let f = gate_fit(&mut w2, xs.as_ref(), &y, &ids, &extra_ids, None, &beta0, n);
             assert!(w2.grad_report.is_some(), "{family:?} x{scale}: not routed");
-            let (mut wb, ..) = fixture(family, "q2s");
+            let (mut wb, ..) = cell();
             wb.route_plan = crate::optim::RoutePlan::BOBYQA;
-            let b = b2_fit(&mut wb, xs.as_ref(), &y, &ids, &[], None, &beta0, n);
+            let b = gate_fit(&mut wb, xs.as_ref(), &y, &ids, &extra_ids, None, &beta0, n);
             assert!(f.converged, "{family:?} x{scale}: not converged");
             assert!(
                 f.deviance <= b.deviance + 1e-6,
@@ -9968,7 +10384,7 @@ fn gradient_route_is_unit_invariant_in_beta() {
     }
 }
 
-/// B2.4. The GLMM curvature hint: a pilot fit's own final BFGS estimate is
+/// The GLMM curvature hint: a pilot fit's own final BFGS estimate is
 /// offered (`glmm_curvature_hint`), a hinted fit reads it without writing it,
 /// results do not depend on the order of hinted draws, and a hinted draw ends
 /// at or below the unhinted one's deviance within `1e-6`.
@@ -9979,7 +10395,7 @@ fn gradient_route_curvature_hint_is_read_only_and_order_free() {
     };
     let (mut pilot, x, y, ids, p, n) = fixture(logit, "q2s");
     let beta0 = vec![0.0; p];
-    let _ = b2_fit(&mut pilot, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    let _ = gate_fit(&mut pilot, x.as_ref(), &y, &ids, &[], None, &beta0, n);
     let hint = super::glmm_curvature_hint(&pilot).expect("a routed pilot offers a hint");
     assert_eq!(hint.dim(), pilot.n_theta + p);
     let hint_bits: Vec<u64> = hint.inv_hessian().iter().map(|v| v.to_bits()).collect();
@@ -9996,7 +10412,7 @@ fn gradient_route_curvature_hint_is_read_only_and_order_free() {
         let mut out = vec![(0u64, 0usize); draws.len()];
         for &d in order {
             ws.grad_hint_in = Some(hint.clone());
-            let f = b2_fit(&mut ws, x.as_ref(), &draws[d], &ids, &[], None, &beta0, n);
+            let f = gate_fit(&mut ws, x.as_ref(), &draws[d], &ids, &[], None, &beta0, n);
             assert!(ws.grad_hint_in.is_none(), "the hint outlived its call");
             out[d] = (f.deviance.to_bits(), f.n_eval);
         }
@@ -10009,7 +10425,7 @@ fn gradient_route_curvature_hint_is_read_only_and_order_free() {
     assert_eq!(hint_bits, after, "the fit wrote the hint");
     let (mut plain, ..) = fixture(logit, "q2s");
     for (d, yd) in draws.iter().enumerate() {
-        let f = b2_fit(&mut plain, x.as_ref(), yd, &ids, &[], None, &beta0, n);
+        let f = gate_fit(&mut plain, x.as_ref(), yd, &ids, &[], None, &beta0, n);
         assert!(
             f64::from_bits(a[d].0) <= f.deviance + 1e-6,
             "draw {d}: hinted {} vs unhinted {}",
@@ -10023,7 +10439,7 @@ fn gradient_route_curvature_hint_is_read_only_and_order_free() {
     }
 }
 
-/// T7. Quasi-separation: the `q2s` logit fixture with its response replaced by
+/// Quasi-separation: the `q2s` logit fixture with its response replaced by
 /// a near-step in the slope covariate (`y = 1` where `x₁ > 0`, every 13th row
 /// flipped), so β₁ runs off along a flat direction. The gradient route must
 /// either end converged at a deviance no worse than the BOBYQA route's by
@@ -10048,12 +10464,12 @@ fn gradient_route_handles_quasi_separation() {
         })
         .collect();
     let beta0 = vec![0.0; p];
-    let f = b2_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    let f = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
     let report = ws.grad_report;
     assert!(report.is_some(), "the quasi-separated fit did not route");
     let (mut wb, ..) = fixture(logit, "q2s");
     wb.route_plan = crate::optim::RoutePlan::BOBYQA;
-    let b = b2_fit(&mut wb, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    let b = gate_fit(&mut wb, x.as_ref(), &y, &ids, &[], None, &beta0, n);
     assert!(f.deviance.is_finite(), "routed deviance {}", f.deviance);
     if let Some((stop, _, _, rung)) = report {
         if rung == 0 {
@@ -10083,33 +10499,46 @@ fn gradient_route_handles_quasi_separation() {
 /// The second and third routed fits on a reused workspace allocate the same
 /// and no more than the same fits on the BOBYQA plan: the gradient search
 /// (its `BfgsState`, the assembly scratch kept under `GRAD_ASM_KEEP_BYTES`)
-/// allocates nothing per fit once the workspace has fitted once.
+/// allocates nothing per fit once the workspace has fitted once. On logit and
+/// on Gamma/log with its free `ln φ`.
 /// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests gradient_route_repeat_fits_allocate_no_more -- --ignored --test-threads=1`
 #[cfg(feature = "alloc-tests")]
 #[test]
 #[ignore]
 fn gradient_route_repeat_fits_allocate_no_more() {
     let _serial = crate::test_support::alloc_test_guard();
-    let logit = Family::Binomial {
-        link: BinomialLink::Logit,
-    };
-    let (mut wr, x, y, ids, p, n) = fixture(logit, "q2s");
-    let (mut wb, ..) = fixture(logit, "q2s");
-    wb.route_plan = crate::optim::RoutePlan::BOBYQA;
-    let beta0 = vec![0.0; p];
-    let mut blocks = |ws: &mut GlmmWorkspace| {
-        let prof = dhat::Profiler::builder().testing().build();
-        let _ = b2_fit(ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
-        let stats = dhat::HeapStats::get();
-        drop(prof);
-        stats.total_blocks
-    };
-    let _ = b2_fit(&mut wr, x.as_ref(), &y, &ids, &[], None, &beta0, n);
-    assert!(wr.grad_report.is_some(), "q2s did not route");
-    let _ = b2_fit(&mut wb, x.as_ref(), &y, &ids, &[], None, &beta0, n);
-    let r2 = blocks(&mut wr);
-    let r3 = blocks(&mut wr);
-    let b2 = blocks(&mut wb);
-    assert_eq!(r2, r3, "routed refits allocate a growing amount");
-    assert!(r2 <= b2, "routed refit {r2} blocks vs BOBYQA refit {b2}");
+    for family in [
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        Family::Gamma {
+            link: GammaLink::Log,
+        },
+    ] {
+        let (mut wr, x, y, ids, p, n) = fixture(family, "q2s");
+        let (mut wb, ..) = fixture(family, "q2s");
+        wb.route_plan = crate::optim::RoutePlan::BOBYQA;
+        let beta0 = vec![0.0; p];
+        let blocks = |ws: &mut GlmmWorkspace| {
+            let prof = dhat::Profiler::builder().testing().build();
+            let _ = gate_fit(ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+            let stats = dhat::HeapStats::get();
+            drop(prof);
+            stats.total_blocks
+        };
+        let _ = gate_fit(&mut wr, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+        assert!(wr.grad_report.is_some(), "{family:?}: q2s did not route");
+        let _ = gate_fit(&mut wb, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+        let r2 = blocks(&mut wr);
+        let r3 = blocks(&mut wr);
+        let b2 = blocks(&mut wb);
+        assert_eq!(
+            r2, r3,
+            "{family:?}: routed refits allocate a growing amount"
+        );
+        assert!(
+            r2 <= b2,
+            "{family:?}: routed refit {r2} blocks vs BOBYQA refit {b2}"
+        );
+    }
 }

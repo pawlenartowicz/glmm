@@ -2620,7 +2620,8 @@ fn stream_scatter<T: TailKernel>(
 /// forms `η`, the family pass and the scatter block by block. The trial's
 /// accept test runs after the sweep (the scatter of a rejected trial is
 /// discarded and redone on the halved `u`). Returns
-/// `(objective, dev, converged)` like `structured_laplace_deviance`.
+/// `(objective, dev, converged)`: the objective as `structured_laplace_deviance`
+/// returns it, and the raw PIRLS deviance `d(y,ũ)` alone.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn structured_stream_deviance<T: TailKernel>(
     family: Family,
@@ -3119,6 +3120,7 @@ mod tests {
                     bt_rows: Vec::new(),
                     agq_rows: Vec::new(),
                     agq_slow: Vec::new(),
+                    pen_dev: f64::NAN,
                 };
                 let mut structured = StructuredScratch {
                     core_blocks: vec![D4::ZERO; (qc * qc * s).max(1)],

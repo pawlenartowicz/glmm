@@ -56,6 +56,16 @@ pub(crate) trait GradObjective: Objective {
     /// is unavailable there, which ends the search (the route hands over to
     /// BOBYQA).
     fn gradient(&mut self, g: &mut [f64]) -> bool;
+
+    /// A coordinate whose curvature the objective knows at the start, as
+    /// `(index, inverse curvature)`: the driver seeds that diagonal entry of
+    /// its start inverse Hessian with it (see [`bfgs::bfgs_minimize`]). Asked
+    /// once, right after the start's value and gradient, and only when no
+    /// caller's inverse Hessian is given. `None` (the default) starts from
+    /// the identity.
+    fn start_curvature(&self) -> Option<(usize, f64)> {
+        None
+    }
 }
 
 /// A frozen curvature estimate for the gradient search, taken once from a
@@ -67,9 +77,10 @@ pub(crate) trait GradObjective: Objective {
 ///
 /// - LMM: the inverse of a finite-difference Hessian at θ̂ (forward
 ///   differences of the analytic gradient, symmetrized), over θ;
-/// - GLMM (binomial and Poisson Laplace): the pilot search's own final BFGS
-///   inverse-Hessian estimate, over `[θ | β̃]` with β whitened (`BetaScale`),
-///   so it costs nothing to take.
+/// - GLMM (binomial, Poisson and Gamma Laplace): the pilot search's own
+///   final BFGS inverse-Hessian estimate, over `[θ | β̃]` with β whitened
+///   (`BetaScale`), and `[θ | β̃ | ln φ]` on a free Gamma dispersion, so it
+///   costs nothing to take.
 ///
 /// The gradient search starts from it instead of the identity, so a draw near
 /// the pilot's optimum needs fewer iterations: on 20-draw loops from the truth
@@ -77,11 +88,17 @@ pub(crate) trait GradObjective: Objective {
 /// 0.25 (geometric mean over 10 LMM cells, 3 to 36 θ) and from 0.37 to 0.23
 /// with the pilot's BFGS estimate on 8 GLMM cells. The fit never writes it,
 /// so results do not depend on call order; a hint whose dimension does not
-/// match the fit's search is rejected.
+/// match the fit's search is rejected. A GLMM hint also carries the response
+/// units its search ran in, and a fit whose first search runs in other units
+/// ignores it.
 #[derive(Clone, Debug)]
 pub struct CurvatureHint {
     n: usize,
     inv_hessian: Vec<f64>,
+    /// The response units `c` of the GLMM search the hint was taken in (the
+    /// kernel fits `y/c` on Gamma's inverse link,
+    /// `fit::glmm::fit_glmm_in_units`); 1 everywhere else.
+    pub(crate) units: f64,
 }
 
 impl CurvatureHint {
@@ -96,9 +113,9 @@ impl CurvatureHint {
     }
 
     /// A hint from an `n×n` row-major inverse Hessian already in hand (the
-    /// GLMM search's final BFGS estimate); `None` unless it is symmetric
-    /// positive definite and finite.
-    pub(crate) fn from_inverse(n: usize, inv_hessian: &[f64]) -> Option<Self> {
+    /// GLMM search's final BFGS estimate, in that search's `units`); `None`
+    /// unless it is symmetric positive definite and finite.
+    pub(crate) fn from_inverse(n: usize, inv_hessian: &[f64], units: f64) -> Option<Self> {
         if inv_hessian.len() != n * n || inv_hessian.iter().any(|v| !v.is_finite()) {
             return None;
         }
@@ -111,7 +128,11 @@ impl CurvatureHint {
             }
         }
         spd_inverse(n, &h)?;
-        Some(Self { n, inv_hessian: h })
+        Some(Self {
+            n,
+            inv_hessian: h,
+            units,
+        })
     }
 
     /// The hint at `x` within `[lo, hi]` from `grad` (the gradient at a point,
@@ -157,7 +178,11 @@ impl CurvatureHint {
                 hm[j * n + i] = a;
             }
         }
-        spd_inverse(n, &hm).map(|inv_hessian| Self { n, inv_hessian })
+        spd_inverse(n, &hm).map(|inv_hessian| Self {
+            n,
+            inv_hessian,
+            units: 1.0,
+        })
     }
 }
 
@@ -228,7 +253,7 @@ pub(crate) enum OuterOptimizer {
 }
 
 /// The optimizer a route's θ search runs on a cold fit and on a warm one,
-/// fixed per workspace from the shape alone (the GLMM gradient route, B2). A
+/// fixed per workspace from the shape alone (the GLMM gradient route). A
 /// fit reads the member for its start kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RoutePlan {

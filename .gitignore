@@ -27,11 +27,10 @@ python/glmm/_native*.pyd
 !/validation/grid/data/fast/
 # read by the weighted-AGQ lib test via include_str!, so it must survive a fresh checkout.
 !/validation/grid/data/gaml_int1_g3000p20_bal_base_wts.csv
-# glmm runs are committed only when started with `--keep`; everything else lands in
-# scratch/. Oracle runs ARE committed and are not listed here.
-/validation/grid/runs/glmm/scratch/
-/validation/grid/runs/glmm_python/scratch/
-/validation/grid/runs/glmm_r/scratch/
-/validation/grid/runs/glmm_wasm/scratch/
+# Every grid run is built in scratch/; only the kept slots last/ and last-timed/
+# are committed (grid/promote.sh). The per-worker part files are a copy of
+# results.jsonl.
+/validation/grid/runs/*/scratch/
+/validation/grid/runs/*/*/results.part*.jsonl
 # run.sh launch logs for the long oracle passes.
 /validation/grid/*.log

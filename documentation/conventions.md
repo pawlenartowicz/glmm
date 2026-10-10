@@ -11,14 +11,16 @@ Gaussian mixed models (LMM) are fit by **profiled REML only** — there is no ML
 switch on this path. The fixed effects β and the residual scale σ² are
 profiled out analytically; the optimizer searches only the relative covariance
 parameter θ. See [`algorithms-lmm.md`](algorithms-lmm.md) for the objective
-and the BOBYQA schedule that minimizes it.
+and the search that minimizes it: BOBYQA, or BFGS on the per-group route
+(random slopes on the only grouping factor).
 
 Non-Gaussian mixed models (GLMM) are fit by **PIRLS + Laplace** by default
-(`nAGQ = 1`, `glmer`-faithful). Adaptive Gauss–Hermite quadrature is opt-in via
-`nagq`/`nAGQ` (an odd integer up to 25), and is honored on binomial and
-Poisson GLMMs with a single grouping factor and up to 3 random effects per
-group; on any other shape the Python and R surfaces warn and fall back to
-Laplace. See
+(`nAGQ = 1`): `glmer`'s objective on the canonical links (logit, Poisson log),
+glmmTMB's on probit, cloglog, negative binomial and Gamma. Adaptive
+Gauss–Hermite quadrature is opt-in via `nagq`/`nAGQ` (an odd integer up to
+25), and is honored on binomial, Poisson, negative-binomial and Gamma GLMMs
+with a single grouping factor and up to 3 random effects per group; on any
+other mixed shape the Python and R surfaces warn and fall back to Laplace. See
 [`algorithms-glmm.md`](algorithms-glmm.md) for the PIRLS inner loop and the
 AGQ gate.
 
@@ -63,9 +65,10 @@ For GLMM, two genuinely different Wald covariances are offered, selected by
   not positive definite, the fit falls back to the Rx covariance below. The
   finite-difference Hessian also falls back when a perturbed deviance is
   non-finite.
-- **Rx** (conditional on θ̂): the expected-information Schur complement of the
-  β block, inverted directly from the factors PIRLS already left behind. This
-  is cheaper but assumes β–θ orthogonality — exact for the Gaussian LMM, but
+- **Rx** (conditional on θ̂): the Schur complement of the β block (expected
+  information on canonical links, observed curvature on the others),
+  inverted directly from the factors PIRLS already left behind. This is
+  cheaper but assumes β–θ orthogonality — exact for the Gaussian LMM, but
   anticonservative for a GLMM, where the IRLS weights couple β and θ.
 
 Coefficient tables report a Wald z-statistic and a two-sided `Pr(>|z|)`
@@ -173,8 +176,10 @@ themselves.
 **`diagnostics` is the channel these live on.** `converged`, `singular`
 and `aliased` are the three most-read fields and stay at the top level of the
 result (properties over `diagnostics` in Python; unchanged top-level fields in
-R), but they are three of six: the full report is `diagnostics.converged`,
-`.singular`, `.aliased`, `.boundary`, `.pinned`, `.notes`.
+R), but they are three of nine: the full report is `diagnostics.converged`,
+`.singular`, `.aliased`, `.boundary`, `.pinned`, `.notes`, `.n_grad`,
+`.outer_stop`, `.outer_decrement`. In Python and R the last three sit on the
+fit itself, not in `diagnostics`.
 
 - `boundary` says where the accepted θ sits — `Interior`, `AtBoundary` (≥ 1
   variance component pinned at 0), or `NoOptimum` (the optimizer capped out at
@@ -187,12 +192,17 @@ R), but they are three of six: the full report is `diagnostics.converged`,
   `varcorr` block layout so `pinned[g][i]` pairs with `stddev_corr(g)`'s `i`-th
   stddev. Empty means "nothing to report" (no components at all, or none
   pinned), not "checked and none pinned."
-- `notes` carries solver observations that have no dedicated flag. Five kinds:
+- `n_grad`, `outer_stop` and `outer_decrement` describe the BFGS θ search:
+  its gradient evaluations, why it stopped, and its estimate of the deviance
+  decrease left. They are 0, `None` (R: `NA`) and NaN on a fit that ran no
+  gradient search.
+- `notes` carries solver observations that have no dedicated flag. There are
+  twelve kinds; [`warnings.md`](warnings.md) gives the warning each one
+  raises. Four of them in more detail:
   - `IllConditioned`: two or more fixed-effect columns are entangled —
     near-collinear but not exactly redundant. That design is **fitted, not
     refused**: the coefficients are real and the standard errors are honest
-    (large, because the data genuinely cannot separate the columns), where an
-    older version of this kernel returned `NaN` for the whole fit. Contrast
+    (large, because the data genuinely cannot separate the columns). Contrast
     `aliased`, which is the genuinely-redundant case — an exactly aliased
     column is still dropped and reported as `NaN`, matching R.
   - `PirlsExhausted`: a GLMM's inner PIRLS solve ran its full iteration cap

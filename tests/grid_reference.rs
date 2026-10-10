@@ -1,7 +1,6 @@
 #![cfg(feature = "formula")]
 //! Saved-reference check: refit every `fast` cell of the accuracy grid and
-//! compare it against the newest committed glmm run under
-//! `validation/grid/runs/glmm/`.
+//! compare it against the kept glmm run, `validation/grid/runs/glmm/last/`.
 //!
 //! This is a REGRESSION gate against the crate's own recorded answers, not a
 //! cross-engine agreement check. It needs no R, no Julia and no network: the
@@ -17,8 +16,9 @@
 //! drift would read as a regression.
 //!
 //! WHAT A FAILURE MEANS, in the order the test checks it:
-//!   * no committed run with `subset: "full"` -- nothing here covers the cells
-//!     this gate reads. A partial run is not a smaller reference, it is not one.
+//!   * no `last/` run, or one without `subset: "full"` -- nothing here covers
+//!     the cells this gate reads. A partial run is not a smaller reference, it
+//!     is not one.
 //!   * `engine_version` mismatch -- the crate version moved and nobody recorded
 //!     a new reference run. Record one (see the message the test prints).
 //!   * a `fast` cell with no record, or a record that did not converge -- the
@@ -57,57 +57,31 @@ fn read_json(path: &str) -> Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
 }
 
-/// The glmm run this gate compares against: the newest run directory under
-/// `runs/glmm/` whose `run_meta.json` says `subset: "full"`.
-///
-/// Two filters, each for its own reason.
-///
-/// `scratch/` is skipped. That is where a run started without `--keep` lands, it
-/// is gitignored, and a local smoke run must never be the reference a push is
-/// gated on.
+/// The glmm run this gate compares against: `runs/glmm/last/`, the one kept
+/// full run (`validation/grid/promote.sh`). `scratch/` holds every other run, is
+/// gitignored, and a local smoke run there must never be the reference a push
+/// is gated on.
 ///
 /// `subset` must be `"full"`. Only an invocation that fitted the whole manifest
 /// covers the cells this gate reads, and `run.sh` is the only writer of that
-/// field. The filter is not decoration: a `--fast --keep` run lands right beside
-/// the baseline, so without it the newest directory could be a 58-cell run that
-/// happens to carry the same cells, or a cell-restricted run that carries almost
-/// none.
-///
-/// Among what is left, newest wins, by the `date` field of `run_meta.json`
-/// compared as a string. The dates are ISO-8601 with an offset, so string order
-/// is time order for runs recorded in one zone, which is what a committed
-/// reference run is.
-fn newest_committed_run() -> (String, Value) {
-    let root = format!("{GRID}/runs/glmm");
-    let mut best: Option<(String, String, Value)> = None;
-    for entry in std::fs::read_dir(&root).unwrap_or_else(|e| panic!("read dir {root}: {e}")) {
-        let dir = entry.expect("dir entry").path();
-        if !dir.is_dir() || dir.file_name().is_some_and(|n| n == "scratch") {
-            continue;
-        }
-        let dir = dir.to_str().expect("utf-8 path").to_string();
-        if !std::path::Path::new(&format!("{dir}/run_meta.json")).exists()
-            || !std::path::Path::new(&format!("{dir}/results.jsonl")).exists()
-        {
-            continue;
-        }
-        let meta = read_json(&format!("{dir}/run_meta.json"));
-        if meta["subset"].as_str() != Some("full") {
-            continue;
-        }
-        let date = meta["date"].as_str().expect("run_meta.date").to_string();
-        if best.as_ref().is_none_or(|(d, _, _)| date > *d) {
-            best = Some((date, dir, meta));
-        }
-    }
-    let (_, dir, meta) = best.unwrap_or_else(|| {
+/// field; promote.sh puts nothing else in `last/`, and this check is what
+/// catches a hand-copied run.
+fn committed_run() -> (String, Value) {
+    let dir = format!("{GRID}/runs/glmm/last");
+    if !std::path::Path::new(&format!("{dir}/run_meta.json")).exists()
+        || !std::path::Path::new(&format!("{dir}/results.jsonl")).exists()
+    {
         panic!(
-            "no committed glmm run with subset \"full\" under {root} (scratch/ \
-             excluded). Only a full run covers the cells this gate reads. Record \
-             one with `validation/grid/run.sh glmm --keep --label \"release \
-             <version> baseline\"` and commit it."
-        )
-    });
+            "no committed glmm run at {dir}. Record one with \
+             `validation/grid/run.sh glmm --keep --label \"<date>\"` and commit it."
+        );
+    }
+    let meta = read_json(&format!("{dir}/run_meta.json"));
+    assert_eq!(
+        meta["subset"].as_str(),
+        Some("full"),
+        "{dir} is not a full run; only a full run covers the cells this gate reads"
+    );
     (dir, meta)
 }
 
@@ -228,10 +202,8 @@ const GATED: [&str; 11] = [
 #[test]
 fn fast_cells_match_the_committed_glmm_run() {
     let manifest = read_json(&format!("{GRID}/manifest.json"));
-    let (run_dir, meta) = newest_committed_run();
-    // Printed so the run being gated against is never a guess. `subset` is
-    // "full" by the selection rule, not by luck -- `newest_committed_run` skips
-    // anything else -- and printing it is what makes that visible in a log.
+    let (run_dir, meta) = committed_run();
+    // Printed so the run being gated against is never a guess.
     println!(
         "reference run: {run_dir}\n  subset: {}   label: {}   cells: {}",
         meta["subset"], meta["label"], meta["cells"]
@@ -243,12 +215,10 @@ fn fast_cells_match_the_committed_glmm_run() {
     assert_eq!(
         meta["engine_version"].as_str(),
         Some(env!("CARGO_PKG_VERSION")),
-        "the newest committed glmm run {run_dir} was fitted by glmm {}, but this \
+        "the committed glmm run {run_dir} was fitted by glmm {}, but this \
          crate is {}. Record a new full run with `validation/grid/run.sh glmm \
-         --keep --label \"release {} baseline\"`, commit it, and do not edit the \
-         old one.",
+         --keep --label \"<date>\"` and commit it.",
         meta["engine_version"],
-        env!("CARGO_PKG_VERSION"),
         env!("CARGO_PKG_VERSION")
     );
 

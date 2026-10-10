@@ -408,7 +408,7 @@ fn mode_solve_f64(
         let saved_schur = pattern.structured_schur.take();
         let saved_force_dense = pattern.force_dense_schur;
         pattern.force_dense_schur = false;
-        let (dev, _dev_scaled, conv, _raw_finite) = structured_laplace_deviance::<f64>(
+        let (dev, _pen_dev, conv, _raw_finite) = structured_laplace_deviance::<f64>(
             family,
             nb_theta,
             g,
@@ -436,7 +436,7 @@ fn mode_solve_f64(
         pattern.force_dense_schur = saved_force_dense;
         conv && dev.is_finite()
     } else {
-        let (dev, _dev_scaled, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
+        let (dev, _pen_dev, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
             family,
             nb_theta,
             g,
@@ -744,7 +744,7 @@ pub(crate) fn gradient_f64_with_dev(
 
 /// The Laplace gradient `dD*/dγ`, `γ = [θ | β]`, at the mode state the LAST
 /// value evaluation left, with no mode solve: the gradient search's half of
-/// "one mode solve per point" (B2, 2026-10-07). Written into `grad[..n_θ + p]`.
+/// "one mode solve per point". Written into `grad[..n_θ + p]`.
 ///
 /// `laplace_deviance` with `BetaMode::Fixed` at full PIRLS tolerance at the
 /// point `params` leaves `pirls.{eta, prob, w, u}`, the per-cluster factors
@@ -765,8 +765,10 @@ pub(crate) fn gradient_f64_with_dev(
 ///
 /// `None` where [`gradient_f64`] refuses: a clamped η row, a non-PD observed
 /// factor (non-canonical links). The caller has checked the layout (blocked,
-/// or structured within the dual tail bound, never packed) and that the fit
-/// has no dispersion coordinate. `asm` is the per-fit scratch, sized on the
+/// or structured within the dual tail bound, never packed). On Gamma the
+/// caller passes as `prior_w` the weights `wᵢ/φ` the value evaluation handed
+/// PIRLS, so the result is the gradient at that fixed φ; the `ln φ` entry is
+/// [`gamma_ln_phi_gradient`]'s. `asm` is the per-fit scratch, sized on the
 /// first call from the workspace's row capacity and reused while the shape
 /// matches, so a search allocates nothing per gradient.
 #[allow(clippy::too_many_arguments)]
@@ -908,7 +910,9 @@ pub(crate) fn gradient_at_mode(
 
 /// [`gradient_at_mode`] on a whole workspace, at `ws.params`: the tests'
 /// entry. `None` also on a shape the assembly does not route (packed, AGQ,
-/// past the dual tail bound) and on a dispersion-scaled workspace.
+/// past the dual tail bound). On a dispersion-scaled workspace it reads the
+/// weights `prior_wᵢ/φ` the value evaluation left in `prior_w_phi`, and
+/// `prior_w` itself at φ = 1, as `glmm::GradSearch` does.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gradient_at_mode_ws(
@@ -921,9 +925,10 @@ pub(crate) fn gradient_at_mode_ws(
     n: usize,
     grad: &mut [f64],
 ) -> Option<()> {
-    if ws.dispersion_scaled() || !assembly_routes(ws, n) || ws.layout == GlmmLayout::Packed {
+    if !assembly_routes(ws, n) || ws.layout == GlmmLayout::Packed {
         return None;
     }
+    let scaled = ws.dispersion_scaled();
     let GlmmWorkspace {
         groupings,
         family,
@@ -932,6 +937,7 @@ pub(crate) fn gradient_at_mode_ws(
         params,
         z_buf,
         prior_w,
+        prior_w_phi,
         pirls,
         structured,
         pattern,
@@ -949,7 +955,7 @@ pub(crate) fn gradient_at_mode_ws(
         extra_ids,
         &params[..m],
         z_buf,
-        prior_w,
+        if scaled { prior_w_phi } else { prior_w },
         pirls,
         structured,
         pattern,
@@ -959,6 +965,34 @@ pub(crate) fn gradient_at_mode_ws(
         n,
         grad,
     )
+}
+
+/// The `ψ = ln φ` entry of the Gamma Laplace gradient at fixed `(θ, β)`:
+///
+/// ```text
+///   ∂F/∂ψ = Gₚ'(ψ) − P_φ − ½·θ·∇_θF
+/// ```
+///
+/// with `F = D/φ + ‖û‖² + log|A| + Gₚ(ψ)` and `P_φ = D/φ + ‖û‖²` (`pen_dev`,
+/// the value evaluation's `pirls.pen_dev`). In `ξ = θ·e^{−ψ/2}` the objective
+/// is `e^{−ψ}·P(ξ, β) + log|A|(ξ, β) + Gₚ(ψ)`, `P` and `log|A|` on the φ = 1
+/// weights, so `∂F/∂ψ` at fixed ξ is `Gₚ'(ψ) − P_φ`. Holding θ instead moves
+/// ξ as `∂ξ/∂ψ = −ξ/2`, and `ξ·∇_ξF = θ·∇_θF` because Λ is linear in θ; so
+/// `grad_theta` is the θ block of [`gradient_at_mode`] at the same φ, in the
+/// units of `theta`, and any linear θ parametrization gives the same dot
+/// product.
+///
+/// `weights` and `n` are as `family::gamma_dispersion_term` takes them.
+pub(crate) fn gamma_ln_phi_gradient(
+    ln_phi: f64,
+    weights: Option<&[f64]>,
+    n: usize,
+    pen_dev: f64,
+    theta: &[f64],
+    grad_theta: &[f64],
+) -> f64 {
+    let theta_dot: f64 = theta.iter().zip(grad_theta).map(|(t, g)| t * g).sum();
+    crate::family::gamma_dispersion_term_d1(ln_phi, weights, n) - pen_dev - 0.5 * theta_dot
 }
 
 /// The joint Laplace Hessian `d²D*/dγdγ'` at the parameters in `ws.params`,
@@ -1591,7 +1625,7 @@ fn run_assembled_hessian<T: Seed>(
                 );
                 (obj.value(), conv)
             } else if extras {
-                let (obj, _dev_scaled, conv, _raw_finite) = structured_laplace_deviance::<T>(
+                let (obj, _pen_dev, conv, _raw_finite) = structured_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     g,
@@ -1621,7 +1655,7 @@ fn run_assembled_hessian<T: Seed>(
                 );
                 (obj.value(), conv)
             } else {
-                let (obj, _dev_scaled, conv, _raw_finite) = blocked_laplace_deviance::<T>(
+                let (obj, _pen_dev, conv, _raw_finite) = blocked_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     g,
@@ -1942,7 +1976,7 @@ fn blocked_chunks<T: Seed>(
                 } else {
                     None
                 };
-                let (obj, _dev_scaled, conv, _raw_finite) = blocked_laplace_deviance::<T>(
+                let (obj, _pen_dev, conv, _raw_finite) = blocked_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     gb,

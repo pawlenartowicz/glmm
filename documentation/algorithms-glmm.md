@@ -19,7 +19,8 @@ factor with up to 3 random effects per group, binomial/Poisson/negative-binomial
 The recurring symbols on this page, defined once here before first use:
 
 - **θ** — the random-effect covariance parameter, in the same relative-Cholesky
-  sense as the LMM page; the outer BOBYQA optimises it.
+  sense as the LMM page; the outer search optimises it (BOBYQA, or BFGS on
+  the gradient route).
 - **Λ = Λ_θ** — the relative Cholesky factor of the random-effect covariance.
 - **Z, M** — the random-effect design and its scaled form `M = ZΛ_θ`, the design
   PIRLS actually works in.
@@ -40,8 +41,8 @@ The recurring symbols on this page, defined once here before first use:
 
 ## Dispatch within the GLMM path
 
-**Code:** `classify_design` and the `(family, Some(re))` arm of the dispatch
-match in `fit_warm` (`src/fit/mod.rs`); `assert_model_shape`
+**Code:** `classify_design` (`src/fit/mod.rs`) and the `(family, Some(_))` arm
+of the dispatch match in `build_workspace` (`src/fit/core.rs`); `assert_model_shape`
 (`src/fit/common.rs`); envelope caps in `src/consts.rs` (`MAX_PRIMARY_Q`,
 `MAX_EXTRA_GROUPINGS`, `MAX_EXTRA_Q`, `MAX_CROSSED_LEVELS`).
 
@@ -93,7 +94,7 @@ GLMM shape, AGQ included (see the weights paragraph in the PIRLS section).
 arm (the packed-row layout) by `sim_binomial_slope_crossed` (a slope-carrying
 crossed extra → `fit_sparse_binomial_slope_crossed_is_pinned` in
 `src/sparse/tests.rs`) and the over-count rungs `sim_sparse_binomial` / `sim_sparse_poisson`
-(rungs 8–9, green against both lme4 and MixedModels.jl).
+(rungs 8–9, grid cells gated against lme4, glmmTMB and MixedModels.jl).
 
 ## PIRLS inner loop
 
@@ -248,7 +249,7 @@ iterate (β in lockstep in Profile mode), which maps an eigenvalue λ of the
 undamped step to `(1 + λ)/2`. The detector is off on dual solves, whose
 one-step exactness it would break. A solve that converges before it fires is
 bit-identical. **Validation:** `nb_pirls_two_cycle_is_damped_and_the_fit_converges`
-(grid cell `nb_cross4_g300p5`, which exhausted the cap before).
+(grid cell `nb_cross4_g300p5_bal_base`, whose PIRLS solves two-cycle without the damping).
 
 **Prior weights.** With `FitOptions::weights`, PIRLS folds `wᵢ` into the
 working weight (`wᵢ·W̃ᵢ`), the deviance contribution (`wᵢ·devᵢ`), and the
@@ -349,9 +350,9 @@ never mixed within a fit:
   own comments for the full derivation: `src/glmm/pirls/blocked.rs`,
   `src/glmm/pirls/blocked_extras.rs`). Because this θ-only pass already
   reaches the Laplace optimum, no joint polish follows — its status alone
-  gates convergence, on the shapes `exact_profile_shape` selects (nAGQ=1,
-  and either no extra groupings or a structured-extras shape within
-  `structured_extras_eligible`; Gamma included, its `ln φ` searched beside θ
+  gates convergence, on the shapes `exact_profile_shape` selects (nAGQ=1 on
+  any layout but the packed one — the blocked layout with no extra groupings,
+  or the structured layout within `structured_extras_eligible`; Gamma included, its `ln φ` searched beside θ
   as NB's `ln θ_NB` is, see [Gamma dispersion](#gamma-dispersion)): the kernel steps with the exact curvature, so
   its own factor gives the û-path adjoint solve its `Ã = A_obs` on every link,
   and the route carries no canonical-link restriction on either shape.
@@ -425,8 +426,8 @@ correlations: measured 2026-10-01 over five start nudges of 1e-9, `cbpp_agq7`
 eleven other joint-search cells measured the median counts agree to 5%, but
 for one wide Gamma cell on the singular boundary (+22%), whose own count spans
 16802 to 23113 across six nudges.
-**Code:** `BetaScale` (`src/glmm/workspace.rs`), its three call sites in
-`fit_glmm`. **Validation:** the Gamma GLMM cases of
+**Code:** `BetaScale` (`src/glmm/workspace.rs`), its call sites in
+`fit_glmm` and in the SE block (`src/glmm/se.rs`). **Validation:** the Gamma GLMM cases of
 `unit_invariance_on_every_route` (`src/fit/standardize_tests.rs`).
 
 The design Gram leaves out the working weights `W`. Where they span decades
@@ -473,7 +474,7 @@ minimum, checked with `any_within` exactly as `fit_glmm` does.
 **Warm-start guard and `PqlThenJoint` fallback.** A warm fit
 (`theta_start.is_some()`) first evaluates the outer objective — the route's
 own Profile mode when stage 1 runs, `BetaMode::Fixed` otherwise — at both the
-caller's θ₀ and the blind cold start `GlmmWorkspace::new` would have used, and
+caller's θ₀ and the blind cold start `GlmmWorkspace::from_groupings` would have used, and
 begins the search from whichever is lower; a tie or a non-finite warm value
 goes to cold. A start whose θ is the blind θ₀ bit for bit skips the guard on
 every route: both candidates would be the same point `[θ₀ | β₀]`, so the
@@ -541,7 +542,7 @@ structured ones with a crossed tail,
 `far_warm_starts_reach_cold_optimum_with_the_border_trust_region` the far
 starts that fail without the trust region.
 
-### Gradient search (BFGS) on binomial and Poisson Laplace fits
+### Gradient search (BFGS) on binomial, Poisson and Gamma Laplace fits
 
 **Code:** `gradient_route_plan`, `GradSearch` and the gradient-route block of
 `fit_glmm` (`src/glmm/mod.rs`); `assembled::gradient_at_mode`
@@ -549,20 +550,58 @@ starts that fail without the trust region.
 (`src/optim/bfgs.rs`), shared with the LMM's per-group route
 ([`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs)).
 
-**When.** A Laplace fit (`nAGQ = 1`) of a binomial (any link) or Poisson GLMM
-with at least two θ on the blocked or the structured layout searches with
-projected BFGS instead of the `ExactProfile` BOBYQA search. A warm fit (a
-caller's θ start the start guard keeps or compares) does too, except one with
-no random-slope block whose primary grouping averages 50 rows per level or
-more (`GRAD_WARM_SCALAR_ROWS_MAX`), which stays on BOBYQA. NB, Gamma, AGQ,
-the packed layout and one-θ fits keep their BOBYQA routes. The rule reads the
-shape and the start kind only.
+**When.** A Laplace fit (`nAGQ = 1`) of a binomial (any link), Poisson or
+Gamma (log and inverse link) GLMM with at least two θ on the blocked or the
+structured layout searches with projected BFGS instead of the `ExactProfile`
+BOBYQA search. A warm fit (a caller's θ start the start guard keeps or
+compares) does too, except one with no random-slope block whose primary
+grouping averages 50 rows per level or more (`GRAD_WARM_SCALAR_ROWS_MAX`),
+which stays on BOBYQA. NB (its `ln θ_NB` changes the variance function, and
+the gradient has no entry for it), AGQ, the packed layout and one-θ fits keep
+their BOBYQA routes. The rule reads the shape and the start kind only.
 
 **The objective** is the fixed-β Laplace deviance over `γ̃ = [θ | β̃]`, θ on
 the symmetric box `±THETA_HI`, β whitened as the joint BOBYQA search's
 (`BetaScale`, `β̃ = Lᵀβ`). Every evaluation runs PIRLS at `pirls_tol` from the
 incumbent's mode. A value whose PIRLS solve runs its iteration cap is a
 failed trial, so an accepted point always rests on a converged mode.
+
+**The `ln φ` coordinate.** On a Gamma fit with a free dispersion the point is
+`[θ | β̃ | ψ]`, `ψ = ln φ_int` on the internal weights (see
+[Gamma dispersion](#gamma-dispersion)), not whitened. Its box and its start are
+the BOBYQA route's: `[ln GAMMA_PHI_LO, ln GAMMA_PHI_HI]`, from the plug-in
+seed `D/Σŵ` or a carried φ. A value evaluation runs PIRLS on the weights
+`wᵢ/φ` and adds `Gₚ(ψ)`, as the BOBYQA objective does. The ψ entry of the
+gradient has a closed form (`assembled::gamma_ln_phi_gradient`):
+
+```text
+  ∂F/∂ψ |_(θ, β) = Gₚ'(ψ) − P_φ − ½·θ·∇_θF,   P_φ = D(û)/φ + ‖û‖²
+```
+
+In `ξ = θ·e^{−ψ/2}` the objective is `F = e^{−ψ}·P(ξ, β) + log|A| + Gₚ(ψ)`,
+with `log|A|` free of ψ, so at fixed ξ the derivative is `Gₚ'(ψ) − P_φ`. The
+search holds θ, not ξ; ξ moves as `∂ξ/∂ψ = −ξ/2`, and `ξ·∇_ξF = θ·∇_θF`
+because Λ is linear in θ. `P_φ` is the value evaluation's `dev + pen`, and
+`θ·∇_θF` is a dot product of entries the same gradient call writes, so the
+entry costs one O(n) sum. The θ and β entries are the binomial/Poisson ones on
+the weights `wᵢ/φ`. A held φ leaves the search on `[θ | β̃]` at that φ.
+The `ln φ` scale probes of the BOBYQA route (`DISP_SCALE_*`) do not run here.
+
+**Start curvature of `ψ` on the inverse link.** The driver starts from the
+identity, which treats ψ like a θ coordinate, while ψ's curvature at fixed ξ,
+`Gₚ''(ψ) + P_φ`, is of order n. On the inverse link the search seeds ψ's
+diagonal entry of the start inverse Hessian with `1/(Gₚ''(ψ) + P_φ)`
+(`GradSearch::start_curvature`), unless a curvature hint is given. The
+first-step cap and Shanno's first rescaling then read and scale only the
+other coordinates, and ψ's entry keeps its value through every restart.
+Without the seed the first capped step is spent on ψ, the first secant pair
+is ψ's, and Shanno's scale shrinks θ and β̃ to ψ's units: the q6 and q8
+inverse-link cells then ran out of iterations. Read over all coordinates,
+Shanno's scale also sent a random-slope fit to a local minimum 0.029 above
+the optimum (`gamma_inverse_gradient_route_matches_bobyqa_in_any_units`,
+y·2⁻⁵). On the log link the seed costs warm starts more evaluations than it
+saves cold ones (measured on the grid's routed Gamma/log cells), so the search
+starts from the identity there.
 
 **One mode solve per point.** The gradient at an accepted point is assembled
 off the state that point's value evaluation left (`gradient_at_mode`): the
@@ -575,9 +614,16 @@ the re-solve one cost 1.83.
 
 **Stops, certificate and fallback ladder.** The driver stops on a projected
 gradient below `1e-6`, an accepted decrease below
-`max(FDELTA_ABS = 1e-9, 16·ε·|f|)` (deviance units: a relative stop grows
+`max(fdelta_abs = 1e-10, 16·ε·|f|)` (deviance units: a relative stop grows
 with n and ended a 300k-row fit 4.7e-4 above its optimum), or at the deviance's
-noise floor. Then:
+noise floor, every trial's predicted decrease below the same threshold. The
+LMM route uses 1e-9; the GLMM route's is 1e-10 (`BfgsConfig::GLMM`). Along a
+variance column collapsing to zero the deviance is nearly flat in a curved
+valley, and the search descends it in waves: the decrease dips for a few
+iterations and grows again. Both stops read one iteration, so at 1e-9 a dip
+ended a Gamma-inverse q6 fit 2.4e-5 above its optimum, and the joint polish
+then took about 13,000 evaluations to cover the rest. At 1e-10 the search
+reaches it. Then:
 
 1. the saddle walk of the `ExactProfile` endpoint runs on the BFGS endpoint's
    θ (β held): each nonzero `Λ` column below `POLISH_NEAR_SINGULAR` is doubled
@@ -610,8 +656,13 @@ on a reused workspace matches a fresh one bit for bit
 
 **Curvature hint.** `loop_advanced::curvature_hint` after a routed pilot fit
 returns the pilot search's own final BFGS inverse-Hessian estimate over
-`[θ | β̃]`, at no cost. `fit_on_hinted` starts each draw's search from it; the
-fit only reads it, so results do not depend on the order of the draws.
+`[θ | β̃]`, and over `[θ | β̃ | ψ]` on a free Gamma dispersion, at no cost.
+`fit_on_hinted` starts each draw's search from it; the fit only reads it, so
+results do not depend on the order of the draws. After a Gamma-inverse retry
+that ran more than the first search (see
+[Response units on the Gamma inverse link](#response-units-on-the-gamma-inverse-link))
+there is no hint: each search's BFGS state is in its own units `c`, and a later
+hinted draw starts in the units of its own first search.
 
 **Memory.** The `f64` assembly scratch (`G_γ`, `m·k`) is sized on a fit's first
 gradient and kept for the next fit up to `GRAD_ASM_KEEP_BYTES = 4 MiB`;
@@ -622,10 +673,16 @@ beyond that it is released before the SE step.
 gradient, every routed family × link × layout, the sparse Schur arm included),
 `gradient_route_matches_or_beats_the_bobyqa_route` (every routed gate cell,
 cold and warm, at or below the BOBYQA route's deviance within `1e-6`),
+`gradient_route_matches_the_bobyqa_route_at_a_held_gamma_dispersion`,
+`gradient_route_seeds_ln_phi_on_the_inverse_link_only`,
 `gradient_route_hands_over_on_the_iteration_cap`,
 `gradient_route_is_unit_invariant_in_beta` and
 `gradient_route_curvature_hint_is_read_only_and_order_free`, all in
-`src/glmm/tests.rs`.
+`src/glmm/tests.rs`; `gamma_inverse_gradient_route_matches_bobyqa_in_any_units`,
+`fit_glmm_gamma_weight_scale_invariant_routed` and
+`fit_on_hinted_takes_a_gamma_hint_with_its_ln_phi_slot`
+(`src/fit/glmm_tests.rs`); `bfgs_start_curvature_seeds_one_coordinate` and
+`bfgs_fdelta_floor_is_finer_on_the_glmm_route` (`src/optim/tests.rs`).
 
 ## Laplace approximation
 
@@ -657,11 +714,12 @@ same objective: its merit, exit band, leverage and adjoint solve are taken off
 the kernel's own factor, which is `A_obs`, with `dW_obs/dη` from
 `family::observed_weight_eta_deriv`, and so are the assembled SE engine's
 `ℓ` terms. Concretely the return is
-`data_term + pen + 2·logdet` — `logdet` accumulates `Σ ln L_ii` off the
+`pen_dev + 2·logdet`, with `pen_dev = dev + pen` (the deviance plus the
+penalty `‖ũ‖²`) — `logdet` accumulates `Σ ln L_ii` off the
 Cholesky factor, i.e. `½·log|A|`, so `2·logdet` *is* the `log|A|` of the
 formula. All three terms come from the returned mode ũ: a converged PIRLS solve
 ends by re-evaluating η/μ/W there, rebuilding `A = MᵀWM + I` from that W and
-refactoring it, so `data_term`, `pen`, `logdet` and the factor the standard-error
+refactoring it, so `dev`, `pen`, `logdet` and the factor the standard-error
 pass inherits describe one iterate. That last rebuild is what the objective needs:
 `D + ‖u‖²` is stationary in u at the mode, so reading it a step early costs
 `O(‖δu‖²)`, but `log|A(u)|` is not stationary and a lagged factor puts a
@@ -780,10 +838,9 @@ each cluster's PIRLS mode/curvature. **Validation:** in-crate goldens
 (against `goldens/cbpp_agq_k{1,7,11}.json` and
 `goldens/grouseticks_agq_k{1,7,11}.json`); the vector-RE shapes are anchored at
 Laplace by validation rungs 25–27 (`sim_binomial_slope1`, `sim_poisson_slope1`,
-`sim_binomial_slope2`). AGQ itself is **not** part of the 3-way `validation/`
-sweep — that corpus is pinned to Laplace (`nAGQ=1`) so it can compare
-like-to-like across lme4, MixedModels.jl and glmm; AGQ lives in the goldens
-track alone, since it is fundamentally an lme4-vs-glmm comparison.
+`sim_binomial_slope2`), whose `nAGQ = 7` and `11` goldens come from
+GLMMadaptive. On the accuracy grid, the 29 `*_agq7` cells fit `nAGQ = 7` and
+are gated against lme4 and GLMMadaptive, each on the cells it fits (see [Validation](#validation)).
 
 ## The three `A`-layouts
 
@@ -819,7 +876,8 @@ against the blocked and structured kernels on grouseticks
 `sparse_schur_se_equals_dense_grouseticks`); external truth is
 `sim_binomial_slope_crossed` (slope-carrying crossed extra), `sim_sparse_binomial`
 and `sim_sparse_poisson` (rungs 8–9, both reference engines), plus the
-lme4-only Gamma/NB goldens `sim_sparse_gamma` / `sim_sparse_nb`.
+Gamma/NB goldens `sim_sparse_gamma` / `sim_sparse_nb` (lme4, with glmmTMB
+references in `sim_sparse_gamma_tmb` / `sim_sparse_nb_tmb`).
 
 ## Negative-Binomial outer θ-loop
 
@@ -845,7 +903,7 @@ the prefit is skipped. Otherwise it cold-starts from the no-RE GLM-NB's own θ̂
 dispersion and lands one to two orders of magnitude low, where PIRLS does not
 converge on random-slope shapes. When that prefit fails, or lands within a
 factor of 10 of the box floor, the coordinate starts from θ = 1 instead
-(`fit::glmm::nb_glmm_seed`): measured on grid cell `nb_q2sx2_g3000p5`, a
+(`fit::glmm::nb_glmm_seed`): measured on grid cell `nb_q2sx2_g3000p5_bal_base`, a
 floor-side start converged 3808 logLik below glmmTMB.
 
 The reported `Fit::deviance` on an NB GLMM is the search's own objective,
@@ -883,7 +941,8 @@ conditions on θ̂. `WaldSe::Rx` conditions on θ̂ by construction. **Validatio
 ## Gamma dispersion
 
 **Code:** `glmm::fit_glmm` (the `ln φ` coordinate and its seed),
-`family::gamma_dispersion_term`, `GlmmWorkspace::gamma_phi` and
+`family::gamma_dispersion_term`, `assembled::gamma_ln_phi_gradient` (its
+gradient entry), `GlmmWorkspace::gamma_phi` and
 `GlmmWorkspace::at_fixed_dispersion` in `src/glmm/workspace.rs`, and the
 dispersion row of `se::joint_hessian_cov`.
 
@@ -915,8 +974,8 @@ order `ln a`.
 
 Rescaling every weight by a constant leaves the likelihood unchanged but
 moves φ̂ by the same constant (`aᵢ = wᵢ/φ` is invariant to `w → c·w,
-φ → c·φ`), so `ln φ` — one more trailing coordinate of the outer BOBYQA,
-exactly as NB's `ln θ` is — searches on the internal `φ_int = φ/w̄` instead,
+φ → c·φ`), so `ln φ` — one more trailing coordinate of the outer search, as
+NB's `ln θ` is of the outer BOBYQA — searches on the internal `φ_int = φ/w̄` instead,
 where `w̄ = 2^round(mean(log₂ wᵢ))` is a power of two near the geometric
 mean of the weights, exactly `1` when unweighted. An arithmetic mean would
 let one outlier weight push `φ_int` out of its search box; a power of two
@@ -933,8 +992,9 @@ Laplace objective on `ŵ`, and `φ̂ = w̄·φ_int` is reported as
 `Fit::dispersion`; the reported `Fit::deviance` is `F` at the optimum (on the
 raw weights) and `Fit::loglik = −½·F` exactly.
 
-**Scale of the `ln φ` coordinate.** On the exact-profile route with a free
-dispersion, two probe solves at `ln φ_int ± h` (`h` the search's start radius)
+**Scale of the `ln φ` coordinate.** On the exact-profile BOBYQA route with a
+free dispersion, two probe solves at `ln φ_int ± h` (`h` the search's start radius,
+and the cold radius `h₀` after a gradient search hands over)
 give the coordinate's curvature `c` and slope `g` at the start. When the
 conditional optimum of `ln φ`, `x₀ − g/c`, lies within one cold radius `h₀` of
 the plug-in seed (`|g|/c ≤ DISP_SCALE_GATE·h₀` when the coordinate starts at
@@ -947,7 +1007,9 @@ original seed. The probes count as evaluations either way, and a later call at
 a probed point reuses its solve. At the grid's starts the gate measures
 0.40–0.48 radii on every Gamma-inverse cell and 3.0–9.5 on every Gamma-log
 cell; on `gami_cross4_g3000p20_bal_base` the scaled search takes 97
-evaluations against 365 unscaled.
+evaluations against 365 unscaled. The probes run on the BOBYQA route only; the gradient
+search seeds ψ's start curvature on the inverse link instead (see
+[Gradient search](#gradient-search-bfgs-on-binomial-poisson-and-gamma-laplace-fits)).
 
 The gate is the cold fit's question on every fit, whatever point the
 coordinate starts from. The plug-in seed charges the random-effect variance
@@ -960,7 +1022,12 @@ against 364 cold, and takes 368. Measuring a carried φ by its own distance
 passes it whenever it is close, which it is by construction, also on
 Gamma-log, where the scaled search is the slower one: from a carried φ̂,
 `gaml_q2s_g3000p20_bal_base` takes 94 evaluations scaled and 44 unscaled,
-against 52 cold.
+against 52 cold. After a gradient search hands over, the coordinate starts at
+the search's incumbent, so the gate measures from the plug-in seed as it does
+for a carried φ. BOBYQA then starts at `RHO_BEGIN_WARM`, but the probes keep
+`h₀`: on the 64 hand-overs of the Gamma gate cells (both links, iteration caps
+1 to 8) that took 5673 evaluations, against 5781 with the probes at the warm
+radius.
 
 At the scaled coordinates `ξ = θ/√φ` (Λ is linear in θ, and `u = v/√φ` maps
 the mode problem at φ onto the φ = 1 one), `log|A|` does not depend on φ and
@@ -970,6 +1037,14 @@ deviance on the φ = 1 weights. The stationarity condition in ψ is then
 equation as the GLM's, with the bare deviance `D` replaced by the penalized
 deviance `P`. The left side rises strictly from 0 to ∞ in ψ, so the root is
 unique.
+
+The same form gives the gradient search its ψ entry at fixed `(θ, β)`. The
+search holds θ, and ξ moves with ψ as `∂ξ/∂ψ = −ξ/2`; `ξ·∇_ξF = θ·∇_θF`
+since Λ is linear in θ. So `∂F/∂ψ = Gₚ'(ψ) − P_φ − ½·θ·∇_θF`, with
+`P_φ = e^{−ψ}·P = D(û)/φ + ‖û‖²` the value evaluation's penalized deviance
+on the weights `wᵢ/φ` and `∇_θF` the θ block of the gradient at that φ. The
+curvature at fixed ξ, `∂²F/∂ψ² = Gₚ''(ψ) + P_φ`, is the inverse-link start
+curvature.
 
 **Standard errors.** At fixed φ̂ the objective in `(θ, β)` is exactly the
 Laplace deviance on the weights `wᵢ/φ̂` with the bare deviance as its data
@@ -1038,7 +1113,8 @@ and a search failed, the failed search with the lowest incumbent is reported
 instead, not converged: a converged σ = 0 fit is then not the optimum. Each
 search but the last saves the workspace slots read after the fit
 (`SearchState`), and the kept search's are put back when it did not run last;
-`n_eval` counts every search. A first search that ends below
+`n_eval` and `n_grad` count every search, and the gradient search's stop and
+decrement are the kept search's. A first search that ends below
 the GLM point, the case of every Gamma-inverse cell of the accuracy grid, is the
 fit, at no extra cost.
 
@@ -1462,8 +1538,7 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   to 0.95 of the fit at `m` 3 to 8), and at 300,000 rows the fit peaks at 63
   to 84 MB against 296 to 464 MB. Above `MAX_DUAL_N` it takes 0.25 to 0.36 of
   the fit the stencil took, and its SEs sit about 3e-6 relative from the
-  stencil's, the stencil's own error. Evidence: pawel scratch
-  `mmjl-rethink/agqse/`.
+  stencil's, the stencil's own error.
 
   **Rung 2 — the hyper-dual pass** (`laplace_hessian`), one
   `HyperDual<N, H>` pass that differentiates the deviance twice at once and
@@ -1572,13 +1647,16 @@ two exact rungs above differentiate the Laplace deviance itself, leaving a
 stencil only for the cells both of them decline. `WaldSe::Rx` ≡
 `vcov(use.hessian = FALSE)` and the MixedModels.jl vcov. **Validation:** the committed fixture
 `tests/fixtures/glmm_hessian_vcov.json` (n=96 / 12-cluster `y ~ x1 + (1|grp)`)
-pins the scheme at its unchanged band; in the `validation/` sweep the two
-methods are gated separately — `se_rx` against all three engines
-(cbpp, grouseticks; glmm sits on the MixedModels value, ~6e-7 on cbpp) and
-`se_hessian` against lme4 alone (`n/a` for MixedModels, which has no Hessian
-vcov), each at ~1e-3 once the references are generated at tightened
-`tolPwrss = 1e-13`; the harness bands are unchanged across the exact-Hessian
-switch.
+pins the scheme. On the accuracy grid the two methods are compared
+separately, as parameter quantities: each passes when it is in band against
+the nearest oracle, and a larger divergence passes only once registered in
+`validation/grid/divergences.json`. `se_rx` is compared against lme4 and
+MixedModels.jl (cbpp, grouseticks; glmm sits on the MixedModels value, ~6e-7
+on cbpp), `se_hessian` against lme4 (`use.hessian = TRUE`), glmmTMB
+(`vcov(m)$cond`) and GLMMadaptive (`n/a` for MixedModels, which has no
+Hessian vcov), each at relative `1e-3` (`validation/grid/tol.R`; the AGQ
+cells' `se_hessian` at `2e-2`), with lme4's references generated at a tightened
+`tolPwrss = 1e-13`.
 
 ## Opt-in parallelism (`parallel` + `parallel_inner`)
 
@@ -1602,41 +1680,50 @@ its own.
 
 ## Validation
 
-The GLMM paths are held to the frozen `validation/` oracle (`validation/README.md`) —
-two independent reference engines (R `lme4`, Julia `MixedModels.jl`) agreeing
-within tolerance is the truth condition; on any disagreement glmm is presumed
-wrong. Estimation is pinned to Laplace (`nAGQ=1`) across the sweep so all three
-engines compare like-to-like. The manifest currently carries 27 datasets
-(rungs 1–23 and 25–28; rung 24, the sparse Gamma, is backed out); the GLMM
-ones among them include cbpp, grouseticks, VerbAgg, Arabidopsis, cbpp_probit,
-`sim_crossed_at_cap`, `sim_poisson_nested`, `sim_binomial_slope_crossed`,
-`sim_gamma`, the over-count pair `sim_sparse_binomial` / `sim_sparse_poisson`,
-the vector-RE anchors `sim_binomial_slope1` / `sim_poisson_slope1` /
-`sim_binomial_slope2` (rungs 25–27), and the offset rung `sim_poisson_offset`
-(rung 28). Directly relevant rungs and goldens:
+The GLMM paths are held to the accuracy grid (`validation/grid/`, see
+`validation/README.md`): 794 cells, each fitted on the same CSV by glmm and by
+the pinned oracles that can fit it — lme4, glmmTMB, MixedModels.jl and
+GLMMadaptive. glmm's deviance gates hard against the best converged oracle on
+the cell; a worse deviance fails, with no escape. β, the SEs and the variance
+components are compared against the nearest oracle, and a divergence beyond
+the band passes only once it is registered in
+`validation/grid/divergences.json`. The oracle runs are frozen and never
+regenerated to absorb a divergence. The Laplace cells compare like-to-like
+across the oracles; the 29 `*_agq7` cells fit `nAGQ = 7` and are gated against
+lme4 and GLMMadaptive, each on the cells it fits. The rung manifest (`validation/manifest.json`, read by
+the in-crate tiers) carries 49 datasets, all but InstEval also grid cells; the
+GLMM ones among them include cbpp, grouseticks, VerbAgg, Arabidopsis,
+cbpp_probit, `sim_crossed_at_cap`, `sim_poisson_nested`,
+`sim_binomial_slope_crossed`, `sim_gamma`, the over-count pair
+`sim_sparse_binomial` / `sim_sparse_poisson`, the sparse Gamma
+`sim_sparse_gamma` (rung 24), the vector-RE anchors `sim_binomial_slope1` /
+`sim_poisson_slope1` / `sim_binomial_slope2` (rungs 25–27), the offset rung
+`sim_poisson_offset` (rung 28), the weighted `glmm_poisson` / `glmm_binomial`
+(rungs 37–38), the large-SD rungs `sim_binomial_bigsd` / `sim_poisson_bigsd` /
+`sim_sparse_binomial_bigsd` (rungs 44–46), `sim_probit_large` (rung 48) and
+`sim_cloglog_nested_crossed` (rung 49). Directly relevant rungs and goldens:
 
 | Path | Rung / golden | Reference | Status |
 |---|---|---|---|
-| Binomial GLMM, dense | cbpp (rung 5) | lme4 + MixedModels.jl | landed |
-| Poisson GLMM, dense | grouseticks (rung 6) | lme4 + MixedModels.jl | landed |
-| Sparse over-count binomial | `sim_sparse_binomial` (rung 8) | lme4 + MixedModels.jl | landed |
-| Sparse over-count Poisson | `sim_sparse_poisson` (rung 9) | lme4 + MixedModels.jl | landed |
-| Binomial, individual 0/1 | VerbAgg (rung 12) | lme4 + MixedModels.jl | landed (used to tune `PIRLS_TOL_REL`) |
-| Poisson, real nested | Arabidopsis (rung 14) | lme4 + MixedModels.jl | landed |
-| Sparse binomial, slope-crossed | `sim_binomial_slope_crossed` (rung 18) | lme4 (+ glmm golden) | landed (2-way gate); in-crate golden gated |
+| Binomial GLMM, dense | cbpp (rung 5) | grid: lme4, glmmTMB, MixedModels.jl | landed |
+| Poisson GLMM, dense | grouseticks (rung 6) | grid: lme4, glmmTMB, MixedModels.jl | landed |
+| Sparse over-count binomial | `sim_sparse_binomial` (rung 8) | grid: lme4, glmmTMB, MixedModels.jl | landed |
+| Sparse over-count Poisson | `sim_sparse_poisson` (rung 9) | grid: lme4, glmmTMB, MixedModels.jl | landed |
+| Binomial, individual 0/1 | VerbAgg (rung 12) | grid: lme4, glmmTMB, MixedModels.jl | landed (used to tune `PIRLS_TOL_REL`) |
+| Poisson, real nested | Arabidopsis (rung 14) | grid: lme4, glmmTMB, MixedModels.jl | landed |
+| Sparse binomial, slope-crossed | `sim_binomial_slope_crossed` (rung 18), `goldens/sim_binomial_slope_crossed.json` | grid: lme4, glmmTMB, MixedModels.jl; golden: lme4 | landed; in-crate golden gated |
 | Probit GLMM (non-canonical) | `goldens/cbpp_probit_glmm_tmb.json` (`fit_glmm_probit_cbpp_matches_glmmtmb`) | glmmTMB (lme4's golden: registered divergences) | in-crate golden |
-| Cloglog GLMM (non-canonical) | `goldens/sim_cloglog_glmm_tmb.json` (`fit_glmm_cloglog_matches_glmmtmb`) | glmmTMB (lme4's golden, rung 50: registered divergences) | in-crate golden |
+| Cloglog GLMM (non-canonical) | `goldens/sim_cloglog_glmm_tmb.json` (`fit_glmm_cloglog_matches_glmmtmb`) | glmmTMB (lme4's golden: registered divergences) | in-crate golden |
 | Gamma GLMM, dense | grid cell `sim_gamma` (`fit_glmm_gamma_sim_matches_grid_reference`), `goldens/sim_gamma_glmm_tmb.json` | glmmTMB (lme4's golden: registered divergences) | in-crate golden |
 | NB GLMM, dense | `goldens/sim_nb_glmm_tmb.json` (`fit_glmm_nb_sim_matches_glmmtmb`) | glmmTMB (lme4's golden: registered divergences) | in-crate golden |
-| AGQ (nAGQ 1/7/11) | `goldens/{cbpp,grouseticks}_agq_k{1,7,11}.json` | lme4 | in-crate golden |
-| Vector-RE Laplace anchors | `sim_binomial_slope1` / `sim_poisson_slope1` / `sim_binomial_slope2` (rungs 25–27) | lme4 (2-way gates) | landed |
-| Poisson with offset | `sim_poisson_offset` (rung 28) | lme4 + MixedModels.jl | in manifest |
-| Sparse Gamma / NB | `goldens/sim_sparse_gamma_tmb.json`, `goldens/sim_sparse_nb_tmb.json` | glmmTMB (lme4's goldens: registered divergences) | in-crate golden |
+| AGQ (nAGQ 1/7/11) | `goldens/{cbpp,grouseticks}_agq_k{1,7,11}.json`; the grid's 29 `*_agq7` cells | goldens: lme4; grid: lme4 and GLMMadaptive | in-crate golden; grid |
+| Vector-RE Laplace anchors | `sim_binomial_slope1` / `sim_poisson_slope1` / `sim_binomial_slope2` (rungs 25–27) | grid: lme4, glmmTMB, MixedModels.jl | landed |
+| Poisson with offset | `sim_poisson_offset` (rung 28) | grid: lme4, glmmTMB, MixedModels.jl | in manifest |
+| Sparse Gamma / NB | `sim_sparse_gamma` (rung 24); `goldens/sim_sparse_gamma_tmb.json`, `goldens/sim_sparse_nb_tmb.json` | grid: lme4, glmmTMB; goldens: glmmTMB (lme4's goldens: registered divergences) | landed; in-crate golden |
 
-Some paths have no dedicated rung: the intercept-only nested/crossed *structured*
-non-Gaussian branch is validated only indirectly, via the grouseticks
-dense-vs-sparse cross-checks and the sparse over-count rungs, rather than by a
-standalone golden.
+The intercept-only nested/crossed *structured* non-Gaussian branch has no
+standalone golden; the grid's non-Gaussian crossed and nested cells fit it
+directly, beside the grouseticks dense-vs-sparse cross-checks.
 
 ## How the other engines fit a GLMM
 
@@ -1648,7 +1735,7 @@ GLMMadaptive is quadrature-first.
 | Default objective | Laplace (`nAGQ=1`) | Laplace | **adaptive GH quadrature** (default 11 points for ≤ 2 REs) | Laplace (`nAGQ=1`) |
 | AGQ shapes | single **scalar** RE only | single scalar RE only | vector REs, product grid (its core feature) | single grouping, `q_p ≤ 3` product grid, binomial/Poisson/NB/Gamma (opt-in `nagq`) |
 | Grouping structure | multiple, crossed/nested | multiple, crossed/nested | **single grouping factor only** | multiple, crossed/nested (dense/sparse routing) |
-| Outer optimisation | derivative-free, θ-then-joint two-stage (BOBYQA/Nelder-Mead) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE); `fast=true` θ-only or joint | hybrid: EM first, then quasi-Newton over all parameters | derivative-free BOBYQA, one of three routes fixed per shape: joint `[θ\|β]`, θ-only PQL profile then joint polish, or θ-only EXACT Laplace profile alone |
+| Outer optimisation | derivative-free, θ-then-joint two-stage (BOBYQA/Nelder-Mead) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE); `fast=true` θ-only or joint | hybrid: EM first, then quasi-Newton over all parameters | projected BFGS on the analytic gradient over `[θ\|β]` (and Gamma's `ln φ`) on binomial, Poisson and Gamma Laplace fits with `n_θ ≥ 2` on the blocked or structured layout, BOBYQA as its polish and fallback; elsewhere derivative-free BOBYQA, one of three routes fixed per shape: joint `[θ\|β]`, θ-only PQL profile then joint polish, or θ-only EXACT Laplace profile alone |
 | Fixed-effect vcov | Hessian (default) or RX | RX-style only | observed information (numeric), sandwich available | both arms: `Hessian` (default, ≡ `use.hessian=TRUE`) and `Rx` (≡ MixedModels) |
 | Families beyond binomial/Poisson | Gamma, NB (`glmer.nb`), … | limited | broad: NB, beta, Student-t, zero-inflated/hurdle, censored, user-defined density | Gamma, NB (marginal-θ as a BOBYQA coordinate) |
 | RE-covariance boundary (singular fits) | bounded linear-scale Cholesky, θ diagonals `≥ 0`: boundary reachable; flagged via `isSingular` (θ `< 1e-4`), raw θ reported | same bounded Cholesky, boundary reachable | **log-Cholesky** (`chol_transf`: Cholesky diagonal on the log scale), unconstrained — the boundary sits at `−∞` and is unreachable | bounded Cholesky as lme4, plus the exact-`0` pin (`PIN_THETA`) and `Diagnostics::singular`/`Diagnostics::boundary`/`Diagnostics::pinned` |
@@ -1721,7 +1808,8 @@ In practice:
   matrix differentials the `log|A|` and `A⁻¹` terms are written from.
 - Powell, M. J. D. (2009). *The BOBYQA algorithm for bound constrained
   optimization without derivatives*. Report DAMTP 2009/NA06, University of
-  Cambridge. — the outer optimizer for both stages.
+  Cambridge. — the derivative-free outer optimizer (both stages off the
+  gradient route, and its polish and fallback).
 - Rizopoulos, D. *GLMMadaptive: Generalized Linear Mixed Models using Adaptive
   Gaussian Quadrature*. R package (CRAN). — the quadrature-first comparison
   engine.

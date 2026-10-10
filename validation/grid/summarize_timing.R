@@ -44,7 +44,8 @@ safe <- function(expr, what) tryCatch(expr, error = function(e) {
 # Every timed run of the engine is merged cell by cell, newest run first, so a
 # timed run of a few named cells adds its rows to the last fast-subset run
 # instead of hiding it. `metas` keeps the run_meta of every run that
-# contributed a cell: provenance, the unlocked warning and the one-machine
+# contributed a cell, including the runs a kept last-timed/ run lists under
+# `carried` (promote.sh): provenance, the unlocked warning and the one-machine
 # check below read all of them.
 merged_timed_runs <- function(grid_dir, dir_name) {
   root <- file.path(grid_dir, "runs", dir_name)
@@ -68,6 +69,11 @@ merged_timed_runs <- function(grid_dir, dir_name) {
     if (!length(new)) next
     recs[new] <- r$recs[new]
     metas[[length(metas) + 1L]] <- r$meta
+    # simplifyDataFrame = FALSE: the default would turn the array of objects
+    # into a data frame, and each carried run_meta is needed as its own list.
+    carried <- jsonlite::fromJSON(file.path(o$dir, "run_meta.json"),
+                                  simplifyDataFrame = FALSE)$carried
+    metas <- c(metas, carried)
   }
   list(meta = metas[[1]], metas = metas, recs = recs)
 }

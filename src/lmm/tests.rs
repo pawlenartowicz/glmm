@@ -3195,7 +3195,7 @@ fn design_qr_reads_a_strided_design_like_a_contiguous_one() {
     }
 }
 
-// --- per-group route gradient (B1.2) ---
+// --- per-group route gradient ---
 
 /// A random-slopes dataset with `q − 1` slopes on the primary grouping:
 /// `nc` clusters of `per` rows, `x = [1, x₁ … x_{q−1}, extra]` (one extra

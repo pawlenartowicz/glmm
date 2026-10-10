@@ -382,6 +382,8 @@ jobs:
       - name: Fit the fast subset through all three front ends
         # --jobs=1: one worker, pinned to core 0. The runner has no P-core/E-core
         # split to respect and the fast subset is under a minute of fitting.
+        env:
+          GRID_MACHINE: ci
         run: |
           validation/grid/run.sh glmm        --fast --jobs=1 --label ci
           validation/grid/run.sh glmm_python --fast --jobs=1 --label ci

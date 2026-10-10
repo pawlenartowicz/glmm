@@ -128,15 +128,15 @@ TOL <- list(
   #          on both kept runs named below, inside dev_eps.
   #          Rule: ceil1(10 x max benign |Delta dev|) over the 8 vector-AGQ
   #          cells, benign = beta/se/stddev in band against GLMMadaptive.
-  #          Measured 2026-10-01 on the P45 kept run
-  #          (runs/glmm/2026-10-01_0.4.1_dell-fedora_p45, which centered the
-  #          slopes) against the run before it (2026-09-30_0.4.1_dell-fedora):
+  #          Measured 2026-10-01 on the P45 glmm run of that day (which
+  #          centered the slopes) against the kept glmm run of 2026-09-30
+  #          (committed in 27318ef):
   #          4.307e-05 on binb_q2s_g3000p20_bal_base_agq7 (beta 1.3e-05,
   #          se_hessian 2.1e-04, stddev 5.3e-05 from GLMMadaptive); the other
   #          seven gaml_q2s_g60p5 +8.0e-06, nb_q2s_g3000p20 -3.2e-06,
   #          pois_q2s_g3000p20 +3.5e-07, the rest below 6e-08. The P45 follow-up
-  #          kept run (2026-10-01_0.4.1_dell-fedora_p45-followup, same
-  #          standardization) against the P45 run: at most 6.3e-10 on these cells.
+  #          kept run of 2026-10-01 (committed in b8d2efd, same standardization)
+  #          against the P45 run: at most 6.3e-10 on these cells.
   dev_eps_agq_vec = 5e-04,
   # dev_big  a convention-mismatch constant, not a fit difference. It must sit
   #          far above the benign |Delta dev| spread and far below the smallest

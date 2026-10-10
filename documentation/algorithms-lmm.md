@@ -292,7 +292,13 @@ determinant 1). The criterion is reported for the caller's design:
 **Prior weights.** With `FitOptions::weights`, the sufficient-statistics
 accumulator (`LmmSuffStats::add_rows_multi`, `src/lmm/kernel.rs`) folds `√wᵢ` into
 every accumulated quantity exactly once per side, so every Gram product carries
-`wᵢ` — but the level counts and df stay raw-row (`n − p`). The weighted
+`wᵢ` — but the level counts and df stay raw-row (`n − p`). The θ search runs
+on `ŵᵢ = wᵢ/s` (`accumulate_lmm_rows`), where `s = family::weight_scale(w)` is
+the power of two nearest the geometric mean of the weights and exactly `1`
+when unweighted. This keeps θ's internal box (`PIN_THETA`, `THETA_HI`)
+meaningful whatever the raw scale of `w`. Only σ̂² moves with that scale, so
+`lmm_view_to_fit` reports `σ̂²·s`; β̂, the SEs, τ² and varcorr need no
+correction, since the factors of `s` in the internal θ̂ and σ̂² cancel. The weighted
 Gaussian deviance needs one further θ-independent term, `−Σ log wᵢ`; because it
 does not move the optimum, `lmm_view_to_fit` (`src/fit/lmm.rs`) applies it to
 the deviance (and recomputes the loglik) *after* optimization rather than paying
@@ -304,15 +310,15 @@ identity link: the core's `Lmm` arm accumulates `y − o` and nothing
 downstream needs to know (same convention as the OLS path).
 
 The objective returns `f64::INFINITY` on any Cholesky failure or non-positive σ̂²
-(the blocked path also on a residual r² ≤ dim·ε·yᵀy, an exact fit whose last
-pivot is round-off of either sign) — that value is the deviance failure surface BOBYQA is driven over.
+(every kernel — dense, blocked and sparse — also on a residual r² ≤ dim·ε·yᵀy,
+an exact fit whose last pivot is round-off of either sign) — that value is the deviance failure surface BOBYQA is driven over.
 
 **Code**: `reml_deviance`, `reml_deviance_blocked`, `LmmSuffStats::add_rows_multi`
 (`src/lmm/kernel.rs`); `accumulate_lmm_rows` (`src/fit/lmm.rs`); `sparse_reml_deviance`
 (`src/sparse/mod.rs`).
 **Convention**: lme4's profiled REML `devfun` — β and σ² profiled out, optimiser
 on θ. **Validation**: the loglik gate is near-exact for LMM rungs (absolute
-~1e-6 on the shared scale, ~1e-9 observed) across Dyestuff, sleepstudy,
+`2e-6` on the shared scale, `loglik_abs_lmm` in `validation/grid/tol.R`; ~1e-9 observed) across Dyestuff, sleepstudy,
 Penicillin, Pastes; sim_slope_extra pins the sparse objective against the same
 references.
 
@@ -320,8 +326,7 @@ references.
 
 The shortcut fires when the primary grouping is intercept-only (`q_p = 1`) and
 its level structure is **balanced** — equal per-level row counts over an active
-prefix. (This balanced shape is the one the grid-atom-snapped simulation designs
-always produce.) In that case the family-by-family loop collapses to closed-form
+prefix. In that case the family-by-family loop collapses to closed-form
 arithmetic. `precompute_balanced_collapse` runs once per fit: it scans the
 per-level counts for an equal-count active prefix starting at family 0, and
 additionally requires the *nested-child* counts to match one common template
@@ -410,7 +415,7 @@ backtracking (`c = 1e-4`, halving, at most 30 trials) on value-only
 evaluations, the gradient once per accepted point; coordinates held on a bound
 the gradient pushes against; Shanno scaling at the first update; the first
 step after a (re)start capped at 0.5 in max norm. Stops: projected gradient
-below `1e-6`; an accepted decrease below `max(FDELTA_ABS = 1e-9,
+below `1e-6`; an accepted decrease below `max(fdelta_abs = 1e-9,
 16·ε·|f|)` after the second iteration (absolute, because the deviance is O(n)
 and a relative stop grows with it); a line search whose every trial's
 predicted decrease is below that floor with the decrement below `1e-8` (the
@@ -494,8 +499,8 @@ numeric knobs.
 default `nloptwrap`/`bobyqa` optimiser for `lmer`. **Validation**: sleepstudy
 (`n_θ = 3`, correlated slope), Penicillin (crossed), Pastes (nested) drive the
 general elimination; sim_slope_extra drives the sparse variant. The tuning
-constants were swept against the validation corpus (27 manifest datasets, rungs
-1–23 and 25–28, all green; rung 24 backed out).
+constants were swept against the validation corpus (the 49 rungs of
+`validation/manifest.json` and the accuracy grid in `validation/grid/`).
 
 ## Boundary handling (PIN_THETA)
 
@@ -609,8 +614,9 @@ same θ both kernels factor the same SPD system, and by
 Cholesky uniqueness the sparse factor equals the dense path's augmented factor
 — so the two fits agree to machine precision wherever both apply, and the
 sparse kernel can serve as the superset solver without a separate tolerance.
-The kernel itself is unchanged; its caller is `fit_lmm` through
-`LmmKernel::Sparse`, built per call by `accumulate_lmm_rows`. The search
+The sparse kernel's caller is `fit_lmm` through
+`LmmKernel::Sparse`, built by `accumulate_lmm_rows` and refilled in place when
+a call brings the same rows (`same_rows`). The search
 around them is one copy: the seed, the BOBYQA schedule, the pin loop, β̂ and
 `Var(β̂)` off the factor, and the joint Wald statistic are `fit_lmm`'s,
 whichever kernel evaluates the objective. The ill-conditioning policy is one
@@ -642,18 +648,23 @@ the same forward-solve columns `C_T = [L_XX⁻¹bₜ]`, so no Gram is formed.
 (`src/lmm/mod.rs`). **Convention**:
 lme4's profiled fixed-effect covariance `σ̂²·(X'V⁻¹X)⁻¹`; all engines compute
 the LMM SE identically. **Validation**: the LMM `se` gate is tight (~1e-3)
-across Dyestuff, sleepstudy, Penicillin, Pastes against both lme4 and
-MixedModels.jl.
+across Dyestuff, sleepstudy, Penicillin, Pastes; on the grid lme4, glmmTMB
+and MixedModels.jl all report it.
 
 ## Validation
 
-The validation suite (`validation/`) fits the same model on the same CSV with lme4,
-MixedModels.jl, and `glmm`, and gates β and varcomp std-devs at relative ~1e-3,
-the LMM `se` at ~1e-3, and the REML loglik at absolute ~1e-6. The committed data
-plus the reference JSONs are frozen and never regenerated to absorb a
-disagreement; a disagreement beyond the band passes only once it is registered
-in `validation/grid/divergences.json`. The manifest currently carries 27 datasets (rungs 1–23 and
-25–28; rung 24, the sparse Gamma, is backed out). The core Gaussian LMM rungs:
+The accuracy grid (`validation/grid/`) fits each Gaussian cell on the same CSV
+with three of the four pinned oracles — lme4, glmmTMB and MixedModels.jl
+(GLMMadaptive fits only non-Gaussian cells) — and with `glmm`. The REML
+deviance gates hard against the best converged oracle on the cell; β and
+varcomp std-devs (relative `1e-3`) and the LMM `se` (relative `1e-3`) are
+compared against the nearest oracle, and a difference beyond the band passes
+only once it is registered in `validation/grid/divergences.json`. The in-crate
+oracle tier (`cargo test --features oracle-tests`) checks the frozen goldens
+at the same bands, with the REML loglik at absolute `2e-6`. The committed data
+plus the reference results are frozen and never regenerated to absorb a
+disagreement. The rung manifest (`validation/manifest.json`) carries 49
+datasets. The core Gaussian LMM rungs:
 
 | Rung | Dataset | Structure | Path exercised |
 |---|---|---|---|
@@ -672,18 +683,20 @@ landed and green — they exercise the same kernels through the same gates.
 
 All three engines that fit LMMs share Doug Bates' formulation: the relative
 Cholesky `Λ_θ`, the profiled deviance with β and σ² eliminated analytically,
-and a derivative-free optimiser over θ alone. The differences are defaults and
-linear algebra, not objective. (GLMMadaptive does not appear on this page — it
+and an optimiser over θ alone — derivative-free in lme4 and MixedModels.jl,
+and in `glmm` everywhere except the per-group route, where BFGS uses the
+analytic gradient. The differences are defaults, optimiser and linear
+algebra, not objective. (GLMMadaptive does not appear on this page — it
 targets non-Gaussian GLMMs and defers Gaussian LMMs to nlme/lme4.)
 
 | | lme4 (`lmer`) | MixedModels.jl | `glmm` |
 |---|---|---|---|
 | Criterion default | REML (ML switch) | **ML** (REML switch) | **REML, locked** — no switch |
-| Optimiser | BOBYQA via nloptwrap (default) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE) | BOBYQA (PRIMA), tuned `npt`/ρ schedule |
+| Optimiser | BOBYQA via nloptwrap (default) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE) | BFGS on the analytic gradient where the per-group route is armed (slopes on the primary only, `n_θ ≥ 3`); BOBYQA (PRIMA) elsewhere and as its polish/fallback, tuned `npt`/ρ schedule |
 | Linear algebra per eval | sparse Cholesky of `ΛᵀZᵀZΛ + I` (CHOLMOD), Z materialised | blocked/amalgamated Cholesky, Z materialised | dense path: **no Z at all** — sufficient statistics + family-block elimination, with a closed-form collapse for balanced single-intercept designs; sparse path: Schur-block Cholesky (AMD sparse tail) |
 | Singular fit | fits, `isSingular` warns | fits, flags | pins diagonal components ≤ `1e-4` to exact `0`, still `converged`, sets `Diagnostics::singular`/`Diagnostics::pinned` |
-| Optimiser cap-out | warns, returns last point | warns, returns last point | returns the best finite point, `converged: false`, `Diagnostics::boundary == Boundary::NoOptimum` (the same on the dense and the sparse kernel, since `fit_lmm` sets it once with no kernel branch); glmm raises `search_limit` there |
-| BLUPs / `ranef` | yes | yes | not computed (deliberate — see [`coming-from-lme4.md`](coming-from-lme4.md)) |
+| Optimiser cap-out | warns, returns last point | warns, returns last point | returns the best finite point, `converged: false`, `Diagnostics::boundary == Boundary::NoOptimum` (the same on the dense and the sparse kernel, since `fit_lmm` sets it once with no kernel branch); the Python and R packages raise a `search_limit` warning there |
+| BLUPs / `ranef` | yes | yes | yes — `Fit::ranef`, recovered once at θ̂ by back-substitution on converged fits (`lmm_view_to_fit` → `assemble_ranef_sparse`) |
 
 The rows that matter in practice: the **criterion lock** (comparing `glmm` to
 MixedModels.jl at defaults differs by REML-vs-ML variance-component bias, not

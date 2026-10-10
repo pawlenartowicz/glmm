@@ -49,7 +49,8 @@ source(file.path(runs_script_dir, "engines", "versions.R"))
 # versions.json. A version mismatch is an ERROR, not a fallback: a reference
 # fitted by an unpinned oracle is not the reference. A `fast` or timed oracle run
 # is never an accuracy reference, which is what the subset test and the `timed`
-# test below enforce.
+# test below enforce. In practice that is runs/<oracle>/last/: promote.sh moves
+# every older run to scratch/, which this search does not read.
 ORACLES <- c("lme4", "glmmTMB", "GLMMadaptive", "MixedModels")
 ENGINE_DIR <- c(lme4 = "lme4", glmmTMB = "glmmtmb",
                 GLMMadaptive = "glmmadaptive", MixedModels = "mixedmodels")

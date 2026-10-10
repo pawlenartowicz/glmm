@@ -47,7 +47,7 @@ data = {
 # y ~ x1 + (1 | group) — Gaussian, random intercept.
 fit = glmm.fit(data, "y ~ x1 + (1 | group)")
 
-assert fit.converged
+print(fit.converged)
 fit.summary()   # prints the coefficient table (and returns it as a string)
 ```
 
@@ -102,9 +102,10 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
   quasi-binomial/quasi-Poisson, GLM only. A float: hold φ fixed (still
   scales SE). Fix-vs-estimate, not a warm start.
 - `nagq` — adaptive Gauss–Hermite node count; `1` = Laplace (default). Must
-  be odd and ≤ 25. `>1` applies to binomial/Poisson models with a single
-  grouping factor and ≤ 3 random effects per group (intercept + slopes,
-  temporary cap); any other shape warns and falls back to Laplace.
+  be odd and ≤ 25. `>1` applies to binomial, Poisson, negative-binomial or
+  Gamma models with one grouping factor and ≤ 3 random effects per group
+  (intercept + slopes, temporary cap); any other shape warns and falls back
+  to Laplace.
 - `wald_se` — fixed-effect Wald-SE denominator: `"hessian"` (default) or
   `"rx"`.
 - `init_theta` — negative-binomial shape seed, named for
@@ -156,7 +157,7 @@ them). It is returned by `fit`, never constructed by callers.
 | `varcorr` | per grouping, in the order the groupings appear in the formula (lme4 instead sorts by decreasing number of levels): vech-packed lower-triangular RE covariance D̂ |
 | `tau2` | legacy per-element RE variances (q=1 only) — prefer `varcorr` |
 | `stddev_se` | SE of each RE stddev, θ layout (not beta-aligned): at the stddev's diagonal slot, `NaN` at the off-diagonal slots and where unavailable |
-| `dispersion` | φ (gamma / inverse-gaussian) / θ (negbin) / 1.0 otherwise |
+| `dispersion` | φ (gamma / inverse-gaussian) / θ (negbin) / residual σ² (gaussian) / 1.0 (binomial, poisson) |
 | `re_groups` | per grouping, in `varcorr` order (formula order): `(name, [term names])` — what `summary()` labels the RE block with |
 | `n_eval` | optimizer objective evaluations (0 on the closed-form/IRLS paths) |
 | `n_grad`, `outer_stop`, `outer_decrement` | the gradient (BFGS) search, on the models `GradientSearchFallbackWarning` names: its gradient evaluations (not in `n_eval`), why it stopped (`"fdelta"`, `"pgrad"`, `"noise_floor"`, `"line_search"`, `"max_iter"`, `"grad_unavailable"`, `"non_finite"`), and its estimate of the deviance decrease left at the endpoint; `0` / `None` / `NaN` on every other fit |
@@ -170,6 +171,7 @@ them). It is returned by `fit`, never constructed by callers.
 | `ranef_blocks` | the same conditional modes, labelled: a list of dicts per grouping (`group`, `terms`, `levels`, `values`); empty exactly when `ranef` is |
 | `converged` | numerical failure signals here (not an exception) — check before trusting `beta`/`se` |
 | `singular` | boundary (singular) fit — `>=1` RE variance component pinned at 0; mirrors lme4's `isSingular` |
+| `dispersion_held` | the number passed as `dispersion=` (gamma / inverse-gaussian only); `None` when φ was estimated or the argument does not apply. When it is set, `summary()` labels the dispersion "fixed" |
 | `diagnostics` | dict with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; `converged`/`singular`/`aliased` above are `@property` forwarders over `diagnostics[...]`, kept at the top level for the most-read fields |
 
 **Warnings.** `fit` raises a warning for anything worth knowing about the fit
@@ -194,8 +196,9 @@ warnings.filterwarnings("ignore", category=glmm.IllConditionedWarning)  # just t
 optimizer minimized, on that fit's own scale: for an LMM it is lme4's
 `REMLcrit` minus a data-independent constant; for a GLMM it is the marginal
 Laplace deviance, which differs from −2·logLik by a data-only saturated
-constant. Those constants do not cancel between two different models, so
-differencing `deviance` across fits — or feeding it to an AIC — is a mistake.
+constant on binomial/Poisson fits and equals −2·logLik on Gamma and
+negative-binomial fits. Those constants do not cancel between two different
+models, so differencing `deviance` across fits — or feeding it to an AIC — is a mistake.
 It is `NaN` for OLS/GLM and on numerical failure.
 
 **`vcov` and `se` carry different information.** `se` is only the diagonal, so

@@ -7,11 +7,23 @@ detail: [`algorithms.md`](algorithms.md),
 [`algorithms-lmm.md`](algorithms-lmm.md),
 [`algorithms-glmm.md`](algorithms-glmm.md).*
 
-All engines minimise the same objective — the profiled deviance over the
-relative-Cholesky θ, derivative-free. `glmm` changes how each evaluation is
-computed and what happens at the edges, not what is estimated: point estimates
-agree with lme4/MixedModels.jl to the validation gates (~1e-3 relative on β and
-variance components) on every supported design.
+All engines minimise the profiled deviance over the relative-Cholesky θ.
+lme4 and MixedModels.jl search it with derivative-free
+methods. `glmm` uses BOBYQA, also derivative-free, on most models, and BFGS on
+an analytic gradient where it has one: LMMs with random slopes on a single
+grouping factor and no other grouping, and binomial, Poisson and Gamma GLMMs
+fitted by the Laplace approximation with at least two variance parameters.
+On LMMs and on canonical-link binomial and Poisson GLMMs the objective is the
+one lme4 and MixedModels.jl use. On non-canonical links (probit, cloglog,
+negative binomial) and on Gamma GLMMs, `glmm` maximises the Laplace
+likelihood itself, which is glmmTMB's objective. lme4 puts the expected
+(Fisher) weight in the Laplace log-determinant there, so its estimates differ:
+fixed effects by up to 7.9 % on cloglog, and more on Gamma. Apart from that
+choice, `glmm` changes how each evaluation is computed and what happens at
+the edges, not what is estimated. Validation gates the deviance hard against
+the best reference engine per design; parameter differences pass only as
+registered divergences (see
+[What keeps the speed honest](#what-keeps-the-speed-honest)).
 
 ## The differences
 
@@ -74,7 +86,8 @@ the loop — no single-fit benchmark claim is made.
 **What.** The BOBYQA configuration is tuned, not default: interpolation-set
 size `⌈1.5n⌉+1` instead of Powell's `2n+1` (from `n_θ ≥ 3`), a start radius per
 kind of search (wide from the blind start, narrow from a warm start or for the
-polish), a stopping radius relaxed from `1e-8` to `1e-6`, and for GLMMs one of
+polish), a stopping radius relaxed from `1e-8` to `1e-6` (`3e-6` on GLMM
+searches), and for GLMMs one of
 three outer routes, fixed per shape and never mixed within a fit: `Joint` runs
 a single θ-and-β BOBYQA; `PqlThenJoint` runs a θ-only warm-start pass first (β
 profiled by PQL inside PIRLS), then a joint `[θ|β]` polish whose status alone
@@ -85,7 +98,9 @@ decides convergence, with no joint polish after it. The routing is a three-way
 chain: `ExactProfile` takes every nAGQ=1 shape on the blocked or
 structured layout; of what is left, `Joint` takes `nAGQ > 1` and the small
 `n_θ ≤ 2 && p ≤ 4` shapes; `PqlThenJoint` takes the rest — the wider
-packed-row shapes.
+packed-row shapes. On the blocked or structured layout, a binomial, Poisson or
+Gamma Laplace fit with `n_θ ≥ 2` replaces the `ExactProfile` BOBYQA search with
+BFGS over `[θ | β̃]`, and BOBYQA stays as its polish and fallback.
 
 **Why it is faster.** Every choice was swept against the validation corpus and
 kept only where it cut evaluations without moving any gated result: the `npt`
@@ -165,17 +180,21 @@ reach.
 
 ## What keeps the speed honest
 
-Every difference above is held to the frozen validation oracle: identical models
-fit in R/lme4 and Julia/MixedModels.jl — two independent implementations — on
-27 committed datasets from single-intercept LMMs to crossed/nested/sparse
-GLMMs. References are never regenerated to relax a tolerance; a disagreement
-beyond the agreement band is investigated as a `glmm` bug first and passes only
-once it is written up and registered (`validation/grid/divergences.json`). Shapes only lme4 covers (Gamma/NB/probit
-GLMMs, AGQ) are pinned by committed lme4 goldens.
+Every difference above is held to four pinned reference engines: R/lme4,
+R/glmmTMB, Julia/MixedModels.jl and R/GLMMadaptive. Each fits the cells it can on
+a 794-cell accuracy grid (`validation/grid/`), from single-intercept LMMs
+to crossed/nested/sparse GLMMs. glmmTMB fits every family but
+inverse-Gaussian, and GLMMadaptive fits AGQ on one grouping factor. A converged deviance worse than the best reference on a cell
+fails. Parameter differences are reported; one beyond the agreement band is
+investigated as a `glmm` bug first and passes only once it is written up and
+registered (`validation/grid/divergences.json`). References are never
+regenerated to relax a tolerance. The crate's own tests also pin 49 frozen
+fixture datasets (`validation/data/`, `validation/goldens/`) against lme4,
+glmmTMB, GLMMadaptive and R's own `glm` references.
 
 ## Limits
 
-The trade is inference machinery and breadth: no BLUPs/`predict`, no
+The trade is inference machinery and breadth: no `predict`, no
 profile/bootstrap CIs, no small-sample df corrections; fewer families than
 glmmTMB/GLMMadaptive; REML-only LMMs; and past a few dozen θ parameters,
 gradient-based engines are expected to win. For one interactive model on one

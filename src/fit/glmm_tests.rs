@@ -1996,7 +1996,15 @@ fn fit_glmm_gamma_weighted_matches_glmmtmb() {
 /// Same fixture as `fit_glmm_gamma_weighted_matches_glmmtmb`.
 #[test]
 fn fit_glmm_gamma_weight_scale_invariant_dense() {
-    weighted_gamma_glmm_scale_invariant_check(1);
+    let (x, ids, ..) = weighted_glmm_design(&WEIGHTED_GAMMA_GLMM_X1);
+    let _ = weighted_gamma_glmm_scale_invariant_check(
+        1,
+        &weighted_gamma_glmm_model(),
+        &x,
+        &WEIGHTED_GAMMA_GLMM_Y,
+        &WEIGHTED_GAMMA_GLMM_W,
+        &ids,
+    );
 }
 
 /// AGQ twin of `fit_glmm_gamma_weight_scale_invariant_dense`, `nagq = 7`: `Gₚ`
@@ -2004,25 +2012,118 @@ fn fit_glmm_gamma_weight_scale_invariant_dense() {
 /// invariance argument applies unchanged.
 #[test]
 fn fit_glmm_gamma_weight_scale_invariant_agq() {
-    weighted_gamma_glmm_scale_invariant_check(7);
+    let (x, ids, ..) = weighted_glmm_design(&WEIGHTED_GAMMA_GLMM_X1);
+    let _ = weighted_gamma_glmm_scale_invariant_check(
+        7,
+        &weighted_gamma_glmm_model(),
+        &x,
+        &WEIGHTED_GAMMA_GLMM_Y,
+        &WEIGHTED_GAMMA_GLMM_W,
+        &ids,
+    );
 }
 
-/// Shared body of the dense/AGQ weight-scale-invariance twins above.
-fn weighted_gamma_glmm_scale_invariant_check(nagq: u8) {
+/// Gradient-search twin of `fit_glmm_gamma_weight_scale_invariant_dense`, on
+/// `gamma_inverse_slope_design` with prior weights: `(1 + x₁ | g)` (n_θ = 3),
+/// which the gradient search fits over `[θ | β̃ | ln φ]` on the same internal
+/// `ŵ`. Two of its three τ² are interior, so the τ² check compares non-zero
+/// values; the third τ² is 0 and the correlation is −1, both on the boundary.
+#[test]
+fn fit_glmm_gamma_weight_scale_invariant_routed() {
+    use super::core::{build_workspace, curvature_hint, fit_on};
+    let (x, y, ids, model) = gamma_inverse_slope_design();
+    let (n, p) = (y.len(), 2);
+    let w: Vec<f64> = (0..n).map(|i| 0.5 + (i % 5) as f64 * 0.25).collect();
+    // The fit routes: only a gradient search leaves a curvature hint, sized
+    // over `[θ | β̃ | ln φ]`.
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        weights: Some(w.clone()),
+        ..FitOptions::default()
+    };
+    let (sized, sids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let _ = fit_on(&mut ws, &x, &y, &sids, None, &opts);
+    let hint = curvature_hint(&mut ws).expect("the slope model takes the gradient search");
+    assert_eq!(hint.dim(), 3 + p + 1);
+    let base = weighted_gamma_glmm_scale_invariant_check(1, &model, &x, &y, &w, &ids.primary);
+    assert!(
+        base.tau2.iter().any(|&t| t > 0.0),
+        "every variance at 0: τ² {:?}",
+        base.tau2
+    );
+}
+
+/// `fit_on_hinted` on a Gamma workspace with a free φ: the routed pilot's
+/// hint is sized over `[θ | β̃ | ln φ]` (n_θ + p + 1), the call takes it, and
+/// on two other draws each hinted fit converges at or below the unhinted fit's
+/// deviance within `1e-6`.
+#[test]
+fn fit_on_hinted_takes_a_gamma_hint_with_its_ln_phi_slot() {
+    use super::core::{build_workspace, curvature_hint, fit_on, fit_on_hinted};
+    let mut model = weighted_gamma_glmm_model();
+    if let Some(re) = model.re.as_mut() {
+        re.slopes = vec![1];
+    }
     let (x, ids, n, p) = weighted_glmm_design(&WEIGHTED_GAMMA_GLMM_X1);
-    let model = weighted_gamma_glmm_model();
     let ids = GroupIds {
         primary: ids,
         extra: vec![],
     };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        weights: Some(WEIGHTED_GAMMA_GLMM_W.to_vec()),
+        ..FitOptions::default()
+    };
+    let (sized, sids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let _ = fit_on(&mut ws, &x, &WEIGHTED_GAMMA_GLMM_Y, &sids, None, &opts);
+    let hint = curvature_hint(&mut ws).expect("the slope model takes the gradient search");
+    assert_eq!(hint.dim(), 3 + p + 1);
+    for d in 1..=2 {
+        let y: Vec<f64> = WEIGHTED_GAMMA_GLMM_Y
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| if (i + d) % 7 == 0 { 1.5 * v } else { v })
+            .collect();
+        let plain = fit_on(&mut ws, &x, &y, &sids, None, &opts)
+            .into_fit(&x, &y, &sids, n, p, &model, &opts);
+        let hinted = fit_on_hinted(&mut ws, &x, &y, &sids, None, Some(&hint), &opts)
+            .into_fit(&x, &y, &sids, n, p, &model, &opts);
+        assert!(hinted.converged(), "draw {d}: hinted fit not converged");
+        assert!(
+            hinted.deviance <= plain.deviance + 1e-6,
+            "draw {d}: hinted {} vs unhinted {}",
+            hinted.deviance,
+            plain.deviance
+        );
+    }
+}
+
+/// Shared body of the weight-scale-invariance twins above, on the row-major
+/// two-column design `x`, response `y`, prior weights `w` and primary group
+/// ids `ids`. Returns the unit-scale fit.
+fn weighted_gamma_glmm_scale_invariant_check(
+    nagq: u8,
+    model: &ModelSpec,
+    x: &[f64],
+    y: &[f64],
+    w: &[f64],
+    ids: &[u32],
+) -> Fit {
+    let (n, p) = (y.len(), 2);
+    let ids = GroupIds {
+        primary: ids.to_vec(),
+        extra: vec![],
+    };
     let fit_at = |c: f64| {
-        let w: Vec<f64> = WEIGHTED_GAMMA_GLMM_W.iter().map(|&wi| c * wi).collect();
+        let w: Vec<f64> = w.iter().map(|&wi| c * wi).collect();
         fit_cold(
-            &x,
-            &WEIGHTED_GAMMA_GLMM_Y,
+            x,
+            y,
             n,
             p,
-            &model,
+            model,
             &ids,
             &FitOptions {
                 target_indices: vec![0, 1],
@@ -2046,16 +2147,32 @@ fn weighted_gamma_glmm_scale_invariant_check(nagq: u8) {
                 base.beta[j]
             );
         }
-        // This fixture's RE variance sits at the zero boundary under
-        // precision weights, so a plain relative check divides 0 by 0;
-        // absolute-plus-relative handles both the boundary and interior case.
-        let tau_diff = (f.tau2[0] - base.tau2[0]).abs();
-        assert!(
-            tau_diff <= 1e-9 * (1.0 + base.tau2[0].abs()),
-            "nagq={nagq} c={c}: τ² {} vs {}",
-            f.tau2[0],
-            base.tau2[0]
-        );
+        // A τ² may be exactly 0, where a plain relative check divides 0 by 0,
+        // so the check is absolute plus relative.
+        assert_eq!(f.tau2.len(), base.tau2.len());
+        for (k, (&t, &tb)) in f.tau2.iter().zip(&base.tau2).enumerate() {
+            assert!(
+                (t - tb).abs() <= 1e-9 * (1.0 + tb.abs()),
+                "nagq={nagq} c={c}: τ²[{k}] {t} vs {tb}"
+            );
+        }
+        // The intercept-slope correlation of each 2×2 block (vech
+        // `[v₀₀, v₁₀, v₁₁]`); NaN on both fits when a variance is at 0.
+        let corr = |fit: &Fit| -> Vec<f64> {
+            fit.varcorr
+                .iter()
+                .filter(|b| b.len() == 3)
+                .map(|b| b[1] / (b[0] * b[2]).sqrt())
+                .collect()
+        };
+        let (rf, rb) = (corr(&f), corr(&base));
+        assert_eq!(rf.len(), rb.len());
+        for (k, (&r, &r_base)) in rf.iter().zip(&rb).enumerate() {
+            assert!(
+                (r - r_base).abs() <= 1e-9 || (r.is_nan() && r_base.is_nan()),
+                "nagq={nagq} c={c}: correlation[{k}] {r} vs {r_base}"
+            );
+        }
         for j in 0..p {
             let se_rel = (f.se[j] - base.se[j]).abs() / base.se[j].abs();
             assert!(
@@ -2080,6 +2197,7 @@ fn weighted_gamma_glmm_scale_invariant_check(nagq: u8) {
             base.dispersion
         );
     }
+    base
 }
 
 /// Held φ under weights, dense mixed Gamma GLMM: `(w, Some(v))` and `(c·w,
@@ -3511,7 +3629,7 @@ fn fit_glmm_gamma_dispersion_is_the_laplace_ml_value() {
 
 /// Gamma log-link GLMM `y ~ 1 + x + grp + (1|cluster)` on sim_gamma, gated
 /// against the accuracy grid's glmmTMB record for cell `sim_gamma`:
-/// `validation/grid/runs/glmmtmb/2026-09-23_1.1.14_dell-fedora_oracle-pin/results.jsonl`
+/// `validation/grid/runs/glmmtmb/last/results.jsonl`
 /// (the same fit as `validation/goldens/sim_gamma_glmm_tmb.json`).
 ///
 /// WHY glmmTMB. glmm and glmmTMB maximise the same objective on this cell: the
@@ -10465,6 +10583,90 @@ fn gamma_inverse_singular_fit_is_equivariant_in_the_units_of_y() {
             (ll - base.loglik).abs() < 1e-8,
             "k = {k:e}: loglik {ll} vs {}",
             base.loglik
+        );
+    }
+}
+
+/// A Gamma-inverse design the gradient search fits: `(1 + x₁ | g)` (n_θ = 3),
+/// 10 clusters of 10 rows, p = 2, cluster intercepts and slopes drawn with
+/// SD scales 0.2 and 0.1, so η stays in `[0.4, 1.2]`, and shape-2 Gamma noise
+/// (the mean of two unit exponentials). Returns the row-major design, y, the
+/// group ids and the model.
+pub(super) fn gamma_inverse_slope_design() -> (Vec<f64>, Vec<f64>, GroupIds, ModelSpec) {
+    let (n_g, per) = (10usize, 10usize);
+    let n = n_g * per;
+    let mut st = 4242u64;
+    let b: Vec<(f64, f64)> = (0..n_g)
+        .map(|_| (0.2 * lcg(&mut st), 0.1 * lcg(&mut st)))
+        .collect();
+    let (mut x, mut y, mut gid) = (Vec::with_capacity(2 * n), Vec::with_capacity(n), Vec::new());
+    for i in 0..n {
+        let g = i / per;
+        let x1 = 0.5 * lcg(&mut st);
+        let eta = 0.8 - 0.3 * x1 + b[g].0 + b[g].1 * x1;
+        let e = |st: &mut u64| -(0.5 * (lcg(st) + 1.0)).max(1e-12).ln();
+        let noise = 0.5 * (e(&mut st) + e(&mut st));
+        x.extend([1.0, x1]);
+        y.push(noise / eta);
+        gid.push(g as u32);
+    }
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Inverse,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: gid,
+        extra: vec![],
+    };
+    (x, y, ids, model)
+}
+
+/// A Gamma-inverse design the gradient search fits, `(1 + x₁ | g)` (n_θ = 3,
+/// 10 clusters of 10 rows), through `fit_cold`, so the units of the first
+/// search and the retry (`gamma_inverse_units`, `gamma_inverse_retry`) run
+/// as for any caller, on y·k for k = 2⁻²⁰ … 2²⁰. At every k the fit is
+/// converged and its deviance in y's units is at or below the BOBYQA route's
+/// on the same data within `dev_eps` (4e-5).
+#[test]
+fn gamma_inverse_gradient_route_matches_bobyqa_in_any_units() {
+    use super::core::{build_workspace, curvature_hint, fit_on};
+    let (x, y1, ids, model) = gamma_inverse_slope_design();
+    let n = y1.len();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (sized, sids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let bobyqa = |y: &[f64]| {
+        let mut ws = build_workspace(&sized, perm, n, 2, &opts);
+        super::core::force_bobyqa_route(&mut ws);
+        fit_on(&mut ws, &x, y, &sids, None, &opts).into_fit(&x, y, &sids, n, 2, &model, &opts)
+    };
+    let mut ws = build_workspace(&sized, perm, n, 2, &opts);
+    let _ = fit_on(&mut ws, &x, &y1, &sids, None, &opts);
+    assert!(
+        curvature_hint(&mut ws).is_some(),
+        "the design does not take the gradient search"
+    );
+    for e in -20..=20 {
+        let k = 2f64.powi(e);
+        let y: Vec<f64> = y1.iter().map(|v| k * v).collect();
+        let shift = 2.0 * n as f64 * k.ln();
+        let f = fit_cold(&x, &y, n, 2, &model, &ids, &opts);
+        let bob = bobyqa(&y);
+        let (dev, dev_bob) = (f.deviance - shift, bob.deviance - shift);
+        assert!(f.converged(), "k = 2^{e}: not converged");
+        assert!(
+            dev <= dev_bob + 4e-5,
+            "k = 2^{e}: gradient route {dev} vs BOBYQA {dev_bob} (in y's units)"
         );
     }
 }

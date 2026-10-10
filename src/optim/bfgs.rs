@@ -12,18 +12,26 @@
 //! [`BfgsConfig::first_step_cap`] in the max norm, so the identity's
 //! unit-free step cannot leave the region the start describes.
 //!
+//! An objective that knows one coordinate's curvature at the start
+//! ([`GradObjective::start_curvature`]) seeds that diagonal entry of `H` with
+//! its inverse instead of 1. The entry keeps that value through Shanno's
+//! rescaling and every restart; the rescaling's `sᵀy/yᵀy` and the first-step
+//! cap read and scale the other coordinates only, since the seeded
+//! coordinate's step is already in its own units.
+//!
 //! Stops:
 //!
 //! - `Pgrad`: the projected-gradient max norm `max|P(x − g) − x|` is below
 //!   [`BfgsConfig::pgrad_tol`];
 //! - `Fdelta`: after the second iteration, the accepted decrease is below
-//!   `max(FDELTA_ABS, FDELTA_ULPS·ε·|f|)`. The absolute part is in deviance
-//!   units: a relative stop (`1e-11·(1 + |f|)`) grows with n, because the
-//!   deviance is O(n), and ended a 300k-row GLMM 4.7e-4 above its optimum
-//!   (2026-10-07, B2 measurements). The ulp part keeps the stop reachable
-//!   where 1e-9 is below the deviance's own rounding (|f| above about 3e5
-//!   makes `16·ε·|f|` exceed 1e-9; at |f| = 1e7 it is 3.6e-8, still three
-//!   orders below `dev_eps`);
+//!   `max(fdelta_abs, FDELTA_ULPS·ε·|f|)` ([`BfgsConfig::fdelta_abs`]). The
+//!   absolute part is in deviance units: a relative stop (`1e-11·(1 + |f|)`)
+//!   grows with n, because the deviance is O(n), and ended a 300k-row GLMM
+//!   4.7e-4 above its optimum (2026-10-07 measurements). The ulp part
+//!   keeps the stop reachable where the absolute part is below the
+//!   deviance's own rounding (at 1e-9, |f| above about 3e5 makes `16·ε·|f|`
+//!   exceed it; at |f| = 1e7 it is 3.6e-8, still three orders below
+//!   `dev_eps`);
 //! - `NoiseFloor`: no trial could be accepted, every trial's predicted
 //!   decrease was below that threshold, and the decrement is below the
 //!   certificate's bound (a warm start at the optimum stops here after one
@@ -40,10 +48,6 @@
 //! search.
 
 use super::GradObjective;
-
-/// Absolute part of the `Fdelta` stop, in deviance units. Shared with the
-/// GLMM route.
-pub(crate) const FDELTA_ABS: f64 = 1e-9;
 
 /// Relative floor of the `Fdelta` stop, in units of `ε·|f|`: two deviances
 /// that differ by fewer ulps than this are not a measured decrease.
@@ -72,6 +76,9 @@ pub(crate) struct BfgsConfig {
     pub pgrad_tol: f64,
     /// Max-norm cap of the first step after a (re)start of `H`.
     pub first_step_cap: f64,
+    /// Absolute part of the `Fdelta` and `NoiseFloor` threshold, in deviance
+    /// units (see the module doc).
+    pub fdelta_abs: f64,
 }
 
 impl BfgsConfig {
@@ -83,17 +90,29 @@ impl BfgsConfig {
         armijo_c: 1e-4,
         pgrad_tol: 1e-6,
         first_step_cap: 0.5,
+        fdelta_abs: 1e-9,
     };
 
-    /// The GLMM Laplace route's settings, over `[θ | β]` (B2): the measured
-    /// prototype's (308 grid and 32 stress cells, 2026-10-06/07), whose
-    /// largest iteration count was about 90 (q8 cells).
+    /// The GLMM Laplace route's settings, over `[θ | β̃]` and a free Gamma
+    /// `ln φ`: the measured prototype's (308 grid and 32 stress cells,
+    /// 2026-10-06/07), whose largest iteration count was about 90 (q8 cells).
+    ///
+    /// `fdelta_abs` is 1e-10, not the LMM's 1e-9. Where a variance column
+    /// collapses toward zero the deviance is nearly flat along a curved
+    /// valley, and the search descends it in waves: the accepted decrease
+    /// dips for a few iterations and grows again. At 1e-9 a dip ended a
+    /// Gamma-inverse q6 fit 2.4e-5 above its optimum (cold, decreases down to
+    /// 8.9e-10) and 9.6e-6 above (truth start, predicted decrease below the
+    /// floor), with the decrement at 9e-10 and 3e-10; the joint polish then
+    /// took 13078 and 9927 evaluations. At 1e-10 both reach the optimum
+    /// (2026-10-09, `gami_q6_g3000p20_bal_base`).
     pub(crate) const GLMM: Self = Self {
         max_iter: 200,
         max_backtracks: 30,
         armijo_c: 1e-4,
         pgrad_tol: 1e-6,
         first_step_cap: 0.5,
+        fdelta_abs: 1e-10,
     };
 }
 
@@ -179,7 +198,8 @@ pub(crate) struct BfgsState {
 
 impl BfgsState {
     /// The last search's `n×n` inverse-Hessian approximation (row-major), as
-    /// it ended: the identity until a first update.
+    /// it ended: the start (the identity, or with its seeded entry) until a
+    /// first update.
     pub(crate) fn inv_hessian(&self) -> &[f64] {
         &self.h
     }
@@ -207,6 +227,14 @@ impl BfgsState {
         self.h.fill(0.0);
         for i in 0..n {
             self.h[i * n + i] = scale;
+        }
+    }
+
+    /// `H = scale·I` with the seeded diagonal entry, if any, at its own value.
+    fn set_start(&mut self, scale: f64, seed: Option<(usize, f64)>) {
+        self.set_identity(scale);
+        if let Some((i, v)) = seed {
+            self.h[i * self.n + i] = v;
         }
     }
 
@@ -281,6 +309,8 @@ fn all_finite(v: &[f64]) -> bool {
 /// `h0`, a row-major `n×n` inverse Hessian (a caller's
 /// [`CurvatureHint`](super::CurvatureHint)), replaces the identity start: no
 /// first-step cap and no Shanno rescaling then, since the scale is known.
+/// Without `h0` the objective's [`GradObjective::start_curvature`] seeds one
+/// diagonal entry (see the module doc).
 #[allow(clippy::needless_range_loop)] // dense small-matrix loops index several arrays
 pub(crate) fn bfgs_minimize(
     obj: &mut impl GradObjective,
@@ -325,12 +355,22 @@ pub(crate) fn bfgs_minimize(
     let pg0 = (0..n)
         .map(|i| ((x[i] - st.g[i]).clamp(lo[i], hi[i]) - x[i]).abs())
         .fold(0.0f64, f64::max);
+    let seed = if hinted {
+        None
+    } else {
+        obj.start_curvature()
+            .filter(|&(i, v)| i < n && v.is_finite() && v > 0.0)
+    };
+    if seed.is_some() {
+        st.set_start(1.0, seed);
+    }
     if pg0 < cfg.pgrad_tol {
         out.stop = BfgsStop::Pgrad;
         st.mark_free(x, lo, hi);
         out.decrement = st.decrement();
         return out;
     }
+    let seeded = |i: usize| seed.is_some_and(|(j, _)| j == i);
     let mut first = !hinted;
     while out.iters < cfg.max_iter {
         out.iters += 1;
@@ -338,7 +378,7 @@ pub(crate) fn bfgs_minimize(
         let mut slope = st.direction();
         if slope >= 0.0 || !slope.is_finite() {
             // Not a descent direction: restart from steepest descent.
-            st.set_identity(1.0);
+            st.set_start(1.0, seed);
             first = true;
             slope = st.direction();
             if slope >= 0.0 || !slope.is_finite() {
@@ -348,17 +388,26 @@ pub(crate) fn bfgs_minimize(
             }
         }
         if first {
-            let dn = st.d.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            let dn = (0..n)
+                .filter(|&i| !seeded(i))
+                .fold(0.0f64, |m, i| m.max(st.d[i].abs()));
             if dn > cfg.first_step_cap {
                 let sc = cfg.first_step_cap / dn;
-                st.d.iter_mut().for_each(|v| *v *= sc);
-                slope *= sc;
+                if seed.is_none() {
+                    st.d.iter_mut().for_each(|v| *v *= sc);
+                    slope *= sc;
+                } else {
+                    // `H` is diagonal after a (re)start, so the partly scaled
+                    // step is still a descent direction.
+                    (0..n).filter(|&i| !seeded(i)).for_each(|i| st.d[i] *= sc);
+                    slope = (0..n).map(|i| st.d[i] * st.g[i]).sum();
+                }
             }
         }
         // A trial whose predicted decrease is below the deviance's noise
         // cannot be told from the incumbent; the search stops at the floor
         // rather than halving further.
-        let floor = FDELTA_ABS.max(FDELTA_ULPS * f64::EPSILON * fk.abs());
+        let floor = cfg.fdelta_abs.max(FDELTA_ULPS * f64::EPSILON * fk.abs());
         let mut alpha = 1.0;
         let mut accepted = None;
         for _ in 0..cfg.max_backtracks {
@@ -408,7 +457,33 @@ pub(crate) fn bfgs_minimize(
         let yy: f64 = st.y.iter().map(|v| v * v).sum();
         if sy > 1e-12 * sn * yy.sqrt() {
             if first {
-                st.set_identity(sy / yy);
+                // With a seed, Shanno's scale reads the other coordinates
+                // only. Read over all of them, a stiff seeded coordinate (a
+                // Gamma `ψ`, curvature of order n) sets the scale of the rest
+                // too: a Gamma-inverse random-slope fit then ended certified
+                // in a local minimum 0.029 above the optimum
+                // (`gamma_inverse_gradient_route_matches_bobyqa_in_any_units`,
+                // y·2⁻⁵, 2026-10-09).
+                let scale = match seed {
+                    None => sy / yy,
+                    Some((j, _)) => {
+                        let rest = (0..n).filter(|&i| i != j);
+                        let sy_r: f64 = rest.clone().map(|i| st.s[i] * st.y[i]).sum();
+                        let yy_r: f64 = rest.map(|i| st.y[i] * st.y[i]).sum();
+                        // The other coordinates' pair carries no positive
+                        // curvature when their step or gradient change is
+                        // zero (every one held on a bound, or n = 1) or the
+                        // step crossed a concave stretch in them. Their ratio
+                        // is then no scale, and the full `sᵀy/yᵀy`, positive
+                        // by the check above, is the one left.
+                        if sy_r > 0.0 && yy_r > 0.0 {
+                            sy_r / yy_r
+                        } else {
+                            sy / yy
+                        }
+                    }
+                };
+                st.set_start(scale, seed);
                 first = false;
             }
             st.update(sy);
@@ -420,7 +495,7 @@ pub(crate) fn bfgs_minimize(
             out.stop = BfgsStop::Pgrad;
             break;
         }
-        let floor = FDELTA_ABS.max(FDELTA_ULPS * f64::EPSILON * fk.abs());
+        let floor = cfg.fdelta_abs.max(FDELTA_ULPS * f64::EPSILON * fk.abs());
         if out.iters > 2 && decrease.abs() < floor {
             out.stop = BfgsStop::Fdelta;
             break;

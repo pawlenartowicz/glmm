@@ -157,16 +157,18 @@ pub struct Fit {
     /// there is no split. (The validation suite skips `sd_se` gating for
     /// dispersion families accordingly.)
     pub stddev_se: Vec<f64>,
-    /// Objective evaluations consumed by the θ (LMM) / joint [θ|β] (GLMM)
-    /// BOBYQA search — GLMM counts both stages. 0 where no derivative-free
-    /// optimizer runs (OLS/GLM closed-form or IRLS paths). Deterministic and
+    /// Objective value evaluations of the outer search over θ (LMM) or the
+    /// joint `[θ|β]` (GLMM): BOBYQA's and BFGS's together, every stage and
+    /// fallback included. A BFGS gradient reuses its point's value evaluation
+    /// and is not counted here (see [`Diagnostics::n_grad`]). 0 where no outer
+    /// search runs (OLS/GLM closed-form or IRLS paths). Deterministic and
     /// clock-independent; the optimizer-grid campaign's primary metric.
     pub n_eval: usize,
     /// Dev-only optimizer evaluation counters — the stage split, the shrink
     /// phase, the PIRLS-iteration histogram and the AGQ node cost. Present
     /// only under the off-by-default `counters` feature, which is NOT
-    /// semver-covered; zeros on every route that runs no derivative-free
-    /// search (OLS, GLM).
+    /// semver-covered; zeros on every route that runs no outer search (OLS,
+    /// GLM).
     #[cfg(feature = "counters")]
     pub counters: crate::counters::EvalCounters,
     /// Minimized optimizer criterion at the accepted point. LMM: the profiled
@@ -508,8 +510,8 @@ pub enum Note {
     /// own).
     ExactProfileFallback,
     /// The gradient search (BFGS: LMMs whose random slopes are all on one
-    /// grouping; binomial and Poisson Laplace GLMMs with at least two θ on the
-    /// blocked or structured layout) did not converge, so BOBYQA, the
+    /// grouping; binomial, Poisson and Gamma Laplace GLMMs with at least two θ
+    /// on the blocked or structured layout) did not converge, so BOBYQA, the
     /// derivative-free search every other model uses, continued from the best
     /// point it had reached, with its own full evaluation budget. The reported
     /// estimates and `converged` are that search's. `n_eval` counts both.

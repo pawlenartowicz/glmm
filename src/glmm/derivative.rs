@@ -1596,7 +1596,7 @@ fn run_gradient<T: Seed>(
                     )
                 }
             } else if extras {
-                let (o, _dev, conv, _raw_finite) = structured_laplace_deviance::<T>(
+                let (o, _pen_dev, conv, _raw_finite) = structured_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     groupings,
@@ -1635,7 +1635,7 @@ fn run_gradient<T: Seed>(
                 }
                 o
             } else {
-                let (o, _dev, conv, _raw_finite) = blocked_laplace_deviance::<T>(
+                let (o, _pen_dev, conv, _raw_finite) = blocked_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     groupings,
@@ -1968,7 +1968,7 @@ pub(crate) fn laplace_gradient(
         let saved_schur = pattern.structured_schur.take();
         let saved_force_dense = pattern.force_dense_schur;
         pattern.force_dense_schur = false;
-        let (dev, _dev_scaled, conv, _raw_finite) = structured_laplace_deviance::<f64>(
+        let (dev, _pen_dev, conv, _raw_finite) = structured_laplace_deviance::<f64>(
             family,
             nb_theta,
             groupings,
@@ -1996,7 +1996,7 @@ pub(crate) fn laplace_gradient(
         pattern.force_dense_schur = saved_force_dense;
         conv && dev.is_finite()
     } else {
-        let (dev, _dev_scaled, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
+        let (dev, _pen_dev, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
             family,
             nb_theta,
             groupings,
@@ -2228,7 +2228,7 @@ fn run_hessian<T: SeedHessian>(
                     )
                 }
             } else if extras {
-                let (o, _dev, conv, _raw_finite) = structured_laplace_deviance::<T>(
+                let (o, _pen_dev, conv, _raw_finite) = structured_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     groupings,
@@ -2260,7 +2260,7 @@ fn run_hessian<T: SeedHessian>(
                 }
                 o
             } else {
-                let (o, _dev, conv, _raw_finite) = blocked_laplace_deviance::<T>(
+                let (o, _pen_dev, conv, _raw_finite) = blocked_laplace_deviance::<T>(
                     family,
                     nb_theta,
                     groupings,
@@ -2599,7 +2599,7 @@ pub(crate) fn laplace_hessian(
         let saved_schur = pattern.structured_schur.take();
         let saved_force_dense = pattern.force_dense_schur;
         pattern.force_dense_schur = false;
-        let (dev, _dev_scaled, conv, _raw_finite) = structured_laplace_deviance::<f64>(
+        let (dev, _pen_dev, conv, _raw_finite) = structured_laplace_deviance::<f64>(
             family,
             nb_theta,
             groupings,
@@ -2627,7 +2627,7 @@ pub(crate) fn laplace_hessian(
         pattern.force_dense_schur = saved_force_dense;
         conv && dev.is_finite()
     } else {
-        let (dev, _dev_scaled, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
+        let (dev, _pen_dev, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
             family,
             nb_theta,
             groupings,

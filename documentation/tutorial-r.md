@@ -62,7 +62,7 @@ data <- data.frame(
 fit <- fastglmm(y ~ x1 + (1 | group), data)
 
 fit$converged
-summary(fit)   # coefficient table + variance components; no fake AIC line
+summary(fit)   # lme4-shaped: criterion, random effects, coefficient table
 ```
 
 Points worth knowing at this layer:
@@ -123,10 +123,10 @@ the same, `Gamma()` and `"gamma"` are not. Choose deliberately.
 The knobs:
 
 - `nAGQ` — adaptive Gauss–Hermite node count; `1` = Laplace (default). Must be an
-  **odd** integer `≤ 25`. `> 1` applies to binomial/Poisson mixed models with a
-  single grouping factor and `≤ 3` random effects per group; **any other shape
-  warns and falls back to Laplace** rather than erroring the way `lme4::glmer`
-  does — the fit you get is a Laplace fit, and the warning is the only notice.
+  **odd** integer `≤ 25`. `> 1` applies to binomial, Poisson, negative-binomial
+  or Gamma mixed models with a single grouping factor and `≤ 3` random effects
+  per group; **any other shape warns and falls back to Laplace** rather than
+  erroring the way `lme4::glmer` does — the fit you get is a Laplace fit, and the warning is the only notice.
 - `dispersion` — Gamma dispersion directive: `NULL` (estimate φ̂ by maximum
   likelihood, the default, on both a GLM and a GLMM, to place `logLik` at
   its maximum — but the two routes report and scale the SE by different
@@ -167,9 +167,12 @@ binomial/Poisson formula — **warns and is stripped**, so it never reaches the
 kernel: loud enough to catch the mistake, lenient enough for exploration.
 
 Three things error *naming the reason* rather than fitting a silently different
-model. Known lme4 arguments passed through `...` (`REML = FALSE`, `control=`,
-`verbose=`, `contrasts=`) each explain why they can't be honored
-(`REML = FALSE`, for instance, because the LMM path is REML-only by design). A
+model. Known lme4 arguments passed through `...` (`control=`, `verbose=`,
+`contrasts=`) each explain why they can't be honored. `REML =` is checked
+against the model: `REML = FALSE` on a Gaussian mixed model errors, because the
+LMM path is REML-only by design, and `REML = TRUE` on any other model errors,
+because that model is fitted by maximum likelihood. `REML = FALSE` on a model
+that is not a Gaussian mixed model is accepted and changes nothing. A
 random-effect term on `family = inverse.gaussian()` errors — the kernel is
 GLM-only for that family — and the remaining open gap, quasi-likelihood
 dispersion on binomial/Poisson, errors until the kernel implements it.
@@ -183,7 +186,7 @@ shaped like lme4's. These **work**:
 
 | accessor | what it returns |
 |---|---|
-| `summary(fit)` | coefficient table (estimate, std. error, Wald **z**, `Pr(>|z|)`), plus the RE block and a dispersion/shape footer. When the fit raised any warnings, the printed summary ends with a `Warnings:` section listing each one's tier, title and message. **No** `AIC`/`BIC`/`logLik`/`deviance` line: the kernel surfaces no comparable log-likelihood, and a fake one would be worse than none. |
+| `summary(fit)` | lme4's blocks in lme4's order: the criterion (`REML criterion at convergence` on an LMM, an `AIC BIC logLik deviance df.resid` row on an ML fit), scaled residuals, the RE block, the coefficient table (estimate, std. error, Wald **z**, `Pr(>|z|)`), the correlation of fixed effects, and a dispersion/shape footer. When the fit raised any warnings, the printed summary ends with a `Warnings:` section listing each one's tier, title and message. |
 | `fixef(fit)` | named fixed-effect estimates; aliased (rank-deficient) columns are `NA`, as in `lm`/lme4. |
 | `vcov(fit)` | full `p × p` Wald covariance of β̂. |
 | `VarCorr(fit)` | variance components on the **SD/correlation** scale, one covariance per grouping, lme4-shaped; a `Residual` row (= `sigma()`) is printed for a gaussian mixed fit. Groups are listed in the order they appear in the formula — lme4's own `VarCorr` instead sorts by decreasing number of levels. |
@@ -193,6 +196,8 @@ shaped like lme4's. These **work**:
 | `nobs`, `formula`, `family`, `model.frame`, `print` | the usual; `formula()` returns the formula **string** as given (the parser is Rust-side, so there is no R `terms` object to hand back). |
 | `ranef(fit)` | conditional modes (BLUPs), one data frame per grouping, lme4-shaped. Conditional variances (`condVar`) are not computed. |
 | `fitted(fit)` | conditional means per row, including the random-effect contribution and any offset. |
+| `residuals(fit)` | `type = "response"` (default, `y - fitted`) or `type = "pearson"`. Deviance and working residuals are not offered. |
+| `tidy(fit)`, `glance(fit)` | broom-shaped data frames: one row per fixed effect (`term`, `estimate`, `std.error`, `statistic`, `p.value`), and one row of fit statistics (`nobs`, `logLik`, `AIC`, `BIC`, `deviance`, `df.residual`, `REML`). |
 | `logLik(fit)` | log-likelihood on `stats::logLik`'s scale, so `AIC()`/`BIC()` work; on the LMM paths this is the REML criterion (`REML = TRUE` attribute). |
 | `fit$diagnostics` | list with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; the top-level `fit$converged`/`fit$singular`/`fit$aliased` are unchanged and mirror the same values. |
 
@@ -220,7 +225,7 @@ suppressWarnings(fastglmm(y ~ x1 + x2 + (1 | group), data), classes = "fastglmm_
 
 These **error, naming the reason** — the package's defining choice, that anything
 the kernel cannot compute honestly is a documented error, never a silently
-different answer: `predict`, `residuals`, `coef`, and `terms`. `coef()` is
+different answer: `predict`, `coef`, and `terms`. `coef()` is
 instructive: lme4's `coef()` means fixed + random effects per group, and
 returning fixed effects only would silently differ from what the same call
 gives an lme4 user, so it errors and points you at `fixef()` and `ranef()`

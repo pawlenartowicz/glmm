@@ -227,8 +227,8 @@ design as given and warns on badly scaled predictors (`checkScaleX`).
 
 Every tuning surface, one line each, pointing at the page that owns it. Public
 `FitOptions` knobs are documented at their use site; internal constants are
-tuned on the crate's validation corpus (27 manifest datasets, rungs 1–23 and 25–28;
-rung 24, the sparse Gamma, is backed out — see the LMM/GLMM validation sections)
+tuned on the crate's validation corpus (the 49 rungs of `validation/manifest.json`
+and the accuracy grid in `validation/grid/` — see the LMM/GLMM validation sections)
 and are not user-facing.
 
 ### Public `FitOptions` fields (`src/fit/mod.rs`, `struct FitOptions`)
@@ -238,8 +238,8 @@ and are not user-facing.
 | `target_indices` | fixed-effect columns to compute SE for | [OLS](#ordinary-least-squares-ols) / [GLM](#generalised-linear-models-glm) here; LMM SE in [`algorithms-lmm.md`](algorithms-lmm.md#standard-errors); GLMM SE in [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) |
 | `wald_se` | `Hessian` (default) vs `Rx` Wald covariance | GLMM only — [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (ignored on OLS/GLM/LMM) |
 | `nagq` | AGQ node count, default 1 (Laplace) | GLMM only — [`algorithms-glmm.md`](algorithms-glmm.md#adaptive-gausshermite-quadrature-agq) |
-| `dispersion` | Gamma φ directive: `None` estimates, `Some(v)` fixes | [GLM Gamma](#generalised-linear-models-glm) here; Gamma GLMM in [`algorithms-glmm.md`](algorithms-glmm.md#laplace-approximation) |
-| `weights` | per-row prior weights `wᵢ`: precision weights on every family with an estimated dispersion (row `i` has dispersion `φ/wᵢ`) — Gaussian, Gamma, inverse-Gaussian; trial counts on aggregated Binomial; same fit either way on Poisson; multiply the log-likelihood on NB. See [`conventions.md`](conventions.md#prior-weights) | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages, **including** AGQ (`nagq > 1`) on the binomial/Poisson shapes AGQ covers |
+| `dispersion` | Gamma or inverse-Gaussian φ directive: `None` estimates, `Some(v)` fixes | [GLM Gamma and inverse-Gaussian](#generalised-linear-models-glm) here; Gamma GLMM in [`algorithms-glmm.md`](algorithms-glmm.md#laplace-approximation) |
+| `weights` | per-row prior weights `wᵢ`: precision weights on every family with an estimated dispersion (row `i` has dispersion `φ/wᵢ`) — Gaussian, Gamma, inverse-Gaussian; trial counts on aggregated Binomial; same fit either way on Poisson; multiply the log-likelihood on NB. See [`conventions.md`](conventions.md#prior-weights) | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages, **including** AGQ (`nagq > 1`) on the binomial/Poisson/NB/Gamma shapes AGQ covers |
 | `offset` | per-row offset `oᵢ` added to the linear predictor | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages |
 | `parallel_inner` | experimental opt-in to parallel inner kernels | GLMM only — AGQ/FD-Hessian, [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (off by default, bit-identical to serial) |
 
@@ -249,7 +249,7 @@ and are not user-facing.
 |---|---|---|
 | `FitWorkspace::set_prestandardized` | `true` fits the design as given, skipping the per-draw standardization except the random-slope scale; default `false`. `fit_cold`/`fit_warm` always standardize | [internal standardization](#internal-standardization-of-the-design) |
 | `FitWorkspace::set_fixed_design` | `true` promises the same `x`, ids and weights on every following `fit_on` (only `y` and the offset change): the column statistics, the design fill and, on the dense LMM route, the fixed-effect factor and the design part of the sufficient statistics are reused; bit-identical; a debug build checks the promise by a hash; default `false` | [internal standardization](#internal-standardization-of-the-design), [`algorithms-lmm.md`](algorithms-lmm.md#fixed-effect-orthogonalization) |
-| `curvature_hint` / `fit_on_hinted` | a frozen inverse Hessian at a pilot fit's optimum that each later draw's BFGS search starts from (LMMs on the per-group route, over θ; binomial and Poisson Laplace GLMMs on the gradient route, over `[θ \| β̃]`, the pilot search's own estimate); read only, so results do not depend on call order; a hint of another search dimension panics | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs), [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-binomial-and-poisson-laplace-fits) |
+| `curvature_hint` / `fit_on_hinted` | a frozen inverse Hessian at a pilot fit's optimum that each later draw's BFGS search starts from (LMMs on the per-group route, over θ; binomial, Poisson and Gamma Laplace GLMMs on the gradient route, over `[θ \| β̃]`, and `[θ \| β̃ \| ln φ]` on a free Gamma dispersion, the pilot search's own estimate); read only, so results do not depend on call order; a hint of another search dimension panics | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs), [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-binomial-poisson-and-gamma-laplace-fits) |
 
 ### Internal tuning constants
 
@@ -257,17 +257,21 @@ and are not user-facing.
 |---|---|---|
 | BOBYQA `npt` | `2·n_θ + 1` for `n_θ < 3`, else `(3·n_θ).div_ceil(2) + 1` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm/mod.rs`) |
 | `rho_begin` per search | LMM `RHO_BEGIN = 0.5` blind, `RHO_BEGIN_WARM = 0.1` warm; GLMM stage 1 and the `Joint` route `GLMM_RHO_BEGIN = 0.2` (stage 1 from a kept warm θ₀ 0.1), the polish `GLMM_RHO_POLISH = 0.03` (0.1 after a stage-1 optimum with a diagonal below `POLISH_NEAR_SINGULAR = 1e-2`) | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ), [`algorithms-glmm.md`](algorithms-glmm.md) (`src/lmm/mod.rs`) |
-| `rho_end` | `RHO_END = 1e-6` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm/mod.rs`) |
+| `rho_end` | LMM `RHO_END = 1e-6`; GLMM searches `GLMM_RHO_END = 3e-6` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ), [`algorithms-glmm.md`](algorithms-glmm.md) (`src/lmm/mod.rs`) |
 | BOBYQA `prima_parity` | `false` on every search: Powell's RESCUE factor at a fully determined model (one-dimensional searches); no effect at any other `npt` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`apply_campaign_overrides`, `src/lmm/mod.rs`) |
 | LMM outer optimizer | BFGS where the per-group regression route is armed (slopes on the primary only, `n_θ ≥ 3`), BOBYQA elsewhere and as its polish/fallback | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs) (`lmm_outer_optimizer`, `src/lmm/mod.rs`) |
-| GLMM outer optimizer | BFGS over `[θ \| β̃]` on binomial (any link) and Poisson Laplace fits with `n_θ ≥ 2` on the blocked or structured layout (a warm fit with no slope block only below 50 rows per primary level); BOBYQA elsewhere and as its polish/fallback; 200 iterations | [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-binomial-and-poisson-laplace-fits) (`gradient_route_plan`, `src/glmm/mod.rs`) |
-| BFGS stops and certificate | projected gradient `< 1e-6`; decrease `< max(FDELTA_ABS = 1e-9, FDELTA_ULPS = 16 · ε·\|f\|)`; accepted when the decrement `½·gᵀHg ≤ CERT_DECREMENT = 1e-8` and no diagonal θ `< CERT_NEAR_ZERO = 1e-3`; Armijo `c = 1e-4`, 30 halvings, first step capped at 0.5, 1000 iterations | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs) (`src/optim/bfgs.rs`) |
+| GLMM outer optimizer | BFGS over `[θ \| β̃]` on binomial (any link), Poisson and Gamma (log and inverse link) Laplace fits with `n_θ ≥ 2` on the blocked or structured layout (a warm fit with no slope block only below 50 rows per primary level), with a free Gamma `ln φ` as one more coordinate (its start curvature seeded on the inverse link); BOBYQA elsewhere and as its polish/fallback; 200 iterations | [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-binomial-poisson-and-gamma-laplace-fits) (`gradient_route_plan`, `src/glmm/mod.rs`) |
+| BFGS stops and certificate | projected gradient `< 1e-6`; decrease `< max(fdelta_abs, FDELTA_ULPS = 16 · ε·\|f\|)`, `fdelta_abs` = 1e-9 on the LMM route, 1e-10 on the GLMM route; accepted when the decrement `½·gᵀHg ≤ CERT_DECREMENT = 1e-8` and no diagonal θ `< CERT_NEAR_ZERO = 1e-3`; Armijo `c = 1e-4`, 30 halvings, first step capped at 0.5; 1000 iterations on the LMM route, 200 on the GLMM route | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs), [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-binomial-poisson-and-gamma-laplace-fits) (`BfgsConfig`, `src/optim/bfgs.rs`) |
+| `GRAD_WARM_THETA_MAX` / `GRAD_THETA_FAR` | `10` / `100` (`0.1·THETA_HI`) — a warm GLMM fit whose θ start has a diagonal above 10 takes the BOBYQA route; a gradient-search endpoint with a diagonal θ at or above 100 hands over to BOBYQA | [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-binomial-poisson-and-gamma-laplace-fits) (`src/glmm/mod.rs`) |
 | `PG_GRAD_BLOCK` | 512 groups per stacked solve of the LMM gradient | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs) (`src/lmm/pg_grad.rs`) |
+| `THETA0` / `THETA_HI` | `1.0` — blind θ start on each diagonal entry (off-diagonals start at `0`); `1e3` — the symmetric search box `[−THETA_HI, THETA_HI]` on every θ entry | [`algorithms-lmm.md`](algorithms-lmm.md#covariance-parameterization-θ-cholesky) (`src/lmm/mod.rs`) |
+| `THETA_TRUTH_FLOOR` | `0.01` — a truth-seeded θ start is clamped to at least this, above `PIN_THETA`, so it never starts on the boundary | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm/mod.rs`) |
 | `PIN_THETA` | `1e-4` — diagonal variance component pinned to `0`, tested on the internal (scaled) θ | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm/mod.rs`) |
 | `SINGULAR_REL_TOL` | `1e-3` — post-hoc relative check: any RE stddev `≤ 1e-3 ×` the largest ⇒ `singular`, on the internal (scaled) stddevs | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/fit/mod.rs`) |
 | RE design column scale | per random-slope column of the standardized design, `√(Σ wᵢx̃ᵢ²/Σ wᵢ)`; intercept subcolumns exactly `1.0`; always on, no trigger | [`algorithms-lmm.md`](algorithms-lmm.md#random-effect-design-column-scaling) (`src/lmm/mod.rs`) |
 | `GRAM_PIVOT_MIN` | `1e-3`: the smallest pivot ratio `R_jj²/(X'WX)_jj` at which the dense LMM route reads its fixed-effect factor off the accumulated Gram; below it the Givens QR runs | [`algorithms-lmm.md`](algorithms-lmm.md#fixed-effect-orthogonalization) (`src/lmm/kernel.rs`) |
-| `outer_search` route | `ExactProfile` on the `exact_profile_shape` shapes (nAGQ=1, no extras or structured extras eligible, canonical or not, Gamma included); else `Joint` when `nAGQ>1 \|\| (n_θ ≤ 2 && p ≤ 4)`; else `PqlThenJoint` | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/workspace.rs`, `src/glmm/mod.rs`) |
+| `TAIL_SPARSE_MIN` | `128` — crossed Schur tails of size `e ≤ 128` keep the dense factor; larger tails take the fill-reducing sparse LLT | [`algorithms-lmm.md`](algorithms-lmm.md#the-sparse-kernel-two-level-schur-block-cholesky) (`src/sparse/mod.rs`) |
+| `outer_search` route | `ExactProfile` on the `exact_profile_shape` shapes (nAGQ=1 on the blocked or structured layout, not the packed one; canonical or not, Gamma included); else `Joint` when `nAGQ>1 \|\| (n_θ ≤ 2 && p ≤ 4)`; else `PqlThenJoint` | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/workspace.rs`, `src/glmm/mod.rs`) |
 | `ExactProfile` stage-1 PIRLS tolerance | `clamp(RHO_TOL_C·ρ², pirls_tol, RHO_TOL_MAX)` with BOBYQA's ρ, `RHO_TOL_C = 1e-2`, `RHO_TOL_MAX = 1e-5`; `pirls_tol` on the first evaluation and once ρ ≤ `RHO_TOL_FULL_FACTOR·GLMM_RHO_END` (3e-5); a loose incumbent re-solved at `pirls_tol` | [`algorithms-glmm.md`](algorithms-glmm.md) (`src/glmm/mod.rs`) |
 | `JOINT_RECHECK_TOL` | `1e-9` relative — after a converged joint `[θ \| β̃]` search, a PQL re-solve of β at the incumbent (then, on AGQ, the AGQ objective there) lower by more than this starts a second pass from it, on β̃ scaled by the β information | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/mod.rs`) |
 | Gamma-inverse response units | first search on y while the largest cluster η is in `[1/64, 64]`, else on y rescaled to bring it into `[4, 8]`; a search that fails or ends no lower than the GLM point (`UNITS_RETRY_TOL = 1e-6` relative) is retried with the smallest start η in `[1/2, 64]` and the largest cluster η in `[4, 8]` and `[8, 16]` | [`algorithms-glmm.md`](algorithms-glmm.md#response-units-on-the-gamma-inverse-link) (`src/fit/glmm.rs`) |
@@ -617,29 +621,34 @@ keep the Fisher factor `(XᵀWX)⁻¹` of the last pass (expected information, a
 `glm.fit`).
 
 **Dispersion.** Binomial and Poisson hold `φ ≡ 1`, so `(XᵀWX)⁻¹` is the full
-covariance. **Gamma** recovers `φ` post-fit: the mean model is φ-independent,
-so φ stays out of the IRLS, and either `FitOptions::dispersion = Some(v)`
-fixes it or `None` estimates it by maximum likelihood. `weights` is a
-precision weight here, the same convention as `lm`, `summary(glm)`, and
-glmm's own Gaussian path: row `i` has dispersion `φ/wᵢ`, so its shape is
-`aᵢ = wᵢ/φ` (see [`conventions.md`](conventions.md#prior-weights)). φ̂ is
-the root of `Σᵢ wᵢ·(ln aᵢ − ψ₀(aᵢ)) = D/2` (`family::gamma_ml_dispersion`;
-at unit weights this is `MASS::gamma.shape`'s equation). Rescaling every
-weight by a constant `c` scales φ̂ by the same `c` and changes nothing else
-about the fit, so the ML search itself runs on weights normalised by
-`w̄ = 2^round(mean(log₂ wᵢ))` — a power of two near the geometric mean of
-the weights, exactly `1` when unweighted (`ŵᵢ = wᵢ/w̄`) — the search box and
-the starting point then stay fixed regardless of the weights' own scale —
-and the reported `φ̂ = w̄·φ̂_int` multiplies the internal root back onto the
-raw scale. An arithmetic mean would let one outlier weight push `φ_int` out
-of its search box; a power of two also keeps rescaling by a power of two
-exact. Unweighted fits skip the division, so they keep their exact
-arithmetic.
+covariance. **Gamma** and **inverse-Gaussian** recover `φ` post-fit: the mean
+model is φ-independent, so φ stays out of the IRLS, and either
+`FitOptions::dispersion = Some(v)` fixes it or `None` estimates it.
+`weights` is a precision weight here, the same convention as `lm`,
+`summary(glm)`, and glmm's own Gaussian path: row `i` has dispersion
+`φ/wᵢ`, so its Gamma shape is `aᵢ = wᵢ/φ` (see
+[`conventions.md`](conventions.md#prior-weights)).
 
 `Fit::dispersion` reports the Pearson moment
-`φ̂_Pearson = Σ wᵢrᵢ²/(n − p)` (raw weights, raw-row df), and the SE is
-scaled by its square root — `summary(glm)`'s convention exactly, at every
-weight scale. `Fit::loglik` is `−½·(D/φ + Gₚ)`, with the raw (un-normalised)
+`φ̂_Pearson = Σ wᵢrᵢ²/(n − p)` (raw weights, raw-row df) on both families,
+and the SE is scaled by its square root — `summary(glm)`'s convention
+exactly, at every weight scale.
+
+On Gamma, `Fit::loglik` uses a different estimator: the maximum-likelihood
+φ̂, the root of `Σᵢ wᵢ·(ln aᵢ − ψ₀(aᵢ)) = D/2`
+(`family::gamma_ml_dispersion`; at unit weights this is
+`MASS::gamma.shape`'s equation). It only places `loglik`; it is not
+reported. Rescaling every weight by a constant `c` scales this φ̂ by the
+same `c` and changes nothing else about the fit, so the ML search itself
+runs on weights normalised by `w̄ = 2^round(mean(log₂ wᵢ))`
+(`family::weight_scale`) — a power of two near the geometric mean of the
+weights, exactly `1` when unweighted (`ŵᵢ = wᵢ/w̄`) — the search box and the
+starting point then stay fixed regardless of the weights' own scale — and
+`φ̂ = w̄·φ̂_int` multiplies the internal root back onto the raw scale. An
+arithmetic mean would let one outlier weight push `φ_int` out of its search
+box; a power of two also keeps rescaling by a power of two exact. Unweighted
+fits skip the division, so they keep their exact arithmetic.
+`Fit::loglik` is `−½·(D/φ + Gₚ)`, with the raw (un-normalised)
 `D` and at `φ = w̄·φ̂_int` (or a held `v`), but `Gₚ` itself — the same
 `family::gamma_dispersion_term` the mixed path uses — is read on the
 normalised `ŵ` at `ln(φ/w̄)` rather than on raw `w` at `ln φ`; the two give
@@ -654,8 +663,8 @@ to zero or below gives `+∞`. β is `stats::glm`'s.
 `logLik.glm` treats `weights` as case weights — it multiplies each row's
 log-density by `wᵢ` — and plugs in `D/Σwᵢ` for φ, which is neither the
 precision model's maximum nor `summary(glm)`'s Pearson value.
-**Inverse-Gaussian** keeps the Pearson moment `φ̂ = Σ wᵢrᵢ²/(n − p)`
-(raw-row df), `summary(glm)`'s, unchanged.
+On **inverse-Gaussian**, `Fit::loglik` places φ at its ML value `D/n` (or a
+held `v`) in closed form (`family::inv_gaussian_aic`).
 
 **Negative-binomial outer θ-loop.** `fit_glm_nb` alternates, `MASS::glm.nb`-style:
 (1) fit the GLM at fixed θ; (2) 1-D maximise the NB profile log-likelihood

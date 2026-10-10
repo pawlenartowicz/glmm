@@ -19,8 +19,9 @@ use crate::spec::Family;
 /// return `d(y,ũ) + ‖ũ‖² + log|A|` — the same three terms `laplace_deviance`
 /// assembles, extracted so a non-f64 scalar has an entry point that does not
 /// carry the packed and structured branches' buffers.
-/// Non-convergence / Cholesky failure ⇒ `+∞`. The third element of the
-/// return is the raw PIRLS deviance's finiteness, read before the `+∞` fold,
+/// Non-convergence / Cholesky failure ⇒ `+∞`. The second element of the
+/// return is the penalized deviance `d(y,ũ) + ‖ũ‖²` alone; the fourth is the
+/// raw PIRLS deviance's finiteness, read before the `+∞` fold,
 /// so the router's `pirls_exhausted` counter can keep telling an
 /// iteration-cap exhaustion (finite raw deviance) apart from a hard failure.
 #[allow(clippy::too_many_arguments)]
@@ -75,12 +76,13 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
         counters,
     );
     let raw_dev_finite = dev.value().is_finite();
+    let pen_dev = dev + pen;
     if !conv || !raw_dev_finite {
-        return (T::from_f64(f64::INFINITY), dev, conv, raw_dev_finite);
+        return (T::from_f64(f64::INFINITY), pen_dev, conv, raw_dev_finite);
     }
     (
-        dev + pen + T::from_f64(2.0) * logdet,
-        dev,
+        pen_dev + T::from_f64(2.0) * logdet,
+        pen_dev,
         conv,
         raw_dev_finite,
     )
@@ -91,7 +93,8 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
 /// nonzeros, refresh the coupling CSR when the pin mask changed, solve the
 /// block+Schur PIRLS conditional modes, and return `d(y,ũ) + ‖ũ‖² + log|A|` —
 /// the same three terms `laplace_deviance` assembles on this arm.
-/// Non-convergence / non-PD core or Schur ⇒ `+∞`.
+/// Non-convergence / non-PD core or Schur ⇒ `+∞`. The rest of the return is
+/// [`blocked_laplace_deviance`]'s.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn structured_laplace_deviance<T: TailKernel>(
     family: Family,
@@ -186,12 +189,13 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
         counters,
     );
     let raw_dev_finite = dev.value().is_finite();
+    let pen_dev = dev + pen;
     if !conv || !raw_dev_finite {
-        return (T::from_f64(f64::INFINITY), dev, conv, raw_dev_finite);
+        return (T::from_f64(f64::INFINITY), pen_dev, conv, raw_dev_finite);
     }
     (
-        dev + pen + T::from_f64(2.0) * logdet,
-        dev,
+        pen_dev + T::from_f64(2.0) * logdet,
+        pen_dev,
         conv,
         raw_dev_finite,
     )
@@ -208,7 +212,9 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
 /// module's failure surface, mirrors `lmm::reml_deviance`). Every PIRLS variant
 /// returns `log|L|` off its converged factor (L the Cholesky factor of A, so
 /// `log|A| = 2 log|L|`) — the caller below doubles it to get `log|A|`, so there
-/// is no re-factor here.
+/// is no re-factor here. A Laplace (not AGQ) evaluation also leaves the
+/// penalized deviance `d(y,ũ) + ‖ũ‖²` alone in `pirls.pen_dev`, which the
+/// gradient search's `ln φ` entry reads.
 /// Every branch requires `data.z_buf` pre-filled for this fit's `x`
 /// (`fill_z_f64`) — `build_packed_m`'s primary-core reduction reads it the same
 /// way `pirls_solve_blocked`'s does, and the packed branch through
@@ -336,6 +342,8 @@ pub(crate) fn laplace_deviance(
     // log-density (`family::gamma_dispersion_term`) itself, the way it adds
     // NB's `nb_term`. So the value returned here is `D/φ + ‖u‖² + log|A|` on
     // every family, and φ = 1 hands PIRLS the caller's own slice untouched.
+    // The gradient search's `GradSearch::gradient` and the tests'
+    // `gradient_at_mode_ws` pick the same slice back — change together.
     let pirls_prior_w: &[f64] = if matches!(family, Family::Gamma { .. }) && gamma_phi != 1.0 {
         for i in 0..n {
             prior_w_phi[i] = prior_w[i] / gamma_phi;
@@ -427,10 +435,10 @@ pub(crate) fn laplace_deviance(
             schur_llt_mem: &mut *schur_llt_mem,
         },
     };
-    let (objective, conv, raw_dev_finite) = match layout {
+    let (objective, pen_dev, conv, raw_dev_finite) = match layout {
         // No extras ⇒ A is block-diagonal: reconstruct mᵢ per row, never build M.
         GlmmLayout::Blocked => {
-            let (obj, _dev, conv, finite) = blocked_laplace_deviance(
+            let (obj, pen_dev, conv, finite) = blocked_laplace_deviance(
                 family,
                 nb_theta,
                 groupings,
@@ -452,10 +460,10 @@ pub(crate) fn laplace_deviance(
                 n,
                 counters,
             );
-            (obj, conv, finite)
+            (obj, pen_dev, conv, finite)
         }
         GlmmLayout::Structured => {
-            let (obj, _dev, conv, finite) = structured_laplace_deviance(
+            let (obj, pen_dev, conv, finite) = structured_laplace_deviance(
                 family,
                 nb_theta,
                 groupings,
@@ -479,7 +487,7 @@ pub(crate) fn laplace_deviance(
                 n,
                 counters,
             );
-            (obj, conv, finite)
+            (obj, pen_dev, conv, finite)
         }
         // The packed-row layout: the dense `k×k` PIRLS over the fixed-width rows.
         GlmmLayout::Packed => {
@@ -502,13 +510,15 @@ pub(crate) fn laplace_deviance(
                 n,
                 counters,
             );
+            let pen_dev = dev + pen;
             if !conv || !dev.is_finite() {
-                (f64::INFINITY, conv, dev.is_finite())
+                (f64::INFINITY, pen_dev, conv, dev.is_finite())
             } else {
-                (dev + pen + 2.0 * logdet, conv, true)
+                (pen_dev + 2.0 * logdet, pen_dev, conv, true)
             }
         }
     };
+    pirls.pen_dev = pen_dev;
     // `!conv` with a FINITE raw deviance is exactly the natural iteration-cap
     // exhaustion: the three PIRLS variants return `(NaN, NaN, NaN, false)` from
     // every OTHER failure path (halving exhausted, non-PD Cholesky), so a

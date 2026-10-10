@@ -907,10 +907,10 @@ pub(crate) fn force_bobyqa_route(ws: &mut FitWorkspace) {
 /// to [`fit_on_hinted`] on later draws. `None` when that fit did not search
 /// with BFGS, or when the curvature there is not positive definite. BFGS
 /// searches LMMs whose random slopes are all on one grouping (the hint then
-/// costs `n_θ + 1` deviance and gradient evaluations), and binomial and
-/// Poisson Laplace GLMMs with at least two θ on the blocked or structured
-/// layout (the hint is the pilot search's own final estimate and costs
-/// nothing). Call it once, on a pilot fit, right after it.
+/// costs `n_θ + 1` deviance and gradient evaluations), and binomial,
+/// Poisson and Gamma Laplace GLMMs with at least two θ on the blocked or
+/// structured layout (the hint is the pilot search's own final estimate and
+/// costs nothing). Call it once, on a pilot fit, right after it.
 pub fn curvature_hint(ws: &mut FitWorkspace) -> Option<CurvatureHint> {
     match &mut ws.kind {
         FitKind::Lmm { ws, .. } => crate::lmm::lmm_curvature_hint(ws),
@@ -924,14 +924,15 @@ pub fn curvature_hint(ws: &mut FitWorkspace) -> Option<CurvatureHint> {
 /// reads it, so results depend on (data, start, hint) and not on the order of
 /// the calls. It is used where the fit searches with BFGS (LMMs whose random
 /// slopes are all on one grouping, when the per-group route is armed for the
-/// draw; binomial and Poisson Laplace GLMMs with at least two θ on the blocked
-/// or structured layout) and ignored where it searches with BOBYQA.
+/// draw; binomial, Poisson and Gamma Laplace GLMMs with at least two θ on the
+/// blocked or structured layout) and ignored where it searches with BOBYQA.
 ///
 /// # Panics
 ///
 /// As [`fit_on`], and when `hint` was taken on a workspace of another kind or
 /// search dimension (a hint applies to LMM workspaces of its own `n_θ`, and
-/// to GLMM workspaces of its own `n_θ + p`).
+/// to GLMM workspaces of its own `n_θ + p`, + 1 on a Gamma fit whose
+/// dispersion is not held).
 pub fn fit_on_hinted<'a>(
     ws: &'a mut FitWorkspace,
     x: &[f64],
@@ -944,7 +945,10 @@ pub fn fit_on_hinted<'a>(
     if let Some(h) = hint {
         let dim = match &ws.kind {
             FitKind::Lmm { ws, .. } => ws.kernel.groupings().n_theta(),
-            FitKind::Glmm { ws } => ws.n_theta + ws.p,
+            // `opts.dispersion`: the workspace's held φ is set later, by the fit.
+            FitKind::Glmm { ws } => {
+                crate::glmm::grad_search_dim(ws.family, ws.n_theta, ws.p, opts.dispersion.is_some())
+            }
             _ => panic!("fit_on_hinted: a curvature hint applies to LMM and GLMM workspaces only"),
         };
         assert_eq!(

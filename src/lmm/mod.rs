@@ -2238,15 +2238,15 @@ fn warm_bobyqa<'a>(slot: &'a mut Option<Bobyqa>, config: &Config, n: usize) -> &
     })
 }
 
-/// The outer optimizer a fit's θ search runs (B1, 2026-10-07): BFGS where
-/// the per-group regression route is armed for this dataset, which admits
-/// random slopes on the primary grouping only (`q_p ≥ 2`, so `n_θ ≥ 3`), and
-/// BOBYQA everywhere else. A function of the shape and the data's level
+/// The outer optimizer a fit's θ search runs: BFGS where the per-group
+/// regression route is armed for this dataset, which admits random slopes on
+/// the primary grouping only (`q_p ≥ 2`, so `n_θ ≥ 3`), and BOBYQA everywhere
+/// else. A function of the shape and the data's level
 /// Grams, not of the start: cold and warm fits route alike.
 ///
-/// Measured on the route's cells (pawel, locked P-core, search wall against
-/// BOBYQA from the same start): 3 θ cold geo 0.42 (none slower), warm 0.48;
-/// 36 θ 0.04 cold, 0.05 warm. Evidence: `docs/0.5.0/b1-lmm-bfgs-spec.md`.
+/// Measured on the route's cells (2026-10-07, pawel, locked P-core, search
+/// wall against BOBYQA from the same start): 3 θ cold geo 0.42 (none slower),
+/// warm 0.48; 36 θ 0.04 cold, 0.05 warm.
 fn lmm_outer_optimizer(kernel: &LmmKernel, n_theta: usize) -> crate::optim::OuterOptimizer {
     match kernel {
         LmmKernel::Dense { fit, .. } if fit.pg_n_active > 0 && n_theta >= 3 => {

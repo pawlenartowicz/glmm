@@ -2,7 +2,7 @@
 
 ## The accuracy grid
 
-`glmm` is validated against a grid of 773 model cells in `validation/grid/`. Each
+`glmm` is validated against a grid of 794 model cells in `validation/grid/`. Each
 cell fixes a family, a link, a random-effect structure, a size, a balance and a
 regime, and — where the data is simulated — records the parameters it was
 generated from. A cell is fitted by `glmm` and by every external engine that can
@@ -13,10 +13,10 @@ Four external engines are the oracles, each pinned to an exact version:
 
 | Oracle | Version | Cells it fits | Estimator |
 |---|---|---|---|
-| R `lme4` | 2.0-6 | every family; negative binomial through `glmer.nb` | Laplace, scalar AGQ |
-| R `glmmTMB` | 1.1.14 | every family but inverse-Gaussian (771 of 773 cells) | Laplace |
-| Julia `MixedModels.jl` | 5.9.0 | gaussian, binomial logit/probit, Poisson | Laplace |
-| R `GLMMadaptive` | 0.9-7 | non-gaussian, one grouping factor | AGQ |
+| R `lme4` | 2.0-6 | every family; negative binomial through `glmer.nb` (782 of 794 cells) | Laplace, scalar AGQ |
+| R `glmmTMB` | 1.1.14 | every family but inverse-Gaussian, no AGQ cells (763 of 794 cells) | Laplace |
+| Julia `MixedModels.jl` | 5.9.0 | gaussian, binomial logit/probit, Poisson (458 of 794 cells) | Laplace |
+| R `GLMMadaptive` | 0.9-7 | non-gaussian, one grouping factor (28 of 794 cells, all AGQ) | AGQ |
 
 The pins are in `validation/grid/versions.json`. A version bump is a deliberate
 event: that oracle is rerun over the whole grid into a **new** run directory, and
@@ -77,9 +77,10 @@ Rscript compare.R                 # the four gates over the newest runs
 Rscript summarize_accuracy.R      # per-cell and per-family report, no gate
 ```
 
-Every run gets its own never-overwritten directory under
-`validation/grid/runs/<engine>/`. A `glmm` run lands in `scratch/` unless started
-with `--keep`. `--timed` needs a locked CPU clock and refuses to start without one.
+Every run gets its own directory under `validation/grid/runs/<engine>/scratch/`,
+which git ignores. An oracle run, and a `glmm` run started with `--keep`, then
+replaces the engine's kept run in `last/` (full runs) or `last-timed/` (timed
+runs). `--timed` needs a locked CPU clock and refuses to start without one.
 See [`../validation/README.md`](../validation/README.md) for the directory layout
 and the flags. The JSONL record's fields are defined in
 `validation/grid/engines/common.rs`'s `base_record`.

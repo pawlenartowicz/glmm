@@ -6,7 +6,7 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
-## [0.5.0] — Unreleased
+## [0.5.0] — 2026-10-10
 
 GLMMs on non-canonical links and Gamma GLMMs now reach the maximum of the
 Laplace likelihood itself, which is glmmTMB's objective and not lme4's. A
@@ -429,8 +429,9 @@ severe warning.
   probes (a later call at a probed point reuses its solve) and searches
   unscaled. The search path changes, so the last digits of the estimates can
   move. The test is the cold fit's on a warm start too: the seed's distance is
-  measured against the cold radius, and a carried dispersion (below) is judged
-  by where the cold seed lies, not by its own distance. Measured against the
+  measured against the cold radius, and a carried dispersion (below), like the
+  point where a gradient search hands over to BOBYQA, is judged by
+  where the cold seed lies, not by its own distance. Measured against the
   warm radius, a warm start from the optimum perturbed by 5% took 1578
   evaluations on `gami_q4_g3000p20_bal_base` (cold 364); it takes 368. Over
   the grid's 35 Gamma cells warm starts without a dispersion take 1.04 of the
@@ -506,9 +507,9 @@ severe warning.
   point is assembled from that point's own mode solve, so a gradient costs
   about one more value evaluation, not a second mode solve. A search that
   does not certify its endpoint is polished by BOBYQA, and one that fails
-  hands over to the BOBYQA route (`Note::GradientSearchFallback`). NB, Gamma,
-  AGQ, the packed layout, one-θ fits, and warm starts far out (a θ above 10,
-  or no random slope at 50 rows per level or more) keep BOBYQA.
+  hands over to the BOBYQA route (`Note::GradientSearchFallback`). NB, AGQ,
+  the packed layout, one-θ fits, and warm starts far out (a θ above 10, or no
+  random slope at 50 rows per level or more) keep BOBYQA.
   - On the grid's fast subset, routed fits take 0.48 of their former time
     (geometric mean, whole fits with Hessian SEs, clock-locked x86), and none
     is slower. The crossed binomial `binb_cross4_g3000p20` goes from 286 to
@@ -521,6 +522,35 @@ severe warning.
   - The search path changes, so results on routed fits move at the
     optimizer's tolerance. Two R acceptance pins were re-recorded at higher
     log-likelihood.
+  - The search stops when one step lowers the deviance by less than 1e-10
+    (LMMs use 1e-9). Where a variance goes to zero, the deviance can be almost
+    flat along a curved valley, and the search goes down it in waves; a stop
+    at 1e-9 ended such a Gamma-inverse fit 2.4e-5 above its optimum.
+    Compared with a stop at 1e-9, this costs about +1–3% time on binomial
+    (logit 1.020x, probit 1.030x, summed over the routed grid cells) and
+    about +1% on Poisson (1.008x); cloglog is 1.4% faster (0.986x). The
+    deviance is equal or better, within 1.1e-9.
+
+- **Gamma GLMMs search with BFGS too: about a quarter of the time of a
+  whole fit.** A Laplace fit of a Gamma GLMM (log or inverse link) with
+  at least two variance parameters on the blocked or structured layout now
+  takes the same BFGS search as binomial and Poisson. The dispersion `ln φ`
+  is one more search coordinate, with an exact gradient in closed form. A
+  held dispersion (`FitOptions::dispersion`) stays fixed, and the search then
+  runs over `[θ | β]` only. On the inverse link the search starts with the
+  known curvature of `ln φ`, so its first steps are not spent on `ln φ`
+  alone.
+  - Whole fits on a clock-locked x86 core, against the BOBYQA search: 0.29x
+    of the time summed over the 88 routed Gamma/log grid cells, and 0.21x
+    over the 14 Gamma/inverse cells. No cell is slower.
+  - WASM, on the timed fast cells: 0.34x on Gamma/log and 0.47x on
+    Gamma/inverse. `gaml_cross4_g30000p20` goes from 10.7 s to 3.7 s.
+  - `n_eval` falls on these fits (a gradient reuses its value evaluation, so
+    it is not counted there). Cold grid fits, median: 82 to 25 on Gamma/log,
+    113 to 82 on Gamma/inverse.
+  - From cold and warm starts the deviance is never worse than the BOBYQA
+    search's by more than 9.4e-10, and no `converged` or `singular` flag
+    changes.
 
 - **Hessian standard errors on large GLMMs take a fraction of the memory
   and less time.** The dual-number scratch of the exact Hessian no longer
@@ -632,8 +662,9 @@ severe warning.
   unhinted time), and no draw is more than 1.25× slower with the hint.
   `fit_on` is `fit_on_hinted` with no hint. On a routed GLMM workspace,
   `curvature_hint` after a pilot fit returns the pilot search's own final
-  inverse-Hessian estimate, at no cost, and a hint's dimension is `n_θ + p`;
-  a hint of another dimension panics, as on an LMM workspace.
+  inverse-Hessian estimate, at no cost, and a hint's dimension is `n_θ + p`
+  (`n_θ + p + 1` on a Gamma fit with a free dispersion); a hint of another
+  dimension panics, as on an LMM workspace.
   **Semver note:** all of it is on
   the unstable loop tier (`loop_advanced`, outside the semver-covered
   surface); `fit_on`, `fit_cold` and `fit_warm` keep their signatures.
