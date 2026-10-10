@@ -132,7 +132,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install python/dist/*.whl
-          python -m pip install pytest
+          python -m pip install pytest pandas pyarrow
           # Scratch dir + absolute tests path: `import glmm` must resolve to the
           # installed wheel, never python/glmm/ in the source tree.
           cd "$RUNNER_TEMP"
@@ -167,7 +167,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install python/dist/*.tar.gz
-          python -m pip install pytest
+          python -m pip install pytest pandas pyarrow
           cd "$RUNNER_TEMP"
           python -m pytest "$GITHUB_WORKSPACE/python/tests" -v
       - uses: actions/upload-artifact@v4
